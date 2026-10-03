@@ -2835,23 +2835,18 @@ unsafe fn syscall_map_view(
     }
 }
 
-/// The full Step-4.B in-process loader drive. Returns the snap result (for the boot-log proof).
-///
-/// 1. Create the process heap (installs it via [`crate::install_process_heap`]).
-/// 2. Snap smss's ntdll imports against OUR export table (direct IAT writes).
-///
-/// After this returns, the trampoline chains to smss's real entry (`NtProcessStartup`) — now with a
-/// correctly-snapped IAT, so smss runs under OUR ntdll.
+/// Initialize the current process heap, import graph, loader lists, TLS and DLL attachments.
+/// Returns the actual import-snap result after successful initialization.
 ///
 /// # Safety
-/// On-target only; `smss_base`/`ntdll_base` mapped PE images.
+/// On-target only; `image_base` and `ntdll_base` are mapped PE images in the current process.
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64, startup_reserved: u64) -> SnapResult {
+pub unsafe fn ldrp_drive(image_base: u64, ntdll_base: u64, startup_reserved: u64) -> SnapResult {
     // Record the EXE base for RtlLookupFunctionEntry (the EXE is NOT in MODULE_TABLE, which holds
     // only dependencies). The SEH unwinder must cover a fault PC in the EXE's own code too.
     // SAFETY: single-threaded loader; written once before any thread that reads it.
     unsafe {
-        EXE_BASE = smss_base;
+        EXE_BASE = image_base;
     }
     // RtlCreateUserProcess copies a de-normalized (self-relative) parameters block into the child.
     // Real ntdll normalizes it before loader initialization exposes ImagePathName, CommandLine, and
@@ -2903,10 +2898,9 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64, startup_reserved: u64)
             core::hint::unreachable_unchecked()
         },
     };
-    // (2) Snap the EXE's imports against our export table + any dependent DLLs (csrsrv for csrss).
-    // smss imports only ntdll (dep-free); csrss also imports csrsrv.dll — which this loads + snaps.
+    // Snap the executable's imports and recursively load its dependencies.
     // SAFETY: on-target mapped-image walk + IAT write + dependent-DLL load syscalls.
-    let out = unsafe { snap_all_imports(smss_base, ntdll_base) };
+    let out = unsafe { snap_all_imports(image_base, ntdll_base) };
     if out.status != 0 {
         drop(_loader_lock);
         unsafe {
@@ -2921,7 +2915,7 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64, startup_reserved: u64)
     // NULL → GetModuleFileNameW(NULL)'s `[Peb->Ldr]+0x10` InLoadOrder walk derefs NULL+0x10 (the
     // kernel32+0xff13 wall). `image_base` (the EXE) is recorded as list entry 0.
     // SAFETY: single-threaded loader; MODULE_TABLE holds mapped images; the process heap is installed.
-    let ldr_status = unsafe { build_peb_ldr(core::ptr::addr_of!(MODULE_TABLE), smss_base) };
+    let ldr_status = unsafe { build_peb_ldr(core::ptr::addr_of!(MODULE_TABLE), image_base) };
     if ldr_status != 0 {
         drop(_loader_lock);
         unsafe {
@@ -2938,7 +2932,7 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64, startup_reserved: u64)
         }
     }
     let tls_status =
-        unsafe { initialize_process_static_tls(smss_base, core::ptr::addr_of!(MODULE_TABLE)) };
+        unsafe { initialize_process_static_tls(image_base, core::ptr::addr_of!(MODULE_TABLE)) };
     if tls_status != 0 {
         drop(_loader_lock);
         unsafe {
@@ -5786,9 +5780,9 @@ pub unsafe fn rtl_create_user_thread(
     }
     // Build the CONTEXT record on the current stack (zeroed, then Rip/Rcx/Rsp set). It must live long
     // enough for the executive's stack-mirror read during the syscall — a stack local of this fn.
-    let mut context = [0u8; nt_thread_start::AMD64_CONTEXT_SIZE];
+    let mut context = nt_thread_start::AlignedAmd64Context::zeroed();
     let initialized = nt_thread_start::initialize_amd64_user_context(
-        &mut context,
+        context.as_bytes_mut(),
         start_address,
         parameter,
         initial_teb[2],
@@ -9832,7 +9826,6 @@ const REG_MULTI_SZ: u32 = 7;
 
 const ENTRY_SIZE: usize = 0x38;
 const OBJ_CASE_INSENSITIVE: u32 = 0x40;
-const OBJ_KERNEL_HANDLE: u32 = 0x200;
 
 /// The RTL_QUERY_REGISTRY_TABLE entry, read field-by-field from the caller's array.
 #[derive(Clone, Copy)]
@@ -10397,7 +10390,7 @@ unsafe fn rtl_get_registry_handle(
         );
         core::ptr::write(
             oa.as_mut_ptr().add(0x18) as *mut u32,
-            OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+            OBJ_CASE_INSENSITIVE,
         );
     }
     let status = if create {

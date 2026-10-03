@@ -177,8 +177,14 @@ impl HostedThreadRuntimeTable {
         tcb: u64,
         badge: u64,
         mechanism: HostedThreadMechanismCaps,
+        teb_alias: u64,
     ) -> Option<HostedThreadRuntime> {
-        if tcb <= 1 || !mechanism.is_live() {
+        if tcb <= 1 || !mechanism.is_live() || teb_alias == 0 || teb_alias & 0xfff != 0 {
+            return None;
+        }
+        if self.get_by_tid(tid).is_some_and(|entry| {
+            entry.teb_alias != 0 && entry.teb_alias != teb_alias
+        }) {
             return None;
         }
         let previous = self
@@ -202,8 +208,10 @@ impl HostedThreadRuntimeTable {
             .filter_map(RuntimeSlot::ordinary_mut)
             .find(|entry| entry.is_live() && entry.tid == tid)?;
         entry.runtime.mechanism = mechanism;
+        entry.runtime.teb_alias = teb_alias;
         Some(HostedThreadRuntime {
             mechanism,
+            teb_alias,
             ..runtime
         })
     }
@@ -989,8 +997,9 @@ impl HostedThreadRuntimes {
         tcb: u64,
         badge: u64,
         mechanism: HostedThreadMechanismCaps,
+        teb_alias: u64,
     ) -> Option<HostedThreadRuntime> {
-        unsafe { (&mut *self.table).register_main(pi, process, tid, tcb, badge, mechanism) }
+        unsafe { (&mut *self.table).register_main(pi, process, tid, tcb, badge, mechanism, teb_alias) }
     }
 
     pub(crate) fn prepare_spawn(

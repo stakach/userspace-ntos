@@ -6,6 +6,7 @@
 //! A failed/torn update preserves the previous payload-valid slot.
 
 use alloc::vec::Vec;
+use nt_config_store::codec::{crc32c, Crc32c};
 
 #[cfg(test)]
 #[path = "snapshot_store_tests.rs"]
@@ -30,6 +31,28 @@ pub trait SnapshotBlockDevice {
     fn sector_size(&self) -> usize;
     fn sector_count(&self) -> u64;
     fn read_sector(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError>;
+
+    /// Read a whole-sector range. Success means every requested byte was read; an error may
+    /// leave partially filled output and must not be treated as a complete payload. The default
+    /// validates the entire range before composing single-sector operations.
+    fn read_sectors(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError> {
+        let size = self.sector_size();
+        if size == 0 || out.len() % size != 0 {
+            return Err(SnapshotBlockStoreError::InvalidGeometry);
+        }
+        let count = u64::try_from(out.len() / size)
+            .map_err(|_| SnapshotBlockStoreError::InvalidGeometry)?;
+        let end = lba
+            .checked_add(count)
+            .ok_or(SnapshotBlockStoreError::InvalidGeometry)?;
+        if end > self.sector_count() {
+            return Err(SnapshotBlockStoreError::InvalidGeometry);
+        }
+        for (index, sector) in out.chunks_exact_mut(size).enumerate() {
+            self.read_sector(lba + index as u64, sector)?;
+        }
+        Ok(())
+    }
     fn write_sector(&mut self, lba: u64, data: &[u8]) -> Result<(), SnapshotBlockStoreError>;
 
     /// Complete all preceding writes to stable storage before returning success. Implementations
@@ -433,24 +456,33 @@ impl SnapshotBlockStore {
         dev: &mut D,
         plan: SlotReadPlan,
     ) -> Result<(), SnapshotBlockStoreError> {
+        const READ_BATCH_SECTORS: u32 = 4;
         let (sector_size, slot_sectors) = self.geometry(dev)?;
         if plan.payload_sectors as u64 > slot_sectors - 1 {
             return Err(SnapshotBlockStoreError::Corrupt);
         }
         let slot_base = self.slot_lba(slot_sectors, plan.slot)?;
-        let mut sector = Vec::new();
-        sector
-            .try_reserve_exact(sector_size)
+        let batch_size = sector_size
+            .checked_mul(READ_BATCH_SECTORS as usize)
+            .ok_or(SnapshotBlockStoreError::InvalidGeometry)?;
+        let mut batch = Vec::new();
+        batch
+            .try_reserve_exact(batch_size)
             .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
-        sector.resize(sector_size, 0);
+        batch.resize(batch_size, 0);
         let mut remaining = plan.payload_len;
         let mut crc = Crc32c::new();
-        for index in 0..plan.payload_sectors {
-            sector.fill(0);
-            dev.read_sector(slot_base + 1 + index as u64, &mut sector)?;
-            let copy = remaining.min(sector_size);
-            crc.update(&sector[..copy]);
+        let mut index = 0;
+        while index < plan.payload_sectors {
+            let sectors = (plan.payload_sectors - index).min(READ_BATCH_SECTORS);
+            let bytes = sectors as usize * sector_size;
+            let output = &mut batch[..bytes];
+            output.fill(0);
+            dev.read_sectors(slot_base + 1 + index as u64, output)?;
+            let copy = remaining.min(bytes);
+            crc.update(&output[..copy]);
             remaining -= copy;
+            index += sectors;
         }
         if remaining != 0 || crc.finish() != plan.payload_crc {
             return Err(SnapshotBlockStoreError::Corrupt);
@@ -651,33 +683,6 @@ impl<D: SnapshotBlockDevice> SnapshotPayloadReader for PayloadSectorReader<'_, D
     }
 }
 
-struct Crc32c {
-    crc: u32,
-}
-
-impl Crc32c {
-    fn new() -> Self {
-        Self { crc: 0xFFFF_FFFF }
-    }
-
-    fn update(&mut self, data: &[u8]) {
-        for &b in data {
-            self.crc ^= b as u32;
-            for _ in 0..8 {
-                self.crc = if self.crc & 1 != 0 {
-                    (self.crc >> 1) ^ 0x82F6_3B78
-                } else {
-                    self.crc >> 1
-                };
-            }
-        }
-    }
-
-    fn finish(self) -> u32 {
-        !self.crc
-    }
-}
-
 fn encode_header(out: &mut [u8], header: SlotHeader) {
     out[..HEADER_LEN].fill(0);
     out[0..8].copy_from_slice(&STORE_MAGIC);
@@ -743,10 +748,4 @@ fn read_u32(bytes: &[u8]) -> u32 {
 
 fn read_u64(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(bytes.try_into().unwrap())
-}
-
-fn crc32c(data: &[u8]) -> u32 {
-    let mut crc = Crc32c::new();
-    crc.update(data);
-    crc.finish()
 }

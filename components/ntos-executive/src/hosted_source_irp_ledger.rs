@@ -1,13 +1,34 @@
-//! Root-owned lifetime authority for driver-allocated source IRPs.
+//! Root-owned lifetime authority for driver-allocated and caller-projected source IRPs.
 
 use super::*;
 use nt_io_manager::retained_query_path_forward::SourceIrpTicket;
+use nt_io_manager::source_irp_auxiliary::{
+    SourceIrpAuxiliary, SourceIrpAuxiliaryError, SourceIrpAuxiliaryLedger, SourceIrpAuxiliaryPhase,
+    SourceIrpCompletionOwner, SourceMdlAllocationIdentity, SourceMemoryIdentity,
+    SourcePoolAllocationIdentity,
+};
 use nt_io_manager::source_irp_ledger::{
     SourceIrpAllocation, SourceIrpLedger, SourceIrpLedgerError, SourceIrpOwner, SourceIrpRetirement,
 };
 
 static LOCK: AtomicU64 = AtomicU64::new(0);
 static mut LEDGER: SourceIrpLedger = SourceIrpLedger::new();
+static mut AUXILIARY: SourceIrpAuxiliaryLedger = SourceIrpAuxiliaryLedger::new();
+static mut CALLER_PROJECTIONS: Option<Vec<CallerProjection>> = None;
+
+#[derive(Clone, Copy)]
+struct CallerProjection {
+    ticket: SourceIrpTicket,
+    allocation: SourceIrpAllocation,
+    node: u64,
+    node_generation: u64,
+    canonical_irp_id: u64,
+}
+
+fn caller_projections() -> &'static mut Vec<CallerProjection> {
+    let slot = unsafe { &mut *core::ptr::addr_of_mut!(CALLER_PROJECTIONS) };
+    slot.get_or_insert_with(Vec::new)
+}
 
 struct Guard;
 
@@ -30,6 +51,428 @@ fn lock() -> Guard {
 fn ledger() -> &'static mut SourceIrpLedger {
     // The lock is held at every call site; no reference survives an external operation.
     unsafe { &mut *core::ptr::addr_of_mut!(LEDGER) }
+}
+
+fn auxiliary() -> &'static mut SourceIrpAuxiliaryLedger {
+    // Serialized by the source-IRP ownership lock alongside the primary ledger.
+    unsafe { &mut *core::ptr::addr_of_mut!(AUXILIARY) }
+}
+
+unsafe fn pool_range_identity_unlocked(
+    inst: DriverInstance,
+    component_address: u64,
+    bytes: u64,
+) -> Option<SourcePoolAllocationIdentity> {
+    if bytes == 0 || component_address < FSD_POOL_VADDR {
+        return None;
+    }
+    let used = read_volatile(inst.exec_pool_va as *const u64);
+    let offset = component_address.checked_sub(FSD_POOL_VADDR)?;
+    let allocation = nt_io_manager::hosted_pool_range::walk_hosted_pool_allocation(
+        used,
+        POOL_DATA_OFF,
+        offset,
+        bytes,
+        |header| {
+            let address = inst.exec_pool_va.checked_add(header)?;
+            Some(read_volatile(address as *const u64))
+        },
+    )?;
+    let base = FSD_POOL_VADDR.checked_add(allocation.base)?;
+    if hosted_instance_pool_allocation_is_free_unlocked(inst, base) != Some(false) {
+        return None;
+    }
+    let exec = inst.exec_pool_va.checked_add(allocation.base)?;
+    let generation = read_volatile((exec - 8) as *const u64);
+    (generation != 0).then_some(SourcePoolAllocationIdentity {
+        component_address: base,
+        capacity: allocation.capacity,
+        pool_generation: generation,
+    })
+}
+
+unsafe fn exact_pool_identity_unlocked(
+    inst: DriverInstance,
+    component_address: u64,
+    bytes: u64,
+) -> Option<SourcePoolAllocationIdentity> {
+    let identity = pool_range_identity_unlocked(inst, component_address, bytes)?;
+    (identity.component_address == component_address).then_some(identity)
+}
+
+unsafe fn mapped_memory_identity_unlocked(
+    instance_index: usize,
+    inst: DriverInstance,
+    runtime: Option<HostedDriverThreadRuntime>,
+    component_address: u64,
+    bytes: u64,
+) -> Option<SourceMemoryIdentity> {
+    if let Some(allocation) = pool_range_identity_unlocked(inst, component_address, bytes) {
+        return Some(SourceMemoryIdentity::Pool {
+            allocation,
+            component_address,
+            bytes,
+        });
+    }
+    let exec_address =
+        component_to_exec_va_for_instance(instance_index, inst, component_address, bytes).or_else(
+            || {
+                runtime.and_then(|runtime| {
+                    hosted_worker_component_to_exec_va(runtime, component_address, bytes)
+                })
+            },
+        )?;
+    Some(SourceMemoryIdentity::MappedRange {
+        component_address,
+        bytes,
+        exec_address,
+    })
+}
+
+unsafe fn memory_identity_matches_unlocked(
+    instance_index: usize,
+    inst: DriverInstance,
+    identity: SourceMemoryIdentity,
+) -> bool {
+    match identity {
+        SourceMemoryIdentity::Pool {
+            allocation,
+            component_address,
+            bytes,
+        } => pool_range_identity_unlocked(inst, component_address, bytes) == Some(allocation),
+        SourceMemoryIdentity::MappedRange {
+            component_address,
+            bytes,
+            exec_address,
+        } => {
+            component_to_exec_va_for_instance(instance_index, inst, component_address, bytes)
+                .or_else(|| {
+                    hosted_driver_runtime_for_worker_component_range(
+                        instance_index,
+                        component_address,
+                        bytes,
+                    )
+                    .and_then(|runtime| {
+                        hosted_worker_component_to_exec_va(runtime, component_address, bytes)
+                    })
+                })
+                == Some(exec_address)
+        }
+    }
+}
+
+unsafe fn mdl_identity_unlocked(
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    mdl: u64,
+    expected_length: u32,
+) -> Option<(SourceMdlAllocationIdentity, u64)> {
+    let pool = exact_pool_identity_unlocked(inst, mdl, nt_mdl::MDL_SIZE as u64)?;
+    let key = hosted_mdl_key(domain, mdl)?;
+    let registry = hosted_mdl_registry_mut();
+    let id = registry.id_for(key)?;
+    if registry.byte_count(id) != Some(expected_length) || !registry.is_locked(id) {
+        return None;
+    }
+    let virtual_address = registry.virtual_address(id)?;
+    let mdl_exec = inst.exec_pool_va + mdl.saturating_sub(FSD_POOL_VADDR);
+    let raw_flags = read_unaligned((mdl_exec + nt_mdl::MDL_OFF_FLAGS) as *const i16);
+    let raw_start = read_unaligned((mdl_exec + nt_mdl::MDL_OFF_START_VA) as *const u64);
+    let raw_offset = read_unaligned((mdl_exec + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32);
+    if read_unaligned((mdl_exec + nt_mdl::MDL_OFF_SIZE) as *const i16) != nt_mdl::MDL_SIZE as i16
+        || read_unaligned((mdl_exec + nt_mdl::MDL_OFF_BYTE_COUNT) as *const u32) != expected_length
+        || raw_flags & nt_mdl::MDL_PAGES_LOCKED == 0
+        || raw_start.checked_add(u64::from(raw_offset)) != Some(virtual_address)
+    {
+        return None;
+    }
+    Some((
+        SourceMdlAllocationIdentity {
+            pool,
+            registry_generation: registry.generation(id)?,
+        },
+        virtual_address,
+    ))
+}
+
+unsafe fn mdl_identity_matches_unlocked(
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    mdl: SourceMdlAllocationIdentity,
+) -> bool {
+    if exact_pool_identity_unlocked(inst, mdl.pool.component_address, nt_mdl::MDL_SIZE as u64)
+        != Some(mdl.pool)
+    {
+        return false;
+    }
+    let Some(key) = hosted_mdl_key(domain, mdl.pool.component_address) else {
+        return false;
+    };
+    let registry = hosted_mdl_registry_mut();
+    registry.id_for(key).is_some_and(|id| {
+        registry.generation(id) == Some(mdl.registry_generation) && registry.is_locked(id)
+    })
+}
+
+fn memory_component_address(identity: SourceMemoryIdentity) -> u64 {
+    match identity {
+        SourceMemoryIdentity::Pool {
+            component_address, ..
+        }
+        | SourceMemoryIdentity::MappedRange {
+            component_address, ..
+        } => component_address,
+    }
+}
+
+fn memory_bytes(identity: SourceMemoryIdentity) -> u64 {
+    match identity {
+        SourceMemoryIdentity::Pool { bytes, .. }
+        | SourceMemoryIdentity::MappedRange { bytes, .. } => bytes,
+    }
+}
+
+unsafe fn capture_auxiliary_unlocked(
+    instance_index: usize,
+    inst: DriverInstance,
+    caller: &HostedDriverCaller,
+    expected_thread: u64,
+    ticket: SourceIrpTicket,
+    source: SourceIrpAllocation,
+) -> Option<SourceIrpAuxiliary> {
+    let irp =
+        hosted_pool_allocation_exec_va(inst.exec_pool_va, source.component_address, source.bytes)?;
+    if allocation_unlocked(
+        instance_index,
+        inst,
+        source.component_address,
+        source.bytes,
+        source.stack_count,
+    ) != Some(source)
+    {
+        return None;
+    }
+    let current_location = read_unaligned((irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *const u8);
+    let current_stack = read_unaligned((irp + 0xb8) as *const u64);
+    if current_location != source.stack_count + 1
+        || current_stack != source.component_address + source.bytes
+    {
+        return None;
+    }
+    let stack = irp + source.bytes - WDM_X64_IO_STACK_LOCATION_SIZE as u64;
+    let major = read_unaligned(stack as *const u8);
+    if !matches!(
+        major,
+        major::IRP_MJ_READ
+            | major::IRP_MJ_WRITE
+            | major::IRP_MJ_FLUSH_BUFFERS
+            | major::IRP_MJ_SHUTDOWN
+            | major::IRP_MJ_PNP
+            | major::IRP_MJ_POWER
+    ) {
+        return None;
+    }
+    let transfer = matches!(major, major::IRP_MJ_READ | major::IRP_MJ_WRITE);
+    let length = if transfer {
+        read_unaligned((stack + 0x08) as *const u32)
+    } else {
+        0
+    };
+    let flags = read_unaligned((irp + 0x10) as *const u32);
+    let system_address = read_unaligned((irp + 0x18) as *const u64);
+    let mdl_address = read_unaligned((irp + 0x08) as *const u64);
+    let user_buffer = read_unaligned((irp + 0x70) as *const u64);
+    if system_address != 0 && mdl_address != 0 {
+        return None;
+    }
+
+    let system_buffer = if system_address != 0 {
+        let expected = IRP_BUFFERED_IO
+            | IRP_DEALLOCATE_BUFFER
+            | if major == major::IRP_MJ_READ {
+                IRP_INPUT_OPERATION
+            } else {
+                0
+            };
+        if !transfer || length == 0 || flags != expected {
+            return None;
+        }
+        Some(exact_pool_identity_unlocked(
+            inst,
+            system_address,
+            u64::from(length),
+        )?)
+    } else {
+        None
+    };
+
+    let (mdl, mdl_buffer_address) = if mdl_address != 0 {
+        if !transfer || length == 0 || flags != 0 || user_buffer != 0 {
+            return None;
+        }
+        let (identity, virtual_address) =
+            mdl_identity_unlocked(inst, source.domain, mdl_address, length)?;
+        (Some(identity), Some(virtual_address))
+    } else {
+        (None, None)
+    };
+
+    let transfer_address = if length == 0 || major == major::IRP_MJ_WRITE && system_buffer.is_some()
+    {
+        None
+    } else if let Some(address) = mdl_buffer_address {
+        Some(address)
+    } else {
+        (user_buffer != 0).then_some(user_buffer)
+    };
+    if transfer && length != 0 && transfer_address.is_none() {
+        return None;
+    }
+    if !transfer && (flags != 0 || system_address != 0 || mdl_address != 0 || user_buffer != 0) {
+        return None;
+    }
+    let transfer_buffer = transfer_address.and_then(|address| {
+        mapped_memory_identity_unlocked(
+            instance_index,
+            inst,
+            caller.runtime,
+            address,
+            u64::from(length),
+        )
+    });
+    if transfer_address.is_some() && transfer_buffer.is_none() {
+        return None;
+    }
+
+    let event_address = read_unaligned((irp + 0x50) as *const u64);
+    let iosb_address = read_unaligned((irp + 0x48) as *const u64);
+    let thread_object = read_unaligned((irp + 0x98) as *const u64);
+    let event = mapped_memory_identity_unlocked(
+        instance_index,
+        inst,
+        caller.runtime,
+        event_address,
+        nt_kernel_exec::kevent::kevent_layout::SIZE_OF as u64,
+    )?;
+    let iosb =
+        mapped_memory_identity_unlocked(instance_index, inst, caller.runtime, iosb_address, 16)?;
+    let event_exec = match event {
+        SourceMemoryIdentity::Pool {
+            allocation,
+            component_address,
+            ..
+        } => {
+            inst.exec_pool_va
+                + allocation.component_address.saturating_sub(FSD_POOL_VADDR)
+                + component_address.saturating_sub(allocation.component_address)
+        }
+        SourceMemoryIdentity::MappedRange { exec_address, .. } => exec_address,
+    };
+    if read_unaligned(event_exec as *const u8) > 1
+        || read_unaligned(
+            (event_exec + nt_kernel_exec::kevent::kevent_layout::SIZE as u64) as *const u8,
+        ) != 6
+        || read_unaligned(
+            (event_exec + nt_kernel_exec::kevent::kevent_layout::WAIT_LIST_HEAD as u64)
+                as *const u64,
+        ) != event_address + nt_kernel_exec::kevent::kevent_layout::WAIT_LIST_HEAD as u64
+        || read_unaligned(
+            (event_exec + nt_kernel_exec::kevent::kevent_layout::WAIT_LIST_HEAD as u64 + 8)
+                as *const u64,
+        ) != event_address + nt_kernel_exec::kevent::kevent_layout::WAIT_LIST_HEAD as u64
+    {
+        return None;
+    }
+    if thread_object == 0 || thread_object != expected_thread {
+        return None;
+    }
+    Some(SourceIrpAuxiliary {
+        source,
+        ticket,
+        system_buffer,
+        mdl,
+        transfer_buffer,
+        completion: SourceIrpCompletionOwner {
+            thread_handle: caller.thread_handle,
+            thread_object,
+            event,
+            iosb,
+        },
+    })
+}
+
+unsafe fn auxiliary_matches_unlocked(
+    instance_index: usize,
+    inst: DriverInstance,
+    auxiliary: SourceIrpAuxiliary,
+    phase: SourceIrpAuxiliaryPhase,
+) -> bool {
+    let Some(irp) = hosted_pool_allocation_exec_va(
+        inst.exec_pool_va,
+        auxiliary.source.component_address,
+        auxiliary.source.bytes,
+    ) else {
+        return false;
+    };
+    let expected_system = auxiliary
+        .system_buffer
+        .map_or(0, |child| child.component_address);
+    let expected_mdl = auxiliary
+        .mdl
+        .map_or(0, |child| child.pool.component_address);
+    let expected_transfer = auxiliary
+        .transfer_buffer
+        .map_or(0, memory_component_address);
+    let expected_user = if auxiliary.mdl.is_some() {
+        0
+    } else if auxiliary.system_buffer.is_some() {
+        if auxiliary.transfer_buffer.is_some() {
+            expected_transfer
+        } else {
+            0
+        }
+    } else {
+        expected_transfer
+    };
+    if allocation_unlocked(
+        instance_index,
+        inst,
+        auxiliary.source.component_address,
+        auxiliary.source.bytes,
+        auxiliary.source.stack_count,
+    ) != Some(auxiliary.source)
+        || read_unaligned((irp + 0x18) as *const u64) != expected_system
+        || read_unaligned((irp + 0x08) as *const u64) != expected_mdl
+        || read_unaligned((irp + 0x70) as *const u64) != expected_user
+        || read_unaligned((irp + 0x98) as *const u64) != auxiliary.completion.thread_object
+        || read_unaligned((irp + 0x50) as *const u64)
+            != memory_component_address(auxiliary.completion.event)
+        || read_unaligned((irp + 0x48) as *const u64)
+            != memory_component_address(auxiliary.completion.iosb)
+        || !memory_identity_matches_unlocked(instance_index, inst, auxiliary.completion.event)
+        || !memory_identity_matches_unlocked(instance_index, inst, auxiliary.completion.iosb)
+    {
+        return false;
+    }
+    if phase == SourceIrpAuxiliaryPhase::Completing {
+        return true;
+    }
+    auxiliary.system_buffer.is_none_or(|child| {
+        exact_pool_identity_unlocked(inst, child.component_address, 1) == Some(child)
+    }) && auxiliary.mdl.is_none_or(|mdl| {
+        if !mdl_identity_matches_unlocked(inst, auxiliary.source.domain, mdl) {
+            return false;
+        }
+        let Some(key) = hosted_mdl_key(auxiliary.source.domain, mdl.pool.component_address) else {
+            return false;
+        };
+        let registry = hosted_mdl_registry_mut();
+        registry
+            .id_for(key)
+            .is_some_and(|id| registry.virtual_address(id) == Some(expected_transfer))
+    }) && auxiliary
+        .transfer_buffer
+        .is_none_or(|buffer| memory_identity_matches_unlocked(instance_index, inst, buffer))
 }
 
 fn allocation(
@@ -85,6 +528,171 @@ fn allocation_unlocked(
     })
 }
 
+unsafe fn projected_node(
+    instance_index: usize,
+    node: u64,
+    canonical_irp_id: u64,
+    raw_irp: u64,
+    expected_kind: u64,
+    expected_generation: Option<u64>,
+) -> Option<(u64, PendingIrp)> {
+    if !pending_irp_node_valid(node) || raw_irp == 0 {
+        return None;
+    }
+    let win = ExecVaWindow::try_for_instance(instance_index)?;
+    let mut cursor = read_volatile((win.data_va + FSD_PENDING_IRP_HEAD_OFF) as *const u64);
+    let mut found = false;
+    for _ in 0..POOL_FREE_LIST_MAX {
+        if cursor == 0 {
+            break;
+        }
+        let exec = pending_irp_node_exec_va(win, cursor)?;
+        if cursor == node {
+            found = true;
+            break;
+        }
+        cursor = read_volatile(exec as *const u64);
+    }
+    if !found {
+        return None;
+    }
+    let exec_node = pending_irp_node_exec_va(win, node)?;
+    let state = pending_irp_owner_state(exec_node).load(Ordering::Acquire);
+    let generation = state & !HOSTED_IRP_STATE_MASK;
+    if hosted_irp_state_kind(state) != expected_kind
+        || generation == 0
+        || expected_generation.is_some_and(|expected| expected != generation)
+        || pending_irp_canonical_id(exec_node).load(Ordering::Acquire) != canonical_irp_id
+        || pending_irp_raw_irp(exec_node).load(Ordering::Acquire) != raw_irp
+    {
+        return None;
+    }
+    let entry = read_volatile(pending_irp_entry_address(exec_node) as *const PendingIrp);
+    (entry.irp == raw_irp).then_some((generation, entry))
+}
+
+unsafe fn projected_registration(
+    instance_index: usize,
+    inst: DriverInstance,
+    ch: &crate::spawn_hosts::PumpChannel,
+    node: u64,
+    canonical_irp_id: u64,
+    raw_irp: u64,
+) -> Option<(SourceIrpAllocation, u64)> {
+    let active = active_hosted_irp_transfer_mut(ch.shared_va, canonical_irp_id)?;
+    if !ch.caps.dispatch_server
+        || active.source_instance != instance_index
+        || read_volatile((inst.exec_shared_va + SH_REQ_CONTROL_ID) as *const u64)
+            != canonical_irp_id
+        || read_volatile((inst.exec_shared_va + SH_ACTIVE_IRP) as *const u64) != raw_irp
+    {
+        return None;
+    }
+    let (node_generation, entry) = projected_node(
+        instance_index,
+        node,
+        canonical_irp_id,
+        raw_irp,
+        HOSTED_IRP_DISPATCHING,
+        None,
+    )?;
+    if entry.source_ticket_id != 0 || entry.source_ticket_generation != 0 {
+        return None;
+    }
+    let header =
+        hosted_pool_allocation_exec_va(inst.exec_pool_va, raw_irp, WDM_X64_IRP_SIZE as u64)?;
+    let stack_count = read_unaligned((header + WDM_X64_IRP_STACK_COUNT_OFFSET) as *const u8);
+    let bytes = (WDM_X64_IRP_SIZE as u64)
+        .checked_add((stack_count as u64).checked_mul(WDM_X64_IO_STACK_LOCATION_SIZE as u64)?)?;
+    let mut allocation = allocation_unlocked(instance_index, inst, raw_irp, bytes, stack_count)?;
+    allocation.owner = SourceIrpOwner::HostedCaller(instance_index);
+    Some((allocation, node_generation))
+}
+
+/// Allocation lifetime effects shared by authenticated ordinary and IRQ arena ingress.
+/// This does not admit IRPs or construct a logical caller on behalf of an interrupt lane.
+pub(super) fn retire_allocation(
+    instance_index: usize,
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    op: u64,
+    component_address: u64,
+) -> (i32, u64, u64) {
+    if !matches!(op, 2 | 3)
+        || component_address == 0
+        || !inst.used
+        || instance_domain_identity(inst) != Some(domain)
+    {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    }
+    let _guard = lock();
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    };
+    if op == 3
+        && auxiliary().protected_pool_child(
+            SourceIrpOwner::HostedDriver(instance_index),
+            domain,
+            component_address,
+        )
+    {
+        return (nt_status::NtStatus::PENDING.raw(), 0, 0);
+    }
+    let owner = ledger().allocation_for(
+        SourceIrpOwner::HostedDriver(instance_index),
+        domain,
+        component_address,
+    );
+    let Some(owner) = owner else {
+        return if op == 3
+            && unsafe { hosted_instance_pool_allocation_is_free_unlocked(inst, component_address) }
+                == Some(false)
+            && unsafe { hosted_instance_pool_free_unlocked(inst, component_address) }
+        {
+            (STATUS_SUCCESS, 0, 0)
+        } else {
+            (STATUS_INVALID_HANDLE, 0, 0)
+        };
+    };
+    if allocation_unlocked(instance_index, inst, component_address, owner.bytes, owner.stack_count)
+        != Some(owner)
+    {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    }
+    match ledger().prepare_driver_free(instance_index, domain, component_address) {
+        Ok(SourceIrpRetirement::Retired(ticket)) => {
+            if !unsafe { hosted_instance_pool_free_unlocked(inst, component_address) } {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            }
+            if ledger().retire(ticket, owner).is_err() {
+                unsafe {
+                    crate::provider_bugcheck::report(
+                        0xc4,
+                        [FSD_SERVICE_SOURCE_IRP_LABEL, op, component_address, ticket.id.get()],
+                    );
+                }
+            }
+            match auxiliary().retire(ticket, owner) {
+                Ok(_) | Err(SourceIrpAuxiliaryError::NotFound) => {}
+                Err(_) => unsafe {
+                    crate::provider_bugcheck::report(
+                        0xc4,
+                        [FSD_SERVICE_SOURCE_IRP_LABEL, 6, component_address, ticket.id.get()],
+                    );
+                },
+            }
+            (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get())
+        }
+        Ok(SourceIrpRetirement::Deferred(ticket)) => (
+            nt_status::NtStatus::PENDING.raw(),
+            ticket.id.get(),
+            ticket.generation.get(),
+        ),
+        Err(SourceIrpLedgerError::Pinned) => (nt_status::NtStatus::DELETE_PENDING.raw(), 0, 0),
+        Err(_) => (STATUS_INVALID_HANDLE, 0, 0),
+    }
+}
+
 pub(super) fn service(
     ch: &crate::spawn_hosts::PumpChannel,
     op: u64,
@@ -120,8 +728,59 @@ pub(super) fn service(
                 Err(_) => (STATUS_INVALID_PARAMETER, 0, 0),
             }
         }
-        2 | 3 if bytes == 0 && stack_count == 0 => {
+        4 if bytes == 0 && stack_count == 0 => {
             let Some(domain) = instance_domain_identity(inst) else {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            };
+            let Some(caller) = hosted_driver_caller(instance_index, inst, caller_badge) else {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            };
+            let expected_thread = match unsafe { crate::provider_registry_caller::resolve(ch) }
+                .and_then(|native_caller| unsafe {
+                    driver_ps_context::project(inst, native_caller)
+                        .map(|(_, _, _, thread, _)| thread)
+                }) {
+                Ok(thread) if thread != 0 => thread,
+                _ => return (STATUS_INVALID_HANDLE, 0, 0),
+            };
+            let _guard = lock();
+            let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) })
+            else {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            };
+            let Some((ticket, source)) = ledger().registered(
+                SourceIrpOwner::HostedDriver(instance_index),
+                domain,
+                component_address,
+            ) else {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            };
+            let Some(owner) = (unsafe {
+                capture_auxiliary_unlocked(
+                    instance_index,
+                    inst,
+                    &caller,
+                    expected_thread,
+                    ticket,
+                    source,
+                )
+            }) else {
+                return (STATUS_INVALID_PARAMETER, 0, 0);
+            };
+            match auxiliary().register(owner) {
+                Ok(()) => (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get()),
+                Err(SourceIrpAuxiliaryError::NoCapacity) => (STATUS_INSUFFICIENT_RESOURCES, 0, 0),
+                Err(SourceIrpAuxiliaryError::AlreadyLive) => {
+                    (nt_status::NtStatus::OBJECT_NAME_COLLISION.raw(), 0, 0)
+                }
+                Err(_) => (STATUS_INVALID_PARAMETER, 0, 0),
+            }
+        }
+        5 if bytes == 0 && stack_count == 0 => {
+            let Some(domain) = instance_domain_identity(inst) else {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            };
+            let Some(_caller) = hosted_driver_caller(instance_index, inst, caller_badge) else {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             };
             let _guard = lock();
@@ -129,66 +788,160 @@ pub(super) fn service(
             else {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             };
-            let owner = ledger().allocation_for(
+            let Some((ticket, source)) = ledger().registered(
                 SourceIrpOwner::HostedDriver(instance_index),
                 domain,
                 component_address,
-            );
-            let Some(owner) = owner else {
-                return if op == 3
-                    && unsafe {
-                        hosted_instance_pool_allocation_is_free_unlocked(inst, component_address)
-                    } == Some(false)
-                    && unsafe { hosted_instance_pool_free_unlocked(inst, component_address) }
-                {
-                    (STATUS_SUCCESS, 0, 0)
-                } else {
-                    (STATUS_INVALID_HANDLE, 0, 0)
-                };
+            ) else {
+                return (STATUS_INVALID_HANDLE, 0, 0);
             };
-            if allocation_unlocked(
-                instance_index,
-                inst,
-                component_address,
-                owner.bytes,
-                owner.stack_count,
-            ) != Some(owner)
+            let Ok((owner, phase)) = auxiliary().snapshot(ticket, source) else {
+                return (nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.raw(), 0, 0);
+            };
+            if phase != SourceIrpAuxiliaryPhase::Protected
+                || !unsafe { auxiliary_matches_unlocked(instance_index, inst, owner, phase) }
             {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             }
-            match ledger().prepare_free(
-                SourceIrpOwner::HostedDriver(instance_index),
-                domain,
-                component_address,
-            ) {
-                Ok(SourceIrpRetirement::Retired(ticket)) => {
-                    if !unsafe { hosted_instance_pool_free_unlocked(inst, component_address) } {
-                        return (STATUS_INVALID_HANDLE, 0, 0);
-                    }
-                    if ledger().retire(ticket, owner).is_err() {
-                        unsafe {
-                            crate::provider_bugcheck::report(
-                                0xc4,
-                                [
-                                    FSD_SERVICE_SOURCE_IRP_LABEL,
-                                    op,
-                                    component_address,
-                                    ticket.id.get(),
-                                ],
-                            );
-                        }
-                    }
-                    (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get())
-                }
-                Ok(SourceIrpRetirement::Deferred(ticket)) => (
-                    nt_status::NtStatus::PENDING.raw(),
-                    ticket.id.get(),
+            match auxiliary().begin_completion(ticket, source) {
+                Ok(owner) => (
+                    STATUS_SUCCESS,
+                    owner.transfer_buffer.map_or(0, memory_bytes),
                     ticket.generation.get(),
                 ),
-                Err(SourceIrpLedgerError::Pinned) => {
-                    (nt_status::NtStatus::DELETE_PENDING.raw(), 0, 0)
-                }
                 Err(_) => (STATUS_INVALID_HANDLE, 0, 0),
+            }
+        }
+        2 | 3 if bytes == 0 && stack_count == 0 => {
+            let Some(domain) = instance_domain_identity(inst) else {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            };
+            retire_allocation(instance_index, inst, domain, op, component_address)
+        }
+        6 => {
+            let node = component_address;
+            let canonical_irp_id = bytes;
+            let raw_irp = stack_count;
+            let _guard = lock();
+            let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) })
+            else {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            };
+            let Some((allocation, node_generation)) = (unsafe {
+                projected_registration(instance_index, inst, ch, node, canonical_irp_id, raw_irp)
+            }) else {
+                return (STATUS_INVALID_PARAMETER, 0, 0);
+            };
+            if caller_projections().iter().any(|row| {
+                row.allocation.domain == allocation.domain
+                    && (row.allocation.component_address == raw_irp
+                        || row.node == node && row.node_generation == node_generation)
+            }) || ledger()
+                .registered(
+                    SourceIrpOwner::HostedDriver(instance_index),
+                    allocation.domain,
+                    raw_irp,
+                )
+                .is_some()
+            {
+                return (nt_status::NtStatus::OBJECT_NAME_COLLISION.raw(), 0, 0);
+            }
+            if caller_projections().try_reserve(1).is_err() {
+                return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
+            }
+            let ticket = match ledger().register(allocation) {
+                Ok(ticket) => ticket,
+                Err(SourceIrpLedgerError::Exhausted) => {
+                    return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
+                }
+                Err(SourceIrpLedgerError::AlreadyLive) => {
+                    return (nt_status::NtStatus::OBJECT_NAME_COLLISION.raw(), 0, 0);
+                }
+                Err(_) => return (STATUS_INVALID_PARAMETER, 0, 0),
+            };
+            caller_projections().push(CallerProjection {
+                ticket,
+                allocation,
+                node,
+                node_generation,
+                canonical_irp_id,
+            });
+            (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get())
+        }
+        7 | 8 => {
+            let Some(domain) = instance_domain_identity(inst) else {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            };
+            let Some(ticket) = SourceIrpTicket::new(domain, component_address, bytes) else {
+                return (STATUS_INVALID_PARAMETER, 0, 0);
+            };
+            let raw_irp = stack_count;
+            let _guard = lock();
+            let Some(row) = caller_projections()
+                .iter()
+                .find(|row| row.ticket == ticket && row.allocation.component_address == raw_irp)
+                .copied()
+            else {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            };
+            if row.allocation.owner != SourceIrpOwner::HostedCaller(instance_index)
+                || unsafe {
+                    projected_node(
+                        instance_index,
+                        row.node,
+                        row.canonical_irp_id,
+                        raw_irp,
+                        HOSTED_IRP_CONSUMING,
+                        Some(row.node_generation),
+                    )
+                }
+                .is_none_or(|(_, entry)| {
+                    entry.source_ticket_id != ticket.id.get()
+                        || entry.source_ticket_generation != ticket.generation.get()
+                })
+            {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            }
+            let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) })
+            else {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            };
+            if op == 7 {
+                let mut current = allocation_unlocked(
+                    instance_index,
+                    inst,
+                    raw_irp,
+                    row.allocation.bytes,
+                    row.allocation.stack_count,
+                );
+                if let Some(allocation) = current.as_mut() {
+                    allocation.owner = SourceIrpOwner::HostedCaller(instance_index);
+                }
+                if current != Some(row.allocation) {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                }
+                match ledger().begin_hosted_caller_retirement(ticket, row.allocation) {
+                    Ok(()) => (STATUS_SUCCESS, 0, 0),
+                    Err(SourceIrpLedgerError::Pinned) => {
+                        (nt_status::NtStatus::DELETE_PENDING.raw(), 0, 0)
+                    }
+                    Err(_) => (STATUS_INVALID_HANDLE, 0, 0),
+                }
+            } else {
+                if unsafe { hosted_instance_pool_allocation_is_free_unlocked(inst, raw_irp) }
+                    != Some(true)
+                    || ledger()
+                        .finish_hosted_caller_retirement(ticket, row.allocation)
+                        .is_err()
+                {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                }
+                let index = caller_projections()
+                    .iter()
+                    .position(|candidate| candidate.ticket == ticket)
+                    .expect("finished caller IRP lost its root-side projection receipt");
+                caller_projections().swap_remove(index);
+                (STATUS_SUCCESS, 0, 0)
             }
         }
         _ => (STATUS_INVALID_PARAMETER, 0, 0),
@@ -206,22 +959,37 @@ pub(super) fn pin(
     }
     let _guard = lock();
     let (ticket, owner) = ledger()
-        .pin(
-            SourceIrpOwner::HostedDriver(instance_index),
-            domain,
-            component_address,
-        )
+        .pin_hosted_forward(instance_index, domain, component_address)
         .ok()?;
-    if allocation(
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
+        let _ = ledger().unpin(ticket);
+        return None;
+    };
+    let mut current = allocation_unlocked(
         instance_index,
         inst,
         component_address,
         owner.bytes,
         owner.stack_count,
-    ) != Some(owner)
-    {
+    );
+    if let Some(allocation) = current.as_mut() {
+        allocation.owner = owner.owner;
+    }
+    if current != Some(owner) {
         let _ = ledger().unpin(ticket);
         return None;
+    }
+    match auxiliary().snapshot(ticket, owner) {
+        Ok((auxiliary, phase))
+            if phase == SourceIrpAuxiliaryPhase::Protected
+                && unsafe {
+                    auxiliary_matches_unlocked(instance_index, inst, auxiliary, phase)
+                } => {}
+        Err(SourceIrpAuxiliaryError::NotFound) => {}
+        _ => {
+            let _ = ledger().unpin(ticket);
+            return None;
+        }
     }
     Some((ticket, owner))
 }
@@ -232,7 +1000,49 @@ pub(super) fn matches(
     ticket: SourceIrpTicket,
 ) -> bool {
     let _guard = lock();
-    ledger().matches(SourceIrpOwner::HostedDriver(instance_index), owner, ticket)
+    if !matches!(
+        owner.owner,
+        SourceIrpOwner::HostedDriver(instance) | SourceIrpOwner::HostedCaller(instance)
+            if instance == instance_index
+    ) || !ledger().matches(owner.owner, owner, ticket)
+    {
+        return false;
+    }
+    let Some(inst) = instance(instance_index) else {
+        return false;
+    };
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
+        return false;
+    };
+    let mut current = allocation_unlocked(
+        instance_index,
+        inst,
+        owner.component_address,
+        owner.bytes,
+        owner.stack_count,
+    );
+    if let Some(allocation) = current.as_mut() {
+        allocation.owner = owner.owner;
+    }
+    if current != Some(owner) {
+        return false;
+    }
+    match auxiliary().snapshot(ticket, owner) {
+        Ok((auxiliary, phase)) => unsafe {
+            auxiliary_matches_unlocked(instance_index, inst, auxiliary, phase)
+        },
+        Err(SourceIrpAuxiliaryError::NotFound) => true,
+        Err(_) => false,
+    }
+}
+
+pub(super) fn mdl_release_allowed(
+    instance_index: usize,
+    domain: HostedDomainIdentity,
+    mdl: u64,
+) -> bool {
+    let _guard = lock();
+    !auxiliary().protected_pool_child(SourceIrpOwner::HostedDriver(instance_index), domain, mdl)
 }
 
 pub(super) fn unpin(ticket: SourceIrpTicket) -> bool {

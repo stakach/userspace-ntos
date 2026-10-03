@@ -43,6 +43,10 @@ pub(crate) unsafe fn run_hosted(
     let Ok(resume) = admitted else {
         return None;
     };
+    let admitted_dispatch = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+        .active_dispatch_identity(lane)
+        .expect("resumed provider retains its dispatch identity")
+        .expect("resumed provider retains an active dispatch");
     let provider_resume = matches!(continuation.pending, PendingComponentDispatch::Provider(_));
     if provider_resume {
         PROVIDER_WAIT_RESUMES.fetch_add(1, Ordering::Relaxed);
@@ -99,6 +103,19 @@ pub(crate) unsafe fn run_hosted(
             }
         }
     };
+    // An authenticated interim Call may replace the lane's Reply while the provider runs.
+    // Its dispatch epoch and physical executor remain the same, but the pre-pump Reply is stale.
+    let current_binding = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+        .binding(lane)
+        .expect("provider return retains its exact lane");
+    assert_eq!(current_binding.executor_id, lane_resume.binding.executor_id);
+    assert_eq!(current_binding.receive_endpoint, lane_resume.binding.receive_endpoint);
+    let dispatch = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+        .active_dispatch_identity(lane)
+        .expect("provider return retains its dispatch identity")
+        .expect("provider return retains an active dispatch");
+    assert_eq!(dispatch, admitted_dispatch);
+    let reply_object = current_binding.reply_object;
     match pump_completion {
         ComponentPumpCompletion::Completed(dispatch) => {
             (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))

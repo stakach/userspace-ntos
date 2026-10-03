@@ -151,8 +151,8 @@ pub(super) fn owns_root_cap(cap: u64) -> bool {
     }
 }
 
-/// This entire branch is owned by Ps, including unallocated addresses. Until exact provider
-/// grants are wired, every provider fault here is refused before client/private mapping paths.
+/// This entire branch is owned by Ps, including unallocated addresses. Provider publication
+/// must acknowledge its exact alias first; faults never authorize anonymous client backing.
 pub(super) fn contains_address(address: u64) -> bool {
     (PS_OBJECT_ARENA_BASE..PS_OBJECT_ARENA_LIMIT).contains(&address)
 }
@@ -232,6 +232,52 @@ pub(super) enum PublishedBody {
     Thread,
 }
 
+/// Read provider-published Win32Thread state from this owner's acknowledged canonical body.
+/// The PM mirror may not yet have been imported while the provider's dispatch is still entered.
+pub(super) fn read_thread_win32(
+    pm: &ProcessManager,
+    lifetime: ThreadLifetime,
+) -> Result<u64, u32> {
+    let _borrow = Borrow::acquire()?;
+    let arena = unsafe { &*core::ptr::addr_of!(ARENA) }
+        .as_ref()
+        .ok_or(INVALID)?;
+    arena.validate(pm)?;
+    if pm.thread_lifetime(lifetime.thread_id()) != Some(lifetime) {
+        return Err(INVALID);
+    }
+    let body = pm
+        .thread_kernel_object(lifetime.thread_id())
+        .ok_or(INVALID)?;
+    if lifetime == arena.root.system.thread() {
+        let initial = ps_bootstrap::initial_system_projection().ok_or(INVALID)?;
+        if initial.identity != arena.root.system || body != initial.thread_body {
+            return Err(INVALID);
+        }
+        // These constructor-owned static pages remain mapped in the executive image.
+    } else {
+        let index = arena
+            .existing(BodyId::Thread(lifetime.thread_id()))
+            .ok_or(INVALID)?;
+        let row = &arena.rows[index];
+        if row.phase != BodyPhase::Published
+            || row.current_thread_lifetime != Some(lifetime)
+            || row.page.descriptor().address != body
+            || !row.page.is_initialized()
+            || !row
+                .page
+                .live_alias(MappingTarget::Executive(arena.root))
+                .is_some_and(|(cap, rights)| cap != 0 && rights == ROOT_ALIAS_RIGHTS)
+        {
+            return Err(INVALID);
+        }
+    }
+    let field = body
+        .checked_add(abi::KTHREAD_WIN32_THREAD as u64)
+        .ok_or(INVALID)?;
+    Ok(unsafe { core::ptr::read_volatile(field as *const u64) })
+}
+
 /// # Safety
 /// Root has admitted this provider to operate on the exact current PM thread/process objects.
 /// This must finish before provider execution, and may not pump component IPC while borrowed.
@@ -278,18 +324,94 @@ pub(super) unsafe fn grant_published_body(
             index
         }
     };
-    if arena.rows[index].phase != BodyPhase::Published { return Err(INVALID); }
-    let _durable = allocator::enter_durable();
-    let row = &mut arena.rows[index];
-    let mut io = Io {
-        paging: &mut arena.paging,
-        providers: &mut arena.providers,
-        root: arena.root,
-        scratch_base,
-        address: row.page.descriptor().address,
-        borrow: &borrow,
+    arena.map_published_row(index, target, scratch_base, &borrow)
+}
+
+/// Project an already referenced canonical Ps body before publishing its pointer to a provider.
+///
+/// # Safety
+/// The caller holds the newly acquired PM pointer reference until this operation returns and
+/// authenticates `target` from the physical service caller. No component IPC may be pumped while
+/// PM or this arena is borrowed. Failed mapping effects remain owned by the canonical page even
+/// when the caller rolls back its unpublished pointer reference.
+pub(super) unsafe fn grant_referenced_body(
+    pm: &ProcessManager,
+    body: u64,
+    target: ProviderRoot,
+    scratch_base: u64,
+) -> Result<(), u32> {
+    let borrow = Borrow::acquire()?;
+    let arena = (&mut *core::ptr::addr_of_mut!(ARENA))
+        .as_mut()
+        .ok_or(INVALID)?;
+    arena.validate(pm)?;
+    arena.providers.mapping_root(target)?;
+    let initial = ps_bootstrap::initial_system_projection().ok_or(INVALID)?;
+    let mut dependent_process = None;
+    let index = if let Some(pid) = pm.pid_for_kernel_process_object(body) {
+        if pid == arena.root.system.process_id() {
+            if initial.identity != arena.root.system || body != initial.process_body {
+                return Err(INVALID);
+            }
+            // This constructor's dedicated image page is retained by the provider image owner.
+            return Ok(());
+        }
+        let index = arena.existing(BodyId::Process(pid)).ok_or(INVALID)?;
+        if arena.rows[index].page.descriptor().address != body {
+            return Err(INVALID);
+        }
+        index
+    } else if let Some(tid) = pm.tid_for_kernel_thread_object(body) {
+        let lifetime = pm.thread_lifetime(tid).ok_or(INVALID)?;
+        if lifetime == arena.root.system.thread() {
+            if initial.identity != arena.root.system || body != initial.thread_body {
+                return Err(INVALID);
+            }
+            return Ok(());
+        }
+        let index = arena.existing(BodyId::Thread(tid)).ok_or(INVALID)?;
+        if arena.rows[index].page.descriptor().address != body
+            || arena.rows[index].current_thread_lifetime != Some(lifetime)
+        {
+            return Err(INVALID);
+        }
+        let Initialization::Thread { fields, .. } =
+            arena.rows[index].page.descriptor().initialization
+        else {
+            return Err(INVALID);
+        };
+        let process_body = fields.process_body.0;
+        if pm.process_kernel_object(lifetime.process_id()) != Some(process_body) {
+            return Err(INVALID);
+        }
+        if lifetime.process_id() == arena.root.system.process_id() {
+            if initial.identity != arena.root.system || process_body != initial.process_body {
+                return Err(INVALID);
+            }
+        } else {
+            let process_index = arena
+                .existing(BodyId::Process(lifetime.process_id()))
+                .ok_or(INVALID)?;
+            if arena.rows[process_index].page.descriptor().address != process_body
+                || arena.rows[process_index].phase != BodyPhase::Published
+            {
+                return Err(INVALID);
+            }
+            dependent_process = Some(process_index);
+        }
+        index
+    } else {
+        return Err(INVALID);
     };
-    row.page.map_alias(MappingTarget::Provider(target), ROOT_ALIAS_RIGHTS, &mut io)
+    if arena.rows[index].phase != BodyPhase::Published {
+        return Err(INVALID);
+    }
+    if let Some(process_index) = dependent_process {
+        // PM process_object_delete_blockers includes this thread's pointer references, so the
+        // acquired ETHREAD reference also prevents withdrawal of its owning EPROCESS.
+        arena.map_published_row(process_index, target, scratch_base, &borrow)?;
+    }
+    arena.map_published_row(index, target, scratch_base, &borrow)
 }
 
 /// # Safety
@@ -329,6 +451,30 @@ impl FrameRelease<'_> {
 }
 
 impl Arena {
+    fn map_published_row(
+        &mut self,
+        index: usize,
+        target: ProviderRoot,
+        scratch_base: u64,
+        borrow: &Borrow,
+    ) -> Result<(), u32> {
+        let row = self.rows.get_mut(index).ok_or(INVALID)?;
+        if row.phase != BodyPhase::Published {
+            return Err(INVALID);
+        }
+        let _durable = allocator::enter_durable();
+        let mut io = Io {
+            paging: &mut self.paging,
+            providers: &mut self.providers,
+            root: self.root,
+            scratch_base,
+            address: row.page.descriptor().address,
+            borrow,
+        };
+        row.page
+            .map_alias(MappingTarget::Provider(target), ROOT_ALIAS_RIGHTS, &mut io)
+    }
+
     fn validate(&self, pm: &ProcessManager) -> Result<(), u32> {
         if pm.initial_system_identity() == Some(self.root.system) {
             Ok(())
@@ -395,8 +541,8 @@ impl Arena {
     }
 }
 
-/// Prepare fresh unpublished storage only. This deliberately does not change PM lookup or
-/// win32k dispatch; callers may publish only in the later, complete provider/retirement cutover.
+/// Prepare fresh unpublished storage without changing PM lookup or provider dispatch. Publish
+/// only after initialization and canonical ownership admission have completed.
 pub(super) unsafe fn prepare_process(
     pm: &ProcessManager,
     pid: ProcessId,
@@ -534,6 +680,28 @@ pub(super) unsafe fn abort_unpublished(
     Ok(())
 }
 
+pub(super) unsafe fn abort_prepared_thread(
+    pm: &ProcessManager,
+    lifetime: ThreadLifetime,
+    scratch_base: u64,
+) -> Result<(), u32> {
+    let body = {
+        let _borrow = Borrow::acquire()?;
+        let arena = (&*core::ptr::addr_of!(ARENA)).as_ref().ok_or(INVALID)?;
+        arena.validate(pm)?;
+        arena.existing(BodyId::Thread(lifetime.thread_id())).and_then(|index| {
+            let row = &arena.rows[index];
+            (row.phase == BodyPhase::Prepared
+                && row.current_thread_lifetime == Some(lifetime))
+                .then_some(row.page.descriptor().address)
+        })
+    };
+    if let Some(body) = body {
+        abort_unpublished(pm, body, scratch_base)?;
+    }
+    Ok(())
+}
+
 /// Publish only already initialized storage. PM preflights both pointers and the exact thread
 /// activation before either becomes visible. No syscall/allocation/reentry separates its commit
 /// from these sticky ownership phases; withdrawal can never make the rows abortable again.
@@ -618,9 +786,14 @@ pub(super) unsafe fn commit_thread_activation(
     };
     let row = &mut arena.rows[index];
     let body = row.page.descriptor().address;
-    if row.phase != BodyPhase::Published
+    if !matches!(row.phase, BodyPhase::Prepared | BodyPhase::Published)
+        || !row.page.is_initialized()
         || row.current_thread_lifetime != Some(plan.expected_lifetime())
-        || pm.thread_kernel_object(plan.thread_id()) != Some(body)
+        || pm.thread_kernel_object(plan.thread_id()) != match row.phase {
+            BodyPhase::Prepared => None,
+            BodyPhase::Published => Some(body),
+            BodyPhase::Retiring { .. } => return Err(INVALID),
+        }
         || row
             .page
             .live_alias(MappingTarget::Executive(arena.root))
@@ -639,11 +812,18 @@ pub(super) unsafe fn commit_thread_activation(
     fields.system_thread = pm.thread(plan.thread_id()).ok_or(INVALID)?.is_system_thread;
     let bytes = core::slice::from_raw_parts_mut(body as *mut u8, abi::ETHREAD_BODY_BYTES);
     abi::validate_thread_activation(bytes, fields).map_err(|_| INVALID)?;
-    pm.commit_thread_activation_with_handle(plan, handle)?;
+    match row.phase {
+        BodyPhase::Prepared => {
+            pm.commit_thread_activation_with_handle_and_object(plan, handle, body)?;
+        }
+        BodyPhase::Published => pm.commit_thread_activation_with_handle(plan, handle)?,
+        BodyPhase::Retiring { .. } => unreachable!(),
+    }
     // Both owners remain exclusively borrowed. No allocation, syscall or provider byte write can
     // invalidate the preflight between PM generation publication and these bounded field writes.
     abi::refresh_thread_activation(bytes, fields).expect("exclusive prevalidated ETHREAD refresh");
     row.current_thread_lifetime = pm.thread_lifetime(plan.thread_id());
+    row.phase = BodyPhase::Published;
     Ok(())
 }
 

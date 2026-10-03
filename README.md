@@ -72,6 +72,9 @@ cross-domain driver READ, FLUSH, and buffered QUERY_INFORMATION requests,
 including immediate and pending completion through the source driver's event
 and IOSB. READ and QUERY_INFORMATION check exact output bytes; FLUSH checks
 zero completion information.
+The optional `tests/native/source_irp/run.sh` profile checks real fileless READ/WRITE
+and all four IOCTL methods through win32k, including immediate and pending completion.
+It verifies bytes, IOSBs and retirement counters; production images omit its fixtures.
 
 The kernel is a **pinned git submodule**, not vendored source: `userspace-ntos`
 depends on an exact kernel SHA (its syscall/invocation ABI is tightly coupled),
@@ -112,8 +115,9 @@ in `extern-rootserver` mode (bring your own root task).
 
 The desktop target hosts **real, unmodified GPL ReactOS binaries** on rust-micro.
 Current restoration and genuine Explorer acceptance are tracked in
-[issue #18](https://github.com/stakach/userspace-ntos/issues/18); crate CI does not
-prove desktop boot. To attempt a boot from a fresh clone:
+[issue #88](https://github.com/stakach/userspace-ntos/issues/88), with broader
+native acceptance in [issue #18](https://github.com/stakach/userspace-ntos/issues/18).
+Crate CI does not prove desktop boot. To attempt a boot from a fresh clone:
 
 ```sh
 git clone --recursive https://github.com/stakach/userspace-ntos.git
@@ -153,38 +157,29 @@ self-contained launcher that:
    the full Explorer gate.
 5. **Boots QEMU.**
 
-### Historical boot output
+### Desktop Acceptance
 
-The output below records an earlier background-paint gate, not current Explorer
-shell acceptance. A painted background alone is not desktop proof.
+Headless mode streams the serial log and checks the complete executive summary,
+the success sentinel, and `PASS exec_explorer_shell_chrome_painted`. This gate
+requires genuine Explorer execution, client callbacks, GDI drawing, and varied
+framebuffer pixels. Background painting or a login dialog alone is not desktop proof.
 
-Headless (default) — the serial log streams to your terminal and ends with the
-executive's success sentinel; `run.sh` then prints a clear verdict:
+The [feature-off production scanout](docs/images/desktop-production.png) records
+genuine Explorer taskbar and Start-button rendering after a fresh profile setup.
+The [source-instrumented scanout](docs/images/desktop-source-irp.png) accompanies
+the strict native source-IRP completion and retirement gate on the same kernel code.
+This is desktop-chrome evidence, not a complete executive-gate pass; remaining
+whole-OS acceptance is tracked in [issue #18](https://github.com/stakach/userspace-ntos/issues/18).
 
-```
-  PASS exec_win32k_desktop_painted
-[ntos-exec] desktop-bg match 768/768 px, px0=0x003a6ea5 (expected 0x003a6ea5)
-[user-callback] rendezvous=119 winlogon-api0=117 table-nonzero-aligned=1 real-api0-redirects=1 real-api0-returns=1 continuation-pushes=7 continuation-unwinds=7 nested-dispatches=5 nested-ssn-1298=1 nested-ssn-126b=4 sequence-completions=1
-  PASS exec_user_callback_real_api0_nested_roundtrip
-  PASS exec_desktop_shell_frontier
-[ntos-exec summary: 273/273 executive->isolated-service checks passed]
-[microtest done]
-SUCCESS — the ReactOS stack booted and the win32k desktop painted (0x003a6ea5).
-```
-
-`--desktop` — a QEMU window opens showing the **real painted desktop**: win32k
-authentically fills the Simpleboot GOP framebuffer with the ReactOS desktop
-background colour `0x003a6ea5` (RGB 58,110,165) via winlogon's natural
-`SwitchDesktop` flow. This is a genuine graphics path (the real ReactOS
-`win32k.sys` + `framebuf.dll` display driver + `ftfd.dll`/Arial font stack), not
-a stub or a mock. This mode intentionally does not exit at `[microtest done]`; the
-terminal remains attached to QEMU and the window persists so you can inspect it.
-Close the QEMU window to quit. Use the default headless mode for an automated
-pass/fail result.
+`--desktop` opens a QEMU window using the real ReactOS `win32k.sys`, display driver,
+and font stack. Boot readiness is the Explorer chrome gate, not the earlier
+`desktop-bg match` message. The launcher bounds boot to one hour and allows a short
+inspection interval after readiness; close the window to quit. Use headless mode
+for an automated pass/fail result.
 
 **Expected run time:** the headless gate can take several minutes under QEMU TCG, especially on
 Apple Silicon, and DLL-loading phases can be quiet for tens of seconds. `--desktop` opens the
-window before win32k paints it; use the serial `desktop-bg match 768/768` line as the ready signal.
+window before win32k paints it; wait for `PASS exec_explorer_shell_chrome_painted`.
 The first run also adds the one-time ReactOS download and a full `cargo` build.
 
 **Gotchas:**

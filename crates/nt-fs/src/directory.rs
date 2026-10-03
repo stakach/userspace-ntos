@@ -12,6 +12,7 @@ pub const MAX_DIRECTORY_NAME: usize = 260;
 pub const MAX_SHORT_NAME: usize = 12;
 const OPEN_SLOT_BITS: u32 = 16;
 const OPEN_SLOT_MASK: u32 = (1 << OPEN_SLOT_BITS) - 1;
+pub const MAX_FAT_OPEN_SLOTS: usize = OPEN_SLOT_MASK as usize + 1;
 
 fn open_id(index: usize, generation: u32) -> u32 {
     (generation << OPEN_SLOT_BITS) | index as u32
@@ -234,15 +235,15 @@ impl DirectoryOpenSlot {
 }
 
 pub struct DirectoryOpenTable<const SLOTS: usize> {
-    slots: [DirectoryOpenSlot; SLOTS],
+    slots: Vec<DirectoryOpenSlot>,
 }
 
 impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
     pub const fn new() -> Self {
         assert!(SLOTS > 0);
-        assert!(SLOTS <= OPEN_SLOT_MASK as usize + 1);
+        assert!(SLOTS <= MAX_FAT_OPEN_SLOTS);
         Self {
-            slots: [DirectoryOpenSlot::empty(); SLOTS],
+            slots: Vec::new(),
         }
     }
 
@@ -261,12 +262,22 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
         }
         let requested = crate::FileShareAccess::new(desired_access, share_access);
         self.check_share_access(volume_relative_path, metadata, requested)?;
-        let (index, slot) = self
+        let index = match self
             .slots
-            .iter_mut()
-            .enumerate()
-            .find(|(_, slot)| !slot.occupied && slot.generation <= u16::MAX as u32)
-            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+            .iter()
+            .position(|slot| !slot.occupied && slot.generation <= u16::MAX as u32)
+        {
+            Some(index) => index,
+            None if self.slots.len() < SLOTS => {
+                self.slots
+                    .try_reserve(1)
+                    .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+                self.slots.push(DirectoryOpenSlot::empty());
+                self.slots.len() - 1
+            }
+            None => return Err(STATUS_INSUFFICIENT_RESOURCES),
+        };
+        let slot = &mut self.slots[index];
         let mut path = [0; DIRECTORY_OPEN_PATH_CAP];
         path[..volume_relative_path.len()].copy_from_slice(volume_relative_path);
         *slot = DirectoryOpenSlot {
@@ -441,8 +452,7 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
 
     /// Drop every open description without constructing another table-sized value.
     ///
-    /// This is useful for fixed storage whose address must remain stable across an
-    /// executive service-loop restart.
+    /// Retain slot generations and allocated capacity across a service-loop restart.
     pub fn clear(&mut self) {
         for slot in &mut self.slots {
             if slot.occupied {
@@ -538,7 +548,7 @@ pub struct ReadOnlyFileOpenTable<const SLOTS: usize> {
 impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
     pub const fn new() -> Self {
         assert!(SLOTS > 0);
-        assert!(SLOTS <= OPEN_SLOT_MASK as usize + 1);
+        assert!(SLOTS <= MAX_FAT_OPEN_SLOTS);
         Self { slots: Vec::new() }
     }
 
@@ -1490,25 +1500,49 @@ mod tests {
 
     #[test]
     fn readonly_file_io_reference_survives_last_handle_cleanup() {
-        let mut table = ReadOnlyFileOpenTable::<1>::new();
+        let mut table = ReadOnlyFileOpenTable::<2>::new();
+        let metadata = crate::FileMetadata { end_of_file: 64, file_id: 41,
+            ..crate::FileMetadata::default() };
+        let options = crate::FILE_SYNCHRONOUS_IO_NONALERT;
         let object = table
             .create(
                 41,
                 64,
                 b"reactos\\system32\\ntdll.dll",
+                crate::FILE_READ_DATA,
                 0,
-                0,
-                0,
-                crate::FileMetadata::default(),
+                options,
+                metadata,
                 crate::FatShortName::EMPTY,
             )
             .unwrap();
+        assert_eq!(table.check_share(
+            b"reactos\\system32\\ntdll.dll", metadata, crate::FILE_READ_DATA, 0),
+            Err(STATUS_SHARING_VIOLATION));
         table.retain_io(object).unwrap();
+        table.get_mut(object).unwrap().current_offset = 17;
         table.release(object).unwrap();
         assert_eq!(table.is_final_reference(object), Err(STATUS_INVALID_HANDLE));
+        let body = table.get(object).unwrap();
+        assert_eq!(body.metadata, metadata);
+        assert_eq!(body.first_cluster, 41);
+        assert_eq!(body.size, 64);
+        assert_eq!(body.current_offset, 17);
+        assert_eq!(body.create_options, options);
+        let reopened = table.create(41, 64, b"reactos\\system32\\ntdll.dll",
+            crate::FILE_READ_DATA, 0, options, metadata, crate::FatShortName::EMPTY).unwrap();
+        assert_eq!(table.get(reopened).unwrap().current_offset, 0);
         assert_eq!(table.set_signaled(object, true), Ok(()));
         table.release_io(object).unwrap();
         assert_eq!(table.get(object), Err(STATUS_INVALID_HANDLE));
+        table.release(reopened).unwrap();
+        let reused = table.create(41, 64, b"reactos\\system32\\ntdll.dll",
+            crate::FILE_READ_DATA, 0, options, metadata, crate::FatShortName::EMPTY).unwrap();
+        assert_ne!(reused, object);
+        assert_eq!(table.retain_io(object), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.release_io(object), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.get_mut(object), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.get(reused).unwrap().current_offset, 0);
     }
 
     #[test]
@@ -1579,6 +1613,7 @@ mod tests {
     fn fat_open_generations_retire_instead_of_wrapping() {
         let metadata = crate::FileMetadata::default();
         let mut directories = DirectoryOpenTable::<1>::new();
+        directories.slots.push(DirectoryOpenSlot::empty());
         directories.slots[0].generation = u16::MAX as u32;
         let directory = directories
             .create(

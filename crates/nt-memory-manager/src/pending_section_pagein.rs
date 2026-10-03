@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::data_section::{DataSectionPageRead, DATA_PAGE_SIZE, STATUS_IO_DEVICE_ERROR};
+use crate::data_section::{DataSectionPageRead, DataSectionReadWindow, DATA_PAGE_SIZE, STATUS_IO_DEVICE_ERROR};
 use crate::{RoutedSectionLease, SectionIdentity};
 
 const STATUS_PENDING: u32 = 0x0000_0103;
@@ -32,7 +32,7 @@ struct Read<R, K> {
     section: SectionIdentity,
     lease: RoutedSectionLease,
     page_index: u64,
-    plan: DataSectionPageRead,
+    plan: DataSectionReadWindow,
     owner: R,
     key: Option<K>,
     phase: Phase,
@@ -63,6 +63,17 @@ impl<R, K: Copy + Eq> PendingSectionPageReads<R, K> {
         plan: DataSectionPageRead,
         owner: R,
     ) -> Result<PendingSectionPageReadId, R> {
+        self.reserve_window(section, lease, page_index, DataSectionReadWindow::from_page(plan), owner)
+    }
+
+    pub fn reserve_window(
+        &mut self,
+        section: SectionIdentity,
+        lease: RoutedSectionLease,
+        page_index: u64,
+        plan: DataSectionReadWindow,
+        owner: R,
+    ) -> Result<PendingSectionPageReadId, R> {
         if page_index.checked_mul(DATA_PAGE_SIZE as u64) != Some(plan.offset()) {
             return Err(owner);
         }
@@ -74,10 +85,10 @@ impl<R, K: Copy + Eq> PendingSectionPageReads<R, K> {
             return Err(owner);
         }
         let mut bytes = Vec::new();
-        if bytes.try_reserve_exact(DATA_PAGE_SIZE).is_err() {
+        if bytes.try_reserve_exact(plan.capacity()).is_err() {
             return Err(owner);
         }
-        bytes.resize(DATA_PAGE_SIZE, 0);
+        bytes.resize(plan.capacity(), 0);
         if self.store == 0 {
             let Ok(store) =
                 NEXT_STORE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -183,8 +194,7 @@ impl<R, K: Copy + Eq> PendingSectionPageReads<R, K> {
             Err(STATUS_IO_DEVICE_ERROR)
         } else {
             row.bytes[..row.plan.length()].copy_from_slice(&output[..row.plan.length()]);
-            let page: &mut [u8; DATA_PAGE_SIZE] = row.bytes.as_mut_slice().try_into().unwrap();
-            row.plan.complete(status, information as usize, page).map(|()| row.bytes)
+            row.plan.complete(status, information as usize, &mut row.bytes).map(|()| row.bytes)
         };
         Some((row.owner, result))
     }
@@ -237,9 +247,8 @@ impl<R, K: Copy + Eq> PendingSectionPageReads<R, K> {
         row.bytes[copied..copied + data.len()].copy_from_slice(data);
         let copied = copied + data.len();
         if copied == row.plan.length() {
-            let page: &mut [u8; DATA_PAGE_SIZE] = row.bytes.as_mut_slice().try_into().unwrap();
             row.plan
-                .complete(0, copied, page)
+                .complete(0, copied, &mut row.bytes)
                 .expect("exact staged page");
             row.phase = Phase::Ready;
         } else {

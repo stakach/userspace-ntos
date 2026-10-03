@@ -28,6 +28,7 @@ fn hive() -> Hive {
     hive.set_dword(config, "CurrentConfig", 7);
     hive.create_key(r"ControlSet001\Hardware Profiles\0007");
     hive.create_key(r"ControlSet001\Hardware Profiles\0009");
+    secure_fixture_hive(&mut hive);
     hive.finish_clean_import();
     hive
 }

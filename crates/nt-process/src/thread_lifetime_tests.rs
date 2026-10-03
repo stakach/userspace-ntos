@@ -157,6 +157,26 @@ fn activation_rejection_preserves_lifetime_and_prepared_plan() {
 }
 
 #[test]
+fn first_activation_publishes_exact_thread_body_atomically() {
+    let (mut pm, pid, tid) = dormant();
+    let before = pm.thread_lifetime(tid).unwrap();
+    let plan = prepare(&pm, tid).unwrap();
+    let reservation = pm.try_reserve_handle_slot(pid).unwrap();
+    pm.bind_reserved_handle(reservation, HandleObject::Thread(tid), THREAD_ALL_ACCESS)
+        .unwrap();
+    assert_eq!(
+        pm.commit_thread_activation_with_handle_and_object(plan, reservation, 0),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(pm.thread_lifetime(tid), Some(before));
+    assert_eq!(pm.thread_kernel_object(tid), None);
+    pm.commit_thread_activation_with_handle_and_object(plan, reservation, 0x20_0000)
+        .unwrap();
+    assert_ne!(pm.thread_lifetime(tid), Some(before));
+    assert_eq!(pm.thread_kernel_object(tid), Some(0x20_0000));
+}
+
+#[test]
 fn failed_first_resume_retires_unpublished_activation_without_rewinding_identity() {
     let (mut pm, pid, tid) = dormant();
     let main_tid = pm.process(pid).unwrap().main_thread.unwrap();

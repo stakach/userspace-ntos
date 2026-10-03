@@ -4,9 +4,9 @@
 //!
 //! win32k.sys imports **224** functions from `ntoskrnl.exe`, **1** from `hal.dll`
 //! (`KeQueryPerformanceCounter`, in [`crate::hal`]), and **34** `FT_*` FreeType
-//! functions from `ftfd.dll` (the font driver) — the FreeType imports have no
-//! kernel dependency and are intentionally out of scope here (see
-//! [`WIN32K_FTFD_IMPORTS`]).
+//! functions from `ftfd.dll` (the font driver). FreeType's win32k imports include
+//! forwarded kernel exports; those targets use the same canonical metadata below.
+//! The FT_* export names are listed separately in [`WIN32K_FTFD_IMPORTS`].
 //!
 //! Each descriptor's [`ExportStatus`](crate::ExportStatus) reflects how it is
 //! serviced: `Implemented`/`Partial` = wired to a real `nt-*` subsystem (or
@@ -16,6 +16,29 @@
 
 use crate::ExportStatus::*;
 use crate::{ExportDescriptor, ExportStatus};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ftfd_win32k_core_forwarders_have_canonical_metadata() {
+        for name in ["RtlMultiByteToUnicodeN", "KeBugCheckEx", "RtlUnwind"] {
+            assert!(
+                WIN32K_NTOSKRNL_IMPORTS.contains(&name),
+                "missing allowed core export {name}"
+            );
+            let descriptor = WIN32K_NTOSKRNL
+                .iter()
+                .chain(crate::ntoskrnl::NTOSKRNL.iter())
+                .find(|descriptor| descriptor.name == name && descriptor.dll == "ntoskrnl.exe")
+                .unwrap_or_else(|| panic!("missing canonical descriptor {name}"));
+            if name == "RtlUnwind" {
+                assert_eq!(descriptor.status, Implemented);
+            }
+        }
+    }
+}
 
 const fn e(name: &'static str, status: ExportStatus, notes: &'static str) -> ExportDescriptor {
     ExportDescriptor {
@@ -89,14 +112,14 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("PsThreadType", Partial, "data export: EPROCESS/ETHREAD object-type pointer (nt-object-manager)"),
     // --- Ke ---
     e("KeBugCheck", TrapIfCalled, "bugcheck: logs the code + panics (fail-loud)"),
-    e("KeSetKernelStackSwapEnable", StubSuccess, "no kernel-stack swapping on the host; returns prior state"),
+    e("KeSetKernelStackSwapEnable", Implemented, "exchanges the selected logical KTHREAD EnableStackSwap policy and returns its actual prior state"),
     e("KeAddSystemServiceTable", Partial, "records win32k's NtUser/NtGdi SSDT (base/count/table) in crate::ssdt for Phase 2 routing"),
     e("KeEnterCriticalRegion", Implemented, "checked native KTHREAD KernelApcDisable nesting via nt-kernel-exec"),
     e("KeLeaveCriticalRegion", Implemented, "checked native KTHREAD KernelApcDisable unwind via nt-kernel-exec"),
     e("KeUserModeCallback", TrapIfCalled, "user-mode callback needs the Phase 2 win32k<->client IPC path; traps until then"),
-    e("KeAttachProcess", Partial, "process-context attach tracked by nt-process; single address space on the host"),
-    e("KeDetachProcess", Partial, "process-context attach tracked by nt-process; single address space on the host"),
-    e("KeStackAttachProcess", Partial, "process-context attach tracked by nt-process; single address space on the host"),
+    e("KeAttachProcess", Implemented, "validated process-window attach with exact target lifetime and nested APC-state ownership"),
+    e("KeDetachProcess", Implemented, "restores the previous process window and retires the exact attach frame"),
+    e("KeStackAttachProcess", Implemented, "validated nested process-window attach with caller-owned KAPC_STATE"),
     e("KeInitializeTimer", Partial, "timer via nt-kernel-exec TimerQueue"),
     e("KeSetPriorityThread", Partial, "atomically returns and updates canonical ETHREAD priority through the executive Ps broker"),
     e("KeWaitForMultipleObjects", Partial, "single-threaded host: satisfied-or-poll-timeout wait via nt-kernel-exec; blocking waits require executive wait-broker wiring"),
@@ -106,7 +129,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("KePulseEvent", Partial, "event state via nt-kernel-exec EventStore"),
     e("KeWaitForSingleObject", Partial, "single-threaded host: satisfied-or-poll-timeout wait via nt-kernel-exec; blocking waits require executive wait-broker wiring"),
     e("KeReadStateEvent", Partial, "event state via nt-kernel-exec EventStore"),
-    e("KeUnstackDetachProcess", Partial, "process-context attach tracked by nt-process; single address space on the host"),
+    e("KeUnstackDetachProcess", Implemented, "restores the exact KAPC_STATE process window and attach generation"),
     // --- Ex ---
     e("ExDeleteResourceLite", Partial, "owner-checked native ERESOURCE deletion; contended waiter teardown awaits the wait broker"),
     e("ExInitializeResourceLite", Partial, "native x64 ERESOURCE layout with dynamic multi-reader owner table via nt-kernel-exec"),
@@ -114,17 +137,17 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("ExEnterCriticalRegionAndAcquireResourceShared", Partial, "checked APC nesting plus real shared ownership; blocking handoff awaits the wait broker"),
     e("ExEnterCriticalRegionAndAcquireResourceExclusive", Partial, "checked APC nesting plus real exclusive ownership; blocking handoff awaits the wait broker"),
     e("ExReleaseResourceAndLeaveCriticalRegion", Partial, "owner-checked ERESOURCE release followed by checked APC-disable unwind"),
-    e("ExGetPreviousMode", StubSuccess, "returns the caller's previous mode (UserMode for win32k syscalls)"),
+    e("ExGetPreviousMode", Implemented, "reads authenticated logical-thread PreviousMode retained across user dispatch, kernel callouts and parked continuations"),
     e("ExAcquireResourceExclusiveLite", Partial, "owner-aware recursive exclusive acquire; Wait=FALSE is exact and blocking handoff awaits the wait broker"),
     e("ExReleaseResourceLite", Partial, "owner-checked recursive ERESOURCE release with native field projection"),
-    e("ExRaiseAccessViolation", TrapIfCalled, "raises a structured exception; not modelled on the host, traps if reached"),
+    e("ExRaiseAccessViolation", Implemented, "raises through the native SEH support image and admitted exception context"),
     e("ExDesktopObjectType", Partial, "data export: object-type pointer (nt-object-manager)"),
     e("ExWindowStationObjectType", Partial, "data export: object-type pointer (nt-object-manager)"),
-    e("ExRaiseStatus", TrapIfCalled, "raises a structured exception; not modelled on the host, traps if reached"),
+    e("ExRaiseStatus", Implemented, "raises the supplied NTSTATUS through the native SEH support image"),
     e("ExpInterlockedPushEntrySList", Implemented, "native x64 SLIST_HEADER push with depth/sequence/header encoding"),
     e("ExpInterlockedPopEntrySList", Implemented, "native x64 SLIST_HEADER pop with depth/header encoding"),
     e("ExQueryDepthSList", Implemented, "reads the native x64 SLIST_HEADER depth field"),
-    e("ExInitializePagedLookasideList", StubSuccess, "lookaside falls back to the pool arena"),
+    e("ExInitializePagedLookasideList", Partial, "initializes the x64 GENERAL_LOOKASIDE through nt-kernel-exec with supplied or pool-default callbacks; flags are not modeled"),
     e("ExAcquireResourceSharedLite", Partial, "recursive multi-reader acquire with native OWNER_ENTRY table; blocking handoff awaits the wait broker"),
     e("ExIsResourceAcquiredSharedLite", Partial, "returns the current thread's exact shared or exclusive recursion count"),
     e("ExAcquireFastMutexUnsafe", Partial, "native FAST_MUTEX count/owner acquire; blocking handoff awaits the wait broker"),
@@ -132,8 +155,12 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("ExEnterCriticalRegionAndAcquireFastMutexUnsafe", Partial, "checked APC nesting plus native FAST_MUTEX ownership; blocking handoff awaits the wait broker"),
     e("ExReleaseFastMutexUnsafeAndLeaveCriticalRegion", Partial, "owner-checked FAST_MUTEX release followed by checked APC-disable unwind"),
     e("ExAllocatePoolWithQuotaTag", Partial, "pool alloc routed to the Driver Host arena (quota/tag ignored)"),
-    e("ExfAcquirePushLockExclusive", StubSuccess, "push-lock is a no-op on the single-threaded host"),
-    e("ExfTryToWakePushLock", StubSuccess, "push-lock is a no-op on the single-threaded host"),
+    e("ExfAcquirePushLockExclusive", Partial, "NT lock-word CAS and intrusive pinned waiters block through canonical synchronization Events; priority boosting is not modeled"),
+    e("ExfAcquirePushLockShared", Partial, "NT shared-owner accounting and intrusive pinned waiters block through canonical synchronization Events; priority boosting is not modeled"),
+    e("ExfReleasePushLockExclusive", Partial, "NT exclusive release and WAKING responsibility wake exact pinned waiters; priority boosting is not modeled"),
+    e("ExfReleasePushLockShared", Partial, "NT saved shared-count release and final-owner wake of exact pinned waiters; priority boosting is not modeled"),
+    e("ExfReleasePushLock", Partial, "NT shared/exclusive release preserves intrusive waiter representation and canonical Event lifetime; priority boosting is not modeled"),
+    e("ExfTryToWakePushLock", Partial, "NT WAKING ownership and selective/all-waiter wake through canonical synchronization Events; priority boosting is not modeled"),
     e("ExAllocatePool", Partial, "pool alloc routed to the Driver Host arena (quota/tag ignored)"),
     e("ExSystemTimeToLocalTime", Implemented, "applies the live registry-derived system timezone bias through nt-kernel-exec"),
     e("ExEventObjectType", Partial, "data export: object-type pointer (nt-object-manager)"),
@@ -149,7 +176,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("ZwQueryValueKey", Partial, "queries CM-owned values with all native value-information layouts and exact sizing behavior"),
     e("ZwSetValueKey", Partial, "registry ops routed to nt-config-manager"),
     e("ZwDuplicateObject", Partial, "handle/directory-object ops routed to nt-object-manager"),
-    e("ZwOpenFile", StubSuccess, "file ops routed to nt-fs where mounted; else success with empty result (Phase 2 wiring)"),
+    e("ZwOpenFile", Partial, "captures an ordinary KernelMode open and routes it through retained canonical file-create work; unsupported capture forms fail explicitly"),
     e("ZwReadFile", Partial, "raw-input async reads route through authenticated File IRPs with pinned stack output/IOSB, File event delivery, and exact completion acknowledgement"),
     e("ZwCancelIoFile", Partial, "cancels and drains the current thread's canonical routed File IRPs before returning to win32k"),
     e("ZwQueryDefaultLocale", Implemented, "returns canonical live system or session default LCID state"),
@@ -168,8 +195,9 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("ZwQueryInformationFile", Partial, "authenticated win32k kernel-handle queries retain real routed File IRP completion and exact pool ownership"),
     e("ZwUnmapViewOfSection", Partial, "virtual-memory/section ops routed to nt-memory-manager/nt-address-space"),
     e("ZwMapViewOfSection", Partial, "virtual-memory/section ops routed to nt-memory-manager/nt-address-space"),
-    e("ZwCreateFile", StubSuccess, "file ops routed to nt-fs where mounted; else success with empty result (Phase 2 wiring)"),
-    e("ZwSetSystemInformation", StubSuccess, "system-information classes win32k needs return canned values; TODO Phase 2"),
+    e("ZwCreateFile", Partial, "captures an ordinary KernelMode create and routes it through retained canonical file-create work; unsupported capture forms fail explicitly"),
+    e("ZwSetSystemInformation", Partial, "KernelMode GDI image load uses authenticated checked dependencies and pinned opaque module handles; unsupported unload retains ownership and fails explicitly"),
+    e("NtSetSystemInformation", Partial, "GDI image classes validate exact lengths and caller PreviousMode before authenticated image loading; unsupported classes and unload fail explicitly"),
     e("ZwClose", Partial, "handle/directory-object ops routed to nt-object-manager"),
     // --- Rtl ---
     e("RtlGetDefaultCodePage", Implemented, "returns the validated CP1252/CP437 table identities"),
@@ -216,25 +244,26 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("RtlNumberOfSetBits", Partial, "RTL_BITMAP ops over the caller's buffer"),
     e("RtlTestBit", Partial, "RTL_BITMAP ops over the caller's buffer"),
     e("RtlTimeToTimeFields", Implemented, "host-tested NT epoch/calendar conversion in nt-kernel-exec"),
-    e("RtlUnwindEx", TrapIfCalled, "structured-exception unwind not modelled on the host; traps if reached"),
+    e("RtlUnwindEx", Implemented, "native SEH unwind through the admitted support image"),
+    e("RtlUnwind", Implemented, "legacy unwind ABI through the admitted native SEH support image"),
     e("RtlUpcaseUnicodeChar", Implemented, "validated l_intl three-level signed-delta uppercase mapping"),
     e("RtlAnsiCharToUnicodeChar", Implemented, "single-character CP1252 decode with native source-pointer advance"),
     e("RtlImageDirectoryEntryToData", Partial, "checked mapped-image directory resolution over registered extents; raw-file views require explicit extent publication"),
     e("RtlAppendUnicodeToString", Implemented, "implemented in crate::rtl (host-tested UNICODE_STRING/string ops)"),
     e("RtlNtStatusToDosError", Implemented, "complete shared ReactOS/NT 19-range status mapping with aliases and unmapped holes"),
-    e("RtlQueryRegistryValues", StubSuccess, "registry query table walked against nt-config; returns success with defaults"),
+    e("RtlQueryRegistryValues", Partial, "queries live registry handles with DIRECT or callback table entries and caller-supplied defaults; unsupported traversal flags fail explicitly"),
     e("RtlEqualUnicodeString", Implemented, "implemented in crate::rtl (host-tested UNICODE_STRING/string ops)"),
     // --- Io ---
-    e("IoGetDeviceProperty", StubSuccess, "returns benign device-property/stack-limit values for win32k init"),
+    e("IoGetDeviceProperty", Partial, "queries canonical PDO properties through an authenticated device consumer and exact lane-owned snapshot transfers; unsupported properties fail explicitly"),
     e("IoGetStackLimits", Implemented, "returns the exact active primary or repeated component-lane stack interval"),
     e("IoGetCurrentProcess", Partial, "returns the current EPROCESS via nt-process"),
     e("IoSynchronousInvalidateDeviceRelations", Partial, "authenticated PDO action retains the win32k Reply until exact PnP terminal completion"),
     e("IoOpenDeviceRegistryKey", Partial, "authenticated PDO Driver-key open with canonical CM property and pending kernel-handle publication; live win32k invocation awaits the remaining import gate"),
     e("IoGetRelatedDeviceObject", Partial, "resolves the canonical live attachment-stack top and returns it only through an exact win32k video Device projection"),
     e("IoGetDeviceObjectPointer", Partial, "opens the dynamically published video route, access-checks it through Object Manager, and returns retained WDM File/Device projections"),
-    e("IofCallDriver", TrapIfCalled, "device-stack I/O not reached on the win32k init path; traps if called"),
-    e("IoBuildDeviceIoControlRequest", Partial, "bounded METHOD_BUFFERED requests allocate a win32k-owned source IRP; dispatch and completion remain gated"),
-    e("IoBuildSynchronousFsdRequest", TrapIfCalled, "device-stack I/O not reached on the win32k init path; traps if called"),
+    e("IofCallDriver", Partial, "exact win32k source IOCTL, PnP TargetDeviceRelation, and FSD read/write dispatch through retained root transactions; unsupported majors fail explicitly"),
+    e("IoBuildDeviceIoControlRequest", Partial, "win32k-owned source IRPs with exact lifetime for all four IOCTL transfer methods"),
+    e("IoBuildSynchronousFsdRequest", Partial, "win32k-owned synchronous FSD source IRPs for planner-supported majors; live dispatch covers PnP TargetDeviceRelation and read/write"),
     // --- Se ---
     e("SeQueryAuthenticationIdToken", Partial, "subject-context/privilege checks routed to nt-security"),
     e("SeExports", Partial, "data export: the SE_EXPORTS well-known-SID/privilege table"),
@@ -443,6 +472,7 @@ pub const WIN32K_NTOSKRNL_IMPORTS: &[&str] = &[
     "RtlTimeToTimeFields",
     "ExSystemTimeToLocalTime",
     "RtlUnwindEx",
+    "RtlUnwind",
     "RtlUpcaseUnicodeChar",
     "RtlAnsiCharToUnicodeChar",
     "PsProcessType",

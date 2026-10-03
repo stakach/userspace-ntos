@@ -136,7 +136,6 @@ pub(super) struct ProviderCaller {
     reply_entered: bool,
 }
 
-static LAST_TOKEN: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) unsafe fn submit_provider(
     channel: &spawn_hosts::PumpChannel,
@@ -172,8 +171,8 @@ unsafe fn submit_provider_inner(
             (row.is_none() && EXECUTING_INDEX.load(Ordering::Relaxed) != index as u64)
                 .then_some(index));
         if index.is_none() { rows.try_reserve(1).map_err(|_| 0xC000_009Au32 as i32)?; }
-        let token = LAST_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
-            |value| value.checked_add(1)).map_err(|_| 0xC000_009Au32 as i32)? + 1;
+        let token = runtime::next_service_wait_token()
+            .map_err(|_| 0xC000_009Au32 as i32)?;
         let reference = with_provider_process_manager(|pm| {
             let requestor = pm.capture_native_handle_caller(
                 admission.caller().original_thread(), nt_types::AccessMode::KernelMode,

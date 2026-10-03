@@ -35,7 +35,6 @@ struct Work {
 
 static mut WORK: Vec<Option<Work>> = Vec::new();
 static mut EXECUTING: Vec<usize> = Vec::new();
-static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 
 fn ready(status: u32) -> SubmitResult {
@@ -97,9 +96,7 @@ pub(crate) unsafe fn submit(
             .expect("unsubmitted RoutedFile close actor");
         return ready(STATUS_NO_MEMORY);
     }
-    let token = match NEXT_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-        next.checked_add(1)
-    }) {
+    let token = match runtime::next_service_wait_token() {
         Ok(token) => token,
         Err(_) => {
             drop(capture);
@@ -136,6 +133,29 @@ pub(crate) unsafe fn submit(
 }
 
 impl Work {
+    unsafe fn ready_for_nested_step(&self) -> bool {
+        use nt_io_manager::retained_file_close_progress::RetainedFileCloseProgress as Progress;
+        let progress = if self.cancelled() {
+            Progress::Cancelled
+        } else if self.reply_entered {
+            Progress::AwaitingReply {
+                acknowledged: runtime::retained_service_reply_acknowledged(
+                    self.route, self.dispatch, self.reply, self.token,
+                ).unwrap_or(false),
+            }
+        } else if !self.close_entered {
+            Progress::ClosePending
+        } else if self.status.is_some() {
+            Progress::Terminal
+        } else {
+            Progress::AwaitingCleanup {
+                terminal: crate::driver_launch::hosted_file_cleanup_terminal(self.file_id),
+                lifecycle_ready: crate::driver_launch::nested_hosted_file_lifecycle_ready(self.file_id),
+            }
+        };
+        progress.ready_for_nested_step()
+    }
+
     unsafe fn cancelled(&self) -> bool {
         runtime::retained_service_cancelled(self.route, self.dispatch, self.reply, self.token)
     }
@@ -169,7 +189,7 @@ impl Work {
         crate::provider_bugcheck::stop(report)
     }
 
-    unsafe fn advance(&mut self, handler: &mut ExecNtHandler) -> bool {
+    unsafe fn advance(&mut self, handler: *mut ExecNtHandler) -> bool {
         if self.reply_entered {
             let acknowledged = runtime::reconcile_retained_service_reply(
                 self.route, self.dispatch, self.reply, self.token,
@@ -178,23 +198,23 @@ impl Work {
                 runtime::retire_stopped_acknowledged_retained_service(
                     self.route, self.dispatch, self.reply, self.token,
                 ).expect("acknowledged RoutedFile close Reply retirement");
-                self.release_actor(handler);
+                self.release_actor(&mut *handler);
                 return true;
             }
-            if self.cancelled() { return self.finish_cancelled(handler); }
+            if self.cancelled() { return self.finish_cancelled(&mut *handler); }
             return false;
         }
         if !self.close_entered {
-            if self.cancelled() { return self.finish_cancelled(handler); }
+            if self.cancelled() { return self.finish_cancelled(&mut *handler); }
             if let Err(status) = self.actor.as_ref().expect("retained RoutedFile close actor")
-                .validate(&handler.pm)
+                .validate(&(*handler).pm)
             {
                 self.close_entered = true;
                 self.capture.take();
                 self.status = Some(status);
                 return false;
             }
-            self.needs_cleanup = match handler.file_completion
+            self.needs_cleanup = match (*handler).file_completion
                 .cleanup_required_on_handle_close(self.file_id)
             {
                 Ok(needed) => needed,
@@ -224,16 +244,16 @@ impl Work {
             };
             let lifecycle_reserved = if peer_cleanup {
                 let reserved = (|| {
-                    let executor = handler.pm.capture_native_handle_caller(
+                    let executor = (*handler).pm.capture_native_handle_caller(
                         self.caller.original_thread(), nt_types::AccessMode::KernelMode,
                     )?;
-                    let requestor = handler.pm.reference_native_requestor(executor)?;
+                    let requestor = (*handler).pm.reference_native_requestor(executor)?;
                     match crate::driver_launch::reserve_hosted_file_lifecycle(
                         self.file_id, executor, requestor,
                     ) {
                         Ok(()) => Ok(()),
                         Err((status, mut requestor)) => {
-                            requestor.release(&mut handler.pm)?;
+                            requestor.release(&mut (*handler).pm)?;
                             Err(status.raw() as u32)
                         }
                     }
@@ -251,7 +271,7 @@ impl Work {
                 false
             };
             self.close_entered = true;
-            match handler.pm.close_native_routed_file_handle(self.caller, self.handle) {
+            match (*handler).pm.close_native_routed_file_handle(self.caller, self.handle) {
                 Ok((file, device)) => {
                     assert_eq!((file, device), (self.file_id, self.device_id));
                     crate::driver_launch::hosted_consumer_file_objects::handle_closed(
@@ -263,7 +283,7 @@ impl Work {
                     // The File still has its handle reference. Drop this temporary pointer
                     // before last-handle release starts and pumps CLEANUP/CLOSE inline.
                     self.capture.take();
-                    handler.release_file_handle_reference(file);
+                    (*handler).release_file_handle_reference(file);
                     if lifecycle_reserved {
                         crate::driver_launch::pump_hosted_file_lifecycle();
                     } else if self.needs_cleanup {
@@ -300,7 +320,7 @@ impl Work {
             crate::driver_launch::pump_hosted_file_lifecycle();
             self.status = Some(0);
         }
-        if self.cancelled() { return self.finish_cancelled(handler); }
+        if self.cancelled() { return self.finish_cancelled(&mut *handler); }
         self.reply_entered = true;
         let _ = runtime::wake_service(
             self.route, self.dispatch, self.reply, self.token,
@@ -311,25 +331,50 @@ impl Work {
 }
 
 /// A moved-out row prevents nested dispatch from replaying its table removal.
-pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
+unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_only: bool) -> bool {
     let _durable = crate::allocator::enter_durable();
     let count = (&*core::ptr::addr_of!(WORK)).len();
-    if count == 0 { return; }
+    if count == 0 { return false; }
     let start = CURSOR.load(Ordering::Relaxed) as usize % count;
     let Some((index, mut work)) = (0..count).find_map(|step| {
         let index = (start + step) % count;
         if (&*core::ptr::addr_of!(EXECUTING)).contains(&index) { return None; }
+        if nested_only && !(&*core::ptr::addr_of!(WORK))[index]
+            .as_ref().is_some_and(|work| work.ready_for_nested_step()) { return None; }
         (&mut *core::ptr::addr_of_mut!(WORK))[index]
             .take().map(|work| (index, work))
-    }) else { return; };
+    }) else { return false; };
     let executing = &mut *core::ptr::addr_of_mut!(EXECUTING);
     if executing.try_reserve(1).is_err() {
         (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
-        return;
+        return false;
     }
     executing.push(index);
     CURSOR.store(index as u64 + 1, Ordering::Relaxed);
+    let before = (work.close_entered, work.status, work.reply_entered);
+    let lifecycle_progress = nested_only && work.close_entered && work.status.is_none()
+        && !work.cancelled()
+        && crate::driver_launch::redrive_nested_hosted_file_lifecycle(work.file_id);
     let done = work.advance(handler);
+    let progressed = done || lifecycle_progress
+        || before != (work.close_entered, work.status, work.reply_entered);
     if !done { (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work); }
     assert_eq!((&mut *core::ptr::addr_of_mut!(EXECUTING)).pop(), Some(index));
+    progressed
+}
+
+pub(crate) unsafe fn nested_work_ready() -> bool {
+    (&*core::ptr::addr_of!(WORK)).iter().enumerate().any(|(index, row)| {
+        !(&*core::ptr::addr_of!(EXECUTING)).contains(&index)
+            && row.as_ref().is_some_and(|work| work.ready_for_nested_step())
+    })
+}
+
+pub(crate) unsafe fn redrive_nested_ready(handler: *mut ExecNtHandler) -> bool {
+    if handler.is_null() { return false; }
+    redrive_one(handler, true)
+}
+
+pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
+    let _ = redrive_one(handler, false);
 }

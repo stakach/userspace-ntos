@@ -1185,6 +1185,9 @@ fn finalize_batch(
 }
 
 pub(crate) enum PreparedHostedResourcePlan {
+    BusReportedBusNumber {
+        resources: nt_pnp_manager::BusReportedBusNumberStart,
+    },
     Pci {
         bus_resources: DevnodePciBusResources,
         window: HostedPnpPciResourceDescriptor,
@@ -1201,6 +1204,7 @@ pub(crate) enum PreparedHostedResourcePlan {
 impl PreparedHostedResourcePlan {
     fn native_property_blobs(&self) -> (Option<&[u8]>, Option<&[u8]>) {
         match self {
+            Self::BusReportedBusNumber { resources } => (Some(&resources.raw_resources), None),
             Self::Pci { bus_resources, .. } => (
                 Some(&bus_resources.raw_boot_resources),
                 Some(&bus_resources.resource_requirements),
@@ -1216,7 +1220,7 @@ impl PreparedHostedResourcePlan {
     unsafe fn release_context_lease(self) -> Result<(), nt_status::NtStatus> {
         let lease = match self {
             Self::Pci { lease, .. } | Self::Platform { lease, .. } => lease,
-            Self::None => return Ok(()),
+            Self::BusReportedBusNumber { .. } | Self::None => return Ok(()),
         };
         release_hosted_pnp_context_lease(lease.into_identity())
     }
@@ -1230,7 +1234,7 @@ impl PreparedHostedResourcePlan {
                     &bus_resources.device,
                 )
             }
-            Self::Platform { .. } | Self::None => {
+            Self::BusReportedBusNumber { .. } | Self::Platform { .. } | Self::None => {
                 crate::hosted_pci_topology::HostedPciInterruptRouteAdmission::Current
             }
         }
@@ -1247,11 +1251,12 @@ unsafe fn release_context_lease_after_error(
 }
 
 struct PreparedHostedDevnode {
-    pdo_description: driver_launch::HostedPdoDescription,
+    pdo_description: Option<driver_launch::HostedPdoDescription>,
     resource_plan: PreparedHostedResourcePlan,
 }
 
 unsafe fn prepare_current_hosted_devnode<H, C>(
+    bus_pdo: Option<u64>,
     instance_id: &str,
     hardware_ids: &[H],
     compatible_ids: &[C],
@@ -1260,6 +1265,17 @@ where
     H: AsRef<str>,
     C: AsRef<str>,
 {
+    if let Some(pdo_device_id) = bus_pdo {
+        if let Some(resources) =
+            driver_launch::prepare_hosted_bus_pdo_bus_number_start(instance_id, pdo_device_id)?
+        {
+            return Ok(PreparedHostedDevnode {
+                pdo_description: None,
+                resource_plan: PreparedHostedResourcePlan::BusReportedBusNumber { resources },
+            });
+        }
+    }
+
     let lease = acquire_hosted_pnp_context_lease()?;
     let context = match hosted_pnp_context_description(&lease) {
         Ok(context) => context,
@@ -1299,7 +1315,7 @@ where
             ),
         };
         return Ok(PreparedHostedDevnode {
-            pdo_description: driver_launch::HostedPdoDescription {
+            pdo_description: Some(driver_launch::HostedPdoDescription {
                 bus_information: nt_pnp_manager::PnpBusInformation {
                     bus_type_guid: nt_pnp_manager::GUID_BUS_TYPE_PCI,
                     legacy_bus_type: nt_pnp_manager::INTERFACE_TYPE_PCI_BUS,
@@ -1315,7 +1331,7 @@ where
                 translated_boot_resources: nt_pnp_manager::PropertyBlobState::Present(
                     bus_resources.translated_boot_resources.clone(),
                 ),
-            },
+            }),
             resource_plan: PreparedHostedResourcePlan::Pci {
                 bus_resources,
                 window,
@@ -1374,7 +1390,7 @@ where
             ),
         };
         return Ok(PreparedHostedDevnode {
-            pdo_description: driver_launch::HostedPdoDescription {
+            pdo_description: Some(driver_launch::HostedPdoDescription {
                 bus_information: nt_pnp_manager::PnpBusInformation {
                     bus_type_guid: nt_pnp_manager::GUID_BUS_TYPE_INTERNAL,
                     legacy_bus_type: nt_pnp_manager::INTERFACE_TYPE_PNP_BUS,
@@ -1390,7 +1406,7 @@ where
                 translated_boot_resources: nt_pnp_manager::PropertyBlobState::Present(
                     grant.translated_boot_resources.clone(),
                 ),
-            },
+            }),
             resource_plan: PreparedHostedResourcePlan::Platform {
                 grant,
                 window,
@@ -1402,7 +1418,7 @@ where
     release_hosted_pnp_context_lease(lease.into_identity())?;
 
     Ok(PreparedHostedDevnode {
-        pdo_description: driver_launch::HostedPdoDescription {
+        pdo_description: Some(driver_launch::HostedPdoDescription {
             bus_information: nt_pnp_manager::PnpBusInformation {
                 bus_type_guid: nt_pnp_manager::GUID_BUS_TYPE_INTERNAL,
                 legacy_bus_type: nt_pnp_manager::INTERFACE_TYPE_PNP_BUS,
@@ -1416,7 +1432,7 @@ where
             },
             resource_publication: nt_root_bus::PdoResourcePublication::none(),
             translated_boot_resources: nt_pnp_manager::PropertyBlobState::KnownNone,
-        },
+        }),
         resource_plan: PreparedHostedResourcePlan::None,
     })
 }
@@ -1462,7 +1478,9 @@ where
     H: AsRef<str>,
     C: AsRef<str>,
 {
+    let bus_pdo = driver_launch::hosted_bus_reported_device_id(devnode.instance_id);
     let prepared = match prepare_current_hosted_devnode(
+        bus_pdo,
         devnode.instance_id,
         devnode.hardware_ids,
         devnode.compatible_ids,
@@ -1530,7 +1548,6 @@ where
         }
     }
     report.attempted += 1;
-    let bus_pdo = driver_launch::hosted_bus_reported_device_id(devnode.instance_id);
     if let Some(pdo_device_id) = bus_pdo {
         let (raw_boot_resources, resource_requirements) = resource_plan.native_property_blobs();
         if let Err(status) = driver_launch::validate_hosted_bus_pdo_resource_properties(
@@ -1569,16 +1586,19 @@ where
                 devnode.instance_id,
                 pdo_device_id,
             ),
-            None => driver_launch::call_add_device_for_driver(
-                driver_id,
-                class_guid,
-                devnode.driver_key,
-                devnode.linkage_export,
-                devnode.instance_id,
-                devnode.hardware_ids,
-                devnode.compatible_ids,
-                pdo_description,
-            ),
+            None => match pdo_description {
+                Some(pdo_description) => driver_launch::call_add_device_for_driver(
+                    driver_id,
+                    class_guid,
+                    devnode.driver_key,
+                    devnode.linkage_export,
+                    devnode.instance_id,
+                    devnode.hardware_ids,
+                    devnode.compatible_ids,
+                    pdo_description,
+                ),
+                None => Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+            },
         }
     };
     match add_device {
@@ -2015,7 +2035,7 @@ unsafe fn try_publish_hosted_video_route(
         &crate::video_device::HostedVideoDeviceRegistration {
             device_id,
             service_registry_path: service_registry_path.as_slice(),
-            allocate_projection: crate::win32k_subsystem::pool_alloc_export,
+            allocate_projection: crate::win32k_subsystem::allocate_root_provider_pool_allocation,
         },
     );
     report.video_route_published |= published;

@@ -138,8 +138,24 @@ pub fn dispatcher_lease_is_ready(
 ) -> bool {
     match lease {
         ProviderDispatcherLease::Event(lease) => {
-            nt_kernel_exec::provider_event_wait_is_ready(event_objects, events, lease)
-                .expect("provider Event wait lost its canonical lease or backing")
+            match nt_kernel_exec::provider_event_wait_is_ready(event_objects, events, lease) {
+                Ok(ready) => ready,
+                Err(nt_kernel_exec::ProviderEventWaitError::Registry(
+                    nt_kernel_exec::EventObjectError::StaleLease,
+                )) => panic!("provider Event wait lease is stale"),
+                Err(nt_kernel_exec::ProviderEventWaitError::Registry(
+                    nt_kernel_exec::EventObjectError::StaleObject,
+                )) => panic!("provider Event wait object is stale"),
+                Err(nt_kernel_exec::ProviderEventWaitError::Registry(
+                    nt_kernel_exec::EventObjectError::WrongLeaseKind,
+                )) => panic!("provider Event wait lease has wrong kind"),
+                Err(nt_kernel_exec::ProviderEventWaitError::Registry(_)) => {
+                    panic!("provider Event wait registry rejected live lease")
+                }
+                Err(nt_kernel_exec::ProviderEventWaitError::MissingBacking) => {
+                    panic!("provider Event wait lost its backing")
+                }
+            }
         }
         ProviderDispatcherLease::Timer(lease) => timers
             .expect("provider Timer table disappeared with a live wait lease")

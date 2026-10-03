@@ -46,11 +46,19 @@ fn execute(
             let (slot, generation) = encoded(id);
             (0, slot, generation, metadata)
         }
-        LocalEventRequest::Read { local } => (0, u64::from(state.read(provider, local)?), 0, 0),
-        LocalEventRequest::Reset { local } => (0, u64::from(state.reset(provider, local)?), 0, 0),
+        LocalEventRequest::Read { local } => {
+            let (current, sequence) = state.read_with_sequence(provider, local)?;
+            (0, u64::from(current), 0, sequence)
+        }
+        LocalEventRequest::Reset { local } => {
+            let previous = state.reset(provider, local)?;
+            let (_, sequence) = state.read_with_sequence(provider, local)?;
+            (0, u64::from(previous), 0, sequence)
+        }
         LocalEventRequest::Clear { local } => {
             state.clear(provider, local)?;
-            (0, 0, 0, 0)
+            let (_, sequence) = state.read_with_sequence(provider, local)?;
+            (0, 0, 0, sequence)
         }
         LocalEventRequest::Retire { local } => match state.retire(provider, local)? {
             Some(id) => {
@@ -70,7 +78,8 @@ fn execute(
                 nt_kernel_exec::EventSignalMode::Pulse
             };
             let (previous, current) = state.signal_unobserved(provider, local, mode)?;
-            (0, u64::from(previous), u64::from(current), 0)
+            let (_, sequence) = state.read_with_sequence(provider, local)?;
+            (0, u64::from(previous), u64::from(current), sequence)
         }
     })
 }

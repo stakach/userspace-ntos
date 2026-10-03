@@ -125,6 +125,143 @@ fn immutable_support_fixture() -> Vec<u8> {
     bytes
 }
 
+fn fill_image_page(pe: &PeFile<'_>, page_rva: u32, file_size: u64) -> [u8; 0x1000] {
+    let plan = pe.image_page_fill_plan(page_rva, file_size).unwrap();
+    let mut page = [0u8; 0x1000];
+    for span in plan.spans() {
+        let from = span.file_offset as usize;
+        let to = span.page_offset as usize;
+        let len = span.length as usize;
+        page[to..to + len].copy_from_slice(&pe.bytes()[from..from + len]);
+    }
+    page
+}
+
+#[test]
+fn image_page_fill_matches_eager_headers_sections_and_zero_pages() {
+    let bytes = build_pe(
+        BASE,
+        0x1000,
+        0x5000,
+        &[
+            text_section(0x1000, vec![0x90; 0x1100]),
+            Sec {
+                name: *b".bss\0\0\0\0",
+                va: 0x3000,
+                chars: 0xc000_0080,
+                data: Vec::new(),
+            },
+        ],
+        &[],
+    );
+    let pe = PeFile::parse(&bytes).unwrap();
+    let eager = pe.map(BASE).unwrap();
+    for rva in [0, 0x1000, 0x2000, 0x3000, 0x4000] {
+        let page = fill_image_page(&pe, rva, bytes.len() as u64);
+        assert_eq!(
+            &page[..],
+            &eager.bytes[rva as usize..rva as usize + 0x1000]
+        );
+    }
+    assert_eq!(
+        pe.image_page_fill_plan(0x1000, bytes.len() as u64)
+            .unwrap()
+            .protection(),
+        ImageProtection::ExecuteWriteCopy
+    );
+    assert!(pe
+        .image_page_fill_plan(0x3000, bytes.len() as u64)
+        .unwrap()
+        .protection()
+        .copy_on_write());
+    assert!(pe
+        .image_page_fill_plan(0x4000, bytes.len() as u64)
+        .unwrap()
+        .spans()
+        .is_empty());
+}
+
+#[test]
+fn image_page_fill_uses_headers_only_and_checks_backing_extent() {
+    let bytes = build_pe(
+        BASE,
+        0x1000,
+        0x3000,
+        &[text_section(0x1000, vec![0xcc; 0x300])],
+        &[],
+    );
+    let headers = PeFile::parse(&bytes[..0x200]).unwrap();
+    let plan = headers
+        .image_page_fill_plan(0x1000, bytes.len() as u64)
+        .unwrap();
+    assert_eq!(plan.spans().len(), 1);
+    assert_eq!(plan.spans()[0].file_offset, 0x200);
+    assert_eq!(plan.spans()[0].length, 0x400);
+    assert_eq!(
+        headers.image_page_fill_plan(0x1000, 0x200),
+        Err(PeError::SectionOutOfBounds)
+    );
+    assert_eq!(
+        headers.image_page_fill_plan(1, bytes.len() as u64),
+        Err(PeError::BadRva(1))
+    );
+    assert_eq!(
+        headers.image_page_fill_plan(0x3000, bytes.len() as u64),
+        Err(PeError::BadRva(0x3000))
+    );
+}
+
+#[test]
+fn image_page_fill_rejects_subpage_section_protection() {
+    let bytes = build_pe(
+        BASE,
+        0x1100,
+        0x3000,
+        &[text_section(0x1100, vec![0xcc; 0x100])],
+        &[],
+    );
+    let pe = PeFile::parse(&bytes).unwrap();
+    assert_eq!(
+        pe.image_page_fill_plan(0x1000, bytes.len() as u64),
+        Err(PeError::UnsupportedImageAlignment(0x1100))
+    );
+}
+
+#[test]
+fn image_page_fill_rejects_header_table_outside_declared_headers() {
+    let mut bytes = build_pe(BASE, 0x1000, 0x3000, &[text_section(0x1000, vec![0xcc])], &[]);
+    put_u32(&mut bytes, OPT_OFF + 60, 0x100);
+    let pe = PeFile::parse(&bytes).unwrap();
+    assert_eq!(
+        pe.image_page_fill_plan(0, bytes.len() as u64),
+        Err(PeError::SectionOutOfBounds)
+    );
+}
+
+#[test]
+fn image_page_fill_rejects_overlapping_section_rights() {
+    let bytes = build_pe(
+        BASE,
+        0x1000,
+        0x3000,
+        &[
+            text_section(0x1000, vec![0xcc; 0x200]),
+            Sec {
+                name: *b".data\0\0\0",
+                va: 0x1000,
+                chars: 0xc000_0040,
+                data: vec![0x55; 0x200],
+            },
+        ],
+        &[],
+    );
+    let pe = PeFile::parse(&bytes).unwrap();
+    assert_eq!(
+        pe.image_page_fill_plan(0x1000, bytes.len() as u64),
+        Err(PeError::AmbiguousImagePage(0x1000))
+    );
+}
+
 fn immutable_result(bytes: &[u8]) -> Result<(), ImmutableSupportImageError> {
     immutable_support_image::validate(&PeFile::parse(bytes).unwrap())
 }
@@ -891,7 +1028,7 @@ fn export_directory_walk_resolves_high_index_forwarder_and_boundaries() {
     // AddressOfFunctions: give each ordinal a distinct, checkable RVA in .text (0x1000-based), EXCEPT
     // the forwarder ordinal whose "RVA" points at fwd_str_local (inside the dir range).
     // AddressOfNameOrdinals: a NON-identity map (ordinal = N-1-i) so an identity assumption fails.
-    let text_rva = |ord: u32| 0x1000 + ord * 0x10; // concrete export RVA for ordinal `ord`
+    let text_rva = |ord: u32| 0x1000 + ord * 4; // keep concrete exports outside .edata
     for i in 0..N {
         let ord = N - 1 - i; // non-identity permutation
                              // AddressOfNames[i] = the name-string RVA.
@@ -933,7 +1070,7 @@ fn export_directory_walk_resolves_high_index_forwarder_and_boundaries() {
         BASE,
         0x1000,
         0x4000,
-        &[text_section(0x1000, vec![0x90, 0xC3]), edata],
+        &[text_section(0x1000, vec![0xC3; (N * 4) as usize]), edata],
         &[(0, EDATA_VA, edata_size)], // data dir 0 = export, size = the dir range
     );
 
@@ -946,7 +1083,7 @@ fn export_directory_walk_resolves_high_index_forwarder_and_boundaries() {
     let gst_ord = N - 1 - HIGH; // AoNO[HIGH]
     assert_eq!(
         gst.rva,
-        0x1000 + gst_ord * 0x10,
+        text_rva(gst_ord),
         "high-index func RVA via AoNO/AoF"
     );
     assert_eq!(
@@ -962,7 +1099,7 @@ fn export_directory_walk_resolves_high_index_forwarder_and_boundaries() {
 
     // Boundary names (first + last in the name array) resolve correctly.
     let first = find("AFirst").expect("first export"); // name index 0 -> ordinal N-1
-    assert_eq!(first.rva, 0x1000 + (N - 1) * 0x10);
+    assert_eq!(first.rva, text_rva(N - 1));
     assert_eq!(pe.export_rva_by_name("AFirst").unwrap(), Some(first.rva));
     let last = find("ZLast").expect("last export"); // name index N-1 -> ordinal 0
     assert_eq!(last.rva, 0x1000);
@@ -983,6 +1120,38 @@ fn export_directory_walk_resolves_high_index_forwarder_and_boundaries() {
 
     // Every one of the N names resolved (no silent drop at a high index / boundary).
     assert_eq!(exports.len(), N as usize, "all names resolved");
+
+    let mapped = pe.map(BASE).unwrap();
+    let namespace = nt_pe_loader::module_namespace::ImageExports::from_mapped(
+        "actual.dll", BASE, &mapped.bytes,
+    ).unwrap();
+    use nt_pe_loader::module_namespace::{resolve, ExportTarget, Symbol};
+    assert_eq!(
+        resolve(core::slice::from_ref(&namespace), "actual.dll",
+            &Symbol::Name("GetSystemTimeAsFileTime".into())),
+        Ok(BASE + u64::from(gst.rva)),
+    );
+    assert_eq!(
+        resolve(core::slice::from_ref(&namespace), "actual.dll", &Symbol::Ordinal(gst.ordinal)),
+        Ok(BASE + u64::from(gst.rva)),
+    );
+    assert!(matches!(
+        namespace.exports.iter().find(|e| e.name == "FwdExport").unwrap().target,
+        ExportTarget::Forwarder(_),
+    ));
+    assert!(nt_pe_loader::module_namespace::ImageExports::from_mapped("actual.dll", BASE, &mapped.bytes[..0x100]).is_err());
+
+    let mut unterminated_forwarder = mapped.bytes.clone();
+    unterminated_forwarder[(EDATA_VA + edata_size - 1) as usize] = b'X';
+    assert!(nt_pe_loader::module_namespace::ImageExports::from_mapped(
+        "actual.dll", BASE, &unterminated_forwarder,
+    ).is_err(), "a forwarder must terminate inside the export directory");
+
+    let mut invalid_target = mapped.bytes.clone();
+    put_u32(&mut invalid_target, (EDATA_VA + aof_local) as usize, 0x4000);
+    assert!(nt_pe_loader::module_namespace::ImageExports::from_mapped(
+        "actual.dll", BASE, &invalid_target,
+    ).is_err(), "a concrete export must remain inside the mapped image");
 
     let mut invalid = pe_bytes.clone();
     let ordinal_file_offset = pe.sections()[1].pointer_to_raw_data as usize + aono_local as usize;

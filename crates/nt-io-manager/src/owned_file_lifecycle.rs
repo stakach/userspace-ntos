@@ -171,6 +171,32 @@ impl FileLifecycleAckInvocation {
 }
 
 impl<P: ObjectManagerPort> IoManager<P> {
+    /// Memory-only selection. It neither removes a queued release nor prepares an IRP.
+    pub fn queued_peer_file_lifecycle_ready(&self, file_id: FileId) -> Result<bool, NtStatus> {
+        if !self.owned_peer_file_lifecycle { return Ok(false); }
+        let Some(file) = self.file(file_id) else { return Ok(false); };
+        if !file.close_retry_queued || !file.close_deferred { return Ok(false); }
+        let major = match file.state {
+            FileState::CleanupPending if !file.cleanup_dispatched => major::IRP_MJ_CLEANUP,
+            FileState::ClosePending if !file.close_dispatched
+                && file.outstanding_irp_refs == 0 && self.file_reference_count(file_id) == 0 =>
+                major::IRP_MJ_CLOSE,
+            _ => return Ok(false),
+        };
+        self.lifecycle_uses_driver_peer(file_id, major)
+    }
+
+    /// Prepare only the selected File, after the native runner owns its parent hold.
+    pub fn prepare_queued_peer_file_lifecycle(
+        &mut self, file_id: FileId, requestor_tid: u64,
+    ) -> Result<Option<PreparedFileLifecycle>, NtStatus> {
+        if !self.queued_peer_file_lifecycle_ready(file_id)? { return Ok(None); }
+        let client = self.file(file_id).ok_or(NtStatus::INVALID_HANDLE)?.client_id;
+        let prepared = self.prepare_file_lifecycle_owned(client, file_id, requestor_tid)?;
+        assert!(self.take_deferred_file_close(file_id));
+        Ok(Some(prepared))
+    }
+
     /// Take one ready hosted lifecycle operation without entering its backend.
     /// The returned preparation owns the exact File/IRP until it is begun or
     /// explicitly requeued; a second pump cannot select the same File. The
@@ -184,32 +210,19 @@ impl<P: ObjectManagerPort> IoManager<P> {
             return Ok(None);
         }
         let mut ready = None;
-        for (file_id, file) in self.files.iter() {
-            if !file.close_retry_queued || !file.close_deferred {
-                continue;
-            }
-            let major = match file.state {
-                FileState::CleanupPending if !file.cleanup_dispatched => major::IRP_MJ_CLEANUP,
-                FileState::ClosePending
-                    if !file.close_dispatched
-                        && file.outstanding_irp_refs == 0
-                        && self.file_reference_count(file_id) == 0 => major::IRP_MJ_CLOSE,
-                _ => continue,
-            };
-            if self.lifecycle_uses_driver_peer(file_id, major)? {
+        for (file_id, _) in self.files.iter() {
+            if self.queued_peer_file_lifecycle_ready(file_id)? {
                 let Some(tid) = requestor_tid(file_id).filter(|tid| *tid != 0) else {
                     continue;
                 };
-                ready = Some((file.client_id, file_id, tid));
+                ready = Some((file_id, tid));
                 break;
             }
         }
-        let Some((client, file_id, tid)) = ready else {
+        let Some((file_id, tid)) = ready else {
             return Ok(None);
         };
-        let prepared = self.prepare_file_lifecycle_owned(client, file_id, tid)?;
-        assert!(self.take_deferred_file_close(file_id));
-        Ok(Some(prepared))
+        self.prepare_queued_peer_file_lifecycle(file_id, tid)
     }
 
     /// Give a preparation back to the close pump when native dispatch could
@@ -560,28 +573,31 @@ impl<P: ObjectManagerPort> IoManager<P> {
 
     /// Transfer only the exact, genuinely published driver completion to an
     /// ACK executor. The backend call itself must occur without `&mut self`.
+    pub fn retained_file_lifecycle_ack_ready(&self, retained: &RetainedFileLifecycle) -> bool {
+        self.retained_file_lifecycle_completion(retained).is_ok()
+    }
+
+    fn retained_file_lifecycle_completion(
+        &self, retained: &RetainedFileLifecycle,
+    ) -> Result<CompletedIrp, NtStatus> {
+        if retained.ack_uncertain { return Err(NtStatus::DELETE_PENDING); }
+        self.validate_lifecycle_owner(&retained.owner, IrpState::Completed)?;
+        let completion = self.completed_irp(retained.irp_id()).ok_or(NtStatus::INVALID_PARAMETER)?;
+        if completion.completion_origin != IrpCompletionOrigin::Driver
+            || completion.file_id != Some(retained.file_id())
+            || completion.major != retained.projection().major
+            || completion.completion_driver_id != retained.projection().driver_id
+            || completion.completion_device_id != retained.projection().device_id {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(completion)
+    }
+
     pub fn begin_retained_file_lifecycle_ack(
         &mut self,
         retained: RetainedFileLifecycle,
     ) -> Result<FileLifecycleAckInvocation, FileLifecycleRejection<RetainedFileLifecycle>> {
-        let valid = (|| {
-            if retained.ack_uncertain {
-                return Err(NtStatus::DELETE_PENDING);
-            }
-            self.validate_lifecycle_owner(&retained.owner, IrpState::Completed)?;
-            let completion = self
-                .completed_irp(retained.irp_id())
-                .ok_or(NtStatus::INVALID_PARAMETER)?;
-            if completion.completion_origin != IrpCompletionOrigin::Driver
-                || completion.file_id != Some(retained.file_id())
-                || completion.major != retained.projection().major
-                || completion.completion_driver_id != retained.projection().driver_id
-                || completion.completion_device_id != retained.projection().device_id
-            {
-                return Err(NtStatus::INVALID_PARAMETER);
-            }
-            Ok(completion)
-        })();
+        let valid = self.retained_file_lifecycle_completion(&retained);
         match valid {
             Ok(completion) => Ok(FileLifecycleAckInvocation {
                 owner: retained.owner,

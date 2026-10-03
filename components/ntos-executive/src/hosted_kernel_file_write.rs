@@ -42,7 +42,6 @@ struct Work {
 
 static mut WORK: Vec<Option<Work>> = Vec::new();
 static mut EXECUTING: Vec<usize> = Vec::new();
-static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 
 fn capture_packet(instance: DriverInstance, packet: u64, length: u64)
@@ -159,7 +158,7 @@ pub(crate) unsafe fn submit(
             .expect("unentered hosted WRITE actor");
         return Some(STATUS_INSUFFICIENT_RESOURCES);
     }
-    let token = match NEXT_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)) {
+    let token = match runtime::next_service_wait_token() {
         Ok(token) => token,
         Err(_) => {
             crate::service_sec_image::with_provider_process_manager(|pm| actor.release(pm))

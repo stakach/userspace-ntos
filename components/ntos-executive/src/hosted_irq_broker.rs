@@ -937,7 +937,7 @@ impl HostedIrqRootSession {
                 {
                     Ok(lease) => {
                         if self.service_locks.try_reserve(1).is_err() {
-                            let _ = hosted_irq_actual_locks_mut().release(lease);
+                            let _ = release_hosted_irq_actual_lock_lease(lease);
                             return fatal_service_result(STATUS_INSUFFICIENT_RESOURCES);
                         }
                         self.service_locks.push(lease);
@@ -960,14 +960,12 @@ impl HostedIrqRootSession {
                 }) else {
                     return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
                 };
-                match hosted_irq_actual_locks_mut().release(lease) {
+                match release_hosted_irq_actual_lock_lease(lease) {
                     Ok(()) => {
                         self.service_locks.pop();
                         service_result(STATUS_SUCCESS, None)
                     }
-                    Err(error) => {
-                        fatal_service_result(hosted_irq_actual_lock_status(error).raw())
-                    }
+                    Err(status) => fatal_service_result(status.raw()),
                 }
             }
             _ => fatal_service_result(STATUS_INVALID_DEVICE_REQUEST),
@@ -1052,6 +1050,41 @@ impl HostedIrqRootSession {
         service_result(status, None)
     }
 
+    unsafe fn pool_retirement_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let Ok(lane) = self.lane(lane_index) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        let root_dpc_grant = self
+            .dpc_grant
+            .is_some_and(|(identity, grant)| identity == lane.identity && grant == command.grant);
+        if !root_dpc_grant && !lane_has_service_grant(lane, command.grant) {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let Ok(current_irql) = lane.arena().control.current_irql(lane.identity) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        let Some((operation, address)) = command.pool_retirement_arguments(
+            lane.identity,
+            command.grant,
+            FSD_SERVICE_SOURCE_IRP_LABEL,
+            current_irql,
+        ) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        let status = service_hosted_irq_lane_pool_retirement(
+            lane.projection_instance,
+            lane.identity.domain_id,
+            lane.identity.domain_cookie,
+            operation,
+            address,
+        );
+        service_result(status, None)
+    }
+
     unsafe fn execute_service(
         &mut self,
         lane_index: usize,
@@ -1068,6 +1101,9 @@ impl HostedIrqRootSession {
             }
             nt_hosted_runtime::HostedIrqServiceKind::Mdl => {
                 self.mdl_service(lane_index, command)
+            }
+            nt_hosted_runtime::HostedIrqServiceKind::PoolRetirement => {
+                self.pool_retirement_service(lane_index, command)
             }
             nt_hosted_runtime::HostedIrqServiceKind::ProviderImport => {
                 self.provider_import_service(lane_index, service, command)
@@ -1201,9 +1237,9 @@ impl HostedIrqRootSession {
     unsafe fn release_service_locks(&mut self) -> Result<(), nt_status::NtStatus> {
         let mut first_error = None;
         while let Some(lease) = self.service_locks.pop() {
-            if let Err(error) = hosted_irq_actual_locks_mut().release(lease) {
+            if let Err(status) = release_hosted_irq_actual_lock_lease(lease) {
                 if first_error.is_none() {
-                    first_error = Some(hosted_irq_actual_lock_status(error));
+                    first_error = Some(status);
                 }
             }
         }
@@ -1236,15 +1272,11 @@ pub(super) unsafe fn dispatch_interrupt(
     ) {
         Ok(transaction) => transaction,
         Err(nt_hosted_runtime::HostedIrqArenaError::Busy) => {
-            hosted_irq_actual_locks_mut()
-                .release(outer_lock)
-                .map_err(hosted_irq_actual_lock_status)?;
+            release_hosted_irq_actual_lock_lease(outer_lock)?;
             return Ok(HostedIrqRootDispatchOutcome::DeferredBusy);
         }
         Err(error) => {
-            hosted_irq_actual_locks_mut()
-                .release(outer_lock)
-                .map_err(hosted_irq_actual_lock_status)?;
+            release_hosted_irq_actual_lock_lease(outer_lock)?;
             return Err(arena_status(error));
         }
     };
@@ -1270,9 +1302,7 @@ pub(super) unsafe fn dispatch_interrupt(
         Ok(token) => token,
         Err(error) => {
             let _ = arena.control.root_finish_transaction(lane.identity, transaction);
-            hosted_irq_actual_locks_mut()
-                .release(outer_lock)
-                .map_err(hosted_irq_actual_lock_status)?;
+            release_hosted_irq_actual_lock_lease(outer_lock)?;
             return Err(arena_status(error));
         }
     };
@@ -1335,9 +1365,7 @@ pub(super) unsafe fn dispatch_interrupt(
         .root_finish_transaction(lane.identity, transaction)
         .map_err(arena_status);
     let outer_release = session.outer_lock.take().map_or(Ok(()), |lease| {
-        hosted_irq_actual_locks_mut()
-            .release(lease)
-            .map_err(hosted_irq_actual_lock_status)
+        release_hosted_irq_actual_lock_lease(lease)
     });
     let result = result?;
     service_release?;

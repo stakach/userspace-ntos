@@ -21,8 +21,12 @@ pub use sel4_rt::*;
 
 mod acpi_platform;
 mod boot_namespace;
+mod boot_progress;
+pub(crate) use boot_progress::{boot_progress_epoch, note_boot_progress, BootProgress};
 mod ahci_maintenance;
 mod allocator;
+mod component_heap;
+mod debug_traps;
 mod alpc_selftest;
 pub(crate) use acpi_platform::*;
 mod cm_server;
@@ -35,6 +39,7 @@ mod registry_security_audit;
 mod provider_registry_caller;
 mod provider_directory_broker;
 mod provider_section_broker;
+mod provider_mm_section_objects;
 mod provider_section_map_broker;
 mod provider_section_unmap_broker;
 mod provider_win32k_subject;
@@ -45,15 +50,19 @@ mod ntoskrnl_shared;
 mod server;
 mod service_sec_image;
 mod storage_host;
+mod bootstrap_image;
 mod system_modules;
 mod video_device;
 mod win32k_pe;
+mod win32k_seh_image;
 mod win32k_session_runtime;
 mod win32k_subsystem;
 pub(crate) use service_sec_image::*;
 mod loader_trace_diag;
 pub(crate) use loader_trace_diag::*;
 mod exec_handler;
+mod native_image_sections;
+mod hosted_routed_image_capture;
 mod thread_context;
 mod thread_suspend;
 mod object_wait;
@@ -95,13 +104,18 @@ mod ps_bootstrap;
 mod dispatcher_bootstrap;
 mod timer_deadline;
 mod provider_local_event;
+mod source_event_completion;
+mod provider_local_timer_request;
 mod provider_dispatcher_backend;
 mod provider_file_wait;
 mod ps_object_retirement;
 mod provider_ps;
+mod provider_ps_projection;
 mod sec_image_diagnostic;
+mod fault_stack_diagnostics;
 use process_vm_retirement::reclaim_final_process_vm;
 mod hosted_driver_projection;
+mod hosted_safe_attach;
 mod rendezvous;
 mod writable_fs;
 pub(crate) use rendezvous::*;
@@ -826,6 +840,10 @@ const _: () = {
     );
     assert!(tp_worker_stack_mirror_va(0, TP_WORKER_LEGACY_SLOT_COUNT) == TP_WORKER_AUX_EXEC_BASE);
     assert!(
+        tp_worker_env_scratch_va(MAX_PI - 1, TP_WORKER_SLOT_COUNT - 1) + 0x4000
+            <= allocator::HEAP_BASE as u64
+    );
+    assert!(
         tp_worker_stack_mirror_va(TP_WORKER_PI_COUNT, 0)
             == TP_WORKER_AUX_EXEC_BASE
                 + ((TP_WORKER_SLOT_COUNT - TP_WORKER_LEGACY_SLOT_COUNT) * TP_WORKER_PI_COUNT)
@@ -1234,8 +1252,8 @@ pub const CSRSS_FILEBUF_OFFSET: u64 = 0x1A000; // 104 KiB in — clear of a ~99 
 /// (past smss+csrss), size reported at STORAGE_SHARED+0x40. The loader needs it or DLL_NOT_FOUND.
 pub const CSRSRV_FILEBUF_OFFSET: u64 = 0x20000; // 128 KiB in — clear of csrss (ends ~111 KiB)
 /// basesrv.dll (~50 KiB) + winsrv.dll (~400 KiB) — csrss's dynamically-loaded ServerDlls — don't fit
-/// in FILEBUF, so they get their own 512 KiB buffer (its own 2 MiB PT), dual-mapped host<->exec like
-/// NTDLLBUF. basesrv at offset 0, winsrv at +0x10000; sizes reported at STORAGE_SHARED +0x44 / +0x48.
+/// in FILEBUF, so they get their own 512 KiB buffer (its own 2 MiB PT), dual-mapped host<->exec.
+/// basesrv at offset 0, winsrv at +0x10000; sizes reported at STORAGE_SHARED +0x44 / +0x48.
 pub const SRVBUF_VADDR: u64 = 0x0000_0100_1400_0000;
 pub const SRVBUF_FRAMES: u64 = 128; // 512 KiB
 pub const BASESRV_SRVBUF_OFFSET: u64 = 0x0;
@@ -1287,6 +1305,7 @@ pub const DEMAND_SCRATCH_WINDOW: u64 = 0x0400_0000; // 64 MiB per process
                                                     // paging level, so this layout does not depend on boot-image page tables.
 pub const SMSS_SCRATCH_BASE: u64 = allocator::HEAP_BASE as u64 + allocator::HEAP_FRAMES * 0x1000;
 const _: () = assert!(SMSS_SCRATCH_BASE & 0x1f_ffff == 0);
+const _: () = assert!(SMSS_SCRATCH_BASE == 0x0000_0100_2200_0000);
 /// csrss's demand-fault scratch window (own 64 MiB, PTs mapped at spawn).
 pub const CSRSS_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + DEMAND_SCRATCH_WINDOW;
 /// Fault-endpoint badge for the THIRD hosted process (winlogon). Distinct from smss (0) + csrss (2).
@@ -2051,9 +2070,6 @@ impl DllArenaPagingState {
 /// Every leaf DLL (kernel32/user32/gdi32/advapi32/rpcrt4/msvcrt/ws2_32/basesrv/winsrv + lsass'
 /// lsasrv/samsrv/msv1_0 + all P5+ binaries) demand-loads with NO edit here.
 pub const DLL_PIN_COUNT: usize = 4;
-/// Buffer for the generated ntdll.dll, shared host<->exec in its own 2 MiB page table.
-pub const NTDLLBUF_VADDR: u64 = 0x0000_0100_1440_0000;
-pub const NTDLLBUF_FRAMES: u64 = 512; // full 2 MiB page-table window
 /// NLS code-page tables (c_1252.nls/c_437.nls/l_intl.nls), shared host<->exec. They live in the
 /// shared-input 2 MiB region (0xA0_0000-0xC0_0000). spawn_sec_image later shares these frames into smss + points the PEB NLS
 /// fields at them so RtlInitNlsTables/RtlUnicodeToMultiByteN work.
@@ -2064,7 +2080,7 @@ pub const NLS_OEM_FRAMES: u64 = 20;
 pub const NLS_CASE_VADDR: u64 = 0x0000_0100_10B4_0000; // l_intl.nls (4870 B = 2 pages)
 pub const NLS_CASE_FRAMES: u64 = 4;
 /// c_20127.nls (US-ASCII, CP20127; 66082 B = 17 pages) — csrss's Win32 client stack maps the named
-/// section \Nls\NlsSectionCP20127 during a DllMain. Shares the NTDLLBUF 0xA0-0xC0 page table so it
+/// section \Nls\NlsSectionCP20127 during a DllMain. Shares the NLS input 0xA0-0xC0 page table so it
 /// needs no extra PT. Placed past the SYSTEM hive buffer.
 pub const NLS_20127_VADDR: u64 = 0x0000_0100_10B9_0000;
 pub const NLS_20127_FRAMES: u64 = 20;
@@ -2097,7 +2113,6 @@ pub const DEFHIVEBUF_VADDR: u64 = 0x0000_0100_10BC_0000;
 pub const DEFHIVEBUF_FRAMES: u64 = 40; // 160 KiB (the staged hive is 139264 B = 34 pages)
 const _: () = assert!(DEFHIVEBUF_FRAMES * 0x1000 >= 139_264);
 const _: () = assert!(DEFHIVEBUF_VADDR + DEFHIVEBUF_FRAMES * 0x1000 <= 0x0000_0100_10C0_0000);
-const _: () = assert!(NTDLLBUF_FRAMES * 0x1000 <= 0x20_0000);
 /// The real ReactOS **SOFTWARE** hive (`\reactos\system32\config\software`, **471040 B** regf) —
 /// the HKLM\Software backing store, mounted read-only at `\Registry\Machine\SOFTWARE`. Same by-path
 /// staging as SECURITY/SAM, but it is ~57x their size (115 pages), so it does NOT fit in the
@@ -3446,8 +3461,14 @@ pub(crate) unsafe fn winlogon_credential_started() -> bool {
 /// keystrokes that genuinely came back out of win32k's queue.
 pub(crate) unsafe fn winlogon_credential_observe_retrieved(hwnd: u64, message: u32, wparam: u64) {
     let mut state = winlogon_credential_load();
+    let previous = state;
     if state.observe_retrieved(hwnd, message, wparam) {
         winlogon_credential_store(state);
+        if state.retrieved_chars() != previous.retrieved_chars()
+            || state.retrieved_return() != previous.retrieved_return()
+        {
+            note_boot_progress(BootProgress::CredentialRetrieved);
+        }
         if message == nt_user_callback::WM_KEYDOWN {
             print_str(
                 b"[cred-inject] real queue delivered VK_RETURN to the IDD_LOGON edit control\n",
@@ -3695,6 +3716,12 @@ unsafe fn winlogon_dialog_modal_store(state: nt_user_callback::DialogModalPumpSe
     WINLOGON_DIALOG_MODAL_COMPLETED.store(state.is_complete() as u64, Ordering::Relaxed);
     WINLOGON_DIALOG_MODAL_PAINTS.store(state.paint_dispatches() as u64, Ordering::Relaxed);
     WINLOGON_DIALOG_MODAL_DRAINED.store(state.is_drained() as u64, Ordering::Relaxed);
+    if state.is_complete() {
+        note_boot_progress(BootProgress::DialogModalCompleted);
+    }
+    if state.is_drained() {
+        note_boot_progress(BootProgress::DialogModalDrained);
+    }
 }
 
 pub(crate) unsafe fn winlogon_dialog_modal_expected_ssn() -> u64 {
@@ -5418,6 +5445,8 @@ fn root_cap_ownership_spec(passed: &mut u64) {
     let unmap_refusals = ROOT_SLOT_PIN_UNMAP_REFUSALS.load(Ordering::Relaxed);
     let move_refusals = ROOT_SLOT_PIN_MOVE_REFUSALS.load(Ordering::Relaxed);
     let required_heap_pts = allocator::HEAP_FRAMES.div_ceil(512);
+    let mapped_heap_frames = allocator::root_heap_committed_frames()
+        + allocator::EXECUTIVE_TRANSIENT_HEAP_FRAMES;
     print_str(b"[cap-owner] pinned-root-slots=");
     print_u64(pinned);
     print_str(b" delete-refusals=");
@@ -5429,7 +5458,7 @@ fn root_cap_ownership_spec(passed: &mut u64) {
     print_str(b"\n");
     check(
         b"exec_root_vspace_caps_lifetime_owned",
-        pinned >= allocator::HEAP_FRAMES + required_heap_pts + 1
+        pinned >= mapped_heap_frames + required_heap_pts + 1
             && delete_refusals == 0
             && unmap_refusals == 0
             && move_refusals == 0,
@@ -6781,40 +6810,6 @@ fn lsa_selfrpc_bounded_spec(passed: &mut u64) {
         passed,
     );
 }
-/// Boot-readiness milestone epoch used by the progress-stall watchdog. Only durable movement toward
-/// the validation frontier belongs here: a new image/page mapping or the first observation of an
-/// Explorer paint milestone. Registry traffic, handle churn, waiter wakes, and IPC completions are
-/// normal runtime activity and must not extend the readiness deadline.
-static BOOT_PROGRESS_EPOCH: AtomicU64 = AtomicU64::new(0);
-static BOOT_PROGRESS_MILESTONES: AtomicU64 = AtomicU64::new(0);
-static BOOT_PROGRESS_SEALED: AtomicBool = AtomicBool::new(false);
-
-#[derive(Clone, Copy)]
-pub(crate) enum BootProgress {
-    ImageActivated,
-    PageMappingPublished,
-    UserShellImageAttempted,
-    ExplorerMessageRegistrationObserved,
-    ExplorerDirectDrawObserved,
-    ExplorerBeginPaintObserved,
-    ExplorerEndPaintObserved,
-    ExplorerGdiBatchObserved,
-}
-
-impl BootProgress {
-    const fn one_shot_bit(self) -> u64 {
-        match self {
-            Self::ImageActivated | Self::PageMappingPublished => 0,
-            Self::UserShellImageAttempted => 1 << 0,
-            Self::ExplorerMessageRegistrationObserved => 1 << 1,
-            Self::ExplorerDirectDrawObserved => 1 << 2,
-            Self::ExplorerBeginPaintObserved => 1 << 3,
-            Self::ExplorerEndPaintObserved => 1 << 4,
-            Self::ExplorerGdiBatchObserved => 1 << 5,
-        }
-    }
-}
-
 pub(crate) fn explorer_chrome_runtime_milestones_reached() -> bool {
     let begin = EXPLORER_BEGIN_PAINTS.load(Ordering::Relaxed);
     begin != 0
@@ -6824,31 +6819,6 @@ pub(crate) fn explorer_chrome_runtime_milestones_reached() -> bool {
         && EXPLORER_GDI_BATCH_RECORDS.load(Ordering::Relaxed) != 0
 }
 
-#[inline]
-pub(crate) fn note_boot_progress(progress: BootProgress) {
-    if BOOT_PROGRESS_SEALED.load(Ordering::Acquire) {
-        return;
-    }
-    let one_shot_bit = progress.one_shot_bit();
-    if one_shot_bit != 0
-        && BOOT_PROGRESS_MILESTONES.fetch_or(one_shot_bit, Ordering::AcqRel) & one_shot_bit != 0
-    {
-        return;
-    }
-    BOOT_PROGRESS_EPOCH.fetch_add(1, Ordering::Relaxed);
-    if explorer_chrome_runtime_milestones_reached()
-        && BOOT_PROGRESS_SEALED
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    {
-        print_str(b"[quiesce] Explorer runtime paint milestones complete; boot-progress epoch sealed\n");
-    }
-}
-
-#[inline]
-pub(crate) fn boot_progress_epoch() -> u64 {
-    BOOT_PROGRESS_EPOCH.load(Ordering::Relaxed)
-}
 /// services' RPC listener thread fault count (multiplex proof).
 static SVC_LISTENER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// BATCH 34 DIAG: per-SSN trace counter for the svc-listener (bounded print of its native SSNs).
@@ -9335,27 +9305,6 @@ unsafe fn shared_image_mapping_put_banked(
         shared_image_mapping_delete_cap(pi as u8, cap);
         false
     }
-}
-
-unsafe fn shared_image_mapping_replace_banked_after_map(
-    pi: u64,
-    process: nt_memory_manager::ProcessIdentity,
-    page: u64,
-    map_cap: u64,
-) -> bool {
-    if pi > u8::MAX as u64 || map_cap == 0 {
-        SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    if shared_image_mapping_find_for(pi, process, page).is_err() {
-        SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    if let Ok(Some(old_map_cap)) = shared_image_mapping_take_for(pi, process, page) {
-        let _ = cnode_delete_recycle_r(old_map_cap);
-        IMAGE_MAP_CAP_REPLACEMENTS.fetch_add(1, Ordering::Relaxed);
-    }
-    shared_image_mapping_put_banked(pi, process, page, map_cap)
 }
 
 unsafe fn shared_image_mapping_contains_for(
@@ -14333,6 +14282,22 @@ unsafe fn grant_hosted_devnode_resources(
     filtered_resource_requirements: alloc::vec::Vec<u8>,
 ) -> Result<Option<HostedDevnodeGrant>, nt_status::NtStatus> {
     match plan {
+        PreparedHostedResourcePlan::BusReportedBusNumber { resources } => {
+            if !filtered_resource_requirements.is_empty() {
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
+            Ok(Some(HostedDevnodeGrant {
+                kind: HostedDevnodeGrantKind::RootBus,
+                raw_resource_list: resources.raw_resources,
+                translated_resource_list: resources.translated_resources,
+                mmio_phys: 0,
+                mmio_len: 0,
+                io_port_base: 0,
+                io_port_len: 0,
+                vector: 0,
+                dma_len: 0,
+            }))
+        }
         PreparedHostedResourcePlan::Pci {
             bus_resources,
             window,
@@ -14943,17 +14908,16 @@ pub(crate) unsafe fn map_image_skeleton(pml4: u64, img_count: u64) {
     map_cluster_pt(pml4);
 }
 
-/// Map the executive's OWN heap (so its front-end can allocate). Builds the heap PT first (the
-/// heap is relocated far above the image, so — unlike before — the kernel's ELF PTs don't cover
-/// it), then maps all HEAP_FRAMES at the relocated `HEAP_BASE`.
-unsafe fn map_own_heap() {
-    map_heap_pts(CAP_INIT_THREAD_VSPACE, allocator::HEAP_FRAMES);
-    let Some(frame_base) = try_alloc_slot_run(allocator::HEAP_FRAMES) else {
-        panic!("required executive heap cap run allocation failed");
+/// Map one contiguous root heap span. This path uses only cap/syscall/static bookkeeping, so the
+/// allocator can invoke it while holding its own lock when the durable arena needs more pages.
+unsafe fn map_own_heap_frames(first: u64, count: u64) -> bool {
+    let Some(frame_base) = try_alloc_slot_run(count) else {
+        print_str(b"[paging] executive heap cap run unavailable\n");
+        return false;
     };
     let mut retyped = 0u64;
-    while retyped < allocator::HEAP_FRAMES {
-        let batch = (allocator::HEAP_FRAMES - retyped).min(ROOT_RETYPE_FAN_OUT_LIMIT);
+    while retyped < count {
+        let batch = (count - retyped).min(ROOT_RETYPE_FAN_OUT_LIMIT);
         let error = untyped_retype_r(
             CAP_INIT_UNTYPED,
             OBJ_X86_4K_PAGE,
@@ -14966,7 +14930,7 @@ unsafe fn map_own_heap() {
             print_hex((frame_base >> 32) as u32);
             print_hex(frame_base as u32);
             print_str(b" index=");
-            print_u64(retyped);
+            print_u64(first + retyped);
             print_str(b" batch=");
             print_u64(batch);
             print_str(b" error=");
@@ -14976,10 +14940,10 @@ unsafe fn map_own_heap() {
         }
         retyped += batch;
     }
-    root_slot_pin_run(frame_base, allocator::HEAP_FRAMES);
-    for i in 0..allocator::HEAP_FRAMES {
+    root_slot_pin_run(frame_base, count);
+    for i in 0..count {
         let f = frame_base + i;
-        let va = allocator::HEAP_BASE as u64 + i * 0x1000;
+        let va = allocator::HEAP_BASE as u64 + (first + i) * 0x1000;
         let map = page_map_r(f, va, RW_NX, CAP_INIT_THREAD_VSPACE);
         if map != 0 {
             let _ = cnode_delete_recycle_r(f);
@@ -14994,11 +14958,47 @@ unsafe fn map_own_heap() {
             print_str(b"\n");
             panic!("required executive heap page map failed");
         }
-        // The initial rootserver has no external pager. Touch every page while the mapping
-        // operation and cap are still in scope so a bad kernel mapping cannot survive until a
-        // late allocator memcpy and appear as an unserviceable user fault.
+        // The initial rootserver has no external pager. Detect bad maps at their source.
         core::ptr::write_volatile(va as *mut u8, 0);
     }
+    true
+}
+
+/// Map initial durable pages and the fixed transient lane without committing the intervening VA.
+unsafe fn map_own_heap() {
+    map_heap_pts(CAP_INIT_THREAD_VSPACE, allocator::HEAP_FRAMES);
+    if !map_own_heap_frames(0, allocator::EXECUTIVE_INITIAL_HEAP_FRAMES) {
+        panic!("required executive heap cap run allocation failed");
+    }
+    if !map_own_heap_frames(
+        allocator::EXECUTIVE_DURABLE_HEAP_FRAMES,
+        allocator::EXECUTIVE_TRANSIENT_HEAP_FRAMES,
+    ) {
+        panic!("required executive transient heap cap run allocation failed");
+    }
+    allocator::publish_root_heap_commit(allocator::EXECUTIVE_INITIAL_HEAP_FRAMES);
+}
+
+/// Called under the allocator lock. Publish the expanded durable bound only after all new frame
+/// mappings exist; a failed cap reservation leaves the old bound intact.
+pub(crate) unsafe fn grow_own_heap(requested_end: usize) -> bool {
+    let current = allocator::root_heap_committed_frames();
+    let Some(target) = allocator::root_commit_target(current, requested_end) else {
+        return false;
+    };
+    if target == current {
+        return true;
+    }
+    if !map_own_heap_frames(current, target - current) {
+        return false;
+    }
+    allocator::publish_root_heap_commit(target);
+    print_str(b"[heap] executive durable committed frames=");
+    print_u64(target);
+    print_str(b"/ ");
+    print_u64(allocator::EXECUTIVE_DURABLE_HEAP_FRAMES);
+    print_str(b"\n");
+    true
 }
 
 /// Build a spawned service's VSpace: image RO+X, private heap, private stack, and
@@ -18401,6 +18401,9 @@ unsafe fn release_hosted_thread_win32_context(
     }
 
     if let Some(expected) = thread_win32 {
+        if !win32k_glue::retire_thread_attach(client) {
+            return false;
+        }
         let flags = if final_mechanism {
             win32k_subsystem::PS_WIN32_PROVIDER_RETAIN_THREAD_CONTEXT
         } else {
@@ -22657,6 +22660,7 @@ const OBJ_KIND_LPC_PORT: u8 = 5;
 const OBJ_KIND_TIMER: u8 = 6;
 const OBJ_KIND_IO_COMPLETION: u8 = 7;
 const OBJ_KIND_JOB: u8 = 8;
+const OBJ_KIND_SECTION: u8 = 9;
 const OBJ_KIND_DELETED: u8 = 0xff;
 const OBJ_NAME_CAP: usize = 128;
 const OBJ_PARENT_ROOT: usize = usize::MAX;
@@ -23305,6 +23309,8 @@ struct ExecNtHandler {
     /// The minimal object-manager namespace (index 0 = root `\`). Entries are inline and the owned
     /// vector grows beyond its boot reserve when required.
     obj_ns: alloc::vec::Vec<ObjEntry>,
+    /// Native image Section identities and their exact file-backed lifetime.
+    image_sections: native_image_sections::NativeImageStore,
     /// Dispatcher state for every `obj_ns` event, keyed by the stable namespace index. The store
     /// owns manual/auto-reset and signal state; `obj_ns` owns names and identity.
     events: nt_kernel_exec::EventStore,
@@ -24017,6 +24023,9 @@ struct PendingDriverStartTransfer {
 }
 
 enum PendingDriverStartOwner {
+    CriticalChild {
+        claim: Option<nt_pnp_manager::CriticalChildStartClaim>,
+    },
     User {
         request: Option<nt_pnp_manager::StartDeviceRequestIdentity>,
         reply: Option<PendingPnpSyscallReply>,
@@ -26319,13 +26328,18 @@ unsafe fn spawn_hosted_thread_mechanism(
     let e_ipc = tcb_set_ipc_buffer_r(tcb, t.ipcbuf_va, ipcbuf);
     if e_ipc != 0 { return failed!(); }
     let e_regs = if let Some(context) = t.user_context {
-        let initial = context.initial_context.prepare_direct_install();
-        if thread_context::write(tcb, &initial, false).is_err() { return failed!(); }
-        if context.loader_va.is_some() {
-            tcb_write_registers_r(tcb, t.tramp_va, new_sp, 0)
+        let initial = if context.loader_va.is_some() {
+            match context.initial_context.prepare_loader_entry(
+                t.tramp_va, new_sp, exec_handler::HIGHEST_USER_ADDRESS,
+            ) {
+                Ok(initial) => initial,
+                Err(_) => return failed!(),
+            }
         } else {
-            0
-        }
+            context.initial_context.prepare_direct_install()
+        };
+        if thread_context::write(tcb, &initial, false).is_err() { return failed!(); }
+        0
     } else {
         tcb_write_registers_r(tcb, t.tramp_va, new_sp, 0)
     };
@@ -29233,27 +29247,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     CAP_INIT_THREAD_VSPACE,
                 );
             }
-            // The generated ntdll buffer, mapped in the executive at its own 2 MiB region.
-            let nb_pt = alloc_slot();
-            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, nb_pt);
-            let _ = paging_struct_map(
-                nb_pt,
-                LBL_X86_PAGE_TABLE_MAP,
-                NTDLLBUF_VADDR,
-                CAP_INIT_THREAD_VSPACE,
-            );
-            let nb_start = alloc_frame();
-            for _ in 1..NTDLLBUF_FRAMES {
-                let _ = alloc_frame();
-            }
-            for i in 0..NTDLLBUF_FRAMES {
-                let _ = page_map(
-                    copy_cap(nb_start + i),
-                    NTDLLBUF_VADDR + i * 0x1000,
-                    RW_NX,
-                    CAP_INIT_THREAD_VSPACE,
-                );
-            }
             // NLS and hive retain their original shared-input region.
             let shared_input_pt = alloc_slot();
             let _ = untyped_retype(
@@ -29512,7 +29505,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 dma_frame,
                 shared_start,
                 fb_start,
-                nb_start,
                 srvbuf_start,
                 win32buf_start,
                 nls_starts[0],
@@ -29587,15 +29579,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 (verdict & 0x10) != 0,
                 &mut passed,
             );
-            // P7 FS-BACKED-BY-PATH: the storage host resolved + read ntdll.dll from the real
-            // install tree at \reactos\system32\ntdll.dll via a nested-directory walk (not the
-            // flat staged ::NTDLL.DLL) — the first binary loaded from a real FS BY PATH.
-            check(
-                b"exec_ntdll_loaded_from_fs_by_path",
-                (verdict & 0x100) != 0,
-                &mut passed,
-            );
-            // P7-A: the WHOLE ReactOS stack (smss/csrss/csrsrv/basesrv/winsrv/ntdll + the Win32
+            // P7-A: the storage-host stack (smss/csrss/csrsrv/basesrv/winsrv + the Win32
             // client stack + NLS + win32k/dxg/ftfd/arial/winlogon + the SYSTEM hive) was
             // sourced BY PATH from the real \reactos install tree — ZERO fallbacks to a flat ::NAME.
             let fs_hits = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0xA0) as *const u32);
@@ -30906,6 +30890,25 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     CAP_INIT_THREAD_VSPACE,
                 );
             }
+            let mut seh_image = win32k_seh_image::load_from_os(
+                &exec_fs().expect("win32k requires the mounted OS filesystem"),
+            )
+                .expect("win32k exception linkage PE missing or invalid");
+            let seh_frames = seh_image.frame_count();
+            let seh_base = alloc_frame();
+            for _ in 1..seh_frames {
+                let _ = alloc_frame();
+            }
+            for frame in 0..seh_frames {
+                let _ = page_map(
+                    copy_cap(seh_base + frame),
+                    win32k_seh_image::IMAGE_VA + frame * 0x1000,
+                    RW_NX,
+                    CAP_INIT_THREAD_VSPACE,
+                );
+            }
+            seh_image.install().expect("win32k exception linkage installation failed");
+            seh_image.publish_imports().expect("win32k exception linkage import publication failed");
             let pool_base = alloc_frame();
             for _ in 1..win32k_subsystem::WIN32K_POOL_FRAMES {
                 let _ = alloc_frame();
@@ -30943,12 +30946,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // The cross-AS arg-marshal frame(s) — mapped in both the executive and the component.
             let arg_base = alloc_frame();
             for _ in 1..win32k_subsystem::WIN32K_ARG_FRAMES {
-                let _ = alloc_frame();
-            }
-            // Dedicated cross-AS video IOCTL staging. EngDeviceIoControl runs in win32k, but hosted
-            // miniport IRPs are executive-owned and must cross the component boundary explicitly.
-            let video_ioctl_base = alloc_frame();
-            for _ in 1..win32k_subsystem::WIN32K_VIDEO_IOCTL_FRAMES {
                 let _ = alloc_frame();
             }
             // Pointer-free kernel LPC staging. The executive owns the isolated LPC broker caps;
@@ -31058,14 +31055,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     CAP_INIT_THREAD_VSPACE,
                 );
             }
-            for i in 0..win32k_subsystem::WIN32K_VIDEO_IOCTL_FRAMES {
-                let _ = page_map(
-                    copy_cap(video_ioctl_base + i),
-                    win32k_subsystem::WIN32K_VIDEO_IOCTL_VADDR + i * 0x1000,
-                    RW_NX,
-                    CAP_INIT_THREAD_VSPACE,
-                );
-            }
             for i in 0..win32k_subsystem::WIN32K_LPC_FRAMES {
                 let _ = page_map(
                     copy_cap(lpc_request_base + i),
@@ -31134,13 +31123,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 NLS_OEM_SIZE.load(Ordering::Relaxed) as usize,
                 NLS_CASE_SIZE.load(Ordering::Relaxed) as usize,
             ];
+            let win32k_image_size = win32k_seh_image::primary_image_size(
+                WIN32KBUF_VADDR,
+                win32k_size,
+            )
+            .expect("staged win32k PE image size invalid");
             let entry_rva =
                 match win32k_subsystem::load_into(WIN32KBUF_VADDR, win32k_size, nls_sizes) {
                     Some(entry_rva) => {
                         let _ = register_system_module(
                             b"reactos\\system32\\win32k.sys",
                             win32k_subsystem::WIN32K_CODE_VA,
-                            win32k_pe::WIN32K_PE.size_of_image,
+                            win32k_image_size,
                         );
                         entry_rva
                     }
@@ -31158,6 +31152,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_ENTRY_RVA)
                     as *mut u64,
                 entry_rva as u64,
+            );
+            core::ptr::write_volatile(
+                win32k_subsystem::WIN32K_SEH_FOREIGN_CALL2_VA as *mut u64,
+                seh_image.linkage().foreign_call2_va,
+            );
+            core::ptr::write_volatile(
+                win32k_subsystem::WIN32K_SEH_FOREIGN_CALL16_VA as *mut u64,
+                seh_image.linkage().foreign_call16_va,
             );
             core::ptr::write_volatile(
                 (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_VERDICT) as *mut u32,
@@ -31199,11 +31201,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     pts: 0,
                 }; 32];
                 let mut n = 0usize;
-                // Heap (uses the pre-built heap PT — map_heap_pt=true).
+                // Private heap reserves its band; physical pages commit on authenticated faults.
                 regions[n] = Region {
-                    source: FrameSource::FreshZeroed,
+                    source: FrameSource::DemandZeroed { initial_frames: allocator::DEFAULT_SERVICE_HEAP_FRAMES },
                     base_va: allocator::HEAP_BASE as u64,
-                    count: allocator::DEFAULT_SERVICE_HEAP_FRAMES,
+                    count: allocator::HEAP_FRAMES,
                     rights: Rights::Uniform(RW_NX),
                     pts: 0,
                 };
@@ -31215,6 +31217,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     count: win32k_subsystem::WIN32K_IMAGE_FRAMES,
                     rights: Rights::PerFrame(code_rights_static),
                     pts: 2,
+                };
+                n += 1;
+                regions[n] = Region {
+                    source: FrameSource::Alias(seh_base),
+                    base_va: win32k_seh_image::IMAGE_VA,
+                    count: seh_frames,
+                    rights: Rights::PerFrame(
+                        seh_image.publish_frame_rights()
+                            .expect("win32k SEH frame rights already published"),
+                    ),
+                    pts: 0,
                 };
                 n += 1;
                 // The aux PT window (DATA/SHARED/ARG live here) — a single PT built ahead of those frames.
@@ -31329,15 +31342,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     pts: 0,
                 };
                 n += 1;
-                // Video IOCTL staging (aux PT window).
-                regions[n] = Region {
-                    source: FrameSource::Alias(video_ioctl_base),
-                    base_va: win32k_subsystem::WIN32K_VIDEO_IOCTL_VADDR,
-                    count: win32k_subsystem::WIN32K_VIDEO_IOCTL_FRAMES,
-                    rights: Rights::Uniform(RW_NX),
-                    pts: 0,
-                };
-                n += 1;
                 // Kernel LPC request staging (aux PT window).
                 regions[n] = Region {
                     source: FrameSource::Alias(lpc_request_base),
@@ -31430,6 +31434,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 WIN32K_ROOT_IMAGE_MAP_OWNER.store(sc.map_cap_bank.owner as u64, Ordering::Relaxed);
                 sc
             };
+            win32k_seh_image::publish(
+                primary_component.pml4,
+                seh_image,
+                win32k_image_size,
+            )
+            .expect("win32k exception image catalog rejected");
+            win32k_glue::load_win32k_static_import_drivers(primary_component.pml4);
+            let (dependencies, loaded, _patches, failures) =
+                win32k_glue::win32k_static_import_loader_proofs();
+            if loaded != dependencies || failures != 0 {
+                panic!("win32k static import dependency load failed");
+            }
             let host_pml4 = primary_component.pml4;
             let primary_cnode = primary_component.cnode;
             let primary_sched_context = primary_component.sched_context;
@@ -32146,16 +32162,21 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // .text faults in live, then it calls RtlNormalizeProcessParams via the resolved
                 // IAT -> NTDLL_BASE+0x48f00 -> ntdll's .text page faults in and REAL NTDLL CODE
                 // EXECUTES. It runs until it derefs the (null) process params -> a safe stop.
-                let ntdll_size =
-                    core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x28) as *const u32);
-                assert!((ntdll_size as u64) <= NTDLLBUF_FRAMES * 0x1000);
-                let ntdll_bytes =
-                    core::slice::from_raw_parts(NTDLLBUF_VADDR as *const u8, ntdll_size as usize);
+                let ntdll_source =
+                    bootstrap_image::load_installed(b"reactos\\system32\\ntdll.dll");
+                check(
+                    b"exec_ntdll_loaded_from_fs_by_path",
+                    ntdll_source.is_some(),
+                    &mut passed,
+                );
+                let ntdll_source = ntdll_source
+                    .expect("bootstrap requires the complete installed ntdll file");
+                let ntdll_bytes = ntdll_source.bytes();
                 let si_fault = spawn_hosts::shared_ingress::owner::runtime::prepare(1)
                     .expect("hosted users share the owned executive ingress endpoint");
                 // OUR Rust ntdll IS `\reactos\system32\ntdll.dll` (make_image stages ours under that
-                // name; the real ReactOS ntdll is NOT on the image). So the ntdll bytes the storage
-                // host read into NTDLLBUF are OURS — no separate load, no flag, no fallback. We DERIVE
+                // name; the real ReactOS ntdll is NOT on the image). The persistent source above
+                // contains the complete installed file, without a staging-size limit. We DERIVE
                 // LdrpInitialize's RVA from the loaded ntdll's export table (never hardcode — it drifts
                 // across builds) and pass it to the spawn trampoline so it calls OUR loader entry.
                 if let Ok(ntdll_pe) = nt_pe_loader::PeFile::parse(ntdll_bytes) {
@@ -32176,7 +32197,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     let tp_completion_worker_rva = ntdll_export_rva("RtlpCompletionWorkerThread");
                     // Relocate ntdll for its load at NTDLL_BASE — its .data list heads etc. hold
                     // absolute self-pointers at the preferred base otherwise.
-                    apply_relocations_to_buf(&ntdll_pe, NTDLLBUF_VADDR, NTDLL_BASE);
+                    apply_relocations_to_buf(&ntdll_pe, ntdll_source.source_va(), NTDLL_BASE);
                     // Publish it so EVERY hosted SEC_IMAGE spawn (csrss/winlogon/services/lsass, all
                     // spawned in service_sec_image.rs) calls OUR LdrpInitialize + uses the native
                     // transport — our ntdll is the ntdll for all of them, not just smss.
@@ -33795,6 +33816,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // client-GDI path now works and msgina's real dialog code creates windows. winlogon then parks in
     // the nested modal message pump (blocked on credential input a headless host can't supply).
     check_logon_dialog_gates(&mut passed);
+    if let Some(covered) = driver_launch::source_observability::report() {
+        check(b"exec_source_native_milestone_coverage", covered, &mut passed);
+    }
 
     // Report both the address-space watermark and actual reusable storage. Durable objects can sit
     // above dropped allocations, so the bump alone is not a live-memory or headroom measurement.

@@ -8,7 +8,7 @@ use nt_io_manager::{
     ReadWriteParameters,
 };
 use nt_memory_manager::data_section::{
-    plan_data_section_page_read, DataSectionPageRead, DATA_PAGE_SIZE,
+    plan_data_section_read_window, DataSectionReadWindow, DATA_PAGE_SIZE,
 };
 use nt_memory_manager::pending_section_pagein::{
     PendingSectionPageReadId, PendingSectionPageReads,
@@ -51,7 +51,7 @@ struct Work {
     lease: nt_memory_manager::RoutedSectionLease,
     page: u64,
     page_index: u64,
-    plan: Option<DataSectionPageRead>,
+    plan: Option<DataSectionReadWindow>,
     access: nt_address_space::FaultAccess,
     capture: driver_launch::hosted_file_capture::Capture,
     origin_driver: u64,
@@ -408,7 +408,9 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                 work.phase = Phase::Cancel;
                 return false;
             };
-            let plan = match plan_data_section_page_read(work.page_index, section.size, end_of_file)
+            let plan = match plan_data_section_read_window(
+                work.page_index, section.size, end_of_file, 8,
+            )
             {
                 Ok(plan) => plan,
                 Err(status) => {
@@ -417,7 +419,7 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                     return false;
                 }
             };
-            let read_id = match (&mut *core::ptr::addr_of_mut!(READS)).reserve(
+            let read_id = match (&mut *core::ptr::addr_of_mut!(READS)).reserve_window(
                 work.section,
                 work.lease,
                 work.page_index,
@@ -447,7 +449,14 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                 .unwrap();
             assert_eq!(page_index, work.page_index);
             let plan = work.plan.unwrap();
-            let mut output = [0u8; DATA_PAGE_SIZE];
+            let mut output = Vec::new();
+            if output.try_reserve_exact(plan.length()).is_err() {
+                (&mut *core::ptr::addr_of_mut!(READS)).cancel_reserved(work.read_id.unwrap());
+                work.failure = Some(STATUS_INSUFFICIENT_RESOURCES);
+                work.phase = Phase::Cancel;
+                return false;
+            }
+            output.resize(plan.length(), 0);
             let result = driver_launch::io_manager_mut().build_and_dispatch_external_to_device(
                 nt_types::ClientId(driver_launch::IO_MANAGER_COMPONENT_ID),
                 DeviceId(work.capture.device_id()),
@@ -462,7 +471,7 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                 }),
                 0,
                 plan.length() as u32,
-                &mut output[..plan.length()],
+                &mut output,
             );
             match result {
                 Ok(ExternalDispatchResult::Completed {
@@ -615,17 +624,21 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                 unreachable!()
             };
             let ctx = handler.loop_ctx.unwrap();
-            if service_sec_image::section_pagein::service_publish_section_frame_from_bytes(
-                ctx.generic_sections,
-                work.section,
-                work.page_index,
-                bytes,
-                hosted_scratch_base_for_pi(work.pi),
-            )
-            .is_err()
-            {
-                work.phase = Phase::Cancel;
-                return false;
+            let plan = work.plan.unwrap();
+            for (index, page) in bytes.chunks_exact(DATA_PAGE_SIZE).enumerate().take(plan.pages()) {
+                if service_sec_image::section_pagein::service_publish_section_frame_from_bytes(
+                    ctx.generic_sections,
+                    work.section,
+                    work.page_index + index as u64,
+                    page,
+                    hosted_scratch_base_for_pi(work.pi),
+                ).is_err() {
+                    if index == 0 {
+                        work.phase = Phase::Cancel;
+                        return false;
+                    }
+                    break;
+                }
             }
             work.phase = Phase::ReadyReply;
             false
@@ -661,6 +674,7 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
             if !client_reply_on(work.reply, 0, 0, 0, 0, 0) {
                 return false;
             }
+            crate::note_boot_progress(crate::BootProgress::PageMappingPublished);
             work.phase = Phase::ReplySent;
             false
         }

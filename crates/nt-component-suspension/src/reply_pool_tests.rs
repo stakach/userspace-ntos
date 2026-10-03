@@ -116,6 +116,25 @@ fn same_lane_is_not_ready_for_a_second_dispatch_while_first_reply_is_owned() {
 }
 
 #[test]
+fn idle_lane_with_receiver_owned_reply_is_not_admissible() {
+    let mut lanes = Lanes::new(1, 2);
+    let lane = lanes.allocate(LaneBinding {
+        executor_id: 10,
+        receive_endpoint: 20,
+        reply_object: 40,
+    }).unwrap();
+    let mut peers = PeerRegistry::new(20, 1);
+    let mut registration = peers.stage_lane(1, 2, &lanes, lane).unwrap();
+    let route = peers.publish_lane(&mut registration, 1, 2, &lanes).unwrap();
+    let receiver = IngressReceiver::<u64>::new(20, 40, 2).unwrap();
+    let pool = IngressReplyPool::<u64>::new(20, 2).unwrap();
+
+    assert!(receiver.excludes_reply(40));
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::Idle));
+    assert!(!pool.ready_for_admission(&receiver, route, &lanes));
+}
+
+#[test]
 fn admission_query_failure_preserves_stored_call_and_all_ownership() {
     for fail_reply in [30, 40] {
         let (mut lanes, mut peers, route, mut owner, mut pool) = setup();

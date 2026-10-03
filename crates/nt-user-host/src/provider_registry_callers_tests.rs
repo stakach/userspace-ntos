@@ -118,6 +118,50 @@ fn foreign_manager_cannot_resolve_or_retire_and_exit_still_allows_cleanup() {
 }
 
 #[test]
+fn retained_job_reference_survives_process_exit_without_live_caller_authority() {
+    let (mut parts, caller) = fixture();
+    let (mut foreign, _) = fixture();
+    let mut owners = RegistryCallerOwners::new();
+    let route = (1u64, 8u64);
+    let dispatch = 7u64;
+    owners.capture(&mut parts.pm, route, Some(dispatch), 0x5000, caller).unwrap();
+    let lifetime = caller.original_thread();
+    assert_eq!(owners.entries[0].reference.validate(&parts.pm), Ok(()));
+    assert_eq!(owners.entries[0].reference.thread_lifetime(), lifetime);
+    assert_eq!(owners.entries[0].reference.process_body(), Some(0x3000));
+    assert_eq!(owners.entries[0].reference.thread_body(), Some(0x4000));
+    assert_eq!(references(&parts.pm, caller), (1, 1));
+
+    parts.pm.terminate_process(lifetime.process_id(), 0).unwrap();
+    // Retained object identity is still valid, but it is not permission to execute a live
+    // handle operation. Native cleanup must not recapture this terminal caller as live.
+    assert_eq!(parts.pm.thread_lifetime(lifetime.thread_id()), Some(lifetime));
+    assert_eq!(owners.entries[0].reference.validate(&parts.pm), Ok(()));
+    assert_eq!(owners.entries[0].reference.validate(&foreign.pm), Err(STATUS_INVALID_HANDLE));
+    for mode in [AccessMode::UserMode, AccessMode::KernelMode] {
+        assert_eq!(parts.pm.capture_native_handle_caller(lifetime, mode), Err(STATUS_INVALID_HANDLE));
+    }
+    assert_eq!(owners.resolve(&parts.pm, route, dispatch, 0x5000), Err(STATUS_INVALID_HANDLE));
+    for (wrong_route, wrong_dispatch, wrong_vspace) in [
+        ((2, 8), dispatch, 0x5000), ((1, 9), dispatch, 0x5000),
+        (route, dispatch + 1, 0x5000), (route, dispatch, 0x6000),
+    ] {
+        assert_eq!(owners.resolve(&parts.pm, wrong_route, wrong_dispatch, wrong_vspace),
+            Err(STATUS_INVALID_HANDLE));
+    }
+    assert_eq!(owners.retire(&mut parts.pm, (1, 9), dispatch), Ok(false));
+    assert_eq!(owners.retire(&mut parts.pm, route, dispatch + 1), Ok(false));
+    assert_eq!(owners.retire(&mut foreign.pm, route, dispatch), Err(STATUS_INVALID_HANDLE));
+    assert_eq!(owners.len(), 1);
+    assert_eq!(references(&parts.pm, caller), (1, 1));
+    assert_eq!(owners.entries[0].reference.validate(&parts.pm), Ok(()));
+    assert_eq!(owners.retire(&mut parts.pm, route, dispatch), Ok(true));
+    assert_eq!(owners.retire(&mut parts.pm, route, dispatch), Ok(false));
+    assert_eq!(owners.resolve(&parts.pm, route, dispatch, 0x5000), Err(STATUS_INVALID_HANDLE));
+    assert_eq!(references(&parts.pm, caller), (0, 0));
+}
+
+#[test]
 fn autonomous_workers_have_distinct_system_threads_and_terminal_reference_owners() {
     let mut parts = PsBootstrapState::try_new(0x1000, 0).unwrap().into_parts();
     let system = parts.pm.initial_system_identity().unwrap();

@@ -19,6 +19,7 @@ pub mod memory;
 mod ntoskrnl;
 mod registry;
 pub mod rtl;
+pub mod source_probe_metrics;
 pub mod ssdt;
 pub mod win32k;
 pub mod win32k_resolve;
@@ -32,7 +33,7 @@ pub use ssdt::{
 };
 pub use win32k::{WIN32K_FTFD_IMPORTS, WIN32K_HAL_IMPORTS, WIN32K_NTOSKRNL_IMPORTS};
 pub use win32k_resolve::{
-    export_descriptor, Win32kExportRegistry, WIN32K_DATA_EXPORTS, WIN32K_EXPORT_INITIAL_RESERVE,
+    export_descriptor, module_export_descriptor, Win32kExportRegistry, WIN32K_DATA_EXPORTS, WIN32K_EXPORT_INITIAL_RESERVE,
 };
 
 /// The v0.1 compatibility status of an export (spec §7.3).

@@ -6,6 +6,7 @@
 
 use alloc::vec::Vec;
 
+use crate::event_deferred_signal::{DeferredEventSignal, DeferredEventSignals};
 use crate::irql::IrqlState;
 
 /// `KEVENT` type.
@@ -68,17 +69,33 @@ struct Event {
     ptr: u64,
     kind: EventKind,
     signaled: bool,
+    generation: u64,
+    state_sequence: u64,
+    issued_sequence: u64,
+}
+
+impl Event {
+    fn mutate(&mut self, signaled: bool) -> Option<bool> {
+        let sequence = self.issued_sequence.checked_add(1)?;
+        let previous = self.signaled;
+        self.signaled = signaled;
+        self.state_sequence = sequence;
+        self.issued_sequence = sequence;
+        Some(previous)
+    }
 }
 
 /// The Driver Host's event store (spec §6.5).
 #[derive(Default)]
 pub struct EventStore {
     events: Vec<Event>,
+    deferred_signals: DeferredEventSignals,
+    issued_generation: u64,
 }
 
 impl EventStore {
     pub fn new() -> Self {
-        Self { events: Vec::new() }
+        Self::default()
     }
 
     /// Construct a store whose backing allocation can be made before a rewindable
@@ -86,6 +103,8 @@ impl EventStore {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             events: Vec::with_capacity(capacity),
+            deferred_signals: DeferredEventSignals::default(),
+            issued_generation: 0,
         }
     }
 
@@ -93,38 +112,62 @@ impl EventStore {
         if let Some(i) = self.events.iter().position(|e| e.ptr == ptr) {
             return &mut self.events[i];
         }
+        let generation = self
+            .issued_generation
+            .checked_add(1)
+            .expect("Event lifetime generation exhausted");
         self.events.push(Event {
             ptr,
             kind: EventKind::Notification,
             signaled: false,
+            generation,
+            state_sequence: 0,
+            issued_sequence: 0,
         });
+        self.issued_generation = generation;
         self.events.last_mut().unwrap()
     }
 
     /// `KeInitializeEvent(Event, Type, State)`.
     pub fn initialize(&mut self, ptr: u64, kind: EventKind, signaled: bool) {
+        assert!(
+            !self.deferred_signals.contains(ptr),
+            "Event reinitialization retains an unpublished completion signal"
+        );
         let e = self.slot(ptr);
+        e.mutate(signaled).expect("Event state sequence exhausted");
         e.kind = kind;
-        e.signaled = signaled;
     }
 
     /// Fallible `KeInitializeEvent` for executive paths that must return a real NT allocation
     /// failure instead of depending on a late heap grow.
     pub fn try_initialize(&mut self, ptr: u64, kind: EventKind, signaled: bool) -> bool {
+        if self.deferred_signals.contains(ptr) {
+            return false;
+        }
         if let Some(i) = self.events.iter().position(|e| e.ptr == ptr) {
             let e = &mut self.events[i];
+            if e.mutate(signaled).is_none() {
+                return false;
+            }
             e.kind = kind;
-            e.signaled = signaled;
             return true;
         }
         if self.events.len() == self.events.capacity() && self.events.try_reserve(16).is_err() {
             return false;
         }
+        let Some(generation) = self.issued_generation.checked_add(1) else {
+            return false;
+        };
         self.events.push(Event {
             ptr,
             kind,
             signaled,
+            generation,
+            state_sequence: 1,
+            issued_sequence: 1,
         });
+        self.issued_generation = generation;
         true
     }
 
@@ -136,11 +179,56 @@ impl EventStore {
     /// Remove an initialized event identity. The executive uses this to roll back an object whose
     /// newly-created handle could not be published to its caller.
     pub fn remove_existing(&mut self, ptr: u64) -> bool {
+        if self.deferred_signals.contains(ptr) {
+            return false;
+        }
         let Some(index) = self.events.iter().position(|event| event.ptr == ptr) else {
             return false;
         };
         self.events.remove(index);
         true
+    }
+
+    /// Prepare an operation's completion Set without altering independently observable state.
+    /// The executive must also retain the canonical Event object and its backing lease.
+    pub fn begin_deferred_signal(&mut self, ptr: u64) -> Result<DeferredEventSignal, ()> {
+        let event = self
+            .events
+            .iter_mut()
+            .find(|event| event.ptr == ptr)
+            .ok_or(())?;
+        let sequence = event.issued_sequence.checked_add(1).ok_or(())?;
+        let token = self
+            .deferred_signals
+            .begin(ptr, event.generation, sequence)?;
+        event.issued_sequence = sequence;
+        Ok(token)
+    }
+
+    /// Publish the reserved signal exactly once, after the origin's terminal acknowledgement.
+    /// A newer visible mutation supersedes it without replaying or undoing that mutation.
+    /// The adapter must arbitrate ready dispatcher waits after this returns.
+    pub fn commit_deferred_signal(&mut self, token: DeferredEventSignal) -> Result<bool, ()> {
+        let index = self
+            .events
+            .iter()
+            .position(|event| {
+                event.ptr == token.native_identity() && event.generation == token.generation()
+            })
+            .ok_or(())?;
+        self.deferred_signals.retire(token)?;
+        let event = &mut self.events[index];
+        let previous = event.signaled;
+        if event.state_sequence < token.state_sequence() {
+            event.signaled = true;
+            event.state_sequence = token.state_sequence();
+        }
+        Ok(previous)
+    }
+
+    /// Cancel an operation that has not committed a visible completion signal.
+    pub fn cancel_deferred_signal(&mut self, token: DeferredEventSignal) -> Result<(), ()> {
+        self.deferred_signals.retire(token)
     }
 
     /// Return the dispatcher type and signal state for an initialized event.
@@ -151,21 +239,25 @@ impl EventStore {
             .map(|event| (event.kind, event.signaled))
     }
 
+    /// Current visible mutation version, excluding unpublished completion reservations.
+    pub fn query_with_sequence(&self, ptr: u64) -> Option<(EventKind, bool, u64)> {
+        self.events
+            .iter()
+            .find(|event| event.ptr == ptr)
+            .map(|event| (event.kind, event.signaled, event.state_sequence))
+    }
+
     /// Strict `NtSetEvent` state transition. Unlike [`Self::set`], this never
     /// manufactures an event for an invalid handle.
     pub fn set_existing(&mut self, ptr: u64) -> Option<bool> {
         let event = self.events.iter_mut().find(|event| event.ptr == ptr)?;
-        let previous = event.signaled;
-        event.signaled = true;
-        Some(previous)
+        event.mutate(true)
     }
 
     /// Strict `NtResetEvent` state transition.
     pub fn reset_existing(&mut self, ptr: u64) -> Option<bool> {
         let event = self.events.iter_mut().find(|event| event.ptr == ptr)?;
-        let previous = event.signaled;
-        event.signaled = false;
-        Some(previous)
+        event.mutate(false)
     }
 
     /// Strict `NtClearEvent` state transition.
@@ -173,8 +265,7 @@ impl EventStore {
         let Some(event) = self.events.iter_mut().find(|event| event.ptr == ptr) else {
             return false;
         };
-        event.signaled = false;
-        true
+        event.mutate(false).is_some()
     }
 
     /// Consume a signaled synchronization event, leaving notification events set.
@@ -185,10 +276,16 @@ impl EventStore {
         if !event.signaled {
             return false;
         }
-        if event.kind == EventKind::Synchronization {
-            event.signaled = false;
-        }
-        true
+        event
+            .mutate(event.kind == EventKind::Notification)
+            .is_some()
+    }
+
+    /// Wait readiness includes admission for the consuming state mutation.
+    pub fn wait_ready(&self, ptr: u64) -> bool {
+        self.events
+            .iter()
+            .any(|event| event.ptr == ptr && event.signaled && event.issued_sequence != u64::MAX)
     }
 
     /// Poll `WaitAny`/`WaitAll` over existing event identities and apply NT
@@ -206,14 +303,14 @@ impl EventStore {
             return WaitManyResult::InvalidEvent;
         }
         if wait_all {
-            if ptrs.iter().any(|ptr| !self.read_state(*ptr)) {
+            if ptrs.iter().any(|ptr| !self.wait_ready(*ptr)) {
                 return WaitManyResult::TimedOut;
             }
             for ptr in ptrs {
                 self.consume_existing(*ptr);
             }
             WaitManyResult::Signaled(0)
-        } else if let Some(index) = ptrs.iter().position(|ptr| self.read_state(*ptr)) {
+        } else if let Some(index) = ptrs.iter().position(|ptr| self.wait_ready(*ptr)) {
             self.consume_existing(ptrs[index]);
             WaitManyResult::Signaled(index)
         } else {
@@ -224,22 +321,20 @@ impl EventStore {
     /// `KeSetEvent` — signal the event, returning the previous state.
     pub fn set(&mut self, ptr: u64) -> bool {
         let e = self.slot(ptr);
-        let old = e.signaled;
-        e.signaled = true;
-        old
+        e.mutate(true).expect("Event state sequence exhausted")
     }
 
     /// `KeResetEvent` — clear + return the previous state.
     pub fn reset(&mut self, ptr: u64) -> bool {
         let e = self.slot(ptr);
-        let old = e.signaled;
-        e.signaled = false;
-        old
+        e.mutate(false).expect("Event state sequence exhausted")
     }
 
     /// `KeClearEvent` — clear (no return value).
     pub fn clear(&mut self, ptr: u64) {
-        self.slot(ptr).signaled = false;
+        self.slot(ptr)
+            .mutate(false)
+            .expect("Event state sequence exhausted");
     }
 
     /// `KeReadStateEvent` — the signaled state.
@@ -255,17 +350,18 @@ impl EventStore {
         if !irql.can_poll() {
             return WaitResult::BadIrql;
         }
-        let e = self.slot(ptr);
-        if e.signaled {
-            if e.kind == EventKind::Synchronization {
-                e.signaled = false; // auto-reset consumes the signal
-            }
+        self.slot(ptr);
+        if self.consume_existing(ptr) {
             WaitResult::Signaled
         } else {
             WaitResult::TimedOut
         }
     }
 }
+
+#[cfg(test)]
+#[path = "event_deferred_signal_tests.rs"]
+mod deferred_signal_tests;
 
 #[cfg(test)]
 mod tests {

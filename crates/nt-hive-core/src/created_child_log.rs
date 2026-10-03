@@ -43,8 +43,9 @@ pub(super) fn decode(payload: &[u8]) -> Result<CreatedChild, HiveLogReplayError>
     let mut reader = Reader::new(payload);
     let parent = string(&mut reader)?;
     let name = string(&mut reader)?;
+    let parent_components = parent.strip_prefix('\\').unwrap_or(&parent);
     if parent.contains('\0')
-        || (!parent.is_empty() && parent.split('\\').any(str::is_empty))
+        || (!parent_components.is_empty() && parent_components.split('\\').any(str::is_empty))
         || name.is_empty()
         || name.contains(['\\', '\0'])
     {

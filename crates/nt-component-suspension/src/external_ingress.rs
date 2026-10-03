@@ -81,6 +81,11 @@ impl<M> ExternalIngress<M> {
     pub fn executor(&self) -> u64 {
         self.executor
     }
+    /// Globally issued selection ordinal, independent of the native queue's reusable slot.
+    /// This is not authority: it does not authorize delivery or transfer retained ownership.
+    pub fn admission_sequence(&self) -> u64 {
+        self.reservation.identity()
+    }
     pub fn message(&self) -> &M {
         self.completed
             .as_ref()

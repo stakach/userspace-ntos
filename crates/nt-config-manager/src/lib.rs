@@ -17,6 +17,8 @@ extern crate alloc;
 
 mod property;
 mod registry;
+mod registry_security;
+mod filter_policy;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -29,6 +31,8 @@ pub use registry::{
     encode_multi_sz, encode_sz, Registry, RegistryKeyId, RegistryTransaction, RegistryValue,
     RegistryValueType,
 };
+pub use filter_policy::{DeviceFilterPolicy, DeviceFilterPolicyError};
+pub use registry_security::{inherit_generated_key_security, validate_generated_key_security};
 
 /// The NT root-bus pseudo-devnode exposed through user-mode PnP relations.
 pub const PNP_ROOT_DEVICE_INSTANCE: &str = r"HTREE\ROOT\0";

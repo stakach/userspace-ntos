@@ -10,7 +10,7 @@ use nt_unwind::{
 };
 use sha2::{Digest, Sha256};
 
-const EXPORTS: [&str; 14] = [
+const EXPORTS: [&str; 15] = [
     "SehCallFilter",
     "SehCallFinally",
     "SehExecuteHandlerForException",
@@ -25,6 +25,7 @@ const EXPORTS: [&str; 14] = [
     "SehFaultEntry",
     "SehFaultDispatch",
     "SehRaiseAccessViolation",
+    "SehUnwind",
 ];
 const RAISE_PROLOGUE: [u8; 8] = [0x9c, 0x48, 0x81, 0xec, 0xf0, 0x04, 0x00, 0x00];
 const RAISE_UNWIND_CODES: [u8; 6] = [8, 1, 0x9e, 0, 1, 2];
@@ -54,6 +55,13 @@ const UNWIND_CODE_SHA256: [u8; 32] = [
     0x66, 0x62, 0x30, 0xec, 0xce, 0xef, 0xc1, 0xf6, 0xdb, 0x71, 0xdf, 0x36, 0xaa, 0xd6, 0x33, 0x3a,
     0x94, 0xd1, 0xf5, 0x19, 0xf2, 0xad, 0x23, 0xa5, 0xba, 0xf2, 0xb2, 0x21, 0x67, 0xb4, 0x1e, 0xd1,
 ];
+const LEGACY_UNWIND_PREFIX: [u8; 26] = [
+    0x48, 0x81, 0xec, 0x08, 0x05, 0x00, 0x00, // sub rsp,0x508
+    0x48, 0x8d, 0x44, 0x24, 0x30, // lea rax,[rsp+0x30]
+    0x48, 0x89, 0x44, 0x24, 0x20, // mov [rsp+0x20],rax
+    0x48, 0xc7, 0x44, 0x24, 0x28, 0, 0, 0, 0, // null history table
+];
+const LEGACY_UNWIND_CODES: [u8; 4] = [7, 1, 0xa1, 0];
 const CALL_FRAME: [u8; 4] = [0x48, 0x83, 0xec, 0x28];
 const UNWIND_ALLOC_40: [u8; 2] = [4, 0x42];
 const EXECUTE_BODY: [u8; 15] = [
@@ -458,6 +466,72 @@ fn verify_unwind_entry(
     Ok(())
 }
 
+fn verify_legacy_unwind_entry(
+    pe: &PeFile<'_>,
+    mapped: &nt_pe_loader::MappedImage,
+    image: &BorrowedExceptionImage<'_>,
+    export: &ExportedSymbol,
+    unwind_ex_rva: u32,
+) -> Result<(), String> {
+    let pc = mapped
+        .load_base
+        .checked_add(u64::from(export.rva))
+        .ok_or("legacy unwind entry VA overflow")?;
+    let function = match image.lookup_exception_function(pc) {
+        Ok(ExceptionFunction::Function { image_base, function })
+            if image_base == mapped.load_base && function.begin == export.rva => function,
+        other => return Err(format!("legacy unwind lacks exact runtime function: {other:?}")),
+    };
+    let code = mapped
+        .bytes
+        .get(function.begin as usize..function.end as usize)
+        .ok_or("legacy unwind code outside image")?;
+    let header: [u8; 4] = mapped
+        .bytes
+        .get(function.unwind_info as usize..function.unwind_info as usize + 4)
+        .ok_or("legacy unwind metadata outside image")?
+        .try_into()
+        .map_err(|_| "legacy unwind metadata malformed")?;
+    let header = UnwindInfoHeader::parse(&header);
+    let displacement = code
+        .get(27..31)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(i32::from_le_bytes)
+        .ok_or("legacy unwind call displacement missing")?;
+    let call_end = export.rva.checked_add(31).ok_or("legacy unwind call overflow")?;
+    if header.version != 1
+        || header.flags != 0
+        || header.is_chained()
+        || header.size_of_prolog != 7
+        || header.frame_register != 0
+        || header.count_of_codes != 2
+        || mapped.bytes.get(function.unwind_info as usize + 4..function.unwind_info as usize + 8)
+            != Some(LEGACY_UNWIND_CODES.as_slice())
+        || code.len() != 33
+        || code.get(..26) != Some(LEGACY_UNWIND_PREFIX.as_slice())
+        || code[26] != 0xe8
+        || code.get(31..) != Some(&[0x0f, 0x0b][..])
+        || call_end.checked_add_signed(displacement) != Some(unwind_ex_rva)
+        || !pe.sections().iter().any(|section| {
+            section.name_str() == ".text"
+                && section_contains(section, export.rva, code.len())
+                && section.is_readable()
+                && section.is_executable()
+                && !section.is_writable()
+        })
+        || !pe.sections().iter().any(|section| {
+            section_contains(section, function.unwind_info, 8)
+                && section.is_readable()
+                && !section.is_writable()
+                && !section.is_executable()
+        })
+    {
+        return Err("legacy unwind wrapper or metadata invalid".into());
+    }
+    println!("{} RVA=0x{:x} unwind=0x{:x}", export.name, export.rva, function.unwind_info);
+    Ok(())
+}
+
 fn verify_dispatch_slot(
     pe: &PeFile<'_>,
     mapped: &nt_pe_loader::MappedImage,
@@ -760,6 +834,11 @@ fn verify(path: &str) -> Result<(), String> {
         .find(|export| export.name == "SehRaiseStatus")
         .ok_or("missing raise export")?
         .rva;
+    let unwind_ex_rva = exports
+        .iter()
+        .find(|export| export.name == "SehUnwindEx")
+        .ok_or("missing six-argument unwind export")?
+        .rva;
     let mapped = pe
         .map(pe.image_base())
         .map_err(|error| format!("map: {error:?}"))?;
@@ -785,6 +864,10 @@ fn verify(path: &str) -> Result<(), String> {
         }
         if export.name == "SehUnwindEx" {
             verify_unwind_entry(&pe, &mapped, &image, &export)?;
+            continue;
+        }
+        if export.name == "SehUnwind" {
+            verify_legacy_unwind_entry(&pe, &mapped, &image, &export, unwind_ex_rva)?;
             continue;
         }
         if export.name == "SehResumeContext" {

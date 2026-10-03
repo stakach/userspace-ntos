@@ -22,6 +22,8 @@ debug-trace = []
 # Native Mup/provider integration boots the normal executive service loop without
 # requiring the unrelated win32k import catalog. Production admission is unchanged.
 mup-provider-kernel-only = []
+# Validation-only win32k-origin IRP caller; excluded from production images.
+source-irp-integration = []
 
 [dependencies]
 # Kernel ABI + SURT transport.
@@ -85,6 +87,7 @@ nt-pnp-context = { path = "../../crates/nt-pnp-context" }
 nt-driver-start = { path = "../../crates/nt-driver-start" }
 # Checked firmware-table discovery remains policy-only; seL4 physical authority lives here.
 nt-acpi = { path = "../../crates/nt-acpi" }
+nt-wmi = { path = "../../crates/nt-wmi" }
 nt-ahci = { path = "../../crates/nt-ahci" }
 # PE loader — load + map + relocate a real Windows .sys binary in the isolated host.
 nt-pe-loader = { path = "../../crates/nt-pe-loader" }

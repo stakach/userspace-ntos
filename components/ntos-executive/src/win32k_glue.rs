@@ -200,6 +200,29 @@ pub(crate) unsafe fn win32k_physical_lane_for_channel(
         })
 }
 
+pub(crate) unsafe fn win32k_physical_stack_route_for_channel(
+    tcb: u64,
+    endpoint: u64,
+    reply_object: u64,
+) -> Option<(
+    nt_component_suspension::peer_registry::PeerRoute,
+    nt_component_suspension::LaneDispatchIdentity,
+    u64,
+    u64,
+)> {
+    let handle = win32k_physical_lane_for_channel(tcb, endpoint, reply_object)?;
+    let lane = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
+        .as_ref()?
+        .iter()
+        .find(|lane| lane.handle == Some(handle) && lane.tcb == tcb)?;
+    let route = lane.route?;
+    let dispatch = crate::spawn_hosts::shared_ingress::owner::runtime::dispatch(route).ok()?;
+    let length = lane.stack_frames.checked_mul(0x1000)?;
+    let last = lane.stack_base.checked_add(length)?.checked_sub(8)?;
+    win32k_stack_alias_for_route(route, last, 8)?;
+    Some((route, dispatch, lane.stack_base, length))
+}
+
 /// Execution quiescence only; callers must separately retire published pointers and mappings.
 pub(crate) unsafe fn win32k_physical_lanes_quiescent() -> bool {
     (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
@@ -594,6 +617,30 @@ unsafe fn retain_failed_shared_win32k_lane(
     print_str(b" provider-retired=1\n");
 }
 
+/// Readiness only: do not admit a lane or allocate worker resources during pump selection.
+pub(crate) unsafe fn source_terminal_dispatch_ready() -> bool {
+    if WIN32K_RETIRED.load(Ordering::Acquire) != 0 {
+        return false;
+    }
+    let Some(lanes) = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES)).as_ref() else {
+        return false;
+    };
+    if lanes.iter().any(|row| {
+        let (Some(handle), Some(route)) = (row.handle, row.route) else { return false; };
+        crate::service_sec_image::component_execution_lane_is_idle(handle)
+            && win32k_physical_lane_binding(handle).is_some()
+            && matches!(crate::spawn_hosts::shared_ingress::owner::runtime::ready_for_admission(route), Ok(true))
+    }) {
+        return true;
+    }
+    !lanes.is_empty()
+        && WIN32K_HOST_PML4.load(Ordering::Acquire) != 0
+        && WIN32K_LANE_STARTUP_ACTIVE.load(Ordering::Acquire) == 0
+        && lanes.iter().filter(|lane| lane.worker.is_some()).count()
+            < win32k_subsystem::WIN32K_LANE_CAPACITY
+        && crate::service_sec_image::component_execution_lane_can_grow()
+}
+
 unsafe fn acquire_or_provision_win32k_execution_lane(
 ) -> Option<nt_component_suspension::LaneHandle> {
     if WIN32K_RETIRED.load(Ordering::Acquire) != 0 {
@@ -602,7 +649,7 @@ unsafe fn acquire_or_provision_win32k_execution_lane(
     if let Some(lane) = acquire_idle_win32k_execution_lane() {
         return Some(lane);
     }
-    if !crate::service_sec_image::component_execution_lane_needs_capacity() {
+    if !crate::service_sec_image::component_execution_lane_can_grow() {
         return None;
     }
     let pml4 = WIN32K_HOST_PML4.load(Ordering::Acquire);
@@ -613,17 +660,29 @@ unsafe fn acquire_or_provision_win32k_execution_lane(
 }
 
 unsafe fn acquire_idle_win32k_execution_lane() -> Option<nt_component_suspension::LaneHandle> {
-    let (handle, route) = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
-        .as_ref()?
-        .iter()
-        .find_map(|row| {
-            let handle = row.handle?;
-            (crate::service_sec_image::component_execution_lane_is_idle(handle)
-                && win32k_physical_lane_binding(handle).is_some())
-                .then_some((handle, row.route))
-        })?;
-    let dispatch = crate::spawn_hosts::shared_ingress::owner::runtime::admit(route?).ok()?;
-    (dispatch.lane() == handle).then_some(handle)
+    let lanes = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES)).as_ref()?;
+    for row in lanes {
+        let (Some(handle), Some(route)) = (row.handle, row.route) else {
+            continue;
+        };
+        if !crate::service_sec_image::component_execution_lane_is_idle(handle)
+            || win32k_physical_lane_binding(handle).is_none()
+        {
+            continue;
+        }
+        if !matches!(
+            crate::spawn_hosts::shared_ingress::owner::runtime::ready_for_admission(route),
+            Ok(true)
+        ) {
+            continue;
+        }
+        match crate::spawn_hosts::shared_ingress::owner::runtime::admit(route) {
+            Ok(dispatch) if dispatch.lane() == handle => return Some(handle),
+            Ok(_) => return None,
+            Err(_) => continue,
+        }
+    }
+    None
 }
 
 unsafe fn shared_win32k_lane_route(
@@ -789,15 +848,13 @@ static mut USER_CALLBACK_SAS_SEQUENCE: nt_user_callback::SasWmCreateNestedSequen
     nt_user_callback::SasWmCreateNestedSequence::new();
 static USER_CALLBACK_SAS_SEQUENCE_ACTIVE: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_SAS_SEQUENCE_CALLBACK_ID: AtomicU64 = AtomicU64::new(0);
-static WIN32K_GDI_LOADER_PML4: AtomicU64 = AtomicU64::new(0);
-static DXGTHK_DRIVER_LOADED: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STATIC_IMPORT_DEPENDENCIES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STATIC_IMPORTS_LOADED: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STATIC_IMPORT_IAT_PATCHES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STATIC_IMPORT_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 const WIN32K_STATIC_IMPORT_BASE_VA: u64 = 0x0000_0100_0870_0000;
-const WIN32K_STATIC_IMPORT_LIMIT_VA: u64 = win32k_subsystem::FRAMEBUF_VA;
+const WIN32K_STATIC_IMPORT_LIMIT_VA: u64 = 0x0000_0100_0890_0000;
 const WIN32K_STATIC_IMPORT_ALIGN: u64 = 0x0010_0000;
 
 #[derive(Clone, Copy)]
@@ -1316,8 +1373,53 @@ fn authenticated_client_window_owner(
 }
 
 unsafe fn select_win32k_client_window(client: Win32kClientContext) -> bool {
-    authenticated_client_window_owner(client)
-        .is_some_and(|owner| unsafe { w32_client_attach(owner) })
+    let Some(owner) = authenticated_client_window_owner(client) else {
+        return false;
+    };
+    match client.logical_caller {
+        Some(caller) => process_attach_root::select_effective_client(caller, owner),
+        None => w32_client_attach(owner),
+    }
+}
+
+unsafe fn grant_win32k_client_ps_bodies(client: Win32kClientContext) -> Result<(), u32> {
+    let Some(caller) = client.logical_caller else {
+        return if client.tid == 0 && client.tcb == 0 {
+            Ok(())
+        } else {
+            Err(nt_process::STATUS_INVALID_PARAMETER)
+        };
+    };
+    let catalog = (&*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS))
+        .identity()
+        .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+    let domain = crate::current_win32k_provider_domain()
+        .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+    let provider = crate::ps_object_provider::ProviderRoot::new(
+        catalog,
+        domain,
+        WIN32K_HOST_PML4.load(Ordering::Acquire),
+    )?;
+    crate::service_sec_image::with_provider_process_manager(|pm| {
+        let lifetime = caller.thread();
+        if pm.thread_lifetime(lifetime.thread_id()) != Some(lifetime)
+            || pm.process_kernel_object(lifetime.process_id()) != Some(client.eprocess)
+            || pm.thread_kernel_object(lifetime.thread_id()) != Some(client.ethread)
+        {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
+        use crate::ps_object_backing::PublishedBody;
+        for body in [PublishedBody::Process, PublishedBody::Thread] {
+            crate::ps_object_backing::grant_published_body(
+                pm,
+                lifetime,
+                body,
+                provider,
+                crate::ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
+            )?;
+        }
+        Ok(())
+    })
 }
 
 fn win32k_dispatch_client_identity(
@@ -2957,7 +3059,18 @@ pub(crate) unsafe fn service_user_callback(
         if !base_shape_valid {
             return false;
         }
-        if matches!(contract, nt_user_callback::UserCallbackContract::Lpk) {
+        if matches!(contract, nt_user_callback::UserCallbackContract::WindowProc) {
+            let payload = core::slice::from_raw_parts(
+                core::ptr::addr_of!((*frame).payload) as *const u8,
+                request.input_length as usize,
+            );
+            nt_user_callback::windowproc_lparam_span(payload).is_ok_and(|span| {
+                request.payload_reference_offset == span.as_ref().map_or(
+                    nt_user_callback::NO_PAYLOAD_REFERENCE,
+                    |span| span.start as u32,
+                )
+            })
+        } else if matches!(contract, nt_user_callback::UserCallbackContract::Lpk) {
             contract.accepts_lpk_layout(
                 request.input_length,
                 callback_payload_u64(frame, 0),
@@ -3522,6 +3635,17 @@ unsafe fn redirect_pending_user_callback(
             + core::mem::size_of::<nt_user_callback::CallbackHeader>() as u64)
             as *const u8;
         let input = core::slice::from_raw_parts(shared, request.input_length as usize);
+        if request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC {
+            let Ok(span) = nt_user_callback::windowproc_lparam_span(input) else {
+                return false;
+            };
+            if request.payload_reference_offset != span.as_ref().map_or(
+                nt_user_callback::NO_PAYLOAD_REFERENCE,
+                |span| span.start as u32,
+            ) {
+                return false;
+            }
+        }
         if !crate::img_spawn::client_write_mapped(
             client.pi as u64,
             layout.input_pointer,
@@ -5603,291 +5727,23 @@ pub(crate) unsafe fn ensure_w32_client_paging(page: u64, w_pml4: u64) -> bool {
 #[path = "win32k_attach.rs"]
 mod client_attach;
 pub(crate) use client_attach::*;
+#[path = "win32k_process_attach_root.rs"]
+mod process_attach_root;
+pub(crate) use process_attach_root::service_process_attach;
+pub(crate) use process_attach_root::retire_thread_attach;
+pub(crate) use process_attach_root::retire_kernel_attach;
 
 
-/// Load ONE driver PE (raw at `src_va` in the executive) into `dst_va` in BOTH the executive (RW,
-/// to load) and win32k (W^X, to run). Reuses [`win32k_subsystem::load_driver_into`]. `dxgthk_base` names
-/// a prior-loaded dxgthk for import resolution (0 for a leaf). Returns (entry_rva, export_dir_rva,
-/// size_of_image). The reusable driver-loader mechanism is also used by display DLL hosting.
-#[inline(never)]
-unsafe fn load_one_driver_fail(stage: &[u8], subject: u64, error: u64) -> Option<(u32, u32, u32)> {
-    print_str(b"[win32k-svc] driver image load ");
-    print_str(stage);
-    print_str(b" failed subject=0x");
-    print_hex((subject >> 32) as u32);
-    print_hex(subject as u32);
-    print_str(b" error=");
-    print_u64(error);
-    print_str(b"\n");
-    None
+/// Checked system-image loading owns its mappings and opaque module allocation independently.
+#[path = "win32k_image_loader.rs"]
+mod image_loader;
+#[cfg(feature = "source-irp-integration")]
+#[path = "source_irp_integration.rs"]
+pub(crate) mod source_irp_integration;
+pub(crate) unsafe fn service_gdi_image_request(pointer: u64, length: u64,
+    source: crate::spawn_hosts::shared_ingress::owner::runtime::PhysicalSource) -> (i32, u64) {
+    image_loader::service_request(pointer, length, source)
 }
-
-unsafe fn release_driver_load_frame_run(base: u64, count: u64) {
-    let mut i = 0u64;
-    while i < count {
-        let _ = cnode_delete_recycle_r(base + i);
-        i += 1;
-    }
-}
-
-unsafe fn release_driver_load_map_caps(caps: &mut [u64], count: u64) {
-    let mut i = 0u64;
-    while i < count.min(caps.len() as u64) {
-        let cap = caps[i as usize];
-        if cap != 0 {
-            let _ = cnode_delete_recycle_r(cap);
-            caps[i as usize] = 0;
-        }
-        i += 1;
-    }
-}
-
-unsafe fn driver_load_scratch_records(frames: usize, fill: u64, stage: &[u8]) -> Option<Vec<u64>> {
-    let mut records = Vec::new();
-    if records.try_reserve_exact(frames).is_err() {
-        print_str(b"[win32k-svc] driver image load ");
-        print_str(stage);
-        print_str(b" scratch allocation failed frames=");
-        print_u64(frames as u64);
-        print_str(b"\n");
-        return None;
-    }
-    records.resize(frames, fill);
-    Some(records)
-}
-
-unsafe fn alloc_driver_load_frame_run(frames: u64) -> Option<u64> {
-    let Some(base) = try_alloc_slot_run(frames) else {
-        print_str(b"[win32k-svc] driver image load frame-run slot allocation failed frames=");
-        print_u64(frames);
-        print_str(b"\n");
-        return None;
-    };
-    let mut i = 0u64;
-    while i < frames {
-        let slot = base + i;
-        let error = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, slot);
-        if error != 0 {
-            let mut j = 0u64;
-            while j < i {
-                let _ = cnode_delete_recycle_r(base + j);
-                j += 1;
-            }
-            while j < frames {
-                recycle_deleted_root_slot(base + j);
-                j += 1;
-            }
-            let _ = load_one_driver_fail(b"frame-retype", slot, error);
-            return None;
-        }
-        i += 1;
-    }
-    Some(base)
-}
-
-#[derive(Clone, Copy)]
-struct DriverLoadPageTable {
-    pml4: u64,
-    base: u64,
-    cap: u64,
-}
-
-const DRIVER_LOAD_PT_SPAN: u64 = 0x20_0000;
-static mut DRIVER_LOAD_PAGE_TABLES: Option<Vec<DriverLoadPageTable>> = None;
-
-#[inline]
-fn driver_load_pt_base(va: u64) -> u64 {
-    va & !(DRIVER_LOAD_PT_SPAN - 1)
-}
-
-unsafe fn driver_load_page_tables_mut() -> &'static mut Vec<DriverLoadPageTable> {
-    let slot = &mut *core::ptr::addr_of_mut!(DRIVER_LOAD_PAGE_TABLES);
-    if slot.is_none() {
-        *slot = Some(Vec::new());
-    }
-    slot.as_mut().unwrap()
-}
-
-unsafe fn driver_load_page_table_find(pml4: u64, base: u64) -> Option<u64> {
-    (&*core::ptr::addr_of!(DRIVER_LOAD_PAGE_TABLES))
-        .as_ref()
-        .and_then(|records| {
-            records
-                .iter()
-                .find(|record| record.pml4 == pml4 && record.base == base)
-                .map(|record| record.cap)
-        })
-}
-
-unsafe fn driver_load_page_table_insert(pml4: u64, base: u64, cap: u64) -> bool {
-    let records = driver_load_page_tables_mut();
-    if records.try_reserve(1).is_err() {
-        print_str(b"[driver-load] page-table record allocation failed pml4=0x");
-        print_hex((pml4 >> 32) as u32);
-        print_hex(pml4 as u32);
-        print_str(b" base=0x");
-        print_hex((base >> 32) as u32);
-        print_hex(base as u32);
-        print_str(b"\n");
-        return false;
-    }
-    records.push(DriverLoadPageTable { pml4, base, cap });
-    true
-}
-
-unsafe fn driver_load_page_table_remove(pml4: u64, base: u64, cap: u64) {
-    let records = driver_load_page_tables_mut();
-    let mut i = 0usize;
-    while i < records.len() {
-        let record = records[i];
-        if record.cap == cap && record.pml4 == pml4 && record.base == base {
-            records.swap_remove(i);
-            return;
-        }
-        i += 1;
-    }
-}
-
-unsafe fn ensure_driver_load_page_table(
-    pml4: u64,
-    va: u64,
-    stage_prefix: &[u8],
-) -> Option<(u64, bool)> {
-    let base = driver_load_pt_base(va);
-    if let Some(existing) = driver_load_page_table_find(pml4, base) {
-        return Some((existing, false));
-    }
-    let Some(pt) = try_alloc_slot() else {
-        return load_one_driver_fail(stage_prefix, base, 4).map(|_| (0, false));
-    };
-    let error = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-    if error != 0 {
-        recycle_deleted_root_slot(pt);
-        return load_one_driver_fail(stage_prefix, pt, error).map(|_| (0, false));
-    }
-    let error = paging_struct_map_r(pt, LBL_X86_PAGE_TABLE_MAP, base, pml4);
-    if error != 0 {
-        let _ = cnode_delete_recycle_r(pt);
-        return load_one_driver_fail(stage_prefix, base, error).map(|_| (0, false));
-    }
-    if !driver_load_page_table_insert(pml4, base, pt) {
-        let _ = cnode_delete_recycle_r(pt);
-        return load_one_driver_fail(stage_prefix, base, 4).map(|_| (0, false));
-    }
-    Some((pt, true))
-}
-
-unsafe fn release_driver_load_page_table_if_new(pml4: u64, va: u64, cap: u64, is_new: bool) {
-    if is_new && cap != 0 {
-        let base = driver_load_pt_base(va);
-        driver_load_page_table_remove(pml4, base, cap);
-        let _ = cnode_delete_recycle_r(cap);
-    }
-}
-
-pub(crate) unsafe fn load_one_driver(
-    src_va: u64,
-    dst_va: u64,
-    frames: u64,
-    host_pml4: u64,
-    dxgthk_base: u64,
-) -> Option<(u32, u32, u32)> {
-    let Ok(frame_count) = usize::try_from(frames) else {
-        return load_one_driver_fail(b"frame-count", frames, 0);
-    };
-    if frame_count == 0 {
-        return None;
-    }
-    // Executive-side PT + frames (RW), to load into.
-    let (ept, ept_new) =
-        ensure_driver_load_page_table(CAP_INIT_THREAD_VSPACE, dst_va, b"exec-pt-map")?;
-    let Some(mut exec_map_caps) = driver_load_scratch_records(frame_count, 0, b"exec-map-caps")
-    else {
-        release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
-        return None;
-    };
-    let Some(mut rights) = driver_load_scratch_records(frame_count, RW_NX, b"rights") else {
-        release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
-        return None;
-    };
-    let Some(mut host_map_caps) = driver_load_scratch_records(frame_count, 0, b"host-map-caps")
-    else {
-        release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
-        return None;
-    };
-    let Some(base) = alloc_driver_load_frame_run(frames) else {
-        release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
-        return None;
-    };
-    for i in 0..frames {
-        let (cap, copy_error) = copy_cap_r(base + i);
-        if copy_error != 0 {
-            release_driver_load_map_caps(exec_map_caps.as_mut_slice(), i);
-            release_driver_load_frame_run(base, frames);
-            release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
-            return load_one_driver_fail(b"exec-frame-copy", base + i, copy_error);
-        }
-        let va = dst_va + i * 0x1000;
-        let map_error = page_map_r(cap, va, RW_NX, CAP_INIT_THREAD_VSPACE);
-        if map_error != 0 {
-            let _ = cnode_delete_recycle_r(cap);
-            release_driver_load_map_caps(exec_map_caps.as_mut_slice(), i);
-            release_driver_load_frame_run(base, frames);
-            release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
-            return load_one_driver_fail(b"exec-frame-map", va, map_error);
-        }
-        exec_map_caps[i as usize] = cap;
-    }
-    // Parse + copy + reloc + resolve imports through the executive's RW mapping. The per-frame
-    // rights live in a heap vector because display/keyboard/helper drivers are not inherently capped
-    // at a particular image size.
-    let Some(res) = win32k_subsystem::load_driver_into(
-        src_va,
-        dst_va,
-        frames,
-        rights.as_mut_slice(),
-        dxgthk_base,
-    ) else {
-        release_driver_load_map_caps(exec_map_caps.as_mut_slice(), frames);
-        release_driver_load_frame_run(base, frames);
-        release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
-        return load_one_driver_fail(b"pe-load", dst_va, 0);
-    };
-    // Map the SAME frames W^X into win32k's VSpace at the same VA (RX code / RW data).
-    let Some((wpt, wpt_new)) = ensure_driver_load_page_table(host_pml4, dst_va, b"host-pt-map")
-    else {
-        release_driver_load_map_caps(exec_map_caps.as_mut_slice(), frames);
-        release_driver_load_frame_run(base, frames);
-        release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
-        return None;
-    };
-    for i in 0..frames {
-        let r = rights[i as usize];
-        let (cap, copy_error) = copy_cap_r(base + i);
-        if copy_error != 0 {
-            release_driver_load_map_caps(host_map_caps.as_mut_slice(), i);
-            release_driver_load_page_table_if_new(host_pml4, dst_va, wpt, wpt_new);
-            release_driver_load_map_caps(exec_map_caps.as_mut_slice(), frames);
-            release_driver_load_frame_run(base, frames);
-            release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
-            return load_one_driver_fail(b"host-frame-copy", base + i, copy_error);
-        }
-        let va = dst_va + i * 0x1000;
-        let map_error = page_map_r(cap, va, r, host_pml4);
-        if map_error != 0 {
-            let _ = cnode_delete_recycle_r(cap);
-            release_driver_load_map_caps(host_map_caps.as_mut_slice(), i);
-            release_driver_load_page_table_if_new(host_pml4, dst_va, wpt, wpt_new);
-            release_driver_load_map_caps(exec_map_caps.as_mut_slice(), frames);
-            release_driver_load_frame_run(base, frames);
-            release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
-            return load_one_driver_fail(b"host-frame-map", va, map_error);
-        }
-        host_map_caps[i as usize] = cap;
-    }
-    Some(res)
-}
-
 unsafe fn driver_image_frame_count(src_va: u64) -> Option<u64> {
     let e = core::ptr::read_unaligned((src_va + 0x3c) as *const u32) as u64;
     let nt = src_va.checked_add(e)?;
@@ -5920,178 +5776,6 @@ fn reserve_win32k_static_import_va(next_va: &mut u64, frames: u64) -> Option<u64
     Some(aligned)
 }
 
-pub(crate) fn register_win32k_gdi_loader(host_pml4: u64) {
-    WIN32K_GDI_LOADER_PML4.store(host_pml4, Ordering::Relaxed);
-}
-
-fn gdi_leaf_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    for i in 0..a.len() {
-        if a[i].to_ascii_lowercase() != b[i].to_ascii_lowercase() {
-            return false;
-        }
-    }
-    true
-}
-
-pub(crate) unsafe fn ensure_win32k_gdi_driver_loaded(leaf: &[u8]) -> bool {
-    if leaf.is_empty() || win32k_subsystem::gdi_driver_registered(leaf) {
-        return true;
-    }
-    let host_pml4 = WIN32K_GDI_LOADER_PML4.load(Ordering::Relaxed);
-    if host_pml4 == 0 {
-        print_str(b"[win32k-svc] GDI demand-load requested before loader registration\n");
-        return false;
-    }
-
-    if gdi_leaf_eq(leaf, b"dxg.sys") {
-        load_directx_drivers(host_pml4);
-        return win32k_subsystem::gdi_driver_registered(leaf);
-    }
-
-    if let Some(display_spec) = system_hive_display_driver_spec() {
-        let display_spec = display_spec.win32k_spec();
-        if gdi_leaf_eq(leaf, display_spec.display_driver_leaf) {
-            load_display_driver(host_pml4, &display_spec);
-            return win32k_subsystem::gdi_driver_registered(leaf);
-        }
-    }
-
-    let mut layout_id = [0u8; 8];
-    if let Some((layout_id_len, _source)) = registry_keyboard_layout_id(&mut layout_id) {
-        let mut layout_file = [0u8; 32];
-        if let Some(layout_file_len) =
-            system_hive_keyboard_layout_file(&layout_id[..layout_id_len], &mut layout_file)
-        {
-            if gdi_leaf_eq(leaf, &layout_file[..layout_file_len]) {
-                load_keyboard_layout_driver(
-                    host_pml4,
-                    &layout_id[..layout_id_len],
-                    &layout_file[..layout_file_len],
-                );
-                return win32k_subsystem::gdi_driver_registered(leaf);
-            }
-        }
-    }
-
-    false
-}
-
-pub(crate) fn service_gdi_driver_load() -> i32 {
-    unsafe {
-        let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
-        let leaf_len =
-            core::ptr::read_volatile((sh + win32k_subsystem::SH_GDI_LOAD_LEAF_LEN) as *const u64)
-                as usize;
-        let status = if leaf_len == 0 || leaf_len > win32k_subsystem::SH_GDI_LOAD_LEAF_CAP {
-            0xC000_000Du32 as i32 // STATUS_INVALID_PARAMETER
-        } else {
-            let mut leaf = [0u8; win32k_subsystem::SH_GDI_LOAD_LEAF_CAP];
-            let mut valid = true;
-            for i in 0..leaf_len {
-                let b = core::ptr::read_volatile(
-                    (sh + win32k_subsystem::SH_GDI_LOAD_LEAF + i as u64) as *const u8,
-                )
-                .to_ascii_lowercase();
-                if !(b.is_ascii_lowercase()
-                    || b.is_ascii_digit()
-                    || b == b'_'
-                    || b == b'-'
-                    || b == b'.')
-                {
-                    valid = false;
-                }
-                leaf[i] = b;
-            }
-            if !valid || leaf[..leaf_len].windows(2).any(|w| w == b"..") {
-                0xC000_000Du32 as i32
-            } else if ensure_win32k_gdi_driver_loaded(&leaf[..leaf_len]) {
-                0
-            } else {
-                0xC000_0135u32 as i32 // STATUS_DLL_NOT_FOUND
-            }
-        };
-        core::ptr::write_volatile(
-            (sh + win32k_subsystem::SH_GDI_LOAD_STATUS) as *mut i32,
-            status,
-        );
-        status
-    }
-}
-
-/// Demand-load dxg.sys + its dxgthk.sys dependency into win32k's VSpace when win32k asks for dxg
-/// through `ZwSetSystemInformation(SystemLoadGdiDriverInformation)`. dxgthk (leaf) loads first,
-/// then dxg imports dxgthk's Eng* exports plus ntoskrnl.
-pub(crate) unsafe fn load_directx_drivers(host_pml4: u64) {
-    if win32k_subsystem::gdi_driver_registered(b"dxg.sys") {
-        return;
-    }
-    let Some(fs) = exec_fs() else {
-        print_str(b"[win32k-svc] DirectX drivers unavailable - executive FS not mounted\n");
-        return;
-    };
-    let mut dxgthk_size = 0u32;
-    if DXGTHK_DRIVER_LOADED.load(Ordering::Relaxed) == 0 {
-        let Some((dxgthk_src, loaded_dxgthk_size)) =
-            load_file_to_pool(&fs, b"reactos\\system32\\drivers\\dxgthk.sys")
-        else {
-            print_str(b"[win32k-svc] dxgthk.sys not found in ReactOS driver directory\n");
-            return;
-        };
-        let Some((_dxgthk_entry, _dxgthk_expdir, dxgthk_len)) = load_one_driver(
-            dxgthk_src,
-            win32k_subsystem::DXGTHK_VA,
-            win32k_subsystem::DXGTHK_LOAD_FRAMES,
-            host_pml4,
-            0,
-        ) else {
-            print_str(b"[win32k-svc] dxgthk load failed\n");
-            return;
-        };
-        let _ = register_system_module(
-            b"reactos\\system32\\drivers\\dxgthk.sys",
-            win32k_subsystem::DXGTHK_VA,
-            dxgthk_len,
-        );
-        DXGTHK_DRIVER_LOADED.store(1, Ordering::Relaxed);
-        dxgthk_size = loaded_dxgthk_size;
-    }
-    let Some((dxg_src, dxg_size)) = load_file_to_pool(&fs, b"reactos\\system32\\drivers\\dxg.sys")
-    else {
-        print_str(b"[win32k-svc] dxg.sys not found in ReactOS driver directory\n");
-        return;
-    };
-    match load_one_driver(
-        dxg_src,
-        win32k_subsystem::DXG_VA,
-        win32k_subsystem::DXG_LOAD_FRAMES,
-        host_pml4,
-        win32k_subsystem::DXGTHK_VA,
-    ) {
-        Some((entry, expdir, len)) => {
-            let _ = register_system_module(
-                b"reactos\\system32\\drivers\\dxg.sys",
-                win32k_subsystem::DXG_VA,
-                len,
-            );
-            win32k_subsystem::record_dxg(entry, expdir, len);
-            print_str(b"[win32k-svc] hosted dxg.sys + dxgthk.sys: file_sizes=");
-            print_u64(dxg_size as u64);
-            print_str(b"/");
-            print_u64(dxgthk_size as u64);
-            print_str(b" entry_rva=0x");
-            print_hex(entry);
-            print_str(b" export_dir_rva=0x");
-            print_hex(expdir);
-            print_str(b" len=0x");
-            print_hex(len);
-            print_str(b"\n");
-        }
-        None => print_str(b"[win32k-svc] dxg load failed\n"),
-    }
-}
 
 pub(crate) fn win32k_static_import_loader_proofs() -> (u64, u64, u64, u64) {
     (
@@ -6171,8 +5855,8 @@ pub(crate) unsafe fn load_win32k_static_import_drivers(host_pml4: u64) {
             dep_index += 1;
             continue;
         };
-        match load_one_driver(src, image_va, image_frames, host_pml4, 0) {
-            Some((entry, _expdir, len)) => {
+        match image_loader::load_one_driver_result(src, file_size, core::str::from_utf8(dll).unwrap_or(""), image_va, image_frames, host_pml4) {
+            Ok((entry, _expdir, len)) => {
                 let _ = register_system_module(&path[..path_len], image_va, len);
                 let patched = win32k_subsystem::patch_win32k_static_import(dll, image_va);
                 print_str(b"[win32k-svc] hosted static win32k import ");
@@ -6198,9 +5882,11 @@ pub(crate) unsafe fn load_win32k_static_import_drivers(host_pml4: u64) {
                     WIN32K_STATIC_IMPORT_IAT_PATCHES.fetch_add(patched as u64, Ordering::Relaxed);
                 }
             }
-            None => {
+            Err(failure) => {
                 print_str(b"[win32k-svc] static win32k import load failed: ");
                 print_str(dll);
+                print_str(b" status=0x");
+                print_hex(failure.ntstatus() as u32);
                 print_str(b"\n");
                 WIN32K_STATIC_IMPORT_FAILURES.fetch_add(1, Ordering::Relaxed);
             }
@@ -6217,18 +5903,6 @@ fn system32_driver_leaf_is_safe(driver_leaf: &[u8]) -> bool {
         && !driver_leaf.windows(2).any(|w| w == b"..")
 }
 
-fn system32_driver_path_vec(driver_leaf: &[u8]) -> Option<Vec<u8>> {
-    if !system32_driver_leaf_is_safe(driver_leaf) {
-        return None;
-    }
-    let prefix = b"reactos\\system32\\";
-    let len = prefix.len().checked_add(driver_leaf.len())?;
-    let mut path = Vec::new();
-    path.try_reserve_exact(len).ok()?;
-    path.extend_from_slice(prefix);
-    path.extend_from_slice(driver_leaf);
-    Some(path)
-}
 
 fn system32_driver_path(driver_leaf: &[u8], out: &mut [u8]) -> Option<usize> {
     if !system32_driver_leaf_is_safe(driver_leaf) {
@@ -6244,159 +5918,36 @@ fn system32_driver_path(driver_leaf: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(len)
 }
 
-unsafe fn map_display_bar_into_win32k(host_pml4: u64) {
-    // Map the full Phase-0 display BAR cap run into win32k. The bootloader framebuffer fields describe
-    // only the current scanout view inside this aperture.
-    let base = FB_BAR_FRAME_BASE.load(Ordering::Relaxed);
-    let count = FB_BAR_FRAME_COUNT.load(Ordering::Relaxed);
-    if base != 0 && count != 0 {
-        for p in 0..(count + 511) / 512 {
-            let pt = alloc_slot();
-            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-            let _ = paging_struct_map(
-                pt,
-                LBL_X86_PAGE_TABLE_MAP,
-                win32k_subsystem::WIN32K_FB_VA + p * 0x20_0000,
-                host_pml4,
-            );
-        }
-        for i in 0..count {
-            let _ = page_map(
-                copy_cap(base + i),
-                win32k_subsystem::WIN32K_FB_VA + i * 0x1000,
-                RW_NX,
-                host_pml4,
-            );
-        }
-        print_str(b"[win32k-svc] mapped display BAR into win32k: ");
-        print_u64(count);
-        print_str(b" frames @ WIN32K_FB_VA=0x");
-        print_hex((win32k_subsystem::WIN32K_FB_VA >> 32) as u32);
-        print_hex(win32k_subsystem::WIN32K_FB_VA as u32);
-        print_str(b"\n");
-    }
-}
 
-/// Host the display driver selected by SYSTEM hive service metadata into win32k's VSpace and map
-/// the owning display BAR. win32k loads the display DLL dynamically via
-/// ZwSetSystemInformation when it enables the display device, so the executive preloads the selected
-/// DLL and records its registry/device metadata for the narrow win32k import bridge.
-pub(crate) unsafe fn load_display_driver(
-    host_pml4: u64,
-    spec: &win32k_subsystem::DisplayRegistrySpec<'_>,
-) {
-    let Some(fs) = exec_fs() else {
-        print_str(b"[win32k-svc] display DLL unavailable - executive FS not mounted\n");
-        return;
-    };
-    let Some(path) = system32_driver_path_vec(spec.display_driver_leaf) else {
-        print_str(b"[win32k-svc] display DLL leaf rejected by loader policy\n");
-        return;
-    };
-    let Some((src_va, sz)) = load_file_to_pool(&fs, &path) else {
-        print_str(b"[win32k-svc] display DLL not found by registry path: ");
-        print_str(&path);
-        print_str(b"\n");
-        return;
-    };
-    match load_one_driver(
-        src_va,
-        win32k_subsystem::FRAMEBUF_VA,
-        win32k_subsystem::FRAMEBUF_LOAD_FRAMES,
-        host_pml4,
-        0,
-    ) {
-        Some((entry, expdir, len)) => {
-            let _ = register_system_module(&path, win32k_subsystem::FRAMEBUF_VA, len);
-            let recorded = win32k_subsystem::record_display_driver(spec, entry, expdir, len);
-            print_str(b"[win32k-svc] hosted display driver ");
-            print_str(spec.display_driver_leaf);
-            print_str(b": file_size=");
-            print_u64(sz as u64);
-            print_str(b" entry_rva=0x");
-            print_hex(entry);
-            print_str(b" len=0x");
-            print_hex(len);
-            print_str(b" recorded=");
-            print_u64(recorded as u64);
-            print_str(b"\n");
-        }
-        None => print_str(b"[win32k-svc] display DLL load failed\n"),
-    }
-    map_display_bar_into_win32k(host_pml4);
-}
-
-/// Host the keyboard layout DLL selected by the registry into win32k's VSpace. win32k loads keyboard
-/// layouts dynamically from UserLoadKbdDll via EngLoadImage -> ZwSetSystemInformation, then looks up
-/// the KbdLayerDescriptor export. The layout id and DLL leaf are supplied by the caller from the
-/// DEFAULT/SYSTEM hive state.
-pub(crate) unsafe fn load_keyboard_layout_driver(
-    host_pml4: u64,
-    layout_id: &[u8],
-    layout_file: &[u8],
-) {
-    let Some(fs) = exec_fs() else {
-        print_str(b"[win32k-svc] keyboard layout DLL unavailable - executive FS not mounted\n");
-        return;
-    };
-    let mut path = [0u8; 64];
-    let Some(path_len) = system32_driver_path(layout_file, &mut path) else {
-        print_str(b"[win32k-svc] keyboard layout DLL leaf rejected by loader policy\n");
-        return;
-    };
-    let Some((src_va, sz)) = load_file_to_pool(&fs, &path[..path_len]) else {
-        print_str(b"[win32k-svc] keyboard layout DLL not found by registry path: ");
-        print_str(&path[..path_len]);
-        print_str(b"\n");
-        return;
-    };
-    match load_one_driver(
-        src_va,
-        win32k_subsystem::KEYBOARD_LAYOUT_VA,
-        win32k_subsystem::KEYBOARD_LAYOUT_LOAD_FRAMES,
-        host_pml4,
-        0,
-    ) {
-        Some((entry, expdir, len)) => {
-            let _ = register_system_module(
-                &path[..path_len],
-                win32k_subsystem::KEYBOARD_LAYOUT_VA,
-                len,
-            );
-            let recorded = win32k_subsystem::record_keyboard_layout_driver(
-                layout_id,
-                layout_file,
-                entry,
-                expdir,
-                len,
-            );
-            print_str(b"[win32k-svc] hosted keyboard layout ");
-            print_str(layout_file);
-            print_str(b": file_size=");
-            print_u64(sz as u64);
-            print_str(b" entry_rva=0x");
-            print_hex(entry);
-            print_str(b" export_dir_rva=0x");
-            print_hex(expdir);
-            print_str(b" len=0x");
-            print_hex(len);
-            print_str(b" recorded=");
-            print_u64(recorded as u64);
-            print_str(b"\n");
-        }
-        None => print_str(b"[win32k-svc] keyboard layout DLL load failed\n"),
+fn executive_win32k_client() -> Win32kClientContext {
+    let pi = W32_CLIENT_PI.load(Ordering::Relaxed) as u32;
+    let (system_sid, system_sid_len) = local_system_sid_native();
+    Win32kClientContext {
+        pi,
+        generation: 0,
+        logical_caller: None,
+        pid: 0,
+        badge: 0,
+        tid: 0,
+        tcb: 0,
+        eprocess: 0,
+        ethread: 0,
+        role: None,
+        process_role: None,
+        top_badge: 0,
+        // Executive commands have no hosted caller TEB; retain the selected provider context.
+        teb: 0,
+        peb_mirror: 0,
+        scratch_base: crate::EXECUTIVE_WIN32K_SCRATCH_BASE,
+        token_authentication_id: SYSTEM_TOKEN_AUTHENTICATION_ID,
+        token_user_sid: system_sid,
+        token_user_sid_len: system_sid_len,
     }
 }
 
 /// Dispatch one win32k SSN (>= 0x1000) into the parked win32k component and run its fault-service
-/// loop until the handler completes (Milestone B). PRECONDITION: the component is blocked in its
-/// dispatch `seL4_Call` on `w_fault` (the executive has received the Call but not yet replied). We
-/// fill the request in the shared page, reply (the Call returns → the component runs the handler),
-/// then demand-page the handler's faults until the component issues its NEXT dispatch Call = "done".
-/// Returns `(status, ok)`; `ok=false` on a wall (null deref / W^X / demand cap / unexpected fault).
+/// loop until the handler completes. Returns `(status, completed)`.
 pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (u64, bool) {
-    let pi = W32_CLIENT_PI.load(Ordering::Relaxed) as u32;
-    let (system_sid, system_sid_len) = local_system_sid_native();
     win32k_dispatch_wide_with_completion_args_and_kind(
         ssn,
         a0,
@@ -6408,32 +5959,67 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
         [a0, a1, a2, a3],
         None,
         None,
-        Win32kClientContext {
-            pi,
-            generation: 0,
-            logical_caller: None,
-            pid: 0,
-            badge: 0,
-            tid: 0,
-            tcb: 0,
-            eprocess: 0,
-            ethread: 0,
-            role: None,
-            process_role: None,
-            top_badge: 0,
-            // Executive-originated probes do not have a hosted caller TEB. Leaving this empty makes
-            // win32k keep the component's already-selected GUI process/thread identity instead of
-            // deriving a new client from SMSS' TEB.
-            teb: 0,
-            peb_mirror: 0,
-            scratch_base: crate::EXECUTIVE_WIN32K_SCRATCH_BASE,
-            token_authentication_id: SYSTEM_TOKEN_AUTHENTICATION_ID,
-            token_user_sid: system_sid,
-            token_user_sid_len: system_sid_len,
-        },
+        executive_win32k_client(),
         win32k_subsystem::WIN32K_REQUEST_SSDT,
         false,
     )
+}
+
+pub(crate) enum SourcePnpTerminalDispatch {
+    NotEntered(i32),
+    Indeterminate(i32),
+    Returned(i32),
+}
+
+pub(crate) unsafe fn dispatch_source_pnp_terminal(
+    packet_va: u64,
+    len: u64,
+) -> SourcePnpTerminalDispatch {
+    dispatch_source_terminal(
+        packet_va, len,
+        win32k_subsystem::WIN32K_REQUEST_SOURCE_PNP_TERMINAL,
+    )
+}
+
+pub(crate) unsafe fn dispatch_source_fsd_terminal(
+    packet_va: u64,
+    len: u64,
+) -> SourcePnpTerminalDispatch {
+    dispatch_source_terminal(
+        packet_va, len, win32k_subsystem::WIN32K_REQUEST_SOURCE_FSD_TERMINAL,
+    )
+}
+
+pub(crate) type SourceIoctlTerminalDispatch = SourcePnpTerminalDispatch;
+
+pub(crate) unsafe fn dispatch_source_ioctl_terminal(
+    packet_va: u64,
+    len: u64,
+) -> SourceIoctlTerminalDispatch {
+    dispatch_source_terminal(
+        packet_va, len, win32k_subsystem::WIN32K_REQUEST_SOURCE_IOCTL_TERMINAL,
+    )
+}
+
+unsafe fn dispatch_source_terminal(
+    packet_va: u64,
+    len: u64,
+    request_kind: u64,
+) -> SourcePnpTerminalDispatch {
+    let mut entered = false;
+    let (result, completed) = win32k_dispatch_wide_observed(
+        0, packet_va, len, 0, 0, 0, &[], [packet_va, len, 0, 0],
+        None, None, executive_win32k_client(), request_kind,
+        false, Some(&mut entered),
+    );
+    let status = result as u32 as i32;
+    if completed {
+        SourcePnpTerminalDispatch::Returned(status)
+    } else if entered {
+        SourcePnpTerminalDispatch::Indeterminate(status)
+    } else {
+        SourcePnpTerminalDispatch::NotEntered(status)
+    }
 }
 
 /// Like [`win32k_dispatch`] but carries the win64 stack-argument source for win32k SSNs. Real client
@@ -6609,6 +6195,61 @@ unsafe fn win32k_dispatch_wide_observed(
     attach_client: bool,
     entered: Option<&mut bool>,
 ) -> (u64, bool) {
+    win32k_dispatch_wide_observed_inner(
+        ssn, a0, a1, a2, a3, caller_sp, stack_args, completion_args, output_stage,
+        paint_output, client, request_kind, attach_client, entered, None,
+    )
+}
+
+/// Executive native work uses a real canonical requestor and a distinct owned completion
+/// destination. Ordinary hosted/SSDT dispatches remain on their existing return path.
+unsafe fn win32k_dispatch_kernel_job_observed(
+    request_kind: u64,
+    arguments: [u64; 4],
+    entered: &mut bool,
+) -> (u64, bool) {
+    use crate::service_sec_image::kernel_provider_activation::{
+        capture_kernel_job, run_kernel_job, KernelJobResult,
+    };
+    let _durable = crate::allocator::enter_durable();
+    let result = KernelJobResult::new();
+    let native = crate::initial_system_driver_caller();
+    let mut client = executive_win32k_client();
+    client.pi = 0;
+    let mut execute = |mut channel: crate::spawn_hosts::PumpChannel, lane| {
+        channel.client_pi = 0;
+        channel.client_generation = 0;
+        channel.caps.provider_wait = true;
+        let caller = capture_kernel_job(&channel, lane, native, &result)?;
+        run_kernel_job(caller, &result)
+    };
+    win32k_dispatch_wide_observed_inner(
+        0, arguments[0], arguments[1], arguments[2], arguments[3], 0, &[],
+        [0; 4], None, None, client, request_kind, false, Some(entered),
+        Some(&mut execute),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn win32k_dispatch_wide_observed_inner(
+    ssn: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    caller_sp: u64,
+    stack_args: &[u64],
+    completion_args: [u64; 4],
+    output_stage: Option<nt_user_callback::DispatchOutputStage>,
+    paint_output: Option<nt_user_callback::PaintOutputClaim>,
+    client: Win32kClientContext,
+    request_kind: u64,
+    attach_client: bool,
+    entered: Option<&mut bool>,
+    kernel_job: Option<&mut dyn FnMut(
+        crate::spawn_hosts::PumpChannel, nt_component_suspension::LaneHandle,
+    ) -> Result<(u64, bool), u32>>,
+) -> (u64, bool) {
     // Reject before attachment or shared request writes, not only at later lane acquisition.
     if crate::component_execution_is_busy()
         || !win32k_client_context_is_admitted(client)
@@ -6634,6 +6275,9 @@ unsafe fn win32k_dispatch_wide_observed(
     }
     if attach_client && !select_win32k_client_window(client) {
         return (0xC000_0001u64, false);
+    }
+    if grant_win32k_client_ps_bodies(client).is_err() {
+        return (nt_process::STATUS_INVALID_PARAMETER as u64, false);
     }
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
     clear_published_win32k_context();
@@ -6724,7 +6368,10 @@ unsafe fn win32k_dispatch_wide_observed(
     core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_SSN) as *mut u64, ssn);
     core::ptr::write_volatile(
         (sh + win32k_subsystem::SH_REQ_KIND) as *mut u64,
-        request_kind,
+        request_kind | if client.logical_caller.is_some()
+            && request_kind == win32k_subsystem::WIN32K_REQUEST_SSDT {
+            win32k_subsystem::WIN32K_REQUEST_USER_ORIGIN
+        } else { 0 },
     );
     core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A0) as *mut u64, a0);
     core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A1) as *mut u64, a1);
@@ -6849,6 +6496,15 @@ unsafe fn win32k_dispatch_wide_observed(
     };
     if let Some(entered) = entered {
         *entered = true;
+    }
+    if let Some(execute) = kernel_job {
+        let result = execute(ch, lane);
+        core::ptr::write(
+            core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous_dispatch,
+        );
+        // Canonical kernel completion already retired this exact physical dispatch. Hosted
+        // finish_win32k_lane_return must not repeat it. Failed/unknown work stays owned.
+        return result.unwrap_or_else(|status| (u64::from(status), false));
     }
     let pr = crate::spawn_hosts::component_pump(&ch);
     if attach_client {

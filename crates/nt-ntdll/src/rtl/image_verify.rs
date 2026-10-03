@@ -24,7 +24,8 @@ pub struct VerifiedImage<'a> {
     /// source image, as required by `LDR_IMPORT_MODULE_CALLBACK`.
     pub import_names: Vec<&'a [u8]>,
     pub stored_checksum: u32,
-    pub calculated_checksum: u32,
+    /// `None` when a tagged KnownDLL handle skips the full-file checksum pass.
+    pub calculated_checksum: Option<u32>,
 }
 
 fn u32_from(bytes: &[u8]) -> Option<u32> {
@@ -79,9 +80,17 @@ pub fn verify_image(
         .get(checksum_offset..checksum_offset + 4)
         .and_then(u32_from)
         .ok_or(ImageVerificationError::MalformedImage)?;
-    let calculated_checksum =
-        calculate_checksum(image, checksum_offset).ok_or(ImageVerificationError::MalformedImage)?;
-    if !bypass_checksum && stored_checksum != 0 && stored_checksum != calculated_checksum {
+    let calculated_checksum = if bypass_checksum {
+        None
+    } else {
+        Some(
+            calculate_checksum(image, checksum_offset)
+                .ok_or(ImageVerificationError::MalformedImage)?,
+        )
+    };
+    if calculated_checksum
+        .is_some_and(|checksum| stored_checksum != 0 && stored_checksum != checksum)
+    {
         return Err(ImageVerificationError::ChecksumMismatch);
     }
 
@@ -219,7 +228,7 @@ mod tests {
             verify_image(&even, false, false)
                 .unwrap()
                 .calculated_checksum,
-            expected
+            Some(expected)
         );
 
         let mut odd = test_image(&[]);
@@ -229,7 +238,7 @@ mod tests {
             verify_image(&odd, false, false)
                 .unwrap()
                 .calculated_checksum,
-            expected
+            Some(expected)
         );
     }
 
@@ -242,10 +251,9 @@ mod tests {
             verify_image(&image, false, true),
             Err(ImageVerificationError::ChecksumMismatch)
         );
-        assert_eq!(
-            verify_image(&image, true, true).unwrap().import_names,
-            vec![b"ntdll.dll".as_slice()]
-        );
+        let known_dll = verify_image(&image, true, true).unwrap();
+        assert_eq!(known_dll.import_names, vec![b"ntdll.dll".as_slice()]);
+        assert_eq!(known_dll.calculated_checksum, None);
     }
 
     #[test]

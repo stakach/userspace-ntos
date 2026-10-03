@@ -1,5 +1,5 @@
 use super::*;
-use crate::mutation_commit::test_support::server;
+use crate::mutation_commit::test_support::secured_server as server;
 use nt_config_abi::{hive_mutation_kind as kind, CmHiveMutationRecord};
 
 mod validation;

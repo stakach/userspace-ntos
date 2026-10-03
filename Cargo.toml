@@ -37,6 +37,7 @@ members = [
     "crates/nt-hal-abi",
     "crates/nt-cm-resources",
     "crates/nt-acpi",
+    "crates/nt-wmi",
     "crates/nt-ahci",
     "crates/nt-pnp",
     "crates/nt-pnp-abi",
@@ -155,6 +156,7 @@ nt-interrupt-authority = { path = "crates/nt-interrupt-authority" }
 nt-hal-abi = { path = "crates/nt-hal-abi" }
 nt-cm-resources = { path = "crates/nt-cm-resources" }
 nt-acpi = { path = "crates/nt-acpi" }
+nt-wmi = { path = "crates/nt-wmi" }
 nt-pnp = { path = "crates/nt-pnp" }
 nt-pnp-abi = { path = "crates/nt-pnp-abi" }
 nt-power-types = { path = "crates/nt-power-types" }

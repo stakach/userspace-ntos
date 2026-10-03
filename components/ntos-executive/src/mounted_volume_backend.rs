@@ -1,8 +1,9 @@
 //! Canonical File IRP dispatch for regular files on the mounted FAT volume.
 //!
-//! The installed layer is immutable. CREATE owns both a generation-fenced File context and a
-//! share-access open; CLEANUP drops the share open and CLOSE drops the File context. No later
-//! operation re-resolves the name to select a different backing file.
+//! The installed layer is immutable. CREATE owns both a generation-fenced File context and an
+//! installed open with independent handle-sharing and body references. CLEANUP releases sharing;
+//! CLOSE releases the body and File context. Position and mode survive CLEANUP for pointer-owned
+//! operations. No later operation re-resolves the name to select a different backing file.
 
 use alloc::vec::Vec;
 
@@ -17,13 +18,16 @@ use crate::fs_loader::{
     fat_open_path_metadata_from, fat_read_file_range, fat_visit_directory_checked, FatOpenMetadata,
 };
 
-const OPEN_CAP: usize = 64;
+// Directory and installed-file handles encode a 16-bit slot index plus a 16-bit generation.
+// This is the identity-schema ceiling, not an eagerly allocated resource reservation.
+const OPEN_CAP: usize = nt_fs::MAX_FAT_OPEN_SLOTS;
 const PATH_CAP: usize = nt_fs::LAYERED_OPEN_NAME_CAP;
 
 #[derive(Clone, Copy)]
 struct MountedBinding {
     context: nt_fs::LayeredOpenContextId,
-    share_open: Option<u32>,
+    installed_open: Option<u32>,
+    installed_handle_open: bool,
     directory_open: Option<u32>,
     overlay_open: bool,
     is_directory: bool,
@@ -42,19 +46,56 @@ pub(crate) struct MountedVolumeBackend {
 }
 
 impl MountedVolumeBackend {
-    pub(crate) fn new(fs: crate::Fat32) -> Result<Self, NtStatus> {
-        let mut bindings = Vec::new();
-        bindings
-            .try_reserve_exact(OPEN_CAP)
-            .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
-        bindings.resize(OPEN_CAP, None);
-        Ok(Self {
+    pub(crate) fn new(fs: crate::Fat32) -> Self {
+        Self {
             fs,
             opens: nt_fs::LayeredOpenTable::new(),
             shares: nt_fs::ReadOnlyFileOpenTable::new(),
             directories: nt_fs::DirectoryOpenTable::new(),
-            bindings,
-        })
+            bindings: Vec::new(),
+        }
+    }
+
+    fn note_create_capacity_failure(&self, stage: &[u8], file_id: u64, error: NtStatus) {
+        if error != NtStatus::INSUFFICIENT_RESOURCES { return; }
+        crate::print_str(b"[mounted-create-capacity] stage=");
+        crate::print_str(stage);
+        crate::print_str(b" file=");
+        crate::print_u64(file_id);
+        crate::print_str(b" binding-slots=");
+        crate::print_u64(self.bindings.len() as u64);
+        crate::print_str(b" live-bindings=");
+        crate::print_u64(self.bindings.iter().filter(|row| row.is_some()).count() as u64);
+        crate::print_str(b" schema-slots=");
+        crate::print_u64(OPEN_CAP as u64);
+        crate::print_str(b"\n");
+    }
+
+    fn reserve_open_context(
+        &mut self,
+        file_id: u64,
+        units: &[u16],
+    ) -> Result<nt_fs::LayeredOpenContextId, NtStatus> {
+        let context = match self.opens.reserve(file_id, units) {
+            Ok(context) => context,
+            Err(error) => {
+                let error = status(error);
+                self.note_create_capacity_failure(b"context", file_id, error);
+                return Err(error);
+            }
+        };
+        let index = context_index(context).expect("context index fits shared handle schema");
+        if index >= self.bindings.len() {
+            let additional = index + 1 - self.bindings.len();
+            if self.bindings.try_reserve(additional).is_err() {
+                self.opens.cancel(context, file_id).expect("unpublished context reservation");
+                self.note_create_capacity_failure(b"binding", file_id, NtStatus::INSUFFICIENT_RESOURCES);
+                return Err(NtStatus::INSUFFICIENT_RESOURCES);
+            }
+            self.bindings.resize(index + 1, None);
+        }
+        assert!(self.bindings[index].is_none(), "new context cannot reuse a retained binding");
+        Ok(context)
     }
 
     fn create(&mut self, irp: &IrpProjection) -> Result<DispatchOutcome, NtStatus> {
@@ -194,51 +235,39 @@ impl MountedVolumeBackend {
         let access = parameters.desired_access.bits();
         let share = parameters.share_access.bits();
         let options = parameters.create_options.bits();
-        if options & nt_fs::FILE_NON_DIRECTORY_FILE != 0 {
-            return Err(status(nt_fs::STATUS_FILE_IS_A_DIRECTORY));
-        }
-        if overlay.is_some_and(|entry| !entry.is_directory)
-            || (overlay.is_none() && installed.is_some_and(|entry| !entry.metadata.is_directory))
-        {
-            return Err(status(nt_fs::STATUS_NOT_A_DIRECTORY));
-        }
-        if overlay.is_none() && installed.is_none() {
-            return Err(NtStatus::NOT_SUPPORTED);
-        }
-        if relative.is_empty() && options & nt_fs::FILE_DELETE_ON_CLOSE != 0 {
-            return Err(status(nt_fs::STATUS_CANNOT_DELETE));
-        }
-        if !matches!(
+        let decision = nt_fs::layered_directory_open_decision(
+            installed.map(|entry| entry.metadata.is_directory),
+            overlay.map(|entry| entry.is_directory),
             parameters.create_disposition,
-            nt_fs::FILE_CREATE | nt_fs::FILE_OPEN | nt_fs::FILE_OPEN_IF
-        ) {
-            return Err(NtStatus::INVALID_PARAMETER);
-        }
-        if parameters.create_disposition == nt_fs::FILE_CREATE {
-            return Err(NtStatus::OBJECT_NAME_COLLISION);
-        }
-        if let Some(source) = installed.filter(|source| source.metadata.is_directory) {
-            self.directories
-                .check_share(relative, source.metadata, access, share)
-                .map_err(status)?;
-            let action = nt_fs::installed_file_open_action(
-                access,
-                parameters.create_disposition,
-                options & !nt_fs::FILE_DIRECTORY_FILE,
-            )
-            .map_err(status)?;
-            if action != nt_fs::InstalledFileOpenAction::ReadOnly {
-                return Err(NtStatus::NOT_SUPPORTED);
-            }
-            if overlay.is_none() || relative.is_empty() {
-                return self.create_installed_directory(
+            options,
+            relative.is_empty(),
+        ).map_err(status)?;
+        match decision {
+            nt_fs::LayeredDirectoryOpenDecision::Installed => {
+                let source = installed.expect("directory policy selected installed backing");
+                // Directory ADD_FILE/ADD_SUBDIRECTORY grants apply to layered children, not writes
+                // to immutable FAT bytes. Deleting a lower entry still requires whiteout support.
+                if options & nt_fs::FILE_DELETE_ON_CLOSE != 0 {
+                    return Err(NtStatus::NOT_SUPPORTED);
+                }
+                self.create_installed_directory(
                     file_id, units, relative, source, access, share, options,
-                );
+                )
             }
+            nt_fs::LayeredDirectoryOpenDecision::Overlay => {
+                if let Some(source) = installed.filter(|source| source.metadata.is_directory) {
+                    self.directories
+                        .check_share(relative, source.metadata, access, share)
+                        .map_err(status)?;
+                }
+                self.create_overlay(
+                    file_id, units, relative, installed, None, false, true, parameters,
+                )
+            }
+            nt_fs::LayeredDirectoryOpenDecision::CreateOverlay => self.create_overlay(
+                file_id, units, relative, None, None, true, true, parameters,
+            ),
         }
-        self.create_overlay(
-            file_id, units, relative, installed, None, false, true, parameters,
-        )
     }
 
     fn create_installed_directory(
@@ -251,7 +280,7 @@ impl MountedVolumeBackend {
         share: u32,
         options: u32,
     ) -> Result<DispatchOutcome, NtStatus> {
-        let context = self.opens.reserve(file_id, units).map_err(status)?;
+        let context = self.reserve_open_context(file_id, units)?;
         let directory_open = match self.directories.create(
             installed.first_cluster,
             relative,
@@ -263,6 +292,7 @@ impl MountedVolumeBackend {
         ) {
             Ok(open) => open,
             Err(error) => {
+                self.note_create_capacity_failure(b"directory", file_id, status(error));
                 self.opens
                     .cancel(context, file_id)
                     .expect("owned reservation");
@@ -284,7 +314,8 @@ impl MountedVolumeBackend {
         debug_assert!(self.bindings[index].is_none());
         self.bindings[index] = Some(MountedBinding {
             context,
-            share_open: None,
+            installed_open: None,
+            installed_handle_open: false,
             directory_open: Some(directory_open),
             overlay_open: false,
             is_directory: true,
@@ -310,8 +341,8 @@ impl MountedVolumeBackend {
         share: u32,
         options: u32,
     ) -> Result<DispatchOutcome, NtStatus> {
-        let context = self.opens.reserve(file_id, units).map_err(status)?;
-        let share_open = match self.shares.create(
+        let context = self.reserve_open_context(file_id, units)?;
+        let installed_open = match self.shares.create(
             installed.first_cluster,
             installed.metadata.end_of_file.min(u32::MAX as u64) as u32,
             relative,
@@ -321,14 +352,20 @@ impl MountedVolumeBackend {
             installed.metadata,
             installed.alternate_name,
         ) {
-            Ok(share_open) => share_open,
+            Ok(installed_open) => installed_open,
             Err(error) => {
+                self.note_create_capacity_failure(b"installed-file", file_id, status(error));
                 self.opens
                     .cancel(context, file_id)
                     .expect("owned reservation");
                 return Err(status(error));
             }
         };
+        if let Err(error) = self.shares.retain_io(installed_open) {
+            self.shares.release(installed_open).expect("unpublished installed handle");
+            self.opens.cancel(context, file_id).expect("owned reservation");
+            return Err(status(error));
+        }
         self.opens
             .finish(
                 context,
@@ -344,7 +381,8 @@ impl MountedVolumeBackend {
         debug_assert!(self.bindings[index].is_none());
         self.bindings[index] = Some(MountedBinding {
             context,
-            share_open: Some(share_open),
+            installed_open: Some(installed_open),
+            installed_handle_open: true,
             directory_open: None,
             overlay_open: false,
             is_directory: false,
@@ -371,15 +409,16 @@ impl MountedVolumeBackend {
         is_directory: bool,
         parameters: &nt_io_manager::CreateParameters,
     ) -> Result<DispatchOutcome, NtStatus> {
+        let context = self.reserve_open_context(file_id, units)?;
         let access = parameters.desired_access.bits();
         let share = parameters.share_access.bits();
         let options = parameters.create_options.bits();
         if let Some(source) = installed {
-            self.shares
-                .check_share(relative, source.metadata, access, share)
-                .map_err(status)?;
+            if let Err(error) = self.shares.check_share(relative, source.metadata, access, share) {
+                self.opens.cancel(context, file_id).expect("unpublished overlay context");
+                return Err(status(error));
+            }
         }
-        let context = self.opens.reserve(file_id, units).map_err(status)?;
         let result = (|| -> Result<(u64, u64), NtStatus> {
             if let Some(parent) = relative
                 .iter()
@@ -432,6 +471,7 @@ impl MountedVolumeBackend {
         let (overlay_file, information) = match result {
             Ok(result) => result,
             Err(error) => {
+                self.note_create_capacity_failure(b"overlay", file_id, error);
                 self.opens
                     .cancel(context, file_id)
                     .expect("owned reservation");
@@ -451,7 +491,8 @@ impl MountedVolumeBackend {
         debug_assert!(self.bindings[index].is_none());
         self.bindings[index] = Some(MountedBinding {
             context,
-            share_open: None,
+            installed_open: None,
+            installed_handle_open: false,
             directory_open: None,
             overlay_open: true,
             is_directory,
@@ -549,9 +590,9 @@ impl MountedVolumeBackend {
         else {
             return Err(NtStatus::INVALID_HANDLE);
         };
-        let share_open = binding.share_open.ok_or(NtStatus::INVALID_HANDLE)?;
+        let installed_open = binding.installed_open.ok_or(NtStatus::INVALID_HANDLE)?;
         let offset = u32::try_from(parameters.offset).map_err(|_| NtStatus::INVALID_PARAMETER)?;
-        self.shares.get(share_open).map_err(status)?;
+        self.shares.get(installed_open).map_err(status)?;
         let eof = metadata.end_of_file.min(u32::MAX as u64) as u32;
         if offset >= eof {
             return Err(NtStatus::END_OF_FILE);
@@ -569,12 +610,12 @@ impl MountedVolumeBackend {
         if written != expected {
             return Err(status(nt_fs::STATUS_DATA_ERROR));
         }
-        if self.shares.get(share_open).map_err(status)?.create_options
+        if self.shares.get(installed_open).map_err(status)?.create_options
             & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
             != 0
         {
             self.shares
-                .get_mut(share_open)
+                .get_mut(installed_open)
                 .map_err(status)?
                 .current_offset = u64::from(offset) + written as u64;
         }
@@ -618,7 +659,7 @@ impl MountedVolumeBackend {
                 } else {
                     let open = self
                         .shares
-                        .get(binding.share_open.ok_or(NtStatus::INVALID_HANDLE)?)
+                        .get(binding.installed_open.ok_or(NtStatus::INVALID_HANDLE)?)
                         .map_err(status)?;
                     (
                         metadata,
@@ -858,12 +899,13 @@ impl MountedVolumeBackend {
     ) -> Result<DispatchOutcome, NtStatus> {
         let (context, binding) = self.binding(irp)?;
         let index = context_index(context).ok_or(NtStatus::INVALID_HANDLE)?;
-        if let Some(share_open) = binding.share_open {
-            self.shares.release(share_open).map_err(status)?;
+        if binding.installed_handle_open {
+            let installed_open = binding.installed_open.ok_or(NtStatus::INVALID_HANDLE)?;
+            self.shares.release(installed_open).map_err(status)?;
             self.bindings[index]
                 .as_mut()
                 .expect("validated binding")
-                .share_open = None;
+                .installed_handle_open = false;
         }
         if let Some(directory_open) = binding.directory_open {
             self.directories.release(directory_open).map_err(status)?;
@@ -890,6 +932,10 @@ impl MountedVolumeBackend {
             }
         }
         if close {
+            if let Some(installed_open) = binding.installed_open {
+                self.shares.release_io(installed_open).map_err(status)?;
+                self.bindings[index].as_mut().expect("validated binding").installed_open = None;
+            }
             self.opens.release(context, file_id.raw()).map_err(status)?;
             self.bindings[index] = None;
         }

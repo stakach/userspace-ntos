@@ -3,18 +3,18 @@
 use alloc::vec::Vec;
 use nt_memory_manager::{RoutedSectionLease, SectionIdentity};
 
-struct Owner<T> {
+struct Owner<T, Identity: Copy + Eq> {
     lease: RoutedSectionLease,
-    section: Option<SectionIdentity>,
+    section: Option<Identity>,
     value: T,
 }
 
-pub struct RoutedSectionOwners<T> {
+pub struct RoutedSectionOwners<T, Identity: Copy + Eq = SectionIdentity> {
     next_lease: u64,
-    owners: Vec<Owner<T>>,
+    owners: Vec<Owner<T, Identity>>,
 }
 
-impl<T> RoutedSectionOwners<T> {
+impl<T, Identity: Copy + Eq> RoutedSectionOwners<T, Identity> {
     pub const fn new() -> Self {
         Self {
             next_lease: 0,
@@ -41,7 +41,7 @@ impl<T> RoutedSectionOwners<T> {
     }
 
     /// Associate an admitted section with its already-reserved owner, without allocation.
-    pub fn bind(&mut self, lease: RoutedSectionLease, section: SectionIdentity) -> bool {
+    pub fn bind(&mut self, lease: RoutedSectionLease, section: Identity) -> bool {
         if self
             .owners
             .iter()
@@ -60,7 +60,7 @@ impl<T> RoutedSectionOwners<T> {
         true
     }
 
-    pub fn get(&self, lease: RoutedSectionLease, section: SectionIdentity) -> Option<&T> {
+    pub fn get(&self, lease: RoutedSectionLease, section: Identity) -> Option<&T> {
         self.owners
             .iter()
             .find(|owner| owner.lease == lease && owner.section == Some(section))
@@ -77,7 +77,7 @@ impl<T> RoutedSectionOwners<T> {
     }
 
     /// Transfer the exact owner to the checked file-reference retirement mechanism.
-    pub fn release(&mut self, lease: RoutedSectionLease, section: SectionIdentity) -> Option<T> {
+    pub fn release(&mut self, lease: RoutedSectionLease, section: Identity) -> Option<T> {
         let index = self
             .owners
             .iter()
@@ -90,7 +90,7 @@ impl<T> RoutedSectionOwners<T> {
     }
 }
 
-impl<T> Default for RoutedSectionOwners<T> {
+impl<T, Identity: Copy + Eq> Default for RoutedSectionOwners<T, Identity> {
     fn default() -> Self {
         Self::new()
     }
@@ -101,7 +101,9 @@ mod tests {
     use super::*;
     use alloc::boxed::Box;
     use nt_memory_manager::{
-        GenericSectionBacking, GenericSectionTable, PAGE_READONLY, SECTION_ATTR_SEC_COMMIT,
+        image_section::{ImageAcquire, ImageAreaId, ImageSectionPurge, ImageSectionTable},
+        GenericSectionBacking, GenericSectionTable, SectionFileIdentity, SectionMountIds,
+        PAGE_READONLY, SECTION_ATTR_SEC_COMMIT,
     };
 
     fn section(table: &mut GenericSectionTable, handle: u64) -> (usize, SectionIdentity) {
@@ -182,10 +184,74 @@ mod tests {
 
     #[test]
     fn exhausted_lease_space_returns_non_copy_owner() {
-        let mut owners = RoutedSectionOwners::new();
+        let mut owners = RoutedSectionOwners::<Box<i32>>::new();
         owners.next_lease = u64::MAX;
         let owner = Box::new(7);
         assert_eq!(owners.reserve(owner).map_err(|owner| *owner), Err(7));
         assert!(owners.is_empty());
+    }
+
+    struct Purge;
+
+    impl ImageSectionPurge for Purge {
+        fn purge_image(&mut self, _: ImageAreaId, _: SectionFileIdentity) -> Result<(), u32> {
+            Ok(())
+        }
+    }
+
+    fn image_file() -> SectionFileIdentity {
+        let mut mounts = SectionMountIds::new();
+        SectionFileIdentity {
+            mount: mounts.allocate().unwrap(),
+            file_id: 71,
+        }
+    }
+
+    fn image_area(images: &mut ImageSectionTable, file: SectionFileIdentity) -> ImageAreaId {
+        let ImageAcquire::Create(creation) = images.acquire(file).unwrap() else {
+            panic!("expected a new image area")
+        };
+        let section = images.publish(creation).unwrap();
+        let area = section.area();
+        images.close_section(section).unwrap();
+        area
+    }
+
+    #[test]
+    fn image_area_binding_rejects_wrong_lease_and_stale_reused_area() {
+        let mut images = ImageSectionTable::new();
+        let file = image_file();
+        let old = image_area(&mut images, file);
+        let mut owners = RoutedSectionOwners::<Box<i32>, ImageAreaId>::new();
+        let old_lease = owners.reserve(Box::new(11)).unwrap();
+        assert!(owners.bind(old_lease, old));
+        assert!(images.flush_for_write(file, &mut Purge).is_ok());
+        let new = image_area(&mut images, file);
+        assert_ne!(old, new);
+        let new_lease = owners.reserve(Box::new(12)).unwrap();
+        assert!(owners.bind(new_lease, new));
+        assert!(owners.get(old_lease, new).is_none());
+        assert!(owners.get(new_lease, old).is_none());
+        assert!(owners.release(old_lease, new).is_none());
+        assert!(owners.release(new_lease, old).is_none());
+        assert_eq!(owners.release(old_lease, old).map(|value| *value), Some(11));
+        assert_eq!(owners.release(new_lease, new).map(|value| *value), Some(12));
+    }
+
+    #[test]
+    fn image_area_binding_refuses_identity_from_another_image_table() {
+        let file = image_file();
+        let mut first_images = ImageSectionTable::new();
+        let mut other_images = ImageSectionTable::new();
+        let first = image_area(&mut first_images, file);
+        let other = image_area(&mut other_images, file);
+        assert_ne!(first, other);
+        let mut owners = RoutedSectionOwners::<Box<i32>, ImageAreaId>::new();
+        let lease = owners.reserve(Box::new(13)).unwrap();
+        assert!(owners.bind(lease, first));
+        assert!(!owners.bind(lease, other));
+        assert!(owners.get(lease, other).is_none());
+        assert!(owners.release(lease, other).is_none());
+        assert_eq!(owners.release(lease, first).map(|value| *value), Some(13));
     }
 }

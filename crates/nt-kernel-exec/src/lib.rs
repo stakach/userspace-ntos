@@ -13,6 +13,7 @@
 extern crate alloc;
 
 mod completion;
+pub mod apc_state;
 pub mod cr8_getter_patch;
 mod cyclic_ids;
 pub mod dbg;
@@ -21,6 +22,7 @@ mod event_signal;
 mod dpc;
 mod driver_thread;
 mod event;
+mod event_deferred_signal;
 mod event_object;
 mod event_wait;
 pub mod executive_sync;
@@ -36,6 +38,7 @@ mod mutant;
 pub mod np_prefix;
 pub mod provider_pool;
 pub mod process_attach;
+pub mod push_lock;
 pub mod provider_bugcheck;
 pub mod rtl_atom;
 pub mod rtl_bitmap;
@@ -74,6 +77,7 @@ pub use driver_thread::{
     HOSTED_DRIVER_THREAD_HANDLE_BASE,
 };
 pub use event::{map_event_access, EventKind, EventStore, WaitManyResult, WaitResult};
+pub use event_deferred_signal::DeferredEventSignal;
 pub use event_wait::{
     acquire_projected_provider_event_wait, acquire_provider_local_event_wait,
     consume_provider_event_wait, provider_event_wait_is_ready, ProviderEventWaitError,

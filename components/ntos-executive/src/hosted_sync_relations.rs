@@ -1,6 +1,5 @@
 use super::*;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
-use core::sync::atomic::{AtomicU64, Ordering};
 use nt_process::native_handle::NativeThreadProcessReference;
 
 struct Work {
@@ -17,7 +16,6 @@ struct Work {
 
 static mut WORK: Vec<Option<Work>> = Vec::new();
 static mut EXECUTING: Vec<usize> = Vec::new();
-static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) unsafe fn submit(
     channel: &crate::spawn_hosts::PumpChannel,
@@ -50,6 +48,8 @@ pub(crate) unsafe fn submit(
         Err(status) => return Some(status),
     };
     match relation_type {
+        // IoSynchronousInvalidateDeviceRelations(TargetDeviceRelation) requests no bus
+        // re-enumeration. The actual TargetDeviceRelation query is a separate PnP IRP.
         nt_pnp_abi::TARGET_DEVICE_RELATION => return Some(nt_status::NtStatus::SUCCESS.raw()),
         nt_pnp_abi::POWER_RELATIONS => return Some(nt_status::NtStatus::NOT_IMPLEMENTED.raw()),
         nt_pnp_abi::BUS_RELATIONS => {}
@@ -86,9 +86,7 @@ pub(crate) unsafe fn submit(
         release_actor(actor);
         return Some(nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw());
     }
-    let token = match NEXT_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-        value.checked_add(1)
-    }) {
+    let token = match runtime::next_service_wait_token() {
         Ok(token) if token != 0 => token,
         _ => {
             release_actor(actor);

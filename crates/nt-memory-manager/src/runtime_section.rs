@@ -24,6 +24,10 @@ pub use retirement::{
     SectionRetirementResource,
 };
 
+#[path = "section_reference.rs"]
+mod reference;
+pub use reference::SectionReference;
+
 use crate::{MemoryLifetime, PAGE_NOACCESS, STATUS_INVALID_PARAMETER_2, STATUS_NOT_MAPPED_VIEW};
 
 pub const GENERIC_SECTION_BACKING_NONE: u8 = 0;
@@ -333,6 +337,9 @@ pub struct GenericSectionTable {
     control_areas: Vec<ControlArea>,
     views: Vec<GenericSectionView>,
     provider_views: Vec<ProviderSectionView>,
+    references: Vec<SectionReference>,
+    reference_authority: u64,
+    reference_generation: u64,
     pages: Vec<GenericSectionPage>,
     dirty_epoch: u64,
     section_generation: u64,
@@ -355,6 +362,9 @@ impl GenericSectionTable {
             control_areas: Vec::new(),
             views: Vec::new(),
             provider_views: Vec::new(),
+            references: Vec::new(),
+            reference_authority: 0,
+            reference_generation: 0,
             pages: Vec::new(),
             dirty_epoch: 0,
             section_generation: 0,
@@ -390,6 +400,7 @@ impl GenericSectionTable {
             .iter()
             .any(|section| section.backing.is_live())
             || !self.provider_views.is_empty()
+            || !self.references.is_empty()
             || self.pages.iter().any(|page| page.live)
         {
             return false;
@@ -576,7 +587,10 @@ impl GenericSectionTable {
         true
     }
 
+    /// Explicit rollback/teardown may clear views, but cannot invalidate outstanding object
+    /// references. Callers must release those exact leases before clearing the section.
     pub fn clear_section(&mut self, index: usize) {
+        assert!(!self.section_has_references(index), "section object references must be released before clear");
         if let Some(section) = self.sections.get_mut(index) {
             section.live = false;
             section.handle = 0;
@@ -603,6 +617,7 @@ impl GenericSectionTable {
             .get(index)
             .is_some_and(|section| section.live && section.handle == 0)
             && !self.section_has_views(index)
+            && !self.section_has_references(index)
         {
             self.clear_section(index);
         }
@@ -1023,6 +1038,137 @@ mod tests {
         assert!(table.section(index).is_none());
         assert_eq!(table.next_retirement().unwrap().identity(), section);
         assert_eq!(table.stats().live_provider_views, 0);
+    }
+
+    #[test]
+    fn section_pointer_retains_backing_after_handle_close_until_exact_release() {
+        let mut table = GenericSectionTable::new();
+        let index = create_section(&mut table, 2, 0x40);
+        let identity = table.section_identity(index).unwrap();
+        let reference = table.retain_section(identity).unwrap();
+        assert_eq!(reference.identity(), identity);
+        assert!(table.release_handle(index));
+        assert_eq!(table.section_identity(index), Some(identity));
+        assert!(table.next_retirement().is_none());
+        assert!(!table.reset());
+
+        assert!(table.release_section_reference(reference));
+        assert!(table.section(index).is_none());
+        let retirement = table.next_retirement().unwrap();
+        assert_eq!(retirement.identity(), identity);
+        assert!(!table.release_section_reference(reference));
+        assert_eq!(table.next_retirement(), Some(retirement));
+        assert!(table.complete_retirement(retirement));
+        assert!(table.next_retirement().is_none());
+    }
+
+    #[test]
+    fn provider_view_survives_final_section_pointer_release_then_exact_unmap_retires() {
+        let mut table = GenericSectionTable::new();
+        let index = create_section(&mut table, 2, 0x40);
+        let identity = table.section_identity(index).unwrap();
+        let reference = table.retain_section(identity).unwrap();
+        assert!(table.release_handle(index));
+        let owner = provider(7, 11);
+        let view = table.map_provider_view(owner, identity, 0x10000, 0x2000, 0).unwrap();
+        assert!(table.release_section_reference(reference));
+        assert_eq!(table.section_identity(index), Some(identity));
+        assert_eq!(table.provider_view_for_page(owner, 0x11000), Some(view));
+        assert!(table.next_retirement().is_none());
+
+        assert_eq!(table.unmap_provider_view_exact(view), Some(view));
+        assert!(table.section(index).is_none());
+        let retirement = table.next_retirement().unwrap();
+        assert_eq!(retirement.identity(), identity);
+        assert_eq!(table.unmap_provider_view_exact(view), None);
+        assert_eq!(table.next_retirement(), Some(retirement));
+        assert!(table.complete_retirement(retirement));
+    }
+
+    #[test]
+    fn exact_live_section_reference_can_duplicate_after_handle_close() {
+        let mut table = GenericSectionTable::new();
+        let index = create_section(&mut table, 2, 0x40);
+        let identity = table.section_identity(index).unwrap();
+        let first = table.retain_section(identity).unwrap();
+        assert!(table.release_handle(index));
+        let second = table.retain_section_reference(first).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(second.identity(), identity);
+        assert!(table.release_section_reference(first));
+        assert!(table.retain_section_reference(first).is_none());
+        assert!(!table.release_section_reference(first));
+        assert_eq!(table.section_identity(index), Some(identity));
+        assert!(table.next_retirement().is_none());
+        assert!(table.release_section_reference(second));
+        assert!(table.section(index).is_none());
+    }
+
+    #[test]
+    fn stale_section_reference_cannot_release_recycled_section_or_lease() {
+        let mut table = GenericSectionTable::new();
+        let index = create_section(&mut table, 2, 0x40);
+        let identity = table.section_identity(index).unwrap();
+        let first = table.retain_section(identity).unwrap();
+        assert!(table.release_handle(index));
+        assert!(table.release_section_reference(first));
+        let retirement = table.next_retirement().unwrap();
+        assert!(table.complete_retirement(retirement));
+        assert!(table.reset());
+
+        let replacement_index = create_section(&mut table, 2, 0x40);
+        assert_eq!(replacement_index, index);
+        let replacement = table.section_identity(replacement_index).unwrap();
+        assert_ne!(identity, replacement);
+        assert!(table.retain_section(identity).is_none());
+        assert!(table.retain_section_reference(first).is_none());
+        let current = table.retain_section(replacement).unwrap();
+        assert_ne!(first, current);
+        assert!(table.release_handle(replacement_index));
+        assert!(!table.release_section_reference(first));
+        assert_eq!(table.section_identity(index), Some(replacement));
+        assert!(table.next_retirement().is_none());
+        assert!(table.release_section_reference(current));
+    }
+
+    #[test]
+    fn section_reference_is_not_authority_in_another_table() {
+        let mut first = GenericSectionTable::new();
+        let mut other = GenericSectionTable::new();
+        let first_index = create_section(&mut first, 2, 0x40);
+        let other_index = create_section(&mut other, 2, 0x40);
+        let reference = first.retain_section(first.section_identity(first_index).unwrap()).unwrap();
+        let other_reference = other.retain_section(other.section_identity(other_index).unwrap()).unwrap();
+        assert!(other.release_handle(other_index));
+        assert!(!other.release_section_reference(reference));
+        assert!(other.retain_section_reference(reference).is_none());
+        assert!(other.section(other_index).is_some());
+        assert!(other.release_section_reference(other_reference));
+        assert!(first.release_section_reference(reference));
+    }
+
+    #[test]
+    fn section_reference_generation_exhaustion_has_no_lifetime_effect() {
+        let mut table = GenericSectionTable::new();
+        let index = create_section(&mut table, 2, 0x40);
+        let identity = table.section_identity(index).unwrap();
+        let reference = table.retain_section(identity).unwrap();
+        table.reference_generation = u64::MAX;
+        assert!(table.retain_section(identity).is_none());
+        assert!(table.retain_section_reference(reference).is_none());
+        assert!(table.release_handle(index));
+        assert_eq!(table.section_identity(index), Some(identity));
+        assert!(table.release_section_reference(reference));
+        assert!(table.section(index).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "section object references must be released before clear")]
+    fn explicit_clear_cannot_bypass_live_section_pointer() {
+        let mut table = GenericSectionTable::new();
+        let index = create_section(&mut table, 2, 0x40);
+        let _reference = table.retain_section(table.section_identity(index).unwrap()).unwrap();
+        table.clear_section(index);
     }
 
     #[test]

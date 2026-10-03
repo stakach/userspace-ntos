@@ -15,6 +15,15 @@ fn root(token: &AccessToken) -> Vec<u8> {
 }
 
 #[test]
+fn mounted_hive_root_uses_mount_security_only_when_imported_root_is_empty() {
+    let mount = root(&AccessToken::system());
+    let imported = root(&AccessToken::admin(123));
+    assert_eq!(mounted_hive_root_security(Some(&[]), &mount), mount);
+    assert_eq!(mounted_hive_root_security(None, &mount), mount);
+    assert_eq!(mounted_hive_root_security(Some(&imported), &mount), imported);
+}
+
+#[test]
 fn root_template_is_exact_ordered_nt5_container_policy() {
     let bytes = root_template().unwrap();
     let sd = parse_self_relative_descriptor(&bytes).unwrap();

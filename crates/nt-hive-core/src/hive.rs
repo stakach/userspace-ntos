@@ -44,8 +44,16 @@ impl HiveKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeyKind {
+    #[default]
+    Ordinary,
+    SymbolicLink,
+}
+
 #[derive(Clone)]
 pub(crate) struct KeyCell {
+    pub kind: KeyKind,
     pub id: CellId,
     pub parent: Option<CellId>,
     pub name: String,
@@ -301,7 +309,7 @@ impl Drop for HiveTransaction<'_> {
 /// corresponding destination metadata only when it is explicitly present. Neither input is
 /// modified, and the returned hive is a clean persistence baseline.
 pub fn compose_hive_overlay(base: &Hive, overlay: &Hive) -> Result<Hive, HiveOverlayError> {
-    compose_hive_overlay_inner(base, overlay, None)
+    compose_hive_overlay_inner(base, overlay, None, false)
 }
 
 /// Compose a generated SYSTEM configuration hive onto the persistent hive's selected control set.
@@ -310,6 +318,14 @@ pub fn compose_hive_overlay(base: &Hive, overlay: &Hive) -> Result<Hive, HiveOve
 /// subtree is applied to the base hive's selected subtree, while the base `Select` key remains the
 /// sole boot-selection authority.
 pub fn compose_system_hive_overlay(base: &Hive, overlay: &Hive) -> Result<Hive, HiveOverlayError> {
+    compose_system_hive_overlay_with_security(base, overlay, false)
+}
+
+fn compose_system_hive_overlay_with_security(
+    base: &Hive,
+    overlay: &Hive,
+    secured: bool,
+) -> Result<Hive, HiveOverlayError> {
     if base.kind != overlay.kind {
         return Err(HiveOverlayError::KindMismatch);
     }
@@ -326,13 +342,27 @@ pub fn compose_system_hive_overlay(base: &Hive, overlay: &Hive) -> Result<Hive, 
         base,
         overlay,
         Some((overlay_control_set.as_str(), base_control_set.as_str())),
+        secured,
     )
 }
+
+/// Compose SYSTEM configuration with real NT security for generated keys.
+/// Existing metadata remains authoritative unless a valid explicit overlay replaces it.
+pub fn compose_system_hive_overlay_secured(
+    base: &Hive,
+    overlay: &Hive,
+) -> Result<Hive, HiveOverlayError> {
+    compose_system_hive_overlay_with_security(base, overlay, true)
+}
+
+#[path = "hive_overlay_security.rs"]
+mod overlay_security;
 
 fn compose_hive_overlay_inner(
     base: &Hive,
     overlay: &Hive,
     system_control_set_remap: Option<(&str, &str)>,
+    secured: bool,
 ) -> Result<Hive, HiveOverlayError> {
     if base.kind != overlay.kind {
         return Err(HiveOverlayError::KindMismatch);
@@ -394,6 +424,9 @@ fn compose_hive_overlay_inner(
                 }
             }
             if let Some(descriptor) = security_descriptor.as_deref() {
+                if secured {
+                    overlay_security::validate_explicit(descriptor)?;
+                }
                 if !composed.set_key_security_descriptor(destination_id, descriptor) {
                     return Err(HiveOverlayError::InvalidSource);
                 }
@@ -416,10 +449,16 @@ fn compose_hive_overlay_inner(
                             }
                             _ => name.as_str(),
                         };
-                        Some(composed.create_subkey_in_storage(destination_id, destination_name, volatile || composed.is_volatile(destination_id)))
+                        Some(overlay_security::create_child(
+                            &mut composed, overlay, child_id, destination_id,
+                            destination_name, volatile, secured,
+                        )?)
                     }
                 }
-                Some(destination_id) => Some(composed.create_subkey_in_storage(destination_id, &name, volatile || composed.is_volatile(destination_id))),
+                Some(destination_id) => Some(overlay_security::create_child(
+                    &mut composed, overlay, child_id, destination_id,
+                    &name, volatile, secured,
+                )?),
                 None => None,
             };
             pending.push((child_id, destination_child));
@@ -582,6 +621,7 @@ impl Hive {
     pub(crate) fn alloc_key(&mut self, parent: Option<CellId>, name: &str) -> CellId {
         let id = self.alloc_id();
         self.push_cell(Cell::Key(KeyCell {
+            kind: KeyKind::Ordinary,
             id,
             parent,
             name: name.into(),
@@ -759,6 +799,23 @@ impl Hive {
 
     pub fn key_security_descriptor(&self, key: CellId) -> Option<&[u8]> {
         self.key(key)?.security_descriptor.as_deref()
+    }
+
+    pub fn key_kind(&self, key: CellId) -> Option<KeyKind> {
+        Some(self.key(key)?.kind)
+    }
+
+    /// Storage metadata for import/setup; changing a key's kind is not a native creation grant.
+    pub fn set_key_kind(&mut self, key: CellId, kind: KeyKind) -> bool {
+        let Some(current) = self.key(key) else { return false; };
+        if current.kind == kind { return true; }
+        if !current.volatile { self.sequence += 1; }
+        let sequence = self.sequence;
+        let current = self.key_mut(key).expect("existing kind target");
+        current.kind = kind;
+        current.last_write_sequence = sequence;
+        self.mark_dirty(key);
+        true
     }
 
     pub fn is_volatile(&self, key: CellId) -> bool {

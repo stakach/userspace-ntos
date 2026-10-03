@@ -179,6 +179,21 @@ fn fsd_read_write_buffer_modes_match_reactos() {
 }
 
 #[test]
+fn zero_length_direct_fsd_does_not_describe_an_unlocked_mdl() {
+    let plan = plan_synchronous_fsd_request(
+        major::IRP_MJ_READ,
+        1,
+        DO_DIRECT_IO,
+        0x1000,
+        0x2000,
+        0,
+        Some(0),
+    )
+    .unwrap();
+    assert_eq!(plan.mdl, None);
+}
+
+#[test]
 fn fsd_control_majors_ignore_buffer_and_offset() {
     for major in [
         major::IRP_MJ_PNP,
@@ -306,6 +321,18 @@ fn ioctl_null_and_zero_buffers_follow_builder_contract() {
             .unwrap();
     assert_eq!(direct.system_buffer_len, 0);
     assert_eq!(direct.mdl, None);
+    assert_eq!(direct.irp_flags, 0);
+    let zero_length = plan_device_io_control_request(
+        code | ioctl::METHOD_OUT_DIRECT, false, 1, 7, 0x1000, 0, 0x2000, 0,
+    ).unwrap();
+    assert_eq!(zero_length.system_buffer_len, 0);
+    assert_eq!(zero_length.system_buffer_input, 0x1000);
+    assert_eq!(zero_length.irp_flags, IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER);
+    assert_eq!(zero_length.mdl, Some(MdlPlan {
+        buffer: 0x2000,
+        length: 0,
+        access: MdlAccess::Write,
+    }));
 }
 
 #[test]

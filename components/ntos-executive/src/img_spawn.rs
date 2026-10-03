@@ -498,6 +498,7 @@ pub(crate) struct MainThreadRuntime {
     pub(crate) thread_id: u64,
     pub(crate) entry: u64,
     pub(crate) teb: Option<u64>,
+    pub(crate) teb_alias: Option<u64>,
     pub(crate) create_time_100ns: i64,
     pub(crate) started: bool,
 }
@@ -1681,6 +1682,7 @@ pub(crate) unsafe fn spawn_sec_image(
             thread_id: client_thread_id,
             entry: PE_LOAD_BASE + pe.entry_point_rva() as u64,
             teb: setup_env.then_some(SMSS_TEB_VA),
+            teb_alias: setup_env.then_some(scr_base),
             create_time_100ns: nt_system_time_100ns() as i64,
             started: start_immediately,
         },

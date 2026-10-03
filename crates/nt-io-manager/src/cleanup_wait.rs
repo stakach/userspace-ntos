@@ -135,7 +135,6 @@ impl PendingFileCleanupWaitTable {
             || self.slots.get(reservation.slot)?.is_some()
             || pending.file_id == 0
             || pending.tid == 0
-            || pending.badge == 0
             || pending.reply_cap == 0
             || self.slots.iter().flatten().any(|current| {
                 current.file_id == pending.file_id
@@ -207,6 +206,18 @@ mod tests {
         assert_eq!(table.park_reserved(current, pending(10, 20, 30)), Some(0));
         assert!(table.take_file(11).is_none());
         assert_eq!(table.take_file(10).unwrap().reply_cap, 30);
+    }
+
+    #[test]
+    fn zero_badge_is_a_valid_cleanup_owner() {
+        let mut table = PendingFileCleanupWaitTable::new();
+        let reservation = table.reserve().unwrap();
+        let wait = PendingFileCleanupWait {
+            badge: 0,
+            ..pending(10, 20, 30)
+        };
+        assert_eq!(table.park_reserved(reservation, wait), Some(0));
+        assert_eq!(table.take_file(10), Some(wait));
     }
 
     #[test]

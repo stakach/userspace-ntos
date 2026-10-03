@@ -29,6 +29,7 @@ pub mod dynamic_function_table;
 pub mod encode;
 pub mod environment;
 pub use nt_unwind as exception;
+pub mod unwind_context;
 pub mod fls;
 pub mod generic_table;
 pub mod guid;

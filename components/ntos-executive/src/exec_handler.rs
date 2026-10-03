@@ -64,6 +64,9 @@ pub(crate) mod directory_object;
 #[path = "exec_section_create.rs"]
 pub(crate) mod section_create;
 
+#[path = "exec_image_section_create.rs"]
+pub(crate) mod image_section_create;
+
 const INTERNAL_DISPATCHER_EVENT_BASE: u64 = 1 << 40;
 pub(crate) const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
 pub(crate) const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
@@ -367,7 +370,6 @@ static EXPLORER_TP_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static IO_COMPLETION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WAIT_OBJECT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NAMED_EVENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
-static PROVIDER_TIMER_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EVENT_DELETE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_POST_LSA_REGISTRY_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static TP_WORKER_PREFERRED_BUSY_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -1653,37 +1655,6 @@ fn trace_named_event_object(
     print_str(b"\n");
 }
 
-fn trace_provider_timer(
-    op: &[u8],
-    provider: nt_provider_wait::ProviderDomainIdentity,
-    local_identity: u64,
-    object: Option<nt_provider_wait::ProviderWaitObject>,
-    detail: u64,
-) {
-    let n = PROVIDER_TIMER_TRACE_N.fetch_add(1, Ordering::Relaxed);
-    if n >= 64 {
-        return;
-    }
-    print_str(b"[provider-timer] #");
-    print_u64(n + 1);
-    print_str(b" op=");
-    print_str(op);
-    print_str(b" provider=");
-    print_u64(provider.domain);
-    print_str(b"/");
-    print_u64(provider.generation);
-    print_str(b" local=0x");
-    print_hex_u64(local_identity);
-    if let Some(object) = object {
-        print_str(b" canonical=");
-        print_u64(object.object_id);
-        print_str(b"/");
-        print_u64(object.object_generation);
-    }
-    print_str(b" detail=");
-    print_u64(detail);
-    print_str(b"\n");
-}
 
 fn trace_winlogon_post_lsa_registry(
     handler: &ExecNtHandler,
@@ -3968,6 +3939,7 @@ impl ExecNtHandler {
             nt_address_space::SecuredVirtualMemoryTable::new()
         );
         write_field!(obj_ns, obj_ns);
+        write_field!(image_sections, native_image_sections::NativeImageStore::new());
         write_field!(events, events);
         write_field!(event_objects, event_objects);
         write_field!(provider_timers, provider_timers);
@@ -5238,6 +5210,9 @@ impl ExecNtHandler {
     fn note_durable_hive_journal_records(&mut self, hive_sel: Option<u32>, records: u32) {
         // The sidecar journal record is already appended and flushed here. Whole-volume
         // snapshots are owned by explicit flush/quiesce paths, not by every registry mutation.
+        if records != 0 {
+            crate::note_boot_progress(crate::BootProgress::DurableRegistryPublication);
+        }
         self.mutable_hive_journal_pending_records = self
             .mutable_hive_journal_pending_records
             .saturating_add(records);
@@ -5245,32 +5220,6 @@ impl ExecNtHandler {
             self.mutable_hive_journal_pending_boot_mask |= bit;
             self.mutable_hive_journal_dirty_boot_mask |= bit;
         }
-    }
-
-    fn journal_mutable_hive_op(
-        &mut self,
-        hive_sel: u32,
-        op: nt_hive_core::HiveLogOp<'_>,
-    ) -> Result<(), u32> {
-        let path = self
-            .mutable_hive_checkpoint_path_owned(hive_sel)
-            .ok_or(STATUS_INVALID_HANDLE)?;
-        {
-            let hive = self
-                .mutable_hives
-                .hive_mut(hive_sel)
-                .ok_or(STATUS_INVALID_HANDLE)?;
-            let seq = hive.sequence.saturating_add(1);
-            let rec = nt_hive_core::encode_log_record(&op, seq);
-            let mut provider = crate::writable_fs::WritableHiveIoProvider::new(&path);
-            nt_hive_core::HiveIoProvider::append_log_record(&mut provider, &rec)
-                .map_err(Self::mutable_hive_journal_status)?;
-            nt_hive_core::HiveIoProvider::flush_log(&mut provider)
-                .map_err(Self::mutable_hive_journal_status)?;
-            nt_hive_core::replay_log(hive, &rec, seq.saturating_sub(1));
-        }
-        self.note_mutable_hive_journal_record(hive_sel);
-        Ok(())
     }
 
     fn journal_create_mutable_subkey(
@@ -5949,6 +5898,13 @@ impl ExecNtHandler {
         file_path: &str,
     ) -> Result<bool, u32> {
         const STATUS_REGISTRY_CORRUPT: u32 = 0xC000_014C;
+        let replay_status = |error| match error {
+            nt_hive_core::HiveLogReplayError::OutOfMemory
+            | nt_hive_core::HiveLogReplayError::CreateChild(
+                nt_hive_core::CreateChildError::InsufficientResources,
+            ) => STATUS_INSUFFICIENT_RESOURCES,
+            _ => STATUS_REGISTRY_CORRUPT,
+        };
 
         let mount_path = hive_mount(hive_sel);
         let log_bytes = unsafe { crate::writable_fs::hive_log_bytes_owned_if_mounted(file_path) }?
@@ -5961,7 +5917,8 @@ impl ExecNtHandler {
                 return Err(STATUS_REGISTRY_CORRUPT);
             };
             let base_sequence = hive.sequence;
-            let last_sequence = nt_hive_core::replay_log(hive, &log_bytes, base_sequence);
+            let last_sequence = nt_hive_core::try_replay_log(hive, &log_bytes, base_sequence)
+                .map_err(replay_status)?;
             self.mutable_hives.clear_hive_dirty(hive_sel);
             let root_subkeys = self
                 .mutable_hives
@@ -5984,7 +5941,8 @@ impl ExecNtHandler {
         };
         if let Ok(mut hive) = nt_hive_core::decode_image(&bytes) {
             let base_sequence = hive.sequence;
-            let last_sequence = nt_hive_core::replay_log(&mut hive, &log_bytes, base_sequence);
+            let last_sequence = nt_hive_core::try_replay_log(&mut hive, &log_bytes, base_sequence)
+                .map_err(replay_status)?;
             let root_subkeys = hive.subkey_count(hive.root()) as u64;
             if self
                 .mutable_hives
@@ -6032,7 +5990,8 @@ impl ExecNtHandler {
                 .hive(hive_sel)
                 .map_or(0, |hive| hive.sequence);
             let last_sequence = if let Some(hive) = self.mutable_hives.hive_mut(hive_sel) {
-                nt_hive_core::replay_log(hive, &log_bytes, base_sequence)
+                nt_hive_core::try_replay_log(hive, &log_bytes, base_sequence)
+                    .map_err(replay_status)?
             } else {
                 base_sequence
             };
@@ -7254,11 +7213,36 @@ impl ExecNtHandler {
             return Ok(self.overlay.key_security_descriptor(index).map(alloc::vec::Vec::from));
         }
         if let Some(key) = self.mutable_registry_key(target) {
-            return Ok(self.mutable_hives.key_security_descriptor(key).map(alloc::vec::Vec::from));
+            let descriptor = self.mutable_hives.key_security_descriptor(key);
+            let mount_root = self.mutable_hives.hive(key.hive)
+                .is_some_and(|hive| key.key == hive.root());
+            let mount_security = if matches!(key.hive, HIVE_SEL_SOFTWARE | HIVE_SEL_SECURITY | HIVE_SEL_SAM) {
+                &self.registry_machine_root_security_descriptor
+            } else {
+                &self.registry_user_root_security_descriptor
+            };
+            return Ok(if mount_root {
+                Some(nt_security::mounted_hive_root_security(
+                    descriptor, mount_security,
+                ).to_vec())
+            } else {
+                descriptor.map(alloc::vec::Vec::from)
+            });
         }
         if let Some((hive, key)) = self.base_hive(target) {
+            let mount_security = if matches!(hive_sel(target), HIVE_SEL_SOFTWARE | HIVE_SEL_SECURITY | HIVE_SEL_SAM) {
+                &self.registry_machine_root_security_descriptor
+            } else {
+                &self.registry_user_root_security_descriptor
+            };
             return hive.key_security_descriptor(key)
-                .map(|descriptor| descriptor.map(alloc::vec::Vec::from))
+                .map(|descriptor| if key == hive.root() {
+                    Some(nt_security::mounted_hive_root_security(
+                        descriptor, mount_security,
+                    ).to_vec())
+                } else {
+                    descriptor.map(alloc::vec::Vec::from)
+                })
                 .map_err(|_| 0xC000_0079);
         }
         Ok(None)
@@ -8490,6 +8474,22 @@ impl ExecNtHandler {
         ).is_ok()
     }
 
+    pub(crate) fn hosted_gui_thread_teb_alias_for(
+        &self,
+        caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
+    ) -> Option<u64> {
+        if !self.validate_provider_logical_caller(caller) {
+            return None;
+        }
+        let runtime = self.thread_runtime.executable_by_badge(caller.badge())?;
+        caller.validate(Some(runtime.binding()), self.pm.thread_lifetime(caller.thread().thread_id()))
+            .ok()?;
+        if runtime.teb_alias == 0 || runtime.teb_alias & 0xfff != 0 {
+            return None;
+        }
+        Some(runtime.teb_alias)
+    }
+
     pub(crate) fn capture_process_identity(
         &self,
         pi: usize,
@@ -8557,17 +8557,33 @@ impl ExecNtHandler {
         let lifetime = self.pm.thread_lifetime(tid).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
         let mapped = spawn.main_runtime;
         let teb = mapped.teb.filter(|teb| *teb != 0).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        let teb_alias = mapped.teb_alias.filter(|alias| *alias != 0 && *alias & 0xfff == 0)
+            .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
         if mapped.process_id != u64::from(process.pid) || mapped.thread_id != u64::from(tid)
             || mapped.started || mapped.entry == 0
         { return Err(nt_process::STATUS_INVALID_PARAMETER); }
         self.thread_runtime.register_main(
-            pi, process, u64::from(tid), spawn.main_tcb, badge, spawn.main_mechanism,
+            pi, process, u64::from(tid), spawn.main_tcb, badge, spawn.main_mechanism, teb_alias,
         ).ok_or(nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
         // Retain the actual mechanism before Ps validation. Neither caller may resume the main
         // TCB until this complete tuple and the real stack geometry have been published.
         self.pm.publish_initial_thread_runtime(
             lifetime, mapped.entry, teb, mapped.create_time_100ns,
         )?;
+        let scratch = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+        let process_body = unsafe {
+            crate::ps_object_backing::prepare_process(&self.pm, process.pid, scratch)?
+        };
+        if let Err(status) = unsafe {
+            crate::ps_object_backing::prepare_thread(&self.pm, lifetime, scratch)
+        } {
+            unsafe {
+                crate::ps_object_backing::abort_unpublished(&self.pm, process_body, scratch)
+                    .expect("unpublished process body remains privately owned");
+            }
+            return Err(status);
+        }
+        unsafe { crate::ps_object_backing::publish_prepared_pair(&mut self.pm, lifetime)?; }
         self.thread_runtime.set_user_stack(
             u64::from(tid), HOSTED_MAIN_STACK_ALLOCATION_BASE, STACK_BASE + STACK_FRAMES * 0x1000,
         ).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
@@ -14296,9 +14312,30 @@ impl ExecNtHandler {
         assert!(self.thread_runtime.validate_spawn(&prepared, &spawn),
             "first run requires the exact completed construction and protected reservation");
         let tcb = spawn.tcb();
-        let activation = crate::ps_object_backing::commit_thread_activation(
-            &mut self.pm, publication.activation, publication.handle,
-        );
+        let scratch = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+        let old_lifetime = publication.activation.expected_lifetime();
+        let prepared_body = if self.pm.thread_kernel_object(tid).is_none() {
+            crate::ps_object_backing::prepare_thread(&self.pm, old_lifetime, scratch).map(Some)
+        } else {
+            Ok(None)
+        };
+        let activation = match prepared_body {
+            Ok(body) => {
+                let result = crate::ps_object_backing::commit_thread_activation(
+                    &mut self.pm, publication.activation, publication.handle,
+                );
+                if result.is_err() && body.is_some() {
+                    crate::ps_object_backing::abort_prepared_thread(&self.pm, old_lifetime, scratch)
+                        .expect("failed activation retains its unpublished ETHREAD owner");
+                }
+                result
+            }
+            Err(status) => {
+                crate::ps_object_backing::abort_prepared_thread(&self.pm, old_lifetime, scratch)
+                    .expect("failed construction retains its unpublished ETHREAD owner");
+                Err(status)
+            }
+        };
         let failure = match activation {
             Err(status) => Some(status),
             Ok(()) => {
@@ -20282,11 +20319,20 @@ impl ExecNtHandler {
                     .handle_object_count(nt_process::HandleObject::Section(section))
                     == 0
                 {
-                    if let Some(loop_ctx) = self.loop_ctx {
-                        unsafe {
-                            let _ =
-                                (&mut *loop_ctx.generic_sections).release_handle(section as usize);
+                    if let Some(image) = native_image_sections::NativeImageSectionId::from_section_id(section) {
+                        self.image_sections.close_handle_group(image)
+                            .expect("final native image Section handle releases its group");
+                        if let Some(index) = self.obj_ns.iter().position(|entry| {
+                            entry.kind == OBJ_KIND_SECTION
+                                && entry.payload == u64::from(section)
+                                && !entry.permanent
+                        }) {
+                            self.obj_ns[index].unlink();
+                            self.image_sections.withdraw_permanent(image)
+                                .expect("unlinked image Section releases its name reference");
                         }
+                    } else if let Some(loop_ctx) = self.loop_ctx {
+                        unsafe { let _ = (&mut *loop_ctx.generic_sections).release_handle(section as usize); }
                     }
                 }
             }
@@ -24277,6 +24323,17 @@ impl ExecNtHandler {
         self.provider_local_events().read(provider, local_identity)
     }
 
+    pub(crate) fn provider_read_local_event_with_sequence(
+        &mut self,
+        provider: nt_provider_wait::ProviderDomainIdentity,
+        local_identity: u64,
+    ) -> Result<(bool, u64), u32> {
+        if !crate::win32k_provider_domain_is_current(provider) {
+            return Err(0xC000_000D);
+        }
+        self.provider_local_events().read_with_sequence(provider, local_identity)
+    }
+
     pub(crate) fn provider_retire_local_event(
         &mut self,
         provider: nt_provider_wait::ProviderDomainIdentity,
@@ -24300,160 +24357,6 @@ impl ExecNtHandler {
             return Err(STATUS_INVALID_PARAMETER);
         }
         self.provider_local_events().ack(provider, local_identity, id)
-    }
-
-    pub(crate) fn provider_publish_local_timer(
-        &mut self,
-        provider: nt_provider_wait::ProviderDomainIdentity,
-        local_identity: u64,
-        timer_type: u32,
-    ) -> Result<nt_provider_wait::ProviderWaitObject, u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if !crate::win32k_provider_domain_is_current(provider) || timer_type > 1 {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        if self.provider_timers.is_none() {
-            self.provider_timers = Some(
-                nt_provider_wait::ProviderTimerTable::new(provider)
-                    .map_err(|_| STATUS_INVALID_PARAMETER)?,
-            );
-        }
-        let timers = self
-            .provider_timers
-            .as_mut()
-            .filter(|timers| timers.provider() == provider)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-        let kind = if timer_type == 0 {
-            nt_provider_wait::ProviderTimerKind::Notification
-        } else {
-            nt_provider_wait::ProviderTimerKind::Synchronization
-        };
-        match timers.publish(local_identity, kind) {
-            Ok(id) => {
-                let object = id.wait_object();
-                trace_provider_timer(b"publish", provider, local_identity, Some(object), 0);
-                Ok(object)
-            }
-            Err(error) => {
-                trace_provider_timer(
-                    b"publish-fail",
-                    provider,
-                    local_identity,
-                    None,
-                    error as u64,
-                );
-                Err(STATUS_INVALID_PARAMETER)
-            }
-        }
-    }
-
-    pub(crate) fn provider_set_local_timer(
-        &mut self,
-        provider: nt_provider_wait::ProviderDomainIdentity,
-        local_identity: u64,
-        due_time_100ns: i64,
-        period_ms: u32,
-    ) -> Result<bool, u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if !crate::win32k_provider_domain_is_current(provider) {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let timers = self.provider_timers
-            .as_mut()
-            .filter(|timers| timers.provider() == provider)
-            .ok_or_else(|| {
-                trace_provider_timer(b"set-no-table", provider, local_identity, None, 0);
-                STATUS_INVALID_PARAMETER
-            })?;
-        match timers.set_local(
-            local_identity,
-            due_time_100ns,
-            period_ms,
-            crate::nt_time_snapshot(),
-        ) {
-            Ok(active) => {
-                trace_provider_timer(b"set", provider, local_identity, None, u64::from(active));
-                Ok(active)
-            }
-            Err(error) => {
-                trace_provider_timer(b"set-fail", provider, local_identity, None, error as u64);
-                Err(STATUS_INVALID_PARAMETER)
-            }
-        }
-    }
-
-    pub(crate) fn provider_cancel_local_timer(
-        &mut self,
-        provider: nt_provider_wait::ProviderDomainIdentity,
-        local_identity: u64,
-    ) -> Result<bool, u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if !crate::win32k_provider_domain_is_current(provider) {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        self.provider_timers
-            .as_mut()
-            .filter(|timers| timers.provider() == provider)
-            .ok_or(STATUS_INVALID_PARAMETER)?
-            .cancel_local(local_identity)
-            .map_err(|_| STATUS_INVALID_PARAMETER)
-    }
-
-    pub(crate) fn provider_read_local_timer(
-        &self,
-        provider: nt_provider_wait::ProviderDomainIdentity,
-        local_identity: u64,
-    ) -> Result<bool, u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if !crate::win32k_provider_domain_is_current(provider) {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let id = self
-            .provider_timers
-            .as_ref()
-            .filter(|timers| timers.provider() == provider)
-            .ok_or(STATUS_INVALID_PARAMETER)?
-            .id_for_local(local_identity)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-        self.provider_timers
-            .as_ref()
-            .expect("provider Timer table disappeared during an immutable query")
-            .read_state(id)
-            .map_err(|_| STATUS_INVALID_PARAMETER)
-    }
-
-    pub(crate) fn provider_retire_local_timer(
-        &mut self,
-        provider: nt_provider_wait::ProviderDomainIdentity,
-        local_identity: u64,
-    ) -> Result<Option<nt_provider_wait::ProviderTimerRetirement>, u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if !crate::win32k_provider_domain_is_current(provider) {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        self.provider_timers
-            .as_mut()
-            .filter(|timers| timers.provider() == provider)
-            .ok_or(STATUS_INVALID_PARAMETER)?
-            .request_retire_local(local_identity)
-            .map_err(|_| STATUS_INVALID_PARAMETER)
-    }
-
-    pub(crate) fn provider_ack_local_timer_retirement(
-        &mut self,
-        provider: nt_provider_wait::ProviderDomainIdentity,
-        retirement: nt_provider_wait::ProviderTimerRetirement,
-    ) -> Result<(), u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if !crate::win32k_provider_domain_is_current(provider) {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        self.provider_timers
-            .as_mut()
-            .filter(|timers| timers.provider() == provider)
-            .ok_or(STATUS_INVALID_PARAMETER)?
-            .ack_retirement(retirement)
-            .map_err(|_| STATUS_INVALID_PARAMETER)
     }
 
     fn provider_event_identity(
@@ -39067,6 +38970,63 @@ impl ExecNtHandler {
             // Provide the US-ASCII NLS code-page section \Nls\NlsSectionCP20127 (csrss's Win32 stack
             // maps it during a DllMain); everything else → NOT_FOUND. Records nls_section_handle.
             NativeService::NtOpenSection => unsafe {
+                if !self.probe_user_output(args[0], core::mem::size_of::<u64>()) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let captured = match self.capture_named_object_attributes(args[2]) {
+                    Ok(captured) => captured,
+                    Err(status) => return status,
+                };
+                let Some(path) = captured.path() else {
+                    return STATUS_OBJECT_NAME_INVALID;
+                };
+                let (root_index, path) = match self.event_root_and_path(captured.root, path) {
+                    Ok(resolved) => resolved,
+                    Err(status) => return status,
+                };
+                if let Some(index) = self.obj_resolve(path, root_index) {
+                    if self.obj_ns[index].kind != OBJ_KIND_SECTION {
+                        return STATUS_OBJECT_TYPE_MISMATCH;
+                    }
+                    let section_id = self.obj_ns[index].payload as nt_process::SectionId;
+                    let Some(image) = native_image_sections::NativeImageSectionId::from_section_id(section_id) else {
+                        return STATUS_INVALID_HANDLE;
+                    };
+                    let caller = match self.native_handle_caller(ctx.previous_mode) {
+                        Ok(caller) => caller,
+                        Err(status) => return status,
+                    };
+                    let had_handle = self.pm.handle_object_count(nt_process::HandleObject::Section(section_id)) != 0;
+                    if let Err(error) = self.image_sections.ensure_handle_group(image) {
+                        return image_section_create::map_image_error(error);
+                    }
+                    let mut publication = match self.pm.reserve_native_section_handle(caller, captured.attributes & (nt_process::native_handle::OBJ_KERNEL_HANDLE | 0x2)) {
+                        Ok(publication) => publication,
+                        Err(status) => {
+                            if !had_handle {
+                                self.image_sections.close_handle_group(image).expect("unopened image group rollback");
+                            }
+                            return status;
+                        }
+                    };
+                    if let Err(status) = publication.bind(&mut self.pm, section_id, nt_ulong_arg(args[1])) {
+                        publication.abort(&mut self.pm).expect("failed image open reservation");
+                        if !had_handle {
+                            self.image_sections.close_handle_group(image).expect("failed image open group rollback");
+                        }
+                        return status;
+                    }
+                    let handle = publication.value();
+                    if !self.user_memory_write(SyscallUserMemory::CurrentProcess, args[0], &handle.to_le_bytes()) {
+                        publication.abort(&mut self.pm).expect("image open copyout rollback");
+                        if !had_handle {
+                            self.image_sections.close_handle_group(image).expect("image open copyout group rollback");
+                        }
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    publication.publish(&mut self.pm).expect("image Section open publication");
+                    return 0;
+                }
                 let ctx = self.loop_ctx.unwrap();
                 let name16 = smss_read_objattr_name(args[2]); // R8 = *ObjectAttributes
                 print_str(b"[ntos-exec] NtOpenSection name=\"");
@@ -41440,7 +41400,40 @@ impl ExecNtHandler {
                 }
 
                 let mut basic_info = [0u8; SECTION_BASIC_INFORMATION_SIZE];
-                let image_info: Option<([u8; 64], &[u8])> = if let Some(i) =
+                let native_image = self
+                    .native_handle_caller(previous_mode)
+                    .ok()
+                    .and_then(|caller| self.pm.lookup_native_section_handle(caller, sect).ok().map(|handle| (caller, handle)))
+                    .and_then(|(caller, handle)| native_image_sections::NativeImageSectionId::from_section_id(handle.section()).map(|id| (caller, handle, id)));
+                let image_info: Option<([u8; 64], &[u8])> = if let Some((caller, section_handle, id)) = native_image {
+                    if let Err(status) = nt_memory_manager::section_view_access::check_section_query_access(
+                        section_handle.granted_access(), caller.mode(),
+                    ) {
+                        return status;
+                    }
+                    let Some(source) = self.image_sections.source(id) else {
+                        return nt_process::STATUS_INVALID_HANDLE;
+                    };
+                    let pe = match nt_pe_loader::PeFile::parse(&source.pe_header) {
+                        Ok(pe) => pe,
+                        Err(_) => return 0xC000_007B,
+                    };
+                    let headers = pe.headers();
+                    let mut info = [0u8; SECTION_IMAGE_INFORMATION_SIZE];
+                    info[0..8].copy_from_slice(&headers.image_base.saturating_add(u64::from(headers.entry_point_rva)).to_le_bytes());
+                    info[0x10..0x18].copy_from_slice(&headers.size_of_stack_reserve.to_le_bytes());
+                    info[0x18..0x20].copy_from_slice(&headers.size_of_stack_commit.to_le_bytes());
+                    info[0x20..0x24].copy_from_slice(&(u32::from(headers.subsystem)).to_le_bytes());
+                    info[0x24..0x26].copy_from_slice(&headers.minor_subsystem_version.to_le_bytes());
+                    info[0x26..0x28].copy_from_slice(&headers.major_subsystem_version.to_le_bytes());
+                    info[0x2c..0x2e].copy_from_slice(&headers.characteristics.to_le_bytes());
+                    info[0x30..0x32].copy_from_slice(&headers.machine.to_le_bytes());
+                    info[0x32] = 1;
+                    info[0x38..0x3c].copy_from_slice(&headers.size_of_image.to_le_bytes());
+                    basic_info[8..12].copy_from_slice(&(SECTION_ATTR_SEC_IMAGE | SECTION_ATTR_SEC_FILE).to_le_bytes());
+                    basic_info[16..24].copy_from_slice(&u64::from(headers.size_of_image).to_le_bytes());
+                    Some((info, b"native image"))
+                } else if let Some(i) =
                     reg.index_for_section(self.pi, sect)
                 {
                     reg.image_info(i).map(|b| {
@@ -41612,6 +41605,51 @@ impl ExecNtHandler {
                 let registry_slot = reg.index_for_file(self.pi, sec_file);
 
                 if allocation_attrs & SEC_IMAGE != 0 {
+                    let caller = match self.native_handle_caller(previous_mode) {
+                        Ok(caller) => caller,
+                        Err(status) => return status,
+                    };
+                    if let Ok(source) = self.pm.lookup_native_section_file_source(caller, sec_file) {
+                        if matches!(source.object(), nt_process::HandleObject::RoutedFile { .. }) {
+                            let mut image_object_attributes = 0;
+                            let named = if args[2] == 0 {
+                                None
+                            } else {
+                                let captured = match self.capture_named_object_attributes(args[2]) {
+                                    Ok(captured) => captured,
+                                    Err(status) => return status,
+                                };
+                                image_object_attributes = captured.attributes;
+                                if let Some(path) = captured.path() {
+                                    let (root_index, path) = match self.event_root_and_path(captured.root, path) {
+                                        Ok(resolved) => resolved,
+                                        Err(status) => return status,
+                                    };
+                                    let root_identity = self.obj_ns[root_index].identity;
+                                    let mut owned_path = Vec::new();
+                                    if owned_path.try_reserve_exact(path.len()).is_err() {
+                                        return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
+                                    }
+                                    owned_path.extend_from_slice(path);
+                                    Some(section_metadata_work::ImageObjectName {
+                                        root_index,
+                                        root_identity,
+                                        path: owned_path,
+                                    })
+                                } else {
+                                    None
+                                }
+                            };
+                            return match crate::section_metadata_work::submit_hosted(
+                                self, caller, source, out, desired_access,
+                                image_object_attributes,
+                                maxsize, page_protection, allocation_attrs, sec_file, named,
+                            ) {
+                                Ok(()) => 0x0000_0103,
+                                Err(status) => status,
+                            };
+                        }
+                    }
                     let exe_known = (&*ctx.exe_images)
                         .index_for_file(self.pi, sec_file)
                         .is_some();
@@ -41721,7 +41759,7 @@ impl ExecNtHandler {
                     if matches!(source.object(), nt_process::HandleObject::RoutedFile { .. }) {
                         return match crate::section_metadata_work::submit_hosted(
                             self, caller, source, out, desired_access, attributes, maxsize,
-                            page_protection, allocation_attrs, sec_file,
+                            page_protection, allocation_attrs, sec_file, None,
                         ) {
                             Ok(()) => 0x0000_0103,
                             Err(status) => status,

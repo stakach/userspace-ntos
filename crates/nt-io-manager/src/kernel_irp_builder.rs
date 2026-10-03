@@ -209,15 +209,17 @@ pub fn plan_synchronous_fsd_request(
                 plan.system_buffer_input_len = length;
             }
         } else if device_flags & DO_DIRECT_IO != 0 {
-            plan.mdl = Some(MdlPlan {
-                buffer,
-                length,
-                access: if major == major::IRP_MJ_READ {
-                    MdlAccess::Write
-                } else {
-                    MdlAccess::Read
-                },
-            });
+            if length != 0 {
+                plan.mdl = Some(MdlPlan {
+                    buffer,
+                    length,
+                    access: if major == major::IRP_MJ_READ {
+                        MdlAccess::Write
+                    } else {
+                        MdlAccess::Read
+                    },
+                });
+            }
         } else {
             plan.user_buffer = buffer;
         }

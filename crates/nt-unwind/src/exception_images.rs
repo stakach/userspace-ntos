@@ -37,6 +37,7 @@ pub enum ImageAdmissionError {
     FunctionTable,
     UnwindMetadata,
     ImageOverlap,
+    InsufficientResources,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -551,6 +552,20 @@ impl ExceptionImageCatalog {
 
     pub fn image_count(&self) -> usize {
         self.images.len()
+    }
+
+    /// Admit another sealed image without invalidating the existing catalog on refusal.
+    pub fn append(&mut self, image: AdmittedExceptionImage) -> Result<(), ImageAdmissionError> {
+        let index = self.images.partition_point(|existing| existing.base < image.base);
+        if self.images.get(index).is_some_and(|next| image.end > next.base)
+            || index.checked_sub(1).and_then(|before| self.images.get(before))
+                .is_some_and(|previous| previous.end > image.base)
+        {
+            return Err(ImageAdmissionError::ImageOverlap);
+        }
+        self.images.try_reserve(1).map_err(|_| ImageAdmissionError::InsufficientResources)?;
+        self.images.insert(index, image);
+        Ok(())
     }
 
     pub fn read_c_scope_table(

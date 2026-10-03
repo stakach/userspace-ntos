@@ -73,7 +73,7 @@ pub use runtime_section::{
     GenericSection, GenericSectionBacking, GenericSectionFlushPlan, GenericSectionTable,
     GenericSectionTableStats, GenericSectionView, ProviderSectionView, ProviderVspaceIdentity,
     PendingSectionFrames, SectionRetirement, SectionRetirementIo,
-    SectionIdentity, SectionPagePublication, SectionPagePublicationError,
+    SectionIdentity, SectionReference, SectionPagePublication, SectionPagePublicationError,
     SectionRetirementResource, RoutedSectionLease, GENERIC_SECTION_BACKING_ANON,
     SectionFileIdentity, SectionMountBindingError, SectionMountBindings, SectionMountId, SectionMountIds,
     GENERIC_SECTION_BACKING_DISK, GENERIC_SECTION_BACKING_NONE, GENERIC_SECTION_BACKING_OVERLAY,
@@ -86,6 +86,7 @@ pub use writeback::admit_section_alias_rearm;
 pub mod routed_section_metadata;
 pub use routed_section_metadata::{CompletedFileQuery, RoutedSectionMetadata};
 pub mod pending_section_metadata;
+pub mod section_metadata_progress;
 pub use pending_section_metadata::{PendingSectionMetadataId, PendingSectionMetadataQueries};
 pub mod section_view_access;
 pub use working_set::{
@@ -474,3 +475,5 @@ impl MemoryManager {
 
 #[cfg(test)]
 mod tests;
+
+pub mod component_heap;

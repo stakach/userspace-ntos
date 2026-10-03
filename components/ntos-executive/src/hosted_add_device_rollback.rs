@@ -1,5 +1,6 @@
 //! Retained ownership of an unpublished AddDevice attempt and its producer projections.
 use super::*;
+use crate::spawn_hosts::shared_ingress::owner::runtime;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Phase {
@@ -217,17 +218,50 @@ pub(super) unsafe fn admit_mutation(
         return Ok(());
     };
     let exact = row.channel.is_some_and(|channel| {
-        badge == 0
+        runtime::channel_route(ch)
+                .ok()
+                .flatten()
+                .is_some_and(|route| route.badge() == badge)
+            && super::instance_for_pump_channel(ch, reply_cap)
+                .is_some_and(|(index, _)| index == row.instance)
             && channel.tcb == ch.tcb
             && channel.fault_ep == ch.fault_ep
             && channel.pml4 == ch.pml4
             && channel.exec_shared_va == ch.shared_va
-            && channel.reply_cap == reply_cap
     });
     if row.phase != Phase::Dispatching || !exact {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     Ok(())
+}
+
+pub(super) unsafe fn power_report_target(
+    domain: HostedDomainIdentity,
+    ch: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    device: nt_io_manager::DeviceId,
+) -> Result<Option<u64>, nt_status::NtStatus> {
+    let (pdo_id, owned, live, dispatching) = {
+        let Some(row) = owners().iter().find(|row| row.domain == domain) else {
+            return Ok(None);
+        };
+        let created = row.created.iter().find(|created| {
+            created.registration.domain() == domain && created.registration.device_id() == device
+        });
+        let is_pdo = device.raw() == row.pdo_id;
+        (row.pdo_id, is_pdo || created.is_some(),
+            is_pdo || created.is_some_and(|created| {
+                !created.pointer_retired && !created.destroyed && !created.projection_retired
+            }),
+            row.phase == Phase::Dispatching && row.power_prepared && row.dispatch_context_held)
+    };
+    if !owned { return Ok(None); }
+    admit_mutation(domain, ch, reply_cap, badge)?;
+    if !live || !dispatching {
+        return Err(nt_status::NtStatus::ACCESS_DENIED);
+    }
+    Ok(Some(pdo_id))
 }
 
 /// CREATE calls this before acquiring the canonical device or pointer registration.

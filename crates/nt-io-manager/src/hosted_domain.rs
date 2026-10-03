@@ -170,6 +170,7 @@ impl<P> IoManager<P> {
             || record.provider.is_some()
             || has_inbound_provider_link
             || self.hosted_device_pointers.retains_domain(identity)
+            || self.hosted_file_systems.retains_domain(identity)
         {
             return Err(NtStatus::DEVICE_BUSY);
         }
@@ -209,6 +210,7 @@ impl<P> IoManager<P> {
             || !record.files.is_empty()
             || record.provider.is_some()
             || has_inbound_provider_link
+            || self.hosted_file_systems.retains_domain(identity)
         {
             return Err(NtStatus::DEVICE_BUSY);
         }

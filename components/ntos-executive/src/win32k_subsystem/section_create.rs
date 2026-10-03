@@ -43,29 +43,10 @@ pub(super) extern "win64" fn create(
         if handle_out.is_null() {
             return STATUS_ACCESS_VIOLATION_I32;
         }
-        let attributes = if object_attributes == 0 {
-            None
-        } else {
-            if read_unaligned(object_attributes as *const u32) < 0x30 {
-                return STATUS_INVALID_PARAMETER_I32;
-            }
-            let root = read_unaligned((object_attributes + 8) as *const u64);
-            let name = read_unaligned((object_attributes + 16) as *const u64);
-            let security = read_unaligned((object_attributes + 32) as *const u64);
-            let qos = read_unaligned((object_attributes + 40) as *const u64);
-            if root != 0 || name != 0 || security != 0 || qos != 0 {
-                return STATUS_NOT_SUPPORTED_I32;
-            }
-            Some(read_unaligned((object_attributes + 24) as *const u32))
-        };
-        let max = (maximum_size != 0).then(|| read_unaligned(maximum_size as *const u64));
-        let request = SectionCreateRequest {
-            desired_access,
-            object_attributes: attributes,
-            maximum_size: max,
-            page_protection,
-            allocation_attributes,
-            file_handle,
+        let request = match capture_request(desired_access, object_attributes, maximum_size,
+            page_protection, allocation_attributes, file_handle) {
+            Ok(request) => request,
+            Err(status) => return status,
         };
         let packet = pool_alloc(wire::PACKET_BYTES as u64);
         if packet == 0 {
@@ -103,4 +84,38 @@ pub(super) extern "win64" fn create(
         }
         0
     }
+}
+
+pub(super) unsafe fn capture_request(
+    desired_access: u32,
+    object_attributes: u64,
+    maximum_size: u64,
+    page_protection: u32,
+    allocation_attributes: u32,
+    file_handle: u64,
+) -> Result<SectionCreateRequest, i32> {
+        let attributes = if object_attributes == 0 {
+            None
+        } else {
+            if read_unaligned(object_attributes as *const u32) < 0x30 {
+                return Err(STATUS_INVALID_PARAMETER_I32);
+            }
+            let root = read_unaligned((object_attributes + 8) as *const u64);
+            let name = read_unaligned((object_attributes + 16) as *const u64);
+            let security = read_unaligned((object_attributes + 32) as *const u64);
+            let qos = read_unaligned((object_attributes + 40) as *const u64);
+            if root != 0 || name != 0 || security != 0 || qos != 0 {
+                return Err(STATUS_NOT_SUPPORTED_I32);
+            }
+            Some(read_unaligned((object_attributes + 24) as *const u32))
+        };
+        let max = (maximum_size != 0).then(|| read_unaligned(maximum_size as *const u64));
+        Ok(SectionCreateRequest {
+            desired_access,
+            object_attributes: attributes,
+            maximum_size: max,
+            page_protection,
+            allocation_attributes,
+            file_handle,
+        })
 }

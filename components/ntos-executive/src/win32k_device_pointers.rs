@@ -39,6 +39,7 @@ pub(crate) unsafe fn service(
                 .dereference_hosted_device_pointer(registration)
                 .map_err(|status| status.raw())?;
             DEREFERENCES.fetch_add(1, Ordering::Relaxed);
+            record_device_pointer_dereference_commit(ch, registration);
         }
         Ok(io_manager_mut().device_reference_count(access.device()))
     })();
@@ -62,9 +63,44 @@ unsafe fn exchange(operation: DevicePointerOperation, address: u64) -> Result<u6
     // Mutating operations are never retried from an ambiguous response. The canonical ledger
     // retains ownership; a failed native call stops instead of inventing a count or double-applying.
     assert_eq!(info, 2, "ambiguous Device pointer reply envelope");
-    DevicePointerReply::decode(status, count)
+    let result = DevicePointerReply::decode(status, count)
         .expect("ambiguous Device pointer reply body")
-        .into_result()
+        .into_result();
+    if let Ok(count) = result {
+        if operation == DevicePointerOperation::Dereference {
+            crate::win32k_subsystem::record_device_pointer_dereference_ack(address, count);
+        }
+    }
+    result
+}
+
+fn record_device_pointer_dereference_commit(
+    ch: &crate::spawn_hosts::PumpChannel,
+    registration: nt_io_manager::HostedDevicePointerRegistration,
+) {
+    #[cfg(feature = "source-irp-integration")]
+    {
+        let domain = registration.domain();
+        print_str(b"[source-receipt] pdo-dereference-commit domain="); print_u64(domain.domain_id.raw());
+        print_str(b" cookie="); print_u64(domain.cookie);
+        print_str(b" device="); print_u64(registration.device_id().raw());
+        print_str(b" address="); print_u64(registration.address());
+        print_str(b" count="); print_u64(io_manager_mut().device_reference_count(registration.device_id()));
+        if let Some(route) = ch.ingress_route {
+            let identity = route.identity();
+            print_str(b" physical-domain="); print_u64(identity.domain);
+            print_str(b" physical-generation="); print_u64(identity.domain_generation);
+            print_str(b" executor="); print_u64(identity.executor);
+            if let Ok(dispatch) = unsafe {
+                crate::spawn_hosts::shared_ingress::owner::runtime::dispatch(route)
+            } {
+                print_str(b" dispatch="); print_u64(dispatch.epoch());
+            }
+        }
+        print_str(b"\n");
+    }
+    #[cfg(not(feature = "source-irp-integration"))]
+    let _ = (ch, registration);
 }
 
 pub(crate) unsafe fn reference(address: u64) -> Result<u64, i32> {

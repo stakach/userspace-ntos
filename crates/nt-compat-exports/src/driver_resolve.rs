@@ -101,6 +101,13 @@ impl DriverExportRegistry {
             .map(|binding| binding.va)
     }
 
+    /// Both canonical module ownership and a live machine-code binding are required.
+    pub fn lookup_module(&self, module: &str, name: &str) -> Option<u64> {
+        let descriptor = crate::module_export_descriptor(module, name)?;
+        if !descriptor.status.is_available() { return None; }
+        self.lookup(name).filter(|address| *address != 0)
+    }
+
     /// Check catalog readiness separately from resolving an image's individual IAT entries.
     /// Report every genuinely absent or zero binding, even after an allocation failure. A failed
     /// catalog does not make its already-bound names unresolved.
@@ -180,6 +187,26 @@ mod tests {
         let mut reg = DriverExportRegistry::new();
         reg.bind("IoCreateDevice", 1);
         assert_eq!(reg.lookup("TotallyMadeUp"), None);
+    }
+
+    #[test]
+    fn qualified_lookup_requires_available_owner_metadata_and_nonzero_binding() {
+        let mut reg = DriverExportRegistry::new();
+        assert_eq!(reg.lookup_module("ntoskrnl.exe", "memcpy"), None);
+        reg.bind("memcpy", 0);
+        assert_eq!(reg.lookup_module("ntoskrnl.exe", "memcpy"), None);
+        reg.bind("memcpy", 0x1000);
+        assert_eq!(reg.lookup_module("NTOSKRNL.EXE", "memcpy"), Some(0x1000));
+        assert_eq!(reg.lookup_module("hal.dll", "memcpy"), None);
+        assert_eq!(reg.lookup_module("unknown.dll", "memcpy"), None);
+        assert_eq!(reg.lookup_module("ntoskrnl.exe", "Memcpy"), None);
+        reg.bind("KeQueryPerformanceCounter", 0x2000);
+        assert_eq!(reg.lookup_module("hal.dll", "KeQueryPerformanceCounter"), Some(0x2000));
+        assert_eq!(reg.lookup_module("ntoskrnl.exe", "KeQueryPerformanceCounter"), None);
+        reg.bind("HalGetBusData", 0x3000);
+        assert_eq!(reg.lookup_module("hal.dll", "HalGetBusData"), None);
+        reg.bind("UncataloguedNativeBinding", 0x4000);
+        assert_eq!(reg.lookup_module("ntoskrnl.exe", "UncataloguedNativeBinding"), None);
     }
 
     #[test]

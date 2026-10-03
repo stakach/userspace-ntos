@@ -78,6 +78,37 @@ unsafe fn next_in_pass(pm: &nt_process::ProcessManager, pass: &mut ResumePass) -
     candidate(resume)
 }
 
+/// Finish currently selected hosted admissions before a caller reply, never fresh reparks.
+/// Kernel continuations remain a barrier for the ordinary runtime/kernel owner.
+pub(super) unsafe fn drain_hosted_ready(handler: *mut ExecNtHandler) -> u64 {
+    if is_running() {
+        return 0;
+    }
+    let Some(ctx) = (*handler).loop_ctx else {
+        return 0;
+    };
+    let _message = crate::ipc_message::SavedMessageBuffer::capture();
+    let _durable = allocator::enter_durable();
+    let mut pass = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).resume_pass();
+    let mut drained = 0;
+    loop {
+        drained += component_terminal::drain(&mut *handler, &mut *ctx.procs, &mut *ctx.pfilled);
+        let Some(candidate) = next_in_pass(&(*handler).pm, &mut pass) else {
+            break;
+        };
+        if matches!(candidate.continuation, ComponentNativeContinuation::Kernel(_)) {
+            break;
+        }
+        if run_hosted(handler, candidate).is_none() {
+            break;
+        }
+    }
+    if (*handler).lpc_endpoint_progress {
+        let _ = lpc_endpoint_redrive_all(&mut *handler);
+    }
+    drained
+}
+
 pub(crate) unsafe fn is_running() -> bool {
     (&*core::ptr::addr_of!(WAKE)).is_running()
 }

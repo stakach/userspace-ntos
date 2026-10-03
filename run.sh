@@ -241,7 +241,7 @@ ensure_no_qemu_lane_running
 ensure_boot_image_available "$BOOT_IMAGE"
 if [ "$GRAPHICS" = 1 ]; then
   say "[5/5] booting QEMU with a DISPLAY window (--desktop)..."
-  say "      Watch for the ReactOS desktop background (a blue-grey field, 0x003a6ea5)."
+  say "      Readiness requires PASS exec_explorer_shell_chrome_painted; background paint alone is not ready."
   mkdir -p "$ROOT/.tmp"
   RUN_LOG="${RUN_LOG:-$ROOT/.tmp/run-desktop-$(date +%Y%m%d-%H%M%S).log}"
   : > "$RUN_LOG"

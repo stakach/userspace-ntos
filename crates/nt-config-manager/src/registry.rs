@@ -177,12 +177,7 @@ fn generated_key_security(parent: Option<&[u8]>) -> Vec<u8> {
         None => assign_registry_root_security(&CapturedSubjectTokens {
             primary: &system, client: None, process_audit_id: 0,
         }, &mut audit),
-        Some(parent) => assign_object_security_with_audit(&ObjectSecurityAssignment {
-            primary: &system, client: None, creator: None, parent: Some(parent),
-            mapping: &KEY_GENERIC_MAPPING, is_container: true,
-            mode: ProcessorMode::KernelMode, object_type: None,
-            inheritance: SecurityAssignmentInheritance::Legacy,
-        }, &mut audit),
+        Some(parent) => crate::inherit_generated_key_security(parent),
     }.expect("generated registry security assignment")
 }
 

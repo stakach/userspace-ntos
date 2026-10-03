@@ -1,5 +1,25 @@
 # Lessons
 
+## Runtime Ownership Is Not A Thread Role
+- Resolve GUI TEB aliases from the published executable runtime and retained logical caller,
+  including the exact process and thread generations. A worker badge's slot encoding is not
+  authority for its role; dynamically registered CSRSS workers can share that slot geometry.
+- Record main-thread aliases from the constructor's checked mapping, not a later process-name
+  or role reconstruction. Revalidate the same owner and alias after operations that may pump.
+
+## Bootstrap Authority Precedes Public Readiness
+- DriverEntry can legitimately reference canonical objects before its completion publishes
+  the provider's public ready state. Authenticate projections through the retained ingress
+  source and registered VSpace owner, not a later readiness atomic. Keep exact route,
+  dispatch, Reply, physical lane and generation checks intact.
+
+## Shared Locks Across Suspended Provider Lanes
+- A root-side yield loop cannot acquire a lock held by an execution-held provider lane.
+  Inspect live syscall return addresses and execution holds, not only the last fault RIP.
+- Root lease revalidation must defer on contention without dropping ownership. For packet
+  effects, distinguish known zero-effect Busy from uncertainty; after a committed ACK,
+  retain readback/retirement phases and never replay the original command to retry cleanup.
+
 ## Build / verification
 - **build.sh silently leaves a STALE rootserver.elf if `cargo build` fails** (documented in
   MEMORY too). A non-ASCII char (em-dash `—`) inside a `b"..."` byte-string literal is a HARD
@@ -292,3 +312,157 @@ diagnosis-free failure.
 - A successful build only proves the exact source tree it compiled. Even a readability-only patch
   can match a neighboring function and move a binding to the wrong scope. Inspect the final diff
   and rerun the native compile after every post-build source edit, before pushing or merging.
+
+## Shared Images Are Not Shared Heaps
+- A shared executable's mutable static must not contain a `Vec`, `Box`, or other private-heap
+  pointer used from multiple VSpaces. Keep its ownership anchor in component-local mapped
+  metadata; workers in that VSpace may share it, but the executive must use authenticated wires.
+- Diagnostic tables obey the same rule as kernel state. RPC tracing once corrupted the
+  executive allocator and token SID metadata by sharing a private-heap vector header.
+
+## Accepted Work Needs Nested Progress
+- Bound pre-reply continuation drains to their starting admission sequence. A polling worker's
+  newly rearmed wait belongs to the next pass; draining to global emptiness can starve a completed
+  caller forever. A validation watchdog must not abandon an already admitted Call before dispatch.
+- Fixing an admission rejection can expose a masked deadlock. Every retained service accepted
+  during a synchronous component pump needs a ready/step path that does not depend on returning
+  to the outer service loop. Exclude pending, uncertain, and delivery-only states from busy retry.
+- Publish completion data, retire source backing, and then expose the completion signal. A Reply
+  acknowledgement is neither source retirement nor permission to wake a caller into reused IRP
+  storage. Stopped cleanup also requires the exact broker safe point, not just a stopped TCB.
+- Readiness predicates must not call helpers that pump, claim, cancel, or acknowledge work. Inspect
+  exact immutable readiness first; perform effects only after parking the parent execution lane.
+- Reply acknowledgement does not prove the resumed origin has recorded its pending token. Use an
+  authenticated pending-armed receipt before sibling completion delivery, rather than guessing
+  from a private phase or repeatedly invoking a no-effect terminal callback.
+
+## Cleanup Proof Must Execute Cleanup
+- Queuing a last-handle release does not prove that CLEANUP ran. A retained-file regression must
+  drive and observe the lifecycle transition before reading through the independent reference.
+- Sharing admission and FILE_OBJECT body ownership have different lifetimes. Release sharing at
+  CLEANUP, but retain metadata and position until CLOSE; reuse the existing independent-reference
+  contract rather than duplicating file state in a second table.
+
+## Reservations Are Address-Space Ownership
+- Expanding a demand-backed heap reserves virtual addresses and page-table coverage even before
+  physical pages commit. Check neighboring arenas against the full reservation, not initial pages.
+- Successful callbacks and drawing calls do not prove scanout. Verify assigned device backing and
+  framebuffer pixels; never let generic anonymous fault fill manufacture a device aperture.
+- Stack routing is not pointer authority. Attaching an upper driver must not revoke a producer's
+  independently anchored, generation-checked projection of the same canonical device.
+
+## Test Layout Without Instantiating It
+- Check maximum-schema type sizes in a function that does not instantiate the type. A large local
+  array can overflow the test thread's stack in its prologue, before the intended size assertion.
+  Exercise growth and lifetime behavior with smaller fixtures that still cross the old limit.
+- A syntax visitor does not expand macro token bodies. Boundary tests that inspect `matches!`
+  must parse and visit its expression and pattern, rather than report absent paths or change
+  production code to accommodate an incomplete visitor.
+
+## Separate Pointer Fields From Referenced Bytes
+- Validate an ABI pointer field at its full stored width, but validate its target against the
+  actual referenced byte span. An appended zero-length or short blob does not contain a pointer
+  word. Derive that span once from the source ABI and reuse it at capture and transfer boundaries.
+- Decode native syscall histograms against the current service constants before naming a hot
+  operation. A saved return instruction and elapsed loop interval do not establish a CPU spin.
+
+## Materialize Security Before Publishing Keys
+- A data-only configuration overlay is not yet an admitted NT registry tree. Assign real
+  container security to newly created keys under their actual secured parents before publication;
+  never repair missing authority with an access-time default ACL or a fabricated readiness event.
+- Validate the imported bytes before choosing a security fix. A stack scan can label pointers into
+  `.rdata` as callers; confirm executable sections and the actual call instruction first.
+- Audit setup composition and later live creation separately. Normalize path creation into exact
+  descriptor-bearing child operations during preparation, and retain those same operations for
+  journal replay, live commit, and projections; an in-memory fix alone is not durable security.
+
+## Registry Identity Precedes Alias Policy
+- Preserve native key-kind metadata through import, snapshots, and overlays before resolving
+  aliases. A key named `Current`, or containing `SymbolicLinkValue`, is not necessarily a link.
+  Verify enumeration followed by an exact retained relative open, not just a path-string rewrite.
+- Follow only admitted link authority. Invalid, cyclic, or unsupported targets must not expose a
+  link's literal body or fall back to a mutable selector.
+
+## IRQ Services Use Their Own Arena
+- Decode a WALL label and message words against the current transport and staged ELF before
+  calling it a timeout or CPU fault. A legitimate kernel service can expose a routing gap.
+- Route IRQ/DPC kernel services through retained arena transactions, not the parked component's
+  ordinary request bank. Share effect policy after exact lane/domain/grant authentication;
+  never impersonate a primary thread to reuse its admission path.
+
+## Retained Ingress Must Not Depend on Slot Order
+- Reusable queue slots are storage, not arrival order. Select eligible retained Calls by their
+  immutable admission ordinal so recurring requests cannot overtake an older fault indefinitely.
+  Selection does not replace exact live-thread, generation, or physical Reply authentication.
+- Confirm reciprocal Reply ownership and the actual thread-state field before diagnosing a lost
+  fault. A retained fault awaiting dispatch needs fair scheduling, not cancellation or replay.
+
+## Native Context and Diagnostics Need Exact Backing
+- Resolve a fault PC against the actual loaded module map before attributing an ABI failure.
+  Publish each successfully unwound non-target CONTEXT; restoring the initial inner frame loses
+  the target's nonvolatile registers. Do not publish the target frame's already-unwound caller.
+- A reserved virtual range or arithmetic mirror is not resident memory. Diagnostic stack scans
+  must read exact process-generation backing and stop at an unavailable word, not fault the
+  executive or substitute zero-filled or backing-image bytes.
+- Different address spaces can place unrelated images at the same numeric address. Match the
+  faulting process's loaded image and staged binary before using any symbol table.
+
+## Mapping Replacement Retires the Old Effect First
+- A mapped frame capability owns an ASID/address/physical leaf. Deleting an old alias after
+  mapping the same frame at that address can remove the new leaf. Acknowledge exact old mapping
+  retirement before replacement, or remap the original retained capability.
+- Cache membership and a mapping catalog are not physical page residency. A failed PageMap
+  cannot become success merely because those records exist.
+- Equivalent projections in one VSpace must share one retained physical leaf with distinct
+  exact owners. Rollback releases only its owner; the last owner deletes the mapped cap after
+  acknowledgement. Repair through a surviving context must use that retained cap, not a retired
+  source alias. Resource-window faults must never fall through to anonymous RAM backing.
+- A numeric resource VA band is scoped to its authenticated physical domain. Another VSpace
+  can legitimately use the same address for client backing; classify retained source authority
+  before applying reservation policy, rather than exempting a named driver or guessing by VA.
+
+## Loader Entry Uses Process-Owned Identity
+- Reserved startup arguments cannot select the executable or permit skipped initialization.
+  Read the primary image from the current PEB; distinguish fresh process initialization from
+  thread attachment before requiring arguments that only process initialization consumes.
+
+## Await Artifact Writers Before Consumers
+- A yielded shell call has not completed its filesystem effects. Wait for the actual exit of
+  copies as well as builds, image updates and VMs before any consumer or writer touches the
+  same artifact. Update a private image from an immutable backup and verify its bytes before
+  publishing it; never use file existence as copy-completion evidence.
+
+## Audit Both Ends of Lifecycle Transitions
+- When resource revocation starts retaining identity, audit the next grant installer as well as
+  STOP and final retirement. An existing empty canonical row is authoritative absence of grants,
+  not a collision or permission to import a mutable shared projection.
+- Exercise revoke, reassign and terminal removal together. A function-scoped ownership check
+  does not prove that adjacent lifecycle consumers still agree on the state transition.
+
+## Journal Contracts Must Match Live Producers
+- Replay tests must use paths produced by the live hive, including its single root separator,
+  rather than only hand-written unrooted examples. Preserve complete child metadata and reject
+  malformed empty components without rejecting the producer's canonical representation.
+- A complete invalid journal record is not a torn tail. Propagate strict replay failure before
+  publishing restored/clean state; a partially restored sentinel can suppress real initialization.
+
+## Object Type Is Independent of GUI Conversion
+- A successful Ps lookup can return a referenced process or thread that has never acquired a GUI
+  context. Classify its exact canonical identity through the authenticated manager, not a GUI
+  context table, address range, or guessed object header.
+- Distinguish an authenticated negative classification from failed transport or authority. A
+  rejected query must stop, not route the pointer to another object's retirement service.
+
+## Execution Identity Is Independent of GUI State
+- The last exiting thread can run a process's Win32 callout without having THREADINFO. Preserve
+  its exact retained canonical ETHREAD and real execution TEB; optional GUI state must never
+  become a NULL current thread, fabricated GUI row, or substituted actor.
+- Validate execution identity before publishing context, and retain the body until the callout
+  returns. Nonexecuting finalization is a separate boundary, not a process-only execution mode.
+
+## Observe Durable Progress Across Every Provider
+- A runnable thread copying a registry tree is not stalled merely because it maps no new image
+  pages. Observe acknowledged durable publications through one sealed observer for both brokered
+  and mounted-hive paths; do not infer progress from reads, timer churn, or filesystem snapshots.
+- Resolve the actual saved PC and retained IPC state before changing watchdog policy. Keep the
+  strict desktop gate and hard boot limit; a successful test-harness exit is not desktop proof.

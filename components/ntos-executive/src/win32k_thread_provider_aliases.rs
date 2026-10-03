@@ -27,7 +27,10 @@ impl ThreadProviderAliasCleanup {
         let _durable = allocator::enter_durable();
         let slot = &mut *core::ptr::addr_of_mut!(BANK);
         if slot.is_none() {
-            *slot = Some(ProviderAliasBank::new(SEGMENT_SLOTS, SEGMENTS).map_err(error_status)?);
+            *slot = Some(
+                ProviderAliasBank::new(SEGMENT_SLOTS, usize::MAX / SEGMENT_SLOTS as usize)
+                    .map_err(error_status)?,
+            );
         }
         ThreadProviderAliasJournal::prepare(id, layout, slot.as_ref().unwrap())
             .map(|journal| Self { journal, layout })

@@ -2353,6 +2353,10 @@ fn mapped_view_fault_access_denies_protection_violations_before_mapping() {
     );
     assert_eq!(
         mapped_view_fault_access_status(PAGE_EXECUTE, FaultAccess::Read),
+        Ok(())
+    );
+    assert_eq!(
+        mapped_view_fault_access_status(PAGE_EXECUTE, FaultAccess::Write),
         Err(STATUS_ACCESS_VIOLATION)
     );
     assert_eq!(

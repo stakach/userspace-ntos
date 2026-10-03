@@ -158,11 +158,12 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use syn::visit::Visit;
 
     struct ProductionBindings {
         names: BTreeSet<std::string::String>,
+        function_targets: BTreeMap<std::string::String, std::vec::Vec<std::string::String>>,
         data_export_loops: usize,
     }
 
@@ -178,6 +179,31 @@ mod tests {
                         ..
                     }) => {
                         self.names.insert(name.value());
+                        if matches!(name.value().as_str(), "IoCallDriver" | "IofCallDriver"
+                            | "ExfAcquirePushLockExclusive" | "ExfAcquirePushLockShared"
+                            | "ExfReleasePushLockExclusive" | "ExfReleasePushLockShared"
+                            | "ExfReleasePushLock" | "ExfTryToWakePushLock") {
+                            let mut target = call.args.iter().nth(1).expect("binding target");
+                            while let syn::Expr::Cast(cast) = target {
+                                target = &cast.expr;
+                            }
+                            let syn::Expr::Path(path) = target else {
+                                panic!("native binding is not a function path");
+                            };
+                            assert!(
+                                self.function_targets
+                                    .insert(
+                                        name.value(),
+                                        path.path
+                                            .segments
+                                            .iter()
+                                            .map(|segment| segment.ident.to_string())
+                                            .collect()
+                                    )
+                                    .is_none(),
+                                "duplicate native binding"
+                            );
+                        }
                     }
                     syn::Expr::Field(field)
                         if matches!(&field.member, syn::Member::Unnamed(index) if index.index == 0)
@@ -226,7 +252,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "issue #88: win32k production bindings are incomplete"]
     fn win32k_production_bindings_cover_required_imports() {
         // Parse the actual executive registration code. A descriptor's Available status does not
         // prove that the production win32k registry binds a trampoline for it.
@@ -242,17 +267,50 @@ mod tests {
         let register = register.expect("production register_trampolines function is absent");
         let mut bindings = ProductionBindings {
             names: BTreeSet::new(),
+            function_targets: BTreeMap::new(),
             data_export_loops: 0,
         };
         bindings.visit_block(&register.block);
+        let call_driver = bindings
+            .function_targets
+            .get("IoCallDriver")
+            .expect("win32k must bind IoCallDriver explicitly");
+        let fast_call_driver = bindings
+            .function_targets
+            .get("IofCallDriver")
+            .expect("win32k must bind IofCallDriver explicitly");
+        assert_eq!(
+            call_driver, fast_call_driver,
+            "call-driver ABI aliases must share the source-IRP route"
+        );
+        let registry = ExportRegistry::new();
+        for (name, target) in [
+            ("ExfAcquirePushLockExclusive", "acquire_exclusive"),
+            ("ExfAcquirePushLockShared", "acquire_shared"),
+            ("ExfReleasePushLockExclusive", "release_exclusive"),
+            ("ExfReleasePushLockShared", "release_shared"),
+            ("ExfReleasePushLock", "release_generic"),
+            ("ExfTryToWakePushLock", "try_to_wake"),
+        ] {
+            let descriptor = crate::win32k_resolve::export_descriptor(name)
+                .expect("push-lock entry point must have shared catalog metadata");
+            assert_eq!(descriptor.status, crate::ExportStatus::Partial, "{name}");
+            assert!(registry.resolve("ntoskrnl.exe", name).loads(), "{name}");
+            let actual = bindings.function_targets.get(name)
+                .expect("push-lock entry point must have a production binding");
+            assert!(actual.iter().map(std::string::String::as_str).eq(["push_lock", target]),
+                "{name} must bind its real native push-lock adapter, not a success stub");
+        }
         assert_eq!(
             bindings.data_export_loops, 1,
             "production data-export registration loop changed"
         );
 
         let production_data = production_data_exports(&source);
-        let production_data_names: std::vec::Vec<_> =
-            production_data.iter().map(std::string::String::as_str).collect();
+        let production_data_names: std::vec::Vec<_> = production_data
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
         assert_eq!(
             production_data_names.as_slice(),
             crate::WIN32K_DATA_EXPORTS,
@@ -385,7 +443,8 @@ mod tests {
 
     #[test]
     fn win32k_import_lists_have_expected_counts() {
-        assert_eq!(crate::WIN32K_NTOSKRNL_IMPORTS.len(), 224);
+        // Includes RtlUnwind, reached through ftfd's real win32k export forwarder.
+        assert_eq!(crate::WIN32K_NTOSKRNL_IMPORTS.len(), 225);
         assert_eq!(crate::WIN32K_HAL_IMPORTS.len(), 1);
         assert_eq!(crate::WIN32K_FTFD_IMPORTS.len(), 34);
         // No duplicate names within the ntoskrnl import list.

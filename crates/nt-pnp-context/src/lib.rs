@@ -8,8 +8,13 @@
 
 extern crate alloc;
 
+pub mod resource_mapping;
+
 use alloc::vec::Vec;
 use core::num::NonZeroU64;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_REGISTRY_AUTHORITY: AtomicU64 = AtomicU64::new(1);
 
 pub const RESOURCE_MAPPING_PAGE_BYTES: u64 = 0x1000;
 
@@ -54,6 +59,7 @@ impl ContextId {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ContextLeaseIdentity {
+    authority: u64,
     context: ContextId,
     token: NonZeroU64,
 }
@@ -90,6 +96,12 @@ pub enum AcquireError {
     NoActiveContext,
     IdExhausted,
     InsufficientResources,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetainError {
+    Lease(LeaseError),
+    Acquire(AcquireError),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -373,6 +385,7 @@ impl<D, O> ContextRecord<D, O> {
 }
 
 pub struct ContextRegistry<D, O> {
+    authority: u64,
     active: Option<ContextRecord<D, O>>,
     retired: Vec<ContextRecord<D, O>>,
     next_context_id: u64,
@@ -388,6 +401,7 @@ impl<D, O> Default for ContextRegistry<D, O> {
 impl<D, O> ContextRegistry<D, O> {
     pub const fn new() -> Self {
         Self {
+            authority: 0,
             active: None,
             retired: Vec::new(),
             next_context_id: 1,
@@ -450,6 +464,13 @@ impl<D, O> ContextRegistry<D, O> {
     }
 
     pub fn acquire_active(&mut self) -> Result<ContextLease, AcquireError> {
+        if self.authority == 0 {
+            self.authority = NEXT_REGISTRY_AUTHORITY
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_add(1)
+                })
+                .map_err(|_| AcquireError::IdExhausted)?;
+        }
         let Some(token) = NonZeroU64::new(self.next_lease_token) else {
             return Err(AcquireError::IdExhausted);
         };
@@ -464,7 +485,37 @@ impl<D, O> ContextRegistry<D, O> {
         active.leases.push(token);
         self.next_lease_token = next_token;
         Ok(ContextLease(ContextLeaseIdentity {
+            authority: self.authority,
             context: active.id,
+            token,
+        }))
+    }
+
+    /// Retain existing backing only; this never admits a replaced context for new dispatch.
+    pub fn retain_lease(
+        &mut self,
+        existing: ContextLeaseIdentity,
+    ) -> Result<ContextLease, RetainError> {
+        self.description_by_identity(existing)
+            .map_err(RetainError::Lease)?;
+        let token = NonZeroU64::new(self.next_lease_token)
+            .ok_or(RetainError::Acquire(AcquireError::IdExhausted))?;
+        let next_token = self
+            .next_lease_token
+            .checked_add(1)
+            .ok_or(RetainError::Acquire(AcquireError::IdExhausted))?;
+        let record = self
+            .record_mut(existing.context)
+            .expect("validated live context lease");
+        record
+            .leases
+            .try_reserve(1)
+            .map_err(|_| RetainError::Acquire(AcquireError::InsufficientResources))?;
+        record.leases.push(token);
+        self.next_lease_token = next_token;
+        Ok(ContextLease(ContextLeaseIdentity {
+            authority: self.authority,
+            context: existing.context,
             token,
         }))
     }
@@ -474,6 +525,9 @@ impl<D, O> ContextRegistry<D, O> {
     }
 
     pub fn description_by_identity(&self, lease: ContextLeaseIdentity) -> Result<&D, LeaseError> {
+        if self.authority == 0 || lease.authority != self.authority {
+            return Err(LeaseError::UnknownLease);
+        }
         let record = self
             .record(lease.context)
             .ok_or(LeaseError::UnknownContext)?;
@@ -488,6 +542,9 @@ impl<D, O> ContextRegistry<D, O> {
         lease: ContextLeaseIdentity,
         mutate: impl FnOnce(&mut D, &mut O) -> R,
     ) -> Result<R, LeaseError> {
+        if self.authority == 0 || lease.authority != self.authority {
+            return Err(LeaseError::UnknownLease);
+        }
         let record = self
             .record_mut(lease.context)
             .ok_or(LeaseError::UnknownContext)?;
@@ -498,6 +555,9 @@ impl<D, O> ContextRegistry<D, O> {
     }
 
     pub fn release(&mut self, lease: ContextLeaseIdentity) -> Result<Option<O>, LeaseError> {
+        if self.authority == 0 || lease.authority != self.authority {
+            return Err(LeaseError::UnknownLease);
+        }
         if let Some(active) = self.active.as_mut() {
             if active.id == lease.context {
                 remove_lease(active, lease)?;
@@ -546,6 +606,69 @@ fn remove_lease<D, O>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retained_lease_keeps_replaced_context_until_both_leases_drain() {
+        let mut registry = ContextRegistry::new();
+        registry.publish(1, 10).unwrap();
+        let original = registry.acquire_active().unwrap().into_identity();
+        registry.publish(2, 20).unwrap();
+        let retained = registry.retain_lease(original).unwrap();
+        assert_eq!(retained.context(), original.context());
+        assert_ne!(retained.identity().token(), original.token());
+        assert_eq!(registry.description(&retained), Ok(&1));
+        assert_eq!(registry.release(original), Ok(None));
+        assert_eq!(
+            registry.retain_lease(original),
+            Err(RetainError::Lease(LeaseError::UnknownLease))
+        );
+        assert_eq!(registry.release(retained.into_identity()), Ok(Some(10)));
+        assert_eq!(
+            registry.retain_lease(original),
+            Err(RetainError::Lease(LeaseError::UnknownContext))
+        );
+        assert_eq!(registry.active_description(), Some(&2));
+    }
+
+    #[test]
+    fn matching_context_and_token_from_another_registry_is_not_authority() {
+        let mut first = ContextRegistry::new();
+        let mut second = ContextRegistry::new();
+        first.publish(1, 10).unwrap();
+        second.publish(1, 10).unwrap();
+        let foreign = first.acquire_active().unwrap().into_identity();
+        let local = second.acquire_active().unwrap().into_identity();
+        assert_eq!(foreign.context(), local.context());
+        assert_eq!(foreign.token(), local.token());
+        assert_eq!(
+            second.retain_lease(foreign),
+            Err(RetainError::Lease(LeaseError::UnknownLease))
+        );
+        assert_eq!(
+            second.description_by_identity(foreign),
+            Err(LeaseError::UnknownLease)
+        );
+        assert_eq!(second.release(foreign), Err(LeaseError::UnknownLease));
+        assert_eq!(second.description_by_identity(local), Ok(&1));
+        let retained = second.retain_lease(local).unwrap();
+        assert_eq!(second.release(local), Ok(None));
+        assert_eq!(second.release(retained.into_identity()), Ok(None));
+    }
+
+    #[test]
+    fn retain_exhaustion_preserves_the_original_live_lease() {
+        let mut registry = ContextRegistry::new();
+        registry.publish(1, 10).unwrap();
+        let original = registry.acquire_active().unwrap().into_identity();
+        registry.next_lease_token = u64::MAX;
+        assert_eq!(
+            registry.retain_lease(original),
+            Err(RetainError::Acquire(AcquireError::IdExhausted))
+        );
+        assert_eq!(registry.description_by_identity(original), Ok(&1));
+        assert_eq!(registry.active.as_ref().unwrap().leases.len(), 1);
+        assert_eq!(registry.release(original), Ok(None));
+    }
+
     use super::*;
 
     #[test]
@@ -632,6 +755,7 @@ mod tests {
         assert_eq!(registry.release(stale), Ok(Some(10)));
         let live = registry.acquire_active().unwrap().into_identity();
         let forged = ContextLeaseIdentity {
+            authority: live.authority,
             context: live.context(),
             token: NonZeroU64::new(stale.token()).unwrap(),
         };

@@ -75,7 +75,7 @@ pub(crate) fn register_mounted_volume(
     let guid = core::str::from_utf8(&guid_bytes).expect("formatted GPT GUID is ASCII");
     let driver_path = alloc::format!("\\Driver\\MountedVolume{{{guid}}}");
     let device_path = alloc::format!("\\Device\\Volume{{{guid}}}");
-    let backend = MountedVolumeBackend::new(fs)?;
+    let backend = MountedVolumeBackend::new(fs);
     let mount = unsafe { allocate_mount_id() }.map_err(|status| NtStatus(status as i32))?;
     unsafe { (&mut *core::ptr::addr_of_mut!(MOUNT_BINDINGS)).reserve(mount) }
         .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;

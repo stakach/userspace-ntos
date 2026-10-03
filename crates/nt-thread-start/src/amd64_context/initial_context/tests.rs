@@ -118,6 +118,28 @@ fn constructor_is_explicit_and_preserves_supplied_start_and_stack_pointer() {
 }
 
 #[test]
+fn loader_entry_installs_one_complete_context_without_changing_the_saved_start() {
+    let start = Amd64ThreadContext {
+        rip: 0x1234,
+        rsp: 0x8768,
+        rcx: 0x1122,
+        rdx: 0x3344,
+    };
+    let initial = InitialAmd64Context::constructor(start, 0xffff).unwrap();
+    let entry = initial.prepare_loader_entry(0x4000, 0x8700, 0xffff).unwrap();
+    assert_eq!(initial.startup_projection(), start);
+    assert_eq!(&entry.registers[..2], &[0x4000, 0x8700]);
+    assert_eq!(entry.registers[5], start.rcx);
+    assert_eq!(entry.registers[6], start.rdx);
+    assert_eq!(entry.register_mask, (1 << 18) - 1);
+    assert!(entry.floating_point.is_some());
+    assert_eq!(
+        initial.prepare_loader_entry(0x4000, 0x8708, 0xffff),
+        Err(CodecError::InvalidStackPointer)
+    );
+}
+
+#[test]
 fn unsupported_extended_state_is_not_erased_by_initialization() {
     for flags in [CONTEXT_AMD64 | 0x40, CONTEXT_AMD64 | 0x80] {
         assert!(matches!(

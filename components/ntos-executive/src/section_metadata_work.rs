@@ -14,7 +14,16 @@ use nt_user_host::provider_logical_caller::ProviderLogicalCaller;
 
 const STATUS_CANCELLED: u32 = 0xc000_0120;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xc000_009a;
+const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xc000_007b;
 const RETRY_DELAY: u64 = 1_000_000;
+const IMAGE_HEADER_READ_SIZE: usize = 0x1000;
+const IMAGE_HEADER_LIMIT: usize = 0x10000;
+
+pub(crate) struct ImageObjectName {
+    pub(crate) root_index: usize,
+    pub(crate) root_identity: u64,
+    pub(crate) path: Vec<u8>,
+}
 
 enum Phase {
     Query,
@@ -30,6 +39,10 @@ enum Phase {
     AckPending {
         irp: IrpId,
     },
+    HeaderDispatch,
+    HeaderPending { irp: IrpId, length: usize },
+    HeaderCopying { irp: IrpId, length: usize, offset: usize },
+    HeaderAckPending { irp: IrpId },
     Publish,
     CopyOut,
     ReadyReply,
@@ -39,6 +52,34 @@ enum Phase {
     RetypeReply,
     ReconcileRuntime,
     Indeterminate,
+}
+
+enum ReservedSection {
+    Data(crate::exec_handler::section_create::ReservedGenericDataSection),
+    Image(crate::exec_handler::image_section_create::ReservedNativeImageSection),
+}
+
+impl ReservedSection {
+    fn value(&self) -> u64 {
+        match self {
+            Self::Data(section) => section.value(),
+            Self::Image(section) => section.value(),
+        }
+    }
+
+    fn publish(&mut self, handler: &mut ExecNtHandler) -> Result<u64, u32> {
+        match self {
+            Self::Data(section) => section.publish(handler),
+            Self::Image(section) => section.publish(handler),
+        }
+    }
+
+    fn abort(&mut self, handler: &mut ExecNtHandler) {
+        match self {
+            Self::Data(section) => section.abort(handler),
+            Self::Image(section) => section.abort(handler),
+        }
+    }
 }
 
 struct Work {
@@ -61,11 +102,14 @@ struct Work {
     page_protection: u32,
     allocation_attrs: u32,
     file_handle: u64,
+    image_name: Option<ImageObjectName>,
     capture: Option<driver_launch::hosted_file_capture::Capture>,
     origin_driver: u64,
     metadata: PendingSectionMetadataQueries<(), u64>,
     metadata_id: PendingSectionMetadataId,
-    reserved: Option<crate::exec_handler::section_create::ReservedGenericDataSection>,
+    file_metadata: Option<nt_memory_manager::RoutedSectionMetadata>,
+    image_header: Vec<u8>,
+    reserved: Option<ReservedSection>,
     published_handle: Option<u64>,
     phase: Phase,
     status: u32,
@@ -79,7 +123,7 @@ static TRANSFERRED: AtomicBool = AtomicBool::new(false);
 static EXECUTING_TID: AtomicU64 = AtomicU64::new(0);
 static EXECUTING_PI: AtomicU64 = AtomicU64::new(u64::MAX);
 static EXECUTING_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
-static EXECUTING_RECONCILING: AtomicBool = AtomicBool::new(false);
+static EXECUTING_ADMISSION_RELEASED: AtomicBool = AtomicBool::new(false);
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -94,18 +138,26 @@ pub(crate) unsafe fn submit_hosted(
     page_protection: u32,
     allocation_attrs: u32,
     file_handle: u64,
+    image_name: Option<ImageObjectName>,
 ) -> Result<(), u32> {
     let _durable = allocator::enter_durable();
     let nt_process::HandleObject::RoutedFile { file_id, device_id } = source.object() else {
         return Err(nt_fs::STATUS_INVALID_HANDLE);
     };
-    nt_memory_manager::data_section::check_data_section_file_access(
-        page_protection,
-        source.granted_access(),
-    )?;
+    if allocation_attrs & 0x0100_0000 != 0 {
+        if !matches!(page_protection, 0x02 | 0x10 | 0x20)
+            || source.granted_access() & 0x20 == 0
+        {
+            return Err(nt_fs::STATUS_ACCESS_DENIED);
+        }
+    } else {
+        nt_memory_manager::data_section::check_data_section_file_access(
+            page_protection,
+            source.granted_access(),
+        )?;
+    }
     let mount = mounted_volume::mount_id_for_live_device(device_id).ok_or(0xc000_0020u32)?;
-    let capture =
-        driver_launch::hosted_file_capture::capture(file_id, device_id, source.granted_access())?;
+    let capture = driver_launch::hosted_file_capture::capture_native_section_source(source)?;
     let origin_driver = driver_launch::io_manager_mut()
         .device(DeviceId(device_id))
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
@@ -173,10 +225,13 @@ pub(crate) unsafe fn submit_hosted(
         page_protection,
         allocation_attrs,
         file_handle,
+        image_name,
         capture: Some(capture),
         origin_driver,
         metadata,
         metadata_id,
+        file_metadata: None,
+        image_header: Vec::new(),
         reserved: None,
         published_handle: None,
         phase: Phase::Query,
@@ -199,24 +254,28 @@ pub(crate) fn take_transferred() -> bool {
 }
 
 pub(crate) fn has_thread(tid: u64) -> bool {
-    (EXECUTING_TID.load(Ordering::Acquire) == tid && !EXECUTING_RECONCILING.load(Ordering::Acquire))
+    (EXECUTING_TID.load(Ordering::Acquire) == tid
+        && !EXECUTING_ADMISSION_RELEASED.load(Ordering::Acquire))
         || unsafe {
             (&*core::ptr::addr_of!(WORK))
                 .iter()
                 .flatten()
-                .any(|work| work.tid == tid && !matches!(&work.phase, Phase::ReconcileRuntime))
+                .any(|work| {
+                    work.tid == tid
+                        && !matches!(&work.phase, Phase::ReplySent | Phase::ReconcileRuntime)
+                })
         }
 }
 
 pub(crate) fn has_process(pi: usize, preserve_tid: Option<u64>) -> bool {
     (EXECUTING_PI.load(Ordering::Acquire) == pi as u64
-        && !EXECUTING_RECONCILING.load(Ordering::Acquire)
+        && !EXECUTING_ADMISSION_RELEASED.load(Ordering::Acquire)
         && preserve_tid != Some(EXECUTING_TID.load(Ordering::Acquire)))
         || unsafe {
             (&*core::ptr::addr_of!(WORK)).iter().flatten().any(|work| {
                 work.pi == pi
                     && preserve_tid != Some(work.tid)
-                    && !matches!(&work.phase, Phase::ReconcileRuntime)
+                    && !matches!(&work.phase, Phase::ReplySent | Phase::ReconcileRuntime)
             })
         }
 }
@@ -307,7 +366,7 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler, queue: &mut nt_delay_e
         }
         EXECUTING_TID.store(0, Ordering::Release);
         EXECUTING_PI.store(u64::MAX, Ordering::Release);
-        EXECUTING_RECONCILING.store(false, Ordering::Release);
+        EXECUTING_ADMISSION_RELEASED.store(false, Ordering::Release);
         EXECUTING_INDEX.store(u64::MAX, Ordering::Release);
     }
     NEXT.store(
@@ -341,7 +400,25 @@ unsafe fn advance(
                 return Step::Progress;
             }
             let Some(class) = work.metadata.next_query(work.metadata_id) else {
-                work.phase = Phase::Publish;
+                let (_, result) = work
+                    .metadata
+                    .take_terminal(work.metadata_id)
+                    .expect("Section metadata did not reach a terminal phase");
+                match result {
+                    Ok(metadata) => {
+                        work.file_metadata = Some(metadata);
+                        work.phase = if work.allocation_attrs & 0x0100_0000 != 0 {
+                            Phase::HeaderDispatch
+                        } else {
+                            Phase::Publish
+                        };
+                    }
+                    Err(status) => {
+                        work.capture.take();
+                        work.status = status;
+                        work.phase = Phase::ReadyReply;
+                    }
+                }
                 return Step::Progress;
             };
             let length = if class == nt_fs::FILE_STANDARD_INFORMATION {
@@ -491,20 +568,151 @@ unsafe fn advance(
             work.phase = Phase::Query;
             Step::Progress
         }
-        Phase::Publish => {
-            let (_, result) = work
-                .metadata
-                .take_terminal(work.metadata_id)
-                .expect("Section metadata did not reach a terminal phase");
-            let metadata = match result {
-                Ok(metadata) => metadata,
-                Err(status) => {
-                    work.capture.take();
-                    work.status = status;
+        Phase::HeaderDispatch => {
+            if work.cancelled {
+                work.capture.take();
+                work.status = STATUS_CANCELLED;
+                work.phase = Phase::RevokeReply;
+                return Step::Progress;
+            }
+            match nt_pe_loader::PeFile::parse(&work.image_header) {
+                Ok(_) => {
+                    work.phase = Phase::Publish;
+                    return Step::Progress;
+                }
+                Err(nt_pe_loader::PeError::Truncated) => {}
+                Err(_) => {
+                    work.status = STATUS_INVALID_IMAGE_FORMAT;
                     work.phase = Phase::ReadyReply;
                     return Step::Progress;
                 }
+            }
+            let metadata = work.file_metadata.expect("image header file metadata");
+            let offset = work.image_header.len();
+            let remaining = metadata.end_of_file.saturating_sub(offset as u64);
+            if offset >= IMAGE_HEADER_LIMIT || remaining == 0 || metadata.is_directory {
+                work.status = STATUS_INVALID_IMAGE_FORMAT;
+                work.phase = Phase::ReadyReply;
+                return Step::Progress;
+            }
+            let length = IMAGE_HEADER_READ_SIZE
+                .min(IMAGE_HEADER_LIMIT - offset)
+                .min(remaining as usize);
+            if work.image_header.try_reserve(length).is_err() {
+                work.status = STATUS_INSUFFICIENT_RESOURCES;
+                work.phase = Phase::ReadyReply;
+                return Step::Progress;
+            }
+            let capture = work.capture.as_ref().expect("image header File capture");
+            let mut output = [0u8; IMAGE_HEADER_READ_SIZE];
+            let result = driver_launch::io_manager_mut().build_and_dispatch_external_to_device(
+                nt_types::ClientId(driver_launch::IO_MANAGER_COMPONENT_ID),
+                DeviceId(capture.device_id()),
+                Some(FileId(capture.file_id())),
+                0,
+                work.tid,
+                nt_io_abi::major::IRP_MJ_READ,
+                IoParameters::Read(nt_io_manager::ReadWriteParameters {
+                    length: length as u32,
+                    key: 0,
+                    offset: offset as u64,
+                }),
+                0,
+                length as u32,
+                &mut output[..length],
+            );
+            match result {
+                Ok(ExternalDispatchResult::Completed { status, information, .. })
+                    if status.raw() == 0 && information == length as u64 =>
+                {
+                    work.image_header.extend_from_slice(&output[..length]);
+                }
+                Ok(ExternalDispatchResult::Completed { status, .. }) => {
+                    work.status = if status.raw() == 0 {
+                        STATUS_INVALID_IMAGE_FORMAT
+                    } else {
+                        status.raw() as u32
+                    };
+                    work.phase = Phase::ReadyReply;
+                }
+                Ok(ExternalDispatchResult::Pending { irp_id }) => {
+                    work.phase = Phase::HeaderPending { irp: irp_id, length };
+                }
+                Err(status) => {
+                    work.status = status.raw() as u32;
+                    work.phase = Phase::ReadyReply;
+                }
+            }
+            Step::Progress
+        }
+        Phase::HeaderPending { irp, length } => {
+            if work.cancelled && !work.cancel_requested {
+                work.cancel_requested = true;
+                let _ = driver_launch::cancel_irp_if_pending(irp.raw());
+            }
+            let Some(completion) = driver_launch::completed_irp_exact(irp.raw()) else {
+                return Step::Wait;
             };
+            let capture = work.capture.as_ref().expect("pending image header File capture");
+            if completion.client_id != driver_launch::IO_MANAGER_COMPONENT_ID
+                || completion.driver_id != work.origin_driver
+                || completion.file_id != capture.file_id()
+                || completion.device_id != capture.device_id()
+                || completion.requestor_tid != work.tid
+                || completion.major != nt_io_abi::major::IRP_MJ_READ
+            {
+                work.phase = Phase::Indeterminate;
+                return Step::Wait;
+            }
+            if completion.status == 0 && completion.information == length as u64 {
+                work.phase = Phase::HeaderCopying { irp, length, offset: 0 };
+            } else {
+                work.status = if completion.status == 0 {
+                    STATUS_INVALID_IMAGE_FORMAT
+                } else {
+                    completion.status
+                };
+                work.phase = Phase::HeaderAckPending { irp };
+            }
+            Step::Progress
+        }
+        Phase::HeaderCopying { irp, length, offset } => {
+            let mut bytes = [0u8; IMAGE_HEADER_READ_SIZE];
+            let remaining = length - offset;
+            let copied = match driver_launch::copy_completed_irp_output_exact(
+                irp.raw(),
+                offset as u64,
+                &mut bytes[..remaining],
+            ) {
+                Ok(copied) if copied != 0 && copied <= remaining => copied,
+                _ => return Step::Wait,
+            };
+            work.image_header.extend_from_slice(&bytes[..copied]);
+            let next = offset + copied;
+            work.phase = if next == length {
+                Phase::HeaderAckPending { irp }
+            } else {
+                Phase::HeaderCopying { irp, length, offset: next }
+            };
+            Step::Progress
+        }
+        Phase::HeaderAckPending { irp } => {
+            work.phase = Phase::Indeterminate;
+            if driver_launch::io_manager_mut()
+                .acknowledge_completed_irp_strict(irp)
+                .is_err()
+            {
+                return Step::Wait;
+            }
+            work.phase = if work.status == 0 {
+                Phase::HeaderDispatch
+            } else {
+                Phase::ReadyReply
+            };
+            Step::Progress
+        }
+        Phase::Publish => {
+            let metadata = work.file_metadata.take().expect("Section publication metadata");
             if work.cancelled
                 || work.reference.validate(&handler.pm).is_err()
                 || !handler.validate_provider_logical_caller(work.logical)
@@ -514,24 +722,38 @@ unsafe fn advance(
                 work.phase = Phase::RevokeReply;
                 return Step::Progress;
             }
-            let admission = crate::exec_handler::section_create::RoutedSectionAdmission {
-                capture: work
-                    .capture
-                    .take()
-                    .expect("Section publication File capture"),
-                metadata,
+            let capture = work.capture.take().expect("Section publication File capture");
+            let result = if work.allocation_attrs & 0x0100_0000 != 0 {
+                handler.reserve_native_image_section(
+                    work.caller,
+                    work.desired_access,
+                    work.attributes,
+                    work.maxsize,
+                    work.page_protection,
+                    work.allocation_attrs,
+                    crate::exec_handler::image_section_create::RoutedImageAdmission {
+                        capture,
+                        metadata,
+                        header: core::mem::take(&mut work.image_header),
+                        name: work.image_name.take(),
+                    },
+                ).map(ReservedSection::Image)
+            } else {
+                handler.reserve_generic_data_section(
+                    work.caller,
+                    work.pi,
+                    work.desired_access,
+                    work.attributes,
+                    work.maxsize,
+                    work.page_protection,
+                    work.allocation_attrs,
+                    work.file_handle,
+                    Some(crate::exec_handler::section_create::RoutedSectionAdmission {
+                        capture,
+                        metadata,
+                    }),
+                ).map(ReservedSection::Data)
             };
-            let result = handler.reserve_generic_data_section(
-                work.caller,
-                work.pi,
-                work.desired_access,
-                work.attributes,
-                work.maxsize,
-                work.page_protection,
-                work.allocation_attrs,
-                work.file_handle,
-                Some(admission),
-            );
             match result {
                 Ok(reserved) => {
                     work.reserved = Some(reserved);
@@ -635,6 +857,7 @@ unsafe fn advance(
                 return Step::Wait;
             }
             work.phase = Phase::ReplySent;
+            EXECUTING_ADMISSION_RELEASED.store(true, Ordering::Release);
             Step::Progress
         }
         Phase::ReplyEntered => {
@@ -643,6 +866,7 @@ unsafe fn advance(
             ) {
                 Ok(true) => {
                     work.phase = Phase::ReplySent;
+                    EXECUTING_ADMISSION_RELEASED.store(true, Ordering::Release);
                     Step::Progress
                 }
                 _ if work.cancelled => {
@@ -679,7 +903,7 @@ unsafe fn advance(
             Step::Progress
         }
         Phase::ReconcileRuntime => {
-            EXECUTING_RECONCILING.store(true, Ordering::Release);
+            EXECUTING_ADMISSION_RELEASED.store(true, Ordering::Release);
             if !hosted_termination::reconcile(handler, queue, work.logical) {
                 return Step::Wait;
             }

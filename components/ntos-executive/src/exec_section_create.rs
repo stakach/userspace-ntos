@@ -46,6 +46,29 @@ impl ReservedGenericDataSection {
         );
         sections.clear_section(self.index);
     }
+
+    pub(crate) fn into_object_reference(
+        mut self,
+        handler: &mut ExecNtHandler,
+    ) -> Result<(nt_memory_manager::SectionReference, u64, u32), u32> {
+        let sections = unsafe {
+            &mut *handler.loop_ctx.expect("reserved Section context").generic_sections
+        };
+        assert_eq!(sections.section_identity(self.index), Some(self.identity));
+        let protection = sections.section(self.index).expect("reserved Section").protection;
+        let Some(reference) = sections.retain_section(self.identity) else {
+            self.abort(handler);
+            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        };
+        // The object reference must fence backing lifetime before canceling its invisible handle.
+        if self.publication.abort(&mut handler.pm) != Ok(Some(self.index as nt_process::SectionId)) {
+            unsafe { crate::provider_bugcheck::report(0xc4, [self.index as u64, self.size, 0, 91]); }
+        }
+        let sections = unsafe { &mut *handler.loop_ctx.expect("Section context").generic_sections };
+        assert_eq!(sections.section_identity(self.index), Some(self.identity));
+        assert!(sections.release_handle(self.index));
+        Ok((reference, self.size, protection))
+    }
 }
 
 impl ExecNtHandler {
@@ -79,10 +102,7 @@ impl ExecNtHandler {
         }
         let generic_sections = self.loop_ctx.ok_or(0xC000_00A3u32)?.generic_sections;
         let mut routed_lease = None;
-        let (backing, backing_size) = if sec_file == 0 {
-            if routed_admission.is_some() {
-                return Err(nt_fs::STATUS_INVALID_HANDLE);
-            }
+        let (backing, backing_size) = if sec_file == 0 && routed_admission.is_none() {
             if maxsize == 0 {
                 return Err(0xC000_00F2); // STATUS_INVALID_PARAMETER_4
             }

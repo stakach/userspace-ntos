@@ -102,13 +102,23 @@ pub(crate) unsafe fn take_hosted_with(
     if crate::writable_fs::registry_journal::owns_volume() {
         return Ok(None);
     }
-    let Some(row) = (&mut *core::ptr::addr_of_mut!(CALLS))
-        .iter_mut()
-        .filter_map(Option::as_mut)
-        .find(|row| !row.delivered && row.call.is_some())
-    else {
+    let Some(index) = nt_component_suspension::oldest_external_ingress(
+        (&*core::ptr::addr_of!(CALLS))
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                let row = row.as_ref()?;
+                if row.delivered {
+                    return None;
+                }
+                row.call.as_ref().map(|call| (index, call))
+            }),
+    ) else {
         return Ok(None);
     };
+    let row = (&mut *core::ptr::addr_of_mut!(CALLS))[index]
+        .as_mut()
+        .ok_or(Error::Retain)?;
     let call = row.call.as_ref().ok_or(Error::Retain)?;
     if crate::service_sec_image::hosted_ingress_binding(row.binding.badge) != Some(row.binding) {
         return Err(Error::PhysicalIdentity);

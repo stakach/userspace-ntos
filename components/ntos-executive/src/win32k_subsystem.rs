@@ -38,29 +38,68 @@ mod provider_wait_context;
 mod source_irp;
 #[path = "win32k_source_irp_aux.rs"]
 mod source_irp_aux;
+#[path = "win32k_subsystem/push_lock.rs"]
+mod push_lock;
 #[path = "win32k_source_irp_call.rs"]
 mod source_irp_call;
-pub(crate) use source_irp::SourceBufferedDispatchLease;
+#[path = "win32k_source_pnp_call.rs"]
+mod source_pnp_call;
+#[path = "win32k_source_fsd.rs"]
+mod source_fsd;
+#[path = "win32k_source_fsd_call.rs"]
+mod source_fsd_call;
+#[path = "win32k_source_call_router.rs"]
+mod source_call_router;
+#[path = "win32k_process_attach.rs"]
+mod process_attach;
+#[path = "win32k_thread_execution.rs"]
+mod thread_execution;
+#[path = "provider_ps_lifecycle.rs"]
+mod provider_ps_lifecycle;
+pub(crate) use source_irp::{SourcePnpDispatchLease, SourceRelationAllocationLease};
+pub(crate) use source_fsd::SourceFsdDispatchLease;
 
-pub(crate) unsafe fn admit_source_buffered_ioctl_dispatch(
+pub(crate) unsafe fn admit_source_fsd_dispatch(
     irp: u64,
     device: u64,
     stack_pointer: u64,
-) -> Result<SourceBufferedDispatchLease, i32> {
-    source_irp::admit_buffered_dispatch(irp, device, stack_pointer)
+    route: Option<nt_component_suspension::peer_registry::PeerRoute>,
+) -> Result<SourceFsdDispatchLease, i32> {
+    source_fsd::admit(irp, device, stack_pointer, route)
 }
 
-pub(crate) unsafe fn release_source_buffered_ioctl_dispatch(
-    lease: &mut SourceBufferedDispatchLease,
-) -> bool {
-    source_irp::release_buffered_dispatch(lease)
+pub(crate) unsafe fn release_source_fsd_dispatch(lease: &mut SourceFsdDispatchLease) -> bool {
+    source_fsd::release(lease)
 }
 
-pub(crate) unsafe fn abort_source_buffered_ioctl_dispatch(
-    lease: &mut SourceBufferedDispatchLease,
-) -> bool {
-    source_irp::release_buffered_admission(lease)
+pub(crate) unsafe fn abort_source_fsd_dispatch(lease: &mut SourceFsdDispatchLease) -> bool {
+    source_fsd::abort(lease)
 }
+
+pub(crate) unsafe fn admit_source_target_relation_dispatch(
+    irp: u64,
+    device: u64,
+    stack_pointer: u64,
+) -> Result<SourcePnpDispatchLease, i32> {
+    source_irp::admit_pnp_target_relation(irp, device, stack_pointer)
+}
+
+pub(crate) unsafe fn release_source_target_relation_dispatch(
+    lease: &mut SourcePnpDispatchLease,
+) -> bool {
+    source_irp::release_pnp_dispatch(lease)
+}
+
+pub(crate) unsafe fn abort_source_target_relation_dispatch(
+    lease: &mut SourcePnpDispatchLease,
+) -> bool {
+    source_irp::abort_pnp_dispatch(lease)
+}
+
+pub(crate) unsafe fn allocate_source_target_relation() -> Option<SourceRelationAllocationLease> {
+    source_irp::allocate_target_relation()
+}
+
 #[path = "win32k_subsystem/provider_input.rs"]
 mod provider_input;
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
@@ -128,6 +167,9 @@ pub const WIN32K_AUX_PT_VADDR: u64 = 0x0000_0100_0700_0000;
 /// 9 frames.
 pub const WIN32K_DATA_VADDR: u64 = 0x0000_0100_0710_0000;
 pub const WIN32K_DATA_FRAMES: u64 = 9;
+pub const WIN32K_SEH_FOREIGN_CALL2_VA: u64 = WIN32K_DATA_VADDR + 0x6000;
+pub const WIN32K_SEH_FOREIGN_CALL16_VA: u64 = WIN32K_SEH_FOREIGN_CALL2_VA + 8;
+const _: () = assert!(WIN32K_SEH_FOREIGN_CALL16_VA + 8 <= WIN32K_DATA_VADDR + WIN32K_DATA_FRAMES * 0x1000);
 /// Per-dispatch primary-token user SID bytes. The shared dispatch page carries a pointer to this
 /// data-region buffer so the callback frame can remain at its fixed `0x200` offset.
 pub const WIN32K_TOKEN_USER_SID_VADDR: u64 = WIN32K_DATA_VADDR + 0x5000;
@@ -255,9 +297,7 @@ pub const WIN32K_SHARED_VADDR: u64 = 0x0000_0100_0718_0000;
 
 unsafe fn call_win32k_pe(target: u64, args: &[u64]) -> u64 {
     assert!(target != 0 && args.len() <= 16, "invalid win32k PE callback");
-    let boundary = read_volatile(
-        (WIN32K_SHARED_VADDR + crate::driver_launch::SH_SEH_FOREIGN_CALL16_VA) as *const u64,
-    );
+    let boundary = read_volatile(WIN32K_SEH_FOREIGN_CALL16_VA as *const u64);
     assert_ne!(boundary, 0, "win32k PE callback lacks its admitted boundary");
     let call: unsafe extern "win64" fn(u64, *const u64, u64) -> u64 =
         core::mem::transmute(boundary as *const ());
@@ -307,16 +347,10 @@ const _: () = assert!(
 );
 const _: () =
     assert!(WIN32K_MESSAGE_STAGE_OUTPUT_LENGTH_OFFSET + 8 <= WIN32K_MESSAGE_STAGE_SLOT_BYTES);
-/// Dedicated cross-address-space video-control window. `EngDeviceIoControl` runs in the win32k
-/// component, but hosted miniport IRPs are executive-owned; this window carries bounded METHOD_BUFFERED
-/// input/output bytes without reusing the live syscall ARG frame or the user-callback shared page.
-pub const WIN32K_VIDEO_IOCTL_VADDR: u64 = 0x0000_0100_071C_0000;
-pub const WIN32K_VIDEO_IOCTL_FRAMES: u64 = 4;
-pub const WIN32K_VIDEO_IOCTL_BYTES: usize = (WIN32K_VIDEO_IOCTL_FRAMES as usize) * 0x1000;
 /// Dedicated cross-address-space LPC request window. Kernel LPC imports execute inside the win32k
 /// component, while the isolated LPC broker channel belongs to the executive's CSpace. The
 /// component therefore stages one bounded, pointer-free request here and calls the executive pump.
-pub const WIN32K_LPC_VADDR: u64 = WIN32K_VIDEO_IOCTL_VADDR + WIN32K_VIDEO_IOCTL_FRAMES * 0x1000;
+pub const WIN32K_LPC_VADDR: u64 = 0x0000_0100_071C_4000;
 pub const WIN32K_LPC_FRAMES: u64 = 1;
 pub const WIN32K_LPC_BYTES: usize = (WIN32K_LPC_FRAMES as usize) * 0x1000;
 /// Dedicated pointer-free staging for native atom services redirected to a job-private win32k
@@ -336,9 +370,7 @@ pub const WIN32K_REGISTRY_BYTES: usize = (WIN32K_REGISTRY_FRAMES as usize) * 0x1
 /// generic ARG window, so it gets a dedicated shared 2 MiB PT window between AUX and the session heap.
 pub const WIN32K_BULK_ARG_VADDR: u64 = 0x0000_0100_0720_0000;
 pub const WIN32K_BULK_ARG_FRAMES: u64 = 512;
-const _: () = assert!(WIN32K_ARG_VADDR + WIN32K_ARG_FRAMES * 0x1000 <= WIN32K_VIDEO_IOCTL_VADDR);
-const _: () =
-    assert!(WIN32K_VIDEO_IOCTL_VADDR + WIN32K_VIDEO_IOCTL_FRAMES * 0x1000 <= WIN32K_LPC_VADDR);
+const _: () = assert!(WIN32K_ARG_VADDR + WIN32K_ARG_FRAMES * 0x1000 <= WIN32K_LPC_VADDR);
 const _: () =
     assert!(WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_FRAMES * 0x1000 <= WIN32K_BULK_ARG_VADDR);
 /// Kernel-mode KUSER_SHARED_DATA mapping used by win32k's direct `SharedUserData` reads. User
@@ -475,13 +507,17 @@ pub const SH_REQ_TOKEN_AUTH: u64 = 0x1B8; // in: packed primary-token Authentica
 pub const SH_REQ_TOKEN_USER_SID_LEN: u64 = 0x1C0; // in: native user SID byte length
 pub const SH_REQ_TOKEN_USER_SID_PTR: u64 = 0x1C8; // in: component VA of native user SID bytes
 pub const WIN32K_TOKEN_USER_SID_MAX: usize = 68; // SID header + 15 sub-authorities
-pub const SH_GDI_LOAD_LEAF_LEN: u64 = 0x1D0; // in: ASCII driver leaf byte length
-pub const SH_GDI_LOAD_STATUS: u64 = 0x1D8; // out: executive load NTSTATUS
-pub const SH_GDI_LOAD_LEAF: u64 = 0x1E0; // in: lower-case ASCII driver leaf bytes
-pub const SH_GDI_LOAD_LEAF_CAP: usize = 24;
 pub const SH_REQ_GENERATION: u64 = 0x1F8; // in: exact hosted-process identity generation
 pub const WIN32K_REQUEST_SSDT: u64 = 0;
 pub const WIN32K_REQUEST_PS_PROVIDER: u64 = 1;
+pub const WIN32K_REQUEST_SOURCE_PNP_TERMINAL: u64 = 2;
+pub const WIN32K_REQUEST_SOURCE_FSD_TERMINAL: u64 = 3;
+pub const WIN32K_REQUEST_SOURCE_IOCTL_TERMINAL: u64 = 4;
+#[cfg(feature = "source-irp-integration")]
+pub const WIN32K_REQUEST_SOURCE_IRP_PROBE: u64 = 5;
+/// Executive-authenticated logical user origin. Component admission additionally requires a
+/// registered SSDT entry before publishing UserMode to its selected KTHREAD.
+pub const WIN32K_REQUEST_USER_ORIGIN: u64 = 1 << 63;
 pub const PS_WIN32_PROVIDER_THREAD_EXIT: u64 = 1;
 pub const PS_WIN32_PROVIDER_PROCESS_EXIT: u64 = 2;
 pub const PS_WIN32_PROVIDER_FINALIZE_PROCESS_OBJECTS: u64 = 3;
@@ -492,7 +528,6 @@ const _: () = assert!(SH_SAS_AHELIST > SH_REQ_NARGS);
 /// tail of the existing shared page; both the component stub and executive pump access it here.
 pub const SH_USER_CALLBACK: u64 = 0x200;
 const _: () = assert!(SH_REQ_TOKEN_USER_SID_PTR + 8 <= SH_USER_CALLBACK);
-const _: () = assert!(SH_GDI_LOAD_LEAF + SH_GDI_LOAD_LEAF_CAP as u64 <= SH_USER_CALLBACK);
 const _: () = assert!(SH_REQ_GENERATION + 8 <= SH_USER_CALLBACK);
 const _: () = assert!(SH_USER_CALLBACK as usize + nt_user_callback::CALLBACK_FRAME_SIZE <= 0x1000);
 /// Provider-owned `WIN32_CALLOUTS_FPNS` metadata copied out by `PsEstablishWin32Callouts`. These
@@ -1260,9 +1295,6 @@ pub const W32_USER_CALLBACK_RESUME_LABEL: u64 = 0x773;
 /// cannot do executive-owned filesystem/capability work in win32k's VSpace, so it sends the bounded
 /// driver leaf through the shared page and waits while the executive performs the real load.
 pub const W32_GDI_LOAD_LABEL: u64 = 0x774;
-/// A component-side `EngDeviceIoControl` request. The display driver and win32k run in the win32k
-/// component, while hosted video miniport IRPs belong to the executive's generic IO manager.
-pub const W32_VIDEO_IOCTL_LABEL: u64 = 0x775;
 /// A component-side kernel LPC request. Broker capabilities stay executive-owned; the component
 /// passes only an operation, an opaque broker handle, and a bounded native PORT_MESSAGE frame.
 pub const W32_LPC_LABEL: u64 = 0x776;
@@ -1291,6 +1323,7 @@ pub const W32_PS_OP_LOOKUP_THREAD: u64 = 5;
 pub const W32_PS_OP_RETAIN_POINTER: u64 = 6;
 pub const W32_PS_OP_RELEASE_POINTER: u64 = 7;
 pub const W32_PS_OP_YIELD_EXECUTION: u64 = 8;
+pub const W32_PS_OP_QUERY_OBJECT_KIND: u64 = 9;
 /// Bounded global-atom requests. The executive owns the one native atom table; win32k stages only
 /// explicit-length UTF-16 input and receives the resulting 16-bit atom.
 pub const W32_ATOM_LABEL: u64 = 0x77E;
@@ -1318,9 +1351,15 @@ pub const W32_FILE_IOCTL_LABEL: u64 = 0x799;
 pub const W32_FILE_IOCTL_COMPLETION_LABEL: u64 = 0x79a;
 pub const W32_FILE_IOCTL_RELEASE_LABEL: u64 = 0x79b;
 pub const W32_SOURCE_IOCTL_LABEL: u64 = 0x7a0;
-pub const W32_SOURCE_IOCTL_COMPLETION_LABEL: u64 = 0x7a1;
-pub const W32_SOURCE_IOCTL_RELEASE_LABEL: u64 = 0x7a2;
 pub const W32_GUI_CLIENT_INFO_LABEL: u64 = 0x7a3;
+pub const W32_PROCESS_ATTACH_LABEL: u64 = 0x7a4;
+pub const W32_SOURCE_PNP_LABEL: u64 = 0x7a5;
+pub const W32_SOURCE_FSD_LABEL: u64 = 0x7a8;
+pub const W32_SOURCE_ARMED_LABEL: u64 = 0x7aa;
+pub const W32_ATTACH_PLAIN: u64 = 1;
+pub const W32_ATTACH_DETACH: u64 = 2;
+pub const W32_ATTACH_STACK: u64 = 3;
+pub const W32_ATTACH_UNSTACK: u64 = 4;
 pub const W32_GUI_CLIENT_INFO_PACKET_MAGIC: u64 = 0x5743_494e_464f_3031;
 
 /// One synchronous provider-owned copyout. All members are scalar claims; the executive checks
@@ -1356,6 +1395,7 @@ pub const W32_FILE_OBJECT_RELATED_DEVICE: u64 = 4;
 pub const W32_FILE_OBJECT_WAIT_IDENTITY: u64 = 5;
 pub const W32_FILE_OBJECT_DEVICE_NAME: u64 = 6;
 pub const W32_FILE_OBJECT_RELEASE_WAIT: u64 = 7;
+pub const W32_FILE_OBJECT_OPEN_DEVICE: u64 = 8;
 /// Root-authenticated kernel activation handoff before entering provider code.
 pub const W32_KERNEL_ACTIVATION_LABEL: u64 = 0x78E;
 pub const W32_MM_SECURE_OP_SECURE: u64 = 1;
@@ -1423,22 +1463,6 @@ unsafe fn provider_event_projection_begin_reclaim(
     (&mut *core::ptr::addr_of_mut!(WIN32K_EVENT_PROJECTIONS))
         .begin_reclaim(body, nt_kernel_exec::EventObjectId(nt_types::ObjectId(raw_id)))
 }
-
-const VIDEO_IOCTL_HDEV: u64 = 0x00;
-const VIDEO_IOCTL_CODE: u64 = 0x08;
-const VIDEO_IOCTL_IN_LEN: u64 = 0x10;
-const VIDEO_IOCTL_OUT_LEN: u64 = 0x18;
-const VIDEO_IOCTL_STATUS: u64 = 0x20;
-const VIDEO_IOCTL_BYTES_RETURNED: u64 = 0x28;
-const VIDEO_IOCTL_IN_BUF: u64 = 0x100;
-const VIDEO_IOCTL_IN_CAP: usize = 0x1000;
-const VIDEO_IOCTL_OUT_BUF: u64 = VIDEO_IOCTL_IN_BUF + VIDEO_IOCTL_IN_CAP as u64;
-const VIDEO_IOCTL_OUT_CAP: usize = WIN32K_VIDEO_IOCTL_BYTES - VIDEO_IOCTL_OUT_BUF as usize;
-const _: () =
-    assert!(VIDEO_IOCTL_OUT_BUF as usize + VIDEO_IOCTL_OUT_CAP <= WIN32K_VIDEO_IOCTL_BYTES);
-static WIN32K_VIDEO_IOCTL_TRACE: AtomicU64 = AtomicU64::new(0);
-static WIN32K_VIDEO_IOCTL_REQUEST_TRACE: AtomicU64 = AtomicU64::new(0);
-static GDI_DRIVER_IMPORT_TRACE: AtomicU64 = AtomicU64::new(0);
 
 const LPC_SERVICE_PORT_HANDLE: u64 = 0x00;
 const LPC_SERVICE_OPERATION: u64 = 0x08;
@@ -1531,6 +1555,16 @@ unsafe fn provider_pool_lock() -> Option<ProviderPoolLockGuard> {
     Some(ProviderPoolLockGuard)
 }
 
+unsafe fn try_provider_pool_lock() -> Option<ProviderPoolLockGuard> {
+    if !provider_pool_ready() {
+        return None;
+    }
+    let lock = &*((WIN32K_POOL_VADDR + shared_pool::LOCK_OFFSET) as *const AtomicU64);
+    lock.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .ok()
+        .map(|_| ProviderPoolLockGuard)
+}
+
 unsafe fn provider_metadata_pool_lock() -> Option<(ProviderMetadataGuard, ProviderPoolLockGuard)> {
     if !provider_pool_ready() {
         return None;
@@ -1572,6 +1606,38 @@ pub fn provider_pool_census() -> ProviderPoolCensus {
     }
 }
 
+fn register_provider_allocation_observed(
+    catalog: &mut nt_provider_wait::ProviderAllocationCatalog,
+    arena: nt_provider_wait::ProviderArenaIdentity,
+    payload: u64,
+    capacity: u64,
+) -> bool {
+    match catalog.register(arena, payload, capacity) {
+        Ok(_) => true,
+        Err(nt_provider_wait::ProviderAllocationError::NoCapacity) => {
+            fn print_statistics(statistics: nt_provider_wait::ProviderAllocationStatistics) {
+                print_str(b" slots="); print_u64(statistics.slots as u64);
+                print_str(b" live="); print_u64(statistics.live as u64);
+                print_str(b" retiring="); print_u64(statistics.retiring as u64);
+                print_str(b" pins="); print_u64(statistics.pins as u64);
+                print_str(b"\n");
+            }
+            print_str(b"[provider-allocation-pressure] attempted-arena="); print_u64(arena.id);
+            print_str(b" generation="); print_u64(arena.generation);
+            print_str(b" address="); print_u64(payload);
+            print_str(b" capacity="); print_u64(capacity);
+            print_statistics(catalog.statistics());
+            for (arena, statistics) in catalog.arena_statistics() {
+                print_str(b"[provider-allocation-pressure] arena="); print_u64(arena.id);
+                print_str(b" generation="); print_u64(arena.generation);
+                print_statistics(statistics);
+            }
+            false
+        }
+        Err(_) => false,
+    }
+}
+
 unsafe fn provider_pool_alloc(size: u64, zero: bool) -> u64 {
     let Some(arena) = fixed_provider_arena_identity(PROVIDER_ARENA_SHARED_POOL_ID) else {
         return 0;
@@ -1588,8 +1654,12 @@ unsafe fn provider_pool_alloc(size: u64, zero: bool) -> u64 {
             Err(error) => Err(Failure::Native(error as u64)),
             Ok(allocation) => {
                 let payload = WIN32K_POOL_VADDR + allocation.payload_offset;
-                if provider_allocations_unlocked(&mut metadata)
-                    .is_some_and(|catalog| catalog.register(arena, payload, allocation.capacity).is_ok())
+                if shared_pool::validate_private_admission(&memory, allocation.identity).is_ok()
+                    && provider_allocations_unlocked(&mut metadata)
+                    .is_some_and(|catalog| {
+                        let _scope = crate::allocator::enter_scope(b"provider-allocation-register");
+                        register_provider_allocation_observed(catalog, arena, payload, allocation.capacity)
+                    })
                 {
                     Ok(payload)
                 } else if shared_pool::allocation_identity(&memory, allocation.payload_offset)
@@ -1665,7 +1735,55 @@ pub(crate) struct ProviderPoolPacketLease {
     length: usize,
     provider: nt_provider_wait::ProviderDomainIdentity,
     allocation: shared_pool::AllocationIdentity,
+    capacity: u64,
 }
+
+impl ProviderPoolPacketLease {
+    pub(crate) fn address(self) -> u64 { self.pointer }
+    pub(crate) fn native_identity(self) -> shared_pool::AllocationIdentity { self.allocation }
+    pub(crate) fn capacity(self) -> u64 { self.capacity }
+    pub(crate) fn provider_identity(self) -> nt_provider_wait::ProviderDomainIdentity { self.provider }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SharedPoolPin {
+    provider: nt_provider_wait::ProviderDomainIdentity,
+    allocation: shared_pool::AllocationIdentity,
+    native: shared_pool::ExclusivePin,
+}
+
+pub(crate) unsafe fn pin_root_provider_pool_packet(lease: ProviderPoolPacketLease)
+    -> Option<SharedPoolPin>
+{
+    if registered_provider_wait_domain() != Some(lease.provider) { return None; }
+    let _pool = provider_pool_lock()?;
+    let mut memory = ProviderPoolMemory;
+    let offset = lease.pointer - WIN32K_POOL_VADDR;
+    if shared_pool::allocation_identity(&memory, offset) != Ok(lease.allocation)
+        || shared_pool::allocation_capacity(&memory, offset) != Ok(lease.capacity) { return None; }
+    let native = shared_pool::pin_exclusive(&mut memory, lease.allocation).ok()?;
+    Some(SharedPoolPin { provider: lease.provider, allocation: lease.allocation, native })
+}
+
+pub(crate) unsafe fn retire_pinned_root_provider_pool_packet(
+    lease: ProviderPoolPacketLease, pin: SharedPoolPin,
+) -> bool {
+    if registered_provider_wait_domain() != Some(lease.provider)
+        || pin.provider != lease.provider || pin.allocation != lease.allocation { return false; }
+    let Some(_pool) = provider_pool_lock() else { return false; };
+    let mut memory = ProviderPoolMemory;
+    let offset = lease.pointer - WIN32K_POOL_VADDR;
+    if shared_pool::allocation_identity(&memory, offset) != Ok(lease.allocation)
+        || shared_pool::allocation_capacity(&memory, offset) != Ok(lease.capacity) { return false; }
+    // Validation and freeing are one physical-lock operation; never expose an unpinned gap.
+    shared_pool::retire_pinned(&mut memory, pin.native).is_ok()
+}
+
+mod root_pool;
+pub(crate) use root_pool::{RootProviderPoolAllocation, allocate_root_provider_pool_allocation,
+    retire_root_provider_pool_allocation, RootPoolError,
+    try_allocate_root_provider_pool_allocation, try_retire_root_provider_pool_allocation,
+    try_capture_root_provider_pool_packet, try_publish_root_provider_pool_packet};
 
 pub(crate) unsafe fn capture_provider_pool_packet(
     pointer: u64,
@@ -1689,7 +1807,41 @@ pub(crate) unsafe fn capture_provider_pool_packet(
     bytes.try_reserve_exact(length).map_err(|_| STATUS_INSUFFICIENT_RESOURCES_I32 as u32)?;
     bytes.resize(length, 0);
     core::ptr::copy_nonoverlapping(pointer as *const u8, bytes.as_mut_ptr(), length);
-    Ok((ProviderPoolPacketLease { pointer, length, provider, allocation }, bytes))
+    Ok((ProviderPoolPacketLease { pointer, length, provider, allocation, capacity }, bytes))
+}
+
+pub(crate) unsafe fn allocate_root_provider_pool_packet(
+    length: usize,
+) -> Option<(ProviderPoolPacketLease, Vec<u8>)> {
+    if length == 0 || length as u64 >= WIN32K_POOL_FRAMES * 0x1000 {
+        return None;
+    }
+    let provider = registered_provider_wait_domain()?;
+    let _guard = provider_pool_lock()?;
+    let mut memory = ProviderPoolMemory;
+    let native = shared_pool::allocate(&mut memory, length as u64, true).ok()?;
+    let pointer = WIN32K_POOL_VADDR + native.payload_offset;
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(length).is_err() {
+        shared_pool::free(&mut memory, native.payload_offset).ok()?;
+        return None;
+    }
+    bytes.resize(length, 0);
+    Some((ProviderPoolPacketLease {
+        pointer, length, provider, allocation: native.identity, capacity: native.capacity,
+    }, bytes))
+}
+
+pub(crate) unsafe fn retire_root_provider_pool_packet(lease: ProviderPoolPacketLease) -> bool {
+    if registered_provider_wait_domain() != Some(lease.provider) {
+        return false;
+    }
+    let Some(_guard) = provider_pool_lock() else { return false };
+    let mut memory = ProviderPoolMemory;
+    let offset = lease.pointer - WIN32K_POOL_VADDR;
+    shared_pool::allocation_identity(&memory, offset) == Ok(lease.allocation)
+        && shared_pool::allocation_capacity(&memory, offset) == Ok(lease.capacity)
+        && shared_pool::free(&mut memory, offset).is_ok()
 }
 
 pub(crate) unsafe fn publish_provider_pool_packet(
@@ -1718,7 +1870,9 @@ pub(crate) unsafe fn provider_pool_packet_lease_live(lease: ProviderPoolPacketLe
     if registered_provider_wait_domain() != Some(lease.provider) {
         return false;
     }
-    let Some(_guard) = provider_pool_lock() else { return false };
+    // Root can hold the provider's execution while it owns this physical lock.
+    // Busy means not revalidated now, not permission to retire or discard the lease.
+    let Some(_guard) = try_provider_pool_lock() else { return false };
     let offset = lease.pointer - WIN32K_POOL_VADDR;
     let memory = ProviderPoolMemory;
     shared_pool::allocation_identity(&memory, offset) == Ok(lease.allocation)
@@ -1789,6 +1943,7 @@ unsafe fn release_reserved_provider_pool(
     retirement: ProviderPoolRetirement,
     reclaim: Option<nt_kernel_exec::ProviderEventProjectionReclaim>,
 ) -> bool {
+    let provider = registered_provider_wait_domain();
     for allocation in retirement.allocations.iter().copied() {
         if !retire_provider_allocation_events(allocation) {
             print_str(b"[win32k-host] fatal provider-pool Event retirement commit failure\n");
@@ -1832,7 +1987,49 @@ unsafe fn release_reserved_provider_pool(
         print_str(b"[win32k-host] fatal provider-pool release commit failure\n");
         park();
     }
+    for (index, &pointer) in retirement.pointers.iter().enumerate() {
+        record_provider_allocation_free(
+            provider, pointer, retirement.shared_identities[index], retirement.allocations[index],
+        );
+    }
     true
+}
+
+fn record_provider_allocation_free(
+    provider: Option<nt_provider_wait::ProviderDomainIdentity>,
+    address: u64,
+    native: shared_pool::AllocationIdentity,
+    allocation: nt_provider_wait::ProviderAllocationSnapshot,
+) {
+    #[cfg(feature = "source-irp-integration")]
+    {
+        let Some(provider) = provider else { return; };
+        print_str(b"[source-receipt] allocation-free provider="); print_u64(provider.domain);
+        print_str(b" generation="); print_u64(provider.generation);
+        print_str(b" address="); print_u64(address);
+        print_str(b" native-id="); print_u64(native.allocation_id);
+        print_str(b" native-generation="); print_u64(native.allocation_generation);
+        print_str(b" arena="); print_u64(allocation.identity.arena.id);
+        print_str(b" arena-generation="); print_u64(allocation.identity.arena.generation);
+        print_str(b" catalog-id="); print_u64(allocation.identity.allocation_id);
+        print_str(b" catalog-generation="); print_u64(allocation.identity.generation);
+        print_str(b"\n");
+    }
+    #[cfg(not(feature = "source-irp-integration"))]
+    let _ = (provider, address, native, allocation);
+}
+
+pub(crate) fn record_device_pointer_dereference_ack(address: u64, count: u64) {
+    #[cfg(feature = "source-irp-integration")]
+    {
+        let Some(provider) = registered_provider_wait_domain() else { return; };
+        print_str(b"[source-receipt] pdo-dereference-ack provider="); print_u64(provider.domain);
+        print_str(b" generation="); print_u64(provider.generation);
+        print_str(b" address="); print_u64(address);
+        print_str(b" count="); print_u64(count); print_str(b"\n");
+    }
+    #[cfg(not(feature = "source-irp-integration"))]
+    let _ = (address, count);
 }
 
 unsafe fn provider_pool_free(p: u64) -> bool {
@@ -1843,11 +2040,6 @@ pub(crate) unsafe fn property_pool_free(p: u64) {
     if !provider_pool_free(p) {
         panic!("device-property snapshot pool ownership failure");
     }
-}
-
-/// Release an executive-owned consumer projection only after its canonical receipts retire.
-pub(crate) unsafe fn release_consumer_projection(address: u64, size: u64) -> bool {
-    size != 0 && provider_pool_release_owned(&[(address, size)])
 }
 
 unsafe fn provider_pool_note_invalid_free() {
@@ -1961,7 +2153,10 @@ unsafe fn reclaiming_pool_alloc(size: u64) -> u64 {
         park();
     };
     if provider_allocations_unlocked(&mut metadata)
-        .is_some_and(|allocations| allocations.register(arena, payload, capacity).is_ok())
+        .is_some_and(|allocations| {
+            let _scope = crate::allocator::enter_scope(b"provider-allocation-register");
+            register_provider_allocation_observed(allocations, arena, payload, capacity)
+        })
     {
         payload
     } else {
@@ -3220,8 +3415,11 @@ extern "win64" fn s_ps_get_thread_process(thread: u64) -> u64 {
 }
 
 unsafe fn win32k_ps_broker_call(op: u64, object: u64, value: u64) -> (i32, u64, u64, u64) {
-    let (_label, status, out1, out2, out3) =
-        crate::driver_launch::call_on4((W32_PS_LABEL << 12) | 3, op, object, value, 0);
+    let (words, status, out1, out2, out3) =
+        crate::driver_launch::call_on4_raw((W32_PS_LABEL << 12) | 3, op, object, value, 0);
+    if words != 4 {
+        crate::provider_bugcheck::report(0xc4, [W32_PS_LABEL, object, words, status]);
+    }
     (status as u32 as i32, out1, out2, out3)
 }
 
@@ -3897,6 +4095,7 @@ mod directory_object;
 mod file_close;
 mod file_open;
 mod section_create;
+mod mm_section;
 mod section_map;
 mod section_unmap;
 mod file_query;
@@ -3946,17 +4145,18 @@ fn classify_type(obj_type: u64) -> Option<ObKind> {
 }
 
 unsafe fn ps_projection_object_type(object: u64) -> Option<u64> {
-    let system = crate::ps_bootstrap::initial_system_projection();
-    if process_context_index_for_eprocess(object).is_some()
-        || system.is_some_and(|system| system.process_body == object)
-    {
-        Some(nt_object_manager::object_type::process_object_type_addr())
-    } else if thread_context_index_for_ethread(object).is_some()
-        || system.is_some_and(|system| system.thread_body == object)
-    {
-        Some(nt_object_manager::object_type::thread_object_type_addr())
-    } else {
-        None
+    let (status, kind, _, _) = win32k_ps_broker_call(W32_PS_OP_QUERY_OBJECT_KIND, object, 0);
+    if status != 0 {
+        crate::provider_bugcheck::report(
+            0xc4,
+            [W32_PS_LABEL, object, status as u32 as u64, kind],
+        );
+    }
+    match kind {
+        0 => None,
+        1 => Some(nt_object_manager::object_type::process_object_type_addr()),
+        2 => Some(nt_object_manager::object_type::thread_object_type_addr()),
+        _ => crate::provider_bugcheck::report(0xc4, [W32_PS_LABEL, object, 0, kind]),
     }
 }
 
@@ -4007,10 +4207,7 @@ extern "win64" fn s_ob_reference_object_by_pointer(
         s_ob_reference_object(object);
         return 0;
     }
-    if unsafe {
-        token_context_index(object).is_some()
-            || crate::video_device::video_file_projection_contains(object)
-    } {
+    if unsafe { token_context_index(object).is_some() } || provider_pool_contains(object) {
         if object_type != 0 {
             return STATUS_OBJECT_TYPE_MISMATCH;
         }
@@ -4050,11 +4247,12 @@ extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
             .unwrap_or_else(|status| reject_ps_broker("token pointer retain", status))
             as u64;
     }
-    if unsafe { crate::video_device::video_file_projection_contains(object) } {
-        return unsafe { crate::video_device::reference_video_file_pointer(object) }
-        .unwrap_or_else(|status| panic!("video projection retain failed: {status:#010x}"));
-    }
     if provider_pool_contains(object) {
+        match unsafe { mm_section::reference(object, false) } {
+            Ok(count) => return count,
+            Err(STATUS_INVALID_HANDLE_I32) => {},
+            Err(status) => panic!("Section pointer retain failed: {status:#010x}"),
+        }
         let (file_status, file_count, _, _) = unsafe {
             win32k_file_object_broker_call(W32_FILE_OBJECT_REFERENCE_POINTER, object, 0, 0)
         };
@@ -4133,11 +4331,12 @@ extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
             .unwrap_or_else(|status| reject_ps_broker("token pointer release", status))
             as u64;
     }
-    if unsafe { crate::video_device::video_file_projection_contains(object) } {
-        return unsafe { crate::video_device::release_video_file_projection(object) }
-            .unwrap_or_else(|status| panic!("video projection release failed: {status:#010x}"));
-    }
     if provider_pool_contains(object) {
+        match unsafe { mm_section::reference(object, true) } {
+            Ok(count) => return count,
+            Err(STATUS_INVALID_HANDLE_I32) => {},
+            Err(status) => panic!("Section pointer release failed: {status:#010x}"),
+        }
         let (file_status, file_count, _, _) = unsafe {
             win32k_file_object_broker_call(W32_FILE_OBJECT_DEREFERENCE_POINTER, object, 0, 0)
         };
@@ -4150,7 +4349,14 @@ extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
     }
     if !provider_event_projection_contains(object) {
         return unsafe { crate::driver_launch::win32k_device_pointers::dereference(object) }
-            .unwrap_or_else(|status| panic!("Device pointer dereference failed: {status:#010x}"));
+            .unwrap_or_else(|status| {
+                print_str(b"[win32k-device-dereference-rejected] object=");
+                print_hex_u64(object);
+                print_str(b" status=");
+                print_hex_u64(u64::from(status as u32));
+                print_str(b"\n");
+                panic!("Device pointer dereference failed: {status:#010x}")
+            });
     }
     let (status, count, _, _) =
         unsafe { win32k_event_broker_call(W32_EVENT_OP_DEREFERENCE, object, 0, 0) };
@@ -4369,7 +4575,6 @@ unsafe fn finish_provider_stack_event_activation(
     }
     file_read::release_completed_for_activation(activation);
     file_ioctl::release_completed_for_activation(activation);
-    source_irp_call::release_completed_for_activation(activation);
     // Event retirement may broker IPC. Keep no catalog borrow across reentrant execution.
     if !retire_provider_local_events_for_backing(activation.backing()) {
         return false;
@@ -4674,7 +4879,7 @@ unsafe fn provider_local_event_signal_lease_or_park(
 
 unsafe fn provider_local_event_call(event: u64, op: u64) -> (u64, u64) {
     let lease = provider_local_event_signal_lease_or_park(event);
-    let (status, out1, out2, _) = win32k_event_broker_call(op, lease.id.raw(), 0, 0);
+    let (status, out1, out2, sequence) = win32k_event_broker_call(op, lease.id.raw(), 0, 0);
     if status != 0 {
         print_str(b"[win32k-event] canonical local Event operation failed\n");
         park();
@@ -4687,7 +4892,11 @@ unsafe fn provider_local_event_call(event: u64, op: u64) -> (u64, u64) {
     };
     let released = {
         let _metadata = ProviderMetadataGuard::acquire();
-        mirror_projected_event_state(event, signaled);
+        let apply = provider_local_events_mut().expect("local Event catalog disappeared")
+            .observe_state(lease, sequence, signaled).unwrap_or_else(|_| {
+                crate::provider_bugcheck::report(0xc4, [W32_EVENT_LABEL, lease.id.raw(), sequence, 96])
+            });
+        if apply { mirror_projected_event_state(event, signaled); }
         provider_local_events_mut()
             .expect("local Event catalog disappeared")
             .release_lease(lease)
@@ -5771,22 +5980,7 @@ unsafe fn registered_kernel_image_containing(address: u64) -> Option<(u64, &'sta
     {
         (WIN32K_CODE_VA, WIN32K_IMAGE_BYTES as usize)
     } else {
-        let records = GDI_DRIVER_RECORDS_PTR.load(Ordering::Acquire);
-        let count = GDI_DRIVER_RECORDS_LEN.load(Ordering::Acquire);
-        let mut found = (0u64, 0usize);
-        if records != 0 {
-            for index in 0..count {
-                let record = read_volatile(gdi_driver_record_ptr(records, index));
-                let Some(end) = record.image.checked_add(u64::from(record.image_len)) else {
-                    continue;
-                };
-                if (record.image..end).contains(&address) {
-                    found = (record.image, record.image_len as usize);
-                    break;
-                }
-            }
-        }
-        found
+        gdi_images::image_containing(address).unwrap_or((0, 0))
     };
     if length == 0 {
         None
@@ -7677,7 +7871,10 @@ unsafe fn heap_alloc_in(
         park();
     };
     let registered = provider_allocations_unlocked(&mut metadata)
-        .is_some_and(|allocations| allocations.register(arena, payload, capacity).is_ok());
+        .is_some_and(|allocations| {
+            let _scope = crate::allocator::enter_scope(b"provider-allocation-register");
+            register_provider_allocation_observed(allocations, arena, payload, capacity)
+        });
     if registered {
         payload
     } else {
@@ -8494,14 +8691,14 @@ unsafe fn publish_gui_client_info_for_dispatch(
         .map(|(_, pin)| pin)
         .unwrap_or_else(|| crate::provider_bugcheck::report(0xc4, [W32_GUI_CLIENT_INFO_LABEL, address, 6, 0]));
     write_volatile(address as *mut Win32kGuiClientInfoPacket, packet);
-    let (words, raw, m1, m2, m3) = crate::driver_launch::call_on4_raw(
+    let (words, raw, _, _, _) = crate::driver_launch::call_on4_raw(
         (W32_GUI_CLIENT_INFO_LABEL << 12) | 4,
         address,
         bytes,
         0,
         0,
     );
-    if words != 1 || raw != 0 || m1 != 0 || m2 != 0 || m3 != 0 {
+    if words != 1 || raw != 0 {
         crate::provider_bugcheck::report(0xc4, [W32_GUI_CLIENT_INFO_LABEL, address, words, raw]);
     }
     release_provider_allocation_pin_or_park(packet_pin);
@@ -8750,28 +8947,39 @@ unsafe fn section_view(section: u64, _size_hint: u64) -> (u64, u64) {
     (map_section(section as *mut u8, |s| heap_alloc(s, true)), sz)
 }
 
-/// `NTSTATUS MmCreateSection(PVOID *SectionObject, ACCESS_MASK, POBJECT_ATTRIBUTES, PLARGE_INTEGER
-/// MaximumSize, ULONG SectionPageProtection, ULONG AllocationAttributes, HANDLE FileHandle,
-/// PFILE_OBJECT FileObject)` — win32k's `UserCreateHeap` creates the global USER-heap section here.
-/// Allocate a real [`session_section`](nt_memory_manager::session_section) descriptor from the pool
-/// and write it to `*SectionObject` (a no-op stub left it null → `MapGlobalUserHeap` later asserted).
+/// Kernel Section creation preserves FileObject authority and real file backing. Anonymous
+/// session heaps retain their coherent server/client aliases in the shared USER heap arena.
 extern "win64" fn s_mm_create_section(
     section_out: *mut u64,
-    _access: u64,
-    _obj_attr: u64,
+    access: u32,
+    obj_attr: u64,
     max_size: *const i64,
+    protection: u32,
+    allocation_attributes: u32,
+    file_handle: u64,
+    file_object: u64,
 ) -> i32 {
     unsafe {
-        let size = if max_size.is_null() {
-            0x0010_0000
-        } else {
-            read_unaligned(max_size) as u64
-        };
+        if section_out.is_null() { return STATUS_ACCESS_VIOLATION_I32; }
+        // Mm's legacy internal flag is consumed before the Section creation policy.
+        let allocation_attributes = allocation_attributes & !1;
+        if file_handle != 0 || file_object != 0 {
+            return mm_section::create(section_out, access, obj_attr, max_size as u64,
+                protection, allocation_attributes, file_handle, file_object);
+        }
+        if max_size.is_null() { return 0xc000_00f2u32 as i32; }
+        let size = read_unaligned(max_size);
+        if size <= 0 || (size as u64).checked_add(0xfff).is_none() {
+            return 0xc000_00f2u32 as i32;
+        }
+        if obj_attr != 0 || protection != nt_address_space::PAGE_READWRITE
+            || !matches!(allocation_attributes, 0x0400_0000 | 0x0800_0000)
+        { return STATUS_NOT_SUPPORTED_I32; }
         let desc = pool_alloc(section_object::SIZE_OF as u64);
         if desc == 0 {
             return STATUS_NO_MEMORY;
         }
-        init_section(desc as *mut u8, size);
+        init_section(desc as *mut u8, size as u64);
         register_section_descriptor(desc);
         if !section_out.is_null() {
             write_unaligned(section_out, desc);
@@ -8790,7 +8998,13 @@ extern "win64" fn s_mm_unmap_view_of_section(_process: u64, base: u64) -> i32 {
 
 /// `NTSTATUS MmUnmapViewInSessionSpace(PVOID MappedBase)` / `MmUnmapViewInSystemSpace`.
 extern "win64" fn s_mm_unmap_view_in_space(base: u64) -> i32 {
-    unsafe { unmap_section_view_addr(base) }
+    unsafe {
+        if find_section_for_view_addr(base) != 0 {
+            unmap_section_view_addr(base)
+        } else {
+            mm_section::unmap(base)
+        }
+    }
 }
 
 /// `MmMapViewInSessionSpace/MmMapViewInSystemSpace(Section, PVOID *MappedBase, PSIZE_T ViewSize)`
@@ -8799,12 +9013,24 @@ extern "win64" fn s_mm_unmap_view_in_space(base: u64) -> i32 {
 /// + `*ViewSize` (a no-op stub left `*MappedBase` null → memset(null)).
 extern "win64" fn s_mm_map_view(section: u64, base_out: *mut u64, size_io: *mut u64) -> i32 {
     unsafe {
+        if base_out.is_null() || size_io.is_null() { return STATUS_ACCESS_VIOLATION_I32; }
         let hint = if size_io.is_null() {
             0
         } else {
             read_volatile(size_io)
         };
-        let (base, size) = section_view(section, hint);
+        let mut descriptor = WIN32K_SECTION_LIST_HEAD.load(Ordering::Acquire);
+        while descriptor != 0 && descriptor != section {
+            descriptor = section_next(descriptor as *const u8);
+        }
+        let (base, size) = if descriptor == section && section != 0 {
+            section_view(section, hint)
+        } else {
+            match mm_section::map(section, hint) {
+                Ok(view) => view,
+                Err(status) => return status,
+            }
+        };
         if base == 0 {
             return STATUS_NO_MEMORY;
         }
@@ -8814,7 +9040,7 @@ extern "win64" fn s_mm_map_view(section: u64, base_out: *mut u64, size_io: *mut 
         if !size_io.is_null() {
             write_volatile(size_io, size);
         }
-        if size >= GDI_HANDLE_COUNT * GDI_TABLE_ENTRY_SIZE && size < 0x0020_0000 {
+        if descriptor != 0 && size >= GDI_HANDLE_COUNT * GDI_TABLE_ENTRY_SIZE && size < 0x0020_0000 {
             write_volatile((WIN32K_SHARED_VADDR + SH_GDI_TABLE_BASE) as *mut u64, base);
             write_volatile((WIN32K_SHARED_VADDR + SH_GDI_TABLE_SIZE) as *mut u64, size);
         }
@@ -9501,6 +9727,18 @@ pub(crate) unsafe fn current_thread_queue_event_body() -> Option<u64> {
 /// Current process identity for the explicitly selected initialization or hosted caller.
 extern "win64" fn s_current_process_id() -> u64 {
     WIN32K_CURRENT_PROCESS_ID.load(Ordering::Relaxed)
+}
+
+/// Thread ownership does not change when its APC environment attaches to another process.
+extern "win64" fn s_current_thread_process_id() -> u64 {
+    unsafe {
+        let thread = current_ethread();
+        if thread == 0 {
+            crate::provider_bugcheck::report(0xc4, [0x5053434944, thread, 0, 1]);
+        }
+        read_volatile((thread + nt_kernel_abi::ps_reactos_x64::ETHREAD_CLIENT_ID_PROCESS as u64)
+            as *const u64)
+    }
 }
 
 unsafe fn zero_region(base: u64, size: u64) {
@@ -10284,20 +10522,21 @@ unsafe fn current_ethread() -> u64 {
 }
 
 unsafe fn current_w32process() -> u64 {
-    let Some(index) = current_process_context_index() else {
+    let eprocess = current_eprocess();
+    if eprocess == 0 {
         return 0;
-    };
-    let eprocess = process_ctx_eprocess(index);
-    if eprocess != 0 {
-        let field = read_volatile((eprocess + EPROCESS_WIN32PROCESS_OFF) as *const u64);
+    }
+    let field = read_volatile((eprocess + EPROCESS_WIN32PROCESS_OFF) as *const u64);
+    if let Some(index) = process_context_index_for_eprocess(eprocess) {
         if field != 0 {
             if process_ctx_w32process(index) == 0 {
                 set_process_ctx_w32process(index, field);
             }
             return field;
         }
+        return process_ctx_w32process(index);
     }
-    process_ctx_w32process(index)
+    field
 }
 
 unsafe fn current_w32thread() -> u64 {
@@ -10996,6 +11235,11 @@ unsafe fn record_process_client_peb(process_index: usize, client_peb: u64) {
 }
 
 unsafe fn initialize_eprocess_body(eprocess: u64, process_id: u64, client_peb: u64) {
+    // Published Ps bodies already carry their identity and PEB. Only win32k-owned compatibility
+    // bodies need this local layout; rewriting a canonical body would corrupt its owner state.
+    if crate::ps_object_backing::contains_address(eprocess) {
+        return;
+    }
     let q = eprocess + 0x900;
     let zstr = eprocess + 0xA00;
     let synthetic_peb = eprocess + 0x800;
@@ -11346,9 +11590,15 @@ unsafe fn restore_current_context_for_user_callback_resume_inner(
     WIN32K_CURRENT_THREAD_ID.store(tid, Ordering::Relaxed);
     prepare_ethread_for_win32k_callout(thread_index, teb);
     write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, teb);
-    write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, eprocess);
+    write_volatile(
+        (WIN32K_KPCR_VA + 0x60) as *mut u64,
+        process_attach::selected_process(ethread, eprocess),
+    );
     write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, ethread);
-    write_volatile(SLOT_W32PROCESS as *mut u64, w32process);
+    write_volatile(
+        SLOT_W32PROCESS as *mut u64,
+        process_attach::selected_win32process(ethread, eprocess, w32process),
+    );
     write_volatile(SLOT_W32THREAD as *mut u64, w32thread);
     write_volatile((ethread + KTHREAD_WIN32THREAD_OFF) as *mut u64, w32thread);
     write_volatile(w32thread as *mut u64, ethread);
@@ -11562,11 +11812,18 @@ unsafe fn select_win32k_client_context(
     WIN32K_CURRENT_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
     WIN32K_CURRENT_PROCESS_ID.store(pid, Ordering::Relaxed);
     WIN32K_CURRENT_THREAD_ID.store(tid, Ordering::Relaxed);
-    write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, eprocess);
+    write_volatile(
+        (WIN32K_KPCR_VA + 0x60) as *mut u64,
+        process_attach::selected_process(ethread, eprocess),
+    );
     write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, ethread);
     write_volatile(
         SLOT_W32PROCESS as *mut u64,
-        process_ctx_w32process(process_index),
+        process_attach::selected_win32process(
+            ethread,
+            eprocess,
+            process_ctx_w32process(process_index),
+        ),
     );
     write_volatile(
         SLOT_W32THREAD as *mut u64,
@@ -12575,216 +12832,11 @@ extern "win64" fn s_wcsnicmp(a: u64, b: u64, n: u64) -> i32 {
     0
 }
 
-/// `NTSTATUS ZwSetSystemInformation(SYSTEM_INFORMATION_CLASS, PVOID, ULONG)`. win32k's
-/// `LDEVOBJ_bLoadImage` loads a GDI driver by calling this with class
-/// `SystemLoadGdiDriverInformation` (26) + a `SYSTEM_GDI_DRIVER_INFORMATION` whose DriverName it
-/// filled; the "kernel" loads the driver + fills ImageAddress/EntryPoint/ExportSectionPointer/etc.
-/// The executive registers each hosted GDI driver image as it is loaded, and this import resolves
-/// only against that registered state (offsets: DriverName@0, ImageAddress@0x10,
-/// SectionPointer@0x18, EntryPoint@0x20, ExportSectionPointer@0x28, ImageLength@0x30). Other
-/// classes → benign success.
-/// Case-insensitive: does the wide DriverName [name_buf, +name_len bytes) end with the ASCII tail?
-unsafe fn wname_ends_with(name_buf: u64, name_len: usize, tail: &[u8]) -> bool {
-    if name_buf == 0 || name_len < tail.len() * 2 {
-        return false;
-    }
-    for (k, &wc) in tail.iter().enumerate() {
-        let off = name_buf + (name_len as u64 - (tail.len() - k) as u64 * 2);
-        let c = read_unaligned(off as *const u16);
-        let lc = if (b'A' as u16..=b'Z' as u16).contains(&c) {
-            c + 32
-        } else {
-            c
-        };
-        if lc != wc as u16 {
-            return false;
-        }
-    }
-    true
-}
 
-const GDI_DRIVER_LEAF_CAP: usize = 24;
-
-#[derive(Clone, Copy)]
-struct GdiDriverRecord {
-    leaf: [u8; GDI_DRIVER_LEAF_CAP],
-    leaf_len: u8,
-    image: u64,
-    entry: u64,
-    expdir: u64,
-    image_len: u32,
-}
-
-impl GdiDriverRecord {
-    const EMPTY: Self = Self {
-        leaf: [0; GDI_DRIVER_LEAF_CAP],
-        leaf_len: 0,
-        image: 0,
-        entry: 0,
-        expdir: 0,
-        image_len: 0,
-    };
-
-    fn leaf_bytes(&self) -> &[u8] {
-        &self.leaf[..self.leaf_len as usize]
-    }
-}
-
-const GDI_DRIVER_RECORD_INITIAL_CAP: u64 = 4;
-static GDI_DRIVER_RECORDS_PTR: AtomicU64 = AtomicU64::new(0);
-static GDI_DRIVER_RECORDS_LEN: AtomicU64 = AtomicU64::new(0);
-static GDI_DRIVER_RECORDS_CAP: AtomicU64 = AtomicU64::new(0);
-
-fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    for i in 0..a.len() {
-        if a[i].to_ascii_lowercase() != b[i].to_ascii_lowercase() {
-            return false;
-        }
-    }
-    true
-}
-
-unsafe fn gdi_driver_record_ptr(base: u64, index: u64) -> *mut GdiDriverRecord {
-    (base + index * core::mem::size_of::<GdiDriverRecord>() as u64) as *mut GdiDriverRecord
-}
-
-unsafe fn ensure_gdi_driver_record_capacity(required: u64) -> bool {
-    let cap = GDI_DRIVER_RECORDS_CAP.load(Ordering::Relaxed);
-    if cap >= required {
-        return true;
-    }
-    let mut new_cap = if cap == 0 {
-        GDI_DRIVER_RECORD_INITIAL_CAP
-    } else {
-        cap.saturating_mul(2)
-    };
-    while new_cap < required {
-        let next = new_cap.saturating_mul(2);
-        if next <= new_cap {
-            return false;
-        }
-        new_cap = next;
-    }
-    let Some(bytes) = (core::mem::size_of::<GdiDriverRecord>() as u64).checked_mul(new_cap) else {
-        return false;
-    };
-    let new_base = pool_alloc(bytes);
-    if new_base == 0 {
-        return false;
-    }
-    let old_base = GDI_DRIVER_RECORDS_PTR.load(Ordering::Relaxed);
-    let len = GDI_DRIVER_RECORDS_LEN.load(Ordering::Relaxed);
-    if old_base != 0 {
-        for index in 0..len {
-            let rec = read_volatile(gdi_driver_record_ptr(old_base, index));
-            write_volatile(gdi_driver_record_ptr(new_base, index), rec);
-        }
-    }
-    GDI_DRIVER_RECORDS_PTR.store(new_base, Ordering::Relaxed);
-    GDI_DRIVER_RECORDS_CAP.store(new_cap, Ordering::Relaxed);
-    true
-}
-
-fn register_gdi_driver_image(
-    leaf: &[u8],
-    image: u64,
-    entry: u64,
-    expdir: u64,
-    image_len: u32,
-) -> bool {
-    if leaf.is_empty() || leaf.len() > GDI_DRIVER_LEAF_CAP || image == 0 || image_len == 0 {
-        return false;
-    }
-    let record = registered_gdi_driver_record(leaf, image, entry, expdir, image_len);
-    unsafe {
-        let len = GDI_DRIVER_RECORDS_LEN.load(Ordering::Relaxed);
-        let base = GDI_DRIVER_RECORDS_PTR.load(Ordering::Relaxed);
-        if base != 0 {
-            for index in 0..len {
-                let ptr = gdi_driver_record_ptr(base, index);
-                let rec = read_volatile(ptr);
-                if ascii_eq_ignore_case(rec.leaf_bytes(), leaf) {
-                    write_volatile(ptr, record);
-                    return true;
-                }
-            }
-        }
-        let Some(required) = len.checked_add(1) else {
-            return false;
-        };
-        if !ensure_gdi_driver_record_capacity(required) {
-            return false;
-        }
-        let base = GDI_DRIVER_RECORDS_PTR.load(Ordering::Relaxed);
-        if base == 0 {
-            return false;
-        }
-        write_volatile(gdi_driver_record_ptr(base, len), record);
-        GDI_DRIVER_RECORDS_LEN.store(required, Ordering::Relaxed);
-        true
-    }
-}
-
-fn registered_gdi_driver_record(
-    leaf: &[u8],
-    image: u64,
-    entry: u64,
-    expdir: u64,
-    image_len: u32,
-) -> GdiDriverRecord {
-    let mut rec = GdiDriverRecord::EMPTY;
-    rec.leaf_len = leaf.len() as u8;
-    for (idx, &b) in leaf.iter().enumerate() {
-        rec.leaf[idx] = b.to_ascii_lowercase();
-    }
-    rec.image = image;
-    rec.entry = entry;
-    rec.expdir = expdir;
-    rec.image_len = image_len;
-    rec
-}
-
-unsafe fn registered_gdi_driver_for_name(
-    name_buf: u64,
-    name_len: usize,
-) -> Option<GdiDriverRecord> {
-    let base = GDI_DRIVER_RECORDS_PTR.load(Ordering::Relaxed);
-    let len = GDI_DRIVER_RECORDS_LEN.load(Ordering::Relaxed);
-    if base == 0 {
-        return None;
-    }
-    for index in 0..len {
-        let rec = read_volatile(gdi_driver_record_ptr(base, index));
-        if wname_ends_with(name_buf, name_len, rec.leaf_bytes()) {
-            return Some(rec);
-        }
-    }
-    None
-}
-
-fn registered_gdi_driver_for_leaf(leaf: &[u8]) -> Option<GdiDriverRecord> {
-    unsafe {
-        let base = GDI_DRIVER_RECORDS_PTR.load(Ordering::Relaxed);
-        let len = GDI_DRIVER_RECORDS_LEN.load(Ordering::Relaxed);
-        if base == 0 {
-            return None;
-        }
-        for index in 0..len {
-            let rec = read_volatile(gdi_driver_record_ptr(base, index));
-            if ascii_eq_ignore_case(rec.leaf_bytes(), leaf) {
-                return Some(rec);
-            }
-        }
-    }
-    None
-}
-
-pub(crate) fn gdi_driver_registered(leaf: &[u8]) -> bool {
-    registered_gdi_driver_for_leaf(leaf).is_some()
-}
+#[path = "win32k_subsystem/gdi_images.rs"]
+mod gdi_images;
+use gdi_images::*;
+pub(crate) use gdi_images::{register_gdi_driver_image, gdi_driver_registered};
 
 unsafe fn gdi_driver_leaf_from_wname(
     name_buf: u64,
@@ -12816,75 +12868,20 @@ unsafe fn gdi_driver_leaf_from_wname(
     Some(leaf_chars)
 }
 
-unsafe fn request_gdi_driver_load(leaf: &[u8]) -> i32 {
-    if leaf.is_empty() || leaf.len() > SH_GDI_LOAD_LEAF_CAP {
-        return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
-    }
-    write_volatile(
-        (WIN32K_SHARED_VADDR + SH_GDI_LOAD_LEAF_LEN) as *mut u64,
-        leaf.len() as u64,
-    );
-    write_volatile(
-        (WIN32K_SHARED_VADDR + SH_GDI_LOAD_STATUS) as *mut i32,
-        0x0000_0103, // STATUS_PENDING, overwritten by the executive before reply.
-    );
-    for i in 0..SH_GDI_LOAD_LEAF_CAP {
-        let b = if i < leaf.len() {
-            leaf[i].to_ascii_lowercase()
-        } else {
-            0
-        };
-        write_volatile(
-            (WIN32K_SHARED_VADDR + SH_GDI_LOAD_LEAF + i as u64) as *mut u8,
-            b,
-        );
-    }
-    let (_label, _tag, _, _, _) = crate::driver_launch::call_on(W32_GDI_LOAD_LABEL << 12);
-    read_volatile((WIN32K_SHARED_VADDR + SH_GDI_LOAD_STATUS) as *const i32)
+#[path = "win32k_subsystem/gdi_image_call.rs"]
+mod gdi_image_call;
+
+extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, len: u64) -> i32 {
+    let _mode = unsafe { thread_execution::PreviousModeScope::enter(nt_kernel_abi::ps_reactos_x64::ThreadPreviousMode::KernelMode) };
+    unsafe { gdi_image_call::set_information(class, buf, len) }
 }
 
-extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -> i32 {
-    const SYSTEM_LOAD_GDI_DRIVER_INFORMATION: u64 = 26;
-    if class != SYSTEM_LOAD_GDI_DRIVER_INFORMATION || buf == 0 {
-        return 0; // STATUS_SUCCESS (unmodelled classes are no-ops)
-    }
-    unsafe {
-        // Read DriverName (UNICODE_STRING @ buf+0: u16 Length, u16 Max, u32 pad, u64 Buffer).
-        let name_len = read_unaligned(buf as *const u16) as usize;
-        let name_buf = read_unaligned((buf + 8) as *const u64);
-        let mut requested_leaf = [0u8; GDI_DRIVER_LEAF_CAP];
-        if let Some(leaf_len) = gdi_driver_leaf_from_wname(name_buf, name_len, &mut requested_leaf)
-        {
-            let leaf = &requested_leaf[..leaf_len];
-            if !gdi_driver_registered(leaf) {
-                let status = request_gdi_driver_load(leaf);
-                if status != 0 {
-                    return status;
-                }
-            }
-        }
-        let Some(driver) = registered_gdi_driver_for_name(name_buf, name_len) else {
-            print_str(b"[win32k gdidrv] ZwSetSystemInformation(GdiDriver) unknown driver\n");
-            return 0xC000_0135u32 as i32; // STATUS_DLL_NOT_FOUND
-        };
-        if driver.image == 0 {
-            return 0xC000_0135u32 as i32;
-        }
-        write_unaligned((buf + 0x10) as *mut u64, driver.image); // ImageAddress
-        write_unaligned((buf + 0x18) as *mut u64, driver.image); // SectionPointer (non-null placeholder)
-        write_unaligned((buf + 0x20) as *mut u64, driver.entry); // EntryPoint (= DrvEnableDriver for display DLL)
-        write_unaligned((buf + 0x28) as *mut u64, driver.expdir); // ExportSectionPointer
-        write_unaligned((buf + 0x30) as *mut u32, driver.image_len); // ImageLength
-        print_str(b"[win32k gdidrv] hosted ");
-        print_str(driver.leaf_bytes());
-        print_str(b" -> image=0x");
-        print_hex((driver.image >> 32) as u32);
-        print_hex(driver.image as u32);
-        print_str(b"\n");
-    }
-    0
+extern "win64" fn s_nt_set_system_information(class: u64, buf: u64, len: u64) -> i32 {
+    let expected = match class { 26 => 0x38, 27 => 8, _ => return 0xc000_0003u32 as i32 };
+    if len != expected { return 0xc000_0004u32 as i32; }
+    if thread_execution::previous_mode() != 0 { return 0xc000_0061u32 as i32; }
+    unsafe { gdi_image_call::set_information(class, buf, len) }
 }
-
 // --- video-device registry import + display miniport IOCTL intercept --------------------------
 //
 // win32k's EngpUpdateGraphicsDeviceList / InitDisplayDriver (ReactOS win32ss/gdi/eng/device.c +
@@ -14414,24 +14411,46 @@ extern "win64" fn s_io_get_device_object_pointer(
     devobj_out: *mut u64,
 ) -> i32 {
     unsafe {
-        crate::video_device::video_get_device_object_pointer(
-            name,
+        if fileobj_out.is_null() || devobj_out.is_null() || name == 0 {
+            return STATUS_ACCESS_VIOLATION_I32;
+        }
+        core::ptr::write_unaligned(fileobj_out, 0);
+        core::ptr::write_unaligned(devobj_out, 0);
+        if access > u32::MAX as u64 {
+            return STATUS_INVALID_PARAMETER_I32;
+        }
+        let length = core::ptr::read_unaligned(name as *const u16) as usize;
+        let maximum = core::ptr::read_unaligned((name + 2) as *const u16) as usize;
+        let buffer = core::ptr::read_unaligned((name + 8) as *const u64);
+        if length == 0 {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+        if length > maximum || length & 1 != 0 || buffer == 0 {
+            return STATUS_INVALID_PARAMETER_I32;
+        }
+        let packet = pool_alloc(length as u64);
+        if packet == 0 {
+            return STATUS_INSUFFICIENT_RESOURCES_I32;
+        }
+        core::ptr::copy_nonoverlapping(buffer as *const u8, packet as *mut u8, length);
+        let (status, file, device, _) = win32k_file_object_broker_call(
+            W32_FILE_OBJECT_OPEN_DEVICE,
+            packet,
             access,
-            fileobj_out,
-            devobj_out,
-        )
+            length as u64,
+        );
+        assert!(provider_pool_free(packet), "device-name packet retirement failed");
+        if status == 0 {
+            core::ptr::write_unaligned(fileobj_out, file);
+            core::ptr::write_unaligned(devobj_out, device);
+        }
+        status
     }
 }
 
 /// `PDEVICE_OBJECT IoGetRelatedDeviceObject(PFILE_OBJECT)`.
 extern "win64" fn s_io_get_related_device_object(file_object: u64) -> u64 {
     unsafe {
-        if crate::video_device::video_file_projection_contains(file_object) {
-            return crate::video_device::video_related_device_object(file_object)
-                .unwrap_or_else(|status| {
-                    panic!("IoGetRelatedDeviceObject rejected video File: {:#010x}", status.raw())
-                });
-        }
         let (status, device, _, _) = win32k_file_object_broker_call(
             W32_FILE_OBJECT_RELATED_DEVICE,
             file_object,
@@ -14445,207 +14464,6 @@ extern "win64" fn s_io_get_related_device_object(file_object: u64) -> u64 {
     }
 }
 
-#[inline]
-unsafe fn write_eng_device_io_control_bytes_returned(bytes_ret: *mut u32, value: u32) {
-    if !bytes_ret.is_null() {
-        write_unaligned(bytes_ret, value);
-    }
-}
-
-#[inline(never)]
-unsafe fn request_video_device_io_control(
-    hdev: u64,
-    ioctl: u32,
-    in_buf: u64,
-    in_len: u32,
-    out_buf: u64,
-    out_len: u32,
-    bytes_ret: *mut u32,
-) -> u32 {
-    write_eng_device_io_control_bytes_returned(bytes_ret, 0);
-    let in_len = in_len as u64;
-    let out_len = out_len as u64;
-    let invalid = in_len > VIDEO_IOCTL_IN_CAP as u64
-        || out_len > VIDEO_IOCTL_OUT_CAP as u64
-        || (in_len != 0 && in_buf == 0)
-        || (out_len != 0 && out_buf == 0);
-    let seq = WIN32K_VIDEO_IOCTL_REQUEST_TRACE.fetch_add(1, Ordering::Relaxed);
-    if seq < 64 {
-        print_str(b"[win32k-video-ioctl-request] hdev=0x");
-        print_hex((hdev >> 32) as u32);
-        print_hex(hdev as u32);
-        print_str(b" ioctl=0x");
-        print_hex(ioctl as u32);
-        print_str(b" in/out=");
-        print_u64(in_len);
-        print_str(b"/");
-        print_u64(out_len);
-        print_str(b" inbuf=0x");
-        print_hex((in_buf >> 32) as u32);
-        print_hex(in_buf as u32);
-        print_str(b" outbuf=0x");
-        print_hex((out_buf >> 32) as u32);
-        print_hex(out_buf as u32);
-        print_str(b" bytes=0x");
-        print_hex(((bytes_ret as u64) >> 32) as u32);
-        print_hex((bytes_ret as u64) as u32);
-        print_str(b" invalid=");
-        print_u64(invalid as u64);
-        print_str(b"\n");
-    }
-    if invalid {
-        return 1;
-    }
-
-    let sh = WIN32K_VIDEO_IOCTL_VADDR;
-    for index in 0..in_len as usize {
-        let value = read_volatile((in_buf + index as u64) as *const u8);
-        write_volatile((sh + VIDEO_IOCTL_IN_BUF + index as u64) as *mut u8, value);
-    }
-    for index in 0..out_len as usize {
-        write_volatile((sh + VIDEO_IOCTL_OUT_BUF + index as u64) as *mut u8, 0);
-    }
-    write_volatile((sh + VIDEO_IOCTL_HDEV) as *mut u64, hdev);
-    write_volatile((sh + VIDEO_IOCTL_CODE) as *mut u64, ioctl as u64);
-    write_volatile((sh + VIDEO_IOCTL_IN_LEN) as *mut u64, in_len);
-    write_volatile((sh + VIDEO_IOCTL_OUT_LEN) as *mut u64, out_len);
-    write_volatile((sh + VIDEO_IOCTL_STATUS) as *mut u32, 1);
-    write_volatile((sh + VIDEO_IOCTL_BYTES_RETURNED) as *mut u32, 0);
-
-    let _ = crate::driver_launch::call_on(W32_VIDEO_IOCTL_LABEL << 12);
-    let status = read_volatile((sh + VIDEO_IOCTL_STATUS) as *const u32);
-    let bytes_returned = read_volatile((sh + VIDEO_IOCTL_BYTES_RETURNED) as *const u32);
-    let copy_len = core::cmp::min(bytes_returned as u64, out_len) as usize;
-    if status == 0 {
-        for index in 0..copy_len {
-            let value = read_volatile((sh + VIDEO_IOCTL_OUT_BUF + index as u64) as *const u8);
-            write_volatile((out_buf + index as u64) as *mut u8, value);
-        }
-    }
-    write_eng_device_io_control_bytes_returned(bytes_ret, bytes_returned);
-    status
-}
-
-#[inline(never)]
-pub(crate) unsafe fn service_video_device_io_control() -> u32 {
-    let sh = WIN32K_VIDEO_IOCTL_VADDR;
-    let hdev = read_volatile((sh + VIDEO_IOCTL_HDEV) as *const u64);
-    let ioctl = read_volatile((sh + VIDEO_IOCTL_CODE) as *const u64);
-    let in_len = read_volatile((sh + VIDEO_IOCTL_IN_LEN) as *const u64);
-    let out_len = read_volatile((sh + VIDEO_IOCTL_OUT_LEN) as *const u64);
-    let mut bytes_returned = 0u32;
-    let status = if ioctl > u32::MAX as u64
-        || in_len > VIDEO_IOCTL_IN_CAP as u64
-        || out_len > VIDEO_IOCTL_OUT_CAP as u64
-    {
-        1
-    } else {
-        crate::video_device::video_device_io_control(
-            hdev,
-            ioctl,
-            sh + VIDEO_IOCTL_IN_BUF,
-            in_len,
-            sh + VIDEO_IOCTL_OUT_BUF,
-            out_len,
-            &mut bytes_returned as *mut u32,
-        )
-    };
-    if status != 0 {
-        bytes_returned = 0;
-    } else if ioctl == nt_video_miniport::IOCTL_VIDEO_QUERY_CURRENT_MODE as u64
-        && bytes_returned as usize >= nt_video_miniport::VIDEO_MODE_INFORMATION_SIZE
-    {
-        let output = core::slice::from_raw_parts(
-            (sh + VIDEO_IOCTL_OUT_BUF) as *const u8,
-            bytes_returned as usize,
-        );
-        if let Ok(mode) = nt_video_miniport::parse_video_mode_information(output) {
-            let _ = crate::publish_active_framebuffer_mode(mode);
-        }
-    } else if ioctl == nt_video_miniport::IOCTL_VIDEO_SET_CURRENT_MODE as u64 {
-        let mut current_mode_bytes = 0u32;
-        let query_status = crate::video_device::video_device_io_control(
-            hdev,
-            nt_video_miniport::IOCTL_VIDEO_QUERY_CURRENT_MODE as u64,
-            0,
-            0,
-            sh + VIDEO_IOCTL_OUT_BUF,
-            nt_video_miniport::VIDEO_MODE_INFORMATION_SIZE as u64,
-            &mut current_mode_bytes,
-        );
-        if query_status == 0
-            && current_mode_bytes as usize >= nt_video_miniport::VIDEO_MODE_INFORMATION_SIZE
-        {
-            let output = core::slice::from_raw_parts(
-                (sh + VIDEO_IOCTL_OUT_BUF) as *const u8,
-                current_mode_bytes as usize,
-            );
-            if let Ok(mode) = nt_video_miniport::parse_video_mode_information(output) {
-                let _ = crate::publish_active_framebuffer_mode(mode);
-            }
-        }
-    }
-    write_volatile((sh + VIDEO_IOCTL_STATUS) as *mut u32, status);
-    write_volatile(
-        (sh + VIDEO_IOCTL_BYTES_RETURNED) as *mut u32,
-        bytes_returned,
-    );
-    let seq = WIN32K_VIDEO_IOCTL_TRACE.fetch_add(1, Ordering::Relaxed);
-    if seq < 64 {
-        print_str(b"[win32k-video-ioctl] hdev=0x");
-        print_hex((hdev >> 32) as u32);
-        print_hex(hdev as u32);
-        print_str(b" ioctl=0x");
-        print_hex(ioctl as u32);
-        print_str(b" in/out=");
-        print_u64(in_len);
-        print_str(b"/");
-        print_u64(out_len);
-        print_str(b" status=");
-        print_u64(status as u64);
-        print_str(b" bytes=");
-        print_u64(bytes_returned as u64);
-        print_str(b"\n");
-    }
-    status
-}
-
-/// win32k's `EngDeviceIoControl` — INTERCEPTED (win32k's export is patched to jmp here in
-/// `load_into`, so both the display DLL's imported calls and win32k's own internal calls route into
-/// the executive-owned video-device boundary). Returns 0 (ERROR_SUCCESS) on handled, nonzero on
-/// unhandled. win64: rcx=hDev, edx=ioctl, r8=inbuf, r9d=inlen, stack: outbuf, outlen(ULONG),
-/// bytesret.
-extern "win64" fn s_eng_device_io_control(
-    hdev: u64,
-    ioctl: u32,
-    in_buf: u64,
-    in_len: u32,
-    out_buf: u64,
-    out_len: u32,
-    bytes_ret: *mut u32,
-) -> u32 {
-    unsafe {
-        request_video_device_io_control(hdev, ioctl, in_buf, in_len, out_buf, out_len, bytes_ret)
-    }
-}
-
-/// Patch win32k's exported `EngDeviceIoControl` to `jmp s_eng_device_io_control`. Runs in `load_into`
-/// while win32k's image is mapped RW in the executive (before spawn maps it RX). 12 bytes:
-/// `mov rax, imm64 (48 B8 ..); jmp rax (FF E0)`. Both the display DLL's IAT-resolved import AND win32k's own
-/// internal EngDeviceIoControl callers then route to our video-IOCTL handler.
-unsafe fn patch_eng_device_io_control() {
-    let va = pe_export_lookup(WIN32K_CODE_VA, b"EngDeviceIoControl\0");
-    if va == 0 {
-        print_str(b"[win32k fb] WARN: EngDeviceIoControl export not found\n");
-        return;
-    }
-    let tgt = s_eng_device_io_control as usize as u64;
-    write_volatile(va as *mut u8, 0x48);
-    write_volatile((va + 1) as *mut u8, 0xB8);
-    write_unaligned((va + 2) as *mut u64, tgt);
-    write_volatile((va + 10) as *mut u8, 0xFF);
-    write_volatile((va + 11) as *mut u8, 0xE0);
-}
 
 /// win32k's KeGetCurrentIrql helper RVA — `mov rax, cr8` (bytes 44 0F 20 C0) followed by `ret`. The
 /// unique CR8 access in the image (verified by opcode scan).
@@ -14745,14 +14563,20 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
                 read_volatile((input + offset as u64) as *const u8),
             );
         }
-        if api == USER32_CB_WINDOWPROC && input_len as usize >= 0x40 {
-            let lparam_size = read_volatile((input + 0x30) as *const i32);
-            if lparam_size >= 0
-                && 0x40usize
-                    .checked_add(lparam_size as usize)
-                    .is_some_and(|end| end <= input_len as usize)
-            {
-                header.payload_reference_offset = 0x40;
+        if api == USER32_CB_WINDOWPROC {
+            let payload = core::slice::from_raw_parts(
+                core::ptr::addr_of!((*frame).payload) as *const u8,
+                input_len as usize,
+            );
+            let span = match nt_user_callback::windowproc_lparam_span(payload) {
+                Ok(span) => span,
+                Err(_) => return 0xC000_0004u32 as i32,
+            };
+            header.payload_reference_offset = span.as_ref().map_or(
+                nt_user_callback::NO_PAYLOAD_REFERENCE,
+                |span| span.start as u32,
+            );
+            if span.is_some() {
                 for offset in 0x28..0x30 {
                     write_volatile(core::ptr::addr_of_mut!((*frame).payload[offset]), 0);
                 }
@@ -14979,15 +14803,26 @@ extern "win64" fn removed_s_ke_user_mode_callback_synthetic_baseline(
 static mut WIN32K_EXPORTS: DriverExportRegistry = DriverExportRegistry::new();
 static mut WIN32K_EXPORTS_READY: bool = false;
 
-/// Bind the complete win32k kernel/HAL import surface into [`WIN32K_EXPORTS`]. Idempotent (`bind`
-/// updates in place), so it is safe to call from any loader (win32k / dxg / driver) regardless of
-/// order. Readiness is published only after every declared import has a nonzero binding.
+/// Bind the complete win32k kernel/HAL import surface into [`WIN32K_EXPORTS`] after the admitted
+/// SEH support image has published its native entry points. `bind` is idempotent for later GDI
+/// loaders; readiness is published only after every declared import has a nonzero binding.
 fn register_trampolines() -> bool {
+    let Some(seh) = crate::win32k_seh_image::admitted_imports() else {
+        return false;
+    };
     // SAFETY: single-threaded executive; the registry is only ever touched here + in export_addr.
     let reg = unsafe { &mut *core::ptr::addr_of_mut!(WIN32K_EXPORTS) };
     if !reg.reserve_initial(DRIVER_EXPORT_INITIAL_RESERVE) {
         return false;
     }
+    reg.bind(
+        "DbgBreakPoint",
+        crate::debug_traps::DbgBreakPoint as *const () as usize as u64,
+    );
+    reg.bind(
+        "DbgBreakPointWithStatus",
+        crate::debug_traps::DbgBreakPointWithStatus as *const () as usize as u64,
+    );
     // pool (Driver Host arena)
     reg.bind(
         "ExAllocatePoolWithTag",
@@ -15011,6 +14846,10 @@ fn register_trampolines() -> bool {
     reg.bind("ProbeForRead", s_probe_for_read as usize as u64);
     reg.bind("ProbeForWrite", s_probe_for_write as usize as u64);
     reg.bind("RtlGetVersion", s_rtl_get_version as usize as u64);
+    reg.bind("ExRaiseAccessViolation", seh.access_violation_va);
+    reg.bind("ExRaiseStatus", seh.raise_va);
+    reg.bind("RtlUnwindEx", seh.unwind_entry_va);
+    reg.bind("RtlUnwind", seh.legacy_unwind_va);
     reg.bind(
         "RtlAreAllAccessesGranted",
         s_rtl_are_all_accesses_granted as usize as u64,
@@ -15386,7 +15225,7 @@ fn register_trampolines() -> bool {
     );
     reg.bind(
         "NtSetSystemInformation",
-        s_zw_set_system_information as usize as u64,
+        s_nt_set_system_information as usize as u64,
     );
     reg.bind("ZwOpenFile", file_open::open as *const () as usize as u64);
     reg.bind("ZwCreateFile", file_open::create as *const () as usize as u64);
@@ -15464,7 +15303,7 @@ fn register_trampolines() -> bool {
     );
     reg.bind(
         "PsGetCurrentThreadProcessId",
-        s_current_process_id as usize as u64,
+        s_current_thread_process_id as usize as u64,
     );
     reg.bind("PsGetProcessId", s_ps_get_process_id as usize as u64);
     reg.bind("PsIsSystemProcess", s_ps_is_system_process as *const () as usize as u64);
@@ -15474,6 +15313,16 @@ fn register_trampolines() -> bool {
     );
     reg.bind("PsGetThreadId", s_ps_get_thread_id as usize as u64);
     reg.bind("KeIsAttachedProcess", s_ke_is_attached_process as usize as u64);
+    reg.bind("KeAttachProcess", process_attach::ke_attach_process as *const () as usize as u64);
+    reg.bind("KeDetachProcess", process_attach::ke_detach_process as *const () as usize as u64);
+    reg.bind(
+        "KeStackAttachProcess",
+        process_attach::ke_stack_attach_process as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeUnstackDetachProcess",
+        process_attach::ke_unstack_detach_process as *const () as usize as u64,
+    );
     reg.bind(
         "PsGetThreadProcessId",
         s_ps_get_thread_process_id as usize as u64,
@@ -15581,6 +15430,18 @@ fn register_trampolines() -> bool {
         source_irp::build_device_io_control_request as *const () as u64,
     );
     reg.bind(
+        "IoBuildSynchronousFsdRequest",
+        source_irp::build_synchronous_fsd_request as *const () as u64,
+    );
+    reg.bind(
+        "IofCallDriver",
+        source_call_router::iof_call_driver as *const () as u64,
+    );
+    reg.bind(
+        "IoCallDriver",
+        source_call_router::iof_call_driver as *const () as u64,
+    );
+    reg.bind(
         "KeUserModeCallback",
         s_ke_user_mode_callback_rendezvous as usize as u64,
     );
@@ -15650,10 +15511,14 @@ fn register_trampolines() -> bool {
         "ExReleaseFastMutexUnsafeAndLeaveCriticalRegion",
         s_ex_release_fast_mutex_unsafe_and_leave_critical_region as usize as u64,
     );
-    reg.bind("ExfAcquirePushLockExclusive", s_true as usize as u64);
-    reg.bind("ExfTryToWakePushLock", s_true as usize as u64);
-    reg.bind("KeSetKernelStackSwapEnable", s_true as usize as u64);
-    reg.bind("ExGetPreviousMode", s_true as usize as u64);
+    reg.bind("ExfAcquirePushLockExclusive", push_lock::acquire_exclusive as *const () as u64);
+    reg.bind("ExfAcquirePushLockShared", push_lock::acquire_shared as *const () as u64);
+    reg.bind("ExfReleasePushLockExclusive", push_lock::release_exclusive as *const () as u64);
+    reg.bind("ExfReleasePushLockShared", push_lock::release_shared as *const () as u64);
+    reg.bind("ExfReleasePushLock", push_lock::release_generic as *const () as u64);
+    reg.bind("ExfTryToWakePushLock", push_lock::try_to_wake as *const () as u64);
+    reg.bind("KeSetKernelStackSwapEnable", thread_execution::set_stack_swap_enable as usize as u64);
+    reg.bind("ExGetPreviousMode", thread_execution::previous_mode as usize as u64);
     // --- batch 5: RTL security descriptors / ACLs / SIDs ---
     reg.bind(
         "RtlCreateSecurityDescriptor",
@@ -15754,6 +15619,11 @@ pub fn export_addr(name: &str) -> u64 {
     unsafe { (*core::ptr::addr_of!(WIN32K_EXPORTS)).lookup(name).unwrap_or(0) }
 }
 
+pub(crate) fn export_addr_for_module(module: &str, name: &str) -> u64 {
+    if !initialize_export_registry() { return 0; }
+    unsafe { (&*core::ptr::addr_of!(WIN32K_EXPORTS)).lookup_module(module, name).unwrap_or(0) }
+}
+
 /// (name, cell value). The six **object-type** cells (`Ps*Type`, `Ex*ObjectType`, `LpcPortObjectType`)
 /// now resolve at runtime to the address of a **real** `nt_object_manager::object_type` `OBJECT_TYPE`
 /// static (see [`object_type_cell_value`]) — their `0` here is a placeholder overridden in
@@ -15803,7 +15673,7 @@ fn object_type_cell_value(name: &str) -> Option<u64> {
 
 /// Per-frame W^X rights for the loaded image (2 = RX code / RW_NX = RW data). A `static` (not a
 /// stack array or heap Vec): the rootserver stack is bounded and the heap is spent.
-static mut CODE_RIGHTS: [u64; WIN32K_IMAGE_FRAMES as usize] = [RW_NX; WIN32K_IMAGE_FRAMES as usize];
+static mut CODE_RIGHTS: [u64; WIN32K_IMAGE_FRAMES as usize] = [RO_NX; WIN32K_IMAGE_FRAMES as usize];
 
 /// The per-frame rights `load_into` computed (for `spawn_win32k_host`'s W^X mapping).
 pub fn code_rights() -> &'static [u64] {
@@ -15981,32 +15851,6 @@ fn import_name_eq(import_name: &[u8], expected: &[u8]) -> bool {
             .all(|(&actual, &expected)| actual == expected)
 }
 
-unsafe fn trace_gdi_driver_import(import_name: &[u8], slot: u64, addr: u64, direct: bool) {
-    if !import_name_eq(import_name, b"EngDeviceIoControl") {
-        return;
-    }
-    let seq = GDI_DRIVER_IMPORT_TRACE.fetch_add(1, Ordering::Relaxed);
-    if seq >= 16 {
-        return;
-    }
-    print_str(b"[win32k-gdidrv-import] ");
-    print_str(import_name);
-    print_str(b" slot=0x");
-    print_hex((slot >> 32) as u32);
-    print_hex(slot as u32);
-    print_str(b" addr=0x");
-    print_hex((addr >> 32) as u32);
-    print_hex(addr as u32);
-    print_str(b" direct=");
-    print_u64(direct as u64);
-    print_str(b"\n");
-}
-
-unsafe fn log_unresolved_gdi_driver_import(import_name: &[u8]) {
-    print_str(b"[win32k-gdidrv-import] unresolved ");
-    print_str(import_name);
-    print_str(b"\n");
-}
 
 unsafe fn log_unresolved_win32k_import(import_name: &[u8]) {
     print_str(b"[win32k-import] unresolved ");
@@ -16123,6 +15967,7 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize, nls_sizes: [usize; 3]) ->
 
     // Copy each section into its virtual address; compute per-frame rights.
     let rights = &mut *core::ptr::addr_of_mut!(CODE_RIGHTS);
+    rights.fill(RO_NX);
     for s in 0..num_sections {
         let sh = sec_table + s * 40;
         let va = read_unaligned((sh + 12) as *const u32) as u64;
@@ -16132,11 +15977,10 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize, nls_sizes: [usize; 3]) ->
         let chars = read_unaligned((sh + 36) as *const u32);
         let n = raw_size.min(WIN32K_IMAGE_FRAMES * 0x1000 - va);
         copy_bytes(code_va + va, src_va + raw_ptr, n);
-        // IMAGE_SCN_MEM_EXECUTE = 0x2000_0000 → RX (rights 2); else RW_NX.
-        let r = if chars & 0x2000_0000 != 0 {
-            2u64
-        } else {
-            RW_NX
+        let r = match nt_pe_loader::Protection::from_section_characteristics(chars) {
+            nt_pe_loader::Protection::ReadExecute => 2,
+            nt_pe_loader::Protection::ReadWrite => RW_NX,
+            nt_pe_loader::Protection::ReadOnly => RO_NX,
         };
         let span = va + vsize.max(raw_size);
         let mut p = va & !0xFFF;
@@ -16197,15 +16041,33 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize, nls_sizes: [usize; 3]) ->
         WIN32K_SE_SID_POOL_VA,
     );
 
-    // Patch the IAT in place: walk the import descriptors (data dir 1) in the mapped image.
+    // Bind only native imports here. Static driver dependencies are loaded into this VSpace and
+    // resolved from their own PE export tables before win32k calls through those IAT slots.
     let imp_rva = read_unaligned((opt + 112 + 8) as *const u32) as u64;
     if imp_rva != 0 {
-        let mut desc = code_va + imp_rva;
-        loop {
+        let imp_size = read_unaligned((opt + 112 + 8 + 4) as *const u32) as u64;
+        if !image_rva_span_ok(imp_rva, imp_size, WIN32K_IMAGE_BYTES) {
+            return None;
+        }
+        let mut desc_rva = imp_rva;
+        while desc_rva + 20 <= imp_rva + imp_size {
+            let desc = code_va + desc_rva;
             let ilt = read_unaligned(desc as *const u32) as u64; // OriginalFirstThunk
             let iat = read_unaligned((desc + 16) as *const u32) as u64; // FirstThunk
             if ilt == 0 && iat == 0 {
                 break;
+            }
+            let dll_rva = read_unaligned((desc + 12) as *const u32) as u64;
+            let Some(dll_len) = image_c_string_len(code_va, dll_rva, WIN32K_IMAGE_BYTES, 31)
+            else {
+                return None;
+            };
+            if !image_c_string_is_safe(code_va, dll_rva, dll_len) {
+                return None;
+            }
+            if !image_c_string_is_native_import(code_va, dll_rva, dll_len) {
+                desc_rva += 20;
+                continue;
             }
             let names = code_va + if ilt != 0 { ilt } else { iat };
             let slots = code_va + iat;
@@ -16240,12 +16102,9 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize, nls_sizes: [usize; 3]) ->
                 }
                 k += 1;
             }
-            desc += 20;
+            desc_rva += 20;
         }
     }
-
-    // Patch win32k's EngDeviceIoControl export to the executive-owned video-device boundary.
-    patch_eng_device_io_control();
 
     // CR8 is privileged; its getter must observe the exact executing provider activation.
     if !patch_ke_get_current_irql() {
@@ -16277,7 +16136,7 @@ pub(crate) unsafe fn pool_alloc_export(size: u64) -> u64 {
 #[no_mangle]
 #[link_section = ".text.win32k_subsystem_entry"]
 pub unsafe extern "C" fn win32k_subsystem_entry(heap_frames: u64) -> ! {
-    if !unsafe { allocator::initialize_mapped_heap(heap_frames) } {
+    if !unsafe { allocator::initialize_reserved_heap(heap_frames) } {
         park();
     }
     if !provider_pool_ready() {
@@ -16337,6 +16196,7 @@ pub unsafe extern "C" fn win32k_subsystem_entry(heap_frames: u64) -> ! {
             mj: 0x100,
             mj_table_off: u64::MAX,
             pool: pool_alloc_export,
+            foreign_call2_va: read_volatile(WIN32K_SEH_FOREIGN_CALL2_VA as *const u64),
             support_entry_rva_off: u64::MAX,
             support_count_off: u64::MAX,
             support_records_off: u64::MAX,
@@ -16475,28 +16335,21 @@ unsafe fn select_existing_ps_provider_context(
         return Err(STATUS_INVALID_CID);
     }
 
-    let thread_index = if tid == 0 {
-        if require_thread {
-            return Err(STATUS_INVALID_CID);
-        }
-        None
-    } else {
-        let Some(index) = thread_context_index_for_tid(tid) else {
-            if require_thread {
-                return Err(STATUS_INVALID_CID);
-            }
-            return install_existing_ps_provider_process_context(process_index, pi, pid, supplied_eprocess);
-        };
+    provider_ps_lifecycle::validate_ps_provider_execution_thread(
+        pid, tid, supplied_eprocess, supplied_ethread,
+    )?;
+    let thread_index = thread_context_index_for_tid(tid);
+    if let Some(index) = thread_index {
         if thread_ctx_pid(index) != pid
             || thread_ctx_pi(index) != pi
             || thread_ctx_generation(index) != generation
-            || supplied_ethread == 0
             || thread_ctx_ethread(index) != supplied_ethread
         {
             return Err(STATUS_INVALID_CID);
         }
-        Some(index)
-    };
+    } else if require_thread {
+        return Err(STATUS_INVALID_CID);
+    }
 
     let selected_teb = if let Some(thread_index) = thread_index {
         let recorded_teb = thread_ctx_teb(thread_index);
@@ -16516,30 +16369,42 @@ unsafe fn select_existing_ps_provider_context(
         }
         teb
     } else {
-        WIN32K_KPCR_VA
+        provider_ps_lifecycle::read_ps_provider_execution_teb(
+            supplied_ethread,
+            read_volatile((sh + SH_REQ_CLIENT_TEB) as *const u64),
+        )?
     };
 
     // Publish the entire selection only after validating every requested thread field.
     WIN32K_CURRENT_CLIENT_PI.store(pi, Ordering::Relaxed);
     WIN32K_CURRENT_PROCESS_ID.store(pid, Ordering::Relaxed);
     WIN32K_CURRENT_THREAD_ID.store(tid, Ordering::Relaxed);
-    write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, supplied_eprocess);
-    write_volatile(SLOT_W32PROCESS as *mut u64, process_ctx_w32process(process_index));
+    write_volatile(
+        (WIN32K_KPCR_VA + 0x60) as *mut u64,
+        process_attach::selected_process(supplied_ethread, supplied_eprocess),
+    );
+    write_volatile(
+        SLOT_W32PROCESS as *mut u64,
+        process_attach::selected_win32process(
+            supplied_ethread,
+            supplied_eprocess,
+            process_ctx_w32process(process_index),
+        ),
+    );
     write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, selected_teb);
+    write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, supplied_ethread);
     if let Some(thread_index) = thread_index {
-        write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, supplied_ethread);
         write_volatile(
             SLOT_W32THREAD as *mut u64,
             thread_ctx_w32thread(thread_index),
         );
         publish_selected_context(process_index, thread_index);
     } else {
-        write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, 0);
         write_volatile(SLOT_W32THREAD as *mut u64, 0);
         write_volatile((sh + SH_CTX_PROCESS_ID) as *mut u64, pid);
-        write_volatile((sh + SH_CTX_THREAD_ID) as *mut u64, 0);
+        write_volatile((sh + SH_CTX_THREAD_ID) as *mut u64, tid);
         write_volatile((sh + SH_CTX_EPROCESS) as *mut u64, supplied_eprocess);
-        write_volatile((sh + SH_CTX_ETHREAD) as *mut u64, 0);
+        write_volatile((sh + SH_CTX_ETHREAD) as *mut u64, supplied_ethread);
         write_volatile(
             (sh + SH_CTX_W32PROCESS) as *mut u64,
             process_ctx_w32process(process_index),
@@ -16547,36 +16412,6 @@ unsafe fn select_existing_ps_provider_context(
         write_volatile((sh + SH_CTX_W32THREAD) as *mut u64, 0);
     }
     Ok((process_index, thread_index))
-}
-
-unsafe fn install_existing_ps_provider_process_context(
-    process_index: usize,
-    pi: u64,
-    pid: u64,
-    eprocess: u64,
-) -> Result<(usize, Option<usize>), u32> {
-    let sh = WIN32K_SHARED_VADDR;
-    WIN32K_CURRENT_CLIENT_PI.store(pi, Ordering::Relaxed);
-    WIN32K_CURRENT_PROCESS_ID.store(pid, Ordering::Relaxed);
-    WIN32K_CURRENT_THREAD_ID.store(0, Ordering::Relaxed);
-    write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, WIN32K_KPCR_VA);
-    write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, eprocess);
-    write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, 0);
-    write_volatile(
-        SLOT_W32PROCESS as *mut u64,
-        process_ctx_w32process(process_index),
-    );
-    write_volatile(SLOT_W32THREAD as *mut u64, 0);
-    write_volatile((sh + SH_CTX_PROCESS_ID) as *mut u64, pid);
-    write_volatile((sh + SH_CTX_THREAD_ID) as *mut u64, 0);
-    write_volatile((sh + SH_CTX_EPROCESS) as *mut u64, eprocess);
-    write_volatile((sh + SH_CTX_ETHREAD) as *mut u64, 0);
-    write_volatile(
-        (sh + SH_CTX_W32PROCESS) as *mut u64,
-        process_ctx_w32process(process_index),
-    );
-    write_volatile((sh + SH_CTX_W32THREAD) as *mut u64, 0);
-    Ok((process_index, None))
 }
 
 unsafe fn dispatch_ps_provider_command(command: u64, expected: u64, flags: u64) -> u64 {
@@ -16646,6 +16481,9 @@ unsafe fn dispatch_ps_provider_command(command: u64, expected: u64, flags: u64) 
             Ok(selected) => selected,
             Err(status) => return status as u64,
         };
+    let _previous_mode = thread_execution::PreviousModeScope::enter(
+        nt_kernel_abi::ps_reactos_x64::ThreadPreviousMode::KernelMode,
+    );
     let pid = process_ctx_pid(process_index);
 
     match command {
@@ -16712,6 +16550,11 @@ unsafe fn dispatch_ps_provider_command(command: u64, expected: u64, flags: u64) 
             }
             if let Some(thread_index) = thread_index {
                 publish_selected_context(process_index, thread_index);
+            } else {
+                write_volatile(
+                    (WIN32K_SHARED_VADDR + SH_CTX_W32PROCESS) as *mut u64,
+                    process_ctx_w32process(process_index),
+                );
             }
             STATUS_SUCCESS
         }
@@ -16732,7 +16575,30 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     let callback_frame =
         (WIN32K_SHARED_VADDR + SH_USER_CALLBACK) as *const nt_user_callback::CallbackFrame;
     let header = read_volatile(core::ptr::addr_of!((*callback_frame).header));
-    let request_kind = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_KIND) as *const u64);
+    let request = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_KIND) as *const u64);
+    let request_kind = request & !WIN32K_REQUEST_USER_ORIGIN;
+    let user_origin = request & WIN32K_REQUEST_USER_ORIGIN != 0;
+    if user_origin && request_kind != WIN32K_REQUEST_SSDT {
+        return (STATUS_INVALID_PARAMETER_I32, STATUS_INVALID_PARAMETER_I32 as u32 as u64);
+    }
+    #[cfg(feature = "source-irp-integration")]
+    if request_kind == WIN32K_REQUEST_SOURCE_IRP_PROBE {
+        let Some(_kernel_activation) = capture_kernel_provider_stack_activation() else {
+            let status = 0xC000_0008u32;
+            return (status as i32, status as u64);
+        };
+        if event_reclaim_pending_marker().load(Ordering::Acquire) != 0
+            && !drain_retired_event_provider_bodies()
+        {
+            let status = 0xC000_0001u32;
+            return (status as i32, status as u64);
+        }
+        let a0 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A0) as *const u64);
+        let a1 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A1) as *const u64);
+        let a2 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A2) as *const u64);
+        let result = crate::win32k_glue::source_irp_integration::component_probe(a0, a1, a2);
+        return (result, result as u32 as u64);
+    }
     let owner = if request_kind == WIN32K_REQUEST_SSDT {
         match hosted_wait_owner_at_dispatch(header) {
             Ok(owner) => owner,
@@ -16766,6 +16632,18 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     if request_kind == WIN32K_REQUEST_PS_PROVIDER {
         let result = dispatch_ps_provider_command(a0, a1, a2);
         return (result as u32 as i32, result);
+    }
+    if request_kind == WIN32K_REQUEST_SOURCE_PNP_TERMINAL {
+        let result = source_pnp_call::complete_terminal(a0, a1);
+        return (result, result as u32 as u64);
+    }
+    if request_kind == WIN32K_REQUEST_SOURCE_FSD_TERMINAL {
+        let result = source_fsd_call::complete_terminal(a0, a1);
+        return (result, result as u32 as u64);
+    }
+    if request_kind == WIN32K_REQUEST_SOURCE_IOCTL_TERMINAL {
+        let result = source_irp_call::complete_terminal(a0, a1);
+        return (result, result as u32 as u64);
     }
     if request_kind != WIN32K_REQUEST_SSDT {
         return (0xC000_000Du32 as i32, 0xC000_000Du32 as u64);
@@ -16853,6 +16731,12 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     ) else {
         return (0xC000_009Au32 as i32, 0xC000_009Au32 as u64);
     };
+    let mode = if user_origin && registered_win32k_provider_argc(ssn).is_some() {
+        nt_kernel_abi::ps_reactos_x64::ThreadPreviousMode::UserMode
+    } else {
+        nt_kernel_abi::ps_reactos_x64::ThreadPreviousMode::KernelMode
+    };
+    let _previous_mode = thread_execution::PreviousModeScope::enter(mode);
     let process_attached = ensure_win32k_process_attached(process_index, process_role);
     let threadinfo_ready = process_attached && ensure_win32k_threadinfo(thread_index, client_teb);
     if !process_attached || !threadinfo_ready {
@@ -17026,6 +16910,11 @@ unsafe fn dispatch_gdi_batch_flush_callout(client_pi: u64, client_teb: u64) -> u
 }
 
 unsafe fn dispatch_win32_job_callout(job: u64, callout_type: u32, data: u64) -> u64 {
+    let _previous_mode = (current_ethread() != 0).then(|| {
+        thread_execution::PreviousModeScope::enter(
+            nt_kernel_abi::ps_reactos_x64::ThreadPreviousMode::KernelMode,
+        )
+    });
     if callout_type == PS_W32_JOB_CONTROL_REMOVE_PROCESS {
         return remove_process_from_win32_job(job, data) as u64;
     }
@@ -17904,9 +17793,7 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     if nargs > 16 {
         return STATUS_INVALID_SYSTEM_SERVICE;
     }
-    let boundary = read_volatile(
-        (sh + crate::driver_launch::SH_SEH_FOREIGN_CALL16_VA) as *const u64,
-    );
+    let boundary = read_volatile(WIN32K_SEH_FOREIGN_CALL16_VA as *const u64);
     if boundary == 0 {
         return STATUS_INVALID_SYSTEM_SERVICE;
     }
@@ -18374,72 +18261,16 @@ unsafe fn record_registered_ntuser_handler() {
 // win32k. The same loader also resolves static win32k import DLLs discovered from win32k's own PE
 // import table.
 
-/// dxgthk.sys loaded-image base in win32k's VSpace (size_of_image 0x5000 -> 8 frames / one 2 MiB PT).
-pub const DXGTHK_VA: u64 = 0x0000_0100_0850_0000;
-pub const DXGTHK_LOAD_FRAMES: u64 = 8;
-/// dxg.sys loaded-image base in win32k's VSpace (size_of_image 0xd000 -> 16 frames / one 2 MiB PT).
-pub const DXG_VA: u64 = 0x0000_0100_0860_0000;
-pub const DXG_LOAD_FRAMES: u64 = 16;
-/// Display driver loaded-image base in win32k's VSpace. ReactOS' current registry selects the
-/// linear-framebuffer driver, whose size_of_image is 0x8000, so this reserves one 8-frame PT window.
-/// win32k loads the selected display DLL dynamically via ZwSetSystemInformation.
-pub const FRAMEBUF_VA: u64 = 0x0000_0100_0890_0000;
-pub const FRAMEBUF_LOAD_FRAMES: u64 = 8;
-/// Keyboard layout DLL loaded-image base in win32k's VSpace. size_of_image 0x4000 -> 4 frames;
-/// reserve 8 frames in its own PT-aligned window. win32k loads the registry-selected layout DLL via
-/// ZwSetSystemInformation, then resolves KbdLayerDescriptor from its export directory.
-pub const KEYBOARD_LAYOUT_VA: u64 = 0x0000_0100_08A0_0000;
-pub const KEYBOARD_LAYOUT_LOAD_FRAMES: u64 = 8;
-/// The complete display PCI BAR mapped into win32k's VSpace, RW. The executive video-device
-/// boundary returns an offset in this aperture for `IOCTL_VIDEO_MAP_VIDEO_MEMORY`; the bootloader
-/// framebuffer fields describe the initial scanout geometry only.
+/// Reserved caller aperture for the assigned display resource grant. Actual visibility belongs
+/// to the video-memory mapping transaction, never to loading a particular display image.
 pub const WIN32K_FB_VA: u64 = 0x0000_0100_0900_0000;
 
-/// Record the loaded display DLL info selected from the SYSTEM hive. Some ReactOS display DLLs have
-/// no export directory; win32k's `EngFindImageProcAddress("DrvEnableDriver")` can special-case to
-/// `EntryPoint` (ldevobj.c), so ExportSectionPointer may be 0.
-pub fn record_display_driver(
-    spec: &DisplayRegistrySpec<'_>,
-    entry_rva: u32,
-    export_dir_rva: u32,
-    image_len: u32,
-) -> bool {
-    let expd = if export_dir_rva != 0 {
-        FRAMEBUF_VA + export_dir_rva as u64
-    } else {
-        0
-    };
-    register_gdi_driver_image(
-        spec.display_driver_leaf,
-        FRAMEBUF_VA,
-        FRAMEBUF_VA + entry_rva as u64,
-        expd,
-        image_len,
-    ) && crate::video_device::hosted_video_device_route_ready()
+/// Reservation geometry is not mapping authority. Only the resource-backed transaction may
+/// populate this band; an unbacked fault must never acquire anonymous private memory.
+pub(crate) const fn is_reserved_win32k_video_aperture(address: u64) -> bool {
+    address >= WIN32K_FB_VA && address < WIN32K_POOL_VADDR
 }
 
-/// Record the loaded keyboard-layout DLL info. win32k uses the export directory to find
-/// KbdLayerDescriptor; the PE entry may be zero.
-pub fn record_keyboard_layout_driver(
-    _layout_id: &[u8],
-    layout_file: &[u8],
-    entry_rva: u32,
-    export_dir_rva: u32,
-    image_len: u32,
-) -> bool {
-    let expd = if export_dir_rva != 0 {
-        KEYBOARD_LAYOUT_VA + export_dir_rva as u64
-    } else {
-        0
-    };
-    register_gdi_driver_image(
-        layout_file,
-        KEYBOARD_LAYOUT_VA,
-        KEYBOARD_LAYOUT_VA + entry_rva as u64,
-        expd,
-        image_len,
-    )
-}
 
 /// Walk an already-mapped image's export table (data-dir 0) at `base`; return the VA of the export
 /// named `name` (nul-terminated), or 0. Handles FORWARDER exports: dxgthk's Eng* exports forward to
@@ -18501,18 +18332,16 @@ unsafe fn pe_export_lookup(base: u64, name: &[u8]) -> u64 {
                     return 0;
                 }
                 let func = core::slice::from_raw_parts(func_ptr as *const u8, fl);
-                let is_win32k = dot >= 6
-                    && read_volatile(s as *const u8).to_ascii_lowercase() == b'w'
-                    && read_volatile((s + 1) as *const u8).to_ascii_lowercase() == b'i'
-                    && read_volatile((s + 2) as *const u8).to_ascii_lowercase() == b'n'
-                    && read_volatile((s + 3) as *const u8).to_ascii_lowercase() == b'3'
-                    && read_volatile((s + 4) as *const u8).to_ascii_lowercase() == b'2'
-                    && read_volatile((s + 5) as *const u8).to_ascii_lowercase() == b'k';
-                if is_win32k {
+                let Ok(module) = core::str::from_utf8(core::slice::from_raw_parts(s as *const u8, dot)) else { return 0; };
+                if module.eq_ignore_ascii_case("win32k") {
                     return pe_export_lookup(WIN32K_CODE_VA, func);
                 }
-                // ntoskrnl / hal forwarder → trampoline.
-                let name = core::str::from_utf8_unchecked(func);
+                let names = if module.eq_ignore_ascii_case("ntoskrnl") {
+                    WIN32K_NTOSKRNL_IMPORTS
+                } else if module.eq_ignore_ascii_case("hal") { WIN32K_HAL_IMPORTS }
+                else { return 0; };
+                let Ok(name) = core::str::from_utf8(func) else { return 0; };
+                if !names.contains(&name) { return 0; }
                 return export_addr(name);
             }
             return base + far;
@@ -18521,203 +18350,6 @@ unsafe fn pe_export_lookup(base: u64, name: &[u8]) -> u64 {
     0
 }
 
-/// Load a driver PE (raw bytes at `src_va`) into `dst_va` (frames pre-mapped RW in BOTH the executive
-/// and win32k). Copies headers + sections, applies DIR64 relocs for `dst_va`, patches the IAT
-/// (dxgthk imports -> `dxgthk_base` exports; ntoskrnl/hal -> [`export_addr`]), records per-frame
-/// rights in `rights_out`. Returns `(entry_rva, export_dir_rva, size_of_image)` or None. HEAP-FREE.
-pub unsafe fn load_driver_into(
-    src_va: u64,
-    dst_va: u64,
-    max_frames: u64,
-    rights_out: &mut [u64],
-    dxgthk_base: u64,
-) -> Option<(u32, u32, u32)> {
-    let e = read_unaligned((src_va + 0x3c) as *const u32) as u64;
-    let nt = src_va + e;
-    if read_unaligned(nt as *const u32) != 0x0000_4550 {
-        return None;
-    }
-    let file_hdr = nt + 4;
-    let num_sections = read_unaligned((file_hdr + 2) as *const u16) as u64;
-    let size_opt_hdr = read_unaligned((file_hdr + 16) as *const u16) as u64;
-    let opt = file_hdr + 20;
-    let entry_rva = read_unaligned((opt + 16) as *const u32);
-    let image_base = read_unaligned((opt + 24) as *const u64);
-    let size_of_headers = read_unaligned((opt + 60) as *const u32) as u64;
-    let size_of_image = read_unaligned((opt + 56) as *const u32);
-    let export_dir_rva = read_unaligned((opt + 112) as *const u32);
-    let sec_table = opt + size_opt_hdr;
-    let cap = max_frames * 0x1000;
-    if cap == 0 || size_of_image == 0 || size_of_image as u64 > cap || size_of_headers > cap {
-        return None;
-    }
-
-    copy_bytes(dst_va, src_va, size_of_headers.min(cap));
-    for s in 0..num_sections {
-        let sh = sec_table + s * 40;
-        let va = read_unaligned((sh + 12) as *const u32) as u64;
-        let raw_size = read_unaligned((sh + 16) as *const u32) as u64;
-        let raw_ptr = read_unaligned((sh + 20) as *const u32) as u64;
-        let vsize = read_unaligned((sh + 8) as *const u32) as u64;
-        let chars = read_unaligned((sh + 36) as *const u32);
-        if va >= cap {
-            continue;
-        }
-        let n = raw_size.min(cap - va);
-        copy_bytes(dst_va + va, src_va + raw_ptr, n);
-        let r = if chars & 0x2000_0000 != 0 {
-            2u64
-        } else {
-            RW_NX
-        };
-        let span = va.saturating_add(vsize.max(raw_size)).min(cap);
-        let mut p = va & !0xFFF;
-        while p < span {
-            let idx = (p / 0x1000) as usize;
-            if idx < rights_out.len() {
-                rights_out[idx] = r;
-            }
-            p += 0x1000;
-        }
-    }
-
-    // DIR64 relocs for the load at dst_va.
-    let delta = dst_va.wrapping_sub(image_base);
-    if delta != 0 {
-        let reloc_rva = read_unaligned((opt + 112 + 5 * 8) as *const u32) as u64;
-        let reloc_size = read_unaligned((opt + 112 + 5 * 8 + 4) as *const u32) as u64;
-        if reloc_rva != 0 && !image_rva_span_ok(reloc_rva, reloc_size, cap) {
-            return None;
-        }
-        let mut off = 0u64;
-        while reloc_rva != 0 && off + 8 <= reloc_size {
-            let block_rva = reloc_rva + off;
-            let page_rva = read_unaligned((dst_va + block_rva) as *const u32) as u64;
-            let block = read_unaligned((dst_va + block_rva + 4) as *const u32) as u64;
-            if block < 8 || block > reloc_size - off {
-                return None;
-            }
-            let cnt = (block - 8) / 2;
-            for i in 0..cnt {
-                let ent = read_unaligned((dst_va + block_rva + 8 + i * 2) as *const u16);
-                if (ent >> 12) == 10 {
-                    let t = page_rva + (ent & 0xFFF) as u64;
-                    if image_rva_span_ok(t, 8, cap) {
-                        let v = read_unaligned((dst_va + t) as *const u64);
-                        write_unaligned((dst_va + t) as *mut u64, v.wrapping_add(delta));
-                    }
-                }
-            }
-            off += block;
-        }
-    }
-
-    // Patch the IAT: resolve per import descriptor by DLL name.
-    let imp_rva = read_unaligned((opt + 112 + 8) as *const u32) as u64;
-    if imp_rva != 0 {
-        let imp_size = read_unaligned((opt + 112 + 8 + 4) as *const u32) as u64;
-        if !image_rva_span_ok(imp_rva, imp_size, cap) {
-            return None;
-        }
-        let imp_end = imp_rva + imp_size;
-        let mut desc_rva = imp_rva;
-        while desc_rva + 20 <= imp_end {
-            let desc = dst_va + desc_rva;
-            let ilt = read_unaligned(desc as *const u32) as u64;
-            let iat = read_unaligned((desc + 16) as *const u32) as u64;
-            let dll_name_rva = read_unaligned((desc + 12) as *const u32) as u64;
-            if ilt == 0 && iat == 0 {
-                break;
-            }
-            let is_dxgthk = dll_name_rva != 0
-                && image_c_string_has_prefix_ignore_case(dst_va, dll_name_rva, cap, 31, b"dxgthk");
-            // ftfd.dll imports its 8 Eng*/Rtl thunks from win32k.sys — resolve against win32k's
-            // own export table (real Eng* code + forwarders to ntoskrnl handled by pe_export_lookup).
-            let is_win32k = dll_name_rva != 0
-                && image_c_string_has_prefix_ignore_case(dst_va, dll_name_rva, cap, 31, b"win32k");
-            let thunk_rva = if ilt != 0 { ilt } else { iat };
-            if !image_rva_span_ok(thunk_rva, 8, cap) || !image_rva_span_ok(iat, 8, cap) {
-                return None;
-            }
-            let names = dst_va + thunk_rva;
-            let slots = dst_va + iat;
-            let mut k = 0u64;
-            let thunk_cap = ((cap - thunk_rva) / 8).min((cap - iat) / 8);
-            let mut terminated = false;
-            while k < thunk_cap {
-                let thunk = read_unaligned((names + k * 8) as *const u64);
-                if thunk == 0 {
-                    terminated = true;
-                    break;
-                }
-                if thunk & 0x8000_0000_0000_0000 == 0 {
-                    let name_rva = thunk & 0x7FFF_FFFF;
-                    if !image_rva_span_ok(name_rva, 2, cap) {
-                        return None;
-                    }
-                    let name_ptr = dst_va + name_rva + 2;
-                    let cstr_len = image_c_string_len(dst_va, name_rva + 2, cap, 63)?;
-                    let import_name = core::slice::from_raw_parts(name_ptr as *const u8, cstr_len);
-                    let (addr, direct) = if import_name_eq(import_name, b"EngDeviceIoControl") {
-                        (s_eng_device_io_control as usize as u64, true)
-                    } else if is_dxgthk {
-                        if dxgthk_base == 0 {
-                            log_unresolved_gdi_driver_import(import_name);
-                            return None;
-                        }
-                        let addr = pe_export_lookup(dxgthk_base, import_name);
-                        if addr == 0 {
-                            log_unresolved_gdi_driver_import(import_name);
-                            return None;
-                        }
-                        (addr, false)
-                    } else if is_win32k {
-                        let addr = pe_export_lookup(WIN32K_CODE_VA, import_name);
-                        if addr == 0 {
-                            log_unresolved_gdi_driver_import(import_name);
-                            return None;
-                        }
-                        (addr, false)
-                    } else {
-                        let name = core::str::from_utf8_unchecked(import_name);
-                        let addr = export_addr(name);
-                        if addr == 0 {
-                            log_unresolved_gdi_driver_import(import_name);
-                            return None;
-                        }
-                        (addr, false)
-                    };
-                    trace_gdi_driver_import(import_name, slots + k * 8, addr, direct);
-                    write_unaligned((slots + k * 8) as *mut u64, addr);
-                }
-                k += 1;
-            }
-            if !terminated {
-                return None;
-            }
-            desc_rva += 20;
-        }
-    }
-
-    Some((entry_rva, export_dir_rva, size_of_image))
-}
-
-/// Record the loaded dxg.sys info for the ZwSetSystemInformation trampoline. Called by the executive
-/// after `load_driver_into(dxg)`.
-pub fn record_dxg(entry_rva: u32, export_dir_rva: u32, image_len: u32) {
-    let expd = if export_dir_rva != 0 {
-        DXG_VA + export_dir_rva as u64
-    } else {
-        0
-    };
-    let _ = register_gdi_driver_image(
-        b"dxg.sys",
-        DXG_VA,
-        DXG_VA + entry_rva as u64,
-        expd,
-        image_len,
-    );
-}
 
 /// Return the Nth non-native static dependency imported by win32k. Native imports (`ntoskrnl.*` and
 /// `hal.*`) are bound by the normal trampoline registry during `load_into`; every other DLL must be
@@ -18772,10 +18404,9 @@ pub unsafe fn win32k_static_import_dependency(index: usize, out: &mut [u8]) -> O
     None
 }
 
-/// Re-patch win32k's OWN IAT for a loaded static import DLL. Runs in the EXECUTIVE while win32k's
-/// frames are still mapped writable at [`WIN32K_CODE_VA`]. `load_into` initially resolved non-native
-/// imports to visible benign stubs because the dependency image was not loaded yet; this points the
-/// import slots at real exports from the loaded dependency. Returns the number of slots patched.
+/// Patch win32k's OWN IAT for a loaded static import DLL. Runs in the EXECUTIVE while win32k's
+/// frames are still mapped writable at [`WIN32K_CODE_VA`]. `load_into` leaves non-native IAT slots
+/// untouched until the dependency image is available. Returns the number of slots patched.
 pub unsafe fn patch_win32k_static_import(dll_name: &[u8], dll_base: u64) -> u32 {
     if !import_dll_name_is_safe(dll_name) || dll_base == 0 {
         return 0;
@@ -18815,37 +18446,46 @@ pub unsafe fn patch_win32k_static_import(dll_name: &[u8], dll_base: u64) -> u32 
             if !image_rva_span_ok(thunk_rva, 8, WIN32K_IMAGE_BYTES)
                 || !image_rva_span_ok(iat, 8, WIN32K_IMAGE_BYTES)
             {
-                return patched;
+                return 0;
             }
             let names = code_va + thunk_rva;
             let slots = code_va + iat;
             let mut k = 0u64;
+            let mut terminated = false;
             let thunk_cap =
                 ((WIN32K_IMAGE_BYTES - thunk_rva) / 8).min((WIN32K_IMAGE_BYTES - iat) / 8);
             while k < thunk_cap {
                 let thunk = read_unaligned((names + k * 8) as *const u64);
                 if thunk == 0 {
+                    terminated = true;
                     break;
                 }
                 if thunk & 0x8000_0000_0000_0000 == 0 {
                     let name_rva = thunk & 0x7FFF_FFFF;
                     if !image_rva_span_ok(name_rva, 2, WIN32K_IMAGE_BYTES) {
-                        return patched;
+                        return 0;
                     }
                     let name_ptr = code_va + name_rva + 2;
                     let Some(cstr_len) =
                         image_c_string_len(code_va, name_rva + 2, WIN32K_IMAGE_BYTES, 63)
                     else {
-                        return patched;
+                        return 0;
                     };
                     let import_name = core::slice::from_raw_parts(name_ptr as *const u8, cstr_len);
                     let addr = pe_export_lookup(dll_base, import_name);
-                    if addr != 0 {
-                        write_unaligned((slots + k * 8) as *mut u64, addr);
-                        patched += 1;
+                    if addr == 0 {
+                        log_unresolved_win32k_import(import_name);
+                        return 0;
                     }
+                    write_unaligned((slots + k * 8) as *mut u64, addr);
+                    patched += 1;
+                } else {
+                    return 0;
                 }
                 k += 1;
+            }
+            if !terminated {
+                return 0;
             }
             break;
         }

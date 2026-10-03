@@ -26,12 +26,15 @@ pub(super) unsafe fn pin_input(
     if address == 0 {
         return Err(STATUS_ACCESS_VIOLATION_I32);
     }
-    if let Some(catalog) = stack_catalog_mut() {
-        if catalog.resolve(address, length).is_ok() {
-            return catalog
-                .pin_active_range(activation, address, length)
-                .map(|(_, pin)| PinnedInput::Stack(pin))
-                .map_err(|_| STATUS_ACCESS_VIOLATION_I32);
+    {
+        let mut metadata = ProviderMetadataGuard::acquire();
+        if let Some(catalog) = stack_catalog_mut(&mut metadata) {
+            if catalog.resolve(address, length).is_ok() {
+                return catalog
+                    .pin_active_range(activation, address, length)
+                    .map(|(_, pin)| PinnedInput::Stack(pin))
+                    .map_err(|_| STATUS_ACCESS_VIOLATION_I32);
+            }
         }
     }
     if provider_pool_contains(address) {
@@ -97,8 +100,10 @@ pub(super) unsafe fn input_live(
     match pin {
         PinnedInput::None => length == 0,
         PinnedInput::Stack(pin) => {
+            let mut metadata = ProviderMetadataGuard::acquire();
             pin.range() == (address, length)
-                && stack_catalog_mut().is_some_and(|catalog| catalog.validate_pin(*pin).is_ok())
+                && stack_catalog_mut(&mut metadata)
+                    .is_some_and(|catalog| catalog.validate_pin(*pin).is_ok())
         }
         PinnedInput::Pool { snapshot, pin, native } => {
             let catalog_live = with_provider_allocations(|catalog| {
@@ -138,13 +143,18 @@ pub(super) unsafe fn input_live(
     }
 }
 
-pub(super) unsafe fn stack_catalog_mut(
-) -> Option<&'static mut nt_provider_wait::ProviderStackActivationCatalog> {
+pub(super) unsafe fn stack_catalog_mut<'a>(
+    _metadata: &'a mut ProviderMetadataGuard,
+) -> Option<&'a mut nt_provider_wait::ProviderStackActivationCatalog> {
     (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS)).as_mut()
 }
 
 pub(super) unsafe fn release_stack_pin(pin: ProviderStackLanePin, label: u64) {
-    if stack_catalog_mut().is_none_or(|catalog| catalog.release_pin(pin).is_err()) {
+    let released = {
+        let mut metadata = ProviderMetadataGuard::acquire();
+        stack_catalog_mut(&mut metadata).is_some_and(|catalog| catalog.release_pin(pin).is_ok())
+    };
+    if !released {
         crate::provider_bugcheck::report(0xc4, [label, pin.range().0, pin.range().1, 1]);
     }
 }
@@ -166,18 +176,27 @@ pub(super) unsafe fn copy_validated_input(
     if address == 0 || destination.len() != length as usize {
         return Err(STATUS_ACCESS_VIOLATION_I32);
     }
-    if let Some(catalog) = stack_catalog_mut() {
-        if catalog.resolve(address, length).is_ok() {
-            let (_, pin) = catalog
-                .pin_active_range(activation, address, length)
-                .map_err(|_| STATUS_ACCESS_VIOLATION_I32)?;
-            destination.copy_from_slice(core::slice::from_raw_parts(
-                address as *const u8,
-                length as usize,
-            ));
-            release_stack_pin(pin, label);
-            return Ok(());
+    let stack_pin = {
+        let mut metadata = ProviderMetadataGuard::acquire();
+        match stack_catalog_mut(&mut metadata) {
+            Some(catalog) if catalog.resolve(address, length).is_ok() => {
+                Some(
+                    catalog
+                        .pin_active_range(activation, address, length)
+                        .map_err(|_| STATUS_ACCESS_VIOLATION_I32)?
+                        .1,
+                )
+            }
+            _ => None,
         }
+    };
+    if let Some(pin) = stack_pin {
+        destination.copy_from_slice(core::slice::from_raw_parts(
+            address as *const u8,
+            length as usize,
+        ));
+        release_stack_pin(pin, label);
+        return Ok(());
     }
     if provider_pool_contains(address) {
         let (_, pin) = with_provider_allocations(|catalog| catalog.pin_containing(address, length))

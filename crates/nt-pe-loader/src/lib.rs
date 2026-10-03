@@ -14,7 +14,12 @@ extern crate alloc;
 mod exports;
 mod headers;
 mod image;
+mod image_page_fill;
 pub mod immutable_support_image;
+pub mod system_module;
+pub mod system_image_request;
+pub mod load_failure;
+pub mod module_namespace;
 mod imports;
 mod relocs;
 mod rva;
@@ -25,6 +30,7 @@ pub use headers::{
     DIRECTORY_ENTRY_RESOURCE, DIRECTORY_ENTRY_TLS,
 };
 pub use image::MappedImage;
+pub use image_page_fill::{ImagePageFileSpan, ImagePageFillPlan, IMAGE_PAGE_SIZE};
 pub use imports::{ImportRef, ImportedDll};
 pub use relocs::{RelocKind, Relocation};
 
@@ -144,6 +150,10 @@ pub enum PeError {
     TooManySections(u16),
     /// A section's raw/virtual extents are out of bounds.
     SectionOutOfBounds,
+    /// A section starts inside a page, so page-level SEC_IMAGE rights are ambiguous.
+    UnsupportedImageAlignment(u32),
+    /// Multiple image regions assign conflicting ownership to one SEC_IMAGE page.
+    AmbiguousImagePage(u32),
     /// An RVA does not fall within any section.
     BadRva(u32),
     /// `SizeOfImage` is implausible / would overflow.
@@ -609,6 +619,17 @@ impl<'a> PeFile<'a> {
             }
         }
         ImageProtection::ReadOnly
+    }
+
+    /// Plan one SEC_IMAGE page from raw file offsets without reading its payload.
+    /// `file_size` is the authenticated backing File's current size, not the
+    /// length of the header buffer passed to [`PeFile::parse`].
+    pub fn image_page_fill_plan(
+        &self,
+        page_rva: u32,
+        file_size: u64,
+    ) -> Result<ImagePageFillPlan, PeError> {
+        image_page_fill::plan(self, page_rva, file_size)
     }
 
     /// Map the image into a fresh buffer at `load_base`, copying headers +

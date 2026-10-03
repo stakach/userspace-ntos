@@ -9,6 +9,9 @@
 mod hosted_irq_arena;
 mod hosted_irq_call_stack;
 mod progress_deferral;
+mod driver_load_receipt;
+
+pub use driver_load_receipt::{DriverLoadPhase, RetainedEffectState};
 
 pub use hosted_irq_arena::{
     decode_hosted_irq_transport_message, HostedIrqArena, HostedIrqArenaConfig,

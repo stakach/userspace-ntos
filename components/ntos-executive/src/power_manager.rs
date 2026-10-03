@@ -46,24 +46,6 @@ pub(crate) unsafe fn unregister_device(devnode_id: u64) {
     }
 }
 
-pub(crate) unsafe fn report_device_state(
-    devnode_id: u64,
-    state: nt_power_manager::DevicePowerState,
-) -> Result<nt_power_manager::DevicePowerState, nt_status::NtStatus> {
-    manager_mut()
-        .report_device_state(devnode_id, state)
-        .map_err(status)
-}
-
-pub(crate) unsafe fn report_system_state(
-    devnode_id: u64,
-    state: nt_power_manager::SystemPowerState,
-) -> Result<nt_power_manager::SystemPowerState, nt_status::NtStatus> {
-    manager_mut()
-        .report_system_state(devnode_id, state)
-        .map_err(status)
-}
-
 pub(crate) unsafe fn started_device_state(
     devnode_id: u64,
 ) -> Result<nt_power_manager::DevicePowerState, nt_status::NtStatus> {

@@ -23,6 +23,7 @@
 //! executive's ad-hoc apphelp denylist hack (`project_full_fs.md`): the loader controls whether the
 //! shim engine loads, by policy, not by a name blocklist. See [`init::ShimPolicy`].
 
+pub mod entry;
 pub mod host;
 pub mod ifeo;
 pub mod init;

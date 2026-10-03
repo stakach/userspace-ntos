@@ -23,6 +23,7 @@ mod mutation;
 mod snapshot;
 mod system_hive_path;
 mod system_mount;
+mod mutation_preparation;
 
 use alloc::rc::Rc;
 use alloc::string::String;
@@ -309,19 +310,8 @@ fn apply_system_hive_mutation(
                 mutation::ChildParentAuthority::Lease(_) => Err(STATUS_INVALID_HANDLE),
             }
         }
-        HiveMutation::CreateKey { path } => {
-            let path = relative(path)?;
-            let mut parent = transaction.hive().root();
-            for name in path.split('\\').filter(|part| !part.is_empty()) {
-                match transaction.hive().open_subkey(parent, name) {
-                    Some(child) => parent = child,
-                    None if transaction.hive().is_volatile(parent) => return Err(0xc000_0181u32 as i32),
-                    None => break,
-                }
-            }
-            transaction.create_key(&path);
-            Ok(())
-        }
+        // Path creation must be normalized to assigned single-child metadata before admission.
+        HiveMutation::CreateKey { .. } => Err(STATUS_INVALID_PARAMETER),
         HiveMutation::SetValue {
             path,
             name,
@@ -454,7 +444,7 @@ fn project_system_hive_mutations(
         enum_changed |= affects_enum;
         match mutation {
             HiveMutation::CreateKey { .. } => {
-                registry.create_key(&path);
+                return Err(STATUS_INVALID_PARAMETER);
             }
             HiveMutation::CreateChild { descriptor, class_name, volatile, .. } => {
                 let key = registry.create_key(&path);
@@ -1019,6 +1009,12 @@ struct PreparedSystemHiveMutation {
     expected_generation: u64,
     next_generation: u64,
     semantic_journal_len: usize,
+    mutations: Vec<HiveMutation>,
+    durable_journal: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct PreparedSystemHiveMutations {
     mutations: Vec<HiveMutation>,
     durable_journal: Vec<u8>,
 }
@@ -2111,7 +2107,7 @@ impl CmServer {
                 class_name: class_name.as_deref(),
                 descriptor,
             },
-            HiveMutation::CreateKey { .. } => HiveLogOp::CreateKey { path: &relative },
+            HiveMutation::CreateKey { .. } => return Err(STATUS_INVALID_PARAMETER),
             HiveMutation::SetValue {
                 name,
                 value_type,
@@ -2151,28 +2147,21 @@ impl CmServer {
     fn prepare_system_hive_mutations(
         &mut self,
         mutations: &[HiveMutation],
-    ) -> Result<Vec<u8>, i32> {
+    ) -> Result<PreparedSystemHiveMutations, i32> {
         let (system_hive, cm) = (&mut self.system_hive, &mut self.cm);
         let mounted = system_hive.as_mut().ok_or(STATUS_DEVICE_NOT_READY)?;
         let previous_control_set = mounted.current_control_set.clone();
         let mut transaction = mounted.hive.begin_transaction();
         let mut durable_journal = Vec::new();
+        let mut normalized = Vec::new();
         for mutation in mutations {
-            let previous_sequence = transaction.hive().sequence;
-            apply_system_hive_mutation(&mut transaction, &previous_control_set, mutation)?;
-            let sequence = transaction.hive().sequence;
-            if sequence == previous_sequence {
-                continue;
-            }
-            let record = Self::encode_system_hive_mutation_log_record(
-                mutation,
+            mutation_preparation::apply(
+                &mut transaction,
                 &previous_control_set,
-                sequence,
+                mutation,
+                &mut normalized,
+                &mut durable_journal,
             )?;
-            durable_journal
-                .try_reserve_exact(record.len())
-                .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-            durable_journal.extend_from_slice(&record);
         }
         let current_control_set = transaction
             .current_control_set()
@@ -2180,13 +2169,13 @@ impl CmServer {
 
         if previous_control_set == current_control_set {
             let mut registry = cm.registry_mut().begin_transaction();
-            let _ = project_system_hive_mutations(&mut registry, &current_control_set, mutations)?;
+            let _ = project_system_hive_mutations(&mut registry, &current_control_set, &normalized)?;
         } else {
             let _ = config_manager_from_system_hive(transaction.hive(), &current_control_set);
         }
         // Both validation transactions roll back here. Publication happens only after the caller
         // has made `durable_journal` stable.
-        Ok(durable_journal)
+        Ok(PreparedSystemHiveMutations { mutations: normalized, durable_journal })
     }
 
     fn commit_system_hive_mutations(
@@ -3871,14 +3860,26 @@ mod tests {
                 instance_id: String::from(r"ROOT\CLAIM\0000"),
             },
         ];
-        assert_eq!(server.commit_system_hive_mutations(&mutations, 2), Ok(true));
+        let prepared = server.prepare_system_hive_mutations(&mutations).unwrap();
+        assert_eq!(server.commit_system_hive_mutations(&prepared.mutations, 2), Ok(true));
     }
 
     fn selected_system_hive(number: u32) -> Hive {
         let mut hive = Hive::new(HiveKind::System);
         let select = hive.create_key("Select");
         hive.set_dword(select, "Current", number);
-        hive.create_key(&alloc::format!("ControlSet{number:03}"));
+        let control_set = hive.create_key(&alloc::format!("ControlSet{number:03}"));
+        let system = nt_security::AccessToken::system();
+        let subject = nt_security::CapturedSubjectTokens {
+            primary: &system, client: None, process_audit_id: 0,
+        };
+        let root_security = nt_security::assign_registry_root_security(
+            &subject, &mut nt_security::SecurityAssignmentAudit::default(),
+        ).unwrap();
+        let child_security = nt_config_manager::inherit_generated_key_security(&root_security).unwrap();
+        hive.set_key_security_descriptor(hive.root(), &root_security);
+        hive.set_key_security_descriptor(select, &child_security);
+        hive.set_key_security_descriptor(control_set, &child_security);
         hive
     }
 
@@ -5076,8 +5077,9 @@ mod tests {
                 ),
             },
         ];
+        let prepared = server.prepare_system_hive_mutations(&mutations).unwrap();
         assert_eq!(
-            server.commit_system_hive_mutations(&mutations, 2),
+            server.commit_system_hive_mutations(&prepared.mutations, 2),
             Ok(false)
         );
 

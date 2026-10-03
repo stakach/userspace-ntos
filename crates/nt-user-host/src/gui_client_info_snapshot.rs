@@ -32,6 +32,7 @@ pub struct DesktopClientMapping {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyboardLayoutClientInfo {
     pub hkl: u64,
+    /// Zero is CP_ACP, the caller's default ANSI codepage.
     pub codepage: u16,
 }
 
@@ -88,7 +89,7 @@ impl<D: Copy + Eq> GuiClientInfoSnapshot<D> {
         if win32_thread_info == 0 {
             return Err(GuiClientInfoError::InvalidThreadInfo);
         }
-        if keyboard_layout.is_some_and(|layout| layout.hkl == 0 || layout.codepage == 0) {
+        if keyboard_layout.is_some_and(|layout| layout.hkl == 0) {
             return Err(GuiClientInfoError::InvalidKeyboardLayout);
         }
         let (client_deskinfo, client_thread_info, desktop_delta) = mapping.translate()?;
@@ -157,7 +158,12 @@ impl DesktopClientMapping {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
+    use nt_object_manager::win32k_ob::{ObHandleTable, ObKind};
     use nt_process::ProcessManager;
+    use nt_provider_wait::{
+        ProviderAllocationCatalog, ProviderAllocationError, ProviderArenaIdentity,
+    };
     use nt_types::ProcessGeneration;
 
     fn owner() -> (ProcessManager, GuiClientInfoOwner<u64>) {
@@ -298,5 +304,69 @@ mod tests {
             ),
             Err(GuiClientInfoError::InvalidKeyboardLayout)
         );
+    }
+
+    #[test]
+    fn cp_acp_is_a_valid_keyboard_layout_codepage() {
+        let (_, owner) = owner();
+        let keyboard = KeyboardLayoutClientInfo {
+            hkl: 0x0409_0409,
+            codepage: 0,
+        };
+        let snapshot = GuiClientInfoSnapshot::capture(
+            owner,
+            owner,
+            1,
+            mapping(),
+            Some(keyboard),
+        )
+        .expect("CP_ACP is represented by zero");
+        assert_eq!(snapshot.values_for(owner).unwrap().keyboard_layout, Some(keyboard));
+    }
+
+    #[test]
+    fn copyout_owners_survive_reentrant_retirement_until_reply() {
+        let (_, owner) = owner();
+        let mut allocations = ProviderAllocationCatalog::new();
+        let arena = ProviderArenaIdentity {
+            id: 1,
+            generation: 1,
+        };
+        let spans = [
+            (0x1230, 0x100),
+            (0x8000_0100, DESKTOPINFO_BYTES),
+            (0x8000_0300, CLIENTTHREADINFO_BYTES),
+            (0x2000, 0x100),
+        ];
+        let mut pins = Vec::new();
+        for (base, bytes) in spans {
+            let snapshot = allocations.register(arena, base, bytes).unwrap();
+            let (pinned, pin) = allocations.pin_containing(base, bytes).unwrap();
+            assert_eq!(pinned.identity, snapshot.identity);
+            pins.push((snapshot.identity, pin));
+        }
+
+        let desktop_body = 0x3000;
+        let mut objects = ObHandleTable::new();
+        let desktop_handle = objects.register(ObKind::Desktop, desktop_body);
+        assert_ne!(desktop_handle, 0);
+        assert_eq!(objects.reference_by_body(desktop_body), Some(2));
+        let snapshot = GuiClientInfoSnapshot::capture(owner, owner, 0x1234, mapping(), None)
+            .unwrap();
+
+        for (identity, _) in &pins {
+            assert_eq!(allocations.begin_retirement(*identity), Err(ProviderAllocationError::Pinned));
+        }
+        assert_eq!(objects.counts_by_body(desktop_body), Some((2, 1)));
+        assert_eq!(snapshot.values_for(owner).unwrap().client_deskinfo, 0x4000_0100);
+
+        // The synchronous component Reply acknowledges the root copyout before these owners go.
+        for (_, pin) in pins.iter().rev() {
+            allocations.release_pin(*pin).unwrap();
+        }
+        assert_eq!(objects.dereference_by_body(desktop_body), Some(1));
+        for (identity, _) in pins {
+            allocations.begin_retirement(identity).unwrap();
+        }
     }
 }

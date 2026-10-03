@@ -12,7 +12,13 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: b
             || crate::driver_launch::nested_hosted_write_ready()
             || crate::driver_launch::nested_hosted_read_ready()
             || crate::driver_launch::nested_hosted_flush_ready()
-            || crate::driver_launch::nested_hosted_query_information_ready() {
+            || crate::driver_launch::nested_hosted_query_information_ready()
+            || crate::driver_launch::nested_hosted_lower_pnp_ready()
+            || crate::driver_launch::nested_hosted_kernel_file_read_query_ready()
+            || crate::hosted_routed_file_close_work::nested_work_ready()
+            || crate::driver_launch::nested_hosted_file_lifecycle_work_ready()
+            || crate::driver_launch::nested_win32k_source_work_ready()
+            || crate::provider_section_broker::nested_work_ready() {
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             let parent = match runtime::nested::park_current() {
                 Ok(parent) => parent,
@@ -124,12 +130,21 @@ pub(super) unsafe fn service_autonomous(route: PeerRoute) -> Result<(), runtime:
             .ok_or(runtime::Error::PhysicalIdentity)?;
         let message = runtime::stored_current_message(route)?;
         let mut reply = channel.reply_cap;
+        let mut seh = hosted_seh_pump::SehLease::claim(&channel, reply, true)
+            .ok_or(runtime::Error::PhysicalIdentity)?;
         let outcome = component_pump_loop(
             &channel,
             PumpMessage::from_received(message),
             &mut reply,
             nt_user_host::component_pump::ComponentPumpAccounting::new(false),
+            &mut seh.pump,
         );
+        let suspended = outcome.callback_suspended
+            || outcome.provider_wait_suspended
+            || outcome.lpc_wait_suspended;
+        if !seh.finish(&channel, reply, suspended) {
+            return Err(runtime::Error::PhysicalIdentity);
+        }
         // An autonomous thread does not speak the dispatch-worker completion protocol. Only
         // the acknowledged service Reply can complete its invocation and return this lane idle.
         if outcome.completed

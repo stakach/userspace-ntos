@@ -41,13 +41,13 @@ impl Drop for ReadsGuard {
     }
 }
 
-unsafe fn stack_catalog_mut(
-) -> Option<&'static mut nt_provider_wait::ProviderStackActivationCatalog> {
-    (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS)).as_mut()
-}
-
 unsafe fn release_pin(pin: ProviderStackLanePin) {
-    if stack_catalog_mut().is_none_or(|catalog| catalog.release_pin(pin).is_err()) {
+    let released = {
+        let mut metadata = ProviderMetadataGuard::acquire();
+        provider_input::stack_catalog_mut(&mut metadata)
+            .is_some_and(|catalog| catalog.release_pin(pin).is_ok())
+    };
+    if !released {
         crate::provider_bugcheck::report(
             0xc4,
             [W32_FILE_READ_LABEL, pin.range().0, pin.range().1, 1],
@@ -72,16 +72,26 @@ unsafe fn reserve_read(
     let next = local_id
         .checked_add(1)
         .ok_or(STATUS_INSUFFICIENT_RESOURCES_I32)?;
-    let catalog = stack_catalog_mut().ok_or(STATUS_NOT_SUPPORTED_I32)?;
-    let (_, iosb_pin) = catalog
-        .pin_active_range(activation, iosb, 16)
-        .map_err(|_| STATUS_ACCESS_VIOLATION_I32)?;
-    let (_, output_pin) = match catalog.pin_active_range(activation, output, length as u64) {
-        Ok(pinned) => pinned,
-        Err(_) => {
-            release_pin(iosb_pin);
-            return Err(STATUS_ACCESS_VIOLATION_I32);
-        }
+    let (iosb_pin, output_pin) = {
+        let mut metadata = ProviderMetadataGuard::acquire();
+        let catalog = provider_input::stack_catalog_mut(&mut metadata)
+            .ok_or(STATUS_NOT_SUPPORTED_I32)?;
+        let (_, iosb_pin) = catalog
+            .pin_active_range(activation, iosb, 16)
+            .map_err(|_| STATUS_ACCESS_VIOLATION_I32)?;
+        let (_, output_pin) = match catalog.pin_active_range(activation, output, length as u64) {
+            Ok(pinned) => pinned,
+            Err(_) => {
+                if catalog.release_pin(iosb_pin).is_err() {
+                    crate::provider_bugcheck::report(
+                        0xc4,
+                        [W32_FILE_READ_LABEL, iosb_pin.range().0, iosb_pin.range().1, 1],
+                    );
+                }
+                return Err(STATUS_ACCESS_VIOLATION_I32);
+            }
+        };
+        (iosb_pin, output_pin)
     };
     reads[slot] = Some(PendingRead {
         local_id,
@@ -265,11 +275,15 @@ pub(super) extern "win64" fn read(
         let Some(activation) = active_provider_stack_event_activation() else {
             return STATUS_NOT_SUPPORTED_I32;
         };
-        if stack_catalog_mut().is_none_or(|catalog| {
-            catalog
-                .resolve(byte_offset, 8)
-                .map_or(true, |(binding, _)| binding.handle != activation.lane)
-        }) {
+        let offset_live = {
+            let mut metadata = ProviderMetadataGuard::acquire();
+            provider_input::stack_catalog_mut(&mut metadata).is_some_and(|catalog| {
+                catalog
+                    .resolve(byte_offset, 8)
+                    .is_ok_and(|(binding, _)| binding.handle == activation.lane)
+            })
+        };
+        if !offset_live {
             return STATUS_ACCESS_VIOLATION_I32;
         }
         let offset = read_unaligned(byte_offset as *const u64);

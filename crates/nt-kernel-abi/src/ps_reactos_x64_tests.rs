@@ -265,6 +265,7 @@ fn system_thread_has_real_cid_process_links_and_cross_thread_flag() {
     initialize_thread(&mut bytes, init).unwrap();
     let mut expected = [0; ETHREAD_BODY_BYTES];
     expected[0] = 6;
+    expected[KTHREAD_ENABLE_STACK_SWAP] = 1;
     for offset in [0x08, 0x18, 0x48, 0x58, 0x330, 0x348, 0x368, 0x3b8] {
         expected_u64(&mut expected, offset, init.body.0 + offset as u64);
         expected_u64(&mut expected, offset + 8, init.body.0 + offset as u64);
@@ -283,6 +284,60 @@ fn system_thread_has_real_cid_process_links_and_cross_thread_flag() {
     assert_eq!(u64_at(&bytes, KTHREAD_WIN32_THREAD), 0);
     assert_eq!(bytes[KTHREAD_PREVIOUS_MODE], 0);
     assert_eq!(ETHREAD_THREAD_NAME + 8, ETHREAD_BODY_BYTES);
+}
+
+#[test]
+fn thread_execution_state_uses_exact_x64_fields_and_preserves_neighbors() {
+    assert_eq!(KTHREAD_ENABLE_STACK_SWAP, 0x94);
+    let mut bytes = [0; ETHREAD_BODY_BYTES];
+    initialize_thread(&mut bytes, thread()).unwrap();
+    assert_eq!(thread_previous_mode(&bytes), Ok(ThreadPreviousMode::KernelMode));
+    let before = bytes;
+    assert_eq!(exchange_thread_stack_swap_enable(&mut bytes, false), Ok(true));
+    assert_eq!(exchange_thread_stack_swap_enable(&mut bytes, false), Ok(false));
+    assert_eq!(exchange_thread_stack_swap_enable(&mut bytes, true), Ok(false));
+    assert_eq!(bytes, before);
+    assert_eq!(exchange_thread_previous_mode(&mut bytes, ThreadPreviousMode::UserMode),
+        Ok(ThreadPreviousMode::KernelMode));
+    assert_eq!(thread_previous_mode(&bytes), Ok(ThreadPreviousMode::UserMode));
+    assert_eq!(exchange_thread_previous_mode(&mut bytes, ThreadPreviousMode::KernelMode),
+        Ok(ThreadPreviousMode::UserMode));
+    assert_eq!(bytes, before);
+}
+
+#[test]
+fn invalid_execution_state_and_short_projections_refuse_mutation() {
+    let mut bytes = [0; ETHREAD_BODY_BYTES];
+    initialize_thread(&mut bytes, thread()).unwrap();
+    bytes[KTHREAD_PREVIOUS_MODE] = 2;
+    bytes[KTHREAD_ENABLE_STACK_SWAP] = 2;
+    let before = bytes;
+    assert_eq!(thread_previous_mode(&bytes), Err(ProjectionError::InvalidPreviousMode));
+    assert_eq!(exchange_thread_previous_mode(&mut bytes, ThreadPreviousMode::KernelMode),
+        Err(ProjectionError::InvalidPreviousMode));
+    assert_eq!(exchange_thread_stack_swap_enable(&mut bytes, true),
+        Err(ProjectionError::InvalidBoolean));
+    assert_eq!(bytes, before);
+    assert_eq!(exchange_thread_previous_mode(&mut bytes[..KTHREAD_PREVIOUS_MODE],
+        ThreadPreviousMode::UserMode), Err(ProjectionError::BufferTooSmall));
+    assert_eq!(exchange_thread_stack_swap_enable(&mut bytes[..KTHREAD_ENABLE_STACK_SWAP], false),
+        Err(ProjectionError::BufferTooSmall));
+    assert_eq!(bytes, before);
+}
+
+#[test]
+fn nested_execution_modes_restore_the_parked_user_continuation() {
+    let mut bytes = [0; ETHREAD_BODY_BYTES];
+    initialize_thread(&mut bytes, thread()).unwrap();
+    let initial = exchange_thread_previous_mode(&mut bytes, ThreadPreviousMode::UserMode).unwrap();
+    let outer = exchange_thread_previous_mode(&mut bytes, ThreadPreviousMode::KernelMode).unwrap();
+    let kernel = exchange_thread_previous_mode(&mut bytes, ThreadPreviousMode::UserMode).unwrap();
+    exchange_thread_previous_mode(&mut bytes, kernel).unwrap();
+    assert_eq!(thread_previous_mode(&bytes), Ok(ThreadPreviousMode::KernelMode));
+    exchange_thread_previous_mode(&mut bytes, outer).unwrap();
+    assert_eq!(thread_previous_mode(&bytes), Ok(ThreadPreviousMode::UserMode));
+    exchange_thread_previous_mode(&mut bytes, initial).unwrap();
+    assert_eq!(thread_previous_mode(&bytes), Ok(ThreadPreviousMode::KernelMode));
 }
 
 #[test]

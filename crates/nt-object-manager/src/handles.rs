@@ -199,15 +199,14 @@ impl ClientRegistry {
         Ok(rec.handle_table.insert(object, granted_access, attributes))
     }
 
-    /// Resolve a handle in `client`'s table to a new counted reference,
-    /// enforcing the expected type and requested access.
-    pub fn reference_by_handle(
+    /// Resolve a handle in `client`'s table to a new counted reference and its
+    /// granted access, enforcing the expected type first.
+    pub fn resolve_handle(
         &self,
         client: ClientId,
         handle: HandleValue,
         expected_type: Option<nt_types::ObjectTypeId>,
-        desired_access: AccessMask,
-    ) -> Result<ObjectRef, NtStatus> {
+    ) -> Result<(ObjectRef, AccessMask), NtStatus> {
         let rec = self.record(client)?;
         let entry = rec.handle_table.get(handle)?;
         if let Some(ty) = expected_type {
@@ -215,10 +214,23 @@ impl ClientRegistry {
                 return Err(NtStatus::OBJECT_TYPE_MISMATCH);
             }
         }
-        if !entry.granted_access.contains(desired_access) {
+        Ok((entry.object.clone(), entry.granted_access))
+    }
+
+    /// Reference a handle using an already-normalized access mask. Callers
+    /// with generic rights should use `ObjectManager::reference_by_handle`.
+    pub fn reference_by_handle(
+        &self,
+        client: ClientId,
+        handle: HandleValue,
+        expected_type: Option<nt_types::ObjectTypeId>,
+        desired_access: AccessMask,
+    ) -> Result<ObjectRef, NtStatus> {
+        let (object, granted_access) = self.resolve_handle(client, handle, expected_type)?;
+        if !granted_access.contains(desired_access) {
             return Err(NtStatus::ACCESS_DENIED);
         }
-        Ok(entry.object.clone())
+        Ok(object)
     }
 
     /// Close a handle in `client`'s table, returning the closed reference.

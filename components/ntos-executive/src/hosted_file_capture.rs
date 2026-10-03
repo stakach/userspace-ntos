@@ -50,6 +50,29 @@ pub(crate) fn capture(file_id: u64, device_id: u64, granted_access: u32) -> Resu
     }
 }
 
+/// The native Section caller has already authenticated a real file handle in its own table.
+/// Its source token supplies the granted access; the canonical File reference still validates
+/// the exact open FileId and device before surviving provider metadata I/O.
+pub(crate) fn capture_native_section_source(
+    source: nt_process::NativeSectionFileSource,
+) -> Result<Capture, u32> {
+    let nt_process::HandleObject::RoutedFile { file_id, device_id } = source.object() else {
+        return Err(STATUS_INVALID_HANDLE as u32);
+    };
+    let _durable = crate::allocator::enter_durable();
+    unsafe {
+        (&mut *core::ptr::addr_of_mut!(CAPTURES))
+            .capture(
+                io_manager_mut(),
+                FileId(file_id),
+                nt_io_manager::DeviceId(device_id),
+                source.granted_access(),
+            )
+            .map(Capture)
+            .map_err(|status| status.raw() as u32)
+    }
+}
+
 /// Extend an existing canonical pointer/IRP lifetime across a transaction continuation.
 pub(crate) fn capture_owned(
     file_id: u64,

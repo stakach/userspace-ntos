@@ -214,6 +214,19 @@ impl<'a> RegfHive<'a> {
     /// A cell body given a *file* offset already past the size word is not needed — everything is
     /// keyed by hbin-relative cell offset via `cell_body`.
 
+    /// Exact NK object kind; a key named `Current` is not necessarily a registry link.
+    pub fn key_kind(&self, nk: KeyRef) -> Result<nt_hive_core::KeyKind, RegfHiveImportError> {
+        let body = self.allocated_cell_body(nk)
+            .filter(|body| body.get(..2) == Some(&b"nk"[..]))
+            .ok_or(RegfHiveImportError::InvalidKey)?;
+        let flags = u16le(body, 2).ok_or(RegfHiveImportError::InvalidKey)?;
+        Ok(if flags & 0x10 != 0 {
+            nt_hive_core::KeyKind::SymbolicLink
+        } else {
+            nt_hive_core::KeyKind::Ordinary
+        })
+    }
+
     /// The name of a key node (ASCII or UTF-16LE per its flags), lowercased for case-insensitive
     /// comparison.
     fn key_name_folded(&self, nk: u32) -> Option<String> {
@@ -1001,6 +1014,9 @@ fn import_regf_key_into_hive(
         .try_reserve(1)
         .map_err(|_| RegfHiveImportError::OutOfMemory)?;
     visited.push(source_key);
+    if !target.set_key_kind(target_key, source.key_kind(source_key)?) {
+        return Err(RegfHiveImportError::InvalidKey);
+    }
     if let Some(class_name) = source.key_class(source_key)? {
         if !target.set_key_class(target_key, Some(&class_name)) {
             return Err(RegfHiveImportError::InvalidKey);
@@ -1110,7 +1126,7 @@ pub fn compose_boot_system_hive(
         .map_err(BootSystemHiveComposeError::PersistedLog)?;
     let generated = nt_hive_core::decode_image(generated_overlay_image)
         .map_err(BootSystemHiveComposeError::GeneratedOverlay)?;
-    let hive = nt_hive_core::compose_system_hive_overlay(&base, &generated)
+    let hive = nt_hive_core::compose_system_hive_overlay_secured(&base, &generated)
         .map_err(BootSystemHiveComposeError::Compose)?;
     Ok(ComposedBootSystemHive {
         hive,
@@ -1262,6 +1278,23 @@ mod tests {
             out.extend_from_slice(&unit.to_le_bytes());
         }
         out
+    }
+
+    #[test]
+    fn imported_nk_link_kind_survives_image_and_subtree_export() {
+        let (mut bytes, _) = metadata_test_hive();
+        let child_body = HBIN_BASE + 0xa0 + 4;
+        write_u16(&mut bytes, child_body + 2, 0x20 | 0x10);
+        let source = RegfHive::new(&bytes).unwrap();
+        assert_eq!(source.key_kind(source.root()), Ok(nt_hive_core::KeyKind::Ordinary));
+        assert_eq!(source.key_kind(0xa0), Ok(nt_hive_core::KeyKind::SymbolicLink));
+        let (hive, _) = try_import_regf_into_hive(&source, HiveKind::System).unwrap();
+        let child = hive.open_key("Child").unwrap();
+        assert_eq!(hive.key_kind(child), Some(nt_hive_core::KeyKind::SymbolicLink));
+        let restored = nt_hive_core::decode_image(&nt_hive_core::encode_image(&hive)).unwrap();
+        assert_eq!(restored.key_kind(restored.open_key("Child").unwrap()), Some(nt_hive_core::KeyKind::SymbolicLink));
+        let subtree = nt_hive_core::decode_image(&nt_hive_core::try_encode_subtree_image(&hive, child).unwrap()).unwrap();
+        assert_eq!(subtree.key_kind(subtree.root()), Some(nt_hive_core::KeyKind::SymbolicLink));
     }
 
     fn metadata_test_hive() -> (Vec<u8>, Vec<u8>) {
@@ -2261,6 +2294,37 @@ mod tests {
         );
     }
 
+    fn system_fixture_security() -> Vec<u8> {
+        let system = nt_security::AccessToken::system();
+        nt_security::assign_registry_root_security(
+            &nt_security::CapturedSubjectTokens {
+                primary: &system,
+                client: None,
+                process_audit_id: 0,
+            },
+            &mut nt_security::SecurityAssignmentAudit::default(),
+        )
+        .expect("System fixture security")
+    }
+
+    fn secured_services_test_hive() -> (Vec<u8>, Vec<u8>) {
+        const SECURITY: u32 = 0x1280;
+        const KEYS: &[u32] = &[
+            0x20, 0x100, 0x180, 0x240, 0x300, 0x880, 0x900, 0xb00, 0xb80, 0xc00,
+            0xc80, 0x1100,
+        ];
+        let mut data = services_test_hive();
+        let descriptor = system_fixture_security();
+        write_security_cell(&mut data, SECURITY, KEYS.len() as u32, &descriptor);
+        let cell_size = (0x18 + descriptor.len() + 7) & !7;
+        let offset = HBIN_BASE + SECURITY as usize;
+        data[offset..offset + 4].copy_from_slice(&(-(cell_size as i32)).to_le_bytes());
+        for &key in KEYS {
+            set_nk_security(&mut data, key, SECURITY);
+        }
+        (data, descriptor)
+    }
+
     fn generated_overlay_image() -> Vec<u8> {
         let mut generated = Hive::new(HiveKind::System);
         let select = generated.create_key("Select");
@@ -2283,6 +2347,24 @@ mod tests {
         persisted.set_dword(inactive, "Sentinel", 1);
         let active = persisted.create_key(r"ControlSet002\Services\Persistent");
         persisted.set_dword(active, "Primary", 2);
+        let parent_security = system_fixture_security();
+        for path in [
+            "",
+            "Select",
+            "ControlSet001",
+            r"ControlSet001\Services",
+            r"ControlSet001\Services\Inactive",
+            "ControlSet002",
+            r"ControlSet002\Services",
+            r"ControlSet002\Services\Persistent",
+        ] {
+            let key = if path.is_empty() {
+                persisted.root()
+            } else {
+                persisted.open_key(path).unwrap()
+            };
+            assert!(persisted.set_key_security_descriptor(key, &parent_security));
+        }
         let base_sequence = persisted.sequence;
         let primary = nt_hive_core::encode_image(&persisted);
         let log = nt_hive_core::encode_log_record(
@@ -2318,6 +2400,18 @@ mod tests {
             .hive
             .open_key(r"ControlSet002\Services\GeneratedDriver")
             .is_some());
+        let services = composed.hive.open_key(r"ControlSet002\Services").unwrap();
+        assert_eq!(
+            composed.hive.key_security_descriptor(services),
+            Some(parent_security.as_slice())
+        );
+        let generated = composed.hive
+            .open_key(r"ControlSet002\Services\GeneratedDriver").unwrap();
+        let inherited = nt_config_manager::inherit_generated_key_security(&parent_security).unwrap();
+        assert_eq!(
+            composed.hive.key_security_descriptor(generated),
+            Some(inherited.as_slice())
+        );
         let inactive = composed
             .hive
             .open_key(r"ControlSet001\Services\Inactive")
@@ -2357,7 +2451,7 @@ mod tests {
 
     #[test]
     fn boot_system_composition_uses_installed_regf_only_when_persistence_is_absent() {
-        let installed_bytes = services_test_hive();
+        let (installed_bytes, parent_security) = secured_services_test_hive();
         let installed = RegfHive::new(&installed_bytes).expect("installed REGF");
         let composed =
             compose_boot_system_hive(Some(&installed), None, &[], &generated_overlay_image())
@@ -2371,6 +2465,18 @@ mod tests {
             .hive
             .open_key(r"ControlSet001\Services\GeneratedDriver")
             .is_some());
+        let services = composed.hive.open_key(r"ControlSet001\Services").unwrap();
+        assert_eq!(
+            composed.hive.key_security_descriptor(services),
+            Some(parent_security.as_slice())
+        );
+        let generated = composed.hive
+            .open_key(r"ControlSet001\Services\GeneratedDriver").unwrap();
+        let inherited = nt_config_manager::inherit_generated_key_security(&parent_security).unwrap();
+        assert_eq!(
+            composed.hive.key_security_descriptor(generated),
+            Some(inherited.as_slice())
+        );
     }
 
     #[test]

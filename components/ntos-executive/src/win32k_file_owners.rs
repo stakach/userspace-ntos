@@ -29,6 +29,7 @@ struct Row {
     file_id: FileId,
     device_id: DeviceId,
     address: u64,
+    allocation: Option<crate::win32k_subsystem::RootProviderPoolAllocation>,
     identity: Option<HostedFileIdentity>,
     projection: Option<ConsumerFileProjection>,
     phase: Phase,
@@ -223,11 +224,12 @@ unsafe fn build(id: u64) -> Result<(), i32> {
         (row.file_id, row.device_id)
     };
     let _ = win32k_device_consumer::ensure_projection(device_id)?;
-    let address = crate::win32k_subsystem::pool_alloc_export(WDM_X64_FILE_OBJECT_SIZE as u64);
-    if address == 0 {
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
-    }
-    row(id).ok_or(STATUS_INVALID_HANDLE)?.address = address;
+    let allocation = crate::win32k_subsystem::allocate_root_provider_pool_allocation(WDM_X64_FILE_OBJECT_SIZE as u64)
+        .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    let address = allocation.address();
+    let owner = row(id).ok_or(STATUS_INVALID_HANDLE)?;
+    owner.address = address;
+    owner.allocation = Some(allocation);
     let identity = win32k_device_consumer::bind_file_projection(address, file_id, device_id)?;
     row(id).ok_or(STATUS_INVALID_HANDLE)?.identity = Some(identity);
     win32k_device_consumer::write_file_projection(identity, device_id)?;
@@ -259,13 +261,13 @@ unsafe fn retire(id: u64) -> Result<(), i32> {
         win32k_device_consumer::retire_file_projection(identity)?;
         owner.identity = None;
     }
-    if owner.address != 0 {
-        if !crate::win32k_subsystem::release_consumer_projection(
-            owner.address, WDM_X64_FILE_OBJECT_SIZE as u64,
-        ) {
+    if let Some(allocation) = owner.allocation {
+        if allocation.address() != owner.address
+            || !crate::win32k_subsystem::retire_root_provider_pool_allocation(allocation) {
             return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
         }
         owner.address = 0;
+        owner.allocation = None;
     }
     let index = rows().iter().position(|row| row.id == id).ok_or(STATUS_INVALID_HANDLE)?;
     rows().swap_remove(index);
@@ -317,7 +319,7 @@ pub(crate) unsafe fn reference_handle(
         rows().try_reserve(1).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         let id = *addr_of!(NEXT_ID);
         rows().push(Row {
-            id, owner, handle, file_id, device_id, address: 0,
+            id, owner, handle, file_id, device_id, address: 0, allocation: None,
             identity: None, projection: None, phase: Phase::Building,
         });
         *addr_of_mut!(NEXT_ID) = next;
@@ -375,6 +377,27 @@ pub(crate) unsafe fn related_device_address(address: u64) -> Result<u64, i32> {
         return Err(STATUS_INVALID_HANDLE);
     }
     win32k_device_consumer::related_file_device_address(projection)
+}
+
+/// Capture a kernel FileObject independently of its possibly closed original handle.
+pub(crate) unsafe fn capture_section_pointer(
+    address: u64,
+) -> Result<crate::driver_launch::hosted_file_capture::Capture, u32> {
+    let id = id_for_address(address).ok_or(STATUS_INVALID_HANDLE as u32)?;
+    let identity = wait_identity_for_row(id, false).map_err(|status| status as u32)?;
+    let (file_id, device_id) = {
+        let owner = row(id).ok_or(STATUS_INVALID_HANDLE as u32)?;
+        if owner.identity != Some(identity) || owner.address != address {
+            return Err(STATUS_INVALID_HANDLE as u32);
+        }
+        (owner.file_id.raw(), owner.device_id.raw())
+    };
+    // MmCreateSection's supplied FileObject path references the object directly;
+    // the canonical backing policy still validates protection and storage rights.
+    const KERNEL_FILE_DATA_ACCESS: u32 = 0x0001 | 0x0002 | 0x0020;
+    crate::driver_launch::hosted_file_capture::capture_owned(
+        file_id, device_id, KERNEL_FILE_DATA_ACCESS,
+    )
 }
 
 /// The caller has already committed the exact typed process-table close.

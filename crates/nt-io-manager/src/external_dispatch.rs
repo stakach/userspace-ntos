@@ -209,7 +209,9 @@ pub struct ExternalPnpTerminalReceipt {
     completion_driver_id: DriverId,
     completion_device_id: DeviceId,
     minor: u8,
+    relation_type: Option<u32>,
     status: NtStatus,
+    information: u64,
     driver_pending: bool,
 }
 
@@ -238,8 +240,16 @@ impl ExternalPnpTerminalReceipt {
         self.minor
     }
 
+    pub const fn relation_type(&self) -> Option<u32> {
+        self.relation_type
+    }
+
     pub const fn status(&self) -> NtStatus {
         self.status
+    }
+
+    pub const fn information(&self) -> u64 {
+        self.information
     }
 
     pub const fn driver_pending(&self) -> bool {
@@ -470,6 +480,7 @@ impl<P> IoManager<P> {
             )?
         };
         irp.requestor_tid = requestor_tid;
+        irp.origin_pnp_relation_type = parameters.relation_type();
         irp.buffer = Some(IoBufferRef {
             buffer_id: 0,
             offset: 0,
@@ -648,7 +659,9 @@ impl<P> IoManager<P> {
                         completion_driver_id: completion.driver_id,
                         completion_device_id: completion.device_id,
                         minor: irp.origin_minor,
+                        relation_type: irp.origin_pnp_relation_type,
                         status,
+                        information,
                         driver_pending: false,
                     })
                 }) {
@@ -755,7 +768,9 @@ impl<P> IoManager<P> {
             completion_driver_id: completion.completion_driver_id,
             completion_device_id: completion.completion_device_id,
             minor: completion.minor,
+            relation_type: irp.origin_pnp_relation_type,
             status: completion.status,
+            information: completion.information,
             driver_pending: true,
         })
     }

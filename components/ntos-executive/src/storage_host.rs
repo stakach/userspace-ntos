@@ -35,7 +35,6 @@ pub unsafe extern "C" fn storage_host_entry(heap_frames: u64) -> ! {
         hive_size,
         smss_size,
         imports_size,
-        ntdll_size,
         nls_ansi_size,
         nls_oem_size,
         nls_case_size,
@@ -46,7 +45,6 @@ pub unsafe extern "C" fn storage_host_entry(heap_frames: u64) -> ! {
         STORAGE_SHARED_VADDR + STORAGE_HIVE_IMAGE_OFFSET,
         FILEBUF_VADDR,
         STORAGE_SHARED_VADDR + STORAGE_IMPORTS_IMAGE_OFFSET,
-        NTDLLBUF_VADDR,
         SRVBUF_VADDR,
         WIN32BUF_VADDR,
         NLS_ANSI_VADDR,
@@ -61,7 +59,6 @@ pub unsafe extern "C" fn storage_host_entry(heap_frames: u64) -> ! {
     core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x18) as *mut u32, hive_size);
     core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x20) as *mut u32, smss_size);
     core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x24) as *mut u32, imports_size);
-    core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x28) as *mut u32, ntdll_size);
     core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x2c) as *mut u32, nls_ansi_size);
     core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x30) as *mut u32, nls_oem_size);
     core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x34) as *mut u32, nls_case_size);

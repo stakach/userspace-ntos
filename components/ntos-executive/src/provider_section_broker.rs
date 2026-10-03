@@ -14,11 +14,13 @@ use nt_process::native_handle::{NativeHandleCaller, NativeThreadProcessReference
 
 use crate::exec_handler::section_create::{ReservedGenericDataSection, RoutedSectionAdmission};
 use crate::{driver_launch, mounted_volume, spawn_hosts, ExecNtHandler};
+use spawn_hosts::shared_ingress::owner::runtime::{self, PhysicalSource};
 
 pub(crate) const OP_CREATE: u64 = 1;
 pub(crate) const OP_PUBLISH: u64 = 2;
 pub(crate) const OP_ABORT: u64 = 3;
 pub(crate) const OP_ACK: u64 = 4;
+pub(crate) const OP_CREATE_OBJECT: u64 = nt_io_manager::win32k_mm_section_wire::OP_CREATE_OBJECT;
 
 const STATUS_INVALID_HANDLE: u32 = nt_process::STATUS_INVALID_HANDLE;
 const STATUS_INVALID_PARAMETER: u32 = nt_process::STATUS_INVALID_PARAMETER;
@@ -41,13 +43,57 @@ struct Owner {
     token: u64,
 }
 
+enum Publication {
+    Handle(ReservedGenericDataSection),
+    Object { address: u64, physical: PhysicalSource },
+}
+
+impl Publication {
+    unsafe fn prepare(handler: &mut ExecNtHandler, reserved: ReservedGenericDataSection,
+        physical: Option<PhysicalSource>) -> Result<Self, u32> {
+        match physical {
+            None => Ok(Self::Handle(reserved)),
+            Some(physical) => crate::provider_mm_section_objects::prepare(handler, reserved, physical)
+                .map(|address| Self::Object { address, physical }),
+        }
+    }
+
+    fn value(&self) -> u64 {
+        match self {
+            Self::Handle(reserved) => reserved.value(),
+            Self::Object { address, .. } => *address,
+        }
+    }
+
+    unsafe fn publish(&mut self, handler: &mut ExecNtHandler) -> Result<u64, u32> {
+        match self {
+            Self::Handle(reserved) => reserved.publish(handler),
+            Self::Object { address, physical } => {
+                crate::provider_mm_section_objects::publish(*address, *physical)?;
+                Ok(*address)
+            }
+        }
+    }
+
+    unsafe fn abort(mut self, handler: &mut ExecNtHandler) {
+        match &mut self {
+            Self::Handle(reserved) => reserved.abort(handler),
+            Self::Object { address, physical } => {
+                if crate::provider_mm_section_objects::abort(handler as *mut _, *address, *physical).is_err() {
+                    crate::provider_bugcheck::report(0xc4, [*address, 0, 0, 92]);
+                }
+            }
+        }
+    }
+}
+
 enum Phase {
     Creating,
     CancelledCreating,
-    Reserved(ReservedGenericDataSection),
+    Reserved(Publication),
     Publishing,
     Aborted,
-    PublishedUnacknowledged,
+    PublishedUnacknowledged(Publication),
     EffectUncertain,
 }
 
@@ -87,14 +133,14 @@ struct MetadataWork {
     origin_driver: u64,
     metadata: PendingSectionMetadataQueries<(), u64>,
     metadata_id: PendingSectionMetadataId,
-    reserved: Option<ReservedGenericDataSection>,
+    reserved: Option<Publication>,
+    physical: Option<PhysicalSource>,
     phase: MetadataPhase,
     status: u32,
     cancel_requested: bool,
 }
 
 static mut PENDING: Vec<Pending> = Vec::new();
-static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 static NEXT_RETRY: AtomicU64 = AtomicU64::new(0);
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 static EXECUTING: AtomicBool = AtomicBool::new(false);
@@ -124,12 +170,10 @@ unsafe fn create(
     dispatch: LaneDispatchIdentity,
     caller: NativeHandleCaller,
     request: SectionCreateRequest,
+    physical: Option<PhysicalSource>,
 ) -> Result<(u64, u64), u32> {
     let owner_pi = handler.native_section_owner_pi(caller)?;
-    let token = NEXT_TOKEN
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-            next.checked_add(1)
-        })
+    let token = spawn_hosts::shared_ingress::owner::runtime::next_service_wait_token()
         .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
     let owner = Owner {
         route,
@@ -161,7 +205,16 @@ unsafe fn create(
         None,
     );
     match result {
-        Ok(mut reserved) => {
+        Ok(reserved) => {
+            let reserved = match Publication::prepare(handler, reserved, physical) {
+                Ok(reserved) => reserved,
+                Err(status) => {
+                    if let Some(index) = position(owner, 0) {
+                        (&mut *core::ptr::addr_of_mut!(PENDING)).swap_remove(index);
+                    }
+                    return Err(status);
+                }
+            };
             let handle = reserved.value();
             let Some(index) = position(owner, 0) else {
                 reserved.abort(handler);
@@ -180,7 +233,7 @@ unsafe fn create(
                 }
             };
             if !active {
-                let mut reserved = reserved.unwrap();
+                let reserved = reserved.unwrap();
                 reserved.abort(handler);
                 return Err(STATUS_INVALID_HANDLE);
             }
@@ -206,16 +259,34 @@ pub(crate) unsafe fn submit(
     second: u64,
     third: u64,
 ) -> SubmitResult {
-    if op != OP_CREATE || third != 0 {
+    if !matches!(op, OP_CREATE | OP_CREATE_OBJECT) || third != 0 {
         return SubmitResult::Ready(dispatch_op(
             handler, route, dispatch, caller, op, first, second, third,
         ));
     }
-    let request = match decode_request(first, second) {
-        Ok(request) => request,
+    let decoded = if op == OP_CREATE_OBJECT {
+        (|| {
+            use nt_io_manager::win32k_mm_section_wire as mm_wire;
+            if second != mm_wire::PACKET_BYTES as u64 { return Err(STATUS_INVALID_PARAMETER); }
+            let physical = runtime::physical_source(route).map_err(|_| STATUS_INVALID_HANDLE)?;
+            let (_, bytes) = crate::win32k_subsystem::capture_provider_pool_packet(first, mm_wire::PACKET_BYTES)?;
+            let request = mm_wire::decode(&bytes).map_err(|_| STATUS_INVALID_PARAMETER)?;
+            if request.base.allocation_attributes & SEC_IMAGE != 0 { return Err(STATUS_NOT_SUPPORTED); }
+            let capture = match request.file_source() {
+                mm_wire::SectionFileSource::Object(address) =>
+                    Some(driver_launch::win32k_file_owners::capture_section_pointer(address)?),
+                _ => None,
+            };
+            Ok((request.base, Some(physical), capture))
+        })()
+    } else {
+        decode_request(first, second).map(|request| (request, None, None))
+    };
+    let (request, physical, object_capture) = match decoded {
+        Ok(decoded) => decoded,
         Err(status) => return SubmitResult::Ready((status as i32, 0, 0, 0)),
     };
-    let source = if request.file_handle == 0 {
+    let source = if object_capture.is_some() || request.file_handle == 0 {
         None
     } else {
         match handler
@@ -226,29 +297,33 @@ pub(crate) unsafe fn submit(
             Err(status) => return SubmitResult::Ready((status as i32, 0, 0, 0)),
         }
     };
-    let Some(source) = source else {
-        return SubmitResult::Ready(result_words(create(
-            handler, route, dispatch, caller, request,
-        )));
-    };
-    let nt_process::HandleObject::RoutedFile { file_id, device_id } = source.object() else {
-        return SubmitResult::Ready(result_words(create(
-            handler, route, dispatch, caller, request,
-        )));
+    let capture = if let Some(capture) = object_capture {
+        capture
+    } else {
+        let Some(source) = source else {
+            return SubmitResult::Ready(result_words(create(
+                handler, route, dispatch, caller, request, physical,
+            )));
+        };
+        let nt_process::HandleObject::RoutedFile { file_id, device_id } = source.object() else {
+            return SubmitResult::Ready(result_words(create(
+                handler, route, dispatch, caller, request, physical,
+            )));
+        };
+        match driver_launch::hosted_file_capture::capture(file_id, device_id, source.granted_access()) {
+            Ok(capture) => capture,
+            Err(status) => return SubmitResult::Ready((status as i32, 0, 0, 0)),
+        }
     };
     let _durable = crate::allocator::enter_durable();
     let result = (|| -> Result<(), u32> {
         nt_memory_manager::data_section::check_data_section_file_access(
             request.page_protection,
-            source.granted_access(),
+            capture.granted_access(),
         )?;
         let owner_pi = handler.native_section_owner_pi(caller)?;
+        let device_id = capture.device_id();
         let mount = mounted_volume::mount_id_for_live_device(device_id).ok_or(0xc000_0020u32)?;
-        let capture = driver_launch::hosted_file_capture::capture(
-            file_id,
-            device_id,
-            source.granted_access(),
-        )?;
         let origin_driver = driver_launch::io_manager_mut()
             .device(DeviceId(device_id))
             .ok_or(STATUS_INVALID_HANDLE)?
@@ -274,9 +349,7 @@ pub(crate) unsafe fn submit(
                 return Err(STATUS_INVALID_HANDLE);
             }
         };
-        let token = match NEXT_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-            next.checked_add(1)
-        }) {
+        let token = match spawn_hosts::shared_ingress::owner::runtime::next_service_wait_token() {
             Ok(token) => token,
             Err(_) => {
                 reference
@@ -314,6 +387,7 @@ pub(crate) unsafe fn submit(
                 metadata,
                 metadata_id,
                 reserved: None,
+                physical,
                 phase: MetadataPhase::Query,
                 status: 0,
                 cancel_requested: false,
@@ -356,9 +430,43 @@ enum MetadataStep {
 }
 
 impl MetadataWork {
+    unsafe fn ready_for_nested_step(&self, owner: Owner, owner_cancelled: bool) -> bool {
+        use nt_memory_manager::section_metadata_progress::SectionMetadataProgress as Progress;
+        let cancelled = runtime::retained_service_cancelled(
+            owner.route, owner.dispatch, self.reply, owner.token,
+        );
+        let provider_ready = || self.capture.as_ref().is_some_and(|capture|
+            driver_launch::provider_section_target_dispatch_ready(DeviceId(capture.device_id())));
+        let progress = match self.phase {
+            MetadataPhase::Indeterminate => Progress::Indeterminate,
+            MetadataPhase::ReplyEntered => Progress::AwaitingReply {
+                acknowledged: runtime::retained_service_reply_acknowledged(
+                    owner.route, owner.dispatch, self.reply, owner.token,
+                ).unwrap_or(false),
+                cancelled,
+            },
+            MetadataPhase::Pending { irp, .. } => Progress::AwaitingCompletion {
+                completion_ready: driver_launch::nested_file_irp_completion_ready_exact(irp.raw()),
+                cancel_pending: (cancelled || owner_cancelled) && !self.cancel_requested,
+                provider_ready: provider_ready(),
+            },
+            MetadataPhase::Copying { .. } | MetadataPhase::AckPending { .. } =>
+                Progress::CopyOrAcknowledge { provider_ready: provider_ready() },
+            _ if cancelled => Progress::Local,
+            _ if owner_cancelled => Progress::Indeterminate,
+            MetadataPhase::Query if self.metadata.next_query(self.metadata_id).is_some() =>
+                Progress::Query { provider_ready: provider_ready() },
+            MetadataPhase::ReadyReply => if runtime::retained_service_reply_not_entered(
+                owner.route, owner.dispatch, self.reply, owner.token,
+            ).unwrap_or(false) { Progress::Local } else { Progress::Indeterminate },
+            MetadataPhase::Query | MetadataPhase::Reserve => Progress::Local,
+        };
+        progress.ready()
+    }
+
     unsafe fn advance(
         &mut self,
-        handler: &mut ExecNtHandler,
+        handler: *mut ExecNtHandler,
         owner: Owner,
         cancelled: bool,
     ) -> MetadataStep {
@@ -394,7 +502,7 @@ impl MetadataWork {
                     DeviceId(capture.device_id()),
                     Some(FileId(capture.file_id())),
                     0,
-                    u64::from(owner.caller.original_thread().thread_id()),
+                    0,
                     nt_io_abi::major::IRP_MJ_QUERY_INFORMATION,
                     IoParameters::QueryInformation(InformationParameters {
                         info_class: class,
@@ -440,12 +548,17 @@ impl MetadataWork {
                 MetadataStep::Progress
             }
             MetadataPhase::Pending { irp, length } => {
-                if cancelled && !self.cancel_requested {
+                let mut cancel_sent = false;
+                if cancelled && !self.cancel_requested
+                    && self.capture.as_ref().is_some_and(|capture|
+                        driver_launch::provider_section_target_dispatch_ready(DeviceId(capture.device_id())))
+                {
                     self.cancel_requested = true;
+                    cancel_sent = true;
                     let _ = driver_launch::cancel_irp_if_pending(irp.raw());
                 }
                 let Some(completion) = driver_launch::completed_irp_exact(irp.raw()) else {
-                    return MetadataStep::Wait;
+                    return if cancel_sent { MetadataStep::Progress } else { MetadataStep::Wait };
                 };
                 let capture = self
                     .capture
@@ -455,8 +568,7 @@ impl MetadataWork {
                     || completion.driver_id != self.origin_driver
                     || completion.file_id != capture.file_id()
                     || completion.device_id != capture.device_id()
-                    || completion.requestor_tid
-                        != u64::from(owner.caller.original_thread().thread_id())
+                    || completion.requestor_tid != 0
                     || completion.major != nt_io_abi::major::IRP_MJ_QUERY_INFORMATION
                     || !self.metadata.terminal(
                         self.metadata_id,
@@ -544,7 +656,7 @@ impl MetadataWork {
                     self.capture.take();
                     return MetadataStep::Cancelled;
                 }
-                if let Err(status) = self.reference.validate(&handler.pm) {
+                if let Err(status) = self.reference.validate(&(*handler).pm) {
                     self.capture.take();
                     self.status = status;
                     self.phase = MetadataPhase::ReadyReply;
@@ -557,7 +669,7 @@ impl MetadataWork {
                         .expect("provider Section admission capture"),
                     metadata,
                 };
-                match handler.reserve_generic_data_section(
+                match (&mut *handler).reserve_generic_data_section(
                     owner.caller,
                     self.owner_pi,
                     self.request.desired_access,
@@ -568,7 +680,10 @@ impl MetadataWork {
                     self.request.file_handle,
                     Some(admission),
                 ) {
-                    Ok(reserved) => self.reserved = Some(reserved),
+                    Ok(reserved) => match Publication::prepare(&mut *handler, reserved, self.physical) {
+                        Ok(publication) => self.reserved = Some(publication),
+                        Err(status) => self.status = status,
+                    },
                     Err(status) => self.status = status,
                 }
                 self.phase = MetadataPhase::ReadyReply;
@@ -578,17 +693,17 @@ impl MetadataWork {
                 if cancelled {
                     return MetadataStep::Cancelled;
                 }
-                if self.reference.validate(&handler.pm).is_err() {
+                if self.reference.validate(&(*handler).pm).is_err() {
                     self.status = STATUS_CANCELLED;
-                    if let Some(mut reserved) = self.reserved.take() {
-                        reserved.abort(handler);
+                    if let Some(reserved) = self.reserved.take() {
+                        reserved.abort(&mut *handler);
                     }
                 }
                 self.phase = MetadataPhase::ReplyEntered;
                 let handle = self
                     .reserved
                     .as_ref()
-                    .map_or(0, ReservedGenericDataSection::value);
+                    .map_or(0, Publication::value);
                 if runtime::wake_section_create_service(
                     owner.route,
                     owner.dispatch,
@@ -610,7 +725,11 @@ impl MetadataWork {
                 {
                     self.phase = MetadataPhase::ReadyReply;
                 }
-                MetadataStep::Wait
+                if matches!(self.phase, MetadataPhase::ReplyEntered) {
+                    MetadataStep::Progress
+                } else {
+                    MetadataStep::Wait
+                }
             }
             MetadataPhase::ReplyEntered => {
                 if matches!(
@@ -655,25 +774,46 @@ pub(crate) fn wake_due(now: u64) -> u64 {
     u64::from(next_deadline().is_some_and(|deadline| now >= deadline))
 }
 
-pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
-    if next_deadline().is_none_or(|deadline| crate::monotonic_time_100ns() < deadline) {
-        return;
+pub(crate) unsafe fn nested_work_ready() -> bool {
+    !EXECUTING.load(Ordering::Acquire)
+        && (&*core::ptr::addr_of!(PENDING)).iter().any(|entry| {
+            entry.metadata.as_ref().is_some_and(|work| work.ready_for_nested_step(
+                entry.owner, matches!(entry.phase, Phase::CancelledCreating),
+            ))
+        })
+}
+
+pub(crate) unsafe fn redrive_nested_ready(handler: *mut ExecNtHandler) -> bool {
+    redrive_one(handler, true)
+}
+
+pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) -> bool {
+    redrive_one(handler, false)
+}
+
+unsafe fn redrive_one(handler: *mut ExecNtHandler, nested: bool) -> bool {
+    if handler.is_null() || (!nested && next_deadline().is_none_or(|deadline| crate::monotonic_time_100ns() < deadline)) {
+        return false;
     }
     if EXECUTING.swap(true, Ordering::AcqRel) {
-        return;
+        return false;
     }
     let _durable = crate::allocator::enter_durable();
     let count = (&*core::ptr::addr_of!(PENDING)).len();
     if count == 0 {
         EXECUTING.store(false, Ordering::Release);
-        return;
+        return false;
     }
     let start = CURSOR.load(Ordering::Relaxed) as usize % count;
     let selected = (0..count).find_map(|step| {
         let index = (start + step) % count;
         let entry = &mut (&mut *core::ptr::addr_of_mut!(PENDING))[index];
+        if !entry.metadata.as_ref().is_some_and(|work| work.ready_for_nested_step(
+            entry.owner, matches!(entry.phase, Phase::CancelledCreating),
+        )) { return None; }
         entry.metadata.take().map(|work| (entry.owner, work, index))
     });
+    let mut progressed = false;
     if let Some((owner, mut work, selected_index)) = selected {
         CURSOR.store(selected_index as u64 + 1, Ordering::Relaxed);
         let mut step = MetadataStep::Progress;
@@ -684,7 +824,9 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
                     Phase::CancelledCreating,
                 )
             });
+            if !work.ready_for_nested_step(owner, cancelled) { break; }
             step = work.advance(handler, owner, cancelled);
+            progressed |= matches!(step, MetadataStep::Progress | MetadataStep::Replied);
             if !matches!(step, MetadataStep::Progress) {
                 break;
             }
@@ -695,14 +837,14 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
         match step {
             MetadataStep::Replied => {
                 work.reference
-                    .release(&mut handler.pm)
+                    .release(&mut (*handler).pm)
                     .expect("acknowledged provider Section requestor");
                 if matches!(
                     (&*core::ptr::addr_of!(PENDING))[index].phase,
                     Phase::CancelledCreating,
                 ) {
-                    if let Some(mut reserved) = work.reserved.take() {
-                        reserved.abort(handler);
+                    if let Some(reserved) = work.reserved.take() {
+                        reserved.abort(&mut *handler);
                     }
                     (&mut *core::ptr::addr_of_mut!(PENDING)).swap_remove(index);
                 } else if let Some(reserved) = work.reserved.take() {
@@ -727,19 +869,20 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
                         Ordering::Release,
                     );
                     EXECUTING.store(false, Ordering::Release);
-                    return;
+                    return progressed;
                 }
-                if let Some(mut reserved) = work.reserved.take() {
-                    reserved.abort(handler);
+                if let Some(reserved) = work.reserved.take() {
+                    reserved.abort(&mut *handler);
                 }
                 work.capture.take();
                 spawn_hosts::shared_ingress::owner::runtime::acknowledge_retained_service_cancellation(
                     owner.route, owner.dispatch, work.reply, owner.token,
                 ).expect("cancelled provider Section Reply retirement");
                 work.reference
-                    .release(&mut handler.pm)
+                    .release(&mut (*handler).pm)
                     .expect("cancelled provider Section requestor");
                 (&mut *core::ptr::addr_of_mut!(PENDING)).swap_remove(index);
+                progressed = true;
             }
             _ => (&mut *core::ptr::addr_of_mut!(PENDING))[index].metadata = Some(work),
         }
@@ -749,6 +892,7 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
         Ordering::Release,
     );
     EXECUTING.store(false, Ordering::Release);
+    progressed
 }
 
 unsafe fn publish(handler: &mut ExecNtHandler, owner: Owner, handle: u64) -> Result<(), u32> {
@@ -772,7 +916,7 @@ unsafe fn publish(handler: &mut ExecNtHandler, owner: Owner, handle: u64) -> Res
                 "Section publication changed its reserved handle"
             );
             let index = position(owner, handle).ok_or(STATUS_INVALID_HANDLE)?;
-            (&mut *core::ptr::addr_of_mut!(PENDING))[index].phase = Phase::PublishedUnacknowledged;
+            (&mut *core::ptr::addr_of_mut!(PENDING))[index].phase = Phase::PublishedUnacknowledged(reserved);
             Ok(())
         }
         Err(status) => {
@@ -793,7 +937,7 @@ unsafe fn abort(handler: &mut ExecNtHandler, owner: Owner, handle: u64) -> Resul
         return Err(STATUS_INVALID_HANDLE);
     }
     let pending = (&mut *core::ptr::addr_of_mut!(PENDING)).swap_remove(index);
-    if let Phase::Reserved(mut reserved) = pending.phase {
+    if let Phase::Reserved(reserved) = pending.phase {
         reserved.abort(handler);
     }
     Ok(())
@@ -811,7 +955,7 @@ unsafe fn dispatch_op(
 ) -> (i32, u64, u64, u64) {
     let result = match op {
         OP_CREATE if third == 0 => decode_request(first, second)
-            .and_then(|request| create(handler, route, dispatch, caller, request)),
+            .and_then(|request| create(handler, route, dispatch, caller, request, None)),
         OP_PUBLISH | OP_ABORT | OP_ACK if third == 0 && first != 0 && second != 0 => {
             let owner = Owner {
                 route,
@@ -829,7 +973,7 @@ unsafe fn dispatch_op(
                     };
                     if !matches!(
                         (&*core::ptr::addr_of!(PENDING))[index].phase,
-                        Phase::PublishedUnacknowledged
+                        Phase::PublishedUnacknowledged(_)
                     ) {
                         Err(STATUS_INVALID_HANDLE)
                     } else {
@@ -863,7 +1007,7 @@ pub(crate) unsafe fn retire_completed(
             Phase::Reserved(_) => 1,
             Phase::Aborted => 2,
             Phase::Publishing => 3,
-            Phase::PublishedUnacknowledged => 4,
+            Phase::PublishedUnacknowledged(_) => 4,
             Phase::CancelledCreating => 5,
             Phase::EffectUncertain => 6,
         };
@@ -874,7 +1018,7 @@ pub(crate) unsafe fn retire_completed(
             }
             1 | 2 => {
                 let entry = (&mut *core::ptr::addr_of_mut!(PENDING)).swap_remove(index);
-                if let Phase::Reserved(mut reserved) = entry.phase {
+                if let Phase::Reserved(reserved) = entry.phase {
                     reserved.abort(handler);
                 }
             }

@@ -1,7 +1,8 @@
 use super::*;
-use crate::data_section::plan_data_section_page_read;
+use crate::data_section::{plan_data_section_page_read, plan_data_section_read_window};
 use crate::{GenericSectionBacking, GenericSectionTable, PAGE_READONLY, SECTION_ATTR_SEC_COMMIT};
 use alloc::boxed::Box;
+use alloc::vec;
 
 fn section() -> SectionIdentity {
     let mut table = GenericSectionTable::new();
@@ -195,6 +196,24 @@ fn inline_short_read_is_terminal_failure_without_publication() {
     assert_eq!(*owner, 42);
     assert_eq!(result, Err(STATUS_IO_DEVICE_ERROR));
     assert!(reads.identity(id).is_none());
+}
+
+#[test]
+fn window_output_is_invisible_until_exact_ack_and_pads_only_eof() {
+    let plan = plan_data_section_read_window(0, 0x3000, 0x2180, 8).unwrap();
+    let mut reads = PendingSectionPageReads::<Box<u32>, u64>::new();
+    let id = reads.reserve_window(section(), lease(), 0, plan, Box::new(52)).unwrap();
+    assert!(reads.bind(id, 92));
+    assert!(reads.terminal(id, 92, 0, plan.length() as u64));
+    assert!(reads.append(id, 92, 0, &vec![0x6b; plan.length()]));
+    assert!(reads.take_acknowledged(id, 92).is_none());
+    assert!(reads.acknowledge_backend(id, 92));
+    let (owner, result) = reads.take_acknowledged(id, 92).unwrap();
+    assert_eq!(*owner, 52);
+    let bytes = result.unwrap();
+    assert_eq!(bytes.len(), plan.capacity());
+    assert!(bytes[..plan.length()].iter().all(|byte| *byte == 0x6b));
+    assert!(bytes[plan.length()..].iter().all(|byte| *byte == 0));
 }
 
 #[test]

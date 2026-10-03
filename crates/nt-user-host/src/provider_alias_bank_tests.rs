@@ -467,12 +467,132 @@ fn slot_capacity_and_segment_boundaries_are_checked_before_copy() {
 }
 
 #[test]
+fn slot_metadata_grows_past_8192_without_relocating_handles() {
+    let mut bank = ProviderAliasBank::new(4096, 3).unwrap();
+    let mut io = Io::default();
+    let first_request = request(4096);
+    let first = bank.map(first_request, &mut io).unwrap();
+    let first_slot_address = bank.slots.get(0).unwrap() as *const Slot as usize;
+    io.calls.clear();
+
+    let total = 8193usize;
+    for index in 1..total {
+        let mapped = bank
+            .map(
+                ProviderAliasRequest {
+                    page: (index as u64 + 1) * 4096,
+                    source_frame: 20 + index as u64,
+                    ..first_request
+                },
+                &mut io,
+            )
+            .unwrap();
+        assert_eq!(mapped.index(), index);
+        io.calls.clear();
+    }
+
+    assert_eq!(bank.entry_count(), total);
+    assert_eq!(bank.stats().live, total);
+    assert_eq!(
+        bank.slots.chunks.len(),
+        (total + SLOT_CHUNK_CAPACITY - 1) / SLOT_CHUNK_CAPACITY
+    );
+    assert!(bank
+        .slots
+        .chunks
+        .iter()
+        .all(|chunk| chunk.len() <= SLOT_CHUNK_CAPACITY));
+    assert_eq!(
+        bank.slots.get(0).unwrap() as *const Slot as usize,
+        first_slot_address
+    );
+    assert_eq!(bank.get(first).unwrap().request, first_request);
+}
+
+#[test]
+fn chunk_boundary_failure_retains_exact_row_for_retry() {
+    let mut bank = ProviderAliasBank::new(SLOT_CHUNK_CAPACITY as u64, 2).unwrap();
+    let mut io = Io::default();
+    for index in 0..SLOT_CHUNK_CAPACITY {
+        bank.map(
+            ProviderAliasRequest {
+                page: (index as u64 + 1) * 4096,
+                source_frame: 20 + index as u64,
+                ..request(4096)
+            },
+            &mut io,
+        )
+        .unwrap();
+        io.calls.clear();
+    }
+
+    let boundary = ProviderAliasRequest {
+        page: (SLOT_CHUNK_CAPACITY as u64 + 1) * 4096,
+        source_frame: 20 + SLOT_CHUNK_CAPACITY as u64,
+        ..request(4096)
+    };
+    io.fail = Some(Call::Segment(1));
+    assert_eq!(bank.map(boundary, &mut io), Err(BankError::Backend(99)));
+    assert_eq!(bank.entry_count(), SLOT_CHUNK_CAPACITY + 1);
+    let retained = bank
+        .snapshots()
+        .find(|snapshot| snapshot.request == boundary)
+        .unwrap();
+    assert_eq!(retained.handle.index(), SLOT_CHUNK_CAPACITY);
+    assert!(retained.root.unwrap().mapped);
+
+    io.calls.clear();
+    assert_eq!(bank.map(boundary, &mut io), Ok(retained.handle));
+    assert_eq!(
+        io.calls,
+        vec![
+            Call::Segment(1),
+            Call::Move(
+                100 + SLOT_CHUNK_CAPACITY as u64 + 1,
+                ChildCap {
+                    cnode: 1001,
+                    slot: 0,
+                }
+            ),
+            Call::Recycle(100 + SLOT_CHUNK_CAPACITY as u64 + 1),
+        ]
+    );
+}
+
+#[test]
+fn extending_segments_preserves_handles_and_expands_capacity() {
+    let mut bank = ProviderAliasBank::new(2, 1).unwrap();
+    let mut io = Io::default();
+    let first = bank.map(request(4096), &mut io).unwrap();
+    bank.map(request(8192), &mut io).unwrap();
+    assert!(bank.needs_segment_for_next_slot());
+    assert_eq!(bank.capacity(), 2);
+    io.calls.clear();
+    assert_eq!(
+        bank.map(request(12288), &mut io),
+        Err(BankError::InsufficientResources)
+    );
+    assert!(io.calls.is_empty());
+
+    bank.extend_segments(1).unwrap();
+    assert!(!bank.needs_segment_for_next_slot());
+    assert_eq!(bank.capacity(), 4);
+    let third = bank.map(request(12288), &mut io).unwrap();
+    assert_eq!(third.index(), 2);
+    assert_eq!(bank.get(first).unwrap().request, request(4096));
+
+    let large = ProviderAliasBank::new(4096, usize::MAX / 4096).unwrap();
+    assert!(large.segment_cnodes.is_empty());
+    assert_eq!(large.capacity(), (usize::MAX / 4096) * 4096);
+}
+
+#[test]
 fn generation_exhaustion_never_reuses_an_old_handle() {
     let mut bank = ProviderAliasBank::new(1, 1).unwrap();
     let req = request(4096);
     let mut io = Io::default();
     bank.map(req, &mut io).unwrap();
-    bank.slots[0].generation = u64::MAX;
+    bank.slots.get_mut(0).unwrap().generation = u64::MAX;
     bank.processes[0].pages[0].1.generation = u64::MAX;
     bank.release_process(req.pi, req.process, &mut io).unwrap();
     io.calls.clear();

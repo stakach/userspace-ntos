@@ -18,8 +18,10 @@ pub(crate) mod nested;
 mod services;
 pub(crate) use services::{
     acknowledge_retained_service_cancellation, cancel_parked_service, finish_autonomous,
-    park_retained_service, park_service, reconcile_retained_service_reply,
+    next_service_wait_token, park_retained_service, park_service, reconcile_retained_service_reply,
     resume_acknowledged_retained_services, resume_service, retained_service_cancelled,
+    retained_service_owner_stopped, retained_service_owner_stopped_at_broker,
+    retained_service_reply_acknowledged,
     retained_service_reply_not_entered, retained_service_resume_next_deadline,
     retire_stopped_acknowledged_retained_service, wake_file_create_service,
     wake_query_path_rejected_service, wake_query_path_service, wake_registry_service,
@@ -207,6 +209,7 @@ pub(crate) unsafe fn register(
     if peers.iter().any(|peer| peer.source == source) {
         return Err(Error::Publication);
     }
+    crate::component_heap::bind_source(physical, verify).map_err(|_| Error::PhysicalIdentity)?;
     let index = peers.len();
     peers.push(NativePeer {
         source,

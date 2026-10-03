@@ -18,10 +18,110 @@ mod terminal;
 #[path = "kernel_provider_wait_work.rs"]
 mod wait_work;
 pub(super) use wait_work::{publish_bootstrap_waits, publish_runtime_waits};
-use bootstrap::{DriverEntryCompletion, DriverEntryRecipient};
+use bootstrap::{KernelJobCompletion, KernelJobRecipient};
 
-static mut ACTIVATIONS: KernelProviderActivations<DriverEntryRecipient> =
+static mut ACTIVATIONS: KernelProviderActivations<KernelJobRecipient> =
     KernelProviderActivations::new();
+
+/// The initiating root consumer retains this slot independently of the activation recipient.
+/// It is not a component pointer or a shared-page result: only acknowledged completion writes it.
+pub(crate) struct KernelJobResult(alloc::sync::Arc<AtomicU64>);
+
+impl KernelJobResult {
+    pub(crate) fn new() -> Self {
+        Self(alloc::sync::Arc::new(AtomicU64::new(0)))
+    }
+
+    fn returned(&self) -> Option<u32> {
+        let value = self.0.load(Ordering::Acquire);
+        (value >> 32 == 1).then_some(value as u32)
+    }
+}
+
+/// Capture a fresh Running job from a real canonical caller, never from a previous bootstrap
+/// descriptor. The owned recipient and requestor pair publish before the component is entered.
+pub(crate) unsafe fn capture_kernel_job(
+    channel: &spawn_hosts::PumpChannel,
+    lane: LaneHandle,
+    native: nt_process::native_handle::NativeHandleCaller,
+    result: &KernelJobResult,
+) -> Result<KernelProviderCaller, u32> {
+    if !kernel_channel(channel) || channel.kernel_caller.is_some()
+        || channel.initial != spawn_hosts::InitialAction::ReplyRequest
+        || (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).binding(lane)
+            != Ok(channel_binding(channel))
+    {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    let provider = current_win32k_provider_domain().ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let recipient = KernelJobRecipient::executive(*channel, result.0.clone())?;
+    let _durable = allocator::enter_durable();
+    with_provider_process_manager(|pm| {
+        pm.validate_native_handle_caller(native)?;
+        (&mut *core::ptr::addr_of_mut!(ACTIVATIONS)).capture_with_recipient(
+            pm, &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
+            &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS), provider, lane, native, recipient,
+        ).map_err(|(status, _recipient)| status)
+    })
+}
+
+/// Run the issued request once. Runtime readiness owns every selected resume thereafter.
+/// A physical wall is returned as incomplete, leaving both the activation and caller roots held.
+pub(crate) unsafe fn run_kernel_job(
+    caller: KernelProviderCaller,
+    result: &KernelJobResult,
+) -> Result<(u64, bool), u32> {
+    let outcome = run_issued_kernel_job(caller)?;
+    if let Some(receipt) = outcome.receipt {
+        deliver_driver_entry_completion(receipt)?;
+    }
+    if let Some(status) = result.returned() { return Ok((u64::from(status), true)); }
+    if !matches!(outcome.stop,
+        nt_user_host::provider_kernel_wait::KernelProviderStoppedOutcome::WaitCaptured(_))
+    {
+        return Ok((u64::from(nt_process::STATUS_UNSUCCESSFUL), false));
+    }
+    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    if handler.is_null() { return Err(nt_status::NtStatus::DEVICE_NOT_READY.raw() as u32); }
+    let _message = crate::ipc_message::SavedMessageBuffer::capture();
+    use spawn_hosts::shared_ingress::owner::runtime as ingress;
+    loop {
+        // Every call below ends its handler/activation borrow before entering a native provider.
+        component_resume::run_outer(handler);
+        redrive_ready_completions();
+        if let Some(status) = result.returned() { return Ok((u64::from(status), true)); }
+        let stop = (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller)?.stopped_outcome()?;
+        if matches!(stop,
+            nt_user_host::provider_kernel_wait::KernelProviderStoppedOutcome::Walled
+            | nt_user_host::provider_kernel_wait::KernelProviderStoppedOutcome::CallbackSuspended
+            | nt_user_host::provider_kernel_wait::KernelProviderStoppedOutcome::LpcWaitSuspended)
+        {
+            return Ok((u64::from(nt_process::STATUS_UNSUCCESSFUL), false));
+        }
+        if redrive_nested_hosted_file_work() { continue; }
+        {
+            let scope = driver_launch::ComponentSchedulerScope::enter();
+            scope.service_irq_yield(0);
+        }
+        crate::registry_mutation_work::redrive_provider();
+        if ingress::resume_acknowledged_retained_services()
+            .map_err(|_| nt_process::STATUS_UNSUCCESSFUL)? { continue; }
+        if !crate::writable_fs::registry_journal::owns_volume()
+            && ingress::service_autonomous().map_err(|_| nt_process::STATUS_UNSUCCESSFUL)?
+        { continue; }
+        // Re-evaluate actual ready work after IRQ/autonomous effects, then sleep on the root
+        // receiver with a fresh Free Reply. Never receive on or retransmit the parked job.
+        component_resume::run_outer(handler);
+        redrive_ready_completions();
+        if let Some(status) = result.returned() { return Ok((u64::from(status), true)); }
+        component_resume::prepare_receive(&mut *handler);
+        let arrival = ingress::receive(nt_component_suspension::IngressExecutionOwner::Idle, 1, true)
+            .map_err(|_| nt_process::STATUS_UNSUCCESSFUL)?;
+        if let ingress::Arrival::Notification(message) = arrival {
+            spawn_hosts::pump_handle_executive_event_badge(message.badge());
+        }
+    }
+}
 
 pub(super) unsafe fn wait_resume_is_eligible(
     pm: &nt_process::ProcessManager,
@@ -147,7 +247,7 @@ pub(crate) unsafe fn capture_win32k_initial_system(
     if lanes.binding(lane) != Ok(channel_binding(channel)) {
         return Err(nt_process::STATUS_INVALID_HANDLE);
     }
-    let recipient = DriverEntryRecipient::new(*channel)?;
+    let recipient = KernelJobRecipient::new(*channel)?;
     with_provider_process_manager(|pm| {
         if !pm.validate_initial_system_caller(system) {
             return Err(nt_process::STATUS_INVALID_HANDLE);
@@ -170,7 +270,7 @@ pub(crate) unsafe fn capture_win32k_initial_system(
 }
 
 #[must_use = "a stopped activation retains its readiness or completion owner"]
-pub(crate) struct InitialDriverEntryOutcome {
+pub(crate) struct KernelJobOutcome {
     pub observation: spawn_hosts::PumpResult,
     pub stop: nt_user_host::provider_kernel_wait::KernelProviderStoppedOutcome,
     pub receipt: Option<KernelProviderCompletionReceipt>,
@@ -180,7 +280,16 @@ pub(crate) struct InitialDriverEntryOutcome {
 /// retains its Running lane throughout; walls and typed waits do not enter this scheduler path.
 pub(crate) unsafe fn run_initial_driver_entry(
     caller: KernelProviderCaller,
-) -> Result<InitialDriverEntryOutcome, u32> {
+) -> Result<KernelJobOutcome, u32> {
+    if !(&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller)?.is_driver_entry() {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    run_issued_kernel_job(caller)
+}
+
+unsafe fn run_issued_kernel_job(
+    caller: KernelProviderCaller,
+) -> Result<KernelJobOutcome, u32> {
     let scope = driver_launch::ComponentSchedulerScope::enter();
     let (channel, mut attempt) = with_provider_process_manager(|pm| {
         let activations = &mut *core::ptr::addr_of_mut!(ACTIVATIONS);
@@ -207,7 +316,7 @@ pub(crate) unsafe fn run_initial_driver_entry(
     } else {
         None
     };
-    Ok(InitialDriverEntryOutcome {
+    Ok(KernelJobOutcome {
         observation: result,
         stop,
         receipt,
@@ -276,6 +385,10 @@ pub(super) unsafe fn service_ps(
     if authenticated_channel_caller(channel) != Ok(caller) {
         return (nt_process::STATUS_INVALID_HANDLE as i32, 0, 0, 0);
     }
+    let target = match provider_ps_projection::authenticated_target(channel) {
+        Ok(target) => target,
+        Err(status) => return (status as i32, 0, 0, 0),
+    };
     match with_provider_process_manager(|pm| {
         (&*core::ptr::addr_of!(ACTIVATIONS)).validate(
             caller,
@@ -283,7 +396,9 @@ pub(super) unsafe fn service_ps(
             &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
             &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
         )?;
-        Ok(provider_ps::dispatch(pm, op, object, value))
+        Ok(provider_ps::dispatch(pm, op, object, value, |pm, body| {
+            provider_ps_projection::grant(target, pm, body)
+        }))
     }) {
         Ok(result) => result,
         Err(status) => (status as i32, 0, 0, 0),
@@ -310,22 +425,33 @@ pub(super) unsafe fn service_event(
                 (win32k_subsystem::W32_EVENT_LABEL << 12) | 4,
             )
         })?;
+        let owner = caller.owner();
+        let provider = nt_provider_wait::ProviderDomainIdentity {
+            domain: owner.provider_domain,
+            generation: owner.provider_generation,
+        };
+        if matches!(
+            op,
+            win32k_subsystem::W32_TIMER_OP_PUBLISH_LOCAL
+                | win32k_subsystem::W32_TIMER_OP_RETIRE_LOCAL
+                | win32k_subsystem::W32_TIMER_OP_ACK_LOCAL_RETIREMENT
+                | win32k_subsystem::W32_TIMER_OP_SET_LOCAL
+                | win32k_subsystem::W32_TIMER_OP_CANCEL_LOCAL
+                | win32k_subsystem::W32_TIMER_OP_READ_LOCAL
+        ) {
+            return Ok(crate::service_sec_image::service_win32k_provider_timer_request(
+                provider, op, arg1, arg2, arg3,
+            ));
+        }
         let request = nt_user_host::provider_local_event_request::LocalEventRequest::decode(
             op, arg1, arg2, arg3,
         )?;
-        let owner = caller.owner();
-        event::dispatch(
-            nt_provider_wait::ProviderDomainIdentity {
-                domain: owner.provider_domain,
-                generation: owner.provider_generation,
-            },
-            request,
-        )
+        event::dispatch(provider, request)
     })();
     result.unwrap_or_else(|status| (status as i32, 0, 0, 0))
 }
 
-pub(super) unsafe fn validate_win32k_service_call(
+pub(crate) unsafe fn validate_win32k_service_call(
     channel: &spawn_hosts::PumpChannel,
     envelope: nt_user_host::provider_kernel_activation::KernelProviderServiceEnvelope,
     expected_message_info: u64,
@@ -396,7 +522,9 @@ unsafe fn observe_driver_entry_pump(
         scheduler_yielded: result.scheduler_yielded,
     };
     let status = facts.is_return(current.reply_cap).then(|| {
-        core::ptr::read_volatile((channel.shared_va + win32k_subsystem::SH_DE_STATUS) as *const u32)
+        let offset = (&*core::ptr::addr_of!(ACTIVATIONS))
+            .recipient(caller).expect("authenticated kernel job recipient").return_status_offset();
+        core::ptr::read_volatile((channel.shared_va + offset) as *const u32)
     });
     (&mut *core::ptr::addr_of_mut!(ACTIVATIONS))
         .recipient_mut(caller)?
@@ -440,6 +568,9 @@ pub(crate) unsafe fn finish_observed_driver_entry_return(
     else {
         return Ok(None);
     };
+    if !crate::win32k_glue::retire_kernel_attach(caller) {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
     let shared = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
         .peer_route(caller.dispatch().lane())
         .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?
@@ -492,11 +623,11 @@ unsafe fn finish_shared_return(
 /// both Ps references survive a failed acknowledgment; shared bytes are never read again here.
 unsafe fn accept_driver_entry_completion(
     receipt: KernelProviderCompletionReceipt,
-) -> Result<DriverEntryCompletion, u32> {
+) -> Result<KernelJobCompletion, u32> {
     with_provider_process_manager(|pm| {
         (&mut *core::ptr::addr_of_mut!(ACTIVATIONS))
             .acknowledge_completion_with_recipient(receipt, pm)
-            .map(|(status, recipient)| DriverEntryCompletion::new(status, recipient))
+            .map(|(status, recipient)| KernelJobCompletion::new(status, recipient))
     })
 }
 
@@ -528,6 +659,7 @@ impl CompletionDeliveryPass {
         // Cleanup of a failed DriverEntry needs no new execution. Successful delayed readiness
         // still requires the original live provider and idle physical lane before releasing refs.
         if (receipt.status() as i32) >= 0
+            && (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(receipt.caller())?.is_driver_entry()
             && !(&*core::ptr::addr_of!(ACTIVATIONS))
                 .recipient(receipt.caller())?
                 .can_initialize(receipt.caller())

@@ -14,6 +14,15 @@ extern crate alloc;
 mod retained_snapshot_integration;
 
 mod active_driver_service;
+mod registry_string;
+pub use registry_string::decode_terminated_reg_sz;
+mod driver_load_request;
+pub use driver_load_request::{
+    capture_driver_service_name, decode_driver_service_name, inspect_driver_service_name,
+    DriverServiceNameBuffer, DRIVER_SERVICE_PATH_MAX_BYTES,
+};
+mod filter_policy;
+pub use filter_policy::DeviceFilterPolicySnapshot;
 mod runtime_key;
 mod system_mount;
 pub use system_mount::{SystemHiveMount, SystemHiveMountState};
@@ -124,7 +133,6 @@ const STATUS_REGISTRY_CORRUPT: i32 = 0xC000_014Cu32 as i32;
 const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001Au32 as i32;
 #[cfg(test)]
 const STATUS_DEVICE_BUSY: i32 = 0x8000_0011u32 as i32;
-#[cfg(test)]
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: i32 = 0xC000_009Au32 as i32;
 
@@ -3909,6 +3917,32 @@ impl<B: Backend> ConfigClient<B> {
 
 #[cfg(test)]
 mod tests {
+    pub(crate) fn secure_fixture_hive(hive: &mut nt_hive_core::Hive) {
+        let system = nt_security::AccessToken::system();
+        let descriptor = nt_security::assign_registry_root_security(
+            &nt_security::CapturedSubjectTokens {
+                primary: &system, client: None, process_audit_id: 0,
+            },
+            &mut nt_security::SecurityAssignmentAudit::default(),
+        ).unwrap();
+        if hive.key_security_descriptor(hive.root()).is_none() {
+            assert!(hive.set_key_security_descriptor(hive.root(), &descriptor));
+        }
+        let mut pending = alloc::vec![hive.root()];
+        while let Some(parent) = pending.pop() {
+            for name in hive.enum_subkeys(parent) {
+                let child = hive.open_subkey(parent, &name).unwrap();
+                if hive.key_security_descriptor(child).is_none() {
+                    let descriptor = nt_config_manager::inherit_generated_key_security(
+                        hive.key_security_descriptor(parent).expect("secured fixture parent"),
+                    ).unwrap();
+                    assert!(hive.set_key_security_descriptor(child, &descriptor));
+                }
+                pending.push(child);
+            }
+        }
+    }
+
     mod runtime_security;
     mod hardware_profile;
     mod key_creation;
@@ -4288,6 +4322,7 @@ mod tests {
         hive.create_subkey(existing, "Child");
         let obsolete = hive.create_key(r"ControlSet001\Services\Obsolete");
         hive.set_dword(obsolete, "Value", 1);
+        secure_fixture_hive(&mut hive);
         hive.finish_clean_import();
         let mut replayed = hive.clone();
 
@@ -5129,6 +5164,7 @@ mod tests {
         let select = hive.create_key("Select");
         hive.set_dword(select, "Current", 1);
         hive.create_key("ControlSet001");
+        secure_fixture_hive(&mut hive);
         hive.finish_clean_import();
 
         let mut client = ConfigClient::new(Framed {

@@ -163,6 +163,13 @@ pub(crate) fn read(file_id: u64, device_id: u64, offset: u64, output: &mut [u8])
                 .unwrap_or(STATUS_IO_DEVICE_ERROR);
             (status, 0)
         }
-        Err(status) => (status.raw() as u32, 0),
+        Err(status) => {
+            crate::print_str(b"[section-read-failed] file="); crate::print_u64(file_id);
+            crate::print_str(b" device="); crate::print_u64(device_id);
+            crate::print_str(b" offset="); crate::print_u64(offset);
+            crate::print_str(b" status="); crate::print_hex(status.raw() as u32);
+            crate::print_str(b"\n");
+            (status.raw() as u32, 0)
+        },
     }
 }

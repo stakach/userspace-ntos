@@ -217,6 +217,9 @@ version = "0.1.0"
 name = "nt-compat-exports"
 version = "0.1.0"
 dependencies = [
+ "nt-kernel-abi",
+ "nt-kernel-exec",
+ "nt-process",
  "syn",
 ]
 
@@ -255,6 +258,7 @@ dependencies = [
  "nt-config-abi",
  "nt-config-manager",
  "nt-hive-core",
+ "nt-security",
  "nt-status",
 ]
 
@@ -340,6 +344,7 @@ name = "nt-fs"
 version = "0.1.0"
 dependencies = [
  "nt-cache-manager",
+ "nt-config-store",
  "nt-hive-core",
  "nt-io-completion",
 ]
@@ -354,6 +359,7 @@ version = "0.1.0"
 dependencies = [
  "nt-config-manager",
  "nt-config-store",
+ "nt-security",
 ]
 
 [[package]]
@@ -362,6 +368,7 @@ version = "0.1.0"
 dependencies = [
  "nt-config-manager",
  "nt-hive-core",
+ "nt-security",
 ]
 
 [[package]]
@@ -377,6 +384,7 @@ name = "nt-io-abi"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "nt-power-types",
 ]
 
 [[package]]
@@ -410,6 +418,7 @@ dependencies = [
  "nt-memory-manager",
  "nt-object-manager",
  "nt-pnp-abi",
+ "nt-power-types",
  "nt-process",
  "nt-provider-wait",
  "nt-status",
@@ -567,6 +576,7 @@ dependencies = [
 name = "nt-pe-loader"
 version = "0.1.0"
 dependencies = [
+ "nt-compat-exports",
  "proptest",
 ]
 
@@ -598,9 +608,12 @@ name = "nt-pnp-manager"
 version = "0.1.0"
 dependencies = [
  "nt-cm-resources",
+ "nt-io-abi",
  "nt-io-manager",
  "nt-pnp-abi",
+ "nt-provider-wait",
  "nt-status",
+ "nt-types",
 ]
 
 [[package]]
@@ -792,6 +805,7 @@ name = "nt-video-miniport"
 version = "0.1.0"
 dependencies = [
  "nt-io-manager",
+ "nt-pnp-abi",
 ]
 
 [[package]]
@@ -844,6 +858,10 @@ version = "0.1.0"
 dependencies = [
  "nt-kernel-exec",
 ]
+
+[[package]]
+name = "nt-wmi"
+version = "0.1.0"
 
 [[package]]
 name = "ntdll-dll-verify"

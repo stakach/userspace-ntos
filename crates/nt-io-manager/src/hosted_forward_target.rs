@@ -59,6 +59,18 @@ impl HostedForwardTarget {
         self.held = false;
         Ok(())
     }
+
+    /// Transfer this exact caller reference to the consumer of the projected pointer.
+    /// The consumer must eventually call `dereference_hosted_device_pointer` with the returned
+    /// registration; this does not consume the projection's enduring registration reference.
+    pub fn transfer_reference<P>(
+        &mut self,
+        io: &IoManager<P>,
+    ) -> Result<HostedDevicePointerRegistration, NtStatus> {
+        self.validate(io)?;
+        self.held = false;
+        Ok(self.registration)
+    }
 }
 
 #[cfg(test)]

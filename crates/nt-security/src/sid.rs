@@ -165,19 +165,8 @@ impl Sid {
 
     /// Decode a native in-memory SID (`SID` header followed by little-endian sub-authorities).
     pub fn from_native_bytes(bytes: &[u8]) -> Result<Self, u32> {
-        if bytes.len() < SID_HEADER_SIZE
-            || bytes[0] != SID_REVISION
-            || bytes[1] > SID_MAX_SUB_AUTHORITIES
-        {
-            return Err(STATUS_INVALID_SID);
-        }
+        Self::validate_native_bytes(bytes)?;
         let count = bytes[1] as usize;
-        let sid_len = SID_HEADER_SIZE
-            .checked_add(count.checked_mul(4).ok_or(STATUS_INVALID_SID)?)
-            .ok_or(STATUS_INVALID_SID)?;
-        if sid_len > bytes.len() {
-            return Err(STATUS_INVALID_SID);
-        }
         let mut sub_authorities = Vec::new();
         if sub_authorities.try_reserve_exact(count).is_err() {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
@@ -198,6 +187,23 @@ impl Sid {
                 .expect("identifier authority slice is 6 bytes"),
             sub_authorities,
         })
+    }
+
+    pub(crate) fn validate_native_bytes(bytes: &[u8]) -> Result<(), u32> {
+        if bytes.len() < SID_HEADER_SIZE
+            || bytes[0] != SID_REVISION
+            || bytes[1] > SID_MAX_SUB_AUTHORITIES
+        {
+            return Err(STATUS_INVALID_SID);
+        }
+        let count = bytes[1] as usize;
+        let sid_len = SID_HEADER_SIZE
+            .checked_add(count.checked_mul(4).ok_or(STATUS_INVALID_SID)?)
+            .ok_or(STATUS_INVALID_SID)?;
+        if sid_len > bytes.len() {
+            return Err(STATUS_INVALID_SID);
+        }
+        Ok(())
     }
 
     /// SDDL string form (`S-1-5-32-544`, spec §18.4).

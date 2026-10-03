@@ -8,13 +8,25 @@ use nt_config_store::codec::{crc32c, Reader};
 #[path = "created_child_log.rs"]
 mod created_child_log;
 
-use crate::hive::{Cell, CellId, Hive, HiveKind, KeyCell, RegistryValueType, ValueCell};
+use crate::hive::{Cell, CellId, Hive, HiveKind, KeyCell, KeyKind, RegistryValueType, ValueCell};
 
 pub const HIVE_IMAGE_MAGIC: [u8; 8] = *b"UNTHIVE1";
 const IMAGE_MAGIC: [u8; 8] = HIVE_IMAGE_MAGIC;
 const IMAGE_HEADER_LEN: usize = 8 + 2 + 2 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 4 + 4; // 68
 const MIN_SCHEMA_VERSION: u16 = 1;
-const SCHEMA_VERSION: u16 = 2;
+const SCHEMA_VERSION: u16 = 3;
+
+fn key_flags(kind: KeyKind) -> u32 {
+    u32::from(kind == KeyKind::SymbolicLink)
+}
+
+fn key_kind(schema: u16, flags: u32) -> Result<KeyKind, HiveDecodeError> {
+    match (schema, flags) {
+        (_, 0) => Ok(KeyKind::Ordinary),
+        (3, 1) => Ok(KeyKind::SymbolicLink),
+        _ => Err(HiveDecodeError::UnsupportedSchema),
+    }
+}
 
 const REC_KEY_CELL: u16 = 1;
 const REC_VALUE_CELL: u16 = 2;
@@ -93,7 +105,7 @@ pub fn try_encode_image(hive: &Hive) -> Result<Vec<u8>, HiveEncodeError> {
         p.u64(k.id.0);
         p.u64(k.parent.unwrap_or(CellId(0)).0);
         p.str16(&k.name);
-        p.u32(0); // flags
+        p.u32(key_flags(k.kind));
         match &k.class_name {
             Some(c) => {
                 p.u8(1);
@@ -278,7 +290,7 @@ fn write_key_record(p: &mut CheckedWriter, key: &KeyCell, encoded_parent: CellId
     p.u64(key.id.0);
     p.u64(encoded_parent.0);
     p.str16(&key.name);
-    p.u32(0);
+    p.u32(key_flags(key.kind));
     match &key.class_name {
         Some(class_name) => {
             p.u8(1);
@@ -435,7 +447,7 @@ pub fn decode_image(bytes: &[u8]) -> Result<Hive, HiveDecodeError> {
                 let raw_id = CellId(pr.u64().ok_or(HiveDecodeError::Truncated)?);
                 let parent_raw = pr.u64().ok_or(HiveDecodeError::Truncated)?;
                 let name = pr.str16().ok_or(HiveDecodeError::Truncated)?;
-                let _flags = pr.u32().ok_or(HiveDecodeError::Truncated)?;
+                let kind = key_kind(schema, pr.u32().ok_or(HiveDecodeError::Truncated)?)?;
                 let class_name = match pr.u8().ok_or(HiveDecodeError::Truncated)? {
                     0 => None,
                     _ => Some(pr.str16().ok_or(HiveDecodeError::Truncated)?),
@@ -454,6 +466,7 @@ pub fn decode_image(bytes: &[u8]) -> Result<Hive, HiveDecodeError> {
                 let parent = (raw_id.0 != root_cell)
                     .then(|| map_decoded_cell_id(&mut id_map, CellId(parent_raw), &mut next_id));
                 hive.insert_key(KeyCell {
+                    kind,
                     volatile: false,
                     id,
                     parent,
@@ -598,7 +611,7 @@ pub fn image_root_subkey_count_if_valid(bytes: &[u8]) -> Result<usize, HiveDecod
                 let raw_id = pr.u64().ok_or(HiveDecodeError::Truncated)?;
                 let parent_raw = pr.u64().ok_or(HiveDecodeError::Truncated)?;
                 let _name = take_len_prefixed_slice(&mut pr)?;
-                let _flags = pr.u32().ok_or(HiveDecodeError::Truncated)?;
+                let _ = key_kind(schema, pr.u32().ok_or(HiveDecodeError::Truncated)?)?;
                 if pr.u8().ok_or(HiveDecodeError::Truncated)? != 0 {
                     let _class_name = take_len_prefixed_slice(&mut pr)?;
                 }
@@ -731,7 +744,7 @@ pub fn image_value_len_if_valid(
                 let raw_id = pr.u64().ok_or(HiveDecodeError::Truncated)?;
                 let parent_raw = pr.u64().ok_or(HiveDecodeError::Truncated)?;
                 let name = take_len_prefixed_slice(&mut pr)?;
-                let _flags = pr.u32().ok_or(HiveDecodeError::Truncated)?;
+                let _ = key_kind(schema, pr.u32().ok_or(HiveDecodeError::Truncated)?)?;
                 match pr.u8().ok_or(HiveDecodeError::Truncated)? {
                     0 => {}
                     _ => {

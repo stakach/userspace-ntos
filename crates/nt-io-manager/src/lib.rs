@@ -18,6 +18,7 @@ use nt_status::NtStatus;
 use nt_types::{ClientId, NtPath, ObjectId};
 
 mod banked_transfer;
+pub mod bus_interface;
 mod bounded_file_read;
 mod buffered_set_information;
 mod cancel;
@@ -27,6 +28,7 @@ mod close;
 mod complete;
 mod completion_unwind;
 mod device;
+pub mod device_power;
 mod device_file_name;
 mod device_reference;
 mod device_control;
@@ -55,6 +57,9 @@ mod hosted_file;
 #[cfg(test)]
 mod hosted_file_lifetime_tests;
 mod hosted_device_pointer;
+mod hosted_attached_device_reference;
+mod hosted_safe_attach;
+mod hosted_file_system_registry;
 pub mod hosted_pool_range;
 pub mod hosted_kernel_read_delivery;
 pub mod inline_file_retirement;
@@ -73,15 +78,24 @@ pub mod retained_read_forward;
 pub mod retained_query_information_forward;
 pub mod retained_flush_forward;
 pub mod source_irp_ledger;
+pub mod source_irp_auxiliary;
 pub mod provider_source_irp;
 pub mod query_path_wire;
 pub mod io_create_file_wire;
 pub mod file_read_query_wire;
+pub mod retained_file_query_progress;
+pub mod retained_file_close_progress;
+pub mod retained_source_progress;
 pub mod win32k_async_read_wire;
 pub mod win32k_section_create_wire;
+pub mod win32k_mm_section_wire;
 pub mod win32k_section_map_wire;
 pub mod win32k_buffered_ioctl_wire;
 pub mod win32k_source_irp_ioctl_wire;
+pub mod win32k_source_pnp_wire;
+pub mod win32k_source_fsd_wire;
+pub mod source_terminal;
+pub mod source_pending_armed;
 pub mod file_directory_query_wire;
 mod lock_control;
 mod set_information_completion;
@@ -295,6 +309,7 @@ pub struct IoManager<P> {
     device_references: device_reference::DeviceReferenceStore,
     file_references: file_reference::FileReferenceStore,
     hosted_device_pointers: hosted_device_pointer::HostedDevicePointerStore,
+    hosted_file_systems: hosted_file_system_registry::HostedFileSystemRegistry,
     files: GenStore<FileId, FileRecord>,
     irps: GenStore<IrpId, IrpRecord>,
     hosted_domains: GenStore<HostedDomainId, HostedDomainRecord>,
@@ -319,6 +334,7 @@ impl<P> IoManager<P> {
             device_references: device_reference::DeviceReferenceStore::default(),
             file_references: file_reference::FileReferenceStore::default(),
             hosted_device_pointers: hosted_device_pointer::HostedDevicePointerStore::default(),
+            hosted_file_systems: hosted_file_system_registry::HostedFileSystemRegistry::default(),
             files: GenStore::new(),
             irps: GenStore::new(),
             hosted_domains: GenStore::new(),

@@ -20,6 +20,32 @@ pub(crate) fn server() -> CmServer {
     server
 }
 
+pub(crate) fn secure_fixture_hive(hive: &mut Hive) {
+    let system = nt_security::AccessToken::system();
+    let subject = nt_security::CapturedSubjectTokens {
+        primary: &system, client: None, process_audit_id: 0,
+    };
+    let descriptor = nt_security::assign_registry_root_security(
+        &subject, &mut nt_security::SecurityAssignmentAudit::default(),
+    ).unwrap();
+    let mut pending = alloc::vec![(hive.root(), descriptor)];
+    while let Some((key, descriptor)) = pending.pop() {
+        assert!(hive.set_key_security_descriptor(key, &descriptor));
+        for name in hive.enum_subkeys(key) {
+            let child = hive.open_subkey(key, &name).unwrap();
+            pending.push((child, nt_config_manager::inherit_generated_key_security(&descriptor).unwrap()));
+        }
+    }
+}
+
+pub(crate) fn secured_server() -> CmServer {
+    let mut server = server();
+    let mounted = server.system_hive.as_mut().unwrap();
+    secure_fixture_hive(&mut mounted.hive);
+    server.cm = config_manager_from_system_hive(&mounted.hive, &mounted.current_control_set);
+    server
+}
+
 pub(super) fn prepare(server: &mut CmServer, name: &str) -> CmHiveMutationCommitRequest {
     let token = server.identities.take().unwrap();
     let expected = server.system_hive.as_ref().unwrap().generation;
@@ -31,14 +57,14 @@ pub(super) fn prepare(server: &mut CmServer, name: &str) -> CmHiveMutationCommit
         class_name: Some(String::from("class")),
         descriptor: alloc::vec![1, 2, 3],
     }];
-    let durable_journal = server.prepare_system_hive_mutations(&mutations).unwrap();
+    let prepared = server.prepare_system_hive_mutations(&mutations).unwrap();
     server.prepared_system_mutation = Some(PreparedSystemHiveMutation {
         token,
         expected_generation: expected,
         next_generation: expected + 1,
         semantic_journal_len: 100,
-        mutations,
-        durable_journal,
+        mutations: prepared.mutations,
+        durable_journal: prepared.durable_journal,
     });
     CmHiveMutationCommitRequest {
         abi_size: core::mem::size_of::<CmHiveMutationCommitRequest>() as u16,

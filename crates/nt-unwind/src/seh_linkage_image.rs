@@ -13,7 +13,7 @@ use nt_pe_loader::{
     DIRECTORY_ENTRY_EXPORT,
 };
 
-const NAMES: [&str; 14] = [
+const NAMES: [&str; 15] = [
     "SehCallFilter",
     "SehCallFinally",
     "SehExecuteHandlerForException",
@@ -28,6 +28,7 @@ const NAMES: [&str; 14] = [
     "SehFaultEntry",
     "SehFaultDispatch",
     "SehRaiseAccessViolation",
+    "SehUnwind",
 ];
 const RAISE_LEN: u32 = 0x12a;
 const ACCESS_VIOLATION_LEN: u32 = 10;
@@ -54,6 +55,7 @@ pub struct SehLinkageImage {
     pub raise_va: u64,
     pub access_violation_va: u64,
     pub unwind_entry_va: u64,
+    pub legacy_unwind_va: u64,
     pub foreign_call2_va: u64,
     pub foreign_call16_va: u64,
     pub fault_entry_va: u64,
@@ -172,6 +174,7 @@ impl SehLinkageImage {
             self.raise_va,
             self.access_violation_va,
             self.unwind_entry_va,
+            self.legacy_unwind_va,
             self.foreign_call2_va,
             self.foreign_call16_va,
             self.fault_entry_va,
@@ -212,7 +215,7 @@ fn checked_export_rvas(
     exports: &[ExportedSymbol],
     sections: &[Section],
     export_directory: DataDirectory,
-) -> Result<[u32; 14], SehLinkageImageError> {
+) -> Result<[u32; NAMES.len()], SehLinkageImageError> {
     if exports.len() != NAMES.len() {
         return Err(SehLinkageImageError::Exports);
     }
@@ -246,12 +249,14 @@ fn checked_export_rvas(
     let fault_entry = found[11].ok_or(SehLinkageImageError::Exports)?;
     let fault_slot = found[12].ok_or(SehLinkageImageError::Exports)?;
     let access_violation = found[13].ok_or(SehLinkageImageError::Exports)?;
+    let legacy_unwind = found[14].ok_or(SehLinkageImageError::Exports)?;
     if !placed_in_section(sections, raise, RAISE_LEN, true)
         || !placed_in_section(sections, access_violation, ACCESS_VIOLATION_LEN, true)
         || !placed_in_section(sections, resume, RESUME_LEN, true)
         || !placed_in_section(sections, slot, 8, false)
         || slot & 7 != 0
         || !placed_in_section(sections, unwind_entry, 1, true)
+        || !placed_in_section(sections, legacy_unwind, 1, true)
         || !placed_in_section(sections, foreign_call2, 1, true)
         || !placed_in_section(sections, foreign_call16, 1, true)
         || !placed_in_section(sections, fault_entry, 1, true)
@@ -283,7 +288,7 @@ pub fn admit(
         return Err(SehLinkageImageError::InvalidImage);
     }
     let exports = pe.exports().map_err(|_| SehLinkageImageError::Exports)?;
-    let [filter, finally, search, unwind, raise, resume, slot, unwind_entry, unwind_slot, foreign_call2, foreign_call16, fault_entry, fault_slot, access_violation] =
+    let [filter, finally, search, unwind, raise, resume, slot, unwind_entry, unwind_slot, foreign_call2, foreign_call16, fault_entry, fault_slot, access_violation, legacy_unwind] =
         checked_export_rvas(
             &exports,
             pe.sections(),
@@ -316,6 +321,10 @@ pub fn admit(
     let unwind_entry_va = mapped
         .load_base
         .checked_add(u64::from(unwind_entry))
+        .ok_or(SehLinkageImageError::AddressOverflow)?;
+    let legacy_unwind_va = mapped
+        .load_base
+        .checked_add(u64::from(legacy_unwind))
         .ok_or(SehLinkageImageError::AddressOverflow)?;
     let foreign_call2_va = mapped
         .load_base
@@ -353,6 +362,7 @@ pub fn admit(
             .checked_add(u64::from(access_violation))
             .ok_or(SehLinkageImageError::AddressOverflow)?,
         unwind_entry_va,
+        legacy_unwind_va,
         foreign_call2_va,
         foreign_call16_va,
         fault_entry_va,
@@ -381,7 +391,7 @@ mod tests {
         let rvas = [
             0x1200, 0x1300, 0x1400, 0x1500, 0x1000, 0x112a, 0x3000, 0x1600, 0x3008, 0x1700,
             0x1800,
-            0x1900, 0x3010, 0x1a00,
+            0x1900, 0x3010, 0x1a00, 0x1b00,
         ];
         let exports = NAMES
             .iter()
@@ -421,7 +431,7 @@ mod tests {
         let (exports, sections, directory) = fixture();
         assert_eq!(
             checked_export_rvas(&exports, &sections, directory),
-            Ok([0x1200, 0x1300, 0x1400, 0x1500, 0x1000, 0x112a, 0x3000, 0x1600, 0x3008, 0x1700, 0x1800, 0x1900, 0x3010, 0x1a00])
+            Ok([0x1200, 0x1300, 0x1400, 0x1500, 0x1000, 0x112a, 0x3000, 0x1600, 0x3008, 0x1700, 0x1800, 0x1900, 0x3010, 0x1a00, 0x1b00])
         );
         let mut missing = exports.clone();
         missing.pop();
@@ -481,6 +491,12 @@ mod tests {
         missing_access_violation[13].name = missing_access_violation[4].name.clone();
         assert_eq!(
             checked_export_rvas(&missing_access_violation, &sections, directory),
+            Err(SehLinkageImageError::Exports)
+        );
+        let mut missing_legacy_unwind = exports.clone();
+        missing_legacy_unwind[14].name = missing_legacy_unwind[7].name.clone();
+        assert_eq!(
+            checked_export_rvas(&missing_legacy_unwind, &sections, directory),
             Err(SehLinkageImageError::Exports)
         );
     }
@@ -728,6 +744,7 @@ mod tests {
             raise_va: 0x5000,
             access_violation_va: 0x5a00,
             unwind_entry_va: 0x5600,
+            legacy_unwind_va: 0x5b00,
             foreign_call2_va: 0x5700,
             foreign_call16_va: 0x5800,
             fault_entry_va: 0x5900,

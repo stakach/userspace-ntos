@@ -26,11 +26,21 @@ pub const WIN32K_EXPORT_INITIAL_RESERVE: usize = DRIVER_EXPORT_INITIAL_RESERVE;
 /// contract (`ntoskrnl.exe` MVP + win32k's extra ntoskrnl surface + `hal.dll`).
 /// Scans the `const` slices — no allocation. Symbol names are case-sensitive.
 pub fn export_descriptor(name: &str) -> Option<&'static ExportDescriptor> {
+    export_descriptors().find(|descriptor| descriptor.name == name)
+}
+
+fn export_descriptors() -> impl Iterator<Item = &'static ExportDescriptor> {
     ntoskrnl::NTOSKRNL
         .iter()
         .chain(win32k::WIN32K_NTOSKRNL.iter())
         .chain(hal::HAL.iter())
-        .find(|d| d.name == name)
+}
+
+/// Module ownership is independent of which symbols one particular image imports.
+pub fn module_export_descriptor(module: &str, name: &str) -> Option<&'static ExportDescriptor> {
+    export_descriptors().find(|descriptor| {
+        descriptor.dll.eq_ignore_ascii_case(module) && descriptor.name == name
+    })
 }
 
 /// The 11 `ntoskrnl.exe` **data exports** win32k dereferences at init, in cell-index order.
@@ -114,6 +124,32 @@ mod tests {
         let mut reg = Win32kExportRegistry::new();
         reg.bind("ObCreateObject", 1);
         assert_eq!(reg.lookup("TotallyMadeUp"), None);
+    }
+
+    #[test]
+    fn canonical_device_and_file_bindings_are_not_success_stubs() {
+        for name in ["IoGetDeviceProperty", "ZwOpenFile", "ZwCreateFile"] {
+            let descriptor = export_descriptor(name).expect("declared canonical import");
+            assert_eq!(descriptor.status, ExportStatus::Partial, "{name}");
+            assert_ne!(descriptor.status, ExportStatus::StubSuccess, "{name}");
+        }
+    }
+
+    #[test]
+    fn lookaside_and_live_registry_bindings_are_not_success_stubs() {
+        for name in ["ExInitializePagedLookasideList", "RtlQueryRegistryValues"] {
+            let descriptor = export_descriptor(name).expect("declared subsystem import");
+            assert_eq!(descriptor.status, ExportStatus::Partial, "{name}");
+            assert_ne!(descriptor.status, ExportStatus::StubSuccess, "{name}");
+        }
+    }
+
+    #[test]
+    fn system_image_bindings_declare_real_partial_contracts() {
+        for name in ["NtSetSystemInformation", "ZwSetSystemInformation"] {
+            let descriptor = export_descriptor(name).expect("declared system image import");
+            assert_eq!(descriptor.status, ExportStatus::Partial, "{name}");
+        }
     }
 
     #[test]

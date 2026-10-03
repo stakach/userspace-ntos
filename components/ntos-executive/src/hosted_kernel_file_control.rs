@@ -43,7 +43,6 @@ struct FileWork {
 
 static mut WORK: Vec<Option<FileWork>> = Vec::new();
 static mut EXECUTING: Vec<usize> = Vec::new();
-static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 
 fn control_access(granted: u32, code: u32) -> bool {
@@ -163,7 +162,7 @@ pub(crate) unsafe fn submit(
             .expect("unadmitted hosted FSCTL actor");
         return Some(STATUS_INSUFFICIENT_RESOURCES);
     }
-    let token = match NEXT_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)) {
+    let token = match runtime::next_service_wait_token() {
         Ok(token) => token,
         Err(_) => {
             crate::service_sec_image::with_provider_process_manager(|pm| actor.release(pm))
@@ -424,7 +423,6 @@ struct WaitWork {
 
 static mut WAITS: Vec<Option<WaitWork>> = Vec::new();
 static mut WAIT_EXECUTING: Vec<usize> = Vec::new();
-static WAIT_NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 static WAIT_CURSOR: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) unsafe fn submit_wait(
@@ -484,7 +482,7 @@ pub(crate) unsafe fn submit_wait(
             .expect("unadmitted hosted File wait actor");
         return Some(STATUS_INSUFFICIENT_RESOURCES);
     }
-    let token = match WAIT_NEXT_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)) {
+    let token = match runtime::next_service_wait_token() {
         Ok(token) => token,
         Err(_) => {
             crate::service_sec_image::with_provider_process_manager(|pm| actor.release(pm))

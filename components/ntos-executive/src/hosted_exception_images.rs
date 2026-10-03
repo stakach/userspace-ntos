@@ -211,6 +211,7 @@ fn admission_error_name(error: ImageAdmissionError) -> &'static [u8] {
         ImageAdmissionError::FunctionTable => b"FunctionTable",
         ImageAdmissionError::UnwindMetadata => b"UnwindMetadata",
         ImageAdmissionError::ImageOverlap => b"ImageOverlap",
+        ImageAdmissionError::InsufficientResources => b"InsufficientResources",
     }
 }
 

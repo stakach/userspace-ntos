@@ -12,6 +12,13 @@ struct BackingIo {
     route: Option<crate::hosted_routed_section_capture::Route>,
 }
 
+fn pagein_failure(stage: &[u8], identity: nt_memory_manager::SectionIdentity, status: u32) -> u32 {
+    print_str(b"[section-pagein-failed] stage="); print_str(stage);
+    print_str(b" section="); print_u64(identity.index() as u64);
+    print_str(b" status="); print_hex(status); print_str(b"\n");
+    status
+}
+
 impl DataSectionFileIo for BackingIo {
     fn query_file(&mut self) -> Result<DataSectionFileInfo, u32> {
         match self.backing.kind {
@@ -134,16 +141,19 @@ pub(crate) unsafe fn service_generic_section_frame(
         .filter(|offset| *offset < section.size)
         .ok_or(nt_memory_manager::STATUS_INVALID_VIEW_SIZE)?;
     if (&*generic_sections).section_identity(section_index) != Some(identity) {
-        return Err(nt_fs::STATUS_INVALID_HANDLE);
+        return Err(pagein_failure(b"section-identity", identity, nt_fs::STATUS_INVALID_HANDLE));
     }
     let route = if let Some(lease) = section.backing.routed_lease {
         Some(
             crate::hosted_routed_section_capture::route(lease, identity)
-                .ok_or(nt_fs::STATUS_INVALID_HANDLE)?,
+                .ok_or_else(|| pagein_failure(b"backing-owner", identity, nt_fs::STATUS_INVALID_HANDLE))?,
         )
     } else {
         None
     };
+    if let Some(frame) = (&*generic_sections).page_frame(section_index, page_index) {
+        return Ok(frame);
+    }
     let mut io = BackingIo { backing: section.backing, route };
     if routed_metadata_validated {
         if section.backing.kind != nt_memory_manager::GENERIC_SECTION_BACKING_ROUTED {
@@ -153,7 +163,7 @@ pub(crate) unsafe fn service_generic_section_frame(
             .ok_or(nt_address_space::STATUS_NOT_COMMITTED);
     }
     let file_size = if section.backing.kind != GENERIC_SECTION_BACKING_ANON {
-        let info = io.query_file()?;
+        let info = io.query_file().map_err(|status| pagein_failure(b"backing-metadata", identity, status))?;
         Some(info.end_of_file)
     } else {
         None
@@ -165,10 +175,11 @@ pub(crate) unsafe fn service_generic_section_frame(
                 crate::hosted_routed_section_capture::route(lease, identity) != route
             })
         {
-            return Err(nt_fs::STATUS_INVALID_HANDLE);
+            return Err(pagein_failure(b"metadata-identity", identity, nt_fs::STATUS_INVALID_HANDLE));
         }
         if let Some(file_size) = file_size {
-            table.refresh_file_extent(section_index, file_size)?;
+            table.refresh_file_extent(section_index, file_size)
+                .map_err(|status| pagein_failure(b"extent", identity, status))?;
         }
         if let Some(frame) = table.page_frame(section_index, page_index) {
             return Ok(frame);
@@ -178,19 +189,21 @@ pub(crate) unsafe fn service_generic_section_frame(
     // the exact Section incarnation and routed lease have been revalidated.
     let mut bytes = [0u8; DATA_PAGE_SIZE];
     if let Some(file_size) = file_size {
-        read_data_section_page(page_index, section.size, file_size, &mut bytes, &mut io)?;
+        read_data_section_page(page_index, section.size, file_size, &mut bytes, &mut io)
+            .map_err(|status| pagein_failure(b"backing-read", identity, status))?;
     }
     if (&*generic_sections).section_identity(section_index) != Some(identity)
         || section.backing.routed_lease.is_some_and(|lease| {
             crate::hosted_routed_section_capture::route(lease, identity) != route
         })
     {
-        return Err(nt_fs::STATUS_INVALID_HANDLE);
+        return Err(pagein_failure(b"read-identity", identity, nt_fs::STATUS_INVALID_HANDLE));
     }
     if let Some(frame) = (&*generic_sections).page_frame(section_index, page_index) {
         return Ok(frame);
     }
     service_publish_section_frame_from_bytes(generic_sections, identity, page_index, &bytes, scratch_base)
+        .map_err(|status| pagein_failure(b"frame-publication", identity, status))
 }
 
 pub(crate) unsafe fn service_publish_section_frame_from_bytes(
@@ -204,8 +217,15 @@ pub(crate) unsafe fn service_publish_section_frame_from_bytes(
         return Err(STATUS_IO_DEVICE_ERROR);
     }
     reserve_pagein_cleanup()?;
+    let scratch = scratch_base.checked_add(DEMAND_SCRATCH_WINDOW - 0x3000)
+        .ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
+    let zero_scratch = scratch_base.checked_add(DEMAND_SCRATCH_WINDOW - 0x1000)
+        .ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
+    // Acquiring a cached frame already maps its zeroing alias into this root-owned window.
+    if !ensure_executive_paging(scratch) || !ensure_executive_paging(zero_scratch) {
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
     let frame = vm_frame_acquire(scratch_base)?;
-    let scratch = scratch_base + DEMAND_SCRATCH_WINDOW - 0x3000;
     if page_map_r(frame, scratch, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
         release_unpublished_section_frame(frame);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);

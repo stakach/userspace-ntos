@@ -16,6 +16,11 @@ use nt_config_abi::{hive_mount, opcode, CmSystemHiveMountRequest, CM_ABI_VERSION
 pub struct SystemHiveMount(NonZeroU64);
 
 impl SystemHiveMount {
+    /// Stable, non-authorizing identity for correlating work across ordinary hive edits.
+    pub fn identity_token(self) -> u64 {
+        self.0.get()
+    }
+
     pub(crate) fn wire_identity(self) -> u64 {
         self.0.get()
     }
