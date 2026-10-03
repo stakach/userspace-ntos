@@ -61,6 +61,10 @@ Any mismatch terminates the real process with STATUS_UNSUCCESSFUL. Nineteen comp
 - OpenFile probes Handle before IOSB and both before ObjectAttributes. Protected
   outputs return the exact exception; an absent relative child preserves Handle
   and both IOSB words instead of publishing a fabricated error result.
+- CreateFile rejects invalid scalar options without consuming an output guard,
+  then probes Handle/IOSB and captures AllocationSize/EA before ObjectAttributes.
+  Direct absolute open and collision cases check handle publication, IOSB padding,
+  Information, and untouched ordinary-error outputs.
 - READ output, WRITE input and IOSB spans crossing into a protected page.
 - Early READ output faults preserve the File signal. Late buffered WRITE input
   faults leave the File and initially-signaled supplied Event reset, without
@@ -87,6 +91,10 @@ Registry sizing follows `ntoskrnl/config/ntapi.c:NtQueryKey` and
 `ntoskrnl/config/cmapi.c:CmpQueryNameInformation`: ResultLength is written before
 BUFFER_TOO_SMALL for a zero-length name query, with four bytes of header plus the
 full UTF-16 path and no terminator. Successful names may differ in letter case.
+CREATE capture ordering follows ReactOS `IopCreateFile` and NT5
+`base/ntos/io/iomgr/iosubs.c`; finalized output disposition and checked publication
+follow ReactOS `IopCreateFile`. These are distinct contracts, not a claim that
+every historical NT release has identical failed-call output contents.
 
 ## Evidence Limits
 

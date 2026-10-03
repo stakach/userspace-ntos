@@ -204,6 +204,31 @@ static void fault_cases(HANDLE file)
     HANDLE event = 0;
     status("event-create", NtCreateEvent(&event, 0x001f0003, 0, 0, 0), SUCCESS);
     int64_t offset = 0;
+    fill(base + 4096, 16, 0xab);
+    protect(base + 4096, PAGE_RW | PAGE_GUARD);
+    status("create-options-before-handle", NtCreateFile((HANDLE *)(base + 4096),
+           SYNC | 1, 0, 0, 0, 0, 7, 1,
+           0x80000000u | NON_DIRECTORY | SYNC_NONALERT, 0, 0), (NTSTATUS)0xc000000du);
+    eq("create-options-before-handle", "old-protection",
+       protect(base + 4096, PAGE_RW), PAGE_RW | PAGE_GUARD);
+    eq("create-options-before-handle", "handle-unchanged", u64(base + 4096), SENTINEL);
+    eq("create-options-before-handle", "protected-output-unchanged", u64(base + 4104), SENTINEL);
+    for (unsigned ea_fault = 0; ea_fault != 2; ++ea_fault) {
+        const char *name = ea_fault ? "create-ea-before-attributes" : "create-allocation-before-attributes";
+        HANDLE handle = (HANDLE)SENTINEL;
+        IO_STATUS_BLOCK iosb = untouched();
+        fill(base + 4096, 16, 0xab);
+        protect(base + 4096, PAGE_RW | PAGE_GUARD);
+        status(name, NtCreateFile(&handle, SYNC | 1, 0, &iosb,
+               ea_fault ? 0 : (int64_t *)(base + 4096), 0, 7, 1,
+               NON_DIRECTORY | SYNC_NONALERT, ea_fault ? base + 4096 : 0,
+               ea_fault ? 4 : 0), GUARD);
+        eq(name, "old-protection", protect(base + 4096, PAGE_RW), PAGE_RW);
+        eq(name, "handle-unchanged", (uintptr_t)handle, SENTINEL);
+        eq(name, "iosb-status", iosb.Status, SENTINEL);
+        eq(name, "iosb-information", iosb.Information, SENTINEL);
+        eq(name, "input-unchanged", u64(base + 4096), SENTINEL);
+    }
     for (unsigned iosb_fault = 0; iosb_fault != 2; ++iosb_fault) {
         const char *name = iosb_fault ? "open-iosb-before-attributes" : "open-handle-before-iosb";
         HANDLE handle = (HANDLE)SENTINEL;
@@ -212,6 +237,16 @@ static void fault_cases(HANDLE file)
         status(name, NtOpenFile(iosb_fault ? &handle : (HANDLE *)(base + 4096),
                SYNC | 1, 0, iosb_fault ? (IO_STATUS_BLOCK *)(base + 4096) : 0,
                7, NON_DIRECTORY | SYNC_NONALERT), GUARD);
+        eq(name, "old-protection", protect(base + 4096, PAGE_RW), PAGE_RW);
+        eq(name, "handle-unchanged", iosb_fault ? (uintptr_t)handle : u64(base + 4096), SENTINEL);
+        eq(name, "protected-output-unchanged", u64(base + 4104), SENTINEL);
+        name = iosb_fault ? "create-iosb-before-attributes" : "create-handle-before-iosb";
+        handle = (HANDLE)SENTINEL;
+        fill(base + 4096, 16, 0xab);
+        protect(base + 4096, PAGE_RW | PAGE_GUARD);
+        status(name, NtCreateFile(iosb_fault ? &handle : (HANDLE *)(base + 4096),
+               SYNC | 1, 0, iosb_fault ? (IO_STATUS_BLOCK *)(base + 4096) : 0,
+               0, 0, 7, 1, NON_DIRECTORY | SYNC_NONALERT, 0, 0), GUARD);
         eq(name, "old-protection", protect(base + 4096, PAGE_RW), PAGE_RW);
         eq(name, "handle-unchanged", iosb_fault ? (uintptr_t)handle : u64(base + 4096), SENTINEL);
         eq(name, "protected-output-unchanged", u64(base + 4104), SENTINEL);
@@ -456,6 +491,28 @@ void NtProcessStartup(void *peb)
     status("relative-create", NtCreateFile(&child, 0x00110183, &child_attrs, &iosb,
            0, 0, 7, 2, NON_DIRECTORY | SYNC_NONALERT | DELETE_ON_CLOSE, 0, 0), SUCCESS);
     eq("relative-create", "information", iosb.Information, 2); ++completed;
+    {
+        uint16_t absolute_units[128];
+        UNICODE_STRING absolute_name = string("\\SystemRoot\\Fonts\\ntos-file-acceptance.tmp", absolute_units);
+        OBJECT_ATTRIBUTES absolute_attrs = attributes(0, &absolute_name);
+        HANDLE direct = (HANDLE)SENTINEL;
+        IO_STATUS_BLOCK direct_iosb = untouched();
+        status("direct-create-open", NtCreateFile(&direct, 0x81 | SYNC, &absolute_attrs,
+               &direct_iosb, 0, 0, 7, 1, NON_DIRECTORY | SYNC_NONALERT, 0, 0), SUCCESS);
+        if (direct == 0 || (uintptr_t)direct == SENTINEL) fail();
+        emit("direct-create-open", "handle-published", 1, 1);
+        eq("direct-create-open", "iosb-status", (uint32_t)direct_iosb.Status, SUCCESS);
+        eq("direct-create-open", "information", direct_iosb.Information, 1);
+        eq("direct-create-open", "iosb-padding", u32((unsigned char *)&direct_iosb + 4), 0xababababu);
+        status("direct-create-close", NtClose(direct), SUCCESS);
+        direct = (HANDLE)SENTINEL;
+        direct_iosb = untouched();
+        status("direct-create-collision", NtCreateFile(&direct, 0x81 | SYNC, &absolute_attrs,
+               &direct_iosb, 0, 0, 7, 2, NON_DIRECTORY | SYNC_NONALERT, 0, 0), (NTSTATUS)0xc0000035u);
+        eq("direct-create-collision", "handle-unchanged", (uintptr_t)direct, SENTINEL);
+        eq("direct-create-collision", "iosb-status", direct_iosb.Status, SENTINEL);
+        eq("direct-create-collision", "iosb-information", direct_iosb.Information, SENTINEL);
+    }
     int64_t offset = 0;
     status("write", NtWriteFile(child, 0, 0, 0, &iosb, (void *)payload, sizeof(payload), &offset, 0), SUCCESS);
     eq("write", "information", iosb.Information, sizeof(payload));

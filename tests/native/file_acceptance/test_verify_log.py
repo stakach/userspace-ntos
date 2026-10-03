@@ -35,6 +35,22 @@ def accepted_log():
 
 
 class AcceptanceParserTests(unittest.TestCase):
+    def test_direct_create_outputs_and_probe_order_receipts_are_required(self):
+        cases = {"direct-create-open", "direct-create-close", "direct-create-collision",
+                 "create-handle-before-iosb", "create-iosb-before-attributes",
+                 "create-options-before-handle", "create-allocation-before-attributes",
+                 "create-ea-before-attributes"}
+        for (case, field), expected in REQUIRED.items():
+            if case not in cases:
+                continue
+            with self.subTest(case=case, field=field):
+                text = "\n".join(line for line in accepted_log().splitlines()
+                                 if not (f"case={case} " in line and f"field={field} " in line))
+                with self.assertRaises(ValueError): verify(text)
+                wrong = accepted_log().replace(record(case, field, expected),
+                                                record(case, field, expected ^ 1, expected))
+                with self.assertRaises(ValueError): verify(wrong)
+
     def test_write_guard_and_early_scalar_signal_receipts_are_required(self):
         cases = ("write-input-guard", "write-offset-noaccess", "write-key-guard")
         for case in cases:
