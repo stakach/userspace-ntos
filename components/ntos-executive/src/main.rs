@@ -21,6 +21,8 @@ pub use sel4_rt::*;
 
 mod acpi_platform;
 mod boot_namespace;
+mod boot_progress;
+pub(crate) use boot_progress::{boot_progress_epoch, note_boot_progress, BootProgress};
 mod ahci_maintenance;
 mod allocator;
 mod component_heap;
@@ -6808,46 +6810,6 @@ fn lsa_selfrpc_bounded_spec(passed: &mut u64) {
         passed,
     );
 }
-/// Boot-readiness milestone epoch used by the progress-stall watchdog. Only durable movement toward
-/// the validation frontier belongs here: a new image/page mapping, finite credential/dialog
-/// advancement, or the first observation of an Explorer paint milestone. Handle churn, waiter wakes,
-/// and IPC completions are
-/// normal runtime activity and must not extend the readiness deadline.
-static BOOT_PROGRESS_EPOCH: AtomicU64 = AtomicU64::new(0);
-static BOOT_PROGRESS_MILESTONES: AtomicU64 = AtomicU64::new(0);
-static BOOT_PROGRESS_SEALED: AtomicBool = AtomicBool::new(false);
-
-#[derive(Clone, Copy)]
-pub(crate) enum BootProgress {
-    ImageActivated,
-    PageMappingPublished,
-    CredentialRetrieved,
-    DialogModalCompleted,
-    DialogModalDrained,
-    UserShellImageAttempted,
-    ExplorerMessageRegistrationObserved,
-    ExplorerDirectDrawObserved,
-    ExplorerBeginPaintObserved,
-    ExplorerEndPaintObserved,
-    ExplorerGdiBatchObserved,
-}
-
-impl BootProgress {
-    const fn one_shot_bit(self) -> u64 {
-        match self {
-            Self::ImageActivated | Self::PageMappingPublished | Self::CredentialRetrieved => 0,
-            Self::UserShellImageAttempted => 1 << 0,
-            Self::ExplorerMessageRegistrationObserved => 1 << 1,
-            Self::ExplorerDirectDrawObserved => 1 << 2,
-            Self::ExplorerBeginPaintObserved => 1 << 3,
-            Self::ExplorerEndPaintObserved => 1 << 4,
-            Self::ExplorerGdiBatchObserved => 1 << 5,
-            Self::DialogModalCompleted => 1 << 6,
-            Self::DialogModalDrained => 1 << 7,
-        }
-    }
-}
-
 pub(crate) fn explorer_chrome_runtime_milestones_reached() -> bool {
     let begin = EXPLORER_BEGIN_PAINTS.load(Ordering::Relaxed);
     begin != 0
@@ -6857,31 +6819,6 @@ pub(crate) fn explorer_chrome_runtime_milestones_reached() -> bool {
         && EXPLORER_GDI_BATCH_RECORDS.load(Ordering::Relaxed) != 0
 }
 
-#[inline]
-pub(crate) fn note_boot_progress(progress: BootProgress) {
-    if BOOT_PROGRESS_SEALED.load(Ordering::Acquire) {
-        return;
-    }
-    let one_shot_bit = progress.one_shot_bit();
-    if one_shot_bit != 0
-        && BOOT_PROGRESS_MILESTONES.fetch_or(one_shot_bit, Ordering::AcqRel) & one_shot_bit != 0
-    {
-        return;
-    }
-    BOOT_PROGRESS_EPOCH.fetch_add(1, Ordering::Relaxed);
-    if explorer_chrome_runtime_milestones_reached()
-        && BOOT_PROGRESS_SEALED
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    {
-        print_str(b"[quiesce] Explorer runtime paint milestones complete; boot-progress epoch sealed\n");
-    }
-}
-
-#[inline]
-pub(crate) fn boot_progress_epoch() -> u64 {
-    BOOT_PROGRESS_EPOCH.load(Ordering::Relaxed)
-}
 /// services' RPC listener thread fault count (multiplex proof).
 static SVC_LISTENER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// BATCH 34 DIAG: per-SSN trace counter for the svc-listener (bounded print of its native SSNs).

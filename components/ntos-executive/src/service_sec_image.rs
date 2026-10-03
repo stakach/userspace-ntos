@@ -9185,11 +9185,7 @@ pub(crate) unsafe fn service_sec_image(
     // only without an owned client ingress: every accepted Call must reach dispatch and its
     // exact reply/park boundary before validation may stop the service loop.
     const STALL_BUDGET_100NS: u64 = 45 * 10_000_000; // 45 s of NO forward progress
-    let progress_epoch = || {
-        boot_progress_epoch().wrapping_add(
-            crate::CM_RUNTIME_SYSTEM_MUTATION_COMMITS.load(Ordering::Relaxed),
-        )
-    };
+    let progress_epoch = boot_progress_epoch;
     let mut last_progress_epoch = progress_epoch();
     let mut last_progress_t = monotonic_time_100ns();
     let mut stall_deferrals =

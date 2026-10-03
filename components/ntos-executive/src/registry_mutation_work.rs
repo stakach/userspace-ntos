@@ -664,6 +664,7 @@ unsafe fn advance(
             let receipt = cm_mutation_transport::commit(work.prepared.as_ref().unwrap())?;
             let outcome = receipt.outcome();
             CM_RUNTIME_SYSTEM_MUTATION_COMMITS.fetch_add(1, Ordering::Relaxed);
+            note_boot_progress(BootProgress::DurableRegistryPublication);
             match &work.caller {
                 Caller::Hosted(HostedCaller { completion: HostedCompletion::Existing { kind, .. }, .. }) => {
                     match kind {

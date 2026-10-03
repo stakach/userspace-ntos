@@ -452,3 +452,10 @@ diagnosis-free failure.
   become a NULL current thread, fabricated GUI row, or substituted actor.
 - Validate execution identity before publishing context, and retain the body until the callout
   returns. Nonexecuting finalization is a separate boundary, not a process-only execution mode.
+
+## Observe Durable Progress Across Every Provider
+- A runnable thread copying a registry tree is not stalled merely because it maps no new image
+  pages. Observe acknowledged durable publications through one sealed observer for both brokered
+  and mounted-hive paths; do not infer progress from reads, timer churn, or filesystem snapshots.
+- Resolve the actual saved PC and retained IPC state before changing watchdog policy. Keep the
+  strict desktop gate and hard boot limit; a successful test-harness exit is not desktop proof.

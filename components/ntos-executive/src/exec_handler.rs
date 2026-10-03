@@ -5210,6 +5210,9 @@ impl ExecNtHandler {
     fn note_durable_hive_journal_records(&mut self, hive_sel: Option<u32>, records: u32) {
         // The sidecar journal record is already appended and flushed here. Whole-volume
         // snapshots are owned by explicit flush/quiesce paths, not by every registry mutation.
+        if records != 0 {
+            crate::note_boot_progress(crate::BootProgress::DurableRegistryPublication);
+        }
         self.mutable_hive_journal_pending_records = self
             .mutable_hive_journal_pending_records
             .saturating_add(records);
