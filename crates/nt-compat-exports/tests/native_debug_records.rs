@@ -81,6 +81,17 @@ fn function<'a>(file: &'a syn::File, name: &str) -> &'a syn::ItemFn {
 }
 
 #[test]
+fn executive_hex_identity_is_one_fixed_width_scalar_not_two_prefixed_halves() {
+    let main = source("main");
+    let formatter = function(&main, "print_hex_u64");
+    let mut calls = Calls::default();
+    calls.visit_block(&formatter.block);
+    assert!(!calls.0.iter().any(|call| call == "print_hex"),
+        "two u32 printers emit two 0x prefixes instead of one exact u64 identity");
+    assert_eq!(calls.0.iter().filter(|call| *call == "print_str").count(), 1);
+}
+
+#[test]
 fn executive_record_anchor_is_installed_after_mapping_before_component_activation() {
     let allocator = source("allocator");
     let mut calls = Calls::default();

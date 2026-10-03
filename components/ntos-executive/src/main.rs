@@ -16460,8 +16460,10 @@ unsafe fn publish_kuser_clocks() {
 }
 
 fn print_hex_u64(value: u64) {
-    print_hex((value >> 32) as u32);
-    print_hex(value as u32);
+    use core::fmt::Write;
+    let mut record = nt_printf::record::RecordBuffer::<18>::new();
+    core::write!(&mut record, "0x{value:016x}").expect("fixed-width hexadecimal record");
+    print_str(record.bytes());
 }
 
 unsafe fn wait_reply_pool_mut() -> &'static mut Vec<WaitReplyPoolRecord> {

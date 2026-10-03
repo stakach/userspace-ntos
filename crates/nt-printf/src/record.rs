@@ -56,6 +56,16 @@ impl<const N: usize> Output for RecordBuffer<N> {
     }
 }
 
+impl<const N: usize> core::fmt::Write for RecordBuffer<N> {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        if self.push_bytes(text.as_bytes()) {
+            Ok(())
+        } else {
+            Err(core::fmt::Error)
+        }
+    }
+}
+
 /// One instance belongs to one stream; incomplete lines are never emitted.
 pub struct LineBuffer<const N: usize> {
     storage: [u8; N],
@@ -109,6 +119,25 @@ mod tests {
     extern crate std;
     use super::*;
     use std::vec::Vec;
+
+    #[test]
+    fn core_formatter_captures_exact_fixed_width_hex_identities() {
+        use core::fmt::Write;
+        for (value, expected) in [
+            (0u64, b"0x0000000000000000"),
+            (0x000001000a123456, b"0x000001000a123456"),
+            (u64::MAX, b"0xffffffffffffffff"),
+        ] {
+            let mut record = RecordBuffer::<18>::new();
+            assert!(core::write!(&mut record, "0x{value:016x}").is_ok());
+            assert_eq!(record.bytes(), expected);
+            assert!(!record.overflowed());
+        }
+        let mut short = RecordBuffer::<17>::new();
+        assert!(core::write!(&mut short, "0x{:016x}", u64::MAX).is_err());
+        assert_eq!(short.len(), 17);
+        assert!(short.overflowed());
+    }
 
     #[test]
     fn fragments_emit_only_complete_records_once() {
