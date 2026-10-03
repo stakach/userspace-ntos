@@ -164,6 +164,11 @@ the success sentinel, and `PASS exec_explorer_shell_chrome_painted`. This gate
 requires genuine Explorer execution, client callbacks, GDI drawing, and varied
 framebuffer pixels. Background painting or a login dialog alone is not desktop proof.
 
+The [feature-off production scanout](docs/images/desktop-production.png) records
+genuine Explorer taskbar and Start-button rendering after a fresh profile setup.
+This is desktop-chrome evidence, not a complete executive-gate pass; remaining
+whole-OS acceptance is tracked in [issue #18](https://github.com/stakach/userspace-ntos/issues/18).
+
 `--desktop` opens a QEMU window using the real ReactOS `win32k.sys`, display driver,
 and font stack. Boot readiness is the Explorer chrome gate, not the earlier
 `desktop-bg match` message. The launcher bounds boot to one hour and allows a short
