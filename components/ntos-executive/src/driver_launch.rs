@@ -4214,6 +4214,9 @@ fn print_tcb_debug_opt(value: u64) {
     }
 }
 
+#[path = "fsd_diagnostics.rs"]
+mod fsd_diagnostics;
+
 unsafe fn trace_pipe_rw_result(
     major: u64,
     file_id: u64,
@@ -4246,28 +4249,7 @@ unsafe fn trace_pipe_rw_result(
         return;
     }
     PIPE_RW_TRACE_COUNT += 1;
-    print_str(b"[fsd-pipe-rw] major=");
-    print_u64(major);
-    print_str(b" fid=0x");
-    print_hex(file_id as u32);
-    print_str(b" end=");
-    print_u64(file_id & 1);
-    print_str(b" fsctx=0x");
-    print_hex(fsctx as u32);
-    print_str(b" len=");
-    print_u64(length);
-    print_str(b" status=0x");
-    print_hex(status);
-    print_str(b" info=");
-    print_u64(info);
-    print_dcerpc_pdu_view(pdu);
-    if let Some(view) = before {
-        print_pipe_ccb_view(b" before", view);
-    }
-    if let Some(view) = after {
-        print_pipe_ccb_view(b" after", view);
-    }
-    print_str(b"\n");
+    fsd_diagnostics::pipe_rw(major, file_id, fsctx, length, status, info, pdu, before, after);
 }
 
 unsafe fn trace_pipe_transceive_result(
@@ -36180,27 +36162,11 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         && FSD_DEVICE_CONTROL_FAILURE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed)
             < FSD_DEVICE_CONTROL_FAILURE_TRACE_CAP
     {
-        print_str(b"[fsd-control-failure] ioctl=0x");
-        print_hex(fsctl as u32);
-        print_str(b" handler=0x");
-        print_hex64(handler);
-        print_str(b" device=0x");
-        print_hex64(devobj);
-        print_str(b" return=0x");
-        print_hex(ret as u32);
-        print_str(b" irp-status=0x");
-        print_hex(post_call_irp_status);
-        print_str(b" irp-information=");
-        print_u64(post_call_irp_information);
-        print_str(b" owner-kind=");
-        print_u64(post_call_owner_kind);
-        print_str(b" final=0x");
-        print_hex(st as u32);
-        print_str(b" information=");
-        print_u64(info);
-        print_str(b" retained-completion=");
-        print_u64(retained_completion.is_some() as u64);
-        print_str(b"\n");
+        fsd_diagnostics::control_failure(
+            fsctl as u32, handler, devobj, ret as u32, post_call_irp_status,
+            post_call_irp_information, post_call_owner_kind, st as u32, info,
+            retained_completion.is_some(),
+        );
     }
     if (major == IRP_MJ_READ || major == IRP_MJ_WRITE) && DATA_TRACE_COUNT < 12 {
         DATA_TRACE_COUNT += 1;

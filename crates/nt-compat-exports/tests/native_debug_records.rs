@@ -138,6 +138,87 @@ fn win32k_removes_raw_format_and_fragmented_debug_printers() {
 }
 
 #[test]
+fn fsd_pipe_and_control_diagnostics_delegate_captured_records() {
+    let driver = source("driver_launch");
+    struct ProducerCalls {
+        pipe: usize,
+        control: usize,
+        old_markers: usize,
+    }
+    impl<'ast> Visit<'ast> for ProducerCalls {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let Expr::Path(path) = &*call.func {
+                let names: Vec<_> = path.path.segments.iter().map(|s| s.ident.to_string()).collect();
+                if names == ["fsd_diagnostics", "pipe_rw"] { self.pipe += 1; }
+                if names == ["fsd_diagnostics", "control_failure"] { self.control += 1; }
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+        fn visit_lit_byte_str(&mut self, literal: &'ast syn::LitByteStr) {
+            let bytes = literal.value();
+            if bytes.starts_with(b"[fsd-pipe-rw]") || bytes.starts_with(b"[fsd-control-failure]") {
+                self.old_markers += 1;
+            }
+        }
+    }
+    let mut calls = ProducerCalls { pipe: 0, control: 0, old_markers: 0 };
+    calls.visit_block(&function(&driver, "trace_pipe_rw_result").block);
+    calls.visit_block(&function(&driver, "run_irp").block);
+    assert_eq!(calls.pipe, 1, "captured pipe snapshots need one atomic diagnostic producer");
+    assert_eq!(calls.control, 1, "captured control failure needs one atomic diagnostic producer");
+    assert_eq!(calls.old_markers, 0, "component sites must not emit fragmented record prefixes");
+}
+
+#[test]
+fn fsd_diagnostic_formatters_are_bounded_atomic_and_mark_overflow() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../components/ntos-executive/src/fsd_diagnostics.rs");
+    assert!(path.exists(), "focused FSD diagnostic capture boundary is absent");
+    let file = syn::parse_file(&std::fs::read_to_string(path).unwrap()).unwrap();
+    for name in ["pipe_rw", "control_failure"] {
+        let mut calls = Calls::default();
+        calls.visit_block(&function(&file, name).block);
+        assert_eq!(calls.0.iter().filter(|call| *call == "emit").count(), 1);
+    }
+    let mut all = Calls::default();
+    all.visit_file(&file);
+    assert!(!all.0.iter().any(|call| matches!(call.as_str(),
+        "print_str" | "debug_put_char" | "print_u64" | "print_hex" | "print_hex64"
+        | "print_pipe_ccb_view" | "print_dcerpc_pdu_view" | "read_volatile" | "read_unaligned")),
+        "format captured values only, without fragments or new provider memory reads");
+    let mut emission = Calls::default();
+    emission.visit_block(&function(&file, "emit").block);
+    assert_eq!(emission.0.iter().filter(|call| *call == "print_record").count(), 1);
+    #[derive(Default)]
+    struct Overflow { checked: bool, marker: bool, bounded: bool }
+    impl<'ast> Visit<'ast> for Overflow {
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            self.checked |= call.method == "overflowed";
+            syn::visit::visit_expr_method_call(self, call);
+        }
+        fn visit_lit_byte_str(&mut self, literal: &'ast syn::LitByteStr) {
+            self.marker |= literal.value() == b"[record-truncated]\n";
+        }
+        fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+            for segment in &path.path.segments {
+                if segment.ident == "RecordBuffer" {
+                    if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                        self.bounded |= args.args.iter().any(|arg| matches!(arg,
+                            syn::GenericArgument::Const(Expr::Lit(literal))
+                            if matches!(&literal.lit, syn::Lit::Int(n) if n.base10_parse::<usize>().is_ok_and(|n| n > 0 && n <= 4096))));
+                    }
+                }
+            }
+            syn::visit::visit_type_path(self, path);
+        }
+    }
+    let mut overflow = Overflow::default();
+    overflow.visit_file(&file);
+    assert!(overflow.checked && overflow.marker && overflow.bounded,
+        "bounded captured records must explicitly mark overflow rather than emit valid-looking truncation");
+}
+
+#[test]
 fn executive_hex_identity_is_one_fixed_width_scalar_not_two_prefixed_halves() {
     let main = source("main");
     let formatter = function(&main, "print_hex_u64");
