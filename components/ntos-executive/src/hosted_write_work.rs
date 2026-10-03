@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
+use nt_io_manager::hosted_forward_progress::HostedForwardWorkProgress;
 use nt_io_manager::{
     detached_file_irp::{ExternalFileIrpDispatchPolicy, ExternalFileIrpRequest},
     retained_write_forward::{
@@ -248,6 +249,23 @@ pub(super) unsafe fn submit(
 }
 
 impl Work {
+    fn progress(&self) -> HostedForwardWorkProgress {
+        HostedForwardWorkProgress {
+            initial_status: self.initial_status,
+            canonical_irp: self.canonical_irp.map(|irp| irp.raw()),
+            retained: self.retained.is_some(),
+            terminal: self.terminal.is_some(),
+            completion: self.completion.is_some(),
+            source_released: self.source_released,
+            source_published: false,
+            cancel_requested: self.cancel_requested,
+            actor_held: self.actor.is_held(),
+            reply_entered: self.reply_entered,
+            origin: None,
+            ack: self.ack.as_ref().map(|ack| ack.reply_entered),
+        }
+    }
+
     unsafe fn release_source(&mut self) -> bool {
         if self.source_released { return true; }
         if self.source.release().is_err() { return false; }
@@ -527,10 +545,12 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
         index, work.source_instance, work.source.source_identity(), work.source.source_pin_owned(),
     ));
     CURSOR.store(index as u64 + 1, Ordering::Relaxed);
+    let before = work.progress();
     let done = work.advance(handler);
+    let progressed = HostedForwardWorkProgress::advanced(before, work.progress(), done);
     if !done { (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work); }
     assert_eq!((&mut *core::ptr::addr_of_mut!(EXECUTING)).pop().map(|row| row.0), Some(index));
-    true
+    progressed
 }
 
 pub(super) unsafe fn redrive(handler: *mut ExecNtHandler) {
@@ -545,7 +565,10 @@ pub(super) unsafe fn nested_work_ready() -> bool {
 }
 
 pub(super) unsafe fn redrive_nested_ready(handler: *mut ExecNtHandler) -> bool {
-    redrive_one(handler, true)
+    let attempts = (&*core::ptr::addr_of!(WORK)).len();
+    nt_io_manager::hosted_forward_progress::redrive_ready_pass(attempts, || {
+        redrive_one(handler, true)
+    })
 }
 
 /// A new authenticated Call acknowledges `IoFreeIrp` issued by the source completion routine.

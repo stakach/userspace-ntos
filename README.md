@@ -77,6 +77,8 @@ zero completion information.
 Forwarded pending dispatch returns independently of terminal completion. Registered
 ordinary workers execute source completion routines, retaining exact IRP ownership
 and callback continuations without serializing unrelated jobs behind a waiting worker.
+Nested work uses bounded scheduling passes and reports only actual phase changes or
+acknowledged retirement as progress, allowing queued IPC to settle blocked ownership.
 Held inline completions retain their source ownership until a genuine resumed
 unwind or authenticated stop; caller-owned IRPs remain under their original owner.
 Its controlled pending-error checks correlate actual File generations, untouched

@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
+use nt_io_manager::hosted_forward_progress::HostedForwardWorkProgress;
 use nt_io_manager::{
     detached_file_irp::{ExternalFileIrpDispatchPolicy, ExternalFileIrpRequest},
     retained_query_information_forward::{
@@ -301,6 +302,23 @@ pub(super) unsafe fn submit(
 }
 
 impl Work {
+    fn progress(&self) -> HostedForwardWorkProgress {
+        HostedForwardWorkProgress {
+            initial_status: self.initial_status,
+            canonical_irp: self.canonical_irp.map(|irp| irp.raw()),
+            retained: self.retained.is_some(),
+            terminal: self.terminal.is_some(),
+            completion: self.completion.is_some(),
+            source_released: self.source_released,
+            source_published: self.source_published,
+            cancel_requested: self.cancel_requested,
+            actor_held: self.actor.is_held(),
+            reply_entered: self.origin.reply_entered,
+            origin: Some(self.origin.progress()),
+            ack: self.ack.as_ref().map(|ack| ack.reply_entered),
+        }
+    }
+
     unsafe fn ready_for_nested_step(&self) -> bool {
         if self.origin.inline_held() {
             return self.source_released || self.source.completion_finished() || self.origin.stopped();
@@ -841,8 +859,9 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
         work.source.source_pin_owned(),
     ));
     CURSOR.store(index as u64 + 1, Ordering::Relaxed);
+    let before = work.progress();
     let done = work.advance(handler);
-    let deferred_unentered = !done && work.initial_status.is_none();
+    let progressed = HostedForwardWorkProgress::advanced(before, work.progress(), done);
     if !done {
         (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
     }
@@ -852,7 +871,7 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
             .map(|row| row.0),
         Some(index)
     );
-    !deferred_unentered
+    progressed
 }
 
 pub(super) unsafe fn redrive(handler: *mut ExecNtHandler) {
@@ -874,7 +893,10 @@ pub(super) unsafe fn nested_work_ready() -> bool {
 }
 
 pub(super) unsafe fn redrive_nested_ready(handler: *mut ExecNtHandler) -> bool {
-    redrive_one(handler, true)
+    let attempts = (&*core::ptr::addr_of!(WORK)).len();
+    nt_io_manager::hosted_forward_progress::redrive_ready_pass(attempts, || {
+        redrive_one(handler, true)
+    })
 }
 
 /// Arm terminal delivery only after the exact source consumed its pending dispatch Reply.

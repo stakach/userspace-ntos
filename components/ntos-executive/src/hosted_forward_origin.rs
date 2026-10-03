@@ -43,6 +43,20 @@ pub(super) struct HostedForwardOrigin {
 }
 
 impl HostedForwardOrigin {
+    pub(super) fn progress(&self) -> nt_io_manager::hosted_forward_progress::HostedForwardOriginProgress {
+        nt_io_manager::hosted_forward_progress::HostedForwardOriginProgress {
+            reply_entered: self.reply_entered,
+            disposition: self.disposition,
+            phase: self.phase,
+            terminal_entered: self.terminal_entered,
+            terminal_completed: self.terminal_completed,
+            terminal_held: self.terminal_held,
+            lane_acknowledged: self.lane_acknowledged,
+            inline_hold: self.inline_hold.phase(),
+            prepared: self.terminal_command.is_some(),
+        }
+    }
+
     pub(super) fn new(
         route: nt_component_suspension::peer_registry::PeerRoute,
         dispatch: nt_component_suspension::LaneDispatchIdentity,
