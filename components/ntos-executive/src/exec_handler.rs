@@ -8474,6 +8474,22 @@ impl ExecNtHandler {
         ).is_ok()
     }
 
+    pub(crate) fn hosted_gui_thread_teb_alias_for(
+        &self,
+        caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
+    ) -> Option<u64> {
+        if !self.validate_provider_logical_caller(caller) {
+            return None;
+        }
+        let runtime = self.thread_runtime.executable_by_badge(caller.badge())?;
+        caller.validate(Some(runtime.binding()), self.pm.thread_lifetime(caller.thread().thread_id()))
+            .ok()?;
+        if runtime.teb_alias == 0 || runtime.teb_alias & 0xfff != 0 {
+            return None;
+        }
+        Some(runtime.teb_alias)
+    }
+
     pub(crate) fn capture_process_identity(
         &self,
         pi: usize,
@@ -8541,11 +8557,13 @@ impl ExecNtHandler {
         let lifetime = self.pm.thread_lifetime(tid).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
         let mapped = spawn.main_runtime;
         let teb = mapped.teb.filter(|teb| *teb != 0).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        let teb_alias = mapped.teb_alias.filter(|alias| *alias != 0 && *alias & 0xfff == 0)
+            .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
         if mapped.process_id != u64::from(process.pid) || mapped.thread_id != u64::from(tid)
             || mapped.started || mapped.entry == 0
         { return Err(nt_process::STATUS_INVALID_PARAMETER); }
         self.thread_runtime.register_main(
-            pi, process, u64::from(tid), spawn.main_tcb, badge, spawn.main_mechanism,
+            pi, process, u64::from(tid), spawn.main_tcb, badge, spawn.main_mechanism, teb_alias,
         ).ok_or(nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
         // Retain the actual mechanism before Ps validation. Neither caller may resume the main
         // TCB until this complete tuple and the real stack geometry have been published.

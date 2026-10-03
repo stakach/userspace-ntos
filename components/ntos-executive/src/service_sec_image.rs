@@ -6718,60 +6718,6 @@ pub(crate) unsafe fn service_win32k_gui_client_info(
     )
 }
 
-fn hosted_gui_thread_teb_alias_for(
-    nt_handler: &ExecNtHandler,
-    pi: usize,
-    badge: u64,
-    current_tid: u64,
-    tp_worker_identity: Option<(usize, usize)>,
-) -> Option<u64> {
-    if let Some((tp_pi, tp_slot)) = tp_worker_identity {
-        if tp_pi != pi || current_tid == 0 {
-            return None;
-        }
-        return (nt_handler
-            .hosted_thread_tid_for_role(pi, HostedThreadRole::TpWorker { slot: tp_slot })
-            == Some(current_tid))
-        .then_some(tp_worker_teb_mirror_va(pi, tp_slot));
-    }
-    if pi == 2 {
-        let (role, teb_alias) = match badge {
-            WINLOGON_WORKER_BADGE => (
-                HostedThreadRole::WinlogonListener,
-                WINLOGON_WORKER_STACK_MIRROR_VA + WL_LISTENER_STACK_FRAMES * 0x1000,
-            ),
-            WINLOGON_WORKER2_BADGE => (
-                HostedThreadRole::WinlogonWorker { slot: 1 },
-                WINLOGON_WORKER2_STACK_MIRROR_VA + WL_WORKER2_STACK_FRAMES * 0x1000,
-            ),
-            WINLOGON_WORKER3_BADGE => (
-                HostedThreadRole::WinlogonWorker { slot: 2 },
-                WINLOGON_WORKER3_STACK_MIRROR_VA + WL_WORKER3_STACK_FRAMES * 0x1000,
-            ),
-            _ => {
-                return (current_tid != 0
-                    && nt_handler.pm_main_tid_for_pi(pi).map(u64::from) == Some(current_tid)
-                    && badge == hosted_top_badge_for_pi(nt_handler, pi))
-                    .then_some(WINLOGON_MAIN_TEB_MIRROR_VA);
-            }
-        };
-        return (current_tid != 0
-            && nt_handler.hosted_thread_tid_for_role(pi, role) == Some(current_tid))
-            .then_some(teb_alias);
-    }
-    let Some(main_tid) = nt_handler.pm_main_tid_for_pi(pi) else {
-        return None;
-    };
-    if current_tid == 0
-        || current_tid != u64::from(main_tid)
-        || badge != hosted_top_badge_for_pi(nt_handler, pi)
-    {
-        return None;
-    }
-    let teb_alias = hosted_env_scratch_base_for_pi(pi);
-    (teb_alias != 0).then_some(teb_alias)
-}
-
 fn log_refreshed_gui_thread_client_info(
     winlogon_gui_client: bool,
     pi: usize,
@@ -16669,14 +16615,9 @@ pub(crate) unsafe fn service_sec_image(
                     // deferred-GDI records march straight through the caller's TEB — the single root
                     // cause of the whole TEB-clobber family (batches 53/59/60) and of winlogon's
                     // `#GP` in `RtlEnterCriticalSection` on rpcrt4's `TEB.ReservedForNtRpc`.
-                    let gdi_teb_alias = hosted_gui_thread_teb_alias_for(
-                        &nt_handler,
-                        pi,
-                        badge,
-                        current_tid,
-                        tp_worker_identity,
-                    )
-                    .unwrap_or(0);
+                    let gdi_teb_alias = dispatch_client.logical_caller
+                        .and_then(|logical| nt_handler.hosted_gui_thread_teb_alias_for(logical))
+                        .unwrap_or(0);
                     crate::ke_gdi_flush_user_batch(client, gdi_teb_alias);
                     let open_dcw_staged_stack =
                         m0 == 0x10de && open_dcw_stack_arg_count == open_dcw_stack_args.len();

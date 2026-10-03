@@ -226,14 +226,7 @@ pub(super) unsafe fn service(
     else {
         return reject(b"snapshot-mapping", invalid);
     };
-    let client_badge = logical.badge();
-    let Some(teb_alias) = hosted_gui_thread_teb_alias_for(
-        handler,
-        pi,
-        client_badge,
-        packet.thread_id,
-        tp_worker_identity_from_badge(client_badge),
-    ) else {
+    let Some(teb_alias) = handler.hosted_gui_thread_teb_alias_for(logical) else {
         return reject(b"teb-alias", invalid);
     };
     let Some(mapped_delta) = win32k_glue::map_win32k_user_heap_into_client(handler, pml4, pi)
@@ -247,13 +240,7 @@ pub(super) unsafe fn service(
     let current_thread = handler.pm.thread_lifetime(thread.thread_id());
     let current_thread_info = ps_object_backing::read_thread_win32(&handler.pm, thread);
     let current_provider = crate::current_win32k_provider_domain();
-    let current_teb_alias = hosted_gui_thread_teb_alias_for(
-        handler,
-        pi,
-        client_badge,
-        packet.thread_id,
-        tp_worker_identity_from_badge(client_badge),
-    );
+    let current_teb_alias = handler.hosted_gui_thread_teb_alias_for(logical);
     if mapped_delta != packet.mapped_delta
         || current_provider != Some(provider)
         || win32k_glue::current_provider_poll_owner(channel) != Some(wait_owner)

@@ -1,5 +1,12 @@
 # Lessons
 
+## Runtime Ownership Is Not A Thread Role
+- Resolve GUI TEB aliases from the published executable runtime and retained logical caller,
+  including the exact process and thread generations. A worker badge's slot encoding is not
+  authority for its role; dynamically registered CSRSS workers can share that slot geometry.
+- Record main-thread aliases from the constructor's checked mapping, not a later process-name
+  or role reconstruction. Revalidate the same owner and alias after operations that may pump.
+
 ## Bootstrap Authority Precedes Public Readiness
 - DriverEntry can legitimately reference canonical objects before its completion publishes
   the provider's public ready state. Authenticate projections through the retained ingress
