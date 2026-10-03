@@ -1,6 +1,7 @@
 /* Native AMD64 WDM fixture for Mup provider registration and query forwarding. */
 #include <stddef.h>
 #include <stdint.h>
+#include "failure_receipts.h"
 
 typedef int32_t NTSTATUS;
 typedef uint16_t WCHAR;
@@ -391,7 +392,8 @@ static NTSTATUS PendTerminalFailure(IRP *irp, uint32_t index)
         return Complete(irp, STATUS_DEVICE_BUSY, 0);
     }
     ++MupProviderEvidence.terminal_failure_pending[index];
-    DbgPrint("[mup-terminal-failure-pending] operation=%u status=0x00000103\n", index);
+    DbgPrint("[mup-terminal-failure-pending] operation=%u " FAILURE_ID_FORMAT " status=0x00000103\n",
+             index, FAILURE_ID_ARGS(owner->file, owner->generation));
     // The source's separate real WRITE releases completion after it checks pending visibility.
     return STATUS_PENDING;
 }
@@ -447,8 +449,8 @@ static NTSTATUS __stdcall ProviderCleanup(DEVICE_OBJECT *device, IRP *irp)
         if (owner != NULL) {
             ++owner->cleaned;
             ++MupProviderEvidence.terminal_failure_cleaned;
-            DbgPrint("[mup-terminal-failure-cleanup] count=%u\n",
-                     MupProviderEvidence.terminal_failure_cleaned);
+            DbgPrint("[mup-terminal-failure-cleanup] " FAILURE_ID_FORMAT " count=%u\n",
+                     FAILURE_ID_ARGS(file, owner->generation), owner->cleaned);
         }
         if (file->FsContext == file) {
             MupProviderEvidence.probe_file_cleaned++;
@@ -472,8 +474,8 @@ static NTSTATUS __stdcall ProviderClose(DEVICE_OBJECT *device, IRP *irp)
             owner->live = 0;
             file->FsContext = NULL;
             ++MupProviderEvidence.terminal_failure_closed;
-            DbgPrint("[mup-terminal-failure-close] count=%u\n",
-                     MupProviderEvidence.terminal_failure_closed);
+            DbgPrint("[mup-terminal-failure-close] " FAILURE_ID_FORMAT " count=%u\n",
+                     FAILURE_ID_ARGS(file, owner->generation), owner->closed);
         }
         if (file->FsContext == file) {
             file->FsContext = NULL;
@@ -502,7 +504,8 @@ static NTSTATUS __stdcall ProviderWrite(DEVICE_OBJECT *device, IRP *irp)
             !__atomic_compare_exchange_n(&FailureReleased[index], &unreleased, 1, 0,
                                          __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
             return Complete(irp, STATUS_INVALID_PARAMETER, 0);
-        DbgPrint("[mup-terminal-failure-release] operation=%u\n", index);
+        DbgPrint("[mup-terminal-failure-release] operation=%u " FAILURE_ID_FORMAT "\n",
+                 index, FAILURE_ID_ARGS(owner->file, owner->generation));
         KeSetEvent(PendingFailureEvents[index], 0, 0);
         return Complete(irp, STATUS_SUCCESS, 2);
     }
@@ -628,9 +631,23 @@ static NTSTATUS __stdcall ProviderQueryInformation(DEVICE_OBJECT *device, IRP *i
 {
     (void)device;
     IO_STACK_LOCATION *stack = irp->CurrentStackLocation;
-    if (stack != NULL && stack->FileObject != NULL &&
-        FailureContext((FILE_OBJECT *)stack->FileObject) != NULL)
-        return PendTerminalFailure(irp, 2);
+    if (stack != NULL && stack->FileObject != NULL) {
+        struct FailureFileContext *owner = FailureContext((FILE_OBJECT *)stack->FileObject);
+        if (owner != NULL) {
+            if (stack->Parameters.QueryFile.FileInformationClass == FileInternalInformation) {
+                if (owner->cleaned != 0 || irp->AssociatedSystemBuffer == NULL ||
+                    stack->Parameters.QueryFile.Length != sizeof(owner->generation))
+                    return Complete(irp, STATUS_INVALID_PARAMETER, 0);
+                uint8_t *output = (uint8_t *)irp->AssociatedSystemBuffer;
+                const uint8_t *generation = (const uint8_t *)&owner->generation;
+                for (uint32_t i = 0; i < sizeof(owner->generation); ++i) output[i] = generation[i];
+                DbgPrint("[mup-terminal-failure-identity] " FAILURE_ID_FORMAT " status=0x00000000 info=8\n",
+                         FAILURE_ID_ARGS(owner->file, owner->generation));
+                return Complete(irp, STATUS_SUCCESS, sizeof(owner->generation));
+            }
+            return PendTerminalFailure(irp, 2);
+        }
+    }
     if (stack != NULL && stack->FileObject != NULL &&
         ((FILE_OBJECT *)stack->FileObject)->FsContext == &SectionFileMarker) {
         if (irp->AssociatedSystemBuffer == NULL) return Complete(irp, STATUS_INVALID_PARAMETER, 0);
@@ -907,8 +924,9 @@ static void __stdcall RegistrationWorker(void *context)
             }
             ++MupProviderEvidence.terminal_failure_completed[index];
             NTSTATUS terminal = unchanged ? STATUS_IO_DEVICE_ERROR : STATUS_UNSUCCESSFUL;
-            DbgPrint("[mup-terminal-failure-complete] operation=%u status=0x%08x info=0 ownership-unchanged=%u\n",
-                     index, (uint32_t)terminal, unchanged);
+            DbgPrint("[mup-terminal-failure-terminal-intent] operation=%u " FAILURE_ID_FORMAT
+                     " status=0x%08x info=0 ownership-unchanged=%u\n",
+                     index, FAILURE_ID_ARGS(file, FailureGenerations[index]), (uint32_t)terminal, unchanged);
             Complete(pending, terminal, 0);
         }
         if (NT_SUCCESS(KeWaitForSingleObject(PendingSectionQueryEvent, 0, 0, 0, NULL))) {

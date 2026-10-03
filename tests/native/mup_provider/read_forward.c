@@ -1,6 +1,7 @@
 /* A separate native driver domain that forwards one buffered READ IRP. */
 #include <stddef.h>
 #include <stdint.h>
+#include "failure_receipts.h"
 
 typedef int32_t NTSTATUS;
 typedef uint16_t WCHAR;
@@ -536,6 +537,49 @@ close:
     return status;
 }
 
+static NTSTATUS QueryFailureIdentity(void *file, DEVICE_OBJECT *device, uint64_t *generation)
+{
+    uint64_t output = 0;
+    void *buffer = ExAllocatePoolWithTag(PagedPool, sizeof(output), 0x466e746e);
+    if (buffer == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+    IRP *irp = IoAllocateIrp(device->StackSize, 0);
+    if (irp == NULL) {
+        ExFreePoolWithTag(buffer, 0x466e746e);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    IO_STACK_LOCATION *stack = IoGetNextIrpStackLocation(irp);
+    if (stack == NULL) {
+        IoFreeIrp(irp); ExFreePoolWithTag(buffer, 0x466e746e);
+        return STATUS_UNSUCCESSFUL;
+    }
+    IO_STATUS_BLOCK iosb = {STATUS_UNSUCCESSFUL, 0, 0};
+    uint64_t event[3] = {0};
+    KeInitializeEvent(event, 1, 0);
+    irp->Flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER | IRP_INPUT_OPERATION;
+    irp->AssociatedSystemBuffer = buffer;
+    irp->UserBuffer = &output;
+    irp->UserIosb = &iosb;
+    irp->UserEvent = event;
+    irp->OriginalFileObject = file;
+    stack->MajorFunction = IRP_MJ_QUERY_INFORMATION;
+    stack->Parameters.QueryFile.Length = sizeof(output);
+    stack->Parameters.QueryFile.FileInformationClass = FileInternalInformation;
+    stack->DeviceObject = device;
+    stack->FileObject = file;
+    NTSTATUS call = IofCallDriver(device, irp);
+    NTSTATUS wait = call == STATUS_SUCCESS || call == STATUS_PENDING
+        ? KeWaitForSingleObject(event, 0, 0, 0, NULL) : STATUS_UNSUCCESSFUL;
+    if (call != STATUS_SUCCESS || wait != STATUS_SUCCESS || iosb.Status != STATUS_SUCCESS ||
+        iosb.Information != sizeof(output) || output == 0)
+        return STATUS_UNSUCCESSFUL;
+    *generation = output;
+    DbgPrint("[terminal-failure-identity] " FAILURE_ID_FORMAT
+             " call=0x%08x wait=0x%08x iosb=0x%08x info=%u\n",
+             FAILURE_ID_ARGS(file, output), (uint32_t)call, (uint32_t)wait,
+             (uint32_t)iosb.Status, (uint32_t)iosb.Information);
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS ReleaseTerminalFailure(void *file, DEVICE_OBJECT *device, uint32_t operation)
 {
     uint8_t *buffer = ExAllocatePoolWithTag(PagedPool, 2, 0x466e746e);
@@ -571,7 +615,7 @@ static NTSTATUS ReleaseTerminalFailure(void *file, DEVICE_OBJECT *device, uint32
         iosb.Status == STATUS_SUCCESS && iosb.Information == 2 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 }
 
-static NTSTATUS TerminalFailureOnce(void *file, DEVICE_OBJECT *device, uint32_t operation)
+static NTSTATUS TerminalFailureOnce(void *file, DEVICE_OBJECT *device, uint64_t generation, uint32_t operation)
 {
     uint8_t output[32];
     for (uint32_t i = 0; i < sizeof(output); ++i) output[i] = 0xcc;
@@ -625,8 +669,9 @@ static NTSTATUS TerminalFailureOnce(void *file, DEVICE_OBJECT *device, uint32_t 
     int64_t zero = 0;
     NTSTATUS pending_event = call == STATUS_PENDING
         ? KeWaitForSingleObject(event, 0, 0, 0, &zero) : STATUS_UNSUCCESSFUL;
-    DbgPrint("[terminal-failure-retained] operation=%u event=0x%08x iosb-and-output-unchanged=%u\n",
-             operation, (uint32_t)pending_event, before_unchanged);
+    DbgPrint("[terminal-failure-retained] operation=%u " FAILURE_ID_FORMAT
+             " event=0x%08x iosb-and-output-unchanged=%u\n",
+             operation, FAILURE_ID_ARGS(file, generation), (uint32_t)pending_event, before_unchanged);
     // Release even after an assertion mismatch: a live pending IRP still owns stack storage.
     NTSTATUS release = call == STATUS_PENDING
         ? ReleaseTerminalFailure(file, device, operation) : STATUS_UNSUCCESSFUL;
@@ -639,10 +684,14 @@ static NTSTATUS TerminalFailureOnce(void *file, DEVICE_OBJECT *device, uint32_t 
         release == STATUS_SUCCESS && pending_event == STATUS_TIMEOUT && before_unchanged &&
         iosb.Status == STATUS_IO_DEVICE_ERROR && iosb.Information == 0 && untouched
         ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
-    DbgPrint("[terminal-failure-result] operation=%u call=0x%08x wait=0x%08x iosb=0x%08x info=%u output-unchanged=%u\n",
-             operation, (uint32_t)call, (uint32_t)wait, (uint32_t)iosb.Status,
+    DbgPrint("[terminal-failure-result] operation=%u " FAILURE_ID_FORMAT
+             " call=0x%08x release=0x%08x wait=0x%08x iosb=0x%08x info=%u output-unchanged=%u\n",
+             operation, FAILURE_ID_ARGS(file, generation), (uint32_t)call, (uint32_t)release,
+             (uint32_t)wait, (uint32_t)iosb.Status,
              (uint32_t)iosb.Information, untouched);
-    if (result == STATUS_SUCCESS) DbgPrint("[terminal-failure-verified-%u]\n", operation);
+    if (result == STATUS_SUCCESS)
+        DbgPrint("[terminal-failure-verified] operation=%u " FAILURE_ID_FORMAT "\n",
+                 operation, FAILURE_ID_ARGS(file, generation));
     return result;
 }
 
@@ -664,15 +713,31 @@ static NTSTATUS CheckTerminalFailures(void)
     result = ObReferenceObjectByHandle(handle, FILE_READ_DATA, NULL, 0, &file, NULL);
     if (NT_SUCCESS(result) && file != NULL) {
         DEVICE_OBJECT *device = IoGetRelatedDeviceObject(file);
+        uint64_t generation = 0;
         if (device == NULL || device->StackSize == 0 || device->StackSize > 32)
             result = STATUS_UNSUCCESSFUL;
-        else for (uint32_t operation = 0; operation < 3 && NT_SUCCESS(result); ++operation)
-            result = TerminalFailureOnce(file, device, operation);
+        else {
+            result = QueryFailureIdentity(file, device, &generation);
+            for (uint32_t operation = 0; operation < 3 && NT_SUCCESS(result); ++operation)
+                result = TerminalFailureOnce(file, device, generation, operation);
+        }
         // Closing the handle must deliver CLEANUP but not CLOSE while this pointer is retained.
+        if (generation != 0)
+            DbgPrint("[terminal-failure-handle-close-begin] " FAILURE_ID_FORMAT "\n",
+                     FAILURE_ID_ARGS(file, generation));
         NTSTATUS close = ZwClose(handle);
         handle = NULL;
+        if (generation != 0)
+            DbgPrint("[terminal-failure-handle-close-return] " FAILURE_ID_FORMAT " status=0x%08x\n",
+                     FAILURE_ID_ARGS(file, generation), (uint32_t)close);
         if (!NT_SUCCESS(close)) result = close;
+        if (generation != 0)
+            DbgPrint("[terminal-failure-pointer-release-begin] " FAILURE_ID_FORMAT "\n",
+                     FAILURE_ID_ARGS(file, generation));
         ObfDereferenceObject(file);
+        if (generation != 0)
+            DbgPrint("[terminal-failure-pointer-release-return] " FAILURE_ID_FORMAT "\n",
+                     FAILURE_ID_ARGS(file, generation));
     } else result = STATUS_UNSUCCESSFUL;
     if (handle != NULL) {
         NTSTATUS close = ZwClose(handle);

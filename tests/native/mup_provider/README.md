@@ -29,8 +29,32 @@ and per-File CLEANUP/CLOSE counters. Completion requires that identity and count
 to remain unchanged; unrelated File activity cannot affect this decision. Separate
 failure counters leave the existing success counters unchanged. Only after all
 three completions does the source close its handle while retaining the File pointer,
-then release that pointer. The gate requires one final CLEANUP and CLOSE for this file,
-exactly three pending/terminal records, and all three source verification records.
+then release that pointer. A real FileInternalInformation IRP first retrieves the
+provider's File context generation. Source and provider receipts carry that generation
+and their own File pointers; distinct virtual addresses are not treated as identical
+across VSpaces. The strict parser requires pending, unchanged precompletion visibility,
+explicit release, provider terminal intent, actual source result, and source verification
+in causal order for all three operations. Provider intent is printed before
+IofCompleteRequest and is not a completion acknowledgement.
+
+Source handle-close and pointer-release intent/return receipts bracket real ZwClose
+and ObfDereferenceObject calls. The parser requires actual successful handle close,
+one exact provider CLEANUP after handle-close intent, and one exact CLOSE after
+pointer-release intent; CLEANUP and CLOSE may arrive after those calls return.
+Malformed, duplicate, stale-generation, early-CLOSE, or failure records reject the
+proof. The runner invokes this parser in addition to the existing successful IRP gates.
+
+Standalone log verification (does not build or boot):
+
+```sh
+python3 tests/native/mup_provider/verify_log.py --verify-log .tmp/mup-provider.log
+```
+
+Parser host regressions:
+
+```sh
+python3 -m unittest discover -s tests/native/mup_provider -p test_verify_log.py
+```
 
 These checks exercise retained ownership through genuine delayed terminal errors.
 They do not prove uncertain native-effect quarantine, stale protocol replay denial,
