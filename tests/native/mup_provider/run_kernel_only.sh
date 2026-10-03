@@ -32,7 +32,7 @@ python3 scripts/run_with_timeout.py \
   --completion-file "$RUN_LOG" \
   --completion-text '[section-read-verified]' \
   --completion-grace-seconds 15 \
-  -- ./scripts/run_specs.sh 2>&1 | tee -a "$RUN_LOG"
+  -- ./scripts/run_specs.sh "$@" 2>&1 | tee -a "$RUN_LOG"
 rc=${PIPESTATUS[0]}
 set -e
 
