@@ -93,9 +93,19 @@ pub enum HostedProcessRole {
     NonInteractiveService,
     InteractiveShellBootstrap,
     InteractiveShell,
+    NativeApplication,
+    Application,
 }
 
 impl HostedProcessRole {
+    /// Generic executable observations. Bootstrap roles come only from their own registration.
+    pub fn for_image_subsystem(subsystem: u16) -> Option<Self> {
+        match subsystem {
+            1 => Some(Self::NativeApplication),
+            2 | 3 => Some(Self::Application),
+            _ => None,
+        }
+    }
     pub fn is_noninteractive_service_class(self) -> bool {
         matches!(
             self,
@@ -108,7 +118,8 @@ impl HostedProcessRole {
     pub fn uses_win32_client_gdi(self) -> bool {
         matches!(
             self,
-            Self::Win32Subsystem
+            Self::Application
+                | Self::Win32Subsystem
                 | Self::InteractiveLogon
                 | Self::ServiceControlManager
                 | Self::LocalSecurityAuthority
@@ -138,6 +149,16 @@ impl SpawnTarget {
     }
 }
 
+/// Immutable historical attribution, not executable, service, or security authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapturedImageObservation {
+    target: SpawnTarget,
+}
+
+impl CapturedImageObservation {
+    pub fn target(self) -> SpawnTarget { self.target }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostedProcessImageRef<'a> {
     pub pi: usize,
@@ -146,10 +167,21 @@ pub struct HostedProcessImageRef<'a> {
     pub leaf: &'a [u8],
     pub process_name: &'a str,
     pub role: HostedProcessRole,
+    pub observation: Option<CapturedImageObservation>,
     pub nt_image_path: &'a [u8],
     pub command_line: &'a [u8],
     pub image_root: HostedImageRoot,
     pub probe_fragment: &'a [u8],
+}
+
+impl HostedProcessImageRef<'_> {
+    pub fn observation_role(&self) -> HostedProcessRole {
+        self.observation.map_or(self.role, |proof| proof.target.role)
+    }
+
+    pub fn observation_target(&self) -> Option<SpawnTarget> {
+        self.observation.map(CapturedImageObservation::target)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -368,6 +400,7 @@ pub struct OwnedHostedProcessImage {
     leaf: FixedBytes<MAX_EXE_LEAF>,
     process_name: FixedBytes<MAX_EXE_LEAF>,
     pub role: HostedProcessRole,
+    observation: Option<CapturedImageObservation>,
     nt_image_path: FixedBytes<MAX_NT_IMAGE_PATH>,
     command_line: FixedBytes<MAX_COMMAND_LINE>,
     pub image_root: HostedImageRoot,
@@ -383,6 +416,7 @@ impl OwnedHostedProcessImage {
             leaf: FixedBytes::empty(),
             process_name: FixedBytes::empty(),
             role: HostedProcessRole::NativeSession,
+            observation: None,
             nt_image_path: FixedBytes::empty(),
             command_line: FixedBytes::empty(),
             image_root: HostedImageRoot::System32,
@@ -412,6 +446,7 @@ impl OwnedHostedProcessImage {
             leaf,
             process_name,
             role,
+            observation: None,
             nt_image_path,
             command_line,
             image_root,
@@ -432,6 +467,7 @@ impl OwnedHostedProcessImage {
         self.process_name
             .set_from_slice(image.process_name.as_bytes())?;
         self.role = image.role;
+        self.observation = image.observation;
         self.nt_image_path.set_from_slice(image.nt_image_path)?;
         self.command_line.set_from_slice(image.command_line)?;
         self.image_root = image.image_root;
@@ -447,6 +483,7 @@ impl OwnedHostedProcessImage {
             leaf: self.leaf.as_slice(),
             process_name: self.process_name_str(),
             role: self.role,
+            observation: self.observation,
             nt_image_path: self.nt_image_path.as_slice(),
             command_line: self.command_line.as_slice(),
             image_root: self.image_root,
@@ -568,6 +605,20 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
         image_root: HostedImageRoot,
         max_pi: usize,
     ) -> Result<usize, HostedImageRegistrationError> {
+        self.admit_dynamic_executable_observed(leaf, role, nt_image_path, command_line,
+            image_root, None, max_pi)
+    }
+
+    pub fn admit_dynamic_executable_observed(
+        &mut self,
+        leaf: &[u8],
+        role: HostedProcessRole,
+        nt_image_path: &[u8],
+        command_line: &[u8],
+        image_root: HostedImageRoot,
+        observation: Option<CapturedImageObservation>,
+        max_pi: usize,
+    ) -> Result<usize, HostedImageRegistrationError> {
         let max_pi = core::cmp::min(max_pi, DYNAMIC_PROCESS_PI_LIMIT);
         let pi = self
             .next_free_pi(DYNAMIC_PROCESS_FIRST_PI, max_pi)
@@ -578,7 +629,7 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
             return Err(HostedImageRegistrationError::GenerationExhausted);
         }
         let generation = self.next_dynamic_generation;
-        let image = OwnedHostedProcessImage::new(
+        let mut image = OwnedHostedProcessImage::new(
             pi,
             top_badge,
             generation,
@@ -590,9 +641,15 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
             image_root,
             leaf,
         )?;
+        image.observation = observation;
         self.register_dynamic_instance(image)?;
         self.next_dynamic_generation += 1;
         Ok(pi)
+    }
+
+    pub fn capture_image_observation(&self, target: SpawnTarget) -> Option<CapturedImageObservation> {
+        (self.get_by_pi(target.pi).map(SpawnTarget::from_image) == Some(target))
+            .then_some(CapturedImageObservation { target })
     }
 
     /// Retire an exact dynamic process-image identity after all process-instance owners have been
@@ -1033,6 +1090,40 @@ impl<const N: usize> ImageTable<N> {
         )
     }
 
+    /// Attach an already authenticated native image Section to an exact registered process.
+    /// The caller owns Section access/backing validation; no synthetic File handle is created.
+    pub fn reserve_spawn_from_native_section<const M: usize>(
+        &mut self,
+        catalog: &OwnedHostedImageCatalog<M>,
+        target: SpawnTarget,
+        owner_pi: usize,
+        section_handle: u64,
+        metadata: ImageMetadata,
+        desired_access: u32,
+        process_handle_out: u64,
+    ) -> Result<SpawnRequest, ImageError> {
+        if section_handle == 0 || process_handle_out == 0 { return Err(ImageError::InvalidHandle); }
+        if metadata.pool_va == 0 || metadata.file_size == 0 || metadata.image_size == 0
+            || u64::from(metadata.entry_rva) >= metadata.image_size
+        { return Err(ImageError::InvalidMetadata); }
+        let image = catalog.get_by_pi(target.pi).ok_or(ImageError::InvalidPath)?;
+        if SpawnTarget::from_image(image) != target { return Err(ImageError::InvalidPath); }
+        let index = self.slots.iter().position(|slot| slot.state == ImageState::Empty)
+            .ok_or(ImageError::Full)?;
+        let mut slot = EMPTY_SLOT;
+        slot.leaf[..image.leaf.len()].copy_from_slice(image.leaf);
+        slot.leaf_len = image.leaf.len() as u8;
+        slot.owner_pi = owner_pi;
+        slot.section_handle = section_handle;
+        slot.metadata = metadata;
+        slot.desired_access = desired_access;
+        slot.process_handle_out = process_handle_out;
+        slot.target = Some(target);
+        slot.state = ImageState::SpawnReserved;
+        self.slots[index] = slot;
+        Ok(self.slots[index].spawn_request(index).unwrap())
+    }
+
     pub fn reserve_spawn_registered<'a, const M: usize>(
         &mut self,
         catalog: &HostedImageCatalog<'a, M>,
@@ -1147,6 +1238,16 @@ impl<const N: usize> ImageTable<N> {
         slot.desired_access = 0;
         slot.process_handle_out = 0;
         slot.state = ImageState::Sectioned;
+        Ok(())
+    }
+
+    /// Remove only a fresh canonical-Section reservation; never close a real Section handle.
+    pub fn discard_native_section_spawn(&mut self, request: SpawnRequest) -> Result<(), ImageError> {
+        let slot = self.slots.get_mut(request.slot).ok_or(ImageError::NotFound)?;
+        if slot.file_handle != 0 || slot.spawn_request(request.slot) != Some(request) {
+            return Err(ImageError::InvalidState);
+        }
+        *slot = EMPTY_SLOT;
         Ok(())
     }
 
@@ -1287,6 +1388,7 @@ mod tests {
             leaf,
             process_name: "registered.exe",
             role,
+            observation: None,
             nt_image_path,
             command_line: leaf,
             image_root,
