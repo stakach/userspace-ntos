@@ -23,6 +23,7 @@ pub mod module_namespace;
 mod imports;
 mod relocs;
 mod relocation_snapshot;
+mod snapshot_capacity;
 mod rva;
 
 pub use exports::ExportedSymbol;
@@ -35,6 +36,7 @@ pub use image_page_fill::{ImagePageFileSpan, ImagePageFillPlan, IMAGE_PAGE_SIZE}
 pub use imports::{ImportRef, ImportedDll};
 pub use relocs::{RelocKind, Relocation};
 pub use relocation_snapshot::relocate_file_snapshot;
+pub use snapshot_capacity::reserve_file_snapshot_capacity;
 
 /// A valid `__security_cookie` (`/GS`) seed. MSVC's x64 `__security_check_cookie`
 /// validates that the cookie's **top 16 bits are zero** (`rol rcx,0x10; test cx,0xffff`)

@@ -1,5 +1,89 @@
 use syn::{visit::Visit, Expr, Item, Stmt};
 
+#[test]
+fn callback_crash_observer_does_not_infer_fixed_role_clientinfo_backing() {
+    let source = syn::parse_file(include_str!(
+        "../../../components/ntos-executive/src/win32k_glue.rs"
+    )).unwrap();
+    let observer = source.items.iter().find_map(|item| match item {
+        Item::Fn(function) if function.sig.ident == "dump_client_callback_crash_state" => Some(function),
+        _ => None,
+    }).expect("actual callback fault identity and register diagnostic remains");
+    #[derive(Default)]
+    struct Contract { fixed_mirrors: usize, raw_reads: usize, saved_rip: usize, callback_requests: usize }
+    impl<'ast> Visit<'ast> for Contract {
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            if let Some(segment) = path.path.segments.last() {
+                self.fixed_mirrors += usize::from(segment.ident == "WINLOGON_MAIN_TEB_MIRROR_VA");
+                self.saved_rip += usize::from(segment.ident == "USER_CONTEXT_RIP");
+            }
+            syn::visit::visit_expr_path(self, path);
+        }
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            self.raw_reads += usize::from(called_name(call).as_deref() == Some("read_volatile"));
+            syn::visit::visit_expr_call(self, call);
+        }
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            self.callback_requests += usize::from(call.method == "request");
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+    let mut contract = Contract::default();
+    contract.visit_item_fn(observer);
+    assert_eq!(contract.fixed_mirrors, 0, "numeric client role is not authority for a TEB mapping");
+    assert_eq!(contract.raw_reads, 0, "historical CLIENTINFO snapshots must not fault crash reporting");
+    assert!(contract.saved_rip >= 1, "retain actual saved fault registers");
+    assert!(contract.callback_requests >= 1, "retain exact active callback metadata");
+}
+
+#[test]
+fn quiescent_boot_observers_do_not_inspect_obsolete_fixed_winlogon_teb_mirrors() {
+    let source = syn::parse_file(include_str!(
+        "../../../components/ntos-executive/src/main.rs"
+    )).unwrap();
+    let obsolete = ["activation_context_stack_spec", "teb_tail_snapshot_diagnostic"];
+    #[derive(Default)]
+    struct Observations { obsolete_calls: usize, fixed_mirrors: usize, raw_reads: usize, counters: Vec<String> }
+    impl<'ast> Visit<'ast> for Observations {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            match called_name(call).as_deref() {
+                Some("activation_context_stack_spec" | "teb_tail_snapshot_diagnostic") => self.obsolete_calls += 1,
+                Some("read_volatile") => self.raw_reads += 1,
+                _ => {}
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            if let Some(name) = path.path.segments.last() {
+                let name = name.ident.to_string();
+                self.fixed_mirrors += usize::from(name == "WINLOGON_MAIN_TEB_MIRROR_VA");
+                self.counters.push(name);
+            }
+            syn::visit::visit_expr_path(self, path);
+        }
+    }
+    let mut calls = Observations::default();
+    calls.visit_file(&source);
+    assert_eq!(calls.obsolete_calls, 0, "obsolete static-role observations cannot fault boot verdict evaluation");
+    for item in &source.items {
+        if let Item::Fn(function) = item {
+            assert!(!obsolete.iter().any(|name| function.sig.ident == *name),
+                "do not retain dormant fixed-role initial-state diagnostics");
+        }
+    }
+    let gdi = source.items.iter().find_map(|item| match item {
+        Item::Fn(function) if function.sig.ident == "gdi_user_batch_flush_spec" => Some(function),
+        _ => None,
+    }).expect("real runtime GDI batch measurement remains");
+    let mut observed = Observations::default();
+    observed.visit_block(&gdi.block);
+    assert_eq!(observed.fixed_mirrors, 0, "runtime batch measurement cannot infer a named process TEB alias");
+    assert_eq!(observed.raw_reads, 0, "the boot gate is counters, not unowned client memory reads");
+    for counter in ["GDI_BATCH_FLUSHES", "GDI_BATCH_RECORDS_FLUSHED", "GDI_BATCH_FLUSH_FAILURES", "GDI_BATCH_MAX_OFFSET"] {
+        assert!(observed.counters.iter().any(|name| name == counter), "retain actual runtime measurement {counter}");
+    }
+}
+
 fn called_name(call: &syn::ExprCall) -> Option<String> {
     let Expr::Path(path) = &*call.func else { return None };
     path.path.segments.last().map(|segment| segment.ident.to_string())

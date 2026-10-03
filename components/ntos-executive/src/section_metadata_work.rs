@@ -603,7 +603,7 @@ unsafe fn advance(
                 return Step::Progress;
             }
             let length = IMAGE_HEADER_READ_SIZE.min(file_size - offset);
-            if work.image_header.try_reserve(length).is_err() {
+            if nt_pe_loader::reserve_file_snapshot_capacity(&mut work.image_header, file_size).is_err() {
                 work.status = STATUS_INSUFFICIENT_RESOURCES;
                 work.phase = Phase::ReadyReply;
                 return Step::Progress;

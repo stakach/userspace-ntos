@@ -10,6 +10,9 @@ use nt_pe_loader::{
 #[path = "parse/raw_relocation.rs"]
 mod raw_relocation;
 
+#[path = "parse/snapshot_capacity.rs"]
+mod snapshot_capacity;
+
 // --- a minimal PE32+ image builder -----------------------------------------
 
 const NT_OFF: usize = 0x40;

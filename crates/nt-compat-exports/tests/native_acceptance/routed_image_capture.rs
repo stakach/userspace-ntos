@@ -91,7 +91,11 @@ fn routed_image_publishes_only_after_exact_eof_not_first_parseable_header() {
         "parseable headers are not a process image snapshot: retained capture must reach exact canonical EOF before Publish");
     let mut calls = Calls::default();
     calls.visit_arm(&phase("HeaderDispatch"));
-    assert!(calls.0.iter().any(|name| name == "try_reserve"), "fallible capture allocation remains required");
+    let reserve = calls.0.iter().position(|name| name == "reserve_file_snapshot_capacity")
+        .expect("fallible capture storage admission remains required");
+    let read = calls.0.iter().position(|name| name == "build_and_dispatch_external_to_device")
+        .expect("exact retained File read");
+    assert!(reserve < read, "storage admission precedes any provider read effect");
     assert!(calls.0.iter().any(|name| name == "build_and_dispatch_external_to_device"), "capture reads the exact retained File through its driver");
 }
 

@@ -4475,27 +4475,6 @@ pub(crate) unsafe fn dump_client_callback_crash_state(client_pi: usize, tcb: u64
         print_crash_hex64(regs[nt_user_callback::USER_CONTEXT_RSP]);
         print_str(b"\n");
     }
-    let teb = if client_pi == 2 {
-        WINLOGON_MAIN_TEB_MIRROR_VA
-    } else {
-        0
-    };
-    if teb == 0 {
-        print_str(b"[cb-crash] CLIENTINFO skipped: no executive-owned TEB mirror\n");
-    } else {
-        let read = |offset: u64| core::ptr::read_volatile((teb + offset) as *const u64);
-        print_str(b"[cb-crash] CLIENTINFO pDeskInfo=0x");
-        print_crash_hex64(read(0x820));
-        print_str(b" ulClientDelta=0x");
-        print_crash_hex64(read(0x828));
-        print_str(b" CallbackWnd{hWnd=0x");
-        print_hex(read(0x840) as u32);
-        print_str(b" pWnd=0x");
-        print_crash_hex64(read(0x848));
-        print_str(b" pActCtx=0x");
-        print_crash_hex64(read(0x850));
-        print_str(b"}\n");
-    }
     if let Some(frame) = active_frame {
         let request = frame.request();
         print_str(b"[cb-crash] active callback api=");
