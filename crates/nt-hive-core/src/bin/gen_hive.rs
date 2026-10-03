@@ -51,6 +51,8 @@ enum GeneratedHiveProfile {
     SehTerminalExitIntegration,
     MupProviderIntegration,
     SourceIrpIntegration,
+    FileAcceptance,
+    FontCleanup,
 }
 
 fn generated_hive_profile_from_name(name: &str) -> Option<GeneratedHiveProfile> {
@@ -63,6 +65,8 @@ fn generated_hive_profile_from_name(name: &str) -> Option<GeneratedHiveProfile> 
         "seh-terminal-exit" => Some(GeneratedHiveProfile::SehTerminalExitIntegration),
         "mup-provider" => Some(GeneratedHiveProfile::MupProviderIntegration),
         "source-irp-integration" => Some(GeneratedHiveProfile::SourceIrpIntegration),
+        "file-acceptance" => Some(GeneratedHiveProfile::FileAcceptance),
+        "font-cleanup" => Some(GeneratedHiveProfile::FontCleanup),
         _ => None,
     }
 }
@@ -71,7 +75,7 @@ fn generated_hive_profile_from_env() -> GeneratedHiveProfile {
     match std::env::var("NTOS_IMAGE_PROFILE") {
         Ok(value) => generated_hive_profile_from_name(&value).unwrap_or_else(|| {
             panic!(
-                "unsupported NTOS_IMAGE_PROFILE '{value}'; supported: production, pending-start, live-device-action, seh-driver, seh-terminal-unhandled, seh-terminal-exit, mup-provider, source-irp-integration"
+                "unsupported NTOS_IMAGE_PROFILE '{value}'; supported: production, pending-start, live-device-action, seh-driver, seh-terminal-unhandled, seh-terminal-exit, mup-provider, source-irp-integration, file-acceptance, font-cleanup"
             )
         }),
         Err(std::env::VarError::NotPresent) => GeneratedHiveProfile::Production,
@@ -1128,6 +1132,16 @@ fn build_hive_with_configuration(
     hive.set_dword(select, "Default", 1);
     hive.set_dword(select, "LastKnownGood", 1);
     hive.set_dword(select, "Failed", 0);
+    if profile == GeneratedHiveProfile::FileAcceptance {
+        let manager = hive.create_key(r"ControlSet001\Control\Session Manager");
+        hive.set_value(manager, "BootExecute", RegistryValueType::MultiSz,
+            encode_multi_sz(&["file_acceptance"]));
+    }
+    if profile == GeneratedHiveProfile::FontCleanup {
+        let manager = hive.create_key(r"ControlSet001\Control\Session Manager");
+        hive.set_value(manager, "BootExecute", RegistryValueType::MultiSz,
+            encode_multi_sz(&["font_run_setup"]));
+    }
     // A recognizable marker the executive reads back: ...\NtosTest\Answer = REG_DWORD 42.
     let key = hive.create_key(r"ControlSet001\Services\NtosTest");
     hive.set_dword(key, "Answer", 42);
@@ -1253,6 +1267,8 @@ fn build_hive_with_configuration(
         | GeneratedHiveProfile::PendingStartIntegration
         | GeneratedHiveProfile::MupProviderIntegration
         | GeneratedHiveProfile::SourceIrpIntegration
+        | GeneratedHiveProfile::FileAcceptance
+        | GeneratedHiveProfile::FontCleanup
         | GeneratedHiveProfile::SehDriverIntegration
         | GeneratedHiveProfile::SehTerminalUnhandledIntegration
         | GeneratedHiveProfile::SehTerminalExitIntegration => {
@@ -1452,6 +1468,25 @@ mod tests {
     }
 
     #[test]
+    fn file_acceptance_profile_is_native_bootexecute_only() {
+        assert_eq!(generated_hive_profile_from_name("file-acceptance"),
+                   Some(GeneratedHiveProfile::FileAcceptance));
+        let path = r"ControlSet001\Control\Session Manager";
+        let production = build_hive();
+        assert!(production.open_key(path)
+            .and_then(|key| production.query_value(key, "BootExecute")).is_none());
+        let hive = build_hive_with_configuration(
+            generated_e1000_adapters(1), GeneratedDisplayMode::DEFAULT,
+            GeneratedHiveProfile::FileAcceptance,
+        );
+        let manager = hive.open_key(path).unwrap();
+        assert_eq!(hive.query_value(manager, "BootExecute"),
+            Some((RegistryValueType::MultiSz, encode_multi_sz(&["file_acceptance"]).as_slice())));
+        assert!(hive.open_key(r"ControlSet001\Services\SourceIrpProbeTarget").is_none());
+        assert!(hive.open_key(r"ControlSet001\Services\NtosMupProviderTest").is_none());
+    }
+
+    #[test]
     fn source_irp_profile_declares_metadata_without_production_fixture() {
         assert!(build_hive().open_key(r"ControlSet001\Services\SourceIrpProbeTarget").is_none());
         let hive = build_hive_with_configuration(
@@ -1474,6 +1509,30 @@ mod tests {
         }
         assert_eq!(generated_hive_profile_from_name("source-irp-integration"),
                    Some(GeneratedHiveProfile::SourceIrpIntegration));
+    }
+
+    #[test]
+    fn font_cleanup_profile_uses_native_setup_without_replacing_the_shell() {
+        assert_eq!(generated_hive_profile_from_name("font-cleanup"),
+                   Some(GeneratedHiveProfile::FontCleanup));
+        let production = build_hive();
+        let hive = build_hive_with_configuration(
+            generated_e1000_adapters(1), GeneratedDisplayMode::DEFAULT,
+            GeneratedHiveProfile::FontCleanup,
+        );
+        let path = r"ControlSet001\Control\Session Manager";
+        assert!(production.open_key(path)
+            .and_then(|key| production.query_value(key, "BootExecute")).is_none());
+        let manager = hive.open_key(path).expect("native test setup command");
+        assert_eq!(hive.query_value(manager, "BootExecute"),
+            Some((RegistryValueType::MultiSz, encode_multi_sz(&["font_run_setup"]).as_slice())));
+        // SOFTWARE Run is installed by public NT registry calls, not a wrong SYSTEM namespace.
+        assert!(hive.open_key(r"Software\Microsoft\Windows\CurrentVersion\Run").is_none());
+        assert!(hive.query_value(manager, "Shell").is_none());
+        assert!(hive.query_value(manager, "Userinit").is_none());
+        for service in ["SourceIrpProbeTarget", "NtosMupProviderTest", "SehDriverTest"] {
+            assert!(hive.open_key(&format!(r"ControlSet001\Services\{}", service)).is_none());
+        }
     }
 
     #[test]
@@ -2214,6 +2273,7 @@ mod tests {
             (GeneratedHiveProfile::SehTerminalExitIntegration, 1),
             (GeneratedHiveProfile::MupProviderIntegration, 1),
             (GeneratedHiveProfile::SourceIrpIntegration, 1),
+            (GeneratedHiveProfile::FontCleanup, 1),
         ] {
             let bytes = encode_image(&build_hive_with_configuration(
                 generated_e1000_adapters(count),

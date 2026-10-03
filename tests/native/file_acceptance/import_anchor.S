@@ -1,0 +1,27 @@
+.text
+.macro IMPORT_ANCHOR name
+.globl \name
+\name:
+    ud2
+    ret
+.endm
+IMPORT_ANCHOR NtCreateFile
+IMPORT_ANCHOR NtOpenFile
+IMPORT_ANCHOR NtReadFile
+IMPORT_ANCHOR NtWriteFile
+IMPORT_ANCHOR NtQueryInformationFile
+IMPORT_ANCHOR NtSetInformationFile
+IMPORT_ANCHOR NtDuplicateObject
+IMPORT_ANCHOR NtAllocateVirtualMemory
+IMPORT_ANCHOR NtProtectVirtualMemory
+IMPORT_ANCHOR NtFreeVirtualMemory
+IMPORT_ANCHOR NtCreateEvent
+IMPORT_ANCHOR NtWaitForSingleObject
+IMPORT_ANCHOR NtClose
+IMPORT_ANCHOR NtDisplayString
+IMPORT_ANCHOR NtTerminateProcess
+IMPORT_ANCHOR NtTerminateThread
+IMPORT_ANCHOR RtlCreateUserThread
+IMPORT_ANCHOR NtOpenKey
+IMPORT_ANCHOR NtQueryKey
+IMPORT_ANCHOR NtQueryInformationProcess
