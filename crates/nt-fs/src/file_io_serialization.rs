@@ -107,7 +107,23 @@ impl FileSystem {
         tid: u64,
     ) -> Result<FileIoAcquireResult, u32> {
         let index = self.checked_file_io_index(handle)?;
+        let mode = self.handles[index].as_ref().unwrap().io_mode();
+        self.zw_acquire_file_io_with_mode(handle, tid, mode)
+    }
+
+    /// Preserve the operation's captured alertability across reentry. Only synchronous class
+    /// must still match the body; changing a later mode cannot change an admitted FIFO wait.
+    pub fn zw_acquire_file_io_with_mode(
+        &mut self,
+        handle: u64,
+        tid: u64,
+        mode: FileIoMode,
+    ) -> Result<FileIoAcquireResult, u32> {
+        let index = self.checked_file_io_index(handle)?;
         let object = self.handles[index].as_mut().unwrap();
+        if mode.is_synchronous() != object.io_mode().is_synchronous() {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
         if object.handle_references == 0 {
             return Err(STATUS_INVALID_HANDLE);
         }
@@ -116,7 +132,7 @@ impl FileSystem {
         }
         let mut serialization = object.serialization;
         let acquired =
-            serialization.begin_io(object.io_mode(), tid, object.cleanup_reference_held)?;
+            serialization.begin_io(mode, tid, object.cleanup_reference_held)?;
         let references = object
             .references
             .checked_add(1)

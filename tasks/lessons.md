@@ -1,5 +1,9 @@
 # Lessons
 
+## Serialize Parser Tests Too
+- A yielded Cargo session is still active. Do not launch even independent Python fixture/parser
+  tests until its actual exit is consumed; single-owner validation includes every test suite.
+
 ## Runtime Ownership Is Not A Thread Role
 - Resolve GUI TEB aliases from the published executable runtime and retained logical caller,
   including the exact process and thread generations. A worker badge's slot encoding is not
