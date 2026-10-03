@@ -36,6 +36,11 @@ mod section_cleanup_authority;
 mod section_retirement_receipts;
 extern crate alloc;
 
+#[path = "native_acceptance/client_copy_recorded_backing.rs"]
+mod client_copy_recorded_backing;
+#[path = "native_acceptance/loader_open_output.rs"]
+mod loader_open_output;
+
 // Executive globals required by the real cache module exercised in the host harness.
 use core::sync::atomic::{AtomicU64, Ordering};
 const MAX_PI: usize = 64;

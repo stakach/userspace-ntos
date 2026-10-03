@@ -60,6 +60,22 @@ class AcceptanceParserTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     verify(text)
 
+    def test_open_output_probe_order_and_unchanged_outputs_are_required(self):
+        cases = ("open-handle-before-iosb", "open-iosb-before-attributes",
+                 "open-attributes-after-outputs", "open-missing-child")
+        for (case, field), expected in REQUIRED.items():
+            if case not in cases:
+                continue
+            with self.subTest(case=case, field=field):
+                text = "\n".join(line for line in accepted_log().splitlines()
+                                 if not (f"case={case} " in line and f"field={field} " in line))
+                with self.assertRaises(ValueError):
+                    verify(text)
+                wrong = accepted_log().replace(record(case, field, expected),
+                                                record(case, field, expected ^ 1, expected))
+                with self.assertRaises(ValueError):
+                    verify(wrong)
+
     def test_exact_dynamic_identity_and_retirement(self):
         self.assertEqual(verify(accepted_log()), (413, 7))
 

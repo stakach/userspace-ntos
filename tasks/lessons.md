@@ -496,3 +496,10 @@ diagnosis-free failure.
 - Preserve NT's distinct early probes and late buffered copies. A late copy
   exception releases acquisition ownership without publishing an I/O completion;
   moving every copy early can conceal a bug while changing observable semantics.
+
+## Address Windows Are Not Mapped Backing
+- A grown stack can overlap a historical heap address window. Numeric containment
+  does not prove an executive alias exists; copy through the exact registered
+  frame and its acknowledged alias, or its retained source capability.
+- Demand-fill history is an observation, not replacement backing after retirement.
+  A failed exact backing lookup must not fall through to a computed mirror.

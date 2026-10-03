@@ -2488,10 +2488,7 @@ unsafe fn trace_user_callback_stack_words(
             process,
             va,
             &mut bytes,
-            &[],
-            0,
             client.scratch_base,
-            true,
         ) {
             true => {
                 print_str(b"0x");
@@ -2728,7 +2725,7 @@ unsafe fn client_copyin_process_u64(
     va: u64,
 ) -> Option<u64> {
     let mut bytes = [0u8; 8];
-    crate::img_spawn::client_copyin_process_mapped_for(pi, process, va, &mut bytes, &[], 0, scratch_base, false)
+    crate::img_spawn::client_copyin_process_mapped_for(pi, process, va, &mut bytes, scratch_base)
         .then_some(u64::from_le_bytes(bytes))
 }
 
@@ -2739,7 +2736,7 @@ unsafe fn client_copyin_process_u32(
     va: u64,
 ) -> Option<u32> {
     let mut bytes = [0u8; 4];
-    crate::img_spawn::client_copyin_process_mapped_for(pi, process, va, &mut bytes, &[], 0, scratch_base, false)
+    crate::img_spawn::client_copyin_process_mapped_for(pi, process, va, &mut bytes, scratch_base)
         .then_some(u32::from_le_bytes(bytes))
 }
 
@@ -2866,10 +2863,7 @@ unsafe fn copy_callback_result_to_shared(
         process,
         result_pointer,
         output,
-        &[],
-        0,
         client.scratch_base,
-        true,
     )
 }
 
@@ -3612,8 +3606,6 @@ unsafe fn redirect_pending_user_callback(
             client.pi as u64,
             layout.input_pointer,
             input,
-            &[],
-            0,
             client.scratch_base,
         ) {
             return false;
@@ -3633,8 +3625,6 @@ unsafe fn redirect_pending_user_callback(
             client.pi as u64,
             layout.input_pointer + WINDOWPROC_LPARAM_OFFSET,
             &reference.to_le_bytes(),
-            &[],
-            0,
             client.scratch_base,
         ) {
             return false;
@@ -3656,8 +3646,6 @@ unsafe fn redirect_pending_user_callback(
         client.pi as u64,
         layout.frame_pointer,
         frame_bytes,
-        &[],
-        0,
         client.scratch_base,
     ) {
         return false;
@@ -4831,10 +4819,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
                         process,
                         result_pointer + 0x38,
                         &mut returned_result,
-                        &[],
-                        0,
                         active_frame.client_scratch_base(),
-                        true,
                     )
                 });
             let mut expected_result = [0u8; 8];
@@ -4846,10 +4831,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
                         process,
                         expected + 0x38,
                         &mut expected_result,
-                        &[],
-                        0,
                         active_frame.client_scratch_base(),
-                        true,
                     )
                 });
             print_str(b"[callback-result] WM_NCCREATE pointer=0x");

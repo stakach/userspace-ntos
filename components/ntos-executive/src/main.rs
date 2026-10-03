@@ -3219,16 +3219,6 @@ static WL_LISTENER_THREAD_MINTED: AtomicU64 = AtomicU64::new(0);
 static WL_LISTENER_STACK_ALLOCATION_BASE: AtomicU64 = AtomicU64::new(0);
 static WL_LISTENER_STACK_BASE_REAL: AtomicU64 = AtomicU64::new(0);
 static WL_LISTENER_STACK_MAPPED_LOW: AtomicU64 = AtomicU64::new(0);
-fn wl_listener_stack_contains(va: u64, len: usize) -> bool {
-    let allocation_base = WL_LISTENER_STACK_ALLOCATION_BASE.load(Ordering::Acquire);
-    let stack_base = WL_LISTENER_STACK_BASE_REAL.load(Ordering::Acquire);
-    allocation_base != 0
-        && stack_base > allocation_base
-        && va >= allocation_base
-        && va
-            .checked_add(len as u64)
-            .is_some_and(|end| end <= stack_base)
-}
 /// Count of real threads created through the general NtCreateThread path.
 static PM_GENERAL_THREADS_CREATED: AtomicU64 = AtomicU64::new(0);
 /// Threads created in a FOREIGN process's address space through the real cross-VSpace

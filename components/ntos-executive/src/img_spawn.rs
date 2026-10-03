@@ -1689,31 +1689,13 @@ pub(crate) unsafe fn spawn_sec_image(
     }
 }
 
-/// Read a u64 from a SEC_IMAGE process VA. Fixed mirrors are the fast path; recorded frames cover
-/// dynamically grown stacks and other mapped private pages.
+/// Read a u64 through the process's recorded frame backing.
 pub(crate) unsafe fn smss_stack_read(stack_va: u64) -> u64 {
     let mut bytes = [0u8; 8];
     if smss_copyin(stack_va, &mut bytes) {
         u64::from_le_bytes(bytes)
     } else {
         0
-    }
-}
-/// Translate a SEC_IMAGE process VA to its executive mirror VA (stack or heap window), or None if
-/// the range isn't covered by a mirror. The executive's copyin/copyout base: a userspace broker
-/// can't walk smss's page tables, so it reaches smss memory through the same frames it mapped.
-#[inline(always)]
-pub(crate) unsafe fn smss_mirror(va: u64, len: u64) -> Option<u64> {
-    hosted_thread_memory_access(ACTIVE_CLIENT_PI.load(Ordering::Relaxed), va, len).ok()?;
-    let end = va.checked_add(len)?;
-    let stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
-    let stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
-    if va >= stack_base && end <= stack_base + stack_size {
-        Some(ACTIVE_STACK_MIRROR.load(Ordering::Relaxed) + (va - stack_base))
-    } else if va >= SMSS_ALLOC_VA && end <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
-        Some(ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed) + (va - SMSS_ALLOC_VA))
-    } else {
-        None
     }
 }
 /// Copy `dst.len()` bytes IN from a SEC_IMAGE process VA (the executive's ProbeForRead+copyin).
@@ -1723,19 +1705,13 @@ pub(crate) unsafe fn smss_copyin(va: u64, dst: &mut [u8]) -> bool {
         || hosted_thread_memory_access(ACTIVE_CLIENT_PI.load(Ordering::Relaxed), va, dst.len() as u64).is_err() {
         return false;
     }
-    match smss_mirror(va, dst.len() as u64) {
-        Some(m) => {
-            core::ptr::copy_nonoverlapping(m as *const u8, dst.as_mut_ptr(), dst.len());
-            true
-        }
-        None => recorded_frame_copyin(
-            ACTIVE_CLIENT_PI.load(Ordering::Relaxed),
-            None,
-            va,
-            dst,
-            ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
-        ),
-    }
+    recorded_frame_copyin(
+        ACTIVE_CLIENT_PI.load(Ordering::Relaxed),
+        None,
+        va,
+        dst,
+        ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
+    )
 }
 /// Copy `src.len()` bytes OUT to a SEC_IMAGE process VA (the executive's copyout).
 /// Image pages use their current recorded frame, not an inferred fixed mirror address.
@@ -1745,28 +1721,7 @@ pub(crate) unsafe fn smss_copyout(va: u64, src: &[u8]) -> bool {
         || hosted_thread_memory_access(pi, va, src.len() as u64).is_err() {
         return false;
     }
-    if has_managed_section_page(pi, va, src.len()) {
-        return recorded_frame_copyout(pi, va, src, ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed));
-    }
-    match smss_mirror(va, src.len() as u64) {
-        Some(m) => {
-            core::ptr::copy_nonoverlapping(src.as_ptr(), m as *mut u8, src.len());
-            true
-        }
-        None => recorded_frame_copyout(
-            ACTIVE_CLIENT_PI.load(Ordering::Relaxed),
-            va,
-            src,
-            ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
-        ),
-    }
-}
-
-unsafe fn has_managed_section_page(pi: u64, va: u64, length: usize) -> bool {
-    nt_address_space::page_chunks(va, length).is_some_and(|mut chunks| {
-        chunks.any(|chunk| crate::process_committed_mapping_basic_information(pi, chunk.page_base)
-            .is_some_and(|info| info.type_ == nt_address_space::MEM_MAPPED))
-    })
+    recorded_frame_copyout(pi, va, src, ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed))
 }
 
 unsafe fn with_recorded_frame_alias(
@@ -1895,41 +1850,22 @@ unsafe fn recorded_frame_copyout_impl(pi: u64, va: u64, src: &[u8], scratch_base
     }
     true
 }
-/// Historical demand-fill scratch lookup for callers that have already validated backing.
-/// Image copies must use the current frame record, not this fill-order bookkeeping.
-pub(crate) unsafe fn scratch_for(
-    va: u64,
-    filled_pages: &[u64],
-    nfilled: usize,
-    scratch_base: u64,
-) -> Option<u64> {
-    let page = va & !0xFFFu64;
-    for i in 0..nfilled.min(filled_pages.len()) {
-        if filled_pages[i] == page {
-            return Some(scratch_base + i as u64 * 0x1000 + (va & 0xFFF));
-        }
-    }
-    None
-}
-
 unsafe fn unregistered_image_mapping(pi: u64, page: u64) -> bool {
     process_committed_mapping_basic_information(pi, page)
         .is_some_and(|info| info.type_ == nt_address_space::MEM_IMAGE)
 }
 
 /// Copy resident client bytes, selecting exact private or shared process mappings first.
-/// Missing committed image mappings and reclaiming records are rejected. Nonimage bootstrap
-/// mirrors and copy-in prefetches remain supported. This never faults in a new page.
+/// Missing committed image mappings and reclaiming records are rejected. Registered copy-in
+/// prefetches remain supported. This never faults in a new page.
 #[inline(always)]
 pub(crate) unsafe fn client_copyin_mapped(
     pi: u64,
     va: u64,
     dst: &mut [u8],
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> bool {
-    client_copyin_process_mapped_pi_unchecked(pi, va, dst, filled_pages, nfilled, scratch_base, true)
+    client_copyin_process_mapped_pi_unchecked(pi, va, dst, scratch_base)
 }
 
 /// Legacy active-client bootstrap path. Callers with a process witness use the exact variant.
@@ -1938,29 +1874,23 @@ unsafe fn client_copyin_process_mapped_pi_unchecked(
     pi: u64,
     va: u64,
     dst: &mut [u8],
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
-    allow_active_mirrors: bool,
 ) -> bool {
     client_copyin_process_mapped_impl(
-        pi, None, va, dst, filled_pages, nfilled, scratch_base, allow_active_mirrors,
+        pi, None, va, dst, scratch_base,
     )
 }
 
-/// Exact process copy-in. Remote callers disable active mirrors because hosted VAs are reused.
+/// Exact process copy-in. The captured lifetime prevents hosted VA reuse from changing backing.
 pub(crate) unsafe fn client_copyin_process_mapped_for(
     pi: u64,
     process: nt_memory_manager::ProcessIdentity,
     va: u64,
     dst: &mut [u8],
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
-    allow_active_mirrors: bool,
 ) -> bool {
     client_copyin_process_mapped_impl(
-        pi, Some(process), va, dst, filled_pages, nfilled, scratch_base, allow_active_mirrors,
+        pi, Some(process), va, dst, scratch_base,
     )
 }
 
@@ -1969,10 +1899,7 @@ unsafe fn client_copyin_process_mapped_impl(
     process: Option<nt_memory_manager::ProcessIdentity>,
     va: u64,
     dst: &mut [u8],
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
-    allow_active_mirrors: bool,
 ) -> bool {
     if crate::temporary_frame_alias::drain().is_err()
         || hosted_thread_memory_access(pi, va, dst.len() as u64).is_err() {
@@ -2039,17 +1966,7 @@ unsafe fn client_copyin_process_mapped_impl(
         if unregistered_image_mapping(pi, current & !0xfff) {
             return false;
         }
-        let mirrored = if !allow_active_mirrors
-            || ACTIVE_CLIENT_PI.load(Ordering::Relaxed) != pi
-            || pi == 2 && wl_listener_stack_contains(current, chunk)
-        {
-            None
-        } else {
-            smss_mirror(current, chunk as u64)
-        };
-        let source = if let Some(source) = mirrored {
-            source
-        } else {
+        let source = {
             let page = current & !0xfff;
             let persistent_alias = if process.is_some() {
                 prefetch.map_or(0, |page| page.alias)
@@ -2059,11 +1976,7 @@ unsafe fn client_copyin_process_mapped_impl(
             if persistent_alias != 0 {
                 persistent_alias + (current & 0xfff)
             } else {
-                if let Some(source) = scratch_for(current, filled_pages, nfilled, scratch_base) {
-                    source
-                } else {
-                    return false;
-                }
+                return false;
             }
         };
         core::ptr::copy_nonoverlapping(source as *const u8, dst.as_mut_ptr().add(copied), chunk);
@@ -2076,12 +1989,10 @@ unsafe fn client_copyin_process_mapped_impl(
 pub(crate) unsafe fn client_read_u64_mapped(
     pi: u64,
     va: u64,
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> Option<u64> {
     let mut bytes = [0u8; 8];
-    client_copyin_mapped(pi, va, &mut bytes, filled_pages, nfilled, scratch_base)
+    client_copyin_mapped(pi, va, &mut bytes, scratch_base)
         .then(|| u64::from_le_bytes(bytes))
 }
 
@@ -2089,24 +2000,12 @@ pub(crate) unsafe fn client_write_mapped(
     pi: u64,
     va: u64,
     src: &[u8],
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> bool {
     if hosted_thread_memory_access(pi, va, src.len() as u64).is_err() {
         return false;
     }
-    if has_managed_section_page(pi, va, src.len()) {
-        // Preserve the first managed-memory refusal, including consumed guard exceptions.
-        return client_copyout_mapped(pi, va, src, filled_pages, nfilled, scratch_base);
-    }
-    if pi == 2 && wl_listener_stack_contains(va, src.len()) {
-        return client_copyout_mapped(pi, va, src, filled_pages, nfilled, scratch_base);
-    }
-    if client_copyout_mapped(pi, va, src, filled_pages, nfilled, scratch_base) {
-        return true;
-    }
-    ACTIVE_CLIENT_PI.load(Ordering::Relaxed) == pi && smss_copyout(va, src)
+    client_copyout_mapped(pi, va, src, scratch_base)
 }
 
 /// Copy out under the process lifetime captured when the syscall entered. A failed exact
@@ -2132,10 +2031,9 @@ pub(crate) unsafe fn client_write_process_mapped_for(
     };
     let mut copied = 0usize;
     for chunk in chunks {
-        let prefetch = match client_copyin_frame_lookup_for(pi, process, chunk.page_base) {
-            Ok(prefetch) => prefetch,
-            Err(_) => return false,
-        };
+        if client_copyin_frame_lookup_for(pi, process, chunk.page_base).is_err() {
+            return false;
+        }
         if handler.capture_process_identity(pi_index) != Some(process)
             || handler
                 .prepare_copy_page(pi_index, chunk.page_base, nt_address_space::FaultAccess::Write)
@@ -2169,24 +2067,7 @@ pub(crate) unsafe fn client_write_process_mapped_for(
                     return false;
                 }
             }
-            nt_memory_manager::ClientCopyoutBacking::Unrecorded => {
-                if prefetch.is_some() || unregistered_image_mapping(pi, chunk.page_base) {
-                    return false;
-                }
-                let current = chunk.page_base + chunk.page_offset as u64;
-                let destination = (ACTIVE_CLIENT_PI.load(Ordering::Relaxed) == pi
-                    && !(pi == 2 && wl_listener_stack_contains(current, chunk.length)))
-                .then(|| smss_mirror(current, chunk.length as u64))
-                .flatten();
-                let Some(destination) = destination else {
-                    return false;
-                };
-                core::ptr::copy_nonoverlapping(
-                    source.as_ptr(),
-                    destination as *mut u8,
-                    chunk.length,
-                );
-            }
+            nt_memory_manager::ClientCopyoutBacking::Unrecorded => return false,
         }
         copied += chunk.length;
     }
@@ -2197,16 +2078,12 @@ pub(crate) unsafe fn client_write_u64_mapped(
     pi: u64,
     va: u64,
     value: u64,
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> bool {
     client_write_mapped(
         pi,
         va,
         &value.to_le_bytes(),
-        filled_pages,
-        nfilled,
         scratch_base,
     )
 }
@@ -2218,11 +2095,9 @@ pub(crate) unsafe fn client_copyout_mapped(
     pi: u64,
     va: u64,
     src: &[u8],
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> bool {
-    client_copyout_mapped_impl(pi, va, src, filled_pages, nfilled, scratch_base, false)
+    client_copyout_mapped_impl(pi, va, src, scratch_base, false)
 }
 
 /// Only for the checked native-copy engine, after its own protection/residency/COW admission.
@@ -2230,19 +2105,15 @@ pub(crate) unsafe fn client_copyout_mapped_admitted(
     pi: u64,
     va: u64,
     src: &[u8],
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> bool {
-    client_copyout_mapped_impl(pi, va, src, filled_pages, nfilled, scratch_base, true)
+    client_copyout_mapped_impl(pi, va, src, scratch_base, true)
 }
 
 unsafe fn client_copyout_mapped_impl(
     pi: u64,
     va: u64,
     src: &[u8],
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
     admitted: bool,
 ) -> bool {
@@ -2275,14 +2146,7 @@ unsafe fn client_copyout_mapped_impl(
             copied += chunk;
             continue;
         }
-        if unregistered_image_mapping(pi, page) {
-            return false;
-        }
-        let Some(destination) = scratch_for(current, filled_pages, nfilled, scratch_base) else {
-            return false;
-        };
-        core::ptr::copy_nonoverlapping(src.as_ptr().add(copied), destination as *mut u8, chunk);
-        copied += chunk;
+        return false;
     }
     true
 }

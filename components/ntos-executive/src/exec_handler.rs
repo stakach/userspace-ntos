@@ -11419,29 +11419,20 @@ impl ExecNtHandler {
         if pi >= MAX_PI {
             return false;
         }
-        let (filled, nfilled, scratch_base) = match self.loop_ctx {
+        let scratch_base = match self.loop_ctx {
             Some(ctx) => {
                 let procs = unsafe { &*ctx.procs };
-                let filled: &[u64] = if pi == self.pi {
-                    let current = unsafe { &*ctx.filled_pages };
-                    &current[..]
-                } else {
-                    let per_process = unsafe { &*ctx.pfilled };
-                    &per_process[pi][..]
-                };
-                (filled, procs[pi].faults as usize, procs[pi].scratch_base)
+                procs[pi].scratch_base
             }
             // Post-loop (the self-tests) there is no loop context; the PEB page is reachable through
             // its registered permanent alias, which `client_copyout_mapped` consults first.
-            None => (&[][..], 0usize, 0u64),
+            None => 0,
         };
         let written = unsafe {
             img_spawn::client_copyout_mapped(
                 pi as u64,
                 SMSS_PEB_VA + PEB_BEING_DEBUGGED_OFFSET,
                 &[u8::from(being_debugged)],
-                filled,
-                nfilled,
                 scratch_base,
             )
         };
@@ -21660,24 +21651,17 @@ impl ExecNtHandler {
         if target_pi == self.pi {
             return self.xas_try_write_buf(address, &state);
         }
-        let (filled, faults, scratch_base) = match self.loop_ctx {
+        let scratch_base = match self.loop_ctx {
             Some(ctx) => {
                 let procs = &*ctx.procs;
-                let per_process = &*ctx.pfilled;
-                (
-                    &per_process[target_pi][..],
-                    procs[target_pi].faults as usize,
-                    procs[target_pi].scratch_base,
-                )
+                procs[target_pi].scratch_base
             }
-            None => (&[][..], 0, 0),
+            None => 0,
         };
         client_copyout_mapped(
             target_pi as u64,
             address,
             &state,
-            filled,
-            faults,
             scratch_base,
         )
     }
@@ -22641,16 +22625,7 @@ impl ExecNtHandler {
             let _ = self.close_process_handle(pid, handle);
         }
     }
-    /// Read a UNICODE_STRING's UTF-16 buffer from the faulting process for an LPC syscall, handling
-    /// a buffer that lives OUTSIDE the stack/heap mirrors — e.g. csrss's `NtConnectPort`
-    /// PortName `L"\\SmApiPort"` is a static string in csrsrv's `.rdata` (~0x8000_xxxx). The
-    /// UNICODE_STRING struct itself is a stack local (mirror-readable); its Buffer is read via the
-    /// per-fault scratch alias of the already-demand-faulted `.rdata` page (`scratch_for`). Empty on
-    /// failure (→ the caller's connect misses by name, a clean error, not a crash).
-    /// Read an OBJECT_ATTRIBUTES.ObjectName (OA+0x10 → PUNICODE_STRING) with the SAME .rdata-capable
-    /// fallback as `read_lpc_name`. The free `smss_read_objattr_name` is mirror-only, so csrss's
-    /// `NtCreatePort(\Windows\ApiPort)` (name in csrsrv .rdata) registered under an EMPTY name → the
-    /// broker couldn't match winlogon's connect. Use this so the port registers under its real name.
+    /// Read an OBJECT_ATTRIBUTES.ObjectName through the current process's admitted backing.
     pub(crate) unsafe fn read_objattr_name(&self, oa_va: u64) -> alloc::vec::Vec<u16> {
         let mut p = [0u8; 8];
         if !self.xas_read(oa_va + 0x10, &mut p) {
@@ -22680,18 +22655,6 @@ impl ExecNtHandler {
             if self.xas_read(va, &mut w) {
                 out.push(u16::from_le_bytes(w));
                 continue;
-            }
-            // Not in a mirror → try the scratch alias of an already-faulted page (csrsrv .rdata).
-            if let Some(ctx) = self.loop_ctx.as_ref() {
-                let fp = &*ctx.filled_pages;
-                let nf = *ctx.faults as usize;
-                if let Some(m) = scratch_for(va, fp, nf, ctx.scratch_base) {
-                    let p = m as *const u8;
-                    w[0] = *p;
-                    w[1] = *p.add(1);
-                    out.push(u16::from_le_bytes(w));
-                    continue;
-                }
             }
             break;
         }
@@ -22726,18 +22689,13 @@ impl ExecNtHandler {
             || process.generation != nt_memory_manager::ProcessGeneration::Hosted(ctx.owner_generation) {
             return false;
         }
-        let filled_pages = &*ctx.filled_pages;
-        let faults = *ctx.faults as usize;
         let stack_read = self.current_hosted_thread_user_stack_contains(va, dst.len());
         if client_copyin_process_mapped_for(
             self.pi as u64,
             process,
             va,
             dst,
-            filled_pages,
-            faults,
             ctx.scratch_base,
-            true,
         ) {
             return true;
         }
@@ -29641,17 +29599,13 @@ impl ExecNtHandler {
                     return false;
                 };
                 let procs = &*ctx.procs;
-                let filled = &*ctx.pfilled;
                 pi < MAX_PI
                     && self.capture_process_identity(pi).is_some_and(|process| client_copyin_process_mapped_for(
                         pi as u64,
                         process,
                         va,
                         dst,
-                        &filled[pi],
-                        procs[pi].faults as usize,
                         procs[pi].scratch_base,
-                        false,
                     ))
             }
         }
@@ -31333,6 +31287,18 @@ impl ExecNtHandler {
         status
     }
 
+    unsafe fn publish_loader_file_open_result(
+        &mut self,
+        file_handle_out: u64,
+        iosb: u64,
+        handle: u64,
+    ) -> Result<(), u32> {
+        // IopCreateFile leaves the committed handle in the table on a late output fault.
+        self.process_memory_write_status(self.pi, file_handle_out, &handle.to_le_bytes())?;
+        self.publish_file_io_status(iosb, nt_fs::STATUS_SUCCESS, 1)
+            .map_err(nt_address_space::copy::MemoryCopyFailure::status)
+    }
+
     #[inline(never)]
     unsafe fn nt_open_file_service(&mut self, args: &[u64]) -> u32 {
         let ctx = self.loop_ctx.unwrap();
@@ -31350,6 +31316,16 @@ impl ExecNtHandler {
             open_options,
         ) {
             return status;
+        }
+        match self.current_user_memory {
+            SyscallUserMemory::CurrentProcess => {
+                if let Err(status) = self.probe_copy_output(self.pi, file_handle_out, 8) {
+                    return status;
+                }
+                if let Err(status) = self.probe_file_io_output(args[3], None) {
+                    return status;
+                }
+            }
         }
         let captured = match self.capture_file_object_attributes(args[2]) {
             Ok(captured) => captured,
@@ -31908,7 +31884,11 @@ impl ExecNtHandler {
         let loader_file = (hosted_exe_leaf.is_some() || dll_i.is_some())
             .then_some(volume_file)
             .flatten();
+        let loader_caller_pid = self.pm_pid_for_pi(self.pi);
         let loader_open = if let (Some(file), Some(path)) = (loader_file, volume_path) {
+            if loader_caller_pid.is_none() {
+                return STATUS_INVALID_HANDLE;
+            }
             Some(self.mint_disk_file_handle(file, path, desired_access, share_access, open_options))
         } else {
             None
@@ -31917,12 +31897,6 @@ impl ExecNtHandler {
             let h = match loader_open {
                 Ok(handle) => handle,
                 Err(status) => {
-                    let iosb = args[3];
-                    self.write_nt_open_file_handle_out(file_handle_out, 0);
-                    if iosb != 0 {
-                        smss_stack_write32(iosb, status);
-                        smss_stack_write(iosb + 8, 0);
-                    }
                     loader_trace_record(
                         self.pi,
                         LoaderOp::OpenFile,
@@ -31939,6 +31913,13 @@ impl ExecNtHandler {
             if let Some(image) = hosted_exe_image {
                 if let Err(error) = record_hosted_child_exe_open(ctx, self.pi, image, h) {
                     let status = hosted_exe_open_status(error);
+                    match self.close_process_handle_checked(
+                        loader_caller_pid.expect("loader handle has its captured canonical caller"),
+                        h,
+                    ) {
+                        Ok(closed) => assert!(closed, "unpublished loader handle lost its owner"),
+                        Err(status) => return status,
+                    }
                     if HOSTED_EXE_OPEN_FAILURE_TRACE_N.fetch_add(1, Ordering::Relaxed) < 8 {
                         print_str(b"[hosted-exe] open record failed pi=");
                         print_u64(self.pi as u64);
@@ -31947,12 +31928,6 @@ impl ExecNtHandler {
                         print_str(b" status=0x");
                         print_hex(status);
                         print_str(b"\n");
-                    }
-                    self.write_nt_open_file_handle_out(file_handle_out, 0);
-                    let iosb = args[3];
-                    if iosb != 0 {
-                        smss_stack_write32(iosb, status);
-                        smss_stack_write(iosb + 8, 0);
                     }
                     loader_trace_record(
                         self.pi,
@@ -31966,14 +31941,11 @@ impl ExecNtHandler {
                     return status;
                 }
             }
-            smss_stack_write(file_handle_out, h);
+            if let Err(status) = self.publish_loader_file_open_result(file_handle_out, args[3], h) {
+                return status;
+            }
             if let Some(i) = dll_i {
                 reg.set_file_handle(self.pi, i, h);
-            }
-            let iosb = args[3];
-            if iosb != 0 {
-                smss_stack_write32(iosb, 0);
-                smss_stack_write(iosb + 8, 1);
             }
             0
         } else if let (Some(file), Some(path)) = (

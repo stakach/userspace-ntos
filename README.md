@@ -84,6 +84,10 @@ The optional [native File acceptance profile](tests/native/file_acceptance/READM
 launches a public-ntdll-only executable through real SMSS to check relative opens,
 FileAll metadata and user-buffer fault precedence. Its process-exit receipts are
 separate from the whole-OS and screenshot gates.
+The optional `font-cleanup` image profile launches a private-font client through
+Explorer's ordinary Run key and checks exact Section-view retirement after process
+termination. Rebuild a fresh production image afterwards; fixture profiles are not
+production desktop evidence.
 
 The kernel is a **pinned git submodule**, not vendored source: `userspace-ntos`
 depends on an exact kernel SHA (its syscall/invocation ABI is tightly coupled),

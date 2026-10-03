@@ -204,6 +204,30 @@ static void fault_cases(HANDLE file)
     HANDLE event = 0;
     status("event-create", NtCreateEvent(&event, 0x001f0003, 0, 0, 0), SUCCESS);
     int64_t offset = 0;
+    for (unsigned iosb_fault = 0; iosb_fault != 2; ++iosb_fault) {
+        const char *name = iosb_fault ? "open-iosb-before-attributes" : "open-handle-before-iosb";
+        HANDLE handle = (HANDLE)SENTINEL;
+        fill(base + 4096, 16, 0xab);
+        protect(base + 4096, PAGE_RW | PAGE_GUARD);
+        status(name, NtOpenFile(iosb_fault ? &handle : (HANDLE *)(base + 4096),
+               SYNC | 1, 0, iosb_fault ? (IO_STATUS_BLOCK *)(base + 4096) : 0,
+               7, NON_DIRECTORY | SYNC_NONALERT), GUARD);
+        eq(name, "old-protection", protect(base + 4096, PAGE_RW), PAGE_RW);
+        eq(name, "handle-unchanged", iosb_fault ? (uintptr_t)handle : u64(base + 4096), SENTINEL);
+        eq(name, "protected-output-unchanged", u64(base + 4104), SENTINEL);
+    }
+    {
+        HANDLE handle = (HANDLE)SENTINEL;
+        IO_STATUS_BLOCK iosb = untouched();
+        protect(base + 4096, PAGE_NOACCESS);
+        status("open-attributes-after-outputs", NtOpenFile(&handle, SYNC | 1,
+               (OBJECT_ATTRIBUTES *)(base + 4096), &iosb, 7, NON_DIRECTORY | SYNC_NONALERT), AV);
+        eq("open-attributes-after-outputs", "handle-unchanged", (uintptr_t)handle, SENTINEL);
+        eq("open-attributes-after-outputs", "iosb-status", iosb.Status, SENTINEL);
+        eq("open-attributes-after-outputs", "iosb-information", iosb.Information, SENTINEL);
+        eq("open-attributes-after-outputs", "old-protection", protect(base + 4096, PAGE_RW), PAGE_NOACCESS);
+    }
+    fill(base + 4096, 16, 0xcc);
     for (unsigned guard = 0; guard != 2; ++guard) {
         NTSTATUS expected = guard ? GUARD : AV;
         const char *name = guard ? "guard-query-output" : "noaccess-query-output";
@@ -416,6 +440,18 @@ void NtProcessStartup(void *peb)
     IO_STATUS_BLOCK iosb = untouched(); HANDLE parent = 0;
     status("parent-open", NtOpenFile(&parent, 0x81 | SYNC, &parent_attrs, &iosb, 7,
            DIRECTORY | SYNC_NONALERT), SUCCESS);
+    {
+        uint16_t missing_units[128];
+        UNICODE_STRING missing_name = string("ntos-file-acceptance-absent.tmp", missing_units);
+        OBJECT_ATTRIBUTES missing_attrs = attributes(parent, &missing_name);
+        HANDLE missing = (HANDLE)SENTINEL;
+        IO_STATUS_BLOCK missing_iosb = untouched();
+        status("open-missing-child", NtOpenFile(&missing, 0x81 | SYNC, &missing_attrs,
+               &missing_iosb, 7, NON_DIRECTORY | SYNC_NONALERT), (NTSTATUS)0xc0000034u);
+        eq("open-missing-child", "handle-unchanged", (uintptr_t)missing, SENTINEL);
+        eq("open-missing-child", "iosb-status", missing_iosb.Status, SENTINEL);
+        eq("open-missing-child", "iosb-information", missing_iosb.Information, SENTINEL);
+    }
     OBJECT_ATTRIBUTES child_attrs = attributes(parent, &child_name); HANDLE child = 0;
     status("relative-create", NtCreateFile(&child, 0x00110183, &child_attrs, &iosb,
            0, 0, 7, 2, NON_DIRECTORY | SYNC_NONALERT | DELETE_ON_CLOSE, 0, 0), SUCCESS);

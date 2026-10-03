@@ -25,10 +25,7 @@ pub(crate) unsafe fn read_fault_stack_word(
         process,
         address,
         &mut bytes,
-        &[],
-        0,
         scratch_base,
-        false,
     ) {
         return None;
     }

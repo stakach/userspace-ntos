@@ -58,6 +58,9 @@ Any mismatch terminates the real process with STATUS_UNSUCCESSFUL. Nineteen comp
   including a read-only handle with inaccessible IOSB, data, offset and key pointers.
 - NOACCESS and GUARD output spans across an actual VM page boundary, unchanged
   output bytes, and the consumed guard's actual protection readback.
+- OpenFile probes Handle before IOSB and both before ObjectAttributes. Protected
+  outputs return the exact exception; an absent relative child preserves Handle
+  and both IOSB words instead of publishing a fabricated error result.
 - READ output, WRITE input and IOSB spans crossing into a protected page.
 - Early READ output faults preserve the File signal. Late buffered WRITE input
   faults leave the File and initially-signaled supplied Event reset, without

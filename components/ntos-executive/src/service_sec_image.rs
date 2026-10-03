@@ -2094,8 +2094,6 @@ unsafe fn process_completed_user_callback_outer_dispatch(
                 completion_pi as u64,
                 dispatch.args[0],
                 &dispatch.arg_snapshot[..output_len],
-                completion_filled_pages,
-                completion_faults,
                 completion_scratch_base,
             )
         {
@@ -2167,8 +2165,6 @@ unsafe fn process_completed_user_callback_outer_dispatch(
             completion_pml4,
             dispatch.args[1],
             userconnect,
-            completion_filled_pages,
-            completion_faults,
             completion_scratch_base,
         ) {
             W32_CONNECTED_MASK.fetch_or(1u64 << completion_pi, Ordering::Relaxed);
@@ -2179,8 +2175,6 @@ unsafe fn process_completed_user_callback_outer_dispatch(
     if completion_pi == 2 {
         observe_winlogon_completed_dispatch(
             dispatch,
-            completion_filled_pages,
-            completion_faults,
             completion_scratch_base,
         );
         observe_completed_dialog_modal_dispatch(dispatch, completion_badge, completion_tid);
@@ -3490,8 +3484,6 @@ unsafe fn service_private_guard_page_fault(
     pml4: u64,
     scratch_base: u64,
     fault_access: nt_address_space::FaultAccess,
-    filled_pages: &[u64; 512],
-    faults: usize,
 ) -> Result<bool, u32> {
     hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
     let process = nt_handler
@@ -3559,8 +3551,6 @@ unsafe fn service_private_guard_page_fault(
                 pi as u64,
                 teb + 0x10,
                 &page.to_le_bytes(),
-                filled_pages,
-                faults,
                 scratch_base,
             );
         }
@@ -6454,8 +6444,6 @@ unsafe fn complete_ntuser_process_connect_copyout(
     pml4: u64,
     client_buffer: u64,
     buffer: &mut [u8],
-    filled_pages: &[u64],
-    faults: usize,
     scratch_base: u64,
 ) -> bool {
     let blen = buffer.len();
@@ -6537,8 +6525,6 @@ unsafe fn complete_ntuser_process_connect_copyout(
         pi as u64,
         client_buffer,
         buffer,
-        filled_pages,
-        faults,
         scratch_base,
     ) {
         let failures = USERCONNECT_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -6578,8 +6564,6 @@ fn userconnect_write_u64(buffer: &mut [u8], offset: u64, value: u64) {
 
 unsafe fn observe_winlogon_completed_dispatch(
     dispatch: win32k_glue::CompletedWin32kDispatch,
-    filled_pages: &mut [u64; 512],
-    faults: usize,
     scratch_base: u64,
 ) {
     if dispatch.ssn != 0x1077 || dispatch.status == 0 {
@@ -6619,7 +6603,7 @@ unsafe fn observe_winlogon_completed_dispatch(
 
     let mut raw = [0u8; 16];
     let descriptor_read =
-        img_spawn::client_copyin_mapped(2, name, &mut raw, filled_pages, faults, scratch_base);
+        img_spawn::client_copyin_mapped(2, name, &mut raw, scratch_base);
     let descriptor = descriptor_read
         .then(|| nt_user_callback::LargeUnicodeStringDescriptor::parse(&raw))
         .and_then(Result::ok);
@@ -6629,13 +6613,11 @@ unsafe fn observe_winlogon_completed_dispatch(
         raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15],
     ]);
     let source = if descriptor.is_some()
-        && img_spawn::smss_mirror(raw_buffer, raw_length as u64).is_some()
+        && csrss_frame_get_exact_record(2, raw_buffer & !0xfff)
+            .and_then(nt_memory_manager::ClientFrameRecord::mapped_alias)
+            .is_some()
     {
         1
-    } else if descriptor.is_some()
-        && img_spawn::scratch_for(raw_buffer, filled_pages, faults, scratch_base).is_some()
-    {
-        2
     } else if descriptor.is_some() && csrss_frame_get(2, raw_buffer & !0xfff) != 0 {
         3
     } else if descriptor.is_some() && client_copyin_frame_get(2, raw_buffer & !0xfff) != 0 {
@@ -6653,8 +6635,6 @@ unsafe fn observe_winlogon_completed_dispatch(
             2,
             descriptor.buffer,
             &mut bytes[..length],
-            filled_pages,
-            faults,
             scratch_base,
         );
         if caption_read {
@@ -6805,7 +6785,7 @@ unsafe fn try_capture_client_string_arg(
     scratch_base: u64,
 ) -> Option<CapturedStringArg> {
     try_capture_client_string_arg_impl(
-        pi, None, sp_va, large, capture_empty_buffer, filled_pages, nfilled, scratch_base,
+        pi, None, sp_va, large, capture_empty_buffer, scratch_base,
     )
 }
 
@@ -6820,7 +6800,7 @@ unsafe fn try_capture_client_string_arg_for(
     scratch_base: u64,
 ) -> Option<CapturedStringArg> {
     try_capture_client_string_arg_impl(
-        pi, Some(process), sp_va, large, capture_empty_buffer, filled_pages, nfilled, scratch_base,
+        pi, Some(process), sp_va, large, capture_empty_buffer, scratch_base,
     )
 }
 
@@ -6829,16 +6809,14 @@ unsafe fn copy_client_string_bytes(
     process: Option<nt_memory_manager::ProcessIdentity>,
     va: u64,
     dst: &mut [u8],
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> bool {
     match process {
         Some(process) => img_spawn::client_copyin_process_mapped_for(
-            pi, process, va, dst, filled_pages, nfilled, scratch_base, true,
+            pi, process, va, dst, scratch_base,
         ),
         None => img_spawn::client_copyin_mapped(
-            pi, va, dst, filled_pages, nfilled, scratch_base,
+            pi, va, dst, scratch_base,
         ),
     }
 }
@@ -6847,13 +6825,11 @@ unsafe fn client_read_u64_for(
     pi: u64,
     process: nt_memory_manager::ProcessIdentity,
     va: u64,
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> Option<u64> {
     let mut bytes = [0u8; 8];
     img_spawn::client_copyin_process_mapped_for(
-        pi, process, va, &mut bytes, filled_pages, nfilled, scratch_base, true,
+        pi, process, va, &mut bytes, scratch_base,
     )
     .then_some(u64::from_le_bytes(bytes))
 }
@@ -6864,15 +6840,13 @@ unsafe fn try_capture_client_string_arg_impl(
     sp_va: u64,
     large: bool,
     capture_empty_buffer: bool,
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> Option<CapturedStringArg> {
     if sp_va == 0 {
         return None;
     }
     let mut sd = [0u8; 16];
-    if !copy_client_string_bytes(pi, process, sp_va, &mut sd, filled_pages, nfilled, scratch_base) {
+    if !copy_client_string_bytes(pi, process, sp_va, &mut sd, scratch_base) {
         return None;
     }
     let (length, maximum, ansi, buffer) = if large {
@@ -6895,8 +6869,6 @@ unsafe fn try_capture_client_string_arg_impl(
                 process,
                 buffer,
                 &mut chars[..length as usize],
-                filled_pages,
-                nfilled,
                 scratch_base,
             )
         {
@@ -6945,8 +6917,6 @@ unsafe fn try_capture_client_string_arg_impl(
 unsafe fn capture_client_devmodew_arg(
     pi: u64,
     devmode: u64,
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> u64 {
     if devmode == 0 {
@@ -6957,8 +6927,6 @@ unsafe fn capture_client_devmodew_arg(
         pi,
         devmode,
         &mut header,
-        filled_pages,
-        nfilled,
         scratch_base,
     ) {
         return devmode;
@@ -6988,8 +6956,6 @@ unsafe fn capture_client_devmodew_arg(
         pi,
         devmode,
         &mut bytes[..size],
-        filled_pages,
-        nfilled,
         scratch_base,
     ) {
         return devmode;
@@ -7002,8 +6968,6 @@ unsafe fn capture_required_client_unicode_string_arg(
     pi: u64,
     process: nt_memory_manager::ProcessIdentity,
     descriptor: u64,
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> Option<u64> {
     if descriptor == 0 {
@@ -7011,7 +6975,7 @@ unsafe fn capture_required_client_unicode_string_arg(
     }
     let mut sd = [0u8; 16];
     if !copy_client_string_bytes(
-        pi, Some(process), descriptor, &mut sd, filled_pages, nfilled, scratch_base,
+        pi, Some(process), descriptor, &mut sd, scratch_base,
     ) {
         return None;
     }
@@ -7019,8 +6983,7 @@ unsafe fn capture_required_client_unicode_string_arg(
     let length = input.length;
     let mut chars = [0u8; RC_ARG_BUF_CAP as usize];
     if !copy_client_string_bytes(
-        pi, Some(process), input.buffer, &mut chars[..input.probe_length],
-        filled_pages, nfilled, scratch_base,
+        pi, Some(process), input.buffer, &mut chars[..input.probe_length], scratch_base,
     ) {
         return None;
     }
@@ -7047,8 +7010,6 @@ unsafe fn stage_unicode_string_descriptor_for_win32k(
     desc_out: u64,
     buf_out: u64,
     buf_cap: u64,
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> bool {
     core::ptr::write_bytes(desc_out as *mut u8, 0, 16);
@@ -7057,7 +7018,7 @@ unsafe fn stage_unicode_string_descriptor_for_win32k(
     }
     let mut sd = [0u8; 16];
     if !copy_client_string_bytes(
-        pi, process, descriptor, &mut sd, filled_pages, nfilled, scratch_base,
+        pi, process, descriptor, &mut sd, scratch_base,
     ) {
         return false;
     }
@@ -7074,7 +7035,7 @@ unsafe fn stage_unicode_string_descriptor_for_win32k(
     if length != 0 {
         let out = core::slice::from_raw_parts_mut(buf_out as *mut u8, length as usize);
         if !copy_client_string_bytes(
-            pi, process, buffer, out, filled_pages, nfilled, scratch_base,
+            pi, process, buffer, out, scratch_base,
         ) {
             return false;
         }
@@ -7181,8 +7142,6 @@ unsafe fn capture_get_class_info_graph(
         class_base,
         class_base + 0x20,
         RC_ARG_CAPTURE_SLOT - 0x20,
-        filled_pages,
-        nfilled,
         scratch_base,
     ) {
         return None;
@@ -7196,8 +7155,6 @@ unsafe fn capture_get_class_info_graph(
         pi,
         wnd_class,
         &mut wnd,
-        filled_pages,
-        nfilled,
         scratch_base,
     ) {
         return None;
@@ -7218,8 +7175,6 @@ unsafe fn capture_get_class_info_graph(
 unsafe fn copy_back_get_class_info(
     pi: usize,
     capture: CapturedGetClassInfo,
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> bool {
     use nt_kernel_exec::user_class::WNDCLASSEXW_SIZE;
@@ -7230,8 +7185,6 @@ unsafe fn copy_back_get_class_info(
             pi as u64,
             capture.menu_client,
             &menu_value.to_le_bytes(),
-            filled_pages,
-            nfilled,
             scratch_base,
         );
     let wnd_bytes = core::slice::from_raw_parts(capture.wnd_out as *const u8, WNDCLASSEXW_SIZE);
@@ -7240,8 +7193,6 @@ unsafe fn copy_back_get_class_info(
             pi as u64,
             capture.wnd_client,
             wnd_bytes,
-            filled_pages,
-            nfilled,
             scratch_base,
         )
 }
@@ -7249,8 +7200,6 @@ unsafe fn copy_back_get_class_info(
 unsafe fn capture_get_class_name_out(
     pi: u64,
     class_name: u64,
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> Option<CapturedGetClassName> {
     if class_name == 0 {
@@ -7261,8 +7210,6 @@ unsafe fn capture_get_class_name_out(
         pi,
         class_name,
         &mut raw,
-        filled_pages,
-        nfilled,
         scratch_base,
     ) {
         return None;
@@ -7298,8 +7245,6 @@ unsafe fn copy_back_get_class_name(
     pi: u64,
     capture: CapturedGetClassName,
     chars_returned: u64,
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> bool {
     let byte_len = chars_returned.saturating_mul(2).min(RC_ARG_BUF_CAP);
@@ -7311,8 +7256,6 @@ unsafe fn copy_back_get_class_name(
         pi,
         capture.buffer_client,
         text,
-        filled_pages,
-        nfilled,
         scratch_base,
     );
 
@@ -7324,8 +7267,6 @@ unsafe fn copy_back_get_class_name(
         pi,
         capture.desc_client,
         &desc,
-        filled_pages,
-        nfilled,
         scratch_base,
     );
     text_ok && desc_ok
@@ -7335,8 +7276,6 @@ unsafe fn capture_get_atom_name_out(
     pi: u64,
     process: nt_memory_manager::ProcessIdentity,
     atom_name: u64,
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> Option<CapturedGetAtomName> {
     if atom_name == 0 {
@@ -7344,7 +7283,7 @@ unsafe fn capture_get_atom_name_out(
     }
     let mut raw = [0u8; 16];
     if !copy_client_string_bytes(
-        pi, Some(process), atom_name, &mut raw, filled_pages, nfilled, scratch_base,
+        pi, Some(process), atom_name, &mut raw, scratch_base,
     ) {
         return None;
     }
@@ -7419,8 +7358,6 @@ unsafe fn stage_session_atom_name(
 unsafe fn stage_unicode_string_output_for_win32k(
     pi: u64,
     descriptor: u64,
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> Option<CapturedUnicodeStringOut> {
     if descriptor == 0 {
@@ -7432,8 +7369,6 @@ unsafe fn stage_unicode_string_output_for_win32k(
         pi,
         descriptor,
         &mut raw,
-        filled_pages,
-        nfilled,
         scratch_base,
     ) {
         return None;
@@ -7472,8 +7407,6 @@ unsafe fn stage_unicode_string_output_for_win32k(
 unsafe fn copy_back_unicode_string_output(
     pi: u64,
     capture: CapturedUnicodeStringOut,
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> bool {
     let mut staged = [0u8; 16];
@@ -7511,8 +7444,6 @@ unsafe fn copy_back_unicode_string_output(
                     pi,
                     capture.buffer_client,
                     core::slice::from_raw_parts(capture.buffer_out as *const u8, length as usize),
-                    filled_pages,
-                    nfilled,
                     scratch_base,
                 ),
             )
@@ -7529,8 +7460,6 @@ unsafe fn copy_back_unicode_string_output(
             pi,
             capture.desc_client,
             &out_desc,
-            filled_pages,
-            nfilled,
             scratch_base,
         )
 }
@@ -7538,8 +7467,6 @@ unsafe fn copy_back_unicode_string_output(
 unsafe fn copy_back_get_icon_info(
     pi: u64,
     capture: CapturedGetIconInfo,
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> bool {
     let iconinfo_ok = capture.iconinfo_client == 0
@@ -7550,8 +7477,6 @@ unsafe fn copy_back_get_icon_info(
                 capture.iconinfo_out as *const u8,
                 GET_ICON_INFO_ICONINFO_BYTES,
             ),
-            filled_pages,
-            nfilled,
             scratch_base,
         );
     let bpp_ok = capture.bpp_client == 0
@@ -7559,15 +7484,13 @@ unsafe fn copy_back_get_icon_info(
             pi,
             capture.bpp_client,
             core::slice::from_raw_parts(capture.bpp_out as *const u8, 4),
-            filled_pages,
-            nfilled,
             scratch_base,
         );
     let module_ok = capture.module.is_none_or(|module| {
-        copy_back_unicode_string_output(pi, module, filled_pages, nfilled, scratch_base)
+        copy_back_unicode_string_output(pi, module, scratch_base)
     });
     let resource_ok = capture.resource.is_none_or(|resource| {
-        copy_back_unicode_string_output(pi, resource, filled_pages, nfilled, scratch_base)
+        copy_back_unicode_string_output(pi, resource, scratch_base)
     });
     iconinfo_ok && bpp_ok && module_ok && resource_ok
 }
@@ -7586,7 +7509,7 @@ unsafe fn capture_register_class_graph(
     let mut wnd = [0u8; WNDCLASSEXW_SIZE];
     if wnd_class == 0
         || !copy_client_string_bytes(
-            pi, Some(process), wnd_class, &mut wnd, filled_pages, nfilled, scratch_base,
+            pi, Some(process), wnd_class, &mut wnd, scratch_base,
         )
     {
         return None;
@@ -7594,7 +7517,7 @@ unsafe fn capture_register_class_graph(
     let mut menu = [0u8; 24];
     if class_menu == 0
         || !copy_client_string_bytes(
-            pi, Some(process), class_menu, &mut menu, filled_pages, nfilled, scratch_base,
+            pi, Some(process), class_menu, &mut menu, scratch_base,
         )
     {
         return None;
@@ -7622,8 +7545,6 @@ unsafe fn capture_register_class_graph(
         menu_desc_out,
         menu_buf_out,
         menu_buf_cap,
-        filled_pages,
-        nfilled,
         scratch_base,
     ) {
         return None;
@@ -7670,8 +7591,6 @@ unsafe fn capture_cursor_counted_string(
     descriptor: u64,
     allow_atom: bool,
     units: &mut [u16; nt_kernel_exec::user_cursor::CURSOR_TEXT_CAP],
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> Option<CapturedCursorString> {
     use nt_kernel_exec::user_cursor::{
@@ -7681,7 +7600,7 @@ unsafe fn capture_cursor_counted_string(
     let mut raw = [0u8; 16];
     if descriptor == 0
         || !img_spawn::client_copyin_mapped(
-            pi, descriptor, &mut raw, filled_pages, nfilled, scratch_base,
+            pi, descriptor, &mut raw, scratch_base,
         )
     {
         return None;
@@ -7692,7 +7611,7 @@ unsafe fn capture_cursor_counted_string(
     };
     let mut bytes = [0u8; nt_kernel_exec::user_cursor::CURSOR_TEXT_CAP * 2];
     if !img_spawn::client_copyin_mapped(
-        pi, buffer, &mut bytes[..length], filled_pages, nfilled, scratch_base,
+        pi, buffer, &mut bytes[..length], scratch_base,
     ) {
         return None;
     }
@@ -7747,8 +7666,6 @@ unsafe fn capture_cursor_identity_key(
     module_descriptor: u64,
     resource_descriptor: u64,
     icon_kind: u32,
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> Option<nt_kernel_exec::user_cursor::CursorLookupKey> {
     use nt_kernel_exec::user_cursor::{CursorLookupKey, CursorResource, CURSOR_TEXT_CAP};
@@ -7759,8 +7676,6 @@ unsafe fn capture_cursor_identity_key(
         module_descriptor,
         false,
         &mut module,
-        filled_pages,
-        nfilled,
         scratch_base,
     )? {
         CapturedCursorString::Text(len) => len,
@@ -7772,8 +7687,6 @@ unsafe fn capture_cursor_identity_key(
         resource_descriptor,
         true,
         &mut resource_name,
-        filled_pages,
-        nfilled,
         scratch_base,
     )? {
         CapturedCursorString::Atom(atom) => CursorResource::atom(atom),
@@ -7799,8 +7712,6 @@ unsafe fn capture_find_existing_cursor_key(
         pi,
         parameter,
         &mut params,
-        filled_pages,
-        nfilled,
         scratch_base,
     ) {
         return None;
@@ -7811,8 +7722,6 @@ unsafe fn capture_find_existing_cursor_key(
         module_descriptor,
         resource_descriptor,
         icon_kind,
-        filled_pages,
-        nfilled,
         scratch_base,
     )
 }
@@ -7852,8 +7761,6 @@ unsafe fn stage_cursor_lookup_args(
         pi,
         parameter,
         &mut params,
-        filled_pages,
-        nfilled,
         scratch_base,
     ) {
         return None;
@@ -7883,8 +7790,6 @@ unsafe fn capture_cursor_set_data_key(
             pi,
             cursor_data,
             &mut data_prefix,
-            filled_pages,
-            nfilled,
             scratch_base,
         )
     {
@@ -7900,8 +7805,6 @@ unsafe fn capture_cursor_set_data_key(
         module_descriptor,
         resource_descriptor,
         icon_kind,
-        filled_pages,
-        nfilled,
         scratch_base,
     )
 }
@@ -7963,8 +7866,6 @@ unsafe fn stage_cursor_icon_data_args(
             pi,
             cursor_data,
             &mut data,
-            filled_pages,
-            nfilled,
             scratch_base,
         )
     {
@@ -8078,22 +7979,16 @@ unsafe fn stage_cursor_icon_data_args(
         pi,
         aspcur_client,
         core::slice::from_raw_parts_mut(staged_aspcur as *mut u8, aspcur_bytes as usize),
-        filled_pages,
-        nfilled,
         scratch_base,
     ) || !img_spawn::client_copyin_mapped(
         pi,
         aicur_client,
         core::slice::from_raw_parts_mut(staged_aicur as *mut u8, aicur_bytes as usize),
-        filled_pages,
-        nfilled,
         scratch_base,
     ) || !img_spawn::client_copyin_mapped(
         pi,
         ajif_rate_client,
         core::slice::from_raw_parts_mut(staged_ajif_rate as *mut u8, ajif_rate_bytes as usize),
-        filled_pages,
-        nfilled,
         scratch_base,
     ) {
         if trace < 96 {
@@ -9621,24 +9516,11 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b" rcx-canonical=");
                 print_u64(canonical as u64);
                 print_str(b"\n");
-                let stk_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
-                let stk_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
-                let stk_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+                let process = nt_handler.capture_process_identity(pi);
                 let read_wl = |va: u64| -> Option<u64> {
-                    unsafe {
-                        if va >= stk_base && va + 8 <= stk_base + stk_size {
-                            return Some(core::ptr::read_volatile(
-                                (stk_mirror + (va - stk_base)) as *const u64,
-                            ));
-                        }
-                        img_spawn::client_read_u64_mapped(
-                            pi as u64,
-                            va,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        )
-                    }
+                    crate::fault_stack_diagnostics::read_fault_stack_word(
+                        &nt_handler, pi, process, va, 0, scratch_base,
+                    )
                 };
                 // The RTL_CRITICAL_SECTION itself: DebugInfo/LockCount/RecursionCount/OwningThread/
                 // LockSemaphore/SpinCount at +0x00/08/0c/10/18/20.
@@ -9667,27 +9549,26 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     print_str(b"\n");
                 }
-                // The live TEB tail through the executive's persistent alias: TEB+0x1698 is
-                // `ReservedForNtRpc`, rpcrt4's per-thread `threaddata` cache.
-                if crate::teb_tail_alias_live_for_pi(2) {
-                    print_str(b"[cs-diag] live TEB+0x1680..0x16b0:");
-                    let mut off = 0u64;
-                    while off < 0x30 {
+                // TEB+0x1698 is rpcrt4's per-thread `ReservedForNtRpc` cache.
+                print_str(b"[cs-diag] live TEB+0x1680..0x16b0:");
+                let tail = nt_handler.hosted_thread_teb_for_badge(badge)
+                    .and_then(|teb| teb.checked_add(0x1680));
+                let mut readable = tail.is_some();
+                if let Some(tail) = tail {
+                    for off in (0..0x30u64).step_by(8) {
+                        let Some(value) = tail.checked_add(off).and_then(|address| read_wl(address)) else {
+                            readable = false;
+                            break;
+                        };
                         print_str(b" ");
-                        print_hex(
-                            (core::ptr::read_volatile(
-                                (crate::WINLOGON_MAIN_TEB_MIRROR_VA + 0x5000 + 0x680 + off)
-                                    as *const u64,
-                            ) >> 32) as u32,
-                        );
-                        print_hex(core::ptr::read_volatile(
-                            (crate::WINLOGON_MAIN_TEB_MIRROR_VA + 0x5000 + 0x680 + off)
-                                as *const u64,
-                        ) as u32);
-                        off += 8;
+                        print_hex((value >> 32) as u32);
+                        print_hex(value as u32);
                     }
-                    print_str(b"\n");
                 }
+                if !readable {
+                    print_str(b" <unreadable: no resident thread TEB backing>");
+                }
+                print_str(b"\n");
                 // The return-address chain. RtlEnterCriticalSection's frame is push/push/sub 0x28,
                 // so its own return address sits at SP+0x38 at the faulting instruction.
                 print_str(b"[cs-diag] ret@sp+0x38=0x");
@@ -9813,22 +9694,12 @@ pub(crate) unsafe fn service_sec_image(
                 print_hex((rsp >> 32) as u32);
                 print_hex(rsp as u32);
                 print_str(b"\n");
-                // Read the EXCEPTION_RECORD (first 0x30 bytes) from winlogon's memory. The record lives
-                // on the raiser's stack → read via the stack mirror (`smss_stack_read`), falling back to
-                // the demand-faulted-page scratch alias for a non-stack record ptr.
-                let stk_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
-                let stk_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
-                let stk_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+                // Diagnostics may inspect only the current process's recorded resident backing.
+                let process = nt_handler.capture_process_identity(pi);
                 let read_wl = |va: u64| -> Option<u64> {
-                    unsafe {
-                        if va >= stk_base && va + 8 <= stk_base + stk_size {
-                            return Some(core::ptr::read_volatile(
-                                (stk_mirror + (va - stk_base)) as *const u64,
-                            ));
-                        }
-                        scratch_for(va, filled_pages, faults as usize, scratch_base)
-                            .map(|m| core::ptr::read_volatile(m as *const u64))
-                    }
+                    crate::fault_stack_diagnostics::read_fault_stack_word(
+                        &nt_handler, pi, process, va, 0, scratch_base,
+                    )
                 };
                 let mut rec = [0u8; 0x30];
                 let mut got = true;
@@ -10003,8 +9874,6 @@ pub(crate) unsafe fn service_sec_image(
                     pi as u64,
                     KERNEL32_BASE_HEAP_HANDLE_TABLE,
                     &mut table,
-                    filled_pages,
-                    faults as usize,
                     scratch_base,
                 );
                 print_str(b"[handle-fault] table-ok=");
@@ -10025,8 +9894,6 @@ pub(crate) unsafe fn service_sec_image(
                     pi as u64,
                     KERNEL32_RTL_ALLOCATE_HANDLE_IAT,
                     &mut iat,
-                    filled_pages,
-                    faults as usize,
                     scratch_base,
                 );
                 print_str(b" iat-ok=");
@@ -10087,8 +9954,6 @@ pub(crate) unsafe fn service_sec_image(
                     2,
                     NTDLL_BASE + 0x99_000,
                     &mut heap_state,
-                    filled_pages,
-                    faults as usize,
                     scratch_base,
                 );
                 print_str(b" heap-ok=");
@@ -10119,8 +9984,6 @@ pub(crate) unsafe fn service_sec_image(
                     pi as u64,
                     entry_va,
                     &mut entry,
-                    filled_pages,
-                    faults as usize,
                     scratch_base,
                 );
                 print_str(b" entry=0x");
@@ -10564,8 +10427,6 @@ pub(crate) unsafe fn service_sec_image(
                 pml4,
                 scratch_base,
                 vm_fault_access_from_x86_error(m3),
-                filled_pages,
-                faults as usize,
             ) {
                 Ok(true) => {
                     note_boot_progress(BootProgress::PageMappingPublished);
@@ -11862,8 +11723,6 @@ pub(crate) unsafe fn service_sec_image(
                             pi as u64,
                             argument_va,
                             &mut bytes,
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         ) {
                             argv[i] = u64::from_le_bytes(bytes);
@@ -12037,8 +11896,6 @@ pub(crate) unsafe fn service_sec_image(
                                     pi as u64,
                                     argv[2],
                                     &mut value_bytes,
-                                    filled_pages,
-                                    faults as usize,
                                     scratch_base,
                                 ) {
                                     print_str(b" value=0x");
@@ -12845,10 +12702,7 @@ pub(crate) unsafe fn service_sec_image(
                                 process,
                                 a1,
                                 input,
-                                filled_pages,
-                                faults as usize,
                                 scratch_base,
-                                true,
                             )
                         })
                     {
@@ -12908,10 +12762,7 @@ pub(crate) unsafe fn service_sec_image(
                                 process,
                                 a0,
                                 input,
-                                filled_pages,
-                                faults as usize,
                                 scratch_base,
-                                false,
                             )
                         }) {
                             d_a0 = arg;
@@ -13094,7 +12945,7 @@ pub(crate) unsafe fn service_sec_image(
                         let addresses = nt_kernel_exec::user_class::register_class_tail_addresses(sp)?;
                         let tail = addresses.map(|va| {
                             client_read_u64_for(
-                                pi as u64, process, va, filled_pages, faults as usize, scratch_base,
+                                pi as u64, process, va, scratch_base,
                             )
                         });
                         Some((name, version, [tail[0]?, tail[1]?, tail[2]?]))
@@ -13150,29 +13001,21 @@ pub(crate) unsafe fn service_sec_image(
                     let tail0 = client_read_u64_mapped(
                         pi as u64,
                         sp + 0x28,
-                        filled_pages,
-                        faults as usize,
                         scratch_base,
                     );
                     let tail1 = client_read_u64_mapped(
                         pi as u64,
                         sp + 0x30,
-                        filled_pages,
-                        faults as usize,
                         scratch_base,
                     );
                     let tail2 = client_read_u64_mapped(
                         pi as u64,
                         sp + 0x38,
-                        filled_pages,
-                        faults as usize,
                         scratch_base,
                     );
                     let tail3 = client_read_u64_mapped(
                         pi as u64,
                         sp + 0x40,
-                        filled_pages,
-                        faults as usize,
                         scratch_base,
                     );
                     if let (Some(tail0), Some(tail1), Some(tail2)) = (tail0, tail1, tail2) {
@@ -13246,15 +13089,11 @@ pub(crate) unsafe fn service_sec_image(
                         let pbpp = client_read_u64_mapped(
                             pi as u64,
                             sp + 0x28,
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         );
                         let b_internal = client_read_u64_mapped(
                             pi as u64,
                             sp + 0x30,
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         );
                         if let (Some(pbpp), Some(b_internal)) = (pbpp, b_internal) {
@@ -13281,8 +13120,6 @@ pub(crate) unsafe fn service_sec_image(
                                 match stage_unicode_string_output_for_win32k(
                                     pi as u64,
                                     d_a2,
-                                    filled_pages,
-                                    faults as usize,
                                     scratch_base,
                                 ) {
                                     Some(capture) => {
@@ -13301,8 +13138,6 @@ pub(crate) unsafe fn service_sec_image(
                                 match stage_unicode_string_output_for_win32k(
                                     pi as u64,
                                     d_a3,
-                                    filled_pages,
-                                    faults as usize,
                                     scratch_base,
                                 ) {
                                     Some(capture) => {
@@ -13364,8 +13199,6 @@ pub(crate) unsafe fn service_sec_image(
                     let bits = client_read_u64_mapped(
                         pi as u64,
                         sp + 0x28,
-                        filled_pages,
-                        faults as usize,
                         scratch_base,
                     );
                     if let Some(bits) = bits {
@@ -13395,8 +13228,6 @@ pub(crate) unsafe fn service_sec_image(
                                         pi as u64,
                                         bits,
                                         input,
-                                        filled_pages,
-                                        faults as usize,
                                         scratch_base,
                                     ) {
                                         create_bitmap_stack_args = [arg];
@@ -13459,8 +13290,6 @@ pub(crate) unsafe fn service_sec_image(
                             match client_read_u64_mapped(
                                 pi as u64,
                                 sp + 0x28 + i as u64 * 8,
-                                filled_pages,
-                                faults as usize,
                                 scratch_base,
                             ) {
                                 Some(value) => create_dib_section_stack_args[i] = value,
@@ -13515,8 +13344,6 @@ pub(crate) unsafe fn service_sec_image(
                                     pi as u64,
                                     a3,
                                     header_out,
-                                    filled_pages,
-                                    faults as usize,
                                     scratch_base,
                                 ) {
                                     layout_ok = false;
@@ -13583,8 +13410,6 @@ pub(crate) unsafe fn service_sec_image(
                                         pi as u64,
                                         a3,
                                         bmi_out,
-                                        filled_pages,
-                                        faults as usize,
                                         scratch_base,
                                     )
                                 };
@@ -13649,8 +13474,6 @@ pub(crate) unsafe fn service_sec_image(
                             match client_read_u64_mapped(
                                 pi as u64,
                                 sp + 0x28 + i as u64 * 8,
-                                filled_pages,
-                                faults as usize,
                                 scratch_base,
                             ) {
                                 Some(value) => create_dibitmap_stack_args[i] = value,
@@ -13753,8 +13576,6 @@ pub(crate) unsafe fn service_sec_image(
                                         pi as u64,
                                         pj_init,
                                         bits_out,
-                                        filled_pages,
-                                        faults as usize,
                                         scratch_base,
                                     )
                                 };
@@ -13783,8 +13604,6 @@ pub(crate) unsafe fn service_sec_image(
                                             pi as u64,
                                             pbmi,
                                             bmi_out,
-                                            filled_pages,
-                                            faults as usize,
                                             scratch_base,
                                         )
                                     };
@@ -13854,8 +13673,6 @@ pub(crate) unsafe fn service_sec_image(
                             match client_read_u64_mapped(
                                 pi as u64,
                                 sp + 0x28 + i as u64 * 8,
-                                filled_pages,
-                                faults as usize,
                                 scratch_base,
                             ) {
                                 Some(value) => stretch_dibits_stack_args[i] = value,
@@ -13963,8 +13780,6 @@ pub(crate) unsafe fn service_sec_image(
                                         pi as u64,
                                         pj_init,
                                         bits_out,
-                                        filled_pages,
-                                        faults as usize,
                                         scratch_base,
                                     )
                                 };
@@ -13990,8 +13805,6 @@ pub(crate) unsafe fn service_sec_image(
                                         pi as u64,
                                         pbmi,
                                         bmi_out,
-                                        filled_pages,
-                                        faults as usize,
                                         scratch_base,
                                     ) {
                                         stretch_dibits_stack_args[0] = cy_dst;
@@ -14059,8 +13872,6 @@ pub(crate) unsafe fn service_sec_image(
                             match client_read_u64_mapped(
                                 pi as u64,
                                 sp + 0x28 + i as u64 * 8,
-                                filled_pages,
-                                faults as usize,
                                 scratch_base,
                             ) {
                                 Some(value) => tail[i] = value,
@@ -14150,8 +13961,6 @@ pub(crate) unsafe fn service_sec_image(
                                                 staged_rect as *mut u8,
                                                 16,
                                             ),
-                                            filled_pages,
-                                            faults as usize,
                                             scratch_base,
                                         )
                                     };
@@ -14171,8 +13980,6 @@ pub(crate) unsafe fn service_sec_image(
                                                 staged_dx as *mut u8,
                                                 dx_bytes as usize,
                                             ),
-                                            filled_pages,
-                                            faults as usize,
                                             scratch_base,
                                         )
                                     };
@@ -14192,8 +13999,6 @@ pub(crate) unsafe fn service_sec_image(
                                                 staged_string as *mut u8,
                                                 string_bytes as usize,
                                             ),
-                                            filled_pages,
-                                            faults as usize,
                                             scratch_base,
                                         )
                                     };
@@ -14272,10 +14077,7 @@ pub(crate) unsafe fn service_sec_image(
                                 process,
                                 rect_ptr,
                                 input,
-                                filled_pages,
-                                faults as usize,
                                 scratch_base,
-                                true,
                             )
                         }) {
                             d_a1 = arg;
@@ -14376,10 +14178,7 @@ pub(crate) unsafe fn service_sec_image(
                                 process,
                                 d_a1,
                                 input,
-                                filled_pages,
-                                faults as usize,
                                 scratch_base,
-                                true,
                             )
                         }) {
                             d_a1 = arg;
@@ -14406,20 +14205,16 @@ pub(crate) unsafe fn service_sec_image(
                     let captured = nt_handler.capture_process_identity(pi).and_then(|process| {
                         let addresses = nt_kernel_exec::user_string::three_stack_tail_addresses(sp)?;
                         let pusz_klid = client_read_u64_for(
-                            pi as u64, process, addresses[0],
-                            filled_pages, faults as usize, scratch_base,
+                            pi as u64, process, addresses[0], scratch_base,
                         )?;
                         let dw_new_kl = client_read_u64_for(
-                            pi as u64, process, addresses[1],
-                            filled_pages, faults as usize, scratch_base,
+                            pi as u64, process, addresses[1], scratch_base,
                         )?;
                         let flags = client_read_u64_for(
-                            pi as u64, process, addresses[2],
-                            filled_pages, faults as usize, scratch_base,
+                            pi as u64, process, addresses[2], scratch_base,
                         )?;
                         let staged_klid = capture_required_client_unicode_string_arg(
-                            pi as u64, process, pusz_klid,
-                            filled_pages, faults as usize, scratch_base,
+                            pi as u64, process, pusz_klid, scratch_base,
                         )?;
                         Some((pusz_klid, staged_klid, dw_new_kl, flags))
                     });
@@ -14453,22 +14248,16 @@ pub(crate) unsafe fn service_sec_image(
                     let result_info = client_read_u64_mapped(
                         pi as u64,
                         sp + 0x28,
-                        filled_pages,
-                        faults as usize,
                         scratch_base,
                     );
                     let dw_type = client_read_u64_mapped(
                         pi as u64,
                         sp + 0x30,
-                        filled_pages,
-                        faults as usize,
                         scratch_base,
                     );
                     let ansi = client_read_u64_mapped(
                         pi as u64,
                         sp + 0x38,
-                        filled_pages,
-                        faults as usize,
                         scratch_base,
                     );
                     if let (Some(result_info), Some(dw_type), Some(ansi)) =
@@ -14484,8 +14273,6 @@ pub(crate) unsafe fn service_sec_image(
                                     pi as u64,
                                     result_info,
                                     &mut seed,
-                                    filled_pages,
-                                    faults as usize,
                                     scratch_base,
                                 ) {
                                     message_call_probe_failed = true;
@@ -14538,8 +14325,7 @@ pub(crate) unsafe fn service_sec_image(
                         let addresses = nt_kernel_exec::user_string::three_stack_tail_addresses(sp)?;
                         nt_kernel_exec::user_string::capture_stack_tail(addresses, |address| {
                             client_read_u64_for(
-                                pi as u64, process, address,
-                                filled_pages, faults as usize, scratch_base,
+                                pi as u64, process, address, scratch_base,
                             )
                         })
                     });
@@ -14584,8 +14370,7 @@ pub(crate) unsafe fn service_sec_image(
                         let addresses = nt_kernel_exec::user_string::four_stack_tail_addresses(sp)?;
                         nt_kernel_exec::user_string::capture_stack_tail(addresses, |address| {
                             client_read_u64_for(
-                                pi as u64, process, address,
-                                filled_pages, faults as usize, scratch_base,
+                                pi as u64, process, address, scratch_base,
                             )
                         })
                     });
@@ -14663,8 +14448,6 @@ pub(crate) unsafe fn service_sec_image(
                         let fl = client_read_u64_mapped(
                             pi as u64,
                             sp + 0x28,
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         );
                         if let Some(fl) = fl {
@@ -14716,8 +14499,6 @@ pub(crate) unsafe fn service_sec_image(
                                                 staged_string as *mut u8,
                                                 string_bytes,
                                             ),
-                                            filled_pages,
-                                            faults as usize,
                                             scratch_base,
                                         )
                                     };
@@ -14766,8 +14547,6 @@ pub(crate) unsafe fn service_sec_image(
                         client_read_u64_mapped(
                             pi as u64,
                             sp + 0x28,
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         )
                     } else {
@@ -14777,8 +14556,6 @@ pub(crate) unsafe fn service_sec_image(
                         client_read_u64_mapped(
                             pi as u64,
                             sp + 0x30,
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         )
                     } else {
@@ -14841,8 +14618,6 @@ pub(crate) unsafe fn service_sec_image(
                                         pi as u64,
                                         d_a3,
                                         input,
-                                        filled_pages,
-                                        faults as usize,
                                         scratch_base,
                                     )
                                 };
@@ -14889,8 +14664,6 @@ pub(crate) unsafe fn service_sec_image(
                         client_read_u64_mapped(
                             pi as u64,
                             sp + 0x28,
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         )
                     } else {
@@ -14900,8 +14673,6 @@ pub(crate) unsafe fn service_sec_image(
                         client_read_u64_mapped(
                             pi as u64,
                             sp + 0x30,
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         )
                     } else {
@@ -14911,8 +14682,6 @@ pub(crate) unsafe fn service_sec_image(
                         client_read_u64_mapped(
                             pi as u64,
                             sp + 0x38,
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         )
                     } else {
@@ -14922,8 +14691,6 @@ pub(crate) unsafe fn service_sec_image(
                         client_read_u64_mapped(
                             pi as u64,
                             sp + 0x40,
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         )
                     } else {
@@ -15011,8 +14778,6 @@ pub(crate) unsafe fn service_sec_image(
                                         pi as u64,
                                         d_a1,
                                         input,
-                                        filled_pages,
-                                        faults as usize,
                                         scratch_base,
                                     )
                                 };
@@ -15083,8 +14848,6 @@ pub(crate) unsafe fn service_sec_image(
                     d_a1 = capture_client_devmodew_arg(
                         pi as u64,
                         d_a1,
-                        filled_pages,
-                        faults as usize,
                         scratch_base,
                     );
                     let mut open_dcw_tail_read = false;
@@ -15095,22 +14858,16 @@ pub(crate) unsafe fn service_sec_image(
                         let b_display = client_read_u64_mapped(
                             pi as u64,
                             sp + 0x28,
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         );
                         let hspool = client_read_u64_mapped(
                             pi as u64,
                             sp + 0x30,
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         );
                         let dhpdev_out = client_read_u64_mapped(
                             pi as u64,
                             sp + 0x38,
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         );
                         if let (Some(b_display), Some(hspool), Some(dhpdev_out)) =
@@ -15182,8 +14939,6 @@ pub(crate) unsafe fn service_sec_image(
                             match client_read_u64_mapped(
                                 pi as u64,
                                 sp + 0x28 + i as u64 * 8,
-                                filled_pages,
-                                faults as usize,
                                 scratch_base,
                             ) {
                                 Some(value) => create_window_stack_args[i] = value,
@@ -15208,8 +14963,6 @@ pub(crate) unsafe fn service_sec_image(
                         pi as u64,
                         d_a1,
                         scratch_base,
-                        &mut faults,
-                        filled_pages,
                         &reg,
                         dll_pe_store.as_slice(),
                     );
@@ -15217,8 +14970,6 @@ pub(crate) unsafe fn service_sec_image(
                         pi as u64,
                         d_a2,
                         scratch_base,
-                        &mut faults,
-                        filled_pages,
                         &reg,
                         dll_pe_store.as_slice(),
                     );
@@ -15226,8 +14977,6 @@ pub(crate) unsafe fn service_sec_image(
                         pi as u64,
                         d_a3,
                         scratch_base,
-                        &mut faults,
-                        filled_pages,
                         &reg,
                         dll_pe_store.as_slice(),
                     );
@@ -15270,8 +15019,7 @@ pub(crate) unsafe fn service_sec_image(
                     if d_a1 != 0 {
                         let capture = nt_handler.capture_process_identity(pi).and_then(|process| {
                             prefill_client_large_string_pages_for(
-                                pi as u64, process, d_a1, scratch_base,
-                                filled_pages, faults as usize, &reg, dll_pe_store.as_slice(),
+                                pi as u64, process, d_a1, scratch_base, &reg, dll_pe_store.as_slice(),
                             );
                             try_capture_client_string_arg_for(
                                 pi as u64, process, d_a1, true, true,
@@ -15436,8 +15184,7 @@ pub(crate) unsafe fn service_sec_image(
                 let get_atom_name_capture = if m0 == 0x10ad {
                     let capture = nt_handler.capture_process_identity(pi).and_then(|process| {
                         capture_get_atom_name_out(
-                            pi as u64, process, a1,
-                            filled_pages, faults as usize, scratch_base,
+                            pi as u64, process, a1, scratch_base,
                         )
                     });
                     if let Some(capture) = capture {
@@ -15466,8 +15213,6 @@ pub(crate) unsafe fn service_sec_image(
                     client_read_u64_mapped(
                         pi as u64,
                         sp + 0x28,
-                        filled_pages,
-                        faults as usize,
                         scratch_base,
                     )
                     .is_some()
@@ -15504,8 +15249,6 @@ pub(crate) unsafe fn service_sec_image(
                     let capture = capture_get_class_name_out(
                         pi as u64,
                         a2,
-                        filled_pages,
-                        faults as usize,
                         scratch_base,
                     );
                     if let Some(capture) = capture {
@@ -15527,8 +15270,6 @@ pub(crate) unsafe fn service_sec_image(
                         pi as u64,
                         a0,
                         &mut oa,
-                        filled_pages,
-                        faults as usize,
                         scratch_base,
                     );
                     let object_name = if oa_ok {
@@ -15542,8 +15283,6 @@ pub(crate) unsafe fn service_sec_image(
                             pi as u64,
                             object_name,
                             &mut name,
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         );
                     let name_lengths = if name_ok {
@@ -15562,8 +15301,6 @@ pub(crate) unsafe fn service_sec_image(
                             pi as u64,
                             name_buffer,
                             &mut prefix,
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         );
                     print_str(b"[w32diag] user-object OA ssn=0x");
@@ -15623,8 +15360,6 @@ pub(crate) unsafe fn service_sec_image(
                             pi as u64,
                             name_buffer,
                             name_out,
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         ) {
                             core::ptr::write_unaligned((arg + 0x10) as *mut u64, arg + 0x30);
@@ -16097,8 +15832,6 @@ pub(crate) unsafe fn service_sec_image(
                             pi as u64,
                             a3,
                             scratch_base,
-                            &mut faults,
-                            filled_pages,
                             &reg,
                             dll_pe_store.as_slice(),
                         );
@@ -16245,15 +15978,11 @@ pub(crate) unsafe fn service_sec_image(
                         let string = client_read_u64_mapped(
                             pi as u64,
                             sp + 0x30,
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         );
                         let count = client_read_u64_mapped(
                             pi as u64,
                             sp + 0x38,
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         );
                         if let (Some(string), Some(count)) = (string, count) {
@@ -16268,8 +15997,6 @@ pub(crate) unsafe fn service_sec_image(
                                 pi as u64,
                                 client_out,
                                 dhpdev,
-                                filled_pages,
-                                faults as usize,
                                 scratch_base,
                             )
                         {
@@ -16296,8 +16023,6 @@ pub(crate) unsafe fn service_sec_image(
                             pi as u64,
                             client_needed,
                             &needed.to_le_bytes(),
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         );
                         let handles_to_copy = (needed as u64).min(c_hwnd_forwarded) as usize;
@@ -16310,8 +16035,6 @@ pub(crate) unsafe fn service_sec_image(
                                     staged_list as *const u8,
                                     handles_to_copy * 8,
                                 ),
-                                filled_pages,
-                                faults as usize,
                                 scratch_base,
                             );
                         if !needed_ok || !handles_ok {
@@ -16334,8 +16057,6 @@ pub(crate) unsafe fn service_sec_image(
                         if !copy_back_get_icon_info(
                             pi as u64,
                             get_icon_info_copyout,
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         ) {
                             let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -16387,8 +16108,6 @@ pub(crate) unsafe fn service_sec_image(
                                         staged_tmwi as *const u8,
                                         output_bytes,
                                     ),
-                                    filled_pages,
-                                    faults as usize,
                                     scratch_base,
                                 ));
                         if !tmwi_ok {
@@ -16411,8 +16130,6 @@ pub(crate) unsafe fn service_sec_image(
                             pi as u64,
                             client_size,
                             core::slice::from_raw_parts(staged_size as *const u8, 8),
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         );
                         if !size_ok {
@@ -16441,8 +16158,6 @@ pub(crate) unsafe fn service_sec_image(
                             pi as u64,
                             client_size,
                             core::slice::from_raw_parts(staged_size as *const u8, 8),
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         );
                         let fit_ok = client_fit == 0
@@ -16450,8 +16165,6 @@ pub(crate) unsafe fn service_sec_image(
                                 pi as u64,
                                 client_fit,
                                 core::slice::from_raw_parts(staged_fit as *const u8, 4),
-                                filled_pages,
-                                faults as usize,
                                 scratch_base,
                             );
                         let dx_ok = client_dx == 0
@@ -16460,8 +16173,6 @@ pub(crate) unsafe fn service_sec_image(
                                 pi as u64,
                                 client_dx,
                                 core::slice::from_raw_parts(staged_dx as *const u8, dx_bytes),
-                                filled_pages,
-                                faults as usize,
                                 scratch_base,
                             );
                         if !size_ok || !fit_ok || !dx_ok {
@@ -16494,8 +16205,6 @@ pub(crate) unsafe fn service_sec_image(
                                     staged_buffer as *const u8,
                                     output_bytes,
                                 ),
-                                filled_pages,
-                                faults as usize,
                                 scratch_base,
                             );
                         if !out_ok {
@@ -16519,8 +16228,6 @@ pub(crate) unsafe fn service_sec_image(
                                 pi as u64,
                                 client_bits_out,
                                 core::slice::from_raw_parts(staged_bits_out as *const u8, 8),
-                                filled_pages,
-                                faults as usize,
                                 scratch_base,
                             );
                         if !bits_ok {
@@ -16547,8 +16254,6 @@ pub(crate) unsafe fn service_sec_image(
                                     staged_result as *const u8,
                                     output_bytes,
                                 ),
-                                filled_pages,
-                                faults as usize,
                                 scratch_base,
                             );
                         if !result_ok {
@@ -16878,8 +16583,6 @@ pub(crate) unsafe fn service_sec_image(
                             pi as u64,
                             a0,
                             output,
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         ) {
                             let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -16911,10 +16614,7 @@ pub(crate) unsafe fn service_sec_image(
                                     process,
                                     a0,
                                     &mut msg,
-                                    filled_pages,
-                                    faults as usize,
                                     scratch_base,
-                                    false,
                                 )
                             })
                         };
@@ -16966,8 +16666,6 @@ pub(crate) unsafe fn service_sec_image(
                             if !copy_back_get_class_info(
                                 pi,
                                 capture,
-                                filled_pages,
-                                faults as usize,
                                 scratch_base,
                             ) {
                                 st = 0;
@@ -16980,8 +16678,6 @@ pub(crate) unsafe fn service_sec_image(
                                 pi as u64,
                                 capture,
                                 st,
-                                filled_pages,
-                                faults as usize,
                                 scratch_base,
                             )
                         {
@@ -17060,8 +16756,6 @@ pub(crate) unsafe fn service_sec_image(
                         pml4,
                         a1,
                         userconnect,
-                        filled_pages,
-                        faults as usize,
                         scratch_base,
                     ) {
                         // NtUserProcessConnect (0x10FA) returned STATUS_SUCCESS for this GUI client
@@ -17114,8 +16808,6 @@ pub(crate) unsafe fn service_sec_image(
                     if winlogon_gui_client && m0 == 0x1077 && st != 0 {
                         observe_winlogon_completed_dispatch(
                             win32k_glue::CompletedWin32kDispatch::new(m0, [a0, a1, a2, a3], sp, st),
-                            filled_pages,
-                            faults as usize,
                             scratch_base,
                         );
                     }
@@ -22956,7 +22648,7 @@ unsafe fn dump_hosted_thread_quiesce(
                 ));
             }
             let mut bytes = [0u8; 8];
-            quiesce_copyin_process_bytes(pi, process, va, &mut bytes, procs, pfilled)
+            quiesce_copyin_process_bytes(pi, process, va, &mut bytes, procs)
                 .then(|| u64::from_le_bytes(bytes))
         }
     };
@@ -23024,7 +22716,6 @@ unsafe fn dump_hosted_thread_quiesce(
                 reg,
                 ntdll,
                 procs,
-                pfilled,
             )
         {
             iat_shown += 1;
@@ -23046,7 +22737,6 @@ unsafe fn quiesce_copyin_process_bytes(
     va: u64,
     dst: &mut [u8],
     procs: &[ProcExec],
-    pfilled: &[[u64; 512]],
 ) -> bool {
     let Some(process) = process else {
         return false;
@@ -23059,10 +22749,7 @@ unsafe fn quiesce_copyin_process_bytes(
         process,
         va,
         dst,
-        &pfilled[pi],
-        procs[pi].faults as usize,
         procs[pi].scratch_base,
-        false,
     )
 }
 
@@ -23076,13 +22763,12 @@ unsafe fn print_quiesce_iat_call_site(
     reg: &nt_dll_registry::Registry,
     ntdll: (u64, &nt_pe_loader::PeFile),
     procs: &[ProcExec],
-    pfilled: &[[u64; 512]],
 ) -> bool {
     let Some(insn_address) = return_address.checked_sub(6) else {
         return false;
     };
     let mut insn = [0u8; 6];
-    if !quiesce_copyin_process_bytes(pi, process, insn_address, &mut insn, procs, pfilled) {
+    if !quiesce_copyin_process_bytes(pi, process, insn_address, &mut insn, procs) {
         return false;
     }
     if insn[0] != 0xff || insn[1] != 0x15 {
@@ -23099,7 +22785,7 @@ unsafe fn print_quiesce_iat_call_site(
     };
     let mut target_bytes = [0u8; 8];
     let target =
-        if quiesce_copyin_process_bytes(pi, process, slot_address, &mut target_bytes, procs, pfilled) {
+        if quiesce_copyin_process_bytes(pi, process, slot_address, &mut target_bytes, procs) {
             Some(u64::from_le_bytes(target_bytes))
         } else {
             None
@@ -26372,8 +26058,6 @@ unsafe fn prefill_client_large_string_pages(
     pi: u64,
     descriptor_va: u64,
     scratch_base: u64,
-    faults: &mut u64,
-    filled_pages: &mut [u64; 512],
     reg: &nt_dll_registry::Registry,
     dll_pes: &[Option<nt_pe_loader::PeFile>],
 ) {
@@ -26382,8 +26066,6 @@ unsafe fn prefill_client_large_string_pages(
         pi,
         descriptor_va,
         &mut raw,
-        filled_pages,
-        *faults as usize,
         scratch_base,
     ) {
         return;
@@ -26414,14 +26096,12 @@ unsafe fn prefill_client_large_string_pages_for(
     process: nt_memory_manager::ProcessIdentity,
     descriptor_va: u64,
     scratch_base: u64,
-    filled_pages: &[u64; 512],
-    nfilled: usize,
     reg: &nt_dll_registry::Registry,
     dll_pes: &[Option<nt_pe_loader::PeFile>],
 ) {
     let mut raw = [0u8; 16];
     if !img_spawn::client_copyin_process_mapped_for(
-        pi, process, descriptor_va, &mut raw, filled_pages, nfilled, scratch_base, true,
+        pi, process, descriptor_va, &mut raw, scratch_base,
     ) {
         return;
     }

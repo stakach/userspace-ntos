@@ -161,8 +161,6 @@ impl CallbackTransfer {
                 u64::from(client.pi),
                 layout.input_pointer,
                 &self.input[..request.input_length as usize],
-                &[],
-                0,
                 client.scratch_base,
             )
         {
@@ -173,8 +171,6 @@ impl CallbackTransfer {
                 u64::from(client.pi),
                 layout.input_pointer + win32k_glue::WINDOWPROC_LPARAM_OFFSET,
                 &reference.to_le_bytes(),
-                &[],
-                0,
                 client.scratch_base,
             ) {
                 return Err(UNSUCCESSFUL);
@@ -189,8 +185,6 @@ impl CallbackTransfer {
             u64::from(client.pi),
             prepared.layout.frame_pointer,
             bytes,
-            &[],
-            0,
             client.scratch_base,
         ) {
             return Err(UNSUCCESSFUL);
