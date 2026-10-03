@@ -29,10 +29,8 @@ struct Work {
     provider_instance: DriverInstance,
     caller: NativeHandleCaller,
     actor: NativeThreadProcessReference,
-    route: nt_component_suspension::peer_registry::PeerRoute,
-    dispatch: nt_component_suspension::LaneDispatchIdentity,
-    reply: u64,
-    token: u64,
+    origin: hosted_forward_origin::HostedForwardOrigin,
+    source_published: bool,
     retained: Option<RetainedQueryInformationForward>,
     terminal: Option<TerminalQueryInformationForward>,
     canonical_irp: Option<IrpId>,
@@ -41,7 +39,6 @@ struct Work {
     source_released: bool,
     initial_status: Option<i32>,
     cancel_requested: bool,
-    reply_entered: bool,
 }
 
 struct RetainedAck {
@@ -216,10 +213,8 @@ pub(super) unsafe fn submit(
         provider_instance,
         caller,
         actor,
-        route,
-        dispatch,
-        reply,
-        token,
+        origin: hosted_forward_origin::HostedForwardOrigin::new(route, dispatch, reply, token),
+        source_published: false,
         retained: None,
         terminal: None,
         canonical_irp: None,
@@ -228,7 +223,6 @@ pub(super) unsafe fn submit(
         source_released: false,
         initial_status: None,
         cancel_requested: false,
-        reply_entered: false,
     };
     let index = if let Some(index) = slot {
         (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
@@ -257,11 +251,24 @@ impl Work {
         if let Some(ack) = &self.ack {
             return !ack.reply_entered;
         }
-        if self.reply_entered {
+        if self.origin.pending() {
+            if self.origin.stopped() { return self.origin.may_discard(); }
+            if !self.origin.armed() { return false; }
+            if self.origin.completed() { return true; }
+            if self.origin.held() && self.source.callback_requested_free() { return true; }
+            return self.source.completion_command(self.origin.token).is_ok_and(|command|
+                self.origin.terminal_ready(command)) && (self.terminal.is_some() || self.canonical_irp
+                    .is_some_and(|irp| completed_irp_exact(irp.raw()).is_some()));
+        }
+        if self.origin.reply_entered {
             return false;
         }
         if self.initial_status.is_none() {
             return self.provider_dispatch_ready();
+        }
+        if self.initial_status == Some(STATUS_PENDING as i32) {
+            return self.source.completion_command(self.origin.token).is_ok_and(|command|
+                self.origin.terminal_ready(command));
         }
         if self.terminal.is_some() {
             return true;
@@ -586,6 +593,7 @@ impl Work {
     }
 
     unsafe fn advance_stopped_source(&mut self) -> bool {
+        if !self.origin.release_prepared() { return false; }
         if !self.cancel_requested {
             if let Some(retained) = self.retained.as_mut() {
                 retained.request_cancel();
@@ -598,29 +606,44 @@ impl Work {
         if self.retained.is_some() {
             self.poll_provider();
         }
-        if !self.retire_after_terminal(true) {
+        if !self.retire_after_terminal(!self.source.callback_requested_free()) {
             return false;
         }
-        runtime::acknowledge_retained_service_cancellation(
-            self.route,
-            self.dispatch,
-            self.reply,
-            self.token,
-        )
-        .expect("stopped QUERY_INFORMATION Call retirement");
-        true
+        self.origin.retire_receipt()
     }
 
     unsafe fn advance(&mut self, handler: *mut ExecNtHandler) -> bool {
+        if self.origin.pending() {
+            if self.origin.stopped() {
+                if !self.origin.may_discard() { return false; }
+                return self.advance_stopped_source();
+            }
+            if !self.origin.armed() { return false; }
+            if self.retained.is_some() { self.poll_provider(); }
+            if self.terminal.is_none() && self.completion.is_none() { return false; }
+            if !self.source_published {
+                self.publish_source();
+                self.source_published = true;
+            }
+            if self.origin.held() && self.source.callback_requested_free() {
+                self.origin.acknowledge_held_free();
+            }
+            if !self.origin.completed() {
+                let command = self.source.completion_command(self.origin.token)
+                    .expect("pending QUERY exact completion owner");
+                if !self.origin.begin_terminal(command) { return false; }
+            }
+            return self.retire_after_terminal(false) && self.origin.retire_receipt();
+        }
         if self.ack.is_some() {
             return self.advance_ack();
         }
-        if self.reply_entered {
+        if self.origin.reply_entered {
             let acked = runtime::reconcile_retained_service_reply(
-                self.route,
-                self.dispatch,
-                self.reply,
-                self.token,
+                self.origin.route,
+                self.origin.dispatch,
+                self.origin.reply,
+                self.origin.token,
             )
             .expect("QUERY_INFORMATION Reply identity");
             if !acked || self.terminal.is_some() {
@@ -630,24 +653,24 @@ impl Work {
                 return false;
             }
             runtime::retire_stopped_acknowledged_retained_service(
-                self.route,
-                self.dispatch,
-                self.reply,
-                self.token,
+                self.origin.route,
+                self.origin.dispatch,
+                self.origin.reply,
+                self.origin.token,
             )
             .expect("rejected QUERY_INFORMATION service retirement");
             return true;
         }
-        if runtime::retained_service_cancelled(self.route, self.dispatch, self.reply, self.token) {
+        if runtime::retained_service_cancelled(self.origin.route, self.origin.dispatch, self.origin.reply, self.origin.token) {
             if self.retained.is_none() && self.terminal.is_none() && self.canonical_irp.is_none() {
                 if !self.release_unentered_owners() {
                     return false;
                 }
                 runtime::acknowledge_retained_service_cancellation(
-                    self.route,
-                    self.dispatch,
-                    self.reply,
-                    self.token,
+                    self.origin.route,
+                    self.origin.dispatch,
+                    self.origin.reply,
+                    self.origin.token,
                 )
                 .expect("unentered QUERY_INFORMATION cancellation");
                 return true;
@@ -666,34 +689,23 @@ impl Work {
         if self.retained.is_some() {
             self.poll_provider();
         }
-        if self.terminal.is_none() && self.canonical_irp.is_some() {
-            return false;
-        }
-        if self.terminal.is_some() {
-            self.publish_source();
-        }
-        self.reply_entered = true;
         let status = self
             .initial_status
             .expect("QUERY_INFORMATION dispatch status");
-        let accepted = self.terminal.is_some();
-        let _ = if accepted {
-            runtime::wake_query_path_service(
-                self.route,
-                self.dispatch,
-                self.reply,
-                self.token,
-                status,
-            )
+        use nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply;
+        let disposition = if status == STATUS_PENDING as i32 {
+            let command = self.source.completion_command(self.origin.token)
+                .expect("pending QUERY lane owner");
+            if !self.origin.prepare_lane(command) { return false; }
+            HostedForwardDispatchReply::Pending
+        } else if self.terminal.is_some() {
+            self.publish_source();
+            self.source_published = true;
+            HostedForwardDispatchReply::InlineTerminal(self.initial_status.unwrap())
         } else {
-            runtime::wake_query_path_rejected_service(
-                self.route,
-                self.dispatch,
-                self.reply,
-                self.token,
-                status,
-            )
+            HostedForwardDispatchReply::Rejected(status)
         };
+        self.origin.reply_dispatch(disposition, self.source_published);
         false
     }
 }
@@ -775,7 +787,33 @@ pub(super) unsafe fn redrive_nested_ready(handler: *mut ExecNtHandler) -> bool {
     redrive_one(handler, true)
 }
 
-/// A new authenticated Call acknowledges `IoFreeIrp` issued by the source completion routine.
+/// Arm terminal delivery only after the exact source consumed its pending dispatch Reply.
+pub(super) unsafe fn arm_pending(
+    ch: &crate::spawn_hosts::PumpChannel, reply_cap: u64, caller_badge: u64,
+    source_irp_address: u64, token: u64,
+) -> Option<i32> {
+    let Some((_, source_instance)) = instance_for_pump_channel(ch, reply_cap) else {
+        return Some(STATUS_INVALID_HANDLE_LOCAL);
+    };
+    if hosted_driver_pump_caller_tcb(ch, reply_cap, caller_badge).is_none() {
+        return Some(STATUS_INVALID_HANDLE_LOCAL);
+    }
+    let Some(index) = source_work_index(source_instance, source_irp_address) else {
+        return Some(STATUS_INVALID_HANDLE_LOCAL);
+    };
+    if (&*core::ptr::addr_of!(EXECUTING)).iter().any(|(active, _, _)| *active == index) {
+        return Some(STATUS_DEVICE_BUSY_LOCAL);
+    }
+    let Some(work) = (&mut *core::ptr::addr_of_mut!(WORK))[index].as_mut() else {
+        return Some(STATUS_INVALID_HANDLE_LOCAL);
+    };
+    if crate::provider_registry_caller::resolve(ch) != Ok(work.caller)
+        || runtime::channel_route(ch).ok().flatten() != Some(work.origin.route)
+        || work.source.completion_command(token).is_err()
+    { return Some(STATUS_INVALID_HANDLE_LOCAL); }
+    Some(work.origin.arm(token).err().unwrap_or(STATUS_SUCCESS))
+}
+
 pub(super) unsafe fn acknowledge(
     ch: &crate::spawn_hosts::PumpChannel,
     reply_cap: u64,
@@ -804,7 +842,7 @@ pub(super) unsafe fn acknowledge(
         return Some(STATUS_INVALID_HANDLE_LOCAL);
     }
     if work.ack.is_some()
-        || !work.reply_entered
+        || !work.origin.reply_entered
         || work.terminal.is_none()
         || !work.source.callback_requested_free()
     {
@@ -812,10 +850,10 @@ pub(super) unsafe fn acknowledge(
     }
     if !matches!(
         runtime::reconcile_retained_service_reply(
-            work.route,
-            work.dispatch,
-            work.reply,
-            work.token,
+            work.origin.route,
+            work.origin.dispatch,
+            work.origin.reply,
+            work.origin.token,
         ),
         Ok(true)
     ) {
@@ -825,7 +863,7 @@ pub(super) unsafe fn acknowledge(
         .validate_source()
         .expect("ACK QUERY_INFORMATION IRP and File identity");
     let route = match runtime::channel_route(ch) {
-        Ok(Some(route)) if route == work.route => route,
+        Ok(Some(route)) if route == work.origin.route => route,
         _ => return Some(STATUS_INVALID_HANDLE_LOCAL),
     };
     let dispatch = match runtime::dispatch(route) {
@@ -841,10 +879,10 @@ pub(super) unsafe fn acknowledge(
         Err(_) => return Some(STATUS_INSUFFICIENT_RESOURCES_LOCAL),
     };
     runtime::retire_stopped_acknowledged_retained_service(
-        work.route,
-        work.dispatch,
-        work.reply,
-        work.token,
+        work.origin.route,
+        work.origin.dispatch,
+        work.origin.reply,
+        work.origin.token,
     )
     .expect("ACK original QUERY_INFORMATION Reply retirement");
     runtime::park_retained_service(route, token)

@@ -128,6 +128,10 @@ mod hosted_query_path_work;
 mod hosted_write_work;
 #[path = "hosted_read_work.rs"]
 mod hosted_read_work;
+#[path = "hosted_source_completion_lane.rs"]
+mod hosted_source_completion_lane;
+#[path = "hosted_forward_origin.rs"]
+mod hosted_forward_origin;
 #[path = "hosted_flush_work.rs"]
 mod hosted_flush_work;
 #[path = "hosted_query_information_work.rs"]
@@ -8741,14 +8745,23 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                     } else {
                         FSD_SERVICE_WRITE_FORWARD_LABEL
                     };
-                    let (reply_label, status, accepted, _, _) = call_on4(
+                    let (reply_label, status, accepted, token, _) = call_on4(
                         (forward_label << 12) | 4,
                         1,
                         device,
                         irp,
                         0,
                     );
-                    if reply_label != 0 || accepted > 1 {
+                    let typed_forward = matches!(major as u8,
+                        major::IRP_MJ_READ | major::IRP_MJ_FLUSH_BUFFERS | major::IRP_MJ_QUERY_INFORMATION);
+                    let disposition = if typed_forward {
+                        nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply::decode(
+                            status as u32 as i32, accepted,
+                        )
+                    } else { None };
+                    if reply_label != 0 || (typed_forward && disposition.is_none())
+                        || (typed_forward && status as u32 == STATUS_PENDING && token == 0)
+                        || (!typed_forward && accepted > 1) {
                         crate::provider_bugcheck::report(
                             0xc4,
                             [forward_label, 1, irp, reply_label],
@@ -8766,6 +8779,12 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                         (next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64,
                         device,
                     );
+                    if typed_forward && status as u32 == STATUS_PENDING {
+                        let control = (next + WDM_X64_IO_STACK_CONTROL_OFFSET) as *mut u8;
+                        write_unaligned(control, read_unaligned(control) | WDM_X64_SL_PENDING_RETURNED);
+                        hosted_forward_origin::arm_pending(forward_label, irp, token);
+                        return STATUS_PENDING as i32;
+                    }
                     let completion = complete_hosted_irp(irp);
                     let (ack_label, ack_status, _, _, _) = call_on4(
                         (forward_label << 12) | 4,
@@ -54284,6 +54303,13 @@ fn hosted_driver_caller(
                     && row.ingress_route == Some(route))?;
             Some(runtime)
         }
+        PhysicalSourceKind::DispatchWorker { ordinal } => {
+            let runtime = unsafe { hosted_source_completion_lane::worker(instance, ordinal)? };
+            if runtime.domain != domain || runtime.tcb != source.tcb
+                || runtime.pml4 != source.pml4 || runtime.ingress_route != Some(route)
+            { return None; }
+            Some(runtime)
+        }
         _ => return None,
     };
     let (handle, tcb) = runtime.map_or((inst.main_thread_id, inst.tcb), |rt| (rt.handle, rt.tcb));
@@ -54329,9 +54355,14 @@ fn clear_hosted_driver_threads_for_instance(instance: usize) {
             let runtime = (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_RUNTIMES)).as_ref()
                 .and_then(|rows| rows.get(index)).copied();
             let Some(runtime) = runtime.filter(|runtime| runtime.instance == instance) else { continue; };
+            if !hosted_source_completion_lane::begin_worker_retirement(instance, runtime.handle) {
+                continue;
+            }
             let _ = hosted_driver_thread_table_mut(instance).and_then(|table|
                 table.terminate(runtime.handle, nt_status::NtStatus::CANCELLED.raw() as i32).ok());
-            let _ = hosted_thread_resources::retire_thread(instance, runtime.handle);
+            if hosted_thread_resources::retire_thread(instance, runtime.handle) {
+                hosted_source_completion_lane::finish_worker_retirement(instance, runtime.handle);
+            }
         }
     }
 }
@@ -55452,7 +55483,8 @@ fn instance_for_pump_channel(
     ch: &crate::spawn_hosts::PumpChannel,
     active_reply_cap: u64,
 ) -> Option<(usize, DriverInstance)> {
-    let (instance, inst) = instance_by_shared_va(ch.shared_va)?;
+    let (instance, inst) = instance_by_shared_va(ch.shared_va)
+        .or_else(|| unsafe { hosted_source_completion_lane::instance_for_shared(ch.shared_va) })?;
     let captured = nt_io_manager::HostedTransportIdentity {
         domain: ch.physical_domain?,
         endpoint: ch.fault_ep,
@@ -55465,7 +55497,10 @@ fn instance_for_pump_channel(
         vspace: inst.pml4,
         shared: inst.exec_shared_va,
     };
-    if !captured.matches_live(live) || active_reply_cap == 0 {
+    let completion_lane = unsafe {
+        hosted_source_completion_lane::matches_channel(instance, inst, ch)
+    };
+    if (!captured.matches_live(live) && !completion_lane) || active_reply_cap == 0 {
         return None;
     }
     let route = unsafe { crate::spawn_hosts::shared_ingress::owner::runtime::channel_route(ch).ok()?? };
@@ -57388,6 +57423,8 @@ pub(crate) unsafe fn service_hosted_read_forward(
             .map(|status| (status, false)),
         2 if irp == 0 => hosted_read_work::acknowledge(ch, reply_cap, badge, address)
             .map(|status| (status, false)),
+        3 => hosted_read_work::arm_pending(ch, reply_cap, badge, address, irp)
+            .map(|status| (status, false)),
         _ => Some((STATUS_INVALID_PARAMETER, false)),
     }
 }
@@ -57408,6 +57445,8 @@ pub(crate) unsafe fn service_hosted_flush_forward(
         1 => hosted_flush_work::submit(ch, irp, address, badge, reply_cap)
             .map(|status| (status, false)),
         2 if irp == 0 => hosted_flush_work::acknowledge(ch, reply_cap, badge, address)
+            .map(|status| (status, false)),
+        3 => hosted_flush_work::arm_pending(ch, reply_cap, badge, address, irp)
             .map(|status| (status, false)),
         _ => Some((STATUS_INVALID_PARAMETER, false)),
     }
@@ -57439,6 +57478,8 @@ pub(crate) unsafe fn service_hosted_query_information_forward(
         2 if irp == 0 => hosted_query_information_work::acknowledge(
             ch, reply_cap, badge, address,
         ).map(|status| (status, false)),
+        3 => hosted_query_information_work::arm_pending(ch, reply_cap, badge, address, irp)
+            .map(|status| (status, false)),
         _ => Some((STATUS_INVALID_PARAMETER, false)),
     }
 }

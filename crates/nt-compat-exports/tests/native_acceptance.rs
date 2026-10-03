@@ -44,6 +44,8 @@ mod loader_open_output;
 mod pending_file_create_output;
 #[path = "native_acceptance/video_consumer_admission.rs"]
 mod video_consumer_admission;
+#[path = "native_acceptance/source_completion_lane.rs"]
+mod source_completion_lane;
 
 // Executive globals required by the real cache module exercised in the host harness.
 use core::sync::atomic::{AtomicU64, Ordering};

@@ -31,6 +31,16 @@ the exact pending owner and permits one release per operation; duplicate release
 are rejected. These three control WRITEs are additional genuine IRPs, not output
 or completion substitutes.
 
+The source bridge must return `STATUS_PENDING` before the lower IRP completes;
+otherwise the release WRITE cannot be issued. Its dispatch Reply carries a checked
+disposition and the exact retained Work token. A separate arm Call acknowledges
+that return before terminal delivery. Registered ordinary completion workers have
+their own canonical threads and KPCRs, while Work retains the original requestor,
+File, source pin and lower terminal owner. Each active worker is reserved for one
+exact source command; waiting callbacks do not block allocation of another worker.
+Known service waits resume their retained dispatch and accounting, not the original
+completion command. Uncertain execution cannot be replayed or reclaimed.
+
 Each pending operation records its exact File context pointer, monotonic generation
 and per-File CLEANUP/CLOSE counters. Completion requires that identity and counters
 to remain unchanged; unrelated File activity cannot affect this decision. Separate

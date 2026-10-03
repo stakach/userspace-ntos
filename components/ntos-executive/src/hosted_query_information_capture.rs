@@ -44,6 +44,12 @@ pub(super) struct CapturedSourceQueryInformation {
 }
 
 impl CapturedSourceQueryInformation {
+    pub(super) fn completion_command(&self, token: u64) -> Result<hosted_source_completion_lane::SourceCompletionCommand, CaptureError> {
+        self.validate_source()?;
+        Ok(hosted_source_completion_lane::SourceCompletionCommand {
+            ticket: self.source, allocation: self.allocation, token,
+        })
+    }
     pub(super) fn source_irp_address(&self) -> u64 {
         self.allocation.component_address
     }

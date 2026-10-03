@@ -58,6 +58,10 @@ struct Wait {
 #[derive(Clone, Copy)]
 enum ServiceCompletion {
     Status(i32),
+    HostedForward {
+        disposition: nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply,
+        token: u64,
+    },
     QueryPath {
         status: i32,
         accepted: bool,
@@ -79,6 +83,10 @@ impl ServiceCompletion {
     fn words(self) -> (u64, [u64; 4]) {
         match self {
             Self::Status(status) => (1, [status as u32 as u64, 0, 0, 0]),
+            Self::HostedForward { disposition, token } => {
+                let (status, kind) = disposition.words().expect("exact hosted forward disposition");
+                (3, [status as u32 as u64, kind, token, 0])
+            }
             Self::QueryPath { status, accepted } => {
                 (2, [status as u32 as u64, u64::from(accepted), 0, 0])
             }
@@ -307,6 +315,17 @@ pub(crate) unsafe fn retained_service_reply_not_entered(
         })
         .ok_or(Error::Admission)?;
     Ok(wait.phase == WaitPhase::Parked)
+}
+
+pub(crate) unsafe fn wake_hosted_forward_service(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+    disposition: nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply,
+) -> Result<(), Error> {
+    wake_with_completion(route, dispatch, reply, token,
+        ServiceCompletion::HostedForward { disposition, token })
 }
 
 pub(crate) unsafe fn wake_query_path_service(
@@ -560,6 +579,36 @@ pub(crate) unsafe fn retained_service_resume_next_deadline() -> Option<u64> {
 
 /// Finalize ACK bookkeeping when this continuation can reacquire root execution. A primary
 /// remains in its dispatch; an autonomous service finishes only its one Call invocation.
+/// Observe a suspended persistent worker's acknowledged service without advancing it.
+pub(crate) unsafe fn retained_service_resume_ready(
+    route: PeerRoute,
+    expected_dispatch: LaneDispatchIdentity,
+) -> Result<bool, Error> {
+    let source = physical_source(route)?;
+    if !matches!(source.domain, PhysicalDomain::Hosted(_))
+        || !matches!(source.kind, PhysicalSourceKind::DispatchWorker { .. })
+        || dispatch(route)? != expected_dispatch
+    {
+        return Err(Error::Admission);
+    }
+    let Some((reply, token, phase)) = (&*core::ptr::addr_of!(WAITS)).iter()
+        .find(|wait| wait.route == route && wait.dispatch == expected_dispatch
+            && matches!(wait.phase, WaitPhase::Acknowledged | WaitPhase::Resumed))
+        .map(|wait| (wait.reply, wait.token, wait.phase))
+    else { return Ok(false); };
+    if current_reply(route)? != reply {
+        return Err(Error::Admission);
+    }
+    if phase == WaitPhase::Acknowledged
+        && !lanes().can_resume_external(route.identity().lane, reply, token)
+            .map_err(|_| Error::Admission)?
+    {
+        return Ok(false);
+    }
+    // Reply ACK alone is not execution readiness. The next Call must already be retained.
+    Ok(next_message(route)?.is_some())
+}
+
 pub(crate) unsafe fn resume_service(route: PeerRoute) -> Result<bool, Error> {
     let source = physical_source(route)?;
     let Some((dispatch, reply, token, phase)) = (&*core::ptr::addr_of!(WAITS))

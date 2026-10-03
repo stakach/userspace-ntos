@@ -91,8 +91,15 @@ fn physical(instance_index: usize, kind: PhysicalSourceKind) -> Option<(Physical
             }
             (row.tcb, row.cnode)
         }
-        // There is no separate ordinal-based dispatch worker owner in the hosted-driver catalog.
-        PhysicalSourceKind::DispatchWorker { .. } => return None,
+        PhysicalSourceKind::DispatchWorker { ordinal } => {
+            let worker = unsafe { hosted_source_completion_lane::worker(instance_index, ordinal)? };
+            let thread = unsafe { (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_TABLES)) }
+                .as_ref()?.get(instance_index)?.get(worker.handle)?;
+            if worker.domain != domain || worker.pml4 != inst.pml4 || thread.tcb != worker.tcb {
+                return None;
+            }
+            (worker.tcb, worker.cnode)
+        }
     };
     if tcb == 0 || cnode == 0 || cnode == crate::CAP_INIT_THREAD_CNODE {
         return None;
@@ -151,6 +158,7 @@ pub(crate) fn caller_route(
             && matches!(
                 row.physical.kind,
                 PhysicalSourceKind::Primary | PhysicalSourceKind::SystemThread { .. }
+                    | PhysicalSourceKind::DispatchWorker { .. }
             )
             && row.route.is_some_and(|route| route.badge() == badge)
     });
@@ -174,7 +182,10 @@ pub(crate) fn thread_enrollment(instance_index: usize, handle: u64) -> Option<En
             .iter()
             .find(|row| {
                 row.instance == instance_index
-                    && row.physical.kind == PhysicalSourceKind::SystemThread { handle }
+                    && (row.physical.kind == PhysicalSourceKind::SystemThread { handle }
+                        || matches!(row.physical.kind, PhysicalSourceKind::DispatchWorker { ordinal }
+                            if hosted_source_completion_lane::worker(instance_index, ordinal)
+                                .is_some_and(|worker| worker.handle == handle)))
                     && row.physical.domain == domain
                     && row.physical.pml4 == inst.pml4
             })
@@ -286,6 +297,15 @@ pub(crate) unsafe fn enroll_system_thread(
         PhysicalSourceKind::SystemThread { handle },
         reply,
     )
+}
+
+/// A persistent initialized ordinary worker has its own startup/dispatch handshake.
+pub(crate) unsafe fn enroll_completion(
+    instance_index: usize,
+    ordinal: u64,
+    reply: u64,
+) -> Result<PeerRoute, Error> {
+    enroll(instance_index, PhysicalSourceKind::DispatchWorker { ordinal }, reply)
 }
 
 /// Publish the complete stopped lane in the canonical lane store before enrollment. Its dedicated

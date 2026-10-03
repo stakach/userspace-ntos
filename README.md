@@ -74,6 +74,9 @@ cross-domain driver READ, FLUSH, and buffered QUERY_INFORMATION requests,
 including immediate and pending completion through the source driver's event
 and IOSB. READ and QUERY_INFORMATION check exact output bytes; FLUSH checks
 zero completion information.
+Forwarded pending dispatch returns independently of terminal completion. Registered
+ordinary workers execute source completion routines, retaining exact IRP ownership
+and callback continuations without serializing unrelated jobs behind a waiting worker.
 Its controlled pending-error checks correlate actual File generations, untouched
 precompletion buffers, delivered errors and retained-pointer cleanup ordering;
 these are separate from desktop proof and uncertain-effect quarantine.

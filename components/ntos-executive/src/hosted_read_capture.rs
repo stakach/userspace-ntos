@@ -43,6 +43,12 @@ pub(super) struct CapturedSourceRead {
 }
 
 impl CapturedSourceRead {
+    pub(super) fn completion_command(&self, token: u64) -> Result<hosted_source_completion_lane::SourceCompletionCommand, CaptureError> {
+        self.validate_source()?;
+        Ok(hosted_source_completion_lane::SourceCompletionCommand {
+            ticket: self.source, allocation: self.allocation, token,
+        })
+    }
     pub(super) fn source_irp_address(&self) -> u64 { self.allocation.component_address }
     pub(super) fn file_id(&self) -> nt_io_manager::FileId {
         self.source_file.as_ref().expect("source File released").file_id()
