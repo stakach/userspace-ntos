@@ -54,7 +54,8 @@ Any mismatch terminates the real process with STATUS_UNSUCCESSFUL. Nineteen comp
   GUARD page: exact failure status, untouched IOSB, and unchanged shared mode and position.
 - Immediate IOSB completion preserves the AMD64 padding adjacent to the 32-bit Status.
 - Short Standard query must leave IOSB/output untouched.
-- Query class/length/probe ordering versus Read handle/probe ordering.
+- Query class/length/probe ordering versus Read/Write handle/access-before-probe ordering,
+  including a read-only handle with inaccessible IOSB, data, offset and key pointers.
 - NOACCESS and GUARD output spans across an actual VM page boundary.
 - READ output, WRITE input and IOSB spans crossing into a protected page.
 - Failed probes leave current position/content unchanged and supplied Event
@@ -80,7 +81,7 @@ full UTF-16 path and no terminator. Successful names may differ in letter case.
 
 ## Evidence Limits
 
-`case=PASS field=cases actual=...0011 expected=...0011` and `EXIT-REQUEST` mean the
+`case=PASS field=cases actual=...0013 expected=...0013` and `EXIT-REQUEST` mean the
 assertions completed and termination was requested. They are NOT alone proof of
 process exit, completed SMSS wait, desktop or whole-OS acceptance. The parser
 requires every expected group, rejects every actual/expected mismatch and failure

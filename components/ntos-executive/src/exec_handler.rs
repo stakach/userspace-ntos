@@ -39961,9 +39961,6 @@ impl ExecNtHandler {
                 let apc_context = args[3];
                 let completion_port_suppressed =
                     nt_io_completion::io_event_suppresses_completion_port(event);
-                if let Err(status) = self.probe_file_io_output(iosb, None) {
-                    return status;
-                }
                 // A promoted File grant is authoritative even if the process handle was reused.
                 // Capture fresh hosted identity/access before any offset, key or payload copyin.
                 let overlay_file = if self.active_synchronous_file_retry.is_none()
@@ -39976,6 +39973,35 @@ impl ExecNtHandler {
                 let overlay_access = overlay_file.and_then(|_| self.hosted_file_access_for(fh));
                 let hosted_write_capture = overlay_file.is_none()
                     .then(|| self.capture_hosted_file_transfer(fh, true));
+                let overlay_write_access = overlay_file.is_none()
+                    || overlay_access.is_some_and(|access| {
+                        access & (0x0000_0002 | 0x0000_0004 | 0x4000_0000 | 0x1000_0000) != 0
+                    });
+                if !overlay_write_access {
+                    return STATUS_ACCESS_DENIED;
+                }
+                if let Some(Err(status)) = hosted_write_capture.as_ref() {
+                    return *status;
+                }
+                let local_write_route = if overlay_file.is_some() {
+                    match self.local_file_io_route_for(fh) {
+                        Ok(Some(route)) => Some(route),
+                        Ok(None) => return STATUS_INVALID_HANDLE,
+                        Err(status) => return status,
+                    }
+                } else {
+                    None
+                };
+                let _local_reference = match local_write_route {
+                    Some(route) => match self.capture_local_file_io_reference(route.file_object) {
+                        Ok(reference) => Some(reference),
+                        Err(status) => return status,
+                    },
+                    None => None,
+                };
+                if let Err(status) = self.probe_file_io_output(iosb, None) {
+                    return status;
+                }
                 let trace = NT_WRITE_FILE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8;
                 let mut offset_bytes = [0u8; 8];
                 let offset_ok = byte_offset == 0 || self.xas_read(byte_offset, &mut offset_bytes);
@@ -39996,10 +40022,6 @@ impl ExecNtHandler {
                 // The writable overlay keeps its existing copy-loop staging bound. Hosted drivers
                 // stream arbitrary ULONG-sized requests through their per-instance transfer bank.
                 const OVERLAY_IO_CAP: usize = LOCAL_FILE_TRANSFER_CAP;
-                let overlay_write_access = overlay_file.is_none()
-                    || overlay_access.is_some_and(|access| {
-                        access & (0x0000_0002 | 0x0000_0004 | 0x4000_0000 | 0x1000_0000) != 0
-                    });
                 let append_only = overlay_access.is_some_and(|access| {
                     access & (0x0000_0002 | 0x0000_0004 | 0x4000_0000 | 0x1000_0000) == 0x0000_0004
                 });
@@ -40047,8 +40069,6 @@ impl ExecNtHandler {
                     0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
                 } else if !payload_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
-                } else if !overlay_write_access {
-                    STATUS_ACCESS_DENIED
                 } else if apc_completion_conflict {
                     STATUS_INVALID_PARAMETER
                 } else {
@@ -40058,10 +40078,10 @@ impl ExecNtHandler {
                             completion_event_index = event_index;
                             if let Some(file_id) = overlay_file {
                                 operation_started = true;
-                                let route = self.local_file_io_route_for(fh);
+                                let route = local_write_route;
                                 let info = crate::writable_fs::file_object_information(file_id);
                                 match (route, info) {
-                                    (Ok(Some(route)), Ok(info)) => {
+                                    (Some(route), Ok(info)) => {
                                         let resolved =
                                             nt_io_manager::resolve_regular_file_write_offset(
                                                 (byte_offset != 0)
@@ -40076,7 +40096,9 @@ impl ExecNtHandler {
                                             Err(status) => return status.raw() as u32,
                                         };
                                         let actual_offset = resolved.value();
-                                        match self.begin_retained_local_file_io(route.file_object) {
+                                        match self.begin_referenced_local_file_io(
+                                            _local_reference.as_ref().expect("admitted local write lost its body reference"),
+                                        ) {
                                             Err(status) => status,
                                             Ok(request_id) => {
                                                 local_file_io = Some((
@@ -40120,85 +40142,82 @@ impl ExecNtHandler {
                                             }
                                         }
                                     }
-                                    (Err(status), _) | (_, Err(status)) => status,
+                                    (_, Err(status)) => status,
                                     _ => nt_fs::STATUS_INVALID_HANDLE,
                                 }
                             } else {
-                                match hosted_write_capture
+                                let (capture, mode) = hosted_write_capture
                                     .as_ref()
                                     .expect("nonlocal write retains its admitted capture")
-                                {
-                                    Err(handle_status) => *handle_status,
-                                    Ok((capture, mode)) => {
-                                        let route = capture.route;
-                                        let file_id = route.file_id;
-                                        completion_file_id = file_id;
-                                        routed_fs_context = route.fs_context;
-                                        let synchronous = mode.is_synchronous();
-                                        let sync_reply_capacity = if synchronous {
-                                            REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
-                                                && wait_reply_pool_has_free()
-                                        } else {
-                                            true
-                                        };
-                                        let owner_capacity = if sync_reply_capacity {
-                                            self.reserve_pending_file_io_owner()
-                                        } else {
-                                            false
-                                        };
-                                        let prepared = if !owner_capacity || !sync_reply_capacity {
-                                            Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
-                                        } else {
-                                            match self.prepare_hosted_file_io(
-                                                route, fh, capture.granted_access,
-                                            ) {
-                                                Err(status) => Err(status),
-                                                Ok(false) => return STATUS_PENDING,
-                                                Ok(true) => {
-                                                    file_retained = true;
-                                                    match self
-                                                        .file_completion
-                                                        .set_signaled(file_id, false)
-                                                    {
-                                                        Ok(()) => Ok(()),
-                                                        Err(status) => {
-                                                            self.release_file_reference(file_id);
-                                                            file_retained = false;
-                                                            Err(status)
-                                                        }
-                                                    }
+                                    .as_ref()
+                                    .expect("write admission succeeded before user-memory access");
+                                let route = capture.route;
+                                let file_id = route.file_id;
+                                completion_file_id = file_id;
+                                routed_fs_context = route.fs_context;
+                                let synchronous = mode.is_synchronous();
+                                let sync_reply_capacity = if synchronous {
+                                    REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
+                                        && wait_reply_pool_has_free()
+                                } else {
+                                    true
+                                };
+                                let owner_capacity = if sync_reply_capacity {
+                                    self.reserve_pending_file_io_owner()
+                                } else {
+                                    false
+                                };
+                                let prepared = if !owner_capacity || !sync_reply_capacity {
+                                    Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
+                                } else {
+                                    match self.prepare_hosted_file_io(
+                                        route, fh, capture.granted_access,
+                                    ) {
+                                        Err(status) => Err(status),
+                                        Ok(false) => return STATUS_PENDING,
+                                        Ok(true) => {
+                                            file_retained = true;
+                                            match self
+                                                .file_completion
+                                                .set_signaled(file_id, false)
+                                            {
+                                                Ok(()) => Ok(()),
+                                                Err(status) => {
+                                                    self.release_file_reference(file_id);
+                                                    file_retained = false;
+                                                    Err(status)
                                                 }
                                             }
-                                        };
-                                        match prepared {
-                                            Err(status) => status,
-                                            Ok(()) => {
-                                                operation_started = true;
-                                                let mut output = [];
-                                                match self.dispatch_hosted_file_read_write_for(
-                                                    route,
-                                                    major::IRP_MJ_WRITE,
-                                                    nt_io_manager::ReadWriteParameters {
-                                                        length: len as u32,
-                                                        key: key_value,
-                                                        offset: offset_value,
-                                                    },
-                                                    &payload,
-                                                    &mut output,
-                                                ) {
-                                                    Ok((
-                                                        driver_status,
-                                                        completed,
-                                                        pending_irp_id,
-                                                    )) => {
-                                                        routed = true;
-                                                        information = completed;
-                                                        pending_write_irp_id = pending_irp_id;
-                                                        driver_status as u32
-                                                    }
-                                                    Err(route_status) => route_status,
-                                                }
+                                        }
+                                    }
+                                };
+                                match prepared {
+                                    Err(status) => status,
+                                    Ok(()) => {
+                                        operation_started = true;
+                                        let mut output = [];
+                                        match self.dispatch_hosted_file_read_write_for(
+                                            route,
+                                            major::IRP_MJ_WRITE,
+                                            nt_io_manager::ReadWriteParameters {
+                                                length: len as u32,
+                                                key: key_value,
+                                                offset: offset_value,
+                                            },
+                                            &payload,
+                                            &mut output,
+                                        ) {
+                                            Ok((
+                                                driver_status,
+                                                completed,
+                                                pending_irp_id,
+                                            )) => {
+                                                routed = true;
+                                                information = completed;
+                                                pending_write_irp_id = pending_irp_id;
+                                                driver_status as u32
                                             }
+                                            Err(route_status) => route_status,
                                         }
                                     }
                                 }
@@ -40411,9 +40430,6 @@ impl ExecNtHandler {
                 let apc_context = args[3];
                 let completion_port_suppressed =
                     nt_io_completion::io_event_suppresses_completion_port(event);
-                if let Err(status) = self.probe_file_io_output(iosb, None) {
-                    return status;
-                }
                 // Hosted retry ownership precedes all fresh local-handle classification.
                 let fresh_handle = self.active_synchronous_file_retry.is_none()
                     && nt_process::Handle::try_from(fh).is_ok();
@@ -40433,6 +40449,34 @@ impl ExecNtHandler {
                     });
                 let hosted_read_capture = (matches!(disk_file, Ok(None)) && overlay_file.is_none())
                     .then(|| self.capture_hosted_file_transfer(fh, false));
+                if let Err(status) = disk_file {
+                    return status;
+                }
+                if !overlay_read_access {
+                    return STATUS_ACCESS_DENIED;
+                }
+                if let Some(Err(status)) = hosted_read_capture.as_ref() {
+                    return *status;
+                }
+                let local_read_route = if matches!(disk_file, Ok(Some(_))) || overlay_file.is_some() {
+                    match self.local_file_io_route_for(fh) {
+                        Ok(Some(route)) => Some(route),
+                        Ok(None) => return STATUS_INVALID_HANDLE,
+                        Err(status) => return status,
+                    }
+                } else {
+                    None
+                };
+                let _local_reference = match local_read_route {
+                    Some(route) => match self.capture_local_file_io_reference(route.file_object) {
+                        Ok(reference) => Some(reference),
+                        Err(status) => return status,
+                    },
+                    None => None,
+                };
+                if let Err(status) = self.probe_file_io_output(iosb, None) {
+                    return status;
+                }
                 let mut captured_offset_bytes = [0u8; 8];
                 let offset_ok =
                     byte_offset == 0 || self.xas_read(byte_offset, &mut captured_offset_bytes);
@@ -40483,12 +40527,6 @@ impl ExecNtHandler {
                     0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
                 } else if len != 0 && buffer == 0 {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
-                } else if let Err(handle_status) = disk_file {
-                    handle_status
-                } else if !overlay_read_access {
-                    STATUS_ACCESS_DENIED
-                } else if let Some(Err(status)) = hosted_read_capture.as_ref() {
-                    *status
                 } else if apc_completion_conflict {
                     STATUS_INVALID_PARAMETER
                 } else if let Err(status) = self.probe_copy_output(self.pi, buffer, len as u64) {
@@ -40526,8 +40564,8 @@ impl ExecNtHandler {
                                     Err(status) => status.raw() as u32,
                                     Ok(resolved) => {
                                         let offset = resolved.value();
-                                        match self.local_file_io_route_for(fh) {
-                                            Ok(Some(route)) => {
+                                        match local_read_route {
+                                            Some(route) => {
                                                 let plan = match nt_io_manager::BoundedFileReadPlan::new(
                                                     resolved, u64::from(file_size), len,
                                                 ) {
@@ -40535,7 +40573,10 @@ impl ExecNtHandler {
                                                     Err(status) => return status.raw() as u32,
                                                 };
                                                 let output_len = plan.transfer_len();
-                                                match self.begin_retained_local_buffered_io(route.file_object, output_len) {
+                                                match self.begin_referenced_local_buffered_io(
+                                                    _local_reference.as_ref().expect("admitted local read lost its body reference"),
+                                                    output_len,
+                                                ) {
                                                     Err(status) => status,
                                                     Ok(request_id) => {
                                                         local_file_io = Some((
@@ -40570,17 +40611,16 @@ impl ExecNtHandler {
                                                     }
                                                 }
                                             }
-                                            Ok(None) => nt_fs::STATUS_INVALID_HANDLE,
-                                            Err(status) => status,
+                                            None => nt_fs::STATUS_INVALID_HANDLE,
                                         }
                                     }
                                 }
                             } else if let Some(file_id) = overlay_file {
                                 operation_started = true;
-                                let route = self.local_file_io_route_for(fh);
+                                let route = local_read_route;
                                 let info = crate::writable_fs::file_object_information(file_id);
                                 match (route, info) {
-                                    (Ok(Some(route)), Ok(info)) => {
+                                    (Some(route), Ok(info)) => {
                                         let resolved =
                                             nt_io_manager::resolve_regular_file_read_offset(
                                                 (byte_offset != 0).then_some(signed_offset),
@@ -40591,7 +40631,10 @@ impl ExecNtHandler {
                                             Err(status) => status.raw() as u32,
                                             Ok(resolved) => {
                                                 let actual_offset = resolved.value();
-                                                match self.begin_retained_local_buffered_io(route.file_object, len) {
+                                                match self.begin_referenced_local_buffered_io(
+                                                    _local_reference.as_ref().expect("admitted local read lost its body reference"),
+                                                    len,
+                                                ) {
                                                     Err(status) => status,
                                                     Ok(request_id) => {
                                                         local_file_io = Some((
@@ -40635,120 +40678,114 @@ impl ExecNtHandler {
                                             }
                                         }
                                     }
-                                    (Err(status), _) | (_, Err(status)) => status,
+                                    (_, Err(status)) => status,
                                     _ => nt_fs::STATUS_INVALID_HANDLE,
                                 }
                             } else {
-                                match hosted_read_capture
+                                let (capture, mode) = hosted_read_capture
                                     .as_ref()
                                     .expect("nonlocal read retains its admitted capture")
-                                {
-                                    Err(handle_status) => {
-                                        npfs_route_status = *handle_status;
-                                        *handle_status
+                                    .as_ref()
+                                    .expect("read admission succeeded before user-memory access");
+                                let route = capture.route;
+                                npfs_route_status = nt_fs::STATUS_SUCCESS;
+                                let file_id = route.file_id;
+                                npfs_route_fid = route.fs_context;
+                                completion_file_id = file_id;
+                                let synchronous = mode.is_synchronous();
+                                let sync_reply_capacity = if synchronous {
+                                    REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
+                                        && wait_reply_pool_has_free()
+                                } else {
+                                    true
+                                };
+                                let owner_capacity = if sync_reply_capacity {
+                                    self.reserve_pending_file_io_owner()
+                                } else {
+                                    false
+                                };
+                                let prepared = if !owner_capacity || !sync_reply_capacity {
+                                    Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
+                                } else {
+                                    match self.prepare_hosted_file_io(
+                                        route, fh, capture.granted_access,
+                                    ) {
+                                        Err(status) => Err(status),
+                                        Ok(false) => return STATUS_PENDING,
+                                        Ok(true) => {
+                                            file_retained = true;
+                                            match self
+                                                .file_completion
+                                                .set_signaled(file_id, false)
+                                            {
+                                                Ok(()) => Ok(()),
+                                                Err(status) => {
+                                                    self.release_file_reference(file_id);
+                                                    file_retained = false;
+                                                    Err(status)
+                                                }
+                                            }
+                                        }
                                     }
-                                    Ok((capture, mode)) => {
-                                        let route = capture.route;
-                                        npfs_route_status = nt_fs::STATUS_SUCCESS;
-                                        let file_id = route.file_id;
-                                        npfs_route_fid = route.fs_context;
-                                        completion_file_id = file_id;
-                                        let synchronous = mode.is_synchronous();
-                                        let sync_reply_capacity = if synchronous {
-                                            REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
-                                                && wait_reply_pool_has_free()
-                                        } else {
-                                            true
-                                        };
-                                        let owner_capacity = if sync_reply_capacity {
-                                            self.reserve_pending_file_io_owner()
-                                        } else {
-                                            false
-                                        };
-                                        let prepared = if !owner_capacity || !sync_reply_capacity {
-                                            Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
-                                        } else {
-                                            match self.prepare_hosted_file_io(
-                                                route, fh, capture.granted_access,
-                                            ) {
-                                                Err(status) => Err(status),
-                                                Ok(false) => return STATUS_PENDING,
-                                                Ok(true) => {
-                                                    file_retained = true;
-                                                    match self
-                                                        .file_completion
-                                                        .set_signaled(file_id, false)
-                                                    {
-                                                        Ok(()) => Ok(()),
-                                                        Err(status) => {
-                                                            self.release_file_reference(file_id);
-                                                            file_retained = false;
-                                                            Err(status)
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        };
-                                        match prepared {
-                                            Err(status) => status,
-                                            Ok(()) => {
-                                                operation_started = true;
-                                                match self.dispatch_hosted_file_read_write_for(
-                                                    route,
-                                                    major::IRP_MJ_READ,
-                                                    nt_io_manager::ReadWriteParameters {
-                                                        length: len as u32,
-                                                        key: key_value,
-                                                        offset: offset_value,
-                                                    },
-                                                    &[],
-                                                    &mut output,
-                                                ) {
-                                                    Ok((
+                                };
+                                match prepared {
+                                    Err(status) => status,
+                                    Ok(()) => {
+                                        operation_started = true;
+                                        match self.dispatch_hosted_file_read_write_for(
+                                            route,
+                                            major::IRP_MJ_READ,
+                                            nt_io_manager::ReadWriteParameters {
+                                                length: len as u32,
+                                                key: key_value,
+                                                offset: offset_value,
+                                            },
+                                            &[],
+                                            &mut output,
+                                        ) {
+                                            Ok((
+                                                driver_status,
+                                                completed,
+                                                pending_irp_id,
+                                            )) => {
+                                                routed = true;
+                                                information = completed;
+                                                pending_read_irp_id = pending_irp_id;
+                                                let mut driver_status =
+                                                    driver_status as u32;
+                                                let copy_len =
+                                                    (completed as usize).min(output.len());
+                                                if driver_status != STATUS_PENDING
+                                                    && nt_io_completion::file_io_status_copies_output(
                                                         driver_status,
-                                                        completed,
-                                                        pending_irp_id,
-                                                    )) => {
-                                                        routed = true;
-                                                        information = completed;
-                                                        pending_read_irp_id = pending_irp_id;
-                                                        let mut driver_status =
-                                                            driver_status as u32;
-                                                        let copy_len =
-                                                            (completed as usize).min(output.len());
-                                                        if driver_status != STATUS_PENDING
-                                                            && nt_io_completion::file_io_status_copies_output(
-                                                                driver_status,
-                                                            )
-                                                        {
-                                                            if completed > output.len() as u64 {
-                                                                driver_status =
-                                                                    STATUS_INVALID_BUFFER_SIZE;
-                                                                information = 0;
-                                                            } else if copy_len != 0
-                                                                && self.xas_try_write_buf(
-                                                                buffer,
-                                                                &output[..copy_len],
-                                                            ) {
-                                                                self.observe_completed_npfs_read(
-                                                                    file_id,
-                                                                    self.current_badge,
-                                                                    driver_status,
-                                                                    completed,
-                                                                    &output[..copy_len],
-                                                                    true,
-                                                                );
-                                                            } else if copy_len != 0 {
-                                                                driver_status =
-                                                                    STATUS_ACCESS_VIOLATION;
-                                                                information = 0;
-                                                            }
-                                                        }
-                                                        driver_status
+                                                    )
+                                                {
+                                                    if completed > output.len() as u64 {
+                                                        driver_status =
+                                                            STATUS_INVALID_BUFFER_SIZE;
+                                                        information = 0;
+                                                    } else if copy_len != 0
+                                                        && self.xas_try_write_buf(
+                                                        buffer,
+                                                        &output[..copy_len],
+                                                    ) {
+                                                        self.observe_completed_npfs_read(
+                                                            file_id,
+                                                            self.current_badge,
+                                                            driver_status,
+                                                            completed,
+                                                            &output[..copy_len],
+                                                            true,
+                                                        );
+                                                    } else if copy_len != 0 {
+                                                        driver_status =
+                                                            STATUS_ACCESS_VIOLATION;
+                                                        information = 0;
                                                     }
-                                                    Err(route_status) => route_status,
                                                 }
+                                                driver_status
                                             }
+                                            Err(route_status) => route_status,
                                         }
                                     }
                                 }

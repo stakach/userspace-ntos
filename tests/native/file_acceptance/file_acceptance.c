@@ -189,6 +189,7 @@ static void query_cases(HANDLE file)
     status("query-length-before-probe", NtQueryInformationFile((HANDLE)0x12345678, 0, 0, 1, 5), BAD_LENGTH);
     status("query-probe-before-handle", NtQueryInformationFile((HANDLE)0x12345678, 0, storage, 24, 5), AV);
     status("read-handle-before-probe", NtReadFile((HANDLE)0x12345678, 0, 0, 0, 0, 0, 8, 0, 0), BAD_HANDLE);
+    status("write-handle-before-probe", NtWriteFile((HANDLE)0x12345678, 0, 0, 0, 0, 0, 8, 0, 0), BAD_HANDLE);
     ++completed;
 }
 
@@ -376,7 +377,9 @@ void NtProcessStartup(void *peb)
 
     /* A valid read-only File handle cannot grant write access. */
     status("write-readonly-handle", NtWriteFile(reopened, 0, 0, 0, &iosb,
-           (void *)payload, sizeof(payload), &offset, 0), ACCESS_DENIED); ++completed;
+           (void *)payload, sizeof(payload), &offset, 0), ACCESS_DENIED);
+    status("write-access-before-probe", NtWriteFile(reopened, 0, 0, 0, 0,
+           0, sizeof(payload), (int64_t *)1, (uint32_t *)1), ACCESS_DENIED); ++completed;
     OBJECT_ATTRIBUTES wrong_root = attributes(child, &child_name); HANDLE denied = 0;
     status("nondirectory-root", NtOpenFile(&denied, 0x81 | SYNC, &wrong_root, &iosb, 7,
            NON_DIRECTORY | SYNC_NONALERT), NOT_DIRECTORY); ++completed;

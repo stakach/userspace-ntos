@@ -476,3 +476,10 @@ diagnosis-free failure.
   and mounted-hive paths; do not infer progress from reads, timer churn, or filesystem snapshots.
 - Resolve the actual saved PC and retained IPC state before changing watchdog policy. Keep the
   strict desktop gate and hard boot limit; a successful test-harness exit is not desktop proof.
+
+## Referenced Bodies Do Not Reenter Handle Admission
+- Capture access and retain the exact File body before reentrant user-memory probes. Continue
+  through that retained route even if the originating handle closes or is reused.
+- A later operation-start transition must consume referenced-body authority, not repeat a
+  live-handle requirement. Keep fresh admission strict and exclude cleanup-only or counted
+  serializer references from the retained-body proof.

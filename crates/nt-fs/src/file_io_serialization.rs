@@ -25,7 +25,7 @@ impl FileObject {
         self.mode_state.io_mode().expect("admitted local File mode")
     }
 
-    fn minimum_references(&self) -> Result<u32, u32> {
+    pub(super) fn minimum_references(&self) -> Result<u32, u32> {
         if (self.cleanup_reference_held && self.handle_references != 0)
             || (!self.cleanup_reference_held
                 && (self.serialization.cleanup_waiting() || self.serialization.is_cleanup_owner()))

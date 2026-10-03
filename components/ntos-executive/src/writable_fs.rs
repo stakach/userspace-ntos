@@ -2114,6 +2114,10 @@ pub(crate) unsafe fn begin_file_io(file_id: u64) -> Result<(), u32> {
     writable_fs()?.zw_begin_file_io(file_id)
 }
 
+pub(crate) unsafe fn begin_referenced_file_io(file_id: u64) -> Result<(), u32> {
+    writable_fs()?.zw_begin_referenced_file_io(file_id)
+}
+
 pub(crate) unsafe fn release_io_reference(file_id: u64) -> Result<(), u32> {
     let fs = writable_fs()?;
     let result = fs.zw_release_io_reference(file_id);

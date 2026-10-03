@@ -26,6 +26,13 @@ fn open_generation(id: u32) -> u32 {
     id >> OPEN_SLOT_BITS
 }
 
+fn duplicate_body_reference(references: u16, handle_references: u16) -> Result<u16, u32> {
+    if references <= handle_references {
+        return Err(STATUS_INVALID_HANDLE);
+    }
+    references.checked_add(1).ok_or(STATUS_QUOTA_EXCEEDED)
+}
+
 pub const FILE_DIRECTORY_INFORMATION: u32 = 1;
 pub const FILE_FULL_DIRECTORY_INFORMATION: u32 = 2;
 pub const FILE_BOTH_DIRECTORY_INFORMATION: u32 = 3;
@@ -389,6 +396,17 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
         Ok(())
     }
 
+    /// Duplicate an I/O reference already held by an admitted operation.
+    pub fn retain_referenced_io(&mut self, id: u32) -> Result<(), u32> {
+        let slot = self
+            .slots
+            .get_mut(open_slot(id))
+            .filter(|slot| slot.occupied && slot.generation == open_generation(id))
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        slot.references = duplicate_body_reference(slot.references, slot.handle_references)?;
+        Ok(())
+    }
+
     pub fn retain_io(&mut self, id: u32) -> Result<(), u32> {
         let slot = self
             .slots
@@ -704,6 +722,17 @@ impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
             .ok_or(STATUS_QUOTA_EXCEEDED)?;
         slot.references = references;
         slot.handle_references = handle_references;
+        Ok(())
+    }
+
+    /// Duplicate an I/O reference already held by an admitted operation.
+    pub fn retain_referenced_io(&mut self, id: u32) -> Result<(), u32> {
+        let slot = self
+            .slots
+            .get_mut(open_slot(id))
+            .filter(|slot| slot.occupied && slot.generation == open_generation(id))
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        slot.references = duplicate_body_reference(slot.references, slot.handle_references)?;
         Ok(())
     }
 
@@ -1372,6 +1401,56 @@ mod tests {
         assert_eq!(table.set_signaled(object, true), Ok(()));
         table.release_io(object).unwrap();
         assert_eq!(table.get(object), Err(STATUS_INVALID_HANDLE));
+    }
+
+    #[test]
+    fn directory_referenced_io_survives_probe_handle_close() {
+        let mut table = DirectoryOpenTable::<1>::new();
+        let create = |table: &mut DirectoryOpenTable<1>| table.create(
+            41, b"directory", 0, 0, 0, crate::FileMetadata::default(),
+            crate::FatShortName::EMPTY,
+        ).unwrap();
+        let object = create(&mut table);
+        table.retain_io(object).unwrap();
+        table.release(object).unwrap();
+        assert_eq!(table.retain_io(object), Err(STATUS_INVALID_HANDLE));
+        table.retain_referenced_io(object).unwrap();
+        table.release_io(object).unwrap();
+        assert!(table.get(object).is_ok());
+        table.release_io(object).unwrap();
+        assert_eq!(table.retain_referenced_io(object), Err(STATUS_INVALID_HANDLE));
+        let reused = create(&mut table);
+        assert_ne!(reused, object);
+        assert_eq!(table.retain_referenced_io(reused), Err(STATUS_INVALID_HANDLE));
+        table.retain_io(reused).unwrap();
+        assert_eq!(table.retain_referenced_io(object), Err(STATUS_INVALID_HANDLE));
+        table.release_io(reused).unwrap();
+        table.release(reused).unwrap();
+    }
+
+    #[test]
+    fn readonly_file_referenced_io_survives_probe_handle_close() {
+        let mut table = ReadOnlyFileOpenTable::<1>::new();
+        let create = |table: &mut ReadOnlyFileOpenTable<1>| table.create(
+            41, 64, b"file", crate::FILE_READ_DATA, 0, 0,
+            crate::FileMetadata::default(), crate::FatShortName::EMPTY,
+        ).unwrap();
+        let object = create(&mut table);
+        table.retain_io(object).unwrap();
+        table.release(object).unwrap();
+        assert_eq!(table.retain_io(object), Err(STATUS_INVALID_HANDLE));
+        table.retain_referenced_io(object).unwrap();
+        table.release_io(object).unwrap();
+        assert!(table.get(object).is_ok());
+        table.release_io(object).unwrap();
+        assert_eq!(table.retain_referenced_io(object), Err(STATUS_INVALID_HANDLE));
+        let reused = create(&mut table);
+        assert_ne!(reused, object);
+        assert_eq!(table.retain_referenced_io(reused), Err(STATUS_INVALID_HANDLE));
+        table.retain_io(reused).unwrap();
+        assert_eq!(table.retain_referenced_io(object), Err(STATUS_INVALID_HANDLE));
+        table.release_io(reused).unwrap();
+        table.release(reused).unwrap();
     }
 
     #[test]

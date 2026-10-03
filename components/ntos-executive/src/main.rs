@@ -24617,6 +24617,11 @@ impl ExecDirectoryOpens {
         unsafe { (&mut *self.table).retain_io(id) }
     }
 
+    fn retain_referenced_io(&mut self, id: u32) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).retain_referenced_io(id) }
+    }
+
     fn set_signaled(&mut self, id: u32, signaled: bool) -> Result<(), u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).set_signaled(id, signaled) }
@@ -24714,6 +24719,11 @@ impl ExecReadOnlyFileOpens {
     fn retain_io(&mut self, id: u32) -> Result<(), u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).retain_io(id) }
+    }
+
+    fn retain_referenced_io(&mut self, id: u32) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).retain_referenced_io(id) }
     }
 
     fn set_signaled(&mut self, id: u32, signaled: bool) -> Result<(), u32> {
