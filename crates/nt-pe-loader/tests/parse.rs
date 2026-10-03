@@ -7,6 +7,9 @@ use nt_pe_loader::{
     LoaderWritablePageState, PeError, PeFile, Protection,
 };
 
+#[path = "parse/raw_relocation.rs"]
+mod raw_relocation;
+
 // --- a minimal PE32+ image builder -----------------------------------------
 
 const NT_OFF: usize = 0x40;
@@ -630,7 +633,7 @@ fn unsupported_relocation_kind_marks_only_its_page_loader_writable() {
     let mut reloc = vec![0u8; 0];
     reloc.extend_from_slice(&data_va.to_le_bytes());
     reloc.extend_from_slice(&12u32.to_le_bytes());
-    reloc.extend_from_slice(&(3u16 << 12).to_le_bytes()); // unsupported by the applier
+    reloc.extend_from_slice(&(6u16 << 12).to_le_bytes()); // reserved relocation type
     reloc.extend_from_slice(&0u16.to_le_bytes());
 
     let sections = [
@@ -652,7 +655,7 @@ fn unsupported_relocation_kind_marks_only_its_page_loader_writable() {
     let pe = PeFile::parse(&pe_bytes).unwrap();
     assert_eq!(
         pe.relocations().unwrap_err(),
-        PeError::UnsupportedRelocation(3)
+        PeError::UnsupportedRelocation(6)
     );
     assert_eq!(pe.page_has_loader_writable_state(data_va).unwrap(), true);
     assert_eq!(

@@ -22,6 +22,7 @@ pub mod load_failure;
 pub mod module_namespace;
 mod imports;
 mod relocs;
+mod relocation_snapshot;
 mod rva;
 
 pub use exports::ExportedSymbol;
@@ -33,6 +34,7 @@ pub use image::MappedImage;
 pub use image_page_fill::{ImagePageFileSpan, ImagePageFillPlan, IMAGE_PAGE_SIZE};
 pub use imports::{ImportRef, ImportedDll};
 pub use relocs::{RelocKind, Relocation};
+pub use relocation_snapshot::relocate_file_snapshot;
 
 /// A valid `__security_cookie` (`/GS`) seed. MSVC's x64 `__security_check_cookie`
 /// validates that the cookie's **top 16 bits are zero** (`rol rcx,0x10; test cx,0xffff`)
@@ -162,11 +164,12 @@ pub enum PeError {
     ImportTableInvalid,
     /// The base-relocation table is malformed.
     RelocationInvalid,
-    /// A base-relocation type this loader does not implement (only `DIR64` +
-    /// `ABSOLUTE` are supported).
+    /// A base-relocation type outside NT's ABSOLUTE/HIGH/LOW/HIGHLOW/DIR64 set.
     UnsupportedRelocation(u16),
     /// A relocation / IAT patch target is out of the mapped image.
     PatchOutOfBounds,
+    /// A checked relocation plan could not reserve its owned storage.
+    InsufficientResources,
 }
 
 /// Which PE directory prevented a loader-writable page classification.

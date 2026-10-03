@@ -1,5 +1,4 @@
-//! Base-relocation parsing (spec §7.2). Only `DIR64` (applied) and `ABSOLUTE`
-//! (padding) are supported; any other type is rejected.
+//! Checked base-relocation parsing and NT fixup arithmetic.
 
 use alloc::vec::Vec;
 
@@ -12,10 +11,43 @@ pub const IMAGE_REL_BASED_DIR64: u16 = 10;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RelocKind {
+    High,
+    Low,
+    HighLow,
     /// Add the image delta to the 64-bit value at `rva`.
     Dir64,
     /// Padding entry (no-op).
     Absolute,
+}
+
+impl RelocKind {
+    pub(crate) const fn width(self) -> usize {
+        match self {
+            Self::Absolute => 0,
+            Self::High | Self::Low => 2,
+            Self::HighLow => 4,
+            Self::Dir64 => 8,
+        }
+    }
+
+    pub(crate) fn apply(self, target: &mut [u8], delta: u64) {
+        match self {
+            Self::Absolute => {}
+            Self::High | Self::Low => {
+                let value = u16::from_le_bytes(target.try_into().unwrap());
+                let addend = if self == Self::High { (delta >> 16) as u16 } else { delta as u16 };
+                target.copy_from_slice(&value.wrapping_add(addend).to_le_bytes());
+            }
+            Self::HighLow => {
+                let value = u32::from_le_bytes(target.try_into().unwrap());
+                target.copy_from_slice(&value.wrapping_add(delta as u32).to_le_bytes());
+            }
+            Self::Dir64 => {
+                let value = u64::from_le_bytes(target.try_into().unwrap());
+                target.copy_from_slice(&value.wrapping_add(delta).to_le_bytes());
+            }
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -33,23 +65,38 @@ pub fn parse_relocations(
     if dir.virtual_address == 0 || dir.size == 0 {
         return Ok(Vec::new());
     }
+    let directory_end = dir.virtual_address.checked_add(dir.size)
+        .ok_or(PeError::RelocationInvalid)?;
+    if directory_end > headers.size_of_image {
+        return Err(PeError::RelocationInvalid);
+    }
     let base_off = rva_to_file_offset(sections, dir.virtual_address)?;
     let total = dir.size as usize;
+    let section = sections.iter().find(|section| {
+        dir.virtual_address.checked_sub(section.virtual_address).is_some_and(|offset| {
+            offset <= section.size_of_raw_data && dir.size <= section.size_of_raw_data - offset
+        })
+    }).ok_or(PeError::RelocationInvalid)?;
+    let expected_off = (section.pointer_to_raw_data as usize)
+        .checked_add((dir.virtual_address - section.virtual_address) as usize)
+        .ok_or(PeError::RelocationInvalid)?;
+    if base_off != expected_off { return Err(PeError::RelocationInvalid); }
+    let end = base_off.checked_add(total).ok_or(PeError::RelocationInvalid)?;
+    let directory = b.get(base_off..end).ok_or(PeError::RelocationInvalid)?;
 
     let mut out = Vec::new();
+    out.try_reserve_exact(total / 2).map_err(|_| PeError::InsufficientResources)?;
     let mut pos = 0usize;
-    while pos + 8 <= total {
-        let block_off = base_off
-            .checked_add(pos)
-            .ok_or(PeError::RelocationInvalid)?;
-        let page_va = u32_at(b, block_off)?;
-        let block_size = u32_at(b, block_off + 4)? as usize;
-        if block_size < 8 || pos + block_size > total {
+    while pos < total {
+        if total - pos < 8 { return Err(PeError::RelocationInvalid); }
+        let page_va = u32_at(directory, pos)?;
+        let block_size = u32_at(directory, pos + 4)? as usize;
+        if block_size < 8 || block_size % 2 != 0 || block_size > total - pos {
             return Err(PeError::RelocationInvalid);
         }
         let entries = (block_size - 8) / 2;
         for i in 0..entries {
-            let entry = u16_at(b, block_off + 8 + i * 2)?;
+            let entry = u16_at(directory, pos + 8 + i * 2)?;
             let kind = (entry >> 12) & 0xf;
             let offset = (entry & 0x0fff) as u32;
             let rva = page_va
@@ -64,6 +111,9 @@ pub fn parse_relocations(
                     rva,
                     kind: RelocKind::Dir64,
                 }),
+                1 => out.push(Relocation { rva, kind: RelocKind::High }),
+                2 => out.push(Relocation { rva, kind: RelocKind::Low }),
+                3 => out.push(Relocation { rva, kind: RelocKind::HighLow }),
                 other => return Err(PeError::UnsupportedRelocation(other)),
             }
         }
