@@ -503,3 +503,9 @@ diagnosis-free failure.
   frame and its acknowledged alias, or its retained source capability.
 - Demand-fill history is an observation, not replacement backing after retirement.
   A failed exact backing lookup must not fall through to a computed mirror.
+
+## Verify The Regression Failure Point
+- Inspect the full failure, not just the test count or exit code. A fixture
+  rejected at admission does not reproduce the later behavior it claims to test.
+- Give retained-owner fixtures valid reservation identities before testing
+  output ordering, and keep setup failures separate from behavioral evidence.

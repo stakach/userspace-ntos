@@ -54,24 +54,60 @@ fn open_file_outputs_are_probed_before_object_attributes_or_loader_effects() {
 
 #[test]
 fn checked_loader_publication_commits_handle_before_iosb_without_late_rollback() {
-    let function = handler_function("publish_loader_file_open_result");
-    let Some(syn::Stmt::Expr(syn::Expr::Try(first), _)) = function.block.stmts.first() else {
-        panic!("Handle copy must propagate its exact fault before IOSB publication");
-    };
-    let syn::Expr::MethodCall(handle) = &*first.expr else { panic!("checked Handle copy"); };
-    assert_eq!(handle.method, "process_memory_write_status");
-    assert!(matches!(handle.args.iter().nth(1), Some(syn::Expr::Path(path))
-        if path.path.is_ident("file_handle_out")));
+    let function = handler_function("publish_file_create_result");
+    struct CheckedPublisher(bool);
+    impl<'ast> Visit<'ast> for CheckedPublisher {
+        fn visit_expr_call(&mut self, expression: &'ast syn::ExprCall) {
+            if matches!(&*expression.func, syn::Expr::Path(path)
+                if path.path.segments.last().is_some_and(|part|
+                    part.ident == "publish_file_create_result_checked"))
+            {
+                assert_eq!(expression.args.len(), 6);
+                for (index, expected) in ["file_handle_out", "iosb", "handle", "status", "information"]
+                    .iter().enumerate()
+                {
+                    assert!(matches!(expression.args.iter().nth(index), Some(syn::Expr::Path(path))
+                        if path.path.is_ident(*expected)), "preserved {expected} publication argument");
+                }
+                let Some(syn::Expr::Closure(copy)) = expression.args.last() else {
+                    panic!("shared publisher requires the actual checked memory-copy boundary");
+                };
+                assert!(matches!(&*copy.body, syn::Expr::MethodCall(call)
+                    if call.method == "process_memory_write_checked"
+                        && matches!(call.args.first(), Some(syn::Expr::Field(field))
+                            if matches!(&field.member, syn::Member::Named(name) if name == "pi"))),
+                    "publication callback preserves target process identity and typed failure");
+                self.0 = true;
+            }
+            syn::visit::visit_expr_call(self, expression);
+        }
+    }
+    let mut checked = CheckedPublisher(false);
+    checked.visit_block(&function.block);
+    assert!(checked.0, "live native helper delegates to the tested status-aware checked publisher");
     let mut calls = Calls::default();
     calls.visit_block(&function.block);
-    let handle = calls.0.iter().position(|name| name == "process_memory_write_status").unwrap();
-    let iosb = calls.0.iter().position(|name| name == "publish_file_io_status").unwrap();
-    assert!(handle < iosb, "canonical IOSB publisher orders Information then Status after Handle");
     assert!(!calls.0.iter().any(|name| matches!(name.as_str(),
-        "close_current_handle" | "close_process_handle" | "release_handle" | "queue_write")),
+        "close_current_handle" | "close_process_handle" | "close_process_handle_checked"
+        | "release_handle" | "queue_write" | "process_memory_write_status" | "publish_file_io_status")),
         "a late fault must not invalidate the already committed handle or discard publication errors");
     assert!(calls.0.iter().any(|name| name == "map_err"),
         "IOSB copy failure preserves its typed fault status");
+    struct FaultStatus(bool);
+    impl<'ast> Visit<'ast> for FaultStatus {
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if call.method == "map_err" {
+                self.0 |= matches!(call.args.first(), Some(syn::Expr::Path(path))
+                    if path.path.segments.len() >= 2
+                        && path.path.segments[path.path.segments.len() - 2].ident == "MemoryCopyFailure"
+                        && path.path.segments.last().unwrap().ident == "status");
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+    let mut fault = FaultStatus(false);
+    fault.visit_block(&function.block);
+    assert!(fault.0, "the returned copy exception is not collapsed or replaced");
 }
 
 #[test]
@@ -95,7 +131,7 @@ fn loader_open_result_uses_checked_publication_not_fire_and_forget_writes() {
     let arm = arm.0.expect("successful canonical loader File branch");
     let mut calls = Calls::default();
     calls.visit_block(&arm);
-    assert!(calls.0.iter().any(|name| name == "publish_loader_file_open_result"),
+    assert!(calls.0.iter().any(|name| name == "publish_file_create_result"),
         "loader branch uses checked Handle then IOSB publication");
     assert!(!calls.0.iter().any(|name| matches!(name.as_str(),
         "smss_stack_write" | "smss_stack_write32" | "queue_write"
@@ -108,7 +144,7 @@ fn loader_open_result_uses_checked_publication_not_fire_and_forget_writes() {
                 if let (syn::Pat::TupleStruct(pattern), syn::Expr::MethodCall(call)) =
                     (&*condition.pat, &*condition.expr)
                 {
-                    if pattern.path.is_ident("Err") && call.method == "publish_loader_file_open_result" {
+                    if pattern.path.is_ident("Err") && call.method == "publish_file_create_result" {
                         let Some(syn::Pat::Ident(status)) = pattern.elems.first() else { panic!("fault binding"); };
                         self.0 = expression.then_branch.stmts.iter().any(|statement|
                             matches!(statement, syn::Stmt::Expr(syn::Expr::Return(return_), _)
@@ -154,7 +190,7 @@ fn internal_loader_record_failure_retires_only_its_unpublished_minted_handle() {
                     let mut calls = Calls::default();
                     calls.visit_block(&expression.then_branch);
                     assert!(!calls.0.iter().any(|name| matches!(name.as_str(),
-                        "close_current_handle" | "close_process_handle" | "publish_loader_file_open_result")),
+                        "close_current_handle" | "close_process_handle" | "publish_file_create_result")),
                         "rollback is checked and cannot publish the failed open");
                     self.0 = true;
                 }
@@ -165,4 +201,20 @@ fn internal_loader_record_failure_retires_only_its_unpublished_minted_handle() {
     let mut failure = RecordFailure(false);
     failure.visit_block(&open_service().block);
     assert!(failure.0, "loader record admission failure boundary exists");
+}
+
+#[test]
+fn finalized_open_routes_share_checked_publication_without_error_output_stores() {
+    for name in ["nt_open_file_service", "create_registered_kernel_file"] {
+        let function = handler_function(name);
+        let mut calls = Calls::default();
+        calls.visit_block(&function.block);
+        assert!(calls.0.iter().any(|name| name == "publish_file_create_result"),
+            "{name} must use the common status-aware publication boundary");
+        assert!(!calls.0.iter().any(|name| matches!(name.as_str(),
+            "queue_write" | "xas_write_buf" | "xas_try_write_buf"
+            | "smss_stack_write" | "smss_stack_write32" | "write_nt_open_file_handle_out"
+            | "publish_loader_file_open_result")),
+            "{name} cannot retain a private unchecked or unconditional final-output path");
+    }
 }

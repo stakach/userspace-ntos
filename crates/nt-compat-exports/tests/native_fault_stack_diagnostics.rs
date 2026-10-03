@@ -97,13 +97,18 @@ fn fault_stack_reader_uses_exact_resident_process_backing_without_mirror_or_imag
         fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
             match called_name(call).as_deref() {
                 Some("client_copyin_process_mapped_for") => {
-                    assert_eq!(call.args.len(), 8);
-                    assert!(matches!(call.args.last(), Some(Expr::Lit(syn::ExprLit {
-                        lit: syn::Lit::Bool(value), ..
-                    })) if !value.value), "no arithmetic active mirror admission");
-                    assert!(matches!(call.args.iter().nth(4), Some(Expr::Reference(reference))
-                        if matches!(&*reference.expr, Expr::Array(array) if array.elems.is_empty())),
-                        "no historical scratch fill-order fallback");
+                    assert_eq!(call.args.len(), 5, "no obsolete mirror-authority or fill-order arguments");
+                    assert!(matches!(call.args.first(), Some(Expr::Cast(cast))
+                        if matches!(&*cast.expr, Expr::Path(path) if path.path.is_ident("pi"))),
+                        "exact target PI");
+                    for (index, expected) in [(1, "process"), (2, "address"), (4, "scratch_base")] {
+                        assert!(matches!(call.args.iter().nth(index), Some(Expr::Path(path))
+                            if path.path.is_ident(expected)), "retained {expected} argument");
+                    }
+                    assert!(matches!(call.args.iter().nth(3), Some(Expr::Reference(reference))
+                        if reference.mutability.is_some()
+                            && matches!(&*reference.expr, Expr::Path(path) if path.path.is_ident("bytes"))),
+                        "bounded local word destination");
                     self.mapped += 1;
                 }
                 Some("smss_stack_read" | "smss_copyin" | "smss_mirror" | "client_copyin_mapped") => {

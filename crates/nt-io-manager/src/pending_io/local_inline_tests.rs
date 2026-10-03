@@ -391,6 +391,7 @@ fn teardown_defers_claimed_reply_until_rejection_or_publication_settles_it() {
     create.signal_file = false;
     create.event_obj_idx = u64::MAX;
     let create_slot = table.park(create).unwrap();
+    table.commit_create_exact(create_slot, ID + 1, 0xc000_0034, 0, 0).unwrap();
     table
         .claim_reply_cap_exact(create_slot, ID + 1)
         .unwrap()

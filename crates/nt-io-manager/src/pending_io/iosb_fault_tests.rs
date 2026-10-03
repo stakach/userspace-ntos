@@ -207,11 +207,17 @@ fn create_fault_does_not_skip_commit_or_user_handle_publication() {
         ..provider()
     };
     let slot = table.park(request).unwrap();
-    table.mark_iosb_faulted_exact(slot, IRP, IOSB).unwrap();
+    assert!(table.mark_iosb_faulted_exact(slot, IRP, IOSB).is_none());
     assert!(table.mark_backend_acked_exact(slot, IRP).is_none());
     table.commit_create_exact(slot, IRP, 0, 1, 2).unwrap();
     assert!(table.mark_backend_acked_exact(slot, IRP).is_none());
-    table.mark_create_handle_published_exact(slot, IRP).unwrap();
+    let identity = table.identity(slot).unwrap();
+    table.observe_create_output_exact(identity, IRP, PendingCreateOutputAction::CommitHandle,
+        PendingCreateOutputObservation::Succeeded).unwrap();
+    table.observe_create_output_exact(identity, IRP, PendingCreateOutputAction::Handle,
+        PendingCreateOutputObservation::Succeeded).unwrap();
+    table.observe_create_output_exact(identity, IRP, PendingCreateOutputAction::Information,
+        PendingCreateOutputObservation::UserFault(0xc000_0005)).unwrap();
     table.mark_backend_acked_exact(slot, IRP).unwrap();
     let finished = table.finish_exact(slot, IRP).unwrap();
     let PendingFileIoOperation::Create(create) = finished.operation else {

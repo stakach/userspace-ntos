@@ -40,6 +40,8 @@ extern crate alloc;
 mod client_copy_recorded_backing;
 #[path = "native_acceptance/loader_open_output.rs"]
 mod loader_open_output;
+#[path = "native_acceptance/pending_file_create_output.rs"]
+mod pending_file_create_output;
 
 // Executive globals required by the real cache module exercised in the host harness.
 use core::sync::atomic::{AtomicU64, Ordering};

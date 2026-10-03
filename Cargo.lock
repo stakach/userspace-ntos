@@ -178,6 +178,7 @@ name = "nt-address-space"
 version = "0.1.0"
 dependencies = [
  "nt-cache-manager",
+ "nt-io-completion",
  "nt-memory-manager",
 ]
 

@@ -25440,38 +25440,19 @@ unsafe fn pending_file_io_redrive_pass(
                     .expect("committed pending CREATE owner disappeared")
                     .delivery_state;
             }
-            let committed = (&*core::ptr::addr_of!(PENDING_FILE_IO))
-                .get_exact(identity)
-                .expect("committed pending CREATE owner disappeared");
-            let nt_io_manager::PendingFileIoOperation::Create(create) = committed.operation else {
+            pending = match crate::pending_file_create::deliver(nt_handler, identity) {
+                Ok(pending) => pending,
+                Err(()) => {
+                    restore_file_io_mirrors!();
+                    continue;
+                }
+            };
+            let nt_io_manager::PendingFileIoOperation::Create(create) = pending.operation else {
                 panic!("pending CREATE changed operation kind");
             };
             terminal_status = create.status;
             terminal_information = create.information;
-            if delivery_state & nt_io_manager::IO_DELIVERY_HANDLE_PUBLISHED == 0 {
-                if !nt_handler
-                    .xas_try_write_buf(create.handle_va, &create.handle_value.to_le_bytes())
-                {
-                    FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
-                    restore_file_io_mirrors!();
-                    continue;
-                }
-                if create.handle_value != 0 {
-                    let reservation = ExecNtHandler::pending_create_reservation(create);
-                    let published = nt_handler
-                        .publish_bound_file_handle(reservation)
-                        .expect("pending CREATE bound handle could not be published");
-                    assert_eq!(published, create.handle_value);
-                    if create.lifecycle_reserved {
-                        assert!(driver_launch::cancel_hosted_file_lifecycle_reservation(
-                            pending.route.hosted_file_id().expect("hosted CREATE lost its File route")
-                        ));
-                    }
-                }
-                delivery_state = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
-                    .mark_create_handle_published_exact(slot, pending.irp_id)
-                    .expect("pending CREATE handle owner disappeared");
-            }
+            delivery_state = pending.delivery_state;
         }
         if matches!(pending.operation, nt_io_manager::PendingFileIoOperation::LocalBuffered(_)) {
             pending = match nt_handler.deliver_local_buffered_output(slot, pending) {
@@ -25575,7 +25556,8 @@ unsafe fn pending_file_io_redrive_pass(
                 ), "local directory completion lost its pending I/O owner");
         }
 
-        if pending.iosb_va != 0
+        if !matches!(pending.operation, nt_io_manager::PendingFileIoOperation::Create(_))
+            && pending.iosb_va != 0
             && delivery_state
                 & (nt_io_manager::IO_DELIVERY_IOSB_PUBLISHED | nt_io_manager::IO_DELIVERY_IOSB_FAULTED)
                 == 0

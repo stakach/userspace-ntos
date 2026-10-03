@@ -1318,13 +1318,8 @@ impl<P> IoManager<P> {
                 self.free_irp(irp_id);
                 if crate::is_create_major(major) {
                     if let Some(file_id) = file_id {
-                        if crate::file::create_terminal_opens_file(status) {
-                            let file = self.file_mut(file_id).expect("CREATE File disappeared");
-                            file.driver_context = file_context;
-                            file.transition(FileState::Open);
-                        } else if let Some(file) = self.file_mut(file_id) {
-                            file.transition(FileState::Closed);
-                        }
+                        self.file_mut(file_id).expect("CREATE File disappeared")
+                            .complete_create(status, file_context);
                     }
                 }
                 ExternalDispatchResult::Completed {
@@ -1342,7 +1337,7 @@ impl<P> IoManager<P> {
                 if crate::is_create_major(major) {
                     if let Some(file_id) = file_id {
                         if let Some(file) = self.file_mut(file_id) {
-                            file.transition(FileState::Closed);
+                            file.complete_create(status, None);
                         }
                     }
                 }

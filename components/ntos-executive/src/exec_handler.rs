@@ -26241,10 +26241,12 @@ impl ExecNtHandler {
         let Some(publication) = publication else {
             return STATUS_PENDING;
         };
-        self.write_nt_open_file_handle_out(file_handle_va, publication.handle);
-        self.xas_write_buf(iosb_va, &publication.status.to_le_bytes());
-        self.xas_write_buf(iosb_va + 8, &publication.information.to_le_bytes());
-        publication.status
+        match self.publish_file_create_result(
+            file_handle_va, iosb_va, publication.handle, publication.status, publication.information,
+        ) {
+            Ok(()) => publication.status,
+            Err(status) => status,
+        }
     }
 
     pub(crate) unsafe fn npfs_create_file(
@@ -26438,6 +26440,7 @@ impl ExecNtHandler {
                         status: STATUS_PENDING,
                         information: 0,
                         handle_value: 0,
+                        output: Default::default(),
                     },
                 ),
                 delivery_state: 0,
@@ -26698,7 +26701,7 @@ impl ExecNtHandler {
         let nt_io_manager::PendingFileIoOperation::Create(create) = pending.operation else {
             return;
         };
-        if pending.delivery_state & nt_io_manager::IO_DELIVERY_HANDLE_PUBLISHED != 0 {
+        if create.output.table_handle_committed() {
             return;
         }
         self.release_hosted_create_reservation(
@@ -31287,15 +31290,19 @@ impl ExecNtHandler {
         status
     }
 
-    unsafe fn publish_loader_file_open_result(
+    unsafe fn publish_file_create_result(
         &mut self,
         file_handle_out: u64,
         iosb: u64,
         handle: u64,
+        status: u32,
+        information: u64,
     ) -> Result<(), u32> {
         // IopCreateFile leaves the committed handle in the table on a late output fault.
-        self.process_memory_write_status(self.pi, file_handle_out, &handle.to_le_bytes())?;
-        self.publish_file_io_status(iosb, nt_fs::STATUS_SUCCESS, 1)
+        nt_address_space::native_output::publish_file_create_result_checked(
+            file_handle_out, iosb, handle, status, information,
+            |address, bytes| self.process_memory_write_checked(self.pi, address, bytes),
+        )
             .map_err(nt_address_space::copy::MemoryCopyFailure::status)
     }
 
@@ -31414,14 +31421,12 @@ impl ExecNtHandler {
                 let Some(publication) = publication else {
                     return STATUS_PENDING;
                 };
-                if publication.handle != 0 {
-                    self.queue_write(file_handle_out, publication.handle);
-                    self.pipe_endpoint_progress |= publication.wake_server_fid != 0;
-                } else {
-                    self.write_nt_open_file_handle_out(file_handle_out, 0);
+                self.pipe_endpoint_progress |= publication.wake_server_fid != 0;
+                if let Err(status) = self.publish_file_create_result(
+                    file_handle_out, args[3], publication.handle, publication.status, publication.information,
+                ) {
+                    return status;
                 }
-                self.xas_write_buf(args[3], &publication.status.to_le_bytes());
-                self.xas_write_buf(args[3] + 8, &publication.information.to_le_bytes());
                 trace_pipe_open(
                     b"NtOpenFile(relative)",
                     self.pi,
@@ -31449,17 +31454,15 @@ impl ExecNtHandler {
             let registry_slot = (status == nt_fs::STATUS_SUCCESS && handle != 0)
                 .then(|| reg.resolve_name(&nb[..nlen]))
                 .flatten();
+            if let Err(status) = self.publish_file_create_result(
+                file_handle_out, args[3], handle, status, information,
+            ) {
+                return status;
+            }
             if handle != 0 {
-                self.queue_write(file_handle_out, handle);
                 if let Some(index) = registry_slot {
                     reg.set_file_handle(self.pi, index, handle);
                 }
-            } else {
-                self.write_nt_open_file_handle_out(file_handle_out, 0);
-            }
-            if args[3] != 0 {
-                self.xas_write_buf(args[3], &status.to_le_bytes());
-                self.xas_write_buf(args[3] + 8, &information.to_le_bytes());
             }
             loader_trace_record(
                 self.pi,
@@ -31525,14 +31528,12 @@ impl ExecNtHandler {
                 let Some(publication) = publication else {
                     return STATUS_PENDING;
                 };
-                if publication.handle != 0 {
-                    self.queue_write(file_handle_out, publication.handle);
-                    self.pipe_endpoint_progress |= publication.wake_server_fid != 0;
-                } else {
-                    self.write_nt_open_file_handle_out(file_handle_out, 0);
+                self.pipe_endpoint_progress |= publication.wake_server_fid != 0;
+                if let Err(status) = self.publish_file_create_result(
+                    file_handle_out, args[3], publication.handle, publication.status, publication.information,
+                ) {
+                    return status;
                 }
-                self.xas_write_buf(args[3], &publication.status.to_le_bytes());
-                self.xas_write_buf(args[3] + 8, &publication.information.to_le_bytes());
                 trace_pipe_open(
                     b"NtOpenFile",
                     self.pi,
@@ -31600,11 +31601,10 @@ impl ExecNtHandler {
                         nt_fs::FILE_OPEN,
                         open_options,
                     );
-                    self.write_nt_open_file_handle_out(file_handle_out, opened_handle);
-                    let iosb = args[3];
-                    if iosb != 0 {
-                        self.xas_write_buf(iosb, &open_status.to_le_bytes());
-                        self.xas_write_buf(iosb + 8, &open_information.to_le_bytes());
+                    if let Err(status) = self.publish_file_create_result(
+                        file_handle_out, args[3], opened_handle, open_status, open_information,
+                    ) {
+                        return status;
                     }
                     loader_trace_record(
                         self.pi,
@@ -31625,23 +31625,14 @@ impl ExecNtHandler {
                     match self.mint_overlay_file_handle(file_id, desired_access) {
                         Some(handle) => {
                             opened_handle = handle;
-                            self.queue_write(file_handle_out, handle);
                         }
                         None => status = 0xC000_009A,
                     }
                 }
-                if opened_handle == 0 {
-                    self.write_nt_open_file_handle_out(file_handle_out, 0);
-                }
-                let iosb = args[3];
-                if iosb != 0 {
-                    self.xas_write_buf(iosb, &status.to_le_bytes());
-                    let info = if status == nt_fs::STATUS_SUCCESS {
-                        information
-                    } else {
-                        0
-                    };
-                    self.xas_write_buf(iosb + 8, &info.to_le_bytes());
+                if let Err(status) = self.publish_file_create_result(
+                    file_handle_out, args[3], opened_handle, status, information,
+                ) {
+                    return status;
                 }
                 loader_trace_record(
                     self.pi,
@@ -31662,11 +31653,6 @@ impl ExecNtHandler {
             let overlay_hit = match crate::writable_fs::query_metadata_relative_if_mounted(relative) {
                 Ok(info) => info.is_some(),
                 Err(status) => {
-                    self.write_nt_open_file_handle_out(file_handle_out, 0);
-                    if args[3] != 0 {
-                        self.xas_write_buf(args[3], &status.to_le_bytes());
-                        self.xas_write_buf(args[3] + 8, &0u64.to_le_bytes());
-                    }
                     return status;
                 }
             };
@@ -31685,23 +31671,14 @@ impl ExecNtHandler {
                     match self.mint_overlay_file_handle(file_id, desired_access) {
                         Some(handle) => {
                             opened_handle = handle;
-                            self.queue_write(file_handle_out, handle);
                         }
                         None => status = 0xC000_009A,
                     }
                 }
-                if opened_handle == 0 {
-                    self.write_nt_open_file_handle_out(file_handle_out, 0);
-                }
-                let iosb = args[3];
-                if iosb != 0 {
-                    self.xas_write_buf(iosb, &status.to_le_bytes());
-                    let info = if status == nt_fs::STATUS_SUCCESS {
-                        information
-                    } else {
-                        0
-                    };
-                    self.xas_write_buf(iosb + 8, &info.to_le_bytes());
+                if let Err(status) = self.publish_file_create_result(
+                    file_handle_out, args[3], opened_handle, status, information,
+                ) {
+                    return status;
                 }
                 loader_trace_record(
                     self.pi,
@@ -31732,11 +31709,10 @@ impl ExecNtHandler {
                     nt_fs::FILE_OPEN,
                     open_options,
                 );
-                self.write_nt_open_file_handle_out(file_handle_out, opened_handle);
-                let iosb = args[3];
-                if iosb != 0 {
-                    self.xas_write_buf(iosb, &status.to_le_bytes());
-                    self.xas_write_buf(iosb + 8, &information.to_le_bytes());
+                if let Err(status) = self.publish_file_create_result(
+                    file_handle_out, args[3], opened_handle, status, information,
+                ) {
+                    return status;
                 }
                 loader_trace_record(
                     self.pi,
@@ -31941,7 +31917,7 @@ impl ExecNtHandler {
                     return status;
                 }
             }
-            if let Err(status) = self.publish_loader_file_open_result(file_handle_out, args[3], h) {
+            if let Err(status) = self.publish_file_create_result(file_handle_out, args[3], h, 0, 1) {
                 return status;
             }
             if let Some(i) = dll_i {
@@ -31956,28 +31932,17 @@ impl ExecNtHandler {
             let opened =
                 self.mint_disk_file_handle(file, path, desired_access, share_access, open_options);
             let opened_handle = match opened {
-                Ok(handle) => {
-                    self.queue_write(file_handle_out, handle);
-                    handle
-                }
+                Ok(handle) => handle,
                 Err(open_status) => {
                     status = open_status;
-                    self.write_nt_open_file_handle_out(file_handle_out, 0);
                     0
                 }
             };
-            let iosb = args[3];
-            if iosb != 0 {
-                self.xas_write_buf(iosb, &status.to_le_bytes());
-                self.xas_write_buf(
-                    iosb + 8,
-                    &(if status == nt_fs::STATUS_SUCCESS {
-                        1u64
-                    } else {
-                        0
-                    })
-                    .to_le_bytes(),
-                );
+            if let Err(status) = self.publish_file_create_result(
+                file_handle_out, args[3], opened_handle, status,
+                u64::from(status == nt_fs::STATUS_SUCCESS),
+            ) {
+                return status;
             }
             loader_trace_record(
                 self.pi,
@@ -32010,9 +31975,6 @@ impl ExecNtHandler {
             opened_handle,
             &nb[..nlen],
         );
-        if status != 0 {
-            self.write_nt_open_file_handle_out(file_handle_out, 0);
-        }
         status
     }
 

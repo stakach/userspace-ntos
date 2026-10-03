@@ -211,6 +211,7 @@ pub use pending_io::{
     FileIoBusyOwner, PendingFileBusy, PendingFileBusyError, PendingFileBusyPhase,
     PendingFileBusyReleaseAttempt, PendingFileBusyWakeAttempt,
     PendingFileCreate, PendingFileIo, PendingFileIoOperation, PendingFileIoParkError,
+    CreateOutputSettlement, PendingCreateOutput, PendingCreateOutputAction, PendingCreateOutputObservation,
     LocalFlushMode, PendingFileIoIdentity, PendingFileIoReservation, PendingFileIoTable, PendingLocalBuffered,
     PendingLocalByteLock, PendingLocalDirectoryNotify, PendingLocalFlush, PendingOwnedInline,
     PendingOwnedModePrecommit,

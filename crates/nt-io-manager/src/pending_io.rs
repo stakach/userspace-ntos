@@ -15,6 +15,10 @@ pub use route::{LocalFileObject, PendingFileRoute};
 
 #[path = "pending_io/route.rs"]
 mod route;
+#[path = "pending_io/create_output.rs"]
+mod create_output;
+pub use create_output::{CreateOutputSettlement, PendingCreateOutput, PendingCreateOutputAction,
+    PendingCreateOutputObservation};
 pub use busy::{
     FileIoBusyOwner, PendingFileBusy, PendingFileBusyError, PendingFileBusyPhase,
     PendingFileBusyReleaseAttempt, PendingFileBusyWakeAttempt,
@@ -61,6 +65,7 @@ const IO_DELIVERY_MARKABLE_FLAGS: u16 = IO_DELIVERY_PUBLIC_FLAGS;
 /// File's dynamically registered device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct PendingFileCreate {
+    pub output: PendingCreateOutput,
     pub handle_va: u64,
     pub desired_access: u32,
     pub provider_context: u64,
@@ -235,6 +240,9 @@ impl PendingFileIo {
     /// Syscall return status may differ from the backing result for a synchronous API's IOSB copy.
     pub fn owned_syscall_status(&self) -> Option<u32> {
         match self.operation {
+            PendingFileIoOperation::Create(create) => create.output.action()
+                .filter(|action| *action != PendingCreateOutputAction::Uncertain)
+                .map(|_| create.output.syscall_fault().unwrap_or(create.status)),
             PendingFileIoOperation::LocalFlush(operation) => Some(operation.syscall_status()),
             _ => self.owned_terminal_result().map(|(status, _)| status),
         }
@@ -496,6 +504,7 @@ impl PendingFileIoTable {
                     && create.status == nt_status::NtStatus::PENDING.raw() as u32
                     && create.information == 0
                     && create.handle_value == 0
+                    && create.output == PendingCreateOutput::default()
                     && pending.output_va == 0
                     && pending.output_len == 0
                     && pending.iosb_va != 0
@@ -1023,7 +1032,7 @@ impl PendingFileIoTable {
     fn required_delivery_state(pending: PendingFileIo) -> u16 {
         let mut required = IO_DELIVERY_BACKEND_ACKED;
         if matches!(pending.operation, PendingFileIoOperation::Create(_)) {
-            required |= IO_DELIVERY_CREATE_COMMITTED | IO_DELIVERY_HANDLE_PUBLISHED;
+            required |= IO_DELIVERY_CREATE_COMMITTED;
         }
         if matches!(pending.operation, PendingFileIoOperation::LocalBuffered(_))
             && !pending.consumer_abandoned
@@ -1036,7 +1045,7 @@ impl PendingFileIoTable {
         } else if pending.output_va != 0 && pending.output_len != 0 {
             required |= IO_DELIVERY_BUFFER_PUBLISHED;
         }
-        if pending.iosb_va != 0 {
+        if pending.iosb_va != 0 && !matches!(pending.operation, PendingFileIoOperation::Create(_)) {
             required |= if pending.delivery_state & IO_DELIVERY_IOSB_FAULTED != 0 {
                 IO_DELIVERY_IOSB_FAULTED
             } else {
@@ -1074,6 +1083,7 @@ impl PendingFileIoTable {
             pending.irp_id == irp_id
                 && !matches!(pending.operation, PendingFileIoOperation::OwnedModePrecommit(_))
                 && pending.busy_is_settled()
+                && Self::create_output_is_settled(pending)
                 && pending.delivery_state
                     & (Self::required_delivery_state(pending) & !IO_DELIVERY_BACKEND_ACKED)
                     == Self::required_delivery_state(pending) & !IO_DELIVERY_BACKEND_ACKED
@@ -1114,21 +1124,23 @@ impl PendingFileIoTable {
         create.status = status;
         create.information = information;
         create.handle_value = handle_value;
+        create.output = PendingCreateOutput::new(status, pending.iosb_va != 0);
         pending.operation = PendingFileIoOperation::Create(create);
         pending.delivery_state |= IO_DELIVERY_CREATE_COMMITTED;
         Some(pending.delivery_state)
     }
 
-    pub fn mark_create_handle_published_exact(&mut self, slot: usize, irp_id: u64) -> Option<u16> {
-        let pending = self.slots.get_mut(slot)?.as_mut()?;
-        if pending.irp_id != irp_id
-            || !matches!(pending.operation, PendingFileIoOperation::Create(_))
-            || pending.delivery_state & IO_DELIVERY_CREATE_COMMITTED == 0
-        {
-            return None;
+    #[cfg(test)]
+    fn settle_test_create(&mut self, slot: usize, irp_id: u64) {
+        let identity = self.identity(slot).unwrap();
+        for action in [PendingCreateOutputAction::CommitHandle, PendingCreateOutputAction::Handle,
+            PendingCreateOutputAction::Information, PendingCreateOutputAction::Status] {
+            if self.create_output_action_exact(identity, irp_id) == Some(action) {
+                self.observe_create_output_exact(identity, irp_id, action,
+                    PendingCreateOutputObservation::Succeeded).unwrap();
+            }
         }
-        pending.delivery_state |= IO_DELIVERY_HANDLE_PUBLISHED;
-        Some(pending.delivery_state)
+        assert_eq!(self.create_output_action_exact(identity, irp_id), Some(PendingCreateOutputAction::Complete));
     }
 
     /// Remove an exact owner only after all required surfaces are settled and backend ACK commits.
@@ -1142,6 +1154,7 @@ impl PendingFileIoTable {
             pending.irp_id == irp_id
                 && !matches!(pending.operation, PendingFileIoOperation::OwnedModePrecommit(_))
                 && pending.busy_is_settled()
+                && Self::create_output_is_settled(pending)
                 && pending.delivery_state & Self::required_delivery_state(pending)
                     == Self::required_delivery_state(pending)
                 && (!(pending.is_local()
@@ -1178,7 +1191,8 @@ impl PendingFileIoTable {
             || (matches!(pending.operation, PendingFileIoOperation::LocalBuffered(_))
                 && (flag == IO_DELIVERY_BUFFER_PUBLISHED || !Self::local_output_settled(*pending)))
             || (flag == IO_DELIVERY_IOSB_PUBLISHED
-                && pending.delivery_state & IO_DELIVERY_IOSB_FAULTED != 0)
+                && (pending.delivery_state & IO_DELIVERY_IOSB_FAULTED != 0
+                    || matches!(pending.operation, PendingFileIoOperation::Create(_))))
         {
             return None;
         }
@@ -1201,7 +1215,7 @@ impl PendingFileIoTable {
         let pending = self.slots.get_mut(slot)?.as_mut()?;
         if pending.irp_id != irp_id
             || matches!(pending.operation, PendingFileIoOperation::LocalFlush(_)
-                | PendingFileIoOperation::OwnedModePrecommit(_))
+                | PendingFileIoOperation::OwnedModePrecommit(_) | PendingFileIoOperation::Create(_))
             || expected_iosb_va == 0
             || pending.iosb_va != expected_iosb_va
             || pending.consumer_abandoned
@@ -1276,6 +1290,7 @@ impl PendingFileIoTable {
             || !Self::local_output_settled(*pending)
             || !Self::local_flush_reply_ready(*pending)
             || !pending.busy_is_settled()
+            || !Self::create_output_is_settled(*pending)
         {
             return None;
         }
@@ -1333,6 +1348,7 @@ impl PendingFileIoTable {
         if pending.irp_id != irp_id
             || matches!(pending.operation, PendingFileIoOperation::OwnedModePrecommit(_))
             || !pending.busy_is_settled()
+            || !Self::create_output_is_settled(*pending)
             || pending.delivery_state & IO_DELIVERY_BACKEND_ACKED != 0
             || pending.delivery_state
                 & (Self::required_delivery_state(*pending) & !IO_DELIVERY_BACKEND_ACKED)
@@ -1477,6 +1493,9 @@ impl PendingFileIoTable {
             || pending.reply_claim_in_flight()
             || pending.busy.is_some()
             || !matches!(pending.operation, PendingFileIoOperation::Create(_))
+            || matches!(pending.operation, PendingFileIoOperation::Create(create)
+                if create.output.table_handle_committed()
+                    || create.output.action() == Some(PendingCreateOutputAction::Uncertain))
         {
             return None;
         }
@@ -1520,6 +1539,9 @@ impl PendingFileIoTable {
             if slot.is_some_and(|pending| {
                 pending.tid == tid && !pending.reply_claim_in_flight() && pending.busy.is_none()
                     && self.owned_reference_releases[index].is_none()
+                    && !matches!(pending.operation, PendingFileIoOperation::Create(create)
+                        if create.output.table_handle_committed()
+                            || create.output.action() == Some(PendingCreateOutputAction::Uncertain))
             }) {
                 let pending = slot.take().unwrap();
                 self.local_outputs[index] = None;
@@ -2358,6 +2380,7 @@ mod tests {
             status: nt_status::NtStatus::PENDING.raw() as u32,
             information: 0,
             handle_value: 0,
+            output: PendingCreateOutput::default(),
         });
         request.output_va = 0;
         request.output_len = 0;
@@ -2375,10 +2398,7 @@ mod tests {
             None,
             "a retry cannot substitute a second handle"
         );
-        table.mark_create_handle_published_exact(slot, 2).unwrap();
-        table
-            .mark_delivery_exact(slot, 2, IO_DELIVERY_IOSB_PUBLISHED)
-            .unwrap();
+        table.settle_test_create(slot, 2);
         assert_eq!(table.claim_reply_cap_exact(slot, 2), Some(Some(0x50)));
         table.mark_reply_published_exact(slot, 2).unwrap();
         assert!(table.completion_surfaces_settled_exact(slot, 2));
@@ -2409,6 +2429,7 @@ mod tests {
             status: nt_status::NtStatus::PENDING.raw() as u32,
             information: 0,
             handle_value: 0,
+            output: PendingCreateOutput::default(),
         });
         request.output_va = 0;
         request.output_len = 0;
@@ -2422,7 +2443,13 @@ mod tests {
             .commit_create_exact(slot, 2, 0xC000_0022, 0, 0)
             .is_some());
         assert!(table.commit_create_exact(slot, 2, 0, 1, 0).is_none());
-        table.mark_create_handle_published_exact(slot, 2).unwrap();
+        let identity = table.identity(slot).unwrap();
+        assert!(table.observe_create_output_exact(identity, 2, PendingCreateOutputAction::Handle,
+            PendingCreateOutputObservation::Succeeded).is_none());
+        assert!(!table.completion_surfaces_settled_exact(slot, 2), "the synchronous Reply still belongs to this owner");
+        assert_eq!(table.claim_reply_cap_exact(slot, 2), Some(Some(0x50)));
+        table.mark_reply_published_exact(slot, 2).unwrap();
+        assert!(table.completion_surfaces_settled_exact(slot, 2));
     }
 
     #[test]
