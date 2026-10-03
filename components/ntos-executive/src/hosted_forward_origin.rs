@@ -67,25 +67,41 @@ impl HostedForwardOrigin {
         self.terminal_completed && self.lane_acknowledged
     }
 
+    pub(super) fn preparation_uncertain(&self) -> bool {
+        self.phase == OriginCallPhase::Indeterminate
+    }
+
     pub(super) unsafe fn prepare_lane(
         &mut self,
         command: hosted_source_completion_lane::SourceCompletionCommand,
-    ) -> bool {
-        if self
-            .terminal_command
-            .is_some_and(|previous| previous != command)
+    ) -> hosted_source_completion_lane::SourceCompletionPreparation {
+        use hosted_source_completion_lane::SourceCompletionPreparation;
+        if self.phase == OriginCallPhase::Indeterminate
+            || command.token != self.token
+            || self
+                .terminal_command
+                .is_some_and(|previous| previous != command)
         {
-            return false;
+            self.phase = OriginCallPhase::Indeterminate;
+            return SourceCompletionPreparation::RetainedUncertain;
         }
         use nt_io_manager::source_irp_ledger::SourceIrpOwner;
         let prepared = match command.allocation.owner {
             SourceIrpOwner::HostedDriver(index) | SourceIrpOwner::HostedCaller(index) => {
-                hosted_source_completion_lane::prepare(index, command).is_ok()
+                hosted_source_completion_lane::prepare(index, command)
             }
-            SourceIrpOwner::Win32k => false,
+            SourceIrpOwner::Win32k => {
+                SourceCompletionPreparation::KnownRejected(STATUS_INVALID_HANDLE as u32)
+            }
         };
-        if prepared {
+        if matches!(
+            prepared,
+            SourceCompletionPreparation::Ready | SourceCompletionPreparation::RetainedUncertain
+        ) {
             self.terminal_command = Some(command);
+        }
+        if matches!(prepared, SourceCompletionPreparation::RetainedUncertain) {
+            self.phase = OriginCallPhase::Indeterminate;
         }
         prepared
     }
@@ -114,6 +130,9 @@ impl HostedForwardOrigin {
         &self,
         command: hosted_source_completion_lane::SourceCompletionCommand,
     ) -> bool {
+        if self.phase == OriginCallPhase::Indeterminate {
+            return false;
+        }
         if self
             .terminal_command
             .is_some_and(|previous| previous != command)
@@ -262,8 +281,10 @@ impl HostedForwardOrigin {
             }
             hosted_source_completion_lane::poll(instance, command)
         } else {
-            if hosted_source_completion_lane::prepare(instance, command).is_err()
-                || !hosted_source_completion_lane::ready_for_source(instance, command)
+            if !matches!(
+                self.prepare_lane(command),
+                hosted_source_completion_lane::SourceCompletionPreparation::Ready
+            ) || !hosted_source_completion_lane::ready_for_source(instance, command)
             {
                 return false;
             }

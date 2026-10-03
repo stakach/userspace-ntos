@@ -220,7 +220,11 @@ impl Work {
                     .is_some_and(|irp| completed_irp_exact(irp.raw()).is_some()));
         }
         if self.origin.reply_entered { return false; }
-        if self.initial_status.is_none() { return self.provider_dispatch_ready(); }
+        if self.initial_status.is_none() {
+            return !self.origin.preparation_uncertain() && self.provider_dispatch_ready()
+                && self.source.completion_command(self.origin.token).is_ok_and(|command|
+                    self.origin.terminal_ready(command));
+        }
         if self.initial_status == Some(STATUS_PENDING as i32) {
             return self.source.completion_command(self.origin.token).is_ok_and(|command|
                 self.origin.terminal_ready(command));
@@ -235,6 +239,7 @@ impl Work {
     }
 
     unsafe fn release_unentered_owners(&mut self) -> bool {
+        if !self.origin.release_prepared() { return false; }
         if !self.source_released {
             if self.source.release().is_err() { return false; }
             self.source_released = true;
@@ -520,22 +525,28 @@ impl Work {
         }
         if self.initial_status.is_none() {
             if !self.provider_dispatch_ready() { return false; }
-            self.dispatch_provider(handler);
+            match self.source.completion_command(self.origin.token) {
+                Ok(command) => match self.origin.prepare_lane(command) {
+                    hosted_source_completion_lane::SourceCompletionPreparation::Ready => self.dispatch_provider(handler),
+                    hosted_source_completion_lane::SourceCompletionPreparation::KnownRejected(status) => self.initial_status = Some(status as i32),
+                    hosted_source_completion_lane::SourceCompletionPreparation::RetainedUncertain => return false,
+                },
+                Err(error) => self.initial_status = Some(status_for_capture(error)),
+            }
             if self.initial_status.is_none() { return false; }
         }
         if self.retained.is_some() { self.poll_provider(); }
         let status = self.initial_status.expect("READ dispatch status");
         use nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply;
         let disposition = if status == STATUS_PENDING as i32 {
-            let command = self.source.completion_command(self.origin.token)
-                .expect("pending READ lane owner");
-            if !self.origin.prepare_lane(command) { return false; }
             HostedForwardDispatchReply::Pending
         } else if self.terminal.is_some() {
+            if !self.origin.release_prepared() { return false; }
             self.publish_source();
             self.source_published = true;
             HostedForwardDispatchReply::InlineTerminal(self.initial_status.unwrap())
         } else {
+            if !self.origin.release_prepared() { return false; }
             HostedForwardDispatchReply::Rejected(status)
         };
         self.origin.reply_dispatch(disposition, self.source_published);

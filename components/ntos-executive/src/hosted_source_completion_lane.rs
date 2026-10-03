@@ -59,6 +59,13 @@ pub(super) enum SourceCompletionDispatch {
     Uncertain,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum SourceCompletionPreparation {
+    Ready,
+    KnownRejected(u32),
+    RetainedUncertain,
+}
+
 static mut LANES: Vec<SourceCompletionLane> = Vec::new();
 
 unsafe fn row_for(instance_index: usize, command: SourceCompletionCommand) -> Option<usize> {
@@ -167,18 +174,27 @@ pub(super) unsafe fn preparation_ready(
 pub(super) unsafe fn prepare(
     instance_index: usize,
     command: SourceCompletionCommand,
-) -> Result<(), u32> {
-    let domain = command.allocation.domain;
-    let inst = instance(instance_index).ok_or(STATUS_INVALID_HANDLE as u32)?;
-    if !command_is_current(instance_index, command) {
-        return Err(STATUS_INVALID_HANDLE as u32);
-    }
-    if let Some(index) = row_for(instance_index, command) {
-        return if (&*core::ptr::addr_of!(LANES))[index].phase == Phase::Prepared {
-            Ok(())
+) -> SourceCompletionPreparation {
+    use SourceCompletionPreparation::{KnownRejected, Ready, RetainedUncertain};
+    // An old-domain construction remains owned even after current admission has disappeared.
+    if let Some(index) = (&*core::ptr::addr_of!(LANES))
+        .iter()
+        .position(|row| row.instance == instance_index && row.command == Some(command))
+    {
+        return if (&*core::ptr::addr_of!(LANES))[index].phase == Phase::Prepared
+            && command_is_current(instance_index, command)
+        {
+            Ready
         } else {
-            Err(STATUS_DEVICE_BUSY_LOCAL)
+            RetainedUncertain
         };
+    }
+    let domain = command.allocation.domain;
+    let Some(inst) = instance(instance_index) else {
+        return KnownRejected(STATUS_INVALID_HANDLE as u32);
+    };
+    if !command_is_current(instance_index, command) {
+        return KnownRejected(STATUS_INVALID_HANDLE as u32);
     }
     if let Some(index) = (&*core::ptr::addr_of!(LANES)).iter().position(|row| {
         row.instance == instance_index
@@ -190,17 +206,18 @@ pub(super) unsafe fn prepare(
         let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
         row.command = Some(command);
         row.phase = Phase::Prepared;
-        return Ok(());
+        return Ready;
     }
     let _durable = crate::allocator::enter_durable();
     let index = {
         let rows = &mut *core::ptr::addr_of_mut!(LANES);
-        rows.try_reserve(1)
-            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES as u32)?;
+        if rows.try_reserve(1).is_err() {
+            return KnownRejected(STATUS_INSUFFICIENT_RESOURCES as u32);
+        }
         let index = rows.len();
-        let ordinal = (index as u64)
-            .checked_add(1)
-            .ok_or(STATUS_INSUFFICIENT_RESOURCES as u32)?;
+        let Some(ordinal) = (index as u64).checked_add(1) else {
+            return KnownRejected(STATUS_INSUFFICIENT_RESOURCES as u32);
+        };
         rows.push(SourceCompletionLane {
             instance: instance_index,
             domain,
@@ -225,10 +242,12 @@ pub(super) unsafe fn prepare(
     } else {
         Phase::Uncertain
     };
-    result
+    if result.is_ok() {
+        Ready
+    } else {
+        RetainedUncertain
+    }
 }
-
-const STATUS_DEVICE_BUSY_LOCAL: u32 = 0x8000_0011;
 
 unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
     let (instance_index, domain, ordinal) = {
@@ -248,37 +267,23 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
         .create(entry as *const () as u64, shared)
         .map_err(|error| hosted_driver_thread_error_status(error) as u32)?;
     (&mut *core::ptr::addr_of_mut!(LANES))[index].handle = handle;
-    let spawn = spawn_hosted_driver_worker_thread(
+    let spawn = spawn_hosted_driver_worker_thread_with_shared_bank(
         instance_index,
         inst,
         handle,
         slot,
         entry as *const () as u64,
         shared,
+        Some(HostedWorkerSharedBankSpec {
+            offset: BANK_OFFSET,
+        }),
     )
     .ok_or(STATUS_INSUFFICIENT_RESOURCES as u32)?;
-    let executive_shared = hosted_worker_exec_base_for_alias(spawn.exec_alias_slot)
-        .and_then(|base| base.checked_add(BANK_OFFSET))
-        .ok_or(STATUS_INSUFFICIENT_RESOURCES as u32)?;
-    let frame = alloc_frame();
-    hosted_thread_resources::root(spawn.construction, frame);
-    let executive_frame = copy_cap(frame);
-    hosted_thread_resources::root(spawn.construction, executive_frame);
-    hosted_thread_resources::mapping(spawn.construction, frame);
-    if page_map_r(frame, shared, RW_NX, inst.pml4) != 0 {
-        return Err(STATUS_INSUFFICIENT_RESOURCES as u32);
+    let bank = spawn.shared_bank.ok_or(STATUS_INVALID_HANDLE as u32)?;
+    if bank.component != shared {
+        return Err(STATUS_INVALID_HANDLE as u32);
     }
-    hosted_thread_resources::mapping(spawn.construction, executive_frame);
-    if page_map_r(
-        executive_frame,
-        executive_shared,
-        RW_NX,
-        CAP_INIT_THREAD_VSPACE,
-    ) != 0
-    {
-        return Err(STATUS_INSUFFICIENT_RESOURCES as u32);
-    }
-    core::ptr::write_bytes(executive_shared as *mut u8, 0, 0x1000);
+    let executive_shared = bank.executive;
     hosted_driver_thread_table_mut(instance_index)
         .ok_or(STATUS_INVALID_HANDLE as u32)?
         .attach_tcb(handle, spawn.tcb)

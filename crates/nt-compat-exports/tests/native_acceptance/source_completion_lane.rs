@@ -63,7 +63,7 @@ fn source_completion_uses_independent_initialized_domain_lane() {
     if calls
         .0
         .iter()
-        .any(|call| call == "spawn_hosted_driver_worker_thread")
+        .any(|call| call == "spawn_hosted_driver_worker_thread_with_shared_bank")
     {
         let driver = syn::parse_file(include_str!(
             "../../../../components/ntos-executive/src/driver_launch.rs"
@@ -73,7 +73,10 @@ fn source_completion_uses_independent_initialized_domain_lane() {
             .items
             .iter()
             .find_map(|item| match item {
-                Item::Fn(function) if function.sig.ident == "spawn_hosted_driver_worker_thread" => {
+                Item::Fn(function)
+                    if function.sig.ident
+                        == "spawn_hosted_driver_worker_thread_with_shared_bank" =>
+                {
                     Some(function)
                 }
                 _ => None,
@@ -82,6 +85,26 @@ fn source_completion_uses_independent_initialized_domain_lane() {
         let mut worker_calls = Calls::default();
         worker_calls.visit_item_fn(worker);
         assert!(worker_calls.0.iter().any(|call| call == "initialize_actor"));
+        let wrapper = driver
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Fn(function) if function.sig.ident == "spawn_hosted_driver_worker_thread" => {
+                    Some(function)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let Some(syn::Stmt::Expr(Expr::Call(call), None)) = wrapper.block.stmts.last() else {
+            panic!("ordinary workers must delegate to the same factory");
+        };
+        assert!(matches!(&*call.func, Expr::Path(path)
+            if path.path.segments.last().unwrap().ident == "spawn_hosted_driver_worker_thread_with_shared_bank"));
+        assert!(
+            matches!(call.args.last(), Some(Expr::Path(path))
+            if path.path.is_ident("None")),
+            "ordinary workers do not acquire an extra bank"
+        );
     } else {
         assert!(
             calls.0.iter().any(|call| call == "initialize_actor"),
@@ -155,5 +178,24 @@ fn completion_command_retains_source_identity_without_second_terminal_owner() {
             !lane.iter().any(|field| field.1 == forbidden),
             "Work retains the source/terminal owner; the lane owns execution only"
         );
+    }
+}
+
+#[test]
+fn completion_bank_is_part_of_the_worker_construction_not_an_append_after_sealing() {
+    let source = lane_source();
+    let construct = source
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Fn(function) if function.sig.ident == "construct" => Some(function),
+            _ => None,
+        })
+        .expect("completion worker construction");
+    let mut calls = Calls::default();
+    calls.visit_item_fn(construct);
+    for forbidden in ["root", "mapping", "page_map_r"] {
+        assert!(!calls.0.iter().any(|name| name == forbidden),
+            "the shared worker factory seals its resource owner; the completion bank must be captured and mapped inside that transaction, not appended through {forbidden}");
     }
 }

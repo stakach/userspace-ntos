@@ -63,6 +63,31 @@ fn forwarding_work_uses_common_origin_instead_of_waiting_for_terminal_to_return_
 }
 
 #[test]
+fn completion_execution_is_reserved_before_lower_dispatch_can_return_pending() {
+    for name in [
+        "hosted_read_work.rs",
+        "hosted_flush_work.rs",
+        "hosted_query_information_work.rs",
+    ] {
+        let source = read_source(name);
+        let mut calls = Calls::default();
+        calls.visit_block(function(&source, "advance"));
+        let prepare = calls
+            .names
+            .iter()
+            .position(|name| name == "prepare_lane")
+            .expect("source completion reservation");
+        let dispatch = calls
+            .names
+            .iter()
+            .position(|name| name == "dispatch_provider")
+            .expect("lower provider dispatch");
+        assert!(prepare < dispatch,
+            "{name}: a pending provider may require another source request to release it; completion worker allocation cannot withhold the Pending return after lower dispatch");
+    }
+}
+
+#[test]
 fn common_origin_uses_shared_pending_readiness_and_armed_terminal_admission() {
     let source = read_source("hosted_forward_origin.rs");
     let mut calls = Calls::default();

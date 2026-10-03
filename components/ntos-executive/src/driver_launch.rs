@@ -54105,6 +54105,17 @@ struct HostedDriverThreadRuntime {
 }
 
 #[derive(Clone, Copy)]
+struct HostedWorkerSharedBankSpec {
+    offset: u64,
+}
+
+#[derive(Clone, Copy)]
+struct HostedWorkerSharedBank {
+    component: u64,
+    executive: u64,
+}
+
+#[derive(Clone, Copy)]
 struct HostedDriverThreadSpawn {
     tcb: u64,
     reply_cap: u64,
@@ -54116,6 +54127,7 @@ struct HostedDriverThreadSpawn {
     raw_cnode: u64,
     cnode: u64,
     sched_context: u64,
+    shared_bank: Option<HostedWorkerSharedBank>,
 }
 
 struct HostedDriverRawWaiter {
@@ -57839,6 +57851,20 @@ unsafe fn spawn_hosted_driver_worker_thread(
     start_routine: u64,
     start_context: u64,
 ) -> Option<HostedDriverThreadSpawn> {
+    spawn_hosted_driver_worker_thread_with_shared_bank(
+        instance, inst, handle, component_slot, start_routine, start_context, None,
+    )
+}
+
+unsafe fn spawn_hosted_driver_worker_thread_with_shared_bank(
+    instance: usize,
+    inst: DriverInstance,
+    handle: u64,
+    component_slot: usize,
+    start_routine: u64,
+    start_context: u64,
+    shared_bank_spec: Option<HostedWorkerSharedBankSpec>,
+) -> Option<HostedDriverThreadSpawn> {
     let component_base = hosted_worker_component_base_for_slot(component_slot)?;
     let stack_base = component_base;
     let ipcbuf_va = component_base.checked_add(FSD_WORKER_IPCBUF_OFFSET)?;
@@ -57850,9 +57876,27 @@ unsafe fn spawn_hosted_driver_worker_thread(
     let tramp_exec_va = exec_base.checked_add(FSD_WORKER_TRAMP_OFFSET)?;
     let scratch_exec_va = exec_base.checked_add(FSD_WORKER_SCRATCH_OFFSET)?;
     let kpcr_exec_va = exec_base.checked_add(FSD_WORKER_KPCR_OFFSET)?;
+    let shared_bank = match shared_bank_spec {
+        Some(spec) => {
+            if spec.offset & 0xfff != 0
+                || spec.offset < FSD_WORKER_KPCR_OFFSET.checked_add(0x1000)?
+                || spec.offset.checked_add(0x1000)? > FSD_WORKER_STRIDE
+            {
+                return None;
+            }
+            Some(HostedWorkerSharedBank {
+                component: component_base.checked_add(spec.offset)?,
+                executive: exec_base.checked_add(spec.offset)?,
+            })
+        }
+        None => None,
+    };
+    let additional_resources = if shared_bank.is_some() { 2 } else { 0 };
 
     let domain = instance_domain_identity(inst)?;
-    let Some(construction) = hosted_thread_resources::begin(instance, handle, domain, inst.pml4) else {
+    let Some(construction) = hosted_thread_resources::begin(
+        instance, handle, domain, inst.pml4, additional_resources,
+    ) else {
         print_str(b"[driver-thread] construction reservation failed\n");
         return None;
     };
@@ -57908,6 +57952,20 @@ unsafe fn spawn_hosted_driver_worker_thread(
         print_hex(status);
         print_str(b"\n");
         return None;
+    }
+
+    if let Some(bank) = shared_bank {
+        let frame = alloc_frame();
+        hosted_thread_resources::root(construction, frame);
+        let executive_frame = copy_cap(frame);
+        hosted_thread_resources::root(construction, executive_frame);
+        hosted_thread_resources::mapping(construction, frame);
+        if page_map_r(frame, bank.component, RW_NX, inst.pml4) != 0 { return None; }
+        hosted_thread_resources::mapping(construction, executive_frame);
+        if page_map_r(executive_frame, bank.executive, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+            return None;
+        }
+        core::ptr::write_bytes(bank.executive as *mut u8, 0, 0x1000);
     }
 
     let ipcbuf = alloc_frame();
@@ -58004,6 +58062,7 @@ unsafe fn spawn_hosted_driver_worker_thread(
         sched_context,
         component_scratch_va: scratch_va,
         exec_scratch_va: scratch_exec_va,
+        shared_bank,
     })
 }
 

@@ -49,12 +49,13 @@ pub(super) unsafe fn begin(
     handle: u64,
     domain: HostedDomainIdentity,
     pml4: u64,
+    additional_resources: usize,
 ) -> Option<usize> {
     let _durable = crate::allocator::enter_durable();
     let mut resources = Vec::new();
-    resources
-        .try_reserve_exact(FSD_WORKER_STACK_FRAMES as usize * 2 + 16)
-        .ok()?;
+    let capacity = (FSD_WORKER_STACK_FRAMES as usize).checked_mul(2)?
+        .checked_add(16)?.checked_add(additional_resources)?;
+    resources.try_reserve_exact(capacity).ok()?;
     let owners = &mut *core::ptr::addr_of_mut!(OWNERS);
     owners.try_reserve(1).ok()?;
     let id = owners.len();
