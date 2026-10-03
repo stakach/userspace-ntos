@@ -6,6 +6,13 @@ After registration, the worker opens `\\Device\\Mup\\ntos-probe\\share` through 
 
 The native gate must load Mup and this fixture and check the accepted query, Mup's query completion, the rerouted FileObject's CREATE/CLEANUP/CLOSE sequence, and the exact WRITE bytes and Information. A successful registration log alone is not forwarding proof. The fixture also exposes a separate `\ntos-probe\section` file with a 4096-byte EOF and stable internal index. It is not a general filesystem.
 
+Pending success operations use initialized auto-reset synchronization Events, not
+worker polling. Dispatch marks the stack location `SL_PENDING_RETURNED` before
+publishing the retained IRP with a release compare-exchange, then signals its Event.
+The worker waits and takes that exact IRP with an acquire exchange before completion.
+An Event signaled before the wait remains signaled, so publication cannot lose its
+wakeup. A rejected publication restores the stack flag and does not signal.
+
 ## Controlled Terminal Errors
 
 The test-only `\ntos-probe\terminal-failure` file accepts separate READ, FLUSH and

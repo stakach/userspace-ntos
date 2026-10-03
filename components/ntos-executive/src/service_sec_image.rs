@@ -8941,7 +8941,8 @@ pub(crate) unsafe fn service_sec_image(
                 last_progress_epoch = ep;
                 last_progress_t = now;
                 let _ = stall_deferrals.observe_progress(ep);
-            } else if ingress.is_none()
+            } else if cfg!(not(feature = "mup-provider-kernel-only"))
+                && ingress.is_none()
                 && now.wrapping_sub(last_progress_t) >= STALL_BUDGET_100NS
             {
                 let deferral =
@@ -17893,6 +17894,11 @@ pub(crate) unsafe fn service_sec_image(
         }
         // A non-VMFault, non-syscall fault (e.g. #GP) the loop can't service — unrecoverable. Park+log.
         park_and_log!(pi, b"other-fault", m1, m1);
+    }
+    if cfg!(feature = "mup-provider-kernel-only") {
+        // This profile has no desktop verdict. Retain all live owners if its pump terminates.
+        print_str(b"[mup-provider-gate] terminal service-loop failure\n");
+        park();
     }
     nt_handler.loop_ctx = nt_handler.loop_ctx.map(|ctx| ctx.checkpoint_live());
     let quiesce_cm_status = checkpoint_boot_hives_at_quiesce(&mut nt_handler);

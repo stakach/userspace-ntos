@@ -320,6 +320,7 @@ static struct FailureFileContext *FailureContext(FILE_OBJECT *file)
     return NULL;
 }
 static IRP *PendingReadIrp;
+static uint8_t PendingReadEvent[0x20] __attribute__((aligned(8)));
 static IRP *PendingFlushIrp;
 static uint8_t PendingFlushEvent[0x20] __attribute__((aligned(8)));
 static IRP *PendingQueryFileIrp;
@@ -579,6 +580,7 @@ static NTSTATUS __stdcall ProviderRead(DEVICE_OBJECT *device, IRP *irp)
         }
         DbgPrint("[mup-provider-read-pending-dispatch] status=0x%08x\n",
                  (uint32_t)STATUS_PENDING);
+        KeSetEvent(PendingReadEvent, 0, 0);
         return STATUS_PENDING;
     }
     FillRead(irp);
@@ -867,7 +869,7 @@ static void __stdcall RegistrationWorker(void *context)
                  MupProviderEvidence.probe_file_created,
                  MupProviderEvidence.probe_file_cleaned,
                  MupProviderEvidence.probe_file_closed);
-        for (uint32_t attempt = 0; attempt < 100; attempt++) {
+        if (NT_SUCCESS(KeWaitForSingleObject(PendingReadEvent, 0, 0, 0, NULL))) {
             IRP *pending = __atomic_exchange_n(&PendingReadIrp, NULL, __ATOMIC_ACQ_REL);
             if (pending != NULL) {
                 int64_t delay = -1000000;
@@ -877,10 +879,7 @@ static void __stdcall RegistrationWorker(void *context)
                          MupProviderEvidence.probe_read_count,
                          MupProviderEvidence.probe_read_bytes);
                 Complete(pending, STATUS_SUCCESS, sizeof(ProbeReadBytes));
-                break;
             }
-            int64_t delay = -1000000;
-            KeDelayExecutionThread(0, 0, &delay);
         }
         if (NT_SUCCESS(KeWaitForSingleObject(PendingFlushEvent, 0, 0, 0, NULL))) {
             IRP *pending = __atomic_exchange_n(&PendingFlushIrp, NULL, __ATOMIC_ACQ_REL);
@@ -961,6 +960,7 @@ fail:
 NTSTATUS __stdcall DriverEntry(DRIVER_OBJECT *driver, UNICODE_STRING *registry_path)
 {
     (void)registry_path;
+    KeInitializeEvent(PendingReadEvent, 1, 0);
     KeInitializeEvent(PendingFlushEvent, 1, 0);
     KeInitializeEvent(PendingQueryFileEvent, 1, 0);
     KeInitializeEvent(PendingSectionQueryEvent, 1, 0);
