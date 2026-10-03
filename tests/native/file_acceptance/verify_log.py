@@ -55,7 +55,11 @@ REQUIRED = {
     ("noaccess-query-output", "output-unchanged"): 1,
     ("guard-query-output", "output-unchanged"): 1,
     ("read-output-crossing", "status"): 0xC0000005,
+    ("read-output-fault-file-wait", "status"): 0,
     ("write-input-crossing", "status"): 0xC0000005,
+    ("write-fault-event-create", "status"): 0,
+    ("write-input-fault-file-wait", "status"): 0x102,
+    ("write-fault-event-close", "status"): 0,
     ("read-iosb-crossing", "status"): 0xC0000005,
     ("content-after-faults", "unchanged"): 1,
     ("content-after-faults", "status"): 0,
@@ -91,6 +95,25 @@ REQUIRED = {
 for case in ("noaccess-query-output", "guard-query-output", "read-output-crossing", "write-input-crossing"):
     for field in ("iosb-status", "iosb-information"):
         REQUIRED[(case, field)] = 0xABABABABABABABAB
+for case, refusal, old_protection, prefix in (
+    ("write-input-guard", 0x80000001, 4, "write-guard"),
+    ("write-offset-noaccess", 0xC0000005, 1, "write-offset"),
+    ("write-key-guard", 0x80000001, 4, "write-key"),
+):
+    REQUIRED[(case, "status")] = refusal
+    REQUIRED[(case, "iosb-status")] = 0xABABABABABABABAB
+    REQUIRED[(case, "iosb-information")] = 0xABABABABABABABAB
+    REQUIRED[(case, "old-protection")] = old_protection
+    REQUIRED[(case, "position")] = 16
+    REQUIRED[(prefix + "-event-create", "status")] = 0
+    REQUIRED[(prefix + "-event-close", "status")] = 0
+    REQUIRED[((case if case == "write-input-guard" else prefix) + "-position", "status")] = 0
+    REQUIRED[((case if case == "write-input-guard" else prefix) + "-file-wait", "status")] = (
+        0x102 if case == "write-input-guard" else 0
+    )
+    REQUIRED[((case if case == "write-input-guard" else prefix) + "-event-wait", "status")] = (
+        0x102 if case == "write-input-guard" else 0
+    )
 REQUIRED[("read-iosb-crossing", "status-word")] = 0xABABABABABABABAB
 for case, refusal in (("mode-noaccess-span", 0xC0000005), ("mode-guard-span", 0x80000001)):
     REQUIRED[(case, "status")] = refusal

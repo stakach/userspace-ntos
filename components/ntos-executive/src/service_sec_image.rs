@@ -11788,6 +11788,9 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.hosted_thread_lpc_client_process(badge);
             assert!(nt_handler.current_synchronous_file.is_none(),
                 "previous syscall retained acquired File Busy");
+            assert!(nt_handler.current_file_transfer_event.is_none(),
+                "previous syscall retained a File completion Event");
+            nt_handler.current_file_transfer_parameters = None;
             assert!(nt_handler.active_synchronous_file_retry.is_none(),
                 "previous syscall retained an unconsumed File ingress claim");
             nt_handler.active_synchronous_file_retry = match (&mut *core::ptr::addr_of_mut!(
@@ -11828,7 +11831,18 @@ pub(crate) unsafe fn service_sec_image(
                 argv[3] = get_recv_mr(8); // R9
                 let n = (entry.max_args as usize).min(16);
                 let mut stack_args_valid = true;
-                if native_call_transport {
+                let retained_arguments = nt_handler.active_synchronous_file_retry.as_ref()
+                    .and_then(|ingress| ingress.waiter().transfer_parameters)
+                    .map(|parameters| parameters.arguments);
+                if let Some(arguments) = retained_arguments {
+                    // begin_ingress authenticated this exact service/thread/badge. These are the
+                    // invocation's original value arguments, not mutable retry stack or IPC words.
+                    if n != arguments.len() {
+                        stack_args_valid = false;
+                    } else {
+                        argv[..n].copy_from_slice(&arguments);
+                    }
+                } else if native_call_transport {
                     const NATIVE_TAIL_STAGE_MR: usize = 32;
                     if (mi & 0x7f) < nt_syscall_abi::native_syscall_request_len(n as u8) {
                         stack_args_valid = false;
@@ -26110,6 +26124,10 @@ unsafe fn pending_file_io_redrive_pass(
             .finish_owner_exact(identity, pending.irp_id)
             .expect("completed pending File owner did not retire");
         crate::pending_file_caller::retire(identity);
+        if let Some(event) = finished.transfer_event {
+            assert!(finished.event_obj_idx == u64::MAX || finished.event_obj_idx == event.native_identity);
+            nt_handler.release_transfer_event(event);
+        }
         match finished.operation {
             nt_io_manager::PendingFileIoOperation::Transfer => {
                 nt_handler.release_file_reference(finished.route.hosted_file_id().expect("provider completion lost its File route"));

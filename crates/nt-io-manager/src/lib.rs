@@ -261,6 +261,7 @@ pub use synchronous_io::{
     SynchronousFileRetryStats,
     SynchronousFileRetryView, SynchronousFileWaitIdentity, SynchronousFileWaitReservation,
     SynchronousFileWaitState, SynchronousFileWaitTable, SynchronousFileWaiter,
+    FileTransferParameters, FileTransferEvent,
 };
 pub use volume_information::{
     query_volume_information_contract, set_volume_information_contract,

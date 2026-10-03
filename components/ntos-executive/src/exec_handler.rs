@@ -32,6 +32,8 @@ mod hosted_file_set;
 
 #[path = "exec_file_acquisition.rs"]
 mod exec_file_acquisition;
+#[path = "exec_file_transfer.rs"]
+mod exec_file_transfer;
 #[path = "exec_file_mode.rs"]
 mod exec_file_mode;
 #[path = "exec_local_file_io.rs"]
@@ -3998,6 +4000,8 @@ impl ExecNtHandler {
         write_field!(current_user_memory, SyscallUserMemory::CurrentProcess);
         write_field!(current_server_client_pid, 0);
         write_field!(active_synchronous_file_retry, None);
+        write_field!(current_file_transfer_parameters, None);
+        write_field!(current_file_transfer_event, None);
         write_field!(current_synchronous_file, None);
         write_field!(current_apc_handoff, None);
         write_field!(context_continue_redirected, false);
@@ -12837,6 +12841,7 @@ impl ExecNtHandler {
                     signal_file: synchronous_file || event_obj_idx == u64::MAX,
                     publish_iocp: args[2] == 0,
                     event_obj_idx,
+                    transfer_event: None,
                     reply_cap: 0,
                     reply_required: false,
                     native_call_transport: self.current_native_call_transport,
@@ -12925,6 +12930,7 @@ impl ExecNtHandler {
             let pending = table.take_create_owner_exact(identity, irp_id)
                 .expect("new CREATE refused its unpublished-handle rollback");
             crate::pending_file_caller::retire(identity);
+            assert!(pending.transfer_event.is_none(), "CREATE inherited a transfer Event");
             self.abandon_file_create(pending);
         } else {
             let pending = table.abandon_transfer_owner_exact(identity, irp_id)
@@ -12951,6 +12957,7 @@ impl ExecNtHandler {
         (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
             .take_thread_creates_exact_with(tid, |identity, pending| {
                 crate::pending_file_caller::retire(identity);
+                assert!(pending.transfer_event.is_none(), "CREATE inherited a transfer Event");
                 creates.push(pending);
             });
         for pending in creates.iter().copied() {
@@ -13319,6 +13326,7 @@ impl ExecNtHandler {
                 signal_file: synchronous || event_obj_idx == u64::MAX,
                 publish_iocp: false,
                 event_obj_idx,
+                transfer_event: None,
                 reply_cap: 0,
                 reply_required: false,
                 native_call_transport: self.current_native_call_transport,
@@ -13393,6 +13401,7 @@ impl ExecNtHandler {
                 signal_file: synchronous || event_obj_idx == u64::MAX,
                 publish_iocp: apc_routine == 0,
                 event_obj_idx,
+                transfer_event: None,
                 reply_cap: 0,
                 reply_required: false,
                 native_call_transport: self.current_native_call_transport,
@@ -13590,6 +13599,7 @@ impl ExecNtHandler {
                         signal_file: synchronous || event_obj_idx == u64::MAX,
                         publish_iocp: false,
                         event_obj_idx,
+                        transfer_event: None,
                         reply_cap: 0,
                         reply_required: false,
                         native_call_transport: self.current_native_call_transport,
@@ -13667,6 +13677,7 @@ impl ExecNtHandler {
                     signal_file: synchronous || event_obj_idx == u64::MAX,
                     publish_iocp: apc_routine == 0,
                     event_obj_idx,
+                    transfer_event: None,
                     reply_cap: 0,
                     reply_required: false,
                     native_call_transport: self.current_native_call_transport,
@@ -13813,6 +13824,7 @@ impl ExecNtHandler {
                 signal_file: true,
                 publish_iocp: false,
                 event_obj_idx: u64::MAX,
+                transfer_event: None,
                 reply_cap: 0,
                 reply_required: false,
                 native_call_transport: self.current_native_call_transport,
@@ -26486,6 +26498,7 @@ impl ExecNtHandler {
                 signal_file: false,
                 publish_iocp: false,
                 event_obj_idx: u64::MAX,
+                transfer_event: None,
                 reply_cap: 0,
                 reply_required: false,
                 native_call_transport: self.current_native_call_transport,
@@ -27048,6 +27061,7 @@ impl ExecNtHandler {
                     signal_file: synchronous_file,
                     publish_iocp: false,
                     event_obj_idx: u64::MAX,
+                    transfer_event: None,
                     reply_cap: 0,
                     reply_required: false,
                     native_call_transport: self.current_native_call_transport,
@@ -27174,6 +27188,7 @@ impl ExecNtHandler {
                     signal_file: synchronous_file,
                     publish_iocp: false,
                     event_obj_idx: u64::MAX,
+                    transfer_event: None,
                     reply_cap: 0,
                     reply_required: false,
                     native_call_transport: self.current_native_call_transport,
@@ -27260,6 +27275,7 @@ impl ExecNtHandler {
                     signal_file: synchronous_file,
                     publish_iocp: false,
                     event_obj_idx: u64::MAX,
+                    transfer_event: None,
                     reply_cap: 0,
                     reply_required: false,
                     native_call_transport: self.current_native_call_transport,
@@ -27360,6 +27376,7 @@ impl ExecNtHandler {
                     signal_file: synchronous_file,
                     publish_iocp: false,
                     event_obj_idx: u64::MAX,
+                    transfer_event: None,
                     reply_cap: 0,
                     reply_required: false,
                     native_call_transport: self.current_native_call_transport,
@@ -27510,6 +27527,7 @@ impl ExecNtHandler {
                     signal_file: synchronous_file,
                     publish_iocp: false,
                     event_obj_idx: u64::MAX,
+                    transfer_event: None,
                     reply_cap: 0,
                     reply_required: false,
                     native_call_transport: self.current_native_call_transport,
@@ -27610,6 +27628,7 @@ impl ExecNtHandler {
                     signal_file: synchronous_file,
                     publish_iocp: false,
                     event_obj_idx: u64::MAX,
+                    transfer_event: None,
                     reply_cap: 0,
                     reply_required: false,
                     native_call_transport: self.current_native_call_transport,
@@ -33462,6 +33481,7 @@ impl ExecNtHandler {
                             signal_file: generic_synchronous_file || event_obj_idx == u64::MAX,
                             publish_iocp: args[2] == 0,
                             event_obj_idx,
+                            transfer_event: None,
                             reply_cap: 0,
                             reply_required: false,
                             native_call_transport: self.current_native_call_transport,
@@ -40001,19 +40021,59 @@ impl ExecNtHandler {
                     },
                     None => None,
                 };
-                if let Err(status) = self.probe_file_io_output(iosb, None) {
-                    return status;
-                }
                 let trace = NT_WRITE_FILE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8;
+                let retained_parameters = match self.retained_file_transfer_parameters(
+                    fh, hosted_write_capture.as_ref().and_then(|capture| capture.as_ref().ok())
+                        .map(|(capture, _)| capture.route),
+                ) {
+                    Ok(parameters) => parameters,
+                    Err(status) => return status,
+                };
+                // ProbeForRead checks the extent here, not resident page protection. The actual
+                // buffered copy occurs after Event reset and File acquisition, as in NT5 write.c.
+                if retained_parameters.is_none() {
+                    if let Err(status) = self.probe_file_io_output(iosb, None) {
+                        return status;
+                    }
+                    if let Err(status) = exec_file_transfer::validate_transfer_input_extent(buffer, len, 1) {
+                        return status;
+                    }
+                }
                 let mut offset_bytes = [0u8; 8];
-                let offset_ok = byte_offset == 0 || self.xas_read(byte_offset, &mut offset_bytes);
+                if let Some(parameters) = retained_parameters {
+                    offset_bytes = parameters.byte_offset.unwrap_or(0).to_le_bytes();
+                } else if byte_offset != 0 {
+                    if let Err(status) = exec_file_transfer::validate_transfer_input_extent(byte_offset, 8, 4) {
+                        return status;
+                    }
+                    if let Err(status) = self.process_memory_read_status(self.pi, byte_offset, &mut offset_bytes) {
+                        return status;
+                    }
+                }
                 let offset_value = u64::from_le_bytes(offset_bytes);
-                let offset_semantics_ok = byte_offset == 0
+                let captured_offset = retained_parameters.map_or_else(
+                    || (byte_offset != 0).then_some(i64::from_le_bytes(offset_bytes)),
+                    |parameters| parameters.byte_offset,
+                );
+                let offset_semantics_ok = captured_offset.is_none()
                     || i64::from_le_bytes(offset_bytes)
                         >= nt_io_manager::FILE_USE_FILE_POINTER_POSITION;
                 let mut key_bytes = [0u8; 4];
-                let key_ok = key == 0 || self.xas_read(key, &mut key_bytes);
+                if let Some(parameters) = retained_parameters {
+                    key_bytes = parameters.key.to_le_bytes();
+                } else if key != 0 {
+                    if let Err(status) = exec_file_transfer::validate_transfer_input_extent(key, 4, 4) {
+                        return status;
+                    }
+                    if let Err(status) = self.process_memory_read_status(self.pi, key, &mut key_bytes) {
+                        return status;
+                    }
+                }
                 let key_value = u32::from_le_bytes(key_bytes);
+                self.current_file_transfer_parameters = Some(nt_io_manager::FileTransferParameters {
+                    arguments: args[..9].try_into().expect("registered transfer requires nine arguments"),
+                    byte_offset: captured_offset, key: key_value,
+                });
                 let apc_completion_conflict = hosted_write_capture
                     .as_ref()
                     .and_then(|capture| capture.as_ref().ok())
@@ -40021,7 +40081,7 @@ impl ExecNtHandler {
                         apc_routine != 0
                             && self.file_completion.binding(capture.route.file_id).is_some()
                     });
-                // The writable overlay keeps its existing copy-loop staging bound. Hosted drivers
+                // The writable overlay keeps its existing per-operation bound. Hosted drivers
                 // stream arbitrary ULONG-sized requests through their per-instance transfer bank.
                 const OVERLAY_IO_CAP: usize = LOCAL_FILE_TRANSFER_CAP;
                 let append_only = overlay_access.is_some_and(|access| {
@@ -40032,27 +40092,8 @@ impl ExecNtHandler {
                 } else {
                     len
                 };
-                let mut payload = if overlay_file.is_some() {
-                    alloc::vec::Vec::new()
-                } else {
-                    match try_zeroed_transfer_buffer(len) {
-                        Ok(payload) => payload,
-                        Err(status) => return status,
-                    }
-                };
-                let payload_ok = if len == 0 {
-                    true
-                } else if buffer == 0 || len > write_capacity {
-                    false
-                } else if overlay_file.is_some() {
-                    let scratch = core::slice::from_raw_parts_mut(
-                        core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
-                        OVERLAY_IO_CAP,
-                    );
-                    self.xas_read(buffer, &mut scratch[..len])
-                } else {
-                    self.xas_read(buffer, &mut payload)
-                };
+                let mut payload = alloc::vec::Vec::new();
+                let mut payload_ok = false;
 
                 let mut completion_event_index = None;
                 let mut information = 0u64;
@@ -40063,31 +40104,25 @@ impl ExecNtHandler {
                 let mut file_retained = false;
                 let mut local_file_io = None;
                 let mut operation_started = false;
-                let mut status = if !offset_ok || !key_ok {
-                    0xC000_0005 // STATUS_ACCESS_VIOLATION
-                } else if !offset_semantics_ok && !append_only {
+                let mut status = if !offset_semantics_ok && !append_only {
                     STATUS_INVALID_PARAMETER
                 } else if len > write_capacity {
                     0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
-                } else if !payload_ok {
-                    0xC000_0005 // STATUS_ACCESS_VIOLATION
                 } else if apc_completion_conflict {
                     STATUS_INVALID_PARAMETER
                 } else {
-                    match self.prepare_io_event_for_request(event) {
+                    match self.prepare_transfer_event(fh, event) {
                         Err(event_status) => event_status,
                         Ok(event_index) => {
                             completion_event_index = event_index;
                             if let Some(file_id) = overlay_file {
-                                operation_started = true;
                                 let route = local_write_route;
                                 let info = crate::writable_fs::file_object_information(file_id);
                                 match (route, info) {
                                     (Some(route), Ok(info)) => {
                                         let resolved =
                                             nt_io_manager::resolve_regular_file_write_offset(
-                                                (byte_offset != 0)
-                                                    .then_some(i64::from_le_bytes(offset_bytes)),
+                                                captured_offset,
                                                 route.synchronous,
                                                 info.current_offset,
                                                 info.metadata.end_of_file,
@@ -40103,6 +40138,22 @@ impl ExecNtHandler {
                                         ) {
                                             Err(status) => status,
                                             Ok(request_id) => {
+                                                payload = {
+                                                    let _durable = allocator::enter_durable();
+                                                    match try_zeroed_transfer_buffer(len) {
+                                                        Ok(payload) => payload,
+                                                        Err(status) => {
+                                                            self.release_local_file_io_reference(route.file_object);
+                                                            return status;
+                                                        }
+                                                    }
+                                                };
+                                                if let Err(status) = self.process_memory_read_status(self.pi, buffer, &mut payload) {
+                                                    self.release_local_file_io_reference(route.file_object);
+                                                    return status;
+                                                }
+                                                payload_ok = true;
+                                                operation_started = true;
                                                 local_file_io = Some((
                                                     request_id,
                                                     route.file_object,
@@ -40123,17 +40174,12 @@ impl ExecNtHandler {
                                                 if lock_status != nt_fs::STATUS_SUCCESS {
                                                     lock_status
                                                 } else {
-                                                    let scratch = core::slice::from_raw_parts(
-                                                        core::ptr::addr_of!(OVERLAY_WRITE_SCRATCH)
-                                                            as *const u8,
-                                                        len,
-                                                    );
                                                     let (status, written) =
                                                         crate::writable_fs::write_completed(
                                                             file_id,
                                                             resolved,
                                                             route.synchronous,
-                                                            scratch,
+                                                            &payload,
                                                         );
                                                     if written != 0 {
                                                         self.writable_fs_dirty = true;
@@ -40196,6 +40242,21 @@ impl ExecNtHandler {
                                 match prepared {
                                     Err(status) => status,
                                     Ok(()) => {
+                                        payload = {
+                                            let _durable = allocator::enter_durable();
+                                            match try_zeroed_transfer_buffer(len) {
+                                                Ok(payload) => payload,
+                                                Err(status) => {
+                                                    self.release_file_reference(file_id);
+                                                    return status;
+                                                }
+                                            }
+                                        };
+                                        if let Err(status) = self.process_memory_read_status(self.pi, buffer, &mut payload) {
+                                            self.release_file_reference(file_id);
+                                            return status;
+                                        }
+                                        payload_ok = true;
                                         operation_started = true;
                                         let mut output = [];
                                         match self.dispatch_hosted_file_read_write_for(
@@ -40262,6 +40323,7 @@ impl ExecNtHandler {
                         signal_file: synchronous || event_obj_idx == u64::MAX,
                         publish_iocp: apc_routine == 0,
                         event_obj_idx,
+                        transfer_event: None,
                         reply_cap: 0,
                         reply_required: false,
                         native_call_transport: self.current_native_call_transport,
@@ -40377,17 +40439,13 @@ impl ExecNtHandler {
                     print_u64((apc_context != 0) as u64);
                     print_str(b" offset_ptr=");
                     print_u64((byte_offset != 0) as u64);
-                    print_str(b" offset_ok=");
-                    print_u64(offset_ok as u64);
-                    if byte_offset != 0 && offset_ok {
+                    if captured_offset.is_some() {
                         print_str(b" offset=0x");
                         print_hex(offset_value as u32);
                     }
                     print_str(b" key_ptr=");
                     print_u64((key != 0) as u64);
-                    print_str(b" key_ok=");
-                    print_u64(key_ok as u64);
-                    if key != 0 && key_ok {
+                    if key != 0 {
                         print_str(b" key=0x");
                         print_hex(key_value);
                     }
@@ -40395,14 +40453,7 @@ impl ExecNtHandler {
                     print_u64(payload_ok as u64);
                     print_str(b" prefix=");
                     if payload_ok {
-                        let prefix = if overlay_file.is_some() {
-                            core::slice::from_raw_parts(
-                                core::ptr::addr_of!(OVERLAY_WRITE_SCRATCH) as *const u8,
-                                len.min(16),
-                            )
-                        } else {
-                            &payload[..payload.len().min(16)]
-                        };
+                        let prefix = &payload[..payload.len().min(16)];
                         for &byte in prefix {
                             print_hex(byte as u32);
                             debug_put_char(b' ');
@@ -40476,20 +40527,57 @@ impl ExecNtHandler {
                     },
                     None => None,
                 };
-                if let Err(status) = self.probe_file_io_output(iosb, None) {
-                    return status;
+                let retained_parameters = match self.retained_file_transfer_parameters(
+                    fh, hosted_read_capture.as_ref().and_then(|capture| capture.as_ref().ok())
+                        .map(|(capture, _)| capture.route),
+                ) {
+                    Ok(parameters) => parameters,
+                    Err(status) => return status,
+                };
+                if retained_parameters.is_none() {
+                    if let Err(status) = self.probe_file_io_output(iosb, None) {
+                        return status;
+                    }
+                    if let Err(status) = self.probe_copy_output(self.pi, buffer, len as u64) {
+                        return status;
+                    }
                 }
                 let mut captured_offset_bytes = [0u8; 8];
-                let offset_ok =
-                    byte_offset == 0 || self.xas_read(byte_offset, &mut captured_offset_bytes);
+                if let Some(parameters) = retained_parameters {
+                    captured_offset_bytes = parameters.byte_offset.unwrap_or(0).to_le_bytes();
+                } else if byte_offset != 0 {
+                    if let Err(status) = exec_file_transfer::validate_transfer_input_extent(byte_offset, 8, 4) {
+                        return status;
+                    }
+                    if let Err(status) = self.process_memory_read_status(self.pi, byte_offset, &mut captured_offset_bytes) {
+                        return status;
+                    }
+                }
                 let offset_value = u64::from_le_bytes(captured_offset_bytes);
                 let signed_offset = i64::from_le_bytes(captured_offset_bytes);
-                let offset_semantics_ok = byte_offset == 0
+                let captured_offset = retained_parameters.map_or_else(
+                    || (byte_offset != 0).then_some(signed_offset),
+                    |parameters| parameters.byte_offset,
+                );
+                let offset_semantics_ok = captured_offset.is_none()
                     || signed_offset >= 0
                     || signed_offset == nt_io_manager::FILE_USE_FILE_POINTER_POSITION;
                 let mut key_bytes = [0u8; 4];
-                let key_ok = key == 0 || self.xas_read(key, &mut key_bytes);
+                if let Some(parameters) = retained_parameters {
+                    key_bytes = parameters.key.to_le_bytes();
+                } else if key != 0 {
+                    if let Err(status) = exec_file_transfer::validate_transfer_input_extent(key, 4, 4) {
+                        return status;
+                    }
+                    if let Err(status) = self.process_memory_read_status(self.pi, key, &mut key_bytes) {
+                        return status;
+                    }
+                }
                 let key_value = u32::from_le_bytes(key_bytes);
+                self.current_file_transfer_parameters = Some(nt_io_manager::FileTransferParameters {
+                    arguments: args[..9].try_into().expect("registered transfer requires nine arguments"),
+                    byte_offset: captured_offset, key: key_value,
+                });
                 let apc_completion_conflict = hosted_read_capture
                     .as_ref()
                     .and_then(|capture| capture.as_ref().ok())
@@ -40521,20 +40609,14 @@ impl ExecNtHandler {
                 let mut completion_event_index = None;
                 let mut completion_event_trace = Ok(None);
                 let mut operation_started = false;
-                let mut status = if !offset_ok || !key_ok {
-                    0xC000_0005 // STATUS_ACCESS_VIOLATION
-                } else if !offset_semantics_ok {
+                let mut status = if !offset_semantics_ok {
                     STATUS_INVALID_PARAMETER
                 } else if overlay_file.is_some() && len > OVERLAY_IO_CAP {
                     0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
-                } else if len != 0 && buffer == 0 {
-                    0xC000_0005 // STATUS_ACCESS_VIOLATION
                 } else if apc_completion_conflict {
                     STATUS_INVALID_PARAMETER
-                } else if let Err(status) = self.probe_copy_output(self.pi, buffer, len as u64) {
-                    status
                 } else {
-                    match self.prepare_io_event_for_request(event) {
+                    match self.prepare_transfer_event(fh, event) {
                         Err(event_status) => {
                             completion_event_trace = Err(event_status);
                             event_status
@@ -40558,7 +40640,7 @@ impl ExecNtHandler {
                                         Err(status) => return status,
                                     };
                                 let resolved = nt_io_manager::resolve_regular_file_read_offset(
-                                    (byte_offset != 0).then_some(signed_offset),
+                                    captured_offset,
                                     synchronous,
                                     current,
                                 );
@@ -40625,7 +40707,7 @@ impl ExecNtHandler {
                                     (Some(route), Ok(info)) => {
                                         let resolved =
                                             nt_io_manager::resolve_regular_file_read_offset(
-                                                (byte_offset != 0).then_some(signed_offset),
+                                                captured_offset,
                                                 route.synchronous,
                                                 info.current_offset,
                                             );
@@ -40830,6 +40912,7 @@ impl ExecNtHandler {
                         signal_file: synchronous || event_obj_idx == u64::MAX,
                         publish_iocp: apc_routine == 0,
                         event_obj_idx,
+                        transfer_event: None,
                         reply_cap: 0,
                         reply_required: false,
                         native_call_transport: self.current_native_call_transport,
@@ -41135,6 +41218,7 @@ impl ExecNtHandler {
                             signal_file: synchronous_file,
                             publish_iocp: false,
                             event_obj_idx: u64::MAX,
+                            transfer_event: None,
                             reply_cap: 0,
                             reply_required: false,
                             native_call_transport: self.current_native_call_transport,

@@ -108,9 +108,12 @@ pub(crate) unsafe fn drive(
                 report_failure(waiter, Effect::RetireApcReplyCap, status);
                 return false;
             }
-            (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
+            let finished = (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
                 .finish_cancellation(identity)
                 .expect("settled File cancellation lost its exact owner");
+            if let Some(event) = finished.transfer_event {
+                nt_handler.release_transfer_event(event);
+            }
             return true;
         }
         if !matches!(phase, Phase::Ready { .. }) {

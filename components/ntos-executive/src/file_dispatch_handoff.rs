@@ -78,6 +78,11 @@ pub(super) unsafe fn before_post_action(
         let identity = reservation.identity();
         let local_terminal = pending.owned_terminal_result().is_some()
             || matches!(pending.operation, nt_io_manager::PendingFileIoOperation::OwnedModePrecommit(_));
+        if let Some(event) = nt_handler.current_file_transfer_event.take() {
+            assert!(pending.transfer_event.is_none());
+            assert!(pending.event_obj_idx == u64::MAX || pending.event_obj_idx == event.native_identity);
+            pending.transfer_event = Some(event);
+        }
         pending_file_io_transfer(
             pending,
             wait_for_completion,
@@ -123,6 +128,7 @@ pub(super) unsafe fn before_post_action(
         inline_file_retirement::retire(identity);
         inline_file_retirement::redrive(nt_handler);
     }
+    nt_handler.release_current_transfer_event();
     if let Some(owner) = published.as_ref().filter(|_| terminating) {
         // The current main Reply was never transferred. Post-action teardown deletes it; the
         // published File owner instead retains real cancellation/completion and Busy retirement.

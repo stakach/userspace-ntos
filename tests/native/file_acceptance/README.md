@@ -59,8 +59,10 @@ Any mismatch terminates the real process with STATUS_UNSUCCESSFUL. Nineteen comp
 - NOACCESS and GUARD output spans across an actual VM page boundary, unchanged
   output bytes, and the consumed guard's actual protection readback.
 - READ output, WRITE input and IOSB spans crossing into a protected page.
-- Failed probes leave current position/content unchanged and supplied Event
-  nonsignaled; successful readback proves real stored bytes are intact.
+- Early READ output faults preserve the File signal. Late buffered WRITE input
+  faults leave the File and initially-signaled supplied Event reset, without
+  publishing IOSB or changing position/content. Successful readback proves Busy
+  was released and real stored bytes are intact.
 - A real `RtlCreateUserThread` worker opens `\Registry\Machine\Software\Classes`.
   `NtQueryKey(KeyNameInformation,NULL,0,&stack_ResultLength)` must return
   BUFFER_TOO_SMALL and the exact required length. A full query checks that length,
@@ -70,7 +72,10 @@ Any mismatch terminates the real process with STATUS_UNSUCCESSFUL. Nineteen comp
 ABI and fault precedence come from ReactOS `ntoskrnl/io/iomgr/iofunc.c`:
 `NtQueryInformationFile` validates class/length, probes IOSB/output, then resolves
 the handle; `NtReadFile`/`NtWriteFile` resolve the File/access first, then probe
-IOSB/data. Those SEH boundaries return the actual exception code. Thus the fixture
+IOSB/data. NT5 `base/ntos/io/iomgr/write.c` distinguishes the early extent-only
+`ProbeForRead` from the actual buffered copy after Event reset, Busy acquisition
+and File signal clear. Its `IopExceptionCleanup` releases ownership without
+signaling or IOSB publication. Those SEH boundaries return the actual exception code. Thus the fixture
 expects STATUS_ACCESS_VIOLATION or STATUS_GUARD_PAGE_VIOLATION returns, not a
 manufactured exception in user mode. `sdk/include/reactos/probe.h` probes the
 complete sixteen-byte IOSB before provider entry. The returned FileAll layout is

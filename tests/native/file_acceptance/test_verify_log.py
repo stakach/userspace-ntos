@@ -35,6 +35,31 @@ def accepted_log():
 
 
 class AcceptanceParserTests(unittest.TestCase):
+    def test_write_guard_and_early_scalar_signal_receipts_are_required(self):
+        cases = ("write-input-guard", "write-offset-noaccess", "write-key-guard")
+        for case in cases:
+            for field in ("status", "iosb-status", "iosb-information", "old-protection", "position"):
+                with self.subTest(case=case, field=field):
+                    text = "\n".join(line for line in accepted_log().splitlines()
+                                     if not (f"case={case} " in line and f"field={field} " in line))
+                    with self.assertRaises(ValueError): verify(text)
+        for case in ("write-input-guard-event-wait", "write-input-guard-file-wait",
+                     "write-offset-event-wait", "write-offset-file-wait",
+                     "write-key-event-wait", "write-key-file-wait"):
+            with self.subTest(case=case):
+                text = "\n".join(line for line in accepted_log().splitlines()
+                                 if f"case={case} " not in line)
+                with self.assertRaises(ValueError): verify(text)
+
+    def test_write_fault_reset_and_early_read_signal_receipts_are_required(self):
+        for case in ["write-fault-event-create", "write-input-fault-file-wait",
+                     "write-fault-event-close", "read-output-fault-file-wait"]:
+            with self.subTest(case=case):
+                text = "\n".join(line for line in accepted_log().splitlines()
+                                 if f"case={case} " not in line)
+                with self.assertRaises(ValueError):
+                    verify(text)
+
     def test_exact_dynamic_identity_and_retirement(self):
         self.assertEqual(verify(accepted_log()), (413, 7))
 

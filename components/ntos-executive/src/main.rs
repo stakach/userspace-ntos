@@ -23355,6 +23355,10 @@ struct ExecNtHandler {
     current_server_client_pid: u32,
     /// Promoted acquisition whose retained route replaces process-handle lookup on retry.
     active_synchronous_file_retry: Option<nt_io_manager::SynchronousFileIngress>,
+    // Checked-copy pumps broker work, not top-level syscall ingress; these owners remain scoped
+    // to this dispatch until handoff transfers them into the exact waiter or pending File row.
+    current_file_transfer_parameters: Option<nt_io_manager::FileTransferParameters>,
+    current_file_transfer_event: Option<nt_io_manager::FileTransferEvent>,
     /// Exact pre-reserved Busy/reference owner, transferred or retired at the dispatch boundary.
     current_synchronous_file: Option<nt_io_manager::inline_file_retirement::InlineFileRetirementIdentity>,
     current_apc_handoff: Option<nt_user_host::current_apc::CurrentApcIdentity>,

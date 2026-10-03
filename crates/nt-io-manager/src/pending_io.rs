@@ -187,6 +187,8 @@ pub struct PendingFileIo {
     pub publish_iocp: bool,
     /// Executive event-object index, or `u64::MAX` when no event was supplied.
     pub event_obj_idx: u64,
+    /// Exact Event Operation lease transferred by READ/WRITE admission, not by handle lookup.
+    pub transfer_event: Option<crate::FileTransferEvent>,
     /// Stolen synchronous syscall reply cap. Async requests have no reply owner.
     pub reply_cap: u64,
     /// Whether this record owns a parked synchronous syscall reply.
@@ -1622,6 +1624,7 @@ mod tests {
             signal_file: false,
             publish_iocp: false,
             event_obj_idx: 7,
+            transfer_event: None,
             reply_cap: 0x50,
             reply_required: true,
             native_call_transport: false,

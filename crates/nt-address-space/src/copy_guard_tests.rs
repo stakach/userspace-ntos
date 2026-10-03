@@ -105,6 +105,38 @@ fn guarded_source_is_partial_copy_and_only_local_guard_is_consumed() {
 }
 
 #[test]
+fn file_input_capture_returns_exact_cross_page_protection_status() {
+    for (protection, expected) in [
+        (PAGE_NOACCESS, STATUS_ACCESS_VIOLATION),
+        (PAGE_READWRITE | PAGE_GUARD, STATUS_GUARD_PAGE_VIOLATION),
+    ] {
+        for length in [4usize, 8, 16] {
+            let mut memory = Memory::default();
+            memory.add(0x1000, PAGE_READWRITE, false, 0x11);
+            memory.add(0x2000, protection, false, 0x22);
+            let mut captured = [0xa5; 16];
+            let start = 0x2000 - (length as u64 / 2);
+            assert_eq!(
+                read_kernel_buffer(start, &mut captured[..length], 0x10000,
+                    |address, bytes| VirtualMemoryCopy::read(&mut memory, address, bytes)),
+                Err(expected),
+            );
+            assert_eq!(&captured[..length / 2], &[0x11; 8][..length / 2]);
+            assert_eq!(&captured[length / 2..], &[0xa5; 16][length / 2..]);
+            assert_eq!(memory.pages[&0x2000].bytes, [0x22; PAGE_SIZE as usize]);
+            if protection & PAGE_GUARD != 0 {
+                assert_eq!(memory.pages[&0x2000].info.protect, PAGE_READWRITE);
+                assert_eq!(
+                    read_kernel_buffer(start, &mut captured[..length], 0x10000,
+                        |address, bytes| VirtualMemoryCopy::read(&mut memory, address, bytes)),
+                    Ok(()),
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn file_query_output_probe_consumes_guard_once_without_publishing_result() {
     let mut memory = Memory::default();
     memory.add(0x1000, PAGE_READWRITE, false, 0xa5);

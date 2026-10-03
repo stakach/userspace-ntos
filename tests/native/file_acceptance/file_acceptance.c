@@ -245,12 +245,64 @@ static void fault_cases(HANDLE file)
     status("read-output-crossing", NtReadFile(file, event, 0, 0, &iosb, base + 4088, 16, &offset, 0), AV);
     eq("read-output-crossing", "iosb-status", iosb.Status, SENTINEL);
     eq("read-output-crossing", "iosb-information", iosb.Information, SENTINEL);
+    int64_t poll = 0;
+    status("read-output-fault-file-wait", NtWaitForSingleObject(file, 0, &poll), SUCCESS);
     query_position(file, sizeof(payload)); nonsignaled(event); ++completed;
 
-    status("write-input-crossing", NtWriteFile(file, event, 0, 0, &iosb, base + 4088, 16, &offset, 0), AV);
+    HANDLE write_event = 0;
+    status("write-fault-event-create", NtCreateEvent(&write_event, 0x001f0003, 0, 0, 1), SUCCESS);
+    status("write-input-crossing", NtWriteFile(file, write_event, 0, 0, &iosb, base + 4088, 16, &offset, 0), AV);
     eq("write-input-crossing", "iosb-status", iosb.Status, SENTINEL);
     eq("write-input-crossing", "iosb-information", iosb.Information, SENTINEL);
-    query_position(file, sizeof(payload)); nonsignaled(event); ++completed;
+    status("write-input-fault-file-wait", NtWaitForSingleObject(file, 0, &poll), TIMEOUT);
+    query_position(file, sizeof(payload)); nonsignaled(write_event);
+    status("write-fault-event-close", NtClose(write_event), SUCCESS);
+
+    protect(base + 4096, PAGE_RW | PAGE_GUARD);
+    iosb = untouched(); write_event = 0;
+    status("write-guard-event-create", NtCreateEvent(&write_event, 0x001f0003, 0, 0, 1), SUCCESS);
+    status("write-input-guard", NtWriteFile(file, write_event, 0, 0, &iosb,
+           base + 4088, 16, &offset, 0), GUARD);
+    eq("write-input-guard", "iosb-status", iosb.Status, SENTINEL);
+    eq("write-input-guard", "iosb-information", iosb.Information, SENTINEL);
+    status("write-input-guard-file-wait", NtWaitForSingleObject(file, 0, &poll), TIMEOUT);
+    status("write-input-guard-event-wait", NtWaitForSingleObject(write_event, 0, &poll), TIMEOUT);
+    eq("write-input-guard", "old-protection", protect(base + 4096, PAGE_RW), PAGE_RW);
+    uint64_t position = UINT64_MAX; IO_STATUS_BLOCK position_iosb = untouched();
+    status("write-input-guard-position", NtQueryInformationFile(file, &position_iosb,
+           &position, sizeof(position), 14), SUCCESS);
+    eq("write-input-guard", "position", position, sizeof(payload));
+    status("write-guard-event-close", NtClose(write_event), SUCCESS);
+
+    /* Optional scalar pointers fault before the initially signaled Event is reset. */
+    for (unsigned key_case = 0; key_case != 2; ++key_case) {
+        const char *name = key_case ? "write-key-guard" : "write-offset-noaccess";
+        fill(base + 4088, 16, 0);
+        protect(base + 4096, key_case ? PAGE_RW | PAGE_GUARD : PAGE_NOACCESS);
+        HANDLE scalar_event = 0;
+        status(key_case ? "write-key-event-create" : "write-offset-event-create",
+               NtCreateEvent(&scalar_event, 0x001f0003, 0, 0, 1), SUCCESS);
+        iosb = untouched();
+        status(name, NtWriteFile(file, scalar_event, 0, 0, &iosb, (void *)payload,
+               sizeof(payload), key_case ? &offset : (int64_t *)(base + 4092),
+               key_case ? (uint32_t *)(base + 4096) : 0), key_case ? GUARD : AV);
+        eq(name, "iosb-status", iosb.Status, SENTINEL);
+        eq(name, "iosb-information", iosb.Information, SENTINEL);
+        status(key_case ? "write-key-event-wait" : "write-offset-event-wait",
+               NtWaitForSingleObject(scalar_event, 0, &poll), SUCCESS);
+        status(key_case ? "write-key-file-wait" : "write-offset-file-wait",
+               NtWaitForSingleObject(file, 0, &poll), SUCCESS);
+        eq(name, "old-protection", protect(base + 4096, PAGE_RW),
+           key_case ? PAGE_RW : PAGE_NOACCESS);
+        position = UINT64_MAX; position_iosb = untouched();
+        status(key_case ? "write-key-position" : "write-offset-position",
+               NtQueryInformationFile(file, &position_iosb, &position, sizeof(position), 14), SUCCESS);
+        eq(name, "position", position, sizeof(payload));
+        status(key_case ? "write-key-event-close" : "write-offset-event-close",
+               NtClose(scalar_event), SUCCESS);
+    }
+    ++completed;
+    protect(base + 4096, PAGE_NOACCESS);
 
     /* IOSB probe spans both words before provider entry; no terminal IOSB publication occurs. */
     uintptr_t *partial = (uintptr_t *)(base + 4088); *partial = SENTINEL;

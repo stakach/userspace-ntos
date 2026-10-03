@@ -99,6 +99,8 @@ impl ExecNtHandler {
                 // The policy transition and transfer are memory-only. No callback can request
                 // cancellation between grant adoption and publication of current-syscall Busy.
                 assert!(!owner.cancellation_requested());
+                assert!(self.current_file_transfer_event.is_none());
+                self.current_file_transfer_event = owner.waiter().transfer_event;
                 self.current_synchronous_file = Some(admission.activate());
                 return Ok(true);
             }
@@ -119,6 +121,8 @@ impl ExecNtHandler {
             self.current_native_call_transport, 0, self.current_resume_ip,
             self.current_sp, self.current_flags,
         );
+        waiter.transfer_parameters = self.current_file_transfer_parameters;
+        waiter.transfer_event = self.current_file_transfer_event;
         // Capture before counting contention: copyin can re-enter the executive. A bad retry
         // frame matters only if this acquisition actually needs to park.
         let retry_ip = if waiter.native_call_transport {
@@ -146,6 +150,8 @@ impl ExecNtHandler {
                 Ok(true)
             }
             Ok(nt_io_completion::FileIoAcquireResult::Contended { alertable }) => {
+                // The counted acquisition now owns the captured Event even if cancellation follows.
+                self.current_file_transfer_event = None;
                 let apc_queued = alertable && self.pm.peek_user_apc(waiter.tid as u32).is_some();
                 if apc_queued || retry_ip.is_err() {
                     if !crate::service_sec_image::synchronous_file_cancellation::cancel_unpublished(

@@ -12,6 +12,8 @@ mod file_mode_set;
 mod file_transfer_admission;
 #[path = "native_acceptance/file_query_output_probe.rs"]
 mod file_query_output_probe;
+#[path = "native_acceptance/file_transfer_input_capture.rs"]
+mod file_transfer_input_capture;
 #[path = "native_acceptance/generic_application_contracts.rs"]
 mod generic_application_contracts;
 #[path = "native_acceptance/image_process_bridge.rs"]

@@ -488,3 +488,11 @@ diagnosis-free failure.
 - A fixture's completed-group count does not identify every check it reached. Verify each
   claimed native case against its actual log record; do not promote host coverage or a later
   source assertion into guest execution evidence.
+
+## Preserve Capture Timing Across Blocking
+- A user pointer retained in a retry frame is not the value captured before a wait.
+  Keep captured scalars and exact referenced objects with the parked request; a
+  reused handle must not redirect an already-admitted operation.
+- Preserve NT's distinct early probes and late buffered copies. A late copy
+  exception releases acquisition ownership without publishing an I/O completion;
+  moving every copy early can conceal a bug while changing observable semantics.
