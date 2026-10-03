@@ -182,7 +182,9 @@ mod tests {
                         if matches!(name.value().as_str(), "IoCallDriver" | "IofCallDriver"
                             | "ExfAcquirePushLockExclusive" | "ExfAcquirePushLockShared"
                             | "ExfReleasePushLockExclusive" | "ExfReleasePushLockShared"
-                            | "ExfReleasePushLock" | "ExfTryToWakePushLock") {
+                            | "ExfReleasePushLock" | "ExfTryToWakePushLock"
+                            | "DbgPrint" | "DbgPrintEx" | "vDbgPrintEx"
+                            | "vDbgPrintExWithPrefix") {
                             let mut target = call.args.iter().nth(1).expect("binding target");
                             while let syn::Expr::Cast(cast) = target {
                                 target = &cast.expr;
@@ -218,6 +220,51 @@ mod tests {
             }
             syn::visit::visit_expr_method_call(self, call);
         }
+    }
+
+    fn collect_debug_helper_bindings(
+        register: &syn::Block,
+        driver: &syn::File,
+        bindings: &mut ProductionBindings,
+    ) -> Result<(), &'static str> {
+        #[derive(Default)]
+        struct HelperCalls {
+            total: usize,
+            exact: usize,
+        }
+        impl<'ast> Visit<'ast> for HelperCalls {
+            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                if let syn::Expr::Path(path) = &*call.func {
+                    if path.path.segments.last().is_some_and(|segment|
+                        segment.ident == "bind_debug_exports")
+                    {
+                        self.total += 1;
+                        let expected = ["crate", "driver_launch", "bind_debug_exports"];
+                        let exact_path = path.path.leading_colon.is_none()
+                            && path.path.segments.len() == expected.len()
+                            && path.path.segments.iter().zip(expected).all(|(segment, name)|
+                                segment.ident == name && matches!(segment.arguments, syn::PathArguments::None));
+                        if exact_path && call.args.len() == 1
+                            && matches!(&call.args[0], syn::Expr::Path(path) if path.path.is_ident("reg"))
+                        {
+                            self.exact += 1;
+                        }
+                    }
+                }
+                syn::visit::visit_expr_call(self, call);
+            }
+        }
+        let mut calls = HelperCalls::default();
+        calls.visit_block(register);
+        if calls.total != 1 || calls.exact != 1 {
+            return Err("win32k must call crate::driver_launch::bind_debug_exports(reg) exactly once");
+        }
+        let helper = driver.items.iter().find_map(|item| match item {
+            syn::Item::Fn(function) if function.sig.ident == "bind_debug_exports" => Some(function),
+            _ => None,
+        }).ok_or("shared debug binding helper is absent")?;
+        bindings.visit_block(&helper.block);
+        Ok(())
     }
 
     fn production_data_exports(source: &syn::File) -> std::vec::Vec<std::string::String> {
@@ -271,6 +318,22 @@ mod tests {
             data_export_loops: 0,
         };
         bindings.visit_block(&register.block);
+        let driver = syn::parse_file(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../components/ntos-executive/src/driver_launch.rs"
+        ))).expect("production driver source must parse");
+        collect_debug_helper_bindings(&register.block, &driver, &mut bindings)
+            .expect("production debug helper call must be exact");
+        for (name, target) in [
+            ("DbgPrint", "hosted_dbg_print_gate"),
+            ("DbgPrintEx", "hosted_dbg_print_ex_gate"),
+            ("vDbgPrintEx", "s_vdbg_print_ex"),
+            ("vDbgPrintExWithPrefix", "s_vdbg_print_ex_with_prefix"),
+        ] {
+            let actual = bindings.function_targets.get(name).expect("shared debug binding");
+            assert!(actual.iter().map(std::string::String::as_str).eq([target]),
+                "{name} must retain its actual variadic or va_list ABI");
+        }
         let call_driver = bindings
             .function_targets
             .get("IoCallDriver")
@@ -328,6 +391,36 @@ mod tests {
             absent.is_empty(),
             "win32k required imports without production bindings: {absent:?}"
         );
+    }
+
+    #[test]
+    fn unused_debug_helper_cannot_satisfy_production_import_coverage() {
+        let driver = syn::parse_file(
+            "fn bind_debug_exports(reg: &mut Registry) { reg.bind(\"DbgPrint\", hosted_dbg_print_gate as u64); }"
+        ).unwrap();
+        for block in [
+            "{}",
+            "{ other::bind_debug_exports(reg); }",
+            "{ crate::driver_launch::bind_debug_exports(other); }",
+            "{ crate::driver_launch::bind_debug_exports(reg); crate::driver_launch::bind_debug_exports(reg); }",
+        ] {
+            let block = syn::parse_str::<syn::Block>(block).unwrap();
+            let mut bindings = ProductionBindings {
+                names: BTreeSet::new(),
+                function_targets: BTreeMap::new(),
+                data_export_loops: 0,
+            };
+            assert!(collect_debug_helper_bindings(&block, &driver, &mut bindings).is_err());
+            assert!(bindings.names.is_empty(), "unreachable helper must not supply bindings");
+        }
+        let block = syn::parse_str("{ crate::driver_launch::bind_debug_exports(reg); }").unwrap();
+        let mut bindings = ProductionBindings {
+            names: BTreeSet::new(),
+            function_targets: BTreeMap::new(),
+            data_export_loops: 0,
+        };
+        collect_debug_helper_bindings(&block, &driver, &mut bindings).unwrap();
+        assert!(bindings.names.contains("DbgPrint"));
     }
 
     #[test]
