@@ -36,7 +36,7 @@ fn terminal(major: u8, status: u32, information: u64, synchronous: bool) -> Pend
         route: PendingFileRoute::Local(LocalFileObject::Overlay(FILE)),
         irp_id: ID,
         major,
-        operation: PendingFileIoOperation::LocalInline(PendingLocalInline {
+        operation: PendingFileIoOperation::OwnedInline(PendingOwnedInline {
             status,
             information,
         }),
@@ -51,11 +51,11 @@ fn terminal(major: u8, status: u32, information: u64, synchronous: bool) -> Pend
 }
 
 fn settle_reply_with_rejection(table: &mut PendingFileIoTable, slot: usize) {
-    let terminal = table.get(slot).unwrap().local_terminal_result();
+    let terminal = table.get(slot).unwrap().owned_terminal_result();
     assert_eq!(table.claim_reply_cap_exact(slot, ID), Some(Some(REPLY)));
     // A definitive native send rejection returns the exact cap; no user copy is repeated.
     table.restore_reply_cap_exact(slot, ID, REPLY).unwrap();
-    assert_eq!(table.get(slot).unwrap().local_terminal_result(), terminal);
+    assert_eq!(table.get(slot).unwrap().owned_terminal_result(), terminal);
     assert!(table.finish_exact(slot, ID).is_none());
     assert_eq!(table.claim_reply_cap_exact(slot, ID), Some(Some(REPLY)));
     table.mark_reply_published_exact(slot, ID).unwrap();
@@ -166,14 +166,14 @@ fn accepted_read_and_write_survive_surface_reply_and_reference_release_retries()
             assert!(table.finish_exact(slot, ID).is_none());
             assert_eq!(fs.query_file_object_information(handle).unwrap(), accepted);
             assert_eq!(
-                table.get(slot).unwrap().local_terminal_result(),
+                table.get(slot).unwrap().owned_terminal_result(),
                 Some((status, transferred as u64))
             );
         }
         assert!(fs.pop_directory_notify_completion().is_none());
         assert_eq!(fs.file_bytes(PATH).unwrap(), bytes.as_slice());
         fs.zw_release_io_reference(handle).unwrap();
-        table.mark_local_reference_released_exact(slot, ID).unwrap();
+        table.mark_owned_reference_released_exact(slot, ID).unwrap();
         table.finish_exact(slot, ID).unwrap();
         assert_eq!(
             fs.query_file_object_information(handle),
@@ -226,11 +226,11 @@ fn definitive_read_copy_fault_keeps_accepted_position_and_access_metadata() {
     assert_eq!(user_output, [b'b', b'c', 0xcc, 0xcc]);
     assert_eq!(fs.query_file_object_information(handle).unwrap(), accepted);
     assert_eq!(
-        table.get(slot).unwrap().local_terminal_result(),
+        table.get(slot).unwrap().owned_terminal_result(),
         Some((copy_status, read as u64))
     );
     fs.zw_release_io_reference(handle).unwrap();
-    table.mark_local_reference_released_exact(slot, ID).unwrap();
+    table.mark_owned_reference_released_exact(slot, ID).unwrap();
     table.finish_exact(slot, ID).unwrap();
     assert_eq!(fs.zw_close(handle), STATUS_SUCCESS);
 }
@@ -285,7 +285,7 @@ fn asynchronous_completed_write_keeps_exact_reply_until_delivery_or_abandonment(
             settle_reply_with_rejection(&mut table, slot);
         }
         assert_eq!(
-            table.get(slot).unwrap().local_terminal_result(),
+            table.get(slot).unwrap().owned_terminal_result(),
             Some((STATUS_SUCCESS, 2))
         );
         assert_eq!(fs.zw_close(handle), STATUS_SUCCESS);
@@ -293,7 +293,7 @@ fn asynchronous_completed_write_keeps_exact_reply_until_delivery_or_abandonment(
         assert_eq!(fs.current_offset(handle), Some(4));
         assert_eq!(fs.file_bytes(PATH), Some(&b"aXYdef"[..]));
         fs.zw_release_io_reference(handle).unwrap();
-        table.mark_local_reference_released_exact(slot, ID).unwrap();
+        table.mark_owned_reference_released_exact(slot, ID).unwrap();
         table.finish_exact(slot, ID).unwrap();
         assert_eq!(
             fs.query_file_object_information(handle),

@@ -9,7 +9,7 @@ fn inline() -> PendingFileIo {
         route: PendingFileRoute::Local(LocalFileObject::Overlay(FILE)),
         irp_id: ID,
         major: nt_io_abi::major::IRP_MJ_LOCK_CONTROL,
-        operation: PendingFileIoOperation::LocalInline(PendingLocalInline {
+        operation: PendingFileIoOperation::OwnedInline(PendingOwnedInline {
             status: 0,
             information: 0x1_0000_0001,
         }),
@@ -47,7 +47,7 @@ fn exact_reserved_insertion_keeps_terminal_information_without_payload() {
     let slot = table.park_reserved(reservation, request).unwrap();
     assert_eq!(table.get(slot), Some(request));
     assert!(request.is_local());
-    assert_eq!(request.local_terminal_result(), Some((0, 0x1_0000_0001)));
+    assert_eq!(request.owned_terminal_result(), Some((0, 0x1_0000_0001)));
     assert_eq!(
         table.park_reserved(reservation, request),
         Err(PendingFileIoParkError::StaleReservation)
@@ -98,7 +98,7 @@ fn local_wait_correlations_cannot_match_provider_completions() {
 fn invalid_local_shapes_do_not_consume_the_reservation() {
     let changes: &[fn(&mut PendingFileIo)] = &[
         |request| {
-            request.operation = PendingFileIoOperation::LocalInline(PendingLocalInline {
+            request.operation = PendingFileIoOperation::OwnedInline(PendingOwnedInline {
                 status: nt_status::NtStatus::PENDING.raw() as u32,
                 information: 0,
             })
@@ -133,7 +133,7 @@ fn invalid_local_shapes_do_not_consume_the_reservation() {
 fn suppressed_inline_failure_can_omit_iosb_and_other_consumer_surfaces() {
     let mut table = PendingFileIoTable::new();
     let mut request = inline();
-    request.operation = PendingFileIoOperation::LocalInline(PendingLocalInline {
+    request.operation = PendingFileIoOperation::OwnedInline(PendingOwnedInline {
         status: 0xc000_000d,
         information: 0,
     });
@@ -149,12 +149,12 @@ fn suppressed_inline_failure_can_omit_iosb_and_other_consumer_surfaces() {
     table.mark_reply_published_exact(slot, ID).unwrap();
     table.mark_backend_acked_exact(slot, ID).unwrap();
     assert!(table.finish_exact(slot, ID).is_none());
-    table.mark_local_reference_released_exact(slot, ID).unwrap();
+    table.mark_owned_reference_released_exact(slot, ID).unwrap();
     assert_eq!(
         table
             .finish_exact(slot, ID)
             .unwrap()
-            .local_terminal_result(),
+            .owned_terminal_result(),
         Some((0xc000_000d, 0))
     );
 }
@@ -172,7 +172,7 @@ fn each_surface_and_both_final_acknowledgements_gate_retirement() {
         let before = table.get(slot).unwrap();
         assert!(table.mark_backend_acked_exact(slot, ID).is_none());
         assert!(table
-            .mark_local_reference_released_exact(slot, ID)
+            .mark_owned_reference_released_exact(slot, ID)
             .is_none());
         assert!(table.finish_exact(slot, ID).is_none());
         assert_eq!(table.get(slot), Some(before));
@@ -184,7 +184,7 @@ fn each_surface_and_both_final_acknowledgements_gate_retirement() {
     table.mark_reply_published_exact(slot, ID).unwrap();
     assert!(table.completion_surfaces_settled_exact(slot, ID));
     assert!(table
-        .mark_local_reference_released_exact(slot, ID)
+        .mark_owned_reference_released_exact(slot, ID)
         .is_none());
     table.mark_backend_acked_exact(slot, ID).unwrap();
     let awaiting_reference = table.get(slot).unwrap();
@@ -192,23 +192,23 @@ fn each_surface_and_both_final_acknowledgements_gate_retirement() {
         assert!(table.finish_exact(slot, ID).is_none());
         assert_eq!(table.get(slot), Some(awaiting_reference));
         assert_eq!(
-            awaiting_reference.local_terminal_result(),
-            inline().local_terminal_result()
+            awaiting_reference.owned_terminal_result(),
+            inline().owned_terminal_result()
         );
     }
     assert!(table
-        .mark_delivery_exact(slot, ID, IO_DELIVERY_LOCAL_REFERENCE_RELEASED)
+        .mark_delivery_exact(slot, ID, IO_DELIVERY_OWNED_REFERENCE_RELEASED)
         .is_none());
-    table.mark_local_reference_released_exact(slot, ID).unwrap();
+    table.mark_owned_reference_released_exact(slot, ID).unwrap();
     assert!(table
-        .mark_local_reference_released_exact(slot, ID)
+        .mark_owned_reference_released_exact(slot, ID)
         .is_none());
     assert_eq!(
         table
             .finish_exact(slot, ID)
             .unwrap()
-            .local_terminal_result(),
-        inline().local_terminal_result()
+            .owned_terminal_result(),
+        inline().owned_terminal_result()
     );
     assert!(table.finish_exact(slot, ID).is_none());
 }
@@ -224,20 +224,20 @@ fn crossed_and_reused_slots_cannot_advance_another_local_owner() {
     assert!(table.claim_reply_cap_exact(slot, ID + 1).is_none());
     assert!(table.mark_backend_acked_exact(slot, ID + 1).is_none());
     assert!(table
-        .mark_local_reference_released_exact(slot, ID + 1)
+        .mark_owned_reference_released_exact(slot, ID + 1)
         .is_none());
     assert!(table.finish_exact(slot, ID + 1).is_none());
     assert_eq!(table.get(slot), original);
     publish_surfaces(&mut table, slot, ID);
     table.mark_backend_acked_exact(slot, ID).unwrap();
-    table.mark_local_reference_released_exact(slot, ID).unwrap();
+    table.mark_owned_reference_released_exact(slot, ID).unwrap();
     table.finish_exact(slot, ID).unwrap();
     let mut next = inline();
     next.irp_id += 1;
     assert_eq!(table.park(next), Some(slot));
     assert!(table.mark_backend_acked_exact(slot, ID).is_none());
     assert!(table
-        .mark_local_reference_released_exact(slot, ID)
+        .mark_owned_reference_released_exact(slot, ID)
         .is_none());
     assert!(table.finish_exact(slot, ID).is_none());
     assert_eq!(table.get(slot), Some(next));
@@ -279,14 +279,14 @@ fn abandonment_preserves_terminal_result_and_final_reference_obligation() {
         );
         let original = abandoned.unwrap();
         assert_eq!(
-            original.local_terminal_result(),
-            inline().local_terminal_result()
+            original.owned_terminal_result(),
+            inline().owned_terminal_result()
         );
         let retained = table.get(slot).unwrap();
         assert!(retained.consumer_abandoned);
         assert_eq!(
-            retained.local_terminal_result(),
-            original.local_terminal_result()
+            retained.owned_terminal_result(),
+            original.owned_terminal_result()
         );
         assert_eq!(
             (retained.iosb_va, retained.apc_routine, retained.reply_cap),
@@ -299,13 +299,13 @@ fn abandonment_preserves_terminal_result_and_final_reference_obligation() {
             table.mark_backend_acked_exact(slot, ID).unwrap();
         }
         assert!(table.finish_exact(slot, ID).is_none());
-        table.mark_local_reference_released_exact(slot, ID).unwrap();
+        table.mark_owned_reference_released_exact(slot, ID).unwrap();
         assert_eq!(
             table
                 .finish_exact(slot, ID)
                 .unwrap()
-                .local_terminal_result(),
-            original.local_terminal_result()
+                .owned_terminal_result(),
+            original.owned_terminal_result()
         );
     }
 }
@@ -339,7 +339,7 @@ fn rejected_reply_restores_only_its_exact_unpublished_cap() {
         table.mark_delivery_exact(slot, ID, flag).unwrap();
     }
     table.mark_backend_acked_exact(slot, ID).unwrap();
-    table.mark_local_reference_released_exact(slot, ID).unwrap();
+    table.mark_owned_reference_released_exact(slot, ID).unwrap();
     table.finish_exact(slot, ID).unwrap();
     let mut next = inline();
     next.irp_id += 1;

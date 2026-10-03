@@ -160,7 +160,7 @@ impl InlineFileRetirementTable {
         &mut self,
         owner: FileIoBusyOwner,
     ) -> Result<InlineFileRetirementReservation, InlineFileRetirementError> {
-        if !matches!(owner.key, FileIoWaitKey::Hosted(file_id) if file_id != 0)
+        if matches!(owner.key, FileIoWaitKey::Hosted(0))
             || owner.tid == 0
             || owner.tid == u64::MAX
             || !owner.mode.is_synchronous()
