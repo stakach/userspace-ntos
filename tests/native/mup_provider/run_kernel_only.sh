@@ -28,6 +28,7 @@ python3 scripts/run_with_timeout.py \
   --failure-file "$RUN_LOG" \
   --failure-text '[provider-bugcheck] terminal' \
   --failure-text '[mup-provider-gate] terminal service-loop failure' \
+  --failure-text '[read-forward-fail]' \
   --completion-file "$RUN_LOG" \
   --completion-text '[section-read-verified]' \
   --completion-grace-seconds 15 \

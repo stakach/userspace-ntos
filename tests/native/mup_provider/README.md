@@ -13,6 +13,15 @@ The worker waits and takes that exact IRP with an acquire exchange before comple
 An Event signaled before the wait remains signaled, so publication cannot lose its
 wakeup. A rejected publication restores the stack flag and does not signal.
 
+Before the pending probes, the source sends an immediate READ with a completion
+routine that returns `STATUS_MORE_PROCESSING_REQUIRED`. The actual dispatch must
+return success with an unsignaled Event and unchanged IOSB/output. The source then
+calls `IofCompleteRequest` on that held IRP and checks the real terminal result,
+including a completion-routine count of one. ReactOS advances the unwind cursor
+before invoking the routine, so resumed completion must not invoke it again. The
+strict parser requires the ordered hold, dispatch return, resume and terminal
+receipts; no manual IRP or SystemBuffer free substitutes for completion.
+
 ## Controlled Terminal Errors
 
 The test-only `\ntos-probe\terminal-failure` file accepts separate READ, FLUSH and

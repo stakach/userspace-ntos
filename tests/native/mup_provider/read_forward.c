@@ -15,6 +15,7 @@ typedef void *HANDLE;
 #define STATUS_OBJECT_PATH_NOT_FOUND ((NTSTATUS)0xc000003au)
 #define STATUS_IO_DEVICE_ERROR ((NTSTATUS)0xc0000185u)
 #define STATUS_TIMEOUT ((NTSTATUS)0x102)
+#define STATUS_MORE_PROCESSING_REQUIRED ((NTSTATUS)0xc0000016u)
 #define NT_SUCCESS(status) ((status) >= 0)
 #define IRP_MJ_CREATE 0x00
 #define IRP_MJ_CLOSE 0x02
@@ -31,6 +32,7 @@ typedef void *HANDLE;
 #define IRP_BUFFERED_IO 0x10
 #define IRP_DEALLOCATE_BUFFER 0x20
 #define IRP_INPUT_OPERATION 0x40
+#define SL_INVOKE_ON_SUCCESS 0x40
 #define FILE_READ_DATA 0x01
 #define FILE_SHARE_READ 0x01
 #define FILE_SHARE_WRITE 0x02
@@ -208,6 +210,92 @@ static WCHAR PrimaryProbeName[] = {
 };
 static DEVICE_OBJECT *PrimaryProbeDevice;
 static uint32_t PrimaryProbeEntered;
+
+typedef struct {
+    uint32_t Count;
+} INLINE_MPR_CONTEXT;
+
+static _Noreturn void ParkUnknownInlineMpr(void)
+{
+    DbgPrint("[read-forward-fail] inline-mpr uncertain dispatch; retained stack owner\n");
+    for (;;) {
+        int64_t delay = -10000000;
+        KeDelayExecutionThread(0, 0, &delay);
+    }
+}
+
+static NTSTATUS __stdcall HoldInlineRead(DEVICE_OBJECT *device, IRP *irp, void *context)
+{
+    (void)device;
+    (void)irp;
+    INLINE_MPR_CONTEXT *held = context;
+    uint32_t count = __atomic_add_fetch(&held->Count, 1, __ATOMIC_ACQ_REL);
+    DbgPrint("[inline-mpr-held] count=%u\n", count);
+    return count == 1 ? STATUS_MORE_PROCESSING_REQUIRED : STATUS_SUCCESS;
+}
+
+static NTSTATUS CheckInlineMpr(void *file, DEVICE_OBJECT *device)
+{
+    uint8_t output[sizeof(ExpectedBytes)];
+    for (uint32_t i = 0; i < sizeof(output); ++i) output[i] = 0xcc;
+    void *buffer = ExAllocatePoolWithTag(PagedPool, sizeof(output), 0x4d706e74);
+    if (buffer == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+    for (uint32_t i = 0; i < sizeof(output); ++i) ((uint8_t *)buffer)[i] = 0xa5;
+    IRP *irp = IoAllocateIrp(device->StackSize, 0);
+    if (irp == NULL) {
+        ExFreePoolWithTag(buffer, 0x4d706e74);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    IO_STACK_LOCATION *stack = IoGetNextIrpStackLocation(irp);
+    if (stack == NULL) {
+        IoFreeIrp(irp);
+        ExFreePoolWithTag(buffer, 0x4d706e74);
+        return STATUS_UNSUCCESSFUL;
+    }
+    INLINE_MPR_CONTEXT context = {0};
+    IO_STATUS_BLOCK iosb = {STATUS_UNSUCCESSFUL, 0, 0x12345678};
+    uint64_t event[3] = {0};
+    KeInitializeEvent(event, 1, 0);
+    irp->Flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER | IRP_INPUT_OPERATION;
+    irp->AssociatedSystemBuffer = buffer;
+    irp->UserBuffer = output;
+    irp->UserIosb = &iosb;
+    irp->UserEvent = event;
+    irp->OriginalFileObject = file;
+    stack->MajorFunction = IRP_MJ_READ;
+    stack->Parameters.Read.Length = sizeof(output);
+    stack->Parameters.Read.ByteOffset = 0;
+    stack->DeviceObject = device;
+    stack->FileObject = file;
+    stack->CompletionRoutine = (void *)HoldInlineRead;
+    stack->Context = &context;
+    stack->Control = SL_INVOKE_ON_SUCCESS;
+    DbgPrint("[inline-mpr-begin]\n");
+    NTSTATUS call = IofCallDriver(device, irp);
+    int64_t zero_timeout = 0;
+    NTSTATUS event_status = KeWaitForSingleObject(event, 0, 0, 0, &zero_timeout);
+    uint32_t count = __atomic_load_n(&context.Count, __ATOMIC_ACQUIRE);
+    uint32_t unchanged = iosb.Status == STATUS_UNSUCCESSFUL && iosb.Information == 0x12345678;
+    for (uint32_t i = 0; i < sizeof(output); ++i) unchanged &= output[i] == 0xcc;
+    DbgPrint("[inline-mpr-dispatch-return] call=0x%08x event=0x%08x iosb-and-output-unchanged=%u count=%u\n",
+             (uint32_t)call, (uint32_t)event_status, unchanged, count);
+    // ReactOS IofCompleteRequest advances the cursor before an MPR callback (irp.c:1442).
+    // Only the witnessed held IRP may be completed again; unknown outcomes are not replayed.
+    if (call != STATUS_SUCCESS || count != 1) ParkUnknownInlineMpr();
+    uint32_t held_valid = event_status == STATUS_TIMEOUT && unchanged;
+    DbgPrint("[inline-mpr-resume] count=%u\n", count);
+    IofCompleteRequest(irp, 0);
+    NTSTATUS wait = KeWaitForSingleObject(event, 0, 0, 0, NULL);
+    uint32_t bytes_match = 1;
+    for (uint32_t i = 0; i < sizeof(output); ++i) bytes_match &= output[i] == ExpectedBytes[i];
+    count = __atomic_load_n(&context.Count, __ATOMIC_ACQUIRE);
+    DbgPrint("[inline-mpr-terminal] wait=0x%08x iosb=0x%08x info=%u bytes-match=%u count=%u\n",
+             (uint32_t)wait, (uint32_t)iosb.Status, (uint32_t)iosb.Information, bytes_match, count);
+    // Real terminal completion owns buffer and IRP reclamation, not this caller.
+    return held_valid && wait == STATUS_SUCCESS && iosb.Status == STATUS_SUCCESS &&
+        iosb.Information == sizeof(output) && bytes_match && count == 1
+        ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
 
 static NTSTATUS ForwardOnce(void *file, DEVICE_OBJECT *device, int64_t offset)
 {
@@ -850,7 +938,8 @@ static void __stdcall ReadWorker(void *context)
         goto dereference;
     }
 
-    status = ForwardOnce(file, device, 0);
+    status = CheckInlineMpr(file, device);
+    if (status == STATUS_SUCCESS) status = ForwardOnce(file, device, 0);
     if (status == STATUS_SUCCESS) status = ForwardOnce(file, device, 1);
     if (status == STATUS_SUCCESS) status = FlushOnce(file, device, 0);
     if (status == STATUS_SUCCESS) status = FlushOnce(file, device, 1);

@@ -27,8 +27,24 @@ SPECS = {
 STATUS_FIELDS = {"status", "call", "release", "wait", "iosb", "event"}
 
 
+def verify_inline_mpr(text):
+    expected = (
+        "[inline-mpr-begin]",
+        "[inline-mpr-held] count=1",
+        "[inline-mpr-dispatch-return] call=0x00000000 event=0x00000102 iosb-and-output-unchanged=1 count=1",
+        "[inline-mpr-resume] count=1",
+        "[inline-mpr-terminal] wait=0x00000000 iosb=0x00000000 info=10 bytes-match=1 count=1",
+    )
+    records = [(position, line) for position, line in enumerate(text.splitlines())
+               if "[inline-mpr-" in line]
+    if tuple(line for _, line in records) != expected:
+        raise ValueError("missing, duplicate, malformed or misordered inline MPR receipt")
+    return records[-1][0]
+
+
 def verify_primary_execution(text):
     identity = verify(text)
+    mpr_terminal = verify_inline_mpr(text)
     lines = text.splitlines()
     expected = (
         "[source-primary-probe] entered",
@@ -40,6 +56,8 @@ def verify_primary_execution(text):
     if tuple(line for _, line in markers) != expected:
         raise ValueError("missing, duplicate, malformed or misordered primary execution receipt")
     entered, terminal, _ = (position for position, _ in markers)
+    if mpr_terminal >= entered:
+        raise ValueError("inline MPR completion did not precede the primary pending probe")
     # Provider CLEANUP/CLOSE can be asynchronous; source execution must stay inside its handler.
     source_positions = [position for position, line in enumerate(lines)
                         if line.startswith("[terminal-failure-")]

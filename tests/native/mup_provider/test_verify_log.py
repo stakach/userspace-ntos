@@ -7,6 +7,22 @@ SOURCE = "file=0x0000010003000100 generation=0x0000000000000007"
 PROVIDER = "file=0x0000010007000200 generation=0x0000000000000007"
 
 
+def inline_mpr_lines():
+    return [
+        "[inline-mpr-begin]",
+        "[inline-mpr-held] count=1",
+        "[inline-mpr-dispatch-return] call=0x00000000 event=0x00000102 iosb-and-output-unchanged=1 count=1",
+        "[inline-mpr-resume] count=1",
+        "[inline-mpr-terminal] wait=0x00000000 iosb=0x00000000 info=10 bytes-match=1 count=1",
+    ]
+
+
+def primary_lines():
+    return [*inline_mpr_lines(), "[source-primary-probe] entered", *accepted_lines(),
+            "[source-primary-probe] terminal-intent status=0x00000000",
+            "[source-primary-probe] delivered call=0x00000000 iosb=0x00000000 info=0 output-unchanged=1"]
+
+
 def accepted_lines():
     lines = [
         f"[mup-terminal-failure-identity] {PROVIDER} status=0x00000000 info=8",
@@ -38,17 +54,16 @@ class MupFailureLogTests(unittest.TestCase):
             verify_primary_execution("\n".join(accepted_lines()))
 
     def test_primary_execution_requires_causal_entry_terminal_and_delivered_result(self):
-        lines = ["[source-primary-probe] entered", *accepted_lines(),
-                 "[source-primary-probe] terminal-intent status=0x00000000",
-                 "[source-primary-probe] delivered call=0x00000000 iosb=0x00000000 info=0 output-unchanged=1"]
+        lines = primary_lines()
         self.assertEqual(verify_primary_execution("\n".join(lines)),
                          (0x10003000100, 0x10007000200, 7))
-        for index in (0, len(lines) - 2, len(lines) - 1):
+        entered = len(inline_mpr_lines())
+        for index in (entered, len(lines) - 2, len(lines) - 1):
             with self.subTest(missing=index), self.assertRaises(ValueError):
                 verify_primary_execution("\n".join(lines[:index] + lines[index + 1:]))
         with self.assertRaises(ValueError):
-            verify_primary_execution("\n".join([*lines[1:], lines[0]]))
-        for marker in (lines[0], lines[-2], lines[-1]):
+            verify_primary_execution("\n".join([*lines[:entered], *lines[entered + 1:], lines[entered]]))
+        for marker in (lines[entered], lines[-2], lines[-1]):
             with self.subTest(duplicate=marker), self.assertRaises(ValueError):
                 verify_primary_execution("\n".join([*lines, marker]))
         with self.assertRaises(ValueError):
@@ -57,6 +72,34 @@ class MupFailureLogTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             verify_primary_execution("\n".join(lines).replace(
                 "info=0 output-unchanged=1", "info=1 output-unchanged=1"))
+
+    def test_inline_mpr_requires_every_ordered_unique_receipt(self):
+        lines = primary_lines()
+        for index in range(len(inline_mpr_lines())):
+            with self.subTest(missing=index), self.assertRaises(ValueError):
+                verify_primary_execution("\n".join(lines[:index] + lines[index + 1:]))
+            with self.subTest(duplicate=index), self.assertRaises(ValueError):
+                verify_primary_execution("\n".join([*lines, lines[index]]))
+        for left, right in [(0, 1), (1, 2), (2, 3), (3, 4)]:
+            changed = lines.copy()
+            changed[left], changed[right] = changed[right], changed[left]
+            with self.subTest(order=(left, right)), self.assertRaises(ValueError):
+                verify_primary_execution("\n".join(changed))
+
+    def test_inline_mpr_rejects_early_publication_and_reexecuted_callback(self):
+        text = "\n".join(primary_lines())
+        for before, after in [
+            ("event=0x00000102", "event=0x00000000"),
+            ("iosb-and-output-unchanged=1", "iosb-and-output-unchanged=0"),
+            ("[inline-mpr-held] count=1", "[inline-mpr-held] count=2"),
+            ("call=0x00000000 event", "call=0x00000103 event"),
+            ("[inline-mpr-resume] count=1", "[inline-mpr-resume] count=2"),
+            ("info=10 bytes-match=1 count=1", "info=10 bytes-match=1 count=2"),
+            ("info=10 bytes-match=1 count=1", "info=9 bytes-match=1 count=1"),
+            ("info=10 bytes-match=1 count=1", "info=10 bytes-match=0 count=1"),
+        ]:
+            with self.subTest(result=after), self.assertRaises(ValueError):
+                verify_primary_execution(text.replace(before, after, 1))
 
     def test_cross_domain_addresses_are_distinct_but_actual_generation_matches(self):
         self.assertEqual(verify("\n".join(accepted_lines())), (0x10003000100, 0x10007000200, 7))
