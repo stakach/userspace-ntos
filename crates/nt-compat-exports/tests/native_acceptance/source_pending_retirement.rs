@@ -7,7 +7,7 @@ fn source(name: &str) -> syn::File {
 }
 
 #[derive(Default)]
-struct Calls(Vec<String>);
+struct Calls(Vec<String>, Vec<(String, Vec<Expr>)>);
 impl<'ast> Visit<'ast> for Calls {
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
         if let Expr::Path(path) = &*call.func {
@@ -17,11 +17,12 @@ impl<'ast> Visit<'ast> for Calls {
     }
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         self.0.push(call.method.to_string());
+        self.1.push((call.method.to_string(), call.args.iter().cloned().collect()));
         syn::visit::visit_expr_method_call(self, call);
     }
 }
 
-fn calls(file: &syn::File, name: &str) -> Vec<String> {
+fn inspected_calls(file: &syn::File, name: &str) -> Calls {
     let mut calls = Calls::default();
     for item in &file.items {
         match item {
@@ -36,7 +37,18 @@ fn calls(file: &syn::File, name: &str) -> Vec<String> {
             _ => {}
         }
     }
-    calls.0
+    calls
+}
+
+fn calls(file: &syn::File, name: &str) -> Vec<String> {
+    inspected_calls(file, name).0
+}
+
+fn expression(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(paren) => expression(&paren.expr),
+        _ => expr,
+    }
 }
 
 #[test]
@@ -83,9 +95,25 @@ fn pending_only_work_release_uses_exact_terminal_finalizer() {
         let owned = calls(&source(capture), "release_owned");
         assert!(owned.iter().any(|name| name == "release_pending_terminal"),
             "{capture} cannot replace pending allocation retirement with bare unpin");
-        let functions = calls(&source(work), "retire_after_terminal");
-        assert!(functions.iter().any(|name| name == "release_pending_terminal"),
-            "{work} must retain the pending-only finalizer until acknowledged");
+        let work_source = source(work);
+        let functions = inspected_calls(&work_source, "retire_after_terminal");
+        let argument = &functions.1.iter().find(|(name, _)| name == "release_source")
+            .unwrap_or_else(|| panic!("{work}: terminal retirement must release its exact source")).1[0];
+        let Expr::Binary(guard) = expression(argument) else { panic!("{work}: guarded finalizer"); };
+        assert!(matches!(guard.op, syn::BinOp::And(_)));
+        assert!(matches!(expression(&guard.right), Expr::Unary(not)
+            if matches!(not.op, syn::UnOp::Not(_))
+                && matches!(expression(&not.expr), Expr::Path(path) if path.path.is_ident("stopped"))));
+        let Expr::Binary(ownership) = expression(&guard.left) else { panic!("{work}: pending or held ownership"); };
+        assert!(matches!(ownership.op, syn::BinOp::Or(_)));
+        for (call, name) in [(&ownership.left, "pending"), (&ownership.right, "inline_held")] {
+            assert!(matches!(expression(call), Expr::MethodCall(method)
+                if method.method == name && method.args.is_empty()), "{work}: {name}");
+        }
+        let finalizer = calls(&work_source, "release_source");
+        assert!(finalizer.iter().any(|name| name == "release_pending_terminal")
+            && finalizer.iter().any(|name| name == "release"),
+            "{work} must keep pending final retirement separate from ordinary unpin");
         assert!(calls(&source(capture), "release").iter().any(|name| name == "release_owned")
             && owned.iter().any(|name| name == "unpin"),
             "ordinary inline producer cleanup must remain separate");

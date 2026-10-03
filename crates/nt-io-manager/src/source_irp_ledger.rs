@@ -39,6 +39,29 @@ impl SourceIrpAllocation {
     }
 }
 
+/// Observational correlation only; neither this value nor a retained Reply owns a source pin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceIrpForwardIdentity {
+    ticket: SourceIrpTicket,
+    allocation: SourceIrpAllocation,
+}
+
+impl SourceIrpForwardIdentity {
+    pub fn new(ticket: SourceIrpTicket, allocation: SourceIrpAllocation) -> Option<Self> {
+        (allocation.valid() && ticket.domain == allocation.domain)
+            .then_some(Self { ticket, allocation })
+    }
+
+    pub fn ticket(self) -> SourceIrpTicket { self.ticket }
+
+    pub fn allocation(self) -> SourceIrpAllocation { self.allocation }
+
+    /// A transport-only tail must not reject a newly allocated source at the same address.
+    pub fn duplicates_owned(self, incoming: Self, source_pin_owned: bool) -> bool {
+        source_pin_owned && self == incoming
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceIrpLedgerError {
     InvalidAllocation,
@@ -480,6 +503,102 @@ mod tests {
         SourceIrpAllocation {
             owner: SourceIrpOwner::HostedCaller(3),
             ..allocation(address, cookie)
+        }
+    }
+
+    #[test]
+    fn forward_identity_allows_reused_address_while_old_transport_receipt_remains() {
+        let mut ledger = SourceIrpLedger::new();
+        let first = allocation(0x2000, 11);
+        let ticket = ledger.register(first).unwrap();
+        let (pinned_ticket, pinned_allocation) = ledger
+            .pin(first.owner, first.domain, first.component_address).unwrap();
+        let old = SourceIrpForwardIdentity::new(pinned_ticket, pinned_allocation).unwrap();
+        assert!(old.duplicates_owned(old, true));
+        ledger.arm_deferred_free(ticket).unwrap();
+        assert_eq!(ledger.prepare_driver_free(3, first.domain, first.component_address),
+            Ok(SourceIrpRetirement::Deferred(ticket)));
+        ledger.unpin(ticket).unwrap();
+        assert_eq!(ledger.prepare_driver_free(3, first.domain, first.component_address),
+            Ok(SourceIrpRetirement::Retired(ticket)));
+        ledger.retire(ticket, first).unwrap();
+        let reused = SourceIrpAllocation { pool_generation: first.pool_generation + 1, ..first };
+        let new_ticket = ledger.register(reused).unwrap();
+        let (current_ticket, current_allocation) = ledger
+            .pin(reused.owner, reused.domain, reused.component_address).unwrap();
+        assert_eq!(current_ticket, new_ticket);
+        let incoming = SourceIrpForwardIdentity::new(current_ticket, current_allocation).unwrap();
+        assert_ne!(incoming.ticket(), old.ticket());
+        assert_eq!(incoming.allocation().component_address, old.allocation().component_address);
+        assert!(!old.duplicates_owned(incoming, false));
+        assert!(!old.duplicates_owned(incoming, true));
+        assert!(!old.duplicates_owned(old, false));
+        // The same predicate covers temporarily moved-out EXECUTING owners, not just Work rows.
+        let executing = [(old, false), (incoming, true)];
+        assert_eq!(executing.iter().filter(|(identity, owned)|
+            identity.duplicates_owned(incoming, *owned)).count(), 1);
+        ledger.unpin(new_ticket).unwrap();
+        ledger.retire(new_ticket, reused).unwrap();
+        assert_eq!(ledger.live_for_owner(first.owner, first.domain), 0);
+    }
+
+    #[test]
+    fn forward_identity_compares_every_allocation_and_ticket_component() {
+        let mut ledger = SourceIrpLedger::new();
+        let owner = allocation(0x2000, 11);
+        let ticket = ledger.register(owner).unwrap();
+        let identity = SourceIrpForwardIdentity::new(ticket, owner).unwrap();
+        for foreign in [
+            SourceIrpAllocation { owner: SourceIrpOwner::HostedCaller(3), ..owner },
+            SourceIrpAllocation { owner: SourceIrpOwner::HostedDriver(4), ..owner },
+            SourceIrpAllocation { component_address: 0x3000, ..owner },
+            SourceIrpAllocation { bytes: owner.bytes + 1, ..owner },
+            SourceIrpAllocation { stack_count: owner.stack_count + 1, ..owner },
+            SourceIrpAllocation { pool_generation: owner.pool_generation + 1, ..owner },
+        ] {
+            let observed = SourceIrpForwardIdentity::new(ticket, foreign).unwrap();
+            assert!(!identity.duplicates_owned(observed, true));
+        }
+        for foreign_ticket in [
+            SourceIrpTicket::new(owner.domain, ticket.id.get() + 1, ticket.generation.get()).unwrap(),
+            SourceIrpTicket::new(owner.domain, ticket.id.get(), ticket.generation.get() + 1).unwrap(),
+        ] {
+            assert!(!identity.duplicates_owned(
+                SourceIrpForwardIdentity::new(foreign_ticket, owner).unwrap(), true));
+        }
+        let foreign = allocation(owner.component_address, owner.domain.cookie + 1);
+        let foreign_ticket = ledger.register(foreign).unwrap();
+        assert!(!identity.duplicates_owned(
+            SourceIrpForwardIdentity::new(foreign_ticket, foreign).unwrap(), true));
+        assert_eq!(SourceIrpForwardIdentity::new(ticket, foreign), None);
+        let foreign_domain = SourceIrpAllocation {
+            domain: HostedDomainIdentity {
+                domain_id: HostedDomainId(owner.domain.domain_id.0 + 1),
+                cookie: owner.domain.cookie,
+            },
+            ..owner
+        };
+        let foreign_ticket = ledger.register(foreign_domain).unwrap();
+        assert!(!identity.duplicates_owned(
+            SourceIrpForwardIdentity::new(foreign_ticket, foreign_domain).unwrap(), true));
+        assert_eq!(SourceIrpForwardIdentity::new(ticket, foreign_domain), None);
+    }
+
+    #[test]
+    fn forward_identity_rejects_invalid_allocation_metadata() {
+        let owner = allocation(0x2000, 11);
+        let ticket = SourceIrpTicket::new(owner.domain, 1, 1).unwrap();
+        for invalid in [
+            SourceIrpAllocation { component_address: 0, ..owner },
+            SourceIrpAllocation { bytes: 0, ..owner },
+            SourceIrpAllocation { stack_count: 0, ..owner },
+            SourceIrpAllocation { pool_generation: 0, ..owner },
+            SourceIrpAllocation { domain: HostedDomainIdentity {
+                domain_id: HostedDomainId::NULL, cookie: 11 }, ..owner },
+            SourceIrpAllocation { domain: HostedDomainIdentity {
+                domain_id: owner.domain.domain_id, cookie: 0 }, ..owner },
+        ] {
+            assert_eq!(SourceIrpForwardIdentity::new(ticket, invalid), None);
         }
     }
 

@@ -14,6 +14,7 @@ use nt_io_manager::{
     },
     InformationParameters, IoParameters,
 };
+use nt_io_manager::source_irp_ledger::SourceIrpForwardIdentity;
 use nt_process::native_handle::{NativeHandleCaller, NativeThreadProcessReference};
 
 const STATUS_INVALID_HANDLE_LOCAL: i32 = 0xc000_0008u32 as i32;
@@ -50,7 +51,7 @@ struct RetainedAck {
 }
 
 static mut WORK: Vec<Option<Work>> = Vec::new();
-static mut EXECUTING: Vec<(usize, DriverInstance, u64)> = Vec::new();
+static mut EXECUTING: Vec<(usize, DriverInstance, SourceIrpForwardIdentity, bool)> = Vec::new();
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 
 fn status_for_capture(error: hosted_query_information_capture::CaptureError) -> i32 {
@@ -64,16 +65,16 @@ fn status_for_capture(error: hosted_query_information_capture::CaptureError) -> 
     }
 }
 
-fn source_work_index(source_instance: DriverInstance, source_irp_address: u64) -> Option<usize> {
+fn source_work_index(source_instance: DriverInstance, incoming: SourceIrpForwardIdentity) -> Option<usize> {
     let active = unsafe { &*core::ptr::addr_of!(EXECUTING) }
         .iter()
-        .find(|(_, instance, address)| {
+        .find(|(_, instance, identity, source_pin_owned)| {
             instance.pml4 == source_instance.pml4
                 && instance.hosted_domain_id == source_instance.hosted_domain_id
                 && instance.hosted_domain_cookie == source_instance.hosted_domain_cookie
-                && *address == source_irp_address
+                && identity.duplicates_owned(incoming, *source_pin_owned)
         })
-        .map(|(index, _, _)| *index);
+        .map(|(index, _, _, _)| *index);
     if active.is_some() {
         return active;
     }
@@ -84,11 +85,62 @@ fn source_work_index(source_instance: DriverInstance, source_irp_address: u64) -
                 work.source_instance.pml4 == source_instance.pml4
                     && work.source_instance.exec_pool_va == source_instance.exec_pool_va
                     && work.source_instance.hosted_domain_id == source_instance.hosted_domain_id
-                    && work.source_instance.hosted_domain_cookie
-                        == source_instance.hosted_domain_cookie
-                    && work.source.source_irp_address() == source_irp_address
+                    && work.source_instance.hosted_domain_cookie == source_instance.hosted_domain_cookie
+                    && work.source.source_identity().duplicates_owned(incoming, work.source.source_pin_owned())
             })
         })
+}
+
+fn source_ack_work_index(source_instance: DriverInstance, source_irp_address: u64) -> Option<usize> {
+    unsafe { &*core::ptr::addr_of!(WORK) }.iter().position(|slot| {
+        slot.as_ref().is_some_and(|work| {
+            !work.source_released && work.source.source_pin_owned()
+                && work.source_instance.pml4 == source_instance.pml4
+                && work.source_instance.exec_pool_va == source_instance.exec_pool_va
+                && work.source_instance.hosted_domain_id == source_instance.hosted_domain_id
+                && work.source_instance.hosted_domain_cookie == source_instance.hosted_domain_cookie
+                && work.source.source_irp_address() == source_irp_address
+                && work.source.validate_source().is_ok()
+        })
+    })
+}
+
+unsafe fn reconcile_source_acks(route: nt_component_suspension::peer_registry::PeerRoute) -> bool {
+    let count = (&*core::ptr::addr_of!(WORK)).len();
+    for index in 0..count {
+        let rows = &mut *core::ptr::addr_of_mut!(WORK);
+        let Some(work) = rows[index].as_ref() else { continue; };
+        let Some(ack) = work.ack.as_ref().filter(|ack| ack.route == route) else { continue; };
+        if !work.source_released || work.actor.is_held() || !ack.reply_entered {
+            return false;
+        }
+        match runtime::reconcile_retained_service_reply(
+            ack.route, ack.dispatch, ack.reply, ack.token,
+        ) {
+            Ok(true) => {},
+            _ => return false,
+        }
+        if runtime::retire_stopped_acknowledged_retained_service(
+            ack.route, ack.dispatch, ack.reply, ack.token,
+        ).is_err() { return false; }
+        rows[index] = None;
+    }
+    true
+}
+
+fn source_token_work_index(source_instance: DriverInstance, source_irp_address: u64, token: u64) -> Option<usize> {
+    unsafe { &*core::ptr::addr_of!(WORK) }.iter().position(|slot| {
+        slot.as_ref().is_some_and(|work| {
+            !work.source_released && work.source.source_pin_owned()
+                && work.origin.token == token
+                && work.source_instance.pml4 == source_instance.pml4
+                && work.source_instance.exec_pool_va == source_instance.exec_pool_va
+                && work.source_instance.hosted_domain_id == source_instance.hosted_domain_id
+                && work.source_instance.hosted_domain_cookie == source_instance.hosted_domain_cookie
+                && work.source.source_irp_address() == source_irp_address
+                && work.source.validate_source().is_ok()
+        })
+    })
 }
 
 /// `None` retains the authenticated source Call. A duplicate cannot dispatch again.
@@ -105,7 +157,10 @@ pub(super) unsafe fn submit(
     if hosted_driver_pump_caller_tcb(ch, active_reply_cap, caller_badge).is_none() {
         return Some(STATUS_INVALID_HANDLE_LOCAL);
     }
-    if source_work_index(source_instance, source_irp_address).is_some() {
+    let Some(route) = runtime::channel_route(ch).ok().flatten() else {
+        return Some(STATUS_INVALID_HANDLE_LOCAL);
+    };
+    if !reconcile_source_acks(route) {
         return Some(STATUS_DEVICE_BUSY_LOCAL);
     }
     let mut source = match hosted_query_information_capture::capture(
@@ -119,6 +174,11 @@ pub(super) unsafe fn submit(
             return Some(status_for_capture(error));
         }
     };
+    let identity = source.source_identity();
+    if source_work_index(source_instance, identity).is_some() {
+        source.release().expect("duplicate QUERY_INFORMATION capture rollback");
+        return Some(STATUS_DEVICE_BUSY_LOCAL);
+    }
     let Some((target_index, _, _)) =
         hosted_driver_device_route_by_device_id(source.device_id().raw())
     else {
@@ -134,12 +194,6 @@ pub(super) unsafe fn submit(
             .release()
             .expect("unentered QUERY_INFORMATION provider rejection");
         return Some(STATUS_INVALID_DEVICE_REQUEST_LOCAL);
-    };
-    let Some(route) = runtime::channel_route(ch).ok().flatten() else {
-        source
-            .release()
-            .expect("unentered QUERY_INFORMATION route rollback");
-        return Some(STATUS_INVALID_HANDLE_LOCAL);
     };
     let Ok(dispatch) = runtime::dispatch(route) else {
         source
@@ -177,7 +231,7 @@ pub(super) unsafe fn submit(
             (row.is_none()
                 && !(&*core::ptr::addr_of!(EXECUTING))
                     .iter()
-                    .any(|(active, _, _)| *active == index))
+                    .any(|(active, _, _, _)| *active == index))
             .then_some(index)
         });
     if slot.is_none()
@@ -288,14 +342,26 @@ impl Work {
         crate::service_sec_image::with_provider_process_manager(|pm| self.actor.release(pm))
     }
 
+    unsafe fn release_source(&mut self, pending_terminal: bool) -> bool {
+        if self.source_released { return true; }
+        let released = if pending_terminal {
+            self.source.release_pending_terminal()
+        } else {
+            self.source.release()
+        };
+        if released.is_err() { return false; }
+        self.source_released = true;
+        // Publish pin retirement before any reentrant actor or Reply effect.
+        let identity = self.source.source_identity();
+        for (_, _, active, source_pin_owned) in &mut *core::ptr::addr_of_mut!(EXECUTING) {
+            if *active == identity { *source_pin_owned = false; }
+        }
+        true
+    }
+
     unsafe fn release_unentered_owners(&mut self) -> bool {
         if !self.origin.release_prepared() { return false; }
-        if !self.source_released {
-            if self.source.release().is_err() {
-                return false;
-            }
-            self.source_released = true;
-        }
+        if !self.release_source(false) { return false; }
         !self.actor.is_held() || self.actor_release().is_ok()
     }
 
@@ -560,16 +626,8 @@ impl Work {
             }
             self.canonical_irp = None;
         }
-        if !self.source_released {
-            let released = if (self.origin.pending() || self.origin.inline_held()) && !stopped {
-                self.source.release_pending_terminal()
-            } else {
-                self.source.release()
-            };
-            if released.is_err() {
-                return false;
-            }
-            self.source_released = true;
+        if !self.release_source((self.origin.pending() || self.origin.inline_held()) && !stopped) {
+            return false;
         }
         !self.actor.is_held() || self.actor_release().is_ok()
     }
@@ -752,7 +810,7 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
         let index = (start + step) % count;
         if (&*core::ptr::addr_of!(EXECUTING))
             .iter()
-            .any(|(active, _, _)| *active == index)
+            .any(|(active, _, _, _)| *active == index)
         {
             return None;
         }
@@ -779,7 +837,8 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
     (&mut *core::ptr::addr_of_mut!(EXECUTING)).push((
         index,
         work.source_instance,
-        work.source.source_irp_address(),
+        work.source.source_identity(),
+        work.source.source_pin_owned(),
     ));
     CURSOR.store(index as u64 + 1, Ordering::Relaxed);
     let done = work.advance(handler);
@@ -807,7 +866,7 @@ pub(super) unsafe fn nested_work_ready() -> bool {
         .any(|(index, row)| {
             !(&*core::ptr::addr_of!(EXECUTING))
                 .iter()
-                .any(|(active, _, _)| *active == index)
+                .any(|(active, _, _, _)| *active == index)
                 && row
                     .as_ref()
                     .is_some_and(|work| work.ready_for_nested_step())
@@ -829,10 +888,10 @@ pub(super) unsafe fn arm_pending(
     if hosted_driver_pump_caller_tcb(ch, reply_cap, caller_badge).is_none() {
         return Some(STATUS_INVALID_HANDLE_LOCAL);
     }
-    let Some(index) = source_work_index(source_instance, source_irp_address) else {
+    let Some(index) = source_token_work_index(source_instance, source_irp_address, token) else {
         return Some(STATUS_INVALID_HANDLE_LOCAL);
     };
-    if (&*core::ptr::addr_of!(EXECUTING)).iter().any(|(active, _, _)| *active == index) {
+    if (&*core::ptr::addr_of!(EXECUTING)).iter().any(|(active, _, _, _)| *active == index) {
         return Some(STATUS_DEVICE_BUSY_LOCAL);
     }
     let Some(work) = (&mut *core::ptr::addr_of_mut!(WORK))[index].as_mut() else {
@@ -858,10 +917,10 @@ pub(super) unsafe fn acknowledge_held(
     if hosted_driver_pump_caller_tcb(ch, reply_cap, caller_badge).is_none() {
         return Some(STATUS_INVALID_HANDLE_LOCAL);
     }
-    let Some(index) = source_work_index(source_instance, source_irp_address) else {
+    let Some(index) = source_token_work_index(source_instance, source_irp_address, token) else {
         return Some(STATUS_INVALID_HANDLE_LOCAL);
     };
-    if (&*core::ptr::addr_of!(EXECUTING)).iter().any(|(active, _, _)| *active == index) {
+    if (&*core::ptr::addr_of!(EXECUTING)).iter().any(|(active, _, _, _)| *active == index) {
         return Some(STATUS_DEVICE_BUSY_LOCAL);
     }
     let Some(work) = (&mut *core::ptr::addr_of_mut!(WORK))[index].as_mut() else {
@@ -888,12 +947,12 @@ pub(super) unsafe fn acknowledge(
     if hosted_driver_pump_caller_tcb(ch, reply_cap, caller_badge).is_none() {
         return Some(STATUS_INVALID_HANDLE_LOCAL);
     }
-    let Some(index) = source_work_index(source_instance, source_irp_address) else {
+    let Some(index) = source_ack_work_index(source_instance, source_irp_address) else {
         return Some(STATUS_INVALID_HANDLE_LOCAL);
     };
     if (&*core::ptr::addr_of!(EXECUTING))
         .iter()
-        .any(|(active, _, _)| *active == index)
+        .any(|(active, _, _, _)| *active == index)
     {
         return Some(STATUS_DEVICE_BUSY_LOCAL);
     }

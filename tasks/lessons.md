@@ -1,5 +1,11 @@
 # Lessons
 
+## AST Regression Bindings
+- Use distinct names for collected calls and parsed expression nodes; a local named `calls`
+  can hide the collector function, and reusing `owned` can hide an earlier call list.
+- A compilation failure is not a behavioral RED. Consume the actual failed exit, fix setup,
+  and reproduce the intended assertion before changing production behavior.
+
 ## Serialize Parser Tests Too
 - A yielded Cargo session is still active. Do not launch even independent Python fixture/parser
   tests until its actual exit is consumed; single-owner validation includes every test suite.
