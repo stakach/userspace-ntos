@@ -11897,6 +11897,17 @@ struct ObjectAttributes {
     security_qos: u64,
 }
 
+#[cfg(target_arch = "x86_64")]
+fn report_file_map_failure(
+    stage: nt_ntdll::loader::file_map_failure::FileMapFailureStage,
+    status: u32,
+) {
+    if let Some(record) = nt_ntdll::loader::file_map_failure::record_failure(stage, status) {
+        // SAFETY: the owned stack record remains mapped throughout synchronous debug capture.
+        unsafe { crate::dbg_print_bytes(record.bytes().as_ptr(), record.bytes().len()) };
+    }
+}
+
 /// `RtlpMapFile` (process.c:20): NtOpenFile(image) → NtCreateSection(SEC_IMAGE) → NtClose(file). On
 /// success `*section` holds the SEC_IMAGE handle.
 ///
@@ -11931,6 +11942,10 @@ unsafe fn rtlp_map_file(image_file_name: *const u8, attributes: u32, section: *m
         )
     } as u32;
     if (st as i32) < 0 {
+        report_file_map_failure(
+            nt_ntdll::loader::file_map_failure::FileMapFailureStage::Open,
+            st,
+        );
         return st;
     }
     // NtCreateSection(&Section, SECTION_ALL_ACCESS, OA=NULL, MaxSize=NULL, PAGE_EXECUTE, SEC_IMAGE,
@@ -11953,6 +11968,13 @@ unsafe fn rtlp_map_file(image_file_name: *const u8, attributes: u32, section: *m
     // SAFETY: on-target; 27 = NtClose.
     unsafe {
         syscall4(27, h_file, 0, 0, 0);
+    }
+    if (st as i32) < 0 {
+        report_file_map_failure(
+            nt_ntdll::loader::file_map_failure::FileMapFailureStage::CreateSection,
+            st,
+        );
+        return st;
     }
     st
 }

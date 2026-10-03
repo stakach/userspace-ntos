@@ -1,0 +1,96 @@
+use syn::visit::Visit;
+
+fn named(path: &syn::Path, name: &str) -> bool {
+    path.segments.last().is_some_and(|part| part.ident == name)
+}
+
+fn mapping_function() -> syn::ItemFn {
+    let file = syn::parse_file(include_str!("../../nt-ntdll-dll/src/on_target.rs")).unwrap();
+    file.items.into_iter().find_map(|item| match item {
+        syn::Item::Fn(function) if function.sig.ident == "rtlp_map_file" => Some(function),
+        _ => None,
+    }).expect("the actual file-to-Section loader function exists")
+}
+
+#[derive(Default)]
+struct Calls(Vec<String>);
+impl<'a> Visit<'a> for Calls {
+    fn visit_expr_call(&mut self, call: &'a syn::ExprCall) {
+        if let syn::Expr::Path(path) = &*call.func {
+            self.0.push(path.path.segments.last().unwrap().ident.to_string());
+        }
+        syn::visit::visit_expr_call(self, call);
+    }
+    fn visit_expr_method_call(&mut self, call: &'a syn::ExprMethodCall) {
+        self.0.push(call.method.to_string());
+        syn::visit::visit_expr_method_call(self, call);
+    }
+}
+
+fn assert_failure_branch(stage: &str, syscall: &str) {
+    let function = mapping_function();
+    let mut last_syscall = None;
+    for statement in &function.block.stmts {
+        let mut calls = Calls::default();
+        calls.visit_stmt(statement);
+        if calls.0.iter().any(|name| name == syscall) {
+            last_syscall = Some(syscall);
+        } else if calls.0.iter().any(|name| name == "syscall6" || name == "syscall8") {
+            last_syscall = None;
+        }
+        let syn::Stmt::Expr(syn::Expr::If(branch), _) = statement else { continue; };
+        if last_syscall != Some(syscall) { continue; }
+        struct NegativeStatus(bool);
+        impl<'a> Visit<'a> for NegativeStatus {
+            fn visit_expr_binary(&mut self, expression: &'a syn::ExprBinary) {
+                self.0 |= matches!(expression.op, syn::BinOp::Lt(_));
+                syn::visit::visit_expr_binary(self, expression);
+            }
+        }
+        let mut negative = NegativeStatus(false);
+        negative.visit_expr(&branch.cond);
+        if !negative.0 { continue; }
+        let mut body_calls = Calls::default();
+        body_calls.visit_block(&branch.then_branch);
+        assert_eq!(body_calls.0, ["report_file_map_failure"],
+            "a negative syscall result must report once, without extra NT calls or pointer reads");
+        let mut report_index = None;
+        let mut return_index = None;
+        for (index, statement) in branch.then_branch.stmts.iter().enumerate() {
+            if let syn::Stmt::Expr(syn::Expr::Call(call), _) = statement {
+                if matches!(&*call.func, syn::Expr::Path(path)
+                    if named(&path.path, "report_file_map_failure")) {
+                    assert_eq!(call.args.len(), 2);
+                    assert!(matches!(&call.args[0], syn::Expr::Path(path)
+                        if named(&path.path, stage)), "the diagnostic must identify the actual failed stage");
+                    assert!(matches!(&call.args[1], syn::Expr::Path(path)
+                        if named(&path.path, "st")), "the diagnostic must preserve the actual status");
+                    report_index = Some(index);
+                }
+            }
+            if let syn::Stmt::Expr(syn::Expr::Return(value), _) = statement {
+                assert!(matches!(value.expr.as_deref(), Some(syn::Expr::Path(path))
+                    if named(&path.path, "st")), "failure must return the original syscall status");
+                return_index = Some(index);
+            }
+        }
+        assert!(report_index.zip(return_index).is_some_and(|(report, ret)| report < ret),
+            "report the negative result before returning its unchanged status");
+        let mut all_calls = Calls::default();
+        all_calls.visit_block(&function.block);
+        assert_eq!(all_calls.0.iter().filter(|name| *name == "report_file_map_failure").count(), 2,
+            "only the two negative syscall-result branches may emit failure records");
+        return;
+    }
+    panic!("{stage} requires its own actual negative-result diagnostic branch");
+}
+
+#[test]
+fn open_file_failure_reports_actual_stage_and_unchanged_status_without_more_effects() {
+    assert_failure_branch("Open", "syscall6");
+}
+
+#[test]
+fn create_section_failure_reports_actual_stage_and_unchanged_status_without_more_effects() {
+    assert_failure_branch("CreateSection", "syscall8");
+}
