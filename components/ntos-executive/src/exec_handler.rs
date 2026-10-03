@@ -38214,8 +38214,10 @@ impl ExecNtHandler {
                 if iosb & 7 != 0 || output & 3 != 0 {
                     return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
                 }
-                if !self.probe_user_output(iosb, 16) || !self.probe_user_output(output, length) {
-                    return nt_syscall::STATUS_ACCESS_VIOLATION;
+                if let Err(status) =
+                    self.probe_file_io_output(iosb, Some((output, length as u64)))
+                {
+                    return status;
                 }
                 let capture = match self.capture_hosted_file_unless_local_with_access(
                     args[0],

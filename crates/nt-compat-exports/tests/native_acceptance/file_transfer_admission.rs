@@ -17,7 +17,7 @@ impl<'ast> Visit<'ast> for Paths {
     }
 }
 
-fn service_branch(name: &str) -> syn::Block {
+pub(super) fn service_branch(name: &str) -> syn::Block {
     let file = syn::parse_file(include_str!(
         "../../../../components/ntos-executive/src/exec_handler.rs"
     )).unwrap();

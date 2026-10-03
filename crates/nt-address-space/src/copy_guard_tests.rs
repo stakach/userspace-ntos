@@ -105,6 +105,30 @@ fn guarded_source_is_partial_copy_and_only_local_guard_is_consumed() {
 }
 
 #[test]
+fn file_query_output_probe_consumes_guard_once_without_publishing_result() {
+    let mut memory = Memory::default();
+    memory.add(0x1000, PAGE_READWRITE, false, 0xa5);
+    memory.add(0x3000, PAGE_READWRITE | PAGE_GUARD, false, 0x5a);
+    assert_eq!(
+        crate::native_output::probe_file_io_output(
+            &mut memory, 0x1000, Some((0x3000, 8)), 0x10000,
+        ),
+        Err(STATUS_GUARD_PAGE_VIOLATION),
+    );
+    assert_eq!(memory.pages[&0x3000].info.protect, PAGE_READWRITE);
+    assert_eq!(memory.pages[&0x1000].bytes, [0xa5; PAGE_SIZE as usize]);
+    assert_eq!(memory.pages[&0x3000].bytes, [0x5a; PAGE_SIZE as usize]);
+    assert_eq!(
+        crate::native_output::probe_file_io_output(
+            &mut memory, 0x1000, Some((0x3000, 8)), 0x10000,
+        ),
+        Ok(()),
+    );
+    assert_eq!(memory.pages[&0x1000].bytes, [0xa5; PAGE_SIZE as usize]);
+    assert_eq!(memory.pages[&0x3000].bytes, [0x5a; PAGE_SIZE as usize]);
+}
+
+#[test]
 fn destination_guard_probe_preserves_status_and_never_copies_source_bytes() {
     for attached in [false, true] {
         let mut memory = Memory::default();

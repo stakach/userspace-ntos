@@ -146,10 +146,11 @@ static void query_position(HANDLE file, uint64_t expected)
     eq("position", "information", iosb.Information, 8);
     eq("position", "offset", position, expected);
 }
-static void protect(void *page, uint32_t protection)
+static uint32_t protect(void *page, uint32_t protection)
 {
     size_t bytes = 4096; uint32_t old = 0;
     status("protect", NtProtectVirtualMemory(CURRENT_PROCESS, &page, &bytes, protection, &old), SUCCESS);
+    return old;
 }
 static void nonsignaled(HANDLE event)
 {
@@ -211,7 +212,10 @@ static void fault_cases(HANDLE file)
         status(name, NtQueryInformationFile(file, &iosb, base + 4088, 24, 5), expected);
         eq(name, "iosb-status", iosb.Status, SENTINEL);
         eq(name, "iosb-information", iosb.Information, SENTINEL);
-        protect(base + 4096, PAGE_RW);
+        uint32_t old = protect(base + 4096, PAGE_RW);
+        eq(name, "old-protection", old, guard ? PAGE_RW : PAGE_NOACCESS);
+        for (size_t i = 4088; i < 4112; ++i) if (base[i] != 0xcc) fail();
+        emit(name, "output-unchanged", 1, 1);
         query_position(file, sizeof(payload)); nonsignaled(event); ++completed;
     }
 

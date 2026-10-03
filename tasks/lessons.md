@@ -483,3 +483,8 @@ diagnosis-free failure.
 - A later operation-start transition must consume referenced-body authority, not repeat a
   live-handle requirement. Keep fresh admission strict and exclude cleanup-only or counted
   serializer references from the retained-body proof.
+
+## Match Evidence to Executed Observations
+- A fixture's completed-group count does not identify every check it reached. Verify each
+  claimed native case against its actual log record; do not promote host coverage or a later
+  source assertion into guest execution evidence.

@@ -56,7 +56,8 @@ Any mismatch terminates the real process with STATUS_UNSUCCESSFUL. Nineteen comp
 - Short Standard query must leave IOSB/output untouched.
 - Query class/length/probe ordering versus Read/Write handle/access-before-probe ordering,
   including a read-only handle with inaccessible IOSB, data, offset and key pointers.
-- NOACCESS and GUARD output spans across an actual VM page boundary.
+- NOACCESS and GUARD output spans across an actual VM page boundary, unchanged
+  output bytes, and the consumed guard's actual protection readback.
 - READ output, WRITE input and IOSB spans crossing into a protected page.
 - Failed probes leave current position/content unchanged and supplied Event
   nonsignaled; successful readback proves real stored bytes are intact.
