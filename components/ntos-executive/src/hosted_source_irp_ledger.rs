@@ -1005,6 +1005,7 @@ pub(super) fn matches(
         SourceIrpOwner::HostedDriver(instance) | SourceIrpOwner::HostedCaller(instance)
             if instance == instance_index
     ) || !ledger().matches(owner.owner, owner, ticket)
+        || !ledger().admits_forward(ticket, owner)
     {
         return false;
     }
@@ -1048,6 +1049,102 @@ pub(super) fn mdl_release_allowed(
 pub(super) fn unpin(ticket: SourceIrpTicket) -> bool {
     let _guard = lock();
     ledger().unpin(ticket).is_ok()
+}
+
+unsafe fn caller_terminal_ready_unlocked(ticket: SourceIrpTicket, allocation: SourceIrpAllocation) -> bool {
+    let SourceIrpOwner::HostedCaller(instance_index) = allocation.owner else { return false; };
+    let Some(inst) = instance(instance_index) else { return false; };
+    if instance_domain_identity(inst) != Some(allocation.domain) { return false; }
+    let mut current = allocation_unlocked(instance_index, inst, allocation.component_address,
+        allocation.bytes, allocation.stack_count);
+    if let Some(current) = current.as_mut() { current.owner = allocation.owner; }
+    if current != Some(allocation) { return false; }
+    let Some(row) = caller_projections().iter().find(|row|
+        row.ticket == ticket && row.allocation == allocation).copied() else { return false; };
+    if !ledger().admits_forward(ticket, allocation) { return false; }
+    [HOSTED_IRP_COMPLETED_DISPATCH, HOSTED_IRP_COMPLETED_CANCEL, HOSTED_IRP_READY,
+        HOSTED_IRP_PUBLISHED, HOSTED_IRP_COPYING, HOSTED_IRP_CONSUMING].iter().any(|kind| {
+        projected_node(instance_index, row.node, row.canonical_irp_id,
+            allocation.component_address, *kind, Some(row.node_generation))
+            .is_some_and(|(_, entry)| entry.source_ticket_id == ticket.id.get()
+                && entry.source_ticket_generation == ticket.generation.get()
+                && entry.completion.completed().is_some())
+    })
+}
+
+pub(super) fn caller_terminal_ready(ticket: SourceIrpTicket, allocation: SourceIrpAllocation) -> bool {
+    let _guard = lock();
+    let SourceIrpOwner::HostedCaller(index) = allocation.owner else { return false; };
+    let Some(inst) = instance(index) else { return false; };
+    if instance_domain_identity(inst) != Some(allocation.domain) { return false; }
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else { return false; };
+    unsafe { caller_terminal_ready_unlocked(ticket, allocation) }
+}
+
+/// Keep the original canonical consumer out of graph retirement while a forwarding owner is live.
+pub(super) fn caller_completion_publishable(
+    instance_index: usize, node: u64, node_generation: u64, canonical_irp_id: u64,
+    raw_irp: u64, ticket_id: u64, ticket_generation: u64,
+) -> bool {
+    let _guard = lock();
+    let Some(inst) = instance(instance_index) else { return false; };
+    let Some(domain) = instance_domain_identity(inst) else { return false; };
+    if ticket_id == 0 && ticket_generation == 0 {
+        return !caller_projections().iter().any(|row|
+            row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index)
+                && row.allocation.domain == domain
+                && (row.node == node || row.allocation.component_address == raw_irp));
+    }
+    let Some(ticket) = SourceIrpTicket::new(domain, ticket_id, ticket_generation) else { return false; };
+    let Some(row) = caller_projections().iter().find(|row|
+        row.ticket == ticket && row.node == node && row.node_generation == node_generation
+            && row.canonical_irp_id == canonical_irp_id && row.allocation.component_address == raw_irp
+            && row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index)).copied()
+    else { return false; };
+    ledger().retirement_ready(ticket, row.allocation).is_ok()
+}
+
+/// The pool lock is acquired before releasing any pin. A lock refusal has no ownership effect.
+/// Driver free is local under both locks; any failure after the final claim is nonreplayable.
+pub(super) fn release_pending_terminal(ticket: SourceIrpTicket, allocation: SourceIrpAllocation) -> bool {
+    let _guard = lock();
+    let index = match allocation.owner {
+        SourceIrpOwner::HostedDriver(index) | SourceIrpOwner::HostedCaller(index) => index,
+        SourceIrpOwner::Win32k => return false,
+    };
+    let Some(inst) = instance(index) else { return false; };
+    if instance_domain_identity(inst) != Some(allocation.domain) { return false; }
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else { return false; };
+    let mut current = allocation_unlocked(index, inst, allocation.component_address,
+        allocation.bytes, allocation.stack_count);
+    if let Some(current) = current.as_mut() { current.owner = allocation.owner; }
+    if current != Some(allocation) { return false; }
+    if matches!(allocation.owner, SourceIrpOwner::HostedCaller(_)) {
+        if !unsafe { caller_terminal_ready_unlocked(ticket, allocation) } { return false; }
+        return ledger().release_hosted_caller_terminal_pin(ticket, allocation).is_ok();
+    }
+    match auxiliary().snapshot(ticket, allocation) {
+        Ok((owner, phase)) if unsafe { auxiliary_matches_unlocked(index, inst, owner, phase) } => {}
+        Err(SourceIrpAuxiliaryError::NotFound) => {}
+        _ => return false,
+    }
+    match ledger().begin_deferred_driver_retirement(ticket, allocation) {
+        Ok(SourceIrpRetirement::Deferred(_)) => return true,
+        Ok(SourceIrpRetirement::Retired(exact)) if exact == ticket => {}
+        _ => return false,
+    }
+    if !unsafe { hosted_instance_pool_free_unlocked(inst, allocation.component_address) }
+        || ledger().retire(ticket, allocation).is_err()
+    {
+        unsafe { crate::provider_bugcheck::report(0xc4,
+            [FSD_SERVICE_SOURCE_IRP_LABEL, 2, allocation.component_address, ticket.id.get()]); }
+    }
+    match auxiliary().retire(ticket, allocation) {
+        Ok(_) | Err(SourceIrpAuxiliaryError::NotFound) => {}
+        Err(_) => unsafe { crate::provider_bugcheck::report(0xc4,
+            [FSD_SERVICE_SOURCE_IRP_LABEL, 6, allocation.component_address, ticket.id.get()]); },
+    }
+    true
 }
 
 pub(super) fn arm_deferred_free(ticket: SourceIrpTicket) -> bool {

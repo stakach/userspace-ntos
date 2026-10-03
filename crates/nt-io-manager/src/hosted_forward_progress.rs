@@ -45,6 +45,43 @@ pub const fn hosted_forward_dispatch_reply_ready(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InlineHoldPhase { Unreported, Held, Retired }
+
+/// Value-only progress. Native owners authenticate the token and completion/stop proof.
+#[derive(Debug)]
+pub struct HostedForwardInlineHold {
+    token: u64,
+    phase: InlineHoldPhase,
+}
+
+impl HostedForwardInlineHold {
+    pub fn new(token: u64) -> Option<Self> {
+        (token != 0).then_some(Self { token, phase: InlineHoldPhase::Unreported })
+    }
+
+    pub fn phase(&self) -> InlineHoldPhase { self.phase }
+
+    pub fn report_held(&mut self, token: u64) -> bool {
+        if token != self.token || self.phase != InlineHoldPhase::Unreported { return false; }
+        self.phase = InlineHoldPhase::Held;
+        true
+    }
+
+    pub fn retirement_ready(&self, terminal_finished: bool, owner_stopped: bool) -> bool {
+        self.phase == InlineHoldPhase::Held && (terminal_finished || owner_stopped)
+    }
+
+    /// Record acknowledged native retirement, never authorize an unwind or dispatch replay.
+    pub fn retire(&mut self, token: u64, terminal_finished: bool, owner_stopped: bool) -> bool {
+        if token != self.token || !self.retirement_ready(terminal_finished, owner_stopped) {
+            return false;
+        }
+        self.phase = InlineHoldPhase::Retired;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

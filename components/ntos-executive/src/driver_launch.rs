@@ -2371,6 +2371,19 @@ unsafe fn poll_hosted_completion(instance_index: usize) -> Option<nt_io_manager:
             let completion = entry.completion.completed();
             pending_irp_owner_state(node_exec).store(ready_state, Ordering::Release);
             if canonical_irp_id != 0 && entry.owner_domain == owner_domain {
+                if !hosted_source_irp_ledger::caller_completion_publishable(
+                    storage_instance,
+                    node,
+                    ready_state & !HOSTED_IRP_STATE_MASK,
+                    canonical_irp_id,
+                    entry.irp,
+                    entry.source_ticket_id,
+                    entry.source_ticket_generation,
+                ) {
+                    node = next;
+                    steps += 1;
+                    continue;
+                }
                 if let Some(completion) = completion {
                     if best
                         .as_ref()
@@ -8785,7 +8798,11 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                         hosted_forward_origin::arm_pending(forward_label, irp, token);
                         return STATUS_PENDING as i32;
                     }
-                    let completion = complete_hosted_irp(irp);
+                    let completion = complete_hosted_irp_with_owner(irp);
+                    if typed_forward && completion.outcome == HostedIrpUnwindOutcome::MoreProcessingRequired {
+                        hosted_forward_origin::acknowledge_inline_held(forward_label, irp, token);
+                        return status as u32 as i32;
+                    }
                     let (ack_label, ack_status, _, _, _) = call_on4(
                         (forward_label << 12) | 4,
                         2,
@@ -8799,7 +8816,9 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                             [forward_label, 2, irp, ack_status],
                         );
                     }
-                    if completion == HostedIrpUnwindOutcome::Terminal {
+                    if completion.outcome == HostedIrpUnwindOutcome::Terminal
+                        && completion.storage_owner == HostedIrpStorageOwner::DriverLocal
+                    {
                         s_io_free_irp(irp);
                     }
                     return status as u32 as i32;
@@ -11492,11 +11511,30 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
 }
 
 unsafe fn complete_hosted_irp(irp: u64) -> HostedIrpUnwindOutcome {
+    unsafe { complete_hosted_irp_with_owner(irp).outcome }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostedIrpStorageOwner {
+    DriverLocal,
+    CanonicalCaller,
+}
+
+struct HostedIrpCompletionReceipt {
+    outcome: HostedIrpUnwindOutcome,
+    storage_owner: HostedIrpStorageOwner,
+}
+
+unsafe fn complete_hosted_irp_with_owner(irp: u64) -> HostedIrpCompletionReceipt {
     unsafe {
         let claim = claim_pending_irp_completion(irp);
         if claim.is_none() && pending_irp_raw_identity_exists(irp) {
             panic!("IoCompleteRequest attempted to complete an owned IRP twice");
         }
+        let storage_owner = match claim {
+            Some(_) => HostedIrpStorageOwner::CanonicalCaller,
+            None => HostedIrpStorageOwner::DriverLocal,
+        };
         let active_seq = FSD_ACTIVE_DISPATCH_SEQ.load(Ordering::Relaxed);
         if active_seq >= 128 && FSD_ACTIVE_COMPLETE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16
         {
@@ -11553,7 +11591,10 @@ unsafe fn complete_hosted_irp(irp: u64) -> HostedIrpUnwindOutcome {
                 if let Some(claim) = claim {
                     park_pending_irp_completion_claim(claim);
                 }
-                return HostedIrpUnwindOutcome::MoreProcessingRequired;
+                return HostedIrpCompletionReceipt {
+                    outcome: HostedIrpUnwindOutcome::MoreProcessingRequired,
+                    storage_owner,
+                };
             }
             Ok(HostedIrpUnwindOutcome::Terminal) => {}
             Err(()) => {
@@ -11570,7 +11611,10 @@ unsafe fn complete_hosted_irp(irp: u64) -> HostedIrpUnwindOutcome {
         }
         let Some(claim) = claim else {
             finish_driver_local_irp(irp);
-            return HostedIrpUnwindOutcome::Terminal;
+            return HostedIrpCompletionReceipt {
+                outcome: HostedIrpUnwindOutcome::Terminal,
+                storage_owner,
+            };
         };
         let node = claim.node;
         let target = claim.target;
@@ -11661,7 +11705,10 @@ unsafe fn complete_hosted_irp(irp: u64) -> HostedIrpUnwindOutcome {
             print_u64(information);
             print_str(b"\n");
         }
-        HostedIrpUnwindOutcome::Terminal
+        HostedIrpCompletionReceipt {
+            outcome: HostedIrpUnwindOutcome::Terminal,
+            storage_owner,
+        }
     }
 }
 
@@ -57437,6 +57484,8 @@ pub(crate) unsafe fn service_hosted_read_forward(
             .map(|status| (status, false)),
         3 => hosted_read_work::arm_pending(ch, reply_cap, badge, address, irp)
             .map(|status| (status, false)),
+        4 => hosted_read_work::acknowledge_held(ch, reply_cap, badge, address, irp)
+            .map(|status| (status, false)),
         _ => Some((STATUS_INVALID_PARAMETER, false)),
     }
 }
@@ -57459,6 +57508,8 @@ pub(crate) unsafe fn service_hosted_flush_forward(
         2 if irp == 0 => hosted_flush_work::acknowledge(ch, reply_cap, badge, address)
             .map(|status| (status, false)),
         3 => hosted_flush_work::arm_pending(ch, reply_cap, badge, address, irp)
+            .map(|status| (status, false)),
+        4 => hosted_flush_work::acknowledge_held(ch, reply_cap, badge, address, irp)
             .map(|status| (status, false)),
         _ => Some((STATUS_INVALID_PARAMETER, false)),
     }
@@ -57491,6 +57542,8 @@ pub(crate) unsafe fn service_hosted_query_information_forward(
             ch, reply_cap, badge, address,
         ).map(|status| (status, false)),
         3 => hosted_query_information_work::arm_pending(ch, reply_cap, badge, address, irp)
+            .map(|status| (status, false)),
+        4 => hosted_query_information_work::acknowledge_held(ch, reply_cap, badge, address, irp)
             .map(|status| (status, false)),
         _ => Some((STATUS_INVALID_PARAMETER, false)),
     }

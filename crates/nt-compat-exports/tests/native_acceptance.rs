@@ -46,6 +46,8 @@ mod pending_file_create_output;
 mod video_consumer_admission;
 #[path = "native_acceptance/source_completion_lane.rs"]
 mod source_completion_lane;
+#[path = "native_acceptance/source_pending_retirement.rs"]
+mod source_pending_retirement;
 
 // Executive globals required by the real cache module exercised in the host harness.
 use core::sync::atomic::{AtomicU64, Ordering};

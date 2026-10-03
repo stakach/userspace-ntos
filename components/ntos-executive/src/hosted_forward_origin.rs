@@ -4,6 +4,7 @@ use super::*;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
 use nt_io_manager::hosted_forward_progress::{
     hosted_forward_dispatch_reply_ready, HostedForwardDispatchReply,
+    HostedForwardInlineHold, InlineHoldPhase,
 };
 use nt_io_manager::source_terminal::{OriginCallPhase, TerminalAdmission, TerminalDelivery};
 
@@ -14,6 +15,14 @@ pub(super) unsafe fn arm_pending(label: u64, irp: u64, token: u64) {
     let (reply_label, status, _, _, _) = call_on4((label << 12) | 4, 3, irp, token, 0);
     if reply_label != 0 || status as u32 as i32 != STATUS_SUCCESS {
         crate::provider_bugcheck::report(0xc4, [label, 3, irp, status]);
+    }
+}
+
+pub(super) unsafe fn acknowledge_inline_held(label: u64, irp: u64, token: u64) {
+    if token == 0 { crate::provider_bugcheck::report(0xc4, [label, 4, irp, token]); }
+    let (reply_label, status, _, _, _) = call_on4((label << 12) | 4, 4, irp, token, 0);
+    if reply_label != 0 || status as u32 as i32 != STATUS_SUCCESS {
+        crate::provider_bugcheck::report(0xc4, [label, 4, irp, status]);
     }
 }
 
@@ -30,6 +39,7 @@ pub(super) struct HostedForwardOrigin {
     terminal_held: bool,
     terminal_command: Option<hosted_source_completion_lane::SourceCompletionCommand>,
     lane_acknowledged: bool,
+    inline_hold: HostedForwardInlineHold,
 }
 
 impl HostedForwardOrigin {
@@ -52,11 +62,37 @@ impl HostedForwardOrigin {
             terminal_held: false,
             terminal_command: None,
             lane_acknowledged: false,
+            inline_hold: HostedForwardInlineHold::new(token).expect("nonzero forward token"),
         }
     }
 
     pub(super) fn pending(&self) -> bool {
         self.disposition == Some(HostedForwardDispatchReply::Pending)
+    }
+
+    pub(super) fn inline_held(&self) -> bool {
+        self.inline_hold.phase() == InlineHoldPhase::Held
+    }
+
+    pub(super) unsafe fn hold_inline(&mut self, token: u64) -> Result<(), i32> {
+        if token != self.token || !self.reply_entered
+            || self.phase != OriginCallPhase::Calling
+            || !matches!(self.disposition, Some(HostedForwardDispatchReply::InlineTerminal(_))) {
+            return Err(STATUS_INVALID_DEVICE_REQUEST as i32);
+        }
+        match runtime::reconcile_retained_service_reply(
+            self.route, self.dispatch, self.reply, self.token,
+        ) {
+            Ok(true) => {},
+            Ok(false) => return Err(nt_status::NtStatus::DEVICE_BUSY.raw()),
+            Err(_) => return Err(STATUS_INVALID_HANDLE as i32),
+        }
+        self.inline_hold.report_held(token).then_some(())
+            .ok_or(STATUS_INVALID_DEVICE_REQUEST as i32)
+    }
+
+    pub(super) fn retire_inline_held(&mut self, terminal_finished: bool, stopped: bool) -> bool {
+        self.inline_hold.retire(self.token, terminal_finished, stopped)
     }
 
     pub(super) fn armed(&self) -> bool {
@@ -161,7 +197,7 @@ impl HostedForwardOrigin {
         self.terminal_held
     }
 
-    pub(super) fn acknowledge_held_free(&mut self) {
+    pub(super) fn acknowledge_held_completion(&mut self) {
         if self.terminal_held && self.lane_acknowledged {
             self.terminal_completed = true;
         }

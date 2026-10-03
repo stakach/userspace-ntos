@@ -226,6 +226,9 @@ pub(super) unsafe fn submit(
 
 impl Work {
     unsafe fn ready_for_nested_step(&self) -> bool {
+        if self.origin.inline_held() {
+            return self.source_released || self.source.completion_finished() || self.origin.stopped();
+        }
         if let Some(ack) = &self.ack {
             return !ack.reply_entered;
         }
@@ -233,7 +236,7 @@ impl Work {
             if self.origin.stopped() { return self.origin.may_discard(); }
             if !self.origin.armed() { return false; }
             if self.origin.completed() { return true; }
-            if self.origin.held() && self.source.callback_requested_free() { return true; }
+            if self.origin.held() && self.source.completion_finished() { return true; }
             return self.source.completion_command(self.origin.token).is_ok_and(|command|
                 self.origin.terminal_ready(command)) && (self.terminal.is_some() || self.canonical_irp
                     .is_some_and(|irp| completed_irp_exact(irp.raw()).is_some()));
@@ -465,6 +468,8 @@ impl Work {
             };
             let result = if stopped {
                 self.source.retire_target_after_source_stop(terminal)
+            } else if self.origin.pending() {
+                self.source.retire_target_after_pending_source_completion(terminal)
             } else {
                 self.source.retire_target_after_source_completion(terminal)
             };
@@ -483,12 +488,27 @@ impl Work {
             self.canonical_irp = None;
         }
         if !self.source_released {
-            if self.source.release().is_err() {
+            let released = if (self.origin.pending() || self.origin.inline_held()) && !stopped {
+                self.source.release_pending_terminal()
+            } else {
+                self.source.release()
+            };
+            if released.is_err() {
                 return false;
             }
             self.source_released = true;
         }
         !self.actor.is_held() || self.actor_release().is_ok()
+    }
+
+    unsafe fn advance_inline_held(&mut self) -> bool {
+        let finished = self.source_released || self.source.completion_finished();
+        let stopped = self.origin.stopped();
+        if !finished && !stopped { return false; }
+        if !self.retire_after_terminal(!finished) || !self.origin.retire_receipt() {
+            return false;
+        }
+        self.origin.retire_inline_held(finished, stopped)
     }
 
     unsafe fn advance_ack(&mut self) -> bool {
@@ -536,13 +556,15 @@ impl Work {
         if self.retained.is_some() {
             self.poll_provider();
         }
-        if !self.retire_after_terminal(!self.source.callback_requested_free()) {
+        let finished = self.source.completion_finished();
+        if !self.retire_after_terminal(!finished) {
             return false;
         }
         self.origin.retire_receipt()
     }
 
     unsafe fn advance(&mut self, handler: *mut ExecNtHandler) -> bool {
+        if self.origin.inline_held() { return self.advance_inline_held(); }
         if self.origin.pending() {
             if self.origin.stopped() {
                 if !self.origin.may_discard() { return false; }
@@ -555,8 +577,8 @@ impl Work {
                 self.publish_source();
                 self.source_published = true;
             }
-            if self.origin.held() && self.source.callback_requested_free() {
-                self.origin.acknowledge_held_free();
+            if self.origin.held() && self.source.completion_finished() {
+                self.origin.acknowledge_held_completion();
             }
             if !self.origin.completed() {
                 let command = self.source.completion_command(self.origin.token)
@@ -748,6 +770,37 @@ pub(super) unsafe fn arm_pending(
     Some(work.origin.arm(token).err().unwrap_or(STATUS_SUCCESS))
 }
 
+pub(super) unsafe fn acknowledge_held(
+    ch: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    caller_badge: u64,
+    source_irp_address: u64,
+    token: u64,
+) -> Option<i32> {
+    let Some((_, source_instance)) = instance_for_pump_channel(ch, reply_cap) else {
+        return Some(STATUS_INVALID_HANDLE_LOCAL);
+    };
+    if hosted_driver_pump_caller_tcb(ch, reply_cap, caller_badge).is_none() {
+        return Some(STATUS_INVALID_HANDLE_LOCAL);
+    }
+    let Some(index) = source_work_index(source_instance, source_irp_address) else {
+        return Some(STATUS_INVALID_HANDLE_LOCAL);
+    };
+    if (&*core::ptr::addr_of!(EXECUTING)).iter().any(|(active, _, _)| *active == index) {
+        return Some(STATUS_DEVICE_BUSY_LOCAL);
+    }
+    let Some(work) = (&mut *core::ptr::addr_of_mut!(WORK))[index].as_mut() else {
+        return Some(STATUS_INVALID_HANDLE_LOCAL);
+    };
+    if work.ack.is_some() || work.terminal.is_none()
+        || crate::provider_registry_caller::resolve(ch) != Ok(work.caller)
+        || runtime::channel_route(ch).ok().flatten() != Some(work.origin.route)
+        || work.source.completion_command(token).is_err() {
+        return Some(STATUS_INVALID_HANDLE_LOCAL);
+    }
+    Some(work.origin.hold_inline(token).err().unwrap_or(STATUS_SUCCESS))
+}
+
 pub(super) unsafe fn acknowledge(
     ch: &crate::spawn_hosts::PumpChannel,
     reply_cap: u64,
@@ -778,7 +831,7 @@ pub(super) unsafe fn acknowledge(
     if work.ack.is_some()
         || !work.origin.reply_entered
         || work.terminal.is_none()
-        || !work.source.callback_requested_free()
+        || !work.source.completion_finished()
     {
         return Some(STATUS_INVALID_DEVICE_REQUEST_LOCAL);
     }
