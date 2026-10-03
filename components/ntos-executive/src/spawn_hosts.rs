@@ -2377,13 +2377,26 @@ unsafe fn component_pump_loop(
                 outcome.wall(msg);
                 break;
             }
-            let starting = ch.caps.kind == ReqKind::Syscall
-                && ch.initial == InitialAction::RecvFirst
-                && crate::win32k_glue::win32k_physical_lane_for_channel(
-                    ch.tcb, ch.fault_ep, ch.reply_cap,
-                ).is_some_and(|lane| {
-                    crate::service_sec_image::component_execution_lane_is_starting(lane)
-                });
+            let hosted_starting =
+                crate::driver_launch::hosted_source_completion_lane::startup_expected(ch).is_some();
+            if hosted_starting
+                && !crate::driver_launch::hosted_source_completion_lane::validate_startup_ready(
+                    ch,
+                    [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4],
+                )
+            {
+                outcome.wall(msg);
+                break;
+            }
+            let starting = hosted_starting
+                || (ch.caps.kind == ReqKind::Syscall
+                    && ch.initial == InitialAction::RecvFirst
+                    && crate::win32k_glue::win32k_physical_lane_for_channel(
+                        ch.tcb, ch.fault_ep, ch.reply_cap,
+                    )
+                    .is_some_and(|lane| {
+                        crate::service_sec_image::component_execution_lane_is_starting(lane)
+                    }));
             // Only an authenticated secondary startup carries publication words. Ordinary
             // completions retain the exact zero-word, no-capability protocol shape.
             let expected_info = (ch.dispatch_label << 12) | if starting { 5 } else { 0 };

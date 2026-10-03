@@ -129,7 +129,7 @@ mod hosted_write_work;
 #[path = "hosted_read_work.rs"]
 mod hosted_read_work;
 #[path = "hosted_source_completion_lane.rs"]
-mod hosted_source_completion_lane;
+pub(crate) mod hosted_source_completion_lane;
 #[path = "hosted_forward_origin.rs"]
 mod hosted_forward_origin;
 #[path = "hosted_flush_work.rs"]

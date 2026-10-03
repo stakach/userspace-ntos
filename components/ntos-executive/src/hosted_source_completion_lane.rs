@@ -49,6 +49,7 @@ struct SourceCompletionLane {
     outcome: Option<HostedIrpUnwindOutcome>,
     pump: Option<crate::spawn_hosts::PumpResult>,
     dispatch: Option<nt_component_suspension::LaneDispatchIdentity>,
+    startup_dispatch: Option<nt_component_suspension::LaneDispatchIdentity>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -232,6 +233,7 @@ pub(super) unsafe fn prepare(
             outcome: None,
             pump: None,
             dispatch: None,
+            startup_dispatch: None,
         });
         index
     };
@@ -330,8 +332,9 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
     ] {
         write_volatile((executive_shared + offset) as *mut u64, value);
     }
-    runtime::start_bootstrap(route, spawn.cnode, spawn.sched_context)
+    let startup_dispatch = runtime::start_bootstrap(route, spawn.cnode, spawn.sched_context)
         .map_err(|_| STATUS_INVALID_HANDLE as u32)?;
+    (&mut *core::ptr::addr_of_mut!(LANES))[index].startup_dispatch = Some(startup_dispatch);
     let caller = hosted_thread_resources::registry_caller(worker)?;
     let channel = channel(index, worker, crate::spawn_hosts::InitialAction::RecvFirst)?;
     let pump = component_scheduler::hosted_component_pump_with_caller(&channel, caller);
@@ -390,6 +393,110 @@ unsafe fn channel(
             ..crate::spawn_hosts::HostCaps::default()
         },
     })
+}
+
+/// Expected protocol is derived from retained startup ownership, never from received words.
+pub(crate) unsafe fn startup_expected(ch: &crate::spawn_hosts::PumpChannel) -> Option<[u64; 5]> {
+    if ch.initial != crate::spawn_hosts::InitialAction::RecvFirst
+        || ch.caps.kind != crate::spawn_hosts::ReqKind::Irp
+        || ch.dispatch_label != LABEL
+    {
+        return None;
+    }
+    let route = runtime::channel_route(ch).ok()??;
+    let source = runtime::physical_source(route).ok()?;
+    let runtime::PhysicalSourceKind::DispatchWorker { ordinal } = source.kind else {
+        return None;
+    };
+    let runtime::PhysicalDomain::Hosted(domain) = source.domain else {
+        return None;
+    };
+    let Some((instance_index, handle, component_shared, startup_dispatch)) =
+        (&*core::ptr::addr_of!(LANES))
+            .iter()
+            .find(|row| {
+                row.phase == Phase::Preparing
+                    && row.route == Some(route)
+                    && row.domain == domain
+                    && row.pml4 == source.pml4
+                    && row.ordinal == ordinal
+                    && row.executive_shared == ch.shared_va
+            })
+            .map(|row| {
+                (
+                    row.instance,
+                    row.handle,
+                    row.component_shared,
+                    row.startup_dispatch,
+                )
+            })
+    else {
+        return None;
+    };
+    let startup_dispatch = startup_dispatch?;
+    let worker = worker(instance_index, ordinal)?;
+    let enrollment = hosted_ingress_sources::enrollment(source)?;
+    if worker.tcb != ch.tcb
+        || source.tcb != ch.tcb
+        || source.pml4 != ch.pml4
+        || worker.pml4 != ch.pml4
+        || worker.domain != domain
+        || ch.physical_domain != Some(domain)
+        || worker.handle != handle
+        || worker.cnode == 0
+        || worker.raw_cnode == 0
+        || enrollment.cnode != worker.cnode
+        || enrollment.route != Some(route)
+        || enrollment.phase != hosted_ingress_sources::EnrollmentPhase::Published
+        || !matches!(runtime::dispatch(route), Ok(current) if current == startup_dispatch)
+    {
+        return None;
+    }
+    Some([
+        ordinal,
+        domain.domain_id.raw(),
+        domain.cookie,
+        component_shared,
+        handle,
+    ])
+}
+
+/// Admit actual READY only under the exact retained startup and rotated Reply ownership.
+pub(crate) unsafe fn validate_startup_ready(
+    ch: &crate::spawn_hosts::PumpChannel,
+    words: [u64; 5],
+) -> bool {
+    if startup_expected(ch) != Some(words) {
+        return false;
+    }
+    let Ok(Some(route)) = runtime::channel_route(ch) else {
+        return false;
+    };
+    let Ok(current) = runtime::current_reply(route) else {
+        return false;
+    };
+    let Ok(Some((incoming, message))) = runtime::next_message(route) else {
+        return false;
+    };
+    if current == 0
+        || incoming == 0
+        || current == incoming
+        || message.badge() != route.badge()
+        || message.info() != (LABEL << 12) | 5
+        || words
+            .iter()
+            .enumerate()
+            .any(|(index, word)| message.word(index) != Some(*word))
+    {
+        return false;
+    }
+    matches!(
+        crate::spawn_hosts::query_component_reply_binding(ch.tcb, current),
+        Ok(nt_component_suspension::ReplyBindingObservation::Free)
+    ) && matches!(
+        crate::spawn_hosts::query_component_reply_binding(ch.tcb, incoming),
+        Ok(nt_component_suspension::ReplyBindingObservation::BoundToTarget)
+    )
 }
 
 pub(super) unsafe fn ready_for_source(

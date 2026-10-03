@@ -107,7 +107,9 @@ unsafe fn hosted_component_pump_inner(
         runtime::admit(route).expect("admit exact hosted dispatch Call");
         channel.reply_cap = runtime::current_reply(route).expect("admitted canonical Reply");
         parent
-    } else { None };
+    } else {
+        None
+    };
     let channel = &mut channel;
     let _registry_caller = caller.map(|caller| {
         crate::provider_registry_caller::Scope::enter(channel, caller)
@@ -128,8 +130,20 @@ unsafe fn hosted_component_pump_inner(
     if result.completed {
         let route = route.expect("hosted completion requires enrolled source");
         let dispatch = runtime::dispatch(route).expect("retained hosted dispatch epoch");
-        runtime::complete(route, dispatch, result.reply_cap, channel.dispatch_label)
-            .expect("authenticate hosted final completion Call");
+        if let Some(words) = result.startup_stack_receipt {
+            assert!(
+                crate::driver_launch::hosted_source_completion_lane::validate_startup_ready(
+                    channel, words
+                ),
+                "authenticate exact retained hosted worker READY"
+            );
+            let reply = runtime::current_reply(route).expect("current canonical startup Reply");
+            runtime::complete_protocol(route, dispatch, reply, channel.dispatch_label, &words)
+                .expect("settle exact hosted worker startup protocol");
+        } else {
+            runtime::complete(route, dispatch, result.reply_cap, channel.dispatch_label)
+                .expect("authenticate hosted final completion Call");
+        }
     }
     runtime::nested::restore(parent).expect("restore nested hosted parent");
     result

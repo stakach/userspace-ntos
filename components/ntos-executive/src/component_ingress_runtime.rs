@@ -977,23 +977,46 @@ pub(crate) unsafe fn complete_protocol(
         return Err(Error::Admission);
     }
     let (incoming, _) = next_message(route)?.ok_or(Error::Protocol)?;
+    let index = (&*core::ptr::addr_of!(NATIVE_PEERS))
+        .iter()
+        .position(|row| row.route == Some(route))
+        .ok_or(Error::UnknownPeer)?;
     let owner = owner();
     let _saved = crate::ipc_message::SavedMessageBuffer::capture();
-    owner
-        .receiver
-        .as_mut()
-        .expect("ready receiver")
-        .complete_protocol_from_message(
-            route,
-            dispatch,
-            incoming,
-            label,
-            words,
-            lanes(),
-            owner.peers.as_mut().expect("ready peers"),
-            |tcb, reply| crate::spawn_hosts::query_component_reply_binding(tcb, reply),
-        )
-        .map_err(|_| Error::Protocol)?;
+    if (&*core::ptr::addr_of!(NATIVE_PEERS))[index].bootstrap {
+        owner
+            .receiver
+            .as_mut()
+            .expect("ready receiver")
+            .complete_bootstrap_protocol_from_message(
+                route,
+                dispatch,
+                incoming,
+                label,
+                words,
+                lanes(),
+                owner.peers.as_ref().expect("ready peers"),
+                |tcb, reply| crate::spawn_hosts::query_component_reply_binding(tcb, reply),
+            )
+            .map_err(|_| Error::Protocol)?;
+        (&mut *core::ptr::addr_of_mut!(NATIVE_PEERS))[index].bootstrap = false;
+    } else {
+        owner
+            .receiver
+            .as_mut()
+            .expect("ready receiver")
+            .complete_protocol_from_message(
+                route,
+                dispatch,
+                incoming,
+                label,
+                words,
+                lanes(),
+                owner.peers.as_mut().expect("ready peers"),
+                |tcb, reply| crate::spawn_hosts::query_component_reply_binding(tcb, reply),
+            )
+            .map_err(|_| Error::Protocol)?;
+    }
     crate::service_sec_image::retire_win32k_directory_route(route, dispatch);
     crate::service_sec_image::retire_win32k_section_create_route(route, dispatch);
     crate::service_sec_image::retire_win32k_section_map_route(route, dispatch);
