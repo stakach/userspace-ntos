@@ -445,3 +445,10 @@ diagnosis-free failure.
   context table, address range, or guessed object header.
 - Distinguish an authenticated negative classification from failed transport or authority. A
   rejected query must stop, not route the pointer to another object's retirement service.
+
+## Execution Identity Is Independent of GUI State
+- The last exiting thread can run a process's Win32 callout without having THREADINFO. Preserve
+  its exact retained canonical ETHREAD and real execution TEB; optional GUI state must never
+  become a NULL current thread, fabricated GUI row, or substituted actor.
+- Validate execution identity before publishing context, and retain the body until the callout
+  returns. Nonexecuting finalization is a separate boundary, not a process-only execution mode.

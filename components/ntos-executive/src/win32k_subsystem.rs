@@ -54,6 +54,8 @@ mod source_call_router;
 mod process_attach;
 #[path = "win32k_thread_execution.rs"]
 mod thread_execution;
+#[path = "provider_ps_lifecycle.rs"]
+mod provider_ps_lifecycle;
 pub(crate) use source_irp::{SourcePnpDispatchLease, SourceRelationAllocationLease};
 pub(crate) use source_fsd::SourceFsdDispatchLease;
 
@@ -16333,28 +16335,21 @@ unsafe fn select_existing_ps_provider_context(
         return Err(STATUS_INVALID_CID);
     }
 
-    let thread_index = if tid == 0 {
-        if require_thread {
-            return Err(STATUS_INVALID_CID);
-        }
-        None
-    } else {
-        let Some(index) = thread_context_index_for_tid(tid) else {
-            if require_thread {
-                return Err(STATUS_INVALID_CID);
-            }
-            return install_existing_ps_provider_process_context(process_index, pi, pid, supplied_eprocess);
-        };
+    provider_ps_lifecycle::validate_ps_provider_execution_thread(
+        pid, tid, supplied_eprocess, supplied_ethread,
+    )?;
+    let thread_index = thread_context_index_for_tid(tid);
+    if let Some(index) = thread_index {
         if thread_ctx_pid(index) != pid
             || thread_ctx_pi(index) != pi
             || thread_ctx_generation(index) != generation
-            || supplied_ethread == 0
             || thread_ctx_ethread(index) != supplied_ethread
         {
             return Err(STATUS_INVALID_CID);
         }
-        Some(index)
-    };
+    } else if require_thread {
+        return Err(STATUS_INVALID_CID);
+    }
 
     let selected_teb = if let Some(thread_index) = thread_index {
         let recorded_teb = thread_ctx_teb(thread_index);
@@ -16374,7 +16369,10 @@ unsafe fn select_existing_ps_provider_context(
         }
         teb
     } else {
-        WIN32K_KPCR_VA
+        provider_ps_lifecycle::read_ps_provider_execution_teb(
+            supplied_ethread,
+            read_volatile((sh + SH_REQ_CLIENT_TEB) as *const u64),
+        )?
     };
 
     // Publish the entire selection only after validating every requested thread field.
@@ -16383,39 +16381,30 @@ unsafe fn select_existing_ps_provider_context(
     WIN32K_CURRENT_THREAD_ID.store(tid, Ordering::Relaxed);
     write_volatile(
         (WIN32K_KPCR_VA + 0x60) as *mut u64,
-        if supplied_ethread != 0 {
-            process_attach::selected_process(supplied_ethread, supplied_eprocess)
-        } else {
-            supplied_eprocess
-        },
+        process_attach::selected_process(supplied_ethread, supplied_eprocess),
     );
     write_volatile(
         SLOT_W32PROCESS as *mut u64,
-        if supplied_ethread != 0 {
-            process_attach::selected_win32process(
-                supplied_ethread,
-                supplied_eprocess,
-                process_ctx_w32process(process_index),
-            )
-        } else {
-            process_ctx_w32process(process_index)
-        },
+        process_attach::selected_win32process(
+            supplied_ethread,
+            supplied_eprocess,
+            process_ctx_w32process(process_index),
+        ),
     );
     write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, selected_teb);
+    write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, supplied_ethread);
     if let Some(thread_index) = thread_index {
-        write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, supplied_ethread);
         write_volatile(
             SLOT_W32THREAD as *mut u64,
             thread_ctx_w32thread(thread_index),
         );
         publish_selected_context(process_index, thread_index);
     } else {
-        write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, 0);
         write_volatile(SLOT_W32THREAD as *mut u64, 0);
         write_volatile((sh + SH_CTX_PROCESS_ID) as *mut u64, pid);
-        write_volatile((sh + SH_CTX_THREAD_ID) as *mut u64, 0);
+        write_volatile((sh + SH_CTX_THREAD_ID) as *mut u64, tid);
         write_volatile((sh + SH_CTX_EPROCESS) as *mut u64, supplied_eprocess);
-        write_volatile((sh + SH_CTX_ETHREAD) as *mut u64, 0);
+        write_volatile((sh + SH_CTX_ETHREAD) as *mut u64, supplied_ethread);
         write_volatile(
             (sh + SH_CTX_W32PROCESS) as *mut u64,
             process_ctx_w32process(process_index),
@@ -16423,36 +16412,6 @@ unsafe fn select_existing_ps_provider_context(
         write_volatile((sh + SH_CTX_W32THREAD) as *mut u64, 0);
     }
     Ok((process_index, thread_index))
-}
-
-unsafe fn install_existing_ps_provider_process_context(
-    process_index: usize,
-    pi: u64,
-    pid: u64,
-    eprocess: u64,
-) -> Result<(usize, Option<usize>), u32> {
-    let sh = WIN32K_SHARED_VADDR;
-    WIN32K_CURRENT_CLIENT_PI.store(pi, Ordering::Relaxed);
-    WIN32K_CURRENT_PROCESS_ID.store(pid, Ordering::Relaxed);
-    WIN32K_CURRENT_THREAD_ID.store(0, Ordering::Relaxed);
-    write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, WIN32K_KPCR_VA);
-    write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, eprocess);
-    write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, 0);
-    write_volatile(
-        SLOT_W32PROCESS as *mut u64,
-        process_ctx_w32process(process_index),
-    );
-    write_volatile(SLOT_W32THREAD as *mut u64, 0);
-    write_volatile((sh + SH_CTX_PROCESS_ID) as *mut u64, pid);
-    write_volatile((sh + SH_CTX_THREAD_ID) as *mut u64, 0);
-    write_volatile((sh + SH_CTX_EPROCESS) as *mut u64, eprocess);
-    write_volatile((sh + SH_CTX_ETHREAD) as *mut u64, 0);
-    write_volatile(
-        (sh + SH_CTX_W32PROCESS) as *mut u64,
-        process_ctx_w32process(process_index),
-    );
-    write_volatile((sh + SH_CTX_W32THREAD) as *mut u64, 0);
-    Ok((process_index, None))
 }
 
 unsafe fn dispatch_ps_provider_command(command: u64, expected: u64, flags: u64) -> u64 {
@@ -16522,9 +16481,9 @@ unsafe fn dispatch_ps_provider_command(command: u64, expected: u64, flags: u64) 
             Ok(selected) => selected,
             Err(status) => return status as u64,
         };
-    let _previous_mode = thread_index.map(|_| thread_execution::PreviousModeScope::enter(
+    let _previous_mode = thread_execution::PreviousModeScope::enter(
         nt_kernel_abi::ps_reactos_x64::ThreadPreviousMode::KernelMode,
-    ));
+    );
     let pid = process_ctx_pid(process_index);
 
     match command {
@@ -16591,6 +16550,11 @@ unsafe fn dispatch_ps_provider_command(command: u64, expected: u64, flags: u64) 
             }
             if let Some(thread_index) = thread_index {
                 publish_selected_context(process_index, thread_index);
+            } else {
+                write_volatile(
+                    (WIN32K_SHARED_VADDR + SH_CTX_W32PROCESS) as *mut u64,
+                    process_ctx_w32process(process_index),
+                );
             }
             STATUS_SUCCESS
         }
