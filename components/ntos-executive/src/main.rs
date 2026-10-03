@@ -27916,7 +27916,6 @@ struct Fat32 {
 #[no_mangle]
 #[link_section = ".text._start"]
 unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
-    serial_records::initialize_root();
     let bi = &*bootinfo;
     if initialize_loader_acpi_root(bi).is_err() {
         print_str(b"[boot] platform did not publish a valid ACPI loader root\n");
@@ -28030,6 +28029,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // relocated out of the 64 MiB ELF reserve into the shared cluster region; the kernel's ELF
     // page tables no longer cover them, so build the cluster PT in the executive's own VSpace.
     map_cluster_pt(CAP_INIT_THREAD_VSPACE);
+
+    serial_records::initialize_root(bi.ipc_buffer as u64);
 
     // The executive front-end allocates (ObjectClient etc.), so give it its own heap.
     map_own_heap();
