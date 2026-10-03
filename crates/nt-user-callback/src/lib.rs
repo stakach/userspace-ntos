@@ -1,6 +1,11 @@
 #![no_std]
 
+mod message_output;
 mod windowproc;
+pub use message_output::{
+    message_dispatch_output_length, message_dispatch_output_length_matches_result,
+    message_dispatch_returned_message,
+};
 pub use windowproc::windowproc_lparam_span;
 
 pub const CALLBACK_MAGIC: u32 = u32::from_le_bytes(*b"UCBK");
@@ -264,45 +269,6 @@ pub const BEGIN_PAINT_OUTPUT_BYTES: u32 = 72;
 pub const GET_UPDATE_RECT_OUTPUT_BYTES: u32 = 16;
 pub const WM_QUIT: u32 = 0x0012;
 pub const DISPATCH_MESSAGE_OUTPUT_BYTES: u32 = 48;
-
-/// Whether a completed Get/Peek dispatch returned a message. These USER services return a 32-bit
-/// `BOOL`; the generic win32k transport preserves the handler's full RAX so its high half is not
-/// part of this ABI result and must not participate in the comparison.
-pub const fn message_dispatch_returned_message(ssn: u64, raw_result: u64) -> bool {
-    matches!(ssn, NTUSER_GET_MESSAGE_SSN | NTUSER_PEEK_MESSAGE_SSN) && raw_result as u32 == 1
-}
-
-/// Number of bytes a completed USER message dispatch authoritatively staged for its caller.
-///
-/// This is evaluated by the win32k provider after the real handler returns. The executive consumes
-/// the published length rather than inferring ownership from the SSN or from a process role. A
-/// successful Peek/Get returns one `MSG`; GetMessage also returns `FALSE` for a staged `WM_QUIT`.
-pub const fn message_dispatch_output_length(ssn: u64, raw_result: u64, staged_message: u32) -> u32 {
-    if message_dispatch_returned_message(ssn, raw_result)
-        || (ssn == NTUSER_GET_MESSAGE_SSN && raw_result as u32 == 0 && staged_message == WM_QUIT)
-    {
-        DISPATCH_MESSAGE_OUTPUT_BYTES
-    } else {
-        0
-    }
-}
-
-/// Whether provider-published output ownership agrees with the public Get/Peek return contract.
-/// A returned message always owns one complete `MSG`; an empty Peek or a failed call owns none.
-pub const fn message_dispatch_output_length_matches_result(
-    ssn: u64,
-    raw_result: u64,
-    output_length: u32,
-) -> bool {
-    let expected = if message_dispatch_returned_message(ssn, raw_result)
-        || (ssn == NTUSER_GET_MESSAGE_SSN && raw_result as u32 == 0)
-    {
-        DISPATCH_MESSAGE_OUTPUT_BYTES
-    } else {
-        0
-    };
-    output_length == expected
-}
 
 /// Match a completed write probe to the base of one leased paint output slot.
 pub const fn paint_probe_output_bytes(
@@ -4005,6 +3971,32 @@ mod gdi_batch_tests {
 #[cfg(test)]
 mod message_result_tests {
     use super::*;
+
+    #[test]
+    fn get_message_false_accepts_no_output_without_inventing_a_message() {
+        for result in [0, 0xfeed_beef_0000_0000] {
+            assert_eq!(
+                message_dispatch_output_length(NTUSER_GET_MESSAGE_SSN, result, 0),
+                0,
+            );
+            assert!(message_dispatch_output_length_matches_result(
+                NTUSER_GET_MESSAGE_SSN, result, 0,
+            ));
+            assert!(message_dispatch_output_length_matches_result(
+                NTUSER_GET_MESSAGE_SSN, result, DISPATCH_MESSAGE_OUTPUT_BYTES,
+            ));
+            for length in [
+                1,
+                DISPATCH_MESSAGE_OUTPUT_BYTES - 1,
+                DISPATCH_MESSAGE_OUTPUT_BYTES + 1,
+                u32::MAX,
+            ] {
+                assert!(!message_dispatch_output_length_matches_result(
+                    NTUSER_GET_MESSAGE_SSN, result, length,
+                ));
+            }
+        }
+    }
 
     #[test]
     fn message_result_uses_the_32_bit_bool_abi() {
