@@ -44626,7 +44626,10 @@ fn dispatch_external_irp_to_device_record_result_exact(
     )
     .ok_or(STATUS_INVALID_PARAMETER as u32)?;
     if registered_file_target(device_id, major)? == RegisteredFileTarget::Kernel {
-        if initial_information != 0 || (!in_data.is_empty() && !out.is_empty()) {
+        if !nt_io_abi::valid_initial_information(major, initial_information, input_len, output_len) {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER.raw() as u32);
+        }
+        if !in_data.is_empty() && !out.is_empty() {
             return Err(nt_status::NtStatus::NOT_SUPPORTED.raw() as u32);
         }
         let mut buffer = Vec::new();
@@ -44636,8 +44639,16 @@ fn dispatch_external_irp_to_device_record_result_exact(
             .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw() as u32)?;
         buffer.resize(capacity, 0);
         buffer[..in_data.len()].copy_from_slice(in_data);
+        let control_code = match &params {
+            IoParameters::DeviceControl(parameters)
+            | IoParameters::InternalDeviceControl(parameters) => parameters.ioctl_code,
+            _ => 0,
+        };
+        if nt_io_abi::initial_output_required(major, control_code, output_len) {
+            buffer[..out.len()].copy_from_slice(out);
+        }
         let result = io_manager_mut()
-            .build_and_dispatch_external_to_device_with_stack_flags(
+            .build_and_dispatch_external_to_device_with_stack_flags_and_initial_information(
                 ClientId(IO_MANAGER_COMPONENT_ID),
                 nt_io_manager::DeviceId(device_id),
                 canonical_file_id,
@@ -44648,6 +44659,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
                 stack_flags,
                 input_len,
                 output_len,
+                initial_information,
                 &mut buffer,
             )
             .map_err(|status| status.raw() as u32)?;

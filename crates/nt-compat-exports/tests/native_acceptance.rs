@@ -2,6 +2,8 @@
 mod dynamic_boot_protocol;
 #[path = "native_acceptance/file_all_owned_fields.rs"]
 mod file_all_owned_fields;
+#[path = "native_acceptance/kernel_query_seed.rs"]
+mod kernel_query_seed;
 #[path = "native_acceptance/file_mode_precommit.rs"]
 mod file_mode_precommit;
 #[path = "native_acceptance/file_mode_set.rs"]

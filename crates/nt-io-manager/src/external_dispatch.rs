@@ -965,6 +965,41 @@ impl<P> IoManager<P> {
         output_len: u32,
         system_buffer: &mut [u8],
     ) -> Result<ExternalDispatchResult, NtStatus> {
+        self.build_and_dispatch_external_to_device_with_stack_flags_and_initial_information(
+            client,
+            device_id,
+            file_id,
+            user_data,
+            requestor_tid,
+            major,
+            params,
+            stack_flags,
+            input_len,
+            output_len,
+            0,
+            system_buffer,
+        )
+    }
+
+    /// Dispatch an already-owned transfer buffer with an explicit initial IoStatus.Information.
+    /// Query output may contain discontiguous I/O Manager fields; the scalar is not a seed prefix
+    /// length. The caller supplies the complete buffer, and real terminal completion replaces the
+    /// initial scalar. Invalid seeds are rejected before IRP allocation or backend entry.
+    pub fn build_and_dispatch_external_to_device_with_stack_flags_and_initial_information(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        file_id: Option<FileId>,
+        user_data: u64,
+        requestor_tid: u64,
+        major: u8,
+        params: IoParameters,
+        stack_flags: StackFlags,
+        input_len: u32,
+        output_len: u32,
+        initial_information: u64,
+        system_buffer: &mut [u8],
+    ) -> Result<ExternalDispatchResult, NtStatus> {
         let driver_id = self
             .device(device_id)
             .ok_or(NtStatus::INVALID_PARAMETER)?
@@ -981,6 +1016,7 @@ impl<P> IoManager<P> {
             stack_flags,
             input_len,
             output_len,
+            initial_information,
             system_buffer,
         )
     }
@@ -1013,6 +1049,7 @@ impl<P> IoManager<P> {
             StackFlags::empty(),
             input_len,
             output_len,
+            0,
             system_buffer,
         )
     }
@@ -1030,8 +1067,12 @@ impl<P> IoManager<P> {
         stack_flags: StackFlags,
         input_len: u32,
         output_len: u32,
+        initial_information: u64,
         system_buffer: &mut [u8],
     ) -> Result<ExternalDispatchResult, NtStatus> {
+        if !nt_io_abi::valid_initial_information(major, initial_information, input_len, output_len) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         validate_external_parameter_layout(major, &params, stack_flags, input_len, output_len, system_buffer.len())?;
         if self.driver(driver_id).is_none() {
             return Err(NtStatus::INVALID_PARAMETER);
@@ -1066,6 +1107,7 @@ impl<P> IoManager<P> {
         }
         irp.user_data = user_data;
         irp.requestor_tid = requestor_tid;
+        irp.information = initial_information;
         let captured_input_len = input_len.min(system_buffer.len() as u32) as usize;
         irp.set_request_input_fingerprint(&system_buffer[..captured_input_len]);
         irp.buffer = Some(IoBufferRef {
