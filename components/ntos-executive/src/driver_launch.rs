@@ -15877,87 +15877,9 @@ extern "win64" fn s_hal_set_bus_data_by_offset(
     )
 }
 
-struct DebugPrintfOutput;
-
-impl nt_printf::Output for DebugPrintfOutput {
-    fn write(&mut self, unit: u16) -> bool {
-        debug_put_char(unit as u8);
-        true
-    }
-}
-
-unsafe fn write_debug_prefix(prefix: u64) {
-    if prefix == 0 {
-        return;
-    }
-    let mut cursor = prefix;
-    loop {
-        let byte = read_volatile(cursor as *const u8);
-        if byte == 0 {
-            return;
-        }
-        debug_put_char(byte);
-        cursor = cursor.saturating_add(1);
-    }
-}
-
-unsafe fn format_debug_driver<A: nt_printf::Arguments>(prefix: u64, fmt: u64, args: &mut A) -> i32 {
-    if fmt == 0 {
-        return STATUS_INVALID_PARAMETER;
-    }
-    write_debug_prefix(prefix);
-    let mut output = DebugPrintfOutput;
-    match nt_printf::format_narrow(fmt as *const u8, args, &mut output) {
-        Ok(_) => STATUS_SUCCESS,
-        Err(()) => STATUS_INVALID_PARAMETER,
-    }
-}
-
-#[no_mangle]
-extern "win64" fn s_dbg_print_body(fmt: u64, a0: u64, a1: u64, a2: u64, caller_rsp: u64) -> i32 {
-    let mut args = Win64PrintfArguments::new([a0, a1, a2], 3, caller_rsp);
-    unsafe { format_debug_driver(0, fmt, &mut args) }
-}
-
-#[no_mangle]
-extern "win64" fn s_dbg_print_ex_body(
-    _component_id: u64,
-    _level: u64,
-    fmt: u64,
-    a0: u64,
-    caller_rsp: u64,
-) -> i32 {
-    let mut args = Win64PrintfArguments::new([a0, 0, 0], 1, caller_rsp);
-    unsafe { format_debug_driver(0, fmt, &mut args) }
-}
-
-#[no_mangle]
-extern "win64" fn s_video_port_debug_print_body(
-    _level: u64,
-    fmt: u64,
-    a0: u64,
-    a1: u64,
-    caller_rsp: u64,
-) -> i32 {
-    let mut args = Win64PrintfArguments::new([a0, a1, 0], 2, caller_rsp);
-    unsafe { format_debug_driver(0, fmt, &mut args) }
-}
-
-extern "win64" fn s_vdbg_print_ex(_component_id: u32, _level: u32, fmt: u64, va_list: u64) -> i32 {
-    let mut args = VaListPrintfArguments { cursor: va_list };
-    unsafe { format_debug_driver(0, fmt, &mut args) }
-}
-
-extern "win64" fn s_vdbg_print_ex_with_prefix(
-    prefix: u64,
-    _component_id: u32,
-    _level: u32,
-    fmt: u64,
-    va_list: u64,
-) -> i32 {
-    let mut args = VaListPrintfArguments { cursor: va_list };
-    unsafe { format_debug_driver(prefix, fmt, &mut args) }
-}
+#[path = "hosted_debug_print.rs"]
+mod hosted_debug_print;
+use hosted_debug_print::{s_vdbg_print_ex, s_vdbg_print_ex_with_prefix};
 
 core::arch::global_asm!(
     ".text",

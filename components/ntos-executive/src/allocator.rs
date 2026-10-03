@@ -361,6 +361,7 @@ pub unsafe fn initialize_mapped_heap(frames: u64) -> bool {
 }
 
 unsafe fn initialize_heap_limit(frames: u64) -> bool {
+    crate::serial_records::initialize_component();
     if frames == 0 {
         return true;
     }

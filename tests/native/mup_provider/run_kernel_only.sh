@@ -40,9 +40,8 @@ if [ "$rc" != 0 ] && [ "$rc" != 3 ]; then
   echo "Mup provider boot did not complete (runner status $rc): $RUN_LOG" >&2
   exit 1
 fi
-# An accepted MUP query requires both completed provider registration and a non-null security
-# context. Serial DbgPrint can interleave within a line, so use the final probe's counters rather
-# than the individual query trace for that proof.
+# An accepted MUP query requires completed provider registration and a non-null security
+# context. The final probe counters certify the complete query, not just an intermediate trace.
 if ! grep -Fq '[mup-provider-gate] kernel-only native service loop' "$RUN_LOG" \
    || ! grep -Fq 'PASS exec_mounted_volume_external_file_dispatch_font_read' "$RUN_LOG" \
    || ! grep -Fq 'PASS exec_mounted_volume_directory_create_query_close' "$RUN_LOG" \
@@ -58,7 +57,7 @@ if ! grep -Fq '[mup-provider-gate] kernel-only native service loop' "$RUN_LOG" \
    || { ! grep -Fq 'offset=0 call=0x00000000 wait=0x00000000 status=0x00000000 iosb=0x00000000 info=10 bytes-match=1' "$RUN_LOG" \
         && ! grep -Fq '[read-forward-verified-0]' "$RUN_LOG"; } \
    || ! grep -Fq '[mup-provider-read-pending-dispatch] status=0x00000103' "$RUN_LOG" \
-   || ! grep -Eq '\[mup-provider-read-pending-complete\] count=[1-9][0-9]* bytes=20' "$RUN_LOG" \
+   || ! grep -Eq '\[mup-provider-read-pending-complete\] count=3 bytes=30' "$RUN_LOG" \
    || ! grep -Fq '[read-forward-verified-1]' "$RUN_LOG" \
    || [ "$(grep -Fc '[mup-provider-read-pending-complete]' "$RUN_LOG")" -ne 1 ] \
    || ! grep -Fq '[mup-provider-flush] count=1' "$RUN_LOG" \

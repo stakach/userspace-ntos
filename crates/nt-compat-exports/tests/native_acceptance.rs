@@ -48,6 +48,8 @@ mod video_consumer_admission;
 mod source_completion_lane;
 #[path = "native_acceptance/source_pending_retirement.rs"]
 mod source_pending_retirement;
+#[path = "native_acceptance/mup_read_evidence.rs"]
+mod mup_read_evidence;
 
 // Executive globals required by the real cache module exercised in the host harness.
 use core::sync::atomic::{AtomicU64, Ordering};

@@ -18,6 +18,8 @@ extern crate alloc;
 
 // Re-export the kernel ABI at crate root so `server` can `use crate::*`.
 pub use sel4_rt::*;
+mod serial_records;
+pub use serial_records::{debug_put_char, print_str, print_u64};
 
 mod acpi_platform;
 mod boot_namespace;
@@ -27914,6 +27916,7 @@ struct Fat32 {
 #[no_mangle]
 #[link_section = ".text._start"]
 unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
+    serial_records::initialize_root();
     let bi = &*bootinfo;
     if initialize_loader_acpi_root(bi).is_err() {
         print_str(b"[boot] platform did not publish a valid ACPI loader root\n");

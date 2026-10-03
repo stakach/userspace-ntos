@@ -84,6 +84,10 @@ unwind or authenticated stop; caller-owned IRPs remain under their original owne
 Its controlled pending-error checks correlate actual File generations, untouched
 precompletion buffers, delivered errors and retained-pointer cleanup ordering;
 these are separate from desktop proof and uncertain-effect quarantine.
+Hosted driver debug messages are formatted in userspace before one bounded,
+non-IPC serial write. The executive frames its own complete diagnostic lines;
+the microkernel captures caller-VSpace bytes before emission without changing
+IPC or Reply state. Acceptance parsers still reject malformed or split records.
 The optional `tests/native/source_irp/run.sh` profile checks real fileless READ/WRITE
 and all four IOCTL methods through win32k, including immediate and pending completion.
 It verifies bytes, IOSBs and retirement counters; production images omit its fixtures.
