@@ -43,9 +43,14 @@ pub(super) unsafe fn release_policy(
                 .release_io(file_id, owner.tid)
                 .map(|release| release.waiters)
         }
-        // Local routes are typed, but shape validation still rejects Busy until retained
-        // cancellation/rollback and the complete local admission lifecycle are implemented.
-        FileIoWaitKey::LocalOverlay(_) => Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST),
+        FileIoWaitKey::LocalOverlay(file_id) => {
+            if crate::writable_fs::file_io_mode(file_id)?.is_synchronous()
+                != owner.mode.is_synchronous()
+            {
+                return Err(nt_fs::STATUS_INVALID_PARAMETER);
+            }
+            crate::writable_fs::release_file_io(file_id, owner.tid)
+        }
     }
 }
 

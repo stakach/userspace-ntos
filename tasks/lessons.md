@@ -4,6 +4,12 @@
 - A yielded Cargo session is still active. Do not launch even independent Python fixture/parser
   tests until its actual exit is consumed; single-owner validation includes every test suite.
 
+## Observations Do Not Admit Execution
+- Retained Section bytes and native handle rights admit process creation. An expired observational
+  catalog association may refuse attribution, but must not reject an otherwise valid executable.
+- Test File-close-before-process creation: observer registration can retire before its retained
+  Section source, so validating both against the same lifetime silently couples policy to tracing.
+
 ## Runtime Ownership Is Not A Thread Role
 - Resolve GUI TEB aliases from the published executable runtime and retained logical caller,
   including the exact process and thread generations. A worker badge's slot encoding is not

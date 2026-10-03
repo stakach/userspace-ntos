@@ -203,8 +203,8 @@ impl ExecNtHandler {
             route: PendingFileRoute::Local(file_object),
             irp_id: request_id,
             major,
-            operation: nt_io_manager::PendingFileIoOperation::LocalInline(
-                nt_io_manager::PendingLocalInline {
+            operation: nt_io_manager::PendingFileIoOperation::OwnedInline(
+                nt_io_manager::PendingOwnedInline {
                     status,
                     information,
                 },
@@ -314,7 +314,7 @@ impl ExecNtHandler {
             return Ok(pending);
         }
         let (status, information) = pending
-            .local_terminal_result()
+            .owned_terminal_result()
             .expect("buffered local output has no terminal result");
         let length = if nt_io_completion::file_io_status_copies_output(status) {
             u32::try_from(information).expect("local buffered result exceeds ULONG")

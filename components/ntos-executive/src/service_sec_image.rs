@@ -115,12 +115,6 @@ static USER_CALLBACK_DEFERRED_RETURNS_FULL: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_DEFERRED_RETURNS_TRACE: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_QUIESCE_DEFER_TRACE: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CONTEXT_IMPORT_TRACE: AtomicU64 = AtomicU64::new(0);
-static GUI_MESSAGE_WAIT_PARKED: AtomicU64 = AtomicU64::new(0);
-static GUI_MESSAGE_WAIT_WOKEN: AtomicU64 = AtomicU64::new(0);
-static GUI_MESSAGE_WAIT_STILL_EMPTY: AtomicU64 = AtomicU64::new(0);
-static GUI_MESSAGE_WAIT_REDRIVES: AtomicU64 = AtomicU64::new(0);
-static GUI_MESSAGE_WAIT_READY_REDRIVES: AtomicU64 = AtomicU64::new(0);
-static GUI_MESSAGE_WAIT_TRACE: AtomicU64 = AtomicU64::new(0);
 static LPC_RECEIVE_WAIT_PARKED: AtomicU64 = AtomicU64::new(0);
 static LPC_RECEIVE_WAIT_WOKEN: AtomicU64 = AtomicU64::new(0);
 static LPC_RECEIVE_WAIT_REDRIVES: AtomicU64 = AtomicU64::new(0);
@@ -653,56 +647,6 @@ const CURSORDATA_AJIFRATE_OFF: usize = 0x78;
 const CURSORF_ACON: u32 = 0x0008;
 const CURSORDATA_ACON_LIMIT: u32 = 1000;
 const DEFERRED_CALLBACK_RETURN_N: usize = nt_user_callback::MAX_CONTINUATION_DEPTH;
-const GUI_MESSAGE_WAITER_INITIAL_RESERVE: usize = 16;
-
-#[derive(Clone, Copy)]
-struct GuiMessageWaiter {
-    logical_caller: Option<nt_user_host::provider_logical_caller::ProviderLogicalCaller>,
-    used: bool,
-    sequence: u64,
-    pi: u32,
-    process_generation: u64,
-    badge: u64,
-    tid: u64,
-    queue_event: nt_kernel_exec::EventObjectId,
-    queue_event_lease: nt_kernel_exec::EventLeaseId,
-    event_selected: bool,
-    msg_ptr: u64,
-    hwnd_filter: u64,
-    filter_min: u64,
-    filter_max: u64,
-    caller_sp: u64,
-    reply_cap: u64,
-    reply_deleted: bool,
-    reply: nt_syscall_abi::ParkedSyscallReply,
-}
-
-impl GuiMessageWaiter {
-    const EMPTY: Self = Self {
-        logical_caller: None,
-        used: false,
-        sequence: 0,
-        pi: 0,
-        process_generation: 0,
-        badge: 0,
-        tid: 0,
-        queue_event: nt_kernel_exec::EventObjectId::NULL,
-        queue_event_lease: nt_kernel_exec::EventLeaseId::NULL,
-        event_selected: false,
-        msg_ptr: 0,
-        hwnd_filter: 0,
-        filter_min: 0,
-        filter_max: 0,
-        caller_sp: 0,
-        reply_cap: 0,
-        reply_deleted: false,
-        reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
-    };
-}
-
-static mut GUI_MESSAGE_WAITERS: alloc::vec::Vec<GuiMessageWaiter> = alloc::vec::Vec::new();
-static GUI_MESSAGE_WAITER_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
-static GUI_MESSAGE_WAITER_STORE_FAILURES: AtomicU64 = AtomicU64::new(0);
 static mut LPC_RECEIVE_WAITS: nt_lpc_continuation::ReceiveWaitTable<LpcReceiveContinuation> =
     nt_lpc_continuation::ReceiveWaitTable::new();
 static mut LPC_CONNECT_WAITS: nt_lpc_continuation::ConnectWaitTable<LpcConnectContinuation> =
@@ -903,23 +847,6 @@ unsafe fn reset_deferred_user_callback_returns() {
     for index in 0..DEFERRED_CALLBACK_RETURN_N {
         table[index] = DeferredCallbackReturn::EMPTY;
     }
-}
-
-#[inline(never)]
-unsafe fn reset_gui_message_waiters() -> bool {
-    let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
-    if waiters.iter().any(|waiter| waiter.used) {
-        return false;
-    }
-    waiters.clear();
-    if waiters.capacity() < GUI_MESSAGE_WAITER_INITIAL_RESERVE {
-        let reserve = GUI_MESSAGE_WAITER_INITIAL_RESERVE - waiters.capacity();
-        if waiters.try_reserve(reserve).is_err() {
-            GUI_MESSAGE_WAITER_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
-    }
-    true
 }
 
 unsafe fn reset_lpc_receive_waits() -> bool {
@@ -1183,316 +1110,6 @@ unsafe fn lpc_request_wait_park(
     print_u64(pending.request.message_id as u64);
     print_str(b" -> PARK requester\n");
     true
-}
-
-pub(crate) fn gui_message_waiter_stats() -> (usize, usize, usize, u64, u64) {
-    unsafe {
-        let waiters = &*core::ptr::addr_of!(GUI_MESSAGE_WAITERS);
-        (
-            waiters.iter().filter(|waiter| waiter.used).count(),
-            waiters.len(),
-            waiters.capacity(),
-            GUI_MESSAGE_WAITER_ALLOCATION_FAILURES.load(Ordering::Relaxed),
-            GUI_MESSAGE_WAITER_STORE_FAILURES.load(Ordering::Relaxed),
-        )
-    }
-}
-
-unsafe fn gui_message_waiter_alloc_slot() -> Option<usize> {
-    let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
-    if let Some(slot) = waiters.iter().position(|waiter| !waiter.used) {
-        assert!(waiters[slot].queue_event_lease.is_null());
-        return Some(slot);
-    }
-    if waiters.len() == waiters.capacity() && waiters.try_reserve(1).is_err() {
-        GUI_MESSAGE_WAITER_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
-        GUI_MESSAGE_WAITER_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    waiters.push(GuiMessageWaiter::EMPTY);
-    Some(waiters.len() - 1)
-}
-
-unsafe fn gui_message_waiter_record(slot: usize) -> Option<GuiMessageWaiter> {
-    (&*core::ptr::addr_of!(GUI_MESSAGE_WAITERS))
-        .get(slot)
-        .copied()
-}
-
-unsafe fn gui_message_waiter_clear_slot(
-    slot: usize,
-    reply_cap: u64,
-    lease: nt_kernel_exec::EventLeaseId,
-) -> bool {
-    let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
-    if let Some(waiter) = waiters.get_mut(slot) {
-        if waiter.used && waiter.reply_cap == reply_cap && waiter.queue_event_lease == lease {
-            *waiter = GuiMessageWaiter::EMPTY;
-            return true;
-        }
-    }
-    false
-}
-
-unsafe fn gui_message_waiter_unselect(slot: usize, lease: nt_kernel_exec::EventLeaseId) {
-    let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
-    if let Some(waiter) = waiters.get_mut(slot) {
-        if waiter.used && waiter.queue_event_lease == lease {
-            waiter.event_selected = false;
-        }
-    }
-}
-
-unsafe fn gui_message_waiter_mark_reply_deleted(
-    slot: usize,
-    reply_cap: u64,
-    lease: nt_kernel_exec::EventLeaseId,
-) -> bool {
-    let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
-    let Some(waiter) = waiters.get_mut(slot) else {
-        return false;
-    };
-    if !waiter.used || waiter.reply_cap != reply_cap || waiter.queue_event_lease != lease {
-        return false;
-    }
-    waiter.reply_deleted = true;
-    true
-}
-
-unsafe fn gui_message_wait_has_selected(event: nt_kernel_exec::EventObjectId) -> bool {
-    (&*core::ptr::addr_of!(GUI_MESSAGE_WAITERS))
-        .iter()
-        .any(|waiter| waiter.used && waiter.queue_event == event && waiter.event_selected)
-}
-
-unsafe fn gui_message_wait_reassign_selected(event: nt_kernel_exec::EventObjectId) -> bool {
-    let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
-    let Some(index) = waiters
-        .iter()
-        .enumerate()
-        .filter(|(_, waiter)| waiter.used && waiter.queue_event == event && !waiter.event_selected)
-        .min_by_key(|(_, waiter)| waiter.sequence)
-        .map(|(index, _)| index)
-    else {
-        return false;
-    };
-    let waiter = &mut waiters[index];
-    waiter.event_selected = true;
-    true
-}
-
-pub(crate) unsafe fn gui_message_wait_oldest_event_consumer_sequence(
-    nt_handler: &ExecNtHandler,
-    event: nt_kernel_exec::EventObjectId,
-) -> Option<u64> {
-    if nt_handler.event_ready_by_id(event).ok()
-        != Some((nt_kernel_exec::EventKind::Synchronization, true))
-    {
-        return None;
-    }
-    (&*core::ptr::addr_of!(GUI_MESSAGE_WAITERS))
-        .iter()
-        .filter(|waiter| {
-            waiter.used && waiter.queue_event == event && !waiter.event_selected
-                && !waiter.reply_deleted && waiter.reply_cap != 0
-                && nt_handler.event_objects.event_for_lease(
-                    waiter.queue_event_lease, nt_kernel_exec::EventLeaseKind::GuiWait,
-                ) == Ok(event)
-        })
-        .map(|waiter| waiter.sequence)
-        .min()
-}
-
-unsafe fn gui_message_waiter_cancel_slot(
-    nt_handler: &mut ExecNtHandler,
-    slot: usize,
-    waiter: GuiMessageWaiter,
-    reconcile_signal: bool,
-) -> bool {
-    if !waiter.used || waiter.reply_cap == 0 || waiter.queue_event_lease.is_null() {
-        return false;
-    }
-    let shared_cancelled = crate::spawn_hosts::shared_ingress::owner::runtime::hosted_cancellation_proven(
-        waiter.badge, waiter.reply_cap,
-    );
-    if !shared_cancelled {
-        if !waiter.reply_deleted {
-            if cnode_delete_r(waiter.reply_cap) != 0 {
-                return false;
-            }
-            assert!(gui_message_waiter_mark_reply_deleted(
-                slot,
-                waiter.reply_cap,
-                waiter.queue_event_lease,
-            ));
-        }
-        if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, waiter.reply_cap) != 0 {
-            return false;
-        }
-        release_reply_pool_cap(waiter.reply_cap);
-    }
-    assert!(gui_message_waiter_clear_slot(
-        slot,
-        waiter.reply_cap,
-        waiter.queue_event_lease
-    ));
-    if shared_cancelled {
-        release_reply_pool_cap(waiter.reply_cap);
-    }
-    if reconcile_signal && waiter.event_selected {
-        if !gui_message_wait_has_selected(waiter.queue_event)
-            && !gui_message_wait_reassign_selected(waiter.queue_event)
-        {
-            nt_handler
-                .cancel_event_signal(waiter.queue_event)
-                .expect("cancelled GUI waiter lost its selected signal lease");
-        }
-    }
-    nt_handler
-        .release_gui_event_wait(waiter.queue_event_lease)
-        .expect("cancelled GUI waiter lost its Event lease");
-    // Retirement may outlive a badge/TID reuse. Only clear the parked marker belonging to this
-    // exact old route; live-ingress admission is not required for the owner's own cleanup.
-    if waiter.logical_caller.is_some_and(|caller| {
-        caller.validate(
-            nt_handler.thread_runtime.get_by_badge(caller.badge()).map(|runtime| runtime.binding()),
-            nt_handler.pm.thread_lifetime(caller.thread().thread_id()),
-        ).is_ok()
-    }) {
-        thread_wait_state_clear_badge(waiter.badge);
-    }
-    true
-}
-
-pub(crate) unsafe fn gui_message_wait_abandon_thread(
-    nt_handler: &mut ExecNtHandler,
-    tid: u64,
-) -> bool {
-    let waiter_count = (&*core::ptr::addr_of!(GUI_MESSAGE_WAITERS)).len();
-    for slot in 0..waiter_count {
-        let Some(waiter) = gui_message_waiter_record(slot) else {
-            continue;
-        };
-        if waiter.used
-            && waiter.tid == tid
-            && !gui_message_waiter_cancel_slot(nt_handler, slot, waiter, true)
-        {
-            return false;
-        }
-    }
-    thread_wait_state_clear_tid(nt_handler, tid);
-    true
-}
-
-pub(crate) unsafe fn gui_message_wait_abandon_process(
-    nt_handler: &mut ExecNtHandler,
-    pi: usize,
-    process_generation: u64,
-) -> bool {
-    let waiter_count = (&*core::ptr::addr_of!(GUI_MESSAGE_WAITERS)).len();
-    for slot in 0..waiter_count {
-        let Some(waiter) = gui_message_waiter_record(slot) else {
-            continue;
-        };
-        if !waiter.used || waiter.pi as usize != pi {
-            continue;
-        }
-        if waiter.process_generation != process_generation
-            || !gui_message_waiter_cancel_slot(nt_handler, slot, waiter, true)
-        {
-            return false;
-        }
-    }
-    true
-}
-
-pub(crate) unsafe fn gui_message_wait_select_level(
-    nt_handler: &mut ExecNtHandler,
-    event: nt_kernel_exec::EventObjectId,
-) -> bool {
-    gui_message_wait_select_level_inner(nt_handler, event, true)
-}
-
-unsafe fn gui_message_wait_select_level_inner(
-    nt_handler: &mut ExecNtHandler,
-    event: nt_kernel_exec::EventObjectId,
-    queue_signal: bool,
-) -> bool {
-    if event.is_null() {
-        return false;
-    }
-    let Ok((kind, signaled)) = nt_handler.event_ready_by_id(event) else {
-        return false;
-    };
-    if !matches!(kind, nt_kernel_exec::EventKind::Synchronization) || !signaled {
-        return false;
-    }
-    let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
-    let already_selected = waiters
-        .iter()
-        .any(|waiter| waiter.used && waiter.queue_event == event && waiter.event_selected);
-    let Some(index) = waiters
-        .iter()
-        .enumerate()
-        .filter(|(_, waiter)| waiter.used && waiter.queue_event == event && !waiter.event_selected)
-        .min_by_key(|(_, waiter)| waiter.sequence)
-        .map(|(index, _)| index)
-    else {
-        if already_selected && queue_signal {
-            nt_handler
-                .queue_event_signal(event)
-                .expect("selected GUI Event lost its registry identity");
-        }
-        return already_selected;
-    };
-    let waiter = &mut waiters[index];
-    waiter.event_selected = true;
-    nt_handler
-        .consume_event_by_id(event)
-        .expect("selected GUI synchronization Event was not signaled");
-    if queue_signal {
-        nt_handler
-            .queue_event_signal(event)
-            .expect("selected GUI Event lost its registry identity");
-    }
-    true
-}
-
-pub(crate) unsafe fn gui_message_wait_select_event_consumer(
-    nt_handler: &mut ExecNtHandler,
-    event: nt_kernel_exec::EventObjectId,
-    expected_sequence: u64,
-) -> bool {
-    if gui_message_wait_oldest_event_consumer_sequence(nt_handler, event) != Some(expected_sequence) {
-        return false;
-    }
-    let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
-    let Some(index) = waiters
-        .iter()
-        .position(|waiter| waiter.used && waiter.queue_event == event
-            && !waiter.event_selected && waiter.sequence == expected_sequence)
-    else {
-        return false;
-    };
-    let waiter = &mut waiters[index];
-    waiter.event_selected = true;
-    nt_handler
-        .consume_event_by_id(event)
-        .expect("selected GUI synchronization Event was not signaled");
-    nt_handler
-        .queue_event_signal(event)
-        .expect("selected GUI Event lost its registry identity");
-    true
-}
-
-unsafe fn gui_message_wait_select_published(nt_handler: &mut ExecNtHandler, slot: usize) -> bool {
-    let Some(waiter) = gui_message_waiter_record(slot) else {
-        return false;
-    };
-    if !waiter.used || waiter.event_selected {
-        return false;
-    }
-    gui_message_wait_select_level(nt_handler, waiter.queue_event)
 }
 
 /// Transfer the current Call to its semantic continuation. Shared ingress already owns its
@@ -2289,8 +1906,6 @@ pub(crate) unsafe fn client_has_vm_continuations(pi: u32) -> bool {
         .any(|(_, frame)| {
             frame.owner.hosted_client().is_some_and(|client| client.client_pi == pi)
         })
-        || (&*core::ptr::addr_of!(GUI_MESSAGE_WAITERS)).iter()
-            .any(|waiter| waiter.used && waiter.pi == pi)
         || (&*core::ptr::addr_of!(DEFERRED_CALLBACK_RETURNS)).iter()
             .any(|entry| entry.used && entry.pi == pi)
         || (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_waiter_for_pi(pi)
@@ -2733,10 +2348,6 @@ unsafe fn drain_deferred_user_callback_returns(
             print_str(b"\n");
         } else if outer_dispatch_completed {
             pfilled[current_pi] = *current_filled_pages;
-            let (_, _, safe) = drain_selected_gui_event_signals(nt_handler);
-            if !safe {
-                print_str(b"[gui-msg-wait] deferred callback drain aborted unsafe redrive\n");
-            }
         }
         if !retained_reply {
             client_reply_on(deferred.reply_cap, 0, 0, 0, 0, 0);
@@ -2957,7 +2568,7 @@ fn record_hosted_client_gdi_mapping(nt_handler: &ExecNtHandler, pi: usize, gdi_v
     let Some(image) = nt_handler.hosted_process_image(pi) else {
         return;
     };
-    let first = match image.role {
+    let first = match image.observation_role() {
         nt_exe_image::HostedProcessRole::InteractiveLogon => {
             WINLOGON_GDI_MAPPED.swap(1, Ordering::Relaxed) == 0
         }
@@ -3276,6 +2887,7 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
     // serialized ownership barrier is the single convergence point for exact-generation final
     // process deletion; individual release sites may still make an eager attempt for low latency.
     let _ = nt_handler.drain_hosted_process_deletion_candidates();
+    nt_handler.drain_native_process_images();
     if let Some(ctx) = nt_handler.loop_ctx {
         if let Err(status) = unsafe { service_drain_section_retirement(&mut *ctx.generic_sections) } {
             return status;
@@ -4402,32 +4014,9 @@ unsafe fn authenticate_win32k_service_request(
     nt_component_suspension::LaneDispatchIdentity,
     nt_process::native_handle::NativeHandleCaller,
 ), u32> {
-    use spawn_hosts::shared_ingress::owner::runtime;
-    if channel.caps.kind != spawn_hosts::ReqKind::Syscall
-        || mi != expected_mi
-        || reply_cap != channel.reply_cap
-    {
-        return Err(nt_process::STATUS_INVALID_PARAMETER);
-    }
-    let Ok(Some(route)) = runtime::channel_route(channel) else {
-        return Err(nt_process::STATUS_INVALID_PARAMETER);
-    };
-    if route.badge() != badge
-        || !matches!(runtime::current_reply(route), Ok(current) if current == reply_cap)
-    {
-        return Err(nt_process::STATUS_INVALID_PARAMETER);
-    }
-    let Ok(dispatch) = runtime::dispatch(route) else {
-        return Err(nt_process::STATUS_INVALID_PARAMETER);
-    };
-    if channel.kernel_caller.is_some() {
-        let envelope = nt_user_host::provider_kernel_activation::KernelProviderServiceEnvelope {
-            badge,
-            message_info: mi,
-            reply_cap,
-        };
-        kernel_provider_activation::validate_win32k_service_call(channel, envelope, expected_mi)?;
-    }
+    let (route, dispatch) = crate::provider_service_ingress::authenticate(
+        channel, reply_cap, badge, mi, expected_mi,
+    )?;
     let caller = crate::provider_registry_caller::resolve(channel)?;
     Ok((route, dispatch, caller))
 }
@@ -4524,6 +4113,12 @@ pub(crate) unsafe fn service_win32k_section_create_request(
     third: u64,
 ) -> crate::provider_section_broker::SubmitResult {
     use crate::provider_section_broker::SubmitResult;
+    use nt_io_manager::win32k_mm_section_wire as mm_wire;
+    if matches!(op, mm_wire::OP_DEREFERENCE | mm_wire::OP_UNMAP) {
+        return crate::provider_section_cleanup::service_win32k_section_cleanup_request(
+            channel, reply_cap, badge, mi, op, first, second, third,
+        );
+    }
     let (route, dispatch, caller) = match authenticate_win32k_service_request(
         channel,
         reply_cap,
@@ -4545,9 +4140,7 @@ pub(crate) unsafe fn service_win32k_section_create_request(
         Ok(handler) if handler.loop_ctx.is_some() => handler,
         _ => return SubmitResult::Ready((0xC000_00A3u32 as i32, 0, 0, 0)),
     };
-    use nt_io_manager::win32k_mm_section_wire as mm_wire;
-    if matches!(op, mm_wire::OP_REFERENCE | mm_wire::OP_DEREFERENCE
-        | mm_wire::OP_MAP | mm_wire::OP_UNMAP)
+    if matches!(op, mm_wire::OP_REFERENCE | mm_wire::OP_MAP)
     {
         if third != 0 || (op != mm_wire::OP_MAP && second != 0) {
             return SubmitResult::Ready((nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0));
@@ -4565,11 +4158,7 @@ pub(crate) unsafe fn service_win32k_section_create_request(
         let result = match op {
             mm_wire::OP_REFERENCE => crate::provider_mm_section_objects::reference(handler, first, physical)
                 .map(|count| (count, 0)),
-            mm_wire::OP_DEREFERENCE => crate::provider_mm_section_objects::dereference(handler, first, physical)
-                .map(|count| (count, 0)),
             mm_wire::OP_MAP => crate::provider_mm_section_objects::map(handler, first, physical, second),
-            mm_wire::OP_UNMAP => crate::provider_mm_section_objects::unmap(handler, first, physical)
-                .map(|()| (0, 0)),
             _ => unreachable!(),
         };
         return SubmitResult::Ready(match result {
@@ -5354,9 +4943,13 @@ pub(crate) unsafe fn with_provider_security_managers<R>(
 }
 
 pub(crate) unsafe fn registry_live_handler() -> Result<&'static mut ExecNtHandler, u32> {
-    (SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler)
-        .as_mut()
-        .ok_or(0xc000_00a3)
+    registry_live_handler_pointer()?.as_mut().ok_or(0xc000_00a3)
+}
+
+/// Effectful adapters retain a raw execution owner, never a handler borrow across native IPC.
+pub(crate) fn registry_live_handler_pointer() -> Result<*mut ExecNtHandler, u32> {
+    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    if handler.is_null() { Err(0xc000_00a3) } else { Ok(handler) }
 }
 
 /// Service `MmSecureVirtualMemory` for the authenticated hosted process generation. The returned
@@ -5630,6 +5223,73 @@ fn win32k_token_context(nt_handler: &ExecNtHandler, pi: usize) -> Win32kTokenCon
         user_sid,
         user_sid_len,
     }
+}
+
+fn registered_gui_dispatch_client(handler: &ExecNtHandler, pi: usize, badge: u64, tid: u64) -> bool {
+    let Some(runtime) = handler.thread_runtime.executable_by_badge(badge) else { return false; };
+    let Some(thread) = handler.pm.thread_lifetime(tid as nt_process::ThreadId) else { return false; };
+    runtime.pi == pi && runtime.tid == tid && !runtime.publication.is_busy()
+        && handler.pm.validate_thread_lifetime(thread)
+        && handler.capture_process_identity(pi) == Some(runtime.process)
+        && runtime.process.pid == thread.process_id()
+}
+
+/// Memory-only observation of the exact retained logical caller while its provider callout runs.
+/// A canonical body can already be published even before the PM mirror imports the dispatch.
+pub(crate) fn callback_client_runtime(
+    client: crate::spawn_hosts::UserCallbackClient,
+) -> Option<(u64, bool)> {
+    let caller = client.logical_caller?;
+    let pointer = registry_live_handler_pointer().ok()?;
+    let handler = unsafe { &*pointer };
+    if !handler.validate_provider_logical_caller(caller)
+        || caller.process().pid as u64 != client.pid
+        || caller.thread().thread_id() as u64 != client.tid
+        || caller.badge() != client.badge
+        || handler.capture_process_identity(client.pi as usize) != Some(caller.process())
+        || handler.hosted_process_generation(client.pi as usize) != Some(client.generation)
+    { return None; }
+    let runtime = handler.thread_runtime.executable_by_badge(client.badge)?;
+    if runtime.pi != client.pi as usize || runtime.tcb != client.tcb
+        || handler.pm.thread_teb(caller.thread().thread_id()) != Some(client.teb)
+        || runtime.publication.is_busy()
+    { return None; }
+    let alias = handler.hosted_gui_thread_teb_alias_for(caller)?;
+    let converted = crate::ps_object_backing::read_thread_win32(&handler.pm, caller.thread())
+        .ok()? != 0;
+    Some((alias, converted))
+}
+
+/// Publish the registered provider's GDI resources before real ClientThreadSetup caches the PEB.
+/// This does not convert a thread or grant GUI-call authority.
+pub(crate) unsafe fn prepare_callback_gdi_projection(
+    client: crate::spawn_hosts::UserCallbackClient,
+) -> bool {
+    if callback_client_runtime(client).is_none() { return false; }
+    let Some(caller) = client.logical_caller else { return false; };
+    let Ok(pointer) = registry_live_handler_pointer() else { return false; };
+    let pi = client.pi as usize;
+    let pml4 = (&(*pointer).process_vspaces).get(pi).copied().unwrap_or(0);
+    let Ok(process) = (*pointer).pm.query_process_basic(caller.process().pid, u64::MAX) else {
+        return false;
+    };
+    let peb = process.peb_base_address;
+    if pml4 == 0 || peb == 0 { return false; }
+    let Some(field) = peb.checked_add(0xf8) else { return false; };
+    let table = win32k_glue::map_gdi_shared_handle_table_into_client(&mut *pointer, pml4, pi);
+    if table == 0 || callback_client_runtime(client).is_none()
+        || (&(*pointer).process_vspaces).get(pi).copied() != Some(pml4)
+    { return false; }
+    if !win32k_glue::map_gdi_user_attributes_into_client(&mut *pointer, pml4, pi)
+        || callback_client_runtime(client).is_none()
+        || (&(*pointer).process_vspaces).get(pi).copied() != Some(pml4)
+    { return false; }
+    if (*pointer).process_memory_write_checked(pi, field, &table.to_le_bytes()).is_err()
+        || callback_client_runtime(client).is_none()
+        || (&(*pointer).process_vspaces).get(pi).copied() != Some(pml4)
+    { return false; }
+    record_hosted_client_gdi_mapping(&*pointer, pi, table);
+    true
 }
 
 fn win32k_client_context_for_thread(
@@ -6112,7 +5772,7 @@ fn interactive_shell_frontier_pi(nt_handler: &ExecNtHandler) -> Option<usize> {
     let create_window_attempted =
         INTERACTIVE_SHELL_CREATE_WINDOW_ATTEMPT_MASK.load(Ordering::Relaxed);
     for pi in 0..MAX_PI.min(64) {
-        if nt_handler.hosted_process_role(pi)
+        if nt_handler.hosted_process_observation_role(pi)
             != Some(nt_exe_image::HostedProcessRole::InteractiveShell)
         {
             continue;
@@ -6530,6 +6190,7 @@ struct HostedExeSpawn<'a> {
     runtime: HostedProcessRuntime,
     pe: &'a nt_pe_loader::PeFile<'static>,
     spawned: &'static AtomicU64,
+    _image_reader: crate::hosted_loaded_images::HostedImageReadScope,
 }
 
 #[derive(Clone, Copy)]
@@ -6595,10 +6256,10 @@ fn hosted_multiplexed_thread_spawn_for(
     }
 }
 
-fn hosted_exe_spawn_for<'a>(
+unsafe fn hosted_exe_spawn_for<'a>(
     request: nt_exe_image::SpawnRequest,
     catalog: &'a nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
-    loaded_images: &'a HostedLoadedImageTable,
+    loaded_images: *mut HostedLoadedImageTable,
 ) -> Option<HostedExeSpawn<'a>> {
     let target = request.target?;
     let image = catalog.get_by_pi(target.pi)?;
@@ -6609,12 +6270,17 @@ fn hosted_exe_spawn_for<'a>(
     }
     let runtime = hosted_process_runtime_for_pi(target.pi)?;
     let spawned = runtime.spawned?;
-    let pe = unsafe { loaded_images.pe_by_pi(target.pi)? };
+    let image_reader = {
+        let _durable = allocator::enter_durable();
+        unsafe { crate::hosted_loaded_images::HostedImageReadScope::capture(loaded_images, target).ok()? }
+    };
+    let pe = unsafe { (&*loaded_images).pe_by_pi(target.pi)? };
     Some(HostedExeSpawn {
         image,
         runtime,
         pe,
         spawned,
+        _image_reader: image_reader,
     })
 }
 
@@ -8757,9 +8423,6 @@ pub(crate) unsafe fn service_sec_image(
     // working locals (pml4/scratch_base/img_end/pe via shadowing, faults/first/ntfaults/filled_pages)
     // are LOADED from these at the top of each iteration and SAVED back before each recv, so the
     // ~30 body references stay unchanged.
-    // Primary PE (the function param `pe` is shadowed per-iteration to the active process's image).
-    // The generated SEC_IMAGE diagnostic uses its own fault loop, never this live service state.
-    let primary_pe: &nt_pe_loader::PeFile = pe;
     // Slots are EPROCESS-linked via the handler-owned process mechanism lookup. smss is live from
     // the initial recv; later hosted processes claim their pid on the native create-process path and
     // fill pml4/scratch/img_end when the service loop constructs their seL4 mechanism.
@@ -8799,9 +8462,6 @@ pub(crate) unsafe fn service_sec_image(
     }
     if !keyed_wait_tables_reset() {
         panic!("keyed wait table allocation failed");
-    }
-    if !reset_gui_message_waiters() {
-        panic!("GUI message waiter table allocation failed");
     }
     if !reset_lpc_receive_waits() {
         panic!("LPC receive waiter table allocation failed");
@@ -9603,7 +9263,6 @@ pub(crate) unsafe fn service_sec_image(
         // RPC-listener-specific parking or quiesce policy.
         let hosted_thread_role = Some(event_runtime.role);
         let tp_worker_identity = tp_worker_identity_from_badge(badge);
-        let tp_worker_slot = tp_worker_identity.map(|(_, slot)| slot);
         let is_tp_worker = tp_worker_identity.is_some();
         let is_scm_worker = hosted_thread_role.is_some_and(|role| role.is_scm_rpc_worker());
         let is_lsa_worker = hosted_thread_role.is_some_and(|role| role.is_lsa_rpc_worker());
@@ -9816,6 +9475,15 @@ pub(crate) unsafe fn service_sec_image(
         ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
         ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
         let img_end = procs[pi].img_end;
+        let event_image_target = nt_exe_image::SpawnTarget::from_image(
+            exe_image_catalog.get_by_pi(pi).expect("event retains its exact executable identity"),
+        );
+        let _event_image_reader = {
+            let _durable = allocator::enter_durable();
+            unsafe { crate::hosted_loaded_images::HostedImageReadScope::capture(
+                hosted_loaded_images_ptr, event_image_target,
+            ) }
+        }.expect("event must retain its parsed executable before dispatch");
         let pe: &nt_pe_loader::PeFile = if pi == primary_pi {
             pe
         } else {
@@ -11549,7 +11217,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"\n");
                 }
             }
-            let trace_process_role = nt_handler.hosted_process_role(pi);
+            let trace_process_role = nt_handler.hosted_process_observation_role(pi);
             let trace_is_lsass =
                 trace_process_role == Some(nt_exe_image::HostedProcessRole::LocalSecurityAuthority);
             // FORWARD-PROGRESS CENSUS: per-SSN histogram for hosted system processes at the current
@@ -11714,7 +11382,7 @@ pub(crate) unsafe fn service_sec_image(
                 m3 = nm3;
                 continue;
             }
-            let syscall_process_role = nt_handler.hosted_process_role(pi);
+            let syscall_process_role = nt_handler.hosted_process_observation_role(pi);
             if matches!(
                 syscall_process_role,
                 Some(
@@ -11910,14 +11578,6 @@ pub(crate) unsafe fn service_sec_image(
                                     }
                                     if outer_dispatch_completed {
                                         pfilled[pi] = *filled_pages;
-                                        let (_, _, safe) = drain_selected_gui_event_signals(
-                                            &mut nt_handler,
-                                        );
-                                        if !safe {
-                                            print_str(
-                                                b"[gui-msg-wait] callback drain aborted unsafe redrive\n",
-                                            );
-                                        }
                                     }
                                 }
                                 win32k_glue::CompletedUserCallback::ProviderWaitSuspended {
@@ -12059,7 +11719,6 @@ pub(crate) unsafe fn service_sec_image(
             // Set by an accepted interactive milestone that parks the caller instead of replying.
             let mut wl_milestone_park = false;
             // A blocking GetMessage park must not end the boot; the service loop keeps running.
-            let mut wl_park_defer_quiesce = false;
             // (Phase 3: the `routed_win32k` / `routed_lpc` / `routed_csr` flags that used to live
             // here are GONE. They existed solely to steer this syscall's reply away from the legacy
             // `reply_to` — which a nested win32k / SM-loop / CSR-thread fault had clobbered — and
@@ -12107,13 +11766,6 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_lpc_receive: Option<PendingLpcReceivePark> = None;
             let mut park_lpc_connect: Option<PendingLpcConnectPark> = None;
             let mut park_lpc_request: Option<PendingLpcRequestPark> = None;
-            let mut gui_message_wait_park_request = false;
-            let mut gui_message_wait_queue_event_body: u64 = 0;
-            let mut gui_message_wait_msg_ptr: u64 = 0;
-            let mut gui_message_wait_hwnd_filter: u64 = 0;
-            let mut gui_message_wait_filter_min: u64 = 0;
-            let mut gui_message_wait_filter_max: u64 = 0;
-            let mut gui_message_wait_caller_sp: u64 = 0;
             // ★ Dbgk TARGET-SIDE BLOCK request (syscall flavour) latched out of the handler:
             // a debug event was posted from THIS syscall arm and NT blocks the reporting thread on
             // the debugger's continue. Consumed at the reply site (the reply-cap steal needs
@@ -12291,6 +11943,12 @@ pub(crate) unsafe fn service_sec_image(
                 // routes a real ALPC process's NtAlpc* syscall to the unified port-service ALPC
                 // adapter (skipping the native ReactOS dispatch).
                 if !stack_args_valid {
+                    if m0 as u32 == SSN_NT_QUERY_KEY as u32 {
+                        let arguments = [argv[0], argv[1], argv[2], argv[3], argv[4]];
+                        crate::registry_query_diagnostics::reject(
+                            &nt_handler, b"argument-capture", &arguments, 0xC000_0005, None,
+                        );
+                    }
                     result = 0xC000_0005;
                 } else if nt_handler.active_synchronous_file_retry.as_ref()
                     .is_some_and(|ingress| !ingress.matches_handle(argv[0]))
@@ -12877,7 +12535,7 @@ pub(crate) unsafe fn service_sec_image(
                 // common for csrss/winlogon and later Win32 children.
                 if let Some(request) = nt_handler.exe_spawn_request {
                     if let Some(spec) =
-                        hosted_exe_spawn_for(request, &*exe_image_catalog, &*hosted_loaded_images)
+                        hosted_exe_spawn_for(request, &*exe_image_catalog, hosted_loaded_images_ptr)
                     {
                         if spec.spawned.load(Ordering::Relaxed) == 0 {
                             let is_csrss_spawn =
@@ -12917,6 +12575,8 @@ pub(crate) unsafe fn service_sec_image(
                     == Some(nt_exe_image::HostedProcessRole::InteractiveShellBootstrap);
                 let explorer_gui_client =
                     process_role == Some(nt_exe_image::HostedProcessRole::InteractiveShell);
+                let observed_explorer_gui_client = nt_handler.hosted_process_observation_role(pi)
+                    == Some(nt_exe_image::HostedProcessRole::InteractiveShell);
                 let shell_gui_client = matches!(
                     process_role,
                     Some(
@@ -12924,9 +12584,8 @@ pub(crate) unsafe fn service_sec_image(
                             | nt_exe_image::HostedProcessRole::InteractiveShell
                     )
                 );
-                let interactive_gui_client = winlogon_gui_client || shell_gui_client;
-                let uses_client_gdi = process_role
-                    .is_some_and(nt_exe_image::HostedProcessRole::uses_win32_client_gdi);
+                let registered_gui_client = registered_gui_dispatch_client(&nt_handler, pi, badge, current_tid);
+                let uses_client_gdi = registered_gui_client;
                 let svc_noninteractive =
                     process_role.is_some_and(|role| role.is_noninteractive_service_class());
                 let dialog_modal_expected_ssn = if winlogon_gui_client {
@@ -12946,7 +12605,7 @@ pub(crate) unsafe fn service_sec_image(
                             modal_message_buffer,
                         )
                     };
-                let explorer_direct_gdi_draw = explorer_gui_client
+                let explorer_direct_gdi_draw = observed_explorer_gui_client
                     && matches!(
                         m0,
                         NTGDI_BIT_BLT_SSN
@@ -13042,178 +12701,6 @@ pub(crate) unsafe fn service_sec_image(
                 {
                     WINLOGON_MSGLOOP_MILESTONE.fetch_add(1, Ordering::Relaxed);
                     print_str(b"[wl-main] winlogon entered its SAS message loop; routing real GetMessage for posted WLX_WM_SAS\n");
-                } else if m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
-                    && GET_MESSAGE_EMPTY_QUEUE_GUARD
-                {
-                    // ★ BATCH 58 — THE GENERAL RULE: A BLOCKING `NtUserGetMessage` MUST NEVER BE
-                    // DISPATCHED INTO win32k ON AN EMPTY QUEUE.
-                    //
-                    // The executive's service loop is SINGLE-THREADED and win32k is a component it
-                    // drives synchronously, so `co_IntGetPeekMessage`'s wait does not block one
-                    // thread — it blocks THE WHOLE SYSTEM, permanently. And because the loop is then
-                    // stuck inside `win32k_dispatch`'s recv, the wall-clock stall watchdog at the
-                    // loop top never runs either, so the boot can never even quiesce to the gate.
-                    // MEASURED (batch 58, `PROVISION_DEFAULT_USER_PROFILE = true`): the profile
-                    // flow's `Error: 87` puts up a real userenv MessageBox whose modal pump calls
-                    // GetMessage on a window no existing special case covers; the boot went
-                    // COMPLETELY SILENT at t=310 s and was killed at 555 s (`RUNEXIT=124`). It was
-                    // never "more UI work costing more time" — the log's last line is a `0x1006`
-                    // dispatch with no reply, and host-side timestamps show ZERO output for the
-                    // remaining 245 s.
-                    //
-                    // The rule is NT's own definition of GetMessage — *peek, and only then wait* —
-                    // so ask win32k the non-blocking half FIRST, with the caller's real arguments
-                    // and `PM_NOREMOVE` (the message stays queued for the GetMessage that follows).
-                    // A non-empty queue dispatches exactly as before (byte-identical behaviour); an
-                    // EMPTY queue — the only case that could hang — takes the established milestone
-                    // park, so the boot quiesces and the gate runs. This subsumes the special-cased
-                    // parks above rather than competing with them: it is the LAST arm of the chain.
-                    let sp = get_recv_mr(16);
-                    let peb_mirror = hosted_peb_mirror_for_pi(pi);
-                    let client_teb = nt_handler
-                        .pm
-                        .thread_teb(current_tid as nt_process::ThreadId)
-                        .filter(|teb| *teb != 0)
-                        .unwrap_or(SMSS_TEB_VA);
-                    // The caller's own NtUserGetMessage(MSG* [R10], HWND [RDX], min [R8], max [R9]);
-                    // NtUserPeekMessage takes the same four plus wRemoveMsg on the stack.
-                    W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
-                    let client = win32k_client_context_for_thread(
-                        &nt_handler,
-                        pi,
-                        badge,
-                        current_tid,
-                        hosted_thread_tcb_or_zero(&nt_handler, current_tid),
-                        nt_handler.hosted_thread_role(current_tid),
-                        client_teb,
-                        peb_mirror,
-                        scratch_base,
-                    );
-                    let peek_arg = win32k_subsystem::WIN32K_ARG_VADDR;
-                    core::ptr::write_bytes(peek_arg as *mut u8, 0, WIN32K_MSG_BYTES);
-                    let peek = dispatch_win32k_for_client(
-                        &mut nt_handler,
-                        nt_user_callback::NTUSER_PEEK_MESSAGE_SSN,
-                        peek_arg,
-                        m3,
-                        get_recv_mr(7),
-                        get_recv_mr(8),
-                        sp,
-                        &[0u64], // wRemoveMsg = PM_NOREMOVE: look, do not consume
-                        client,
-                    );
-                    let peek_callback_suspended = win32k_glue::take_user_callback_pump_suspended();
-                    if peek_callback_suspended {
-                        let _ = win32k_glue::cancel_suspended_user_callback();
-                    }
-                    GET_MESSAGE_PREFLIGHT_PEEKS.fetch_add(1, Ordering::Relaxed);
-                    if peek_callback_suspended || !peek.1 || peek.0 == 0 {
-                        let main_tid = nt_handler
-                            .pm_main_tid_for_pi(pi)
-                            .map(u64::from)
-                            .unwrap_or(0);
-                        if post_winlogon_second_sas_after_welcome_drain(
-                            client.logical_caller,
-                            pi,
-                            nt_handler.hosted_process_generation(pi).unwrap_or(0),
-                            badge,
-                            current_tid,
-                            hosted_thread_tcb_or_zero(&nt_handler, current_tid),
-                            nt_handler.hosted_thread_role(current_tid),
-                            nt_handler.hosted_process_role(pi),
-                            nt_handler.hosted_process_top_badge(pi).unwrap_or(0),
-                            main_tid,
-                            nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
-                            client_teb,
-                            peb_mirror,
-                            scratch_base,
-                            win32k_token_context(&nt_handler, pi),
-                        ) {
-                            GET_MESSAGE_EMPTY_QUEUE_REPOPULATED.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            let n = GET_MESSAGE_EMPTY_QUEUE_PARKS.fetch_add(1, Ordering::Relaxed);
-                            let queue_event_body = if shell_gui_client {
-                                win32k_subsystem::current_thread_queue_event_body().unwrap_or(0)
-                            } else {
-                                0
-                            };
-                            if shell_gui_client && queue_event_body != 0 {
-                                gui_message_wait_park_request = true;
-                                gui_message_wait_queue_event_body = queue_event_body;
-                                gui_message_wait_msg_ptr = get_recv_mr(9);
-                                gui_message_wait_hwnd_filter = m3;
-                                gui_message_wait_filter_min = get_recv_mr(7);
-                                gui_message_wait_filter_max = get_recv_mr(8);
-                                gui_message_wait_caller_sp = sp;
-                                if n < 16 {
-                                    print_str(
-                                        b"[gui-msg-wait] blocking shell GetMessage on empty queue (pi=",
-                                    );
-                                    print_u64(pi as u64);
-                                    print_str(b" badge=");
-                                    print_u64(badge);
-                                    print_str(b" hwnd-filter=0x");
-                                    print_hex(m3 as u32);
-                                    print_str(b") -> queue-event park\n");
-                                }
-                            } else {
-                                // ★ WHOSE park ends the boot. winlogon's MAIN thread (badge 4) running out
-                                // of messages is the established terminal condition — it is the thread that
-                                // drives the logon, so its empty SAS loop means winlogon has nothing left.
-                                // A WORKER thread's pump running dry does NOT: measured, the profile copy
-                                // runs on the MAIN thread while worker badge 13 pumps the desktop, so
-                                // quiescing on the worker's park CUT THE `CopyDirectory` OFF MID-TREE.
-                                // Park the worker and keep the loop running so the main thread advances;
-                                // the grace is BOUNDED so a boot where nothing else can run still reaches
-                                // the gate rather than blocking in the loop's recv forever.
-                                const EMPTY_QUEUE_PARK_GRACE: u64 = 3;
-                                let winlogon_top_badge = hosted_top_badge_for_role(
-                                    &nt_handler,
-                                    nt_exe_image::HostedProcessRole::InteractiveLogon,
-                                )
-                                .expect(
-                                    "winlogon hosted metadata must be registered before GUI pump",
-                                );
-                                let userinit_top_badge = hosted_top_badge_for_role(
-                                    &nt_handler,
-                                    nt_exe_image::HostedProcessRole::InteractiveShellBootstrap,
-                                )
-                                .expect(
-                                    "userinit hosted metadata must be registered before GUI pump",
-                                );
-                                let defer = (badge != winlogon_top_badge
-                                    && badge != userinit_top_badge
-                                    && n < EMPTY_QUEUE_PARK_GRACE)
-                                    || (owner_top_badge_for(&nt_handler, badge)
-                                        != Some(userinit_top_badge)
-                                        && userinit_shell_frontier_pending(
-                                            &nt_handler,
-                                            crash_parked,
-                                            wait_parked,
-                                        ));
-                                if n < 8 {
-                                    print_str(
-                                        b"[wl-main] blocking GetMessage on an EMPTY queue (pi=",
-                                    );
-                                    print_u64(pi as u64);
-                                    print_str(b" badge=");
-                                    print_u64(badge);
-                                    print_str(b" hwnd-filter=0x");
-                                    print_hex(m3 as u32);
-                                    print_str(if defer {
-                                        b") -> parking this thread, loop continues\n"
-                                    } else {
-                                        b") -> parking instead of hanging win32k\n"
-                                    });
-                                }
-                                handled = false;
-                                wl_milestone_park = true;
-                                wl_park_defer_quiesce = defer;
-                            }
-                        }
-                    } else {
-                        GET_MESSAGE_PREFLIGHT_READY.fetch_add(1, Ordering::Relaxed);
-                    }
                 }
                 // Tell win32k_dispatch WHICH client this call belongs to (csrss pi 1 / winlogon pi 2 /
                 // services pi 3 / lsass pi 4) so it attaches win32k's client window to this client's frames
@@ -13374,7 +12861,7 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     (a1, 0)
                 };
-                let msg_syscall = interactive_gui_client
+                let msg_syscall = registered_gui_client
                     && a0 != 0
                     && (m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
                         || m0 == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
@@ -16211,13 +15698,8 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"\n");
                     }
                 }
-                let (mut st, mut ok): (u64, bool) = if wl_milestone_park
-                    || gui_message_wait_park_request
-                {
-                    // This caller is intentionally parked without a provider dispatch. For GUI
-                    // message waits this means the preflight PeekMessage proved the queue is empty,
-                    // so dispatching the blocking GetMessage would park the single-threaded host
-                    // inside win32k. The !handled block below owns the wait-park.
+                let (mut st, mut ok): (u64, bool) = if wl_milestone_park {
+                    // The bootstrap milestone owner handles this intentional park below.
                     (0, false)
                 } else if message_output_stage_failed {
                     (0xC000_009A, true)
@@ -17069,7 +16551,7 @@ pub(crate) unsafe fn service_sec_image(
                             r = (0, true);
                         }
                     }
-                    if explorer_gui_client && r.1 && r.0 != 0 {
+                    if observed_explorer_gui_client && r.1 && r.0 != 0 {
                         match m0 {
                             NTUSER_BEGIN_PAINT_SSN => {
                                 if EXPLORER_BEGIN_PAINTS.fetch_add(1, Ordering::Relaxed) == 0 {
@@ -17576,28 +17058,10 @@ pub(crate) unsafe fn service_sec_image(
                         st = 0xC000_0001;
                     }
                 }
-                if !gui_message_wait_park_request
-                    && ok
-                    && !callback_suspended
-                    && !redirected_user_callback
-                {
-                    let (_, _, drain_safe) =
-                        drain_selected_gui_event_signals(&mut nt_handler);
-                    if !drain_safe {
-                        print_str(b"[win32k-gui-event-drain-unsafe] ssn=");
-                        print_hex_u64(m0);
-                        print_str(b" pi=");
-                        print_u64(pi as u64);
-                        print_str(b"\n");
-                        ok = false;
-                        st = 0xC000_0001;
-                    }
-                }
                 // Use the request's sampling decision for the matching status line. Real provider
                 // walls still print, but an intentional wait-park is not a failed dispatch.
                 if !redirected_user_callback
                     && !wl_milestone_park
-                    && !gui_message_wait_park_request
                     && (!ok || w32_log)
                 {
                     print_str(b"[win32k-svc] ");
@@ -17663,8 +17127,6 @@ pub(crate) unsafe fn service_sec_image(
                         // logon-process access check would fail SetLogonNotifyWindow → InitializeSAS FALSE.)
                         print_str(b"[wl-main] winlogon registered logon-notify window (0x127c) = SAS window ready -> advancing to post-SAS setup\n");
                     }
-                } else if gui_message_wait_park_request {
-                    result = 0;
                 } else {
                     handled = false; // dispatch wall — stop with the SSN recorded
                     result = 0xC0000001;
@@ -17704,8 +17166,7 @@ pub(crate) unsafe fn service_sec_image(
                         wait_parked,
                         b"winlogon-milestone",
                     );
-                    if !wl_park_defer_quiesce
-                        && !pre_user_shell_pending
+                    if !pre_user_shell_pending
                         && !userinit_shell_pending
                         && !explorer_chrome_pending
                         && WINLOGON_KEY_OPENED.load(Ordering::Relaxed) != 0
@@ -17978,63 +17439,6 @@ pub(crate) unsafe fn service_sec_image(
             procs[pi].ntfaults = ntfaults;
             pfilled[pi] = *filled_pages;
             let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-            if gui_message_wait_park_request {
-                let (_, _, prepark_safe) =
-                    drain_selected_gui_event_signals(&mut nt_handler);
-                if prepark_safe
-                    && reply_main != 0
-                    && gui_message_wait_park(
-                        &mut nt_handler,
-                        pi as u32,
-                        badge,
-                        current_tid,
-                        gui_message_wait_queue_event_body,
-                        gui_message_wait_msg_ptr,
-                        gui_message_wait_hwnd_filter,
-                        gui_message_wait_filter_min,
-                        gui_message_wait_filter_max,
-                        gui_message_wait_caller_sp,
-                        parked_syscall_reply,
-                    )
-                {
-                    let (event_signals, _, _drain_safe) =
-                        drain_selected_gui_event_signals(&mut nt_handler);
-                    if event_signals != 0 {
-                        GUI_MESSAGE_WAIT_READY_REDRIVES.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if gui_message_wait_was_replied(pi as u32, badge) {
-                        let _ = finalize_service_loop_state(&mut nt_handler);
-                        let received =
-                            component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
-                        badge = received.0;
-                        mi = received.1;
-                        m0 = received.2;
-                        m1 = received.3;
-                        m2 = received.4;
-                        m3 = received.5;
-                        continue;
-                    }
-                    trace_indefinite_wait_park(
-                        &nt_handler,
-                        badge,
-                        live_top_badges(&nt_handler),
-                        crash_parked,
-                        wait_parked,
-                    );
-                    mark_wait_parked!(pi, resume_ip);
-                    let _ = finalize_service_loop_state(&mut nt_handler);
-                    let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
-                    badge = received.0;
-                    mi = received.1;
-                    m0 = received.2;
-                    m1 = received.3;
-                    m2 = received.4;
-                    m3 = received.5;
-                    continue;
-                }
-                print_str(b"[gui-msg-wait] park unavailable -> GetMessage failure\n");
-                result = u64::MAX;
-            }
             if let Some(pending) = park_lpc_receive.take() {
                 if reply_main != 0
                     && lpc_receive_wait_park(
@@ -24747,434 +24151,6 @@ pub(crate) unsafe fn lpc_request_wait_abandon_thread(
     abandoned
 }
 
-#[allow(clippy::too_many_arguments)]
-unsafe fn gui_message_wait_park(
-    nt_handler: &mut ExecNtHandler,
-    pi: u32,
-    badge: u64,
-    tid: u64,
-    queue_event_body: u64,
-    msg_ptr: u64,
-    hwnd_filter: u64,
-    filter_min: u64,
-    filter_max: u64,
-    caller_sp: u64,
-    reply: nt_syscall_abi::ParkedSyscallReply,
-) -> bool {
-    if queue_event_body == 0 || msg_ptr == 0 {
-        return false;
-    }
-    let Some(logical_caller) = nt_handler.capture_provider_logical_caller(
-        pi as usize, tid, badge, hosted_thread_tcb_or_zero(nt_handler, tid),
-    ) else {
-        return false;
-    };
-    let Some(slot) = gui_message_waiter_alloc_slot() else {
-        return false;
-    };
-    let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    if stolen == 0 {
-        return false;
-    }
-    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
-        return false;
-    };
-    let pi_index = pi as usize;
-    let Some(process_generation) = nt_handler.hosted_process_generation(pi_index) else {
-        return false;
-    };
-    let Some(process_id) = nt_handler.pm_pid_for_pi(pi_index) else {
-        return false;
-    };
-    if !nt_handler
-        .pm
-        .thread(tid as nt_process::ThreadId)
-        .is_some_and(|thread| thread.process_id == process_id && thread.exit_status.is_none())
-    {
-        return false;
-    }
-    let Ok((queue_event, queue_event_lease)) = nt_handler.acquire_gui_event_wait(queue_event_body)
-    else {
-        return false;
-    };
-    {
-        let table = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
-        table[slot] = GuiMessageWaiter {
-            logical_caller: Some(logical_caller),
-            used: true,
-            sequence: crate::next_dispatcher_wait_sequence(),
-            pi,
-            process_generation,
-            badge,
-            tid,
-            queue_event,
-            queue_event_lease,
-            event_selected: false,
-            msg_ptr,
-            hwnd_filter,
-            filter_min,
-            filter_max,
-            caller_sp,
-            reply_cap: stolen,
-            reply_deleted: false,
-            reply,
-        };
-    }
-    let _ = gui_message_wait_select_published(nt_handler, slot);
-    reply_park.commit();
-    let n = GUI_MESSAGE_WAIT_PARKED.fetch_add(1, Ordering::Relaxed);
-    if n < 32 {
-        print_str(b"[gui-msg-wait] parked pi=");
-        print_u64(pi as u64);
-        print_str(b" badge=");
-        print_u64(badge);
-        print_str(b" tid=");
-        print_u64(tid);
-        print_str(b" queue-event=0x");
-        print_hex_u64(queue_event_body);
-        print_str(b" msg=0x");
-        print_hex_u64(msg_ptr);
-        print_str(b"\n");
-    }
-    true
-}
-
-unsafe fn gui_message_wait_was_replied(pi: u32, badge: u64) -> bool {
-    let table = &*core::ptr::addr_of!(GUI_MESSAGE_WAITERS);
-    !table
-        .iter()
-        .any(|waiter| waiter.used && waiter.pi == pi && waiter.badge == badge)
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum GuiEventRedriveDisposition {
-    Complete,
-    Retry,
-    Unsafe,
-}
-
-struct GuiEventRedriveResult {
-    woken: u64,
-    disposition: GuiEventRedriveDisposition,
-}
-
-unsafe fn gui_message_wait_redrive_event(
-    nt_handler: &mut ExecNtHandler,
-    event: nt_kernel_exec::EventObjectId,
-) -> GuiEventRedriveResult {
-    if event.is_null() {
-        return GuiEventRedriveResult {
-            woken: 0,
-            disposition: GuiEventRedriveDisposition::Complete,
-        };
-    }
-    let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
-    let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
-    let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
-    let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
-    let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
-    let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
-    let saved_w32_client_pi = W32_CLIENT_PI.load(Ordering::Relaxed);
-    let saved_pi = nt_handler.pi;
-    let saved_tid = nt_handler.current_tid;
-    let saved_badge = nt_handler.current_badge;
-    let saved_resume_ip = nt_handler.current_resume_ip;
-    let saved_sp = nt_handler.current_sp;
-    let saved_flags = nt_handler.current_flags;
-    let saved_ctx = nt_handler.loop_ctx;
-    let mut woken = 0u64;
-    let mut disposition = GuiEventRedriveDisposition::Complete;
-
-    let waiter_count = (&*core::ptr::addr_of!(GUI_MESSAGE_WAITERS)).len();
-    for slot in 0..waiter_count {
-        let Some(waiter) = gui_message_waiter_record(slot) else {
-            continue;
-        };
-        if !waiter.used || waiter.queue_event != event || !waiter.event_selected {
-            continue;
-        }
-        if waiter.reply_deleted {
-            if !gui_message_waiter_cancel_slot(nt_handler, slot, waiter, false) {
-                disposition = GuiEventRedriveDisposition::Retry;
-                break;
-            }
-            continue;
-        }
-        let pi = waiter.pi as usize;
-        let wait_admission = waiter.logical_caller.and_then(|caller| {
-            if caller.pi() != pi || u64::from(caller.thread().thread_id()) != waiter.tid
-                || caller.badge() != waiter.badge
-            {
-                return None;
-            }
-            // Ownership visibility is not fresh provider admission. A control-busy published
-            // runtime is still the live owner of this wait; do not cancel its bound Reply.
-            let published = (&*nt_handler.thread_runtime.table).entries.iter()
-                .filter(|slot| !slot.is_pending())
-                .filter_map(|slot| slot.owner())
-                .find(|owner| owner.badge == waiter.badge && !owner.publication.is_busy())
-                .map(|owner| owner.binding());
-            caller.retained_wait_admission(
-                published,
-                nt_handler.admit_hosted_thread_ingress(waiter.badge).ok()
-                    .map(|runtime| runtime.binding()),
-                nt_handler.pm.thread_lifetime(caller.thread().thread_id()),
-            ).ok()
-        });
-        let live_identity = pi < MAX_PI
-            && wait_admission.is_some()
-            && nt_handler.hosted_process_generation(pi) == Some(waiter.process_generation)
-            && nt_handler
-                .pm
-                .thread(waiter.tid as nt_process::ThreadId)
-                .is_some_and(|thread| {
-                    thread.exit_status.is_none()
-                        && nt_handler.pm_pid_for_pi(pi) == Some(thread.process_id)
-                });
-        if !live_identity {
-            if !gui_message_waiter_cancel_slot(nt_handler, slot, waiter, false) {
-                disposition = GuiEventRedriveDisposition::Retry;
-                break;
-            }
-            continue;
-        }
-        if wait_admission == Some(nt_user_host::provider_logical_caller::ProviderWaitAdmission::Deferred) {
-            disposition = GuiEventRedriveDisposition::Retry;
-            break;
-        }
-        nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(pi));
-        GUI_MESSAGE_WAIT_REDRIVES.fetch_add(1, Ordering::Relaxed);
-        let (sb, ss, smv, hmv, scratch_base) = mirror_ctx_for(waiter.badge, pi);
-        ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
-        ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
-        ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
-        ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
-        ACTIVE_CLIENT_PI.store(waiter.pi as u64, Ordering::Relaxed);
-        ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
-        W32_CLIENT_PI.store(waiter.pi as u64, Ordering::Relaxed);
-        nt_handler.pi = pi;
-        nt_handler.current_tid = waiter.tid;
-        nt_handler.current_badge = waiter.badge;
-        nt_handler.current_resume_ip = waiter.reply.resume_ip();
-        nt_handler.current_sp = waiter.reply.resume_sp();
-        nt_handler.current_flags = waiter.reply.resume_flags();
-
-        let peb_mirror = hosted_peb_mirror_for_pi(pi);
-        let client_teb = nt_handler
-            .pm
-            .thread_teb(waiter.tid as nt_process::ThreadId)
-            .filter(|teb| *teb != 0)
-            .unwrap_or(SMSS_TEB_VA);
-        let mut client = win32k_client_context_for_thread(
-            nt_handler,
-            pi,
-            waiter.badge,
-            waiter.tid,
-            hosted_thread_tcb_or_zero(nt_handler, waiter.tid),
-            nt_handler.hosted_thread_role(waiter.tid),
-            client_teb,
-            peb_mirror,
-            scratch_base,
-        );
-        client.logical_caller = waiter.logical_caller;
-        let arg = win32k_subsystem::WIN32K_ARG_VADDR;
-        core::ptr::write_bytes(arg as *mut u8, 0, WIN32K_MSG_BYTES);
-        let peek = dispatch_win32k_for_client(
-            nt_handler,
-            nt_user_callback::NTUSER_PEEK_MESSAGE_SSN,
-            arg,
-            waiter.hwnd_filter,
-            waiter.filter_min,
-            waiter.filter_max,
-            waiter.caller_sp,
-            &[0u64],
-            client,
-        );
-        if win32k_glue::take_user_callback_pump_suspended() {
-            let (_, stack_ok) = win32k_glue::cancel_suspended_user_callback();
-            let n = GUI_MESSAGE_WAIT_TRACE.fetch_add(1, Ordering::Relaxed);
-            if n < 16 {
-                print_str(b"[gui-msg-wait] callback during PeekMessage redrive pi=");
-                print_u64(waiter.pi as u64);
-                print_str(b" badge=");
-                print_u64(waiter.badge);
-                print_str(b" -> keep parked\n");
-            }
-            disposition = if stack_ok {
-                GuiEventRedriveDisposition::Retry
-            } else {
-                GuiEventRedriveDisposition::Unsafe
-            };
-            break;
-        }
-        if !peek.1 {
-            let n = GUI_MESSAGE_WAIT_TRACE.fetch_add(1, Ordering::Relaxed);
-            if n < 16 {
-                print_str(b"[gui-msg-wait] PeekMessage redrive WALL pi=");
-                print_u64(waiter.pi as u64);
-                print_str(b" badge=");
-                print_u64(waiter.badge);
-                print_str(b" -> keep parked\n");
-            }
-            disposition = GuiEventRedriveDisposition::Unsafe;
-            break;
-        }
-        if peek.0 == 0 {
-            let n = GUI_MESSAGE_WAIT_STILL_EMPTY.fetch_add(1, Ordering::Relaxed);
-            if n < 16 {
-                print_str(b"[gui-msg-wait] redrive still empty pi=");
-                print_u64(waiter.pi as u64);
-                print_str(b" badge=");
-                print_u64(waiter.badge);
-                print_str(b" queue-event=0x");
-                print_hex_u64(event.0 .0);
-                print_str(b"\n");
-            }
-            gui_message_waiter_unselect(slot, waiter.queue_event_lease);
-            continue;
-        }
-
-        core::ptr::write_bytes(arg as *mut u8, 0, WIN32K_MSG_BYTES);
-        let get = dispatch_win32k_for_client(
-            nt_handler,
-            nt_user_callback::NTUSER_GET_MESSAGE_SSN,
-            arg,
-            waiter.hwnd_filter,
-            waiter.filter_min,
-            waiter.filter_max,
-            waiter.caller_sp,
-            &[],
-            client,
-        );
-        if win32k_glue::take_user_callback_pump_suspended() {
-            let (_, stack_ok) = win32k_glue::cancel_suspended_user_callback();
-            let n = GUI_MESSAGE_WAIT_TRACE.fetch_add(1, Ordering::Relaxed);
-            if n < 16 {
-                print_str(b"[gui-msg-wait] callback during GetMessage redrive pi=");
-                print_u64(waiter.pi as u64);
-                print_str(b" badge=");
-                print_u64(waiter.badge);
-                print_str(b" -> keep parked\n");
-            }
-            disposition = if stack_ok {
-                GuiEventRedriveDisposition::Retry
-            } else {
-                GuiEventRedriveDisposition::Unsafe
-            };
-            break;
-        }
-        if !get.1 {
-            let n = GUI_MESSAGE_WAIT_TRACE.fetch_add(1, Ordering::Relaxed);
-            if n < 16 {
-                print_str(b"[gui-msg-wait] GetMessage redrive WALL pi=");
-                print_u64(waiter.pi as u64);
-                print_str(b" badge=");
-                print_u64(waiter.badge);
-                print_str(b" -> keep parked\n");
-            }
-            disposition = GuiEventRedriveDisposition::Unsafe;
-            break;
-        }
-
-        let staged_message = core::ptr::read_unaligned((arg + 8) as *const u32);
-        let should_copy_msg = get.0 != 0 || staged_message == WM_QUIT;
-        if !should_copy_msg {
-            let n = GUI_MESSAGE_WAIT_STILL_EMPTY.fetch_add(1, Ordering::Relaxed);
-            if n < 16 {
-                print_str(b"[gui-msg-wait] GetMessage redrive returned no message pi=");
-                print_u64(waiter.pi as u64);
-                print_str(b" badge=");
-                print_u64(waiter.badge);
-                print_str(b"\n");
-            }
-            gui_message_waiter_unselect(slot, waiter.queue_event_lease);
-            continue;
-        }
-        let mut output = [0u8; WIN32K_MSG_BYTES];
-        core::ptr::copy_nonoverlapping(arg as *const u8, output.as_mut_ptr(), output.len());
-        let copy_ok = nt_handler.xas_try_write_buf(waiter.msg_ptr, &output);
-        let status = if copy_ok { get.0 } else { u64::MAX };
-        reply_parked_syscall(waiter.reply_cap, status);
-        release_reply_pool_cap(waiter.reply_cap);
-        thread_wait_state_clear_badge_ready(nt_handler, waiter.badge);
-        assert!(gui_message_waiter_clear_slot(
-            slot,
-            waiter.reply_cap,
-            waiter.queue_event_lease
-        ));
-        nt_handler
-            .release_gui_event_wait(waiter.queue_event_lease)
-            .expect("completed GUI waiter lost its Event lease");
-        woken += 1;
-        let n = GUI_MESSAGE_WAIT_WOKEN.fetch_add(1, Ordering::Relaxed);
-        if n < 32 {
-            let hwnd = core::ptr::read_unaligned(arg as *const u64);
-            print_str(b"[gui-msg-wait] woke pi=");
-            print_u64(waiter.pi as u64);
-            print_str(b" badge=");
-            print_u64(waiter.badge);
-            print_str(b" hwnd=0x");
-            print_hex_u64(hwnd);
-            print_str(b" msg=0x");
-            print_hex(staged_message);
-            print_str(b" ret=0x");
-            print_hex(status as u32);
-            print_str(if copy_ok { b"\n" } else { b" copyout-failed\n" });
-        }
-    }
-
-    ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
-    ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
-    ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
-    ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
-    ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
-    ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
-    W32_CLIENT_PI.store(saved_w32_client_pi, Ordering::Relaxed);
-    nt_handler.pi = saved_pi;
-    nt_handler.current_tid = saved_tid;
-    nt_handler.current_badge = saved_badge;
-    nt_handler.current_resume_ip = saved_resume_ip;
-    nt_handler.current_sp = saved_sp;
-    nt_handler.current_flags = saved_flags;
-    nt_handler.loop_ctx = saved_ctx;
-    GuiEventRedriveResult { woken, disposition }
-}
-
-unsafe fn drain_selected_gui_event_signals(
-    nt_handler: &mut ExecNtHandler,
-) -> (u64, u64, bool) {
-    let mut signals = 0u64;
-    let mut woken = 0u64;
-    let budget = nt_handler.queued_event_signal_count();
-    let mut safe = true;
-    for _ in 0..budget {
-        let Some(signal) = nt_handler.take_event_signal() else {
-            break;
-        };
-        signals += 1;
-        if !gui_message_wait_has_selected(signal.id) {
-            let _ = gui_message_wait_select_level_inner(nt_handler, signal.id, false);
-        }
-        let result = gui_message_wait_redrive_event(nt_handler, signal.id);
-        woken += result.woken;
-        match result.disposition {
-            GuiEventRedriveDisposition::Complete => nt_handler
-                .complete_event_signal(signal.id)
-                .expect("delivered GUI Event signal lost its registry lease"),
-            GuiEventRedriveDisposition::Retry | GuiEventRedriveDisposition::Unsafe => {
-                nt_handler
-                    .retry_event_signal(signal.id)
-                    .expect("incomplete GUI Event delivery lost its registry lease");
-                if result.disposition == GuiEventRedriveDisposition::Unsafe {
-                    safe = false;
-                    break;
-                }
-            }
-        }
-    }
-    (signals, woken, safe)
-}
-
 unsafe fn io_completion_park(
     nt_handler: &mut ExecNtHandler,
     port_id: u32,
@@ -26275,6 +25251,29 @@ unsafe fn pending_file_io_redrive_pass(
             .get_exact(identity).filter(|live| live.irp_id == pending.irp_id)
         else { continue; };
         pending = live;
+        if let nt_io_manager::PendingFileIoOperation::OwnedModePrecommit(operation) = pending.operation {
+            // The original input, File reference, Busy and Reply already belong to this row.
+            // Preparation is no-effect on Busy; never re-enter the syscall or read user input.
+            let result = if pending.consumer_abandoned {
+                Err(driver_launch::FileModePreparationError::Status(nt_fs::STATUS_CANCELLED))
+            } else {
+                nt_handler.commit_owned_file_mode_request(pending.route, operation.requested_mode, pending.tid)
+            };
+            let status = match result {
+                Err(driver_launch::FileModePreparationError::Busy) => {
+                    FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                    continue;
+                }
+                Err(driver_launch::FileModePreparationError::Status(status)) => status,
+                Ok(()) => nt_fs::STATUS_SUCCESS,
+            };
+            (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                .commit_owned_mode_exact(identity, pending.irp_id, status)
+                .expect("non-reentrant mode commit lost its retained precommit owner");
+            // The transition is recorded before any fallible delivery operation.
+            pending = (&*core::ptr::addr_of!(PENDING_FILE_IO)).get_exact(identity)
+                .expect("committed mode lost its delivery row");
+        }
         let Ok(delivery) = pending_file_delivery::Delivery::begin(identity, pending.irp_id)
         else { continue; };
         let hosted_file_id = pending.route.hosted_file_id();
@@ -26292,7 +25291,7 @@ unsafe fn pending_file_io_redrive_pass(
         });
         // Once local output is committed, the I/O owner retains the terminal result even after
         // the FSD acknowledges its bytes. Later surface/reference retries must not re-query it.
-        let local_terminal = if let Some(terminal) = pending.local_terminal_result() {
+        let local_terminal = if let Some(terminal) = pending.owned_terminal_result() {
             Some(terminal)
         } else if let nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(operation) = pending.operation {
             if pending.consumer_abandoned
@@ -26315,7 +25314,9 @@ unsafe fn pending_file_io_redrive_pass(
         } else {
             None
         };
-        let mut completed = if pending.is_local() {
+        let mut completed = if pending.is_local()
+            || matches!(pending.operation, nt_io_manager::PendingFileIoOperation::OwnedInline(_))
+        {
             None
         } else {
             driver_launch::completed_irp_exact(pending.irp_id)
@@ -26783,7 +25784,7 @@ unsafe fn pending_file_io_redrive_pass(
             };
             // A definitive payload fault changes Status and may suppress inline surfaces.
             // Use the refreshed owner, never the pre-copy snapshot, for the remaining delivery.
-            (terminal_status, terminal_information) = pending.local_terminal_result()
+            (terminal_status, terminal_information) = pending.owned_terminal_result()
                 .expect("buffered local result disappeared during delivery");
             delivery_state = pending.delivery_state;
         } else if pending.output_va != 0
@@ -26807,7 +25808,7 @@ unsafe fn pending_file_io_redrive_pass(
                 let chunk = ((delivery_len - offset) as usize).min(4096);
                 let work = &mut *core::ptr::addr_of_mut!(FILE_IO_COPY_WORK);
                 let copy_result = match pending.operation {
-                    nt_io_manager::PendingFileIoOperation::LocalInline(_)
+                    nt_io_manager::PendingFileIoOperation::OwnedInline(_)
                     | nt_io_manager::PendingFileIoOperation::LocalBuffered(_)
                     | nt_io_manager::PendingFileIoOperation::LocalFlush(_) => {
                         Err(nt_fs::STATUS_INVALID_PARAMETER)
@@ -27028,7 +26029,7 @@ unsafe fn pending_file_io_redrive_pass(
                 .expect("pending File reply owner disappeared")
                 .expect("pending File reply cap was claimed without publication");
             let replied = reply_parked_syscall(
-                cap, pending.local_syscall_status().unwrap_or(terminal_status) as u64,
+                cap, pending.owned_syscall_status().unwrap_or(terminal_status) as u64,
             );
             if !replied {
                 (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
@@ -27069,18 +26070,41 @@ unsafe fn pending_file_io_redrive_pass(
                 .mark_backend_acked_exact(slot, pending.irp_id)
                 .expect("ACKed pending File owner disappeared");
         }
-        if pending.is_local()
-            && delivery_state & nt_io_manager::IO_DELIVERY_LOCAL_REFERENCE_RELEASED == 0
+        if (pending.is_local()
+            || matches!(pending.operation, nt_io_manager::PendingFileIoOperation::OwnedInline(_)))
+            && delivery_state & nt_io_manager::IO_DELIVERY_OWNED_REFERENCE_RELEASED == 0
         {
-            if nt_handler.try_release_local_file_io_reference(local_file_object.expect("local completion lost its File route")).is_err() {
+            let released = if let Some(file) = local_file_object {
+                nt_handler.try_release_local_file_io_reference(file)
+            } else {
+                let receipt = (&*core::ptr::addr_of!(PENDING_FILE_IO))
+                    .owned_reference_release_exact(identity, pending.irp_id);
+                let receipt = match receipt {
+                    Some(receipt) => Ok(receipt),
+                    None => nt_handler.file_completion.release_file(
+                        hosted_file_id.expect("Hosted-inline completion lost its File route"),
+                    ).map(|receipt| {
+                        (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                            .record_owned_reference_release_exact(identity, pending.irp_id, receipt)
+                            .expect("consumed File reference lost its retained inline owner");
+                        receipt
+                    }),
+                };
+                receipt.and_then(|receipt| crate::file_reference_retirement::followup(nt_handler, receipt))
+            };
+            if released.is_err() {
                 FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                 restore_file_io_mirrors!();
                 continue;
             }
             (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
-                .mark_local_reference_released_exact(slot, pending.irp_id)
-                .expect("released local File reference lost its pending owner");
+                .mark_owned_reference_released_exact(slot, pending.irp_id)
+                .expect("released owned File reference lost its pending owner");
         }
+        assert!(
+            !matches!(pending.operation, nt_io_manager::PendingFileIoOperation::OwnedModePrecommit(_)),
+            "nonterminal mode preparation cannot retire its retained File owner",
+        );
         let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
         let finished = table
             .finish_owner_exact(identity, pending.irp_id)
@@ -27116,9 +26140,12 @@ unsafe fn pending_file_io_redrive_pass(
             }
             nt_io_manager::PendingFileIoOperation::LocalByteLock(_)
             | nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(_)
-            | nt_io_manager::PendingFileIoOperation::LocalInline(_)
+            | nt_io_manager::PendingFileIoOperation::OwnedInline(_)
             | nt_io_manager::PendingFileIoOperation::LocalBuffered(_)
             | nt_io_manager::PendingFileIoOperation::LocalFlush(_) => {}
+            nt_io_manager::PendingFileIoOperation::OwnedModePrecommit(_) => {
+                unreachable!("finished File owner retained nonterminal mode preparation")
+            }
         }
         delivered += 1;
         let trace_completion = FILE_IO_COMPLETION_TRACE.fetch_add(1, Ordering::Relaxed) < 32

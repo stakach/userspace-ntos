@@ -39,6 +39,11 @@ mod registry_security_audit;
 mod provider_registry_caller;
 mod provider_directory_broker;
 mod provider_section_broker;
+mod provider_service_ingress;
+mod provider_section_cleanup;
+mod provider_section_receipts;
+mod registry_query_diagnostics;
+mod process_terminal_receipt;
 mod provider_mm_section_objects;
 mod provider_section_map_broker;
 mod provider_section_unmap_broker;
@@ -62,6 +67,7 @@ mod loader_trace_diag;
 pub(crate) use loader_trace_diag::*;
 mod exec_handler;
 mod native_image_sections;
+pub(crate) use exec_handler::file_image_section;
 mod hosted_routed_image_capture;
 mod thread_context;
 mod thread_suspend;
@@ -7289,22 +7295,7 @@ static W32_PREV_BUCKET: AtomicU64 = AtomicU64::new(u64::MAX);
 pub(crate) static W32_DISPATCH_SPAN_100NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static W32_DISPATCH_SPANNED: AtomicU64 = AtomicU64::new(0);
 
-/// ═══ THE BLOCKING-`NtUserGetMessage` GUARD ═══════════════════════════════════════════════════
-///
-/// `PREFLIGHT_PEEKS` counts the non-blocking `NtUserPeekMessage(PM_NOREMOVE)` the executive issues
-/// before ever letting a blocking `NtUserGetMessage` into win32k. The outcome counters classify
-/// every peek as ready, safely repopulated, or parked. An unhandled empty result would be a
-/// permanent system-wide hang: win32k is driven synchronously by the single-threaded service loop,
-/// so its wait would stop both the boot and the loop-top stall watchdog.
 pub(crate) static PROFILE_FRONTIER_TRACED: AtomicU64 = AtomicU64::new(0);
-/// The guard's kill switch — the BYPASS control. `false` restores the pre-batch behaviour exactly
-/// (a blocking `NtUserGetMessage` is dispatched straight into win32k), which is a permanent
-/// system-wide hang the moment one finds an empty queue.
-pub(crate) const GET_MESSAGE_EMPTY_QUEUE_GUARD: bool = false;
-pub(crate) static GET_MESSAGE_PREFLIGHT_PEEKS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static GET_MESSAGE_PREFLIGHT_READY: AtomicU64 = AtomicU64::new(0);
-pub(crate) static GET_MESSAGE_EMPTY_QUEUE_REPOPULATED: AtomicU64 = AtomicU64::new(0);
-pub(crate) static GET_MESSAGE_EMPTY_QUEUE_PARKS: AtomicU64 = AtomicU64::new(0);
 
 /// Record a win32k dispatch entry for the census, and tick the periodic heartbeat from inside the
 /// nested pump. Called from the SSN >= 0x1000 arm of the service loop.
@@ -10220,23 +10211,6 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_str(b"/");
     print_u64(delay_wait_store_fails);
     let (
-        gui_message_wait_live,
-        gui_message_wait_records,
-        gui_message_wait_cap,
-        gui_message_wait_alloc_fails,
-        gui_message_wait_store_fails,
-    ) = service_sec_image::gui_message_waiter_stats();
-    print_str(b" gui-msg-wait=");
-    print_u64(gui_message_wait_live as u64);
-    print_str(b"/");
-    print_u64(gui_message_wait_records as u64);
-    print_str(b"/");
-    print_u64(gui_message_wait_cap as u64);
-    print_str(b"/");
-    print_u64(gui_message_wait_alloc_fails);
-    print_str(b"/");
-    print_u64(gui_message_wait_store_fails);
-    let (
         object_wait_live,
         object_wait_records,
         object_wait_cap,
@@ -10670,7 +10644,10 @@ pub(crate) unsafe fn ke_gdi_flush_user_batch(
     if offset as u64 > previous {
         GDI_BATCH_MAX_OFFSET.store(offset as u64, Ordering::Relaxed);
     }
-    if client.process_role == Some(nt_exe_image::HostedProcessRole::InteractiveShell) {
+    let observation_role = hosted_process_runtime_for_pi(client.pi as usize)
+        .filter(|runtime| runtime.generation == client.generation)
+        .map(|runtime| runtime.observation_role);
+    if observation_role == Some(nt_exe_image::HostedProcessRole::InteractiveShell) {
         let first_flush = EXPLORER_GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed) == 0;
         EXPLORER_GDI_BATCH_RECORDS.fetch_add(count as u64, Ordering::Relaxed);
         if first_flush {
@@ -18512,9 +18489,6 @@ unsafe fn terminate_hosted_thread_mechanism(
         return false;
     }
     notify_thread_termination_ports(tid, handler);
-    if !crate::service_sec_image::gui_message_wait_abandon_thread(handler, tid) {
-        return false;
-    }
     if !release_hosted_thread_win32_context(tid, handler) {
         return false;
     }
@@ -23311,6 +23285,8 @@ struct ExecNtHandler {
     obj_ns: alloc::vec::Vec<ObjEntry>,
     /// Native image Section identities and their exact file-backed lifetime.
     image_sections: native_image_sections::NativeImageStore,
+    /// Canonical image execution references independent of their creator's Section handles.
+    process_image_owners: Vec<exec_handler::image_process_create::ProcessImageOwner>,
     /// Dispatcher state for every `obj_ns` event, keyed by the stable namespace index. The store
     /// owns manual/auto-reset and signal state; `obj_ns` owns names and identity.
     events: nt_kernel_exec::EventStore,
@@ -24298,6 +24274,23 @@ impl ExecFileCompletion {
     fn io_mode(&self, file_id: u64) -> Result<nt_io_completion::FileIoMode, u32> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).io_mode(file_id) }
+    }
+
+    fn update_io_mode_with(
+        &mut self,
+        file_id: u64,
+        expected_device: u64,
+        tid: u64,
+        expected_live_mode: nt_io_completion::FileIoMode,
+        next_mode: nt_io_completion::FileIoMode,
+        commit_body: impl FnOnce() -> Result<(), u32>,
+    ) -> Result<(), u32> {
+        // The canonical body commit is memory-only and cannot reenter this sole-owned table.
+        unsafe {
+            (&mut *self.table).update_io_mode_with(
+                file_id, expected_device, tid, expected_live_mode, next_mode, commit_body,
+            )
+        }
     }
 
     fn io_waiter_count(&self, file_id: u64) -> Result<u32, u32> {
@@ -28776,6 +28769,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             leaf: b"secimgtest.exe",
             process_name: "secimgtest.exe",
             role: nt_exe_image::HostedProcessRole::NonInteractiveService,
+            observation: None,
             nt_image_path: b"\\SystemRoot\\System32\\secimgtest.exe",
             command_line: b"secimgtest.exe",
             image_root: nt_exe_image::HostedImageRoot::System32,

@@ -17,7 +17,6 @@ const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xc000_009a;
 const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xc000_007b;
 const RETRY_DELAY: u64 = 1_000_000;
 const IMAGE_HEADER_READ_SIZE: usize = 0x1000;
-const IMAGE_HEADER_LIMIT: usize = 0x10000;
 
 pub(crate) struct ImageObjectName {
     pub(crate) root_index: usize,
@@ -109,6 +108,8 @@ struct Work {
     metadata_id: PendingSectionMetadataId,
     file_metadata: Option<nt_memory_manager::RoutedSectionMetadata>,
     image_header: Vec<u8>,
+    image_path: Option<Vec<u8>>,
+    observation_target: Option<nt_exe_image::CapturedImageObservation>,
     reserved: Option<ReservedSection>,
     published_handle: Option<u64>,
     phase: Phase,
@@ -144,20 +145,23 @@ pub(crate) unsafe fn submit_hosted(
     let nt_process::HandleObject::RoutedFile { file_id, device_id } = source.object() else {
         return Err(nt_fs::STATUS_INVALID_HANDLE);
     };
-    if allocation_attrs & 0x0100_0000 != 0 {
-        if !matches!(page_protection, 0x02 | 0x10 | 0x20)
-            || source.granted_access() & 0x20 == 0
-        {
-            return Err(nt_fs::STATUS_ACCESS_DENIED);
-        }
-    } else {
-        nt_memory_manager::data_section::check_data_section_file_access(
-            page_protection,
-            source.granted_access(),
-        )?;
+    if allocation_attrs & 0x0100_0000 != 0
+        && !matches!(page_protection, 0x02 | 0x10 | 0x20)
+    {
+        return Err(nt_fs::STATUS_ACCESS_DENIED);
     }
+    nt_memory_manager::data_section::check_data_section_file_access(
+        page_protection,
+        source.granted_access(),
+    )?;
     let mount = mounted_volume::mount_id_for_live_device(device_id).ok_or(0xc000_0020u32)?;
     let capture = driver_launch::hosted_file_capture::capture_native_section_source(source)?;
+    let observation_target = handler.capture_native_image_observation(file_handle);
+    let image_path = if allocation_attrs & 0x0100_0000 != 0 {
+        Some(capture.owned_image_path()?)
+    } else {
+        None
+    };
     let origin_driver = driver_launch::io_manager_mut()
         .device(DeviceId(device_id))
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
@@ -232,6 +236,8 @@ pub(crate) unsafe fn submit_hosted(
         metadata_id,
         file_metadata: None,
         image_header: Vec::new(),
+        image_path,
+        observation_target,
         reserved: None,
         published_handle: None,
         phase: Phase::Query,
@@ -575,29 +581,28 @@ unsafe fn advance(
                 work.phase = Phase::RevokeReply;
                 return Step::Progress;
             }
-            match nt_pe_loader::PeFile::parse(&work.image_header) {
-                Ok(_) => {
-                    work.phase = Phase::Publish;
-                    return Step::Progress;
-                }
-                Err(nt_pe_loader::PeError::Truncated) => {}
-                Err(_) => {
-                    work.status = STATUS_INVALID_IMAGE_FORMAT;
-                    work.phase = Phase::ReadyReply;
-                    return Step::Progress;
-                }
-            }
-            let metadata = work.file_metadata.expect("image header file metadata");
+            let metadata = work.file_metadata.expect("image file metadata");
             let offset = work.image_header.len();
-            let remaining = metadata.end_of_file.saturating_sub(offset as u64);
-            if offset >= IMAGE_HEADER_LIMIT || remaining == 0 || metadata.is_directory {
+            let Ok(file_size) = usize::try_from(metadata.end_of_file) else {
+                work.status = STATUS_INSUFFICIENT_RESOURCES;
+                work.phase = Phase::ReadyReply;
+                return Step::Progress;
+            };
+            if metadata.is_directory || file_size == 0 || offset > file_size {
                 work.status = STATUS_INVALID_IMAGE_FORMAT;
                 work.phase = Phase::ReadyReply;
                 return Step::Progress;
             }
-            let length = IMAGE_HEADER_READ_SIZE
-                .min(IMAGE_HEADER_LIMIT - offset)
-                .min(remaining as usize);
+            if offset as u64 == metadata.end_of_file {
+                if nt_pe_loader::PeFile::parse(&work.image_header).is_ok() {
+                    work.phase = Phase::Publish;
+                } else {
+                    work.status = STATUS_INVALID_IMAGE_FORMAT;
+                    work.phase = Phase::ReadyReply;
+                }
+                return Step::Progress;
+            }
+            let length = IMAGE_HEADER_READ_SIZE.min(file_size - offset);
             if work.image_header.try_reserve(length).is_err() {
                 work.status = STATUS_INSUFFICIENT_RESOURCES;
                 work.phase = Phase::ReadyReply;
@@ -735,6 +740,8 @@ unsafe fn advance(
                         capture,
                         metadata,
                         header: core::mem::take(&mut work.image_header),
+                        image_path: work.image_path.take().expect("captured image File name"),
+                        observation_target: work.observation_target,
                         name: work.image_name.take(),
                     },
                 ).map(ReservedSection::Image)

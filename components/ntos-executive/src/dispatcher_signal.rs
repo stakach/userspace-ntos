@@ -18,12 +18,8 @@ impl EventSignalSelector for Selector<'_> {
             DispatcherWaitSource::Native => {
                 object_waiter_oldest_event_consumer_sequence(self.handler, self.index)
             }
-            DispatcherWaitSource::Gui => unsafe {
-                service_sec_image::gui_message_wait_oldest_event_consumer_sequence(
-                    self.handler,
-                    self.event?,
-                )
-            },
+            // GUI queue waits execute inside win32k and use the Provider wait owner.
+            DispatcherWaitSource::Gui => None,
             DispatcherWaitSource::Provider => {
                 service_sec_image::provider_wait_oldest_event_consumer_sequence(
                     self.handler,
@@ -39,14 +35,7 @@ impl EventSignalSelector for Selector<'_> {
                 DispatcherWaitSource::Native => {
                     object_waiter_select_event_consumer(self.handler, self.index, sequence)
                 }
-                DispatcherWaitSource::Gui => {
-                    service_sec_image::gui_message_wait_select_event_consumer(
-                        self.handler,
-                        self.event
-                            .expect("GUI selection requires a canonical Event"),
-                        sequence,
-                    )
-                }
+                DispatcherWaitSource::Gui => unreachable!("no root GUI wait consumer"),
                 DispatcherWaitSource::Provider => {
                     service_sec_image::provider_wait_select_event_consumer(
                         self.handler,

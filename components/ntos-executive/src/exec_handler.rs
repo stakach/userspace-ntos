@@ -15,6 +15,9 @@ mod file_flush;
 #[path = "exec_file_capture.rs"]
 mod file_capture;
 
+#[path = "file_image_section.rs"]
+pub(crate) mod file_image_section;
+
 #[path = "exec_file_query.rs"]
 mod file_query;
 
@@ -27,11 +30,18 @@ mod file_set_information;
 #[path = "exec_hosted_file_set.rs"]
 mod hosted_file_set;
 
+#[path = "exec_file_acquisition.rs"]
+mod exec_file_acquisition;
+#[path = "exec_file_mode.rs"]
+mod exec_file_mode;
 #[path = "exec_local_file_io.rs"]
 mod local_file_io;
 
 #[path = "exec_virtual_memory_copy.rs"]
 mod virtual_memory_copy;
+
+#[path = "exec_registry_value_name.rs"]
+mod registry_value_name;
 
 #[path = "exec_virtual_memory_protect.rs"]
 mod virtual_memory_protect;
@@ -66,6 +76,9 @@ pub(crate) mod section_create;
 
 #[path = "exec_image_section_create.rs"]
 pub(crate) mod image_section_create;
+
+#[path = "exec_image_process_create.rs"]
+pub(crate) mod image_process_create;
 
 const INTERNAL_DISPATCHER_EVENT_BASE: u64 = 1 << 40;
 pub(crate) const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
@@ -971,7 +984,8 @@ impl nt_hive_core::ReactOsSetupSeedTarget for CollectSystemSetupSeedTarget {
 #[used]
 static NT_OPEN_FILE_SERVICE_ENTRY: ExecServiceHandler = exec_nt_open_file_service_entry;
 #[used]
-static NT_CREATE_PROCESS_SERVICE_ENTRY: ExecServiceHandler = exec_nt_create_process_service_entry;
+static NT_CREATE_PROCESS_SERVICE_ENTRY: unsafe extern "C" fn(*mut ExecNtHandler, *const u64, usize, u8) -> u32 =
+    exec_nt_create_process_service_entry;
 #[used]
 static NT_WAIT_FOR_DEBUG_EVENT_SERVICE_ENTRY: ExecServiceHandler =
     exec_nt_wait_for_debug_event_service_entry;
@@ -2376,9 +2390,15 @@ unsafe extern "C" fn exec_nt_create_process_service_entry(
     handler: *mut ExecNtHandler,
     args_ptr: *const u64,
     args_len: usize,
+    mode: u8,
 ) -> u32 {
     let args = unsafe { core::slice::from_raw_parts(args_ptr, args_len) };
-    unsafe { (&mut *handler).nt_create_process_service(args) }
+    let previous_mode = match mode {
+        0 => nt_syscall::ProcessorMode::KernelMode,
+        1 => nt_syscall::ProcessorMode::UserMode,
+        _ => return STATUS_INVALID_PARAMETER,
+    };
+    unsafe { (&mut *handler).nt_create_process_service(args, previous_mode) }
 }
 
 #[unsafe(no_mangle)]
@@ -3940,6 +3960,7 @@ impl ExecNtHandler {
         );
         write_field!(obj_ns, obj_ns);
         write_field!(image_sections, native_image_sections::NativeImageStore::new());
+        write_field!(process_image_owners, Vec::new());
         write_field!(events, events);
         write_field!(event_objects, event_objects);
         write_field!(provider_timers, provider_timers);
@@ -9315,6 +9336,10 @@ impl ExecNtHandler {
         self.hosted_process_image(pi).map(|image| image.role)
     }
 
+    pub(crate) fn hosted_process_observation_role(&self, pi: usize) -> Option<nt_exe_image::HostedProcessRole> {
+        self.hosted_process_image(pi).map(|image| image.observation_role())
+    }
+
     pub(crate) fn hosted_process_generation(&self, pi: usize) -> Option<u64> {
         self.process_mechanisms
             .get(pi)
@@ -9451,20 +9476,6 @@ impl ExecNtHandler {
 
     fn current_process_is_interactive_shell(&self) -> bool {
         self.current_process_has_role(nt_exe_image::HostedProcessRole::InteractiveShell)
-    }
-
-    fn current_process_uses_pe_backed_registry_strings(&self) -> bool {
-        matches!(
-            self.current_hosted_process_role(),
-            Some(
-                nt_exe_image::HostedProcessRole::InteractiveLogon
-                    | nt_exe_image::HostedProcessRole::ServiceControlManager
-                    | nt_exe_image::HostedProcessRole::LocalSecurityAuthority
-                    | nt_exe_image::HostedProcessRole::NonInteractiveService
-                    | nt_exe_image::HostedProcessRole::InteractiveShellBootstrap
-                    | nt_exe_image::HostedProcessRole::InteractiveShell
-            )
-        )
     }
 
     fn current_hosted_thread_role(&self) -> Option<HostedThreadRole> {
@@ -11555,12 +11566,6 @@ impl ExecNtHandler {
         &mut self,
         object: nt_kernel_exec::DispatcherSignalObject,
     ) -> u32 {
-        let transitioned_event = match object {
-            nt_kernel_exec::DispatcherSignalObject::Event(identity) => {
-                (!self.events.read_state(identity)).then_some(identity as usize)
-            }
-            _ => None,
-        };
         match nt_kernel_exec::signal_dispatcher_for_wait(
             &mut self.events,
             &mut self.semaphores,
@@ -11573,11 +11578,6 @@ impl ExecNtHandler {
                 // interleave between the two halves of NtSignalAndWaitForSingleObject.
                 unsafe {
                     let _ = wait_wake_dispatcher_set(self);
-                    if let Some(index) = transitioned_event {
-                        if let Some(id) = self.event_id_for_index(index) {
-                            crate::service_sec_image::gui_message_wait_select_level(self, id);
-                        }
-                    }
                 }
                 0
             }
@@ -12671,8 +12671,7 @@ impl ExecNtHandler {
         if iosb == 0 || !self.probe_user_output(iosb, 16) {
             return false;
         }
-        self.xas_try_write_buf(iosb, &status.to_le_bytes())
-            && self.xas_try_write_buf(iosb + 8, &information.to_le_bytes())
+        self.publish_file_io_status(iosb, status, information).is_ok()
     }
 
     unsafe fn nt_device_io_control_file_service(&mut self, args: &[u64]) -> u32 {
@@ -12888,7 +12887,7 @@ impl ExecNtHandler {
                     operation.notify_id,
                 );
             }
-            nt_io_manager::PendingFileIoOperation::LocalInline(_)
+            nt_io_manager::PendingFileIoOperation::OwnedInline(_)
             | nt_io_manager::PendingFileIoOperation::LocalBuffered(_)
             | nt_io_manager::PendingFileIoOperation::LocalFlush(_) => {}
             _ => {
@@ -17714,6 +17713,14 @@ impl ExecNtHandler {
                 let image = process_committed_image_allocation(target_pi as u64, plan.page)
                     .ok_or(nt_address_space::STATUS_NOT_COMMITTED)?;
                 let base = image.allocation_base;
+                let _image_reader = if base == PE_LOAD_BASE {
+                    let _durable = crate::allocator::enter_durable();
+                    let image = (&*ctx.exe_image_catalog).get_by_pi(target_pi)
+                        .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?;
+                    Some(crate::hosted_loaded_images::HostedImageReadScope::capture(
+                        ctx.hosted_loaded_images, nt_exe_image::SpawnTarget::from_image(image),
+                    ).map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?)
+                } else { None };
                 let pe = if base == PE_LOAD_BASE {
                     (&*ctx.hosted_loaded_images)
                         .pe_by_pi(target_pi)
@@ -20828,15 +20835,6 @@ impl ExecNtHandler {
                     {
                         return HostedProcessDeletionOutcome::Pending(candidate.phase);
                     }
-                    if !unsafe {
-                        crate::service_sec_image::gui_message_wait_abandon_process(
-                            self,
-                            pi,
-                            process_mechanism.generation,
-                        )
-                    } {
-                        return HostedProcessDeletionOutcome::Pending(candidate.phase);
-                    }
                     let thread_has_win32_context = self.pm.process(pid).is_some_and(|process| {
                         process
                             .threads
@@ -21034,6 +21032,7 @@ impl ExecNtHandler {
                         .release_exact(process_mechanism)
                         .expect("preflighted hosted process mechanism must retire exactly");
                     debug_assert_eq!(released.pid, pid);
+                    self.release_native_process_image(pi, pid, candidate.generation);
                     self.pool_used[pi] = 0;
                     self.drain_job_destructions();
                     self.refresh_process_manager_gates();
@@ -23341,13 +23340,17 @@ impl ExecNtHandler {
         output_va: u64,
         output_length: usize,
         result_length_va: u64,
+        query_arguments: Option<&[u64; 5]>,
     ) -> u32 {
         let Ok(result_length) = u32::try_from(information.len()) else {
             return STATUS_INSUFFICIENT_RESOURCES;
         };
         let result_length = result_length.to_le_bytes();
-        let result_length_written = self.xas_try_write_buf(result_length_va, &result_length);
-        if !result_length_written {
+        if let Err(failure) = self.process_memory_write_checked(self.pi, result_length_va, &result_length) {
+            if let Some(arguments) = query_arguments {
+                crate::registry_query_diagnostics::reject(self, b"result-length", arguments,
+                    STATUS_ACCESS_VIOLATION, Some(failure));
+            }
             return STATUS_ACCESS_VIOLATION;
         }
         if output_length < minimum_length {
@@ -23355,6 +23358,10 @@ impl ExecNtHandler {
         }
         let copy_len = output_length.min(information.len());
         if !self.xas_try_write_buf(output_va, &information[..copy_len]) {
+            if let Some(arguments) = query_arguments {
+                crate::registry_query_diagnostics::reject(self, b"output-copy", arguments,
+                    STATUS_ACCESS_VIOLATION, None);
+            }
             return STATUS_ACCESS_VIOLATION;
         }
         if output_length < information.len() {
@@ -24430,37 +24437,6 @@ impl ExecNtHandler {
             .map(|(_, _, _, signaled)| signaled)
     }
 
-    pub(crate) fn acquire_gui_event_wait(
-        &mut self,
-        body: u64,
-    ) -> Result<(nt_kernel_exec::EventObjectId, nt_kernel_exec::EventLeaseId), u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        let (id, _, kind, _) = self.provider_event_identity(body)?;
-        if !matches!(kind, nt_kernel_exec::EventKind::Synchronization) {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let lease = self
-            .event_objects
-            .acquire_wait(id, nt_kernel_exec::EventLeaseKind::GuiWait)
-            .map_err(|_| STATUS_INVALID_PARAMETER)?;
-        Ok((id, lease))
-    }
-
-    pub(crate) fn release_gui_event_wait(
-        &mut self,
-        lease: nt_kernel_exec::EventLeaseId,
-    ) -> Result<(), u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if let Some(retired) = self
-            .event_objects
-            .release_wait(lease, nt_kernel_exec::EventLeaseKind::GuiWait)
-            .map_err(|_| STATUS_INVALID_PARAMETER)?
-        {
-            self.finalize_retired_event_object(retired);
-        }
-        Ok(())
-    }
-
     pub(crate) fn event_ready_by_id(
         &self,
         id: nt_kernel_exec::EventObjectId,
@@ -24490,70 +24466,11 @@ impl ExecNtHandler {
             .ok_or(STATUS_INVALID_PARAMETER)
     }
 
-    pub(crate) fn queue_event_signal(
-        &mut self,
-        id: nt_kernel_exec::EventObjectId,
-    ) -> Result<(), u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        self.event_objects
-            .queue_signal(id)
-            .map(|_| ())
-            .map_err(|_| STATUS_INVALID_PARAMETER)
-    }
-
-    pub(crate) fn take_event_signal(&mut self) -> Option<nt_kernel_exec::PendingEventSignal> {
-        self.event_objects.take_next_signal()
-    }
-
-    pub(crate) fn queued_event_signal_count(&self) -> usize {
-        self.event_objects.queued_signal_count()
-    }
-
-    pub(crate) fn retry_event_signal(
-        &mut self,
-        id: nt_kernel_exec::EventObjectId,
-    ) -> Result<(), u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        self.event_objects
-            .retry_signal(id)
-            .map_err(|_| STATUS_INVALID_PARAMETER)
-    }
-
-    pub(crate) fn cancel_event_signal(
-        &mut self,
-        id: nt_kernel_exec::EventObjectId,
-    ) -> Result<(), u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if let Some(retired) = self
-            .event_objects
-            .cancel_signal(id)
-            .map_err(|_| STATUS_INVALID_PARAMETER)?
-        {
-            self.finalize_retired_event_object(retired);
-        }
-        Ok(())
-    }
-
     pub(crate) fn event_id_for_index(
         &self,
         index: usize,
     ) -> Option<nt_kernel_exec::EventObjectId> {
         self.event_objects.id_for_native(index as u64)
-    }
-
-    pub(crate) fn complete_event_signal(
-        &mut self,
-        id: nt_kernel_exec::EventObjectId,
-    ) -> Result<(), u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if let Some(retired) = self
-            .event_objects
-            .complete_signal(id)
-            .map_err(|_| STATUS_INVALID_PARAMETER)?
-        {
-            self.finalize_retired_event_object(retired);
-        }
-        Ok(())
     }
 
     pub(crate) fn provider_close_event(&mut self, pi: usize, handle: u64) -> Result<(), u32> {
@@ -28267,151 +28184,11 @@ impl ExecNtHandler {
         handle: u64,
         granted_access: u32,
     ) -> Result<bool, u32> {
-        const STATUS_USER_APC: u32 = 0x0000_00C0;
-        let wait_route = nt_io_manager::FileIoWaitRoute::Hosted {
+        self.prepare_owned_file_io(nt_io_manager::FileIoWaitRoute::Hosted {
             file_id: route.file_id,
             device_id: route.device_id,
             fs_context: route.fs_context,
-        };
-        let live_mode = self.file_completion.io_mode(route.file_id)?;
-        let retry = self.synchronous_file_retry_for(handle);
-        if self.active_synchronous_file_retry.is_some() && retry.is_none() {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let mode = if let Some(retry) = retry {
-            if retry.route != wait_route
-                || retry.mode.is_synchronous() != live_mode.is_synchronous()
-            {
-                return Err(STATUS_INVALID_PARAMETER);
-            }
-            retry.mode
-        } else {
-            live_mode
-        };
-        if mode == nt_io_completion::FileIoMode::Asynchronous {
-            self.file_completion.retain_file(route.file_id)?;
-            return Ok(true);
-        }
-
-        assert!(self.current_synchronous_file.is_none(),
-            "one syscall acquired more than one synchronous File");
-        let admission = crate::service_sec_image::inline_file_retirement::reserve(
-            nt_io_manager::FileIoBusyOwner {
-                key: nt_io_manager::FileIoWaitKey::Hosted(route.file_id),
-                tid: self.current_tid,
-                mode,
-            },
-        )?;
-
-        if retry.is_some() {
-            let mut ingress = self.active_synchronous_file_retry.take()
-                .expect("promoted File acquisition lost its ingress claim");
-            let identity = ingress.identity();
-            let mut attempt = match (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-                .begin_adoption(&mut ingress)
-            {
-                Ok(attempt) => attempt,
-                Err(error) => {
-                    let status = if error == nt_io_manager::SynchronousFileIngressError::Exhausted {
-                        STATUS_INSUFFICIENT_RESOURCES
-                    } else {
-                        nt_fs::STATUS_CANCELLED
-                    };
-                    let identity = (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-                        .reject_ingress(&mut ingress, status)
-                        .expect("unstarted File adoption lost its claim");
-                    crate::service_sec_image::synchronous_file_cancellation::drive(self, identity);
-                    return Err(status);
-                }
-            };
-            let result = self.file_completion.adopt_io_grant(route.file_id, self.current_tid);
-            let adopted = (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-                .record_adoption(&mut attempt, result)
-                .expect("File adoption receipt lost its entered owner");
-            if let Some(owner) = adopted {
-                // The policy transition and transfer are memory-only. No callback can request
-                // cancellation between grant adoption and publication of current-syscall Busy.
-                assert!(!owner.cancellation_requested());
-                self.current_synchronous_file = Some(admission.activate());
-                return Ok(true);
-            }
-            crate::service_sec_image::synchronous_file_cancellation::drive(self, identity);
-            return Err(result.expect_err("rejected File adoption reported success"));
-        }
-
-        let reservation = (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-            .reserve().ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
-        if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free() {
-            assert!((&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-                .cancel_reservation(reservation));
-            return Err(STATUS_INSUFFICIENT_RESOURCES);
-        }
-        let mut waiter = nt_io_manager::SynchronousFileWaiter::waiting(
-            wait_route, handle as u32, granted_access, self.current_service_number,
-            self.pi as u32, self.current_tid, self.current_badge, mode,
-            self.current_native_call_transport, 0, self.current_resume_ip,
-            self.current_sp, self.current_flags,
-        );
-        // Capture before counting contention: copyin can re-enter the executive. A bad retry
-        // frame matters only if this acquisition actually needs to park.
-        let retry_ip = if waiter.native_call_transport {
-            Ok(0)
-        } else if let Some(ip) = waiter.resume_ip.checked_sub(2) {
-            let mut syscall = [0u8; 2];
-            if self.xas_read(ip, &mut syscall) && syscall == [0x0f, 0x05] {
-                Ok(ip)
-            } else {
-                Err(STATUS_ACCESS_VIOLATION)
-            }
-        } else {
-            Err(STATUS_ACCESS_VIOLATION)
-        };
-        if self.file_completion.is_synchronous(route.file_id) != Ok(mode.is_synchronous()) {
-            assert!((&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-                .cancel_reservation(reservation));
-            return Err(STATUS_INVALID_HANDLE);
-        }
-        match self.file_completion.acquire_file_io_with_mode(route.file_id, waiter.tid, mode) {
-            Ok(nt_io_completion::FileIoAcquireResult::Acquired) => {
-                assert!((&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-                    .cancel_reservation(reservation));
-                self.current_synchronous_file = Some(admission.activate());
-                Ok(true)
-            }
-            Ok(nt_io_completion::FileIoAcquireResult::Contended { alertable }) => {
-                let apc_queued = alertable && self.pm.peek_user_apc(waiter.tid as u32).is_some();
-                if apc_queued || retry_ip.is_err() {
-                    if !crate::service_sec_image::synchronous_file_cancellation::cancel_unpublished(
-                        self, reservation, waiter,
-                    ) {
-                        return Err(STATUS_UNSUCCESSFUL);
-                    }
-                    if !apc_queued {
-                        return Err(retry_ip.expect_err("File rollback lost its retry-frame refusal"));
-                    }
-                    // No counted File acquisition remains when APC staging takes ownership of
-                    // the current syscall's still-untransferred reply.
-                    return match self.try_deliver_current_user_apc(STATUS_USER_APC) {
-                        Ok(true) => Err(STATUS_USER_APC),
-                        Ok(false) => Err(STATUS_UNSUCCESSFUL),
-                        Err(status) => Err(status),
-                    };
-                }
-                waiter.retry_ip = retry_ip.expect("parked File lost its captured retry frame");
-                assert!(self.pending_synchronous_file_wait.is_none());
-                self.pending_synchronous_file_wait = Some((waiter, reservation));
-                Ok(false)
-            }
-            Ok(nt_io_completion::FileIoAcquireResult::Bypassed) => {
-                unreachable!("synchronous File admission bypassed its captured mode")
-            }
-            Err(status) => {
-                // Atomic admission rejected before retaining a reference or counting a waiter.
-                assert!((&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-                    .cancel_reservation(reservation));
-                Err(status)
-            }
-        }
+        }, handle, granted_access)
     }
 
     /// Reference an optional file-I/O event with EVENT_MODIFY_STATE and clear it before the IRP is
@@ -32249,7 +32026,7 @@ impl ExecNtHandler {
     }
 
     #[inline(never)]
-    unsafe fn nt_create_process_service(&mut self, args: &[u64]) -> u32 {
+    unsafe fn nt_create_process_service(&mut self, args: &[u64], previous_mode: nt_syscall::ProcessorMode) -> u32 {
         let legacy = self.current_service_number == SSN_NT_CREATE_PROCESS as u32;
         let create = match nt_process::decode_process_create_input(args, !legacy) {
             Ok(create) => create,
@@ -32279,6 +32056,14 @@ impl ExecNtHandler {
             || create.exception_port != 0
         {
             return STATUS_NOT_SUPPORTED;
+        }
+        match self.reserve_native_image_process(parent, create, nt_ulong_arg(args[1]), args[0], previous_mode) {
+            Ok(Some(request)) => {
+                self.exe_spawn_request = Some(request);
+                return 0;
+            }
+            Ok(None) => {}
+            Err(status) => return status,
         }
         let ctx = self.loop_ctx.unwrap();
         let sect = create.section_handle;
@@ -33211,6 +32996,7 @@ impl ExecNtHandler {
                         args[3],
                         output_length,
                         args[5],
+                        None,
                     );
                     trace_winlogon_post_lsa_registry(
                         self,
@@ -33259,6 +33045,7 @@ impl ExecNtHandler {
                     args[3],
                     output_length,
                     args[5],
+                    None,
                 );
                 trace_winlogon_post_lsa_registry(
                     self,
@@ -33277,11 +33064,15 @@ impl ExecNtHandler {
             // key's owning authority: CM for leased SYSTEM identities, otherwise the executive's
             // mounted/overlay namespaces.
             NativeService::NtQueryKey => unsafe {
+                let query_arguments = [args[0], args[1], args[2], args[3], args[4]];
                 let info_class = nt_ulong_arg(args[1]);
                 let required_access = if info_class == 3 { 0 } else { 0x1 };
                 let key = match self.resolve_registry_key(args[0], required_access) {
                     Ok(key) => key,
-                    Err(status) => return status,
+                    Err(status) => {
+                        crate::registry_query_diagnostics::reject(self, b"key-owner", &query_arguments, status, None);
+                        return status;
+                    }
                 };
                 let _transient = allocator::enter_transient();
                 let output_length = nt_ulong_arg(args[3]) as usize;
@@ -33292,7 +33083,10 @@ impl ExecNtHandler {
                                 lease,
                             ) {
                                 Ok(information) => Some(information),
-                                Err(status) => return status as u32,
+                                Err(status) => {
+                                    crate::registry_query_diagnostics::reject(self, b"leased-information", &query_arguments, status as u32, None);
+                                    return status as u32;
+                                }
                             }
                         }
                         None => None,
@@ -33301,7 +33095,10 @@ impl ExecNtHandler {
                     Some(information) => RegistryKeyStats::from_leased_key(information),
                     None => match self.registry_key_stats(key) {
                         Ok(stats) => stats,
-                        Err(status) => return status,
+                        Err(status) => {
+                            crate::registry_query_diagnostics::reject(self, b"key-stats", &query_arguments, status, None);
+                            return status;
+                        }
                     },
                 };
                 let full_path = leased_information.as_ref().map_or_else(
@@ -33312,7 +33109,10 @@ impl ExecNtHandler {
                     Some(information) => information.class_name.clone(),
                     None => match self.registry_key_class(key) {
                         Ok(class_name) => class_name,
-                        Err(status) => return status,
+                        Err(status) => {
+                            crate::registry_query_diagnostics::reject(self, b"key-class", &query_arguments, status, None);
+                            return status;
+                        }
                     },
                 };
                 let (info, minimum_length) = match build_registry_key_query_info(
@@ -33322,7 +33122,10 @@ impl ExecNtHandler {
                     class_name.as_deref(),
                 ) {
                     Ok(info) => info,
-                    Err(status) => return status,
+                    Err(status) => {
+                        crate::registry_query_diagnostics::reject(self, b"information-class", &query_arguments, status, None);
+                        return status;
+                    }
                 };
                 if Self::is_dynamic_user_volatile_env_canon(&full_path) {
                     USER_VOLATILE_ENV_QUERIED.fetch_add(1, Ordering::Relaxed);
@@ -33335,6 +33138,7 @@ impl ExecNtHandler {
                     args[2],
                     output_length,
                     args[4],
+                    Some(&query_arguments),
                 )
             },
             // NtCreateNamedPipeFile(FileHandle[R10], DesiredAccess[RDX], ObjectAttributes[R8],
@@ -33759,13 +33563,7 @@ impl ExecNtHandler {
                 {
                     return 0xC000_0005;
                 }
-                // Hosted GUI/service processes commonly pass value names from DLL `.rdata` literals the
-                // stack/heap mirror can't reach, so read them from the backing PE (`read_ustr_pe`).
-                // read_ustr_pe uses xas_read → resolves any resident/PE page.
                 let key_path = self.registry_target_path(key);
-                let key_is_ifeo = key_path
-                    .as_deref()
-                    .is_some_and(|path| path.contains(r"\image file execution options\"));
                 let shell_com_inproc_bit = if self.current_process_is_interactive_shell() {
                     key_path
                         .as_deref()
@@ -33773,14 +33571,10 @@ impl ExecNtHandler {
                 } else {
                     0
                 };
-                let pe_backed_registry_strings =
-                    self.current_process_uses_pe_backed_registry_strings();
-                let name16 =
-                    if pe_backed_registry_strings || key_is_ifeo || shell_com_inproc_bit != 0 {
-                        self.read_ustr_pe(args[1])
-                    } else {
-                        smss_read_ustr(args[1])
-                    };
+                let name16 = match self.capture_registry_value_name(args[1]) {
+                    Ok(name) => name,
+                    Err(status) => return status,
+                };
                 let mut name_lc = alloc::string::String::new();
                 for &w in &name16 {
                     if let Some(c) = char::from_u32(w as u32) {
@@ -34982,9 +34776,8 @@ impl ExecNtHandler {
                 // LSASS connects during LsapRmInitializeServer; the executive owns the SRM side, drains
                 // the broker's connection request, accepts it, and completes it through the same LPC
                 // state machine as the user-mode SM/CSR/LSA rendezvous paths.
-                if self.current_process_is_lsass()
-                    && Self::lpc_name_equals_ascii(&name16, b"\\sermcommandport")
-                {
+                let srm_listen_handle = SRM_COMMAND_PORT_OBJECT_HANDLE.load(Ordering::Acquire);
+                if srm_listen_handle != 0 && listen_handle == srm_listen_handle {
                     if connector_view.is_some() || connector_remote_view.is_some() {
                         return STATUS_INVALID_PARAMETER;
                     }
@@ -41123,7 +40916,11 @@ impl ExecNtHandler {
                 if iosb == 0 || !self.probe_user_output(iosb, 16) {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                if !self.probe_user_input(args[2], length) {
+                if information_class == nt_fs::FILE_MODE_INFORMATION {
+                    if let Err(status) = self.probe_file_mode_input_extent(args[2], length) {
+                        return status;
+                    }
+                } else if !self.probe_user_input(args[2], length) {
                     return STATUS_ACCESS_VIOLATION;
                 }
                 let capture = match self.capture_hosted_file_unless_local_with_access(
@@ -41132,6 +40929,11 @@ impl ExecNtHandler {
                     Ok(capture) => capture,
                     Err(status) => return status,
                 };
+                if let Some(status) = self.try_set_file_mode_information(
+                    args[0], iosb, args[2], length, information_class, capture.as_ref(),
+                ) {
+                    return status;
+                }
                 if let Some(capture) = capture.as_ref() {
                     return self.set_hosted_file_information(
                         args[0], iosb, args[2], length, information_class, capture,
@@ -41587,21 +41389,37 @@ impl ExecNtHandler {
                 const STATUS_INVALID_FILE_FOR_SECTION: u32 = 0xC000_0020;
                 let previous_mode = ctx.previous_mode;
                 let ctx = self.loop_ctx.unwrap();
-                let reg = &mut *ctx.reg;
                 let out = args[0];
                 let desired_access = nt_ulong_arg(args[1]);
+                let page_protection = nt_ulong_arg(args[4]);
+                let allocation_attrs = nt_ulong_arg(args[5]);
+                if let Err(status) = nt_memory_manager::validate_section_creation_parameters(
+                    allocation_attrs, page_protection,
+                ) {
+                    return status;
+                }
+                if previous_mode != nt_syscall::ProcessorMode::KernelMode {
+                    if let Err(status) = self.probe_copy_scalar::<8>(out) {
+                        return status;
+                    }
+                }
                 let maxsize_ptr = args[3];
                 let mut maxsize = 0u64;
                 if maxsize_ptr != 0 {
+                    if previous_mode != nt_syscall::ProcessorMode::KernelMode && maxsize_ptr & 7 != 0 {
+                        return STATUS_DATATYPE_MISALIGNMENT;
+                    }
                     let mut bytes = [0u8; 8];
-                    if !self.xas_read(maxsize_ptr, &mut bytes) {
-                        return STATUS_ACCESS_VIOLATION;
+                    if let Err(status) = self.process_memory_read_status(self.pi, maxsize_ptr, &mut bytes) {
+                        return status;
                     }
                     maxsize = u64::from_le_bytes(bytes);
                 }
-                let page_protection = nt_ulong_arg(args[4]);
-                let allocation_attrs = nt_ulong_arg(args[5]);
+                if let Err(status) = nt_memory_manager::data_section::data_section_file_access(page_protection) {
+                    return status;
+                }
                 let sec_file = args[6];
+                let reg = &mut *ctx.reg;
                 let registry_slot = reg.index_for_file(self.pi, sec_file);
 
                 if allocation_attrs & SEC_IMAGE != 0 {
@@ -41610,7 +41428,9 @@ impl ExecNtHandler {
                         Err(status) => return status,
                     };
                     if let Ok(source) = self.pm.lookup_native_section_file_source(caller, sec_file) {
-                        if matches!(source.object(), nt_process::HandleObject::RoutedFile { .. }) {
+                        if matches!(source.object(), nt_process::HandleObject::RoutedFile { .. }
+                            | nt_process::HandleObject::DiskFile { .. }
+                            | nt_process::HandleObject::OverlayFile(_)) {
                             let mut image_object_attributes = 0;
                             let named = if args[2] == 0 {
                                 None
@@ -41640,14 +41460,25 @@ impl ExecNtHandler {
                                     None
                                 }
                             };
-                            return match crate::section_metadata_work::submit_hosted(
-                                self, caller, source, out, desired_access,
-                                image_object_attributes,
-                                maxsize, page_protection, allocation_attrs, sec_file, named,
-                            ) {
-                                Ok(()) => 0x0000_0103,
-                                Err(status) => status,
-                            };
+                            match source.object() {
+                                nt_process::HandleObject::DiskFile { .. }
+                                | nt_process::HandleObject::OverlayFile(_) => {
+                                    return crate::file_image_section::submit_local_image_section(
+                                        self, caller, source, out, desired_access,
+                                        image_object_attributes, maxsize, page_protection,
+                                        allocation_attrs, sec_file, named,
+                                    );
+                                }
+                                nt_process::HandleObject::RoutedFile { .. } => return match crate::section_metadata_work::submit_hosted(
+                                    self, caller, source, out, desired_access,
+                                    image_object_attributes,
+                                    maxsize, page_protection, allocation_attrs, sec_file, named,
+                                ) {
+                                    Ok(()) => 0x0000_0103,
+                                    Err(status) => status,
+                                },
+                                _ => unreachable!("validated image File source"),
+                            }
                         }
                     }
                     let exe_known = (&*ctx.exe_images)
@@ -42146,7 +41977,8 @@ impl ExecNtHandler {
             NativeService::NtCreateProcess | NativeService::NtCreateProcessEx => unsafe {
                 let service =
                     core::ptr::read_volatile(core::ptr::addr_of!(NT_CREATE_PROCESS_SERVICE_ENTRY));
-                service(self as *mut ExecNtHandler, args.as_ptr(), args.len())
+                service(self as *mut ExecNtHandler, args.as_ptr(), args.len(),
+                    u8::from(ctx.previous_mode == nt_syscall::ProcessorMode::UserMode))
             },
             // NtTerminateProcess(ProcessHandle[R10]=args[0], ExitStatus[RDX]=args[1]). Route NT's two
             // user-mode shutdown phases through pm: NULL means terminate every other thread and return
@@ -42201,9 +42033,13 @@ impl ExecNtHandler {
                         Ok(files) => files,
                         Err(status) => return status,
                     };
+                    let was_terminated = self.pm.is_process_signaled(pid);
                     if let Err(status) = self.pm.terminate_process_at(pid, status, exit_time) {
                         self.cancel_rundown_hosted_files(&reserved_files);
                         return status;
+                    }
+                    if !was_terminated {
+                        crate::process_terminal_receipt::note_native_process_terminal(self, pid, process_index);
                     }
                     self.release_process_handles(pid, reserved_files);
                     if let Some(process_index) = process_index {
@@ -42283,13 +42119,7 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 };
                 let exit_time = nt_system_time_100ns() as i64;
-                let outcome = if self.current_process_is_csrss()
-                    && self.pm.main_thread(caller_pid) == Some(target)
-                {
-                    self.pm.exit_thread_at(target, status, exit_time)
-                } else {
-                    self.pm.terminate_thread_at(target, status, exit_time)
-                };
+                let outcome = self.pm.terminate_thread_at(target, status, exit_time);
                 if let Err(status) = outcome {
                     self.cancel_rundown_hosted_files(&reserved_files);
                     return status;

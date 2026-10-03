@@ -79,6 +79,25 @@ pub(crate) unsafe fn quiescent() -> bool {
     rows().is_empty() && wait_receipts().is_empty()
 }
 
+/// The publication lease held by the caller fences this exact root-owned allocation.
+pub(crate) unsafe fn mode_projection_address(identity: HostedFileIdentity) -> Result<Option<u64>, u32> {
+    let Some(owner) = rows().iter().find(|row| row.identity == Some(identity)) else {
+        return Ok(None);
+    };
+    if owner.phase != Phase::Live || owner.file_id != identity.file_id()
+        || owner.address != identity.address()
+    {
+        return Err(STATUS_INVALID_HANDLE as u32);
+    }
+    let allocation = owner.allocation.ok_or(STATUS_INVALID_HANDLE as u32)?;
+    if allocation.address() != owner.address
+        || allocation.length() < WDM_X64_FILE_OBJECT_SIZE as u64
+    {
+        return Err(STATUS_INVALID_HANDLE as u32);
+    }
+    Ok(Some(allocation.address()))
+}
+
 /// Admit an embedded FILE_OBJECT Event only while the exact projection is still referenced.
 /// The row pin is recorded before acquiring independently owned canonical receipts, so
 /// retirement cannot recycle its address during any external I/O-manager operation.

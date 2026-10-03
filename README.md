@@ -75,6 +75,10 @@ zero completion information.
 The optional `tests/native/source_irp/run.sh` profile checks real fileless READ/WRITE
 and all four IOCTL methods through win32k, including immediate and pending completion.
 It verifies bytes, IOSBs and retirement counters; production images omit its fixtures.
+The optional [native File acceptance profile](tests/native/file_acceptance/README.md)
+launches a public-ntdll-only executable through real SMSS to check relative opens,
+FileAll metadata and user-buffer fault precedence. Its process-exit receipts are
+separate from the whole-OS and screenshot gates.
 
 The kernel is a **pinned git submodule**, not vendored source: `userspace-ntos`
 depends on an exact kernel SHA (its syscall/invocation ABI is tightly coupled),

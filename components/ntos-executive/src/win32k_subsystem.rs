@@ -552,6 +552,8 @@ pub const HOSTED_PROCESS_ROLE_INTERACTIVE_SHELL_BOOTSTRAP: u64 = 5;
 pub const HOSTED_PROCESS_ROLE_INTERACTIVE_SHELL: u64 = 6;
 pub const HOSTED_PROCESS_ROLE_SERVICE_CONTROL_MANAGER: u64 = 7;
 pub const HOSTED_PROCESS_ROLE_LOCAL_SECURITY_AUTHORITY: u64 = 8;
+pub const HOSTED_PROCESS_ROLE_NATIVE_APPLICATION: u64 = 9;
+pub const HOSTED_PROCESS_ROLE_APPLICATION: u64 = 10;
 
 /// The registered win32k service metadata published by `KeAddSystemServiceTable`.
 ///
@@ -1189,7 +1191,6 @@ const THREADINFO_HDESK_OFF: u64 = 0xD8;
 /// pointer at +0x140. `IntMsqSetWakeMask` returns the handle to user32 and `MsqWakeQueue` signals the
 /// server pointer.
 const THREADINFO_HEVENT_QUEUE_CLIENT_OFF: u64 = 0x138;
-const THREADINFO_PEVENT_QUEUE_SERVER_OFF: u64 = 0x140;
 /// THREADINFO->PtiLink offset, membership in DESKTOP.PtiList.
 const THREADINFO_PTI_LINK_OFF: u64 = 0x148;
 /// KL layout and CLIENTINFO.{hKL,CodePage}. ReactOS' `tagKL` starts with `HEAD` (16 bytes on x64),
@@ -9714,15 +9715,6 @@ static WIN32K_CLIENT_SYSTEM_FONT_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_SYSTEM_FONT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_SET_THREAD_DESKTOP_PREPARES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_TICK_COUNT: AtomicU64 = AtomicU64::new(1);
-
-pub(crate) unsafe fn current_thread_queue_event_body() -> Option<u64> {
-    let w32thread = current_w32thread();
-    if w32thread == 0 {
-        return None;
-    }
-    let body = read_volatile((w32thread + THREADINFO_PEVENT_QUEUE_SERVER_OFF) as *const u64);
-    (body != 0).then_some(body)
-}
 
 /// Current process identity for the explicitly selected initialization or hosted caller.
 extern "win64" fn s_current_process_id() -> u64 {

@@ -12,6 +12,7 @@ use nt_hosted_runtime::{DynamicRuntimeArena, ProcessRuntimeLayout};
 pub(crate) struct HostedProcessRuntime {
     pub(crate) pi: usize,
     pub(crate) generation: u64,
+    pub(crate) observation_role: nt_exe_image::HostedProcessRole,
     pub(crate) priority: u64,
     pub(crate) env_scratch_va: u64,
     pub(crate) stack_mirror_va: u64,
@@ -293,6 +294,8 @@ fn address_layout_for_image(
     image: nt_exe_image::HostedProcessImageRef<'_>,
 ) -> Option<HostedProcessAddressLayout> {
     match image.role {
+        nt_exe_image::HostedProcessRole::NativeApplication
+        | nt_exe_image::HostedProcessRole::Application => dynamic_layout(image.pi),
         nt_exe_image::HostedProcessRole::NativeSession if image.pi == 0 => {
             Some(HostedProcessAddressLayout {
                 scratch_base: SMSS_SCRATCH_BASE,
@@ -336,6 +339,7 @@ fn runtime_for_image(
     Ok(HostedProcessRuntime {
         pi: image.pi,
         generation: image.generation,
+        observation_role: image.observation_role(),
         priority: HOSTED_PROCESS_DEFAULT_PRIORITY,
         env_scratch_va: layout.env_scratch_va,
         stack_mirror_va: layout.stack_mirror_va,

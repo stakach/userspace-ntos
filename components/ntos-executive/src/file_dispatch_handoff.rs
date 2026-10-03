@@ -54,10 +54,15 @@ pub(super) unsafe fn before_post_action(
         if let Some(identity) = nt_handler.current_synchronous_file {
             let owner = inline_file_retirement::active_owner(identity);
             assert_eq!(
-                pending
-                    .route
-                    .hosted_file_id()
-                    .map(nt_io_manager::FileIoWaitKey::Hosted),
+                match pending.route {
+                    nt_io_manager::PendingFileRoute::Hosted(file) => {
+                        Some(nt_io_manager::FileIoWaitKey::Hosted(file))
+                    }
+                    nt_io_manager::PendingFileRoute::Local(nt_io_manager::LocalFileObject::Overlay(file)) => {
+                        Some(nt_io_manager::FileIoWaitKey::LocalOverlay(file))
+                    }
+                    nt_io_manager::PendingFileRoute::Local(_) => None,
+                },
                 Some(owner.key)
             );
             assert_eq!(pending.tid, owner.tid);
@@ -71,7 +76,8 @@ pub(super) unsafe fn before_post_action(
         // The source remains in the handler until publication succeeds. Continuing synchronous
         // calls attach their reply in this same commit, never exposing an unarmed delivery row.
         let identity = reservation.identity();
-        let local_terminal = pending.local_terminal_result().is_some();
+        let local_terminal = pending.owned_terminal_result().is_some()
+            || matches!(pending.operation, nt_io_manager::PendingFileIoOperation::OwnedModePrecommit(_));
         pending_file_io_transfer(
             pending,
             wait_for_completion,

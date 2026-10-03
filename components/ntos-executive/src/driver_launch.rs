@@ -144,6 +144,10 @@ mod hosted_create_security_graph;
 mod hosted_file_objects;
 #[path = "hosted_reparse_name.rs"]
 mod hosted_reparse_name;
+#[path = "hosted_file_mode.rs"]
+mod hosted_file_mode;
+pub(crate) use hosted_file_mode::prepare as prepare_hosted_file_mode;
+pub(crate) use hosted_file_mode::PreparationError as FileModePreparationError;
 #[path = "hosted_consumer_file_objects.rs"]
 pub(crate) mod hosted_consumer_file_objects;
 #[path = "hosted_io_create_file_adapter.rs"]

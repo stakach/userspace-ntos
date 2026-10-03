@@ -300,11 +300,13 @@ pub(crate) unsafe fn map(
         return Err(status);
     }
     (*mapping).published = true;
-    print_str(b"[kernel-section-map] pointer=0x"); print_hex_u64(address);
+    print_str(b"[kernel-section-map] pointer="); print_hex_u64(address);
     print_str(b" native-generation=");
     print_u64((*row).allocation.unwrap().packet_lease().native_identity().allocation_generation);
     print_str(b" view-generation="); print_u64(view.generation);
-    print_str(b" base=0x"); print_hex_u64(base);
+    print_str(b" provider-domain="); print_u64(view.owner.domain);
+    print_str(b" provider-generation="); print_u64(view.owner.generation);
+    print_str(b" base="); print_hex_u64(base);
     print_str(b" bytes="); print_u64(size);
     print_str(b" pages="); print_u64(rounded / 0x1000); print_str(b"\n");
     Ok((base, size))
@@ -347,6 +349,24 @@ unsafe fn retire_mapping(sections: *mut GenericSectionTable, mapping: *mut Mappi
     Ok(())
 }
 
+unsafe fn capture_retirement(
+    row: *const Object,
+    mapping: *const Mapping,
+) -> Option<crate::provider_section_receipts::RetirementReceipt> {
+    if !(*mapping).published { return None; }
+    let native = (*row).allocation?.packet_lease().native_identity();
+    let provider = provider_identity((*row).physical).ok()?;
+    Some(crate::provider_section_receipts::RetirementReceipt {
+        pointer: (*row).address,
+        native_generation: native.allocation_generation,
+        view_generation: (*mapping).view.generation,
+        provider_domain: provider.domain,
+        provider_generation: provider.generation,
+        base: (*mapping).view.base,
+        remaining_references: (*row).references.len() as u64,
+    })
+}
+
 pub(crate) unsafe fn unmap(
     handler: *mut ExecNtHandler, base: u64, physical: runtime::PhysicalSource,
 ) -> Result<(), u32> {
@@ -357,7 +377,9 @@ pub(crate) unsafe fn unmap(
             .map(|index| (&mut **row as *mut Object, index))).ok_or(INVALID)?;
     let mapping = &mut *(&mut (*row).maps)[index] as *mut Mapping;
     (*mapping).retiring = true;
+    let receipt = capture_retirement(row, mapping);
     retire_mapping(sections, mapping)?;
+    crate::provider_section_receipts::unmap_retired(receipt);
     (*row).maps.swap_remove(index);
     if (*row).retiring { let _ = retire_object(row); }
     Ok(())
@@ -393,7 +415,9 @@ pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) {
         let mut index = 0;
         while index < (*row).maps.len() {
             let mapping = &mut *(&mut (*row).maps)[index] as *mut Mapping;
+            let receipt = capture_retirement(row, mapping);
             if (*mapping).retiring && !(*mapping).uncertain && retire_mapping(sections, mapping).is_ok() {
+                crate::provider_section_receipts::unmap_retired(receipt);
                 (*row).maps.swap_remove(index);
             } else { index += 1; }
         }

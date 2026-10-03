@@ -854,6 +854,9 @@ fn invoke(handle: u64, iosb: u64, output: u64, length: u32, operation: Operation
     if iosb == 0 || (length != 0 && output == 0) {
         return STATUS_INVALID_PARAMETER;
     }
+    if iosb.checked_add(15).is_none() {
+        return nt_address_space::STATUS_ACCESS_VIOLATION as i32;
+    }
     let total = match wire::packet_len(length) {
         Ok(total) if (total as u64) < FSD_POOL_FRAMES * 0x1000 => total,
         _ => return STATUS_INVALID_BUFFER_SIZE as i32,
@@ -916,10 +919,18 @@ fn invoke(handle: u64, iosb: u64, output: u64, length: u32, operation: Operation
             if copied != 0 {
                 core::ptr::copy_nonoverlapping(bytes.as_ptr(), output as *mut u8, copied);
             }
-            write_unaligned(iosb as *mut u32, terminal);
-            write_unaligned((iosb + 8) as *mut u64, information);
         }
-        terminal as i32
+        match nt_address_space::native_output::publish_file_io_status_checked(
+            iosb, terminal, information, |address, bytes| {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len());
+                }
+                Ok(())
+            },
+        ) {
+            Ok(()) => terminal as i32,
+            Err(failure) => failure.status() as i32,
+        }
     } else {
         status as u32 as i32
     };

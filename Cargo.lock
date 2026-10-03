@@ -217,8 +217,10 @@ version = "0.1.0"
 name = "nt-compat-exports"
 version = "0.1.0"
 dependencies = [
+ "nt-exe-image",
  "nt-kernel-abi",
  "nt-kernel-exec",
+ "nt-pe-loader",
  "nt-process",
  "syn",
 ]

@@ -1750,6 +1750,12 @@ fn callback_process_role_code(role: Option<nt_exe_image::HostedProcessRole>) -> 
         Some(nt_exe_image::HostedProcessRole::InteractiveShell) => {
             win32k_subsystem::HOSTED_PROCESS_ROLE_INTERACTIVE_SHELL as u32
         }
+        Some(nt_exe_image::HostedProcessRole::NativeApplication) => {
+            win32k_subsystem::HOSTED_PROCESS_ROLE_NATIVE_APPLICATION as u32
+        }
+        Some(nt_exe_image::HostedProcessRole::Application) => {
+            win32k_subsystem::HOSTED_PROCESS_ROLE_APPLICATION as u32
+        }
         None => win32k_subsystem::HOSTED_PROCESS_ROLE_NONE as u32,
     }
 }
@@ -1779,6 +1785,12 @@ fn callback_process_role_from_code(code: u32) -> Option<nt_exe_image::HostedProc
         }
         win32k_subsystem::HOSTED_PROCESS_ROLE_INTERACTIVE_SHELL => {
             Some(nt_exe_image::HostedProcessRole::InteractiveShell)
+        }
+        win32k_subsystem::HOSTED_PROCESS_ROLE_NATIVE_APPLICATION => {
+            Some(nt_exe_image::HostedProcessRole::NativeApplication)
+        }
+        win32k_subsystem::HOSTED_PROCESS_ROLE_APPLICATION => {
+            Some(nt_exe_image::HostedProcessRole::Application)
         }
         _ => None,
     }
@@ -2303,51 +2315,8 @@ unsafe fn remember_active_dispatch_arg_snapshot(
         .is_ok()
 }
 
-fn winlogon_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -> Option<u64> {
-    let winlogon_pi = callback_client_owner_pi(client)?;
-    if !callback_client_is_winlogon(client) || client.tid == 0 {
-        return None;
-    }
-    let alias = match client.role {
-        Some(HostedThreadRole::Main) => WINLOGON_MAIN_TEB_MIRROR_VA,
-        Some(HostedThreadRole::WinlogonListener) => {
-            WINLOGON_WORKER_STACK_MIRROR_VA + WL_LISTENER_STACK_FRAMES * 0x1000
-        }
-        Some(HostedThreadRole::WinlogonWorker { slot: 1 }) => {
-            WINLOGON_WORKER2_STACK_MIRROR_VA + WL_WORKER2_STACK_FRAMES * 0x1000
-        }
-        Some(HostedThreadRole::WinlogonWorker { slot: 2 }) => {
-            WINLOGON_WORKER3_STACK_MIRROR_VA + WL_WORKER3_STACK_FRAMES * 0x1000
-        }
-        Some(HostedThreadRole::TpWorker { slot }) => tp_worker_teb_mirror_va(winlogon_pi, slot),
-        _ => return None,
-    };
-    Some(alias)
-}
-
 fn main_gui_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -> Option<u64> {
-    let pi = callback_client_owner_pi(client)?;
-    if client.tid == 0
-        || !client
-            .process_role
-            .is_some_and(nt_exe_image::HostedProcessRole::uses_win32_client_gdi)
-    {
-        return None;
-    }
-    match client.role {
-        Some(HostedThreadRole::Main)
-            if client.top_badge != 0 && client.badge == client.top_badge =>
-        {
-            let alias = crate::env_scratch_base_for_pi(pi);
-            (alias != 0).then_some(alias)
-        }
-        Some(HostedThreadRole::TpWorker { slot })
-            if tp_worker_identity_from_badge(client.badge) == Some((pi, slot)) =>
-        {
-            Some(tp_worker_teb_mirror_va(pi, slot))
-        }
-        _ => None,
-    }
+    crate::service_sec_image::callback_client_runtime(client).map(|(alias, _)| alias)
 }
 
 fn callback_client_owner_pi(client: crate::spawn_hosts::UserCallbackClient) -> Option<usize> {
@@ -2535,26 +2504,17 @@ unsafe fn trace_user_callback_stack_words(
 }
 
 fn client_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -> Option<u64> {
-    if callback_client_is_winlogon(client) {
-        winlogon_callback_teb_alias(client)
-    } else {
-        main_gui_callback_teb_alias(client)
-    }
+    main_gui_callback_teb_alias(client)
 }
 
 fn client_callback_supported_for_api(
     client: crate::spawn_hosts::UserCallbackClient,
     api_index: u32,
 ) -> bool {
-    if callback_client_owner_pi(client).is_none() {
+    let Some((_, converted)) = crate::service_sec_image::callback_client_runtime(client) else {
         return false;
-    }
-    if api_index == nt_user_callback::USER32_CALLBACK_CLIENTTHREADSTARTUP {
-        return true;
-    }
-    client
-        .process_role
-        .is_some_and(nt_exe_image::HostedProcessRole::uses_win32_client_gdi)
+    };
+    api_index == nt_user_callback::USER32_CALLBACK_CLIENTTHREADSTARTUP || converted
 }
 
 unsafe fn bind_client_callback_window(
@@ -3140,6 +3100,8 @@ pub(crate) unsafe fn service_user_callback(
         && contract_valid
         && !client_dead
         && !owner_mismatch
+        && (request.api_index != nt_user_callback::USER32_CALLBACK_CLIENTTHREADSTARTUP
+            || crate::service_sec_image::prepare_callback_gdi_projection(client))
     {
         let callback_table = if client.peb_mirror == 0 {
             0

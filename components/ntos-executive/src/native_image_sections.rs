@@ -49,12 +49,24 @@ impl From<ImageSectionError> for NativeImageError {
 /// The source is captured before publication and held until checked image purge.
 /// For a routed source, `backing.routed_lease` names an independently retained
 /// FILE_OBJECT capture; dropping this value alone does not release that capture.
+/// `local_file` similarly owns a local File IO reference, independent of handles.
+#[must_use = "retire captured backing ownership after checked image purge"]
 pub(crate) struct NativeImageSource {
     pub(crate) backing: GenericSectionBacking,
     pub(crate) pe_header: Vec<u8>,
+    pub(crate) local_file: Option<crate::file_image_section::LocalImageFile>,
+    /// Captured opened pathname for process metadata, never source selection.
+    pub(crate) image_path: Option<Vec<u8>>,
+    pub(crate) observation_target: Option<nt_exe_image::CapturedImageObservation>,
 }
 
 impl NativeImageSource {
+    pub(crate) fn has_complete_image(&self) -> bool {
+        self.backing.is_live()
+            && self.backing.file_extent != 0
+            && u64::try_from(self.pe_header.len()).ok() == Some(self.backing.file_extent)
+    }
+
     fn valid_for(&self, file: SectionFileIdentity) -> bool {
         self.backing.is_live() && self.backing.file == Some(file) && !self.pe_header.is_empty()
     }
@@ -353,19 +365,18 @@ impl NativeImageStore {
         Ok(())
     }
 
-    /// A successful purge retires both the authority area and its captured
-    /// metadata. The caller must release any routed or overlay backing lease
-    /// through its actual owner as part of `purge_image` before returning Ok.
+    /// Transfer captured source ownership only after acknowledged authority purge.
+    /// The caller must explicitly retire or transfer its backing owner; failure
+    /// leaves the source in this store, including every retained local File ref.
+    #[must_use = "retire or transfer the purged image source backing"]
     pub(crate) fn flush_for_write(
         &mut self,
         file: SectionFileIdentity,
         io: &mut impl ImageSectionPurge,
-    ) -> Result<(), nt_memory_manager::image_section::ImageFlushError> {
+    ) -> Result<Option<NativeImageSource>, nt_memory_manager::image_section::ImageFlushError> {
         self.authority.flush_for_write(file, io)?;
-        if let Some(index) = self.sources.iter().position(|source| source.file == file) {
-            self.sources.remove(index);
-        }
-        Ok(())
+        Ok(self.sources.iter().position(|source| source.file == file)
+            .map(|index| self.sources.remove(index).source))
     }
 
     pub(crate) fn file_identity(&self, id: NativeImageSectionId) -> Option<SectionFileIdentity> {
