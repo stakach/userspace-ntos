@@ -281,7 +281,8 @@ static NTSTATUS CheckInlineMpr(void *file, DEVICE_OBJECT *device)
              (uint32_t)call, (uint32_t)event_status, unchanged, count);
     // ReactOS IofCompleteRequest advances the cursor before an MPR callback (irp.c:1442).
     // Only the witnessed held IRP may be completed again; unknown outcomes are not replayed.
-    if (call != STATUS_SUCCESS || count != 1) ParkUnknownInlineMpr();
+    if (call != STATUS_SUCCESS || count != 1 || event_status != STATUS_TIMEOUT || !unchanged)
+        ParkUnknownInlineMpr();
     uint32_t held_valid = event_status == STATUS_TIMEOUT && unchanged;
     DbgPrint("[inline-mpr-resume] count=%u\n", count);
     IofCompleteRequest(irp, 0);

@@ -48,6 +48,14 @@ class InlineMprSourceLifetimeTests(unittest.TestCase):
         )
         guards = [statement for statement in pre_resume if statement.get("kind") == "IfStmt"]
         self.assertTrue(guards, "uncertain dispatch outcome needs an explicit guard")
+        held_proof = {"call", "count", "event_status", "unchanged"}
+        self.assertTrue(any(
+            held_proof <= {
+                node.get("referencedDecl", {}).get("name")
+                for node in walk(guard.get("inner", [])[0])
+                if node.get("kind") == "DeclRefExpr"
+            } for guard in guards
+        ), "resume requires dispatch, callback, unsignaled Event and unchanged IOSB/output proof")
         parked = [functions[name] for guard in guards for name in calls(guard)
                   if name in functions and any(child.get("kind") == "C11NoReturnAttr"
                                               for child in functions[name].get("inner", []))]

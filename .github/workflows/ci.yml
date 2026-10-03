@@ -59,6 +59,13 @@ jobs:
           python3 -m unittest discover -s tests/native/file_acceptance -p test_verify_log.py 2>&1 | tee file-log-specs.log
           python3 -m unittest discover -s tests/native/font_cleanup -p test_verify_log.py 2>&1 | tee font-log-specs.log
           python3 -m unittest discover -s tests/native/mup_provider -p test_verify_log.py 2>&1 | tee mup-log-specs.log
+      - name: Native fixture source lifetime specs
+        run: |
+          if ! command -v clang >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y clang
+          fi
+          python3 -m unittest discover -s tests/native/mup_provider -p test_source_lifetime.py 2>&1 | tee mup-source-lifetime-specs.log
       - name: Upload spec logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -70,4 +77,5 @@ jobs:
             file-log-specs.log
             font-log-specs.log
             mup-log-specs.log
+            mup-source-lifetime-specs.log
           if-no-files-found: warn
