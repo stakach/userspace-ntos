@@ -81,6 +81,63 @@ fn function<'a>(file: &'a syn::File, name: &str) -> &'a syn::ItemFn {
 }
 
 #[test]
+fn both_kernel_registries_use_the_same_variadic_debug_export_binding() {
+    let driver = source("driver_launch");
+    let win32k = source("win32k_subsystem");
+    for (file, name) in [(&driver, "register_fsd_trampolines"), (&win32k, "register_trampolines")] {
+        let mut calls = Calls::default();
+        calls.visit_block(&function(file, name).block);
+        assert_eq!(calls.0.iter().filter(|call| *call == "bind_debug_exports").count(), 1,
+            "{name} must use the shared Win64 debug export boundary");
+    }
+    let helper = function(&driver, "bind_debug_exports");
+    #[derive(Default)]
+    struct Bindings(Vec<(String, Vec<String>)>);
+    impl<'ast> Visit<'ast> for Bindings {
+        fn visit_expr_method_call(&mut self, expression: &'ast syn::ExprMethodCall) {
+            if expression.method == "bind" && expression.args.len() == 2 {
+                if let Expr::Lit(literal) = &expression.args[0] {
+                    if let syn::Lit::Str(name) = &literal.lit {
+                        #[derive(Default)]
+                        struct Paths(Vec<String>);
+                        impl<'ast> Visit<'ast> for Paths {
+                            fn visit_expr_path(&mut self, expression: &'ast syn::ExprPath) {
+                                self.0.push(expression.path.segments.last().unwrap().ident.to_string());
+                            }
+                        }
+                        let mut paths = Paths::default();
+                        paths.visit_expr(&expression.args[1]);
+                        self.0.push((name.value(), paths.0));
+                    }
+                }
+            }
+            syn::visit::visit_expr_method_call(self, expression);
+        }
+    }
+    let mut bindings = Bindings::default();
+    bindings.visit_block(&helper.block);
+    for (name, gate) in [
+        ("DbgPrint", "hosted_dbg_print_gate"),
+        ("DbgPrintEx", "hosted_dbg_print_ex_gate"),
+        ("vDbgPrintEx", "s_vdbg_print_ex"),
+        ("vDbgPrintExWithPrefix", "s_vdbg_print_ex_with_prefix"),
+    ] {
+        let values: Vec<_> = bindings.0.iter().filter(|(export, _)| export == name).collect();
+        assert_eq!(values.len(), 1, "one authoritative binding required for {name}");
+        assert!(values[0].1.iter().any(|path| path == gate), "{name} lost its actual argument ABI");
+    }
+}
+
+#[test]
+fn win32k_removes_raw_format_and_fragmented_debug_printers() {
+    let win32k = source("win32k_subsystem");
+    assert!(!win32k.items.iter().any(|item| matches!(item,
+        Item::Fn(function) if function.sig.ident == "s_dbg_print"
+            || function.sig.ident == "s_vdbg_print_ex_with_prefix")),
+        "Win32k must not retain separate raw-format or byte-output debug implementations");
+}
+
+#[test]
 fn executive_hex_identity_is_one_fixed_width_scalar_not_two_prefixed_halves() {
     let main = source("main");
     let formatter = function(&main, "print_hex_u64");

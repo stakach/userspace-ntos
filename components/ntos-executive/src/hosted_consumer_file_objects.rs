@@ -5,15 +5,16 @@
 
 use super::*;
 use nt_io_manager::{
-    consumer_file_projection::{consumer_file_metadata, ConsumerFileProjection}, DeviceId, FileId,
-    FileReference, HostedDevicePointerRegistration, HostedDomainIdentity, HostedFileIdentity,
-    HostedFilePublicationLease, HostedFileUnbindOutcome, WdmOpenDeviceProjectionInit,
-    WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_OBJECT_SIZE,
+    consumer_file_projection::{consumer_file_metadata, ConsumerFileProjection},
+    DeviceId, FileId, FileReference, HostedDevicePointerRegistration, HostedDomainIdentity,
+    HostedFileIdentity, HostedFilePublicationLease, HostedFileUnbindOutcome, WdmDeviceObjectInit,
     WDM_X64_FILE_OBJECT_SIZE,
 };
 use nt_process::{native_handle::NativeHandleScope, HandleObject, ProcessId};
 
-const ALLOCATION_COUNT: usize = 5;
+use super::hosted_consumer_device_objects::{acquire_device, release_device, DeviceOwner};
+
+const ALLOCATION_COUNT: usize = 2;
 const STATUS_BUSY: i32 = nt_status::NtStatus::DEVICE_BUSY.raw();
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -34,6 +35,7 @@ struct Row {
     pool_va: u64,
     allocations: [Option<u64>; ALLOCATION_COUNT],
     device: Option<HostedDevicePointerRegistration>,
+    device_owner: Option<DeviceOwner>,
     file: Option<HostedFileIdentity>,
     projection: Option<ConsumerFileProjection>,
     phase: Phase,
@@ -47,8 +49,6 @@ struct Metadata {
     device_flags: u32,
     device_characteristics: u32,
     device_stack_size: u8,
-    file_create_options: u32,
-    file_opened_case_sensitive: bool,
 }
 
 static mut ROWS: Vec<Row> = Vec::new();
@@ -63,17 +63,27 @@ pub(super) struct ForwardFileOwner {
 }
 
 impl ForwardFileOwner {
-    pub(super) fn file_id(&self) -> FileId { self.identity.file_id() }
-    pub(super) fn device_id(&self) -> DeviceId { self.device.device_id() }
+    pub(super) fn file_id(&self) -> FileId {
+        self.identity.file_id()
+    }
+    pub(super) fn device_id(&self) -> DeviceId {
+        self.device.device_id()
+    }
 
     pub(super) fn validate(&self) -> Result<(), i32> {
         let io = io_manager_mut();
-        if io.hosted_file_identity_at(
-            self.identity.domain(), self.identity.file_id(), self.identity.address(),
-        ).map_err(|status| status.raw())? != Some(self.identity)
+        if io
+            .hosted_file_identity_at(
+                self.identity.domain(),
+                self.identity.file_id(),
+                self.identity.address(),
+            )
+            .map_err(|status| status.raw())?
+            != Some(self.identity)
             || io.hosted_device_pointer_registration(self.device.domain(), self.device.address())
                 != Some(self.device)
-            || io.file(self.identity.file_id())
+            || io
+                .file(self.identity.file_id())
                 .is_none_or(|file| file.device_id != self.device.device_id())
         {
             return Err(STATUS_INVALID_HANDLE);
@@ -85,10 +95,12 @@ impl ForwardFileOwner {
         self.validate()?;
         let io = io_manager_mut();
         if self.reference.is_held() {
-            io.release_file_reference(&mut self.reference).map_err(|status| status.raw())?;
+            io.release_file_reference(&mut self.reference)
+                .map_err(|status| status.raw())?;
         }
         if self.lease.is_held() {
-            io.release_hosted_file_publication(&mut self.lease).map_err(|status| status.raw())?;
+            io.release_hosted_file_publication(&mut self.lease)
+                .map_err(|status| status.raw())?;
         }
         Ok(())
     }
@@ -100,7 +112,10 @@ fn rows() -> &'static mut Vec<Row> {
 }
 
 fn row(id: u64) -> &'static mut Row {
-    rows().iter_mut().find(|row| row.id == id).expect("consumer File owner missing")
+    rows()
+        .iter_mut()
+        .find(|row| row.id == id)
+        .expect("consumer File owner missing")
 }
 
 fn row_for_handle(
@@ -109,20 +124,29 @@ fn row_for_handle(
     handle: u64,
     file_id: FileId,
 ) -> Option<u64> {
-    rows().iter().find(|row| {
-        row.domain == domain && row.owner == owner && row.handle == handle && row.file_id == file_id
-    }).map(|row| row.id)
+    rows()
+        .iter()
+        .find(|row| {
+            row.domain == domain
+                && row.owner == owner
+                && row.handle == handle
+                && row.file_id == file_id
+        })
+        .map(|row| row.id)
 }
 
 fn row_for_pointer(domain: HostedDomainIdentity, address: u64) -> Option<u64> {
-    rows().iter().find(|row| {
-        row.domain == domain && row.allocations[2] == Some(address)
-    }).map(|row| row.id)
+    rows()
+        .iter()
+        .find(|row| row.domain == domain && row.allocations[0] == Some(address))
+        .map(|row| row.id)
 }
 
 fn copy_units(source: &[u16]) -> Result<Vec<u16>, i32> {
     let mut owned = Vec::new();
-    owned.try_reserve_exact(source.len()).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    owned
+        .try_reserve_exact(source.len())
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
     owned.extend_from_slice(source);
     Ok(owned)
 }
@@ -134,7 +158,9 @@ fn metadata(file_id: FileId, device_id: DeviceId) -> Result<Metadata, i32> {
     if device.delete_pending || device.stack_size == 0 {
         return Err(STATUS_INVALID_DEVICE_REQUEST);
     }
-    let driver = io.driver(device.driver_id).ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+    let driver = io
+        .driver(device.driver_id)
+        .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
     let driver_name = copy_units(&driver.name.to_units())?;
     Ok(Metadata {
         driver_name,
@@ -144,8 +170,6 @@ fn metadata(file_id: FileId, device_id: DeviceId) -> Result<Metadata, i32> {
         device_flags: device.flags.bits(),
         device_characteristics: device.characteristics.bits(),
         device_stack_size: device.stack_size,
-        file_create_options: file.create_options,
-        file_opened_case_sensitive: file.opened_case_sensitive,
     })
 }
 
@@ -185,56 +209,52 @@ unsafe fn write_name(id: u64, slot: usize, units: &[u16]) -> Result<(u64, u16, u
 }
 
 unsafe fn build(id: u64, metadata: &Metadata) -> Result<(), i32> {
-    let (driver, driver_exec) = allocate(
-        id, 0, WDM_X64_DRIVER_OBJECT_SIZE + WDM_X64_DRIVER_EXTENSION_SIZE,
-    )?;
-    let (device, device_exec) = allocate(id, 1, WDM_X64_DEVICE_OBJECT_SIZE)?;
-    let (file, file_exec) = allocate(id, 2, WDM_X64_FILE_OBJECT_SIZE)?;
-    let (driver_name, driver_len, driver_max) = write_name(id, 3, &metadata.driver_name)?;
-    let (file_name, file_len, file_max) = write_name(id, 4, &metadata.file_name)?;
-    let driver_bytes = core::slice::from_raw_parts_mut(
-        driver_exec as *mut u8, WDM_X64_DRIVER_OBJECT_SIZE + WDM_X64_DRIVER_EXTENSION_SIZE,
-    );
-    let device_bytes = core::slice::from_raw_parts_mut(device_exec as *mut u8, WDM_X64_DEVICE_OBJECT_SIZE);
-    let file_bytes = core::slice::from_raw_parts_mut(file_exec as *mut u8, WDM_X64_FILE_OBJECT_SIZE);
-    nt_io_manager::write_wdm_open_device_projection(
-        driver_bytes,
-        device_bytes,
-        file_bytes,
-        WdmOpenDeviceProjectionInit {
-            file_object_address: file,
-            driver_object: driver,
-            driver_extension: driver + WDM_X64_DRIVER_OBJECT_SIZE as u64,
-            driver_name_len: driver_len,
-            driver_name_max_len: driver_max,
-            driver_name_buffer: driver_name,
-            device_object: device,
-            // FsContext is an address in the provider's VSpace, not this consumer's.
-            file_object_context: 0,
+    let (instance_index, domain, device_id, file_id) = {
+        let owner = row(id);
+        (
+            owner.instance_index,
+            owner.domain,
+            owner.device_id,
+            owner.file_id,
+        )
+    };
+    let owner = acquire_device(
+        instance_index,
+        domain,
+        file_id,
+        device_id,
+        &metadata.driver_name,
+        WdmDeviceObjectInit {
+            flags: metadata.device_flags,
+            characteristics: metadata.device_characteristics,
             device_type: metadata.device_type,
-            device_flags: metadata.device_flags,
-            device_characteristics: metadata.device_characteristics,
-            device_stack_size: metadata.device_stack_size,
-            file_create_options: metadata.file_create_options,
-            file_opened_case_sensitive: metadata.file_opened_case_sensitive,
-            file_name_len: file_len,
-            file_name_max_len: file_max,
-            file_name_buffer: file_name,
+            stack_size: metadata.device_stack_size,
             ..Default::default()
         },
-    ).map_err(|_| STATUS_INVALID_PARAMETER)?;
-    let (domain, device_id, file_id) = {
-        let owner = row(id);
-        (owner.domain, owner.device_id, owner.file_id)
-    };
-    let registration = io_manager_mut()
-        .bind_hosted_device_pointer(domain, device, device_id)
-        .map_err(|status| status.raw())?;
+    )?;
+    let registration = owner.registration();
     row(id).device = Some(registration);
+    row(id).device_owner = Some(owner);
+    let (file, file_exec) = allocate(id, 0, WDM_X64_FILE_OBJECT_SIZE)?;
+    let (file_name, file_len, file_max) = write_name(id, 1, &metadata.file_name)?;
+    let file_bytes =
+        core::slice::from_raw_parts_mut(file_exec as *mut u8, WDM_X64_FILE_OBJECT_SIZE);
     let identity = io_manager_mut()
         .bind_hosted_file_identity(domain, file, file_id)
         .map_err(|status| status.raw())?;
     row(id).file = Some(identity);
+    nt_io_manager::consumer_file_projection::write_consumer_wdm_file_object(
+        io_manager_mut(),
+        identity,
+        registration,
+        file_bytes,
+    )
+    .map_err(|status| status.raw())?;
+    // The shared writer supplies canonical mode and the completed CREATE Event state.
+    // Only the separately owned consumer name descriptor is added here.
+    file_bytes[0x58..0x5a].copy_from_slice(&file_len.to_le_bytes());
+    file_bytes[0x5a..0x5c].copy_from_slice(&file_max.to_le_bytes());
+    file_bytes[0x60..0x68].copy_from_slice(&file_name.to_le_bytes());
     let projection = ConsumerFileProjection::new(io_manager_mut(), identity, registration)
         .map_err(|status| status.raw())?;
     row(id).projection = Some(projection);
@@ -254,7 +274,9 @@ unsafe fn retire(id: u64) -> Result<(), i32> {
         if !projection.is_ready_to_retire() {
             return Err(STATUS_BUSY);
         }
-        projection.retire(io_manager_mut()).map_err(|status| status.raw())?;
+        projection
+            .retire(io_manager_mut())
+            .map_err(|status| status.raw())?;
         row(id).projection = None;
         row(id).file = None;
     }
@@ -265,9 +287,9 @@ unsafe fn retire(id: u64) -> Result<(), i32> {
             Err(status) => return Err(status.raw()),
         }
     }
-    if let Some(registration) = row(id).device {
-        io_manager_mut().retire_hosted_device_pointer(registration)
-            .map_err(|status| status.raw())?;
+    if let Some(owner) = row(id).device_owner.as_mut() {
+        release_device(owner)?;
+        row(id).device_owner = None;
         row(id).device = None;
     }
     let inst = live_instance(id)?;
@@ -279,7 +301,10 @@ unsafe fn retire(id: u64) -> Result<(), i32> {
             row(id).allocations[slot] = None;
         }
     }
-    let index = rows().iter().position(|owner| owner.id == id).expect("consumer File owner missing");
+    let index = rows()
+        .iter()
+        .position(|owner| owner.id == id)
+        .expect("consumer File owner missing");
     rows().swap_remove(index);
     Ok(())
 }
@@ -306,7 +331,9 @@ pub(super) unsafe fn capture_forward_file(
     let owner = row(id);
     let projection = owner.projection.as_ref().ok_or(STATUS_INVALID_HANDLE)?;
     if projection.pointer_reference_count() == 0
-        || projection.related_device_address(io_manager_mut()).map_err(|status| status.raw())?
+        || projection
+            .related_device_address(io_manager_mut())
+            .map_err(|status| status.raw())?
             != device_address
     {
         return Err(STATUS_INVALID_HANDLE);
@@ -314,7 +341,9 @@ pub(super) unsafe fn capture_forward_file(
     let identity = projection.identity();
     let device = projection.device_registration();
     let io = io_manager_mut();
-    let mut lease = io.lease_hosted_file_identity(identity).map_err(|status| status.raw())?;
+    let mut lease = io
+        .lease_hosted_file_identity(identity)
+        .map_err(|status| status.raw())?;
     let reference = match io.retain_file_reference(identity.file_id()) {
         Ok(reference) => reference,
         Err(status) => {
@@ -323,7 +352,12 @@ pub(super) unsafe fn capture_forward_file(
             return Err(status.raw());
         }
     };
-    Ok(ForwardFileOwner { identity, device, reference, lease })
+    Ok(ForwardFileOwner {
+        identity,
+        device,
+        reference,
+        lease,
+    })
 }
 
 /// One call is never replayed after an uncertain Reply. Repeated, distinct calls share a single
@@ -340,21 +374,32 @@ pub(super) unsafe fn reference_handle(
         if access_mode > 1 {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let caller = crate::provider_registry_caller::resolve(ch).map_err(|status| status as i32)?;
+        let caller =
+            crate::provider_registry_caller::resolve(ch).map_err(|status| status as i32)?;
         let (owner, file_id, device_id, grant, attributes) =
             crate::service_sec_image::with_provider_process_manager(|pm| {
-                let (file_id, device_id) = pm.lookup_native_routed_file_handle(caller, handle, 0)?;
+                let (file_id, device_id) =
+                    pm.lookup_native_routed_file_handle(caller, handle, 0)?;
                 let target = pm.inspect_native_close_target(caller, handle)?;
                 if target.object() != (HandleObject::RoutedFile { file_id, device_id }) {
                     return Err(STATUS_INVALID_HANDLE as u32);
                 }
-                let NativeHandleScope::Table { owner, .. } = pm.decode_native_handle(caller, handle)? else {
+                let NativeHandleScope::Table { owner, .. } =
+                    pm.decode_native_handle(caller, handle)?
+                else {
                     return Err(STATUS_INVALID_HANDLE as u32);
                 };
                 let info = target.information();
                 let grant = info.granted_access.ok_or(STATUS_INVALID_HANDLE as u32)?;
-                Ok((owner, FileId(file_id), DeviceId(device_id), grant, info.attributes))
-            }).map_err(|status| status as i32)?;
+                Ok((
+                    owner,
+                    FileId(file_id),
+                    DeviceId(device_id),
+                    grant,
+                    info.attributes,
+                ))
+            })
+            .map_err(|status| status as i32)?;
         if access_mode == 1 && desired_access & !grant != 0 {
             return Err(STATUS_ACCESS_DENIED);
         }
@@ -370,21 +415,36 @@ pub(super) unsafe fn reference_handle(
             }
             live_instance(id)?;
             let identity = row(id).file.ok_or(STATUS_INVALID_HANDLE)?;
-            let pointer = row(id).projection.as_mut().unwrap()
+            let pointer = row(id)
+                .projection
+                .as_mut()
+                .unwrap()
                 .reference_by_handle(io_manager_mut(), identity)
                 .map_err(|status| status.raw())?;
             return Ok((pointer, grant, attributes));
         }
         let id = NEXT_ROW_ID;
         let next = id.checked_add(1).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
-        rows().try_reserve(1).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-        let (instance_index, _) = instance_for_pump_channel(ch, reply_cap)
-            .ok_or(STATUS_ACCESS_DENIED)?;
+        rows()
+            .try_reserve(1)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        let (instance_index, _) =
+            instance_for_pump_channel(ch, reply_cap).ok_or(STATUS_ACCESS_DENIED)?;
         rows().push(Row {
-            id, domain, owner, handle, file_id, device_id, instance_index,
+            id,
+            domain,
+            owner,
+            handle,
+            file_id,
+            device_id,
+            instance_index,
             pool_va: inst.exec_pool_va,
-            allocations: [None; ALLOCATION_COUNT], device: None, file: None,
-            projection: None, phase: Phase::Building,
+            allocations: [None; ALLOCATION_COUNT],
+            device: None,
+            device_owner: None,
+            file: None,
+            projection: None,
+            phase: Phase::Building,
         });
         NEXT_ROW_ID = next;
         if let Err(status) = build(id, &metadata) {
@@ -392,8 +452,13 @@ pub(super) unsafe fn reference_handle(
             let _ = retire(id);
             return Err(status);
         }
-        let identity = row(id).file.expect("built consumer projection lacks identity");
-        let pointer = row(id).projection.as_mut().unwrap()
+        let identity = row(id)
+            .file
+            .expect("built consumer projection lacks identity");
+        let pointer = row(id)
+            .projection
+            .as_mut()
+            .unwrap()
             .reference_by_handle(io_manager_mut(), identity)
             .map_err(|status| status.raw())?;
         Ok((pointer, grant, attributes))
@@ -416,8 +481,12 @@ pub(super) unsafe fn reference_pointer(
             return Err(STATUS_INVALID_HANDLE);
         }
         let identity = row(id).file.ok_or(STATUS_INVALID_HANDLE)?;
-        row(id).projection.as_mut().ok_or(STATUS_INVALID_HANDLE)?
-            .reference_by_pointer(io_manager_mut(), identity).map_err(|status| status.raw())
+        row(id)
+            .projection
+            .as_mut()
+            .ok_or(STATUS_INVALID_HANDLE)?
+            .reference_by_pointer(io_manager_mut(), identity)
+            .map_err(|status| status.raw())
     })();
     match result {
         Ok(pointer) => (STATUS_SUCCESS, pointer),
@@ -434,8 +503,12 @@ pub(super) unsafe fn dereference_pointer(
         let (_, domain) = authenticate(ch, reply_cap)?;
         let id = row_for_pointer(domain, address).ok_or(STATUS_INVALID_PARAMETER)?;
         let identity = row(id).file.ok_or(STATUS_INVALID_HANDLE)?;
-        row(id).projection.as_mut().ok_or(STATUS_INVALID_HANDLE)?
-            .dereference(io_manager_mut(), identity).map_err(|status| status.raw())?;
+        row(id)
+            .projection
+            .as_mut()
+            .ok_or(STATUS_INVALID_HANDLE)?
+            .dereference(io_manager_mut(), identity)
+            .map_err(|status| status.raw())?;
         if row(id).phase == Phase::Retiring {
             let _ = retire(id);
         }
@@ -446,18 +519,18 @@ pub(super) unsafe fn dereference_pointer(
 
 /// Called only after the typed process-table close receipt is committed. A pointer reference may
 /// outlive that handle; the canonical File and local allocations remain owned until dereference.
-pub(crate) unsafe fn handle_closed(
-    owner: ProcessId,
-    handle: u64,
-    file_id: u64,
-) -> Result<(), i32> {
-    for row in rows().iter_mut().filter(|row| {
-        row.owner == owner && row.handle == handle && row.file_id == FileId(file_id)
-    }) {
+pub(crate) unsafe fn handle_closed(owner: ProcessId, handle: u64, file_id: u64) -> Result<(), i32> {
+    for row in rows()
+        .iter_mut()
+        .filter(|row| row.owner == owner && row.handle == handle && row.file_id == FileId(file_id))
+    {
         if row.phase == Phase::Live {
             let identity = row.file.ok_or(STATUS_INVALID_HANDLE)?;
-            row.projection.as_mut().ok_or(STATUS_INVALID_HANDLE)?
-                .handle_closed(identity).map_err(|status| status.raw())?;
+            row.projection
+                .as_mut()
+                .ok_or(STATUS_INVALID_HANDLE)?
+                .handle_closed(identity)
+                .map_err(|status| status.raw())?;
         }
         row.phase = Phase::Retiring;
     }
@@ -468,9 +541,16 @@ pub(crate) unsafe fn handle_closed(
 pub(crate) unsafe fn redrive() {
     let mut cursor = 0;
     loop {
-        let Some(id) = rows().iter().filter(|row| row.phase == Phase::Retiring && row.id > cursor)
-            .map(|row| row.id).min() else { break };
+        let Some(id) = rows()
+            .iter()
+            .filter(|row| row.phase == Phase::Retiring && row.id > cursor)
+            .map(|row| row.id)
+            .min()
+        else {
+            break;
+        };
         cursor = id;
         let _ = retire(id);
     }
+    super::hosted_consumer_device_objects::redrive();
 }

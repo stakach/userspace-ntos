@@ -515,3 +515,10 @@ diagnosis-free failure.
   rejected at admission does not reproduce the later behavior it claims to test.
 - Give retained-owner fixtures valid reservation identities before testing
   output ordering, and keep setup failures separate from behavioral evidence.
+
+## Consume Validation Exit Before Starting Another
+- A session ID means validation is still active, including quiet executable startup
+  or a pending artifact lock. Consume its final exit before launching any other
+  build, test suite, image generation, or guest run against shared artifacts.
+- An exact test filter must name the complete test. A zero-test success is not
+  regression evidence; check the executed count and the actual failure assertion.

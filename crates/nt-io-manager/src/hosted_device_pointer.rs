@@ -28,6 +28,9 @@ impl HostedDevicePointerRegistration {
     pub const fn device_id(self) -> DeviceId {
         self.device
     }
+    pub const fn generation(self) -> u64 {
+        self.sequence
+    }
 }
 
 /// One returned object reference. Failed adoption or release leaves this owner intact.

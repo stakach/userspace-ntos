@@ -9176,96 +9176,6 @@ extern "win64" fn s_ke_add_system_service_table(
     1
 }
 
-/// `DbgPrint(PCSTR Format, ...)` — forward the (format) string to serial for observability.
-extern "win64" fn s_dbg_print(fmt: *const u8) -> u32 {
-    if !fmt.is_null() {
-        print_str(b"[win32k dbg] ");
-        unsafe {
-            let mut i = 0usize;
-            while i < 240 {
-                let c = *fmt.add(i);
-                if c == 0 {
-                    break;
-                }
-                debug_put_char(c);
-                i += 1;
-            }
-        }
-        print_str(b"\n");
-    }
-    0
-}
-
-/// `ULONG vDbgPrintExWithPrefix(PCCH Prefix, ULONG ComponentId, ULONG Level, PCCH Format,
-/// va_list arglist)` — the real DbgPrintEx backend. win64: rcx/rdx/r8/r9 + the 5th arg
-/// (`va_list`, a pointer to the argument array) from the stack. Prints the prefix then the
-/// `%`-substituted format via the host-tested `nt_kernel_exec::dbg` formatter, so win32k's
-/// `DPRINT`/`DbgPrintEx` diagnostics finally render substituted (was an `s_zero` no-op).
-extern "win64" fn s_vdbg_print_ex_with_prefix(
-    prefix: u64,
-    _component: u64,
-    _level: u64,
-    fmt: u64,
-    va_list: u64,
-) -> u32 {
-    print_str(b"[win32k dbg] ");
-    unsafe {
-        if prefix != 0 {
-            let mut i = 0u64;
-            while i < 64 {
-                let c = read_volatile((prefix + i) as *const u8);
-                if c == 0 {
-                    break;
-                }
-                debug_put_char(c);
-                i += 1;
-            }
-        }
-        if fmt != 0 {
-            let mut fbuf = [0u8; 256];
-            let mut flen = 0usize;
-            while flen < 255 {
-                let c = read_volatile((fmt + flen as u64) as *const u8);
-                if c == 0 {
-                    break;
-                }
-                fbuf[flen] = c;
-                flen += 1;
-            }
-            let mut k = 0u64;
-            let mut next_arg = || {
-                let v = if va_list != 0 {
-                    unsafe { read_volatile((va_list + k * 8) as *const u64) }
-                } else {
-                    0
-                };
-                k += 1;
-                v
-            };
-            let mut read_cstr = |ptr: u64, buf: &mut [u8]| -> usize {
-                let mut n = 0usize;
-                while n < buf.len() {
-                    let c = unsafe { read_volatile((ptr + n as u64) as *const u8) };
-                    if c == 0 {
-                        break;
-                    }
-                    buf[n] = c;
-                    n += 1;
-                }
-                n
-            };
-            nt_kernel_exec::dbg::format_dbg(
-                &fbuf[..flen],
-                &mut next_arg,
-                &mut read_cstr,
-                &mut |b| debug_put_char(b),
-            );
-        }
-    }
-    print_str(b"\n");
-    0
-}
-
 // --- CRT + misc ntoskrnl trampolines dxg.sys imports -----------------------------------------
 
 /// `void* memcpy(void* dst, const void* src, size_t n)`.
@@ -15143,11 +15053,7 @@ fn register_trampolines() -> bool {
         "RtlTimeToTimeFields",
         s_rtl_time_to_time_fields as usize as u64,
     );
-    // --- batch 2: real va_list DbgPrintEx backend (nt_kernel_exec::dbg) ---
-    reg.bind(
-        "vDbgPrintExWithPrefix",
-        s_vdbg_print_ex_with_prefix as usize as u64,
-    );
+    crate::driver_launch::bind_debug_exports(reg);
     // --- batch 3: section objects (nt-kernel-exec session_section) ---
     reg.bind("MmCreateSection", s_mm_create_section as usize as u64);
     reg.bind("MmMapViewInSessionSpace", s_mm_map_view as usize as u64);
@@ -15445,7 +15351,6 @@ fn register_trampolines() -> bool {
         "KeQueryPerformanceCounter",
         s_ke_query_performance_counter as usize as u64,
     );
-    reg.bind("DbgPrint", s_dbg_print as usize as u64);
     // --- batch 4: native executive resources / critical regions / fast mutexes ---
     reg.bind(
         "ExInitializeResourceLite",

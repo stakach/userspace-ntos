@@ -154,6 +154,8 @@ pub(crate) use hosted_file_mode::prepare as prepare_hosted_file_mode;
 pub(crate) use hosted_file_mode::PreparationError as FileModePreparationError;
 #[path = "hosted_consumer_file_objects.rs"]
 pub(crate) mod hosted_consumer_file_objects;
+#[path = "hosted_consumer_device_objects.rs"]
+mod hosted_consumer_device_objects;
 #[path = "hosted_io_create_file_adapter.rs"]
 mod hosted_io_create_file_adapter;
 #[path = "hosted_io_create_file_ingress.rs"]
@@ -15913,6 +15915,22 @@ extern "win64" {
     fn hosted_dbg_print_gate();
     fn hosted_dbg_print_ex_gate();
     fn hosted_video_port_debug_print_gate();
+}
+
+pub(crate) fn bind_debug_exports(reg: &mut DriverExportRegistry) {
+    reg.bind(
+        "vDbgPrintExWithPrefix",
+        s_vdbg_print_ex_with_prefix as *const () as usize as u64,
+    );
+    reg.bind("vDbgPrintEx", s_vdbg_print_ex as *const () as usize as u64);
+    reg.bind(
+        "DbgPrint",
+        hosted_dbg_print_gate as *const () as usize as u64,
+    );
+    reg.bind(
+        "DbgPrintEx",
+        hosted_dbg_print_ex_gate as *const () as usize as u64,
+    );
 }
 
 extern "win64" fn s_dbg_query_debug_filter_state(_component_id: u32, _level: u32) -> u8 {
@@ -33627,19 +33645,7 @@ fn register_fsd_trampolines() -> bool {
         s_io_get_current_process as *const () as usize as u64,
     );
     // Debug print exports retain their distinct Win64 variadic and va_list ABIs.
-    reg.bind(
-        "vDbgPrintExWithPrefix",
-        s_vdbg_print_ex_with_prefix as *const () as usize as u64,
-    );
-    reg.bind("vDbgPrintEx", s_vdbg_print_ex as *const () as usize as u64);
-    reg.bind(
-        "DbgPrint",
-        hosted_dbg_print_gate as *const () as usize as u64,
-    );
-    reg.bind(
-        "DbgPrintEx",
-        hosted_dbg_print_ex_gate as *const () as usize as u64,
-    );
+    bind_debug_exports(reg);
     reg.bind(
         "DbgQueryDebugFilterState",
         s_dbg_query_debug_filter_state as *const () as usize as u64,
