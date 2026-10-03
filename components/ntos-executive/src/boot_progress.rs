@@ -6,6 +6,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub(crate) enum BootProgress {
     ImageActivated,
     PageMappingPublished,
+    ImageSnapshotCaptured,
     DurableRegistryPublication,
     CredentialRetrieved,
     DialogModalCompleted,
@@ -23,6 +24,7 @@ impl BootProgress {
         match self {
             Self::ImageActivated
             | Self::PageMappingPublished
+            | Self::ImageSnapshotCaptured
             | Self::DurableRegistryPublication
             | Self::CredentialRetrieved => 0,
             Self::UserShellImageAttempted => 1 << 0,

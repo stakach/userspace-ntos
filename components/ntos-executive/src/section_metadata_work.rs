@@ -631,6 +631,9 @@ unsafe fn advance(
                     if status.raw() == 0 && information == length as u64 =>
                 {
                     work.image_header.extend_from_slice(&output[..length]);
+                    if !work.cancelled {
+                        crate::note_boot_progress(crate::BootProgress::ImageSnapshotCaptured);
+                    }
                 }
                 Ok(ExternalDispatchResult::Completed { status, .. }) => {
                     work.status = if status.raw() == 0 {
@@ -708,6 +711,9 @@ unsafe fn advance(
                 .is_err()
             {
                 return Step::Wait;
+            }
+            if work.status == 0 && !work.cancelled {
+                crate::note_boot_progress(crate::BootProgress::ImageSnapshotCaptured);
             }
             work.phase = if work.status == 0 {
                 Phase::HeaderDispatch
