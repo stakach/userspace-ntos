@@ -182,7 +182,8 @@ fn completed_and_drained_modal_frontiers_are_one_shot_progress() {
     calls.visit_item_fn(store);
     assert!(calls.completed && calls.drained,
         "real correlated modal completion/drain must publish finite boot frontiers");
-    let implementation = source.items.iter().find_map(|item| match item {
+    let policy = syn::parse_file(include_str!("../../../components/ntos-executive/src/boot_progress.rs")).unwrap();
+    let implementation = policy.items.iter().find_map(|item| match item {
         syn::Item::Impl(item) if matches!(&*item.self_ty, syn::Type::Path(path)
             if path.path.is_ident("BootProgress")) => Some(item),
         _ => None,
