@@ -47,6 +47,8 @@ mod exec_file_transfer;
 mod exec_file_mode;
 #[path = "exec_local_file_io.rs"]
 mod local_file_io;
+#[path = "exec_disk_file.rs"]
+mod disk_file;
 
 #[path = "exec_virtual_memory_copy.rs"]
 mod virtual_memory_copy;
@@ -10014,49 +10016,6 @@ impl ExecNtHandler {
         let count = self.pm.handle_count(reservation.process_id) as u64;
         PM_HANDLE_PEAK.fetch_max(count, Ordering::Relaxed);
         PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
-        Ok(handle as u64)
-    }
-
-    /// Mint a process-local handle for a read-only file on the mounted FAT volume.
-    pub(crate) fn mint_disk_file_handle(
-        &mut self,
-        file: crate::fs_loader::FatOpenMetadata,
-        volume_relative_path: &[u8],
-        access: u32,
-        share_access: u32,
-        create_options: u32,
-    ) -> Result<u64, u32> {
-        let pid = self
-            .pm_pid_for_pi(self.pi)
-            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
-        let first_cluster = file.first_cluster;
-        let size =
-            u32::try_from(file.metadata.end_of_file).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-        let object_id = self.readonly_file_opens.create(
-            first_cluster,
-            size,
-            volume_relative_path,
-            access,
-            share_access,
-            create_options,
-            file.metadata,
-            file.alternate_name,
-        )?;
-        let handle = match self.insert_process_handle(
-            pid,
-            nt_process::HandleObject::DiskFile {
-                first_cluster,
-                size,
-                object_id,
-            },
-            access,
-        ) {
-            Ok(handle) => handle,
-            Err(status) => {
-                let _ = self.readonly_file_opens.release(object_id);
-                return Err(status);
-            }
-        };
         Ok(handle as u64)
     }
 

@@ -7609,7 +7609,7 @@ static mut DIRECTORY_OPEN_WORK: nt_fs::DirectoryOpenTable<64> = nt_fs::Directory
 /// Persistent read-only FAT FILE_OBJECT state. Read-only file data stays on the boot FAT volume,
 /// but synchronous `NtReadFile(NULL ByteOffset)`, `FilePositionInformation`, and duplicated handles
 /// still need a shared FILE_OBJECT current byte offset.
-static mut READONLY_FILE_OPEN_WORK: nt_fs::ReadOnlyFileOpenTable<64> =
+static mut READONLY_FILE_OPEN_WORK: nt_fs::ReadOnlyFileOpenTable =
     nt_fs::ReadOnlyFileOpenTable::new();
 
 fn try_alloc_slot() -> Option<u64> {
@@ -24311,12 +24311,17 @@ impl ExecDirectoryOpens {
     }
 }
 
-/// Exclusive pointer to the serialized executive's fixed read-only file-open table.
+/// Exclusive pointer to the serialized executive's lazily growing read-only File table.
 struct ExecReadOnlyFileOpens {
-    table: *mut nt_fs::ReadOnlyFileOpenTable<64>,
+    table: *mut nt_fs::ReadOnlyFileOpenTable,
 }
 
 impl ExecReadOnlyFileOpens {
+    fn usage(&self) -> nt_fs::ReadOnlyFileOpenUsage {
+        // Copy observations without retaining a table borrow across diagnostic emission.
+        unsafe { (&*self.table).usage() }
+    }
+
     fn reset() -> Self {
         assert!(
             unsafe { local_section_file::data_sources_empty() },

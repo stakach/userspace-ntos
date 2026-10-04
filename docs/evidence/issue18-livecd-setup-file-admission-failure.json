@@ -25,7 +25,7 @@
     "No actual Userinit or Explorer process launch was observed; bootstrap image loads are not execution evidence.",
     "A loader dependency File open failed with STATUS_INSUFFICIENT_RESOURCES before LoadLibraryExW(syssetup.dll) reported DLL_NOT_FOUND. The failed dependency name and exact resource-admission branch were not recorded.",
     "The previous USER pointer-reference underflow did not recur; this does not prove complete native USER ownership.",
-    "Terminal provider cleanup still reported authenticated caller rejection and failed Section dereference; fresh private-font terminal unmap acceptance remains unproven.",
+    "Authenticated fresh-handle caller rejection was observed after process signaling. Generic Section probes also reported INVALID_HANDLE for unclassified bodies; those records alone do not prove failed Section retirement. Fresh private-font terminal unmap acceptance remains unproven.",
     "i8042prt admission rejected unresolved IoStartNextPacket, and real keyboard/mouse reads failed. No hardware-input proof was obtained."
   ]
 }

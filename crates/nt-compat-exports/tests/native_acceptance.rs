@@ -60,6 +60,8 @@ mod mup_read_evidence;
 mod media_setup_authority;
 #[path = "native_acceptance/user_binding_authority.rs"]
 mod user_binding_authority;
+#[path = "native_acceptance/readonly_file_capacity.rs"]
+mod readonly_file_capacity;
 
 // Executive globals required by the real cache module exercised in the host harness.
 use core::sync::atomic::{AtomicU64, Ordering};
