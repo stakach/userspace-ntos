@@ -15,6 +15,14 @@ pub struct ObservationKey {
     pub process: ProcessIdentity,
 }
 
+/// Finite evidence budgets. Zero disables a category; it never disables native execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObservationLimits {
+    pub processes: usize,
+    pub workers_per_process: usize,
+    pub gui_kinds_per_process: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublicationFact {
     ProcessCatalog,
@@ -40,6 +48,9 @@ pub enum ObservationError {
     AmbiguousRole,
     InvalidCount,
     CountOverflow,
+    ProcessLimit,
+    WorkerLimit,
+    GuiKindLimit,
     InsufficientResources,
 }
 
@@ -132,17 +143,15 @@ impl<R: Copy, I, F: Eq> ProcessObservation<R, I, F> {
 /// GUI history is bounded by distinct kinds rather than the number of draw calls.
 pub struct ProcessObservations<R, I, F> {
     rows: Vec<ProcessObservation<R, I, F>>,
-}
-
-impl<R: Copy + Eq, I: Eq, F: Eq> Default for ProcessObservations<R, I, F> {
-    fn default() -> Self {
-        Self::new()
-    }
+    limits: ObservationLimits,
 }
 
 impl<R: Copy + Eq, I: Eq, F: Eq> ProcessObservations<R, I, F> {
-    pub const fn new() -> Self {
-        Self { rows: Vec::new() }
+    pub const fn new(limits: ObservationLimits) -> Self {
+        Self {
+            rows: Vec::new(),
+            limits,
+        }
     }
 
     pub fn register(
@@ -161,8 +170,11 @@ impl<R: Copy + Eq, I: Eq, F: Eq> ProcessObservations<R, I, F> {
                 Err(ObservationError::ConflictingRegistration)
             };
         }
+        if self.rows.len() >= self.limits.processes {
+            return Err(ObservationError::ProcessLimit);
+        }
         self.rows
-            .try_reserve(1)
+            .try_reserve_exact(1)
             .map_err(|_| ObservationError::InsufficientResources)?;
         self.rows.push(ProcessObservation {
             key,
@@ -233,17 +245,25 @@ impl<R: Copy + Eq, I: Eq, F: Eq> ProcessObservations<R, I, F> {
         caller: ProviderLogicalCaller,
         current: ThreadLifetime,
     ) -> Result<ObservationAck, ObservationError> {
+        let limit = self.limits.workers_per_process;
         let row = self.row_mut(key)?;
         row.caller_is_current(caller, current)?;
         if row.workers.contains(&caller) {
             return Ok(ObservationAck::Duplicate);
         }
-        if row.workers.iter().any(|worker| worker.thread() == caller.thread()) {
+        if row
+            .workers
+            .iter()
+            .any(|worker| worker.thread() == caller.thread())
+        {
             return Err(ObservationError::ConflictingReceipt);
         }
         row.active()?;
+        if row.workers.len() >= limit {
+            return Err(ObservationError::WorkerLimit);
+        }
         row.workers
-            .try_reserve(1)
+            .try_reserve_exact(1)
             .map_err(|_| ObservationError::InsufficientResources)?;
         row.workers.push(caller);
         Ok(ObservationAck::Recorded)
@@ -259,6 +279,7 @@ impl<R: Copy + Eq, I: Eq, F: Eq> ProcessObservations<R, I, F> {
         kind: F,
         amount: u64,
     ) -> Result<u64, ObservationError> {
+        let limit = self.limits.gui_kinds_per_process;
         let row = self.row_mut(key)?;
         row.caller_is_current(caller, current)?;
         row.active()?;
@@ -276,8 +297,11 @@ impl<R: Copy + Eq, I: Eq, F: Eq> ProcessObservations<R, I, F> {
             fact.count = count;
             return Ok(count);
         }
+        if row.gui.len() >= limit {
+            return Err(ObservationError::GuiKindLimit);
+        }
         row.gui
-            .try_reserve(1)
+            .try_reserve_exact(1)
             .map_err(|_| ObservationError::InsufficientResources)?;
         row.gui.push(FactCount {
             kind,

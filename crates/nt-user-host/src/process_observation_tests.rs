@@ -15,6 +15,14 @@ enum Fact {
 }
 type Observations = ProcessObservations<Role, u64, Fact>;
 
+fn observations() -> Observations {
+    Observations::new(ObservationLimits {
+        processes: 4,
+        workers_per_process: 4,
+        gui_kinds_per_process: 4,
+    })
+}
+
 fn fixture() -> (
     ProcessManager,
     ThreadBinding<()>,
@@ -48,7 +56,7 @@ fn fixture() -> (
 #[test]
 fn publication_phases_are_independent_and_exact_duplicate_acks_are_idempotent() {
     let (_, _, caller, key) = fixture();
-    let mut observations = Observations::new();
+    let mut observations = observations();
     assert_eq!(
         observations.register(key, Role::Shell, 42),
         Ok(ObservationAck::Recorded)
@@ -102,7 +110,7 @@ fn publication_phases_are_independent_and_exact_duplicate_acks_are_idempotent() 
 #[test]
 fn foreign_generation_and_conflicting_main_receipt_cannot_borrow_observation() {
     let (pm, binding, caller, key) = fixture();
-    let mut observations = Observations::new();
+    let mut observations = observations();
     observations.register(key, Role::Shell, 42).unwrap();
     observations
         .record_main_publication(key, caller, caller.thread())
@@ -143,7 +151,7 @@ fn foreign_generation_and_conflicting_main_receipt_cannot_borrow_observation() {
 #[test]
 fn same_worker_lifetime_with_changed_physical_receipt_is_conflicting() {
     let (_, binding, caller, key) = fixture();
-    let mut observations = Observations::new();
+    let mut observations = observations();
     observations.register(key, Role::Shell, 42).unwrap();
     observations
         .record_worker_activation(key, caller, caller.thread())
@@ -173,7 +181,7 @@ fn same_worker_lifetime_with_changed_physical_receipt_is_conflicting() {
 #[test]
 fn reused_thread_generation_requires_fresh_activation_and_gui_caller_receipt() {
     let (mut pm, binding, caller, key) = fixture();
-    let mut observations = Observations::new();
+    let mut observations = observations();
     observations.register(key, Role::Shell, 42).unwrap();
     observations
         .record_worker_activation(key, caller, caller.thread())
@@ -222,7 +230,7 @@ fn reused_thread_generation_requires_fresh_activation_and_gui_caller_receipt() {
 #[test]
 fn gui_counts_are_per_kind_and_overflow_refuses_before_mutation() {
     let (_, _, caller, key) = fixture();
-    let mut observations = Observations::new();
+    let mut observations = observations();
     observations.register(key, Role::Shell, 42).unwrap();
     assert_eq!(
         observations.record_gui_fact(key, caller, caller.thread(), Fact::Window, 1),
@@ -256,7 +264,7 @@ fn gui_counts_are_per_kind_and_overflow_refuses_before_mutation() {
 #[test]
 fn immutable_terminal_and_retired_history_never_count_as_current_live() {
     let (_, _, caller, key) = fixture();
-    let mut observations = Observations::new();
+    let mut observations = observations();
     observations.register(key, Role::Bootstrap, 42).unwrap();
     observations
         .record_main_publication(key, caller, caller.thread())
@@ -297,7 +305,7 @@ fn immutable_terminal_and_retired_history_never_count_as_current_live() {
 #[test]
 fn pi_and_pid_reuse_preserves_history_without_lending_facts_to_new_key() {
     let (_, binding, caller, key) = fixture();
-    let mut observations = Observations::new();
+    let mut observations = observations();
     observations.register(key, Role::Bootstrap, 42).unwrap();
     observations
         .record_main_publication(key, caller, caller.thread())
@@ -337,7 +345,7 @@ fn role_selection_refuses_ambiguity_and_uses_only_supplied_current_keys() {
             generation: ProcessGeneration::Hosted(9),
         },
     };
-    let mut observations = Observations::new();
+    let mut observations = observations();
     observations.register(key, Role::Shell, 42).unwrap();
     observations.register(second, Role::Shell, 43).unwrap();
     assert_eq!(
@@ -372,4 +380,152 @@ fn role_selection_refuses_ambiguity_and_uses_only_supplied_current_keys() {
         .live_for_role(Role::Shell, &[])
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn process_limit_preserves_exact_duplicate_and_retired_history() {
+    let (_, _, caller, key) = fixture();
+    let mut observations = Observations::new(ObservationLimits {
+        processes: 1,
+        workers_per_process: 1,
+        gui_kinds_per_process: 1,
+    });
+    observations.register(key, Role::Shell, 42).unwrap();
+    assert_eq!(
+        observations.register(key, Role::Shell, 42),
+        Ok(ObservationAck::Duplicate)
+    );
+    assert_eq!(
+        observations.register(key, Role::Shell, 43),
+        Err(ObservationError::ConflictingRegistration)
+    );
+    let next = ObservationKey {
+        process: ProcessIdentity {
+            generation: ProcessGeneration::Hosted(3),
+            ..key.process
+        },
+        ..key
+    };
+    assert_eq!(
+        observations.register(next, Role::Shell, 43),
+        Err(ObservationError::ProcessLimit)
+    );
+    observations
+        .record_main_publication(key, caller, caller.thread())
+        .unwrap();
+    observations.record_terminal(key, 0).unwrap();
+    observations.retire(key).unwrap();
+    assert_eq!(
+        observations.register(next, Role::Shell, 43),
+        Err(ObservationError::ProcessLimit)
+    );
+    assert!(observations.historical_snapshot(next).is_none());
+    assert!(observations.historical_snapshot(key).unwrap().is_retired());
+    assert_eq!(observations.historical_snapshot(key).unwrap().image(), &42);
+}
+
+#[test]
+fn worker_limit_refuses_new_lifetime_without_mutating_receipts() {
+    let (mut pm, binding, caller, key) = fixture();
+    let mut observations = Observations::new(ObservationLimits {
+        processes: 1,
+        workers_per_process: 1,
+        gui_kinds_per_process: 1,
+    });
+    observations.register(key, Role::Shell, 42).unwrap();
+    observations
+        .record_worker_activation(key, caller, caller.thread())
+        .unwrap();
+    assert_eq!(
+        observations.record_worker_activation(key, caller, caller.thread()),
+        Ok(ObservationAck::Duplicate)
+    );
+    let tid = pm.create_thread(key.process.pid, 0x4000, 0, false).unwrap();
+    let other = ProviderLogicalCaller::capture(
+        ThreadBinding {
+            tid: u64::from(tid),
+            badge: 615,
+            tcb: 14,
+            ..binding
+        },
+        pm.thread_lifetime(tid).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        observations.record_worker_activation(key, other, other.thread()),
+        Err(ObservationError::WorkerLimit)
+    );
+    assert_eq!(
+        observations
+            .historical_snapshot(key)
+            .unwrap()
+            .worker_activations(),
+        &[caller]
+    );
+}
+
+#[test]
+fn gui_kind_limit_allows_existing_count_without_per_event_allocation() {
+    let (_, _, caller, key) = fixture();
+    let mut observations = Observations::new(ObservationLimits {
+        processes: 1,
+        workers_per_process: 0,
+        gui_kinds_per_process: 1,
+    });
+    observations.register(key, Role::Shell, 42).unwrap();
+    observations
+        .record_main_publication(key, caller, caller.thread())
+        .unwrap();
+    assert_eq!(
+        observations.record_gui_fact(key, caller, caller.thread(), Fact::Window, 1),
+        Ok(1)
+    );
+    assert_eq!(
+        observations.record_gui_fact(key, caller, caller.thread(), Fact::Window, 3),
+        Ok(4)
+    );
+    assert_eq!(
+        observations.record_gui_fact(key, caller, caller.thread(), Fact::Draw, 1),
+        Err(ObservationError::GuiKindLimit)
+    );
+    let snapshot = observations.historical_snapshot(key).unwrap();
+    assert_eq!(snapshot.gui_fact_kinds(), 1);
+    assert_eq!(snapshot.gui_count(Fact::Window), 4);
+    assert_eq!(snapshot.gui_count(Fact::Draw), 0);
+}
+
+#[test]
+fn zero_limits_are_valid_and_refuse_only_the_configured_category() {
+    let (_, _, caller, key) = fixture();
+    let mut empty = Observations::new(ObservationLimits {
+        processes: 0,
+        workers_per_process: 0,
+        gui_kinds_per_process: 0,
+    });
+    assert_eq!(
+        empty.register(key, Role::Shell, 42),
+        Err(ObservationError::ProcessLimit)
+    );
+    assert!(empty.historical_snapshot(key).is_none());
+    let mut observations = Observations::new(ObservationLimits {
+        processes: 1,
+        workers_per_process: 0,
+        gui_kinds_per_process: 0,
+    });
+    observations.register(key, Role::Shell, 42).unwrap();
+    observations
+        .record_main_publication(key, caller, caller.thread())
+        .unwrap();
+    assert_eq!(
+        observations.record_worker_activation(key, caller, caller.thread()),
+        Err(ObservationError::WorkerLimit)
+    );
+    assert_eq!(
+        observations.record_gui_fact(key, caller, caller.thread(), Fact::Window, 1),
+        Err(ObservationError::GuiKindLimit)
+    );
+    let snapshot = observations.historical_snapshot(key).unwrap();
+    assert!(snapshot.worker_activations().is_empty());
+    assert_eq!(snapshot.gui_fact_kinds(), 0);
+    assert_eq!(snapshot.main_publication(), Some(caller));
 }
