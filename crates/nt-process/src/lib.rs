@@ -24,6 +24,7 @@ pub mod job;
 pub mod job_abi;
 mod initial_system;
 pub mod native_handle;
+pub mod native_handle_search;
 mod native_section_file_source;
 mod native_section_handle;
 mod registry_key_handle;
