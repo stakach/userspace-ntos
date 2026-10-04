@@ -19,6 +19,7 @@ mod native_acl;
 pub mod native_acl_inheritance;
 mod native_sd;
 mod port;
+mod section_security;
 pub mod se_exports;
 mod sid;
 pub mod subject_context;
@@ -83,6 +84,9 @@ pub use native_sd::{
 };
 pub use port::{
     validate_secure_port_connect, SecurePortConnectSecurity, STATUS_SERVER_SID_MISMATCH,
+};
+pub use section_security::{
+    assign_section_security, authorize_section_open, SECTION_GENERIC_MAPPING,
 };
 pub use sid::{write_native_sid_sddl_utf16, Luid, Sid, STATUS_INVALID_SID};
 pub use subject_context::{
