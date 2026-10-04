@@ -149,8 +149,10 @@ in `extern-rootserver` mode (bring your own root task).
 The desktop target hosts **real, unmodified GPL ReactOS binaries** on rust-micro.
 Genuine Explorer and native acceptance are tracked in
 [issue #18](https://github.com/stakach/userspace-ntos/issues/18).
-[Fresh logon-rendering evidence](docs/evidence/issue18-bounded-source-logon.json)
-includes the real credential dialog, but does not establish Explorer desktop boot.
+[Earlier logon-rendering evidence](docs/evidence/issue18-bounded-source-logon.json)
+includes the credential dialog. The newer [media-policy boot](docs/evidence/issue18-livecd-setup-user-reference-failure.json)
+stopped at a USER-object ownership failure with only a blue background. Neither
+run establishes current Explorer desktop boot.
 Crate CI does not prove desktop boot. To attempt a boot from a fresh clone:
 
 ```sh
