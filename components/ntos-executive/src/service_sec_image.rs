@@ -10323,11 +10323,42 @@ pub(crate) unsafe fn service_sec_image(
                     park_and_log!(pi, b"wl-stack-growth", m0, addr);
                 }
             }
-            // Dynamic stack growth (Windows guard-page style): grow only inside the faulting
-            // thread's recorded stack reservation, and only if the page immediately above the fault
-            // is already a registered stack page for the same process. This replaces the historical
-            // global floor with per-thread NT stack metadata.
-            if m3 & 1 == 0 {
+            match crate::hosted_stack_growth::service_hosted_stack_growth(
+                &mut nt_handler, pi, badge, addr, pml4, scratch_base,
+                vm_fault_access_from_x86_error(m3),
+            ) {
+                Ok(Some(nt_thread_start::stack_vad::StackVadOutcome::Grown)) => {
+                    note_boot_progress(BootProgress::PageMappingPublished);
+                    faults += 1;
+                    procs[pi].faults = faults;
+                    procs[pi].first = first;
+                    procs[pi].ntfaults = ntfaults;
+                    pfilled[pi] = *filled_pages;
+                    let (nb, nmi, nm0, nm1, nm2, nm3) =
+                        component_reply_recv!(fault_ep, 0, 0, 0, 0, 0);
+                    badge = nb;
+                    mi = nmi;
+                    m0 = nm0;
+                    m1 = nm1;
+                    m2 = nm2;
+                    m3 = nm3;
+                    continue;
+                }
+                Ok(Some(_)) => {
+                    print_str(b"[stack-guard] overflow; retaining fault Reply\n");
+                    park_and_log!(pi, b"stack-overflow", m0, addr);
+                }
+                Ok(None) => {}
+                Err(status) => {
+                    print_str(b"[stack-guard] failed status=");
+                    print_hex(status);
+                    print_str(b"\n");
+                    park_and_log!(pi, b"stack-guard", m0, addr);
+                }
+            }
+            // Fixed bootstrap transport stacks do not own caller VAD reservations. Their
+            // contiguous backing path must never replace caller-owned NT stack policy.
+            if m3 & 1 == 0 && process_vm_region_map(pi).is_some_and(|map| map.extent_at(page).is_none()) {
                 if let Some((allocation_base, stack_base, role)) =
                     nt_handler.hosted_thread_user_stack_for_badge(badge, pi)
                 {

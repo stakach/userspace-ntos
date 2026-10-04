@@ -56,6 +56,7 @@ mod lpc_server;
 mod ntoskrnl_shared;
 mod server;
 mod service_sec_image;
+mod hosted_stack_growth;
 mod storage_host;
 mod bootstrap_image;
 mod system_modules;
@@ -8168,6 +8169,7 @@ fn client_frame_registry_stats() -> ClientFrameRegistryStats {
 }
 fn client_frame_registry_process_is_empty(pi: u64) -> bool {
     temporary_frame_alias::process_available(pi)
+        && hosted_private_page_installation::process_available(pi)
         && unsafe { (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).is_process_empty(pi) }
 }
 /// Record GUI client `pi`'s frame cap `fr` for page VA `page` (once per (pi,page)).
@@ -8329,6 +8331,10 @@ pub(crate) unsafe fn csrss_frame_drop_process_all(
     process: nt_memory_manager::ProcessIdentity,
     handler: &ExecNtHandler,
 ) -> Result<u64, u32> {
+    hosted_private_page_installation::drain_for_process(handler, process)?;
+    if !hosted_private_page_installation::process_available(pi) {
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
     let lifetime = nt_memory_manager::MemoryLifetime::Process(process);
     let access = retirement_memory_access::Access::Process { process, handler };
     let mut dropped = 0u64;
@@ -12237,6 +12243,7 @@ unsafe fn vm_frame_return_to_free_list(frame: u64) {
         return;
     }
     assert!(!frame_acquisition::owns_root_cap(frame), "frame acquisition retains this owner");
+    assert!(!hosted_private_page_installation::owns_root_cap(frame), "private installation retains this owner");
     assert!(!ps_object_backing::owns_root_cap(frame), "canonical Ps backing retains this owner");
     temporary_frame_alias::drain()
         .expect("legacy frame publication requires completed temporary-frame alias retirement");
@@ -12250,6 +12257,8 @@ unsafe fn vm_frame_release_unmapped(frame: u64) {
 }
 
 unsafe fn vm_frame_release(frame: u64, alias_cap: u64) {
+    assert!(!hosted_private_page_installation::owns_root_cap(frame), "private installation retains this owner");
+    assert!(!hosted_private_page_installation::owns_root_cap(alias_cap), "private installation retains this alias");
     assert!(!frame_acquisition::owns_root_cap(frame), "frame acquisition retains this owner");
     assert!(!frame_acquisition::owns_root_cap(alias_cap), "frame acquisition retains this alias slot");
     assert!(!ps_object_backing::owns_root_cap(frame), "canonical Ps backing retains this owner");
@@ -12382,65 +12391,9 @@ unsafe fn vm_map_private_page(
     pml4: u64,
     scratch_base: u64,
 ) -> Result<(), u32> {
-    let process = handler.capture_process_identity(pi)
-        .ok_or(nt_address_space::STATUS_ACCESS_VIOLATION)?;
-    let lifetime = nt_memory_manager::MemoryLifetime::Process(process);
-    hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
-    if handler.restore_process_pagefile_page(pi, page, pml4, scratch_base)? {
-        return Ok(());
-    }
-    handler.ensure_process_working_set_admission(pi, page, scratch_base)?;
-    vm_ensure_private_pt(handler, pi, page, pml4)?;
-    let frame = match vm_frame_acquire(scratch_base) {
-        Ok(frame) => frame,
-        Err(status) => {
-            VM_FAIL_FRAME.fetch_add(1, Ordering::Relaxed);
-            return Err(status);
-        }
-    };
-    let map_label = page_map_r(frame, page, vm_page_rights(protection), pml4);
-    if map_label != 0 {
-        vm_frame_release(frame, 0);
-        if VM_FAIL_MAP.fetch_add(1, Ordering::Relaxed) < 8 {
-            // Name the refusal instead of collapsing it into STATUS_INSUFFICIENT_RESOURCES:
-            // label 8 (`seL4_DeleteFirst`) = the leaf PTE is ALREADY occupied, i.e. a VA collision,
-            // not an exhausted pool. `known` says whether the frame registry knows that mapping.
-            let known = csrss_frame_get_exact(pi as u64, page).0;
-            print_str(b"[vm-map-fail] pi=");
-            print_u64(pi as u64);
-            print_str(b" page=0x");
-            print_hex((page >> 32) as u32);
-            print_hex(page as u32);
-            print_str(b" prot=0x");
-            print_hex(protection);
-            print_str(b" label=");
-            print_u64(map_label);
-            print_str(b" known-frame=0x");
-            print_hex(known as u32);
-            print_str(b"\n");
-        }
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    let mut alias = 0;
-    let mut alias_cap = 0;
-    if page >= SMSS_ALLOC_VA && page < SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
-        alias = heap_mirror_for_pi(pi) + (page - SMSS_ALLOC_VA);
-        let (copied, copy_error) = copy_cap_r(frame);
-        if copy_error != 0 || page_map_r(copied, alias, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
-            let _ = cnode_delete_recycle_r(copied);
-            vm_frame_release(frame, 0);
-            VM_FAIL_ALIAS.fetch_add(1, Ordering::Relaxed);
-            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-        }
-        alias_cap = copied;
-    }
-    if !csrss_frame_put_at_cap(pi as u64, lifetime, page, frame, alias, alias_cap) {
-        vm_frame_release(frame, alias_cap);
-        VM_FAIL_REGISTRY.fetch_add(1, Ordering::Relaxed);
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    vm_watch(b"map", pi, page, frame);
-    Ok(())
+    hosted_private_page_installation::map_private_page(
+        handler, pi, page, protection, pml4, scratch_base,
+    )
 }
 
 /// A bounded map/unmap WATCH over one private-VM page window, so the LIFE of a colliding VA is
@@ -14515,6 +14468,7 @@ mod ps_object_provider;
 mod thread_mechanism_retirement;
 mod ps_object_backing;
 mod frame_acquisition;
+mod hosted_private_page_installation;
 mod frame_recycle;
 mod client_frame_cleanup;
 mod retirement_memory_access;

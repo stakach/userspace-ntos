@@ -220,7 +220,7 @@ impl ExecNtHandler {
         )
     }
 
-    pub(super) unsafe fn process_memory_read_status(
+    pub(crate) unsafe fn process_memory_read_status(
         &mut self,
         pi: usize,
         address: u64,

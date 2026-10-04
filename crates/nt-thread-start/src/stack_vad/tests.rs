@@ -231,6 +231,60 @@ fn guard_growth_consumes_exact_guard_preserves_other_pages_and_charges_one_page(
 }
 
 #[test]
+fn csrss_loader_growth_publishes_writable_consumed_guards_and_preserves_next_guard() {
+    use nt_address_space::copy::{copy_page_plan_checked, CopyPagePlan};
+    use nt_address_space::{FaultAccess, MEM_COMMIT};
+
+    let mut shape = StackGeometry {
+        allocation_base: 0x3002_0000,
+        stack_base: 0x3012_0000,
+        stack_limit: 0x3011_f000,
+        guard_base: Some(0x3011_e000),
+    };
+    let mut current = VmRegionMap::<24>::new(PAGE_SIZE, 0x4000_0000);
+    let mut candidate = current;
+    let before = current;
+    prepare_initial_into(&before, &mut candidate, shape, PAGE_READWRITE, u64::MAX)
+        .unwrap().apply_exact(&mut current).unwrap();
+
+    for old_guard in [0x3011_e000, 0x3011_d000, 0x3011_c000] {
+        assert_eq!(shape.guard_base, Some(old_guard));
+        let before = current;
+        let committed_before = before.committed_bytes();
+        let plan = prepare_guard_growth_into(
+            &before, &mut candidate, shape, old_guard + 0xa8, RW, PAGE_SIZE,
+        ).unwrap();
+        let changes = plan.changes();
+        assert_eq!(changes.outcome, StackVadOutcome::Grown);
+        assert_eq!(changes.commit_base, Some(old_guard - PAGE_SIZE));
+        assert_eq!(changes.commit_bytes, PAGE_SIZE);
+        assert_eq!(before.protection_at(old_guard), Some(PAGE_READWRITE | PAGE_GUARD));
+        plan.apply_exact(&mut current).unwrap();
+        shape = changes.geometry;
+        assert_eq!(current.committed_bytes(), committed_before + PAGE_SIZE);
+
+        let consumed = current.query_basic(old_guard, 0x4000_0000).unwrap();
+        assert_eq!(consumed.state, MEM_COMMIT);
+        assert_eq!(consumed.protect, PAGE_READWRITE);
+        assert!(matches!(copy_page_plan_checked(old_guard, consumed, FaultAccess::Write, false),
+            Ok(CopyPagePlan::Resident(_))));
+
+        let new_guard = changes.new_guard.unwrap();
+        let guarded = current.query_basic(new_guard, 0x4000_0000).unwrap();
+        assert_eq!(guarded.state, MEM_COMMIT);
+        assert_eq!(guarded.protect, PAGE_READWRITE | PAGE_GUARD);
+        assert!(matches!(copy_page_plan_checked(new_guard, guarded, FaultAccess::Write, false),
+            Ok(CopyPagePlan::ConsumeGuard(_))),
+            "a typed write must consume/report the next guard, never treat it as ordinary writable backing");
+        assert_eq!(current.extent_at(new_guard - PAGE_SIZE).unwrap().state, VmExtentState::Reserved);
+    }
+    let handle_page = 0x3011_d000;
+    assert!(matches!(copy_page_plan_checked(
+        handle_page, current.query_basic(handle_page, 0x4000_0000).unwrap(), FaultAccess::Write, false,
+    ), Ok(CopyPagePlan::Resident(_))));
+}
+
+#[test]
 fn executable_stack_policy_is_preserved() {
     let shape = geometry(11);
     let before = initialized(shape, PAGE_EXECUTE_READWRITE);
