@@ -2,6 +2,57 @@ use std::path::PathBuf;
 use syn::parse::Parser;
 use syn::visit::Visit;
 
+#[test]
+fn local_data_section_creation_retains_admission_in_the_common_work_owner() {
+    let file = source("section_metadata_work.rs");
+    let body = function(&file, "submit_local_data");
+    let mut calls = Calls::default();
+    calls.visit_block(&body);
+    assert!(calls.0.iter().any(|call| call == "retain_work"));
+    for forbidden in ["reserve", "mount_id_for_live_device", "capture_native_section_source"] {
+        assert!(!calls.0.iter().any(|call| call == forbidden), "local work must not fabricate provider admission via {forbidden}");
+    }
+    let work = file.items.iter().find_map(|item| match item {
+        syn::Item::Struct(item) if item.ident == "Work" => Some(item),
+        _ => None,
+    }).unwrap();
+    assert!(work.fields.iter().any(|field| field.ident.as_ref().is_some_and(|name| name == "data_admission")),
+        "the Work owns captured Section subject and namespace refs across waits");
+}
+
+#[test]
+fn committed_data_section_copyout_faults_do_not_abort_or_replay_publication() {
+    let file = source("section_metadata_work.rs");
+    let body = function(&file, "copy_data_section_output");
+    let mut calls = Calls::default();
+    calls.visit_block(&body);
+    assert!(calls.0.iter().any(|call| call == "process_memory_write_checked"));
+    for forbidden in ["publish", "abort", "close_native_table_handle"] {
+        assert!(!calls.0.iter().any(|call| call == forbidden), "a committed DATA copy must not repeat or withdraw {forbidden}");
+    }
+    struct Policy { fault: bool, retry: bool, retained: bool }
+    impl<'ast> Visit<'ast> for Policy {
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            for segment in &path.path.segments {
+                self.fault |= segment.ident == "UserFault";
+                self.retry |= segment.ident == "Retry";
+                self.retained |= segment.ident == "Indeterminate";
+            }
+            syn::visit::visit_expr_path(self, path);
+        }
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            for segment in &path.segments {
+                self.fault |= segment.ident == "UserFault";
+                self.retry |= segment.ident == "Retry";
+            }
+            syn::visit::visit_path(self, path);
+        }
+    }
+    let mut policy = Policy { fault: false, retry: false, retained: false };
+    policy.visit_block(&body);
+    assert!(policy.fault && policy.retry && policy.retained);
+}
+
 fn source(name: &str) -> syn::File {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../components/ntos-executive/src")

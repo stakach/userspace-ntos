@@ -87,6 +87,9 @@ pub(crate) mod directory_security;
 #[path = "exec_namespace_security.rs"]
 mod namespace_security;
 
+#[path = "exec_named_data_sections.rs"]
+pub(crate) mod named_data_sections;
+
 #[path = "exec_section_create.rs"]
 pub(crate) mod section_create;
 
@@ -3955,6 +3958,8 @@ impl ExecNtHandler {
         );
         write_field!(obj_ns, obj_ns);
         write_field!(directory_security, directory_security);
+        write_field!(data_section_security, Vec::new());
+        write_field!(data_section_names, Vec::new());
         write_field!(image_sections, native_image_sections::NativeImageStore::new());
         write_field!(process_image_owners, Vec::new());
         write_field!(native_image_views, Vec::new());
@@ -20312,8 +20317,8 @@ impl ExecNtHandler {
                             self.image_sections.withdraw_permanent(image)
                                 .expect("unlinked image Section releases its name reference");
                         }
-                    } else if let Some(loop_ctx) = self.loop_ctx {
-                        unsafe { let _ = (&mut *loop_ctx.generic_sections).release_handle(section as usize); }
+                    } else {
+                        self.data_section_last_handle_closed(section as usize);
                     }
                 }
             }
@@ -40582,12 +40587,6 @@ impl ExecNtHandler {
                         basic_info[8..12]
                             .copy_from_slice(&section.basic_attributes().to_le_bytes());
                         basic_info[16..24].copy_from_slice(&section.size.to_le_bytes());
-                    } else if *ctx.nls_section_handle != 0 && sect == *ctx.nls_section_handle {
-                        let nls_size =
-                            core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x74) as *const u32)
-                                as u64;
-                        basic_info[8..12].copy_from_slice(&SECTION_ATTR_SEC_FILE.to_le_bytes());
-                        basic_info[16..24].copy_from_slice(&nls_size.to_le_bytes());
                     } else {
                         return native_section.err().unwrap_or(nt_process::STATUS_INVALID_HANDLE);
                     }
@@ -40844,21 +40843,15 @@ impl ExecNtHandler {
                 if !self.probe_user_output(out, core::mem::size_of::<u64>()) {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                let attributes = if args[2] == 0 {
-                    0
+                let _durable = allocator::enter_durable();
+                let captured = if args[2] == 0 {
+                    CapturedNamedObjectAttributes { root: 0, attributes: 0, security_descriptor: 0,
+                        path_len: None, path: [0; NAMED_OBJECT_PATH_CAP] }
                 } else {
-                    let Some(oa) = self.capture_object_attributes(args[2]) else {
-                        return STATUS_ACCESS_VIOLATION;
-                    };
-                    if oa.length as usize != core::mem::size_of::<nt_ntdll_layout::ObjectAttributes>()
-                        || oa.root_directory != 0
-                        || oa.object_name != 0
-                        || oa.security_descriptor != 0
-                        || oa.security_quality_of_service != 0
-                    {
-                        return nt_process::STATUS_INVALID_PARAMETER;
+                    match self.capture_named_object_attributes(args[2]) {
+                        Ok(captured) => captured,
+                        Err(status) => return status,
                     }
-                    oa.attributes
                 };
                 let Some(caller_pid) = self.pm_pid_for_pi(self.pi) else {
                     return nt_fs::STATUS_INVALID_HANDLE;
@@ -40870,63 +40863,11 @@ impl ExecNtHandler {
                 if caller.effective_process() != caller_pid {
                     return nt_fs::STATUS_INVALID_HANDLE;
                 }
-
-                if sec_file != 0 {
-                    let source = match self.pm.lookup_native_section_file_source(caller, sec_file) {
-                        Ok(source) => source,
-                        Err(status) => return status,
-                    };
-                    if matches!(source.object(), nt_process::HandleObject::RoutedFile { .. }) {
-                        return match crate::section_metadata_work::submit_hosted(
-                            self, caller, source, out, desired_access, attributes, maxsize,
-                            page_protection, allocation_attrs, sec_file, None,
-                        ) {
-                            Ok(()) => 0x0000_0103,
-                            Err(status) => status,
-                        };
-                    }
-                }
-
-                let owner_pi = self.pi;
-                let mut reserved = match self.reserve_generic_data_section(
-                    caller, owner_pi, desired_access, attributes, maxsize,
-                    page_protection, allocation_attrs, sec_file, None,
-                ) {
-                    Ok(reserved) => reserved,
+                let admission = match self.prepare_data_section_name(&captured, caller, desired_access, true) {
+                    Ok(admission) => admission,
                     Err(status) => return status,
                 };
-                let h = reserved.value();
-                let backing_size = reserved.size;
-                if !self.user_memory_write(
-                    SyscallUserMemory::CurrentProcess,
-                    out,
-                    &h.to_le_bytes(),
-                ) {
-                    reserved.abort(self);
-                    return STATUS_ACCESS_VIOLATION;
-                }
-                reserved.publish(self)
-                    .expect("uncontended Section publication follows syscall output copy");
-                print_str(b"[section] create generic pi=");
-                print_u64(self.pi as u64);
-                print_str(b" handle=0x");
-                print_hex(h as u32);
-                print_str(b" size=0x");
-                print_hex((backing_size >> 32) as u32);
-                print_hex(backing_size as u32);
-                print_str(b" file=0x");
-                print_hex(sec_file as u32);
-                print_str(b"\n");
-                loader_trace_record(
-                    self.pi,
-                    LoaderOp::CreateSection,
-                    0,
-                    registry_slot,
-                    sec_file,
-                    h,
-                    b"",
-                );
-                0
+                self.create_admitted_data_section(caller, out, maxsize, page_protection, allocation_attrs, sec_file, admission)
             },
             // NtMapViewOfSection captured args: SectionHandle=args[0], ProcessHandle=args[1],
             // *BaseAddress=args[2], ZeroBits=args[3], CommitSize=args[4],
@@ -41063,59 +41004,6 @@ impl ExecNtHandler {
                         );
                         STATUS_INVALID_IMAGE_FORMAT
                     }
-                } else if *ctx.nls_section_handle != 0 && sect == *ctx.nls_section_handle {
-                    // The named NLS section \Nls\NlsSectionCP20127: map the staged c_20127.nls frames
-                    // into csrss at a VA past the DLL bases (same 0x8000_0000 PDPT slot, whose PD the
-                    // DLL loads already created), then hand back *BaseAddress / *ViewSize.
-                    const NLS_SECTION_CSRSS_VA: u64 = 0x0000_0000_A000_0000;
-                    let nls_start = NLS_20127_START.load(Ordering::Relaxed);
-                    let nls_size =
-                        core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x74) as *const u32)
-                            as u64;
-                    let npages = (nls_size + 0xFFF) / 0x1000;
-                    // The DLL arena PD covers this 1 GiB PDPT slot. The leaf table remains a
-                    // process-owned MM resource and must be charged before it becomes visible.
-                    if let Err(status) =
-                        ensure_process_user_page_table(self, self.pi, NLS_SECTION_CSRSS_VA, pml4)
-                    {
-                        return status;
-                    }
-                    for i in 0..npages {
-                        let _ = page_map(
-                            copy_cap(nls_start + i),
-                            NLS_SECTION_CSRSS_VA + i * 0x1000,
-                            RW_NX,
-                            pml4,
-                        );
-                    }
-                    if !self.user_memory_write(
-                        SyscallUserMemory::CurrentProcess,
-                        args[2],
-                        &NLS_SECTION_CSRSS_VA.to_le_bytes(),
-                    ) {
-                        return STATUS_ACCESS_VIOLATION;
-                    }
-                    let vs_ptr = args[6];
-                    if vs_ptr != 0 {
-                        if !self.user_memory_write(
-                            SyscallUserMemory::CurrentProcess,
-                            vs_ptr,
-                            &nls_size.to_le_bytes(),
-                        ) {
-                            return STATUS_ACCESS_VIOLATION;
-                        }
-                    }
-                    print_str(b"[ntos-exec] NtMapViewOfSection NlsCP20127 -> base 0xA0000000\n");
-                    loader_trace_record(
-                        self.pi,
-                        LoaderOp::MapViewOfSection,
-                        0,
-                        None,
-                        sect,
-                        NLS_SECTION_CSRSS_VA,
-                        b"",
-                    );
-                    0
                 } else {
                     const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
                     const PROCESS_VM_OPERATION: u32 = 0x0008;

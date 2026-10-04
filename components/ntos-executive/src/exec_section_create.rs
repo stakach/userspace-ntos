@@ -18,6 +18,9 @@ pub(crate) struct ReservedGenericDataSection {
 }
 
 impl ReservedGenericDataSection {
+    pub(crate) fn identity(&self) -> nt_memory_manager::SectionIdentity {
+        self.identity
+    }
     pub(crate) fn value(&self) -> u64 {
         self.publication.value()
     }
@@ -34,6 +37,7 @@ impl ReservedGenericDataSection {
     }
 
     pub(crate) fn abort(&mut self, handler: &mut ExecNtHandler) {
+        handler.withdraw_data_section_name(self.identity);
         let sections = unsafe {
             &mut *handler
                 .loop_ctx
@@ -46,6 +50,7 @@ impl ReservedGenericDataSection {
             Ok(Some(self.index as nt_process::SectionId)),
         );
         sections.clear_section(self.index);
+        handler.sweep_data_section_security();
     }
 
     pub(crate) fn into_object_reference(
@@ -53,17 +58,26 @@ impl ReservedGenericDataSection {
         handler: &mut ExecNtHandler,
     ) -> Result<(nt_memory_manager::SectionReference, u64, u32), u32> {
         let sections = unsafe {
-            &mut *handler.loop_ctx.expect("reserved Section context").generic_sections
+            &mut *handler
+                .loop_ctx
+                .expect("reserved Section context")
+                .generic_sections
         };
         assert_eq!(sections.section_identity(self.index), Some(self.identity));
-        let protection = sections.section(self.index).expect("reserved Section").protection;
+        let protection = sections
+            .section(self.index)
+            .expect("reserved Section")
+            .protection;
         let Some(reference) = sections.retain_section(self.identity) else {
             self.abort(handler);
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
         };
         // The object reference must fence backing lifetime before canceling its invisible handle.
-        if self.publication.abort(&mut handler.pm) != Ok(Some(self.index as nt_process::SectionId)) {
-            unsafe { crate::provider_bugcheck::report(0xc4, [self.index as u64, self.size, 0, 91]); }
+        if self.publication.abort(&mut handler.pm) != Ok(Some(self.index as nt_process::SectionId))
+        {
+            unsafe {
+                crate::provider_bugcheck::report(0xc4, [self.index as u64, self.size, 0, 91]);
+            }
         }
         let sections = unsafe { &mut *handler.loop_ctx.expect("Section context").generic_sections };
         assert_eq!(sections.section_identity(self.index), Some(self.identity));
@@ -73,17 +87,14 @@ impl ReservedGenericDataSection {
 }
 
 impl ExecNtHandler {
-    pub(crate) fn native_section_owner_pi(
-        &self,
-        caller: NativeHandleCaller,
-    ) -> Result<usize, u32> {
+    pub(crate) fn native_section_owner_pi(&self, caller: NativeHandleCaller) -> Result<usize, u32> {
         (0..MAX_PI)
             .find(|&pi| self.pm_pid_for_pi(pi) == Some(caller.effective_process()))
             .ok_or(nt_fs::STATUS_INVALID_HANDLE)
     }
 
-    /// Reserve a real section and an invisible native handle. The caller must publish only after
-    /// output delivery, or abort to retire the section and its retained backing reference.
+    /// Reserve a real section and an invisible native handle. Publish at the admitted commit
+    /// boundary, or abort before commit to retire the section and retained backing reference.
     pub(crate) unsafe fn reserve_generic_data_section(
         &mut self,
         caller: NativeHandleCaller,
@@ -123,7 +134,9 @@ impl ExecNtHandler {
                     admission.capture.granted_access(),
                 )
             } else {
-                let source = self.pm.lookup_native_section_file_source(caller, sec_file)?;
+                let source = self
+                    .pm
+                    .lookup_native_section_file_source(caller, sec_file)?;
                 (source.object(), source.granted_access())
             };
             nt_memory_manager::data_section::check_data_section_file_access(
@@ -137,7 +150,10 @@ impl ExecNtHandler {
                     object_id,
                 } => {
                     let (backing, lease) = local_section_file::reserve_disk_source(
-                        self, object_id, first_cluster, size,
+                        self,
+                        object_id,
+                        first_cluster,
+                        size,
                     )?;
                     local_lease = Some(lease);
                     (backing, None)
@@ -185,7 +201,12 @@ impl ExecNtHandler {
             match routed_size {
                 Some(size) => (backing, size),
                 None => {
-                    match service_prepare_data_section_file(backing, maxsize, page_protection, access) {
+                    match service_prepare_data_section_file(
+                        backing,
+                        maxsize,
+                        page_protection,
+                        access,
+                    ) {
                         Ok(prepared) => prepared,
                         Err(status) => {
                             if let Some(lease) = local_lease {

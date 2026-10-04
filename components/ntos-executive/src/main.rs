@@ -1988,11 +1988,6 @@ pub const NLS_OEM_VADDR: u64 = 0x0000_0100_10B2_0000; // c_437.nls (66594 B = 17
 pub const NLS_OEM_FRAMES: u64 = 20;
 pub const NLS_CASE_VADDR: u64 = 0x0000_0100_10B4_0000; // l_intl.nls (4870 B = 2 pages)
 pub const NLS_CASE_FRAMES: u64 = 4;
-/// c_20127.nls (US-ASCII, CP20127; 66082 B = 17 pages) — csrss's Win32 client stack maps the named
-/// section \Nls\NlsSectionCP20127 during a DllMain. Shares the NLS input 0xA0-0xC0 page table so it
-/// needs no extra PT. Placed past the SYSTEM hive buffer.
-pub const NLS_20127_VADDR: u64 = 0x0000_0100_10B9_0000;
-pub const NLS_20127_FRAMES: u64 = 20;
 /// The installed ReactOS SYSTEM registry hive (::ROSSYS.HIV, ~204 KiB regf), read off the disk by
 /// the isolated storage host into these shared frames. Boot composition imports it once and hands
 /// the resulting image to isolated CM; it is not a runtime executive registry view.
@@ -2001,7 +1996,7 @@ pub const HIVEBUF_FRAMES: u64 = 64; // 256 KiB
 /// The real ReactOS **SECURITY** hive (`\reactos\system32\config\security`, 8 KiB regf) — the LSA
 /// policy database's on-disk backing store. Read BY PATH off the image by the isolated storage
 /// host, exactly like the SYSTEM hive, and mounted read-only at `\Registry\Machine\SECURITY`.
-/// Shares the 0xA0-0xC0 input page table (placed past NLS_20127).
+/// Shares the 0xA0-0xC0 input page table.
 pub const SECHIVEBUF_VADDR: u64 = 0x0000_0100_10BB_0000;
 pub const SECHIVEBUF_FRAMES: u64 = 8; // 32 KiB (the staged hive is 8 KiB)
 /// The real ReactOS **SAM** hive (`\reactos\system32\config\sam`, 8 KiB regf), mounted read-only at
@@ -22470,9 +22465,6 @@ struct ExecLoopCtx {
     /// PML4/scratch through the access-checked target pid rather than the caller's active context.
     procs: *mut [ProcExec],
     pfilled: *mut [[u64; 512]],
-    /// The named NLS section handle (\Nls\NlsSectionCP20127) NtOpenSection records so
-    /// NtMapViewOfSection can back it. Points at the loop-local `nls_section_handle`.
-    nls_section_handle: *mut u64,
     /// The DLL registry (csrsrv/basesrv/winsrv + the Win32 client stack): name→index resolution,
     /// per-DLL file/section-handle tracking, and image-info synthesis for the file/section fakes.
     reg: *mut nt_dll_registry::Registry,
@@ -22948,6 +22940,8 @@ struct ExecNtHandler {
     /// vector grows beyond its boot reserve when required.
     obj_ns: alloc::vec::Vec<ObjEntry>,
     directory_security: alloc::vec::Vec<exec_handler::directory_security::DirectorySecurityRecord>,
+    data_section_security: alloc::vec::Vec<exec_handler::named_data_sections::DataSectionSecurity>,
+    data_section_names: alloc::vec::Vec<exec_handler::named_data_sections::DataSectionName>,
     /// Native image Section identities and their exact file-backed lifetime.
     image_sections: native_image_sections::NativeImageStore,
     /// Canonical image execution references independent of their creator's Section handles.
@@ -26121,7 +26115,6 @@ static NTALLOC_SERVICED: AtomicU64 = AtomicU64::new(0);
 static NLS_ANSI_START: AtomicU64 = AtomicU64::new(0);
 static NLS_OEM_START: AtomicU64 = AtomicU64::new(0);
 static NLS_CASE_START: AtomicU64 = AtomicU64::new(0);
-static NLS_20127_START: AtomicU64 = AtomicU64::new(0);
 static NLS_ANSI_SIZE: AtomicU64 = AtomicU64::new(0);
 static NLS_OEM_SIZE: AtomicU64 = AtomicU64::new(0);
 static NLS_CASE_SIZE: AtomicU64 = AtomicU64::new(0);
@@ -29092,21 +29085,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             NLS_ANSI_START.store(nls_starts[0], Ordering::Relaxed);
             NLS_OEM_START.store(nls_starts[1], Ordering::Relaxed);
             NLS_CASE_START.store(nls_starts[2], Ordering::Relaxed);
-            // c_20127.nls (US-ASCII CP20127) — also shares the input 0xA0-0xC0 PT (at 0xB9_0000,
-            // past HIVEBUF), so map its contiguous frame run in the executive with no extra PT.
-            let nls20127_start = alloc_frame();
-            for _ in 1..NLS_20127_FRAMES {
-                let _ = alloc_frame();
-            }
-            for i in 0..NLS_20127_FRAMES {
-                let _ = page_map(
-                    copy_cap(nls20127_start + i),
-                    NLS_20127_VADDR + i * 0x1000,
-                    RW_NX,
-                    CAP_INIT_THREAD_VSPACE,
-                );
-            }
-            NLS_20127_START.store(nls20127_start, Ordering::Relaxed);
             // The real SYSTEM hive buffer (64 frames, shares the 0xA0-0xC0 PT), mapped in the
             // executive; the same frames are granted to the storage host in spawn_storage_host.
             let hivebuf_start = alloc_frame();
@@ -29194,7 +29172,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 nls_starts[0],
                 nls_starts[1],
                 nls_starts[2],
-                nls20127_start,
                 hivebuf_start,
                 win32kbuf_start,
                 winlogonbuf_start,

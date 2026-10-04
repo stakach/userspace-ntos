@@ -21,7 +21,6 @@ pub(crate) unsafe fn storage_probe(
     nls_ansi_dest: u64,
     nls_oem_dest: u64,
     nls_case_dest: u64,
-    nls20127_dest: u64,
     win32kbuf_dest: u64,
     winlogonbuf_dest: u64,
 ) -> (u32, u32, u32, u32, u32, u32, u32) {
@@ -376,22 +375,6 @@ pub(crate) unsafe fn storage_probe(
                 if got == want && sz > 0 {
                     *out = sz;
                 }
-            }
-        }
-        // c_20127.nls (US-ASCII CP20127) into `nls20127_dest`; report its size at STORAGE_SHARED+0x74
-        // (a direct write like the DLL size reads, so it doesn't need a tuple return slot). csrss maps
-        // the named section \Nls\NlsSectionCP20127 from this during a DllMain.
-        if let Some((c, sz, _)) = open_or_sys32!(b"c_20127.nls", b"C_20127 NLS") {
-            let cap = (NLS_20127_FRAMES * 0x1000) as u32;
-            let want = if sz < cap { sz } else { cap };
-            let got = fat_read_file(&fs, c, want, nls20127_dest);
-            print_str(b"[storage-host] NLS C_20127 NLS size=");
-            print_u64(sz as u64);
-            print_str(b" read=");
-            print_u64(got as u64);
-            print_str(b"\n");
-            if got == want && sz > 0 {
-                core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x74) as *mut u32, sz);
             }
         }
         // win32k.sys (~2.1 MiB, PE32+) — the ReactOS GUI subsystem kernel driver. Staged into the

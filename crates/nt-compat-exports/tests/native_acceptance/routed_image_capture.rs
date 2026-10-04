@@ -167,12 +167,23 @@ fn routed_image_display_path_is_owned_from_the_same_retained_file() {
     let submit = file.items.iter().find_map(|item| match item {
         Item::Fn(value) if value.sig.ident == "submit_hosted" => Some(value), _ => None,
     }).expect("exact retained Section submission");
-    let mut path = PathCapture { exact: false, retained: false };
-    path.visit_block(&submit.block);
-    assert!(path.exact && path.retained,
-        "image display metadata must be captured and retained from the same canonical File owner");
     let mut calls = Calls::default();
     calls.visit_block(&submit.block);
+    assert!(calls.0.iter().any(|name| name == "submit_hosted_inner"));
+    let capture = file.items.iter().find_map(|item| match item {
+        Item::Fn(value) if value.sig.ident == "submit_hosted_inner" => Some(value), _ => None,
+    }).expect("shared routed File capture");
+    calls.visit_block(&capture.block);
+    assert!(calls.0.iter().any(|name| name == "retain_work"));
+    let retain = file.items.iter().find_map(|item| match item {
+        Item::Fn(value) if value.sig.ident == "retain_work" => Some(value), _ => None,
+    }).expect("shared retained Section work owner");
+    let mut path = PathCapture { exact: false, retained: false };
+    path.visit_block(&capture.block);
+    path.visit_block(&retain.block);
+    assert!(path.exact && path.retained,
+        "image display metadata must be captured and retained from the same canonical File owner");
+    calls.visit_block(&retain.block);
     for forbidden in ["load_file_to_pool", "load_fat", "admit_dynamic_hosted_exe", "get_latest_by_leaf"] {
         assert!(!calls.0.iter().any(|name| name == forbidden), "no path/leaf source selection via {forbidden}");
     }

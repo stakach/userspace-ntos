@@ -971,7 +971,6 @@ pub(crate) unsafe fn spawn_storage_host(
     nls_ansi_start: u64,
     nls_oem_start: u64,
     nls_case_start: u64,
-    nls20127_start: u64,
     hivebuf_start: u64,
     win32kbuf_start: u64,
     winlogonbuf_start: u64,
@@ -1083,7 +1082,6 @@ pub(crate) unsafe fn spawn_storage_host(
         (nls_ansi_start, NLS_ANSI_VADDR, NLS_ANSI_FRAMES),
         (nls_oem_start, NLS_OEM_VADDR, NLS_OEM_FRAMES),
         (nls_case_start, NLS_CASE_VADDR, NLS_CASE_FRAMES),
-        (nls20127_start, NLS_20127_VADDR, NLS_20127_FRAMES),
         (hivebuf_start, HIVEBUF_VADDR, HIVEBUF_FRAMES),
         (
             SECHIVEBUF_START.load(Ordering::Relaxed),

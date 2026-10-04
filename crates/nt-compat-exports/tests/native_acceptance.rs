@@ -18,6 +18,8 @@ mod file_transfer_input_capture;
 mod generic_application_contracts;
 #[path = "native_acceptance/image_process_bridge.rs"]
 mod image_process_bridge;
+#[path = "native_acceptance/named_data_sections.rs"]
+mod named_data_sections;
 #[path = "native_acceptance/directory_security.rs"]
 mod directory_security;
 #[path = "native_acceptance/immediate_iosb_publication.rs"]

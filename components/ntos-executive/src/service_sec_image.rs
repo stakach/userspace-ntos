@@ -2844,6 +2844,7 @@ fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
 
 fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
     nt_handler.sweep_directory_security_bodies();
+    nt_handler.sweep_data_section_security();
     // The journal owns the mounted volume, including all dirty state, until its terminal proof.
     // Leave maintenance flags untouched; an unavailable volume is neither clean nor absent.
     if crate::writable_fs::registry_journal::owns_volume() {
@@ -8139,10 +8140,6 @@ pub(crate) unsafe fn service_sec_image(
     // csrss's loadable DLLs (csrsrv + the ServerDlls basesrv/winsrv) are tracked by the generic
     // nt-dll-registry, built below once their PEs are parsed. Each hosted VSpace gets its own
     // exact dynamic parent paging owner as images map; placement is not paging authority.
-    // The named NLS section \Nls\NlsSectionCP20127 (US-ASCII code-page table) csrss's Win32 client
-    // stack maps during a DllMain. NtOpenSection records the handle; NtMapViewOfSection maps the
-    // staged c_20127.nls frames into csrss.
-    let mut nls_section_handle = 0u64;
     // The bootstrap manifest supplies disk paths,
     // image identity, and runtime layout; each loaded PE is relocated to PE_LOAD_BASE and published
     // into the loaded-image registry below.
@@ -8718,7 +8715,6 @@ pub(crate) unsafe fn service_sec_image(
         pml4,
         procs,
         pfilled,
-        nls_section_handle: &mut nls_section_handle as *mut u64,
         reg: &mut reg as *mut nt_dll_registry::Registry,
         hosted_loaded_images: hosted_loaded_images_ptr,
         exe_images: exe_images as *mut nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP>,
