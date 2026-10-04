@@ -23754,7 +23754,6 @@ static EXEC_NT_HANDLER_INITIALIZED: core::sync::atomic::AtomicBool =
 unsafe fn initialize_exec_nt_handler_once(
     hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
     driver_starts: DriverStartBootstrap,
-    bootstrap_system_journal_records: u32,
 ) -> &'static mut ExecNtHandler {
     assert!(!EXEC_NT_HANDLER_INITIALIZED.swap(true, Ordering::AcqRel),
         "the live executive handler has one owner and cannot be reinitialized");
@@ -23765,7 +23764,6 @@ unsafe fn initialize_exec_nt_handler_once(
         slot,
         hosted_images,
         driver_starts,
-        bootstrap_system_journal_records,
     )
 }
 
@@ -29541,28 +29539,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     shared_ingress_selftest::run();
 
-    let installed_state = exec_handler::provision_reactos_installed_boot_state()
-        .unwrap_or_else(|status| {
-            print_str(b"[setup-state] installed-boot transaction failed status=0x");
-            print_hex(status);
-            print_str(b"\n");
-            panic!("commit ReactOS installed state before SCM selection");
-        });
-    match installed_state.generation {
-        Some(generation) => {
-            print_str(b"[setup-state] ReactOS installed-boot values committed setup/service=");
-            print_u64(installed_state.stats.setup_values as u64);
-            print_str(b"/");
-            print_u64(installed_state.stats.service_values as u64);
-            print_str(b" through CM generation ");
-            print_u64(generation);
-            print_str(b" before SCM selection; pending durable records=");
-            print_u64(installed_state.journal_records as u64);
-            print_str(b"\n");
-        }
-        None => print_str(b"[setup-state] installed SYSTEM state canonical before SCM selection\n"),
-    }
-
     if let Err(status) = publish_acpi_root_devnode_from_registry_policy() {
         print_str(b"[acpi-platform] root devnode publication failed status=");
         print_hex(status.raw() as u32);
@@ -29585,25 +29561,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         nt_config_abi::win32_service_plan_kind::DEMAND_START,
     )
     .expect("query live demand-start Win32 service launch plan");
-    let plugplay_auto = auto_win32_service_snapshot
-        .launches
-        .iter()
-        .any(|launch| launch.service_name.eq_ignore_ascii_case("PlugPlay"));
-    let plugplay_demand = demand_win32_service_snapshot
-        .launches
-        .iter()
-        .any(|launch| launch.service_name.eq_ignore_ascii_case("PlugPlay"));
-    print_str(b"[scm-select] PlugPlay auto/demand=");
-    print_u64(plugplay_auto as u64);
-    print_str(b"/");
-    print_u64(plugplay_demand as u64);
-    print_str(b" from installed SYSTEM generation\n");
-    if installed_state.generation.is_some() {
-        assert!(
-            plugplay_auto && !plugplay_demand,
-            "installed-state transition must classify PlugPlay as auto-start before SCM selection"
-        );
-    }
     let system_boot_driver_plan = system_hive_boot_driver_launch_plan(&boot_driver_snapshot);
     let config_pnp_plan = config_hive_boot_system_pnp_driver_launch_plan(&boot_driver_snapshot);
     let config_demand_pnp_plan = config_hive_demand_pnp_driver_launch_plan(&demand_driver_snapshot);
@@ -31989,7 +31946,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         SCRATCH_BASE,
                         (NTDLL_BASE, smss_ntdll_pe),
                         driver_start_bootstrap,
-                        installed_state.journal_records,
                     );
                     // The service has returned its exclusive borrow. Final observations read only
                     // the retained catalog and canonical process ownership tables, not loop context.

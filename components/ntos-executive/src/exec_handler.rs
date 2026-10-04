@@ -2858,10 +2858,6 @@ fn is_profile_list_sid_key_canon(path: &str) -> bool {
         && comps[7].starts_with("s-")
 }
 
-fn is_system_setup_key_canon(path: &str) -> bool {
-    path.eq_ignore_ascii_case(r"\registry\machine\system\setup")
-}
-
 fn is_dynamic_hive_selector(sel: u32) -> bool {
     HIVE_SEL_DYNAMIC.iter().any(|candidate| *candidate == sel)
 }
@@ -3658,62 +3654,11 @@ pub(crate) fn win32_job_callout_selftest() -> u64 {
     proof
 }
 
-/// Commit the one-time ReactOS installed-state transition before any SCM launch-plan snapshot.
-///
-/// The staged media describes a LiveCD setup. The transition changes the existing PlugPlay service
-/// to auto-start together with the setup markers, and Config Manager persists and publishes that
-/// mutation atomically. Calling this while constructing the later syscall handler would leave SCM
-/// with a stale demand-start view until the next boot.
-pub(crate) struct ReactOsInstalledBootProvision {
-    pub stats: nt_hive_core::ReactOsInstalledBootSeedStats,
-    pub generation: Option<u64>,
-    pub journal_records: u32,
-}
-
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HostedProcessDeletionOutcome {
     Pending(nt_user_host::ProcessDeletionPhase),
     Complete,
     Stale,
-}
-
-pub(crate) fn provision_reactos_installed_boot_state(
-) -> Result<ReactOsInstalledBootProvision, u32> {
-    let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
-    let mut target = CollectSystemSetupSeedTarget::new(expected_generation);
-    let seed = nt_hive_core::seed_reactos_installed_boot_state_into_target(&mut target);
-    let mutations = target.finish_required()?;
-    let stats = seed.map_err(|error| match error {
-        nt_hive_core::ReactOsInstalledBootSeedError::PlugPlayServiceMissing => {
-            STATUS_OBJECT_NAME_NOT_FOUND
-        }
-    })?;
-    if mutations.is_empty() {
-        return Ok(ReactOsInstalledBootProvision {
-            stats,
-            generation: None,
-            journal_records: 0,
-        });
-    }
-
-    let client_mutations: alloc::vec::Vec<_> = mutations
-        .iter()
-        .map(OwnedSystemHiveMutation::as_client_mutation)
-        .collect();
-    let outcome = unsafe { crate::persist_and_publish_system_hive_mutation(expected_generation, &client_mutations) }?;
-    assert!(
-        outcome.journaled,
-        "nonempty installed-state mutation must own a durable journal record"
-    );
-    assert!(
-        !outcome.wake_device_action,
-        "installed setup/service values cannot publish a PnP topology action"
-    );
-    Ok(ReactOsInstalledBootProvision {
-        stats,
-        generation: Some(outcome.generation),
-        journal_records: mutations.len().min(u32::MAX as usize) as u32,
-    })
 }
 
 impl ExecNtHandler {
@@ -3755,7 +3700,6 @@ impl ExecNtHandler {
         slot: *mut ExecNtHandler,
         hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
         driver_starts: DriverStartBootstrap,
-        bootstrap_system_journal_records: u32,
     ) -> &'static mut Self {
         // The REAL SECURITY + SAM hives the storage host read BY PATH off
         // `\reactos\system32\config\{security,sam}`. Borrow the staged bytes (no copy) and parse
@@ -3937,10 +3881,7 @@ impl ExecNtHandler {
         write_field!(hive_mounts, hive_mounts);
         write_field!(mutable_hives, mutable_hives);
         write_field!(mutable_key_handles, alloc::vec::Vec::with_capacity(256));
-        write_field!(
-            mutable_hive_journal_pending_records,
-            bootstrap_system_journal_records
-        );
+        write_field!(mutable_hive_journal_pending_records, 0);
         write_field!(mutable_hive_journal_pending_boot_mask, 0);
         write_field!(mutable_hive_journal_dirty_boot_mask, 0);
         write_field!(boot_hive_checkpoints_refreshed, false);
@@ -4101,11 +4042,8 @@ impl ExecNtHandler {
         write_field!(job_token_policies, nt_security::JobTokenPolicyStore::new());
         write_field!(anonymous_logon_tokens, anonymous_logon_tokens);
         write_field!(overlay, nt_hive_core::RegistryOverlay::with_capacity(64));
-        write_field!(writable_fs_dirty, bootstrap_system_journal_records != 0);
-        write_field!(
-            writable_fs_commit_required,
-            bootstrap_system_journal_records != 0
-        );
+        write_field!(writable_fs_dirty, false);
+        write_field!(writable_fs_commit_required, false);
         let handler = &mut *slot;
         for (pi, &pid) in bootstrap_pids.iter().enumerate() {
             let main_tid = bootstrap_main_tids[pi];
@@ -4437,13 +4375,6 @@ impl ExecNtHandler {
         print_u64(generation);
         print_str(b"\n");
         Ok(outcome)
-    }
-
-    fn should_expose_sam_setup_phase(&self, key_path: Option<&str>, value_name: &str) -> bool {
-        self.current_process_is_lsass()
-            && value_name.eq_ignore_ascii_case("SetupType")
-            && key_path.is_some_and(is_system_setup_key_canon)
-            && SAM_SETUP_KEYS_CREATED.load(Ordering::Relaxed) == 0
     }
 
     fn persist_and_publish_system_mutations(
@@ -33487,30 +33418,7 @@ impl ExecNtHandler {
                     }
                 }
                 let key_is_real_winlogon = key_path.as_deref().is_some_and(is_winlogon_key);
-                let query_status = if self
-                    .should_expose_sam_setup_phase(key_path.as_deref(), &name_lc)
-                {
-                    let data = 1u32.to_le_bytes();
-                    let status = self.query_value_key_copyout_status(
-                        info_class,
-                        args[3],
-                        output_length,
-                        args[5],
-                        "",
-                        4,
-                        &data,
-                    );
-                    trace_winlogon_post_lsa_registry(
-                        self,
-                        b"query-value",
-                        key_path.as_deref(),
-                        &name_lc,
-                        status,
-                        Some(4),
-                        Some(&data),
-                    );
-                    status
-                } else {
+                let query_status = {
                     let captured = self.registry_value_with_result(key, &name_lc, |ty, data| {
                         let mut captured_data = try_zeroed_transfer_buffer(data.len())?;
                         captured_data.copy_from_slice(data);

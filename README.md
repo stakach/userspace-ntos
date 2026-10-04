@@ -73,6 +73,9 @@ Native builds and end-to-end CI are separate follow-ups, not covered by these sp
 Disk-backed `SEC_IMAGE` sources retain their exact opened File, capture bounded PE
 metadata, and fill image pages from validated File spans. Mutable sources retain
 admission snapshots; the process constructor owns its separate loader snapshot.
+Media registry values select the real setup and shell startup paths. The kernel
+does not convert a LiveCD into installed-system state or override setup queries
+according to the caller's executable.
 CI also checks native acceptance log parsing and fixture lifetimes through Clang's
 source AST. These host-only checks do not prove guest execution.
 The local `tests/native/mup_provider/run_kernel_only.sh` gate checks real

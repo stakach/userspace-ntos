@@ -8127,7 +8127,6 @@ pub(crate) unsafe fn service_sec_image(
     scratch_base: u64,
     ntdll: (u64, &nt_pe_loader::PeFile),
     driver_starts: DriverStartBootstrap,
-    bootstrap_system_journal_records: u32,
 ) -> (
     u64,
     u64,
@@ -8341,7 +8340,6 @@ pub(crate) unsafe fn service_sec_image(
     let mut nt_handler = initialize_exec_nt_handler_once(
         exe_image_catalog as *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
         driver_starts,
-        bootstrap_system_journal_records,
     );
     print_str(b"[sec-init] handler-ready\n");
     nt_handler.register_main_thread_spawn(primary_pi, primary_spawn)

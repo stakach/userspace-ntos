@@ -535,3 +535,12 @@ diagnosis-free failure.
   build, test suite, image generation, or guest run against shared artifacts.
 - An exact test filter must name the complete test. A zero-test success is not
   regression evidence; check the executed count and the actual failure assertion.
+
+## Preserve Media Startup Policy
+- Trace the imported registry values through their actual composition and query
+  paths before diagnosing a missing shell. Kernel-written installed-state flags
+  can suppress the media's genuine setup process and make downstream credentials
+  or shell configuration look like the cause.
+- Return the shared mounted registry state to every caller. Do not fabricate
+  setup phases by executable identity or perform user-mode setup transitions in
+  kernel bootstrap; implement the NT APIs the real setup process invokes.

@@ -1536,6 +1536,71 @@ mod tests {
     }
 
     #[test]
+    fn production_and_font_overlays_preserve_imported_livecd_startup() {
+        let mut imported = Hive::new(HiveKind::System);
+        let select = imported.create_key("Select");
+        imported.set_dword(select, "Current", 2);
+        let setup = imported.create_key("Setup");
+        imported.set_dword(setup, "SetupType", 1);
+        imported.set_dword(setup, "SystemSetupInProgress", 1);
+        let command = utf16le_sz("setup -mini");
+        imported.set_value(setup, "CmdLine", RegistryValueType::ExpandSz, command.clone());
+        let plugplay = imported.create_key(r"ControlSet002\Services\PlugPlay");
+        imported.set_dword(plugplay, "Start", 3);
+        let manager = imported.create_key(r"ControlSet002\Control\Session Manager");
+        imported.set_value(
+            manager,
+            "BootExecute",
+            RegistryValueType::MultiSz,
+            encode_multi_sz(&[]),
+        );
+        imported.finish_clean_import();
+
+        // ReactOS winlogon RunSetup consumes this real CmdLine; syssetup InstallLiveCD
+        // then launches userinit. Generated driver/test metadata must not bypass that path.
+        // This fixture intentionally has an empty imported BootExecute list and does not
+        // assert preservation/merging semantics for a populated list.
+        for profile in [
+            GeneratedHiveProfile::Production,
+            GeneratedHiveProfile::FontCleanup,
+        ] {
+            let generated = build_hive_with_configuration(
+                generated_e1000_adapters(1),
+                GeneratedDisplayMode::DEFAULT,
+                profile,
+            );
+            let composed = compose_system_hive_overlay(&imported, &generated)
+                .expect("compose generated overlay with imported LiveCD SYSTEM");
+            assert_eq!(composed.current_control_set().unwrap().number(), 2);
+            let setup = composed
+                .open_key("Setup")
+                .expect("imported Setup key retained");
+            assert_eq!(composed.query_dword(setup, "SetupType"), Some(1));
+            assert_eq!(composed.query_dword(setup, "SystemSetupInProgress"), Some(1));
+            assert_eq!(
+                composed.query_value(setup, "CmdLine"),
+                Some((RegistryValueType::ExpandSz, command.as_slice()))
+            );
+            let plugplay = composed
+                .open_key(r"ControlSet002\Services\PlugPlay")
+                .expect("imported PlugPlay service retained");
+            assert_eq!(composed.query_dword(plugplay, "Start"), Some(3));
+            let manager = composed
+                .open_key(r"ControlSet002\Control\Session Manager")
+                .expect("selected control set retains Session Manager");
+            let expected = match profile {
+                GeneratedHiveProfile::Production => encode_multi_sz(&[]),
+                GeneratedHiveProfile::FontCleanup => encode_multi_sz(&["font_run_setup"]),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                composed.query_value(manager, "BootExecute"),
+                Some((RegistryValueType::MultiSz, expected.as_slice()))
+            );
+        }
+    }
+
+    #[test]
     fn mup_provider_profile_declares_native_provider_and_read_source() {
         let production = build_hive();
         assert!(production
