@@ -94,3 +94,48 @@ fn open_file_failure_reports_actual_stage_and_unchanged_status_without_more_effe
 fn create_section_failure_reports_actual_stage_and_unchanged_status_without_more_effects() {
     assert_failure_branch("CreateSection", "syscall8");
 }
+
+#[test]
+fn map_view_failure_reports_actual_status_after_section_close_without_replay() {
+    let file = syn::parse_file(include_str!("../../nt-ntdll-dll/src/on_target.rs")).unwrap();
+    let function = file.items.iter().find_map(|item| match item {
+        syn::Item::Fn(function) if function.sig.ident == "load_dependent_dll" => Some(function),
+        _ => None,
+    }).expect("actual dependency loader");
+    let mut map_index = None;
+    let mut close_index = None;
+    let mut report_index = None;
+    for (index, statement) in function.block.stmts.iter().enumerate() {
+        let mut calls = Calls::default();
+        calls.visit_stmt(statement);
+        if calls.0.iter().any(|name| name == "syscall_map_view") { map_index = Some(index); }
+        if calls.0.iter().any(|name| name == "syscall4") { close_index = Some(index); }
+        let syn::Stmt::Expr(syn::Expr::If(branch), _) = statement else { continue; };
+        if !calls.0.iter().any(|name| name == "report_file_map_failure") { continue; }
+        let mut body = Calls::default();
+        body.visit_block(&branch.then_branch);
+        assert_eq!(body.0, ["report_file_map_failure"], "failure reporting adds no calls or reads");
+        assert!(matches!(&*branch.cond, syn::Expr::Binary(binary)
+            if matches!(binary.op, syn::BinOp::Lt(_))
+            && matches!(&*binary.left, syn::Expr::Paren(paren)
+                if matches!(&*paren.expr, syn::Expr::Cast(cast)
+                    if matches!(&*cast.expr, syn::Expr::Path(path) if named(&path.path, "st"))))));
+        let syn::Stmt::Expr(syn::Expr::Call(report), _) = &branch.then_branch.stmts[0] else {
+            panic!("report the actual negative MapView result first");
+        };
+        assert_eq!(report.args.len(), 2);
+        assert!(matches!(&report.args[0], syn::Expr::Path(path) if named(&path.path, "MapView")));
+        assert!(matches!(&report.args[1], syn::Expr::Cast(cast)
+            if matches!(&*cast.expr, syn::Expr::Path(path) if named(&path.path, "st"))
+            && matches!(&*cast.ty, syn::Type::Path(path) if named(&path.path, "u32"))),
+            "capture the unchanged 32-bit NTSTATUS from the syscall return register");
+        assert!(matches!(&branch.then_branch.stmts[1], syn::Stmt::Expr(syn::Expr::Return(ret), _)
+            if matches!(ret.expr.as_deref(), Some(syn::Expr::Lit(lit))
+                if matches!(&lit.lit, syn::Lit::Int(value) if value.base10_parse::<u64>().unwrap() == 0))),
+            "preserve the loader's existing failed-map return value");
+        report_index = Some(index);
+    }
+    assert!(map_index.zip(close_index).zip(report_index)
+        .is_some_and(|((map, close), report)| map < close && close < report),
+        "a failed MapView must report its actual status after the existing Section close");
+}

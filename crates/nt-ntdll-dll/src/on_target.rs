@@ -2488,6 +2488,10 @@ unsafe fn load_dependent_dll(open_name_lc: &[u8]) -> u64 {
     };
     unsafe { syscall4(SSN_NT_CLOSE, section, 0, 0, 0) };
     if (st as i32) < 0 {
+        report_file_map_failure(
+            nt_ntdll::loader::file_map_failure::FileMapFailureStage::MapView,
+            st as u32,
+        );
         return 0;
     }
     base_address

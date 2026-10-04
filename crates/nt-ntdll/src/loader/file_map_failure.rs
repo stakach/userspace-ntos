@@ -7,6 +7,7 @@ use nt_printf::record::RecordBuffer;
 pub enum FileMapFailureStage {
     Open,
     CreateSection,
+    MapView,
 }
 
 pub fn record_failure(stage: FileMapFailureStage, status: u32) -> Option<RecordBuffer<96>> {
@@ -16,6 +17,7 @@ pub fn record_failure(stage: FileMapFailureStage, status: u32) -> Option<RecordB
     let stage = match stage {
         FileMapFailureStage::Open => "open",
         FileMapFailureStage::CreateSection => "create-section",
+        FileMapFailureStage::MapView => "map-view",
     };
     let mut record = RecordBuffer::new();
     core::write!(
@@ -62,10 +64,25 @@ mod tests {
 
     #[test]
     fn successful_and_informational_statuses_emit_nothing() {
-        for stage in [FileMapFailureStage::Open, FileMapFailureStage::CreateSection] {
+        for stage in [
+            FileMapFailureStage::Open,
+            FileMapFailureStage::CreateSection,
+            FileMapFailureStage::MapView,
+        ] {
             for status in [0, 0x103, 0x4000_0000, 0x7fff_ffff] {
                 assert!(record_failure(stage, status).is_none());
             }
         }
+    }
+
+    #[test]
+    fn captures_exact_map_view_failure_without_overflow() {
+        let record = record_failure(FileMapFailureStage::MapView, 0xc000_0008)
+            .expect("negative MapView status is captured");
+        assert_eq!(
+            record.bytes(),
+            b"[ldr-file-map-failed] stage=map-view status=0xc0000008\n"
+        );
+        assert!(!record.overflowed());
     }
 }
