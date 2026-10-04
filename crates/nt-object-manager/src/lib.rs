@@ -17,6 +17,8 @@ mod access;
 mod handles;
 mod io;
 mod namespace;
+#[cfg(test)]
+mod namespace_bootstrap_tests;
 pub use namespace::FilePathTarget;
 pub mod directory;
 pub mod object_security;
