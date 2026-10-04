@@ -1,5 +1,12 @@
 # Lessons
 
+## Cleanup State Does Not Identify Failure Phase
+- Follow every producer of a retained failure bundle. A completed constructor can become
+  retained again when publication or activation fails; the shared cleanup state is not proof
+  that construction failed.
+- Record failure phase and actual result before ownership moves into reconciliation. Use absent
+  boundary records to narrow the path, not to infer an unobserved native operation.
+
 ## Decode The Producer's Hive Format
 - Follow the actual image producer before choosing a registry decoder. The installed REGF
   source and composed core SYSTEM transport are distinct encodings of related data.

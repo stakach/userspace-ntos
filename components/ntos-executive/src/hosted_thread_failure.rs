@@ -5,6 +5,7 @@ use nt_user_host::thread_construction::{MemoryConstructionProgress, ThreadConstr
 
 pub(crate) enum ThreadConstructionError {
     Native(u64),
+    NtStatus(u32),
     Codec(nt_thread_start::amd64_context::CodecError),
     Admission(&'static str),
 }
@@ -28,6 +29,9 @@ pub(crate) fn record_hosted_thread_construction_failure(
     match error {
         ThreadConstructionError::Native(error) => {
             let _ = write!(record, " error-kind=native error=0x{error:016x}");
+        }
+        ThreadConstructionError::NtStatus(status) => {
+            let _ = write!(record, " error-kind=nt status=0x{status:08x}");
         }
         ThreadConstructionError::Codec(error) => {
             let _ = write!(

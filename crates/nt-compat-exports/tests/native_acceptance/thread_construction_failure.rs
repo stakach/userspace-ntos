@@ -1,6 +1,39 @@
 use syn::visit::Visit;
 
 #[test]
+fn activation_failure_is_recorded_before_completed_construction_is_retained() {
+    let file = syn::parse_file(include_str!(
+        "../../../../components/ntos-executive/src/exec_handler.rs"
+    )).unwrap();
+    let function = file.items.iter().find_map(|item| match item {
+        syn::Item::Impl(item) => item.items.iter().find_map(|item| match item {
+            syn::ImplItem::Fn(function) if function.sig.ident == "finish_hosted_thread_publication" => Some(function),
+            _ => None,
+        }),
+        _ => None,
+    }).unwrap();
+    #[derive(Default)]
+    struct Calls(Vec<String>);
+    impl<'ast> Visit<'ast> for Calls {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = &*call.func {
+                self.0.push(path.path.segments.last().unwrap().ident.to_string());
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            self.0.push(call.method.to_string());
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+    let mut calls = Calls::default();
+    calls.visit_block(&function.block);
+    let record = calls.0.iter().position(|name| name == "record_hosted_thread_construction_failure")
+        .expect("successful construction can fail during ETHREAD activation: record its actual status");
+    assert!(record < calls.0.iter().position(|name| name == "into_failed").unwrap());
+}
+
+#[test]
 fn native_thread_construction_captures_failure_before_retained_cleanup() {
     let file = syn::parse_file(include_str!(
         "../../../../components/ntos-executive/src/main.rs"

@@ -14303,6 +14303,10 @@ impl ExecNtHandler {
                 let result = crate::ps_object_backing::commit_thread_activation(
                     &mut self.pm, publication.activation, publication.handle,
                 );
+                if let Err(status) = result {
+                    record_hosted_thread_construction_failure(prepared.ticket.owner(),
+                        b"thread-activation", ThreadConstructionError::NtStatus(status), tcb);
+                }
                 if result.is_err() && body.is_some() {
                     crate::ps_object_backing::abort_prepared_thread(&self.pm, old_lifetime, scratch)
                         .expect("failed activation retains its unpublished ETHREAD owner");
@@ -14310,6 +14314,8 @@ impl ExecNtHandler {
                 result
             }
             Err(status) => {
+                record_hosted_thread_construction_failure(prepared.ticket.owner(),
+                    b"thread-body-preparation", ThreadConstructionError::NtStatus(status), tcb);
                 crate::ps_object_backing::abort_prepared_thread(&self.pm, old_lifetime, scratch)
                     .expect("failed construction retains its unpublished ETHREAD owner");
                 Err(status)
@@ -14320,7 +14326,10 @@ impl ExecNtHandler {
             Ok(()) => {
                 let lifetime = self.pm.thread_lifetime(tid)
                     .expect("successful activation retains its exact thread");
-                if resume && tcb_resume(tcb) != 0 {
+                let resume_error = if resume { tcb_resume(tcb) } else { 0 };
+                if resume_error != 0 {
+                    record_hosted_thread_construction_failure(prepared.ticket.owner(),
+                        b"thread-first-resume", ThreadConstructionError::Native(resume_error), tcb);
                     // Construction's compact WriteRegisters never resumes. The Resume invocation
                     // has no failure after making a TCB runnable, so this target never ran.
                     assert!(self.pm.validate_thread_lifetime(lifetime));
