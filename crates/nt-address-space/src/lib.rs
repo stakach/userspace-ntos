@@ -2564,6 +2564,26 @@ pub enum FaultAccess {
     Lock,
 }
 
+/// Why image residency was requested, independently of the requested access.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ImageFaultObservation {
+    /// A checked software copy or residency request, not a hardware fault.
+    CopyAccess,
+    NotPresent,
+    Protection,
+}
+
+impl ImageFaultObservation {
+    /// Preserve x86 fault provenance; reserved-bit faults must never demand-fill.
+    pub const fn from_x86_error(error: u64) -> Self {
+        if error & ((1 << 0) | (1 << 3)) != 0 {
+            Self::Protection
+        } else {
+            Self::NotPresent
+        }
+    }
+}
+
 /// Which access rights an MDL lock requires (spec §15.2).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum LockAccess {

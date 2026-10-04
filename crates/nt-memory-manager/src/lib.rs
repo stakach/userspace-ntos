@@ -37,6 +37,7 @@ pub mod transition_page_restoration;
 pub use private_page_retirement::admit_private_page_retirement;
 mod resident_reprotect;
 pub use resident_reprotect::{admit_client_alias_source, admit_resident_reprotect};
+pub mod resident_mapping_revalidation;
 mod shared_image_mapping;
 pub use shared_image_mapping::SharedImageMappingIdentity;
 pub mod alias_transition;
