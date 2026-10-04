@@ -4039,6 +4039,7 @@ impl ExecNtHandler {
         write_field!(pool_used, zeroed_process_slot_u64_vec());
         write_field!(tp_worker_window_used, zeroed_process_slot_u64_vec());
         write_field!(thread_runtime, HostedThreadRuntimes::reset());
+        write_field!(desktop_observations, DesktopObservations::new());
         write_field!(win32k_session, Win32kSessionRuntime::reset());
         write_field!(token_store, token_store);
         write_field!(job_token_policies, nt_security::JobTokenPolicyStore::new());
@@ -4060,6 +4061,7 @@ impl ExecNtHandler {
                         image.generation,
                     );
                 }
+                handler.observe_desktop_catalog(pi);
                 for slot in 0..PM_RUNTIME_THREAD_SLOTS {
                     let tid = bootstrap_pool_tids[pi][slot];
                     if tid != 0 {
@@ -8094,9 +8096,7 @@ impl ExecNtHandler {
         unsafe { user_image_paging::mark_process_accounted(self, pi, caps) };
         self.process_vspaces[pi] = caps.pml4;
         self.process_vspace_caps[pi] = Some(caps);
-        if pi < 64 {
-            PM_VSPACE_PUBLISHED_OK.fetch_or(1u64 << pi, Ordering::Relaxed);
-        }
+        self.observe_desktop_vspace(pi);
         Ok(())
     }
 
@@ -9310,7 +9310,6 @@ impl ExecNtHandler {
         if self.hosted_process_image(image.pi) != Some(image) {
             return Err(nt_process::STATUS_INVALID_PARAMETER);
         }
-        publish_hosted_gate_image(image);
         Ok(())
     }
 
@@ -9711,6 +9710,7 @@ impl ExecNtHandler {
             }
         }
         self.pm.reserve_handles(pid, PM_HANDLE_RESERVE);
+        self.observe_desktop_catalog(child_pi);
         PM_DYNAMIC_PROCESS_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         self.refresh_process_manager_gates();
         unsafe {
@@ -14259,6 +14259,9 @@ impl ExecNtHandler {
             return Err(status);
         }
         self.commit_hosted_thread_runtime_publication(prepared, spawn);
+        if resume {
+            self.observe_desktop_thread_activation(u64::from(tid));
+        }
         if !resume {
             crate::thread_suspend::publish_dormant(self, u64::from(tid))
                 .expect("unresumed construction retains its exact startup ownership");
@@ -16508,6 +16511,9 @@ impl ExecNtHandler {
             Ok(previous) => previous,
             Err(status) => return status,
         };
+        if self.pm.thread(tid as nt_process::ThreadId).is_some_and(|thread| thread.suspend_count == 0) {
+            self.observe_desktop_thread_activation(tid);
+        }
         print_str(b"[thread-life] resume tid=");
         print_u64(tid);
         print_str(b" pi=");
@@ -20551,6 +20557,7 @@ impl ExecNtHandler {
         let Some(process_mechanism) = self.process_mechanisms.get(pi) else {
             return HostedProcessDeletionOutcome::Stale;
         };
+        self.observe_desktop_terminal(pi);
         let (candidate, newly_queued) = match self.process_deletion_candidates.get(pi) {
             Some(candidate) => {
                 if !candidate.matches_mechanism(process_mechanism) {
@@ -20718,6 +20725,7 @@ impl ExecNtHandler {
         if !candidate.matches_mechanism(process_mechanism) {
             return HostedProcessDeletionOutcome::Pending(candidate.phase);
         }
+        self.observe_desktop_terminal(pi);
         loop {
             match candidate.phase {
                 nt_user_host::ProcessDeletionPhase::AwaitingReferences => {
@@ -20939,6 +20947,12 @@ impl ExecNtHandler {
                     print_u64(candidate.deleted_threads as u64);
                     print_str(b"\n");
                     crate::note_boot_progress(crate::BootProgress::ProcessRetired);
+                    self.observe_desktop_retirement(nt_user_host::process_observation::ObservationKey {
+                        pi,
+                        process: nt_user_host::process_identity::ProcessIdentity {
+                            pid, generation: nt_user_host::process_identity::ProcessGeneration::Hosted(candidate.generation),
+                        },
+                    });
                     return HostedProcessDeletionOutcome::Complete;
                 }
             }
@@ -34224,6 +34238,9 @@ impl ExecNtHandler {
                         ) {
                             let _ = self.pm.cancel_bound_handle(handle_reservation);
                             return status;
+                        }
+                        if !create_suspended {
+                            self.observe_desktop_thread_activation(u64::from(tid));
                         }
                         let handle =
                             self.pm.publish_reserved_handle(handle_reservation).expect(

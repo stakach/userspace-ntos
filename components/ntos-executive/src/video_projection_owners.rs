@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut};
 
 use nt_io_manager::{
-    consumer_file_projection::ConsumerFileProjection, FileId, HostedFileIdentity,
+    consumer_file_projection::ConsumerFileProjection, FileId, HostedDomainIdentity, HostedFileIdentity,
     WDM_X64_FILE_OBJECT_SIZE,
 };
 use nt_status::NtStatus;
@@ -192,13 +192,18 @@ pub(super) unsafe fn pointer_reference_count(id: u64) -> Option<usize> {
         .map(ConsumerFileProjection::pointer_reference_count)
 }
 
-pub(super) unsafe fn related_device_address(id: u64, address: u64) -> Result<u64, NtStatus> {
+pub(super) unsafe fn related_device_address(
+    domain: HostedDomainIdentity, id: u64, address: u64,
+) -> Result<u64, NtStatus> {
     let index = index_for(id).ok_or(NtStatus::INVALID_HANDLE)?;
     let row = rows()[index].as_ref().ok_or(NtStatus::INVALID_HANDLE)?;
     if row.retiring || row.address != address {
         return Err(NtStatus::INVALID_HANDLE);
     }
     let projection = row.projection.as_ref().ok_or(NtStatus::INVALID_HANDLE)?;
+    if projection.identity().domain() != domain {
+        return Err(NtStatus::INVALID_HANDLE);
+    }
     if projection.pointer_reference_count() == 0 {
         return Err(NtStatus::INVALID_HANDLE);
     }
@@ -222,13 +227,18 @@ pub(super) unsafe fn reference_by_handle(id: u64, address: u64) -> Result<u64, N
     Ok((projection.pointer_reference_count() as u64).saturating_add(1))
 }
 
-pub(super) unsafe fn reference_by_pointer(id: u64, address: u64) -> Result<u64, NtStatus> {
+pub(super) unsafe fn reference_by_pointer(
+    domain: HostedDomainIdentity, id: u64, address: u64,
+) -> Result<u64, NtStatus> {
     let index = index_for(id).ok_or(NtStatus::INVALID_HANDLE)?;
     let row = rows_mut()[index].as_mut().unwrap();
     if row.retiring || row.address != address {
         return Err(NtStatus::INVALID_HANDLE);
     }
     let identity = row.identity.ok_or(NtStatus::INVALID_HANDLE)?;
+    if identity.domain() != domain {
+        return Err(NtStatus::INVALID_HANDLE);
+    }
     let projection = row.projection.as_mut().ok_or(NtStatus::INVALID_HANDLE)?;
     let pointer = crate::driver_launch::win32k_device_consumer::reference_file_by_pointer(
         projection, identity,
@@ -238,13 +248,18 @@ pub(super) unsafe fn reference_by_pointer(id: u64, address: u64) -> Result<u64, 
     Ok((projection.pointer_reference_count() as u64).saturating_add(1))
 }
 
-pub(super) unsafe fn dereference(id: u64, address: u64) -> Result<u64, NtStatus> {
+pub(super) unsafe fn dereference(
+    domain: HostedDomainIdentity, id: u64, address: u64,
+) -> Result<u64, NtStatus> {
     let index = index_for(id).ok_or(NtStatus::INVALID_HANDLE)?;
     let row = rows_mut()[index].as_mut().unwrap();
     if row.address != address {
         return Err(NtStatus::INVALID_HANDLE);
     }
     let identity = row.identity.ok_or(NtStatus::INVALID_HANDLE)?;
+    if identity.domain() != domain {
+        return Err(NtStatus::INVALID_HANDLE);
+    }
     let projection = row.projection.as_mut().ok_or(NtStatus::INVALID_HANDLE)?;
     crate::driver_launch::win32k_device_consumer::dereference_file_owner(projection, identity)
         .map_err(NtStatus)?;

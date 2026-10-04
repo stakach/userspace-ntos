@@ -5,7 +5,7 @@ use core::ptr::{addr_of, addr_of_mut};
 
 use nt_io_manager::{
     consumer_file_projection::ConsumerFileProjection, DeviceId, FileId, FileReference,
-    HostedFileIdentity, HostedFilePublicationLease, HostedFileWaitLeaseLedger,
+    HostedDomainIdentity, HostedFileIdentity, HostedFilePublicationLease, HostedFileWaitLeaseLedger,
     WDM_X64_FILE_OBJECT_EVENT_OFFSET, WDM_X64_FILE_OBJECT_EVENT_SIGNAL_STATE_OFFSET,
     WDM_X64_FILE_OBJECT_SIZE,
 };
@@ -102,6 +102,7 @@ pub(crate) unsafe fn mode_projection_address(identity: HostedFileIdentity) -> Re
 /// The row pin is recorded before acquiring independently owned canonical receipts, so
 /// retirement cannot recycle its address during any external I/O-manager operation.
 pub(crate) unsafe fn acquire_wait_identity_for_event(
+    domain: HostedDomainIdentity,
     event: u64,
 ) -> Result<(HostedFileIdentity, u64), i32> {
     let id = rows()
@@ -113,6 +114,9 @@ pub(crate) unsafe fn acquire_wait_identity_for_event(
         .map(|row| row.id)
         .ok_or(STATUS_INVALID_HANDLE)?;
     let identity = wait_identity_for_row(id, false)?;
+    if identity.domain() != domain {
+        return Err(STATUS_INVALID_HANDLE);
+    }
     wait_receipts()
         .try_reserve(1)
         .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
@@ -146,7 +150,7 @@ pub(crate) unsafe fn acquire_wait_identity_for_event(
         Ok(())
     })();
     if let Err(status) = result {
-        if release_wait_identity(token).is_err() {
+        if release_wait_identity(identity.domain(), token).is_err() {
             park();
         }
         return Err(status);
@@ -156,12 +160,15 @@ pub(crate) unsafe fn acquire_wait_identity_for_event(
 
 /// Retain the token and any unreleased receipts on uncertainty. Redrive may complete a
 /// partially released token without requiring LIFO pointer-reference behavior.
-pub(crate) unsafe fn release_wait_identity(token: u64) -> Result<(), i32> {
+pub(crate) unsafe fn release_wait_identity(domain: HostedDomainIdentity, token: u64) -> Result<(), i32> {
     let index = wait_receipts()
         .iter()
         .position(|receipt| token != 0 && receipt.token == token)
         .ok_or(STATUS_INVALID_HANDLE)?;
     let receipt = &mut wait_receipts()[index];
+    if receipt.identity.domain() != domain {
+        return Err(STATUS_INVALID_HANDLE);
+    }
     receipt.releasing = true;
     if let Some(reference) = receipt.reference.as_mut() {
         io_manager_mut()
@@ -360,22 +367,28 @@ pub(crate) unsafe fn reference_handle(
     }
 }
 
-pub(crate) unsafe fn reference_pointer(address: u64) -> Result<u64, i32> {
+pub(crate) unsafe fn reference_pointer(domain: HostedDomainIdentity, address: u64) -> Result<u64, i32> {
     let id = id_for_address(address).ok_or(STATUS_INVALID_HANDLE)?;
     let row = row(id).ok_or(STATUS_INVALID_HANDLE)?;
     if row.phase == Phase::Building {
         return Err(STATUS_INVALID_HANDLE);
     }
     let identity = row.identity.ok_or(STATUS_INVALID_HANDLE)?;
+    if identity.domain() != domain {
+        return Err(STATUS_INVALID_HANDLE);
+    }
     let projection = row.projection.as_mut().ok_or(STATUS_INVALID_HANDLE)?;
     win32k_device_consumer::reference_file_by_pointer(projection, identity)?;
     Ok((projection.pointer_reference_count() as u64).saturating_add(1))
 }
 
-pub(crate) unsafe fn dereference_pointer(address: u64) -> Result<u64, i32> {
+pub(crate) unsafe fn dereference_pointer(domain: HostedDomainIdentity, address: u64) -> Result<u64, i32> {
     let id = id_for_address(address).ok_or(STATUS_INVALID_HANDLE)?;
     let row = row(id).ok_or(STATUS_INVALID_HANDLE)?;
     let identity = row.identity.ok_or(STATUS_INVALID_HANDLE)?;
+    if identity.domain() != domain {
+        return Err(STATUS_INVALID_HANDLE);
+    }
     let projection = row.projection.as_mut().ok_or(STATUS_INVALID_HANDLE)?;
     win32k_device_consumer::dereference_file_owner(projection, identity)?;
     let count = projection.pointer_reference_count() as u64;
@@ -385,13 +398,16 @@ pub(crate) unsafe fn dereference_pointer(address: u64) -> Result<u64, i32> {
     Ok(count.saturating_add(1))
 }
 
-pub(crate) unsafe fn related_device_address(address: u64) -> Result<u64, i32> {
+pub(crate) unsafe fn related_device_address(domain: HostedDomainIdentity, address: u64) -> Result<u64, i32> {
     let id = id_for_address(address).ok_or(STATUS_INVALID_HANDLE)?;
     let row = row(id).ok_or(STATUS_INVALID_HANDLE)?;
     if row.phase == Phase::Building {
         return Err(STATUS_INVALID_HANDLE);
     }
     let projection = row.projection.as_ref().ok_or(STATUS_INVALID_HANDLE)?;
+    if projection.identity().domain() != domain {
+        return Err(STATUS_INVALID_HANDLE);
+    }
     if projection.pointer_reference_count() == 0 {
         return Err(STATUS_INVALID_HANDLE);
     }
@@ -441,14 +457,14 @@ pub(crate) unsafe fn handle_closed(
 
 pub(crate) unsafe fn redrive() {
     let mut cursor = 0;
-    while let Some(token) = wait_receipts()
+    while let Some((token, domain)) = wait_receipts()
         .iter()
         .filter(|receipt| receipt.releasing && receipt.token > cursor)
-        .map(|receipt| receipt.token)
-        .min()
+        .map(|receipt| (receipt.token, receipt.identity.domain()))
+        .min_by_key(|(token, _)| *token)
     {
         cursor = token;
-        let _ = release_wait_identity(token);
+        let _ = release_wait_identity(domain, token);
     }
     let mut cursor = 0;
     while let Some(id) = rows().iter().filter(|row| {

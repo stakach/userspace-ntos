@@ -491,7 +491,6 @@ pub const SH_REQ_PROCESS_ID: u64 = 0x138; // in: routed caller's real Process Ma
 pub const SH_REQ_NESTED_CALLBACK: u64 = 0x140; // in: dispatch is nested inside a parked user callback
 pub const SH_REQ_CLIENT_PI: u64 = 0x148; // in: executive hosted-process index for this dispatch
 pub const SH_REQ_CLIENT_TEB: u64 = 0x150; // in: routed caller's current-thread TEB user VA
-pub const SH_REQ_DEBUG_FLAGS: u64 = 0x158; // in: executive-only diagnostic flags for this dispatch
 pub const SH_REQ_CALLER_SP: u64 = 0x160; // in: real syscall-entry RSP when tail args live on the client stack
 pub const SH_REQ_THREAD_ID: u64 = 0x168; // in: routed caller's real Process Manager tid (u64)
 pub const SH_REQ_EPROCESS: u64 = 0x170; // in: Process Manager's parked EPROCESS body, or 0
@@ -508,6 +507,9 @@ pub const SH_REQ_TOKEN_USER_SID_LEN: u64 = 0x1C0; // in: native user SID byte le
 pub const SH_REQ_TOKEN_USER_SID_PTR: u64 = 0x1C8; // in: component VA of native user SID bytes
 pub const WIN32K_TOKEN_USER_SID_MAX: usize = 68; // SID header + 15 sub-authorities
 pub const SH_REQ_GENERATION: u64 = 0x1F8; // in: exact hosted-process identity generation
+pub const SH_DISPATCH_RETURN: u64 = 0x1D0; // out: correlated operation provenance, kind committed last
+const _: () = assert!(SH_REQ_TOKEN_USER_SID_PTR + 8 <= SH_DISPATCH_RETURN);
+const _: () = assert!(SH_DISPATCH_RETURN + 32 <= SH_REQ_GENERATION);
 pub const WIN32K_REQUEST_SSDT: u64 = 0;
 pub const WIN32K_REQUEST_PS_PROVIDER: u64 = 1;
 pub const WIN32K_REQUEST_SOURCE_PNP_TERMINAL: u64 = 2;
@@ -522,7 +524,6 @@ pub const PS_WIN32_PROVIDER_THREAD_EXIT: u64 = 1;
 pub const PS_WIN32_PROVIDER_PROCESS_EXIT: u64 = 2;
 pub const PS_WIN32_PROVIDER_FINALIZE_PROCESS_OBJECTS: u64 = 3;
 pub const PS_WIN32_PROVIDER_RETAIN_THREAD_CONTEXT: u64 = 1;
-pub const SH_REQ_DEBUG_ATL_REPLAY: u64 = 0x0000_0001;
 const _: () = assert!(SH_SAS_AHELIST > SH_REQ_NARGS);
 /// Phase 2A callback rendezvous frame. The fixed, pointer-free ABI occupies the otherwise-unused
 /// tail of the existing shared page; both the component stub and executive pump access it here.
@@ -1134,7 +1135,6 @@ const BROADCAST_QUERY_DENY: u64 = 1_112_363_332;
 const WM_USER: u32 = 0x0400;
 const REGISTERED_MESSAGE_FIRST: u32 = 0xC000;
 static WIN32K_EXPLORER_SETWNDPROC_CLIENT_CALLS: AtomicU64 = AtomicU64::new(0);
-static WIN32K_EXPLORER_SETWNDPROC_REPLAY_CALLS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_GDI_HANDLE_MISMATCH_TRACES: AtomicU64 = AtomicU64::new(0);
 
 /// THREADINFO->rpdesk offset (win32.h: W32THREAD prefix 0x50, then ptl@0x50, ppi@0x58,
@@ -17408,10 +17408,23 @@ unsafe fn observe_gdi_handle_return(ssn: u64, handle: u64) {
     print_str(b" BAD\n");
 }
 
+/// Commit operation provenance after the foreign handler has genuinely returned.
+unsafe fn record_win32k_handler_return(dispatch_id: u64, ssn: u64, ret: u64) {
+    let words = nt_user_callback::DispatchReturnReceipt::handler_returned(dispatch_id, ssn, ret).words();
+    let address = WIN32K_SHARED_VADDR + SH_DISPATCH_RETURN;
+    write_volatile((address + 16) as *mut u64, 0);
+    write_volatile(address as *mut u64, words[0]);
+    write_volatile((address + 8) as *mut u64, words[1]);
+    write_volatile((address + 24) as *mut u64, words[3]);
+    write_volatile((address + 16) as *mut u64, words[2]);
+}
+
 /// Resolve a win32k SSN (>= [`WIN32K_SERVICE_BASE`]) through the registered NtUser/NtGdi SSDT and
 /// invoke its handler with the correct win64 register/stack args. Returns the pointer-width handler
 /// result (or `STATUS_INVALID_SYSTEM_SERVICE` in the low 32 bits if the SSN is invalid).
 unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let frame = (WIN32K_SHARED_VADDR + SH_USER_CALLBACK) as *const nt_user_callback::CallbackFrame;
+    let dispatch_id = read_volatile(core::ptr::addr_of!((*frame).header.dispatch_id));
     const STATUS_INVALID_SYSTEM_SERVICE: u64 = 0xC000_001Cu32 as u64;
     const STATUS_INVALID_PARAMETER: u64 = 0xC000_000Du32 as u64;
     let base = read_volatile((WIN32K_SHARED_VADDR + SH_SSDT_BASE) as *const u64);
@@ -17437,7 +17450,6 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         return STATUS_INVALID_SYSTEM_SERVICE;
     }
     let sh = WIN32K_SHARED_VADDR;
-    let debug_flags = read_volatile((sh + SH_REQ_DEBUG_FLAGS) as *const u64);
     let caller_sp = read_volatile((sh + SH_REQ_CALLER_SP) as *const u64);
     let staged_nargs = read_volatile((sh + SH_REQ_NARGS) as *const u64);
     let request_client_pi = read_volatile((sh + SH_REQ_CLIENT_PI) as *const u64);
@@ -17500,11 +17512,7 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         && (a1 as u32) as u64 == GWLP_WNDPROC_INDEX_U32
         && request_client_pi == 6;
     if explorer_setwndproc {
-        if debug_flags & SH_REQ_DEBUG_ATL_REPLAY != 0 {
-            WIN32K_EXPLORER_SETWNDPROC_REPLAY_CALLS.fetch_add(1, Ordering::Relaxed);
-        } else {
-            WIN32K_EXPLORER_SETWNDPROC_CLIENT_CALLS.fetch_add(1, Ordering::Relaxed);
-        }
+        WIN32K_EXPLORER_SETWNDPROC_CLIENT_CALLS.fetch_add(1, Ordering::Relaxed);
     }
     if nargs > 16 {
         return STATUS_INVALID_SYSTEM_SERVICE;
@@ -17521,6 +17529,7 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     let call: unsafe extern "win64" fn(u64, *const u64, u64) -> u64 =
         core::mem::transmute(boundary as *const ());
     let ret = call(handler, args.as_ptr(), nargs);
+    record_win32k_handler_return(dispatch_id, ssn, ret);
     observe_gdi_handle_return(ssn, ret);
 
     ret
@@ -17753,11 +17762,8 @@ pub(crate) fn client_system_font_proofs() -> (u64, u64, u64) {
     )
 }
 
-pub(crate) fn explorer_setwndproc_proofs() -> (u64, u64) {
-    (
-        WIN32K_EXPLORER_SETWNDPROC_CLIENT_CALLS.load(Ordering::Relaxed),
-        WIN32K_EXPLORER_SETWNDPROC_REPLAY_CALLS.load(Ordering::Relaxed),
-    )
+pub(crate) fn explorer_setwndproc_proofs() -> u64 {
+    WIN32K_EXPLORER_SETWNDPROC_CLIENT_CALLS.load(Ordering::Relaxed)
 }
 
 /// The post-NtUserInitialize graphics prerequisite initialization runs once.

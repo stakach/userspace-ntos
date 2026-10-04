@@ -4,6 +4,9 @@ use super::*;
 use nt_component_suspension::LaneDispatchIdentity;
 use nt_provider_wait::{CatalogIdentity, ProviderDomainIdentity};
 
+#[path = "win32k_device_consumer/identity_bridge.rs"]
+mod identity_bridge;
+
 struct Projection {
     address: u64,
     device: nt_io_manager::DeviceId,
@@ -54,6 +57,27 @@ unsafe fn consumer_mut() -> Result<&'static mut Consumer, i32> {
     (&mut *core::ptr::addr_of_mut!(CONSUMER))
         .as_mut()
         .ok_or(STATUS_DEVICE_NOT_READY)
+}
+
+/// Retained pointer release is independent of the original handle caller and of new-consumer
+/// admission. The authenticated physical provider must still own this exact consumer VSpace.
+pub(crate) unsafe fn retained_consumer_domain(
+    catalog: CatalogIdentity,
+    provider: ProviderDomainIdentity,
+    pml4: u64,
+) -> Result<HostedDomainIdentity, i32> {
+    if (&*core::ptr::addr_of!(crate::PROVIDER_WAIT_DOMAINS)).identity() != Some(catalog)
+        || crate::current_win32k_provider_domain() != Some(provider)
+        || !crate::win32k_provider_domain_is_current(provider)
+    {
+        return Err(STATUS_ACCESS_DENIED);
+    }
+    let consumer = consumer_mut()?;
+    identity_bridge::retained_domain(
+        (consumer.catalog, consumer.provider, consumer.pml4, consumer.domain),
+        (catalog, provider, pml4),
+        io_manager_mut().hosted_domain_identity(consumer.domain.domain_id),
+    ).ok_or(STATUS_ACCESS_DENIED)
 }
 
 /// Diagnostic observation only; it neither admits a request nor manufactures a zero for a missing

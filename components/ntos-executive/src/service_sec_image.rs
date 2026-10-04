@@ -39,6 +39,9 @@ mod file_dispatch_handoff;
 pub(crate) mod inline_file_retirement;
 #[path = "hosted_gui_client_info.rs"]
 mod hosted_gui_client_info;
+#[path = "provider_file_objects.rs"]
+mod provider_file_objects;
+pub(crate) use provider_file_objects::service_win32k_file_object_request;
 
 pub(crate) static FILE_IO_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
 static FILE_IO_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -2178,7 +2181,35 @@ unsafe fn process_completed_user_callback_outer_dispatch(
         );
         observe_completed_dialog_modal_dispatch(dispatch, completion_badge, completion_tid);
     }
+    observe_completed_desktop_dispatch(nt_handler, dispatch.logical_caller,
+        dispatch.ssn, dispatch.args, dispatch.status, dispatch.dispatch_return);
     true
+}
+
+/// Only settled provider output reaches this boundary, for inline and retained continuations.
+fn observe_completed_desktop_dispatch(
+    nt_handler: &mut ExecNtHandler,
+    original_caller: Option<nt_user_host::provider_logical_caller::ProviderLogicalCaller>,
+    ssn: u64,
+    args: [u64; 4],
+    status: u64,
+    dispatch_return: Option<nt_user_callback::DispatchReturn>,
+) {
+    let Some(caller) = original_caller else { return; };
+    if dispatch_return.and_then(|returned| returned.handler_value()) != Some(status) { return; }
+    if status == 0 { return; }
+    let fact = match ssn {
+        0x1077 => Some(DesktopGuiFact::WindowCreated),
+        0x1036 => Some(DesktopGuiFact::MessageRegistered),
+        NTUSER_BEGIN_PAINT_SSN => Some(DesktopGuiFact::BeginPaint),
+        NTUSER_END_PAINT_SSN => Some(DesktopGuiFact::EndPaint),
+        0x105b | 0x1298 if args[1] as u32 == (-4i32) as u32 => Some(DesktopGuiFact::WndProcCompleted),
+        NTGDI_BIT_BLT_SSN | NTGDI_STRETCH_BLT_SSN | NTGDI_LINE_TO_SSN | NTGDI_PAT_BLT_SSN
+            | NTGDI_POLY_PAT_BLT_SSN | NTGDI_ALPHA_BLEND_SSN | NTGDI_STRETCH_DIBITS_INTERNAL_SSN
+            | NTUSER_FILL_WINDOW_SSN | NTGDI_RECTANGLE_SSN | nt_user_callback::NTGDI_EXT_TEXT_OUT_W_SSN => Some(DesktopGuiFact::DirectDraw),
+        _ => None,
+    };
+    if let Some(fact) = fact { nt_handler.observe_desktop_gui_for(caller, fact, 1); }
 }
 
 unsafe fn copy_completed_paint_output(
@@ -2557,7 +2588,13 @@ fn win32k_client_label<'a>(nt_handler: &'a ExecNtHandler, pi: usize) -> &'a [u8]
     nt_handler.hosted_process_leaf(pi).unwrap_or(b"client")
 }
 
-fn record_hosted_client_gdi_mapping(nt_handler: &ExecNtHandler, pi: usize, gdi_va: u64) {
+fn record_hosted_client_gdi_mapping(
+    nt_handler: &mut ExecNtHandler, pi: usize, gdi_va: u64,
+    caller: Option<nt_user_host::provider_logical_caller::ProviderLogicalCaller>,
+) {
+    if let Some(caller) = caller {
+        nt_handler.observe_desktop_gui_for(caller, DesktopGuiFact::GdiMapped, 1);
+    }
     let Some(image) = nt_handler.hosted_process_image(pi) else {
         return;
     };
@@ -3633,6 +3670,32 @@ pub(crate) unsafe fn hosted_ingress_binding(
     (&*handler).admit_hosted_thread_ingress(badge).ok().map(|runtime| runtime.binding())
 }
 
+/// Called only after a provider operation returned; no handler borrow crosses its execution.
+pub(crate) unsafe fn service_observe_desktop_gui_for(
+    caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
+    fact: DesktopGuiFact,
+    amount: u64,
+) {
+    let pointer = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    if !pointer.is_null() { (*pointer).observe_desktop_gui_for(caller, fact, amount); }
+}
+
+pub(crate) unsafe fn service_observe_desktop_callback_return(
+    caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
+    api_index: u32,
+    callback_status: u64,
+) {
+    if api_index != 0 {
+        return;
+    }
+    let fact = if callback_status as i32 >= 0 {
+        DesktopGuiFact::CallbackCompleted
+    } else {
+        DesktopGuiFact::CallbackFailed
+    };
+    service_observe_desktop_gui_for(caller, fact, 1);
+}
+
 unsafe fn clear_service_delay_drain_context() {
     SERVICE_DELAY_DRAIN_QUEUE.store(0, Ordering::Release);
     SERVICE_DELAY_DRAIN_HANDLER.store(0, Ordering::Release);
@@ -4651,170 +4714,6 @@ pub(crate) unsafe fn service_win32k_file_cancel_request(
     crate::driver_launch::service_win32k_file_cancel(channel, handle)
 }
 
-/// Resolve only canonical routed File handles or exact win32k consumer pointer receipts.
-pub(crate) unsafe fn service_win32k_file_object_request(
-    channel: &spawn_hosts::PumpChannel,
-    reply_cap: u64,
-    badge: u64,
-    mi: u64,
-    op: u64,
-    object: u64,
-    access: u64,
-    mode: u64,
-) -> (i32, u64, u64, u64) {
-    use crate::win32k_subsystem::{
-        W32_FILE_OBJECT_DEREFERENCE_POINTER, W32_FILE_OBJECT_DEVICE_NAME,
-        W32_FILE_OBJECT_LABEL, W32_FILE_OBJECT_REFERENCE_HANDLE,
-        W32_FILE_OBJECT_REFERENCE_POINTER, W32_FILE_OBJECT_RELATED_DEVICE,
-        W32_FILE_OBJECT_RELEASE_WAIT, W32_FILE_OBJECT_WAIT_IDENTITY,
-        W32_FILE_OBJECT_OPEN_DEVICE,
-    };
-    let caller = match authenticate_win32k_service_request(
-        channel, reply_cap, badge, mi, (W32_FILE_OBJECT_LABEL << 12) | 4,
-    ) {
-        Ok((_, _, caller)) => caller,
-        Err(status) => return (status as i32, 0, 0, 0),
-    };
-    if SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) == 0 {
-        return (0xC000_00A3u32 as i32, 0, 0, 0);
-    }
-    match op {
-        W32_FILE_OBJECT_REFERENCE_HANDLE => {
-            let (Ok(access), Ok(mode)) = (u32::try_from(access), u8::try_from(mode)) else {
-                return (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0);
-            };
-            let (status, pointer, granted, attributes) =
-                crate::driver_launch::win32k_file_owners::reference_handle(
-                    caller, object, access, mode,
-                );
-            (status, pointer, granted as u64, attributes as u64)
-        }
-        W32_FILE_OBJECT_REFERENCE_POINTER if access == 0 && mode == 0 => {
-            if crate::video_device::video_file_projection_contains(object) {
-                return match crate::video_device::reference_video_file_pointer(object) {
-                    Ok(count) => (0, count, 0, 0),
-                    Err(status) => (status, 0, 0, 0),
-                };
-            }
-            match crate::driver_launch::win32k_file_owners::reference_pointer(object) {
-                Ok(count) => (0, count, 0, 0),
-                Err(status) => (status, 0, 0, 0),
-            }
-        }
-        W32_FILE_OBJECT_DEREFERENCE_POINTER if access == 0 && mode == 0 => {
-            if crate::video_device::video_file_projection_contains(object) {
-                return match crate::video_device::release_video_file_projection(object) {
-                    Ok(count) => (0, count, 0, 0),
-                    Err(status) => (status, 0, 0, 0),
-                };
-            }
-            match crate::driver_launch::win32k_file_owners::dereference_pointer(object) {
-                Ok(count) => (0, count, 0, 0),
-                Err(status) => (status, 0, 0, 0),
-            }
-        }
-        W32_FILE_OBJECT_RELATED_DEVICE if access == 0 && mode == 0 => {
-            if crate::video_device::video_file_projection_contains(object) {
-                return match crate::video_device::video_related_device_object(object) {
-                    Ok(device) => (0, device, 0, 0),
-                    Err(status) => (status.raw(), 0, 0, 0),
-                };
-            }
-            match crate::driver_launch::win32k_file_owners::related_device_address(object) {
-                Ok(device) => (0, device, 0, 0),
-                Err(status) => (status, 0, 0, 0),
-            }
-        }
-        W32_FILE_OBJECT_WAIT_IDENTITY if access == 0 && mode == 0 => {
-            match crate::driver_launch::win32k_file_owners::acquire_wait_identity_for_event(object) {
-                Ok((identity, token)) =>
-                    (0, identity.file_id().raw(), identity.binding_generation(), token),
-                Err(status) => (status, 0, 0, 0),
-            }
-        }
-        W32_FILE_OBJECT_RELEASE_WAIT if access == 0 && mode == 0 => {
-            match crate::driver_launch::win32k_file_owners::release_wait_identity(object) {
-                Ok(()) => (0, 0, 0, 0),
-                Err(status) => (status, 0, 0, 0),
-            }
-        }
-        W32_FILE_OBJECT_OPEN_DEVICE => {
-            let Ok(length) = usize::try_from(mode) else {
-                return (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0);
-            };
-            if access > u32::MAX as u64 || length == 0 || length & 1 != 0 {
-                return (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0);
-            }
-            let (_lease, packet) =
-                match crate::win32k_subsystem::capture_provider_pool_packet(object, length) {
-                    Ok(packet) => packet,
-                    Err(status) => return (status as i32, 0, 0, 0),
-                };
-            let mut name = Vec::new();
-            if name.try_reserve_exact(length / 2).is_err() {
-                return (nt_process::STATUS_INSUFFICIENT_RESOURCES as i32, 0, 0, 0);
-            }
-            for unit in packet.chunks_exact(2) {
-                name.push(u16::from_le_bytes([unit[0], unit[1]]));
-            }
-            match crate::video_device::video_get_device_object_pointer(&name, access as u32) {
-                Ok((file, device)) => (0, file, device, 0),
-                Err(status) => (status, 0, 0, 0),
-            }
-        }
-        W32_FILE_OBJECT_DEVICE_NAME => {
-            let Ok(length) = usize::try_from(access) else {
-                return (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0);
-            };
-            if length != nt_io_manager::file_object_name::FILE_OBJECT_NAME_SCRATCH_BYTES {
-                return (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0);
-            }
-            let (lease, mut packet) =
-                match crate::win32k_subsystem::capture_provider_pool_packet(object, length) {
-                    Ok(packet) => packet,
-                    Err(status) => return (status as i32, 0, 0, 0),
-                };
-            let target = with_provider_process_manager(|pm| {
-                pm.validate_native_handle_caller(caller)?;
-                let (file_id, device_id) = pm.lookup_native_routed_file_handle(caller, mode, 0)?;
-                let close = pm.inspect_native_close_target(caller, mode)?;
-                if close.object() != (nt_process::HandleObject::RoutedFile { file_id, device_id }) {
-                    return Err(nt_process::STATUS_INVALID_HANDLE);
-                }
-                Ok((file_id, device_id))
-            });
-            let (file_id, device_id) = match target {
-                Ok(target) => target,
-                Err(status) => return (status as i32, 0, 0, 0),
-            };
-            let io = crate::driver_launch::io_manager_mut();
-            let name = match io.file(nt_io_manager::FileId(file_id)) {
-                Some(file) if file.device_id.raw() == device_id => io
-                    .device(file.device_id)
-                    .map(|device| device.name.as_ref().map(|path| path.to_unicode_string())),
-                _ => None,
-            };
-            let Some(name) = name else {
-                return (nt_process::STATUS_INVALID_HANDLE as i32, 0, 0, 0);
-            };
-            let name = name.as_ref().map_or(&[][..], |name| name.as_units());
-            let required = name.len().saturating_mul(2);
-            if required > length - 4 || required > u16::MAX as usize - 1 {
-                return (0x8000_0005u32 as i32, required as u64, 0, 0);
-            }
-            packet[..4].copy_from_slice(&(required as u32).to_le_bytes());
-            for (index, unit) in name.iter().enumerate() {
-                packet[4 + index * 2..6 + index * 2].copy_from_slice(&unit.to_le_bytes());
-            }
-            if !crate::win32k_subsystem::publish_provider_pool_packet(lease, &packet) {
-                return (nt_process::STATUS_INVALID_HANDLE as i32, 0, 0, 0);
-            }
-            (0, required as u64, file_id, 0)
-        }
-        _ => (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0),
-    }
-}
-
 /// The canonical shared-ingress completion owns final cleanup of unpublished stages.
 pub(crate) unsafe fn retire_win32k_directory_route(
     route: nt_component_suspension::peer_registry::PeerRoute,
@@ -5273,7 +5172,7 @@ pub(crate) unsafe fn prepare_callback_gdi_projection(
         || callback_client_runtime(client).is_none()
         || (&(*pointer).process_vspaces).get(pi).copied() != Some(pml4)
     { return false; }
-    record_hosted_client_gdi_mapping(&*pointer, pi, table);
+    record_hosted_client_gdi_mapping(&mut *pointer, pi, table, Some(caller));
     true
 }
 
@@ -5482,8 +5381,9 @@ unsafe fn dispatch_win32k_for_client_with_completion_args(
     output_stage: Option<nt_user_callback::DispatchOutputStage>,
     paint_output: Option<nt_user_callback::PaintOutputClaim>,
     client: win32k_glue::Win32kClientContext,
+    dispatch_return: &mut Option<nt_user_callback::DispatchReturn>,
 ) -> (u64, bool) {
-    let result = win32k_glue::win32k_dispatch_wide_with_completion_args(
+    let result = win32k_glue::win32k_dispatch_wide_with_return_receipt(
         ssn,
         a0,
         a1,
@@ -5496,13 +5396,14 @@ unsafe fn dispatch_win32k_for_client_with_completion_args(
         paint_output,
         client,
     );
+    *dispatch_return = result.2;
     if sync_win32k_context_to_process_manager(
         nt_handler,
         client.pi as usize,
         client.pid,
         client.tid,
     ) {
-        result
+        (result.0, result.1)
     } else {
         (0xC000_00A3u32 as u64, false)
     }
@@ -6400,7 +6301,6 @@ unsafe fn spawn_requested_hosted_exe(
         return Err(0xC000_000D);
     }
     spec.spawned.store(1, Ordering::Relaxed);
-    PM_PROCESS_SPAWNED_OK.fetch_or(1u64 << pi, Ordering::Relaxed);
 
     print_str(b"[ntos-exec] NtCreateProcessEx: spawned ");
     print_str(spec.image.leaf);
@@ -8137,6 +8037,7 @@ pub(crate) unsafe fn service_sec_image(
     NativeDriverLoadReport,
     LiveDeviceActionReport,
     StartDeviceCallReport,
+    DesktopAcceptanceReport,
 ) {
     let pml4 = primary_spawn.pml4;
     let main_tcb = primary_spawn.main_tcb;
@@ -8447,6 +8348,7 @@ pub(crate) unsafe fn service_sec_image(
         let status = crate::win32k_glue::source_irp_integration::run_configured(nt_handler as *mut _);
         assert_eq!(status, 0, "native source IRP fixture did not prove completion");
     }
+    nt_handler.capture_desktop_launch_contract();
     #[cfg(not(feature = "mup-provider-kernel-only"))]
     {
         let resume_error = tcb_resume_r(main_tcb);
@@ -8460,6 +8362,9 @@ pub(crate) unsafe fn service_sec_image(
             print_u64(resume_error);
             print_str(b"\n");
             panic!("primary hosted process resume failed");
+        }
+        if let Some(tid) = nt_handler.pm_main_tid_for_pi(primary_pi) {
+            nt_handler.observe_desktop_thread_activation(u64::from(tid));
         }
     }
     #[cfg(feature = "mup-provider-kernel-only")]
@@ -16058,6 +15963,7 @@ pub(crate) unsafe fn service_sec_image(
                         } else {
                             m0
                         };
+                    let mut dispatch_return = None;
                     let mut r = dispatch_win32k_for_client_with_completion_args(
                         &mut nt_handler,
                         dispatch_ssn,
@@ -16071,6 +15977,7 @@ pub(crate) unsafe fn service_sec_image(
                         message_output_stage.or(paint_output_stage),
                         paint_output_claim,
                         client,
+                        &mut dispatch_return,
                     );
                     if explorer_direct_gdi_draw && r.1 {
                         if EXPLORER_DIRECT_GDI_DRAW_RETURNS.fetch_add(1, Ordering::Relaxed) == 0 {
@@ -16385,6 +16292,10 @@ pub(crate) unsafe fn service_sec_image(
                             }
                             r = (0, true);
                         }
+                    }
+                    if r.1 {
+                        observe_completed_desktop_dispatch(&mut nt_handler, client.logical_caller,
+                            m0, [a0, a1, a2, a3], r.0, dispatch_return);
                     }
                     if observed_explorer_gui_client && r.1 && r.0 != 0 {
                         match m0 {
@@ -16914,7 +16825,9 @@ pub(crate) unsafe fn service_sec_image(
                     let gdi_attributes =
                         win32k_glue::map_gdi_user_attributes_into_client(&mut nt_handler, pml4, pi);
                     if gdi_va != 0 && gdi_attributes {
-                        record_hosted_client_gdi_mapping(&nt_handler, pi, gdi_va);
+                        record_hosted_client_gdi_mapping(
+                            &mut nt_handler, pi, gdi_va, dispatch_client.logical_caller,
+                        );
                     }
                 }
                 if redirected_user_callback {
@@ -22301,6 +22214,7 @@ pub(crate) unsafe fn service_sec_image(
     let native_driver_load_report = nt_handler.native_driver_load_report;
     let live_device_action_report = print_live_device_action_report(&nt_handler);
     let start_device_call_report = print_start_device_call_report(&nt_handler);
+    let desktop_acceptance_report = nt_handler.capture_desktop_acceptance_report();
     nt_handler.loop_ctx = None;
     (
         procs[primary_pi].faults,
@@ -22312,6 +22226,7 @@ pub(crate) unsafe fn service_sec_image(
         native_driver_load_report,
         live_device_action_report,
         start_device_call_report,
+        desktop_acceptance_report,
     )
 }
 

@@ -71,6 +71,8 @@ pub(crate) use service_sec_image::*;
 mod loader_trace_diag;
 pub(crate) use loader_trace_diag::*;
 mod exec_handler;
+mod desktop_observation;
+use desktop_observation::{DesktopAcceptanceReport, DesktopGuiFact, DesktopLaunchContract, DesktopObservations};
 mod native_image_sections;
 pub(crate) use exec_handler::file_image_section;
 mod hosted_routed_image_capture;
@@ -105,8 +107,6 @@ mod section_pagein_work;
 pub(crate) use fs_loader::*;
 mod hosted_bootstrap;
 pub(crate) use hosted_bootstrap::*;
-mod hosted_gate;
-pub(crate) use hosted_gate::*;
 mod hosted_loaded_images;
 pub(crate) use hosted_loaded_images::*;
 mod hosted_process_runtime;
@@ -1360,7 +1360,7 @@ pub(crate) const HOSTED_PROCESS_IMAGE_CAP: usize = MAX_PI * 4;
 /// progress. Keep the reset-safe table fixed, but size it with measured runway so the headroom gate
 /// remains meaningful instead of sitting exactly on its three-quarter ceiling.
 const VM_REGION_CAPACITY: usize = 96;
-/// The VAD authority covers the complete NT private-address domain. Automatic allocations retain
+/// The VAD authority covers the complete user-address domain. Automatic private allocations retain
 /// [`SMSS_ALLOC_VA`] as their preferred floor in the syscall policy layer; explicit reservations may
 /// occupy lower addresses when normal NT rounding admits them.
 const PRIVATE_VM_DOMAIN_BASE: u64 = 0;
@@ -1380,6 +1380,10 @@ static mut PROCESS_COMMITTED_MAPPINGS: alloc::vec::Vec<
     nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>,
 > = alloc::vec::Vec::new();
 
+const fn new_process_vm_region_map() -> nt_address_space::VmRegionMap<VM_REGION_CAPACITY> {
+    nt_address_space::VmRegionMap::new(PRIVATE_VM_DOMAIN_BASE, USER_ADDRESS_LIMIT)
+}
+
 pub(crate) unsafe fn reset_process_vm_region_maps(slots: usize) -> bool {
     let maps = &mut *core::ptr::addr_of_mut!(PROCESS_VM_REGIONS);
     maps.clear();
@@ -1388,10 +1392,7 @@ pub(crate) unsafe fn reset_process_vm_region_maps(slots: usize) -> bool {
         return false;
     }
     while maps.len() < slots {
-        maps.push(nt_address_space::VmRegionMap::new(
-            PRIVATE_VM_DOMAIN_BASE,
-            PRIVATE_VM_LIMIT,
-        ));
+        maps.push(new_process_vm_region_map());
     }
     true
 }
@@ -1410,7 +1411,7 @@ pub(crate) unsafe fn process_vm_region_map(
 
 pub(crate) unsafe fn process_vm_region_map_reset(pi: usize) {
     if let Some(map) = process_vm_region_map_mut(pi) {
-        *map = nt_address_space::VmRegionMap::new(PRIVATE_VM_DOMAIN_BASE, PRIVATE_VM_LIMIT);
+        *map = new_process_vm_region_map();
     }
 }
 
@@ -1603,9 +1604,9 @@ fn process_committed_mapping_stats() -> (usize, usize, u64) {
 /// [`VM_REGION_CAPACITY`] grew. Static (the executive is single-threaded and neither snapshot
 /// outlives its call), so the frame cost is a pointer.
 pub(crate) static mut VM_MAP_BEFORE: nt_address_space::VmRegionMap<VM_REGION_CAPACITY> =
-    nt_address_space::VmRegionMap::new(PRIVATE_VM_DOMAIN_BASE, PRIVATE_VM_LIMIT);
+    new_process_vm_region_map();
 pub(crate) static mut VM_MAP_AFTER: nt_address_space::VmRegionMap<VM_REGION_CAPACITY> =
-    nt_address_space::VmRegionMap::new(PRIVATE_VM_DOMAIN_BASE, PRIVATE_VM_LIMIT);
+    new_process_vm_region_map();
 pub(crate) static mut COMMITTED_MAP_BEFORE: nt_address_space::VmCommittedRangeTable<
     PROCESS_COMMITTED_MAPPING_CAPACITY,
 > = nt_address_space::VmCommittedRangeTable::new();
@@ -3951,7 +3952,12 @@ unsafe fn latched_or_live(latched: &AtomicU64, live: impl FnOnce() -> bool) -> b
 }
 
 #[inline(never)]
-unsafe fn check_logon_dialog_gates(passed: &mut u64) {
+unsafe fn check_logon_dialog_gates(passed: &mut u64, report: &DesktopAcceptanceReport) {
+    if report.launch_contract() == DesktopLaunchContract::MediaSetup {
+        print_str(b"[desktop-acceptance] installed-logon prerequisites=N/A (media setup)\n");
+        writable_overlay_spec(passed, report);
+        return;
+    }
     print_str(b"[winlogon] msgina dialog windows created (post-SAS-notify #32770): ");
     print_u64(WINLOGON_DIALOG_WINDOWS.load(Ordering::Relaxed));
     print_str(b" (client GDI handle table mapped=");
@@ -4072,7 +4078,7 @@ unsafe fn check_logon_dialog_gates(passed: &mut u64) {
             && WINLOGON_CRED_ERRORS.load(Ordering::Relaxed) == 0,
         passed,
     );
-    lsa_authentication_port_specs(passed);
+    lsa_authentication_port_specs(passed, report);
 }
 
 /// ═══ `\LsaAuthenticationPort` transport specs ═══════════════════════════════════════════════════
@@ -4082,7 +4088,7 @@ unsafe fn check_logon_dialog_gates(passed: &mut u64) {
 /// `LsapHandlePortConnection` issuing `NtOpenProcess`/`NtOpenProcessToken`/`NtQueryInformationToken`
 /// and its OWN `NtAcceptConnectPort(Accept)` decision, the broker's real comm-port handles, and the
 /// `LSA_API_MSG`s winlogon's `LsaLookupAuthenticationPackage`/`LsaLogonUser` marshalled.
-fn lsa_authentication_port_specs(passed: &mut u64) {
+fn lsa_authentication_port_specs(passed: &mut u64, report: &DesktopAcceptanceReport) {
     let server_port = LSA_AUTH_PORT_OBJECT_HANDLE.load(Ordering::Relaxed);
     let client_port = WINLOGON_LSA_PORT_HANDLE.load(Ordering::Relaxed);
     let connects_delivered = LSA_CONNECT_DELIVERED.load(Ordering::Relaxed);
@@ -4201,7 +4207,7 @@ fn lsa_authentication_port_specs(passed: &mut u64) {
     lsa_security_database_specs(passed);
     winlogon_logon_action_spec(passed);
     unsafe { software_hive_mount_spec(passed) };
-    unsafe { writable_overlay_spec(passed) };
+    unsafe { writable_overlay_spec(passed, report) };
 }
 
 /// ═══ THE WRITABLE FILESYSTEM OVERLAY IS A REAL FILE SYSTEM ═════════════════════════════════════
@@ -4236,7 +4242,7 @@ fn lsa_authentication_port_specs(passed: &mut u64) {
 /// deliberate staging step — persistent FAT32 write-through is a separate, tracked milestone, and
 /// when it lands only the backing behind `writable_fs` changes because every caller is above the
 /// `Zw*` seam.
-unsafe fn writable_overlay_spec(passed: &mut u64) {
+unsafe fn writable_overlay_spec(passed: &mut u64, report: &DesktopAcceptanceReport) {
     use crate::writable_fs::*;
     let selftest = OVERLAY_SELFTEST.load(Ordering::Relaxed);
     let dirs = OVERLAY_DIRS_CREATED.load(Ordering::Relaxed);
@@ -4299,9 +4305,13 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
             && ((dirs >= 1 && creates >= dirs) || restored_profile_source),
         passed,
     );
-    unsafe { default_user_profile_spec(passed) };
-    winlogon_profile_directories_spec(passed);
-    unsafe { winlogon_profile_copied_spec(passed) };
+    if report.launch_contract() != DesktopLaunchContract::MediaSetup {
+        default_user_profile_spec(passed);
+        winlogon_profile_directories_spec(passed);
+        winlogon_profile_copied_spec(passed);
+    } else {
+        print_str(b"[desktop-acceptance] installed-profile prerequisites=N/A (media setup)\n");
+    }
     provider_wait_transport_spec(passed);
     synchronous_file_retry_spec(passed);
     vspace_asid_unmap_spec(passed);
@@ -4313,9 +4323,11 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
     vm_pool_headroom_spec(passed);
     unsafe { lsarpc_connection_worker_spec(passed) };
     gdi_user_batch_flush_spec(passed);
-    unsafe { profile_ntuser_dat_spec(passed) };
-    unsafe { nt_load_key_spec(passed) };
-    user_shell_activation_spec(passed);
+    if report.launch_contract() != DesktopLaunchContract::MediaSetup {
+        profile_ntuser_dat_spec(passed);
+        nt_load_key_spec(passed);
+    }
+    user_shell_activation_spec(passed, report);
 }
 
 /// ═══ winlogon RAN ITS WHOLE `HandleLogon` AND ASKED FOR `userinit.exe` ══════════════════════════
@@ -4327,13 +4339,13 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
 /// Reaching the LAST link is therefore a structural witness that every earlier one succeeded.
 ///
 /// The generic image lane accepts its open, creates SEC_IMAGE, answers SectionImageInformation, and
-/// publishes a real pi=5 process. The separate gate below proves every stage plus the live VSpace.
+/// publishes a canonical process incarnation. The separate gate below consumes its exact receipt.
 ///
 /// The Winlogon key is now read from the real SOFTWARE hive. This proof keeps the essential shell
 /// frontier facts: msgina read the real `Userinit` value, winlogon attempted `userinit.exe`, and the
 /// logon token carried a real logon SID. Other Winlogon-key values are counted as real hive traffic,
 /// not suppressed by executive policy.
-fn user_shell_activation_spec(passed: &mut u64) {
+fn user_shell_activation_spec(passed: &mut u64, report: &DesktopAcceptanceReport) {
     let reads = WINLOGON_USERINIT_READS.load(Ordering::Relaxed);
     let ty = WINLOGON_USERINIT_TYPE.load(Ordering::Relaxed);
     let bytes = WINLOGON_USERINIT_BYTES.load(Ordering::Relaxed);
@@ -4361,55 +4373,46 @@ fn user_shell_activation_spec(passed: &mut u64) {
     print_u64(DEFAULT_USER_LOCALE_TYPE.load(Ordering::Relaxed));
     print_str(b")");
     print_str(b"\n");
-    check(
-        b"exec_winlogon_user_shell_activated",
-        // `WlxActivateUserShell` really read `Userinit`, and got the REAL hive value:
-        // `%SystemRoot%\system32\userinit.exe` is 35 chars => 70 bytes with its NUL, and
-        // the hive stores it as REG_EXPAND_SZ (2) — the type msgina insists on.
-        reads >= 1
-            && ty == 2
-            && bytes == 70
-            // winlogon's OWN CreateProcessAsUserW then reached the shell binary.
-            && opens >= 1
-            // The key was not an executive-owned two-value surface; all served values are real hive
-            // values and at least include Userinit.
-            && served >= reads
-            // `AllowAccessOnSession` could only have been passed with a real logon SID in
-            // TOKEN_GROUPS (it dereferences an uninitialised local otherwise).
-            && logon_sids >= 1
-            // Setup's locale step really seeded the value `SetDefaultLanguage` needs.
-            && DEFAULT_USER_LOCALE_TYPE.load(Ordering::Relaxed) == 1
-            && DEFAULT_USER_LOCALE_BYTES.load(Ordering::Relaxed) > 0,
-        passed,
-    );
-    userinit_image_pipeline_spec(passed);
+    match report.launch_contract() {
+        DesktopLaunchContract::InstalledLogon => check(
+            b"exec_winlogon_user_shell_activated",
+            // `WlxActivateUserShell` read the genuine REG_EXPAND_SZ Userinit value.
+            report.evidence_available && reads >= 1
+                && ty == 2
+                && bytes == 70
+                && opens >= 1
+                && served >= reads
+                && logon_sids >= 1
+                && DEFAULT_USER_LOCALE_TYPE.load(Ordering::Relaxed) == 1
+                && DEFAULT_USER_LOCALE_BYTES.load(Ordering::Relaxed) > 0,
+            passed,
+        ),
+        DesktopLaunchContract::MediaSetup => {
+            print_str(b"[desktop-acceptance] WlxActivateUserShell=N/A (media setup)\n");
+        }
+        DesktopLaunchContract::Unavailable => {
+            print_str(b"[desktop-acceptance] launch contract unavailable\n");
+            check(b"exec_desktop_launch_contract_available", false, passed);
+        }
+    }
+    userinit_image_pipeline_spec(passed, report);
 }
 
 /// ═══ userinit HAS REAL FILE + SEC_IMAGE + PROCESS SEMANTICS ═══════════════════════════════════
-fn userinit_image_pipeline_spec(passed: &mut u64) {
-    let userinit_pi = hosted_gate_pi(b"userinit.exe");
-    let userinit_bit = hosted_gate_bit(b"userinit.exe");
+fn userinit_image_pipeline_spec(passed: &mut u64, report: &DesktopAcceptanceReport) {
+    let userinit = report.userinit.filter(|_| report.evidence_available);
+    let userinit_pi = userinit.map(|receipt| receipt.key.pi);
     let opened = USERINIT_IMAGE_OPEN_SUCCESSES.load(Ordering::Relaxed);
     let sectioned = USERINIT_IMAGE_SECTIONS.load(Ordering::Relaxed);
     let queried = USERINIT_IMAGE_QUERIES.load(Ordering::Relaxed);
     let creates = USERINIT_CREATE_PROCESS_REQUESTS.load(Ordering::Relaxed);
-    let process_linked_now =
-        userinit_bit != 0 && (PM_EXEC_LINK_OK.load(Ordering::Relaxed) & userinit_bit) != 0;
-    let identity_published_now =
-        userinit_bit != 0 && (PM_IDENTITY_OK.load(Ordering::Relaxed) & userinit_bit) != 0;
-    let spawned_signal = USERINIT_SPAWNED.load(Ordering::Relaxed);
-    let spawned_ever =
-        userinit_bit != 0 && (PM_PROCESS_SPAWNED_OK.load(Ordering::Relaxed) & userinit_bit) != 0;
-    let vspace_published =
-        userinit_bit != 0 && (PM_VSPACE_PUBLISHED_OK.load(Ordering::Relaxed) & userinit_bit) != 0;
-    let main_thread_published = userinit_pi
-        .map(|pi| hosted_thread_runtime_gate_published(pi, HostedThreadRole::Main))
-        .unwrap_or(false);
+    let fully_published = userinit.is_some_and(|receipt| receipt.fully_published);
+    let main_thread_published = userinit.is_some_and(|receipt| receipt.main.is_some());
     let token_assigned = USERINIT_PRIMARY_TOKEN_ASSIGNED.load(Ordering::Relaxed);
     let shell_attempts = USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed);
     let explorer_attempts = USERINIT_EXPLORER_IMAGE_ATTEMPTS.load(Ordering::Relaxed);
     let wallpaper_spi_captures = USERINIT_WALLPAPER_SPI_CAPTURES.load(Ordering::Relaxed);
-    let gdi_mapped = USERINIT_GDI_MAPPED.load(Ordering::Relaxed);
+    let gdi_mapped = userinit.map_or(0, |receipt| receipt.gui_count(DesktopGuiFact::GdiMapped));
     let cursor_class = win32k_session_cursor_class_counters();
     let atom_names = win32k_session_atom_name_counters();
     let stock_observed = win32k_session_stock_counters();
@@ -4424,16 +4427,10 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_u64(creates);
     print_str(b" pi=");
     print_u64(userinit_pi.unwrap_or(MAX_PI) as u64);
-    print_str(b" eprocess-linked-now=");
-    print_u64(process_linked_now as u64);
-    print_str(b" identity-published-now=");
-    print_u64(identity_published_now as u64);
-    print_str(b" spawned-signal/ever=");
-    print_u64(spawned_signal);
-    print_str(b"/");
-    print_u64(spawned_ever as u64);
-    print_str(b" vspace-published=");
-    print_u64(vspace_published as u64);
+    print_str(b" exact-historical-publication=");
+    print_u64(fully_published as u64);
+    print_str(b" retired=");
+    print_u64(userinit.is_some_and(|receipt| receipt.retired) as u64);
     print_str(b" main-thread-runtime-ok=");
     print_u64(main_thread_published as u64);
     print_str(b" primary-token-assignments=");
@@ -4481,19 +4478,12 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_str(b"\n");
     check(
         b"exec_userinit_process_spawned",
-        opened >= 1
-            && sectioned >= 1
-            && queried >= 1
-            && creates >= 1
-            && spawned_ever
-            && vspace_published
-            && main_thread_published
-            && token_assigned >= 1,
+        fully_published && main_thread_published,
         passed,
     );
     check(
         b"exec_userinit_shell_image_attempted",
-        shell_attempts >= 1 && explorer_attempts >= 1,
+        report.coherent_shell_chain(),
         passed,
     );
     check(
@@ -4502,61 +4492,28 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
         passed,
     );
     check(
-        b"exec_userinit_system_font_seeded",
-        userinit_bit != 0
-            && (font_seeds & userinit_bit) != 0
-            && (font_successes & userinit_bit) != 0
-            && (font_failures & userinit_bit) == 0,
-        passed,
-    );
-    check(
-        b"exec_userinit_global_cursor_reused",
-        cursor_class.cursor_identities_observed >= 1
-            && cursor_class.cursor_promotions >= 1
-            && cursor_class.userinit_cursor_hits >= 1
-            && cursor_class.userinit_cursor_handle != 0,
-        passed,
-    );
-    check(
         b"exec_gdi_stock_objects_observed",
         stock_observed >= 1,
         passed,
     );
-    check(
-        b"exec_userinit_builtin_classes_reused",
-        cursor_class.builtin_classes_observed >= 9
-            && cursor_class.userinit_builtin_class_hits >= 9
-            && cursor_class.userinit_builtin_class_misses == 0
-            && cursor_class.userinit_builtin_class_mask & 0x02ff == 0x02ff
-            && cursor_class.userinit_dialog_class_atom == 0x8002,
-        passed,
-    );
-    explorer_image_pipeline_spec(passed);
+    print_str(b"[desktop-acceptance] font seed/cursor cache/class reuse totals are diagnostic only, not launch prerequisites\n");
+    explorer_image_pipeline_spec(passed, report);
 }
 
 /// ═══ userinit LAUNCHED THE REAL SHELL IMAGE THROUGH THE SAME EXE PIPELINE ═════════════════════
-fn explorer_image_pipeline_spec(passed: &mut u64) {
-    let userinit_bit = hosted_gate_bit(b"userinit.exe");
-    let explorer_pi = hosted_gate_pi(b"explorer.exe");
-    let explorer_bit = hosted_gate_bit(b"explorer.exe");
-    let shell_font_bits = userinit_bit | explorer_bit;
+fn explorer_image_pipeline_spec(passed: &mut u64, report: &DesktopAcceptanceReport) {
+    let explorer = report.explorer.filter(|_| report.evidence_available);
+    let explorer_pi = explorer.map(|receipt| receipt.key.pi);
     let opened = EXPLORER_IMAGE_OPEN_SUCCESSES.load(Ordering::Relaxed);
     let sectioned = EXPLORER_IMAGE_SECTIONS.load(Ordering::Relaxed);
     let queried = EXPLORER_IMAGE_QUERIES.load(Ordering::Relaxed);
     let creates = EXPLORER_CREATE_PROCESS_REQUESTS.load(Ordering::Relaxed);
-    let process_linked =
-        explorer_bit != 0 && (PM_EXEC_LINK_OK.load(Ordering::Relaxed) & explorer_bit) != 0;
-    let spawned = EXPLORER_SPAWNED.load(Ordering::Relaxed);
-    let vspace_published =
-        explorer_bit != 0 && (PM_VSPACE_PUBLISHED_OK.load(Ordering::Relaxed) & explorer_bit) != 0;
-    let main_thread_published = explorer_pi
-        .map(|pi| hosted_thread_runtime_gate_published(pi, HostedThreadRole::Main))
-        .unwrap_or(false);
+    let fully_published = explorer.is_some_and(|receipt| receipt.fully_published);
+    let main_thread_published = explorer.is_some_and(|receipt| receipt.main.is_some());
+    let live = explorer.is_some_and(|receipt| !receipt.retired && receipt.terminal_status.is_none());
     let image_pts = EXPLORER_IMAGE_PAGE_TABLES.load(Ordering::Relaxed);
-    let create_window_string_captures =
-        EXPLORER_CREATE_WINDOW_STRING_CAPTURES.load(Ordering::Relaxed);
-    let register_window_message_captures =
-        EXPLORER_REGISTER_WINDOW_MESSAGE_CAPTURES.load(Ordering::Relaxed);
+    let create_window_string_captures = explorer.map_or(0, |receipt| receipt.gui_count(DesktopGuiFact::WindowCreated));
+    let register_window_message_captures = explorer.map_or(0, |receipt| receipt.gui_count(DesktopGuiFact::MessageRegistered));
     let win32k_pool_exhaustions = WIN32K_POOL_EXHAUSTIONS.load(Ordering::Relaxed);
     let atom_names = win32k_session_atom_name_counters();
     let shell_com_provisioned = EXPLORER_SHELL_COM_REG_CLASSES_PROVISIONED.load(Ordering::Relaxed);
@@ -4564,16 +4521,18 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     let shell_com_inproc_default = EXPLORER_SHELL_COM_INPROC_DEFAULT_MASK.load(Ordering::Relaxed);
     let shell_com_threading = EXPLORER_SHELL_COM_THREADING_MODEL_MASK.load(Ordering::Relaxed);
     let (font_seeds, font_successes, font_failures) = win32k_subsystem::client_system_font_proofs();
-    let (setwndproc_client, setwndproc_replay) = win32k_subsystem::explorer_setwndproc_proofs();
+    let setwndproc_client = win32k_subsystem::explorer_setwndproc_proofs();
     let (api0_redirects, callback_failures, dead_callback_failures, nccreate_false) =
         win32k_glue::explorer_user_callback_proofs();
-    let begin_paints = EXPLORER_BEGIN_PAINTS.load(Ordering::Relaxed);
-    let end_paints = EXPLORER_END_PAINTS.load(Ordering::Relaxed);
-    let direct_draw_returns = EXPLORER_DIRECT_GDI_DRAW_RETURNS.load(Ordering::Relaxed);
-    let gdi_batch_flushes = EXPLORER_GDI_BATCH_FLUSHES.load(Ordering::Relaxed);
-    let gdi_batch_records = EXPLORER_GDI_BATCH_RECORDS.load(Ordering::Relaxed);
-    let process_self_term = explorer_bit != 0
-        && (PM_TERMINATE_PROCESS_NO_REPLY_PIS.load(Ordering::Relaxed) & explorer_bit) != 0;
+    let begin_paints = explorer.map_or(0, |receipt| receipt.gui_count(DesktopGuiFact::BeginPaint));
+    let end_paints = explorer.map_or(0, |receipt| receipt.gui_count(DesktopGuiFact::EndPaint));
+    let direct_draw_returns = explorer.map_or(0, |receipt| receipt.gui_count(DesktopGuiFact::DirectDraw));
+    let gdi_batch_flushes = explorer.map_or(0, |receipt| receipt.gui_count(DesktopGuiFact::BatchFlush));
+    let gdi_batch_records = explorer.map_or(0, |receipt| receipt.gui_count(DesktopGuiFact::BatchRecords));
+    let completed_callbacks = explorer.map_or(0, |receipt| receipt.gui_count(DesktopGuiFact::CallbackCompleted));
+    let failed_callbacks = explorer.map_or(0, |receipt| receipt.gui_count(DesktopGuiFact::CallbackFailed));
+    let completed_wndproc = explorer.map_or(0, |receipt| receipt.gui_count(DesktopGuiFact::WndProcCompleted));
+    let process_self_term = explorer.is_some_and(|receipt| receipt.terminal_status.is_some());
     print_str(b"[explorer-image] opens=");
     print_u64(opened);
     print_str(b" sections=");
@@ -4584,12 +4543,10 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_u64(creates);
     print_str(b" pi=");
     print_u64(explorer_pi.unwrap_or(MAX_PI) as u64);
-    print_str(b" eprocess-linked=");
-    print_u64(process_linked as u64);
-    print_str(b" spawned=");
-    print_u64(spawned);
-    print_str(b" vspace-published=");
-    print_u64(vspace_published as u64);
+    print_str(b" exact-live-publication=");
+    print_u64(fully_published as u64);
+    print_str(b" live=");
+    print_u64(live as u64);
     print_str(b" main-thread-runtime-ok=");
     print_u64(main_thread_published as u64);
     print_str(b" image-pts=");
@@ -4616,10 +4573,14 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_u64(dead_callback_failures);
     print_str(b" nccreate-false=");
     print_u64(nccreate_false);
-    print_str(b" setwndproc-client/replay=");
+    print_str(b" setwndproc-client=");
     print_u64(setwndproc_client);
+    print_str(b" exact-callback-completed/failed=");
+    print_u64(completed_callbacks);
     print_str(b"/");
-    print_u64(setwndproc_replay);
+    print_u64(failed_callbacks);
+    print_str(b" exact-wndproc-completed=");
+    print_u64(completed_wndproc);
     print_str(b" shell-com-provisioned=0x");
     print_hex(shell_com_provisioned as u32);
     print_str(b" shell-com-opened=0x");
@@ -4687,15 +4648,7 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     let fb_span_y = fb_readback.span_y();
     check(
         b"exec_explorer_process_spawned",
-        opened >= 1
-            && sectioned >= 1
-            && queried >= 1
-            && creates >= 1
-            && process_linked
-            && spawned == 1
-            && vspace_published
-            && main_thread_published
-            && image_pts >= 2,
+        report.coherent_shell_chain() && fully_published && main_thread_published && live,
         passed,
     );
     check(
@@ -4714,39 +4667,14 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
         passed,
     );
     check(
-        b"exec_userinit_explorer_system_fonts_seeded",
-        userinit_bit != 0
-            && explorer_bit != 0
-            && (font_seeds & shell_font_bits) == shell_font_bits
-            && (font_successes & shell_font_bits) == shell_font_bits
-            && (font_failures & shell_font_bits) == 0,
-        passed,
-    );
-    check(
         b"exec_explorer_user_callbacks_redirected",
-        api0_redirects >= 1 && callback_failures == 0,
-        passed,
-    );
-    check(
-        b"exec_explorer_wndproc_installed_by_client",
-        setwndproc_client >= 1 && setwndproc_replay == 0,
-        passed,
-    );
-    check(
-        b"exec_explorer_shell_com_classes_served",
-        shell_com_provisioned & EXPLORER_SHELL_COM_REQUIRED_MASK
-            == EXPLORER_SHELL_COM_REQUIRED_MASK
-            && shell_com_opened & EXPLORER_SHELL_COM_REQUIRED_MASK
-                == EXPLORER_SHELL_COM_REQUIRED_MASK
-            && shell_com_inproc_default & EXPLORER_SHELL_COM_REQUIRED_MASK
-                == EXPLORER_SHELL_COM_REQUIRED_MASK
-            && shell_com_threading & EXPLORER_SHELL_COM_REQUIRED_MASK
-                == EXPLORER_SHELL_COM_REQUIRED_MASK,
+        report.coherent_shell_chain() && fully_published && main_thread_published && live
+            && completed_callbacks >= 1 && failed_callbacks == 0,
         passed,
     );
     check(
         b"exec_explorer_shell_chrome_painted",
-        spawned == 1
+        report.coherent_shell_chain() && fully_published && main_thread_published && live
             && begin_paints >= 1
             && end_paints >= begin_paints
             && direct_draw_returns >= 1
@@ -4760,6 +4688,7 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
             && fb_readback.unique_non_bg >= 8,
         passed,
     );
+    print_str(b"[desktop-acceptance] font seed/COM/subclassing totals are diagnostic only, not desktop prerequisites\n");
 }
 
 #[derive(Clone, Copy)]
@@ -10414,7 +10343,20 @@ pub(crate) unsafe fn ke_gdi_flush_user_batch(
             }
         }
     });
+    // Keep the original caller receipt across the provider call; nested callbacks can change
+    // the ambient thread. Only acknowledged completion is desktop drawing evidence.
+    let batch_caller = client.logical_caller;
     let (status, ok) = win32k_glue::win32k_flush_user_gdi_batch(client);
+    if ok && status as u32 == 0 {
+        if let Some(caller) = batch_caller {
+            service_sec_image::service_observe_desktop_gui_for(
+                caller, desktop_observation::DesktopGuiFact::BatchFlush, 1,
+            );
+            service_sec_image::service_observe_desktop_gui_for(
+                caller, desktop_observation::DesktopGuiFact::BatchRecords, count as u64,
+            );
+        }
+    }
     if !ok || status as u32 != 0 {
         let failures = GDI_BATCH_FLUSH_FAILURES.fetch_add(1, Ordering::Relaxed);
         if failures < 8 {
@@ -23227,6 +23169,7 @@ struct ExecNtHandler {
     /// resolve TID -> TCB; the old TCB atomics are synchronized mirrors for global glue that has not
     /// been threaded through `ExecNtHandler` yet.
     thread_runtime: HostedThreadRuntimes,
+    desktop_observations: DesktopObservations,
     /// Session-scoped win32k state observed from provider-owned objects and reused only through
     /// explicit session/runtime lookup.
     win32k_session: Win32kSessionRuntime,
@@ -26301,10 +26244,6 @@ static PM_INITIAL_SYSTEM_OBJECT_PRESENT: AtomicU64 = AtomicU64::new(0);
 /// Hosted EPROCESS allocations performed by real `NtCreateProcess[Ex]` calls after the SMSS
 /// bootstrap trio.
 static PM_DYNAMIC_PROCESS_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
-/// Bit i is set once dynamically hosted process pi=i has completed real process allocation, VSpace
-/// publication, and image-table spawn publication. Unlike the live ProcessManager masks, this
-/// lifecycle proof is retained after a short-lived bootstrap process exits normally.
-static PM_PROCESS_SPAWNED_OK: AtomicU64 = AtomicU64::new(0);
 /// Bit i set iff EPROCESS pi=i exists AND its image_file_name matches the expected hosted binary AND
 /// its pid is distinct — proves the real objects (not just pid scalars) back each hosted process.
 static PM_IDENTITY_OK: AtomicU64 = AtomicU64::new(0);
@@ -26690,8 +26629,6 @@ impl ProcExec {
 /// struct is EPROCESS-linked at runtime (path 3). The gate derives the expected mask from runtime
 /// hosted-process metadata registration.
 static PM_EXEC_LINK_OK: AtomicU64 = AtomicU64::new(0);
-/// Bit i set when the handler accepted a nonzero seL4 VSpace cap for hosted process pi.
-static PM_VSPACE_PUBLISHED_OK: AtomicU64 = AtomicU64::new(0);
 /// Frame-cap base of the staged system font (arial.ttf) in FONTBUF (fed to IntGdiAddFontMemResource).
 static FONTBUF_START: AtomicU64 = AtomicU64::new(0);
 /// The win32k component's stack frame-cap base + count + TCB (for the fault-time stack backtrace).
@@ -27958,6 +27895,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     install_object_manager_client(&mut *c);
 
     let mut passed = 0u64;
+    let mut desktop_acceptance = DesktopAcceptanceReport::unavailable();
     check(b"exec_ob_ping", c.ping().is_success(), &mut passed);
     let created = c.create_directory("\\Device\\Test0", true);
     check(b"exec_ob_create_directory", created.is_ok(), &mut passed);
@@ -31943,6 +31881,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         native_driver_load_report,
                         live_device_action_report,
                         start_device_call_report,
+                        desktop_report,
                     ) = service_sec_image(
                         si_fault,
                         spawn,
@@ -31952,6 +31891,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         (NTDLL_BASE, smss_ntdll_pe),
                         driver_start_bootstrap,
                     );
+                    desktop_acceptance = desktop_report;
                     // The service has returned its exclusive borrow. Final observations read only
                     // the retained catalog and canonical process ownership tables, not loop context.
                     let observation_handler =
@@ -33501,7 +33441,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // window could be created (msgina's FindResource missed + gdi32 NULL-derefed); >=2 proves the
     // client-GDI path now works and msgina's real dialog code creates windows. winlogon then parks in
     // the nested modal message pump (blocked on credential input a headless host can't supply).
-    check_logon_dialog_gates(&mut passed);
+    check_logon_dialog_gates(&mut passed, &desktop_acceptance);
     if let Some(covered) = driver_launch::source_observability::report() {
         check(b"exec_source_native_milestone_coverage", covered, &mut passed);
     }

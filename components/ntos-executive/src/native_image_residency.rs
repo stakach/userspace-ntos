@@ -1,6 +1,7 @@
 //! Canonical area/RVA backing and separately owned per-view mapping caps.
 
 use super::*;
+use core::fmt::Write;
 use exec_handler::native_image_view::NativeImageViewDescriptor;
 use nt_address_space::FaultAccess;
 use nt_memory_manager::borrowed_page_installation::{
@@ -319,26 +320,79 @@ pub(crate) unsafe fn service_native_image_page_residency(
     access: FaultAccess,
     fault_observed: bool,
 ) -> Result<(), u32> {
+    let mut stage = "borrow";
+    let result = service_page_residency(handler, view, page, access, fault_observed, &mut stage);
+    if let Err(status) = result {
+        if fault_observed {
+            trace_image_fault_failure(handler, view, page, access, stage, status);
+        }
+    }
+    result
+}
+
+unsafe fn trace_image_fault_failure(
+    handler: &ExecNtHandler,
+    view: NativeImageViewDescriptor,
+    page: u64,
+    access: FaultAccess,
+    stage: &str,
+    status: u32,
+) {
+    // Copy evidence after the residency borrow ends; the record grants no new access authority.
+    let current_process = handler.capture_process_identity(view.pi);
+    let source = handler.image_sections.source_for_view(view.view).map(|source| {
+        (source.backing, source.layout.headers().image_base)
+    });
+    let mapping = process_committed_mapping_basic_information(view.pi as u64, page);
+    let resident = (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).get(view.pi as u64, page);
+    let rva = page.checked_sub(view.base).and_then(|offset| view.section_offset.checked_add(offset));
+    let mut record = nt_printf::record::RecordBuffer::<3072>::new();
+    let _ = writeln!(
+        record,
+        "[native-image-fault-failure] stage={stage} status=0x{status:08x} access={access:?} page=0x{page:x} rva={rva:x?} view={view:x?} current-process={current_process:?} source-and-preferred={source:x?} mapping={mapping:x?} resident={resident:x?}"
+    );
+    sel4_rt::print_record(if record.overflowed() {
+        b"[native-image-fault-failure] record-truncated\n"
+    } else {
+        record.bytes()
+    });
+}
+
+unsafe fn service_page_residency(
+    handler: &mut ExecNtHandler,
+    view: NativeImageViewDescriptor,
+    page: u64,
+    access: FaultAccess,
+    fault_observed: bool,
+    stage: &mut &'static str,
+) -> Result<(), u32> {
     let _borrow = Borrow::acquire()?;
+    *stage = "view-identity";
     if !current(handler, view, page) || page & 0xfff != 0 {
         return Err(INVALID);
     }
+    *stage = "memory-access";
     hosted_thread_memory_access(view.pi as u64, page, 4096)?;
+    *stage = "rva";
     let rva = view
         .section_offset
         .checked_add(page.checked_sub(view.base).ok_or(INVALID)?)
         .and_then(|rva| u32::try_from(rva).ok())
         .ok_or(INVALID)?;
+    *stage = "source";
     let source = handler
         .image_sections
         .source_for_view(view.view)
         .ok_or(INVALID)?;
+    *stage = "fill-plan";
     source
         .layout
         .image_page_fill_plan(rva, source.backing.file_extent)
         .map_err(|_| INVALID)?;
+    *stage = "committed-mapping";
     let info = process_committed_mapping_basic_information(view.pi as u64, page)
         .ok_or(nt_address_space::STATUS_NOT_COMMITTED)?;
+    *stage = "mapping-identity";
     if info.allocation_base != view.base
         || info.type_ != nt_address_space::MEM_IMAGE
         || info.state != nt_address_space::MEM_COMMIT
@@ -346,10 +400,12 @@ pub(crate) unsafe fn service_native_image_page_residency(
         return Err(INVALID);
     }
     let protection = info.protect;
+    *stage = "access";
     nt_address_space::image_view_fault_access_status(protection, access)?;
     let fault_plan =
         nt_address_space::image_view_fault_plan(protection, access == FaultAccess::Write);
     if let Some(record) = (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).get(view.pi as u64, page) {
+        *stage = "resident-identity";
         if !record.is_resident()
             || record.lifetime != nt_memory_manager::MemoryLifetime::Process(view.process)
         {
@@ -359,8 +415,10 @@ pub(crate) unsafe fn service_native_image_page_residency(
             // A private COW page already contains loader/application changes; never refill it.
             if fault_observed {
                 if !fault_plan.copy_on_write {
+                    *stage = "resident-private-fault";
                     return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
                 }
+                *stage = "private-reprotect";
                 return vm_reprotect_private_page(
                     view.pi,
                     view.process,
@@ -373,12 +431,15 @@ pub(crate) unsafe fn service_native_image_page_residency(
             return Ok(());
         }
         if fault_observed && !fault_plan.copy_on_write {
+            *stage = "resident-shared-fault";
             return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
         }
     }
+    *stage = "pagefile-restore";
     if handler.restore_process_pagefile_page(view.pi, page, view.pml4, view.scratch_base)? {
         return Ok(());
     }
+    *stage = "source-page";
     let source_frame = ensure_source_page(handler, view, rva)?;
     if fault_plan.copy_on_write {
         let target = ViewPage {
@@ -387,6 +448,7 @@ pub(crate) unsafe fn service_native_image_page_residency(
             protection: fault_plan.map_protection,
         };
         let preparation = &mut *core::ptr::addr_of_mut!(COW_SOURCE);
+        *stage = "cow-owner";
         if preparation.is_some_and(|(old, frame)| old != target || frame != source_frame) {
             return Err(RESOURCES);
         }
@@ -394,7 +456,9 @@ pub(crate) unsafe fn service_native_image_page_residency(
         // through cleanup/initializer refusal, independently of the old resident row.
         *preparation = Some((target, source_frame));
         let access = retirement_memory_access::Access::Ordinary;
+        *stage = "cow-withdraw";
         client_frame_cleanup::release_with_access(view.pi as u64, page, &access)?;
+        *stage = "cow-install";
         let result = hosted_private_page_installation::map_private_page_from_frame(
             handler,
             view.pi,
@@ -410,6 +474,7 @@ pub(crate) unsafe fn service_native_image_page_residency(
         }
         return result;
     }
+    *stage = "shared-install";
     install_view_page(
         handler,
         ViewPage {

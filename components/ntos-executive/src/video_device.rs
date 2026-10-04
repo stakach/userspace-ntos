@@ -687,7 +687,10 @@ pub(crate) unsafe fn video_get_device_object_pointer(
 }
 
 /// Resolve the current attachment top through the File's exact consumer projection.
-pub(crate) unsafe fn video_related_device_object(file_object: u64) -> Result<u64, NtStatus> {
+pub(crate) unsafe fn video_related_device_object(
+    domain: nt_io_manager::HostedDomainIdentity,
+    file_object: u64,
+) -> Result<u64, NtStatus> {
     if !projected_video_route_ready() {
         return Err(NtStatus::DEVICE_NOT_READY);
     }
@@ -695,7 +698,7 @@ pub(crate) unsafe fn video_related_device_object(file_object: u64) -> Result<u64
     if file_object == 0 || file_object != state.route.file_projection {
         return Err(NtStatus::INVALID_HANDLE);
     }
-    video_projection_owners::related_device_address(state.route.owner_id, file_object)
+    video_projection_owners::related_device_address(domain, state.route.owner_id, file_object)
 }
 
 pub(crate) unsafe fn video_file_projection_contains(object: u64) -> bool {
@@ -725,21 +728,27 @@ pub(crate) unsafe fn retain_video_file_projection(
         .map_err(|status| status.raw())
 }
 
-pub(crate) unsafe fn reference_video_file_pointer(object: u64) -> Result<u64, i32> {
+pub(crate) unsafe fn reference_video_file_pointer(
+    domain: nt_io_manager::HostedDomainIdentity,
+    object: u64,
+) -> Result<u64, i32> {
     let _operation = PublicationGuard::enter().ok_or(NtStatus::DEVICE_BUSY.raw())?;
     if !projected_video_route_ready() || !video_file_projection_contains(object) {
         return Err(STATUS_OBJECT_NAME_NOT_FOUND);
     }
     let owner = video_state_snapshot().route.owner_id;
-    video_projection_owners::reference_by_pointer(owner, object).map_err(|status| status.raw())
+    video_projection_owners::reference_by_pointer(domain, owner, object).map_err(|status| status.raw())
 }
 
-pub(crate) unsafe fn release_video_file_projection(object: u64) -> Result<u64, i32> {
+pub(crate) unsafe fn release_video_file_projection(
+    domain: nt_io_manager::HostedDomainIdentity,
+    object: u64,
+) -> Result<u64, i32> {
     let _operation = PublicationGuard::enter().ok_or(NtStatus::DEVICE_BUSY.raw())?;
     if !video_file_projection_contains(object) {
         return Err(STATUS_OBJECT_NAME_NOT_FOUND);
     }
-    video_projection_owners::dereference(video_state_snapshot().route.owner_id, object)
+    video_projection_owners::dereference(domain, video_state_snapshot().route.owner_id, object)
         .map_err(|status| status.raw())
 }
 

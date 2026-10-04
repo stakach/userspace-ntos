@@ -200,10 +200,14 @@ unsafe fn process_output(
         continuation.return_target.delivery().is_some(),
         "retiring target cannot deliver output"
     );
-    let NativeReturn::Hosted(dispatch) = terminal.returned else {
+    let NativeReturn::Hosted(mut dispatch) = terminal.returned else {
         return;
     };
     let client = continuation.pending.client();
+    if dispatch.logical_caller != client.logical_caller {
+        // Identity disagreement removes evidence only, not retained output/Reply ownership.
+        dispatch.logical_caller = None;
+    }
     let pi = client.pi as usize;
     let copied = match (procs.get(pi), pfilled.get_mut(pi)) {
         (Some(process), Some(filled)) if process.pml4 != 0 => {

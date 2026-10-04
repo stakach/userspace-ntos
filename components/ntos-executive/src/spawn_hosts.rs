@@ -1788,6 +1788,8 @@ unsafe fn pump_reply_recv4(
 /// dispatch loop (sent `dispatch_label`); `false` = it hit a wall (fault we won't demand-map).
 #[derive(Clone, Copy)]
 pub(crate) struct PumpResult {
+    pub dispatch_return_receipt: Option<nt_user_callback::DispatchReturnReceipt>,
+    pub dispatch_return: Option<nt_user_callback::DispatchReturn>,
     pub status: i32,
     /// Pointer-width dispatch return. For IRP components this mirrors `status`; for win32k it is
     /// the full handler RAX, needed by NtUser/NtGdi APIs that return handles or LONG_PTR values.
@@ -1822,6 +1824,8 @@ impl PumpResult {
     /// An adapter's genuine admission failure, never a provider completion or resumable yield.
     pub(crate) fn refused(status: i32, reply_cap: u64) -> Self {
         Self {
+            dispatch_return_receipt: None,
+            dispatch_return: None,
             status,
             result: status as u32 as u64,
             reply_cap,
@@ -4547,6 +4551,16 @@ unsafe fn pump_result_from_outcome(
         (status, status as u32 as u64)
     };
     PumpResult {
+        dispatch_return: None,
+        dispatch_return_receipt: if outcome.completed && ch.caps.kind == ReqKind::Syscall {
+            let address = ch.shared_va + crate::win32k_subsystem::SH_DISPATCH_RETURN;
+            Some(nt_user_callback::DispatchReturnReceipt::from_words([
+                core::ptr::read_volatile(address as *const u64),
+                core::ptr::read_volatile((address + 8) as *const u64),
+                core::ptr::read_volatile((address + 16) as *const u64),
+                core::ptr::read_volatile((address + 24) as *const u64),
+            ]))
+        } else { None },
         status,
         result,
         reply_cap,

@@ -480,6 +480,34 @@ mod tests {
     }
 
     #[test]
+    fn retained_owner_release_requires_exact_consumer_domain_after_handle_close() {
+        let (mut io, identity, device) = opened();
+        let mut projection = ConsumerFileProjection::new(&mut io, identity, device).unwrap();
+        projection.reference_by_handle(&mut io, identity).unwrap();
+        projection.handle_closed(identity).unwrap();
+
+        let foreign_domain = io.register_hosted_domain();
+        let foreign = io.bind_hosted_file_identity(
+            foreign_domain, identity.address(), identity.file_id(),
+        ).unwrap();
+        let references = io.file_reference_count(identity.file_id());
+        assert_eq!(projection.dereference(&mut io, foreign), Err(NtStatus::INVALID_HANDLE));
+        assert_eq!(projection.pointer_reference_count(), 1);
+        assert_eq!(io.file_reference_count(identity.file_id()), references);
+        assert_eq!(io.hosted_device_pointer_count(device), Ok(1));
+
+        // Retirement is legitimately pending until this already-owned pointer is released.
+        assert_eq!(projection.retire(&mut io), Err(NtStatus::DEVICE_BUSY));
+        projection.dereference(&mut io, identity).unwrap();
+        projection.retire(&mut io).unwrap();
+        assert_eq!(projection.pointer_reference_count(), 0);
+        assert_eq!(io.file_reference_count(identity.file_id()), references - 1);
+        assert_eq!(io.hosted_device_pointer_count(device), Ok(0));
+        assert_eq!(io.hosted_file_by_identity(identity.domain(), identity.address()), None);
+        assert_eq!(io.hosted_file_by_identity(foreign_domain, identity.address()), Some(identity.file_id()));
+    }
+
+    #[test]
     fn device_projection_cannot_retire_while_file_projection_is_live() {
         let (mut io, identity, device) = opened();
         let mut projection = ConsumerFileProjection::new(&mut io, identity, device).unwrap();

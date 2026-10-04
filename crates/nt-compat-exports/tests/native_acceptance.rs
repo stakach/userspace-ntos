@@ -62,7 +62,23 @@ mod media_setup_authority;
 mod user_binding_authority;
 #[path = "native_acceptance/readonly_file_capacity.rs"]
 mod readonly_file_capacity;
+#[path = "native_acceptance/exact_desktop_receipts.rs"]
+mod exact_desktop_receipts;
+#[path = "native_acceptance/image_vad_domain.rs"]
+mod image_vad_domain;
 
 // Executive globals required by the real cache module exercised in the host harness.
 use core::sync::atomic::{AtomicU64, Ordering};
 const MAX_PI: usize = 64;
+
+#[path = "native_acceptance/retained_file_cleanup_authority.rs"]
+mod retained_file_cleanup_authority;
+
+#[path = "native_acceptance/completed_gui_receipts.rs"]
+mod completed_gui_receipts;
+
+#[path = "native_acceptance/desktop_gate_contract.rs"]
+mod desktop_gate_contract;
+
+#[path = "native_acceptance/gui_dispatch_provenance.rs"]
+mod gui_dispatch_provenance;

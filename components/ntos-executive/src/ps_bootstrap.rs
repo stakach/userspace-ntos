@@ -160,10 +160,7 @@ fn seed_processes(entry: u64, parameter: u64) -> Result<PsBootstrapSeed, u32> {
     PM_OBJECT_COUNT.store(0, Ordering::Relaxed);
     PM_INITIAL_SYSTEM_OBJECT_PRESENT.store(0, Ordering::Relaxed);
     PM_DYNAMIC_PROCESS_ALLOCATIONS.store(0, Ordering::Relaxed);
-    PM_PROCESS_SPAWNED_OK.store(0, Ordering::Relaxed);
     PM_IDENTITY_OK.store(0, Ordering::Relaxed);
-    PM_VSPACE_PUBLISHED_OK.store(0, Ordering::Relaxed);
-    reset_hosted_gate_metadata();
     PM_RUNNING_PROCESS_MASK.store(0, Ordering::Relaxed);
     PM_MAIN_THREADS_OK.store(0, Ordering::Relaxed);
     HOSTED_THREAD_RUNTIME_OK.store(0, Ordering::Relaxed);
