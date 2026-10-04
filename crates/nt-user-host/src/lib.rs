@@ -26,6 +26,7 @@ mod mechanism;
 mod ntdll;
 mod profile;
 pub mod process_identity;
+pub mod process_observation;
 pub mod provider_alias_bank;
 pub mod provider_finalization;
 pub mod provider_file_close;
