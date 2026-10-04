@@ -58,6 +58,8 @@ mod source_pending_retirement;
 mod mup_read_evidence;
 #[path = "native_acceptance/media_setup_authority.rs"]
 mod media_setup_authority;
+#[path = "native_acceptance/user_binding_authority.rs"]
+mod user_binding_authority;
 
 // Executive globals required by the real cache module exercised in the host harness.
 use core::sync::atomic::{AtomicU64, Ordering};

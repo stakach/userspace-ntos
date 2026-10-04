@@ -3881,7 +3881,6 @@ unsafe fn resume_suspended_user_callback_component(
         client.teb,
         client.eprocess,
         client.ethread,
-        callback_process_role_code(client.process_role) as u64,
     ) {
         return crate::spawn_hosts::PumpResult::refused(
             0xC000_000Du32 as i32, channel.reply_cap,
@@ -4014,7 +4013,6 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
         client.teb,
         client.eprocess,
         client.ethread,
-        callback_process_role_code(client.process_role) as u64,
     ) {
         return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
     }
@@ -4221,7 +4219,6 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
         client.teb,
         client.eprocess,
         client.ethread,
-        callback_process_role_code(client.process_role) as u64,
     ) {
         return LpcWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
     }

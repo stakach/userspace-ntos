@@ -954,15 +954,6 @@ pub fn registered_win32k_callouts() -> Option<nt_process::Win32Callouts> {
     }
 }
 
-fn hosted_process_role_is_noninteractive_service_class(process_role: u64) -> bool {
-    matches!(
-        process_role,
-        HOSTED_PROCESS_ROLE_NONINTERACTIVE_SERVICE
-            | HOSTED_PROCESS_ROLE_SERVICE_CONTROL_MANAGER
-            | HOSTED_PROCESS_ROLE_LOCAL_SECURITY_AUTHORITY
-    )
-}
-
 /// Component-side lookup of the provider's win32k x64 SSPT/KiArgumentTable arity.
 ///
 /// # Safety
@@ -1064,11 +1055,8 @@ const PROCESSINFO_PTILIST_OFF: u64 = 0xD8;
 /// real IntSetThreadDesktop path skip the debug-only "assign it now" branch that formats
 /// `peProcess->ImageFileName` out of our synthetic EPROCESS body.
 const PROCESSINFO_PTIMAINTHREAD_OFF: u64 = 0xE0;
-const PROCESSINFO_RPDESK_STARTUP_OFF: u64 = 0xE8;
-const PROCESSINFO_HDESK_STARTUP_OFF: u64 = 0x110;
 const PROCESSINFO_PRPWINSTA_OFF: u64 = 0x220;
 const PROCESSINFO_HWINSTA_OFF: u64 = 0x228;
-const PROCESSINFO_AMWINSTA_OFF: u64 = 0x230;
 /// `PROCESSINFO.pW32Job`, immediately after `dwLpkEntryPoints` in the NT5/ReactOS layout.
 const PROCESSINFO_PW32JOB_OFF: u64 = 0x260;
 /// ReactOS 0.4.17 `gAtomTable` pointer cell. `NtUserRegisterWindowMessage`'s call to `IntAddAtom`
@@ -1089,8 +1077,6 @@ const W32HEAP_MAPPING_LIMIT_OFF: u64 = 0x18;
 const W32HEAP_MAPPING_COUNT_OFF: u64 = 0x20;
 const W32HEAP_MAPPING_SIZE: u64 = 0x28;
 const W32PF_CREATEDWINORDC: u32 = 0x0400_0000;
-const W32PF_READSCREENACCESSGRANTED: u32 = 0x0000_0010;
-const WINSTA_ALL_ACCESS: u32 = 0x000f_037f;
 const FIRST_USER_HANDLE: u64 = 0x20;
 const LAST_USER_HANDLE: u64 = 0xFFEF;
 const USER_HANDLE_ENTRY_SIZE: u64 = 0x18;
@@ -1172,20 +1158,14 @@ const THREADINFO_PDESKINFO_OFF: u64 = 0x80;
 /// THREADINFO->pClientInfo offset (win32.h, after pDeskInfo). `IntSetThreadDesktop` also updates the
 /// client-side `pci->pDeskInfo` (desktop.c:3434) from this.
 const THREADINFO_PCLIENTINFO_OFF: u64 = 0x88;
-const THREADINFO_FLAGS_OFF: u64 = 0x90;
 const THREADINFO_PCTI_OFF: u64 = 0x70;
 /// THREADINFO.cti, the embedded CLIENTTHREADINFO used while a thread has no desktop. ReactOS
 /// initializes `pcti = &cti` and only replaces it with desktop-heap storage in IntSetThreadDesktop.
 const THREADINFO_EMBEDDED_CTI_OFF: u64 = 0x2A8;
-const TIF_SYSTEMTHREAD: u32 = 0x0000_0004;
-const TIF_CSRSSTHREAD: u32 = 0x0000_0008;
 const CLIENTTHREADINFO_SIZE: u64 = 0x20;
 const CLIENTINFO_PDESKINFO_OFF: u64 = 0x20;
 const CLIENTINFO_ULCLIENTDELTA_OFF: u64 = 0x28;
 const CLIENTINFO_PCLIENTTHREADINFO_OFF: u64 = 0x60;
-/// THREADINFO->hdesk offset (`win32.h`: after `exitCode`, before `cPaintsReady`). Keep it consistent
-/// with `rpdesk`/`pDeskInfo` when preparing a real first `NtUserSetThreadDesktop` call.
-const THREADINFO_HDESK_OFF: u64 = 0xD8;
 /// THREADINFO->hEventQueueClient / ->pEventQueueServer offsets. ReactOS' `CreateThreadInfo` creates
 /// a synchronization event, stores the client handle at +0x138, then references it to a server KEVENT
 /// pointer at +0x140. `IntMsqSetWakeMask` returns the handle to user32 and `MsqWakeQueue` signals the
@@ -1272,12 +1252,6 @@ const DESKTOP_HEAP_WINLOGON_BYTES: u64 = 128 * 1024;
 /// naturally-created DESKTOP objects come through the routed `dispatch_ssn` path; Ob creation now
 /// populates `pdesk->rpwinstaParent` and the section-backed desktop heap before the handle is returned.
 pub const SSN_NT_USER_CREATE_DESKTOP: u64 = 0x122d;
-
-/// `NtUserSetThreadDesktop` (SSN 0x1092, w32ksvc64.h) → `IntSetThreadDesktop` (desktop.c:3295), the
-/// REAL thread↔desktop connection: it sets `pti->rpdesk` + `pti->pDeskInfo`. winlogon's WlxActivate
-/// user thread drives it (wlx.c:1077 `SetThreadDesktop(hdeskWinlogon)`). We latch the fields it sets
-/// (post-dispatch) so the per-dispatch reassert can protect `pti->pDeskInfo` for the class path.
-pub const SSN_NT_USER_SET_THREAD_DESKTOP: u64 = 0x1092;
 
 /// The IPC message label the dispatch loop uses when it `seL4_Call`s the executive to signal
 /// ready/done. win32k is NOT a hosted TCB (its trampolines issue real seL4 syscalls for serial), so
@@ -4084,7 +4058,7 @@ extern "win64" fn s_establish_win32_callouts(callout_data: u64) -> i32 {
 // semantics (handle minting, the registry, the create→insert latch, the single-instance
 // window-station cache) live in the crate.
 use nt_object_manager::win32k_ob::{
-    init_desktop_body, link_thread_to_desktop, unlink_thread_from_desktop, ObHandleTable, ObKind,
+    init_desktop_body, ObHandleTable, ObKind,
     PendingObjectRelease, DESKTOP_BODY_SIZE,
 };
 
@@ -4274,6 +4248,68 @@ extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
     count
 }
 
+unsafe fn trace_user_object_reference_underflow(
+    object: u64,
+    kind: Option<ObKind>,
+    counts: (u32, u32),
+) {
+    let eprocess = current_eprocess();
+    let ethread = current_ethread();
+    let process = process_context_index_for_eprocess(eprocess).map(|index| {
+        (
+            process_ctx_pi(index),
+            process_ctx_pid(index),
+            process_ctx_generation(index),
+        )
+    });
+    let thread = thread_context_index_for_ethread(ethread).map(|index| {
+        (
+            thread_ctx_tid(index),
+            thread_ctx_pid(index),
+            thread_ctx_generation(index),
+        )
+    });
+
+    print_str(b"[win32k-ob-underflow] body=0x");
+    print_win32k_hex64(object);
+    print_str(b" kind=");
+    print_str(match kind {
+        Some(ObKind::Desktop) => b"Desktop",
+        Some(ObKind::WindowStation) => b"WindowStation",
+        Some(ObKind::Other) => b"Other",
+        None => b"unknown",
+    });
+    print_str(b" pointers=");
+    print_u64(counts.0 as u64);
+    print_str(b" handles=");
+    print_u64(counts.1 as u64);
+    print_str(b" eprocess=0x");
+    print_win32k_hex64(eprocess);
+    if let Some((pi, pid, generation)) = process {
+        print_str(b" pi=");
+        print_u64(pi);
+        print_str(b" pid=");
+        print_u64(pid);
+        print_str(b" process-generation=");
+        print_u64(generation);
+    } else {
+        print_str(b" process-context=absent");
+    }
+    print_str(b" ethread=0x");
+    print_win32k_hex64(ethread);
+    if let Some((tid, pid, generation)) = thread {
+        print_str(b" tid=");
+        print_u64(tid);
+        print_str(b" thread-pid=");
+        print_u64(pid);
+        print_str(b" thread-process-generation=");
+        print_u64(generation);
+    } else {
+        print_str(b" thread-context=absent");
+    }
+    print_str(b"\n");
+}
+
 extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
     let pending = unsafe {
         (&mut *core::ptr::addr_of_mut!(OBJ_TABLE)).release_pending_by_body(object)
@@ -4295,11 +4331,23 @@ extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
         },
         None => {}
     }
-    if unsafe { (&*core::ptr::addr_of!(OBJ_TABLE)).counts_by_body(object) }.is_some() {
-        return unsafe {
+    let user_object = unsafe {
+        let table = &*core::ptr::addr_of!(OBJ_TABLE);
+        table
+            .counts_by_body(object)
+            .map(|counts| (table.kind_by_body(object), counts))
+    };
+    if let Some((kind, counts)) = user_object {
+        let remaining = unsafe {
             (&mut *core::ptr::addr_of_mut!(OBJ_TABLE))
                 .dereference_by_body(object)
-                .expect("USER object pointer reference underflow") as u64
+        };
+        return match remaining {
+            Some(count) => count as u64,
+            None => {
+                unsafe { trace_user_object_reference_underflow(object, kind, counts) };
+                panic!("USER object pointer reference underflow");
+            }
         };
     }
     if unsafe { (&*core::ptr::addr_of!(WIN32K_LPC_PORT_REFERENCES)).contains(object) } {
@@ -9614,16 +9662,9 @@ const WIN32K_SERVICE_WINSTA_INITIAL_CAP: u64 = 4;
 static WIN32K_SERVICE_WINSTA_RECORDS_PTR: AtomicU64 = AtomicU64::new(0);
 static WIN32K_SERVICE_WINSTA_RECORDS_LEN: AtomicU64 = AtomicU64::new(0);
 static WIN32K_SERVICE_WINSTA_RECORDS_CAP: AtomicU64 = AtomicU64::new(0);
-static WIN32K_STARTUP_DESKTOP_SEEDS: AtomicU64 = AtomicU64::new(0);
-static WIN32K_INHERITED_WINSTA_SEEDS: AtomicU64 = AtomicU64::new(0);
-static WIN32K_NONINTERACTIVE_WINSTA_RESOLVES: AtomicU64 = AtomicU64::new(0);
-static WIN32K_DEFAULT_DESKTOP_HANDLE: AtomicU64 = AtomicU64::new(0);
-static WIN32K_DEFAULT_DESKTOP_BODY: AtomicU64 = AtomicU64::new(0);
-static WIN32K_DEFAULT_DESKTOP_PUBLISHES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_SYSTEM_FONT_SEEDS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_SYSTEM_FONT_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_SYSTEM_FONT_FAILURES: AtomicU64 = AtomicU64::new(0);
-static WIN32K_SET_THREAD_DESKTOP_PREPARES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_TICK_COUNT: AtomicU64 = AtomicU64::new(1);
 
 /// Current process identity for the explicitly selected initialization or hosted caller.
@@ -11268,7 +11309,6 @@ struct Win32kCallbackRequestContext {
     client_teb: u64,
     supplied_eprocess: u64,
     supplied_ethread: u64,
-    process_role: u64,
 }
 
 unsafe fn callback_request_context_for_request(
@@ -11295,7 +11335,6 @@ unsafe fn callback_request_context_for_request(
     let sh_tid = read_volatile((sh + SH_REQ_THREAD_ID) as *const u64);
     let sh_matches_request =
         sh_pi == request.client_pi as u64 && sh_pid == pid && sh_tid == request.client_tid;
-    let role_matches_process = sh_pi == request.client_pi as u64 && sh_pid == pid;
     let table_teb = thread_ctx_teb(thread_index);
     let supplied_eprocess = process_ctx_eprocess(process_index);
     let supplied_ethread = thread_ctx_ethread(thread_index);
@@ -11317,11 +11356,6 @@ unsafe fn callback_request_context_for_request(
         },
         supplied_eprocess,
         supplied_ethread,
-        process_role: if role_matches_process {
-            read_volatile((sh + SH_REQ_PROCESS_ROLE) as *const u64)
-        } else {
-            HOSTED_PROCESS_ROLE_NONE
-        },
     })
 }
 
@@ -11349,7 +11383,6 @@ unsafe fn restore_user_callback_execution_context(
         context.client_teb,
         context.supplied_eprocess,
         context.supplied_ethread,
-        context.process_role,
         true,
         trace_resume,
     )
@@ -11362,7 +11395,6 @@ pub(crate) unsafe fn restore_current_context_for_user_callback_resume(
     client_teb: u64,
     supplied_eprocess: u64,
     supplied_ethread: u64,
-    process_role: u64,
 ) -> bool {
     restore_current_context_for_user_callback_resume_inner(
         pi,
@@ -11371,7 +11403,6 @@ pub(crate) unsafe fn restore_current_context_for_user_callback_resume(
         client_teb,
         supplied_eprocess,
         supplied_ethread,
-        process_role,
         true,
         true,
     )
@@ -11384,7 +11415,6 @@ unsafe fn restore_current_context_for_user_callback_resume_inner(
     client_teb: u64,
     supplied_eprocess: u64,
     supplied_ethread: u64,
-    process_role: u64,
     publish_context: bool,
     trace_resume: bool,
 ) -> bool {
@@ -11507,13 +11537,6 @@ unsafe fn restore_current_context_for_user_callback_resume_inner(
     sync_threadinfo_process(w32thread);
     if publish_context {
         publish_selected_context(process_index, thread_index);
-    }
-
-    let ppi = current_w32process();
-    if let Some((hdesk, desk_body, pdeskinfo)) =
-        selected_thread_desktop(process_role, ppi, w32thread)
-    {
-        publish_thread_desktop_binding(w32thread, hdesk, desk_body, pdeskinfo);
     }
 
     if trace_resume {
@@ -11735,7 +11758,7 @@ unsafe fn select_win32k_client_context(
     Some((process_index, thread_index))
 }
 
-unsafe fn ensure_win32k_process_attached(process_index: usize, process_role: u64) -> bool {
+unsafe fn ensure_win32k_process_attached(process_index: usize) -> bool {
     if !process_ctx_index_valid(process_index) {
         return false;
     }
@@ -11800,28 +11823,6 @@ unsafe fn ensure_win32k_process_attached(process_index: usize, process_role: u64
         process_ctx_w32process(process_index),
     );
     link_processinfo_to_eprocess(process_index);
-    if process_role == HOSTED_PROCESS_ROLE_WIN32_SUBSYSTEM
-        || hosted_process_role_is_noninteractive_service_class(process_role)
-    {
-        let n = WIN32K_NONINTERACTIVE_WINSTA_RESOLVES.fetch_add(1, Ordering::Relaxed);
-        if n < 16 {
-            let pi = process_ctx_pi(process_index);
-            let pid = process_ctx_pid(process_index);
-            let ppi = process_ctx_w32process(process_index);
-            print_str(
-                b"[win32k-host] noninteractive service desktop left to InitThreadCallback pid=",
-            );
-            print_u64(pid);
-            print_str(b" pi=");
-            print_u64(pi);
-            print_str(b" ppi=0x");
-            print_hex((ppi >> 32) as u32);
-            print_hex(ppi as u32);
-            print_str(b"\n");
-        }
-    } else {
-        seed_inherited_process_window_station(process_index);
-    }
     true
 }
 
@@ -11838,94 +11839,6 @@ unsafe fn link_processinfo_to_eprocess(process_index: usize) {
     if read_volatile((ppi + W32PROCESS_PEPROCESS_OFF) as *const u64) == 0 {
         write_volatile((ppi + W32PROCESS_PEPROCESS_OFF) as *mut u64, process);
     }
-}
-
-unsafe fn seed_inherited_process_window_station(process_index: usize) {
-    let ppi = process_ctx_w32process(process_index);
-    if ppi == 0 {
-        return;
-    }
-    let table = &*core::ptr::addr_of!(OBJ_TABLE);
-    let winsta_handle = table.cached_winsta_handle();
-    let winsta_body = table.cached_winsta_body();
-    if winsta_handle == 0 || winsta_body == 0 {
-        return;
-    }
-
-    link_processinfo_to_eprocess(process_index);
-    let eprocess = process_ctx_eprocess(process_index);
-    if eprocess != 0 && s_ps_get_process_winsta(eprocess) == 0 {
-        s_ps_set_process_winsta(eprocess, winsta_handle);
-    }
-
-    let mut seeded_winsta = false;
-    if read_volatile((ppi + PROCESSINFO_PRPWINSTA_OFF) as *const u64) == 0 {
-        write_volatile((ppi + PROCESSINFO_PRPWINSTA_OFF) as *mut u64, winsta_body);
-        write_volatile((ppi + PROCESSINFO_HWINSTA_OFF) as *mut u64, winsta_handle);
-        write_volatile(
-            (ppi + PROCESSINFO_AMWINSTA_OFF) as *mut u32,
-            WINSTA_ALL_ACCESS,
-        );
-        let flags = read_volatile((ppi + W32PROCESS_FLAGS_OFF) as *const u32);
-        write_volatile(
-            (ppi + W32PROCESS_FLAGS_OFF) as *mut u32,
-            flags | W32PF_READSCREENACCESSGRANTED,
-        );
-        seeded_winsta = true;
-    }
-    seed_default_startup_desktop_for_process(ppi, 0);
-
-    if seeded_winsta && WIN32K_INHERITED_WINSTA_SEEDS.fetch_add(1, Ordering::Relaxed) < 16 {
-        let pi = process_ctx_pi(process_index);
-        let pid = process_ctx_pid(process_index);
-        print_str(b"[win32k-host] inherited WinSta0 for pid=");
-        print_u64(pid);
-        print_str(b" pi=");
-        print_u64(pi as u64);
-        print_str(b" ppi=0x");
-        print_hex((ppi >> 32) as u32);
-        print_hex(ppi as u32);
-        print_str(b" hWinSta=0x");
-        print_hex(winsta_handle as u32);
-        print_str(b" body=0x");
-        print_hex((winsta_body >> 32) as u32);
-        print_hex(winsta_body as u32);
-        print_str(b"\n");
-    }
-}
-
-unsafe fn publish_default_desktop(hdesk: u64, desk_body: u64, source: &[u8]) {
-    if hdesk == 0 || desk_body == 0 {
-        return;
-    }
-    let old_hdesk = WIN32K_DEFAULT_DESKTOP_HANDLE.load(Ordering::Relaxed);
-    let old_body = WIN32K_DEFAULT_DESKTOP_BODY.load(Ordering::Relaxed);
-    WIN32K_DEFAULT_DESKTOP_HANDLE.store(hdesk, Ordering::Relaxed);
-    WIN32K_DEFAULT_DESKTOP_BODY.store(desk_body, Ordering::Relaxed);
-    if (old_hdesk != hdesk || old_body != desk_body)
-        && WIN32K_DEFAULT_DESKTOP_PUBLISHES.fetch_add(1, Ordering::Relaxed) < 16
-    {
-        print_str(b"[win32k-host] published default desktop from ");
-        print_str(source);
-        print_str(b" hDesk=0x");
-        print_hex(hdesk as u32);
-        print_str(b" body=0x");
-        print_hex((desk_body >> 32) as u32);
-        print_hex(desk_body as u32);
-        print_str(b"\n");
-    }
-}
-
-unsafe fn default_desktop() -> Option<(u64, u64)> {
-    let hdesk = WIN32K_DEFAULT_DESKTOP_HANDLE.load(Ordering::Relaxed);
-    let desk_body = WIN32K_DEFAULT_DESKTOP_BODY.load(Ordering::Relaxed);
-    if hdesk == 0 || desk_body == 0 {
-        return None;
-    }
-    if (*core::ptr::addr_of!(OBJ_TABLE)).lookup_body(hdesk) != desk_body {
-        return None;
-    }
-    Some((hdesk, desk_body))
 }
 
 unsafe fn ensure_desktop_runtime_fields(desk_body: u64) -> Option<u64> {
@@ -11950,84 +11863,6 @@ unsafe fn ensure_desktop_runtime_fields(desk_body: u64) -> Option<u64> {
         return None;
     }
     Some(pdeskinfo)
-}
-
-unsafe fn process_startup_desktop(ppi: u64) -> Option<(u64, u64, u64)> {
-    if ppi == 0 {
-        return None;
-    }
-    let hdesk = read_volatile((ppi + PROCESSINFO_HDESK_STARTUP_OFF) as *const u64);
-    let desk_body = read_volatile((ppi + PROCESSINFO_RPDESK_STARTUP_OFF) as *const u64);
-    if hdesk == 0 || desk_body == 0 {
-        return None;
-    }
-    if (*core::ptr::addr_of!(OBJ_TABLE)).lookup_body(hdesk) != desk_body {
-        return None;
-    }
-    ensure_desktop_runtime_fields(desk_body).map(|pdeskinfo| (hdesk, desk_body, pdeskinfo))
-}
-
-unsafe fn selected_thread_desktop(
-    process_role: u64,
-    ppi: u64,
-    pti: u64,
-) -> Option<(u64, u64, u64)> {
-    if pti == 0 {
-        return None;
-    }
-
-    let current_body = read_volatile((pti + THREADINFO_RPDESK_OFF) as *const u64);
-    let current_info = read_volatile((pti + THREADINFO_PDESKINFO_OFF) as *const u64);
-    if current_body != 0 && current_info != 0 {
-        let current_hdesk = read_volatile((pti + THREADINFO_HDESK_OFF) as *const u64);
-        return Some((current_hdesk, current_body, current_info));
-    }
-
-    // ReactOS marks CSRSS GUI threads TIF_CSRSSTHREAD and explicitly excludes them from automatic
-    // window-station/desktop assignment. DesktopThreadMain is the distinct permanent owner.
-    let flags = read_volatile((pti + THREADINFO_FLAGS_OFF) as *const u32);
-    if flags & (TIF_SYSTEMTHREAD | TIF_CSRSSTHREAD) != 0 {
-        return None;
-    }
-
-    let shell_client = process_role == HOSTED_PROCESS_ROLE_INTERACTIVE_SHELL_BOOTSTRAP
-        || process_role == HOSTED_PROCESS_ROLE_INTERACTIVE_SHELL;
-    if shell_client {
-        if let Some(startup) = process_startup_desktop(ppi) {
-            return Some(startup);
-        }
-    }
-
-    if !hosted_process_role_is_noninteractive_service_class(process_role)
-        && BOUND_DESK_BODY != 0
-        && BOUND_DESK_PDESKINFO != 0
-    {
-        return Some((0, BOUND_DESK_BODY, BOUND_DESK_PDESKINFO));
-    }
-
-    process_startup_desktop(ppi)
-}
-
-unsafe fn publish_thread_desktop_binding(pti: u64, hdesk: u64, desk_body: u64, pdeskinfo: u64) {
-    if pti == 0 || desk_body == 0 || pdeskinfo == 0 {
-        return;
-    }
-    let Some(pdeskinfo) = ensure_desktop_runtime_fields(desk_body) else {
-        return;
-    };
-    write_volatile((pti + THREADINFO_RPDESK_OFF) as *mut u64, desk_body);
-    write_volatile((pti + THREADINFO_PDESKINFO_OFF) as *mut u64, pdeskinfo);
-    if hdesk != 0 {
-        write_volatile((pti + THREADINFO_HDESK_OFF) as *mut u64, hdesk);
-    }
-    let _ = write_thread_client_desktop_info(pti, desk_body, pdeskinfo);
-}
-
-unsafe fn seed_default_startup_desktop_for_process(ppi: u64, pti: u64) -> bool {
-    let Some((hdesk, desk_body)) = default_desktop() else {
-        return false;
-    };
-    seed_process_startup_desktop_for_process(ppi, hdesk, desk_body, pti)
 }
 
 unsafe fn ensure_win32k_threadinfo(thread_index: usize, client_teb: u64) -> bool {
@@ -16597,7 +16432,6 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     let generation = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_GENERATION) as *const u64);
     let supplied_eprocess = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_EPROCESS) as *const u64);
     let supplied_ethread = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_ETHREAD) as *const u64);
-    let process_role = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_PROCESS_ROLE) as *const u64);
     let token_authentication_id =
         read_volatile((WIN32K_SHARED_VADDR + SH_REQ_TOKEN_AUTH) as *const u64);
     let token_user_sid_len =
@@ -16612,8 +16446,6 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
             sid_i += 1;
         }
     }
-    let top_level =
-        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_NESTED_CALLBACK) as *const u64) == 0;
     let Some((process_index, thread_index)) = select_win32k_client_context(
         client_pi,
         process_id,
@@ -16634,7 +16466,7 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         nt_kernel_abi::ps_reactos_x64::ThreadPreviousMode::KernelMode
     };
     let _previous_mode = thread_execution::PreviousModeScope::enter(mode);
-    let process_attached = ensure_win32k_process_attached(process_index, process_role);
+    let process_attached = ensure_win32k_process_attached(process_index);
     let threadinfo_ready = process_attached && ensure_win32k_threadinfo(thread_index, client_teb);
     if !process_attached || !threadinfo_ready {
         return (0xC000_009Au32 as i32, 0xC000_009Au32 as u64);
@@ -16699,15 +16531,6 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     // a `pEThread` win32k set itself is left alone.
     if read_volatile(t as *const u64) == 0 {
         write_volatile(t as *mut u64, ethread);
-    }
-    // Reassert the selected client's own desktop binding before normal dispatch. Logon threads keep
-    // the secure desktop they established through NtUserSetThreadDesktop; shell clients inherit the
-    // process startup desktop that winlogon supplied through WinSta0\Default.
-    if top_level && ssn != SSN_NT_USER_SET_THREAD_DESKTOP {
-        let ppi = current_w32process();
-        if let Some((hdesk, desk_body, pdeskinfo)) = selected_thread_desktop(process_role, ppi, t) {
-            publish_thread_desktop_binding(t, hdesk, desk_body, pdeskinfo);
-        }
     }
     let paint_window_valid = paint_stage_valid && resolve_window_handle(a0) != 0;
     let result = if ssn == SSN_GDI_BATCH_FLUSH_CALLOUT {
@@ -17683,10 +17506,6 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             WIN32K_EXPLORER_SETWNDPROC_CLIENT_CALLS.fetch_add(1, Ordering::Relaxed);
         }
     }
-    if ssn == SSN_NT_USER_SET_THREAD_DESKTOP {
-        prepare_set_thread_desktop(a0);
-    }
-
     if nargs > 16 {
         return STATUS_INVALID_SYSTEM_SERVICE;
     }
@@ -17704,58 +17523,6 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     let ret = call(handler, args.as_ptr(), nargs);
     observe_gdi_handle_return(ssn, ret);
 
-    // Publish only the interactive Default desktop after Ob creation has already installed its real
-    // parent window station and desktop heap. Service desktops remain scoped to their own window
-    // station and must not inherit WinSta0 here.
-    if ssn == SSN_NT_USER_CREATE_DESKTOP && ret != 0 {
-        let hdesk = (ret as u32) as u64;
-        let desk_body = (*core::ptr::addr_of!(OBJ_TABLE)).lookup_body(hdesk);
-        if desk_body != 0 && object_attributes_name_leaf_eq_ascii(a0, b"default") {
-            let rpwinsta = read_volatile((desk_body + DESKTOP_RPWINSTA_PARENT_OFF) as *const u64);
-            let input_winsta =
-                read_volatile((WIN32K_CODE_VA + INPUT_WINDOW_STATION_RVA) as *const u64);
-            if rpwinsta != 0 && rpwinsta == input_winsta {
-                publish_default_desktop(hdesk, desk_body, b"NtUserCreateDesktop(Default)");
-            }
-        }
-    }
-    // ★ BATCH 43 — LATCH the thread↔desktop connection winlogon's OWN NtUserSetThreadDesktop makes.
-    //
-    // `NtUserSetThreadDesktop` (SSN 0x1092 → IntSetThreadDesktop) is where winlogon connects its
-    // interactive thread to the Default desktop: on its `if (pdesk != NULL)` branch it sets
-    // `pti->rpdesk = pdesk; pti->pDeskInfo = pti->rpdesk->pDeskInfo;` (desktop.c:3428/3430). We DO NOT
-    // pre-seed those fields (doing so flips its own `if (pti->rpdesk != NULL)` class-migration branch,
-    // desktop.c:3404, into an unmapped-desktop-heap fault) — we let win32k's real handler do the bind,
-    // then READ BACK the fields it set and LATCH them (BOUND_DESK_*). The dispatch_loop then re-asserts
-    // them before every subsequent dispatch, so a LATER `NtUserProcessConnect` (0x10FA) whose inner
-    // IntSetThreadDesktop ELSE branch (desktop.c:3451-3453) NULLs `pti->pDeskInfo` can't leave the
-    // thread disconnected before the next `NtUserGetClassInfo` (0x10bd) reads `[pti+0x80]` — the wall.
-    if ssn == SSN_NT_USER_SET_THREAD_DESKTOP && ret != 0 {
-        let pti = current_w32thread();
-        let rpdesk = read_volatile((pti + THREADINFO_RPDESK_OFF) as *const u64);
-        let pdeskinfo = read_volatile((pti + THREADINFO_PDESKINFO_OFF) as *const u64);
-        if rpdesk != 0 && pdeskinfo != 0 {
-            // Keep the real per-desktop heap handle that IntCreateDesktop installed. The class
-            // call-proc path `UserGetCPD -> CreateCallProc -> DesktopHeapAlloc` allocates through
-            // `RtlAllocateHeap(pdesk->pheapDesktop, ...)`; a missing or foreign handle means desktop
-            // initialization did not complete and must not be patched over here.
-            let pheap = read_volatile((rpdesk + DESKTOP_PHEAP_OFF) as *const u64);
-            if pheap == 0 || hosted_heap_bounds(pheap).is_none() {
-                return ret;
-            }
-            BOUND_DESK_BODY = rpdesk;
-            BOUND_DESK_PDESKINFO = pdeskinfo;
-            print_str(b"[win32k-host] NtUserSetThreadDesktop latched: pti->rpdesk=0x");
-            print_hex((rpdesk >> 32) as u32);
-            print_hex(rpdesk as u32);
-            print_str(b" pti->pDeskInfo=0x");
-            print_hex((pdeskinfo >> 32) as u32);
-            print_hex(pdeskinfo as u32);
-            print_str(b" pheapDesktop=0x");
-            print_hex(pheap as u32);
-            print_str(b"\n");
-        }
-    }
     ret
 }
 
@@ -17909,127 +17676,6 @@ unsafe fn sync_threadinfo_process(w32thread: u64) {
     }
 }
 
-unsafe fn prepare_set_thread_desktop(hdesk: u64) {
-    seed_process_startup_desktop(hdesk);
-    if hdesk == 0 {
-        return;
-    }
-    let pti = current_w32thread();
-    if pti == 0 {
-        return;
-    }
-
-    let old_rpdesk = read_volatile((pti + THREADINFO_RPDESK_OFF) as *const u64);
-    let old_pdeskinfo = read_volatile((pti + THREADINFO_PDESKINFO_OFF) as *const u64);
-    let old_hdesk = read_volatile((pti + THREADINFO_HDESK_OFF) as *const u64);
-    let requested_rpdesk = (*core::ptr::addr_of!(OBJ_TABLE)).lookup_body(hdesk);
-    if requested_rpdesk != 0 && requested_rpdesk == old_rpdesk {
-        return;
-    }
-    if old_rpdesk == 0 && old_pdeskinfo == 0 && old_hdesk == 0 {
-        ensure_list_head_initialized(pti + THREADINFO_PTI_LINK_OFF);
-        return;
-    }
-
-    if !unlink_thread_from_desktop(pti as *mut u8) {
-        let n = WIN32K_SET_THREAD_DESKTOP_PREPARES.fetch_add(1, Ordering::Relaxed);
-        if n < 16 {
-            let flink = read_volatile((pti + THREADINFO_PTI_LINK_OFF) as *const u64);
-            let blink = read_volatile((pti + THREADINFO_PTI_LINK_OFF + 8) as *const u64);
-            print_str(b"[win32k-host] ERROR: cannot clear corrupt desktop membership pti=0x");
-            print_hex((pti >> 32) as u32);
-            print_hex(pti as u32);
-            print_str(b" flink=0x");
-            print_hex((flink >> 32) as u32);
-            print_hex(flink as u32);
-            print_str(b" blink=0x");
-            print_hex((blink >> 32) as u32);
-            print_hex(blink as u32);
-            print_str(b"\n");
-        }
-        return;
-    }
-
-    write_volatile((pti + THREADINFO_RPDESK_OFF) as *mut u64, 0);
-    write_volatile((pti + THREADINFO_PDESKINFO_OFF) as *mut u64, 0);
-    write_volatile((pti + THREADINFO_HDESK_OFF) as *mut u64, 0);
-
-    let n = WIN32K_SET_THREAD_DESKTOP_PREPARES.fetch_add(1, Ordering::Relaxed);
-    if n < 16 {
-        print_str(b"[win32k-host] pre-SetThreadDesktop cleared old binding pti=0x");
-        print_hex((pti >> 32) as u32);
-        print_hex(pti as u32);
-        print_str(b" old-rpdesk=0x");
-        print_hex((old_rpdesk >> 32) as u32);
-        print_hex(old_rpdesk as u32);
-        print_str(b" old-pdeskinfo=0x");
-        print_hex((old_pdeskinfo >> 32) as u32);
-        print_hex(old_pdeskinfo as u32);
-        print_str(b" old-hdesk=0x");
-        print_hex(old_hdesk as u32);
-        print_str(b"\n");
-    }
-}
-
-unsafe fn seed_process_startup_desktop(hdesk: u64) {
-    if hdesk == 0 {
-        return;
-    }
-    let ppi = current_w32process();
-    if ppi == 0 {
-        return;
-    }
-    let desk_body = (*core::ptr::addr_of!(OBJ_TABLE)).lookup_body(hdesk);
-    if desk_body == 0 {
-        return;
-    }
-    let _ = seed_process_startup_desktop_for_process(ppi, hdesk, desk_body, current_w32thread());
-}
-
-unsafe fn seed_process_startup_desktop_for_process(
-    ppi: u64,
-    hdesk: u64,
-    desk_body: u64,
-    pti: u64,
-) -> bool {
-    if ppi == 0 || hdesk == 0 || desk_body == 0 {
-        return false;
-    }
-    if read_volatile((ppi + PROCESSINFO_RPDESK_STARTUP_OFF) as *const u64) != 0
-        || read_volatile((ppi + PROCESSINFO_HDESK_STARTUP_OFF) as *const u64) != 0
-    {
-        return false;
-    }
-    if read_volatile((desk_body + DESKTOP_RPWINSTA_PARENT_OFF) as *const u64) == 0 {
-        return false;
-    }
-    let pheap = read_volatile((desk_body + DESKTOP_PHEAP_OFF) as *const u64);
-    if pheap == 0 || hosted_heap_bounds(pheap).is_none() {
-        return false;
-    }
-    write_volatile((ppi + PROCESSINFO_HDESK_STARTUP_OFF) as *mut u64, hdesk);
-    write_volatile(
-        (ppi + PROCESSINFO_RPDESK_STARTUP_OFF) as *mut u64,
-        desk_body,
-    );
-    if pti != 0 && read_volatile((ppi + PROCESSINFO_PTIMAINTHREAD_OFF) as *const u64) == 0 {
-        write_volatile((ppi + PROCESSINFO_PTIMAINTHREAD_OFF) as *mut u64, pti);
-    }
-    let n = WIN32K_STARTUP_DESKTOP_SEEDS.fetch_add(1, Ordering::Relaxed);
-    if n < 16 {
-        print_str(b"[win32k-host] startup desktop seeded hDesk=0x");
-        print_hex(hdesk as u32);
-        print_str(b" ppi=0x");
-        print_hex((ppi >> 32) as u32);
-        print_hex(ppi as u32);
-        print_str(b" rpdeskStartup=0x");
-        print_hex((desk_body >> 32) as u32);
-        print_hex(desk_body as u32);
-        print_str(b"\n");
-    }
-    true
-}
-
 /// Load the staged system font (arial.ttf at [`FONTBUF_VADDR`]) into win32k via
 /// `IntGdiAddFontMemResource`, so the desktop-graphics font realize (TextIntRealizeFont) finds a
 /// real font instead of null-derefing at RVA 0x4d7eb ("no fonts loaded at all"). Runs once, after
@@ -18116,15 +17762,6 @@ pub(crate) fn explorer_setwndproc_proofs() -> (u64, u64) {
 
 /// The post-NtUserInitialize graphics prerequisite initialization runs once.
 static mut DESKTOP_GFX_SEEDED: bool = false;
-
-/// The DESKTOP body + its DESKTOPINFO (`rpdesk->pDeskInfo`) the dispatch thread is bound to, latched
-/// by completed desktop dispatches. Re-asserted onto the shared
-/// dispatch W32THREAD at the top of every dispatch so an intervening win32k `IntSetThreadDesktop`
-/// ELSE branch (which clears `pti->pDeskInfo` when it can't map the desktop-heap view — the exact
-/// pre-BATCH-43 wall) can't leave the thread disconnected before the NEXT syscall body reads
-/// `pti->pDeskInfo`. Zero until the seed runs.
-static mut BOUND_DESK_BODY: u64 = 0;
-static mut BOUND_DESK_PDESKINFO: u64 = 0;
 
 /// Record a routing proof from win32k's registered service table without creating any GUI object.
 unsafe fn record_registered_ntuser_handler() {
