@@ -154,8 +154,10 @@ Genuine Explorer and native acceptance are tracked in
 [Earlier logon-rendering evidence](docs/evidence/issue18-bounded-source-logon.json)
 includes the credential dialog. After removing synthetic USER bindings, the latest
 [media-policy boot](docs/evidence/issue18-livecd-setup-file-admission-failure.json)
-launched genuine setup but failed a dependency File open, leaving background and
-cursor only. These runs do not establish current Explorer desktop boot.
+launched genuine setup but failed a dependency File open. The fresh
+[File-capacity boot](docs/evidence/issue18-livecd-theme-helper-startup-failure.json)
+progressed into syssetup, then its theme helper faulted at startup. The screenshot
+still contains only background and cursor, not a current Explorer desktop.
 Crate CI does not prove desktop boot. To attempt a boot from a fresh clone:
 
 ```sh

@@ -1,0 +1,32 @@
+{
+  "native_commit": "3a133cd4f7a89d421813500ee838706f2547c156",
+  "microkernel_commit": "92c4e2b330019c7c8afb1544b3cbf8ca1219eb73",
+  "profile": "font-cleanup",
+  "command": "env -u NTOS_MUP_PROVIDER_KERNEL_ONLY -u NTDLL_FEATURES NTOS_IMAGE_PROFILE=font-cleanup IMAGE_MIB=256 PERSIST_IMAGE_MIB=16 BOOT_TIMEOUT_SECONDS=3600 RUN_LOG=$PWD/.tmp/issue18-readonly-growth-font-boot.log ./run.sh --desktop -qmp unix:$PWD/.tmp/issue18-readonly-growth-font-qmp.sock,server=on,wait=off",
+  "boot_limit_seconds": 3600,
+  "termination": "Guest reached its microtest sentinel naturally within the boot limit. The desktop launcher refused the incomplete Explorer proof.",
+  "launcher_exit": 1,
+  "collector_exit": 0,
+  "collector_frames": 241,
+  "font_parser_exit": 1,
+  "font_parser_failure": "Missing font-acceptance PID-QUERY; the Explorer Run-key client did not execute.",
+  "guest_summary": { "passed": 222, "total": 300 },
+  "explorer_desktop_proven": false,
+  "screenshot": "../images/livecd-theme-helper-startup-failure.png",
+  "screenshot_sha256": "53ad5f5ac610f375103c4b38bc9dcda1b85defd34e60860272a02fff0da0c9cb",
+  "root_viewed_screenshot": true,
+  "raw_log_sha256": "43b09bcb59f2ffce2566d5857c6409bcb43bd4d3c55889410885782a90ab8e2a",
+  "archived_log": "issue18-livecd-theme-helper-startup-failure.log.gz",
+  "rootserver_sha256": "ebf6a5512f5b8fdaee3b26b8c084e155ba8531947a5ef4680124278e45791b1f",
+  "disk_sha256_after_termination": "b7e0c0c6a98b15eaad55128c3a3ebadce81b4825eb6c13647d61e9594adfc10c",
+  "observations": [
+    "The same-run final screenshot contains background and cursor, without Explorer chrome or icons.",
+    "Genuine setup.exe pi17/pid1096 resumed from Winlogon pid376 and executed syssetup's Classic-theme application.",
+    "The previous loader File-open INSUFFICIENT_RESOURCES failure did not recur; no readonly-file-admission-failure record was emitted.",
+    "Setup launched rundll32.exe pi15/pid1312, parent1096, with main tid1320 and entry0x00000100302d51e0, then parked in a two-object WaitAny.",
+    "The child loader resolved1594 imports with zero missing. NtContinue restored that entry, then an instruction fault returned STATUS_ACCESS_VIOLATION and parked the child before Userinit launch.",
+    "The failing native image access/residency branch was not recorded, so cross-process startup-address provenance is an audit target rather than a proven relocation diagnosis.",
+    "The font setup fixture registered its ordinary Run value and committed zero-exit/retirement. The private-font client did not execute; terminal font unmap remains unproven.",
+    "No actual Userinit or Explorer launch was observed. i8042prt still lacked real StartIo admission, and keyboard/mouse reads failed."
+  ]
+}
