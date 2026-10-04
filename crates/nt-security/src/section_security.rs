@@ -1,9 +1,8 @@
 //! Section descriptor assignment and existing-object access; no namespace or handle effects.
 
 use crate::{
-    AccessCheckResult, CapturedSubjectTokens, GenericMapping, ObjectSecurityAssignment,
-    ProcessorMode, SecurityAssignmentAudit, SecurityAssignmentClient,
-    SecurityAssignmentInheritance,
+    AccessCheckResult, CapturedSubjectTokens, GenericMapping, ProcessorMode,
+    SecurityAssignmentAudit,
 };
 use alloc::vec::Vec;
 
@@ -25,24 +24,13 @@ pub fn assign_section_security(
     mode: ProcessorMode,
     audit: &mut SecurityAssignmentAudit,
 ) -> Result<Vec<u8>, u32> {
-    crate::assign_object_security_with_audit(
-        &ObjectSecurityAssignment {
-            primary: subject.primary,
-            client: subject
-                .client
-                .as_ref()
-                .map(|client| SecurityAssignmentClient {
-                    token: client.token,
-                    level: client.level,
-                }),
-            creator,
-            parent,
-            mapping: &SECTION_GENERIC_MAPPING,
-            is_container: false,
-            mode,
-            object_type: None,
-            inheritance: SecurityAssignmentInheritance::Legacy,
-        },
+    crate::object_security::assign(
+        subject,
+        creator,
+        parent,
+        mode,
+        &SECTION_GENERIC_MAPPING,
+        false,
         audit,
     )
 }
@@ -55,15 +43,11 @@ pub fn authorize_section_open(
     desired_access: u32,
     mode: ProcessorMode,
 ) -> Result<AccessCheckResult, u32> {
-    let descriptor = if mode == ProcessorMode::KernelMode {
-        None
-    } else {
-        Some(crate::security_descriptor_bytes_for_access(descriptor)?)
-    };
-    Ok(subject.check_access(
-        descriptor.as_ref(),
+    crate::object_security::authorize(
+        subject,
+        descriptor,
         desired_access,
-        &SECTION_GENERIC_MAPPING,
         mode,
-    ))
+        &SECTION_GENERIC_MAPPING,
+    )
 }
