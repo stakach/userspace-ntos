@@ -24,6 +24,10 @@
 
 extern crate alloc;
 
+#[cfg(target_arch = "x86_64")]
+#[path = "dll_relocation.rs"]
+mod dll_relocation;
+
 use core::{
     ffi::c_void,
     marker::PhantomData,
@@ -2464,11 +2468,18 @@ unsafe fn load_dependent_dll(open_name_lc: &[u8]) -> u64 {
         return 0;
     }
 
+    let load = match unsafe { dll_relocation::DllLoad::reserve(open_name_lc) } {
+        Ok(load) => load,
+        Err(_) => {
+            unsafe { syscall4(SSN_NT_CLOSE, section, 0, 0, 0) };
+            return 0;
+        }
+    };
+
     // NtMapViewOfSection(Section, NtCurrentProcess(), &BaseAddress, ZeroBits=0, CommitSize=0,
     //                    &SectionOffset=NULL, &ViewSize, InheritDisposition=1, AllocationType=0,
-    //                    Protect=PAGE_EXECUTE_READ). The executive writes the DLL's fixed registry
-    // base into *BaseAddress and its extent into *ViewSize. *BaseAddress MUST be a stack local (the
-    // executive writes it through its stack mirror).
+    //                    Protect=PAGE_EXECUTE_READ). The canonical image mapper supplies the base
+    // and extent; the in-process loader, not the kernel, applies any required relocation.
     let mut base_address: u64 = 0;
     let mut view_size: u64 = 0;
     // SAFETY: on-target syscall; stack-local out-params.
@@ -2492,6 +2503,10 @@ unsafe fn load_dependent_dll(open_name_lc: &[u8]) -> u64 {
             nt_ntdll::loader::file_map_failure::FileMapFailureStage::MapView,
             st as u32,
         );
+        let _ = unsafe { load.finish(base_address, view_size, st as u32) };
+        return 0;
+    }
+    if unsafe { load.finish(base_address, view_size, st as u32) }.is_err() {
         return 0;
     }
     base_address

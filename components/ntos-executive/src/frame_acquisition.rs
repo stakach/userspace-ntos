@@ -94,3 +94,10 @@ pub(super) fn owns_root_cap(cap: u64) -> bool {
     };
     unsafe { (&*core::ptr::addr_of!(OWNER)).owns_root_cap(cap) }
 }
+
+pub(super) fn backing_release_available() -> bool {
+    let Ok(_borrow) = Borrow::acquire() else {
+        return false;
+    };
+    unsafe { (&*core::ptr::addr_of!(OWNER)).pending().is_none() }
+}

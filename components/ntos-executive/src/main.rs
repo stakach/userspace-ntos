@@ -1884,14 +1884,6 @@ const _: () = assert!(
 );
 
 #[derive(Clone, Copy)]
-pub(crate) struct DllArenaPagingStats {
-    pub records: usize,
-    pub capacity: usize,
-    pub growths: u64,
-    pub allocation_failures: u64,
-}
-
-#[derive(Clone, Copy)]
 pub(crate) struct DllPeStoreStats {
     pub records: usize,
     pub capacity: usize,
@@ -1961,102 +1953,6 @@ impl DllPeStore {
         DllPeStoreStats {
             records: self.entries.len(),
             capacity: self.entries.capacity(),
-            growths: self.growths,
-            allocation_failures: self.allocation_failures,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct DllArenaPagingRecord {
-    pi: usize,
-    pd_cap: u64,
-}
-
-impl DllArenaPagingRecord {
-    const fn new(pi: usize) -> Self {
-        Self { pi, pd_cap: 0 }
-    }
-}
-
-pub(crate) struct DllArenaPagingState {
-    records: Vec<DllArenaPagingRecord>,
-    growths: u64,
-    allocation_failures: u64,
-}
-
-impl DllArenaPagingState {
-    pub(crate) const fn new() -> Self {
-        Self {
-            records: Vec::new(),
-            growths: 0,
-            allocation_failures: 0,
-        }
-    }
-
-    pub(crate) fn reset(&mut self) {
-        self.records.clear();
-        self.growths = 0;
-        self.allocation_failures = 0;
-    }
-
-    fn index_for(&self, pi: usize) -> Option<usize> {
-        self.records.iter().position(|record| record.pi == pi)
-    }
-
-    fn ensure_index(&mut self, pi: usize) -> Result<usize, u32> {
-        if let Some(index) = self.index_for(pi) {
-            return Ok(index);
-        }
-        let old_capacity = self.records.capacity();
-        if self.records.try_reserve(1).is_err() {
-            self.allocation_failures = self.allocation_failures.saturating_add(1);
-            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-        }
-        if self.records.capacity() != old_capacity {
-            self.growths = self.growths.saturating_add(1);
-        }
-        self.records.push(DllArenaPagingRecord::new(pi));
-        Ok(self.records.len() - 1)
-    }
-
-    pub(crate) fn reserve_process(&mut self, pi: usize) -> Result<(), u32> {
-        self.ensure_index(pi).map(|_| ())
-    }
-
-    pub(crate) fn pd_cap(&self, pi: usize) -> u64 {
-        self.index_for(pi)
-            .map(|index| self.records[index].pd_cap)
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn set_pd_cap(&mut self, pi: usize, cap: u64) -> Result<(), u32> {
-        if cap == 0 {
-            return Err(nt_address_space::STATUS_INVALID_PARAMETER);
-        }
-        let index = self.ensure_index(pi)?;
-        if self.records[index].pd_cap != 0 {
-            return Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES);
-        }
-        self.records[index].pd_cap = cap;
-        Ok(())
-    }
-
-    pub(crate) fn clear_process_exact(&mut self, pi: usize, pd_cap: u64) -> bool {
-        let Some(index) = self.index_for(pi) else {
-            return false;
-        };
-        if self.records[index].pd_cap != pd_cap {
-            return false;
-        }
-        self.records.swap_remove(index);
-        true
-    }
-
-    pub(crate) fn stats(&self) -> DllArenaPagingStats {
-        DllArenaPagingStats {
-            records: self.records.len(),
-            capacity: self.records.capacity(),
             growths: self.growths,
             allocation_failures: self.allocation_failures,
         }
@@ -9887,15 +9783,18 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     } else {
         print_str(b" object-security=busy");
     }
-    let dll_paging = service_sec_image::service_dll_arena_paging_stats();
-    print_str(b" dll-paging=");
-    print_u64(dll_paging.records as u64);
-    print_str(b"/");
-    print_u64(dll_paging.capacity as u64);
-    print_str(b"/");
-    print_u64(dll_paging.growths);
-    print_str(b"/");
-    print_u64(dll_paging.allocation_failures);
+    if let Some((records, capacity, growths, failures)) = user_image_paging::stats() {
+        print_str(b" user-paging=");
+        print_u64(records as u64);
+        print_str(b"/");
+        print_u64(capacity as u64);
+        print_str(b"/");
+        print_u64(growths);
+        print_str(b"/");
+        print_u64(failures);
+    } else {
+        print_str(b" user-paging=busy");
+    }
     let dll_pe_store = service_sec_image::service_dll_pe_store_stats();
     print_str(b" dll-pe=");
     print_u64(dll_pe_store.records as u64);
@@ -12345,6 +12244,7 @@ pub(crate) unsafe fn ensure_process_user_page_table(
     if pi >= MAX_PI || pml4 == 0 {
         return Err(nt_process::STATUS_INVALID_HANDLE);
     }
+    user_image_paging::ensure_process_user_paging_parents(handler, pi, page, pml4)?;
     let base = page & !(nt_address_space::PAGE_TABLE_SPAN - 1);
     let insert = {
         let page_tables = &mut *core::ptr::addr_of_mut!(PROCESS_USER_PAGE_TABLES);
@@ -12492,40 +12392,6 @@ unsafe fn vm_reprotect_private_frame(
 #[inline(never)]
 unsafe fn vm_copy_frame_4k(source_cap: u64, dest_frame: u64, scratch_base: u64) -> Result<(), u32> {
     temporary_frame_alias::copy_page(source_cap, dest_frame, scratch_base)
-}
-
-unsafe fn vm_restore_transition_mapping(
-    pi: usize,
-    lifetime: nt_memory_manager::MemoryLifetime,
-    page: u64,
-    protection: u32,
-    pml4: u64,
-    frame: u64,
-) -> Result<(), u32> {
-    hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
-    if page_map_r(frame, page, vm_page_rights(protection), pml4) != 0 {
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    let mut alias = 0;
-    let mut alias_cap = 0;
-    if page >= SMSS_ALLOC_VA && page < SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
-        alias = heap_mirror_for_pi(pi) + (page - SMSS_ALLOC_VA);
-        let (copied, copy_error) = copy_cap_r(frame);
-        if copy_error != 0 || page_map_r(copied, alias, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
-            if copied != 0 {
-                let _ = cnode_delete_recycle_r(copied);
-            }
-            let _ = page_unmap_r(frame);
-            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-        }
-        alias_cap = copied;
-    }
-    if !csrss_frame_put_at_cap(pi as u64, lifetime, page, frame, alias, alias_cap) {
-        let _ = page_unmap_r(frame);
-        recycle_mapped_cap(alias_cap);
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    Ok(())
 }
 
 unsafe fn recycle_unmapped_frame_record_caps(
@@ -14469,6 +14335,9 @@ mod thread_mechanism_retirement;
 mod ps_object_backing;
 mod frame_acquisition;
 mod hosted_private_page_installation;
+mod native_image_residency;
+mod transition_page_restoration;
+mod user_image_paging;
 mod frame_recycle;
 mod client_frame_cleanup;
 mod retirement_memory_access;
@@ -22635,9 +22504,6 @@ struct ExecLoopCtx {
     /// for non-SEC_IMAGE mappings: NtCreateSection records backing, NtMapViewOfSection reserves a
     /// VAD, and the fault router materialises pages on demand.
     generic_sections: *mut GenericSectionTable,
-    /// Per-hosted-process DLL arena paging state. Each hosted VSpace needs its own PD covering the
-    /// compact DLL range plus PT windows for every mapped DLL.
-    dll_arena_paging: *mut DllArenaPagingState,
 }
 
 impl ExecLoopCtx {
@@ -23080,6 +22946,7 @@ struct ExecNtHandler {
     image_sections: native_image_sections::NativeImageStore,
     /// Canonical image execution references independent of their creator's Section handles.
     process_image_owners: Vec<exec_handler::image_process_create::ProcessImageOwner>,
+    native_image_views: Vec<exec_handler::native_image_view::NativeImageViewOwner>,
     /// Dispatcher state for every `obj_ns` event, keyed by the stable namespace index. The store
     /// owns manual/auto-reset and signal state; `obj_ns` owns names and identity.
     events: nt_kernel_exec::EventStore,

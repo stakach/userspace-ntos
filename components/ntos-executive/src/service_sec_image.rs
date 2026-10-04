@@ -156,7 +156,6 @@ static NTUSER_CALL_ONE_PARAM_TRACE: AtomicU64 = AtomicU64::new(0);
 static mut SERVICE_SSN_RING_WORK: [u16; 32] = [0; 32];
 static mut SERVICE_SSN_RING_BADGE_WORK: [u8; 32] = [0; 32];
 static mut SERVICE_WL_RING_WORK: [u16; 48] = [0; 48];
-static mut SERVICE_DLL_ARENA_PAGING_WORK: DllArenaPagingState = DllArenaPagingState::new();
 static mut SERVICE_PROCS_WORK: alloc::vec::Vec<ProcExec> = alloc::vec::Vec::new();
 static SERVICE_PROCS_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static mut SERVICE_EXE_IMAGES_WORK: nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP> =
@@ -2790,17 +2789,6 @@ unsafe fn reset_service_generic_sections_work() -> *mut GenericSectionTable {
 
 pub(crate) fn service_generic_section_stats() -> GenericSectionTableStats {
     unsafe { (&*core::ptr::addr_of!(SERVICE_GENERIC_SECTIONS_WORK)).stats() }
-}
-
-#[inline(never)]
-unsafe fn reset_service_dll_arena_paging_work() -> &'static mut DllArenaPagingState {
-    let state = &mut *core::ptr::addr_of_mut!(SERVICE_DLL_ARENA_PAGING_WORK);
-    state.reset();
-    state
-}
-
-pub(crate) fn service_dll_arena_paging_stats() -> DllArenaPagingStats {
-    unsafe { (&*core::ptr::addr_of!(SERVICE_DLL_ARENA_PAGING_WORK)).stats() }
 }
 
 pub(crate) fn service_hosted_loaded_images_stats() -> (usize, usize, usize, usize, u64) {
@@ -8137,8 +8125,7 @@ pub(crate) unsafe fn service_sec_image(
     }
     // csrss's loadable DLLs (csrsrv + the ServerDlls basesrv/winsrv) are tracked by the generic
     // nt-dll-registry, built below once their PEs are parsed. Each hosted VSpace gets its own
-    // growable DLL arena paging record as images map into the compact 0x8000_0000 range.
-    let dll_arena_paging = reset_service_dll_arena_paging_work();
+    // exact dynamic parent paging owner as images map; placement is not paging authority.
     // The named NLS section \Nls\NlsSectionCP20127 (US-ASCII code-page table) csrss's Win32 client
     // stack maps during a DllMain. NtOpenSection records the handle; NtMapViewOfSection maps the
     // staged c_20127.nls frames into csrss.
@@ -8733,7 +8720,6 @@ pub(crate) unsafe fn service_sec_image(
         nt_end,
         dll_pe_store: dll_pe_store as *mut DllPeStore,
         generic_sections,
-        dll_arena_paging: dll_arena_paging as *mut DllArenaPagingState,
     };
     nt_handler.loop_ctx = Some(memory_context);
     // This endpoint admits hosted faults/native Calls, not asynchronous Send traffic. A rejected
@@ -10489,6 +10475,33 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(status);
                     print_str(b"\n");
                     park_and_log!(pi, b"guard-page", m0, addr);
+                }
+            }
+            match nt_handler.service_native_image_page_residency(
+                pi, page, vm_fault_access_from_x86_error(m3), true,
+            ) {
+                Ok(Some(())) => {
+                    note_boot_progress(BootProgress::PageMappingPublished);
+                    faults += 1;
+                    procs[pi].faults = faults;
+                    procs[pi].first = first;
+                    procs[pi].ntfaults = ntfaults;
+                    pfilled[pi] = *filled_pages;
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = component_reply_recv!(fault_ep, 0, 0, 0, 0, 0);
+                    badge = nb;
+                    mi = nmi;
+                    m0 = nm0;
+                    m1 = nm1;
+                    m2 = nm2;
+                    m3 = nm3;
+                    continue;
+                }
+                Ok(None) => {}
+                Err(status) => {
+                    print_str(b"[native-image] fault failed status=0x");
+                    print_hex(status);
+                    print_str(b"\n");
+                    park_and_log!(pi, b"native-image", m0, addr);
                 }
             }
             match service_generic_section_fault(

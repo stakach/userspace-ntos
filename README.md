@@ -2,15 +2,18 @@
 
 A from-scratch reimplementation of the **Windows NT kernel personality in user
 space**, running on the [rust-micro](https://github.com/stakach/rust-micro) seL4
-microkernel. Everything is Rust.
+microkernel. The personality and matching `ntdll.dll` are implemented in Rust;
+ReactOS supplies the hosted drivers, applications and shell.
 
 NT's executive is a set of cooperating subsystems (Object Manager, Memory
 Manager, Process/Thread manager, I/O manager, …) layered over a small kernel.
 This project rebuilds that personality as **isolated user-space components on a
 capability microkernel** — the microkernel provides threads, address spaces, IPC,
-and capabilities; the NT semantics live entirely in user space. The first
-component is the **NT Object Manager** (the `\ObjectDirectory` namespace, typed
-objects, handles, symbolic links).
+and capabilities; the NT semantics live entirely in user space. Focused,
+host-testable crates implement Object, Process/Thread, Memory and I/O contracts;
+native service adapters retain capabilities and continuations across callbacks,
+faults and cleanup. The matching `ntdll.dll` exposes those contracts to hosted
+user-mode code.
 
 ## Repository layout
 

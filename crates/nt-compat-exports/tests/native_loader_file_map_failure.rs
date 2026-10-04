@@ -114,7 +114,8 @@ fn map_view_failure_reports_actual_status_after_section_close_without_replay() {
         if !calls.0.iter().any(|name| name == "report_file_map_failure") { continue; }
         let mut body = Calls::default();
         body.visit_block(&branch.then_branch);
-        assert_eq!(body.0, ["report_file_map_failure"], "failure reporting adds no calls or reads");
+        assert_eq!(body.0, ["report_file_map_failure", "finish"],
+            "failure reporting is followed only by exact load-owner settlement, not NT replay");
         assert!(matches!(&*branch.cond, syn::Expr::Binary(binary)
             if matches!(binary.op, syn::BinOp::Lt(_))
             && matches!(&*binary.left, syn::Expr::Paren(paren)
@@ -129,7 +130,23 @@ fn map_view_failure_reports_actual_status_after_section_close_without_replay() {
             if matches!(&*cast.expr, syn::Expr::Path(path) if named(&path.path, "st"))
             && matches!(&*cast.ty, syn::Type::Path(path) if named(&path.path, "u32"))),
             "capture the unchanged 32-bit NTSTATUS from the syscall return register");
-        assert!(matches!(&branch.then_branch.stmts[1], syn::Stmt::Expr(syn::Expr::Return(ret), _)
+        struct ExactSettlement(bool);
+        impl<'ast> syn::visit::Visit<'ast> for ExactSettlement {
+            fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+                self.0 |= call.method == "finish" && call.args.len() == 3
+                    && matches!(&*call.receiver, syn::Expr::Path(path) if named(&path.path, "load"))
+                    && matches!(&call.args[0], syn::Expr::Path(path) if named(&path.path, "base_address"))
+                    && matches!(&call.args[1], syn::Expr::Path(path) if named(&path.path, "view_size"))
+                    && matches!(&call.args[2], syn::Expr::Cast(cast)
+                        if matches!(&*cast.expr, syn::Expr::Path(path) if named(&path.path, "st"))
+                        && matches!(&*cast.ty, syn::Type::Path(path) if named(&path.path, "u32")));
+                syn::visit::visit_expr_method_call(self, call);
+            }
+        }
+        let mut settlement = ExactSettlement(false);
+        settlement.visit_stmt(&branch.then_branch.stmts[1]);
+        assert!(settlement.0, "retain the exact failed Map observation in its original load owner");
+        assert!(matches!(&branch.then_branch.stmts[2], syn::Stmt::Expr(syn::Expr::Return(ret), _)
             if matches!(ret.expr.as_deref(), Some(syn::Expr::Lit(lit))
                 if matches!(&lit.lit, syn::Lit::Int(value) if value.base10_parse::<u64>().unwrap() == 0))),
             "preserve the loader's existing failed-map return value");

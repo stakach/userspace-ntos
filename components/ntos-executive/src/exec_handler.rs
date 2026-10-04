@@ -85,6 +85,9 @@ pub(crate) mod image_section_create;
 #[path = "exec_image_process_create.rs"]
 pub(crate) mod image_process_create;
 
+#[path = "exec_native_image_view.rs"]
+pub(crate) mod native_image_view;
+
 const INTERNAL_DISPATCHER_EVENT_BASE: u64 = 1 << 40;
 pub(crate) const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
 pub(crate) const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
@@ -3966,6 +3969,7 @@ impl ExecNtHandler {
         write_field!(obj_ns, obj_ns);
         write_field!(image_sections, native_image_sections::NativeImageStore::new());
         write_field!(process_image_owners, Vec::new());
+        write_field!(native_image_views, Vec::new());
         write_field!(events, events);
         write_field!(event_objects, event_objects);
         write_field!(provider_timers, provider_timers);
@@ -16255,28 +16259,21 @@ impl ExecNtHandler {
         let process = self.capture_process_identity(pi)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         let lifetime = nt_memory_manager::MemoryLifetime::Process(process);
+        if let Some(restored) = transition_page_restoration::resume(self, pi, page, pml4, scratch_base)? {
+            return Ok(restored);
+        }
         hosted_thread_memory_access(pi as u64, page, 0x1000)?;
         match (&*core::ptr::addr_of!(PROCESS_PAGEFILE)).lifetime(pi as u64, page) {
             None => return Ok(false),
             Some(owner) if owner != lifetime => return Err(nt_process::STATUS_INVALID_HANDLE),
             Some(_) => {}
         }
+        let transition = (&*core::ptr::addr_of!(PROCESS_PAGEFILE))
+            .page_for(pi as u64, lifetime, page)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         self.ensure_process_working_set_admission(pi, page, scratch_base)?;
-        vm_ensure_private_pt(self, pi, page, pml4)?;
-        let pagefile = &mut *core::ptr::addr_of_mut!(PROCESS_PAGEFILE);
-        let transition = pagefile
-            .take_for(pi as u64, lifetime, page)
-            .map_err(|_| nt_process::STATUS_INSUFFICIENT_RESOURCES)?
-            .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
-        if let Err(status) =
-            vm_restore_transition_mapping(pi, transition.lifetime, page, transition.protection, pml4, transition.backing)
-        {
-            pagefile
-                .restore(transition)
-                .expect("taking a transition record retains its vector capacity");
-            return Err(status);
-        }
-        Ok(true)
+        ensure_process_user_page_table(self, pi, page, pml4)?;
+        transition_page_restoration::begin(self, pi, process, pml4, scratch_base, transition)
     }
 
     unsafe fn set_job_extended_limits_transactional(
@@ -17716,6 +17713,9 @@ impl ExecNtHandler {
                 }
             }
             nt_address_space::VmResidencySource::Image => {
+                if self.service_native_image_page_residency(target_pi, plan.page, plan.access, false)?.is_some() {
+                    return Ok(());
+                }
                 let image = process_committed_image_allocation(target_pi as u64, plan.page)
                     .ok_or(nt_address_space::STATUS_NOT_COMMITTED)?;
                 let base = image.allocation_base;
@@ -36338,6 +36338,11 @@ impl ExecNtHandler {
                         Ok(target) => target,
                         Err(status) => return status,
                     };
+                match self.unmap_native_image_view(target_pi, base) {
+                    Ok(true) => return 0,
+                    Ok(false) => {}
+                    Err(status) => return status,
+                }
                 match self.unmap_generic_section_view_for_target(target_pid, target_pi, base, None) {
                     Ok(true) => return 0,
                     Ok(false) => {}
@@ -41128,6 +41133,11 @@ impl ExecNtHandler {
             NativeService::NtMapViewOfSection => unsafe {
                 const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xC000_007B;
                 let previous_mode = ctx.previous_mode;
+                match self.map_native_image_section_view(args, previous_mode) {
+                    Ok(Some(status)) => return status,
+                    Ok(None) => {}
+                    Err(status) => return status,
+                }
                 let ctx = self.loop_ctx.unwrap();
                 let reg = &mut *ctx.reg;
                 let dll_pes = ctx.dll_pes();
@@ -41147,38 +41157,9 @@ impl ExecNtHandler {
                             Some(pid) => pid,
                             None => return nt_process::STATUS_INVALID_HANDLE,
                         };
-                        let dll_arena_paging = &mut *ctx.dll_arena_paging;
-                        if let Err(status) = dll_arena_paging.reserve_process(pi) {
-                            return status;
-                        }
-                        if dll_arena_paging.pd_cap(pi) == 0 {
-                            let pd = alloc_slot();
-                            if untyped_retype_r(
-                                CAP_INIT_UNTYPED,
-                                OBJ_X86_PAGE_DIRECTORY,
-                                PAGING_BITS,
-                                1,
-                                pd,
-                            ) != 0
-                            {
-                                let _ = cnode_delete_recycle_r(pd);
-                                return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
-                            }
-                            if paging_struct_map_r(
-                                pd,
-                                LBL_X86_PAGE_DIRECTORY_MAP,
-                                DLL_ARENA_START,
-                                pml4,
-                            ) != 0
-                            {
-                                let _ = cnode_delete_recycle_r(pd);
-                                return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
-                            }
-                            if let Err(status) = dll_arena_paging.set_pd_cap(pi, pd) {
-                                let _ = cnode_delete_recycle_r(pd);
-                                return status;
-                            }
-                        }
+                        if let Err(status) = user_image_paging::ensure_process_user_paging_parents(
+                            self, pi, DLL_ARENA_START, pml4,
+                        ) { return status; }
                         if let Some(pt_range) = reg.page_table_range(i) {
                             for pt_index in pt_range {
                                 let pt_va = DLL_ARENA_START

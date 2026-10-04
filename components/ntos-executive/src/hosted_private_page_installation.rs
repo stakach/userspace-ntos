@@ -15,6 +15,7 @@ struct Target {
     pml4: u64,
     scratch_base: u64,
     alias: u64,
+    initialize_from: Option<u64>,
 }
 
 static mut OWNER: PrivatePageInstallation<Target> = PrivatePageInstallation::new();
@@ -70,6 +71,27 @@ impl PrivatePageInstallationIo<Target> for Io<'_> {
             VM_FAIL_FRAME.fetch_add(1, Ordering::Relaxed);
             status
         })
+    }
+    fn initialize_frame(&mut self, target: &Target, frame: InstallationCap) -> InstallationEffect {
+        if !target_is_current(self.handler, target) {
+            return InstallationEffect::Refused(nt_process::STATUS_INVALID_HANDLE);
+        }
+        if let Err(status) = unsafe { frame_recycle::validate_owned_backing(frame.cap) } {
+            return InstallationEffect::Refused(status);
+        }
+        if let Some(source) = target.initialize_from {
+            // A copy can modify the destination before scratch-alias cleanup refuses. Never
+            // replay or release either backing after such an uncertain initializer result.
+            match unsafe {
+                temporary_frame_alias::copy_page(source, frame.cap, target.scratch_base)
+            } {
+                Ok(()) => InstallationEffect::Acknowledged,
+                Err(status) => InstallationEffect::Uncertain(status),
+            }
+        } else {
+            // Frame acquisition already zeroed this exclusively owned, unmapped backing.
+            InstallationEffect::Acknowledged
+        }
     }
     fn reserve_alias(&mut self, _: &Target) -> Result<InstallationCap, u32> {
         try_alloc_slot()
@@ -211,6 +233,7 @@ pub(super) unsafe fn map_private_page(
         pml4,
         scratch_base,
         alias: 0,
+        initialize_from: None,
     };
     if !target_is_current(handler, &target) {
         return Err(nt_process::STATUS_INVALID_HANDLE);
@@ -232,6 +255,59 @@ pub(super) unsafe fn map_private_page(
     target.alias = alias;
     owner.begin(target, alias != 0)?;
     result(owner.advance(&mut Io { handler }))
+}
+
+/// Image COW uses the same retained owner, but fills from canonical backing before user mapping.
+pub(super) unsafe fn map_private_page_from_frame(
+    handler: &mut ExecNtHandler,
+    pi: usize,
+    page: u64,
+    protection: u32,
+    pml4: u64,
+    scratch_base: u64,
+    source: u64,
+) -> Result<(), u32> {
+    let _borrow = Borrow::acquire()?;
+    let owner = &mut *core::ptr::addr_of_mut!(OWNER);
+    if !owner.is_idle() {
+        let _ = owner.advance(&mut Io { handler });
+        if !owner.is_idle() {
+            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        }
+    }
+    frame_recycle::validate_owned_backing(source)?;
+    let process = handler
+        .capture_process_identity(pi)
+        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let target = Target {
+        pi,
+        process,
+        page,
+        protection,
+        pml4,
+        scratch_base,
+        alias: 0,
+        initialize_from: Some(source),
+    };
+    if !target_is_current(handler, &target) {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
+    handler.ensure_process_working_set_admission(pi, page, scratch_base)?;
+    ensure_process_user_page_table(handler, pi, page, pml4)?;
+    owner.begin(target, false)?;
+    result(owner.advance(&mut Io { handler }))
+}
+
+pub(super) fn references_source_cap(cap: u64) -> bool {
+    let Ok(_borrow) = Borrow::acquire() else {
+        return true;
+    };
+    unsafe {
+        (&*core::ptr::addr_of!(OWNER))
+            .descriptor()
+            .is_some_and(|target| target.initialize_from == Some(cap))
+    }
 }
 
 pub(super) fn process_available(pi: u64) -> bool {
