@@ -6,6 +6,9 @@
 
 #![no_std]
 
+mod process_image_layout;
+pub use process_image_layout::ProcessImageLayout;
+
 pub const MAX_EXE_LEAF: usize = 64;
 pub const MAX_NT_IMAGE_PATH: usize = 192;
 pub const MAX_COMMAND_LINE: usize = 384;
