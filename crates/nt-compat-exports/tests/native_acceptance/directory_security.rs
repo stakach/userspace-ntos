@@ -1,5 +1,131 @@
 use syn::visit::Visit;
 
+#[test]
+fn directory_creation_grant_uses_shared_policy_and_audits_before_error_propagation() {
+    let file = syn::parse_file(include_str!(
+        "../../../../components/ntos-executive/src/exec_directory_security.rs"
+    ))
+    .unwrap();
+    fn argument_name(expression: &syn::Expr) -> Option<String> {
+        match expression {
+            syn::Expr::Reference(reference) => argument_name(&reference.expr),
+            syn::Expr::Path(path) => path
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string()),
+            _ => None,
+        }
+    }
+    #[derive(Default)]
+    struct Audit {
+        attributes: bool,
+        granted: bool,
+        used: bool,
+        denied: bool,
+        used_flag: bool,
+        denied_on_false: bool,
+        propagation: bool,
+    }
+    impl<'ast> Visit<'ast> for Audit {
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            self.used_flag |= path
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "SE_PRIVILEGE_USED_FOR_ACCESS");
+            syn::visit::visit_expr_path(self, path);
+        }
+        fn visit_expr_unary(&mut self, expression: &'ast syn::ExprUnary) {
+            self.denied_on_false |= matches!(expression.op, syn::UnOp::Not(_))
+                && matches!(&*expression.expr, syn::Expr::Field(field)
+                    if matches!(&field.member, syn::Member::Named(name) if name == "granted"));
+            syn::visit::visit_expr_unary(self, expression);
+        }
+        fn visit_expr_field(&mut self, field: &'ast syn::ExprField) {
+            self.attributes |=
+                matches!(&field.member, syn::Member::Named(name) if name == "attributes");
+            self.granted |= matches!(&field.member, syn::Member::Named(name) if name == "granted");
+            syn::visit::visit_expr_field(self, field);
+        }
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if call.method == "fetch_add" {
+                self.used |= argument_name(&call.receiver).as_deref() == Some("PRIVILEGES_USED");
+                self.denied |=
+                    argument_name(&call.receiver).as_deref() == Some("PRIVILEGE_DENIALS");
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+        fn visit_expr_try(&mut self, expression: &'ast syn::ExprTry) {
+            self.propagation |= argument_name(&expression.expr).as_deref() == Some("granted");
+            syn::visit::visit_expr_try(self, expression);
+        }
+    }
+    struct Binding(bool);
+    impl<'ast> Visit<'ast> for Binding {
+        fn visit_block(&mut self, block: &'ast syn::Block) {
+            for (position, statement) in block.stmts.iter().enumerate() {
+                let syn::Stmt::Local(local) = statement else {
+                    continue;
+                };
+                let Some(initializer) = &local.init else {
+                    continue;
+                };
+                let syn::Expr::Call(call) = &*initializer.expr else {
+                    continue;
+                };
+                if argument_name(&call.func).as_deref() != Some("prepare_object_creation_grant") {
+                    continue;
+                }
+                let arguments: Vec<_> = call.args.iter().map(argument_name).collect();
+                assert_eq!(
+                    arguments,
+                    [
+                        "tokens",
+                        "desired_access",
+                        "DIRECTORY_GENERIC_MAPPING",
+                        "mode",
+                        "privilege_audit"
+                    ]
+                    .map(|name| Some(name.to_owned()))
+                );
+                let mut audit = Audit::default();
+                let mut saw_audit = false;
+                let mut saw_propagation = false;
+                for following in &block.stmts[position + 1..] {
+                    audit.visit_stmt(following);
+                    if audit.propagation {
+                        assert!(
+                            saw_audit,
+                            "privilege audit must be recorded even when grant returns an error"
+                        );
+                        saw_propagation = true;
+                        break;
+                    }
+                    saw_audit |= audit.attributes
+                        && audit.granted
+                        && audit.used
+                        && audit.denied
+                        && audit.used_flag
+                        && audit.denied_on_false;
+                }
+                assert!(
+                    saw_propagation,
+                    "the exact grant result must propagate after audit"
+                );
+                self.0 = true;
+            }
+            syn::visit::visit_block(self, block);
+        }
+    }
+    let mut binding = Binding(false);
+    binding.visit_block(&method(&file, "prepare_directory_object_security").block);
+    assert!(
+        binding.0,
+        "Directory must consume the shared creation-grant policy"
+    );
+}
+
 fn source() -> syn::File {
     syn::parse_file(include_str!(
         "../../../../components/ntos-executive/src/exec_directory_object.rs"
@@ -91,7 +217,7 @@ fn native_directory_handle_is_committed_before_checked_copyout_without_late_abor
 #[test]
 fn root_directory_handle_reference_does_not_require_traverse_handle_access() {
     let file = syn::parse_file(include_str!(
-        "../../../../components/ntos-executive/src/exec_handler.rs"
+        "../../../../components/ntos-executive/src/exec_namespace_security.rs"
     ))
     .unwrap();
     struct RequiredAccess(Option<u32>);
@@ -225,6 +351,10 @@ fn retained_directory_security_allocations_are_durable_before_capture_and_public
         "../../../../components/ntos-executive/src/exec_directory_security.rs"
     ))
     .unwrap();
+    let namespace = syn::parse_file(include_str!(
+        "../../../../components/ntos-executive/src/exec_namespace_security.rs"
+    ))
+    .unwrap();
     for (name, first_effect) in [
         (
             "capture_named_creator_security_descriptor",
@@ -234,7 +364,12 @@ fn retained_directory_security_allocations_are_durable_before_capture_and_public
         ("commit_directory_object_security", "try_reserve"),
     ] {
         let mut calls = Calls::default();
-        calls.visit_block(&method(&file, name).block);
+        let owner = if name == "capture_named_creator_security_descriptor" {
+            &namespace
+        } else {
+            &file
+        };
+        calls.visit_block(&method(owner, name).block);
         let durable = calls
             .0
             .iter()

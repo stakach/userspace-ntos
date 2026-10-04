@@ -84,6 +84,9 @@ pub(crate) mod directory_object;
 #[path = "exec_directory_security.rs"]
 pub(crate) mod directory_security;
 
+#[path = "exec_namespace_security.rs"]
+mod namespace_security;
+
 #[path = "exec_section_create.rs"]
 pub(crate) mod section_create;
 
@@ -9933,30 +9936,6 @@ impl ExecNtHandler {
             nt_syscall::ProcessorMode::UserMode => nt_types::AccessMode::UserMode,
         };
         self.pm.capture_native_handle_caller(thread, mode)
-    }
-
-    fn native_directory_root_and_path<'a>(
-        &self,
-        caller: nt_process::native_handle::NativeHandleCaller,
-        root: u64,
-        path: &'a [u8],
-    ) -> Result<(usize, &'a [u8]), u32> {
-        if root == 0 {
-            return if path.first() == Some(&b'\\') {
-                Ok((0, path))
-            } else {
-                Err(0xC000_0033) // STATUS_OBJECT_NAME_INVALID
-            };
-        }
-        if path.first() == Some(&b'\\') {
-            return Err(0xC000_0033);
-        }
-        let identity = self.pm.lookup_native_object_directory_handle(
-            caller,
-            root,
-            0,
-        )?;
-        Ok((self.directory_namespace_index_for_identity(identity)?, path))
     }
 
     fn mint_object_namespace_handle(&mut self, index: usize, desired_access: u32) -> Option<u64> {
@@ -30457,61 +30436,6 @@ impl ExecNtHandler {
     ) -> Option<usize> {
         self.obj_resolve_authorized(path, root_idx, follow_final_link, |_| Ok(()))
             .ok().flatten()
-    }
-
-    fn obj_resolve_authorized(
-        &self,
-        path: &[u8],
-        root_idx: usize,
-        follow_final_link: bool,
-        mut traverse: impl FnMut(usize) -> Result<(), u32>,
-    ) -> Result<Option<usize>, u32> {
-        const SYMLINK_LIMIT: u32 = 32;
-        let mut components = Self::object_path_components(path);
-        let mut cur = if path.first() == Some(&b'\\') {
-            0
-        } else {
-            root_idx
-        };
-        let mut index = 0usize;
-        let mut hops = 0u32;
-
-        while index < components.len() {
-            let Some(cur_entry) = self.obj_ns.get(cur) else { return Ok(None) };
-            if !cur_entry.is_live() || cur_entry.kind != OBJ_KIND_DIRECTORY {
-                return Ok(None);
-            }
-            traverse(cur)?;
-            let Some(child) = self.obj_child(cur, &components[index]) else { return Ok(None) };
-            let Some(entry) = self.obj_ns.get(child) else { return Ok(None) };
-            if !entry.is_live() {
-                return Ok(None);
-            }
-            let final_component = index + 1 == components.len();
-            if entry.kind == OBJ_KIND_SYMBOLIC_LINK && (!final_component || follow_final_link) {
-                hops += 1;
-                if hops > SYMLINK_LIMIT {
-                    return Ok(None);
-                }
-                let target = entry.target();
-                let target_absolute = target.first() == Some(&b'\\');
-                let mut rebuilt = Self::object_path_components(target);
-                rebuilt.extend(components[index + 1..].iter().cloned());
-                components = rebuilt;
-                cur = if target_absolute {
-                    0
-                } else if entry.parent == OBJ_PARENT_ROOT {
-                    0
-                } else {
-                    entry.parent
-                };
-                index = 0;
-                continue;
-            }
-            cur = child;
-            index += 1;
-        }
-        Ok(Some(cur))
     }
 
     /// Resolve an object path to an `obj_ns` index, following the final symbolic link.
