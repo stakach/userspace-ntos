@@ -1,0 +1,31 @@
+{
+  "native_commit": "3d01f214e643f7f3042800c83324708b0bf63c81",
+  "microkernel_commit": "92c4e2b330019c7c8afb1544b3cbf8ca1219eb73",
+  "profile": "font-cleanup",
+  "command": "env -u NTOS_MUP_PROVIDER_KERNEL_ONLY -u NTDLL_FEATURES NTOS_IMAGE_PROFILE=font-cleanup IMAGE_MIB=256 PERSIST_IMAGE_MIB=16 BOOT_TIMEOUT_SECONDS=3600 RUN_LOG=$PWD/.tmp/issue18-user-owned-desktop-font-boot.log ./run.sh --desktop -qmp unix:$PWD/.tmp/issue18-user-owned-desktop-font-qmp.sock,server=on,wait=off",
+  "boot_limit_seconds": 3600,
+  "termination": "Guest reached its microtest sentinel naturally within the boot limit. The desktop launcher refused the incomplete Explorer proof.",
+  "launcher_exit": 1,
+  "collector_exit": 0,
+  "collector_frames": 265,
+  "font_parser_exit": 1,
+  "font_parser_failure": "Missing font-acceptance PID-QUERY; the Explorer Run-key client did not execute.",
+  "guest_summary": { "passed": 223, "total": 300 },
+  "explorer_desktop_proven": false,
+  "screenshot": "../images/livecd-setup-file-admission-failure.png",
+  "screenshot_sha256": "53ad5f5ac610f375103c4b38bc9dcda1b85defd34e60860272a02fff0da0c9cb",
+  "root_viewed_screenshot": true,
+  "raw_log_sha256": "da204348dfc533c12ce0b370996a34aaaf247cb25072834fc535c50e347ff62e",
+  "archived_log": "issue18-livecd-setup-file-admission-failure.log.gz",
+  "rootserver_sha256": "f95bfb12c108853cc1733cba962047e522aa308695324f7b86aff3ade9b46e5b",
+  "disk_sha256_after_termination": "d139a1419c220ea6ecd18027d87f701280b4ac677c29a300f08e697676a1218c",
+  "observations": [
+    "The same-run final screenshot contains background and cursor, without Explorer chrome or icons.",
+    "The real media-selected startup path launched setup.exe, pi16/pid952, from Winlogon pid376.",
+    "No actual Userinit or Explorer process launch was observed; bootstrap image loads are not execution evidence.",
+    "A loader dependency File open failed with STATUS_INSUFFICIENT_RESOURCES before LoadLibraryExW(syssetup.dll) reported DLL_NOT_FOUND. The failed dependency name and exact resource-admission branch were not recorded.",
+    "The previous USER pointer-reference underflow did not recur; this does not prove complete native USER ownership.",
+    "Terminal provider cleanup still reported authenticated caller rejection and failed Section dereference; fresh private-font terminal unmap acceptance remains unproven.",
+    "i8042prt admission rejected unresolved IoStartNextPacket, and real keyboard/mouse reads failed. No hardware-input proof was obtained."
+  ]
+}
