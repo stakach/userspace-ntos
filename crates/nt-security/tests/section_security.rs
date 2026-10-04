@@ -167,3 +167,42 @@ fn sacl_assignment_reports_actual_denied_privilege() {
         Some(SecurityAssignmentPrivilegeOutcome::Denied)
     );
 }
+
+#[test]
+fn existing_section_maximum_allowed_is_not_the_new_creation_grant() {
+    let owner = AccessToken::user(19);
+    let descriptor = assign_section_security(
+        &subject(&owner),
+        Some(&world_descriptor(4)),
+        None,
+        ProcessorMode::UserMode,
+        &mut SecurityAssignmentAudit::default(),
+    )
+    .unwrap();
+    let reader = AccessToken::user(20);
+    let captured = subject(&reader);
+    let existing = authorize_section_open(
+        &captured,
+        &descriptor,
+        nt_security::MAXIMUM_ALLOWED,
+        ProcessorMode::UserMode,
+    )
+    .unwrap();
+    assert_eq!((existing.status, existing.granted_access), (0, 4));
+
+    let created = nt_security::prepare_object_creation_grant(
+        &captured,
+        nt_security::MAXIMUM_ALLOWED,
+        &SECTION_GENERIC_MAPPING,
+        ProcessorMode::UserMode,
+        &mut None,
+    )
+    .unwrap();
+    assert_eq!(created, SECTION_GENERIC_MAPPING.generic_all);
+    let incorrect_reopen =
+        authorize_section_open(&captured, &descriptor, created, ProcessorMode::UserMode).unwrap();
+    assert_eq!(
+        (incorrect_reopen.status, incorrect_reopen.granted_access),
+        (STATUS_ACCESS_DENIED, 0)
+    );
+}
