@@ -39,6 +39,8 @@ pub struct WdmDriverObjectInit {
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct WdmDeviceObjectInit {
+    /// Final WDM virtual address, which may differ from this writer's output slice address.
+    pub device_object_address: u64,
     pub size_field: u16,
     pub driver_object: u64,
     pub next_device: u64,
@@ -232,24 +234,6 @@ pub fn write_wdm_driver_object(
     Ok(())
 }
 
-pub fn write_wdm_device_object(
-    bytes: &mut [u8],
-    init: WdmDeviceObjectInit,
-) -> Result<(), WdmLayoutError> {
-    require(bytes, WDM_X64_DEVICE_OBJECT_SIZE)?;
-    zero(bytes);
-    put_i16(bytes, 0x00, WDM_X64_IO_TYPE_DEVICE);
-    put_u16(bytes, 0x02, init.size_field);
-    put_u64(bytes, 0x08, init.driver_object);
-    put_u64(bytes, 0x10, init.next_device);
-    put_u32(bytes, 0x30, init.flags);
-    put_u32(bytes, 0x34, init.characteristics);
-    put_u64(bytes, 0x40, init.device_extension);
-    put_u32(bytes, 0x48, init.device_type);
-    put_u8(bytes, 0x4c, init.stack_size);
-    Ok(())
-}
-
 pub fn write_wdm_file_object(
     bytes: &mut [u8],
     init: WdmFileObjectInit,
@@ -351,6 +335,20 @@ pub fn write_wdm_open_device_projection(
     require(driver_bytes, WDM_X64_DRIVER_OBJECT_SIZE)?;
     require(device_bytes, WDM_X64_DEVICE_OBJECT_SIZE)?;
     require(file_bytes, WDM_X64_FILE_OBJECT_SIZE)?;
+    let prepared_device = device_object::prepare_device_object(
+        device_bytes.len(),
+        WdmDeviceObjectInit {
+            device_object_address: init.device_object,
+            size_field: WDM_X64_DEVICE_OBJECT_SIZE as u16,
+            driver_object: init.driver_object,
+            next_device: 0,
+            device_extension: 0,
+            flags: init.device_flags,
+            characteristics: init.device_characteristics,
+            device_type: init.device_type,
+            stack_size: init.device_stack_size,
+        },
+    )?;
     write_wdm_driver_object(
         driver_bytes,
         WdmDriverObjectInit {
@@ -363,19 +361,7 @@ pub fn write_wdm_open_device_projection(
     put_u16(driver_bytes, 0x38, init.driver_name_len);
     put_u16(driver_bytes, 0x3a, init.driver_name_max_len);
     put_u64(driver_bytes, 0x40, init.driver_name_buffer);
-    write_wdm_device_object(
-        device_bytes,
-        WdmDeviceObjectInit {
-            size_field: WDM_X64_DEVICE_OBJECT_SIZE as u16,
-            driver_object: init.driver_object,
-            next_device: 0,
-            device_extension: 0,
-            flags: init.device_flags,
-            characteristics: init.device_characteristics,
-            device_type: init.device_type,
-            stack_size: init.device_stack_size,
-        },
-    )?;
+    device_object::commit_device_object(device_bytes, prepared_device);
     write_wdm_file_object(
         file_bytes,
         WdmFileObjectInit {
@@ -692,3 +678,9 @@ fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
 
 #[cfg(test)]
 mod file_object_tests;
+
+#[cfg(test)]
+mod device_object_tests;
+
+mod device_object;
+pub use device_object::write_wdm_device_object;

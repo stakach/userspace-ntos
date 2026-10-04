@@ -498,6 +498,7 @@ unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> Option<Roo
     let initialized = write_wdm_device_object(
         core::slice::from_raw_parts_mut(device as *mut u8, WDM_X64_DEVICE_OBJECT_SIZE),
         WdmDeviceObjectInit {
+            device_object_address: device,
             size_field: WDM_X64_DEVICE_OBJECT_SIZE as u16,
             driver_object: driver,
             device_type: nt_video_miniport::FILE_DEVICE_VIDEO,

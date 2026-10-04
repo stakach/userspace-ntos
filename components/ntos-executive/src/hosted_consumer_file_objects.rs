@@ -225,6 +225,7 @@ unsafe fn build(id: u64, metadata: &Metadata) -> Result<(), i32> {
         device_id,
         &metadata.driver_name,
         WdmDeviceObjectInit {
+            device_object_address: 0, // The shared-device builder supplies the final provider VA.
             flags: metadata.device_flags,
             characteristics: metadata.device_characteristics,
             device_type: metadata.device_type,

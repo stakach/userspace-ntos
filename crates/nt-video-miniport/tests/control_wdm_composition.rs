@@ -26,9 +26,11 @@ impl ProjectedRequest {
     fn new() -> Self {
         let mut device = Box::new([0xa5; WDM_X64_DEVICE_OBJECT_SIZE]);
         let extension = Box::new([0; 32]);
+        let device_object_address = device.as_ptr() as u64;
         write_wdm_device_object(
             device.as_mut_slice(),
             WdmDeviceObjectInit {
+                device_object_address,
                 size_field: WDM_X64_DEVICE_OBJECT_SIZE as u16,
                 device_extension: extension.as_ptr() as u64,
                 device_type: FILE_DEVICE_VIDEO,
@@ -219,9 +221,11 @@ impl CombinedDevice {
     fn new() -> Box<Self> {
         let mut device = Box::new(Self([0; COMBINED_DEVICE_SIZE]));
         let prefix_address = device.0.as_ptr() as u64 + WDM_X64_DEVICE_OBJECT_SIZE as u64;
+        let device_object_address = device.0.as_ptr() as u64;
         write_wdm_device_object(
             &mut device.0[..WDM_X64_DEVICE_OBJECT_SIZE],
             WdmDeviceObjectInit {
+                device_object_address,
                 size_field: COMBINED_DEVICE_SIZE as u16,
                 device_extension: prefix_address,
                 device_type: FILE_DEVICE_VIDEO,

@@ -119,6 +119,7 @@ unsafe fn build(id: u64, name: &[u16], mut init: WdmDeviceObjectInit) -> Result<
     core::ptr::write_unaligned((name_exec + length as u64) as *mut u16, 0);
     init.driver_object = driver;
     init.size_field = WDM_X64_DEVICE_OBJECT_SIZE as u16;
+    init.device_object_address = device;
     nt_io_manager::write_wdm_device_object(
         core::slice::from_raw_parts_mut(device_exec as *mut u8, WDM_X64_DEVICE_OBJECT_SIZE),
         init,

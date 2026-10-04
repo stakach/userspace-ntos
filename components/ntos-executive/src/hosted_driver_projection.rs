@@ -72,6 +72,7 @@ pub(crate) unsafe fn create_hosted_device_projection(
     if write_wdm_device_object(
         device_bytes,
         WdmDeviceObjectInit {
+            device_object_address: device_object,
             size_field,
             driver_object,
             next_device,

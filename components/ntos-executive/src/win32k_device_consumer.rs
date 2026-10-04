@@ -243,6 +243,7 @@ pub(crate) unsafe fn ensure_projection(device: nt_io_manager::DeviceId) -> Resul
     nt_io_manager::write_wdm_device_object(
         core::slice::from_raw_parts_mut(address as *mut u8, device_size as usize),
         nt_io_manager::WdmDeviceObjectInit {
+            device_object_address: address,
             size_field: device_size as u16,
             driver_object: base,
             flags,

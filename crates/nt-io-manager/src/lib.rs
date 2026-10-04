@@ -8061,6 +8061,7 @@ mod tests {
         write_wdm_device_object(
             &mut dev,
             WdmDeviceObjectInit {
+                device_object_address: 0x1000_0000,
                 size_field: (WDM_X64_DEVICE_OBJECT_SIZE + 16) as u16,
                 driver_object: 0x1111,
                 next_device: 0x2222,
