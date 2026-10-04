@@ -1,5 +1,11 @@
 # Lessons
 
+## Decode The Producer's Hive Format
+- Follow the actual image producer before choosing a registry decoder. The installed REGF
+  source and composed core SYSTEM transport are distinct encodings of related data.
+- Test bootstrap policy reads with the real composed-image encoder and a non-default selected
+  control set. Missing policy may use its NT initial value; invalid data must remain an error.
+
 ## AST Regression Bindings
 - Use distinct names for collected calls and parsed expression nodes; a local named `calls`
   can hide the collector function, and reusing `owned` can hide an earlier call list.

@@ -1,6 +1,31 @@
 use syn::visit::Visit;
 
 #[test]
+fn boot_directory_policy_reads_the_composed_core_hive_transport() {
+    let file = syn::parse_file(include_str!(
+        "../../../../components/ntos-executive/src/exec_directory_security.rs"
+    )).unwrap();
+    let capture = file.items.iter().find_map(|item| match item {
+        syn::Item::Fn(item) if item.sig.ident == "capture_boot_protection_mode" => Some(item),
+        _ => None,
+    }).expect("native bootstrap captures the composed SYSTEM policy");
+    #[derive(Default)]
+    struct Decoder { core: bool, regf: bool }
+    impl<'ast> Visit<'ast> for Decoder {
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            self.core |= path.path.segments.last().is_some_and(|part|
+                part.ident == "boot_object_protection_mode_from_image");
+            self.regf |= path.path.segments.iter().any(|part| part.ident == "RegfHive");
+            syn::visit::visit_expr_path(self, path);
+        }
+    }
+    let mut decoder = Decoder::default();
+    decoder.visit_block(&capture.block);
+    assert!(decoder.core && !decoder.regf,
+        "the owned composed SYSTEM is a core hive image, not the installed REGF source");
+}
+
+#[test]
 fn directory_creation_grant_uses_shared_policy_and_audits_before_error_propagation() {
     let file = syn::parse_file(include_str!(
         "../../../../components/ntos-executive/src/exec_directory_security.rs"

@@ -15,11 +15,16 @@
 extern crate alloc;
 
 mod codec;
+mod boot_object_policy;
 mod config_import;
 mod hive;
 mod io;
 mod overlay;
 mod reactos_registration;
+
+pub use boot_object_policy::{
+    boot_object_protection_mode, boot_object_protection_mode_from_image, BootObjectPolicyError,
+};
 
 pub use overlay::{canon_path, RegistryOverlay};
 pub use reactos_registration::{

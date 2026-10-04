@@ -73,26 +73,11 @@ fn assignment_audit(audit: nt_security::SecurityAssignmentAudit) {
 }
 
 pub(super) fn capture_boot_protection_mode(bytes: &[u8]) -> Result<u32, u32> {
-    let hive = RegfHive::new(bytes).ok_or(0xC000_014Cu32)?;
-    let control_set = hive
-        .current_control_set_name()
-        .map_err(|_| 0xC000_014Cu32)?;
-    let path = alloc::format!("{}\\Control\\Session Manager", control_set);
-    let Some(key) = hive.open_key(&path) else {
-        return Ok(0);
-    };
-    // ObpProtectionMode starts at zero; only a genuinely absent value uses that NT default.
-    match hive.value_with(key, "ProtectionMode", |kind, bytes| {
-        if kind != 4 || bytes.len() != 4 {
-            Err(0xC000_0024)
-        } else {
-            Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
-        }
-    }) {
-        Some(value) => value,
-        None if !hive.value_exists(key, "ProtectionMode") => Ok(0),
-        None => Err(0xC000_014C),
-    }
+    nt_hive_core::boot_object_protection_mode_from_image(bytes).map_err(|error| match error {
+        nt_hive_core::BootObjectPolicyError::Image(_)
+        | nt_hive_core::BootObjectPolicyError::Selection(_) => 0xC000_014C,
+        nt_hive_core::BootObjectPolicyError::InvalidProtectionMode => 0xC000_0024,
+    })
 }
 
 pub(super) fn prepare_boot_directory_security(
