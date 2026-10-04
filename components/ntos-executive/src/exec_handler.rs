@@ -21051,6 +21051,7 @@ impl ExecNtHandler {
                     print_str(b" threads=");
                     print_u64(candidate.deleted_threads as u64);
                     print_str(b"\n");
+                    crate::note_boot_progress(crate::BootProgress::ProcessRetired);
                     return HostedProcessDeletionOutcome::Complete;
                 }
             }

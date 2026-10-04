@@ -7,6 +7,7 @@ pub(crate) enum BootProgress {
     ImageActivated,
     PageMappingPublished,
     ImageSnapshotCaptured,
+    ProcessRetired,
     DurableRegistryPublication,
     CredentialRetrieved,
     DialogModalCompleted,
@@ -25,6 +26,7 @@ impl BootProgress {
             Self::ImageActivated
             | Self::PageMappingPublished
             | Self::ImageSnapshotCaptured
+            | Self::ProcessRetired
             | Self::DurableRegistryPublication
             | Self::CredentialRetrieved => 0,
             Self::UserShellImageAttempted => 1 << 0,
@@ -65,7 +67,8 @@ impl LocalBootProgressObserver {
         }
         self.epoch.fetch_add(1, Ordering::Relaxed);
         explorer_completed
-            && self.sealed
+            && self
+                .sealed
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
     }
@@ -80,8 +83,13 @@ static BOOT_PROGRESS: LocalBootProgressObserver = LocalBootProgressObserver::new
 /// Only acknowledged state publications belong here, never polling, wakes, or IPC churn.
 #[inline]
 pub(crate) fn note_boot_progress(progress: BootProgress) {
-    if BOOT_PROGRESS.note(progress, crate::explorer_chrome_runtime_milestones_reached()) {
-        crate::print_str(b"[quiesce] Explorer runtime paint milestones complete; boot-progress epoch sealed\n");
+    if BOOT_PROGRESS.note(
+        progress,
+        crate::explorer_chrome_runtime_milestones_reached(),
+    ) {
+        crate::print_str(
+            b"[quiesce] Explorer runtime paint milestones complete; boot-progress epoch sealed\n",
+        );
     }
 }
 
