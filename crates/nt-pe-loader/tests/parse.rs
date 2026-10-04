@@ -16,6 +16,9 @@ mod snapshot_capacity;
 #[path = "parse/image_view_layout.rs"]
 mod image_view_layout;
 
+#[path = "parse/owned_image_layout.rs"]
+mod owned_image_layout;
+
 // --- a minimal PE32+ image builder -----------------------------------------
 
 const NT_OFF: usize = 0x40;

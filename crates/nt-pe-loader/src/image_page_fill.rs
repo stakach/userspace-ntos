@@ -1,6 +1,6 @@
 //! Checked raw-file spans for one SEC_IMAGE demand page.
 
-use crate::{headers, ImageProtection, PeError, PeFile};
+use crate::{headers, ImageProtection, PeError, PeLayout};
 
 pub const IMAGE_PAGE_SIZE: usize = 0x1000;
 const MAX_SPANS: usize = headers::MAX_SECTIONS + 1;
@@ -59,7 +59,7 @@ impl ImagePageFillPlan {
 }
 
 pub(crate) fn plan(
-    pe: &PeFile<'_>,
+    pe: &PeLayout,
     page_rva: u32,
     file_size: u64,
 ) -> Result<ImagePageFillPlan, PeError> {
