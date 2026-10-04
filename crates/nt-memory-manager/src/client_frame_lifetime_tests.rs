@@ -138,6 +138,45 @@ fn resident_reprotect_refuses_foreign_generation_before_mapping_effect() {
 }
 
 #[test]
+fn resident_reprotect_refuses_exact_process_reclaim_before_mapping_effect() {
+    let process = ProcessIdentity {
+        pid: 42,
+        generation: ProcessGeneration::Hosted(2),
+    };
+    for intent in [RELEASE, ClientFrameReclaimIntent::Pageout { protection: 4 }] {
+        let mut registry = ClientFrameRegistry::new();
+        registry
+            .insert(7, crate::MemoryLifetime::Process(process), 0x1000, 11, 0, 0, 0, true)
+            .unwrap();
+        let resident = registry.get(7, 0x1000).unwrap();
+        assert_eq!(
+            crate::admit_resident_reprotect(7, process, 0x1000, &registry),
+            Ok(Some(resident)),
+        );
+        let retained = registry.begin_reclaim_exact(resident, intent).unwrap();
+        assert!(!retained.is_resident());
+        let mut mapping_effects = 0;
+        let result = crate::admit_resident_reprotect(7, process, 0x1000, &registry)
+            .map(|record| {
+                if record.is_some() {
+                    mapping_effects += 1;
+                }
+            });
+        assert_eq!(result, Err(crate::STATUS_INVALID_HANDLE));
+        assert_eq!(mapping_effects, 0);
+        assert_eq!(registry.get(7, 0x1000), Some(retained));
+        assert_eq!(
+            crate::admit_client_alias_source(7, process, 0x1000, &registry),
+            Err(crate::STATUS_INVALID_HANDLE),
+        );
+        assert_eq!(
+            crate::admit_resident_reprotect(7, process, 0x2000, &registry),
+            Ok(None),
+        );
+    }
+}
+
+#[test]
 fn image_fixup_does_not_treat_a_foreign_frame_as_a_cache_miss() {
     let old = ProcessIdentity {
         pid: 42,

@@ -33,6 +33,7 @@ mod process_slot_reuse;
 pub use process_slot_reuse::{admit_empty_process_slot, ProcessSlotBlocker};
 mod private_page_retirement;
 pub mod private_page_installation;
+pub mod transition_page_restoration;
 pub use private_page_retirement::admit_private_page_retirement;
 mod resident_reprotect;
 pub use resident_reprotect::{admit_client_alias_source, admit_resident_reprotect};

@@ -55,6 +55,10 @@ impl<D: Copy + Eq> ImageSourcePage<D> {
         (self.phase == Phase::Ready).then_some(self.frame).flatten()
     }
 
+    pub fn is_retiring(&self) -> bool {
+        matches!(self.phase, Phase::Retiring(_))
+    }
+
     pub fn owns_cap(&self, cap: u64) -> bool {
         cap != 0 && self.frame.is_some_and(|frame| frame.cap == cap)
     }
@@ -177,6 +181,7 @@ mod tests {
         io.release = InstallationEffect::Acknowledged;
         assert_eq!(owner.advance(&mut io), ImageSourcePageOutcome::Retired);
         assert!(!owner.owns_cap(7));
+        assert!(!owner.is_retiring());
     }
 
     #[test]
@@ -187,6 +192,7 @@ mod tests {
         io.release = InstallationEffect::Refused(3);
         assert_eq!(owner.advance(&mut io), ImageSourcePageOutcome::Retained(3));
         assert!(owner.owns_cap(7));
+        assert!(owner.is_retiring());
         io.release = InstallationEffect::Acknowledged;
         assert_eq!(owner.advance(&mut io), ImageSourcePageOutcome::Failed(2));
         assert_eq!(io.events, ["acquire", "initialize", "release", "release"]);
@@ -215,6 +221,7 @@ mod tests {
             assert_eq!(io.events, events);
             assert!(owner.owns_cap(7));
             assert!(!owner.begin_retirement((9, 0)));
+            assert!(!owner.is_retiring());
         }
     }
 
