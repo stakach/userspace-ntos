@@ -27,6 +27,7 @@ mod ntdll;
 mod profile;
 pub mod process_identity;
 pub mod process_observation;
+pub mod desktop_launch;
 pub mod provider_alias_bank;
 pub mod provider_finalization;
 pub mod provider_file_close;
