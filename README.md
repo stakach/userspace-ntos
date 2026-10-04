@@ -144,9 +144,10 @@ in `extern-rootserver` mode (bring your own root task).
 ## Running the hosted ReactOS desktop (quick start)
 
 The desktop target hosts **real, unmodified GPL ReactOS binaries** on rust-micro.
-Current restoration and genuine Explorer acceptance are tracked in
-[issue #88](https://github.com/stakach/userspace-ntos/issues/88), with broader
-native acceptance in [issue #18](https://github.com/stakach/userspace-ntos/issues/18).
+Genuine Explorer and native acceptance are tracked in
+[issue #18](https://github.com/stakach/userspace-ntos/issues/18).
+[Fresh logon-rendering evidence](docs/evidence/issue18-bounded-source-logon.json)
+includes the real credential dialog, but does not establish Explorer desktop boot.
 Crate CI does not prove desktop boot. To attempt a boot from a fresh clone:
 
 ```sh
