@@ -19,6 +19,7 @@ mod native_acl;
 pub mod native_acl_inheritance;
 mod native_sd;
 mod object_security;
+mod object_creation_grant;
 mod directory_security;
 mod port;
 mod section_security;
@@ -94,6 +95,7 @@ pub use section_security::{
 pub use directory_security::{
     assign_directory_security, authorize_directory_open, DIRECTORY_GENERIC_MAPPING,
 };
+pub use object_creation_grant::{prepare_object_creation_grant, ObjectCreationPrivilegeAudit};
 pub use sid::{write_native_sid_sddl_utf16, Luid, Sid, STATUS_INVALID_SID};
 pub use subject_context::{
     CapturedClientToken, CapturedSubjectContext, CapturedSubjectTokens, SubjectClientIdentity,

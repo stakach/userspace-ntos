@@ -1,10 +1,9 @@
 //! Ordinary new-Key security preparation, before mutation and native handle publication.
 
 use crate::{
-    AccessCheckResult, CapturedSubjectTokens, Luid, ObjectSecurityAssignment, PrivilegeAdjustment,
-    ProcessorMode, SecurityAssignmentAudit, SecurityAssignmentClient,
-    SecurityAssignmentInheritance, ACCESS_SYSTEM_SECURITY, KEY_GENERIC_MAPPING, MAXIMUM_ALLOWED,
-    STATUS_PRIVILEGE_NOT_HELD,
+    AccessCheckResult, CapturedSubjectTokens, ObjectSecurityAssignment, ProcessorMode,
+    SecurityAssignmentAudit, SecurityAssignmentClient, SecurityAssignmentInheritance,
+    KEY_GENERIC_MAPPING,
 };
 use alloc::vec::Vec;
 
@@ -16,12 +15,7 @@ pub struct KeyCreationAudit {
     pub handle_security: Option<KeyHandleSecurityAudit>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KeyHandleSecurityAudit {
-    pub granted: bool,
-    /// Returned native privilege attributes distinguish actual use from a KernelMode bypass.
-    pub attributes: u32,
-}
+pub type KeyHandleSecurityAudit = crate::ObjectCreationPrivilegeAudit;
 
 pub struct PreparedKeyCreationSecurity {
     pub descriptor: Vec<u8>,
@@ -75,31 +69,16 @@ pub fn prepare_key_creation_security(
         &mut audit.assignment,
     )?;
     let desired = desired_access & !0x0300;
-    let mapped = KEY_GENERIC_MAPPING.map(
-        (desired & !MAXIMUM_ALLOWED)
-            | if desired & MAXIMUM_ALLOWED != 0 {
-                0x1000_0000
-            } else {
-                0
-            },
-    );
-    if mapped & ACCESS_SYSTEM_SECURITY != 0 {
-        let mut privilege = [PrivilegeAdjustment {
-            luid: Luid::new(8),
-            attributes: 0,
-        }];
-        let granted = subject.check_privileges(&mut privilege, true, mode);
-        audit.handle_security = Some(KeyHandleSecurityAudit {
-            granted,
-            attributes: privilege[0].attributes,
-        });
-        if !granted {
-            return Err(STATUS_PRIVILEGE_NOT_HELD);
-        }
-    }
+    let granted_access = crate::prepare_object_creation_grant(
+        subject,
+        desired,
+        &KEY_GENERIC_MAPPING,
+        mode,
+        &mut audit.handle_security,
+    )?;
     Ok(PreparedKeyCreationSecurity {
         descriptor,
-        granted_access: mapped & (KEY_GENERIC_MAPPING.generic_all | ACCESS_SYSTEM_SECURITY),
+        granted_access,
     })
 }
 
