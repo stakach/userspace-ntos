@@ -61,24 +61,27 @@ fn exact_loaded_image_registration_does_not_select_an_old_same_leaf_snapshot() {
 }
 
 #[test]
-fn generic_image_bridge_checks_relocation_plan_before_publication() {
+fn generic_image_bridge_checks_preferred_layout_before_publication() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../components/ntos-executive/src/exec_image_process_create.rs");
     let file = syn::parse_file(&std::fs::read_to_string(path).unwrap()).unwrap();
     let body = &method(&file, "reserve_native_image_process").block;
     let mut calls = Calls::default();
     calls.visit_block(body);
-    let checked = calls.0.iter().position(|name| name == "relocate_file_snapshot")
-        .expect("generic canonical images require a checked, atomic raw-file relocation transform");
+    let checked = calls.0.iter().position(|name| name == "checked")
+        .expect("canonical images require a checked preferred ProcessImageLayout");
+    let admitted = calls.0.iter().position(|name| name == "validate_hosted_main_image_layout")
+        .expect("constructor-owned mapping conflicts must be rejected before publication");
+    assert!(checked < admitted);
     for publication in ["reference_view", "admit_dynamic_executable_observed", "register_exact_loaded"] {
         let index = calls.0.iter().position(|name| name == publication).unwrap();
-        assert!(checked < index, "reject malformed relocation before {publication}");
+        assert!(admitted < index, "reject invalid preferred placement before {publication}");
     }
-    for unchecked in ["apply_relocations_to_buf", "read_unaligned", "write_unaligned", "write_volatile"] {
+    for unchecked in ["relocate_file_snapshot", "apply_relocations_to_buf", "read_unaligned", "write_unaligned", "write_volatile"] {
         assert!(!calls.0.iter().any(|name| name == unchecked), "no unchecked transform via {unchecked}");
     }
     #[derive(Default)]
-    struct CheckedResult { try_depth: usize, propagated: bool }
+    struct CheckedResult { try_depth: usize, layout: bool, admission: bool }
     impl<'ast> Visit<'ast> for CheckedResult {
         fn visit_expr_try(&mut self, value: &'ast syn::ExprTry) {
             self.try_depth += 1;
@@ -87,9 +90,18 @@ fn generic_image_bridge_checks_relocation_plan_before_publication() {
         }
         fn visit_expr_call(&mut self, value: &'ast syn::ExprCall) {
             if let syn::Expr::Path(path) = &*value.func {
-                if path.path.segments.last().unwrap().ident == "relocate_file_snapshot" {
-                    assert_eq!(value.args.len(), 2, "checked transform takes independent bytes and load base");
-                    self.propagated |= self.try_depth != 0;
+                let segments: Vec<_> = path.path.segments.iter()
+                    .map(|segment| segment.ident.to_string()).collect();
+                if segments.ends_with(&["ProcessImageLayout".to_owned(), "checked".to_owned()]) {
+                    assert_eq!(value.args.len(), 3);
+                    for (argument, member) in [(0, "image_base"), (2, "entry_point_rva")] {
+                        assert!(matches!(&value.args[argument], syn::Expr::Field(field)
+                            if matches!(&field.member, syn::Member::Named(name) if name == member)),
+                            "layout must preserve canonical header {member}");
+                    }
+                    self.layout = self.try_depth != 0;
+                } else if segments.last().is_some_and(|name| name == "validate_hosted_main_image_layout") {
+                    self.admission = self.try_depth != 0;
                 }
             }
             syn::visit::visit_expr_call(self, value);
@@ -97,5 +109,6 @@ fn generic_image_bridge_checks_relocation_plan_before_publication() {
     }
     let mut checked_result = CheckedResult::default();
     checked_result.visit_block(body);
-    assert!(checked_result.propagated, "malformed-image rejection must propagate before publication");
+    assert!(checked_result.layout && checked_result.admission,
+        "checked layout and conflict errors must propagate before publication");
 }
