@@ -480,3 +480,5 @@ impl MemoryManager {
 mod tests;
 
 pub mod component_heap;
+pub mod image_source_page;
+pub mod borrowed_page_installation;

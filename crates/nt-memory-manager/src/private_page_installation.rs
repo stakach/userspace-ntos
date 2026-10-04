@@ -42,6 +42,10 @@ pub trait PrivatePageInstallationIo<D> {
     /// Err transfers nothing; the acquisition backend must retain its partial owner on error.
     /// Success transfers exclusive zeroed UNMAPPED backing; it cannot enter any other reuse pool.
     fn acquire_frame(&mut self, descriptor: &D) -> Result<InstallationCap, u32>;
+    /// Initialize owned backing before any user mapping. Refused means no stores or aliases
+    /// remain; a failure after writes or uncertain scratch retirement must be Uncertain.
+    /// Even an already-zeroed acquisition must explicitly acknowledge this stage.
+    fn initialize_frame(&mut self, descriptor: &D, frame: InstallationCap) -> InstallationEffect;
     /// Err reserves nothing. Return an owned EMPTY slot validated by the native allocator.
     fn reserve_alias(&mut self, descriptor: &D) -> Result<InstallationCap, u32>;
     fn copy_alias(&mut self, frame: InstallationCap, alias: InstallationCap) -> InstallationEffect;
@@ -60,6 +64,7 @@ pub trait PrivatePageInstallationIo<D> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
     Acquire,
+    Initialize,
     MapFrame,
     ReserveAlias,
     CopyAlias,
@@ -173,7 +178,7 @@ impl<D: Copy + Eq> PrivatePageInstallation<D> {
                             owner.failure = INVALID;
                             owner.phase = Phase::Quarantined;
                         } else {
-                            owner.phase = Phase::MapFrame;
+                            owner.phase = Phase::Initialize;
                         }
                     }
                     Err(status) => {
@@ -181,6 +186,15 @@ impl<D: Copy + Eq> PrivatePageInstallation<D> {
                         return PrivatePageInstallOutcome::Failed(status);
                     }
                 },
+                Phase::Initialize => {
+                    if Self::reject(
+                        owner,
+                        io.initialize_frame(&owner.descriptor, owner.frame.unwrap()),
+                    ) {
+                        continue;
+                    }
+                    owner.phase = Phase::MapFrame;
+                }
                 Phase::MapFrame => {
                     if Self::reject(owner, io.map_frame(&owner.descriptor, owner.frame.unwrap())) {
                         continue;

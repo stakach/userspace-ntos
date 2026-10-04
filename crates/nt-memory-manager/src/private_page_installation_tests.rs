@@ -11,8 +11,18 @@ struct Io {
     refuse: Option<&'static str>,
     uncertain: Option<&'static str>,
     publication: Option<PrivatePagePublication<u64>>,
+    frame_bytes: [u8; 16],
 }
 impl Io {
+    fn initialize_frame(&mut self, descriptor: &u64, frame: InstallationCap) -> InstallationEffect {
+        assert_eq!(*descriptor, 42);
+        assert_eq!(frame, FRAME);
+        let effect = self.effect("initialize");
+        if effect == InstallationEffect::Acknowledged {
+            self.frame_bytes.copy_from_slice(b"canonical-image!");
+        }
+        effect
+    }
     fn effect(&mut self, name: &'static str) -> InstallationEffect {
         self.calls.push(name);
         if self.uncertain == Some(name) {
@@ -30,6 +40,9 @@ impl PrivatePageInstallationIo<u64> for Io {
     fn acquire_frame(&mut self, _: &u64) -> Result<InstallationCap, u32> {
         self.calls.push("acquire");
         Ok(FRAME)
+    }
+    fn initialize_frame(&mut self, descriptor: &u64, frame: InstallationCap) -> InstallationEffect {
+        Io::initialize_frame(self, descriptor, frame)
     }
     fn reserve_alias(&mut self, _: &u64) -> Result<InstallationCap, u32> {
         self.calls.push("reserve");
@@ -88,6 +101,7 @@ fn publication_transfers_exact_owners_only_after_both_maps_ack() {
         io.calls,
         [
             "acquire",
+            "initialize",
             "map-frame",
             "reserve",
             "copy",
@@ -192,6 +206,9 @@ impl CleanupRefusal<'_> {
     }
 }
 impl PrivatePageInstallationIo<u64> for CleanupRefusal<'_> {
+    fn initialize_frame(&mut self, descriptor: &u64, frame: InstallationCap) -> InstallationEffect {
+        self.inner.initialize_frame(descriptor, frame)
+    }
     fn acquire_frame(&mut self, descriptor: &u64) -> Result<InstallationCap, u32> {
         self.inner.acquire_frame(descriptor)
     }
@@ -258,7 +275,7 @@ fn private_stack_page_needs_no_optional_root_alias() {
     let mut io = Io::default();
     owner.begin(42, false).unwrap();
     assert_eq!(owner.advance(&mut io), PrivatePageInstallOutcome::Published);
-    assert_eq!(io.calls, ["acquire", "map-frame", "publish"]);
+    assert_eq!(io.calls, ["acquire", "initialize", "map-frame", "publish"]);
     assert_eq!(io.publication.unwrap().alias, None);
 }
 
@@ -285,4 +302,54 @@ fn uncertain_cleanup_never_recycles_or_releases_retained_backing() {
         PrivatePageInstallOutcome::Quarantined(FAIL)
     );
     assert_eq!(io.calls.len(), calls);
+}
+
+#[test]
+fn initializer_ack_precedes_user_map_and_publishes_initialized_bytes() {
+    let mut owner = PrivatePageInstallation::new();
+    let mut io = Io::default();
+    owner.begin(42, false).unwrap();
+    assert_eq!(owner.advance(&mut io), PrivatePageInstallOutcome::Published);
+    assert_eq!(io.calls, ["acquire", "initialize", "map-frame", "publish"]);
+    assert_eq!(&io.frame_bytes, b"canonical-image!");
+}
+
+#[test]
+fn initializer_refusal_cleans_unmapped_frame_without_user_publication() {
+    let mut owner = PrivatePageInstallation::new();
+    let mut io = Io {
+        refuse: Some("initialize"),
+        ..Default::default()
+    };
+    owner.begin(42, true).unwrap();
+    assert_eq!(
+        owner.advance(&mut io),
+        PrivatePageInstallOutcome::Failed(FAIL)
+    );
+    assert_eq!(io.calls, ["acquire", "initialize", "release"]);
+    assert!(io.publication.is_none());
+    assert!(owner.is_idle());
+}
+
+#[test]
+fn uncertain_initializer_keeps_backing_without_map_recycle_or_replay() {
+    let mut owner = PrivatePageInstallation::new();
+    let mut io = Io {
+        uncertain: Some("initialize"),
+        ..Default::default()
+    };
+    owner.begin(42, true).unwrap();
+    assert_eq!(
+        owner.advance(&mut io),
+        PrivatePageInstallOutcome::Quarantined(FAIL)
+    );
+    assert_eq!(io.calls, ["acquire", "initialize"]);
+    assert!(owner.owns_cap(FRAME.cap));
+    assert_eq!(owner.begin(43, false), Err(INVALID));
+    assert_eq!(
+        owner.advance(&mut io),
+        PrivatePageInstallOutcome::Quarantined(FAIL)
+    );
+    assert_eq!(io.calls, ["acquire", "initialize"]);
+    assert!(io.publication.is_none());
 }

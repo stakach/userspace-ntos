@@ -21,6 +21,7 @@ pub mod native_output;
 pub mod commitment;
 pub mod protection;
 pub mod query;
+pub mod image_view_placement;
 pub mod scratch;
 
 use alloc::collections::BTreeMap;

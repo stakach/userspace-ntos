@@ -7,6 +7,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::SectionFileIdentity;
 
+#[path = "image_section/mapped_view.rs"]
+mod mapped_view;
+pub use mapped_view::{ImageMappedView, ImageMappedViewPhase, ImageMappedViewRetirement};
+
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,6 +142,7 @@ pub struct ImageSectionTable {
     generation: u64,
     areas: Vec<Option<Area>>,
     references: Vec<Option<Reference>>,
+    mapped_views: Vec<mapped_view::ManagedView>,
 }
 
 impl Default for ImageSectionTable {
@@ -153,6 +158,7 @@ impl ImageSectionTable {
             generation: 0,
             areas: Vec::new(),
             references: Vec::new(),
+            mapped_views: Vec::new(),
         }
     }
 
@@ -364,6 +370,9 @@ impl ImageSectionTable {
     /// The backend must already have acknowledged complete view teardown, including private COW
     /// frames and shared aliases. A failed/partial unmap must keep this reference alive.
     pub fn release_view(&mut self, view: ImageViewRef) -> Result<(), ImageSectionError> {
+        if self.mapped_view(view).is_some() {
+            return Err(ImageSectionError::InvalidReference);
+        }
         let index = self.reference_index(view.area, view.generation, ReferenceKind::View)?;
         self.references[index] = None;
         Ok(())
