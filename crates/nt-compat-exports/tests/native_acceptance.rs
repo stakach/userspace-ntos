@@ -22,6 +22,8 @@ mod image_process_bridge;
 mod named_data_sections;
 #[path = "native_acceptance/directory_security.rs"]
 mod directory_security;
+#[path = "native_acceptance/thread_construction_failure.rs"]
+mod thread_construction_failure;
 #[path = "native_acceptance/immediate_iosb_publication.rs"]
 mod immediate_iosb_publication;
 #[path = "native_acceptance/loaded_image_lifetime.rs"]

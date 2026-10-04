@@ -25625,28 +25625,33 @@ unsafe fn spawn_hosted_thread_mechanism(
     let mut memory_progress = MemoryConstructionProgress::empty();
     let mut retained_teb_alias = 0;
     macro_rules! failed {
-        () => {
+        ($phase:expr, $error:expr, $target:expr) => {{
+            record_hosted_thread_construction_failure(&binding, $phase, $error, $target);
             Err(HostedThreadSpawnFailure::Retained(RetainedHostedThreadConstruction {
                 binding, resources, construction, memory_progress, teb_alias: retained_teb_alias,
             }))
-        };
+        }};
     }
     macro_rules! memory_cap {
-        ($operation:expr) => {{
+        ($phase:expr, $operation:expr, $target:expr) => {{
             let (cap, error) = $operation;
             if error != 0 || cap <= 1 {
                 if cap > 1 {
                     memory_progress.retain_empty_slot(cap)
                         .expect("construction stops at its first failed memory slot");
                 }
-                return failed!();
+                return failed!($phase, if cap <= 1 {
+                    ThreadConstructionError::Admission("no-slot")
+                } else {
+                    ThreadConstructionError::Native(error)
+                }, $target);
             }
             cap
         }};
     }
     let scr = t.scr;
     if !ensure_hosted_thread_exec_alias_paging(t, scr) {
-        return failed!();
+        return failed!(b"executive-alias-paging", ThreadConstructionError::Admission("paging-refused"), scr);
     }
     // Stack, mapped into the target VSpace AND (optionally) mirrored into the executive for a
     // rendezvous's out-param copyout. GUI-client stacks must also be discoverable by win32k's
@@ -25654,15 +25659,15 @@ unsafe fn spawn_hosted_thread_mechanism(
     // faults in win32k and is incorrectly backed by a fresh unrelated page.
     for i in 0..resources.stack_frames() {
         let index = i as usize;
-        let f = memory_cap!(alloc_frame_r());
+        let f = memory_cap!(b"stack-frame", alloc_frame_r(), resources.stack_base() + i * 0x1000);
         resources.stack_owner[index] = f;
         let page = resources.stack_base() + i * 0x1000;
-        let target_cap = memory_cap!(copy_thread_construction_cap(f));
+        let target_cap = memory_cap!(b"stack-target-cap", copy_thread_construction_cap(f), page);
         resources.stack_target[index] = target_cap;
         let target_map = page_map_r(target_cap, page, RW_NX, t.pml4);
         let mut mirror_map = 0;
         if t.stack_mirror_va != 0 {
-            let mirror_cap = memory_cap!(copy_thread_construction_cap(f));
+            let mirror_cap = memory_cap!(b"stack-mirror-cap", copy_thread_construction_cap(f), t.stack_mirror_va + i * 0x1000);
             resources.stack_mirror[index] = mirror_cap;
             mirror_map = page_map_r(
                 mirror_cap,
@@ -25690,23 +25695,29 @@ unsafe fn spawn_hosted_thread_mechanism(
             print_str(b" registered=");
             print_u64(registered as u64);
             print_str(b"\n");
-            return failed!();
+            if target_map != 0 {
+                return failed!(b"stack-target-map", ThreadConstructionError::Native(target_map), page);
+            }
+            if mirror_map != 0 {
+                return failed!(b"stack-mirror-map", ThreadConstructionError::Native(mirror_map), t.stack_mirror_va + i * 0x1000);
+            }
+            return failed!(b"stack-register", ThreadConstructionError::Admission("registry-refused"), page);
         }
     }
     // TEB page 1: self@0x30, ClientId@0x40/0x48, PEB@0x60 (shared), StackBase@0x08/StackLimit@0x10,
     // ActivationContextStackPointer@0x2C8 points to the private ACS page after both TEB pages.
-    let teb = memory_cap!(alloc_frame_r());
+    let teb = memory_cap!(b"teb-frame", alloc_frame_r(), t.teb_va);
     resources.teb_owner = teb;
-    let teb_client = memory_cap!(copy_thread_construction_cap(teb));
+    let teb_client = memory_cap!(b"teb-target-cap", copy_thread_construction_cap(teb), t.teb_va);
     resources.teb_target = teb_client;
-    let teb_scratch = memory_cap!(copy_thread_construction_cap(teb));
+    let teb_scratch = memory_cap!(b"teb-scratch-cap", copy_thread_construction_cap(teb), scr);
     resources.teb_scratch = teb_scratch;
     let teb_live_alias = if t.client_pi != 0 && t.stack_mirror_va != 0 {
         t.stack_mirror_va + t.stack_frames * 0x1000
     } else {
         0
     };
-    let teb_live_mirror = if teb_live_alias != 0 { memory_cap!(copy_thread_construction_cap(teb)) } else { 0 };
+    let teb_live_mirror = if teb_live_alias != 0 { memory_cap!(b"teb-mirror-cap", copy_thread_construction_cap(teb), teb_live_alias) } else { 0 };
     resources.teb_local_mirror = teb_live_mirror;
     let teb_target_map = page_map_r(teb_client, t.teb_va, RW_NX, t.pml4);
     let teb_scratch_map = page_map_r(teb_scratch, scr, RW_NX, CAP_INIT_THREAD_VSPACE);
@@ -25728,7 +25739,13 @@ unsafe fn spawn_hosted_thread_mechanism(
         print_str(b"/");
         print_u64(teb_live_map);
         print_str(b"\n");
-        return failed!();
+        if teb_target_map != 0 {
+            return failed!(b"teb-target-map", ThreadConstructionError::Native(teb_target_map), t.teb_va);
+        }
+        if teb_scratch_map != 0 {
+            return failed!(b"teb-scratch-map", ThreadConstructionError::Native(teb_scratch_map), scr);
+        }
+        return failed!(b"teb-mirror-map", ThreadConstructionError::Native(teb_live_map), teb_live_alias);
     }
     {
         let registered = csrss_frame_put_at_cap_source_backing(
@@ -25753,7 +25770,7 @@ unsafe fn spawn_hosted_thread_mechanism(
             print_hex((t.teb_va >> 32) as u32);
             print_hex(t.teb_va as u32);
             print_str(b"\n");
-            return failed!();
+            return failed!(b"teb-register", ThreadConstructionError::Admission("registry-refused"), t.teb_va);
         }
     }
     core::ptr::write_volatile((scr + 0x30) as *mut u64, t.teb_va);
@@ -25784,18 +25801,18 @@ unsafe fn spawn_hosted_thread_mechanism(
     let acs_va = t.teb_va + 0x2000;
     core::ptr::write_volatile((scr + 0x2c8) as *mut u64, acs_va);
     // TEB page 2: StaticUnicodeString (MaximumLength=522, Buffer in TEB) + DeallocationStack.
-    let teb2 = memory_cap!(alloc_frame_r());
+    let teb2 = memory_cap!(b"teb-tail-frame", alloc_frame_r(), t.teb_va + 0x1000);
     resources.teb2_owner = teb2;
-    let teb2_client = memory_cap!(copy_thread_construction_cap(teb2));
+    let teb2_client = memory_cap!(b"teb-tail-target-cap", copy_thread_construction_cap(teb2), t.teb_va + 0x1000);
     resources.teb2_target = teb2_client;
-    let teb2_scratch = memory_cap!(copy_thread_construction_cap(teb2));
+    let teb2_scratch = memory_cap!(b"teb-tail-scratch-cap", copy_thread_construction_cap(teb2), scr + 0x1000);
     resources.teb2_scratch = teb2_scratch;
     let teb2_live_alias = if t.client_pi != 0 && t.stack_mirror_va != 0 {
         t.stack_mirror_va + (t.stack_frames + 1) * 0x1000
     } else {
         0
     };
-    let teb2_live_mirror = if teb2_live_alias != 0 { memory_cap!(copy_thread_construction_cap(teb2)) } else { 0 };
+    let teb2_live_mirror = if teb2_live_alias != 0 { memory_cap!(b"teb-tail-mirror-cap", copy_thread_construction_cap(teb2), teb2_live_alias) } else { 0 };
     resources.teb2_local_mirror = teb2_live_mirror;
     let teb2_target_map = page_map_r(teb2_client, t.teb_va + 0x1000, RW_NX, t.pml4);
     let teb2_scratch_map = page_map_r(teb2_scratch, scr + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
@@ -25817,7 +25834,13 @@ unsafe fn spawn_hosted_thread_mechanism(
         print_str(b"/");
         print_u64(teb2_live_map);
         print_str(b"\n");
-        return failed!();
+        if teb2_target_map != 0 {
+            return failed!(b"teb-tail-target-map", ThreadConstructionError::Native(teb2_target_map), t.teb_va + 0x1000);
+        }
+        if teb2_scratch_map != 0 {
+            return failed!(b"teb-tail-scratch-map", ThreadConstructionError::Native(teb2_scratch_map), scr + 0x1000);
+        }
+        return failed!(b"teb-tail-mirror-map", ThreadConstructionError::Native(teb2_live_map), teb2_live_alias);
     }
     if teb_live_alias != 0 && teb_live_map == 0 && teb2_live_map == 0 {
         retained_teb_alias = teb_live_alias;
@@ -25848,17 +25871,17 @@ unsafe fn spawn_hosted_thread_mechanism(
             print_hex((page >> 32) as u32);
             print_hex(page as u32);
             print_str(b"\n");
-            return failed!();
+            return failed!(b"teb-tail-register", ThreadConstructionError::Admission("registry-refused"), t.teb_va + 0x1000);
         }
     }
     // The private ACS page is initialized only after scratch and target mappings are checked.
     // Deliberately NOT `csrss_frame_put`-registered — win32k has no business with a
     // thread's activation-context stack, and not registering it means a win32k fault at that VA can
     // never be answered with this page.
-    let acs_frame = memory_cap!(alloc_frame_r());
+    let acs_frame = memory_cap!(b"activation-frame", alloc_frame_r(), acs_va);
     resources.acs_owner = acs_frame;
     let acs_scratch_map = page_map_r(acs_frame, scr + 0x4000, RW_NX, CAP_INIT_THREAD_VSPACE);
-    let acs_target_cap = memory_cap!(copy_thread_construction_cap(acs_frame));
+    let acs_target_cap = memory_cap!(b"activation-target-cap", copy_thread_construction_cap(acs_frame), acs_va);
     resources.acs_target = acs_target_cap;
     let acs_target_map = page_map_r(acs_target_cap, acs_va, RW_NX, t.pml4);
     if acs_scratch_map != 0 || acs_target_map != 0 {
@@ -25867,7 +25890,10 @@ unsafe fn spawn_hosted_thread_mechanism(
         print_str(b"/");
         print_u64(acs_target_map);
         print_str(b"\n");
-        return failed!();
+        if acs_scratch_map != 0 {
+            return failed!(b"activation-scratch-map", ThreadConstructionError::Native(acs_scratch_map), scr + 0x4000);
+        }
+        return failed!(b"activation-target-map", ThreadConstructionError::Native(acs_target_map), acs_va);
     }
     let acs = scr + 0x4000;
     core::ptr::write_volatile((acs + 0x00) as *mut u64, 0);
@@ -25881,24 +25907,24 @@ unsafe fn spawn_hosted_thread_mechanism(
     seed_teb_tail_canary(scr + 0x1000);
     // Every hosted thread gets a distinct IPC frame. Native ntdll derives `ipcbuf_va` from the
     // active TEB; trap threads use the same binding directly through the kernel fault transport.
-    let ipcbuf = memory_cap!(alloc_frame_r());
+    let ipcbuf = memory_cap!(b"ipc-frame", alloc_frame_r(), t.ipcbuf_va);
     resources.ipc_owner = ipcbuf;
     let e_ipc_target_map = page_map_r(ipcbuf, t.ipcbuf_va, RW_NX, t.pml4);
     if e_ipc_target_map != 0 {
         print_str(b"[thread-life] IPC buffer map failure status=");
         print_u64(e_ipc_target_map);
         print_str(b"\n");
-        return failed!();
+        return failed!(b"ipc-target-map", ThreadConstructionError::Native(e_ipc_target_map), t.ipcbuf_va);
     }
     // User entry restores the captured context; internal entry calls a constructor function.
-    let tramp = memory_cap!(alloc_frame_r());
+    let tramp = memory_cap!(b"trampoline-frame", alloc_frame_r(), t.tramp_va);
     resources.tramp_owner = tramp;
     let e_tramp_exec_map = page_map_r(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
     if e_tramp_exec_map != 0 {
         print_str(b"[thread-life] trampoline executive map failure status=");
         print_u64(e_tramp_exec_map);
         print_str(b"\n");
-        return failed!();
+        return failed!(b"trampoline-scratch-map", ThreadConstructionError::Native(e_tramp_exec_map), scr + 0x2000);
     }
     if let Some(context) = t.user_context {
         const CONTEXT_OFFSET: u64 = 0x1900;
@@ -25906,18 +25932,20 @@ unsafe fn spawn_hosted_thread_mechanism(
         let context_scratch = scr + CONTEXT_OFFSET;
         let context_target = t.teb_va + CONTEXT_OFFSET;
         if context.initial_context.startup_projection() != context.start {
-            return failed!();
+            return failed!(b"context-projection", ThreadConstructionError::Admission("projection-mismatch"), context_target);
         }
         for (j, &byte) in context.initial_context.as_bytes().iter().enumerate() {
             core::ptr::write_volatile((context_scratch + j as u64) as *mut u8, byte);
         }
         if let Some(loader_va) = context.loader_va {
-            let Some(nt_continue_va) = context.nt_continue_va else { return failed!(); };
+            let Some(nt_continue_va) = context.nt_continue_va else {
+                return failed!(b"loader-continuation", ThreadConstructionError::Admission("missing-continuation"), loader_va);
+            };
             let tb = match nt_thread_start::amd64_context::initial_context_trampoline(
                 context_target, nt_continue_va, Some((loader_va, NTDLL_BASE)),
             ) {
                 Ok(tb) => tb,
-                Err(_) => return failed!(),
+                Err(error) => return failed!(b"context-trampoline", ThreadConstructionError::Codec(error), context_target),
             };
             for (j, &byte) in tb.as_bytes().iter().enumerate() {
                 core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, byte);
@@ -25938,14 +25966,14 @@ unsafe fn spawn_hosted_thread_mechanism(
             core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
         }
     }
-    let tramp_tgt_cap = memory_cap!(copy_thread_construction_cap(tramp));
+    let tramp_tgt_cap = memory_cap!(b"trampoline-target-cap", copy_thread_construction_cap(tramp), t.tramp_va);
     resources.tramp_target = tramp_tgt_cap;
     let e_tramp_tgt_map = page_map_r(tramp_tgt_cap, t.tramp_va, /* RX */ 2, t.pml4);
     if e_tramp_tgt_map != 0 {
         print_str(b"[thread-life] trampoline target map failure status=");
         print_u64(e_tramp_tgt_map);
         print_str(b"\n");
-        return failed!();
+        return failed!(b"trampoline-target-map", ThreadConstructionError::Native(e_tramp_tgt_map), t.tramp_va);
     }
     if t.diag {
         // Observe the already-owned executive mapping; diagnostics must not create untracked aliases.
@@ -25961,30 +25989,38 @@ unsafe fn spawn_hosted_thread_mechanism(
     }
     // CNode (PML4 + the dedicated fault EP) + TCB.
     let Some(raw) = try_alloc_slot() else {
-        return failed!();
+        return failed!(b"raw-cnode-slot", ThreadConstructionError::Admission("no-slot"), 0);
     };
     construction.adopt_empty(Role::RawCnode, raw).expect("new raw CNode slot");
     let e_cn = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
     if e_cn != 0 {
-        return failed!();
+        return failed!(b"raw-cnode-retype", ThreadConstructionError::Native(e_cn), raw);
     }
     construction.acknowledge_object(Role::RawCnode, raw).expect("retyped raw CNode");
     let Some(cnode) = try_alloc_slot() else {
-        return failed!();
+        return failed!(b"guarded-cnode-slot", ThreadConstructionError::Admission("no-slot"), 0);
     };
     construction.adopt_empty(Role::GuardedCnode, cnode).expect("new guarded CNode slot");
     let e_cnode_mint = cnode_mint_r(CAP_INIT_THREAD_CNODE, cnode, raw, CN_GUARD_BADGE);
     if e_cnode_mint != 0 {
-        return failed!();
+        return failed!(b"guarded-cnode-mint", ThreadConstructionError::Native(e_cnode_mint), cnode);
     }
     construction.acknowledge_object(Role::GuardedCnode, cnode).expect("minted guarded CNode");
     let e_cnode_pml4 = cnode_copy_at_r(cnode, CT_PML4, t.pml4);
     let e_cnode_fault = install_hosted_thread_endpoint(t.fault_ep, cnode);
-    if e_cnode_pml4 != 0 || e_cnode_fault.is_err() {
-        return failed!();
+    if e_cnode_pml4 != 0 {
+        return failed!(b"cnode-vspace-copy", ThreadConstructionError::Native(e_cnode_pml4), cnode);
+    }
+    if let Err(error) = e_cnode_fault {
+        let error = match error {
+            nt_user_host::thread_endpoint::EndpointInstallError::Backend(error) => ThreadConstructionError::Native(error),
+            nt_user_host::thread_endpoint::EndpointInstallError::InvalidSource => ThreadConstructionError::Admission("invalid-endpoint-source"),
+            nt_user_host::thread_endpoint::EndpointInstallError::InvalidBadge => ThreadConstructionError::Admission("invalid-endpoint-badge"),
+        };
+        return failed!(b"cnode-fault-endpoint", error, cnode);
     }
     let Some(tcb) = try_alloc_slot() else {
-        return failed!();
+        return failed!(b"tcb-slot", ThreadConstructionError::Admission("no-slot"), 0);
     };
     construction.adopt_empty(Role::Tcb, tcb).expect("new TCB slot");
     let new_sp = match t.user_context {
@@ -25992,40 +26028,44 @@ unsafe fn spawn_hosted_thread_mechanism(
         None => t.stack_base + t.stack_frames * 0x1000 - 16,
     };
     let e_tcb = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
-    if e_tcb != 0 { return failed!(); }
+    if e_tcb != 0 { return failed!(b"tcb-retype", ThreadConstructionError::Native(e_tcb), tcb); }
     construction.acknowledge_object(Role::Tcb, tcb).expect("retyped TCB");
     let e_space = tcb_set_space_r(tcb, CT_FAULT, cnode, t.pml4);
-    if e_space != 0 { return failed!(); }
+    if e_space != 0 { return failed!(b"tcb-set-space", ThreadConstructionError::Native(e_space), tcb); }
     let e_ipc = tcb_set_ipc_buffer_r(tcb, t.ipcbuf_va, ipcbuf);
-    if e_ipc != 0 { return failed!(); }
+    if e_ipc != 0 { return failed!(b"tcb-set-ipc", ThreadConstructionError::Native(e_ipc), t.ipcbuf_va); }
     let e_regs = if let Some(context) = t.user_context {
         let initial = if context.loader_va.is_some() {
             match context.initial_context.prepare_loader_entry(
                 t.tramp_va, new_sp, exec_handler::HIGHEST_USER_ADDRESS,
             ) {
                 Ok(initial) => initial,
-                Err(_) => return failed!(),
+                Err(error) => return failed!(b"loader-entry-context", ThreadConstructionError::Codec(error), new_sp),
             }
         } else {
             context.initial_context.prepare_direct_install()
         };
-        if thread_context::write(tcb, &initial, false).is_err() { return failed!(); }
+        if let Err(error) = thread_context::write(tcb, &initial, false) {
+            return failed!(b"tcb-write-context", ThreadConstructionError::Native(error), tcb);
+        }
         0
     } else {
         tcb_write_registers_r(tcb, t.tramp_va, new_sp, 0)
     };
-    if e_regs != 0 { return failed!(); }
-    if tcb_set_gs_base_r(tcb, t.teb_va) != 0 {
-        return failed!();
+    if e_regs != 0 { return failed!(b"tcb-write-registers", ThreadConstructionError::Native(e_regs), tcb); }
+    let e_gs = tcb_set_gs_base_r(tcb, t.teb_va);
+    if e_gs != 0 {
+        return failed!(b"tcb-set-gs", ThreadConstructionError::Native(e_gs), t.teb_va);
     }
-    if tcb_set_priority_r(
+    let e_priority = tcb_set_priority_r(
         tcb,
         if t.prio != 0 {
             t.prio as u64
         } else {
             HOSTED_USER_THREAD_PRIORITY as u64
         },
-    ) != 0 { return failed!(); }
+    );
+    if e_priority != 0 { return failed!(b"tcb-set-priority", ThreadConstructionError::Native(e_priority), tcb); }
     if t.diag {
         print_str(b"[spawn-diag] tcb=0x");
         print_hex(tcb as u32);
@@ -26060,7 +26100,8 @@ unsafe fn spawn_hosted_thread_mechanism(
     // still dispatches natively (MR0=SSN), while raw ReactOS DLL syscall stubs fault to the executive
     // instead of colliding with seL4 syscall numbers such as `GWLP_WNDPROC=-4`.
     let _native_transport = t.native;
-    if tcb_set_hosted_syscalls_r(tcb) != 0 { return failed!(); }
+    let e_syscalls = tcb_set_hosted_syscalls_r(tcb);
+    if e_syscalls != 0 { return failed!(b"tcb-hosted-syscalls", ThreadConstructionError::Native(e_syscalls), tcb); }
     let sched_context = match attach_sched_context(tcb) {
         Ok(sc) => sc,
         Err(e_sc) => {
@@ -26069,7 +26110,11 @@ unsafe fn spawn_hosted_thread_mechanism(
             print_str(b" error=");
             print_u64(e_sc);
             print_str(b"\n");
-            return failed!();
+            return failed!(b"tcb-scheduling-context", if e_sc == u64::MAX {
+                ThreadConstructionError::Admission("scheduler-construction-refused")
+            } else {
+                ThreadConstructionError::Native(e_sc)
+            }, tcb);
         }
     };
     construction.adopt_object(Role::SchedContext, sched_context).expect("attached SC owner");
