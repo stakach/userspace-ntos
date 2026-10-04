@@ -3,6 +3,25 @@ use nt_status::NtStatus;
 use nt_types::AccessMode;
 
 #[test]
+fn named_object_attribute_policy_applies_the_registered_type_invalid_mask() {
+    use nt_object_manager::directory::admit_named_object_attributes;
+    for mode in [AccessMode::UserMode, AccessMode::KernelMode] {
+        assert_eq!(admit_named_object_attributes(0x100, mode, 0), Ok(0x100));
+        assert_eq!(admit_named_object_attributes(0x100, mode, 0x100), Err(NtStatus::INVALID_PARAMETER));
+        assert_eq!(admit_named_object_attributes(0x40, mode, 0x40), Err(NtStatus::INVALID_PARAMETER));
+        assert_eq!(admit_named_object_attributes(0x8000_0020, mode, 0), Err(NtStatus::INVALID_PARAMETER));
+    }
+}
+
+#[test]
+fn shared_named_policy_preserves_normalization_and_exclusivity_refusal() {
+    use nt_object_manager::directory::admit_named_object_attributes;
+    assert_eq!(admit_named_object_attributes(0x10240, AccessMode::UserMode, 0x100), Ok(0x40));
+    assert_eq!(admit_named_object_attributes(0x10000, AccessMode::KernelMode, 0x100), Err(NtStatus::NOT_SUPPORTED));
+    assert_eq!(admit_named_object_attributes(0x22, AccessMode::KernelMode, 0), Err(NtStatus::INVALID_PARAMETER));
+}
+
+#[test]
 fn ordinary_attributes_are_preserved_without_inventing_privilege_authority() {
     for mode in [AccessMode::UserMode, AccessMode::KernelMode] {
         for attributes in [0, 0x2, 0x10, 0x40, 0x80, 0x400, 0x4d2] {

@@ -25,10 +25,19 @@ pub fn admit_directory_object_attributes(
     attributes: u32,
     mode: AccessMode,
 ) -> Result<u32, NtStatus> {
+    admit_named_object_attributes(attributes, mode, 0x100)
+}
+
+/// Validate common Object Manager attributes against the registered type's invalid mask.
+pub fn admit_named_object_attributes(
+    attributes: u32,
+    mode: AccessMode,
+    invalid_type_attributes: u32,
+) -> Result<u32, NtStatus> {
     const VALID_ATTRIBUTES: u32 = 0x7f2;
     const KERNEL_EXCLUSIVE: u32 = 0x10000;
     if attributes & !(VALID_ATTRIBUTES | KERNEL_EXCLUSIVE) != 0
-        || attributes & 0x100 != 0
+        || attributes & invalid_type_attributes != 0
         || attributes & 0x22 == 0x22
     {
         return Err(NtStatus::INVALID_PARAMETER);
