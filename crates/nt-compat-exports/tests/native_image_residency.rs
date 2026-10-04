@@ -56,7 +56,7 @@ fn residency_calls(file: &syn::File) -> Vec<String> {
             .args
             .iter()
             .take(5)
-            .zip(["handler", "view", "page", "access", "fault_observed"])
+            .zip(["handler", "view", "page", "access", "observation"])
     {
         assert!(
             matches!(argument, syn::Expr::Path(path) if path.path.is_ident(expected)),
@@ -221,7 +221,14 @@ fn residency_failure_diagnostic_runs_after_inner_borrow_ends() {
         };
         let mut calls = Calls::default();
         calls.visit_block(&branch.then_branch);
-        matches!(&*branch.cond, syn::Expr::Path(path) if path.path.is_ident("fault_observed"))
+        matches!(&*branch.cond, syn::Expr::Binary(condition)
+            if matches!(condition.op, syn::BinOp::Ne(_))
+            && matches!(&*condition.left, syn::Expr::Path(path)
+                if path.path.is_ident("observation"))
+            && matches!(&*condition.right, syn::Expr::Path(path)
+                if path.path.segments.len() == 2
+                && path.path.segments[0].ident == "ImageFaultObservation"
+                && path.path.segments[1].ident == "CopyAccess"))
             && calls
                 .0
                 .iter()

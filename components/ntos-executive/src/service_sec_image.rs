@@ -10454,7 +10454,7 @@ pub(crate) unsafe fn service_sec_image(
                 }
             }
             match nt_handler.service_native_image_page_residency(
-                pi, page, vm_fault_access_from_x86_error(m3), true,
+                pi, page, vm_fault_access_from_x86_error(m3), nt_address_space::ImageFaultObservation::from_x86_error(m3),
             ) {
                 Ok(Some(())) => {
                     note_boot_progress(BootProgress::PageMappingPublished);

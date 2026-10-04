@@ -3,6 +3,7 @@
 use super::*;
 use crate::native_image_sections::NativeImageSectionId;
 use nt_memory_manager::image_section::{ImageMappedViewPhase, ImageViewRef};
+use nt_address_space::ImageFaultObservation;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct NativeImageViewDescriptor {
@@ -51,11 +52,11 @@ impl ExecNtHandler {
 
     pub(crate) unsafe fn service_native_image_page_residency(
         &mut self, pi: usize, page: u64, access: nt_address_space::FaultAccess,
-        fault_observed: bool,
+        observation: ImageFaultObservation,
     ) -> Result<Option<()>, u32> {
         let Some(view) = self.native_image_view_for_page(pi, page)? else { return Ok(None); };
         crate::native_image_residency::service_native_image_page_residency(
-            self, view, page, access, fault_observed,
+            self, view, page, access, observation,
         )?;
         Ok(Some(()))
     }

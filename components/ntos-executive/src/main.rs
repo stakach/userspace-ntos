@@ -27436,6 +27436,28 @@ unsafe fn get_frame_paddr(frame_cap: u64) -> u64 {
     paddr
 }
 
+/// Unlike the diagnostic query, retain and validate GetAddress's reply label and length.
+unsafe fn get_frame_paddr_checked(frame_cap: u64) -> Result<u64, u32> {
+    let reply: u64;
+    let paddr: u64;
+    core::arch::asm!(
+        "syscall",
+        in("rdx") SYS_CALL as u64,
+        inout("rdi") frame_cap => _,
+        inout("rsi") (LBL_X86_PAGE_GET_ADDRESS << 12) => reply,
+        out("r10") paddr,
+        in("r12") 0u64,
+        in("r13") 0u64,
+        lateout("r8") _, lateout("r9") _, lateout("r15") _,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    if reply >> 12 != 0 || reply & 0x7f != 1 {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    Ok(paddr)
+}
+
 /// DISK-I/O CENSUS. The AHCI path is the executive's hottest emulated device path — every PE
 /// image, hive and directory scan flows through it — and under TCG a port round-trip costs orders
 /// of magnitude more than the RAM work around it. These counters turn that into a MEASUREMENT.

@@ -885,6 +885,9 @@ pub(crate) fn hosted_thread_memory_access(pi: u64, base: u64, size: u64) -> Resu
 /// and live scratch aliases. Ordinary reads, mappings and writes use the stricter entry above.
 pub(crate) fn hosted_thread_memory_retirement_access(pi: u64, base: u64, size: u64) -> Result<(), u32> {
     use nt_user_host::thread_memory_access::{check_pending_thread_memory, PendingThreadMemory};
+    if !crate::native_image_residency::memory_available(pi, base, size) {
+        return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
+    }
     if !crate::transition_page_restoration::memory_available(pi, base, size) {
         return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
     }

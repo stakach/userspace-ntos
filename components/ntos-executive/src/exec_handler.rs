@@ -17606,7 +17606,7 @@ impl ExecNtHandler {
                 }
             }
             nt_address_space::VmResidencySource::Image => {
-                if self.service_native_image_page_residency(target_pi, plan.page, plan.access, false)?.is_some() {
+                if self.service_native_image_page_residency(target_pi, plan.page, plan.access, nt_address_space::ImageFaultObservation::CopyAccess)?.is_some() {
                     return Ok(());
                 }
                 let image = process_committed_image_allocation(target_pi as u64, plan.page)

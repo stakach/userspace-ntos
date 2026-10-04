@@ -3,7 +3,7 @@
 use super::*;
 use core::fmt::Write;
 use exec_handler::native_image_view::NativeImageViewDescriptor;
-use nt_address_space::FaultAccess;
+use nt_address_space::{FaultAccess, ImageFaultObservation};
 use nt_memory_manager::borrowed_page_installation::{
     BorrowedPageInstallOutcome, BorrowedPageInstallation, BorrowedPageInstallationIo,
 };
@@ -12,6 +12,9 @@ use nt_memory_manager::image_source_page::{
     ImageSourcePage, ImageSourcePageIo, ImageSourcePageOutcome,
 };
 use nt_memory_manager::private_page_installation::{InstallationCap, InstallationEffect};
+use nt_memory_manager::resident_mapping_revalidation::{
+    ResidentMappingRevalidation, ResidentMappingRevalidationIo, ResidentMappingRevalidationOutcome,
+};
 
 const RESOURCES: u32 = nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
 const INVALID: u32 = nt_address_space::STATUS_INVALID_PARAMETER;
@@ -36,6 +39,12 @@ struct SourceRow {
 static mut SOURCES: Vec<SourceRow> = Vec::new();
 static mut INSTALL: Option<BorrowedPageInstallation<ViewPage>> = None;
 static mut COW_SOURCE: Option<(ViewPage, u64)> = None;
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ResidentPage {
+    target: ViewPage,
+    record: nt_memory_manager::ClientFrameRecord,
+}
+static mut REVALIDATION: Option<ResidentMappingRevalidation<ResidentPage>> = None;
 static BORROWED: AtomicBool = AtomicBool::new(false);
 struct Borrow;
 impl Borrow {
@@ -318,16 +327,180 @@ pub(crate) unsafe fn service_native_image_page_residency(
     view: NativeImageViewDescriptor,
     page: u64,
     access: FaultAccess,
-    fault_observed: bool,
+    observation: ImageFaultObservation,
 ) -> Result<(), u32> {
     let mut stage = "borrow";
-    let result = service_page_residency(handler, view, page, access, fault_observed, &mut stage);
+    let result = service_page_residency(handler, view, page, access, observation, &mut stage);
     if let Err(status) = result {
-        if fault_observed {
-            trace_image_fault_failure(handler, view, page, access, stage, status);
+        if observation != ImageFaultObservation::CopyAccess {
+            trace_image_fault_failure(handler, view, page, access, observation, stage, status);
         }
     }
     result
+}
+
+unsafe fn ready_source_frame(view: NativeImageViewDescriptor, rva: u32) -> Result<u64, u32> {
+    (&*core::ptr::addr_of!(SOURCES))
+        .iter()
+        .find(|row| {
+            row.owner.descriptor()
+                == SourceKey {
+                    area: view.view.area(),
+                    rva,
+                }
+        })
+        .filter(|row| !row.retiring && !row.revoke_acked)
+        .and_then(|row| row.owner.ready_frame())
+        .map(|frame| frame.cap)
+        .ok_or(INVALID)
+}
+
+struct ResidentIo<'a> {
+    handler: &'a ExecNtHandler,
+    rva: u32,
+}
+impl ResidentMappingRevalidationIo<ResidentPage> for ResidentIo<'_> {
+    fn validate_current(
+        &mut self,
+        resident: &ResidentPage,
+        mapped: InstallationCap,
+        backing: InstallationCap,
+    ) -> Result<(), u32> {
+        let target = resident.target;
+        let record = resident.record;
+        if !current(self.handler, target.view, target.page)
+            || !record.is_resident()
+            || record.lifetime != nt_memory_manager::MemoryLifetime::Process(target.view.process)
+            || mapped.cap != record.frame
+            || unsafe {
+                (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY))
+                    .get(target.view.pi as u64, target.page)
+            } != Some(record)
+        {
+            return Err(INVALID);
+        }
+        let info = unsafe {
+            process_committed_mapping_basic_information(target.view.pi as u64, target.page)
+        }
+        .ok_or(INVALID)?;
+        let map_protection = if record.owns_frame {
+            nt_address_space::private_backing_protection(info.protect)
+        } else {
+            nt_address_space::image_view_fault_plan(info.protect, false).map_protection
+        };
+        if info.allocation_base != target.view.base
+            || info.type_ != nt_address_space::MEM_IMAGE
+            || info.state != nt_address_space::MEM_COMMIT
+            || map_protection != target.protection
+        {
+            return Err(INVALID);
+        }
+        let exact_backing = if record.owns_frame {
+            unsafe {
+                frame_recycle::validate_owned_backing(record.owned_backing_cap)?;
+            }
+            record.owned_backing_cap
+        } else {
+            unsafe { ready_source_frame(target.view, self.rva)? }
+        };
+        if exact_backing == 0 || backing.cap != exact_backing {
+            return Err(INVALID);
+        }
+        Ok(())
+    }
+    fn frame_address(&mut self, cap: InstallationCap) -> Result<u64, u32> {
+        unsafe { get_frame_paddr_checked(cap.cap) }
+    }
+    fn map_existing(
+        &mut self,
+        resident: &ResidentPage,
+        mapped: InstallationCap,
+    ) -> InstallationEffect {
+        let target = resident.target;
+        unsafe {
+            effect(page_map_r(
+                mapped.cap,
+                target.page,
+                vm_page_rights(target.protection),
+                target.view.pml4,
+            ))
+        }
+    }
+}
+
+unsafe fn revalidate_resident_image_page(
+    handler: &ExecNtHandler,
+    view: NativeImageViewDescriptor,
+    page: u64,
+    protection: u32,
+    rva: u32,
+    record: nt_memory_manager::ClientFrameRecord,
+) -> Result<(), u32> {
+    let target = ResidentPage {
+        target: ViewPage {
+            view,
+            page,
+            protection: if record.owns_frame {
+                nt_address_space::private_backing_protection(protection)
+            } else {
+                nt_address_space::image_view_fault_plan(protection, false).map_protection
+            },
+        },
+        record,
+    };
+    let backing = if record.owns_frame {
+        record.owned_backing_cap
+    } else {
+        ready_source_frame(view, rva)?
+    };
+    let pending = &mut *core::ptr::addr_of_mut!(REVALIDATION);
+    if let Some(owner) = pending {
+        if owner.descriptor() != target
+            || owner.mapped().cap != record.frame
+            || owner.source().cap != backing
+        {
+            return Err(RESOURCES);
+        }
+    } else {
+        *pending = Some(ResidentMappingRevalidation::begin(
+            target,
+            InstallationCap { cap: record.frame },
+            InstallationCap { cap: backing },
+            true,
+        )?);
+    }
+    match pending
+        .as_mut()
+        .ok_or(INVALID)?
+        .advance(&mut ResidentIo { handler, rva })
+    {
+        ResidentMappingRevalidationOutcome::Revalidated => {
+            *pending = None;
+            Ok(())
+        }
+        ResidentMappingRevalidationOutcome::Refused(status) => {
+            *pending = None;
+            Err(status)
+        }
+        ResidentMappingRevalidationOutcome::Quarantined(status) => Err(status),
+    }
+}
+
+/// Pending native effects deny cleanup/access; this observation never grants backing authority.
+pub(crate) fn memory_available(pi: u64, base: u64, size: u64) -> bool {
+    unsafe {
+        (&*core::ptr::addr_of!(REVALIDATION))
+            .as_ref()
+            .is_none_or(|owner| {
+                let target = owner.descriptor().target;
+                !owner.blocks_retirement()
+                    || target.view.pi as u64 != pi
+                    || size == 0
+                    || base
+                        .checked_add(size)
+                        .is_some_and(|end| end <= target.page || base >= target.page + 4096)
+            })
+    }
 }
 
 unsafe fn trace_image_fault_failure(
@@ -335,21 +508,25 @@ unsafe fn trace_image_fault_failure(
     view: NativeImageViewDescriptor,
     page: u64,
     access: FaultAccess,
+    observation: ImageFaultObservation,
     stage: &str,
     status: u32,
 ) {
     // Copy evidence after the residency borrow ends; the record grants no new access authority.
     let current_process = handler.capture_process_identity(view.pi);
-    let source = handler.image_sections.source_for_view(view.view).map(|source| {
-        (source.backing, source.layout.headers().image_base)
-    });
+    let source = handler
+        .image_sections
+        .source_for_view(view.view)
+        .map(|source| (source.backing, source.layout.headers().image_base));
     let mapping = process_committed_mapping_basic_information(view.pi as u64, page);
     let resident = (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).get(view.pi as u64, page);
-    let rva = page.checked_sub(view.base).and_then(|offset| view.section_offset.checked_add(offset));
+    let rva = page
+        .checked_sub(view.base)
+        .and_then(|offset| view.section_offset.checked_add(offset));
     let mut record = nt_printf::record::RecordBuffer::<3072>::new();
     let _ = writeln!(
         record,
-        "[native-image-fault-failure] stage={stage} status=0x{status:08x} access={access:?} page=0x{page:x} rva={rva:x?} view={view:x?} current-process={current_process:?} source-and-preferred={source:x?} mapping={mapping:x?} resident={resident:x?}"
+        "[native-image-fault-failure] stage={stage} status=0x{status:08x} access={access:?} observation={observation:?} page=0x{page:x} rva={rva:x?} view={view:x?} current-process={current_process:?} source-and-preferred={source:x?} mapping={mapping:x?} resident={resident:x?}"
     );
     sel4_rt::print_record(if record.overflowed() {
         b"[native-image-fault-failure] record-truncated\n"
@@ -363,7 +540,7 @@ unsafe fn service_page_residency(
     view: NativeImageViewDescriptor,
     page: u64,
     access: FaultAccess,
-    fault_observed: bool,
+    observation: ImageFaultObservation,
     stage: &mut &'static str,
 ) -> Result<(), u32> {
     let _borrow = Borrow::acquire()?;
@@ -411,9 +588,15 @@ unsafe fn service_page_residency(
         {
             return Err(INVALID);
         }
+        if observation == ImageFaultObservation::NotPresent
+            && (record.owns_frame || !fault_plan.copy_on_write)
+        {
+            *stage = "resident-revalidation";
+            return revalidate_resident_image_page(handler, view, page, protection, rva, record);
+        }
         if record.owns_frame {
             // A private COW page already contains loader/application changes; never refill it.
-            if fault_observed {
+            if observation == ImageFaultObservation::Protection {
                 if !fault_plan.copy_on_write {
                     *stage = "resident-private-fault";
                     return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
@@ -430,10 +613,12 @@ unsafe fn service_page_residency(
             }
             return Ok(());
         }
-        if fault_observed && !fault_plan.copy_on_write {
+        if observation == ImageFaultObservation::Protection && !fault_plan.copy_on_write {
             *stage = "resident-shared-fault";
             return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
         }
+    } else if observation == ImageFaultObservation::Protection {
+        return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
     }
     *stage = "pagefile-restore";
     if handler.restore_process_pagefile_page(view.pi, page, view.pml4, view.scratch_base)? {
@@ -489,6 +674,14 @@ unsafe fn service_page_residency(
 /// Invoked only by checked ImageSectionPurge after the authority's references have drained.
 pub(crate) unsafe fn purge_area(area: ImageAreaId) -> Result<(), u32> {
     let _borrow = Borrow::acquire()?;
+    if (&*core::ptr::addr_of!(REVALIDATION))
+        .as_ref()
+        .is_some_and(|owner| {
+            owner.descriptor().target.view.view.area() == area && owner.blocks_retirement()
+        })
+    {
+        return Err(RESOURCES);
+    }
     if (&*core::ptr::addr_of!(INSTALL))
         .as_ref()
         .is_some_and(|owner| owner.descriptor().view.view.area() == area)
@@ -562,6 +755,12 @@ pub(crate) unsafe fn drain_view(
     view: NativeImageViewDescriptor,
 ) -> Result<(), u32> {
     let _borrow = Borrow::acquire()?;
+    if (&*core::ptr::addr_of!(REVALIDATION))
+        .as_ref()
+        .is_some_and(|owner| owner.descriptor().target.view == view && owner.blocks_retirement())
+    {
+        return Err(RESOURCES);
+    }
     let pending = &mut *core::ptr::addr_of_mut!(INSTALL);
     if let Some(owner) = pending
         .as_mut()
