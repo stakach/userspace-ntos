@@ -88,6 +88,10 @@ impl NativeImageReservation {
     pub(crate) const fn file(&self) -> SectionFileIdentity {
         self.file
     }
+
+    pub(crate) const fn is_pending(&self) -> bool {
+        self.acquisition.is_some()
+    }
 }
 
 struct StoredSource {
@@ -117,42 +121,84 @@ pub(crate) struct NativeImageStore {
 
 impl NativeImageStore {
     pub(crate) fn reserve_mapped_view(
-        &mut self, id: NativeImageSectionId, process: nt_memory_manager::ProcessIdentity,
-        base: u64, size: u64,
+        &mut self,
+        id: NativeImageSectionId,
+        process: nt_memory_manager::ProcessIdentity,
+        base: u64,
+        size: u64,
     ) -> Result<ImageViewRef, NativeImageError> {
-        let group = self.objects[self.object_index(id)?].group.ok_or(NativeImageError::InvalidSection)?;
-        self.views.try_reserve(1).map_err(|_| NativeImageError::InsufficientResources)?;
-        let view = self.authority.reserve_mapped_view(group, process, base, size)?;
+        let group = self.objects[self.object_index(id)?]
+            .group
+            .ok_or(NativeImageError::InvalidSection)?;
+        self.views
+            .try_reserve(1)
+            .map_err(|_| NativeImageError::InsufficientResources)?;
+        let view = self
+            .authority
+            .reserve_mapped_view(group, process, base, size)?;
         self.views.push(view);
         Ok(view)
     }
 
-    pub(crate) fn mapped_view(&self, view: ImageViewRef) -> Option<nt_memory_manager::image_section::ImageMappedView> {
+    pub(crate) fn mapped_view(
+        &self,
+        view: ImageViewRef,
+    ) -> Option<nt_memory_manager::image_section::ImageMappedView> {
         self.authority.mapped_view(view)
     }
 
-    pub(crate) fn begin_mapped_view_mapping(&mut self, view: ImageViewRef, process: nt_memory_manager::ProcessIdentity) -> Result<(), NativeImageError> {
-        self.authority.begin_mapped_view_mapping(view, process).map_err(Into::into)
+    pub(crate) fn begin_mapped_view_mapping(
+        &mut self,
+        view: ImageViewRef,
+        process: nt_memory_manager::ProcessIdentity,
+    ) -> Result<(), NativeImageError> {
+        self.authority
+            .begin_mapped_view_mapping(view, process)
+            .map_err(Into::into)
     }
 
-    pub(crate) fn publish_mapped_view(&mut self, view: ImageViewRef) -> Result<(), NativeImageError> {
+    pub(crate) fn publish_mapped_view(
+        &mut self,
+        view: ImageViewRef,
+    ) -> Result<(), NativeImageError> {
         self.authority.publish_mapped_view(view).map_err(Into::into)
     }
 
-    pub(crate) fn abort_prepared_mapped_view(&mut self, view: ImageViewRef, process: nt_memory_manager::ProcessIdentity) -> Result<(), NativeImageError> {
-        let index = self.views.iter().position(|candidate| *candidate == view).ok_or(NativeImageError::InvalidSection)?;
+    pub(crate) fn abort_prepared_mapped_view(
+        &mut self,
+        view: ImageViewRef,
+        process: nt_memory_manager::ProcessIdentity,
+    ) -> Result<(), NativeImageError> {
+        let index = self
+            .views
+            .iter()
+            .position(|candidate| *candidate == view)
+            .ok_or(NativeImageError::InvalidSection)?;
         self.authority.abort_prepared_mapped_view(view, process)?;
         self.views.swap_remove(index);
         Ok(())
     }
 
-    pub(crate) fn begin_mapped_view_retirement(&mut self, view: ImageViewRef, process: nt_memory_manager::ProcessIdentity) -> Result<nt_memory_manager::image_section::ImageMappedViewRetirement, NativeImageError> {
-        self.authority.begin_mapped_view_retirement(view, process).map_err(Into::into)
+    pub(crate) fn begin_mapped_view_retirement(
+        &mut self,
+        view: ImageViewRef,
+        process: nt_memory_manager::ProcessIdentity,
+    ) -> Result<nt_memory_manager::image_section::ImageMappedViewRetirement, NativeImageError> {
+        self.authority
+            .begin_mapped_view_retirement(view, process)
+            .map_err(Into::into)
     }
 
-    pub(crate) fn acknowledge_mapped_view_retirement(&mut self, receipt: nt_memory_manager::image_section::ImageMappedViewRetirement) -> Result<(), NativeImageError> {
+    pub(crate) fn acknowledge_mapped_view_retirement(
+        &mut self,
+        receipt: nt_memory_manager::image_section::ImageMappedViewRetirement,
+    ) -> Result<(), NativeImageError> {
         let view = receipt.view();
-        let index = self.views.iter().position(|candidate| *candidate == view).ok_or(NativeImageError::InvalidSection)?;
+        let index = self
+            .views
+            .iter()
+            .position(|candidate| *candidate == view)
+            .ok_or(NativeImageError::InvalidSection)?;
         self.authority.acknowledge_mapped_view_retirement(receipt)?;
         self.views.swap_remove(index);
         Ok(())
@@ -177,6 +223,31 @@ impl NativeImageStore {
             file,
             acquisition: Some(acquisition),
         })
+    }
+
+    pub(crate) fn cached_source_for_reservation(
+        &self,
+        reservation: &NativeImageReservation,
+        file_extent: u64,
+    ) -> Result<&NativeImageSource, NativeImageError> {
+        let Some(ImageAcquire::Section(section)) = reservation.acquisition else {
+            return Err(NativeImageError::InvalidSource);
+        };
+        if self.authority.file_identity(section.area()) != Some(reservation.file) {
+            return Err(NativeImageError::InvalidSource);
+        }
+        let source = self
+            .sources
+            .iter()
+            .find(|source| source.area == section.area() && source.file == reservation.file)
+            .ok_or(NativeImageError::InvalidSource)?;
+        if !source.source.valid_for(reservation.file)
+            || !source.source.has_complete_image()
+            || source.source.backing.file_extent != file_extent
+        {
+            return Err(NativeImageError::InvalidSource);
+        }
+        Ok(&source.source)
     }
 
     /// `source` must be Some for first publication, None for an existing area.
@@ -418,14 +489,23 @@ impl NativeImageStore {
     ) -> Result<Option<NativeImageSource>, nt_memory_manager::image_section::ImageFlushError> {
         struct Purge<'a, T>(&'a mut T);
         impl<T: ImageSectionPurge> ImageSectionPurge for Purge<'_, T> {
-            fn purge_image(&mut self, area: ImageAreaId, file: SectionFileIdentity) -> Result<(), u32> {
+            fn purge_image(
+                &mut self,
+                area: ImageAreaId,
+                file: SectionFileIdentity,
+            ) -> Result<(), u32> {
                 // The authority has excluded every live view/handle before this callback.
-                unsafe { crate::native_image_residency::purge_area(area)?; }
+                unsafe {
+                    crate::native_image_residency::purge_area(area)?;
+                }
                 self.0.purge_image(area, file)
             }
         }
         self.authority.flush_for_write(file, &mut Purge(io))?;
-        Ok(self.sources.iter().position(|source| source.file == file)
+        Ok(self
+            .sources
+            .iter()
+            .position(|source| source.file == file)
             .map(|index| self.sources.remove(index).source))
     }
 

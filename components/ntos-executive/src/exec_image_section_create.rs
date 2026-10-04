@@ -1,7 +1,9 @@
 //! Native image Section admission from an exact, retained routed FILE_OBJECT.
 
 use super::*;
-use crate::native_image_sections::{NativeImageError, NativeImageSectionId, NativeImageSource};
+use crate::native_image_sections::{
+    NativeImageError, NativeImageReservation, NativeImageSectionId, NativeImageSource,
+};
 
 const SEC_IMAGE: u32 = 0x0100_0000;
 const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xc000_007b;
@@ -42,7 +44,9 @@ impl ReservedNativeImageSection {
 
     pub(crate) fn publish(&mut self, handler: &mut ExecNtHandler) -> Result<u64, u32> {
         let value = self.publication.publish(&mut handler.pm)?;
-        let observation = handler.image_sections.source(self.id)
+        let observation = handler
+            .image_sections
+            .source(self.id)
             .and_then(|source| source.observation_target);
         if let Some(proof) = observation {
             match proof.target().role {
@@ -64,21 +68,28 @@ impl ReservedNativeImageSection {
             assert_eq!(entry.identity, identity);
             assert_eq!(entry.payload, u64::from(self.id.section_id()));
             entry.unlink();
-            handler.image_sections.withdraw_permanent(self.id).expect("unpublished image name pin");
+            handler
+                .image_sections
+                .withdraw_permanent(self.id)
+                .expect("unpublished image name pin");
         }
         assert_eq!(
             self.publication.abort(&mut handler.pm),
             Ok(Some(self.id.section_id())),
         );
-        handler.image_sections.close_handle_group(self.id).expect("unpublished image handle group");
+        handler
+            .image_sections
+            .close_handle_group(self.id)
+            .expect("unpublished image handle group");
     }
 }
 
 pub(crate) fn map_image_error(error: NativeImageError) -> u32 {
     match error {
         NativeImageError::InsufficientResources
-        | NativeImageError::Authority(nt_memory_manager::image_section::ImageSectionError::InsufficientResources) =>
-            STATUS_INSUFFICIENT_RESOURCES,
+        | NativeImageError::Authority(
+            nt_memory_manager::image_section::ImageSectionError::InsufficientResources,
+        ) => STATUS_INSUFFICIENT_RESOURCES,
         _ => STATUS_INVALID_IMAGE_FORMAT,
     }
 }
@@ -112,7 +123,10 @@ fn validate_pe_header(header: &[u8], file_size: u64) -> Result<(), u32> {
 
 impl ExecNtHandler {
     /// Observe only the exact executable registration attached to this admitted File handle.
-    pub(crate) fn capture_native_image_observation(&self, file_handle: u64) -> Option<nt_exe_image::CapturedImageObservation> {
+    pub(crate) fn capture_native_image_observation(
+        &self,
+        file_handle: u64,
+    ) -> Option<nt_exe_image::CapturedImageObservation> {
         let ctx = self.loop_ctx?;
         unsafe {
             let table = &*ctx.exe_images;
@@ -135,14 +149,34 @@ impl ExecNtHandler {
         if admission.metadata.is_directory {
             return Err(STATUS_INVALID_IMAGE_FORMAT);
         }
-        self.reserve_image_section(caller, desired_access, attributes, maximum_size,
-            page_protection, allocation_attrs, admission.metadata.file,
-            admission.metadata.end_of_file, admission.header, admission.name,
+        let mut image = self
+            .image_sections
+            .reserve(admission.metadata.file)
+            .map_err(map_image_error)?;
+        let result = self.reserve_image_section(
+            caller,
+            desired_access,
+            attributes,
+            maximum_size,
+            page_protection,
+            allocation_attrs,
+            admission.metadata.file,
+            admission.metadata.end_of_file,
+            admission.header,
+            admission.name,
             admission.observation_target,
             ImageSourceAdmission::Routed {
                 capture: Some(admission.capture),
                 path: admission.image_path,
-            })
+            },
+            &mut image,
+        );
+        if result.is_err() && image.is_pending() {
+            self.image_sections
+                .abort(&mut image)
+                .expect("unpublished routed image reservation");
+        }
+        result
     }
 
     pub(crate) unsafe fn reserve_local_native_image_section(
@@ -159,12 +193,28 @@ impl ExecNtHandler {
         name: Option<crate::section_metadata_work::ImageObjectName>,
         observation_target: Option<nt_exe_image::CapturedImageObservation>,
         file: &mut Option<crate::file_image_section::LocalImageFile>,
+        image: &mut NativeImageReservation,
     ) -> Result<ReservedNativeImageSection, u32> {
         let identity = backing.file.ok_or(STATUS_INVALID_HANDLE)?;
-        self.reserve_image_section(caller, desired_access, attributes, maximum_size,
-            page_protection, allocation_attrs, identity, backing.file_extent, bytes, name,
+        self.reserve_image_section(
+            caller,
+            desired_access,
+            attributes,
+            maximum_size,
+            page_protection,
+            allocation_attrs,
+            identity,
+            backing.file_extent,
+            bytes,
+            name,
             observation_target,
-            ImageSourceAdmission::Local { backing, file, path })
+            ImageSourceAdmission::Local {
+                backing,
+                file,
+                path,
+            },
+            image,
+        )
     }
 
     unsafe fn reserve_image_section(
@@ -181,6 +231,7 @@ impl ExecNtHandler {
         name: Option<crate::section_metadata_work::ImageObjectName>,
         observation_target: Option<nt_exe_image::CapturedImageObservation>,
         mut admission: ImageSourceAdmission<'_>,
+        image: &mut NativeImageReservation,
     ) -> Result<ReservedNativeImageSection, u32> {
         if maximum_size != 0
             || !matches!(page_protection, 0x02 | 0x10 | 0x20)
@@ -191,7 +242,18 @@ impl ExecNtHandler {
         if file_size == 0 {
             return Err(STATUS_INVALID_IMAGE_FORMAT);
         }
-        validate_pe_header(&header, file_size)?;
+        if image.file() != file_identity {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        if image.needs_source() {
+            validate_pe_header(&header, file_size)?;
+        } else {
+            let cached = self
+                .image_sections
+                .cached_source_for_reservation(image, file_size)
+                .map_err(map_image_error)?;
+            validate_pe_header(&cached.pe_header, file_size)?;
+        }
         if let Some(ref name) = name {
             let Some(root) = self.obj_ns.get(name.root_index) else {
                 return Err(STATUS_INVALID_HANDLE);
@@ -207,13 +269,6 @@ impl ExecNtHandler {
             caller,
             attributes & (nt_process::native_handle::OBJ_KERNEL_HANDLE | 0x2),
         )?;
-        let mut image = match self.image_sections.reserve(file_identity) {
-            Ok(image) => image,
-            Err(error) => {
-                publication.abort(&mut self.pm).expect("unbound image handle reservation");
-                return Err(map_image_error(error));
-            }
-        };
         let mut source = None;
         let mut routed_lease = None;
         if image.needs_source() {
@@ -224,19 +279,28 @@ impl ExecNtHandler {
                     ) {
                         Ok(lease) => lease,
                         Err(_capture) => {
-                            self.image_sections.abort(&mut image).expect("unpublished image reservation");
-                            publication.abort(&mut self.pm).expect("unbound image handle reservation");
+                            publication
+                                .abort(&mut self.pm)
+                                .expect("unbound image handle reservation");
                             return Err(STATUS_INSUFFICIENT_RESOURCES);
                         }
                     };
                     routed_lease = Some(lease);
-                    (nt_memory_manager::GenericSectionBacking::routed(
-                        lease, file_identity, file_size,
-                    ), None, Some(core::mem::take(path)))
+                    (
+                        nt_memory_manager::GenericSectionBacking::routed(
+                            lease,
+                            file_identity,
+                            file_size,
+                        ),
+                        None,
+                        Some(core::mem::take(path)),
+                    )
                 }
-                ImageSourceAdmission::Local { backing, file, path } => {
-                    (*backing, file.take(), Some(core::mem::take(path)))
-                }
+                ImageSourceAdmission::Local {
+                    backing,
+                    file,
+                    path,
+                } => (*backing, file.take(), Some(core::mem::take(path))),
             };
             source = Some(NativeImageSource {
                 backing,
@@ -246,19 +310,21 @@ impl ExecNtHandler {
                 observation_target,
             });
         }
-        let id = match self.image_sections.publish(&mut image, &mut source) {
+        let id = match self.image_sections.publish(image, &mut source) {
             Ok(id) => id,
             Err(error) => {
-                self.image_sections.abort(&mut image).expect("unpublished image reservation");
                 if let ImageSourceAdmission::Local { file, .. } = &mut admission {
                     if let Some(source) = source.as_mut() {
                         **file = source.local_file.take();
                     }
                 }
                 if let Some(lease) = routed_lease {
-                    crate::hosted_routed_image_capture::cancel_unbound(lease).expect("unbound image File capture");
+                    crate::hosted_routed_image_capture::cancel_unbound(lease)
+                        .expect("unbound image File capture");
                 }
-                publication.abort(&mut self.pm).expect("unbound image handle reservation");
+                publication
+                    .abort(&mut self.pm)
+                    .expect("unbound image handle reservation");
                 return Err(map_image_error(error));
             }
         };
@@ -270,14 +336,30 @@ impl ExecNtHandler {
         if let Some(name) = name {
             let permanent = attributes & OBJ_PERMANENT != 0;
             if let Err(error) = self.image_sections.make_permanent(id) {
-                self.image_sections.close_handle_group(id).expect("failed image name pin");
-                publication.abort(&mut self.pm).expect("unbound image handle reservation");
+                self.image_sections
+                    .close_handle_group(id)
+                    .expect("failed image name pin");
+                publication
+                    .abort(&mut self.pm)
+                    .expect("unbound image handle reservation");
                 return Err(map_image_error(error));
             }
-            let Some(index) = self.obj_create(&name.path, name.root_index, OBJ_KIND_SECTION, &[], permanent) else {
-                self.image_sections.withdraw_permanent(id).expect("failed image name publication");
-                self.image_sections.close_handle_group(id).expect("failed image name publication");
-                publication.abort(&mut self.pm).expect("unbound image handle reservation");
+            let Some(index) = self.obj_create(
+                &name.path,
+                name.root_index,
+                OBJ_KIND_SECTION,
+                &[],
+                permanent,
+            ) else {
+                self.image_sections
+                    .withdraw_permanent(id)
+                    .expect("failed image name publication");
+                self.image_sections
+                    .close_handle_group(id)
+                    .expect("failed image name publication");
+                publication
+                    .abort(&mut self.pm)
+                    .expect("unbound image handle reservation");
                 return Err(STATUS_INSUFFICIENT_RESOURCES);
             };
             self.obj_ns[index].payload = u64::from(id.section_id());
@@ -286,12 +368,22 @@ impl ExecNtHandler {
         if let Err(status) = publication.bind(&mut self.pm, id.section_id(), desired_access) {
             if let Some((index, _)) = named {
                 self.obj_ns[index].unlink();
-                self.image_sections.withdraw_permanent(id).expect("failed image handle binding");
+                self.image_sections
+                    .withdraw_permanent(id)
+                    .expect("failed image handle binding");
             }
-            self.image_sections.close_handle_group(id).expect("failed image handle binding");
-            publication.abort(&mut self.pm).expect("failed image handle binding reservation");
+            self.image_sections
+                .close_handle_group(id)
+                .expect("failed image handle binding");
+            publication
+                .abort(&mut self.pm)
+                .expect("failed image handle binding reservation");
             return Err(status);
         }
-        Ok(ReservedNativeImageSection { publication, id, named })
+        Ok(ReservedNativeImageSection {
+            publication,
+            id,
+            named,
+        })
     }
 }

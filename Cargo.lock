@@ -221,6 +221,7 @@ dependencies = [
  "nt-exe-image",
  "nt-kernel-abi",
  "nt-kernel-exec",
+ "nt-memory-manager",
  "nt-pe-loader",
  "nt-process",
  "syn",

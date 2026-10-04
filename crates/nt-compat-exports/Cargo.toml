@@ -11,6 +11,7 @@ authors.workspace = true
 undocumented_unsafe_blocks = "deny"
 
 [dev-dependencies]
+nt-memory-manager = { path = "../nt-memory-manager" }
 nt-exe-image = { path = "../nt-exe-image" }
 nt-pe-loader = { path = "../nt-pe-loader" }
 nt-kernel-abi = { path = "../nt-kernel-abi" }
