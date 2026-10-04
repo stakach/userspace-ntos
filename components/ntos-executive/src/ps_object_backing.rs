@@ -61,6 +61,7 @@ struct Row {
 enum BodyPhase {
     Prepared,
     Published,
+    Reactivating { lifetime: ThreadLifetime },
     Retiring { published: bool },
 }
 
@@ -68,7 +69,7 @@ impl Row {
     fn was_published(&self) -> bool {
         matches!(
             self.phase,
-            BodyPhase::Published | BodyPhase::Retiring { published: true }
+            BodyPhase::Published | BodyPhase::Reactivating { .. } | BodyPhase::Retiring { published: true }
         )
     }
 
@@ -170,7 +171,7 @@ pub(super) fn print_census_changes() {
     for row in &arena.rows {
         counts[match row.phase {
             BodyPhase::Prepared => 0,
-            BodyPhase::Published => 1,
+            BodyPhase::Published | BodyPhase::Reactivating { .. } => 1,
             BodyPhase::Retiring { .. } => 2,
         }] += 1;
         let page = row.page.stats();
@@ -721,7 +722,7 @@ pub(super) unsafe fn publish_prepared_pair(
         .existing(BodyId::Thread(lifetime.thread_id()))
         .ok_or(INVALID)?;
     if [process, thread].into_iter().any(|index| {
-        matches!(arena.rows[index].phase, BodyPhase::Retiring { .. })
+        !matches!(arena.rows[index].phase, BodyPhase::Prepared | BodyPhase::Published)
             || !arena.rows[index].page.is_initialized()
     }) || arena.rows[thread].current_thread_lifetime != Some(lifetime)
     {
@@ -760,121 +761,9 @@ pub(super) unsafe fn publish_system_worker(
     Ok(())
 }
 
-/// Commit PM activation and refresh its stable body without an intervening provider entry.
-///
-/// # Safety
-/// The target TCB remains suspended. Every old-activation execution/request reference is drained;
-/// the alias owner separately proves that even failed non-root mapping candidates are gone.
-pub(super) unsafe fn commit_thread_activation(
-    pm: &mut ProcessManager,
-    plan: nt_process::ThreadActivationPlan,
-    handle: nt_process::HandleReservation,
-) -> Result<(), u32> {
-    let _borrow = Borrow::acquire()?;
-    let arena = (&mut *core::ptr::addr_of_mut!(ARENA))
-        .as_mut()
-        .ok_or(INVALID)?;
-    arena.validate(pm)?;
-    let Some(index) = arena.existing(BodyId::Thread(plan.thread_id())) else {
-        if pm
-            .thread_kernel_object(plan.thread_id())
-            .is_some_and(contains_address)
-        {
-            return Err(INVALID);
-        }
-        return pm.commit_thread_activation_with_handle(plan, handle);
-    };
-    let row = &mut arena.rows[index];
-    let body = row.page.descriptor().address;
-    if !matches!(row.phase, BodyPhase::Prepared | BodyPhase::Published)
-        || !row.page.is_initialized()
-        || row.current_thread_lifetime != Some(plan.expected_lifetime())
-        || pm.thread_kernel_object(plan.thread_id()) != match row.phase {
-            BodyPhase::Prepared => None,
-            BodyPhase::Published => Some(body),
-            BodyPhase::Retiring { .. } => return Err(INVALID),
-        }
-        || row
-            .page
-            .live_alias(MappingTarget::Executive(arena.root))
-            .is_none()
-        || !row.page.non_root_aliases_drained()
-    {
-        record_thread_activation_guard_failure(pm, &plan, row, arena.root, "body-guard");
-        return Err(INVALID);
-    }
-    let Initialization::Thread { mut fields, .. } = row.page.descriptor().initialization else {
-        record_thread_activation_guard_failure(pm, &plan, row, arena.root, "body-type");
-        return Err(INVALID);
-    };
-    if pm.process_kernel_object(plan.process_id()) != Some(fields.process_body.0) {
-        record_thread_activation_guard_failure(pm, &plan, row, arena.root, "process-body");
-        return Err(INVALID);
-    }
-    fields.teb = GuestAddr(plan.teb_base());
-    fields.system_thread = pm.thread(plan.thread_id()).ok_or(INVALID)?.is_system_thread;
-    let bytes = core::slice::from_raw_parts_mut(body as *mut u8, abi::ETHREAD_BODY_BYTES);
-    if abi::validate_thread_activation(bytes, fields).is_err() {
-        record_thread_activation_guard_failure(pm, &plan, row, arena.root, "body-bytes");
-        return Err(INVALID);
-    }
-    match row.phase {
-        BodyPhase::Prepared => {
-            pm.commit_thread_activation_with_handle_and_object(plan, handle, body)?;
-        }
-        BodyPhase::Published => pm.commit_thread_activation_with_handle(plan, handle)?,
-        BodyPhase::Retiring { .. } => unreachable!(),
-    }
-    // Both owners remain exclusively borrowed. No allocation, syscall or provider byte write can
-    // invalidate the preflight between PM generation publication and these bounded field writes.
-    abi::refresh_thread_activation(bytes, fields).expect("exclusive prevalidated ETHREAD refresh");
-    row.current_thread_lifetime = pm.thread_lifetime(plan.thread_id());
-    row.phase = BodyPhase::Published;
-    Ok(())
-}
-
-fn record_thread_activation_guard_failure(
-    pm: &ProcessManager,
-    plan: &nt_process::ThreadActivationPlan,
-    row: &Row,
-    root: Root,
-    reason: &str,
-) {
-    use core::fmt::Write;
-    let mut record = nt_printf::record::RecordBuffer::<512>::new();
-    let expected = plan.expected_lifetime();
-    let phase = match row.phase {
-        BodyPhase::Prepared => "prepared",
-        BodyPhase::Published => "published",
-        BodyPhase::Retiring { .. } => "retiring",
-    };
-    let body = row.page.descriptor().address;
-    let pm_body = pm.thread_kernel_object(plan.thread_id());
-    let body_matches = match row.phase {
-        BodyPhase::Prepared => pm_body.is_none(),
-        BodyPhase::Published => pm_body == Some(body),
-        BodyPhase::Retiring { .. } => false,
-    };
-    let process_body_matches = match row.page.descriptor().initialization {
-        Initialization::Thread { fields, .. } => {
-            pm.process_kernel_object(plan.process_id()) == Some(fields.process_body.0)
-        }
-        _ => false,
-    };
-    let _ = writeln!(record,
-        "[thread-activation-guard] pid={} tid={} expected-generation={} cached-generation={} phase={} reason={} initialized={} lifetime-equal={} pm-lifetime-equal={} pm-body-equal={} root-alias={} nonroot-drained={} process-body-equal={} body=0x{:016x}",
-        expected.process_id(), expected.thread_id(), expected.generation(),
-        row.current_thread_lifetime.map_or(0, |lifetime| lifetime.generation()), phase, reason,
-        row.page.is_initialized() as u8, (row.current_thread_lifetime == Some(expected)) as u8,
-        (pm.thread_lifetime(plan.thread_id()) == Some(expected)) as u8, body_matches as u8,
-        row.page.live_alias(MappingTarget::Executive(root)).is_some() as u8,
-        row.page.non_root_aliases_drained() as u8, process_body_matches as u8, body);
-    sel4_rt::print_record(if record.overflowed() {
-        b"[thread-activation-guard] record-truncated\n"
-    } else {
-        record.bytes()
-    });
-}
+#[path = "ps_object_backing/thread_activation.rs"]
+mod thread_activation;
+pub(super) use thread_activation::{commit_thread_activation, prepare_thread_reactivation};
 
 /// Physical cleanup has completed, but the arena still owns the virtual-address reservations.
 /// Dropping this receipt does not release them. The PM withdrawal owner retains this receipt

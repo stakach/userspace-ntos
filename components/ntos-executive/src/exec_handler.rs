@@ -14156,7 +14156,22 @@ impl ExecNtHandler {
                 nt_system_time_100ns() as i64,
                 hide_from_debugger,
             ) {
-                Ok(activation) => break (slot, activation),
+                Ok(activation) => {
+                    // The fresh PM plan and empty runtime slot prove the old activation has no
+                    // execution owners. Keep native body grants fenced until alias cleanup ACKs.
+                    let scratch = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+                    if unsafe {
+                        crate::ps_object_backing::prepare_thread_reactivation(
+                            &self.pm, &activation, scratch,
+                        )
+                    }.is_err() {
+                        self.release_pool_usage_slot(owner_pi, slot);
+                        skipped |= 1u64 << slot;
+                        crate::PM_POOL_UNRECLAIMABLE_SKIPS.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    break (slot, activation);
+                }
                 Err(_) => {
                     self.release_pool_usage_slot(owner_pi, slot);
                     skipped |= 1u64 << slot;
