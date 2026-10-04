@@ -131,8 +131,8 @@ fn process_bridge_accepts_complete_routed_source_not_a_local_marker() {
     }).expect("exact image process bridge");
     let mut calls = Calls::default();
     calls.visit_block(&method.block);
-    assert!(calls.0.iter().any(|name| name == "has_complete_image"),
-        "process construction requires exact complete source bytes, independent of local/routed backing");
+    assert!(calls.0.iter().any(|name| name == "materialize_process_snapshot"),
+        "process construction captures exact complete bytes through the canonical source capability");
     struct LocalMarker(bool);
     impl<'ast> Visit<'ast> for LocalMarker {
         fn visit_expr_field(&mut self, field: &'ast syn::ExprField) {
@@ -194,18 +194,18 @@ fn retained_section_completeness_is_independent_of_closed_file_observation_targe
     let file = source("native_image_sections.rs");
     let method = file.items.iter().find_map(|item| match item {
         Item::Impl(value) => value.items.iter().find_map(|item| match item {
-            syn::ImplItem::Fn(value) if value.sig.ident == "has_complete_image" => Some(value),
+            syn::ImplItem::Fn(value) if value.sig.ident == "has_readable_image" => Some(value),
             _ => None,
         }),
         _ => None,
-    }).expect("retained canonical image completeness contract");
+    }).expect("retained canonical image source contract");
     #[derive(Default)]
     struct Fields { extent: bool, bytes: bool, observation: bool }
     impl<'ast> Visit<'ast> for Fields {
         fn visit_expr_field(&mut self, field: &'ast syn::ExprField) {
             if let syn::Member::Named(name) = &field.member {
                 self.extent |= name == "file_extent";
-                self.bytes |= name == "pe_header";
+                self.bytes |= name == "contents";
                 self.observation |= name == "observation_target";
             }
             syn::visit::visit_expr_field(self, field);
@@ -215,5 +215,5 @@ fn retained_section_completeness_is_independent_of_closed_file_observation_targe
     fields.visit_block(&method.block);
     assert!(fields.extent && fields.bytes);
     assert!(!fields.observation,
-        "File close may retire its observational catalog entry; the retained Section still owns its exact image bytes");
+        "File close may retire its observation; the retained Section still owns its exact source capability");
 }

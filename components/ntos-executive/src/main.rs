@@ -58,6 +58,7 @@ mod server;
 mod service_sec_image;
 mod hosted_stack_growth;
 mod local_section_file;
+mod native_image_source_io;
 mod storage_host;
 mod bootstrap_image;
 mod system_modules;
@@ -31990,6 +31991,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         driver_start_bootstrap,
                         installed_state.journal_records,
                     );
+                    // The service has returned its exclusive borrow. Final observations read only
+                    // the retained catalog and canonical process ownership tables, not loop context.
+                    let observation_handler =
+                        &*(core::ptr::addr_of!(EXEC_NT_HANDLER_WORK) as *const ExecNtHandler);
                     let final_config = final_driver_start_reports.config_pnp;
                     let final_boot = final_driver_start_reports.boot_service;
                     let hosted_pnp_pending_proofs =
@@ -32120,7 +32125,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(b"exec_winlogon_staged", wl_staged, &mut passed);
                     check(
                         b"exec_winlogon_spawned",
-                        WINLOGON_SPAWNED.load(Ordering::Relaxed) == 1,
+                        service_sec_image::live_hosted_pi_for_observation_role(
+                            observation_handler,
+                            nt_exe_image::HostedProcessRole::InteractiveLogon,
+                        ).is_some(),
                         &mut passed,
                     );
                     check(
@@ -32728,7 +32736,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // spawn fired; `exec_services_loader_running` = its loader demand-faulted pages.
                     check(
                         b"exec_services_spawned",
-                        SERVICES_SPAWNED.load(Ordering::Relaxed) == 1,
+                        service_sec_image::live_hosted_pi_for_observation_role(
+                            observation_handler,
+                            nt_exe_image::HostedProcessRole::ServiceControlManager,
+                        ).is_some(),
                         &mut passed,
                     );
                     check(
@@ -32742,7 +32753,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // still returns immediately (winlogon's WaitForLsass) — real blocking is step 2.
                     check(
                         b"exec_lsass_spawned",
-                        LSASS_SPAWNED.load(Ordering::Relaxed) == 1,
+                        service_sec_image::live_hosted_pi_for_observation_role(
+                            observation_handler,
+                            nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
+                        ).is_some(),
                         &mut passed,
                     );
                     check(
@@ -32819,7 +32833,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_hex(WAIT_WOKEN_COUNT.load(Ordering::Relaxed) as u32);
                     print_str(b"\n");
                     print_str(b"[ntos-exec] lsass spawned=0x");
-                    print_hex(LSASS_SPAWNED.load(Ordering::Relaxed) as u32);
+                    print_hex(service_sec_image::live_hosted_pi_for_observation_role(
+                        observation_handler,
+                        nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
+                    ).is_some() as u32);
                     print_str(b" faults=0x");
                     print_hex(LSASS_FAULTS.load(Ordering::Relaxed) as u32);
                     print_str(b"\n");

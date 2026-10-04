@@ -81,11 +81,12 @@ impl ImageSourcePageIo<SourceKey> for SourceIo<'_> {
         let Some(source) = self.handler.image_sections.source_for_view(self.view.view) else {
             return InstallationEffect::Refused(INVALID);
         };
-        if key.area != self.view.view.area() || !source.has_complete_image() {
+        if key.area != self.view.view.area() || !source.has_readable_image() {
             return InstallationEffect::Refused(INVALID);
         }
-        let plan = match nt_pe_loader::PeFile::parse(&source.pe_header)
-            .and_then(|pe| pe.image_page_fill_plan(key.rva, source.pe_header.len() as u64))
+        let plan = match source
+            .layout
+            .image_page_fill_plan(key.rva, source.backing.file_extent)
         {
             Ok(plan) => plan,
             Err(_) => return InstallationEffect::Refused(INVALID),
@@ -98,21 +99,25 @@ impl ImageSourcePageIo<SourceKey> for SourceIo<'_> {
                 0..4096,
                 true,
                 |address| {
-                    for span in plan.spans() {
-                        // The checked planner bounds both file and destination spans; the source Vec is
-                        // immutable and independently fenced by the canonical view reference.
-                        core::ptr::copy_nonoverlapping(
-                            source.pe_header.as_ptr().add(span.file_offset as usize),
-                            (address as *mut u8).add(span.page_offset as usize),
-                            span.length as usize,
-                        );
-                    }
+                    // read_into_page zeroes before its first read. Any refusal after entry
+                    // therefore retains this initializer owner rather than replaying it.
                     wrote = true;
+                    let page = core::slice::from_raw_parts_mut(address as *mut u8, 4096);
+                    plan.read_into_page(page, |offset, output| {
+                        source.read_exact(self.handler, offset, output)?;
+                        Ok::<usize, u32>(output.len())
+                    })
+                    .map_err(|error| match error {
+                        nt_pe_loader::ImagePageReadError::Read(status) => status,
+                        nt_pe_loader::ImagePageReadError::ShortRead { .. } => 0xc000_0185,
+                        nt_pe_loader::ImagePageReadError::InvalidPageSize(_) => INVALID,
+                    })
                 },
             )
         };
         match result {
-            Ok(()) => InstallationEffect::Acknowledged,
+            Ok(Ok(())) => InstallationEffect::Acknowledged,
+            Ok(Err(status)) => InstallationEffect::Uncertain(status),
             Err(status) if wrote || !temporary_frame_alias::backing_release_available() => {
                 InstallationEffect::Uncertain(status)
             }
@@ -328,8 +333,9 @@ pub(crate) unsafe fn service_native_image_page_residency(
         .image_sections
         .source_for_view(view.view)
         .ok_or(INVALID)?;
-    let pe = nt_pe_loader::PeFile::parse(&source.pe_header).map_err(|_| INVALID)?;
-    pe.image_page_fill_plan(rva, source.pe_header.len() as u64)
+    source
+        .layout
+        .image_page_fill_plan(rva, source.backing.file_extent)
         .map_err(|_| INVALID)?;
     let info = process_committed_mapping_basic_information(view.pi as u64, page)
         .ok_or(nt_address_space::STATUS_NOT_COMMITTED)?;

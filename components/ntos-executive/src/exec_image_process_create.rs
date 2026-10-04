@@ -35,8 +35,7 @@ impl ExecNtHandler {
             && handle.granted_access() & nt_memory_manager::section_view_access::SECTION_MAP_EXECUTE == 0
         { return Err(nt_process::STATUS_ACCESS_DENIED); }
         let source = self.image_sections.source(id).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        // A Section handle alone does not imply its retained source contains the complete PE.
-        if !source.has_complete_image() { return Err(STATUS_NOT_SUPPORTED); }
+        if !source.has_readable_image() { return Err(STATUS_NOT_SUPPORTED); }
         let path = source.image_path.as_deref().ok_or(STATUS_NOT_SUPPORTED)?;
         let leaf = nt_exe_image::canonical_exe_leaf(path).ok_or(INVALID_IMAGE)?;
         let mut captured_leaf = [0; nt_exe_image::MAX_EXE_LEAF];
@@ -46,13 +45,10 @@ impl ExecNtHandler {
         let (path_len, root) = dynamic_hosted_nt_image_path(path, leaf, &mut image_path)
             .ok_or(STATUS_NOT_SUPPORTED)?;
         let _durable = crate::allocator::enter_durable();
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(source.pe_header.len()).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-        bytes.extend_from_slice(&source.pe_header);
+        let mut bytes = source.materialize_process_snapshot(self)?;
         if bytes.len() as u64 != source.backing.file_extent { return Err(INVALID_IMAGE); }
         // Preserve the canonical preferred transfer address through main-image placement.
-        let pe = nt_pe_loader::PeFile::parse(&source.pe_header).map_err(|_| INVALID_IMAGE)?;
-        let headers = pe.headers();
+        let headers = source.layout.headers();
         if headers.machine != 0x8664 || !headers.is_executable() { return Err(INVALID_IMAGE); }
         let role = nt_exe_image::HostedProcessRole::for_image_subsystem(headers.subsystem)
             .ok_or(STATUS_NOT_SUPPORTED)?;

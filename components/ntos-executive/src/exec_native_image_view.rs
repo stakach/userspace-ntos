@@ -101,8 +101,8 @@ impl ExecNtHandler {
         } else { 0 };
         if offset & 0xffff != 0 { return Err(0xc000_0220); } // STATUS_MAPPED_ALIGNMENT
         let source = self.image_sections.source(id).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        if !source.has_complete_image() { return Err(STATUS_NOT_SUPPORTED); }
-        let pe = nt_pe_loader::PeFile::parse(&source.pe_header).map_err(|_| 0xc000_007b_u32)?;
+        if !source.has_readable_image() { return Err(STATUS_NOT_SUPPORTED); }
+        let pe = &source.layout;
         let remaining = u64::from(pe.size_of_image()).checked_sub(offset)
             .filter(|size| *size != 0).ok_or(0xc000_001f_u32)?;
         let size = if requested_size == 0 { remaining } else { requested_size };
@@ -147,7 +147,7 @@ impl ExecNtHandler {
         for relative in (0..placement.size).step_by(0x1000) {
             let rva = u32::try_from(offset + relative).map_err(|_| 0xc000_007b_u32)?;
             pe.image_page_fill_plan(rva, source.backing.file_extent).map_err(|_| 0xc000_007b_u32)?;
-            let protection = image_rva_protection(&pe, rva);
+            let protection = img_spawn::image_protection_to_nt(pe.image_protection_at(rva));
             if matches!(protection, nt_address_space::PAGE_WRITECOPY | nt_address_space::PAGE_EXECUTE_WRITECOPY) {
                 charge_bytes = charge_bytes.checked_add(0x1000).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
             }

@@ -2,7 +2,8 @@
 
 use super::*;
 use crate::native_image_sections::{
-    NativeImageError, NativeImageReservation, NativeImageSectionId, NativeImageSource,
+    NativeImageContents, NativeImageError, NativeImageReservation, NativeImageSectionId,
+    NativeImageSource,
 };
 
 const SEC_IMAGE: u32 = 0x0100_0000;
@@ -94,8 +95,7 @@ pub(crate) fn map_image_error(error: NativeImageError) -> u32 {
     }
 }
 
-fn validate_pe_header(header: &[u8], file_size: u64) -> Result<(), u32> {
-    let pe = nt_pe_loader::PeFile::parse(header).map_err(|_| STATUS_INVALID_IMAGE_FORMAT)?;
+fn validate_image_layout(pe: &nt_pe_loader::PeLayout, file_size: u64) -> Result<(), u32> {
     if !pe.headers().is_executable()
         || pe.size_of_image() == 0
         || u64::from(pe.headers().size_of_headers) > file_size
@@ -162,7 +162,8 @@ impl ExecNtHandler {
             allocation_attrs,
             admission.metadata.file,
             admission.metadata.end_of_file,
-            admission.header,
+            None,
+            NativeImageContents::Snapshot(admission.header),
             admission.name,
             admission.observation_target,
             ImageSourceAdmission::Routed {
@@ -188,7 +189,8 @@ impl ExecNtHandler {
         page_protection: u32,
         allocation_attrs: u32,
         backing: nt_memory_manager::GenericSectionBacking,
-        bytes: Vec<u8>,
+        layout: Option<nt_pe_loader::PeLayout>,
+        contents: NativeImageContents,
         path: Vec<u8>,
         name: Option<crate::section_metadata_work::ImageObjectName>,
         observation_target: Option<nt_exe_image::CapturedImageObservation>,
@@ -205,7 +207,8 @@ impl ExecNtHandler {
             allocation_attrs,
             identity,
             backing.file_extent,
-            bytes,
+            layout,
+            contents,
             name,
             observation_target,
             ImageSourceAdmission::Local {
@@ -227,7 +230,8 @@ impl ExecNtHandler {
         allocation_attrs: u32,
         file_identity: nt_memory_manager::SectionFileIdentity,
         file_size: u64,
-        header: Vec<u8>,
+        layout: Option<nt_pe_loader::PeLayout>,
+        contents: NativeImageContents,
         name: Option<crate::section_metadata_work::ImageObjectName>,
         observation_target: Option<nt_exe_image::CapturedImageObservation>,
         mut admission: ImageSourceAdmission<'_>,
@@ -245,15 +249,25 @@ impl ExecNtHandler {
         if image.file() != file_identity {
             return Err(STATUS_INVALID_HANDLE);
         }
-        if image.needs_source() {
-            validate_pe_header(&header, file_size)?;
+        let layout = if image.needs_source() {
+            let layout = match layout {
+                Some(layout) => layout,
+                None => match &contents {
+                    NativeImageContents::Snapshot(bytes) => nt_pe_loader::PeLayout::parse(bytes)
+                        .map_err(|_| STATUS_INVALID_IMAGE_FORMAT)?,
+                    NativeImageContents::RetainedDisk => return Err(STATUS_INVALID_IMAGE_FORMAT),
+                },
+            };
+            validate_image_layout(&layout, file_size)?;
+            Some(layout)
         } else {
             let cached = self
                 .image_sections
                 .cached_source_for_reservation(image, file_size)
                 .map_err(map_image_error)?;
-            validate_pe_header(&cached.pe_header, file_size)?;
-        }
+            validate_image_layout(&cached.layout, file_size)?;
+            None
+        };
         if let Some(ref name) = name {
             let Some(root) = self.obj_ns.get(name.root_index) else {
                 return Err(STATUS_INVALID_HANDLE);
@@ -304,7 +318,8 @@ impl ExecNtHandler {
             };
             source = Some(NativeImageSource {
                 backing,
-                pe_header: header,
+                layout: layout.expect("new image layout validated before File transfer"),
+                contents,
                 local_file,
                 image_path,
                 observation_target,

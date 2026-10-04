@@ -40534,11 +40534,7 @@ impl ExecNtHandler {
                     let Some(source) = self.image_sections.source(id) else {
                         return nt_process::STATUS_INVALID_HANDLE;
                     };
-                    let pe = match nt_pe_loader::PeFile::parse(&source.pe_header) {
-                        Ok(pe) => pe,
-                        Err(_) => return 0xC000_007B,
-                    };
-                    let headers = pe.headers();
+                    let headers = source.layout.headers();
                     let mut info = [0u8; SECTION_IMAGE_INFORMATION_SIZE];
                     info[0..8].copy_from_slice(&headers.image_base.saturating_add(u64::from(headers.entry_point_rva)).to_le_bytes());
                     info[0x10..0x18].copy_from_slice(&headers.size_of_stack_reserve.to_le_bytes());

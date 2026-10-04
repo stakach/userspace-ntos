@@ -156,6 +156,49 @@ pub(crate) enum LocalSectionFile {
 }
 
 impl LocalSectionFile {
+    pub(crate) fn read_exact(
+        &self,
+        handler: &ExecNtHandler,
+        backing: GenericSectionBacking,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<(), u32> {
+        let Self::Disk {
+            object_id,
+            first_cluster,
+            size,
+        } = self
+        else {
+            return Err(nt_fs::STATUS_INVALID_HANDLE);
+        };
+        let open = handler.readonly_file_opens.get(*object_id)?;
+        let identity = unsafe { crate::exec_fs_file_identity(open.metadata.file_id) }
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        if open.metadata.is_directory
+            || open.first_cluster != *first_cluster
+            || open.size != *size
+            || backing.kind != nt_memory_manager::GENERIC_SECTION_BACKING_DISK
+            || backing.file != Some(identity)
+            || backing.first_cluster != *first_cluster
+            || backing.file_size != *size
+            || backing.file_extent != u64::from(*size)
+            || offset
+                .checked_add(output.len() as u64)
+                .is_none_or(|end| end > u64::from(*size))
+        {
+            return Err(nt_fs::STATUS_INVALID_HANDLE);
+        }
+        let fs = unsafe { crate::exec_fs() }.ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        let offset = u32::try_from(offset).map_err(|_| nt_fs::STATUS_INVALID_HANDLE)?;
+        let copied = unsafe {
+            crate::fs_loader::fat_read_file_range(&fs, *first_cluster, *size, offset, output)
+        };
+        if copied != output.len() {
+            return Err(0xc000_0185);
+        }
+        Ok(())
+    }
+
     pub(crate) unsafe fn release(self, handler: &mut ExecNtHandler) {
         match self {
             Self::Disk { object_id, .. } => handler

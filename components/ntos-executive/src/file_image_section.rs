@@ -71,7 +71,8 @@ pub(crate) unsafe fn submit_local_image_section(
             .map_err(crate::exec_handler::image_section_create::map_image_error)?;
         let mut retained = None;
         let captured = (|| {
-            let mut header = Vec::new();
+            let mut layout = None;
+            let mut contents = crate::native_image_sections::NativeImageContents::RetainedDisk;
             let mut image_path = Vec::new();
             if image.needs_source() {
                 match &file {
@@ -89,41 +90,33 @@ pub(crate) unsafe fn submit_local_image_section(
                     }
                 }
                 retained = Some(file);
-                let length = usize::try_from(backing.file_extent)
-                    .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
-                if length == 0 {
-                    return Err(0xc000_007bu32);
-                }
-                header
-                    .try_reserve_exact(length)
-                    .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
-                header.resize(length, 0);
-                let copied = match retained.as_ref().expect("retained local image File") {
-                    LocalImageFile::Disk {
-                        first_cluster,
-                        size,
-                        ..
-                    } => {
-                        let fs = exec_fs().ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-                        crate::fs_loader::fat_read_file_range(
-                            &fs,
-                            *first_cluster,
-                            *size,
-                            0,
-                            &mut header,
-                        )
+                match retained.as_ref().expect("retained local image File") {
+                    file @ LocalImageFile::Disk { .. } => {
+                        layout = Some(
+                            nt_pe_loader::capture_image_layout(
+                                backing.file_extent,
+                                |offset, output| {
+                                    file.read_exact(handler, backing, offset, output)?;
+                                    Ok::<usize, u32>(output.len())
+                                },
+                            )
+                            .map_err(|error| match error {
+                                nt_pe_loader::ImageHeaderCaptureError::Read(status) => status,
+                                nt_pe_loader::ImageHeaderCaptureError::ShortRead { .. } => {
+                                    0xc000_0185
+                                }
+                                nt_pe_loader::ImageHeaderCaptureError::Parse(_) => 0xc000_007b,
+                            })?,
+                        );
                     }
                     LocalImageFile::Overlay { object_id } => {
-                        let (status, copied) =
-                            crate::writable_fs::read_backing_into(*object_id, 0, &mut header);
-                        if status != 0 {
-                            return Err(status);
-                        }
-                        copied
+                        let bytes = capture_overlay_snapshot(*object_id, backing.file_extent)?;
+                        layout = Some(
+                            nt_pe_loader::PeLayout::parse(&bytes).map_err(|_| 0xc000_007bu32)?,
+                        );
+                        contents =
+                            crate::native_image_sections::NativeImageContents::Snapshot(bytes);
                     }
-                };
-                if copied != length {
-                    return Err(0xc000_0185u32);
                 }
             }
             handler.reserve_local_native_image_section(
@@ -134,7 +127,8 @@ pub(crate) unsafe fn submit_local_image_section(
                 page_protection,
                 allocation_attrs,
                 backing,
-                header,
+                layout,
+                contents,
                 image_path,
                 name,
                 observation_target,
@@ -167,4 +161,24 @@ pub(crate) unsafe fn submit_local_image_section(
         }
     })();
     result.map_or_else(|status| status, |()| 0)
+}
+
+/// Overlay remains an immutable admission snapshot until its write/invalidation protocol
+/// can fence every mutation against live image areas.
+fn capture_overlay_snapshot(object_id: u64, extent: u64) -> Result<Vec<u8>, u32> {
+    let length =
+        usize::try_from(extent).map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
+    bytes.resize(length, 0);
+    let (status, copied) = unsafe { crate::writable_fs::read_backing_into(object_id, 0, &mut bytes) };
+    if status != 0 {
+        return Err(status);
+    }
+    if copied != length {
+        return Err(0xc000_0185);
+    }
+    Ok(bytes)
 }

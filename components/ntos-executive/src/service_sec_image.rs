@@ -2511,7 +2511,7 @@ unsafe fn progress_stall_deferral_snapshot(
         });
     }
     if interactive_shell_chrome_frontier_pending(nt_handler, crash_parked, wait_parked) {
-        let pi = live_hosted_pi_for_role(
+        let pi = live_hosted_pi_for_observation_role(
             nt_handler,
             nt_exe_image::HostedProcessRole::InteractiveShell,
         )?;
@@ -5690,6 +5690,55 @@ fn hosted_pi_for_role(
     })
 }
 
+pub(crate) fn live_hosted_pi_for_observation_role(
+    nt_handler: &ExecNtHandler,
+    role: nt_exe_image::HostedProcessRole,
+) -> Option<usize> {
+    let mut selected = None;
+    for pi in 0..MAX_PI {
+        let Some(image) = nt_handler.hosted_process_image(pi) else {
+            continue;
+        };
+        let Some(runtime) = hosted_process_runtime_for_pi(pi) else {
+            continue;
+        };
+        if image.pi != pi
+            || image.observation_role() != role
+            || runtime.observation_role != role
+            || runtime.pi != image.pi
+            || runtime.generation != image.generation
+            || !runtime
+                .spawned
+                .is_some_and(|spawned| spawned.load(Ordering::Relaxed) == 1)
+        {
+            continue;
+        }
+        let Some(mechanism) = nt_handler.process_mechanisms.get(pi) else {
+            continue;
+        };
+        let Some(identity) = nt_handler.capture_process_identity(pi) else {
+            continue;
+        };
+        if mechanism.pi != pi
+            || mechanism.generation != image.generation
+            || mechanism.top_badge != image.top_badge
+            || identity.pid != mechanism.pid
+            || identity.generation != nt_memory_manager::ProcessGeneration::Hosted(image.generation)
+            || !nt_handler
+                .pm
+                .process(identity.pid)
+                .is_some_and(|process| process.state == nt_process::ProcessState::Running)
+        {
+            continue;
+        }
+        if selected.is_some() {
+            return None;
+        }
+        selected = Some(pi);
+    }
+    selected
+}
+
 fn hosted_pi_for_top_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<usize> {
     (0..MAX_PI).find(|&pi| {
         hosted_process_runtime_for_pi(pi).is_some()
@@ -5779,13 +5828,10 @@ unsafe fn interactive_shell_chrome_frontier_pending(
     crash_parked: u64,
     wait_parked: u64,
 ) -> bool {
-    if EXPLORER_SPAWNED.load(Ordering::Relaxed) != 1 {
-        return false;
-    }
     if explorer_chrome_runtime_milestones_reached() {
         return false;
     }
-    let Some(pi) = live_hosted_pi_for_role(
+    let Some(pi) = live_hosted_pi_for_observation_role(
         nt_handler,
         nt_exe_image::HostedProcessRole::InteractiveShell,
     ) else {
@@ -5833,8 +5879,14 @@ unsafe fn pre_user_shell_frontier_pending(
     wait_parked: u64,
     reason: &[u8],
 ) -> bool {
-    if USERINIT_SPAWNED.load(Ordering::Relaxed) != 0
-        || SERVICES_SPAWNED.load(Ordering::Relaxed) == 0
+    if live_hosted_pi_for_observation_role(
+        nt_handler,
+        nt_exe_image::HostedProcessRole::InteractiveShellBootstrap,
+    ).is_some()
+        || live_hosted_pi_for_observation_role(
+            nt_handler,
+            nt_exe_image::HostedProcessRole::ServiceControlManager,
+        ).is_none()
     {
         return false;
     }
@@ -5843,10 +5895,11 @@ unsafe fn pre_user_shell_frontier_pending(
     // Those waiters are live, but they are not runnable work that should defer the interactive
     // login gate once the pre-user-shell path has otherwise gone idle.
     let mut runnable_owners = runnable_top_badges(nt_handler) & !(crash_parked | wait_parked);
-    if let Some(winlogon_badge) = hosted_top_badge_for_role(
+    if let Some(winlogon_badge) = live_hosted_pi_for_observation_role(
         nt_handler,
         nt_exe_image::HostedProcessRole::InteractiveLogon,
-    ) {
+    ).and_then(|pi| nt_handler.hosted_process_top_badge(pi))
+    {
         if winlogon_badge < 64 {
             runnable_owners &= !(1u64 << winlogon_badge);
         }
@@ -5868,7 +5921,10 @@ unsafe fn pre_user_shell_frontier_pending(
         print_str(b" lsa-active=");
         print_u64(LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed));
         print_str(b" userinit=");
-        print_u64(USERINIT_SPAWNED.load(Ordering::Relaxed));
+        print_u64(live_hosted_pi_for_observation_role(
+            nt_handler,
+            nt_exe_image::HostedProcessRole::InteractiveShellBootstrap,
+        ).is_some() as u64);
         print_str(b"\n");
     }
     true
@@ -5882,19 +5938,24 @@ unsafe fn dump_shell_launch_quiesce(
     procs: &[ProcExec],
     pfilled: &[[u64; 512]],
 ) {
-    if USERINIT_SPAWNED.load(Ordering::Relaxed) != 0
+    let userinit_pi = live_hosted_pi_for_observation_role(
+        nt_handler,
+        nt_exe_image::HostedProcessRole::InteractiveShellBootstrap,
+    );
+    let explorer_pi = live_hosted_pi_for_observation_role(
+        nt_handler,
+        nt_exe_image::HostedProcessRole::InteractiveShell,
+    );
+    if userinit_pi.is_some()
         && USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed) == 0
         && EXPLORER_IMAGE_OPEN_SUCCESSES.load(Ordering::Relaxed) == 0
     {
-        if let Some(pi) = live_hosted_pi_for_role(
-            nt_handler,
-            nt_exe_image::HostedProcessRole::InteractiveShellBootstrap,
-        ) {
+        if let Some(pi) = userinit_pi {
             if SHELL_LAUNCH_QUIESCE_DUMPED.fetch_or(1, Ordering::Relaxed) & 1 == 0 {
                 print_str(b"[shell-launch] userinit spawned but no shell image open attempt; pi=");
                 print_u64(pi as u64);
                 print_str(b" spawned=");
-                print_u64(USERINIT_SPAWNED.load(Ordering::Relaxed));
+                print_u64(1);
                 print_str(b" shell-attempts=");
                 print_u64(USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed));
                 print_str(b" explorer-opens=");
@@ -5914,20 +5975,17 @@ unsafe fn dump_shell_launch_quiesce(
         }
     }
 
-    if EXPLORER_SPAWNED.load(Ordering::Relaxed) != 0
+    if explorer_pi.is_some()
         && EXPLORER_CREATE_WINDOW_STRING_CAPTURES.load(Ordering::Relaxed) == 0
     {
-        if let Some(pi) = live_hosted_pi_for_role(
-            nt_handler,
-            nt_exe_image::HostedProcessRole::InteractiveShell,
-        ) {
+        if let Some(pi) = explorer_pi {
             if SHELL_LAUNCH_QUIESCE_DUMPED.fetch_or(2, Ordering::Relaxed) & 2 == 0 {
                 print_str(
                     b"[shell-launch] explorer spawned before first captured CreateWindow string; pi=",
                 );
                 print_u64(pi as u64);
                 print_str(b" spawned=");
-                print_u64(EXPLORER_SPAWNED.load(Ordering::Relaxed));
+                print_u64(1);
                 print_str(b" create-window-strings=");
                 print_u64(EXPLORER_CREATE_WINDOW_STRING_CAPTURES.load(Ordering::Relaxed));
                 print_str(b" connected-mask=0x");
@@ -5947,14 +6005,11 @@ unsafe fn dump_shell_launch_quiesce(
         }
     }
 
-    if EXPLORER_SPAWNED.load(Ordering::Relaxed) != 0
+    if explorer_pi.is_some()
         && (EXPLORER_REGISTER_WINDOW_MESSAGE_CAPTURES.load(Ordering::Relaxed) == 0
             || EXPLORER_BEGIN_PAINTS.load(Ordering::Relaxed) == 0)
     {
-        if let Some(pi) = live_hosted_pi_for_role(
-            nt_handler,
-            nt_exe_image::HostedProcessRole::InteractiveShell,
-        ) {
+        if let Some(pi) = explorer_pi {
             if SHELL_LAUNCH_QUIESCE_DUMPED.fetch_or(4, Ordering::Relaxed) & 4 == 0 {
                 print_str(b"[shell-launch] explorer spawned before shell chrome milestones; pi=");
                 print_u64(pi as u64);
@@ -5994,11 +6049,11 @@ unsafe fn dump_lsa_readiness_quiesce(
         return;
     }
 
-    let services_pi = live_hosted_pi_for_role(
+    let services_pi = live_hosted_pi_for_observation_role(
         nt_handler,
         nt_exe_image::HostedProcessRole::ServiceControlManager,
     );
-    let lsass_pi = live_hosted_pi_for_role(
+    let lsass_pi = live_hosted_pi_for_observation_role(
         nt_handler,
         nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
     );
@@ -6024,9 +6079,9 @@ unsafe fn dump_lsa_readiness_quiesce(
         None => print_str(b"none"),
     }
     print_str(b" services-spawned=");
-    print_u64(SERVICES_SPAWNED.load(Ordering::Relaxed));
+    print_u64(services_pi.is_some() as u64);
     print_str(b" lsass-spawned=");
-    print_u64(LSASS_SPAWNED.load(Ordering::Relaxed));
+    print_u64(lsass_pi.is_some() as u64);
     print_str(b" srm-port=0x");
     print_hex_u64(SRM_COMMAND_PORT_OBJECT_HANDLE.load(Ordering::Relaxed));
     print_str(b" srm-connected=");
@@ -6089,20 +6144,25 @@ unsafe fn dump_services_start_quiesce(
     procs: &[ProcExec],
     pfilled: &[[u64; 512]],
 ) {
-    if SERVICES_SPAWNED.load(Ordering::Relaxed) == 0
-        || USERINIT_SPAWNED.load(Ordering::Relaxed) != 0
-        || EXPLORER_SPAWNED.load(Ordering::Relaxed) != 0
-    {
+    let services_pi = live_hosted_pi_for_observation_role(
+        nt_handler,
+        nt_exe_image::HostedProcessRole::ServiceControlManager,
+    );
+    let userinit_pi = live_hosted_pi_for_observation_role(
+        nt_handler,
+        nt_exe_image::HostedProcessRole::InteractiveShellBootstrap,
+    );
+    let explorer_pi = live_hosted_pi_for_observation_role(
+        nt_handler,
+        nt_exe_image::HostedProcessRole::InteractiveShell,
+    );
+    if services_pi.is_none() || userinit_pi.is_some() || explorer_pi.is_some() {
         return;
     }
     if SERVICES_START_QUIESCE_DUMPED.fetch_or(1, Ordering::Relaxed) & 1 != 0 {
         return;
     }
 
-    let services_pi = live_hosted_pi_for_role(
-        nt_handler,
-        nt_exe_image::HostedProcessRole::ServiceControlManager,
-    );
     print_str(b"[services-quiesce] services spawned before user shell launch");
     print_str(b" pi=");
     match services_pi {
@@ -6118,9 +6178,9 @@ unsafe fn dump_services_start_quiesce(
     print_str(b" scm-worker-faults=");
     print_u64(SCM_WORKER_FAULTS.load(Ordering::Relaxed));
     print_str(b" userinit=");
-    print_u64(USERINIT_SPAWNED.load(Ordering::Relaxed));
+    print_u64(userinit_pi.is_some() as u64);
     print_str(b" explorer=");
-    print_u64(EXPLORER_SPAWNED.load(Ordering::Relaxed));
+    print_u64(explorer_pi.is_some() as u64);
     print_str(b"\n");
 
     if let Some(pi) = services_pi {
@@ -22178,7 +22238,7 @@ pub(crate) unsafe fn service_sec_image(
     {
         loader_trace_dump(&reg);
     }
-    if let Some(winlogon_pi) = live_hosted_pi_for_role(
+    if let Some(winlogon_pi) = live_hosted_pi_for_observation_role(
         &nt_handler,
         nt_exe_image::HostedProcessRole::InteractiveLogon,
     ) {
@@ -22194,7 +22254,7 @@ pub(crate) unsafe fn service_sec_image(
     } else {
         WINLOGON_FAULTS.store(0, Ordering::Relaxed);
     }
-    if let Some(services_pi) = live_hosted_pi_for_role(
+    if let Some(services_pi) = live_hosted_pi_for_observation_role(
         &nt_handler,
         nt_exe_image::HostedProcessRole::ServiceControlManager,
     ) {
@@ -22210,7 +22270,7 @@ pub(crate) unsafe fn service_sec_image(
     } else {
         SERVICES_FAULTS.store(0, Ordering::Relaxed);
     }
-    if let Some(lsass_pi) = live_hosted_pi_for_role(
+    if let Some(lsass_pi) = live_hosted_pi_for_observation_role(
         &nt_handler,
         nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
     ) {
@@ -22391,7 +22451,7 @@ unsafe fn dump_interactive_logon_quiesce(
     procs: &[ProcExec],
     pfilled: &[[u64; 512]],
 ) {
-    let Some(pi) = hosted_pi_for_role(
+    let Some(pi) = live_hosted_pi_for_observation_role(
         nt_handler,
         nt_exe_image::HostedProcessRole::InteractiveLogon,
     ) else {
@@ -26371,16 +26431,20 @@ fn userinit_shell_frontier_pending(
     crash_parked: u64,
     wait_parked: u64,
 ) -> bool {
-    if USERINIT_SPAWNED.load(Ordering::Relaxed) != 1
-        || USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed) != 0
-    {
+    if USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed) != 0 {
         return false;
     }
-    let userinit_badge = hosted_top_badge_for_role(
+    let Some(userinit_badge) = live_hosted_pi_for_observation_role(
         nt_handler,
         nt_exe_image::HostedProcessRole::InteractiveShellBootstrap,
     )
-    .expect("userinit hosted metadata must be registered once userinit is spawned");
+    .and_then(|pi| nt_handler.hosted_process_top_badge(pi))
+    else {
+        return false;
+    };
+    if userinit_badge >= 64 {
+        return false;
+    }
     let userinit_bit = 1u64 << userinit_badge;
     (crash_parked | wait_parked) & userinit_bit == 0
 }

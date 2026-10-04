@@ -337,7 +337,11 @@ pub(crate) unsafe fn image_page_protection(
 }
 
 pub(crate) fn image_rva_protection(pe: &nt_pe_loader::PeFile, rva: u32) -> u32 {
-    match pe.image_protection_at(rva) {
+    image_protection_to_nt(pe.image_protection_at(rva))
+}
+
+pub(crate) fn image_protection_to_nt(protection: nt_pe_loader::ImageProtection) -> u32 {
+    match protection {
         nt_pe_loader::ImageProtection::ReadOnly => nt_address_space::PAGE_READONLY,
         nt_pe_loader::ImageProtection::ReadWrite => nt_address_space::PAGE_READWRITE,
         nt_pe_loader::ImageProtection::WriteCopy => nt_address_space::PAGE_WRITECOPY,

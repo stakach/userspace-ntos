@@ -70,6 +70,9 @@ No kernel build or proprietary Windows binaries are required. The optional
 Windows 7 export test requires a locally supplied `references/ntdll.dll`:
 `cargo test -p nt-pe-loader --test ntdll_exports -- --ignored`.
 Native builds and end-to-end CI are separate follow-ups, not covered by these specs.
+Disk-backed `SEC_IMAGE` sources retain their exact opened File, capture bounded PE
+metadata, and fill image pages from validated File spans. Mutable sources retain
+admission snapshots; the process constructor owns its separate loader snapshot.
 CI also checks native acceptance log parsing and fixture lifetimes through Clang's
 source AST. These host-only checks do not prove guest execution.
 The local `tests/native/mup_provider/run_kernel_only.sh` gate checks real

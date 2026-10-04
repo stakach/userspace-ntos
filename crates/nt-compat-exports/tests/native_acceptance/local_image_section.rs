@@ -119,11 +119,10 @@ fn sec_image_admits_exact_local_file_source_not_only_preloaded_boot_images() {
 }
 
 #[test]
-fn local_image_capture_retains_exact_file_and_reads_full_extent_before_publication() {
+fn local_image_capture_retains_exact_file_before_bounded_metadata_publication() {
     struct Capture {
         calls: Vec<String>,
         full_extent: bool,
-        exact_count: bool,
     }
     impl<'ast> Visit<'ast> for Capture {
         fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
@@ -141,12 +140,6 @@ fn local_image_capture_retains_exact_file_and_reads_full_extent_before_publicati
                 && matches!(&*field.base, Expr::Path(path) if path.path.is_ident("backing"));
             syn::visit::visit_expr_field(self, field);
         }
-        fn visit_expr_binary(&mut self, binary: &'ast syn::ExprBinary) {
-            self.exact_count |= matches!(binary.op, syn::BinOp::Ne(_))
-                && matches!(&*binary.left, Expr::Path(path) if path.path.is_ident("copied"))
-                && matches!(&*binary.right, Expr::Path(path) if path.path.is_ident("length"));
-            syn::visit::visit_expr_binary(self, binary);
-        }
     }
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../components/ntos-executive/src/file_image_section.rs");
@@ -156,19 +149,19 @@ fn local_image_capture_retains_exact_file_and_reads_full_extent_before_publicati
         syn::Item::Fn(function) if function.sig.ident == "submit_local_image_section" => Some(function),
         _ => None,
     }).expect("actual local image capture function");
-    let mut capture = Capture { calls: Vec::new(), full_extent: false, exact_count: false };
+    let mut capture = Capture { calls: Vec::new(), full_extent: false };
     capture.visit_block(&function.block);
     let position = |name: &str| capture.calls.iter().position(|call| call == name).unwrap();
-    assert!(capture.full_extent && capture.exact_count,
-        "capture must check the complete canonical File extent, not just a PE header prefix");
-    assert!(position("retain_io") < position("fat_read_file_range"));
-    assert!(position("retain_io_reference") < position("read_backing_into"));
+    assert!(capture.full_extent,
+        "bounded header planning uses the authenticated canonical File extent");
+    assert!(position("retain_io") < position("capture_image_layout"));
+    assert!(position("retain_io_reference") < position("capture_image_layout"));
     assert!(position("check_data_section_file_access") < position("retain_io"));
     assert!(position("check_data_section_file_access") < position("retain_io_reference"));
     assert!(position("probe_copy_scalar") < position("retain_io"));
     assert!(position("probe_copy_scalar") < position("retain_io_reference"));
-    assert!(position("fat_read_file_range") < position("reserve_local_native_image_section"));
-    assert!(position("read_backing_into") < position("reserve_local_native_image_section"));
+    assert!(position("capture_image_layout") < position("reserve_local_native_image_section"));
+    assert!(position("read_exact") < position("reserve_local_native_image_section"));
     assert!(!capture.calls.iter().any(|call| matches!(call.as_str(), "admit_dynamic_hosted_exe" | "load_fat")),
         "canonical image capture must not reopen by leaf or depend on boot role");
 }
@@ -224,8 +217,8 @@ fn cached_local_image_acquires_exact_area_before_snapshot_and_transfers_reservat
                 && matches!(&*call.receiver, Expr::Path(path) if path.path.is_ident("image"))) {
                 let mut calls = OrderedCalls::default();
                 calls.visit_block(&branch.then_branch);
-                self.capture_gated |= ["retain_io", "retain_io_reference", "try_reserve_exact",
-                    "fat_read_file_range", "read_backing_into"].iter()
+                self.capture_gated |= ["retain_io", "retain_io_reference", "capture_image_layout",
+                    "read_exact"].iter()
                     .all(|required| calls.0.iter().any(|call| call == required));
             }
             syn::visit::visit_expr_if(self, branch);
@@ -234,13 +227,13 @@ fn cached_local_image_acquires_exact_area_before_snapshot_and_transfers_reservat
     let mut reservation = Reservation::default();
     reservation.visit_block(&function.block);
     assert!(reservation.exact_area,
-        "local admission must acquire the exact canonical image area before allocating a duplicate EOF snapshot");
+        "local admission acquires the exact canonical image area before capturing another source");
     let position = |name: &str| reservation.calls.iter().position(|call| call == name).expect(name);
-    for effect in ["retain_io", "retain_io_reference", "fat_read_file_range", "read_backing_into"] {
+    for effect in ["retain_io", "retain_io_reference", "capture_image_layout", "read_exact"] {
         assert!(position("reserve") < position(effect), "area acquisition precedes {effect}");
     }
     assert!(reservation.capture_gated,
-        "only a new-area reservation may retain File IO and allocate/read the complete snapshot");
+        "only a new-area reservation may retain File IO and read metadata");
     assert!(reservation.transferred,
         "publication must receive the same held image reservation, not reacquire after capture");
     assert!(reservation.abort_pending_only,

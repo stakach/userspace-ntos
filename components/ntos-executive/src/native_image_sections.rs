@@ -53,22 +53,39 @@ impl From<ImageSectionError> for NativeImageError {
 #[must_use = "retire captured backing ownership after checked image purge"]
 pub(crate) struct NativeImageSource {
     pub(crate) backing: GenericSectionBacking,
-    pub(crate) pe_header: Vec<u8>,
+    pub(crate) layout: nt_pe_loader::PeLayout,
+    pub(crate) contents: NativeImageContents,
     pub(crate) local_file: Option<crate::file_image_section::LocalImageFile>,
     /// Captured opened pathname for process metadata, never source selection.
     pub(crate) image_path: Option<Vec<u8>>,
     pub(crate) observation_target: Option<nt_exe_image::CapturedImageObservation>,
 }
 
+/// Mounted Disk Files are immutable and retained for bounded page reads. Mutable Overlay and
+/// routed providers preserve their existing captured snapshot until a real write/paging fence
+/// is integrated; this is not a fallback between source kinds.
+pub(crate) enum NativeImageContents {
+    RetainedDisk,
+    Snapshot(Vec<u8>),
+}
+
 impl NativeImageSource {
-    pub(crate) fn has_complete_image(&self) -> bool {
+    pub(crate) fn has_readable_image(&self) -> bool {
         self.backing.is_live()
             && self.backing.file_extent != 0
-            && u64::try_from(self.pe_header.len()).ok() == Some(self.backing.file_extent)
+            && match &self.contents {
+                NativeImageContents::RetainedDisk => {
+                    self.local_file.is_some()
+                        && self.backing.kind == nt_memory_manager::GENERIC_SECTION_BACKING_DISK
+                }
+                NativeImageContents::Snapshot(bytes) => {
+                    u64::try_from(bytes.len()).ok() == Some(self.backing.file_extent)
+                }
+            }
     }
 
     fn valid_for(&self, file: SectionFileIdentity) -> bool {
-        self.backing.is_live() && self.backing.file == Some(file) && !self.pe_header.is_empty()
+        self.backing.file == Some(file) && self.has_readable_image()
     }
 }
 
@@ -242,7 +259,7 @@ impl NativeImageStore {
             .find(|source| source.area == section.area() && source.file == reservation.file)
             .ok_or(NativeImageError::InvalidSource)?;
         if !source.source.valid_for(reservation.file)
-            || !source.source.has_complete_image()
+            || !source.source.has_readable_image()
             || source.source.backing.file_extent != file_extent
         {
             return Err(NativeImageError::InvalidSource);
