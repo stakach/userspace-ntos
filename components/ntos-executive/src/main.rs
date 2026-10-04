@@ -57,6 +57,7 @@ mod ntoskrnl_shared;
 mod server;
 mod service_sec_image;
 mod hosted_stack_growth;
+mod local_section_file;
 mod storage_host;
 mod bootstrap_image;
 mod system_modules;

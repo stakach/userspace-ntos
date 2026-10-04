@@ -4,22 +4,7 @@ use crate::*;
 use alloc::vec::Vec;
 use nt_memory_manager::GenericSectionBacking;
 
-#[must_use = "release the retained local File only after exact image purge"]
-pub(crate) enum LocalImageFile {
-    Disk { object_id: u32, first_cluster: u32, size: u32 },
-    Overlay { object_id: u64 },
-}
-
-impl LocalImageFile {
-    pub(crate) unsafe fn release(self, handler: &mut ExecNtHandler) {
-        match self {
-            Self::Disk { object_id, .. } => handler.readonly_file_opens.release_io(object_id)
-                .expect("retained image disk File"),
-            Self::Overlay { object_id } => crate::writable_fs::release_io_reference(object_id)
-                .expect("retained image overlay File"),
-        }
-    }
-}
+pub(crate) use crate::local_section_file::LocalSectionFile as LocalImageFile;
 
 pub(crate) unsafe fn submit_local_image_section(
     handler: &mut ExecNtHandler,
