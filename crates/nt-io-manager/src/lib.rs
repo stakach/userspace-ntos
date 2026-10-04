@@ -28,6 +28,7 @@ mod close;
 mod complete;
 mod completion_unwind;
 mod device;
+pub mod device_queue;
 pub mod device_power;
 mod device_file_name;
 mod device_reference;
