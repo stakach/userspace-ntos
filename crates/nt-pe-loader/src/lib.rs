@@ -16,15 +16,16 @@ mod headers;
 mod image;
 mod image_page_fill;
 pub mod immutable_support_image;
-pub mod system_module;
-pub mod system_image_request;
-pub mod load_failure;
-pub mod module_namespace;
 mod imports;
-mod relocs;
+pub mod load_failure;
+mod mapped_relocations;
+pub mod module_namespace;
 mod relocation_snapshot;
-mod snapshot_capacity;
+mod relocs;
 mod rva;
+mod snapshot_capacity;
+pub mod system_image_request;
+pub mod system_module;
 
 pub use exports::ExportedSymbol;
 pub use headers::{
@@ -34,8 +35,9 @@ pub use headers::{
 pub use image::MappedImage;
 pub use image_page_fill::{ImagePageFileSpan, ImagePageFillPlan, IMAGE_PAGE_SIZE};
 pub use imports::{ImportRef, ImportedDll};
-pub use relocs::{RelocKind, Relocation};
+pub use mapped_relocations::{plan_mapped_relocations, MappedRelocationPlan};
 pub use relocation_snapshot::relocate_file_snapshot;
+pub use relocs::{RelocKind, Relocation};
 pub use snapshot_capacity::reserve_file_snapshot_capacity;
 
 /// A valid `__security_cookie` (`/GS`) seed. MSVC's x64 `__security_check_cookie`
@@ -166,6 +168,8 @@ pub enum PeError {
     ImportTableInvalid,
     /// The base-relocation table is malformed.
     RelocationInvalid,
+    /// A rebased mapped image explicitly stripped its relocation information.
+    RelocationsStripped,
     /// A base-relocation type outside NT's ABSOLUTE/HIGH/LOW/HIGHLOW/DIR64 set.
     UnsupportedRelocation(u16),
     /// A relocation / IAT patch target is out of the mapped image.

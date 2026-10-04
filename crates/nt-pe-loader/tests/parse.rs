@@ -13,6 +13,9 @@ mod raw_relocation;
 #[path = "parse/snapshot_capacity.rs"]
 mod snapshot_capacity;
 
+#[path = "parse/image_view_layout.rs"]
+mod image_view_layout;
+
 // --- a minimal PE32+ image builder -----------------------------------------
 
 const NT_OFF: usize = 0x40;
@@ -164,10 +167,7 @@ fn image_page_fill_matches_eager_headers_sections_and_zero_pages() {
     let eager = pe.map(BASE).unwrap();
     for rva in [0, 0x1000, 0x2000, 0x3000, 0x4000] {
         let page = fill_image_page(&pe, rva, bytes.len() as u64);
-        assert_eq!(
-            &page[..],
-            &eager.bytes[rva as usize..rva as usize + 0x1000]
-        );
+        assert_eq!(&page[..], &eager.bytes[rva as usize..rva as usize + 0x1000]);
     }
     assert_eq!(
         pe.image_page_fill_plan(0x1000, bytes.len() as u64)
@@ -235,7 +235,13 @@ fn image_page_fill_rejects_subpage_section_protection() {
 
 #[test]
 fn image_page_fill_rejects_header_table_outside_declared_headers() {
-    let mut bytes = build_pe(BASE, 0x1000, 0x3000, &[text_section(0x1000, vec![0xcc])], &[]);
+    let mut bytes = build_pe(
+        BASE,
+        0x1000,
+        0x3000,
+        &[text_section(0x1000, vec![0xcc])],
+        &[],
+    );
     put_u32(&mut bytes, OPT_OFF + 60, 0x100);
     let pe = PeFile::parse(&bytes).unwrap();
     assert_eq!(
@@ -1129,35 +1135,67 @@ fn export_directory_walk_resolves_high_index_forwarder_and_boundaries() {
 
     let mapped = pe.map(BASE).unwrap();
     let namespace = nt_pe_loader::module_namespace::ImageExports::from_mapped(
-        "actual.dll", BASE, &mapped.bytes,
-    ).unwrap();
+        "actual.dll",
+        BASE,
+        &mapped.bytes,
+    )
+    .unwrap();
     use nt_pe_loader::module_namespace::{resolve, ExportTarget, Symbol};
     assert_eq!(
-        resolve(core::slice::from_ref(&namespace), "actual.dll",
-            &Symbol::Name("GetSystemTimeAsFileTime".into())),
+        resolve(
+            core::slice::from_ref(&namespace),
+            "actual.dll",
+            &Symbol::Name("GetSystemTimeAsFileTime".into())
+        ),
         Ok(BASE + u64::from(gst.rva)),
     );
     assert_eq!(
-        resolve(core::slice::from_ref(&namespace), "actual.dll", &Symbol::Ordinal(gst.ordinal)),
+        resolve(
+            core::slice::from_ref(&namespace),
+            "actual.dll",
+            &Symbol::Ordinal(gst.ordinal)
+        ),
         Ok(BASE + u64::from(gst.rva)),
     );
     assert!(matches!(
-        namespace.exports.iter().find(|e| e.name == "FwdExport").unwrap().target,
+        namespace
+            .exports
+            .iter()
+            .find(|e| e.name == "FwdExport")
+            .unwrap()
+            .target,
         ExportTarget::Forwarder(_),
     ));
-    assert!(nt_pe_loader::module_namespace::ImageExports::from_mapped("actual.dll", BASE, &mapped.bytes[..0x100]).is_err());
+    assert!(nt_pe_loader::module_namespace::ImageExports::from_mapped(
+        "actual.dll",
+        BASE,
+        &mapped.bytes[..0x100]
+    )
+    .is_err());
 
     let mut unterminated_forwarder = mapped.bytes.clone();
     unterminated_forwarder[(EDATA_VA + edata_size - 1) as usize] = b'X';
-    assert!(nt_pe_loader::module_namespace::ImageExports::from_mapped(
-        "actual.dll", BASE, &unterminated_forwarder,
-    ).is_err(), "a forwarder must terminate inside the export directory");
+    assert!(
+        nt_pe_loader::module_namespace::ImageExports::from_mapped(
+            "actual.dll",
+            BASE,
+            &unterminated_forwarder,
+        )
+        .is_err(),
+        "a forwarder must terminate inside the export directory"
+    );
 
     let mut invalid_target = mapped.bytes.clone();
     put_u32(&mut invalid_target, (EDATA_VA + aof_local) as usize, 0x4000);
-    assert!(nt_pe_loader::module_namespace::ImageExports::from_mapped(
-        "actual.dll", BASE, &invalid_target,
-    ).is_err(), "a concrete export must remain inside the mapped image");
+    assert!(
+        nt_pe_loader::module_namespace::ImageExports::from_mapped(
+            "actual.dll",
+            BASE,
+            &invalid_target,
+        )
+        .is_err(),
+        "a concrete export must remain inside the mapped image"
+    );
 
     let mut invalid = pe_bytes.clone();
     let ordinal_file_offset = pe.sections()[1].pointer_to_raw_data as usize + aono_local as usize;
