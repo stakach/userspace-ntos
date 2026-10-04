@@ -21,6 +21,9 @@ mod file_create;
 #[path = "exec_named_sections.rs"]
 mod named_sections;
 
+#[path = "exec_named_directories.rs"]
+mod named_directories;
+
 #[path = "file_image_section.rs"]
 pub(crate) mod file_image_section;
 
@@ -37327,51 +37330,9 @@ impl ExecNtHandler {
             // NtOpen/CreateDirectoryObject(*Handle[R10]=args[0], DesiredAccess, *OA[R8]=args[2]).
             // Resolve/insert in the executive object namespace, hand back a real handle.
             NativeService::NtOpenDirectoryObject | NativeService::NtCreateDirectoryObject => unsafe {
-                let out = args[0]; // R10 = *Handle
-                let desired_access = nt_ulong_arg(args[1]);
-                let oa = args[2]; // R8 = *OBJECT_ATTRIBUTES
-                if out == 0 {
-                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                }
-                if out & 7 != 0 {
-                    return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
-                }
-                if !self.probe_event_output(out, 8) {
-                    return 0xC000_0005;
-                }
-                let captured = match self.capture_named_object_attributes(oa) {
-                    Ok(captured) => captured,
-                    Err(status) => return status,
-                };
-                if captured.path().is_none() {
-                    return 0xC000_0033; // STATUS_OBJECT_NAME_INVALID
-                }
-                let caller = match self.native_handle_caller(ctx.previous_mode) {
-                    Ok(caller) => caller,
-                    Err(status) => return status,
-                };
-                let mut staged = match self.stage_native_directory_object_open(
-                    &captured,
-                    caller,
-                    desired_access,
-                    ctx.service == NativeService::NtCreateDirectoryObject,
-                ) {
-                    Ok(staged) => staged,
-                    Err(status) => return status,
-                };
-                if !self.xas_write_u64(out, staged.publication.value()) {
-                    self.abort_staged_directory_object_open(&mut staged);
-                    return 0xC000_0005;
-                }
-                if let Err(status) = staged.publication.publish(&mut self.pm) {
-                    self.abort_staged_directory_object_open(&mut staged);
-                    return status;
-                }
-                self.record_process_handle_insert(
-                    staged.publication.process_id(),
-                    staged.cap_before,
-                );
-                staged.status
+                self.nt_named_directory_service(
+                    args, ctx.previous_mode, ctx.service == NativeService::NtCreateDirectoryObject,
+                )
             },
             // Enumerate the canonical namespace through the shared NT x64 packing contract.
             NativeService::NtQueryDirectoryObject => unsafe {
