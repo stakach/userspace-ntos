@@ -156,8 +156,11 @@ includes the credential dialog. After removing synthetic USER bindings, the late
 [media-policy boot](docs/evidence/issue18-livecd-setup-file-admission-failure.json)
 launched genuine setup but failed a dependency File open. The fresh
 [File-capacity boot](docs/evidence/issue18-livecd-theme-helper-startup-failure.json)
-progressed into syssetup, then its theme helper faulted at startup. The screenshot
-still contains only background and cursor, not a current Explorer desktop.
+progressed into syssetup, then its theme helper faulted at startup. The latest
+[full USER-range boot](docs/evidence/issue18-livecd-rpcrt4-queued-fault-failure.json)
+executed high preferred DLL addresses but rejected a queued sibling page fault in
+svchost's rpcrt4 mapping. Its screenshot still contains only background and cursor,
+not a current Explorer desktop.
 Crate CI does not prove desktop boot. To attempt a boot from a fresh clone:
 
 ```sh

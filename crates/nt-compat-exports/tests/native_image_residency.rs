@@ -25,24 +25,66 @@ fn source() -> syn::File {
     .unwrap()
 }
 
-fn calls(file: &syn::File, name: &str) -> Vec<String> {
-    let function = file
-        .items
+fn function<'a>(file: &'a syn::File, name: &str) -> &'a syn::ItemFn {
+    file.items
         .iter()
         .find_map(|item| match item {
             syn::Item::Fn(function) if function.sig.ident == name => Some(function),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("missing canonical image lifecycle function {name}"));
+        .unwrap_or_else(|| panic!("missing canonical image lifecycle function {name}"))
+}
+
+fn calls(file: &syn::File, name: &str) -> Vec<String> {
+    let function = function(file, name);
     let mut calls = Calls::default();
     calls.visit_block(&function.block);
     calls.0
 }
 
+fn residency_calls(file: &syn::File) -> Vec<String> {
+    let wrapper = function(file, "service_native_image_page_residency");
+    let invocation = wrapper.block.stmts.iter().find_map(|statement| {
+        let syn::Stmt::Local(local) = statement else { return None; };
+        let syn::Expr::Call(call) = &*local.init.as_ref()?.expr else { return None; };
+        matches!(&*call.func, syn::Expr::Path(path) if path.path.is_ident("service_page_residency"))
+            .then_some(call)
+    }).expect("public residency wrapper must call the actual owner implementation");
+    assert_eq!(invocation.args.len(), 6);
+    for (argument, expected) in
+        invocation
+            .args
+            .iter()
+            .take(5)
+            .zip(["handler", "view", "page", "access", "fault_observed"])
+    {
+        assert!(
+            matches!(argument, syn::Expr::Path(path) if path.path.is_ident(expected)),
+            "residency wrapper must preserve {expected}"
+        );
+    }
+    let wrapper_calls = calls(file, "service_native_image_page_residency");
+    assert_eq!(
+        wrapper_calls
+            .iter()
+            .filter(|call| *call == "service_page_residency")
+            .count(),
+        1
+    );
+    assert!(
+        !wrapper_calls.iter().any(|call| matches!(
+            call.as_str(),
+            "acquire" | "ensure_source_page" | "install_view_page"
+        )),
+        "all borrow and mapping effects belong to the inner residency operation"
+    );
+    calls(file, "service_page_residency")
+}
+
 #[test]
 fn canonical_image_source_fill_precedes_any_view_mapping() {
     let file = source();
-    let sequence = calls(&file, "service_native_image_page_residency");
+    let sequence = residency_calls(&file);
     let source = sequence
         .iter()
         .position(|call| call == "ensure_source_page")
@@ -104,7 +146,7 @@ fn canonical_image_view_registration_is_borrowed_and_source_purge_is_acknowledge
 #[test]
 fn canonical_image_access_uses_current_committed_protection_not_raw_pe_flags() {
     let file = source();
-    let sequence = calls(&file, "service_native_image_page_residency");
+    let sequence = residency_calls(&file);
     let metadata = sequence
         .iter()
         .position(|call| call == "process_committed_mapping_basic_information")
@@ -124,6 +166,76 @@ fn canonical_image_access_uses_current_committed_protection_not_raw_pe_flags() {
     );
     assert!(!sequence.iter().any(|call|call=="vm_promote_image_cow_page"||call=="vm_promote_mapped_cow_page"),
         "legacy unchecked COW cleanup cannot own canonical image installation");
+}
+
+#[test]
+fn residency_failure_diagnostic_runs_after_inner_borrow_ends() {
+    let file = source();
+    let inner = residency_calls(&file);
+    assert_eq!(inner.first().map(String::as_str), Some("acquire"));
+    assert!(
+        !inner.iter().any(|call| call == "trace_image_fault_failure"),
+        "do not emit diagnostics while the residency owner is borrowed"
+    );
+    let wrapper = function(&file, "service_native_image_page_residency");
+    let returned = wrapper
+        .block
+        .stmts
+        .iter()
+        .position(|statement| {
+            matches!(statement, syn::Stmt::Local(local)
+            if matches!(&local.pat, syn::Pat::Ident(binding) if binding.ident == "result")
+            && local.init.as_ref().is_some_and(|initializer| matches!(&*initializer.expr,
+                syn::Expr::Call(call) if matches!(&*call.func,
+                    syn::Expr::Path(path) if path.path.is_ident("service_page_residency")))))
+        })
+        .expect("capture the completed inner operation before formatting evidence");
+    let diagnostic = wrapper
+        .block
+        .stmts
+        .iter()
+        .enumerate()
+        .find_map(|(index, statement)| {
+            let syn::Stmt::Expr(syn::Expr::If(branch), _) = statement else {
+                return None;
+            };
+            let mut calls = Calls::default();
+            calls.visit_block(&branch.then_branch);
+            calls
+                .0
+                .iter()
+                .any(|call| call == "trace_image_fault_failure")
+                .then_some((index, branch))
+        })
+        .expect("actual faults retain failure evidence");
+    assert!(returned < diagnostic.0);
+    assert!(
+        matches!(&*diagnostic.1.cond, syn::Expr::Let(condition)
+        if matches!(&*condition.pat, syn::Pat::TupleStruct(pattern) if pattern.path.is_ident("Err"))
+        && matches!(&*condition.expr, syn::Expr::Path(path) if path.path.is_ident("result"))),
+        "successful residency must not emit failure evidence"
+    );
+    let fault_guarded = diagnostic.1.then_branch.stmts.iter().any(|statement| {
+        let syn::Stmt::Expr(syn::Expr::If(branch), _) = statement else {
+            return false;
+        };
+        let mut calls = Calls::default();
+        calls.visit_block(&branch.then_branch);
+        matches!(&*branch.cond, syn::Expr::Path(path) if path.path.is_ident("fault_observed"))
+            && calls
+                .0
+                .iter()
+                .any(|call| call == "trace_image_fault_failure")
+    });
+    assert!(
+        fault_guarded,
+        "ordinary memory-copy refusals are not hardware fault diagnostics"
+    );
+    assert!(
+        matches!(wrapper.block.stmts.last(), Some(syn::Stmt::Expr(syn::Expr::Path(path), None))
+        if path.path.is_ident("result")),
+        "diagnostics must preserve the original residency result"
+    );
 }
 
 #[test]
