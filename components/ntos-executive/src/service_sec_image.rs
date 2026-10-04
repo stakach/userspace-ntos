@@ -3204,10 +3204,11 @@ fn sec_image_page_shareable(
     pe: &nt_pe_loader::PeFile,
     rva: u32,
     base: u64,
+    main_image_base: u64,
     protection: u32,
     plan: nt_address_space::VmImageViewFaultPlan,
 ) -> bool {
-    base != PE_LOAD_BASE
+    base != main_image_base
         && (nt_address_space::image_view_shared_cacheable(protection, plan.map_protection)
             || (!plan.copy_on_write
                 && (protection & 0xff) == nt_address_space::PAGE_WRITECOPY
@@ -3295,7 +3296,9 @@ pub(crate) unsafe fn service_image_page_residency(
         return Ok(());
     }
 
-    let shareable = sec_image_page_shareable(pe, rva, base, info.protect, fault_plan);
+    let main_image_base = nt_handler.loop_ctx.and_then(|ctx| ctx.for_process(pi))
+        .ok_or(nt_process::STATUS_INVALID_HANDLE)?.img_base;
+    let shareable = sec_image_page_shareable(pe, rva, base, main_image_base, info.protect, fault_plan);
     let cached = if shareable { dll_cache_get(page) } else { 0 };
 
     if !fault_observed
@@ -6167,6 +6170,7 @@ struct HostedExeSpawn<'a> {
     image: nt_exe_image::HostedProcessImageRef<'a>,
     runtime: HostedProcessRuntime,
     pe: &'a nt_pe_loader::PeFile<'static>,
+    layout: nt_exe_image::ProcessImageLayout,
     spawned: &'static AtomicU64,
     _image_reader: crate::hosted_loaded_images::HostedImageReadScope,
 }
@@ -6253,10 +6257,12 @@ unsafe fn hosted_exe_spawn_for<'a>(
         unsafe { crate::hosted_loaded_images::HostedImageReadScope::capture(loaded_images, target).ok()? }
     };
     let pe = unsafe { (&*loaded_images).pe_by_pi(target.pi)? };
+    let layout = (&*loaded_images).layout_by_pi(target.pi)?;
     Some(HostedExeSpawn {
         image,
         runtime,
         pe,
+        layout,
         spawned,
         _image_reader: image_reader,
     })
@@ -6288,6 +6294,7 @@ unsafe fn spawn_requested_hosted_exe(
                 .ok_or(nt_process::STATUS_INVALID_HANDLE)?,
         ),
         spec.pe,
+        spec.layout,
         mint_badged(fault_ep, spec.image.top_badge)?,
         Some(ntdll),
         true,
@@ -6303,7 +6310,8 @@ unsafe fn spawn_requested_hosted_exe(
         return Err(nt_process::STATUS_INVALID_HANDLE);
     }
     nt_handler.register_main_thread_spawn(pi, child_spawn)?;
-    procs[pi].img_end = PE_LOAD_BASE + image_extent(spec.pe);
+    procs[pi].img_base = spec.layout.base();
+    procs[pi].img_end = spec.layout.end();
     procs[pi].scratch_base = spec.runtime.scratch_base;
     map_demand_scratch_pts(spec.runtime.scratch_base);
 
@@ -8071,7 +8079,9 @@ pub(crate) unsafe fn service_sec_image(
     let main_tcb = primary_spawn.main_tcb;
     loader_trace_clear();
     reset_deferred_user_callback_returns();
-    let img_end = PE_LOAD_BASE + image_extent(pe);
+    let primary_layout = primary_spawn.layout;
+    let img_base = primary_layout.base();
+    let img_end = primary_layout.end();
     let nt_base = ntdll.0;
     let nt_end = nt_base + image_extent(ntdll.1);
     let mut faults: u64;
@@ -8322,6 +8332,7 @@ pub(crate) unsafe fn service_sec_image(
         .expect("primary VSpace publication requires a registered bootstrap process");
     procs[primary_pi].scratch_base = scratch_base;
     procs[primary_pi].img_end = img_end;
+    procs[primary_pi].img_base = img_base;
     // Per-process demand-fill bookkeeping is kept out of the bounded rootserver stack. It is now a
     // heap-backed slice sized for the runtime process-index window instead of a fixed BSS matrix.
     let pfilled = reset_pfilled_work(MAX_PI).expect("process fault scratch allocation failed");
@@ -8716,6 +8727,7 @@ pub(crate) unsafe fn service_sec_image(
         ntdll_pe: ntdll.1 as *const nt_pe_loader::PeFile as *const ()
             as *const nt_pe_loader::PeFile<'static>,
         img_end,
+        img_base,
         nt_base,
         nt_end,
         dll_pe_store: dll_pe_store as *mut DllPeStore,
@@ -9357,6 +9369,7 @@ pub(crate) unsafe fn service_sec_image(
         ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
         ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
         let img_end = procs[pi].img_end;
+        let img_base = procs[pi].img_base;
         let event_image_target = nt_exe_image::SpawnTarget::from_image(
             exe_image_catalog.get_by_pi(pi).expect("event retains its exact executable identity"),
         );
@@ -9397,6 +9410,7 @@ pub(crate) unsafe fn service_sec_image(
             faults: &mut faults as *mut u64,
             scratch_base,
             img_end,
+            img_base,
             ..memory_context
         });
         // A CPU exception (label 3). The DEBUG ntdll emits `int 0x2d` (DebugService/DPRINT),
@@ -10574,7 +10588,7 @@ pub(crate) unsafe fn service_sec_image(
                 process_committed_image_allocation(pi as u64, page)
             {
                 let base = image_owner.allocation_base;
-                let tpe = if base == PE_LOAD_BASE {
+                let tpe = if base == img_base {
                     pe
                 } else if nt_base != 0 && base == nt_base {
                     ntfaults += 1;
@@ -10688,7 +10702,7 @@ pub(crate) unsafe fn service_sec_image(
                             // + hosted image/env pointers so the immediate rpcrt4/lsasrv caller +
                             // the heap/env dispatch object are captured.
                             let is_dll = v >= 0x8000_0000 && v < 0x8300_0000;
-                            let is_hosted_image = v >= PE_LOAD_BASE && v < 0x0000_0100_00d0_0000;
+                            let is_hosted_image = v >= img_base && v < img_end;
                             let is_hosted_env = v >= HOSTED_CLIENT_ENV_BASE
                                 && v < HOSTED_CLIENT_ENV_BASE + 0x20_0000;
                             if is_ntdll || is_dll || is_hosted_image || is_hosted_env {
@@ -10945,7 +10959,7 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 let plan = nt_address_space::image_view_fault_plan(info.protect, false);
                 let shareable = sec_image_page_shareable(
-                    tpe, (bpage - base) as u32, base, info.protect, plan,
+                    tpe, (bpage - base) as u32, base, img_base, info.protect, plan,
                 );
                 if !shareable && !forward_policy.private_neighbours {
                     SEC_IMAGE_PRIVATE_PREFETCH_SKIPS.fetch_add(1, Ordering::Relaxed);
@@ -22863,8 +22877,8 @@ unsafe fn quiesce_addr_is_known(
     reg: &nt_dll_registry::Registry,
     ntdll: (u64, &nt_pe_loader::PeFile),
 ) -> bool {
-    if let Some(pe) = loaded_images.pe_by_pi(pi) {
-        if address >= PE_LOAD_BASE && address < PE_LOAD_BASE + image_extent(pe) {
+    if let Some(layout) = loaded_images.layout_by_pi(pi) {
+        if layout.rva(address).is_some() {
             return true;
         }
     }
@@ -22886,14 +22900,14 @@ unsafe fn print_quiesce_addr(
     print_str(b"0x");
     print_hex_u64(address);
     print_str(b"(");
-    if let Some(pe) = loaded_images.pe_by_pi(pi) {
-        if address >= PE_LOAD_BASE && address < PE_LOAD_BASE + image_extent(pe) {
+    if let Some(layout) = loaded_images.layout_by_pi(pi) {
+        if let Some(rva) = layout.rva(address) {
             match loaded_images.get_by_pi(pi) {
                 Some(image) => print_str(image.leaf()),
                 None => print_str(b"exe"),
             }
             print_str(b"+0x");
-            print_hex((address - PE_LOAD_BASE) as u32);
+            print_hex(rva as u32);
             print_str(b")");
             return;
         }

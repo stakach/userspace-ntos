@@ -133,6 +133,32 @@ fn admit<const N: usize>(catalog: &mut OwnedHostedImageCatalog<N>) -> SpawnTarge
 }
 
 #[test]
+fn exact_snapshot_layout_preserves_each_raw_source_base_and_attachment_lifetime() {
+    let mut catalog = OwnedHostedImageCatalog::<2>::new();
+    let first = admit(&mut catalog);
+    let second = admit(&mut catalog);
+    let mut table = HostedLoadedImageTable::new();
+    assert!(table.reset(MAX_PI));
+    let first_bytes = image_bytes(0x90);
+    let mut second_bytes = image_bytes(0xcc);
+    second_bytes[0x70..0x78].copy_from_slice(&0x1_8000_0000u64.to_le_bytes());
+    table.register_exact_loaded(catalog.get_by_pi(first.pi).unwrap(), first_bytes.clone()).unwrap();
+    table.register_exact_loaded(catalog.get_by_pi(second.pi).unwrap(), second_bytes.clone()).unwrap();
+    let first_layout = table.layout_by_pi(first.pi).unwrap();
+    let second_layout = table.layout_by_pi(second.pi).unwrap();
+    assert_eq!((first_layout.base(), first_layout.size(), first_layout.entry()),
+        (0x1_4000_0000, 0x2000, 0x1_4000_1000));
+    assert_eq!((second_layout.base(), second_layout.size(), second_layout.entry()),
+        (0x1_8000_0000, 0x2000, 0x1_8000_1000));
+    table.retire_exact(first).unwrap();
+    assert!(table.layout_by_pi(first.pi).is_none());
+    assert_eq!(table.retire_exact_snapshot(first).unwrap(), first_bytes);
+    assert_eq!(table.layout_by_pi(second.pi), Some(second_layout));
+    table.retire_exact(second).unwrap();
+    assert_eq!(table.retire_exact_snapshot(second).unwrap(), second_bytes);
+}
+
+#[test]
 fn private_snapshot_release_requires_exact_detached_owner_and_consumes_once() {
     let mut catalog = OwnedHostedImageCatalog::<2>::new();
     let first = admit(&mut catalog);

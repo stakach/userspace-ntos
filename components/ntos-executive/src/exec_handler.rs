@@ -8165,6 +8165,7 @@ impl ExecNtHandler {
             return Err(nt_process::STATUS_INVALID_PARAMETER);
         }
         unsafe { self.ensure_process_commit_owner(pid, pi)? };
+        unsafe { user_image_paging::mark_process_accounted(self, pi, caps) };
         self.process_vspaces[pi] = caps.pml4;
         self.process_vspace_caps[pi] = Some(caps);
         if pi < 64 {
@@ -15506,7 +15507,7 @@ impl ExecNtHandler {
     fn process_virtual_footprint(&self, pid: nt_process::ProcessId) -> u64 {
         if self.pm_pid_for_pi(self.pi) == Some(pid) {
             if let Some(ctx) = self.loop_ctx {
-                return ctx.img_end.saturating_sub(PE_LOAD_BASE).max(0x1000);
+                return ctx.img_end.saturating_sub(ctx.img_base).max(0x1000);
             }
         }
         let section = self
@@ -15523,9 +15524,9 @@ impl ExecNtHandler {
     unsafe fn current_process_image_information(&self) -> Option<[u8; 0x40]> {
         let ctx = self.loop_ctx?;
         let pe = ctx.main_image()?;
-        let metadata = image_metadata_from_pe(pe, PE_LOAD_BASE);
+        let metadata = image_metadata_from_pe(pe, ctx.img_base);
         let mut info = nt_dll_registry::image_info(
-            PE_LOAD_BASE,
+            ctx.img_base,
             metadata.entry_rva,
             metadata.image_size as u32,
             false,
@@ -16046,7 +16047,7 @@ impl ExecNtHandler {
             .or_else(|| self.temporary_pi_for_pid(pid))
     }
 
-    unsafe fn ensure_process_commit_owner(
+    pub(crate) unsafe fn ensure_process_commit_owner(
         &mut self,
         pid: nt_process::ProcessId,
         pi: usize,
@@ -16112,6 +16113,9 @@ impl ExecNtHandler {
                     return Err(status);
                 }
             }
+        }
+        if let Some(caps) = self.process_vspace_caps.get(pi).copied().flatten() {
+            user_image_paging::mark_process_accounted(self, pi, caps);
         }
         Ok(())
     }
@@ -17719,7 +17723,7 @@ impl ExecNtHandler {
                 let image = process_committed_image_allocation(target_pi as u64, plan.page)
                     .ok_or(nt_address_space::STATUS_NOT_COMMITTED)?;
                 let base = image.allocation_base;
-                let _image_reader = if base == PE_LOAD_BASE {
+                let _image_reader = if base == target.img_base {
                     let _durable = crate::allocator::enter_durable();
                     let image = (&*ctx.exe_image_catalog).get_by_pi(target_pi)
                         .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?;
@@ -17727,7 +17731,7 @@ impl ExecNtHandler {
                         ctx.hosted_loaded_images, nt_exe_image::SpawnTarget::from_image(image),
                     ).map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?)
                 } else { None };
-                let pe = if base == PE_LOAD_BASE {
+                let pe = if base == target.img_base {
                     (&*ctx.hosted_loaded_images)
                         .pe_by_pi(target_pi)
                         .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?
@@ -22723,11 +22727,11 @@ impl ExecNtHandler {
         while done < dst.len() {
             let cur = va + done as u64;
             let (pe, byte_rva): (&nt_pe_loader::PeFile, u32) =
-                if cur >= PE_LOAD_BASE && cur < ctx.img_end {
+                if cur >= ctx.img_base && cur < ctx.img_end {
                     let Some(pe) = ctx.main_image() else {
                         return false;
                     };
-                    (pe, (cur - PE_LOAD_BASE) as u32)
+                    (pe, (cur - ctx.img_base) as u32)
                 } else if !ctx.ntdll_pe.is_null() && cur >= ctx.nt_base && cur < ctx.nt_end {
                     (&*ctx.ntdll_pe, (cur - ctx.nt_base) as u32)
                 } else if let Some((i, rva)) = reg.dll_for_page(self.pi, cur) {

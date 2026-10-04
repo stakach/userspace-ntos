@@ -1710,6 +1710,8 @@ fn process_user_page_table_stats() -> nt_address_space::VmPageTableOwnershipStat
 
 pub(crate) unsafe fn process_user_page_table_commit_bytes(pi: usize) -> u64 {
     (&*core::ptr::addr_of!(PROCESS_USER_PAGE_TABLES)).process_commit_bytes(pi as u64)
+        .checked_add(user_image_paging::process_commit_bytes(pi))
+        .expect("bounded process paging ledger cannot overflow commitment")
 }
 
 /// Reclaim leaf page tables left by an address space which never reached process publication.
@@ -22489,11 +22491,12 @@ struct ExecLoopCtx {
     filled_pages: *mut [u64; 512],
     faults: *mut u64,
     /// The faulting image's persistent executive scratch base (smss's), and the two images
-    /// NtQueryDefaultLocale may demand-fill from (the main image at PE_LOAD_BASE up to
+    /// NtQueryDefaultLocale may demand-fill from (the main image at `img_base` up to
     /// `img_end`, and `ntdll_pe` in [`nt_base`,`nt_end`); `ntdll_pe` is null if absent).
     scratch_base: u64,
     ntdll_pe: *const nt_pe_loader::PeFile<'static>,
     img_end: u64,
+    img_base: u64,
     nt_base: u64,
     nt_end: u64,
     /// The mutable backing store for loadable DLL PEs (csrsrv/basesrv/winsrv + the Win32 client
@@ -22530,7 +22533,7 @@ impl ExecLoopCtx {
                 && pid == self.owner_pid
                 && generation == self.owner_generation).then_some(self);
         }
-        let pe = (&*self.hosted_loaded_images).pe_by_pi(pi)?;
+        let layout = (&*self.hosted_loaded_images).layout_by_pi(pi)?;
         let (filled_pages, faults) = if selection == nt_memory_manager::CopyBookkeeping::Live {
             let live = self.live_paging?;
             if target.pml4 != live.pml4 || pid != live.pid || generation != live.generation {
@@ -22549,7 +22552,8 @@ impl ExecLoopCtx {
             owner_generation: generation,
             pml4: target.pml4,
             scratch_base: target.scratch_base,
-            img_end: PE_LOAD_BASE.checked_add(pe.size_of_image() as u64)?,
+            img_base: layout.base(),
+            img_end: layout.end(),
             filled_pages,
             faults,
             ..self
@@ -26611,6 +26615,7 @@ struct ProcExec {
     scratch_base: u64,
     /// End VA of this process's mapped image — the demand-fill upper bound (was `img_ends[pi]`).
     img_end: u64,
+    img_base: u64,
     /// Total page faults serviced for this process (was `pfaults[pi]`).
     faults: u64,
     /// First faulting address seen for this process — diagnostics (was `pfirst[pi]`).
@@ -26625,6 +26630,7 @@ impl ProcExec {
             pml4: 0,
             scratch_base: 0,
             img_end: 0,
+            img_base: 0,
             faults: 0,
             first: 0,
             ntfaults: 0,
@@ -28460,6 +28466,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             sec_image_test_image,
             img_spawn::allocate_unpublished_image_lifetime(),
             &pe,
+            nt_exe_image::ProcessImageLayout::checked(PE_LOAD_BASE, u64::from(pe.size_of_image()), pe.entry_point_rva())
+                .expect("diagnostic image layout"),
             si_fault_c,
             None,
             false,
@@ -31907,6 +31915,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             },
                         ),
                         &pe,
+                        nt_exe_image::ProcessImageLayout::checked(PE_LOAD_BASE, u64::from(pe.size_of_image()), pe.entry_point_rva())
+                            .expect("bootstrap image layout"),
                         smss_fault_c,
                         Some((NTDLL_BASE, smss_ntdll_pe)),
                         true,

@@ -370,6 +370,18 @@ pub(crate) unsafe fn register_image_committed_mappings(
     image_base: u64,
 ) -> bool {
     let image_size = image_extent(pe);
+    register_image_range_committed_mappings(pi, pe, image_base, image_size)
+}
+
+unsafe fn register_image_layout_committed_mappings(
+    pi: u64, pe: &nt_pe_loader::PeFile, layout: nt_exe_image::ProcessImageLayout,
+) -> bool {
+    register_image_range_committed_mappings(pi, pe, layout.base(), layout.size())
+}
+
+unsafe fn register_image_range_committed_mappings(
+    pi: u64, pe: &nt_pe_loader::PeFile, image_base: u64, image_size: u64,
+) -> bool {
     let Some(image_end) = image_base.checked_add(image_size) else {
         return false;
     };
@@ -484,6 +496,7 @@ impl HostedProcessVspaceCaps {
 #[derive(Clone, Copy)]
 pub(crate) struct SecImageSpawn {
     pub(crate) lifetime: nt_memory_manager::MemoryLifetime,
+    pub(crate) layout: nt_exe_image::ProcessImageLayout,
     pub(crate) pml4: u64,
     pub(crate) main_tcb: u64,
     pub(crate) main_mechanism: HostedThreadMechanismCaps,
@@ -855,18 +868,45 @@ pub(crate) unsafe fn fill_image_page(pe: &nt_pe_loader::PeFile, rva: u32, dst: u
     RW_NX // gap between sections — a zero page
 }
 
-/// Demand-load a PE via SEC_IMAGE: build a fresh VSpace, RESERVE the image VA (page tables present,
-/// image pages ABSENT), map a stack + IPC buffer, and prepare the entry point. The caller decides
-/// whether the initial TCB starts immediately; child processes normally remain suspended until their
-/// creator resumes the typed initial-thread handle returned by `NtResumeThread`.
-unsafe fn reserve_sec_image_page_tables(pi: u64, pml4: u64, image_va: u64, extent: u64) -> u64 {
-    let span = extent.max(0x1000);
-    let start = image_va & !0x1f_ffff;
-    let end = image_va.saturating_add(span - 1) & !0x1f_ffff;
+/// Reject preferred image placement that overlaps constructor-owned user mappings.
+pub(crate) fn validate_hosted_main_image_layout(
+    layout: nt_exe_image::ProcessImageLayout,
+    ntdll: Option<(u64, u64)>,
+    setup_env: bool,
+) -> Result<(), u32> {
+    if layout.base() & 0xffff != 0 || layout.size() & 0xfff != 0
+        || layout.end() > USER_ADDRESS_LIMIT {
+        return Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES);
+    }
+    let overlaps = |base: u64, size: u64| {
+        base.checked_add(size).is_none_or(|end| base < layout.end() && layout.base() < end)
+    };
+    if overlaps(WORK_CLUSTER_BASE, 0x20_0000)
+        || ntdll.is_some_and(|(base, size)| overlaps(base, size))
+        || (setup_env && (overlaps(KUSER_VA, 0x1000)
+            || overlaps(HOSTED_CLIENT_ENV_BASE, 0x20_0000)
+            || overlaps(HOSTED_MAIN_STACK_ALLOCATION_BASE,
+                STACK_BASE + STACK_FRAMES * 0x1000 - HOSTED_MAIN_STACK_ALLOCATION_BASE)
+            || overlaps(TP_WORKER_SLOT0_REGION_BASE, TP_WORKER_SLOT_COUNT as u64 * TP_WORKER_EXEC_STRIDE)))
+    {
+        return Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES);
+    }
+    Ok(())
+}
+
+unsafe fn reserve_sec_image_layout_page_tables(
+    pi: u64, lifetime: nt_memory_manager::MemoryLifetime,
+    caps: &HostedProcessVspaceCaps, layout: nt_exe_image::ProcessImageLayout,
+) -> u64 {
+    let start = layout.base() & !0x1f_ffff;
+    let end = (layout.end() - 1) & !0x1f_ffff;
     let mut mapped = 0u64;
     let mut va = start;
     loop {
-        map_initial_process_page_table(pi, pml4, va, b"image-pt");
+        user_image_paging::ensure_spawn_user_paging_parents(
+            pi as usize, caps.generation, lifetime, *caps, va,
+        ).expect("main image requires exact spawn-owned parent paging");
+        map_initial_process_page_table(pi, caps.pml4, va, b"image-pt");
         mapped += 1;
         if va == end {
             break;
@@ -876,11 +916,14 @@ unsafe fn reserve_sec_image_page_tables(pi: u64, pml4: u64, image_va: u64, exten
     mapped
 }
 
+/// Demand-load a PE via SEC_IMAGE with absent image pages and an exact admitted layout.
+/// Child processes remain suspended until their creator resumes the typed initial thread.
 pub(crate) unsafe fn spawn_sec_image(
     pi: u64,
     generation: u64,
     lifetime: nt_memory_manager::MemoryLifetime,
     pe: &nt_pe_loader::PeFile,
+    layout: nt_exe_image::ProcessImageLayout,
     fault_ep_c: u64,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
     setup_env: bool,
@@ -901,6 +944,11 @@ pub(crate) unsafe fn spawn_sec_image(
     ldrpinit_rva: u64,
 ) -> SecImageSpawn {
     assert!(lifetime.is_valid(), "SEC_IMAGE spawn requires exact memory lifetime");
+    assert_eq!(layout.size(), u64::from(pe.size_of_image()));
+    assert_eq!(layout.entry_rva(), pe.entry_point_rva());
+    validate_hosted_main_image_layout(
+        layout, ntdll.map(|(base, pe)| (base, image_extent(pe))), setup_env,
+    ).expect("SEC_IMAGE layout must be admitted before native construction");
     if let nt_memory_manager::MemoryLifetime::Process(process) = lifetime {
         assert_eq!(u64::from(process.pid), client_process_id, "SEC_IMAGE PID differs from owner");
     }
@@ -915,6 +963,7 @@ pub(crate) unsafe fn spawn_sec_image(
     .expect("SEC_IMAGE spawn requires completed prior frame and pagefile retirement");
     assert!(
         client_frame_registry_process_is_empty(pi)
+            && user_image_paging::spawn_process_available(pi as usize)
             && client_copyin_frame_process_is_empty(pi)
             && shared_image_mapping_process_is_empty(pi as usize)
             && kuser_page_alias_get(pi as usize) == 0
@@ -939,7 +988,7 @@ pub(crate) unsafe fn spawn_sec_image(
     // `seL4_DeleteFirst` phantom out-of-memory on the next commit at that VA. See `vspace_assign_asid`.
     checked_spawn_asid(pml4);
     trace_spawn_phase(pi, b"vspace");
-    let main_image_size = image_extent(pe);
+    let main_image_size = layout.size();
     let pdpt = alloc_slot();
     spawn_paging_retype(pdpt, OBJ_X86_PDPT, b"image-pdpt");
     let pd = alloc_slot();
@@ -949,16 +998,30 @@ pub(crate) unsafe fn spawn_sec_image(
     // The image VA's page tables — but NOT the image pages. Touching the image faults in.
     checked_spawn_paging_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4, b"pdpt");
     checked_spawn_paging_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4, b"pd");
-    let image_pts = reserve_sec_image_page_tables(pi, pml4, PE_LOAD_BASE, main_image_size);
+    if setup_env {
+        let kuser_pdpt = alloc_slot();
+        vspace_caps.kuser_pdpt = kuser_pdpt;
+        spawn_paging_retype(kuser_pdpt, OBJ_X86_PDPT, b"kuser-pdpt");
+        let kuser_pd = alloc_slot();
+        vspace_caps.kuser_pd = kuser_pd;
+        spawn_paging_retype(kuser_pd, OBJ_X86_PAGE_DIRECTORY, b"kuser-pd");
+        checked_spawn_paging_map(
+            kuser_pdpt, LBL_X86_PDPT_MAP, KUSER_VA, pml4, b"kuser-pdpt",
+        );
+        checked_spawn_paging_map(
+            kuser_pd, LBL_X86_PAGE_DIRECTORY_MAP, KUSER_VA, pml4, b"kuser-pd",
+        );
+    }
+    let image_pts = reserve_sec_image_layout_page_tables(pi, lifetime, &vspace_caps, layout);
     if pi == 6 {
         EXPLORER_IMAGE_PAGE_TABLES.store(image_pts, Ordering::Relaxed);
     }
-    if !register_image_committed_mappings(pi, pe, PE_LOAD_BASE) {
+    if !register_image_layout_committed_mappings(pi, pe, layout) {
         print_str(b"[spawn-vad] image committed mapping failed pi=");
         print_u64(pi);
         print_str(b" base=0x");
-        print_hex((PE_LOAD_BASE >> 32) as u32);
-        print_hex(PE_LOAD_BASE as u32);
+        print_hex((layout.base() >> 32) as u32);
+        print_hex(layout.base() as u32);
         print_str(b" size=0x");
         print_hex((main_image_size >> 32) as u32);
         print_hex(main_image_size as u32);
@@ -1199,7 +1262,7 @@ pub(crate) unsafe fn spawn_sec_image(
             b"peb-scratch",
         );
         zero_scratch_page(scr + 0x1000);
-        core::ptr::write_volatile((scr + 0x1000 + 0x10) as *mut u64, PE_LOAD_BASE); // ImageBaseAddress
+        core::ptr::write_volatile((scr + 0x1000 + 0x10) as *mut u64, layout.base()); // ImageBaseAddress
         core::ptr::write_volatile((scr + 0x1000 + 0x20) as *mut u64, SMSS_PARAMS_VA);
         core::ptr::write_volatile(
             (scr + 0x1000 + 0xBC) as *mut u32,
@@ -1474,17 +1537,9 @@ pub(crate) unsafe fn spawn_sec_image(
             nt_address_space::PAGE_READWRITE,
             b"params-env",
         );
-        // KUSER_SHARED_DATA at 0x7FFE0000 (PML4[0] — a fresh PT chain; the image is PML4[2]).
+        // KUSER_SHARED_DATA uses the constructor-owned parents installed before image paging.
         // LdrpInitialize reads it early (e.g. 0x7FFE0274); an unmapped read would #PF. A zeroed
         // page satisfies the early reads (a real cookie/NtGlobalFlag can be filled in later).
-        let kpdpt = alloc_slot();
-        spawn_paging_retype(kpdpt, OBJ_X86_PDPT, b"kuser-pdpt");
-        let kpd = alloc_slot();
-        spawn_paging_retype(kpd, OBJ_X86_PAGE_DIRECTORY, b"kuser-pd");
-        vspace_caps.kuser_pdpt = kpdpt;
-        vspace_caps.kuser_pd = kpd;
-        checked_spawn_paging_map(kpdpt, LBL_X86_PDPT_MAP, KUSER_VA, pml4, b"kuser-pdpt");
-        checked_spawn_paging_map(kpd, LBL_X86_PAGE_DIRECTORY_MAP, KUSER_VA, pml4, b"kuser-pd");
         map_initial_process_page_table(pi, pml4, KUSER_VA, b"kuser-pt");
         // Build the KUSER page via a scratch mapping so we can populate the fields the Win32 create
         // path reads. KUSER_SHARED_DATA.ImageNumberLow(@0x260)/ImageNumberHigh(@0x262) bound the
@@ -1561,7 +1616,7 @@ pub(crate) unsafe fn spawn_sec_image(
         let eff_ldrp = effective_ldrp_rva(ldrpinit_rva);
         if eff_ldrp != 0 {
             tb.extend_from_slice(&[0x49, 0xB8]); // movabs r8, imm64
-            tb.extend_from_slice(&PE_LOAD_BASE.to_le_bytes()); // R8 = child image base
+            tb.extend_from_slice(&layout.base().to_le_bytes()); // R8 = child image base
         } else {
             tb.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d  (SystemArgument2)
         }
@@ -1579,7 +1634,7 @@ pub(crate) unsafe fn spawn_sec_image(
         tb.extend_from_slice(&[0x48, 0xB9]);
         tb.extend_from_slice(&SMSS_PEB_VA.to_le_bytes()); // movabs rcx, PEB
         tb.extend_from_slice(&[0x48, 0xB8]);
-        tb.extend_from_slice(&(PE_LOAD_BASE + pe.entry_point_rva() as u64).to_le_bytes()); // movabs rax, entry
+        tb.extend_from_slice(&layout.entry().to_le_bytes()); // movabs rax, entry
         tb.extend_from_slice(&[0xFF, 0xD0]); // call rax  (enter smss)
         tb.extend_from_slice(&[0xEB, 0xFE]); // jmp $
         for (j, &b) in tb.iter().enumerate() {
@@ -1605,7 +1660,7 @@ pub(crate) unsafe fn spawn_sec_image(
         trace_spawn_phase(pi, b"env");
         SMSS_TRAMP_VA
     } else {
-        PE_LOAD_BASE + pe.entry_point_rva() as u64
+        layout.entry()
     };
     trace_spawn_phase(pi, b"thread-objects");
     let raw = alloc_slot();
@@ -1673,6 +1728,7 @@ pub(crate) unsafe fn spawn_sec_image(
     trace_spawn_phase(pi, b"done");
     SecImageSpawn {
         lifetime,
+        layout,
         pml4,
         main_tcb: tcb,
         main_mechanism: HostedThreadMechanismCaps::new(raw, cnode, sched_context),
@@ -1680,7 +1736,7 @@ pub(crate) unsafe fn spawn_sec_image(
         main_runtime: MainThreadRuntime {
             process_id: client_process_id,
             thread_id: client_thread_id,
-            entry: PE_LOAD_BASE + pe.entry_point_rva() as u64,
+            entry: layout.entry(),
             teb: setup_env.then_some(SMSS_TEB_VA),
             teb_alias: setup_env.then_some(scr_base),
             create_time_100ns: nt_system_time_100ns() as i64,

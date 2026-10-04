@@ -50,7 +50,7 @@ impl ExecNtHandler {
         bytes.try_reserve_exact(source.pe_header.len()).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         bytes.extend_from_slice(&source.pe_header);
         if bytes.len() as u64 != source.backing.file_extent { return Err(INVALID_IMAGE); }
-        // Parse the untouched canonical snapshot, then relocate only its independently owned copy.
+        // Preserve the canonical preferred transfer address through main-image placement.
         let pe = nt_pe_loader::PeFile::parse(&source.pe_header).map_err(|_| INVALID_IMAGE)?;
         let headers = pe.headers();
         if headers.machine != 0x8664 || !headers.is_executable() { return Err(INVALID_IMAGE); }
@@ -63,10 +63,12 @@ impl ExecNtHandler {
             subsystem: headers.subsystem, subsystem_major: headers.major_subsystem_version,
             subsystem_minor: headers.minor_subsystem_version,
         };
-        nt_pe_loader::relocate_file_snapshot(&mut bytes, PE_LOAD_BASE).map_err(|error| match error {
-            nt_pe_loader::PeError::InsufficientResources => STATUS_INSUFFICIENT_RESOURCES,
-            _ => INVALID_IMAGE,
-        })?;
+        let layout = nt_exe_image::ProcessImageLayout::checked(
+            headers.image_base, u64::from(headers.size_of_image), headers.entry_point_rva,
+        ).map_err(|_| INVALID_IMAGE)?;
+        let ntdll_extent = (!ctx.ntdll_pe.is_null())
+            .then(|| (ctx.nt_base, image_extent(&*ctx.ntdll_pe)));
+        img_spawn::validate_hosted_main_image_layout(layout, ntdll_extent, true)?;
         self.process_image_owners.try_reserve(1).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         let view = self.image_sections.reference_view(id).map_err(image_section_create::map_image_error)?;
         let catalog = &mut *ctx.exe_image_catalog;

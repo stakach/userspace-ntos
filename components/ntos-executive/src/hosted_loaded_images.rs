@@ -55,6 +55,7 @@ impl HostedLoadedImage {
 struct HostedLoadedImageCacheEntry {
     image: HostedLoadedImage,
     pe: nt_pe_loader::PeFile<'static>,
+    layout: nt_exe_image::ProcessImageLayout,
     /// Exact snapshots own their immutable bytes independently of the Section's retained File.
     owned_bytes: Option<Vec<u8>>,
     owner: Option<nt_exe_image::SpawnTarget>,
@@ -168,6 +169,9 @@ impl HostedLoadedImageTable {
                         leaf_len: image.leaf.len(),
                         pool_va,
                     },
+                    layout: nt_exe_image::ProcessImageLayout::checked(
+                        pe.headers().image_base, u64::from(pe.size_of_image()), pe.entry_point_rva(),
+                    ).map_err(|_| HostedLoadedImageRegistrationError::InvalidPoolVa)?,
                     pe,
                     owned_bytes: None,
                     owner: None,
@@ -209,6 +213,9 @@ impl HostedLoadedImageTable {
         let index = self.cache.len();
         let entry = try_box_entry(HostedLoadedImageCacheEntry {
             image: HostedLoadedImage { leaf, leaf_len: image.leaf.len(), pool_va },
+            layout: nt_exe_image::ProcessImageLayout::checked(
+                pe.headers().image_base, u64::from(pe.size_of_image()), pe.entry_point_rva(),
+            ).map_err(|_| HostedLoadedImageRegistrationError::InvalidPoolVa)?,
             pe, owned_bytes: Some(bytes),
             owner: Some(nt_exe_image::SpawnTarget::from_image(image)),
         })?;
@@ -228,6 +235,11 @@ impl HostedLoadedImageTable {
         self.cache
             .get(attachment.cache_index)
             .map(|entry| entry.image)
+    }
+
+    pub(crate) fn layout_by_pi(&self, pi: usize) -> Option<nt_exe_image::ProcessImageLayout> {
+        let attachment = self.attachment_for_pi(pi)?;
+        self.cache.get(attachment.cache_index).map(|entry| entry.layout)
     }
 
     pub(crate) unsafe fn pe_by_pi<'a>(
