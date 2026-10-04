@@ -1,6 +1,8 @@
 #![no_std]
 
 mod message_output;
+mod dispatch_return;
+pub use dispatch_return::{DispatchReturn, DispatchReturnError, DispatchReturnReceipt};
 mod windowproc;
 pub use message_output::{
     message_dispatch_output_length, message_dispatch_output_length_matches_result,
