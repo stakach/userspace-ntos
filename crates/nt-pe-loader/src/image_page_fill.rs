@@ -22,6 +22,13 @@ pub struct ImagePageFillPlan {
     span_count: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImagePageReadError<E> {
+    InvalidPageSize(usize),
+    Read(E),
+    ShortRead { expected: usize, actual: usize },
+}
+
 impl ImagePageFillPlan {
     pub const fn page_rva(&self) -> u32 {
         self.page_rva
@@ -33,6 +40,32 @@ impl ImagePageFillPlan {
 
     pub fn spans(&self) -> &[ImagePageFileSpan] {
         &self.spans[..self.span_count]
+    }
+
+    /// Fill exactly one image page from the validated File spans. On error the destination
+    /// may already contain accepted writes; this method does not authorize publication or replay.
+    pub fn read_into_page<E>(
+        &self,
+        page: &mut [u8],
+        mut read: impl FnMut(u64, &mut [u8]) -> Result<usize, E>,
+    ) -> Result<(), ImagePageReadError<E>> {
+        if page.len() != IMAGE_PAGE_SIZE {
+            return Err(ImagePageReadError::InvalidPageSize(page.len()));
+        }
+        page.fill(0);
+        for span in self.spans() {
+            let start = usize::from(span.page_offset);
+            let length = usize::from(span.length);
+            let actual = read(span.file_offset, &mut page[start..start + length])
+                .map_err(ImagePageReadError::Read)?;
+            if actual != length {
+                return Err(ImagePageReadError::ShortRead {
+                    expected: length,
+                    actual,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn push(&mut self, file_offset: u64, image_rva: u64, length: u64) -> Result<(), PeError> {
@@ -55,6 +88,89 @@ impl ImagePageFillPlan {
         };
         self.span_count += 1;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn two_spans() -> ImagePageFillPlan {
+        let mut plan = ImagePageFillPlan {
+            page_rva: 0,
+            protection: ImageProtection::ReadOnly,
+            spans: [ImagePageFileSpan::default(); MAX_SPANS],
+            span_count: 0,
+        };
+        plan.push(0x400, 0, 4).unwrap();
+        plan.push(0x900, 16, 8).unwrap();
+        plan
+    }
+
+    #[test]
+    fn checked_read_adapter_handles_two_spans_and_zero_gaps() {
+        let plan = two_spans();
+        let mut page = [0xff; IMAGE_PAGE_SIZE];
+        let mut calls = 0;
+        plan.read_into_page(&mut page, |offset, output: &mut [u8]| {
+            assert_eq!(
+                (offset, output.len()),
+                if calls == 0 { (0x400, 4) } else { (0x900, 8) }
+            );
+            calls += 1;
+            output.fill(calls as u8);
+            Ok::<_, u32>(output.len())
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(&page[..4], &[1; 4]);
+        assert_eq!(&page[16..24], &[2; 8]);
+        assert!(page[4..16]
+            .iter()
+            .chain(page[24..].iter())
+            .all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn later_span_short_read_preserves_prior_effect_and_refuses_success() {
+        let mut page = [0xff; IMAGE_PAGE_SIZE];
+        let mut calls = 0;
+        assert_eq!(
+            two_spans().read_into_page(&mut page, |_, output: &mut [u8]| {
+                calls += 1;
+                output.fill(calls as u8);
+                Ok::<_, u32>(if calls == 1 {
+                    output.len()
+                } else {
+                    output.len() - 1
+                })
+            }),
+            Err(ImagePageReadError::ShortRead {
+                expected: 8,
+                actual: 7
+            })
+        );
+        assert_eq!(calls, 2);
+        assert_eq!(&page[..4], &[1; 4]);
+    }
+
+    #[test]
+    fn later_span_error_preserves_exact_status_without_more_reads() {
+        let mut page = [0xff; IMAGE_PAGE_SIZE];
+        let mut calls = 0;
+        assert_eq!(
+            two_spans().read_into_page(&mut page, |_, output: &mut [u8]| {
+                calls += 1;
+                if calls == 2 {
+                    return Err(0xc0000185u32);
+                }
+                output.fill(1);
+                Ok(output.len())
+            }),
+            Err(ImagePageReadError::Read(0xc0000185))
+        );
+        assert_eq!(calls, 2);
+        assert_eq!(&page[..4], &[1; 4]);
     }
 }
 
@@ -105,14 +221,15 @@ pub(crate) fn plan(
     for section in pe.sections() {
         let start = u64::from(section.virtual_address);
         let virtual_end = start
-            .checked_add(u64::from(section.virtual_size.max(section.size_of_raw_data)))
+            .checked_add(u64::from(
+                section.virtual_size.max(section.size_of_raw_data),
+            ))
             .filter(|end| *end <= image_size)
             .ok_or(PeError::SectionOutOfBounds)?;
         if virtual_end > start && start % IMAGE_PAGE_SIZE as u64 != 0 {
             return Err(PeError::UnsupportedImageAlignment(section.virtual_address));
         }
-        let mapped_end = virtual_end
-            .saturating_add((IMAGE_PAGE_SIZE - 1) as u64)
+        let mapped_end = virtual_end.saturating_add((IMAGE_PAGE_SIZE - 1) as u64)
             & !((IMAGE_PAGE_SIZE - 1) as u64);
         if page_start >= start && page_start < mapped_end {
             if header_page || section_page {

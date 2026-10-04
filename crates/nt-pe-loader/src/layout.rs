@@ -18,9 +18,17 @@ impl PeLayout {
     }
 
     pub(crate) fn from_headers(bytes: &[u8], headers: Headers) -> Result<Self, PeError> {
+        let table = headers.section_table_offset();
+        Self::from_section_window(bytes, headers, table)
+    }
+
+    pub(crate) fn from_section_window(
+        bytes: &[u8],
+        headers: Headers,
+        table: usize,
+    ) -> Result<Self, PeError> {
         let section_count = headers.number_of_sections as usize;
         let mut sections = [Section::default(); headers::MAX_SECTIONS];
-        let table = headers.section_table_offset();
         for (i, section) in sections.iter_mut().enumerate().take(section_count) {
             *section = Section::parse(bytes, table + i * 40)?;
         }

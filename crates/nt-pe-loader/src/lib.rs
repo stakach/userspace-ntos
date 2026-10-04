@@ -14,6 +14,7 @@ extern crate alloc;
 mod exports;
 mod headers;
 mod image;
+mod image_header_capture;
 mod image_page_fill;
 pub mod immutable_support_image;
 mod imports;
@@ -34,7 +35,10 @@ pub use headers::{
     DIRECTORY_ENTRY_RESOURCE, DIRECTORY_ENTRY_TLS,
 };
 pub use image::MappedImage;
-pub use image_page_fill::{ImagePageFileSpan, ImagePageFillPlan, IMAGE_PAGE_SIZE};
+pub use image_header_capture::{capture_image_layout, ImageHeaderCaptureError};
+pub use image_page_fill::{
+    ImagePageFileSpan, ImagePageFillPlan, ImagePageReadError, IMAGE_PAGE_SIZE,
+};
 pub use imports::{ImportRef, ImportedDll};
 pub use layout::PeLayout;
 pub use mapped_relocations::{plan_mapped_relocations, MappedRelocationPlan};

@@ -19,6 +19,12 @@ mod image_view_layout;
 #[path = "parse/owned_image_layout.rs"]
 mod owned_image_layout;
 
+#[path = "parse/image_header_capture.rs"]
+mod image_header_capture;
+
+#[path = "parse/image_page_read.rs"]
+mod image_page_read;
+
 // --- a minimal PE32+ image builder -----------------------------------------
 
 const NT_OFF: usize = 0x40;
