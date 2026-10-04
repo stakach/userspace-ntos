@@ -22947,6 +22947,7 @@ struct ExecNtHandler {
     /// The minimal object-manager namespace (index 0 = root `\`). Entries are inline and the owned
     /// vector grows beyond its boot reserve when required.
     obj_ns: alloc::vec::Vec<ObjEntry>,
+    directory_security: alloc::vec::Vec<exec_handler::directory_security::DirectorySecurityRecord>,
     /// Native image Section identities and their exact file-backed lifetime.
     image_sections: native_image_sections::NativeImageStore,
     /// Canonical image execution references independent of their creator's Section handles.
@@ -24324,6 +24325,10 @@ struct ExecReadOnlyFileOpens {
 
 impl ExecReadOnlyFileOpens {
     fn reset() -> Self {
+        assert!(
+            unsafe { local_section_file::data_sources_empty() },
+            "retained DATA Section File references must retire before readonly table reset"
+        );
         let table = core::ptr::addr_of_mut!(READONLY_FILE_OPEN_WORK);
         // SAFETY: service_sec_image is serialized. A previous handler has been
         // dropped before a new one is constructed, so no other table reference exists.

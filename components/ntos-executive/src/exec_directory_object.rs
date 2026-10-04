@@ -8,17 +8,16 @@ pub(crate) struct StagedDirectoryObjectOpen {
     pub(crate) created_index: Option<usize>,
     pub(crate) cap_before: usize,
     pub(crate) status: u32,
+    pub(crate) security: directory_security::DirectorySecurityAdmission,
 }
 
-/// An invisible handle reservation. Namespace resolution is deferred until PUBLISH, after the
-/// component has written the handle output to its caller.
+/// An invisible handle reservation with captured security and pinned namespace bodies. Handle
+/// publication is deferred until the component's existing output protocol acknowledges it.
 pub(crate) struct ReservedProviderDirectoryObject {
     publication: nt_process::ObjectDirectoryHandlePublication,
-    captured: CapturedNamedObjectAttributes,
-    desired_access: u32,
-    create: bool,
     cap_before: usize,
     created_index: Option<usize>,
+    security: directory_security::DirectorySecurityAdmission,
 }
 
 impl ReservedProviderDirectoryObject {
@@ -38,6 +37,7 @@ impl ExecNtHandler {
         desired_access: u32,
         create: bool,
     ) -> Result<ReservedProviderDirectoryObject, u32> {
+        let _durable = allocator::enter_durable();
         const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
         if name.is_empty() || name.len() > NAMED_OBJECT_PATH_CAP {
             return Err(STATUS_OBJECT_NAME_INVALID);
@@ -45,6 +45,7 @@ impl ExecNtHandler {
         let mut captured = CapturedNamedObjectAttributes {
             root,
             attributes,
+            security_descriptor: 0,
             path_len: Some(name.len()),
             path: [0; NAMED_OBJECT_PATH_CAP],
         };
@@ -61,18 +62,25 @@ impl ExecNtHandler {
         if components.any(|component| component.is_empty() || component.len() > OBJ_NAME_CAP) {
             return Err(STATUS_OBJECT_NAME_INVALID);
         }
-        let handle_attributes = attributes & (nt_process::native_handle::OBJ_KERNEL_HANDLE | 0x2);
+        let mut security =
+            self.prepare_directory_object_security(&captured, caller, desired_access, create)?;
+        let handle_attributes = security.handle_attributes;
         let cap_before = self.pm.handle_capacity(caller.effective_process());
-        let publication = self
+        let publication = match self
             .pm
-            .reserve_native_object_directory_handle(caller, handle_attributes)?;
+            .reserve_native_object_directory_handle(caller, handle_attributes)
+        {
+            Ok(publication) => publication,
+            Err(status) => {
+                self.release_directory_object_security(&mut security);
+                return Err(status);
+            }
+        };
         Ok(ReservedProviderDirectoryObject {
             publication,
-            captured,
-            desired_access,
-            create,
             cap_before,
             created_index: None,
+            security,
         })
     }
 
@@ -83,56 +91,38 @@ impl ExecNtHandler {
         desired_access: u32,
         create: bool,
     ) -> Result<StagedDirectoryObjectOpen, u32> {
-        let path = captured.path().ok_or(0xC000_0033u32)?;
-        let permanent = captured.attributes & OBJ_PERMANENT != 0;
-        let (root_idx, path) = self.native_directory_root_and_path(caller, captured.root, path)?;
-        let mut opened_existing = false;
-        let existing = if create {
-            match self.obj_resolve(path, root_idx) {
-                Some(index) if self.obj_ns[index].kind == OBJ_KIND_DIRECTORY => {
-                    if captured.attributes & 0x80 == 0 {
-                        return Err(0xC000_0035); // STATUS_OBJECT_NAME_COLLISION
-                    }
-                    opened_existing = true;
-                    Some(index)
-                }
-                Some(_) => return Err(0xC000_0024), // STATUS_OBJECT_TYPE_MISMATCH
-                None => None,
-            }
-        } else {
-            let index = self.obj_resolve(path, root_idx).ok_or(0xC000_0034u32)?;
-            if self.obj_ns[index].kind != OBJ_KIND_DIRECTORY {
-                return Err(0xC000_0024); // STATUS_OBJECT_TYPE_MISMATCH
-            }
-            Some(index)
-        };
-        let handle_attributes =
-            captured.attributes & (nt_process::native_handle::OBJ_KERNEL_HANDLE | 0x2);
+        let _durable = allocator::enter_durable();
+        let mut security =
+            self.prepare_directory_object_security(captured, caller, desired_access, create)?;
+        let handle_attributes = security.handle_attributes;
         let cap_before = self.pm.handle_capacity(caller.effective_process());
-        let mut publication = self
+        let mut publication = match self
             .pm
-            .reserve_native_object_directory_handle(caller, handle_attributes)?;
-        let created_index = if existing.is_none() {
-            match self.obj_create(path, root_idx, OBJ_KIND_DIRECTORY, &[], permanent) {
-                Some(index) => Some(index),
-                None => {
-                    assert_eq!(publication.abort(&mut self.pm), Ok(None));
-                    return Err(0xC000_003A); // STATUS_OBJECT_PATH_NOT_FOUND
-                }
+            .reserve_native_object_directory_handle(caller, handle_attributes)
+        {
+            Ok(publication) => publication,
+            Err(status) => {
+                self.release_directory_object_security(&mut security);
+                return Err(status);
             }
-        } else {
-            None
         };
-        let index = existing
-            .or(created_index)
-            .expect("directory resolved or created");
+        let (index, created) = match self.commit_directory_object_security(&mut security) {
+            Ok(result) => result,
+            Err(status) => {
+                assert_eq!(publication.abort(&mut self.pm), Ok(None));
+                self.release_directory_object_security(&mut security);
+                return Err(status);
+            }
+        };
+        let created_index = created.then_some(index);
         let identity = self.obj_ns[index].identity;
-        let access = Self::map_directory_object_access(desired_access);
+        let access = security.granted_access;
         if let Err(status) = publication.bind(&mut self.pm, identity, access) {
             assert_eq!(publication.abort(&mut self.pm), Ok(None));
             if let Some(index) = created_index {
                 self.rollback_new_namespace_object(index);
             }
+            self.release_directory_object_security(&mut security);
             return Err(status);
         }
         Ok(StagedDirectoryObjectOpen {
@@ -140,7 +130,12 @@ impl ExecNtHandler {
             identity,
             created_index,
             cap_before,
-            status: if opened_existing { 0x4000_0000 } else { 0 },
+            status: if security.opened_existing {
+                0x4000_0000
+            } else {
+                0
+            },
+            security,
         })
     }
 
@@ -149,45 +144,21 @@ impl ExecNtHandler {
         staged: &mut ReservedProviderDirectoryObject,
         caller: nt_process::native_handle::NativeHandleCaller,
     ) -> Result<u32, u32> {
+        let _durable = allocator::enter_durable();
         let result = (|| {
-            let path = staged.captured.path().ok_or(0xC000_0033u32)?;
-            let (root_idx, path) =
-                self.native_directory_root_and_path(caller, staged.captured.root, path)?;
-            let existing = if staged.create {
-                match self.obj_resolve(path, root_idx) {
-                    Some(index) if self.obj_ns[index].kind == OBJ_KIND_DIRECTORY => {
-                        if staged.captured.attributes & 0x80 == 0 {
-                            return Err(0xC000_0035); // STATUS_OBJECT_NAME_COLLISION
-                        }
-                        Some(index)
-                    }
-                    Some(_) => return Err(0xC000_0024), // STATUS_OBJECT_TYPE_MISMATCH
-                    None => None,
-                }
-            } else {
-                let index = self.obj_resolve(path, root_idx).ok_or(0xC000_0034u32)?;
-                if self.obj_ns[index].kind != OBJ_KIND_DIRECTORY {
-                    return Err(0xC000_0024);
-                }
-                Some(index)
-            };
-            let index = match existing {
-                Some(index) => index,
-                None => {
-                    let permanent = staged.captured.attributes & OBJ_PERMANENT != 0;
-                    let index = self
-                        .obj_create(path, root_idx, OBJ_KIND_DIRECTORY, &[], permanent)
-                        .ok_or(0xC000_003Au32)?; // STATUS_OBJECT_PATH_NOT_FOUND
-                    staged.created_index = Some(index);
-                    index
-                }
-            };
+            if caller != staged.security.caller() {
+                return Err(0xC000_0008);
+            }
+            self.pm.validate_native_handle_caller(caller)?;
+            let (index, created) = self.commit_directory_object_security(&mut staged.security)?;
+            staged.created_index = created.then_some(index);
             let identity = self.obj_ns[index].identity;
-            let access = Self::map_directory_object_access(staged.desired_access);
+            let access = staged.security.granted_access;
             staged.publication.bind(&mut self.pm, identity, access)?;
             staged.publication.publish(&mut self.pm)?;
             self.record_process_handle_insert(staged.publication.process_id(), staged.cap_before);
-            Ok(if staged.create && existing.is_some() {
+            self.release_directory_object_security(&mut staged.security);
+            Ok(if staged.security.opened_existing {
                 0x4000_0000
             } else {
                 0
@@ -210,6 +181,7 @@ impl ExecNtHandler {
         if let Some(index) = staged.created_index.take() {
             self.rollback_new_namespace_object(index);
         }
+        self.release_directory_object_security(&mut staged.security);
     }
 
     pub(crate) fn close_provider_directory_object(
@@ -250,5 +222,6 @@ impl ExecNtHandler {
                 self.obj_ns[index].unlink();
             }
         }
+        self.release_directory_object_security(&mut staged.security);
     }
 }

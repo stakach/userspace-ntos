@@ -81,6 +81,8 @@ mod directory_query;
 
 #[path = "exec_directory_object.rs"]
 pub(crate) mod directory_object;
+#[path = "exec_directory_security.rs"]
+pub(crate) mod directory_security;
 
 #[path = "exec_section_create.rs"]
 pub(crate) mod section_create;
@@ -176,6 +178,7 @@ pub(crate) use nt_user_host::provider_dispatcher_backend::ProviderDispatcherLeas
 struct CapturedNamedObjectAttributes {
     root: u64,
     attributes: u32,
+    security_descriptor: u64,
     path_len: Option<usize>,
     path: [u8; NAMED_OBJECT_PATH_CAP],
 }
@@ -3096,10 +3099,6 @@ pub(super) fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
         b"??".as_slice(),
         b"device",
         b"global??",
-        b"knowndlls",
-        b"basenamedobjects",
-        b"sessions",
-        b"windows",
         b"objecttypes",
         b"driver",
         b"filesystem",
@@ -3109,32 +3108,6 @@ pub(super) fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
     }
     ObjEntry::push_symlink(&mut v, b"dosdevices", 0, b"\\??", true)
         .expect("initial DosDevices alias");
-    let bno = v
-        .iter()
-        .position(|entry| entry.parent == 0 && entry.name() == b"basenamedobjects")
-        .expect("pre-created BaseNamedObjects directory");
-    let sessions = v
-        .iter()
-        .position(|entry| entry.parent == 0 && entry.name() == b"sessions")
-        .expect("pre-created Sessions object directory");
-    ObjEntry::push_dir(&mut v, b"bnolinks", sessions, true).expect("initial BnoLinks directory");
-    let session0 = v.len();
-    ObjEntry::push_dir(&mut v, b"0", sessions, true).expect("initial Session 0 directory");
-    ObjEntry::push_symlink(
-        &mut v,
-        b"basenamedobjects",
-        session0,
-        b"\\basenamedobjects",
-        true,
-    )
-    .expect("initial BaseNamedObjects link");
-    ObjEntry::push_symlink(&mut v, b"global", bno, b"\\basenamedobjects", true)
-        .expect("initial Global link");
-    ObjEntry::push_symlink(&mut v, b"local", bno, b"\\basenamedobjects", true)
-        .expect("initial Local link");
-    ObjEntry::push_symlink(&mut v, b"session", bno, b"\\sessions\\bnolinks", true)
-        .expect("initial Session link");
-    ObjEntry::push_dir(&mut v, b"restricted", bno, true).expect("initial Restricted directory");
     v
 }
 
@@ -3811,6 +3784,8 @@ impl ExecNtHandler {
         let mut mutable_hives = nt_hive_core::MutableHiveSet::new();
         let owned_boot_system_image = take_boot_system_hive_image()
             .expect("live hosted-process service requires the composed boot SYSTEM image");
+        let directory_protection_mode = directory_security::capture_boot_protection_mode(&owned_boot_system_image)
+            .expect("capture owned SYSTEM ProtectionMode before directory bootstrap");
         print_str(b"[cm-hive] released composed SYSTEM transport bytes=");
         print_u64(owned_boot_system_image.len() as u64);
         print_str(b"\n");
@@ -3940,6 +3915,9 @@ impl ExecNtHandler {
         let root_security =
             nt_user_host::registry_bootstrap::prepare_registry_root_security(&pm, &mut token_store)
                 .expect("initialize registry root security from bootstrap subject");
+        let directory_security = directory_security::prepare_boot_directory_security(
+            &pm, &mut token_store, &obj_ns, directory_protection_mode,
+        ).expect("initialize exact core directory security from bootstrap subject");
         macro_rules! write_field {
             ($field:ident, $value:expr) => {
                 unsafe {
@@ -3973,6 +3951,7 @@ impl ExecNtHandler {
             nt_address_space::SecuredVirtualMemoryTable::new()
         );
         write_field!(obj_ns, obj_ns);
+        write_field!(directory_security, directory_security);
         write_field!(image_sections, native_image_sections::NativeImageStore::new());
         write_field!(process_image_owners, Vec::new());
         write_field!(native_image_views, Vec::new());
@@ -9975,7 +9954,7 @@ impl ExecNtHandler {
         let identity = self.pm.lookup_native_object_directory_handle(
             caller,
             root,
-            DIRECTORY_TRAVERSE_ACCESS,
+            0,
         )?;
         Ok((self.directory_namespace_index_for_identity(identity)?, path))
     }
@@ -23889,10 +23868,9 @@ impl ExecNtHandler {
     /// Capture and validate the byte-oriented subset of named Object Manager attributes supported
     /// by the compact namespace. Caller memory never escapes this fixed stack representation.
     unsafe fn capture_named_object_attributes(
-        &self,
+        &mut self,
         oa_va: u64,
     ) -> Result<CapturedNamedObjectAttributes, u32> {
-        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
         const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
         const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
 
@@ -23900,28 +23878,26 @@ impl ExecNtHandler {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let mut oa = [0u8; 0x30];
-        if !self.xas_read(oa_va, &mut oa) {
-            return Err(STATUS_ACCESS_VIOLATION);
-        }
+        self.process_memory_read_status(self.pi, oa_va, &mut oa)?;
         if u32::from_le_bytes(oa[0..4].try_into().unwrap()) < 0x30 {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let root = u64::from_le_bytes(oa[8..16].try_into().unwrap());
         let object_name = u64::from_le_bytes(oa[16..24].try_into().unwrap());
         let attributes = u32::from_le_bytes(oa[24..28].try_into().unwrap());
+        let security_descriptor = u64::from_le_bytes(oa[32..40].try_into().unwrap());
         if object_name == 0 {
             return Ok(CapturedNamedObjectAttributes {
                 root,
                 attributes,
+                security_descriptor,
                 path_len: None,
                 path: [0; NAMED_OBJECT_PATH_CAP],
             });
         }
 
         let mut ustr = [0u8; 16];
-        if !self.xas_read(object_name, &mut ustr) {
-            return Err(STATUS_ACCESS_VIOLATION);
-        }
+        self.process_memory_read_status(self.pi, object_name, &mut ustr)?;
         let length = u16::from_le_bytes(ustr[0..2].try_into().unwrap()) as usize;
         let maximum = u16::from_le_bytes(ustr[2..4].try_into().unwrap()) as usize;
         let buffer = u64::from_le_bytes(ustr[8..16].try_into().unwrap());
@@ -23934,9 +23910,7 @@ impl ExecNtHandler {
             return Err(STATUS_OBJECT_NAME_INVALID);
         }
         let mut bytes = [0u8; NAMED_OBJECT_PATH_CAP * 2];
-        if !self.xas_read(buffer, &mut bytes[..length]) {
-            return Err(STATUS_ACCESS_VIOLATION);
-        }
+        self.process_memory_read_status(self.pi, buffer, &mut bytes[..length])?;
         let path_len = length / 2;
         let mut path = [0u8; NAMED_OBJECT_PATH_CAP];
         for (index, word) in bytes[..length].chunks_exact(2).enumerate() {
@@ -23956,6 +23930,7 @@ impl ExecNtHandler {
         Ok(CapturedNamedObjectAttributes {
             root,
             attributes,
+            security_descriptor,
             path_len: Some(path_len),
             path,
         })
@@ -24060,7 +24035,14 @@ impl ExecNtHandler {
 
     fn rollback_new_namespace_object(&mut self, index: usize) {
         if index + 1 == self.obj_ns.len() {
+            let identity = self.obj_ns[index].identity;
+            let parent = self.obj_ns[index].parent;
+            let parent_identity = self.obj_ns.get(parent).map(|entry| entry.identity);
+            self.directory_security.retain(|record| record.identity() != identity);
             self.obj_ns.pop();
+            if let Some(identity) = parent_identity {
+                self.retire_directory_security_body(parent, identity);
+            }
         }
     }
 
@@ -24544,7 +24526,11 @@ impl ExecNtHandler {
             }
         }
         match kind {
-            OBJ_KIND_DIRECTORY | OBJ_KIND_SYMBOLIC_LINK | OBJ_KIND_LPC_PORT => {}
+            OBJ_KIND_DIRECTORY => {
+                self.unlink_directory_security_name(index);
+                return;
+            }
+            OBJ_KIND_SYMBOLIC_LINK | OBJ_KIND_LPC_PORT => {}
             OBJ_KIND_TIMER => {
                 self.events.remove_existing(index as u64);
                 self.user_timer_remove(index as u64);
@@ -24557,7 +24543,12 @@ impl ExecNtHandler {
             }
             _ => return,
         }
+        let parent = self.obj_ns[index].parent;
+        let parent_identity = self.obj_ns.get(parent).map(|entry| entry.identity);
         self.obj_ns[index].unlink();
+        if let Some(identity) = parent_identity {
+            self.retire_directory_security_body(parent, identity);
+        }
     }
 
     fn release_opaque_namespace_reference(&mut self, tag: u64) {
@@ -30464,6 +30455,17 @@ impl ExecNtHandler {
         root_idx: usize,
         follow_final_link: bool,
     ) -> Option<usize> {
+        self.obj_resolve_authorized(path, root_idx, follow_final_link, |_| Ok(()))
+            .ok().flatten()
+    }
+
+    fn obj_resolve_authorized(
+        &self,
+        path: &[u8],
+        root_idx: usize,
+        follow_final_link: bool,
+        mut traverse: impl FnMut(usize) -> Result<(), u32>,
+    ) -> Result<Option<usize>, u32> {
         const SYMLINK_LIMIT: u32 = 32;
         let mut components = Self::object_path_components(path);
         let mut cur = if path.first() == Some(&b'\\') {
@@ -30475,20 +30477,21 @@ impl ExecNtHandler {
         let mut hops = 0u32;
 
         while index < components.len() {
-            let cur_entry = self.obj_ns.get(cur)?;
+            let Some(cur_entry) = self.obj_ns.get(cur) else { return Ok(None) };
             if !cur_entry.is_live() || cur_entry.kind != OBJ_KIND_DIRECTORY {
-                return None;
+                return Ok(None);
             }
-            let child = self.obj_child(cur, &components[index])?;
-            let entry = self.obj_ns.get(child)?;
+            traverse(cur)?;
+            let Some(child) = self.obj_child(cur, &components[index]) else { return Ok(None) };
+            let Some(entry) = self.obj_ns.get(child) else { return Ok(None) };
             if !entry.is_live() {
-                return None;
+                return Ok(None);
             }
             let final_component = index + 1 == components.len();
             if entry.kind == OBJ_KIND_SYMBOLIC_LINK && (!final_component || follow_final_link) {
                 hops += 1;
                 if hops > SYMLINK_LIMIT {
-                    return None;
+                    return Ok(None);
                 }
                 let target = entry.target();
                 let target_absolute = target.first() == Some(&b'\\');
@@ -30508,7 +30511,7 @@ impl ExecNtHandler {
             cur = child;
             index += 1;
         }
-        Some(cur)
+        Ok(Some(cur))
     }
 
     /// Resolve an object path to an `obj_ns` index, following the final symbolic link.

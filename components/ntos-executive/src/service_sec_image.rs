@@ -2843,6 +2843,7 @@ fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
 }
 
 fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
+    nt_handler.sweep_directory_security_bodies();
     // The journal owns the mounted volume, including all dirty state, until its terminal proof.
     // Leave maintenance flags untouched; an unavailable volume is neither clean nor absent.
     if crate::writable_fs::registry_journal::owns_volume() {
@@ -2871,7 +2872,9 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
     let _ = nt_handler.drain_hosted_process_deletion_candidates();
     nt_handler.drain_native_process_images();
     if let Some(ctx) = nt_handler.loop_ctx {
-        if let Err(status) = unsafe { service_drain_section_retirement(&mut *ctx.generic_sections) } {
+        if let Err(status) = unsafe {
+            service_drain_section_retirement_for_handler(&mut *ctx.generic_sections, nt_handler)
+        } {
             return status;
         }
     }
@@ -2999,7 +3002,7 @@ pub(crate) use section_scratch::{service_read_file_coherent, service_resize_file
 pub(crate) use section_scratch::section_scratch_is_quiescent;
 #[path = "service_section_retirement.rs"]
 mod section_retirement;
-pub(crate) use section_retirement::{service_drain_section_retirement, service_unmap_section_view_mappings};
+pub(crate) use section_retirement::{service_drain_section_retirement, service_drain_section_retirement_for_handler, service_unmap_section_view_mappings};
 pub(crate) use section_writeback::{
     service_generic_section_writeback_file, service_generic_section_writeback_plan,
     service_generic_section_writeback_view,
