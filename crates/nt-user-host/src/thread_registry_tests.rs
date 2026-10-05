@@ -12,6 +12,49 @@ use crate::thread_rollback::{
 const REGISTERED: [u64; 4] = [0x10000, 0x11000, 0x13000, 0x14000];
 
 #[test]
+fn separate_stack_target_refuses_legacy_owner_as_registered_mapping() {
+    let mut resources = partial();
+    resources.stack_owner[0] = 10;
+    resources.stack_target[0] = 11;
+    let mut registry = ClientFrameRegistry::new();
+    registry
+        .insert_with_backing(27, MEMORY_PROCESS, 0x10000, 10, 0, 0, 10, true, 10)
+        .unwrap();
+    let before = registry.get(27, 0x10000);
+    assert!(
+        matches!(
+            ThreadRegistrySnapshot::capture_partial(&resources, &registry, &[0x10000]),
+            Err(ThreadRegistryError::WrongFrame { page: 0x10000 })
+        ),
+        "a separate mapped target must not fall back to physical backing identity"
+    );
+    assert_eq!(registry.get(27, 0x10000), before);
+}
+
+#[test]
+fn direct_mapped_ipc_owner_remains_a_valid_exact_registry_mapping() {
+    let mut resources = partial();
+    resources.ipc_owner = 60;
+    let mut registry = ClientFrameRegistry::new();
+    registry
+        .insert_with_backing(27, MEMORY_PROCESS, 0x12000, 60, 0, 0, 60, true, 60)
+        .unwrap();
+    let snapshot =
+        ThreadRegistrySnapshot::capture_partial(&resources, &registry, &[0x12000]).unwrap();
+    assert_eq!(snapshot.records()[0].frame, 60);
+    assert_eq!(snapshot.records()[0].owned_backing_cap, 60);
+    assert_eq!(snapshot.rollback_resources().len(), 1);
+    assert_eq!(snapshot.rollback_resources()[0].cap, 60);
+    assert_eq!(snapshot.rollback_resources()[0].kind, Kind::Frame);
+    let transfer = snapshot
+        .prepare_transfer(&resources, &mut registry)
+        .unwrap()
+        .unwrap();
+    registry.finish_transfer(transfer).unwrap();
+    assert!(registry.get(27, 0x12000).is_none());
+}
+
+#[test]
 fn main_transport_transfer_leaves_private_stack_in_registry() {
     let layout = ThreadMemoryLayout::without_stack(0x12000, 0x13000, 0x16000).unwrap();
     let mut main = ThreadMemoryResources::<3>::new(27, layout).unwrap();
@@ -304,8 +347,8 @@ fn resources(pi: usize) -> ThreadMemoryResources<3> {
 fn registry(pi: usize) -> ClientFrameRegistry {
     let mut registry = ClientFrameRegistry::new();
     for (page, frame, alias, source) in [
-        (0x10000, 10, 12, 10),
-        (0x11000, 20, 22, 20),
+        (0x10000, 11, 12, 10),
+        (0x11000, 21, 22, 20),
         (0x13000, 31, 33, 34),
         (0x14000, 41, 43, 44),
     ] {
@@ -364,13 +407,13 @@ fn native_target_teb_records_never_become_second_physical_owners() {
 }
 
 #[test]
-fn owner_and_target_representations_use_runtime_authority_not_registry_flags() {
+fn exact_target_mapping_uses_runtime_backing_authority_not_registry_flags() {
     for owns_frame in [false, true] {
         let resources = resources(27);
         let mut registry = registry(27);
         registry.take(27, 0x13000).unwrap();
         registry
-            .insert(27, MEMORY_PROCESS, 0x13000, 30, 0, 0, 30, owns_frame)
+            .insert(27, MEMORY_PROCESS, 0x13000, 31, 0, 0, 30, owns_frame)
             .unwrap();
         let snapshot = ThreadRegistrySnapshot::capture(&resources, &registry, &REGISTERED).unwrap();
         assert_eq!(
@@ -455,8 +498,9 @@ fn arbitrary_backing_pages_can_be_explicitly_registered_without_role_policy() {
     let mut registry = ClientFrameRegistry::new();
     let mut pages = Vec::new();
     for (page, owner, _) in resources.backing_pages() {
+        let mapped = resources.expected_mapping_cap(page).unwrap();
         registry
-            .insert(0, MEMORY_PROCESS, page, owner, 0, 0, owner, false)
+            .insert(0, MEMORY_PROCESS, page, mapped, 0, 0, owner, false)
             .unwrap();
         pages.push(page);
     }

@@ -25616,42 +25616,36 @@ unsafe fn spawn_hosted_thread_mechanism(
         let target_cap = memory_cap!(b"stack-target-cap", copy_thread_construction_cap(f), page);
         resources.stack_target[index] = target_cap;
         let target_map = page_map_r(target_cap, page, RW_NX, t.pml4);
-        let mut mirror_map = 0;
+        if target_map != 0 {
+            return failed!(b"stack-target-map", ThreadConstructionError::Native(target_map), page);
+        }
         if t.stack_mirror_va != 0 {
             let mirror_cap = memory_cap!(b"stack-mirror-cap", copy_thread_construction_cap(f), t.stack_mirror_va + i * 0x1000);
             resources.stack_mirror[index] = mirror_cap;
-            mirror_map = page_map_r(
+            let mirror_map = page_map_r(
                 mirror_cap,
                 t.stack_mirror_va + i * 0x1000,
                 RW_NX,
                 CAP_INIT_THREAD_VSPACE,
             );
+            if mirror_map != 0 {
+                return failed!(b"stack-mirror-map", ThreadConstructionError::Native(mirror_map), t.stack_mirror_va + i * 0x1000);
+            }
         }
-        let registered = csrss_frame_put(
+        let registered = csrss_frame_put_with_source(
             t.client_pi,
             nt_memory_manager::MemoryLifetime::Process(binding.process),
             page,
+            target_cap,
             f,
         );
         if registered { memory_progress.record_stack(index); }
-        if target_map != 0 || mirror_map != 0 || !registered {
+        if !registered {
             print_str(b"[thread-life] stack publication failed pi=");
             print_u64(t.client_pi);
             print_str(b" page=0x");
             print_hex_u64(page);
-            print_str(b" map=");
-            print_u64(target_map);
-            print_str(b"/");
-            print_u64(mirror_map);
-            print_str(b" registered=");
-            print_u64(registered as u64);
             print_str(b"\n");
-            if target_map != 0 {
-                return failed!(b"stack-target-map", ThreadConstructionError::Native(target_map), page);
-            }
-            if mirror_map != 0 {
-                return failed!(b"stack-mirror-map", ThreadConstructionError::Native(mirror_map), t.stack_mirror_va + i * 0x1000);
-            }
             return failed!(b"stack-register", ThreadConstructionError::Admission("registry-refused"), page);
         }
     }

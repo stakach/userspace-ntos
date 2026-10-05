@@ -49,7 +49,7 @@ fn fixture() -> (
     progress.record_teb(0);
     let mut registry = ClientFrameRegistry::new();
     registry
-        .insert(7, MEMORY_PROCESS, 0x1000, 10, 0, 12, 13, false)
+        .insert(7, MEMORY_PROCESS, 0x1000, 11, 0, 12, 13, false)
         .unwrap();
     registry
         .insert(7, MEMORY_PROCESS, 0x5000, 21, 0, 22, 23, false)
@@ -513,7 +513,7 @@ fn registered_coverage_is_explicit_even_for_pi_zero_and_empty_registration() {
     assert!(snapshot.records().is_empty());
     assert!(!snapshot.rollback_resources().is_empty());
     registry
-        .insert(0, MEMORY_PROCESS, 0x1000, 10, 0, 12, 13, false)
+        .insert(0, MEMORY_PROCESS, 0x1000, 11, 0, 12, 13, false)
         .unwrap();
     assert!(matches!(
         state.reconcile_registered(id, &resources, &[], &registry),
