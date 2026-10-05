@@ -159,9 +159,9 @@ in `extern-rootserver` mode (bring your own root task).
 The desktop target hosts **real, unmodified GPL ReactOS binaries** on rust-micro.
 Genuine Explorer and native acceptance are tracked in
 [issue #18](https://github.com/stakach/userspace-ntos/issues/18).
-The latest [fresh-run receipt](docs/evidence/issue18-alias-refusal-font-frontier.json)
-passes the earlier allocation and LPC retirement failures during genuine setup,
-but stops at an unmapped image execution fault (219/261 executive checks). Its
+The latest [fresh-run receipt](docs/evidence/issue18-loader-graph-font-frontier.json)
+passes the earlier allocation, LPC retirement and loader image failures during
+genuine setup, but stops at a low-address mapped-section paging failure. Its
 screenshot shows background and cursor, not a working desktop. Acceptance requires both strict
 native private-font cleanup and a separate fixture-free Userinit/Explorer boot
 with real callbacks, GDI drawing, logs and screenshots. Crate CI does not prove
