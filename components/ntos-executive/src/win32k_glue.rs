@@ -1092,10 +1092,19 @@ pub(crate) struct StagedUserCallbackContext {
     client_tcb: u64,
 }
 
+impl StagedUserCallbackContext {
+    /// Caller must hold the exact authenticated target and an ACK for its installed callback
+    /// image. Restart independently validates that target against the retained physical Reply.
+    pub(crate) const unsafe fn installed(client_tcb: u64) -> Self {
+        Self { client_tcb }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum CompletedUserCallback {
     Completed {
         outer_dispatch: Option<CompletedWin32kDispatch>,
+        callback_context: StagedUserCallbackContext,
     },
     ProviderWaitSuspended {
         pending: PendingProviderWaitDispatch,
@@ -3321,6 +3330,23 @@ pub(crate) unsafe fn complete_staged_user_callback_context(
     crate::thread_context::write(context.client_tcb, &update, false).is_ok()
 }
 
+/// Consume the exact bound Call without the ordinary IPC return-register fanout. The staged
+/// parent (or chained dispatcher) remains canonical; no saved register image is replayed here.
+pub(crate) unsafe fn restart_staged_user_callback_context(
+    context: StagedUserCallbackContext,
+    reply: u64,
+) -> bool {
+    let update = nt_thread_start::amd64_context::LegacyContextRestore {
+        registers: [0; 20],
+        register_mask: 0,
+        floating_point: None,
+        debug: None,
+    };
+    crate::spawn_hosts::shared_ingress::owner::runtime::restart_hosted(
+        reply, context.client_tcb, &update,
+    ).expect("uncertain callback restart retains its exact hosted Call").is_ok()
+}
+
 pub(crate) unsafe fn tcb_unset_breakpoint(tcb: u64, bp_num: u64) -> u64 {
     let reply_info: u64;
     core::arch::asm!(
@@ -5027,6 +5053,9 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         }
         return Some(CompletedUserCallback::Completed {
             outer_dispatch: None,
+            callback_context: StagedUserCallbackContext {
+                client_tcb: callback_context_tcb(chained_client)?,
+            },
         });
     }
     let nested_user_callback = (&*core::ptr::addr_of!(USER_CALLBACK_ACTIVE))
@@ -5130,23 +5159,21 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     // `IntRestoreTebWndCallback` — can have left win32k's untranslated PWND in CLIENTINFO.CallbackWnd,
     // so restate the enclosing frame's bridged triple before the client runs again.
     reassert_top_client_callback_window(&identity);
-    if stage_returned_user_callback_context(
+    let Some(callback_context) = stage_returned_user_callback_context(
         completed_frame,
         completed_context,
         request.api_index,
         component.result,
         return_rsp,
         b"completed-outer",
-    )
-    .is_none()
-    {
+    ) else {
         abort_controlled_user_callbacks();
         print_str(b"[user-callback] completed callback missing executable outer resume=0x");
         print_crash_hex64(completed_frame.outer_resume_ip());
         print_str(b"\n");
         release_dispatch_output_stage(dispatch_context);
         return None;
-    }
+    };
     record_completed_user_callback(completed_client, request, callback_status);
     USER_CALLBACK_REAL_RETURNS.fetch_add(1, Ordering::Relaxed);
     if callback_trace {
@@ -5207,6 +5234,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     }
     Some(CompletedUserCallback::Completed {
         outer_dispatch: Some(outer_dispatch),
+        callback_context,
     })
 }
 

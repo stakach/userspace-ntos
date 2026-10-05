@@ -2274,6 +2274,7 @@ unsafe fn drain_deferred_user_callback_returns(
         let mut effects_ok;
         let mut outer_dispatch_completed = false;
         let mut retained_reply = false;
+        let mut staged_context = None;
         if let Some(completion) = completion {
             let completion_pi = deferred.pi as usize;
             effects_ok = completion_pi < MAX_PI;
@@ -2285,7 +2286,8 @@ unsafe fn drain_deferred_user_callback_returns(
                 );
             }
             match completion {
-                win32k_glue::CompletedUserCallback::Completed { outer_dispatch } => {
+                win32k_glue::CompletedUserCallback::Completed { outer_dispatch, callback_context } => {
+                    staged_context = Some(callback_context);
                     if let Some(dispatch) = outer_dispatch {
                         if effects_ok {
                             let completion_pml4 = procs[completion_pi].pml4;
@@ -2374,7 +2376,12 @@ unsafe fn drain_deferred_user_callback_returns(
             pfilled[current_pi] = *current_filled_pages;
         }
         if !retained_reply {
-            client_reply_on(deferred.reply_cap, 0, 0, 0, 0, 0);
+            assert!(effects_ok, "failed deferred callback retains its bound Reply");
+            let restarted = win32k_glue::restart_staged_user_callback_context(
+                staged_context.expect("completed callback owns its installed context"),
+                deferred.reply_cap,
+            );
+            assert!(restarted, "rejected deferred callback restart retains its bound Reply");
             release_reply_pool_cap(deferred.reply_cap);
             let n = USER_CALLBACK_DEFERRED_RETURNS_WOKEN.fetch_add(1, Ordering::Relaxed);
             if n < 32 {
@@ -9995,28 +10002,9 @@ pub(crate) unsafe fn service_sec_image(
             // value and the loop never makes progress (deterministic hang). So STOP the loop cleanly
             // with a diagnostic instead — exactly like the win32k `[vmf-out]` stop path.
             if addr < 0x10000 {
-                let tcb = event_runtime.tcb;
-                if tcb != 0 {
-                    let mut regs = [0u64; 20];
-                    win32k_glue::tcb_read_regs20(tcb, &mut regs);
-                    print_str(b"[vmf-low] rcx=0x");
-                    print_hex((regs[5] >> 32) as u32);
-                    print_hex(regs[5] as u32);
-                    print_str(b" rsi=0x");
-                    print_hex((regs[7] >> 32) as u32);
-                    print_hex(regs[7] as u32);
-                    print_str(b" rdi=0x");
-                    print_hex((regs[8] >> 32) as u32);
-                    print_hex(regs[8] as u32);
-                    print_str(b" rsp=0x");
-                    print_hex((regs[1] >> 32) as u32);
-                    print_hex(regs[1] as u32);
-                    print_str(b" ret=0x");
-                    let ret = smss_stack_read(regs[1] + 0x10);
-                    print_hex((ret >> 32) as u32);
-                    print_hex(ret as u32);
-                    print_str(b"\n");
-                }
+                fault_stack_diagnostics::trace_user_fault_context(
+                    &nt_handler, event_runtime, scratch_base,
+                );
                 if is_tp_worker {
                     assert!(drop_current_hosted_reply(), "terminal worker fault must retire its Call");
                     print_str(b"[tp-worker] wall badge=");
@@ -10102,51 +10090,6 @@ pub(crate) unsafe fn service_sec_image(
                     m2 = nm2;
                     m3 = nm3;
                     continue;
-                }
-                print_str(match pi {
-                    1 => b"[csrss vmf] NULL/low deref ip=0x",
-                    2 => b"[winlogon vmf] NULL/low deref ip=0x",
-                    3 => b"[services vmf] NULL/low deref ip=0x",
-                    4 => b"[lsass vmf] NULL/low deref ip=0x",
-                    5 => b"[userinit vmf] NULL/low deref ip=0x",
-                    _ => b"[smss vmf] NULL/low deref ip=0x",
-                });
-                print_hex((m0 >> 32) as u32);
-                print_hex(m0 as u32);
-                print_str(b" addr=0x");
-                print_hex((addr >> 32) as u32);
-                print_hex(addr as u32);
-                print_str(b" (dll_rva = ip - dll_base; user32@0x84000000, gdi32@0x85000000)\n");
-                // DIAG (BATCH 7): dump the fault frame RSP + the caller return addresses so we can
-                // identify who passed NULL (e.g. strlen(NULL) during msvcrt CRT init). At strlen+0x16
-                // the frame is `sub rsp,0x18` deep so the return addr is at [rsp+0x18]; also dump a
-                // small window of the stack to see the call chain.
-                {
-                    let sp = get_recv_mr(16);
-                    print_str(b"[winlogon vmf] rsp=0x");
-                    print_hex((sp >> 32) as u32);
-                    print_hex(sp as u32);
-                    print_str(b" retaddrs[");
-                    // Scan up the stack for the first plausible RETURN ADDRESSES (msvcrt 0x806xxxxx,
-                    // our ntdll 0x100_00xxxxxx, or another mapped DLL 0x80xxxxxx) so we see the caller
-                    // chain that reached strlen(NULL).
-                    let mut k: u64 = 0;
-                    let mut printed: u64 = 0;
-                    while k < 96 && printed < 10 {
-                        let v = smss_stack_read(sp + k * 8);
-                        let is_ntdll = v >= 0x0000_0100_0000_0000 && v < 0x0000_0100_0100_0000;
-                        let is_dll = v >= 0x8000_0000 && v < 0x8100_0000;
-                        if is_ntdll || is_dll {
-                            print_str(b" +0x");
-                            print_hex((k * 8) as u32);
-                            print_str(b":0x");
-                            print_hex((v >> 32) as u32);
-                            print_hex(v as u32);
-                            printed += 1;
-                        }
-                        k += 1;
-                    }
-                    print_str(b" ]\n");
                 }
                 // BATCH 39 — winlogon (pi 2) is the process the whole boot drives toward; once it has
                 // crossed OpenSCManager (the SCM RPC round-trip) and reached its GUI/login init, the
@@ -11430,10 +11373,12 @@ pub(crate) unsafe fn service_sec_image(
                                 print_str(
                                     b"[win32k-context] ERROR: callback completion could not publish Ps identity\n",
                                 );
+                                panic!("failed callback context publication retains its bound Reply");
                             }
-                            match completion {
+                            let staged_context = match completion {
                                 win32k_glue::CompletedUserCallback::Completed {
                                     outer_dispatch,
+                                    callback_context,
                                 } => {
                                     let mut outer_dispatch_completed = false;
                                     if let Some(dispatch) = outer_dispatch {
@@ -11461,6 +11406,7 @@ pub(crate) unsafe fn service_sec_image(
                                     if outer_dispatch_completed {
                                         pfilled[pi] = *filled_pages;
                                     }
+                                    callback_context
                                 }
                                 win32k_glue::CompletedUserCallback::ProviderWaitSuspended {
                                     pending,
@@ -11530,7 +11476,7 @@ pub(crate) unsafe fn service_sec_image(
                                     m3 = nm3;
                                     continue;
                                 }
-                            }
+                            };
                             drain_deferred_user_callback_returns(
                                 &mut nt_handler,
                                 pi,
@@ -11544,7 +11490,11 @@ pub(crate) unsafe fn service_sec_image(
                             procs[pi].ntfaults = ntfaults;
                             pfilled[pi] = *filled_pages;
                             let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                            client_reply_on(reply_main, 0, 0, 0, 0, 0);
+                            let restarted = win32k_glue::restart_staged_user_callback_context(
+                                staged_context,
+                                reply_main,
+                            );
+                            assert!(restarted, "rejected callback restart retains its bound Reply");
                             let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, reply_main);
                             badge = nb;
                             mi = nmi;
@@ -17855,17 +17805,25 @@ pub(crate) unsafe fn service_sec_image(
                     .requires_post_reply_inspection(nt_handler.lpc_reply_published);
             // Ordinary completion changes only RAX. Provider reentry can legitimately install
             // newer target registers while this syscall is serviced; never replay ingress state.
-            // A committed callback redirect already owns the full canonical context and gets
-            // an empty reply. Successful NtContinue has restarted atomically and bypassed this tail.
-            let len = if redirected_user_control { 0 } else { 1 };
-            let r0 = if redirected_user_control { 0 } else { result };
-            let ((nb, nmi, nm0, nm1, nm2, nm3), native_reply_delivered) = if reply_main == 0 {
+            // A committed callback redirect already owns the full canonical context and must
+            // restart without IPC register fanout. NtContinue already bypassed this tail.
+            let len = 1;
+            let r0 = result;
+            let ((nb, nmi, nm0, nm1, nm2, nm3), native_reply_delivered) = if redirected_user_control {
+                let restarted = win32k_glue::restart_staged_user_callback_context(
+                    win32k_glue::StagedUserCallbackContext::installed(event_runtime.tcb),
+                    reply_main,
+                );
+                assert!(restarted, "rejected callback redirect restart retains its bound Reply");
+                if inspect_component_lpc_after_reply {
+                    let _ = lpc_component_reply_commit_drain(&mut nt_handler);
+                }
+                (component_recv!(fault_ep, reply_main), true)
+            } else if reply_main == 0 {
                 // Pre-retype (demo path): no reply objects exist yet, legacy `reply_to` it is.
                 (component_reply_recv!(fault_ep, len, r0, 0, 0, 0), true)
             } else {
-                // A client redirected into a win32k user-mode callback resumes with the length-0
-                // fault reply the redirect staged, not with a syscall result. Current APC delivery
-                // owns its saved Reply independently and has already bypassed this tail.
+                // Current APC delivery owns its saved Reply independently and bypasses this tail.
                 if inspect_component_lpc_after_reply {
                     // The broker reply is visible, but its server must observe this native reply
                     // before the retained component client resumes. Calls made during the bounded
