@@ -166,12 +166,15 @@ with activation-frame pointer `0xc0` after `WM_CREATE`. A subsequent
 passed that frontier: the genuine helper completed its window callbacks and exited
 successfully. Native capability cleanup then progressed too slowly; the run was
 manually stopped after about 52 minutes, without a guest summary or sentinel.
-After the native leaf-revoke fix, the latest
+After the native leaf-revoke fix, a
 [font-profile boot](docs/evidence/issue18-client-frame-growth-allocation-failure.json)
 reached the genuine helper's client-thread setup, then refused a 3.75 MiB
 allocation during client-frame registration. It was manually stopped after about
-30 minutes without a guest verdict. Its screenshot still shows background and
-cursor only. Font acceptance, Userinit/Explorer, and desktop rendering remain
+30 minutes without a guest verdict. With chunked frame storage, the latest
+[boot](docs/evidence/issue18-chunked-frame-boot-frontier.json) completed the theme
+helper's exit and retirement without an allocation-refusal diagnostic, then
+reached the natural gate at 218/261. Its screenshot still shows background and
+cursor only; font acceptance, Userinit/Explorer, and desktop rendering remain
 unproven.
 Crate CI does not prove desktop boot. To attempt a boot from a fresh clone:
 
