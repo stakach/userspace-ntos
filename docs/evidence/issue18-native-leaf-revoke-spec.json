@@ -1,0 +1,88 @@
+{
+  "parent_commit_at_capture": "a30823891e78a3e3572462f4e058bb1a6e5f346a",
+  "microkernel_commit": "95daf082577c80b69a3b9742977b6dda2afd9bb3",
+  "merged_microkernel_commit": "1a0985b6f0d636b7299f4e7cd6271a226c2c0ffa",
+  "merged_pull_request": "https://github.com/stakach/rust-micro/pull/12",
+  "merged_tree_provenance": "Root fetched the published squash merge and consumed git diff 95daf082577c80b69a3b9742977b6dda2afd9bb3..1a0985b6f0d636b7299f4e7cd6271a226c2c0ffa --exit-code with exit0. Tested candidate and merged pin have identical trees; the artifact hashes below were captured before the next production build.",
+  "scope": "Native microkernel specification proof for scan-free leaf CNodeRevoke; not an NT desktop or font acceptance run.",
+  "validation_owner": "Root agent; all reported build and guest exit statuses were consumed serially by that owner. This archive operation ran no builds or tests.",
+  "guest_bound": "Each native spec attempt was bounded by gtimeout -k 10s with a 600-second limit.",
+  "guest_command": "gtimeout -k 10s 600s ./scripts/run_specs.sh (working directory rust-micro)",
+  "traced_guest_command": "gtimeout -k 10s 600s ./scripts/run_specs.sh -d int,cpu_reset -D /Users/steve/projects/userspace-ntos/.tmp/issue18-leaf-revoke-green-startup-trace.log",
+  "production_change": "Nine-line fast path after existing source-range validation uses the canonical direct-child count. A zero-child source skips the global descendant scan. Empty Untyped revoke still resets its free watermark; nonleaf revocation retains the existing traversal.",
+  "specification_change": "Five focused native specifications plus a spec-feature-only CteCursor::next counter. Coverage includes mapped Frame source/parent preservation, empty source no-op, empty Untyped reset followed by genuine Retype, invalid source rejection, and a real TCB-internal IPC-buffer child that still requires traversal.",
+  "initial_packaging": {
+    "build_exit": 1,
+    "diagnostic": "Kernel compiled, then image packaging rejected staged hive profile 'font-cleanup' versus requested 'production'.",
+    "subsequent_image_only_exit": 0,
+    "meaning": "Packaging profile mismatch, not a leaf-revoke test result. The root validation owner corrected the requested image profile before running the RED guest."
+  },
+  "final_build": {
+    "session": 96289,
+    "exit": 0,
+    "source_log": ".tmp/issue18-leaf-revoke-green-final-build.log",
+    "sha256": "441d42ed18354fe4d57c89c906a03091038cc0b584e39a3c51297437685d5494"
+  },
+  "attempts": [
+    {
+      "phase": "red",
+      "session": 82832,
+      "exit": 255,
+      "outcome": "Original production revoke failed the intended zero-global-scan assertion at src/invocation/leaf_revoke_specs.rs:50.",
+      "raw_log_sha256": "1a1df0022747f9eb9e5ebef6c6c6e44133e7659b4f65d9c803b71c2dbec4ca0d",
+      "archived_log": "issue18-native-leaf-revoke-spec-red.log.gz",
+      "archived_log_sha256": "67179ef835c6693dab0a0c31e5f94641661f1f24c388b76f3bdceea58c908ccd"
+    },
+    {
+      "phase": "intermediate-fixture-failure",
+      "session": 86288,
+      "exit": 255,
+      "outcome": "Leaf Frame no-scan test passed, then the Untyped Retype fixture failed at line100. Its invocation left a0 at default0 while asserting derivation from source slot1. The subsequent correction was test-only a0=1, not a weakened assertion or another production change.",
+      "raw_log_sha256": "85840a6d2f738fa517d903361266220dc37cb39016b869ab3d4d2b22c0c67d01",
+      "archived_log": "issue18-native-leaf-revoke-spec-fixture-failure.log.gz",
+      "archived_log_sha256": "390368a42eb9ea2d54a1c4e735f6302574caf635d9a8d279c19ffbdffb89defa"
+    },
+    {
+      "phase": "early-startup-without-verdict",
+      "session": 39598,
+      "exit": 1,
+      "outcome": "Guest stopped after Initializing SYSCALL MSRs, before any specification verdict. Runner reported QEMU exited without the successful guest completion verdict. This failure remains unresolved under issue287.",
+      "raw_log_sha256": "a0dcafe0ee268b4df244c233e8bfb833f0e736c957ebfda2f3b1e62d232b783d",
+      "archived_log": "issue18-native-leaf-revoke-spec-early-startup.log.gz",
+      "archived_log_sha256": "b97cdbc977751e4febaa8a9ac8954f2e4296b390619d8271070b6ff98f6b236c"
+    },
+    {
+      "phase": "green-with-startup-tracing",
+      "session": 92680,
+      "exit": 0,
+      "outcome": "Unchanged final artifact reached All specs passed at line378 and 15 passed, 0 failed microtests at line415, then its sentinel at417.",
+      "raw_log_sha256": "db2ed2016d74a453b1a11bc1affc2699512ae52e71e28a92d350706350ca48c0",
+      "archived_log": "issue18-native-leaf-revoke-spec-green-traced.log.gz",
+      "archived_log_sha256": "b902dcf068c596f2a3e3e3b811b7099c8ec0a7bcf349600396a574ac02e7fcf3"
+    },
+    {
+      "phase": "green-untraced-repeat",
+      "session": 90911,
+      "exit": 0,
+      "outcome": "Same final artifact repeated without startup tracing: All specs passed at line378, 15 passed, 0 failed microtests at415, and sentinel at417.",
+      "raw_log_sha256": "5b5296a3487be7efe419fc1f7fcdcf00757f535b3d0611eb118d286402018575",
+      "archived_log": "issue18-native-leaf-revoke-spec-green-repeat.log.gz",
+      "archived_log_sha256": "5609233e7209aeea13194e707f2292fb18cc9e73805e3f01e0ae20610b140333"
+    }
+  ],
+  "artifacts_captured_before_next_production_build": {
+    "kernel_path": "rust-micro/target/mykernel-x86/release/mykernel-rust",
+    "kernel_sha256": "082df1d164290bf69a67982afaa668cd9a733a484279ad610527ecf4d3c5322f",
+    "disk_path": "rust-micro/.tmp/disk.img",
+    "disk_sha256": "cb49cb08211381746f9039abdc901f71c24a851e060a7c44881ad1937317de2e",
+    "rootserver_path": "rust-micro/.tmp/rootserver.elf",
+    "rootserver_sha256": "04f665e90ec6142f969c576c0511f3e18f452a652a3d7e8b5024018da816fa0c",
+    "qualification": "These are the current native spec/microtest artifacts, not the previously archived font-cleanup NT executive boot artifacts. No RED-artifact hash is inferred from them."
+  },
+  "limitations": [
+    "This establishes the leaf-revoke native specification result, not complete cleanup performance or desktop boot completion.",
+    "Issue286 IPC-capability-transfer provenance is not fixed by this change.",
+    "Issue287 early-startup failure remains unresolved despite the two subsequent successful unchanged-artifact runs.",
+    "No font acceptance or Explorer desktop proof is claimed. The stopped font-run archive and README remain unchanged."
+  ]
+}

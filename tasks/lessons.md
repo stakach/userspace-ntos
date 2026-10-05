@@ -528,6 +528,9 @@ diagnosis-free failure.
   rejected at admission does not reproduce the later behavior it claims to test.
 - Give retained-owner fixtures valid reservation identities before testing
   output ordering, and keep setup failures separate from behavioral evidence.
+- Direct kernel invocation fixtures must name the actual source CPtr in the
+  invocation arguments. A matching typed capability snapshot alone is not source
+  authority; never relax admission to compensate for an incorrect fixture.
 
 ## Consume Validation Exit Before Starting Another
 - A session ID means validation is still active, including quiet executable startup
