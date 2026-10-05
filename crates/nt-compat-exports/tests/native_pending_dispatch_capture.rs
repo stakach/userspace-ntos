@@ -22,7 +22,7 @@ fn initial_wait_snapshot_capture_has_one_policy_and_reparks_keep_saved_bytes() {
             struct Capture {
                 calls: usize,
                 constructor: Option<String>,
-                fields: Vec<String>,
+                fields: Vec<(String, bool)>,
             }
             impl<'ast> Visit<'ast> for Capture {
                 fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
@@ -45,9 +45,10 @@ fn initial_wait_snapshot_capture_has_one_policy_and_reparks_keep_saved_bytes() {
                         for field in &expression.fields {
                             if let syn::Member::Named(name) = &field.member {
                                 if matches!(name.to_string().as_str(), "arg_snapshot_len" | "arg_snapshot") {
-                                    assert!(matches!(&field.expr, syn::Expr::Path(path) if path.path.is_ident(name)),
-                                        "initial pending dispatch must store its canonical capture");
-                                    self.fields.push(name.to_string());
+                                    let name = name.to_string();
+                                    let canonical = matches!(&field.expr, syn::Expr::Path(path)
+                                        if path.path.is_ident(name.as_str()));
+                                    self.fields.push((name, canonical));
                                 }
                             }
                         }
@@ -60,6 +61,8 @@ fn initial_wait_snapshot_capture_has_one_policy_and_reparks_keep_saved_bytes() {
             if capture.calls != 0 {
                 assert_eq!(capture.calls, 1, "one canonical capture per initial suspension branch");
                 assert_eq!(capture.fields.len(), 2, "both original snapshot fields must be retained");
+                assert!(capture.fields.iter().all(|(_, canonical)| *canonical),
+                    "initial pending dispatch must store its canonical capture");
                 let constructor = capture.constructor.expect("initial suspension stores a typed pending dispatch");
                 struct Condition(Vec<String>);
                 impl<'ast> Visit<'ast> for Condition {

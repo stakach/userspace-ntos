@@ -446,24 +446,111 @@ fn uncertain_resident_remap_fences_access_view_drain_and_source_purge() {
     }
     let runtime = executive_source("hosted_thread_runtime.rs");
     let retirement = function(&runtime, "hosted_thread_memory_retirement_access");
-    let first_guard = retirement
+    fn mentions(statement: &syn::Stmt, name: &str) -> bool {
+        struct Names<'a> {
+            name: &'a str,
+            found: bool,
+        }
+        impl<'ast> Visit<'ast> for Names<'_> {
+            fn visit_path_segment(&mut self, segment: &'ast syn::PathSegment) {
+                self.found |= segment.ident == self.name;
+                syn::visit::visit_path_segment(self, segment);
+            }
+            fn visit_macro(&mut self, invocation: &'ast syn::Macro) {
+                if invocation.path.segments.last().is_some_and(|segment| {
+                    segment.ident == "addr_of" || segment.ident == "addr_of_mut"
+                }) {
+                    let addressed: syn::Expr = syn::parse2(invocation.tokens.clone())
+                        .expect("backing address macro must contain an actual expression");
+                    self.found |= names_in_expression(&addressed)
+                        .iter()
+                        .any(|name| name == self.name);
+                }
+                syn::visit::visit_macro(self, invocation);
+            }
+        }
+        let mut names = Names { name, found: false };
+        names.visit_stmt(statement);
+        names.found
+    }
+    let backing = retirement
         .block
         .stmts
         .iter()
-        .find_map(|statement| match statement {
-            syn::Stmt::Expr(syn::Expr::If(branch), _) => Some(branch),
-            _ => None,
-        })
-        .unwrap();
-    assert!(
-        names_in_expression(&first_guard.cond)
+        .position(|statement| mentions(statement, "HOSTED_THREAD_RUNTIME_WORK"))
+        .expect("inspect the actual pending-thread backing table access");
+    for owner in ["private_residency", "native_image_residency"] {
+        let fence = retirement
+            .block
+            .stmts
             .iter()
-            .any(|name| name == "native_image_residency"),
-        "ordinary and cleanup access must consult remap denial before touching backing"
-    );
-    let mut refusal = Calls::default();
-    refusal.visit_block(&first_guard.then_branch);
-    assert!(refusal.0.iter().any(|call| call == "Err"));
+            .enumerate()
+            .find_map(|(index, statement)| {
+                let syn::Stmt::Expr(syn::Expr::If(branch), _) = statement else {
+                    return None;
+                };
+                let syn::Expr::Unary(denial) = &*branch.cond else {
+                    return None;
+                };
+                let mut condition = Calls::default();
+                condition.visit_expr(&denial.expr);
+                if !matches!(denial.op, syn::UnOp::Not(_))
+                    || !names_in_expression(&denial.expr)
+                        .iter()
+                        .any(|name| name == owner)
+                    || !condition.0.iter().any(|call| call == "memory_available")
+                {
+                    return None;
+                }
+                let refuses = branch.then_branch.stmts.iter().any(|statement| {
+                    let syn::Stmt::Expr(syn::Expr::Return(ret), _) = statement else {
+                        return false;
+                    };
+                    let Some(expression) = &ret.expr else {
+                        return false;
+                    };
+                    let mut refusal = Calls::default();
+                    refusal.visit_expr(expression);
+                    refusal.0.iter().any(|call| call == "Err")
+                });
+                assert!(
+                    refuses,
+                    "{owner} denial must return an error, not merely observe it"
+                );
+                Some(index)
+            })
+            .unwrap_or_else(|| panic!("cleanup access must deny pending {owner} remaps"));
+        assert!(
+            fence < backing,
+            "{owner} must fence before pending-thread backing access"
+        );
+    }
+    let ordinary = function(&runtime, "hosted_thread_memory_access");
+    let delegated = ordinary
+        .block
+        .stmts
+        .iter()
+        .position(|statement| {
+            let syn::Stmt::Expr(syn::Expr::Try(propagated), _) = statement else {
+                return false;
+            };
+            names_in_expression(&propagated.expr)
+                .iter()
+                .any(|name| name == "hosted_thread_memory_retirement_access")
+        })
+        .expect("ordinary access must propagate both residency fences through cleanup admission");
+    for storage in ["CLIENT_FRAME_REGISTRY", "PROCESS_PAGEFILE"] {
+        let access = ordinary
+            .block
+            .stmts
+            .iter()
+            .position(|statement| mentions(statement, storage))
+            .unwrap_or_else(|| panic!("inspect actual {storage} backing access"));
+        assert!(
+            delegated < access,
+            "both residency fences must precede {storage} access"
+        );
+    }
     for (name, cleanup) in [
         ("drain_view", "advance"),
         ("purge_area", "begin_retirement"),
