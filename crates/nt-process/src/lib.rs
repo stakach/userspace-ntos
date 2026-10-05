@@ -24,6 +24,10 @@ pub mod job;
 pub mod job_abi;
 mod initial_system;
 mod initial_thread_creation;
+mod fresh_hosted_thread;
+pub use fresh_hosted_thread::FreshHostedThreadPreparation;
+#[cfg(test)]
+mod fresh_hosted_thread_tests;
 pub use initial_thread_creation::InitialThreadCreationPlan;
 pub mod native_handle;
 pub mod native_handle_search;
@@ -989,6 +993,8 @@ pub struct NtThread {
     activation_generation: u64,
     /// Initial main-runtime metadata has been published, including any explicit zero values.
     initial_runtime_published: bool,
+    /// Exact unborn preparation owner; cleared only by activation or checked cancellation.
+    fresh_hosted_nonce: Option<u64>,
     /// LPC port objects referenced by `NtRegisterThreadTerminatePort`, in registration order.
     /// `PspExitThread` drains this as a stack, so duplicates intentionally remain distinct.
     termination_ports: Vec<u64>,
@@ -2095,58 +2101,19 @@ impl ProcessManager {
         }
         let affinity_mask = proc.affinity_mask;
         let base_priority = proc.base_priority;
-        let mut termination_ports = Vec::new();
-        termination_ports
-            .try_reserve_exact(THREAD_TERMINATION_PORT_RESERVE)
-            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-        let tid = allocate_client_id(&mut self.next_cid);
+        let tid = self.next_cid;
+        let thread = NtThread::try_construct(
+            tid, pid, start_address, parameter, is_system_thread, state,
+            affinity_mask, base_priority,
+        )?;
+        let allocated = allocate_client_id(&mut self.next_cid);
+        debug_assert_eq!(allocated, tid);
         proc.threads.insert(tid);
         if proc.main_thread.is_none() {
             proc.main_thread = Some(tid);
             proc.state = ProcessState::Running;
         }
-        self.threads.insert(
-            tid,
-            NtThread {
-                thread_id: tid,
-                process_id: pid,
-                start_address,
-                win32_start_address: start_address,
-                parameter,
-                state,
-                scheduling_state: state,
-                is_system_thread,
-                exit_status: None,
-                wait_references: 0,
-                kernel_pointer_references: 0,
-                create_time_100ns: 0,
-                exit_time_100ns: 0,
-                kernel_time_100ns: 0,
-                user_time_100ns: 0,
-                activation_generation: 1,
-                initial_runtime_published: false,
-                termination_ports,
-                impersonation: None,
-                security_descriptor: Vec::from(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]),
-                suspend_count: 0,
-                suspend_revision: 0,
-                pending_suspend_control: None,
-                freeze_count: 0,
-                win32_thread: None,
-                kernel_thread_object: None,
-                teb_base: 0,
-                affinity_mask,
-                priority: base_priority,
-                base_priority,
-                ideal_processor: 0,
-                break_on_termination: false,
-                disable_boost: false,
-                hide_from_debugger: false,
-                thread_name_len: 0,
-                thread_name: Vec::new(),
-                user_apc_queue: VecDeque::new(),
-            },
-        );
+        self.threads.insert(tid, thread);
         Ok(tid)
     }
 
@@ -3435,6 +3402,7 @@ impl ProcessManager {
         thread.thread_name.clear();
         thread.user_apc_queue.clear();
         thread.activation_generation = next_generation;
+        thread.fresh_hosted_nonce = None;
         Ok(())
     }
 
