@@ -78,6 +78,10 @@ does not convert a LiveCD into installed-system state or override setup queries
 according to the caller's executable.
 The real USER driver owns window-station and desktop assignment; the host does
 not seed process bindings or restore thread bindings from a global desktop cache.
+Additional hosted threads receive fresh canonical ETHREAD identities. A retired
+execution window can be reused while handles retain the previous terminated
+thread; its object, exit status and identity are not reset. Physical execution
+windows remain bounded independently of canonical thread-object lifetimes.
 CI also checks native acceptance log parsing and fixture lifetimes through Clang's
 source AST. These host-only checks do not prove guest execution.
 The local `tests/native/mup_provider/run_kernel_only.sh` gate checks real

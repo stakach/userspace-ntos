@@ -15,6 +15,7 @@ pub(crate) struct HostedThreadRuntimeOwner {
     pub(crate) initial_creation: core::cell::RefCell<
         Option<crate::exec_handler::initial_thread_creation::PendingInitialThreadCreation>,
     >,
+    fresh_creation: core::cell::RefCell<Option<nt_process::FreshHostedThreadPreparation>>,
     memory_coverage: nt_user_host::thread_construction::MemoryConstructionCoverage<TP_WORKER_STACK_FRAME_COUNT>,
     registered_memory: Option<nt_user_host::thread_construction::RegisteredThreadMemory>,
     registry_preparation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation<TP_WORKER_STACK_FRAME_COUNT>,
@@ -31,6 +32,7 @@ impl HostedThreadRuntimeOwner {
             runtime,
             suspension: crate::thread_suspend::HostedThreadSuspend::new(),
             initial_creation: core::cell::RefCell::new(None),
+            fresh_creation: core::cell::RefCell::new(None),
             memory_coverage: nt_user_host::thread_construction::MemoryConstructionCoverage::empty(),
             registered_memory: None,
             registry_preparation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation::empty(),
@@ -45,6 +47,7 @@ impl HostedThreadRuntimeOwner {
     fn construction_is_empty(&self) -> bool {
         self.suspension.is_empty()
             && self.initial_creation.try_borrow().is_ok_and(|owner| owner.is_none())
+            && self.fresh_creation.try_borrow().is_ok_and(|owner| owner.is_none())
             && self.memory_coverage.is_empty()
             && !self.registry_preparation.is_prepared() && self.alias_preparation.get().is_none()
             && self.prefetch_preparation.get().is_none()
@@ -942,6 +945,20 @@ pub(crate) struct HostedThreadRuntimes {
 }
 
 impl HostedThreadRuntimes {
+    pub(crate) fn retain_fresh_construction(
+        &mut self,
+        preparation: nt_process::FreshHostedThreadPreparation,
+    ) {
+        let lifetime = preparation.lifetime();
+        let owner = unsafe { (&*self.table).entries.iter()
+            .filter_map(RuntimeSlot::owner)
+            .find(|owner| owner.tid == u64::from(lifetime.thread_id())
+                && owner.process.pid == lifetime.process_id()) }
+            .expect("uncertain construction retains its exact runtime owner");
+        let mut held = owner.fresh_creation.borrow_mut();
+        assert!(held.is_none(), "fresh construction ownership transfers once");
+        *held = Some(preparation);
+    }
     pub(crate) fn admit_ingress(
         &self,
         badge: u64,
@@ -1090,7 +1107,7 @@ impl HostedThreadRuntimes {
     /// free reservation release. Failed construction never committed an MM/job charge.
     pub(crate) unsafe fn advance_failed_construction(
         &mut self, index: usize, id: nt_user_host::thread_rollback::ThreadRollbackId,
-    ) -> Result<HostedThreadRuntime, u32> {
+    ) -> Result<(HostedThreadRuntime, Option<nt_process::FreshHostedThreadPreparation>), u32> {
         let _durable = allocator::enter_durable();
         let table = &mut *self.table;
         let result = (|| {
@@ -1116,7 +1133,7 @@ impl HostedThreadRuntimes {
             memory_retirement::prepare(slot, id)?;
             memory_retirement::advance(slot, id)?;
             let owner = slot.take_retired_payload(id).ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
-            Ok(owner.runtime)
+            Ok((owner.runtime, owner.fresh_creation.into_inner()))
         })();
         if let Some(pending) = table.entries.get(index).and_then(RuntimeSlot::pending)
             .filter(|pending| pending.id() == id)

@@ -22576,7 +22576,7 @@ pub(crate) enum HostedThreadPublicationKind {
     Remote,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct PreparedHostedThreadPublication {
     owner_pi: usize,
     pool_slot: usize,
@@ -22585,22 +22585,23 @@ pub(crate) struct PreparedHostedThreadPublication {
     handle_out: u64,
     client_id_out: u64,
     kind: HostedThreadPublicationKind,
+    fresh: nt_process::FreshHostedThreadPreparation,
 }
 
 impl PreparedHostedThreadPublication {
-    pub(crate) const fn tid(self) -> u64 {
+    pub(crate) const fn tid(&self) -> u64 {
         self.activation.thread_id() as u64
     }
 
-    pub(crate) const fn pid(self) -> u64 {
+    pub(crate) const fn pid(&self) -> u64 {
         self.activation.process_id() as u64
     }
 
-    pub(crate) const fn handle(self) -> u64 {
+    pub(crate) const fn handle(&self) -> u64 {
         self.handle.handle as u64
     }
 
-    pub(crate) const fn create_suspended(self) -> bool {
+    pub(crate) const fn create_suspended(&self) -> bool {
         self.activation.create_suspended()
     }
 }
@@ -23163,7 +23164,7 @@ struct ExecNtHandler {
     /// Allocation-free hosted main/pool ETHREAD identities. Backed by BSS to keep handler
     /// construction independent of table size.
     thread_mechanisms: ExecThreadMechanisms,
-    /// Runtime occupancy mask for the pre-created ETHREAD pool of each hosted process.
+    /// Runtime occupancy mask for native execution leases, independent of ETHREAD retention.
     pool_used: alloc::vec::Vec<u64>,
     /// Hosted worker stack/TEB VA windows consumed in each process VSpace. Thread teardown releases
     /// the mapped frames/caps and clears the slot, so a later ETHREAD can reuse the same mechanism
@@ -26278,14 +26279,10 @@ static PM_HANDLE_CAP_GROWTHS: AtomicU64 = AtomicU64::new(0);
 /// current fixed-address userspace layout derives target stack/TEB/IPC/trampoline VAs and executive
 /// mirrors from this value, while ProcessManager remains the policy authority for real ETHREADs.
 const PM_RUNTIME_THREAD_SLOTS: usize = 16;
-/// Runtime `NtCreateThread`s refused because the pre-created ETHREAD pool had no free slot. Counted
-/// (and the first few reported with the pool's state) because the ONLY thing the caller ever sees is
+/// Runtime `NtCreateThread`s refused because no native execution lease is free. Counted
+/// (and the first few reported with the lease state) because the ONLY thing the caller ever sees is
 /// `STATUS_INSUFFICIENT_RESOURCES` — rpcrt4 answers it by silently dropping an RPC connection.
 pub(crate) static PM_POOL_REFUSALS: AtomicU64 = AtomicU64::new(0);
-/// Free usage slots skipped because their terminated ETHREAD still has a live user handle and is not
-/// reclaimable yet. The selector must continue to another slot instead of falsely reporting pool
-/// exhaustion.
-pub(crate) static PM_POOL_UNRECLAIMABLE_SKIPS: AtomicU64 = AtomicU64::new(0);
 /// Bit i set iff hosted EPROCESS pi=i has proven image identity and ProcessManager still reports it
 /// Running. Identity persists after process termination; live thread/mechanism proofs use this mask.
 static PM_RUNNING_PROCESS_MASK: AtomicU64 = AtomicU64::new(0);
@@ -32149,7 +32146,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_u64(LSASS_LISTENER_FAULTS.load(Ordering::Relaxed));
                     print_str(b"\n");
                     // ★ GENERAL NtCreateThread (real service): winlogon's RPC listener thread is a REAL
-                    // seL4-thread-backed nt-process ETHREAD — its NtCreateThread popped a pool ETHREAD,
+                    // seL4-thread-backed nt-process ETHREAD — its NtCreateThread prepared a fresh ETHREAD,
                     // bound the RPC listener StartRoutine, mapped a real TEB, and minted a typed Thread
                     // handle (`exec_general_nt_create_thread`). The main thread then read that thread's
                     // real TEB/ClientId via NtQueryInformationThread(ThreadBasicInformation), so

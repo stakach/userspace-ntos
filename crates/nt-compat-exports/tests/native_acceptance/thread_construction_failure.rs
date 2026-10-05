@@ -17,43 +17,32 @@ fn activation_source() -> syn::File {
 }
 
 #[test]
-fn native_reactivation_fences_old_lifetime_before_alias_retirement() {
+fn fresh_body_activation_has_no_obsolete_reactivation_admission() {
     let file = activation_source();
-    let function = file.items.iter().find_map(|item| match item {
-        syn::Item::Fn(function) if function.sig.ident == "prepare_thread_reactivation" => Some(function),
-        _ => None,
-    }).unwrap();
-    #[derive(Default)]
-    struct Sequence { calls: Vec<String>, fence: Option<usize>, reopened: bool }
-    impl<'ast> Visit<'ast> for Sequence {
-        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-            self.calls.push(call.method.to_string());
-            syn::visit::visit_expr_method_call(self, call);
-        }
-        fn visit_expr_assign(&mut self, assignment: &'ast syn::ExprAssign) {
-            if matches!(&*assignment.left, syn::Expr::Field(field)
-                if matches!(&field.member, syn::Member::Named(name) if name == "phase")) {
-                match &*assignment.right {
-                    syn::Expr::Struct(value) if value.path.segments.last().unwrap().ident == "Reactivating" => {
-                        assert!(value.fields.iter().any(|field|
-                            matches!(&field.member, syn::Member::Named(name) if name == "lifetime")));
-                        self.fence = Some(self.calls.len());
-                    }
-                    syn::Expr::Path(value) if value.path.segments.last().unwrap().ident == "Published" => self.reopened = true,
-                    _ => {}
-                }
-            }
-            syn::visit::visit_expr_assign(self, assignment);
-        }
-    }
-    let mut sequence = Sequence::default();
-    sequence.visit_block(&function.block);
-    let fence = sequence.fence.expect("old body grants must close durably for the exact held lifetime");
-    for validation in ["expected_lifetime", "thread_lifetime", "can_reclaim_thread", "thread_kernel_object", "live_alias"] {
-        assert!(sequence.calls.iter().position(|call| call == validation).unwrap() < fence);
-    }
-    assert!(fence <= sequence.calls.iter().position(|call| call == "retire_non_root_aliases").unwrap());
-    assert!(!sequence.reopened, "a refused cleanup cannot reopen old-body grants");
+    assert!(!file
+        .items
+        .iter()
+        .any(|item| matches!(item, syn::Item::Fn(function)
+        if function.sig.ident == "prepare_thread_reactivation")));
+    let parent = syn::parse_file(include_str!(
+        "../../../../components/ntos-executive/src/ps_object_backing.rs"
+    ))
+    .unwrap();
+    let phase = parent
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Enum(value) if value.ident == "BodyPhase" => Some(value),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        !phase
+            .variants
+            .iter()
+            .any(|variant| variant.ident == "Reactivating"),
+        "fresh identity construction must not keep an old-body grant fence path"
+    );
 }
 
 #[test]
@@ -102,39 +91,69 @@ fn native_activation_keeps_drain_guard_and_reopens_only_after_pm_commit() {
 }
 
 #[test]
-fn native_thread_reuse_drains_exact_body_aliases_before_admitting_construction() {
+fn native_fresh_thread_identity_precedes_activation_and_bound_handle() {
     let file = syn::parse_file(include_str!(
         "../../../../components/ntos-executive/src/exec_handler.rs"
-    )).unwrap();
-    let function = file.items.iter().find_map(|item| match item {
-        syn::Item::Impl(item) => item.items.iter().find_map(|item| match item {
-            syn::ImplItem::Fn(function) if function.sig.ident == "prepare_hosted_thread_publication" => Some(function),
+    ))
+    .unwrap();
+    let function = file
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Impl(item) => item.items.iter().find_map(|item| match item {
+                syn::ImplItem::Fn(function)
+                    if function.sig.ident == "prepare_hosted_thread_publication" =>
+                {
+                    Some(function)
+                }
+                _ => None,
+            }),
             _ => None,
-        }),
-        _ => None,
-    }).unwrap();
+        })
+        .unwrap();
     #[derive(Default)]
-    struct Admission { drain: bool, bind: bool }
+    struct Admission {
+        fresh: bool,
+        activation: bool,
+        bind: bool,
+    }
     impl<'ast> Visit<'ast> for Admission {
-        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-            if matches!(&*call.func, syn::Expr::Path(path)
-                if path.path.segments.last().is_some_and(|part| part.ident == "prepare_thread_reactivation")) {
-                self.drain = true;
-            }
-            syn::visit::visit_expr_call(self, call);
-        }
         fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-            if call.method == "bind_reserved_handle" {
-                assert!(self.drain, "exact old body alias admission precedes a new caller handle");
-                self.bind = true;
+            match call.method.to_string().as_str() {
+                "prepare_fresh_hosted_thread" => self.fresh = true,
+                "prepare_thread_activation" => {
+                    assert!(
+                        self.fresh,
+                        "fresh canonical identity must precede activation"
+                    );
+                    self.activation = true;
+                }
+                "bind_reserved_handle" => {
+                    assert!(
+                        self.fresh && self.activation,
+                        "fresh exact identity and activation must precede caller handle binding"
+                    );
+                    self.bind = true;
+                }
+                "pm_pool_tid_for_slot" => {
+                    panic!("native thread construction cannot select old ETHREAD identity")
+                }
+                _ => {}
             }
             syn::visit::visit_expr_method_call(self, call);
+        }
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            assert!(
+                !matches!(&*call.func, syn::Expr::Path(path)
+                if path.path.segments.last().is_some_and(|part| part.ident == "prepare_thread_reactivation")),
+                "fresh construction cannot reactivate an old native body"
+            );
+            syn::visit::visit_expr_call(self, call);
         }
     }
     let mut admission = Admission::default();
     admission.visit_block(&function.block);
-    assert!(admission.drain && admission.bind,
-        "PM reuse admission must include the retained native ETHREAD alias owner");
+    assert!(admission.fresh && admission.activation && admission.bind);
 }
 
 #[test]

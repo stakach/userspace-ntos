@@ -61,7 +61,6 @@ struct Row {
 enum BodyPhase {
     Prepared,
     Published,
-    Reactivating { lifetime: ThreadLifetime },
     Retiring { published: bool },
 }
 
@@ -69,7 +68,7 @@ impl Row {
     fn was_published(&self) -> bool {
         matches!(
             self.phase,
-            BodyPhase::Published | BodyPhase::Reactivating { .. } | BodyPhase::Retiring { published: true }
+            BodyPhase::Published | BodyPhase::Retiring { published: true }
         )
     }
 
@@ -171,7 +170,7 @@ pub(super) fn print_census_changes() {
     for row in &arena.rows {
         counts[match row.phase {
             BodyPhase::Prepared => 0,
-            BodyPhase::Published | BodyPhase::Reactivating { .. } => 1,
+            BodyPhase::Published => 1,
             BodyPhase::Retiring { .. } => 2,
         }] += 1;
         let page = row.page.stats();
@@ -763,7 +762,7 @@ pub(super) unsafe fn publish_system_worker(
 
 #[path = "ps_object_backing/thread_activation.rs"]
 mod thread_activation;
-pub(super) use thread_activation::{commit_thread_activation, prepare_thread_reactivation};
+pub(super) use thread_activation::commit_thread_activation;
 
 /// Physical cleanup has completed, but the arena still owns the virtual-address reservations.
 /// Dropping this receipt does not release them. The PM withdrawal owner retains this receipt

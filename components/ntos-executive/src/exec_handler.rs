@@ -3842,7 +3842,6 @@ impl ExecNtHandler {
             ps,
             pids: bootstrap_pids,
             main_tids: bootstrap_main_tids,
-            pool_tids: bootstrap_pool_tids,
         } = crate::ps_bootstrap::take();
         let nt_user_host::ps_bootstrap::PsBootstrapParts {
             pm, mut token_store, anonymous_logon_tokens,
@@ -4055,12 +4054,6 @@ impl ExecNtHandler {
                     );
                 }
                 handler.observe_desktop_catalog(pi);
-                for slot in 0..PM_RUNTIME_THREAD_SLOTS {
-                    let tid = bootstrap_pool_tids[pi][slot];
-                    if tid != 0 {
-                        let _ = handler.register_hosted_pool_thread_identity(pi, slot, tid);
-                    }
-                }
             }
         }
         if crate::writable_fs::snapshot_restore_seen() {
@@ -8141,11 +8134,11 @@ impl ExecNtHandler {
         (slot < TP_WORKER_SLOT_COUNT && slot < 64).then_some(1u64 << slot)
     }
 
-    fn claim_pool_usage_slot_excluding(&mut self, pi: usize, skip_mask: u64) -> Option<usize> {
+    fn claim_pool_usage_slot(&mut self, pi: usize) -> Option<usize> {
         let used = *self.pool_used.get(pi)?;
         let slot = (0..PM_RUNTIME_THREAD_SLOTS).find(|slot| {
             let bit = 1u64 << slot;
-            used & bit == 0 && skip_mask & bit == 0
+            used & bit == 0
                 && !self.thread_runtime.holds_pool_slot(pi, *slot)
         })?;
         self.pool_used[pi] |= 1u64 << slot;
@@ -8166,6 +8159,9 @@ impl ExecNtHandler {
         let Some(used) = self.pool_used.get_mut(pi) else {
             return false;
         };
+        // Runtime teardown has acknowledged all execution owners. The ETHREAD and its
+        // handles/body may remain alive, but they no longer own this mechanism lease.
+        let _ = self.thread_mechanisms.release_pool(pi, slot);
         *used &= !bit;
         true
     }
@@ -8249,46 +8245,6 @@ impl ExecNtHandler {
         self.process_vspaces[pi] = 0;
         self.clear_hosted_tp_worker_windows(pi);
         true
-    }
-
-    pub(crate) fn register_temporary_pool_thread_slot(
-        &mut self,
-        pi: usize,
-        slot: usize,
-        tid: nt_process::ThreadId,
-    ) -> Result<(), u32> {
-        let Some(pid) = self.temporary_pid_for_pi(pi) else {
-            return Err(nt_process::STATUS_INVALID_PARAMETER);
-        };
-        if slot >= PM_RUNTIME_THREAD_SLOTS {
-            return Err(nt_process::STATUS_INVALID_PARAMETER);
-        }
-        match self.pm.thread(tid) {
-            Some(thread) if thread.process_id == pid => {}
-            _ => return Err(nt_process::STATUS_INVALID_PARAMETER),
-        }
-        if self.process_mechanisms.pid_for_pi(pi).is_some() {
-            return Err(nt_process::STATUS_INVALID_PARAMETER);
-        }
-        if self.thread_runtime.holds_pool_slot(pi, slot) {
-            return Err(nt_process::STATUS_INVALID_PARAMETER);
-        }
-        self.register_hosted_pool_thread_identity(pi, slot, tid)?;
-        self.release_pool_usage_slot(pi, slot);
-        Ok(())
-    }
-
-    pub(crate) fn clear_temporary_pool_thread_slot(&mut self, pi: usize, slot: usize) {
-        if pi >= MAX_PI
-            || slot >= PM_RUNTIME_THREAD_SLOTS
-            || self.temporary_pid_for_pi(pi).is_none()
-            || self.process_mechanisms.pid_for_pi(pi).is_some()
-            || self.thread_runtime.holds_pool_slot(pi, slot)
-        {
-            return;
-        }
-        let _ = self.thread_mechanisms.release_pool(pi, slot);
-        self.release_pool_usage_slot(pi, slot);
     }
 
     pub(crate) fn register_hosted_thread_tcb(
@@ -9719,19 +9675,6 @@ impl ExecNtHandler {
                         return Err(status);
                     }
                 }
-            }
-        }
-        for slot in 0..PM_RUNTIME_THREAD_SLOTS {
-            let tid = match self.pm.create_dormant_thread(pid) {
-                Ok(tid) => tid,
-                Err(status) => {
-                    self.rollback_hosted_process_creation(child_pi, pid);
-                    return Err(status);
-                }
-            };
-            if let Err(status) = self.register_hosted_pool_thread_identity(child_pi, slot, tid) {
-                self.rollback_hosted_process_creation(child_pi, pid);
-                return Err(status);
             }
         }
         self.pm.reserve_handles(pid, PM_HANDLE_RESERVE);
@@ -13990,6 +13933,8 @@ impl ExecNtHandler {
                 return error.status();
             }
         };
+        let trace_tid = publication.tid();
+        let trace_handle = publication.handle();
         self.thread_spawn_request = Some(HostedThreadSpawnRequest::TpWorker {
             pi: target_pi,
             slot,
@@ -14006,7 +13951,7 @@ impl ExecNtHandler {
         print_str(b" slot=");
         print_u64(slot as u64);
         print_str(b" tid=");
-        print_u64(publication.tid());
+        print_u64(trace_tid);
         print_str(b" entry=0x");
         print_hex((start.rip >> 32) as u32);
         print_hex(start.rip as u32);
@@ -14018,12 +13963,12 @@ impl ExecNtHandler {
         print_str(b" hide-debug=");
         print_u64(hide_from_debugger as u64);
         print_str(b" handle=0x");
-        print_hex(publication.handle() as u32);
+        print_hex(trace_handle as u32);
         print_str(b"\n");
         0
     }
 
-    /// Reserve a dormant ETHREAD identity and an exact caller handle slot without publishing either.
+    /// Reserve a fresh ETHREAD identity and an exact caller handle slot without publishing either.
     /// The service-loop owner commits this plan only after the seL4 mechanism and runtime record exist.
     fn prepare_hosted_thread_publication(
         &mut self,
@@ -14038,9 +13983,9 @@ impl ExecNtHandler {
         client_id_out: u64,
         kind: HostedThreadPublicationKind,
     ) -> Result<PreparedHostedThreadPublication, u32> {
-        let mut skipped = 0u64;
-        let (pool_slot, activation) = loop {
-            let Some(slot) = self.claim_pool_usage_slot_excluding(owner_pi, skipped) else {
+        let pool_slot = match self.claim_pool_usage_slot(owner_pi) {
+            Some(slot) => slot,
+            None => {
                 if crate::PM_POOL_REFUSALS.fetch_add(1, Ordering::Relaxed) < 8 {
                     unsafe {
                         print_str(b"[thread-pool] REFUSED NtCreateThread pi=");
@@ -14049,56 +13994,52 @@ impl ExecNtHandler {
                         print_hex(self.pool_used_mask(owner_pi) as u32);
                         print_str(b" slots=");
                         print_u64(PM_RUNTIME_THREAD_SLOTS as u64);
-                        print_str(b" skipped=");
-                        print_u64(crate::PM_POOL_UNRECLAIMABLE_SKIPS.load(Ordering::Relaxed));
                         print_str(b"\n");
                     }
                 }
                 return Err(STATUS_INSUFFICIENT_RESOURCES);
-            };
-            let Some(tid) = self.pm_pool_tid_for_slot(owner_pi, slot) else {
-                self.release_pool_usage_slot(owner_pi, slot);
-                skipped |= 1u64 << slot;
-                crate::PM_POOL_UNRECLAIMABLE_SKIPS.fetch_add(1, Ordering::Relaxed);
-                continue;
-            };
-            match self.pm.prepare_thread_activation(
-                tid,
-                start.rip,
-                start.rcx,
-                create_suspended,
-                teb_base,
-                nt_system_time_100ns() as i64,
-                hide_from_debugger,
-            ) {
-                Ok(activation) => {
-                    // The fresh PM plan and empty runtime slot prove the old activation has no
-                    // execution owners. Keep native body grants fenced until alias cleanup ACKs.
-                    let scratch = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
-                    if unsafe {
-                        crate::ps_object_backing::prepare_thread_reactivation(
-                            &self.pm, &activation, scratch,
-                        )
-                    }.is_err() {
-                        self.release_pool_usage_slot(owner_pi, slot);
-                        skipped |= 1u64 << slot;
-                        crate::PM_POOL_UNRECLAIMABLE_SKIPS.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    break (slot, activation);
-                }
-                Err(_) => {
-                    self.release_pool_usage_slot(owner_pi, slot);
-                    skipped |= 1u64 << slot;
-                    crate::PM_POOL_UNRECLAIMABLE_SKIPS.fetch_add(1, Ordering::Relaxed);
-                }
             }
         };
+        let pid = match self.pm_pid_for_pi(owner_pi) {
+            Some(pid) => pid,
+            None => {
+                self.release_pool_usage_slot(owner_pi, pool_slot);
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+        };
+        let fresh = match self.pm.prepare_fresh_hosted_thread(pid) {
+            Ok(fresh) => fresh,
+            Err(status) => {
+                self.release_pool_usage_slot(owner_pi, pool_slot);
+                return Err(status);
+            }
+        };
+        let tid = fresh.lifetime().thread_id();
+        let activation = match self.pm.prepare_thread_activation(
+            tid, start.rip, start.rcx, create_suspended, teb_base,
+            nt_system_time_100ns() as i64, hide_from_debugger,
+        ) {
+            Ok(activation) => activation,
+            Err(status) => {
+                self.pm.cancel_fresh_hosted_thread(&fresh)
+                    .expect("unpublished fresh identity retains exact rollback authority");
+                self.release_pool_usage_slot(owner_pi, pool_slot);
+                return Err(status);
+            }
+        };
+        if let Err(status) = self.register_hosted_pool_thread_identity(owner_pi, pool_slot, tid) {
+            self.pm.cancel_fresh_hosted_thread(&fresh)
+                .expect("failed lease publication retains exact unborn identity");
+            self.release_pool_usage_slot(owner_pi, pool_slot);
+            return Err(status);
+        }
 
         let capacity = self.pm.handle_capacity(caller_pid);
         let handle = match self.pm.try_reserve_handle_slot(caller_pid) {
             Ok(reservation) => reservation,
             Err(status) => {
+                self.pm.cancel_fresh_hosted_thread(&fresh)
+                    .expect("handle reservation failure has not published the fresh thread");
                 self.release_pool_usage_slot(owner_pi, pool_slot);
                 return Err(status);
             }
@@ -14116,6 +14057,8 @@ impl ExecNtHandler {
             desired_access,
         ) {
             let _ = self.pm.cancel_reserved_handle(handle);
+            self.pm.cancel_fresh_hosted_thread(&fresh)
+                .expect("failed handle binding retains the fresh thread preparation");
             self.release_pool_usage_slot(owner_pi, pool_slot);
             return Err(status);
         }
@@ -14127,6 +14070,7 @@ impl ExecNtHandler {
             handle_out,
             client_id_out,
             kind,
+            fresh,
         })
     }
 
@@ -14202,6 +14146,13 @@ impl ExecNtHandler {
         if publication.client_id_out != 0 {
             self.queue_write(publication.client_id_out, 0);
             self.queue_write(publication.client_id_out + 8, 0);
+        }
+        if self.thread_runtime.get_by_tid(publication.tid()).is_some() {
+            self.thread_runtime.retain_fresh_construction(publication.fresh);
+        } else {
+            // A refused cancellation leaves the canonical PM row and its exact effects intact.
+            // It must never turn an acknowledged handle rollback into body/runtime completion.
+            let _ = self.pm.cancel_fresh_hosted_thread(&publication.fresh);
         }
     }
 
@@ -14427,6 +14378,8 @@ impl ExecNtHandler {
             self.abort_unbuilt_hosted_thread_request(publication);
             return nt_process::STATUS_INVALID_PARAMETER;
         }
+        let trace_handle = publication.handle();
+        let trace_tid = publication.tid();
         self.thread_spawn_request = Some(HostedThreadSpawnRequest::Multiplexed {
             kind: spec.spawn_kind,
             start,
@@ -14439,8 +14392,8 @@ impl ExecNtHandler {
             spec,
             start,
             initial_teb,
-            publication.handle(),
-            publication.tid(),
+            trace_handle,
+            trace_tid,
         );
         0
     }
@@ -15058,6 +15011,79 @@ impl ExecNtHandler {
             .map_or_else(|status| status, |()| 0)
     }
 
+    fn capture_live_thread_tebs(
+        &self,
+        process: nt_user_host::process_identity::ProcessIdentity,
+    ) -> Result<alloc::vec::Vec<(nt_user_host::provider_logical_caller::ProviderLogicalCaller, u64)>, u32> {
+        let mut tebs = alloc::vec::Vec::new();
+        tebs.try_reserve_exact(self.thread_runtime.slot_count())
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        for index in 0..self.thread_runtime.slot_count() {
+            let Some(runtime) = self.thread_runtime.executable_by_index(index) else { continue; };
+            if runtime.process != process { continue; }
+            let tid = u32::try_from(runtime.tid).map_err(|_| STATUS_INVALID_HANDLE)?;
+            let thread = self.pm.thread(tid).ok_or(STATUS_INVALID_HANDLE)?;
+            if matches!(thread.state, nt_process::ThreadState::Initialized | nt_process::ThreadState::Terminated) {
+                continue;
+            }
+            let caller = self.capture_provider_logical_caller(
+                runtime.pi, runtime.tid, runtime.badge, runtime.tcb,
+            ).ok_or(STATUS_INVALID_HANDLE)?;
+            let teb = self.pm.thread_teb(tid).ok_or(STATUS_INVALID_HANDLE)?;
+            if !self.validate_live_thread_teb(caller, teb) {
+                return Err(STATUS_ACCESS_VIOLATION);
+            }
+            tebs.push((caller, teb));
+        }
+        // A busy or incompletely published live runtime cannot silently disappear from the
+        // process-wide operation. All admission and allocation finish before any TLS write.
+        let owner = self.pm.process(process.pid).ok_or(STATUS_INVALID_HANDLE)?;
+        for tid in &owner.threads {
+            let thread = self.pm.thread(*tid).ok_or(STATUS_INVALID_HANDLE)?;
+            if !matches!(thread.state, nt_process::ThreadState::Initialized | nt_process::ThreadState::Terminated)
+                && !tebs.iter().any(|(caller, _)| caller.thread().thread_id() == *tid)
+            {
+                return Err(nt_process::STATUS_DEVICE_BUSY);
+            }
+        }
+        Ok(tebs)
+    }
+
+    fn validate_live_thread_teb(
+        &self,
+        caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
+        teb: u64,
+    ) -> bool {
+        if !self.validate_provider_logical_caller(caller)
+            || self.capture_process_identity(self.pi) != Some(caller.process())
+            || teb == 0 || teb & 0xfff != 0
+            || teb.checked_add(0x2000).is_none_or(|end| end > USER_ADDRESS_LIMIT)
+            || self.pm.thread_teb(caller.thread().thread_id()) != Some(teb)
+            || self.pm.thread(caller.thread().thread_id()).is_none_or(|thread| {
+                matches!(thread.state, nt_process::ThreadState::Initialized | nt_process::ThreadState::Terminated)
+            })
+        {
+            return false;
+        }
+        let Some(runtime) = self.thread_runtime.executable_by_tid(u64::from(caller.thread().thread_id())) else {
+            return false;
+        };
+        let lifetime = nt_memory_manager::MemoryLifetime::Process(caller.process());
+        let Some(head) = (unsafe { csrss_frame_get_exact_record(runtime.pi as u64, teb) }) else {
+            return false;
+        };
+        let Some(tail) = (unsafe { csrss_frame_get_exact_record(runtime.pi as u64, teb + 0x1000) }) else {
+            return false;
+        };
+        head.lifetime == lifetime && tail.lifetime == lifetime
+            && head.is_resident() && tail.is_resident()
+            && head.mapped_alias() == Some(runtime.teb_alias)
+            && (!runtime.resources.is_live()
+                || (runtime.resources.teb_va() == teb
+                    && runtime.resources.teb_target == head.frame
+                    && runtime.resources.teb2_target == tail.frame))
+    }
+
     unsafe fn nt_set_thread_zero_tls_cell(
         &mut self,
         handle: u64,
@@ -15067,7 +15093,6 @@ impl ExecNtHandler {
         const THREAD_SET_INFORMATION: u32 = 0x0020;
         const TLS_MINIMUM_AVAILABLE: u32 = 64;
         const TLS_EXPANSION_SLOTS: u32 = 1024;
-        const TEB_CAPTURE_LIMIT: usize = 1 + PM_RUNTIME_THREAD_SLOTS;
 
         if information_length != 4 {
             return nt_process::STATUS_INFO_LENGTH_MISMATCH;
@@ -15097,29 +15122,19 @@ impl ExecNtHandler {
         if tid != current_tid {
             return STATUS_INVALID_PARAMETER;
         }
-        let process_id = match self.pm.thread(tid).map(|thread| thread.process_id) {
-            Some(pid) => pid,
+        let process = match self.capture_thread_process_identity(self.pi, u64::from(tid)) {
+            Some(process) => process,
             None => return nt_process::STATUS_INVALID_HANDLE,
         };
+        let tebs = match self.capture_live_thread_tebs(process) {
+            Ok(tebs) => tebs,
+            Err(status) => return status,
+        };
 
-        let mut tebs = [0u64; TEB_CAPTURE_LIMIT];
-        let mut count = 0usize;
-        let mut overflow = false;
-        if let Err(status) = self.pm.for_each_process_thread_teb(process_id, |_, teb| {
-            if count < tebs.len() {
-                tebs[count] = teb;
-                count += 1;
-            } else {
-                overflow = true;
+        for (caller, teb) in tebs {
+            if !self.validate_live_thread_teb(caller, teb) {
+                return STATUS_ACCESS_VIOLATION;
             }
-        }) {
-            return status;
-        }
-        if overflow {
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-
-        for teb in tebs[..count].iter().copied() {
             if tls_index < TLS_MINIMUM_AVAILABLE {
                 let slot = teb
                     + nt_ntdll_layout::TEB_TLS_SLOTS_OFFSET
@@ -15135,9 +15150,13 @@ impl ExecNtHandler {
                 }
                 let expansion_slots = u64::from_le_bytes(expansion);
                 if expansion_slots != 0 {
-                    let slot = expansion_slots
-                        + u64::from(tls_index - TLS_MINIMUM_AVAILABLE)
-                            * core::mem::size_of::<u64>() as u64;
+                    let Some(slot) = expansion_slots.checked_add(
+                        u64::from(tls_index - TLS_MINIMUM_AVAILABLE)
+                            * core::mem::size_of::<u64>() as u64,
+                    ) else { return STATUS_ACCESS_VIOLATION; };
+                    if !self.validate_live_thread_teb(caller, teb) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
                     if !self.xas_write_u64(slot, 0) {
                         return STATUS_ACCESS_VIOLATION;
                     }
@@ -21025,11 +21044,14 @@ impl ExecNtHandler {
                 Self::tp_worker_slot_bit(window)
                     .is_none_or(|bit| self.tp_worker_window_used[runtime.pi] & bit == 0)
             }) { continue; }
-            if let Ok(retired) = unsafe { self.thread_runtime.advance_failed_construction(index, id) } {
+            if let Ok((retired, fresh)) = unsafe { self.thread_runtime.advance_failed_construction(index, id) } {
                 assert_eq!(retired.reservations, Some(reservations));
                 assert!(self.release_pool_usage_slot(runtime.pi, reservations.pool_slot));
                 if let Some(window) = reservations.window_slot {
                     self.clear_hosted_tp_worker_window_slot(runtime.pi, window);
+                }
+                if let Some(fresh) = fresh {
+                    let _ = self.pm.cancel_fresh_hosted_thread(&fresh);
                 }
                 print_str(b"[thread-retirement] retired pending tid=");
                 print_u64(runtime.tid);
@@ -34071,7 +34093,7 @@ impl ExecNtHandler {
             },
             // NtCreateThreadEx(*ThreadHandle, DesiredAccess, *ObjectAttributes, ProcessHandle,
             // StartRoutine, Argument, CreateFlags, ZeroBits, StackSize, MaximumStackSize,
-            // *AttributeList). Direct native thread creation uses the same ETHREAD pool, typed handle
+            // *AttributeList). Direct native thread creation uses fresh ETHREADs, typed handle
             // table, hosted worker window, loader trampoline, and NtResumeThread suspend state as the
             // existing NtCreateThread plane.
             NativeService::NtCreateThreadEx => unsafe { self.nt_create_thread_ex_service(args) },
@@ -34172,6 +34194,7 @@ impl ExecNtHandler {
                                 self.abort_unbuilt_hosted_thread_request(publication);
                                 return nt_process::STATUS_INVALID_PARAMETER;
                             }
+                            let trace_handle = publication.handle();
                             self.thread_spawn_request = Some(HostedThreadSpawnRequest::TpWorker {
                                 pi: self.pi,
                                 slot,
@@ -34185,7 +34208,7 @@ impl ExecNtHandler {
                             print_str(b" tid=");
                             print_u64(tid);
                             print_str(b" handle=0x");
-                            print_hex(publication.handle() as u32);
+                            print_hex(trace_handle as u32);
                             print_str(b" suspended=");
                             print_u64(create_suspended as u64);
                             print_str(b"\n");
@@ -34281,6 +34304,7 @@ impl ExecNtHandler {
                                 Err(status) => return status,
                             };
                             let tid = publication.tid();
+                            let trace_handle = publication.handle();
                             if !self.reserve_hosted_thread_runtime(self.pi, tid, badge, role) {
                                 self.abort_hosted_thread_publication(publication);
                                 return 0xC000_009A;
@@ -34328,7 +34352,7 @@ impl ExecNtHandler {
                                 print_str(b" alloc_base=0x");
                                 print_hex(initial_stack.allocated_stack_base as u32);
                                 print_str(b" handle=0x");
-                                print_hex(publication.handle() as u32);
+                                print_hex(trace_handle as u32);
                                 print_str(b" tid=");
                                 print_u64(tid);
                                 print_str(b" suspended=");

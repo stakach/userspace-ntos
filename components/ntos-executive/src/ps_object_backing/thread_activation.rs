@@ -1,67 +1,6 @@
-//! Exact dormant ETHREAD alias admission and activation publication.
+//! Exact fresh ETHREAD body activation publication.
 
 use super::*;
-
-/// Close old-body grant admission before removing its provider aliases.
-///
-/// # Safety
-/// `plan` was just returned by PM prepare_thread_activation under exclusive caller ownership,
-/// before binding any new handle. No NT operation, provider entry or pump may intervene. This
-/// fresh plan proves Initialized-thread reference policy; Terminated threads are also rechecked.
-pub(crate) unsafe fn prepare_thread_reactivation(
-    pm: &ProcessManager,
-    plan: &nt_process::ThreadActivationPlan,
-    scratch_base: u64,
-) -> Result<(), u32> {
-    let lifetime = plan.expected_lifetime();
-    if pm.thread_lifetime(plan.thread_id()) != Some(lifetime) {
-        return Err(INVALID);
-    }
-    match pm.thread(plan.thread_id()).ok_or(INVALID)?.state {
-        nt_process::ThreadState::Initialized => {}
-        nt_process::ThreadState::Terminated if pm.can_reclaim_thread(plan.thread_id()) => {}
-        _ => return Err(INVALID),
-    }
-    let Some(body) = pm.thread_kernel_object(plan.thread_id()) else {
-        return Ok(());
-    };
-    let borrow = Borrow::acquire()?;
-    let arena = (&mut *core::ptr::addr_of_mut!(ARENA))
-        .as_mut()
-        .ok_or(INVALID)?;
-    arena.validate(pm)?;
-    let Some(index) = arena.existing(BodyId::Thread(plan.thread_id())) else {
-        // A published pointer without its exact owner cannot prove old aliases were drained.
-        // Only the genuinely absent-body path above admits first initialization without a row.
-        return Err(INVALID);
-    };
-    let row = &mut arena.rows[index];
-    if row.page.descriptor().address != body
-        || row.current_thread_lifetime != Some(lifetime)
-        || !row.page.is_initialized()
-        || row
-            .page
-            .live_alias(MappingTarget::Executive(arena.root))
-            .is_none()
-        || !match row.phase {
-            BodyPhase::Published => true,
-            BodyPhase::Reactivating { lifetime: held } => held == lifetime,
-            _ => false,
-        }
-    {
-        return Err(INVALID);
-    }
-    row.phase = BodyPhase::Reactivating { lifetime };
-    let mut io = Io {
-        paging: &mut arena.paging,
-        providers: &mut arena.providers,
-        root: arena.root,
-        scratch_base,
-        address: row.page.descriptor().address,
-        borrow: &borrow,
-    };
-    row.page.retire_non_root_aliases(&mut io)
-}
 
 /// Commit PM activation and refresh its stable body without an intervening provider entry.
 ///
@@ -89,16 +28,13 @@ pub(crate) unsafe fn commit_thread_activation(
     };
     let row = &mut arena.rows[index];
     let body = row.page.descriptor().address;
-    if !matches!(
-        row.phase,
-        BodyPhase::Prepared | BodyPhase::Published | BodyPhase::Reactivating { .. }
-    ) || matches!(row.phase, BodyPhase::Reactivating { lifetime } if lifetime != plan.expected_lifetime())
+    if !matches!(row.phase, BodyPhase::Prepared | BodyPhase::Published)
         || !row.page.is_initialized()
         || row.current_thread_lifetime != Some(plan.expected_lifetime())
         || pm.thread_kernel_object(plan.thread_id())
             != match row.phase {
                 BodyPhase::Prepared => None,
-                BodyPhase::Published | BodyPhase::Reactivating { .. } => Some(body),
+                BodyPhase::Published => Some(body),
                 BodyPhase::Retiring { .. } => return Err(INVALID),
             }
         || row
@@ -129,9 +65,7 @@ pub(crate) unsafe fn commit_thread_activation(
         BodyPhase::Prepared => {
             pm.commit_thread_activation_with_handle_and_object(plan, handle, body)?;
         }
-        BodyPhase::Published | BodyPhase::Reactivating { .. } => {
-            pm.commit_thread_activation_with_handle(plan, handle)?
-        }
+        BodyPhase::Published => pm.commit_thread_activation_with_handle(plan, handle)?,
         BodyPhase::Retiring { .. } => unreachable!(),
     }
     // Both owners remain exclusively borrowed. No allocation, syscall or provider byte write can
@@ -155,14 +89,13 @@ fn record_thread_activation_guard_failure(
     let phase = match row.phase {
         BodyPhase::Prepared => "prepared",
         BodyPhase::Published => "published",
-        BodyPhase::Reactivating { .. } => "reactivating",
         BodyPhase::Retiring { .. } => "retiring",
     };
     let body = row.page.descriptor().address;
     let pm_body = pm.thread_kernel_object(plan.thread_id());
     let body_matches = match row.phase {
         BodyPhase::Prepared => pm_body.is_none(),
-        BodyPhase::Published | BodyPhase::Reactivating { .. } => pm_body == Some(body),
+        BodyPhase::Published => pm_body == Some(body),
         BodyPhase::Retiring { .. } => false,
     };
     let process_body_matches = match row.page.descriptor().initialization {

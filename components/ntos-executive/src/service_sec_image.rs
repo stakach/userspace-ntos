@@ -12313,7 +12313,7 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 if let Some(request) = nt_handler.remote_thread_request.take() {
                     if let Err(status) =
-                        spawn_requested_remote_thread(&mut nt_handler, &request, fault_ep)
+                        spawn_requested_remote_thread(&mut nt_handler, request, fault_ep)
                     {
                         result = u64::from(status);
                     }
@@ -21418,14 +21418,7 @@ pub(crate) unsafe fn service_sec_image(
             } else {
                 false
             };
-            // The target's pre-created spare ETHREAD pool — the same reset-safe pool every hosted
-            // process gets at boot, and what a runtime thread create draws from.
-            let pool_tid = nt_handler.pm.create_dormant_thread(target).unwrap_or(0);
             let target_registered = brk_test_claim.is_some();
-            let pool_registered = target_registered
-                && nt_handler
-                    .register_temporary_pool_thread_slot(test_pi, 0, pool_tid)
-                    .is_ok();
             // This process HAS its initial thread, so a foreign-handle create is a genuine
             // ADDITIONAL thread — the real cross-VSpace path (exactly the live rule).
             if target_registered {
@@ -21474,9 +21467,7 @@ pub(crate) unsafe fn service_sec_image(
                 && code_mapped
                 && target_main != 0
                 && target_backing
-                && pool_tid != 0
                 && target_registered
-                && pool_registered
                 && h_target != 0
                 && h_target_no_create != 0
                 && args_ready
@@ -21629,6 +21620,10 @@ pub(crate) unsafe fn service_sec_image(
                                 )
                                 .is_none()
                     });
+                    let request_observation = request.as_ref().map(|request| (
+                        request.target_pi, request.pml4, request.start.rip,
+                        request.start.rcx, request.cid_thread,
+                    ));
 
                     // ── 0x0010 — ★ THE REMOTE THREAD REALLY RUNS IN THE TARGET'S VSPACE.
                     // Build the mechanism through the same entry the loop uses; the thread's own
@@ -21636,7 +21631,7 @@ pub(crate) unsafe fn service_sec_image(
                     // lands in a page that exists ONLY there.
                     let mut spawned_tcb = 0u64;
                     let mut breakin_runtime_slot = 0usize;
-                    if let Some(request) = request.as_ref() {
+                    if let Some(request) = request {
                         breakin_runtime_slot = request.slot;
                         let runtime_publication = nt_handler.prepare_hosted_thread_runtime_publication(
                             test_pi, request.cid_thread, tp_worker_badge(test_pi, request.slot),
@@ -21704,12 +21699,12 @@ pub(crate) unsafe fn service_sec_image(
                         && cid_proc == target as u64
                         && breakin_tid != 0
                         && breakin_tid != target_main as u64
-                        && request.as_ref().is_some_and(|r| {
-                            r.target_pi == test_pi
-                                && r.pml4 == target_pml4
-                                && r.start.rip == selftests::DBGK_BREAKIN_CODE_VA
-                                && r.start.rcx == selftests::DBGK_BREAKIN_PARAM
-                                && r.cid_thread == breakin_tid
+                        && request_observation.is_some_and(|(pi, pml4, rip, rcx, tid)| {
+                            pi == test_pi
+                                && pml4 == target_pml4
+                                && rip == selftests::DBGK_BREAKIN_CODE_VA
+                                && rcx == selftests::DBGK_BREAKIN_PARAM
+                                && tid == breakin_tid
                         })
                     {
                         br_ok |= 0x0008;
@@ -21727,7 +21722,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" tid=");
                     print_u64(breakin_tid);
                     print_str(b" req=");
-                    print_u64(request.is_some() as u64);
+                    print_u64(request_observation.is_some() as u64);
                     print_str(b"\n");
                     if spawned_tcb != 0 {
                         // Its first fault: the `int3` if it read BeingDebugged = 1, else its exit
@@ -21953,7 +21948,7 @@ pub(crate) unsafe fn service_sec_image(
             }
             let breakin_pm_tid = u32::try_from(breakin_runtime_tid)
                 .expect("debugger fixture runtime thread ID fits the process manager");
-            for tid in [target_main, pool_tid, breakin_pm_tid] {
+            for tid in [target_main, breakin_pm_tid] {
                 while tid != 0 && nt_handler.pm.close_handle_by_object(
                     debugger_pid, nt_process::HandleObject::Thread(tid),
                 ) {}
@@ -21968,7 +21963,6 @@ pub(crate) unsafe fn service_sec_image(
             }
             if let Some(claim) = brk_test_claim {
                 let _ = csrss_frame_take(test_pi as u64, SMSS_PEB_VA);
-                nt_handler.clear_temporary_pool_thread_slot(test_pi, 0);
                 assert!(nt_handler.release_temporary_process_slot(claim),
                     "debugger fixture releases its temporary process slot");
             }
@@ -23004,14 +22998,19 @@ unsafe fn spawn_requested_local_thread(
     let (publication, start, stack_origin) = match &request {
         HostedThreadSpawnRequest::Multiplexed { publication, start, initial_teb, .. }
         | HostedThreadSpawnRequest::Winlogon { publication, start, initial_teb, .. } =>
-            (*publication, *start, ThreadStackOrigin::Caller(*initial_teb)),
+            (publication, *start, ThreadStackOrigin::Caller(*initial_teb)),
         HostedThreadSpawnRequest::TpWorker { publication, start, stack_origin, .. } =>
-            (*publication, *start, *stack_origin),
+            (publication, *start, *stack_origin),
     };
     if let ThreadStackOrigin::Caller(initial_teb) = stack_origin {
         if let Err(status) = nt_handler.validate_hosted_caller_stack(
             publication.owner_pi, start, initial_teb,
         ) {
+            let publication = match request {
+                HostedThreadSpawnRequest::Multiplexed { publication, .. }
+                | HostedThreadSpawnRequest::Winlogon { publication, .. }
+                | HostedThreadSpawnRequest::TpWorker { publication, .. } => publication,
+            };
             nt_handler.abort_unbuilt_hosted_thread_request(publication);
             return Err(status);
         }
@@ -23291,7 +23290,7 @@ unsafe fn spawn_requested_tp_worker(
 /// Any hosted-process index under MAX_PI has a unique worker badge and mirror window.
 pub(crate) unsafe fn spawn_requested_remote_thread(
     nt_handler: &mut ExecNtHandler,
-    request: &RemoteThreadRequest,
+    request: RemoteThreadRequest,
     fault_ep: u64,
 ) -> Result<u64, u32> {
     if request.target_pi >= MAX_PI || request.slot >= TP_WORKER_SLOT_COUNT {
