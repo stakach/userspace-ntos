@@ -45,7 +45,7 @@ fn initial_wait_snapshot_capture_has_one_policy_and_reparks_keep_saved_bytes() {
                         for field in &expression.fields {
                             if let syn::Member::Named(name) = &field.member {
                                 if matches!(name.to_string().as_str(), "arg_snapshot_len" | "arg_snapshot") {
-                                    assert!(matches!(&field.expr, syn::Expr::Path(path) if path.path.is_ident(name.to_string())),
+                                    assert!(matches!(&field.expr, syn::Expr::Path(path) if path.path.is_ident(name)),
                                         "initial pending dispatch must store its canonical capture");
                                     self.fields.push(name.to_string());
                                 }
