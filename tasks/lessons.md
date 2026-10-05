@@ -1,5 +1,12 @@
 # Lessons
 
+## Error Logs Are Not Submitted I/O Receipts
+- Trace status initialization and every diagnostic producer before attributing a native read
+  failure. ReactOS input threads can print unchanged initial failure statuses when device opens
+  never succeeded; that is not proof a READ was submitted or that the thread spins.
+- Require actual open/read ownership receipts and wait behavior before claiming polling cost
+  or choosing a performance fix. Keep missing driver-stack support distinct from scheduling.
+
 ## Cleanup State Does Not Identify Failure Phase
 - Follow every producer of a retained failure bundle. A completed constructor can become
   retained again when publication or activation fails; the shared cleanup state is not proof

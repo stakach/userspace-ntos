@@ -175,11 +175,15 @@ allocation during client-frame registration. It was manually stopped after about
 helper's exit and retirement without an allocation-refusal diagnostic, then
 reached the natural gate at 218/261. Its screenshot still shows background and
 cursor only; font acceptance, Userinit/Explorer, and desktop rendering remain
-unproven. The latest [mapping-retirement boot](docs/evidence/issue18-frame-map-font-boot-frontier.json)
+unproven. The [mapping-retirement boot](docs/evidence/issue18-frame-map-font-boot-frontier.json)
 also completed the helper's exit and retirement, then reported a directory-query
 allocation refusal and Setup's Plug and Play startup failure. It was stopped at
 that fatal boundary within the one-hour limit. Native mapping specifications
-pass separately; this fresh boot still does not prove font cleanup or Explorer.
+pass separately. The latest [directory-scratch boot](docs/evidence/issue18-directory-scratch-font-boot-frontier.json)
+completed the genuine helper's exit and retirement without an allocation-refusal
+diagnostic, but Setup again failed starting Plug and Play. The guest was stopped
+at its fatal MessageBox within the one-hour limit. Current screenshot evidence
+remains background/cursor only; font cleanup and Explorer are not yet proven.
 Crate CI does not prove desktop boot. To attempt a boot from a fresh clone:
 
 ```sh
