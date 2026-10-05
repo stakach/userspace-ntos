@@ -15,6 +15,64 @@ fn register(pm: &mut ProcessManager, tid: ThreadId, endpoint: u64) -> ThreadTerm
 }
 
 #[test]
+fn checked_refusal_is_not_delivery_and_requires_reference_release_ack() {
+    let (mut pm, tid) = thread();
+    let ticket = register(&mut pm, tid, 17);
+    assert_eq!(
+        pm.acknowledge_thread_termination_port_refusal(&ticket, 0xc000_0037),
+        Err(STATUS_DEVICE_BUSY)
+    );
+    pm.begin_thread_termination_port_delivery(&ticket).unwrap();
+    for status in [0, 0x103, 0x4000_0000, 0x8000_0005] {
+        assert_eq!(
+            pm.acknowledge_thread_termination_port_refusal(&ticket, status),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+        assert_eq!(
+            pm.peek_thread_termination_port(tid).unwrap().unwrap().phase,
+            ThreadTerminationPortPhase::DeliveryPending
+        );
+    }
+    assert_eq!(
+        pm.begin_thread_termination_port_release(&ticket),
+        Err(STATUS_DEVICE_BUSY)
+    );
+    pm.acknowledge_thread_termination_port_refusal(&ticket, 0xc000_0037)
+        .unwrap();
+    let snapshot = pm.peek_thread_termination_port(tid).unwrap().unwrap();
+    assert_eq!(snapshot.phase, ThreadTerminationPortPhase::Refused);
+    assert_eq!(snapshot.refusal_status, Some(0xc000_0037));
+    assert_eq!(snapshot.endpoint, Some(17));
+    assert_eq!(
+        pm.acknowledge_thread_termination_port_delivery(&ticket),
+        Err(STATUS_DEVICE_BUSY)
+    );
+    assert_eq!(
+        pm.acknowledge_thread_termination_port_refusal(&ticket, 0xc000_0008),
+        Err(STATUS_DEVICE_BUSY)
+    );
+    assert_eq!(
+        pm.acknowledge_thread_termination_port_release(&ticket),
+        Err(STATUS_DEVICE_BUSY)
+    );
+    pm.begin_thread_termination_port_release(&ticket).unwrap();
+    assert_eq!(
+        pm.peek_thread_termination_port(tid)
+            .unwrap()
+            .unwrap()
+            .refusal_status,
+        Some(0xc000_0037)
+    );
+    assert_eq!(
+        pm.begin_thread_termination_port_release(&ticket),
+        Err(STATUS_DEVICE_BUSY)
+    );
+    pm.acknowledge_thread_termination_port_release(&ticket)
+        .unwrap();
+    assert!(pm.peek_thread_termination_port(tid).unwrap().is_none());
+}
+
+#[test]
 fn registrations_grow_preserve_duplicate_references_and_deliver_lifo() {
     let (mut pm, tid) = thread();
     let ports = [11, 22, 11, 33, 44, 55, 66, 77];

@@ -159,10 +159,10 @@ in `extern-rootserver` mode (bring your own root task).
 The desktop target hosts **real, unmodified GPL ReactOS binaries** on rust-micro.
 Genuine Explorer and native acceptance are tracked in
 [issue #18](https://github.com/stakach/userspace-ntos/issues/18).
-The latest [fresh-run receipt](docs/evidence/issue18-fresh-thread-font-frontier.json)
-proves strict win32k admission and genuine setup/helper execution, but ends at
-218/261 checks with an LPC connection blocked during setup. Its screenshot shows
-background and cursor, not a working desktop. Acceptance requires both strict
+The latest [fresh-run receipt](docs/evidence/issue18-lpc-map-owner-font-frontier.json)
+proves native LPC endpoint retirement during genuine setup, but stops at a
+durable mapping-owner allocation failure. Its screenshot shows background and
+cursor, not a working desktop. Acceptance requires both strict
 native private-font cleanup and a separate fixture-free Userinit/Explorer boot
 with real callbacks, GDI drawing, logs and screenshots. Crate CI does not prove
 desktop boot. To attempt a boot from a fresh clone:

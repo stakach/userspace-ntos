@@ -182,6 +182,9 @@ impl Server {
                 self.op_retained_request_wait_reply(in_buf, out_buf)
             }
             opcode::LPC_OP_RETAINED_REQUEST_PORT => self.op_retained_request_port(in_buf),
+            opcode::LPC_OP_RETAINED_REQUEST_PORT_OUTCOME => {
+                self.op_retained_request_port_outcome(in_buf, out_buf)
+            }
             _ => Err(NtStatus::NOT_IMPLEMENTED),
         }
     }
@@ -492,7 +495,7 @@ impl Server {
         }
     }
 
-    fn op_retained_request_port(&mut self, buf: &[u8]) -> Result<LpcReply, NtStatus> {
+    fn capture_retained_request(buf: &[u8]) -> Result<(LpcMessageRequest, Vec<u8>), NtStatus> {
         let req: LpcMessageRequest = read_req(buf)?;
         let msg = read_blob(buf, req.msg_offset, req.msg_len_bytes)?;
         let msg_type = msg_type_of(msg);
@@ -505,6 +508,11 @@ impl Server {
         } else {
             return Err(NtStatus::INVALID_PARAMETER);
         };
+        Ok((req, msg))
+    }
+
+    fn op_retained_request_port(&mut self, buf: &[u8]) -> Result<LpcReply, NtStatus> {
+        let (req, msg) = Self::capture_retained_request(buf)?;
         self.core.send_retained_message(
             req.port_handle,
             &msg,
@@ -515,6 +523,60 @@ impl Server {
             },
         )?;
         Ok(ok())
+    }
+
+    fn op_retained_request_port_outcome(
+        &mut self,
+        buf: &[u8],
+        out: &mut [u8],
+    ) -> Result<LpcReply, NtStatus> {
+        use nt_lpc_abi::{retained_request_disposition as disposition, LpcRetainedRequestOutcome};
+        let req: LpcMessageRequest = read_req(buf)?;
+        let header = size_of::<LpcMessageRequest>();
+        if req.abi_size as usize != header
+            || req._reserved != 0
+            || req._reserved2 != 0
+            || req.msg_offset as usize != header
+            || header.checked_add(req.msg_len_bytes as usize) != Some(buf.len())
+            || req.port_handle == 0
+            || req.client_process == 0
+            || req.client_thread == 0
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        if out.len() < size_of::<LpcRetainedRequestOutcome>() {
+            return Err(NtStatus::BUFFER_TOO_SMALL);
+        }
+        let (req, msg) = Self::capture_retained_request(buf)?;
+        // Every returned error precedes queue publication. Allocation panics/transport loss
+        // cannot produce this certificate and therefore remain indeterminate to the caller.
+        let (disposition, status) = match self.core.send_retained_message(
+            req.port_handle,
+            &msg,
+            MessageAttrs::default(),
+            ClientId {
+                process: req.client_process,
+                thread: req.client_thread,
+            },
+        ) {
+            Ok(()) => (disposition::QUEUED, NtStatus::SUCCESS.raw() as u32),
+            Err(status) if (status.raw() as u32) >> 30 == 3 => {
+                (disposition::REFUSED, status.raw() as u32)
+            }
+            Err(_) => return Err(NtStatus::UNSUCCESSFUL),
+        };
+        let certificate = LpcRetainedRequestOutcome {
+            abi_size: size_of::<LpcRetainedRequestOutcome>() as u16,
+            disposition,
+            status,
+            endpoint_handle: req.port_handle,
+            client_process: req.client_process,
+            client_thread: req.client_thread,
+            reserved: 0,
+        };
+        let bytes = bytemuck::bytes_of(&certificate);
+        out[..bytes.len()].copy_from_slice(bytes);
+        Ok(reply(NtStatus::SUCCESS, bytes.len() as u32, 0, 0))
     }
 
     fn op_receive_reply(&mut self, buf: &[u8], out_buf: &mut [u8]) -> Result<LpcReply, NtStatus> {
@@ -1894,6 +1956,117 @@ mod tests {
             &received.connection_info[nt_lpc_abi::PORT_MESSAGE_HEADER_LEN..],
             &0x1234u64.to_le_bytes()
         );
+        assert_eq!(client.reply_wait_receive(listen), Err(NtStatus::PENDING));
+    }
+
+    #[test]
+    fn retained_request_outcome_certifies_queue_and_disconnected_no_enqueue() {
+        use nt_lpc_client::RetainedRequestPortOutcome as Outcome;
+        let mut server = Server::new();
+        server.set_accept_policy(AcceptPolicy::Manual);
+        let mut client = LpcClient::new(Direct {
+            server: &mut server,
+            out: [0; 512],
+        });
+        let name = utf16("\\CheckedDeath");
+        let listen = client.create_port(&name, 0, 0x148, 0).unwrap();
+        let id = client
+            .connect_port_with_client_id(&name, 0, &[], 42, 43)
+            .unwrap()
+            .connection_id;
+        client.reply_wait_receive(listen).unwrap();
+        let accepted = client.accept_connect(id, true, 0x9876).unwrap();
+        let connector = client.complete_connect(id).unwrap().handle;
+        let retained = client.retain_port_object(connector).unwrap();
+        let message = nt_lpc_abi::client_died_message(0x1234);
+        assert_eq!(
+            client.retained_request_port_outcome(retained, &message, 42, 43),
+            Ok(Outcome::Queued)
+        );
+        let received = client.reply_wait_receive(listen).unwrap();
+        assert_eq!(received.msg_type, msg_type::LPC_CLIENT_DIED);
+        assert_eq!((received.client_process, received.client_thread), (42, 43));
+        assert_eq!(client.reply_wait_receive(listen), Err(NtStatus::PENDING));
+        client.close_port(accepted).unwrap();
+        assert_eq!(
+            client.retained_request_port_outcome(retained, &message, 42, 43),
+            Ok(Outcome::Refused(NtStatus::PORT_DISCONNECTED))
+        );
+        assert_eq!(
+            client.reply_wait_receive(listen),
+            Err(NtStatus::PENDING),
+            "checked refusal queued no peer message"
+        );
+        assert!(
+            client.query_handle(retained).is_ok(),
+            "send refusal does not release its reference"
+        );
+        client.close_port(connector).unwrap();
+        assert!(client
+            .release_port_object_with_lifetime(retained)
+            .unwrap()
+            .unwrap()
+            .is_deleted());
+    }
+
+    #[test]
+    fn retained_request_outcome_preflights_wire_and_output_before_queue_effects() {
+        let mut server = Server::new();
+        let (listen, retained) = {
+            let mut client = LpcClient::new(Direct {
+                server: &mut server,
+                out: [0; 512],
+            });
+            let listen = client
+                .create_port(&utf16("\\CheckedWire"), 0, 0x148, 0)
+                .unwrap();
+            (listen, client.retain_port_object(listen).unwrap())
+        };
+        let message = nt_lpc_abi::client_died_message(3);
+        let request = LpcMessageRequest {
+            abi_size: size_of::<LpcMessageRequest>() as u16,
+            port_handle: retained,
+            msg_offset: size_of::<LpcMessageRequest>() as u32,
+            msg_len_bytes: message.len() as u32,
+            client_process: 42,
+            client_thread: 43,
+            ..Default::default()
+        };
+        let mut valid = bytemuck::bytes_of(&request).to_vec();
+        valid.extend_from_slice(&message);
+        let opcode = opcode::LPC_OP_RETAINED_REQUEST_PORT_OUTCOME;
+        assert_eq!(
+            server.dispatch(opcode, &valid, &mut [0; 39]).status,
+            NtStatus::BUFFER_TOO_SMALL.raw()
+        );
+        for case in 0..8 {
+            let mut invalid = valid.clone();
+            match case {
+                0 => invalid[0..2].copy_from_slice(&0u16.to_le_bytes()),
+                1 => invalid[2..4].copy_from_slice(&1u16.to_le_bytes()),
+                2 => invalid[4..8].copy_from_slice(&1u32.to_le_bytes()),
+                3 => invalid[16..20].copy_from_slice(&0u32.to_le_bytes()),
+                4 => invalid.push(0),
+                5 => invalid[8..16].fill(0),
+                6 => invalid[24..32].fill(0),
+                _ => invalid[32..40].fill(0),
+            }
+            assert_eq!(
+                server.dispatch(opcode, &invalid, &mut [0; 40]).status,
+                NtStatus::INVALID_PARAMETER.raw()
+            );
+        }
+        let mut client = LpcClient::new(Direct {
+            server: &mut server,
+            out: [0; 512],
+        });
+        assert_eq!(client.reply_wait_receive(listen), Err(NtStatus::PENDING));
+        assert!(client.query_handle(retained).is_ok());
+        assert_eq!(
+            client.retained_request_port_outcome(retained, &message, 42, 43),
+            Ok(nt_lpc_client::RetainedRequestPortOutcome::Queued)
+        );
+        client.reply_wait_receive(listen).unwrap();
         assert_eq!(client.reply_wait_receive(listen), Err(NtStatus::PENDING));
     }
 

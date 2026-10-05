@@ -97,32 +97,48 @@ pub(crate) unsafe fn notify_thread_termination_ports(tid: u64, handler: &mut Exe
             {
                 break;
             }
-            if let Err(status) = lpc.retained_request_port(
+            match lpc.retained_request_port_outcome(
                 endpoint,
                 &message,
                 lifetime.process_id() as u64,
                 lifetime.thread_id() as u64,
             ) {
-                LPC_THREAD_TERMINATE_PORT_DELIVERY_FAILURES.fetch_add(1, Ordering::Relaxed);
-                print_str(b"[thread-term-port] retained delivery unresolved tid=");
-                print_u64(tid);
-                print_str(b" endpoint=0x");
-                print_hex_u64(endpoint);
-                print_str(b" status=0x");
-                print_hex(status.raw() as u32);
-                print_str(b"\n");
-                break;
+                Ok(nt_lpc_client::RetainedRequestPortOutcome::Queued) => {
+                    handler
+                        .pm
+                        .acknowledge_thread_termination_port_delivery(ticket)
+                        .expect("exact entered termination delivery ACK");
+                    LPC_THREAD_TERMINATE_PORT_DELIVERIES.fetch_add(1, Ordering::Relaxed);
+                    handler.lpc_endpoint_progress = true;
+                    if csr_api_port {
+                        CSR_KERNEL_MESSAGES_PENDING.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Ok(nt_lpc_client::RetainedRequestPortOutcome::Refused(status)) => {
+                    handler
+                        .pm
+                        .acknowledge_thread_termination_port_refusal(ticket, status.raw() as u32)
+                        .expect("exact checked termination delivery refusal");
+                    LPC_THREAD_TERMINATE_PORT_DELIVERY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    print_str(b"[thread-term-port] retained delivery refused tid=");
+                    print_u64(tid);
+                    print_str(b" status=0x");
+                    print_hex(status.raw() as u32);
+                    print_str(b"\n");
+                }
+                Err(status) => {
+                    LPC_THREAD_TERMINATE_PORT_DELIVERY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    print_str(b"[thread-term-port] retained delivery unresolved tid=");
+                    print_u64(tid);
+                    print_str(b" endpoint=0x");
+                    print_hex_u64(endpoint);
+                    print_str(b" status=0x");
+                    print_hex(status.raw() as u32);
+                    print_str(b"\n");
+                    break;
+                }
             }
-            handler
-                .pm
-                .acknowledge_thread_termination_port_delivery(ticket)
-                .expect("exact entered termination delivery ACK");
-            LPC_THREAD_TERMINATE_PORT_DELIVERIES.fetch_add(1, Ordering::Relaxed);
-            handler.lpc_endpoint_progress = true;
-            if csr_api_port {
-                CSR_KERNEL_MESSAGES_PENDING.fetch_add(1, Ordering::Relaxed);
-            }
-        } else if snapshot.phase != Phase::Delivered {
+        } else if !matches!(snapshot.phase, Phase::Delivered | Phase::Refused) {
             // Pending effects are sticky: later cleanup cannot resend or rerelease them.
             break;
         }

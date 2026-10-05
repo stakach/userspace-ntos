@@ -10,6 +10,7 @@ pub enum ThreadTerminationPortPhase {
     Registered,
     DeliveryPending,
     Delivered,
+    Refused,
     ReleasePending,
 }
 
@@ -30,6 +31,7 @@ pub struct ThreadTerminationPortSnapshot {
     pub phase: ThreadTerminationPortPhase,
     pub endpoint: Option<u64>,
     pub create_time_100ns: i64,
+    pub refusal_status: Option<u32>,
 }
 
 pub(super) struct ThreadTerminationPortRegistration {
@@ -38,6 +40,7 @@ pub(super) struct ThreadTerminationPortRegistration {
     endpoint: Option<u64>,
     phase: ThreadTerminationPortPhase,
     create_time_100ns: i64,
+    refusal_status: Option<u32>,
 }
 
 impl ProcessManager {
@@ -84,6 +87,7 @@ impl ProcessManager {
                 endpoint: None,
                 phase: ThreadTerminationPortPhase::Reserved,
                 create_time_100ns: thread.create_time_100ns,
+                refusal_status: None,
             });
         Ok(ThreadTerminationPortTicket { nonce, lifetime })
     }
@@ -159,6 +163,7 @@ impl ProcessManager {
                 phase: record.phase,
                 endpoint: record.endpoint,
                 create_time_100ns: record.create_time_100ns,
+                refusal_status: record.refusal_status,
             }))
     }
 
@@ -196,15 +201,38 @@ impl ProcessManager {
             ThreadTerminationPortPhase::Delivered,
         )
     }
+    /// The host must supply a checked broker certificate proving no message was queued.
+    /// A raw transport status is not such proof.
+    pub fn acknowledge_thread_termination_port_refusal(
+        &mut self,
+        ticket: &ThreadTerminationPortTicket,
+        status: u32,
+    ) -> Result<(), u32> {
+        if status >> 30 != 3 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let record = self.termination_port_record_mut(ticket)?;
+        if record.phase != ThreadTerminationPortPhase::DeliveryPending {
+            return Err(STATUS_DEVICE_BUSY);
+        }
+        record.refusal_status = Some(status);
+        record.phase = ThreadTerminationPortPhase::Refused;
+        Ok(())
+    }
+
     pub fn begin_thread_termination_port_release(
         &mut self,
         ticket: &ThreadTerminationPortTicket,
     ) -> Result<(), u32> {
-        self.transition_thread_termination_port(
-            ticket,
-            ThreadTerminationPortPhase::Delivered,
-            ThreadTerminationPortPhase::ReleasePending,
-        )
+        let record = self.termination_port_record_mut(ticket)?;
+        if !matches!(
+            record.phase,
+            ThreadTerminationPortPhase::Delivered | ThreadTerminationPortPhase::Refused
+        ) {
+            return Err(STATUS_DEVICE_BUSY);
+        }
+        record.phase = ThreadTerminationPortPhase::ReleasePending;
+        Ok(())
     }
     pub fn acknowledge_thread_termination_port_release(
         &mut self,

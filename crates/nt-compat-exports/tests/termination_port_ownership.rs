@@ -1,6 +1,7 @@
 use syn::visit::Visit;
 
-const MAIN: &str = include_str!("../../../components/ntos-executive/src/main.rs");
+const FOCUSED: &str =
+    include_str!("../../../components/ntos-executive/src/termination_port_notifications.rs");
 const HANDLER: &str = include_str!("../../../components/ntos-executive/src/exec_handler.rs");
 
 #[derive(Default)]
@@ -19,25 +20,13 @@ impl<'a> Visit<'a> for Calls {
     }
 }
 
-fn focused_native_source() -> String {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../components/ntos-executive/src/termination_port_notifications.rs");
-    // The current implementation lives in main/handler. An absent extraction does not
-    // cause compile failure: the assertions inspect the real existing implementation.
-    std::fs::read_to_string(path).unwrap_or_default()
-}
-
 fn notification_calls() -> Calls {
-    let focused = focused_native_source();
-    for source in [&focused[..], MAIN] {
-        let parsed = syn::parse_file(source).unwrap();
-        for item in parsed.items {
-            if let syn::Item::Fn(function) = item {
-                if function.sig.ident == "notify_thread_termination_ports" {
-                    let mut calls = Calls::default();
-                    calls.visit_block(&function.block);
-                    return calls;
-                }
+    for item in syn::parse_file(FOCUSED).unwrap().items {
+        if let syn::Item::Fn(function) = item {
+            if function.sig.ident == "notify_thread_termination_ports" {
+                let mut calls = Calls::default();
+                calls.visit_block(&function.block);
+                return calls;
             }
         }
     }
@@ -46,35 +35,20 @@ fn notification_calls() -> Calls {
 
 #[test]
 fn termination_registration_retains_real_broker_object_before_canonical_storage() {
-    let focused = focused_native_source();
     let mut calls = Calls::default();
-    if focused.is_empty() {
-        struct Registration<'a>(&'a mut Calls);
-        impl<'a> Visit<'a> for Registration<'_> {
-            fn visit_arm(&mut self, arm: &'a syn::Arm) {
-                if matches!(&arm.pat, syn::Pat::Path(path) if path.path.segments.last().unwrap().ident == "NtRegisterThreadTerminatePort")
-                {
-                    self.0.visit_expr(&arm.body);
-                }
-                syn::visit::visit_arm(self, arm);
+    for item in syn::parse_file(FOCUSED).unwrap().items {
+        if let syn::Item::Fn(function) = item {
+            if function.sig.ident == "register_native_thread_termination_port" {
+                calls.visit_block(&function.block);
             }
         }
-        Registration(&mut calls).visit_file(&syn::parse_file(HANDLER).unwrap());
-    } else {
-        for item in syn::parse_file(&focused).unwrap().items {
-            if let syn::Item::Fn(function) = item {
-                if function.sig.ident == "register_native_thread_termination_port" {
-                    calls.visit_block(&function.block);
-                }
-            }
-        }
-        let mut handler_calls = Calls::default();
-        handler_calls.visit_file(&syn::parse_file(HANDLER).unwrap());
-        assert!(handler_calls
-            .0
-            .iter()
-            .any(|call| call == "register_native_thread_termination_port"));
     }
+    let mut handler_calls = Calls::default();
+    handler_calls.visit_file(&syn::parse_file(HANDLER).unwrap());
+    assert!(handler_calls
+        .0
+        .iter()
+        .any(|call| call == "register_native_thread_termination_port"));
     let retained = calls.0.iter().position(|call| call == "retain_port_object");
     let stored = calls
         .0
@@ -103,7 +77,7 @@ fn termination_delivery_keeps_registration_until_checked_delivery_and_release() 
     for required in [
         "peek_thread_termination_port",
         "begin_thread_termination_port_delivery",
-        "retained_request_port",
+        "retained_request_port_outcome",
         "acknowledge_thread_termination_port_delivery",
         "begin_thread_termination_port_release",
         "release_port_object_with_lifetime",
@@ -115,9 +89,12 @@ fn termination_delivery_keeps_registration_until_checked_delivery_and_release() 
         );
     }
     let position = |name| calls.0.iter().position(|call| call == name).unwrap();
-    assert!(position("begin_thread_termination_port_delivery") < position("retained_request_port"));
     assert!(
-        position("retained_request_port")
+        position("begin_thread_termination_port_delivery")
+            < position("retained_request_port_outcome")
+    );
+    assert!(
+        position("retained_request_port_outcome")
             < position("acknowledge_thread_termination_port_delivery")
     );
     assert!(
@@ -131,5 +108,58 @@ fn termination_delivery_keeps_registration_until_checked_delivery_and_release() 
     assert!(
         position("release_port_object_with_lifetime")
             < position("acknowledge_thread_termination_port_release")
+    );
+}
+
+#[test]
+fn checked_broker_refusal_has_a_distinct_terminal_transition() {
+    let calls = notification_calls();
+    assert!(
+        calls
+            .0
+            .iter()
+            .any(|call| call == "retained_request_port_outcome"),
+        "raw NtStatus cannot distinguish checked no-enqueue refusal from transport uncertainty"
+    );
+    assert!(calls.0.iter().any(|call| call == "acknowledge_thread_termination_port_refusal"),
+        "known PORT_DISCONNECTED must settle delivery without fabricating delivery success or pinning the registration forever");
+    #[derive(Default)]
+    struct RefusalArm(bool);
+    #[derive(Default)]
+    struct RefusalPattern(bool);
+    impl<'a> Visit<'a> for RefusalPattern {
+        fn visit_pat_tuple_struct(&mut self, pattern: &'a syn::PatTupleStruct) {
+            self.0 |= pattern.path.segments.last().unwrap().ident == "Refused";
+            syn::visit::visit_pat_tuple_struct(self, pattern);
+        }
+        fn visit_pat_struct(&mut self, pattern: &'a syn::PatStruct) {
+            self.0 |= pattern.path.segments.last().unwrap().ident == "Refused";
+            syn::visit::visit_pat_struct(self, pattern);
+        }
+    }
+    impl<'a> Visit<'a> for RefusalArm {
+        fn visit_arm(&mut self, arm: &'a syn::Arm) {
+            let mut pattern = RefusalPattern::default();
+            pattern.visit_pat(&arm.pat);
+            if pattern.0 {
+                let mut calls = Calls::default();
+                calls.visit_expr(&arm.body);
+                self.0 |= calls
+                    .0
+                    .iter()
+                    .any(|name| name == "acknowledge_thread_termination_port_refusal")
+                    && !calls
+                        .0
+                        .iter()
+                        .any(|name| name == "acknowledge_thread_termination_port_delivery");
+            }
+            syn::visit::visit_arm(self, arm);
+        }
+    }
+    let mut refused = RefusalArm::default();
+    refused.visit_file(&syn::parse_file(FOCUSED).unwrap());
+    assert!(
+        refused.0,
+        "checked refusal must not be reported as a delivered notification"
     );
 }

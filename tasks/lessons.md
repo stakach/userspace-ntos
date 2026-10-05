@@ -561,3 +561,20 @@ diagnosis-free failure.
   implementation and acceptance, including fresh native or desktop evidence.
 - Close the issue only after its actual checklist is proven. Keep source tests,
   crate tests, native builds and desktop proof distinct throughout the work.
+
+## Bound Every Storage Layer
+- Available aggregate memory does not guarantee a contiguous allocation. Compare
+  the refused request with the largest reusable span, and reproduce the exact
+  allocation boundary before diagnosing a leak.
+- Bounded leaves need bounded directories and indexes too. Reducing a chunk size
+  can move the same failure into its pointer directory; test growth beyond the
+  observed live population while preserving stable identities and generations.
+- A dormant helper is not a live allocation path. Trace actual callers and
+  same-run receipts before changing mapping policy or claiming causation.
+
+## Distinguish Refusal From Uncertainty
+- A raw error status cannot certify that an IPC effect did not occur. Require a
+  checked outcome bound to the exact target and actors before settling refusal.
+- Definitive no-enqueue refusal is a terminal state, not successful delivery and
+  not permanent uncertainty. Retain the reference until its separate release ACK;
+  missing or malformed outcomes remain owned and must not be replayed.

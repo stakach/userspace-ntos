@@ -493,15 +493,18 @@ fn slot_metadata_grows_past_8192_without_relocating_handles() {
 
     assert_eq!(bank.entry_count(), total);
     assert_eq!(bank.stats().live, total);
+    let mut leaves = 0;
+    bank.slots.values.visit_allocations(|leaf, len, bytes| {
+        assert!(bytes <= 4096);
+        if leaf {
+            leaves += 1;
+            assert!(len <= SLOT_CHUNK_CAPACITY);
+        }
+    });
     assert_eq!(
-        bank.slots.chunks.len(),
+        leaves,
         (total + SLOT_CHUNK_CAPACITY - 1) / SLOT_CHUNK_CAPACITY
     );
-    assert!(bank
-        .slots
-        .chunks
-        .iter()
-        .all(|chunk| chunk.len() <= SLOT_CHUNK_CAPACITY));
     assert_eq!(
         bank.slots.get(0).unwrap() as *const Slot as usize,
         first_slot_address
