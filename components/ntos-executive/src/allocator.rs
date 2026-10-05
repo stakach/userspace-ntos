@@ -319,6 +319,12 @@ fn report_oom(size: usize, align: usize, cur: usize, start: usize, requested_end
     debug_usize(requested_end);
     debug_bytes(b" cap=");
     debug_usize(heap_size());
+    debug_bytes(b" durable-committed-cap=");
+    debug_usize(durable_heap_capacity());
+    debug_bytes(b" durable-reserved-cap=");
+    debug_usize(transient_heap_start().saturating_sub(DATA));
+    debug_bytes(b" transient-cap=");
+    debug_usize(transient_heap_size());
     let context = unsafe { read_word(OOM_CONTEXT) } as u32;
     if context != 0 {
         debug_bytes(b" ctx=");
