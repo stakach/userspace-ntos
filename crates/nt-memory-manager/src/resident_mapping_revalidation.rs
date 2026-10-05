@@ -22,6 +22,10 @@ pub trait ResidentMappingRevalidationIo<D> {
     fn map_existing(&mut self, descriptor: &D, mapped: InstallationCap) -> InstallationEffect;
 }
 
+#[cfg(test)]
+#[path = "resident_mapping_revalidation_tests.rs"]
+mod tests;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResidentMappingRevalidationOutcome {
     Revalidated,
