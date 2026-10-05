@@ -170,12 +170,16 @@ After the native leaf-revoke fix, a
 [font-profile boot](docs/evidence/issue18-client-frame-growth-allocation-failure.json)
 reached the genuine helper's client-thread setup, then refused a 3.75 MiB
 allocation during client-frame registration. It was manually stopped after about
-30 minutes without a guest verdict. With chunked frame storage, the latest
+30 minutes without a guest verdict. With chunked frame storage, a subsequent
 [boot](docs/evidence/issue18-chunked-frame-boot-frontier.json) completed the theme
 helper's exit and retirement without an allocation-refusal diagnostic, then
 reached the natural gate at 218/261. Its screenshot still shows background and
 cursor only; font acceptance, Userinit/Explorer, and desktop rendering remain
-unproven.
+unproven. The latest [mapping-retirement boot](docs/evidence/issue18-frame-map-font-boot-frontier.json)
+also completed the helper's exit and retirement, then reported a directory-query
+allocation refusal and Setup's Plug and Play startup failure. It was stopped at
+that fatal boundary within the one-hour limit. Native mapping specifications
+pass separately; this fresh boot still does not prove font cleanup or Explorer.
 Crate CI does not prove desktop boot. To attempt a boot from a fresh clone:
 
 ```sh
