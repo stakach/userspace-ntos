@@ -14840,7 +14840,8 @@ unsafe fn consumer_file_object_in_local_pool(object: u64) -> bool {
 
 unsafe fn consumer_device_object_in_local_pool(object: u64) -> bool {
     component_pool_allocation_capacity(object)
-        .is_some_and(|capacity| capacity >= WDM_X64_DEVICE_OBJECT_SIZE as u64)
+        .is_some_and(|capacity| capacity >= nt_io_manager::WdmDeviceObjectAllocationLayout::plan(0)
+            .expect("zero driver extension has a representable layout").allocation_size() as u64)
         && read_unaligned(object as *const i16) == WDM_X64_IO_TYPE_DEVICE
 }
 
@@ -44945,22 +44946,23 @@ unsafe fn validate_and_sync_hosted_device_projection(
     let (device_exec, capacity) =
         hosted_pool_allocation_exec_range(inst.exec_pool_va, device_object)
             .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    let required = (WDM_X64_DEVICE_OBJECT_SIZE as u64)
-        .checked_add(extension_size as u64)
-        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    let expected_extension = if extension_size == 0 {
-        0
-    } else {
-        device_object + WDM_X64_DEVICE_OBJECT_SIZE as u64
-    };
-    let expected_size =
-        u16::try_from(required).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+    let layout = nt_io_manager::WdmDeviceObjectAllocationLayout::plan(extension_size)
+        .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+    let required = layout.allocation_size() as u64;
+    let expected_extension = layout.driver_extension_offset()
+        .map_or(0, |offset| device_object + offset as u64);
+    let expected_size = layout.size_field();
+    let kernel_offset = layout.kernel_extension_offset() as u64;
     if capacity < required
         || hosted_instance_pool_allocation_is_free_unlocked(inst, device_object) != Some(false)
         || read_unaligned(device_exec as *const i16) != WDM_X64_IO_TYPE_DEVICE
         || read_unaligned((device_exec + 2) as *const u16) != expected_size
         || read_unaligned((device_exec + 0x08) as *const u64) != expected_driver_object
         || read_unaligned((device_exec + 0x40) as *const u64) != expected_extension
+        || read_unaligned((device_exec + 0x138) as *const u64) != device_object + kernel_offset
+        || read_unaligned((device_exec + kernel_offset) as *const u16) != 13
+        || read_unaligned((device_exec + kernel_offset + 2) as *const u16) != 0
+        || read_unaligned((device_exec + kernel_offset + 8) as *const u64) != device_object
         || read_unaligned((device_exec + 0x48) as *const u32) != device_type.0
         || read_unaligned((device_exec + 0x34) as *const u32) != characteristics.bits()
     {
@@ -51863,15 +51865,12 @@ pub(crate) fn service_hosted_device(
             else {
                 return (STATUS_INVALID_PARAMETER, 0, 0, 0);
             };
-            let required_device_bytes =
-                match (WDM_X64_DEVICE_OBJECT_SIZE as u64).checked_add(extension_size as u64) {
-                    Some(bytes) => bytes,
-                    None => return (STATUS_INVALID_PARAMETER, 0, 0, 0),
-                };
-            let expected_device_size = match u16::try_from(required_device_bytes) {
-                Ok(size) => size,
+            let layout = match nt_io_manager::WdmDeviceObjectAllocationLayout::plan(extension_size) {
+                Ok(layout) => layout,
                 Err(_) => return (STATUS_INVALID_PARAMETER, 0, 0, 0),
             };
+            let required_device_bytes = layout.allocation_size() as u64;
+            let expected_device_size = layout.size_field();
             if driver_capacity < WDM_X64_DRIVER_OBJECT_SIZE as u64
                 || device_capacity < required_device_bytes
                 || hosted_instance_pool_allocation_is_free_unlocked(inst, arg2) != Some(false)
@@ -51885,12 +51884,15 @@ pub(crate) fn service_hosted_device(
             {
                 return (STATUS_INVALID_PARAMETER, 0, 0, 0);
             }
-            let expected_extension = if extension_size == 0 {
-                0
-            } else {
-                pdo_object + WDM_X64_DEVICE_OBJECT_SIZE as u64
-            };
-            if read_unaligned((device_exec + 0x40) as *const u64) != expected_extension {
+            let expected_extension = layout.driver_extension_offset()
+                .map_or(0, |offset| pdo_object + offset as u64);
+            let kernel_offset = layout.kernel_extension_offset() as u64;
+            if read_unaligned((device_exec + 0x40) as *const u64) != expected_extension
+                || read_unaligned((device_exec + 0x138) as *const u64) != pdo_object + kernel_offset
+                || read_unaligned((device_exec + kernel_offset) as *const u16) != 13
+                || read_unaligned((device_exec + kernel_offset + 2) as *const u16) != 0
+                || read_unaligned((device_exec + kernel_offset + 8) as *const u64) != pdo_object
+            {
                 return (STATUS_INVALID_PARAMETER, 0, 0, 0);
             }
             (

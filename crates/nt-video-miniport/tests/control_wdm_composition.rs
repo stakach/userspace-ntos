@@ -1,9 +1,10 @@
 //! Host byte-layout composition, not execution of native video-port globals or callbacks.
 
 use nt_io_manager::{
-    write_wdm_device_object, write_wdm_io_stack_location, write_wdm_irp, WdmDeviceObjectInit,
-    WdmIoStackLocationInit, WdmIoStackParameters, WdmIrpInit, WDM_X64_DEVICE_OBJECT_SIZE,
-    WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IRP_SIZE,
+    write_wdm_device_object, write_wdm_io_stack_location, write_wdm_irp,
+    WdmDeviceObjectAllocationLayout, WdmDeviceObjectInit, WdmIoStackLocationInit,
+    WdmIoStackParameters, WdmIrpInit, WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_IO_STACK_LOCATION_SIZE,
+    WDM_X64_IRP_SIZE,
 };
 use nt_video_miniport::{
     classify_start_io_status, VideoAdapterDiscoveryState, VideoHardwareInitializationState,
@@ -16,29 +17,14 @@ const IO_STATUS_OFFSET: usize = 0x30;
 const IO_STATUS_END: usize = 0x40;
 
 struct ProjectedRequest {
-    device: Box<[u8; WDM_X64_DEVICE_OBJECT_SIZE]>,
-    extension: Box<[u8; 32]>,
+    device: Box<CombinedDevice>,
     irp: Box<[u8]>,
     system: Box<[u8; VIDEO_MODE_INFORMATION_SIZE]>,
 }
 
 impl ProjectedRequest {
     fn new() -> Self {
-        let mut device = Box::new([0xa5; WDM_X64_DEVICE_OBJECT_SIZE]);
-        let extension = Box::new([0; 32]);
-        let device_object_address = device.as_ptr() as u64;
-        write_wdm_device_object(
-            device.as_mut_slice(),
-            WdmDeviceObjectInit {
-                device_object_address,
-                size_field: WDM_X64_DEVICE_OBJECT_SIZE as u16,
-                device_extension: extension.as_ptr() as u64,
-                device_type: FILE_DEVICE_VIDEO,
-                stack_size: 1,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let device = CombinedDevice::new();
         let mut system = Box::new([0; VIDEO_MODE_INFORMATION_SIZE]);
         system[..4].copy_from_slice(&0x1234u32.to_le_bytes());
         let mut irp =
@@ -65,7 +51,7 @@ impl ProjectedRequest {
                 minor: 0,
                 flags: 0,
                 control: 0,
-                device_object: device.as_ptr() as u64,
+                device_object: device.0.as_ptr() as u64,
                 file_object: 0,
                 parameters: WdmIoStackParameters::DeviceControl {
                     input_buffer_length: 4,
@@ -78,7 +64,6 @@ impl ProjectedRequest {
         .unwrap();
         Self {
             device,
-            extension,
             irp,
             system,
         }
@@ -121,11 +106,11 @@ fn transient_request_packet_points_to_persistent_irp_status_and_buffered_storage
         );
         assert_eq!(
             u64_at(&request.irp[WDM_X64_IRP_SIZE..], 0x28),
-            request.device.as_ptr() as u64
+            request.device.0.as_ptr() as u64
         );
         assert_eq!(
-            u64_at(request.device.as_slice(), 0x40),
-            request.extension.as_ptr() as u64
+            u64_at(&request.device.0, 0x40),
+            request.device.0.as_ptr() as u64 + WDM_X64_DEVICE_OBJECT_SIZE as u64
         );
         let offset = (packet.status_block - request.irp.as_ptr() as u64) as usize;
         VideoStatusBlockX64 {
@@ -167,7 +152,7 @@ fn vp_completion_mapping_updates_only_original_irp_io_status_with_full_width_inf
         for information in [0, 0x1_0000_0004, u64::MAX] {
             let mut request = ProjectedRequest::new();
             let original_irp = request.irp.to_vec();
-            let original_device = *request.device;
+            let original_device = request.device.0;
             VideoStatusBlockX64 {
                 status: vp_status as i32,
                 information,
@@ -205,14 +190,21 @@ fn vp_completion_mapping_updates_only_original_irp_io_status_with_full_width_inf
                 &request.irp[IO_STATUS_END..],
                 &original_irp[IO_STATUS_END..]
             );
-            assert_eq!(*request.device, original_device);
+            assert_eq!(request.device.0, original_device);
         }
     }
 }
 
 const HARDWARE_EXTENSION_SIZE: usize = 32;
 const HARDWARE_EXTENSION_OFFSET: usize = WDM_X64_DEVICE_OBJECT_SIZE + VIDEO_PORT_DEVICE_STATE_SIZE;
-const COMBINED_DEVICE_SIZE: usize = HARDWARE_EXTENSION_OFFSET + HARDWARE_EXTENSION_SIZE;
+const HARDWARE_EXTENSION_END: usize = HARDWARE_EXTENSION_OFFSET + HARDWARE_EXTENSION_SIZE;
+const DRIVER_EXTENSION_SIZE: u32 = (VIDEO_PORT_DEVICE_STATE_SIZE + HARDWARE_EXTENSION_SIZE) as u32;
+const DEVICE_LAYOUT: WdmDeviceObjectAllocationLayout =
+    match WdmDeviceObjectAllocationLayout::plan(DRIVER_EXTENSION_SIZE) {
+        Ok(layout) => layout,
+        Err(_) => panic!("video fixture device layout"),
+    };
+const COMBINED_DEVICE_SIZE: usize = DEVICE_LAYOUT.allocation_size();
 
 #[repr(align(16))]
 struct CombinedDevice([u8; COMBINED_DEVICE_SIZE]);
@@ -220,14 +212,12 @@ struct CombinedDevice([u8; COMBINED_DEVICE_SIZE]);
 impl CombinedDevice {
     fn new() -> Box<Self> {
         let mut device = Box::new(Self([0; COMBINED_DEVICE_SIZE]));
-        let prefix_address = device.0.as_ptr() as u64 + WDM_X64_DEVICE_OBJECT_SIZE as u64;
         let device_object_address = device.0.as_ptr() as u64;
         write_wdm_device_object(
-            &mut device.0[..WDM_X64_DEVICE_OBJECT_SIZE],
+            &mut device.0,
             WdmDeviceObjectInit {
                 device_object_address,
-                size_field: COMBINED_DEVICE_SIZE as u16,
-                device_extension: prefix_address,
+                driver_extension_size: DRIVER_EXTENSION_SIZE,
                 device_type: FILE_DEVICE_VIDEO,
                 stack_size: 1,
                 ..Default::default()
@@ -262,7 +252,19 @@ impl CombinedDevice {
         );
         assert_eq!(
             u16::from_le_bytes(self.0[2..4].try_into().unwrap()) as usize,
-            COMBINED_DEVICE_SIZE
+            DEVICE_LAYOUT.size_field() as usize
+        );
+        let kernel_offset = DEVICE_LAYOUT.kernel_extension_offset();
+        assert!(kernel_offset >= HARDWARE_EXTENSION_END);
+        assert_eq!(kernel_offset % 16, 0);
+        assert_eq!(
+            u64_at(&self.0, 0x138),
+            self.0.as_ptr() as u64 + kernel_offset as u64
+        );
+        assert_eq!(u64_at(&self.0, kernel_offset + 8), self.0.as_ptr() as u64);
+        assert_eq!(
+            u16::from_le_bytes(self.0[kernel_offset..kernel_offset + 2].try_into().unwrap()),
+            13
         );
     }
 }
@@ -276,18 +278,20 @@ fn combined_devices_keep_discovery_and_initialization_state_independent_of_each_
     second.assert_layout();
     assert_ne!(first.0.as_ptr(), second.0.as_ptr());
     assert_eq!(
-        &first.0[HARDWARE_EXTENSION_OFFSET..],
+        &first.0[HARDWARE_EXTENSION_OFFSET..HARDWARE_EXTENSION_END],
         &[0; HARDWARE_EXTENSION_SIZE]
     );
     assert_eq!(
-        &second.0[HARDWARE_EXTENSION_OFFSET..],
+        &second.0[HARDWARE_EXTENSION_OFFSET..HARDWARE_EXTENSION_END],
         &[0; HARDWARE_EXTENSION_SIZE]
     );
     let first_header = first.0[..WDM_X64_DEVICE_OBJECT_SIZE].to_vec();
     let second_header = second.0[..WDM_X64_DEVICE_OBJECT_SIZE].to_vec();
     // Miniport-owned contents must survive every subsequent port-state publication.
-    first.0[HARDWARE_EXTENSION_OFFSET..].fill(0x31);
-    second.0[HARDWARE_EXTENSION_OFFSET..].fill(0x72);
+    let first_kernel = first.0[DEVICE_LAYOUT.kernel_extension_offset()..].to_vec();
+    let second_kernel = second.0[DEVICE_LAYOUT.kernel_extension_offset()..].to_vec();
+    first.0[HARDWARE_EXTENSION_OFFSET..HARDWARE_EXTENSION_END].fill(0x31);
+    second.0[HARDWARE_EXTENSION_OFFSET..HARDWARE_EXTENSION_END].fill(0x72);
     let mut first_state = first.state();
     first_state.begin_find_adapter().unwrap();
     first.store(first_state);
@@ -334,12 +338,20 @@ fn combined_devices_keep_discovery_and_initialization_state_independent_of_each_
     assert_eq!(&first.0[..WDM_X64_DEVICE_OBJECT_SIZE], &first_header);
     assert_eq!(&second.0[..WDM_X64_DEVICE_OBJECT_SIZE], &second_header);
     assert_eq!(
-        &first.0[HARDWARE_EXTENSION_OFFSET..],
+        &first.0[HARDWARE_EXTENSION_OFFSET..HARDWARE_EXTENSION_END],
         &[0x31; HARDWARE_EXTENSION_SIZE]
     );
     assert_eq!(
-        &second.0[HARDWARE_EXTENSION_OFFSET..],
+        &second.0[HARDWARE_EXTENSION_OFFSET..HARDWARE_EXTENSION_END],
         &[0x72; HARDWARE_EXTENSION_SIZE]
+    );
+    assert_eq!(
+        &first.0[DEVICE_LAYOUT.kernel_extension_offset()..],
+        &first_kernel
+    );
+    assert_eq!(
+        &second.0[DEVICE_LAYOUT.kernel_extension_offset()..],
+        &second_kernel
     );
 }
 
@@ -357,7 +369,7 @@ fn repeated_opens_preserve_initialized_prefix_and_hardware_extension_contents() 
     );
     device.store(state);
     // Model the initialized hardware context, without asserting a native allocator/cache policy.
-    device.0[HARDWARE_EXTENSION_OFFSET..].fill(0x5c);
+    device.0[HARDWARE_EXTENSION_OFFSET..HARDWARE_EXTENSION_END].fill(0x5c);
     state.finish_initialize(true).unwrap();
     device.store(state);
     let initialized = device.0;

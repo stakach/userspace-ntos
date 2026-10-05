@@ -11,7 +11,7 @@ use core::ptr::{addr_of, addr_of_mut, read_unaligned, write_unaligned};
 
 use nt_io_manager::{
     write_wdm_device_object, write_wdm_driver_object, WdmDeviceObjectInit, WdmDriverObjectInit,
-    WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_OBJECT_SIZE,
+    WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_OBJECT_SIZE,
 };
 use nt_status::NtStatus;
 use crate::win32k_subsystem::RootProviderPoolAllocation;
@@ -470,7 +470,9 @@ unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> Option<Roo
         (*addr_of_mut!(VIDEO_STATE)).objects.driver = allocation.address();
     }
     if video_state_snapshot().objects.device == 0 {
-        let Some(allocation) = allocate_projection(WDM_X64_DEVICE_OBJECT_SIZE as u64) else { return false; };
+        let layout = nt_io_manager::WdmDeviceObjectAllocationLayout::plan(0)
+            .expect("zero driver extension has a representable layout");
+        let Some(allocation) = allocate_projection(layout.allocation_size() as u64) else { return false; };
         (*addr_of_mut!(VIDEO_STATE)).objects.device_allocation = Some(allocation);
         (*addr_of_mut!(VIDEO_STATE)).objects.device = allocation.address();
     }
@@ -480,6 +482,8 @@ unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> Option<Roo
     if driver == 0 || device == 0 {
         return false;
     }
+    let device_layout = nt_io_manager::WdmDeviceObjectAllocationLayout::plan(0)
+        .expect("zero driver extension has a representable layout");
 
     // win32k needs projected, dereferenceable WDM bodies for the I/O Manager route identities.
     if write_wdm_driver_object(
@@ -496,10 +500,9 @@ unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> Option<Roo
         return false;
     }
     let initialized = write_wdm_device_object(
-        core::slice::from_raw_parts_mut(device as *mut u8, WDM_X64_DEVICE_OBJECT_SIZE),
+        core::slice::from_raw_parts_mut(device as *mut u8, device_layout.allocation_size()),
         WdmDeviceObjectInit {
             device_object_address: device,
-            size_field: WDM_X64_DEVICE_OBJECT_SIZE as u16,
             driver_object: driver,
             device_type: nt_video_miniport::FILE_DEVICE_VIDEO,
             stack_size: 1,

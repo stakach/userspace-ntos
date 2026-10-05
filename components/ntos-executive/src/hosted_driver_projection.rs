@@ -6,7 +6,7 @@
 
 use core::ptr::{read_unaligned, write_unaligned};
 
-use nt_io_manager::{write_wdm_device_object, WdmDeviceObjectInit, WDM_X64_DEVICE_OBJECT_SIZE};
+use nt_io_manager::{write_wdm_device_object, WdmDeviceObjectInit, WdmDeviceObjectAllocationLayout};
 
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: i32 = 0xC000_009Au32 as i32;
@@ -40,18 +40,10 @@ pub(crate) unsafe fn create_hosted_device_projection(
     allocate: unsafe fn(u64) -> u64,
     free: unsafe fn(u64),
 ) -> Result<HostedDeviceProjection, i32> {
-    let Some(allocation_len) =
-        (WDM_X64_DEVICE_OBJECT_SIZE as u64).checked_add(extension_size as u64)
-    else {
-        return Err(STATUS_INVALID_PARAMETER);
-    };
-    let Ok(allocation_len_usize) = usize::try_from(allocation_len) else {
-        return Err(STATUS_INVALID_PARAMETER);
-    };
-    let Ok(size_field) = u16::try_from(allocation_len) else {
-        return Err(STATUS_INVALID_PARAMETER);
-    };
-    let device_object = allocate(allocation_len);
+    let layout = WdmDeviceObjectAllocationLayout::plan(extension_size)
+        .map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let allocation_len_usize = layout.allocation_size();
+    let device_object = allocate(allocation_len_usize as u64);
     if device_object == 0 {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
@@ -61,22 +53,15 @@ pub(crate) unsafe fn create_hosted_device_projection(
     } else {
         0
     };
-    let device_extension = if extension_size != 0 {
-        device_object + WDM_X64_DEVICE_OBJECT_SIZE as u64
-    } else {
-        0
-    };
-
     let device_bytes =
         core::slice::from_raw_parts_mut(device_object as *mut u8, allocation_len_usize);
     if write_wdm_device_object(
         device_bytes,
         WdmDeviceObjectInit {
             device_object_address: device_object,
-            size_field,
+            driver_extension_size: extension_size,
             driver_object,
             next_device,
-            device_extension,
             flags,
             characteristics,
             device_type,

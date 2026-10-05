@@ -228,7 +228,8 @@ pub(crate) unsafe fn ensure_projection(device: nt_io_manager::DeviceId) -> Resul
     let pdo_identity = hosted_pnp_manager_mut().devnode_identity_for_pdo(device.raw());
     let driver_size = nt_io_manager::WDM_X64_DRIVER_OBJECT_SIZE as u64;
     let extension_size = nt_io_manager::WDM_X64_DRIVER_EXTENSION_SIZE as u64;
-    let device_size = nt_io_manager::WDM_X64_DEVICE_OBJECT_SIZE as u64;
+    let device_size = nt_io_manager::WdmDeviceObjectAllocationLayout::plan(0)
+        .map_err(|_| STATUS_INVALID_PARAMETER)?.allocation_size() as u64;
     let size = driver_size + extension_size + device_size;
     let (base, address) = if let Some(row) = consumer.projections.iter().find(|row| row.device == device) {
         let allocation = row.owned_allocation.ok_or(STATUS_DEVICE_NOT_READY)?;
@@ -268,7 +269,6 @@ pub(crate) unsafe fn ensure_projection(device: nt_io_manager::DeviceId) -> Resul
         core::slice::from_raw_parts_mut(address as *mut u8, device_size as usize),
         nt_io_manager::WdmDeviceObjectInit {
             device_object_address: address,
-            size_field: device_size as u16,
             driver_object: base,
             flags,
             characteristics,

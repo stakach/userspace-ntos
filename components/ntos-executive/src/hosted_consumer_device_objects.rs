@@ -4,7 +4,7 @@ use super::*;
 use nt_io_manager::{
     consumer_device_projection::{ConsumerDeviceLease, ConsumerDeviceProjection},
     DeviceId, FileId, HostedDevicePointerRegistration, HostedDomainIdentity, WdmDeviceObjectInit,
-    WdmDriverObjectInit, WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_SIZE,
+    WdmDriverObjectInit, WdmDeviceObjectAllocationLayout, WDM_X64_DRIVER_EXTENSION_SIZE,
     WDM_X64_DRIVER_OBJECT_SIZE,
 };
 const STATUS_DEVICE_BUSY: i32 = nt_status::NtStatus::DEVICE_BUSY.raw();
@@ -90,7 +90,9 @@ unsafe fn build(id: u64, name: &[u16], mut init: WdmDeviceObjectInit) -> Result<
         0,
         WDM_X64_DRIVER_OBJECT_SIZE + WDM_X64_DRIVER_EXTENSION_SIZE,
     )?;
-    let (device, device_exec) = allocate(id, 1, WDM_X64_DEVICE_OBJECT_SIZE)?;
+    let layout = WdmDeviceObjectAllocationLayout::plan(init.driver_extension_size)
+        .map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let (device, device_exec) = allocate(id, 1, layout.allocation_size())?;
     let length = name.len().checked_mul(2).ok_or(STATUS_INVALID_PARAMETER)?;
     let maximum = length.checked_add(2).ok_or(STATUS_INVALID_PARAMETER)?;
     let length = u16::try_from(length).map_err(|_| STATUS_INVALID_PARAMETER)?;
@@ -118,10 +120,9 @@ unsafe fn build(id: u64, name: &[u16], mut init: WdmDeviceObjectInit) -> Result<
     }
     core::ptr::write_unaligned((name_exec + length as u64) as *mut u16, 0);
     init.driver_object = driver;
-    init.size_field = WDM_X64_DEVICE_OBJECT_SIZE as u16;
     init.device_object_address = device;
     nt_io_manager::write_wdm_device_object(
-        core::slice::from_raw_parts_mut(device_exec as *mut u8, WDM_X64_DEVICE_OBJECT_SIZE),
+        core::slice::from_raw_parts_mut(device_exec as *mut u8, layout.allocation_size()),
         init,
     )
     .map_err(|_| STATUS_INVALID_PARAMETER)?;

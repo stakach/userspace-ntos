@@ -8,6 +8,49 @@ use crate::device_queue::{
 
 const DEVICE_QUEUE_OFFSET: usize = 0xa0;
 const QUEUE_LIST_OFFSET: usize = 0x50;
+pub const WDM_X64_DEVICE_OBJECT_EXTENSION_SIZE: usize = 0x50;
+
+/// ReactOS x64 pool alignment; logical DEVICE_OBJECT.Size excludes this padding and kernel body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WdmDeviceObjectAllocationLayout {
+    driver_size: u32,
+    size_field: u16,
+    kernel_offset: usize,
+    allocation_size: usize,
+}
+
+impl WdmDeviceObjectAllocationLayout {
+    pub const fn plan(driver_size: u32) -> Result<Self, WdmLayoutError> {
+        // Keep the supported logical Size representable, independently of allocation padding.
+        if driver_size > u16::MAX as u32 - WDM_X64_DEVICE_OBJECT_SIZE as u32 {
+            return Err(WdmLayoutError::InvalidField);
+        }
+        let logical = WDM_X64_DEVICE_OBJECT_SIZE + driver_size as usize;
+        let kernel_offset = (logical + 15) & !15;
+        Ok(Self {
+            driver_size,
+            size_field: logical as u16,
+            kernel_offset,
+            allocation_size: kernel_offset + WDM_X64_DEVICE_OBJECT_EXTENSION_SIZE,
+        })
+    }
+    pub const fn allocation_size(self) -> usize {
+        self.allocation_size
+    }
+    pub const fn size_field(self) -> u16 {
+        self.size_field
+    }
+    pub const fn driver_extension_offset(self) -> Option<usize> {
+        if self.driver_size == 0 {
+            None
+        } else {
+            Some(WDM_X64_DEVICE_OBJECT_SIZE)
+        }
+    }
+    pub const fn kernel_extension_offset(self) -> usize {
+        self.kernel_offset
+    }
+}
 
 enum QueueInitialization {
     Device([u8; DEVICE_QUEUE_SIZE]),
@@ -16,6 +59,7 @@ enum QueueInitialization {
 
 pub(super) struct PreparedDeviceObject {
     init: WdmDeviceObjectInit,
+    layout: WdmDeviceObjectAllocationLayout,
     queue: QueueInitialization,
 }
 
@@ -64,7 +108,8 @@ pub(super) fn prepare_device_object(
     output_len: usize,
     init: WdmDeviceObjectInit,
 ) -> Result<PreparedDeviceObject, WdmLayoutError> {
-    if output_len < WDM_X64_DEVICE_OBJECT_SIZE {
+    let layout = WdmDeviceObjectAllocationLayout::plan(init.driver_extension_size)?;
+    if output_len < layout.allocation_size() {
         return Err(WdmLayoutError::BufferTooSmall);
     }
     if init.device_object_address == 0
@@ -92,7 +137,7 @@ pub(super) fn prepare_device_object(
         initialize_device_queue(&mut encoding, address).map_err(|_| WdmLayoutError::InvalidField)?;
         QueueInitialization::Device(encoding.bytes)
     };
-    Ok(PreparedDeviceObject { init, queue })
+    Ok(PreparedDeviceObject { init, layout, queue })
 }
 
 pub fn write_wdm_device_object(
@@ -106,14 +151,21 @@ pub fn write_wdm_device_object(
 
 pub(super) fn commit_device_object(bytes: &mut [u8], prepared: PreparedDeviceObject) {
     let init = prepared.init;
+    let layout = prepared.layout;
     zero(bytes);
     put_i16(bytes, 0x00, WDM_X64_IO_TYPE_DEVICE);
-    put_u16(bytes, 0x02, init.size_field);
+    put_u16(bytes, 0x02, layout.size_field());
     put_u64(bytes, 0x08, init.driver_object);
     put_u64(bytes, 0x10, init.next_device);
     put_u32(bytes, 0x30, init.flags);
     put_u32(bytes, 0x34, init.characteristics);
-    put_u64(bytes, 0x40, init.device_extension);
+    put_u64(bytes, 0x40, layout.driver_extension_offset()
+        .map_or(0, |offset| init.device_object_address + offset as u64));
+    let kernel_offset = layout.kernel_extension_offset();
+    put_u64(bytes, 0x138, init.device_object_address + kernel_offset as u64);
+    put_u16(bytes, kernel_offset, 13);
+    put_u16(bytes, kernel_offset + 2, 0);
+    put_u64(bytes, kernel_offset + 8, init.device_object_address);
     put_u32(bytes, 0x48, init.device_type);
     put_u8(bytes, 0x4c, init.stack_size);
     match prepared.queue {

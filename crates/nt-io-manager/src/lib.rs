@@ -278,7 +278,8 @@ pub use wdm_x64::{
     write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
     write_wdm_irp_completion_targets,
     write_wdm_open_device_projection,
-    WdmDeviceObjectInit, WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit,
+    WdmDeviceObjectInit, WdmDeviceObjectAllocationLayout, WDM_X64_DEVICE_OBJECT_EXTENSION_SIZE,
+    WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit,
     WdmIoStackParameters, WdmIrpInit, WdmLayoutError, WdmOpenDeviceProjectionInit,
     WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_OFFSET, WDM_X64_DRIVER_EXTENSION_SIZE,
     WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET,
@@ -8057,15 +8058,14 @@ mod tests {
         assert_eq!(le_u64(&driver, WDM_X64_DRIVER_EXTENSION_OFFSET), 0x7777);
         assert_eq!(le_u64(&driver, WDM_X64_DRIVER_UNLOAD_OFFSET), 0x8888);
 
-        let mut dev = [0xCC; WDM_X64_DEVICE_OBJECT_SIZE + 16];
+        let mut dev = [0xCC; WDM_X64_DEVICE_OBJECT_SIZE + 16 + WDM_X64_DEVICE_OBJECT_EXTENSION_SIZE];
         write_wdm_device_object(
             &mut dev,
             WdmDeviceObjectInit {
                 device_object_address: 0x1000_0000,
-                size_field: (WDM_X64_DEVICE_OBJECT_SIZE + 16) as u16,
+                driver_extension_size: 16,
                 driver_object: 0x1111,
                 next_device: 0x2222,
-                device_extension: 0x3333,
                 flags: 0x4455_6677,
                 characteristics: 0x8899_aabb,
                 device_type: 0x44,
@@ -8079,10 +8079,14 @@ mod tests {
         assert_eq!(le_u64(&dev, 0x10), 0x2222);
         assert_eq!(le_u32(&dev, 0x30), 0x4455_6677);
         assert_eq!(le_u32(&dev, 0x34), 0x8899_aabb);
-        assert_eq!(le_u64(&dev, 0x40), 0x3333);
+        assert_eq!(le_u64(&dev, 0x40), 0x1000_0000 + WDM_X64_DEVICE_OBJECT_SIZE as u64);
         assert_eq!(le_u32(&dev, 0x48), 0x44);
         assert_eq!(dev[0x4c], 3);
-        assert!(dev.iter().skip(WDM_X64_DEVICE_OBJECT_SIZE).all(|b| *b == 0));
+        let kernel_offset = WDM_X64_DEVICE_OBJECT_SIZE + 16;
+        assert!(dev[WDM_X64_DEVICE_OBJECT_SIZE..kernel_offset].iter().all(|b| *b == 0));
+        assert_eq!(le_u64(&dev, 0x138), 0x1000_0000 + kernel_offset as u64);
+        assert_eq!(le_u16(&dev, kernel_offset), 13);
+        assert_eq!(le_u64(&dev, kernel_offset + 8), 0x1000_0000);
 
         let mut file = [0xCC; WDM_X64_FILE_OBJECT_SIZE];
         write_wdm_file_object(
@@ -8113,7 +8117,7 @@ mod tests {
     #[test]
     fn wdm_x64_open_device_projection_wires_backlinks() {
         let mut driver = [0xCC; WDM_X64_DRIVER_OBJECT_SIZE + WDM_X64_DRIVER_EXTENSION_SIZE];
-        let mut device = [0xCC; WDM_X64_DEVICE_OBJECT_SIZE];
+        let mut device = [0xCC; WDM_X64_DEVICE_OBJECT_SIZE + WDM_X64_DEVICE_OBJECT_EXTENSION_SIZE];
         let mut file = [0xCC; WDM_X64_FILE_OBJECT_SIZE];
 
         write_wdm_open_device_projection(

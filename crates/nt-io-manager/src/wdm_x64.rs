@@ -41,10 +41,9 @@ pub struct WdmDriverObjectInit {
 pub struct WdmDeviceObjectInit {
     /// Final WDM virtual address, which may differ from this writer's output slice address.
     pub device_object_address: u64,
-    pub size_field: u16,
+    pub driver_extension_size: u32,
     pub driver_object: u64,
     pub next_device: u64,
-    pub device_extension: u64,
     pub flags: u32,
     pub characteristics: u32,
     pub device_type: u32,
@@ -339,10 +338,9 @@ pub fn write_wdm_open_device_projection(
         device_bytes.len(),
         WdmDeviceObjectInit {
             device_object_address: init.device_object,
-            size_field: WDM_X64_DEVICE_OBJECT_SIZE as u16,
+            driver_extension_size: 0,
             driver_object: init.driver_object,
             next_device: 0,
-            device_extension: 0,
             flags: init.device_flags,
             characteristics: init.device_characteristics,
             device_type: init.device_type,
@@ -683,4 +681,5 @@ mod file_object_tests;
 mod device_object_tests;
 
 mod device_object;
-pub use device_object::write_wdm_device_object;
+pub use device_object::{write_wdm_device_object, WdmDeviceObjectAllocationLayout,
+    WDM_X64_DEVICE_OBJECT_EXTENSION_SIZE};
