@@ -179,11 +179,15 @@ unproven. The [mapping-retirement boot](docs/evidence/issue18-frame-map-font-boo
 also completed the helper's exit and retirement, then reported a directory-query
 allocation refusal and Setup's Plug and Play startup failure. It was stopped at
 that fatal boundary within the one-hour limit. Native mapping specifications
-pass separately. The latest [directory-scratch boot](docs/evidence/issue18-directory-scratch-font-boot-frontier.json)
+pass separately. The [directory-scratch boot](docs/evidence/issue18-directory-scratch-font-boot-frontier.json)
 completed the genuine helper's exit and retirement without an allocation-refusal
 diagnostic, but Setup again failed starting Plug and Play. The guest was stopped
 at its fatal MessageBox within the one-hour limit. Current screenshot evidence
 remains background/cursor only; font cleanup and Explorer are not yet proven.
+The latest [canonical initial-thread boot](docs/evidence/issue18-canonical-initial-font-boot-frontier.json)
+proves correct main-thread admission after hosted-slot reuse and genuine helper
+exit/retirement, but Setup still fails starting Plug and Play. Its bounded run
+and strict font parser failed; the screenshot is background/cursor only.
 Crate CI does not prove desktop boot. To attempt a boot from a fresh clone:
 
 ```sh
