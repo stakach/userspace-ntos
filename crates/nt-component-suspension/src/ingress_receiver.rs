@@ -138,7 +138,7 @@ mod bootstrap_adoption;
 pub use bootstrap_adoption::BootstrapAdoptionError;
 mod nested_execution;
 mod parked_reply;
-pub use nested_execution::{NestedExecutionError, NestedExecutionScope};
+pub use nested_execution::{NestedExecutionError, NestedExecutionIdentity, NestedExecutionScope};
 mod bootstrap_completion;
 mod stopped_route;
 pub use stopped_route::{CancelledStoppedCall, StoppedRouteError};

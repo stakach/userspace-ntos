@@ -59,7 +59,51 @@ pub struct ExternalIngress<M> {
     restart: RestartPhase,
 }
 
+/// Equality witness for one retained external Call, never a capability or admission authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExternalAdmissionKey {
+    identity: u64,
+    executor: u64,
+    reply: u64,
+}
+
+impl ExternalAdmissionKey {
+    pub const fn executor(self) -> u64 {
+        self.executor
+    }
+    pub const fn reply(self) -> u64 {
+        self.reply
+    }
+    pub const fn admission_sequence(self) -> u64 {
+        self.identity
+    }
+}
+
+/// Positive send acknowledgement followed by checked Free reconciliation of the original Call.
+/// Only the owning receiver can issue this receipt; it cannot be cloned or reconstructed.
+#[must_use = "retain the settlement until its dependent work is released"]
+#[derive(Debug)]
+pub struct ExternalSettlement {
+    admission: ExternalAdmissionKey,
+}
+
+impl ExternalSettlement {
+    pub const fn admission_key(&self) -> ExternalAdmissionKey {
+        self.admission
+    }
+    pub(crate) fn new(admission: ExternalAdmissionKey) -> Self {
+        Self { admission }
+    }
+}
+
 impl<M> ExternalIngress<M> {
+    pub fn admission_key(&self) -> ExternalAdmissionKey {
+        ExternalAdmissionKey {
+            identity: self.reservation.identity(),
+            executor: self.executor(),
+            reply: self.reply(),
+        }
+    }
     pub(crate) fn new(
         ingress: ComponentIngress<M>,
         reservation: RetainedWorkReservation,

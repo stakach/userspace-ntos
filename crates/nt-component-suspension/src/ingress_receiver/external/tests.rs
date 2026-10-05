@@ -7,6 +7,88 @@ mod stop_tests;
 #[path = "restart_tests.rs"]
 mod restart_tests;
 
+#[test]
+fn settlement_requires_owned_ack_and_free_and_preserves_pending_on_every_refusal() {
+    let (lanes, mut receiver, mut pool) = fixture(true);
+    let mut pending = Some(
+        pool.retain_external(&mut receiver, &lanes, 10, spare_free, bound)
+            .unwrap(),
+    );
+    let key = pending.as_ref().unwrap().admission_key();
+    assert_eq!((key.executor(), key.reply()), (10, 30));
+    assert_eq!(
+        key.admission_sequence(),
+        pending.as_ref().unwrap().admission_sequence()
+    );
+    assert!(matches!(
+        receiver.finish_external_with_settlement(&mut pending, no_query),
+        Err(ExternalIngressError::NotAcknowledged)
+    ));
+    pending
+        .as_mut()
+        .unwrap()
+        .reply_owned(bound, |_| IngressReplyObservation::Acknowledged)
+        .unwrap();
+    let mut foreign = IngressReceiver::<ReceivedMessage>::new(20, 50, 1).unwrap();
+    assert!(matches!(
+        foreign.finish_external_with_settlement(&mut pending, no_query),
+        Err(ExternalIngressError::WrongOwner)
+    ));
+    let mut foreign_endpoint = IngressReceiver::<ReceivedMessage>::new(21, 50, 1).unwrap();
+    assert!(matches!(
+        foreign_endpoint.finish_external_with_settlement(&mut pending, no_query),
+        Err(ExternalIngressError::WrongOwner)
+    ));
+    assert!(matches!(
+        receiver.finish_external_with_settlement(&mut pending, bound),
+        Err(ExternalIngressError::NotFree)
+    ));
+    assert!(matches!(
+        receiver.finish_external_with_settlement(&mut pending, |_, _| Err(9u8)),
+        Err(ExternalIngressError::Query(9))
+    ));
+    assert_eq!(pending.as_ref().unwrap().admission_key(), key);
+    assert!(receiver.excludes_reply(30));
+    let (ready, message, settlement) = receiver
+        .finish_external_with_settlement(&mut pending, free)
+        .unwrap();
+    assert_eq!(settlement.admission_key(), key);
+    assert_eq!(ready.reply(), 30);
+    assert_eq!(message.word(4), Some(55));
+    assert!(pending.is_none());
+    assert!(matches!(
+        receiver.finish_external_with_settlement(&mut pending, no_query),
+        Err(ExternalIngressError::Empty)
+    ));
+}
+
+#[test]
+fn reused_reply_and_executor_do_not_alias_external_admission_key() {
+    let (lanes, mut first, mut pool) = fixture(true);
+    let mut pending = Some(
+        pool.retain_external(&mut first, &lanes, 10, spare_free, bound)
+            .unwrap(),
+    );
+    let first_key = pending.as_ref().unwrap().admission_key();
+    pending
+        .as_mut()
+        .unwrap()
+        .reply_owned(bound, |_| IngressReplyObservation::Acknowledged)
+        .unwrap();
+    let (_, _, receipt) = first
+        .finish_external_with_settlement(&mut pending, free)
+        .unwrap();
+    let (lanes, mut second, mut pool) = fixture(true);
+    let call = pool
+        .retain_external(&mut second, &lanes, 10, spare_free, bound)
+        .unwrap();
+    assert_eq!(
+        (call.reply(), call.executor()),
+        (first_key.reply(), first_key.executor())
+    );
+    assert_ne!(call.admission_key(), receipt.admission_key());
+}
+
 type Lanes = ComponentSuspensionLanes<(), (), ()>;
 fn bound(tcb: u64, reply: u64) -> Result<ReplyBindingObservation, u8> {
     assert_eq!((tcb, reply), (10, 30));

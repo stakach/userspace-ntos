@@ -21,6 +21,7 @@ pub mod provider_dispatcher_backend;
 pub mod provider_wait_selection;
 pub mod pending_caller;
 pub mod hosted_return_target;
+pub mod receive_child_barrier;
 
 mod mechanism;
 mod ntdll;
