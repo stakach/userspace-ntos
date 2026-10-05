@@ -60,7 +60,7 @@ fn fixture() -> (
 #[test]
 fn partial_coverage_captures_registry_only_aliases_without_transferring_rows() {
     let (resources, progress, registry) = fixture();
-    let records = registry.records().to_vec();
+    let records = registry.records().copied().collect::<Vec<_>>();
     let state = ThreadRegistryReconciliation::empty();
     let id = attempt();
     let (progress, retirement) = seal(progress, id);
@@ -75,7 +75,7 @@ fn partial_coverage_captures_registry_only_aliases_without_transferring_rows() {
             .iter()
             .any(|resource| resource.cap == cap));
     }
-    assert_eq!(registry.records(), records);
+    assert_eq!(registry.records().copied().collect::<Vec<_>>(), records);
     assert!(core::ptr::eq(
         snapshot,
         state
@@ -366,7 +366,7 @@ fn registered_complete_capture_replays_same_page_set_without_construction_eviden
             .any(|entry| entry.cap == cap
                 && entry.kind == crate::thread_rollback::ThreadRollbackResourceKind::Frame));
     }
-    assert_eq!(registry.records().len(), 2);
+    assert_eq!(registry.len(), 2);
 }
 
 #[test]

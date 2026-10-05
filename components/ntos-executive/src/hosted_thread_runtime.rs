@@ -426,7 +426,7 @@ impl HostedThreadRuntimeTable {
         for cap in mechanisms.entries().filter_map(|(_, state)| state.slot()) {
             if (construction_retirement.is_some() && owner.memory_coverage.empty_slot() == Some(cap))
                 || snapshot.rollback_resources().iter().any(|resource| resource.cap == cap)
-                || registry.records().iter().any(|record|
+                || registry.records().any(|record|
                     [record.frame, record.alias_cap, record.source_cap].contains(&cap))
             {
                 return Err(ThreadReconciliationError::OwnershipConflict);
@@ -495,7 +495,7 @@ impl HostedThreadRuntimeTable {
             return Err(ThreadReconciliationError::OwnershipConflict);
         }
         for cap in aliases.capabilities().chain(prefetch.capabilities()).chain(provider.root_capabilities()) {
-            if registry.records().iter().any(|record|
+            if registry.records().any(|record|
                     [record.frame, record.alias_cap, record.source_cap].contains(&cap))
             {
                 return Err(ThreadReconciliationError::OwnershipConflict);

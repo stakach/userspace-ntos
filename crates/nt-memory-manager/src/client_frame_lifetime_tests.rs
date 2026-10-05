@@ -4,6 +4,7 @@ const MEMORY_PROCESS: crate::MemoryLifetime =
         generation: crate::ProcessGeneration::Hosted(1),
     });
 use super::*;
+use alloc::vec::Vec;
 use crate::{ProcessGeneration, ProcessIdentity};
 const RELEASE: ClientFrameReclaimIntent = ClientFrameReclaimIntent::Release;
 

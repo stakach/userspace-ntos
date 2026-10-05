@@ -1833,7 +1833,6 @@ unsafe fn registered_frame_first_overlap_unowned_private_vad(
     }
     (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY))
         .records()
-        .iter()
         .filter(|record| {
             record.pi == pi as u64
                 && record.page < end

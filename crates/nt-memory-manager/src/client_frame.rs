@@ -1,5 +1,4 @@
 use crate::MemoryLifetime;
-use alloc::vec::Vec;
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -11,6 +10,10 @@ mod reclaim;
 pub use reclaim::{ClientFrameReclaimError, ClientFrameReclaimIntent, ClientFrameReclaimIo};
 
 static NEXT_RECORD_ID: AtomicU64 = AtomicU64::new(1);
+
+#[path = "client_frame_storage.rs"]
+mod storage;
+use storage::RecordStorage;
 
 fn allocate_record_id(counter: &AtomicU64) -> Result<u64, ClientFrameInsertError> {
     counter
@@ -100,7 +103,7 @@ pub struct ClientFrameRegistryStats {
 }
 
 pub struct ClientFrameRegistry {
-    records: Vec<ClientFrameRecord>,
+    records: RecordStorage,
     reclaiming: usize,
     next_age: u64,
     high_water: usize,
@@ -118,7 +121,7 @@ pub struct ClientFrameRegistry {
 impl ClientFrameRegistry {
     pub const fn new() -> Self {
         Self {
-            records: Vec::new(),
+            records: RecordStorage::new(),
             reclaiming: 0,
             next_age: 1,
             high_water: 0,
@@ -134,6 +137,7 @@ impl ClientFrameRegistry {
         }
     }
 
+    /// Reserve bounded backing chunks. Refusal may retain empty chunks but never changes owners.
     pub fn reserve_initial(&mut self, records: usize) -> bool {
         if self.records.try_reserve(records).is_err() {
             self.allocation_failures = self.allocation_failures.saturating_add(1);
@@ -407,8 +411,22 @@ impl ClientFrameRegistry {
             .min()
     }
 
-    pub fn records(&self) -> &[ClientFrameRecord] {
-        &self.records
+    /// Borrow existing owners without allocating a contiguous snapshot.
+    pub fn records(&self) -> impl Iterator<Item = &ClientFrameRecord> {
+        self.records.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Copy an observation; indices can change after removal and are not owner identities.
+    pub fn record_at(&self, index: usize) -> Option<ClientFrameRecord> {
+        (index < self.len()).then(|| self.records[index])
     }
 
     pub fn reclaiming_count(&self) -> usize {
@@ -482,6 +500,10 @@ impl ClientFrameReclaimIo for SuccessfulCleanup {
 #[cfg(test)]
 #[path = "client_frame_lifetime_tests.rs"]
 mod lifetime_tests;
+
+#[cfg(test)]
+#[path = "client_frame_storage_tests.rs"]
+mod storage_tests;
 
 #[cfg(test)]
 mod tests {

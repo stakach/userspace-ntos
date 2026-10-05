@@ -193,7 +193,10 @@ fn partial_capture_merges_only_constructed_backing_and_exact_registered_aliases(
         .map(|entry| entry.cap)
         .collect();
     assert_eq!(aliases, [11, 12, 13]);
-    assert_eq!(snapshot.records(), registry.records());
+    assert_eq!(
+        snapshot.records(),
+        registry.records().copied().collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -239,7 +242,7 @@ fn partial_capture_checks_unbuilt_geometry_for_unexpected_rows() {
         ThreadRegistrySnapshot::capture_partial(&resources, &registry, &[]),
         Err(ThreadRegistryError::UnexpectedRecord { page: 0x14000 })
     ));
-    assert_eq!(registry.records().len(), 1);
+    assert_eq!(registry.len(), 1);
 }
 
 #[test]
@@ -353,8 +356,11 @@ fn native_target_teb_records_never_become_second_physical_owners() {
             Kind::Alias
         );
     }
-    assert_eq!(snapshot.records(), registry.records());
-    assert!(registry.records().iter().all(|record| record.is_resident()));
+    assert_eq!(
+        snapshot.records(),
+        registry.records().copied().collect::<Vec<_>>()
+    );
+    assert!(registry.records().all(|record| record.is_resident()));
 }
 
 #[test]
@@ -477,19 +483,19 @@ fn empty_coverage_is_revalidated_before_reporting_no_registry_transfer() {
     registry
         .insert(27, MEMORY_PROCESS, 0x13000, 31, 0, 0, 0, true)
         .unwrap();
-    let before = registry.records().to_vec();
+    let before = registry.records().copied().collect::<Vec<_>>();
     assert!(matches!(
         snapshot.prepare_transfer(&resources, &mut registry),
         Err(ThreadRegistryError::UnexpectedRecord { page: 0x13000 }),
     ));
-    assert_eq!(registry.records(), before);
+    assert_eq!(registry.records().copied().collect::<Vec<_>>(), before);
 }
 
 #[test]
 fn malformed_coverage_and_partial_resources_are_refused_without_mutation() {
     let mut resources = resources(27);
     let registry = registry(27);
-    let before = registry.records().to_vec();
+    let before = registry.records().copied().collect::<Vec<_>>();
     for pages in [&[0x10000, 0x10000][..], &[0x10001][..], &[0x17000][..]] {
         assert!(matches!(
             ThreadRegistrySnapshot::capture(&resources, &registry, pages),
@@ -511,7 +517,7 @@ fn malformed_coverage_and_partial_resources_are_refused_without_mutation() {
         ThreadRegistrySnapshot::capture(&ThreadMemoryResources::<3>::empty(), &registry, &[]),
         Err(ThreadRegistryError::Resources(_))
     ));
-    assert_eq!(registry.records(), before);
+    assert_eq!(registry.records().copied().collect::<Vec<_>>(), before);
 }
 
 #[test]
@@ -656,12 +662,12 @@ fn exact_record_replacement_and_resource_changes_invalidate_capture() {
             old.age,
         )
         .unwrap();
-    let before = registry.records().to_vec();
+    let before = registry.records().copied().collect::<Vec<_>>();
     assert!(matches!(
         snapshot.prepare_transfer(&resources, &mut registry),
         Err(ThreadRegistryError::StaleRecord { page: 0x13000 })
     ));
-    assert_eq!(registry.records(), before);
+    assert_eq!(registry.records().copied().collect::<Vec<_>>(), before);
 }
 
 #[test]
@@ -672,12 +678,12 @@ fn newly_present_unselected_pages_prevent_handoff_without_claiming_selected_rows
     registry
         .insert(27, MEMORY_PROCESS, 0x12000, 60, 0, 0, 0, true)
         .unwrap();
-    let before = registry.records().to_vec();
+    let before = registry.records().copied().collect::<Vec<_>>();
     assert!(matches!(
         snapshot.prepare_transfer(&resources, &mut registry),
         Err(ThreadRegistryError::UnexpectedRecord { page: 0x12000 })
     ));
-    assert_eq!(registry.records(), before);
+    assert_eq!(registry.records().copied().collect::<Vec<_>>(), before);
 }
 
 #[test]

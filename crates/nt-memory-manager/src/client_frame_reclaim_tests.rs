@@ -701,7 +701,7 @@ fn invalid_or_conflicting_backing_provenance_cannot_partially_publish_a_record()
             ),
             Err(crate::ClientFrameInsertError::InvalidRecord)
         );
-        assert!(registry.records().is_empty());
+        assert!(registry.is_empty());
     }
     registry
         .insert_at_age_with_backing(7, MEMORY_PROCESS, 0x1000, 11, 0x2000, 12, 13, true, 40, 12)

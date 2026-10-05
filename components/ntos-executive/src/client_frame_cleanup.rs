@@ -148,9 +148,7 @@ pub(super) unsafe fn retry_pending(handler: &ExecNtHandler) {
     let mut index = 0;
     loop {
         let Some(record) = (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY))
-            .records()
-            .get(index)
-            .copied()
+            .record_at(index)
         else {
             break;
         };

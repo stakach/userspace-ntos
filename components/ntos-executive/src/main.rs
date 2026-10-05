@@ -678,7 +678,7 @@ unsafe fn release_hosted_thread_resources(resources: HostedThreadResources) {
     }
 
     assert!(
-        !(&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).records().iter().any(|record| {
+        !(&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).records().any(|record| {
             record.pi == resources.client_pi as u64 && record.is_reclaiming()
                 && resources.retains_page_backing(record.page)
         }),
@@ -9159,9 +9159,9 @@ unsafe fn process_working_set_resident_pages(
     let frames = &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY);
     let mut pages = Vec::new();
     pages
-        .try_reserve(frames.records().len().saturating_add(1))
+        .try_reserve(frames.len().saturating_add(1))
         .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
-    for record in frames.records().iter().filter(|record| record.pi == pi as u64) {
+    for record in frames.records().filter(|record| record.pi == pi as u64) {
         if record.lifetime != nt_memory_manager::MemoryLifetime::Process(process) {
             return Err(nt_fs::STATUS_INVALID_HANDLE);
         }
