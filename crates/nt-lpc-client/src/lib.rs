@@ -345,6 +345,127 @@ impl<B: Backend> LpcClient<B> {
         NtStatus(reply.status).to_result()
     }
 
+    fn endpoint_transition(
+        &mut self,
+        opcode: u16,
+        handle: u64,
+    ) -> Result<Option<nt_lpc_abi::LpcEndpointLifetime>, NtStatus> {
+        let request = nt_lpc_abi::LpcClosePortRequest {
+            abi_size: size_of::<nt_lpc_abi::LpcClosePortRequest>() as u16,
+            port_handle: handle,
+            ..Default::default()
+        };
+        let mut out = [0u8; size_of::<nt_lpc_abi::LpcEndpointLifetime>()];
+        let reply = self
+            .backend
+            .call(opcode, bytemuck::bytes_of(&request), &mut out);
+        let snapshot = Self::decode_endpoint_lifetime(reply, &out)?;
+        if snapshot.endpoint == 0 {
+            if snapshot.connection_id != 0
+                || snapshot.owner_process != 0
+                || snapshot.endpoint_handle != 0
+                || snapshot.user_open != 0
+                || snapshot.kernel_references != 0
+                || snapshot.construction_references != 0
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            return Ok(None);
+        }
+        if opcode == opcode::LPC_OP_CLOSE_PORT_WITH_LIFETIME && snapshot.endpoint_handle != handle {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(Some(snapshot))
+    }
+
+    fn decode_endpoint_lifetime(
+        reply: LpcReply,
+        out: &[u8],
+    ) -> Result<nt_lpc_abi::LpcEndpointLifetime, NtStatus> {
+        NtStatus(reply.status).to_result()?;
+        if reply.information as usize != size_of::<nt_lpc_abi::LpcEndpointLifetime>() {
+            return Err(NtStatus::BUFFER_TOO_SMALL);
+        }
+        let snapshot: nt_lpc_abi::LpcEndpointLifetime =
+            bytemuck::try_pod_read_unaligned(out).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+        if snapshot.abi_size as usize != size_of::<nt_lpc_abi::LpcEndpointLifetime>()
+            || snapshot.user_open > 1
+            || snapshot.construction_references > 1
+            || !matches!(
+                snapshot.endpoint,
+                0 | nt_lpc_abi::handle_endpoint::CLIENT_COMM_PORT
+                    | nt_lpc_abi::handle_endpoint::SERVER_COMM_PORT
+            )
+            || (snapshot.endpoint != 0 && snapshot.connection_id == 0)
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(snapshot)
+    }
+
+    pub fn close_port_with_lifetime(
+        &mut self,
+        port_handle: u64,
+    ) -> Result<Option<nt_lpc_abi::LpcEndpointLifetime>, NtStatus> {
+        self.endpoint_transition(opcode::LPC_OP_CLOSE_PORT_WITH_LIFETIME, port_handle)
+    }
+
+    /// Close canonical user handles after the executive has authenticated process teardown.
+    /// Repetition after acknowledged completion is harmless; retained kernel references remain.
+    pub fn close_process_ports(&mut self, owner_process: u64) -> Result<u64, NtStatus> {
+        let request = nt_lpc_abi::LpcCloseProcessPortsRequest {
+            abi_size: size_of::<nt_lpc_abi::LpcCloseProcessPortsRequest>() as u16,
+            owner_process,
+            ..Default::default()
+        };
+        let reply = self.backend.call(
+            opcode::LPC_OP_CLOSE_PROCESS_PORTS,
+            bytemuck::bytes_of(&request),
+            &mut [],
+        );
+        NtStatus(reply.status).to_result()?;
+        Ok(reply.detail0)
+    }
+
+    pub fn release_port_object_with_lifetime(
+        &mut self,
+        retained: u64,
+    ) -> Result<Option<nt_lpc_abi::LpcEndpointLifetime>, NtStatus> {
+        self.endpoint_transition(opcode::LPC_OP_RELEASE_PORT_OBJECT_WITH_LIFETIME, retained)
+    }
+
+    /// Read exact canonical endpoint references; an unavailable/malformed response is not
+    /// deletion evidence. The snapshot itself holds no endpoint reference.
+    pub fn query_endpoint_lifetime(
+        &mut self,
+        connection_id: u64,
+        endpoint: u16,
+        owner_process: u64,
+    ) -> Result<nt_lpc_abi::LpcEndpointLifetime, NtStatus> {
+        let request = nt_lpc_abi::LpcEndpointLifetimeRequest {
+            abi_size: size_of::<nt_lpc_abi::LpcEndpointLifetimeRequest>() as u16,
+            endpoint,
+            connection_id,
+            owner_process,
+            ..Default::default()
+        };
+        let mut out = [0u8; size_of::<nt_lpc_abi::LpcEndpointLifetime>()];
+        let reply = self.backend.call(
+            opcode::LPC_OP_QUERY_ENDPOINT_LIFETIME,
+            bytemuck::bytes_of(&request),
+            &mut out,
+        );
+        let snapshot = Self::decode_endpoint_lifetime(reply, &out)?;
+        if snapshot.connection_id != connection_id
+            || snapshot.endpoint != endpoint
+            || snapshot.owner_process != owner_process
+            || endpoint == 0
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(snapshot)
+    }
+
     /// Acquire a broker-owned kernel endpoint referencing one live connection port. The returned
     /// handle is not a user handle and is released only through [`Self::release_connection_port`].
     pub fn retain_connection_port(&mut self, port_handle: u64) -> Result<u64, NtStatus> {
@@ -1034,6 +1155,96 @@ mod tests {
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()
+    }
+
+    #[test]
+    fn endpoint_snapshot_decoder_refuses_foreign_and_malformed_deletion_evidence() {
+        let valid = nt_lpc_abi::LpcEndpointLifetime {
+            abi_size: size_of::<nt_lpc_abi::LpcEndpointLifetime>() as u16,
+            endpoint: nt_lpc_abi::handle_endpoint::CLIENT_COMM_PORT,
+            connection_id: 7,
+            owner_process: 42,
+            endpoint_handle: 91,
+            ..Default::default()
+        };
+        for invalid in [
+            nt_lpc_abi::LpcEndpointLifetime {
+                owner_process: 43,
+                ..valid
+            },
+            nt_lpc_abi::LpcEndpointLifetime {
+                connection_id: 8,
+                ..valid
+            },
+            nt_lpc_abi::LpcEndpointLifetime {
+                endpoint: nt_lpc_abi::handle_endpoint::SERVER_COMM_PORT,
+                ..valid
+            },
+            nt_lpc_abi::LpcEndpointLifetime {
+                user_open: 2,
+                ..valid
+            },
+            nt_lpc_abi::LpcEndpointLifetime {
+                construction_references: 2,
+                ..valid
+            },
+            nt_lpc_abi::LpcEndpointLifetime {
+                abi_size: 0,
+                ..valid
+            },
+        ] {
+            let mut client = LpcClient::new(ImmediateBackend {
+                reply: LpcReply {
+                    status: 0,
+                    information: size_of::<nt_lpc_abi::LpcEndpointLifetime>() as u32,
+                    ..Default::default()
+                },
+                bytes: bytemuck::bytes_of(&invalid).to_vec(),
+            });
+            assert_eq!(
+                client.query_endpoint_lifetime(
+                    7,
+                    nt_lpc_abi::handle_endpoint::CLIENT_COMM_PORT,
+                    42
+                ),
+                Err(NtStatus::INVALID_PARAMETER)
+            );
+        }
+        let mut client = LpcClient::new(ImmediateBackend {
+            reply: LpcReply {
+                status: 0,
+                information: 1,
+                ..Default::default()
+            },
+            bytes: bytemuck::bytes_of(&valid).to_vec(),
+        });
+        assert_eq!(
+            client.query_endpoint_lifetime(7, nt_lpc_abi::handle_endpoint::CLIENT_COMM_PORT, 42),
+            Err(NtStatus::BUFFER_TOO_SMALL)
+        );
+    }
+
+    #[test]
+    fn close_snapshot_requires_the_actual_closed_endpoint_handle() {
+        let snapshot = nt_lpc_abi::LpcEndpointLifetime {
+            abi_size: size_of::<nt_lpc_abi::LpcEndpointLifetime>() as u16,
+            endpoint: nt_lpc_abi::handle_endpoint::CLIENT_COMM_PORT,
+            connection_id: 7,
+            endpoint_handle: 92,
+            ..Default::default()
+        };
+        let mut client = LpcClient::new(ImmediateBackend {
+            reply: LpcReply {
+                status: 0,
+                information: size_of::<nt_lpc_abi::LpcEndpointLifetime>() as u32,
+                ..Default::default()
+            },
+            bytes: bytemuck::bytes_of(&snapshot).to_vec(),
+        });
+        assert_eq!(
+            client.close_port_with_lifetime(91),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
     }
 
     #[test]

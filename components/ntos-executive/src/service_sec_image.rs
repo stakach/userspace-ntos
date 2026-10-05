@@ -572,8 +572,8 @@ const CURSORDATA_ACON_LIMIT: u32 = 1000;
 const DEFERRED_CALLBACK_RETURN_N: usize = nt_user_callback::MAX_CONTINUATION_DEPTH;
 static mut LPC_RECEIVE_WAITS: nt_lpc_continuation::ReceiveWaitTable<LpcReceiveContinuation> =
     nt_lpc_continuation::ReceiveWaitTable::new();
-static mut LPC_CONNECT_WAITS: nt_lpc_continuation::ConnectWaitTable<LpcConnectContinuation> =
-    nt_lpc_continuation::ConnectWaitTable::new();
+static mut LPC_CONNECT_WAITS: nt_lpc_continuation::ConnectWaitTable<LpcConnectContinuation, PendingLpcConnectCompletion> =
+    nt_lpc_continuation::ConnectWaitTable::with_completion_storage(16);
 static mut LPC_REQUEST_WAITS: nt_lpc_continuation::RequestWaitTable<LpcRequestContinuation> =
     nt_lpc_continuation::RequestWaitTable::new();
 static mut LPC_COMPONENT_WAITS: nt_lpc_continuation::BrokerRequestWaitTable<
@@ -809,6 +809,7 @@ pub(crate) unsafe fn lpc_request_wait_cancel_reservation(
 }
 
 pub(crate) unsafe fn lpc_connect_wait_reserve() -> Result<nt_lpc_continuation::Reservation, u32> {
+    let _durable = crate::allocator::enter_durable();
     (&mut *core::ptr::addr_of_mut!(LPC_CONNECT_WAITS))
         .reserve()
         .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
@@ -2864,6 +2865,13 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
     // serialized ownership barrier is the single convergence point for exact-generation final
     // process deletion; individual release sites may still make an eager attempt for low latency.
     let _ = nt_handler.drain_hosted_process_deletion_candidates();
+    {
+        let _message = unsafe { crate::ipc_message::SavedMessageBuffer::capture() };
+        unsafe {
+            nt_handler.retry_pending_section_view_rollbacks();
+            let _ = lpc_connect_completion_drain(nt_handler);
+        }
+    }
     nt_handler.drain_native_process_images();
     if let Some(ctx) = nt_handler.loop_ctx {
         if let Err(status) = unsafe {
@@ -11851,10 +11859,7 @@ pub(crate) unsafe fn service_sec_image(
                     lpc_request_wait_cancel_reservation(stale.reservation);
                     panic!("previous syscall leaked an LPC request continuation reservation");
                 }
-                assert!(
-                    nt_handler.lpc_connect_completion.is_none(),
-                    "previous syscall leaked an LPC connect completion"
-                );
+                let _ = lpc_connect_completion_drain(&mut nt_handler);
                 // ALPC last-mile item (a): NtAlpc* SSNs are registered in the dispatcher via this
                 // recognizer. DORMANT — `ALPC_HOST_PRESENT` is never set at boot (no ALPC binary
                 // yet), and the Win7 ALPC SSNs collide with the live ReactOS SSN space, so it can
@@ -12443,9 +12448,7 @@ pub(crate) unsafe fn service_sec_image(
                 if nt_handler.lpc_endpoint_progress {
                     let _ = lpc_endpoint_redrive_all(&mut nt_handler);
                 }
-                if let Some(completion) = nt_handler.lpc_connect_completion.take() {
-                    let _ = lpc_connect_wait_complete(&mut nt_handler, completion);
-                }
+                let _ = lpc_connect_completion_drain(&mut nt_handler);
                 // The hosted-exe lane reserved a spawn after validating the owner-local file ->
                 // section -> process transition in `exe_images`. The remaining per-image policy is
                 // the address-space descriptor; handle publication and ProcessManager wiring are
@@ -23732,11 +23735,25 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     woken
 }
 
+pub(crate) unsafe fn lpc_connect_completion_drain(nt_handler: &mut ExecNtHandler) -> usize {
+    let mut delivered = 0;
+    let pending = nt_handler.lpc_connect_completions.len();
+    for _ in 0..pending {
+        let Some(completion) = nt_handler.lpc_connect_completions.pop_front() else { break; };
+        if lpc_connect_wait_complete(nt_handler, completion) { delivered += 1; }
+    }
+    delivered
+}
+
 unsafe fn lpc_connect_wait_complete(
     nt_handler: &mut ExecNtHandler,
-    completion: PendingLpcConnectCompletion,
+    mut completion: PendingLpcConnectCompletion,
 ) -> bool {
-    let Some((slot, wait)) = (&*core::ptr::addr_of!(LPC_CONNECT_WAITS))
+    if completion.retained_refusal {
+        nt_handler.queue_lpc_connect_completion(completion);
+        return false;
+    }
+    let Some((_slot, wait)) = (&*core::ptr::addr_of!(LPC_CONNECT_WAITS))
         .find_connection(completion.connection_id)
         .map(|(slot, wait)| (slot, *wait))
     else {
@@ -23746,8 +23763,23 @@ unsafe fn lpc_connect_wait_complete(
         print_str(b" status=0x");
         print_hex(completion.status);
         print_str(b"\n");
+        completion.retained_refusal = true;
+        nt_handler.queue_lpc_connect_completion(completion);
         return false;
     };
+
+    let ticket = match (&mut *core::ptr::addr_of_mut!(LPC_CONNECT_WAITS))
+        .begin_completion(completion.connection_id, completion) {
+        Ok(ticket) => ticket,
+        Err((_, mut terminal)) => {
+            terminal.retained_refusal = true;
+            nt_handler.queue_lpc_connect_completion(terminal);
+            LPC_CONNECT_WAIT_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+    };
+    let completion = (&*core::ptr::addr_of!(LPC_CONNECT_WAITS)).completion(&ticket)
+        .expect("exact completion admission retains terminal data").view();
 
     let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
     let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
@@ -23813,17 +23845,22 @@ unsafe fn lpc_connect_wait_complete(
     nt_handler.current_user_memory = saved_user_memory;
     nt_handler.loop_ctx = saved_ctx;
 
-    let Some(completed) = (&mut *core::ptr::addr_of_mut!(LPC_CONNECT_WAITS)).take(slot) else {
+    if (&mut *core::ptr::addr_of_mut!(LPC_CONNECT_WAITS)).begin_reply(&ticket, status).is_err() {
         LPC_CONNECT_WAIT_FAILURES.fetch_add(1, Ordering::Relaxed);
         return false;
-    };
+    }
     let replied = reply_parked_syscall(
-        completed.continuation.reply_cap,
+        wait.continuation.reply_cap,
         status as u64,
     );
-    release_reply_pool_cap(completed.continuation.reply_cap);
-    thread_wait_state_clear_badge_ready(nt_handler, completed.continuation.badge);
     if replied {
+        let Some((completed, completion)) = (&mut *core::ptr::addr_of_mut!(LPC_CONNECT_WAITS))
+            .finish_reply(ticket, true) else {
+            LPC_CONNECT_WAIT_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        release_reply_pool_cap(completed.continuation.reply_cap);
+        thread_wait_state_clear_badge_ready(nt_handler, completed.continuation.badge);
         LPC_CONNECT_WAIT_WOKEN.fetch_add(1, Ordering::Relaxed);
         if status == nt_syscall::STATUS_SUCCESS && completed_csr_api_connect {
             CSR_AUTHENTIC_ACCEPTS.fetch_add(1, Ordering::Relaxed);
@@ -23851,16 +23888,18 @@ unsafe fn lpc_connect_wait_complete(
             }
         }
     } else {
+        let _ = (&mut *core::ptr::addr_of_mut!(LPC_CONNECT_WAITS)).finish_reply(ticket, false);
         LPC_CONNECT_WAIT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
     }
     print_str(b"[lpc-connect-wait] WAKE pi=");
-    print_u64(completed.continuation.pi as u64);
+    print_u64(wait.continuation.pi as u64);
     print_str(b" badge=");
-    print_u64(completed.continuation.badge);
+    print_u64(wait.continuation.badge);
     print_str(b" tid=");
-    print_u64(completed.continuation.tid);
+    print_u64(wait.continuation.tid);
     print_str(b" conn=");
-    print_u64(completed.request.connection_id);
+    print_u64(wait.request.connection_id);
     print_str(b" status=0x");
     print_hex(status);
     print_str(b" replied=");
@@ -23900,28 +23939,36 @@ pub(crate) unsafe fn lpc_connect_wait_abandon_thread(
     nt_handler: &mut ExecNtHandler,
     tid: u64,
 ) -> u64 {
-    let table = &mut *core::ptr::addr_of_mut!(LPC_CONNECT_WAITS);
     let mut abandoned = 0u64;
-    for slot in 0..table.slot_count() {
-        let Some(wait) = table.get(slot).copied() else {
+    let slots = (&*core::ptr::addr_of!(LPC_CONNECT_WAITS)).slot_count();
+    for slot in 0..slots {
+        let Some(wait) = (&*core::ptr::addr_of!(LPC_CONNECT_WAITS)).get(slot).copied() else {
             continue;
         };
         if wait.continuation.tid != tid {
             continue;
         }
-        let removed = table.take(slot).unwrap();
+        let ticket = match (&mut *core::ptr::addr_of_mut!(LPC_CONNECT_WAITS)).begin_cancel(wait.request.connection_id) {
+            Ok(ticket) => ticket,
+            Err(_) => continue,
+        };
+        let cap = wait.continuation.reply_cap;
+        let cancelled = cancel_parked_reply_transport(cap);
+        let Some(removed) = (&mut *core::ptr::addr_of_mut!(LPC_CONNECT_WAITS)).finish_cancel(ticket, cancelled) else {
+            continue;
+        };
         if let Some(client) = lpc_client() {
             let _ = client.accept_connect(removed.request.connection_id, false, 0);
         }
         nt_handler.abort_lpc_connection_views(removed.request.connection_id);
-        let cap = removed.continuation.reply_cap;
-        let cancelled = cancel_parked_reply_transport(cap);
-        if cancelled {
-            release_reply_pool_cap(cap);
-        }
+        release_reply_pool_cap(cap);
         abandoned += 1;
     }
-    if abandoned != 0 {
+    let still_owned = (0..(&*core::ptr::addr_of!(LPC_CONNECT_WAITS)).slot_count()).any(|slot| {
+        (&*core::ptr::addr_of!(LPC_CONNECT_WAITS)).get(slot)
+            .is_some_and(|wait| wait.continuation.tid == tid)
+    });
+    if abandoned != 0 && !still_owned {
         thread_wait_state_clear_tid(nt_handler, tid);
     }
     abandoned

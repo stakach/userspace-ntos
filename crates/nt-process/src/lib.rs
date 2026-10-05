@@ -38,6 +38,10 @@ mod object_directory_handle;
 mod routed_file_handle;
 pub mod process_object_retirement;
 pub mod thread_suspend;
+mod thread_termination_port;
+pub use thread_termination_port::{ThreadTerminationPortPhase, ThreadTerminationPortSnapshot, ThreadTerminationPortTicket};
+#[cfg(test)]
+mod thread_termination_port_tests;
 
 pub use initial_system::InitialSystemIdentity;
 pub use native_section_file_source::NativeSectionFileSource;
@@ -997,7 +1001,7 @@ pub struct NtThread {
     fresh_hosted_nonce: Option<u64>,
     /// LPC port objects referenced by `NtRegisterThreadTerminatePort`, in registration order.
     /// `PspExitThread` drains this as a stack, so duplicates intentionally remain distinct.
-    termination_ports: Vec<u64>,
+    termination_ports: Vec<thread_termination_port::ThreadTerminationPortRegistration>,
     /// Active impersonation context. The thread owns a token reference independently of the user
     /// handle that assigned it.
     impersonation: Option<ImpersonationContext>,
@@ -3513,39 +3517,6 @@ impl ProcessManager {
     }
 
     // --- termination + signalling (spec §12.3, §21) --------------------------
-
-    /// Attach a referenced LPC port object to the current ETHREAD. Registrations are intentionally
-    /// not deduplicated: NT allocates one termination record per call and later delivers them LIFO.
-    /// Capacity is reserved when the thread object is created so this mutation is safe under a
-    /// rewindable syscall allocator.
-    pub fn register_thread_termination_port(
-        &mut self,
-        tid: ThreadId,
-        port: u64,
-    ) -> Result<(), u32> {
-        if port == 0 {
-            return Err(STATUS_INVALID_HANDLE);
-        }
-        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
-        if thread.state == ThreadState::Terminated {
-            return Err(STATUS_THREAD_IS_TERMINATING);
-        }
-        if thread.termination_ports.len() == thread.termination_ports.capacity() {
-            return Err(STATUS_INSUFFICIENT_RESOURCES);
-        }
-        thread.termination_ports.push(port);
-        Ok(())
-    }
-
-    /// Remove the most recently registered termination port. Teardown calls this until `None`,
-    /// which both enforces native LIFO delivery and releases every retained registration exactly
-    /// once even when delivery itself fails.
-    pub fn pop_thread_termination_port(&mut self, tid: ThreadId) -> Result<Option<u64>, u32> {
-        self.threads
-            .get_mut(&tid)
-            .map(|thread| thread.termination_ports.pop())
-            .ok_or(STATUS_INVALID_HANDLE)
-    }
 
     /// `NtTerminateThread` (spec §21.1): set the exit status, mark terminated (signalled), and if
     /// this was the last non-system thread, initiate process exit.

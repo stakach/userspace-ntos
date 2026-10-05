@@ -31,6 +31,8 @@ mod allocator;
 mod component_heap;
 mod debug_traps;
 mod alpc_selftest;
+mod termination_port_notifications;
+use termination_port_notifications::notify_thread_termination_ports;
 pub(crate) use acpi_platform::*;
 mod cm_server;
 mod cm_key_ownership;
@@ -72,6 +74,7 @@ pub(crate) use service_sec_image::*;
 mod loader_trace_diag;
 pub(crate) use loader_trace_diag::*;
 mod exec_handler;
+use exec_handler::lpc_connection_views::PendingLpcConnectionViews;
 mod desktop_observation;
 use desktop_observation::{DesktopAcceptanceReport, DesktopGuiFact, DesktopLaunchContract, DesktopObservations};
 mod native_image_sections;
@@ -17818,66 +17821,6 @@ unsafe fn hosted_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
     thread_wait_state_clear_tid(handler, tid);
 }
 
-/// `PspExitThread` termination-port phase. Every registration owns one logical port reference and
-/// therefore produces one `LPC_CLIENT_DIED` message in reverse registration order. A dying thread
-/// cannot receive an error, so failed sends are diagnosed and the registration is still released.
-unsafe fn notify_thread_termination_ports(tid: u64, handler: &mut ExecNtHandler) {
-    let (process_id, create_time) = handler
-        .pm
-        .thread(tid as nt_process::ThreadId)
-        .map(|thread| (thread.process_id as u64, thread.create_time_100ns))
-        .unwrap_or((0, 0));
-    let mut message = nt_lpc_abi::client_died_message(create_time);
-    // `PspExitThread` leaves ClientId empty in its stack frame; `LpcRequestPort` stamps the current
-    // ETHREAD identity while moving the message into the port queue.
-    message[8..16].copy_from_slice(&process_id.to_le_bytes());
-    message[16..24].copy_from_slice(&tid.to_le_bytes());
-    loop {
-        let port = match handler
-            .pm
-            .pop_thread_termination_port(tid as nt_process::ThreadId)
-        {
-            Ok(Some(port)) => port,
-            Ok(None) | Err(_) => break,
-        };
-        let (status, csr_api_port) = match lpc_client() {
-            Some(lpc) => {
-                let csr_api_port = lpc
-                    .query_handle(port)
-                    .is_ok_and(|identity| lpc_name_is(&identity.name, b"\\windows\\apiport"));
-                let status = match lpc.request_port(port, &message) {
-                    Ok(()) => 0,
-                    Err(status) => status.raw() as u32,
-                };
-                (status, csr_api_port)
-            }
-            None => (0xC000_0001, false),
-        };
-        if status == 0 {
-            LPC_THREAD_TERMINATE_PORT_DELIVERIES.fetch_add(1, Ordering::Relaxed);
-            handler.lpc_endpoint_progress = true;
-            if csr_api_port {
-                CSR_KERNEL_MESSAGES_PENDING.fetch_add(1, Ordering::Relaxed);
-            }
-        } else {
-            LPC_THREAD_TERMINATE_PORT_DELIVERY_FAILURES.fetch_add(1, Ordering::Relaxed);
-            if LPC_THREAD_TERMINATE_PORT_FAILURE_TRACE.fetch_add(1, Ordering::Relaxed) < 16 {
-                print_str(b"[thread-term-port] delivery failed tid=");
-                print_u64(tid);
-                print_str(b" port=0x");
-                print_hex_u64(port);
-                print_str(b" status=0x");
-                print_hex(status);
-                print_str(b"\n");
-            }
-        }
-    }
-    // Termination post-actions run after the ordinary syscall-phase LPC redrive. Wake the generic
-    // broker waiters at this producer boundary so a queued client-died message cannot depend on a
-    // later, unrelated syscall for delivery to the real server worker.
-    let _ = crate::service_sec_image::lpc_endpoint_redrive_all(handler);
-}
-
 fn hosted_process_has_one_mechanism_left(
     pid: nt_process::ProcessId,
     handler: &ExecNtHandler,
@@ -22698,6 +22641,7 @@ struct PendingLpcConnectCompletion {
     status: u32,
     client_handle: u64,
     connection_information: alloc::vec::Vec<u8>,
+    retained_refusal: bool,
 }
 
 /// Allocation-safe handoff for a queued synchronous request. The broker has already assigned the
@@ -22758,57 +22702,6 @@ impl PendingWaitTimeout {
     }
 }
 
-/// Kernel-captured native `PORT_VIEW` and resolved section identity. The user buffer is retained
-/// only as an output destination; all input fields come from the captured bytes.
-#[derive(Clone, Copy)]
-struct CapturedLpcPortView {
-    pointer: u64,
-    native: [u8; nt_lpc_abi::PORT_VIEW_LEN],
-    section_index: usize,
-    section_offset: u64,
-    view_size: u64,
-}
-
-/// Kernel-captured native `REMOTE_PORT_VIEW` output descriptor.
-#[derive(Clone, Copy)]
-struct CapturedLpcRemoteView {
-    pointer: u64,
-    native: [u8; nt_lpc_abi::REMOTE_PORT_VIEW_LEN],
-}
-
-/// One offered section mapped into its owner and peer processes.
-#[derive(Clone, Copy)]
-struct MappedLpcPortView {
-    owner_view: Option<nt_memory_manager::GenericSectionView>,
-    peer_view: Option<nt_memory_manager::GenericSectionView>,
-    owner_base: u64,
-    peer_base: u64,
-    view_size: u64,
-}
-
-impl MappedLpcPortView {
-    fn abi(self) -> Option<nt_lpc_abi::MappedPortView> {
-        (self.owner_view.is_some() && self.peer_view.is_some()).then_some(nt_lpc_abi::MappedPortView {
-            owner_base: self.owner_base,
-            peer_base: self.peer_base,
-            view_size: self.view_size,
-        })
-    }
-}
-
-/// Kernel-owned connection-view transaction. A broker connection id, never an image role or a
-/// most-recent slot, is the durable identity across connect, accept, and complete.
-#[derive(Clone, Copy)]
-struct PendingLpcConnectionViews {
-    connection_id: u64,
-    aborting: bool,
-    connector_pi: usize,
-    connector_memory: SyscallUserMemory,
-    connector_view: Option<CapturedLpcPortView>,
-    connector_remote_view: Option<CapturedLpcRemoteView>,
-    connector_mapping: Option<MappedLpcPortView>,
-    acceptor_mapping: Option<MappedLpcPortView>,
-}
 
 #[derive(Clone)]
 pub(crate) struct CmSystemKeyTarget {
@@ -23004,7 +22897,7 @@ struct ExecNtHandler {
     /// object. Completion is keyed only by the broker-authored connection id.
     lpc_connect_park: Option<PendingLpcConnectPark>,
     /// Accepted, refused, or disconnected connect outcome waiting for exact connector copyout.
-    lpc_connect_completion: Option<PendingLpcConnectCompletion>,
+    lpc_connect_completions: alloc::collections::VecDeque<PendingLpcConnectCompletion>,
     /// Allocation-reserved synchronous request keyed by broker-authored message identity.
     lpc_request_park: Option<PendingLpcRequestPark>,
     /// The LPC broker changed in a way that can satisfy an ordinary receive or request waiter. The
@@ -26326,7 +26219,6 @@ static PM_TERMINATE_THREAD_TCB_RECLAIMED: AtomicU64 = AtomicU64::new(0);
 static LPC_THREAD_TERMINATE_PORT_REGISTRATIONS: AtomicU64 = AtomicU64::new(0);
 static LPC_THREAD_TERMINATE_PORT_DELIVERIES: AtomicU64 = AtomicU64::new(0);
 static LPC_THREAD_TERMINATE_PORT_DELIVERY_FAILURES: AtomicU64 = AtomicU64::new(0);
-static LPC_THREAD_TERMINATE_PORT_FAILURE_TRACE: AtomicU64 = AtomicU64::new(0);
 /// Successful current-thread terminations whose bound syscall Reply object was deleted without a
 /// send before the exact caller TCB was suspended/deleted. This is the non-return contract proof.
 static PM_TERMINATE_THREAD_NO_REPLY: AtomicU64 = AtomicU64::new(0);

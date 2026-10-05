@@ -159,44 +159,13 @@ in `extern-rootserver` mode (bring your own root task).
 The desktop target hosts **real, unmodified GPL ReactOS binaries** on rust-micro.
 Genuine Explorer and native acceptance are tracked in
 [issue #18](https://github.com/stakach/userspace-ntos/issues/18).
-[Earlier logon-rendering evidence](docs/evidence/issue18-bounded-source-logon.json)
-includes the credential dialog. After removing synthetic USER bindings, the latest
-[media-policy boot](docs/evidence/issue18-livecd-setup-file-admission-failure.json)
-launched genuine setup but failed a dependency File open. The fresh
-[File-capacity boot](docs/evidence/issue18-livecd-theme-helper-startup-failure.json)
-progressed into syssetup, then its theme helper faulted at startup. A subsequent
-[full USER-range boot](docs/evidence/issue18-livecd-rpcrt4-queued-fault-failure.json)
-exposed a queued image-fault race. After that fix, an
-[instrumented boot](docs/evidence/issue18-livecd-rundll-activation-frame-failure.json)
-ran genuine setup and rundll32 window callbacks, then rundll32 faulted in ntdll
-with activation-frame pointer `0xc0` after `WM_CREATE`. A subsequent
-[callback-restart boot](docs/evidence/issue18-native-leaf-revoke-cleanup-frontier.json)
-passed that frontier: the genuine helper completed its window callbacks and exited
-successfully. Native capability cleanup then progressed too slowly; the run was
-manually stopped after about 52 minutes, without a guest summary or sentinel.
-After the native leaf-revoke fix, a
-[font-profile boot](docs/evidence/issue18-client-frame-growth-allocation-failure.json)
-reached the genuine helper's client-thread setup, then refused a 3.75 MiB
-allocation during client-frame registration. It was manually stopped after about
-30 minutes without a guest verdict. With chunked frame storage, a subsequent
-[boot](docs/evidence/issue18-chunked-frame-boot-frontier.json) completed the theme
-helper's exit and retirement without an allocation-refusal diagnostic, then
-reached the natural gate at 218/261. Its screenshot still shows background and
-cursor only; font acceptance, Userinit/Explorer, and desktop rendering remain
-unproven. The [mapping-retirement boot](docs/evidence/issue18-frame-map-font-boot-frontier.json)
-also completed the helper's exit and retirement, then reported a directory-query
-allocation refusal and Setup's Plug and Play startup failure. It was stopped at
-that fatal boundary within the one-hour limit. Native mapping specifications
-pass separately. The [directory-scratch boot](docs/evidence/issue18-directory-scratch-font-boot-frontier.json)
-completed the genuine helper's exit and retirement without an allocation-refusal
-diagnostic, but Setup again failed starting Plug and Play. The guest was stopped
-at its fatal MessageBox within the one-hour limit. Current screenshot evidence
-remains background/cursor only; font cleanup and Explorer are not yet proven.
-The latest [canonical initial-thread boot](docs/evidence/issue18-canonical-initial-font-boot-frontier.json)
-proves correct main-thread admission after hosted-slot reuse and genuine helper
-exit/retirement, but Setup still fails starting Plug and Play. Its bounded run
-and strict font parser failed; the screenshot is background/cursor only.
-Crate CI does not prove desktop boot. To attempt a boot from a fresh clone:
+The latest [fresh-run receipt](docs/evidence/issue18-fresh-thread-font-frontier.json)
+proves strict win32k admission and genuine setup/helper execution, but ends at
+218/261 checks with an LPC connection blocked during setup. Its screenshot shows
+background and cursor, not a working desktop. Acceptance requires both strict
+native private-font cleanup and a separate fixture-free Userinit/Explorer boot
+with real callbacks, GDI drawing, logs and screenshots. Crate CI does not prove
+desktop boot. To attempt a boot from a fresh clone:
 
 ```sh
 git clone --recursive https://github.com/stakach/userspace-ntos.git

@@ -7493,8 +7493,13 @@ pub(crate) unsafe fn service_lpc_request() -> i32 {
         },
         LPC_SERVICE_RELEASE_PORT if message_len == 0 => match lpc_client() {
             Some(lpc) => lpc
-                .release_port_object(port_handle)
-                .map(|()| 0)
+                .release_port_object_with_lifetime(port_handle)
+                .map(|receipt| {
+                    if receipt.is_some_and(|receipt| receipt.is_deleted()) {
+                        crate::exec_handler::lpc_connection_views::note_reference_release();
+                    }
+                    0
+                })
                 .unwrap_or_else(|status| status.raw()),
             None => 0xC000_0001u32 as i32,
         },

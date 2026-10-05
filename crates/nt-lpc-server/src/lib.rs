@@ -144,6 +144,25 @@ impl Server {
                 self.op_receive(in_buf, out_buf)
             }
             opcode::LPC_OP_CLOSE_PORT => self.op_close_port(in_buf),
+            opcode::LPC_OP_CLOSE_PORT_WITH_LIFETIME => {
+                self.op_endpoint_close(in_buf, out_buf, false)
+            }
+            opcode::LPC_OP_RELEASE_PORT_OBJECT_WITH_LIFETIME => {
+                self.op_endpoint_close(in_buf, out_buf, true)
+            }
+            opcode::LPC_OP_QUERY_ENDPOINT_LIFETIME => self.op_endpoint_lifetime(in_buf, out_buf),
+            opcode::LPC_OP_CLOSE_PROCESS_PORTS => {
+                let req: nt_lpc_abi::LpcCloseProcessPortsRequest = read_req(in_buf)?;
+                if in_buf.len() != size_of::<nt_lpc_abi::LpcCloseProcessPortsRequest>()
+                    || usize::from(req.abi_size) != in_buf.len()
+                    || req._reserved != 0
+                    || req._reserved2 != 0
+                {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
+                let closed = self.core.close_process_ports(req.owner_process)?;
+                Ok(reply(NtStatus::SUCCESS, 0, closed, 0))
+            }
             // Message plane over the shared core. LPC carries no ALPC message attributes.
             opcode::LPC_OP_REQUEST_WAIT_REPLY => self.op_request_wait_reply(in_buf, out_buf),
             opcode::LPC_OP_REPLY_PORT => self.op_reply_port(in_buf),
@@ -246,6 +265,14 @@ impl Server {
         out_buf: &mut [u8],
     ) -> Result<LpcReply, NtStatus> {
         let req: LpcCompleteConnectRequest = read_req(buf)?;
+        let response_len = self
+            .core
+            .completion_response_info(req.connection_id)
+            .ok_or(NtStatus::INVALID_PARAMETER)?
+            .len();
+        if response_len > out_buf.len() {
+            return Err(NtStatus::BUFFER_TOO_SMALL);
+        }
         let (client_handle, conn_id) = self.core.complete(req.connection_id)?;
         let response_info = self
             .core
@@ -567,8 +594,85 @@ impl Server {
 
     fn op_close_port(&mut self, buf: &[u8]) -> Result<LpcReply, NtStatus> {
         let req: LpcClosePortRequest = read_req(buf)?;
-        self.core.close_port(req.port_handle);
+        self.core.close_port_checked(req.port_handle)?;
         Ok(ok())
+    }
+
+    fn write_endpoint_lifetime(
+        snapshot: Option<nt_port_core::PortEndpointLifetime>,
+        out: &mut [u8],
+    ) -> Result<LpcReply, NtStatus> {
+        let mut response = nt_lpc_abi::LpcEndpointLifetime {
+            abi_size: size_of::<nt_lpc_abi::LpcEndpointLifetime>() as u16,
+            ..Default::default()
+        };
+        if let Some(snapshot) = snapshot {
+            response.endpoint = match snapshot.endpoint {
+                PortHandleEndpoint::ClientCommPort => handle_endpoint::CLIENT_COMM_PORT,
+                PortHandleEndpoint::ServerCommPort => handle_endpoint::SERVER_COMM_PORT,
+                PortHandleEndpoint::ListenPort => return Err(NtStatus::INVALID_PARAMETER),
+            };
+            response.connection_id = snapshot.connection_id;
+            response.owner_process = snapshot.owner_process;
+            response.endpoint_handle = snapshot.endpoint_handle;
+            response.user_open = u32::from(snapshot.user_open);
+            response.kernel_references = snapshot.kernel_references;
+            response.construction_references = snapshot.construction_references;
+        }
+        let bytes = bytemuck::bytes_of(&response);
+        if out.len() < bytes.len() {
+            return Err(NtStatus::BUFFER_TOO_SMALL);
+        }
+        out[..bytes.len()].copy_from_slice(bytes);
+        Ok(reply(NtStatus::SUCCESS, bytes.len() as u32, 0, 0))
+    }
+
+    fn op_endpoint_close(
+        &mut self,
+        buf: &[u8],
+        out: &mut [u8],
+        release: bool,
+    ) -> Result<LpcReply, NtStatus> {
+        let req: LpcClosePortRequest = read_req(buf)?;
+        if buf.len() != size_of::<LpcClosePortRequest>()
+            || usize::from(req.abi_size) != buf.len()
+            || req._reserved != 0
+            || req._reserved2 != 0
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        // Output capacity is checked before the reference transition.
+        if out.len() < size_of::<nt_lpc_abi::LpcEndpointLifetime>() {
+            return Err(NtStatus::BUFFER_TOO_SMALL);
+        }
+        let snapshot = if release {
+            self.core
+                .release_port_object_with_lifetime(req.port_handle)?
+        } else {
+            self.core.close_port_checked(req.port_handle)?
+        };
+        Self::write_endpoint_lifetime(snapshot, out)
+    }
+
+    fn op_endpoint_lifetime(&mut self, buf: &[u8], out: &mut [u8]) -> Result<LpcReply, NtStatus> {
+        let req: nt_lpc_abi::LpcEndpointLifetimeRequest = read_req(buf)?;
+        if buf.len() != size_of::<nt_lpc_abi::LpcEndpointLifetimeRequest>()
+            || usize::from(req.abi_size) != buf.len()
+            || req._reserved != 0
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let endpoint = match req.endpoint {
+            handle_endpoint::CLIENT_COMM_PORT => PortHandleEndpoint::ClientCommPort,
+            handle_endpoint::SERVER_COMM_PORT => PortHandleEndpoint::ServerCommPort,
+            _ => return Err(NtStatus::INVALID_PARAMETER),
+        };
+        let snapshot = self.core.communication_endpoint_lifetime(
+            req.connection_id,
+            endpoint,
+            req.owner_process,
+        )?;
+        Self::write_endpoint_lifetime(Some(snapshot), out)
     }
 
     fn op_retain_connection_port(&mut self, buf: &[u8]) -> Result<LpcReply, NtStatus> {
@@ -1233,7 +1337,7 @@ mod tests {
             let r = c.connect_port(&utf16("\\P"), 0, &[]).unwrap();
             (ph, r.connection_id)
         };
-        let sh = {
+        let (sh, client_h) = {
             let mut c = LpcClient::new(Direct {
                 server: &mut s,
                 out: [0; 512],
@@ -1242,10 +1346,8 @@ mod tests {
             let sh = c.accept_connect(cid, true, 0).unwrap();
             let ch = c.complete_connect(cid).unwrap().handle;
             assert_ne!(ch, 0);
-            sh
+            (sh, ch)
         };
-        // The client comm-port handle: a re-complete returns it (idempotent).
-        let (client_h, _) = s.core_mut().complete(cid).unwrap();
 
         // Client sends a synchronous request. The adapter owns its header identity.
         let message = port_message(msg_type::LPC_REQUEST, b"ping");
@@ -1457,6 +1559,385 @@ mod tests {
                 b"response"
             );
         }
+    }
+
+    #[test]
+    fn close_port_refuses_invalid_and_stale_handles_over_actual_wire() {
+        let mut server = Server::new();
+        let mut client = LpcClient::new(Direct {
+            server: &mut server,
+            out: [0; 512],
+        });
+        assert_eq!(
+            client.close_port(u64::MAX),
+            Err(NtStatus::INVALID_PORT_HANDLE)
+        );
+        let listen = client
+            .create_port(&utf16("\\CloseLifetime"), 0, 0x148, 0)
+            .unwrap();
+        client.close_port(listen).unwrap();
+        assert_eq!(
+            client.close_port(listen),
+            Err(NtStatus::INVALID_PORT_HANDLE)
+        );
+    }
+
+    #[test]
+    fn endpoint_lifetime_wire_preserves_independent_peers_and_final_kernel_reference() {
+        let mut server = Server::new();
+        server.set_accept_policy(AcceptPolicy::Manual);
+        let mut client = LpcClient::new(Direct {
+            server: &mut server,
+            out: [0; 512],
+        });
+        let name = utf16("\\EndpointLifetime");
+        let listen = client.create_port(&name, 0, 0x148, 0).unwrap();
+        let pending = client
+            .connect_port_with_client_id(&name, 0, &[], 42, 43)
+            .unwrap();
+        let id = pending.connection_id;
+        let before = client
+            .query_endpoint_lifetime(id, handle_endpoint::CLIENT_COMM_PORT, 42)
+            .unwrap();
+        assert_eq!(before.construction_references, 1);
+        assert!(!before.is_deleted());
+        client.reply_wait_receive(listen).unwrap();
+        let server_handle = client.accept_connect(id, true, 0).unwrap();
+        let connector = client.complete_connect(id).unwrap().handle;
+        let server_owner = client.query_handle(server_handle).unwrap().server_process;
+        let first = client.retain_port_object(connector).unwrap();
+        let second = client.retain_port_object(connector).unwrap();
+        assert_eq!(client.close_port(first), Err(NtStatus::INVALID_PORT_HANDLE));
+        let closed = client.close_port_with_lifetime(connector).unwrap().unwrap();
+        assert_eq!(closed.kernel_references, 2);
+        assert!(!closed.is_deleted());
+        assert!(client
+            .query_endpoint_lifetime(id, handle_endpoint::CLIENT_COMM_PORT, 99)
+            .is_err());
+        assert!(!client
+            .query_endpoint_lifetime(id, handle_endpoint::SERVER_COMM_PORT, server_owner)
+            .unwrap()
+            .is_deleted());
+        assert_eq!(
+            client
+                .release_port_object_with_lifetime(first)
+                .unwrap()
+                .unwrap()
+                .kernel_references,
+            1
+        );
+        assert_eq!(
+            client.release_port_object_with_lifetime(first),
+            Err(NtStatus::INVALID_PORT_HANDLE)
+        );
+        assert!(client
+            .release_port_object_with_lifetime(second)
+            .unwrap()
+            .unwrap()
+            .is_deleted());
+        assert!(client
+            .close_port_with_lifetime(server_handle)
+            .unwrap()
+            .unwrap()
+            .is_deleted());
+        assert!(client
+            .query_endpoint_lifetime(id, handle_endpoint::SERVER_COMM_PORT, server_owner)
+            .unwrap()
+            .is_deleted());
+        assert_eq!(client.close_process_ports(42), Ok(0));
+    }
+
+    #[test]
+    fn endpoint_transition_checks_output_capacity_before_closing_handle() {
+        let mut server = Server::new();
+        let listen = server
+            .core
+            .create_port(&utf16("\\OutputRefusal"), PortApi::Lpc);
+        let request = LpcClosePortRequest {
+            abi_size: size_of::<LpcClosePortRequest>() as u16,
+            port_handle: listen,
+            ..Default::default()
+        };
+        assert_eq!(
+            server.op_endpoint_close(bytemuck::bytes_of(&request), &mut [], false),
+            Err(NtStatus::BUFFER_TOO_SMALL)
+        );
+        assert!(server.core.handle_info(listen).is_some());
+    }
+
+    #[test]
+    fn accepted_server_close_deletes_unpublished_connector_without_reopening() {
+        let mut server = Server::new();
+        server.set_accept_policy(AcceptPolicy::Manual);
+        let mut client = LpcClient::new(Direct {
+            server: &mut server,
+            out: [0; 512],
+        });
+        let name = utf16("\\AcceptRollback");
+        let listen = client.create_port(&name, 0, 0x148, 0).unwrap();
+        for _ in 0..4 {
+            let id = client
+                .connect_port_with_client_id(&name, 0, &[], 42, 43)
+                .unwrap()
+                .connection_id;
+            client.reply_wait_receive(listen).unwrap();
+            let accepted = client.accept_connect(id, true, 0).unwrap();
+            assert!(!client
+                .query_endpoint_lifetime(id, handle_endpoint::CLIENT_COMM_PORT, 42)
+                .unwrap()
+                .is_deleted());
+            assert!(client
+                .close_port_with_lifetime(accepted)
+                .unwrap()
+                .unwrap()
+                .is_deleted());
+            let deleted = client
+                .query_endpoint_lifetime(id, handle_endpoint::CLIENT_COMM_PORT, 42)
+                .unwrap();
+            assert_eq!(deleted.endpoint_handle, 0);
+            assert!(deleted.is_deleted());
+            assert_eq!(
+                client.complete_connect(id),
+                Err(NtStatus::INVALID_PARAMETER)
+            );
+            assert_eq!(
+                client.accept_connect(id, true, 0),
+                Err(NtStatus::INVALID_PARAMETER)
+            );
+            assert_eq!(
+                client
+                    .query_endpoint_lifetime(id, handle_endpoint::CLIENT_COMM_PORT, 42)
+                    .unwrap(),
+                deleted
+            );
+        }
+    }
+
+    #[test]
+    fn process_port_drain_is_idempotent_over_actual_wire() {
+        let mut server = Server::new();
+        server.set_accept_policy(AcceptPolicy::Manual);
+        let mut client = LpcClient::new(Direct {
+            server: &mut server,
+            out: [0; 512],
+        });
+        let name = utf16("\\ProcessDrain");
+        let listen = client.create_port(&name, 0, 0x148, 0).unwrap();
+        let id = client
+            .connect_port_with_client_id(&name, 0, &[], 42, 43)
+            .unwrap()
+            .connection_id;
+        client.reply_wait_receive(listen).unwrap();
+        let server_handle = client.accept_connect(id, true, 0).unwrap();
+        let connector = client.complete_connect(id).unwrap().handle;
+        let retained = client.retain_port_object(connector).unwrap();
+        assert_eq!(
+            client.close_process_ports(0),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert_eq!(client.close_process_ports(42), Ok(1));
+        assert_eq!(client.close_process_ports(42), Ok(0));
+        assert!(client.query_handle(connector).is_err());
+        assert!(client.query_handle(server_handle).is_ok());
+        assert!(!client
+            .query_endpoint_lifetime(id, handle_endpoint::CLIENT_COMM_PORT, 42)
+            .unwrap()
+            .is_deleted());
+        assert!(client
+            .release_port_object_with_lifetime(retained)
+            .unwrap()
+            .unwrap()
+            .is_deleted());
+    }
+
+    #[test]
+    fn complete_output_refusal_preserves_accepted_endpoint_for_valid_retry() {
+        let mut server = Server::new();
+        server.set_accept_policy(AcceptPolicy::Manual);
+        let name = utf16("\\CompletePreflight");
+        server.core.create_port(&name, PortApi::Lpc);
+        let id = match server
+            .core
+            .connect_with_client_id(
+                &name,
+                PortApi::Lpc,
+                0,
+                b"response",
+                ClientId {
+                    process: 42,
+                    thread: 43,
+                },
+            )
+            .unwrap()
+        {
+            ConnectOutcome::Pending { connection_id } => connection_id,
+            _ => panic!("manual connection"),
+        };
+        let accepted = server.core.accept(id, true, 0).unwrap();
+        let request = LpcCompleteConnectRequest {
+            abi_size: size_of::<LpcCompleteConnectRequest>() as u16,
+            connection_id: accepted,
+            ..Default::default()
+        };
+        let before = server
+            .core
+            .communication_endpoint_lifetime(id, PortHandleEndpoint::ClientCommPort, 42)
+            .unwrap();
+        assert!(!before.user_open);
+        assert_eq!(
+            server
+                .dispatch(
+                    opcode::LPC_OP_COMPLETE_CONNECT,
+                    bytemuck::bytes_of(&request),
+                    &mut [0; 1]
+                )
+                .status,
+            NtStatus::BUFFER_TOO_SMALL.raw()
+        );
+        assert_eq!(
+            server
+                .core
+                .communication_endpoint_lifetime(id, PortHandleEndpoint::ClientCommPort, 42)
+                .unwrap(),
+            before,
+            "output refusal must not publish the connector endpoint"
+        );
+        assert_eq!(server.core.connection_state(id), Some(ConnState::Accepted));
+        let mut out = [0; 8];
+        let completed = server.dispatch(
+            opcode::LPC_OP_COMPLETE_CONNECT,
+            bytemuck::bytes_of(&request),
+            &mut out,
+        );
+        assert_eq!(completed.status, 0);
+        assert_ne!(completed.detail0, 0);
+        assert_eq!(&out, b"response");
+    }
+
+    #[test]
+    fn endpoint_mutations_refuse_noncanonical_wire_headers_before_effects() {
+        for op in [
+            opcode::LPC_OP_CLOSE_PORT_WITH_LIFETIME,
+            opcode::LPC_OP_RELEASE_PORT_OBJECT_WITH_LIFETIME,
+            opcode::LPC_OP_CLOSE_PROCESS_PORTS,
+        ] {
+            for malformed in 0..4 {
+                let mut server = Server::new();
+                let listen = server.core.create_port_with_owner(
+                    &utf16("\\HeaderRefusal"),
+                    PortApi::Lpc,
+                    ClientId {
+                        process: 42,
+                        thread: 43,
+                    },
+                );
+                let retained = server.core.retain_connection_port(listen).unwrap();
+                let handle = if op == opcode::LPC_OP_RELEASE_PORT_OBJECT_WITH_LIFETIME {
+                    retained
+                } else {
+                    listen
+                };
+                let mut bytes = if op == opcode::LPC_OP_CLOSE_PROCESS_PORTS {
+                    bytemuck::bytes_of(&nt_lpc_abi::LpcCloseProcessPortsRequest {
+                        abi_size: size_of::<nt_lpc_abi::LpcCloseProcessPortsRequest>() as u16,
+                        owner_process: 42,
+                        ..Default::default()
+                    })
+                    .to_vec()
+                } else {
+                    bytemuck::bytes_of(&LpcClosePortRequest {
+                        abi_size: size_of::<LpcClosePortRequest>() as u16,
+                        port_handle: handle,
+                        ..Default::default()
+                    })
+                    .to_vec()
+                };
+                match malformed {
+                    0 => bytes[0..2].copy_from_slice(&0u16.to_le_bytes()),
+                    1 => bytes[2..4].copy_from_slice(&1u16.to_le_bytes()),
+                    2 => bytes[4..8].copy_from_slice(&1u32.to_le_bytes()),
+                    _ => bytes.push(0),
+                }
+                let response = server.dispatch(op, &bytes, &mut [0; 40]);
+                assert_eq!(
+                    response.status,
+                    NtStatus::INVALID_PARAMETER.raw(),
+                    "opcode {op:x}, malformed {malformed}"
+                );
+                assert!(server.core.handle_info(listen).is_some());
+                assert!(server.core.handle_info(retained).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn retained_client_died_listen_datagram_survives_sender_reference_release() {
+        let mut server = Server::new();
+        let mut client = LpcClient::new(Direct {
+            server: &mut server,
+            out: [0; 512],
+        });
+        let listen = client
+            .create_port(&utf16("\\ListenDeath"), 0, 0x148, 0)
+            .unwrap();
+        let retained = client.retain_port_object(listen).unwrap();
+        let message = nt_lpc_abi::client_died_message(0x1234);
+        client
+            .retained_request_port(retained, &message, 42, 43)
+            .unwrap();
+        client.release_port_object(retained).unwrap();
+        let received = client.reply_wait_receive(listen).expect("acknowledged datagram is owned by the receiving port, not the released sender reference");
+        assert_eq!(received.msg_type, msg_type::LPC_CLIENT_DIED);
+        assert_eq!(received.client_process, 42);
+        assert_eq!(received.client_thread, 43);
+        assert_eq!(
+            &received.connection_info[nt_lpc_abi::PORT_MESSAGE_HEADER_LEN..],
+            &0x1234u64.to_le_bytes()
+        );
+        assert_eq!(client.reply_wait_receive(listen), Err(NtStatus::PENDING));
+    }
+
+    #[test]
+    fn retained_client_died_communication_datagram_survives_final_sender_deletion() {
+        let mut server = Server::new();
+        server.set_accept_policy(AcceptPolicy::Manual);
+        let mut client = LpcClient::new(Direct {
+            server: &mut server,
+            out: [0; 512],
+        });
+        let name = utf16("\\CommunicationDeath");
+        let listen = client.create_port(&name, 0, 0x148, 0).unwrap();
+        let id = client
+            .connect_port_with_client_id(&name, 0, &[], 42, 43)
+            .unwrap()
+            .connection_id;
+        client.reply_wait_receive(listen).unwrap();
+        let accepted = client.accept_connect(id, true, 0x9876).unwrap();
+        let connector = client.complete_connect(id).unwrap().handle;
+        let retained = client.retain_port_object(connector).unwrap();
+        client.close_port(connector).unwrap();
+        let message = nt_lpc_abi::client_died_message(0x1234);
+        client
+            .retained_request_port(retained, &message, 42, 43)
+            .unwrap();
+        client.release_port_object(retained).unwrap();
+        assert!(client
+            .query_endpoint_lifetime(id, handle_endpoint::CLIENT_COMM_PORT, 42)
+            .unwrap()
+            .is_deleted());
+        let received = client
+            .reply_wait_receive(listen)
+            .expect("server-owned committed datagram survives deletion of its sender");
+        assert_eq!(received.msg_type, msg_type::LPC_CLIENT_DIED);
+        assert_eq!(received.client_process, 42);
+        assert_eq!(received.client_thread, 43);
+        assert_eq!(received.port_context, 0x9876);
+        assert_eq!(
+            &received.connection_info[nt_lpc_abi::PORT_MESSAGE_HEADER_LEN..],
+            &0x1234u64.to_le_bytes()
+        );
+        assert_eq!(client.reply_wait_receive(listen), Err(NtStatus::PENDING));
+        client.close_port(accepted).unwrap();
     }
 
     #[test]
