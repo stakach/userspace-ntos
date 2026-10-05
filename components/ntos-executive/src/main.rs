@@ -11516,7 +11516,9 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
         );
         return;
     }
-    if let Err(status) = vm_ensure_private_pt(handler, pi, page, pml4) {
+    if let Err(status) = hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)
+        .and_then(|()| ensure_process_user_page_table(handler, pi, page, pml4))
+    {
         finish_mapped_section_writecopy_cow_selftest(
             handler,
             process,
@@ -11896,7 +11898,9 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(
         );
         return;
     }
-    if let Err(status) = vm_ensure_private_pt(handler, pi, page, pml4) {
+    if let Err(status) = hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)
+        .and_then(|()| ensure_process_user_page_table(handler, pi, page, pml4))
+    {
         finish_image_writecopy_cow_selftest(handler, process, pi, page, source_frame, loose_map_cap, proof, status);
         return;
     }
@@ -12168,19 +12172,6 @@ fn vm_page_rights(protection: u32) -> u64 {
     } else {
         2
     }) | if executable { 0 } else { PAGE_EXECUTE_NEVER }
-}
-
-unsafe fn vm_ensure_private_pt(
-    handler: &mut ExecNtHandler,
-    pi: usize,
-    page: u64,
-    pml4: u64,
-) -> Result<(), u32> {
-    hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
-    page.checked_sub(SMSS_ALLOC_VA)
-        .filter(|offset| *offset < PRIVATE_VM_LIMIT - SMSS_ALLOC_VA)
-        .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?;
-    ensure_process_user_page_table(handler, pi, page, pml4).map(|_| ())
 }
 
 pub(crate) unsafe fn ensure_process_user_page_table(
@@ -12757,7 +12748,9 @@ unsafe fn vm_promote_mapped_cow_page(
         None
     };
 
-    if let Err(status) = vm_ensure_private_pt(handler, pi, page, pml4) {
+    if let Err(status) = hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)
+        .and_then(|()| ensure_process_user_page_table(handler, pi, page, pml4))
+    {
         restore_old_mapped_mapping(pi, lifetime, page, old_mapping, retained_alias, old_protection, pml4);
         vm_frame_release(new_frame, 0);
         return Err(status);

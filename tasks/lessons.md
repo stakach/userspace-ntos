@@ -578,3 +578,10 @@ diagnosis-free failure.
 - Definitive no-enqueue refusal is a terminal state, not successful delivery and
   not permanent uncertainty. Retain the reference until its separate release ACK;
   missing or malformed outcomes remain owned and must not be replayed.
+
+## Scratch Addresses Are Not Test Ownership
+- Moving a destructive native selftest to a real user's mapping geometry also
+  requires exact vacant-VAD acquisition and owned cleanup. Process identity
+  alone does not authorize unmapping an arbitrary test address.
+- Exercise an actual extracted native boundary for the focused regression when
+  no safe native test reservation exists; do not call host execution native proof.

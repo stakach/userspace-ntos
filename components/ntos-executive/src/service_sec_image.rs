@@ -3156,7 +3156,8 @@ pub(crate) unsafe fn service_generic_section_fault(
         )?;
         return Ok(GenericSectionFaultResult::Mapped);
     }
-    vm_ensure_private_pt(nt_handler, pi, page, pml4)?;
+    hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
+    ensure_process_user_page_table(nt_handler, pi, page, pml4)?;
     if fault_plan.mark_dirty {
         generic_section_mark_dirty_if_backed(&mut *generic_sections, section_index, section, page_index)?;
     }
