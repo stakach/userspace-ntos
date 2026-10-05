@@ -161,13 +161,18 @@ progressed into syssetup, then its theme helper faulted at startup. A subsequent
 exposed a queued image-fault race. After that fix, an
 [instrumented boot](docs/evidence/issue18-livecd-rundll-activation-frame-failure.json)
 ran genuine setup and rundll32 window callbacks, then rundll32 faulted in ntdll
-with activation-frame pointer `0xc0` after `WM_CREATE`. The latest
+with activation-frame pointer `0xc0` after `WM_CREATE`. A subsequent
 [callback-restart boot](docs/evidence/issue18-native-leaf-revoke-cleanup-frontier.json)
 passed that frontier: the genuine helper completed its window callbacks and exited
 successfully. Native capability cleanup then progressed too slowly; the run was
 manually stopped after about 52 minutes, without a guest summary or sentinel.
-Its screenshot still shows background and cursor only. Font acceptance,
-Userinit/Explorer, and desktop rendering remain unproven.
+After the native leaf-revoke fix, the latest
+[font-profile boot](docs/evidence/issue18-client-frame-growth-allocation-failure.json)
+reached the genuine helper's client-thread setup, then refused a 3.75 MiB
+allocation during client-frame registration. It was manually stopped after about
+30 minutes without a guest verdict. Its screenshot still shows background and
+cursor only. Font acceptance, Userinit/Explorer, and desktop rendering remain
+unproven.
 Crate CI does not prove desktop boot. To attempt a boot from a fresh clone:
 
 ```sh
