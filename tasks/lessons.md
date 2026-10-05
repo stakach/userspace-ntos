@@ -554,3 +554,10 @@ diagnosis-free failure.
 - Return the shared mounted registry state to every caller. Do not fabricate
   setup phases by executable identity or perform user-mode setup transitions in
   kernel bootstrap; implement the NT APIs the real setup process invokes.
+
+## Finish The Requested Acceptance Scope
+- When the user requests completion of a named issue, verified refactors are
+  intermediate increments, not a stopping point. Continue through its remaining
+  implementation and acceptance, including fresh native or desktop evidence.
+- Close the issue only after its actual checklist is proven. Keep source tests,
+  crate tests, native builds and desktop proof distinct throughout the work.

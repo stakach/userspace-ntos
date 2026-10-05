@@ -8273,7 +8273,7 @@ pub(crate) unsafe fn service_sec_image(
     nt_handler.capture_desktop_launch_contract();
     #[cfg(not(feature = "mup-provider-kernel-only"))]
     {
-        let resume_error = tcb_resume_r(main_tcb);
+        let resume_error = nt_handler.start_configured_initial_thread(primary_pi, main_tcb);
         if resume_error != 0 {
             print_str(b"[thread-life] primary resume after service init failed pi=");
             print_u64(primary_pi as u64);
@@ -8281,7 +8281,7 @@ pub(crate) unsafe fn service_sec_image(
             print_hex((main_tcb >> 32) as u32);
             print_hex(main_tcb as u32);
             print_str(b" error=");
-            print_u64(resume_error);
+            print_u64(u64::from(resume_error));
             print_str(b"\n");
             panic!("primary hosted process resume failed");
         }
@@ -21248,7 +21248,11 @@ pub(crate) unsafe fn service_sec_image(
             // This process HAS its initial thread, so a foreign-handle create is a genuine
             // ADDITIONAL thread — the real cross-VSpace path (exactly the live rule).
             if target_registered {
-                PM_INITIAL_THREAD_DONE.fetch_or(1u64 << test_pi, Ordering::Relaxed);
+                let plan = nt_handler.pm.prepare_initial_thread_creation(target)
+                    .expect("debugger fixture reserves its exact initial thread")
+                    .expect("debugger fixture has a fresh initial thread");
+                nt_handler.pm.commit_initial_thread_creation(&plan)
+                    .expect("debugger fixture retains its published initial thread");
             }
 
             let h_target = nt_handler
@@ -21786,7 +21790,6 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.clear_temporary_pool_thread_slot(test_pi, 0);
                 assert!(nt_handler.release_temporary_process_slot(claim),
                     "debugger fixture releases its temporary process slot");
-                PM_INITIAL_THREAD_DONE.fetch_and(!(1u64 << test_pi), Ordering::Relaxed);
             }
             if let Some(previous) = saved_target_proc {
                 if let Some(accounting) = nt_handler.process_commit.accounting(target) {

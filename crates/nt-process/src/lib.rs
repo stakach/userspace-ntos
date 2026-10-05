@@ -23,6 +23,8 @@ pub mod dbgk;
 pub mod job;
 pub mod job_abi;
 mod initial_system;
+mod initial_thread_creation;
+pub use initial_thread_creation::InitialThreadCreationPlan;
 pub mod native_handle;
 pub mod native_handle_search;
 mod native_section_file_source;
@@ -674,6 +676,7 @@ pub struct NtProcess {
     pub image_section: Option<SectionId>,
     pub threads: ThreadIdSet,
     pub main_thread: Option<ThreadId>,
+    initial_creation: initial_thread_creation::InitialThreadCreationState,
     pub state: ProcessState,
     pub exit_status: Option<u32>,
     /// Dispatcher references held by parked waits independently of user handles.
@@ -1301,6 +1304,7 @@ impl ProcessManager {
                 image_section,
                 threads: ThreadIdSet::new(),
                 main_thread: None,
+                initial_creation: initial_thread_creation::InitialThreadCreationState::Unclaimed,
                 state,
                 exit_status: None,
                 wait_references: 0,
@@ -1441,7 +1445,7 @@ impl ProcessManager {
     /// caller. External handle owners must release their references and empty the new handle table
     /// first; Ps then removes job membership and the private process record.
     pub fn abort_process_creation(&mut self, pid: ProcessId) -> Option<ProcessObjectDeletion> {
-        if self.has_process_suspend_control(pid) {
+        if self.has_process_suspend_control(pid) || self.has_initial_thread_creation_pending(pid) {
             return None;
         }
         let Some(process) = self.processes.get(&pid) else {
@@ -3211,6 +3215,7 @@ impl ProcessManager {
         self.thread(tid).is_some_and(|thread| {
             thread.state == ThreadState::Terminated
                 && thread.pending_suspend_control.is_none()
+                && !self.has_initial_thread_creation_pending_for(tid)
                 && thread.wait_references == 0
                 && thread.kernel_pointer_references == 0
                 && thread.termination_ports.is_empty()
@@ -3235,7 +3240,7 @@ impl ProcessManager {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let thread = self.threads.get(&tid).ok_or(STATUS_INVALID_HANDLE)?;
-        if thread.pending_suspend_control.is_some() {
+        if thread.pending_suspend_control.is_some() || self.has_initial_thread_creation_pending_for(tid) {
             return Err(STATUS_DEVICE_BUSY);
         }
         let process = self
@@ -3327,7 +3332,7 @@ impl ProcessManager {
         activation_handle: Option<HandleReservation>,
     ) -> Result<(), u32> {
         let current = self.threads.get(&plan.tid).ok_or(STATUS_INVALID_HANDLE)?;
-        if current.pending_suspend_control.is_some() {
+        if current.pending_suspend_control.is_some() || self.has_initial_thread_creation_pending_for(plan.tid) {
             return Err(STATUS_DEVICE_BUSY);
         }
         if current.process_id != plan.process_id
@@ -3588,7 +3593,7 @@ impl ProcessManager {
         exit_time_100ns: i64,
     ) -> Result<(), u32> {
         let target = self.threads.get(&tid).ok_or(STATUS_INVALID_HANDLE)?;
-        if target.pending_suspend_control.is_some() {
+        if target.pending_suspend_control.is_some() || self.has_initial_thread_creation_pending_for(tid) {
             return Err(STATUS_DEVICE_BUSY);
         }
         // The last user-thread exit cascades into process termination. Check that boundary before
@@ -3599,7 +3604,8 @@ impl ProcessManager {
                     && !other.is_system_thread
                     && !matches!(other.state, ThreadState::Initialized | ThreadState::Terminated)
             })
-            && self.has_process_suspend_control(target.process_id)
+            && (self.has_process_suspend_control(target.process_id)
+                || self.has_initial_thread_creation_pending(target.process_id))
         {
             return Err(STATUS_DEVICE_BUSY);
         }
@@ -3657,6 +3663,9 @@ impl ProcessManager {
         exit_status: u32,
         exit_time_100ns: i64,
     ) -> Result<(), u32> {
+        if self.has_initial_thread_creation_pending_for(tid) {
+            return Err(STATUS_DEVICE_BUSY);
+        }
         let t = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
         if t.pending_suspend_control.is_some() {
             return Err(STATUS_DEVICE_BUSY);
@@ -3692,7 +3701,7 @@ impl ProcessManager {
         exit_status: u32,
         exit_time_100ns: i64,
     ) -> Result<(), u32> {
-        if self.has_process_suspend_control(pid) {
+        if self.has_process_suspend_control(pid) || self.has_initial_thread_creation_pending(pid) {
             return Err(STATUS_DEVICE_BUSY);
         }
         let (thread_count, section) = {
@@ -3756,6 +3765,12 @@ impl ProcessManager {
         exit_status: u32,
         exit_time_100ns: i64,
     ) -> Result<(), u32> {
+        if self.threads.values().any(|thread| {
+            thread.process_id == pid && thread.thread_id != current_tid
+                && self.has_initial_thread_creation_pending_for(thread.thread_id)
+        }) {
+            return Err(STATUS_DEVICE_BUSY);
+        }
         let thread_count = {
             let proc = self.processes.get(&pid).ok_or(STATUS_INVALID_HANDLE)?;
             if proc.state == ProcessState::Terminated {
@@ -4001,7 +4016,7 @@ impl ProcessManager {
     /// Whether only Ps-owned token/port references remain before the process delete procedure can
     /// run. The debug port is detached here once its final event has been continued.
     pub fn process_object_delete_ready(&mut self, pid: ProcessId) -> bool {
-        if self.has_process_suspend_control(pid) {
+        if self.has_process_suspend_control(pid) || self.has_initial_thread_creation_pending(pid) {
             return false;
         }
         let _ = self.clear_deleted_process_debug_object_if_unreferenced(pid);

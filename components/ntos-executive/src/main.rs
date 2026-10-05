@@ -26277,12 +26277,6 @@ static PM_HANDLE_CAP_MAX: AtomicU64 = AtomicU64::new(0);
 /// Count of real handle-table capacity growths after the bootstrap reserve.
 static PM_HANDLE_CAP_GROWTHS: AtomicU64 = AtomicU64::new(0);
 // === Path 2 — lifecycle: real ETHREADs + create/terminate/open routed through pm ===============
-/// Bit `pi` set once the target process's INITIAL thread has been created through `NtCreateThread`
-/// with a foreign `ProcessHandle` (`RtlCreateUserProcess`'s "create the process, then its first
-/// thread" pair). The FIRST such create binds the process's pre-created main ETHREAD (and the seL4
-/// main TCB the spawn already made); every SUBSEQUENT one is a genuine ADDITIONAL thread and takes
-/// the real cross-VSpace spawn path. Exactly NT's rule — a process has one initial thread.
-pub(crate) static PM_INITIAL_THREAD_DONE: AtomicU64 = AtomicU64::new(0);
 /// Configured per-process hosted-thread mechanism windows. These are not launch policy: each slot is
 /// a reusable seL4/VA mechanism lane that can host any ordinary NT thread in that process. The
 /// current fixed-address userspace layout derives target stack/TEB/IPC/trampoline VAs and executive

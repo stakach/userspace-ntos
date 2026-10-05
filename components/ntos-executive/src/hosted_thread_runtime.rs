@@ -12,6 +12,9 @@ mod memory_retirement;
 pub(crate) struct HostedThreadRuntimeOwner {
     runtime: HostedThreadRuntime,
     pub(crate) suspension: crate::thread_suspend::HostedThreadSuspend,
+    pub(crate) initial_creation: core::cell::RefCell<
+        Option<crate::exec_handler::initial_thread_creation::PendingInitialThreadCreation>,
+    >,
     memory_coverage: nt_user_host::thread_construction::MemoryConstructionCoverage<TP_WORKER_STACK_FRAME_COUNT>,
     registered_memory: Option<nt_user_host::thread_construction::RegisteredThreadMemory>,
     registry_preparation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation<TP_WORKER_STACK_FRAME_COUNT>,
@@ -27,6 +30,7 @@ impl HostedThreadRuntimeOwner {
         Self {
             runtime,
             suspension: crate::thread_suspend::HostedThreadSuspend::new(),
+            initial_creation: core::cell::RefCell::new(None),
             memory_coverage: nt_user_host::thread_construction::MemoryConstructionCoverage::empty(),
             registered_memory: None,
             registry_preparation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation::empty(),
@@ -39,7 +43,9 @@ impl HostedThreadRuntimeOwner {
     }
 
     fn construction_is_empty(&self) -> bool {
-        self.suspension.is_empty() && self.memory_coverage.is_empty()
+        self.suspension.is_empty()
+            && self.initial_creation.try_borrow().is_ok_and(|owner| owner.is_none())
+            && self.memory_coverage.is_empty()
             && !self.registry_preparation.is_prepared() && self.alias_preparation.get().is_none()
             && self.prefetch_preparation.get().is_none()
             && self.provider_preparation.get().is_none()
@@ -1241,6 +1247,7 @@ impl RuntimeIdentity for HostedThreadRuntimeOwner {
 
     fn control_busy(&self) -> bool {
         self.suspension.is_pending()
+            || self.initial_creation.try_borrow().map_or(true, |owner| owner.is_some())
     }
 }
 
@@ -1280,6 +1287,9 @@ pub(crate) fn check_user_stack_retirement_access(
 
 impl RuntimeTcbProjection for HostedThreadRuntimeOwner {
     fn clear_retired_tcb_projection(&mut self, expected_cap: u64) -> Result<(), u32> {
+        if self.initial_creation.try_borrow().map_or(true, |owner| owner.is_some()) {
+            return Err(nt_process::STATUS_DEVICE_BUSY);
+        }
         if expected_cap <= 1 || (self.runtime.tcb != expected_cap && self.runtime.tcb != 1) {
             return Err(nt_address_space::STATUS_INVALID_PARAMETER);
         }

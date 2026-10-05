@@ -9,6 +9,9 @@ use crate::provider_local_event::trace as trace_provider_local_event;
 use nt_io_abi::major;
 use nt_io_manager::{LocalFileObject, PendingFileRoute};
 
+#[path = "initial_thread_creation.rs"]
+pub(crate) mod initial_thread_creation;
+
 #[path = "exec_file_flush.rs"]
 mod file_flush;
 
@@ -34194,84 +34197,8 @@ impl ExecNtHandler {
                 // Keep process access and liveness checks common while that ownership gap is open.
                 if matches!(ctx.service, NativeService::NtCreateThread) && args[3] != u64::MAX {
                     unsafe {
-                        let caller_pid = match self.pm_pid_for_pi(self.pi) {
-                            Some(pid) => pid,
-                            None => return 0xC000_0008,
-                        };
-                        let (target_pid, target_pi) = match self.resolve_process_for_access(args[3], 0x0002) {
-                            Ok(target) => target,
-                            Err(status) => return status,
-                        };
-                        if self.pm.process(target_pid).is_some_and(|process| {
-                            matches!(process.state,
-                                nt_process::ProcessState::Exiting | nt_process::ProcessState::Terminated)
-                        }) {
-                            return nt_process::STATUS_PROCESS_IS_TERMINATING;
-                        }
-                        if PM_INITIAL_THREAD_DONE.load(Ordering::Relaxed) & (1u64 << target_pi) != 0 {
-                            // The target already has its initial thread ⇒ REAL cross-VSpace create.
-                            return self.create_remote_thread(args, start,
-                                initial_context.take().expect("captured remote context"), initial_stack);
-                        }
-                        let tid = match self.pm.main_thread(target_pid) {
-                            Some(tid) => tid,
-                            None => return 0xC000_0008,
-                        };
-                        let create_suspended =
-                            nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
-                        let handle_capacity = self.pm.handle_capacity(caller_pid);
-                        let handle_reservation = match self.pm.try_reserve_handle_slot(caller_pid) {
-                            Ok(reservation) => reservation,
-                            Err(status) => return status,
-                        };
-                        if let Err(status) = self.pm.bind_reserved_handle(
-                            handle_reservation,
-                            nt_process::HandleObject::Thread(tid),
-                            nt_ulong_arg(args[1]),
-                        ) {
-                            let _ = self.pm.cancel_reserved_handle(handle_reservation);
-                            return status;
-                        }
-                        if let Err(status) = crate::thread_suspend::create_initial_thread(
-                            self, tid, create_suspended,
-                        ) {
-                            let _ = self.pm.cancel_bound_handle(handle_reservation);
-                            return status;
-                        }
-                        if !create_suspended {
-                            self.observe_desktop_thread_activation(u64::from(tid));
-                        }
-                        let handle =
-                            self.pm.publish_reserved_handle(handle_reservation).expect(
-                                "main hosted TCB admission preserves its bound thread handle",
-                            ) as u64;
-                        self.record_process_handle_insert(caller_pid, handle_capacity);
-                        self.queue_write(args[0], handle);
-                        let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
-                        if cid_ptr != 0 {
-                            self.queue_write(cid_ptr, target_pid as u64);
-                            self.queue_write(cid_ptr + 8, tid as u64);
-                        }
-                        let trace = THREAD_LIFECYCLE_TRACE_N.fetch_add(1, Ordering::Relaxed);
-                        if trace < 4 {
-                            print_str(b"[thread-life] create caller_pi=");
-                            print_u64(self.pi as u64);
-                            print_str(b" foreign_process=0x");
-                            print_hex(args[3] as u32);
-                            print_str(b" resolved_pid=");
-                            print_u64(target_pid as u64);
-                            print_str(b" main_tid=");
-                            print_u64(tid as u64);
-                            print_str(b" suspended=");
-                            print_u64(create_suspended as u64);
-                            print_str(b" handle=0x");
-                            print_hex(handle as u32);
-                            print_str(b" status=0\n");
-                        }
-                        // This target now HAS its initial thread; any further foreign create for it
-                        // is a genuine additional thread (the cross-VSpace path above).
-                        PM_INITIAL_THREAD_DONE.fetch_or(1u64 << target_pi, Ordering::Relaxed);
-                        return 0;
+                        return self.create_foreign_thread(args, start,
+                            initial_context.take().expect("captured foreign context"), initial_stack);
                     }
                 }
                 if matches!(ctx.service, NativeService::NtCreateThread) {
