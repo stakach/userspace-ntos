@@ -149,11 +149,16 @@ impl ProcessVmRetirementIo for FinalProcessVm<'_> {
             if !kuser_page_alias_release(pi) || kuser_page_alias_get(pi) != 0 {
                 return false;
             }
-            if let Some(owner) = self.handler.process_vspace_caps[pi].as_mut() {
-                if !release_sec_image_vspace_leaves(owner) {
+            let mut update = match self.handler.process_vspace_caps.begin_update(pi, owner.process) {
+                Ok(update) => update,
+                Err(_) => return false,
+            };
+            if let Some(update) = update.as_mut() {
+                if !release_sec_image_vspace_leaves(update.caps_mut()) {
                     return false;
                 }
             }
+            drop(update);
             // Transition backing is physical ownership, not metadata cleanup. Complete it while
             // a failure can still retain the exact process and its page tables/VSpace.
             process_working_set_retire_for(pi, owner.process, self.handler).is_ok()
@@ -176,7 +181,7 @@ impl ProcessVmRetirementIo for FinalProcessVm<'_> {
         let pi = self.candidate.pi;
         // A process can exit before publishing a VSpace. Empty physical ownership still needs
         // logical retirement; never skip that work just because the published root is zero.
-        if self.handler.process_vspace_caps[pi].is_none() {
+        if matches!(self.handler.process_vspace_caps.get(pi), Some(None)) {
             return self.handler.process_vspaces[pi] == 0;
         }
         unsafe { self.handler.release_hosted_process_vspace_caps(pi) }

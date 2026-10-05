@@ -165,6 +165,8 @@ static mut SERVICE_SSN_RING_WORK: [u16; 32] = [0; 32];
 static mut SERVICE_SSN_RING_BADGE_WORK: [u8; 32] = [0; 32];
 static mut SERVICE_WL_RING_WORK: [u16; 48] = [0; 48];
 static mut SERVICE_PROCS_WORK: alloc::vec::Vec<ProcExec> = alloc::vec::Vec::new();
+#[path = "component_receive_vspace.rs"]
+pub(crate) mod receive_vspace;
 static SERVICE_PROCS_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static mut SERVICE_EXE_IMAGES_WORK: nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP> =
     nt_exe_image::ImageTable::new();
@@ -1186,6 +1188,7 @@ fn component_expected_owner(
     match pending {
         PendingComponentDispatch::Provider(pending) => provider_wait_expected_owner(pending),
         PendingComponentDispatch::Lpc(pending) => lpc_wait_expected_owner(pending),
+        PendingComponentDispatch::Receive(pending) => Some(pending.yielded.owner),
     }
 }
 
@@ -1202,6 +1205,9 @@ fn component_suspension_key(
         }
         PendingComponentDispatch::Lpc(pending) => {
             nt_component_suspension::SuspensionKey::lpc_request(pending.request.generation)
+        }
+        PendingComponentDispatch::Receive(pending) => {
+            nt_component_suspension::SuspensionKey::receive(pending.yielded.child.admission_sequence())
         }
     }
 }
@@ -1608,6 +1614,29 @@ unsafe fn provider_wait_admit_current(
     true
 }
 
+unsafe fn receive_admit_current(pending: win32k_glue::PendingReceiveDispatch) -> bool {
+    if pending.yielded.replaces.is_some() { return false; }
+    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else { return false; };
+    let Ok(return_target) = HostedReturnTarget::new(REPLY_MAIN_SLOT.load(Ordering::Relaxed), None)
+        else { return false; };
+    let key = nt_component_suspension::SuspensionKey::receive(pending.yielded.child.admission_sequence());
+    let sequence = next_dispatcher_wait_sequence();
+    let continuation = ComponentNativeContinuation::Hosted(HostedNativeContinuation {
+        pending: PendingComponentDispatch::Receive(pending), return_target,
+    });
+    let admitted = crate::spawn_hosts::shared_ingress::owner::runtime::with_bound_receive_scope(
+        pending.yielded.parent, |scope| {
+            (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                .admit_receive_owned(scope, key, sequence, pending.yielded.owner,
+                    pending.yielded.child, continuation)
+                .map_err(|_| crate::spawn_hosts::shared_ingress::owner::runtime::Error::Protocol)
+        },
+    );
+    if admitted.is_err() { return false; }
+    reply_park.commit();
+    true
+}
+
 unsafe fn lpc_wait_admit_retained(
     nt_handler: &mut ExecNtHandler,
     pending: win32k_glue::PendingLpcWaitDispatch,
@@ -1716,6 +1745,7 @@ unsafe fn component_suspension_cancel_scope(
             .phase
             .clone();
         let external_cancelled = match wait_key.kind {
+            nt_component_suspension::SuspensionKind::Receive => return false,
             nt_component_suspension::SuspensionKind::ProviderWait => {
                 (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER))
                     .cancel(nt_handler, wait_key.id, 0xC000_0120u32 as i32)
@@ -8618,27 +8648,86 @@ pub(crate) unsafe fn service_sec_image(
         generic_sections,
     };
     nt_handler.loop_ctx = Some(memory_context);
-    // This endpoint admits hosted faults/native Calls, not asynchronous Send traffic. A rejected
-    // caller stays blocked; its uniquely owned Reply must be cancelled before the next receive.
-    macro_rules! reject_hosted_ingress {
-        () => {{
-            print_str(b"[service-loop] rejected hosted ingress badge=");
-            print_u64(badge);
-            print_str(b" label=");
-            print_u64(mi >> 12);
-            print_str(b"\n");
-            assert!(drop_current_hosted_reply(), "cannot cancel rejected hosted ingress");
-            let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
-            badge = received.0;
-            mi = received.1;
-            m0 = received.2;
-            m1 = received.3;
-            m2 = received.4;
-            m3 = received.5;
-            continue;
-        }};
-    }
-    loop {
+    receive_vspace::install(nt_handler.hosted_vspace_observer());
+    let mut receive_boundary = None;
+    'service_loop: loop {
+        macro_rules! component_receive_outcome {
+            ($outcome:expr) => {{
+                match $outcome {
+                    crate::executive_ingress::ReceiveOutcome::Message(message) => message,
+                    crate::executive_ingress::ReceiveOutcome::OuterBoundary(boundary) => {
+                        receive_boundary = Some(boundary);
+                        continue 'service_loop;
+                    }
+                }
+            }};
+        }
+        macro_rules! component_recv {
+            ($ep:expr, $reply:expr) => {{
+                assert!(crate::executive_ingress::handles($ep));
+                if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+                    component_resume::prepare_receive(&mut nt_handler);
+                }
+                component_receive_outcome!(crate::executive_ingress::receive($reply))
+            }};
+        }
+        macro_rules! component_client_reply_recv {
+            ($ep:expr, $reply:expr, $len:expr, $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {{
+                assert!(crate::executive_ingress::handles($ep));
+                if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+                    component_resume::prepare_receive(&mut nt_handler);
+                }
+                component_receive_outcome!(crate::executive_ingress::reply_receive(
+                    $reply, $len, $r0, $r1, $r2, $r3))
+            }};
+        }
+        macro_rules! component_reply_recv {
+            ($ep:expr, $len:expr, $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {{
+                component_client_reply_recv!($ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                    $len, $r0, $r1, $r2, $r3)
+            }};
+        }
+        // This endpoint admits hosted faults/native Calls, not asynchronous Send traffic. A
+        // rejected caller's uniquely owned Reply must be cancelled before the next receive.
+        macro_rules! reject_hosted_ingress {
+            () => {{
+                print_str(b"[service-loop] rejected hosted ingress badge=");
+                print_u64(badge);
+                print_str(b" label=");
+                print_u64(mi >> 12);
+                print_str(b"\n");
+                assert!(drop_current_hosted_reply(), "cannot cancel rejected hosted ingress");
+                let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                badge = received.0;
+                mi = received.1;
+                m0 = received.2;
+                m1 = received.3;
+                m2 = received.4;
+                m3 = received.5;
+                continue 'service_loop;
+            }};
+        }
+        // The previous iteration's event locals and borrows have ended. Restore before any
+        // new maintenance or admission; refusal retains the boundary and cannot be replayed.
+        if let Some(boundary) = receive_boundary.take() {
+            if let Some(retained) = component_resume::run_receive(core::ptr::from_mut(&mut *nt_handler), boundary) {
+                let _retained = retained;
+                panic!("Receive restoration is retained; no replay or next ingress is permitted");
+            }
+            if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+                component_resume::run_outer(core::ptr::from_mut(&mut *nt_handler));
+                component_resume::prepare_receive(&mut nt_handler);
+            }
+            let received = crate::executive_ingress::receive(REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+            let crate::executive_ingress::ReceiveOutcome::Message(received) = received else {
+                panic!("completed Receive cannot issue another settlement boundary");
+            };
+            (badge, mi, m0, m1, m2, m3) = received;
+        }
+        // A selected child is serviced before unrelated work can enter the held provider or
+        // change its attachment. Its ordinary fault handler still performs fresh admission.
+        let ingress;
+        if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
         // Bound notifications do not bind the offered Reply and use a separate badge namespace.
         crate::provider_bugcheck::stop_if_pending();
         // Retry outside registry/runtime borrows, including when the next ingress is excluded.
@@ -8697,7 +8786,7 @@ pub(crate) unsafe fn service_sec_image(
             m3 = received.5;
             continue;
         }
-        let ingress = if badge == DELAY_TIMER_BADGE || hosted_irq_lines_from_badge(badge) != 0 {
+        ingress = if badge == DELAY_TIMER_BADGE || hosted_irq_lines_from_badge(badge) != 0 {
             None
         } else {
             match nt_handler.admit_hosted_thread_ingress(badge) {
@@ -9011,12 +9100,51 @@ pub(crate) unsafe fn service_sec_image(
         // Only this outer owner can leave all executive/scratch borrows before a resume pump.
         // Any absorbed timer deliveries have already been processed above.
         component_resume::run_outer(core::ptr::from_mut(&mut *nt_handler));
+        } else {
+            ingress = Some(nt_handler.admit_hosted_thread_ingress(badge)
+                .expect("selected Receive child retains its current ingress binding"));
+            assert!(crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_is_current(
+                ingress.as_ref().unwrap().binding(), REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+            ), "only the exact selected Receive child may run while its parent is held");
+        }
         // Deferred work may retire a process/thread. Revalidate the complete binding before
         // selecting any role, LPC context, stack mirror or process memory state.
         let event_runtime = match (ingress, nt_handler.admit_hosted_thread_ingress(badge)) {
             (Some(admitted), Ok(current)) if admitted.binding() == current.binding() => current,
             _ => reject_hosted_ingress!(),
         };
+        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+            let observed = crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_observation(
+                event_runtime.binding(), REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+            ).expect("selected Receive child owns its exact resident observation");
+            assert!(receive_vspace::validate_current(&nt_handler, event_runtime.binding(), observed),
+                "Receive child and held provider require exact distinct current VSpace objects");
+            nt_handler.service_captured_private_read_fault(observed.resident, event_runtime.binding())
+                .expect("changed or uncertain Receive residency retains child Call and parent");
+            thread_wait_state_clear_badge_running(&mut nt_handler, badge);
+            wait_parked = wait_parked_owner_mask(&nt_handler);
+            if procs[event_runtime.pi].faults == 0 { procs[event_runtime.pi].first = m1; }
+            procs[event_runtime.pi].faults += 1;
+            note_boot_progress(BootProgress::PageMappingPublished);
+            win32k_glue::trace_receive_phase(
+                b"resident-revalidated",
+                observed.parent,
+                observed.child,
+                observed.trace_owner,
+            );
+            // No attachment, process scratch, provider, timer or legacy fault policy runs here.
+            // The ordinary canonical pager revalidated the same captured resident frame.
+            let outcome = crate::executive_ingress::reply_receive(
+                REPLY_MAIN_SLOT.load(Ordering::Relaxed), 0, 0, 0, 0, 0,
+            );
+            match outcome {
+                crate::executive_ingress::ReceiveOutcome::OuterBoundary(boundary) => {
+                    receive_boundary = Some(boundary);
+                    continue 'service_loop;
+                }
+                crate::executive_ingress::ReceiveOutcome::Message(_) => panic!("Receive ACK requires exact settlement boundary"),
+            }
+        }
         iters += 1;
         // `iters` is diagnostic only. A real NT kernel does not stop a runnable hosted process set at a
         // historical boot-frontier count; quiesce is driven by wait/crash/stall predicates above.
@@ -10309,6 +10437,34 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(status);
                     print_str(b"\n");
                     park_and_log!(pi, b"guard-page", m0, addr);
+                }
+            }
+            match nt_handler.service_committed_private_page_residency(
+                pi, page, vm_fault_access_from_x86_error(m3),
+                nt_address_space::ImageFaultObservation::from_x86_error(m3),
+            ) {
+                Ok(Some(())) => {
+                    note_boot_progress(BootProgress::PageMappingPublished);
+                    faults += 1;
+                    procs[pi].faults = faults;
+                    procs[pi].first = first;
+                    procs[pi].ntfaults = ntfaults;
+                    pfilled[pi] = *filled_pages;
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = component_reply_recv!(fault_ep, 0, 0, 0, 0, 0);
+                    badge = nb;
+                    mi = nmi;
+                    m0 = nm0;
+                    m1 = nm1;
+                    m2 = nm2;
+                    m3 = nm3;
+                    continue;
+                }
+                Ok(None) => {}
+                Err(status) => {
+                    print_str(b"[private-page] fault failed status=0x");
+                    print_hex(status);
+                    print_str(b"\n");
+                    park_and_log!(pi, b"private-page", m0, addr);
                 }
             }
             match nt_handler.service_native_image_page_residency(
@@ -16298,7 +16454,12 @@ pub(crate) unsafe fn service_sec_image(
                     r
                 };
                 let callback_suspended = win32k_glue::take_user_callback_pump_suspended();
-                if let Some(pending) = win32k_glue::take_pending_provider_wait_dispatch() {
+                if let Some(pending) = win32k_glue::take_pending_receive_dispatch() {
+                    component_suspension_admitted_dispatch_id = pending.dispatch.dispatch_id;
+                    component_suspension_park_request = receive_admit_current(pending);
+                    assert!(component_suspension_park_request, "Receive retains parked parent and original client Reply");
+                    redirected_user_callback = true;
+                } else if let Some(pending) = win32k_glue::take_pending_provider_wait_dispatch() {
                     component_suspension_admitted_dispatch_id = pending.dispatch.dispatch_id;
                     component_suspension_park_request = provider_wait_admit_current(
                         &mut nt_handler,
@@ -16962,12 +17123,20 @@ pub(crate) unsafe fn service_sec_image(
                 procs[pi].first = first;
                 procs[pi].ntfaults = ntfaults;
                 pfilled[pi] = *filled_pages;
-                let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
+                let receive_child_pending = crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending();
+                if receive_child_pending {
+                    // Drop pointers to this event's stack locals without executing a provider or
+                    // filesystem finalizer while the physical GUI parent is held.
+                    nt_handler.loop_ctx = nt_handler.loop_ctx.map(|ctx| ctx.checkpoint_live());
+                }
+                if !receive_child_pending {
+                    let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
+                }
                 if component_suspension_owns_hosted_dispatch(component_suspension_admitted_dispatch_id)
                 {
                     mark_wait_parked!(pi, resume_ip);
                 }
-                let _ = finalize_service_loop_state(&mut nt_handler);
+                if !receive_child_pending { let _ = finalize_service_loop_state(&mut nt_handler); }
                 let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                 badge = received.0;
                 mi = received.1;

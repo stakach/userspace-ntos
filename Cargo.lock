@@ -224,6 +224,7 @@ dependencies = [
  "nt-memory-manager",
  "nt-pe-loader",
  "nt-process",
+ "nt-user-host",
  "syn",
 ]
 

@@ -27,7 +27,7 @@ impl ComponentSchedulerScope {
     pub(crate) unsafe fn service_irq_yield(&self, shared_va: u64) {
         let _message = crate::ipc_message::SavedMessageBuffer::capture();
         let _durable = crate::allocator::enter_durable();
-        let parent = crate::spawn_hosts::shared_ingress::owner::runtime::nested::park_current()
+        let mut parent = crate::spawn_hosts::shared_ingress::owner::runtime::nested::park_current()
             .expect("IRQ scheduling must preserve its exact parent invocation");
         let yield_number = YIELDS.fetch_add(1, Ordering::Relaxed) + 1;
         crate::dispatcher_bootstrap::request_receive_checkpoint();
@@ -66,7 +66,7 @@ impl ComponentSchedulerScope {
             }
             print_str(b"\n");
         }
-        crate::spawn_hosts::shared_ingress::owner::runtime::nested::restore(parent)
+        crate::spawn_hosts::shared_ingress::owner::runtime::nested::restore(&mut parent)
             .expect("IRQ scheduling must restore its retained parent invocation");
     }
 }
@@ -101,7 +101,7 @@ unsafe fn hosted_component_pump_inner(
     use crate::spawn_hosts::shared_ingress::owner::runtime;
     let mut channel = *channel;
     let route = runtime::channel_route(&channel).expect("physical hosted ingress identity");
-    let parent = if channel.initial == crate::spawn_hosts::InitialAction::ReplyRequest {
+    let mut parent = if channel.initial == crate::spawn_hosts::InitialAction::ReplyRequest {
         let parent = runtime::nested::park_current().expect("retain nested hosted parent");
         let route = route.expect("hosted dispatch requires enrolled source");
         runtime::admit(route).expect("admit exact hosted dispatch Call");
@@ -145,6 +145,6 @@ unsafe fn hosted_component_pump_inner(
                 .expect("authenticate hosted final completion Call");
         }
     }
-    runtime::nested::restore(parent).expect("restore nested hosted parent");
+    runtime::nested::restore(&mut parent).expect("restore nested hosted parent");
     result
 }

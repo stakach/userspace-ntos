@@ -378,7 +378,6 @@ pub(crate) unsafe fn ensure_process_user_paging_parents(
     let caps = handler
         .process_vspace_caps
         .get(pi)
-        .copied()
         .flatten()
         .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
     let mechanism = handler

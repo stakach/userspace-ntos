@@ -2,6 +2,31 @@
 
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(crate) struct ReceiveYield {
+    pub parent: nt_component_suspension::NestedExecutionIdentity,
+    pub child: nt_component_suspension::ExternalAdmissionKey,
+    pub owner: nt_component_suspension::SuspensionOwner,
+    pub replaces: Option<nt_component_suspension::SuspensionKey>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PendingReceiveDispatch {
+    pub yielded: ReceiveYield,
+    pub pump: crate::spawn_hosts::PumpResult,
+    pub channel: crate::spawn_hosts::PumpChannel,
+    pub dispatch: nt_user_callback::DispatchContext,
+    pub client: Win32kClientContext,
+    pub arg_snapshot_len: u32,
+    pub arg_snapshot: [u8; COMPLETED_ARG_SNAPSHOT_BYTES],
+}
+
+pub(super) static mut RECEIVE_PENDING_DISPATCH: Option<PendingReceiveDispatch> = None;
+
+pub(crate) unsafe fn take_pending_receive_dispatch() -> Option<PendingReceiveDispatch> {
+    core::ptr::replace(core::ptr::addr_of_mut!(RECEIVE_PENDING_DISPATCH), None)
+}
+
 pub(super) static PROVIDER_WAIT_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
 pub(super) static LPC_WAIT_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
 

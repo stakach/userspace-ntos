@@ -39,7 +39,12 @@ pub(crate) use hosted::{
     finish_acknowledged_hosted_reply, hosted_can_resume, hosted_cancellation_proven,
     hosted_reply_cancelled, owns_hosted_reply, release_hosted_reply, reply_hosted, restart_hosted,
     stop_and_cancel_hosted, stop_hosted_caller, take_hosted_with,
+    bind_receive_settlement, prepare_receive_settlement, take_outer_boundary,
+    ReceiveSettlementBoundary, ReceiveChildObservation,
+    receive_child_pending, receive_child_is_current, receive_child_observation,
+    receive_child_delivery_allowed, with_bound_receive_scope,
 };
+pub(crate) use hosted::PendingSnapshot;
 
 const RETAINED_CALL_CAPACITY: usize = 256;
 const PEER_CAPACITY: usize = 256;

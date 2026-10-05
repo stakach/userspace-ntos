@@ -704,7 +704,7 @@ pub(super) unsafe fn poll(
         return SourceCompletionDispatch::Uncertain;
     };
     let _message = crate::ipc_message::SavedMessageBuffer::capture();
-    let Ok(parent) = runtime::nested::park_current() else {
+    let Ok(mut parent) = runtime::nested::park_current() else {
         return SourceCompletionDispatch::Suspended;
     };
     (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Entered;
@@ -729,7 +729,7 @@ pub(super) unsafe fn poll(
         }
         Ok(Some(pump))
     })();
-    if runtime::nested::restore(parent).is_err() {
+    if runtime::nested::restore(&mut parent).is_err() {
         (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Uncertain;
         return SourceCompletionDispatch::Uncertain;
     }

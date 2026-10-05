@@ -6,6 +6,7 @@ use super::*;
 pub(super) enum PendingComponentDispatch {
     Provider(win32k_glue::PendingProviderWaitDispatch),
     Lpc(win32k_glue::PendingLpcWaitDispatch),
+    Receive(win32k_glue::PendingReceiveDispatch),
 }
 
 impl PendingComponentDispatch {
@@ -13,6 +14,7 @@ impl PendingComponentDispatch {
         match self {
             Self::Provider(pending) => pending.client,
             Self::Lpc(pending) => pending.client,
+            Self::Receive(pending) => pending.client,
         }
     }
 }
@@ -26,6 +28,10 @@ pub(crate) struct ComponentSuspensionCompletion {
 }
 
 impl ComponentSuspensionCompletion {
+    /// Internal receive readiness, never supplied as a provider wait result or user Reply.
+    pub(super) const fn receive_ready() -> Self {
+        Self::provider(0)
+    }
     pub(super) const fn provider(status: i32) -> Self {
         Self {
             status,

@@ -215,12 +215,9 @@ pub(super) unsafe fn map_private_page(
 ) -> Result<(), u32> {
     let _borrow = Borrow::acquire()?;
     let owner = &mut *core::ptr::addr_of_mut!(OWNER);
-    // A prior call can retain only rollback or quarantine here: advance never returns mid-map.
+    // Cleanup is an explicit operation on its retained owner, never a side effect of a new fault.
     if !owner.is_idle() {
-        let _ = owner.advance(&mut Io { handler });
-        if !owner.is_idle() {
-            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-        }
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
     let process = handler
         .capture_process_identity(pi)
@@ -243,7 +240,7 @@ pub(super) unsafe fn map_private_page(
         return Ok(());
     }
     handler.ensure_process_working_set_admission(pi, page, scratch_base)?;
-    vm_ensure_private_pt(handler, pi, page, pml4)?;
+    ensure_process_user_page_table(handler, pi, page, pml4)?;
     if !target_is_current(handler, &target) {
         return Err(nt_process::STATUS_INVALID_HANDLE);
     }
@@ -270,10 +267,7 @@ pub(super) unsafe fn map_private_page_from_frame(
     let _borrow = Borrow::acquire()?;
     let owner = &mut *core::ptr::addr_of_mut!(OWNER);
     if !owner.is_idle() {
-        let _ = owner.advance(&mut Io { handler });
-        if !owner.is_idle() {
-            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-        }
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
     frame_recycle::validate_owned_backing(source)?;
     let process = handler

@@ -111,6 +111,7 @@ pub(crate) use hosted_bootstrap::*;
 mod hosted_loaded_images;
 pub(crate) use hosted_loaded_images::*;
 mod hosted_process_runtime;
+mod hosted_process_vspace;
 pub(crate) use hosted_process_runtime::*;
 mod process_vm_retirement;
 mod ps_bootstrap;
@@ -7996,6 +7997,7 @@ fn client_frame_registry_stats() -> ClientFrameRegistryStats {
 fn client_frame_registry_process_is_empty(pi: u64) -> bool {
     temporary_frame_alias::process_available(pi)
         && hosted_private_page_installation::process_available(pi)
+        && exec_handler::private_residency::memory_available(pi, 0, USER_ADDRESS_LIMIT)
         && unsafe { (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).is_process_empty(pi) }
 }
 /// Record GUI client `pi`'s frame cap `fr` for page VA `page` (once per (pi,page)).
@@ -15810,7 +15812,7 @@ unsafe fn reply_recv_badge(
 /// r12 across the syscall (it reads it, never writes it), so `in` is sufficient.
 unsafe fn recv_full_r12(ep: u64, reply_cptr: u64) -> (u64, u64, u64, u64, u64, u64) {
     if executive_ingress::handles(ep) {
-        return executive_ingress::receive(REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+        return executive_ingress::receive(REPLY_MAIN_SLOT.load(Ordering::Relaxed)).expect_message();
     }
     let message = recv_owned_r12(ep, reply_cptr);
     // recv_owned_r12's bookkeeping is memory-only; the live buffer remains this receive's buffer.
@@ -15873,7 +15875,7 @@ unsafe fn client_reply_recv_badge(
     r3: u64,
 ) -> (u64, u64, u64, u64, u64, u64) {
     if executive_ingress::handles(recv_ep) {
-        return executive_ingress::reply_receive(reply_cptr, reply_len, r0, r1, r2, r3);
+        return executive_ingress::reply_receive(reply_cptr, reply_len, r0, r1, r2, r3).expect_message();
     }
     let recv_started = disk_census_ticks();
     let badge: u64;
@@ -23154,7 +23156,7 @@ struct ExecNtHandler {
     /// seL4 VSpace caps for hosted and temporary process slots, owned by the handler.
     process_vspaces: alloc::vec::Vec<u64>,
     /// Generation-exact capabilities that constitute each hosted SEC_IMAGE address space.
-    process_vspace_caps: alloc::vec::Vec<Option<img_spawn::HostedProcessVspaceCaps>>,
+    process_vspace_caps: hosted_process_vspace::HostedProcessVSpaces,
     /// Non-hosted throwaway processes used by post-quiesce self-tests. These slots deliberately do
     /// not enter `process_mechanisms`: they have no fault badge and are not launch topology.
     temporary_process_slots: nt_user_host::process_identity::TemporaryProcessSlots,

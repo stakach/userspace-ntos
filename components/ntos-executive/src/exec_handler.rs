@@ -56,6 +56,9 @@ mod disk_file;
 #[path = "exec_virtual_memory_copy.rs"]
 mod virtual_memory_copy;
 
+#[path = "exec_private_residency.rs"]
+pub(crate) mod private_residency;
+
 #[path = "exec_registry_value_name.rs"]
 mod registry_value_name;
 
@@ -3343,18 +3346,6 @@ fn zeroed_process_slot_u64_vec() -> alloc::vec::Vec<u64> {
     slots
 }
 
-fn empty_process_vspace_caps_vec(
-) -> alloc::vec::Vec<Option<img_spawn::HostedProcessVspaceCaps>> {
-    let mut slots = alloc::vec::Vec::new();
-    if slots.try_reserve_exact(MAX_PI).is_err() {
-        panic!("process VSpace capability vector allocation failed");
-    }
-    while slots.len() < MAX_PI {
-        slots.push(None);
-    }
-    slots
-}
-
 fn registered_win32_callouts_for_manager(
     pm: &mut nt_process::ProcessManager,
 ) -> Result<nt_process::Win32Callouts, u32> {
@@ -4033,7 +4024,7 @@ impl ExecNtHandler {
         write_field!(ps_object_retirements, crate::ps_object_retirement::Retirements::default());
         write_field!(hosted_images, hosted_images);
         write_field!(process_vspaces, zeroed_process_slot_u64_vec());
-        write_field!(process_vspace_caps, empty_process_vspace_caps_vec());
+        write_field!(process_vspace_caps, hosted_process_vspace::HostedProcessVSpaces::new(MAX_PI));
         write_field!(temporary_process_slots,
             nt_user_host::process_identity::TemporaryProcessSlots::try_new(MAX_PI)
                 .expect("temporary process slot allocation failed"));
@@ -8089,15 +8080,18 @@ impl ExecNtHandler {
             .filter(|mechanism| mechanism.generation == caps.generation)
             .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
         if mechanism.pid != pid
-            || self.process_vspace_caps[pi].is_some()
+            || !matches!(self.process_vspace_caps.get(pi), Some(None))
             || self.process_vspaces[pi] != 0
         {
             return Err(nt_process::STATUS_INVALID_PARAMETER);
         }
+        let process = self.capture_process_identity(pi).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        self.process_vspace_caps.validate_publication(pi, process, caps)?;
         unsafe { self.ensure_process_commit_owner(pid, pi)? };
         unsafe { user_image_paging::mark_process_accounted(self, pi, caps) };
+        self.process_vspace_caps.publish(pi, process, caps)
+            .expect("preflighted VSpace publication follows exact accounting acknowledgement");
         self.process_vspaces[pi] = caps.pml4;
-        self.process_vspace_caps[pi] = Some(caps);
         self.observe_desktop_vspace(pi);
         Ok(())
     }
@@ -8108,6 +8102,10 @@ impl ExecNtHandler {
         (pml4 != 0).then_some(pml4)
     }
 
+    pub(crate) fn hosted_vspace_observer(&self) -> hosted_process_vspace::VSpaceObserver {
+        self.process_vspace_caps.observer()
+    }
+
     pub(crate) unsafe fn release_hosted_process_vspace_caps(&mut self, pi: usize) -> bool {
         let Some(mechanism) = self.process_mechanisms.get(pi) else {
             return false;
@@ -8115,13 +8113,11 @@ impl ExecNtHandler {
         if self.thread_runtime.has_process(pi) {
             return false;
         }
-        let Some(owner) = self
-            .process_vspace_caps
-            .get_mut(pi)
-            .and_then(Option::as_mut)
-        else {
+        let Some(process) = self.capture_process_identity(pi) else { return false; };
+        let Ok(Some(mut update)) = self.process_vspace_caps.begin_update(pi, process) else {
             return false;
         };
+        let owner = update.caps_mut();
         if owner.generation != mechanism.generation
             || owner.pml4 == 0
             || self.process_vspaces.get(pi).copied() != Some(owner.pml4)
@@ -8132,7 +8128,7 @@ impl ExecNtHandler {
         if !release_sec_image_vspace_root(owner) {
             return false;
         }
-        self.process_vspace_caps[pi] = None;
+        update.finish_retirement();
         self.process_vspaces[pi] = 0;
         true
     }
@@ -16002,7 +15998,7 @@ impl ExecNtHandler {
                 }
             }
         }
-        if let Some(caps) = self.process_vspace_caps.get(pi).copied().flatten() {
+        if let Some(caps) = self.process_vspace_caps.get(pi).flatten() {
             user_image_paging::mark_process_accounted(self, pi, caps);
         }
         Ok(())
@@ -17571,20 +17567,7 @@ impl ExecNtHandler {
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         match plan.source {
             nt_address_space::VmResidencySource::Private => {
-                if plan.page == KUSER_VA && kuser_page_alias_get(target_pi) != 0 {
-                    return Ok(());
-                }
-                if csrss_frame_get_exact(target_pi as u64, plan.page).0 == 0 {
-                    vm_map_private_page(
-                        self,
-                        target_pi,
-                        plan.page,
-                        plan.map_protection,
-                        target.pml4,
-                        target.scratch_base,
-                    )?;
-                }
-                Ok(())
+                self.ensure_private_page_residency(target_pi, plan)
             }
             nt_address_space::VmResidencySource::Mapped => {
                 match service_generic_section_fault(
@@ -20621,7 +20604,7 @@ impl ExecNtHandler {
         print_u64(
             self.process_vspace_caps
                 .get(pi)
-                .is_none_or(Option::is_some) as u64,
+                .is_none_or(|owner| owner.is_some()) as u64,
         );
         print_str(b" w32p=");
         print_u64(self.pm.process_win32(candidate.pid).is_some() as u64);
@@ -20778,7 +20761,7 @@ impl ExecNtHandler {
                         || self
                             .process_vspace_caps
                             .get(pi)
-                            .is_none_or(Option::is_some)
+                            .is_none_or(|owner| owner.is_some())
                     {
                         return HostedProcessDeletionOutcome::Pending(candidate.phase);
                     }

@@ -99,6 +99,10 @@ Hosted driver debug messages are formatted in userspace before one bounded,
 non-IPC serial write. The executive frames its own complete diagnostic lines;
 the microkernel captures caller-VSpace bytes before emission without changing
 IPC or Reply state. Acceptance parsers still reject malformed or split records.
+GUI receive continuations retain the actual provider execution hold while the root
+services an authenticated resident private-page fault. Exact child Reply settlement
+precedes parent restoration and receive-only continuation; physical VSpace checks
+and the shared ownership journal reject stale identities and aliased roots.
 The optional `tests/native/source_irp/run.sh` profile checks real fileless READ/WRITE
 and all four IOCTL methods through win32k, including immediate and pending completion.
 It verifies bytes, IOSBs and retirement counters; production images omit its fixtures.

@@ -6,6 +6,13 @@ use nt_component_suspension::peer_registry::PeerRoute;
 
 pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: bool) -> PumpMessage {
     loop {
+        if !retained_seh {
+            match crate::win32k_glue::prepare_receive_yield(ch) {
+                Ok(Some(yielded)) => return PumpMessage::hosted_receive_yield(yielded),
+                Ok(None) => {}
+                Err(_) => panic!("receive-yield preparation retains exact ingress ownership"),
+            }
+        }
         crate::registry_mutation_work::redrive_provider();
         if crate::driver_launch::nested_hosted_driver_create_ready()
             || crate::driver_launch::nested_hosted_query_path_ready()
@@ -20,12 +27,12 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: b
             || crate::driver_launch::nested_win32k_source_work_ready()
             || crate::provider_section_broker::nested_work_ready() {
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
-            let parent = match runtime::nested::park_current() {
+            let mut parent = match runtime::nested::park_current() {
                 Ok(parent) => parent,
                 Err(_) => return PumpMessage::transport_wall(),
             };
             let progressed = crate::service_sec_image::redrive_nested_hosted_file_work();
-            if runtime::nested::restore(parent).is_err() {
+            if runtime::nested::restore(&mut parent).is_err() {
                 return PumpMessage::transport_wall();
             }
             if progressed { continue; }
@@ -134,7 +141,7 @@ pub(super) unsafe fn service_wait_yields(ch: &PumpChannel) -> bool {
 }
 
 pub(super) unsafe fn service_autonomous(route: PeerRoute) -> Result<(), runtime::Error> {
-    let parent = runtime::nested::park_current()?;
+    let mut parent = runtime::nested::park_current()?;
     let serviced = (|| {
         runtime::resume_service(route)?;
         runtime::admit(route)?;
@@ -176,7 +183,7 @@ pub(super) unsafe fn service_autonomous(route: PeerRoute) -> Result<(), runtime:
             return Err(runtime::Error::Retirement);
         }
     }
-    if let Err(error) = runtime::nested::restore(parent) {
+    if let Err(error) = runtime::nested::restore(&mut parent) {
         autonomous_failure_diag(route, b"parent restoration retained");
         return Err(error);
     }

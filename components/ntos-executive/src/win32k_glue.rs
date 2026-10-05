@@ -8,14 +8,20 @@ use alloc::vec::Vec;
 
 #[path = "win32k_pending_dispatch.rs"]
 mod pending_dispatch;
+#[path = "win32k_receive.rs"]
+mod receive;
+pub(crate) use receive::{prepare_receive_yield, resume_suspended_receive_component,
+    receive_continuation_is_current, trace_receive_phase, ReceivePumpCompletion};
 pub(crate) use pending_dispatch::{
     take_pending_lpc_wait_dispatch, take_pending_provider_wait_dispatch, LpcWaitPumpCompletion,
     PendingLpcWaitDispatch, PendingProviderWaitDispatch, ProviderWaitPumpCompletion,
+    PendingReceiveDispatch, ReceiveYield, take_pending_receive_dispatch,
 };
 use pending_dispatch::{
     capture_initial_arg_snapshot, capture_lpc_wait_repark, capture_provider_wait_repark,
     LPC_WAIT_LAST_PUMP_SUSPENDED, LPC_WAIT_PENDING_DISPATCH, PROVIDER_WAIT_LAST_PUMP_SUSPENDED,
     PROVIDER_WAIT_PENDING_DISPATCH,
+    RECEIVE_PENDING_DISPATCH,
 };
 
 pub(crate) const WINDOWPROC_LPARAM_OFFSET: u64 = 0x28;
@@ -382,6 +388,7 @@ unsafe fn win32k_lane_channel(
             usermode_callback,
             provider_wait,
             kernel_irq_yield: false,
+            hosted_receive_yield: false,
             wide_arg_marshal: true,
             assert_skip: true,
             sparse_vspace: true,
@@ -523,7 +530,7 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
         physical.handle = Some(route.identity().lane);
         physical.route = Some(route);
     }
-    let parent = runtime::nested::park_current().expect("retain parent before Win32k worker startup");
+    let mut parent = runtime::nested::park_current().expect("retain parent before Win32k worker startup");
     let started = {
         let worker = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
             .as_ref().unwrap()[physical_index].worker.as_ref().unwrap();
@@ -532,7 +539,7 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
     if started.is_err() {
         retain_failed_shared_win32k_lane(tcb, Some(route), b"startup");
         runtime::retire(route).expect("failed Win32k startup retains uncertain drain and parent");
-        runtime::nested::restore(parent).expect("restore parent after canceled Win32k startup");
+        runtime::nested::restore(&mut parent).expect("restore parent after canceled Win32k startup");
         return false;
     }
     // Keep the receipt locally owned through receive; publish it before any further native effect.
@@ -554,10 +561,10 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
     if ready.is_err() || WIN32K_RETIRED.load(Ordering::Acquire) != 0 {
         retain_failed_shared_win32k_lane(tcb, Some(route), b"readiness");
         runtime::retire(route).expect("failed Win32k readiness retains uncertain drain and parent");
-        runtime::nested::restore(parent).expect("restore parent after canceled Win32k readiness");
+        runtime::nested::restore(&mut parent).expect("restore parent after canceled Win32k readiness");
         return false;
     }
-    runtime::nested::restore(parent).expect("restore parent after acknowledged Win32k readiness");
+    runtime::nested::restore(&mut parent).expect("restore parent after acknowledged Win32k readiness");
     print_str(b"[win32k-lane] shared physical lane=");
     print_u64(worker_index as u64 + 1);
     print_str(b" tcb=0x");
@@ -3722,7 +3729,7 @@ pub(crate) unsafe fn retire_bugchecked_vspace(vspace: u64, reporting_tcb: u64) {
 }
 
 unsafe fn retire_win32k_on_wall(pr: &crate::spawn_hosts::PumpResult) {
-    if pr.completed || pr.callback_suspended || pr.provider_wait_suspended || pr.lpc_wait_suspended
+    if pr.completed || pr.callback_suspended || pr.provider_wait_suspended || pr.lpc_wait_suspended || pr.receive_yield.is_some()
     {
         return;
     }
@@ -4030,35 +4037,47 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
     if !pump.completed {
         return ProviderWaitPumpCompletion::Failed(pump.status);
     }
+    complete_resumed_dispatch(pending.dispatch, client, pending.nested_user_callback,
+        pending.arg_snapshot_len, pending.arg_snapshot, pump)
+}
+
+unsafe fn complete_resumed_dispatch(
+    dispatch: UserCallbackDispatchContext,
+    client: Win32kClientContext,
+    nested_user_callback: bool,
+    arg_snapshot_len: u32,
+    arg_snapshot: [u8; COMPLETED_ARG_SNAPSHOT_BYTES],
+    pump: crate::spawn_hosts::PumpResult,
+) -> ProviderWaitPumpCompletion {
     if !complete_wait_resumed_user_callback_dispatch(
         client,
-        pending.dispatch.dispatch_id,
-        pending.nested_user_callback,
+        dispatch.dispatch_id,
+        nested_user_callback,
     ) {
         return ProviderWaitPumpCompletion::Failed(0xC000_0001u32 as i32);
     }
     unregister_win32k_dispatch_client(
-        pending.dispatch.dispatch_id,
+        dispatch.dispatch_id,
         client.pi,
         client.tid,
         client.badge,
     );
 
     let mut completed = CompletedWin32kDispatch::new(
-        pending.dispatch.ssn,
-        pending.dispatch.args,
-        pending.dispatch.caller_sp,
+        dispatch.ssn,
+        dispatch.args,
+        dispatch.caller_sp,
         pump.result,
     );
     completed.logical_caller = client.logical_caller;
     completed.dispatch_return = pump.dispatch_return;
-    if pending.dispatch.paint_output.is_some() {
-        capture_paint_dispatch_output(pending.dispatch, &mut completed);
+    if dispatch.paint_output.is_some() {
+        capture_paint_dispatch_output(dispatch, &mut completed);
     } else if matches!(
-        pending.dispatch.ssn,
+        dispatch.ssn,
         nt_user_callback::NTUSER_GET_MESSAGE_SSN | nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
     ) {
-        if let Some(stage) = pending.dispatch.output_stage {
+        if let Some(stage) = dispatch.output_stage {
             match published_win32k_output_length(stage) {
                 Some(len) => {
                     completed.provider_output_len = len;
@@ -4074,11 +4093,11 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
             completed.provider_output_len = u32::MAX;
         }
     } else {
-        if pending.arg_snapshot_len != 0 {
-            let len = pending.arg_snapshot_len as usize;
-            let _ = completed.set_arg_snapshot(&pending.arg_snapshot[..len]);
+        if arg_snapshot_len != 0 {
+            let len = arg_snapshot_len as usize;
+            let _ = completed.set_arg_snapshot(&arg_snapshot[..len]);
         }
-        release_dispatch_output_stage(pending.dispatch);
+        release_dispatch_output_stage(dispatch);
     }
     ProviderWaitPumpCompletion::Completed(completed)
 }
@@ -5214,7 +5233,7 @@ unsafe fn map_win32k_arena_prefix_into_client(
         | nt_user_host::process_identity::ProcessGeneration::Temporary(generation) => generation,
     };
     if pml4 == 0 || handler.process_vspaces.get(pi).copied() != Some(pml4)
-        || handler.process_vspace_caps.get(pi).and_then(Option::as_ref)
+        || handler.process_vspace_caps.get(pi).flatten()
             .is_none_or(|owner| owner.pml4 != pml4 || owner.generation != generation)
     {
         return false;
@@ -6438,7 +6457,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
     // faults answered through the per-caller REPLY_W32 cap so REPLY_MAIN's binding to the outer csrss
     // caller survives] + (f) demand-fault client-frame sharing + (g) int-0x2c assert-skip + the
     // 8192-page demand cap all live in the pump behind these flags — no logic deleted, only relocated.
-    let Some(ch) = win32k_lane_channel(
+    let Some(mut ch) = win32k_lane_channel(
         lane,
         client,
         crate::spawn_hosts::InitialAction::ReplyRequest,
@@ -6460,6 +6479,8 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         // finish_win32k_lane_return must not repeat it. Failed/unknown work stays owned.
         return result.unwrap_or_else(|status| (u64::from(status), false));
     }
+    ch.caps.hosted_receive_yield = request_kind == win32k_subsystem::WIN32K_REQUEST_SSDT
+        && !nested_user_callback && outer_callback.is_none();
     let mut pr = crate::spawn_hosts::component_pump(&ch);
     pr.dispatch_return = capture_win32k_dispatch_return(
         pr.dispatch_return_receipt, dispatch_id, ssn, pr.result, pr.completed,
@@ -6479,7 +6500,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         pending_callback_token_on_lane(client, lane).is_some_and(|token| {
             crate::service_sec_image::suspend_component_execution_lane_for_callback(lane, token)
         })
-    } else if pr.provider_wait_suspended || pr.lpc_wait_suspended {
+    } else if pr.provider_wait_suspended || pr.lpc_wait_suspended || pr.receive_yield.is_some() {
         true
     } else if pr.completed {
         if let Some((outer_lane, token)) = outer_callback {
@@ -6495,6 +6516,17 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         panic!("win32k dispatch violated execution-lane ownership");
     }
     USER_CALLBACK_LAST_PUMP_SUSPENDED.store(pr.callback_suspended as u64, Ordering::Release);
+    if let Some(yielded) = pr.receive_yield {
+        assert!(!nested_user_callback && outer_callback.is_none(), "Receive owns only an initial hosted dispatch");
+        assert!((*core::ptr::addr_of!(RECEIVE_PENDING_DISPATCH)).is_none());
+        let (arg_snapshot_len, arg_snapshot) = capture_initial_arg_snapshot(ssn, completion_args);
+        core::ptr::write(core::ptr::addr_of_mut!(RECEIVE_PENDING_DISPATCH), Some(PendingReceiveDispatch {
+            yielded, pump: pr, channel: ch,
+            dispatch: UserCallbackDispatchContext { lane, dispatch_id, ssn,
+                args: completion_args, caller_sp, output_stage, paint_output },
+            client, arg_snapshot_len, arg_snapshot,
+        }));
+    }
     if pr.callback_suspended {
         capture_suspended_published_win32k_context(callback_client);
     }
@@ -6571,6 +6603,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         && !pr.callback_suspended
         && !pr.provider_wait_suspended
         && !pr.lpc_wait_suspended
+        && pr.receive_yield.is_none()
     {
         unregister_win32k_dispatch_client(
             dispatch_id,

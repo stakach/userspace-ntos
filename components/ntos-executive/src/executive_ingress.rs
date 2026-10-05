@@ -7,6 +7,23 @@ use nt_component_suspension::{IngressExecutionOwner, ReceivedMessage, ReplyBindi
 // seL4 boot-cap slot for the executive's own TCB; used only as a live Reply-query probe.
 const ROOT_THREAD_CAP: u64 = 1;
 
+pub(crate) enum ReceiveOutcome {
+    Message((u64, u64, u64, u64, u64, u64)),
+    OuterBoundary(runtime::ReceiveSettlementBoundary),
+}
+
+impl ReceiveOutcome {
+    /// Bootstrap/isolated callers cannot own a parked hosted receive continuation.
+    pub(crate) fn expect_message(self) -> (u64, u64, u64, u64, u64, u64) {
+        match self {
+            Self::Message(message) => message,
+            Self::OuterBoundary(_) => {
+                panic!("receive continuation requires the outer service boundary")
+            }
+        }
+    }
+}
+
 pub(crate) unsafe fn handles(endpoint: u64) -> bool {
     runtime::endpoint() == Some(endpoint)
 }
@@ -19,12 +36,17 @@ unsafe fn materialize(message: ReceivedMessage) -> (u64, u64, u64, u64, u64, u64
 
 /// This runs only at a root event boundary. Nested pumps enqueue hosted Calls without touching
 /// REPLY_MAIN_SLOT, which may still be the Reply of their outer blocked syscall.
-pub(crate) unsafe fn receive(reply_cptr: u64) -> (u64, u64, u64, u64, u64, u64) {
+pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
     assert_eq!(
         reply_cptr,
         REPLY_MAIN_SLOT.load(Ordering::Relaxed),
         "shared root receive must own the current hosted Reply"
     );
+    if let Some(boundary) = runtime::take_outer_boundary()
+        .expect("settled child retains its exact parent restoration permit")
+    {
+        return ReceiveOutcome::OuterBoundary(boundary);
+    }
     if reply_cptr != 0 {
         if runtime::owns_hosted_reply(reply_cptr) {
             runtime::release_hosted_reply(reply_cptr).expect(
@@ -39,7 +61,15 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> (u64, u64, u64, u64, u64, u64) 
         }
     }
     loop {
+        if let Some(boundary) = runtime::take_outer_boundary()
+            .expect("settled child retains its exact parent restoration permit")
+        {
+            return ReceiveOutcome::OuterBoundary(boundary);
+        }
         let delivered = runtime::take_hosted_with(|reply, _message| {
+            if !runtime::receive_child_delivery_allowed(reply) {
+                return false;
+            }
             // The pre-delivery sweep may have recycled the previous acknowledged root Reply.
             let reply_cptr = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
             if wait_reply_pool_find_cap(reply).is_some() {
@@ -67,8 +97,12 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> (u64, u64, u64, u64, u64, u64) 
         })
         .expect("hosted ingress handoff retained after refusal");
         if let Some((_reply, message)) = delivered {
-            return materialize(message);
+            return ReceiveOutcome::Message(materialize(message));
         }
+        assert!(
+            !runtime::receive_child_pending(),
+            "Receive child cannot be replaced by another ingress before its exact settlement"
+        );
         // The snapshot journal owns the mounted volume through COMMIT and its terminal ACK.
         // Autonomous Calls stay retained and unadmitted while that ownership is live.
         if !crate::writable_fs::registry_journal::owns_volume() {
@@ -81,7 +115,9 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> (u64, u64, u64, u64, u64, u64) 
         match runtime::receive(IngressExecutionOwner::Idle, ROOT_THREAD_CAP, true)
             .expect("unified executive ingress retained after receive failure")
         {
-            runtime::Arrival::Notification(message) => return materialize(message),
+            runtime::Arrival::Notification(message) => {
+                return ReceiveOutcome::Message(materialize(message))
+            }
             runtime::Arrival::Hosted | runtime::Arrival::Call { .. } => {}
         }
     }
@@ -94,7 +130,7 @@ pub(crate) unsafe fn reply_receive(
     r1: u64,
     r2: u64,
     r3: u64,
-) -> (u64, u64, u64, u64, u64, u64) {
+) -> ReceiveOutcome {
     // One-way acknowledged reply separates outgoing ownership from receive admission. The
     // unified receiver retains arrivals between these operations, including hosted reentry.
     assert!(

@@ -38172,7 +38172,7 @@ unsafe fn load_driver_reserved(
             nt_status::NtStatus::DEVICE_BUSY
         }
     })?;
-    let parent = crate::spawn_hosts::shared_ingress::owner::runtime::nested::park_current()
+    let mut parent = crate::spawn_hosts::shared_ingress::owner::runtime::nested::park_current()
         .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL)?;
     crate::spawn_hosts::shared_ingress::owner::runtime::start_bootstrap(route, cnode, sched_context)
         .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL)?;
@@ -38214,7 +38214,7 @@ unsafe fn load_driver_reserved(
         },
     };
     let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
-    crate::spawn_hosts::shared_ingress::owner::runtime::nested::restore(parent)
+    crate::spawn_hosts::shared_ingress::owner::runtime::nested::restore(&mut parent)
         .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL)?;
     let faults = pr.faults;
     let demand = pr.demand;
@@ -49969,7 +49969,7 @@ unsafe fn ensure_hosted_irq_lane(
         quarantine_shared_hosted_irq_lane(lane_index);
         return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
     };
-    let parent = runtime::nested::park_current().expect("retain parent before IRQ startup");
+    let mut parent = runtime::nested::park_current().expect("retain parent before IRQ startup");
     let started = (|| {
         // Mark possible execution before entering the one-shot native resume owner.
         hosted_irq_lanes_mut()[lane_index].tcb_resumed = true;
@@ -49996,11 +49996,11 @@ unsafe fn ensure_hosted_irq_lane(
             "failed IRQ startup retains semantic owner and parent");
         retire_hosted_irq_lane_if_unreferenced(projection_instance, domain)
             .expect("failed IRQ startup retains uncertain drain and parent");
-        runtime::nested::restore(parent).expect("restore parent after canceled IRQ startup");
+        runtime::nested::restore(&mut parent).expect("restore parent after canceled IRQ startup");
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
     }
     hosted_irq_lanes_mut()[lane_index].state = HostedIrqLaneState::Ready;
-    runtime::nested::restore(parent).expect("restore parent after acknowledged IRQ readiness");
+    runtime::nested::restore(&mut parent).expect("restore parent after acknowledged IRQ readiness");
     Ok(generation)
 }
 

@@ -144,6 +144,8 @@ pub(crate) struct HostCaps {
     /// The caller owns a scheduler scope and an authenticated receive-only IRQ continuation.
     /// Set only by the kernel bootstrap adapter after claiming its retained pump attempt.
     pub kernel_irq_yield: bool,
+    /// The initial hosted GUI dispatch permits an authenticated child-fault receive boundary.
+    pub hosted_receive_yield: bool,
     /// win32k: carry wide (>4) stack args through caller RSP or explicit `SH_REQ_A4..` staging.
     // Capability-surface documentation (§2.3) — see `usermode_callback`; not read by the pump.
     #[allow(dead_code)]
@@ -1524,6 +1526,7 @@ struct PumpMessage {
     m3: u64,
     m4: u64,
     scheduler_yield: bool,
+    receive_yield: Option<crate::win32k_glue::ReceiveYield>,
 }
 
 impl PumpMessage {
@@ -1545,6 +1548,7 @@ impl PumpMessage {
             m4: received.word(4).unwrap_or(0),
             received: Some(received),
             scheduler_yield: false,
+            receive_yield: None,
         }
     }
 
@@ -1574,6 +1578,7 @@ impl PumpMessage {
             m3: 0,
             m4: 0,
             scheduler_yield: false,
+            receive_yield: None,
         }
     }
 
@@ -1591,6 +1596,7 @@ impl PumpMessage {
             m3: 0,
             m4: 0,
             scheduler_yield: false,
+            receive_yield: None,
         }
     }
 
@@ -1608,6 +1614,15 @@ impl PumpMessage {
             m3: 0,
             m4: 0,
             scheduler_yield: true,
+            receive_yield: None,
+        }
+    }
+
+    fn hosted_receive_yield(yielded: crate::win32k_glue::ReceiveYield) -> Self {
+        Self {
+            shared_reply: None, service_finished: false, received: None,
+            badge: 0, mi: 0, m0: 0, m1: 0, m2: 0, m3: 0, m4: 0,
+            scheduler_yield: false, receive_yield: Some(yielded),
         }
     }
 }
@@ -1658,6 +1673,7 @@ struct PumpLoopOutcome {
     provider_wait_suspended: bool,
     lpc_wait_suspended: bool,
     scheduler_yielded: bool,
+    receive_yield: Option<crate::win32k_glue::ReceiveYield>,
     wall_ip: u64,
     wall_addr: u64,
     wall_label: u64,
@@ -1677,6 +1693,7 @@ impl PumpLoopOutcome {
             provider_wait_suspended: false,
             lpc_wait_suspended: false,
             scheduler_yielded: false,
+            receive_yield: None,
             wall_ip: 0,
             wall_addr: 0,
             wall_label: 0,
@@ -1808,6 +1825,7 @@ pub(crate) struct PumpResult {
     /// The request remains live while IRQ scheduler work runs. Continue its receive half on this
     /// reply object with the same accounting; do not replay an initial request or callback resume.
     pub scheduler_yielded: bool,
+    pub receive_yield: Option<crate::win32k_glue::ReceiveYield>,
     /// Wall diagnostics (only meaningful when `!completed`).
     pub wall_ip: u64,
     pub wall_addr: u64,
@@ -1835,6 +1853,7 @@ impl PumpResult {
             provider_wait_suspended: false,
             lpc_wait_suspended: false,
             scheduler_yielded: false,
+            receive_yield: None,
             wall_ip: 0,
             wall_addr: 0,
             wall_label: 0,
@@ -1849,7 +1868,7 @@ impl PumpResult {
 
     fn is_receive_yield(&self) -> bool {
         self.reply_cap != 0
-            && self.scheduler_yielded
+            && (self.scheduler_yielded || self.receive_yield.is_some())
             && !self.completed
             && !self.callback_suspended
             && !self.provider_wait_suspended
@@ -1976,7 +1995,7 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
     completion_label: u64,
 ) -> HostedIrqExchangeResult {
     use shared_ingress::owner::runtime;
-    let parent = runtime::nested::park_current().expect("retain IRQ invocation parent");
+    let mut parent = runtime::nested::park_current().expect("retain IRQ invocation parent");
     let route = runtime::channel_route(ch).expect("IRQ physical source").expect("enrolled IRQ source");
     let dispatch = runtime::admit(route).expect("admit retained IRQ completion Call");
     let mut channel = *ch;
@@ -2060,7 +2079,7 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
             .expect("authenticate IRQ arena-token completion");
     }
     pump_suspend_walled_component(ch, outcome);
-    runtime::nested::restore(parent).expect("restore IRQ invocation parent");
+    runtime::nested::restore(&mut parent).expect("restore IRQ invocation parent");
     HostedIrqExchangeResult {
         reply_cap: ch.reply_cap,
         message,
@@ -2101,7 +2120,9 @@ pub(crate) unsafe fn component_pump_continue_receive(
     previous: &PumpResult,
 ) -> Result<PumpResult, u32> {
     if !previous.is_receive_yield()
-        || !(ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
+        || !(ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield
+            || previous.receive_yield.is_some_and(|yielded|
+                crate::win32k_glue::receive_continuation_is_current(ch, yielded)))
         || (ch.caps.kernel_irq_yield && previous.reply_cap != ch.reply_cap)
     {
         return Err(nt_process::STATUS_INVALID_PARAMETER);
@@ -2118,6 +2139,7 @@ pub(crate) unsafe fn component_pump_continue_receive(
     let mut outcome = component_pump_loop(ch, first, &mut reply_cap, previous.accounting, &mut seh.pump);
     let suspended = outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended;
     if !seh.finish(ch, reply_cap, suspended) {
+        assert!(outcome.receive_yield.is_none(), "receive yield retained with failed SEH retirement");
         outcome.callback_suspended = false;
         outcome.provider_wait_suspended = false;
         outcome.lpc_wait_suspended = false;
@@ -2268,6 +2290,7 @@ unsafe fn component_pump_enter(
     let mut outcome = component_pump_loop(ch, first, &mut reply_cap, accounting, &mut seh.pump);
     let suspended = outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended;
     if !seh.finish(ch, reply_cap, suspended) {
+        assert!(outcome.receive_yield.is_none(), "receive yield retained with failed SEH retirement");
         outcome.callback_suspended = false;
         outcome.provider_wait_suspended = false;
         outcome.lpc_wait_suspended = false;
@@ -2350,6 +2373,11 @@ unsafe fn component_pump_loop(
             break;
         }
         msg.restore_received();
+        if let Some(yielded) = msg.receive_yield {
+            assert!(!seh.retained(), "retained exception cannot yield its receive ownership");
+            outcome.receive_yield = Some(yielded);
+            break;
+        }
         if msg.scheduler_yield {
             if seh.retained() {
                 msg = pump_recv_retained_seh(ch);
@@ -4442,7 +4470,7 @@ unsafe fn pump_finish_slice(
 ) -> PumpResult {
     use nt_user_host::component_pump::PumpDepthDisposition;
     match outcome.accounting.after_slice(
-        outcome.scheduler_yielded,
+        outcome.scheduler_yielded || outcome.receive_yield.is_some(),
         outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended,
     ) {
         PumpDepthDisposition::None | PumpDepthDisposition::Retained => {}
@@ -4466,6 +4494,7 @@ unsafe fn pump_suspend_walled_component(ch: &PumpChannel, outcome: PumpLoopOutco
         && !outcome.provider_wait_suspended
         && !outcome.lpc_wait_suspended
         && !outcome.scheduler_yielded
+        && outcome.receive_yield.is_none()
     {
         pump_wall_state_diag(ch, outcome);
         crate::print_str(b"[pump] WALL label=");
@@ -4543,6 +4572,7 @@ unsafe fn pump_result_from_outcome(
         || outcome.provider_wait_suspended
         || outcome.lpc_wait_suspended
         || outcome.scheduler_yielded
+        || outcome.receive_yield.is_some()
     {
         let status = nt_user_callback::STATUS_PENDING;
         (status, status as u32 as u64)
@@ -4570,6 +4600,7 @@ unsafe fn pump_result_from_outcome(
         provider_wait_suspended: outcome.provider_wait_suspended,
         lpc_wait_suspended: outcome.lpc_wait_suspended,
         scheduler_yielded: outcome.scheduler_yielded,
+        receive_yield: outcome.receive_yield,
         wall_ip: outcome.wall_ip,
         wall_addr: outcome.wall_addr,
         wall_label: outcome.wall_label,
