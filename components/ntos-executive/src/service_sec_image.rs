@@ -6,6 +6,11 @@ use crate::fault_stack_diagnostics::read_fault_stack_word;
 use crate::*;
 use nt_user_host::hosted_return_target::HostedReturnTarget;
 
+#[path = "component_continuation.rs"]
+mod component_continuation;
+use component_continuation::{HostedNativeContinuation, PendingComponentDispatch};
+pub(crate) use component_continuation::{ComponentNativeContinuation, ComponentSuspensionCompletion};
+
 #[path = "bootstrap_wait_selftest.rs"]
 pub(crate) mod bootstrap_wait_selftest;
 
@@ -172,96 +177,6 @@ static mut SERVICE_GENERIC_SECTIONS_WORK: GenericSectionTable = GenericSectionTa
 static mut SERVICE_DELAY_QUEUE_WORK: Option<nt_delay_execution::Queue> = None;
 static SERVICE_DELAY_DRAIN_HANDLER: AtomicU64 = AtomicU64::new(0);
 static SERVICE_DELAY_DRAIN_QUEUE: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Clone, Copy)]
-enum PendingComponentDispatch {
-    Provider(win32k_glue::PendingProviderWaitDispatch),
-    Lpc(win32k_glue::PendingLpcWaitDispatch),
-}
-
-impl PendingComponentDispatch {
-    fn client(self) -> win32k_glue::Win32kClientContext {
-        match self {
-            Self::Provider(pending) => pending.client,
-            Self::Lpc(pending) => pending.client,
-        }
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct ComponentSuspensionCompletion {
-    status: i32,
-    lpc_message_id: u32,
-    lpc_reply_len: u32,
-    lpc_reply: [u8; nt_lpc_abi::PORT_MESSAGE_MAX_LEN],
-}
-
-impl ComponentSuspensionCompletion {
-    const fn provider(status: i32) -> Self {
-        Self {
-            status,
-            lpc_message_id: 0,
-            lpc_reply_len: 0,
-            lpc_reply: [0; nt_lpc_abi::PORT_MESSAGE_MAX_LEN],
-        }
-    }
-
-    fn lpc(status: i32, message_id: u32, reply: &[u8]) -> Option<Self> {
-        if reply.len() > nt_lpc_abi::PORT_MESSAGE_MAX_LEN {
-            return None;
-        }
-        let mut completion = Self {
-            status,
-            lpc_message_id: message_id,
-            lpc_reply_len: reply.len() as u32,
-            lpc_reply: [0; nt_lpc_abi::PORT_MESSAGE_MAX_LEN],
-        };
-        completion.lpc_reply[..reply.len()].copy_from_slice(reply);
-        Some(completion)
-    }
-
-    fn lpc_reply(&self) -> &[u8] {
-        &self.lpc_reply[..self.lpc_reply_len as usize]
-    }
-}
-
-#[derive(Clone, Copy)]
-struct HostedNativeContinuation {
-    pending: PendingComponentDispatch,
-    return_target: HostedReturnTarget<win32k_glue::StagedUserCallbackContext>,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum ComponentNativeContinuation {
-    Hosted(HostedNativeContinuation),
-    // Native blocking admission still requires the stopped-job scheduler and receive ownership.
-    Kernel(nt_user_host::provider_kernel_activation::KernelProviderWaitCapture),
-}
-
-impl nt_user_host::provider_kernel_wait::KernelProviderWaitContinuation for ComponentNativeContinuation {
-    fn kernel_wait_capture(&self) -> Option<nt_user_host::provider_kernel_activation::KernelProviderWaitCapture> {
-        match self {
-            Self::Kernel(capture) => Some(*capture),
-            Self::Hosted(_) => None,
-        }
-    }
-}
-
-impl ComponentNativeContinuation {
-    fn hosted(&self) -> Option<&HostedNativeContinuation> {
-        match self {
-            Self::Hosted(hosted) => Some(hosted),
-            Self::Kernel(_) => None,
-        }
-    }
-
-    fn hosted_mut(&mut self) -> Option<&mut HostedNativeContinuation> {
-        match self {
-            Self::Hosted(hosted) => Some(hosted),
-            Self::Kernel(_) => None,
-        }
-    }
-}
 
 #[derive(Clone, Copy)]
 struct ComponentCallbackTransfer {
