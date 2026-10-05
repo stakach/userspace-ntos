@@ -8,6 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+nt-page-storage = { workspace = true }
 nt-delay-execution = { workspace = true }
 nt-syscall = { workspace = true }
 nt-ntdll-layout = { workspace = true }
@@ -31,6 +32,7 @@ nt-user-callback = { workspace = true }
 undocumented_unsafe_blocks = "deny"
 
 [dev-dependencies]
+nt-page-storage = { workspace = true, features = ["allocation-observation"] }
 nt-time = { workspace = true }
 nt-config-manager = { workspace = true }
 nt-fs = { workspace = true }
