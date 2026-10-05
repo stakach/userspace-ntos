@@ -96,6 +96,7 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: b
                 // this invocation's stored arrival on the next pass.
             }
             Ok(runtime::Arrival::Notification(message)) => {
+                crate::census_tick_static(crate::monotonic_time_100ns());
                 let (event, _, irq) = pump_handle_executive_event_badge(message.badge());
                 if !event {
                     continue;

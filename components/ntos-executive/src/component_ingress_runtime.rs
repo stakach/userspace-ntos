@@ -75,6 +75,41 @@ static mut SOURCES: IngressSourceRegistry = IngressSourceRegistry::new();
 static mut NATIVE_PEERS: Vec<NativePeer> = Vec::new();
 static mut INITIAL_REPLIES: Vec<Option<ComponentIngress<ReceivedMessage>>> = Vec::new();
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RunningSnapshot {
+    pub lane: nt_component_suspension::LaneHandle,
+    pub binding: Option<nt_component_suspension::LaneBinding>,
+    pub dispatch: Option<LaneDispatchIdentity>,
+    pub route: Option<PeerRoute>,
+    pub physical: Option<PhysicalSource>,
+    pub quarantined: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HoldSnapshot {
+    pub running: Option<RunningSnapshot>,
+    pub oldest: Option<hosted::PendingSnapshot>,
+}
+
+/// Evidence only: called at serialized event boundaries after mutable ingress borrows end.
+pub(crate) unsafe fn hold_snapshot() -> HoldSnapshot {
+    let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);
+    let peers = &*core::ptr::addr_of!(NATIVE_PEERS);
+    let running = lanes.running().map(|lane| {
+        let route = lanes.peer_route(lane).ok().flatten();
+        let peer = route.and_then(|route| peers.iter().find(|peer| peer.route == Some(route)));
+        RunningSnapshot {
+            lane,
+            binding: lanes.binding(lane).ok(),
+            dispatch: lanes.active_dispatch_identity(lane).ok().flatten(),
+            route,
+            physical: peer.map(|peer| peer.physical),
+            quarantined: peer.map(|peer| peer.quarantined),
+        }
+    });
+    HoldSnapshot { running, oldest: hosted::oldest_pending_snapshot() }
+}
+
 unsafe fn lanes() -> &'static mut ComponentLanes {
     &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS)
 }

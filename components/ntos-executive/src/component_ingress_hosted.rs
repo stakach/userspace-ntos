@@ -21,6 +21,38 @@ struct HostedCall {
     released: bool,
 }
 static mut CALLS: Vec<Option<HostedCall>> = Vec::new();
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingSnapshot {
+    pub binding: Binding,
+    pub reply: u64,
+    pub executor: u64,
+    pub admission_sequence: u64,
+    pub info: u64,
+    pub registers: [u64; 4],
+}
+
+pub(super) unsafe fn oldest_pending_snapshot() -> Option<PendingSnapshot> {
+    let rows = &*core::ptr::addr_of!(CALLS);
+    let index = nt_component_suspension::oldest_external_ingress(
+        rows.iter().enumerate().filter_map(|(index, row)| {
+            let row = row.as_ref()?;
+            if row.delivered { return None; }
+            row.call.as_ref().map(|call| (index, call))
+        }),
+    )?;
+    let row = rows[index].as_ref()?;
+    let call = row.call.as_ref()?;
+    let message = call.message();
+    Some(PendingSnapshot {
+        binding: row.binding,
+        reply: call.reply(),
+        executor: call.executor(),
+        admission_sequence: call.admission_sequence(),
+        info: message.info(),
+        registers: message.registers(),
+    })
+}
 struct Cancellation {
     binding: Binding,
     reply: u64,

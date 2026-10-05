@@ -1135,6 +1135,29 @@ type UserCallbackDispatchContext = nt_user_callback::DispatchContext;
 static mut USER_CALLBACK_CURRENT_DISPATCH: UserCallbackDispatchContext =
     UserCallbackDispatchContext::EMPTY;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DispatchObservationSnapshot {
+    pub dispatch_id: u64,
+    pub ssn: u64,
+    pub args: [u64; 4],
+    pub logical_caller: Option<nt_user_host::provider_logical_caller::ProviderLogicalCaller>,
+}
+
+pub(crate) unsafe fn dispatch_observation_snapshot(
+    lane: nt_component_suspension::LaneHandle,
+) -> Option<DispatchObservationSnapshot> {
+    let dispatch = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+    if dispatch.lane != lane || dispatch.dispatch_id == 0 { return None; }
+    let registry = &*core::ptr::addr_of!(WIN32K_DISPATCH_CLIENT_REGISTRY);
+    let client = registry.dispatch(dispatch.dispatch_id)?;
+    Some(DispatchObservationSnapshot {
+        dispatch_id: dispatch.dispatch_id,
+        ssn: dispatch.ssn,
+        args: dispatch.args,
+        logical_caller: client.logical_caller,
+    })
+}
+
 /// Bind a registry request to the logical client registered for this exact running GUI job.
 /// A live thread plus a live physical channel alone does not establish their association.
 pub(crate) unsafe fn registry_logical_caller_is_current(

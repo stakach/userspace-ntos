@@ -19,6 +19,7 @@ extern crate alloc;
 // Re-export the kernel ABI at crate root so `server` can `use crate::*`.
 pub use sel4_rt::*;
 mod serial_records;
+mod ingress_observation;
 pub use serial_records::{debug_put_char, print_str, print_u64};
 
 mod acpi_platform;
@@ -7033,6 +7034,7 @@ fn print_hot_ssn_field(who: &[u8], hist: &[AtomicU64; SSN_HIST_N]) {
 }
 
 fn print_periodic_census_heartbeat(n: u64, now: u64) {
+    ingress_observation::print_hold_snapshot(now);
     let mut total_events = 0u64;
     let mut hot_badge = usize::MAX;
     let mut hot_badge_events = 0u64;
