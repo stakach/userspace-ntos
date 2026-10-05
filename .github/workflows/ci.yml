@@ -51,7 +51,7 @@ jobs:
           cp references/reactos/win32ss/drivers/miniport/bochs/bochsmp.inf rust-micro/.tmp/reactos/reactos/inf/bochsmp.inf
       - uses: dtolnay/rust-toolchain@stable
       - name: Workspace unit, integration and doc specs
-        run: cargo test --workspace --locked 2>&1 | tee crate-specs.log
+        run: cargo test --workspace --locked --no-fail-fast 2>&1 | tee crate-specs.log
       - name: ntdll native-transport specs
         run: cargo test -p nt-ntdll --features native_transport --locked 2>&1 | tee native-transport-specs.log
       - name: Native acceptance log verifier specs
