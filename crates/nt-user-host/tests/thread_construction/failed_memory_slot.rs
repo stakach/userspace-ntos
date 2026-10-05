@@ -185,7 +185,7 @@ fn recycled_slot_reuse_elsewhere_preserves_original_snapshot_but_not_stale_rows(
     let (mut slot, id, _) = retained(None, true);
     let mut registry = ClientFrameRegistry::new();
     registry
-        .insert(2, MEMORY_PROCESS, 0x1000, 200, 0, 201, 202, false)
+        .insert(2, MEMORY_PROCESS, 0x1000, 100, 0, 201, 202, false)
         .unwrap();
     registry
         .insert(3, MEMORY_PROCESS, 0xa000, 601, 0, 0, 0, false)
