@@ -148,10 +148,8 @@ fn gui_message_capture_and_wait_use_registered_runtime_and_real_provider_wait() 
     let body = function(&source("win32k_glue.rs"), "resume_suspended_provider_wait_component");
     let mut names = Names::default();
     names.visit_block(&body);
-    for required in ["published_win32k_output_length", "release_win32k_message_stage"] {
-        assert!(names.calls.iter().any(|name| name == required),
-            "actual wait completion must publish and retire its exact MSG stage: {required}");
-    }
+    assert!(names.calls.iter().any(|name| name == "complete_resumed_dispatch"),
+        "actual provider wait completion must reach shared dispatch completion");
     struct OriginalSsn(bool);
     impl<'ast> Visit<'ast> for OriginalSsn {
         fn visit_expr_field(&mut self, expression: &'ast syn::ExprField) {
@@ -167,6 +165,43 @@ fn gui_message_capture_and_wait_use_registered_runtime_and_real_provider_wait() 
     let mut original = OriginalSsn(false);
     original.visit_block(&body);
     assert!(original.0, "the retained original syscall, not Peek, determines resumed completion");
+    let body = function(&source("win32k_receive.rs"), "resume_suspended_receive_component");
+    let mut names = Names::default();
+    names.visit_block(&body);
+    assert!(names.calls.iter().any(|name| name == "complete_resumed_dispatch"),
+        "actual Receive completion must reach shared dispatch completion");
+    let body = function(&source("win32k_glue.rs"), "complete_resumed_dispatch");
+    let mut names = Names::default();
+    names.visit_block(&body);
+    for required in ["published_win32k_output_length", "release_win32k_message_stage"] {
+        assert!(names.calls.iter().any(|name| name == required),
+            "shared resumed completion must publish and retire its exact MSG stage: {required}");
+    }
+    struct CompletedOriginalSsn(bool);
+    impl<'ast> Visit<'ast> for CompletedOriginalSsn {
+        fn visit_expr_call(&mut self, expression: &'ast syn::ExprCall) {
+            if matches!(&*expression.func, syn::Expr::Path(path)
+                if path.path.segments.iter().map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>() == ["CompletedWin32kDispatch", "new"])
+            {
+                self.0 |= matches!(expression.args.first(), Some(syn::Expr::Field(field))
+                    if matches!(&field.member, syn::Member::Named(name) if name == "ssn")
+                        && matches!(&*field.base, syn::Expr::Path(path) if path.path.is_ident("dispatch")));
+            }
+            syn::visit::visit_expr_call(self, expression);
+        }
+    }
+    let mut completed = CompletedOriginalSsn(false);
+    completed.visit_block(&body);
+    assert!(completed.0, "shared completion must construct the result from the retained original syscall");
+    let file = source("component_resume_execute.rs");
+    for caller in ["run_hosted", "run_receive"] {
+        let body = function(&file, caller);
+        let mut names = Names::default();
+        names.visit_block(&body);
+        assert!(names.calls.iter().any(|name| name == "finish_hosted_resume"),
+            "{caller} must reach the shared terminal/callback/retained-wait completion tail");
+    }
 }
 
 #[test]

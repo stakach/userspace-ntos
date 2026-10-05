@@ -121,16 +121,31 @@ impl VSpaceObserver {
         &self,
         binding: nt_user_host::thread_binding::ThreadBinding<super::HostedThreadRole>,
     ) -> Option<u64> {
+        self.root_for_process(binding.pi, binding.process)
+    }
+
+    /// Exact process publication lookup; a cap alone cannot select an owner or its incarnation.
+    pub(crate) fn root_for_process(&self, pi: usize, process: ProcessIdentity) -> Option<u64> {
         let rows = self.store.try_borrow().ok()?;
-        let Slot::Owned(owner) = rows.get(binding.pi)? else {
+        let Slot::Owned(owner) = rows.get(pi)? else {
             return None;
         };
-        (binding.process == owner.process
-            && binding.process.is_valid()
-            && binding.process.generation
+        (process == owner.process
+            && process.is_valid()
+            && process.generation
                 == nt_memory_manager::ProcessGeneration::Hosted(owner.caps.generation)
             && owner.caps.pml4 != 0)
             .then_some(owner.caps.pml4)
+    }
+
+    /// Connect the effect's destination with the same root observed by the physical query.
+    pub(crate) fn matches_mapping_destination(
+        &self,
+        pi: usize,
+        process: ProcessIdentity,
+        destination: u64,
+    ) -> bool {
+        destination != 0 && self.root_for_process(pi, process) == Some(destination)
     }
 }
 
@@ -238,8 +253,34 @@ mod tests {
         let observer = journal.observer();
         let borrowed = journal.store.borrow_mut();
         assert_eq!(observer.expected_child_root(binding(2)), None);
+        assert!(!observer.matches_mapping_destination(0, binding(2).process, 100));
         drop(borrowed);
         assert_eq!(observer.expected_child_root(binding(2)), Some(100));
+    }
+    #[test]
+    fn mapping_destination_requires_exact_current_journal_owner_and_nonzero_root() {
+        let journal = HostedProcessVSpaces::new(2);
+        journal.publish(0, binding(2).process, caps(2)).unwrap();
+        let observer = journal.observer();
+        assert!(observer.matches_mapping_destination(0, binding(2).process, 100));
+        assert!(!observer.matches_mapping_destination(0, binding(2).process, 200));
+        assert!(!observer.matches_mapping_destination(0, binding(2).process, 0));
+        assert!(!observer.matches_mapping_destination(0, binding(3).process, 100));
+        assert!(!observer.matches_mapping_destination(1, binding(2).process, 100));
+        let mut foreign = binding(2).process;
+        foreign.pid = 400;
+        assert!(!observer.matches_mapping_destination(0, foreign, 100));
+        assert_eq!(journal.get(0).flatten().unwrap().pml4, 100);
+        let mut update = journal
+            .begin_update(0, binding(2).process)
+            .unwrap()
+            .unwrap();
+        assert!(!observer.matches_mapping_destination(0, binding(2).process, 100));
+        // A cleared root can never be accepted, even while other cleanup metadata is retained.
+        update.caps_mut().pml4 = 0;
+        drop(update);
+        assert_eq!(observer.root_for_process(0, binding(2).process), None);
+        assert!(!observer.matches_mapping_destination(0, binding(2).process, 0));
     }
     #[test]
     fn native_update_moves_owner_and_restores_acknowledged_prefix_on_refusal() {

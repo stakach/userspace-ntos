@@ -102,6 +102,10 @@ impl ResidentMappingRevalidationIo<ResidentPrivatePage> for ResidentIo<'_> {
             || current.scratch_base != target.scratch
             || target.pml4 == 0
             || target.scratch == 0
+            || !self
+                .handler
+                .hosted_vspace_observer()
+                .matches_mapping_destination(target.pi, target.process, target.pml4)
             || retained_record(target.pi, target.process, target.page)? != Some(target.record)
             || mapped.cap != target.record.frame
             || backing.cap != target.record.owned_backing_cap
@@ -234,6 +238,18 @@ impl ExecNtHandler {
             || canonical_private_information(binding.pi, capture.page) != Some(capture.information)
             || retained_record(binding.pi, binding.process, capture.page)? != Some(capture.record)
         {
+            return Err(INVALID);
+        }
+        let ctx = self
+            .loop_ctx
+            .and_then(|ctx| ctx.for_process(binding.pi))
+            .ok_or(INVALID)?;
+        let current = (&*ctx.procs).get(binding.pi).copied().ok_or(INVALID)?;
+        if !self.hosted_vspace_observer().matches_mapping_destination(
+            binding.pi,
+            binding.process,
+            current.pml4,
+        ) {
             return Err(INVALID);
         }
         let plan = match plan_private_read_fault(
