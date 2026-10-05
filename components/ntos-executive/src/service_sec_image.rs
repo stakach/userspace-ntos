@@ -6,6 +6,10 @@ use crate::fault_stack_diagnostics::read_fault_stack_word;
 use crate::*;
 use nt_user_host::hosted_return_target::HostedReturnTarget;
 
+#[path = "hosted_quiesce.rs"]
+mod hosted_quiesce;
+use hosted_quiesce::dump_all_hosted_thread_quiesce;
+
 #[path = "component_continuation.rs"]
 mod component_continuation;
 use component_continuation::{HostedNativeContinuation, PendingComponentDispatch};
@@ -17975,6 +17979,14 @@ pub(crate) unsafe fn service_sec_image(
     if quiesce_cm_status != nt_fs::STATUS_SUCCESS {
         stop = quiesce_cm_status as u64;
     }
+    dump_all_hosted_thread_quiesce(
+        &nt_handler,
+        &*hosted_loaded_images,
+        &reg,
+        ntdll,
+        procs,
+        pfilled,
+    );
     dump_interactive_logon_quiesce(
         &nt_handler,
         &*hosted_loaded_images,
@@ -22634,9 +22646,33 @@ unsafe fn dump_hosted_thread_quiesce(
     procs: &[ProcExec],
     pfilled: &[[u64; 512]],
 ) {
-    let process = nt_handler.capture_process_identity(pi);
-    let mut regs = [0u64; 20];
-    crate::win32k_glue::tcb_read_regs20(tcb, &mut regs);
+    let Some(caller) = hosted_quiesce::quiesce_caller(nt_handler, pi, tid, tcb, badge) else {
+        print_quiesce_tag(label, b"-caller");
+        print_str(b" unavailable (no exact current process/thread lifetime)\n");
+        return;
+    };
+    let process = Some(caller.process());
+    let wait = object_wait_snapshot_for_caller(caller);
+    hosted_quiesce::print_wait_snapshot(label, wait);
+    let reply = wait.filter(|wait| !wait.reply_sent).map_or(0, |wait| wait.reply_cap);
+    if reply == 0 {
+        print_quiesce_tag(label, b"-reply");
+        print_str(b" unavailable (no exact unsent dispatcher-wait Reply)\n");
+    }
+    crate::win32k_glue::trace_hosted_tcb_debug_state(label, tcb, reply);
+    let context = match crate::thread_context::LegacyThreadContext::read(tcb) {
+        Ok(context) => context,
+        Err(error) => {
+            print_quiesce_tag(label, b"-registers");
+            print_str(b" unavailable tcb=0x");
+            print_hex_u64(tcb);
+            print_str(b" error=0x");
+            print_hex_u64(error);
+            print_str(b"\n");
+            return;
+        }
+    };
+    let regs = context.registers;
     let rip = regs[nt_user_callback::USER_CONTEXT_RIP];
     let rsp = regs[nt_user_callback::USER_CONTEXT_RSP];
     let rax = regs[nt_user_callback::USER_CONTEXT_RAX];
@@ -22690,11 +22726,6 @@ unsafe fn dump_hosted_thread_quiesce(
     print_hex_u64(r9);
     print_str(b"\n");
 
-    crate::win32k_glue::trace_hosted_tcb_debug_state(
-        label,
-        tcb,
-        REPLY_MAIN_SLOT.load(Ordering::Relaxed),
-    );
     dump_hosted_quiesce_rip_mapping(label, pi, rip);
 
     let mut threads = [HostedThreadQuiesceRecord::empty(); 32];

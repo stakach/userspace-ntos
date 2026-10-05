@@ -60,7 +60,7 @@ and [issues](https://github.com/stakach/userspace-ntos/issues), not Markdown pro
 commands sequentially on stable Rust:
 
 ```sh
-RUST_TEST_THREADS=1 cargo test --workspace --locked
+RUST_TEST_THREADS=1 cargo test --workspace --locked --no-fail-fast
 RUST_TEST_THREADS=1 cargo test -p nt-ntdll --features native_transport --locked
 ```
 

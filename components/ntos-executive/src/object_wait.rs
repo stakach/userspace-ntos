@@ -122,6 +122,37 @@ pub(super) fn object_waiter_len() -> usize {
     unsafe { (&*core::ptr::addr_of!(OBJECT_WAITERS)).slot_len() }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct ObjectWaitSnapshot {
+    pub(super) reply_cap: u64,
+    pub(super) reply_sent: bool,
+    pub(super) sequence: u64,
+    pub(super) objects: [WaitObject; WAITER_MAX_EVENTS],
+    pub(super) count: u8,
+    pub(super) wait_all: bool,
+    pub(super) alertable: bool,
+    pub(super) deadline: nt_delay_execution::Deadline,
+}
+
+pub(super) fn object_wait_snapshot_for_caller(
+    caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
+) -> Option<ObjectWaitSnapshot> {
+    let table = unsafe { &*core::ptr::addr_of!(OBJECT_WAITERS) };
+    let mut matches = table.iter().filter(|(_, record)| record.caller == caller);
+    let (_, record) = matches.next()?;
+    if matches.next().is_some() { return None; }
+    Some(ObjectWaitSnapshot {
+        reply_cap: record.reply_cap,
+        reply_sent: record.reply_sent,
+        sequence: record.sequence,
+        objects: record.objects,
+        count: record.count,
+        wait_all: record.wait_all,
+        alertable: record.alertable,
+        deadline: record.deadline,
+    })
+}
+
 pub(super) fn object_waiter_record(
     slot: usize,
 ) -> Option<(ObjectWaiterIdentity, ObjectWaiterRecord)> {

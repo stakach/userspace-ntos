@@ -9051,6 +9051,33 @@ impl ExecNtHandler {
             .map(|runtime| runtime.badge)
     }
 
+    pub(crate) fn next_hosted_thread_quiesce_snapshot(
+        &self,
+        mut cursor: usize,
+    ) -> Option<(
+        usize,
+        nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
+        Option<nt_process::ThreadLifetime>,
+    )> {
+        let table = unsafe { &*self.thread_runtime.table };
+        while let Some(slot) = table.entries.get(cursor) {
+            cursor += 1;
+            let Some(runtime) = slot.executable() else { continue; };
+            if !runtime.is_live() || runtime.tcb <= 1 { continue; }
+            let binding = runtime.binding();
+            let lifetime = nt_process::ThreadId::try_from(binding.tid).ok()
+                .and_then(|tid| self.pm.thread_lifetime(tid))
+                .filter(|lifetime| {
+                    self.capture_process_identity(binding.pi) == Some(binding.process)
+                        && self.capture_provider_logical_caller(
+                            binding.pi, binding.tid, binding.badge, binding.tcb,
+                        ).is_some_and(|caller| caller.thread() == *lifetime)
+                });
+            return Some((cursor, binding, lifetime));
+        }
+        None
+    }
+
     pub(crate) fn hosted_thread_quiesce_records_for_pi(
         &self,
         pi: usize,
