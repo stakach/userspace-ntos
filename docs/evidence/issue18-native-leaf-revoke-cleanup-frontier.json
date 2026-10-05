@@ -1,0 +1,63 @@
+{
+  "native_commit": "49578c3eaf30d61de5710adc072a1b2471e712d3",
+  "microkernel_commit": "92c4e2b330019c7c8afb1544b3cbf8ca1219eb73",
+  "profile": "font-cleanup",
+  "launcher": "./run.sh --desktop",
+  "command": "env -u NTOS_MUP_PROVIDER_KERNEL_ONLY -u NTDLL_FEATURES NTOS_IMAGE_PROFILE=font-cleanup IMAGE_MIB=256 PERSIST_IMAGE_MIB=16 BOOT_TIMEOUT_SECONDS=3600 RUN_LOG=$PWD/.tmp/issue18-callback-restart-font-boot.log ./run.sh --desktop -qmp unix:$PWD/.tmp/issue18-callback-restart-font-qmp.sock,server=on,wait=off",
+  "boot_limit_seconds": 3600,
+  "termination": "The root validation owner sent SIGTERM to the exact QEMU PID12550 after approximately 52 minutes, following investigation of slow native cleanup. This was not natural quiescence, a completed guest gate, or a timeout verdict.",
+  "launcher_exit": 1,
+  "qemu_exit": null,
+  "qemu_termination_signal": 15,
+  "collector_exit": 130,
+  "parser_exit": 1,
+  "exit_status_provenance": "Root consumed launcher session23600 exit1, collector session70374 exit130, and the directly invoked parser exit1. The validation log records QEMU terminating on signal15; the collector finally block records266 frames and last-slot1 before KeyboardInterrupt.",
+  "parser_command": "python3 tests/native/font_cleanup/verify_log.py .tmp/issue18-callback-restart-font-boot.log",
+  "parser_diagnostic": "FAIL native font cleanup: missing or duplicate \\[font-acceptance\\] PID-QUERY actual=0x00000000 expected=0x00000000",
+  "collector_frames": 266,
+  "collector_last_slot": 1,
+  "executive_gate_passed": null,
+  "executive_gate_total": null,
+  "guest_summary_observed": false,
+  "guest_sentinel_observed": false,
+  "explorer_desktop_proven": false,
+  "font_acceptance_proven": false,
+  "screenshot": "../images/native-leaf-revoke-cleanup-frontier.png",
+  "screenshot_origin": "Same-run manual QMP capture while the guest was stopped, converted and viewed by the root validation owner. This is separate from the collector's final slot1.",
+  "screenshot_sha256": "53ad5f5ac610f375103c4b38bc9dcda1b85defd34e60860272a02fff0da0c9cb",
+  "root_viewed_screenshot": true,
+  "raw_log_sha256": "403fd6cffba531e08cb5445b208c74cb1941628f0f5e948ac7b5494c9ed87154",
+  "archived_log": "issue18-native-leaf-revoke-cleanup-frontier.log.gz",
+  "archived_log_sha256": "a73c74a4b5e49a36f837440e2b3cd190d05ce56f743b61a8cf4dfd181425e33f",
+  "validation_log_sha256": "26f3e1566f87431975cd1ee0b115e552f5732f8764ebe1be78ec8469097c8d14",
+  "collector_log_sha256": "d7d73c283661b96be96db2f968bf9bd0b64cc5cebb97821a5a6c63a1bc67e380",
+  "qmp_register_records": [
+    {
+      "path": "issue18-native-leaf-revoke-cleanup-frontier-registers-a.jsonl",
+      "sha256": "d5a8d20357b3702d1cd3f2fefe422af5f70c2fb941f359e5f342da13de0b07a2",
+      "cpu0_rip": "0xfffffffffe026ee4"
+    },
+    {
+      "path": "issue18-native-leaf-revoke-cleanup-frontier-registers-b.jsonl",
+      "sha256": "3eb6b2d4bfe1d7e1817c479c06d10922ec8c572114fb06d320f4bc30766613d7",
+      "cpu0_rip": "0xfffffffffe01affc"
+    }
+  ],
+  "rootserver_path": "rust-micro/.tmp/rootserver.elf",
+  "rootserver_bytes": 9436024,
+  "rootserver_sha256": "deffa95c69bf109787a5c312840ba4ff6f036f5e4175fcf9fd45f2b215184137",
+  "kernel_path": "rust-micro/target/mykernel-x86/release/mykernel-rust",
+  "kernel_sha256": "769c70bb7d278dbcfb35e20c42f5765bdad195c3840a93b7b631d933e06223f3",
+  "disk_path": "rust-micro/.tmp/disk.img",
+  "disk_sha256_after_termination": "7eec9c58c2ad7bef63a5f38079df895082db1ecf732214995c249c18abb62ff2",
+  "observations": [
+    "Raw log line65312 publishes setup.exe PI17/PID1024, parent376. Line106312 publishes its rundll32.exe child PI19/PID1312, parent1024. The former PI19 occupant spoolsv.exe PID1168 generation14 had retired at line100600; its exit is not the helper's exit.",
+    "The helper's initial TID1320 receives TCB capability0x33724 at line106439 and resumes at106533. Its actual hosted IPC badge806 is recorded at108976/108998.",
+    "The helper executes real API0 WM_CREATE callbacks at117188 and119062, then later window-position and destruction callbacks. It passes the prior low activation-frame fault frontier; the run contains no vmf-low or native-image-fault-failure diagnostic.",
+    "Line128370 records the exact helper PI19/PID1312 generation16 terminal receipt: exit-status0 and signaled1. The remaining process-delete-pending record at128372 is not a completed process-reclamation receipt.",
+    "Earlier direct root QMP tool snapshots captured CPU0 at 0xfffffffffe00639a (decode_cnode revoke marking pass) and 0xfffffffffe030d5a (CteCursor::next), with other CPUs waiting on the BKL. The sampled revoke epochs advanced from0xe2c to0xf12 and source slots changed: repeated expensive revokes, not a proven infinite traversal. These earlier snapshots are tool transcript evidence, not the two archived JSONL records.",
+    "The two later archived stopped QMP register samples roughly52 seconds apart capture CPU0 in CPL0 at different kernel RIPs, with CPUs1-3 halted. They confirm continued native execution after the earlier scans; they do not prove cleanup completed or that there is a deadlock.",
+    "The stopped same-run screenshot shows only background and cursor. No genuine Userinit or Explorer process launch is recorded, and the guest emits neither its final summary nor its sentinel before manual termination.",
+    "The font parser reports missing PID-QUERY evidence. No font acceptance, Explorer desktop proof, or complete boot verdict is claimed. Earlier archived evidence remains unchanged."
+  ]
+}
