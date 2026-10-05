@@ -5,6 +5,10 @@ use crate::native_image_sections::NativeImageSectionId;
 use nt_memory_manager::image_section::{ImageMappedViewPhase, ImageViewRef};
 use nt_address_space::ImageFaultObservation;
 
+#[path = "image_view_transition.rs"]
+mod transition;
+use transition::{capture_image_view_transition, emit_image_view_transition, ImageViewTransitionKind};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct NativeImageViewDescriptor {
     pub(crate) view: ImageViewRef,
@@ -174,12 +178,14 @@ impl ExecNtHandler {
                 .map_err(image_section_create::map_image_error)?;
             return Err(nt_process::STATUS_INVALID_HANDLE);
         }
+        let observation = capture_image_view_transition(self, descriptor);
         self.native_image_views.push(NativeImageViewOwner { descriptor });
         self.image_sections.begin_mapped_view_mapping(view, process).map_err(image_section_create::map_image_error)?;
         *process_vm_region_map_mut(pi).ok_or(nt_process::STATUS_INVALID_HANDLE)? = *after;
         *process_committed_mapping_table_mut(pi).ok_or(nt_process::STATUS_INVALID_HANDLE)? = *committed;
         self.commit_process_commit_charge(charge);
         self.image_sections.publish_mapped_view(view).map_err(image_section_create::map_image_error)?;
+        emit_image_view_transition(observation, ImageViewTransitionKind::Mapped, self.native_image_views.len());
         // A committed view survives late user publication faults, just as the reference NT map.
         self.process_memory_write_checked(self.pi, args[6], &placement.size.to_le_bytes())
             .map_err(nt_address_space::copy::MemoryCopyFailure::status)?;
@@ -214,6 +220,7 @@ impl ExecNtHandler {
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         committed.unregister_allocation_base(descriptor.base);
         self.ensure_process_commit_owner(descriptor.process.pid, pi)?;
+        let observation = capture_image_view_transition(self, descriptor);
         let receipt = self.image_sections.begin_mapped_view_retirement(descriptor.view, descriptor.process)
             .map_err(image_section_create::map_image_error)?;
         crate::native_image_residency::drain_view(self, descriptor)?;
@@ -225,6 +232,7 @@ impl ExecNtHandler {
         *process_committed_mapping_table_mut(pi).ok_or(nt_process::STATUS_INVALID_HANDLE)? = *committed;
         self.release_process_commit(descriptor.process.pid, charge);
         self.native_image_views.swap_remove(index);
+        emit_image_view_transition(observation, ImageViewTransitionKind::Unmapped, self.native_image_views.len());
         Ok(true)
     }
 

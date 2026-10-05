@@ -34,6 +34,7 @@ pub mod module;
 pub mod notification;
 pub mod order;
 pub mod peb;
+pub mod reference_graph;
 pub mod resolve;
 pub mod thread;
 pub mod tls;
