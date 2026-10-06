@@ -1,5 +1,12 @@
 # Lessons
 
+## Shell Metadata Is Not JSON Input
+- JSON string quoting is not shell quoting. Backticks and dollar expressions in a GitHub body
+  still execute inside a double-quoted shell argument; pass prose through a structured input or
+  correctly escaped single-quoted argument instead.
+- Verify the stored issue or PR text after updating it. A successful CLI exit alone does not
+  prove that the body, commit IDs and code identifiers survived shell interpretation.
+
 ## Error Logs Are Not Submitted I/O Receipts
 - Trace status initialization and every diagnostic producer before attributing a native read
   failure. ReactOS input threads can print unchanged initial failure statuses when device opens
