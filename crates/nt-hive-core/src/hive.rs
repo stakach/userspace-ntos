@@ -8,6 +8,7 @@
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
+use nt_page_storage::PageSequence;
 
 #[path = "hive_create_child.rs"]
 mod create_child;
@@ -158,7 +159,7 @@ pub enum CurrentControlSetError {
 /// A mounted registry subtree as a cell arena (spec §6.1).
 #[derive(Clone)]
 pub struct Hive {
-    pub(crate) cells: Vec<Option<Cell>>,
+    pub(crate) cells: PageSequence<Option<Cell>>,
     pub(crate) value_blobs: Vec<Rc<Vec<u8>>>,
     pub(crate) root: CellId,
     pub(crate) next_id: u64,
@@ -473,7 +474,7 @@ impl Hive {
     /// Create an empty hive of `kind` with a root key cell.
     pub fn new(kind: HiveKind) -> Self {
         let mut h = Hive {
-            cells: Vec::new(),
+            cells: PageSequence::new(),
             value_blobs: Vec::new(),
             root: CellId(0),
             next_id: 1,
@@ -534,7 +535,7 @@ impl Hive {
     }
 
     pub fn reserve_cells(&mut self, additional: usize) -> bool {
-        self.cells.try_reserve_exact(additional).is_ok()
+        self.cells.try_reserve(additional).is_ok()
     }
 
     pub fn reserve_value_blobs(&mut self, additional: usize) -> bool {

@@ -868,7 +868,7 @@ fn compact_value_blobs_rejects_missing_payload_without_changes() {
         .zip(&blobs_before)
         .all(|(left, right)| Rc::ptr_eq(left, right)));
     assert_eq!(hive.cells.len(), cells_before.len());
-    for (after, before) in hive.cells.iter().zip(&cells_before) {
+    for (after, before) in hive.cells.iter().zip(cells_before.iter()) {
         match (after, before) {
             (Some(Cell::Value(after)), Some(Cell::Value(before))) => {
                 assert_eq!(after.id, before.id);
@@ -1355,7 +1355,7 @@ fn image_len_validation_checks_header_without_decoding_cells() {
 #[test]
 fn hive_image_compacts_sparse_cell_ids_on_decode() {
     let mut h = Hive {
-        cells: Vec::new(),
+        cells: nt_page_storage::PageSequence::new(),
         value_blobs: alloc::vec![Rc::new(b"service".to_vec())],
         root: CellId(64),
         next_id: 2048,

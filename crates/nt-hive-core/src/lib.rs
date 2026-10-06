@@ -87,3 +87,6 @@ mod tests;
 
 #[cfg(test)]
 mod key_kind_tests;
+
+#[cfg(test)]
+mod allocation_growth_tests;

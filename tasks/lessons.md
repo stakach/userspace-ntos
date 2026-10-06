@@ -585,3 +585,10 @@ diagnosis-free failure.
   alone does not authorize unmapping an arbitrary test address.
 - Exercise an actual extracted native boundary for the focused regression when
   no safe native test reservation exists; do not call host execution native proof.
+
+## Preserve Reservation Overflow Admission
+- Replacing a contiguous vector with segmented storage must retain its immediate
+  rejection of impossible logical byte extents. Checked element-count addition
+  alone does not prevent an enormous allocation loop.
+- Test refusal before directory construction, generators, identity publication or
+  journal effects. Aggregate host memory pressure is not a substitute for this check.

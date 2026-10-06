@@ -91,6 +91,10 @@ impl<T> PageSequence<T> {
         if Self::leaf_capacity() == 0 || Self::fanout() < 2 {
             return Err(());
         }
+        // Preserve Vec-compatible logical extent admission before allocating the segmented tree.
+        end.checked_mul(core::mem::size_of::<T>())
+            .filter(|bytes| *bytes <= isize::MAX as usize)
+            .ok_or(())?;
         for index in self.len..end {
             while index >= Self::capacity_at(self.depth) {
                 let mut children = Self::branch()?;
@@ -147,6 +151,39 @@ impl<T> PageSequence<T> {
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &T> + DoubleEndedIterator {
         (0..self.len).map(|index| self.get(index).expect("published metadata element"))
+    }
+
+    /// Traverse disjoint leaf elements without allocating iterator bookkeeping.
+    pub fn iter_mut(&mut self) -> impl ExactSizeIterator<Item = &mut T> {
+        IterMut::new(&mut self.root, self.len)
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        while self.len > len {
+            drop(self.pop());
+        }
+    }
+
+    /// Reserve every new slot before generating or publishing any new element.
+    pub fn try_resize_with(
+        &mut self,
+        new_len: usize,
+        mut generate: impl FnMut() -> T,
+    ) -> Result<(), ()> {
+        if new_len <= self.len {
+            self.truncate(new_len);
+            return Ok(());
+        }
+        self.try_reserve(new_len - self.len)?;
+        while self.len < new_len {
+            self.push(generate());
+        }
+        Ok(())
+    }
+
+    pub fn resize_with(&mut self, new_len: usize, generate: impl FnMut() -> T) {
+        self.try_resize_with(new_len, generate)
+            .expect("page sequence resize allocation failed");
     }
 
     /// Caller must reserve before publishing ownership or performing native effects.
@@ -216,6 +253,96 @@ impl<T> PageSequence<T> {
             }
         }
         walk(&self.root, &mut visit);
+    }
+}
+
+// IterMut retains only sibling iterators while descending, so every mutable reference is disjoint.
+// A directory's fanout is at least two; a usize-indexed tree cannot exceed usize::BITS ancestors.
+struct IterMut<'a, T> {
+    branches: [Option<core::slice::IterMut<'a, Node<T>>>; usize::BITS as usize],
+    depth: usize,
+    leaf: Option<core::slice::IterMut<'a, T>>,
+    remaining: usize,
+}
+
+impl<'a, T> IterMut<'a, T> {
+    fn new(root: &'a mut Node<T>, len: usize) -> Self {
+        let mut iterator = Self {
+            branches: core::array::from_fn(|_| None),
+            depth: 0,
+            leaf: None,
+            remaining: len,
+        };
+        match root {
+            Node::Empty => {}
+            Node::Leaf(values) => iterator.leaf = Some(values.iter_mut()),
+            Node::Branch(children) => {
+                iterator.branches[0] = Some(children.iter_mut());
+                iterator.depth = 1;
+            }
+        }
+        iterator
+    }
+}
+
+impl<'a, T> Iterator for IterMut<'a, T> {
+    type Item = &'a mut T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        loop {
+            if let Some(value) = self.leaf.as_mut().and_then(|leaf| leaf.next()) {
+                self.remaining -= 1;
+                return Some(value);
+            }
+            self.leaf = None;
+            let level = self.depth.checked_sub(1)?;
+            let next = self.branches[level]
+                .as_mut()
+                .expect("active directory iterator")
+                .next();
+            match next {
+                None => {
+                    self.branches[level] = None;
+                    self.depth = level;
+                }
+                Some(Node::Empty) => {}
+                Some(Node::Leaf(values)) => self.leaf = Some(values.iter_mut()),
+                Some(Node::Branch(children)) => {
+                    self.branches[self.depth] = Some(children.iter_mut());
+                    self.depth += 1;
+                }
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl<T> ExactSizeIterator for IterMut<'_, T> {}
+
+impl<T: Clone> PageSequence<T> {
+    /// Clone logical elements into separately reserved page-bounded backing storage.
+    pub fn try_clone(&self) -> Result<Self, ()> {
+        let mut cloned = Self::new();
+        if self.len != 0 {
+            cloned.try_reserve(self.len)?;
+        }
+        for value in self.iter() {
+            cloned.push(value.clone());
+        }
+        Ok(cloned)
+    }
+}
+
+impl<T: Clone> Clone for PageSequence<T> {
+    fn clone(&self) -> Self {
+        self.try_clone()
+            .expect("page sequence clone allocation failed")
     }
 }
 

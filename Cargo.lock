@@ -365,6 +365,7 @@ version = "0.1.0"
 dependencies = [
  "nt-config-manager",
  "nt-config-store",
+ "nt-page-storage",
  "nt-security",
 ]
 
