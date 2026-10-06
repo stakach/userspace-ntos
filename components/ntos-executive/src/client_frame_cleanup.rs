@@ -58,19 +58,30 @@ unsafe fn admit(record: ClientFrameRecord, access: &retirement_memory_access::Ac
 
 /// The caller is retiring this page's VM ownership, not merely trimming its working set.
 /// That permits cancelling an unfinished pageout while preserving all cleanup acknowledgements.
-pub(super) unsafe fn release(pi: u64, page: u64) -> Result<bool, u32> {
-    release_with_access(pi, page, &retirement_memory_access::Access::Ordinary)
-}
-
 pub(super) unsafe fn release_with_access(
     pi: u64,
     page: u64,
     access: &retirement_memory_access::Access<'_>,
 ) -> Result<bool, u32> {
     access.check(pi, page)?;
-    let Some(mut record) = (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).get(pi, page) else {
+    let Some((index, record)) = (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).get_with_index(pi, page) else {
         return Ok(false);
     };
+    release_at_exact_with_access(index, record, access)?;
+    Ok(true)
+}
+
+pub(super) unsafe fn release_at_exact_with_access(
+    index: usize,
+    mut record: ClientFrameRecord,
+    access: &retirement_memory_access::Access<'_>,
+) -> Result<(), u32> {
+    if (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).record_at(index) != Some(record) {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    }
+    if record.has_pending_transfer() {
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
     admit(record, access)?;
     if record.owns_frame {
         frame_recycle::prepare(record.owned_backing_cap)?;
@@ -81,18 +92,18 @@ pub(super) unsafe fn release_with_access(
         Some(ClientFrameReclaimIntent::Pageout { .. })
     ) {
         record = registry
-            .cancel_pageout_to_release_exact(record)
+            .cancel_pageout_to_release_at_exact(index, record)
             .map_err(status)?;
     }
     let intent = ClientFrameReclaimIntent::Release;
     record = registry
-        .begin_reclaim_exact(record, intent)
+        .begin_reclaim_at_exact(index, record, intent)
         .map_err(status)?;
     record = registry
-        .cleanup_reclaim_exact(record, intent, &mut Io)
+        .cleanup_reclaim_at_exact(index, record, intent, &mut Io)
         .map_err(status)?;
     registry
-        .commit_reclaim_exact(record, intent, |ready| {
+        .commit_reclaim_at_exact(index, record, intent, |ready| {
             if ready.owns_frame {
                 frame_recycle::publish(ready.owned_backing_cap)
             } else {
@@ -100,7 +111,7 @@ pub(super) unsafe fn release_with_access(
             }
         })
         .map_err(status)?;
-    Ok(true)
+    Ok(())
 }
 
 pub(super) unsafe fn pageout(

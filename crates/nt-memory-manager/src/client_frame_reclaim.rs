@@ -77,27 +77,63 @@ impl ClientFrameRecord {
 }
 
 impl ClientFrameRegistry {
-    fn reclaim_index(&self, expected: ClientFrameRecord) -> Result<usize, ClientFrameReclaimError> {
-        let index = self
-            .index_for(expected.pi, expected.page)
-            .ok_or(ClientFrameReclaimError::StaleRecord)?;
-        if self.records[index] != expected {
-            return Err(ClientFrameReclaimError::StaleRecord);
-        }
-        if expected.transfer_id.is_some() {
-            return Err(ClientFrameReclaimError::InvalidState);
-        }
-        Ok(index)
-    }
-
-    /// Close resident access before the first backend operation. The existing record identity and
-    /// complete snapshot, rather than a reusable key/cap tuple, authorize every subsequent step.
     pub fn begin_reclaim_exact(
         &mut self,
         expected: ClientFrameRecord,
         intent: ClientFrameReclaimIntent,
     ) -> Result<ClientFrameRecord, ClientFrameReclaimError> {
         let index = self.reclaim_index(expected)?;
+        self.begin_reclaim_at_exact(index, expected, intent)
+    }
+
+    pub fn cleanup_reclaim_exact(
+        &mut self,
+        expected: ClientFrameRecord,
+        intent: ClientFrameReclaimIntent,
+        io: &mut impl ClientFrameReclaimIo,
+    ) -> Result<ClientFrameRecord, ClientFrameReclaimError> {
+        let index = self.reclaim_index(expected)?;
+        self.cleanup_reclaim_at_exact(index, expected, intent, io)
+    }
+
+    pub fn commit_reclaim_exact(
+        &mut self,
+        expected: ClientFrameRecord,
+        intent: ClientFrameReclaimIntent,
+        terminal: impl FnOnce(ClientFrameRecord) -> Result<(), u32>,
+    ) -> Result<ClientFrameRecord, ClientFrameReclaimError> {
+        let index = self.reclaim_index(expected)?;
+        self.commit_reclaim_at_exact(index, expected, intent, terminal)
+    }
+
+    fn reclaim_index(&self, expected: ClientFrameRecord) -> Result<usize, ClientFrameReclaimError> {
+        self.index_for(expected.pi, expected.page)
+            .ok_or(ClientFrameReclaimError::StaleRecord)
+    }
+
+    fn validate_reclaim_at(
+        &self,
+        index: usize,
+        expected: ClientFrameRecord,
+    ) -> Result<(), ClientFrameReclaimError> {
+        if self.record_at(index) != Some(expected) {
+            return Err(ClientFrameReclaimError::StaleRecord);
+        }
+        if expected.transfer_id.is_some() {
+            return Err(ClientFrameReclaimError::InvalidState);
+        }
+        Ok(())
+    }
+
+    /// Close resident access before the first backend operation. The existing record identity and
+    /// complete snapshot, rather than a reusable key/cap tuple, authorize every subsequent step.
+    pub fn begin_reclaim_at_exact(
+        &mut self,
+        index: usize,
+        expected: ClientFrameRecord,
+        intent: ClientFrameReclaimIntent,
+    ) -> Result<ClientFrameRecord, ClientFrameReclaimError> {
+        self.validate_reclaim_at(index, expected)?;
         let row = &mut self.records[index];
         if let Some(state) = row.cleanup {
             if state.intent != intent {
@@ -123,13 +159,14 @@ impl ClientFrameRegistry {
     /// Source/alias role numbers survive deletion until strict recycling succeeds. The canonical
     /// owned frame is unmapped but never deleted or published by this helper, even when other roles
     /// name that same cap. The backend may not reenter or mutate this registry.
-    pub fn cleanup_reclaim_exact(
+    pub fn cleanup_reclaim_at_exact(
         &mut self,
+        index: usize,
         expected: ClientFrameRecord,
         intent: ClientFrameReclaimIntent,
         io: &mut impl ClientFrameReclaimIo,
     ) -> Result<ClientFrameRecord, ClientFrameReclaimError> {
-        let index = self.reclaim_index(expected)?;
+        self.validate_reclaim_at(index, expected)?;
         let row = &mut self.records[index];
         let state = row.cleanup.ok_or(ClientFrameReclaimError::InvalidState)?;
         if state.intent != intent {
@@ -170,13 +207,14 @@ impl ClientFrameRegistry {
     /// Validate readiness before publishing a frame or committing an already-prepared pagefile
     /// transition. The callback must be failure-atomic and may not yield/reenter this registry.
     /// Success removes the exact row immediately, with no allocation or fallible step in between.
-    pub fn commit_reclaim_exact(
+    pub fn commit_reclaim_at_exact(
         &mut self,
+        index: usize,
         expected: ClientFrameRecord,
         intent: ClientFrameReclaimIntent,
         terminal: impl FnOnce(ClientFrameRecord) -> Result<(), u32>,
     ) -> Result<ClientFrameRecord, ClientFrameReclaimError> {
-        let index = self.reclaim_index(expected)?;
+        self.validate_reclaim_at(index, expected)?;
         let state = expected
             .cleanup
             .ok_or(ClientFrameReclaimError::InvalidState)?;
@@ -196,6 +234,15 @@ impl ClientFrameRegistry {
         expected: ClientFrameRecord,
     ) -> Result<ClientFrameRecord, ClientFrameReclaimError> {
         let index = self.reclaim_index(expected)?;
+        self.cancel_pageout_to_release_at_exact(index, expected)
+    }
+
+    pub fn cancel_pageout_to_release_at_exact(
+        &mut self,
+        index: usize,
+        expected: ClientFrameRecord,
+    ) -> Result<ClientFrameRecord, ClientFrameReclaimError> {
+        self.validate_reclaim_at(index, expected)?;
         let row = &mut self.records[index];
         let state = row
             .cleanup
@@ -212,3 +259,7 @@ impl ClientFrameRegistry {
 #[cfg(test)]
 #[path = "client_frame_reclaim_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "client_frame_indexed_reclaim_tests.rs"]
+mod indexed_tests;

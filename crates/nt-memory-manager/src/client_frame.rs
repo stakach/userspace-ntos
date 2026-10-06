@@ -53,6 +53,10 @@ impl ClientFrameRecord {
         self.cleanup.is_some() || self.transfer_id.is_some()
     }
 
+    pub const fn has_pending_transfer(self) -> bool {
+        self.transfer_id.is_some()
+    }
+
     pub fn mapped_alias(self) -> Option<u64> {
         (self.is_resident() && self.alias != 0 && self.alias_cap != 0).then_some(self.alias)
     }
@@ -104,6 +108,8 @@ pub struct ClientFrameRegistryStats {
 
 pub struct ClientFrameRegistry {
     records: RecordStorage,
+    #[cfg(test)]
+    lookup_steps: core::cell::Cell<usize>,
     reclaiming: usize,
     next_age: u64,
     high_water: usize,
@@ -122,6 +128,8 @@ impl ClientFrameRegistry {
     pub const fn new() -> Self {
         Self {
             records: RecordStorage::new(),
+            #[cfg(test)]
+            lookup_steps: core::cell::Cell::new(0),
             reclaiming: 0,
             next_age: 1,
             high_water: 0,
@@ -150,7 +158,11 @@ impl ClientFrameRegistry {
     fn index_for(&self, pi: u64, page: u64) -> Option<usize> {
         self.records
             .iter()
-            .position(|record| record.pi == pi && record.page == page)
+            .position(|record| {
+                #[cfg(test)]
+                self.lookup_steps.set(self.lookup_steps.get() + 1);
+                record.pi == pi && record.page == page
+            })
     }
 
     pub fn insert(

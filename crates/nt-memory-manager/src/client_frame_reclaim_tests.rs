@@ -6,6 +6,358 @@ const MEMORY_PROCESS: crate::MemoryLifetime =
 use super::*;
 use alloc::{vec, vec::Vec};
 
+#[test]
+fn indexed_cleanup_retains_every_acknowledgement_and_terminal_failure() {
+    for owned in [false, true] {
+        let (mut baseline, initial) = fixture(owned);
+        let start = baseline
+            .begin_reclaim_at_exact(0, initial, RELEASE)
+            .unwrap();
+        let mut successful = Io::default();
+        baseline
+            .cleanup_reclaim_at_exact(0, start, RELEASE, &mut successful)
+            .unwrap();
+        for (position, failure) in successful.calls.iter().copied().enumerate() {
+            let (mut registry, initial) = fixture(owned);
+            let start = registry
+                .begin_reclaim_at_exact(0, initial, RELEASE)
+                .unwrap();
+            let mut io = Io {
+                failure: Some(failure),
+                ..Io::default()
+            };
+            registry.lookup_steps.set(0);
+            assert_eq!(
+                registry.cleanup_reclaim_at_exact(0, start, RELEASE, &mut io),
+                Err(ClientFrameReclaimError::Backend(77))
+            );
+            assert_eq!(io.calls, successful.calls[..=position]);
+            let retained = registry.record_at(0).unwrap();
+            assert!(!retained.is_resident());
+            io.calls.clear();
+            let ready = registry
+                .cleanup_reclaim_at_exact(0, retained, RELEASE, &mut io)
+                .unwrap();
+            assert_eq!(io.calls, successful.calls[position..]);
+            assert_eq!(
+                registry.commit_reclaim_at_exact(0, ready, RELEASE, |_| Err(19)),
+                Err(ClientFrameReclaimError::Backend(19))
+            );
+            assert_eq!(registry.record_at(0), Some(ready));
+            io.calls.clear();
+            assert_eq!(
+                registry.cleanup_reclaim_at_exact(0, ready, RELEASE, &mut io),
+                Ok(ready)
+            );
+            assert!(io.calls.is_empty());
+            registry
+                .commit_reclaim_at_exact(0, ready, RELEASE, |_| Ok(()))
+                .unwrap();
+            assert_eq!(registry.lookup_steps.get(), 0);
+            assert_eq!(registry.reclaiming_count(), 0);
+        }
+    }
+}
+
+#[test]
+fn indexed_equal_caps_and_pageout_conversion_preserve_progress() {
+    for owned in [false, true] {
+        let mut registry = ClientFrameRegistry::new();
+        registry
+            .insert(7, MEMORY_PROCESS, 0x1000, 11, 0x2000, 11, 11, owned)
+            .unwrap();
+        let initial = registry.record_at(0).unwrap();
+        let intent = if owned { PAGEOUT } else { RELEASE };
+        let start = registry.begin_reclaim_at_exact(0, initial, intent).unwrap();
+        let failure = if owned {
+            Call::Revoke(11)
+        } else {
+            Call::Recycle(11)
+        };
+        let mut io = Io {
+            failure: Some(failure),
+            ..Io::default()
+        };
+        assert!(registry
+            .cleanup_reclaim_at_exact(0, start, intent, &mut io)
+            .is_err());
+        let retained = registry.record_at(0).unwrap();
+        let retained = if owned {
+            registry
+                .cancel_pageout_to_release_at_exact(0, retained)
+                .unwrap()
+        } else {
+            retained
+        };
+        io.calls.clear();
+        let ready = registry
+            .cleanup_reclaim_at_exact(0, retained, RELEASE, &mut io)
+            .unwrap();
+        assert_eq!(io.calls, vec![failure]);
+        assert_eq!(
+            registry.cancel_pageout_to_release_at_exact(0, ready),
+            Err(ClientFrameReclaimError::InvalidState)
+        );
+        assert_eq!(
+            registry.commit_reclaim_at_exact(0, ready, PAGEOUT, |_| panic!("wrong intent")),
+            Err(ClientFrameReclaimError::InvalidState)
+        );
+        registry
+            .commit_reclaim_at_exact(0, ready, RELEASE, |_| Ok(()))
+            .unwrap();
+    }
+}
+
+fn assert_indexed_refusal(
+    registry: &mut ClientFrameRegistry,
+    index: usize,
+    expected: ClientFrameRecord,
+    error: ClientFrameReclaimError,
+) {
+    let mut io = Io::default();
+    registry.lookup_steps.set(0);
+    assert_eq!(
+        registry.begin_reclaim_at_exact(index, expected, RELEASE),
+        Err(error)
+    );
+    assert_eq!(
+        registry.cleanup_reclaim_at_exact(index, expected, RELEASE, &mut io),
+        Err(error)
+    );
+    assert_eq!(
+        registry.cancel_pageout_to_release_at_exact(index, expected),
+        Err(error)
+    );
+    assert_eq!(
+        registry.commit_reclaim_at_exact(index, expected, RELEASE, |_| panic!("invalid witness")),
+        Err(error)
+    );
+    assert!(io.calls.is_empty());
+    assert_eq!(registry.lookup_steps.get(), 0);
+}
+
+fn retire_indexed_owner(
+    registry: &mut ClientFrameRegistry,
+    pi: u64,
+    lifetime: crate::MemoryLifetime,
+    io: &mut Io,
+) -> Result<usize, ClientFrameReclaimError> {
+    let mut index = 0;
+    let mut removed = 0;
+    while let Some(mut row) = registry.record_at(index) {
+        if row.pi != pi {
+            index += 1;
+            continue;
+        }
+        if row.lifetime != lifetime {
+            return Err(ClientFrameReclaimError::StaleRecord);
+        }
+        if row
+            .reclaim_intent()
+            .is_some_and(|intent| matches!(intent, ClientFrameReclaimIntent::Pageout { .. }))
+        {
+            row = registry.cancel_pageout_to_release_at_exact(index, row)?;
+        }
+        row = registry.begin_reclaim_at_exact(index, row, RELEASE)?;
+        row = registry.cleanup_reclaim_at_exact(index, row, RELEASE, io)?;
+        registry.commit_reclaim_at_exact(index, row, RELEASE, |_| Ok(()))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+#[test]
+fn mixed_owner_indexed_walk_rechecks_swap_ins_and_retains_transferred_row() {
+    let mut registry = ClientFrameRegistry::new();
+    for (pi, page, cap, owned) in [
+        (8, 0x1000, 10, false),
+        (7, 0x2000, 20, false),
+        (9, 0x3000, 30, true),
+        (7, 0x4000, 40, true),
+        (7, 0x5000, 50, true),
+        (7, 0x6000, 60, true),
+    ] {
+        registry
+            .insert(pi, MEMORY_PROCESS, page, cap, 0, 0, 0, owned)
+            .unwrap();
+    }
+    let unrelated = [
+        registry.record_at(0).unwrap(),
+        registry.record_at(2).unwrap(),
+    ];
+    let pending = registry.record_at(3).unwrap();
+    let pending = registry
+        .begin_reclaim_at_exact(3, pending, PAGEOUT)
+        .unwrap();
+    let mut setup = Io {
+        failure: Some(Call::Revoke(40)),
+        ..Io::default()
+    };
+    assert!(registry
+        .cleanup_reclaim_at_exact(3, pending, PAGEOUT, &mut setup)
+        .is_err());
+    let pending = registry.record_at(3).unwrap();
+    let transferred = registry.record_at(4).unwrap();
+    let transfer = registry.prepare_transfer_exact(&[transferred]).unwrap();
+    let held = transfer.records()[0];
+    registry.lookup_steps.set(0);
+    let mut io = Io::default();
+    assert_eq!(
+        retire_indexed_owner(&mut registry, 7, MEMORY_PROCESS, &mut io),
+        Err(ClientFrameReclaimError::InvalidState)
+    );
+    assert_eq!(registry.lookup_steps.get(), 0);
+    let remaining: Vec<_> = registry.records().copied().collect();
+    assert_eq!(remaining.len(), 4);
+    assert!(unrelated.iter().all(|row| remaining.contains(row)));
+    assert!(remaining.contains(&held));
+    assert!(remaining.contains(&pending));
+    assert!(!io.calls.iter().any(|call| matches!(
+        call,
+        Call::Unmap(10 | 30 | 50) | Call::Delete(10 | 30 | 50) | Call::Revoke(30 | 50)
+    )));
+    assert_eq!(
+        io.calls
+            .iter()
+            .filter(|call| **call == Call::Unmap(40))
+            .count(),
+        0
+    );
+    assert_eq!(
+        io.calls
+            .iter()
+            .filter(|call| **call == Call::Revoke(40))
+            .count(),
+        0
+    );
+    registry.finish_transfer(transfer).unwrap();
+    io.calls.clear();
+    registry.lookup_steps.set(0);
+    assert_eq!(
+        retire_indexed_owner(&mut registry, 7, MEMORY_PROCESS, &mut io),
+        Ok(1)
+    );
+    assert_eq!(registry.lookup_steps.get(), 0);
+    assert_eq!(io.calls, vec![Call::Revoke(40)]);
+    assert_eq!(registry.len(), 2);
+    assert!(unrelated
+        .iter()
+        .all(|row| registry.records().any(|current| current == row)));
+}
+
+#[test]
+fn mixed_owner_indexed_walk_failure_retains_exact_progress_and_stale_lifetime() {
+    let (mut registry, initial) = fixture(false);
+    registry
+        .insert(8, MEMORY_PROCESS, 0x3000, 21, 0, 0, 0, true)
+        .unwrap();
+    let unrelated = registry.record_at(1).unwrap();
+    let mut io = Io {
+        failure: Some(Call::Recycle(11)),
+        ..Io::default()
+    };
+    assert_eq!(
+        retire_indexed_owner(&mut registry, 7, MEMORY_PROCESS, &mut io),
+        Err(ClientFrameReclaimError::Backend(77))
+    );
+    let retained = registry.record_at(0).unwrap();
+    assert_eq!(retained.record_id, initial.record_id);
+    assert_eq!(registry.record_at(1), Some(unrelated));
+    assert!(!retained.is_resident());
+    io.calls.clear();
+    assert_eq!(
+        retire_indexed_owner(&mut registry, 7, MEMORY_PROCESS, &mut io),
+        Ok(1)
+    );
+    assert_eq!(io.calls.first(), Some(&Call::Recycle(11)));
+    assert_eq!(registry.record_at(0), Some(unrelated));
+    let stale = crate::MemoryLifetime::Process(crate::ProcessIdentity {
+        pid: 1,
+        generation: crate::ProcessGeneration::Hosted(2),
+    });
+    registry
+        .insert(7, stale, 0x4000, 31, 0, 0, 0, true)
+        .unwrap();
+    let row = registry.record_at(1).unwrap();
+    io.calls.clear();
+    assert_eq!(
+        retire_indexed_owner(&mut registry, 7, MEMORY_PROCESS, &mut io),
+        Err(ClientFrameReclaimError::StaleRecord)
+    );
+    assert!(io.calls.is_empty());
+    assert_eq!(registry.record_at(1), Some(row));
+    assert_eq!(registry.record_at(0), Some(unrelated));
+}
+
+#[test]
+fn indexed_witnesses_reject_stale_moved_reused_and_transferred_records() {
+    let (mut registry, initial) = fixture(true);
+    assert_indexed_refusal(
+        &mut registry,
+        usize::MAX,
+        initial,
+        ClientFrameReclaimError::StaleRecord,
+    );
+    registry
+        .insert(8, MEMORY_PROCESS, 0x3000, 21, 0, 0, 0, true)
+        .unwrap();
+    let moved = registry.record_at(1).unwrap();
+    registry.take_exact(initial).unwrap();
+    assert_indexed_refusal(
+        &mut registry,
+        1,
+        moved,
+        ClientFrameReclaimError::StaleRecord,
+    );
+    assert_indexed_refusal(
+        &mut registry,
+        0,
+        initial,
+        ClientFrameReclaimError::StaleRecord,
+    );
+    assert_eq!(registry.record_at(0), Some(moved));
+    registry.take_exact(moved).unwrap();
+    registry
+        .insert_at_age(7, MEMORY_PROCESS, 0x1000, 11, 0x2000, 12, 13, true, 40)
+        .unwrap();
+    assert_indexed_refusal(
+        &mut registry,
+        0,
+        initial,
+        ClientFrameReclaimError::StaleRecord,
+    );
+    let current = registry.record_at(0).unwrap();
+    let start = registry
+        .begin_reclaim_at_exact(0, current, PAGEOUT)
+        .unwrap();
+    assert_indexed_refusal(
+        &mut registry,
+        0,
+        current,
+        ClientFrameReclaimError::StaleRecord,
+    );
+    let ready = registry
+        .cleanup_reclaim_at_exact(0, start, PAGEOUT, &mut Io::default())
+        .unwrap();
+    registry
+        .commit_reclaim_at_exact(0, ready, PAGEOUT, |_| Ok(()))
+        .unwrap();
+    registry
+        .insert(7, MEMORY_PROCESS, 0x1000, 11, 0, 0, 0, true)
+        .unwrap();
+    let current = registry.record_at(0).unwrap();
+    let transfer = registry.prepare_transfer_exact(&[current]).unwrap();
+    let held = transfer.records()[0];
+    assert_indexed_refusal(
+        &mut registry,
+        0,
+        held,
+        ClientFrameReclaimError::InvalidState,
+    );
+    assert_eq!(registry.record_at(0), Some(held));
+    registry.finish_transfer(transfer).unwrap();
+}
+
 const RELEASE: ClientFrameReclaimIntent = ClientFrameReclaimIntent::Release;
 const PAGEOUT: ClientFrameReclaimIntent = ClientFrameReclaimIntent::Pageout { protection: 4 };
 
