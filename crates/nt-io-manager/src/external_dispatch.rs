@@ -20,6 +20,11 @@ use crate::irp::{
 use crate::object_port::ObjectManagerPort;
 use crate::{DeviceId, DriverId, FileId, IoManager, IrpId};
 
+#[path = "detached_external_pnp.rs"]
+mod detached;
+pub use detached::{ExternalPnpFinishRejection, ExternalPnpFinishResult, ExternalPnpInvocation,
+    ExternalPnpReturn, RetainedExternalPnp};
+
 pub(crate) fn validate_external_parameter_layout(
     major: u8,
     params: &IoParameters,
@@ -569,6 +574,8 @@ impl<P> IoManager<P> {
     /// allocation. Any violated invariant or backend transport error retains the IRP as
     /// `Indeterminate`; only a genuine synchronous return reclaims it here. A foreign manager is
     /// rejected before examining any IRP and returns the preparation unchanged.
+    /// This legacy combined adapter still borrows the manager across backend execution and drops
+    /// nonterminal payload storage. Native reentrant adapters must use the detached owned API.
     pub fn dispatch_prepared_external_pnp(
         &mut self,
         prepared: PreparedExternalPnpIrp,
@@ -638,6 +645,24 @@ impl<P> IoManager<P> {
             }
         };
         let outcome = self.dispatch_pnp_to_driver(current_driver_id, irp_id, &mut prepared.payload);
+        self.reconcile_external_pnp(prepared, outcome)
+    }
+
+    fn reconcile_external_pnp(
+        &mut self,
+        prepared: PreparedExternalPnpIrp,
+        outcome: PnpBackendDispatch,
+    ) -> ExternalPnpDispatchResult {
+        let mut prepared = Some(prepared);
+        self.reconcile_external_pnp_retaining(&mut prepared, outcome)
+    }
+
+    fn reconcile_external_pnp_retaining(
+        &mut self,
+        prepared: &mut Option<PreparedExternalPnpIrp>,
+        outcome: PnpBackendDispatch,
+    ) -> ExternalPnpDispatchResult {
+        let irp_id = prepared.as_ref().expect("owned PnP reconciliation").irp_id;
         if self
             .irp(irp_id)
             .map(|irp| irp.state != IrpState::Dispatched)
@@ -684,6 +709,7 @@ impl<P> IoManager<P> {
                     .irp(irp_id)
                     .is_some_and(|irp| irp.buffer.is_some_and(|buffer| buffer.output_len != 0));
                 self.free_irp(irp_id);
+                let prepared = prepared.take().expect("terminal PnP payload owner");
                 if returns_payload {
                     ExternalPnpDispatchResult::ReturnedPayload {
                         status,

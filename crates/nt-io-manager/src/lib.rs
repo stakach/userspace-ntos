@@ -182,6 +182,8 @@ pub use ea::{
 };
 pub use external_dispatch::{
     ExternalDispatchResult, ExternalPnpDispatchResult, ExternalPnpTerminalReceipt,
+    ExternalPnpFinishRejection, ExternalPnpFinishResult, ExternalPnpInvocation, ExternalPnpReturn,
+    RetainedExternalPnp,
     PreparedExternalPnpIrp, PreparedExternalPnpRejection,
 };
 pub use file::{CreateOptions, FileRecord, FileState, ShareAccess};
@@ -1479,6 +1481,7 @@ mod tests {
     extern crate std;
 
     mod exact_external_pnp;
+    mod detached_external_pnp;
 
     use super::*;
     use nt_io_abi::{ioctl, major};
