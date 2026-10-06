@@ -41,6 +41,7 @@ mod registry_mutation_work;
 mod hosted_routed_file_close_work;
 mod registry_key_targets;
 mod registry_security_audit;
+mod registry_query_audit;
 mod provider_registry_caller;
 mod provider_directory_broker;
 mod provider_section_broker;

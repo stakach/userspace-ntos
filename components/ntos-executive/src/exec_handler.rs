@@ -32941,6 +32941,9 @@ impl ExecNtHandler {
             // volatile HARDWARE tree published through Config Manager. Other values use their
             // mounted-hive or Config Manager authority through the same handle contract.
             NativeService::NtQueryValueKey => unsafe {
+                let query_pid = self.pm_pid_for_pi(self.pi);
+                let query_tid = self.current_tid;
+                let query_pi = self.pi;
                 let key = match self.resolve_registry_key(args[0], 0x1) {
                     Ok(key) => key,
                     Err(status) => return status,
@@ -33121,6 +33124,9 @@ impl ExecNtHandler {
                                 0xC000_0034,
                                 None,
                                 None,
+                            );
+                            crate::registry_query_audit::missing_value(
+                                query_pid, query_tid, query_pi, key, key_path.as_deref(), &name16,
                             );
                             0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND — smss uses defaults
                         }
