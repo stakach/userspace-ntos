@@ -592,3 +592,8 @@ diagnosis-free failure.
   alone does not prevent an enormous allocation loop.
 - Test refusal before directory construction, generators, identity publication or
   journal effects. Aggregate host memory pressure is not a substitute for this check.
+
+## Correlate Native Frontiers Exactly
+- Absence of an error before a timeout is not passage of its former failure point.
+  Correlate the exact operation, owner and mapping receipt across runs; line counts,
+  helper counts and unrelated snapshot generations are not substitutes.
