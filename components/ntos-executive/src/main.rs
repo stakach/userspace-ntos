@@ -41,6 +41,7 @@ mod registry_mutation_work;
 mod hosted_routed_file_close_work;
 mod registry_key_targets;
 mod registry_security_audit;
+mod diagnostic_receipt_budget;
 mod registry_query_audit;
 mod provider_registry_caller;
 mod provider_directory_broker;
@@ -15960,7 +15961,7 @@ fn monotonic_time_100ns() -> u64 {
 }
 
 /// Optional diagnostic time: unavailable telemetry never uses the uncalibrated TSC fallback.
-pub(crate) fn registry_query_audit_time_100ns() -> Option<u64> {
+pub(crate) fn diagnostic_time_100ns() -> Option<u64> {
     if HPET_PERIOD_FS.load(Ordering::Relaxed) != 0
         && HPET_MONOTONIC_READY.load(Ordering::Acquire)
     {

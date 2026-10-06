@@ -140,6 +140,8 @@ fn receipt_has_no_allocation_user_reads_authority_resolution_or_policy_filters()
     let file = source("registry_query_audit.rs");
     let mut effects = Effects::default();
     effects.visit_file(&file);
+    assert!(effects.calls.iter().any(|name| name == "claim"));
+    effects.visit_file(&source("diagnostic_receipt_budget.rs"));
     for forbidden in ["format", "collect", "to_string", "to_owned", "to_vec", "reserve",
         "try_reserve", "from_utf16", "from_utf16_lossy", "read_volatile", "read_unaligned",
         "resolve_registry_key", "registry_target_path", "capture_registry_value_name",
@@ -159,7 +161,7 @@ static AUDIT_CLOCK_AVAILABLE: std::sync::atomic::AtomicBool =
 static AUDIT_CLOCK_100NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-fn registry_query_audit_time_100ns() -> Option<u64> {
+fn diagnostic_time_100ns() -> Option<u64> {
     use std::sync::atomic::Ordering;
     AUDIT_CLOCK_AVAILABLE.load(Ordering::Acquire)
         .then(|| AUDIT_CLOCK_100NS.load(Ordering::Relaxed))
@@ -170,6 +172,8 @@ fn print_u64(value: u64) { print_str(value.to_string().as_bytes()); }
 
 #[path = "../../../components/ntos-executive/src/registry_query_audit.rs"]
 mod native_audit;
+#[path = "../../../components/ntos-executive/src/diagnostic_receipt_budget.rs"]
+mod diagnostic_receipt_budget;
 
 #[test]
 fn actual_receipt_bounds_total_output_and_escapes_original_utf16() {
@@ -216,7 +220,7 @@ const TEST_WINDOW_100NS: u64 = 60 * 10_000_000;
 
 #[test]
 fn unavailable_budget_renews_at_first_known_zero_epoch() {
-    let budget = native_audit::ReceiptBudget::new();
+    let budget = diagnostic_receipt_budget::ReceiptBudget::new();
     for ordinal in 1..=128 {
         let receipt = budget.claim(None).unwrap();
         assert_eq!(receipt.receipt, ordinal);
@@ -236,7 +240,7 @@ fn unavailable_budget_renews_at_first_known_zero_epoch() {
 
 #[test]
 fn only_a_forward_epoch_renews_the_current_window() {
-    let budget = native_audit::ReceiptBudget::new();
+    let budget = diagnostic_receipt_budget::ReceiptBudget::new();
     for ordinal in 1..=128 {
         assert_eq!(budget.claim(Some(0)).unwrap().receipt, ordinal);
     }
@@ -267,7 +271,7 @@ fn only_a_forward_epoch_renews_the_current_window() {
 
 #[test]
 fn maximum_clock_value_is_representable_without_reopening_old_windows() {
-    let budget = native_audit::ReceiptBudget::new();
+    let budget = diagnostic_receipt_budget::ReceiptBudget::new();
     let epoch = u64::MAX / TEST_WINDOW_100NS;
     for ordinal in 1..=128 {
         let now = if ordinal == 1 || ordinal % 3 == 0 {
@@ -289,7 +293,7 @@ fn maximum_clock_value_is_representable_without_reopening_old_windows() {
 
 #[test]
 fn lifetime_limit_is_exact_across_windows_and_refusals() {
-    let budget = native_audit::ReceiptBudget::new();
+    let budget = diagnostic_receipt_budget::ReceiptBudget::new();
     for window in 0..64 {
         for ordinal in 1..=128 {
             let receipt = budget.claim(Some(window * TEST_WINDOW_100NS)).unwrap();
@@ -306,7 +310,7 @@ fn lifetime_limit_is_exact_across_windows_and_refusals() {
 
 #[test]
 fn concurrent_claims_cannot_leak_lifetime_budget_on_cas_retries() {
-    let budget = std::sync::Arc::new(native_audit::ReceiptBudget::new());
+    let budget = std::sync::Arc::new(diagnostic_receipt_budget::ReceiptBudget::new());
     let start = std::sync::Arc::new(std::sync::Barrier::new(8));
     let threads: Vec<_> = (0..8).map(|_| {
         let budget = std::sync::Arc::clone(&budget);
@@ -337,10 +341,10 @@ fn concurrent_claims_cannot_leak_lifetime_budget_on_cas_retries() {
 fn registry_query_clock_is_optional_local_hpet_observation() {
     let file = source("main.rs");
     let helper = file.items.iter().find_map(|item| match item {
-        syn::Item::Fn(function) if function.sig.ident == "registry_query_audit_time_100ns" =>
+        syn::Item::Fn(function) if function.sig.ident == "diagnostic_time_100ns" =>
             Some(function),
         _ => None,
-    }).expect("optional HPET-only registry diagnostic clock helper");
+    }).expect("optional HPET-only diagnostic clock helper");
     assert!(matches!(&helper.sig.output, syn::ReturnType::Type(_, ty)
         if matches!(&**ty, syn::Type::Path(path)
             if path.path.segments.last().is_some_and(|segment| segment.ident == "Option"))));

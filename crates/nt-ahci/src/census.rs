@@ -22,6 +22,70 @@ pub struct IoSnapshot {
     pub failures: u64,
 }
 
+impl IoSnapshot {
+    fn wrapping_delta(self, before: Self) -> Self {
+        Self {
+            commands: self.commands.wrapping_sub(before.commands),
+            sectors: self.sectors.wrapping_sub(before.sectors),
+            ticks: self.ticks.wrapping_sub(before.ticks),
+            failures: self.failures.wrapping_sub(before.failures),
+        }
+    }
+}
+
+/// Inclusive diagnostic deltas, sampled independently. Interleaved commands are included;
+/// this is not per-operation attribution or a device-completion/durability receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandWindowSnapshot {
+    pub read: IoSnapshot,
+    pub write: IoSnapshot,
+    pub barrier: IoSnapshot,
+    /// Caller-clock interval in explicitly supplied 100 ns units. Counter ticks stay ticks.
+    pub elapsed_100ns: Option<u64>,
+}
+
+/// Borrows the original census so completion cannot substitute another device's totals.
+pub struct CommandWindow<'a> {
+    census: &'a CommandCensus,
+    read: IoSnapshot,
+    write: IoSnapshot,
+    barrier: IoSnapshot,
+    started_100ns: Option<u64>,
+}
+
+impl<'a> CommandWindow<'a> {
+    pub fn start(census: &'a CommandCensus, started_100ns: Option<u64>) -> Self {
+        Self {
+            census,
+            read: census.snapshot(IoOperation::Read),
+            write: census.snapshot(IoOperation::Write),
+            barrier: census.snapshot(IoOperation::Barrier),
+            started_100ns,
+        }
+    }
+
+    pub fn finish(self, finished_100ns: Option<u64>) -> CommandWindowSnapshot {
+        CommandWindowSnapshot {
+            read: self
+                .census
+                .snapshot(IoOperation::Read)
+                .wrapping_delta(self.read),
+            write: self
+                .census
+                .snapshot(IoOperation::Write)
+                .wrapping_delta(self.write),
+            barrier: self
+                .census
+                .snapshot(IoOperation::Barrier)
+                .wrapping_delta(self.barrier),
+            elapsed_100ns: self
+                .started_100ns
+                .zip(finished_100ns)
+                .and_then(|(start, finish)| finish.checked_sub(start)),
+        }
+    }
+}
+
 struct Counters {
     commands: AtomicU64,
     sectors: AtomicU64,
@@ -110,3 +174,7 @@ impl Default for CommandCensus {
 #[cfg(test)]
 #[path = "census_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "command_window_tests.rs"]
+mod window_tests;
