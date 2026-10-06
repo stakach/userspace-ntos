@@ -73,14 +73,18 @@ pub use hive::{
     CurrentControlSetError, DeleteKeyError, Hive, HiveId, HiveKind, HiveMountTable,
     HiveOverlayError, HiveTransaction, HiveValueBlobCompactError, HiveValueBlobCompaction,
     MutableHiveSet, RegistryValueCopyProvenance, RegistryValueCopyProvenanceTable,
-    PreparedSetValue, RegistryValueType, ResolvedHiveKey, ResolvedHiveValue, SetValueError,
+    HiveValueJournalPhase, PreparedSetValue, RegistryValueType, ResolvedHiveKey,
+    ResolvedHiveValue, RetainedHiveValueJournal, SetValueError,
     SYSTEM_HIVE_PATH,
 };
 mod hardware_profile;
+#[cfg(test)]
+mod hive_retained_mutation_tests;
 pub use hardware_profile::{HardwareProfileAlias, HardwareProfileError};
 pub use io::{
     FaultInjectionHiveIoProvider, FlushMode, HiveBootError, HiveFlushError, HiveIoError,
     HiveIoProvider, HiveIoProviderKind, HiveIoStatus, HiveManager, MemoryHiveIoProvider,
+    HiveSetValueError, HiveSetValueReceipt,
 };
 
 #[cfg(test)]

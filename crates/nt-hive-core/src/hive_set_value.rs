@@ -6,6 +6,7 @@ use super::{Cell, CellId, Hive, Rc, RegistryValueType, String, ValueCell, Vec};
 pub enum SetValueError {
     KeyNotFound,
     InsufficientResources,
+    RetainedPublication,
 }
 
 enum PreparedBlob {
@@ -50,6 +51,9 @@ impl Hive {
         value_type: RegistryValueType,
         data: Vec<u8>,
     ) -> Result<PreparedSetValue<'_>, SetValueError> {
+        if self.pending_value_journal.is_some() {
+            return Err(SetValueError::RetainedPublication);
+        }
         usize::try_from(key.0).map_err(|_| SetValueError::KeyNotFound)?;
         let parent = self.key(key).ok_or(SetValueError::KeyNotFound)?;
         let sequence = self
@@ -125,6 +129,32 @@ impl Hive {
 }
 
 impl PreparedSetValue<'_> {
+    pub(crate) fn begin_journal(&mut self, sequence: u64, record: Vec<u8>) {
+        assert!(self.hive.pending_value_journal.is_none());
+        self.hive.pending_value_journal = Some(super::PendingHiveValueJournal {
+            sequence,
+            phase: super::HiveValueJournalPhase::AppendEntered,
+            record,
+        });
+    }
+
+    pub(crate) fn journal_record(&self) -> &[u8] {
+        &self
+            .hive
+            .pending_value_journal
+            .as_ref()
+            .expect("journal owner installed")
+            .record
+    }
+
+    pub(crate) fn enter_journal_flush(&mut self) {
+        self.hive
+            .pending_value_journal
+            .as_mut()
+            .expect("journal owner installed")
+            .phase = super::HiveValueJournalPhase::FlushEntered;
+    }
+
     /// Publish the already-reserved edit exactly once, without allocating or returning an error.
     pub fn commit(self) -> CellId {
         let Self {

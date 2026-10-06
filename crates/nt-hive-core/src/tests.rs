@@ -1355,6 +1355,7 @@ fn image_len_validation_checks_header_without_decoding_cells() {
 #[test]
 fn hive_image_compacts_sparse_cell_ids_on_decode() {
     let mut h = Hive {
+        pending_value_journal: None,
         cells: nt_page_storage::PageSequence::new(),
         value_blobs: alloc::vec![Rc::new(b"service".to_vec())],
         root: CellId(64),

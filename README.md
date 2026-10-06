@@ -76,6 +76,9 @@ admission snapshots; the process constructor owns its separate loader snapshot.
 Media registry values select the real setup and shell startup paths. The kernel
 does not convert a LiveCD into installed-system state or override setup queries
 according to the caller's executable.
+Hive cell storage grows in bounded pages. Prepared value edits reserve live
+resources before journal I/O; uncertain append or flush effects retain their exact
+record and block mutation, checkpoint acknowledgement and hive retirement.
 The real USER driver owns window-station and desktop assignment; the host does
 not seed process bindings or restore thread bindings from a global desktop cache.
 Additional hosted threads receive fresh canonical ETHREAD identities. A retired

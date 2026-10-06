@@ -13,6 +13,10 @@ use nt_page_storage::PageSequence;
 #[path = "hive_set_value.rs"]
 mod set_value;
 pub use set_value::{PreparedSetValue, SetValueError};
+#[path = "hive_value_journal.rs"]
+mod value_journal;
+pub use value_journal::{HiveValueJournalPhase, RetainedHiveValueJournal};
+use value_journal::PendingHiveValueJournal;
 
 #[path = "hive_create_child.rs"]
 mod create_child;
@@ -90,6 +94,7 @@ pub(crate) enum Cell {
 pub enum DeleteKeyError {
     NotFound,
     CannotDelete,
+    RetainedPublication,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -97,12 +102,14 @@ pub enum HiveOverlayError {
     KindMismatch,
     InvalidSource,
     InvalidControlSetSelection,
+    RetainedPublication,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HiveValueBlobCompactError {
     MissingBlob,
     OutOfMemory,
+    RetainedPublication,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -158,11 +165,13 @@ pub enum CurrentControlSetError {
     CurrentValueMissing,
     CurrentValueInvalid,
     TargetKeyMissing,
+    RetainedPublication,
 }
 
 /// A mounted registry subtree as a cell arena (spec §6.1).
 #[derive(Clone)]
 pub struct Hive {
+    pub(crate) pending_value_journal: Option<PendingHiveValueJournal>,
     pub(crate) cells: PageSequence<Option<Cell>>,
     pub(crate) value_blobs: Vec<Rc<Vec<u8>>>,
     pub(crate) root: CellId,
@@ -218,6 +227,7 @@ impl HiveTransaction<'_> {
     }
 
     pub fn create_key(&mut self, rel_path: &str) -> CellId {
+        assert!(self.hive.pending_value_journal.is_none(), "retained publication excludes legacy creation");
         let mut current = self.hive.root;
         for component in Hive::components(rel_path) {
             if let Some(child) = self.hive.open_subkey(current, component) {
@@ -231,11 +241,13 @@ impl HiveTransaction<'_> {
     }
 
     pub fn set_key_class(&mut self, key: CellId, class_name: Option<&str>) -> bool {
+        if self.hive.pending_value_journal.is_some() { return false; }
         self.snapshot_cell(key);
         self.hive.set_key_class(key, class_name)
     }
 
     pub fn set_key_security_descriptor(&mut self, key: CellId, descriptor: &[u8]) -> bool {
+        if self.hive.pending_value_journal.is_some() { return false; }
         self.snapshot_cell(key);
         self.hive.set_key_security_descriptor(key, descriptor)
     }
@@ -247,6 +259,7 @@ impl HiveTransaction<'_> {
         value_type: RegistryValueType,
         data: Vec<u8>,
     ) -> bool {
+        if self.hive.pending_value_journal.is_some() { return false; }
         self.snapshot_cell(key);
         if let Some(value) = self.hive.value_id_by_name(key, name) {
             self.snapshot_cell(value);
@@ -255,6 +268,7 @@ impl HiveTransaction<'_> {
     }
 
     pub fn delete_value(&mut self, key: CellId, name: &str) -> bool {
+        if self.hive.pending_value_journal.is_some() { return false; }
         self.snapshot_cell(key);
         if let Some(value) = self.hive.value_id_by_name(key, name) {
             self.snapshot_cell(value);
@@ -263,6 +277,9 @@ impl HiveTransaction<'_> {
     }
 
     pub fn delete_key(&mut self, key: CellId) -> Result<(), DeleteKeyError> {
+        if self.hive.pending_value_journal.is_some() {
+            return Err(DeleteKeyError::RetainedPublication);
+        }
         if let Some((parent, values)) = self
             .hive
             .key(key)
@@ -369,6 +386,9 @@ fn compose_hive_overlay_inner(
     system_control_set_remap: Option<(&str, &str)>,
     secured: bool,
 ) -> Result<Hive, HiveOverlayError> {
+    if base.pending_value_journal.is_some() || overlay.pending_value_journal.is_some() {
+        return Err(HiveOverlayError::RetainedPublication);
+    }
     if base.kind != overlay.kind {
         return Err(HiveOverlayError::KindMismatch);
     }
@@ -478,6 +498,7 @@ impl Hive {
     /// Create an empty hive of `kind` with a root key cell.
     pub fn new(kind: HiveKind) -> Self {
         let mut h = Hive {
+            pending_value_journal: None,
             cells: PageSequence::new(),
             value_blobs: Vec::new(),
             root: CellId(0),
@@ -555,6 +576,9 @@ impl Hive {
     pub fn compact_value_blobs(
         &mut self,
     ) -> Result<HiveValueBlobCompaction, HiveValueBlobCompactError> {
+        if self.pending_value_journal.is_some() {
+            return Err(HiveValueBlobCompactError::RetainedPublication);
+        }
         const UNUSED: usize = usize::MAX;
         const REFERENCED: usize = usize::MAX - 1;
 
@@ -743,6 +767,7 @@ impl Hive {
 
     /// Open or create an immediate subkey.
     pub fn create_subkey(&mut self, parent: CellId, name: &str) -> CellId {
+        assert!(self.pending_value_journal.is_none(), "retained publication excludes legacy creation");
         self.create_subkey_in_storage(parent, name, self.is_volatile(parent))
     }
 
@@ -761,6 +786,7 @@ impl Hive {
 
     /// `ZwCreateKey` — open or create a key at a relative path (creating intermediates).
     pub fn create_key(&mut self, rel_path: &str) -> CellId {
+        assert!(self.pending_value_journal.is_none(), "retained publication excludes legacy creation");
         let mut cur = self.root;
         for comp in Self::components(rel_path) {
             cur = self.create_subkey(cur, comp);
@@ -769,6 +795,7 @@ impl Hive {
     }
 
     pub fn set_key_class(&mut self, key: CellId, class_name: Option<&str>) -> bool {
+        if self.pending_value_journal.is_some() { return false; }
         if self.key(key).is_none() {
             return false;
         }
@@ -788,6 +815,7 @@ impl Hive {
     }
 
     pub fn set_key_security_descriptor(&mut self, key: CellId, descriptor: &[u8]) -> bool {
+        if self.pending_value_journal.is_some() { return false; }
         if self.key(key).is_none() {
             return false;
         }
@@ -812,6 +840,7 @@ impl Hive {
 
     /// Storage metadata for import/setup; changing a key's kind is not a native creation grant.
     pub fn set_key_kind(&mut self, key: CellId, kind: KeyKind) -> bool {
+        if self.pending_value_journal.is_some() { return false; }
         let Some(current) = self.key(key) else { return false; };
         if current.kind == kind { return true; }
         if !current.volatile { self.sequence += 1; }
@@ -851,6 +880,7 @@ impl Hive {
             .count()
     }
     pub(crate) fn clear_dirty(&mut self) {
+        assert!(self.pending_value_journal.is_none(), "retained publication excludes dirty acknowledgement");
         self.clean_sequence = self.sequence;
     }
 
@@ -859,6 +889,7 @@ impl Hive {
     /// Checkpoint transports must exclude mutation while the image is in flight. A stale sequence
     /// or unexpected image generation therefore leaves both generation and dirty state unchanged.
     pub fn acknowledge_checkpoint(&mut self, sequence: u64, image_generation: u64) -> bool {
+        if self.pending_value_journal.is_some() { return false; }
         if sequence != self.sequence || image_generation != self.generation.saturating_add(1) {
             return false;
         }
@@ -873,6 +904,7 @@ impl Hive {
     /// the first journalled sequence numbers, and a later checkpoint should not report import-time
     /// construction as dirty runtime state.
     pub fn finish_clean_import(&mut self) {
+        assert!(self.pending_value_journal.is_none(), "retained publication excludes import reset");
         self.sequence = 0;
         self.generation = 0;
         for cell in self.cells.iter_mut().filter_map(|cell| cell.as_mut()) {
@@ -892,6 +924,7 @@ impl Hive {
         value_type: RegistryValueType,
         data: Vec<u8>,
     ) -> bool {
+        if self.pending_value_journal.is_some() { return false; }
         if self.key(key).is_none() {
             return false;
         }
@@ -942,6 +975,7 @@ impl Hive {
         value_type: RegistryValueType,
         source: CellId,
     ) -> bool {
+        if self.pending_value_journal.is_some() { return false; }
         if self.key(key).is_none() {
             return false;
         }
@@ -987,6 +1021,7 @@ impl Hive {
         value_type: RegistryValueType,
         data: Rc<Vec<u8>>,
     ) -> bool {
+        if self.pending_value_journal.is_some() { return false; }
         if self.key(key).is_none() {
             return false;
         }
@@ -1025,6 +1060,7 @@ impl Hive {
 
     /// `ZwDeleteValueKey` — remove a named value from a key cell.
     pub fn delete_value(&mut self, key: CellId, name: &str) -> bool {
+        if self.pending_value_journal.is_some() { return false; }
         let Some((pos, value_id)) = self.key(key).and_then(|k| {
             k.values
                 .iter()
@@ -1057,6 +1093,9 @@ impl Hive {
     /// NT refuses the hive root and keys that still have subkeys; callers that need a subtree
     /// removal must enumerate/delete children first.
     pub fn delete_key(&mut self, key: CellId) -> Result<(), DeleteKeyError> {
+        if self.pending_value_journal.is_some() {
+            return Err(DeleteKeyError::RetainedPublication);
+        }
         if key == self.root {
             return Err(DeleteKeyError::CannotDelete);
         }
@@ -1484,6 +1523,15 @@ impl MutableHiveSet {
         hive_id: HiveId,
         hive: Hive,
     ) -> Result<(), CurrentControlSetError> {
+        let retained_id = self.hive(hive_id)
+            .is_some_and(|owned| owned.pending_value_journal.is_some());
+        let retained_root = self.mounts.mounts.iter()
+            .filter(|entry| entry.root.eq_ignore_ascii_case(root_path))
+            .any(|entry| self.hive(entry.hive)
+                .is_some_and(|owned| owned.pending_value_journal.is_some()));
+        if retained_id || retained_root {
+            return Err(CurrentControlSetError::RetainedPublication);
+        }
         let current_control_set = if root_path.eq_ignore_ascii_case(SYSTEM_HIVE_PATH) {
             Some(hive.current_control_set()?)
         } else {
@@ -1503,8 +1551,13 @@ impl MutableHiveSet {
     }
 
     pub fn unmount(&mut self, root_path: &str) -> Option<Hive> {
-        let hive_id = self.mounts.unmount(root_path)?;
+        let hive_id = self.mounts.mounts.iter()
+            .find(|entry| entry.root.eq_ignore_ascii_case(root_path))?.hive;
         let index = self.hives.iter().position(|(id, _)| *id == hive_id)?;
+        if self.hives[index].1.pending_value_journal.is_some() {
+            return None;
+        }
+        self.mounts.unmount(root_path)?;
         Some(self.hives.remove(index).1)
     }
 
@@ -1527,6 +1580,7 @@ impl MutableHiveSet {
         let Some(hive) = self.hive_mut(hive_id) else {
             return false;
         };
+        if hive.pending_value_journal.is_some() { return false; }
         hive.clear_dirty();
         true
     }
@@ -1552,6 +1606,7 @@ impl MutableHiveSet {
     pub fn create_key(&mut self, full_path: &str) -> Option<ResolvedHiveKey> {
         let (hive_id, rel_path) = self.mounts.resolve(full_path)?;
         let hive = self.hive_mut(hive_id)?;
+        if hive.pending_value_journal.is_some() { return None; }
         Some(ResolvedHiveKey {
             hive: hive_id,
             key: hive.create_key(&rel_path),
@@ -1568,6 +1623,7 @@ impl MutableHiveSet {
             return None;
         }
         let hive = self.hive_mut(parent.hive)?;
+        if hive.pending_value_journal.is_some() { return None; }
         Some(ResolvedHiveKey {
             hive: parent.hive,
             key: hive.create_subkey(parent.key, name),
