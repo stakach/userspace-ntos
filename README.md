@@ -162,9 +162,9 @@ in `extern-rootserver` mode (bring your own root task).
 The desktop target hosts **real, unmodified GPL ReactOS binaries** on rust-micro.
 Genuine Explorer and native acceptance are tracked in
 [issue #18](https://github.com/stakach/userspace-ntos/issues/18).
-The latest [fresh-run receipt](docs/evidence/issue18-prepared-hive-font-timeout.json)
-records a one-hour timeout during genuine setup after the prepared hive changes.
-It has no allocation abort, but does not prove passage of the earlier registry failure. Its
+The latest [fresh-run receipt](docs/evidence/issue18-sparse-retirement-font-timeout.json)
+records a one-hour timeout during genuine setup after sparse image retirement.
+It passes the correlated earlier registry allocation frontier without an allocation abort. Its
 screenshot shows background and cursor, not a working desktop. Acceptance requires both strict
 native private-font cleanup and a separate production Userinit/Explorer boot without
 acceptance startup hooks

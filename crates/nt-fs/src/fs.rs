@@ -7,6 +7,7 @@
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use nt_config_store::codec::{crc32c, Crc32c};
 
 use crate::directory::{
     query_directory_by_index, DirectoryEntry, DirectoryQueryResult, DirectoryQueryState,
@@ -19,6 +20,10 @@ use crate::snapshot_store::{
     SnapshotPayloadSink,
 };
 use crate::status::*;
+
+#[cfg(test)]
+#[path = "snapshot_crc_compatibility_tests.rs"]
+mod snapshot_crc_compatibility_tests;
 
 #[path = "optional_file.rs"]
 mod optional_file;
@@ -270,39 +275,6 @@ impl FileData {
             }
         }
     }
-}
-
-struct Crc32c {
-    crc: u32,
-}
-
-impl Crc32c {
-    fn new() -> Self {
-        Self { crc: 0xFFFF_FFFF }
-    }
-
-    fn update(&mut self, data: &[u8]) {
-        for &b in data {
-            self.crc ^= b as u32;
-            for _ in 0..8 {
-                self.crc = if self.crc & 1 != 0 {
-                    (self.crc >> 1) ^ 0x82F6_3B78
-                } else {
-                    self.crc >> 1
-                };
-            }
-        }
-    }
-
-    fn finish(self) -> u32 {
-        !self.crc
-    }
-}
-
-fn crc32c(data: &[u8]) -> u32 {
-    let mut crc = Crc32c::new();
-    crc.update(data);
-    crc.finish()
 }
 
 struct SnapshotCrcSink {
