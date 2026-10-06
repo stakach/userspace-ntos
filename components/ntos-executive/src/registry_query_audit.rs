@@ -3,10 +3,76 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 const RECEIPT_LIMIT: u64 = 128;
+const LIFETIME_RECEIPT_LIMIT: u64 = 8192;
+const WINDOW_100NS: u64 = 60 * 10_000_000;
 const PATH_BYTE_LIMIT: usize = 256;
 const VALUE_UNIT_LIMIT: usize = 64;
 const HEX: &[u8; 16] = b"0123456789abcdef";
-static EMITTED: AtomicU64 = AtomicU64::new(0);
+const COUNT_BITS: u32 = 8;
+const LIFETIME_BITS: u32 = 14;
+const EPOCH_BITS: u32 = 35;
+const COUNT_MASK: u64 = (1 << COUNT_BITS) - 1;
+const LIFETIME_MASK: u64 = (1 << LIFETIME_BITS) - 1;
+const EPOCH_MASK: u64 = (1 << EPOCH_BITS) - 1;
+const EPOCH_SHIFT: u32 = COUNT_BITS + LIFETIME_BITS;
+const CLOCK_KNOWN: u64 = 1 << (EPOCH_SHIFT + EPOCH_BITS);
+const _: () = assert!(RECEIPT_LIMIT <= COUNT_MASK);
+const _: () = assert!(LIFETIME_RECEIPT_LIMIT <= LIFETIME_MASK);
+const _: () = assert!(u64::MAX / WINDOW_100NS <= EPOCH_MASK);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BudgetReceipt {
+    pub(crate) receipt: u64,
+    pub(crate) lifetime_receipt: u64,
+    pub(crate) window: Option<u64>,
+}
+
+/// Window and lifetime claims share one CAS, so contention cannot consume a partial claim.
+pub(crate) struct ReceiptBudget {
+    state: AtomicU64,
+}
+
+impl ReceiptBudget {
+    pub(crate) const fn new() -> Self {
+        Self { state: AtomicU64::new(0) }
+    }
+
+    pub(crate) fn claim(&self, now: Option<u64>) -> Option<BudgetReceipt> {
+        let previous = self.state.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+            next_claim(state, now).map(|(next, _)| next)
+        }).ok()?;
+        next_claim(previous, now).map(|(_, receipt)| receipt)
+    }
+}
+
+fn next_claim(state: u64, now: Option<u64>) -> Option<(u64, BudgetReceipt)> {
+    let mut count = state & COUNT_MASK;
+    let lifetime = (state >> COUNT_BITS) & LIFETIME_MASK;
+    let mut epoch = (state >> EPOCH_SHIFT) & EPOCH_MASK;
+    let mut known = state & CLOCK_KNOWN != 0;
+    if lifetime >= LIFETIME_RECEIPT_LIMIT { return None; }
+    if let Some(now) = now {
+        let observed = now / WINDOW_100NS;
+        if !known || observed > epoch {
+            count = 0;
+            epoch = observed;
+            known = true;
+        }
+    }
+    if count >= RECEIPT_LIMIT { return None; }
+    let receipt = BudgetReceipt {
+        receipt: count + 1,
+        lifetime_receipt: lifetime + 1,
+        window: known.then_some(epoch),
+    };
+    let next = receipt.receipt
+        | (receipt.lifetime_receipt << COUNT_BITS)
+        | (epoch << EPOCH_SHIFT)
+        | if known { CLOCK_KNOWN } else { 0 };
+    Some((next, receipt))
+}
+
+static BUDGET: ReceiptBudget = ReceiptBudget::new();
 
 fn hex_escape(value: u16, wide: bool) {
     let mut bytes = [b'\\', b'u', b'0', b'0', b'0', b'0'];
@@ -47,13 +113,20 @@ fn value_units(value: &[u16]) {
 pub(crate) fn missing_value(
     pid: Option<u32>, tid: u64, pi: usize, key: u32, path: Option<&str>, name: &[u16],
 ) {
-    let Ok(previous) = EMITTED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-        (count < RECEIPT_LIMIT).then(|| count + 1)
-    }) else { return; };
+    let Some(receipt) = BUDGET.claim(crate::registry_query_audit_time_100ns()) else { return; };
     crate::print_str(b"[registry-query-miss] receipt=");
-    crate::print_u64(previous + 1);
+    crate::print_u64(receipt.receipt);
     crate::print_str(b"/");
     crate::print_u64(RECEIPT_LIMIT);
+    crate::print_str(b" lifetime-receipt=");
+    crate::print_u64(receipt.lifetime_receipt);
+    crate::print_str(b"/");
+    crate::print_u64(LIFETIME_RECEIPT_LIMIT);
+    crate::print_str(b" window=");
+    match receipt.window {
+        Some(window) => crate::print_u64(window),
+        None => crate::print_str(b"unavailable"),
+    }
     crate::print_str(b" pid=");
     match pid {
         Some(pid) => crate::print_u64(u64::from(pid)),

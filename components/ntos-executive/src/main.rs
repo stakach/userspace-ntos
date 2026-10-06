@@ -15967,6 +15967,17 @@ fn monotonic_time_100ns() -> u64 {
     }
 }
 
+/// Optional diagnostic time: unavailable telemetry never uses the uncalibrated TSC fallback.
+pub(crate) fn registry_query_audit_time_100ns() -> Option<u64> {
+    if HPET_PERIOD_FS.load(Ordering::Relaxed) != 0
+        && HPET_MONOTONIC_READY.load(Ordering::Acquire)
+    {
+        Some(monotonic_time_100ns())
+    } else {
+        None
+    }
+}
+
 pub(crate) fn platform_tsc_frequency_hz() -> u64 {
     PLATFORM_TSC_FREQUENCY_HZ.load(Ordering::Acquire)
 }
