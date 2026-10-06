@@ -15,6 +15,7 @@ mod bus_properties;
 mod bus_relations;
 mod critical_child_start;
 mod relation_owners;
+pub mod returned_pnp_buffer;
 mod retained_lower_pnp_forward;
 mod target_device_relation;
 

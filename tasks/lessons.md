@@ -620,3 +620,9 @@ diagnosis-free failure.
 ## Check Generated Patch Escaping
 - When constructing a patch through JavaScript, inspect the resulting Rust byte strings. A log
   newline must be `b"\n"`, not a double-escaped literal backslash followed by `n`.
+
+## Separate Physical Provenance
+- A source allocation's domain is physical provenance and must match its source arena. A device
+  projection may name a different logical domain; retain the authenticated allocator separately.
+- One source ticket names one immutable allocation lifetime. Changed address, extent or generation
+  under the same ticket is a contradiction, not a new packet or ownership transfer.
