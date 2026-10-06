@@ -162,10 +162,12 @@ in `extern-rootserver` mode (bring your own root task).
 The desktop target hosts **real, unmodified GPL ReactOS binaries** on rust-micro.
 Genuine Explorer and native acceptance are tracked in
 [issue #18](https://github.com/stakach/userspace-ntos/issues/18).
-The latest [fresh-run receipt](docs/evidence/issue18-owned-receipts-combined-crc-font-timeout.json)
-records a one-hour timeout after the actual device-install queue drained and real setup
-continued component registration. Destructive private queue repair, obsolete DLL staging and empty bootstrap
-reservations are removed; font cleanup and desktop acceptance remain unproven. Its
+The latest [fresh-run receipt](docs/evidence/issue18-canonical-gui-font-timeout.json)
+records a one-hour timeout during real setup component registration. Canonical GUI
+contexts ran, and exact installer-child traces exposed missing PDO descriptions;
+native input-driver admission still lacks `IoStartNextPacket`. Destructive private
+queue repair, obsolete DLL staging and empty bootstrap reservations are removed;
+font cleanup and desktop acceptance remain unproven. Its
 screenshot shows background and cursor, not a working desktop. Acceptance requires both strict
 native private-font cleanup and a separate production Userinit/Explorer boot without
 acceptance startup hooks
