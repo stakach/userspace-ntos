@@ -1,0 +1,41 @@
+{
+  "issue": 18,
+  "source_commit": "3f929636e60cce0c97f7b43a9ed3ef8e04afad27",
+  "microkernel_commit": "2debcee98856ea648924c9ddf0c20a491750668b",
+  "profile": "font-cleanup",
+  "boot_bound_seconds": 3600,
+  "build_exit": 0,
+  "launcher_exit": 124,
+  "collector_exit": 0,
+  "collector_frames": 359,
+  "collector_final_slot": 0,
+  "image_matched_font_parser_exit": 1,
+  "exact_head_ci": 37430698694,
+  "termination": "The original one-hour deadline expired while setup was still making progress. No extension or startup bypass was used. Both guest and collector final exits were consumed before local tests resumed.",
+  "preboot_sha256": {
+    "rootserver": "d2fb0de52f7b7dbeb8b8439240dd3b49fa90fee99d19d3a01fda459cbee5c8a7",
+    "microkernel": "fc0e1ca81c3130a8603f879771ff819edf9dc3fd5a59da2eb7a4d83790d9bb37",
+    "disk": "7305e446b4b7d33229098132a2ae5058993de0767a1481bab6abd6fdb9077e5b",
+    "ntdll": "6b621e789fd6feea323e5e2003c242e31c8b1a8e818956bf4a870b16a97491a3",
+    "font_acceptance": "1729483e54eba2e8b891beeae4dca6d3881f2f1ac45cbce90ba74c4e4908e6f3",
+    "font_run_setup": "f2238bde4b0d68808f01b1e7f5ce95817e03063db1a4616a63d15716e0bb85b5"
+  },
+  "artifact_sha256": {
+    "raw_log": "3959903756be0f76b24a5923537a81555c3a947b5c7c317456c8da43ad1da44d",
+    "archived_log": "dae4d287eaf64d16a5b7ac1d47d61b7a3b8ad085841361268a921f1dc1d396dd",
+    "collector_log": "204a980b71f38781668f42e211d2f17f93c0142ee67114d7c1c9a78c5411bc44",
+    "screenshot": "53ad5f5ac610f375103c4b38bc9dcda1b85defd34e60860272a02fff0da0c9cb"
+  },
+  "observations": [
+    "After destructive private NPFS queue repair was deleted, actual pending read/write, data and completion acknowledgement passed. C-f reported canonical-before=1 pending=1 write=1 read=1 acknowledged=1; concurrent IRP, File lifetime, split write and canonical File lifecycle gates passed. No private queue repair receipt remains.",
+    "Actual install-worker retirement reached process slot17 generation97, followed by real setup registry/filesystem writes. No alloc-oom or terminal provider-bugcheck receipt appeared in the complete log. This does not identify the exact storage owner of the former 60528-byte refusal or independently prove its precise operation completed.",
+    "Setup Run registration passed, but font-acceptance PID-QUERY, genuine Userinit/Explorer activation and desktop chrome never appeared. The final screenshot shows background and cursor only. The image-matched parser failed for missing font execution; it is the older contract, not the strengthened provenance verifier written during this run.",
+    "Final census118: heap watermark56702464/live56632184, reusable2087920/largest2017640; scratch peak1728888/4194304. Dispatch122715/1127543Mtick; disk read1941653attempts/6261181sectors/37787Mtick, write1441406attempts/5751223sectors/31597Mtick, barriers9588/1533Mtick; recorded disk failures zero. Counters are not final durability or elapsed wall-clock receipts.",
+    "Source audit confirms SYSTEM journal append and mutable local hive flush both publish complete volume snapshots. Full-tree CRC passes and alternate-slot validation/write remain despite four-sector write batching. The aggregate counters alone do not establish elapsed-time dominance; any incremental persistence change must preserve exact journal ownership, recovery and actual barriers."
+  ],
+  "evidence": {
+    "log": "docs/evidence/issue18-canonical-npfs-font-timeout.log.gz",
+    "collector_log": "docs/evidence/issue18-canonical-npfs-font-timeout-qmp.log.gz",
+    "screenshot": "docs/images/canonical-npfs-font-timeout.png"
+  }
+}
