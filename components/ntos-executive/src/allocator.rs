@@ -16,6 +16,9 @@ use core::mem::{align_of, size_of};
 use core::ptr::{copy_nonoverlapping, null_mut, read_volatile, write_volatile};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+#[path = "allocator_oom_budget.rs"]
+mod oom_budget;
+
 /// The component-local heap VA. The root reserves the 64 MiB band ending at the original scratch
 /// base; its lower 32 MiB is mapped initially and later durable pages are committed on demand.
 /// This band is above the executive image and worker mirrors. Isolated components have separate
@@ -303,10 +306,10 @@ fn debug_context(context: u32) {
 }
 
 fn report_oom(size: usize, align: usize, cur: usize, start: usize, requested_end: usize) {
-    if unsafe { read_word(OOM_REPORTED) } != 0 {
+    let Some(emission) = oom_budget::next_oom_emission(unsafe { read_word(OOM_REPORTED) }) else {
         return;
-    }
-    unsafe { write_word(OOM_REPORTED, 1) };
+    };
+    unsafe { write_word(OOM_REPORTED, emission) };
     debug_bytes(b"[alloc-oom] size=");
     debug_usize(size);
     debug_bytes(b" align=");
@@ -325,6 +328,10 @@ fn report_oom(size: usize, align: usize, cur: usize, start: usize, requested_end
     debug_usize(transient_heap_start().saturating_sub(DATA));
     debug_bytes(b" transient-cap=");
     debug_usize(transient_heap_size());
+    debug_bytes(b" receipt=");
+    debug_usize(emission);
+    debug_bytes(b"/");
+    debug_usize(oom_budget::OOM_EMISSION_LIMIT);
     let context = unsafe { read_word(OOM_CONTEXT) } as u32;
     if context != 0 {
         debug_bytes(b" ctx=");

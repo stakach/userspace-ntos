@@ -1843,6 +1843,7 @@ impl nt_hive_core::HiveIoProvider for WritableHiveIoProvider {
     }
 
     fn append_log_record(&mut self, bytes: &[u8]) -> Result<(), nt_hive_core::HiveIoError> {
+        let _scope = crate::allocator::enter_scope(b"memfs.hive-journal-append");
         hive_io_status(unsafe { append_file(&self.log_path, bytes) })
     }
 

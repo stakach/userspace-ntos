@@ -10,6 +10,7 @@ impl ExecNtHandler {
         data: &[u8],
     ) -> Result<(), u32> {
         let _durable = allocator::enter_durable();
+        let _path_scope = allocator::enter_scope(b"registry.mutable-hive-path");
         let relative = self
             .mutable_key_relative_path(key)
             .ok_or(STATUS_INVALID_HANDLE)?;
@@ -23,6 +24,7 @@ impl ExecNtHandler {
                 .ok_or(STATUS_INVALID_HANDLE)?;
             let provider = crate::writable_fs::WritableHiveIoProvider::new(&path);
             let mut manager = nt_hive_core::HiveManager::for_live_hive(provider, hive);
+            let _prepare_scope = allocator::enter_scope(b"hive.prepare-value");
             manager
                 .try_set_value(hive, key.key, &relative, name, value_type, data)
                 .map_err(Self::mutable_hive_set_value_status)?
