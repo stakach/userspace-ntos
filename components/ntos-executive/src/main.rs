@@ -9582,14 +9582,6 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(context_lifetime.process_rows_live);
     print_str(b"/");
     print_u64(context_lifetime.thread_rows_live);
-    print_str(b" ep=");
-    print_u64(context_lifetime.eprocess_allocations);
-    print_str(b"/");
-    print_u64(context_lifetime.eprocess_frees);
-    print_str(b" et=");
-    print_u64(context_lifetime.ethread_allocations);
-    print_str(b"/");
-    print_u64(context_lifetime.ethread_frees);
     print_str(b" token=");
     print_u64(context_lifetime.token_allocations);
     print_str(b"/");

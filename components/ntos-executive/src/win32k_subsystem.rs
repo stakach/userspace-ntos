@@ -210,8 +210,6 @@ const SLOT_W32THREAD: u64 = WIN32K_DATA_VADDR + 0x4008; // Ps{Set,Get}ThreadWin3
 const WIN32_CALLOUTS: u64 = WIN32K_DATA_VADDR + 0x4100; // recorded WIN32_CALLOUTS_FG table (copy)
 /// A synthetic process handle NtUserProcessConnect's ObReferenceObjectByHandle resolves.
 pub const FAKE_PROCESS_HANDLE: u64 = 0x0000_0000_5A5A_0100;
-const WIN32K_EPROCESS_BYTES: u64 = 0x1000;
-const WIN32K_ETHREAD_BYTES: u64 = nt_kernel_abi::ps_reactos_x64::ETHREAD_BODY_BYTES as u64;
 /// The win32k session-heap arena that lookaside fallbacks, section descriptors, and section backing
 /// allocate from (counter at +0, free-list head at +8, data at +0x1000). Section-backed USER and
 /// desktop heaps then allocate inside their own section views, using the same block allocator.
@@ -3296,7 +3294,6 @@ const EPROCESS_SECTION_BASE_ADDRESS_OFF: u64 = 0x1F0;
 const EPROCESS_WIN32_WINDOW_STATION_OFF: u64 = 0x208;
 #[allow(dead_code)]
 const EPROCESS_SESSION_OFF: u64 = 0x258;
-const EPROCESS_PEB_OFF: u64 = 0x2B8;
 
 /// `PEPROCESS IoGetCurrentProcess()` / `PsGetCurrentProcess()` reads the selected KPCR context,
 /// including the initialization caller which has no GUI runtime record.
@@ -9609,7 +9606,6 @@ struct Win32kProcessContextRecord {
     eprocess: u64,
     w32process: u64,
     terminating: u64,
-    client_peb: u64,
     token_authentication_id: u64,
     primary_token: u64,
     token_references: nt_object_manager::win32k_ob::OwnedObjectReferenceCounts,
@@ -9640,10 +9636,6 @@ static WIN32K_THREAD_CTX_ALLOC_FAILURES: AtomicU64 = AtomicU64::new(0);
 // Context dispatch and callback resume are continuation-serialized through the single win32k
 // component. Release publication therefore forms the quiescent boundary for replacing table
 // backing. A future multi-worker provider must add an explicit read-side lifetime protocol.
-static WIN32K_CONTEXT_EPROCESS_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
-static WIN32K_CONTEXT_EPROCESS_FREES: AtomicU64 = AtomicU64::new(0);
-static WIN32K_CONTEXT_ETHREAD_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
-static WIN32K_CONTEXT_ETHREAD_FREES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CONTEXT_TOKEN_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CONTEXT_TOKEN_FREES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CONTEXT_CALLOUT_TEB_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
@@ -9659,7 +9651,6 @@ static WIN32K_CLIENT_THREAD_CALLOUTS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_CONTEXT_TRACES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CALLBACK_RESUME_CONTEXT_RESTORES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CALLBACK_RESUME_CONTEXT_FAILURES: AtomicU64 = AtomicU64::new(0);
-static WIN32K_CLIENT_PEB_INSTALLS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_WALL_CONTEXT_TRACES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_TOKEN_CONTEXT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_PRIMARY_TOKEN_REFERENCE_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -9823,7 +9814,6 @@ process_ctx_getter!(process_ctx_generation, generation);
 process_ctx_getter!(process_ctx_eprocess, eprocess);
 process_ctx_getter!(process_ctx_w32process, w32process);
 process_ctx_getter!(process_ctx_terminating, terminating);
-process_ctx_getter!(process_ctx_client_peb, client_peb);
 process_ctx_getter!(process_ctx_token_authentication_id, token_authentication_id);
 process_ctx_getter!(process_ctx_primary_token, primary_token);
 process_ctx_setter!(set_process_ctx_pid, pid);
@@ -9832,7 +9822,6 @@ process_ctx_setter!(set_process_ctx_generation, generation);
 process_ctx_setter!(set_process_ctx_eprocess, eprocess);
 process_ctx_setter!(set_process_ctx_w32process, w32process);
 process_ctx_setter!(set_process_ctx_terminating, terminating);
-process_ctx_setter!(set_process_ctx_client_peb, client_peb);
 process_ctx_setter!(
     set_process_ctx_token_authentication_id,
     token_authentication_id
@@ -10080,12 +10069,6 @@ unsafe fn finalize_thread_ctx_record(index: usize) -> bool {
         return note_context_retirement_failure(b"thread", record.tid);
     }
 
-    let owns_ethread = match provider_storage_owned(record.ethread, WIN32K_ETHREAD_BYTES) {
-        Ok(owned) => owned,
-        Err(()) => {
-            return note_context_retirement_failure(b"thread-ethread-storage", record.tid)
-        }
-    };
     let owns_callout_teb = if record.callout_teb == 0 {
         false
     } else {
@@ -10097,14 +10080,10 @@ unsafe fn finalize_thread_ctx_record(index: usize) -> bool {
         }
     };
 
-    let mut owned = [(0u64, 0u64); 2];
+    let mut owned = [(0u64, 0u64); 1];
     let mut owned_len = 0usize;
     if owns_callout_teb {
         owned[owned_len] = (record.callout_teb, 0x1000);
-        owned_len += 1;
-    }
-    if owns_ethread {
-        owned[owned_len] = (record.ethread, WIN32K_ETHREAD_BYTES);
         owned_len += 1;
     }
     let retirement = if owned_len == 0 {
@@ -10145,9 +10124,6 @@ unsafe fn finalize_thread_ctx_record(index: usize) -> bool {
     if owns_callout_teb {
         WIN32K_CONTEXT_CALLOUT_TEB_FREES.fetch_add(1, Ordering::Relaxed);
     }
-    if owns_ethread {
-        WIN32K_CONTEXT_ETHREAD_FREES.fetch_add(1, Ordering::Relaxed);
-    }
     write_volatile(
         ptr,
         Win32kThreadContextRecord {
@@ -10181,12 +10157,6 @@ unsafe fn finalize_process_ctx_record(index: usize) -> bool {
         return note_context_retirement_failure(b"process", record.pid);
     }
 
-    let owns_eprocess = match provider_storage_owned(record.eprocess, WIN32K_EPROCESS_BYTES) {
-        Ok(owned) => owned,
-        Err(()) => {
-            return note_context_retirement_failure(b"process-eprocess-storage", record.pid)
-        }
-    };
     let owns_primary_token = if record.primary_token == 0 {
         false
     } else {
@@ -10198,14 +10168,10 @@ unsafe fn finalize_process_ctx_record(index: usize) -> bool {
         }
     };
 
-    let mut owned = [(0u64, 0u64); 2];
+    let mut owned = [(0u64, 0u64); 1];
     let mut owned_len = 0usize;
     if owns_primary_token {
         owned[owned_len] = (record.primary_token, WIN32K_PRIMARY_TOKEN_BYTES);
-        owned_len += 1;
-    }
-    if owns_eprocess {
-        owned[owned_len] = (record.eprocess, WIN32K_EPROCESS_BYTES);
         owned_len += 1;
     }
     let retirement = if owned_len == 0 {
@@ -10247,9 +10213,6 @@ unsafe fn finalize_process_ctx_record(index: usize) -> bool {
     if owns_primary_token {
         WIN32K_CONTEXT_TOKEN_FREES.fetch_add(1, Ordering::Relaxed);
     }
-    if owns_eprocess {
-        WIN32K_CONTEXT_EPROCESS_FREES.fetch_add(1, Ordering::Relaxed);
-    }
     write_volatile(
         ptr,
         Win32kProcessContextRecord {
@@ -10259,7 +10222,6 @@ unsafe fn finalize_process_ctx_record(index: usize) -> bool {
             eprocess: 0,
             w32process: 0,
             terminating: 0,
-            client_peb: 0,
             token_authentication_id: 0,
             primary_token: 0,
             token_references:
@@ -10271,56 +10233,12 @@ unsafe fn finalize_process_ctx_record(index: usize) -> bool {
 
 unsafe fn process_context_object_matches_or_empty(index: usize, supplied: u64) -> bool {
     let existing = process_ctx_eprocess(index);
-    supplied == 0 || existing == 0 || existing == supplied
+    supplied != 0 && (existing == 0 || existing == supplied)
 }
 
 unsafe fn thread_context_object_matches_or_empty(index: usize, supplied: u64) -> bool {
     let existing = thread_ctx_ethread(index);
-    supplied == 0 || existing == 0 || existing == supplied
-}
-
-unsafe fn process_context_object_or_allocate(
-    index: usize,
-    supplied: u64,
-    size: u64,
-) -> Option<u64> {
-    let existing = process_ctx_eprocess(index);
-    if existing != 0 {
-        return Some(existing);
-    }
-    let object = if supplied != 0 {
-        supplied
-    } else {
-        allocate_kernel_object_body(size)
-    };
-    if object == 0 {
-        return None;
-    }
-    set_process_ctx_eprocess(index, object);
-    if supplied == 0 {
-        WIN32K_CONTEXT_EPROCESS_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-    }
-    Some(object)
-}
-
-unsafe fn thread_context_object_or_allocate(index: usize, supplied: u64, size: u64) -> Option<u64> {
-    let existing = thread_ctx_ethread(index);
-    if existing != 0 {
-        return Some(existing);
-    }
-    let object = if supplied != 0 {
-        supplied
-    } else {
-        allocate_kernel_object_body(size)
-    };
-    if object == 0 {
-        return None;
-    }
-    set_thread_ctx_ethread(index, object);
-    if supplied == 0 {
-        WIN32K_CONTEXT_ETHREAD_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-    }
-    Some(object)
+    supplied != 0 && (existing == 0 || existing == supplied)
 }
 
 pub(crate) fn win32k_context_store_stats() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
@@ -10340,10 +10258,6 @@ pub(crate) fn win32k_context_store_stats() -> (u64, u64, u64, u64, u64, u64, u64
 pub(crate) struct Win32kContextLifetimeCensus {
     pub process_rows_live: u64,
     pub thread_rows_live: u64,
-    pub eprocess_allocations: u64,
-    pub eprocess_frees: u64,
-    pub ethread_allocations: u64,
-    pub ethread_frees: u64,
     pub token_allocations: u64,
     pub token_frees: u64,
     pub token_pointer_references: u64,
@@ -10376,10 +10290,6 @@ pub(crate) fn win32k_context_lifetime_census() -> Win32kContextLifetimeCensus {
         Win32kContextLifetimeCensus {
             process_rows_live,
             thread_rows_live,
-            eprocess_allocations: WIN32K_CONTEXT_EPROCESS_ALLOCATIONS.load(Ordering::Relaxed),
-            eprocess_frees: WIN32K_CONTEXT_EPROCESS_FREES.load(Ordering::Relaxed),
-            ethread_allocations: WIN32K_CONTEXT_ETHREAD_ALLOCATIONS.load(Ordering::Relaxed),
-            ethread_frees: WIN32K_CONTEXT_ETHREAD_FREES.load(Ordering::Relaxed),
             token_allocations: WIN32K_CONTEXT_TOKEN_ALLOCATIONS.load(Ordering::Relaxed),
             token_frees: WIN32K_CONTEXT_TOKEN_FREES.load(Ordering::Relaxed),
             token_pointer_references,
@@ -11164,65 +11074,6 @@ unsafe fn eprocess_for_pid(process_id: u64) -> u64 {
         .unwrap_or(0)
 }
 
-unsafe fn client_peb_from_teb(client_teb: u64) -> u64 {
-    if client_teb < 0x10000 {
-        return 0;
-    }
-    let peb = read_volatile((client_teb + TEB_PROCESS_ENVIRONMENT_BLOCK_OFF) as *const u64);
-    if peb < 0x10000 {
-        0
-    } else {
-        peb
-    }
-}
-
-unsafe fn record_process_client_peb(process_index: usize, client_peb: u64) {
-    if client_peb != 0 {
-        set_process_ctx_client_peb(process_index, client_peb);
-    }
-}
-
-unsafe fn initialize_eprocess_body(eprocess: u64, process_id: u64, client_peb: u64) {
-    // Published Ps bodies already carry their identity and PEB. Only win32k-owned compatibility
-    // bodies need this local layout; rewriting a canonical body would corrupt its owner state.
-    if crate::ps_object_backing::contains_address(eprocess) {
-        return;
-    }
-    let q = eprocess + 0x900;
-    let zstr = eprocess + 0xA00;
-    let synthetic_peb = eprocess + 0x800;
-    let synthetic_params = eprocess + 0xB00;
-    write_volatile((eprocess + 0x20) as *mut u64, q);
-    write_volatile((q + 0x80) as *mut u64, zstr);
-    write_volatile(zstr as *mut u16, 0);
-    write_volatile(
-        (eprocess + EPROCESS_UNIQUE_PROCESS_ID_OFF) as *mut u64,
-        process_id,
-    );
-    if client_peb != 0 {
-        let current = read_volatile((eprocess + EPROCESS_PEB_OFF) as *const u64);
-        if current != client_peb {
-            write_volatile((eprocess + EPROCESS_PEB_OFF) as *mut u64, client_peb);
-            let n = WIN32K_CLIENT_PEB_INSTALLS.fetch_add(1, Ordering::Relaxed);
-            if n < 16 {
-                print_str(b"[win32k-context] EPROCESS.Peb <- client PEB pid=");
-                print_u64(process_id);
-                print_str(b" peb=0x");
-                print_hex((client_peb >> 32) as u32);
-                print_hex(client_peb as u32);
-                print_str(b" params=<client>");
-                print_str(b"\n");
-            }
-        }
-    } else if read_volatile((eprocess + EPROCESS_PEB_OFF) as *const u64) == 0 {
-        write_volatile((eprocess + EPROCESS_PEB_OFF) as *mut u64, synthetic_peb);
-        write_volatile(
-            (synthetic_peb + PEB_PROCESS_PARAMETERS_OFF) as *mut u64,
-            synthetic_params,
-        );
-    }
-}
-
 unsafe fn seed_win32k_callout_teb(thread_index: usize) -> Option<u64> {
     let pid = thread_ctx_pid(thread_index);
     let tid = thread_ctx_tid(thread_index);
@@ -11478,8 +11329,6 @@ unsafe fn restore_current_context_for_user_callback_resume_inner(
     if client_teb != 0 {
         set_thread_ctx_teb(thread_index, client_teb);
     }
-    let recorded_client_peb = process_ctx_client_peb(process_index);
-    initialize_eprocess_body(eprocess, pid, recorded_client_peb);
     let Some(teb) = seed_win32k_callout_teb(thread_index) else {
         let n = WIN32K_CALLBACK_RESUME_CONTEXT_FAILURES.fetch_add(1, Ordering::Relaxed);
         if n < 16 {
@@ -11572,14 +11421,15 @@ unsafe fn restore_current_context_for_user_callback_resume_inner(
     true
 }
 
+// Root validates and maps the exact published Ps pair before dispatch. These records retain
+// those supplied identities; their storage never owns or initializes the Ps bodies.
 unsafe fn ensure_process_context(
     pi: usize,
     pid: u64,
     generation: u64,
     supplied_eprocess: u64,
-    client_peb: u64,
 ) -> Option<usize> {
-    if pid == 0 {
+    if pid == 0 || supplied_eprocess == 0 {
         return None;
     }
     if let Some(index) = process_context_index_for_pid(pid) {
@@ -11587,51 +11437,35 @@ unsafe fn ensure_process_context(
         if generation != 0 && recorded_generation != 0 && generation != recorded_generation {
             return None;
         }
-        set_process_ctx_pi(index, pi as u64);
-        if recorded_generation == 0 {
-            set_process_ctx_generation(index, generation);
-        }
         if !process_context_object_matches_or_empty(index, supplied_eprocess) {
             print_str(b"[win32k-context] ERROR: supplied EPROCESS mismatch for pid=");
             print_u64(pid);
             print_str(b"\n");
             return None;
         }
-        let eprocess =
-            process_context_object_or_allocate(index, supplied_eprocess, WIN32K_EPROCESS_BYTES)?;
-        record_process_client_peb(index, client_peb);
-        initialize_eprocess_body(eprocess, pid, client_peb);
+        set_process_ctx_pi(index, pi as u64);
+        if recorded_generation == 0 {
+            set_process_ctx_generation(index, generation);
+        }
+        set_process_ctx_eprocess(index, supplied_eprocess);
         return Some(index);
     }
     let index = reserve_process_ctx_record()?;
-    let eprocess = if supplied_eprocess != 0 {
-        supplied_eprocess
-    } else {
-        allocate_kernel_object_body(WIN32K_EPROCESS_BYTES)
-    };
-    if eprocess == 0 {
-        return None;
-    }
-    if supplied_eprocess == 0 {
-        WIN32K_CONTEXT_EPROCESS_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-    }
     commit_process_ctx_record(
         index,
         Win32kProcessContextRecord {
             pid,
             pi: pi as u64,
             generation,
-            eprocess,
+            eprocess: supplied_eprocess,
             w32process: 0,
             terminating: 0,
-            client_peb,
             token_authentication_id: 0,
             primary_token: 0,
             token_references:
                 nt_object_manager::win32k_ob::OwnedObjectReferenceCounts::new(),
         },
     );
-    initialize_eprocess_body(eprocess, pid, client_peb);
     Some(index)
 }
 
@@ -11643,7 +11477,7 @@ unsafe fn ensure_thread_context(
     teb: u64,
     supplied_ethread: u64,
 ) -> Option<usize> {
-    if pid == 0 || tid == 0 {
+    if pid == 0 || tid == 0 || supplied_ethread == 0 {
         return None;
     }
     if let Some(index) = thread_context_index_for_tid(tid) {
@@ -11654,6 +11488,12 @@ unsafe fn ensure_thread_context(
         if generation != 0 && recorded_generation != 0 && generation != recorded_generation {
             return None;
         }
+        if !thread_context_object_matches_or_empty(index, supplied_ethread) {
+            print_str(b"[win32k-context] ERROR: supplied ETHREAD mismatch for tid=");
+            print_u64(tid);
+            print_str(b"\n");
+            return None;
+        }
         set_thread_ctx_pi(index, pi as u64);
         if recorded_generation == 0 {
             set_thread_ctx_generation(index, generation);
@@ -11661,27 +11501,10 @@ unsafe fn ensure_thread_context(
         if teb != 0 {
             set_thread_ctx_teb(index, teb);
         }
-        if !thread_context_object_matches_or_empty(index, supplied_ethread) {
-            print_str(b"[win32k-context] ERROR: supplied ETHREAD mismatch for tid=");
-            print_u64(tid);
-            print_str(b"\n");
-            return None;
-        }
-        let _ = thread_context_object_or_allocate(index, supplied_ethread, WIN32K_ETHREAD_BYTES)?;
+        set_thread_ctx_ethread(index, supplied_ethread);
         return Some(index);
     }
     let index = reserve_thread_ctx_record()?;
-    let ethread = if supplied_ethread != 0 {
-        supplied_ethread
-    } else {
-        allocate_kernel_object_body(WIN32K_ETHREAD_BYTES)
-    };
-    if ethread == 0 {
-        return None;
-    }
-    if supplied_ethread == 0 {
-        WIN32K_CONTEXT_ETHREAD_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-    }
     commit_thread_ctx_record(
         index,
         Win32kThreadContextRecord {
@@ -11691,7 +11514,7 @@ unsafe fn ensure_thread_context(
             generation,
             teb,
             callout_teb: 0,
-            ethread,
+            ethread: supplied_ethread,
             w32thread: 0,
         },
     );
@@ -11711,7 +11534,9 @@ unsafe fn select_win32k_client_context(
     token_user_sid_len: usize,
 ) -> Option<(usize, usize)> {
     let pi = checked_client_index(pi)?;
-    if process_id == 0 || thread_id == 0 || generation == 0 {
+    if process_id == 0 || thread_id == 0 || generation == 0
+        || supplied_eprocess == 0 || supplied_ethread == 0
+    {
         return None;
     }
     if crate::ps_bootstrap::initial_system_projection().is_some_and(|system| {
@@ -11723,8 +11548,7 @@ unsafe fn select_win32k_client_context(
         return None;
     }
     let (pid, tid) = (process_id, thread_id);
-    let client_peb = client_peb_from_teb(client_teb);
-    let process_index = ensure_process_context(pi, pid, generation, supplied_eprocess, client_peb)?;
+    let process_index = ensure_process_context(pi, pid, generation, supplied_eprocess)?;
     if !record_process_token_context(
         process_index,
         token_authentication_id,
@@ -11737,8 +11561,6 @@ unsafe fn select_win32k_client_context(
         ensure_thread_context(pi, pid, tid, generation, client_teb, supplied_ethread)?;
     let eprocess = process_ctx_eprocess(process_index);
     let ethread = thread_ctx_ethread(thread_index);
-    record_process_client_peb(process_index, client_peb);
-    initialize_eprocess_body(eprocess, pid, client_peb);
     WIN32K_CURRENT_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
     WIN32K_CURRENT_PROCESS_ID.store(pid, Ordering::Relaxed);
     WIN32K_CURRENT_THREAD_ID.store(tid, Ordering::Relaxed);
