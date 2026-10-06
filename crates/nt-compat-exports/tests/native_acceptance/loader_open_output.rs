@@ -160,7 +160,7 @@ fn open_file_outputs_are_probed_before_object_attributes_or_loader_effects() {
     let handle_probe = calls.0.iter().position(|name| name == "probe_copy_output")
         .expect("typed Handle output probe");
     assert!(handle_probe < probe, "Handle probe precedes IOSB probe");
-    for effect in ["capture_file_object_attributes", "demand_load_dll_result", "mint_disk_file_handle"] {
+    for effect in ["capture_file_object_attributes", "mint_disk_file_handle"] {
         assert!(probe < calls.0.iter().position(|name| name == effect).unwrap(),
             "output fault precedes {effect}");
     }

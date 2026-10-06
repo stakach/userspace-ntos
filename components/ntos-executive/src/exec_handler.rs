@@ -31290,64 +31290,11 @@ impl ExecNtHandler {
         {
             WINLOGON_USERINIT_IMAGE_OPENS.fetch_add(1, Ordering::Relaxed);
         }
-        let mut dll_i = if self.pi >= 1 {
+        let dll_i = if self.pi >= 1 {
             reg.resolve_name(&nb[..nlen])
         } else {
             None
         };
-        if self.pi >= 1 && dll_i.is_none() && !is_sxs {
-            let load = {
-                let _alloc_scope = crate::allocator::enter_scope(b"demand-load-dll");
-                demand_load_dll_result(reg, &mut *ctx.dll_pe_store, &nb[..nlen])
-            };
-            match load {
-                Ok(result) => {
-                    dll_i = Some(result.slot);
-                }
-                Err(err) => {
-                    if !self.current_process_is_winlogon()
-                        && (nb[..nlen].ends_with(b".dll")
-                            || nb[..nlen].windows(4).any(|w| w == b".dll"))
-                    {
-                        print_str(b"[demand-miss] pi=");
-                        print_u64(self.pi as u64);
-                        print_str(b" reason=");
-                        print_str(err.tag());
-                        match err {
-                            DemandLoadError::StoreAllocationFailed { slot } => {
-                                print_str(b" slot=");
-                                print_u64(slot as u64);
-                            }
-                            DemandLoadError::PoolExhausted { size } => {
-                                print_str(b" size=");
-                                print_u64(size as u64);
-                            }
-                            DemandLoadError::ShortRead { expected, actual } => {
-                                print_str(b" expected=");
-                                print_u64(expected as u64);
-                                print_str(b" actual=");
-                                print_u64(actual as u64);
-                            }
-                            DemandLoadError::ArenaExhausted { image_size } => {
-                                print_str(b" image_size=");
-                                print_u64(image_size);
-                            }
-                            DemandLoadError::UnsupportedImageName
-                            | DemandLoadError::SxsProbe
-                            | DemandLoadError::DeniedDiverter
-                            | DemandLoadError::RegistrySlotAllocationFailed
-                            | DemandLoadError::NoMountedFs
-                            | DemandLoadError::FileMissing
-                            | DemandLoadError::EmptyFile
-                            | DemandLoadError::PeParseFailed => {}
-                        }
-                        print_str(b" name=");
-                        print_str(&nb[..nlen.min(64)]);
-                        print_str(b"\n");
-                    }
-                }
-            }
-        }
         let mut opened_handle = 0;
         let loader_file = (hosted_exe_leaf.is_some() || dll_i.is_some())
             .then_some(volume_file)

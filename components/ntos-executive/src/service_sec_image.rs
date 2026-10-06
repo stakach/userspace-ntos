@@ -8101,46 +8101,16 @@ pub(crate) unsafe fn service_sec_image(
         );
     }
     print_str(b"[sec-init] bootstrap-image-load end\n");
-    // Generic DLL registry: the loadable DLLs each hosted process's ntdll loader resolves +
-    // demand-pages — csrss's static import csrsrv.dll + its CsrLoadServerDll ServerDlls
-    // basesrv/winsrv, the shared Win32 client stack (kernel32/user32/gdi32/rpcrt4/…), winlogon's
-    // userenv/mpr, and lsass's lsasrv/samsrv/msv1_0. ALL are sourced BY PATH from the real \reactos
-    // FS into the demand-load pool — NO hardcoded per-DLL block, NO fixed staging buffer, NO
-    // STORAGE_SHARED offset: a single DATA-DRIVEN table (seed stem, System32 leaf) drives the load.
-    // Adding a served DLL = one row here. ORDER IS LOAD-BEARING: it is the registration order, which
-    // is the base-assignment order — csrsrv MUST stay first so it keeps registry base 0x8000_0000 =
-    // its preferred ImageBase (relocation delta 0, text byte-identical + shared read-only across
-    // processes); the rest are loader-relocated to their fixed slots. All slots share the 1 GiB
-    // 0x8000_0000 PDPT range. Load-flow DECISIONS (name/handle/VA lookups + SECTION_IMAGE_INFORMATION)
-    // run through host-tested nt-dll-registry; the executive keeps the parsed PEs parallel (same
-    // index) for the effectful demand-fill. (winsrv is ~100 pages — the root CNode is an XL page under
-    // extern-rootserver, so the caps fit.)
-    // Part 3 — TRUE syscall-time demand-load. The eager per-DLL `DLL_TABLE` is GONE: DLLs load PURELY
-    // ON-DEMAND from the real \reactos FS when a hosted process's loader first requests one (a
-    // `reg.resolve_name` MISS in NtOpenFile → `fs_loader::demand_load_dll`). At boot we only:
-    //   (1) PIN csrsrv at slot 0 (base 0x8000_0000 = its preferred ImageBase, relocation delta 0 →
-    //       byte-identical shared text, loader never relocates it). Demand-load assigns slots in
-    //       loader-request order, which can't guarantee csrsrv lands at slot 0, so this ONE entry is a
-    //       documented pin (DLL_PIN_COUNT). No other DLL cares about its base (all get relocated).
-    //   (2) RESERVE empty metadata slots from the live System32 cache size (per-pi handle stores and
-    //       PE-store slots). Demand-load can still append a checked slot later; ownership keeps the
-    //       backing allocation live. The pool bytes live in the cap-mapped POOL arena (atomic
-    //       POOL_NEXT).
-    // Adding a new DLL (userinit/explorer/shell32/…) now needs NO edit here — it demand-loads into a
-    // data-derived or dynamically appended slot. NO maintained DLL list remains (only the 1-entry
-    // csrsrv base pin plus forwarder-only `_vista` pins).
-    // csrsrv (base pin) + the three `_vista` forwarder DLLs (loaded via LdrpSnapThunk's forwarder
-    // path, which the NtOpenFile-based demand-load hook can't catch — see DLL_PIN_COUNT). ws2help is
-    // demand-loadable (ws2_32 loads it as a normal import, not a forwarder), so it's NOT pinned.
+    // Retain the existing bootstrap DLL registry and its parsed pool-backed images for legacy
+    // bootstrap consumers. Ordinary File opens do not populate this store: canonical SEC_IMAGE
+    // admission captures the opened File, and image residency reads that retained source.
     const DLL_PINS: [(&[u8], &[u8]); DLL_PIN_COUNT] = [
         (b"csrsrv", b"reactos\\system32\\csrsrv.dll"),
         (b"kernel32_vista", b"reactos\\system32\\kernel32_vista.dll"),
         (b"advapi32_vista", b"reactos\\system32\\advapi32_vista.dll"),
         (b"ntdll_vista", b"reactos\\system32\\ntdll_vista.dll"),
     ];
-    // Parsed-PE storage lives for the whole service loop. `ExecLoopCtx::dll_pes()` derives a slice
-    // from this vector each dispatch, so demand-load slot growth cannot leave a stale parallel ref
-    // table behind.
+    // Bootstrap parsed-PE storage lives for the whole service loop.
     let dll_pe_store = reset_service_dll_pe_store_work();
     let mut reg = nt_dll_registry::Registry::new(DLL_ARENA_START, DLL_ARENA_END);
     print_str(b"[sec-init] pinned-dll-load begin\n");
@@ -8170,8 +8140,7 @@ pub(crate) unsafe fn service_sec_image(
         }
     }
     print_str(b"[sec-init] pinned-dll-load end\n");
-    // (2) Reserve empty metadata slots from the live System32 cache. VA is consumed only when a real
-    // image activates one; this is a performance/persistence reserve, not a hard ceiling.
+    // Preserve existing legacy registry capacity; this is not canonical image admission.
     let dll_slot_reserve = match exec_fs().and_then(|fs| system32_cache_slot_reserve_hint(&fs)) {
         Some(count) => count.max(DLL_PIN_COUNT),
         None => DLL_PIN_COUNT,

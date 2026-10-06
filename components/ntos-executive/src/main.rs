@@ -1971,22 +1971,8 @@ impl DllPeStore {
     }
 }
 
-/// Slots PINNED (eagerly loaded + registered at BOOT, NOT demand-loaded). The FLAGGED IRREDUCIBLE
-/// MINIMUM — every OTHER System32 DLL demand-loads on the fly. Two reasons a DLL must be pinned:
-///   • **csrsrv** (slot 0) — needs base 0x8000_0000 (its preferred ImageBase → relocation delta 0 →
-///     byte-identical shared text, loader never relocates it). Demand-load assigns slots in
-///     loader-request order, which can't guarantee csrsrv lands at slot 0.
-///   • **the `_vista` forwarder DLLs + ws2help** — these are loaded by ntdll's loader via the
-///     FORWARDER path in `LdrpSnapThunk`/`ldrpe.c` (e.g. advapi32 exports `RegDeleteTreeW` as a
-///     forwarder to `advapi32_vista.RegDeleteTreeW`). That forwarder resolution can fail BEFORE it
-///     ever reaches NtOpenFile (SxS/actctx redirection returns 0xC0000034 with no implicit act ctx),
-///     so the demand-load hook (which fires on the NtOpenFile resolve-miss) never sees the request →
-///     the snap fails fatally (observed: "Failed to snap advapi32_vista.dll!RegDeleteTreeW for
-///     rpcrt4.dll" → NtRaiseHardError). Pre-registering them means the loader finds them already
-///     loaded (`LdrpCheckForLoadedDll` hits) and skips the fragile forwarder-open path. This is a
-///     loader limitation, not a demand-load bug — documented pin, not a maintained content list.
-/// Every leaf DLL (kernel32/user32/gdi32/advapi32/rpcrt4/msvcrt/ws2_32/basesrv/winsrv + lsass'
-/// lsasrv/samsrv/msv1_0 + all P5+ binaries) demand-loads with NO edit here.
+/// Existing bootstrap DLL registry entries. Canonical File-backed SEC_IMAGE does not use these
+/// entries to discover, stage, or assign addresses to ordinary DLLs.
 pub const DLL_PIN_COUNT: usize = 4;
 /// NLS code-page tables (c_1252.nls/c_437.nls/l_intl.nls), shared host<->exec. They live in the
 /// shared-input 2 MiB region (0xA0_0000-0xC0_0000). spawn_sec_image later shares these frames into smss + points the PEB NLS
@@ -6064,13 +6050,9 @@ fn lsa_security_database_specs(passed: &mut u64) {
             && sid_shape_ok,
         passed,
     );
-    // (2) samsrv.dll is GENUINELY hosted: demand-loaded BY PATH off the real \reactos tree (nothing
-    //     in the executive names it — lsass resolves it at runtime), the real SAM hive is mounted,
-    //     and samsrv's OWN `SampSetupCreateServer` created its database keys (`SAM`, `SAM\Domains`)
-    //     under that mount.
-    print_str(b"[lsa-db] samsrv.dll loaded=");
-    print_u64(SAMSRV_LOADED_SIZE.load(Ordering::Relaxed));
-    print_str(b"B sam-setup-keys=");
+    // (2) Require actual SAM hive access and database creation, or a restored database with an
+    // authenticated logon. Staged DLL bytes are not evidence that SAM code executed.
+    print_str(b"[lsa-db] sam-setup-keys=");
     print_u64(SAM_SETUP_KEYS_CREATED.load(Ordering::Relaxed));
     print_str(b" sam-mount-opens=");
     print_u64(SAM_HIVE_ROOT_OPENED.load(Ordering::Relaxed));
@@ -6086,8 +6068,7 @@ fn lsa_security_database_specs(passed: &mut u64) {
     print_str(b"\n");
     check(
         b"exec_samsrv_hosted",
-        SAMSRV_LOADED_SIZE.load(Ordering::Relaxed) >= 200_000
-            && SAM_HIVE_SIZE.load(Ordering::Relaxed) == 8192
+        SAM_HIVE_SIZE.load(Ordering::Relaxed) == 8192
             && SAM_HIVE_ROOT_OPENED.load(Ordering::Relaxed) >= 1
             && sam_database_proven,
         passed,
@@ -21934,8 +21915,6 @@ pub(crate) static LSA_ACCT_DOMAIN_ATTR_READS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LSA_ACCT_DOMAIN_ATTR_READS_IN_LOGON: AtomicU64 = AtomicU64::new(0);
 /// Set while a real `LsaLogonUser` (`LSA_API_MSG` ApiNumber 2) request is being serviced.
 pub(crate) static LSA_LOGON_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
-/// samsrv.dll's on-disk byte size, recorded when the by-path demand-loader actually loaded it.
-pub(crate) static SAMSRV_LOADED_SIZE: AtomicU64 = AtomicU64::new(0);
 /// ═══ `NtCreateToken` (SSN 57) — the real logon-token mint ══════════════════════════════════════
 /// Serviced calls, and how each one ended. Every value below is written by the handler out of what
 /// it ACTUALLY captured from the caller's address space — nothing is seeded or defaulted.
@@ -22303,9 +22282,8 @@ struct ExecLoopCtx {
     img_base: u64,
     nt_base: u64,
     nt_end: u64,
-    /// The mutable backing store for loadable DLL PEs (csrsrv/basesrv/winsrv + the Win32 client
-    /// stack). The demand-load path writes freshly parsed PEs here, and `dll_pes()` derives a live
-    /// slice from the current vector so runtime slot growth cannot leave a stale reference table.
+    /// Parsed bootstrap DLLs retained for legacy registry consumers. Canonical File-backed image
+    /// sources and their views are owned separately by NativeImageStore.
     dll_pe_store: *mut DllPeStore,
     /// Generic data/pagefile section objects and mapped views. This is the real section-object path
     /// for non-SEC_IMAGE mappings: NtCreateSection records backing, NtMapViewOfSection reserves a
