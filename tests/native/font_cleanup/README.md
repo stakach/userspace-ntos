@@ -22,6 +22,13 @@ font process with actual Section view/unmap/final-reference receipts. A full des
 screenshot are separate requirements. Retained pending ownership, stale replay denial, and stopped
 physical provider cleanup are not claimed solely from this fixture's successful exit.
 
+The strict parser requires at least one file-backed view mapped by that exact hosted process
+incarnation during the font-load interval. Its map, acknowledged unmap, and successful terminal
+cleanup result must agree on native allocation, provider, view, Section, mounted File, and original
+initiator identities. The cleanup actor must also match the terminal process incarnation. This
+does not prove a font pathname or retirement of every font view. Older logs without these copied
+provenance fields are not sufficient for this strengthened receipt contract.
+
 ## Build
 
 The sole build/test owner may run `bash tests/native/font_cleanup/build.sh` after our ntdll and

@@ -91,3 +91,68 @@ fn cleanup_observer_follows_physical_auth_and_actual_operation_result_without_ne
         assert!(!calls.iter().any(|call| call == forbidden), "cleanup observation must not acquire {forbidden}");
     }
 }
+
+#[test]
+fn mapping_retains_copied_initiator_and_backing_before_native_effects() {
+    let file = source("provider_mm_section_objects.rs");
+    let mapping = file.items.iter().find_map(|item| match item {
+        syn::Item::Struct(item) if item.ident == "Mapping" => Some(item),
+        _ => None,
+    }).expect("actual provider Mapping owner");
+    assert!(mapping.fields.iter().any(|field|
+        field.ident.as_ref().is_some_and(|name| name == "provenance")));
+    let map = calls(&function(&file, "map"));
+    before(&map, "capture_mapping_provenance", "map_provider_view");
+    before(&map, "page_map_r", "map_published");
+    let receipts = source("provider_section_receipts.rs");
+    let capture = function(&receipts, "capture_mapping_provenance");
+    let mut fields = Fields::default();
+    fields.visit_item_fn(&capture);
+    for expected in ["generation", "backing", "file", "kind"] {
+        assert!(fields.0.iter().any(|field| field == expected), "missing {expected}");
+    }
+    let effects = calls(&capture);
+    for forbidden in ["unwrap", "expect", "lookup_native_section_file_source", "retain_section", "open_file"] {
+        assert!(!effects.iter().any(|call| call == forbidden), "observation acquired {forbidden}");
+    }
+}
+
+#[test]
+fn successful_cleanup_passes_captured_retired_view_without_post_retirement_lookup() {
+    let file = source("provider_section_cleanup.rs");
+    let cleanup = function(&file, "service_win32k_section_cleanup_request");
+    struct ObserverArgs(Vec<String>);
+    impl<'ast> Visit<'ast> for ObserverArgs {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if matches!(&*call.func, syn::Expr::Path(path)
+                if path.path.segments.last().is_some_and(|part| part.ident == "observe_cleanup_result"))
+            {
+                struct Paths<'a>(&'a mut Vec<String>);
+                impl<'ast> Visit<'ast> for Paths<'_> {
+                    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+                        self.0.push(path.path.segments.last().unwrap().ident.to_string());
+                    }
+                }
+                let mut paths = Paths(&mut self.0);
+                for argument in &call.args { paths.visit_expr(argument); }
+            }
+            visit::visit_expr_call(self, call);
+        }
+    }
+    let mut args = ObserverArgs(Vec::new());
+    args.visit_item_fn(&cleanup);
+    assert!(args.0.iter().any(|name| name == "retired_view"));
+    let objects = source("provider_mm_section_objects.rs");
+    let unmap = function(&objects, "unmap");
+    let syn::ReturnType::Type(_, ty) = &unmap.sig.output else { panic!("unmap result") };
+    struct ReceiptType(bool);
+    impl<'ast> Visit<'ast> for ReceiptType {
+        fn visit_type_path(&mut self, ty: &'ast syn::TypePath) {
+            self.0 |= ty.path.segments.iter().any(|part| part.ident == "RetirementReceipt");
+            visit::visit_type_path(self, ty);
+        }
+    }
+    let mut receipt = ReceiptType(false);
+    receipt.visit_type(ty);
+    assert!(receipt.0, "return the copied successful retirement, not a freed-row lookup");
+}

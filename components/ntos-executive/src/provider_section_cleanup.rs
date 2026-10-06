@@ -34,17 +34,21 @@ pub(crate) unsafe fn service_win32k_section_cleanup_request(
         }
         // The canonical object/view ledger verifies exact provider ownership and records
         // retirement before effects. No logical process handle authority is acquired here.
+        let mut retired_view = None;
         let result = match op {
             wire::OP_DEREFERENCE => {
                 provider_mm_section_objects::dereference(handler, address, physical)
             }
             wire::OP_UNMAP => {
-                provider_mm_section_objects::unmap(handler, address, physical).map(|()| 0)
+                provider_mm_section_objects::unmap(handler, address, physical).map(|receipt| {
+                    retired_view = receipt;
+                    0
+                })
             }
             _ => unreachable!(),
         };
         provider_section_receipts::observe_cleanup_result(
-            handler, channel, physical, op, address, &result,
+            handler, channel, physical, op, address, &result, retired_view,
         );
         result
     })();

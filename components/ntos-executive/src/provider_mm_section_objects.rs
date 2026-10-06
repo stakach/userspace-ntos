@@ -30,6 +30,7 @@ struct Cap {
 
 struct Mapping {
     view: ProviderSectionView,
+    provenance: crate::provider_section_receipts::MappingProvenance,
     span: u64,
     frames: Vec<Cap>,
     tables: Vec<Cap>,
@@ -219,6 +220,7 @@ fn rights(protection: u32) -> Result<u64, u32> {
 
 pub(crate) unsafe fn map(
     handler: *mut ExecNtHandler, address: u64, physical: runtime::PhysicalSource, requested_size: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
 ) -> Result<(u64, u64), u32> {
     let _durable = crate::allocator::enter_durable();
     let row = object(address, physical).map_err(|status| map_failure(b"object-owner", address, status))?;
@@ -231,6 +233,9 @@ pub(crate) unsafe fn map(
     let section = (&*sections).section(identity.index()).filter(|_| {
         (&*sections).section_identity(identity.index()) == Some(identity)
     }).ok_or_else(|| map_failure(b"section-identity", address, INVALID))?;
+    let provenance = crate::provider_section_receipts::capture_mapping_provenance(
+        &*handler, caller, identity, section,
+    );
     let size = if requested_size == 0 { section.size } else { requested_size };
     if size == 0 || size > section.size { return Err(0xc000_001f); }
     let rights = rights(section.protection)?;
@@ -248,7 +253,7 @@ pub(crate) unsafe fn map(
     let view = (&mut *sections).map_provider_view(provider_identity(physical)?, identity, base, rounded, 0)
         .ok_or(NO_MEMORY)?;
     (*row).maps.push(Box::new(Mapping {
-        view, span, frames, tables, published: false, retiring: false, uncertain: false,
+        view, provenance, span, frames, tables, published: false, retiring: false, uncertain: false,
     }));
     let mapping = &mut **(*row).maps.last_mut().unwrap() as *mut Mapping;
     let result = (|| -> Result<(), u32> {
@@ -300,15 +305,7 @@ pub(crate) unsafe fn map(
         return Err(status);
     }
     (*mapping).published = true;
-    print_str(b"[kernel-section-map] pointer="); print_hex_u64(address);
-    print_str(b" native-generation=");
-    print_u64((*row).allocation.unwrap().packet_lease().native_identity().allocation_generation);
-    print_str(b" view-generation="); print_u64(view.generation);
-    print_str(b" provider-domain="); print_u64(view.owner.domain);
-    print_str(b" provider-generation="); print_u64(view.owner.generation);
-    print_str(b" base="); print_hex_u64(base);
-    print_str(b" bytes="); print_u64(size);
-    print_str(b" pages="); print_u64(rounded / 0x1000); print_str(b"\n");
+    crate::provider_section_receipts::map_published(capture_retirement(row, mapping), size, rounded / 0x1000);
     Ok((base, size))
 }
 
@@ -364,12 +361,13 @@ unsafe fn capture_retirement(
         provider_generation: provider.generation,
         base: (*mapping).view.base,
         remaining_references: (*row).references.len() as u64,
+        provenance: (*mapping).provenance,
     })
 }
 
 pub(crate) unsafe fn unmap(
     handler: *mut ExecNtHandler, base: u64, physical: runtime::PhysicalSource,
-) -> Result<(), u32> {
+) -> Result<Option<crate::provider_section_receipts::RetirementReceipt>, u32> {
     let sections = table(handler)?;
     let (row, index) = (&mut *core::ptr::addr_of_mut!(OBJECTS)).iter_mut()
         .filter(|row| row.physical.domain == physical.domain && row.physical.pml4 == physical.pml4)
@@ -382,7 +380,7 @@ pub(crate) unsafe fn unmap(
     crate::provider_section_receipts::unmap_retired(receipt);
     (*row).maps.swap_remove(index);
     if (*row).retiring { let _ = retire_object(row); }
-    Ok(())
+    Ok(receipt)
 }
 
 unsafe fn retire_object(row: *mut Object) -> Result<(), u32> {

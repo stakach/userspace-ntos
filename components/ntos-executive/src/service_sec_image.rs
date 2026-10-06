@@ -4171,7 +4171,7 @@ pub(crate) unsafe fn service_win32k_section_create_request(
         let result = match op {
             mm_wire::OP_REFERENCE => crate::provider_mm_section_objects::reference(handler, first, physical)
                 .map(|count| (count, 0)),
-            mm_wire::OP_MAP => crate::provider_mm_section_objects::map(handler, first, physical, second),
+            mm_wire::OP_MAP => crate::provider_mm_section_objects::map(handler, first, physical, second, caller),
             _ => unreachable!(),
         };
         return SubmitResult::Ready(match result {
