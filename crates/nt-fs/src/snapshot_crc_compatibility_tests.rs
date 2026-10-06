@@ -1,5 +1,5 @@
 use super::*;
-use crate::snapshot_test_device::CachedDisk;
+use crate::snapshot_test_device::{CachedDisk, Event};
 
 fn reference_crc32c(bytes: &[u8]) -> u32 {
     let mut crc = u32::MAX;
@@ -91,9 +91,17 @@ fn fragmented_snapshot_updates_preserve_encoded_bytes_and_durable_payload() {
         );
         let expected = reference_snapshot(&fs.volume);
         assert_eq!(fs.export_volume_snapshot().unwrap(), expected);
+        disk.events.clear();
         let (generation, length) = fs.commit_volume_snapshot(&store, &mut disk).unwrap();
         assert_eq!(generation, index as u64 + 1);
         assert_eq!(length, expected.len());
+        let slot_base = (index as u64 % 2) * 8;
+        let mut expected_events = alloc::vec![Event::Flush];
+        for sector in 0..expected.len().div_ceil(512) {
+            expected_events.push(Event::Write(slot_base + 1 + sector as u64));
+        }
+        expected_events.extend([Event::Flush, Event::Write(slot_base), Event::Flush]);
+        assert_eq!(disk.events, expected_events);
         disk.power_cut();
         let stored = store.read_latest(&mut disk).unwrap().unwrap();
         assert_eq!(stored.generation, generation);

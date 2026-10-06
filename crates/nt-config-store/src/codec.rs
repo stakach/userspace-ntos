@@ -4,6 +4,10 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+#[cfg(test)]
+#[path = "codec_crc32c_tests.rs"]
+mod crc32c_tests;
+
 const CRC32C_TABLE: [u32; 256] = crc32c_table();
 
 const fn crc32c_table() -> [u32; 256] {
@@ -53,6 +57,47 @@ pub fn crc32c(data: &[u8]) -> u32 {
     let mut crc = Crc32c::new();
     crc.update(data);
     crc.finish()
+}
+
+/// CRC-32C of two concatenated streams, given their finalized checksums and the
+/// byte length of the second stream. An empty second stream has checksum zero.
+///
+/// Applies the linear zero-byte operator over GF(2) by repeated squaring. This
+/// is the CRC concatenation mathematics also used by Mark Adler's zlib
+/// `crc32_combine`, adapted to Castagnoli without polynomial-period assumptions.
+/// No allocation or multiplication of the byte length by eight is required.
+pub fn crc32c_combine(mut left_crc: u32, right_crc: u32, mut right_len: u64) -> u32 {
+    if right_len == 0 {
+        return left_crc;
+    }
+    let mut operator = [0u32; 32];
+    for (bit, image) in operator.iter_mut().enumerate() {
+        let basis = 1u32 << bit;
+        *image = (basis >> 8) ^ CRC32C_TABLE[(basis & 0xff) as usize];
+    }
+    loop {
+        if right_len & 1 != 0 {
+            left_crc = apply_crc_operator(&operator, left_crc);
+        }
+        right_len >>= 1;
+        if right_len == 0 {
+            return left_crc ^ right_crc;
+        }
+        let mut squared = [0u32; 32];
+        for (image, basis_image) in squared.iter_mut().zip(operator) {
+            *image = apply_crc_operator(&operator, basis_image);
+        }
+        operator = squared;
+    }
+}
+
+fn apply_crc_operator(operator: &[u32; 32], mut value: u32) -> u32 {
+    let mut result = 0;
+    while value != 0 {
+        result ^= operator[value.trailing_zeros() as usize];
+        value &= value - 1;
+    }
+    result
 }
 
 /// An append-only little-endian byte writer.

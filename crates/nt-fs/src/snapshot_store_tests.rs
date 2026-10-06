@@ -179,6 +179,79 @@ fn streaming_crc_mismatch_never_publishes_a_header() {
 }
 
 #[test]
+fn combined_crc_rejects_changed_truncated_and_extended_streams_before_publication() {
+    use nt_config_store::codec::crc32c_combine;
+
+    let header = b"captured snapshot header";
+    let payload = alloc::vec![0x5a; 1300];
+    let total_len = header.len() + payload.len();
+    let expected_crc = crc32c_combine(crc32c(header), crc32c(&payload), payload.len() as u64);
+    for drift in 0..3 {
+        let (store, mut dev) = two_generations();
+        let mut actual_payload = payload.clone();
+        if drift == 0 {
+            actual_payload[777] ^= 1;
+        } else if drift == 1 {
+            actual_payload.pop();
+        }
+        assert_eq!(
+            store.commit_next_streaming(&mut dev, total_len, expected_crc, |writer| {
+                writer.write_all(header)?;
+                writer.write_all(&actual_payload)?;
+                if drift == 2 {
+                    // Even an encoder ignoring the overrun cannot publish a header.
+                    assert_eq!(
+                        writer.write_all(&[0]),
+                        Err(SnapshotBlockStoreError::Corrupt)
+                    );
+                }
+                Ok(())
+            }),
+            Err(SnapshotBlockStoreError::Corrupt)
+        );
+        assert_eq!(dev.events.first(), Some(&Event::Flush));
+        assert!(!dev.events.contains(&Event::Write(0)));
+        assert_eq!(
+            dev.events
+                .iter()
+                .filter(|event| **event == Event::Flush)
+                .count(),
+            1
+        );
+        dev.power_cut();
+        let previous = store.read_latest(&mut dev).unwrap().unwrap();
+        assert_eq!(previous.generation, 2);
+        assert_eq!(previous.payload, b"second");
+
+        dev.events.clear();
+        assert_eq!(
+            store.commit_next_streaming(&mut dev, total_len, expected_crc, |writer| {
+                writer.write_all(header)?;
+                writer.write_all(&payload)
+            }),
+            Ok(3)
+        );
+        assert_eq!(
+            dev.events,
+            [
+                Event::Flush,
+                Event::Write(1),
+                Event::Write(2),
+                Event::Write(3),
+                Event::Flush,
+                Event::Write(0),
+                Event::Flush
+            ]
+        );
+        dev.power_cut();
+        let committed = store.read_latest(&mut dev).unwrap().unwrap();
+        assert_eq!(committed.generation, 3);
+        assert_eq!(&committed.payload[..header.len()], header);
+        assert_eq!(&committed.payload[header.len()..], payload);
+    }
+}
+
+#[test]
 fn empty_payload_still_persists_its_commit_header() {
     let (store, mut dev) = two_generations();
     assert_eq!(store.commit_next(&mut dev, b""), Ok(3));

@@ -7,7 +7,7 @@
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use nt_config_store::codec::{crc32c, Crc32c};
+use nt_config_store::codec::{crc32c, crc32c_combine, Crc32c};
 
 use crate::directory::{
     query_directory_by_index, DirectoryEntry, DirectoryQueryResult, DirectoryQueryState,
@@ -1162,13 +1162,7 @@ impl MemFs {
         let mut header = [0u8; MEMFS_SNAPSHOT_HEADER_LEN];
         Self::write_snapshot_header(&mut header, record_count, payload_len_u64, payload_crc);
 
-        let mut store_crc_sink = SnapshotCrcSink::new();
-        store_crc_sink.write_all(&header)?;
-        let written_records = self.write_snapshot_payload_to_sink(&mut store_crc_sink)?;
-        let (store_payload_crc, store_payload_len) = store_crc_sink.finish();
-        if written_records != record_count || store_payload_len != total_len {
-            return Err(SnapshotBlockStoreError::Corrupt);
-        }
+        let store_payload_crc = crc32c_combine(crc32c(&header), payload_crc, payload_len_u64);
 
         let generation =
             store.commit_next_streaming(dev, total_len, store_payload_crc, |writer| {
