@@ -196,3 +196,98 @@ fn sam_acceptance_requires_database_evidence_not_staged_dll_bytes() {
         );
     }
 }
+
+#[test]
+fn bootstrap_registers_real_images_without_filesystem_count_reservation() {
+    let file = source("service_sec_image.rs");
+    let function = file
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Fn(value) if value.sig.ident == "service_sec_image" => Some(value),
+            _ => None,
+        })
+        .expect("actual bootstrap service boundary");
+    struct BootstrapSlots {
+        registered_images: usize,
+        vacant_slot_effects: Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for BootstrapSlots {
+        fn visit_expr_for_loop(&mut self, expression: &'ast syn::ExprForLoop) {
+            let mut effects = Effects::default();
+            effects.visit_block(&expression.body);
+            if effects.calls.iter().any(|call| call == "load_dll_from_fs") {
+                assert!(
+                    effects.calls.iter().any(|call| call == "register"),
+                    "each loaded bootstrap image retains registry admission"
+                );
+                assert!(
+                    effects.calls.iter().any(|call| call == "set"),
+                    "each loaded bootstrap image retains its parsed source"
+                );
+                self.registered_images += 1;
+            }
+            syn::visit::visit_expr_for_loop(self, expression);
+        }
+
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if matches!(&*call.func, Expr::Path(path)
+                if path.path.segments.last().is_some_and(|part|
+                    part.ident == "system32_cache_slot_reserve_hint"))
+            {
+                self.vacant_slot_effects.push("filesystem count".into());
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if call.method == "try_reserve_slot" || call.method == "ensure_slot" {
+                self.vacant_slot_effects.push(call.method.to_string());
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+    let mut slots = BootstrapSlots {
+        registered_images: 0,
+        vacant_slot_effects: Vec::new(),
+    };
+    slots.visit_block(&function.block);
+    assert_eq!(
+        slots.registered_images, 1,
+        "preserve the actual bootstrap image loop"
+    );
+    assert!(
+        slots.vacant_slot_effects.is_empty(),
+        "unrelated filesystem entries must not allocate empty DLL owners: {:?}",
+        slots.vacant_slot_effects
+    );
+}
+
+#[test]
+fn obsolete_filesystem_count_hint_is_removed_but_file_cache_is_retained() {
+    let file = source("fs_loader.rs");
+    let names: Vec<_> = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Fn(value) => Some(value.sig.ident.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !names
+            .iter()
+            .any(|name| name == "system32_cache_slot_reserve_hint"),
+        "remove the single-consumer empty DLL reservation hint"
+    );
+    for required in [
+        "system32_cache_build",
+        "load_file_to_pool",
+        "load_dll_from_fs",
+    ] {
+        assert!(
+            names.iter().any(|name| name == required),
+            "preserve independent filesystem/bootstrap operation {required}"
+        );
+    }
+}

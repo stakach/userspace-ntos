@@ -8114,7 +8114,7 @@ pub(crate) unsafe fn service_sec_image(
     let dll_pe_store = reset_service_dll_pe_store_work();
     let mut reg = nt_dll_registry::Registry::new(DLL_ARENA_START, DLL_ARENA_END);
     print_str(b"[sec-init] pinned-dll-load begin\n");
-    // (1) Load + register + relocate the pinned csrsrv at slot 0 (base 0x8000_0000, delta 0).
+    // Allocate metadata only for these loaded bootstrap images; csrsrv keeps slot 0 and its base.
     for (i, &(stem, path)) in DLL_PINS.iter().enumerate() {
         print_str(b"[sec-init] pinned-dll-load item=");
         print_u64(i as u64);
@@ -8140,34 +8140,6 @@ pub(crate) unsafe fn service_sec_image(
         }
     }
     print_str(b"[sec-init] pinned-dll-load end\n");
-    // Preserve existing legacy registry capacity; this is not canonical image admission.
-    let dll_slot_reserve = match exec_fs().and_then(|fs| system32_cache_slot_reserve_hint(&fs)) {
-        Some(count) => count.max(DLL_PIN_COUNT),
-        None => DLL_PIN_COUNT,
-    };
-    print_str(b"[sec-init] dll-reserve begin\n");
-    print_str(b"[sec-init] dll-reserve target=");
-    print_u64(dll_slot_reserve as u64);
-    print_str(b"\n");
-    while reg.len() < dll_slot_reserve {
-        match reg.try_reserve_slot() {
-            Ok(slot) => {
-                if dll_pe_store.ensure_slot(slot).is_err() {
-                    print_str(b"[sec-init] dll-pe-store reserve allocation failed slot=");
-                    print_u64(slot as u64);
-                    print_str(b"\n");
-                    break;
-                }
-            }
-            Err(_) => {
-                print_str(b"[sec-init] dll-registry reserve allocation failed len=");
-                print_u64(reg.len() as u64);
-                print_str(b"\n");
-                break;
-            }
-        }
-    }
-    print_str(b"[sec-init] dll-reserve end\n");
     // The real NT syscall path (seam): dispatch SSNs the handler implements; the remaining legacy
     // broker-owned SSNs continue through the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());

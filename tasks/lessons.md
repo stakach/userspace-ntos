@@ -604,3 +604,9 @@ diagnosis-free failure.
 - Require an observation from the live target branch, not merely a successful helper
   roundtrip. Generate test wakeups through ordinary owned kernel operations rather
   than synthetic counter increments or test-only interrupt injection.
+
+## Separate Refusal From Abort
+- No terminal allocation abort does not imply that all fallible allocations succeeded.
+  Inspect refusal receipts and diagnostic suppression before declaring a memory frontier passed.
+- Identify the owning operation before interpreting an allocation size. Remove proven unused
+  reservations before increasing capacity; total free bytes do not certify a contiguous span.

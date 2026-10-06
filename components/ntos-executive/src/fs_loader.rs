@@ -594,18 +594,6 @@ unsafe fn system32_cache_lookup_metadata(fs: &Fat32, leaf: &[u8]) -> Option<FatO
     None
 }
 
-pub(crate) unsafe fn system32_cache_slot_reserve_hint(fs: &Fat32) -> Option<usize> {
-    if system32_cache_state_read(SYSTEM32_CACHE_STATE_READY) == 0 {
-        if !system32_cache_build(fs) {
-            return None;
-        }
-        system32_cache_state_write(SYSTEM32_CACHE_STATE_READY, 1);
-    }
-    let count = system32_cache_state_read(SYSTEM32_CACHE_STATE_COUNT) as usize;
-    let capacity = system32_cache_state_read(SYSTEM32_CACHE_STATE_CAPACITY) as usize;
-    Some(count.min(capacity))
-}
-
 fn system32_leaf_from_volume_path(path: &[u8]) -> Option<&[u8]> {
     const PREFIX: &[u8] = b"reactos\\system32\\";
     const ALT_PREFIX: &[u8] = b"reactos/system32/";
