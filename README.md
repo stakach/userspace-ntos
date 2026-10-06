@@ -162,7 +162,7 @@ in `extern-rootserver` mode (bring your own root task).
 The desktop target hosts **real, unmodified GPL ReactOS binaries** on rust-micro.
 Genuine Explorer and native acceptance are tracked in
 [issue #18](https://github.com/stakach/userspace-ntos/issues/18).
-The latest [fresh-run receipt](docs/evidence/issue18-canonical-gui-font-timeout.json)
+The latest full [acceptance attempt](docs/evidence/issue18-canonical-gui-font-timeout.json)
 records a one-hour timeout during real setup component registration. Canonical GUI
 contexts ran, and exact installer-child traces exposed missing PDO descriptions;
 native input-driver admission still lacks `IoStartNextPacket`. Destructive private
@@ -172,7 +172,10 @@ screenshot shows background and cursor, not a working desktop. Acceptance requir
 native private-font cleanup and a separate production Userinit/Explorer boot without
 acceptance startup hooks
 with real callbacks, GDI drawing, logs and screenshots. Crate CI does not prove
-desktop boot. To attempt a boot from a fresh clone:
+desktop boot. A subsequent [bounded diagnostic boot](docs/evidence/issue18-registry-checkpoint-probe.json)
+verified live SYSTEM-journal checkpoint timing and inclusive I/O measurements; it
+was stopped after reproducing the input-driver gap and still rendered only background
+and cursor. To attempt a boot from a fresh clone:
 
 ```sh
 git clone --recursive https://github.com/stakach/userspace-ntos.git
