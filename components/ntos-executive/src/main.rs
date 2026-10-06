@@ -42,6 +42,7 @@ mod hosted_routed_file_close_work;
 mod registry_key_targets;
 mod registry_security_audit;
 mod diagnostic_receipt_budget;
+mod registry_checkpoint_audit;
 mod registry_query_audit;
 mod provider_registry_caller;
 mod provider_directory_broker;

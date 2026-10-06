@@ -218,11 +218,14 @@ version = "0.1.0"
 name = "nt-compat-exports"
 version = "0.1.0"
 dependencies = [
+ "nt-ahci",
  "nt-exe-image",
+ "nt-fs",
  "nt-kernel-abi",
  "nt-kernel-exec",
  "nt-memory-manager",
  "nt-pe-loader",
+ "nt-printf",
  "nt-process",
  "nt-user-host",
  "syn",
