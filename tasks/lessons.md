@@ -610,3 +610,13 @@ diagnosis-free failure.
   Inspect refusal receipts and diagnostic suppression before declaring a memory frontier passed.
 - Identify the owning operation before interpreting an allocation size. Remove proven unused
   reservations before increasing capacity; total free bytes do not certify a contiguous span.
+
+## Provider Teardown Owns Private Storage
+- A provider may legitimately clear and free its private context before a later CLOSE. Follow
+  canonical File projection identity and actual contexts, not a cached numeric provider file ID.
+- Pool bounds, structure tags and zeroed fields do not authorize repair. Never rewrite provider
+  queues to avoid a historical spin; preserve the real driver result and retained ownership.
+
+## Check Generated Patch Escaping
+- When constructing a patch through JavaScript, inspect the resulting Rust byte strings. A log
+  newline must be `b"\n"`, not a double-escaped literal backslash followed by `n`.

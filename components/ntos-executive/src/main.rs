@@ -29971,6 +29971,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             //   4. the client writes, which COMPLETES the server's still-pending read
                             //      (npfs' `NpWriteDataQueue` → `IofCompleteRequest`) and the delivered
                             //      payload must be byte-exact in the completion stash.
+                            let srv_projection = driver_launch::capture_file_projection_identity(srv_fid);
+                            let cli_projection = driver_launch::capture_file_projection_identity(cli_fid);
+                            let projection_is_current = || {
+                                srv_projection.is_some_and(driver_launch::file_projection_identity_is_current)
+                                    && cli_projection.is_some_and(driver_launch::file_projection_identity_is_current)
+                            };
+                            let projection_before = projection_is_current()
+                                && matches!((srv_projection, cli_projection), (Some(server), Some(client))
+                                    if server.file_id() != client.file_id()
+                                        && server.address() != client.address());
                             let mut pend_out = [0u8; 64];
                             let srv_pending = driver_launch::npfs_dispatch_irp_exact(
                                 3, /* READ */
@@ -29984,6 +29994,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 srv_pending,
                                 Some((st, _, irp_id)) if st as u32 == 0x0000_0103 && irp_id != 0
                             );
+                            let projection_pending = projection_is_current();
                             let mut response = [0u8; 48];
                             for (i, slot) in response.iter_mut().enumerate() {
                                 *slot = 0x40u8.wrapping_add(i as u8);
@@ -29993,12 +30004,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 4, /* WRITE */
                                 0, srv_fid, &response, &mut cnone,
                             );
+                            let projection_write = projection_is_current();
                             let mut resp_in = [0u8; 64];
                             let concur_read =
                                 npfs_dispatch_irp(3 /* READ */, 0, cli_fid, &[], &mut resp_in);
                             let response_ok = matches!(concur_write, Some((0, 48)))
                                 && matches!(concur_read, Some((0, 48)))
                                 && resp_in[..48] == response[..48];
+                            let projection_read = projection_is_current();
                             // Now wake the server's STILL-pending read from the other end.
                             let wake = *b"WAKE-PENDING-READ";
                             let cli_wake = npfs_dispatch_irp(
@@ -30013,6 +30026,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                     driver_launch::acknowledge_completed_irp(irp_id).is_ok()
                                 })
                                 .unwrap_or(false);
+                            let projection_acked = projection_is_current();
                             let pending_delivered = match &stash {
                                 Some((st, info, bytes)) => {
                                     *st == 0
@@ -30032,11 +30046,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             print_u64(pending_delivered as u64);
                             print_str(b" fo_reused=");
                             print_u64(driver_launch::FSD_FO_REUSED.load(Ordering::Relaxed));
-                            print_str(b" queue_repairs=");
-                            print_u64(driver_launch::FSD_QUEUE_REPAIRS.load(Ordering::Relaxed));
                             print_str(b"\n");
                             // A pending read AND a write on ONE FILE_OBJECT both complete with the
-                            // right bytes, npfs' queues stayed consistent (zero repairs), and the
+                            // right bytes, their completion was acknowledged, and the
                             // write actually reused the open's FILE_OBJECT rather than a fresh one.
                             check(
                                 b"exec_npfs_concurrent_irp_read_and_write",
@@ -30044,44 +30056,34 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                     && response_ok
                                     && pending_delivered
                                     && stash_acked
-                                    && driver_launch::FSD_FO_REUSED.load(Ordering::Relaxed) >= 4
-                                    && driver_launch::FSD_QUEUE_REPAIRS.load(Ordering::Relaxed)
-                                        == 0,
+                                    && driver_launch::FSD_FO_REUSED.load(Ordering::Relaxed) >= 4,
                                 &mut passed,
                             );
 
-                            // ★ C-f: the FILE_OBJECT LIFETIME proof. npfs stores our FILE_OBJECT in
-                            // `Ccb->FileObject[NamedPipeEnd]` (create.c:645/772, statesup.c:51) and
-                            // WRITES THROUGH it on disconnect. `audit_ccb` therefore re-validates
-                            // every FSD-held FILE_OBJECT pointer before each IRP: it must still be
-                            // one of our live per-open objects AND still CONTAIN a FILE_OBJECT
-                            // (`Type == IO_TYPE_FILE`, `Size == 0x100`). With the old per-IRP
-                            // lifetime the pool had already recycled those blocks into npfs' own
-                            // `NP_DATA_QUEUE_ENTRY`/`NP_CCB` allocations, so both checks fail.
-                            let fo_checks =
-                                driver_launch::FSD_FO_LIVE_CHECKS.load(Ordering::Relaxed);
-                            let fo_dangling =
-                                driver_launch::FSD_FO_DANGLING.load(Ordering::Relaxed);
-                            let fo_corrupt =
-                                driver_launch::FSD_FO_CORRUPTED.load(Ordering::Relaxed);
-                            let fo_opens = driver_launch::FSD_FO_OPENS.load(Ordering::Relaxed);
-                            print_str(b"[npfs-svc] C-f FO-LIFETIME opens=");
-                            print_u64(fo_opens);
-                            print_str(b" held-checks=");
-                            print_u64(fo_checks);
-                            print_str(b" dangling=");
-                            print_u64(fo_dangling);
-                            print_str(b" corrupted=");
-                            print_u64(fo_corrupt);
-                            print_str(b" audits=");
-                            print_u64(driver_launch::FSD_QUEUE_AUDITS.load(Ordering::Relaxed));
+                            // C-f observes canonical binding generations, not NPFS-private pointers.
+                            // No publication lease is added to make the tested lifetime survive.
+                            print_str(b"[npfs-svc] C-f FO-LIFETIME canonical-before=");
+                            print_u64(projection_before as u64);
+                            print_str(b" pending=");
+                            print_u64(projection_pending as u64);
+                            print_str(b" write=");
+                            print_u64(projection_write as u64);
+                            print_str(b" read=");
+                            print_u64(projection_read as u64);
+                            print_str(b" acknowledged=");
+                            print_u64(projection_acked as u64);
                             print_str(b"\n");
                             check(
                                 b"exec_npfs_file_object_lifetime",
-                                fo_opens >= 2
-                                    && fo_checks >= 4
-                                    && fo_dangling == 0
-                                    && fo_corrupt == 0,
+                                projection_before
+                                    && projection_pending
+                                    && projection_write
+                                    && projection_read
+                                    && projection_acked
+                                    && srv_read_pended
+                                    && response_ok
+                                    && pending_delivered
+                                    && stash_acked,
                                 &mut passed,
                             );
 
@@ -30144,8 +30146,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             print_u64(hdr_ok as u64);
                             print_str(b" rest_ok=");
                             print_u64(rest_ok as u64);
-                            print_str(b" repairs=");
-                            print_u64(driver_launch::FSD_QUEUE_REPAIRS.load(Ordering::Relaxed));
                             print_str(b"\n");
                             check(
                                 b"exec_npfs_write_split_across_pending_read",
@@ -30153,9 +30153,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                     && body_write.is_some()
                                     && hdr_ok
                                     && hdr_stash_acked
-                                    && rest_ok
-                                    && driver_launch::FSD_QUEUE_REPAIRS.load(Ordering::Relaxed)
-                                        == 0,
+                                    && rest_ok,
                                 &mut passed,
                             );
 
