@@ -1122,6 +1122,30 @@ struct PendingIrp {
     completion: nt_io_manager::RetainedIrpCompletion,
 }
 
+impl PendingIrp {
+    fn allocation_graph(&self) -> nt_io_manager::pending_irp_graph::PendingIrpAllocationGraph {
+        nt_io_manager::pending_irp_graph::PendingIrpAllocationGraph::new(
+            nt_io_manager::pending_irp_graph::PendingIrpGraphPointers {
+                reclaim: self
+                    .completion
+                    .completed()
+                    .map(|completion| completion.reclaim)
+                    .unwrap_or(0),
+                mdl: self.mdl,
+                aux_data: self.aux_data,
+                data: self.data,
+                create_parameters: self.create_parameters,
+                create_access_state: self.create_access_state,
+                create_security_context: self.create_security_context,
+                pnp_resource_list: self.pnp_resource_list,
+                irp: self.irp,
+                file_object: self.file_object,
+                owns_file: self.owns_fo,
+            },
+        )
+    }
+}
+
 static mut DATA_TRACE_COUNT: u32 = 0;
 /// Hosted-driver IRP dispatch sequence. This always increments; the print policy below is bounded.
 static FSD_DISPATCH_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1981,33 +2005,13 @@ unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
             );
         }
     }
-    let reclaim = entry
-        .completion
-        .completed()
-        .map(|completion| completion.reclaim)
-        .unwrap_or(0);
-    let candidates = [
-        reclaim,
-        entry.mdl,
-        if entry.aux_data != entry.data {
-            entry.aux_data
-        } else {
-            0
-        },
-        entry.data,
-        entry.create_parameters,
-        entry.create_access_state,
-        entry.create_security_context,
-        entry.pnp_resource_list,
-        entry.irp,
-        if entry.owns_fo { entry.file_object } else { 0 },
-    ];
-    for (index, pointer) in candidates.iter().copied().enumerate() {
-        if pointer != 0 && !candidates[..index].contains(&pointer) {
-            if entry.owns_fo && pointer == entry.file_object {
-                hosted_file_objects::free_file_storage(pointer);
-            } else {
-                pool_free(pointer);
+    for allocation in entry.allocation_graph().allocations() {
+        match allocation.release_kind {
+            nt_io_manager::pending_irp_graph::GraphReleaseKind::FileStorage => {
+                hosted_file_objects::free_file_storage(allocation.pointer);
+            }
+            nt_io_manager::pending_irp_graph::GraphReleaseKind::Pool => {
+                pool_free(allocation.pointer);
             }
         }
     }
