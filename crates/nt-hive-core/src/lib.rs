@@ -73,7 +73,8 @@ pub use hive::{
     CurrentControlSetError, DeleteKeyError, Hive, HiveId, HiveKind, HiveMountTable,
     HiveOverlayError, HiveTransaction, HiveValueBlobCompactError, HiveValueBlobCompaction,
     MutableHiveSet, RegistryValueCopyProvenance, RegistryValueCopyProvenanceTable,
-    RegistryValueType, ResolvedHiveKey, ResolvedHiveValue, SYSTEM_HIVE_PATH,
+    PreparedSetValue, RegistryValueType, ResolvedHiveKey, ResolvedHiveValue, SetValueError,
+    SYSTEM_HIVE_PATH,
 };
 mod hardware_profile;
 pub use hardware_profile::{HardwareProfileAlias, HardwareProfileError};

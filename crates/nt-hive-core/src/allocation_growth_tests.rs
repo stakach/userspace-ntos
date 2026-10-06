@@ -223,3 +223,167 @@ fn refused_cell_reservation_preserves_logical_hive_state() {
     assert_eq!(crate::encode_image(&hive), before);
     assert_eq!(hive.query_value(root, "Existing"), Some((RegistryValueType::Binary, &[0x5a][..])));
 }
+
+fn commit_without_allocations(prepared: crate::PreparedSetValue<'_>) -> crate::CellId {
+    MAX_REQUEST.store(0, Ordering::Relaxed);
+    REFUSALS.store(0, Ordering::Relaxed);
+    SPAN_LIMIT.store(1, Ordering::Relaxed);
+    let guard = SpanLimitGuard;
+    let id = prepared.commit();
+    drop(guard);
+    assert_eq!(MAX_REQUEST.load(Ordering::Relaxed), 0);
+    assert_eq!(REFUSALS.load(Ordering::Relaxed), 0);
+    id
+}
+
+#[test]
+fn prepared_new_and_replacement_commits_allocate_nothing() {
+    if !isolated_child("allocation_growth_tests::prepared_new_and_replacement_commits_allocate_nothing") {
+        return;
+    }
+    for replacement in [false, true] {
+        for deduplicated in [false, true] {
+            let mut hive = Hive::new(HiveKind::Software);
+            let root = hive.root();
+            assert!(hive.set_value(root, "Original", RegistryValueType::Binary, alloc::vec![7]));
+            assert!(hive.set_value(root, "Shared", RegistryValueType::Binary, alloc::vec![9]));
+            if !replacement {
+                let boundary = nt_page_storage::PageSequence::<Option<Cell>>::leaf_capacity();
+                while hive.cells.len() < boundary {
+                    let name = std::format!("V{}", hive.cells.len());
+                    assert!(hive.set_value(root, &name, RegistryValueType::Binary, alloc::vec![7]));
+                }
+            }
+            let original = hive.key(root).unwrap().values[0];
+            let shared = hive.key(root).unwrap().values[1];
+            let shared_blob = hive.value(shared).unwrap().data_blob;
+            let sequence = hive.sequence;
+            let cells = hive.cells.len();
+            let next_id = hive.next_id;
+            let blobs = hive.value_blobs.len();
+            let name = if replacement { "ORIGINAL" } else { "New" };
+            let byte = if deduplicated { 9 } else { 11 };
+            let prepared = hive
+                .try_prepare_set_value(root, name, RegistryValueType::Dword, alloc::vec![byte])
+                .unwrap();
+            let id = commit_without_allocations(prepared);
+
+            assert_eq!(id.0, if replacement { original.0 } else { next_id });
+            assert_eq!(hive.cells.len(), cells + usize::from(!replacement));
+            assert_eq!(hive.next_id, next_id + u64::from(!replacement));
+            assert_eq!(hive.sequence, sequence + 1);
+            assert_eq!(hive.value_blobs.len(), blobs + usize::from(!deduplicated));
+            assert_eq!(hive.value(id).unwrap().name, if replacement { "Original" } else { "New" });
+            assert_eq!(hive.query_value(root, name), Some((RegistryValueType::Dword, &[byte][..])));
+            assert_eq!(hive.query_value(root, "Shared"), Some((RegistryValueType::Binary, &[9][..])));
+            if deduplicated {
+                assert_eq!(hive.value(id).unwrap().data_blob, shared_blob);
+                assert_eq!(
+                    hive.query_value(root, name).unwrap().1.as_ptr(),
+                    hive.query_value(root, "Shared").unwrap().1.as_ptr(),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn abandoned_prepared_edits_preserve_encoded_and_logical_state() {
+    if !isolated_child("allocation_growth_tests::abandoned_prepared_edits_preserve_encoded_and_logical_state") {
+        return;
+    }
+    for replacement in [false, true] {
+        for deduplicated in [false, true] {
+            let mut hive = Hive::new(HiveKind::Software);
+            let root = hive.root();
+            assert!(hive.set_value(root, "Original", RegistryValueType::Binary, alloc::vec![7]));
+            let before = crate::encode_image(&hive);
+            let cells = hive.cells.len();
+            let next_id = hive.next_id;
+            let blobs = hive.value_blobs.len();
+            let sequence = hive.sequence;
+            let dirty = hive.dirty_count();
+            let name = if replacement { "ORIGINAL" } else { "New" };
+            let data = alloc::vec![if deduplicated { 7 } else { 11 }];
+            drop(hive.try_prepare_set_value(root, name, RegistryValueType::Dword, data).unwrap());
+            assert_eq!(hive.cells.len(), cells);
+            assert_eq!(hive.next_id, next_id);
+            assert_eq!(hive.value_blobs.len(), blobs);
+            assert_eq!(hive.sequence, sequence);
+            assert_eq!(hive.dirty_count(), dirty);
+            assert_eq!(crate::encode_image(&hive), before);
+        }
+    }
+}
+
+#[test]
+fn refused_prepared_growth_preserves_cells_ids_sequence_and_payloads() {
+    if !isolated_child("allocation_growth_tests::refused_prepared_growth_preserves_cells_ids_sequence_and_payloads") {
+        return;
+    }
+    // Refuse a name, a new cell page, a full value-link vector, and a full blob directory.
+    for stage in 0..4 {
+        let mut hive = Hive::new(HiveKind::Software);
+        let root = hive.root();
+        assert!(hive.set_value(root, "Original", RegistryValueType::Binary, alloc::vec![7]));
+        match stage {
+            1 => {
+                let leaf_capacity = nt_page_storage::PageSequence::<Option<Cell>>::leaf_capacity();
+                while hive.cells.len() < leaf_capacity {
+                    let name = std::format!("V{}", hive.cells.len());
+                    assert!(hive.set_value(root, &name, RegistryValueType::Binary, alloc::vec![7]));
+                }
+            }
+            2 => {
+                while hive.key(root).unwrap().values.len() < hive.key(root).unwrap().values.capacity() {
+                    let name = std::format!("V{}", hive.key(root).unwrap().values.len());
+                    assert!(hive.set_value(root, &name, RegistryValueType::Binary, alloc::vec![7]));
+                }
+                assert!(hive.reserve_cells(1));
+            }
+            3 => {
+                while hive.value_blobs.len() < hive.value_blobs.capacity() {
+                    let index = hive.value_blobs.len();
+                    let name = std::format!("B{index}");
+                    assert!(hive.set_value(
+                        root, &name, RegistryValueType::Binary, alloc::vec![20 + index as u8],
+                    ));
+                }
+            }
+            _ => {}
+        }
+        let before = crate::encode_image(&hive);
+        let cells = hive.cells.len();
+        let next_id = hive.next_id;
+        let blobs = hive.value_blobs.len();
+        let sequence = hive.sequence;
+        let dirty = hive.dirty_count();
+        let ids = hive.key(root).unwrap().values.clone();
+        let name = match stage {
+            0 => "Refused",
+            3 => "ORIGINAL",
+            _ => "",
+        };
+        let data = alloc::vec![if stage == 3 { 99 } else { 7 }];
+        MAX_REQUEST.store(0, Ordering::Relaxed);
+        REFUSALS.store(0, Ordering::Relaxed);
+        SPAN_LIMIT.store(1, Ordering::Relaxed);
+        let guard = SpanLimitGuard;
+        let result = hive.try_prepare_set_value(root, name, RegistryValueType::Dword, data);
+        drop(guard);
+        let refused = matches!(&result, Err(crate::SetValueError::InsufficientResources));
+        drop(result);
+
+        assert!(refused, "preparation stage {stage} must return resource failure");
+        assert_eq!(REFUSALS.load(Ordering::Relaxed), 1);
+        assert!(MAX_REQUEST.load(Ordering::Relaxed) > 1);
+        assert_eq!(hive.cells.len(), cells);
+        assert_eq!(hive.next_id, next_id);
+        assert_eq!(hive.value_blobs.len(), blobs);
+        assert_eq!(hive.sequence, sequence);
+        assert_eq!(hive.dirty_count(), dirty);
+        assert_eq!(hive.key(root).unwrap().values, ids);
+        assert_eq!(crate::encode_image(&hive), before);
+        assert_eq!(hive.query_value(root, "Original"), Some((RegistryValueType::Binary, &[7][..])));
+    }
+}

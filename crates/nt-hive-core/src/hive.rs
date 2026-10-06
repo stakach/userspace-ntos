@@ -10,6 +10,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use nt_page_storage::PageSequence;
 
+#[path = "hive_set_value.rs"]
+mod set_value;
+pub use set_value::{PreparedSetValue, SetValueError};
+
 #[path = "hive_create_child.rs"]
 mod create_child;
 pub use create_child::CreateChildError;
