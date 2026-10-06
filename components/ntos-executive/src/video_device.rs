@@ -11,7 +11,7 @@ use core::ptr::{addr_of, addr_of_mut, read_unaligned, write_unaligned};
 
 use nt_io_manager::{
     write_wdm_device_object, write_wdm_driver_object, WdmDeviceObjectInit, WdmDriverObjectInit,
-    WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_OBJECT_SIZE,
+    WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_OBJECT_SIZE,
 };
 use nt_status::NtStatus;
 use crate::win32k_subsystem::RootProviderPoolAllocation;
@@ -470,7 +470,9 @@ unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> Option<Roo
         (*addr_of_mut!(VIDEO_STATE)).objects.driver = allocation.address();
     }
     if video_state_snapshot().objects.device == 0 {
-        let Some(allocation) = allocate_projection(WDM_X64_DEVICE_OBJECT_SIZE as u64) else { return false; };
+        let layout = nt_io_manager::WdmDeviceObjectAllocationLayout::plan(0)
+            .expect("zero driver extension has a representable layout");
+        let Some(allocation) = allocate_projection(layout.allocation_size() as u64) else { return false; };
         (*addr_of_mut!(VIDEO_STATE)).objects.device_allocation = Some(allocation);
         (*addr_of_mut!(VIDEO_STATE)).objects.device = allocation.address();
     }
@@ -480,6 +482,8 @@ unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> Option<Roo
     if driver == 0 || device == 0 {
         return false;
     }
+    let device_layout = nt_io_manager::WdmDeviceObjectAllocationLayout::plan(0)
+        .expect("zero driver extension has a representable layout");
 
     // win32k needs projected, dereferenceable WDM bodies for the I/O Manager route identities.
     if write_wdm_driver_object(
@@ -496,9 +500,9 @@ unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> Option<Roo
         return false;
     }
     let initialized = write_wdm_device_object(
-        core::slice::from_raw_parts_mut(device as *mut u8, WDM_X64_DEVICE_OBJECT_SIZE),
+        core::slice::from_raw_parts_mut(device as *mut u8, device_layout.allocation_size()),
         WdmDeviceObjectInit {
-            size_field: WDM_X64_DEVICE_OBJECT_SIZE as u16,
+            device_object_address: device,
             driver_object: driver,
             device_type: nt_video_miniport::FILE_DEVICE_VIDEO,
             stack_size: 1,
@@ -686,7 +690,10 @@ pub(crate) unsafe fn video_get_device_object_pointer(
 }
 
 /// Resolve the current attachment top through the File's exact consumer projection.
-pub(crate) unsafe fn video_related_device_object(file_object: u64) -> Result<u64, NtStatus> {
+pub(crate) unsafe fn video_related_device_object(
+    domain: nt_io_manager::HostedDomainIdentity,
+    file_object: u64,
+) -> Result<u64, NtStatus> {
     if !projected_video_route_ready() {
         return Err(NtStatus::DEVICE_NOT_READY);
     }
@@ -694,7 +701,7 @@ pub(crate) unsafe fn video_related_device_object(file_object: u64) -> Result<u64
     if file_object == 0 || file_object != state.route.file_projection {
         return Err(NtStatus::INVALID_HANDLE);
     }
-    video_projection_owners::related_device_address(state.route.owner_id, file_object)
+    video_projection_owners::related_device_address(domain, state.route.owner_id, file_object)
 }
 
 pub(crate) unsafe fn video_file_projection_contains(object: u64) -> bool {
@@ -724,21 +731,27 @@ pub(crate) unsafe fn retain_video_file_projection(
         .map_err(|status| status.raw())
 }
 
-pub(crate) unsafe fn reference_video_file_pointer(object: u64) -> Result<u64, i32> {
+pub(crate) unsafe fn reference_video_file_pointer(
+    domain: nt_io_manager::HostedDomainIdentity,
+    object: u64,
+) -> Result<u64, i32> {
     let _operation = PublicationGuard::enter().ok_or(NtStatus::DEVICE_BUSY.raw())?;
     if !projected_video_route_ready() || !video_file_projection_contains(object) {
         return Err(STATUS_OBJECT_NAME_NOT_FOUND);
     }
     let owner = video_state_snapshot().route.owner_id;
-    video_projection_owners::reference_by_pointer(owner, object).map_err(|status| status.raw())
+    video_projection_owners::reference_by_pointer(domain, owner, object).map_err(|status| status.raw())
 }
 
-pub(crate) unsafe fn release_video_file_projection(object: u64) -> Result<u64, i32> {
+pub(crate) unsafe fn release_video_file_projection(
+    domain: nt_io_manager::HostedDomainIdentity,
+    object: u64,
+) -> Result<u64, i32> {
     let _operation = PublicationGuard::enter().ok_or(NtStatus::DEVICE_BUSY.raw())?;
     if !video_file_projection_contains(object) {
         return Err(STATUS_OBJECT_NAME_NOT_FOUND);
     }
-    video_projection_owners::dereference(video_state_snapshot().route.owner_id, object)
+    video_projection_owners::dereference(domain, video_state_snapshot().route.owner_id, object)
         .map_err(|status| status.raw())
 }
 

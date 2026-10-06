@@ -9,7 +9,7 @@ use nt_io_manager::{
         select_write_buffer_source, CapturedWrite, PreparedWriteForward, TerminalWriteForward,
         WriteBufferSource, WriteCompletion, WriteForwardIdentity,
     },
-    source_irp_ledger::SourceIrpAllocation,
+    source_irp_ledger::{SourceIrpAllocation, SourceIrpForwardIdentity},
     DeviceFlags, HostedDomainIdentity, StackFlags,
 };
 use nt_kernel_abi::{IoStackLocation, Irp};
@@ -41,6 +41,11 @@ pub(super) struct CapturedSourceWrite {
 
 impl CapturedSourceWrite {
     pub(super) fn source_ticket(&self) -> SourceIrpTicket { self.source }
+    pub(super) fn source_identity(&self) -> SourceIrpForwardIdentity {
+        SourceIrpForwardIdentity::new(self.source, self.allocation)
+            .expect("captured WRITE source identity")
+    }
+    pub(super) fn source_pin_owned(&self) -> bool { self.pinned }
     pub(super) fn source_irp_address(&self) -> u64 { self.allocation.component_address }
     pub(super) fn file_id(&self) -> nt_io_manager::FileId {
         self.source_file.as_ref().expect("source File released").file_id()

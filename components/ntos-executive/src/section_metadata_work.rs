@@ -1,4 +1,4 @@
-//! Retained native NtCreateSection metadata I/O for routed Files.
+//! Retained native Section publication and routed File metadata I/O.
 
 use crate::*;
 use alloc::vec::Vec;
@@ -17,7 +17,6 @@ const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xc000_009a;
 const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xc000_007b;
 const RETRY_DELAY: u64 = 1_000_000;
 const IMAGE_HEADER_READ_SIZE: usize = 0x1000;
-const IMAGE_HEADER_LIMIT: usize = 0x10000;
 
 pub(crate) struct ImageObjectName {
     pub(crate) root_index: usize,
@@ -40,9 +39,18 @@ enum Phase {
         irp: IrpId,
     },
     HeaderDispatch,
-    HeaderPending { irp: IrpId, length: usize },
-    HeaderCopying { irp: IrpId, length: usize, offset: usize },
-    HeaderAckPending { irp: IrpId },
+    HeaderPending {
+        irp: IrpId,
+        length: usize,
+    },
+    HeaderCopying {
+        irp: IrpId,
+        length: usize,
+        offset: usize,
+    },
+    HeaderAckPending {
+        irp: IrpId,
+    },
     Publish,
     CopyOut,
     ReadyReply,
@@ -103,12 +111,15 @@ struct Work {
     allocation_attrs: u32,
     file_handle: u64,
     image_name: Option<ImageObjectName>,
+    data_admission: Option<crate::exec_handler::named_data_sections::DataSectionAdmission>,
     capture: Option<driver_launch::hosted_file_capture::Capture>,
-    origin_driver: u64,
+    origin_driver: Option<u64>,
     metadata: PendingSectionMetadataQueries<(), u64>,
-    metadata_id: PendingSectionMetadataId,
+    metadata_id: Option<PendingSectionMetadataId>,
     file_metadata: Option<nt_memory_manager::RoutedSectionMetadata>,
     image_header: Vec<u8>,
+    image_path: Option<Vec<u8>>,
+    observation_target: Option<nt_exe_image::CapturedImageObservation>,
     reserved: Option<ReservedSection>,
     published_handle: Option<u64>,
     phase: Phase,
@@ -127,6 +138,23 @@ static EXECUTING_ADMISSION_RELEASED: AtomicBool = AtomicBool::new(false);
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+struct Submission {
+    output: u64,
+    desired_access: u32,
+    attributes: u32,
+    maxsize: u64,
+    page_protection: u32,
+    allocation_attrs: u32,
+    file_handle: u64,
+    image_name: Option<ImageObjectName>,
+    capture: Option<driver_launch::hosted_file_capture::Capture>,
+    origin_driver: Option<u64>,
+    mount: Option<nt_memory_manager::SectionMountId>,
+    image_path: Option<Vec<u8>>,
+    observation_target: Option<nt_exe_image::CapturedImageObservation>,
+    phase: Phase,
+}
+
 pub(crate) unsafe fn submit_hosted(
     handler: &mut ExecNtHandler,
     caller: NativeHandleCaller,
@@ -140,29 +168,177 @@ pub(crate) unsafe fn submit_hosted(
     file_handle: u64,
     image_name: Option<ImageObjectName>,
 ) -> Result<(), u32> {
+    submit_hosted_inner(
+        handler,
+        caller,
+        source,
+        output,
+        desired_access,
+        attributes,
+        maxsize,
+        page_protection,
+        allocation_attrs,
+        file_handle,
+        image_name,
+        None,
+    )
+}
+
+pub(crate) unsafe fn submit_hosted_data(
+    handler: &mut ExecNtHandler,
+    caller: NativeHandleCaller,
+    source: nt_process::NativeSectionFileSource,
+    output: u64,
+    desired_access: u32,
+    attributes: u32,
+    maxsize: u64,
+    page_protection: u32,
+    allocation_attrs: u32,
+    file_handle: u64,
+    admission: &mut Option<crate::exec_handler::named_data_sections::DataSectionAdmission>,
+) -> Result<(), u32> {
+    submit_hosted_inner(
+        handler,
+        caller,
+        source,
+        output,
+        desired_access,
+        attributes,
+        maxsize,
+        page_protection,
+        allocation_attrs,
+        file_handle,
+        None,
+        Some(admission),
+    )
+}
+
+unsafe fn submit_hosted_inner(
+    handler: &mut ExecNtHandler,
+    caller: NativeHandleCaller,
+    source: nt_process::NativeSectionFileSource,
+    output: u64,
+    desired_access: u32,
+    attributes: u32,
+    maxsize: u64,
+    page_protection: u32,
+    allocation_attrs: u32,
+    file_handle: u64,
+    image_name: Option<ImageObjectName>,
+    data_admission: Option<
+        &mut Option<crate::exec_handler::named_data_sections::DataSectionAdmission>,
+    >,
+) -> Result<(), u32> {
     let _durable = allocator::enter_durable();
-    let nt_process::HandleObject::RoutedFile { file_id, device_id } = source.object() else {
+    let nt_process::HandleObject::RoutedFile { device_id, .. } = source.object() else {
         return Err(nt_fs::STATUS_INVALID_HANDLE);
     };
-    if allocation_attrs & 0x0100_0000 != 0 {
-        if !matches!(page_protection, 0x02 | 0x10 | 0x20)
-            || source.granted_access() & 0x20 == 0
-        {
-            return Err(nt_fs::STATUS_ACCESS_DENIED);
-        }
-    } else {
-        nt_memory_manager::data_section::check_data_section_file_access(
-            page_protection,
-            source.granted_access(),
-        )?;
+    if allocation_attrs & 0x0100_0000 != 0 && !matches!(page_protection, 0x02 | 0x10 | 0x20) {
+        return Err(nt_fs::STATUS_ACCESS_DENIED);
     }
+    nt_memory_manager::data_section::check_data_section_file_access(
+        page_protection,
+        source.granted_access(),
+    )?;
     let mount = mounted_volume::mount_id_for_live_device(device_id).ok_or(0xc000_0020u32)?;
     let capture = driver_launch::hosted_file_capture::capture_native_section_source(source)?;
+    let observation_target = handler.capture_native_image_observation(file_handle);
+    let image_path = if allocation_attrs & 0x0100_0000 != 0 {
+        Some(capture.owned_image_path()?)
+    } else {
+        None
+    };
     let origin_driver = driver_launch::io_manager_mut()
         .device(DeviceId(device_id))
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
         .driver_id
         .raw();
+    retain_work(
+        handler,
+        caller,
+        Submission {
+            output,
+            desired_access,
+            attributes,
+            maxsize,
+            page_protection,
+            allocation_attrs,
+            file_handle,
+            image_name,
+            capture: Some(capture),
+            origin_driver: Some(origin_driver),
+            mount: Some(mount),
+            image_path,
+            observation_target,
+            phase: Phase::Query,
+        },
+        data_admission,
+        None,
+    )
+}
+
+pub(crate) unsafe fn submit_local_data(
+    handler: &mut ExecNtHandler,
+    caller: NativeHandleCaller,
+    output: u64,
+    file_handle: u64,
+    reserved: &mut Option<crate::exec_handler::section_create::ReservedGenericDataSection>,
+    admission: &mut Option<crate::exec_handler::named_data_sections::DataSectionAdmission>,
+) -> Result<(), u32> {
+    let _durable = allocator::enter_durable();
+    let admitted = admission.as_ref().ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+    let identity = reserved
+        .as_ref()
+        .map(|section| section.identity())
+        .or_else(|| admitted.existing().map(|reference| reference.identity()))
+        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+    let table = &*handler.loop_ctx.ok_or(0xc000_00a3u32)?.generic_sections;
+    if table.section_identity(identity.index()) != Some(identity) {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    }
+    let section = table
+        .section(identity.index())
+        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+    retain_work(
+        handler,
+        caller,
+        Submission {
+            output,
+            file_handle,
+            desired_access: admitted.granted_access,
+            attributes: admitted.handle_attributes,
+            maxsize: section.size,
+            page_protection: section.protection,
+            allocation_attrs: section.allocation_attributes,
+            image_name: None,
+            capture: None,
+            origin_driver: None,
+            mount: None,
+            image_path: None,
+            observation_target: None,
+            phase: Phase::Publish,
+        },
+        Some(admission),
+        Some(reserved),
+    )
+}
+
+unsafe fn retain_work(
+    handler: &mut ExecNtHandler,
+    caller: NativeHandleCaller,
+    submission: Submission,
+    data_admission: Option<
+        &mut Option<crate::exec_handler::named_data_sections::DataSectionAdmission>,
+    >,
+    reserved: Option<&mut Option<crate::exec_handler::section_create::ReservedGenericDataSection>>,
+) -> Result<(), u32> {
+    let _durable = allocator::enter_durable();
+    if data_admission.as_ref().is_some_and(|slot| {
+        slot.as_ref()
+            .is_none_or(|admission| admission.caller() != caller)
+    }) {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    }
     let tid = handler.current_tid;
     if has_thread(tid) {
         return Err(nt_fs::STATUS_INVALID_HANDLE);
@@ -178,9 +354,10 @@ pub(crate) unsafe fn submit_hosted(
         .capture_native_handle_caller(logical.thread(), nt_types::AccessMode::KernelMode)?;
     let mut reference = handler.pm.reference_native_requestor(requestor)?;
     let mut metadata = PendingSectionMetadataQueries::<(), u64>::new();
-    let metadata_id = match metadata.reserve(mount, ()) {
-        Ok(id) => id,
-        Err(()) => {
+    let metadata_id = match submission.mount.map(|mount| metadata.reserve(mount, ())) {
+        Some(Ok(id)) => Some(id),
+        None => None,
+        Some(Err(())) => {
             reference
                 .release(&mut handler.pm)
                 .expect("unsubmitted Section requestor");
@@ -218,23 +395,28 @@ pub(crate) unsafe fn submit_hosted(
         flags: handler.current_flags,
         native_call_transport: handler.current_native_call_transport,
         service_number: handler.current_service_number,
-        output,
-        desired_access,
-        attributes,
-        maxsize,
-        page_protection,
-        allocation_attrs,
-        file_handle,
-        image_name,
-        capture: Some(capture),
-        origin_driver,
+        output: submission.output,
+        desired_access: submission.desired_access,
+        attributes: submission.attributes,
+        maxsize: submission.maxsize,
+        page_protection: submission.page_protection,
+        allocation_attrs: submission.allocation_attrs,
+        file_handle: submission.file_handle,
+        image_name: submission.image_name,
+        data_admission: data_admission.and_then(|slot| slot.take()),
+        capture: submission.capture,
+        origin_driver: submission.origin_driver,
         metadata,
         metadata_id,
         file_metadata: None,
         image_header: Vec::new(),
-        reserved: None,
+        image_path: submission.image_path,
+        observation_target: submission.observation_target,
+        reserved: reserved
+            .and_then(|slot| slot.take())
+            .map(ReservedSection::Data),
         published_handle: None,
-        phase: Phase::Query,
+        phase: submission.phase,
         status: 0,
         cancelled: false,
         cancel_requested: false,
@@ -257,13 +439,10 @@ pub(crate) fn has_thread(tid: u64) -> bool {
     (EXECUTING_TID.load(Ordering::Acquire) == tid
         && !EXECUTING_ADMISSION_RELEASED.load(Ordering::Acquire))
         || unsafe {
-            (&*core::ptr::addr_of!(WORK))
-                .iter()
-                .flatten()
-                .any(|work| {
-                    work.tid == tid
-                        && !matches!(&work.phase, Phase::ReplySent | Phase::ReconcileRuntime)
-                })
+            (&*core::ptr::addr_of!(WORK)).iter().flatten().any(|work| {
+                work.tid == tid
+                    && !matches!(&work.phase, Phase::ReplySent | Phase::ReconcileRuntime)
+            })
         }
 }
 
@@ -376,6 +555,140 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler, queue: &mut nt_delay_e
     ACTIVE.store(false, Ordering::Release);
 }
 
+unsafe fn publish_data_section_work(handler: &mut ExecNtHandler, work: &mut Work) -> Step {
+    if work.cancelled
+        || work.reference.validate(&handler.pm).is_err()
+        || !handler.validate_provider_logical_caller(work.logical)
+    {
+        if let Some(mut reserved) = work.reserved.take() {
+            reserved.abort(handler);
+        }
+        work.capture.take();
+        work.cancelled = true;
+        work.phase = Phase::RevokeReply;
+        return Step::Progress;
+    }
+    let admission = work
+        .data_admission
+        .as_mut()
+        .expect("DATA publication admission");
+    if let Err(status) = handler.reconcile_data_section_name(admission) {
+        if let Some(mut reserved) = work.reserved.take() {
+            reserved.abort(handler);
+        }
+        work.capture.take();
+        work.status = status;
+        work.phase = Phase::ReadyReply;
+        return Step::Progress;
+    }
+    let created = admission.existing().is_none();
+    let result = if !created {
+        if let Some(mut candidate) = work.reserved.take() {
+            candidate.abort(handler);
+        }
+        work.capture.take();
+        match handler
+            .pm
+            .reserve_native_section_handle(work.caller, admission.handle_attributes)
+        {
+            Ok(mut publication) => {
+                let result = handler.publish_existing_data_section(admission, &mut publication);
+                if result.is_err() {
+                    publication
+                        .abort(&mut handler.pm)
+                        .expect("failed existing DATA handle reservation");
+                }
+                result
+            }
+            Err(status) => Err(status),
+        }
+    } else {
+        if work.reserved.is_none() {
+            let capture = work.capture.take().expect("routed DATA File capture");
+            let metadata = work.file_metadata.take().expect("routed DATA metadata");
+            match handler.reserve_generic_data_section(
+                work.caller,
+                work.pi,
+                admission.granted_access,
+                admission.handle_attributes,
+                work.maxsize,
+                work.page_protection,
+                work.allocation_attrs,
+                work.file_handle,
+                Some(
+                    crate::exec_handler::section_create::RoutedSectionAdmission {
+                        capture,
+                        metadata,
+                    },
+                ),
+            ) {
+                Ok(reserved) => work.reserved = Some(ReservedSection::Data(reserved)),
+                Err(status) => {
+                    work.status = status;
+                    work.phase = Phase::ReadyReply;
+                    return Step::Progress;
+                }
+            }
+        }
+        let Some(ReservedSection::Data(section)) = work.reserved.as_ref() else {
+            unreachable!("DATA reservation kind");
+        };
+        match handler.attach_data_section_name(admission, section.identity()) {
+            Ok(()) => work.reserved.as_mut().unwrap().publish(handler),
+            Err(status) => Err(status),
+        }
+    };
+    match result {
+        Ok(handle) => {
+            work.reserved.take();
+            work.published_handle = Some(handle);
+            work.status = admission.status;
+            if created {
+                loader_trace_record(
+                    work.pi,
+                    LoaderOp::CreateSection,
+                    work.status,
+                    None,
+                    work.file_handle,
+                    handle,
+                    b"",
+                );
+            }
+            work.phase = Phase::CopyOut;
+        }
+        Err(status) => {
+            if let Some(mut reserved) = work.reserved.take() {
+                reserved.abort(handler);
+            }
+            work.status = status;
+            work.phase = Phase::ReadyReply;
+        }
+    }
+    Step::Progress
+}
+
+unsafe fn copy_data_section_output(handler: &mut ExecNtHandler, work: &mut Work) -> Step {
+    if work.cancelled {
+        work.phase = Phase::RevokeReply;
+        return Step::Progress;
+    }
+    let handle = work
+        .published_handle
+        .expect("DATA handle committed before output");
+    match handler.process_memory_write_checked(work.pi, work.output, &handle.to_le_bytes()) {
+        Ok(()) | Err(nt_address_space::copy::MemoryCopyFailure::UserFault(_)) => {
+            // Section SEH keeps the committed handle and prior successful/informational status.
+            work.phase = Phase::ReadyReply;
+            Step::Progress
+        }
+        Err(nt_address_space::copy::MemoryCopyFailure::Retry(_)) => {
+            // A typed Retry does not prove that no bytes were stored. Retain, never replay.
+            work.phase = Phase::Indeterminate;
+            Step::Wait
+        }
+    }
+}
+
 unsafe fn advance(
     handler: &mut ExecNtHandler,
     queue: &mut nt_delay_execution::Queue,
@@ -399,10 +712,13 @@ unsafe fn advance(
                 work.phase = Phase::RevokeReply;
                 return Step::Progress;
             }
-            let Some(class) = work.metadata.next_query(work.metadata_id) else {
+            let Some(class) = work
+                .metadata
+                .next_query(work.metadata_id.expect("routed metadata owner"))
+            else {
                 let (_, result) = work
                     .metadata
-                    .take_terminal(work.metadata_id)
+                    .take_terminal(work.metadata_id.expect("routed metadata owner"))
                     .expect("Section metadata did not reach a terminal phase");
                 match result {
                     Ok(metadata) => {
@@ -453,7 +769,7 @@ unsafe fn advance(
                     ..
                 }) => {
                     assert!(work.metadata.complete_inline(
-                        work.metadata_id,
+                        work.metadata_id.expect("routed metadata owner"),
                         CompletedFileQuery {
                             status: status.raw() as u32,
                             information,
@@ -462,7 +778,10 @@ unsafe fn advance(
                     ));
                 }
                 Ok(ExternalDispatchResult::Pending { irp_id }) => {
-                    assert!(work.metadata.bind_pending(work.metadata_id, irp_id.raw()));
+                    assert!(work.metadata.bind_pending(
+                        work.metadata_id.expect("routed metadata owner"),
+                        irp_id.raw()
+                    ));
                     work.phase = Phase::Pending {
                         irp: irp_id,
                         length,
@@ -470,7 +789,7 @@ unsafe fn advance(
                 }
                 Err(status) => {
                     assert!(work.metadata.complete_inline(
-                        work.metadata_id,
+                        work.metadata_id.expect("routed metadata owner"),
                         CompletedFileQuery {
                             status: status.raw() as u32,
                             information: 0,
@@ -494,7 +813,7 @@ unsafe fn advance(
                 .as_ref()
                 .expect("pending Section metadata File capture");
             if completion.client_id != driver_launch::IO_MANAGER_COMPONENT_ID
-                || completion.driver_id != work.origin_driver
+                || Some(completion.driver_id) != work.origin_driver
                 || completion.file_id != capture.file_id()
                 || completion.device_id != capture.device_id()
                 || completion.requestor_tid != work.tid
@@ -504,7 +823,7 @@ unsafe fn advance(
                 return Step::Wait;
             }
             if !work.metadata.terminal(
-                work.metadata_id,
+                work.metadata_id.expect("routed metadata owner"),
                 irp.raw(),
                 completion.status,
                 completion.information,
@@ -538,9 +857,12 @@ unsafe fn advance(
                 Ok(copied) if copied != 0 && copied <= remaining => copied,
                 _ => return Step::Wait,
             };
-            assert!(work
-                .metadata
-                .append(work.metadata_id, irp.raw(), offset, &bytes[..copied],));
+            assert!(work.metadata.append(
+                work.metadata_id.expect("routed metadata owner"),
+                irp.raw(),
+                offset,
+                &bytes[..copied],
+            ));
             let next = offset + copied;
             work.phase = if next == length {
                 Phase::AckPending { irp }
@@ -564,7 +886,7 @@ unsafe fn advance(
             }
             assert!(work
                 .metadata
-                .acknowledge_backend(work.metadata_id, irp.raw()));
+                .acknowledge_backend(work.metadata_id.expect("routed metadata owner"), irp.raw()));
             work.phase = Phase::Query;
             Step::Progress
         }
@@ -575,30 +897,31 @@ unsafe fn advance(
                 work.phase = Phase::RevokeReply;
                 return Step::Progress;
             }
-            match nt_pe_loader::PeFile::parse(&work.image_header) {
-                Ok(_) => {
-                    work.phase = Phase::Publish;
-                    return Step::Progress;
-                }
-                Err(nt_pe_loader::PeError::Truncated) => {}
-                Err(_) => {
-                    work.status = STATUS_INVALID_IMAGE_FORMAT;
-                    work.phase = Phase::ReadyReply;
-                    return Step::Progress;
-                }
-            }
-            let metadata = work.file_metadata.expect("image header file metadata");
+            let metadata = work.file_metadata.expect("image file metadata");
             let offset = work.image_header.len();
-            let remaining = metadata.end_of_file.saturating_sub(offset as u64);
-            if offset >= IMAGE_HEADER_LIMIT || remaining == 0 || metadata.is_directory {
+            let Ok(file_size) = usize::try_from(metadata.end_of_file) else {
+                work.status = STATUS_INSUFFICIENT_RESOURCES;
+                work.phase = Phase::ReadyReply;
+                return Step::Progress;
+            };
+            if metadata.is_directory || file_size == 0 || offset > file_size {
                 work.status = STATUS_INVALID_IMAGE_FORMAT;
                 work.phase = Phase::ReadyReply;
                 return Step::Progress;
             }
-            let length = IMAGE_HEADER_READ_SIZE
-                .min(IMAGE_HEADER_LIMIT - offset)
-                .min(remaining as usize);
-            if work.image_header.try_reserve(length).is_err() {
+            if offset as u64 == metadata.end_of_file {
+                if nt_pe_loader::PeFile::parse(&work.image_header).is_ok() {
+                    work.phase = Phase::Publish;
+                } else {
+                    work.status = STATUS_INVALID_IMAGE_FORMAT;
+                    work.phase = Phase::ReadyReply;
+                }
+                return Step::Progress;
+            }
+            let length = IMAGE_HEADER_READ_SIZE.min(file_size - offset);
+            if nt_pe_loader::reserve_file_snapshot_capacity(&mut work.image_header, file_size)
+                .is_err()
+            {
                 work.status = STATUS_INSUFFICIENT_RESOURCES;
                 work.phase = Phase::ReadyReply;
                 return Step::Progress;
@@ -622,10 +945,15 @@ unsafe fn advance(
                 &mut output[..length],
             );
             match result {
-                Ok(ExternalDispatchResult::Completed { status, information, .. })
-                    if status.raw() == 0 && information == length as u64 =>
-                {
+                Ok(ExternalDispatchResult::Completed {
+                    status,
+                    information,
+                    ..
+                }) if status.raw() == 0 && information == length as u64 => {
                     work.image_header.extend_from_slice(&output[..length]);
+                    if !work.cancelled {
+                        crate::note_boot_progress(crate::BootProgress::ImageSnapshotCaptured);
+                    }
                 }
                 Ok(ExternalDispatchResult::Completed { status, .. }) => {
                     work.status = if status.raw() == 0 {
@@ -636,7 +964,10 @@ unsafe fn advance(
                     work.phase = Phase::ReadyReply;
                 }
                 Ok(ExternalDispatchResult::Pending { irp_id }) => {
-                    work.phase = Phase::HeaderPending { irp: irp_id, length };
+                    work.phase = Phase::HeaderPending {
+                        irp: irp_id,
+                        length,
+                    };
                 }
                 Err(status) => {
                     work.status = status.raw() as u32;
@@ -653,9 +984,12 @@ unsafe fn advance(
             let Some(completion) = driver_launch::completed_irp_exact(irp.raw()) else {
                 return Step::Wait;
             };
-            let capture = work.capture.as_ref().expect("pending image header File capture");
+            let capture = work
+                .capture
+                .as_ref()
+                .expect("pending image header File capture");
             if completion.client_id != driver_launch::IO_MANAGER_COMPONENT_ID
-                || completion.driver_id != work.origin_driver
+                || Some(completion.driver_id) != work.origin_driver
                 || completion.file_id != capture.file_id()
                 || completion.device_id != capture.device_id()
                 || completion.requestor_tid != work.tid
@@ -665,7 +999,11 @@ unsafe fn advance(
                 return Step::Wait;
             }
             if completion.status == 0 && completion.information == length as u64 {
-                work.phase = Phase::HeaderCopying { irp, length, offset: 0 };
+                work.phase = Phase::HeaderCopying {
+                    irp,
+                    length,
+                    offset: 0,
+                };
             } else {
                 work.status = if completion.status == 0 {
                     STATUS_INVALID_IMAGE_FORMAT
@@ -676,7 +1014,11 @@ unsafe fn advance(
             }
             Step::Progress
         }
-        Phase::HeaderCopying { irp, length, offset } => {
+        Phase::HeaderCopying {
+            irp,
+            length,
+            offset,
+        } => {
             let mut bytes = [0u8; IMAGE_HEADER_READ_SIZE];
             let remaining = length - offset;
             let copied = match driver_launch::copy_completed_irp_output_exact(
@@ -692,7 +1034,11 @@ unsafe fn advance(
             work.phase = if next == length {
                 Phase::HeaderAckPending { irp }
             } else {
-                Phase::HeaderCopying { irp, length, offset: next }
+                Phase::HeaderCopying {
+                    irp,
+                    length,
+                    offset: next,
+                }
             };
             Step::Progress
         }
@@ -704,6 +1050,9 @@ unsafe fn advance(
             {
                 return Step::Wait;
             }
+            if work.status == 0 && !work.cancelled {
+                crate::note_boot_progress(crate::BootProgress::ImageSnapshotCaptured);
+            }
             work.phase = if work.status == 0 {
                 Phase::HeaderDispatch
             } else {
@@ -712,7 +1061,13 @@ unsafe fn advance(
             Step::Progress
         }
         Phase::Publish => {
-            let metadata = work.file_metadata.take().expect("Section publication metadata");
+            if work.data_admission.is_some() {
+                return publish_data_section_work(handler, work);
+            }
+            let metadata = work
+                .file_metadata
+                .take()
+                .expect("Section publication metadata");
             if work.cancelled
                 || work.reference.validate(&handler.pm).is_err()
                 || !handler.validate_provider_logical_caller(work.logical)
@@ -722,37 +1077,48 @@ unsafe fn advance(
                 work.phase = Phase::RevokeReply;
                 return Step::Progress;
             }
-            let capture = work.capture.take().expect("Section publication File capture");
+            let capture = work
+                .capture
+                .take()
+                .expect("Section publication File capture");
             let result = if work.allocation_attrs & 0x0100_0000 != 0 {
-                handler.reserve_native_image_section(
-                    work.caller,
-                    work.desired_access,
-                    work.attributes,
-                    work.maxsize,
-                    work.page_protection,
-                    work.allocation_attrs,
-                    crate::exec_handler::image_section_create::RoutedImageAdmission {
-                        capture,
-                        metadata,
-                        header: core::mem::take(&mut work.image_header),
-                        name: work.image_name.take(),
-                    },
-                ).map(ReservedSection::Image)
+                handler
+                    .reserve_native_image_section(
+                        work.caller,
+                        work.desired_access,
+                        work.attributes,
+                        work.maxsize,
+                        work.page_protection,
+                        work.allocation_attrs,
+                        crate::exec_handler::image_section_create::RoutedImageAdmission {
+                            capture,
+                            metadata,
+                            header: core::mem::take(&mut work.image_header),
+                            image_path: work.image_path.take().expect("captured image File name"),
+                            observation_target: work.observation_target,
+                            name: work.image_name.take(),
+                        },
+                    )
+                    .map(ReservedSection::Image)
             } else {
-                handler.reserve_generic_data_section(
-                    work.caller,
-                    work.pi,
-                    work.desired_access,
-                    work.attributes,
-                    work.maxsize,
-                    work.page_protection,
-                    work.allocation_attrs,
-                    work.file_handle,
-                    Some(crate::exec_handler::section_create::RoutedSectionAdmission {
-                        capture,
-                        metadata,
-                    }),
-                ).map(ReservedSection::Data)
+                handler
+                    .reserve_generic_data_section(
+                        work.caller,
+                        work.pi,
+                        work.desired_access,
+                        work.attributes,
+                        work.maxsize,
+                        work.page_protection,
+                        work.allocation_attrs,
+                        work.file_handle,
+                        Some(
+                            crate::exec_handler::section_create::RoutedSectionAdmission {
+                                capture,
+                                metadata,
+                            },
+                        ),
+                    )
+                    .map(ReservedSection::Data)
             };
             match result {
                 Ok(reserved) => {
@@ -768,6 +1134,9 @@ unsafe fn advance(
             Step::Progress
         }
         Phase::CopyOut => {
+            if work.data_admission.is_some() {
+                return copy_data_section_output(handler, work);
+            }
             if work.cancelled {
                 work.reserved
                     .take()
@@ -826,7 +1195,10 @@ unsafe fn advance(
         }
         Phase::ReadyReply => {
             if work.cancelled {
-                if let Some(handle) = work.published_handle {
+                if let Some(handle) = work
+                    .published_handle
+                    .filter(|_| work.data_admission.is_none())
+                {
                     match handler.close_native_table_handle(work.caller, handle) {
                         Ok(_) => work.published_handle = None,
                         Err(_)
@@ -884,6 +1256,9 @@ unsafe fn advance(
             work.reference
                 .release(&mut handler.pm)
                 .expect("Section requestor reference");
+            if let Some(mut admission) = work.data_admission.take() {
+                handler.release_data_section_admission(&mut admission);
+            }
             Step::Done
         }
         Phase::RevokeReply => {
@@ -910,6 +1285,9 @@ unsafe fn advance(
             work.reference
                 .release(&mut handler.pm)
                 .expect("retired Section requestor reference");
+            if let Some(mut admission) = work.data_admission.take() {
+                handler.release_data_section_admission(&mut admission);
+            }
             Step::Done
         }
         Phase::Indeterminate => Step::Wait,

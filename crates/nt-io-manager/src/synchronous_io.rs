@@ -75,6 +75,22 @@ pub enum SynchronousFileWaitState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileTransferParameters {
+    /// Original value arguments, including the user buffer/IOSB addresses and ULONG length.
+    pub arguments: [u64; 9],
+    pub byte_offset: Option<i64>,
+    pub key: u32,
+}
+
+/// An adapter-owned Operation lease. Copies describe the owner, not additional references.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileTransferEvent {
+    pub id: nt_kernel_exec::EventObjectId,
+    pub lease: nt_kernel_exec::EventLeaseId,
+    pub native_identity: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SynchronousFileWaiter {
     pub route: FileIoWaitRoute,
     pub handle: u32,
@@ -96,6 +112,10 @@ pub struct SynchronousFileWaiter {
     /// Complete native IPC register frame. The executive snapshots it before parking so replay
     /// cannot inherit argument MRs from the unrelated caller that releases Busy.
     pub reply_mrs: [u64; 18],
+    /// Values captured before Busy admission; promotion must not reread user scalar pointers.
+    pub transfer_parameters: Option<FileTransferParameters>,
+    /// The optional completion Event, retained independently of its process handle.
+    pub transfer_event: Option<FileTransferEvent>,
     pub state: SynchronousFileWaitState,
     sequence: u64,
 }
@@ -133,6 +153,8 @@ impl SynchronousFileWaiter {
             resume_sp,
             resume_flags,
             reply_mrs: [0; 18],
+            transfer_parameters: None,
+            transfer_event: None,
             state: SynchronousFileWaitState::Waiting,
             sequence: 0,
         }
@@ -554,6 +576,8 @@ mod tests {
             reply_mrs: [0; 18],
             state: SynchronousFileWaitState::Waiting,
             sequence: 0,
+            transfer_parameters: None,
+            transfer_event: None,
         }
     }
 

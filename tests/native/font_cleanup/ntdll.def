@@ -1,0 +1,9 @@
+LIBRARY ntdll.dll
+EXPORTS
+NtDisplayString
+NtQueryInformationProcess
+NtTerminateProcess
+NtCreateKey
+NtSetValueKey
+NtQueryValueKey
+NtClose

@@ -200,10 +200,14 @@ unsafe fn process_output(
         continuation.return_target.delivery().is_some(),
         "retiring target cannot deliver output"
     );
-    let NativeReturn::Hosted(dispatch) = terminal.returned else {
+    let NativeReturn::Hosted(mut dispatch) = terminal.returned else {
         return;
     };
     let client = continuation.pending.client();
+    if dispatch.logical_caller != client.logical_caller {
+        // Identity disagreement removes evidence only, not retained output/Reply ownership.
+        dispatch.logical_caller = None;
+    }
     let pi = client.pi as usize;
     let copied = match (procs.get(pi), pfilled.get_mut(pi)) {
         (Some(process), Some(filled)) if process.pml4 != 0 => {
@@ -311,7 +315,7 @@ pub(super) unsafe fn drain(
                             TerminalStage::Reply => {
                                 if callback.phase() != component_callback_transfer::TransferPhase::Published {
                                     Err(0xC000_000D)
-                                } else if client_reply_on(reply.reply_cap(), 0, 0, 0, 0, 0) {
+                                } else if callback.restart(reply.reply_cap()) {
                                     Ok(())
                                 } else {
                                     Err(0xC000_0001)
@@ -362,8 +366,8 @@ pub(super) unsafe fn drain(
                             }
                         },
                         TerminalStage::Reply => match reply {
-                            HostedReply::Callback { reply_cap, .. } => {
-                                client_reply_on(reply_cap, 0, 0, 0, 0, 0)
+                            HostedReply::Callback { reply_cap, context } => {
+                                win32k_glue::restart_staged_user_callback_context(context, reply_cap)
                             }
                             HostedReply::Syscall { reply_cap } => {
                                 reply_parked_syscall(reply_cap, payload.status)

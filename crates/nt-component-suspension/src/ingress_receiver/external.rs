@@ -32,6 +32,16 @@ impl<M> IngressReceiver<M> {
         pending: &mut Option<ExternalIngress<M>>,
         query: impl FnOnce(u64, u64) -> Result<ReplyBindingObservation, E>,
     ) -> Result<(ComponentIngress<M>, M), ExternalIngressError<E>> {
+        self.finish_external_with_settlement(pending, query)
+            .map(|(owner, message, _settlement)| (owner, message))
+    }
+
+    /// Issue a single-use dependent-work receipt only after the original retained Call settles.
+    pub fn finish_external_with_settlement<E>(
+        &mut self,
+        pending: &mut Option<ExternalIngress<M>>,
+        query: impl FnOnce(u64, u64) -> Result<ReplyBindingObservation, E>,
+    ) -> Result<(ComponentIngress<M>, M, crate::ExternalSettlement), ExternalIngressError<E>> {
         let external = pending.as_ref().ok_or(ExternalIngressError::Empty)?;
         if self.endpoint() != external.ingress.endpoint()
             || !self.store.owns_external(&external.reservation)
@@ -52,11 +62,13 @@ impl<M> IngressReceiver<M> {
         {
             return Err(ExternalIngressError::NotFree);
         }
+        let admission = external.admission_key();
         let mut external = pending.take().expect("preflight external completion");
         self.store.release_external(&mut external.reservation);
         Ok((
             external.ingress,
             external.completed.take().expect("acknowledged payload"),
+            crate::ExternalSettlement::new(admission),
         ))
     }
 

@@ -1,0 +1,39 @@
+{
+  "issue": 18,
+  "source_commit": "58af680d1ac2e05054b4491126d98b3ae98bfbf4",
+  "microkernel_commit": "2debcee98856ea648924c9ddf0c20a491750668b",
+  "profile": "font-cleanup",
+  "boot_bound_seconds": 3600,
+  "build_exit": 0,
+  "launcher_exit": 130,
+  "collector_exit": 0,
+  "collector_frames": 52,
+  "collector_final_slot": 1,
+  "strict_font_parser_exit": 1,
+  "exact_head_ci": 37424728900,
+  "termination": "Deliberate SIGINT after about nine minutes to remove a source-proven obsolete bootstrap metadata reservation before the next fresh build. The guest was progressing, not declared hung; the original deadline was not extended.",
+  "preboot_sha256": {
+    "rootserver": "fd9f17a9aefccc10488d6293d9bb7b80a9589fdc26779aef21d2f80029125313",
+    "microkernel": "fc0e1ca81c3130a8603f879771ff819edf9dc3fd5a59da2eb7a4d83790d9bb37",
+    "disk": "85dc8b7bd5f1af1ce8b08a841c0cc4a3302aec5eb99321331d24a4e4f80798cf",
+    "ntdll": "6b621e789fd6feea323e5e2003c242e31c8b1a8e818956bf4a870b16a97491a3",
+    "font_acceptance": "1729483e54eba2e8b891beeae4dca6d3881f2f1ac45cbce90ba74c4e4908e6f3",
+    "font_run_setup": "f2238bde4b0d68808f01b1e7f5ce95817e03063db1a4616a63d15716e0bb85b5"
+  },
+  "artifact_sha256": {
+    "raw_log": "86075370490bc1f1106843f7a6c81190f9a5e6e4ead823b5179e4f2022fe4360",
+    "archived_log": "6a0f8db167f98ac70fe68db3656cf3afb07e3c0d30d4a2fb4c4369b7b86e763c",
+    "screenshot": "53ad5f5ac610f375103c4b38bc9dcda1b85defd34e60860272a02fff0da0c9cb"
+  },
+  "observations": [
+    "Actual File and retained Disk SEC_IMAGE mappings continued without the deleted eager DLL stage. Real Winlogon/services/LSASS and device installation ran; canonical worker retirement reached process slot17 generation17. Local native source/boundary regressions144+4 passed; independent source review and complete exact-head crate CI passed.",
+    "No allocation-refusal, terminal provider bugcheck or file-pool exhaustion receipt appeared before the deliberate stop. This partial run does not prove passage of the former late60528-byte NtSetValueKey failure, native font terminal cleanup or total boot improvement.",
+    "The strict parser exited1 for missing font PID-QUERY. No Userinit/Explorer desktop proof was obtained; final same-run screenshot shows background and cursor only.",
+    "The live image still logged dll-reserve target1506 for four bootstrap entries. Source audit found no remaining runtime insertion consumer after issue298. The1502 unused entries require at least4445920bytes of embedded section-array and per-process handle/flag payload alone; exact total native allocator consumption was not measured. Issue299 removes this obsolete reserve, preserving the live System32 cache and real bootstrap entries.",
+    "Final census16: heap watermark60827416/live60341192, reusable2573216/largest2086992; scratch peak1728888/4194304. Dispatch23503/119001Mtick; disk read496501attempts/946584sectors/9616Mtick, write147331attempts/586630sectors/3265Mtick, barriers1794/184Mtick, all recorded disk failures zero. These are operation counters, not final durability or wall-clock receipts."
+  ],
+  "evidence": {
+    "log": "docs/evidence/issue18-canonical-open-font-diagnostic.log.gz",
+    "screenshot": "docs/images/canonical-open-font-diagnostic.png"
+  }
+}

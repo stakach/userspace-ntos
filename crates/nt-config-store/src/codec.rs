@@ -4,7 +4,12 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+#[cfg(test)]
+#[path = "codec_crc32c_tests.rs"]
+mod crc32c_tests;
+
 const CRC32C_TABLE: [u32; 256] = crc32c_table();
+const CRC32C_SLICING_TABLES: [[u32; 256]; 7] = crc32c_slicing_tables();
 
 const fn crc32c_table() -> [u32; 256] {
     let mut table = [0u32; 256];
@@ -26,6 +31,25 @@ const fn crc32c_table() -> [u32; 256] {
     table
 }
 
+const fn crc32c_slicing_tables() -> [[u32; 256]; 7] {
+    let mut tables = [[0u32; 256]; 7];
+    let mut row = 0;
+    while row < tables.len() {
+        let mut byte = 0;
+        while byte < CRC32C_TABLE.len() {
+            let previous = if row == 0 {
+                CRC32C_TABLE[byte]
+            } else {
+                tables[row - 1][byte]
+            };
+            tables[row][byte] = (previous >> 8) ^ CRC32C_TABLE[(previous & 0xff) as usize];
+            byte += 1;
+        }
+        row += 1;
+    }
+    tables
+}
+
 /// Incremental CRC-32C (Castagnoli) over exactly the supplied bytes.
 pub struct Crc32c {
     crc: u32,
@@ -37,10 +61,25 @@ impl Crc32c {
     }
 
     pub fn update(&mut self, data: &[u8]) {
-        for &byte in data {
-            let index = ((self.crc ^ u32::from(byte)) & 0xff) as usize;
-            self.crc = (self.crc >> 8) ^ CRC32C_TABLE[index];
+        let mut crc = self.crc;
+        let mut blocks = data.chunks_exact(8);
+        for block in &mut blocks {
+            // Rows advance each byte's contribution through the rest of the block.
+            let word = crc ^ u32::from_le_bytes([block[0], block[1], block[2], block[3]]);
+            crc = CRC32C_SLICING_TABLES[6][(word & 0xff) as usize]
+                ^ CRC32C_SLICING_TABLES[5][((word >> 8) & 0xff) as usize]
+                ^ CRC32C_SLICING_TABLES[4][((word >> 16) & 0xff) as usize]
+                ^ CRC32C_SLICING_TABLES[3][(word >> 24) as usize]
+                ^ CRC32C_SLICING_TABLES[2][block[4] as usize]
+                ^ CRC32C_SLICING_TABLES[1][block[5] as usize]
+                ^ CRC32C_SLICING_TABLES[0][block[6] as usize]
+                ^ CRC32C_TABLE[block[7] as usize];
         }
+        for &byte in blocks.remainder() {
+            let index = ((crc ^ u32::from(byte)) & 0xff) as usize;
+            crc = (crc >> 8) ^ CRC32C_TABLE[index];
+        }
+        self.crc = crc;
     }
 
     pub fn finish(self) -> u32 {
@@ -53,6 +92,47 @@ pub fn crc32c(data: &[u8]) -> u32 {
     let mut crc = Crc32c::new();
     crc.update(data);
     crc.finish()
+}
+
+/// CRC-32C of two concatenated streams, given their finalized checksums and the
+/// byte length of the second stream. An empty second stream has checksum zero.
+///
+/// Applies the linear zero-byte operator over GF(2) by repeated squaring. This
+/// is the CRC concatenation mathematics also used by Mark Adler's zlib
+/// `crc32_combine`, adapted to Castagnoli without polynomial-period assumptions.
+/// No allocation or multiplication of the byte length by eight is required.
+pub fn crc32c_combine(mut left_crc: u32, right_crc: u32, mut right_len: u64) -> u32 {
+    if right_len == 0 {
+        return left_crc;
+    }
+    let mut operator = [0u32; 32];
+    for (bit, image) in operator.iter_mut().enumerate() {
+        let basis = 1u32 << bit;
+        *image = (basis >> 8) ^ CRC32C_TABLE[(basis & 0xff) as usize];
+    }
+    loop {
+        if right_len & 1 != 0 {
+            left_crc = apply_crc_operator(&operator, left_crc);
+        }
+        right_len >>= 1;
+        if right_len == 0 {
+            return left_crc ^ right_crc;
+        }
+        let mut squared = [0u32; 32];
+        for (image, basis_image) in squared.iter_mut().zip(operator) {
+            *image = apply_crc_operator(&operator, basis_image);
+        }
+        operator = squared;
+    }
+}
+
+fn apply_crc_operator(operator: &[u32; 32], mut value: u32) -> u32 {
+    let mut result = 0;
+    while value != 0 {
+        result ^= operator[value.trailing_zeros() as usize];
+        value &= value - 1;
+    }
+    result
 }
 
 /// An append-only little-endian byte writer.

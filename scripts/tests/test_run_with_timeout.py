@@ -22,6 +22,7 @@ class RunWithTimeoutTests(unittest.TestCase):
         post_ready_seconds: float | None = None,
         merge_output: bool = False,
         failure_file: Path | None = None,
+        failure_texts: tuple[str, ...] = ("BOOT_FAILED",),
     ) -> subprocess.CompletedProcess[str]:
         args = [
             sys.executable,
@@ -49,9 +50,9 @@ class RunWithTimeoutTests(unittest.TestCase):
                 ]
             )
         if failure_file is not None:
-            args.extend(
-                ["--failure-file", str(failure_file), "--failure-text", "BOOT_FAILED"]
-            )
+            args.extend(["--failure-file", str(failure_file)])
+            for marker in failure_texts:
+                args.extend(["--failure-text", marker])
         args.extend(["--", *command])
         if merge_output:
             return subprocess.run(
@@ -230,6 +231,65 @@ class RunWithTimeoutTests(unittest.TestCase):
         self.assertEqual(result.returncode, 125)
         self.assertIn("terminal failure marker observed", result.stderr)
         self.assertLess(time.monotonic() - started, 3)
+
+    def test_each_repeated_failure_marker_independently_stops_process(self) -> None:
+        markers = ("BOOT_FAILED", "PROFILE_TERMINAL_FAILURE")
+        for marker in markers:
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as directory:
+                log = Path(directory) / "serial.log"
+                program = (
+                    "import pathlib,time; "
+                    f"pathlib.Path({str(log)!r}).write_text({marker!r}); "
+                    "time.sleep(30)"
+                )
+                result = self.run_helper(
+                    1, [sys.executable, "-c", program], failure_file=log,
+                    failure_texts=markers,
+                )
+                self.assertEqual(result.returncode, 125)
+                self.assertIn("terminal failure marker observed", result.stderr)
+
+    def test_empty_single_or_repeated_failure_marker_is_rejected_before_launch(self) -> None:
+        for markers in [("",), ("BOOT_FAILED", ""), ("", "BOOT_FAILED")]:
+            with self.subTest(markers=markers), tempfile.TemporaryDirectory() as directory:
+                log = Path(directory) / "serial.log"
+                launched = Path(directory) / "launched"
+                program = (
+                    "import pathlib; "
+                    f"pathlib.Path({str(launched)!r}).touch()"
+                )
+                result = self.run_helper(
+                    1, [sys.executable, "-c", program], failure_file=log,
+                    failure_texts=markers,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("failure markers must be nonempty", result.stderr)
+                self.assertFalse(launched.exists(), "invalid monitor configuration cannot launch a child")
+
+    def test_repeated_failure_markers_preserve_split_and_stale_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "serial.log"
+            log.write_text("BOOT_FAILED PROFILE_TERMINAL_FAILURE")
+            stale = self.run_helper(
+                1, [sys.executable, "-c", "import time; time.sleep(.2)"],
+                failure_file=log,
+                failure_texts=("BOOT_FAILED", "PROFILE_TERMINAL_FAILURE"),
+            )
+            self.assertEqual(stale.returncode, 0)
+            self.assertNotIn("terminal failure marker observed", stale.stderr)
+            program = (
+                "import pathlib,time; "
+                f"p=pathlib.Path({str(log)!r}); "
+                "time.sleep(.2); p.open('a').write('BOOT_'); "
+                "time.sleep(.2); p.open('a').write('FAILED'); "
+                "time.sleep(30)"
+            )
+            result = self.run_helper(
+                1, [sys.executable, "-c", program], failure_file=log,
+                failure_texts=("BOOT_FAILED", "PROFILE_TERMINAL_FAILURE"),
+            )
+        self.assertEqual(result.returncode, 125)
+        self.assertIn("terminal failure marker observed", result.stderr)
 
     def test_split_failure_after_readiness_still_stops_process(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

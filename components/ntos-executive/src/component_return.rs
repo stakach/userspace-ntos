@@ -106,18 +106,21 @@ pub(super) unsafe fn prepare_abandoned_replies(
             .frames()
             .find(|(_, frame)| {
                 scope.matches(frame.owner)
-                    && frame.continuation.hosted().is_some_and(|hosted| {
-                        hosted.return_target.delivery().is_some()
-                    })
+                    && frame
+                        .continuation
+                        .hosted()
+                        .is_some_and(|hosted| hosted.return_target.delivery().is_some())
             })
-            .map(|(lane, frame)| (lane, frame.key));
-        let Some((lane, key)) = target else { break };
-        let frame = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-            .frame_mut(lane, key)
+            .map(|(lane, frame)| (lane, frame.key, frame.owner));
+        let Some((lane, key, owner)) = target else {
+            break;
+        };
+        let continuation = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+            .continuation_mut(lane, key, owner)
             .ok()
             .flatten()
             .expect("hosted return abandonment lost its frame");
-        let Some(hosted) = frame.continuation.hosted_mut() else {
+        let Some(hosted) = continuation.hosted_mut() else {
             return false;
         };
         hosted.return_target.request_abandonment();
@@ -127,21 +130,22 @@ pub(super) unsafe fn prepare_abandoned_replies(
             .frames()
             .find(|(_, frame)| {
                 scope.matches(frame.owner)
-                    && frame.continuation.hosted().is_some_and(|hosted| {
-                        !hosted.return_target.is_abandoned()
-                    })
+                    && frame
+                        .continuation
+                        .hosted()
+                        .is_some_and(|hosted| !hosted.return_target.is_abandoned())
             })
             .map(|(lane, frame)| (lane, frame.key, frame.owner));
         let Some((lane, key, owner)) = target else {
             return true;
         };
         let mut attempt = {
-            let frame = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                .frame_mut(lane, key)
+            let continuation = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                .continuation_mut(lane, key, owner)
                 .ok()
                 .flatten()
                 .expect("hosted return retirement lost its frame");
-            let Some(hosted) = frame.continuation.hosted_mut() else {
+            let Some(hosted) = continuation.hosted_mut() else {
                 return false;
             };
             let Ok(attempt) = hosted.return_target.begin_retirement() else {
@@ -151,19 +155,16 @@ pub(super) unsafe fn prepare_abandoned_replies(
         };
         let outcome = invoke(attempt.effect(), attempt.reply_cap());
         let abandoned = {
-            let frame = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                .frame_mut(lane, key)
+            let continuation = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                .continuation_mut(lane, key, owner)
                 .ok()
                 .flatten()
                 .expect("entered hosted return retirement lost its frame");
-            assert_eq!(
-                frame.owner, owner,
-                "hosted return retirement changed caller"
-            );
-            let Some(hosted) = frame.continuation.hosted_mut() else {
+            let Some(hosted) = continuation.hosted_mut() else {
                 return false;
             };
-            hosted.return_target
+            hosted
+                .return_target
                 .record_retirement(&mut attempt, outcome)
                 .expect("hosted return retirement lost its exact effect receipt");
             hosted.return_target.is_abandoned()

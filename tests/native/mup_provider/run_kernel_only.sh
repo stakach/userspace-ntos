@@ -27,10 +27,12 @@ python3 scripts/run_with_timeout.py \
   --cwd "$ROOT/rust-micro" \
   --failure-file "$RUN_LOG" \
   --failure-text '[provider-bugcheck] terminal' \
+  --failure-text '[mup-provider-gate] terminal service-loop failure' \
+  --failure-text '[read-forward-fail]' \
   --completion-file "$RUN_LOG" \
   --completion-text '[section-read-verified]' \
   --completion-grace-seconds 15 \
-  -- ./scripts/run_specs.sh 2>&1 | tee -a "$RUN_LOG"
+  -- ./scripts/run_specs.sh "$@" 2>&1 | tee -a "$RUN_LOG"
 rc=${PIPESTATUS[0]}
 set -e
 
@@ -38,9 +40,8 @@ if [ "$rc" != 0 ] && [ "$rc" != 3 ]; then
   echo "Mup provider boot did not complete (runner status $rc): $RUN_LOG" >&2
   exit 1
 fi
-# An accepted MUP query requires both completed provider registration and a non-null security
-# context. Serial DbgPrint can interleave within a line, so use the final probe's counters rather
-# than the individual query trace for that proof.
+# An accepted MUP query requires completed provider registration and a non-null security
+# context. The final probe counters certify the complete query, not just an intermediate trace.
 if ! grep -Fq '[mup-provider-gate] kernel-only native service loop' "$RUN_LOG" \
    || ! grep -Fq 'PASS exec_mounted_volume_external_file_dispatch_font_read' "$RUN_LOG" \
    || ! grep -Fq 'PASS exec_mounted_volume_directory_create_query_close' "$RUN_LOG" \
@@ -56,7 +57,7 @@ if ! grep -Fq '[mup-provider-gate] kernel-only native service loop' "$RUN_LOG" \
    || { ! grep -Fq 'offset=0 call=0x00000000 wait=0x00000000 status=0x00000000 iosb=0x00000000 info=10 bytes-match=1' "$RUN_LOG" \
         && ! grep -Fq '[read-forward-verified-0]' "$RUN_LOG"; } \
    || ! grep -Fq '[mup-provider-read-pending-dispatch] status=0x00000103' "$RUN_LOG" \
-   || ! grep -Eq '\[mup-provider-read-pending-complete\] count=[1-9][0-9]* bytes=20' "$RUN_LOG" \
+   || ! grep -Eq '\[mup-provider-read-pending-complete\] count=3 bytes=30' "$RUN_LOG" \
    || ! grep -Fq '[read-forward-verified-1]' "$RUN_LOG" \
    || [ "$(grep -Fc '[mup-provider-read-pending-complete]' "$RUN_LOG")" -ne 1 ] \
    || ! grep -Fq '[mup-provider-flush] count=1' "$RUN_LOG" \
@@ -74,6 +75,7 @@ if ! grep -Fq '[mup-provider-gate] kernel-only native service loop' "$RUN_LOG" \
    || ! grep -Fq '[mup-provider-query-file] count=3 class=5 bytes=24' "$RUN_LOG" \
    || ! grep -Fq '[zw-query-file-verified]' "$RUN_LOG" \
    || ! grep -Fq '[zw-read-file-verified]' "$RUN_LOG" \
+   || grep -Fq '[read-forward-fail]' "$RUN_LOG" \
    || ! grep -Fq '[mup-provider-section-create] count=1' "$RUN_LOG" \
    || ! grep -Fq '[mup-provider-section-query-pending-dispatch] class=5 bytes=24' "$RUN_LOG" \
    || ! grep -Fq '[mup-provider-section-query-pending-complete] class=5 bytes=24' "$RUN_LOG" \
@@ -92,4 +94,6 @@ if ! grep -Fq '[mup-provider-gate] kernel-only native service loop' "$RUN_LOG" \
   exit 1
 fi
 
-echo "Mup/provider registration, File WRITE, immediate/pending cross-domain READ, FLUSH and QUERY_INFORMATION, section-shaped class 5/class 6 metadata and pending page READ, Zw READ/QUERY, and CREATE/CLEANUP/CLOSE verified (IRP-level only): $RUN_LOG"
+python3 tests/native/mup_provider/verify_log.py --verify-log "$RUN_LOG"
+
+echo "Mup/provider registration, File WRITE, immediate/pending cross-domain READ, FLUSH and QUERY_INFORMATION, controlled pending failures, section-shaped class 5/class 6 metadata and pending page READ, Zw READ/QUERY, and CREATE/CLEANUP/CLOSE verified (IRP-level only): $RUN_LOG"

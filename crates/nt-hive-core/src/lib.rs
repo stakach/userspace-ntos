@@ -15,11 +15,16 @@
 extern crate alloc;
 
 mod codec;
+mod boot_object_policy;
 mod config_import;
 mod hive;
 mod io;
 mod overlay;
 mod reactos_registration;
+
+pub use boot_object_policy::{
+    boot_object_protection_mode, boot_object_protection_mode_from_image, BootObjectPolicyError,
+};
 
 pub use overlay::{canon_path, RegistryOverlay};
 pub use reactos_registration::{
@@ -29,8 +34,6 @@ pub use reactos_registration::{
     seed_reactos_explorer_shell_com_classes,
     seed_reactos_explorer_shell_com_classes_in_mutable_hives,
     seed_reactos_explorer_shell_com_classes_into_target,
-    seed_reactos_installed_boot_state_in_mutable_hives,
-    seed_reactos_installed_boot_state_into_target,
     seed_reactos_network_adapter_bindings_into_target,
     seed_reactos_network_bindings_from_config_manager_into_target,
     seed_reactos_network_bindings_from_pnp_driver_bindings_into_target,
@@ -39,8 +42,7 @@ pub use reactos_registration::{
     seed_reactos_print_setup_into_target, seed_reactos_time_zone_setup_into_target,
     seed_reactos_user_profile_shell_folders_in_mutable_hives,
     seed_reactos_user_profile_shell_folders_into_target, utf16le_sz,
-    ReactOsComClassRegistrationScript, ReactOsInstalledBootSeedError,
-    ReactOsInstalledBootSeedStats, ReactOsNetworkAdapterBinding, ReactOsNetworkIpv4Defaults,
+    ReactOsComClassRegistrationScript, ReactOsNetworkAdapterBinding, ReactOsNetworkIpv4Defaults,
     ReactOsNetworkSetupSeedStats, ReactOsPrintEnvironmentRegistration, ReactOsPrintSetupSeedStats,
     ReactOsProfileShellFolder, ReactOsProfileShellFolderSeedStats, ReactOsSetupSeedTarget,
     ReactOsTimeZoneDatabaseError, ReactOsTimeZoneSeedError, ReactOsTimeZoneSeedOutcome,
@@ -71,13 +73,18 @@ pub use hive::{
     CurrentControlSetError, DeleteKeyError, Hive, HiveId, HiveKind, HiveMountTable,
     HiveOverlayError, HiveTransaction, HiveValueBlobCompactError, HiveValueBlobCompaction,
     MutableHiveSet, RegistryValueCopyProvenance, RegistryValueCopyProvenanceTable,
-    RegistryValueType, ResolvedHiveKey, ResolvedHiveValue, SYSTEM_HIVE_PATH,
+    HiveValueJournalPhase, PreparedSetValue, RegistryValueType, ResolvedHiveKey,
+    ResolvedHiveValue, RetainedHiveValueJournal, SetValueError,
+    SYSTEM_HIVE_PATH,
 };
 mod hardware_profile;
+#[cfg(test)]
+mod hive_retained_mutation_tests;
 pub use hardware_profile::{HardwareProfileAlias, HardwareProfileError};
 pub use io::{
     FaultInjectionHiveIoProvider, FlushMode, HiveBootError, HiveFlushError, HiveIoError,
     HiveIoProvider, HiveIoProviderKind, HiveIoStatus, HiveManager, MemoryHiveIoProvider,
+    HiveSetValueError, HiveSetValueReceipt,
 };
 
 #[cfg(test)]
@@ -85,3 +92,6 @@ mod tests;
 
 #[cfg(test)]
 mod key_kind_tests;
+
+#[cfg(test)]
+mod allocation_growth_tests;

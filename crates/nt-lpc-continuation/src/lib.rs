@@ -64,6 +64,29 @@ enum Slot<T> {
     Occupied { generation: u64, value: T },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectCompletionPhase {
+    Waiting,
+    Publishing,
+    ReplyPending,
+    CancellationPending,
+    Indeterminate,
+}
+
+struct ConnectOwner<C, R> {
+    wait: PendingConnect<C>,
+    phase: ConnectCompletionPhase,
+    terminal: Option<R>,
+    status: Option<u32>,
+}
+
+/// Exact, generation-bound completion admission. Its fields cannot be supplied by callers.
+pub struct ConnectCompletionTicket {
+    slot: usize,
+    generation: u64,
+    connection_id: u64,
+}
+
 struct GenerationTable<T> {
     slots: Vec<Slot<T>>,
     initial_reserve: usize,
@@ -533,13 +556,13 @@ impl<C> RequestWaitTable<C> {
 }
 
 /// Growable, generation-exact ownership table for pending LPC connects.
-pub struct ConnectWaitTable<C> {
-    inner: GenerationTable<PendingConnect<C>>,
+pub struct ConnectWaitTable<C, R = ()> {
+    inner: GenerationTable<ConnectOwner<C, R>>,
 }
 
-impl<C> Default for ConnectWaitTable<C> {
+impl<C, R> Default for ConnectWaitTable<C, R> {
     fn default() -> Self {
-        Self::new()
+        Self::with_completion_storage(DEFAULT_INITIAL_RESERVE)
     }
 }
 
@@ -549,12 +572,21 @@ impl<C> ConnectWaitTable<C> {
     }
 
     pub const fn with_initial_reserve(initial_reserve: usize) -> Self {
+        Self::with_completion_storage(initial_reserve)
+    }
+}
+
+impl<C, R> ConnectWaitTable<C, R> {
+    pub const fn with_completion_storage(initial_reserve: usize) -> Self {
         Self {
             inner: GenerationTable::with_initial_reserve(initial_reserve),
         }
     }
 
     pub fn reset(&mut self) -> Result<(), TableError> {
+        if !self.inner.is_empty() {
+            return Err(TableError::InvalidRequest);
+        }
         self.inner.reset()
     }
 
@@ -575,17 +607,25 @@ impl<C> ConnectWaitTable<C> {
             return Err(TableError::InvalidRequest);
         }
         if self.inner.occupied_slots().any(|slot| {
-            self.inner
-                .get(slot)
-                .is_some_and(|wait| wait.request.connection_id == value.request.connection_id)
+            self.inner.get(slot).is_some_and(|owner| {
+                owner.wait.request.connection_id == value.request.connection_id
+            })
         }) {
             return Err(TableError::InvalidRequest);
         }
-        self.inner.publish(reservation, value)
+        self.inner.publish(
+            reservation,
+            ConnectOwner {
+                wait: value,
+                phase: ConnectCompletionPhase::Waiting,
+                terminal: None,
+                status: None,
+            },
+        )
     }
 
     pub fn get(&self, slot: usize) -> Option<&PendingConnect<C>> {
-        self.inner.get(slot)
+        self.inner.get(slot).map(|owner| &owner.wait)
     }
 
     pub fn occupied_slots(&self) -> impl Iterator<Item = usize> + '_ {
@@ -594,13 +634,145 @@ impl<C> ConnectWaitTable<C> {
 
     pub fn find_connection(&self, connection_id: u64) -> Option<(usize, &PendingConnect<C>)> {
         self.inner.occupied_slots().find_map(|slot| {
-            let wait = self.inner.get(slot)?;
+            let wait = &self.inner.get(slot)?.wait;
             (wait.request.connection_id == connection_id).then_some((slot, wait))
         })
     }
 
     pub fn take(&mut self, slot: usize) -> Option<PendingConnect<C>> {
-        self.inner.take(slot)
+        if self.inner.get(slot)?.phase != ConnectCompletionPhase::Waiting {
+            return None;
+        }
+        self.inner.take(slot).map(|owner| owner.wait)
+    }
+
+    pub fn begin_completion(
+        &mut self,
+        connection_id: u64,
+        terminal: R,
+    ) -> Result<ConnectCompletionTicket, (TableError, R)> {
+        let Some(slot) = self.inner.occupied_slots().find(|&slot| {
+            self.inner
+                .get(slot)
+                .is_some_and(|owner| owner.wait.request.connection_id == connection_id)
+        }) else {
+            return Err((TableError::InvalidRequest, terminal));
+        };
+        let Slot::Occupied { generation, value } = &mut self.inner.slots[slot] else {
+            unreachable!();
+        };
+        if value.phase != ConnectCompletionPhase::Waiting {
+            return Err((TableError::InvalidRequest, terminal));
+        }
+        value.terminal = Some(terminal);
+        value.phase = ConnectCompletionPhase::Publishing;
+        Ok(ConnectCompletionTicket {
+            slot,
+            generation: *generation,
+            connection_id,
+        })
+    }
+
+    fn completion_owner(&self, ticket: &ConnectCompletionTicket) -> Option<&ConnectOwner<C, R>> {
+        match self.inner.slots.get(ticket.slot)? {
+            Slot::Occupied { generation, value }
+                if *generation == ticket.generation
+                    && value.wait.request.connection_id == ticket.connection_id =>
+            {
+                Some(value)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn completion(&self, ticket: &ConnectCompletionTicket) -> Option<&R> {
+        self.completion_owner(ticket)?.terminal.as_ref()
+    }
+
+    pub fn begin_reply(
+        &mut self,
+        ticket: &ConnectCompletionTicket,
+        status: u32,
+    ) -> Result<(), TableError> {
+        if self
+            .completion_owner(ticket)
+            .is_none_or(|owner| owner.phase != ConnectCompletionPhase::Publishing)
+        {
+            return Err(TableError::InvalidRequest);
+        }
+        let Slot::Occupied { value, .. } = &mut self.inner.slots[ticket.slot] else {
+            unreachable!();
+        };
+        value.status = Some(status);
+        value.phase = ConnectCompletionPhase::ReplyPending;
+        Ok(())
+    }
+
+    pub fn finish_reply(
+        &mut self,
+        ticket: ConnectCompletionTicket,
+        acknowledged: bool,
+    ) -> Option<(PendingConnect<C>, R)> {
+        if self.completion_owner(&ticket)?.phase != ConnectCompletionPhase::ReplyPending {
+            return None;
+        }
+        if !acknowledged {
+            let Slot::Occupied { value, .. } = &mut self.inner.slots[ticket.slot] else {
+                unreachable!();
+            };
+            value.phase = ConnectCompletionPhase::Indeterminate;
+            return None;
+        }
+        let owner = self.inner.take(ticket.slot)?;
+        Some((
+            owner.wait,
+            owner
+                .terminal
+                .expect("completion intent retains its terminal payload"),
+        ))
+    }
+
+    pub fn begin_cancel(
+        &mut self,
+        connection_id: u64,
+    ) -> Result<ConnectCompletionTicket, TableError> {
+        let Some(slot) = self.inner.occupied_slots().find(|&slot| {
+            self.inner
+                .get(slot)
+                .is_some_and(|owner| owner.wait.request.connection_id == connection_id)
+        }) else {
+            return Err(TableError::InvalidRequest);
+        };
+        let Slot::Occupied { generation, value } = &mut self.inner.slots[slot] else {
+            unreachable!();
+        };
+        if value.phase != ConnectCompletionPhase::Waiting {
+            return Err(TableError::InvalidRequest);
+        }
+        value.phase = ConnectCompletionPhase::CancellationPending;
+        Ok(ConnectCompletionTicket {
+            slot,
+            generation: *generation,
+            connection_id,
+        })
+    }
+
+    pub fn finish_cancel(
+        &mut self,
+        ticket: ConnectCompletionTicket,
+        acknowledged: bool,
+    ) -> Option<PendingConnect<C>> {
+        if self.completion_owner(&ticket)?.phase != ConnectCompletionPhase::CancellationPending {
+            return None;
+        }
+        if !acknowledged {
+            let Slot::Occupied { value, .. } = &mut self.inner.slots[ticket.slot] else {
+                unreachable!();
+            };
+            value.phase = ConnectCompletionPhase::Indeterminate;
+            return None;
+        }
+        self.inner.take(ticket.slot).map(|owner| owner.wait)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -615,6 +787,9 @@ impl<C> ConnectWaitTable<C> {
         self.inner.allocation_capacity()
     }
 }
+
+#[cfg(test)]
+mod connect_completion_tests;
 
 #[cfg(test)]
 mod tests {

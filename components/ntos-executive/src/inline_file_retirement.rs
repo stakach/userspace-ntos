@@ -83,7 +83,10 @@ fn report(owner: FileIoBusyOwner, effect: Effect, status: u32, uncertain: bool) 
     print_str(b"[inline-file-retirement] retained file=");
     match owner.key {
         FileIoWaitKey::Hosted(file_id) => print_u64(file_id),
-        FileIoWaitKey::LocalOverlay(_) => print_str(b"invalid-domain"),
+        FileIoWaitKey::LocalOverlay(file_id) => {
+            print_str(b"overlay/");
+            print_u64(file_id);
+        }
     }
     print_str(b" tid=");
     print_u64(owner.tid);
@@ -133,7 +136,9 @@ unsafe fn drive(handler: &mut ExecNtHandler, identity: Identity) {
                     .file_completion
                     .release_file(file_id)
                     .map(Outcome::ReferenceReleased),
-                FileIoWaitKey::LocalOverlay(_) => Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST),
+                FileIoWaitKey::LocalOverlay(file_id) => handler
+                    .try_release_local_file_io_reference(nt_io_manager::LocalFileObject::Overlay(file_id))
+                    .map(|()| Outcome::ReferenceReleased(nt_io_completion::FileReferenceRelease::default())),
             },
             Effect::ReferenceFollowup => {
                 let receipt = attempt

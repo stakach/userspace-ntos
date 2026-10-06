@@ -64,7 +64,9 @@ impl PendingFileIo {
             PendingFileIoOperation::LocalDirectoryNotify(_) => {
                 matches!(self.route, Local(ReadonlyDirectory(_) | Overlay(_)))
             }
-            PendingFileIoOperation::LocalInline(_) => matches!(self.route, Local(_)),
+            PendingFileIoOperation::OwnedInline(_) => self.route.is_valid(),
+            PendingFileIoOperation::OwnedModePrecommit(_) => matches!(self.route,
+                Hosted(_) | Local(Overlay(_))),
             PendingFileIoOperation::LocalBuffered(_) => match self.major {
                 nt_io_abi::major::IRP_MJ_READ => {
                     matches!(self.route, Local(ReadonlyFile(_) | Overlay(_)))

@@ -345,6 +345,7 @@ fn apply_system_hive_mutation(
                 Ok(()) => Ok(()),
                 Err(nt_hive_core::DeleteKeyError::NotFound) => Err(STATUS_OBJECT_NAME_NOT_FOUND),
                 Err(nt_hive_core::DeleteKeyError::CannotDelete) => Err(STATUS_CANNOT_DELETE),
+                Err(nt_hive_core::DeleteKeyError::RetainedPublication) => Err(STATUS_DEVICE_BUSY),
             }
         }
         HiveMutation::SetKeyClass { path, class_name } => {

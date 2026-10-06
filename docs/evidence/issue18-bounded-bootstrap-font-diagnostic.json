@@ -1,0 +1,39 @@
+{
+  "issue": 18,
+  "source_commit": "c8b284a4a30d728790f4c780b947cb127bc6bd6d",
+  "microkernel_commit": "2debcee98856ea648924c9ddf0c20a491750668b",
+  "profile": "font-cleanup",
+  "boot_bound_seconds": 3600,
+  "build_exit": 0,
+  "launcher_exit": 130,
+  "collector_exit": 0,
+  "collector_frames": 128,
+  "collector_final_slot": 1,
+  "strict_font_parser_exit": 1,
+  "exact_head_ci": 37426586548,
+  "termination": "Deliberate SIGINT after about 21 minutes upon confirming that executing legacy NPFS queue repair writes provider-private storage without exact allocation lifetime authority. The guest was progressing, not declared hung; the original deadline was not extended.",
+  "preboot_sha256": {
+    "rootserver": "6dc40524efd6662bdbee4990de2f226bda78423a0ca4110e5a044cb4ab15e405",
+    "microkernel": "fc0e1ca81c3130a8603f879771ff819edf9dc3fd5a59da2eb7a4d83790d9bb37",
+    "disk": "7a83ac846d586b41d0c94656fb08fcd6c65575ace493978f33263c4a80e1ca7f",
+    "ntdll": "6b621e789fd6feea323e5e2003c242e31c8b1a8e818956bf4a870b16a97491a3",
+    "font_acceptance": "1729483e54eba2e8b891beeae4dca6d3881f2f1ac45cbce90ba74c4e4908e6f3",
+    "font_run_setup": "f2238bde4b0d68808f01b1e7f5ce95817e03063db1a4616a63d15716e0bb85b5"
+  },
+  "artifact_sha256": {
+    "raw_log": "75c32e0e6484a313170703c1efa29c8b7492ab6152667e106f6dde6e622ddf64",
+    "archived_log": "55bf3b3fdf4390cdf2a8dede262a445da1e77b0c5b4c352c25fd2f33bdfa6f1a",
+    "screenshot": "53ad5f5ac610f375103c4b38bc9dcda1b85defd34e60860272a02fff0da0c9cb"
+  },
+  "observations": [
+    "Obsolete directory-sized empty bootstrap DLL reservation is absent. Four real bootstrap entries and canonical File/Section mappings remain. Full native image build and complete exact-head crate CI passed; six focused source contracts passed after two expected RED failures.",
+    "Actual device-install workers retired through process slot17 generation39. Setup Run registration succeeded, but font-acceptance PID-QUERY never appeared. Strict font cleanup and Userinit/Explorer desktop acceptance remain unproven; the final screenshot shows background and cursor only.",
+    "No allocation-refusal or terminal provider bugcheck receipt appeared before the deliberate stop. This does not prove passage of the former late60528-byte registry allocation frontier or a total boot performance improvement.",
+    "Live INCONSISTENT -> repaired receipts report zeroed NPFS queue state. ReactOS NpUninitializeDataQueue legitimately zeroes storage before NpDeleteCcb frees it; cleanup clears FILE_OBJECT contexts first. Host audit_ccb instead follows old numeric file_id using only pool bounds and NodeType, then audit_data_queue rewrites private links and counters. These receipts do not prove provider corruption. Issue300 removes this unauthoritative machinery before further acceptance.",
+    "Final census41: heap watermark54142944/live53745688, reusable780112/largest382856; scratch peak1728888/4194304. Dispatch39107/334089Mtick; disk read531455attempts/982484sectors/10475Mtick, write147649attempts/587894sectors/3329Mtick, barriers1797/187Mtick, all recorded disk failures zero. Operation counters are not final durability receipts."
+  ],
+  "evidence": {
+    "log": "docs/evidence/issue18-bounded-bootstrap-font-diagnostic.log.gz",
+    "screenshot": "docs/images/bounded-bootstrap-font-diagnostic.png"
+  }
+}

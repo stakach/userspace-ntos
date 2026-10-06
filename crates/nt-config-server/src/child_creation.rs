@@ -2,7 +2,7 @@
 
 use super::{
     HiveTransaction, String, Vec, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER,
-    STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_DEVICE_BUSY,
 };
 
 fn string(value: &str) -> Result<String, i32> {
@@ -79,6 +79,7 @@ pub(super) fn apply_cell(
                 CreateChildError::NameCollision => 0xc000_0035u32 as i32,
                 CreateChildError::InsufficientResources => STATUS_INSUFFICIENT_RESOURCES,
                 CreateChildError::ChildMustBeVolatile => 0xc000_0181u32 as i32,
+                CreateChildError::RetainedPublication => STATUS_DEVICE_BUSY,
                 CreateChildError::InvalidName | CreateChildError::EmptySecurityDescriptor => {
                     STATUS_INVALID_PARAMETER
                 }

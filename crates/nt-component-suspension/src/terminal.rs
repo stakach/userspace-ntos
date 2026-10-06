@@ -224,6 +224,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         }
         if lane.terminal.is_some()
             || lane.resume_epoch == 0
+            || frame.receive.is_some_and(|admission| !admission.restored)
             || !matches!(frame.phase, SuspensionPhase::Resuming { .. })
         {
             return Err(LaneError::InvalidPhase);

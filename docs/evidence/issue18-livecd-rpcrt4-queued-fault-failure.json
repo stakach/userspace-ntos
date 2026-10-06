@@ -1,0 +1,29 @@
+{
+  "native_commit": "e19855ecdb19732a811b672a7f9122ccac0eeac5",
+  "microkernel_commit": "92c4e2b330019c7c8afb1544b3cbf8ca1219eb73",
+  "profile": "font-cleanup",
+  "command": "env -u NTOS_MUP_PROVIDER_KERNEL_ONLY -u NTDLL_FEATURES NTOS_IMAGE_PROFILE=font-cleanup IMAGE_MIB=256 PERSIST_IMAGE_MIB=16 BOOT_TIMEOUT_SECONDS=3600 RUN_LOG=$PWD/.tmp/issue18-exact-desktop-font-boot.log ./run.sh --desktop -qmp unix:$PWD/.tmp/issue18-exact-desktop-font-qmp.sock,server=on,wait=off",
+  "boot_limit_seconds": 3600,
+  "termination": "Stopped the exact guest after approximately33 minutes once an unrecoverable svchost worker fault was understood; no completed guest gate.",
+  "launcher_exit": 1,
+  "collector_exit": 0,
+  "collector_frames": 197,
+  "explorer_desktop_proven": false,
+  "screenshot": "../images/livecd-rpcrt4-queued-fault-failure.png",
+  "screenshot_sha256": "53ad5f5ac610f375103c4b38bc9dcda1b85defd34e60860272a02fff0da0c9cb",
+  "root_viewed_screenshot": true,
+  "raw_log_sha256": "69a5087e7df157535da5320925347dba9cbc8a0ce19e2fa0153261c2e6cf6231",
+  "archived_log": "issue18-livecd-rpcrt4-queued-fault-failure.log.gz",
+  "rootserver_sha256": "1c580b98455e0a18447a6806cff50ac86b1ea9aebf1a1bda2734d0a796b38090",
+  "disk_sha256_after_termination": "a870442d76c6f92bbb5fbc770481d91ddf14662c6cd60ec1018fdf7e81421d85",
+  "observations": [
+    "Fresh full USER-range image placement executed high preferred DLL addresses, including the services child startup at0x7ffb60151e0.",
+    "The same-run final screenshot contains background and cursor without Explorer chrome or icons.",
+    "svchost.exe PID952/PI15 generation11 hosted workers TID960 and964; this is not the earlier ThemeHelper startup failure.",
+    "Two adjacent kernel-captured nonpresent execute faults, TCB83 then82, target rpcrt4.dll page0x7ffaa05f000 before executive failure handling.",
+    "The failure-only diagnostic records current matching view/process identity, MEM_COMMIT SEC_IMAGE protection PAGE_EXECUTE_WRITECOPY and a resident borrowed mapping cap0x34483.",
+    "The resident-shared-fault branch returns STATUS_ACCESS_VIOLATION and parks TCB82/badge742, while TCB83 subsequently advances.",
+    "A queued sibling fault is the supported hypothesis; the log does not establish unrelated cap reuse or loss of an existing leaf mapping.",
+    "No genuine Userinit/Explorer launch or private-font terminal acceptance was observed. Issue18 remains open."
+  ]
+}

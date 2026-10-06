@@ -23,6 +23,12 @@ pub use device_parameters_security::prepare_device_parameters_security;
 
 #[path = "registry_root_security.rs"]
 mod registry_root_security;
+#[path = "object_directory_root_security.rs"]
+mod object_directory_root_security;
+#[path = "bootstrap_directory_security.rs"]
+mod bootstrap_directory_security;
+pub use bootstrap_directory_security::{assign_security_directory_security, assign_dos_devices_directory_security};
+pub use object_directory_root_security::assign_object_directory_root_security;
 pub use registry_root_security::{
     assign_registry_root_security, mounted_hive_root_security, KEY_GENERIC_MAPPING,
 };

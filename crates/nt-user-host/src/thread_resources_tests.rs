@@ -25,6 +25,44 @@ fn resources() -> ThreadMemoryResources<3> {
 }
 
 #[test]
+fn exact_mapping_caps_follow_geometry_not_backing_or_mirror_aliases() {
+    let resources = resources();
+    for (page, cap) in [
+        (0x10000, 11),
+        (0x11000, 21),
+        (0x12000, 60),
+        (0x13000, 31),
+        (0x14000, 41),
+        (0x15000, 51),
+        (0x16000, 71),
+    ] {
+        assert_eq!(resources.expected_mapping_cap(page), Some(cap));
+        assert_eq!(resources.expected_mapping_cap(page + 1), None);
+    }
+    assert_eq!(resources.expected_mapping_cap(0x17000), None);
+    assert_eq!(
+        ThreadMemoryResources::<3>::empty().expected_mapping_cap(0x10000),
+        None,
+    );
+}
+
+#[test]
+fn unbuilt_target_does_not_fall_back_to_existing_backing_or_mirror() {
+    let mut resources = resources();
+    resources.stack_target[0] = 0;
+    resources.teb_target = 0;
+    resources.teb2_target = 0;
+    resources.acs_target = 0;
+    resources.tramp_target = 0;
+    for page in [0x10000, 0x13000, 0x14000, 0x15000, 0x16000] {
+        assert_eq!(resources.expected_mapping_cap(page), None);
+    }
+    assert_eq!(resources.expected_mapping_cap(0x12000), Some(60));
+    resources.ipc_owner = 0;
+    assert_eq!(resources.expected_mapping_cap(0x12000), None);
+}
+
+#[test]
 fn backing_retirement_excludes_every_retained_transport_page_but_not_neighbors() {
     let resources = resources();
     for page in (0x10000..0x17000).step_by(0x1000) {

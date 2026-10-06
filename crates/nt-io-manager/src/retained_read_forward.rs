@@ -497,6 +497,50 @@ mod tests {
     }
 
     #[test]
+    fn pending_dispatch_reply_precedes_terminal_without_releasing_exact_read_owner() {
+        use crate::hosted_forward_progress::{
+            hosted_forward_dispatch_reply_ready, HostedForwardDispatchReply,
+        };
+        use crate::source_terminal::{OriginCallPhase, TerminalAdmission, TerminalDelivery};
+
+        let (mut io, prepared) = fixture(DeviceFlags::BUFFERED_IO);
+        let identity = prepared.identity();
+        let device = identity.target.device_id();
+        let held = io.device_reference_count(device);
+        let invocation = prepared.begin(&io, identity).unwrap();
+        let retained = match invocation.returned(ReadForwardOutcome::Pending).finish(&io, identity) {
+            ReadForwardResult::Retained(retained) => retained,
+            _ => panic!("the real pending forward retains its exact provider target"),
+        };
+        assert_eq!(retained.identity(), identity);
+        assert_eq!(io.device_reference_count(device), held);
+        assert!(!retained.is_indeterminate());
+        // Native acceptance separately observes the untouched source IOSB, Event and output.
+        let ready = hosted_forward_dispatch_reply_ready(HostedForwardDispatchReply::Pending, false);
+        assert_eq!(io.device_reference_count(device), held);
+
+        let token = identity.source.id.get();
+        assert_eq!(TerminalDelivery::Pending.admit(OriginCallPhase::Calling, token), TerminalAdmission::NotReady);
+        assert_eq!(TerminalDelivery::Pending.admit(OriginCallPhase::Armed(token + 1), token), TerminalAdmission::Rejected);
+        assert_eq!(TerminalDelivery::Pending.admit(OriginCallPhase::Armed(token), token), TerminalAdmission::Ready);
+        let mut stale = identity;
+        stale.source.generation = core::num::NonZeroU64::new(identity.source.generation.get() + 1).unwrap();
+        let retained = match retained.complete(&io, stale, completion(0, 3, &[1, 2, 3])) {
+            ReadForwardResult::Rejected { error: ReadForwardError::WrongIdentity, retained } => retained,
+            _ => panic!("a foreign terminal cannot consume the retained source"),
+        };
+        assert_eq!(io.device_reference_count(device), held);
+        let terminal = match retained.complete(&io, identity, completion(0, 3, &[1, 2, 3])) {
+            ReadForwardResult::Terminal(terminal) => terminal,
+            _ => panic!("only the genuine exact terminal can advance completion"),
+        };
+        assert_eq!(io.device_reference_count(device), held);
+        assert_eq!(terminal.retire(&mut io).unwrap().bytes(), &[1, 2, 3]);
+        assert_eq!(io.device_reference_count(device), held - 1);
+        assert!(ready, "STATUS_PENDING dispatch must return before the later terminal is published");
+    }
+
+    #[test]
     fn pending_cancel_keeps_target_until_exact_late_terminal_is_retired() {
         let (mut io, prepared) = fixture(DeviceFlags::BUFFERED_IO);
         let identity = prepared.identity();

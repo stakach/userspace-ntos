@@ -21,6 +21,9 @@ pub(crate) unsafe fn run_hosted(
         ComponentNativeContinuation::Hosted(hosted) => hosted,
         ComponentNativeContinuation::Kernel(_) => return None,
     };
+    if matches!(continuation.pending, PendingComponentDispatch::Receive(_)) {
+        return None;
+    }
     if !continuation.return_target.can_resume()
         || !win32k_glue::win32k_client_context_is_admitted(continuation.pending.client())
     {
@@ -28,7 +31,7 @@ pub(crate) unsafe fn run_hosted(
     }
     // Reserve all handoff storage before entering a provider that may yield a callback.
     // Refusal leaves the selected source wait and its reply authority unchanged.
-    let Ok(mut callback_transfer) = component_callback_transfer::CallbackTransfer::reserve() else {
+    let Ok(callback_transfer) = component_callback_transfer::CallbackTransfer::reserve() else {
         return None;
     };
     let admitted = {
@@ -102,14 +105,191 @@ pub(crate) unsafe fn run_hosted(
                 }
             }
         }
+        PendingComponentDispatch::Receive(_) => {
+            unreachable!("Receive requires its sealed child boundary")
+        }
     };
+    finish_hosted_resume(
+        nt_handler,
+        lane,
+        lane_resume.binding,
+        admitted_dispatch,
+        resume,
+        frame,
+        continuation,
+        callback_transfer,
+        pump_completion,
+    )
+}
+
+/// Resume only the exact Receive child boundary retained by the physical parent owner.
+pub(crate) unsafe fn run_receive(
+    nt_handler: *mut ExecNtHandler,
+    boundary: crate::spawn_hosts::shared_ingress::owner::runtime::ReceiveSettlementBoundary,
+) -> Option<crate::spawn_hosts::shared_ingress::owner::runtime::ReceiveSettlementBoundary> {
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    let prepared = (|| {
+        let handle = boundary.parent.as_ref()?;
+        let (lane, binding, dispatch, frame, continuation, pending) =
+            runtime::nested::with_receive_restore(handle, |scope, permit| {
+                // Settlement certifies the captured child lifetime. Its current row may have retired
+                // or been reused after ACK; re-admission cannot revoke that exact settled receipt.
+                let dispatch = scope.dispatch();
+                let lane = dispatch.lane();
+                let key = nt_component_suspension::SuspensionKey::receive(
+                    permit.admission_key().admission_sequence(),
+                );
+                let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);
+                let frame = lanes
+                    .frame(lane, key)
+                    .map_err(|_| runtime::Error::Admission)?
+                    .ok_or(runtime::Error::Admission)?
+                    .clone();
+                let ComponentNativeContinuation::Hosted(continuation) = frame.continuation else {
+                    return Err(runtime::Error::Admission);
+                };
+                let PendingComponentDispatch::Receive(pending) = continuation.pending else {
+                    return Err(runtime::Error::Admission);
+                };
+                if pending.yielded.parent != scope.identity()
+                    || pending.yielded.child != permit.admission_key()
+                    || pending.yielded.owner != frame.owner
+                    || !continuation.return_target.can_resume()
+                    || !win32k_glue::win32k_client_context_is_admitted(pending.client)
+                {
+                    return Err(runtime::Error::Admission);
+                }
+                let binding = lanes.binding(lane).map_err(|_| runtime::Error::Admission)?;
+                Ok((lane, binding, dispatch, frame, continuation, pending))
+            })
+            .ok()?;
+        let callback_transfer = component_callback_transfer::CallbackTransfer::reserve().ok()?;
+        let resume = runtime::nested::with_receive_restore(handle, |scope, permit| {
+            // Internal readiness only: no completion value is delivered to a provider or user.
+            (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                .begin_receive_restore(
+                    scope,
+                    frame.key,
+                    frame.owner,
+                    permit.settlement(),
+                    ComponentSuspensionCompletion::receive_ready(),
+                )
+                .map_err(|_| runtime::Error::Admission)
+        })
+        .ok()?;
+        Some((
+            lane,
+            binding,
+            dispatch,
+            frame,
+            continuation,
+            pending,
+            callback_transfer,
+            resume,
+        ))
+    })();
+    let Some((lane, binding, dispatch, frame, continuation, pending, callback_transfer, resume)) =
+        prepared
+    else {
+        return Some(boundary);
+    };
+    let pump_completion = match win32k_glue::resume_suspended_receive_component(pending, boundary) {
+        win32k_glue::ReceivePumpCompletion::Restored(completion) => completion,
+        win32k_glue::ReceivePumpCompletion::Reparked(next) => {
+            assert!(
+                next.yielded.replaces == Some(frame.key) && next.yielded.owner == frame.owner,
+                "Receive repark retains the original exact continuation owner"
+            );
+            let next_key = component_suspension_key(PendingComponentDispatch::Receive(next));
+            let sequence = next_dispatcher_wait_sequence();
+            let next_continuation = ComponentNativeContinuation::Hosted(HostedNativeContinuation {
+                pending: PendingComponentDispatch::Receive(next),
+                return_target: continuation.return_target,
+            });
+            runtime::with_bound_receive_scope(next.yielded.parent, |scope| {
+                (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                    .rearm_receive_owned(
+                        scope,
+                        frame.key,
+                        next_key,
+                        sequence,
+                        frame.owner,
+                        next.yielded.child,
+                        next_continuation,
+                    )
+                    .map(|_| ())
+                    .map_err(|_| runtime::Error::Admission)
+            })
+            .expect(
+                "Receive repark retains both sealed child and original continuation on refusal",
+            );
+            return None;
+        }
+        win32k_glue::ReceivePumpCompletion::Deferred(boundary) => {
+            // No callback input or capability has been captured into this reserved storage.
+            // The exact Parent, child permit and Resuming frame remain retained by their owners.
+            return Some(boundary);
+        }
+    };
+    let pump_completion = match pump_completion {
+        win32k_glue::ProviderWaitPumpCompletion::Completed(dispatch) => {
+            ComponentPumpCompletion::Completed(dispatch)
+        }
+        win32k_glue::ProviderWaitPumpCompletion::Reparked(pending) => {
+            ComponentPumpCompletion::Reparked(PendingComponentDispatch::Provider(pending))
+        }
+        win32k_glue::ProviderWaitPumpCompletion::LpcReparked(pending) => {
+            ComponentPumpCompletion::Reparked(PendingComponentDispatch::Lpc(pending))
+        }
+        win32k_glue::ProviderWaitPumpCompletion::UserCallbackSuspended => {
+            ComponentPumpCompletion::UserCallbackSuspended
+        }
+        win32k_glue::ProviderWaitPumpCompletion::Failed(status) => {
+            ComponentPumpCompletion::Failed(status)
+        }
+    };
+    let outcome = finish_hosted_resume(
+        nt_handler,
+        lane,
+        binding,
+        dispatch,
+        resume,
+        frame,
+        continuation,
+        callback_transfer,
+        pump_completion,
+    );
+    assert!(
+        outcome.is_some(),
+        "restored Receive retains its terminal or re-wait owner"
+    );
+    None
+}
+
+unsafe fn finish_hosted_resume(
+    nt_handler: *mut ExecNtHandler,
+    lane: nt_component_suspension::LaneHandle,
+    original_binding: nt_component_suspension::LaneBinding,
+    admitted_dispatch: nt_component_suspension::LaneDispatchIdentity,
+    resume: nt_component_suspension::SuspensionResume<ComponentSuspensionCompletion>,
+    frame: nt_component_suspension::SuspensionFrame<
+        ComponentNativeContinuation,
+        ComponentSuspensionCompletion,
+    >,
+    continuation: HostedNativeContinuation,
+    mut callback_transfer: component_callback_transfer::CallbackTransfer,
+    pump_completion: ComponentPumpCompletion,
+) -> Option<ComponentSuspensionRuntimeOutcome> {
     // An authenticated interim Call may replace the lane's Reply while the provider runs.
     // Its dispatch epoch and physical executor remain the same, but the pre-pump Reply is stale.
     let current_binding = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
         .binding(lane)
         .expect("provider return retains its exact lane");
-    assert_eq!(current_binding.executor_id, lane_resume.binding.executor_id);
-    assert_eq!(current_binding.receive_endpoint, lane_resume.binding.receive_endpoint);
+    assert_eq!(current_binding.executor_id, original_binding.executor_id);
+    assert_eq!(
+        current_binding.receive_endpoint,
+        original_binding.receive_endpoint
+    );
     let dispatch = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
         .active_dispatch_identity(lane)
         .expect("provider return retains its dispatch identity")
@@ -298,6 +478,9 @@ pub(crate) unsafe fn run_hosted(
                     ) {
                         return Some(ComponentSuspensionRuntimeOutcome::Parked);
                     }
+                }
+                PendingComponentDispatch::Receive(_) => {
+                    unreachable!("Receive is not a readiness wait")
                 }
             }
         }

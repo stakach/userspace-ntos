@@ -325,10 +325,30 @@ pub fn encode_file_all_io_manager_information(
     if output.len() < FILE_ALL_INFORMATION_MINIMUM_LENGTH {
         return Err(STATUS_INFO_LENGTH_MISMATCH);
     }
-    encode_query_information(FILE_ACCESS_INFORMATION, metadata, &mut output[76..80])?;
-    encode_query_information(FILE_MODE_INFORMATION, metadata, &mut output[88..92])?;
-    encode_query_information(FILE_ALIGNMENT_INFORMATION, metadata, &mut output[92..96])?;
+    encode_query_information(FILE_ACCESS_INFORMATION, metadata, &mut output[FILE_ALL_ACCESS_OFFSET..FILE_ALL_ACCESS_OFFSET + 4])?;
+    encode_query_information(FILE_MODE_INFORMATION, metadata, &mut output[FILE_ALL_MODE_OFFSET..FILE_ALL_MODE_OFFSET + 4])?;
+    encode_query_information(FILE_ALIGNMENT_INFORMATION, metadata, &mut output[FILE_ALL_ALIGNMENT_OFFSET..FILE_ALL_ALIGNMENT_OFFSET + 4])?;
     Ok(3 * core::mem::size_of::<u32>())
+}
+
+const FILE_ALL_ACCESS_OFFSET: usize = 76;
+const FILE_ALL_MODE_OFFSET: usize = 88;
+const FILE_ALL_ALIGNMENT_OFFSET: usize = 92;
+
+/// Preserve the manager-owned fields seeded before filesystem FileAll dispatch. All other
+/// metadata, including the filesystem's current position, remains unchanged.
+pub fn capture_file_all_io_manager_information(
+    input: &[u8],
+    metadata: &mut QueryMetadata,
+) -> Result<(), u32> {
+    if input.len() < FILE_ALL_INFORMATION_MINIMUM_LENGTH {
+        return Err(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let read = |offset| u32::from_le_bytes(input[offset..offset + 4].try_into().unwrap());
+    metadata.access_flags = read(FILE_ALL_ACCESS_OFFSET);
+    metadata.mode = read(FILE_ALL_MODE_OFFSET);
+    metadata.alignment_requirement = read(FILE_ALL_ALIGNMENT_OFFSET);
+    Ok(())
 }
 
 const fn normalized_file_attributes(metadata: QueryMetadata) -> u32 {

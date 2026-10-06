@@ -296,7 +296,7 @@ fn registry_preparation_oom_and_revalidation_keep_pending_ownership() {
     partial.memory_progress.retain_empty_slot(601).unwrap();
     let mut registry = ClientFrameRegistry::new();
     registry
-        .insert(2, MEMORY_PROCESS, 0x1000, 200, 0, 201, 202, false)
+        .insert(2, MEMORY_PROCESS, 0x1000, 100, 0, 201, 202, false)
         .unwrap();
     let id = without_allocation(|| slot.retain_failed_construction(ticket, partial)).unwrap();
     {

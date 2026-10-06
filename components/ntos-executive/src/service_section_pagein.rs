@@ -2,6 +2,7 @@
 
 use super::section_retirement::{release_unpublished_section_frame, reserve_pagein_cleanup};
 use super::*;
+use crate::local_section_file;
 use nt_memory_manager::data_section::{
     prepare_data_section_file, read_data_section_page, DataSectionFileInfo, DataSectionFileIo,
     DataSectionReadIo, DATA_PAGE_SIZE, STATUS_IO_DEVICE_ERROR,
@@ -143,6 +144,10 @@ pub(crate) unsafe fn service_generic_section_frame(
     if (&*generic_sections).section_identity(section_index) != Some(identity) {
         return Err(pagein_failure(b"section-identity", identity, nt_fs::STATUS_INVALID_HANDLE));
     }
+    if section.backing.kind == GENERIC_SECTION_BACKING_DISK {
+        let lease = section.backing.local_lease.ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        local_section_file::validate_bound(lease, identity, section.backing)?;
+    }
     let route = if let Some(lease) = section.backing.routed_lease {
         Some(
             crate::hosted_routed_section_capture::route(lease, identity)
@@ -170,6 +175,9 @@ pub(crate) unsafe fn service_generic_section_frame(
     };
     {
         let table = &mut *generic_sections;
+        if let Some(lease) = section.backing.local_lease {
+            local_section_file::validate_bound(lease, identity, section.backing)?;
+        }
         if table.section_identity(section_index) != Some(identity)
             || section.backing.routed_lease.is_some_and(|lease| {
                 crate::hosted_routed_section_capture::route(lease, identity) != route
@@ -191,6 +199,9 @@ pub(crate) unsafe fn service_generic_section_frame(
     if let Some(file_size) = file_size {
         read_data_section_page(page_index, section.size, file_size, &mut bytes, &mut io)
             .map_err(|status| pagein_failure(b"backing-read", identity, status))?;
+    }
+    if let Some(lease) = section.backing.local_lease {
+        local_section_file::validate_bound(lease, identity, section.backing)?;
     }
     if (&*generic_sections).section_identity(section_index) != Some(identity)
         || section.backing.routed_lease.is_some_and(|lease| {

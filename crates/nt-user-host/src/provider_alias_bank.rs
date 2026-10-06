@@ -8,8 +8,12 @@ use crate::thread_rollback::ThreadRollbackId;
 pub mod segment;
 #[path = "thread_provider_alias_journal.rs"]
 pub mod thread_journal;
+#[cfg(test)]
 use alloc::vec::Vec;
 use core::ops::{Index, IndexMut};
+#[path = "provider_alias_storage.rs"]
+mod storage;
+use storage::PageSequence;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProviderAliasRequest {
@@ -154,73 +158,47 @@ struct Slot {
     next_free: Option<usize>,
 }
 
-const SLOT_CHUNK_CAPACITY: usize = 256;
+#[cfg(test)]
+const SLOT_CHUNK_CAPACITY: usize = PageSequence::<Slot>::leaf_capacity();
 
 /// Stable slot storage. Growing the table allocates one bounded chunk and never relocates an
 /// existing generation-bearing slot.
 struct SlotTable {
-    chunks: Vec<Vec<Slot>>,
-    len: usize,
+    values: PageSequence<Slot>,
 }
 
 impl SlotTable {
     const fn new() -> Self {
         Self {
-            chunks: Vec::new(),
-            len: 0,
+            values: PageSequence::new(),
         }
     }
 
     fn len(&self) -> usize {
-        self.len
+        self.values.len()
     }
 
     fn get(&self, index: usize) -> Option<&Slot> {
-        if index >= self.len {
-            return None;
-        }
-        self.chunks
-            .get(index / SLOT_CHUNK_CAPACITY)?
-            .get(index % SLOT_CHUNK_CAPACITY)
+        self.values.get(index)
     }
 
     fn get_mut(&mut self, index: usize) -> Option<&mut Slot> {
-        if index >= self.len {
-            return None;
-        }
-        self.chunks
-            .get_mut(index / SLOT_CHUNK_CAPACITY)?
-            .get_mut(index % SLOT_CHUNK_CAPACITY)
+        self.values.get_mut(index)
     }
 
     fn iter(&self) -> impl Iterator<Item = &Slot> {
-        self.chunks.iter().flat_map(|chunk| chunk.iter())
+        self.values.iter()
     }
 
     fn push(&mut self, slot: Slot, capacity: usize) -> Result<usize, BankError> {
-        if self.len >= capacity {
+        if self.len() >= capacity {
             return Err(BankError::InsufficientResources);
         }
-        if self
-            .chunks
-            .last()
-            .is_none_or(|chunk| chunk.len() == SLOT_CHUNK_CAPACITY)
-        {
-            self.chunks
-                .try_reserve(1)
-                .map_err(|_| BankError::InsufficientResources)?;
-            let mut chunk = Vec::new();
-            chunk
-                .try_reserve_exact(SLOT_CHUNK_CAPACITY)
-                .map_err(|_| BankError::InsufficientResources)?;
-            self.chunks.push(chunk);
-        }
-        let index = self.len;
-        self.chunks
-            .last_mut()
-            .expect("slot chunk reserved")
-            .push(slot);
-        self.len += 1;
+        self.values
+            .try_reserve(1)
+            .map_err(|_| BankError::InsufficientResources)?;
+        let index = self.len();
+        self.values.push(slot);
         Ok(index)
     }
 }
@@ -243,14 +221,14 @@ struct ProcessRows {
     pi: usize,
     process: ProcessIdentity,
     releasing: bool,
-    pages: Vec<(u64, ProviderAliasHandle)>,
+    pages: PageSequence<(u64, ProviderAliasHandle)>,
 }
 
 pub struct ProviderAliasBank {
     slots: SlotTable,
     free_head: Option<usize>,
-    processes: Vec<ProcessRows>,
-    segment_cnodes: Vec<Option<u64>>,
+    processes: PageSequence<ProcessRows>,
+    segment_cnodes: PageSequence<Option<u64>>,
     live: usize,
     segment_slots: u64,
     segment_limit: usize,
@@ -271,9 +249,9 @@ impl ProviderAliasBank {
         Ok(Self {
             slots: SlotTable::new(),
             free_head: None,
-            processes: Vec::new(),
+            processes: PageSequence::new(),
             live: 0,
-            segment_cnodes: Vec::new(),
+            segment_cnodes: PageSequence::new(),
             segment_slots,
             segment_limit: max_segments,
             capacity,
@@ -327,9 +305,11 @@ impl ProviderAliasBank {
         let required = segment + 1;
         if self.segment_cnodes.len() < required {
             self.segment_cnodes
-                .try_reserve_exact(required - self.segment_cnodes.len())
+                .try_reserve(required - self.segment_cnodes.len())
                 .map_err(|_| BankError::InsufficientResources)?;
-            self.segment_cnodes.resize(required, None);
+            while self.segment_cnodes.len() < required {
+                self.segment_cnodes.push(None);
+            }
         }
         Ok(())
     }
@@ -522,7 +502,7 @@ impl ProviderAliasBank {
         let candidate_segment = (candidate_index as u64 / self.segment_slots) as usize;
         self.ensure_segment_metadata(candidate_segment)?;
         // Reserve both ownership indexing and every eventual free publication before effects.
-        let mut new_pages = Vec::new();
+        let mut new_pages = PageSequence::new();
         if let Some(index) = process_index {
             self.processes[index]
                 .pages

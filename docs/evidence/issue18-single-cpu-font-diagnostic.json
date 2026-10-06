@@ -1,0 +1,36 @@
+{
+  "issue": 18,
+  "source_commit": "8520553c1bcfd2c0e5bcfdfe148a36cf7d77c60e",
+  "microkernel_commit": "eeaab1f8ba24e2c9b6bbeaab6b87dd177eb18015",
+  "profile": "font-cleanup",
+  "qemu_cpus": 1,
+  "boot_bound_seconds": 3600,
+  "launcher_exit": 130,
+  "collector_exit": 0,
+  "collector_frames": 32,
+  "collector_final_slot": 1,
+  "termination": "Deliberately stopped the diagnostic with supervisor SIGINT after collecting the first slow process-deletion close and census9. The original deadline was not extended.",
+  "preboot_sha256": {
+    "rootserver": "28dd0c82ed37d7b78b422581a5e489870a25215e9a521fcea80b53965b522baf",
+    "microkernel": "05e4edf2c9c112571663f806ee12a6a6c4b67760c7f404a59f3f8aac4451ee86",
+    "disk": "60dcf525c5c3a115ee7a1dd6b2a0324ebdacf9a665cc354435361443a5abc57b",
+    "ntdll": "5c1a33cb4fbab7d10bb85490c0da83d24beca935487321590e246842fc4aff1c",
+    "font_acceptance": "1729483e54eba2e8b891beeae4dca6d3881f2f1ac45cbce90ba74c4e4908e6f3",
+    "font_run_setup": "f2238bde4b0d68808f01b1e7f5ce95817e03063db1a4616a63d15716e0bb85b5"
+  },
+  "artifact_sha256": {
+    "raw_log": "8c2c48bea6b9d56dc688d218391632747d85454c3b715613b0a6d37e2c7feb69",
+    "archived_log": "521ef0adcc6352c843056f0432aaee6aa46f81a2cdcc1032a352c7a2dc193ed0",
+    "screenshot": "53ad5f5ac610f375103c4b38bc9dcda1b85defd34e60860272a02fff0da0c9cb"
+  },
+  "observations": [
+    "Full fresh native image rebuild exited0, with rootserver and microkernel hashes identical to the preceding four-CPU run. Hardware registry reports1processor. This is a controlled diagnostic, not font or desktop acceptance.",
+    "First slow NtClose followed process18/Hosted13 retirement and cost3327Mtick, versus3439Mtick in the four-CPU run. PID, thread and allocation identities differ dynamically; this is a comparable phase, not exact target identity or a complete performance comparison.",
+    "The early observations do not establish a large improvement from eliminating remote CPU invalidation. Whole-registry cleanup searches remain a source-confirmed candidate; their runtime contribution is not separately measured.",
+    "No strict font PID-QUERY receipt or Explorer execution appeared before the deliberate stop. The final same-run screenshot is background and cursor only."
+  ],
+  "evidence": {
+    "log": "docs/evidence/issue18-single-cpu-font-diagnostic.log.gz",
+    "screenshot": "docs/images/single-cpu-font-diagnostic.png"
+  }
+}

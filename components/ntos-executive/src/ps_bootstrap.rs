@@ -7,8 +7,6 @@ pub(crate) struct PsBootstrapSeed {
     pub ps: nt_user_host::ps_bootstrap::PsBootstrapState,
     pub pids: [nt_process::ProcessId; HOSTED_PROCESS_MANAGER_SEED_COUNT],
     pub main_tids: [nt_process::ThreadId; HOSTED_PROCESS_MANAGER_SEED_COUNT],
-    pub pool_tids:
-        [[nt_process::ThreadId; PM_RUNTIME_THREAD_SLOTS]; HOSTED_PROCESS_MANAGER_SEED_COUNT],
 }
 
 static mut BOOTSTRAP: BootstrapStore<PsBootstrapSeed> = BootstrapStore::new();
@@ -150,7 +148,6 @@ fn seed_processes(entry: u64, parameter: u64) -> Result<PsBootstrapSeed, u32> {
         .expect("bootstrap owns initial System identity");
     let mut pids = [0; HOSTED_PROCESS_MANAGER_SEED_COUNT];
     let mut main_tids = [0; HOSTED_PROCESS_MANAGER_SEED_COUNT];
-    let mut pool_tids = [[0; PM_RUNTIME_THREAD_SLOTS]; HOSTED_PROCESS_MANAGER_SEED_COUNT];
 
     pm.reserve_modules(64);
     pm.reserve_process_capacity(MAX_PI + 1);
@@ -160,10 +157,7 @@ fn seed_processes(entry: u64, parameter: u64) -> Result<PsBootstrapSeed, u32> {
     PM_OBJECT_COUNT.store(0, Ordering::Relaxed);
     PM_INITIAL_SYSTEM_OBJECT_PRESENT.store(0, Ordering::Relaxed);
     PM_DYNAMIC_PROCESS_ALLOCATIONS.store(0, Ordering::Relaxed);
-    PM_PROCESS_SPAWNED_OK.store(0, Ordering::Relaxed);
     PM_IDENTITY_OK.store(0, Ordering::Relaxed);
-    PM_VSPACE_PUBLISHED_OK.store(0, Ordering::Relaxed);
-    reset_hosted_gate_metadata();
     PM_RUNNING_PROCESS_MASK.store(0, Ordering::Relaxed);
     PM_MAIN_THREADS_OK.store(0, Ordering::Relaxed);
     HOSTED_THREAD_RUNTIME_OK.store(0, Ordering::Relaxed);
@@ -190,16 +184,12 @@ fn seed_processes(entry: u64, parameter: u64) -> Result<PsBootstrapSeed, u32> {
     for (pi, &pid) in pids.iter().enumerate() {
         main_tids[pi] = pm.create_thread(pid, 0, 0, false)?;
     }
-    for (pi, &pid) in pids.iter().enumerate() {
-        for slot in 0..PM_RUNTIME_THREAD_SLOTS {
-            pool_tids[pi][slot] = pm.create_dormant_thread(pid)?;
-        }
+    for &pid in &pids {
         pm.reserve_handles(pid, PM_HANDLE_RESERVE);
     }
     Ok(PsBootstrapSeed {
         ps,
         pids,
         main_tids,
-        pool_tids,
     })
 }

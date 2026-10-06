@@ -27,7 +27,7 @@ impl ComponentSchedulerScope {
     pub(crate) unsafe fn service_irq_yield(&self, shared_va: u64) {
         let _message = crate::ipc_message::SavedMessageBuffer::capture();
         let _durable = crate::allocator::enter_durable();
-        let parent = crate::spawn_hosts::shared_ingress::owner::runtime::nested::park_current()
+        let mut parent = crate::spawn_hosts::shared_ingress::owner::runtime::nested::park_current()
             .expect("IRQ scheduling must preserve its exact parent invocation");
         let yield_number = YIELDS.fetch_add(1, Ordering::Relaxed) + 1;
         crate::dispatcher_bootstrap::request_receive_checkpoint();
@@ -66,7 +66,7 @@ impl ComponentSchedulerScope {
             }
             print_str(b"\n");
         }
-        crate::spawn_hosts::shared_ingress::owner::runtime::nested::restore(parent)
+        crate::spawn_hosts::shared_ingress::owner::runtime::nested::restore(&mut parent)
             .expect("IRQ scheduling must restore its retained parent invocation");
     }
 }
@@ -101,13 +101,15 @@ unsafe fn hosted_component_pump_inner(
     use crate::spawn_hosts::shared_ingress::owner::runtime;
     let mut channel = *channel;
     let route = runtime::channel_route(&channel).expect("physical hosted ingress identity");
-    let parent = if channel.initial == crate::spawn_hosts::InitialAction::ReplyRequest {
+    let mut parent = if channel.initial == crate::spawn_hosts::InitialAction::ReplyRequest {
         let parent = runtime::nested::park_current().expect("retain nested hosted parent");
         let route = route.expect("hosted dispatch requires enrolled source");
         runtime::admit(route).expect("admit exact hosted dispatch Call");
         channel.reply_cap = runtime::current_reply(route).expect("admitted canonical Reply");
         parent
-    } else { None };
+    } else {
+        None
+    };
     let channel = &mut channel;
     let _registry_caller = caller.map(|caller| {
         crate::provider_registry_caller::Scope::enter(channel, caller)
@@ -128,9 +130,21 @@ unsafe fn hosted_component_pump_inner(
     if result.completed {
         let route = route.expect("hosted completion requires enrolled source");
         let dispatch = runtime::dispatch(route).expect("retained hosted dispatch epoch");
-        runtime::complete(route, dispatch, result.reply_cap, channel.dispatch_label)
-            .expect("authenticate hosted final completion Call");
+        if let Some(words) = result.startup_stack_receipt {
+            assert!(
+                crate::driver_launch::hosted_source_completion_lane::validate_startup_ready(
+                    channel, words
+                ),
+                "authenticate exact retained hosted worker READY"
+            );
+            let reply = runtime::current_reply(route).expect("current canonical startup Reply");
+            runtime::complete_protocol(route, dispatch, reply, channel.dispatch_label, &words)
+                .expect("settle exact hosted worker startup protocol");
+        } else {
+            runtime::complete(route, dispatch, result.reply_cap, channel.dispatch_label)
+                .expect("authenticate hosted final completion Call");
+        }
     }
-    runtime::nested::restore(parent).expect("restore nested hosted parent");
+    runtime::nested::restore(&mut parent).expect("restore nested hosted parent");
     result
 }

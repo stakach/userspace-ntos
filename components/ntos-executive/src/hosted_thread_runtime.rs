@@ -12,6 +12,10 @@ mod memory_retirement;
 pub(crate) struct HostedThreadRuntimeOwner {
     runtime: HostedThreadRuntime,
     pub(crate) suspension: crate::thread_suspend::HostedThreadSuspend,
+    pub(crate) initial_creation: core::cell::RefCell<
+        Option<crate::exec_handler::initial_thread_creation::PendingInitialThreadCreation>,
+    >,
+    fresh_creation: core::cell::RefCell<Option<nt_process::FreshHostedThreadPreparation>>,
     memory_coverage: nt_user_host::thread_construction::MemoryConstructionCoverage<TP_WORKER_STACK_FRAME_COUNT>,
     registered_memory: Option<nt_user_host::thread_construction::RegisteredThreadMemory>,
     registry_preparation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation<TP_WORKER_STACK_FRAME_COUNT>,
@@ -27,6 +31,8 @@ impl HostedThreadRuntimeOwner {
         Self {
             runtime,
             suspension: crate::thread_suspend::HostedThreadSuspend::new(),
+            initial_creation: core::cell::RefCell::new(None),
+            fresh_creation: core::cell::RefCell::new(None),
             memory_coverage: nt_user_host::thread_construction::MemoryConstructionCoverage::empty(),
             registered_memory: None,
             registry_preparation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation::empty(),
@@ -39,7 +45,10 @@ impl HostedThreadRuntimeOwner {
     }
 
     fn construction_is_empty(&self) -> bool {
-        self.suspension.is_empty() && self.memory_coverage.is_empty()
+        self.suspension.is_empty()
+            && self.initial_creation.try_borrow().is_ok_and(|owner| owner.is_none())
+            && self.fresh_creation.try_borrow().is_ok_and(|owner| owner.is_none())
+            && self.memory_coverage.is_empty()
             && !self.registry_preparation.is_prepared() && self.alias_preparation.get().is_none()
             && self.prefetch_preparation.get().is_none()
             && self.provider_preparation.get().is_none()
@@ -426,7 +435,7 @@ impl HostedThreadRuntimeTable {
         for cap in mechanisms.entries().filter_map(|(_, state)| state.slot()) {
             if (construction_retirement.is_some() && owner.memory_coverage.empty_slot() == Some(cap))
                 || snapshot.rollback_resources().iter().any(|resource| resource.cap == cap)
-                || registry.records().iter().any(|record|
+                || registry.records().any(|record|
                     [record.frame, record.alias_cap, record.source_cap].contains(&cap))
             {
                 return Err(ThreadReconciliationError::OwnershipConflict);
@@ -495,7 +504,7 @@ impl HostedThreadRuntimeTable {
             return Err(ThreadReconciliationError::OwnershipConflict);
         }
         for cap in aliases.capabilities().chain(prefetch.capabilities()).chain(provider.root_capabilities()) {
-            if registry.records().iter().any(|record|
+            if registry.records().any(|record|
                     [record.frame, record.alias_cap, record.source_cap].contains(&cap))
             {
                 return Err(ThreadReconciliationError::OwnershipConflict);
@@ -885,6 +894,15 @@ pub(crate) fn hosted_thread_memory_access(pi: u64, base: u64, size: u64) -> Resu
 /// and live scratch aliases. Ordinary reads, mappings and writes use the stricter entry above.
 pub(crate) fn hosted_thread_memory_retirement_access(pi: u64, base: u64, size: u64) -> Result<(), u32> {
     use nt_user_host::thread_memory_access::{check_pending_thread_memory, PendingThreadMemory};
+    if !crate::exec_handler::private_residency::memory_available(pi, base, size) {
+        return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
+    }
+    if !crate::native_image_residency::memory_available(pi, base, size) {
+        return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
+    }
+    if !crate::transition_page_restoration::memory_available(pi, base, size) {
+        return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
+    }
     if !crate::temporary_frame_alias::memory_available(pi, base, size) {
         return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
     }
@@ -927,6 +945,20 @@ pub(crate) struct HostedThreadRuntimes {
 }
 
 impl HostedThreadRuntimes {
+    pub(crate) fn retain_fresh_construction(
+        &mut self,
+        preparation: nt_process::FreshHostedThreadPreparation,
+    ) {
+        let lifetime = preparation.lifetime();
+        let owner = unsafe { (&*self.table).entries.iter()
+            .filter_map(RuntimeSlot::owner)
+            .find(|owner| owner.tid == u64::from(lifetime.thread_id())
+                && owner.process.pid == lifetime.process_id()) }
+            .expect("uncertain construction retains its exact runtime owner");
+        let mut held = owner.fresh_creation.borrow_mut();
+        assert!(held.is_none(), "fresh construction ownership transfers once");
+        *held = Some(preparation);
+    }
     pub(crate) fn admit_ingress(
         &self,
         badge: u64,
@@ -1075,7 +1107,7 @@ impl HostedThreadRuntimes {
     /// free reservation release. Failed construction never committed an MM/job charge.
     pub(crate) unsafe fn advance_failed_construction(
         &mut self, index: usize, id: nt_user_host::thread_rollback::ThreadRollbackId,
-    ) -> Result<HostedThreadRuntime, u32> {
+    ) -> Result<(HostedThreadRuntime, Option<nt_process::FreshHostedThreadPreparation>), u32> {
         let _durable = allocator::enter_durable();
         let table = &mut *self.table;
         let result = (|| {
@@ -1101,7 +1133,7 @@ impl HostedThreadRuntimes {
             memory_retirement::prepare(slot, id)?;
             memory_retirement::advance(slot, id)?;
             let owner = slot.take_retired_payload(id).ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
-            Ok(owner.runtime)
+            Ok((owner.runtime, owner.fresh_creation.into_inner()))
         })();
         if let Some(pending) = table.entries.get(index).and_then(RuntimeSlot::pending)
             .filter(|pending| pending.id() == id)
@@ -1235,6 +1267,7 @@ impl RuntimeIdentity for HostedThreadRuntimeOwner {
 
     fn control_busy(&self) -> bool {
         self.suspension.is_pending()
+            || self.initial_creation.try_borrow().map_or(true, |owner| owner.is_some())
     }
 }
 
@@ -1274,6 +1307,9 @@ pub(crate) fn check_user_stack_retirement_access(
 
 impl RuntimeTcbProjection for HostedThreadRuntimeOwner {
     fn clear_retired_tcb_projection(&mut self, expected_cap: u64) -> Result<(), u32> {
+        if self.initial_creation.try_borrow().map_or(true, |owner| owner.is_some()) {
+            return Err(nt_process::STATUS_DEVICE_BUSY);
+        }
         if expected_cap <= 1 || (self.runtime.tcb != expected_cap && self.runtime.tcb != 1) {
             return Err(nt_address_space::STATUS_INVALID_PARAMETER);
         }

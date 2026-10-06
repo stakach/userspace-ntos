@@ -5,7 +5,7 @@ use nt_component_suspension::{LaneResume, ResumeDemand, ResumePass, ResumeWake, 
 
 #[path = "component_resume_execute.rs"]
 mod execute;
-pub(super) use execute::run_hosted;
+pub(super) use execute::{run_hosted, run_receive};
 
 #[path = "component_resume_bootstrap.rs"]
 mod bootstrap;

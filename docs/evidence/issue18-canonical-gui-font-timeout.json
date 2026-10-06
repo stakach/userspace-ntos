@@ -1,0 +1,45 @@
+{
+  "issue": 18,
+  "source_commit": "e1563b467e938443b5c9aaf819af65c9b2b144ab",
+  "microkernel_commit": "2debcee98856ea648924c9ddf0c20a491750668b",
+  "profile": "font-cleanup",
+  "boot_bound_seconds": 3600,
+  "build_exit": 0,
+  "launcher_exit": 124,
+  "collector_exit": 0,
+  "collector_frames": 359,
+  "collector_final_slot": 0,
+  "image_matched_font_parser_exit": 1,
+  "exact_head_ci": 37452657959,
+  "termination": "The original one-hour deadline expired during real setup component registration. Guest and collector final exits were consumed before running the strict font parser or any later local suite. Source-only returned-buffer policy work prepared after launch is not part of this image.",
+  "preboot_sha256": {
+    "rootserver": "b5d3a92d6a2553edd743814e97d272400112c98a1bcafeac4e0a972070178235",
+    "microkernel": "fc0e1ca81c3130a8603f879771ff819edf9dc3fd5a59da2eb7a4d83790d9bb37",
+    "staged_esp_kernel": "f148ca228efcb73aa79fc50729d2ab2833a1665ec583087468c8190028258503",
+    "disk": "7c19d14944723753849c3d8b3da20dfc785be598c9bc9d0e6c8339dd6f018f4b",
+    "ntdll": "5c1a33cb4fbab7d10bb85490c0da83d24beca935487321590e246842fc4aff1c",
+    "font_acceptance": "1729483e54eba2e8b891beeae4dca6d3881f2f1ac45cbce90ba74c4e4908e6f3",
+    "font_run_setup": "f2238bde4b0d68808f01b1e7f5ce95817e03063db1a4616a63d15716e0bb85b5"
+  },
+  "artifact_sha256": {
+    "raw_log": "adec4ee2a5cabf834c0112312503aa76fdfd8b228cd9c2201724c0485efb029a",
+    "archived_log": "ff284d5583e49e396f0ea92f4adb219b5de78a19455d9ece1789cf2d9023f3ac",
+    "collector_log": "ee2eb870323772c36af16a39e0455439b7cfdb4f11b5a6edf85046771dc10410",
+    "archived_collector_log": "2e2265f5bf772bae0c9e6a88ac11b6e793c8bcd6d1ee01a03a2ebca114c37cf9",
+    "screenshot": "53ad5f5ac610f375103c4b38bc9dcda1b85defd34e60860272a02fff0da0c9cb"
+  },
+  "observations": [
+    "The genuine BootExecute font-setup fixture registered and read back its Run entry, then terminated. Font-acceptance PID-QUERY never appeared; the strict parser failed for missing execution. The explicitly inspected final screenshot contains only background and cursor, not Explorer chrome.",
+    "Canonical GUI contexts ran for CSRSS, Winlogon, setup and real helper processes, including actual user callback resume. No supplied-body mismatch, GUI context initialization failure or terminal provider-bugcheck was observed. This is native context coverage, not font terminal cleanup or desktop acceptance.",
+    "Windowed missing-value observations continued through window60/lifetime receipt847. Exact installer-child DeviceDesc misses include HTREE root at58985, NIC at81059, PCI host at86762, display at92437 and SATA at98136. Their counted complete Enum paths join the preceding install path and real child PID/TID; status is C0000034 followed by DevInstallW error2. ReactOS SetupAPI/newdev source matches early property-query cleanup before INF search. No explicit user-mode API-return receipt or LocationInformation miss is claimed.",
+    "Keyboard and mouse critical-load attempts at3436-3457 rejected i8042prt.sys on unresolved IoStartNextPacket before DriverEntry. The repeated input.c UNSUCCESSFUL messages do not prove failed reads: initialized statuses can be logged while both handles are absent, and the thread still waits on Shutdown/MasterTimer. Issue283 remains a real native import/StartIo integration gap.",
+    "Actual final device-install helper PI17/PID1476/generation97 committed exit0 at546085 and retired at546335. Zero helper exit is not successful installation. Setup PID256/TID260 continued real registry operations, including class and component-registration paths, until the boot deadline.",
+    "Final census118 reports heap watermark55704896/live55410400, reusable1212552/largest918056, scratch peak1728888/4194304; disk read1003122attempts/2527680sectors, write507018attempts/2021160sectors and4617barriers with recorded failures zero. These aggregate counters neither prove wall-clock dominance nor passage of the exact former60528-byte allocation operation.",
+    "Full native build and exact-head crate CI passed for e1563b46. Separate fresh production Userinit/Explorer and strict private-font lifetime acceptance remain required; issue18 stays open. The newly researched returned-buffer contract and caller-IRP pool-free admission fix were not integrated in this guest."
+  ],
+  "evidence": {
+    "log": "docs/evidence/issue18-canonical-gui-font-timeout.log.gz",
+    "collector_log": "docs/evidence/issue18-canonical-gui-font-timeout-qmp.log.gz",
+    "screenshot": "docs/images/canonical-gui-font-timeout.png"
+  }
+}

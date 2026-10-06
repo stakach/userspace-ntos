@@ -84,7 +84,13 @@ impl ProcessVmRetirementIo for FinalProcessVm<'_> {
                 },
                 vspace: WIN32K_HOST_PML4.load(Ordering::Acquire),
             };
+            if transition_page_restoration::drain_process(self.handler, pi, owner.process).is_err() {
+                return false;
+            }
             if win32k_glue::detach_attached_client_process(owner).is_err() {
+                return false;
+            }
+            if self.handler.retire_native_image_views_for_process(pi, owner.process).is_err() {
                 return false;
             }
             let sections = &mut *ctx.generic_sections;
@@ -143,11 +149,16 @@ impl ProcessVmRetirementIo for FinalProcessVm<'_> {
             if !kuser_page_alias_release(pi) || kuser_page_alias_get(pi) != 0 {
                 return false;
             }
-            if let Some(owner) = self.handler.process_vspace_caps[pi].as_mut() {
-                if !release_sec_image_vspace_leaves(owner) {
+            let mut update = match self.handler.process_vspace_caps.begin_update(pi, owner.process) {
+                Ok(update) => update,
+                Err(_) => return false,
+            };
+            if let Some(update) = update.as_mut() {
+                if !release_sec_image_vspace_leaves(update.caps_mut()) {
                     return false;
                 }
             }
+            drop(update);
             // Transition backing is physical ownership, not metadata cleanup. Complete it while
             // a failure can still retain the exact process and its page tables/VSpace.
             process_working_set_retire_for(pi, owner.process, self.handler).is_ok()
@@ -157,23 +168,12 @@ impl ProcessVmRetirementIo for FinalProcessVm<'_> {
     fn retire_page_tables(&mut self) -> bool {
         unsafe {
             let pi = self.candidate.pi;
-            let ctx = self
-                .handler
-                .loop_ctx
-                .expect("retirement retains the VM owner context");
-            let paging = &mut *ctx.dll_arena_paging;
-            let pd = paging.pd_cap(pi);
-            if pd != 0 {
-                if cnode_delete_recycle_r(pd) != 0 {
-                    return false;
-                }
-                assert!(paging.clear_process_exact(pi, pd));
-            }
             let (_, failures) = process_user_page_tables_release(pi, self.handler);
             failures == 0
                 && (&*core::ptr::addr_of!(PROCESS_USER_PAGE_TABLES))
                     .first_for_process(pi as u64)
                     .is_none()
+                && user_image_paging::retire_process_user_paging_parents(self.handler, pi).is_ok()
         }
     }
 
@@ -181,7 +181,7 @@ impl ProcessVmRetirementIo for FinalProcessVm<'_> {
         let pi = self.candidate.pi;
         // A process can exit before publishing a VSpace. Empty physical ownership still needs
         // logical retirement; never skip that work just because the published root is zero.
-        if self.handler.process_vspace_caps[pi].is_none() {
+        if matches!(self.handler.process_vspace_caps.get(pi), Some(None)) {
             return self.handler.process_vspaces[pi] == 0;
         }
         unsafe { self.handler.release_hosted_process_vspace_caps(pi) }

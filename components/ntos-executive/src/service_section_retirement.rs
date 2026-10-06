@@ -1,5 +1,6 @@
 //! Section resource release after explicit view/handle retirement.
 use super::*;
+use crate::local_section_file;
 use nt_memory_manager::{GenericSectionBacking, PendingSectionFrames, SectionRetirementIo};
 
 static mut PENDING_PAGEIN_FRAMES: PendingSectionFrames = PendingSectionFrames::new();
@@ -14,12 +15,14 @@ pub(super) unsafe fn reserve_pagein_cleanup() -> Result<(), u32> {
 
 pub(super) unsafe fn release_unpublished_section_frame(frame: u64) {
     (&mut *core::ptr::addr_of_mut!(PENDING_PAGEIN_FRAMES))
-        .release_or_defer(frame, &mut RetirementIo);
+        .release_or_defer(frame, &mut RetirementIo { files: None });
 }
 
-struct RetirementIo;
+struct RetirementIo<'a> {
+    files: Option<&'a mut crate::ExecReadOnlyFileOpens>,
+}
 
-impl SectionRetirementIo for RetirementIo {
+impl SectionRetirementIo for RetirementIo<'_> {
     fn release_frame(&mut self, frame: u64) -> Result<(), u32> {
         unsafe {
             frame_recycle::prepare(frame)?;
@@ -47,7 +50,12 @@ impl SectionRetirementIo for RetirementIo {
                 let lease = backing.routed_lease.ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
                 crate::hosted_routed_section_capture::release(lease, identity)
             },
-            nt_memory_manager::GENERIC_SECTION_BACKING_ANON | GENERIC_SECTION_BACKING_DISK => Ok(()),
+            GENERIC_SECTION_BACKING_DISK => unsafe {
+                let lease = backing.local_lease.ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                let files = self.files.as_deref_mut().ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                local_section_file::release_bound(files, lease, identity)
+            },
+            nt_memory_manager::GENERIC_SECTION_BACKING_ANON => Ok(()),
             _ => Err(nt_fs::STATUS_INVALID_HANDLE),
         }
     }
@@ -57,8 +65,19 @@ pub(crate) unsafe fn service_drain_section_retirement(
     table: &mut GenericSectionTable,
 ) -> Result<(), u32> {
     section_scratch::drain_section_scratch()?;
-    (&mut *core::ptr::addr_of_mut!(PENDING_PAGEIN_FRAMES)).drain(&mut RetirementIo)?;
-    table.drain_retired(&mut RetirementIo)
+    let mut io = RetirementIo { files: None };
+    (&mut *core::ptr::addr_of_mut!(PENDING_PAGEIN_FRAMES)).drain(&mut io)?;
+    table.drain_retired(&mut io)
+}
+
+pub(crate) unsafe fn service_drain_section_retirement_for_handler(
+    table: &mut GenericSectionTable,
+    handler: &mut ExecNtHandler,
+) -> Result<(), u32> {
+    section_scratch::drain_section_scratch()?;
+    let mut io = RetirementIo { files: Some(&mut handler.readonly_file_opens) };
+    (&mut *core::ptr::addr_of_mut!(PENDING_PAGEIN_FRAMES)).drain(&mut io)?;
+    table.drain_retired(&mut io)
 }
 
 /// Detach every page, not just dirty writeback pages, before the view identity is discarded.

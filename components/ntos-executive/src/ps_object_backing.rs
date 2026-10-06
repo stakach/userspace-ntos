@@ -721,7 +721,7 @@ pub(super) unsafe fn publish_prepared_pair(
         .existing(BodyId::Thread(lifetime.thread_id()))
         .ok_or(INVALID)?;
     if [process, thread].into_iter().any(|index| {
-        matches!(arena.rows[index].phase, BodyPhase::Retiring { .. })
+        !matches!(arena.rows[index].phase, BodyPhase::Prepared | BodyPhase::Published)
             || !arena.rows[index].page.is_initialized()
     }) || arena.rows[thread].current_thread_lifetime != Some(lifetime)
     {
@@ -760,72 +760,9 @@ pub(super) unsafe fn publish_system_worker(
     Ok(())
 }
 
-/// Commit PM activation and refresh its stable body without an intervening provider entry.
-///
-/// # Safety
-/// The target TCB remains suspended. Every old-activation execution/request reference is drained;
-/// the alias owner separately proves that even failed non-root mapping candidates are gone.
-pub(super) unsafe fn commit_thread_activation(
-    pm: &mut ProcessManager,
-    plan: nt_process::ThreadActivationPlan,
-    handle: nt_process::HandleReservation,
-) -> Result<(), u32> {
-    let _borrow = Borrow::acquire()?;
-    let arena = (&mut *core::ptr::addr_of_mut!(ARENA))
-        .as_mut()
-        .ok_or(INVALID)?;
-    arena.validate(pm)?;
-    let Some(index) = arena.existing(BodyId::Thread(plan.thread_id())) else {
-        if pm
-            .thread_kernel_object(plan.thread_id())
-            .is_some_and(contains_address)
-        {
-            return Err(INVALID);
-        }
-        return pm.commit_thread_activation_with_handle(plan, handle);
-    };
-    let row = &mut arena.rows[index];
-    let body = row.page.descriptor().address;
-    if !matches!(row.phase, BodyPhase::Prepared | BodyPhase::Published)
-        || !row.page.is_initialized()
-        || row.current_thread_lifetime != Some(plan.expected_lifetime())
-        || pm.thread_kernel_object(plan.thread_id()) != match row.phase {
-            BodyPhase::Prepared => None,
-            BodyPhase::Published => Some(body),
-            BodyPhase::Retiring { .. } => return Err(INVALID),
-        }
-        || row
-            .page
-            .live_alias(MappingTarget::Executive(arena.root))
-            .is_none()
-        || !row.page.non_root_aliases_drained()
-    {
-        return Err(INVALID);
-    }
-    let Initialization::Thread { mut fields, .. } = row.page.descriptor().initialization else {
-        return Err(INVALID);
-    };
-    if pm.process_kernel_object(plan.process_id()) != Some(fields.process_body.0) {
-        return Err(INVALID);
-    }
-    fields.teb = GuestAddr(plan.teb_base());
-    fields.system_thread = pm.thread(plan.thread_id()).ok_or(INVALID)?.is_system_thread;
-    let bytes = core::slice::from_raw_parts_mut(body as *mut u8, abi::ETHREAD_BODY_BYTES);
-    abi::validate_thread_activation(bytes, fields).map_err(|_| INVALID)?;
-    match row.phase {
-        BodyPhase::Prepared => {
-            pm.commit_thread_activation_with_handle_and_object(plan, handle, body)?;
-        }
-        BodyPhase::Published => pm.commit_thread_activation_with_handle(plan, handle)?,
-        BodyPhase::Retiring { .. } => unreachable!(),
-    }
-    // Both owners remain exclusively borrowed. No allocation, syscall or provider byte write can
-    // invalidate the preflight between PM generation publication and these bounded field writes.
-    abi::refresh_thread_activation(bytes, fields).expect("exclusive prevalidated ETHREAD refresh");
-    row.current_thread_lifetime = pm.thread_lifetime(plan.thread_id());
-    row.phase = BodyPhase::Published;
-    Ok(())
-}
+#[path = "ps_object_backing/thread_activation.rs"]
+mod thread_activation;
+pub(super) use thread_activation::commit_thread_activation;
 
 /// Physical cleanup has completed, but the arena still owns the virtual-address reservations.
 /// Dropping this receipt does not release them. The PM withdrawal owner retains this receipt

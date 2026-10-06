@@ -252,16 +252,37 @@ impl<D, L: Copy + Eq> OwnedObjectPage<D, L> {
         let Some(row) = self.aliases.iter_mut().find(|row| row.target == target) else {
             return Ok(());
         };
+        Self::retire_alias_row(row, self.frame.unwrap_or(0), io)
+    }
+
+    fn retire_alias_row(
+        row: &mut Alias<L>,
+        frame: u64,
+        io: &mut impl ObjectPageIo<D, L>,
+    ) -> Result<(), u32> {
         if row.transition.is_empty() {
             return Ok(());
         }
         let mut adapter = Io {
             backend: io,
-            frame: self.frame.unwrap_or(0),
-            target,
+            frame,
+            target: row.target,
             descriptor: core::marker::PhantomData::<D>,
         };
         row.transition.retire(&mut adapter)
+    }
+
+    /// Drain every nonroot alias without withdrawing the canonical body or its root access.
+    /// The caller must fence old-lifetime grants and execution until all cleanup succeeds.
+    /// Failed prefixes retain their transition ownership; retry never repeats acknowledged
+    /// cleanup. A fresh alias may be authorized afterwards unless whole retirement has started.
+    pub fn retire_non_root_aliases(&mut self, io: &mut impl ObjectPageIo<D, L>) -> Result<(), u32> {
+        for row in &mut self.aliases {
+            if row.target != self.root_target {
+                Self::retire_alias_row(row, self.frame.unwrap_or(0), io)?;
+            }
+        }
+        Ok(())
     }
 
     /// Caller first withdraws pointer/execution admission. This permanently withdraws alias
@@ -275,13 +296,7 @@ impl<D, L: Copy + Eq> OwnedObjectPage<D, L> {
                 if (row.target == self.root_target) != root_pass {
                     continue;
                 }
-                let mut adapter = Io {
-                    backend: io,
-                    frame: self.frame.unwrap_or(0),
-                    target: row.target,
-                    descriptor: core::marker::PhantomData::<D>,
-                };
-                row.transition.retire(&mut adapter)?;
+                Self::retire_alias_row(row, self.frame.unwrap_or(0), io)?;
             }
         }
         if let Some(frame) = self.frame {

@@ -50,7 +50,6 @@ pub unsafe extern "C" fn storage_host_entry(heap_frames: u64) -> ! {
         NLS_ANSI_VADDR,
         NLS_OEM_VADDR,
         NLS_CASE_VADDR,
-        NLS_20127_VADDR,
         WIN32KBUF_VADDR,
         WINLOGONBUF_VADDR,
     );

@@ -1,0 +1,30 @@
+{
+  "native_commit": "90a13b2378fe0af7a9f647471509c03db879c0ef",
+  "microkernel_commit": "92c4e2b330019c7c8afb1544b3cbf8ca1219eb73",
+  "profile": "font-cleanup",
+  "command": "env -u NTOS_MUP_PROVIDER_KERNEL_ONLY -u NTDLL_FEATURES NTOS_IMAGE_PROFILE=font-cleanup IMAGE_MIB=256 PERSIST_IMAGE_MIB=16 BOOT_TIMEOUT_SECONDS=3600 RUN_LOG=$PWD/.tmp/issue18-bounded-source-font-boot.log ./run.sh --desktop -qmp unix:$PWD/.tmp/issue18-bounded-source-font-qmp.sock,server=on,wait=off",
+  "boot_limit_seconds": 3600,
+  "termination": "Root stopped QEMU with SIGTERM after identifying the rendered-logon/input frontier; this was not a successful guest verdict.",
+  "launcher_exit": 1,
+  "collector_exit": 0,
+  "collector_frames": 202,
+  "font_parser_exit": 1,
+  "font_parser_failure": "Missing font-acceptance PID-QUERY; Explorer Run-key client did not execute.",
+  "guest_summary": null,
+  "explorer_desktop_proven": false,
+  "screenshot": "../images/logon-bounded-source.png",
+  "screenshot_sha256": "b1df6a76899eb51d4061543cd39aa072f605d36e2028eda9a3e1762e33479889",
+  "root_viewed_screenshot": true,
+  "raw_log_sha256": "934e1daf5b9b68ef677a6ef5ff071b0fbd39fd481577c16460ba97d918c7a248",
+  "archived_log": "issue18-bounded-source-logon.log.gz",
+  "rootserver_sha256": "f05a0970acc84d57cda6ad6815c2072ab5b7824e18b285b3301b22d3138eda7c",
+  "disk_sha256_after_termination": "4f8d2d71f702cc3ee0f6d968f8608a4674918af4a44a08fd8a43f6d2187ca844",
+  "observations": [
+    "Same-run screenshot contains ReactOS Logon banner, credential controls, domain selector and buttons.",
+    "Real winlogon api0 callbacks, nested callbacks, WM_PAINT and NtUserEndPaint executed.",
+    "No executive OOM was recorded in this run; the previous full-source allocation frontier was passed.",
+    "Userinit and Explorer were not created before termination.",
+    "i8042prt import admission rejected unresolved IoStartNextPacket twice; keyboard/mouse reads failed.",
+    "Staged SOFTWARE enables autologon with empty default username/domain/password; source policy rejects empty credentials before authentication. Runtime credential-value attribution is not yet proven."
+  ]
+}

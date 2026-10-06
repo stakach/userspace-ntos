@@ -1,5 +1,48 @@
 # Lessons
 
+## Shell Metadata Is Not JSON Input
+- JSON string quoting is not shell quoting. Backticks and dollar expressions in a GitHub body
+  still execute inside a double-quoted shell argument; pass prose through a structured input or
+  correctly escaped single-quoted argument instead.
+- Verify the stored issue or PR text after updating it. A successful CLI exit alone does not
+  prove that the body, commit IDs and code identifiers survived shell interpretation.
+
+## Error Logs Are Not Submitted I/O Receipts
+- Trace status initialization and every diagnostic producer before attributing a native read
+  failure. ReactOS input threads can print unchanged initial failure statuses when device opens
+  never succeeded; that is not proof a READ was submitted or that the thread spins.
+- Require actual open/read ownership receipts and wait behavior before claiming polling cost
+  or choosing a performance fix. Keep missing driver-stack support distinct from scheduling.
+
+## Cleanup State Does Not Identify Failure Phase
+- Follow every producer of a retained failure bundle. A completed constructor can become
+  retained again when publication or activation fails; the shared cleanup state is not proof
+  that construction failed.
+- Record failure phase and actual result before ownership moves into reconciliation. Use absent
+  boundary records to narrow the path, not to infer an unobserved native operation.
+
+## Decode The Producer's Hive Format
+- Follow the actual image producer before choosing a registry decoder. The installed REGF
+  source and composed core SYSTEM transport are distinct encodings of related data.
+- Test bootstrap policy reads with the real composed-image encoder and a non-default selected
+  control set. Missing policy may use its NT initial value; invalid data must remain an error.
+
+## AST Regression Bindings
+- Use distinct names for collected calls and parsed expression nodes; a local named `calls`
+  can hide the collector function, and reusing `owned` can hide an earlier call list.
+- A compilation failure is not a behavioral RED. Consume the actual failed exit, fix setup,
+  and reproduce the intended assertion before changing production behavior.
+
+## Serialize Parser Tests Too
+- A yielded Cargo session is still active. Do not launch even independent Python fixture/parser
+  tests until its actual exit is consumed; single-owner validation includes every test suite.
+
+## Observations Do Not Admit Execution
+- Retained Section bytes and native handle rights admit process creation. An expired observational
+  catalog association may refuse attribution, but must not reject an otherwise valid executable.
+- Test File-close-before-process creation: observer registration can retire before its retained
+  Section source, so validating both against the same lifetime silently couples policy to tracing.
+
 ## Runtime Ownership Is Not A Thread Role
 - Resolve GUI TEB aliases from the published executable runtime and retained logical caller,
   including the exact process and thread generations. A worker badge's slot encoding is not
@@ -466,3 +509,127 @@ diagnosis-free failure.
   and mounted-hive paths; do not infer progress from reads, timer churn, or filesystem snapshots.
 - Resolve the actual saved PC and retained IPC state before changing watchdog policy. Keep the
   strict desktop gate and hard boot limit; a successful test-harness exit is not desktop proof.
+
+## Referenced Bodies Do Not Reenter Handle Admission
+- Capture access and retain the exact File body before reentrant user-memory probes. Continue
+  through that retained route even if the originating handle closes or is reused.
+- A later operation-start transition must consume referenced-body authority, not repeat a
+  live-handle requirement. Keep fresh admission strict and exclude cleanup-only or counted
+  serializer references from the retained-body proof.
+
+## Match Evidence to Executed Observations
+- A fixture's completed-group count does not identify every check it reached. Verify each
+  claimed native case against its actual log record; do not promote host coverage or a later
+  source assertion into guest execution evidence.
+
+## Preserve Capture Timing Across Blocking
+- A user pointer retained in a retry frame is not the value captured before a wait.
+  Keep captured scalars and exact referenced objects with the parked request; a
+  reused handle must not redirect an already-admitted operation.
+- Preserve NT's distinct early probes and late buffered copies. A late copy
+  exception releases acquisition ownership without publishing an I/O completion;
+  moving every copy early can conceal a bug while changing observable semantics.
+
+## Address Windows Are Not Mapped Backing
+- A grown stack can overlap a historical heap address window. Numeric containment
+  does not prove an executive alias exists; copy through the exact registered
+  frame and its acknowledged alias, or its retained source capability.
+- Demand-fill history is an observation, not replacement backing after retirement.
+  A failed exact backing lookup must not fall through to a computed mirror.
+
+## Verify The Regression Failure Point
+- Inspect the full failure, not just the test count or exit code. A fixture
+  rejected at admission does not reproduce the later behavior it claims to test.
+- Give retained-owner fixtures valid reservation identities before testing
+  output ordering, and keep setup failures separate from behavioral evidence.
+- Direct kernel invocation fixtures must name the actual source CPtr in the
+  invocation arguments. A matching typed capability snapshot alone is not source
+  authority; never relax admission to compensate for an incorrect fixture.
+
+## Consume Validation Exit Before Starting Another
+- A session ID means validation is still active, including quiet executable startup
+  or a pending artifact lock. Consume its final exit before launching any other
+  build, test suite, image generation, or guest run against shared artifacts.
+- An exact test filter must name the complete test. A zero-test success is not
+  regression evidence; check the executed count and the actual failure assertion.
+
+## Preserve Media Startup Policy
+- Trace the imported registry values through their actual composition and query
+  paths before diagnosing a missing shell. Kernel-written installed-state flags
+  can suppress the media's genuine setup process and make downstream credentials
+  or shell configuration look like the cause.
+- Return the shared mounted registry state to every caller. Do not fabricate
+  setup phases by executable identity or perform user-mode setup transitions in
+  kernel bootstrap; implement the NT APIs the real setup process invokes.
+
+## Finish The Requested Acceptance Scope
+- When the user requests completion of a named issue, verified refactors are
+  intermediate increments, not a stopping point. Continue through its remaining
+  implementation and acceptance, including fresh native or desktop evidence.
+- Close the issue only after its actual checklist is proven. Keep source tests,
+  crate tests, native builds and desktop proof distinct throughout the work.
+
+## Bound Every Storage Layer
+- Available aggregate memory does not guarantee a contiguous allocation. Compare
+  the refused request with the largest reusable span, and reproduce the exact
+  allocation boundary before diagnosing a leak.
+- Bounded leaves need bounded directories and indexes too. Reducing a chunk size
+  can move the same failure into its pointer directory; test growth beyond the
+  observed live population while preserving stable identities and generations.
+- A dormant helper is not a live allocation path. Trace actual callers and
+  same-run receipts before changing mapping policy or claiming causation.
+
+## Distinguish Refusal From Uncertainty
+- A raw error status cannot certify that an IPC effect did not occur. Require a
+  checked outcome bound to the exact target and actors before settling refusal.
+- Definitive no-enqueue refusal is a terminal state, not successful delivery and
+  not permanent uncertainty. Retain the reference until its separate release ACK;
+  missing or malformed outcomes remain owned and must not be replayed.
+
+## Scratch Addresses Are Not Test Ownership
+- Moving a destructive native selftest to a real user's mapping geometry also
+  requires exact vacant-VAD acquisition and owned cleanup. Process identity
+  alone does not authorize unmapping an arbitrary test address.
+- Exercise an actual extracted native boundary for the focused regression when
+  no safe native test reservation exists; do not call host execution native proof.
+
+## Preserve Reservation Overflow Admission
+- Replacing a contiguous vector with segmented storage must retain its immediate
+  rejection of impossible logical byte extents. Checked element-count addition
+  alone does not prevent an enormous allocation loop.
+- Test refusal before directory construction, generators, identity publication or
+  journal effects. Aggregate host memory pressure is not a substitute for this check.
+
+## Correlate Native Frontiers Exactly
+- Absence of an error before a timeout is not passage of its former failure point.
+  Correlate the exact operation, owner and mapping receipt across runs; line counts,
+  helper counts and unrelated snapshot generations are not substitutes.
+
+## Prove Interrupt Delivery Per CPU
+- A finite busy window on one CPU does not prove another CPU received interrupts.
+  Verify the actual timer or IPI routing before using that window as native coverage.
+- Require an observation from the live target branch, not merely a successful helper
+  roundtrip. Generate test wakeups through ordinary owned kernel operations rather
+  than synthetic counter increments or test-only interrupt injection.
+
+## Separate Refusal From Abort
+- No terminal allocation abort does not imply that all fallible allocations succeeded.
+  Inspect refusal receipts and diagnostic suppression before declaring a memory frontier passed.
+- Identify the owning operation before interpreting an allocation size. Remove proven unused
+  reservations before increasing capacity; total free bytes do not certify a contiguous span.
+
+## Provider Teardown Owns Private Storage
+- A provider may legitimately clear and free its private context before a later CLOSE. Follow
+  canonical File projection identity and actual contexts, not a cached numeric provider file ID.
+- Pool bounds, structure tags and zeroed fields do not authorize repair. Never rewrite provider
+  queues to avoid a historical spin; preserve the real driver result and retained ownership.
+
+## Check Generated Patch Escaping
+- When constructing a patch through JavaScript, inspect the resulting Rust byte strings. A log
+  newline must be `b"\n"`, not a double-escaped literal backslash followed by `n`.
+
+## Separate Physical Provenance
+- A source allocation's domain is physical provenance and must match its source arena. A device
+  projection may name a different logical domain; retain the authenticated allocator separately.
+- One source ticket names one immutable allocation lifetime. Changed address, extent or generation
+  under the same ticket is a contradiction, not a new packet or ownership transfer.

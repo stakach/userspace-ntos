@@ -378,10 +378,11 @@ impl PendingFileIoTable {
         identity: PendingFileIoIdentity,
         expected_irp: u64,
     ) -> Result<PendingFileApcDeliveryLease, PendingFileApcError> {
-        self.get_exact(identity)
+        let pending = self.get_exact(identity)
             .filter(|pending| pending.irp_id == expected_irp)
             .ok_or(PendingFileApcError::WrongIdentity)?;
-        if self.delivery_attempts[identity.slot] != 0
+        if matches!(pending.operation, PendingFileIoOperation::OwnedModePrecommit(_))
+            || self.delivery_attempts[identity.slot] != 0
             || self.apc_controls[identity.slot]
                 .is_some_and(|control| control.phase != PendingFileApcPhase::AwaitTerminal)
         {
@@ -448,7 +449,7 @@ impl PendingFileIoTable {
             || view.pending.is_local()
                 && view
                     .pending
-                    .local_terminal_result()
+                    .owned_terminal_result()
                     .map(|(status, _)| status)
                     != Some(status)
         {

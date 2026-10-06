@@ -221,7 +221,6 @@ fn validate_empty_slot<const STACK: usize>(
         || (retirement.pending_memory_slot().is_some()
             && registry
                 .records()
-                .iter()
                 .any(|record| [record.frame, record.alias_cap, record.source_cap].contains(&slot)))
     {
         return Err(ReconciliationError::Registry(

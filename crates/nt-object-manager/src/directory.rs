@@ -18,6 +18,41 @@ pub const NO_MORE_ENTRIES: NtStatus = NtStatus(0x8000_001a_u32 as i32);
 pub const OBJECT_PATH_SYNTAX_BAD: NtStatus = NtStatus(0xc000_003b_u32 as i32);
 const RECORD_SIZE: usize = 32;
 
+/// Validate Directory attributes before security or namespace effects.
+/// ReactOS recognizes kernel-exclusive in either mode, but only applies its
+/// protection for kernel callers; NT5 does not recognize that extension.
+pub fn admit_directory_object_attributes(
+    attributes: u32,
+    mode: AccessMode,
+) -> Result<u32, NtStatus> {
+    admit_named_object_attributes(attributes, mode, 0x100)
+}
+
+/// Validate common Object Manager attributes against the registered type's invalid mask.
+pub fn admit_named_object_attributes(
+    attributes: u32,
+    mode: AccessMode,
+    invalid_type_attributes: u32,
+) -> Result<u32, NtStatus> {
+    const VALID_ATTRIBUTES: u32 = 0x7f2;
+    const KERNEL_EXCLUSIVE: u32 = 0x10000;
+    if attributes & !(VALID_ATTRIBUTES | KERNEL_EXCLUSIVE) != 0
+        || attributes & invalid_type_attributes != 0
+        || attributes & 0x22 == 0x22
+    {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+    let normalized = if mode == AccessMode::UserMode {
+        attributes & !(0x200 | KERNEL_EXCLUSIVE)
+    } else {
+        attributes
+    };
+    if normalized & (0x20 | KERNEL_EXCLUSIVE) != 0 {
+        return Err(NtStatus::NOT_SUPPORTED);
+    }
+    Ok(normalized)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectoryHandle {
     pub handle: HandleValue,
@@ -235,6 +270,16 @@ impl ObjectManager {
         attributes: ObjAttrFlags,
         create: bool,
     ) -> Result<(), NtStatus> {
+        let mode = self.client_mode(client)?;
+        // This adapter has no captured-subject forced-access or exclusivity
+        // implementation. Preserve its narrower feature policy after validation.
+        admit_directory_object_attributes(attributes.bits(), mode).map_err(|status| {
+            if status == NtStatus::NOT_SUPPORTED {
+                NtStatus::INVALID_PARAMETER
+            } else {
+                status
+            }
+        })?;
         let allowed = ObjAttrFlags::CASE_INSENSITIVE
             | ObjAttrFlags::INHERIT
             | ObjAttrFlags::KERNEL_HANDLE
@@ -243,7 +288,6 @@ impl ObjectManager {
         if attributes.bits() & !allowed.bits() != 0 {
             return Err(NtStatus::INVALID_PARAMETER);
         }
-        let mode = self.client_mode(client)?;
         if mode == AccessMode::UserMode
             && (attributes.contains(ObjAttrFlags::KERNEL_HANDLE)
                 || (create && attributes.contains(ObjAttrFlags::PERMANENT)))

@@ -58,6 +58,17 @@ impl CallbackTransfer {
         self.phase
     }
 
+    pub(super) unsafe fn restart(&self, reply: u64) -> bool {
+        if self.phase != TransferPhase::Published {
+            return false;
+        }
+        let Some(binding) = self.binding else { return false; };
+        win32k_glue::restart_staged_user_callback_context(
+            win32k_glue::StagedUserCallbackContext::installed(binding.client().tcb),
+            reply,
+        )
+    }
+
     /// Capture while the provider still owns the shared-bank execution token. Later preparation
     /// reads only this owned input, never whichever request another lane published most recently.
     pub(super) unsafe fn capture(
@@ -161,8 +172,6 @@ impl CallbackTransfer {
                 u64::from(client.pi),
                 layout.input_pointer,
                 &self.input[..request.input_length as usize],
-                &[],
-                0,
                 client.scratch_base,
             )
         {
@@ -173,8 +182,6 @@ impl CallbackTransfer {
                 u64::from(client.pi),
                 layout.input_pointer + win32k_glue::WINDOWPROC_LPARAM_OFFSET,
                 &reference.to_le_bytes(),
-                &[],
-                0,
                 client.scratch_base,
             ) {
                 return Err(UNSUCCESSFUL);
@@ -189,8 +196,6 @@ impl CallbackTransfer {
             u64::from(client.pi),
             prepared.layout.frame_pointer,
             bytes,
-            &[],
-            0,
             client.scratch_base,
         ) {
             return Err(UNSUCCESSFUL);
@@ -199,7 +204,7 @@ impl CallbackTransfer {
     }
 
     /// Install only the already-prepared GPR/control image. Success acknowledges this private
-    /// mechanism alone: callback-stack publication and the client's empty Reply remain separate.
+    /// mechanism alone: callback-stack publication and the client's bound restart remain separate.
     pub(super) unsafe fn install(&mut self) -> Result<(), u32> {
         if self.phase != TransferPhase::Prepared {
             return Err(INVALID);

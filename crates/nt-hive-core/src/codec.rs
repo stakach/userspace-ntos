@@ -1161,7 +1161,8 @@ fn apply_log(hive: &mut Hive, op: u16, payload: &[u8]) -> Result<(), HiveLogRepl
 impl Hive {
     fn empty(kind: HiveKind, root: CellId, generation: u64, sequence: u64) -> Hive {
         Hive {
-            cells: Vec::new(),
+            pending_value_journal: None,
+            cells: nt_page_storage::PageSequence::new(),
             value_blobs: Vec::new(),
             root,
             next_id: 1,

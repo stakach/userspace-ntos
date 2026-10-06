@@ -5,6 +5,33 @@ use core::sync::atomic::Ordering;
 use nt_component_suspension::{ExternalIngress, ReplyBindingObservation};
 type Binding = nt_user_host::thread_binding::ThreadBinding<crate::HostedThreadRole>;
 
+struct ReceiveSettlement {
+    barrier: nt_user_host::receive_child_barrier::ReceiveChildBarrier<crate::HostedThreadRole>,
+    observation: crate::exec_handler::private_residency::ResidentReadFaultCapture,
+    provider_tcb: u64,
+    provider_pml4: u64,
+    // Copied at admission for diagnostics only; the barrier owns restoration authority.
+    trace_owner: nt_component_suspension::SuspensionOwner,
+    parent: Option<super::nested::ParkedParentHandle>,
+    transferred: bool,
+    rejected: Option<nt_component_suspension::ExternalSettlement>,
+}
+
+/// Single-use outer-loop delivery. The parent row already retains the sealed settlement permit.
+pub(crate) struct ReceiveSettlementBoundary {
+    pub(crate) parent: Option<super::nested::ParkedParentHandle>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ReceiveChildObservation {
+    pub resident: crate::exec_handler::private_residency::ResidentReadFaultCapture,
+    pub parent: nt_component_suspension::NestedExecutionIdentity,
+    pub child: nt_component_suspension::ExternalAdmissionKey,
+    pub provider_tcb: u64,
+    pub provider_pml4: u64,
+    pub trace_owner: nt_component_suspension::SuspensionOwner,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Completion {
     Acknowledged,
@@ -19,8 +46,43 @@ struct HostedCall {
     recycled: Option<ComponentIngress<ReceivedMessage>>,
     completion: Option<Completion>,
     released: bool,
+    receive_settlement: Option<ReceiveSettlement>,
 }
 static mut CALLS: Vec<Option<HostedCall>> = Vec::new();
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingSnapshot {
+    pub binding: Binding,
+    pub reply: u64,
+    pub executor: u64,
+    pub admission_sequence: u64,
+    pub info: u64,
+    pub registers: [u64; 4],
+}
+
+pub(super) unsafe fn oldest_pending_snapshot() -> Option<PendingSnapshot> {
+    let rows = &*core::ptr::addr_of!(CALLS);
+    let index = nt_component_suspension::oldest_external_ingress(
+        rows.iter().enumerate().filter_map(|(index, row)| {
+            let row = row.as_ref()?;
+            if row.delivered {
+                return None;
+            }
+            row.call.as_ref().map(|call| (index, call))
+        }),
+    )?;
+    let row = rows[index].as_ref()?;
+    let call = row.call.as_ref()?;
+    let message = call.message();
+    Some(PendingSnapshot {
+        binding: row.binding,
+        reply: call.reply(),
+        executor: call.executor(),
+        admission_sequence: call.admission_sequence(),
+        info: message.info(),
+        registers: message.registers(),
+    })
+}
 struct Cancellation {
     binding: Binding,
     reply: u64,
@@ -91,6 +153,7 @@ pub(super) unsafe fn retain(
         recycled: None,
         completion: None,
         released: false,
+        receive_settlement: None,
     });
     Ok(())
 }
@@ -364,17 +427,248 @@ pub(crate) unsafe fn finish_acknowledged_hosted_reply(reply: u64) -> Result<bool
 unsafe fn finish_acknowledged(row: &mut HostedCall) -> Result<(), Error> {
     let _saved = crate::ipc_message::SavedMessageBuffer::capture();
     let owner = owner();
-    let (ready, _message) = owner
+    let (ready, _message, settlement) = owner
         .receiver
         .as_mut()
         .expect("ready receiver")
-        .finish_external(&mut row.call, |tcb, reply| {
+        .finish_external_with_settlement(&mut row.call, |tcb, reply| {
             crate::spawn_hosts::query_component_reply_binding(tcb, reply)
         })
         .map_err(|_| Error::Reply)?;
     row.recycled = Some(ready);
     row.completion = Some(Completion::Acknowledged);
+    settle_receive(row, settlement)?;
+    let trace = row.receive_settlement.as_ref().and_then(|receive| {
+        receive
+            .parent
+            .as_ref()
+            .map(|parent| {
+                (
+                    parent.identity(),
+                    receive.barrier.admission_key(),
+                    receive.trace_owner,
+                )
+            })
+    });
+    if let Some((parent, child, trace_owner)) = trace {
+        crate::win32k_glue::trace_receive_phase(b"child-ack-free", parent, child, trace_owner);
+    }
     Ok(())
+}
+
+fn settle_receive(
+    row: &mut HostedCall,
+    settlement: nt_component_suspension::ExternalSettlement,
+) -> Result<(), Error> {
+    let Some(receive) = row.receive_settlement.as_mut() else {
+        return Ok(());
+    };
+    match receive.barrier.accept_settlement(row.binding, settlement) {
+        Ok(()) => Ok(()),
+        Err((_, settlement)) => {
+            receive.rejected = Some(settlement);
+            Err(Error::Admission)
+        }
+    }
+}
+
+fn receive_settlement_consumed(row: &HostedCall) -> bool {
+    row.receive_settlement.as_ref().is_none_or(|receive| {
+        receive.transferred && receive.parent.is_none() && receive.rejected.is_none()
+    })
+}
+
+pub(crate) unsafe fn prepare_receive_settlement(
+    snapshot: PendingSnapshot,
+    observation: crate::exec_handler::private_residency::ResidentReadFaultCapture,
+    provider_tcb: u64,
+    provider_pml4: u64,
+    trace_owner: nt_component_suspension::SuspensionOwner,
+) -> Result<nt_component_suspension::ExternalAdmissionKey, Error> {
+    let oldest = oldest_pending_snapshot().ok_or(Error::Admission)?;
+    if oldest.binding != snapshot.binding
+        || oldest.reply != snapshot.reply
+        || oldest.admission_sequence != snapshot.admission_sequence
+    {
+        return Err(Error::Admission);
+    }
+    let row = (&mut *core::ptr::addr_of_mut!(CALLS))
+        .iter_mut()
+        .flatten()
+        .find(|row| {
+            row.binding == snapshot.binding
+                && row.call.as_ref().is_some_and(|call| {
+                    call.reply() == snapshot.reply
+                        && call.admission_sequence() == snapshot.admission_sequence
+                })
+        })
+        .ok_or(Error::Admission)?;
+    if row.receive_settlement.is_some() || row.delivered || row.released {
+        return Err(Error::Admission);
+    }
+    let barrier = nt_user_host::receive_child_barrier::ReceiveChildBarrier::prepare(
+        row.call.as_ref().ok_or(Error::Admission)?,
+        row.binding,
+    )
+    .map_err(|_| Error::Admission)?;
+    let admission = barrier.admission_key();
+    row.receive_settlement = Some(ReceiveSettlement {
+        barrier,
+        observation,
+        provider_tcb,
+        provider_pml4,
+        trace_owner,
+        parent: None,
+        transferred: false,
+        rejected: None,
+    });
+    Ok(admission)
+}
+
+pub(crate) unsafe fn receive_child_pending() -> bool {
+    (&*core::ptr::addr_of!(CALLS)).iter().flatten().any(|row| {
+        row.receive_settlement
+            .as_ref()
+            .is_some_and(|receive| !receive.transferred)
+    })
+}
+
+pub(crate) unsafe fn receive_child_is_current(binding: Binding, reply: u64) -> bool {
+    (&*core::ptr::addr_of!(CALLS))
+        .iter()
+        .filter_map(Option::as_ref)
+        .any(|row| {
+            row.binding == binding
+                && row.delivered
+                && row.call.as_ref().is_some_and(|call| call.reply() == reply)
+                && row
+                    .receive_settlement
+                    .as_ref()
+                    .is_some_and(|receive| !receive.transferred)
+        })
+}
+
+pub(crate) unsafe fn receive_child_observation(
+    binding: Binding,
+    reply: u64,
+) -> Option<ReceiveChildObservation> {
+    (&*core::ptr::addr_of!(CALLS))
+        .iter()
+        .filter_map(Option::as_ref)
+        .find_map(|row| {
+            if row.binding != binding
+                || !row.delivered
+                || !row.call.as_ref().is_some_and(|call| call.reply() == reply)
+            {
+                return None;
+            }
+            row.receive_settlement
+                .as_ref()
+                .filter(|receive| !receive.transferred)
+                .and_then(|receive| {
+                    Some(ReceiveChildObservation {
+                        resident: receive.observation,
+                        parent: receive.parent.as_ref()?.identity(),
+                        child: receive.barrier.admission_key(),
+                        provider_tcb: receive.provider_tcb,
+                        provider_pml4: receive.provider_pml4,
+                        trace_owner: receive.trace_owner,
+                    })
+                })
+        })
+}
+
+pub(crate) unsafe fn receive_child_delivery_allowed(reply: u64) -> bool {
+    !receive_child_pending()
+        || (&*core::ptr::addr_of!(CALLS))
+            .iter()
+            .filter_map(Option::as_ref)
+            .any(|row| {
+                !row.delivered
+                    && row.call.as_ref().is_some_and(|call| call.reply() == reply)
+                    && row
+                        .receive_settlement
+                        .as_ref()
+                        .is_some_and(|receive| !receive.transferred)
+            })
+}
+
+/// The actual child owns the parent ticket until the sealed outer-boundary transfer.
+pub(crate) unsafe fn with_bound_receive_scope<T>(
+    identity: nt_component_suspension::NestedExecutionIdentity,
+    use_scope: impl FnOnce(&nt_component_suspension::NestedExecutionScope) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let parent = (&*core::ptr::addr_of!(CALLS))
+        .iter()
+        .flatten()
+        .filter_map(|row| row.receive_settlement.as_ref()?.parent.as_ref())
+        .find(|parent| parent.identity() == identity)
+        .ok_or(Error::Admission)?;
+    super::nested::with_receive_scope(parent, use_scope)
+}
+
+pub(crate) unsafe fn bind_receive_settlement(
+    snapshot: PendingSnapshot,
+    parent: super::nested::ParkedParentHandle,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+) -> Result<(), (Error, super::nested::ParkedParentHandle)> {
+    let result = (|| {
+        let row = (&mut *core::ptr::addr_of_mut!(CALLS))
+            .iter_mut()
+            .flatten()
+            .find(|row| {
+                row.binding == snapshot.binding
+                    && row.call.as_ref().is_some_and(|call| {
+                        call.reply() == snapshot.reply
+                            && call.admission_sequence() == snapshot.admission_sequence
+                    })
+            })
+            .ok_or(Error::Admission)?;
+        let receive = row.receive_settlement.as_mut().ok_or(Error::Admission)?;
+        if receive.parent.is_some() || receive.transferred || row.delivered {
+            return Err(Error::Admission);
+        }
+        super::nested::bind_receive_child(&parent, &mut receive.barrier, dispatch)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        return Err((error, parent));
+    }
+    let receive = (&mut *core::ptr::addr_of_mut!(CALLS))
+        .iter_mut()
+        .flatten()
+        .find(|row| {
+            row.binding == snapshot.binding
+                && row.call.as_ref().is_some_and(|call| {
+                    call.reply() == snapshot.reply
+                        && call.admission_sequence() == snapshot.admission_sequence
+                })
+        })
+        .and_then(|row| row.receive_settlement.as_mut())
+        .expect("validated child retained");
+    receive.parent = Some(parent);
+    Ok(())
+}
+
+pub(crate) unsafe fn take_outer_boundary() -> Result<Option<ReceiveSettlementBoundary>, Error> {
+    for row in (&mut *core::ptr::addr_of_mut!(CALLS)).iter_mut().flatten() {
+        let Some(receive) = row.receive_settlement.as_mut() else {
+            continue;
+        };
+        if receive.transferred || row.completion != Some(Completion::Acknowledged) {
+            continue;
+        }
+        if receive.rejected.is_some() {
+            return Err(Error::Admission);
+        }
+        let parent = receive.parent.as_ref().ok_or(Error::Admission)?;
+        super::nested::consume_receive_settlement(parent, &mut receive.barrier)?;
+        receive.transferred = true;
+        return Ok(Some(ReceiveSettlementBoundary {
+            parent: receive.parent.take(),
+        }));
+    }
+    Ok(None)
 }
 
 pub(crate) unsafe fn stop_hosted_caller(
@@ -536,7 +830,7 @@ pub(super) unsafe fn recycle_completed() -> Result<(), Error> {
         let Some(row) = record.as_mut() else {
             continue;
         };
-        if !row.released {
+        if !row.released || !receive_settlement_consumed(row) {
             continue;
         }
         let Some(ready) = row.recycled.as_ref() else {

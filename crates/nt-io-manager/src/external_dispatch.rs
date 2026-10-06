@@ -20,6 +20,11 @@ use crate::irp::{
 use crate::object_port::ObjectManagerPort;
 use crate::{DeviceId, DriverId, FileId, IoManager, IrpId};
 
+#[path = "detached_external_pnp.rs"]
+mod detached;
+pub use detached::{ExternalPnpFinishRejection, ExternalPnpFinishResult, ExternalPnpInvocation,
+    ExternalPnpReturn, RetainedExternalPnp};
+
 pub(crate) fn validate_external_parameter_layout(
     major: u8,
     params: &IoParameters,
@@ -569,6 +574,8 @@ impl<P> IoManager<P> {
     /// allocation. Any violated invariant or backend transport error retains the IRP as
     /// `Indeterminate`; only a genuine synchronous return reclaims it here. A foreign manager is
     /// rejected before examining any IRP and returns the preparation unchanged.
+    /// This legacy combined adapter still borrows the manager across backend execution and drops
+    /// nonterminal payload storage. Native reentrant adapters must use the detached owned API.
     pub fn dispatch_prepared_external_pnp(
         &mut self,
         prepared: PreparedExternalPnpIrp,
@@ -638,6 +645,24 @@ impl<P> IoManager<P> {
             }
         };
         let outcome = self.dispatch_pnp_to_driver(current_driver_id, irp_id, &mut prepared.payload);
+        self.reconcile_external_pnp(prepared, outcome)
+    }
+
+    fn reconcile_external_pnp(
+        &mut self,
+        prepared: PreparedExternalPnpIrp,
+        outcome: PnpBackendDispatch,
+    ) -> ExternalPnpDispatchResult {
+        let mut prepared = Some(prepared);
+        self.reconcile_external_pnp_retaining(&mut prepared, outcome)
+    }
+
+    fn reconcile_external_pnp_retaining(
+        &mut self,
+        prepared: &mut Option<PreparedExternalPnpIrp>,
+        outcome: PnpBackendDispatch,
+    ) -> ExternalPnpDispatchResult {
+        let irp_id = prepared.as_ref().expect("owned PnP reconciliation").irp_id;
         if self
             .irp(irp_id)
             .map(|irp| irp.state != IrpState::Dispatched)
@@ -684,6 +709,7 @@ impl<P> IoManager<P> {
                     .irp(irp_id)
                     .is_some_and(|irp| irp.buffer.is_some_and(|buffer| buffer.output_len != 0));
                 self.free_irp(irp_id);
+                let prepared = prepared.take().expect("terminal PnP payload owner");
                 if returns_payload {
                     ExternalPnpDispatchResult::ReturnedPayload {
                         status,
@@ -965,6 +991,41 @@ impl<P> IoManager<P> {
         output_len: u32,
         system_buffer: &mut [u8],
     ) -> Result<ExternalDispatchResult, NtStatus> {
+        self.build_and_dispatch_external_to_device_with_stack_flags_and_initial_information(
+            client,
+            device_id,
+            file_id,
+            user_data,
+            requestor_tid,
+            major,
+            params,
+            stack_flags,
+            input_len,
+            output_len,
+            0,
+            system_buffer,
+        )
+    }
+
+    /// Dispatch an already-owned transfer buffer with an explicit initial IoStatus.Information.
+    /// Query output may contain discontiguous I/O Manager fields; the scalar is not a seed prefix
+    /// length. The caller supplies the complete buffer, and real terminal completion replaces the
+    /// initial scalar. Invalid seeds are rejected before IRP allocation or backend entry.
+    pub fn build_and_dispatch_external_to_device_with_stack_flags_and_initial_information(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        file_id: Option<FileId>,
+        user_data: u64,
+        requestor_tid: u64,
+        major: u8,
+        params: IoParameters,
+        stack_flags: StackFlags,
+        input_len: u32,
+        output_len: u32,
+        initial_information: u64,
+        system_buffer: &mut [u8],
+    ) -> Result<ExternalDispatchResult, NtStatus> {
         let driver_id = self
             .device(device_id)
             .ok_or(NtStatus::INVALID_PARAMETER)?
@@ -981,6 +1042,7 @@ impl<P> IoManager<P> {
             stack_flags,
             input_len,
             output_len,
+            initial_information,
             system_buffer,
         )
     }
@@ -1013,6 +1075,7 @@ impl<P> IoManager<P> {
             StackFlags::empty(),
             input_len,
             output_len,
+            0,
             system_buffer,
         )
     }
@@ -1030,8 +1093,12 @@ impl<P> IoManager<P> {
         stack_flags: StackFlags,
         input_len: u32,
         output_len: u32,
+        initial_information: u64,
         system_buffer: &mut [u8],
     ) -> Result<ExternalDispatchResult, NtStatus> {
+        if !nt_io_abi::valid_initial_information(major, initial_information, input_len, output_len) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         validate_external_parameter_layout(major, &params, stack_flags, input_len, output_len, system_buffer.len())?;
         if self.driver(driver_id).is_none() {
             return Err(NtStatus::INVALID_PARAMETER);
@@ -1066,6 +1133,7 @@ impl<P> IoManager<P> {
         }
         irp.user_data = user_data;
         irp.requestor_tid = requestor_tid;
+        irp.information = initial_information;
         let captured_input_len = input_len.min(system_buffer.len() as u32) as usize;
         irp.set_request_input_fingerprint(&system_buffer[..captured_input_len]);
         irp.buffer = Some(IoBufferRef {
@@ -1276,13 +1344,8 @@ impl<P> IoManager<P> {
                 self.free_irp(irp_id);
                 if crate::is_create_major(major) {
                     if let Some(file_id) = file_id {
-                        if crate::file::create_terminal_opens_file(status) {
-                            let file = self.file_mut(file_id).expect("CREATE File disappeared");
-                            file.driver_context = file_context;
-                            file.transition(FileState::Open);
-                        } else if let Some(file) = self.file_mut(file_id) {
-                            file.transition(FileState::Closed);
-                        }
+                        self.file_mut(file_id).expect("CREATE File disappeared")
+                            .complete_create(status, file_context);
                     }
                 }
                 ExternalDispatchResult::Completed {
@@ -1300,7 +1363,7 @@ impl<P> IoManager<P> {
                 if crate::is_create_major(major) {
                     if let Some(file_id) = file_id {
                         if let Some(file) = self.file_mut(file_id) {
-                            file.transition(FileState::Closed);
+                            file.complete_create(status, None);
                         }
                     }
                 }

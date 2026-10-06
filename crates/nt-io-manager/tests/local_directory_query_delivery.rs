@@ -65,7 +65,7 @@ fn terminal(status: u32, information: usize, synchronous: bool, event: u64) -> P
         route: PendingFileRoute::Local(LocalFileObject::Overlay(FILE)),
         irp_id: ID,
         major: nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL,
-        operation: PendingFileIoOperation::LocalInline(PendingLocalInline {
+        operation: PendingFileIoOperation::OwnedInline(PendingOwnedInline {
             status,
             information: information as u64,
         }),
@@ -107,10 +107,10 @@ fn settle_surfaces(fs: &mut FileSystem, handle: u64, table: &mut PendingFileIoTa
 }
 
 fn settle_reply(table: &mut PendingFileIoTable, slot: usize) {
-    let terminal = table.get(slot).unwrap().local_terminal_result();
+    let terminal = table.get(slot).unwrap().owned_terminal_result();
     assert_eq!(table.claim_reply_cap_exact(slot, ID), Some(Some(REPLY)));
     table.restore_reply_cap_exact(slot, ID, REPLY).unwrap();
-    assert_eq!(table.get(slot).unwrap().local_terminal_result(), terminal);
+    assert_eq!(table.get(slot).unwrap().owned_terminal_result(), terminal);
     assert!(table.finish_exact(slot, ID).is_none());
     assert_eq!(table.claim_reply_cap_exact(slot, ID), Some(Some(REPLY)));
     table.mark_reply_published_exact(slot, ID).unwrap();
@@ -120,7 +120,7 @@ fn settle_reply(table: &mut PendingFileIoTable, slot: usize) {
 
 fn release(fs: &mut FileSystem, handle: u64, table: &mut PendingFileIoTable, slot: usize) {
     fs.zw_release_io_reference(handle).unwrap();
-    table.mark_local_reference_released_exact(slot, ID).unwrap();
+    table.mark_owned_reference_released_exact(slot, ID).unwrap();
     table.finish_exact(slot, ID).unwrap();
 }
 
@@ -247,7 +247,7 @@ fn overflow_and_end_of_scan_publish_warning_completions_in_every_open_mode() {
                     Ok(synchronous || event == u64::MAX)
                 );
                 assert_eq!(
-                    table.get(slot).unwrap().local_terminal_result(),
+                    table.get(slot).unwrap().owned_terminal_result(),
                     Some((result.status, result.information as u64))
                 );
                 release(&mut fs, handle, &mut table, slot);

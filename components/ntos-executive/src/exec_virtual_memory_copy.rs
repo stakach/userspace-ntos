@@ -220,7 +220,7 @@ impl ExecNtHandler {
         )
     }
 
-    pub(super) unsafe fn process_memory_read_status(
+    pub(crate) unsafe fn process_memory_read_status(
         &mut self,
         pi: usize,
         address: u64,
@@ -476,10 +476,7 @@ impl ExecNtHandler {
             process,
             address,
             output,
-            &*ctx.filled_pages,
-            *ctx.faults as usize,
             ctx.scratch_base,
-            false,
         ) {
             Ok(())
         } else {
@@ -513,8 +510,6 @@ impl ExecNtHandler {
             pi as u64,
             address,
             input,
-            &*ctx.filled_pages,
-            *ctx.faults as usize,
             ctx.scratch_base,
         ) {
             Ok(())

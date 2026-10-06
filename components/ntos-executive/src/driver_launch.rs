@@ -128,6 +128,10 @@ mod hosted_query_path_work;
 mod hosted_write_work;
 #[path = "hosted_read_work.rs"]
 mod hosted_read_work;
+#[path = "hosted_source_completion_lane.rs"]
+pub(crate) mod hosted_source_completion_lane;
+#[path = "hosted_forward_origin.rs"]
+mod hosted_forward_origin;
 #[path = "hosted_flush_work.rs"]
 mod hosted_flush_work;
 #[path = "hosted_query_information_work.rs"]
@@ -144,8 +148,14 @@ mod hosted_create_security_graph;
 mod hosted_file_objects;
 #[path = "hosted_reparse_name.rs"]
 mod hosted_reparse_name;
+#[path = "hosted_file_mode.rs"]
+mod hosted_file_mode;
+pub(crate) use hosted_file_mode::prepare as prepare_hosted_file_mode;
+pub(crate) use hosted_file_mode::PreparationError as FileModePreparationError;
 #[path = "hosted_consumer_file_objects.rs"]
 pub(crate) mod hosted_consumer_file_objects;
+#[path = "hosted_consumer_device_objects.rs"]
+mod hosted_consumer_device_objects;
 #[path = "hosted_io_create_file_adapter.rs"]
 mod hosted_io_create_file_adapter;
 #[path = "hosted_io_create_file_ingress.rs"]
@@ -195,7 +205,7 @@ mod hosted_kernel_file_write;
 #[path = "driver_share_access.rs"]
 mod driver_share_access;
 use hosted_file_objects::{
-    fo_bind, fo_is_registered, fo_lookup, fo_register, fo_release, fo_reserve_new_slot,
+    fo_bind, fo_lookup, fo_register, fo_release, fo_reserve_new_slot,
 };
 #[path = "hosted_file_capture.rs"]
 pub(crate) mod hosted_file_capture;
@@ -1112,6 +1122,30 @@ struct PendingIrp {
     completion: nt_io_manager::RetainedIrpCompletion,
 }
 
+impl PendingIrp {
+    fn allocation_graph(&self) -> nt_io_manager::pending_irp_graph::PendingIrpAllocationGraph {
+        nt_io_manager::pending_irp_graph::PendingIrpAllocationGraph::new(
+            nt_io_manager::pending_irp_graph::PendingIrpGraphPointers {
+                reclaim: self
+                    .completion
+                    .completed()
+                    .map(|completion| completion.reclaim)
+                    .unwrap_or(0),
+                mdl: self.mdl,
+                aux_data: self.aux_data,
+                data: self.data,
+                create_parameters: self.create_parameters,
+                create_access_state: self.create_access_state,
+                create_security_context: self.create_security_context,
+                pnp_resource_list: self.pnp_resource_list,
+                irp: self.irp,
+                file_object: self.file_object,
+                owns_file: self.owns_fo,
+            },
+        )
+    }
+}
+
 static mut DATA_TRACE_COUNT: u32 = 0;
 /// Hosted-driver IRP dispatch sequence. This always increments; the print policy below is bounded.
 static FSD_DISPATCH_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1971,33 +2005,13 @@ unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
             );
         }
     }
-    let reclaim = entry
-        .completion
-        .completed()
-        .map(|completion| completion.reclaim)
-        .unwrap_or(0);
-    let candidates = [
-        reclaim,
-        entry.mdl,
-        if entry.aux_data != entry.data {
-            entry.aux_data
-        } else {
-            0
-        },
-        entry.data,
-        entry.create_parameters,
-        entry.create_access_state,
-        entry.create_security_context,
-        entry.pnp_resource_list,
-        entry.irp,
-        if entry.owns_fo { entry.file_object } else { 0 },
-    ];
-    for (index, pointer) in candidates.iter().copied().enumerate() {
-        if pointer != 0 && !candidates[..index].contains(&pointer) {
-            if entry.owns_fo && pointer == entry.file_object {
-                hosted_file_objects::free_file_storage(pointer);
-            } else {
-                pool_free(pointer);
+    for allocation in entry.allocation_graph().allocations() {
+        match allocation.release_kind {
+            nt_io_manager::pending_irp_graph::GraphReleaseKind::FileStorage => {
+                hosted_file_objects::free_file_storage(allocation.pointer);
+            }
+            nt_io_manager::pending_irp_graph::GraphReleaseKind::Pool => {
+                pool_free(allocation.pointer);
             }
         }
     }
@@ -2363,6 +2377,19 @@ unsafe fn poll_hosted_completion(instance_index: usize) -> Option<nt_io_manager:
             let completion = entry.completion.completed();
             pending_irp_owner_state(node_exec).store(ready_state, Ordering::Release);
             if canonical_irp_id != 0 && entry.owner_domain == owner_domain {
+                if !hosted_source_irp_ledger::caller_completion_publishable(
+                    storage_instance,
+                    node,
+                    ready_state & !HOSTED_IRP_STATE_MASK,
+                    canonical_irp_id,
+                    entry.irp,
+                    entry.source_ticket_id,
+                    entry.source_ticket_generation,
+                ) {
+                    node = next;
+                    steps += 1;
+                    continue;
+                }
                 if let Some(completion) = completion {
                     if best
                         .as_ref()
@@ -2638,76 +2665,14 @@ unsafe fn pool_free(p: u64) {
 pub(crate) static FSD_FO_OPENS: AtomicU64 = AtomicU64::new(0);
 /// IRPs that REUSED the open's existing FILE_OBJECT (the concurrent-IRP proof).
 pub(crate) static FSD_FO_REUSED: AtomicU64 = AtomicU64::new(0);
-/// Times a `Ccb->FileObject[end]` pointer npfs still holds was checked for liveness.
-pub(crate) static FSD_FO_LIVE_CHECKS: AtomicU64 = AtomicU64::new(0);
-/// …and was NOT one of our live per-open FILE_OBJECTs (a dangling FSD-held pointer).
-pub(crate) static FSD_FO_DANGLING: AtomicU64 = AtomicU64::new(0);
-/// …and no longer even CONTAINS a FILE_OBJECT (`Type != IO_TYPE_FILE` / wrong `Size`) — the hard,
-/// non-circular evidence of a use-after-free: the pool recycled the block under npfs' feet.
-pub(crate) static FSD_FO_CORRUPTED: AtomicU64 = AtomicU64::new(0);
 /// Opens rejected because the per-open FILE_OBJECT registry could not grow.
 pub(crate) static FSD_FO_TABLE_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 
-// --- npfs DATA-QUEUE CONSISTENCY AUDIT (the hang guard + the lifetime proof) -------------------
-//
-// npfs' own `ASSERT`s over these invariants are compiled out of the release `npfs.sys` we host, so
-// an inconsistency is not caught — it becomes the call-free `NpGetNextRealDataQueueEntry` spin
-// described above, which freezes the WHOLE boot (the executive blocks in `component_pump`'s recv,
-// RUNEXIT=124). Auditing the queues from the host BEFORE we dispatch into npfs turns that class of
-// failure into a bounded, counter-backed report — and, because the audit also validates the
-// FILE_OBJECT pointers npfs is holding, it is the direct proof that the lifetime fix above works.
-//
-// x64 offsets (`npfs.h`): NP_CCB { NodeType@0, NamedPipeState@2, ClientQos@8, CcbEntry@0x18,
-// Fcb@0x28, FileObject[2]@0x30, Process@0x40, ClientSession@0x48, NonPagedCcb@0x50,
-// DataQueue[2]@0x58 (0x28 each), ClientContext@0xA8, IrpList@0xB0 }.
-// NP_DATA_QUEUE { Queue(LIST_ENTRY)@0, QueueState@0x10, BytesInQueue@0x14, EntriesInQueue@0x18,
-// QuotaUsed@0x1c, ByteOffset@0x20, Quota@0x24 }.
-// NP_DATA_QUEUE_ENTRY { QueueEntry(LIST_ENTRY)@0, DataEntryType@0x10, Irp@0x18, QuotaInEntry@0x20,
-// ClientSecurityContext@0x28, DataSize@0x30 }.
+// Read-only NPFS diagnostic views; provider-private storage is never repaired by the host.
 const NPFS_NTC_CCB: u16 = 6;
-const NP_CCB_FILE_OBJECT: u64 = 0x30;
 const NP_CCB_DATA_QUEUE: u64 = 0x58;
 const NP_DATA_QUEUE_SIZE: u64 = 0x28;
-/// `NP_DATA_QUEUE_STATE::Empty`.
 const NP_QUEUE_EMPTY: u32 = 2;
-/// Largest legal `NP_DATA_QUEUE_ENTRY::DataEntryType` (Buffered=0, Unbuffered=1, plus npfs'
-/// internal 2 = flush-buffers marker and 3).
-const NP_ENTRY_TYPE_MAX: u32 = 3;
-/// Hard bound on a data-queue walk (npfs' quotas keep real queues tiny).
-const NP_QUEUE_WALK_MAX: u32 = 64;
-
-/// Data queues audited before dispatch.
-pub(crate) static FSD_QUEUE_AUDITS: AtomicU64 = AtomicU64::new(0);
-/// Data queues found INCONSISTENT and re-initialised to a consistent empty state (the hang guard).
-/// MUST be 0 on a healthy boot — a non-zero value is a gate failure, not a silent 555-second hang.
-pub(crate) static FSD_QUEUE_REPAIRS: AtomicU64 = AtomicU64::new(0);
-static mut QUEUE_DUMP_COUNT: u32 = 0;
-
-/// Print one data-queue dump line (bounded).
-unsafe fn queue_dump(tag: &[u8], dq: u64, state: u32, entries: u32, walked: u32, types: u32) {
-    print_str(tag);
-    print_str(b" dq=0x");
-    print_hex(dq as u32);
-    print_str(b" state=");
-    print_u64(state as u64);
-    print_str(b" entries=");
-    print_u64(entries as u64);
-    print_str(b" walked=");
-    print_u64(walked as u64);
-    print_str(b" types=0x");
-    print_hex(types);
-    unsafe {
-        print_str(b" bytes=");
-        print_u64(read_volatile((dq + 0x14) as *const u32) as u64);
-        print_str(b" quotaused=");
-        print_u64(read_volatile((dq + 0x1c) as *const u32) as u64);
-        print_str(b" byteoff=");
-        print_u64(read_volatile((dq + 0x20) as *const u32) as u64);
-        print_str(b" quota=");
-        print_u64(read_volatile((dq + 0x24) as *const u32) as u64);
-    }
-    print_str(b"\n");
-}
 
 #[derive(Clone, Copy)]
 struct PipeQueueView {
@@ -4191,6 +4156,9 @@ fn print_tcb_debug_opt(value: u64) {
     }
 }
 
+#[path = "fsd_diagnostics.rs"]
+mod fsd_diagnostics;
+
 unsafe fn trace_pipe_rw_result(
     major: u64,
     file_id: u64,
@@ -4223,28 +4191,7 @@ unsafe fn trace_pipe_rw_result(
         return;
     }
     PIPE_RW_TRACE_COUNT += 1;
-    print_str(b"[fsd-pipe-rw] major=");
-    print_u64(major);
-    print_str(b" fid=0x");
-    print_hex(file_id as u32);
-    print_str(b" end=");
-    print_u64(file_id & 1);
-    print_str(b" fsctx=0x");
-    print_hex(fsctx as u32);
-    print_str(b" len=");
-    print_u64(length);
-    print_str(b" status=0x");
-    print_hex(status);
-    print_str(b" info=");
-    print_u64(info);
-    print_dcerpc_pdu_view(pdu);
-    if let Some(view) = before {
-        print_pipe_ccb_view(b" before", view);
-    }
-    if let Some(view) = after {
-        print_pipe_ccb_view(b" after", view);
-    }
-    print_str(b"\n");
+    fsd_diagnostics::pipe_rw(major, file_id, fsctx, length, status, info, pdu, before, after);
 }
 
 unsafe fn trace_pipe_transceive_result(
@@ -4299,184 +4246,6 @@ unsafe fn trace_pipe_transceive_result(
     print_str(b"\n");
 }
 
-/// Audit ONE `NP_DATA_QUEUE`; repair (re-init to a consistent Empty) if any npfs invariant is
-/// broken. Returns true if a repair was made.
-unsafe fn audit_data_queue(dq: u64) -> bool {
-    let pool_end = FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000;
-    let flink = read_volatile(dq as *const u64);
-    let state = read_volatile((dq + 0x10) as *const u32);
-    let entries = read_volatile((dq + 0x18) as *const u32);
-    let list_empty = flink == dq;
-    let mut walked = 0u32;
-    let mut types = 0u32; // a bitmask of the DataEntryTypes seen (diagnostic)
-    let mut bad_link = false;
-    let mut bad_type = false;
-    let mut cur = flink;
-    while cur != dq {
-        if cur < FSD_POOL_VADDR + POOL_DATA_OFF || cur + 0x38 > pool_end || cur & 7 != 0 {
-            bad_link = true;
-            break;
-        }
-        let ty = read_volatile((cur + 0x10) as *const u32);
-        if ty > NP_ENTRY_TYPE_MAX {
-            bad_type = true;
-        } else {
-            types |= 1 << ty;
-        }
-        cur = read_volatile(cur as *const u64);
-        walked += 1;
-        if walked > NP_QUEUE_WALK_MAX {
-            bad_link = true;
-            break;
-        }
-    }
-    let inconsistent = bad_link
-        || bad_type
-        || state > NP_QUEUE_EMPTY
-        || (state == NP_QUEUE_EMPTY) != list_empty
-        || walked != entries;
-    FSD_QUEUE_AUDITS.fetch_add(1, Ordering::Relaxed);
-    if !inconsistent {
-        if QUEUE_DUMP_COUNT < 24 && !list_empty {
-            QUEUE_DUMP_COUNT += 1;
-            queue_dump(b"[fsd-queue]", dq, state, entries, walked, types);
-            let mut e = read_volatile(dq as *const u64);
-            let mut n = 0u32;
-            while e != dq && n <= NP_QUEUE_WALK_MAX {
-                if e < FSD_POOL_VADDR + POOL_DATA_OFF || e + 0x38 > pool_end {
-                    break;
-                }
-                let ty = read_volatile((e + 0x10) as *const u32);
-                let eirp = read_volatile((e + 0x18) as *const u64);
-                let dsz = read_volatile((e + 0x30) as *const u32);
-                let quota = read_volatile((e + 0x20) as *const u32);
-                print_str(b"[fsd-queue]   entry=");
-                print_hex(e as u32);
-                print_str(b" type=");
-                print_u64(ty as u64);
-                print_str(b" size=");
-                print_u64(dsz as u64);
-                print_str(b" quota=");
-                print_u64(quota as u64);
-                print_str(b" irp=");
-                print_hex(eirp as u32);
-                if eirp != 0
-                    && eirp >= FSD_POOL_VADDR + POOL_DATA_OFF
-                    && eirp + WDM_X64_IRP_SIZE as u64 <= pool_end
-                {
-                    let stack = read_volatile((eirp + 0xb8) as *const u64);
-                    let mj = if stack >= FSD_POOL_VADDR + POOL_DATA_OFF
-                        && stack + WDM_X64_IO_STACK_LOCATION_SIZE as u64 <= pool_end
-                    {
-                        read_volatile(stack as *const u8) as u64
-                    } else {
-                        0xFF
-                    };
-                    print_str(b" irp-major=");
-                    print_u64(mj);
-                }
-                print_str(b"\n");
-                e = read_volatile(e as *const u64);
-                n += 1;
-            }
-        }
-        return false;
-    }
-    FSD_QUEUE_REPAIRS.fetch_add(1, Ordering::Relaxed);
-    queue_dump(
-        b"[fsd-queue] INCONSISTENT -> repaired",
-        dq,
-        state,
-        entries,
-        walked,
-        types,
-    );
-    // Re-initialise exactly as `NpInitializeDataQueue` (`datasup.c:32`) does, keeping Quota: an
-    // empty circular list in state Empty. npfs can no longer spin on it.
-    write_volatile(dq as *mut u64, dq); // Flink = &Queue
-    write_volatile((dq + 8) as *mut u64, dq); // Blink = &Queue
-    write_volatile((dq + 0x10) as *mut u32, NP_QUEUE_EMPTY);
-    write_volatile((dq + 0x14) as *mut u32, 0); // BytesInQueue
-    write_volatile((dq + 0x18) as *mut u32, 0); // EntriesInQueue
-    write_volatile((dq + 0x1c) as *mut u32, 0); // QuotaUsed
-    write_volatile((dq + 0x20) as *mut u32, 0); // ByteOffset
-    true
-}
-
-/// Audit the CCB behind `fid` before an IRP is dispatched on it: the FILE_OBJECT pointers npfs is
-/// holding, then both data queues. No-op unless `fid` really is a `NPFS_NTC_CCB` inside the FSD pool.
-unsafe fn audit_ccb(fid: u64) {
-    if fid == 0 || fid == 1 {
-        return;
-    }
-    let ccb = fid & !1;
-    let pool_end = FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000;
-    if ccb < FSD_POOL_VADDR + POOL_DATA_OFF || ccb + 0xC0 > pool_end || ccb & 7 != 0 {
-        return;
-    }
-    if read_volatile(ccb as *const u16) != NPFS_NTC_CCB {
-        return;
-    }
-    if QUEUE_DUMP_COUNT < 24 {
-        let fcb = read_volatile((ccb + 0x28) as *const u64);
-        print_str(b"[fsd-ccb] ccb=");
-        print_hex(ccb as u32);
-        print_str(b" state=");
-        print_u64(read_volatile((ccb + 2) as *const u8) as u64);
-        print_str(b" readmode=");
-        print_u64(read_volatile((ccb + 3) as *const u8) as u64);
-        print_u64(read_volatile((ccb + 4) as *const u8) as u64);
-        print_str(b" complmode=");
-        print_u64(read_volatile((ccb + 5) as *const u8) as u64);
-        print_u64(read_volatile((ccb + 6) as *const u8) as u64);
-        print_str(b" fcb=");
-        print_hex(fcb as u32);
-        if fcb >= FSD_POOL_VADDR + POOL_DATA_OFF && fcb + 0x80 <= pool_end {
-            print_str(b" cfg=");
-            print_u64(read_volatile((fcb + 0x34) as *const u16) as u64);
-            print_str(b" pipetype=");
-            print_u64(read_volatile((fcb + 0x36) as *const u16) as u64);
-            print_str(b" instances=");
-            print_u64(read_volatile((fcb + 0x20) as *const u32) as u64);
-        }
-        print_str(b"\n");
-    }
-    // (a) the FILE_OBJECTs npfs still holds must still BE FILE_OBJECTs (the lifetime proof).
-    for end in 0..2u64 {
-        let held = read_volatile((ccb + NP_CCB_FILE_OBJECT + end * 8) as *const u64);
-        if held == 0 {
-            continue;
-        }
-        FSD_FO_LIVE_CHECKS.fetch_add(1, Ordering::Relaxed);
-        let in_pool = held >= FSD_POOL_VADDR + POOL_DATA_OFF
-            && held + WDM_X64_FILE_OBJECT_SIZE as u64 <= pool_end;
-        let looks_like_fo = in_pool
-            && read_volatile(held as *const u16) == WDM_X64_IO_TYPE_FILE as u16
-            && read_volatile((held + 2) as *const u16) == WDM_X64_FILE_OBJECT_SIZE as u16;
-        if !looks_like_fo && FSD_FO_CORRUPTED.fetch_add(1, Ordering::Relaxed) < 4 {
-            print_str(b"[fsd-fo] CORRUPT FSD-held FILE_OBJECT ccb=0x");
-            print_hex(ccb as u32);
-            print_str(b" end=");
-            print_u64(end);
-            print_str(b" fo=0x");
-            print_hex(held as u32);
-            print_str(b"\n");
-        }
-        if !fo_is_registered(held) && FSD_FO_DANGLING.fetch_add(1, Ordering::Relaxed) < 4 {
-            print_str(b"[fsd-fo] DANGLING FSD-held FILE_OBJECT ccb=0x");
-            print_hex(ccb as u32);
-            print_str(b" end=");
-            print_u64(end);
-            print_str(b" fo=0x");
-            print_hex(held as u32);
-            print_str(b"\n");
-        }
-    }
-    // (b) both data queues.
-    for q in 0..2u64 {
-        audit_data_queue(ccb + NP_CCB_DATA_QUEUE + q * NP_DATA_QUEUE_SIZE);
-    }
-}
 
 // --- KeBugCheckEx: a hosted driver's consistency bugcheck is CAUGHT, REPORTED and UNWOUND -------
 //
@@ -6612,7 +6381,7 @@ extern "win64" fn s_rtl_free_unicode_string(us: u64) {
     unsafe {
         if let Some((_len, _max, buf)) = unicode_string_triplet(us) {
             if buf != 0 {
-                pool_free(buf);
+                s_ex_free_pool(buf);
             }
             write_unaligned((us + UNICODE_STRING_LENGTH_OFFSET) as *mut u16, 0);
             write_unaligned((us + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *mut u16, 0);
@@ -6925,7 +6694,7 @@ extern "win64" fn s_rtl_free_ansi_string(s: u64) {
     unsafe {
         if let Some((_len, _max, buf)) = ansi_string_triplet(s) {
             if buf != 0 {
-                pool_free(buf);
+                s_ex_free_pool(buf);
             }
             write_unaligned((s + ANSI_STRING_LENGTH_OFFSET) as *mut u16, 0);
             write_unaligned((s + ANSI_STRING_MAXIMUM_LENGTH_OFFSET) as *mut u16, 0);
@@ -8737,14 +8506,23 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                     } else {
                         FSD_SERVICE_WRITE_FORWARD_LABEL
                     };
-                    let (reply_label, status, accepted, _, _) = call_on4(
+                    let (reply_label, status, accepted, token, _) = call_on4(
                         (forward_label << 12) | 4,
                         1,
                         device,
                         irp,
                         0,
                     );
-                    if reply_label != 0 || accepted > 1 {
+                    let typed_forward = matches!(major as u8,
+                        major::IRP_MJ_READ | major::IRP_MJ_FLUSH_BUFFERS | major::IRP_MJ_QUERY_INFORMATION);
+                    let disposition = if typed_forward {
+                        nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply::decode(
+                            status as u32 as i32, accepted,
+                        )
+                    } else { None };
+                    if reply_label != 0 || (typed_forward && disposition.is_none())
+                        || (typed_forward && status as u32 == STATUS_PENDING && token == 0)
+                        || (!typed_forward && accepted > 1) {
                         crate::provider_bugcheck::report(
                             0xc4,
                             [forward_label, 1, irp, reply_label],
@@ -8762,7 +8540,17 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                         (next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64,
                         device,
                     );
-                    let completion = complete_hosted_irp(irp);
+                    if typed_forward && status as u32 == STATUS_PENDING {
+                        let control = (next + WDM_X64_IO_STACK_CONTROL_OFFSET) as *mut u8;
+                        write_unaligned(control, read_unaligned(control) | WDM_X64_SL_PENDING_RETURNED);
+                        hosted_forward_origin::arm_pending(forward_label, irp, token);
+                        return STATUS_PENDING as i32;
+                    }
+                    let completion = complete_hosted_irp_with_owner(irp);
+                    if typed_forward && completion.outcome == HostedIrpUnwindOutcome::MoreProcessingRequired {
+                        hosted_forward_origin::acknowledge_inline_held(forward_label, irp, token);
+                        return status as u32 as i32;
+                    }
                     let (ack_label, ack_status, _, _, _) = call_on4(
                         (forward_label << 12) | 4,
                         2,
@@ -8776,7 +8564,9 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                             [forward_label, 2, irp, ack_status],
                         );
                     }
-                    if completion == HostedIrpUnwindOutcome::Terminal {
+                    if completion.outcome == HostedIrpUnwindOutcome::Terminal
+                        && completion.storage_owner == HostedIrpStorageOwner::DriverLocal
+                    {
                         s_io_free_irp(irp);
                     }
                     return status as u32 as i32;
@@ -11469,11 +11259,30 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
 }
 
 unsafe fn complete_hosted_irp(irp: u64) -> HostedIrpUnwindOutcome {
+    unsafe { complete_hosted_irp_with_owner(irp).outcome }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostedIrpStorageOwner {
+    DriverLocal,
+    CanonicalCaller,
+}
+
+struct HostedIrpCompletionReceipt {
+    outcome: HostedIrpUnwindOutcome,
+    storage_owner: HostedIrpStorageOwner,
+}
+
+unsafe fn complete_hosted_irp_with_owner(irp: u64) -> HostedIrpCompletionReceipt {
     unsafe {
         let claim = claim_pending_irp_completion(irp);
         if claim.is_none() && pending_irp_raw_identity_exists(irp) {
             panic!("IoCompleteRequest attempted to complete an owned IRP twice");
         }
+        let storage_owner = match claim {
+            Some(_) => HostedIrpStorageOwner::CanonicalCaller,
+            None => HostedIrpStorageOwner::DriverLocal,
+        };
         let active_seq = FSD_ACTIVE_DISPATCH_SEQ.load(Ordering::Relaxed);
         if active_seq >= 128 && FSD_ACTIVE_COMPLETE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16
         {
@@ -11530,7 +11339,10 @@ unsafe fn complete_hosted_irp(irp: u64) -> HostedIrpUnwindOutcome {
                 if let Some(claim) = claim {
                     park_pending_irp_completion_claim(claim);
                 }
-                return HostedIrpUnwindOutcome::MoreProcessingRequired;
+                return HostedIrpCompletionReceipt {
+                    outcome: HostedIrpUnwindOutcome::MoreProcessingRequired,
+                    storage_owner,
+                };
             }
             Ok(HostedIrpUnwindOutcome::Terminal) => {}
             Err(()) => {
@@ -11547,7 +11359,10 @@ unsafe fn complete_hosted_irp(irp: u64) -> HostedIrpUnwindOutcome {
         }
         let Some(claim) = claim else {
             finish_driver_local_irp(irp);
-            return HostedIrpUnwindOutcome::Terminal;
+            return HostedIrpCompletionReceipt {
+                outcome: HostedIrpUnwindOutcome::Terminal,
+                storage_owner,
+            };
         };
         let node = claim.node;
         let target = claim.target;
@@ -11638,7 +11453,10 @@ unsafe fn complete_hosted_irp(irp: u64) -> HostedIrpUnwindOutcome {
             print_u64(information);
             print_str(b"\n");
         }
-        HostedIrpUnwindOutcome::Terminal
+        HostedIrpCompletionReceipt {
+            outcome: HostedIrpUnwindOutcome::Terminal,
+            storage_owner,
+        }
     }
 }
 
@@ -14786,7 +14604,8 @@ unsafe fn consumer_file_object_in_local_pool(object: u64) -> bool {
 
 unsafe fn consumer_device_object_in_local_pool(object: u64) -> bool {
     component_pool_allocation_capacity(object)
-        .is_some_and(|capacity| capacity >= WDM_X64_DEVICE_OBJECT_SIZE as u64)
+        .is_some_and(|capacity| capacity >= nt_io_manager::WdmDeviceObjectAllocationLayout::plan(0)
+            .expect("zero driver extension has a representable layout").allocation_size() as u64)
         && read_unaligned(object as *const i16) == WDM_X64_IO_TYPE_DEVICE
 }
 
@@ -15807,87 +15626,9 @@ extern "win64" fn s_hal_set_bus_data_by_offset(
     )
 }
 
-struct DebugPrintfOutput;
-
-impl nt_printf::Output for DebugPrintfOutput {
-    fn write(&mut self, unit: u16) -> bool {
-        debug_put_char(unit as u8);
-        true
-    }
-}
-
-unsafe fn write_debug_prefix(prefix: u64) {
-    if prefix == 0 {
-        return;
-    }
-    let mut cursor = prefix;
-    loop {
-        let byte = read_volatile(cursor as *const u8);
-        if byte == 0 {
-            return;
-        }
-        debug_put_char(byte);
-        cursor = cursor.saturating_add(1);
-    }
-}
-
-unsafe fn format_debug_driver<A: nt_printf::Arguments>(prefix: u64, fmt: u64, args: &mut A) -> i32 {
-    if fmt == 0 {
-        return STATUS_INVALID_PARAMETER;
-    }
-    write_debug_prefix(prefix);
-    let mut output = DebugPrintfOutput;
-    match nt_printf::format_narrow(fmt as *const u8, args, &mut output) {
-        Ok(_) => STATUS_SUCCESS,
-        Err(()) => STATUS_INVALID_PARAMETER,
-    }
-}
-
-#[no_mangle]
-extern "win64" fn s_dbg_print_body(fmt: u64, a0: u64, a1: u64, a2: u64, caller_rsp: u64) -> i32 {
-    let mut args = Win64PrintfArguments::new([a0, a1, a2], 3, caller_rsp);
-    unsafe { format_debug_driver(0, fmt, &mut args) }
-}
-
-#[no_mangle]
-extern "win64" fn s_dbg_print_ex_body(
-    _component_id: u64,
-    _level: u64,
-    fmt: u64,
-    a0: u64,
-    caller_rsp: u64,
-) -> i32 {
-    let mut args = Win64PrintfArguments::new([a0, 0, 0], 1, caller_rsp);
-    unsafe { format_debug_driver(0, fmt, &mut args) }
-}
-
-#[no_mangle]
-extern "win64" fn s_video_port_debug_print_body(
-    _level: u64,
-    fmt: u64,
-    a0: u64,
-    a1: u64,
-    caller_rsp: u64,
-) -> i32 {
-    let mut args = Win64PrintfArguments::new([a0, a1, 0], 2, caller_rsp);
-    unsafe { format_debug_driver(0, fmt, &mut args) }
-}
-
-extern "win64" fn s_vdbg_print_ex(_component_id: u32, _level: u32, fmt: u64, va_list: u64) -> i32 {
-    let mut args = VaListPrintfArguments { cursor: va_list };
-    unsafe { format_debug_driver(0, fmt, &mut args) }
-}
-
-extern "win64" fn s_vdbg_print_ex_with_prefix(
-    prefix: u64,
-    _component_id: u32,
-    _level: u32,
-    fmt: u64,
-    va_list: u64,
-) -> i32 {
-    let mut args = VaListPrintfArguments { cursor: va_list };
-    unsafe { format_debug_driver(prefix, fmt, &mut args) }
-}
+#[path = "hosted_debug_print.rs"]
+mod hosted_debug_print;
+use hosted_debug_print::{s_vdbg_print_ex, s_vdbg_print_ex_with_prefix};
 
 core::arch::global_asm!(
     ".text",
@@ -15921,6 +15662,22 @@ extern "win64" {
     fn hosted_dbg_print_gate();
     fn hosted_dbg_print_ex_gate();
     fn hosted_video_port_debug_print_gate();
+}
+
+pub(crate) fn bind_debug_exports(reg: &mut DriverExportRegistry) {
+    reg.bind(
+        "vDbgPrintExWithPrefix",
+        s_vdbg_print_ex_with_prefix as *const () as usize as u64,
+    );
+    reg.bind("vDbgPrintEx", s_vdbg_print_ex as *const () as usize as u64);
+    reg.bind(
+        "DbgPrint",
+        hosted_dbg_print_gate as *const () as usize as u64,
+    );
+    reg.bind(
+        "DbgPrintEx",
+        hosted_dbg_print_ex_gate as *const () as usize as u64,
+    );
 }
 
 extern "win64" fn s_dbg_query_debug_filter_state(_component_id: u32, _level: u32) -> u8 {
@@ -33635,19 +33392,7 @@ fn register_fsd_trampolines() -> bool {
         s_io_get_current_process as *const () as usize as u64,
     );
     // Debug print exports retain their distinct Win64 variadic and va_list ABIs.
-    reg.bind(
-        "vDbgPrintExWithPrefix",
-        s_vdbg_print_ex_with_prefix as *const () as usize as u64,
-    );
-    reg.bind("vDbgPrintEx", s_vdbg_print_ex as *const () as usize as u64);
-    reg.bind(
-        "DbgPrint",
-        hosted_dbg_print_gate as *const () as usize as u64,
-    );
-    reg.bind(
-        "DbgPrintEx",
-        hosted_dbg_print_ex_gate as *const () as usize as u64,
-    );
+    bind_debug_exports(reg);
     reg.bind(
         "DbgQueryDebugFilterState",
         s_dbg_query_debug_filter_state as *const () as usize as u64,
@@ -35059,13 +34804,6 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     // CREATE. The component never fabricates a replacement for a missing binding.
     let uses_file_object = canonical_file_id != 0;
 
-    // ★ Audit the CCB's data queues (and the FILE_OBJECTs npfs holds) BEFORE handing it an IRP.
-    // npfs' own ASSERTs over these invariants are compiled out of the release binary, and a broken
-    // one is a call-free infinite spin inside `NpGetNextRealDataQueueEntry` that freezes the whole
-    // boot. See [`audit_ccb`].
-    if uses_file_object {
-        audit_ccb(file_id);
-    }
     let pipe_rw_before = if major == IRP_MJ_READ
         || major == IRP_MJ_WRITE
         || (major == IRP_MJ_FILE_SYSTEM_CONTROL && fsctl == FSCTL_PIPE_TRANSCEIVE)
@@ -36182,27 +35920,11 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         && FSD_DEVICE_CONTROL_FAILURE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed)
             < FSD_DEVICE_CONTROL_FAILURE_TRACE_CAP
     {
-        print_str(b"[fsd-control-failure] ioctl=0x");
-        print_hex(fsctl as u32);
-        print_str(b" handler=0x");
-        print_hex64(handler);
-        print_str(b" device=0x");
-        print_hex64(devobj);
-        print_str(b" return=0x");
-        print_hex(ret as u32);
-        print_str(b" irp-status=0x");
-        print_hex(post_call_irp_status);
-        print_str(b" irp-information=");
-        print_u64(post_call_irp_information);
-        print_str(b" owner-kind=");
-        print_u64(post_call_owner_kind);
-        print_str(b" final=0x");
-        print_hex(st as u32);
-        print_str(b" information=");
-        print_u64(info);
-        print_str(b" retained-completion=");
-        print_u64(retained_completion.is_some() as u64);
-        print_str(b"\n");
+        fsd_diagnostics::control_failure(
+            fsctl as u32, handler, devobj, ret as u32, post_call_irp_status,
+            post_call_irp_information, post_call_owner_kind, st as u32, info,
+            retained_completion.is_some(),
+        );
     }
     if (major == IRP_MJ_READ || major == IRP_MJ_WRITE) && DATA_TRACE_COUNT < 12 {
         DATA_TRACE_COUNT += 1;
@@ -38208,7 +37930,7 @@ unsafe fn load_driver_reserved(
             nt_status::NtStatus::DEVICE_BUSY
         }
     })?;
-    let parent = crate::spawn_hosts::shared_ingress::owner::runtime::nested::park_current()
+    let mut parent = crate::spawn_hosts::shared_ingress::owner::runtime::nested::park_current()
         .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL)?;
     crate::spawn_hosts::shared_ingress::owner::runtime::start_bootstrap(route, cnode, sched_context)
         .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL)?;
@@ -38250,7 +37972,7 @@ unsafe fn load_driver_reserved(
         },
     };
     let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
-    crate::spawn_hosts::shared_ingress::owner::runtime::nested::restore(parent)
+    crate::spawn_hosts::shared_ingress::owner::runtime::nested::restore(&mut parent)
         .map_err(|_| nt_status::NtStatus::UNSUCCESSFUL)?;
     let faults = pr.faults;
     let demand = pr.demand;
@@ -38953,6 +38675,28 @@ pub(crate) fn io_manager_mut() -> &'static mut ExecutiveIoManager {
         }
         (*slot).assume_init_mut()
     }
+}
+
+/// Observe one canonical projection without retaining a publication lease or provider pointer.
+/// The temporary enumeration is dropped before the next native dispatch; only the typed receipt
+/// crosses that boundary. Observation failure is not absence or successful lifetime proof.
+pub(crate) fn capture_file_projection_identity(
+    file: u64,
+) -> Option<nt_io_manager::HostedFileIdentity> {
+    let _transient = crate::allocator::enter_transient();
+    let identities = io_manager_mut().hosted_file_identities(FileId(file)).ok()?;
+    if identities.len() != 1 {
+        return None;
+    }
+    Some(identities[0])
+}
+
+pub(crate) fn file_projection_identity_is_current(
+    identity: nt_io_manager::HostedFileIdentity,
+) -> bool {
+    io_manager_mut().hosted_file_identity_at(
+        identity.domain(), identity.file_id(), identity.address(),
+    ) == Ok(Some(identity))
 }
 
 pub(crate) fn registered_dos_drive_type(target: &[u8]) -> Option<u8> {
@@ -44622,7 +44366,10 @@ fn dispatch_external_irp_to_device_record_result_exact(
     )
     .ok_or(STATUS_INVALID_PARAMETER as u32)?;
     if registered_file_target(device_id, major)? == RegisteredFileTarget::Kernel {
-        if initial_information != 0 || (!in_data.is_empty() && !out.is_empty()) {
+        if !nt_io_abi::valid_initial_information(major, initial_information, input_len, output_len) {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER.raw() as u32);
+        }
+        if !in_data.is_empty() && !out.is_empty() {
             return Err(nt_status::NtStatus::NOT_SUPPORTED.raw() as u32);
         }
         let mut buffer = Vec::new();
@@ -44632,8 +44379,16 @@ fn dispatch_external_irp_to_device_record_result_exact(
             .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw() as u32)?;
         buffer.resize(capacity, 0);
         buffer[..in_data.len()].copy_from_slice(in_data);
+        let control_code = match &params {
+            IoParameters::DeviceControl(parameters)
+            | IoParameters::InternalDeviceControl(parameters) => parameters.ioctl_code,
+            _ => 0,
+        };
+        if nt_io_abi::initial_output_required(major, control_code, output_len) {
+            buffer[..out.len()].copy_from_slice(out);
+        }
         let result = io_manager_mut()
-            .build_and_dispatch_external_to_device_with_stack_flags(
+            .build_and_dispatch_external_to_device_with_stack_flags_and_initial_information(
                 ClientId(IO_MANAGER_COMPONENT_ID),
                 nt_io_manager::DeviceId(device_id),
                 canonical_file_id,
@@ -44644,6 +44399,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
                 stack_flags,
                 input_len,
                 output_len,
+                initial_information,
                 &mut buffer,
             )
             .map_err(|status| status.raw() as u32)?;
@@ -44969,22 +44725,23 @@ unsafe fn validate_and_sync_hosted_device_projection(
     let (device_exec, capacity) =
         hosted_pool_allocation_exec_range(inst.exec_pool_va, device_object)
             .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    let required = (WDM_X64_DEVICE_OBJECT_SIZE as u64)
-        .checked_add(extension_size as u64)
-        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    let expected_extension = if extension_size == 0 {
-        0
-    } else {
-        device_object + WDM_X64_DEVICE_OBJECT_SIZE as u64
-    };
-    let expected_size =
-        u16::try_from(required).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+    let layout = nt_io_manager::WdmDeviceObjectAllocationLayout::plan(extension_size)
+        .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+    let required = layout.allocation_size() as u64;
+    let expected_extension = layout.driver_extension_offset()
+        .map_or(0, |offset| device_object + offset as u64);
+    let expected_size = layout.size_field();
+    let kernel_offset = layout.kernel_extension_offset() as u64;
     if capacity < required
         || hosted_instance_pool_allocation_is_free_unlocked(inst, device_object) != Some(false)
         || read_unaligned(device_exec as *const i16) != WDM_X64_IO_TYPE_DEVICE
         || read_unaligned((device_exec + 2) as *const u16) != expected_size
         || read_unaligned((device_exec + 0x08) as *const u64) != expected_driver_object
         || read_unaligned((device_exec + 0x40) as *const u64) != expected_extension
+        || read_unaligned((device_exec + 0x138) as *const u64) != device_object + kernel_offset
+        || read_unaligned((device_exec + kernel_offset) as *const u16) != 13
+        || read_unaligned((device_exec + kernel_offset + 2) as *const u16) != 0
+        || read_unaligned((device_exec + kernel_offset + 8) as *const u64) != device_object
         || read_unaligned((device_exec + 0x48) as *const u32) != device_type.0
         || read_unaligned((device_exec + 0x34) as *const u32) != characteristics.bits()
     {
@@ -49993,7 +49750,7 @@ unsafe fn ensure_hosted_irq_lane(
         quarantine_shared_hosted_irq_lane(lane_index);
         return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
     };
-    let parent = runtime::nested::park_current().expect("retain parent before IRQ startup");
+    let mut parent = runtime::nested::park_current().expect("retain parent before IRQ startup");
     let started = (|| {
         // Mark possible execution before entering the one-shot native resume owner.
         hosted_irq_lanes_mut()[lane_index].tcb_resumed = true;
@@ -50020,11 +49777,11 @@ unsafe fn ensure_hosted_irq_lane(
             "failed IRQ startup retains semantic owner and parent");
         retire_hosted_irq_lane_if_unreferenced(projection_instance, domain)
             .expect("failed IRQ startup retains uncertain drain and parent");
-        runtime::nested::restore(parent).expect("restore parent after canceled IRQ startup");
+        runtime::nested::restore(&mut parent).expect("restore parent after canceled IRQ startup");
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
     }
     hosted_irq_lanes_mut()[lane_index].state = HostedIrqLaneState::Ready;
-    runtime::nested::restore(parent).expect("restore parent after acknowledged IRQ readiness");
+    runtime::nested::restore(&mut parent).expect("restore parent after acknowledged IRQ readiness");
     Ok(generation)
 }
 
@@ -51887,15 +51644,12 @@ pub(crate) fn service_hosted_device(
             else {
                 return (STATUS_INVALID_PARAMETER, 0, 0, 0);
             };
-            let required_device_bytes =
-                match (WDM_X64_DEVICE_OBJECT_SIZE as u64).checked_add(extension_size as u64) {
-                    Some(bytes) => bytes,
-                    None => return (STATUS_INVALID_PARAMETER, 0, 0, 0),
-                };
-            let expected_device_size = match u16::try_from(required_device_bytes) {
-                Ok(size) => size,
+            let layout = match nt_io_manager::WdmDeviceObjectAllocationLayout::plan(extension_size) {
+                Ok(layout) => layout,
                 Err(_) => return (STATUS_INVALID_PARAMETER, 0, 0, 0),
             };
+            let required_device_bytes = layout.allocation_size() as u64;
+            let expected_device_size = layout.size_field();
             if driver_capacity < WDM_X64_DRIVER_OBJECT_SIZE as u64
                 || device_capacity < required_device_bytes
                 || hosted_instance_pool_allocation_is_free_unlocked(inst, arg2) != Some(false)
@@ -51909,12 +51663,15 @@ pub(crate) fn service_hosted_device(
             {
                 return (STATUS_INVALID_PARAMETER, 0, 0, 0);
             }
-            let expected_extension = if extension_size == 0 {
-                0
-            } else {
-                pdo_object + WDM_X64_DEVICE_OBJECT_SIZE as u64
-            };
-            if read_unaligned((device_exec + 0x40) as *const u64) != expected_extension {
+            let expected_extension = layout.driver_extension_offset()
+                .map_or(0, |offset| pdo_object + offset as u64);
+            let kernel_offset = layout.kernel_extension_offset() as u64;
+            if read_unaligned((device_exec + 0x40) as *const u64) != expected_extension
+                || read_unaligned((device_exec + 0x138) as *const u64) != pdo_object + kernel_offset
+                || read_unaligned((device_exec + kernel_offset) as *const u16) != 13
+                || read_unaligned((device_exec + kernel_offset + 2) as *const u16) != 0
+                || read_unaligned((device_exec + kernel_offset + 8) as *const u64) != pdo_object
+            {
                 return (STATUS_INVALID_PARAMETER, 0, 0, 0);
             }
             (
@@ -54070,6 +53827,17 @@ struct HostedDriverThreadRuntime {
 }
 
 #[derive(Clone, Copy)]
+struct HostedWorkerSharedBankSpec {
+    offset: u64,
+}
+
+#[derive(Clone, Copy)]
+struct HostedWorkerSharedBank {
+    component: u64,
+    executive: u64,
+}
+
+#[derive(Clone, Copy)]
 struct HostedDriverThreadSpawn {
     tcb: u64,
     reply_cap: u64,
@@ -54081,6 +53849,7 @@ struct HostedDriverThreadSpawn {
     raw_cnode: u64,
     cnode: u64,
     sched_context: u64,
+    shared_bank: Option<HostedWorkerSharedBank>,
 }
 
 struct HostedDriverRawWaiter {
@@ -54268,6 +54037,13 @@ fn hosted_driver_caller(
                     && row.ingress_route == Some(route))?;
             Some(runtime)
         }
+        PhysicalSourceKind::DispatchWorker { ordinal } => {
+            let runtime = unsafe { hosted_source_completion_lane::worker(instance, ordinal)? };
+            if runtime.domain != domain || runtime.tcb != source.tcb
+                || runtime.pml4 != source.pml4 || runtime.ingress_route != Some(route)
+            { return None; }
+            Some(runtime)
+        }
         _ => return None,
     };
     let (handle, tcb) = runtime.map_or((inst.main_thread_id, inst.tcb), |rt| (rt.handle, rt.tcb));
@@ -54313,9 +54089,14 @@ fn clear_hosted_driver_threads_for_instance(instance: usize) {
             let runtime = (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_RUNTIMES)).as_ref()
                 .and_then(|rows| rows.get(index)).copied();
             let Some(runtime) = runtime.filter(|runtime| runtime.instance == instance) else { continue; };
+            if !hosted_source_completion_lane::begin_worker_retirement(instance, runtime.handle) {
+                continue;
+            }
             let _ = hosted_driver_thread_table_mut(instance).and_then(|table|
                 table.terminate(runtime.handle, nt_status::NtStatus::CANCELLED.raw() as i32).ok());
-            let _ = hosted_thread_resources::retire_thread(instance, runtime.handle);
+            if hosted_thread_resources::retire_thread(instance, runtime.handle) {
+                hosted_source_completion_lane::finish_worker_retirement(instance, runtime.handle);
+            }
         }
     }
 }
@@ -55436,7 +55217,8 @@ fn instance_for_pump_channel(
     ch: &crate::spawn_hosts::PumpChannel,
     active_reply_cap: u64,
 ) -> Option<(usize, DriverInstance)> {
-    let (instance, inst) = instance_by_shared_va(ch.shared_va)?;
+    let (instance, inst) = instance_by_shared_va(ch.shared_va)
+        .or_else(|| unsafe { hosted_source_completion_lane::instance_for_shared(ch.shared_va) })?;
     let captured = nt_io_manager::HostedTransportIdentity {
         domain: ch.physical_domain?,
         endpoint: ch.fault_ep,
@@ -55449,7 +55231,10 @@ fn instance_for_pump_channel(
         vspace: inst.pml4,
         shared: inst.exec_shared_va,
     };
-    if !captured.matches_live(live) || active_reply_cap == 0 {
+    let completion_lane = unsafe {
+        hosted_source_completion_lane::matches_channel(instance, inst, ch)
+    };
+    if (!captured.matches_live(live) && !completion_lane) || active_reply_cap == 0 {
         return None;
     }
     let route = unsafe { crate::spawn_hosts::shared_ingress::owner::runtime::channel_route(ch).ok()?? };
@@ -57372,6 +57157,10 @@ pub(crate) unsafe fn service_hosted_read_forward(
             .map(|status| (status, false)),
         2 if irp == 0 => hosted_read_work::acknowledge(ch, reply_cap, badge, address)
             .map(|status| (status, false)),
+        3 => hosted_read_work::arm_pending(ch, reply_cap, badge, address, irp)
+            .map(|status| (status, false)),
+        4 => hosted_read_work::acknowledge_held(ch, reply_cap, badge, address, irp)
+            .map(|status| (status, false)),
         _ => Some((STATUS_INVALID_PARAMETER, false)),
     }
 }
@@ -57392,6 +57181,10 @@ pub(crate) unsafe fn service_hosted_flush_forward(
         1 => hosted_flush_work::submit(ch, irp, address, badge, reply_cap)
             .map(|status| (status, false)),
         2 if irp == 0 => hosted_flush_work::acknowledge(ch, reply_cap, badge, address)
+            .map(|status| (status, false)),
+        3 => hosted_flush_work::arm_pending(ch, reply_cap, badge, address, irp)
+            .map(|status| (status, false)),
+        4 => hosted_flush_work::acknowledge_held(ch, reply_cap, badge, address, irp)
             .map(|status| (status, false)),
         _ => Some((STATUS_INVALID_PARAMETER, false)),
     }
@@ -57423,6 +57216,10 @@ pub(crate) unsafe fn service_hosted_query_information_forward(
         2 if irp == 0 => hosted_query_information_work::acknowledge(
             ch, reply_cap, badge, address,
         ).map(|status| (status, false)),
+        3 => hosted_query_information_work::arm_pending(ch, reply_cap, badge, address, irp)
+            .map(|status| (status, false)),
+        4 => hosted_query_information_work::acknowledge_held(ch, reply_cap, badge, address, irp)
+            .map(|status| (status, false)),
         _ => Some((STATUS_INVALID_PARAMETER, false)),
     }
 }
@@ -57782,6 +57579,20 @@ unsafe fn spawn_hosted_driver_worker_thread(
     start_routine: u64,
     start_context: u64,
 ) -> Option<HostedDriverThreadSpawn> {
+    spawn_hosted_driver_worker_thread_with_shared_bank(
+        instance, inst, handle, component_slot, start_routine, start_context, None,
+    )
+}
+
+unsafe fn spawn_hosted_driver_worker_thread_with_shared_bank(
+    instance: usize,
+    inst: DriverInstance,
+    handle: u64,
+    component_slot: usize,
+    start_routine: u64,
+    start_context: u64,
+    shared_bank_spec: Option<HostedWorkerSharedBankSpec>,
+) -> Option<HostedDriverThreadSpawn> {
     let component_base = hosted_worker_component_base_for_slot(component_slot)?;
     let stack_base = component_base;
     let ipcbuf_va = component_base.checked_add(FSD_WORKER_IPCBUF_OFFSET)?;
@@ -57793,9 +57604,27 @@ unsafe fn spawn_hosted_driver_worker_thread(
     let tramp_exec_va = exec_base.checked_add(FSD_WORKER_TRAMP_OFFSET)?;
     let scratch_exec_va = exec_base.checked_add(FSD_WORKER_SCRATCH_OFFSET)?;
     let kpcr_exec_va = exec_base.checked_add(FSD_WORKER_KPCR_OFFSET)?;
+    let shared_bank = match shared_bank_spec {
+        Some(spec) => {
+            if spec.offset & 0xfff != 0
+                || spec.offset < FSD_WORKER_KPCR_OFFSET.checked_add(0x1000)?
+                || spec.offset.checked_add(0x1000)? > FSD_WORKER_STRIDE
+            {
+                return None;
+            }
+            Some(HostedWorkerSharedBank {
+                component: component_base.checked_add(spec.offset)?,
+                executive: exec_base.checked_add(spec.offset)?,
+            })
+        }
+        None => None,
+    };
+    let additional_resources = if shared_bank.is_some() { 2 } else { 0 };
 
     let domain = instance_domain_identity(inst)?;
-    let Some(construction) = hosted_thread_resources::begin(instance, handle, domain, inst.pml4) else {
+    let Some(construction) = hosted_thread_resources::begin(
+        instance, handle, domain, inst.pml4, additional_resources,
+    ) else {
         print_str(b"[driver-thread] construction reservation failed\n");
         return None;
     };
@@ -57851,6 +57680,20 @@ unsafe fn spawn_hosted_driver_worker_thread(
         print_hex(status);
         print_str(b"\n");
         return None;
+    }
+
+    if let Some(bank) = shared_bank {
+        let frame = alloc_frame();
+        hosted_thread_resources::root(construction, frame);
+        let executive_frame = copy_cap(frame);
+        hosted_thread_resources::root(construction, executive_frame);
+        hosted_thread_resources::mapping(construction, frame);
+        if page_map_r(frame, bank.component, RW_NX, inst.pml4) != 0 { return None; }
+        hosted_thread_resources::mapping(construction, executive_frame);
+        if page_map_r(executive_frame, bank.executive, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+            return None;
+        }
+        core::ptr::write_bytes(bank.executive as *mut u8, 0, 0x1000);
     }
 
     let ipcbuf = alloc_frame();
@@ -57947,6 +57790,7 @@ unsafe fn spawn_hosted_driver_worker_thread(
         sched_context,
         component_scratch_va: scratch_va,
         exec_scratch_va: scratch_exec_va,
+        shared_bank,
     })
 }
 

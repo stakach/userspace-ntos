@@ -19,12 +19,12 @@ mod services;
 pub(crate) use services::{
     acknowledge_retained_service_cancellation, cancel_parked_service, finish_autonomous,
     next_service_wait_token, park_retained_service, park_service, reconcile_retained_service_reply,
-    resume_acknowledged_retained_services, resume_service, retained_service_cancelled,
+    resume_acknowledged_retained_services, resume_service, retained_service_resume_ready, retained_service_cancelled,
     retained_service_owner_stopped, retained_service_owner_stopped_at_broker,
     retained_service_reply_acknowledged,
     retained_service_reply_not_entered, retained_service_resume_next_deadline,
     retire_stopped_acknowledged_retained_service, wake_file_create_service,
-    wake_query_path_rejected_service, wake_query_path_service, wake_registry_service,
+    wake_query_path_rejected_service, wake_query_path_service, wake_hosted_forward_service, wake_registry_service,
     wake_section_create_service, wake_service,
 };
 
@@ -39,7 +39,12 @@ pub(crate) use hosted::{
     finish_acknowledged_hosted_reply, hosted_can_resume, hosted_cancellation_proven,
     hosted_reply_cancelled, owns_hosted_reply, release_hosted_reply, reply_hosted, restart_hosted,
     stop_and_cancel_hosted, stop_hosted_caller, take_hosted_with,
+    bind_receive_settlement, prepare_receive_settlement, take_outer_boundary,
+    ReceiveSettlementBoundary, ReceiveChildObservation,
+    receive_child_pending, receive_child_is_current, receive_child_observation,
+    receive_child_delivery_allowed, with_bound_receive_scope,
 };
+pub(crate) use hosted::PendingSnapshot;
 
 const RETAINED_CALL_CAPACITY: usize = 256;
 const PEER_CAPACITY: usize = 256;
@@ -74,6 +79,41 @@ struct NativePeer {
 static mut SOURCES: IngressSourceRegistry = IngressSourceRegistry::new();
 static mut NATIVE_PEERS: Vec<NativePeer> = Vec::new();
 static mut INITIAL_REPLIES: Vec<Option<ComponentIngress<ReceivedMessage>>> = Vec::new();
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RunningSnapshot {
+    pub lane: nt_component_suspension::LaneHandle,
+    pub binding: Option<nt_component_suspension::LaneBinding>,
+    pub dispatch: Option<LaneDispatchIdentity>,
+    pub route: Option<PeerRoute>,
+    pub physical: Option<PhysicalSource>,
+    pub quarantined: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HoldSnapshot {
+    pub running: Option<RunningSnapshot>,
+    pub oldest: Option<hosted::PendingSnapshot>,
+}
+
+/// Evidence only: called at serialized event boundaries after mutable ingress borrows end.
+pub(crate) unsafe fn hold_snapshot() -> HoldSnapshot {
+    let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);
+    let peers = &*core::ptr::addr_of!(NATIVE_PEERS);
+    let running = lanes.running().map(|lane| {
+        let route = lanes.peer_route(lane).ok().flatten();
+        let peer = route.and_then(|route| peers.iter().find(|peer| peer.route == Some(route)));
+        RunningSnapshot {
+            lane,
+            binding: lanes.binding(lane).ok(),
+            dispatch: lanes.active_dispatch_identity(lane).ok().flatten(),
+            route,
+            physical: peer.map(|peer| peer.physical),
+            quarantined: peer.map(|peer| peer.quarantined),
+        }
+    });
+    HoldSnapshot { running, oldest: hosted::oldest_pending_snapshot() }
+}
 
 unsafe fn lanes() -> &'static mut ComponentLanes {
     &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS)
@@ -977,23 +1017,46 @@ pub(crate) unsafe fn complete_protocol(
         return Err(Error::Admission);
     }
     let (incoming, _) = next_message(route)?.ok_or(Error::Protocol)?;
+    let index = (&*core::ptr::addr_of!(NATIVE_PEERS))
+        .iter()
+        .position(|row| row.route == Some(route))
+        .ok_or(Error::UnknownPeer)?;
     let owner = owner();
     let _saved = crate::ipc_message::SavedMessageBuffer::capture();
-    owner
-        .receiver
-        .as_mut()
-        .expect("ready receiver")
-        .complete_protocol_from_message(
-            route,
-            dispatch,
-            incoming,
-            label,
-            words,
-            lanes(),
-            owner.peers.as_mut().expect("ready peers"),
-            |tcb, reply| crate::spawn_hosts::query_component_reply_binding(tcb, reply),
-        )
-        .map_err(|_| Error::Protocol)?;
+    if (&*core::ptr::addr_of!(NATIVE_PEERS))[index].bootstrap {
+        owner
+            .receiver
+            .as_mut()
+            .expect("ready receiver")
+            .complete_bootstrap_protocol_from_message(
+                route,
+                dispatch,
+                incoming,
+                label,
+                words,
+                lanes(),
+                owner.peers.as_ref().expect("ready peers"),
+                |tcb, reply| crate::spawn_hosts::query_component_reply_binding(tcb, reply),
+            )
+            .map_err(|_| Error::Protocol)?;
+        (&mut *core::ptr::addr_of_mut!(NATIVE_PEERS))[index].bootstrap = false;
+    } else {
+        owner
+            .receiver
+            .as_mut()
+            .expect("ready receiver")
+            .complete_protocol_from_message(
+                route,
+                dispatch,
+                incoming,
+                label,
+                words,
+                lanes(),
+                owner.peers.as_mut().expect("ready peers"),
+                |tcb, reply| crate::spawn_hosts::query_component_reply_binding(tcb, reply),
+            )
+            .map_err(|_| Error::Protocol)?;
+    }
     crate::service_sec_image::retire_win32k_directory_route(route, dispatch);
     crate::service_sec_image::retire_win32k_section_create_route(route, dispatch);
     crate::service_sec_image::retire_win32k_section_map_route(route, dispatch);

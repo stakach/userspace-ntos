@@ -14,6 +14,8 @@ pub(crate) fn owns_volume() -> bool {
 #[must_use = "retain journal work until confirmed publication or rollback"]
 pub(crate) struct Journal<C> {
     storage: OwnedSnapshotJournal<snapshot_storage::Lease, C>,
+    mount: nt_memory_manager::SectionMountId,
+    journal_bytes: usize,
 }
 
 impl<C> Journal<C> {
@@ -35,6 +37,8 @@ impl<C> Journal<C> {
             Ok(admitted) => admitted,
             Err(status) => return Err((status, journal, context)),
         };
+        let mount = *device.identity();
+        let journal_bytes = journal.len();
         // No IPC occurs between this admission and the move. All public access checks this gate.
         if OWNED.swap(true, Ordering::AcqRel) {
             return Err((snapshot_storage::BUSY, journal, context));
@@ -49,7 +53,7 @@ impl<C> Journal<C> {
             OwnedSnapshotJournal::create(filesystem, device, store, &path, journal, context)
         };
         match result {
-            Ok(storage) => Ok(Self { storage }),
+            Ok(storage) => Ok(Self { storage, mount, journal_bytes }),
             Err(error) => {
                 restore(error.filesystem);
                 drop(error.device);
@@ -64,7 +68,18 @@ impl<C> Journal<C> {
 
     pub(crate) fn make_durable(&mut self) -> Result<(), u32> {
         let _durable = crate::allocator::enter_durable();
-        self.storage.make_durable().map_err(status)
+        let phase_before = self.storage.phase();
+        let window = nt_ahci::CommandWindow::start(&crate::AHCI_CENSUS, crate::diagnostic_time_100ns());
+        let result = self.storage.make_durable().map_err(status);
+        let delta = window.finish(crate::diagnostic_time_100ns());
+        let phase_after = self.storage.phase();
+        let durability = self.storage.durability().map(|proof| {
+            (proof.snapshot_generation(), proof.snapshot_bytes())
+        });
+        crate::registry_checkpoint_audit::system_journal(
+            self.mount, self.journal_bytes, phase_before, phase_after, durability, result, delta,
+        );
+        result
     }
 
     pub(crate) fn begin_publication(&mut self) -> Result<&mut C, u32> {
@@ -95,7 +110,7 @@ impl<C> Journal<C> {
                 publish_staged_profile();
                 Ok(context)
             }
-            Err(storage) => Err(Self { storage }),
+            Err(storage) => Err(Self { storage, mount: self.mount, journal_bytes: self.journal_bytes }),
         }
     }
 
@@ -109,7 +124,7 @@ impl<C> Journal<C> {
                 publish_staged_profile();
                 Ok(context)
             }
-            Err(storage) => Err(Self { storage }),
+            Err(storage) => Err(Self { storage, mount: self.mount, journal_bytes: self.journal_bytes }),
         }
     }
 }

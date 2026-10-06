@@ -1,0 +1,41 @@
+{
+  "issue": 18,
+  "source_commit": "a770d1d9d235816ee2bfca04d121165f75578dd4",
+  "microkernel_commit": "eeaab1f8ba24e2c9b6bbeaab6b87dd177eb18015",
+  "profile": "font-cleanup",
+  "boot_bound_seconds": 3600,
+  "launcher_exit": 124,
+  "collector_exit": 0,
+  "collector_frames": 359,
+  "collector_final_slot": 0,
+  "strict_font_parser_exit": 1,
+  "termination": "Original one-hour boot deadline expired; supervisor terminated the process group. No guest summary or sentinel.",
+  "preboot_sha256": {
+    "rootserver": "ba53f0522ce089c96fad77415948bfd61c339a5c01e2747394659ca3ec25fe1d",
+    "microkernel": "05e4edf2c9c112571663f806ee12a6a6c4b67760c7f404a59f3f8aac4451ee86",
+    "disk": "5719b5fa582a9e2b40f341d95705cf4e63997a53ef9e3ec4a6eb7dfdc0a92efd",
+    "ntdll": "5c1a33cb4fbab7d10bb85490c0da83d24beca935487321590e246842fc4aff1c",
+    "font_acceptance": "1729483e54eba2e8b891beeae4dca6d3881f2f1ac45cbce90ba74c4e4908e6f3",
+    "font_run_setup": "f2238bde4b0d68808f01b1e7f5ce95817e03063db1a4616a63d15716e0bb85b5"
+  },
+  "artifact_sha256": {
+    "raw_log": "fb6a11f756bb6482362f51393d5375e687ccb7109964003bd6489f16ec803a8d",
+    "archived_log": "689cb469276c8ff224e4d08d578d4860bdecbf6c5a864dc571a3f72c0133e9f2",
+    "screenshot": "53ad5f5ac610f375103c4b38bc9dcda1b85defd34e60860272a02fff0da0c9cb",
+    "parser_log": "d58beafc576bbd7541f3578a5db7425abf1134875ee5e766f2dddb0fe42f5e8f",
+    "collector_log": "a8d9c2b1472f6d64ba8928dce6197d995896075806f9fcaf77f6da961961731a",
+    "postboot_disk": "774230297bab222baa58317573ff8dbde365be1aa77139b65b60b822e9cc07ca"
+  },
+  "observations": [
+    "Source commit compiled in a complete native font image build with exit zero; focused Hive156, ConfigServer128 and native source/progress15 tests passed. Exact-head crate CI37394652621 succeeded.",
+    "Guest continued through real setup and acknowledged retirement of PID1464 Hosted97 at log769963. Helpers also report DevInstallW error2; successful process exit is not successful device installation.",
+    "No allocation abort or terminal provider marker appeared. This does not prove passage of the exact previous DirectPlay/registry allocation sequence; timeout occurred before its matching low-address Section receipt.",
+    "Final census117 at3598918ms reports heap watermark61256184, allocated60850880, reusable2063528 and largest reusable span1658224.",
+    "Writable snapshot generation896 committed736697 bytes; the deadline interrupted the next dirty snapshot. This is not a font cleanup or desktop receipt.",
+    "Strict font parser rejected the missing PID-QUERY. Same-run final screenshot shows background and cursor only. Userinit/Explorer/font acceptance remains unproven."
+  ],
+  "evidence": {
+    "log": "docs/evidence/issue18-prepared-hive-font-timeout.log.gz",
+    "screenshot": "docs/images/prepared-hive-font-timeout.png"
+  }
+}

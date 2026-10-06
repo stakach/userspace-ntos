@@ -28,6 +28,9 @@ mod close;
 mod complete;
 mod completion_unwind;
 mod device;
+pub mod device_queue;
+pub mod start_io;
+pub mod start_io_current;
 pub mod device_power;
 mod device_file_name;
 mod device_reference;
@@ -57,6 +60,7 @@ mod hosted_file;
 #[cfg(test)]
 mod hosted_file_lifetime_tests;
 mod hosted_device_pointer;
+mod projection_allocation;
 mod hosted_attached_device_reference;
 mod hosted_safe_attach;
 mod hosted_file_system_registry;
@@ -70,6 +74,7 @@ pub mod io_create_file_capture;
 pub mod io_create_file_reply;
 pub mod provider_create_delivery;
 pub mod consumer_file_projection;
+pub mod consumer_device_projection;
 pub mod hosted_forward_target;
 pub mod redir_query_path;
 pub mod retained_query_path_forward;
@@ -86,6 +91,7 @@ pub mod file_read_query_wire;
 pub mod retained_file_query_progress;
 pub mod retained_file_close_progress;
 pub mod retained_source_progress;
+pub mod hosted_forward_progress;
 pub mod win32k_async_read_wire;
 pub mod win32k_section_create_wire;
 pub mod win32k_mm_section_wire;
@@ -106,6 +112,7 @@ mod open;
 mod owned_file_metadata;
 pub mod owned_file_lifecycle;
 mod pending_io;
+pub mod pending_irp_graph;
 mod pending_set_file_name;
 mod pipe;
 mod projection;
@@ -141,7 +148,9 @@ pub use completion_unwind::{
 pub use device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
 pub use device_reference::DeviceReference;
 pub use file_reference::FileReference;
-pub use hosted_device_pointer::{HostedDevicePointerReference, HostedDevicePointerRegistration};
+pub use hosted_device_pointer::{HostedDevicePointerReference, HostedDevicePointerRegistration,
+    HostedDeviceProjectionReference};
+pub use projection_allocation::{ProjectionAllocationLedger, ProjectionAllocationOwner};
 pub use device_property_query::{
     query_device_property, PropertyQueryReply, PropertyQueryRequest, PropertyQueryResult,
     PropertyQueryTransport, PROPERTY_QUERY_CHUNK_BYTES,
@@ -173,6 +182,8 @@ pub use ea::{
 };
 pub use external_dispatch::{
     ExternalDispatchResult, ExternalPnpDispatchResult, ExternalPnpTerminalReceipt,
+    ExternalPnpFinishRejection, ExternalPnpFinishResult, ExternalPnpInvocation, ExternalPnpReturn,
+    RetainedExternalPnp,
     PreparedExternalPnpIrp, PreparedExternalPnpRejection,
 };
 pub use file::{CreateOptions, FileRecord, FileState, ShareAccess};
@@ -211,14 +222,16 @@ pub use pending_io::{
     FileIoBusyOwner, PendingFileBusy, PendingFileBusyError, PendingFileBusyPhase,
     PendingFileBusyReleaseAttempt, PendingFileBusyWakeAttempt,
     PendingFileCreate, PendingFileIo, PendingFileIoOperation, PendingFileIoParkError,
+    CreateOutputSettlement, PendingCreateOutput, PendingCreateOutputAction, PendingCreateOutputObservation,
     LocalFlushMode, PendingFileIoIdentity, PendingFileIoReservation, PendingFileIoTable, PendingLocalBuffered,
-    PendingLocalByteLock, PendingLocalDirectoryNotify, PendingLocalFlush, PendingLocalInline,
+    PendingLocalByteLock, PendingLocalDirectoryNotify, PendingLocalFlush, PendingOwnedInline,
+    PendingOwnedModePrecommit,
     PendingSetFileNameOperation,
     IO_DELIVERY_APC_PUBLISHED, IO_DELIVERY_BACKEND_ACKED, IO_DELIVERY_BUFFER_PUBLISHED,
     IO_DELIVERY_CREATE_COMMITTED,
     IO_DELIVERY_EVENT_PUBLISHED, IO_DELIVERY_FILE_LOCK_RELEASED, IO_DELIVERY_FILE_PUBLISHED,
     IO_DELIVERY_HANDLE_PUBLISHED, IO_DELIVERY_IOCP_PUBLISHED, IO_DELIVERY_IOSB_FAULTED,
-    IO_DELIVERY_IOSB_PUBLISHED, IO_DELIVERY_LOCAL_REFERENCE_RELEASED, IO_DELIVERY_OUTPUT_FAULTED,
+    IO_DELIVERY_IOSB_PUBLISHED, IO_DELIVERY_OWNED_REFERENCE_RELEASED, IO_DELIVERY_OUTPUT_FAULTED,
     IO_DELIVERY_REPLY_CLAIMED, IO_DELIVERY_REPLY_PUBLISHED, IO_DELIVERY_USER_APC_STAGED,
 };
 pub use pending_set_file_name::{
@@ -260,6 +273,7 @@ pub use synchronous_io::{
     SynchronousFileRetryStats,
     SynchronousFileRetryView, SynchronousFileWaitIdentity, SynchronousFileWaitReservation,
     SynchronousFileWaitState, SynchronousFileWaitTable, SynchronousFileWaiter,
+    FileTransferParameters, FileTransferEvent,
 };
 pub use volume_information::{
     query_volume_information_contract, set_volume_information_contract,
@@ -272,7 +286,8 @@ pub use wdm_x64::{
     write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
     write_wdm_irp_completion_targets,
     write_wdm_open_device_projection,
-    WdmDeviceObjectInit, WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit,
+    WdmDeviceObjectInit, WdmDeviceObjectAllocationLayout, WDM_X64_DEVICE_OBJECT_EXTENSION_SIZE,
+    WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit,
     WdmIoStackParameters, WdmIrpInit, WdmLayoutError, WdmOpenDeviceProjectionInit,
     WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_OFFSET, WDM_X64_DRIVER_EXTENSION_SIZE,
     WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET,
@@ -1466,6 +1481,7 @@ mod tests {
     extern crate std;
 
     mod exact_external_pnp;
+    mod detached_external_pnp;
 
     use super::*;
     use nt_io_abi::{ioctl, major};
@@ -8051,14 +8067,14 @@ mod tests {
         assert_eq!(le_u64(&driver, WDM_X64_DRIVER_EXTENSION_OFFSET), 0x7777);
         assert_eq!(le_u64(&driver, WDM_X64_DRIVER_UNLOAD_OFFSET), 0x8888);
 
-        let mut dev = [0xCC; WDM_X64_DEVICE_OBJECT_SIZE + 16];
+        let mut dev = [0xCC; WDM_X64_DEVICE_OBJECT_SIZE + 16 + WDM_X64_DEVICE_OBJECT_EXTENSION_SIZE];
         write_wdm_device_object(
             &mut dev,
             WdmDeviceObjectInit {
-                size_field: (WDM_X64_DEVICE_OBJECT_SIZE + 16) as u16,
+                device_object_address: 0x1000_0000,
+                driver_extension_size: 16,
                 driver_object: 0x1111,
                 next_device: 0x2222,
-                device_extension: 0x3333,
                 flags: 0x4455_6677,
                 characteristics: 0x8899_aabb,
                 device_type: 0x44,
@@ -8072,10 +8088,14 @@ mod tests {
         assert_eq!(le_u64(&dev, 0x10), 0x2222);
         assert_eq!(le_u32(&dev, 0x30), 0x4455_6677);
         assert_eq!(le_u32(&dev, 0x34), 0x8899_aabb);
-        assert_eq!(le_u64(&dev, 0x40), 0x3333);
+        assert_eq!(le_u64(&dev, 0x40), 0x1000_0000 + WDM_X64_DEVICE_OBJECT_SIZE as u64);
         assert_eq!(le_u32(&dev, 0x48), 0x44);
         assert_eq!(dev[0x4c], 3);
-        assert!(dev.iter().skip(WDM_X64_DEVICE_OBJECT_SIZE).all(|b| *b == 0));
+        let kernel_offset = WDM_X64_DEVICE_OBJECT_SIZE + 16;
+        assert!(dev[WDM_X64_DEVICE_OBJECT_SIZE..kernel_offset].iter().all(|b| *b == 0));
+        assert_eq!(le_u64(&dev, 0x138), 0x1000_0000 + kernel_offset as u64);
+        assert_eq!(le_u16(&dev, kernel_offset), 13);
+        assert_eq!(le_u64(&dev, kernel_offset + 8), 0x1000_0000);
 
         let mut file = [0xCC; WDM_X64_FILE_OBJECT_SIZE];
         write_wdm_file_object(
@@ -8106,7 +8126,7 @@ mod tests {
     #[test]
     fn wdm_x64_open_device_projection_wires_backlinks() {
         let mut driver = [0xCC; WDM_X64_DRIVER_OBJECT_SIZE + WDM_X64_DRIVER_EXTENSION_SIZE];
-        let mut device = [0xCC; WDM_X64_DEVICE_OBJECT_SIZE];
+        let mut device = [0xCC; WDM_X64_DEVICE_OBJECT_SIZE + WDM_X64_DEVICE_OBJECT_EXTENSION_SIZE];
         let mut file = [0xCC; WDM_X64_FILE_OBJECT_SIZE];
 
         write_wdm_open_device_projection(

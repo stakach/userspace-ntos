@@ -52,6 +52,21 @@ impl GenericSectionTable {
         self.retain_section(reference.identity)
     }
 
+    /// Bind an opening handle only through a still-owned reference from this exact table.
+    pub fn bind_section_reference_handle(
+        &mut self,
+        reference: SectionReference,
+        handle: u64,
+    ) -> bool {
+        if reference.authority != self.reference_authority
+            || !self.references.contains(&reference)
+            || self.section_identity(reference.identity.index) != Some(reference.identity)
+        {
+            return false;
+        }
+        self.bind_handle(reference.identity.index, handle)
+    }
+
     /// Consume one exact lease. Neither a consumed copy nor another table's lease is authority.
     pub fn release_section_reference(&mut self, reference: SectionReference) -> bool {
         if reference.authority != self.reference_authority

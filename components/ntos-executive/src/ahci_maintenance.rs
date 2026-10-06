@@ -48,6 +48,18 @@ impl PortIo for Port {
 /// The existing boot-volume transport exclusively owns port zero and this DMA frame during each
 /// synchronous call. A timeout/error is returned, never converted to an unsupported no-op flush.
 pub(super) unsafe fn flush(fat: &Fat32, selected: &mut Option<FlushCommand>) -> Result<(), Error> {
+    let started = fat.census.then(disk_census_ticks);
+    let result = flush_owned(fat, selected);
+    crate::fs_loader::disk_census_record(
+        nt_ahci::IoOperation::Barrier,
+        started,
+        0,
+        result.is_err(),
+    );
+    result
+}
+
+unsafe fn flush_owned(fat: &Fat32, selected: &mut Option<FlushCommand>) -> Result<(), Error> {
     let timeout = platform_tsc_frequency_hz()
         .checked_mul(30)
         .ok_or(Error::InvalidDma)?;

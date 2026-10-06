@@ -23,7 +23,14 @@ pub mod dbgk;
 pub mod job;
 pub mod job_abi;
 mod initial_system;
+mod initial_thread_creation;
+mod fresh_hosted_thread;
+pub use fresh_hosted_thread::FreshHostedThreadPreparation;
+#[cfg(test)]
+mod fresh_hosted_thread_tests;
+pub use initial_thread_creation::InitialThreadCreationPlan;
 pub mod native_handle;
+pub mod native_handle_search;
 mod native_section_file_source;
 mod native_section_handle;
 mod registry_key_handle;
@@ -31,6 +38,10 @@ mod object_directory_handle;
 mod routed_file_handle;
 pub mod process_object_retirement;
 pub mod thread_suspend;
+mod thread_termination_port;
+pub use thread_termination_port::{ThreadTerminationPortPhase, ThreadTerminationPortSnapshot, ThreadTerminationPortTicket};
+#[cfg(test)]
+mod thread_termination_port_tests;
 
 pub use initial_system::InitialSystemIdentity;
 pub use native_section_file_source::NativeSectionFileSource;
@@ -673,6 +684,7 @@ pub struct NtProcess {
     pub image_section: Option<SectionId>,
     pub threads: ThreadIdSet,
     pub main_thread: Option<ThreadId>,
+    initial_creation: initial_thread_creation::InitialThreadCreationState,
     pub state: ProcessState,
     pub exit_status: Option<u32>,
     /// Dispatcher references held by parked waits independently of user handles.
@@ -985,9 +997,11 @@ pub struct NtThread {
     activation_generation: u64,
     /// Initial main-runtime metadata has been published, including any explicit zero values.
     initial_runtime_published: bool,
+    /// Exact unborn preparation owner; cleared only by activation or checked cancellation.
+    fresh_hosted_nonce: Option<u64>,
     /// LPC port objects referenced by `NtRegisterThreadTerminatePort`, in registration order.
     /// `PspExitThread` drains this as a stack, so duplicates intentionally remain distinct.
-    termination_ports: Vec<u64>,
+    termination_ports: Vec<thread_termination_port::ThreadTerminationPortRegistration>,
     /// Active impersonation context. The thread owns a token reference independently of the user
     /// handle that assigned it.
     impersonation: Option<ImpersonationContext>,
@@ -1300,6 +1314,7 @@ impl ProcessManager {
                 image_section,
                 threads: ThreadIdSet::new(),
                 main_thread: None,
+                initial_creation: initial_thread_creation::InitialThreadCreationState::Unclaimed,
                 state,
                 exit_status: None,
                 wait_references: 0,
@@ -1440,7 +1455,7 @@ impl ProcessManager {
     /// caller. External handle owners must release their references and empty the new handle table
     /// first; Ps then removes job membership and the private process record.
     pub fn abort_process_creation(&mut self, pid: ProcessId) -> Option<ProcessObjectDeletion> {
-        if self.has_process_suspend_control(pid) {
+        if self.has_process_suspend_control(pid) || self.has_initial_thread_creation_pending(pid) {
             return None;
         }
         let Some(process) = self.processes.get(&pid) else {
@@ -2090,58 +2105,19 @@ impl ProcessManager {
         }
         let affinity_mask = proc.affinity_mask;
         let base_priority = proc.base_priority;
-        let mut termination_ports = Vec::new();
-        termination_ports
-            .try_reserve_exact(THREAD_TERMINATION_PORT_RESERVE)
-            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-        let tid = allocate_client_id(&mut self.next_cid);
+        let tid = self.next_cid;
+        let thread = NtThread::try_construct(
+            tid, pid, start_address, parameter, is_system_thread, state,
+            affinity_mask, base_priority,
+        )?;
+        let allocated = allocate_client_id(&mut self.next_cid);
+        debug_assert_eq!(allocated, tid);
         proc.threads.insert(tid);
         if proc.main_thread.is_none() {
             proc.main_thread = Some(tid);
             proc.state = ProcessState::Running;
         }
-        self.threads.insert(
-            tid,
-            NtThread {
-                thread_id: tid,
-                process_id: pid,
-                start_address,
-                win32_start_address: start_address,
-                parameter,
-                state,
-                scheduling_state: state,
-                is_system_thread,
-                exit_status: None,
-                wait_references: 0,
-                kernel_pointer_references: 0,
-                create_time_100ns: 0,
-                exit_time_100ns: 0,
-                kernel_time_100ns: 0,
-                user_time_100ns: 0,
-                activation_generation: 1,
-                initial_runtime_published: false,
-                termination_ports,
-                impersonation: None,
-                security_descriptor: Vec::from(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]),
-                suspend_count: 0,
-                suspend_revision: 0,
-                pending_suspend_control: None,
-                freeze_count: 0,
-                win32_thread: None,
-                kernel_thread_object: None,
-                teb_base: 0,
-                affinity_mask,
-                priority: base_priority,
-                base_priority,
-                ideal_processor: 0,
-                break_on_termination: false,
-                disable_boost: false,
-                hide_from_debugger: false,
-                thread_name_len: 0,
-                thread_name: Vec::new(),
-                user_apc_queue: VecDeque::new(),
-            },
-        );
+        self.threads.insert(tid, thread);
         Ok(tid)
     }
 
@@ -3210,6 +3186,7 @@ impl ProcessManager {
         self.thread(tid).is_some_and(|thread| {
             thread.state == ThreadState::Terminated
                 && thread.pending_suspend_control.is_none()
+                && !self.has_initial_thread_creation_pending_for(tid)
                 && thread.wait_references == 0
                 && thread.kernel_pointer_references == 0
                 && thread.termination_ports.is_empty()
@@ -3234,7 +3211,7 @@ impl ProcessManager {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let thread = self.threads.get(&tid).ok_or(STATUS_INVALID_HANDLE)?;
-        if thread.pending_suspend_control.is_some() {
+        if thread.pending_suspend_control.is_some() || self.has_initial_thread_creation_pending_for(tid) {
             return Err(STATUS_DEVICE_BUSY);
         }
         let process = self
@@ -3326,7 +3303,7 @@ impl ProcessManager {
         activation_handle: Option<HandleReservation>,
     ) -> Result<(), u32> {
         let current = self.threads.get(&plan.tid).ok_or(STATUS_INVALID_HANDLE)?;
-        if current.pending_suspend_control.is_some() {
+        if current.pending_suspend_control.is_some() || self.has_initial_thread_creation_pending_for(plan.tid) {
             return Err(STATUS_DEVICE_BUSY);
         }
         if current.process_id != plan.process_id
@@ -3429,6 +3406,7 @@ impl ProcessManager {
         thread.thread_name.clear();
         thread.user_apc_queue.clear();
         thread.activation_generation = next_generation;
+        thread.fresh_hosted_nonce = None;
         Ok(())
     }
 
@@ -3540,39 +3518,6 @@ impl ProcessManager {
 
     // --- termination + signalling (spec §12.3, §21) --------------------------
 
-    /// Attach a referenced LPC port object to the current ETHREAD. Registrations are intentionally
-    /// not deduplicated: NT allocates one termination record per call and later delivers them LIFO.
-    /// Capacity is reserved when the thread object is created so this mutation is safe under a
-    /// rewindable syscall allocator.
-    pub fn register_thread_termination_port(
-        &mut self,
-        tid: ThreadId,
-        port: u64,
-    ) -> Result<(), u32> {
-        if port == 0 {
-            return Err(STATUS_INVALID_HANDLE);
-        }
-        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
-        if thread.state == ThreadState::Terminated {
-            return Err(STATUS_THREAD_IS_TERMINATING);
-        }
-        if thread.termination_ports.len() == thread.termination_ports.capacity() {
-            return Err(STATUS_INSUFFICIENT_RESOURCES);
-        }
-        thread.termination_ports.push(port);
-        Ok(())
-    }
-
-    /// Remove the most recently registered termination port. Teardown calls this until `None`,
-    /// which both enforces native LIFO delivery and releases every retained registration exactly
-    /// once even when delivery itself fails.
-    pub fn pop_thread_termination_port(&mut self, tid: ThreadId) -> Result<Option<u64>, u32> {
-        self.threads
-            .get_mut(&tid)
-            .map(|thread| thread.termination_ports.pop())
-            .ok_or(STATUS_INVALID_HANDLE)
-    }
-
     /// `NtTerminateThread` (spec §21.1): set the exit status, mark terminated (signalled), and if
     /// this was the last non-system thread, initiate process exit.
     pub fn terminate_thread(&mut self, tid: ThreadId, exit_status: u32) -> Result<(), u32> {
@@ -3587,7 +3532,7 @@ impl ProcessManager {
         exit_time_100ns: i64,
     ) -> Result<(), u32> {
         let target = self.threads.get(&tid).ok_or(STATUS_INVALID_HANDLE)?;
-        if target.pending_suspend_control.is_some() {
+        if target.pending_suspend_control.is_some() || self.has_initial_thread_creation_pending_for(tid) {
             return Err(STATUS_DEVICE_BUSY);
         }
         // The last user-thread exit cascades into process termination. Check that boundary before
@@ -3598,7 +3543,8 @@ impl ProcessManager {
                     && !other.is_system_thread
                     && !matches!(other.state, ThreadState::Initialized | ThreadState::Terminated)
             })
-            && self.has_process_suspend_control(target.process_id)
+            && (self.has_process_suspend_control(target.process_id)
+                || self.has_initial_thread_creation_pending(target.process_id))
         {
             return Err(STATUS_DEVICE_BUSY);
         }
@@ -3656,6 +3602,9 @@ impl ProcessManager {
         exit_status: u32,
         exit_time_100ns: i64,
     ) -> Result<(), u32> {
+        if self.has_initial_thread_creation_pending_for(tid) {
+            return Err(STATUS_DEVICE_BUSY);
+        }
         let t = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
         if t.pending_suspend_control.is_some() {
             return Err(STATUS_DEVICE_BUSY);
@@ -3691,7 +3640,7 @@ impl ProcessManager {
         exit_status: u32,
         exit_time_100ns: i64,
     ) -> Result<(), u32> {
-        if self.has_process_suspend_control(pid) {
+        if self.has_process_suspend_control(pid) || self.has_initial_thread_creation_pending(pid) {
             return Err(STATUS_DEVICE_BUSY);
         }
         let (thread_count, section) = {
@@ -3755,6 +3704,12 @@ impl ProcessManager {
         exit_status: u32,
         exit_time_100ns: i64,
     ) -> Result<(), u32> {
+        if self.threads.values().any(|thread| {
+            thread.process_id == pid && thread.thread_id != current_tid
+                && self.has_initial_thread_creation_pending_for(thread.thread_id)
+        }) {
+            return Err(STATUS_DEVICE_BUSY);
+        }
         let thread_count = {
             let proc = self.processes.get(&pid).ok_or(STATUS_INVALID_HANDLE)?;
             if proc.state == ProcessState::Terminated {
@@ -4000,7 +3955,7 @@ impl ProcessManager {
     /// Whether only Ps-owned token/port references remain before the process delete procedure can
     /// run. The debug port is detached here once its final event has been continued.
     pub fn process_object_delete_ready(&mut self, pid: ProcessId) -> bool {
-        if self.has_process_suspend_control(pid) {
+        if self.has_process_suspend_control(pid) || self.has_initial_thread_creation_pending(pid) {
             return false;
         }
         let _ = self.clear_deleted_process_debug_object_if_unreferenced(pid);

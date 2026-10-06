@@ -6,7 +6,7 @@ fn open(options: u32) -> (FileSystem, u64) {
     let mut fs = FileSystem::new(MemFs::new());
     let result = fs.zw_create_file(
         PATH,
-        FILE_READ_DATA | FILE_WRITE_DATA | DELETE,
+        FILE_READ_DATA | FILE_WRITE_DATA | DELETE | SYNCHRONIZE,
         0,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         FILE_CREATE,
@@ -71,6 +71,71 @@ fn missing_and_released_objects_cannot_begin() {
     }
     assert_eq!(fs.zw_close(handle), STATUS_SUCCESS);
     assert_eq!(fs.zw_begin_file_io(handle), Err(STATUS_INVALID_HANDLE));
+}
+
+#[test]
+fn admitted_body_reference_can_begin_after_last_handle_closes() {
+    let (mut fs, handle) = open(FILE_NON_DIRECTORY_FILE);
+    fs.zw_retain_io_reference(handle).unwrap();
+    assert_eq!(fs.zw_close(handle), STATUS_SUCCESS);
+    fs.zw_set_file_signaled(handle, true).unwrap();
+    assert_eq!(state(&fs, handle), (1, 0, true));
+
+    assert_eq!(fs.zw_begin_file_io(handle), Err(STATUS_INVALID_HANDLE));
+    assert_eq!(state(&fs, handle), (1, 0, true));
+    assert_eq!(fs.zw_begin_referenced_file_io(handle), Ok(()));
+    assert_eq!(state(&fs, handle), (2, 0, false));
+
+    fs.zw_release_io_reference(handle).unwrap();
+    assert_eq!(state(&fs, handle), (1, 0, false));
+    fs.zw_release_io_reference(handle).unwrap();
+    assert!(fs.obj(handle).is_none());
+    assert_eq!(fs.zw_begin_referenced_file_io(handle), Err(STATUS_INVALID_HANDLE));
+}
+
+#[test]
+fn referenced_begin_requires_an_independent_body_pin() {
+    let (mut fs, handle) = open(FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+    let before = state(&fs, handle);
+    assert_eq!(fs.zw_begin_referenced_file_io(handle), Err(STATUS_INVALID_HANDLE));
+    assert_eq!(state(&fs, handle), before);
+
+    fs.zw_acquire_file_io(handle, 7).unwrap();
+    let before = state(&fs, handle);
+    assert_eq!(fs.zw_begin_referenced_file_io(handle), Err(STATUS_INVALID_HANDLE));
+    assert_eq!(state(&fs, handle), before);
+    fs.zw_acquire_file_io(handle, 8).unwrap();
+    let before = state(&fs, handle);
+    assert_eq!(fs.zw_begin_referenced_file_io(handle), Err(STATUS_INVALID_HANDLE));
+    assert_eq!(state(&fs, handle), before);
+    assert_eq!(fs.zw_close(handle), STATUS_SUCCESS);
+    let before = state(&fs, handle);
+    assert_eq!(fs.zw_begin_referenced_file_io(handle), Err(STATUS_INVALID_HANDLE));
+    assert_eq!(state(&fs, handle), before);
+}
+
+#[test]
+fn retained_cleanup_only_is_not_admitted_body_authority() {
+    let (mut fs, handle) = open(
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_DELETE_ON_CLOSE,
+    );
+    fs.zw_acquire_file_io(handle, 7).unwrap();
+    let object = fs.obj(handle).unwrap();
+    let (node, entry) = (object.node_id, object.entry_id);
+    let (parent, index, _) = fs.volume.entry_location(entry).unwrap();
+    fs.volume.node_mut(parent).unwrap().children[index].node_id = 0;
+    assert_eq!(fs.zw_close(handle), STATUS_SUCCESS);
+    fs.zw_release_file_io(handle, 7).unwrap();
+    fs.zw_release_io_reference(handle).unwrap();
+    let before = state(&fs, handle);
+    assert_eq!(before.0, 1);
+    assert_eq!(before.1, 0);
+    assert!(fs.zw_file_io_state(handle).unwrap().cleanup_pending);
+    assert_eq!(fs.zw_begin_referenced_file_io(handle), Err(STATUS_INVALID_HANDLE));
+    assert_eq!(state(&fs, handle), before);
+    fs.volume.node_mut(parent).unwrap().children[index].node_id = node;
+    assert_eq!(fs.zw_redrive_file_cleanup(handle), Ok(true));
+    assert!(fs.obj(handle).is_none());
 }
 
 #[test]

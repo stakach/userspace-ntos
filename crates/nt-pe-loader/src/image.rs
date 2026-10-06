@@ -65,16 +65,13 @@ impl MappedImage {
             return Ok(());
         }
         for r in pe.relocations()? {
-            if r.kind != RelocKind::Dir64 {
+            if r.kind == RelocKind::Absolute {
                 continue;
             }
             let off = r.rva as usize;
-            let end = off.checked_add(8).ok_or(PeError::PatchOutOfBounds)?;
-            let cur = {
-                let s = self.bytes.get(off..end).ok_or(PeError::PatchOutOfBounds)?;
-                u64::from_le_bytes(s.try_into().unwrap())
-            };
-            self.bytes[off..end].copy_from_slice(&cur.wrapping_add(delta).to_le_bytes());
+            let end = off.checked_add(r.kind.width()).ok_or(PeError::PatchOutOfBounds)?;
+            let target = self.bytes.get_mut(off..end).ok_or(PeError::PatchOutOfBounds)?;
+            r.kind.apply(target, delta);
         }
         Ok(())
     }

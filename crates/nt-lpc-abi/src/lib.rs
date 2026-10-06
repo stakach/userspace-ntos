@@ -71,6 +71,11 @@ pub mod opcode {
     // message semantics.
     pub const LPC_OP_RETAINED_REQUEST_WAIT_REPLY: u16 = 0x2214;
     pub const LPC_OP_RETAINED_REQUEST_PORT: u16 = 0x2215;
+    pub const LPC_OP_CLOSE_PORT_WITH_LIFETIME: u16 = 0x2216;
+    pub const LPC_OP_QUERY_ENDPOINT_LIFETIME: u16 = 0x2217;
+    pub const LPC_OP_RELEASE_PORT_OBJECT_WITH_LIFETIME: u16 = 0x2218;
+    pub const LPC_OP_CLOSE_PROCESS_PORTS: u16 = 0x2219;
+    pub const LPC_OP_RETAINED_REQUEST_PORT_OUTCOME: u16 = 0x221a;
 }
 
 /// True if `op` is an LPC opcode.
@@ -518,6 +523,70 @@ pub struct LpcClosePortRequest {
     pub port_handle: u64,
 }
 
+/// Exact canonical communication endpoint key, valid independently of a live user handle.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LpcEndpointLifetimeRequest {
+    pub abi_size: u16,
+    pub endpoint: u16,
+    pub _reserved: u32,
+    pub connection_id: u64,
+    pub owner_process: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LpcCloseProcessPortsRequest {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub _reserved2: u32,
+    pub owner_process: u64,
+}
+
+pub mod retained_request_disposition {
+    pub const QUEUED: u16 = 1;
+    pub const REFUSED: u16 = 2;
+}
+
+/// Checked broker result for one retained datagram attempt, not a replay permit.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LpcRetainedRequestOutcome {
+    pub abi_size: u16,
+    pub disposition: u16,
+    pub status: u32,
+    pub endpoint_handle: u64,
+    pub client_process: u64,
+    pub client_thread: u64,
+    pub reserved: u64,
+}
+
+/// Broker-authored endpoint reference snapshot. This is not a retained reference or a
+/// reusable authorization token. Endpoint zero denotes a listen-port close with no views.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LpcEndpointLifetime {
+    pub abi_size: u16,
+    pub endpoint: u16,
+    pub user_open: u32,
+    pub connection_id: u64,
+    pub owner_process: u64,
+    pub endpoint_handle: u64,
+    pub kernel_references: u32,
+    pub construction_references: u32,
+}
+
+impl LpcEndpointLifetime {
+    pub const fn is_deleted(self) -> bool {
+        (self.endpoint == handle_endpoint::CLIENT_COMM_PORT
+            || self.endpoint == handle_endpoint::SERVER_COMM_PORT)
+            && self.connection_id != 0
+            && self.user_open == 0
+            && self.kernel_references == 0
+            && self.construction_references == 0
+    }
+}
+
 /// `LPC_OP_QUERY_HANDLE` — resolve a broker handle to its live endpoint identity.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -609,6 +678,10 @@ const _: () = {
     assert!(size_of::<LpcRequestIdentityRequest>() == 32);
     assert!(size_of::<LpcQueryRequestResponse>() == 40);
     assert!(size_of::<LpcClosePortRequest>() == 16);
+    assert!(size_of::<LpcEndpointLifetimeRequest>() == 24);
+    assert!(size_of::<LpcEndpointLifetime>() == 40);
+    assert!(size_of::<LpcRetainedRequestOutcome>() == 40);
+    assert!(size_of::<LpcCloseProcessPortsRequest>() == 16);
     assert!(size_of::<LpcQueryHandleRequest>() == 16);
     assert!(size_of::<LpcQueryHandleResponse>() == 200);
     assert!(size_of::<LpcReply>() == 24);

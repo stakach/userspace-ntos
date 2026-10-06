@@ -8,6 +8,10 @@
 use alloc::vec::Vec;
 use nt_config_store::codec::{crc32c, Crc32c};
 
+#[path = "snapshot_payload_writer.rs"]
+mod payload_writer;
+pub use payload_writer::PayloadSectorWriter;
+
 #[cfg(test)]
 #[path = "snapshot_store_tests.rs"]
 mod tests;
@@ -84,19 +88,6 @@ pub trait SnapshotPayloadSink {
 pub trait SnapshotPayloadReader {
     fn read_exact(&mut self, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError>;
     fn remaining(&self) -> usize;
-}
-
-/// Sector-buffered payload writer for [`SnapshotBlockStore::commit_next_streaming`].
-pub struct PayloadSectorWriter<'a, D: SnapshotBlockDevice> {
-    dev: &'a mut D,
-    sector: Vec<u8>,
-    sector_size: usize,
-    slot_base: u64,
-    max_payload_len: usize,
-    written: usize,
-    sector_index: u64,
-    sector_offset: usize,
-    crc: Crc32c,
 }
 
 /// Sector-buffered payload reader for [`SnapshotBlockStore::read_latest_streaming`].
@@ -263,6 +254,9 @@ impl SnapshotBlockStore {
         F: FnOnce(&mut PayloadSectorWriter<'_, D>) -> Result<(), SnapshotBlockStoreError>,
     {
         let (sector_size, slot_sectors) = self.geometry(dev)?;
+        let batch_size = sector_size
+            .checked_mul(payload_writer::WRITE_BATCH_SECTORS)
+            .ok_or(SnapshotBlockStoreError::InvalidGeometry)?;
         let max_payload_len = usize::try_from(
             slot_sectors
                 .checked_sub(1)
@@ -298,9 +292,9 @@ impl SnapshotBlockStore {
         let slot_base = self.slot_lba(slot_sectors, target_slot)?;
         let mut sector = Vec::new();
         sector
-            .try_reserve_exact(sector_size)
+            .try_reserve_exact(batch_size)
             .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
-        sector.resize(sector_size, 0);
+        sector.resize(batch_size, 0);
         let mut writer = PayloadSectorWriter::new(dev, sector, sector_size, slot_base, payload_len);
         write_payload(&mut writer)?;
         let (mut sector, written, actual_crc) = writer.finish()?;
@@ -537,80 +531,6 @@ impl SnapshotBlockStore {
             (Err(err), Ok(None)) | (Ok(None), Err(err)) => Err(err),
             (Err(_), Err(_)) => Err(SnapshotBlockStoreError::Corrupt),
         }
-    }
-}
-
-impl<'a, D: SnapshotBlockDevice> PayloadSectorWriter<'a, D> {
-    fn new(
-        dev: &'a mut D,
-        sector: Vec<u8>,
-        sector_size: usize,
-        slot_base: u64,
-        max_payload_len: usize,
-    ) -> Self {
-        Self {
-            dev,
-            sector,
-            sector_size,
-            slot_base,
-            max_payload_len,
-            written: 0,
-            sector_index: 0,
-            sector_offset: 0,
-            crc: Crc32c::new(),
-        }
-    }
-
-    fn finish(mut self) -> Result<(Vec<u8>, usize, u32), SnapshotBlockStoreError> {
-        if self.sector_offset != 0 {
-            self.sector[self.sector_offset..].fill(0);
-            self.dev
-                .write_sector(self.slot_base + 1 + self.sector_index, &self.sector)?;
-            self.sector.fill(0);
-        }
-        Ok((self.sector, self.written, self.crc.finish()))
-    }
-}
-
-impl<D: SnapshotBlockDevice> SnapshotPayloadSink for PayloadSectorWriter<'_, D> {
-    fn write_all(&mut self, mut bytes: &[u8]) -> Result<(), SnapshotBlockStoreError> {
-        let remaining = self
-            .max_payload_len
-            .checked_sub(self.written)
-            .ok_or(SnapshotBlockStoreError::Corrupt)?;
-        if bytes.len() > remaining {
-            return Err(SnapshotBlockStoreError::Corrupt);
-        }
-        self.crc.update(bytes);
-        while !bytes.is_empty() {
-            if self.sector_offset == 0 && bytes.len() >= self.sector_size {
-                let full_len = bytes.len() - (bytes.len() % self.sector_size);
-                let sector_count = full_len / self.sector_size;
-                self.dev
-                    .write_sectors(self.slot_base + 1 + self.sector_index, &bytes[..full_len])?;
-                self.sector_index = self
-                    .sector_index
-                    .checked_add(sector_count as u64)
-                    .ok_or(SnapshotBlockStoreError::Corrupt)?;
-                self.written += full_len;
-                bytes = &bytes[full_len..];
-                continue;
-            }
-            let copy = bytes.len().min(self.sector_size - self.sector_offset);
-            self.sector[self.sector_offset..self.sector_offset + copy]
-                .copy_from_slice(&bytes[..copy]);
-            self.sector_offset += copy;
-            self.written += copy;
-            bytes = &bytes[copy..];
-            if self.sector_offset == self.sector_size {
-                self.dev
-                    .write_sector(self.slot_base + 1 + self.sector_index, &self.sector)?;
-                self.sector.fill(0);
-                self.sector_index += 1;
-                self.sector_offset = 0;
-            }
-        }
-        Ok(())
     }
 }
 

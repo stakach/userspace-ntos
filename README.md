@@ -2,15 +2,18 @@
 
 A from-scratch reimplementation of the **Windows NT kernel personality in user
 space**, running on the [rust-micro](https://github.com/stakach/rust-micro) seL4
-microkernel. Everything is Rust.
+microkernel. The personality and matching `ntdll.dll` are implemented in Rust;
+ReactOS supplies the hosted drivers, applications and shell.
 
 NT's executive is a set of cooperating subsystems (Object Manager, Memory
 Manager, Process/Thread manager, I/O manager, …) layered over a small kernel.
 This project rebuilds that personality as **isolated user-space components on a
 capability microkernel** — the microkernel provides threads, address spaces, IPC,
-and capabilities; the NT semantics live entirely in user space. The first
-component is the **NT Object Manager** (the `\ObjectDirectory` namespace, typed
-objects, handles, symbolic links).
+and capabilities; the NT semantics live entirely in user space. Focused,
+host-testable crates implement Object, Process/Thread, Memory and I/O contracts;
+native service adapters retain capabilities and continuations across callbacks,
+faults and cleanup. The matching `ntdll.dll` exposes those contracts to hosted
+user-mode code.
 
 ## Repository layout
 
@@ -57,7 +60,7 @@ and [issues](https://github.com/stakach/userspace-ntos/issues), not Markdown pro
 commands sequentially on stable Rust:
 
 ```sh
-RUST_TEST_THREADS=1 cargo test --workspace --locked
+RUST_TEST_THREADS=1 cargo test --workspace --locked --no-fail-fast
 RUST_TEST_THREADS=1 cargo test -p nt-ntdll --features native_transport --locked
 ```
 
@@ -67,14 +70,57 @@ No kernel build or proprietary Windows binaries are required. The optional
 Windows 7 export test requires a locally supplied `references/ntdll.dll`:
 `cargo test -p nt-pe-loader --test ntdll_exports -- --ignored`.
 Native builds and end-to-end CI are separate follow-ups, not covered by these specs.
+Disk-backed `SEC_IMAGE` sources retain their exact opened File, capture bounded PE
+metadata, and fill image pages from validated File spans. Mutable sources retain
+admission snapshots; the process constructor owns its separate loader snapshot.
+Media registry values select the real setup and shell startup paths. The kernel
+does not convert a LiveCD into installed-system state or override setup queries
+according to the caller's executable.
+Hive cell storage grows in bounded pages. Prepared value edits reserve live
+resources before journal I/O; uncertain append or flush effects retain their exact
+record and block mutation, checkpoint acknowledgement and hive retirement.
+The real USER driver owns window-station and desktop assignment; the host does
+not seed process bindings or restore thread bindings from a global desktop cache.
+Additional hosted threads receive fresh canonical ETHREAD identities. A retired
+execution window can be reused while handles retain the previous terminated
+thread; its object, exit status and identity are not reset. Physical execution
+windows remain bounded independently of canonical thread-object lifetimes.
+CI also checks native acceptance log parsing and fixture lifetimes through Clang's
+source AST. These host-only checks do not prove guest execution.
 The local `tests/native/mup_provider/run_kernel_only.sh` gate checks real
 cross-domain driver READ, FLUSH, and buffered QUERY_INFORMATION requests,
 including immediate and pending completion through the source driver's event
 and IOSB. READ and QUERY_INFORMATION check exact output bytes; FLUSH checks
 zero completion information.
+Forwarded pending dispatch returns independently of terminal completion. Registered
+ordinary workers execute source completion routines, retaining exact IRP ownership
+and callback continuations without serializing unrelated jobs behind a waiting worker.
+Nested work uses bounded scheduling passes and reports only actual phase changes or
+acknowledged retirement as progress, allowing queued IPC to settle blocked ownership.
+Held inline completions retain their source ownership until a genuine resumed
+unwind or authenticated stop; caller-owned IRPs remain under their original owner.
+Its controlled pending-error checks correlate actual File generations, untouched
+precompletion buffers, delivered errors and retained-pointer cleanup ordering;
+these are separate from desktop proof and uncertain-effect quarantine.
+Hosted driver debug messages are formatted in userspace before one bounded,
+non-IPC serial write. The executive frames its own complete diagnostic lines;
+the microkernel captures caller-VSpace bytes before emission without changing
+IPC or Reply state. Acceptance parsers still reject malformed or split records.
+GUI receive continuations retain the actual provider execution hold while the root
+services an authenticated resident private-page fault. Exact child Reply settlement
+precedes parent restoration and receive-only continuation; physical VSpace checks
+and the shared ownership journal reject stale identities and aliased roots.
 The optional `tests/native/source_irp/run.sh` profile checks real fileless READ/WRITE
 and all four IOCTL methods through win32k, including immediate and pending completion.
 It verifies bytes, IOSBs and retirement counters; production images omit its fixtures.
+The optional [native File acceptance profile](tests/native/file_acceptance/README.md)
+launches a public-ntdll-only executable through real SMSS to check relative opens,
+FileAll metadata and user-buffer fault precedence. Its process-exit receipts are
+separate from the whole-OS and screenshot gates.
+The optional `font-cleanup` image profile launches a private-font client through
+Explorer's ordinary Run key and checks exact Section-view retirement after process
+termination. Rebuild a fresh production image afterwards; fixture profiles are not
+production desktop evidence.
 
 The kernel is a **pinned git submodule**, not vendored source: `userspace-ntos`
 depends on an exact kernel SHA (its syscall/invocation ABI is tightly coupled),
@@ -114,10 +160,22 @@ in `extern-rootserver` mode (bring your own root task).
 ## Running the hosted ReactOS desktop (quick start)
 
 The desktop target hosts **real, unmodified GPL ReactOS binaries** on rust-micro.
-Current restoration and genuine Explorer acceptance are tracked in
-[issue #88](https://github.com/stakach/userspace-ntos/issues/88), with broader
-native acceptance in [issue #18](https://github.com/stakach/userspace-ntos/issues/18).
-Crate CI does not prove desktop boot. To attempt a boot from a fresh clone:
+Genuine Explorer and native acceptance are tracked in
+[issue #18](https://github.com/stakach/userspace-ntos/issues/18).
+The latest full [acceptance attempt](docs/evidence/issue18-canonical-gui-font-timeout.json)
+records a one-hour timeout during real setup component registration. Canonical GUI
+contexts ran, and exact installer-child traces exposed missing PDO descriptions;
+native input-driver admission still lacks `IoStartNextPacket`. Destructive private
+queue repair, obsolete DLL staging and empty bootstrap reservations are removed;
+font cleanup and desktop acceptance remain unproven. Its
+screenshot shows background and cursor, not a working desktop. Acceptance requires both strict
+native private-font cleanup and a separate production Userinit/Explorer boot without
+acceptance startup hooks
+with real callbacks, GDI drawing, logs and screenshots. Crate CI does not prove
+desktop boot. A subsequent [bounded diagnostic boot](docs/evidence/issue18-registry-checkpoint-probe.json)
+verified live SYSTEM-journal checkpoint timing and inclusive I/O measurements; it
+was stopped after reproducing the input-driver gap and still rendered only background
+and cursor. To attempt a boot from a fresh clone:
 
 ```sh
 git clone --recursive https://github.com/stakach/userspace-ntos.git
@@ -156,6 +214,13 @@ self-contained launcher that:
    `bash scripts/run-seh-fault-integration.sh`; pass `--desktop` to also require
    the full Explorer gate.
 5. **Boots QEMU.**
+
+Periodic census separates disk read, write and barrier attempts, requested sectors,
+errors and elapsed TSC ticks; these are not durability receipts or wall-clock times.
+Successful win32k client switches remain counted, with per-switch text available
+in executive builds using the `debug-trace` feature.
+Filesystem snapshots use the shared CRC32C codec and bounded whole-sector staging;
+coalescing encoder fragments preserves the existing durability barriers.
 
 ### Desktop Acceptance
 

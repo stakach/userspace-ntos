@@ -26,6 +26,33 @@ impl Capture {
     pub(crate) fn granted_access(&self) -> u32 {
         self.0.granted_access()
     }
+
+    /// Display metadata copied from this retained canonical File, never an image lookup key.
+    pub(crate) fn owned_image_path(&self) -> Result<alloc::vec::Vec<u8>, u32> {
+        let io = io_manager_mut();
+        let file = io.file(FileId(self.file_id())).ok_or(STATUS_INVALID_HANDLE as u32)?;
+        if file.device_id.raw() != self.device_id()
+            || file.driver_context.unwrap_or(0) != self.fs_context()
+        {
+            return Err(STATUS_INVALID_HANDLE as u32);
+        }
+        let units = file.file_name.as_units();
+        if units.is_empty() {
+            return Err(0xc000_00bbu32);
+        }
+        let capacity = units.len().checked_mul(3).ok_or(0xc000_009au32)?;
+        let mut path = alloc::vec::Vec::new();
+        path.try_reserve_exact(capacity).map_err(|_| 0xc000_009au32)?;
+        for character in core::char::decode_utf16(units.iter().copied()) {
+            let character = character.map_err(|_| 0xc000_000du32)?;
+            if character == '\0' {
+                return Err(0xc000_000du32);
+            }
+            let mut bytes = [0u8; 4];
+            path.extend_from_slice(character.encode_utf8(&mut bytes).as_bytes());
+        }
+        Ok(path)
+    }
 }
 
 pub(crate) fn capture(file_id: u64, device_id: u64, granted_access: u32) -> Result<Capture, u32> {

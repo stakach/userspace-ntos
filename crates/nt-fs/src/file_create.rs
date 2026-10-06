@@ -325,6 +325,7 @@ impl FileSystem {
             current_offset: 0,
             signaled: true,
             create_options: options,
+            mode_state: crate::FileModeState::from_create_options(options),
             share,
             open_privileges: FileOpenPrivileges::default(),
             handle_references: 1,

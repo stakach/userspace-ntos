@@ -76,6 +76,22 @@ impl<T, Identity: Copy + Eq> RoutedSectionOwners<T, Identity> {
         Some(self.owners.swap_remove(index).value)
     }
 
+    /// Retain an unpublished owner until its backing release acknowledges success.
+    pub fn cancel_unbound_checked<E>(
+        &mut self,
+        lease: RoutedSectionLease,
+        release: impl FnOnce(&mut T) -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let Some(index) = self
+            .owners
+            .iter()
+            .position(|owner| owner.lease == lease && owner.section.is_none())
+        else {
+            return Ok(false);
+        };
+        self.release_index_checked(index, release)
+    }
+
     /// Transfer the exact owner to the checked file-reference retirement mechanism.
     pub fn release(&mut self, lease: RoutedSectionLease, section: Identity) -> Option<T> {
         let index = self
@@ -83,6 +99,33 @@ impl<T, Identity: Copy + Eq> RoutedSectionOwners<T, Identity> {
             .iter()
             .position(|owner| owner.lease == lease && owner.section == Some(section))?;
         Some(self.owners.swap_remove(index).value)
+    }
+
+    /// Release only the exact bound owner; refusal preserves its value and identity.
+    pub fn release_checked<E>(
+        &mut self,
+        lease: RoutedSectionLease,
+        section: Identity,
+        release: impl FnOnce(&mut T) -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let Some(index) = self
+            .owners
+            .iter()
+            .position(|owner| owner.lease == lease && owner.section == Some(section))
+        else {
+            return Ok(false);
+        };
+        self.release_index_checked(index, release)
+    }
+
+    fn release_index_checked<E>(
+        &mut self,
+        index: usize,
+        release: impl FnOnce(&mut T) -> Result<(), E>,
+    ) -> Result<bool, E> {
+        release(&mut self.owners[index].value)?;
+        self.owners.swap_remove(index);
+        Ok(true)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -95,6 +138,10 @@ impl<T, Identity: Copy + Eq> Default for RoutedSectionOwners<T, Identity> {
         Self::new()
     }
 }
+
+#[cfg(test)]
+#[path = "routed_section_owner/checked_release_tests.rs"]
+mod checked_release_tests;
 
 #[cfg(test)]
 mod tests {

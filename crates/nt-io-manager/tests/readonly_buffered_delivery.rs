@@ -142,7 +142,7 @@ impl Work {
 
     fn finish(&mut self) {
         let pending = self.pending();
-        if pending.local_terminal_result().unwrap().1 == 0 {
+        if pending.owned_terminal_result().unwrap().1 == 0 {
             self.table
                 .advance_output_exact(self.slot, self.id, 0, 0)
                 .unwrap();
@@ -188,12 +188,12 @@ impl Work {
         assert!(self.table.finish_exact(self.slot, self.id).is_none());
         self.files.release_io(self.object).unwrap();
         self.table
-            .mark_local_reference_released_exact(self.slot, self.id)
+            .mark_owned_reference_released_exact(self.slot, self.id)
             .unwrap();
         let retired = self.table.finish_exact(self.slot, self.id).unwrap();
         assert_eq!(
-            retired.local_terminal_result(),
-            pending.local_terminal_result()
+            retired.owned_terminal_result(),
+            pending.owned_terminal_result()
         );
     }
 }
@@ -204,7 +204,7 @@ fn copy(
     attempts: &mut Vec<usize>,
     failure: Option<MemoryCopyFailure>,
 ) -> Result<(), MemoryCopyFailure> {
-    let information = work.pending().local_terminal_result().unwrap().1 as usize;
+    let information = work.pending().owned_terminal_result().unwrap().1 as usize;
     loop {
         let offset = work.pending().output_offset as usize;
         if offset == information {
@@ -259,7 +259,7 @@ fn large_read_is_accepted_once_and_survives_close_and_typed_copy_retry() {
     let retry = work.pending();
     assert_eq!(retry.output_offset, 4);
     assert_eq!(
-        retry.local_terminal_result(),
+        retry.owned_terminal_result(),
         Some((STATUS_SUCCESS, expected.len() as u64))
     );
     source.bytes.fill(0xff);
@@ -284,7 +284,7 @@ fn extent_truncation_and_permanent_copy_fault_preserve_sync_and_async_positions(
             let mut work = Work::prepare(&mut source, 100, 100 * 1024, synchronous);
             assert_eq!(work.transfer_length, 16);
             assert_eq!(
-                work.pending().local_terminal_result(),
+                work.pending().owned_terminal_result(),
                 Some((STATUS_SUCCESS, 16))
             );
             let position = if synchronous { 116 } else { INITIAL_POSITION };
@@ -303,7 +303,7 @@ fn extent_truncation_and_permanent_copy_fault_preserve_sync_and_async_positions(
                     .settle_local_output_fault_exact(work.slot, work.id, OUTPUT, status)
                     .unwrap();
                 let terminal = work.pending();
-                assert_eq!(terminal.local_terminal_result(), Some((status, 16)));
+                assert_eq!(terminal.owned_terminal_result(), Some((status, 16)));
                 assert_eq!(terminal.output_offset, 4);
                 assert_eq!(terminal.delivery_state & IO_DELIVERY_BUFFER_PUBLISHED, 0);
                 assert_eq!(&memory[..4], &expected[..4]);
@@ -351,7 +351,7 @@ fn zero_length_and_nonempty_eof_never_call_the_source_or_narrow_the_offset() {
             assert_eq!(source.calls, 0);
             assert_eq!(work.transfer_length, 0);
             assert_eq!(
-                work.pending().local_terminal_result(),
+                work.pending().owned_terminal_result(),
                 Some((
                     if requested == 0 {
                         STATUS_SUCCESS
@@ -383,7 +383,7 @@ fn short_source_is_not_accepted_as_partial_success_or_a_position_update() {
         let mut work = Work::prepare(&mut source, 31, 64, synchronous);
         assert_eq!(source.calls, 1);
         assert_eq!(work.transfer_length, 64);
-        assert_eq!(work.pending().local_terminal_result(), Some((IO_ERROR, 0)));
+        assert_eq!(work.pending().owned_terminal_result(), Some((IO_ERROR, 0)));
         assert_eq!(work.position(), INITIAL_POSITION);
         let mut forbidden = [0xcc; 1];
         assert!(work
