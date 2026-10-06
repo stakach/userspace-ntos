@@ -9,6 +9,7 @@ use nt_io_manager::source_irp_auxiliary::{
 };
 use nt_io_manager::source_irp_ledger::{
     SourceIrpAllocation, SourceIrpLedger, SourceIrpLedgerError, SourceIrpOwner, SourceIrpRetirement,
+    SourcePoolFreeAdmission,
 };
 
 static LOCK: AtomicU64 = AtomicU64::new(0);
@@ -638,21 +639,22 @@ pub(super) fn retire_allocation(
     {
         return (nt_status::NtStatus::PENDING.raw(), 0, 0);
     }
-    let owner = ledger().allocation_for(
-        SourceIrpOwner::HostedDriver(instance_index),
-        domain,
-        component_address,
-    );
-    let Some(owner) = owner else {
-        return if op == 3
-            && unsafe { hosted_instance_pool_allocation_is_free_unlocked(inst, component_address) }
-                == Some(false)
-            && unsafe { hosted_instance_pool_free_unlocked(inst, component_address) }
-        {
-            (STATUS_SUCCESS, 0, 0)
-        } else {
-            (STATUS_INVALID_HANDLE, 0, 0)
-        };
+    let owner = match ledger().pool_free_admission(instance_index, domain, component_address) {
+        Ok(SourcePoolFreeAdmission::Unregistered) => {
+            return if op == 3
+                && unsafe { hosted_instance_pool_allocation_is_free_unlocked(inst, component_address) }
+                    == Some(false)
+                && unsafe { hosted_instance_pool_free_unlocked(inst, component_address) }
+            {
+                (STATUS_SUCCESS, 0, 0)
+            } else {
+                (STATUS_INVALID_HANDLE, 0, 0)
+            };
+        }
+        Ok(SourcePoolFreeAdmission::DriverOwned(owner)) => owner,
+        Ok(SourcePoolFreeAdmission::Protected(_)) | Err(_) => {
+            return (STATUS_INVALID_HANDLE, 0, 0);
+        }
     };
     if allocation_unlocked(instance_index, inst, component_address, owner.bytes, owner.stack_count)
         != Some(owner)

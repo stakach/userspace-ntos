@@ -80,6 +80,14 @@ pub enum SourceIrpRetirement {
     Deferred(SourceIrpTicket),
 }
 
+/// Pool-free routing only; driver-owned storage still requires exact retirement admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourcePoolFreeAdmission {
+    Unregistered,
+    DriverOwned(SourceIrpAllocation),
+    Protected(SourceIrpAllocation),
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Row {
     allocation: SourceIrpAllocation,
@@ -198,6 +206,37 @@ impl SourceIrpLedger {
                     && row.allocation.component_address == component_address
             })
             .map(|row| row.allocation)
+    }
+
+    /// Classify all registered owners at an exact physical domain/address without changing them.
+    ///
+    /// Caller projections remain protected after retirement begins and until their explicit
+    /// physical-free acknowledgement removes the row. The caller must hold the ledger and pool
+    /// locks across this observation and any admitted effect; absence is not a transferable token.
+    pub fn pool_free_admission(
+        &self,
+        instance: usize,
+        domain: HostedDomainIdentity,
+        component_address: u64,
+    ) -> Result<SourcePoolFreeAdmission, SourceIrpLedgerError> {
+        if domain.domain_id == HostedDomainId::NULL || domain.cookie == 0 || component_address == 0 {
+            return Err(SourceIrpLedgerError::InvalidAllocation);
+        }
+        let mut matches = self.rows.iter().filter(|row| {
+            row.allocation.domain == domain
+                && row.allocation.component_address == component_address
+        });
+        let Some(row) = matches.next() else {
+            return Ok(SourcePoolFreeAdmission::Unregistered);
+        };
+        if matches.next().is_some() {
+            return Err(SourceIrpLedgerError::WrongIdentity);
+        }
+        Ok(if row.allocation.owner == SourceIrpOwner::HostedDriver(instance) {
+            SourcePoolFreeAdmission::DriverOwned(row.allocation)
+        } else {
+            SourcePoolFreeAdmission::Protected(row.allocation)
+        })
     }
 
     pub fn registered(
