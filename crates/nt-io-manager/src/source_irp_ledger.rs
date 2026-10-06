@@ -29,7 +29,7 @@ pub struct SourceIrpAllocation {
 }
 
 impl SourceIrpAllocation {
-    fn valid(self) -> bool {
+    pub(crate) fn valid(self) -> bool {
         self.domain.domain_id != HostedDomainId::NULL
             && self.domain.cookie != 0
             && self.component_address != 0

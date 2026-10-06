@@ -2,6 +2,9 @@
 //! This metadata is not transfer authority: native callers must retain/authenticate the actual
 //! graph generation and physical allocation arena before observing or releasing its pointers.
 
+#[path = "pending_irp_graph_captured.rs"]
+pub mod captured;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PendingIrpGraphPointers {
     pub reclaim: u64,
