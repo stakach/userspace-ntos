@@ -31,6 +31,14 @@ pub struct Packet<O> {
     pub owner: O,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CurrentPacketRelation {
+    Empty,
+    LiveSame,
+    LiveOther,
+    Completed,
+}
+
 /// All reads and the final commit use the same exclusive device/queue ownership. Admission must
 /// protect actual live storage, not infer authority from decoded bytes. `packet` must admit the
 /// requested cancel callback too. Commit is infallible local stores, with no IPC or reentry.
@@ -40,6 +48,16 @@ pub trait LockedStartIoMemory: LockedDeviceQueueMemory {
     /// Revalidate the retained callback's exact device lifetime, not just its numeric address.
     fn validate_device_owner(&self, retained: &Device<Self::Owner>) -> Result<(), Self::Error>;
     fn packet(&self, entry: u64, cancel: Option<u64>) -> Result<Packet<Self::Owner>, Self::Error>;
+    /// Authenticate the device's retained current lifetime and the admitted incoming packet.
+    /// Unknown or uncertain ownership must return an error. Completed requires acknowledged
+    /// completion/retirement, not callback return; equal addresses additionally require a distinct
+    /// new packet lifetime. Never inspect completed packet storage. LiveOther requires two live
+    /// allocations at different addresses. Empty requires no retained current obligation.
+    fn classify_current_packet(
+        &self,
+        device: &Device<Self::Owner>,
+        packet: &Packet<Self::Owner>,
+    ) -> Result<CurrentPacketRelation, Self::Error>;
     fn commit_start_io(&mut self, writes: &[DeviceQueueWrite]);
 }
 
@@ -76,7 +94,7 @@ pub struct Outcome<O, L> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error<E> {
-    Memory(E), Queue(DeviceQueueError<E>), InvalidDevice, DuplicateCurrent,
+    Memory(E), Queue(DeviceQueueError<E>), InvalidDevice, InvalidCurrent, DuplicateCurrent,
     MissingCancelLock, UnexpectedCancelLock, CountOverflow, InvalidCount,
 }
 
@@ -149,7 +167,16 @@ pub fn start_packet<M: LockedStartIoMemory, L>(memory: &mut M, address: u64, ent
         if cancel.is_some() != lock.is_some() { return Err(if cancel.is_some() { Error::MissingCancelLock } else { Error::UnexpectedCancelLock }); }
         let mut d = device(memory, address)?;
         let p = packet(memory, entry, cancel)?;
-        if d.current_irp == p.irp { return Err(Error::DuplicateCurrent); }
+        let current = memory.classify_current_packet(&d, &p).map_err(Error::Memory)?;
+        match current {
+            CurrentPacketRelation::Empty if d.current_irp == 0 => {}
+            CurrentPacketRelation::LiveSame if d.current_irp == p.irp => {
+                return Err(Error::DuplicateCurrent);
+            }
+            CurrentPacketRelation::LiveOther if d.current_irp != 0 && d.current_irp != p.irp => {}
+            CurrentPacketRelation::Completed if d.current_irp != 0 => {}
+            _ => return Err(Error::InvalidCurrent),
+        }
         let deferred = d.flags & DEFERRED != 0;
         let count = if deferred { Some(d.count.checked_add(1).filter(|count| *count <= i32::MAX as u32).ok_or(Error::CountOverflow)?) } else { None };
         let mut writes = Writes::new();

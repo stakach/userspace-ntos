@@ -71,6 +71,21 @@ impl LockedStartIoMemory for Memory {
         Ok(Packet { irp, entry, cancelled: self.bytes[(irp + 0x44) as usize] != 0,
             owner: Owner { address: irp, generation: self.generation } })
     }
+    fn classify_current_packet(&self, device: &Device<Owner>, packet: &Packet<Owner>)
+        -> Result<CurrentPacketRelation, Self::Error> {
+        self.validate_device_owner(device)?;
+        if packet.owner.address != packet.irp || packet.owner.generation != self.generation
+            || self.generation == 0 || device.current_irp != self.u64(D + 0x20) {
+            return Err("current packet authority");
+        }
+        // This fixture's fixed packet allocations remain live for its entire lifetime.
+        match device.current_irp {
+            0 => Ok(CurrentPacketRelation::Empty),
+            current if ![A, B, C].contains(&current) => Err("current packet authority"),
+            current if current == packet.irp => Ok(CurrentPacketRelation::LiveSame),
+            _ => Ok(CurrentPacketRelation::LiveOther),
+        }
+    }
     fn commit_start_io(&mut self, writes: &[DeviceQueueWrite]) { self.apply_writes(writes); }
 }
 
@@ -165,6 +180,219 @@ fn refused_owner_or_duplicate_current_is_atomic_and_returns_lock_owner() {
     assert_eq!(m.bytes, before, "staged unlink cannot precede packet admission");
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CurrentPacketLifetime {
+    address: u64,
+    generation: u64,
+    completed: bool,
+}
+
+/// Test allocation lifetimes are separate from the device and from its raw CurrentIrp field.
+/// This models completion/free, not a native completion receipt or an alternative packet queue.
+struct PacketLifetimeMemory {
+    memory: Memory,
+    packet_generations: [u64; 3],
+    current: Option<CurrentPacketLifetime>,
+    uncertain: bool,
+}
+
+impl PacketLifetimeMemory {
+    fn new() -> Self {
+        Self { memory: Memory::new(), packet_generations: [1; 3], current: None, uncertain: false }
+    }
+
+    fn packet_index(address: u64) -> Option<usize> {
+        [A, B, C].iter().position(|candidate| *candidate == address)
+    }
+
+    fn complete_free_and_reallocate_current(&mut self) {
+        let current = self.current.as_mut().expect("an actual started packet");
+        assert!(!current.completed);
+        let index = Self::packet_index(current.address).unwrap();
+        assert_eq!(current.generation, self.packet_generations[index]);
+        current.completed = true;
+        // The callback has returned and completion/free retires this allocation. New storage
+        // at the same address has a fresh lifetime and an uninserted DeviceQueueEntry.
+        self.memory.bytes[current.address as usize..current.address as usize + 0xd0].fill(0);
+        self.packet_generations[index] += 1;
+    }
+}
+
+impl LockedDeviceQueueMemory for PacketLifetimeMemory {
+    type Error = &'static str;
+    fn validate_unpublished_queue_storage(&self, address: u64) -> Result<(), Self::Error> {
+        self.memory.validate_unpublished_queue_storage(address)
+    }
+    fn queue(&self, address: u64) -> Result<DeviceQueueSnapshot, Self::Error> {
+        self.memory.queue(address)
+    }
+    fn entry(&self, address: u64) -> Result<DeviceQueueEntrySnapshot, Self::Error> {
+        self.memory.entry(address)
+    }
+    fn apply(&mut self, edits: &DeviceQueueEdits) { self.memory.apply(edits); }
+}
+
+impl LockedStartIoMemory for PacketLifetimeMemory {
+    type Owner = Owner;
+    fn device(&self, address: u64) -> Result<Device<Owner>, Self::Error> {
+        self.memory.device(address)
+    }
+    fn validate_device_owner(&self, retained: &Device<Owner>) -> Result<(), Self::Error> {
+        self.memory.validate_device_owner(retained)
+    }
+    fn packet(&self, entry: u64, cancel: Option<u64>) -> Result<Packet<Owner>, Self::Error> {
+        let mut packet = self.memory.packet(entry, cancel)?;
+        let index = Self::packet_index(packet.irp).ok_or("packet allocation")?;
+        packet.owner.generation = self.packet_generations[index];
+        if packet.owner.generation == 0 { return Err("packet allocation generation"); }
+        Ok(packet)
+    }
+    fn classify_current_packet(&self, device: &Device<Owner>, packet: &Packet<Owner>)
+        -> Result<CurrentPacketRelation, Self::Error> {
+        self.memory.validate_device_owner(device)?;
+        if self.uncertain { return Err("uncertain current lifetime"); }
+        let index = Self::packet_index(packet.irp).ok_or("packet allocation")?;
+        if packet.owner.address != packet.irp || packet.owner.generation == 0
+            || packet.owner.generation != self.packet_generations[index]
+            || device.current_irp != self.memory.u64(D + 0x20) {
+            return Err("current packet authority");
+        }
+        let Some(current) = self.current else {
+            return if device.current_irp == 0 { Ok(CurrentPacketRelation::Empty) }
+                else { Err("missing current lifetime") };
+        };
+        if current.address != device.current_irp || current.generation == 0 {
+            return Err("mismatched current lifetime");
+        }
+        if current.completed {
+            if current.address == packet.irp && current.generation >= packet.owner.generation {
+                return Err("completed lifetime is not a new allocation");
+            }
+            return Ok(CurrentPacketRelation::Completed);
+        }
+        let current_index = Self::packet_index(current.address).ok_or("current allocation")?;
+        if current.generation != self.packet_generations[current_index] {
+            return Err("unretired current allocation changed");
+        }
+        Ok(if current.address == packet.irp { CurrentPacketRelation::LiveSame }
+            else { CurrentPacketRelation::LiveOther })
+    }
+    fn commit_start_io(&mut self, writes: &[DeviceQueueWrite]) {
+        self.memory.commit_start_io(writes);
+        for write in writes {
+            if let DeviceQueueWrite::U64 { address, value } = *write {
+                if address == D + 0x20 {
+                    self.current = Self::packet_index(value).map(|index| CurrentPacketLifetime {
+                        address: value,
+                        generation: self.packet_generations[index],
+                        completed: false,
+                    });
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn completed_current_address_can_queue_a_new_packet_generation_before_next() {
+    // NT5 iosubs.c IopStartPacket inserts by queue state, not CurrentIrp pointer equality.
+    // ReactOS i8042prt/keyboard.c completes its current IRP before IoStartNextPacket.
+    let mut memory = PacketLifetimeMemory::new();
+    let first = match start_packet(&mut memory, D, A + 0x78, None, None, None::<CancelLock<u64>>) {
+        Ok(outcome) => outcome,
+        Err(_) => panic!("initial packet admission"),
+    };
+    assert!(matches!(&first.action, Action::Start { packet, .. }
+        if packet.owner.generation == 1));
+    drop(first);
+    memory.complete_free_and_reallocate_current();
+    let completed = memory.current;
+    assert_eq!(completed, Some(CurrentPacketLifetime { address: A, generation: 1, completed: true }));
+    assert_eq!(memory.memory.generation, 1, "the device has not been recycled");
+    assert_eq!(memory.memory.u64(D + 0x20), A, "completion does not call Next");
+    assert!(memory.queue(D + 0xa0).unwrap().busy);
+    assert!(!memory.entry(A + 0x78).unwrap().inserted);
+
+    let queued = match start_packet(&mut memory, D, A + 0x78, None, None, None::<CancelLock<u64>>) {
+        Ok(outcome) => outcome,
+        Err(refusal) => panic!("a retired CurrentIrp address is not a live duplicate: {:?}", refusal.error),
+    };
+    assert!(matches!(&queued.action, Action::Queued { device, packet, .. }
+        if device.owner.generation == 1 && packet.owner.generation == 2));
+    assert_eq!(memory.current, completed, "queuing cannot replace current ownership");
+    assert!(memory.entry(A + 0x78).unwrap().inserted);
+    let next = match start_next(&mut memory, D, None, false, None::<CancelLock<u64>>) {
+        Ok(outcome) => outcome,
+        Err(_) => panic!("Next must select the new queued generation"),
+    };
+    assert!(matches!(&next.action, Action::Start { packet, .. }
+        if packet.owner.generation == 2));
+    assert_eq!(memory.current, Some(CurrentPacketLifetime { address: A, generation: 2, completed: false }));
+}
+
+#[test]
+fn same_live_current_packet_generation_is_refused_without_mutation() {
+    let mut memory = PacketLifetimeMemory::new();
+    let first = match start_packet(&mut memory, D, A + 0x78, None, None, None::<CancelLock<u64>>) {
+        Ok(outcome) => outcome,
+        Err(_) => panic!("initial packet admission"),
+    };
+    drop(first);
+    let before = memory.memory.bytes.clone();
+    let commits = memory.memory.commits;
+    let current = memory.current;
+    let refusal = match start_packet(&mut memory, D, A + 0x78, None, Some(0xa000),
+        Some(CancelLock { token: 29, previous_irql: 2 })) {
+        Err(refusal) => refusal,
+        Ok(_) => panic!("same live packet cannot be submitted twice"),
+    };
+    assert_eq!(refusal.error, Error::DuplicateCurrent);
+    assert_eq!(refusal.lock.unwrap().token, 29);
+    assert_eq!(memory.memory.bytes, before);
+    assert_eq!(memory.memory.commits, commits);
+    assert_eq!(memory.current, current);
+    assert_eq!(memory.packet_generations, [1; 3]);
+    assert_eq!(memory.memory.generation, 1);
+}
+
+#[test]
+fn missing_uncertain_or_mismatched_current_lifetime_refuses_before_effects() {
+    for case in 0..8 {
+        let mut memory = PacketLifetimeMemory::new();
+        match start_packet(&mut memory, D, A + 0x78, None, None, None::<CancelLock<u64>>) {
+            Ok(outcome) => drop(outcome),
+            Err(_) => panic!("initial packet admission"),
+        }
+        match case {
+            0 => memory.current = None,
+            1 => memory.uncertain = true,
+            2 => memory.current.as_mut().unwrap().generation = 0,
+            3 => memory.current.as_mut().unwrap().address = B,
+            4 => memory.current.as_mut().unwrap().completed = true,
+            5 => memory.packet_generations[0] = 2,
+            6 => memory.memory.put64(D + 0x20, 0),
+            7 => memory.packet_generations[0] = 0,
+            _ => unreachable!(),
+        }
+        let before = memory.memory.bytes.clone();
+        let commits = memory.memory.commits;
+        let current = memory.current;
+        let generations = memory.packet_generations;
+        let refusal = match start_packet(&mut memory, D, A + 0x78, None, Some(0xa000),
+            Some(CancelLock { token: 37, previous_irql: 2 })) {
+            Err(refusal) => refusal,
+            Ok(_) => panic!("case {case}: uncertain ownership cannot admit a packet"),
+        };
+        assert!(matches!(refusal.error, Error::Memory(_)), "case {case}");
+        assert_eq!(refusal.lock.unwrap().token, 37, "case {case}");
+        assert_eq!(memory.memory.bytes, before, "case {case}");
+        assert_eq!(memory.memory.commits, commits, "case {case}");
+        assert_eq!(memory.current, current, "case {case}");
+        assert_eq!(memory.packet_generations, generations, "case {case}");
+        assert_eq!(memory.memory.generation, 1, "case {case}");
+    }
+}
+
 #[test]
 fn missing_lock_and_deferred_overflow_leave_all_bytes_unchanged() {
     let mut m = Memory::new(); let before = m.bytes.clone();
@@ -252,6 +480,16 @@ impl LockedStartIoMemory for DropMemory {
     fn packet(&self, entry: u64, cancel: Option<u64>) -> Result<Packet<DropOwner>, Self::Error> {
         let p = self.memory.packet(entry, cancel)?;
         Ok(Packet { irp: p.irp, entry: p.entry, cancelled: p.cancelled, owner: self.owner(p.irp) })
+    }
+    fn classify_current_packet(&self, device: &Device<DropOwner>, packet: &Packet<DropOwner>)
+        -> Result<CurrentPacketRelation, Self::Error> {
+        self.validate_device_owner(device)?;
+        if packet.owner.address != packet.irp || packet.owner.generation != self.memory.generation {
+            return Err("packet generation authority");
+        }
+        let current = self.memory.device(device.address)?;
+        if current.current_irp != device.current_irp { return Err("current packet authority"); }
+        self.memory.classify_current_packet(&current, &self.memory.packet(packet.entry, None)?)
     }
     fn commit_start_io(&mut self, writes: &[DeviceQueueWrite]) { self.memory.commit_start_io(writes); }
 }
