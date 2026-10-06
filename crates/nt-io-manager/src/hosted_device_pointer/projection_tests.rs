@@ -210,7 +210,7 @@ fn native_projection_retirement_retries_busy_before_freeing_projection() {
         .find("retire_hosted_device_pointer(registration)")
         .unwrap();
     let free = function
-        .find("retire_hosted_device_projection(inst, retirement.device_object)")
+        .find("retire_hosted_device_projection(")
         .unwrap();
     let retry = function[retire..free]
         .find("Err(nt_status::NtStatus::DEVICE_BUSY)")

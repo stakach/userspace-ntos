@@ -60,6 +60,7 @@ mod hosted_file;
 #[cfg(test)]
 mod hosted_file_lifetime_tests;
 mod hosted_device_pointer;
+mod projection_allocation;
 mod hosted_attached_device_reference;
 mod hosted_safe_attach;
 mod hosted_file_system_registry;
@@ -149,6 +150,7 @@ pub use device_reference::DeviceReference;
 pub use file_reference::FileReference;
 pub use hosted_device_pointer::{HostedDevicePointerReference, HostedDevicePointerRegistration,
     HostedDeviceProjectionReference};
+pub use projection_allocation::{ProjectionAllocationLedger, ProjectionAllocationOwner};
 pub use device_property_query::{
     query_device_property, PropertyQueryReply, PropertyQueryRequest, PropertyQueryResult,
     PropertyQueryTransport, PROPERTY_QUERY_CHUNK_BYTES,
