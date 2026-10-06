@@ -6377,7 +6377,7 @@ extern "win64" fn s_rtl_free_unicode_string(us: u64) {
     unsafe {
         if let Some((_len, _max, buf)) = unicode_string_triplet(us) {
             if buf != 0 {
-                pool_free(buf);
+                s_ex_free_pool(buf);
             }
             write_unaligned((us + UNICODE_STRING_LENGTH_OFFSET) as *mut u16, 0);
             write_unaligned((us + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *mut u16, 0);
@@ -6690,7 +6690,7 @@ extern "win64" fn s_rtl_free_ansi_string(s: u64) {
     unsafe {
         if let Some((_len, _max, buf)) = ansi_string_triplet(s) {
             if buf != 0 {
-                pool_free(buf);
+                s_ex_free_pool(buf);
             }
             write_unaligned((s + ANSI_STRING_LENGTH_OFFSET) as *mut u16, 0);
             write_unaligned((s + ANSI_STRING_MAXIMUM_LENGTH_OFFSET) as *mut u16, 0);

@@ -75,6 +75,135 @@ impl<'ast> Visit<'ast> for Boundary {
     }
 }
 
+fn assert_string_free_retirement(body: &syn::Block, triplet: &str, offsets: [&str; 3]) {
+    struct DescriptorGuard<'a> {
+        triplet: &'a str,
+        offsets: [&'a str; 3],
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for DescriptorGuard<'_> {
+        fn visit_expr_if(&mut self, value: &'ast syn::ExprIf) {
+            let mut condition = Boundary::default();
+            condition.visit_expr(&value.cond);
+            if condition.calls.iter().any(|call| call == self.triplet) {
+                assert!(matches!(&*value.cond, syn::Expr::Let(binding)
+                    if matches!(&*binding.pat, syn::Pat::TupleStruct(tuple)
+                        if tuple.path.is_ident("Some"))),
+                    "invalid string descriptors must not reach retirement or clearing");
+                assert!(value.else_branch.is_none());
+                let mut retired = false;
+                let mut cleared = Vec::new();
+                let mut clearing_writes = 0;
+                for statement in &value.then_branch.stmts {
+                    if let syn::Stmt::Expr(syn::Expr::If(buffer), _) = statement {
+                        assert!(matches!(&*buffer.cond, syn::Expr::Binary(binary)
+                            if matches!(binary.op, syn::BinOp::Ne(_))
+                            && matches!(&*binary.left, syn::Expr::Path(path) if path.path.is_ident("buf"))
+                            && matches!(&*binary.right, syn::Expr::Lit(literal)
+                                if matches!(&literal.lit, syn::Lit::Int(integer)
+                                    if integer.base10_parse::<u64>().ok() == Some(0)))),
+                            "null buffers must not be submitted for retirement");
+                        assert!(buffer.else_branch.is_none());
+                        let mut branch = Boundary::default();
+                        branch.visit_block(&buffer.then_branch);
+                        assert_eq!(branch.calls.len(), 1);
+                        assert_eq!(branch.calls[0], "s_ex_free_pool");
+                        assert!(branch.paths.iter().any(|path| path == "buf"));
+                        retired = true;
+                    } else {
+                        let mut boundary = Boundary::default();
+                        boundary.visit_stmt(statement);
+                        if boundary.calls.iter().any(|call| call == "write_unaligned") {
+                            clearing_writes += 1;
+                            assert!(retired, "retire the buffer before clearing its descriptor");
+                            assert!(matches!(statement, syn::Stmt::Expr(syn::Expr::Call(call), _)
+                                if call.args.len() == 2
+                                && matches!(call.args.iter().nth(1), Some(syn::Expr::Lit(literal))
+                                    if matches!(&literal.lit, syn::Lit::Int(integer)
+                                        if integer.base10_parse::<u64>().ok() == Some(0)))),
+                                "clear descriptor fields to zero after retirement");
+                            cleared.extend(boundary.paths.into_iter().filter(|path|
+                                self.offsets.contains(&path.as_str())));
+                        }
+                    }
+                }
+                assert!(retired);
+                assert_eq!(clearing_writes, 3, "clear exactly the three descriptor fields");
+                for offset in self.offsets {
+                    assert!(cleared.iter().any(|path| path == offset),
+                        "preserve descriptor clearing for {offset}");
+                }
+                self.found = true;
+            }
+            syn::visit::visit_expr_if(self, value);
+        }
+    }
+    let mut boundary = Boundary::default();
+    boundary.visit_block(body);
+    assert!(!boundary.calls.iter().any(|call| call == "pool_free"),
+        "string free must not bypass retained allocation retirement");
+    assert_eq!(boundary.calls.iter().filter(|call| *call == "s_ex_free_pool").count(), 1);
+    let mut guard = DescriptorGuard { triplet, offsets, found: false };
+    guard.visit_block(body);
+    assert!(guard.found, "preserve the valid-triplet guard");
+}
+
+#[test]
+fn string_free_exports_use_pool_retirement_before_clearing_valid_descriptors() {
+    let source = syn::parse_file(include_str!(
+        "../../../components/ntos-executive/src/driver_launch.rs"
+    ))
+    .unwrap();
+    for (name, triplet, offsets) in [
+        ("s_rtl_free_unicode_string", "unicode_string_triplet", [
+            "UNICODE_STRING_LENGTH_OFFSET", "UNICODE_STRING_MAXIMUM_LENGTH_OFFSET",
+            "UNICODE_STRING_BUFFER_OFFSET",
+        ]),
+        ("s_rtl_free_ansi_string", "ansi_string_triplet", [
+            "ANSI_STRING_LENGTH_OFFSET", "ANSI_STRING_MAXIMUM_LENGTH_OFFSET",
+            "ANSI_STRING_BUFFER_OFFSET",
+        ]),
+    ] {
+        let body = function(&source, name);
+        assert_string_free_retirement(body, triplet, offsets);
+    }
+}
+
+#[test]
+fn string_free_scanner_rejects_nonzero_reset_and_clearing_before_retirement() {
+    let valid: syn::Block = syn::parse_quote!({
+        unsafe {
+            if let Some((_len, _max, buf)) = unicode_string_triplet(us) {
+                if buf != 0 { s_ex_free_pool(buf); }
+                write_unaligned((us + LENGTH) as *mut u16, 0);
+                write_unaligned((us + MAXIMUM_LENGTH) as *mut u16, 0);
+                write_unaligned((us + BUFFER) as *mut u64, 0);
+            }
+        }
+    });
+    let check = |body: &syn::Block| {
+        assert_string_free_retirement(body, "unicode_string_triplet",
+            ["LENGTH", "MAXIMUM_LENGTH", "BUFFER"]);
+    };
+    check(&valid);
+    for reset_before_retirement in [false, true] {
+        let mut invalid = valid.clone();
+        let syn::Stmt::Expr(syn::Expr::Unsafe(outer), _) = &mut invalid.stmts[0]
+            else { panic!("fixture unsafe block") };
+        let syn::Stmt::Expr(syn::Expr::If(descriptor), _) = &mut outer.block.stmts[0]
+            else { panic!("fixture triplet guard") };
+        if reset_before_retirement {
+            descriptor.then_branch.stmts.swap(0, 1);
+        } else {
+            let syn::Stmt::Expr(syn::Expr::Call(write), _) = &mut descriptor.then_branch.stmts[1]
+                else { panic!("fixture reset") };
+            *write.args.iter_mut().nth(1).unwrap() = syn::parse_quote!(1);
+        }
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&invalid))).is_err(),
+            "scanner must reject nonzero reset or retirement-order bypass");
+    }
+}
+
 #[test]
 fn pool_and_irp_free_exports_use_common_retirement_with_exact_operations() {
     let source = syn::parse_file(include_str!(
