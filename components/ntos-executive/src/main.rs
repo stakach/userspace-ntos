@@ -117,6 +117,8 @@ mod hosted_process_runtime;
 mod hosted_process_vspace;
 pub(crate) use hosted_process_runtime::*;
 mod process_vm_retirement;
+mod image_range_retirement;
+use image_range_retirement::vm_unmap_shared_image_mapping_range;
 mod ps_bootstrap;
 mod dispatcher_bootstrap;
 mod timer_deadline;
@@ -7152,13 +7154,24 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
     print_str(b"/");
     print_u64(EXEC_DISPATCH_TICKS.load(Ordering::Relaxed) / 1_000_000);
     print_str(b"Mtick");
-    print_str(b" disk=");
-    print_u64(AHCI_CMDS.load(Ordering::Relaxed));
-    print_str(b"cmd/");
-    print_u64(AHCI_SECTORS.load(Ordering::Relaxed));
-    print_str(b"sec/");
-    print_u64(AHCI_TICKS.load(Ordering::Relaxed) / 1_000_000);
-    print_str(b"Mtick");
+    for (label, operation) in [
+        (b" disk-read=".as_slice(), nt_ahci::IoOperation::Read),
+        (b" disk-write=".as_slice(), nt_ahci::IoOperation::Write),
+        (b" disk-barrier=".as_slice(), nt_ahci::IoOperation::Barrier),
+    ] {
+        let sample = AHCI_CENSUS.snapshot(operation);
+        print_str(label);
+        print_u64(sample.commands);
+        print_str(b"attempt/");
+        print_u64(sample.sectors);
+        print_str(b"sec/");
+        print_u64(sample.ticks / 1_000_000);
+        print_str(b"Mtick/");
+        print_u64(sample.failures);
+        print_str(b"fail");
+    }
+    print_str(b" client-switches=");
+    print_u64(win32k_glue::client_attachment_switches());
     print_str(b" ssn-hot");
     print_hot_ssn_field(b"services", unsafe {
         &*core::ptr::addr_of!(SERVICES_SSN_HIST)
@@ -12351,28 +12364,6 @@ unsafe fn recycle_unmapped_frame_record_caps(
     if source_cap != 0 && source_cap != frame && source_cap != alias_cap {
         let _ = cnode_delete_recycle_r(source_cap);
     }
-}
-
-unsafe fn vm_unmap_shared_image_mapping_range(
-    pi: usize,
-    process: nt_user_host::process_identity::ProcessIdentity,
-    base: u64,
-    end: u64,
-    handler: &ExecNtHandler,
-) -> Result<(), u32> {
-    let size = end.checked_sub(base).ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
-    hosted_thread_memory_retirement_access(pi as u64, base, size)?;
-    if vm_page_lock_range_is_locked(pi as u64, base, end) {
-        VM_LOCK_RECLAIM_REFUSALS.fetch_add(1, Ordering::Relaxed);
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    shared_image_mapping_validate_range_for(pi as u64, process, base, end)?;
-    let mut page = base;
-    while page < end {
-        vm_unmap_private_page(pi, process, page, handler)?;
-        page += 0x1000;
-    }
-    shared_image_mapping_unmap_range(pi as u64, process, base, end)
 }
 
 unsafe fn vm_reprotect_shared_image_mapping(
@@ -27332,16 +27323,13 @@ unsafe fn get_frame_paddr_checked(frame_cap: u64) -> Result<u64, u32> {
     Ok(paddr)
 }
 
-/// DISK-I/O CENSUS. The AHCI path is the executive's hottest emulated device path — every PE
-/// image, hive and directory scan flows through it — and under TCG a port round-trip costs orders
-/// of magnitude more than the RAM work around it. These counters turn that into a MEASUREMENT.
+/// Operation-separated disk attempts and elapsed caller-clock ticks, including errors. A barrier
+/// attempt includes capability identification on its first use; it is not a raw ATA-command count.
 ///
 /// They are only ever updated on the EXECUTIVE's mount (`Fat32::census`). The isolated storage
 /// host maps its image READ-ONLY, so a write to any static there faults with no handler and wedges
 /// the boot; `Fat32::census` is false on the mount that host builds by hand.
-pub(crate) static AHCI_CMDS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static AHCI_SECTORS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static AHCI_TICKS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static AHCI_CENSUS: nt_ahci::CommandCensus = nt_ahci::CommandCensus::new();
 
 /// A clock readable from any address space (no HPET mapping needed, unlike the census clock).
 #[inline(always)]

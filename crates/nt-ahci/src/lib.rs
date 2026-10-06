@@ -1,6 +1,9 @@
 //! Polled AHCI maintenance commands over a caller-owned port and coherent DMA frame.
 #![no_std]
 
+mod census;
+pub use census::{CommandCensus, IoOperation, IoSnapshot};
+
 #[cfg(test)]
 mod tests;
 

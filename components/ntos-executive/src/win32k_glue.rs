@@ -5677,6 +5677,9 @@ pub(crate) unsafe fn ensure_w32_client_paging(page: u64, w_pml4: u64) -> bool {
 
 #[path = "win32k_attach.rs"]
 mod client_attach;
+pub(crate) fn client_attachment_switches() -> u64 {
+    client_attach::ATTACH_SWITCHES.load(Ordering::Relaxed)
+}
 pub(crate) use client_attach::*;
 #[path = "win32k_process_attach_root.rs"]
 mod process_attach_root;

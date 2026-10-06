@@ -32,6 +32,8 @@ pub use memory_lifetime::MemoryLifetime;
 mod process_slot_reuse;
 pub use process_slot_reuse::{admit_empty_process_slot, ProcessSlotBlocker};
 mod private_page_retirement;
+mod private_page_range;
+pub use private_page_range::next_private_page_in_range;
 pub mod private_page_installation;
 pub mod transition_page_restoration;
 pub use private_page_retirement::admit_private_page_retirement;

@@ -117,6 +117,7 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
             let absolute = self.absolute_lba(lba + sector_index as u64)?;
             let byte_start = sector_index * sector_size;
             let byte_end = byte_start + chunk_sectors * sector_size;
+            let started = self.fat.census.then(disk_census_ticks);
             let tfd = unsafe {
                 ahci_read_sectors(
                     self.fat.ahci_vaddr,
@@ -126,6 +127,12 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
                     chunk_sectors as u32,
                 )
             };
+            crate::fs_loader::disk_census_record(
+                nt_ahci::IoOperation::Read,
+                started,
+                chunk_sectors as u64,
+                tfd & nt_ahci::TASK_FILE_FAILURE != 0,
+            );
             if tfd & nt_ahci::TASK_FILE_FAILURE != 0 {
                 return Err(nt_fs::SnapshotBlockStoreError::Io);
             }
@@ -175,6 +182,7 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
             let absolute = self.absolute_lba(relative_lba)?;
             let byte_start = sector_index * sector_size;
             let byte_end = byte_start + chunk_sectors * sector_size;
+            let started = self.fat.census.then(disk_census_ticks);
             let tfd = unsafe {
                 ahci_write_sectors(
                     self.fat.ahci_vaddr,
@@ -184,6 +192,12 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
                     &data[byte_start..byte_end],
                 )
             };
+            crate::fs_loader::disk_census_record(
+                nt_ahci::IoOperation::Write,
+                started,
+                chunk_sectors as u64,
+                tfd & nt_ahci::TASK_FILE_FAILURE != 0,
+            );
             if tfd & nt_ahci::TASK_FILE_FAILURE != 0 {
                 return Err(nt_fs::SnapshotBlockStoreError::Io);
             }

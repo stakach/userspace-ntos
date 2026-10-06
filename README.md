@@ -166,7 +166,8 @@ The latest [fresh-run receipt](docs/evidence/issue18-prepared-hive-font-timeout.
 records a one-hour timeout during genuine setup after the prepared hive changes.
 It has no allocation abort, but does not prove passage of the earlier registry failure. Its
 screenshot shows background and cursor, not a working desktop. Acceptance requires both strict
-native private-font cleanup and a separate fixture-free Userinit/Explorer boot
+native private-font cleanup and a separate production Userinit/Explorer boot without
+acceptance startup hooks
 with real callbacks, GDI drawing, logs and screenshots. Crate CI does not prove
 desktop boot. To attempt a boot from a fresh clone:
 
@@ -207,6 +208,11 @@ self-contained launcher that:
    `bash scripts/run-seh-fault-integration.sh`; pass `--desktop` to also require
    the full Explorer gate.
 5. **Boots QEMU.**
+
+Periodic census separates disk read, write and barrier attempts, requested sectors,
+errors and elapsed TSC ticks; these are not durability receipts or wall-clock times.
+Successful win32k client switches remain counted, with per-switch text available
+in executive builds using the `debug-trace` feature.
 
 ### Desktop Acceptance
 

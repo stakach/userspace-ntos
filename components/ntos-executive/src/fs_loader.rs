@@ -133,7 +133,12 @@ unsafe fn fat_read_sector_checked(fs: &Fat32, sector: u32) -> Option<*const u8> 
     let disk_lba = nt_fs::checked_partition_lba(fs.volume_start_lba, sector)?;
     let census_started = fs.census.then(disk_census_ticks);
     let status = ahci_read_sector(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba);
-    disk_census_record(census_started, 1);
+    disk_census_record(
+        nt_ahci::IoOperation::Read,
+        census_started,
+        1,
+        status & nt_ahci::TASK_FILE_FAILURE != 0,
+    );
     if status == 0xFF {
         print_str(b"[fat-sector] read timeout sector=");
         print_u64(sector as u64);
@@ -148,14 +153,13 @@ unsafe fn fat_read_sectors_checked(fs: &Fat32, sector: u32, count: u32) -> Optio
     let last = sector.checked_add(count.checked_sub(1)?)?;
     nt_fs::checked_partition_lba(fs.volume_start_lba, last)?;
     let census_started = fs.census.then(disk_census_ticks);
-    let status = ahci_read_sectors(
-        fs.ahci_vaddr,
-        fs.dma_vaddr,
-        fs.dma_paddr,
-        disk_lba,
-        count,
+    let status = ahci_read_sectors(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba, count);
+    disk_census_record(
+        nt_ahci::IoOperation::Read,
+        census_started,
+        count as u64,
+        status & nt_ahci::TASK_FILE_FAILURE != 0,
     );
-    disk_census_record(census_started, count as u64);
     if status == 0xFF {
         print_str(b"[fat-sector] read timeout sector=");
         print_u64(sector as u64);
@@ -167,12 +171,15 @@ unsafe fn fat_read_sectors_checked(fs: &Fat32, sector: u32, count: u32) -> Optio
     Some((fs.dma_vaddr + AHCI_DMA_DATA_OFFSET) as *const u8)
 }
 
-/// Fold one completed disk command into the census (no-op on the storage host's mount).
-fn disk_census_record(started: Option<u64>, sectors: u64) {
+/// Fold one returned I/O attempt into the census (no-op on the storage host's mount).
+pub(crate) fn disk_census_record(
+    operation: nt_ahci::IoOperation,
+    started: Option<u64>,
+    sectors: u64,
+    failed: bool,
+) {
     let Some(started) = started else { return };
-    AHCI_CMDS.fetch_add(1, Ordering::Relaxed);
-    AHCI_SECTORS.fetch_add(sectors, Ordering::Relaxed);
-    AHCI_TICKS.fetch_add(disk_census_ticks().wrapping_sub(started), Ordering::Relaxed);
+    AHCI_CENSUS.record(operation, started, disk_census_ticks(), sectors, failed);
 }
 
 unsafe fn fat_cache_invalidate(fs: &Fat32) {
@@ -189,7 +196,15 @@ pub(crate) unsafe fn fat_write_sector(fs: &Fat32, sector: u32, data: &[u8]) -> u
     let Some(disk_lba) = nt_fs::checked_partition_lba(fs.volume_start_lba, sector) else {
         return 0xff;
     };
-    ahci_write_sectors(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba, data)
+    let started = fs.census.then(disk_census_ticks);
+    let status = ahci_write_sectors(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba, data);
+    disk_census_record(
+        nt_ahci::IoOperation::Write,
+        started,
+        1,
+        status & nt_ahci::TASK_FILE_FAILURE != 0,
+    );
+    status
 }
 
 #[allow(dead_code)]
@@ -210,13 +225,15 @@ pub(crate) unsafe fn fat_write_sectors(fs: &Fat32, sector: u32, data: &[u8]) -> 
     if nt_fs::checked_partition_lba(fs.volume_start_lba, last).is_none() {
         return 0xff;
     }
-    ahci_write_sectors(
-        fs.ahci_vaddr,
-        fs.dma_vaddr,
-        fs.dma_paddr,
-        disk_lba,
-        data,
-    )
+    let started = fs.census.then(disk_census_ticks);
+    let status = ahci_write_sectors(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba, data);
+    disk_census_record(
+        nt_ahci::IoOperation::Write,
+        started,
+        sectors as u64,
+        status & nt_ahci::TASK_FILE_FAILURE != 0,
+    );
+    status
 }
 
 #[allow(dead_code)]
