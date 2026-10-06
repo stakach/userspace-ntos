@@ -147,7 +147,8 @@ pub use completion_unwind::{
 pub use device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
 pub use device_reference::DeviceReference;
 pub use file_reference::FileReference;
-pub use hosted_device_pointer::{HostedDevicePointerReference, HostedDevicePointerRegistration};
+pub use hosted_device_pointer::{HostedDevicePointerReference, HostedDevicePointerRegistration,
+    HostedDeviceProjectionReference};
 pub use device_property_query::{
     query_device_property, PropertyQueryReply, PropertyQueryRequest, PropertyQueryResult,
     PropertyQueryTransport, PROPERTY_QUERY_CHUNK_BYTES,

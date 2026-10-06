@@ -52,10 +52,32 @@ impl HostedDevicePointerReference {
     }
 }
 
+/// Owns the exact native projection as well as its canonical Device body. Unlike a detached
+/// pointer reference, this owner prevents unregister/unbind until its checked release succeeds.
+#[derive(Debug)]
+#[must_use = "retain the projection until all native pointer consumers have finished"]
+pub struct HostedDeviceProjectionReference {
+    registration: HostedDevicePointerRegistration,
+    reference: DeviceReference,
+}
+
+impl HostedDeviceProjectionReference {
+    pub fn registration(&self) -> HostedDevicePointerRegistration {
+        self.registration
+    }
+    pub fn is_held(&self) -> bool {
+        self.reference.is_held()
+    }
+    pub fn release<P>(&mut self, io: &mut IoManager<P>) -> Result<(), NtStatus> {
+        io.release_hosted_device_projection_reference(self)
+    }
+}
+
 struct Row {
     registration: HostedDevicePointerRegistration,
     anchor: DeviceReference,
     callers: Option<DeviceReference>,
+    projection_references: u64,
 }
 
 #[derive(Default)]
@@ -183,6 +205,7 @@ impl<P> IoManager<P> {
             registration,
             anchor,
             callers: None,
+            projection_references: 0,
         });
         self.hosted_device_pointers.sequence = sequence;
         Ok(registration)
@@ -286,6 +309,44 @@ impl<P> IoManager<P> {
         Ok(HostedDevicePointerReference { reference })
     }
 
+    /// Pin a live exact projection independently of caller references. Count and allocation
+    /// refusal precede publication; detached Device references retain their existing semantics.
+    pub fn retain_hosted_device_projection_reference(
+        &mut self,
+        registration: HostedDevicePointerRegistration,
+    ) -> Result<HostedDeviceProjectionReference, NtStatus> {
+        let index = self.live_pointer_row_index(registration)?;
+        let count = self.hosted_device_pointers.rows[index]
+            .projection_references
+            .checked_add(1)
+            .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+        let reference = self.retain_device_reference(registration.device)?;
+        self.hosted_device_pointers.rows[index].projection_references = count;
+        Ok(HostedDeviceProjectionReference {
+            registration,
+            reference,
+        })
+    }
+
+    /// Exact one-shot release. The row and both counts remain intact on every refusal, including
+    /// foreign-manager and stale registration errors. No new domain acquisition is required.
+    pub fn release_hosted_device_projection_reference(
+        &mut self,
+        owner: &mut HostedDeviceProjectionReference,
+    ) -> Result<(), NtStatus> {
+        let index = self.pointer_row_index(owner.registration)?;
+        if !owner.is_held()
+            || owner.reference.count() != 1
+            || owner.reference.device_id() != owner.registration.device
+            || self.hosted_device_pointers.rows[index].projection_references == 0
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        self.release_device_reference(&mut owner.reference)?;
+        self.hosted_device_pointers.rows[index].projection_references -= 1;
+        Ok(())
+    }
+
     /// Detach exactly one already-owned caller reference for result publication or rollback.
     pub fn take_hosted_device_pointer_reference(
         &mut self,
@@ -330,14 +391,15 @@ impl<P> IoManager<P> {
         })
     }
 
-    /// Retire only the registration anchor after every local caller reference has been drained.
-    /// Detached result owners remain independent and continue protecting the canonical device.
+    /// Retire the anchor only after local callers, projection pins and registration consumers
+    /// drain. Detached result owners remain independent and protect only the canonical device.
     pub fn unregister_hosted_device_pointer(
         &mut self,
         registration: HostedDevicePointerRegistration,
     ) -> Result<(), NtStatus> {
         let index = self.pointer_row_index(registration)?;
-        if self.hosted_device_pointers.rows[index].callers.is_some()
+        if self.hosted_device_pointers.rows[index].projection_references != 0
+            || self.hosted_device_pointers.rows[index].callers.is_some()
             || self.hosted_file_systems.retains_registration(registration)
         {
             return Err(NtStatus::DEVICE_BUSY);
@@ -373,3 +435,7 @@ impl<P> IoManager<P> {
 #[cfg(test)]
 #[path = "hosted_device_pointer/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "hosted_device_pointer/projection_tests.rs"]
+mod projection_tests;
