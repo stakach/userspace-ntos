@@ -9,13 +9,14 @@ impl ExecNtHandler {
         value_type: nt_hive_core::RegistryValueType,
         data: &[u8],
     ) -> Result<(), u32> {
+        let _durable = allocator::enter_durable();
         let relative = self
             .mutable_key_relative_path(key)
             .ok_or(STATUS_INVALID_HANDLE)?;
         let path = self
             .mutable_hive_checkpoint_path_owned(key.hive)
             .ok_or(STATUS_INVALID_HANDLE)?;
-        {
+        let receipt = {
             let hive = self
                 .mutable_hives
                 .hive_mut(key.hive)
@@ -23,61 +24,27 @@ impl ExecNtHandler {
             let provider = crate::writable_fs::WritableHiveIoProvider::new(&path);
             let mut manager = nt_hive_core::HiveManager::for_live_hive(provider, hive);
             manager
-                .mutate_with_live_apply(
-                    hive,
-                    nt_hive_core::HiveLogOp::SetValue {
-                        path: &relative,
-                        name,
-                        value_type,
-                        data,
-                    },
-                    |hive| hive.set_value(key.key, name, value_type, data.to_vec()),
-                )
-                .map_err(Self::mutable_hive_journal_status)?;
+                .try_set_value(hive, key.key, &relative, name, value_type, data)
+                .map_err(Self::mutable_hive_set_value_status)?
+        };
+        if receipt.durable {
+            self.note_mutable_hive_journal_record(key.hive);
         }
-        self.note_mutable_hive_journal_record(key.hive);
         Ok(())
     }
 
-    pub(super) fn journal_set_mutable_value_from_existing_value(
-        &mut self,
-        key: ResolvedHiveKey,
-        name: &str,
-        value_type: nt_hive_core::RegistryValueType,
-        source: nt_hive_core::ResolvedHiveValue,
-    ) -> Result<(), u32> {
-        let log_data = match self.mutable_hives.query_resolved_value(source) {
-            Some((source_type, source_data)) if source_type == value_type => source_data.to_vec(),
-            _ => return Err(STATUS_INVALID_HANDLE),
-        };
-        if key.hive != source.hive {
-            return self.journal_set_mutable_value(key, name, value_type, &log_data);
+    fn mutable_hive_set_value_status(err: nt_hive_core::HiveSetValueError) -> u32 {
+        use nt_hive_core::{HiveSetValueError, SetValueError};
+        match err {
+            HiveSetValueError::Prepare(SetValueError::KeyNotFound)
+            | HiveSetValueError::PathMismatch => STATUS_INVALID_HANDLE,
+            HiveSetValueError::Prepare(SetValueError::InsufficientResources)
+            | HiveSetValueError::Encode(_)
+            | HiveSetValueError::SequenceOverflow => nt_fs::STATUS_INSUFFICIENT_RESOURCES,
+            HiveSetValueError::Io(err) => Self::mutable_hive_journal_status(err),
+            HiveSetValueError::Prepare(SetValueError::RetainedPublication)
+            | HiveSetValueError::RetainedPublication
+            | HiveSetValueError::SequenceMismatch => STATUS_UNSUCCESSFUL,
         }
-        let relative = self
-            .mutable_key_relative_path(key)
-            .ok_or(STATUS_INVALID_HANDLE)?;
-        let path = self
-            .mutable_hive_checkpoint_path_owned(key.hive)
-            .ok_or(STATUS_INVALID_HANDLE)?;
-        let hive = self
-            .mutable_hives
-            .hive_mut(key.hive)
-            .ok_or(STATUS_INVALID_HANDLE)?;
-        let provider = crate::writable_fs::WritableHiveIoProvider::new(&path);
-        let mut manager = nt_hive_core::HiveManager::for_live_hive(provider, hive);
-        manager
-            .mutate_with_live_apply(
-                hive,
-                nt_hive_core::HiveLogOp::SetValue {
-                    path: &relative,
-                    name,
-                    value_type,
-                    data: &log_data,
-                },
-                |hive| hive.set_value_from_existing_value(key.key, name, value_type, source.value),
-            )
-            .map_err(Self::mutable_hive_journal_status)?;
-        self.note_mutable_hive_journal_record(key.hive);
-        Ok(())
     }
 }

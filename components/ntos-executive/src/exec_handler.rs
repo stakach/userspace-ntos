@@ -5988,6 +5988,11 @@ impl ExecNtHandler {
         if hive_sel == HIVE_SEL_SYSTEM {
             return STATUS_INVALID_HANDLE;
         }
+        if self.mutable_hives.hive(hive_sel)
+            .is_some_and(|hive| hive.retained_value_journal().is_some())
+        {
+            return STATUS_UNSUCCESSFUL;
+        }
         if dirty_cells == 0 {
             return nt_fs::STATUS_SUCCESS;
         }
@@ -6066,6 +6071,7 @@ impl ExecNtHandler {
                 print_str(match err {
                     nt_hive_core::HiveValueBlobCompactError::MissingBlob => b"missing-blob",
                     nt_hive_core::HiveValueBlobCompactError::OutOfMemory => b"out-of-memory",
+                    nt_hive_core::HiveValueBlobCompactError::RetainedPublication => b"retained-publication",
                 });
                 print_str(b" path=");
                 print_ascii_str(file_path);
@@ -6093,6 +6099,14 @@ impl ExecNtHandler {
     }
 
     pub(crate) fn complete_committed_mutable_hive_journal_snapshot(&mut self, reason: &[u8]) {
+        if [HIVE_SEL_SOFTWARE, HIVE_SEL_SECURITY, HIVE_SEL_SAM, HIVE_SEL_USER_DEFAULT]
+            .iter().copied().chain(HIVE_SEL_DYNAMIC.iter().copied())
+            .any(|hive_sel| self.mutable_hives.hive(hive_sel)
+                .is_some_and(|hive| hive.retained_value_journal().is_some()))
+        {
+            print_str(b"[cm-flush] journal accounting retained after uncertain value publication\n");
+            return;
+        }
         let pending_records = self.mutable_hive_journal_pending_records;
         let pending_boot_mask = self.mutable_hive_journal_pending_boot_mask;
         let dirty_boot_mask = self.mutable_hive_journal_dirty_boot_mask;
@@ -6184,6 +6198,11 @@ impl ExecNtHandler {
         min_post_checkpoint_headroom: usize,
     ) -> u32 {
         const MIN_IMAGE_HINT: usize = 0x1_0000;
+        if self.mutable_hives.hive(hive_sel)
+            .is_some_and(|hive| hive.retained_value_journal().is_some())
+        {
+            return STATUS_UNSUCCESSFUL;
+        }
         if dirty_cells == 0 {
             return nt_fs::STATUS_SUCCESS;
         }
@@ -6289,6 +6308,11 @@ impl ExecNtHandler {
         let mut candidates = [None; 4];
         let mut candidate_len = 0usize;
         for hive_sel in HIVE_SELS {
+            if self.mutable_hives.hive(hive_sel)
+                .is_some_and(|hive| hive.retained_value_journal().is_some())
+            {
+                return STATUS_UNSUCCESSFUL;
+            }
             let dirty = self
                 .mutable_hives
                 .hive(hive_sel)
@@ -6379,6 +6403,11 @@ impl ExecNtHandler {
 
     fn checkpoint_dynamic_mutable_hive(&mut self, hive_sel: u32, dirty_cells: usize) -> u32 {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        if self.mutable_hives.hive(hive_sel)
+            .is_some_and(|hive| hive.retained_value_journal().is_some())
+        {
+            return STATUS_UNSUCCESSFUL;
+        }
         if dirty_cells == 0 {
             return nt_fs::STATUS_SUCCESS;
         }
@@ -6955,6 +6984,14 @@ impl ExecNtHandler {
             // same refusal NT makes for a hive it did not load on request.
             NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
             return STATUS_INVALID_PARAMETER;
+        }
+        let Some(hive) = self.mutable_hives.hive(self.hive_mounts[index].sel) else {
+            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return STATUS_INVALID_HANDLE;
+        };
+        if hive.retained_value_journal().is_some() {
+            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return STATUS_UNSUCCESSFUL;
         }
         let mount = self.hive_mounts.remove(index);
         if let Some(slot) = mount.slot {
