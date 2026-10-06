@@ -213,6 +213,8 @@ Periodic census separates disk read, write and barrier attempts, requested secto
 errors and elapsed TSC ticks; these are not durability receipts or wall-clock times.
 Successful win32k client switches remain counted, with per-switch text available
 in executive builds using the `debug-trace` feature.
+Filesystem snapshots use the shared CRC32C codec and bounded whole-sector staging;
+coalescing encoder fragments preserves the existing durability barriers.
 
 ### Desktop Acceptance
 
