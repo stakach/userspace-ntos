@@ -597,3 +597,10 @@ diagnosis-free failure.
 - Absence of an error before a timeout is not passage of its former failure point.
   Correlate the exact operation, owner and mapping receipt across runs; line counts,
   helper counts and unrelated snapshot generations are not substitutes.
+
+## Prove Interrupt Delivery Per CPU
+- A finite busy window on one CPU does not prove another CPU received interrupts.
+  Verify the actual timer or IPI routing before using that window as native coverage.
+- Require an observation from the live target branch, not merely a successful helper
+  roundtrip. Generate test wakeups through ordinary owned kernel operations rather
+  than synthetic counter increments or test-only interrupt injection.
