@@ -58,6 +58,7 @@ pub struct RegistryWal<D: SnapshotBlockDevice> {
     cursor: u64,
     next_serial: u64,
     records: Vec<RegistryWalRecord>,
+    record_end_lbas: Vec<u64>,
     pending: Option<Pending>,
     recovered_tail_sectors: Option<u64>,
     state: RegistryWalState,
@@ -175,6 +176,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
         let mut cursor = 0u64;
         let mut serial = 1u64;
         let mut records = Vec::new();
+        let mut record_end_lbas = Vec::new();
         let mut recovered_tail_sectors = None;
         while cursor < device.sector_count() {
             device
@@ -256,7 +258,11 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
             records
                 .try_reserve(1)
                 .map_err(|_| RegistryWalError::OutOfMemory)?;
+            record_end_lbas
+                .try_reserve(1)
+                .map_err(|_| RegistryWalError::OutOfMemory)?;
             records.push(RegistryWalRecord { serial, payload });
+            record_end_lbas.push(marker_lba + 1);
             serial = serial
                 .checked_add(1)
                 .ok_or(RegistryWalError::GenerationExhausted)?;
@@ -268,6 +274,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
             cursor,
             next_serial: serial,
             records,
+            record_end_lbas,
             pending: None,
             recovered_tail_sectors,
             state: if recovered_tail_sectors.is_some() {
@@ -283,6 +290,28 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
     }
     pub fn state(&self) -> RegistryWalState {
         self.state
+    }
+
+    /// Only a scanned or settled WAL prefix can satisfy an external durability anchor.
+    pub(crate) fn verified_prefix(&self) -> Option<(u64, u64, u64)> {
+        if !matches!(
+            self.state,
+            RegistryWalState::Ready | RegistryWalState::RecoveredUncommitted
+        ) {
+            return None;
+        }
+        let serial = self.records.last().map_or(0, |record| record.serial);
+        Some((self.incarnation, serial, self.cursor))
+    }
+
+    /// Exact end of one parsed committed frame, including its marker sector.
+    pub(crate) fn verified_record_end_lba(&self, serial: u64) -> Option<u64> {
+        self.verified_prefix()?;
+        if serial == 0 {
+            return Some(0);
+        }
+        let index = usize::try_from(serial.checked_sub(1)?).ok()?;
+        self.record_end_lbas.get(index).copied()
     }
 
     /// Discard a verified but unmarked tail after reboot. This may write after recovery,
@@ -336,6 +365,9 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
             .checked_add(1)
             .ok_or(RegistryWalError::GenerationExhausted)?;
         self.records
+            .try_reserve(1)
+            .map_err(|_| RegistryWalError::OutOfMemory)?;
+        self.record_end_lbas
             .try_reserve(1)
             .map_err(|_| RegistryWalError::OutOfMemory)?;
         self.pending = Some(Pending {
@@ -444,6 +476,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
             serial: pending.serial,
             payload: pending.payload,
         });
+        self.record_end_lbas.push(marker_lba + 1);
         self.next_serial += 1;
         self.cursor = marker_lba + 1;
         self.state = RegistryWalState::Ready;
