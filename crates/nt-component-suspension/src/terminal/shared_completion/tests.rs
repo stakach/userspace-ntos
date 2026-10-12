@@ -348,14 +348,14 @@ fn external_transfer_token_uses_existing_running_retirement() {
 }
 
 #[test]
-fn existing_finish_terminal_keeps_original_idle_behavior() {
-    let (mut lanes, _, _, dispatch, terminal, _) = setup(false);
+fn generic_terminal_retirement_cannot_drop_an_active_shared_dispatch() {
+    let (mut lanes, _, route, dispatch, terminal, receiver) = setup(false);
     ack_all(&mut lanes, terminal);
-    lanes
-        .finish_terminal(terminal, 40, Ok(()))
-        .unwrap()
-        .unwrap();
-    assert_eq!(lanes.phase(dispatch.lane()), Ok(LanePhase::Idle));
-    assert_eq!(lanes.active_dispatch_identity(dispatch.lane()), Ok(None));
+    assert!(lanes.finish_terminal(terminal, 40, Ok(())).is_err());
+    assert_eq!(lanes.phase(dispatch.lane()), Ok(LanePhase::Terminal));
+    assert_eq!(lanes.active_dispatch_identity(dispatch.lane()), Ok(Some(dispatch)));
+    assert!(receiver.retained_reply_owner(40).unwrap().admitted);
     assert_eq!(lanes.running(), None);
+    assert!(lanes.finish_shared_terminal(route, dispatch, terminal, 40, Ok(())).unwrap().is_some());
+    assert_eq!(lanes.active_dispatch_identity(dispatch.lane()), Ok(Some(dispatch)));
 }

@@ -230,6 +230,9 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
     if !runtime_ready(handler) || is_running() {
         return;
     }
+    // A hosted terminal may own the shared execution fence while awaiting the separately
+    // retained final Call. Settle that exact return before the ordinary busy-lane gate.
+    let _ = component_terminal::drain_shared_returns();
     if component_execution_is_busy()
         && !kernel_provider_activation::has_stopped_wait_work(&(*handler).pm)
     {

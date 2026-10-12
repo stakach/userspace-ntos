@@ -116,6 +116,47 @@ fn same_lane_is_not_ready_for_a_second_dispatch_while_first_reply_is_owned() {
 }
 
 #[test]
+fn completed_lane_reuses_its_physical_reply_after_next_call_is_retained() {
+    let (mut lanes, mut peers, route, mut owner, _) = setup();
+    let mut pool = IngressReplyPool::new(20, 2).unwrap();
+    pool.insert(ComponentIngress::new(20, 41).unwrap(), &owner, &lanes, free)
+        .ok().unwrap();
+    call(&mut owner, &lanes);
+    pool.retain(&mut owner, &lanes, &mut peers, route.badge(), free, bound)
+        .unwrap();
+    assert_eq!(owner.retained_reply_owner(40).unwrap().kind, crate::RetainedReplyKind::Stored);
+    pool.admit(&mut owner, route, &mut lanes, &peers, 1, 2, |_, reply| {
+        Ok::<_, u8>(if reply == 30 {
+            ReplyBindingObservation::Free
+        } else {
+            ReplyBindingObservation::BoundToTarget
+        })
+    }).unwrap();
+    assert!(owner.retained_reply_owner(40).unwrap().admitted);
+
+    let mut checkout = owner.checkout(route).unwrap();
+    let mut attempt = checkout.begin_reply().unwrap();
+    checkout.observe_reply(&mut attempt, IngressReplyObservation::Acknowledged)
+        .unwrap();
+    let (_, mut checkout) = owner.finish_checkout(checkout, &mut peers).err().unwrap();
+    checkout.finish_dispatch(&mut lanes).unwrap();
+    let (ready, _) = owner.finish_checkout(checkout, &mut peers).ok().unwrap();
+    drop(ready); // The canonical lane, now bound to Reply 40, owns this capability.
+    assert!(owner.retained_reply_owner(40).is_none());
+
+    assert_eq!(lanes.phase(route.identity().lane), Ok(LanePhase::Idle));
+    assert_eq!(lanes.binding(route.identity().lane).unwrap().reply_object, 40);
+    call(&mut owner, &lanes);
+    pool.retain(&mut owner, &lanes, &mut peers, route.badge(), free, bound)
+        .unwrap();
+    assert_eq!(pool.len(), 0);
+    assert!(!owner.excludes_reply(40));
+    assert!(!pool.excludes_reply(40));
+    assert!(owner.next_unadmitted(route).is_some());
+    assert!(pool.ready_for_admission(&owner, route, &lanes));
+}
+
+#[test]
 fn idle_lane_with_receiver_owned_reply_is_not_admissible() {
     let mut lanes = Lanes::new(1, 2);
     let lane = lanes.allocate(LaneBinding {

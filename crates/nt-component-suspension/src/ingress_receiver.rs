@@ -329,6 +329,10 @@ impl<M> IngressReceiver<M> {
         self.ingress.reply() == reply || self.store.excludes_reply(reply)
     }
 
+    pub fn retained_reply_owner(&self, reply: u64) -> Option<crate::RetainedReplyOwner> {
+        self.store.reply_owner(reply)
+    }
+
     pub fn phase(&self) -> Option<ReservedReceivePhase> {
         self.receive.as_ref().map(ReservedIngressReceive::phase)
     }

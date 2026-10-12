@@ -10,6 +10,8 @@ use alloc::vec::Vec;
 mod pending_dispatch;
 #[path = "win32k_receive.rs"]
 mod receive;
+#[path = "win32k_lane_diagnostics.rs"]
+mod lane_diagnostics;
 pub(crate) use receive::{prepare_receive_yield, resume_suspended_receive_component,
     receive_continuation_is_current, trace_receive_phase, ReceivePumpCompletion};
 pub(crate) use pending_dispatch::{
@@ -111,6 +113,9 @@ enum Win32kStackAlias {
 static mut WIN32K_PHYSICAL_LANES: Option<Vec<Win32kPhysicalLane>> = None;
 static mut WIN32K_PENDING_PRIMARY: Option<crate::spawn_hosts::SpawnedComponent> = None;
 static WIN32K_LANE_STARTUP_ACTIVE: AtomicU64 = AtomicU64::new(0);
+/// The first failures contain the useful frontier; cap serial output across repeat syscalls.
+static WIN32K_LANE_FAILURE_DUMPS: AtomicU64 = AtomicU64::new(0);
+const WIN32K_LANE_FAILURE_DUMP_LIMIT: u64 = 3;
 
 struct Win32kLaneStartupGuard;
 
@@ -659,21 +664,180 @@ pub(crate) unsafe fn source_terminal_dispatch_ready() -> bool {
 }
 
 unsafe fn acquire_or_provision_win32k_execution_lane(
+    ssn: u64,
 ) -> Option<nt_component_suspension::LaneHandle> {
     if WIN32K_RETIRED.load(Ordering::Acquire) != 0 {
+        dump_win32k_lane_admission_failure(ssn, b"provider-retired");
         return None;
     }
     if let Some(lane) = acquire_idle_win32k_execution_lane() {
         return Some(lane);
     }
     if !crate::service_sec_image::component_execution_lane_can_grow() {
+        dump_win32k_lane_admission_failure(ssn, b"canonical-lane-capacity");
         return None;
     }
     let pml4 = WIN32K_HOST_PML4.load(Ordering::Acquire);
-    if pml4 == 0 || !initialize_win32k_physical_lane(pml4) {
+    if pml4 == 0 {
+        dump_win32k_lane_admission_failure(ssn, b"host-pml4-absent");
         return None;
     }
-    acquire_idle_win32k_execution_lane()
+    if !initialize_win32k_physical_lane(pml4) {
+        let rows = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES)).as_ref();
+        let reason: &[u8] = if WIN32K_RETIRED.load(Ordering::Acquire) != 0 {
+            b"provider-retired"
+        } else if WIN32K_LANE_STARTUP_ACTIVE.load(Ordering::Acquire) != 0 {
+            b"startup-active"
+        } else if rows.is_none_or(Vec::is_empty) {
+            b"primary-lane-absent"
+        } else if rows.is_some_and(|lanes| lanes.iter().filter(|row| row.worker.is_some()).count()
+            >= win32k_subsystem::WIN32K_LANE_CAPACITY) {
+            b"physical-worker-capacity"
+        } else {
+            b"physical-provision-failed"
+        };
+        dump_win32k_lane_admission_failure(ssn, reason);
+        return None;
+    }
+    let acquired = acquire_idle_win32k_execution_lane();
+    if acquired.is_none() {
+        dump_win32k_lane_admission_failure(ssn, b"new-lane-not-admissible");
+    }
+    acquired
+}
+
+/// Read only: the shared owner resolves the exact physical source before reporting route readiness.
+/// Neither this dump nor its failed queries admit, retire, or replay a lane.
+unsafe fn dump_win32k_lane_admission_failure(ssn: u64, reason: &[u8]) {
+    if WIN32K_LANE_FAILURE_DUMPS.fetch_add(1, Ordering::Relaxed)
+        >= WIN32K_LANE_FAILURE_DUMP_LIMIT
+    {
+        return;
+    }
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    let mut counts = lane_diagnostics::LaneCounts::default();
+    let rows = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES)).as_ref();
+    let worker_count = rows.map_or(0, |lanes| lanes.iter().filter(|row| row.worker.is_some()).count());
+    print_str(b"[win32k-lane] admission-failure ssn=");
+    crate::print_hex_u64(ssn);
+    print_str(b" reason=");
+    print_str(reason);
+    print_str(b" workers=");
+    print_u64(worker_count as u64);
+    print_str(b"/");
+    print_u64(win32k_subsystem::WIN32K_LANE_CAPACITY as u64);
+    print_str(b" startup-active=");
+    print_u64(WIN32K_LANE_STARTUP_ACTIVE.load(Ordering::Acquire));
+    print_str(b" canonical-can-grow=");
+    print_u64(crate::service_sec_image::component_execution_lane_can_grow() as u64);
+    print_str(b" host-pml4=");
+    crate::print_hex_u64(WIN32K_HOST_PML4.load(Ordering::Acquire));
+    if let Some(route) = rows.and_then(|rows| rows.iter().find_map(|row| row.route)) {
+        if let Ok(state) = runtime::admission_readiness(route) {
+            print_str(b" receive-busy=");
+            print_u64(state.receive_busy as u64);
+            print_str(b" pool=");
+            print_u64(state.pool_len as u64);
+            print_str(b"/");
+            print_u64(state.pool_capacity as u64);
+        }
+    }
+    print_str(b"\n");
+    if let Some(rows) = rows {
+        // Primary plus the configured worker capacity. A retained over-capacity row is reported
+        // in the aggregate below without allowing unbounded serial output.
+        for (index, row) in rows.iter().enumerate() {
+            let phase = row.handle.and_then(|handle| crate::service_sec_image::component_execution_lane_phase(handle));
+            counts.observe(phase);
+            if index >= win32k_subsystem::WIN32K_LANE_CAPACITY + 1 {
+                continue;
+            }
+            print_str(b"[win32k-lane] row=");
+            print_u64(index as u64);
+            print_str(b" phase=");
+            print_str(lane_diagnostics::phase_name(phase));
+            print_str(b" tcb=");
+            crate::print_hex_u64(row.tcb);
+            if let Some(handle) = row.handle {
+                print_str(b" lane=");
+                print_u64(handle.index as u64);
+                print_str(b" generation=");
+                print_u64(handle.generation);
+                print_str(b" binding=");
+                print_u64(win32k_physical_lane_binding(handle).is_some() as u64);
+                if let Some(binding) = win32k_physical_lane_binding(handle) {
+                    print_str(b" reply=");
+                    crate::print_hex_u64(binding.reply_object);
+                }
+                if let Some(dispatch) = crate::service_sec_image::component_execution_dispatch_identity(handle) {
+                    print_str(b" dispatch-epoch=");
+                    print_u64(dispatch.epoch());
+                } else {
+                    print_str(b" dispatch-epoch=none");
+                }
+            } else {
+                print_str(b" lane=none dispatch-epoch=none");
+            }
+            if let Some(route) = row.route {
+                let owner = route.identity();
+                if let Ok(state) = runtime::admission_readiness(route) {
+                    print_str(b" held-call=");
+                    print_u64(state.held_call as u64);
+                    print_str(b" receiver-reply-alias=");
+                    print_u64(state.receiver_excludes_reply as u64);
+                    print_str(b" current-reply-alias=");
+                    print_u64(state.receiver_current_reply as u64);
+                    print_str(b" held-reply-alias=");
+                    print_u64(state.held_call_reply as u64);
+                    if let Some(held) = state.retained_reply_owner {
+                        print_str(b" retained-reply-kind=");
+                        print_str(match held.kind {
+                            nt_component_suspension::RetainedReplyKind::External => b"external",
+                            nt_component_suspension::RetainedReplyKind::Reserved => b"reserved",
+                            nt_component_suspension::RetainedReplyKind::Stored => b"stored",
+                            nt_component_suspension::RetainedReplyKind::CheckedOut => b"checked-out",
+                        });
+                        print_str(b" retained-reply-admitted=");
+                        print_u64(held.admitted as u64);
+                        if let Some(owner_route) = held.route {
+                            print_str(b" retained-reply-lane=");
+                            print_u64(owner_route.identity().lane.index as u64);
+                        }
+                    }
+                    print_str(b" pool-reply-alias=");
+                    print_u64(state.pool_excludes_reply as u64);
+                }
+                print_str(b" owner-domain=");
+                print_u64(owner.domain);
+                print_str(b" owner-generation=");
+                print_u64(owner.domain_generation);
+                print_str(b" owner-executor=");
+                crate::print_hex_u64(owner.executor);
+                print_str(b" route-ready=");
+                print_str(match runtime::ready_for_admission(route) {
+                    Ok(true) => b"yes",
+                    Ok(false) => b"no",
+                    Err(_) => b"error",
+                });
+            } else {
+                print_str(b" route=none");
+            }
+            print_str(b"\n");
+        }
+    }
+    print_str(b"[win32k-lane] totals idle=");
+    print_u64(counts.idle as u64);
+    print_str(b" running=");
+    print_u64(counts.running as u64);
+    print_str(b" suspended=");
+    print_u64(counts.suspended as u64);
+    print_str(b" terminal=");
+    print_u64(counts.terminal as u64);
+    print_str(b" other=");
+    print_u64(counts.other as u64);
+    print_str(b" rows=");
+    print_u64(rows.map_or(0, Vec::len) as u64);
+    print_str(b"\n");
 }
 
 unsafe fn acquire_idle_win32k_execution_lane() -> Option<nt_component_suspension::LaneHandle> {
@@ -6307,7 +6471,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
     } else if nested_user_callback {
         None
     } else {
-        acquire_or_provision_win32k_execution_lane()
+        acquire_or_provision_win32k_execution_lane(ssn)
     };
     let Some(lane) = lane else {
         if nested_user_callback {

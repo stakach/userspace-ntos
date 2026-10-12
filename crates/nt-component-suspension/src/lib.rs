@@ -51,7 +51,7 @@ pub use startup::StartupError;
 pub use startup::StartupStopError;
 pub use startup::StartupDetachError;
 pub use startup::StartupDeleteError;
-pub use retained_work::{RetainedWork, RetainedWorkCheckout, RetainedWorkError, RetainedWorkFinishError, RetainedWorkReservation};
+pub use retained_work::{RetainedReplyKind, RetainedReplyOwner, RetainedWork, RetainedWorkCheckout, RetainedWorkError, RetainedWorkFinishError, RetainedWorkReservation};
 pub use retained_dispatch::{RetainedDispatch, RetainedDispatchError};
 pub use retained_ingress::{RetainedIngress, RetainedIngressError};
 pub use lane_peer::PeerLaneError;

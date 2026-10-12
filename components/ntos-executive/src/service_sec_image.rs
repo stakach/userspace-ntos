@@ -257,6 +257,13 @@ pub(crate) unsafe fn component_execution_lane_is_idle(
         == Ok(nt_component_suspension::LanePhase::Idle)
 }
 
+/// Read-only canonical phase for physical-lane admission diagnostics.
+pub(crate) unsafe fn component_execution_lane_phase(
+    lane: nt_component_suspension::LaneHandle,
+) -> Option<nt_component_suspension::LanePhase> {
+    (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).phase(lane).ok()
+}
+
 pub(crate) unsafe fn component_execution_lane_is_running(
     lane: nt_component_suspension::LaneHandle,
 ) -> bool {

@@ -140,6 +140,10 @@ impl<M> IngressReplyPool<M> {
         self.entries.len()
     }
 
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

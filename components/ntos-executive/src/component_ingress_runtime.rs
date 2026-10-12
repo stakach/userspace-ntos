@@ -713,6 +713,44 @@ pub(crate) unsafe fn ready_for_admission(route: PeerRoute) -> Result<bool, Error
     Ok(replacements.ready_for_admission(receiver, route, lanes()))
 }
 
+/// Read-only admission state for diagnostics. The route must still resolve through its retained
+/// physical source; no badge or numeric lane handle alone authorizes a snapshot.
+pub(crate) struct AdmissionReadiness {
+    pub receive_busy: bool,
+    pub held_call: bool,
+    pub pool_len: usize,
+    pub pool_capacity: usize,
+    pub receiver_excludes_reply: bool,
+    pub receiver_current_reply: bool,
+    pub held_call_reply: bool,
+    pub retained_reply_owner: Option<nt_component_suspension::RetainedReplyOwner>,
+    pub pool_excludes_reply: bool,
+}
+
+pub(crate) unsafe fn admission_readiness(route: PeerRoute) -> Result<AdmissionReadiness, Error> {
+    if resolve(route, false).is_none() {
+        return Err(Error::PhysicalIdentity);
+    }
+    let ingress = owner();
+    let receiver = ingress.receiver.as_ref().ok_or(Error::Initialization)?;
+    let replacements = ingress.replacements.as_ref().ok_or(Error::Initialization)?;
+    let reply = lanes()
+        .binding(route.identity().lane)
+        .map_err(|_| Error::Admission)?
+        .reply_object;
+    Ok(AdmissionReadiness {
+        receive_busy: receiver.phase().is_some(),
+        held_call: receiver.next_unadmitted(route).is_some(),
+        pool_len: replacements.len(),
+        pool_capacity: replacements.capacity(),
+        receiver_excludes_reply: receiver.excludes_reply(reply),
+        receiver_current_reply: receiver.reply() == reply,
+        held_call_reply: receiver.next_unadmitted(route).is_some_and(|(held, _)| held == reply),
+        retained_reply_owner: receiver.retained_reply_owner(reply),
+        pool_excludes_reply: replacements.excludes_reply(reply),
+    })
+}
+
 /// Resolve a transport snapshot through its retained physical source, not its numeric badge.
 pub(crate) unsafe fn channel_route(
     channel: &crate::spawn_hosts::PumpChannel,

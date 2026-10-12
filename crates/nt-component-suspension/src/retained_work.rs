@@ -30,6 +30,23 @@ pub enum RetainedWorkFinishError {
     Call(RetainedIngressError<Infallible>),
 }
 
+/// Read-only description of a Reply retained in the receiver ledger. A numeric Reply alone is
+/// never authority to finish or recycle the entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetainedReplyKind {
+    External,
+    Reserved,
+    Stored,
+    CheckedOut,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetainedReplyOwner {
+    pub kind: RetainedReplyKind,
+    pub route: Option<PeerRoute>,
+    pub admitted: bool,
+}
+
 /// Dropping a reservation does not release capacity while a native receive may be in flight.
 ///
 /// ```compile_fail
@@ -158,6 +175,26 @@ impl<M> RetainedWork<M> {
             Slot::Reserved { reply: owned, .. } => *owned == reply,
             Slot::External { reply: owned, .. } => *owned == reply,
             _ => false,
+        })
+    }
+
+    /// Inspect exact in-memory ownership without changing a reservation or native Reply binding.
+    pub fn reply_owner(&self, reply: u64) -> Option<RetainedReplyOwner> {
+        self.slots.iter().find_map(|slot| match slot {
+            Slot::External { reply: owned, .. } if *owned == reply => Some(RetainedReplyOwner {
+                kind: RetainedReplyKind::External, route: None, admitted: false,
+            }),
+            Slot::Reserved { reply: owned, .. } if *owned == reply => Some(RetainedReplyOwner {
+                kind: RetainedReplyKind::Reserved, route: None, admitted: false,
+            }),
+            Slot::Stored { call, .. } if call.reply() == reply => Some(RetainedReplyOwner {
+                kind: RetainedReplyKind::Stored, route: Some(call.route()),
+                admitted: call.admitted.is_some(),
+            }),
+            Slot::CheckedOut { reply: owned, route, .. } if *owned == reply => Some(RetainedReplyOwner {
+                kind: RetainedReplyKind::CheckedOut, route: Some(*route), admitted: false,
+            }),
+            _ => None,
         })
     }
 
