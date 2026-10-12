@@ -547,8 +547,11 @@ unsafe fn restore_snapshot_volume(
     dev: &mut snapshot_storage::Lease,
 ) -> Result<Option<(nt_fs::FileSystem, u64, usize)>, u32> {
     let store = dev.store();
-    match nt_fs::FileSystem::restore_volume_snapshot_from_store(&store, dev) {
-        Ok(Some((fs, generation, bytes))) => Ok(Some((fs, generation, bytes))),
+    // A WAL-bearing snapshot cannot be published until its committed suffix has been
+    // authenticated and replayed. The current native writer still uses legacy snapshots;
+    // the pre-replay reader also admits a complete, empty-WAL v2 baseline.
+    match nt_fs::FileSystem::restore_volume_snapshot_before_wal_replay_from_store(&store, dev) {
+        Ok(Some((fs, metadata))) => Ok(Some((fs, metadata.generation, metadata.payload_len))),
         Ok(None) => {
             WRITABLE_FS_SNAPSHOT_EMPTY_MOUNTS.fetch_add(1, Ordering::Relaxed);
             print_str(b"[writable-fs-snapshot] no stored snapshot in reserve sectors=");

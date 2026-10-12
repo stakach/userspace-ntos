@@ -3,6 +3,25 @@
 use std::process::Command;
 
 #[test]
+fn native_registry_mount_requires_wal_replay_admission() {
+    let source = include_str!("../../../components/ntos-executive/src/writable_fs.rs");
+    let start = source.find("unsafe fn restore_snapshot_volume(").unwrap();
+    let end = source[start..]
+        .find("\nunsafe fn restore_snapshot_volume_once(")
+        .unwrap()
+        + start;
+    let restore = &source[start..end];
+    assert!(
+        restore.contains("restore_volume_snapshot_before_wal_replay_from_store"),
+        "native boot must reject an advanced WAL snapshot until replay is owned"
+    );
+    assert!(
+        !restore.contains("restore_volume_snapshot_from_store("),
+        "the format-blind reader could publish a snapshot without its committed WAL suffix"
+    );
+}
+
+#[test]
 fn journal_bearing_cm_mutations_still_require_precommit_storage() {
     let source = include_str!("../../../components/ntos-executive/src/registry_mutation_work.rs");
     let start = source.find("enum SystemMutationStorage {").unwrap();
