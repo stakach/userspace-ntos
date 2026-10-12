@@ -356,10 +356,17 @@ fn capture_projection_registration(
             .hosted_device_address_by_identity(physical.domain, device)
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
     };
-    io_manager_mut()
+    let registration = io_manager_mut()
         .hosted_device_pointer_registration(physical.domain, address)
         .filter(|registration| registration.device_id() == device)
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let inst = instance(physical.instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    if !physical.live()
+        || hosted_device_allocations::registration(inst, address) != Ok(Some(registration))
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    Ok(registration)
 }
 
 fn live_route(id: u64) -> bool {

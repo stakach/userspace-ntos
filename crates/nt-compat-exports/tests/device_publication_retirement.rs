@@ -2,6 +2,7 @@
 use syn::visit::Visit;
 const CONSUMER: &str = include_str!("../../../components/ntos-executive/src/hosted_consumer_device_objects.rs");
 const ROLLBACK: &str = include_str!("../../../components/ntos-executive/src/hosted_add_device_rollback.rs");
+const FILE_OWNERS: &str = include_str!("../../../components/ntos-executive/src/hosted_file_owners.rs");
 const DRIVER: &str = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
 
 fn native_function(start: &str, end: &str) -> syn::ItemFn {
@@ -83,4 +84,20 @@ fn add_device_binding_uses_the_created_registration_without_republishing_it() {
     let owner = calls.0.iter().position(|call| call == "owns_created_registration").unwrap();
     let binding = calls.0.iter().position(|call| call == "register_hosted_device_binding").unwrap();
     assert!(owner < binding, "the AddDevice row must authenticate the FDO before binding publication");
+}
+
+#[test]
+fn file_projection_pin_requires_the_exact_physical_catalog_registration() {
+    let file = syn::parse_file(FILE_OWNERS).unwrap();
+    let mut capture = Calls::default();
+    capture.visit_block(&function(&file, "capture_projection_registration").block);
+    let canonical = capture.0.iter().position(|name| name == "hosted_device_pointer_registration").unwrap();
+    let physical = capture.0.iter().position(|name| name == "registration").unwrap();
+    assert!(canonical < physical, "physical ownership must match the canonical registration");
+
+    let mut route = Calls::default();
+    route.visit_block(&function(&file, "capture_route").block);
+    let resolve = route.0.iter().position(|name| name == "capture_projection_registration").unwrap();
+    let retain = route.0.iter().position(|name| name == "retain_hosted_device_projection_reference").unwrap();
+    assert!(resolve < retain, "physical ownership must be resolved before publishing the File pin");
 }
