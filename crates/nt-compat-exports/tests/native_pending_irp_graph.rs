@@ -186,6 +186,20 @@ fn source_ticket_operations_still_bracket_native_free_order() {
 }
 
 #[test]
+fn bare_dispatch_return_cannot_retire_a_ticket_without_terminal_completion() {
+    let native = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    let consuming = native
+        .split("    if let Some(consuming_state) = consuming_state {")
+        .nth(1)
+        .expect("native post-dispatch consuming branch")
+        .split("        release_pending_irp_graph_component(completed);")
+        .next()
+        .expect("source-graph retirement");
+    assert!(consuming.contains("completed.completion.completed().is_none()"),
+        "root op7 requires a real retained IoCompleteRequest terminal; a bare return must keep its source ticket and graph");
+}
+
+#[test]
 fn terminal_replacement_does_not_reject_npfs_completion_or_enter_initial_graph() {
     let ledger = include_str!("../../../components/ntos-executive/src/hosted_source_irp_ledger.rs");
     assert!(ledger.contains("capture_projected_graph_unlocked(inst, allocation, entry)"),

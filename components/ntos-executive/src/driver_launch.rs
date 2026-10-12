@@ -222,6 +222,8 @@ pub(crate) mod hosted_file_capture;
 pub(crate) use hosted_file_owners::Stats as HostedFileOwnerStats;
 #[path = "hosted_video_port_control.rs"]
 mod hosted_video_port_control;
+#[path = "hosted_video_port_pnp.rs"]
+mod hosted_video_port_pnp;
 #[path = "driver_ps_context.rs"]
 mod driver_ps_context;
 #[path = "driver_thread_projection.rs"]
@@ -992,6 +994,7 @@ pub const FSD_DISPATCH_PROVIDER_CALLBACK: u64 = u64::MAX - 0x77A;
 pub const FSD_DISPATCH_CANCEL_IRP: u64 = u64::MAX - 0x77B;
 pub const FSD_DISPATCH_COPY_COMPLETION: u64 = u64::MAX - 0x77C;
 pub const FSD_DISPATCH_ACK_COMPLETION: u64 = u64::MAX - 0x77D;
+pub const FSD_DISPATCH_VIDEO_RELATION_ACK: u64 = u64::MAX - 0x77E;
 pub const FSD_DISPATCH_CREATE_PDO_PROJECTION: u64 = u64::MAX - 0x77F;
 pub const FSD_DISPATCH_DRAIN_FILE_RETIREMENTS: u64 = u64::MAX - 0x781;
 
@@ -17099,6 +17102,11 @@ extern "win64" fn s_video_port_initialize(
                         hosted_video_port_control::dispatch as *const () as u64,
                     );
                 }
+                write_unaligned(
+                    (context1 + WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET as u64
+                        + major::IRP_MJ_PNP as u64 * 8) as *mut u64,
+                    hosted_video_port_pnp::dispatch as *const () as u64,
+                );
                 STATUS_SUCCESS
             }
             Err(error) => {
@@ -34262,6 +34270,16 @@ unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64
             (0xC000_000Du32 as i32, 0) // STATUS_INVALID_PARAMETER
         };
     }
+    if major == FSD_DISPATCH_VIDEO_RELATION_ACK {
+        let parent = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
+        let allocation = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
+        let generation = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
+        return match hosted_video_port_pnp::acknowledge_relation(parent, allocation, generation) {
+            Some(true) => (STATUS_SUCCESS, 1),
+            None => (STATUS_SUCCESS, 0),
+            Some(false) => (STATUS_INVALID_DEVICE_REQUEST, 0),
+        };
+    }
     if major == FSD_DISPATCH_CREATE_PDO_PROJECTION {
         let projection = match crate::hosted_driver_projection::create_hosted_device_projection(
             0,
@@ -36143,6 +36161,19 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     if let Some(consuming_state) = consuming_state {
         let mut completed =
             read_volatile(pending_irp_entry_address(owner_node) as *const PendingIrp);
+        if completed.source_ticket_id != 0 && completed.completion.completed().is_none() {
+            // A nonpending dispatch return is not IoCompleteRequest. The source ledger owns the
+            // immutable physical graph until a real terminal capture; keep this node and ticket
+            // quarantined instead of asking root op7 to free an uncompleted request.
+            print_str(b"[fsd-irreversible-bare-return] irp/minor/status=");
+            print_u64(irp);
+            print_str(b"/");
+            print_u64(minor);
+            print_str(b"/");
+            print_hex(st as u32);
+            print_str(b"\n");
+            return (STATUS_INVALID_DEVICE_REQUEST, 0);
+        }
         if major == IRP_MJ_PNP && minor == IRP_MN_FILTER_RESOURCE_REQUIREMENTS && info != 0 {
             if component_pool_allocation_capacity(info).is_none() {
                 st = 0xC000_0005u32 as i32; // STATUS_ACCESS_VIOLATION
@@ -41512,6 +41543,65 @@ unsafe fn complete_hosted_relation_probe_without_publication(
     Ok(())
 }
 
+unsafe fn acknowledge_hosted_video_relation(
+    allocation: u64,
+    generation: u64,
+) -> Result<(), HostedRelationPublishError> {
+    let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_ref()
+        .ok_or(HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST))?;
+    let (route_instance, route, parent_object) =
+        hosted_driver_device_route_by_device_id(query.completion_device_id.raw())
+            .ok_or(HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST))?;
+    if route.driver_id != query.completion_driver_id.raw()
+        || hosted_relation_allocation_instance(query.completion_driver_id)
+            != Some(query.allocation_instance)
+        || parent_object == 0
+    {
+        return Err(HostedRelationPublishError::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+    }
+    let result = dispatch_irp_for_instance_exact(
+        route_instance,
+        FSD_DISPATCH_VIDEO_RELATION_ACK,
+        generation,
+        parent_object,
+        query.irp_id.raw(),
+        0,
+        allocation,
+        parent_object,
+        0,
+        None,
+        &[],
+        &mut [],
+        Some(crate::initial_system_driver_caller()),
+    );
+    match result {
+        Some(HostedIrpTransportResult::Returned { status, information: 0 | 1, .. })
+            if status.is_success() => Ok(()),
+        Some(HostedIrpTransportResult::NotDispatched { status })
+            if status == nt_status::NtStatus::INSUFFICIENT_RESOURCES
+                || status == nt_status::NtStatus::DEVICE_BUSY =>
+        {
+            Err(HostedRelationPublishError::Retry)
+        }
+        Some(HostedIrpTransportResult::Returned { status, .. }) if status.is_success() => {
+            Err(HostedRelationPublishError::Barrier(
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            ))
+        }
+        Some(HostedIrpTransportResult::Returned { status, .. })
+        | Some(HostedIrpTransportResult::NotDispatched { status }) => {
+            Err(HostedRelationPublishError::Barrier(status))
+        }
+        Some(HostedIrpTransportResult::Indeterminate { transport_status }) => {
+            Err(HostedRelationPublishError::Barrier(transport_status))
+        }
+        None => Err(HostedRelationPublishError::Retry),
+    }
+}
+
 unsafe fn drain_hosted_device_relation_query() -> usize {
     let mut progress = 0usize;
     loop {
@@ -41606,12 +41696,21 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     .allocation_instance;
                 let disposition =
                     match copy_hosted_device_relations_result(allocation_instance, information) {
-                        Ok(objects) => {
+                        Ok((objects, generation)) => {
                             (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
                                 .as_mut()
                                 .unwrap()
                                 .child_pdo_objects = objects;
-                            HostedDeviceRelationQueryDisposition::Copied
+                            (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                                .as_mut()
+                                .unwrap()
+                                .phase = HostedDeviceRelationQueryPhase::AwaitingProviderRelationAck {
+                                    allocation: information,
+                                    generation,
+                                    pending_completion,
+                                };
+                            progress = progress.saturating_add(1);
+                            continue;
                         }
                         Err(HostedDriverAllocationCopyError::RetryResources) => return progress,
                         Err(HostedDriverAllocationCopyError::InvalidPointer)
@@ -41635,6 +41734,36 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     set_hosted_relation_query_disposition(disposition);
                 }
                 progress = progress.saturating_add(1);
+            }
+            HostedDeviceRelationQueryPhase::AwaitingProviderRelationAck {
+                allocation,
+                generation,
+                pending_completion,
+            } => {
+                match acknowledge_hosted_video_relation(allocation, generation) {
+                    Ok(()) => {
+                        if pending_completion {
+                            (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                                .as_mut()
+                                .unwrap()
+                                .phase = HostedDeviceRelationQueryPhase::AwaitingAck {
+                                    disposition: HostedDeviceRelationQueryDisposition::Copied,
+                                };
+                        } else {
+                            set_hosted_relation_query_disposition(
+                                HostedDeviceRelationQueryDisposition::Copied,
+                            );
+                        }
+                        progress = progress.saturating_add(1);
+                    }
+                    Err(HostedRelationPublishError::Retry) => return progress,
+                    Err(HostedRelationPublishError::Barrier(status)) => {
+                        set_hosted_relation_query_disposition(
+                            HostedDeviceRelationQueryDisposition::Barrier(status),
+                        );
+                        return progress.saturating_add(1);
+                    }
+                }
             }
             HostedDeviceRelationQueryPhase::AwaitingAck { disposition } => {
                 let irp_id = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
@@ -46224,6 +46353,11 @@ enum HostedDeviceRelationQueryPhase {
         information: u64,
         pending_completion: bool,
     },
+    AwaitingProviderRelationAck {
+        allocation: u64,
+        generation: u64,
+        pending_completion: bool,
+    },
     AwaitingAck {
         disposition: HostedDeviceRelationQueryDisposition,
     },
@@ -48059,6 +48193,7 @@ pub(crate) unsafe fn print_hosted_pnp_enumeration_evidence() {
     let (phase, child_index) = match query.phase {
         HostedDeviceRelationQueryPhase::AwaitingCompletion
         | HostedDeviceRelationQueryPhase::AwaitingCopy { .. }
+        | HostedDeviceRelationQueryPhase::AwaitingProviderRelationAck { .. }
         | HostedDeviceRelationQueryPhase::AwaitingAck { .. }
         | HostedDeviceRelationQueryPhase::RelationsCopied => (b"relations".as_slice(), usize::MAX),
         HostedDeviceRelationQueryPhase::NoRelations => {
@@ -48319,7 +48454,7 @@ pub(crate) unsafe fn quarantine_hosted_critical_child_start(
 unsafe fn copy_hosted_device_relations_result(
     instance_index: usize,
     component_pointer: u64,
-) -> Result<Vec<u64>, HostedDriverAllocationCopyError> {
+) -> Result<(Vec<u64>, u64), HostedDriverAllocationCopyError> {
     if component_pointer == 0 {
         return Err(HostedDriverAllocationCopyError::InvalidPointer);
     }
@@ -48341,7 +48476,7 @@ unsafe fn copy_hosted_device_relations_result(
     let result = match nt_pnp_manager::copy_device_relations_x64(allocation) {
         Ok(objects) => {
             if hosted_instance_pool_free_unlocked(inst, component_pointer) {
-                Ok(objects)
+                Ok((objects, generation))
             } else {
                 Err(HostedDriverAllocationCopyError::ReleaseFailed)
             }
