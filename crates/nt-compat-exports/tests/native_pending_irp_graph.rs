@@ -73,7 +73,7 @@ fn pending_irp_inventory_reads_only_the_retained_completed_reclaim() {
         let syn::Item::Impl(implementation) = item else { return None; };
         if !matches!(&*implementation.self_ty, syn::Type::Path(path) if path.path.is_ident("PendingIrp")) { return None; }
         implementation.items.iter().find_map(|item| match item {
-            syn::ImplItem::Fn(function) if function.sig.ident == "allocation_graph" => Some(function),
+            syn::ImplItem::Fn(function) if function.sig.ident == "allocation_pointers" => Some(function),
             _ => None,
         })
     }).expect("native graph snapshot delegated from its actual retained owner");
@@ -132,7 +132,7 @@ fn source_ticket_operations_still_bracket_native_free_order() {
     let pool = effects
         .0
         .iter()
-        .position(|name| name == "pool_free")
+        .position(|name| name == "source-op9")
         .unwrap();
     let after = effects
         .0
@@ -156,4 +156,62 @@ fn source_ticket_operations_still_bracket_native_free_order() {
             .count(),
         1
     );
+    assert_eq!(effects.0.iter().filter(|name| *name == "source-op9").count(), 1);
+}
+
+#[test]
+fn ticketed_terminal_pool_members_are_released_by_the_root_broker() {
+    let source = include_str!("../../../components/ntos-executive/src/hosted_source_irp_ledger.rs");
+    assert!(source.contains("released_members |= bit"),
+        "record terminal ownership before the physical free");
+    assert!(source.contains("exact_pool_identity_unlocked(inst, member_address, 1)"),
+        "verify capacity and generation of the exact captured member");
+    assert!(source.contains("hosted_instance_pool_free_unlocked(inst, member_address)"),
+        "only the root broker may retire the verified member");
+    assert!(source.contains("row.released_members != (1u16 << row.graph.initial_members().len()) - 1"),
+        "op8 must wait for every captured member to settle");
+}
+
+#[test]
+fn projected_irp_registration_captures_every_initial_physical_member() {
+    let source = include_str!(
+        "../../../components/ntos-executive/src/hosted_source_irp_ledger.rs"
+    );
+    let parsed = syn::parse_file(source).unwrap();
+    let capture = parsed.items.iter().find_map(|item| match item {
+        syn::Item::Fn(function) if function.sig.ident == "capture_projected_graph_unlocked" => {
+            Some(function)
+        }
+        _ => None,
+    }).expect("caller projection must capture its graph before provider entry");
+    let mut effects = Effects::default();
+    effects.visit_block(&capture.block);
+    assert!(effects.0.iter().any(|name| name == "allocation_graph"));
+    assert!(effects.0.iter().any(|name| name == "exact_pool_identity_unlocked"));
+    assert!(effects.0.iter().any(|name| name == "prepare"));
+
+    assert!(source.contains("graph: CapturedGraph"),
+        "the issued ticket must retain the non-Copy generation-bearing graph");
+    assert!(source.contains("capture_projected_graph_unlocked(inst, allocation, entry)"),
+        "source registration must capture the graph while its root pool lock is held");
+}
+
+#[test]
+fn generic_pool_free_checks_the_captured_physical_member() {
+    let parsed = syn::parse_file(include_str!(
+        "../../../components/ntos-executive/src/hosted_source_irp_ledger.rs"
+    )).unwrap();
+    let function = |name: &str| parsed.items.iter().find_map(|item| match item {
+        syn::Item::Fn(function) if function.sig.ident == name => Some(function),
+        _ => None,
+    }).unwrap();
+    let mut broker = Effects::default();
+    broker.visit_block(&function("caller_graph_protects_current_member_unlocked").block);
+    assert!(broker.0.iter().any(|name| name == "pool_range_identity_unlocked"));
+    assert!(broker.0.iter().any(|name| name == "protects_current_member"));
+
+    let mut retirement = Effects::default();
+    retirement.visit_block(&function("retire_allocation").block);
+    assert!(retirement.0.iter().any(|name| name == "caller_graph_protects_current_member_unlocked"),
+        "generic pool free must consult captured child generations before freeing");
 }
