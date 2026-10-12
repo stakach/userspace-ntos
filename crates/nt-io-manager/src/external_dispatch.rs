@@ -24,6 +24,8 @@ use crate::{DeviceId, DriverId, FileId, IoManager, IrpId};
 mod detached;
 pub use detached::{ExternalPnpFinishRejection, ExternalPnpFinishResult, ExternalPnpInvocation,
     ExternalPnpReturn, RetainedExternalPnp};
+pub use detached::{ExternalPnpCompletionInvocation, ExternalPnpCompletionReturn,
+    ExternalPnpCompletionRejection};
 
 pub(crate) fn validate_external_parameter_layout(
     major: u8,
@@ -783,7 +785,9 @@ impl<P> IoManager<P> {
             return None;
         }
         let irp = self.irp_mut(irp_id)?;
-        if irp.external_pnp_terminal_receipt_claimed {
+        if irp.external_pnp_terminal_receipt_claimed
+            || irp.completion_ack_reservation.is_some()
+        {
             return None;
         }
         irp.external_pnp_terminal_receipt_claimed = true;

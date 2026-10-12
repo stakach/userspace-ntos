@@ -252,6 +252,14 @@ impl PnpParameters {
         }
     }
 
+    pub(crate) fn has_status_only_result(self) -> bool {
+        match self.kind {
+            PnpParameterKind::Start(_) => self.minor == nt_pnp_abi::IRP_MN_START_DEVICE,
+            PnpParameterKind::Lifecycle => Self::is_lifecycle_minor(self.minor),
+            _ => false,
+        }
+    }
+
     pub const fn relation_type(self) -> Option<u32> {
         match self.kind {
             PnpParameterKind::QueryDeviceRelations { relation_type } => Some(relation_type),
@@ -553,6 +561,7 @@ pub struct IrpRecord {
     pub(crate) external_pnp_terminal_receipt_claimed: bool,
     /// A detached dispatch owns retirement; ordinary free/ACK cannot consume it across IPC.
     pub(crate) detached_file_owner: bool,
+    pub(crate) completion_ack_reservation: Option<crate::completion_ack::CompletionAckReservation>,
     pub(crate) detached_file_intent: crate::detached_file_irp::ExternalFileIrpIntent,
     pub stack: Vec<IoStackLocation>,
     pub current_location: u8,
@@ -592,6 +601,7 @@ impl IrpRecord {
             completion_origin: None,
             external_pnp_terminal_receipt_claimed: false,
             detached_file_owner: false,
+            completion_ack_reservation: None,
             detached_file_intent: crate::detached_file_irp::ExternalFileIrpIntent::default(),
             stack: Vec::new(),
             current_location: 0,
@@ -637,6 +647,10 @@ impl IrpRecord {
         self.stack.get(self.current_location as usize)
     }
 
+    pub(crate) fn has_external_retirement_owner(&self) -> bool {
+        self.detached_file_owner || self.completion_ack_reservation.is_some()
+    }
+
     /// Publish the next lower stack location and advance ownership. The caller must own the current
     /// frame, while the supplied frame must preserve the precomputed lower driver/device/File
     /// identity. Stale, skipped, or cross-stack forwarding is rejected without changing the cursor.
@@ -645,7 +659,7 @@ impl IrpRecord {
         caller: DriverId,
         next_stack: IoStackLocation,
     ) -> Result<&IoStackLocation, NtStatus> {
-        if self.detached_file_owner { return Err(NtStatus::INVALID_DEVICE_REQUEST); }
+        if self.has_external_retirement_owner() { return Err(NtStatus::INVALID_DEVICE_REQUEST); }
         let current = self.current_stack().ok_or(NtStatus::INVALID_PARAMETER)?;
         if current.driver_id != caller {
             return Err(NtStatus::INVALID_PARAMETER);

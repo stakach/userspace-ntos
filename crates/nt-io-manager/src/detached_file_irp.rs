@@ -146,13 +146,7 @@ pub struct ExternalFileIrpCompletionReturn {
     acknowledgement: ExternalFileIrpAcknowledgement,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ExternalFileIrpAcknowledgement {
-    Acknowledged,
-    NotEntered { status: NtStatus },
-    Rejected { status: NtStatus },
-    Indeterminate { transport_status: NtStatus },
-}
+pub use crate::completion_ack::CompletionAcknowledgement as ExternalFileIrpAcknowledgement;
 
 #[derive(Debug)]
 #[must_use = "recover the unchanged owner"]
@@ -293,11 +287,7 @@ impl ExternalFileIrpCompletionInvocation {
 impl ExternalFileIrpCompletionReturn {
     /// Only a failed ACK can be executed again. An accepted ACK remains durable for local retry.
     pub fn retry(self) -> Result<ExternalFileIrpAckInvocation, Self> {
-        if matches!(
-            self.acknowledgement,
-            ExternalFileIrpAcknowledgement::NotEntered { .. }
-                | ExternalFileIrpAcknowledgement::Rejected { .. }
-        ) {
+        if self.acknowledgement.permits_retry() {
             Ok(self.invocation)
         } else {
             Err(self)
@@ -959,14 +949,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 {
                     return Err(NtStatus::INVALID_PARAMETER);
                 }
-                match returned.acknowledgement {
-                    ExternalFileIrpAcknowledgement::Acknowledged => Ok(()),
-                    ExternalFileIrpAcknowledgement::NotEntered { status }
-                    | ExternalFileIrpAcknowledgement::Rejected { status } => Err(status),
-                    ExternalFileIrpAcknowledgement::Indeterminate { transport_status } => {
-                        Err(transport_status)
-                    }
-                }
+                returned.acknowledgement.checked_status()
             });
         if let Err(status) = valid {
             return Err(ExternalFileIrpRejection {

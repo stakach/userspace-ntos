@@ -99,7 +99,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 if self.publish_backend_completion(idx, completion) {
                     progress += 1;
                 } else {
-                    if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
+                    if self.irp(irp_id).is_some_and(|irp| irp.has_external_retirement_owner()) {
                         continue;
                     }
                     // Poll transfers one retained backend completion to the manager. If its
@@ -142,7 +142,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         let mut index = 0;
         while index < self.cancel_dispatch_retries.len() {
             let irp_id = self.cancel_dispatch_retries[index];
-            if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
+            if self.irp(irp_id).is_some_and(|irp| irp.has_external_retirement_owner()) {
                 self.cancel_dispatch_retries.swap_remove(index);
                 continue;
             }
@@ -184,7 +184,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         let mut index = 0;
         while index < self.rejected_completion_acks.len() {
             let (backend_index, irp_id) = self.rejected_completion_acks[index];
-            if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
+            if self.irp(irp_id).is_some_and(|irp| irp.has_external_retirement_owner()) {
                 index += 1;
                 continue;
             }
@@ -397,7 +397,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         offset: u64,
         output: &mut [u8],
     ) -> Result<usize, NtStatus> {
-        if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
+        if self.irp(irp_id).is_some_and(|irp| irp.has_external_retirement_owner()) {
             return Err(NtStatus::DELETE_PENDING);
         }
         let (driver_id, information, output_capacity) = {
@@ -434,7 +434,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         output: &mut [u8],
     ) -> Result<usize, NtStatus> {
         let irp = self.irp(irp_id).ok_or(NtStatus::INVALID_PARAMETER)?;
-        if irp.detached_file_owner {
+        if irp.has_external_retirement_owner() {
             return Err(NtStatus::DELETE_PENDING);
         }
         if irp.state != IrpState::Completed
@@ -502,7 +502,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         offset: u64,
         output: &mut [u8],
     ) -> Result<usize, NtStatus> {
-        if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
+        if self.irp(irp_id).is_some_and(|irp| irp.has_external_retirement_owner()) {
             return Err(NtStatus::DELETE_PENDING);
         }
         let (driver_id, output_capacity) = {
@@ -538,7 +538,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         offset: u64,
         output: &mut [u8],
     ) -> Result<usize, NtStatus> {
-        if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
+        if self.irp(irp_id).is_some_and(|irp| irp.has_external_retirement_owner()) {
             return Err(NtStatus::DELETE_PENDING);
         }
         let (driver_id, payload_len) = {
@@ -610,14 +610,12 @@ impl<P: ObjectManagerPort> IoManager<P> {
         irp_id: IrpId,
         reclaim_faulted_backend: bool,
     ) -> Result<CompletedIrp, NtStatus> {
-        if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
+        if self.irp(irp_id).is_some_and(|irp| irp.has_external_retirement_owner()) {
             return Err(NtStatus::DELETE_PENDING);
         }
-        let queue_index = self
-            .completed_irps
-            .iter()
-            .position(|queued| *queued == irp_id)
-            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if !self.completed_irps.contains(&irp_id) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         let completed = self
             .completed_irp_snapshot(irp_id)
             .ok_or(NtStatus::INVALID_PARAMETER)?;
@@ -633,10 +631,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         } else {
             self.backends[backend_index].acknowledge_completion(irp_id)?;
         }
-        self.completed_irps.remove(queue_index);
-        self.free_irp(irp_id)
-            .expect("validated completed IRP disappeared after backend acknowledgement");
-
+        self.retire_acknowledged_completion(&completed, None)?;
         if let Some(file_id) = completed.file_id {
             if completed.major == major::IRP_MJ_CLEANUP {
                 if let Some(file) = self.file_mut(file_id) {

@@ -2,6 +2,12 @@
 
 use super::*;
 
+#[path = "detached_external_pnp_completion.rs"]
+mod completion;
+pub use completion::{
+    ExternalPnpCompletionInvocation, ExternalPnpCompletionRejection, ExternalPnpCompletionReturn,
+};
+
 #[derive(Debug)]
 struct Snapshot {
     projection: IrpProjection,
@@ -185,44 +191,7 @@ impl<P> IoManager<P> {
         &mut self,
         returned: ExternalPnpReturn,
     ) -> Result<ExternalPnpFinishResult, ExternalPnpFinishRejection> {
-        let valid = (|| {
-            let invocation = &returned.invocation;
-            let prepared = &invocation.prepared;
-            let snapshot = &invocation.snapshot;
-            if prepared.manager_identity == 0
-                || prepared.manager_identity != self.ownership_identity()
-            {
-                return Err(NtStatus::INVALID_PARAMETER);
-            }
-            let irp = self
-                .irp(prepared.irp_id)
-                .ok_or(NtStatus::INVALID_PARAMETER)?;
-            if irp.id != snapshot.projection.irp_id
-                || irp.client_id != snapshot.client
-                || matches!(irp.state, IrpState::Allocated | IrpState::Initialized)
-                || irp.origin_driver_id != snapshot.origin_driver
-                || irp.origin_device_id != snapshot.origin_device
-                || irp.origin_major != nt_io_abi::major::IRP_MJ_PNP
-                || irp.origin_minor != snapshot.minor
-                || irp.origin_pnp_relation_type != snapshot.relation_type
-                || irp.file_id.is_some()
-                || irp.requestor_tid != snapshot.projection.requestor_tid
-                || irp.user_data != snapshot.projection.user_data
-                || irp.buffer != snapshot.projection.buffer
-                || irp.stack.len() != snapshot.stack.len()
-                || !irp
-                    .stack
-                    .iter()
-                    .zip(&snapshot.stack)
-                    .all(|(entry, pair)| (entry.driver_id, entry.device_id) == *pair)
-                || !irp
-                    .current_stack()
-                    .is_some_and(|stack| stack.major == nt_io_abi::major::IRP_MJ_PNP)
-            {
-                return Err(NtStatus::INVALID_PARAMETER);
-            }
-            Ok(())
-        })();
+        let valid = self.validate_external_pnp_invocation(&returned.invocation);
         if let Err(status) = valid {
             return Err(ExternalPnpFinishRejection {
                 status,
@@ -246,5 +215,45 @@ impl<P> IoManager<P> {
                 outcome: result,
             }),
         })
+    }
+
+    fn validate_external_pnp_invocation(
+        &self,
+        invocation: &ExternalPnpInvocation,
+    ) -> Result<(), NtStatus> {
+        let prepared = &invocation.prepared;
+        let snapshot = &invocation.snapshot;
+        if prepared.manager_identity == 0 || prepared.manager_identity != self.ownership_identity()
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let irp = self
+            .irp(prepared.irp_id)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if irp.id != snapshot.projection.irp_id
+            || irp.client_id != snapshot.client
+            || matches!(irp.state, IrpState::Allocated | IrpState::Initialized)
+            || irp.origin_driver_id != snapshot.origin_driver
+            || irp.origin_device_id != snapshot.origin_device
+            || irp.origin_major != nt_io_abi::major::IRP_MJ_PNP
+            || irp.origin_minor != snapshot.minor
+            || irp.origin_pnp_relation_type != snapshot.relation_type
+            || irp.file_id.is_some()
+            || irp.requestor_tid != snapshot.projection.requestor_tid
+            || irp.user_data != snapshot.projection.user_data
+            || irp.buffer != snapshot.projection.buffer
+            || irp.stack.len() != snapshot.stack.len()
+            || !irp
+                .stack
+                .iter()
+                .zip(&snapshot.stack)
+                .all(|(entry, pair)| (entry.driver_id, entry.device_id) == *pair)
+            || !irp
+                .current_stack()
+                .is_some_and(|stack| stack.major == nt_io_abi::major::IRP_MJ_PNP)
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(())
     }
 }

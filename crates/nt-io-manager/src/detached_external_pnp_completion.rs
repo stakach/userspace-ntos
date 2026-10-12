@@ -1,0 +1,209 @@
+//! Status-only StartDevice/lifecycle PnP completion ACK across foreign execution.
+//! Retained bytes are the original owned input, not a captured provider output. Queries returning
+//! output or pointers require a separate checked output/adoption contract before ACK can free them.
+use super::*;
+use crate::completion_ack::{CompletionAckReservation, CompletionAcknowledgement};
+use crate::CompletedIrp;
+
+#[derive(Debug)]
+#[must_use = "retain the rejected completion owner"]
+pub struct ExternalPnpCompletionRejection<T> {
+    status: NtStatus,
+    owner: T,
+}
+
+impl<T> ExternalPnpCompletionRejection<T> {
+    pub fn status(&self) -> NtStatus {
+        self.status
+    }
+    pub fn owner(&self) -> &T {
+        &self.owner
+    }
+    pub fn into_owner(self) -> T {
+        self.owner
+    }
+}
+
+#[derive(Debug)]
+#[must_use = "invoke ACK once, or retain the reserved completion"]
+pub struct ExternalPnpCompletionInvocation {
+    owner: RetainedExternalPnp,
+    completion: CompletedIrp,
+    reservation: CompletionAckReservation,
+    backend_index: usize,
+}
+
+impl ExternalPnpCompletionInvocation {
+    pub fn completion(&self) -> &CompletedIrp {
+        &self.completion
+    }
+    pub fn payload(&self) -> &[u8] {
+        self.owner.payload()
+    }
+    /// Route observation only. Native adapters must authenticate the actual provider instance.
+    pub fn backend_index(&self) -> usize {
+        self.backend_index
+    }
+    pub fn invoke<F>(self, invoke: F) -> ExternalPnpCompletionReturn
+    where
+        F: FnOnce(&CompletedIrp) -> CompletionAcknowledgement,
+    {
+        let acknowledgement = invoke(&self.completion);
+        ExternalPnpCompletionReturn {
+            invocation: self,
+            acknowledgement,
+        }
+    }
+}
+
+#[derive(Debug)]
+#[must_use = "retain the ACK result until exact local retirement succeeds"]
+pub struct ExternalPnpCompletionReturn {
+    invocation: ExternalPnpCompletionInvocation,
+    acknowledgement: CompletionAcknowledgement,
+}
+
+impl ExternalPnpCompletionReturn {
+    pub fn payload(&self) -> &[u8] {
+        self.invocation.payload()
+    }
+    pub fn acknowledgement(&self) -> CompletionAcknowledgement {
+        self.acknowledgement
+    }
+    /// Only checked no-effect refusal permits another foreign ACK. Accepted and uncertain
+    /// operations retain the exact response for local settlement, never another invocation.
+    pub fn retry(self) -> Result<ExternalPnpCompletionInvocation, Self> {
+        if self.acknowledgement.permits_retry() {
+            Ok(self.invocation)
+        } else {
+            Err(self)
+        }
+    }
+}
+
+impl<P: ObjectManagerPort> IoManager<P> {
+    pub fn prepare_external_pnp_completion(
+        &mut self,
+        retained: RetainedExternalPnp,
+    ) -> Result<ExternalPnpCompletionInvocation, ExternalPnpCompletionRejection<RetainedExternalPnp>>
+    {
+        let valid = (|| {
+            self.validate_external_pnp_invocation(&retained.owner.invocation)?;
+            if !matches!(&retained.owner.invocation.snapshot.projection.parameters,
+                IoParameters::Pnp(parameters) if parameters.has_status_only_result())
+            {
+                return Err(NtStatus::NOT_SUPPORTED);
+            }
+            let id = retained.irp_id();
+            let completion = self.completed_irp_snapshot(id).ok_or(NtStatus::PENDING)?;
+            let irp = self.irp(id).ok_or(NtStatus::INVALID_PARAMETER)?;
+            if !irp.current_stack().is_some_and(|stack| {
+                matches!(&stack.parameters, IoParameters::Pnp(parameters)
+                    if stack.minor == parameters.minor && parameters.has_status_only_result())
+            }) {
+                return Err(NtStatus::NOT_SUPPORTED);
+            }
+            if !self.completed_irps.contains(&id)
+                || irp.completion_ack_reservation.is_some()
+                || irp.detached_file_owner
+                || irp.external_pnp_terminal_receipt_claimed
+                || completion.completion_origin != IrpCompletionOrigin::Driver
+                || completion.major != nt_io_abi::major::IRP_MJ_PNP
+                || completion.status == NtStatus::PENDING
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            let backend_index = self
+                .driver(completion.completion_driver_id)
+                .map(|driver| driver.backend.0 as usize)
+                .filter(|index| *index < self.backends.len())
+                .ok_or(NtStatus::INVALID_PARAMETER)?;
+            if self.backends[backend_index].is_faulted() {
+                return Err(NtStatus::DEVICE_NOT_CONNECTED);
+            }
+            let reservation = CompletionAckReservation::new(self.ownership_identity(), id)?;
+            Ok((completion, reservation, backend_index))
+        })();
+        match valid {
+            Err(status) => Err(ExternalPnpCompletionRejection {
+                status,
+                owner: retained,
+            }),
+            Ok((completion, reservation, backend_index)) => {
+                self.irps
+                    .get_mut(completion.id)
+                    .unwrap()
+                    .completion_ack_reservation = Some(reservation);
+                Ok(ExternalPnpCompletionInvocation {
+                    owner: retained,
+                    completion,
+                    reservation,
+                    backend_index,
+                })
+            }
+        }
+    }
+
+    pub fn finish_external_pnp_completion(
+        &mut self,
+        returned: ExternalPnpCompletionReturn,
+    ) -> Result<
+        (ExternalPnpTerminalReceipt, Vec<u8>),
+        ExternalPnpCompletionRejection<ExternalPnpCompletionReturn>,
+    > {
+        let valid = (|| {
+            let invocation = &returned.invocation;
+            self.validate_external_pnp_invocation(&invocation.owner.owner.invocation)?;
+            let completion = &invocation.completion;
+            let irp = self.irp(completion.id).ok_or(NtStatus::INVALID_PARAMETER)?;
+            if irp.completion_ack_reservation != Some(invocation.reservation)
+                || !invocation
+                    .reservation
+                    .matches(self.ownership_identity(), completion.id)
+                || self.completed_irp_snapshot(completion.id).as_ref() != Some(completion)
+                || !self.completed_irps.contains(&completion.id)
+                || self
+                    .driver(completion.completion_driver_id)
+                    .map(|driver| driver.backend.0 as usize)
+                    != Some(invocation.backend_index)
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            returned.acknowledgement.checked_status()
+        })();
+        if let Err(status) = valid {
+            return Err(ExternalPnpCompletionRejection {
+                status,
+                owner: returned,
+            });
+        }
+        let invocation = &returned.invocation;
+        if let Err(status) = self
+            .retire_acknowledged_completion(&invocation.completion, Some(invocation.reservation))
+        {
+            return Err(ExternalPnpCompletionRejection {
+                status,
+                owner: returned,
+            });
+        }
+        let completion = returned.invocation.completion;
+        let retained = returned.invocation.owner;
+        let relation_type = retained.owner.invocation.snapshot.relation_type;
+        let payload = retained.owner.invocation.prepared.payload;
+        Ok((
+            ExternalPnpTerminalReceipt {
+                irp_id: completion.id,
+                origin_driver_id: completion.driver_id,
+                origin_device_id: completion.device_id,
+                completion_driver_id: completion.completion_driver_id,
+                completion_device_id: completion.completion_device_id,
+                minor: completion.minor,
+                relation_type,
+                status: completion.status,
+                information: completion.information,
+                driver_pending: true,
+            },
+            payload,
+        ))
+    }
+}

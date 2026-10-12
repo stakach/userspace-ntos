@@ -60,6 +60,8 @@ mod hosted_file;
 #[cfg(test)]
 mod hosted_file_lifetime_tests;
 mod hosted_device_pointer;
+mod completion_ack;
+mod completion_retirement;
 mod projection_allocation;
 mod hosted_attached_device_reference;
 mod hosted_safe_attach;
@@ -184,8 +186,10 @@ pub use external_dispatch::{
     ExternalDispatchResult, ExternalPnpDispatchResult, ExternalPnpTerminalReceipt,
     ExternalPnpFinishRejection, ExternalPnpFinishResult, ExternalPnpInvocation, ExternalPnpReturn,
     RetainedExternalPnp,
+    ExternalPnpCompletionInvocation, ExternalPnpCompletionReturn, ExternalPnpCompletionRejection,
     PreparedExternalPnpIrp, PreparedExternalPnpRejection,
 };
+pub use completion_ack::CompletionAcknowledgement;
 pub use file::{CreateOptions, FileRecord, FileState, ShareAccess};
 pub use file_mode::FileModeState;
 pub use file_information::{
@@ -1130,6 +1134,9 @@ impl<P> IoManager<P> {
 
     /// Allocate an IRP record, assigning + returning its id.
     pub fn allocate_irp(&mut self, mut record: IrpRecord) -> Result<IrpId, NtStatus> {
+        if record.completion_ack_reservation.is_some() {
+            return Err(NtStatus::DELETE_PENDING);
+        }
         if is_create_major(record.origin_major) && record.file_id.is_some()
             && self.irps.iter().any(|(_, existing)| existing.file_id == record.file_id
                 && is_create_major(existing.origin_major)) {
@@ -1387,10 +1394,13 @@ impl<P> IoManager<P> {
         self.irps.get(id)
     }
     pub fn irp_mut(&mut self, id: IrpId) -> Option<&mut IrpRecord> {
+        if self.irp(id).is_some_and(|irp| irp.completion_ack_reservation.is_some()) {
+            return None;
+        }
         self.irps.get_mut(id)
     }
     pub fn free_irp(&mut self, id: IrpId) -> Option<IrpRecord> {
-        if self.irp(id).is_some_and(|irp| irp.detached_file_owner) {
+        if self.irp(id).is_some_and(|irp| irp.detached_file_owner || irp.completion_ack_reservation.is_some()) {
             return None;
         }
         let record = self.irps.remove(id)?;
@@ -1482,6 +1492,7 @@ mod tests {
 
     mod exact_external_pnp;
     mod detached_external_pnp;
+    mod detached_external_pnp_completion;
 
     use super::*;
     use nt_io_abi::{ioctl, major};
