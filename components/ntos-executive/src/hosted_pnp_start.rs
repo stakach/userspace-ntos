@@ -152,6 +152,7 @@ pub(crate) struct OwnedHostedPnpStartBatch {
     pending_device_id: u64,
     pending_filter: Option<PendingHostedPnpFilter>,
     pending_relations: Option<driver_launch::HostedPnpRelationRefresh>,
+    pending_bus_relation_devnode: Option<usize>,
     single_start_evidence: SingleStartEvidence,
 }
 
@@ -213,6 +214,7 @@ impl OwnedHostedPnpStartBatch {
             pending_device_id: 0,
             pending_filter: None,
             pending_relations: None,
+            pending_bus_relation_devnode: None,
             single_start_evidence: SingleStartEvidence::NotDispatched,
         }
     }
@@ -341,6 +343,10 @@ impl OwnedHostedPnpStartBatch {
         progress: HostedPnpDevnodeProgress,
     ) -> Option<OwnedHostedPnpStartProgress> {
         match progress {
+            HostedPnpDevnodeProgress::BusRelationPending => {
+                self.pending_bus_relation_devnode = Some(devnode_index);
+                return Some(OwnedHostedPnpStartProgress::AwaitingCompletion);
+            }
             HostedPnpDevnodeProgress::ResourceAdmissionPending => {
                 return Some(OwnedHostedPnpStartProgress::AwaitingCompletion);
             }
@@ -381,6 +387,10 @@ impl OwnedHostedPnpStartBatch {
                 ));
             }
             _ => {}
+        }
+
+        if self.pending_bus_relation_devnode == Some(devnode_index) {
+            self.pending_bus_relation_devnode = None;
         }
 
         let token = self
@@ -438,7 +448,8 @@ impl OwnedHostedPnpStartBatch {
                     },
                 ))
             }
-            HostedPnpDevnodeProgress::FilterPending { .. }
+            HostedPnpDevnodeProgress::BusRelationPending
+            | HostedPnpDevnodeProgress::FilterPending { .. }
             | HostedPnpDevnodeProgress::FilterOwnershipLost { .. }
             | HostedPnpDevnodeProgress::ResourceAdmissionPending => unreachable!(),
         }
@@ -642,6 +653,7 @@ impl OwnedHostedPnpStartBatch {
                             hardware_ids: &devnode.hardware_ids,
                             compatible_ids: &devnode.compatible_ids,
                         },
+                        self.pending_bus_relation_devnode == Some(devnode_index),
                         self.options,
                         &mut self.report,
                     );
@@ -1257,6 +1269,7 @@ struct PreparedHostedDevnode {
 
 unsafe fn prepare_current_hosted_devnode<H, C>(
     bus_pdo: Option<u64>,
+    require_accepted_bus_pdo: bool,
     instance_id: &str,
     hardware_ids: &[H],
     compatible_ids: &[C],
@@ -1265,6 +1278,9 @@ where
     H: AsRef<str>,
     C: AsRef<str>,
 {
+    if require_accepted_bus_pdo && bus_pdo.is_none() {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
     if let Some(pdo_device_id) = bus_pdo {
         if let Some(resources) =
             driver_launch::prepare_hosted_bus_pdo_bus_number_start(instance_id, pdo_device_id)?
@@ -1438,6 +1454,7 @@ where
 }
 
 enum HostedPnpDevnodeProgress {
+    BusRelationPending,
     ResourceAdmissionPending,
     Terminal {
         device_id: u64,
@@ -1471,6 +1488,7 @@ unsafe fn start_one_devnode<H, C>(
     service_name: &str,
     class_guid: Option<&str>,
     devnode: HostedPnpDevnodeStart<'_, H, C>,
+    require_accepted_bus_pdo: bool,
     options: HostedPnpStartOptions,
     report: &mut HostedPnpStartReport,
 ) -> HostedPnpDevnodeProgress
@@ -1479,8 +1497,12 @@ where
     C: AsRef<str>,
 {
     let bus_pdo = driver_launch::hosted_bus_reported_device_id(devnode.instance_id);
+    if bus_pdo.is_none() && driver_launch::hosted_bus_relation_pending() {
+        return HostedPnpDevnodeProgress::BusRelationPending;
+    }
     let prepared = match prepare_current_hosted_devnode(
         bus_pdo,
+        require_accepted_bus_pdo,
         devnode.instance_id,
         devnode.hardware_ids,
         devnode.compatible_ids,

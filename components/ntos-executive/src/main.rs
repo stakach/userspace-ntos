@@ -19498,6 +19498,8 @@ fn print_live_device_action_report(handler: &ExecNtHandler) -> LiveDeviceActionR
             nt_config_client::DeviceActionKind::Arrival => b"arrival",
             nt_config_client::DeviceActionKind::Change => b"change",
             nt_config_client::DeviceActionKind::Removal => b"removal",
+            nt_config_client::DeviceActionKind::EnsurePresent =>
+                unreachable!("input-only CM intent cannot be a device action event"),
         });
         print_str(b" response/reply=");
         print_hex(row.response_status);

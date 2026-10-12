@@ -21,3 +21,23 @@ fn relation_publication_captures_provider_text_before_device_action() {
     assert!(description < action, "description must be committed before notification");
     assert!(mutations.contains("child_properties"), "text must come from child query state");
 }
+
+#[test]
+fn root_pdo_backend_preserves_unhandled_device_text_result() {
+    let backend = body(
+        "impl DriverDispatchBackend for HostedRootBusBackend {",
+        "const HOSTED_ROOT_BUS_DRIVER_PATH:",
+    );
+    assert!(
+        backend.contains("dispatch_pnp_outcome(irp.device_id, irp.minor)"),
+        "dispatch to the exact root PDO and PnP minor"
+    );
+    assert!(
+        backend.contains("completion_or(irp.status.raw(), irp.information)"),
+        "an unhandled QueryDeviceText must preserve STATUS_NOT_SUPPORTED and Information=0"
+    );
+    assert!(
+        !backend.contains("status: nt_status::NtStatus::SUCCESS"),
+        "the root backend cannot report synthetic success for every PnP minor"
+    );
+}

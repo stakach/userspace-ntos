@@ -18277,6 +18277,8 @@ impl ExecNtHandler {
                 PNP_EVENT_CATEGORY_TARGET_DEVICE_CHANGE,
                 &event.publication.instance_id,
             ),
+            nt_config_client::DeviceActionKind::EnsurePresent =>
+                unreachable!("input-only CM intent cannot be a device action event"),
         }
     }
 

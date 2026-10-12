@@ -199,6 +199,8 @@ pub enum DeviceActionKind {
     Arrival,
     Change,
     Removal,
+    /// Input-only bus presence intent. The journal emits Arrival, Change, or no event.
+    EnsurePresent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -327,12 +329,12 @@ impl DeviceActionJournal {
             }
         }
 
-        let event_count = actions.len();
-        let event_count_u64 = u64::try_from(event_count)
+        let maximum_event_count = actions.len();
+        let maximum_event_count_u64 = u64::try_from(maximum_event_count)
             .map_err(|_| DeviceActionJournalError::InsufficientResources)?;
-        let next_sequence = self
+        self
             .next_sequence
-            .checked_add(event_count_u64)
+            .checked_add(maximum_event_count_u64)
             .ok_or(DeviceActionJournalError::InsufficientResources)?;
 
         let mut next_known = Vec::new();
@@ -343,11 +345,10 @@ impl DeviceActionJournal {
 
         let mut events = Vec::new();
         events
-            .try_reserve_exact(event_count)
+            .try_reserve_exact(maximum_event_count)
             .map_err(|_| DeviceActionJournalError::InsufficientResources)?;
         let mut sequence = self.next_sequence;
         for action in actions {
-            let kind = action.kind;
             let instance = action.instance_id.as_str();
             let previous_index = next_known
                 .iter()
@@ -355,19 +356,35 @@ impl DeviceActionJournal {
             let current_publication = current
                 .iter()
                 .find(|publication| publication.instance_id.eq_ignore_ascii_case(instance));
-            let publication = match (kind, previous_index, current_publication) {
+            let resolved = match (action.kind, previous_index, current_publication) {
                 (DeviceActionKind::Arrival, None, Some(publication)) => {
                     next_known.push(publication.clone());
-                    publication.clone()
+                    Some((DeviceActionKind::Arrival, publication.clone()))
                 }
                 (DeviceActionKind::Change, Some(index), Some(publication))
                     if next_known[index] != *publication =>
                 {
                     next_known[index] = publication.clone();
-                    publication.clone()
+                    Some((DeviceActionKind::Change, publication.clone()))
                 }
-                (DeviceActionKind::Removal, Some(index), None) => next_known.remove(index),
+                (DeviceActionKind::Removal, Some(index), None) => {
+                    Some((DeviceActionKind::Removal, next_known.remove(index)))
+                }
+                (DeviceActionKind::EnsurePresent, None, Some(publication)) => {
+                    next_known.push(publication.clone());
+                    Some((DeviceActionKind::Arrival, publication.clone()))
+                }
+                (DeviceActionKind::EnsurePresent, Some(index), Some(publication))
+                    if next_known[index] != *publication =>
+                {
+                    next_known[index] = publication.clone();
+                    Some((DeviceActionKind::Change, publication.clone()))
+                }
+                (DeviceActionKind::EnsurePresent, Some(_), Some(_)) => None,
                 _ => return Err(DeviceActionJournalError::InvalidTransition),
+            };
+            let Some((kind, publication)) = resolved else {
+                continue;
             };
             events.push(DeviceActionEvent {
                 sequence,
@@ -377,8 +394,7 @@ impl DeviceActionJournal {
             });
             sequence += 1;
         }
-        debug_assert_eq!(events.len(), event_count);
-        debug_assert_eq!(sequence, next_sequence);
+        let event_count = events.len();
 
         self.pending
             .try_reserve_exact(events.len())
@@ -386,7 +402,7 @@ impl DeviceActionJournal {
         self.pending.extend(events);
         self.known = next_known;
         self.last_mount_generation = mount_generation;
-        self.next_sequence = next_sequence;
+        self.next_sequence = sequence;
         Ok(event_count)
     }
 
@@ -4457,6 +4473,54 @@ mod tests {
         assert_eq!(journal.last_mount_generation(), 11);
         assert_eq!(journal.pending_len(), 1);
         assert_eq!(journal.peek().unwrap().sequence, 1);
+    }
+
+    #[test]
+    fn device_action_journal_reconciles_bus_presence_against_seeded_enum() {
+        let mut cm = ConfigManager::new();
+        cm.register_devnode(r"ROOT\EXISTING\0000", None, Some(r"\Device\Existing"), &[], &[]);
+        let mut journal = DeviceActionJournal::new();
+        journal.seed(1, &cm.devnode_publications()).unwrap();
+
+        cm.register_devnode(r"ROOT\NEW\0000", None, Some(r"\Device\New"), &[], &[]);
+        let intents = [
+            DeviceActionIntent {
+                kind: DeviceActionKind::EnsurePresent,
+                instance_id: String::from(r"ROOT\EXISTING\0000"),
+            },
+            DeviceActionIntent {
+                kind: DeviceActionKind::EnsurePresent,
+                instance_id: String::from(r"ROOT\NEW\0000"),
+            },
+        ];
+        assert_eq!(journal.publish_actions(2, &cm.devnode_publications(), &intents), Ok(1));
+        let arrival = journal.peek().unwrap();
+        assert_eq!(arrival.kind, DeviceActionKind::Arrival);
+        assert_eq!(arrival.sequence, 1);
+        assert_eq!(arrival.publication.instance_id, r"ROOT\NEW\0000");
+        journal.acknowledge(1).unwrap();
+
+        let existing = cm.registry().open_key(&devnode_path(r"ROOT\EXISTING\0000")).unwrap();
+        cm.registry_mut().set_string(existing, "PdoName", r"\Device\Updated");
+        assert_eq!(journal.publish_actions(3, &cm.devnode_publications(), &intents[..1]), Ok(1));
+        let change = journal.peek().unwrap();
+        assert_eq!(change.kind, DeviceActionKind::Change);
+        assert_eq!(change.sequence, 2);
+        assert_eq!(change.publication.pdo_name.as_deref(), Some(r"\Device\Updated"));
+        assert_eq!(
+            journal.publish_actions(4, &cm.devnode_publications(), &intents[..1]),
+            Err(DeviceActionJournalError::PendingInstance)
+        );
+        journal.acknowledge(2).unwrap();
+        let missing = [DeviceActionIntent {
+            kind: DeviceActionKind::EnsurePresent,
+            instance_id: String::from(r"ROOT\MISSING\0000"),
+        }];
+        assert_eq!(
+            journal.publish_actions(4, &cm.devnode_publications(), &missing),
+            Err(DeviceActionJournalError::InvalidTransition)
+        );
+        assert_eq!(journal.last_mount_generation(), 3);
     }
 
     #[test]

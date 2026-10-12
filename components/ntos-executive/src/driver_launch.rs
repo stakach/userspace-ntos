@@ -39320,6 +39320,26 @@ unsafe fn set_hosted_relation_query_disposition(disposition: HostedDeviceRelatio
             query.barrier_origin = HostedRelationBarrierOrigin::None;
         }
         HostedDeviceRelationQueryDisposition::Barrier(status) => {
+            print_str(b"[pnp-relations] barrier-source phase=");
+            print_str(match query.phase {
+                HostedDeviceRelationQueryPhase::AwaitingAcpiPciAddressMethodCompletion { .. } =>
+                    b"pci-address-completion",
+                HostedDeviceRelationQueryPhase::AwaitingAcpiPciAddressMethodCopy { .. } =>
+                    b"pci-address-copy",
+                HostedDeviceRelationQueryPhase::AwaitingAcpiPciAddressMethodAck { .. } =>
+                    b"pci-address-ack",
+                HostedDeviceRelationQueryPhase::CompleteAcpiPciScopeSource { .. } =>
+                    b"pci-scope-complete",
+                HostedDeviceRelationQueryPhase::AcpiPciScopeSourcesReady => b"pci-sources-ready",
+                HostedDeviceRelationQueryPhase::PrepareAcpiPciCatalogUpdate =>
+                    b"pci-catalog-prepare",
+                HostedDeviceRelationQueryPhase::AcpiPciCatalogPrepared => b"pci-catalog-prepared",
+                HostedDeviceRelationQueryPhase::IdsCopied => b"ids-copied",
+                _ => b"other",
+            });
+            print_str(b" status=0x");
+            print_hex(status.raw() as u32);
+            print_str(b"\n");
             query.phase = HostedDeviceRelationQueryPhase::Barrier;
             query.barrier_status = Some(status);
             if query.barrier_origin == HostedRelationBarrierOrigin::None {
@@ -41240,11 +41260,7 @@ unsafe fn build_hosted_relation_mutations(
             });
         }
         mutations.push(HostedRelationRegistryMutation::PublishDeviceAction {
-            kind: if change.kind == nt_pnp_manager::BusRelationChangeKind::Arrival {
-                nt_config_client::DeviceActionKind::Arrival
-            } else {
-                nt_config_client::DeviceActionKind::Change
-            },
+            kind: nt_config_client::DeviceActionKind::EnsurePresent,
             instance_id,
         });
     }
@@ -43035,6 +43051,65 @@ unsafe fn retire_hosted_device_relation_barrier() -> usize {
         .iter()
         .any(|failure| failure.invalidation == claim)
     {
+        let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+            .as_ref()
+            .expect("barrier owner disappeared before terminal failure recording");
+        print_str(b"[pnp-relations] barrier status=0x");
+        print_hex(status.raw() as u32);
+        print_str(b" origin=");
+        print_str(match query.barrier_origin {
+            HostedRelationBarrierOrigin::None => b"none",
+            HostedRelationBarrierOrigin::ClaimTarget => b"claim-target",
+            HostedRelationBarrierOrigin::PrepareIrp => b"prepare-irp",
+            HostedRelationBarrierOrigin::DispatchIdentity => b"dispatch-identity",
+            HostedRelationBarrierOrigin::DriverResult => b"driver-result",
+        });
+        print_str(b" parent/id/gen/pdo=");
+        print_u64(claim.parent.devnode_id());
+        print_str(b"/");
+        print_u64(claim.parent.generation());
+        print_str(b"/");
+        print_u64(claim.parent.pdo_object_id());
+        print_str(b" claim/seq/type=");
+        print_u64(claim.pdo_device_id);
+        print_str(b"/");
+        print_u64(claim.sequence);
+        print_str(b"/");
+        print_u64(claim.relation_type as u64);
+        print_str(b" irp/child/selector=");
+        print_u64(irp_id.raw());
+        print_str(b"/");
+        print_u64(query.last_child_index as u64);
+        print_str(b"/0x");
+        print_hex(query.last_selector as u32);
+        print_str(b" last-op=");
+        print_str(match query.last_operation {
+            HostedRelationQueryOperation::Relations => b"relations",
+            HostedRelationQueryOperation::QueryId => b"id",
+            HostedRelationQueryOperation::QueryProperty => b"property",
+            HostedRelationQueryOperation::QueryCapabilities => b"capabilities",
+            HostedRelationQueryOperation::AcpiNamespace => b"namespace",
+            HostedRelationQueryOperation::AcpiPciRoot => b"pci-root",
+            HostedRelationQueryOperation::AcpiPciNamespace => b"pci-namespace",
+            HostedRelationQueryOperation::AcpiPciAddress => b"pci-address",
+        });
+        if query.last_operation == HostedRelationQueryOperation::AcpiPciAddress {
+            if let Some(HostedAcpiPciScopeDiscoveryState::EvaluatingAddresses { plan, .. }) =
+                query.child_properties.get(query.last_child_index).map(|properties| {
+                    &properties.acpi_pci_scope_discovery
+                })
+            {
+                if let Some(address) = plan.addresses.get(query.last_selector as usize) {
+                    print_str(b" method=");
+                    print_str(address.method_path.as_str().as_bytes());
+                }
+            }
+        }
+        if let Some(driver_status) = query.driver_status {
+            print_str(b" driver-status=0x");
+            print_hex(driver_status.raw() as u32);
+        }
+        print_str(b"\n");
         hosted_device_relation_failures_mut().push(HostedDeviceRelationFailure {
             invalidation: claim,
             status,
@@ -44733,20 +44808,25 @@ struct HostedRootBusBackend;
 impl DriverDispatchBackend for HostedRootBusBackend {
     fn dispatch_irp(
         &mut self,
-        _ctx: DispatchContext<'_>,
+        ctx: DispatchContext<'_>,
         irp: &IrpProjection,
     ) -> Result<DispatchOutcome, nt_status::NtStatus> {
-        if irp.major == major::IRP_MJ_PNP {
-            Ok(DispatchOutcome::Completed {
-                status: nt_status::NtStatus::SUCCESS,
-                information: 0,
-                file_context: None,
-            })
-        } else {
-            Ok(DispatchOutcome::Failed {
+        if irp.major != major::IRP_MJ_PNP
+            || irp.driver_id != ctx.driver_id
+            || irp.file_id.is_some()
+            || !matches!(&irp.parameters, IoParameters::Pnp(parameters) if parameters.minor == irp.minor)
+        {
+            return Ok(DispatchOutcome::Failed {
                 status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-            })
+            });
         }
+        let outcome = unsafe { hosted_root_bus_mut().dispatch_pnp_outcome(irp.device_id, irp.minor) };
+        let (status, information) = outcome.completion_or(irp.status.raw(), irp.information);
+        Ok(DispatchOutcome::Completed {
+            status: nt_status::NtStatus(status),
+            information,
+            file_context: None,
+        })
     }
 
     fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
@@ -48055,6 +48135,15 @@ pub(crate) unsafe fn enqueue_hosted_initial_bus_relations(
             invalidation: enqueued.invalidation,
         }
     })
+}
+
+/// An uncommitted relation may still contribute the exact PDO for a registry devnode. The
+/// claimant is removed from the queue while its query is active, so both owners must be checked.
+pub(crate) unsafe fn hosted_bus_relation_pending() -> bool {
+    (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_INVALIDATIONS))
+        .as_ref()
+        .is_some_and(|queue| queue.len() != 0)
+        || (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).is_some()
 }
 
 pub(crate) unsafe fn hosted_pnp_relation_progress(

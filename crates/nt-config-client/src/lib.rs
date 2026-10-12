@@ -418,6 +418,8 @@ pub enum DeviceActionKind {
     Arrival,
     Change,
     Removal,
+    /// Input-only intent resolved by CM against its mounted Enum snapshot.
+    EnsurePresent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1295,6 +1297,7 @@ fn encode_hive_mutation_journal(mutations: &[SystemHiveMutation<'_>]) -> Result<
                     DeviceActionKind::Arrival => device_action_kind::ARRIVAL,
                     DeviceActionKind::Change => device_action_kind::CHANGE,
                     DeviceActionKind::Removal => device_action_kind::REMOVAL,
+                    DeviceActionKind::EnsurePresent => device_action_kind::ENSURE_PRESENT,
                 };
                 append_hive_mutation_record(
                     &mut journal,

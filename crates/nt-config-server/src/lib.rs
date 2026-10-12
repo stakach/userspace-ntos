@@ -854,6 +854,7 @@ fn encode_device_action_event(event: &DeviceActionEvent) -> Option<Vec<u8>> {
         DeviceActionKind::Arrival => device_action_kind::ARRIVAL,
         DeviceActionKind::Change => device_action_kind::CHANGE,
         DeviceActionKind::Removal => device_action_kind::REMOVAL,
+        DeviceActionKind::EnsurePresent => return None,
     };
     let service_present = if event.publication.service_name.is_some() {
         device_action_service::PRESENT
@@ -905,6 +906,7 @@ fn device_action_intents(mutations: &[HiveMutation]) -> Result<Vec<DeviceActionI
             device_action_kind::ARRIVAL => DeviceActionKind::Arrival,
             device_action_kind::CHANGE => DeviceActionKind::Change,
             device_action_kind::REMOVAL => DeviceActionKind::Removal,
+            device_action_kind::ENSURE_PRESENT => DeviceActionKind::EnsurePresent,
             _ => return Err(STATUS_INVALID_PARAMETER),
         };
         actions

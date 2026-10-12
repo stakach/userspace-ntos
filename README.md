@@ -164,9 +164,11 @@ Genuine Explorer and native acceptance are tracked in
 [issue #18](https://github.com/stakach/userspace-ntos/issues/18).
 The current [issue #18 diagnostic](https://github.com/stakach/userspace-ntos/issues/18)
 has advanced through ReactOS setup and real device installation after a resumed
-registry snapshot. VideoPort now enumerates the bochsmp monitor child, but setup
-has not yet handed off to the genuine Userinit and Explorer processes. Native
-input drivers still lack `IoStartPacket`/`IoStartNextPacket`. Font cleanup and
+registry snapshot. ACPI and PCI bus relations now commit, and the PCI root driver
+starts. SMSS launches CSRSS, then win32k stops because
+`HARDWARE\\DEVICEMAP\\VIDEO` is absent; bochsmp child START remains under
+validation. VideoPort enumerates the bochsmp monitor child. Input drivers still
+lack `IoStartPacket`/`IoStartNextPacket`. Font cleanup and
 desktop acceptance remain unproven. Acceptance requires strict native private-font
 cleanup and a separate fresh production Userinit/Explorer boot with real callbacks,
 GDI drawing, logs and screenshots. Crate CI does not prove desktop boot. An earlier

@@ -331,6 +331,8 @@ pub mod device_action_kind {
     pub const ARRIVAL: u16 = 1;
     pub const CHANGE: u16 = 2;
     pub const REMOVAL: u16 = 3;
+    /// Input-only bus presence intent; never appears in a delivered event.
+    pub const ENSURE_PRESENT: u16 = 4;
 }
 
 pub mod device_action_service {
