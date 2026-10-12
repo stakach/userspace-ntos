@@ -30,6 +30,9 @@ mod acpi_pci_routing_discovery;
 mod acpi_pci_scope_catalog;
 mod pci_interrupt_routes;
 mod pci_inventory;
+mod pci_bus_reported_resources;
+
+pub use pci_bus_reported_resources::{validate_pci_bus_reported_resources, PciBusResourceError};
 
 pub use acpi_pci_routing_discovery::{
     AcpiPciCrsMethodSource, AcpiPciInterruptLinkEvaluation, AcpiPciInterruptLinkMethodQuery,

@@ -607,13 +607,21 @@ fn io_address_requirement_matches(
     let maximum = read_u64(bytes, descriptor + 24).map_err(IoResourceAssignmentError::Malformed)?;
     let flags = u16::from_le_bytes([bytes[descriptor + 4], bytes[descriptor + 5]]);
     let end = candidate_start.checked_add(candidate_length.saturating_sub(1) as u64);
+    // BAR is broker metadata on the candidate, not a native PCI requirement flag.
+    // Preserve the candidate's other resource attributes while matching a bus PDO list.
+    let marker = if bytes[descriptor + 1] == CM_RESOURCE_TYPE_MEMORY {
+        CM_RESOURCE_MEMORY_BAR
+    } else {
+        CM_RESOURCE_PORT_BAR
+    };
     Ok(length != 0
         && alignment != 0
         && maximum >= minimum
         && candidate_length == length
         && candidate_start >= minimum
         && candidate_start % alignment as u64 == 0
-        && candidate_flags == flags
+        && (candidate_flags == flags
+            || (candidate_flags & marker != 0 && candidate_flags & !marker == flags))
         && candidate_share == bytes[descriptor + 2]
         && end.is_some_and(|end| end <= maximum))
 }

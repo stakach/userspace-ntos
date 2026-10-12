@@ -13780,6 +13780,7 @@ unsafe fn grant_hosted_devnode_resources(
             bus_resources,
             window,
             lease,
+            ..
         } => {
             let context_lease = lease.into_identity();
             let result = grant_hosted_pci_devnode_resources(

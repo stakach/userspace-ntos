@@ -61897,6 +61897,50 @@ pub(crate) unsafe fn validate_hosted_bus_pdo_resource_properties(
     }
 }
 
+/// Retain the exact PCI bus-owned query results before a function driver can filter them. The
+/// independently scanned PCI function supplies physical BDF/BAR evidence; the accepted PDO owns
+/// its native property bytes and the platform route remains a separate authority.
+pub(crate) unsafe fn hosted_accepted_pci_resource_properties(
+    instance_path: &str,
+    pdo_device_id: u64,
+    device: &nt_pnp::PciDevice,
+) -> Result<(Vec<u8>, Vec<u8>), nt_status::NtStatus> {
+    let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+    if hosted_bus_reported_device_id(instance_path) != Some(pdo_device_id) {
+        return Err(invalid);
+    }
+    let properties = hosted_pnp_manager_mut()
+        .enumerated_pdo_properties(pdo_device_id)
+        .ok_or(invalid)?;
+    let information = properties.bus_information.as_ref().ok_or(invalid)?;
+    let capabilities = properties.capabilities.as_ref().ok_or(invalid)?;
+    if information.bus_type_guid != nt_pnp_manager::GUID_BUS_TYPE_PCI
+        || information.legacy_bus_type != nt_pnp_manager::INTERFACE_TYPE_PCI_BUS
+        || information.bus_number != u32::from(device.bus)
+        || capabilities.address != ((u32::from(device.dev) << 16) | u32::from(device.func))
+    {
+        return Err(invalid);
+    }
+    let (nt_pnp_manager::PropertyBlobState::Present(raw), nt_pnp_manager::PropertyBlobState::Present(requirements)) =
+        (&properties.boot_resources_raw, &properties.resource_requirements)
+    else {
+        return Err(invalid);
+    };
+    nt_pnp::validate_pci_bus_reported_resources(device, raw, requirements)
+        .map_err(|_| invalid)?;
+    let mut raw_copy = Vec::new();
+    raw_copy
+        .try_reserve_exact(raw.len())
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    raw_copy.extend_from_slice(raw);
+    let mut requirements_copy = Vec::new();
+    requirements_copy
+        .try_reserve_exact(requirements.len())
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    requirements_copy.extend_from_slice(requirements);
+    Ok((raw_copy, requirements_copy))
+}
+
 pub(crate) unsafe fn commit_hosted_device_resource_assignment(
     device_id: u64,
     raw_resource_list: &[u8],

@@ -1202,6 +1202,7 @@ pub(crate) enum PreparedHostedResourcePlan {
     },
     Pci {
         bus_resources: DevnodePciBusResources,
+        accepted_properties: Option<(Vec<u8>, Vec<u8>)>,
         window: HostedPnpPciResourceDescriptor,
         lease: nt_pnp_context::ContextLease,
     },
@@ -1217,10 +1218,13 @@ impl PreparedHostedResourcePlan {
     fn native_property_blobs(&self) -> (Option<&[u8]>, Option<&[u8]>) {
         match self {
             Self::BusReportedBusNumber { resources } => (Some(&resources.raw_resources), None),
-            Self::Pci { bus_resources, .. } => (
-                Some(&bus_resources.raw_boot_resources),
-                Some(&bus_resources.resource_requirements),
-            ),
+            Self::Pci { bus_resources, accepted_properties, .. } => accepted_properties
+                .as_ref()
+                .map(|(raw, requirements)| (Some(raw.as_slice()), Some(requirements.as_slice())))
+                .unwrap_or((
+                    Some(&bus_resources.raw_boot_resources),
+                    Some(&bus_resources.resource_requirements),
+                )),
             Self::Platform { grant, .. } => (
                 Some(&grant.raw_boot_resources),
                 Some(&grant.resource_requirements),
@@ -1322,6 +1326,17 @@ where
                 nt_status::NtStatus::INVALID_DEVICE_REQUEST,
             ));
         };
+        let accepted_properties = match bus_pdo {
+            Some(pdo) => match driver_launch::hosted_accepted_pci_resource_properties(
+                instance_id,
+                pdo,
+                device,
+            ) {
+                Ok(properties) => Some(properties),
+                Err(status) => return Err(release_context_lease_after_error(lease, status)),
+            },
+            None => None,
+        };
         let resource_publication = nt_root_bus::PdoResourcePublication {
             raw_boot_resources: nt_root_bus::BusResourceState::Present(
                 bus_resources.raw_boot_resources.clone(),
@@ -1350,6 +1365,7 @@ where
             }),
             resource_plan: PreparedHostedResourcePlan::Pci {
                 bus_resources,
+                accepted_properties,
                 window,
                 lease,
             },
