@@ -168,7 +168,10 @@ and reached the guest's terminal verdict. It passed 217/261 executive checks;
 the font Run client, Userinit and Explorer did not execute. Many provider devnodes
 lacked `DeviceDesc`, while native input drivers still lack
 `IoStartPacket`/`IoStartNextPacket`. The captured frame shows only background and
-cursor. Font cleanup and desktop acceptance remain unproven. Acceptance requires both strict
+cursor. The same-run trace now identifies the immediate desktop blocker: while
+Winlogon was waiting in media setup, `setup.exe` crashed after a 16-to-24-byte
+`msvcrt!realloc` returned null inside `riched20.dll`. The allocator failure reason
+is under investigation. Font cleanup and desktop acceptance remain unproven. Acceptance requires both strict
 native private-font cleanup and a separate production Userinit/Explorer boot without
 acceptance startup hooks
 with real callbacks, GDI drawing, logs and screenshots. Crate CI does not prove

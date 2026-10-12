@@ -24,6 +24,7 @@
     "UMPnP completed its initial device list and set the real PnP_No_Pending_Install_Events object. The earlier 900-second cutoff occurred while UMPnP was still installing devices.",
     "Multiple actual PCI and ACPI installer children queried missing Enum DeviceDesc values and DevInstallW returned error 2. The HTREE root DeviceDesc miss is expected in the ReactOS reference; no root description was synthesized.",
     "SMSS registered the font Run key, but the private-font Run client did not execute. The terminal summary reported no Userinit image open, no Explorer process, and FAIL exec_explorer_shell_chrome_painted.",
+    "The guest remained in MediaSetup. setup.exe (pi 15, tid 256) faulted at log lines 376361-376366 and was parked. RIP 0x7ff8c0216c9 maps to riched20.dll LookupInit: its 16-to-24-byte msvcrt realloc returned NULL before an unchecked write to address 0x10. The reason realloc failed is not yet established. ReactOS Winlogon waits for setup.exe before Userinit.",
     "The final same-run QMP screenshot shows only the blue background and cursor. It is diagnostic evidence, not strict font cleanup or production desktop proof.",
     "The launcher returned zero because the guest emitted its completion sentinel. The strict executive/desktop gate failed at 217/261 checks; launcher exit is not an acceptance result."
   ],
