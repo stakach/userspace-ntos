@@ -1,0 +1,35 @@
+{
+  "issue": 18,
+  "related_issues": [283, 294, 302],
+  "image_source_commit": "455c6060",
+  "profile": "font-cleanup",
+  "boot_bound_seconds": 3600,
+  "launcher_exit": 0,
+  "collector_exit": 0,
+  "collector_frames": 25,
+  "collector_final_slot": 0,
+  "executive_checks": { "passed": 217, "total": 261 },
+  "desktop_acceptance": false,
+  "font_cleanup_acceptance": false,
+  "artifact_sha256": {
+    "preboot_staged_disk": "16426ed9683c4b6c67abc76f79add5c522adab486abaa21bdaa80fdfa12fb317",
+    "raw_log": "996245ce5c44770af76d2a87e001f6be8ea9a5128d94bd0aed3b15e75dfcaef9",
+    "archived_log": "789e2afee93cd50a2fc846bfe9271292cbf5c9fd4671a4c5c644c537ad0ac226",
+    "raw_collector_log": "68f2d9c91a79f6dce4ca666084a1ca15ba60d0d481fe89160ec4ec8d4fabf3d3",
+    "archived_collector_log": "6bd20591b06095c5601dcbfe71a59e242024eb6d35301625bc8baab8cd1dd672",
+    "final_screenshot": "53ad5f5ac610f375103c4b38bc9dcda1b85defd34e60860272a02fff0da0c9cb"
+  },
+  "observations": [
+    "This run used the same preboot disk bytes as the earlier 900-second diagnostic. It was allowed the full 3600-second bound and reached the guest's own terminal validation verdict before that bound.",
+    "UMPnP completed its initial device list and set the real PnP_No_Pending_Install_Events object. The earlier 900-second cutoff occurred while UMPnP was still installing devices.",
+    "Multiple actual PCI and ACPI installer children queried missing Enum DeviceDesc values and DevInstallW returned error 2. The HTREE root DeviceDesc miss is expected in the ReactOS reference; no root description was synthesized.",
+    "SMSS registered the font Run key, but the private-font Run client did not execute. The terminal summary reported no Userinit image open, no Explorer process, and FAIL exec_explorer_shell_chrome_painted.",
+    "The final same-run QMP screenshot shows only the blue background and cursor. It is diagnostic evidence, not strict font cleanup or production desktop proof.",
+    "The launcher returned zero because the guest emitted its completion sentinel. The strict executive/desktop gate failed at 217/261 checks; launcher exit is not an acceptance result."
+  ],
+  "evidence": {
+    "log": "docs/evidence/issue18-extended-font-verdict.log.gz",
+    "collector_log": "docs/evidence/issue18-extended-font-verdict-qmp.log.gz",
+    "screenshot": "docs/images/issue18-extended-font-verdict.png"
+  }
+}

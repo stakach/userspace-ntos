@@ -162,11 +162,13 @@ in `extern-rootserver` mode (bring your own root task).
 The desktop target hosts **real, unmodified GPL ReactOS binaries** on rust-micro.
 Genuine Explorer and native acceptance are tracked in
 [issue #18](https://github.com/stakach/userspace-ntos/issues/18).
-The latest [bounded diagnostic boot](docs/evidence/issue18-adddevice-fix-timeout.json)
-started real ACPI and bochsmp drivers and published the video route after fixing
-duplicate FDO publication. It timed out at 900 seconds during setup; native input
-drivers still lack `IoStartPacket`/`IoStartNextPacket`, and the captured frame is black.
-Font cleanup and desktop acceptance remain unproven. Acceptance requires both strict
+The latest [bounded diagnostic boot](docs/evidence/issue18-extended-font-verdict.json)
+started real ACPI and bochsmp drivers, completed UMPnP's initial install list,
+and reached the guest's terminal verdict. It passed 217/261 executive checks;
+the font Run client, Userinit and Explorer did not execute. Many provider devnodes
+lacked `DeviceDesc`, while native input drivers still lack
+`IoStartPacket`/`IoStartNextPacket`. The captured frame shows only background and
+cursor. Font cleanup and desktop acceptance remain unproven. Acceptance requires both strict
 native private-font cleanup and a separate production Userinit/Explorer boot without
 acceptance startup hooks
 with real callbacks, GDI drawing, logs and screenshots. Crate CI does not prove
