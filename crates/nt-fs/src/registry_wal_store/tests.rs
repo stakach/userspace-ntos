@@ -480,3 +480,38 @@ fn rejected_anchor_admission_returns_verified_owner_with_lease_held() {
     drop(verified.into_device());
     assert!(reserve.try_acquire().is_some());
 }
+
+#[test]
+fn uncertain_anchor_write_keeps_the_original_wal_reserve_lease() {
+    use crate::{WalSnapshotAnchorUpdate, WalSnapshotManifest};
+
+    let store = SnapshotBlockStore::new(0, 16);
+    let reserve = SnapshotReserve::new(CachedDisk::with_sectors(32), 17, store);
+    let mut lease = reserve.try_acquire().unwrap();
+    let baseline = WalSnapshotManifest {
+        incarnation: 77,
+        base_serial: 0,
+        high_water_serial: 0,
+        high_water_end_lba: 0,
+    };
+    store.commit_next_with_wal_manifest(&mut lease, b"older", baseline).unwrap();
+    store.commit_next_with_wal_manifest(&mut lease, b"newer", baseline).unwrap();
+    // A one-sector WAL append emits five events. Fail the first anchor header
+    // write after that append has reached its marker barrier.
+    let fail_event = lease.test_device_mut().events.len() + 5;
+    lease.test_device_mut().fail_event = Some(fail_event);
+    let owned = OwnedBoundedBlockRange::new(lease, 16, 16).ok().unwrap();
+    let mut wal = RegistryWal::recover(owned, 77).unwrap();
+    wal.begin(alloc::vec![7; 512]).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    let verified = wal.into_verified_device().unwrap().into_full_device();
+    let mut update = WalSnapshotAnchorUpdate::admit_verified_wal(store, verified)
+        .ok()
+        .unwrap();
+    assert_eq!(update.advance(), Err(SnapshotBlockStoreError::Io));
+    let retained = update.into_device().err().unwrap();
+    assert!(reserve.try_acquire().is_none());
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(retained))).is_err());
+    assert!(reserve.try_acquire().is_none());
+}
