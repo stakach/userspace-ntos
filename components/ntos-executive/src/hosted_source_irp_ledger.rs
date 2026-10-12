@@ -14,6 +14,9 @@ use nt_io_manager::source_irp_ledger::{
     SourceIrpOwner, SourceIrpRetirement,
     SourcePoolFreeAdmission,
 };
+use nt_io_manager::start_io_native_owner::{
+    PendingStartIoNodeIdentity, PendingStartIoQueueIdentity, StartIoAdmission,
+};
 
 static LOCK: AtomicU64 = AtomicU64::new(0);
 static mut LEDGER: SourceIrpLedger = SourceIrpLedger::new();
@@ -1181,6 +1184,73 @@ pub(super) fn service(
         }
         _ => (STATUS_INVALID_PARAMETER, 0, 0),
     }
+}
+
+/// Admit only an op6-published caller packet. This obtains real source and device pins, but it
+/// does not enqueue the packet or authorize a callback. The native StartIo adapter must recheck
+/// the node phase while it owns the physical queue lock before its eventual local WDM commit.
+pub(super) fn admit_projected_start_io_packet(
+    instance_index: usize,
+    inst: DriverInstance,
+    observed: PendingStartIoNodeIdentity,
+    dispatch_device: nt_io_manager::HostedDevicePointerRegistration,
+) -> Result<StartIoAdmission, i32> {
+    let _source_guard = lock();
+    let _pool_guard = unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }
+        .ok_or(STATUS_INVALID_HANDLE)?;
+    let (generation, entry) = unsafe {
+        projected_node(
+            instance_index,
+            observed.node,
+            observed.canonical_irp_id,
+            observed.raw_irp,
+            HOSTED_IRP_DISPATCHING,
+            Some(observed.generation),
+        )
+    }
+    .ok_or(STATUS_INVALID_HANDLE)?;
+    if generation != observed.generation
+        || entry.source_ticket_id != observed.source.id.get()
+        || entry.source_ticket_generation != observed.source.generation.get()
+    {
+        return Err(STATUS_INVALID_HANDLE);
+    }
+    let source = caller_projections()
+        .iter()
+        .find(|row| {
+            row.node == observed.node
+                && row.node_generation == observed.generation
+                && row.canonical_irp_id == observed.canonical_irp_id
+                && row.ticket == observed.source
+                && row.allocation.component_address == observed.raw_irp
+                && row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index)
+                && !row.terminal_started
+        })
+        .map(|row| row.allocation)
+        .ok_or(STATUS_INVALID_HANDLE)?;
+    let mut physical = allocation_unlocked(
+        instance_index,
+        inst,
+        source.component_address,
+        source.bytes,
+        source.stack_count,
+    )
+    .ok_or(STATUS_INVALID_HANDLE)?;
+    physical.owner = SourceIrpOwner::HostedCaller(instance_index);
+    if physical != source {
+        return Err(STATUS_INVALID_HANDLE);
+    }
+    let registered = PendingStartIoQueueIdentity::new(observed, dispatch_device)
+        .ok_or(STATUS_INVALID_HANDLE)?;
+    StartIoAdmission::acquire_projected(
+        io_manager_mut(),
+        ledger(),
+        source,
+        registered,
+        observed,
+        dispatch_device,
+    )
+    .map_err(|_| STATUS_INVALID_HANDLE)
 }
 
 pub(super) fn pin(

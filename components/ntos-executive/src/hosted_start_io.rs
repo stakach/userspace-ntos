@@ -7,6 +7,56 @@ use nt_io_manager::device_queue::{
     LockedDeviceQueueMemory,
 };
 use nt_io_manager::start_io::{self, CurrentPacketRelation, Device, LockedStartIoMemory, Packet};
+use nt_io_manager::start_io_current::{CurrentReceipt, LivePacket};
+use nt_io_manager::start_io_native_owner::{PendingStartIoNodeIdentity, StartIoSourcePin};
+use nt_io_manager::source_irp_ledger::SourceIrpForwardIdentity;
+
+#[path = "hosted_start_io_packet.rs"]
+mod packet;
+
+/// Exact pre-effect owners for an op6-projected first packet. This does not enqueue or invoke
+/// StartIo. The eventual native callback transaction must consume these owners under the queue
+/// lock and retain them across its uncertain Reply and terminal completion.
+#[must_use = "retain the exact packet and device owners until native callback integration"]
+struct PreparedFirstProjectedPacket {
+    instance: DriverInstance,
+    registration: nt_io_manager::HostedDevicePointerRegistration,
+    current: CurrentReceipt<nt_io_manager::HostedDeviceProjectionReference, StartIoSourcePin>,
+    incoming: LivePacket<StartIoSourcePin>,
+}
+
+impl PreparedFirstProjectedPacket {
+    fn source_identity(&self) -> SourceIrpForwardIdentity { self.incoming.identity() }
+}
+
+/// Admit from the root's own pending-node row and physical source ledger, never from component
+/// bytes alone. No queue or callback effect is performed by this preparatory slice.
+fn prepare_first_projected_packet(
+    ch: &crate::spawn_hosts::PumpChannel,
+    device: u64,
+    observed: PendingStartIoNodeIdentity,
+    active_reply_cap: u64,
+) -> Result<PreparedFirstProjectedPacket, i32> {
+    let (index, inst, device_id) = authenticated_hosted_device(ch, device, active_reply_cap)
+        .map_err(|status| status.raw())?;
+    let domain = instance_domain_identity(inst).ok_or(STATUS_INVALID_HANDLE)?;
+    let registration = hosted_device_pointer_registration(domain, device, device_id)
+        .map_err(|status| status.raw())?;
+    if hosted_device_allocations::registration(inst, device) != Ok(Some(registration)) {
+        return Err(STATUS_INVALID_HANDLE);
+    }
+    let admitted = hosted_source_irp_ledger::admit_projected_start_io_packet(
+        index, inst, observed, registration,
+    )?;
+    let identity = admitted.source_identity();
+    let (device_owner, source_owner) = admitted.into_owners();
+    Ok(PreparedFirstProjectedPacket {
+        instance: inst,
+        registration,
+        current: CurrentReceipt::new(registration, identity.allocation().domain, device_owner),
+        incoming: LivePacket::new(identity, source_owner),
+    })
+}
 
 /// This trampoline runs in the hosted component. It never reads root I/O Manager state or stores
 /// StartIo flags locally: the authenticated device service performs that effect in root space.
