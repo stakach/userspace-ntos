@@ -33,7 +33,8 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use nt_ntdll::heap::{
-    Heap, HeapRegistry, HeapRemoval, HeapUserInfo, HeapWalkError, HeapWalkOutcome, RtlHeapWalkEntry,
+    reallocate_in_process_segments, Heap, HeapRegistry, HeapRemoval, HeapUserInfo, HeapWalkError,
+    HeapWalkOutcome, RtlHeapWalkEntry,
 };
 
 /// Step 4.0b — the `Rtl*` / `Ldr*` / `Dbg*` / CRT PE exports smss.exe imports (completes the export
@@ -819,60 +820,56 @@ pub(crate) unsafe fn heap_realloc_with_flags(
     let is_process_heap = registry
         .process_handle()
         .is_some_and(|process| process == handle);
-    if let Some(result) = unsafe {
-        registry
-            .find_mut(handle)
-            .and_then(|heap| heap.reallocate_with_flags(ptr, new_size, flags, in_place_only))
-    } {
-        return result;
-    }
-    if !is_process_heap {
+    let Some(base_heap) = registry.find_mut(handle) else {
         return core::ptr::null_mut();
+    };
+    if !is_process_heap {
+        return unsafe { base_heap.reallocate_with_flags(ptr, new_size, flags, in_place_only) }
+            .unwrap_or(core::ptr::null_mut());
     }
     unsafe {
         let segments = process_heap_segments_locked();
-        for heap in segments.iter_mut().filter_map(Option::as_mut) {
-            if let Some(result) = heap.reallocate_with_flags(ptr, new_size, flags, in_place_only) {
-                return result;
-            }
+        if let Some(result) = reallocate_in_process_segments(
+            base_heap,
+            segments,
+            ptr,
+            new_size,
+            flags,
+            in_place_only,
+        ) {
+            return result;
         }
-        if in_place_only {
+        if in_place_only
+            || (base_heap.size_of(ptr).is_none()
+                && !segments
+                .iter()
+                .filter_map(Option::as_ref)
+                .any(|heap| heap.size_of(ptr).is_some()))
+        {
             return core::ptr::null_mut();
         }
-        let old_size = registry
-            .find(handle)
-            .and_then(|heap| heap.size_of(ptr))
-            .or_else(|| {
-                segments
-                    .iter()
-                    .filter_map(Option::as_ref)
-                    .find_map(|heap| heap.size_of(ptr))
-            });
-        let Some(old_size) = old_size else {
+
+        let Some(slot_index) = segments.iter().position(Option::is_none) else {
             return core::ptr::null_mut();
         };
         let Some(segment_size) = process_heap_segment_size(new_size) else {
             return core::ptr::null_mut();
         };
-        let Some(slot_index) = segments.iter().position(Option::is_none) else {
-            return core::ptr::null_mut();
-        };
         let Some(mut heap) = create_process_heap_segment(segment_size) else {
             return core::ptr::null_mut();
         };
-        let Some(result) = heap.allocate_with_flags(new_size, flags) else {
+        let result = if base_heap.size_of(ptr).is_some() {
+            base_heap.relocate_to(&mut heap, ptr, new_size, flags)
+        } else {
+            segments
+                .iter_mut()
+                .filter_map(Option::as_mut)
+                .find_map(|owner| owner.relocate_to(&mut heap, ptr, new_size, flags))
+        };
+        let Some(result) = result else {
             release_owned_heap(heap);
             return core::ptr::null_mut();
         };
-        core::ptr::copy_nonoverlapping(ptr, result, old_size.min(new_size));
-        if let Some(base_heap) = registry.find_mut(handle) {
-            let _ = base_heap.free(ptr);
-        }
-        for existing in segments.iter_mut().filter_map(Option::as_mut) {
-            if existing.free(ptr) {
-                break;
-            }
-        }
         segments[slot_index] = Some(heap);
         result
     }
