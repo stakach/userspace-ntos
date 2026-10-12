@@ -1132,26 +1132,32 @@ struct PendingIrp {
 }
 
 impl PendingIrp {
+    fn allocation_pointers(&self) -> nt_io_manager::pending_irp_graph::PendingIrpGraphPointers {
+        nt_io_manager::pending_irp_graph::PendingIrpGraphPointers {
+            reclaim: self
+                .completion
+                .completed()
+                // A source ticket covers the allocations captured before dispatch. A
+                // replacement SystemBuffer belongs to the provider's later allocation
+                // lifetime and cannot be released through that original graph.
+                .filter(|_| self.source_ticket_id == 0)
+                .map(|completion| completion.reclaim)
+                .unwrap_or(0),
+            mdl: self.mdl,
+            aux_data: self.aux_data,
+            data: self.data,
+            create_parameters: self.create_parameters,
+            create_access_state: self.create_access_state,
+            create_security_context: self.create_security_context,
+            pnp_resource_list: self.pnp_resource_list,
+            irp: self.irp,
+            file_object: self.file_object,
+            owns_file: self.owns_fo,
+        }
+    }
+
     fn allocation_graph(&self) -> nt_io_manager::pending_irp_graph::PendingIrpAllocationGraph {
-        nt_io_manager::pending_irp_graph::PendingIrpAllocationGraph::new(
-            nt_io_manager::pending_irp_graph::PendingIrpGraphPointers {
-                reclaim: self
-                    .completion
-                    .completed()
-                    .map(|completion| completion.reclaim)
-                    .unwrap_or(0),
-                mdl: self.mdl,
-                aux_data: self.aux_data,
-                data: self.data,
-                create_parameters: self.create_parameters,
-                create_access_state: self.create_access_state,
-                create_security_context: self.create_security_context,
-                pnp_resource_list: self.pnp_resource_list,
-                irp: self.irp,
-                file_object: self.file_object,
-                owns_file: self.owns_fo,
-            },
-        )
+        nt_io_manager::pending_irp_graph::PendingIrpAllocationGraph::new(self.allocation_pointers())
     }
 }
 
@@ -2049,7 +2055,7 @@ unsafe fn tombstone_pending_irp_owner(node: u64, consuming_state: u64) {
 
 unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
     if entry.source_ticket_id != 0 {
-        let (words, status, _, _, _) = call_on4_raw(
+        let (words, status, member_count, replacement_address, _) = call_on4_raw(
             (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
             7,
             entry.source_ticket_id,
@@ -2062,18 +2068,42 @@ unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
                 [FSD_SERVICE_SOURCE_IRP_LABEL, 7, entry.irp, status],
             );
         }
-    }
-    for allocation in entry.allocation_graph().allocations() {
-        match allocation.release_kind {
-            nt_io_manager::pending_irp_graph::GraphReleaseKind::FileStorage => {
-                hosted_file_objects::free_file_storage(allocation.pointer);
-            }
-            nt_io_manager::pending_irp_graph::GraphReleaseKind::Pool => {
-                pool_free(allocation.pointer);
+        if member_count == 0 || member_count > 10 {
+            crate::provider_bugcheck::report(
+                0xc4,
+                [FSD_SERVICE_SOURCE_IRP_LABEL, 7, entry.irp, member_count],
+            );
+        }
+        for index in 0..member_count {
+            let (words, status, _, _, _) = call_on4_raw(
+                (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
+                9,
+                entry.source_ticket_id,
+                entry.source_ticket_generation,
+                index,
+            );
+            if words != 3 || status as u32 as i32 != STATUS_SUCCESS {
+                crate::provider_bugcheck::report(
+                    0xc4,
+                    [FSD_SERVICE_SOURCE_IRP_LABEL, 9, index, status],
+                );
             }
         }
-    }
-    if entry.source_ticket_id != 0 {
+        if replacement_address != 0 {
+            let (words, status, _, _, _) = call_on4_raw(
+                (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
+                10,
+                entry.source_ticket_id,
+                entry.source_ticket_generation,
+                replacement_address,
+            );
+            if words != 3 || status as u32 as i32 != STATUS_SUCCESS {
+                crate::provider_bugcheck::report(
+                    0xc4,
+                    [FSD_SERVICE_SOURCE_IRP_LABEL, 10, replacement_address, status],
+                );
+            }
+        }
         let (words, status, _, _, _) = call_on4_raw(
             (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
             8,
@@ -2086,6 +2116,18 @@ unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
                 0xc4,
                 [FSD_SERVICE_SOURCE_IRP_LABEL, 8, entry.irp, status],
             );
+        }
+    } else {
+        // No root ticket exists yet; the constructor still owns this local graph.
+        for allocation in entry.allocation_graph().allocations() {
+            match allocation.release_kind {
+                nt_io_manager::pending_irp_graph::GraphReleaseKind::FileStorage => {
+                    hosted_file_objects::free_file_storage(allocation.pointer);
+                }
+                nt_io_manager::pending_irp_graph::GraphReleaseKind::Pool => {
+                    pool_free(allocation.pointer);
+                }
+            }
         }
     }
 }

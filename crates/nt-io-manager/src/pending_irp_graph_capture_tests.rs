@@ -86,6 +86,18 @@ fn capture_preserves_exact_source_identities_roles_and_release_order() {
 }
 
 #[test]
+fn captured_graph_protects_only_the_original_pool_generation() {
+    let graph = graph();
+    let original = members()[2];
+    assert!(graph.protects_current_member(original));
+    assert!(!graph.protects_current_member(SourcePoolAllocationIdentity {
+        pool_generation: original.pool_generation + 1,
+        ..original
+    }));
+    assert!(!graph.protects_current_member(allocation(0xd000, 71)));
+}
+
+#[test]
 fn exact_aliases_merge_roles_but_conflicting_alias_identities_are_rejected() {
     let mut pointers = pointers();
     pointers.aux_data = pointers.data;

@@ -67,13 +67,35 @@ fn pending_irp_release_uses_the_shared_exact_allocation_inventory() {
 }
 
 #[test]
+fn ticketed_release_uses_only_the_roots_immutable_inventory() {
+    let native = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    let ledger = include_str!("../../../components/ntos-executive/src/hosted_source_irp_ledger.rs");
+    let release = native.split("unsafe fn release_pending_irp_graph_component(entry: PendingIrp)")
+        .nth(1).unwrap().split("unsafe fn insert_pending_irp").next().unwrap();
+    let ticketed = release.split("    } else {\n        // No root ticket").next().unwrap();
+    assert!(release.contains("for index in 0..member_count"),
+        "a mutable completion-time PendingIrp cannot enumerate constructor allocations");
+    assert!(!ticketed.contains("entry.allocation_graph()")
+        && !ticketed.contains("entry.completion.completed()"),
+        "ticketed release must use only the broker receipt");
+    assert!(release.contains("entry.source_ticket_id != 0") && release.contains("entry.allocation_graph()"),
+        "keep the independent unticketed release path");
+    assert!(ledger.contains("row.graph.initial_members().get(member_index)"),
+        "op9 must resolve each index from the immutable root graph");
+    assert!(ledger.contains("row.graph.initial_members().len() as u64"),
+        "op7 must return the immutable member count");
+    assert!(ledger.contains("row.replacement.map_or(0, |identity| identity.component_address)"),
+        "op7 must return its separately adopted replacement address");
+}
+
+#[test]
 fn pending_irp_inventory_reads_only_the_retained_completed_reclaim() {
     let parsed = source();
     let snapshot = parsed.items.iter().find_map(|item| {
         let syn::Item::Impl(implementation) = item else { return None; };
         if !matches!(&*implementation.self_ty, syn::Type::Path(path) if path.path.is_ident("PendingIrp")) { return None; }
         implementation.items.iter().find_map(|item| match item {
-            syn::ImplItem::Fn(function) if function.sig.ident == "allocation_graph" => Some(function),
+            syn::ImplItem::Fn(function) if function.sig.ident == "allocation_pointers" => Some(function),
             _ => None,
         })
     }).expect("native graph snapshot delegated from its actual retained owner");
@@ -124,22 +146,25 @@ fn source_ticket_operations_still_bracket_native_free_order() {
         .iter()
         .position(|name| name == "source-op7")
         .unwrap();
-    let file = effects
+    let member = effects
         .0
         .iter()
-        .position(|name| name == "free_file_storage")
-        .unwrap();
-    let pool = effects
-        .0
-        .iter()
-        .position(|name| name == "pool_free")
+        .position(|name| name == "source-op9")
         .unwrap();
     let after = effects
         .0
         .iter()
         .position(|name| name == "source-op8")
         .unwrap();
-    assert!(before < file && before < pool && file < after && pool < after);
+    let local_pool = effects.0.iter().position(|name| name == "pool_free").unwrap();
+    let file = effects.0.iter().position(|name| name == "free_file_storage").unwrap();
+    assert!(before < member && member < after && after < file && after < local_pool);
+    let replacement = effects
+        .0
+        .iter()
+        .position(|name| name == "source-op10")
+        .unwrap();
+    assert!(before < replacement && member < replacement && replacement < after);
     assert_eq!(
         effects
             .0
@@ -156,4 +181,50 @@ fn source_ticket_operations_still_bracket_native_free_order() {
             .count(),
         1
     );
+    assert_eq!(effects.0.iter().filter(|name| *name == "source-op9").count(), 1);
+    assert_eq!(effects.0.iter().filter(|name| *name == "source-op10").count(), 1);
+}
+
+#[test]
+fn terminal_replacement_does_not_reject_npfs_completion_or_enter_initial_graph() {
+    let ledger = include_str!("../../../components/ntos-executive/src/hosted_source_irp_ledger.rs");
+    assert!(ledger.contains("capture_projected_graph_unlocked(inst, allocation, entry)"),
+        "capture constructor allocations before provider dispatch");
+    assert!(!ledger.contains("member.allocation.component_address == reclaim"),
+        "NPFS can supply a new SystemBuffer at completion; it is not an initial member");
+    let release = release();
+    let mut effects = Effects::default();
+    effects.visit_block(&release.block);
+    assert!(effects.0.iter().any(|name| name == "source-op9"),
+        "root must check exact captured generation before each initial free");
+    assert!(effects.0.iter().any(|name| name == "allocation_graph"));
+    let native = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    assert!(native.contains(".filter(|_| self.source_ticket_id == 0)"),
+        "a provider replacement cannot enter the source ticket's original graph");
+    assert!(ledger.contains("replacement: Option<SourcePoolAllocationIdentity>"),
+        "retain adopted replacement generation separately from initial members");
+    assert!(ledger.contains("completion.flags & IRP_DEALLOCATE_BUFFER"),
+        "the completion must explicitly transfer SystemBuffer disposal");
+    assert!(ledger.contains("ledger().pool_free_admission(instance_index, domain, reclaim)"),
+        "a different registered source owner excludes adoption");
+    assert!(ledger.contains("auxiliary().owns_pool_child_in_domain(domain, reclaim)"),
+        "any retained auxiliary owner in the physical domain excludes adoption");
+    assert!(ledger.contains("row.replacement = replacement"),
+        "record replacement ownership before terminal retirement begins");
+    assert!(native.contains("10,"),
+        "native must request the exact adopted replacement release separately");
+}
+
+#[test]
+fn caller_graph_release_keeps_exact_pool_generation_checks() {
+    let ledger = include_str!("../../../components/ntos-executive/src/hosted_source_irp_ledger.rs");
+    assert!(ledger.contains("graph: CapturedGraph"));
+    assert!(ledger.contains("row.graph.protects_current_member(current)"),
+        "ordinary provider frees must exclude only the captured live generation");
+    assert!(ledger.contains("exact_pool_identity_unlocked(inst, member_address, 1)"),
+        "terminal release must revalidate the captured physical generation");
+    assert!(ledger.contains("row.released_members |= bit"),
+        "retain terminal ownership before physical release");
+    assert!(ledger.contains("row.released_members != (1u16 << row.graph.initial_members().len()) - 1"),
+        "source retirement must wait for every initial member");
 }
