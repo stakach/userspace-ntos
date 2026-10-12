@@ -21,6 +21,7 @@ mod hive;
 mod io;
 mod overlay;
 mod reactos_registration;
+pub mod writeback_owner;
 
 pub use boot_object_policy::{
     boot_object_protection_mode, boot_object_protection_mode_from_image, BootObjectPolicyError,
@@ -89,6 +90,8 @@ pub use io::{
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod writeback_owner_tests;
 
 #[cfg(test)]
 mod key_kind_tests;
