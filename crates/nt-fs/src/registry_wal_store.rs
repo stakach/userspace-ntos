@@ -1,0 +1,500 @@
+//! A bounded sector WAL whose durable commit marker is separate from its prepared data.
+//!
+//! The caller owns CM publication. It may call `commit` only after the exact prepared
+//! mutation has entered CM COMMIT. Neither `prepare` nor `commit` retries uncertain I/O.
+//! The device is retained until the operation is settled; a crash may replay a marked
+//! mutation whose caller never received a reply.
+//! Live recovery still needs a separately durable high-water anchor: a wholly erased
+//! committed suffix otherwise looks like an unused zero-filled tail.
+
+use alloc::vec::Vec;
+use nt_config_store::codec::crc32c;
+
+use crate::{SnapshotBlockDevice, SnapshotBlockStoreError};
+
+const PREPARE_MAGIC: [u8; 8] = *b"USRWALP1";
+const COMMIT_MAGIC: [u8; 8] = *b"USRWALC1";
+const HEADER_BYTES: usize = 36;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegistryWalError {
+    InvalidGeometry,
+    WrongIncarnation,
+    Corrupt,
+    OutOfSpace,
+    OutOfMemory,
+    GenerationExhausted,
+    InvalidState,
+    Uncertain,
+    Storage(SnapshotBlockStoreError),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegistryWalState {
+    Ready,
+    RecoveredUncommitted,
+    PendingPrepare,
+    Prepared,
+    Uncertain,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegistryWalRecord {
+    pub serial: u64,
+    pub payload: Vec<u8>,
+}
+
+struct Pending {
+    serial: u64,
+    sectors: u64,
+    payload: Vec<u8>,
+}
+
+/// Owns one exact device lease and an unresolved append until its terminal barrier.
+#[must_use = "retain the WAL owner and device lease across uncertain writes"]
+pub struct RegistryWal<D: SnapshotBlockDevice> {
+    device: Option<D>,
+    incarnation: u64,
+    cursor: u64,
+    next_serial: u64,
+    records: Vec<RegistryWalRecord>,
+    pending: Option<Pending>,
+    recovered_tail_sectors: Option<u64>,
+    state: RegistryWalState,
+}
+
+impl<D: SnapshotBlockDevice> Drop for RegistryWal<D> {
+    fn drop(&mut self) {
+        if self.state != RegistryWalState::Ready {
+            // A missing explicit terminal result cannot release the physical lease. The
+            // leaked owner keeps the reserve closed, and the panic exposes caller misuse.
+            if let Some(device) = self.device.take() {
+                core::mem::forget(device);
+            }
+            panic!("dropping unresolved registry WAL storage effect");
+        }
+    }
+}
+
+impl<D: SnapshotBlockDevice> core::fmt::Debug for RegistryWal<D> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RegistryWal")
+            .field("incarnation", &self.incarnation)
+            .field("cursor", &self.cursor)
+            .field("next_serial", &self.next_serial)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+fn sector_buffer(size: usize) -> Result<Vec<u8>, RegistryWalError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|_| RegistryWalError::OutOfMemory)?;
+    bytes.resize(size, 0);
+    Ok(bytes)
+}
+
+fn sector_is_zero(bytes: &[u8]) -> bool {
+    bytes.iter().all(|byte| *byte == 0)
+}
+
+fn zero_suffix<D: SnapshotBlockDevice>(
+    device: &mut D,
+    start: u64,
+    sector: &mut [u8],
+) -> Result<bool, RegistryWalError> {
+    for lba in start..device.sector_count() {
+        device
+            .read_sector(lba, sector)
+            .map_err(RegistryWalError::Storage)?;
+        if !sector_is_zero(sector) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn clear_frame<D: SnapshotBlockDevice>(
+    device: &mut D,
+    start: u64,
+    payload_sectors: u64,
+) -> Result<(), RegistryWalError> {
+    let blank = sector_buffer(device.sector_size())?;
+    let marker = start + 1 + payload_sectors;
+    // Keep the valid PREPARE header while clearing its suffix. A power cut before the
+    // first barrier leaves an unmarked tail; after it, the header can be cleared safely.
+    for lba in start + 1..=marker {
+        device
+            .write_sector(lba, &blank)
+            .map_err(RegistryWalError::Storage)?;
+    }
+    device.flush().map_err(RegistryWalError::Storage)?;
+    device
+        .write_sector(start, &blank)
+        .map_err(RegistryWalError::Storage)?;
+    device.flush().map_err(RegistryWalError::Storage)
+}
+
+fn framed_sector(
+    size: usize,
+    magic: [u8; 8],
+    incarnation: u64,
+    serial: u64,
+    payload_len: u32,
+    payload_crc: u32,
+) -> Result<Vec<u8>, RegistryWalError> {
+    let mut sector = sector_buffer(size)?;
+    sector[..8].copy_from_slice(&magic);
+    sector[8..16].copy_from_slice(&incarnation.to_le_bytes());
+    sector[16..24].copy_from_slice(&serial.to_le_bytes());
+    sector[24..28].copy_from_slice(&payload_len.to_le_bytes());
+    sector[28..32].copy_from_slice(&payload_crc.to_le_bytes());
+    let header_crc = crc32c(&sector[..32]);
+    sector[32..HEADER_BYTES].copy_from_slice(&header_crc.to_le_bytes());
+    Ok(sector)
+}
+
+fn payload_sectors(len: usize, size: usize) -> Result<u64, RegistryWalError> {
+    let rounded = len
+        .checked_add(size - 1)
+        .ok_or(RegistryWalError::OutOfSpace)?;
+    u64::try_from(rounded / size).map_err(|_| RegistryWalError::OutOfSpace)
+}
+
+impl<D: SnapshotBlockDevice> RegistryWal<D> {
+    /// Recover only the contiguous, checksum-verified committed prefix. A valid prepared
+    /// record without a marker is an unacknowledged tail and may be reused after reboot.
+    pub fn recover(mut device: D, incarnation: u64) -> Result<Self, RegistryWalError> {
+        let size = device.sector_size();
+        if incarnation == 0 || size < HEADER_BYTES || device.sector_count() < 3 {
+            return Err(RegistryWalError::InvalidGeometry);
+        }
+        let mut sector = sector_buffer(size)?;
+        let mut cursor = 0u64;
+        let mut serial = 1u64;
+        let mut records = Vec::new();
+        let mut recovered_tail_sectors = None;
+        while cursor < device.sector_count() {
+            device
+                .read_sector(cursor, &mut sector)
+                .map_err(RegistryWalError::Storage)?;
+            if sector_is_zero(&sector) {
+                if !zero_suffix(&mut device, cursor, &mut sector)? {
+                    return Err(RegistryWalError::Corrupt);
+                }
+                break;
+            }
+            if sector[..8] != PREPARE_MAGIC
+                || u32::from_le_bytes(sector[32..HEADER_BYTES].try_into().unwrap())
+                    != crc32c(&sector[..32])
+                || !sector_is_zero(&sector[HEADER_BYTES..])
+            {
+                return Err(RegistryWalError::Corrupt);
+            }
+            let found_incarnation = u64::from_le_bytes(sector[8..16].try_into().unwrap());
+            if found_incarnation != incarnation {
+                return Err(RegistryWalError::WrongIncarnation);
+            }
+            let found_serial = u64::from_le_bytes(sector[16..24].try_into().unwrap());
+            if found_serial != serial {
+                return Err(RegistryWalError::Corrupt);
+            }
+            let len = u32::from_le_bytes(sector[24..28].try_into().unwrap()) as usize;
+            if len == 0 {
+                return Err(RegistryWalError::Corrupt);
+            }
+            let payload_crc = u32::from_le_bytes(sector[28..32].try_into().unwrap());
+            let payload_count = payload_sectors(len, size)?;
+            let marker_lba = cursor
+                .checked_add(1)
+                .and_then(|v| v.checked_add(payload_count))
+                .ok_or(RegistryWalError::Corrupt)?;
+            if marker_lba >= device.sector_count() {
+                return Err(RegistryWalError::Corrupt);
+            }
+            device
+                .read_sector(marker_lba, &mut sector)
+                .map_err(RegistryWalError::Storage)?;
+            if sector_is_zero(&sector) {
+                if !zero_suffix(&mut device, marker_lba, &mut sector)? {
+                    return Err(RegistryWalError::Corrupt);
+                }
+                recovered_tail_sectors = Some(payload_count);
+                break;
+            }
+            let expected = framed_sector(
+                size,
+                COMMIT_MAGIC,
+                incarnation,
+                serial,
+                len as u32,
+                payload_crc,
+            )?;
+            if sector != expected {
+                return Err(RegistryWalError::Corrupt);
+            }
+            let mut payload = Vec::new();
+            payload
+                .try_reserve_exact(len)
+                .map_err(|_| RegistryWalError::OutOfMemory)?;
+            for index in 0..payload_count {
+                device
+                    .read_sector(cursor + 1 + index, &mut sector)
+                    .map_err(RegistryWalError::Storage)?;
+                let remaining = len - payload.len();
+                let take = remaining.min(size);
+                payload.extend_from_slice(&sector[..take]);
+                if take < size && !sector_is_zero(&sector[take..]) {
+                    return Err(RegistryWalError::Corrupt);
+                }
+            }
+            if crc32c(&payload) != payload_crc {
+                return Err(RegistryWalError::Corrupt);
+            }
+            records
+                .try_reserve(1)
+                .map_err(|_| RegistryWalError::OutOfMemory)?;
+            records.push(RegistryWalRecord { serial, payload });
+            serial = serial
+                .checked_add(1)
+                .ok_or(RegistryWalError::GenerationExhausted)?;
+            cursor = marker_lba + 1;
+        }
+        Ok(Self {
+            device: Some(device),
+            incarnation,
+            cursor,
+            next_serial: serial,
+            records,
+            pending: None,
+            recovered_tail_sectors,
+            state: if recovered_tail_sectors.is_some() {
+                RegistryWalState::RecoveredUncommitted
+            } else {
+                RegistryWalState::Ready
+            },
+        })
+    }
+
+    pub fn records(&self) -> &[RegistryWalRecord] {
+        &self.records
+    }
+    pub fn state(&self) -> RegistryWalState {
+        self.state
+    }
+
+    /// Discard a verified but unmarked tail after reboot. This may write after recovery,
+    /// so its owner and lease are retained if any clearing effect is uncertain.
+    pub fn clear_recovered_tail(&mut self) -> Result<(), RegistryWalError> {
+        if self.state == RegistryWalState::Uncertain {
+            return Err(RegistryWalError::Uncertain);
+        }
+        if self.state != RegistryWalState::RecoveredUncommitted {
+            return Err(RegistryWalError::InvalidState);
+        }
+        let sectors = self.recovered_tail_sectors.expect("recovered WAL tail");
+        let result = clear_frame(
+            self.device.as_mut().expect("retained WAL device"),
+            self.cursor,
+            sectors,
+        );
+        if let Err(error) = result {
+            self.state = RegistryWalState::Uncertain;
+            return Err(error);
+        }
+        self.recovered_tail_sectors = None;
+        self.state = RegistryWalState::Ready;
+        Ok(())
+    }
+
+    /// Reserve the entire frame and its marker before the first native effect.
+    pub fn begin(&mut self, payload: Vec<u8>) -> Result<(), RegistryWalError> {
+        if self.state == RegistryWalState::Uncertain {
+            return Err(RegistryWalError::Uncertain);
+        }
+        if self.state != RegistryWalState::Ready {
+            return Err(RegistryWalError::InvalidState);
+        }
+        let device = self.device.as_ref().expect("retained WAL device");
+        let size = device.sector_size();
+        let len = u32::try_from(payload.len()).map_err(|_| RegistryWalError::OutOfSpace)?;
+        if len == 0 {
+            return Err(RegistryWalError::InvalidGeometry);
+        }
+        let count = payload_sectors(payload.len(), size)?;
+        let end = self
+            .cursor
+            .checked_add(count)
+            .and_then(|v| v.checked_add(2))
+            .ok_or(RegistryWalError::OutOfSpace)?;
+        if end > device.sector_count() {
+            return Err(RegistryWalError::OutOfSpace);
+        }
+        self.next_serial
+            .checked_add(1)
+            .ok_or(RegistryWalError::GenerationExhausted)?;
+        self.records
+            .try_reserve(1)
+            .map_err(|_| RegistryWalError::OutOfMemory)?;
+        self.pending = Some(Pending {
+            serial: self.next_serial,
+            sectors: count,
+            payload,
+        });
+        self.state = RegistryWalState::PendingPrepare;
+        Ok(())
+    }
+
+    /// Write PREPARE plus payload, then issue the first device durability barrier.
+    pub fn prepare(&mut self) -> Result<(), RegistryWalError> {
+        if self.state == RegistryWalState::Uncertain {
+            return Err(RegistryWalError::Uncertain);
+        }
+        if self.state != RegistryWalState::PendingPrepare {
+            return Err(RegistryWalError::InvalidState);
+        }
+        let pending = self.pending.as_ref().unwrap();
+        let size = self
+            .device
+            .as_ref()
+            .expect("retained WAL device")
+            .sector_size();
+        let result = (|| {
+            let header = framed_sector(
+                size,
+                PREPARE_MAGIC,
+                self.incarnation,
+                pending.serial,
+                pending.payload.len() as u32,
+                crc32c(&pending.payload),
+            )?;
+            self.device
+                .as_mut()
+                .expect("retained WAL device")
+                .write_sector(self.cursor, &header)
+                .map_err(RegistryWalError::Storage)?;
+            let mut sector = sector_buffer(size)?;
+            for (index, chunk) in pending.payload.chunks(size).enumerate() {
+                sector.fill(0);
+                sector[..chunk.len()].copy_from_slice(chunk);
+                self.device
+                    .as_mut()
+                    .expect("retained WAL device")
+                    .write_sector(self.cursor + 1 + index as u64, &sector)
+                    .map_err(RegistryWalError::Storage)?;
+            }
+            self.device
+                .as_mut()
+                .expect("retained WAL device")
+                .flush()
+                .map_err(RegistryWalError::Storage)
+        })();
+        self.state = if result.is_ok() {
+            RegistryWalState::Prepared
+        } else {
+            RegistryWalState::Uncertain
+        };
+        result
+    }
+
+    /// Call only after CM has entered COMMIT for the exact prepared journal. The marker's
+    /// barrier is the proof required before CM ACK or any caller success reply.
+    pub fn commit(&mut self) -> Result<(), RegistryWalError> {
+        if self.state == RegistryWalState::Uncertain {
+            return Err(RegistryWalError::Uncertain);
+        }
+        if self.state != RegistryWalState::Prepared {
+            return Err(RegistryWalError::InvalidState);
+        }
+        let pending = self.pending.as_ref().unwrap();
+        let size = self
+            .device
+            .as_ref()
+            .expect("retained WAL device")
+            .sector_size();
+        let marker_lba = self.cursor + 1 + pending.sectors;
+        let result = (|| {
+            let marker = framed_sector(
+                size,
+                COMMIT_MAGIC,
+                self.incarnation,
+                pending.serial,
+                pending.payload.len() as u32,
+                crc32c(&pending.payload),
+            )?;
+            self.device
+                .as_mut()
+                .expect("retained WAL device")
+                .write_sector(marker_lba, &marker)
+                .map_err(RegistryWalError::Storage)?;
+            self.device
+                .as_mut()
+                .expect("retained WAL device")
+                .flush()
+                .map_err(RegistryWalError::Storage)
+        })();
+        if let Err(error) = result {
+            self.state = RegistryWalState::Uncertain;
+            return Err(error);
+        }
+        let pending = self.pending.take().unwrap();
+        self.records.push(RegistryWalRecord {
+            serial: pending.serial,
+            payload: pending.payload,
+        });
+        self.next_serial += 1;
+        self.cursor = marker_lba + 1;
+        self.state = RegistryWalState::Ready;
+        Ok(())
+    }
+
+    /// Call only after CM confirms that the matching preparation was aborted before COMMIT.
+    /// A failed clearing barrier retains the exact pending record and blocks reuse.
+    pub fn abort_prepared(&mut self) -> Result<(), RegistryWalError> {
+        if self.state == RegistryWalState::Uncertain {
+            return Err(RegistryWalError::Uncertain);
+        }
+        if self.state != RegistryWalState::Prepared {
+            return Err(RegistryWalError::InvalidState);
+        }
+        let sectors = self.pending.as_ref().unwrap().sectors;
+        let result = clear_frame(
+            self.device.as_mut().expect("retained WAL device"),
+            self.cursor,
+            sectors,
+        );
+        if let Err(error) = result {
+            self.state = RegistryWalState::Uncertain;
+            return Err(error);
+        }
+        self.pending = None;
+        self.state = RegistryWalState::Ready;
+        Ok(())
+    }
+
+    /// The lease can leave only after all owned writes have a terminal durable result.
+    pub fn into_device(mut self) -> Result<D, Self> {
+        if self.state == RegistryWalState::Ready {
+            Ok(self.device.take().expect("retained WAL device"))
+        } else {
+            Err(self)
+        }
+    }
+
+    #[cfg(test)]
+    fn device_mut_for_test(&mut self) -> &mut D {
+        self.device.as_mut().expect("retained WAL device")
+    }
+
+    #[cfg(test)]
+    fn into_device_for_test(mut self) -> D {
+        self.state = RegistryWalState::Ready;
+        self.device.take().expect("retained WAL device")
+    }
+}
+
+#[cfg(test)]
+#[path = "registry_wal_store/tests.rs"]
+mod tests;

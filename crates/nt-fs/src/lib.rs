@@ -32,6 +32,7 @@ mod query;
 mod snapshot_store;
 mod snapshot_reserve;
 mod snapshot_region;
+mod registry_wal_store;
 #[cfg(test)]
 mod snapshot_test_device;
 mod status;
@@ -80,6 +81,7 @@ pub use snapshot_store::{
 };
 pub use snapshot_reserve::{SnapshotReserve, SnapshotReserveLease};
 pub use snapshot_region::BoundedBlockRange;
+pub use registry_wal_store::{RegistryWal, RegistryWalError, RegistryWalRecord, RegistryWalState};
 pub use status::*;
 pub use volume::*;
 
