@@ -221,6 +221,9 @@ Successful win32k client switches remain counted, with per-switch text available
 in executive builds using the `debug-trace` feature.
 Filesystem snapshots use the shared CRC32C codec and bounded whole-sector staging;
 coalescing encoder fragments preserves the existing durability barriers.
+New images reserve 16 MiB for the existing snapshot slots and 16 MiB for a future
+registry append log. Set `PERSIST_IMAGE_MIB=16` to build a legacy snapshot-only
+image; the append area is not yet used for registry writes.
 
 ### Desktop Acceptance
 
