@@ -130,6 +130,27 @@ impl Caller {
 
 type HostedContext<'a> = Option<(&'a mut ExecNtHandler, &'a mut nt_delay_execution::Queue)>;
 
+/// Storage admission for the current CM COMMIT protocol. A journal-bearing mutation must
+/// retain its exact snapshot owner and pass its barrier before entering COMMIT. Lazy hive
+/// writeback needs a separate CM publication/replay contract before it can replace this path.
+enum SystemMutationStorage {
+    NoJournal,
+    PrecommitJournal(Vec<u8>),
+}
+
+fn system_mutation_storage(
+    prepared: &PreparedSystemHiveMutation,
+) -> Result<SystemMutationStorage, u32> {
+    let journal = prepared.durable_journal();
+    if journal.is_empty() {
+        return Ok(SystemMutationStorage::NoJournal);
+    }
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(journal.len()).map_err(|_| 0xC000_009Au32)?;
+    bytes.extend_from_slice(journal);
+    Ok(SystemMutationStorage::PrecommitJournal(bytes))
+}
+
 enum Phase {
     ProviderAdmit,
     Begin(CmMutationBeginAttempt<()>),
@@ -627,16 +648,13 @@ unsafe fn advance(
                 work.phase = Phase::Abort;
                 return Ok(false);
             }
-            if prepared.durable_journal().is_empty() {
-                work.phase = Phase::Commit;
-            } else {
-                let mut bytes = Vec::new();
-                bytes.try_reserve_exact(prepared.durable_journal().len())
-                    .map_err(|_| 0xC000_009Au32 as i32)?;
-                bytes.extend_from_slice(prepared.durable_journal());
-                match writable_fs::registry_journal::Journal::admit(bytes, ()) {
-                    Ok(journal) => { work.journal = Some(journal); work.phase = Phase::Durable; }
-                    Err((status, _, ())) => return Err(status as i32),
+            match system_mutation_storage(prepared).map_err(|status| status as i32)? {
+                SystemMutationStorage::NoJournal => work.phase = Phase::Commit,
+                SystemMutationStorage::PrecommitJournal(bytes) => {
+                    match writable_fs::registry_journal::Journal::admit(bytes, ()) {
+                        Ok(journal) => { work.journal = Some(journal); work.phase = Phase::Durable; }
+                        Err((status, _, ())) => return Err(status as i32),
+                    }
                 }
             }
         }
