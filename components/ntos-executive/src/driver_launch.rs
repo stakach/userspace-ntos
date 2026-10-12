@@ -35907,6 +35907,26 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let post_call_irp_information = read_unaligned((irp + 0x38) as *const u64);
     let post_call_owner_kind =
         hosted_irp_state_kind(pending_irp_owner_state(owner_node).load(Ordering::Acquire));
+    static PNP_BARE_RETURN_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+    if major == IRP_MJ_PNP
+        && post_call_owner_kind == HOSTED_IRP_DISPATCHING
+        && ret as u32 != STATUS_PENDING
+        && PNP_BARE_RETURN_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16
+    {
+        print_str(b"[fsd-pnp-return-without-completion] irp/minor/handler/ret/iosb/info=");
+        print_hex(irp as u32);
+        print_str(b"/");
+        print_u64(minor);
+        print_str(b"/");
+        print_hex(handler as u32);
+        print_str(b"/");
+        print_hex(ret as u32);
+        print_str(b"/");
+        print_hex(post_call_irp_status);
+        print_str(b"/");
+        print_u64(post_call_irp_information);
+        print_str(b"\n");
+    }
     write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_IRP) as *mut u64, 0);
     write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_IOSL) as *mut u64, 0);
     write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DATA) as *mut u64, 0);
@@ -43211,11 +43231,6 @@ unsafe fn drain_hosted_filter_requirements_transactions() -> usize {
                     transaction.filtered = Some(copied);
                     transaction.phase =
                         HostedFilterRequirementsPhase::AwaitingCommit { pending_completion };
-                } else if status == nt_status::NtStatus::NOT_SUPPORTED {
-                    let transaction = &mut hosted_filter_requirements_transactions_mut()[index];
-                    transaction.filtered = Some(core::mem::take(&mut transaction.original));
-                    transaction.phase =
-                        HostedFilterRequirementsPhase::AwaitingCommit { pending_completion };
                 } else {
                     set_hosted_filter_requirements_disposition(
                         irp_id,
@@ -47946,6 +47961,97 @@ pub(crate) unsafe fn hosted_pnp_relation_progress(
 }
 
 pub(crate) unsafe fn print_hosted_pnp_enumeration_evidence() {
+    let relation_queue = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_INVALIDATIONS))
+        .as_ref()
+        .map(|queue| queue.len())
+        .unwrap_or(0);
+    let lifecycle_active = (*core::ptr::addr_of!(HOSTED_PNP_TRANSACTIONS))
+        .as_ref()
+        .map(|transactions| {
+            transactions
+                .iter()
+                .filter(|transaction| transaction.phase != HostedPnpTransactionPhase::Terminal)
+                .count()
+        })
+        .unwrap_or(0);
+    let filter_active = (*core::ptr::addr_of!(HOSTED_FILTER_REQUIREMENTS_TRANSACTIONS))
+        .as_ref()
+        .map(|transactions| transactions.len())
+        .unwrap_or(0);
+    let transfers = (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS))
+        .as_ref()
+        .map(|transfers| transfers.len())
+        .unwrap_or(0);
+    let route_fences = (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_INDETERMINATE_IRPS))
+        .as_ref()
+        .map(|records| records.len())
+        .unwrap_or(0);
+    print_str(b"[pnp-relation-gates] queued/lifecycle/filter/transfers/route-query/fences=");
+    print_u64(relation_queue as u64);
+    print_str(b"/");
+    print_u64(lifecycle_active as u64);
+    print_str(b"/");
+    print_u64(filter_active as u64);
+    print_str(b"/");
+    print_u64(transfers as u64);
+    print_str(b"/");
+    print_u64((*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_QUERY)).is_some() as u64);
+    print_str(b"/");
+    print_u64(route_fences as u64);
+    print_str(b"\n");
+    if let Some(transaction) = (*core::ptr::addr_of!(HOSTED_PNP_TRANSACTIONS))
+        .as_ref()
+        .and_then(|transactions| {
+            transactions
+                .iter()
+                .find(|transaction| transaction.phase != HostedPnpTransactionPhase::Terminal)
+        })
+    {
+        print_str(b"[pnp-relation-gate-owner] irp/phase=");
+        print_u64(transaction.irp_id.raw());
+        print_str(b"/");
+        print_str(match transaction.phase {
+            HostedPnpTransactionPhase::Prepared => b"prepared",
+            HostedPnpTransactionPhase::Dispatching => b"dispatching",
+            HostedPnpTransactionPhase::DetachedDispatchInFlight => b"detached-dispatch",
+            HostedPnpTransactionPhase::AwaitingCompletion => b"awaiting-completion",
+            HostedPnpTransactionPhase::DetachedAckInFlight => b"detached-ack",
+            HostedPnpTransactionPhase::DetachedAckRetry => b"detached-ack-retry",
+            HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck => b"lifecycle-ack",
+            HostedPnpTransactionPhase::PostPublicationRepair => b"publication-repair",
+            HostedPnpTransactionPhase::Indeterminate => b"indeterminate",
+            HostedPnpTransactionPhase::Terminal => unreachable!(),
+        });
+        print_str(b"\n");
+    }
+    if let Some(transaction) = (*core::ptr::addr_of!(HOSTED_FILTER_REQUIREMENTS_TRANSACTIONS))
+        .as_ref()
+        .and_then(|transactions| transactions.first())
+    {
+        print_str(b"[pnp-filter-gate-owner] irp/device/phase/status=");
+        print_u64(transaction.irp_id.raw());
+        print_str(b"/");
+        print_u64(transaction.binding.device_id);
+        print_str(b"/");
+        print_str(match transaction.phase {
+            HostedFilterRequirementsPhase::AwaitingCompletion => b"awaiting-completion",
+            HostedFilterRequirementsPhase::AwaitingCopy { .. } => b"awaiting-copy",
+            HostedFilterRequirementsPhase::AwaitingCommit { .. } => b"awaiting-commit",
+            HostedFilterRequirementsPhase::AwaitingAck { .. } => b"awaiting-ack",
+            HostedFilterRequirementsPhase::Ready => b"ready",
+            HostedFilterRequirementsPhase::Barrier => b"barrier",
+            HostedFilterRequirementsPhase::Indeterminate => b"indeterminate",
+        });
+        print_str(b"/");
+        print_hex(
+            transaction
+                .barrier_status
+                .or(transaction.driver_status)
+                .unwrap_or(nt_status::NtStatus::SUCCESS)
+                .raw() as u32,
+        );
+        print_str(b"\n");
+    }
     let Some(query) = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).as_ref() else {
         print_str(b"[pnp-enumeration] relation=none\n");
         return;
@@ -48463,20 +48569,24 @@ unsafe fn retain_hosted_filter_requirements_return(
         .find(|transaction| transaction.irp_id == irp_id)
         .expect("hosted filter-requirements transaction disappeared");
     transaction.driver_status = Some(status);
-    if information != 0 {
-        transaction.phase = HostedFilterRequirementsPhase::AwaitingCopy {
-            information,
-            pending_completion,
-        };
-    } else if status.is_success() || status == nt_status::NtStatus::NOT_SUPPORTED {
-        transaction.filtered = Some(core::mem::take(&mut transaction.original));
-        transaction.phase = HostedFilterRequirementsPhase::AwaitingCommit { pending_completion };
-    } else {
-        set_hosted_filter_requirements_disposition(
-            irp_id,
-            pending_completion,
-            HostedFilterRequirementsDisposition::Barrier(status),
-        );
+    match nt_pnp_manager::filter_requirements_return_action(status, information) {
+        nt_pnp_manager::FilterRequirementsReturnAction::CopyProviderOutput { information } => {
+            transaction.phase = HostedFilterRequirementsPhase::AwaitingCopy {
+                information,
+                pending_completion,
+            };
+        }
+        nt_pnp_manager::FilterRequirementsReturnAction::UseOriginal => {
+            transaction.filtered = Some(core::mem::take(&mut transaction.original));
+            transaction.phase = HostedFilterRequirementsPhase::AwaitingCommit { pending_completion };
+        }
+        nt_pnp_manager::FilterRequirementsReturnAction::Barrier(status) => {
+            set_hosted_filter_requirements_disposition(
+                irp_id,
+                pending_completion,
+                HostedFilterRequirementsDisposition::Barrier(status),
+            );
+        }
     }
 }
 
