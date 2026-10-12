@@ -376,6 +376,29 @@ fn detached_pnp_completion_refuses_output_and_pointer_results_before_reservation
 }
 
 #[test]
+fn detached_pnp_completion_refuses_nonzero_information_before_ack_reservation() {
+    for parameters in [
+        PnpParameters::start(32, 32).unwrap(),
+        PnpParameters::lifecycle(nt_pnp_abi::IRP_MN_STOP_DEVICE).unwrap(),
+    ] {
+        let mut io = io();
+        let payload = alloc::vec![0x63; parameters.payload_len() as usize];
+        let (retained, release) = pending_for(&mut io, parameters, payload.clone());
+        let id = retained.irp_id();
+        release.set(true);
+        assert_eq!(io.pump(), 1);
+        io.irp_mut(id).unwrap().information = 0x1000;
+        let completion = io.completed_irp(id).unwrap();
+
+        let refusal = io.prepare_external_pnp_completion(retained).unwrap_err();
+        assert_eq!(refusal.status(), NtStatus::NOT_SUPPORTED);
+        assert_eq!(refusal.owner().payload(), payload);
+        assert_eq!(io.completed_irp(id), Some(completion));
+        assert!(io.irp_mut(id).is_some(), "refusal must not reserve ACK ownership");
+    }
+}
+
+#[test]
 fn detached_pnp_completion_rechecks_canonical_result_shape_before_reservation() {
     let mut io = io();
     let (retained, release) = pending(&mut io);
@@ -390,4 +413,23 @@ fn detached_pnp_completion_rechecks_canonical_result_shape_before_reservation() 
     assert_eq!(refusal.status(), NtStatus::NOT_SUPPORTED);
     assert!(io.irp_mut(id).is_some(), "refusal must not reserve ACK ownership");
     assert_eq!(refusal.owner().payload(), &[0x63; 64]);
+}
+
+#[test]
+fn detached_pnp_completion_refuses_a_different_status_only_minor() {
+    let mut io = io();
+    let (retained, release) = pending(&mut io);
+    let id = retained.irp_id();
+    release.set(true);
+    assert_eq!(io.pump(), 1);
+    let replacement = PnpParameters::lifecycle(nt_pnp_abi::IRP_MN_STOP_DEVICE).unwrap();
+    let irp = io.irp_mut(id).unwrap();
+    let stack = &mut irp.stack[irp.current_location as usize];
+    stack.minor = replacement.minor;
+    stack.parameters = IoParameters::Pnp(replacement);
+
+    let refusal = io.prepare_external_pnp_completion(retained).unwrap_err();
+    assert_eq!(refusal.status(), NtStatus::NOT_SUPPORTED);
+    assert_eq!(refusal.owner().payload(), &[0x63; 64]);
+    assert!(io.irp_mut(id).is_some(), "refusal must not reserve ACK ownership");
 }

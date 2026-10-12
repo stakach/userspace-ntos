@@ -123,10 +123,17 @@ impl<P: ObjectManagerPort> IoManager<P> {
             }
             let id = retained.irp_id();
             let completion = self.completed_irp_snapshot(id).ok_or(NtStatus::PENDING)?;
+            // This owner only carries a status result. A nonzero Information value could be a
+            // provider-owned output pointer and must be adopted by a different contract.
+            if completion.information != 0 {
+                return Err(NtStatus::NOT_SUPPORTED);
+            }
             let irp = self.irp(id).ok_or(NtStatus::INVALID_PARAMETER)?;
             if !irp.current_stack().is_some_and(|stack| {
                 matches!(&stack.parameters, IoParameters::Pnp(parameters)
-                    if stack.minor == parameters.minor && parameters.has_status_only_result())
+                    if stack.minor == parameters.minor
+                        && stack.minor == retained.owner.invocation.snapshot.minor
+                        && parameters.has_status_only_result())
             }) {
                 return Err(NtStatus::NOT_SUPPORTED);
             }
