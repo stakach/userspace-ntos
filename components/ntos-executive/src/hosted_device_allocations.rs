@@ -410,30 +410,75 @@ pub(super) struct LocalRetirement {
     _guard: Guard,
 }
 
+/// Read-only validation while the exact physical catalog and allocator are both excluded.
+/// The caller must perform no native effect until checked admission returns successfully.
+pub(super) struct RetirementPreflight {
+    domain: HostedDomainIdentity,
+}
+
+impl RetirementPreflight {
+    pub(super) unsafe fn related_allocation_exec(
+        &self,
+        address: u64,
+    ) -> Result<u64, nt_status::NtStatus> {
+        let row = rows()
+            .iter()
+            .find(|row| {
+                row.domain == self.domain && row.allocation.component_address == address
+            })
+            .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+        if row.allocation.capacity < WDM_X64_DEVICE_OBJECT_SIZE as u64
+            || allocation(row.instance, address)? != row.allocation
+        {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        row.instance
+            .exec_pool_va
+            .checked_add(address - FSD_POOL_VADDR)
+            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)
+    }
+}
+
 pub(super) unsafe fn admit_retirement(
     inst: DriverInstance,
     address: u64,
     registration: Option<HostedDevicePointerRegistration>,
 ) -> Result<LocalRetirement, nt_status::NtStatus> {
+    admit_retirement_checked(inst, address, registration, |_| Ok(())).map(|(receipt, ())| receipt)
+}
+
+/// Structural refusals are known to have no native effect and leave the exact owner available.
+/// Once this returns, callers must retain the pending row through every uncertain native effect.
+pub(super) unsafe fn admit_retirement_checked<T>(
+    inst: DriverInstance,
+    address: u64,
+    registration: Option<HostedDevicePointerRegistration>,
+    check: impl FnOnce(&RetirementPreflight) -> Result<T, nt_status::NtStatus>,
+) -> Result<(LocalRetirement, T), nt_status::NtStatus> {
     let guard = lock();
     let domain = validate_arena(inst)?;
     let pool =
         hosted_instance_pool_lock(inst.exec_pool_va).ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
     let current = allocation(inst, address)?;
-    let row = rows()
-        .iter_mut()
-        .find(|row| same_arena(row.instance, inst) && row.allocation.component_address == address)
+    let index = rows()
+        .iter()
+        .position(|row| same_arena(row.instance, inst) && row.allocation.component_address == address)
         .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if rows()[index].retirement_pending {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    let checked = check(&RetirementPreflight { domain })?;
+    let row = &mut rows()[index];
     ledger().begin_retirement(&row.owner, domain, current, registration)?;
     row.retirement_pending = true;
-    Ok(LocalRetirement {
+    Ok((LocalRetirement {
         receipt: Retirement {
             domain,
             allocation: current,
         },
         _pool: pool,
         _guard: guard,
-    })
+    }, checked))
 }
 
 /// Called only by the exact native free owner after an acknowledged physical free.
@@ -449,29 +494,6 @@ fn acknowledge(receipt: &Retirement) -> Result<(), nt_status::NtStatus> {
     ledger().acknowledge_free(&mut rows()[index].owner)?;
     rows().swap_remove(index);
     Ok(())
-}
-
-impl LocalRetirement {
-    pub(super) unsafe fn related_allocation_exec(
-        &self,
-        address: u64,
-    ) -> Result<u64, nt_status::NtStatus> {
-        let row = rows()
-            .iter()
-            .find(|row| {
-                row.domain == self.receipt.domain && row.allocation.component_address == address
-            })
-            .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
-        if row.allocation.capacity < WDM_X64_DEVICE_OBJECT_SIZE as u64
-            || allocation(row.instance, address)? != row.allocation
-        {
-            return Err(nt_status::NtStatus::INVALID_PARAMETER);
-        }
-        row.instance
-            .exec_pool_va
-            .checked_add(address - FSD_POOL_VADDR)
-            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)
-    }
 }
 
 pub(super) unsafe fn capture_allocation(

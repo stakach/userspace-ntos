@@ -56,7 +56,7 @@ fn generic_pool_free_checks_independent_projection_owner_before_unregistered_fre
 fn physical_device_retirement_checks_captured_owner_before_mutating_or_freeing() {
     let file = syn::parse_file(RETIREMENT).unwrap();
     let found = calls(function(&file, "retire_hosted_device_projection"));
-    let admitted = position(&found, "admit_retirement");
+    let admitted = position(&found, "admit_retirement_checked");
     assert!(admitted < position(&found, "write_unaligned"));
     assert!(admitted < position(&found, "hosted_instance_pool_free_unlocked"));
     assert!(

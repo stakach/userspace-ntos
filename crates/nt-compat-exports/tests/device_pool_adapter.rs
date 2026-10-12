@@ -65,7 +65,7 @@ impl Drop for ManagerScope {
 
 mod hosted_device_allocations {
     pub(super) use super::native::{protect_allocation, protects_allocation,
-        registration, admit_retirement, finish_retirement};
+        registration, admit_retirement, admit_retirement_checked, finish_retirement};
 
     pub(super) fn publish_registration(
         inst: super::DriverInstance,
@@ -354,6 +354,27 @@ fn actual_adapter_protects_exact_allocations_and_retains_uncertain_retirement() 
     let _manager_scope = ManagerScope;
     unsafe { publication_failure_preserves_canonical_owner(driver); }
     unsafe { late_rebind_refuses_actual_physical_retirement(driver); }
+    unsafe { malformed_device_preflight_does_not_enter_retirement(); }
+}
+
+unsafe fn malformed_device_preflight_does_not_enter_retirement() {
+    let domain = io_manager_mut().register_hosted_domain();
+    let pool = Pool::new(domain, 53, 0x8000);
+    native::protect_allocation(pool.inst, ADDRESS).unwrap();
+    let device_exec = pool.inst.exec_pool_va + PAYLOAD;
+    write_unaligned(device_exec as *mut i16, WDM_X64_IO_TYPE_DEVICE);
+    write_unaligned((device_exec + 2) as *mut u16, 0);
+    let before = pool._bytes.to_vec();
+    assert_eq!(retirement::retire_hosted_device_projection(pool.inst, ADDRESS,
+        retirement::CanonicalRetirement::ConfirmedUnbound { domain }, None),
+        Err(nt_status::NtStatus::INVALID_PARAMETER));
+    assert_eq!(&*pool._bytes, before.as_slice(), "rejected preflight has no native effect");
+    assert!(native::protects_allocation(pool.inst, ADDRESS));
+    write_unaligned((device_exec + 2) as *mut u16, WDM_X64_DEVICE_OBJECT_SIZE as u16);
+    retirement::retire_hosted_device_projection(pool.inst, ADDRESS,
+        retirement::CanonicalRetirement::ConfirmedUnbound { domain }, None)
+        .expect("no-effect preflight refusal preserves exact retirement authority");
+    assert!(native::instance_quiesced(pool.inst));
 }
 
 unsafe fn late_rebind_refuses_actual_physical_retirement(driver: nt_io_manager::DriverId) {

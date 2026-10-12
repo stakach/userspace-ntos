@@ -45,64 +45,73 @@ pub(super) unsafe fn retire_hosted_device_projection(
     if physical_registration.is_some() && physical_registration != registration {
         return Err(nt_status::NtStatus::INVALID_HANDLE);
     }
-    let retirement = hosted_device_allocations::admit_retirement(inst, device_object, physical_registration)?;
-    let (device_exec, capacity) =
-        hosted_pool_allocation_exec_range(inst.exec_pool_va, device_object)
-            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    let projected_size = read_unaligned((device_exec + 2) as *const u16) as u64;
-    if capacity < WDM_X64_DEVICE_OBJECT_SIZE as u64
-        || hosted_instance_pool_allocation_is_free_unlocked(inst, device_object) != Some(false)
-        || read_unaligned(device_exec as *const i16) != WDM_X64_IO_TYPE_DEVICE
-        || projected_size < WDM_X64_DEVICE_OBJECT_SIZE as u64
-        || projected_size > capacity
-    {
-        return Err(nt_status::NtStatus::INVALID_PARAMETER);
-    }
-    let rollback_pdo_exec = match rollback_pdo {
-        Some(pdo) => Some(retirement.related_allocation_exec(pdo)?),
-        None => None,
-    };
-    let driver_object = read_unaligned((device_exec + 0x08) as *const u64);
-    let next_device = read_unaligned((device_exec + 0x10) as *const u64);
-    if driver_object != 0 {
-        let (driver_exec, driver_capacity) =
-            hosted_pool_allocation_exec_range(inst.exec_pool_va, driver_object)
-                .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-        if driver_capacity < WDM_X64_DRIVER_OBJECT_SIZE as u64
-            || hosted_instance_pool_allocation_is_free_unlocked(inst, driver_object) != Some(false)
-            || read_unaligned(driver_exec as *const i16) != WDM_X64_IO_TYPE_DRIVER
-        {
-            return Err(nt_status::NtStatus::INVALID_PARAMETER);
-        }
-        let mut link_exec = driver_exec + 0x08;
-        let mut current = read_unaligned(link_exec as *const u64);
-        let mut traversed = 0u64;
-        let mut target_link = None;
-        while current != 0 {
-            if traversed >= POOL_FREE_LIST_MAX {
-                return Err(nt_status::NtStatus::INVALID_PARAMETER);
-            }
-            let (current_exec, current_capacity) =
-                hosted_pool_allocation_exec_range(inst.exec_pool_va, current)
-                    .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-            if current_capacity < WDM_X64_DEVICE_OBJECT_SIZE as u64
-                || hosted_instance_pool_allocation_is_free_unlocked(inst, current) != Some(false)
-                || read_unaligned(current_exec as *const i16) != WDM_X64_IO_TYPE_DEVICE
-                || read_unaligned((current_exec + 0x08) as *const u64) != driver_object
-            {
-                return Err(nt_status::NtStatus::INVALID_PARAMETER);
-            }
-            if current == device_object {
-                if target_link.is_some() {
+    let (retirement, (device_exec, next_device, target_link, rollback_pdo_exec)) =
+        hosted_device_allocations::admit_retirement_checked(
+            inst, device_object, physical_registration, |preflight| {
+                let (device_exec, capacity) =
+                    hosted_pool_allocation_exec_range(inst.exec_pool_va, device_object)
+                        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+                let projected_size = read_unaligned((device_exec + 2) as *const u16) as u64;
+                if capacity < WDM_X64_DEVICE_OBJECT_SIZE as u64
+                    || hosted_instance_pool_allocation_is_free_unlocked(inst, device_object) != Some(false)
+                    || read_unaligned(device_exec as *const i16) != WDM_X64_IO_TYPE_DEVICE
+                    || projected_size < WDM_X64_DEVICE_OBJECT_SIZE as u64
+                    || projected_size > capacity
+                {
                     return Err(nt_status::NtStatus::INVALID_PARAMETER);
                 }
-                target_link = Some(link_exec);
-            }
-            link_exec = current_exec + 0x10;
-            current = read_unaligned(link_exec as *const u64);
-            traversed += 1;
-        }
-        let target_link = target_link.ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+                let rollback_pdo_exec = match rollback_pdo {
+                    Some(pdo) => Some(preflight.related_allocation_exec(pdo)?),
+                    None => None,
+                };
+                let driver_object = read_unaligned((device_exec + 0x08) as *const u64);
+                let next_device = read_unaligned((device_exec + 0x10) as *const u64);
+                let mut target_link = None;
+                if driver_object != 0 {
+                    let (driver_exec, driver_capacity) =
+                        hosted_pool_allocation_exec_range(inst.exec_pool_va, driver_object)
+                            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+                    if driver_capacity < WDM_X64_DRIVER_OBJECT_SIZE as u64
+                        || hosted_instance_pool_allocation_is_free_unlocked(inst, driver_object) != Some(false)
+                        || read_unaligned(driver_exec as *const i16) != WDM_X64_IO_TYPE_DRIVER
+                    {
+                        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+                    }
+                    let mut link_exec = driver_exec + 0x08;
+                    let mut current = read_unaligned(link_exec as *const u64);
+                    let mut traversed = 0u64;
+                    while current != 0 {
+                        if traversed >= POOL_FREE_LIST_MAX {
+                            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+                        }
+                        let (current_exec, current_capacity) =
+                            hosted_pool_allocation_exec_range(inst.exec_pool_va, current)
+                                .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+                        if current_capacity < WDM_X64_DEVICE_OBJECT_SIZE as u64
+                            || hosted_instance_pool_allocation_is_free_unlocked(inst, current) != Some(false)
+                            || read_unaligned(current_exec as *const i16) != WDM_X64_IO_TYPE_DEVICE
+                            || read_unaligned((current_exec + 0x08) as *const u64) != driver_object
+                        {
+                            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+                        }
+                        if current == device_object {
+                            if target_link.is_some() {
+                                return Err(nt_status::NtStatus::INVALID_PARAMETER);
+                            }
+                            target_link = Some(link_exec);
+                        }
+                        link_exec = current_exec + 0x10;
+                        current = read_unaligned(link_exec as *const u64);
+                        traversed += 1;
+                    }
+                    if target_link.is_none() {
+                        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+                    }
+                }
+                Ok((device_exec, next_device, target_link, rollback_pdo_exec))
+            },
+        )?;
+    if let Some(target_link) = target_link {
         write_unaligned(target_link as *mut u64, next_device);
     }
     if let Some(pdo_exec) = rollback_pdo_exec {
