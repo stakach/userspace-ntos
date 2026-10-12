@@ -17,7 +17,7 @@ use crate::fat_directory::FileShortName;
 use crate::path::{normalize_separators, MountManager, MEMFS_VOLUME};
 use crate::snapshot_store::{
     SnapshotBlockDevice, SnapshotBlockStore, SnapshotBlockStoreError, SnapshotPayloadReader,
-    SnapshotPayloadSink,
+    SnapshotPayloadSink, WalSnapshotManifest,
 };
 use crate::status::*;
 
@@ -1148,6 +1148,7 @@ impl MemFs {
         &self,
         store: &SnapshotBlockStore,
         dev: &mut D,
+        wal: Option<WalSnapshotManifest>,
     ) -> Result<(u64, usize), SnapshotBlockStoreError> {
         let mut payload_crc_sink = SnapshotCrcSink::new();
         let record_count = self.write_snapshot_payload_to_sink(&mut payload_crc_sink)?;
@@ -1164,15 +1165,24 @@ impl MemFs {
 
         let store_payload_crc = crc32c_combine(crc32c(&header), payload_crc, payload_len_u64);
 
-        let generation =
-            store.commit_next_streaming(dev, total_len, store_payload_crc, |writer| {
-                writer.write_all(&header)?;
-                let written_records = self.write_snapshot_payload_to_sink(writer)?;
-                if written_records != record_count {
-                    return Err(SnapshotBlockStoreError::Corrupt);
-                }
-                Ok(())
-            })?;
+        let write_payload = |writer: &mut crate::snapshot_store::PayloadSectorWriter<'_, D>| {
+            writer.write_all(&header)?;
+            let written_records = self.write_snapshot_payload_to_sink(writer)?;
+            if written_records != record_count {
+                return Err(SnapshotBlockStoreError::Corrupt);
+            }
+            Ok(())
+        };
+        let generation = match wal {
+            Some(manifest) => store.commit_next_streaming_with_wal_manifest(
+                dev,
+                total_len,
+                store_payload_crc,
+                manifest,
+                write_payload,
+            )?,
+            None => store.commit_next_streaming(dev, total_len, store_payload_crc, write_payload)?,
+        };
         Ok((generation, total_len))
     }
 
@@ -3947,7 +3957,19 @@ impl FileSystem {
         store: &SnapshotBlockStore,
         dev: &mut D,
     ) -> Result<(u64, usize), SnapshotBlockStoreError> {
-        self.volume.commit_snapshot_to_store(store, dev)
+        self.volume.commit_snapshot_to_store(store, dev, None)
+    }
+
+    /// Commit the same streaming volume image with an explicit WAL manifest. Every
+    /// mounted-volume checkpoint can use this contract once native WAL recovery and
+    /// mutation ordering are active; the caller must supply the exact folded serial.
+    pub fn commit_volume_snapshot_with_wal_manifest<D: SnapshotBlockDevice>(
+        &self,
+        store: &SnapshotBlockStore,
+        dev: &mut D,
+        manifest: WalSnapshotManifest,
+    ) -> Result<(u64, usize), SnapshotBlockStoreError> {
+        self.volume.commit_snapshot_to_store(store, dev, Some(manifest))
     }
 
     /// Restore the durable volume tree from a block-backed snapshot store without allocating the

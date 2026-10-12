@@ -32,6 +32,87 @@ fn one_committed_wal() -> RegistryWal<CachedDisk> {
 }
 
 #[test]
+fn boot_system_log_replays_only_suffix_after_selected_snapshot_base() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::new();
+    let manifest = WalSnapshotManifest {
+        incarnation: 77,
+        base_serial: 1,
+        high_water_serial: 2,
+        high_water_end_lba: 6,
+    };
+    store
+        .commit_next_with_wal_manifest(&mut disk, b"older", manifest)
+        .unwrap();
+    store
+        .commit_next_with_wal_manifest(&mut disk, b"newer", manifest)
+        .unwrap();
+    let selected = store.read_latest_wal(&mut disk).unwrap().unwrap();
+
+    let mut wal = RegistryWal::recover(CachedDisk::with_sectors(16), 77).unwrap();
+    for payload in [b"already-in-snapshot".as_slice(), b"new-mutation".as_slice()] {
+        wal.begin(payload.to_vec()).unwrap();
+        wal.prepare().unwrap();
+        wal.commit().unwrap();
+    }
+    assert_eq!(
+        selected.verified_boot_system_log(b"snapshot-log", &wal),
+        Ok(b"snapshot-lognew-mutation".to_vec())
+    );
+}
+
+#[test]
+fn boot_system_log_refuses_erased_anchored_suffix() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::new();
+    let manifest = WalSnapshotManifest {
+        incarnation: 77,
+        base_serial: 0,
+        high_water_serial: 1,
+        high_water_end_lba: 3,
+    };
+    store
+        .commit_next_with_wal_manifest(&mut disk, b"older", manifest)
+        .unwrap();
+    store
+        .commit_next_with_wal_manifest(&mut disk, b"newer", manifest)
+        .unwrap();
+    let selected = store.read_latest_wal(&mut disk).unwrap().unwrap();
+    let erased = RegistryWal::recover(CachedDisk::with_sectors(16), 77).unwrap();
+    assert_eq!(
+        selected.verified_boot_system_log(b"snapshot-log", &erased),
+        Err(SnapshotBlockStoreError::Corrupt)
+    );
+}
+
+#[test]
+fn streamed_v2_checkpoint_preserves_a_complete_slot_at_each_write_barrier() {
+    let manifest = base();
+    for partial_flush in [false, true] {
+        for fail_event in 0..5 {
+            let (store, mut disk) = two_v2_slots();
+            disk.fail_event = Some(fail_event);
+            disk.partial_flush = partial_flush;
+            assert_eq!(
+                store.commit_next_streaming_with_wal_manifest(
+                    &mut disk,
+                    5,
+                    crc32c(b"third"),
+                    manifest,
+                    |writer| writer.write_all(b"third"),
+                ),
+                Err(SnapshotBlockStoreError::Io)
+            );
+            disk.power_cut();
+            let restored = store.read_latest_wal(&mut disk).unwrap().unwrap();
+            assert!(restored.snapshot.payload == b"newer" || restored.snapshot.payload == b"third");
+            assert_eq!(restored.anchor.incarnation, manifest.incarnation);
+            assert_eq!(restored.anchor.serial, 0);
+        }
+    }
+}
+
+#[test]
 fn v1_header_bytes_and_reads_remain_unchanged() {
     let store = SnapshotBlockStore::new(0, 16);
     let mut disk = CachedDisk::new();
@@ -45,6 +126,10 @@ fn v1_header_bytes_and_reads_remain_unchanged() {
         store.read_latest_wal(&mut disk),
         Err(SnapshotBlockStoreError::Corrupt)
     );
+    let metadata = store.read_latest_metadata(&mut disk).unwrap().unwrap();
+    assert_eq!(metadata.format, SnapshotReadFormat::Legacy);
+    assert_eq!(metadata.generation, 1);
+    assert_eq!(metadata.payload_len, b"legacy".len());
 }
 
 #[test]
@@ -211,6 +296,75 @@ fn mixed_legacy_and_v2_slots_cannot_enter_wal_recovery() {
     assert_eq!(
         store.read_latest_wal(&mut disk),
         Err(SnapshotBlockStoreError::Corrupt)
+    );
+}
+
+#[test]
+fn metadata_selector_rejects_mixed_slots_before_streaming_payload() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::new();
+    store.commit_next(&mut disk, b"legacy").unwrap();
+    store
+        .commit_next_with_wal_manifest(&mut disk, b"candidate", base())
+        .unwrap();
+    assert_eq!(store.read_latest_metadata(&mut disk), Err(SnapshotBlockStoreError::Corrupt));
+    let mut called = false;
+    let result = store.read_latest_streaming_with_metadata(&mut disk, |_| {
+        called = true;
+        Ok(())
+    });
+    assert_eq!(result, Err(SnapshotBlockStoreError::Corrupt));
+    assert!(!called);
+}
+
+#[test]
+fn damaged_v2_header_cannot_downgrade_to_valid_legacy_slot() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::new();
+    store.commit_next(&mut disk, b"legacy").unwrap();
+    store
+        .commit_next_with_wal_manifest(&mut disk, b"candidate", base())
+        .unwrap();
+    disk.corrupt(8);
+    assert_eq!(store.read_latest_metadata(&mut disk), Err(SnapshotBlockStoreError::Corrupt));
+}
+
+#[test]
+fn metadata_selector_keeps_legacy_payload_fallback() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::new();
+    store.commit_next(&mut disk, b"older").unwrap();
+    store.commit_next(&mut disk, b"newer").unwrap();
+    disk.corrupt(9);
+    let metadata = store.read_latest_metadata(&mut disk).unwrap().unwrap();
+    assert_eq!(metadata.generation, 1);
+    assert_eq!(metadata.format, SnapshotReadFormat::Legacy);
+}
+
+#[test]
+fn metadata_and_streaming_payload_select_the_same_v2_generation() {
+    let (store, mut disk) = two_v2_slots();
+    let metadata = store.read_latest_metadata(&mut disk).unwrap().unwrap();
+    let (streamed, payload) = store
+        .read_latest_streaming_with_metadata(&mut disk, |reader| {
+            let mut payload = alloc::vec![0; reader.remaining()];
+            reader.read_exact(&mut payload)?;
+            Ok(payload)
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata, streamed);
+    assert_eq!(payload, b"newer");
+    assert_eq!(
+        metadata.format,
+        SnapshotReadFormat::Wal {
+            selected_base_serial: 0,
+            anchor: WalSnapshotAnchor {
+                incarnation: 77,
+                serial: 0,
+                end_lba: 0,
+            },
+        }
     );
 }
 

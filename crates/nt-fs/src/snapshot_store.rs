@@ -191,11 +191,52 @@ impl WalSnapshotManifest {
     }
 }
 
+fn wal_recovery_floor(
+    selected: WalSnapshotManifest,
+    other: Option<WalSnapshotManifest>,
+) -> Result<WalSnapshotAnchor, SnapshotBlockStoreError> {
+    let mut anchor = selected.anchor();
+    if let Some(other) = other {
+        let candidate = other.anchor();
+        if candidate.incarnation != anchor.incarnation
+            || (candidate.serial == anchor.serial && candidate.end_lba != anchor.end_lba)
+            || (candidate.serial > anchor.serial && candidate.end_lba < anchor.end_lba)
+            || (candidate.serial < anchor.serial && candidate.end_lba > anchor.end_lba)
+        {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        if candidate.serial > anchor.serial {
+            anchor = candidate;
+        }
+    }
+    if selected.base_serial > anchor.serial {
+        return Err(SnapshotBlockStoreError::Corrupt);
+    }
+    Ok(anchor)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredWalSnapshot {
     pub snapshot: StoredSnapshot,
     pub selected_base_serial: u64,
     pub anchor: WalSnapshotAnchor,
+}
+
+/// Format and WAL recovery floor for the payload selected by the streaming reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotReadFormat {
+    Legacy,
+    Wal {
+        selected_base_serial: u64,
+        anchor: WalSnapshotAnchor,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredSnapshotMetadata {
+    pub generation: u64,
+    pub payload_len: usize,
+    pub format: SnapshotReadFormat,
 }
 
 impl StoredWalSnapshot {
@@ -216,6 +257,38 @@ impl StoredWalSnapshot {
             return Err(SnapshotBlockStoreError::Corrupt);
         }
         Ok(())
+    }
+
+    /// Assemble the exact SYSTEM sidecar log to replay before CM imports the boot hive.
+    /// The selected snapshot already contains records through `selected_base_serial`;
+    /// appending them again could apply a mutation twice. The anchor check also rejects
+    /// a lost committed suffix before any WAL payload is exposed to the hive decoder.
+    pub fn verified_boot_system_log<D: SnapshotBlockDevice>(
+        &self,
+        snapshot_log: &[u8],
+        wal: &crate::RegistryWal<D>,
+    ) -> Result<Vec<u8>, SnapshotBlockStoreError> {
+        self.verify_recovered_wal(wal)?;
+        let base = usize::try_from(self.selected_base_serial)
+            .map_err(|_| SnapshotBlockStoreError::Corrupt)?;
+        let suffix = wal
+            .records()
+            .get(base..)
+            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        let total = suffix
+            .iter()
+            .try_fold(snapshot_log.len(), |length, record| {
+                length.checked_add(record.payload.len())
+            })
+            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        let mut log = Vec::new();
+        log.try_reserve_exact(total)
+            .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
+        log.extend_from_slice(snapshot_log);
+        for record in suffix {
+            log.extend_from_slice(&record.payload);
+        }
+        Ok(log)
     }
 }
 
@@ -282,6 +355,51 @@ impl SnapshotBlockStore {
         let Some(plan) = self.latest_valid_slot(dev)? else {
             return Ok(None);
         };
+        self.read_selected_streaming(dev, plan, read_payload).map(Some)
+    }
+
+    /// Inspect the format of the same payload selected by the streaming reader without
+    /// allocating that payload. A mixed or damaged companion slot is ambiguous at a
+    /// legacy-to-WAL boundary and must not silently select the legacy image.
+    pub fn read_latest_metadata<D: SnapshotBlockDevice>(
+        &self,
+        dev: &mut D,
+    ) -> Result<Option<StoredSnapshotMetadata>, SnapshotBlockStoreError> {
+        let Some(plan) = self.latest_valid_slot(dev)? else {
+            return Ok(None);
+        };
+        self.metadata_for_selected(dev, plan).map(Some)
+    }
+
+    /// Read the selected payload and its format under the same device borrow. Native boot
+    /// can use the metadata for WAL recovery before publishing the decoded filesystem.
+    pub fn read_latest_streaming_with_metadata<D, F, R>(
+        &self,
+        dev: &mut D,
+        read_payload: F,
+    ) -> Result<Option<(StoredSnapshotMetadata, R)>, SnapshotBlockStoreError>
+    where
+        D: SnapshotBlockDevice,
+        F: FnOnce(&mut PayloadSectorReader<'_, D>) -> Result<R, SnapshotBlockStoreError>,
+    {
+        let Some(plan) = self.latest_valid_slot(dev)? else {
+            return Ok(None);
+        };
+        let metadata = self.metadata_for_selected(dev, plan)?;
+        let (_, _, payload) = self.read_selected_streaming(dev, plan, read_payload)?;
+        Ok(Some((metadata, payload)))
+    }
+
+    fn read_selected_streaming<D, F, R>(
+        &self,
+        dev: &mut D,
+        plan: SlotReadPlan,
+        read_payload: F,
+    ) -> Result<(u64, usize, R), SnapshotBlockStoreError>
+    where
+        D: SnapshotBlockDevice,
+        F: FnOnce(&mut PayloadSectorReader<'_, D>) -> Result<R, SnapshotBlockStoreError>,
+    {
         let (sector_size, slot_sectors) = self.geometry(dev)?;
         let slot_base = self.slot_lba(slot_sectors, plan.slot)?;
         let mut sector = Vec::new();
@@ -294,7 +412,44 @@ impl SnapshotBlockStore {
         let mut reader = PayloadSectorReader::new(dev, sector, sector_size, slot_base, plan);
         let result = read_payload(&mut reader)?;
         reader.finish()?;
-        Ok(Some((generation, payload_len, result)))
+        Ok((generation, payload_len, result))
+    }
+
+    fn metadata_for_selected<D: SnapshotBlockDevice>(
+        &self,
+        dev: &mut D,
+        selected: SlotReadPlan,
+    ) -> Result<StoredSnapshotMetadata, SnapshotBlockStoreError> {
+        let other_slot = 1 - selected.slot;
+        let other_header = self.read_slot_plan(dev, other_slot)?;
+        let format = match (selected.wal, other_header) {
+            // A legacy payload may fall back from a companion legacy payload whose CRC is bad.
+            // A damaged header remains ambiguous because its format cannot be trusted.
+            (None, None | Some(SlotReadPlan { wal: None, .. })) => SnapshotReadFormat::Legacy,
+            (None, Some(_)) => return Err(SnapshotBlockStoreError::Corrupt),
+            (Some(selected_manifest), other_header) => {
+                let other_manifest = match other_header {
+                    None => None,
+                    Some(SlotReadPlan { wal: None, .. }) => {
+                        return Err(SnapshotBlockStoreError::Corrupt)
+                    }
+                    Some(_) => Some(
+                        self.read_valid_slot_plan(dev, other_slot)?
+                            .and_then(|plan| plan.wal)
+                            .ok_or(SnapshotBlockStoreError::Corrupt)?,
+                    ),
+                };
+                SnapshotReadFormat::Wal {
+                    selected_base_serial: selected_manifest.base_serial,
+                    anchor: wal_recovery_floor(selected_manifest, other_manifest)?,
+                }
+            }
+        };
+        Ok(StoredSnapshotMetadata {
+            generation: selected.generation,
+            payload_len: selected.payload_len,
+            format,
+        })
     }
 
     /// Commit a new payload to the alternate slot and return its generation.
@@ -316,17 +471,11 @@ impl SnapshotBlockStore {
         payload: &[u8],
         manifest: WalSnapshotManifest,
     ) -> Result<u64, SnapshotBlockStoreError> {
-        if !manifest.valid() {
-            return Err(SnapshotBlockStoreError::Corrupt);
-        }
-        if dev.sector_size() < WAL_HEADER_LEN {
-            return Err(SnapshotBlockStoreError::InvalidGeometry);
-        }
-        self.commit_next_streaming_inner(
+        self.commit_next_streaming_with_wal_manifest(
             dev,
             payload.len(),
             crc32c(payload),
-            Some(manifest),
+            manifest,
             |writer| writer.write_all(payload),
         )
     }
@@ -352,24 +501,8 @@ impl SnapshotBlockStore {
             (Some(a), None) | (None, Some(a)) => (a, None),
         };
         let selected_manifest = selected.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
-        let mut anchor = selected_manifest.anchor();
-        if let Some(other) = other {
-            let other_manifest = other.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
-            let candidate = other_manifest.anchor();
-            if candidate.incarnation != anchor.incarnation
-                || (candidate.serial == anchor.serial && candidate.end_lba != anchor.end_lba)
-                || (candidate.serial > anchor.serial && candidate.end_lba < anchor.end_lba)
-                || (candidate.serial < anchor.serial && candidate.end_lba > anchor.end_lba)
-            {
-                return Err(SnapshotBlockStoreError::Corrupt);
-            }
-            if candidate.serial > anchor.serial {
-                anchor = candidate;
-            }
-        }
-        if selected_manifest.base_serial > anchor.serial {
-            return Err(SnapshotBlockStoreError::Corrupt);
-        }
+        let other_manifest = other.map(|other| other.wal.ok_or(SnapshotBlockStoreError::Corrupt)).transpose()?;
+        let anchor = wal_recovery_floor(selected_manifest, other_manifest)?;
         Ok(Some(StoredWalSnapshot {
             snapshot: StoredSnapshot {
                 generation: selected.generation,
@@ -397,6 +530,36 @@ impl SnapshotBlockStore {
         F: FnOnce(&mut PayloadSectorWriter<'_, D>) -> Result<(), SnapshotBlockStoreError>,
     {
         self.commit_next_streaming_inner(dev, payload_len, payload_crc, None, write_payload)
+    }
+
+    /// Stream a volume checkpoint with the WAL incarnation, included serial, and exact
+    /// acknowledged high-water recorded in the slot header. The ordinary v1 entry point
+    /// remains unchanged for volumes that have not entered WAL mode.
+    pub fn commit_next_streaming_with_wal_manifest<D, F>(
+        &self,
+        dev: &mut D,
+        payload_len: usize,
+        payload_crc: u32,
+        manifest: WalSnapshotManifest,
+        write_payload: F,
+    ) -> Result<u64, SnapshotBlockStoreError>
+    where
+        D: SnapshotBlockDevice,
+        F: FnOnce(&mut PayloadSectorWriter<'_, D>) -> Result<(), SnapshotBlockStoreError>,
+    {
+        if !manifest.valid() {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        if dev.sector_size() < WAL_HEADER_LEN {
+            return Err(SnapshotBlockStoreError::InvalidGeometry);
+        }
+        self.commit_next_streaming_inner(
+            dev,
+            payload_len,
+            payload_crc,
+            Some(manifest),
+            write_payload,
+        )
     }
 
     fn commit_next_streaming_inner<D, F>(

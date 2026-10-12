@@ -2473,6 +2473,32 @@ fn memfs_streaming_snapshot_commit_matches_exported_snapshot() {
 }
 
 #[test]
+fn memfs_streaming_v2_checkpoint_keeps_the_same_volume_payload() {
+    let fs = FileSystem::new(MemFs::new());
+    let expected = fs.export_volume_snapshot().unwrap();
+    let store = SnapshotBlockStore::new(0, 48);
+    let mut disk = MemoryBlockDevice::new(512, 48);
+    let manifest = WalSnapshotManifest {
+        incarnation: 91,
+        base_serial: 0,
+        high_water_serial: 0,
+        high_water_end_lba: 0,
+    };
+
+    for generation in [1, 2] {
+        let (actual_generation, actual_len) = fs
+            .commit_volume_snapshot_with_wal_manifest(&store, &mut disk, manifest)
+            .unwrap();
+        assert_eq!(actual_generation, generation);
+        assert_eq!(actual_len, expected.len());
+    }
+    let restored = store.read_latest_wal(&mut disk).unwrap().unwrap();
+    assert_eq!(restored.snapshot.payload, expected);
+    assert_eq!(restored.anchor.incarnation, manifest.incarnation);
+    assert_eq!(restored.selected_base_serial, 0);
+}
+
+#[test]
 fn memfs_streaming_snapshot_repeated_mutation_round_trips_mixed_storage() {
     const SYSTEM: &str = r"\??\C:\ReactOS\System32\Config\SYSTEM";
     const LOG: &str = r"\??\C:\ReactOS\System32\Config\SYSTEM.LOG";

@@ -77,8 +77,9 @@ pub use path::{
 pub use query::*;
 pub use snapshot_store::{
     PayloadSectorReader, PayloadSectorWriter, SnapshotBlockDevice, SnapshotBlockStore,
-    SnapshotBlockStoreError, SnapshotPayloadReader, SnapshotPayloadSink, StoredSnapshot,
-    StoredWalSnapshot, WalSnapshotAnchor, WalSnapshotAnchorUpdate, WalSnapshotManifest,
+    SnapshotBlockStoreError, SnapshotPayloadReader, SnapshotPayloadSink, SnapshotReadFormat,
+    StoredSnapshot, StoredSnapshotMetadata, StoredWalSnapshot, WalSnapshotAnchor,
+    WalSnapshotAnchorUpdate, WalSnapshotManifest,
 };
 pub use snapshot_reserve::{SnapshotReserve, SnapshotReserveLease};
 pub use snapshot_region::{BoundedBlockRange, OwnedBoundedBlockRange};
