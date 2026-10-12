@@ -140,7 +140,7 @@ fn final_stream_validation_still_precedes_commit_header_publication() {
         })
         .flatten()
         .find_map(|item| match item {
-            ImplItem::Fn(method) if method.sig.ident == "commit_next_streaming" => Some(method),
+            ImplItem::Fn(method) if method.sig.ident == "commit_next_streaming_inner" => Some(method),
             _ => None,
         })
         .expect("actual store streaming commit method");
