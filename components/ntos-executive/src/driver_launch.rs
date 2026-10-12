@@ -52198,6 +52198,7 @@ fn register_hosted_device_binding(
     projection_instance: usize,
     projection_domain: HostedDomainIdentity,
     device_object: u64,
+    registration: nt_io_manager::HostedDevicePointerRegistration,
     pdo_object: u64,
     registry_identity_id: HostedRegistryIdentityId,
     bus_information: Option<&nt_pnp_manager::PnpBusInformation>,
@@ -52269,12 +52270,17 @@ fn register_hosted_device_binding(
     }
     let projection_inst = self::instance(projection_instance)
         .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-    register_hosted_device_projection(
-        projection_inst,
-        projection_domain,
-        device_object,
-        nt_io_manager::DeviceId(device_id),
-    ).map_err(|error| error.status)?;
+    if registration.domain() != projection_domain
+        || registration.address() != device_object
+        || registration.device_id() != nt_io_manager::DeviceId(device_id)
+        || hosted_device_pointer_registration(
+            projection_domain, device_object, nt_io_manager::DeviceId(device_id),
+        ) != Ok(registration)
+        || hosted_device_allocations::registration(projection_inst, device_object)?
+            != Some(registration)
+    {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
     let binding = HostedDeviceBinding {
         driver_id,
         device_id,
@@ -59427,6 +59433,14 @@ unsafe fn call_add_device_for_existing_pdo(
         if !driver_instances().is_some_and(|table| index < table.len() && table[index].used) {
             return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
         }
+        let registration = hosted_device_pointer_registration(
+            projection_domain, add_device.fdo_object, device_id,
+        )?;
+        if !hosted_add_device_rollback::owns_created_registration(
+            rollback.as_ref().unwrap(), registration,
+        ) {
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
         register_hosted_device_binding(
             driver_id,
             device_id.raw(),
@@ -59435,6 +59449,7 @@ unsafe fn call_add_device_for_existing_pdo(
             projection_instance,
             projection_domain,
             add_device.fdo_object,
+            registration,
             pdo_object,
             registry_identity_id,
             bus_information.as_ref(),

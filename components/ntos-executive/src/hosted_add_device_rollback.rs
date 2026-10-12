@@ -335,6 +335,22 @@ pub(super) unsafe fn record_created(
     });
 }
 
+/// The FDO registration minted by this exact AddDevice dispatch remains owned by this rollback
+/// row until stack publication commits. A canonical lookup alone cannot establish that owner.
+pub(super) unsafe fn owns_created_registration(
+    reservation: &Reservation,
+    registration: nt_io_manager::HostedDevicePointerRegistration,
+) -> bool {
+    let row = owner(reservation.0);
+    row.phase == Phase::Preparing
+        && row.created.iter().any(|created| {
+            created.registration == registration
+                && !created.pointer_retired
+                && !created.destroyed
+                && !created.projection_retired
+        })
+}
+
 pub(super) unsafe fn record_retired(registration: nt_io_manager::HostedDevicePointerRegistration) {
     for row in owners() {
         if let Some(device) = row
