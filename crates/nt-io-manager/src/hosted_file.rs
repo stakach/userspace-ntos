@@ -176,6 +176,24 @@ impl<P> IoManager<P> {
             .map(|binding| binding.identity))
     }
 
+    /// Observe any binding at a physical FILE_OBJECT address, including one whose canonical
+    /// File record has already retired. Exact tuple absence alone cannot prove address vacancy.
+    pub fn hosted_file_identity_at_address(
+        &self,
+        domain: HostedDomainIdentity,
+        address: u64,
+    ) -> Result<Option<HostedFileIdentity>, NtStatus> {
+        if address == 0 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let record = self.hosted_domains.get(domain.domain_id)
+            .filter(|record| domain.cookie != 0 && record.cookie() == domain.cookie)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        Ok(record.files.iter()
+            .find(|binding| binding.identity.address == address)
+            .map(|binding| binding.identity))
+    }
+
     /// Retire a wire identity only in the broker-authenticated domain. Historical generations
     /// are idempotent, but zero/future generations are not valid retirement receipts. A stored
     /// opaque receipt is required for removal; no receipt is reconstructed from caller fields.

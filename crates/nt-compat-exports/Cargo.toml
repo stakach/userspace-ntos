@@ -24,4 +24,5 @@ nt-pe-loader = { path = "../nt-pe-loader" }
 nt-kernel-abi = { path = "../nt-kernel-abi" }
 nt-kernel-exec = { path = "../nt-kernel-exec" }
 nt-process = { path = "../nt-process" }
+nt-driver-runtime = { path = "../nt-driver-runtime" }
 syn = { version = "2", features = ["full", "visit"] }

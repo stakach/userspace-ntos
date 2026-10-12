@@ -3,9 +3,11 @@
 use core::ptr::{read_unaligned, read_volatile, write_volatile, write_unaligned};
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use nt_io_manager::{
     DeviceCharacteristics, DeviceFlags, DeviceType, HostedDomainIdentity, IoManager,
     MockDriverBackend, MockObjectPort, WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_OBJECT_SIZE,
+    WDM_X64_FILE_OBJECT_SIZE,
     WDM_X64_IO_TYPE_DEVICE, WDM_X64_IO_TYPE_DRIVER,
 };
 use nt_types::NtPath;
@@ -17,6 +19,7 @@ const PAYLOAD: u64 = POOL_DATA_OFF + 16;
 const ADDRESS: u64 = FSD_POOL_VADDR + PAYLOAD;
 const CAPACITY: u64 = 0x200;
 const POOL_FREE_LIST_MAX: u64 = FSD_POOL_FRAMES * 0x1000 / 16;
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Copy)]
 struct DriverInstance {
@@ -43,6 +46,7 @@ thread_local! {
     static REFUSE_PUBLICATION: Cell<bool> = const { Cell::new(false) };
     static ACCEPTED: Cell<Option<nt_io_manager::HostedDevicePointerRegistration>> = const { Cell::new(None) };
     static PUBLICATION_PIN: RefCell<Option<nt_io_manager::HostedDeviceProjectionReference>> = const { RefCell::new(None) };
+    static REFUSE_FILE_FREE: Cell<bool> = const { Cell::new(false) };
 }
 
 fn io_manager_mut() -> &'static mut IoManager<MockObjectPort> {
@@ -87,6 +91,9 @@ mod retirement;
 
 unsafe fn hosted_instance_pool_free_unlocked(inst: DriverInstance, address: u64) -> bool {
     assert_pool_locked(inst.exec_pool_va);
+    if address == ADDRESS && REFUSE_FILE_FREE.with(|refuse| refuse.get()) {
+        return false;
+    }
     if hosted_instance_pool_allocation_is_free_unlocked(inst, address) != Some(false) {
         return false;
     }
@@ -186,7 +193,64 @@ impl Pool {
 }
 
 #[test]
+fn actual_file_broker_frees_constructor_name_after_driver_replaces_field() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let domain = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId::new(901, 1),
+        cookie: 901,
+    };
+    let pool = Pool::new(domain, 17, 0x901000);
+    let name_a = ADDRESS + CAPACITY + 16;
+    let name_b = name_a + 0x100 + 16;
+    unsafe {
+        let exec = pool.inst.exec_pool_va;
+        write_volatile((exec + PAYLOAD + CAPACITY) as *mut u64, 0x100);
+        write_volatile((exec + PAYLOAD + CAPACITY + 8) as *mut u64, 18);
+        write_volatile((exec + PAYLOAD + CAPACITY + 0x110) as *mut u64, 0x100);
+        write_volatile((exec + PAYLOAD + CAPACITY + 0x118) as *mut u64, 19);
+        write_volatile(exec as *mut u64, PAYLOAD + CAPACITY + 0x220);
+        write_unaligned((exec + PAYLOAD + 0x60) as *mut u64, name_a);
+        assert_eq!(native::file_storage_bound_generation(pool.inst, 41, ADDRESS), None);
+        native::protect_file_storage(pool.inst, 41, ADDRESS).unwrap();
+        let collision = native::protect_file_storage(pool.inst, 41, ADDRESS).err().unwrap();
+        assert!(!collision.no_root_owner);
+        assert!(native::cancel_unpublished_file_capture(pool.inst, 41, ADDRESS));
+        drop(native::generic_free_admission(pool.inst, ADDRESS).unwrap());
+        native::protect_file_storage(pool.inst, 41, ADDRESS).unwrap();
+        assert_eq!(native::file_storage_bound_generation(pool.inst, 41, ADDRESS), None);
+        assert_eq!(native::file_storage_bound_generation(pool.inst, 41, ADDRESS), None);
+        assert!(!native::mark_file_unbound_exact(pool.inst, 41, ADDRESS, 7));
+        assert_eq!(native::retire_file_storage(pool.inst, 41, ADDRESS),
+            Err(nt_status::NtStatus::DEVICE_BUSY));
+        assert!(native::mark_file_bound(pool.inst, 41, ADDRESS, 7));
+        assert_eq!(native::file_storage_bound_generation(pool.inst, 41, ADDRESS), Some(7));
+        assert!(!native::mark_file_unbound_exact(pool.inst, 41, ADDRESS, 6));
+        assert_eq!(native::retire_file_storage(pool.inst, 41, ADDRESS),
+            Err(nt_status::NtStatus::DEVICE_BUSY));
+        write_unaligned((exec + PAYLOAD + 0x60) as *mut u64, name_b);
+        assert!(native::generic_free_admission(pool.inst, name_a).is_err());
+        assert!(native::generic_free_admission(pool.inst, ADDRESS).is_err());
+        drop(native::generic_free_admission(pool.inst, name_b).unwrap());
+        assert!(native::mark_file_unbound_exact(pool.inst, 41, ADDRESS, 7));
+        REFUSE_FILE_FREE.with(|refuse| refuse.set(true));
+        assert_eq!(native::retire_file_storage(pool.inst, 41, ADDRESS),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
+        REFUSE_FILE_FREE.with(|refuse| refuse.set(false));
+        drop(native::generic_free_admission(pool.inst, name_a).unwrap());
+        assert!(native::generic_free_admission(pool.inst, ADDRESS).is_err());
+        native::retire_file_storage(pool.inst, 41, ADDRESS).unwrap();
+        let _lock = hosted_instance_pool_lock(exec).unwrap();
+        assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(pool.inst, name_a), Some(true));
+        assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(pool.inst, ADDRESS), Some(true));
+        assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(pool.inst, name_b), Some(false));
+    }
+    let refused = unsafe { native::protect_file_storage(pool.inst, 41, ADDRESS) }.err().unwrap();
+    assert!(refused.no_root_owner);
+}
+
+#[test]
 fn actual_adapter_protects_exact_allocations_and_retains_uncertain_retirement() {
+    let _serial = TEST_LOCK.lock().unwrap();
     // One scenario owns the real adapter's process-global catalog and all backing pools.
     let mut io = IoManager::new(MockObjectPort::new());
     let driver = io.create_driver(

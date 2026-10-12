@@ -134,3 +134,14 @@ fn retained_creation_reply_cannot_enter_clean_rejection_cleanup() {
     arms.visit_block(&item.block);
     assert_eq!(arms.seen, 1, "explicit retained CREATE outcome is required");
 }
+
+#[test]
+fn file_create_refusals_cancel_physical_capture_before_driver_entry() {
+    let file = syn::parse_file(DRIVER).unwrap();
+    let found = calls(function(&file, "service_hosted_file"));
+    let capture = position(&found, "protect_file_storage");
+    assert!(capture < position(&found, "active_hosted_irp_transfer_mut"));
+    assert!(capture < position(&found, "hosted_instance_pool_allocation_exec_if_live"));
+    assert!(capture < position(&found, "bind_hosted_file_identity"));
+    assert!(found.iter().filter(|call| *call == "cancel_unpublished_file_capture").count() >= 4);
+}

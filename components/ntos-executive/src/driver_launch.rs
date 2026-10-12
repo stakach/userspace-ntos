@@ -2684,6 +2684,19 @@ pub(crate) unsafe fn pool_alloc(size: u64) -> u64 {
 /// Push one exact allocation base back onto the free list, rejecting invalid and duplicate frees.
 unsafe fn pool_free(p: u64) {
     let _guard = component_pool_lock();
+    let _ = pool_free_locked(p);
+}
+
+/// The constructor owner uses this only after root proves publication never acquired the block.
+unsafe fn pool_free_exact(p: u64, generation: u64) -> bool {
+    let _guard = component_pool_lock();
+    generation != 0
+        && component_pool_allocation_capacity(p).is_some()
+        && read_volatile((p - 8) as *const u64) == generation
+        && pool_free_locked(p)
+}
+
+unsafe fn pool_free_locked(p: u64) -> bool {
     POOL_CALLS += 1;
     if POOL_CALLS % 16384 == 0 {
         print_str(b"[fsd-pool-heartbeat] calls=");
@@ -2698,7 +2711,7 @@ unsafe fn pool_free(p: u64) {
             print_hex64(p);
             print_str(b"\n");
         }
-        return;
+        return false;
     }
     let head_slot = (FSD_POOL_VADDR + 8) as *mut u64;
     let mut cur = read_volatile(head_slot);
@@ -2718,7 +2731,7 @@ unsafe fn pool_free(p: u64) {
                 print_hex(p as u32);
                 print_str(b" (would cycle the free list)\n");
             }
-            return;
+            return false;
         }
         cur = read_volatile((cur - 8) as *const u64);
         steps += 1;
@@ -2728,11 +2741,12 @@ unsafe fn pool_free(p: u64) {
         if FSD_POOL_LIST_CYCLES.fetch_add(1, Ordering::Relaxed) == 0 {
             print_str(b"[fsd-host] POOL FREE-LIST CYCLE on free -> drop\n");
         }
-        return;
+        return false;
     }
     let head = read_volatile(head_slot);
     write_volatile((p - 8) as *mut u64, head);
     write_volatile(head_slot, p);
+    true
 }
 
 // --- FILE_OBJECT LIFETIME: one FILE_OBJECT per OPEN, not per IRP -------------------------------
@@ -55817,15 +55831,15 @@ pub(crate) fn service_hosted_file(
             (status, object, 0, 0)
         };
     }
-    if !matches!(operation, 1..=3)
+    if !matches!(operation, 1..=3 | 9)
         || file_id == 0
         || address == 0
         || address & 7 != 0
         || address
             .checked_add(WDM_X64_FILE_OBJECT_SIZE as u64)
             .is_none()
-        || (operation == 3 && request_id != 0)
-        || (operation != 3 && request_id == 0)
+        || (matches!(operation, 3 | 9) && request_id != 0)
+        || (matches!(operation, 1 | 2) && request_id == 0)
     {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
     }
@@ -55838,12 +55852,22 @@ pub(crate) fn service_hosted_file(
     let file = FileId(file_id);
     let result = match operation {
         1 => {
+            // First establish or conclusively refuse a physical owner. Every following
+            // pre-entry refusal can then return an exact no-owner receipt to the constructor.
+            if let Err(error) = unsafe {
+                hosted_device_allocations::protect_file_storage(instance, file_id, address)
+            } {
+                return (error.status.raw(), 0, u64::from(error.no_root_owner), 0);
+            }
             let authorized = unsafe {
                 active_hosted_irp_transfer_mut(ch.shared_va, request_id)
                     .is_some_and(|active| active.file_create == Some((file, domain)))
             };
             if !authorized {
-                return (STATUS_ACCESS_DENIED, 0, 0, 0);
+                let canceled = hosted_device_allocations::cancel_unpublished_file_capture(
+                    instance, file_id, address,
+                );
+                return (STATUS_ACCESS_DENIED, 0, u64::from(canceled), 0);
             }
             // CREATE authority identifies the File, not arbitrary component memory. Prove the
             // submitted projection occupies a live provider-pool allocation before publishing it.
@@ -55854,25 +55878,90 @@ pub(crate) fn service_hosted_file(
                     WDM_X64_FILE_OBJECT_SIZE as u64,
                 )
             }) else {
-                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+                let canceled = hosted_device_allocations::cancel_unpublished_file_capture(
+                    instance, file_id, address,
+                );
+                return (STATUS_INVALID_PARAMETER, 0, u64::from(canceled), 0);
             };
             if unsafe {
                 read_unaligned(file_object as *const i16) != nt_io_manager::WDM_X64_IO_TYPE_FILE
                     || read_unaligned((file_object + 2) as *const u16)
                         != WDM_X64_FILE_OBJECT_SIZE as u16
             } {
-                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+                let canceled = hosted_device_allocations::cancel_unpublished_file_capture(
+                    instance, file_id, address,
+                );
+                return (STATUS_INVALID_PARAMETER, 0, u64::from(canceled), 0);
             }
-            io_manager_mut()
-                .bind_hosted_file_identity(domain, address, file)
-                .map(|identity| identity.binding_generation())
+            match io_manager_mut().bind_hosted_file_identity(domain, address, file) {
+                Ok(identity) => {
+                    assert!(hosted_device_allocations::mark_file_bound(
+                        instance, file_id, address, identity.binding_generation(),
+                    ),
+                        "accepted File binding lost its physical owner");
+                    Ok(identity.binding_generation())
+                }
+                Err(status) => {
+                    let no_root_owner = hosted_device_allocations::cancel_unpublished_file_capture(
+                        instance, file_id, address,
+                    );
+                    return (status.raw(), 0, u64::from(no_root_owner), 0);
+                }
+            }
+        }
+        2 if hosted_device_allocations::file_storage_bound_generation(
+            instance, file_id, address,
+        ) != Some(request_id) => {
+            Err(nt_status::NtStatus::DEVICE_BUSY)
         }
         2 => io_manager_mut()
             .unbind_authenticated_hosted_file(domain, file, address, request_id)
-            .map(|_| 0),
-        3 => io_manager_mut()
-            .hosted_file_identity_at(domain, file, address)
-            .map(|identity| identity.map_or(0, |identity| identity.binding_generation())),
+            .and_then(|_| {
+                if !io_manager_mut()
+                    .hosted_file_identity_at_address(domain, address)?
+                    .is_none()
+                {
+                    return Err(nt_status::NtStatus::DEVICE_BUSY);
+                }
+                if !hosted_device_allocations::mark_file_unbound_exact(
+                    instance, file_id, address, request_id,
+                ) {
+                    return Err(nt_status::NtStatus::DEVICE_BUSY);
+                }
+                Ok(0)
+            }),
+        3 => {
+            let Some(physical_generation) = hosted_device_allocations::file_storage_bound_generation(
+                instance, file_id, address,
+            ) else {
+                return (nt_status::NtStatus::DEVICE_BUSY.raw(), 0, 0, 0);
+            };
+            io_manager_mut()
+                .hosted_file_identity_at(domain, file, address)
+                .and_then(|identity| {
+                    let address_vacant = identity.is_none()
+                        && io_manager_mut()
+                            .hosted_file_identity_at_address(domain, address)?
+                            .is_none();
+                    if identity.is_some_and(|identity| identity.binding_generation() != physical_generation)
+                        || identity.is_none() && !address_vacant
+                    {
+                        return Err(nt_status::NtStatus::DEVICE_BUSY);
+                    }
+                    Ok((identity, address_vacant))
+                })
+                .and_then(|(identity, address_vacant)| {
+                    if address_vacant && !hosted_device_allocations::mark_file_unbound_exact(
+                        instance, file_id, address, physical_generation,
+                    ) {
+                        return Err(nt_status::NtStatus::DEVICE_BUSY);
+                    }
+                    Ok(identity.map_or(0, |identity| identity.binding_generation()))
+                })
+        }
+        9 => unsafe {
+            hosted_device_allocations::retire_file_storage(instance, file_id, address).map(|_| 0)
+        },
         _ => unreachable!("validated File service operation"),
     };
     match result {

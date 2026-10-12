@@ -16,6 +16,32 @@ struct Row {
 static LOCK: AtomicU64 = AtomicU64::new(0);
 static mut LEDGER: ProjectionAllocationLedger = ProjectionAllocationLedger::new();
 static mut ROWS: Vec<Row> = Vec::new();
+// FILE_OBJECT storage has the same pool exclusion requirement as Device projections. Its
+// constructor name is captured before the driver's CREATE callback can mutate FileName.Buffer.
+struct FileStorageRow {
+    instance: DriverInstance,
+    domain: HostedDomainIdentity,
+    file_id: u64,
+    file: SourcePoolAllocationIdentity,
+    name: SourcePoolAllocationIdentity,
+    publishing: bool,
+    binding_generation: u64,
+    canonical_unbound: bool,
+    name_freed: bool,
+    file_freed: bool,
+}
+static mut FILE_ROWS: Vec<FileStorageRow> = Vec::new();
+fn file_rows() -> &'static mut Vec<FileStorageRow> {
+    unsafe { &mut *core::ptr::addr_of_mut!(FILE_ROWS) }
+}
+fn contains_allocation(identity: SourcePoolAllocationIdentity, address: u64) -> bool {
+    address >= identity.component_address
+        && address < identity.component_address.saturating_add(identity.capacity)
+}
+fn protects_file_member(row: &FileStorageRow, address: u64) -> bool {
+    (!row.file_freed && contains_allocation(row.file, address))
+        || (!row.name_freed && contains_allocation(row.name, address))
+}
 
 pub(super) struct Guard;
 impl Drop for Guard {
@@ -118,10 +144,175 @@ pub(super) fn generic_free_admission(
                 && address >= row.allocation.component_address
                 && address < row.allocation.component_address + row.allocation.capacity
         })
+        || file_rows().iter().any(|row| {
+            same_pool(row.instance, inst) && protects_file_member(row, address)
+        })
     {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     Ok(guard)
+}
+
+/// Capture both exact physical allocations while CREATE still owns the unentered driver call.
+#[derive(Debug)]
+pub(super) struct FileStorageCaptureError {
+    pub(super) status: nt_status::NtStatus,
+    /// The failed operation did not install an owner and no other physical row owns either member.
+    pub(super) no_root_owner: bool,
+}
+
+pub(super) unsafe fn protect_file_storage(
+    inst: DriverInstance,
+    file_id: u64,
+    address: u64,
+) -> Result<(), FileStorageCaptureError> {
+    let _durable = crate::allocator::enter_durable();
+    let _guard = lock();
+    let mut name_address = 0;
+    let result = (|| -> Result<(), nt_status::NtStatus> {
+        let domain = validate_arena(inst)?;
+        let _pool = hosted_instance_pool_lock(inst.exec_pool_va)
+            .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+        let file = allocation(inst, address)?;
+        if file.capacity < WDM_X64_FILE_OBJECT_SIZE as u64 {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        let exec = inst.exec_pool_va + address - FSD_POOL_VADDR;
+        name_address = read_unaligned((exec + 0x60) as *const u64);
+        if name_address == 0 || name_address == address {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        let name = allocation(inst, name_address)?;
+        if file_rows().iter().any(|row| {
+            (row.domain == domain || same_pool(row.instance, inst))
+                && (protects_file_member(row, address)
+                    || protects_file_member(row, name_address))
+        }) || rows().iter().any(|row| {
+            same_pool(row.instance, inst)
+                && (contains_allocation(row.allocation, address)
+                    || contains_allocation(row.allocation, name_address))
+        }) {
+            return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
+        }
+        file_rows().try_reserve(1)
+            .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        file_rows().push(FileStorageRow {
+            instance: inst, domain, file_id, file, name,
+            publishing: true, binding_generation: 0,
+            canonical_unbound: false, name_freed: false, file_freed: false,
+        });
+        Ok(())
+    })();
+    result.map_err(|status| {
+        let owned = file_rows().iter().any(|row| {
+            same_pool(row.instance, inst)
+                && (protects_file_member(row, address)
+                    || name_address != 0 && protects_file_member(row, name_address))
+        }) || rows().iter().any(|row| {
+            same_pool(row.instance, inst)
+                && (contains_allocation(row.allocation, address)
+                    || name_address != 0 && contains_allocation(row.allocation, name_address))
+        });
+        FileStorageCaptureError { status, no_root_owner: !owned }
+    })
+}
+
+pub(super) fn mark_file_unbound_exact(
+    inst: DriverInstance, file_id: u64, address: u64, generation: u64,
+) -> bool {
+    let _guard = lock();
+    let Some(row) = file_rows().iter_mut().find(|row| {
+        same_arena(row.instance, inst) && row.file_id == file_id
+            && row.file.component_address == address
+            && !row.publishing && row.binding_generation == generation && generation != 0
+    }) else { return false; };
+    row.canonical_unbound = true;
+    true
+}
+
+/// A QUERY may mark absent only the physical row observed before consulting IoManager.
+/// Zero/no row and publishing rows have no retirement authority.
+pub(super) fn file_storage_bound_generation(
+    inst: DriverInstance, file_id: u64, address: u64,
+) -> Option<u64> {
+    let _guard = lock();
+    file_rows().iter().find(|row| {
+        same_arena(row.instance, inst) && row.file_id == file_id
+            && row.file.component_address == address && !row.publishing
+            && row.binding_generation != 0
+    }).map(|row| row.binding_generation)
+}
+
+pub(super) fn mark_file_bound(
+    inst: DriverInstance, file_id: u64, address: u64, generation: u64,
+) -> bool {
+    if generation == 0 { return false; }
+    let _guard = lock();
+    let Some(row) = file_rows().iter_mut().find(|row| {
+        same_arena(row.instance, inst) && row.file_id == file_id
+            && row.file.component_address == address && row.publishing
+    }) else { return false; };
+    row.publishing = false;
+    row.binding_generation = generation;
+    true
+}
+
+/// Undo a just-captured row only after synchronous canonical bind returned a definite error.
+/// The driver has not entered and no File publication exists for this attempt.
+pub(super) fn cancel_unpublished_file_capture(
+    inst: DriverInstance,
+    file_id: u64,
+    address: u64,
+) -> bool {
+    let _guard = lock();
+    let Some(index) = file_rows().iter().position(|row| {
+        same_arena(row.instance, inst) && row.file_id == file_id
+            && row.file.component_address == address
+            && row.publishing && !row.canonical_unbound && !row.name_freed && !row.file_freed
+    }) else {
+        return false;
+    };
+    file_rows().swap_remove(index);
+    true
+}
+
+/// The single authenticated physical free attempt; each member is acknowledged independently.
+/// A failed or uncertain attempt retains its row, barring address reuse and generic free.
+pub(super) unsafe fn retire_file_storage(
+    inst: DriverInstance,
+    file_id: u64,
+    address: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let _guard = lock();
+    let domain = validate_arena(inst)?;
+    let _pool = hosted_instance_pool_lock(inst.exec_pool_va)
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    let index = file_rows().iter().position(|row| {
+        same_arena(row.instance, inst) && row.domain == domain
+            && row.file_id == file_id && row.file.component_address == address
+    }).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    let row = &mut file_rows()[index];
+    if row.publishing || !row.canonical_unbound {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    if !row.name_freed {
+        if allocation(inst, row.name.component_address)? != row.name
+            || !hosted_instance_pool_free_unlocked(inst, row.name.component_address)
+        {
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
+        row.name_freed = true;
+    }
+    if !row.file_freed {
+        if allocation(inst, row.file.component_address)? != row.file
+            || !hosted_instance_pool_free_unlocked(inst, row.file.component_address)
+        {
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
+        row.file_freed = true;
+    }
+    file_rows().swap_remove(index);
+    Ok(())
 }
 
 pub(super) unsafe fn protect_allocation(
@@ -149,6 +340,11 @@ pub(super) unsafe fn protect_allocation_exact(
         (row.domain == domain || same_pool(row.instance, inst)) && !same_arena(row.instance, inst)
     }) {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    if file_rows().iter().any(|row| {
+        same_pool(row.instance, inst) && protects_file_member(row, address)
+    }) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     if let Some(row) = rows()
         .iter()
@@ -381,7 +577,8 @@ pub(super) fn registration(
 
 pub(super) fn instance_quiesced(inst: DriverInstance) -> bool {
     let _guard = lock();
-    !rows()
+    !file_rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
+        && !rows()
         .iter()
         .any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
 }
