@@ -1,7 +1,7 @@
 //! The single owned backend for the executable mount's physical snapshot reserve.
 
 use super::*;
-use nt_fs::{BoundedBlockRange, SnapshotBlockDevice, SnapshotReserve, SnapshotReserveLease};
+use nt_fs::{BoundedBlockRange, OwnedBoundedBlockRange, SnapshotBlockDevice, SnapshotReserve, SnapshotReserveLease};
 use nt_memory_manager::SectionMountId;
 
 type Reserve = SnapshotReserve<AhciSnapshotDevice, SectionMountId>;
@@ -35,6 +35,16 @@ pub(super) fn wal_region(lease: &mut Lease) -> Result<Option<BoundedBlockRange<'
     BoundedBlockRange::new(lease, SNAPSHOT_SECTORS, WAL_SECTORS)
         .map(Some)
         .map_err(|_| nt_fs::STATUS_INVALID_PARAMETER)
+}
+
+/// Move the exact reserve lease into a bounded WAL owner. Once a record write begins,
+/// uncertainty must retain this owner so the reserve cannot be reused by a new writer.
+#[allow(dead_code)]
+pub(super) fn owned_wal_region(
+    lease: Lease,
+) -> Result<OwnedBoundedBlockRange<Lease>, (u32, Lease)> {
+    OwnedBoundedBlockRange::new(lease, SNAPSHOT_SECTORS, WAL_SECTORS)
+        .map_err(|(_, lease)| (nt_fs::STATUS_INVALID_PARAMETER, lease))
 }
 
 pub(super) unsafe fn acquire() -> Result<Lease, u32> {

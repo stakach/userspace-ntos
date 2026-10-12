@@ -57,8 +57,45 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
         })
     }
 
+    /// Catch up or repair both snapshot headers using a parsed WAL prefix and the same
+    /// physical device owner. Every existing header must name a frame boundary verified
+    /// by this WAL; no separately supplied anchor or reconstructed lease is accepted.
+    pub fn admit_verified_wal(
+        store: SnapshotBlockStore,
+        verified: crate::RegistryWalVerifiedDevice<D>,
+    ) -> Result<Self, (SnapshotBlockStoreError, crate::RegistryWalVerifiedDevice<D>)> {
+        let (device, prefix, record_end_lbas) = verified.into_parts();
+        let next = prefix.anchor();
+        let result = Self::admit_checked(store, device, next, |current| {
+            for anchor in current {
+                let exact_end = if anchor.serial == 0 {
+                    Some(0)
+                } else {
+                    usize::try_from(anchor.serial - 1)
+                        .ok()
+                        .and_then(|index| record_end_lbas.get(index).copied())
+                };
+                if anchor.incarnation != next.incarnation
+                    || anchor.serial > next.serial
+                    || exact_end != Some(anchor.end_lba)
+                {
+                    return Err(SnapshotBlockStoreError::Corrupt);
+                }
+            }
+            Ok(())
+        });
+        match result {
+            Ok(update) => Ok(update),
+            Err((error, device)) => Err((
+                error,
+                crate::RegistryWalVerifiedDevice::from_parts(device, prefix, record_end_lbas),
+            )),
+        }
+    }
+
     /// Repair or advance both copies to a prefix proven by a parsed WAL after reboot.
     /// The caller must replay that prefix into registry state before publishing it.
+    #[cfg(test)]
     pub fn admit_verified_prefix<W: SnapshotBlockDevice>(
         store: SnapshotBlockStore,
         device: D,

@@ -1,6 +1,6 @@
 use super::*;
 use crate::snapshot_test_device::CachedDisk;
-use crate::{BoundedBlockRange, SnapshotBlockStore, SnapshotReserve};
+use crate::{BoundedBlockRange, OwnedBoundedBlockRange, SnapshotBlockStore, SnapshotReserve, WalSnapshotAnchor};
 extern crate std;
 
 fn disk() -> CachedDisk {
@@ -360,4 +360,123 @@ fn bounded_view_never_writes_snapshot_slots() {
             payload: alloc::vec![3; 700]
         }]
     );
+}
+
+#[test]
+fn verified_prefix_transfers_the_same_owned_lease_for_anchor_publication() {
+    let reserve = SnapshotReserve::new(
+        CachedDisk::with_sectors(48),
+        13,
+        SnapshotBlockStore::new(0, 32),
+    );
+    let lease = reserve.try_acquire().unwrap();
+    let owned = match OwnedBoundedBlockRange::new(lease, 32, 16) {
+        Ok(owned) => owned,
+        Err((error, _)) => panic!("valid WAL range: {error:?}"),
+    };
+    let mut wal = RegistryWal::recover(owned, 77).unwrap();
+    wal.begin(alloc::vec![0x51; 600]).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+
+    let verified = wal.into_verified_device().unwrap();
+    assert_eq!(verified.anchor(), WalSnapshotAnchor {
+        incarnation: 77,
+        serial: 1,
+        end_lba: 4,
+    });
+    assert!(reserve.try_acquire().is_none());
+    let lease = verified.into_device().into_device();
+    assert_eq!(*lease.identity(), 13);
+    drop(lease);
+    assert!(reserve.try_acquire().is_some());
+}
+
+#[test]
+fn uncertain_prefix_transfer_refuses_to_release_the_owned_lease() {
+    let mut disk = CachedDisk::with_sectors(48);
+    disk.fail_event = Some(2);
+    let reserve = SnapshotReserve::new(disk, 14, SnapshotBlockStore::new(0, 32));
+    let lease = reserve.try_acquire().unwrap();
+    let owned = match OwnedBoundedBlockRange::new(lease, 32, 16) {
+        Ok(owned) => owned,
+        Err((error, _)) => panic!("valid WAL range: {error:?}"),
+    };
+    let mut wal = RegistryWal::recover(owned, 77).unwrap();
+    wal.begin(alloc::vec![0x51; 512]).unwrap();
+    assert_eq!(wal.prepare(), Err(RegistryWalError::Storage(SnapshotBlockStoreError::Io)));
+    let retained = wal.into_verified_device().err().unwrap();
+    assert_eq!(retained.state(), RegistryWalState::Uncertain);
+    assert!(reserve.try_acquire().is_none());
+    core::mem::forget(retained);
+    assert!(reserve.try_acquire().is_none());
+}
+
+#[test]
+fn verified_wal_device_advances_anchor_using_the_same_physical_lease() {
+    use crate::{WalSnapshotAnchorUpdate, WalSnapshotManifest};
+
+    let store = SnapshotBlockStore::new(0, 16);
+    let reserve = SnapshotReserve::new(CachedDisk::with_sectors(32), 15, store);
+    let mut lease = reserve.try_acquire().unwrap();
+    let baseline = WalSnapshotManifest {
+        incarnation: 77,
+        base_serial: 0,
+        high_water_serial: 0,
+        high_water_end_lba: 0,
+    };
+    store.commit_next_with_wal_manifest(&mut lease, b"older", baseline).unwrap();
+    store.commit_next_with_wal_manifest(&mut lease, b"newer", baseline).unwrap();
+    let owned = match OwnedBoundedBlockRange::new(lease, 16, 16) {
+        Ok(owned) => owned,
+        Err((error, _)) => panic!("valid WAL range: {error:?}"),
+    };
+    let mut wal = RegistryWal::recover(owned, 77).unwrap();
+    wal.begin(alloc::vec![7; 512]).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    let verified = wal.into_verified_device().unwrap();
+    let mut update = WalSnapshotAnchorUpdate::admit_verified_wal(
+        store,
+        verified.into_full_device(),
+    ).ok().unwrap();
+    assert!(reserve.try_acquire().is_none());
+    update.advance().unwrap();
+    let mut lease = update.into_device().unwrap();
+    assert_eq!(store.read_latest_wal(&mut lease).unwrap().unwrap().anchor,
+        WalSnapshotAnchor { incarnation: 77, serial: 1, end_lba: 3 });
+}
+
+#[test]
+fn rejected_anchor_admission_returns_verified_owner_with_lease_held() {
+    use crate::{WalSnapshotAnchorUpdate, WalSnapshotManifest};
+
+    let store = SnapshotBlockStore::new(0, 16);
+    let reserve = SnapshotReserve::new(CachedDisk::with_sectors(32), 16, store);
+    let mut lease = reserve.try_acquire().unwrap();
+    let incompatible = WalSnapshotManifest {
+        incarnation: 88,
+        base_serial: 0,
+        high_water_serial: 0,
+        high_water_end_lba: 0,
+    };
+    store.commit_next_with_wal_manifest(&mut lease, b"older", incompatible).unwrap();
+    store.commit_next_with_wal_manifest(&mut lease, b"newer", incompatible).unwrap();
+    let owned = match OwnedBoundedBlockRange::new(lease, 16, 16) {
+        Ok(owned) => owned,
+        Err((error, _)) => panic!("valid WAL range: {error:?}"),
+    };
+    let mut wal = RegistryWal::recover(owned, 77).unwrap();
+    wal.begin(alloc::vec![7; 512]).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    let verified = wal.into_verified_device().unwrap().into_full_device();
+    let (error, verified) = match WalSnapshotAnchorUpdate::admit_verified_wal(store, verified) {
+        Ok(_) => panic!("wrong incarnation must not advance anchor"),
+        Err(error) => error,
+    };
+    assert_eq!(error, SnapshotBlockStoreError::Corrupt);
+    assert!(reserve.try_acquire().is_none());
+    drop(verified.into_device());
+    assert!(reserve.try_acquire().is_some());
 }

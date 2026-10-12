@@ -81,8 +81,8 @@ pub use snapshot_store::{
     StoredWalSnapshot, WalSnapshotAnchor, WalSnapshotAnchorUpdate, WalSnapshotManifest,
 };
 pub use snapshot_reserve::{SnapshotReserve, SnapshotReserveLease};
-pub use snapshot_region::BoundedBlockRange;
-pub use registry_wal_store::{RegistryWal, RegistryWalError, RegistryWalRecord, RegistryWalState};
+pub use snapshot_region::{BoundedBlockRange, OwnedBoundedBlockRange};
+pub use registry_wal_store::{RegistryWal, RegistryWalError, RegistryWalRecord, RegistryWalState, RegistryWalVerifiedDevice, RegistryWalVerifiedPrefix};
 pub use status::*;
 pub use volume::*;
 

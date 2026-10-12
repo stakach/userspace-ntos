@@ -10,7 +10,7 @@
 use alloc::vec::Vec;
 use nt_config_store::codec::crc32c;
 
-use crate::{SnapshotBlockDevice, SnapshotBlockStoreError};
+use crate::{OwnedBoundedBlockRange, SnapshotBlockDevice, SnapshotBlockStoreError, WalSnapshotAnchor};
 
 const PREPARE_MAGIC: [u8; 8] = *b"USRWALP1";
 const COMMIT_MAGIC: [u8; 8] = *b"USRWALC1";
@@ -42,6 +42,56 @@ pub enum RegistryWalState {
 pub struct RegistryWalRecord {
     pub serial: u64,
     pub payload: Vec<u8>,
+}
+
+/// The exact committed prefix parsed or durably written before its device owner leaves
+/// the WAL. Only a settled WAL can issue this proof; callers may move the returned device
+/// into the two-header snapshot anchor update without reopening the physical reserve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegistryWalVerifiedPrefix {
+    incarnation: u64,
+    serial: u64,
+    end_lba: u64,
+}
+
+/// Carries a verified committed prefix with the exact device that supplied it. Native
+/// recovery and publication pass this owner directly to the snapshot anchor update.
+#[must_use = "retain the verified WAL device until its anchor is published or recovery is resolved"]
+pub struct RegistryWalVerifiedDevice<D> {
+    device: D,
+    prefix: RegistryWalVerifiedPrefix,
+    record_end_lbas: Vec<u64>,
+}
+
+impl<D> RegistryWalVerifiedDevice<D> {
+    pub fn anchor(&self) -> WalSnapshotAnchor { self.prefix.anchor() }
+    pub fn into_device(self) -> D { self.device }
+
+    pub(crate) fn into_parts(self) -> (D, RegistryWalVerifiedPrefix, Vec<u64>) {
+        (self.device, self.prefix, self.record_end_lbas)
+    }
+
+    pub(crate) fn from_parts(device: D, prefix: RegistryWalVerifiedPrefix, record_end_lbas: Vec<u64>) -> Self {
+        Self { device, prefix, record_end_lbas }
+    }
+}
+
+impl<D: SnapshotBlockDevice> RegistryWalVerifiedDevice<OwnedBoundedBlockRange<D>> {
+    /// Move from the bounded WAL view to its full parent without releasing the exact lease.
+    pub fn into_full_device(self) -> RegistryWalVerifiedDevice<D> {
+        let (device, prefix, record_end_lbas) = self.into_parts();
+        RegistryWalVerifiedDevice::from_parts(device.into_device(), prefix, record_end_lbas)
+    }
+}
+
+impl RegistryWalVerifiedPrefix {
+    pub fn anchor(self) -> WalSnapshotAnchor {
+        WalSnapshotAnchor {
+            incarnation: self.incarnation,
+            serial: self.serial,
+            end_lba: self.end_lba,
+        }
+    }
 }
 
 struct Pending {
@@ -514,6 +564,22 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
         } else {
             Err(self)
         }
+    }
+
+    /// Atomically transfer the settled device and its exact committed prefix. The same
+    /// physical lease can then enter [`crate::WalSnapshotAnchorUpdate::admit_verified_wal`]
+    /// without recreating storage authority or guessing the final frame boundary.
+    pub fn into_verified_device(mut self) -> Result<RegistryWalVerifiedDevice<D>, Self> {
+        if self.state != RegistryWalState::Ready {
+            return Err(self);
+        }
+        let (incarnation, serial, end_lba) = self.verified_prefix().expect("settled WAL prefix");
+        let prefix = RegistryWalVerifiedPrefix { incarnation, serial, end_lba };
+        Ok(RegistryWalVerifiedDevice::from_parts(
+            self.device.take().expect("retained WAL device"),
+            prefix,
+            core::mem::take(&mut self.record_end_lbas),
+        ))
     }
 
     #[cfg(test)]
