@@ -22,6 +22,7 @@ pub enum DeviceTextPublicationError {
     WrongRequest,
     WrongQuery,
     WrongPhase,
+    ProviderFailure(u32),
     WrongAllocation,
     MissingRead,
     OutOfBounds,
@@ -86,13 +87,13 @@ pub fn plan_device_text_publication(
             if allocation.is_some() || read.is_some() {
                 return Err(DeviceTextPublicationError::WrongAllocation);
             }
-            return Ok(DeviceTextPublication::NoText(
-                if status & 0x8000_0000 != 0 {
-                    NoDeviceText::Unsupported(status)
-                } else {
-                    NoDeviceText::Empty
-                },
-            ));
+            return match status {
+                0xc000_00bb => Ok(DeviceTextPublication::NoText(NoDeviceText::Unsupported(
+                    status,
+                ))),
+                0 => Ok(DeviceTextPublication::NoText(NoDeviceText::Empty)),
+                _ => Err(DeviceTextPublicationError::ProviderFailure(status)),
+            };
         }
         BufferPhase::Published => {}
         _ => return Err(DeviceTextPublicationError::WrongPhase),
@@ -120,12 +121,6 @@ pub fn plan_device_text_publication(
         return Ok(DeviceTextPublication::NoText(NoDeviceText::Empty));
     }
     let value_bytes = (end + 1) * 2;
-    let text_units = read[..value_bytes - 2]
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
-    if core::char::decode_utf16(text_units).any(|unit| unit.is_err()) {
-        return Err(DeviceTextPublicationError::MalformedUtf16);
-    }
     let mut data = Vec::new();
     data.try_reserve_exact(value_bytes)
         .map_err(|_| DeviceTextPublicationError::InsufficientResources)?;

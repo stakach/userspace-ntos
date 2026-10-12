@@ -106,6 +106,18 @@ fn unsupported_and_empty_are_distinct_and_never_create_a_label() {
             NOT_SUPPORTED
         )))
     );
+    let mut failed_catalog = ReturnedPnpBufferCatalog::new().unwrap();
+    let failed_ticket = failed_catalog.prepare(request).unwrap();
+    let provider_failure = 0xc000_009a;
+    failed_catalog
+        .publish_terminal(failed_ticket, request, provider_failure, 0, None)
+        .unwrap();
+    assert_eq!(
+        plan_device_text_publication(&failed_catalog, failed_ticket, request, None, None, false),
+        Err(DeviceTextPublicationError::ProviderFailure(
+            provider_failure
+        ))
+    );
     let (catalog, ticket) = published(other_request());
     assert_eq!(
         plan_device_text_publication(
@@ -124,7 +136,7 @@ fn unsupported_and_empty_are_distinct_and_never_create_a_label() {
 fn malformed_or_out_of_allocation_text_never_yields_registry_data() {
     let request = request();
     let (catalog, ticket) = published(request);
-    for bad in [&[b'A', 0][..], &[0x00, 0xd8, 0, 0][..], &[b'A'][..]] {
+    for bad in [&[b'A', 0][..], &[b'A'][..]] {
         assert!(plan_device_text_publication(
             &catalog,
             ticket,
@@ -135,6 +147,23 @@ fn malformed_or_out_of_allocation_text_never_yields_registry_data() {
         )
         .is_err());
     }
+    // ReactOS copies WCHAR units into REG_SZ without Unicode scalar validation.
+    let unpaired_surrogate = [0x00, 0xd8, 0, 0];
+    assert_eq!(
+        plan_device_text_publication(
+            &catalog,
+            ticket,
+            request,
+            Some(allocation()),
+            Some(&unpaired_surrogate),
+            false,
+        ),
+        Ok(DeviceTextPublication::Write(DeviceTextRegistryValue {
+            name: "DeviceDesc",
+            value_type: REG_SZ,
+            data: unpaired_surrogate.to_vec(),
+        }))
+    );
     assert_eq!(
         plan_device_text_publication(
             &catalog,
