@@ -114,6 +114,8 @@ mod hosted_file_lifecycle_owners;
 mod hosted_file_retirements;
 #[path = "hosted_source_irp_ledger.rs"]
 mod hosted_source_irp_ledger;
+#[path = "hosted_start_io.rs"]
+mod hosted_start_io;
 #[path = "hosted_synchronous_fsd_request.rs"]
 mod hosted_synchronous_fsd_request;
 #[path = "hosted_source_create_security.rs"]
@@ -5342,6 +5344,7 @@ const HOSTED_DEVICE_OP_ROLLBACK_ATTACH_SAFE: u64 = 18;
 const HOSTED_DEVICE_OP_REGISTER_FILE_SYSTEM: u64 = 19;
 const HOSTED_DEVICE_OP_UNREGISTER_FILE_SYSTEM: u64 = 20;
 const HOSTED_DEVICE_OP_REPORT_POWER_STATE: u64 = 21;
+const HOSTED_DEVICE_OP_SET_START_IO_ATTRIBUTES: u64 = 22;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN: u64 = 0;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF: u64 = 2;
 const HOSTED_DEVICE_ARG_DATA_OFF: u64 = FSD_ARG_BYTES;
@@ -32661,6 +32664,10 @@ fn register_fsd_trampolines() -> bool {
         s_io_release_cancel_spin_lock as *const () as usize as u64,
     );
     reg.bind(
+        "IoSetStartIoAttributes",
+        hosted_start_io::s_io_set_start_io_attributes as *const () as usize as u64,
+    );
+    reg.bind(
         "IoCsqInitialize",
         s_io_csq_initialize as *const () as usize as u64,
     );
@@ -51866,13 +51873,14 @@ pub(crate) fn service_hosted_device(
             | HOSTED_DEVICE_OP_REGISTER_FILE_SYSTEM
             | HOSTED_DEVICE_OP_UNREGISTER_FILE_SYSTEM
             | HOSTED_DEVICE_OP_REPORT_POWER_STATE
+            | HOSTED_DEVICE_OP_SET_START_IO_ATTRIBUTES
     ) {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
     }
     if op == HOSTED_DEVICE_OP_REPORT_POWER_STATE {
         return hosted_power_broker::service_report(ch, pdo_object, arg2, arg3, active_reply_cap, caller_badge);
     }
-    if matches!(op, HOSTED_DEVICE_OP_CREATE | HOSTED_DEVICE_OP_ATTACH | HOSTED_DEVICE_OP_DETACH | HOSTED_DEVICE_OP_DELETE | HOSTED_DEVICE_OP_ATTACH_SAFE | HOSTED_DEVICE_OP_ROLLBACK_ATTACH_SAFE | HOSTED_DEVICE_OP_REGISTER_FILE_SYSTEM | HOSTED_DEVICE_OP_UNREGISTER_FILE_SYSTEM) {
+    if matches!(op, HOSTED_DEVICE_OP_CREATE | HOSTED_DEVICE_OP_ATTACH | HOSTED_DEVICE_OP_DETACH | HOSTED_DEVICE_OP_DELETE | HOSTED_DEVICE_OP_ATTACH_SAFE | HOSTED_DEVICE_OP_ROLLBACK_ATTACH_SAFE | HOSTED_DEVICE_OP_REGISTER_FILE_SYSTEM | HOSTED_DEVICE_OP_UNREGISTER_FILE_SYSTEM | HOSTED_DEVICE_OP_SET_START_IO_ATTRIBUTES) {
         let Some((_, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
             return (STATUS_ACCESS_DENIED, 0, 0, 0);
         };
@@ -51902,6 +51910,9 @@ pub(crate) fn service_hosted_device(
             Ok(top) => (STATUS_SUCCESS, top, 0, 0),
             Err(status) => (status.raw(), 0, 0, 0),
         };
+    }
+    if op == HOSTED_DEVICE_OP_SET_START_IO_ATTRIBUTES {
+        return hosted_start_io::service_set_attributes(ch, pdo_object, arg2, arg3, active_reply_cap);
     }
     if op == HOSTED_DEVICE_OP_REGISTER_FILE_SYSTEM
         || op == HOSTED_DEVICE_OP_UNREGISTER_FILE_SYSTEM

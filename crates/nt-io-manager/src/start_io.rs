@@ -154,7 +154,16 @@ fn finish<O>(d: &mut Device<O>, writes: &mut Writes) -> Result<Option<(Option<u3
 }
 
 pub fn set_attributes<M: LockedStartIoMemory>(memory: &mut M, address: u64, deferred: bool, no_cancel: bool) -> Result<(), Error<M::Error>> {
-    let d = device(memory, address)?;
+    // IoSetStartIoAttributes only updates DEVOBJ_EXTENSION flags. It is valid before a
+    // DriverStartIo routine is installed and does not inspect the packet queue, CurrentIrp or
+    // deferred count. The adapter still has to admit the exact live device/extension storage.
+    let d = memory.device(address).map_err(Error::Memory)?;
+    if d.address != address || address == 0 || address & 15 != 0
+        || address.checked_add(0x150).is_none()
+        || d.extension < address + 0x150 || d.extension & 15 != 0
+        || d.extension.checked_add(0x50).is_none()
+    { return Err(Error::InvalidDevice); }
+    memory.validate_device_owner(&d).map_err(Error::Memory)?;
     let flags = d.flags | if deferred { DEFERRED } else { 0 } | if no_cancel { NO_CANCEL } else { 0 };
     memory.commit_start_io(&[DeviceQueueWrite::U32 { address: d.extension + 0x40, value: flags }]);
     Ok(())

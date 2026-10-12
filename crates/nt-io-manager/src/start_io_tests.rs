@@ -12,10 +12,12 @@ const C: u64 = 0x600;
 
 #[derive(Debug, PartialEq, Eq)]
 struct Owner { address: u64, generation: u64 }
-struct Memory { bytes: Vec<u8>, generation: u64, refused: Option<u64>, commits: usize }
+struct Memory { bytes: Vec<u8>, generation: u64, refused: Option<u64>, commits: usize,
+    start_io: u64, queue_address: u64, refuse_device_owner: bool }
 impl Memory {
     fn new() -> Self {
-        let mut m = Self { bytes: vec![0; 2048], generation: 1, refused: None, commits: 0 };
+        let mut m = Self { bytes: vec![0; 2048], generation: 1, refused: None, commits: 0,
+            start_io: 0x9000, queue_address: D + 0xa0, refuse_device_owner: false };
         initialize_device_queue(&mut m, D + 0xa0).unwrap();
         m
     }
@@ -57,12 +59,13 @@ impl LockedDeviceQueueMemory for Memory {
 impl LockedStartIoMemory for Memory {
     type Owner = Owner;
     fn validate_device_owner(&self, retained: &Device<Owner>) -> Result<(), Self::Error> {
-        if retained.owner.address == D && retained.owner.generation == self.generation { Ok(()) } else { Err("retired device generation") }
+        if !self.refuse_device_owner && retained.owner.address == D
+            && retained.owner.generation == self.generation { Ok(()) } else { Err("retired device generation") }
     }
     fn device(&self, address: u64) -> Result<Device<Owner>, Self::Error> {
         if address != D || self.refused == Some(address) { return Err("device authority"); }
-        Ok(Device { address, queue: D + 0xa0, extension: X, current_irp: self.u64(D + 0x20),
-            start_io: 0x9000, count: self.u32(X + 0x38), key: self.u32(X + 0x3c), flags: self.u32(X + 0x40),
+        Ok(Device { address, queue: self.queue_address, extension: X, current_irp: self.u64(D + 0x20),
+            start_io: self.start_io, count: self.u32(X + 0x38), key: self.u32(X + 0x3c), flags: self.u32(X + 0x40),
             owner: Owner { address, generation: self.generation } })
     }
     fn packet(&self, entry: u64, _: Option<u64>) -> Result<Packet<Owner>, Self::Error> {
@@ -87,6 +90,35 @@ impl LockedStartIoMemory for Memory {
         }
     }
     fn commit_start_io(&mut self, writes: &[DeviceQueueWrite]) { self.apply_writes(writes); }
+}
+
+#[test]
+fn attributes_ignore_unrelated_packet_state_and_only_or_extension_flags() {
+    let mut m = Memory::new();
+    m.start_io = 0;
+    m.queue_address = 0;
+    m.put64(D + 0x20, 0xffff_ffff_ffff_fff8);
+    m.put32(X + 0x38, u32::MAX);
+    m.put32(X + 0x40, 0x8000);
+    let before = m.bytes.clone();
+    let commits = m.commits;
+    set_attributes(&mut m, D, true, true).unwrap();
+    assert_eq!(m.u32(X + 0x40), 0x8000 | DEFERRED | NO_CANCEL);
+    assert_eq!(m.commits, commits + 1);
+    assert_eq!(&m.bytes[..(X + 0x40) as usize], &before[..(X + 0x40) as usize]);
+    assert_eq!(&m.bytes[(X + 0x44) as usize..], &before[(X + 0x44) as usize..]);
+}
+
+#[test]
+fn attributes_refuse_retired_device_owner_before_flag_write() {
+    let mut m = Memory::new();
+    m.refuse_device_owner = true;
+    let before = m.bytes.clone();
+    let commits = m.commits;
+    assert_eq!(set_attributes(&mut m, D, true, true),
+        Err(Error::Memory("retired device generation")));
+    assert_eq!(m.bytes, before);
+    assert_eq!(m.commits, commits);
 }
 
 #[test]
