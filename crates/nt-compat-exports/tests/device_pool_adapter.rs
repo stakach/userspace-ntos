@@ -267,6 +267,21 @@ fn actual_adapter_protects_exact_allocations_and_retains_uncertain_retirement() 
         native::finish_retirement(retirement).unwrap();
         assert!(native::instance_quiesced(foreign.inst));
         assert!(native::protects_allocation(uncertain.inst, ADDRESS));
+
+        // A private graph member may be freed only with the allocation captured at creation.
+        // A reused address with a new pool generation cannot acknowledge the old owner.
+        let member_domain = io.register_hosted_domain();
+        let member = Pool::new(member_domain, 17, 0x7000);
+        let captured = native::capture_allocation(member.inst, ADDRESS).unwrap();
+        member.set_generation(18);
+        assert!(!native::free_captured_allocation(member.inst, captured));
+        {
+            let _pool = hosted_instance_pool_lock(member.inst.exec_pool_va).unwrap();
+            assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(member.inst, ADDRESS), Some(false));
+        }
+        member.set_generation(17);
+        assert!(native::free_captured_allocation(member.inst, captured));
+        assert!(!native::free_captured_allocation(member.inst, captured));
         // Leak only uncertain backing: actual retained catalog authority must not outlive it.
         std::mem::forget(uncertain);
     }

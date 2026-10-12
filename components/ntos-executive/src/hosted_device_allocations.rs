@@ -287,6 +287,24 @@ pub(super) unsafe fn capture_allocation(
     allocation(inst, address)
 }
 
+/// Free one row-owned graph member only when its original physical allocation is still live.
+/// The caller clears its ownership bit only after this exact free acknowledges success.
+pub(super) unsafe fn free_captured_allocation(
+    inst: DriverInstance,
+    expected: SourcePoolAllocationIdentity,
+) -> bool {
+    let Ok(_projection) = generic_free_admission(inst, expected.component_address) else {
+        return false;
+    };
+    let Some(_pool) = hosted_instance_pool_lock(inst.exec_pool_va) else {
+        return false;
+    };
+    if allocation(inst, expected.component_address) != Ok(expected) {
+        return false;
+    }
+    hosted_instance_pool_free_unlocked(inst, expected.component_address)
+}
+
 /// Root rollback may free only the exact captured constructor set, not another chain.
 pub(super) unsafe fn validate_rollback_allocations(
     inst: DriverInstance,

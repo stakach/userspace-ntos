@@ -17647,6 +17647,7 @@ struct HostedProviderMiniportInterruptShadow {
     device_id: u64,
     dependent_component_va: u64,
     provider_component_va: u64,
+    provider_allocation: Option<nt_io_manager::source_irp_auxiliary::SourcePoolAllocationIdentity>,
     provider_component_owned_by_bridge: bool,
     bytes: u64,
 }
@@ -17662,6 +17663,7 @@ impl HostedProviderMiniportInterruptShadow {
             device_id: 0,
             dependent_component_va: 0,
             provider_component_va: 0,
+            provider_allocation: None,
             provider_component_owned_by_bridge: false,
             bytes: 0,
         }
@@ -24076,6 +24078,7 @@ unsafe fn allocate_hosted_provider_miniport_interrupt_shadow(
         device_id: binding.device_id,
         dependent_component_va,
         provider_component_va: 0,
+        provider_allocation: None,
         provider_component_owned_by_bridge: false,
         bytes: NDIS_MINIPORT_INTERRUPT_LEN_X64,
     };
@@ -24127,6 +24130,13 @@ unsafe fn allocate_hosted_provider_miniport_interrupt_shadow(
         record.provider_component_va = provider_component_va;
         record.provider_component_owned_by_bridge = true;
     }
+    let identity = match hosted_device_allocations::capture_allocation(provider_inst, provider_component_va) {
+        Ok(identity) => identity,
+        Err(status) => return Err(retain_or_clear_failed_hosted_provider_miniport_interrupt_construction(
+            construction_index, status.raw(),
+        )),
+    };
+    hosted_provider_miniport_interrupt_shadows_mut()[construction_index].provider_allocation = Some(identity);
     if component_to_exec_va_for_instance(
         provider_instance,
         provider_inst,
@@ -24162,13 +24172,11 @@ unsafe fn release_hosted_provider_miniport_interrupt_shadow_record(
         return false;
     }
     if record.provider_component_owned_by_bridge {
-        if !release_hosted_provider_owned_pool_allocation(
-            record.owner,
-            record.provider_instance,
-            record.dependent_instance,
-            record.provider_instance,
-            record.provider_component_va,
-        ) {
+        let Some(identity) = record.provider_allocation else { return false; };
+        if identity.component_address != record.provider_component_va
+            || !instance(record.provider_instance).is_some_and(|inst|
+                hosted_device_allocations::free_captured_allocation(inst, identity))
+        {
             return false;
         }
         record.provider_component_owned_by_bridge = false;
