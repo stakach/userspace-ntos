@@ -18,6 +18,66 @@ use fixture::{
 };
 
 #[test]
+fn native_pre_entry_refusal_can_cancel_only_its_unentered_catalog_row() {
+    let mut catalog = ReturnedPnpBufferCatalog::new().unwrap();
+    let request = request();
+    let (ticket, permit) = catalog.prepare_for_entry(request).unwrap();
+    assert_eq!(catalog.snapshot(ticket).unwrap().phase, BufferPhase::Prepared);
+    assert!(catalog.blocks_arena_teardown(request.source_arena));
+    assert!(catalog.blocks_arena_teardown(request.expected_allocator));
+    assert_eq!(
+        catalog.publish_terminal(ticket, request, NOT_SUPPORTED, 0, None),
+        Err(ReturnedPnpBufferError::WrongPhase),
+    );
+    catalog.cancel_before_entry(permit).unwrap();
+    assert_eq!(catalog.snapshot(ticket), Err(ReturnedPnpBufferError::NotFound));
+    assert!(!catalog.blocks_arena_teardown(request.source_arena));
+    assert!(!catalog.blocks_arena_teardown(request.expected_allocator));
+    assert!(catalog.prepare_for_entry(request).is_ok());
+}
+
+#[test]
+fn native_entry_consumes_rollback_authority_and_keeps_uncertain_returned_storage() {
+    let mut catalog = ReturnedPnpBufferCatalog::new().unwrap();
+    let request = request();
+    let returned = allocation();
+    let (ticket, permit) = catalog.prepare_for_entry(request).unwrap();
+    assert_eq!(catalog.enter(permit), Ok(ticket));
+    assert_eq!(catalog.snapshot(ticket).unwrap().phase, BufferPhase::Entered);
+    assert!(catalog.retire_no_buffer(ticket).is_err());
+    assert!(catalog.blocks_arena_teardown(request.source_arena));
+    assert!(catalog.blocks_arena_teardown(request.expected_allocator));
+    assert_eq!(
+        catalog
+            .publish_terminal(
+                ticket,
+                request,
+                SUCCESS,
+                returned.pool.component_address,
+                Some(returned),
+            )
+            .unwrap(),
+        TerminalOutcome::Published(ticket),
+    );
+    let release = catalog.begin_release(ticket, returned).unwrap();
+    catalog.observe_release(release, ReleaseResult::Uncertain).unwrap();
+    assert!(catalog.blocks_pool_free(returned.arena, returned.pool.component_address));
+    assert!(catalog.blocks_arena_teardown(returned.arena));
+    assert!(catalog.prepare_for_entry(request).is_err());
+}
+
+#[test]
+fn pre_entry_permit_is_bound_to_its_issuing_catalog() {
+    let mut first = ReturnedPnpBufferCatalog::new().unwrap();
+    let mut other = ReturnedPnpBufferCatalog::new().unwrap();
+    let request = request();
+    let (ticket, permit) = first.prepare_for_entry(request).unwrap();
+    assert_eq!(other.cancel_before_entry(permit), Err(ReturnedPnpBufferError::ForeignTicket));
+    assert_eq!(first.snapshot(ticket).unwrap().phase, BufferPhase::Prepared);
+    assert!(first.blocks_arena_teardown(request.source_arena));
+}
+
+#[test]
 fn identical_inflight_request_cannot_gain_second_publication_or_release_authority() {
     let mut catalog = ReturnedPnpBufferCatalog::new().unwrap();
     let request = request();

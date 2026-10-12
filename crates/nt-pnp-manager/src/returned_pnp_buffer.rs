@@ -123,6 +123,13 @@ pub struct ReturnedPnpBufferTicket {
     serial: u64,
 }
 
+/// Sole authority to cancel a prepared request before native driver entry. The native adapter
+/// must consume this permit immediately before invoking the driver; losing it retains the row.
+#[must_use = "enter the driver or cancel only after proving it was never entered"]
+pub struct PreEntryPermit {
+    ticket: ReturnedPnpBufferTicket,
+}
+
 /// A single release intent, tied to the issuing catalog and exact retained allocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReleaseToken {
@@ -133,6 +140,7 @@ pub struct ReleaseToken {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BufferPhase {
     Prepared,
+    Entered,
     Published,
     Releasing,
     TerminalNoBuffer { status: u32 },
@@ -178,6 +186,7 @@ pub enum ReturnedPnpBufferError {
 struct Row {
     ticket: ReturnedPnpBufferTicket,
     snapshot: BufferSnapshot,
+    requires_entry: bool,
 }
 
 /// No Clone implementation: local tickets and release tokens belong to one catalog incarnation.
@@ -205,6 +214,24 @@ impl ReturnedPnpBufferCatalog {
     pub fn prepare(
         &mut self,
         request: ReturnedPnpRequest,
+    ) -> Result<ReturnedPnpBufferTicket, ReturnedPnpBufferError> {
+        self.prepare_row(request, false)
+    }
+
+    /// Native path: the non-copyable permit owns the only pre-entry rollback authority.
+    /// A terminal result is refused until the adapter consumes it at the driver-entry boundary.
+    pub fn prepare_for_entry(
+        &mut self,
+        request: ReturnedPnpRequest,
+    ) -> Result<(ReturnedPnpBufferTicket, PreEntryPermit), ReturnedPnpBufferError> {
+        let ticket = self.prepare_row(request, true)?;
+        Ok((ticket, PreEntryPermit { ticket }))
+    }
+
+    fn prepare_row(
+        &mut self,
+        request: ReturnedPnpRequest,
+        requires_entry: bool,
     ) -> Result<ReturnedPnpBufferTicket, ReturnedPnpBufferError> {
         if !request.valid() {
             return Err(ReturnedPnpBufferError::InvalidRequest);
@@ -234,9 +261,40 @@ impl ReturnedPnpBufferCatalog {
                 phase: BufferPhase::Prepared,
                 allocation: None,
             },
+            requires_entry,
         });
         self.next_serial = next;
         Ok(ticket)
+    }
+
+    /// Consume rollback authority before a possible native effect. From here, a missing or
+    /// ambiguous reply cannot discard the row; only its exact terminal outcome can retire it.
+    pub fn enter(
+        &mut self,
+        permit: PreEntryPermit,
+    ) -> Result<ReturnedPnpBufferTicket, ReturnedPnpBufferError> {
+        let index = self.index(permit.ticket)?;
+        let row = &mut self.rows[index];
+        if !row.requires_entry || row.snapshot.phase != BufferPhase::Prepared {
+            return Err(ReturnedPnpBufferError::WrongPhase);
+        }
+        row.snapshot.phase = BufferPhase::Entered;
+        Ok(permit.ticket)
+    }
+
+    /// Remove only a native request for which the adapter still holds its pre-entry permit and
+    /// has proved that no driver entry or other native effect was attempted.
+    pub fn cancel_before_entry(
+        &mut self,
+        permit: PreEntryPermit,
+    ) -> Result<(), ReturnedPnpBufferError> {
+        let index = self.index(permit.ticket)?;
+        let row = &self.rows[index];
+        if !row.requires_entry || row.snapshot.phase != BufferPhase::Prepared {
+            return Err(ReturnedPnpBufferError::WrongPhase);
+        }
+        self.rows.swap_remove(index);
+        Ok(())
     }
 
     /// No allocation or native effects. Any rejection leaves the prepared owner unchanged.
@@ -253,7 +311,9 @@ impl ReturnedPnpBufferCatalog {
         if before.request != request {
             return Err(ReturnedPnpBufferError::WrongIdentity);
         }
-        if before.phase != BufferPhase::Prepared {
+        if before.phase != BufferPhase::Entered
+            && (before.phase != BufferPhase::Prepared || self.rows[index].requires_entry)
+        {
             return Err(ReturnedPnpBufferError::WrongPhase);
         }
         if status == 0x103 {
