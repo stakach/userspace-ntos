@@ -79,3 +79,36 @@ fn pending_lifecycle_acks_exact_provider_before_state_publication() {
     assert!(poll.contains("poll_hosted_completion_at_storage(dependent_instance, provider.storage_instance)"));
     assert!(!poll.contains("io_manager_mut"));
 }
+
+#[test]
+fn no_entry_ack_retry_keeps_exact_owner_and_provider_out_of_completion_drain() {
+    let retry = between(
+        SOURCE,
+        "unsafe fn retry_hosted_detached_lifecycle_ack(",
+        "unsafe fn drain_hosted_pnp_completions()",
+    );
+    for required in [
+        "HostedDetachedPnpOwner::AckReturned(returned)",
+        "CompletionAcknowledgement::NotEntered",
+        "detached_provider_lease.is_some()",
+        "hosted_pnp_physical_provider_current(provider)",
+        "retry_external_pnp_completion(returned)",
+        "DetachedAckInFlight",
+        "control_exact_storage(",
+        "finish_hosted_detached_lifecycle_ack(irp_id, returned)",
+    ] {
+        assert!(retry.contains(required), "missing checked ACK retry step: {required}");
+    }
+    let drain = between(
+        SOURCE,
+        "unsafe fn drain_hosted_pnp_completions()",
+        "pub(crate) unsafe fn observe_hosted_pnp_start(",
+    );
+    assert!(!drain.contains("retry_hosted_detached_lifecycle_ack(irp_id)"));
+    let observe = between(
+        SOURCE,
+        "pub(crate) unsafe fn observe_hosted_pnp_lifecycle(",
+        "pub(crate) unsafe fn abandon_pending_irp(",
+    );
+    assert!(observe.contains("retry_hosted_detached_lifecycle_ack(irp_id)"));
+}

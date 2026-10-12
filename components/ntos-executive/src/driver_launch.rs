@@ -43377,17 +43377,36 @@ unsafe fn drain_hosted_detached_lifecycle_completion(irp_id: IrpId) -> bool {
             &mut [],
         ))
     });
+    finish_hosted_detached_lifecycle_ack(irp_id, returned)
+}
+
+unsafe fn finish_hosted_detached_lifecycle_ack(
+    irp_id: IrpId,
+    returned: nt_io_manager::ExternalPnpCompletionReturn,
+) -> bool {
     let (receipt, payload) = match io_manager_mut().finish_external_pnp_completion(returned) {
         Ok(terminal) => terminal,
         Err(rejection) => {
             let status = rejection.status();
+            let not_entered = matches!(
+                rejection.owner().acknowledgement(),
+                nt_io_manager::CompletionAcknowledgement::NotEntered { .. }
+            );
             retain_hosted_detached_pnp_owner(
                 irp_id,
                 HostedDetachedPnpOwner::AckReturned(rejection.into_owner()),
             )
             .expect("rejected detached lifecycle ACK result lost its owner");
-            set_hosted_pnp_indeterminate(irp_id, status)
-                .expect("rejected detached lifecycle ACK result lost its transaction");
+            if not_entered {
+                transition_hosted_pnp_transaction_phase(
+                    irp_id,
+                    HostedPnpTransactionPhase::DetachedAckRetry,
+                )
+                .expect("no-entry detached lifecycle ACK lost its retry phase");
+            } else {
+                set_hosted_pnp_indeterminate(irp_id, status)
+                    .expect("rejected detached lifecycle ACK result lost its transaction");
+            }
             return true;
         }
     };
@@ -43407,6 +43426,69 @@ unsafe fn drain_hosted_detached_lifecycle_completion(irp_id: IrpId) -> bool {
             .expect("detached lifecycle could not become terminal");
     }
     true
+}
+
+/// One retry per external lifecycle observation. The completion drain never retries this phase,
+/// so a provider that repeatedly refuses entry cannot spin inside one completion pump.
+unsafe fn retry_hosted_detached_lifecycle_ack(irp_id: IrpId) {
+    let (provider, leased, not_entered) = {
+        let transaction = hosted_pnp_transactions_mut()
+            .iter()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .expect("retryable detached lifecycle transaction disappeared");
+        (
+            transaction.detached_provider.expect("retryable ACK lost its provider"),
+            transaction.detached_provider_lease.is_some(),
+            matches!(
+                transaction.detached_owner.as_ref(),
+                Some(HostedDetachedPnpOwner::AckReturned(returned))
+                    if matches!(returned.acknowledgement(),
+                        nt_io_manager::CompletionAcknowledgement::NotEntered { .. })
+            ),
+        )
+    };
+    if !not_entered || provider.publication_cookie != 0 && !leased
+        || !hosted_pnp_physical_provider_current(provider)
+    {
+        set_hosted_pnp_indeterminate(irp_id, nt_status::NtStatus::DEVICE_NOT_CONNECTED)
+            .expect("retryable detached lifecycle lost its provider");
+        return;
+    }
+    let owner = hosted_pnp_transactions_mut()
+        .iter_mut()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .and_then(|transaction| transaction.detached_owner.take())
+        .expect("retryable detached lifecycle ACK lost its owner");
+    let HostedDetachedPnpOwner::AckReturned(returned) = owner else {
+        unreachable!("retryable detached lifecycle ACK has the wrong owner")
+    };
+    let invocation = match io_manager_mut().retry_external_pnp_completion(returned) {
+        Ok(invocation) => invocation,
+        Err(rejection) => {
+            let status = rejection.status();
+            retain_hosted_detached_pnp_owner(
+                irp_id,
+                HostedDetachedPnpOwner::AckReturned(rejection.into_owner()),
+            )
+            .expect("rejected detached lifecycle retry lost its owner");
+            set_hosted_pnp_indeterminate(irp_id, status)
+                .expect("rejected detached lifecycle retry lost its transaction");
+            return;
+        }
+    };
+    transition_hosted_pnp_transaction_phase(irp_id, HostedPnpTransactionPhase::DetachedAckInFlight)
+        .expect("retryable detached lifecycle ACK lost its transaction phase");
+    let returned = invocation.invoke(|_| {
+        hosted_file_dispatch::acknowledgement_result(hosted_file_dispatch::control_exact_storage(
+            provider.storage_instance,
+            provider.storage_domain,
+            irp_id,
+            FSD_DISPATCH_ACK_COMPLETION,
+            0,
+            &mut [],
+        ))
+    });
+    finish_hosted_detached_lifecycle_ack(irp_id, returned);
 }
 
 unsafe fn drain_hosted_pnp_completions() -> usize {
@@ -43586,6 +43668,7 @@ unsafe fn drain_hosted_pnp_completions() -> usize {
             HostedPnpTransactionPhase::Prepared
             | HostedPnpTransactionPhase::DetachedDispatchInFlight
             | HostedPnpTransactionPhase::DetachedAckInFlight
+            | HostedPnpTransactionPhase::DetachedAckRetry
             | HostedPnpTransactionPhase::Terminal
             | HostedPnpTransactionPhase::Indeterminate => {
                 index += 1;
@@ -43639,6 +43722,7 @@ pub(crate) unsafe fn observe_hosted_pnp_start(
         | HostedPnpTransactionPhase::DetachedDispatchInFlight
         | HostedPnpTransactionPhase::AwaitingCompletion
         | HostedPnpTransactionPhase::DetachedAckInFlight
+        | HostedPnpTransactionPhase::DetachedAckRetry
         | HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck
         | HostedPnpTransactionPhase::PostPublicationRepair => {
             Ok(HostedPnpStartObservation::AwaitingCompletion)
@@ -43805,6 +43889,13 @@ pub(crate) unsafe fn observe_hosted_pnp_lifecycle(
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
     let irp_id = IrpId(irp_id);
+    if hosted_pnp_transactions_mut().iter().any(|transaction| {
+        transaction.irp_id == irp_id
+            && transaction.minor == expected_minor
+            && transaction.phase == HostedPnpTransactionPhase::DetachedAckRetry
+    }) {
+        retry_hosted_detached_lifecycle_ack(irp_id);
+    }
     let transactions = hosted_pnp_transactions_mut();
     let index = transactions
         .iter()
@@ -43834,6 +43925,7 @@ pub(crate) unsafe fn observe_hosted_pnp_lifecycle(
         | HostedPnpTransactionPhase::DetachedDispatchInFlight
         | HostedPnpTransactionPhase::AwaitingCompletion
         | HostedPnpTransactionPhase::DetachedAckInFlight
+        | HostedPnpTransactionPhase::DetachedAckRetry
         | HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck
         | HostedPnpTransactionPhase::PostPublicationRepair => {
             Ok(HostedPnpLifecycleObservation::AwaitingCompletion)
@@ -46437,6 +46529,7 @@ enum HostedPnpTransactionPhase {
     DetachedDispatchInFlight,
     AwaitingCompletion,
     DetachedAckInFlight,
+    DetachedAckRetry,
     LifecycleCommittedAwaitingAck,
     PostPublicationRepair,
     Terminal,
@@ -48612,6 +48705,12 @@ unsafe fn transition_hosted_pnp_transaction_phase(
         ) | (
             HostedPnpTransactionPhase::DetachedAckInFlight,
             HostedPnpTransactionPhase::PostPublicationRepair
+        ) | (
+            HostedPnpTransactionPhase::DetachedAckInFlight,
+            HostedPnpTransactionPhase::DetachedAckRetry
+        ) | (
+            HostedPnpTransactionPhase::DetachedAckRetry,
+            HostedPnpTransactionPhase::DetachedAckInFlight
         ) | (
             HostedPnpTransactionPhase::Dispatching,
             HostedPnpTransactionPhase::PostPublicationRepair

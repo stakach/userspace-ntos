@@ -72,8 +72,11 @@ impl ExternalPnpCompletionReturn {
     }
     /// Only checked no-effect refusal permits another foreign ACK. Accepted and uncertain
     /// operations retain the exact response for local settlement, never another invocation.
-    pub fn retry(self) -> Result<ExternalPnpCompletionInvocation, Self> {
-        if self.acknowledgement.permits_retry() {
+    pub(crate) fn retry(self) -> Result<ExternalPnpCompletionInvocation, Self> {
+        if matches!(
+            self.acknowledgement,
+            CompletionAcknowledgement::NotEntered { .. }
+        ) {
             Ok(self.invocation)
         } else {
             Err(self)
@@ -82,6 +85,30 @@ impl ExternalPnpCompletionReturn {
 }
 
 impl<P: ObjectManagerPort> IoManager<P> {
+    fn validate_external_pnp_completion_return(
+        &self,
+        returned: &ExternalPnpCompletionReturn,
+    ) -> Result<(), NtStatus> {
+        let invocation = &returned.invocation;
+        self.validate_external_pnp_invocation(&invocation.owner.owner.invocation)?;
+        let completion = &invocation.completion;
+        let irp = self.irp(completion.id).ok_or(NtStatus::INVALID_PARAMETER)?;
+        if irp.completion_ack_reservation != Some(invocation.reservation)
+            || !invocation
+                .reservation
+                .matches(self.ownership_identity(), completion.id)
+            || self.completed_irp_snapshot(completion.id).as_ref() != Some(completion)
+            || !self.completed_irps.contains(&completion.id)
+            || self
+                .driver(completion.completion_driver_id)
+                .map(|driver| driver.backend.0 as usize)
+                != Some(invocation.backend_index)
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(())
+    }
+
     pub fn prepare_external_pnp_completion(
         &mut self,
         retained: RetainedExternalPnp,
@@ -151,26 +178,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
         (ExternalPnpTerminalReceipt, Vec<u8>),
         ExternalPnpCompletionRejection<ExternalPnpCompletionReturn>,
     > {
-        let valid = (|| {
-            let invocation = &returned.invocation;
-            self.validate_external_pnp_invocation(&invocation.owner.owner.invocation)?;
-            let completion = &invocation.completion;
-            let irp = self.irp(completion.id).ok_or(NtStatus::INVALID_PARAMETER)?;
-            if irp.completion_ack_reservation != Some(invocation.reservation)
-                || !invocation
-                    .reservation
-                    .matches(self.ownership_identity(), completion.id)
-                || self.completed_irp_snapshot(completion.id).as_ref() != Some(completion)
-                || !self.completed_irps.contains(&completion.id)
-                || self
-                    .driver(completion.completion_driver_id)
-                    .map(|driver| driver.backend.0 as usize)
-                    != Some(invocation.backend_index)
-            {
-                return Err(NtStatus::INVALID_PARAMETER);
-            }
-            returned.acknowledgement.checked_status()
-        })();
+        let valid = self
+            .validate_external_pnp_completion_return(&returned)
+            .and_then(|_| returned.acknowledgement.checked_status());
         if let Err(status) = valid {
             return Err(ExternalPnpCompletionRejection {
                 status,
@@ -205,5 +215,36 @@ impl<P: ObjectManagerPort> IoManager<P> {
             },
             payload,
         ))
+    }
+
+    /// Re-enter a foreign ACK only after a proven no-entry response and exact local reservation
+    /// revalidation. Accepted or uncertain replies retain their original return for settlement.
+    pub fn retry_external_pnp_completion(
+        &mut self,
+        returned: ExternalPnpCompletionReturn,
+    ) -> Result<
+        ExternalPnpCompletionInvocation,
+        ExternalPnpCompletionRejection<ExternalPnpCompletionReturn>,
+    > {
+        let valid = if matches!(
+            returned.acknowledgement,
+            CompletionAcknowledgement::NotEntered { .. }
+        ) {
+            self.validate_external_pnp_completion_return(&returned).and_then(|_| {
+                self.backends
+                    .get(returned.invocation.backend_index)
+                    .filter(|backend| !backend.is_faulted())
+                    .map(|_| ())
+                    .ok_or(NtStatus::DEVICE_NOT_CONNECTED)
+            })
+        } else {
+            Err(NtStatus::INVALID_DEVICE_REQUEST)
+        };
+        if let Err(status) = valid {
+            return Err(ExternalPnpCompletionRejection { status, owner: returned });
+        }
+        Ok(returned
+            .retry()
+            .expect("validated no-entry ACK must permit retry"))
     }
 }

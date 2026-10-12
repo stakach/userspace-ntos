@@ -151,6 +151,77 @@ fn detached_pnp_completion_uncertain_ack_or_reply_only_success_never_frees_or_re
 }
 
 #[test]
+fn detached_pnp_retry_requires_proven_no_entry_and_revalidates_reserved_completion() {
+    let mut primary_io = io();
+    let (retained, release) = pending_for(
+        &mut primary_io,
+        PnpParameters::lifecycle(nt_pnp_abi::IRP_MN_STOP_DEVICE).unwrap(),
+        Vec::new(),
+    );
+    let id = retained.irp_id();
+    release.set(true);
+    assert_eq!(primary_io.pump(), 1);
+    let invocation = primary_io.prepare_external_pnp_completion(retained).unwrap();
+    let completion = *invocation.completion();
+    let first = invocation.invoke(|_| ExternalFileIrpAcknowledgement::NotEntered {
+        status: NtStatus::DEVICE_NOT_READY,
+    });
+    let rejected = primary_io.finish_external_pnp_completion(first).unwrap_err();
+    assert_eq!(primary_io.completed_irp(id), Some(completion));
+    let retry = primary_io.retry_external_pnp_completion(rejected.into_owner()).unwrap();
+    assert_eq!(retry.completion(), &completion);
+    let second = retry.invoke(|_| ExternalFileIrpAcknowledgement::Acknowledged);
+    let (receipt, payload) = primary_io.finish_external_pnp_completion(second).unwrap();
+    assert!(payload.is_empty());
+    assert_eq!(receipt.irp_id(), id);
+    assert!(primary_io.irp(id).is_none());
+
+    for acknowledgement in [
+        ExternalFileIrpAcknowledgement::Rejected {
+            status: NtStatus::DEVICE_NOT_READY,
+        },
+        ExternalFileIrpAcknowledgement::Indeterminate {
+            transport_status: NtStatus::UNSUCCESSFUL,
+        },
+    ] {
+        let mut other_io = io();
+        let (retained, release) = pending(&mut other_io);
+        let id = retained.irp_id();
+        release.set(true);
+        assert_eq!(other_io.pump(), 1);
+        let invocation = other_io.prepare_external_pnp_completion(retained).unwrap();
+        let returned = invocation.invoke(|_| acknowledgement);
+        let rejected = other_io.finish_external_pnp_completion(returned).unwrap_err();
+        let rejected = other_io.retry_external_pnp_completion(rejected.into_owner()).unwrap_err();
+        assert_eq!(rejected.owner().acknowledgement(), acknowledgement);
+        assert!(other_io.irp(id).is_some());
+    }
+}
+
+#[test]
+fn detached_pnp_no_entry_retry_rejects_changed_terminal_before_foreign_reentry() {
+    let mut io = io();
+    let (retained, release) = pending(&mut io);
+    let id = retained.irp_id();
+    release.set(true);
+    assert_eq!(io.pump(), 1);
+    let invocation = io.prepare_external_pnp_completion(retained).unwrap();
+    let original = io.irp(id).unwrap().information;
+    let first = invocation.invoke(|_| ExternalFileIrpAcknowledgement::NotEntered {
+        status: NtStatus::DEVICE_NOT_READY,
+    });
+    let rejected = io.finish_external_pnp_completion(first).unwrap_err();
+    io.irps.get_mut(id).unwrap().information += 1;
+    let rejected = io.retry_external_pnp_completion(rejected.into_owner()).unwrap_err();
+    assert_eq!(rejected.status(), NtStatus::INVALID_PARAMETER);
+    assert_eq!(rejected.owner().payload(), &[0x63; 64]);
+    io.irps.get_mut(id).unwrap().information = original;
+    let retry = io.retry_external_pnp_completion(rejected.into_owner()).unwrap();
+    let second = retry.invoke(|_| ExternalFileIrpAcknowledgement::Acknowledged);
+    assert!(io.finish_external_pnp_completion(second).is_ok());
+}
+
+#[test]
 fn detached_pnp_completion_changed_backend_retains_accepted_ack_until_exact_route_restored() {
     let mut io = io();
     let (retained, release) = pending(&mut io);
