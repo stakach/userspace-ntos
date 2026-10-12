@@ -1846,8 +1846,34 @@ struct PendingIrpCompletionTarget {
 struct PendingIrpCompletionClaim {
     node: u64,
     completing_state: u64,
+    identity: Option<nt_io_manager::start_io_native_owner::PendingStartIoNodeIdentity>,
     owner_claim: nt_io_manager::CompletionOwnerClaim,
     target: PendingIrpCompletionTarget,
+}
+
+/// Called only while the caller owns the pending-node phase. The node remains the authoritative
+/// storage owner; this captures the generation and root ticket that a future StartIo current
+/// receipt must match before it can observe terminal completion.
+unsafe fn pending_irp_start_io_identity(
+    node: u64,
+) -> Option<nt_io_manager::start_io_native_owner::PendingStartIoNodeIdentity> {
+    if !pending_irp_node_valid(node) {
+        return None;
+    }
+    let state = pending_irp_owner_state(node).load(Ordering::Acquire);
+    let owner = read_volatile(pending_irp_entry_address(node) as *const PendingIrp);
+    let source = nt_io_manager::retained_query_path_forward::SourceIrpTicket::new(
+        owner.owner_domain,
+        owner.source_ticket_id,
+        owner.source_ticket_generation,
+    )?;
+    nt_io_manager::start_io_native_owner::PendingStartIoNodeIdentity::new(
+        node,
+        state & !HOSTED_IRP_STATE_MASK,
+        pending_irp_canonical_id(node).load(Ordering::Relaxed),
+        pending_irp_raw_irp(node).load(Ordering::Relaxed),
+        source,
+    ).filter(|identity| identity.raw_irp == owner.irp)
 }
 
 unsafe fn claim_pending_irp_completion(irp: u64) -> Option<PendingIrpCompletionClaim> {
@@ -1878,9 +1904,23 @@ unsafe fn claim_pending_irp_completion(irp: u64) -> Option<PendingIrpCompletionC
                 .is_ok()
             {
                 let entry = pending_irp_entry_address(node);
+                let owner = read_volatile(entry as *const PendingIrp);
+                let source = nt_io_manager::start_io_native_owner::completion_source_ticket(
+                    owner.owner_domain,
+                    owner.source_ticket_id,
+                    owner.source_ticket_generation,
+                ).expect("claimed pending IRP has an incomplete source ticket");
+                // Ordinary pending IRPs retain their original phase/generation CAS. A root-issued
+                // source ticket adds the exact node/source witness without inventing one for them.
+                let identity = source.map(|_| {
+                    pending_irp_start_io_identity(node)
+                        .filter(|identity| identity.raw_irp == irp)
+                        .expect("claimed source IRP changed its exact node/ticket identity")
+                });
                 return Some(PendingIrpCompletionClaim {
                     node,
                     completing_state: completing,
+                    identity,
                     owner_claim,
                     target: PendingIrpCompletionTarget {
                         data: read_volatile(
@@ -1938,6 +1978,15 @@ unsafe fn release_pending_irp_completion_claim(
     claim: PendingIrpCompletionClaim,
     release: nt_io_manager::CompletionClaimRelease,
 ) {
+    if let Some(identity) = claim.identity {
+        let observed = pending_irp_start_io_identity(claim.node);
+        assert!(observed.is_some_and(|observed| identity.matches(observed)),
+            "source IRP node/ticket identity changed under completion ownership");
+    } else {
+        let owner = read_volatile(pending_irp_entry_address(claim.node) as *const PendingIrp);
+        assert!(owner.source_ticket_id == 0 && owner.source_ticket_generation == 0,
+            "ticketless pending IRP gained a source ticket under completion ownership");
+    }
     let active = hosted_irp_state_with_kind(
         claim.completing_state,
         completion_owner_kind(claim.owner_claim.release(release, false)),

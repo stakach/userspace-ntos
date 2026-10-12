@@ -637,3 +637,9 @@ diagnosis-free failure.
   projection may name a different logical domain; retain the authenticated allocator separately.
 - One source ticket names one immutable allocation lifetime. Changed address, extent or generation
   under the same ticket is a contradiction, not a new packet or ownership transfer.
+
+## Classify Optional Native Tickets Before Requiring Them
+- A pending IRP node can legitimately be ticketless. Prove which path issues a root source ticket
+  before imposing that invariant on a shared completion claim.
+- Treat a zero/zero ticket pair as ordinary, a complete valid pair as root-issued, and a half-set
+  pair as corrupt. Preserve the existing node-generation CAS for both valid paths.

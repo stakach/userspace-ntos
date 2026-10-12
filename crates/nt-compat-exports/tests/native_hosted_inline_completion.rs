@@ -138,3 +138,19 @@ fn inline_driver_free_uses_claim_derived_completion_owner() {
     assert!(calls(&file, "complete_hosted_irp").iter().any(|name| name == "complete_hosted_irp_with_owner"),
         "legacy outcome wrapper must share the same authoritative walk");
 }
+
+#[test]
+fn native_completion_claim_classifies_ticketless_and_ticketed_nodes_after_exclusive_cas() {
+    let file = source("driver_launch.rs");
+    let claim = calls(&file, "claim_pending_irp_completion");
+    let cas = claim.iter().position(|name| name == "compare_exchange")
+        .expect("completion must first claim the generation-bearing node phase");
+    let classify = claim.iter().position(|name| name == "completion_source_ticket")
+        .expect("native completion must classify ordinary and root-ticketed IRPs");
+    assert!(cas < classify, "source identity must be captured under the exclusive node claim");
+    assert!(claim.iter().any(|name| name == "pending_irp_start_io_identity"),
+        "root-ticketed completion must capture the exact node/source identity");
+    let release = calls(&file, "release_pending_irp_completion_claim");
+    assert!(release.iter().any(|name| name == "pending_irp_start_io_identity"),
+        "ticketed completion must recheck source identity before releasing its claim");
+}

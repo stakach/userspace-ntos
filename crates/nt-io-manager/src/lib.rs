@@ -31,6 +31,7 @@ mod device;
 pub mod device_queue;
 pub mod start_io;
 pub mod start_io_current;
+pub mod start_io_native_owner;
 pub mod device_power;
 mod device_file_name;
 mod device_reference;
