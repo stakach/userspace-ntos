@@ -21,6 +21,7 @@ mod hive;
 mod io;
 mod overlay;
 mod reactos_registration;
+pub mod registry_wal;
 pub mod writeback_owner;
 
 pub use boot_object_policy::{
@@ -92,6 +93,8 @@ pub use io::{
 mod tests;
 #[cfg(test)]
 mod writeback_owner_tests;
+#[cfg(test)]
+mod registry_wal_tests;
 
 #[cfg(test)]
 mod key_kind_tests;
