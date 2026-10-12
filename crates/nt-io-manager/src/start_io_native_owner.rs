@@ -1,11 +1,16 @@
-//! Exact native pending-node identity for a future StartIo queue/current adapter.
+//! Exact native StartIo source/device admission and pending-node identity.
 //!
 //! The provider's pending node remains the packet owner. This value is an observation of its
 //! generation and root-issued source ticket, not a second queue or a source allocation pin.
 //! It may be held across callbacks only together with the canonical node owner's phase claim.
+//! StartIoAdmission obtains real source and device owners before any future WDM queue effect.
 
 use crate::retained_query_path_forward::SourceIrpTicket;
-use crate::{HostedDevicePointerRegistration, HostedDomainIdentity};
+use crate::source_irp_ledger::{SourceIrpAllocation, SourceIrpForwardIdentity, SourceIrpLedger,
+    SourceIrpLedgerError};
+use crate::{HostedDevicePointerRegistration, HostedDeviceProjectionReference,
+    HostedDomainIdentity, IoManager};
+use nt_status::NtStatus;
 
 /// Ordinary pending IRPs have no source ticket. A half-published ticket is never ordinary.
 pub fn completion_source_ticket(
@@ -17,6 +22,78 @@ pub fn completion_source_ticket(
         return Ok(None);
     }
     SourceIrpTicket::new(domain, id, generation).map(Some).ok_or(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartIoAdmissionError {
+    Source(SourceIrpLedgerError),
+    WrongSourceAllocation,
+    Device(NtStatus),
+}
+
+/// One real source-ledger pin. The ticket and allocation are observations; this non-Copy value
+/// carries the obligation to release the pin after exact terminal observation or refusal.
+#[derive(Debug)]
+#[must_use = "transfer or release the admitted source pin"]
+pub struct StartIoSourcePin {
+    identity: SourceIrpForwardIdentity,
+    held: bool,
+}
+
+impl StartIoSourcePin {
+    pub fn identity(&self) -> SourceIrpForwardIdentity { self.identity }
+
+    pub fn release(&mut self, ledger: &mut SourceIrpLedger) -> Result<(), SourceIrpLedgerError> {
+        if !self.held || !ledger.admits_forward(self.identity.ticket(), self.identity.allocation()) {
+            return Err(SourceIrpLedgerError::WrongIdentity);
+        }
+        ledger.unpin(self.identity.ticket())?;
+        self.held = false;
+        Ok(())
+    }
+}
+
+/// Atomic local acquisition of physical source and logical device projection owners. The source
+/// domain deliberately need not equal the device projection domain. No WDM queue write occurs
+/// here; the native adapter transfers these owners into its canonical queue/current receipt.
+#[derive(Debug)]
+#[must_use = "transfer both owners into the canonical queue/current receipt or release them"]
+pub struct StartIoAdmission {
+    source: StartIoSourcePin,
+    device: HostedDeviceProjectionReference,
+}
+
+impl StartIoAdmission {
+    pub fn acquire<P>(
+        io: &mut IoManager<P>,
+        ledger: &mut SourceIrpLedger,
+        expected_source: SourceIrpAllocation,
+        device: HostedDevicePointerRegistration,
+    ) -> Result<Self, StartIoAdmissionError> {
+        let (ticket, allocation) = ledger.pin(
+            expected_source.owner,
+            expected_source.domain,
+            expected_source.component_address,
+        ).map_err(StartIoAdmissionError::Source)?;
+        if allocation != expected_source {
+            ledger.unpin(ticket).expect("new StartIo pin changed before local rollback");
+            return Err(StartIoAdmissionError::WrongSourceAllocation);
+        }
+        let identity = SourceIrpForwardIdentity::new(ticket, allocation)
+            .expect("source ledger returned an invalid registered allocation");
+        let projection = match io.retain_hosted_device_projection_reference(device) {
+            Ok(projection) => projection,
+            Err(status) => {
+                ledger.unpin(ticket).expect("new StartIo pin changed before local rollback");
+                return Err(StartIoAdmissionError::Device(status));
+            }
+        };
+        Ok(Self { source: StartIoSourcePin { identity, held: true }, device: projection })
+    }
+
+    pub fn into_owners(self) -> (HostedDeviceProjectionReference, StartIoSourcePin) {
+        (self.device, self.source)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,7 +149,10 @@ impl PendingStartIoQueueIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{HostedDomainId, HostedDomainIdentity};
+    use crate::source_irp_ledger::SourceIrpOwner;
+    use crate::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType, DriverBackendId,
+        DriverRecord, HostedDomainId, HostedDomainIdentity, MajorFunctionTable, MockObjectPort};
+    use nt_types::{NtPath, ObjectId};
 
     fn ticket() -> SourceIrpTicket {
         SourceIrpTicket::new(
@@ -116,5 +196,74 @@ mod tests {
         assert_eq!(completion_source_ticket(domain, 19, 0), Err(()));
         assert_eq!(completion_source_ticket(domain, 0, 23), Err(()));
         assert_eq!(completion_source_ticket(HostedDomainIdentity::default(), 19, 23), Err(()));
+    }
+
+    #[test]
+    fn admission_retains_exact_physical_source_and_logical_device_until_transfer() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let driver = io.register_driver(DriverRecord::new(
+            ObjectId::NULL,
+            NtPath::parse_str("\\Driver\\StartIoOwner").unwrap(),
+            DriverBackendId(1),
+            MajorFunctionTable::new(),
+        ));
+        let device = io.add_device(DeviceRecord::new(
+            ObjectId::NULL, driver, None, DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(), DeviceFlags::empty(), 0,
+        ));
+        let physical = io.register_hosted_domain();
+        let logical = io.register_hosted_domain();
+        let registration = io.bind_hosted_device_pointer(logical, 0x4000, device).unwrap();
+        let source = SourceIrpAllocation {
+            owner: SourceIrpOwner::HostedDriver(3), domain: physical,
+            component_address: 0x2000, bytes: 0x128, stack_count: 2, pool_generation: 7,
+        };
+        let mut ledger = SourceIrpLedger::new();
+        let ticket = ledger.register(source).unwrap();
+        let baseline = io.device_reference_count(device);
+        let stale = SourceIrpAllocation { pool_generation: source.pool_generation + 1, ..source };
+        assert!(matches!(StartIoAdmission::acquire(&mut io, &mut ledger, stale, registration),
+            Err(StartIoAdmissionError::WrongSourceAllocation)));
+        assert_eq!(ledger.unpin(ticket), Err(SourceIrpLedgerError::WrongIdentity));
+        assert_eq!(io.device_reference_count(device), baseline);
+        let admission = StartIoAdmission::acquire(&mut io, &mut ledger, source, registration).unwrap();
+        assert_eq!(io.device_reference_count(device), baseline + 1);
+        assert_eq!(io.retire_hosted_device_pointer(registration), Err(NtStatus::DEVICE_BUSY));
+        let (mut device_owner, mut source_owner) = admission.into_owners();
+        assert_eq!(source_owner.identity().ticket(), ticket);
+        assert_eq!(source_owner.identity().allocation(), source);
+        assert_eq!(ledger.prepare_driver_free(3, physical, source.component_address),
+            Err(SourceIrpLedgerError::Pinned));
+        source_owner.release(&mut ledger).unwrap();
+        device_owner.release(&mut io).unwrap();
+        assert_eq!(io.device_reference_count(device), baseline);
+    }
+
+    #[test]
+    fn admission_refusal_rolls_back_new_pin_and_keeps_unrelated_device_owner() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let physical = io.register_hosted_domain();
+        let source = SourceIrpAllocation {
+            owner: SourceIrpOwner::HostedDriver(3), domain: physical,
+            component_address: 0x2000, bytes: 0x128, stack_count: 2, pool_generation: 7,
+        };
+        let mut ledger = SourceIrpLedger::new();
+        let ticket = ledger.register(source).unwrap();
+        // A registration from another manager is rejected after source pinning.
+        let mut other = IoManager::new(MockObjectPort::new());
+        let driver = other.register_driver(DriverRecord::new(
+            ObjectId::NULL, NtPath::parse_str("\\Driver\\ForeignStartIo").unwrap(),
+            DriverBackendId(1), MajorFunctionTable::new(),
+        ));
+        let device = other.add_device(DeviceRecord::new(
+            ObjectId::NULL, driver, None, DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(), DeviceFlags::empty(), 0,
+        ));
+        let foreign_domain = other.register_hosted_domain();
+        let foreign = other.bind_hosted_device_pointer(foreign_domain, 0x4000, device).unwrap();
+        assert!(matches!(StartIoAdmission::acquire(&mut io, &mut ledger, source, foreign),
+            Err(StartIoAdmissionError::Device(_))));
+        assert_eq!(ledger.unpin(ticket), Err(SourceIrpLedgerError::WrongIdentity),
+            "refusal must have rolled back its sole source pin");
     }
 }
