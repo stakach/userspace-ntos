@@ -1,6 +1,7 @@
 use nt_pnp_manager::device_text::{
-    plan_device_text_publication, DeviceTextPublication, DeviceTextPublicationError,
-    DeviceTextRegistryValue, NoDeviceText, DEVICE_TEXT_LOCATION_INFORMATION, REG_SZ,
+    plan_device_text_publication, plan_required_device_description, DeviceTextPublication,
+    DeviceTextPublicationError, DeviceTextRegistryValue, NoDeviceText,
+    DEVICE_TEXT_LOCATION_INFORMATION, REG_SZ,
 };
 use nt_pnp_manager::returned_pnp_buffer::{
     ReleaseResult, ReturnedPnpBufferCatalog, ReturnedPnpQuery, ReturnedPnpRequest,
@@ -129,6 +130,37 @@ fn unsupported_and_empty_are_distinct_and_never_create_a_label() {
             false,
         ),
         Ok(DeviceTextPublication::NoText(NoDeviceText::Empty))
+    );
+}
+
+#[test]
+fn required_description_uses_reference_label_only_after_verified_empty_query() {
+    let request = request();
+    let mut catalog = ReturnedPnpBufferCatalog::new().unwrap();
+    let ticket = catalog.prepare(request).unwrap();
+    catalog
+        .publish_terminal(ticket, request, NOT_SUPPORTED, 0x500000, None)
+        .unwrap();
+    let fallback = DeviceTextPublication::Write(DeviceTextRegistryValue {
+        name: "DeviceDesc",
+        value_type: REG_SZ,
+        data: "Unknown device"
+            .encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect(),
+    });
+    assert_eq!(
+        plan_required_device_description(&catalog, ticket, request, None, None, false),
+        Ok(fallback)
+    );
+    assert_eq!(
+        plan_required_device_description(&catalog, ticket, request, None, None, true),
+        Ok(DeviceTextPublication::KeepExistingDescription)
+    );
+    assert_eq!(
+        plan_required_device_description(&catalog, ticket, other_request(), None, None, false),
+        Err(DeviceTextPublicationError::WrongRequest)
     );
 }
 

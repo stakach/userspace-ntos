@@ -131,3 +131,61 @@ pub fn plan_device_text_publication(
         data,
     }))
 }
+
+/// Apply ReactOS PiSetDevNodeText's mandatory DeviceDesc rule after a genuine PDO text query.
+///
+/// The query ticket and returned allocation are checked by `plan_device_text_publication` first.
+/// An unsupported or empty description is not an install success: it authorizes only the
+/// reference-defined `Unknown device` REG_SZ. The native caller must commit that value to CM
+/// before publishing an install action. Other provider failures remain failures.
+pub fn plan_required_device_description(
+    catalog: &ReturnedPnpBufferCatalog,
+    ticket: ReturnedPnpBufferTicket,
+    request: ReturnedPnpRequest,
+    allocation: Option<ReturnedAllocation>,
+    read: Option<&[u8]>,
+    description_exists: bool,
+) -> Result<DeviceTextPublication, DeviceTextPublicationError> {
+    if !matches!(
+        request.query,
+        ReturnedPnpQuery::DeviceText {
+            text_type: DEVICE_TEXT_DESCRIPTION,
+            ..
+        }
+    ) {
+        return Err(DeviceTextPublicationError::WrongQuery);
+    }
+    let publication = plan_device_text_publication(
+        catalog,
+        ticket,
+        request,
+        allocation,
+        read,
+        description_exists,
+    )?;
+    match publication {
+        DeviceTextPublication::NoText(NoDeviceText::Unsupported(_))
+        | DeviceTextPublication::NoText(NoDeviceText::Empty) if description_exists => {
+            Ok(DeviceTextPublication::KeepExistingDescription)
+        }
+        DeviceTextPublication::NoText(NoDeviceText::Unsupported(_))
+        | DeviceTextPublication::NoText(NoDeviceText::Empty) => {
+            let mut data = Vec::new();
+            const UNKNOWN_DEVICE: &[u16] = &[
+                0x0055, 0x006e, 0x006b, 0x006e, 0x006f, 0x0077, 0x006e, 0x0020, 0x0064,
+                0x0065, 0x0076, 0x0069, 0x0063, 0x0065, 0,
+            ];
+            data.try_reserve_exact(UNKNOWN_DEVICE.len() * 2)
+                .map_err(|_| DeviceTextPublicationError::InsufficientResources)?;
+            for unit in UNKNOWN_DEVICE {
+                data.extend_from_slice(&unit.to_le_bytes());
+            }
+            Ok(DeviceTextPublication::Write(DeviceTextRegistryValue {
+                name: "DeviceDesc",
+                value_type: REG_SZ,
+                data,
+            }))
+        }
+        other => Ok(other),
+    }
+}
