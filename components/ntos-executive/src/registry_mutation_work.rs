@@ -174,11 +174,77 @@ enum Phase {
     ProviderReplyEntered,
 }
 
+/// Owns the exact storage effect independently of the CM preparation and COMMIT receipt.
+/// The current protocol still makes a journal durable before entering CM publication.
+/// A failed or uncertain storage release leaves the same journal here for redrive.
+struct MutationPersistence {
+    journal: Option<writable_fs::registry_journal::Journal<()>>,
+}
+
+impl MutationPersistence {
+    fn new() -> Self {
+        Self { journal: None }
+    }
+
+    fn has_journal(&self) -> bool {
+        self.journal.is_some()
+    }
+
+    unsafe fn admit(&mut self, bytes: Vec<u8>) -> Result<(), u32> {
+        assert!(self.journal.is_none(), "one storage owner per CM mutation");
+        let journal = writable_fs::registry_journal::Journal::admit(bytes, ())
+            .map_err(|(status, _, ())| status)?;
+        self.journal = Some(journal);
+        Ok(())
+    }
+
+    fn make_durable(&mut self) -> Result<(), u32> {
+        self.journal.as_mut().expect("admitted CM journal").make_durable()
+    }
+
+    fn begin_publication(&mut self) -> Result<(), u32> {
+        if let Some(journal) = self.journal.as_mut() {
+            journal.begin_publication()?;
+        }
+        Ok(())
+    }
+
+    fn rollback(&mut self) -> Result<(), u32> {
+        self.journal.as_mut().expect("unpublished CM journal").rollback()
+    }
+
+    unsafe fn release_after_publication(&mut self) -> Result<(), u32> {
+        if let Some(journal) = self.journal.take() {
+            match journal.release_after_publication() {
+                Ok(()) => {}
+                Err(journal) => {
+                    self.journal = Some(journal);
+                    return Err(0xC000_000D);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    unsafe fn release_rolled_back(&mut self) -> Result<(), u32> {
+        if let Some(journal) = self.journal.take() {
+            match journal.release_rolled_back() {
+                Ok(()) => {}
+                Err(journal) => {
+                    self.journal = Some(journal);
+                    return Err(0xC000_000D);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 struct Work {
     caller: Caller,
     phase: Phase,
     prepared: Option<PreparedSystemHiveMutation>,
-    journal: Option<writable_fs::registry_journal::Journal<()>>,
+    persistence: MutationPersistence,
     receipt: Option<SystemHiveMutationCommitReceipt>,
     opening: Option<cm_key_ownership::PublicationOpen>,
     status: u32,
@@ -266,7 +332,7 @@ pub(crate) unsafe fn submit_hosted(
     };
     assert_ne!(caller.reply, 0);
     let work = Some(Work {
-        caller: Caller::Hosted(caller), phase: Phase::Begin(attempt), prepared: None, journal: None,
+        caller: Caller::Hosted(caller), phase: Phase::Begin(attempt), prepared: None, persistence: MutationPersistence::new(),
         receipt: None, opening: None, status: 0,
         cancelled: false, commit_entered: false, published: false,
     });
@@ -374,7 +440,7 @@ pub(crate) unsafe fn submit_hosted_existing(
     };
     assert_ne!(hosted.reply, 0);
     let work = Some(Work {
-        caller: Caller::Hosted(hosted), phase: Phase::Begin(attempt), prepared: None, journal: None,
+        caller: Caller::Hosted(hosted), phase: Phase::Begin(attempt), prepared: None, persistence: MutationPersistence::new(),
         receipt: None, opening: None, status: 0,
         cancelled: false, commit_entered: false, published: false,
     });
@@ -431,7 +497,7 @@ pub(crate) unsafe fn submit_hosted_system_locale(
     };
     assert_ne!(caller.reply, 0);
     let work = Some(Work {
-        caller: Caller::Hosted(caller), phase: Phase::Begin(attempt), prepared: None, journal: None,
+        caller: Caller::Hosted(caller), phase: Phase::Begin(attempt), prepared: None, persistence: MutationPersistence::new(),
         receipt: None, opening: None, status: 0,
         cancelled: false, commit_entered: false, published: false,
     });
@@ -651,10 +717,8 @@ unsafe fn advance(
             match system_mutation_storage(prepared).map_err(|status| status as i32)? {
                 SystemMutationStorage::NoJournal => work.phase = Phase::Commit,
                 SystemMutationStorage::PrecommitJournal(bytes) => {
-                    match writable_fs::registry_journal::Journal::admit(bytes, ()) {
-                        Ok(journal) => { work.journal = Some(journal); work.phase = Phase::Durable; }
-                        Err((status, _, ())) => return Err(status as i32),
-                    }
+                    work.persistence.admit(bytes).map_err(|status| status as i32)?;
+                    work.phase = Phase::Durable;
                 }
             }
         }
@@ -663,19 +727,16 @@ unsafe fn advance(
                 work.phase = Phase::Rollback;
                 return Ok(false);
             }
-            let journal = work.journal.as_mut().unwrap();
-            journal.make_durable().map_err(|status| status as i32)?;
+            work.persistence.make_durable().map_err(|status| status as i32)?;
             work.phase = Phase::Commit;
         }
         Phase::Commit => {
             if work.cancelled && !work.commit_entered {
-                work.phase = if work.journal.is_some() { Phase::Rollback } else { Phase::Abort };
+                work.phase = if work.persistence.has_journal() { Phase::Rollback } else { Phase::Abort };
                 return Ok(false);
             }
             if !work.commit_entered {
-                if let Some(journal) = work.journal.as_mut() {
-                    journal.begin_publication().map_err(|status| status as i32)?;
-                }
+                work.persistence.begin_publication().map_err(|status| status as i32)?;
                 // No IPC separates the storage barrier from recording COMMIT entry.
                 work.commit_entered = true;
             }
@@ -782,15 +843,7 @@ unsafe fn advance(
         }
         Phase::Acknowledge => {
             cm_mutation_transport::acknowledge(work.receipt.unwrap())?;
-            if let Some(journal) = work.journal.take() {
-                match journal.release_after_publication() {
-                    Ok(()) => {}
-                    Err(journal) => {
-                        work.journal = Some(journal);
-                        return Err(0xC000_000Du32 as i32);
-                    }
-                }
-            }
+            work.persistence.release_after_publication().map_err(|status| status as i32)?;
             if let Caller::Hosted(HostedCaller {
                 completion: HostedCompletion::SystemLocale { locale_id, .. }, ..
             }) = &work.caller {
@@ -805,8 +858,7 @@ unsafe fn advance(
             work.phase = Phase::AcknowledgeAbort(receipt);
         }
         Phase::Rollback => {
-            work.journal.as_mut().expect("unpublished journal owner")
-                .rollback().map_err(|status| status as i32)?;
+            work.persistence.rollback().map_err(|status| status as i32)?;
             work.phase = Phase::Abort;
         }
         Phase::AcknowledgeAbort(receipt) => {
@@ -814,15 +866,7 @@ unsafe fn advance(
             work.phase = Phase::ReleaseRollback;
         }
         Phase::ReleaseRollback => {
-            if let Some(journal) = work.journal.take() {
-                match journal.release_rolled_back() {
-                    Ok(()) => {}
-                    Err(journal) => {
-                        work.journal = Some(journal);
-                        return Err(0xC000_000Du32 as i32);
-                    }
-                }
-            }
+            work.persistence.release_rolled_back().map_err(|status| status as i32)?;
             work.phase = Phase::Complete;
         }
         Phase::Complete => {

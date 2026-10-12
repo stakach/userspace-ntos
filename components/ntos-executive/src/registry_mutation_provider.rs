@@ -200,7 +200,7 @@ unsafe fn submit_provider_inner(
     };
     let work = Some(Work {
         caller: Caller::Provider(caller), phase: Phase::ProviderAdmit,
-        prepared: None, journal: None, receipt: None, opening: None, status: 0,
+        prepared: None, persistence: MutationPersistence::new(), receipt: None, opening: None, status: 0,
         cancelled: false, commit_entered: false, published: false,
     });
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
