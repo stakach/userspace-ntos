@@ -48,6 +48,7 @@ pub const IRP_MN_QUERY_INTERFACE: u8 = 0x08;
 pub const IRP_MN_QUERY_CAPABILITIES: u8 = 0x09;
 pub const IRP_MN_QUERY_RESOURCES: u8 = 0x0A;
 pub const IRP_MN_QUERY_RESOURCE_REQUIREMENTS: u8 = 0x0B;
+pub const IRP_MN_QUERY_DEVICE_TEXT: u8 = 0x0C;
 pub const IRP_MN_FILTER_RESOURCE_REQUIREMENTS: u8 = 0x0D;
 pub const IRP_MN_QUERY_ID: u8 = 0x13;
 pub const IRP_MN_QUERY_BUS_INFORMATION: u8 = 0x15;
@@ -414,6 +415,7 @@ mod tests {
         assert_eq!(IRP_MN_REMOVE_DEVICE, 2);
         assert_eq!(IRP_MN_QUERY_DEVICE_RELATIONS, 7);
         assert_eq!(IRP_MN_QUERY_INTERFACE, 8);
+        assert_eq!(IRP_MN_QUERY_DEVICE_TEXT, 0x0C);
         assert_eq!(IRP_MN_QUERY_ID, 0x13);
         assert_eq!(BUS_RELATIONS, 0);
         assert_eq!(BUS_QUERY_INSTANCE_ID, 3);

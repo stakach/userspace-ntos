@@ -35452,6 +35452,20 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 id_type: fsctl as u32,
             }
         }
+        IRP_MJ_PNP if minor == nt_pnp_abi::IRP_MN_QUERY_DEVICE_TEXT as u64 => {
+            if inlen != 0 || outlen != 0 || fsctl != 0 {
+                pool_free(irp);
+                pool_free_request_buffers(data, aux_data, mdl);
+                if owns_fo {
+                    hosted_file_objects::free_file_storage(fo);
+                }
+                return (STATUS_INVALID_PARAMETER, 0);
+            }
+            WdmIoStackParameters::PnpQueryDeviceText {
+                text_type: request.parameter_offset,
+                locale_id: request.parameter_len,
+            }
+        }
         IRP_MJ_PNP if minor == nt_pnp_abi::IRP_MN_QUERY_CAPABILITIES as u64 => {
             if inlen != nt_pnp_abi::DEVICE_CAPABILITIES_X64_SIZE as u64
                 || outlen != nt_pnp_abi::DEVICE_CAPABILITIES_X64_SIZE as u64
@@ -43760,15 +43774,7 @@ fn hosted_irp_dispatch_request(
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
     let (parameter_offset, parameter_len) = match &irp.parameters {
-        IoParameters::Pnp(parameters) => parameters
-            .start_parameters()
-            .map(|start| {
-                (
-                    start.raw_resource_list_len,
-                    start.translated_resource_list_len,
-                )
-            })
-            .unwrap_or((0, 0)),
+        IoParameters::Pnp(parameters) => parameters.wire_parameter_words(),
         _ => (0, 0),
     };
     let transfer_len = if projection_uses_separate_output(irp) {

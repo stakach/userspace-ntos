@@ -157,6 +157,7 @@ enum PnpParameterKind {
     Start(PnpStartParameters),
     QueryDeviceRelations { relation_type: u32 },
     QueryId { id_type: u32 },
+    QueryDeviceText { text_type: u32, locale_id: u32 },
     QueryInformation,
     QueryCapabilities,
     FilterResourceRequirements { input_len: u32 },
@@ -204,6 +205,16 @@ impl PnpParameters {
         Self {
             minor: nt_pnp_abi::IRP_MN_QUERY_ID,
             kind: PnpParameterKind::QueryId { id_type },
+        }
+    }
+
+    pub const fn query_device_text(text_type: u32, locale_id: u32) -> Self {
+        Self {
+            minor: nt_pnp_abi::IRP_MN_QUERY_DEVICE_TEXT,
+            kind: PnpParameterKind::QueryDeviceText {
+                text_type,
+                locale_id,
+            },
         }
     }
 
@@ -271,6 +282,31 @@ impl PnpParameters {
         match self.kind {
             PnpParameterKind::QueryId { id_type } => Some(id_type),
             _ => None,
+        }
+    }
+
+    pub const fn device_text(self) -> Option<(u32, u32)> {
+        match self.kind {
+            PnpParameterKind::QueryDeviceText {
+                text_type,
+                locale_id,
+            } => Some((text_type, locale_id)),
+            _ => None,
+        }
+    }
+
+    /// Minor-specific words carried separately from the buffered payload.
+    pub const fn wire_parameter_words(self) -> (u32, u32) {
+        match self.kind {
+            PnpParameterKind::Start(start) => (
+                start.raw_resource_list_len,
+                start.translated_resource_list_len,
+            ),
+            PnpParameterKind::QueryDeviceText {
+                text_type,
+                locale_id,
+            } => (text_type, locale_id),
+            _ => (0, 0),
         }
     }
 

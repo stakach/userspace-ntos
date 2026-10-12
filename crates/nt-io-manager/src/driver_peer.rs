@@ -226,8 +226,9 @@ fn build_dispatch_request(
             0,
             0,
         ),
-        crate::irp::IoParameters::Pnp(p) => match p.start_parameters() {
-            Some(start) => (
+        crate::irp::IoParameters::Pnp(p) => {
+            let (parameter_offset, parameter_len) = p.wire_parameter_words();
+            (
                 p.wire_argument().unwrap_or(0),
                 p.input_len(),
                 p.output_len(),
@@ -239,25 +240,10 @@ fn build_dispatch_request(
                 0,
                 0,
                 0,
-                start.raw_resource_list_len,
-                start.translated_resource_list_len,
-            ),
-            None => (
-                p.wire_argument().unwrap_or(0),
-                p.input_len(),
-                p.output_len(),
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-            ),
-        },
+                parameter_offset,
+                parameter_len,
+            )
+        }
         _ => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
     };
     let set_information_control = match &irp.parameters {

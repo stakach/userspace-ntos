@@ -2605,6 +2605,14 @@ mod tests {
         assert_eq!(id.id_type(), Some(nt_pnp_abi::BUS_QUERY_INSTANCE_ID));
         assert_eq!(id.relation_type(), None);
         assert_eq!(id.input_len(), 0);
+        let text = PnpParameters::query_device_text(1, 0x0409);
+        assert_eq!(text.minor, nt_pnp_abi::IRP_MN_QUERY_DEVICE_TEXT);
+        assert_eq!(text.device_text(), Some((1, 0x0409)));
+        assert_eq!(text.wire_parameter_words(), (1, 0x0409));
+        assert_eq!(text.wire_argument(), None);
+        assert_eq!(text.input_len(), 0);
+        assert_eq!(text.output_len(), 0);
+        assert_eq!(id.device_text(), None);
         for minor in [
             nt_pnp_abi::IRP_MN_QUERY_RESOURCES,
             nt_pnp_abi::IRP_MN_QUERY_RESOURCE_REQUIREMENTS,
@@ -3330,6 +3338,29 @@ mod tests {
         let request = control.last_request().unwrap();
         assert_eq!(request.minor, nt_pnp_abi::IRP_MN_QUERY_ID);
         assert_eq!(request.ioctl_code, nt_pnp_abi::BUS_QUERY_INSTANCE_ID);
+
+        let text = PnpParameters::query_device_text(1, 0x0409);
+        let _ = io
+            .build_and_dispatch_external_to_device(
+                client,
+                device,
+                None,
+                0,
+                0,
+                major::IRP_MJ_PNP,
+                IoParameters::Pnp(text),
+                0,
+                0,
+                &mut empty,
+            )
+            .unwrap();
+        let request = control.last_request().unwrap();
+        assert_eq!(request.minor, nt_pnp_abi::IRP_MN_QUERY_DEVICE_TEXT);
+        assert_eq!(request.ioctl_code, 0);
+        assert_eq!(request.input_len, 0);
+        assert_eq!(request.output_len, 0);
+        assert_eq!(request.parameter_offset, 1);
+        assert_eq!(request.parameter_len, 0x0409);
 
         let capabilities = PnpParameters::query_capabilities();
         let mut capability_buffer = [0u8; nt_pnp_abi::DEVICE_CAPABILITIES_X64_SIZE];
@@ -8621,6 +8652,26 @@ mod tests {
         assert_eq!(stack[0x01], nt_pnp_abi::IRP_MN_QUERY_ID);
         assert_eq!(le_u32(&stack, 0x08), nt_pnp_abi::BUS_QUERY_HARDWARE_IDS);
         assert_eq!(le_u64(&stack, 0x28), 0x5555);
+
+        write_wdm_io_stack_location(
+            &mut stack,
+            WdmIoStackLocationInit {
+                major: major::IRP_MJ_PNP,
+                minor: nt_pnp_abi::IRP_MN_QUERY_DEVICE_TEXT,
+                device_object: 0x5556,
+                parameters: WdmIoStackParameters::PnpQueryDeviceText {
+                    text_type: 1,
+                    locale_id: 0x0409,
+                },
+                ..WdmIoStackLocationInit::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(stack[0x01], nt_pnp_abi::IRP_MN_QUERY_DEVICE_TEXT);
+        assert_eq!(le_u32(&stack, 0x08), 1);
+        assert_eq!(le_u32(&stack, 0x0c), 0);
+        assert_eq!(le_u32(&stack, 0x10), 0x0409);
+        assert_eq!(le_u64(&stack, 0x28), 0x5556);
 
         write_wdm_io_stack_location(
             &mut stack,
