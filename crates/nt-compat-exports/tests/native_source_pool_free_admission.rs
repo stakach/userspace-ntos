@@ -247,13 +247,19 @@ fn caller_op7_and_op8_keep_separate_close_and_physical_acknowledgement() {
                         if matches!(integer.base10_parse::<u64>(), Ok(7)))))
             {
                 let begin = facts(&branch.then_branch);
+                // The completion probe also tests `op == 7`; select the branch
+                // that actually enters caller retirement.
+                if !contains(&begin.methods, "begin_hosted_caller_retirement") {
+                    syn::visit::visit_expr_if(self, branch);
+                    return;
+                }
                 assert!(contains(&begin.methods, "begin_hosted_caller_retirement"));
                 assert!(!contains(&begin.methods, "finish_hosted_caller_retirement"));
                 let mut finish = Facts::default();
                 finish.visit_expr(&branch.else_branch.as_ref().expect("op8 ack branch").1);
                 assert!(contains(
                     &finish.calls,
-                    "hosted_instance_pool_allocation_is_free_unlocked"
+                    "exact_pool_identity_unlocked"
                 ));
                 assert!(contains(&finish.methods, "finish_hosted_caller_retirement"));
                 assert!(contains(&finish.methods, "swap_remove"));
@@ -261,7 +267,7 @@ fn caller_op7_and_op8_keep_separate_close_and_physical_acknowledgement() {
                     &begin.calls,
                     "hosted_instance_pool_free_unlocked"
                 ));
-                assert!(!contains(
+                assert!(contains(
                     &finish.calls,
                     "hosted_instance_pool_free_unlocked"
                 ));
