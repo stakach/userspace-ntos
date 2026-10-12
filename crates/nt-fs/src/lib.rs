@@ -31,6 +31,7 @@ mod path;
 mod query;
 mod snapshot_store;
 mod snapshot_reserve;
+mod snapshot_region;
 #[cfg(test)]
 mod snapshot_test_device;
 mod status;
@@ -78,6 +79,7 @@ pub use snapshot_store::{
     SnapshotBlockStoreError, SnapshotPayloadReader, SnapshotPayloadSink, StoredSnapshot,
 };
 pub use snapshot_reserve::{SnapshotReserve, SnapshotReserveLease};
+pub use snapshot_region::BoundedBlockRange;
 pub use status::*;
 pub use volume::*;
 

@@ -19,9 +19,13 @@ pub(crate) struct CachedDisk {
 
 impl CachedDisk {
     pub(crate) fn new() -> Self {
+        Self::with_sectors(16)
+    }
+
+    pub(crate) fn with_sectors(sectors: usize) -> Self {
         Self {
-            stable: alloc::vec![0; 16 * 512],
-            cache: alloc::vec![0; 16 * 512],
+            stable: alloc::vec![0; sectors * 512],
+            cache: alloc::vec![0; sectors * 512],
             pending: Vec::new(),
             events: Vec::new(),
             fail_event: None,
@@ -53,7 +57,7 @@ impl SnapshotBlockDevice for CachedDisk {
         512
     }
     fn sector_count(&self) -> u64 {
-        16
+        (self.cache.len() / 512) as u64
     }
 
     fn read_sector(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError> {

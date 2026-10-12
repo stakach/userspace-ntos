@@ -44,6 +44,19 @@ impl FlushCommand {
     }
 }
 
+/// Parse the physical sector count advertised by a valid ATA IDENTIFY LBA48 device.
+/// The GPT backup header only describes the original image and cannot prove tail capacity.
+pub fn lba48_sector_count(word83: u16, words100_to_103: [u16; 4]) -> Option<u64> {
+    if word83 & 0xc000 != 0x4000 || word83 & (1 << 10) == 0 {
+        return None;
+    }
+    let count = u64::from(words100_to_103[0])
+        | (u64::from(words100_to_103[1]) << 16)
+        | (u64::from(words100_to_103[2]) << 32)
+        | (u64::from(words100_to_103[3]) << 48);
+    (count != 0 && count < (1u64 << 48)).then_some(count)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Identify,

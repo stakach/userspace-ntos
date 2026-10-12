@@ -59,6 +59,27 @@ pub(super) unsafe fn flush(fat: &Fat32, selected: &mut Option<FlushCommand>) -> 
     result
 }
 
+/// Identify the actual AHCI device size while the boot-volume owner holds port zero.
+/// Read-only GPT metadata is insufficient to authorize sectors appended after its backup header.
+pub(super) unsafe fn physical_sector_count(fat: &Fat32) -> Result<u64, Error> {
+    let timeout = platform_tsc_frequency_hz()
+        .checked_mul(30)
+        .ok_or(Error::InvalidDma)?;
+    let mut port = Port {
+        controller: fat.ahci_vaddr,
+        port: fat.ahci_vaddr + 0x100,
+        dma: fat.dma_vaddr,
+    };
+    nt_ahci::execute(&mut port, fat.dma_paddr, Command::Identify, timeout)?;
+    let word = |index: u64| unsafe {
+        core::ptr::read_volatile(
+            (fat.dma_vaddr + nt_ahci::DATA_OFFSET as u64 + index * 2) as *const u16,
+        )
+    };
+    nt_ahci::lba48_sector_count(word(83), [word(100), word(101), word(102), word(103)])
+        .ok_or(Error::Device)
+}
+
 unsafe fn flush_owned(fat: &Fat32, selected: &mut Option<FlushCommand>) -> Result<(), Error> {
     let timeout = platform_tsc_frequency_hz()
         .checked_mul(30)

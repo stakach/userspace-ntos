@@ -70,6 +70,11 @@ impl<D, I> SnapshotReserveLease<'_, D, I> {
     fn device_mut(&mut self) -> &mut D {
         unsafe { &mut *self.reserve.device.get() }
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_device_mut(&mut self) -> &mut D {
+        self.device_mut()
+    }
 }
 
 impl<D: SnapshotBlockDevice, I> SnapshotBlockDevice for SnapshotReserveLease<'_, D, I> {
