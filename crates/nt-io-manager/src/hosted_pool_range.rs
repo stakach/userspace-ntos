@@ -14,17 +14,23 @@ pub struct HostedPoolAllocation {
 
 /// Locate the one bump allocation containing `[target_offset, target_offset + length)`.
 ///
-/// `used` is the pool's high-water offset, and `data_offset` is its first possible header offset.
+/// `arena_bytes` is the immutable mapped extent. `used` is the provider-writable high-water
+/// offset, and `data_offset` is its first possible header offset. Refuse an invalid high-water
+/// offset before invoking the reader, even if the requested target appears to be in bounds.
 /// The reader receives only aligned header offsets whose eight-byte capacity slot lies below
 /// `used`. It must read from the same locked pool snapshot as those offsets. An arbitrary aligned
 /// value inside a payload is never treated as a header.
 pub fn walk_hosted_pool_allocation(
+    arena_bytes: u64,
     used: u64,
     data_offset: u64,
     target_offset: u64,
     length: u64,
     mut read_capacity: impl FnMut(u64) -> Option<u64>,
 ) -> Option<HostedPoolAllocation> {
+    if data_offset > used || used > arena_bytes {
+        return None;
+    }
     let target_end = target_offset.checked_add(length)?;
     if length == 0 || target_offset < data_offset || target_end > used {
         return None;
@@ -69,7 +75,7 @@ mod tests {
         target: u64,
         length: u64,
     ) -> Option<HostedPoolAllocation> {
-        walk_hosted_pool_allocation(used, 0x1000, target, length, |at| {
+        walk_hosted_pool_allocation(0x2000, used, 0x1000, target, length, |at| {
             headers
                 .iter()
                 .find(|(offset, _)| *offset == at)
@@ -136,14 +142,39 @@ mod tests {
     fn rejects_arithmetic_overflow() {
         assert_eq!(find(&[(0x1000, 24)], 0x1028, u64::MAX, 2), None);
         assert_eq!(
-            walk_hosted_pool_allocation(u64::MAX, u64::MAX - 7, u64::MAX - 7, 1, |_| Some(1)),
+            walk_hosted_pool_allocation(u64::MAX, u64::MAX, u64::MAX - 7, u64::MAX - 7, 1, |_| Some(1)),
             None
         );
         assert_eq!(
-            walk_hosted_pool_allocation(u64::MAX, u64::MAX - 31, u64::MAX - 15, 1, |_| Some(
+            walk_hosted_pool_allocation(u64::MAX, u64::MAX, u64::MAX - 31, u64::MAX - 15, 1, |_| Some(
                 u64::MAX
             )),
             None
         );
+    }
+
+    #[test]
+    fn rejects_provider_cursor_beyond_immutable_arena_before_reading() {
+        let mut reads = 0;
+        let found = walk_hosted_pool_allocation(
+            0x2000,
+            0x2020,
+            0x1000,
+            0x2010,
+            1,
+            |_| {
+                reads += 1;
+                Some(0x1000)
+            },
+        );
+        assert_eq!(found, None);
+        assert_eq!(reads, 0, "invalid provider cursor must not reach the reader");
+
+        let in_arena = walk_hosted_pool_allocation(0x2000, 0x2020, 0x1000, 0x1010, 1, |_| {
+            reads += 1;
+            Some(0x10)
+        });
+        assert_eq!(in_arena, None, "an in-arena target cannot validate a corrupt cursor");
+        assert_eq!(reads, 0);
     }
 }

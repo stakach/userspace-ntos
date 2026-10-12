@@ -141,6 +141,7 @@ unsafe fn hosted_instance_pool_allocation_is_free_unlocked(
 unsafe fn hosted_pool_allocation_exec_range(exec: u64, address: u64) -> Option<(u64, u64)> {
     assert_pool_locked(exec);
     let found = nt_io_manager::hosted_pool_range::walk_hosted_pool_allocation(
+        FSD_POOL_FRAMES * 0x1000,
         read_volatile(exec as *const u64), POOL_DATA_OFF,
         address.checked_sub(FSD_POOL_VADDR)?, 1,
         |header| Some(read_volatile((exec + header) as *const u64)),

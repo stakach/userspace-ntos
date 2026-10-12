@@ -71,6 +71,7 @@ unsafe fn allocation(
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
     let found = nt_io_manager::hosted_pool_range::walk_hosted_pool_allocation(
+        FSD_POOL_FRAMES * 0x1000,
         used,
         POOL_DATA_OFF,
         offset,

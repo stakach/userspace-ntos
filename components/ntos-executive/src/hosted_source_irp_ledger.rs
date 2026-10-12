@@ -73,6 +73,7 @@ unsafe fn pool_range_identity_unlocked(
     }
     let offset = component_address.checked_sub(FSD_POOL_VADDR)?;
     let allocation = nt_io_manager::hosted_pool_range::walk_hosted_pool_allocation(
+        FSD_POOL_FRAMES * 0x1000,
         used,
         POOL_DATA_OFF,
         offset,
