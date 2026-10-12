@@ -162,16 +162,16 @@ in `extern-rootserver` mode (bring your own root task).
 The desktop target hosts **real, unmodified GPL ReactOS binaries** on rust-micro.
 Genuine Explorer and native acceptance are tracked in
 [issue #18](https://github.com/stakach/userspace-ntos/issues/18).
-The latest [bounded diagnostic boot](docs/evidence/issue18-heap-font-timeout.json)
-ran the rebuilt process heap for one hour. UMPnP signaled its real pending-install
-event, and `setup.exe` resumed without the crash seen in the
-[prior run](docs/evidence/issue18-extended-font-verdict.json), but setup had not
-exited at the deadline. Userinit and Explorer did not execute; the captured frame
-shows only a blue background. Native input drivers still lack
-`IoStartPacket`/`IoStartNextPacket`. Font cleanup and desktop acceptance remain
-unproven. Acceptance requires strict native private-font cleanup and a separate
-production Userinit/Explorer boot with real callbacks, GDI drawing, logs and
-screenshots. Crate CI does not prove desktop boot. An earlier
+The current [issue #18 diagnostic](https://github.com/stakach/userspace-ntos/issues/18)
+completed a bounded ReactOS setup run after a resumed registry snapshot. The
+win32k physical worker exhaustion is fixed, but Winlogon did not read its real
+SOFTWARE-hive `Userinit` value, so Userinit and Explorer did not execute. The
+separate fresh production boot ran for one hour and rendered only a blue
+background. Native input drivers still lack `IoStartPacket`/`IoStartNextPacket`.
+Font cleanup and desktop acceptance remain unproven. Acceptance requires strict
+native private-font cleanup and a separate fresh production Userinit/Explorer
+boot with real callbacks, GDI drawing, logs and screenshots. Crate CI does not
+prove desktop boot. An earlier
 [bounded diagnostic boot](docs/evidence/issue18-registry-checkpoint-probe.json)
 verified live SYSTEM-journal checkpoint timing and inclusive I/O measurements; it
 was stopped after reproducing the input-driver gap and still rendered only background
