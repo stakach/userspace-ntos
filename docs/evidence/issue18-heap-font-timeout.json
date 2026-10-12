@@ -1,0 +1,34 @@
+{
+  "issue": 18,
+  "related_issues": [283, 302],
+  "image_source_commit": "f3333f2d",
+  "profile": "font-cleanup",
+  "boot_bound_seconds": 3600,
+  "launcher_exit": 124,
+  "collector_exit": 0,
+  "collector_frames": 178,
+  "collector_final_slot": 1,
+  "desktop_acceptance": false,
+  "font_cleanup_acceptance": false,
+  "artifact_sha256": {
+    "preboot_staged_disk": "8fb95da172823fd684a416e2d45c898b3948d438e98570066271355749287d92",
+    "staged_ntdll": "80be52c2e8161e52ead09810c935de41551744a7c6478230d7f8a5c8802d866a",
+    "raw_log": "f3df4b76d1a2b2146f516a69c8879f0edcd3c685d4242cfd106aac676e4e3123",
+    "archived_log": "e69ac1e0888d5fe0f4f81b8582e9d6a456b5c18c719feaa3316b035a3acc3327",
+    "raw_collector_log": "71486ef520fa70f00c90ea22a4d6db66ecb3a9500705ce1bb03a49cb07200a44",
+    "archived_collector_log": "4c0fd4d9582b6b6a90464cd8b839b6f1bd00712cd106157478b500d8ef0d914c",
+    "final_screenshot": "53ad5f5ac610f375103c4b38bc9dcda1b85defd34e60860272a02fff0da0c9cb"
+  },
+  "observations": [
+    "The one-hour run reached the deadline and was terminated by the wrapper. No terminal guest acceptance summary was emitted.",
+    "UMPnP made an initial and queued device-install pass. It set the real PnP_No_Pending_Install_Events object at log line 550744; setup.exe then resumed and performed registry queries through the final census.",
+    "The prior riched20 setup.exe fault was not observed, but this run did not complete setup. Absence of that fault does not prove the heap change fixed the earlier crash.",
+    "The final census at guest t_ms=3605039 reported faults=2, explorer=none, and no Userinit or Explorer launch. The final QMP frame is the blue background with no shell chrome.",
+    "The current native registry writeback still checkpoints the full snapshot on each mutation. During the final interval the log shows snapshot generations 2546 and 2547, each rewriting the reserve; this is a performance lead for issue 302, not a validated causal explanation for the missing desktop."
+  ],
+  "evidence": {
+    "log": "docs/evidence/issue18-heap-font-timeout.log.gz",
+    "collector_log": "docs/evidence/issue18-heap-font-timeout-qmp.log.gz",
+    "screenshot": "docs/images/issue18-heap-font-timeout.png"
+  }
+}
