@@ -2499,6 +2499,76 @@ fn memfs_streaming_v2_checkpoint_keeps_the_same_volume_payload() {
 }
 
 #[test]
+fn pre_replay_restore_accepts_legacy_and_complete_zero_wal_baseline() {
+    let fs = FileSystem::new(MemFs::new());
+    let store = SnapshotBlockStore::new(0, 48);
+    let mut legacy = MemoryBlockDevice::new(512, 48);
+    fs.commit_volume_snapshot(&store, &mut legacy).unwrap();
+    let (_, metadata) = FileSystem::restore_volume_snapshot_before_wal_replay_from_store(
+        &store, &mut legacy,
+    ).unwrap().unwrap();
+    assert_eq!(metadata.format, crate::SnapshotReadFormat::Legacy);
+
+    let mut wal = MemoryBlockDevice::new(512, 48);
+    let baseline = WalSnapshotManifest {
+        incarnation: 91,
+        base_serial: 0,
+        high_water_serial: 0,
+        high_water_end_lba: 0,
+    };
+    for _ in 0..2 {
+        fs.commit_volume_snapshot_with_wal_manifest(&store, &mut wal, baseline).unwrap();
+    }
+    let (_, metadata) = FileSystem::restore_volume_snapshot_before_wal_replay_from_store(
+        &store, &mut wal,
+    ).unwrap().unwrap();
+    assert_eq!(metadata.format, crate::SnapshotReadFormat::Wal {
+        selected_base_serial: 0,
+        anchor: crate::WalSnapshotAnchor { incarnation: 91, serial: 0, end_lba: 0 },
+    });
+}
+
+#[test]
+fn pre_replay_restore_refuses_incomplete_mixed_and_advanced_wal() {
+    let fs = FileSystem::new(MemFs::new());
+    let store = SnapshotBlockStore::new(0, 48);
+    let baseline = WalSnapshotManifest {
+        incarnation: 91,
+        base_serial: 0,
+        high_water_serial: 0,
+        high_water_end_lba: 0,
+    };
+    let mut one_slot = MemoryBlockDevice::new(512, 48);
+    fs.commit_volume_snapshot_with_wal_manifest(&store, &mut one_slot, baseline).unwrap();
+    assert!(matches!(
+        FileSystem::restore_volume_snapshot_before_wal_replay_from_store(&store, &mut one_slot),
+        Err(SnapshotBlockStoreError::Corrupt)
+    ));
+
+    let mut mixed = MemoryBlockDevice::new(512, 48);
+    fs.commit_volume_snapshot(&store, &mut mixed).unwrap();
+    fs.commit_volume_snapshot_with_wal_manifest(&store, &mut mixed, baseline).unwrap();
+    assert!(matches!(
+        FileSystem::restore_volume_snapshot_before_wal_replay_from_store(&store, &mut mixed),
+        Err(SnapshotBlockStoreError::Corrupt)
+    ));
+
+    let mut advanced = MemoryBlockDevice::new(512, 48);
+    let high_water = WalSnapshotManifest {
+        high_water_serial: 1,
+        high_water_end_lba: 3,
+        ..baseline
+    };
+    for _ in 0..2 {
+        fs.commit_volume_snapshot_with_wal_manifest(&store, &mut advanced, high_water).unwrap();
+    }
+    assert!(matches!(
+        FileSystem::restore_volume_snapshot_before_wal_replay_from_store(&store, &mut advanced),
+        Err(SnapshotBlockStoreError::Corrupt)
+    ));
+}
+
+#[test]
 fn memfs_streaming_snapshot_repeated_mutation_round_trips_mixed_storage() {
     const SYSTEM: &str = r"\??\C:\ReactOS\System32\Config\SYSTEM";
     const LOG: &str = r"\??\C:\ReactOS\System32\Config\SYSTEM.LOG";

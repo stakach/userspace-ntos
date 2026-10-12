@@ -17,7 +17,7 @@ use crate::fat_directory::FileShortName;
 use crate::path::{normalize_separators, MountManager, MEMFS_VOLUME};
 use crate::snapshot_store::{
     SnapshotBlockDevice, SnapshotBlockStore, SnapshotBlockStoreError, SnapshotPayloadReader,
-    SnapshotPayloadSink, WalSnapshotManifest,
+    SnapshotPayloadSink, StoredSnapshotMetadata, WalSnapshotManifest,
 };
 use crate::status::*;
 
@@ -3984,6 +3984,18 @@ impl FileSystem {
             Some((generation, bytes, fs)) => Ok(Some((fs, generation, bytes))),
             None => Ok(None),
         }
+    }
+
+    /// Decode a snapshot before the native caller can replay WAL records. A v2 image is
+    /// returned only after both slots prove the same empty WAL baseline; later v2 states
+    /// require the WAL-aware boot path and may not be published from snapshot bytes alone.
+    pub fn restore_volume_snapshot_before_wal_replay_from_store<D: SnapshotBlockDevice>(
+        store: &SnapshotBlockStore,
+        dev: &mut D,
+    ) -> Result<Option<(Self, StoredSnapshotMetadata)>, SnapshotBlockStoreError> {
+        store.read_latest_streaming_before_wal_replay(dev, |reader| {
+            Ok(Self::new(MemFs::from_snapshot_reader(reader)?))
+        }).map(|restored| restored.map(|(metadata, fs)| (fs, metadata)))
     }
 
     /// Restore a file system from a durable volume snapshot, with a fresh handle table and the

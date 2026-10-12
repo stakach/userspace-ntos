@@ -390,6 +390,40 @@ impl SnapshotBlockStore {
         Ok(Some((metadata, payload)))
     }
 
+    /// Restore before WAL replay is wired into the caller. Legacy snapshots remain readable,
+    /// but v2 is usable only when both slots contain a validated, identical zero-serial
+    /// baseline. A partial migration or an acknowledged WAL suffix needs explicit recovery.
+    pub fn read_latest_streaming_before_wal_replay<D, F, R>(
+        &self,
+        dev: &mut D,
+        read_payload: F,
+    ) -> Result<Option<(StoredSnapshotMetadata, R)>, SnapshotBlockStoreError>
+    where
+        D: SnapshotBlockDevice,
+        F: FnOnce(&mut PayloadSectorReader<'_, D>) -> Result<R, SnapshotBlockStoreError>,
+    {
+        let Some(plan) = self.latest_valid_slot(dev)? else {
+            return Ok(None);
+        };
+        let metadata = self.metadata_for_selected(dev, plan)?;
+        if let SnapshotReadFormat::Wal { selected_base_serial, anchor } = metadata.format {
+            if selected_base_serial != 0 || anchor.serial != 0 || anchor.end_lba != 0 {
+                return Err(SnapshotBlockStoreError::Corrupt);
+            }
+            let first = self.read_valid_slot_plan(dev, 0)?
+                .and_then(|plan| plan.wal)
+                .ok_or(SnapshotBlockStoreError::Corrupt)?;
+            let second = self.read_valid_slot_plan(dev, 1)?
+                .and_then(|plan| plan.wal)
+                .ok_or(SnapshotBlockStoreError::Corrupt)?;
+            if first != second || first.incarnation != anchor.incarnation {
+                return Err(SnapshotBlockStoreError::Corrupt);
+            }
+        }
+        let (_, _, payload) = self.read_selected_streaming(dev, plan, read_payload)?;
+        Ok(Some((metadata, payload)))
+    }
+
     fn read_selected_streaming<D, F, R>(
         &self,
         dev: &mut D,
