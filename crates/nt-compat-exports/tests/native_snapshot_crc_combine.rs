@@ -19,7 +19,9 @@ impl<'ast> Visit<'ast> for Calls {
         if call.method == "write_snapshot_payload_to_sink" {
             self.payload_traversals += 1;
         }
-        if call.method == "commit_next_streaming" {
+        if call.method == "commit_next_streaming"
+            || call.method == "commit_next_streaming_with_wal_manifest"
+        {
             self.streaming_commits += 1;
         }
         syn::visit::visit_expr_method_call(self, call);
@@ -65,8 +67,8 @@ fn memfs_snapshot_combines_captured_crc_without_a_third_payload_traversal() {
     );
     assert_eq!(calls.combinations, 1, "combine the captured finalized CRCs");
     assert_eq!(
-        calls.streaming_commits, 1,
-        "keep the existing final stream validation and publication protocol"
+        calls.streaming_commits, 2,
+        "both legacy and WAL headers must use a validated streaming commit"
     );
     let body = &methods[0].block;
     let combination = local_initializer(body, "store_payload_crc");
@@ -86,12 +88,20 @@ fn memfs_snapshot_combines_captured_crc_without_a_third_payload_traversal() {
     );
     assert!(path_named(&combination.args[1], "payload_crc"));
     assert!(path_named(&combination.args[2], "payload_len_u64"));
-    let commit = strip_try(local_initializer(body, "generation"));
-    let syn::Expr::MethodCall(commit) = commit else {
-        panic!("generation must be the actual streaming commit result");
+    let syn::Expr::Match(commits) = local_initializer(body, "generation") else {
+        panic!("generation must select a streaming commit for each snapshot format");
     };
-    assert_eq!(commit.method, "commit_next_streaming");
-    assert!(path_named(&commit.args[2], "store_payload_crc"));
+    assert_eq!(commits.arms.len(), 2);
+    for (arm, method) in commits.arms.iter().zip([
+        "commit_next_streaming_with_wal_manifest",
+        "commit_next_streaming",
+    ]) {
+        let syn::Expr::MethodCall(commit) = strip_try(&arm.body) else {
+            panic!("each format must return its actual streaming commit result");
+        };
+        assert_eq!(commit.method, method);
+        assert!(path_named(&commit.args[2], "store_payload_crc"));
+    }
 }
 
 fn local_initializer<'a>(body: &'a syn::Block, name: &str) -> &'a syn::Expr {
