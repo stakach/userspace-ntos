@@ -68,6 +68,9 @@ unsafe fn pool_range_identity_unlocked(
         return None;
     }
     let used = read_volatile(inst.exec_pool_va as *const u64);
+    if used < POOL_DATA_OFF || used > FSD_POOL_FRAMES.checked_mul(0x1000)? {
+        return None;
+    }
     let offset = component_address.checked_sub(FSD_POOL_VADDR)?;
     let allocation = nt_io_manager::hosted_pool_range::walk_hosted_pool_allocation(
         used,
@@ -108,7 +111,12 @@ unsafe fn mapped_memory_identity_unlocked(
     component_address: u64,
     bytes: u64,
 ) -> Option<SourceMemoryIdentity> {
-    if let Some(allocation) = pool_range_identity_unlocked(inst, component_address, bytes) {
+    // A pool address needs an exact live allocation identity. The generic window
+    // translation cannot establish allocation lifetime or generation.
+    if (FSD_POOL_VADDR..FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000)
+        .contains(&component_address)
+    {
+        let allocation = pool_range_identity_unlocked(inst, component_address, bytes)?;
         return Some(SourceMemoryIdentity::Pool {
             allocation,
             component_address,
@@ -146,6 +154,11 @@ unsafe fn memory_identity_matches_unlocked(
             bytes,
             exec_address,
         } => {
+            if (FSD_POOL_VADDR..FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000)
+                .contains(&component_address)
+            {
+                return false;
+            }
             component_to_exec_va_for_instance(instance_index, inst, component_address, bytes)
                 .or_else(|| {
                     hosted_driver_runtime_for_worker_component_range(
@@ -627,6 +640,10 @@ pub(super) fn retire_allocation(
         return (STATUS_INVALID_HANDLE, 0, 0);
     }
     let _guard = lock();
+    let _projection_guard = match hosted_device_allocations::generic_free_admission(inst, component_address) {
+        Ok(guard) => guard,
+        Err(status) => return (status.raw(), 0, 0),
+    };
     let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
         return (STATUS_INVALID_HANDLE, 0, 0);
     };
@@ -1116,6 +1133,9 @@ pub(super) fn release_pending_terminal(ticket: SourceIrpTicket, allocation: Sour
     };
     let Some(inst) = instance(index) else { return false; };
     if instance_domain_identity(inst) != Some(allocation.domain) { return false; }
+    let Ok(_projection_guard) = hosted_device_allocations::generic_free_admission(
+        inst, allocation.component_address,
+    ) else { return false; };
     let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else { return false; };
     let mut current = allocation_unlocked(index, inst, allocation.component_address,
         allocation.bytes, allocation.stack_count);

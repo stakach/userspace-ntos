@@ -1,5 +1,9 @@
 # Lessons
 
+## Resume Completed Agents Explicitly
+- A message to a completed agent does not start another turn. Use `followup_task` for
+  implementation approval after its final response, then confirm the agent resumed.
+
 ## Shell Metadata Is Not JSON Input
 - JSON string quoting is not shell quoting. Backticks and dollar expressions in a GitHub body
   still execute inside a double-quoted shell argument; pass prose through a structured input or

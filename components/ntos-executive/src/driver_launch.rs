@@ -100,6 +100,14 @@ pub(crate) mod hosted_add_device_rollback;
 mod hosted_file_dispatch;
 #[path = "hosted_file_owners.rs"]
 mod hosted_file_owners;
+#[path = "hosted_device_allocations.rs"]
+mod hosted_device_allocations;
+#[path = "hosted_device_publication.rs"]
+mod hosted_device_publication;
+use hosted_device_publication::{register_hosted_device_projection, ProjectionPublicationError};
+#[path = "hosted_device_retirement.rs"]
+mod hosted_device_retirement;
+use hosted_device_retirement::{retire_hosted_device_projection, CanonicalRetirement};
 #[path = "hosted_file_lifecycle_owners.rs"]
 mod hosted_file_lifecycle_owners;
 #[path = "hosted_file_retirements.rs"]
@@ -983,7 +991,6 @@ pub const FSD_DISPATCH_CANCEL_IRP: u64 = u64::MAX - 0x77B;
 pub const FSD_DISPATCH_COPY_COMPLETION: u64 = u64::MAX - 0x77C;
 pub const FSD_DISPATCH_ACK_COMPLETION: u64 = u64::MAX - 0x77D;
 pub const FSD_DISPATCH_CREATE_PDO_PROJECTION: u64 = u64::MAX - 0x77F;
-pub const FSD_DISPATCH_ROLLBACK_ADD_DEVICE: u64 = u64::MAX - 0x780;
 pub const FSD_DISPATCH_DRAIN_FILE_RETIREMENTS: u64 = u64::MAX - 0x781;
 
 const HOSTED_INTERRUPT_OP_CONNECT: u64 = 1;
@@ -3757,6 +3764,7 @@ unsafe fn hosted_instance_pool_free_unlocked(inst: DriverInstance, p: u64) -> bo
 }
 
 unsafe fn hosted_instance_pool_free(inst: DriverInstance, p: u64) -> bool {
+    let Ok(_projection) = hosted_device_allocations::generic_free_admission(inst, p) else { return false; };
     let Some(_guard) = hosted_instance_pool_lock(inst.exec_pool_va) else {
         return false;
     };
@@ -3800,6 +3808,7 @@ unsafe fn release_hosted_instance_pool_allocation_if_live(inst: DriverInstance, 
     if p == 0 {
         return true;
     }
+    let Ok(_projection) = hosted_device_allocations::generic_free_admission(inst, p) else { return false; };
     let Some(_guard) = hosted_instance_pool_lock(inst.exec_pool_va) else {
         return false;
     };
@@ -3814,6 +3823,7 @@ unsafe fn free_hosted_instance_pool_allocation_exact(inst: DriverInstance, p: u6
     if p == 0 {
         return false;
     }
+    let Ok(_projection) = hosted_device_allocations::generic_free_admission(inst, p) else { return false; };
     let Some(_guard) = hosted_instance_pool_lock(inst.exec_pool_va) else {
         return false;
     };
@@ -6211,9 +6221,19 @@ unsafe fn hosted_device_invalidate_relations(pdo: u64, relation_type: u32) {
 }
 
 unsafe fn hosted_device_create(device: u64, driver: u64, extension_size: u64) -> (i32, u64) {
-    match hosted_device_mutation(HOSTED_DEVICE_OP_CREATE, device, driver, extension_size, true) {
-        Ok(device) => (STATUS_SUCCESS, device.expect("CREATE reply carries device identity").get()),
-        Err(status) => (status, 0),
+    let (info, status, value, reserved0, reserved1) = call_on4_raw(
+        (FSD_SERVICE_DEVICE_LABEL << 12) | 4, HOSTED_DEVICE_OP_CREATE, device, driver, extension_size,
+    );
+    if info != 4 {
+        crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_DEVICE_LABEL, HOSTED_DEVICE_OP_CREATE, info, status]);
+    }
+    match nt_io_abi::device_mutation::DeviceCreationReply::decode(status, value, [reserved0, reserved1]) {
+        Ok(nt_io_abi::device_mutation::DeviceCreationReply::Success(device)) => (STATUS_SUCCESS, device.get()),
+        Ok(nt_io_abi::device_mutation::DeviceCreationReply::Rejected(status)) => (status, 0),
+        Ok(nt_io_abi::device_mutation::DeviceCreationReply::Retained(status)) => {
+            crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_DEVICE_LABEL, HOSTED_DEVICE_OP_CREATE, device, status as u32 as u64]);
+        }
+        Err(_) => crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_DEVICE_LABEL, HOSTED_DEVICE_OP_CREATE, status, value]),
     }
 }
 
@@ -8246,9 +8266,7 @@ extern "win64" fn s_io_queue_work_item(
 
 /// `VOID IoFreeWorkItem(PIO_WORKITEM)`.
 extern "win64" fn s_io_free_work_item(work_item: u64) {
-    unsafe {
-        pool_free(work_item);
-    }
+    s_ex_free_pool(work_item);
 }
 
 /// `VOID IoAcquireCancelSpinLock(PKIRQL)`.
@@ -9309,9 +9327,7 @@ extern "win64" fn s_mm_free_contiguous_memory_specify_cache(
     _number_of_bytes: u64,
     _cache_type: u32,
 ) {
-    unsafe {
-        pool_free(base);
-    }
+    s_ex_free_pool(base);
 }
 
 extern "win64" fn s_mm_allocate_non_cached_memory(number_of_bytes: u64) -> u64 {
@@ -9319,9 +9335,7 @@ extern "win64" fn s_mm_allocate_non_cached_memory(number_of_bytes: u64) -> u64 {
 }
 
 extern "win64" fn s_mm_free_non_cached_memory(base: u64, _number_of_bytes: u64) {
-    unsafe {
-        pool_free(base);
-    }
+    s_ex_free_pool(base);
 }
 
 unsafe fn hosted_physical_mapping_slice_mut(
@@ -11475,11 +11489,7 @@ extern "win64" fn s_io_allocate_error_log_entry(_io_object: u64, entry_size: u8)
 
 /// `VOID IoWriteErrorLogEntry(PVOID)`.
 extern "win64" fn s_io_write_error_log_entry(entry: u64) {
-    unsafe {
-        if entry != 0 {
-            pool_free(entry);
-        }
-    }
+    s_ex_free_pool(entry);
 }
 
 // Keep prefix links in the caller's UNICODE_PREFIX_TABLE and entries. A host-global list would
@@ -13855,9 +13865,7 @@ extern "win64" fn s_lookaside_alloc(_pool_type: u64, size: u64, _tag: u64) -> u6
 
 /// A GENERAL_LOOKASIDE default free callback.
 extern "win64" fn s_lookaside_free(buf: u64) {
-    unsafe {
-        pool_free(buf);
-    }
+    s_ex_free_pool(buf);
 }
 
 unsafe fn init_driver_lookaside(
@@ -34103,40 +34111,6 @@ unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64
         };
         return (STATUS_SUCCESS, projection.device_object());
     }
-    if major == FSD_DISPATCH_ROLLBACK_ADD_DEVICE {
-        let driver_object = read_volatile((FSD_SHARED_VADDR + SH_DRVOBJ) as *const u64);
-        let pdo = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
-        let previous_device_head = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
-        let delete_pdo = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64) != 0;
-        if pdo == 0 || (driver_object == 0 && previous_device_head != 0) {
-            return (STATUS_INVALID_PARAMETER, 0);
-        }
-        if driver_object != 0 {
-            let mut current = read_unaligned((driver_object + 0x08) as *const u64);
-            let mut count = 0usize;
-            while current != previous_device_head {
-                if current == 0 || count >= 1024 {
-                    return (STATUS_INVALID_PARAMETER, 0);
-                }
-                current = read_unaligned((current + 0x10) as *const u64);
-                count += 1;
-            }
-            while read_unaligned((driver_object + 0x08) as *const u64) != previous_device_head {
-                let device_object = read_unaligned((driver_object + 0x08) as *const u64);
-                if crate::hosted_driver_projection::hosted_attached_device(pdo) == device_object {
-                    crate::hosted_driver_projection::detach_hosted_device_projection(pdo);
-                }
-                crate::hosted_driver_projection::delete_hosted_device_projection(
-                    device_object,
-                    pool_free,
-                );
-            }
-        }
-        if delete_pdo {
-            crate::hosted_driver_projection::delete_hosted_device_projection(pdo, pool_free);
-        }
-        return (STATUS_SUCCESS, 0);
-    }
     if major == FSD_DISPATCH_ADD_DEVICE {
         let add_device = read_volatile((FSD_SHARED_VADDR + SH_ADD_DEVICE) as *const u64);
         if add_device == 0 {
@@ -47649,6 +47623,8 @@ unsafe fn copy_hosted_device_relations_result(
         return Err(HostedDriverAllocationCopyError::InvalidPointer);
     }
     let inst = instance(instance_index).ok_or(HostedDriverAllocationCopyError::InvalidPointer)?;
+    let _projection = hosted_device_allocations::generic_free_admission(inst, component_pointer)
+        .map_err(|_| HostedDriverAllocationCopyError::ReleaseFailed)?;
     let _guard = hosted_instance_pool_lock(inst.exec_pool_va)
         .ok_or(HostedDriverAllocationCopyError::InvalidPointer)?;
     if hosted_instance_pool_allocation_is_free_unlocked(inst, component_pointer) != Some(false) {
@@ -47702,6 +47678,8 @@ unsafe fn copy_hosted_query_id_result(
         return Err(HostedDriverAllocationCopyError::InvalidPointer);
     }
     let inst = instance(instance_index).ok_or(HostedDriverAllocationCopyError::InvalidPointer)?;
+    let _projection = hosted_device_allocations::generic_free_admission(inst, component_pointer)
+        .map_err(|_| HostedDriverAllocationCopyError::ReleaseFailed)?;
     let _guard = hosted_instance_pool_lock(inst.exec_pool_va)
         .ok_or(HostedDriverAllocationCopyError::InvalidPointer)?;
     if hosted_instance_pool_allocation_is_free_unlocked(inst, component_pointer) != Some(false) {
@@ -47743,6 +47721,8 @@ unsafe fn copy_hosted_bus_property_result(
         return Err(HostedDriverAllocationCopyError::InvalidPointer);
     }
     let inst = instance(instance_index).ok_or(HostedDriverAllocationCopyError::InvalidPointer)?;
+    let _projection = hosted_device_allocations::generic_free_admission(inst, component_pointer)
+        .map_err(|_| HostedDriverAllocationCopyError::ReleaseFailed)?;
     let _guard = hosted_instance_pool_lock(inst.exec_pool_va)
         .ok_or(HostedDriverAllocationCopyError::InvalidPointer)?;
     if hosted_instance_pool_allocation_is_free_unlocked(inst, component_pointer) != Some(false) {
@@ -51719,16 +51699,22 @@ pub(crate) fn service_hosted_device(
                 return (status.raw(), 0, 0, 0);
             }
         };
-        let registration = match io_manager_mut().bind_hosted_device_pointer(domain, pdo_object, device_id) {
+        let registration = match register_hosted_device_projection(inst, domain, pdo_object, device_id) {
             Ok(registration) => registration,
-            Err(status) => {
-                unsafe { hosted_add_device_rollback::cancel_created(rollback_slot) };
-                io_manager_mut()
-                    .destroy_device(device_id)
-                    .unwrap_or_else(|cleanup| {
-                        panic!("hosted IoCreateDevice rollback failed: {cleanup:?}")
-                    });
-                return (status.raw(), 0, 0, 0);
+            Err(error) => {
+                if let Some(registration) = error.accepted_registration() {
+                    unsafe { hosted_add_device_rollback::record_created(rollback_slot, registration) };
+                } else {
+                    unsafe { hosted_add_device_rollback::cancel_created(rollback_slot) };
+                }
+                if error.accepted_registration().is_none() {
+                    io_manager_mut()
+                        .destroy_device(device_id)
+                        .unwrap_or_else(|cleanup| {
+                            panic!("hosted IoCreateDevice rollback failed: {cleanup:?}")
+                        });
+                }
+                return (error.status.raw(), 0, u64::from(error.retained), 0);
             }
         };
         unsafe { hosted_add_device_rollback::record_created(rollback_slot, registration) };
@@ -52224,11 +52210,14 @@ fn register_hosted_device_binding(
     if free_slot.is_none() && bindings.try_reserve(1).is_err() {
         return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     }
-    io_manager_mut().bind_hosted_device_pointer(
+    let projection_inst = self::instance(projection_instance)
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    register_hosted_device_projection(
+        projection_inst,
         projection_domain,
         device_object,
         nt_io_manager::DeviceId(device_id),
-    )?;
+    ).map_err(|error| error.status)?;
     let binding = HostedDeviceBinding {
         driver_id,
         device_id,
@@ -53263,65 +53252,6 @@ fn clear_hosted_device_binding_by_device_id(device_id: u64) {
     }
 }
 
-unsafe fn retire_hosted_device_projection(
-    inst: DriverInstance,
-    device_object: u64,
-) -> Result<(), nt_status::NtStatus> {
-    let _guard = hosted_instance_pool_lock(inst.exec_pool_va)
-        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    let (device_exec, capacity) =
-        hosted_pool_allocation_exec_range(inst.exec_pool_va, device_object)
-            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    let projected_size = read_unaligned((device_exec + 2) as *const u16) as u64;
-    if capacity < WDM_X64_DEVICE_OBJECT_SIZE as u64
-        || hosted_instance_pool_allocation_is_free_unlocked(inst, device_object) != Some(false)
-        || read_unaligned(device_exec as *const i16) != WDM_X64_IO_TYPE_DEVICE
-        || projected_size < WDM_X64_DEVICE_OBJECT_SIZE as u64
-        || projected_size > capacity
-    {
-        return Err(nt_status::NtStatus::INVALID_PARAMETER);
-    }
-    let driver_object = read_unaligned((device_exec + 0x08) as *const u64);
-    let next_device = read_unaligned((device_exec + 0x10) as *const u64);
-    if driver_object != 0 {
-        let (driver_exec, driver_capacity) =
-            hosted_pool_allocation_exec_range(inst.exec_pool_va, driver_object)
-                .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-        if driver_capacity < WDM_X64_DRIVER_OBJECT_SIZE as u64
-            || hosted_instance_pool_allocation_is_free_unlocked(inst, driver_object) != Some(false)
-            || read_unaligned(driver_exec as *const i16) != WDM_X64_IO_TYPE_DRIVER
-        {
-            return Err(nt_status::NtStatus::INVALID_PARAMETER);
-        }
-        let mut link_exec = driver_exec + 0x08;
-        let mut current = read_unaligned(link_exec as *const u64);
-        let mut traversed = 0u64;
-        while current != device_object {
-            if current == 0 || traversed >= POOL_FREE_LIST_MAX {
-                return Err(nt_status::NtStatus::INVALID_PARAMETER);
-            }
-            let (current_exec, current_capacity) =
-                hosted_pool_allocation_exec_range(inst.exec_pool_va, current)
-                    .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-            if current_capacity < WDM_X64_DEVICE_OBJECT_SIZE as u64
-                || hosted_instance_pool_allocation_is_free_unlocked(inst, current) != Some(false)
-                || read_unaligned(current_exec as *const i16) != WDM_X64_IO_TYPE_DEVICE
-            {
-                return Err(nt_status::NtStatus::INVALID_PARAMETER);
-            }
-            link_exec = current_exec + 0x10;
-            current = read_unaligned(link_exec as *const u64);
-            traversed += 1;
-        }
-        write_unaligned(link_exec as *mut u64, next_device);
-    }
-    write_unaligned(device_exec as *mut u16, 0);
-    if !hosted_instance_pool_free_unlocked(inst, device_object) {
-        return Err(nt_status::NtStatus::UNSUCCESSFUL);
-    }
-    Ok(())
-}
-
 unsafe fn drain_hosted_device_retirements() -> usize {
     let mut progress = 0usize;
     let mut index = 0usize;
@@ -53455,7 +53385,7 @@ unsafe fn drain_hosted_device_retirements() -> usize {
                 continue;
             }
         }
-        retire_hosted_device_projection(inst, retirement.device_object).unwrap_or_else(|status| {
+        retire_hosted_device_projection(inst, retirement.device_object, CanonicalRetirement::Retired { registration: retirement.pointer_registration }, None).unwrap_or_else(|status| {
             panic!("canonical hosted device retired before its projection: {status:?}")
         });
         hosted_add_device_rollback::record_retired(retirement.pointer_registration);
@@ -54977,6 +54907,9 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     if let Some(inst) = inst {
+        if !hosted_device_allocations::instance_quiesced(inst) {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
         if inst.driver_id != 0 {
             let Some(domain) = instance_domain_identity(inst) else {
                 return Err(nt_status::NtStatus::INVALID_PARAMETER);
@@ -55018,6 +54951,9 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
 }
 
 fn finish_instance_physical_release(i: usize, inst: DriverInstance) -> Result<(), nt_status::NtStatus> {
+    if !hosted_device_allocations::instance_quiesced(inst) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     if instance_domain_identity(inst).is_some_and(|domain| unsafe {
         hosted_video_caller_aperture::blocks_domain_retirement(
             crate::spawn_hosts::shared_ingress::owner::runtime::PhysicalDomain::Hosted(domain))
@@ -55870,6 +55806,9 @@ unsafe fn service_hosted_driver_mdl_for_instance(
                 mdl,
             ) {
                 return nt_status::NtStatus::PENDING.raw();
+            }
+            if hosted_device_allocations::protects_allocation(inst, mdl) {
+                return nt_status::NtStatus::DEVICE_BUSY.raw();
             }
             match release_hosted_provider_ndis_buffer_shadow_by_component_mdl(
                 instance_index,
@@ -58879,26 +58818,6 @@ unsafe fn create_hosted_pdo_projection(
     }
 }
 
-unsafe fn rollback_hosted_add_device_projection(
-    projection_instance: usize,
-    driver_object: u64,
-    pdo_object: u64,
-    previous_device_head: u64,
-    delete_pdo: bool,
-    caller: nt_process::native_handle::NativeHandleCaller,
-) -> Result<(), nt_status::NtStatus> {
-    dispatch_device_projection_control_for_instance(
-        projection_instance,
-        driver_object,
-        FSD_DISPATCH_ROLLBACK_ADD_DEVICE,
-        pdo_object,
-        previous_device_head,
-        delete_pdo,
-        caller,
-    )
-    .map(|_| ())
-}
-
 struct AddDeviceDispatchResult {
     status: nt_status::NtStatus,
     driver_object: u64,
@@ -59352,15 +59271,23 @@ unsafe fn call_add_device_for_existing_pdo(
                 }
             };
             hosted_add_device_rollback::set_pdo(rollback.as_ref().unwrap(), pdo_object, true, None);
-            let registration = match io_manager_mut().bind_hosted_device_pointer(
+            let registration = match register_hosted_device_projection(
+                projection_inst,
                 projection_domain,
                 pdo_object,
                 pdo_device,
             ) {
                 Ok(registration) => registration,
-                Err(status) => {
-                    hosted_add_device_rollback::abort(rollback.take().unwrap());
-                    return Err(status);
+                Err(error) => {
+                    if let Some(registration) = error.accepted_registration() {
+                        hosted_add_device_rollback::set_pdo(rollback.as_ref().unwrap(), pdo_object, true, Some(registration));
+                        hosted_add_device_rollback::abort(rollback.take().unwrap());
+                    } else if error.cleanup_unbound {
+                        hosted_add_device_rollback::abort(rollback.take().unwrap());
+                    } else {
+                        hosted_add_device_rollback::block(rollback.take().unwrap(), error.status);
+                    }
+                    return Err(error.status);
                 }
             };
             hosted_add_device_rollback::set_pdo(rollback.as_ref().unwrap(), pdo_object, true, Some(registration));

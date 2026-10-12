@@ -42,6 +42,9 @@ mod section_cleanup_authority;
 mod section_retirement_receipts;
 extern crate alloc;
 
+#[path = "native_acceptance/device_pool_lifetime.rs"]
+mod device_pool_lifetime;
+
 #[path = "native_acceptance/client_copy_recorded_backing.rs"]
 mod client_copy_recorded_backing;
 #[path = "native_acceptance/loader_open_output.rs"]
@@ -82,3 +85,6 @@ mod desktop_gate_contract;
 
 #[path = "native_acceptance/gui_dispatch_provenance.rs"]
 mod gui_dispatch_provenance;
+
+#[path = "native_acceptance/hosted_file_projection_ownership.rs"]
+mod hosted_file_projection_ownership;

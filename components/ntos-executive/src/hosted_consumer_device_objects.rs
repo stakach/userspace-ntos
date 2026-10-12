@@ -11,7 +11,7 @@ const STATUS_DEVICE_BUSY: i32 = nt_status::NtStatus::DEVICE_BUSY.raw();
 
 struct Allocation {
     address: u64,
-    generation: u64,
+    identity: Option<nt_io_manager::source_irp_auxiliary::SourcePoolAllocationIdentity>,
 }
 struct Row {
     id: u64,
@@ -23,6 +23,8 @@ struct Row {
     allocations: [Option<Allocation>; 3],
     projection: Option<ConsumerDeviceProjection>,
     registration: Option<HostedDevicePointerRegistration>,
+    canonical_retired: bool,
+    publication_blocked: bool,
     retiring: bool,
 }
 static mut ROWS: Vec<Row> = Vec::new();
@@ -68,19 +70,12 @@ unsafe fn allocate(id: u64, slot: usize, bytes: usize) -> Result<(u64, u64), i32
     // Retain the address before any subsequent lookup or write can refuse admission.
     row(id).allocations[slot] = Some(Allocation {
         address,
-        generation: 0,
+        identity: None,
     });
-    let _lock = hosted_instance_pool_lock(inst.exec_pool_va).ok_or(STATUS_INVALID_PARAMETER)?;
-    if hosted_instance_pool_allocation_is_free_unlocked(inst, address) != Some(false) {
-        return Err(STATUS_INVALID_PARAMETER);
-    }
-    let exec = hosted_pool_allocation_exec_va(inst.exec_pool_va, address, bytes as u64)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
-    let generation = read_volatile((exec - 8) as *const u64);
-    if generation == 0 {
-        return Err(STATUS_INVALID_PARAMETER);
-    }
-    row(id).allocations[slot].as_mut().unwrap().generation = generation;
+    let identity = hosted_device_allocations::capture_allocation(inst, address).map_err(|status| status.raw())?;
+    row(id).allocations[slot].as_mut().unwrap().identity = Some(identity);
+    hosted_device_allocations::protect_allocation_exact(inst, address, Some(identity)).map_err(|status| status.raw())?;
+    let exec = inst.exec_pool_va.checked_add(address - FSD_POOL_VADDR).ok_or(STATUS_INVALID_PARAMETER)?;
     Ok((address, exec))
 }
 
@@ -126,9 +121,14 @@ unsafe fn build(id: u64, name: &[u16], mut init: WdmDeviceObjectInit) -> Result<
         init,
     )
     .map_err(|_| STATUS_INVALID_PARAMETER)?;
-    let registration = io_manager_mut()
-        .bind_hosted_device_pointer(row(id).domain, device, row(id).device)
-        .map_err(|status| status.raw())?;
+    let registration = match register_hosted_device_projection(live_instance(id)?, row(id).domain, device, row(id).device) {
+        Ok(registration) => registration,
+        Err(error) => {
+            row(id).registration = error.accepted_registration();
+            row(id).publication_blocked = row(id).registration.is_none() && !error.cleanup_unbound;
+            return Err(error.status.raw());
+        }
+    };
     row(id).registration = Some(registration);
     row(id).projection = Some(
         ConsumerDeviceProjection::new(io_manager_mut(), registration)
@@ -142,29 +142,55 @@ unsafe fn retire(id: u64) -> Result<(), i32> {
         return Err(STATUS_DEVICE_BUSY);
     }
     let inst = live_instance(id)?;
+    if row(id).publication_blocked { return Err(STATUS_DEVICE_BUSY); }
     if let Some(projection) = row(id).projection.as_mut() {
         if !projection.is_retired() {
             projection
                 .begin_retirement(io_manager_mut())
                 .map_err(|status| status.raw())?;
         }
-        row(id).registration = None;
-    } else if let Some(registration) = row(id).registration {
+        row(id).canonical_retired = true;
+    } else if !row(id).canonical_retired {
+        if let Some(registration) = row(id).registration {
         io_manager_mut()
             .retire_hosted_device_pointer(registration)
             .map_err(|status| status.raw())?;
-        row(id).registration = None;
+        }
+        row(id).canonical_retired = true;
     }
     for slot in (0..3).rev() {
         if let Some(allocation) = row(id).allocations[slot].as_ref() {
             let address = allocation.address;
-            let generation = allocation.generation;
-            let _lock = hosted_instance_pool_lock(inst.exec_pool_va).ok_or(STATUS_DEVICE_BUSY)?;
+            let identity = allocation.identity.ok_or(STATUS_INVALID_PARAMETER)?;
+            let domain = row(id).registration.map_or(row(id).domain, |registration| registration.domain());
+            let canonical_address = row(id).registration.map(|registration| registration.address())
+                .or_else(|| row(id).allocations[1].as_ref().map(|allocation| allocation.address));
+            if canonical_address.is_some_and(|address|
+                io_manager_mut().hosted_device_by_identity(domain, address).is_some()
+                    || io_manager_mut().hosted_device_pointer_registration(domain, address).is_some()) {
+                return Err(STATUS_DEVICE_BUSY);
+            }
+            if io_manager_mut().hosted_device_by_identity(domain, address).is_some()
+                || io_manager_mut().hosted_device_pointer_registration(domain, address).is_some() {
+                return Err(STATUS_DEVICE_BUSY);
+            }
+            if !hosted_device_allocations::protects_allocation(inst, address) {
+                hosted_device_allocations::protect_allocation_exact(inst, address, Some(identity)).map_err(|status| status.raw())?;
+            }
+            let registration = hosted_device_allocations::registration(inst, address).map_err(|status| status.raw())?;
+            // Catalog provenance is checked only after the row-owned canonical retirement gate.
+            // A failed catalog publication may leave None, but must never hide a live bind.
+            if !row(id).canonical_retired || registration.is_some_and(|registration|
+                slot != 1 || row(id).registration != Some(registration)) {
+                return Err(STATUS_INVALID_HANDLE);
+            }
+            let retirement = hosted_device_allocations::admit_retirement(inst, address, registration)
+                .map_err(|status| status.raw())?;
             let exec = hosted_pool_allocation_exec_va(inst.exec_pool_va, address, 1)
                 .ok_or(STATUS_INVALID_PARAMETER)?;
-            if generation == 0
+            if identity.component_address != address
                 || hosted_instance_pool_allocation_is_free_unlocked(inst, address) != Some(false)
-                || read_volatile((exec - 8) as *const u64) != generation
+                || read_volatile((exec - 8) as *const u64) != identity.pool_generation
             {
                 return Err(STATUS_INVALID_PARAMETER);
             }
@@ -172,6 +198,7 @@ unsafe fn retire(id: u64) -> Result<(), i32> {
             if !hosted_instance_pool_free_unlocked(inst, address) {
                 return Err(STATUS_DEVICE_BUSY);
             }
+            hosted_device_allocations::finish_retirement(retirement).map_err(|status| status.raw())?;
             row(id).allocations[slot] = None;
         }
     }
@@ -241,6 +268,8 @@ pub(super) unsafe fn acquire_device(
             allocations: [None, None, None],
             projection: None,
             registration: None,
+            canonical_retired: false,
+            publication_blocked: false,
             retiring: false,
         });
         NEXT_ID = next;
