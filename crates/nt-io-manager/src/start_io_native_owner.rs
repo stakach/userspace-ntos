@@ -28,6 +28,8 @@ pub fn completion_source_ticket(
 pub enum StartIoAdmissionError {
     Source(SourceIrpLedgerError),
     WrongSourceAllocation,
+    WrongPendingNode,
+    WrongDispatchDevice,
     Device(NtStatus),
     AlreadyRetained,
     NoCapacity,
@@ -67,6 +69,45 @@ pub struct StartIoAdmission {
 }
 
 impl StartIoAdmission {
+    /// The native caller must first validate `registered` against the root op6 caller-projection
+    /// row, `observed` against the live pending-node phase/generation, and
+    /// `dispatch_device` against the authenticated canonical dispatch target. An op6 row does
+    /// not carry device authority. This binds both independent witnesses to real source and
+    /// device owners before any WDM queue write.
+    pub fn acquire_projected<P>(
+        io: &mut IoManager<P>,
+        ledger: &mut SourceIrpLedger,
+        expected_source: SourceIrpAllocation,
+        registered: PendingStartIoQueueIdentity,
+        observed: PendingStartIoNodeIdentity,
+        dispatch_device: HostedDevicePointerRegistration,
+    ) -> Result<Self, StartIoAdmissionError> {
+        if registered.device != dispatch_device {
+            return Err(StartIoAdmissionError::WrongDispatchDevice);
+        }
+        if !matches!(expected_source.owner, crate::source_irp_ledger::SourceIrpOwner::HostedCaller(_))
+            || !registered.packet.matches(observed)
+            || observed.raw_irp != expected_source.component_address
+            || observed.source.domain != expected_source.domain
+        {
+            return Err(StartIoAdmissionError::WrongPendingNode);
+        }
+        let Some((ticket, allocation)) = ledger.registered(
+            expected_source.owner, expected_source.domain, expected_source.component_address,
+        ) else {
+            return Err(StartIoAdmissionError::Source(SourceIrpLedgerError::NotFound));
+        };
+        if allocation != expected_source {
+            return Err(StartIoAdmissionError::WrongSourceAllocation);
+        }
+        if ticket != observed.source {
+            return Err(StartIoAdmissionError::WrongPendingNode);
+        }
+        // The caller holds the source lock through admission; this second exact check prevents
+        // a borrowed ticket observation from serving as the physical lifetime owner.
+        Self::acquire(io, ledger, expected_source, registered.device)
+    }
+
     pub fn acquire<P>(
         io: &mut IoManager<P>,
         ledger: &mut SourceIrpLedger,
@@ -214,8 +255,9 @@ impl PendingStartIoNodeIdentity {
     }
 }
 
-/// Adds the exact registered DEVICE_OBJECT projection. The registration is an observation;
-/// native code must retain the matching projection reference until this obligation settles.
+/// Pairs a pending-node observation with a DEVICE_OBJECT registration. The op6 row authenticates
+/// only the IRP: native admission must compare this registration with the independently
+/// authenticated canonical dispatch device and retain the matching projection reference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingStartIoQueueIdentity {
     pub packet: PendingStartIoNodeIdentity,
@@ -362,5 +404,67 @@ mod tests {
             Err(StartIoAdmissionError::Device(_))));
         assert_eq!(ledger.unpin(ticket), Err(SourceIrpLedgerError::WrongIdentity),
             "refusal must have rolled back its sole source pin");
+    }
+
+    #[test]
+    fn projected_packet_requires_exact_op6_ticket_node_and_device_before_queue_effect() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let driver = io.register_driver(DriverRecord::new(
+            ObjectId::NULL, NtPath::parse_str("\\Driver\\ProjectedStartIo").unwrap(),
+            DriverBackendId(1), MajorFunctionTable::new(),
+        ));
+        let device = io.add_device(DeviceRecord::new(
+            ObjectId::NULL, driver, None, DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(), DeviceFlags::empty(), 0,
+        ));
+        let source_domain = io.register_hosted_domain();
+        let projection_domain = io.register_hosted_domain();
+        let registration = io.bind_hosted_device_pointer(projection_domain, 0x4000, device).unwrap();
+        let source = SourceIrpAllocation {
+            owner: SourceIrpOwner::HostedCaller(3), domain: source_domain,
+            component_address: 0x2000, bytes: 0x128, stack_count: 2, pool_generation: 7,
+        };
+        let mut ledger = SourceIrpLedger::new();
+        let ticket = ledger.register(source).unwrap();
+        let registered = PendingStartIoNodeIdentity::new(0x1000, 0x100, 31, 0x2000, ticket).unwrap();
+        let queue = PendingStartIoQueueIdentity::new(registered, registration).unwrap();
+        let baseline = io.device_reference_count(device);
+
+        let stale_node = PendingStartIoNodeIdentity::new(0x1000, 0x200, 31, 0x2000, ticket).unwrap();
+        assert!(matches!(StartIoAdmission::acquire_projected(
+            &mut io, &mut ledger, source, queue, stale_node, registration,
+        ), Err(StartIoAdmissionError::WrongPendingNode)));
+        let stale_ticket = SourceIrpTicket::new(source_domain, ticket.id.get(), ticket.generation.get() + 1).unwrap();
+        let stale_source = PendingStartIoNodeIdentity::new(0x1000, 0x100, 31, 0x2000, stale_ticket).unwrap();
+        assert!(matches!(StartIoAdmission::acquire_projected(
+            &mut io, &mut ledger, source, queue, stale_source, registration,
+        ), Err(StartIoAdmissionError::WrongPendingNode)));
+        let reused_pool = SourceIrpAllocation { pool_generation: 8, ..source };
+        assert!(matches!(StartIoAdmission::acquire_projected(
+            &mut io, &mut ledger, reused_pool, queue, registered, registration,
+        ), Err(StartIoAdmissionError::WrongSourceAllocation)));
+        let other_device = io.add_device(DeviceRecord::new(
+            ObjectId::NULL, driver, None, DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(), DeviceFlags::empty(), 0,
+        ));
+        let wrong_live = io.bind_hosted_device_pointer(projection_domain, 0x5000, other_device).unwrap();
+        assert!(matches!(StartIoAdmission::acquire_projected(
+            &mut io, &mut ledger, source, queue, registered, wrong_live,
+        ), Err(StartIoAdmissionError::WrongDispatchDevice)));
+        assert_eq!(io.retire_hosted_device_pointer(wrong_live), Ok(()));
+        assert_eq!(io.device_reference_count(device), baseline);
+        assert_eq!(ledger.unpin(ticket), Err(SourceIrpLedgerError::WrongIdentity));
+
+        let mut admitted = StartIoAdmission::acquire_projected(
+            &mut io, &mut ledger, source, queue, registered, registration,
+        ).unwrap();
+        assert_eq!(admitted.source_identity().ticket(), ticket);
+        assert_eq!(admitted.source_identity().allocation(), source);
+        assert_eq!(admitted.device_registration(), registration);
+        assert_eq!(io.retire_hosted_device_pointer(registration), Err(NtStatus::DEVICE_BUSY));
+        assert_eq!(ledger.begin_hosted_caller_retirement(ticket, source),
+            Err(SourceIrpLedgerError::Pinned));
+        admitted.release(&mut io, &mut ledger).unwrap();
+        assert_eq!(io.device_reference_count(device), baseline);
     }
 }
