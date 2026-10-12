@@ -166,10 +166,11 @@ The current [issue #18 diagnostic](https://github.com/stakach/userspace-ntos/iss
 has advanced through ReactOS setup and real device installation after a resumed
 registry snapshot. ACPI and PCI bus relations now commit, and the PCI root driver
 starts. The live bochsmp PCI PDO now passes resource validation and reaches
-AddDevice. Its resource-filter request still hits a root-bus-only VideoPort
-dispatch path, so START has not completed and `HARDWARE\\DEVICEMAP\\VIDEO` remains
-absent when win32k starts. VideoPort enumerates the bochsmp monitor child. Input drivers still
-lack `IoStartPacket`/`IoStartNextPacket`. Font cleanup and
+AddDevice. VideoPort now forwards FILTER and START to the accepted PCI provider;
+a bounded boot recorded successful bochsmp StartDevice, FindAdapter, and hosted
+video-device publication. That diagnostic was stopped while SMSS was still
+scanning KnownDLLs, before CSRSS or Explorer launched. Input drivers
+still lack `IoStartPacket`/`IoStartNextPacket`. Font cleanup and
 desktop acceptance remain unproven. Acceptance requires strict native private-font
 cleanup and a separate fresh production Userinit/Explorer boot with real callbacks,
 GDI drawing, logs and screenshots. Crate CI does not prove desktop boot. An earlier

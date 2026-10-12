@@ -1924,6 +1924,13 @@ unsafe fn observe_canonical_start(
         driver_launch::pump_hosted_io_completions();
     }
     match driver_launch::observe_hosted_pnp_start(irp_id) {
+        Ok(driver_launch::HostedPnpStartObservation::NotEntered { status, device_id }) => {
+            CanonicalStartDisposition::Terminal {
+                status: rollback_pre_dispatch_start(device_id, status),
+                waited: driver_pending,
+                receipt: None,
+            }
+        }
         Ok(driver_launch::HostedPnpStartObservation::Terminal {
             driver_status,
             receipt,

@@ -606,11 +606,32 @@ mod tests {
     use nt_io_manager::{
         DeviceCharacteristics, DeviceFlags, DeviceType, DispatchContext, DispatchOutcome,
         DispatchTarget, DriverBackendId, DriverCompletion, DriverDispatchBackend, DriverPeerId,
-        DriverRecord, IrpProjection, MajorFunctionTable, MockObjectPort,
+        DriverRecord, IrpProjection, MajorFunctionTable, MockObjectPort, PnpBackendDispatch,
     };
     use nt_types::{NtPath, ObjectId};
 
     struct StartBackend;
+
+    struct PassThroughFilterBackend;
+
+    impl DriverDispatchBackend for PassThroughFilterBackend {
+        fn dispatch_irp(
+            &mut self,
+            _context: DispatchContext<'_>,
+            irp: &IrpProjection,
+        ) -> Result<DispatchOutcome, NtStatus> {
+            assert_eq!(irp.minor, nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS);
+            Ok(DispatchOutcome::Completed {
+                status: NtStatus::NOT_SUPPORTED,
+                information: irp.information,
+                file_context: None,
+            })
+        }
+
+        fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
+            Err(NtStatus::NOT_SUPPORTED)
+        }
+    }
 
     impl DriverDispatchBackend for StartBackend {
         fn dispatch_irp(
@@ -952,5 +973,241 @@ mod tests {
             Err(LowerPnpForwardError::SameDomain)
         ));
         assert_eq!(fixture.io.irp_count(), before);
+    }
+
+    #[test]
+    fn canonical_video_start_enters_only_the_accepted_pci_provider() {
+        let mut fixture = fixture(Box::new(StartBackend));
+        let pdo = fixture.provider.device_id();
+        let outer = fixture
+            .io
+            .prepare_external_pnp_owned_to_exact_device(
+                fixture.client,
+                pdo,
+                0,
+                PnpParameters::start(0, 0).unwrap(),
+                Vec::new(),
+            )
+            .unwrap();
+        let prepared = crate::PreparedAcceptedPdoPnp::start(
+            &fixture.pnp,
+            &fixture.relations,
+            &fixture.providers,
+            &mut fixture.io,
+            outer.irp_id(),
+            pdo,
+            fixture.client,
+            0,
+            0,
+            0,
+            Vec::new(),
+        )
+        .unwrap();
+        let identity = prepared.identity();
+        let invocation = prepared
+            .begin(
+                &fixture.pnp,
+                &fixture.relations,
+                &fixture.providers,
+                &mut fixture.io,
+                identity,
+            )
+            .unwrap();
+        let provider_irp = invocation.provider_irp();
+        let returned = invocation.invoke(|_, _| {
+            // Native provider entry can take a new short borrow of the manager.
+            assert!(fixture.io.irp(provider_irp).is_some());
+            PnpBackendDispatch::Returned {
+                status: NtStatus::SUCCESS,
+                information: 0,
+            }
+        });
+        let terminal = match returned.finish(&mut fixture.io).unwrap() {
+            crate::AcceptedPdoPnpResult::Terminal(terminal) => terminal,
+            result => panic!("unexpected provider result: {result:?}"),
+        };
+        assert_eq!(terminal.status(), NtStatus::SUCCESS);
+        assert_eq!(terminal.retire(&mut fixture.io).unwrap(), NtStatus::SUCCESS);
+        fixture.io.discard_prepared_external_pnp(outer).unwrap();
+    }
+
+    #[test]
+    fn canonical_video_start_rejects_wrong_outer_identity_before_provider_entry() {
+        let mut fixture = fixture(Box::new(StartBackend));
+        let pdo = fixture.provider.device_id();
+        let outer = fixture
+            .io
+            .prepare_external_pnp_owned_to_exact_device(
+                fixture.client,
+                pdo,
+                0,
+                PnpParameters::start(0, 0).unwrap(),
+                Vec::new(),
+            )
+            .unwrap();
+        let prepared = crate::PreparedAcceptedPdoPnp::start(
+            &fixture.pnp,
+            &fixture.relations,
+            &fixture.providers,
+            &mut fixture.io,
+            outer.irp_id(),
+            pdo,
+            fixture.client,
+            0,
+            0,
+            0,
+            Vec::new(),
+        )
+        .unwrap();
+        let wrong = crate::AcceptedPdoPnpIdentity {
+            outer_irp: IrpId(outer.irp_id().raw() + 1),
+            ..prepared.identity()
+        };
+        let prepared = match prepared.begin(
+            &fixture.pnp,
+            &fixture.relations,
+            &fixture.providers,
+            &mut fixture.io,
+            wrong,
+        ) {
+            Err((crate::AcceptedPdoPnpError::WrongIdentity, prepared)) => prepared,
+            result => panic!("wrong outer identity entered provider: {result:?}"),
+        };
+        assert!(matches!(
+            prepared.discard(&mut fixture.io),
+            crate::AcceptedPdoPnpDiscard::Retired
+        ));
+        fixture.io.discard_prepared_external_pnp(outer).unwrap();
+    }
+
+    #[test]
+    fn canonical_video_filter_preserves_native_unsupported_without_exporting_input_pointer() {
+        let mut fixture = fixture(Box::new(PassThroughFilterBackend));
+        let pdo = fixture.provider.device_id();
+        let input = vec![0u8; 64];
+        let outer = fixture
+            .io
+            .prepare_external_pnp_owned_to_exact_device(
+                fixture.client,
+                pdo,
+                0,
+                PnpParameters::filter_resource_requirements(input.len() as u32).unwrap(),
+                input.clone(),
+            )
+            .unwrap();
+        let prepared = crate::PreparedAcceptedPdoPnp::filter(
+            &fixture.pnp,
+            &fixture.relations,
+            &fixture.providers,
+            &mut fixture.io,
+            outer.irp_id(),
+            pdo,
+            fixture.client,
+            0,
+            input,
+        )
+        .unwrap();
+        let identity = prepared.identity();
+        let invocation = prepared
+            .begin(
+                &fixture.pnp,
+                &fixture.relations,
+                &fixture.providers,
+                &mut fixture.io,
+                identity,
+            )
+            .unwrap();
+        let returned = invocation.invoke(|_, _| PnpBackendDispatch::Returned {
+            status: NtStatus::NOT_SUPPORTED,
+            information: 0x1234_5000,
+        });
+        let terminal = match returned.finish(&mut fixture.io).unwrap() {
+            crate::AcceptedPdoPnpResult::Terminal(terminal) => terminal,
+            result => panic!("unexpected FILTER result: {result:?}"),
+        };
+        assert_eq!(terminal.status(), NtStatus::NOT_SUPPORTED);
+        assert_eq!(terminal.information(), 0);
+        // FILTER owns only an input extent. A pass-through failure returns no output buffer.
+        assert!(terminal.payload().is_none());
+        assert_eq!(
+            terminal.retire(&mut fixture.io).unwrap(),
+            NtStatus::NOT_SUPPORTED
+        );
+        fixture.io.discard_prepared_external_pnp(outer).unwrap();
+    }
+
+    #[test]
+    fn canonical_video_pending_start_keeps_provider_until_exact_ack() {
+        let mut fixture = fixture(Box::new(StartBackend));
+        let pdo = fixture.provider.device_id();
+        let outer = fixture
+            .io
+            .prepare_external_pnp_owned_to_exact_device(
+                fixture.client,
+                pdo,
+                0,
+                PnpParameters::start(0, 0).unwrap(),
+                Vec::new(),
+            )
+            .unwrap();
+        let prepared = crate::PreparedAcceptedPdoPnp::start(
+            &fixture.pnp,
+            &fixture.relations,
+            &fixture.providers,
+            &mut fixture.io,
+            outer.irp_id(),
+            pdo,
+            fixture.client,
+            0,
+            0,
+            0,
+            Vec::new(),
+        )
+        .unwrap();
+        let identity = prepared.identity();
+        let invocation = prepared
+            .begin(
+                &fixture.pnp,
+                &fixture.relations,
+                &fixture.providers,
+                &mut fixture.io,
+                identity,
+            )
+            .unwrap();
+        let provider_irp = invocation.provider_irp();
+        let returned = invocation.invoke(|_, _| PnpBackendDispatch::Pending);
+        let retained = match returned.finish(&mut fixture.io).unwrap() {
+            crate::AcceptedPdoPnpResult::Retained(retained) => retained,
+            result => panic!("unexpected pending START result: {result:?}"),
+        };
+        assert_eq!(retained.provider_irp(), provider_irp);
+        let driver = fixture
+            .io
+            .irp(provider_irp)
+            .unwrap()
+            .current_stack()
+            .unwrap()
+            .driver_id;
+        assert!(fixture.io.publish_driver_completion(
+            driver,
+            DriverCompletion {
+                irp_id: provider_irp,
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            }
+        ));
+        let ack = retained
+            .prepare_completion(&mut fixture.io, identity)
+            .unwrap();
+        assert_eq!(ack.completion().id, provider_irp);
+        let returned = ack.invoke(|_| nt_io_manager::CompletionAcknowledgement::Acknowledged);
+        let terminal = match returned.finish(&mut fixture.io).unwrap() {
+            crate::AcceptedPdoPnpResult::Terminal(terminal) => terminal,
+            result => panic!("unexpected pending START terminal: {result:?}"),
+        };
+        assert!(terminal.provider_acknowledged());
+        assert_eq!(terminal.retire(&mut fixture.io).unwrap(), NtStatus::SUCCESS);
+        fixture.io.discard_prepared_external_pnp(outer).unwrap();
     }
 }

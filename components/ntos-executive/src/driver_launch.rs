@@ -43344,6 +43344,60 @@ unsafe fn drain_hosted_filter_requirements_transactions() -> usize {
             )
         };
         match phase {
+            HostedFilterRequirementsPhase::AwaitingVideoProvider => {
+                let stage = hosted_filter_requirements_transactions_mut()[index]
+                    .video_provider
+                    .take()
+                    .expect("VideoPort FILTER provider stage disappeared");
+                let owner = advance_hosted_video_provider(stage);
+                match &owner.stage {
+                    HostedVideoProviderStage::Ready { status, identity } => {
+                        let (status, identity) = (*status, *identity);
+                        if identity.outer_irp != irp_id
+                            || identity.pdo.raw() != binding.pdo_device_id
+                            || identity.minor != nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS
+                            || !hosted_video_provider_identity_current(identity)
+                        {
+                            let transaction = &mut hosted_filter_requirements_transactions_mut()[index];
+                            transaction.phase = HostedFilterRequirementsPhase::Indeterminate;
+                            transaction.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                            progress = progress.saturating_add(1);
+                            index += 1;
+                            continue;
+                        }
+                        let prepared = {
+                            let transaction = &mut hosted_filter_requirements_transactions_mut()[index];
+                            transaction.video_provider_proof = Some(status);
+                            transaction.phase = HostedFilterRequirementsPhase::AwaitingCompletion;
+                            transaction.video_outer_prepared.take().expect("VideoPort FILTER outer owner disappeared")
+                        };
+                        dispatch_hosted_filter_prepared(irp_id, prepared);
+                    }
+                    HostedVideoProviderStage::Indeterminate(status) => {
+                        let status = *status;
+                        let transaction = &mut hosted_filter_requirements_transactions_mut()[index];
+                        transaction.video_provider = Some(owner);
+                        transaction.phase = HostedFilterRequirementsPhase::Indeterminate;
+                        transaction.barrier_status = Some(status);
+                    }
+                    HostedVideoProviderStage::Retained(retained)
+                        if retained.is_indeterminate()
+                            || retained.has_rejected_terminal()
+                            || retained.identity().minor == nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS =>
+                    {
+                        let transaction = &mut hosted_filter_requirements_transactions_mut()[index];
+                        transaction.video_provider = Some(owner);
+                        transaction.phase = HostedFilterRequirementsPhase::Indeterminate;
+                        transaction.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                    }
+                    _ => {
+                        hosted_filter_requirements_transactions_mut()[index].video_provider = Some(owner);
+                        index += 1;
+                        continue;
+                    }
+                }
+                progress = progress.saturating_add(1);
+            }
             HostedFilterRequirementsPhase::AwaitingCompletion => {
                 let Some(completion) = io_manager_mut().completed_irp(irp_id) else {
                     index += 1;
@@ -44002,6 +44056,7 @@ unsafe fn drain_hosted_pnp_completions() -> usize {
                 }
             }
             HostedPnpTransactionPhase::Prepared
+            | HostedPnpTransactionPhase::AwaitingVideoProvider
             | HostedPnpTransactionPhase::DetachedDispatchInFlight
             | HostedPnpTransactionPhase::DetachedAckInFlight
             | HostedPnpTransactionPhase::DetachedAckRetry
@@ -44021,6 +44076,9 @@ pub(crate) unsafe fn observe_hosted_pnp_start(
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
     let irp_id = IrpId(irp_id);
+    if let Some(observation) = advance_hosted_video_start_provider(irp_id)? {
+        return Ok(observation);
+    }
     let (minor, phase) = hosted_pnp_transactions_mut()
         .iter()
         .find(|transaction| transaction.irp_id == irp_id)
@@ -44054,6 +44112,7 @@ pub(crate) unsafe fn observe_hosted_pnp_start(
             })
         }
         HostedPnpTransactionPhase::Prepared
+        | HostedPnpTransactionPhase::AwaitingVideoProvider
         | HostedPnpTransactionPhase::Dispatching
         | HostedPnpTransactionPhase::DetachedDispatchInFlight
         | HostedPnpTransactionPhase::AwaitingCompletion
@@ -44064,6 +44123,167 @@ pub(crate) unsafe fn observe_hosted_pnp_start(
             Ok(HostedPnpStartObservation::AwaitingCompletion)
         }
     }
+}
+
+unsafe fn advance_hosted_video_start_provider(
+    irp_id: IrpId,
+) -> Result<Option<HostedPnpStartObservation>, nt_status::NtStatus> {
+    let Some(transaction) = hosted_pnp_transactions_mut()
+        .iter_mut()
+        .find(|transaction| transaction.irp_id == irp_id)
+    else {
+        return Ok(None);
+    };
+    if transaction.phase != HostedPnpTransactionPhase::AwaitingVideoProvider {
+        return Ok(None);
+    }
+    let stage = transaction
+        .video_provider
+        .take()
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let owner = advance_hosted_video_provider(stage);
+    match &owner.stage {
+        HostedVideoProviderStage::Ready { status, identity } => {
+            let (status, identity) = (*status, *identity);
+            let binding = hosted_pnp_transactions_mut()
+                .iter()
+                .find(|transaction| transaction.irp_id == irp_id)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+                .binding;
+            if identity.outer_irp != irp_id
+                || identity.pdo.raw() != binding.pdo_device_id
+                || identity.minor != nt_pnp_abi::IRP_MN_START_DEVICE
+                || !hosted_video_provider_identity_current(identity)
+            {
+                let status = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+                set_hosted_pnp_indeterminate(irp_id, status)?;
+                return Ok(Some(HostedPnpStartObservation::Indeterminate {
+                    transport_status: status,
+                    receipt: None,
+                }));
+            }
+            let prepared = {
+                let transaction = hosted_pnp_transactions_mut()
+                    .iter_mut()
+                    .find(|transaction| transaction.irp_id == irp_id)
+                    .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+                transaction.video_provider_proof = Some(status);
+                transaction
+                    .video_outer_prepared
+                    .take()
+                    .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            };
+            transition_hosted_pnp_transaction_phase(irp_id, HostedPnpTransactionPhase::Dispatching)?;
+            let outcome = dispatch_prepared_hosted_pnp_start(irp_id, prepared);
+            let observation = match outcome {
+                Ok(HostedPnpStartOutcome::Started { receipt }) => HostedPnpStartObservation::Terminal {
+                    driver_status: nt_status::NtStatus::SUCCESS,
+                    receipt,
+                },
+                Ok(HostedPnpStartOutcome::Failed { status, receipt }) => HostedPnpStartObservation::Terminal {
+                    driver_status: status,
+                    receipt,
+                },
+                Ok(HostedPnpStartOutcome::Indeterminate { transport_status, .. }) => HostedPnpStartObservation::Indeterminate {
+                    transport_status,
+                    receipt: None,
+                },
+                Ok(HostedPnpStartOutcome::Pending { .. } | HostedPnpStartOutcome::RepairRequired { .. }) => {
+                    HostedPnpStartObservation::AwaitingCompletion
+                }
+                Err(failure) => HostedPnpStartObservation::Indeterminate {
+                    transport_status: failure.status,
+                    receipt: None,
+                },
+            };
+            Ok(Some(observation))
+        }
+        HostedVideoProviderStage::Retained(retained)
+            if retained.is_indeterminate() || retained.has_rejected_terminal() =>
+        {
+            hosted_pnp_transactions_mut()
+                .iter_mut()
+                .find(|transaction| transaction.irp_id == irp_id)
+                .expect("VideoPort START owner disappeared")
+                .video_provider = Some(owner);
+            let status = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+            set_hosted_pnp_indeterminate(irp_id, status)?;
+            Ok(Some(HostedPnpStartObservation::Indeterminate {
+                transport_status: status,
+                receipt: None,
+            }))
+        }
+        HostedVideoProviderStage::Indeterminate(status) => {
+            let status = *status;
+            let device_id = hosted_pnp_transactions_mut()
+                .iter()
+                .find(|transaction| transaction.irp_id == irp_id)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+                .binding.device_id;
+            hosted_pnp_transactions_mut()
+                .iter_mut()
+                .find(|transaction| transaction.irp_id == irp_id)
+                .expect("VideoPort START owner disappeared")
+                .video_provider = Some(owner);
+            match abort_hosted_video_start_before_entry(irp_id) {
+                Ok(()) => Ok(Some(HostedPnpStartObservation::NotEntered { status, device_id })),
+                Err(transport_status) => {
+                    set_hosted_pnp_indeterminate(irp_id, transport_status)?;
+                    Ok(Some(HostedPnpStartObservation::Indeterminate {
+                        transport_status,
+                        receipt: None,
+                    }))
+                }
+            }
+        }
+        _ => {
+            hosted_pnp_transactions_mut()
+                .iter_mut()
+                .find(|transaction| transaction.irp_id == irp_id)
+                .expect("VideoPort START owner disappeared")
+                .video_provider = Some(owner);
+            Ok(Some(HostedPnpStartObservation::AwaitingCompletion))
+        }
+    }
+}
+
+/// A lower provider refusal before native entry can release the exact START token and outer IRP.
+/// Any failed abort/discard keeps both owners as a barrier rather than allowing a second START.
+unsafe fn abort_hosted_video_start_before_entry(
+    irp_id: IrpId,
+) -> Result<(), nt_status::NtStatus> {
+    let transaction = hosted_pnp_transactions_mut()
+        .iter()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let token = transaction
+        .token
+        .as_ref()
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if !matches!(transaction.video_provider.as_ref().map(|owner| &owner.stage),
+        Some(HostedVideoProviderStage::Indeterminate(_)))
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    hosted_pnp_manager_mut()
+        .abort_pnp_dispatch(token, irp_id.raw())
+        .map_err(hosted_pnp_status)?;
+    let prepared = hosted_pnp_transactions_mut()
+        .iter_mut()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .and_then(|transaction| transaction.video_outer_prepared.take())
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if let Err(rejection) = io_manager_mut().discard_prepared_external_pnp(prepared) {
+        let status = rejection.status();
+        hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .expect("unretired VideoPort outer owner disappeared")
+            .video_outer_prepared = Some(rejection.into_prepared());
+        return Err(status);
+    }
+    remove_hosted_pnp_transaction(irp_id);
+    Ok(())
 }
 
 unsafe fn take_terminal_hosted_pnp_start(
@@ -44257,6 +44477,7 @@ pub(crate) unsafe fn observe_hosted_pnp_lifecycle(
             })
         }
         HostedPnpTransactionPhase::Prepared
+        | HostedPnpTransactionPhase::AwaitingVideoProvider
         | HostedPnpTransactionPhase::Dispatching
         | HostedPnpTransactionPhase::DetachedDispatchInFlight
         | HostedPnpTransactionPhase::AwaitingCompletion
@@ -46874,6 +47095,7 @@ enum HostedDriverAllocationCopyError {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum HostedPnpTransactionPhase {
     Prepared,
+    AwaitingVideoProvider,
     Dispatching,
     DetachedDispatchInFlight,
     AwaitingCompletion,
@@ -46890,6 +47112,372 @@ enum HostedDetachedPnpOwner {
     DispatchReturned(nt_io_manager::ExternalPnpReturn),
     Retained(nt_io_manager::RetainedExternalPnp),
     AckReturned(nt_io_manager::ExternalPnpCompletionReturn),
+}
+
+/// The lower PCI PDO runs before the VideoPort shim completes the outer function-stack IRP.
+/// Every state retains its canonical provider owner until the exact terminal is acknowledged.
+enum HostedVideoProviderStage {
+    Prepared(nt_pnp_manager::PreparedAcceptedPdoPnp),
+    Return(nt_pnp_manager::AcceptedPdoPnpReturn),
+    Retained(nt_pnp_manager::RetainedAcceptedPdoPnp),
+    CompletionReturn(nt_pnp_manager::AcceptedPdoPnpCompletionReturn),
+    Terminal(nt_pnp_manager::TerminalAcceptedPdoPnp),
+    Discarded(nt_pnp_manager::DiscardedAcceptedPdoPnp),
+    Ready {
+        status: nt_status::NtStatus,
+        identity: nt_pnp_manager::AcceptedPdoPnpIdentity,
+    },
+    Indeterminate(nt_status::NtStatus),
+}
+
+struct HostedVideoProviderOwner {
+    stage: HostedVideoProviderStage,
+    physical: Option<HostedPnpPhysicalProvider>,
+    lease: Option<HostedProviderDependencyDispatchLease>,
+}
+
+impl HostedVideoProviderOwner {
+    fn prepared(prepared: nt_pnp_manager::PreparedAcceptedPdoPnp) -> Self {
+        Self {
+            stage: HostedVideoProviderStage::Prepared(prepared),
+            physical: None,
+            lease: None,
+        }
+    }
+}
+
+fn hosted_video_provider_status(error: nt_pnp_manager::AcceptedPdoPnpError) -> nt_status::NtStatus {
+    use nt_pnp_manager::AcceptedPdoPnpError;
+    match error {
+        AcceptedPdoPnpError::Provider(status)
+        | AcceptedPdoPnpError::Prepare(status)
+        | AcceptedPdoPnpError::Dispatch(status) => status,
+        AcceptedPdoPnpError::Authority(nt_pnp_manager::AcceptedPdoProviderError::InsufficientResources) => {
+            nt_status::NtStatus::INSUFFICIENT_RESOURCES
+        }
+        _ => nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+    }
+}
+
+unsafe fn hosted_video_provider_identity_current(
+    identity: nt_pnp_manager::AcceptedPdoPnpIdentity,
+) -> bool {
+    hosted_accepted_pdo_provider_catalog()
+        .resolve(
+            hosted_pnp_manager_mut(),
+            hosted_bus_relations(),
+            io_manager_mut(),
+            identity.pdo.raw(),
+        )
+        .is_ok_and(|current| current == identity.provider)
+}
+
+unsafe fn hosted_video_physical_provider(
+    identity: nt_pnp_manager::AcceptedPdoPnpIdentity,
+    provider_irp: IrpId,
+) -> Option<(HostedPnpPhysicalProvider, Option<HostedProviderDependencyDispatchLease>)> {
+    let driver_id = io_manager_mut().irp(provider_irp)?.current_stack()?.driver_id;
+    let (index, inst) = instance_by_driver_id(driver_id.raw())?;
+    let physical = hosted_pnp_physical_provider(index, driver_id)?;
+    if !inst.ready
+        || physical.dependent_domain != identity.provider.provider().domain()
+        || !hosted_pnp_physical_provider_current(physical)
+    {
+        return None;
+    }
+    let lease = if physical.publication_cookie == 0 {
+        None
+    } else {
+        Some(acquire_hosted_provider_dependency_dispatch_lease(
+            physical.storage_instance,
+            physical.dependent_instance,
+            physical.publication_cookie,
+        )?)
+    };
+    Some((physical, lease))
+}
+
+unsafe fn advance_hosted_video_provider(
+    mut owner: HostedVideoProviderOwner,
+) -> HostedVideoProviderOwner {
+    owner.stage = advance_hosted_video_provider_stage(
+        owner.stage,
+        &mut owner.physical,
+        &mut owner.lease,
+    );
+    owner
+}
+
+unsafe fn advance_hosted_video_provider_stage(
+    stage: HostedVideoProviderStage,
+    physical: &mut Option<HostedPnpPhysicalProvider>,
+    lease: &mut Option<HostedProviderDependencyDispatchLease>,
+) -> HostedVideoProviderStage {
+    use nt_pnp_manager::{AcceptedPdoPnpDiscard, AcceptedPdoPnpResult};
+    match stage {
+        HostedVideoProviderStage::Prepared(prepared) => {
+            let identity = prepared.identity();
+            if physical.is_none() {
+                let Some((captured, captured_lease)) =
+                    hosted_video_physical_provider(identity, prepared.provider_irp())
+                else {
+                    return match prepared.discard(io_manager_mut()) {
+                        AcceptedPdoPnpDiscard::Retired => HostedVideoProviderStage::Indeterminate(
+                            nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+                        ),
+                        AcceptedPdoPnpDiscard::NotDiscarded { prepared, .. } => {
+                            HostedVideoProviderStage::Prepared(prepared)
+                        }
+                        AcceptedPdoPnpDiscard::Retained { discarded, .. } => {
+                            HostedVideoProviderStage::Discarded(discarded)
+                        }
+                    };
+                };
+                *physical = Some(captured);
+                *lease = captured_lease;
+            }
+            let invocation = match prepared.begin(
+                hosted_pnp_manager_mut(),
+                hosted_bus_relations(),
+                hosted_accepted_pdo_provider_catalog(),
+                io_manager_mut(),
+                identity,
+            ) {
+                Ok(invocation) => invocation,
+                Err((error, prepared)) => return match prepared.discard(io_manager_mut()) {
+                    AcceptedPdoPnpDiscard::Retired => {
+                        HostedVideoProviderStage::Indeterminate(hosted_video_provider_status(error))
+                    }
+                    AcceptedPdoPnpDiscard::NotDiscarded { prepared, .. } => {
+                        HostedVideoProviderStage::Prepared(prepared)
+                    }
+                    AcceptedPdoPnpDiscard::Retained { discarded, .. } => {
+                        HostedVideoProviderStage::Discarded(discarded)
+                    }
+                },
+            };
+            let returned = invocation.invoke(|context, projection| {
+                let Some((index, inst)) = instance_by_driver_id(projection.driver_id.raw()) else {
+                    return PnpBackendDispatch::NotDispatched {
+                        status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+                    };
+                };
+                if !inst.ready
+                    || instance_domain_identity(inst) != Some(identity.provider.provider().domain())
+                    || projection.device_id != identity.pdo
+                    || projection.irp_id == identity.outer_irp
+                    || physical.is_none_or(|route| {
+                        route.dependent_instance != index
+                            || route.dependent_driver_id != projection.driver_id
+                            || !hosted_pnp_physical_provider_current(route)
+                    })
+                {
+                    return PnpBackendDispatch::NotDispatched {
+                        status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                    };
+                }
+                HostedDriverBackend { instance: index }.dispatch_pnp_irp(context, projection)
+            });
+            match returned.finish(io_manager_mut()) {
+                Ok(AcceptedPdoPnpResult::Terminal(terminal)) => {
+                    HostedVideoProviderStage::Terminal(terminal)
+                }
+                Ok(AcceptedPdoPnpResult::Retained(retained)
+                    | AcceptedPdoPnpResult::Rejected { retained, .. }) => {
+                    HostedVideoProviderStage::Retained(retained)
+                }
+                Ok(AcceptedPdoPnpResult::NotEntered { error, prepared }) => {
+                    match prepared.discard(io_manager_mut()) {
+                        AcceptedPdoPnpDiscard::Retired => {
+                            HostedVideoProviderStage::Indeterminate(hosted_video_provider_status(error))
+                        }
+                        AcceptedPdoPnpDiscard::NotDiscarded { prepared, .. } => {
+                            HostedVideoProviderStage::Prepared(prepared)
+                        }
+                        AcceptedPdoPnpDiscard::Retained { discarded, .. } => {
+                            HostedVideoProviderStage::Discarded(discarded)
+                        }
+                    }
+                }
+                Err(rejection) => HostedVideoProviderStage::Return(rejection.into_returned()),
+            }
+        }
+        HostedVideoProviderStage::Return(returned) => match returned.finish(io_manager_mut()) {
+            Ok(AcceptedPdoPnpResult::Terminal(terminal)) => HostedVideoProviderStage::Terminal(terminal),
+            Ok(AcceptedPdoPnpResult::Retained(retained)
+                | AcceptedPdoPnpResult::Rejected { retained, .. }) => HostedVideoProviderStage::Retained(retained),
+            Ok(AcceptedPdoPnpResult::NotEntered { prepared, .. }) => HostedVideoProviderStage::Prepared(prepared),
+            Err(rejection) => HostedVideoProviderStage::Return(rejection.into_returned()),
+        },
+        HostedVideoProviderStage::Retained(retained) => {
+            if retained.is_indeterminate()
+                || retained.has_rejected_terminal()
+                || retained.identity().minor == nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS
+            {
+                return HostedVideoProviderStage::Retained(retained);
+            }
+            let identity = retained.identity();
+            let invocation = match retained.prepare_completion(io_manager_mut(), identity) {
+                Ok(invocation) => invocation,
+                Err((_, retained)) => return HostedVideoProviderStage::Retained(retained),
+            };
+            let provider_irp = invocation.completion().id;
+            let captured = *physical;
+            let returned = invocation.invoke(|completion| {
+                let Some(provider) = captured else {
+                    return hosted_file_dispatch::acknowledgement_result(
+                        HostedIrpTransportResult::NotDispatched { status: nt_status::NtStatus::DEVICE_NOT_CONNECTED }
+                    );
+                };
+                if !hosted_pnp_physical_provider_current(provider)
+                    || lease.is_none() && provider.publication_cookie != 0
+                {
+                    return hosted_file_dispatch::acknowledgement_result(
+                        HostedIrpTransportResult::NotDispatched { status: nt_status::NtStatus::DEVICE_NOT_CONNECTED }
+                    );
+                }
+                if provider.dependent_domain != identity.provider.provider().domain()
+                    || provider.dependent_driver_id != completion.completion_driver_id
+                    || completion.id != provider_irp
+                    || completion.device_id != identity.pdo
+                {
+                    return hosted_file_dispatch::acknowledgement_result(
+                        HostedIrpTransportResult::NotDispatched { status: nt_status::NtStatus::INVALID_DEVICE_REQUEST }
+                    );
+                }
+                hosted_file_dispatch::acknowledgement_result(hosted_file_dispatch::control_exact_storage(
+                    provider.storage_instance,
+                    provider.storage_domain,
+                    provider_irp,
+                    FSD_DISPATCH_ACK_COMPLETION,
+                    0,
+                    &mut [],
+                ))
+            });
+            match returned.finish(io_manager_mut()) {
+                Ok(AcceptedPdoPnpResult::Terminal(terminal)) => HostedVideoProviderStage::Terminal(terminal),
+                Ok(AcceptedPdoPnpResult::Retained(retained)
+                    | AcceptedPdoPnpResult::Rejected { retained, .. }) => HostedVideoProviderStage::Retained(retained),
+                Ok(AcceptedPdoPnpResult::NotEntered { prepared, .. }) => HostedVideoProviderStage::Prepared(prepared),
+                Err(rejection) => HostedVideoProviderStage::CompletionReturn(rejection.into_returned()),
+            }
+        }
+        HostedVideoProviderStage::CompletionReturn(returned) => match returned.finish(io_manager_mut()) {
+            Ok(AcceptedPdoPnpResult::Terminal(terminal)) => HostedVideoProviderStage::Terminal(terminal),
+            Ok(AcceptedPdoPnpResult::Retained(retained)
+                | AcceptedPdoPnpResult::Rejected { retained, .. }) => HostedVideoProviderStage::Retained(retained),
+            Ok(AcceptedPdoPnpResult::NotEntered { prepared, .. }) => HostedVideoProviderStage::Prepared(prepared),
+            Err(rejection) => HostedVideoProviderStage::CompletionReturn(rejection.into_returned()),
+        },
+        HostedVideoProviderStage::Terminal(mut terminal) => {
+            if terminal.acknowledge_provider(io_manager_mut()).is_err() {
+                return HostedVideoProviderStage::Terminal(terminal);
+            }
+            let identity = terminal.identity();
+            match terminal.retire(io_manager_mut()) {
+                Ok(status) => HostedVideoProviderStage::Ready { status, identity },
+                Err((_, terminal)) => HostedVideoProviderStage::Terminal(terminal),
+            }
+        }
+        HostedVideoProviderStage::Discarded(discarded) => {
+            match discarded.retire(io_manager_mut()) {
+                Ok(()) => HostedVideoProviderStage::Indeterminate(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+                Err((_, retained)) => HostedVideoProviderStage::Discarded(retained),
+            }
+        }
+        ready => ready,
+    }
+}
+
+unsafe fn hosted_video_foreign_pci_pdo(
+    binding: HostedDeviceBinding,
+) -> Result<bool, nt_status::NtStatus> {
+    let (_, inst) = instance_by_driver_id(binding.driver_id)
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    if !hosted_instance_video_port_initialized(inst)
+        || hosted_root_bus_mut()
+            .pdo(nt_io_manager::DeviceId(binding.pdo_device_id))
+            .is_some()
+    {
+        return Ok(false);
+    }
+    let properties = hosted_pnp_manager_mut()
+        .enumerated_pdo_properties(binding.pdo_device_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if !properties.bus_information.as_ref().is_some_and(|bus| {
+        bus.bus_type_guid == nt_pnp_manager::GUID_BUS_TYPE_PCI
+            && bus.legacy_bus_type == nt_pnp_manager::INTERFACE_TYPE_PCI_BUS
+    }) {
+        return Ok(false);
+    }
+    hosted_accepted_pdo_provider_catalog()
+        .resolve(
+            hosted_pnp_manager_mut(),
+            hosted_bus_relations(),
+            io_manager_mut(),
+            binding.pdo_device_id,
+        )
+        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    Ok(true)
+}
+
+unsafe fn prepare_hosted_video_provider_filter(
+    outer_irp: IrpId,
+    binding: HostedDeviceBinding,
+    requirements: &[u8],
+) -> Result<Option<HostedVideoProviderOwner>, nt_status::NtStatus> {
+    if !hosted_video_foreign_pci_pdo(binding)? {
+        return Ok(None);
+    }
+    let payload = clone_pnp_resource_list(requirements)?;
+    nt_pnp_manager::PreparedAcceptedPdoPnp::filter(
+        hosted_pnp_manager_mut(),
+        hosted_bus_relations(),
+        hosted_accepted_pdo_provider_catalog(),
+        io_manager_mut(),
+        outer_irp,
+        nt_io_manager::DeviceId(binding.pdo_device_id),
+        ClientId(IO_MANAGER_COMPONENT_ID),
+        0,
+        payload,
+    )
+    .map(HostedVideoProviderOwner::prepared)
+    .map(Some)
+    .map_err(hosted_video_provider_status)
+}
+
+unsafe fn prepare_hosted_video_provider_start(
+    outer_irp: IrpId,
+    binding: HostedDeviceBinding,
+    raw: &[u8],
+    translated: &[u8],
+) -> Result<Option<HostedVideoProviderOwner>, nt_status::NtStatus> {
+    if !hosted_video_foreign_pci_pdo(binding)? {
+        return Ok(None);
+    }
+    let raw_len = u32::try_from(raw.len()).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+    let translated_len = u32::try_from(translated.len()).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+    let mut payload = Vec::new();
+    payload.try_reserve_exact(raw.len().checked_add(translated.len()).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    payload.extend_from_slice(raw);
+    payload.extend_from_slice(translated);
+    nt_pnp_manager::PreparedAcceptedPdoPnp::start(
+        hosted_pnp_manager_mut(),
+        hosted_bus_relations(),
+        hosted_accepted_pdo_provider_catalog(),
+        io_manager_mut(),
+        outer_irp,
+        nt_io_manager::DeviceId(binding.pdo_device_id),
+        ClientId(IO_MANAGER_COMPONENT_ID),
+        0,
+        raw_len,
+        translated_len,
+        payload,
+    )
+    .map(HostedVideoProviderOwner::prepared)
+    .map(Some)
+    .map_err(hosted_video_provider_status)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -47014,6 +47602,9 @@ struct HostedPnpTransaction {
     token: Option<nt_pnp_manager::PnpDispatchToken>,
     terminal_io_receipt: Option<nt_io_manager::ExternalPnpTerminalReceipt>,
     detached_owner: Option<HostedDetachedPnpOwner>,
+    video_provider: Option<HostedVideoProviderOwner>,
+    video_outer_prepared: Option<nt_io_manager::PreparedExternalPnpIrp>,
+    video_provider_proof: Option<nt_status::NtStatus>,
     detached_provider: Option<HostedPnpPhysicalProvider>,
     detached_provider_lease: Option<HostedProviderDependencyDispatchLease>,
     start_receipt: Option<nt_pnp_manager::StartDeviceLifecycleReceipt>,
@@ -47047,6 +47638,7 @@ enum HostedFilterRequirementsDisposition {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostedFilterRequirementsPhase {
+    AwaitingVideoProvider,
     AwaitingCompletion,
     AwaitingCopy {
         information: u64,
@@ -47070,6 +47662,9 @@ struct HostedFilterRequirementsTransaction {
     completion_driver_id: DriverId,
     completion_device_id: nt_io_manager::DeviceId,
     allocation_instance: usize,
+    video_provider: Option<HostedVideoProviderOwner>,
+    video_outer_prepared: Option<nt_io_manager::PreparedExternalPnpIrp>,
+    video_provider_proof: Option<nt_status::NtStatus>,
     phase: HostedFilterRequirementsPhase,
     driver_status: Option<nt_status::NtStatus>,
     barrier_status: Option<nt_status::NtStatus>,
@@ -47117,6 +47712,10 @@ pub(crate) enum HostedPnpStartOutcome {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum HostedPnpStartObservation {
     AwaitingCompletion,
+    NotEntered {
+        status: nt_status::NtStatus,
+        device_id: u64,
+    },
     Terminal {
         driver_status: nt_status::NtStatus,
         receipt: nt_pnp_manager::StartDeviceLifecycleReceipt,
@@ -48235,6 +48834,7 @@ pub(crate) unsafe fn print_hosted_pnp_enumeration_evidence() {
         print_str(b"/");
         print_str(match transaction.phase {
             HostedPnpTransactionPhase::Prepared => b"prepared",
+            HostedPnpTransactionPhase::AwaitingVideoProvider => b"video-provider",
             HostedPnpTransactionPhase::Dispatching => b"dispatching",
             HostedPnpTransactionPhase::DetachedDispatchInFlight => b"detached-dispatch",
             HostedPnpTransactionPhase::AwaitingCompletion => b"awaiting-completion",
@@ -48257,6 +48857,7 @@ pub(crate) unsafe fn print_hosted_pnp_enumeration_evidence() {
         print_u64(transaction.binding.device_id);
         print_str(b"/");
         print_str(match transaction.phase {
+            HostedFilterRequirementsPhase::AwaitingVideoProvider => b"video-provider",
             HostedFilterRequirementsPhase::AwaitingCompletion => b"awaiting-completion",
             HostedFilterRequirementsPhase::AwaitingCopy { .. } => b"awaiting-copy",
             HostedFilterRequirementsPhase::AwaitingCommit { .. } => b"awaiting-commit",
@@ -48814,6 +49415,43 @@ unsafe fn retain_hosted_filter_requirements_return(
     }
 }
 
+unsafe fn dispatch_hosted_filter_prepared(
+    irp_id: IrpId,
+    prepared: nt_io_manager::PreparedExternalPnpIrp,
+) {
+    match io_manager_mut()
+        .dispatch_prepared_external_pnp(prepared)
+        .expect("prepared hosted PnP request belongs to the canonical I/O manager")
+    {
+        ExternalPnpDispatchResult::Returned {
+            status,
+            information,
+            ..
+        } => retain_hosted_filter_requirements_return(irp_id, status, information, false),
+        ExternalPnpDispatchResult::ReturnedPayload { .. } => {
+            set_hosted_filter_requirements_indeterminate(
+                irp_id,
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            );
+        }
+        ExternalPnpDispatchResult::Pending { irp_id: pending_id } => {
+            assert_eq!(pending_id, irp_id);
+            hosted_filter_requirements_transactions_mut()
+                .iter_mut()
+                .find(|transaction| transaction.irp_id == irp_id)
+                .expect("hosted filter owner disappeared")
+                .phase = HostedFilterRequirementsPhase::AwaitingCompletion;
+        }
+        ExternalPnpDispatchResult::Indeterminate {
+            irp_id: retained_id,
+            transport_status,
+        } => {
+            assert_eq!(retained_id, irp_id);
+            set_hosted_filter_requirements_indeterminate(irp_id, transport_status);
+        }
+    }
+}
+
 unsafe fn hosted_pnp_transactions_mut() -> &'static mut Vec<HostedPnpTransaction> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_PNP_TRANSACTIONS);
     if slot.is_none() {
@@ -49148,6 +49786,12 @@ unsafe fn transition_hosted_pnp_transaction_phase(
         (
             HostedPnpTransactionPhase::Dispatching,
             HostedPnpTransactionPhase::AwaitingCompletion
+        ) | (
+            HostedPnpTransactionPhase::Dispatching,
+            HostedPnpTransactionPhase::AwaitingVideoProvider
+        ) | (
+            HostedPnpTransactionPhase::AwaitingVideoProvider,
+            HostedPnpTransactionPhase::Dispatching
         ) | (
             HostedPnpTransactionPhase::Dispatching,
             HostedPnpTransactionPhase::DetachedDispatchInFlight
@@ -61558,11 +62202,29 @@ unsafe fn dispatch_video_pnp_irp_for_instance(
             };
         }
 
-        // VideoPort forwards this IRP to the PDO first. A PnP miniport without legacy access
-        // ranges (including bochsmp) leaves the returned requirements list unchanged.
-        let (status, information) = hosted_root_bus_mut()
-            .dispatch_pnp_outcome(nt_io_manager::DeviceId(binding.pdo_device_id), irp.minor)
-            .completion_or(irp.status.raw(), irp.information);
+        let (status, information) = if hosted_root_bus_mut()
+            .pdo(nt_io_manager::DeviceId(binding.pdo_device_id))
+            .is_some()
+        {
+            hosted_root_bus_mut()
+                .dispatch_pnp_outcome(nt_io_manager::DeviceId(binding.pdo_device_id), irp.minor)
+                .completion_or(irp.status.raw(), irp.information)
+        } else {
+            let proof = hosted_filter_requirements_transactions_mut()
+                .iter_mut()
+                .find(|transaction| {
+                    transaction.irp_id == irp.irp_id
+                        && transaction.binding.pdo_device_id == binding.pdo_device_id
+                        && transaction.binding.device_id == binding.device_id
+                })
+                .and_then(|transaction| transaction.video_provider_proof.take());
+            let Some(status) = proof else {
+                return PnpBackendDispatch::NotDispatched {
+                    status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                };
+            };
+            (status.raw(), 0)
+        };
         return PnpBackendDispatch::Returned {
             status: nt_status::NtStatus(status),
             information,
@@ -61593,16 +62255,37 @@ unsafe fn dispatch_video_pnp_irp_for_instance(
         };
     }
 
-    let root_status = match hosted_root_bus_mut().dispatch_pnp_outcome(
-        nt_io_manager::DeviceId(binding.pdo_device_id),
-        IRP_MN_START_DEVICE as u8,
-    ) {
-        nt_root_bus::RootPdoPnpDispatch::Handled(status) => nt_status::NtStatus(status),
-        nt_root_bus::RootPdoPnpDispatch::Unhandled => {
+    let root_status = if hosted_root_bus_mut()
+        .pdo(nt_io_manager::DeviceId(binding.pdo_device_id))
+        .is_some()
+    {
+        match hosted_root_bus_mut().dispatch_pnp_outcome(
+            nt_io_manager::DeviceId(binding.pdo_device_id),
+            IRP_MN_START_DEVICE as u8,
+        ) {
+            nt_root_bus::RootPdoPnpDispatch::Handled(status) => nt_status::NtStatus(status),
+            nt_root_bus::RootPdoPnpDispatch::Unhandled => {
+                return PnpBackendDispatch::NotDispatched {
+                    status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                };
+            }
+        }
+    } else {
+        let proof = hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| {
+                transaction.irp_id == irp.irp_id
+                    && transaction.minor == nt_pnp_manager::PnpMinor::StartDevice
+                    && transaction.binding.pdo_device_id == binding.pdo_device_id
+                    && transaction.binding.device_id == binding.device_id
+            })
+            .and_then(|transaction| transaction.video_provider_proof.take());
+        let Some(status) = proof else {
             return PnpBackendDispatch::NotDispatched {
                 status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
             };
-        }
+        };
+        status
     };
     if !root_status.is_success() {
         return PnpBackendDispatch::Returned {
@@ -62016,7 +62699,8 @@ unsafe fn take_hosted_filter_requirements_outcome(
                     .expect("indeterminate filter-requirements transaction has no status"),
             })
         }
-        HostedFilterRequirementsPhase::AwaitingCompletion
+        HostedFilterRequirementsPhase::AwaitingVideoProvider
+        | HostedFilterRequirementsPhase::AwaitingCompletion
         | HostedFilterRequirementsPhase::AwaitingCopy { .. }
         | HostedFilterRequirementsPhase::AwaitingCommit { .. }
         | HostedFilterRequirementsPhase::AwaitingAck { .. } => {
@@ -62089,6 +62773,9 @@ pub(crate) unsafe fn filter_hosted_device_resource_requirements(
         completion_device_id,
         allocation_instance,
         phase: HostedFilterRequirementsPhase::AwaitingCompletion,
+        video_provider: None,
+        video_outer_prepared: None,
+        video_provider_proof: None,
         driver_status: None,
         barrier_status: None,
         original,
@@ -62100,31 +62787,41 @@ pub(crate) unsafe fn filter_hosted_device_resource_requirements(
             .expect("owned prepared hosted PnP request could not be discarded");
         return Err(status);
     }
-    match io_manager_mut()
-        .dispatch_prepared_external_pnp(prepared)
-        .expect("prepared hosted PnP request belongs to the canonical I/O manager")
+    let video_provider = match prepare_hosted_video_provider_filter(
+        irp_id,
+        binding,
+        resource_requirements,
+    ) {
+        Ok(stage) => stage,
+        Err(status) => {
+            hosted_filter_requirements_transactions_mut()
+                .retain(|transaction| transaction.irp_id != irp_id);
+            io_manager_mut()
+                .discard_prepared_external_pnp(prepared)
+                .expect("unentered VideoPort FILTER outer owner could not be discarded");
+            return Err(status);
+        }
+    };
+    if let Some(stage) = video_provider {
+        let transaction = hosted_filter_requirements_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .expect("hosted VideoPort FILTER owner disappeared");
+        transaction.video_provider = Some(stage);
+        transaction.phase = HostedFilterRequirementsPhase::AwaitingVideoProvider;
+    }
+    if hosted_filter_requirements_transactions_mut()
+        .iter()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .is_some_and(|transaction| transaction.video_provider.is_some())
     {
-        ExternalPnpDispatchResult::Returned {
-            status,
-            information,
-            ..
-        } => retain_hosted_filter_requirements_return(irp_id, status, information, false),
-        ExternalPnpDispatchResult::ReturnedPayload { .. } => {
-            set_hosted_filter_requirements_indeterminate(
-                irp_id,
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-            );
-        }
-        ExternalPnpDispatchResult::Pending { irp_id: pending_id } => {
-            assert_eq!(pending_id, irp_id);
-        }
-        ExternalPnpDispatchResult::Indeterminate {
-            irp_id: retained_id,
-            transport_status,
-        } => {
-            assert_eq!(retained_id, irp_id);
-            set_hosted_filter_requirements_indeterminate(irp_id, transport_status);
-        }
+        hosted_filter_requirements_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .expect("hosted VideoPort FILTER owner disappeared")
+            .video_outer_prepared = Some(prepared);
+    } else {
+        dispatch_hosted_filter_prepared(irp_id, prepared);
     }
     drain_hosted_filter_requirements_transactions();
     take_hosted_filter_requirements_outcome(irp_id)
@@ -62261,6 +62958,9 @@ pub(crate) unsafe fn dispatch_hosted_pnp_lifecycle_canonical(
         token: None,
         terminal_io_receipt: None,
         detached_owner: None,
+        video_provider: None,
+        video_outer_prepared: None,
+        video_provider_proof: None,
         detached_provider: Some(detached_provider),
         detached_provider_lease,
         start_receipt: None,
@@ -62559,6 +63259,9 @@ pub(crate) unsafe fn start_hosted_device_canonical(
         token: None,
         terminal_io_receipt: None,
         detached_owner: None,
+        video_provider: None,
+        video_outer_prepared: None,
+        video_provider_proof: None,
         detached_provider: None,
         detached_provider_lease: None,
         start_receipt: None,
@@ -62589,6 +63292,21 @@ pub(crate) unsafe fn start_hosted_device_canonical(
             .expect("owned prepared hosted PnP request could not be discarded");
         return Err(local_failure(status));
     }
+    let video_provider = match prepare_hosted_video_provider_start(
+        irp_id,
+        binding,
+        raw_resource_list,
+        translated_resource_list,
+    ) {
+        Ok(stage) => stage,
+        Err(status) => {
+            io_manager_mut()
+                .discard_prepared_external_pnp(prepared)
+                .expect("unentered VideoPort START outer owner could not be discarded");
+            remove_hosted_pnp_transaction(irp_id);
+            return Err(local_failure(status));
+        }
+    };
     let token = match hosted_pnp_manager_mut().begin_pnp_dispatch(
         binding.pdo_device_id,
         nt_pnp_manager::PnpMinor::StartDevice,
@@ -62597,6 +63315,46 @@ pub(crate) unsafe fn start_hosted_device_canonical(
         Ok(token) => token,
         Err(error) => {
             let status = hosted_pnp_status(error);
+            if let Some(owner) = video_provider {
+                let HostedVideoProviderStage::Prepared(provider_prepared) = owner.stage else {
+                    unreachable!("unentered VideoPort provider was dispatched before START token");
+                };
+                match provider_prepared.discard(io_manager_mut()) {
+                    nt_pnp_manager::AcceptedPdoPnpDiscard::Retired => {}
+                    nt_pnp_manager::AcceptedPdoPnpDiscard::NotDiscarded { prepared: provider_owner, .. } => {
+                        let transaction = hosted_pnp_transactions_mut()
+                            .iter_mut()
+                            .find(|transaction| transaction.irp_id == irp_id)
+                            .expect("VideoPort START provider owner disappeared");
+                        transaction.video_provider = Some(HostedVideoProviderOwner::prepared(provider_owner));
+                        transaction.video_outer_prepared = Some(prepared);
+                        set_hosted_pnp_indeterminate(irp_id, status)
+                            .expect("unretired VideoPort START owner lost its barrier");
+                        return Ok(HostedPnpStartOutcome::Indeterminate {
+                            irp_id: irp_id.raw(),
+                            transport_status: status,
+                        });
+                    }
+                    nt_pnp_manager::AcceptedPdoPnpDiscard::Retained { discarded, .. } => {
+                        let transaction = hosted_pnp_transactions_mut()
+                            .iter_mut()
+                            .find(|transaction| transaction.irp_id == irp_id)
+                            .expect("VideoPort START provider owner disappeared");
+                        transaction.video_provider = Some(HostedVideoProviderOwner {
+                            stage: HostedVideoProviderStage::Discarded(discarded),
+                            physical: None,
+                            lease: None,
+                        });
+                        transaction.video_outer_prepared = Some(prepared);
+                        set_hosted_pnp_indeterminate(irp_id, status)
+                            .expect("unretired VideoPort START owner lost its barrier");
+                        return Ok(HostedPnpStartOutcome::Indeterminate {
+                            irp_id: irp_id.raw(),
+                            transport_status: status,
+                        });
+                    }
+                }
+            }
             io_manager_mut()
                 .discard_prepared_external_pnp(prepared)
                 .expect("owned prepared hosted PnP request could not be discarded");
@@ -62609,6 +63367,30 @@ pub(crate) unsafe fn start_hosted_device_canonical(
     };
     set_hosted_pnp_transaction_token(irp_id, token)
         .expect("reserved hosted PnP transaction disappeared before dispatch");
+    if let Some(stage) = video_provider {
+        let transaction = hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .expect("VideoPort START transaction disappeared");
+        transaction.video_provider = Some(stage);
+        transaction.video_outer_prepared = Some(prepared);
+        transition_hosted_pnp_transaction_phase(
+            irp_id,
+            HostedPnpTransactionPhase::AwaitingVideoProvider,
+        )
+        .expect("VideoPort START provider stage lost its transaction");
+        return Ok(HostedPnpStartOutcome::Pending {
+            irp_id: irp_id.raw(),
+        });
+    }
+
+    dispatch_prepared_hosted_pnp_start(irp_id, prepared)
+}
+
+unsafe fn dispatch_prepared_hosted_pnp_start(
+    irp_id: IrpId,
+    prepared: nt_io_manager::PreparedExternalPnpIrp,
+) -> Result<HostedPnpStartOutcome, HostedPnpStartFailure> {
 
     match io_manager_mut()
         .dispatch_prepared_external_pnp(prepared)
