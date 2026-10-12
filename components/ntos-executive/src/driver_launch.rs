@@ -39268,7 +39268,8 @@ fn next_hosted_bus_property(minor: u8) -> Option<u8> {
     match minor {
         nt_pnp_abi::IRP_MN_QUERY_BUS_INFORMATION => Some(nt_pnp_abi::IRP_MN_QUERY_RESOURCES),
         nt_pnp_abi::IRP_MN_QUERY_RESOURCES => Some(nt_pnp_abi::IRP_MN_QUERY_RESOURCE_REQUIREMENTS),
-        nt_pnp_abi::IRP_MN_QUERY_RESOURCE_REQUIREMENTS => None,
+        nt_pnp_abi::IRP_MN_QUERY_RESOURCE_REQUIREMENTS => Some(nt_pnp_abi::IRP_MN_QUERY_DEVICE_TEXT),
+        nt_pnp_abi::IRP_MN_QUERY_DEVICE_TEXT => None,
         _ => None,
     }
 }
@@ -39638,6 +39639,11 @@ unsafe fn store_hosted_bus_property(
         {
             properties.resource_requirements = nt_pnp_manager::PropertyBlobState::KnownNone
         }
+        (nt_pnp_abi::IRP_MN_QUERY_DEVICE_TEXT, Some(HostedBusPropertyValue::Text(value)))
+            if properties.description == nt_pnp_manager::PropertyBlobState::Unqueried =>
+        {
+            properties.description = nt_pnp_manager::PropertyBlobState::Present(value)
+        }
         _ => return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
     }
     Ok(())
@@ -39667,6 +39673,7 @@ unsafe fn advance_hosted_bus_property(child_index: usize, minor: u8) {
             properties.bus_information != HostedBusInformationState::Unqueried
                 && properties.boot_resources_raw != nt_pnp_manager::PropertyBlobState::Unqueried
                 && properties.resource_requirements != nt_pnp_manager::PropertyBlobState::Unqueried
+                && matches!(&properties.description, nt_pnp_manager::PropertyBlobState::Present(_))
         });
     if complete {
         query.phase = HostedDeviceRelationQueryPhase::DispatchCapabilities { child_index: 0 };
@@ -39717,9 +39724,13 @@ unsafe fn retain_hosted_bus_property_result(
         return;
     }
 
-    let disposition = match store_hosted_bus_property(child_index, minor, None) {
-        Ok(()) => HostedQueryPropertyDisposition::Advance,
-        Err(status) => HostedQueryPropertyDisposition::Barrier(status),
+    let disposition = if minor == nt_pnp_abi::IRP_MN_QUERY_DEVICE_TEXT {
+        HostedQueryPropertyDisposition::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+    } else {
+        match store_hosted_bus_property(child_index, minor, None) {
+            Ok(()) => HostedQueryPropertyDisposition::Advance,
+            Err(status) => HostedQueryPropertyDisposition::Barrier(status),
+        }
     };
     if pending_completion {
         (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
@@ -39767,13 +39778,20 @@ unsafe fn dispatch_hosted_bus_property(child_index: usize, minor: u8) -> bool {
             return true;
         }
     };
-    let parameters = match PnpParameters::query_information(minor) {
-        Ok(parameters) => parameters,
-        Err(status) => {
-            set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
-                status,
-            ));
-            return true;
+    let parameters = if minor == nt_pnp_abi::IRP_MN_QUERY_DEVICE_TEXT {
+        PnpParameters::query_device_text(
+            nt_pnp_abi::DEVICE_TEXT_DESCRIPTION,
+            crate::exec_handler::default_locale_id(false),
+        )
+    } else {
+        match PnpParameters::query_information(minor) {
+            Ok(parameters) => parameters,
+            Err(status) => {
+                set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
+                    status,
+                ));
+                return true;
+            }
         }
     };
     let prepared = match io_manager_mut().prepare_external_pnp_to_device(
@@ -41016,8 +41034,13 @@ unsafe fn build_hosted_relation_mutations(
     prepared: &nt_pnp_manager::PreparedBusRelations,
     policies: &[Option<nt_config_client::CriticalDeviceBinding>],
     existing: &[ExistingHostedRelationValues],
+    reported_children: &[nt_pnp_manager::BusReportedChild],
+    child_properties: &[HostedBusChildProperties],
 ) -> Result<Vec<HostedRelationRegistryMutation>, HostedRelationPublishError> {
-    if policies.len() != prepared.changes().len() || existing.len() != prepared.changes().len() {
+    if policies.len() != prepared.changes().len()
+        || existing.len() != prepared.changes().len()
+        || reported_children.len() != child_properties.len()
+    {
         return Err(HostedRelationPublishError::Barrier(
             nt_status::NtStatus::INVALID_DEVICE_REQUEST,
         ));
@@ -41025,7 +41048,7 @@ unsafe fn build_hosted_relation_mutations(
     let capacity = prepared
         .changes()
         .len()
-        .checked_mul(7)
+        .checked_mul(8)
         .ok_or(HostedRelationPublishError::Retry)?;
     let mut mutations = Vec::new();
     mutations
@@ -41062,6 +41085,30 @@ unsafe fn build_hosted_relation_mutations(
             "CompatibleIDs",
             nt_config_manager::RegistryValueType::MultiSz,
             encode_hosted_relation_multi_sz(&change.child.compatible_ids)?,
+        );
+
+        let description = reported_children
+            .iter()
+            .position(|child| child.pdo_object_id == change.child.pdo_object_id)
+            .and_then(|index| child_properties.get(index))
+            .and_then(|properties| match &properties.description {
+                nt_pnp_manager::PropertyBlobState::Present(bytes) => Some(bytes.as_slice()),
+                _ => None,
+            })
+            .ok_or(HostedRelationPublishError::Barrier(
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            ))?;
+        let mut description_data = Vec::new();
+        description_data
+            .try_reserve_exact(description.len())
+            .map_err(|_| HostedRelationPublishError::Retry)?;
+        description_data.extend_from_slice(description);
+        push_hosted_relation_value(
+            &mut mutations,
+            &enum_path,
+            "DeviceDesc",
+            nt_config_manager::RegistryValueType::Sz,
+            description_data,
         );
 
         let policy = policies[index].as_ref();
@@ -41240,7 +41287,13 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
         .reserve_capacity(critical_starts.len())
         .map_err(|_| HostedRelationPublishError::Retry)?;
 
-    let mutations = build_hosted_relation_mutations(&prepared, &policies, &existing)?;
+    let mutations = build_hosted_relation_mutations(
+        &prepared,
+        &policies,
+        &existing,
+        &query.reported_children,
+        &query.child_properties,
+    )?;
     let mut providers = Vec::new();
     providers
         .try_reserve_exact(query.reported_children.len())
@@ -43085,7 +43138,8 @@ unsafe fn drain_hosted_filter_requirements_transactions() -> usize {
                     nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS,
                 ) {
                     Ok(HostedBusPropertyValue::Blob(bytes)) => bytes,
-                    Ok(HostedBusPropertyValue::BusInformation(_)) => {
+                    Ok(HostedBusPropertyValue::BusInformation(_))
+                    | Ok(HostedBusPropertyValue::Text(_)) => {
                         set_hosted_filter_requirements_indeterminate(
                             irp_id,
                             nt_status::NtStatus::INVALID_DEVICE_REQUEST,
@@ -46409,6 +46463,7 @@ struct HostedBusChildProperties {
     capabilities: HostedDeviceCapabilitiesState,
     boot_resources_raw: nt_pnp_manager::PropertyBlobState,
     resource_requirements: nt_pnp_manager::PropertyBlobState,
+    description: nt_pnp_manager::PropertyBlobState,
     acpi_namespace: HostedAcpiNamespaceState,
     acpi_pci_root: HostedAcpiPciRootState,
     acpi_pci_scope_discovery: HostedAcpiPciScopeDiscoveryState,
@@ -46421,6 +46476,7 @@ impl Default for HostedBusChildProperties {
             capabilities: HostedDeviceCapabilitiesState::Unqueried,
             boot_resources_raw: nt_pnp_manager::PropertyBlobState::Unqueried,
             resource_requirements: nt_pnp_manager::PropertyBlobState::Unqueried,
+            description: nt_pnp_manager::PropertyBlobState::Unqueried,
             acpi_namespace: HostedAcpiNamespaceState::Unqueried,
             acpi_pci_root: HostedAcpiPciRootState::Unqueried,
             acpi_pci_scope_discovery: HostedAcpiPciScopeDiscoveryState::Unqueried,
@@ -46431,6 +46487,7 @@ impl Default for HostedBusChildProperties {
 enum HostedBusPropertyValue {
     BusInformation(nt_pnp_manager::PnpBusInformation),
     Blob(Vec<u8>),
+    Text(Vec<u8>),
 }
 
 enum HostedRelationRegistryMutation {
@@ -48264,6 +48321,10 @@ unsafe fn copy_hosted_bus_property_result(
         nt_pnp_abi::IRP_MN_QUERY_RESOURCE_REQUIREMENTS => {
             nt_pnp_manager::copy_io_resource_requirements_list(allocation)
                 .map(HostedBusPropertyValue::Blob)
+        }
+        nt_pnp_abi::IRP_MN_QUERY_DEVICE_TEXT => {
+            nt_pnp_manager::copy_pnp_device_text_x64(allocation)
+                .map(HostedBusPropertyValue::Text)
         }
         nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS => {
             nt_pnp_manager::copy_io_resource_requirements_list(allocation)

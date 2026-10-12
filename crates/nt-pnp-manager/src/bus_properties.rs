@@ -20,6 +20,40 @@ pub enum BusPropertyCopyError {
     InsufficientResources,
 }
 
+/// Copy a provider-owned `IRP_MN_QUERY_DEVICE_TEXT` description before its pool allocation is
+/// retired. The resulting REG_SZ preserves the provider's UTF-16 units, including its terminator.
+pub fn copy_pnp_device_text_x64(bytes: &[u8]) -> Result<Vec<u8>, BusPropertyCopyError> {
+    const MAX_DESCRIPTION_UNITS: usize = 512;
+    let mut end = None;
+    for index in 0..MAX_DESCRIPTION_UNITS.min(bytes.len() / 2) {
+        let unit = u16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]);
+        if unit == 0 {
+            end = Some(index);
+            break;
+        }
+    }
+    let units = end.ok_or(BusPropertyCopyError::Truncated)?;
+    if units == 0 {
+        return Err(BusPropertyCopyError::Malformed);
+    }
+    if core::char::decode_utf16(
+        bytes[..units * 2]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]])),
+    )
+    .any(|result| result.is_err())
+    {
+        return Err(BusPropertyCopyError::Malformed);
+    }
+    let length = (units + 1) * 2;
+    let mut copied = Vec::new();
+    copied
+        .try_reserve_exact(length)
+        .map_err(|_| BusPropertyCopyError::InsufficientResources)?;
+    copied.extend_from_slice(&bytes[..length]);
+    Ok(copied)
+}
+
 /// An immutable bus-owned boot resource assignment that needs no HAL translation.
 ///
 /// A PCI root bridge reported by ACPI has one `CmResourceTypeBusNumber` boot descriptor and no
@@ -409,5 +443,19 @@ mod tests {
             crate::PropertyBlobState::Present(vec![1]),
         );
         assert_eq!(prepare_bus_reported_bus_number_start(&arbitrated), Ok(None));
+    }
+
+    #[test]
+    fn native_device_text_copy_preserves_provider_utf16_and_bounds() {
+        let source: Vec<u8> = "PCI Interrupt Link\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .chain([0xaa, 0xbb])
+            .collect();
+        let copied = copy_pnp_device_text_x64(&source).expect("terminated provider text");
+        assert_eq!(copied, &source[..source.len() - 2]);
+        assert_eq!(copy_pnp_device_text_x64(&source[..source.len() - 4]), Err(BusPropertyCopyError::Truncated));
+        assert_eq!(copy_pnp_device_text_x64(&[0, 0]), Err(BusPropertyCopyError::Malformed));
+        assert_eq!(copy_pnp_device_text_x64(&[0x00, 0xd8, 0, 0]), Err(BusPropertyCopyError::Malformed));
     }
 }
