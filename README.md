@@ -168,12 +168,14 @@ registry snapshot. ACPI and PCI bus relations now commit, and the PCI root drive
 starts. The live bochsmp PCI PDO now passes resource validation and reaches
 AddDevice. VideoPort now forwards FILTER and START to the accepted PCI provider;
 a bounded boot recorded successful bochsmp StartDevice, FindAdapter, and hosted
-video-device publication. That diagnostic was stopped while SMSS was still
-scanning KnownDLLs, before CSRSS or Explorer launched. Input drivers
-still lack `IoStartPacket`/`IoStartNextPacket`. Font cleanup and
+video-device publication. A longer bounded guest reached real CSRSS, Winlogon,
+Services and setup.exe and created a 1024x768 display PDEV. Its same-run frame
+still shows only background and cursor; Userinit and Explorer have not run.
+Input drivers still lack `IoStartPacket`/`IoStartNextPacket`. Font cleanup and
 desktop acceptance remain unproven. Acceptance requires strict native private-font
 cleanup and a separate fresh production Userinit/Explorer boot with real callbacks,
-GDI drawing, logs and screenshots. Crate CI does not prove desktop boot. An earlier
+GDI drawing, logs and screenshots. The [PCI video boot evidence](docs/evidence/issue306-pci-video-boot.json)
+records the bounded resumed diagnostic. Crate CI does not prove desktop boot. An earlier
 [bounded diagnostic boot](docs/evidence/issue18-registry-checkpoint-probe.json)
 verified live SYSTEM-journal checkpoint timing and inclusive I/O measurements; it
 was stopped after reproducing the input-driver gap and still rendered only background

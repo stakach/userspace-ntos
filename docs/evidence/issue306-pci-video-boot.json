@@ -1,0 +1,27 @@
+{
+  "issue": 18,
+  "related_issues": [283, 306],
+  "source_commit": "b25a6bd2",
+  "microkernel_commit": "9f3104feeb982542a6df47657d4fe9c632974e72",
+  "profile": "resumed production diagnostic",
+  "boot_bound_seconds": 1200,
+  "build_exit": 0,
+  "launcher_exit": 1,
+  "termination": "QEMU was deliberately stopped by QMP after about eight guest minutes when setup had reached a blue background and cursor but no Userinit or Explorer. The 1200-second bound did not expire.",
+  "artifact_sha256": {
+    "raw_log": "0caf397e9d98b778599d9b8f974fb93c2affb5e5a6d1969d9bab835e4848f9a1",
+    "archived_log": "027978f0663b72cec7519c41dac916dff680f44f13f819eebbdc6f795e67d9f0",
+    "same_run_screenshot": "53ad5f5ac610f375103c4b38bc9dcda1b85defd34e60860272a02fff0da0c9cb"
+  },
+  "observations": [
+    "The exact accepted PCI provider returned successful bochsmp StartDevice. VideoPort FindAdapter succeeded, the hosted video device route was published, and win32k successfully changed the display PDEV to 1024x768.",
+    "SMSS finished its finite KnownDLL scan; genuine CSRSS, Winlogon, Services, LSASS, RPCSS and setup.exe processes launched. The census at guest 479554 ms had no Explorer process.",
+    "The same-run QMP screenshot shows only blue background and cursor. It is not desktop proof. The frame happens to be byte-identical to the earlier issue18-adddevice-fix-timeout screenshot, so that existing artifact is reused.",
+    "Win32k reported keyboard and mouse read failures c0000001 16078 times each. Native IoStartPacket and IoStartNextPacket remain unbound; issue #283 tracks exact packet/callback/completion ownership. This association is diagnostic, not proof that StartIo alone will launch Explorer.",
+    "No provider bugcheck was observed. Strict private-font terminal cleanup was not run in this production diagnostic."
+  ],
+  "evidence": {
+    "log": "docs/evidence/issue306-pci-video-boot.log.gz",
+    "screenshot": "docs/images/issue18-adddevice-fix-timeout.png"
+  }
+}
