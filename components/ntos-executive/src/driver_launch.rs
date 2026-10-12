@@ -2397,8 +2397,17 @@ fn hosted_completion_storage_instance(instance: usize) -> usize {
 }
 
 unsafe fn poll_hosted_completion(instance_index: usize) -> Option<nt_io_manager::DriverCompletion> {
+    poll_hosted_completion_at_storage(
+        instance_index,
+        hosted_completion_storage_instance(instance_index),
+    )
+}
+
+unsafe fn poll_hosted_completion_at_storage(
+    instance_index: usize,
+    storage_instance: usize,
+) -> Option<nt_io_manager::DriverCompletion> {
     let owner_domain = instance_domain_identity(instance(instance_index)?)?;
-    let storage_instance = hosted_completion_storage_instance(instance_index);
     let win = ExecVaWindow::try_for_instance(storage_instance)?;
     let head = (win.data_va + FSD_PENDING_IRP_HEAD_OFF) as *const AtomicU64;
     loop {
@@ -2493,6 +2502,43 @@ unsafe fn poll_hosted_completion(instance_index: usize) -> Option<nt_io_manager:
             },
         });
     }
+}
+
+/// A pending detached lifecycle owns the physical completion store selected at dispatch. Route
+/// retirement can remove that store from the generic lookup before the provider completes, while
+/// the transaction's dependency lease still keeps the original storage instance alive.
+unsafe fn poll_hosted_detached_pnp_completion(
+    dependent_instance: usize,
+) -> Option<nt_io_manager::DriverCompletion> {
+    let transactions = (*core::ptr::addr_of!(HOSTED_PNP_TRANSACTIONS)).as_ref()?;
+    for transaction in transactions {
+        if transaction.phase != HostedPnpTransactionPhase::AwaitingCompletion
+            || !matches!(
+                transaction.detached_owner.as_ref(),
+                Some(HostedDetachedPnpOwner::Retained(_))
+            )
+        {
+            continue;
+        }
+        let Some(provider) = transaction.detached_provider else {
+            continue;
+        };
+        if provider.dependent_instance != dependent_instance
+            || provider.publication_cookie != 0 && transaction.detached_provider_lease.is_none()
+            || instance(dependent_instance).and_then(instance_domain_identity)
+                != Some(provider.dependent_domain)
+            || instance(provider.storage_instance).and_then(instance_domain_identity)
+                != Some(provider.storage_domain)
+        {
+            continue;
+        }
+        if let Some(completion) =
+            poll_hosted_completion_at_storage(dependent_instance, provider.storage_instance)
+        {
+            return Some(completion);
+        }
+    }
+    None
 }
 
 // --- host-side pool allocator (the trampolines run in the component) --------------------------
@@ -43236,6 +43282,133 @@ pub(crate) unsafe fn hosted_pnp_device_state_for_instance(
     hosted_pnp_manager_mut().state(devnode_id)
 }
 
+/// A non-START lifecycle completion keeps its detached owner until the exact provider ACK
+/// retires the canonical IRP. PnP state changes and publication follow that retirement.
+unsafe fn drain_hosted_detached_lifecycle_completion(irp_id: IrpId) -> bool {
+    let (binding, minor, origin_driver_id, completion_driver_id, completion_device_id, provider, leased, payload_empty) = {
+        let transaction = hosted_pnp_transactions_mut()
+            .iter()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .expect("detached lifecycle transaction disappeared");
+        assert_ne!(transaction.minor, nt_pnp_manager::PnpMinor::StartDevice);
+        let Some(HostedDetachedPnpOwner::Retained(owner)) =
+            transaction.detached_owner.as_ref()
+        else {
+            unreachable!("pending detached lifecycle lost its retained owner")
+        };
+        (
+            transaction.binding,
+            transaction.minor,
+            transaction.origin_driver_id,
+            transaction.completion_driver_id,
+            transaction.completion_device_id,
+            transaction.detached_provider.expect("detached lifecycle lost provider identity"),
+            transaction.detached_provider_lease.is_some(),
+            owner.payload().is_empty(),
+        )
+    };
+    if !payload_empty {
+        set_hosted_pnp_indeterminate(irp_id, nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+            .expect("payload-bearing lifecycle completion lost its transaction");
+        return true;
+    }
+    let Some(completion) = io_manager_mut().completed_irp(irp_id) else {
+        return false;
+    };
+    let identity_valid = completion.id == irp_id
+        && completion.client_id == ClientId(IO_MANAGER_COMPONENT_ID)
+        && completion.file_id.is_none()
+        && completion.driver_id == origin_driver_id
+        && completion.device_id == nt_io_manager::DeviceId(binding.pdo_device_id)
+        && completion.major == major::IRP_MJ_PNP
+        && completion.minor == minor.raw()
+        && completion.completion_driver_id == completion_driver_id
+        && completion.completion_device_id == completion_device_id
+        && completion.user_data == 0
+        && completion.requestor_tid == 0
+        && completion.completion_origin == IrpCompletionOrigin::Driver;
+    if !identity_valid {
+        set_hosted_pnp_indeterminate(irp_id, nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+            .expect("detached lifecycle identity failure lost its transaction");
+        return true;
+    }
+    if provider.dependent_driver_id != completion_driver_id
+        || provider.publication_cookie != 0 && !leased
+        || !hosted_pnp_physical_provider_current(provider)
+    {
+        set_hosted_pnp_indeterminate(irp_id, nt_status::NtStatus::DEVICE_NOT_CONNECTED)
+            .expect("detached lifecycle provider loss lost its transaction");
+        return true;
+    }
+    let owner = hosted_pnp_transactions_mut()
+        .iter_mut()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .and_then(|transaction| transaction.detached_owner.take())
+        .expect("pending detached lifecycle lost its owner");
+    let HostedDetachedPnpOwner::Retained(owner) = owner else {
+        unreachable!("pending detached lifecycle has the wrong owner")
+    };
+    let invocation = match io_manager_mut().prepare_external_pnp_completion(owner) {
+        Ok(invocation) => invocation,
+        Err(rejection) => {
+            let status = rejection.status();
+            retain_hosted_detached_pnp_owner(
+                irp_id,
+                HostedDetachedPnpOwner::Retained(rejection.into_owner()),
+            )
+            .expect("rejected detached lifecycle ACK lost its owner");
+            if status == nt_status::NtStatus::PENDING {
+                return false;
+            }
+            set_hosted_pnp_indeterminate(irp_id, status)
+                .expect("rejected detached lifecycle ACK lost its transaction");
+            return true;
+        }
+    };
+    transition_hosted_pnp_transaction_phase(irp_id, HostedPnpTransactionPhase::DetachedAckInFlight)
+        .expect("detached lifecycle ACK lost its transaction phase");
+    let returned = invocation.invoke(|_| {
+        hosted_file_dispatch::acknowledgement_result(hosted_file_dispatch::control_exact_storage(
+            provider.storage_instance,
+            provider.storage_domain,
+            irp_id,
+            FSD_DISPATCH_ACK_COMPLETION,
+            0,
+            &mut [],
+        ))
+    });
+    let (receipt, payload) = match io_manager_mut().finish_external_pnp_completion(returned) {
+        Ok(terminal) => terminal,
+        Err(rejection) => {
+            let status = rejection.status();
+            retain_hosted_detached_pnp_owner(
+                irp_id,
+                HostedDetachedPnpOwner::AckReturned(rejection.into_owner()),
+            )
+            .expect("rejected detached lifecycle ACK result lost its owner");
+            set_hosted_pnp_indeterminate(irp_id, status)
+                .expect("rejected detached lifecycle ACK result lost its transaction");
+            return true;
+        }
+    };
+    assert!(payload.is_empty(), "status-only lifecycle gained a payload after ACK");
+    let status = receipt.status();
+    set_hosted_pnp_terminal_io_receipt(irp_id, receipt)
+        .expect("detached lifecycle receipt lost its transaction");
+    if let Err(lifecycle_status) = complete_hosted_pnp_lifecycle(irp_id, status) {
+        set_hosted_pnp_indeterminate(irp_id, lifecycle_status)
+            .expect("detached lifecycle failure lost its transaction");
+        return true;
+    }
+    set_hosted_pnp_driver_status(irp_id, HostedPnpTransactionPhase::PostPublicationRepair, status)
+        .expect("detached lifecycle status lost its transaction");
+    if finish_hosted_pnp_publication(irp_id).is_ok() {
+        transition_hosted_pnp_transaction_phase(irp_id, HostedPnpTransactionPhase::Terminal)
+            .expect("detached lifecycle could not become terminal");
+    }
+    true
+}
+
 unsafe fn drain_hosted_pnp_completions() -> usize {
     let mut progress = 0usize;
     let mut index = 0usize;
@@ -43260,6 +43433,20 @@ unsafe fn drain_hosted_pnp_completions() -> usize {
                 transaction.completion_device_id,
             )
         };
+        if phase == HostedPnpTransactionPhase::AwaitingCompletion
+            && minor != nt_pnp_manager::PnpMinor::StartDevice
+            && matches!(
+                hosted_pnp_transactions_mut()[index].detached_owner.as_ref(),
+                Some(HostedDetachedPnpOwner::Retained(_))
+            )
+        {
+            if drain_hosted_detached_lifecycle_completion(irp_id) {
+                progress = progress.saturating_add(1);
+            } else {
+                index += 1;
+            }
+            continue;
+        }
         match phase {
             HostedPnpTransactionPhase::Dispatching
             | HostedPnpTransactionPhase::AwaitingCompletion => {
@@ -43397,6 +43584,8 @@ unsafe fn drain_hosted_pnp_completions() -> usize {
                 }
             }
             HostedPnpTransactionPhase::Prepared
+            | HostedPnpTransactionPhase::DetachedDispatchInFlight
+            | HostedPnpTransactionPhase::DetachedAckInFlight
             | HostedPnpTransactionPhase::Terminal
             | HostedPnpTransactionPhase::Indeterminate => {
                 index += 1;
@@ -43447,7 +43636,9 @@ pub(crate) unsafe fn observe_hosted_pnp_start(
         }
         HostedPnpTransactionPhase::Prepared
         | HostedPnpTransactionPhase::Dispatching
+        | HostedPnpTransactionPhase::DetachedDispatchInFlight
         | HostedPnpTransactionPhase::AwaitingCompletion
+        | HostedPnpTransactionPhase::DetachedAckInFlight
         | HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck
         | HostedPnpTransactionPhase::PostPublicationRepair => {
             Ok(HostedPnpStartObservation::AwaitingCompletion)
@@ -43640,7 +43831,9 @@ pub(crate) unsafe fn observe_hosted_pnp_lifecycle(
         }
         HostedPnpTransactionPhase::Prepared
         | HostedPnpTransactionPhase::Dispatching
+        | HostedPnpTransactionPhase::DetachedDispatchInFlight
         | HostedPnpTransactionPhase::AwaitingCompletion
+        | HostedPnpTransactionPhase::DetachedAckInFlight
         | HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck
         | HostedPnpTransactionPhase::PostPublicationRepair => {
             Ok(HostedPnpLifecycleObservation::AwaitingCompletion)
@@ -44146,7 +44339,10 @@ impl DriverDispatchBackend for HostedDriverBackend {
     }
 
     fn poll_completion(&mut self) -> Option<nt_io_manager::DriverCompletion> {
-        unsafe { poll_hosted_completion(self.instance) }
+        unsafe {
+            poll_hosted_detached_pnp_completion(self.instance)
+                .or_else(|| poll_hosted_completion(self.instance))
+        }
     }
 
     fn copy_completion_output(
@@ -46238,11 +46434,131 @@ enum HostedDriverAllocationCopyError {
 enum HostedPnpTransactionPhase {
     Prepared,
     Dispatching,
+    DetachedDispatchInFlight,
     AwaitingCompletion,
+    DetachedAckInFlight,
     LifecycleCommittedAwaitingAck,
     PostPublicationRepair,
     Terminal,
     Indeterminate,
+}
+
+enum HostedDetachedPnpOwner {
+    Prepared(nt_io_manager::PreparedExternalPnpIrp),
+    DispatchReturned(nt_io_manager::ExternalPnpReturn),
+    Retained(nt_io_manager::RetainedExternalPnp),
+    AckReturned(nt_io_manager::ExternalPnpCompletionReturn),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct HostedPnpPhysicalProvider {
+    dependent_instance: usize,
+    dependent_driver_id: DriverId,
+    dependent_domain: HostedDomainIdentity,
+    storage_instance: usize,
+    storage_domain: HostedDomainIdentity,
+    publication_cookie: u64,
+}
+
+fn hosted_pnp_physical_provider(
+    dependent_instance: usize,
+    driver_id: DriverId,
+) -> Option<HostedPnpPhysicalProvider> {
+    let dependent = instance(dependent_instance)?;
+    let dependent_domain = instance_domain_identity(dependent)?;
+    if !dependent.ready
+        || dependent.driver_id != driver_id.raw()
+        || io_manager_mut().hosted_domain_identity(dependent_domain.domain_id)
+            != Some(dependent_domain)
+    {
+        return None;
+    }
+    let route = unsafe { hosted_provider_dispatch_route_for_instance(dependent_instance) };
+    if let Some(route) = route {
+        let storage = instance(route.provider_instance)?;
+        if !route.add_device_ready()
+            || route.dependent_driver_id != driver_id.raw()
+            || route.dependent_domain != dependent_domain
+            || !storage.ready
+            || instance_domain_identity(storage) != Some(route.provider_domain)
+            || io_manager_mut().hosted_domain_identity(route.provider_domain.domain_id)
+                != Some(route.provider_domain)
+        {
+            return None;
+        }
+        return Some(HostedPnpPhysicalProvider {
+            dependent_instance,
+            dependent_driver_id: driver_id,
+            dependent_domain,
+            storage_instance: route.provider_instance,
+            storage_domain: route.provider_domain,
+            publication_cookie: route.provider_publication_cookie,
+        });
+    }
+    // A stale route must not be silently interpreted as a self-hosted provider.
+    if unsafe { hosted_provider_dispatch_routes() }.is_some_and(|routes| {
+        routes.iter().any(|route| route.used && route.dependent_instance == dependent_instance)
+    }) {
+        return None;
+    }
+    Some(HostedPnpPhysicalProvider {
+        dependent_instance,
+        dependent_driver_id: driver_id,
+        dependent_domain,
+        storage_instance: dependent_instance,
+        storage_domain: dependent_domain,
+        publication_cookie: 0,
+    })
+}
+
+fn hosted_pnp_physical_provider_current(provider: HostedPnpPhysicalProvider) -> bool {
+    let dependent_live = instance(provider.dependent_instance).is_some_and(|inst| {
+        inst.ready
+            && inst.driver_id == provider.dependent_driver_id.raw()
+            && instance_domain_identity(inst) == Some(provider.dependent_domain)
+    });
+    let storage_live = instance(provider.storage_instance).is_some_and(|inst| {
+        inst.ready && instance_domain_identity(inst) == Some(provider.storage_domain)
+    });
+    if !dependent_live
+        || !storage_live
+        || io_manager_mut().hosted_domain_identity(provider.dependent_domain.domain_id)
+            != Some(provider.dependent_domain)
+        || io_manager_mut().hosted_domain_identity(provider.storage_domain.domain_id)
+            != Some(provider.storage_domain)
+    {
+        return false;
+    }
+    if provider.publication_cookie == 0 {
+        return provider.dependent_instance == provider.storage_instance
+            && provider.dependent_domain == provider.storage_domain
+            && unsafe { hosted_provider_dispatch_routes() }.is_none_or(|routes| {
+                !routes.iter().any(|route| {
+                    route.used && route.dependent_instance == provider.dependent_instance
+                })
+            });
+    }
+    // A retained dependency lease prevents teardown while an ACK is in flight. Retirement may
+    // mark this published route retiring, so inspect its exact publication rather than selecting
+    // whichever live route is currently advertised for the dependent.
+    unsafe {
+        hosted_provider_dispatch_routes().is_some_and(|routes| {
+            routes.iter().any(|route| {
+                route.used
+                    && route.construction_state == HostedProviderConstructionState::Published
+                    && route.dependent_instance == provider.dependent_instance
+                    && route.dependent_driver_id == provider.dependent_driver_id.raw()
+                    && route.dependent_domain == provider.dependent_domain
+                    && route.provider_instance == provider.storage_instance
+                    && route.provider_domain == provider.storage_domain
+                    && route.provider_publication_cookie == provider.publication_cookie
+            })
+        }) && find_hosted_provider_singleton_by_cookie(provider.publication_cookie)
+            .is_some_and(|(_, singleton)| {
+                singleton.instance == provider.storage_instance
+                    && singleton.owner_domain == provider.storage_domain
+            })
+    }
 }
 
 struct HostedPnpTransaction {
@@ -46255,6 +46571,9 @@ struct HostedPnpTransaction {
     completion_device_id: nt_io_manager::DeviceId,
     token: Option<nt_pnp_manager::PnpDispatchToken>,
     terminal_io_receipt: Option<nt_io_manager::ExternalPnpTerminalReceipt>,
+    detached_owner: Option<HostedDetachedPnpOwner>,
+    detached_provider: Option<HostedPnpPhysicalProvider>,
+    detached_provider_lease: Option<HostedProviderDependencyDispatchLease>,
     start_receipt: Option<nt_pnp_manager::StartDeviceLifecycleReceipt>,
     phase: HostedPnpTransactionPhase,
     driver_status: Option<nt_status::NtStatus>,
@@ -48250,6 +48569,21 @@ unsafe fn set_hosted_pnp_transaction_token(
     Ok(())
 }
 
+unsafe fn retain_hosted_detached_pnp_owner(
+    irp_id: IrpId,
+    owner: HostedDetachedPnpOwner,
+) -> Result<(), nt_status::NtStatus> {
+    let transaction = hosted_pnp_transactions_mut()
+        .iter_mut()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if transaction.detached_owner.is_some() {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    transaction.detached_owner = Some(owner);
+    Ok(())
+}
+
 unsafe fn transition_hosted_pnp_transaction_phase(
     irp_id: IrpId,
     phase: HostedPnpTransactionPhase,
@@ -48265,6 +48599,21 @@ unsafe fn transition_hosted_pnp_transaction_phase(
             HostedPnpTransactionPhase::AwaitingCompletion
         ) | (
             HostedPnpTransactionPhase::Dispatching,
+            HostedPnpTransactionPhase::DetachedDispatchInFlight
+        ) | (
+            HostedPnpTransactionPhase::DetachedDispatchInFlight,
+            HostedPnpTransactionPhase::AwaitingCompletion
+        ) | (
+            HostedPnpTransactionPhase::DetachedDispatchInFlight,
+            HostedPnpTransactionPhase::PostPublicationRepair
+        ) | (
+            HostedPnpTransactionPhase::AwaitingCompletion,
+            HostedPnpTransactionPhase::DetachedAckInFlight
+        ) | (
+            HostedPnpTransactionPhase::DetachedAckInFlight,
+            HostedPnpTransactionPhase::PostPublicationRepair
+        ) | (
+            HostedPnpTransactionPhase::Dispatching,
             HostedPnpTransactionPhase::PostPublicationRepair
         ) | (
             HostedPnpTransactionPhase::Dispatching,
@@ -48272,6 +48621,9 @@ unsafe fn transition_hosted_pnp_transaction_phase(
         ) | (
             HostedPnpTransactionPhase::AwaitingCompletion,
             HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck
+        ) | (
+            HostedPnpTransactionPhase::AwaitingCompletion,
+            HostedPnpTransactionPhase::PostPublicationRepair
         ) | (
             HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck,
             HostedPnpTransactionPhase::PostPublicationRepair
@@ -61180,6 +61532,38 @@ pub(crate) unsafe fn dispatch_hosted_pnp_lifecycle_canonical(
                 return Err(status);
             }
         };
+    let Some((provider_index, _)) = instance_by_driver_id(completion_driver_id.raw()) else {
+        io_manager_mut()
+            .discard_prepared_external_pnp(prepared)
+            .expect("hosted lifecycle preparation lost its owner");
+        return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+    };
+    let Some(detached_provider) =
+        hosted_pnp_physical_provider(provider_index, completion_driver_id)
+    else {
+        io_manager_mut()
+            .discard_prepared_external_pnp(prepared)
+            .expect("hosted lifecycle preparation lost its owner");
+        return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+    };
+    let detached_provider_lease = if detached_provider.publication_cookie != 0 {
+        let lease = unsafe {
+            acquire_hosted_provider_dependency_dispatch_lease(
+                detached_provider.storage_instance,
+                detached_provider.dependent_instance,
+                detached_provider.publication_cookie,
+            )
+        };
+        let Some(lease) = lease else {
+            io_manager_mut()
+                .discard_prepared_external_pnp(prepared)
+                .expect("hosted lifecycle preparation lost its owner");
+            return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+        };
+        Some(lease)
+    } else {
+        None
+    };
     if let Err(status) = reserve_active_hosted_irp_transfer_slot() {
         io_manager_mut()
             .discard_prepared_external_pnp(prepared)
@@ -61196,6 +61580,9 @@ pub(crate) unsafe fn dispatch_hosted_pnp_lifecycle_canonical(
         completion_device_id,
         token: None,
         terminal_io_receipt: None,
+        detached_owner: None,
+        detached_provider: Some(detached_provider),
+        detached_provider_lease,
         start_receipt: None,
         phase: HostedPnpTransactionPhase::Prepared,
         driver_status: None,
@@ -61246,6 +61633,8 @@ pub(crate) unsafe fn dispatch_hosted_pnp_lifecycle_canonical(
         nt_pnp_manager::PnpMinor::SurpriseRemoval | nt_pnp_manager::PnpMinor::RemoveDevice
     ) {
         if let Err(status) = guard_hosted_device_retirements_for_pnp(irp_id) {
+            retain_hosted_detached_pnp_owner(irp_id, HostedDetachedPnpOwner::Prepared(prepared))
+                .expect("hosted removal retirement guard lost its prepared owner");
             set_hosted_pnp_indeterminate(irp_id, status)
                 .expect("hosted removal retirement guard lost its transaction");
             return Ok(HostedPnpLifecycleOutcome::Indeterminate {
@@ -61255,10 +61644,97 @@ pub(crate) unsafe fn dispatch_hosted_pnp_lifecycle_canonical(
         }
     }
 
-    match io_manager_mut()
-        .dispatch_prepared_external_pnp(prepared)
-        .expect("prepared hosted PnP request belongs to the canonical I/O manager")
-    {
+    transition_hosted_pnp_transaction_phase(
+        irp_id,
+        HostedPnpTransactionPhase::DetachedDispatchInFlight,
+    )
+    .expect("detached hosted lifecycle lost its transaction phase");
+    // The provider can issue Source IRP RPCs during this dispatch. Its invocation owner must
+    // leave the manager before native entry so those callbacks can use the manager safely.
+    let invocation = match io_manager_mut().begin_prepared_external_pnp(prepared) {
+        Ok(invocation) => invocation,
+        Err(rejection) => {
+            let (status, prepared) = rejection.into_parts();
+            io_manager_mut()
+                .discard_prepared_external_pnp(prepared)
+                .expect("rejected hosted lifecycle preparation could not be discarded");
+            set_hosted_pnp_indeterminate(irp_id, status)
+                .expect("rejected hosted lifecycle lost its transaction");
+            return Ok(HostedPnpLifecycleOutcome::Indeterminate {
+                irp_id: irp_id.raw(),
+                transport_status: status,
+            });
+        }
+    };
+    let returned = invocation.invoke(|context, projection| {
+        let Some((instance_index, instance)) = instance_by_driver_id(projection.driver_id.raw()) else {
+            return PnpBackendDispatch::NotDispatched {
+                status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+            };
+        };
+        if !instance.ready
+            || instance_index != detached_provider.dependent_instance
+            || instance_domain_identity(instance) != Some(detached_provider.dependent_domain)
+            || hosted_pnp_physical_provider(instance_index, projection.driver_id)
+                != Some(detached_provider)
+        {
+            return PnpBackendDispatch::NotDispatched {
+                status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+            };
+        }
+        HostedDriverBackend {
+            instance: instance_index,
+        }
+        .dispatch_pnp_irp(context, projection)
+    });
+    let finished = match io_manager_mut().finish_external_pnp(returned) {
+        Ok(finished) => finished,
+        Err(rejection) => {
+            let status = rejection.status();
+            retain_hosted_detached_pnp_owner(
+                irp_id,
+                HostedDetachedPnpOwner::DispatchReturned(rejection.into_owner()),
+            )
+            .expect("rejected hosted lifecycle return lost its transaction");
+            set_hosted_pnp_indeterminate(irp_id, status)
+                .expect("rejected hosted lifecycle return lost its transaction");
+            return Ok(HostedPnpLifecycleOutcome::Indeterminate {
+                irp_id: irp_id.raw(),
+                transport_status: status,
+            });
+        }
+    };
+    let outcome = match finished {
+        nt_io_manager::ExternalPnpFinishResult::Terminal(outcome) => outcome,
+        nt_io_manager::ExternalPnpFinishResult::Retained(retained) => {
+            let (pending, transport_status) = match retained.outcome() {
+                ExternalPnpDispatchResult::Pending { .. } => (true, nt_status::NtStatus::PENDING),
+                ExternalPnpDispatchResult::Indeterminate {
+                    transport_status, ..
+                } => (false, *transport_status),
+                _ => unreachable!("terminal hosted lifecycle cannot retain its payload"),
+            };
+            retain_hosted_detached_pnp_owner(irp_id, HostedDetachedPnpOwner::Retained(retained))
+                .expect("retained hosted lifecycle lost its transaction");
+            if pending {
+                transition_hosted_pnp_transaction_phase(
+                    irp_id,
+                    HostedPnpTransactionPhase::AwaitingCompletion,
+                )
+                .expect("pending hosted lifecycle IRP lost its transaction");
+                return Ok(HostedPnpLifecycleOutcome::Pending {
+                    irp_id: irp_id.raw(),
+                });
+            }
+            set_hosted_pnp_indeterminate(irp_id, transport_status)
+                .expect("indeterminate hosted lifecycle IRP lost its transaction");
+            return Ok(HostedPnpLifecycleOutcome::Indeterminate {
+                irp_id: irp_id.raw(),
+                transport_status,
+            });
+        }
+    };
+    match outcome {
         ExternalPnpDispatchResult::Returned {
             status, receipt, ..
         } => {
@@ -61299,26 +61775,9 @@ pub(crate) unsafe fn dispatch_hosted_pnp_lifecycle_canonical(
                 transport_status,
             })
         }
-        ExternalPnpDispatchResult::Pending { irp_id } => {
-            transition_hosted_pnp_transaction_phase(
-                irp_id,
-                HostedPnpTransactionPhase::AwaitingCompletion,
-            )
-            .expect("pending hosted lifecycle IRP lost its transaction");
-            Ok(HostedPnpLifecycleOutcome::Pending {
-                irp_id: irp_id.raw(),
-            })
-        }
-        ExternalPnpDispatchResult::Indeterminate {
-            irp_id,
-            transport_status,
-        } => {
-            set_hosted_pnp_indeterminate(irp_id, transport_status)
-                .expect("indeterminate hosted lifecycle IRP lost its transaction");
-            Ok(HostedPnpLifecycleOutcome::Indeterminate {
-                irp_id: irp_id.raw(),
-                transport_status,
-            })
+        ExternalPnpDispatchResult::Pending { .. }
+        | ExternalPnpDispatchResult::Indeterminate { .. } => {
+            unreachable!("nonterminal hosted lifecycle must retain its detached owner")
         }
     }
 }
@@ -61419,6 +61878,9 @@ pub(crate) unsafe fn start_hosted_device_canonical(
         completion_device_id,
         token: None,
         terminal_io_receipt: None,
+        detached_owner: None,
+        detached_provider: None,
+        detached_provider_lease: None,
         start_receipt: None,
         phase: HostedPnpTransactionPhase::Prepared,
         driver_status: None,

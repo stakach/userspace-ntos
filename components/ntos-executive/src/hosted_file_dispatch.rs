@@ -150,7 +150,7 @@ pub(super) fn copy(mut invocation: ExternalFileIrpCopyInvocation) -> ExternalFil
     invocation.returned(outcome)
 }
 
-fn acknowledgement_result(result: HostedIrpTransportResult) -> ExternalFileIrpAcknowledgement {
+pub(super) fn acknowledgement_result(result: HostedIrpTransportResult) -> ExternalFileIrpAcknowledgement {
     match result {
         HostedIrpTransportResult::NotDispatched { status } => {
             ExternalFileIrpAcknowledgement::NotEntered { status }
@@ -272,6 +272,51 @@ pub(super) fn control(
         }
     }
     result
+}
+
+/// Issue a retained PnP ACK to its captured physical completion store. The dependent driver
+/// route is deliberately not resolved again: it may now name a different provider publication.
+pub(super) fn control_exact_storage(
+    storage_instance: usize,
+    storage_domain: HostedDomainIdentity,
+    irp_id: IrpId,
+    operation: u64,
+    offset: u64,
+    output: &mut [u8],
+) -> HostedIrpTransportResult {
+    if operation != FSD_DISPATCH_ACK_COMPLETION
+        || irp_id.raw() == 0
+        || instance(storage_instance).is_none_or(|inst| {
+            !inst.ready || instance_domain_identity(inst) != Some(storage_domain)
+        })
+        || io_manager_mut().hosted_domain_identity(storage_domain.domain_id)
+            != Some(storage_domain)
+        || unsafe { hosted_provider_dispatch_route_for_instance(storage_instance) }.is_some()
+    {
+        return HostedIrpTransportResult::NotDispatched {
+            status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+        };
+    }
+    unsafe {
+        dispatch_irp_for_instance_exact(
+            storage_instance,
+            operation,
+            0,
+            0,
+            irp_id.raw(),
+            0,
+            offset,
+            0,
+            0,
+            None,
+            &[],
+            output,
+            Some(crate::initial_system_driver_caller()),
+        )
+    }
+    .unwrap_or(HostedIrpTransportResult::NotDispatched {
+        status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+    })
 }
 
 pub(super) fn execute(

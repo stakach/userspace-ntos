@@ -1,4 +1,4 @@
-//! Live detached File adoption only. Borrowed PnP/lifecycle backends still hold &mut IoManager
+//! Live detached File adoption. Remaining borrowed PnP backends still hold &mut IoManager
 //! across their pump and cannot acquire or release projection owners from nested source RPCs.
 use syn::visit::Visit;
 

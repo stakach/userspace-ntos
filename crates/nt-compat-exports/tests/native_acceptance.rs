@@ -88,3 +88,5 @@ mod gui_dispatch_provenance;
 
 #[path = "native_acceptance/hosted_file_projection_ownership.rs"]
 mod hosted_file_projection_ownership;
+#[path = "native_acceptance/hosted_pnp_detached_lifecycle.rs"]
+mod hosted_pnp_detached_lifecycle;
