@@ -1253,6 +1253,27 @@ pub(super) fn admit_projected_start_io_packet(
     .map_err(|_| STATUS_INVALID_HANDLE)
 }
 
+/// Checked no-effect release. A failed device release leaves the source pin held; callers retain
+/// both values and retry only this local release, never a WDM queue effect or foreign Reply.
+pub(super) fn release_projected_start_io_packet(
+    registration: nt_io_manager::HostedDevicePointerRegistration,
+    identity: SourceIrpForwardIdentity,
+    device: &mut nt_io_manager::HostedDeviceProjectionReference,
+    source: &mut nt_io_manager::start_io_native_owner::StartIoSourcePin,
+) -> Result<(), i32> {
+    let _guard = lock();
+    if device.registration() != registration
+        || source.identity() != identity
+        || !ledger().admits_forward(identity.ticket(), identity.allocation())
+    {
+        return Err(STATUS_INVALID_HANDLE);
+    }
+    if device.is_held() {
+        device.release(io_manager_mut()).map_err(|status| status.raw())?;
+    }
+    source.release(ledger()).map_err(|_| STATUS_INVALID_HANDLE)
+}
+
 pub(super) fn pin(
     instance_index: usize,
     domain: HostedDomainIdentity,

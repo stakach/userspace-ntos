@@ -6,9 +6,11 @@
 
 use super::*;
 use nt_io_manager::device_queue::DEVICE_QUEUE_SIZE;
+use nt_io_manager::start_io::Action;
 
-struct LockedFirstPacketMemory<'a> {
-    prepared: &'a PreparedFirstProjectedPacket,
+struct LockedFirstPacketMemory {
+    registration: nt_io_manager::HostedDevicePointerRegistration,
+    source: SourceIrpForwardIdentity,
     _pool: ExecutivePoolLockGuard,
     device: AttributeMemory,
     device_capacity: u64,
@@ -25,7 +27,7 @@ fn range_contains(base: u64, capacity: u64, address: u64, bytes: u64) -> bool {
         })
 }
 
-impl LockedFirstPacketMemory<'_> {
+impl LockedFirstPacketMemory {
     fn exec_address(&self, address: u64, bytes: u64) -> Option<u64> {
         if range_contains(self.device.address, self.device_capacity, address, bytes) {
             return self.device.device_exec.checked_add(address - self.device.address);
@@ -55,19 +57,20 @@ impl LockedFirstPacketMemory<'_> {
 /// The source pin and projection pin were acquired from the root's op6 row before this lock.
 /// Recheck the same physical generations here; no mutable packet or queue bytes escape the lock.
 fn locked_first_packet_memory(
-    prepared: &PreparedFirstProjectedPacket,
-) -> Result<LockedFirstPacketMemory<'_>, i32> {
-    let inst = prepared.instance;
-    let irp = prepared.source_identity().allocation();
+    inst: DriverInstance,
+    registration: nt_io_manager::HostedDevicePointerRegistration,
+    source: SourceIrpForwardIdentity,
+) -> Result<LockedFirstPacketMemory, i32> {
+    let irp = source.allocation();
     let _pool = unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }
         .ok_or(STATUS_INVALID_HANDLE)?;
     let extension_size = io_manager_mut()
-        .device(prepared.registration.device_id())
+        .device(registration.device_id())
         .filter(|record| !record.delete_pending)
         .map(|record| record.extension_size)
         .ok_or(STATUS_INVALID_HANDLE)?;
     let device = unsafe {
-        attribute_memory(inst, prepared.registration.address(), prepared.registration, extension_size)
+        attribute_memory(inst, registration.address(), registration, extension_size)
     }
     .ok_or(STATUS_INVALID_HANDLE)?;
     if unsafe { read_unaligned((device.device_exec + 0x20) as *const u64) } != 0 {
@@ -109,16 +112,78 @@ fn locked_first_packet_memory(
     }
     // DRIVER_OBJECT.DriverStartIo is at 0x60 in the x64 WDM layout.
     let start_io = unsafe { read_unaligned((driver_exec + 0x60) as *const u64) };
-    if start_io == 0 {
+    let image_end = inst.image_frames.checked_mul(0x1000)
+        .and_then(|bytes| FSD_CODE_VA.checked_add(bytes))
+        .ok_or(STATUS_INVALID_HANDLE)?;
+    if !inst.used || !inst.ready || start_io < FSD_CODE_VA || start_io >= image_end {
         return Err(STATUS_INVALID_DEVICE_REQUEST);
     }
     Ok(LockedFirstPacketMemory {
-        prepared, _pool, device, device_capacity,
+        registration, source, _pool, device, device_capacity,
         irp: irp.component_address, irp_exec, irp_capacity, start_io,
     })
 }
 
-impl LockedDeviceQueueMemory for LockedFirstPacketMemory<'_> {
+pub(super) struct FirstPacketCommit {
+    pub current: CurrentReceipt<nt_io_manager::HostedDeviceProjectionReference, StartIoSourcePin>,
+    pub identity: SourceIrpForwardIdentity,
+    pub registration: nt_io_manager::HostedDevicePointerRegistration,
+    pub callback_target: u64,
+    pub node: PendingStartIoNodeIdentity,
+}
+
+/// No foreign call occurs here. The CurrentReceipt update is prepared before the WDM queue
+/// effect, then published under the same pool lock. Refusal returns both original owners.
+pub(super) fn commit_first_projected_packet(
+    prepared: PreparedFirstProjectedPacket,
+) -> Result<FirstPacketCommit, PreparedFirstProjectedPacket> {
+    let PreparedFirstProjectedPacket {
+        instance, registration, node, mut current, incoming,
+    } = prepared;
+    let identity = incoming.identity();
+    let mut memory = match locked_first_packet_memory(instance, registration, identity) {
+        Ok(memory) => memory,
+        Err(_) => return Err(PreparedFirstProjectedPacket {
+            instance, registration, node, current, incoming,
+        }),
+    };
+    let queue_head = registration.address() + 0xa0 + 8;
+    match memory.queue(registration.address() + 0xa0) {
+        Ok(queue) if !queue.busy && queue.flink == queue_head && queue.blink == queue_head => {},
+        _ => return Err(PreparedFirstProjectedPacket {
+            instance, registration, node, current, incoming,
+        }),
+    }
+    let prepared_update = match current.prepare_update(registration, 0, Some(incoming)) {
+        Ok(update) => update,
+        Err(refusal) => return Err(PreparedFirstProjectedPacket {
+            instance, registration, node, current,
+            incoming: refusal.incoming.expect("first packet refusal retains incoming owner"),
+        }),
+    };
+    let callback_target = memory.start_io;
+    let outcome = start_io::start_packet::<_, ()>(
+        &mut memory, registration.address(), identity.allocation().component_address + 0x78,
+        None, None, None,
+    );
+    match outcome {
+        Ok(outcome) => {
+            assert!(matches!(outcome.action, Action::Start { .. }) && outcome.release_lock.is_none(),
+                "idle first-packet queue changed under its lock");
+            assert!(prepared_update.commit().is_none(), "empty current displaced a live packet");
+            Ok(FirstPacketCommit { current, identity, registration, callback_target, node })
+        }
+        Err(_) => {
+            let incoming = prepared_update.abort()
+                .expect("first packet refusal retains incoming owner");
+            Err(PreparedFirstProjectedPacket {
+                instance, registration, node, current, incoming,
+            })
+        }
+    }
+}
+
+impl LockedDeviceQueueMemory for LockedFirstPacketMemory {
     type Error = ();
 
     fn validate_unpublished_queue_storage(&self, _: u64) -> Result<(), Self::Error> { Err(()) }
@@ -139,7 +204,7 @@ impl LockedDeviceQueueMemory for LockedFirstPacketMemory<'_> {
     }
 }
 
-impl LockedStartIoMemory for LockedFirstPacketMemory<'_> {
+impl LockedStartIoMemory for LockedFirstPacketMemory {
     type Owner = nt_io_manager::HostedDevicePointerRegistration;
 
     fn device(&self, address: u64) -> Result<Device<Self::Owner>, Self::Error> {
@@ -151,28 +216,28 @@ impl LockedStartIoMemory for LockedFirstPacketMemory<'_> {
             count: unsafe { read_unaligned((self.device.extension_exec + 0x38) as *const u32) },
             key: unsafe { read_unaligned((self.device.extension_exec + 0x3c) as *const u32) },
             flags: unsafe { read_unaligned((self.device.extension_exec + 0x40) as *const u32) },
-            owner: self.prepared.registration,
+            owner: self.registration,
         })
     }
     fn validate_device_owner(&self, retained: &Device<Self::Owner>) -> Result<(), Self::Error> {
         (retained.address == self.device.address
-            && retained.owner == self.prepared.registration).then_some(()).ok_or(())
+            && retained.owner == self.registration).then_some(()).ok_or(())
     }
     fn packet(&self, entry: u64, cancel: Option<u64>) -> Result<Packet<Self::Owner>, Self::Error> {
         if entry != self.irp + 0x78 || cancel.is_some() { return Err(()); }
         Ok(Packet {
             irp: self.irp, entry,
             cancelled: unsafe { read_unaligned((self.irp_exec + WDM_X64_IRP_CANCEL_OFFSET) as *const u8) != 0 },
-            owner: self.prepared.registration,
+            owner: self.registration,
         })
     }
     fn classify_current_packet(
         &self, device: &Device<Self::Owner>, packet: &Packet<Self::Owner>,
     ) -> Result<CurrentPacketRelation, Self::Error> {
-        if packet.irp != self.irp { return Err(()); }
-        self.prepared.current.classify(
-            device.owner, device.current_irp, &self.prepared.incoming,
-        ).map_err(|_| ())
+        if packet.irp != self.source.allocation().component_address
+            || device.owner != self.registration || device.current_irp != 0
+        { return Err(()); }
+        Ok(CurrentPacketRelation::Empty)
     }
     fn commit_start_io(&mut self, writes: &[DeviceQueueWrite]) {
         // Validate the complete edit set before the first physical store. These are local writes

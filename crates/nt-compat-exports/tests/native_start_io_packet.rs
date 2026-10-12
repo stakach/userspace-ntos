@@ -38,3 +38,19 @@ fn packet_imports_wait_for_callback_and_terminal_integration() {
         assert!(!registry.contains(&format!("\"{import}\",")));
     }
 }
+
+#[test]
+fn first_packet_commit_retains_current_and_callback_before_reply() {
+    let adapter = native("hosted_start_io.rs");
+    let memory = native("hosted_start_io_packet.rs");
+    assert!(adapter.contains("fn commit_first_projected_packet("));
+    assert!(adapter.contains("CommittedStartIo::new("));
+    assert!(adapter.contains("fn begin_first_packet_reply("));
+    assert!(adapter.contains("fn first_packet_callback_returned("));
+    assert!(adapter.contains("retain_hosted_device_projection_reference("));
+    assert!(adapter.contains("release_prepared_first_packet("));
+    assert!(adapter.contains("release_projected_start_io_packet("));
+    assert!(memory.contains("start_io::start_packet::<_, ()>("));
+    assert!(memory.contains("prepare_update("));
+    assert!(memory.contains("prepared_update.commit("));
+}

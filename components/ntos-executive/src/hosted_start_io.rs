@@ -10,6 +10,7 @@ use nt_io_manager::start_io::{self, CurrentPacketRelation, Device, LockedStartIo
 use nt_io_manager::start_io_current::{CurrentReceipt, LivePacket};
 use nt_io_manager::start_io_native_owner::{PendingStartIoNodeIdentity, StartIoSourcePin};
 use nt_io_manager::source_irp_ledger::SourceIrpForwardIdentity;
+use nt_io_manager::start_io_native_transaction::{CommittedStartIo, StartIoTransactionId};
 
 #[path = "hosted_start_io_packet.rs"]
 mod packet;
@@ -21,12 +22,181 @@ mod packet;
 struct PreparedFirstProjectedPacket {
     instance: DriverInstance,
     registration: nt_io_manager::HostedDevicePointerRegistration,
+    node: PendingStartIoNodeIdentity,
     current: CurrentReceipt<nt_io_manager::HostedDeviceProjectionReference, StartIoSourcePin>,
     incoming: LivePacket<StartIoSourcePin>,
 }
 
 impl PreparedFirstProjectedPacket {
     fn source_identity(&self) -> SourceIrpForwardIdentity { self.incoming.identity() }
+}
+
+#[must_use = "retain a refused no-effect owner until checked local release"]
+enum FirstPacketReleaseRefusal {
+    NotEmpty(PreparedFirstProjectedPacket),
+    Owners {
+        registration: nt_io_manager::HostedDevicePointerRegistration,
+        identity: SourceIrpForwardIdentity,
+        device: nt_io_manager::HostedDeviceProjectionReference,
+        source: StartIoSourcePin,
+    },
+}
+
+/// Only a proven no-effect refusal may enter this release path. An uncertain queue write or
+/// foreign Reply must stay in the committed transaction instead.
+fn release_prepared_first_packet(
+    prepared: PreparedFirstProjectedPacket,
+) -> Result<(), FirstPacketReleaseRefusal> {
+    let PreparedFirstProjectedPacket {
+        instance, registration, node, current, incoming,
+    } = prepared;
+    let device = match current.into_empty_owner() {
+        Ok(device) => device,
+        Err(current) => return Err(FirstPacketReleaseRefusal::NotEmpty(
+            PreparedFirstProjectedPacket { instance, registration, node, current, incoming },
+        )),
+    };
+    let identity = incoming.identity();
+    let source = incoming.into_owner();
+    let mut refused = FirstPacketReleaseRefusal::Owners {
+        registration, identity, device, source,
+    };
+    if retry_first_packet_release(&mut refused).is_err() { return Err(refused); }
+    Ok(())
+}
+
+fn retry_first_packet_release(refused: &mut FirstPacketReleaseRefusal) -> Result<(), i32> {
+    let FirstPacketReleaseRefusal::Owners {
+        registration, identity, device, source,
+    } = refused else { return Err(STATUS_INVALID_HANDLE); };
+    hosted_source_irp_ledger::release_projected_start_io_packet(
+        *registration, *identity, device, source,
+    )
+}
+
+type FirstPacketOwner = CommittedStartIo<
+    nt_io_manager::HostedDeviceProjectionReference,
+    StartIoSourcePin,
+    nt_io_manager::HostedDeviceProjectionReference,
+>;
+
+struct FirstPacketTransaction {
+    id: StartIoTransactionId,
+    node: PendingStartIoNodeIdentity,
+    registration: nt_io_manager::HostedDevicePointerRegistration,
+    callback_target: u64,
+    source: SourceIrpForwardIdentity,
+    owner: FirstPacketOwner,
+}
+
+static FIRST_PACKET_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static FIRST_PACKET_LOCK: AtomicU64 = AtomicU64::new(0);
+static mut FIRST_PACKET_TRANSACTIONS: Option<Vec<FirstPacketTransaction>> = None;
+
+struct FirstPacketGuard;
+impl Drop for FirstPacketGuard {
+    fn drop(&mut self) { FIRST_PACKET_LOCK.store(0, Ordering::Release); }
+}
+
+fn lock_first_packets() -> FirstPacketGuard {
+    while FIRST_PACKET_LOCK.compare_exchange_weak(
+        0, 1, Ordering::Acquire, Ordering::Relaxed,
+    ).is_err() { crate::yield_now(); }
+    FirstPacketGuard
+}
+
+fn first_packet_transactions() -> &'static mut Vec<FirstPacketTransaction> {
+    // Every caller holds FIRST_PACKET_LOCK; no reference crosses a callback or foreign Reply.
+    unsafe { (&mut *core::ptr::addr_of_mut!(FIRST_PACKET_TRANSACTIONS)).get_or_insert_with(Vec::new) }
+}
+
+#[must_use = "retain any no-effect StartIo owner until checked local release"]
+struct FirstPacketCommitRefusal {
+    prepared: PreparedFirstProjectedPacket,
+    callback_owner: Option<nt_io_manager::HostedDeviceProjectionReference>,
+}
+
+#[must_use = "retain the no-effect owner until checked local release succeeds"]
+enum FirstPacketCommitReleaseRefusal {
+    Callback(FirstPacketCommitRefusal),
+    Packet(FirstPacketReleaseRefusal),
+}
+
+fn release_first_packet_commit_refusal(
+    mut refused: FirstPacketCommitRefusal,
+) -> Result<(), FirstPacketCommitReleaseRefusal> {
+    if let Some(callback) = refused.callback_owner.as_mut() {
+        if callback.is_held() && callback.release(io_manager_mut()).is_err() {
+            return Err(FirstPacketCommitReleaseRefusal::Callback(refused));
+        }
+    }
+    release_prepared_first_packet(refused.prepared)
+        .map_err(FirstPacketCommitReleaseRefusal::Packet)
+}
+
+/// Reserve all root ownership before the local queue write. A successful return leaves the
+/// CurrentIrp, source pin, projection and callback image pin in the root transaction table.
+/// No Reply or callback is issued here; that separate edge must use begin_first_packet_reply.
+fn commit_first_projected_packet(
+    prepared: PreparedFirstProjectedPacket,
+) -> Result<StartIoTransactionId, FirstPacketCommitRefusal> {
+    let _guard = lock_first_packets();
+    if first_packet_transactions().try_reserve(1).is_err() {
+        return Err(FirstPacketCommitRefusal { prepared, callback_owner: None });
+    }
+    let serial = match FIRST_PACKET_NEXT_ID.fetch_update(
+        Ordering::Relaxed, Ordering::Relaxed,
+        |value| value.checked_add(1).filter(|next| *next != 0),
+    ) {
+        Ok(serial) => serial,
+        Err(_) => return Err(FirstPacketCommitRefusal { prepared, callback_owner: None }),
+    };
+    let id = StartIoTransactionId::new(serial, prepared.node.generation)
+        .expect("admitted pending node has a nonzero generation");
+    let mut callback_owner = match io_manager_mut()
+        .retain_hosted_device_projection_reference(prepared.registration)
+    {
+        Ok(owner) => owner,
+        Err(_) => return Err(FirstPacketCommitRefusal { prepared, callback_owner: None }),
+    };
+    let committed = match packet::commit_first_projected_packet(prepared) {
+        Ok(committed) => committed,
+        Err(prepared) => {
+            if callback_owner.release(io_manager_mut()).is_err() {
+                return Err(FirstPacketCommitRefusal {
+                    prepared, callback_owner: Some(callback_owner),
+                });
+            }
+            return Err(FirstPacketCommitRefusal { prepared, callback_owner: None });
+        }
+    };
+    let owner = CommittedStartIo::new(
+        committed.current, committed.identity, id, callback_owner,
+    ).unwrap_or_else(|_| panic!("committed first packet lost its exact CurrentIrp receipt"));
+    first_packet_transactions().push(FirstPacketTransaction {
+        id, node: committed.node, registration: committed.registration,
+        callback_target: committed.callback_target, source: committed.identity, owner,
+    });
+    Ok(id)
+}
+
+/// Mark Reply uncertain before yielding its scalar callback command. A lost or failed Reply
+/// outcome cannot re-enter this operation or repeat the WDM queue commit.
+fn begin_first_packet_reply(id: StartIoTransactionId) -> Result<(u64, u64, u64), i32> {
+    let _guard = lock_first_packets();
+    let row = first_packet_transactions().iter_mut().find(|row| row.id == id)
+        .ok_or(STATUS_INVALID_HANDLE)?;
+    row.owner.begin_reply().map_err(|_| STATUS_INVALID_HANDLE)?;
+    Ok((row.callback_target, row.registration.address(), row.source.allocation().component_address))
+}
+
+/// Callback return does not retire the source IRP. The independent terminal completion hook is
+/// still required before the transaction may release any physical or callback image owner.
+fn first_packet_callback_returned(id: StartIoTransactionId) -> Result<(), i32> {
+    let _guard = lock_first_packets();
+    let row = first_packet_transactions().iter_mut().find(|row| row.id == id)
+        .ok_or(STATUS_INVALID_HANDLE)?;
+    row.owner.callback_returned(id).map_err(|_| STATUS_INVALID_HANDLE)
 }
 
 /// Admit from the root's own pending-node row and physical source ledger, never from component
@@ -53,6 +223,7 @@ fn prepare_first_projected_packet(
     Ok(PreparedFirstProjectedPacket {
         instance: inst,
         registration,
+        node: observed,
         current: CurrentReceipt::new(registration, identity.allocation().domain, device_owner),
         incoming: LivePacket::new(identity, source_owner),
     })

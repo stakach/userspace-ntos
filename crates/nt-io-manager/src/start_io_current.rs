@@ -136,6 +136,12 @@ impl<D, P> CurrentReceipt<D, P> {
         }
     }
 
+    /// Withdraw an untouched current receipt after a proven no-effect refusal. Any live or
+    /// completed packet keeps the device owner in the returned receipt for exact settlement.
+    pub fn into_empty_owner(self) -> Result<D, Self> {
+        if self.packet.is_some() { Err(self) } else { Ok(self._device_owner) }
+    }
+
     fn validate_device(&self, device: HostedDevicePointerRegistration) -> Result<(), Error> {
         if device != self.device {
             return Err(Error::WrongDevice);

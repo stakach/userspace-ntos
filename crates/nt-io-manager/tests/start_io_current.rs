@@ -104,6 +104,39 @@ fn packet(
 }
 
 #[test]
+fn no_effect_refusal_returns_only_an_empty_current_device_owner() {
+    let device = DeviceFixture::new();
+    let drops = Rc::new(RefCell::new(Vec::new()));
+    let current = CurrentReceipt::<Owner, Owner>::new(
+        device.registration, device.registration.domain(), owner(1, &drops),
+    );
+    let returned = current.into_empty_owner().ok().expect("empty receipt returns its owner");
+    assert_eq!(returned.id, 1);
+    assert!(drops.borrow().is_empty());
+    drop(returned);
+    assert_eq!(&*drops.borrow(), &[1]);
+
+    let mut live = CurrentReceipt::new(
+        device.registration, device.registration.domain(), owner(2, &drops),
+    );
+    let incoming = packet(identity(device.registration, 0x2000, 7), 3, &drops);
+    assert!(live.prepare_update(device.registration, 0, Some(incoming))
+        .unwrap().commit().is_none());
+    let live = live.into_empty_owner().err().expect("live packet cannot be withdrawn");
+    assert_eq!(live.snapshot().phase, CurrentPhase::Live);
+    assert_eq!(live.snapshot().packet.unwrap().allocation().component_address, 0x2000);
+    assert_eq!(&*drops.borrow(), &[1]);
+    let mut completed = live;
+    let returned = completed.observe_completion(
+        device.registration, identity(device.registration, 0x2000, 7),
+        CompletionObservation::Acknowledged,
+    ).unwrap().expect("exact terminal packet owner");
+    assert_eq!(returned.identity().allocation().component_address, 0x2000);
+    assert_eq!(completed.into_empty_owner().err().unwrap().snapshot().phase,
+        CurrentPhase::Completed);
+}
+
+#[test]
 fn empty_and_live_classification_uses_exact_packet_lifetimes() {
     let device = DeviceFixture::new();
     let drops = Rc::new(RefCell::new(Vec::new()));
