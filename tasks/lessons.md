@@ -643,3 +643,7 @@ diagnosis-free failure.
   before imposing that invariant on a shared completion claim.
 - Treat a zero/zero ticket pair as ordinary, a complete valid pair as root-issued, and a half-set
   pair as corrupt. Preserve the existing node-generation CAS for both valid paths.
+
+## Respect Canonical Device Binding Cardinality In Tests
+- The I/O Manager permits one hosted pointer binding per canonical device. To test a wrong
+  registration, create a second device rather than binding the original device twice.

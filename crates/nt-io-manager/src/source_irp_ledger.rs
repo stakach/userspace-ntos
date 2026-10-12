@@ -101,6 +101,8 @@ struct Row {
 pub struct SourceIrpLedger {
     rows: Vec<Row>,
     next_serial: u64,
+    /// StartIo owns device/source lifetimes here; the WDM device queue alone selects packets.
+    pub(crate) start_io_owners: Vec<crate::start_io_native_owner::StartIoAdmission>,
 }
 
 impl Default for SourceIrpLedger {
@@ -114,6 +116,7 @@ impl SourceIrpLedger {
         Self {
             rows: Vec::new(),
             next_serial: 1,
+            start_io_owners: Vec::new(),
         }
     }
 

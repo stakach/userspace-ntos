@@ -29,6 +29,8 @@ pub enum StartIoAdmissionError {
     Source(SourceIrpLedgerError),
     WrongSourceAllocation,
     Device(NtStatus),
+    AlreadyRetained,
+    NoCapacity,
 }
 
 /// One real source-ledger pin. The ticket and allocation are observations; this non-Copy value
@@ -60,7 +62,8 @@ impl StartIoSourcePin {
 #[must_use = "transfer both owners into the canonical queue/current receipt or release them"]
 pub struct StartIoAdmission {
     source: StartIoSourcePin,
-    device: HostedDeviceProjectionReference,
+    registration: HostedDevicePointerRegistration,
+    device: Option<HostedDeviceProjectionReference>,
 }
 
 impl StartIoAdmission {
@@ -88,11 +91,94 @@ impl StartIoAdmission {
                 return Err(StartIoAdmissionError::Device(status));
             }
         };
-        Ok(Self { source: StartIoSourcePin { identity, held: true }, device: projection })
+        Ok(Self { source: StartIoSourcePin { identity, held: true }, registration: device,
+            device: Some(projection) })
     }
 
     pub fn into_owners(self) -> (HostedDeviceProjectionReference, StartIoSourcePin) {
-        (self.device, self.source)
+        (self.device.expect("admitted StartIo device owner"), self.source)
+    }
+
+    pub fn source_identity(&self) -> SourceIrpForwardIdentity { self.source.identity() }
+
+    pub fn device_registration(&self) -> HostedDevicePointerRegistration {
+        self.registration
+    }
+
+    /// Called after a proved no-effect queue refusal or exact terminal withdrawal. Keep the
+    /// physical source pinned if device release refuses, so storage cannot retire prematurely.
+    pub fn release<P>(&mut self, io: &mut IoManager<P>, ledger: &mut SourceIrpLedger)
+        -> Result<(), StartIoAdmissionError>
+    {
+        if let Some(device) = self.device.as_mut() {
+            device.release(io).map_err(StartIoAdmissionError::Device)?;
+            self.device = None;
+        }
+        if self.source.held {
+            self.source.release(ledger).map_err(StartIoAdmissionError::Source)?;
+        }
+        Ok(())
+    }
+}
+
+impl SourceIrpLedger {
+    /// Retain the owner transaction before provider queue effects. This is an ownership ledger,
+    /// not an alternative packet queue: selection remains in the WDM KDEVICE_QUEUE.
+    pub fn retain_start_io<P>(
+        &mut self, io: &mut IoManager<P>, expected_source: SourceIrpAllocation,
+        device: HostedDevicePointerRegistration,
+    ) -> Result<SourceIrpTicket, StartIoAdmissionError> {
+        if self.start_io_owners.iter().any(|owner| {
+            owner.source_identity().allocation() == expected_source
+        }) {
+            return Err(StartIoAdmissionError::AlreadyRetained);
+        }
+        self.start_io_owners.try_reserve(1).map_err(|_| StartIoAdmissionError::NoCapacity)?;
+        let admission = StartIoAdmission::acquire(io, self, expected_source, device)?;
+        let ticket = admission.source_identity().ticket();
+        self.start_io_owners.push(admission);
+        Ok(ticket)
+    }
+
+    pub fn start_io_registration(&self, ticket: SourceIrpTicket)
+        -> Option<HostedDevicePointerRegistration>
+    {
+        self.start_io_owners.iter()
+            .find(|owner| owner.source_identity().ticket() == ticket)
+            .map(StartIoAdmission::device_registration)
+    }
+
+    pub fn start_io_allocation(&self, ticket: SourceIrpTicket,
+        device: HostedDevicePointerRegistration) -> Option<SourceIrpAllocation>
+    {
+        self.start_io_owners.iter()
+            .find(|owner| owner.source_identity().ticket() == ticket
+                && owner.device_registration() == device)
+            .map(|owner| owner.source_identity().allocation())
+    }
+
+    /// Transfer an exact owner to a locked native queue/current adapter. The caller must retain
+    /// this non-Copy value across all foreign effects and any uncertain response.
+    pub fn take_start_io(&mut self, ticket: SourceIrpTicket,
+        device: HostedDevicePointerRegistration) -> Option<StartIoAdmission>
+    {
+        let index = self.start_io_owners.iter().position(|owner|
+            owner.source_identity().ticket() == ticket && owner.device_registration() == device)?;
+        Some(self.start_io_owners.swap_remove(index))
+    }
+
+    pub fn return_start_io(&mut self, admission: StartIoAdmission)
+        -> Result<(), (StartIoAdmissionError, StartIoAdmission)>
+    {
+        if self.start_io_owners.iter().any(|owner|
+            owner.source_identity().ticket() == admission.source_identity().ticket()) {
+            return Err((StartIoAdmissionError::AlreadyRetained, admission));
+        }
+        if self.start_io_owners.try_reserve(1).is_err() {
+            return Err((StartIoAdmissionError::NoCapacity, admission));
+        }
+        self.start_io_owners.push(admission);
+        Ok(())
     }
 }
 
@@ -226,16 +312,27 @@ mod tests {
             Err(StartIoAdmissionError::WrongSourceAllocation)));
         assert_eq!(ledger.unpin(ticket), Err(SourceIrpLedgerError::WrongIdentity));
         assert_eq!(io.device_reference_count(device), baseline);
-        let admission = StartIoAdmission::acquire(&mut io, &mut ledger, source, registration).unwrap();
+        assert_eq!(ledger.retain_start_io(&mut io, source, registration), Ok(ticket));
+        assert_eq!(ledger.start_io_registration(ticket), Some(registration));
+        assert_eq!(ledger.retain_start_io(&mut io, source, registration),
+            Err(StartIoAdmissionError::AlreadyRetained));
         assert_eq!(io.device_reference_count(device), baseline + 1);
         assert_eq!(io.retire_hosted_device_pointer(registration), Err(NtStatus::DEVICE_BUSY));
-        let (mut device_owner, mut source_owner) = admission.into_owners();
-        assert_eq!(source_owner.identity().ticket(), ticket);
-        assert_eq!(source_owner.identity().allocation(), source);
         assert_eq!(ledger.prepare_driver_free(3, physical, source.component_address),
             Err(SourceIrpLedgerError::Pinned));
-        source_owner.release(&mut ledger).unwrap();
-        device_owner.release(&mut io).unwrap();
+        let other_device = io.add_device(DeviceRecord::new(
+            ObjectId::NULL, driver, None, DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(), DeviceFlags::empty(), 0,
+        ));
+        let wrong_device = io.bind_hosted_device_pointer(logical, 0x5000, other_device).unwrap();
+        assert!(ledger.take_start_io(ticket, wrong_device).is_none());
+        let admission = ledger.take_start_io(ticket, registration).unwrap();
+        assert_eq!(admission.source_identity().ticket(), ticket);
+        assert_eq!(admission.source_identity().allocation(), source);
+        ledger.return_start_io(admission).unwrap();
+        let mut admission = ledger.take_start_io(ticket, registration).unwrap();
+        admission.release(&mut io, &mut ledger).unwrap();
+        io.retire_hosted_device_pointer(wrong_device).unwrap();
         assert_eq!(io.device_reference_count(device), baseline);
     }
 
