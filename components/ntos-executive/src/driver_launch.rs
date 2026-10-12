@@ -1132,28 +1132,26 @@ struct PendingIrp {
 }
 
 impl PendingIrp {
-    fn allocation_pointers(&self) -> nt_io_manager::pending_irp_graph::PendingIrpGraphPointers {
-        nt_io_manager::pending_irp_graph::PendingIrpGraphPointers {
-            reclaim: self
-                .completion
-                .completed()
-                .map(|completion| completion.reclaim)
-                .unwrap_or(0),
-            mdl: self.mdl,
-            aux_data: self.aux_data,
-            data: self.data,
-            create_parameters: self.create_parameters,
-            create_access_state: self.create_access_state,
-            create_security_context: self.create_security_context,
-            pnp_resource_list: self.pnp_resource_list,
-            irp: self.irp,
-            file_object: self.file_object,
-            owns_file: self.owns_fo,
-        }
-    }
-
     fn allocation_graph(&self) -> nt_io_manager::pending_irp_graph::PendingIrpAllocationGraph {
-        nt_io_manager::pending_irp_graph::PendingIrpAllocationGraph::new(self.allocation_pointers())
+        nt_io_manager::pending_irp_graph::PendingIrpAllocationGraph::new(
+            nt_io_manager::pending_irp_graph::PendingIrpGraphPointers {
+                reclaim: self
+                    .completion
+                    .completed()
+                    .map(|completion| completion.reclaim)
+                    .unwrap_or(0),
+                mdl: self.mdl,
+                aux_data: self.aux_data,
+                data: self.data,
+                create_parameters: self.create_parameters,
+                create_access_state: self.create_access_state,
+                create_security_context: self.create_security_context,
+                pnp_resource_list: self.pnp_resource_list,
+                irp: self.irp,
+                file_object: self.file_object,
+                owns_file: self.owns_fo,
+            },
+        )
     }
 }
 
@@ -2071,23 +2069,7 @@ unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
                 hosted_file_objects::free_file_storage(allocation.pointer);
             }
             nt_io_manager::pending_irp_graph::GraphReleaseKind::Pool => {
-                if entry.source_ticket_id != 0 {
-                    let (words, status, _, _, _) = call_on4_raw(
-                        (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
-                        9,
-                        entry.source_ticket_id,
-                        entry.source_ticket_generation,
-                        allocation.pointer,
-                    );
-                    if words != 3 || status as u32 as i32 != STATUS_SUCCESS {
-                        crate::provider_bugcheck::report(
-                            0xc4,
-                            [FSD_SERVICE_SOURCE_IRP_LABEL, 9, allocation.pointer, status],
-                        );
-                    }
-                } else {
-                    pool_free(allocation.pointer);
-                }
+                pool_free(allocation.pointer);
             }
         }
     }

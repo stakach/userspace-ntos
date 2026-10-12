@@ -258,14 +258,6 @@ impl CapturedGraph {
         &self.initial[..self.len]
     }
 
-    /// A root pool observation is protected only while it is the exact captured allocation.
-    /// Reuse at the same address has a different generation and is a different owner.
-    pub fn protects_current_member(&self, current: SourcePoolAllocationIdentity) -> bool {
-        self.initial_members()
-            .iter()
-            .any(|member| member.allocation == current)
-    }
-
     /// Validate all changes without modifying the immutable initial capture.
     ///
     /// A refusal returns this same graph and the proposed metadata. The native caller must
