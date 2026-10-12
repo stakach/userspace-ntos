@@ -1,0 +1,33 @@
+{
+  "issue": 18,
+  "related_issues": [283, 303],
+  "source_commit": "455c6060",
+  "microkernel_commit": "2debcee98856ea648924c9ddf0c20a491750668b",
+  "profile": "font-cleanup",
+  "boot_bound_seconds": 900,
+  "build_exit": 0,
+  "launcher_exit": 124,
+  "collector_exit": 0,
+  "collector_frames": 90,
+  "collector_final_slot": 1,
+  "termination": "The configured 900-second readiness bound expired and QEMU was terminated. Strict font cleanup and Explorer paint were not observed.",
+  "artifact_sha256": {
+    "staged_disk": "16426ed9683c4b6c67abc76f79add5c522adab486abaa21bdaa80fdfa12fb317",
+    "raw_log": "1ba960f861d3c43505b37fe75b87638eeb40055496870a618be312fe9939a5fb",
+    "raw_collector_log": "1c2505d5a506e21123e5ff8dbdd28a63bf3a408a1cf067fce521eec990231f39",
+    "archived_log": "f81e13ab3fa6d58df52e136131418b7564ea14669f82cf89be3062afd6bfafe0",
+    "archived_collector_log": "b59da0110e0c8b2ac958f2f65cd68ebd0ca368243430bea378a2e99f58da5af0",
+    "screenshot": "53ad5f5ac610f375103c4b38bc9dcda1b85defd34e60860272a02fff0da0c9cb"
+  },
+  "observations": [
+    "The original ee071e76 boot failed ACPI and bochsmp AddDevice with STATUS_OBJECT_NAME_COLLISION because binding attempted to publish an FDO already published by IoCreateDevice. The corrected 455c6060 image accepted and started both real drivers; bochsmp reported video=1/1 and root=1.",
+    "The font setup process passed RUN-REGISTERED through SMSS. The font Run client did not start, so no private-font cleanup verdict is claimed.",
+    "The guest exchanged setup LPC/RPC messages through the bound, but win32k repeatedly reported keyboard and mouse read status c0000001. Each occurred 18,763 times in the serial log. Native IoStartPacket and IoStartNextPacket remain unbound pending exact queue/current ownership integration.",
+    "The final same-run QMP screenshot is black. Genuine Explorer execution and painted desktop are not proven. This fixture-profile screenshot also cannot serve as separate production desktop acceptance."
+  ],
+  "evidence": {
+    "log": "docs/evidence/issue18-adddevice-fix-timeout.log.gz",
+    "collector_log": "docs/evidence/issue18-adddevice-fix-timeout-qmp.log.gz",
+    "screenshot": "docs/images/issue18-adddevice-fix-timeout.png"
+  }
+}
