@@ -1,6 +1,6 @@
 use syn::{visit::Visit, Expr, Item};
 
-fn poll() -> syn::ItemFn {
+fn poll(name: &str) -> syn::ItemFn {
     let source = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../components/ntos-executive/src/driver_launch.rs"
@@ -11,7 +11,7 @@ fn poll() -> syn::ItemFn {
         .items
         .into_iter()
         .find_map(|item| match item {
-            Item::Fn(function) if function.sig.ident == "poll_hosted_completion" => Some(function),
+            Item::Fn(function) if function.sig.ident == name => Some(function),
             _ => None,
         })
         .expect("actual canonical completion poll")
@@ -105,8 +105,12 @@ fn original_caller_publication_waits_for_exact_forwarding_pin_retirement() {
         }
     }
     let mut contract = Contract::default();
-    contract.visit_item_fn(&poll());
+    contract.visit_item_fn(&poll("poll_hosted_completion_at_storage"));
     assert!(contract.gate && contract.candidate && contract.publication);
+    let mut wrapper = Names::default();
+    wrapper.visit_item_fn(&poll("poll_hosted_completion"));
+    assert!(wrapper.0.iter().any(|name| name == "poll_hosted_completion_at_storage"));
+    assert!(wrapper.0.iter().any(|name| name == "hosted_completion_storage_instance"));
 }
 
 #[test]
