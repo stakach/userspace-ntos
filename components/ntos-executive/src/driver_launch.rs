@@ -981,6 +981,7 @@ pub const FSD_SERVICE_QUERY_INFORMATION_FORWARD_LABEL: u64 = 0x7A3;
 pub const FSD_SERVICE_ZW_READ_QUERY_FILE_LABEL: u64 = 0x7A4;
 pub const FSD_SERVICE_ZW_LOAD_DRIVER_LABEL: u64 = 0x7A5;
 pub const FSD_SERVICE_LOWER_PNP_FORWARD_LABEL: u64 = 0x7A6;
+pub const FSD_SERVICE_CONNECT_FORWARD_LABEL: u64 = 0x7A7;
 const _: () = {
     let labels = [
         FSD_SERVICE_SOURCE_IRP_LABEL,
@@ -997,6 +998,7 @@ const _: () = {
         FSD_SERVICE_ZW_READ_QUERY_FILE_LABEL,
         FSD_SERVICE_ZW_LOAD_DRIVER_LABEL,
         FSD_SERVICE_LOWER_PNP_FORWARD_LABEL,
+        FSD_SERVICE_CONNECT_FORWARD_LABEL,
     ];
     let mut i = 0;
     while i < labels.len() {
@@ -8840,6 +8842,29 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
             return call_hosted_pe(handler, &[device, irp]) as u32 as i32;
         }
 
+        if major == major::IRP_MJ_INTERNAL_DEVICE_CONTROL as u64 {
+            let control = read_unaligned(next as *const nt_kernel_abi::IoStackLocation)
+                .device_io_control()
+                .io_control_code;
+            if control == nt_io_manager::retained_connect_forward::ConnectControl::Keyboard.code()
+                || control == nt_io_manager::retained_connect_forward::ConnectControl::Mouse.code()
+            {
+                let (reply_label, status, accepted, _, _) = call_on4(
+                    (FSD_SERVICE_CONNECT_FORWARD_LABEL << 12) | 4,
+                    1,
+                    device,
+                    irp,
+                    0,
+                );
+                if reply_label != 0 || accepted != 0 {
+                    crate::provider_bugcheck::report(
+                        0xc4,
+                        [FSD_SERVICE_CONNECT_FORWARD_LABEL, 1, irp, reply_label],
+                    );
+                }
+                return status as u32 as i32;
+            }
+        }
         if major != IRP_MJ_PNP {
             return nt_status::NtStatus::INVALID_DEVICE_REQUEST.raw();
         }
@@ -59350,6 +59375,65 @@ pub(crate) unsafe fn service_hosted_lower_pnp_forward(
     irp_or_minor: u64,
 ) -> Option<(i32, bool)> {
     hosted_lower_pnp_work::service(ch, reply_cap, badge, operation, address, irp_or_minor)
+}
+
+/// Authenticate and capture the class CONNECT boundary before a port-domain projection exists.
+/// The source is explicitly aborted before provider entry; the real port dispatch is enabled
+/// only when its reverse device aliases and executable class callback are retained.
+pub(crate) unsafe fn service_hosted_connect_forward(
+    ch: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    operation: u64,
+    address: u64,
+    irp: u64,
+) -> Option<(i32, bool)> {
+    let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST.raw();
+    if operation != 1 || address == 0 || irp == 0 {
+        return Some((STATUS_INVALID_PARAMETER, false));
+    }
+    let Some((_, inst)) = instance_for_pump_channel(ch, reply_cap) else {
+        return Some((invalid, false));
+    };
+    let Some(domain) = instance_domain_identity(inst) else {
+        return Some((invalid, false));
+    };
+    let Ok(Some((target, class_driver))) =
+        hosted_upper_filter_projection::entered_lower_registration(domain, address)
+    else {
+        print_str(b"[hosted-connect] lower projection not entered\n");
+        return Some((invalid, false));
+    };
+    let Ok(Some(port_registration)) = hosted_add_device_rollback::inflight_created_above_lower(
+        domain, ch, reply_cap, badge, target.device_id(), class_driver,
+    ) else {
+        print_str(b"[hosted-connect] class PortDO topology not owned\n");
+        return Some((invalid, false));
+    };
+    let mut captured = match hosted_connect_capture::capture(
+        ch, reply_cap, irp, address, port_registration.address(), class_driver,
+    ) {
+        Ok(captured) => captured,
+        Err(error) => {
+            print_str(b"[hosted-connect] source capture failed=");
+            print_hex(error as u32);
+            print_str(b"\n");
+            return Some((invalid, false));
+        }
+    };
+    if captured.payload().forward.target != target {
+        if captured.abort_unentered().is_err() {
+            core::mem::forget(captured);
+            crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_CONNECT_FORWARD_LABEL, 3, address, irp]);
+        }
+        return Some((invalid, false));
+    }
+    print_str(b"[hosted-connect] captured exact class CONNECT; reverse projection pending\n");
+    if captured.abort_unentered().is_err() {
+        core::mem::forget(captured);
+        crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_CONNECT_FORWARD_LABEL, 4, address, irp]);
+    }
+    Some((invalid, false))
 }
 
 pub(crate) unsafe fn redrive_hosted_lower_pnp_forward(handler: *mut ExecNtHandler) {

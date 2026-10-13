@@ -9,7 +9,7 @@ use nt_io_manager::{
     },
     retained_query_path_forward::SourceIrpTicket,
     source_irp_ledger::{SourceIrpAllocation, SourceIrpForwardIdentity},
-    DeviceId, HostedDomainIdentity,
+    HostedDomainIdentity,
 };
 use nt_kernel_abi::{IoStackLocation, Irp};
 
@@ -236,7 +236,8 @@ pub(super) unsafe fn capture(
     reply: u64,
     source_irp_address: u64,
     target_device_address: u64,
-    expected_class_device: DeviceId,
+    expected_stack_device: u64,
+    expected_class_driver: nt_io_manager::DriverId,
 ) -> Result<CapturedConnect, CaptureError> {
     let (instance_index, inst) =
         instance_for_pump_channel(channel, reply).ok_or(CaptureError::InvalidCaller)?;
@@ -264,7 +265,7 @@ pub(super) unsafe fn capture(
         if stack.major_function != major::IRP_MJ_INTERNAL_DEVICE_CONTROL
             || stack.minor_function != 0
             || stack.file_object.0 != 0
-            || stack.device_object.0 != target_device_address
+            || stack.device_object.0 != expected_stack_device
             || params.input_buffer_length != 16
             || params.output_buffer_length != 0
             || params.type3_input_buffer.0 == 0
@@ -312,10 +313,18 @@ pub(super) unsafe fn capture(
             class_device,
             class_service,
         });
+        let expected_class_device = class_registration.map(|registration| registration.device_id());
+        let class_owned = expected_class_device.is_some_and(|device_id| {
+            io_manager_mut().device(device_id).is_some_and(|device| {
+                device.driver_id == expected_class_driver && device.attached_to.is_none()
+            })
+        });
         if !(FSD_CODE_VA..image_end).contains(&class_service)
+            || !class_owned
+            || hosted_device_allocations::capture_allocation(inst, class_address).is_err()
             || payload.is_none_or(|payload| {
                 forward
-                    .capture_payload(io_manager_mut(), payload, expected_class_device)
+                    .capture_payload(io_manager_mut(), payload, expected_class_device.unwrap())
                     .is_err()
             })
         {

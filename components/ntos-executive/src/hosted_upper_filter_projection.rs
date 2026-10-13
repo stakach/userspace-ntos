@@ -100,6 +100,37 @@ pub(super) unsafe fn class_fdo_registration(
     Ok(registration)
 }
 
+/// Resolve the lower alias while the class AddDevice callback is active. This alias is the
+/// actual target of the forwarded CONNECT; the newly created class PortDO is above it.
+pub(super) unsafe fn entered_lower_registration(
+    domain: HostedDomainIdentity,
+    address: u64,
+) -> Result<Option<(HostedDevicePointerRegistration, DriverId)>, nt_status::NtStatus> {
+    let Some(row) = owners().iter().find(|row| {
+        row.class_domain == domain
+            && row.lower_alias.is_some_and(|alias| alias.address == address)
+    }).copied() else {
+        return Ok(None);
+    };
+    if row.phase != Phase::Entered
+        || hosted_pnp_manager_mut().devnode_identity_for_pdo(row.pdo.raw()) != Some(row.devnode)
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    let alias = row.lower_alias.ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    let registration = alias.registration.ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    let allocation = alias.allocation.ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    let inst = instance(row.class_instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    if instance_domain_identity(inst) != Some(domain)
+        || io_manager_mut().hosted_device_pointer_registration(domain, address) != Some(registration)
+        || registration.device_id() != row.lower
+        || hosted_device_allocations::capture_allocation(inst, address)? != allocation
+    {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    Ok(Some((registration, row.class_driver)))
+}
+
 fn owners() -> &'static mut Vec<Owner> {
     unsafe { &mut *core::ptr::addr_of_mut!(OWNERS) }
 }

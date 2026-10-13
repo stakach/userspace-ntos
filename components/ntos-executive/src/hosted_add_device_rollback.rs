@@ -351,6 +351,56 @@ pub(super) unsafe fn owns_created_registration(
         })
 }
 
+/// Prove that the active class AddDevice created one live PortDO FDO above the exact canonical
+/// lower device. CONNECT is forwarded to a lower alias, while the PortDO itself is a distinct
+/// class-owned object. The exact provider channel and callback phase are part of this proof.
+pub(super) unsafe fn inflight_created_above_lower(
+    domain: HostedDomainIdentity,
+    ch: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    lower: nt_io_manager::DeviceId,
+    class_driver: nt_io_manager::DriverId,
+) -> Result<Option<nt_io_manager::HostedDevicePointerRegistration>, nt_status::NtStatus> {
+    let Some((phase, dispatch_context_held)) = owners()
+        .iter()
+        .find(|row| row.domain == domain)
+        .map(|row| (row.phase, row.dispatch_context_held))
+    else {
+        return Ok(None);
+    };
+    if phase != Phase::Dispatching || !dispatch_context_held {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    admit_mutation(domain, ch, reply_cap, badge)?;
+    let row = owners()
+        .iter()
+        .find(|row| row.domain == domain)
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    if nt_io_manager::DriverId(row.driver_id) != class_driver {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    let mut match_registration = None;
+    for created in &row.created {
+        let registration = created.registration;
+        if registration.domain() != domain
+            || created.pointer_retired || created.destroyed || created.projection_retired
+            || io_manager_mut().hosted_device_pointer_registration(domain, registration.address())
+                != Some(registration)
+        {
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
+        if io_manager_mut().device(registration.device_id()).is_some_and(|canonical| {
+            canonical.driver_id == class_driver && canonical.attached_to == Some(lower)
+        }) {
+            if match_registration.replace(registration).is_some() {
+                return Err(nt_status::NtStatus::INVALID_HANDLE);
+            }
+        }
+    }
+    Ok(match_registration)
+}
+
 pub(super) unsafe fn record_retired(registration: nt_io_manager::HostedDevicePointerRegistration) {
     for row in owners() {
         if let Some(device) = row
