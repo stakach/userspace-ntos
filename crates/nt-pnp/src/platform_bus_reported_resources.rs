@@ -135,8 +135,9 @@ pub fn admit_bus_reported_platform_resources<'a>(
     }
     let raw_interrupt = raw_interrupt.ok_or(invalid)?;
     // ReactOS ACPI buspdo allocates the requirements list without clearing it and fills only
-    // the interrupt's minimum/maximum line. Normalize an impossible policy enum pair from that
-    // provider residue for selection, while preserving the accepted bytes and real policies.
+    // the interrupt's minimum/maximum line. An impossible policy enum proves its entire
+    // unwritten policy tail is pool residue, even when targeted processors is nonzero.
+    // Normalize only that copy for selection; preserve accepted bytes and real policies.
     let selector_requirements = normalized_interrupt_requirements(
         resource_requirements,
         interface_type,
@@ -202,9 +203,8 @@ fn normalized_interrupt_requirements(
                 && field_u16(bytes, descriptor + 4)? == raw_interrupt.flags
                 && field_u32(bytes, descriptor + 8)? == raw_interrupt.level
                 && field_u32(bytes, descriptor + 12)? == raw_interrupt.level
-                && field_u32(bytes, descriptor + 16)? > 5
-                && field_u32(bytes, descriptor + 20)? > 3
-                && field_u64(bytes, descriptor + 24)? == 0
+                && (field_u32(bytes, descriptor + 16)? > 5
+                    || field_u32(bytes, descriptor + 20)? > 3)
             {
                 copy.get_mut(descriptor + 16..descriptor + IO_RESOURCE_DESCRIPTOR_SIZE)
                     .ok_or(invalid)?

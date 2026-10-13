@@ -65,6 +65,24 @@ fn keyboard_keeps_exact_bus_bytes_and_requires_both_physical_ports() {
 }
 
 #[test]
+fn keyboard_accepts_live_reactos_pool_residue_without_changing_bus_bytes() {
+    let (raw, _) = keyboard_reports();
+    // Accepted PNP0303 PDO query captured during the native Q35 boot. ReactOS leaves the
+    // interrupt policy tail uninitialized; here it contains UTF-16 pool residue.
+    let requirements = hex_bytes("880000000000000000000000000000000000000000000000b025830e01000000010001000300000000010200110000000100000001000000600000000000000060000000000000000001020011000000010000000100000064000000000000006400000000000000010201000100630001000000010000002d005f0041004d004400360034005f00");
+    let root_port_control = [PlatformPortResource { start: 0, length: 0x1_0000 }];
+    let admitted = admit_bus_reported_platform_resources(
+        &raw,
+        &requirements,
+        &root_port_control,
+        irq(1, 33),
+    ).expect("accepted keyboard PDO's physical assignment is complete");
+    assert_eq!(admitted.raw_resources, raw);
+    assert_eq!(admitted.resource_requirements, requirements);
+    assert_eq!(admitted.ports.iter().map(|port| port.start).collect::<Vec<_>>(), [0x60, 0x64]);
+}
+
+#[test]
 fn mouse_accepts_an_interrupt_only_and_rejects_changed_bus_evidence() {
     let (raw, requirements) = mouse_reports();
     let admitted = admit_bus_reported_platform_resources(&raw, &requirements, &[], irq(12, 44))
