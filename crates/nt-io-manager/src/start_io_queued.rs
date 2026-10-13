@@ -34,6 +34,14 @@ impl<O> QueuedStartIo<O> {
         Ok(self.owner.take().expect("live queued owner"))
     }
 
+    /// Consume a queued owner only after the native WDM queue has unlinked this exact entry
+    /// under its lock for terminal completion. This is distinct from selecting it for StartIo;
+    /// the caller must retain the returned owner through checked source and device release.
+    pub fn unlink_terminal(mut self, unlinked: SourceIrpForwardIdentity) -> Result<O, Self> {
+        if unlinked != self.identity { return Err(self); }
+        Ok(self.owner.take().expect("linked queued owner"))
+    }
+
     /// The exact cancel routine was selected while the native cancel lock was held. The native
     /// adapter transfers that lock to the callback separately; this receipt retains the packet.
     pub fn begin_cancel(mut self, cancelled: SourceIrpForwardIdentity)

@@ -171,8 +171,11 @@ a bounded boot recorded successful bochsmp StartDevice, FindAdapter, and hosted
 video-device publication. A longer bounded guest reached real CSRSS, Winlogon,
 Services and setup.exe and created a 1024x768 display PDEV. Its same-run frame
 still shows only background and cursor; Userinit and Explorer have not run.
-Input drivers still lack `IoStartPacket`/`IoStartNextPacket`. Font cleanup and
-desktop acceptance remain unproven. Acceptance requires strict native private-font
+The native `IoStartPacket`/`IoStartNextPacket` path now builds, and a resumed boot
+loaded i8042prt successfully. Its keyboard and mouse starts are currently blocked
+before AddDevice by ACPI child resource admission, so actual input callbacks remain
+unproven. Font cleanup and desktop acceptance remain unproven. Acceptance
+requires strict native private-font
 cleanup and a separate fresh production Userinit/Explorer boot with real callbacks,
 GDI drawing, logs and screenshots. The [PCI video boot evidence](docs/evidence/issue306-pci-video-boot.json)
 records the bounded resumed diagnostic. Crate CI does not prove desktop boot. An earlier

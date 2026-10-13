@@ -142,6 +142,23 @@ impl<D, P> CurrentReceipt<D, P> {
         if self.packet.is_some() { Err(self) } else { Ok(self._device_owner) }
     }
 
+    /// Permit checked native release of an idle device projection while keeping this receipt
+    /// intact on refusal. The caller must serialize this with any new queue admission.
+    pub fn empty_owner_mut(&mut self) -> Option<&mut D> {
+        self.packet.is_none().then_some(&mut self._device_owner)
+    }
+
+    /// Withdraw a terminal current after its source pin was transferred at acknowledged
+    /// completion. This never examines the old packet allocation; native cleanup still has to
+    /// release the returned device owner through its checked ledger path.
+    pub fn into_completed_owner(self) -> Result<D, Self> {
+        if matches!(&self.packet, Some(CurrentPacket::Completed(_))) {
+            Ok(self._device_owner)
+        } else {
+            Err(self)
+        }
+    }
+
     fn validate_device(&self, device: HostedDevicePointerRegistration) -> Result<(), Error> {
         if device != self.device {
             return Err(Error::WrongDevice);

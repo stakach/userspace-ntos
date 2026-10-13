@@ -966,6 +966,10 @@ pub(super) fn service(
             let Some(ticket) = SourceIrpTicket::new(domain, component_address, bytes) else {
                 return (STATUS_INVALID_PARAMETER, 0, 0);
             };
+            // The committed StartIo path holds FIRST_PACKET_LOCK across its local WDM write
+            // and row publication, then takes the hosted pool lock. Acquire in that same order
+            // before this op7 terminal observation so neither path can see a half publication.
+            let _first_packet_guard = (op == 7).then(hosted_start_io::lock_first_packets);
             let _guard = lock();
             let member_index = if op == 9 {
                 let Ok(index) = usize::try_from(stack_count) else {
@@ -1102,6 +1106,12 @@ pub(super) fn service(
                         })
                     }
                 };
+                let Some(observed) = PendingStartIoNodeIdentity::new(
+                    row_node, row_generation, row_canonical_irp_id, raw_irp, ticket,
+                ) else { return (STATUS_INVALID_HANDLE, 0, 0); };
+                if hosted_start_io::observe_terminal_before_retirement(ledger(), observed).is_err() {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                }
                 match ledger().begin_hosted_caller_retirement(ticket, source_allocation) {
                     Ok(()) => {
                         let row = caller_projections().iter_mut()
@@ -1251,6 +1261,131 @@ pub(super) fn admit_projected_start_io_packet(
         dispatch_device,
     )
     .map_err(|_| STATUS_INVALID_HANDLE)
+}
+
+/// Reconstruct the component's packet observation from the root-issued op6 row. The caller's
+/// node address is only a selector; its ticket, generation and canonical ID come from this row
+/// and are revalidated by `admit_projected_start_io_packet` before any queue effect.
+pub(super) fn observed_projected_start_io_packet(
+    instance_index: usize,
+    node: u64,
+    raw_irp: u64,
+) -> Option<PendingStartIoNodeIdentity> {
+    let _guard = lock();
+    let row = caller_projections().iter().find(|row| {
+        row.node == node
+            && row.allocation.component_address == raw_irp
+            && row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index)
+            && !row.terminal_started
+    })?;
+    let (generation, entry) = unsafe {
+        projected_node(
+            instance_index,
+            row.node,
+            row.canonical_irp_id,
+            raw_irp,
+            HOSTED_IRP_DISPATCHING,
+            Some(row.node_generation),
+        )
+    }?;
+    if entry.source_ticket_id != row.ticket.id.get()
+        || entry.source_ticket_generation != row.ticket.generation.get()
+    {
+        return None;
+    }
+    PendingStartIoNodeIdentity::new(
+        node,
+        generation,
+        row.canonical_irp_id,
+        raw_irp,
+        row.ticket,
+    )
+}
+
+/// Final physical node check for the StartIo queue commit. The caller already owns the exact
+/// source pin and hosted pool guard; no source-ledger lock may be taken in this order.
+pub(super) unsafe fn projected_start_io_node_matches_locked(
+    instance_index: usize,
+    observed: PendingStartIoNodeIdentity,
+    terminal_ready: bool,
+) -> bool {
+    let kinds: &[u64] = if terminal_ready {
+        &[HOSTED_IRP_READY, HOSTED_IRP_PUBLISHED]
+    } else {
+        &[HOSTED_IRP_DISPATCHING]
+    };
+    kinds.iter().any(|&kind| projected_node(
+        instance_index, observed.node, observed.canonical_irp_id, observed.raw_irp,
+        kind, Some(observed.generation),
+    ).is_some_and(|(_, entry)| {
+        entry.source_ticket_id == observed.source.id.get()
+            && entry.source_ticket_generation == observed.source.generation.get()
+            && (!terminal_ready || entry.completion.completed().is_some())
+    }))
+}
+
+/// A linked packet may be selected only while its exact caller node is still dispatching or
+/// pending. READY/COMPLETED means another path ended this source before WDM dequeue.
+pub(super) unsafe fn projected_start_io_queued_node_matches_locked(
+    instance_index: usize,
+    observed: PendingStartIoNodeIdentity,
+) -> bool {
+    [HOSTED_IRP_DISPATCHING, HOSTED_IRP_PENDING].iter().any(|&kind| {
+        projected_node(instance_index, observed.node, observed.canonical_irp_id,
+            observed.raw_irp, kind, Some(observed.generation))
+            .is_some_and(|(_, entry)| {
+                entry.source_ticket_id == observed.source.id.get()
+                    && entry.source_ticket_generation == observed.source.generation.get()
+                    && entry.completion.completed().is_none()
+            })
+    })
+}
+
+/// A current packet may be withdrawn by Next before terminal completion. Its retained source
+/// pin keeps the physical allocation alive; the exact pending generation is still checked under
+/// the caller's FIRST→source→pool lock chain.
+pub(super) unsafe fn projected_start_io_live_node_matches_locked(
+    instance_index: usize,
+    observed: PendingStartIoNodeIdentity,
+) -> bool {
+    [HOSTED_IRP_DISPATCHING, HOSTED_IRP_PENDING].iter().any(|&kind| {
+        projected_node(instance_index, observed.node, observed.canonical_irp_id,
+            observed.raw_irp, kind, Some(observed.generation))
+            .is_some_and(|(_, entry)| {
+                entry.source_ticket_id == observed.source.id.get()
+                    && entry.source_ticket_generation == observed.source.generation.get()
+                    && entry.completion.completed().is_none()
+            })
+    })
+}
+
+pub(super) unsafe fn projected_start_io_copying_node_matches_locked(
+    instance_index: usize,
+    observed: PendingStartIoNodeIdentity,
+) -> bool {
+    projected_node(instance_index, observed.node, observed.canonical_irp_id,
+        observed.raw_irp, HOSTED_IRP_COPYING, Some(observed.generation))
+        .is_some_and(|(_, entry)| {
+            entry.source_ticket_id == observed.source.id.get()
+                && entry.source_ticket_generation == observed.source.generation.get()
+                && entry.completion.completed().is_some()
+        })
+}
+
+pub(super) fn projected_start_io_terminal_ready(
+    instance_index: usize,
+    observed: PendingStartIoNodeIdentity,
+) -> bool {
+    let _guard = lock();
+    caller_projections().iter().any(|row| {
+        row.node == observed.node
+            && row.node_generation == observed.generation
+            && row.canonical_irp_id == observed.canonical_irp_id
+            && row.ticket == observed.source
+            && row.allocation.component_address == observed.raw_irp
+            && row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index)
+            && !row.terminal_started
+    }) && unsafe { projected_start_io_node_matches_locked(instance_index, observed, true) }
 }
 
 /// Checked no-effect release. A failed device release leaves the source pin held; callers retain
@@ -1414,6 +1549,9 @@ pub(super) fn caller_completion_publishable(
     instance_index: usize, node: u64, node_generation: u64, canonical_irp_id: u64,
     raw_irp: u64, ticket_id: u64, ticket_generation: u64,
 ) -> bool {
+    // First packet publication and callback-return ACK use FIRST before the source and pool
+    // locks. A READY claim remains component-owned while this exact terminal observation runs.
+    let _first_packet_guard = hosted_start_io::lock_first_packets();
     let _guard = lock();
     let Some(inst) = instance(instance_index) else { return false; };
     let Some(domain) = instance_domain_identity(inst) else { return false; };
@@ -1430,6 +1568,34 @@ pub(super) fn caller_completion_publishable(
             && row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index))
         .map(|row| row.allocation)
     else { return false; };
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
+        return false;
+    };
+    let valid_ready = unsafe {
+        projected_node(instance_index, node, canonical_irp_id, raw_irp,
+            HOSTED_IRP_COPYING, Some(node_generation))
+    }.is_some_and(|(_, entry)| {
+        entry.source_ticket_id == ticket_id
+            && entry.source_ticket_generation == ticket_generation
+            && entry.completion.completed().is_some()
+    });
+    if !valid_ready || !unsafe { caller_terminal_ready_unlocked(ticket, row_allocation) } {
+        return false;
+    }
+    let Some(observed) = PendingStartIoNodeIdentity::new(
+        node, node_generation, canonical_irp_id, raw_irp, ticket,
+    ) else { return false; };
+    // An active DriverStartIo callback retains its only physical source guard. The exact
+    // completion remains READY and the next poll retries after callback-return ACK.
+    let queued = match hosted_start_io::settle_queued_terminal_locked(
+        ledger(), instance_index, inst, observed,
+    ) {
+        Ok(queued) => queued,
+        Err(_) => return false,
+    };
+    if !queued && hosted_start_io::observe_terminal_before_retirement(ledger(), observed).is_err() {
+        return false;
+    }
     ledger().retirement_ready(ticket, row_allocation).is_ok()
 }
 

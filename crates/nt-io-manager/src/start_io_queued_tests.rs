@@ -34,6 +34,19 @@ fn selected_packet_transfers_only_its_exact_queued_owner() {
 }
 
 #[test]
+fn checked_terminal_unlink_has_a_distinct_one_use_owner_transfer() {
+    let drops = Rc::new(Cell::new(0));
+    let packet = identity(1, 1, 0x1000);
+    let reused = identity(2, 2, 0x1000);
+    let queued = QueuedStartIo::new(packet, Owner(drops.clone()));
+    let queued = queued.unlink_terminal(reused).err()
+        .expect("reused numeric IRP cannot take a queued terminal owner");
+    assert_eq!(drops.get(), 0);
+    drop(queued.unlink_terminal(packet).ok().unwrap());
+    assert_eq!(drops.get(), 1);
+}
+
+#[test]
 fn reused_address_and_ticket_cannot_complete_old_queued_cancel() {
     let drops = Rc::new(Cell::new(0));
     let first = identity(1, 1, 0x1000);

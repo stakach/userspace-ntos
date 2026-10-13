@@ -116,6 +116,8 @@ mod hosted_file_retirements;
 mod hosted_source_irp_ledger;
 #[path = "hosted_start_io.rs"]
 mod hosted_start_io;
+#[path = "hosted_kd_debug.rs"]
+mod hosted_kd_debug;
 #[path = "hosted_synchronous_fsd_request.rs"]
 mod hosted_synchronous_fsd_request;
 #[path = "hosted_source_create_security.rs"]
@@ -1085,6 +1087,10 @@ const HOSTED_IRP_COPYING: u64 = 16;
 const HOSTED_IRP_COMPLETING_DEFERRED: u64 = 17;
 /// A completion routine stopped an unwind while the originating dispatch is still on-stack.
 const HOSTED_IRP_STOPPED_DISPATCH: u64 = 18;
+/// Queue selection owns this exact pending generation until the selected callback transaction is
+/// durably published. Completion and cancellation retry the same node instead of treating it as
+/// a second completion or an unowned IRP.
+const HOSTED_IRP_START_IO_SELECTING: u64 = 19;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1896,6 +1902,16 @@ unsafe fn claim_pending_irp_completion(irp: u64) -> Option<PendingIrpCompletionC
         }
         let state = pending_irp_owner_state(node).load(Ordering::Acquire);
         let kind = hosted_irp_state_kind(state);
+        if kind == HOSTED_IRP_START_IO_SELECTING
+            && pending_irp_raw_irp(node).load(Ordering::Relaxed) == irp
+        {
+            crate::yield_now();
+            // The node generation and identity are checked afresh after the selection owner
+            // publishes PENDING. Never classify this exact live owner as a duplicate completion.
+            node = (&*pending_irp_head(FSD_DATA_VADDR).cast::<AtomicU64>()).load(Ordering::Acquire);
+            steps = 0;
+            continue;
+        }
         if let Some(owner_claim) =
             completion_owner_phase(kind).and_then(nt_io_manager::CompletionOwnerClaim::begin)
         {
@@ -2223,6 +2239,14 @@ unsafe fn claim_pending_irp_cancel_target(canonical_irp_id: u64) -> Option<Pendi
             return None;
         }
         let state = pending_irp_owner_state(node).load(Ordering::Acquire);
+        if hosted_irp_state_kind(state) == HOSTED_IRP_START_IO_SELECTING
+            && pending_irp_canonical_id(node).load(Ordering::Relaxed) == canonical_irp_id
+        {
+            crate::yield_now();
+            node = (&*pending_irp_head(FSD_DATA_VADDR).cast::<AtomicU64>()).load(Ordering::Acquire);
+            steps = 0;
+            continue;
+        }
         if hosted_irp_state_kind(state) == HOSTED_IRP_PENDING
             && pending_irp_canonical_id(node).load(Ordering::Relaxed) == canonical_irp_id
         {
@@ -2487,9 +2511,11 @@ unsafe fn poll_hosted_completion_at_storage(
             let canonical_irp_id = pending_irp_canonical_id(node_exec).load(Ordering::Relaxed);
             let entry = read_volatile(pending_irp_entry_address(node_exec) as *const PendingIrp);
             let completion = entry.completion.completed();
-            pending_irp_owner_state(node_exec).store(ready_state, Ordering::Release);
-            if canonical_irp_id != 0 && entry.owner_domain == owner_domain {
-                if !hosted_source_irp_ledger::caller_completion_publishable(
+            // Keep the generation-bearing READY claim while root checks callback lifetime and
+            // transfers any exact StartIo source pin. A second poll cannot publish this node
+            // before that checked transfer is resolved.
+            let publishable = canonical_irp_id != 0 && entry.owner_domain == owner_domain
+                && hosted_source_irp_ledger::caller_completion_publishable(
                     storage_instance,
                     node,
                     ready_state & !HOSTED_IRP_STATE_MASK,
@@ -2497,11 +2523,9 @@ unsafe fn poll_hosted_completion_at_storage(
                     entry.irp,
                     entry.source_ticket_id,
                     entry.source_ticket_generation,
-                ) {
-                    node = next;
-                    steps += 1;
-                    continue;
-                }
+                );
+            pending_irp_owner_state(node_exec).store(ready_state, Ordering::Release);
+            if publishable {
                 if let Some(completion) = completion {
                     if best
                         .as_ref()
@@ -5404,6 +5428,10 @@ const HOSTED_DEVICE_OP_REGISTER_FILE_SYSTEM: u64 = 19;
 const HOSTED_DEVICE_OP_UNREGISTER_FILE_SYSTEM: u64 = 20;
 const HOSTED_DEVICE_OP_REPORT_POWER_STATE: u64 = 21;
 const HOSTED_DEVICE_OP_SET_START_IO_ATTRIBUTES: u64 = 22;
+const HOSTED_DEVICE_OP_START_PACKET: u64 = 23;
+const HOSTED_DEVICE_OP_START_PACKET_CALLBACK_RETURNED: u64 = 24;
+const HOSTED_DEVICE_OP_START_NEXT_PACKET: u64 = 25;
+const HOSTED_DEVICE_OP_START_NEXT_PACKET_CALLBACK_RETURNED: u64 = 26;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN: u64 = 0;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF: u64 = 2;
 const HOSTED_DEVICE_ARG_DATA_OFF: u64 = FSD_ARG_BYTES;
@@ -32509,6 +32537,10 @@ fn register_fsd_trampolines() -> bool {
         "DbgBreakPointWithStatus",
         crate::debug_traps::DbgBreakPointWithStatus as *const () as usize as u64,
     );
+    reg.bind(
+        "KdSystemDebugControl",
+        hosted_kd_debug::s_kd_system_debug_control as *const () as usize as u64,
+    );
     // pool (ExAllocatePool* → the FSD arena)
     reg.bind(
         "ExAllocatePoolWithTag",
@@ -32730,6 +32762,14 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "IoSetStartIoAttributes",
         hosted_start_io::s_io_set_start_io_attributes as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoStartPacket",
+        hosted_start_io::s_io_start_packet as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoStartNextPacket",
+        hosted_start_io::s_io_start_next_packet as *const () as usize as u64,
     );
     reg.bind(
         "IoCsqInitialize",
@@ -43555,6 +43595,7 @@ unsafe fn drain_hosted_filter_requirements_transactions() -> usize {
 pub(crate) fn pump_hosted_io_completions() -> usize {
     let pumped = pump_io_manager();
     pumped
+        .saturating_add(hosted_start_io::drain_cleanup())
         .saturating_add(hosted_file_owners::drain())
         .saturating_add(hosted_file_lifecycle_owners::retire())
         .saturating_add(unsafe { drain_hosted_acpi_pci_route_indeterminate_irps() })
@@ -52969,6 +53010,10 @@ pub(crate) fn service_hosted_device(
             | HOSTED_DEVICE_OP_UNREGISTER_FILE_SYSTEM
             | HOSTED_DEVICE_OP_REPORT_POWER_STATE
             | HOSTED_DEVICE_OP_SET_START_IO_ATTRIBUTES
+            | HOSTED_DEVICE_OP_START_PACKET
+            | HOSTED_DEVICE_OP_START_PACKET_CALLBACK_RETURNED
+            | HOSTED_DEVICE_OP_START_NEXT_PACKET
+            | HOSTED_DEVICE_OP_START_NEXT_PACKET_CALLBACK_RETURNED
     ) {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
     }
@@ -53008,6 +53053,24 @@ pub(crate) fn service_hosted_device(
     }
     if op == HOSTED_DEVICE_OP_SET_START_IO_ATTRIBUTES {
         return hosted_start_io::service_set_attributes(ch, pdo_object, arg2, arg3, active_reply_cap);
+    }
+    if op == HOSTED_DEVICE_OP_START_PACKET {
+        return hosted_start_io::service_start_packet(ch, pdo_object, arg2, arg3, active_reply_cap);
+    }
+    if op == HOSTED_DEVICE_OP_START_PACKET_CALLBACK_RETURNED {
+        return hosted_start_io::service_start_packet_callback_returned(
+            ch, pdo_object, arg2, arg3, active_reply_cap,
+        );
+    }
+    if op == HOSTED_DEVICE_OP_START_NEXT_PACKET {
+        return hosted_start_io::service_start_next_packet(
+            ch, pdo_object, arg2, arg3, active_reply_cap,
+        );
+    }
+    if op == HOSTED_DEVICE_OP_START_NEXT_PACKET_CALLBACK_RETURNED {
+        return hosted_start_io::service_start_next_packet_callback_returned(
+            ch, pdo_object, arg2, arg3, active_reply_cap,
+        );
     }
     if op == HOSTED_DEVICE_OP_REGISTER_FILE_SYSTEM
         || op == HOSTED_DEVICE_OP_UNREGISTER_FILE_SYSTEM

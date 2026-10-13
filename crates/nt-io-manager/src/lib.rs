@@ -33,6 +33,7 @@ pub mod start_io;
 pub mod start_io_current;
 pub mod start_io_native_owner;
 pub mod start_io_queued;
+pub mod start_io_selection;
 pub mod start_io_native_transaction;
 pub mod device_power;
 mod device_file_name;
