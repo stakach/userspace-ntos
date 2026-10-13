@@ -21,6 +21,7 @@ mod relation_owners;
 mod retained_lower_pnp_forward;
 pub mod returned_pnp_buffer;
 mod target_device_relation;
+mod upper_filter_attachment;
 
 pub use accepted_pdo_pnp::*;
 pub use accepted_pdo_provider::*;
@@ -31,6 +32,7 @@ pub use filter_resource_requirements::*;
 pub use relation_owners::*;
 pub use retained_lower_pnp_forward::*;
 pub use target_device_relation::*;
+pub use upper_filter_attachment::*;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
