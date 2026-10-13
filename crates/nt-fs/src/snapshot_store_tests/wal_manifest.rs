@@ -149,6 +149,52 @@ fn v2_manifest_survives_both_snapshot_slots() {
 }
 
 #[test]
+fn v2_checkpoint_cannot_regress_an_applied_wal_base() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::new();
+    let mut manifest = WalSnapshotManifest {
+        incarnation: 77,
+        base_serial: 0,
+        high_water_serial: 1,
+        high_water_end_lba: 3,
+    };
+    store
+        .commit_next_with_wal_manifest(&mut disk, b"before", manifest)
+        .unwrap();
+    manifest.base_serial = 1;
+    store
+        .commit_next_with_wal_manifest(&mut disk, b"applied", manifest)
+        .unwrap();
+    disk.events.clear();
+
+    manifest.base_serial = 0;
+    assert_eq!(
+        store.commit_next_with_wal_manifest(&mut disk, b"regressed", manifest),
+        Err(SnapshotBlockStoreError::Corrupt)
+    );
+    assert!(!disk.events.iter().any(|event| matches!(event, Event::Write(_))));
+    assert_eq!(
+        store.read_latest_wal(&mut disk).unwrap().unwrap().snapshot.payload,
+        b"applied"
+    );
+}
+
+#[test]
+fn recovered_newer_snapshot_cannot_require_a_reclaimed_wal_prefix() {
+    let older = WalSnapshotManifest {
+        incarnation: 77,
+        base_serial: 1,
+        high_water_serial: 1,
+        high_water_end_lba: 3,
+    };
+    let newer = WalSnapshotManifest { base_serial: 0, ..older };
+    assert_eq!(
+        wal_recovery_floor(newer, Some(older)),
+        Err(SnapshotBlockStoreError::Corrupt)
+    );
+}
+
+#[test]
 fn anchor_advances_only_after_two_header_barriers() {
     let (store, disk) = two_v2_slots();
     let next = WalSnapshotAnchor {

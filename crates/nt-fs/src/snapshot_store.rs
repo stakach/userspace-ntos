@@ -198,7 +198,8 @@ fn wal_recovery_floor(
     let mut anchor = selected.anchor();
     if let Some(other) = other {
         let candidate = other.anchor();
-        if candidate.incarnation != anchor.incarnation
+        if selected.base_serial < other.base_serial
+            || candidate.incarnation != anchor.incarnation
             || (candidate.serial == anchor.serial && candidate.end_lba != anchor.end_lba)
             || (candidate.serial > anchor.serial && candidate.end_lba < anchor.end_lba)
             || (candidate.serial < anchor.serial && candidate.end_lba > anchor.end_lba)
@@ -633,7 +634,12 @@ impl SnapshotBlockStore {
             for slot in 0..2 {
                 let plan = self.read_valid_slot_plan(dev, slot)?;
                 if let Some(previous) = plan.and_then(|plan| plan.wal) {
-                    if current.anchor() != previous.anchor() {
+                    // A newer checkpoint may fold more of the WAL into its payload, but
+                    // must never make recovery depend on records an earlier checkpoint
+                    // had already applied and may have reclaimed.
+                    if current.anchor() != previous.anchor()
+                        || current.base_serial < previous.base_serial
+                    {
                         return Err(SnapshotBlockStoreError::Corrupt);
                     }
                 }
