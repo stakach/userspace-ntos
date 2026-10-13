@@ -6,6 +6,7 @@ use nt_cm_resources::{
     CM_RESOURCE_PORT_16_BIT_DECODE, CM_RESOURCE_PORT_POSITIVE_DECODE,
     CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE, CM_RESOURCE_SHARE_DRIVER_EXCLUSIVE,
     CM_RESOURCE_SHARE_SHARED, CM_RESOURCE_TYPE_INTERRUPT, CM_RESOURCE_TYPE_PORT,
+    INTERFACE_TYPE_INTERNAL,
     IO_RESOURCE_DESCRIPTOR_SIZE, IO_RESOURCE_LIST_HEADER_SIZE,
     IO_RESOURCE_REQUIREMENTS_FIXED_SIZE, PARTIAL_DESCRIPTOR_SIZE,
 };
@@ -136,8 +137,13 @@ pub fn admit_bus_reported_platform_resources<'a>(
     // ReactOS ACPI buspdo allocates the requirements list without clearing it and fills only
     // the interrupt's minimum/maximum line. Normalize an impossible policy enum pair from that
     // provider residue for selection, while preserving the accepted bytes and real policies.
-    let selector_requirements = normalized_interrupt_requirements(resource_requirements)?;
-    let selected = nt_cm_resources::select_io_resource_assignment(
+    let selector_requirements = normalized_interrupt_requirements(
+        resource_requirements,
+        interface_type,
+        bus_number,
+        raw_interrupt,
+    )?;
+    let selected = nt_cm_resources::select_complete_io_resource_assignment(
         &selector_requirements,
         interface_type,
         bus_number,
@@ -167,6 +173,9 @@ pub fn admit_bus_reported_platform_resources<'a>(
 
 fn normalized_interrupt_requirements(
     bytes: &[u8],
+    interface_type: i32,
+    bus_number: u32,
+    raw_interrupt: InterruptDescriptor,
 ) -> Result<Vec<u8>, BusReportedPlatformResourceError> {
     let invalid = BusReportedPlatformResourceError::Invalid;
     if nt_cm_resources::validate_io_resource_requirements_list_extent(bytes)
@@ -186,7 +195,13 @@ fn normalized_interrupt_requirements(
             let descriptor = descriptors
                 .checked_add(index.checked_mul(IO_RESOURCE_DESCRIPTOR_SIZE).ok_or(invalid)?)
                 .ok_or(invalid)?;
-            if bytes.get(descriptor + 1).copied() == Some(CM_RESOURCE_TYPE_INTERRUPT)
+            if interface_type == INTERFACE_TYPE_INTERNAL
+                && bus_number == 0
+                && bytes.get(descriptor + 1).copied() == Some(CM_RESOURCE_TYPE_INTERRUPT)
+                && bytes.get(descriptor + 2).copied() == Some(raw_interrupt.share)
+                && field_u16(bytes, descriptor + 4)? == raw_interrupt.flags
+                && field_u32(bytes, descriptor + 8)? == raw_interrupt.level
+                && field_u32(bytes, descriptor + 12)? == raw_interrupt.level
                 && field_u32(bytes, descriptor + 16)? > 5
                 && field_u32(bytes, descriptor + 20)? > 3
                 && field_u64(bytes, descriptor + 24)? == 0
@@ -201,6 +216,11 @@ fn normalized_interrupt_requirements(
             .ok_or(invalid)?;
     }
     Ok(copy)
+}
+
+fn field_u16(bytes: &[u8], offset: usize) -> Result<u16, BusReportedPlatformResourceError> {
+    let field = bytes.get(offset..offset + 2).ok_or(BusReportedPlatformResourceError::Invalid)?;
+    Ok(u16::from_le_bytes(field.try_into().expect("two-byte field")))
 }
 
 fn field_u32(bytes: &[u8], offset: usize) -> Result<u32, BusReportedPlatformResourceError> {

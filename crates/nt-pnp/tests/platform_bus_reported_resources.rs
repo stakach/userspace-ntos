@@ -1,6 +1,10 @@
 use nt_pnp::{
     admit_bus_reported_platform_resources, PlatformInterruptResource, PlatformPortResource,
 };
+use nt_cm_resources::{
+    build_io_resource_requirements_lists, io_resource_requirements_lists_size,
+    IoAddressRequirement, IoInterruptRequirement, IoResourceAlternative, IoResourceRequirement,
+};
 
 fn hex_bytes(hex: &str) -> Vec<u8> {
     hex.as_bytes()
@@ -76,5 +80,45 @@ fn mouse_accepts_an_interrupt_only_and_rejects_changed_bus_evidence() {
     let mut unsupported_policy = requirements.clone();
     unsupported_policy[56..64].copy_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
     assert!(admit_bus_reported_platform_resources(&raw, &unsupported_policy, &[], irq(12, 44)).is_err());
+    let mut non_acpi_raw = raw.clone();
+    let mut non_acpi_requirements = requirements.clone();
+    non_acpi_raw[4] = 5;
+    non_acpi_requirements[4] = 5;
+    assert!(admit_bus_reported_platform_resources(&non_acpi_raw, &non_acpi_requirements, &[], irq(12, 44)).is_err());
     assert!(admit_bus_reported_platform_resources(&raw[..raw.len() - 1], &requirements, &[], irq(12, 44)).is_err());
+}
+
+#[test]
+fn a_later_complete_requirement_alternative_is_not_hidden_by_irq_only_choice() {
+    let (raw, _) = keyboard_reports();
+    let interrupt = IoResourceRequirement::Interrupt(IoInterruptRequirement {
+        option: 0,
+        share: 1,
+        flags: 1,
+        minimum_vector: 1,
+        maximum_vector: 1,
+        affinity_policy: 0,
+        priority_policy: 0,
+        targeted_processors: 0,
+    });
+    let port = |start| IoResourceRequirement::Port(IoAddressRequirement {
+        option: 0,
+        share: 2,
+        flags: 17,
+        length: 1,
+        alignment: 1,
+        minimum: start,
+        maximum: start,
+    });
+    let irq_only = [interrupt];
+    let complete = [port(0x60), port(0x64), interrupt];
+    let alternatives = [
+        IoResourceAlternative { descriptors: &irq_only },
+        IoResourceAlternative { descriptors: &complete },
+    ];
+    let mut requirements = vec![0; io_resource_requirements_lists_size(&alternatives).unwrap()];
+    build_io_resource_requirements_lists(&mut requirements, 0, 0, 0, &alternatives).unwrap();
+
+    let root_port_control = [PlatformPortResource { start: 0, length: 0x1_0000 }];
+    assert!(admit_bus_reported_platform_resources(&raw, &requirements, &root_port_control, irq(1, 33)).is_ok());
 }
