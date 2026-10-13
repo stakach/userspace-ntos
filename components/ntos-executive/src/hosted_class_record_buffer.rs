@@ -22,14 +22,14 @@ pub(super) struct ClassRecordBuffer {
 }
 
 impl ClassRecordBuffer {
-    /// Allocate the full 24 KiB contract before admitting an IRQ callback. The component never
+    /// Allocate the full 24 KiB record contract plus a four byte result before an IRQ callback. The component never
     /// allocates on the callback path; root reserves pool storage while the class instance is
     /// live, then immediately publishes a free-interlocked generation-bound pin.
     pub(super) unsafe fn preallocate(instance_index: usize) -> Result<Self, nt_status::NtStatus> {
         let inst = instance(instance_index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
         let domain =
             instance_domain_identity(inst).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-        let capacity = hosted_class_callback_lane::MAX_RECORD_BYTES as u64;
+        let capacity = hosted_class_callback_lane::MAX_RECORD_BYTES as u64 + 4;
         let address = hosted_instance_pool_alloc(inst, capacity)
             .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
         let pin = match hosted_device_allocations::pin_temporary_pool_range(inst, address, capacity)
@@ -115,6 +115,48 @@ impl ClassRecordBuffer {
         }
         self.length = bytes.len();
         Ok((start, end))
+    }
+
+    /// The callback's consumed count lives after the maximum record batch, so it cannot
+    /// overlap records even when the batch occupies the full 24 KiB.
+    pub(super) fn consumed_pointer(&self) -> Result<u64, nt_status::NtStatus> {
+        if !self.occupied || self.retired || self.uncertain || !self.generation_live() {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+        self.pin
+            .allocation()
+            .component_address
+            .checked_add(hosted_class_callback_lane::MAX_RECORD_BYTES as u64)
+            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)
+    }
+
+    pub(super) unsafe fn zero_consumed(&mut self) -> Result<u64, nt_status::NtStatus> {
+        let pointer = self.consumed_pointer()?;
+        if let Err(status) = hosted_device_allocations::write_temporary_pool_pin(
+            &self.pin,
+            hosted_class_callback_lane::MAX_RECORD_BYTES as u64,
+            &0u32.to_le_bytes(),
+        ) {
+            if hosted_device_allocations::temporary_pool_pin_uncertain(&self.pin) {
+                self.retain_uncertain();
+            }
+            return Err(status);
+        }
+        Ok(pointer)
+    }
+
+    pub(super) unsafe fn read_consumed(&mut self) -> Result<u32, nt_status::NtStatus> {
+        self.consumed_pointer()?;
+        let mut bytes = [0u8; 4];
+        if let Err(status) = hosted_device_allocations::copy_temporary_pool_pin(
+            &self.pin,
+            hosted_class_callback_lane::MAX_RECORD_BYTES as u64,
+            &mut bytes,
+        ) {
+            self.retain_uncertain();
+            return Err(status);
+        }
+        Ok(u32::from_le_bytes(bytes))
     }
 
     /// Invoke only after the class callback's output copyback, source continuation, and Reply
