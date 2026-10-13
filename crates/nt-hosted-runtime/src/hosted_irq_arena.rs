@@ -118,6 +118,7 @@ pub enum HostedIrqDispatchKind {
     InterruptService = 1,
     DeferredProcedure = 2,
     ProviderCallback = 3,
+    ClassServiceCallback = 4,
 }
 
 impl HostedIrqDispatchKind {
@@ -126,6 +127,7 @@ impl HostedIrqDispatchKind {
             1 => Some(Self::InterruptService),
             2 => Some(Self::DeferredProcedure),
             3 => Some(Self::ProviderCallback),
+            4 => Some(Self::ClassServiceCallback),
             _ => None,
         }
     }
@@ -141,6 +143,9 @@ pub enum HostedIrqServiceKind {
     ReleaseActualLock = 5,
     Mdl = 6,
     PoolRetirement = 7,
+    /// Port DPC calls the generation-bound class service thunk. Root must capture both the
+    /// input records and consumed-count output before scheduling class-domain execution.
+    ClassServiceRequest = 8,
 }
 
 impl HostedIrqServiceKind {
@@ -153,12 +158,13 @@ impl HostedIrqServiceKind {
             5 => Some(Self::ReleaseActualLock),
             6 => Some(Self::Mdl),
             7 => Some(Self::PoolRetirement),
+            8 => Some(Self::ClassServiceRequest),
             _ => None,
         }
     }
 
     pub const fn may_request_nested_dispatch(self) -> bool {
-        matches!(self, Self::ProviderCallbackRequest)
+        matches!(self, Self::ProviderCallbackRequest | Self::ClassServiceRequest)
     }
 }
 
@@ -414,14 +420,15 @@ impl HostedIrqDispatchCommand {
         match self.kind {
             HostedIrqDispatchKind::InterruptService => HostedIrqTransactionClass::Interrupt,
             HostedIrqDispatchKind::DeferredProcedure => HostedIrqTransactionClass::Dpc,
-            HostedIrqDispatchKind::ProviderCallback => HostedIrqTransactionClass::Callback,
+            HostedIrqDispatchKind::ProviderCallback | HostedIrqDispatchKind::ClassServiceCallback => HostedIrqTransactionClass::Callback,
         }
     }
 
     pub const fn execution_irql(self) -> u8 {
         match self.kind {
             HostedIrqDispatchKind::InterruptService => self.synchronize_irql,
-            HostedIrqDispatchKind::DeferredProcedure | HostedIrqDispatchKind::ProviderCallback => {
+            HostedIrqDispatchKind::DeferredProcedure | HostedIrqDispatchKind::ProviderCallback
+                | HostedIrqDispatchKind::ClassServiceCallback => {
                 self.entry_irql
             }
         }
@@ -442,6 +449,13 @@ impl HostedIrqDispatchCommand {
                 self.entry_irql == 2 && self.synchronize_irql == 2
             }
             HostedIrqDispatchKind::ProviderCallback => self.synchronize_irql == self.entry_irql,
+            HostedIrqDispatchKind::ClassServiceCallback => {
+                self.entry_irql == 2 && self.synchronize_irql == 2
+                    && self.argument_count == 4
+                    && self.arguments[0] != 0 && self.arguments[1] != 0
+                    && self.arguments[2] > self.arguments[1] && self.arguments[3] != 0
+                    && self.arguments[4..].iter().all(|argument| *argument == 0)
+            }
         }
     }
 }
@@ -493,6 +507,13 @@ impl HostedIrqServiceCommand {
                 | HostedIrqServiceKind::ProviderCallbackRequest => {
                     self.authority_cookie != 0
                         && self.argument_count as usize == HOSTED_IRQ_ARENA_ARGUMENT_CAP
+                }
+                HostedIrqServiceKind::ClassServiceRequest => {
+                    self.authority_cookie != 0
+                        && self.argument_count == 4
+                        && self.arguments[..4].iter().all(|argument| *argument != 0)
+                        && self.arguments[2] > self.arguments[1]
+                        && self.arguments[4..].iter().all(|argument| *argument == 0)
                 }
             }
     }
@@ -1743,6 +1764,8 @@ impl HostedIrqSlotPage {
                         || class == HostedIrqTransactionClass::Interrupt)
                     && (kind != HostedIrqDispatchKind::DeferredProcedure
                         || (class == HostedIrqTransactionClass::Dpc && token.depth == 0))
+                    && (kind != HostedIrqDispatchKind::ClassServiceCallback
+                        || class == HostedIrqTransactionClass::Callback)
             }
             HostedIrqLaneDirection::Service => {
                 if wire.argument_count > HOSTED_IRQ_ARENA_ARGUMENT_CAP as u32 {
@@ -1969,6 +1992,8 @@ impl HostedIrqDispatchPage {
                 && transaction.class != HostedIrqTransactionClass::Interrupt)
             || (command.kind == HostedIrqDispatchKind::DeferredProcedure
                 && (transaction.class != HostedIrqTransactionClass::Dpc || depth != 0))
+            || (command.kind == HostedIrqDispatchKind::ClassServiceCallback
+                && transaction.class != HostedIrqTransactionClass::Callback)
         {
             return Err(HostedIrqArenaError::InvalidCommand);
         }
@@ -2150,6 +2175,47 @@ impl HostedIrqServicePage {
         }
     }
 
+    /// Read back the exact service that `root_begin` marked running. A native memory lease may
+    /// use this without consuming or completing the token. A stale sequence, grant, or reused
+    /// depth never authorizes access to the parked worker's stack.
+    pub fn root_running_command(
+        &self,
+        control: &HostedIrqArenaControl,
+        identity: HostedIrqLaneIdentity,
+        token: HostedIrqArenaToken,
+    ) -> Result<HostedIrqServiceCommand, HostedIrqArenaError> {
+        self.0.check(control, identity, HostedIrqLaneDirection::Service)?;
+        control.token_is_active(identity, token)?;
+        self.0.validate_token(identity, token, HostedIrqLaneDirection::Service)?;
+        if self.0.state.load(Ordering::Acquire) != SLOT_RUNNING {
+            return Err(HostedIrqArenaError::NotRunning);
+        }
+        let command = HostedIrqServiceCommand {
+            kind: HostedIrqServiceKind::from_raw(self.0.kind.load(Ordering::Relaxed))
+                .ok_or(HostedIrqArenaError::InvalidCommand)?,
+            service_id: self.0.operation.load(Ordering::Relaxed),
+            target_domain_id: self.0.target0.load(Ordering::Relaxed),
+            target_domain_cookie: self.0.target1.load(Ordering::Relaxed),
+            authority_cookie: self.0.context.load(Ordering::Relaxed),
+            grant: HostedIrqGrantIdentity {
+                owner_domain_id: self.0.grant_owner_domain_id.load(Ordering::Relaxed),
+                owner_domain_cookie: self.0.grant_owner_domain_cookie.load(Ordering::Relaxed),
+                grant_id: self.0.grant_id.load(Ordering::Relaxed),
+                grant_generation: self.0.grant_generation.load(Ordering::Relaxed),
+            },
+            argument_count: u8::try_from(self.0.argument_count.load(Ordering::Relaxed))
+                .map_err(|_| HostedIrqArenaError::InvalidCommand)?,
+            arguments: core::array::from_fn(|index| self.0.arguments[index].load(Ordering::Relaxed)),
+        };
+        if !command.valid()
+            || command.grant.owner_domain_id != identity.domain_id
+            || command.grant.owner_domain_cookie != identity.domain_cookie
+        {
+            return Err(HostedIrqArenaError::InvalidCommand);
+        }
+        Ok(command)
+    }
+
     pub fn root_complete(
         &self,
         control: &HostedIrqArenaControl,
@@ -2272,7 +2338,8 @@ mod tests {
         let (entry_irql, synchronize_irql) = match kind {
             HostedIrqDispatchKind::InterruptService => (5, 7),
             HostedIrqDispatchKind::DeferredProcedure => (2, 2),
-            HostedIrqDispatchKind::ProviderCallback => (2, 2),
+            HostedIrqDispatchKind::ProviderCallback
+            | HostedIrqDispatchKind::ClassServiceCallback => (2, 2),
         };
         HostedIrqDispatchCommand {
             kind,
@@ -2314,6 +2381,14 @@ mod tests {
             dispatch(HostedIrqDispatchKind::ProviderCallback).execution_irql(),
             2
         );
+        let mut class = dispatch(HostedIrqDispatchKind::ClassServiceCallback);
+        class.argument_count = 4;
+        class.arguments = [0x1000, 0x2000, 0x2018, 0x3000, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(class.transaction_class(), HostedIrqTransactionClass::Callback);
+        assert_eq!(class.execution_irql(), 2);
+        assert!(class.valid());
+        class.arguments[2] = class.arguments[1];
+        assert!(!class.valid());
     }
 
     #[test]
@@ -2346,8 +2421,10 @@ mod tests {
             HostedIrqServiceKind::from_raw(7),
             Some(HostedIrqServiceKind::PoolRetirement)
         );
-        assert_eq!(HostedIrqServiceKind::from_raw(8), None);
+        assert_eq!(HostedIrqServiceKind::from_raw(8), Some(HostedIrqServiceKind::ClassServiceRequest));
+        assert_eq!(HostedIrqServiceKind::from_raw(9), None);
         assert!(HostedIrqServiceKind::ProviderCallbackRequest.may_request_nested_dispatch());
+        assert!(HostedIrqServiceKind::ClassServiceRequest.may_request_nested_dispatch());
         assert!(!HostedIrqServiceKind::ProviderImport.may_request_nested_dispatch());
 
         let mut acquire = service();
@@ -2397,6 +2474,14 @@ mod tests {
         provider.kind = HostedIrqServiceKind::ProviderCallbackRequest;
         provider.argument_count = HOSTED_IRQ_ARENA_ARGUMENT_CAP as u8;
         assert!(provider.valid());
+
+        let mut class = service();
+        class.kind = HostedIrqServiceKind::ClassServiceRequest;
+        class.argument_count = 4;
+        class.arguments = [47, 53, 59, 61, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(class.valid());
+        class.arguments[4] = 1;
+        assert!(!class.valid());
     }
 
     fn service() -> HostedIrqServiceCommand {

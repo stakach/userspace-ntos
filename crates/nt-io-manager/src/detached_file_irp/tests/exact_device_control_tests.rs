@@ -60,6 +60,94 @@ fn control_buffers() -> ExternalFileIrpBuffers {
 }
 
 #[test]
+fn method_neither_mutable_input_is_captured_before_ack_with_zero_output_length() {
+    for len in [40usize, 48] {
+        let mut f = fixture();
+        let mut request = request(&f, nt_io_abi::ioctl::METHOD_NEITHER, true);
+        request.parameters = IoParameters::InternalDeviceControl(crate::DeviceControlParameters {
+            ioctl_code: 0x0022_0000 | nt_io_abi::ioctl::METHOD_NEITHER,
+            input_len: len as u32,
+            output_len: 0,
+        });
+        let policy = ExternalFileIrpDispatchPolicy::MutableMethodNeitherInputAtDevice;
+        assert_eq!(
+            policy.output_capture(),
+            ExternalFileIrpOutputCapture::MethodNeitherInput
+        );
+        let prepared = policy
+            .prepare(
+                &mut f.io,
+                request,
+                ExternalFileIrpBuffers::new(vec![1; len], vec![]),
+            )
+            .unwrap();
+        let invocation = f.io.begin_prepared_external_file_irp(prepared).unwrap();
+        let owner = match f
+            .io
+            .finish_external_file_irp(invocation.returned(ExternalFileIrpOutcome::Pending))
+            .unwrap()
+        {
+            ExternalFileIrpResult::Pending(owner) => owner,
+            other => panic!("expected pending mutable input, got {other:?}"),
+        };
+        publish_policy_completion(&mut f, &owner, NtStatus::SUCCESS, 0);
+        let completion =
+            f.io.prepare_external_file_irp_completion_with_capture(
+                owner,
+                ExternalFileIrpOutputCapture::MethodNeitherInput,
+            )
+            .unwrap();
+        assert_eq!(completion.capture_len(), len);
+        let rejection =
+            f.io.begin_external_file_irp_acknowledgement(completion)
+                .err()
+                .expect("mutable input is required before ACK");
+        assert_eq!(rejection.status(), NtStatus::DELETE_PENDING);
+        let mut copy =
+            f.io.begin_external_file_irp_copy(rejection.into_owner(), len)
+                .unwrap();
+        assert_eq!(
+            copy.capture_kind(),
+            ExternalFileIrpOutputCapture::MethodNeitherInput
+        );
+        copy.staging_mut().fill(7);
+        let completion =
+            f.io.finish_external_file_irp_copy(
+                copy.returned(ExternalFileIrpCopyOutcome::Copied { bytes: len }),
+            )
+            .unwrap();
+        let ack =
+            f.io.begin_external_file_irp_acknowledgement(completion)
+                .unwrap();
+        let (_, buffers) =
+            f.io.finish_external_file_irp_completion(
+                ack.acknowledged(ExternalFileIrpAcknowledgement::Acknowledged),
+            )
+            .unwrap();
+        assert_eq!(buffers.input(), vec![7; len].as_slice());
+        assert!(buffers.output().is_empty());
+    }
+}
+
+#[test]
+fn mutable_method_neither_input_rejects_more_than_one_page() {
+    let mut f = fixture();
+    let mut request = request(&f, nt_io_abi::ioctl::METHOD_NEITHER, true);
+    let len = 4097usize;
+    request.parameters = IoParameters::InternalDeviceControl(crate::DeviceControlParameters {
+        ioctl_code: 0x0022_0000 | nt_io_abi::ioctl::METHOD_NEITHER,
+        input_len: len as u32,
+        output_len: 0,
+    });
+    let result = ExternalFileIrpDispatchPolicy::MutableMethodNeitherInputAtDevice.prepare(
+        &mut f.io,
+        request,
+        ExternalFileIrpBuffers::new(vec![1; len], vec![]),
+    );
+    assert_eq!(result.err(), Some(NtStatus::INVALID_PARAMETER));
+}
+
+#[test]
 fn exact_middle_control_skips_upper_but_ordinary_preparation_keeps_top_routing() {
     let (mut f, lower, upper_driver, upper) = stack_fixture();
     for internal in [false, true] {
@@ -271,7 +359,10 @@ fn explicit_policy_prepares_same_request_with_distinct_route_and_completion_capt
         let expected_route = match policy {
             ExternalFileIrpDispatchPolicy::File
             | ExternalFileIrpDispatchPolicy::FileDeviceControl => (upper_driver, upper),
-            ExternalFileIrpDispatchPolicy::DeviceControlAtDevice => (f.driver, f.device),
+            ExternalFileIrpDispatchPolicy::DeviceControlAtDevice
+            | ExternalFileIrpDispatchPolicy::MutableMethodNeitherInputAtDevice => {
+                (f.driver, f.device)
+            }
         };
         assert_eq!(
             (owner.route().driver_id(), owner.route().device_id()),

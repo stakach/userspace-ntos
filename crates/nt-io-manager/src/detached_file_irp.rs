@@ -136,6 +136,7 @@ pub struct ExternalFileIrpTerminal {
 pub struct ExternalFileIrpCompletionInvocation {
     owner: Owner,
     completion: CompletedIrp,
+    capture: ExternalFileIrpOutputCapture,
     captured: usize,
     capture_len: usize,
 }
@@ -243,7 +244,7 @@ owner_accessors!(ExternalFileIrpCompletionInvocation, owner);
 mod operations;
 pub use operations::*;
 mod policy;
-pub use policy::ExternalFileIrpDispatchPolicy;
+pub use policy::{ExternalFileIrpDispatchPolicy, MAX_MUTABLE_METHOD_NEITHER_INPUT};
 
 impl ExternalFileIrpInvocation {
     pub fn buffers_mut(&mut self) -> ExternalFileIrpBufferView<'_> {
@@ -257,6 +258,11 @@ impl ExternalFileIrpInvocation {
             owner: self.0,
             outcome,
         }
+    }
+    /// Mutable METHOD_NEITHER input writeback is admitted only by the dispatch policy. Native
+    /// code fills this from the exact completed Type3InputBuffer before consuming the owner.
+    pub fn input_mut(&mut self) -> &mut [u8] {
+        &mut self.0.buffers.input
     }
 }
 impl RetainedExternalFileIrp {
@@ -920,6 +926,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             Ok((completion, capture_len)) => Ok(ExternalFileIrpCompletionInvocation {
                 owner: retained.owner,
                 completion,
+                capture,
                 captured: 0,
                 capture_len,
             }),
