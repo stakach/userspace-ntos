@@ -6,6 +6,8 @@ use super::*;
 mod completion;
 pub use completion::{
     ExternalPnpCompletionInvocation, ExternalPnpCompletionRejection, ExternalPnpCompletionReturn,
+    ExternalPnpFilterCompletionInvocation, ExternalPnpFilterCompletionReturn,
+    ExternalPnpFilterOutput,
 };
 
 #[derive(Debug)]
@@ -86,6 +88,9 @@ impl ExternalPnpReturn {
     }
     pub fn payload(&self) -> &[u8] {
         &self.invocation.prepared.payload
+    }
+    pub fn outcome(&self) -> &PnpBackendDispatch {
+        &self.outcome
     }
 }
 

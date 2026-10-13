@@ -43,6 +43,178 @@ fn pending_for(
     (owner, release)
 }
 
+fn pending_filter_with_terminal(
+    io: &mut IoManager<MockObjectPort>,
+    status: NtStatus,
+    information: u64,
+) -> (RetainedExternalPnp, std::rc::Rc<std::cell::Cell<bool>>) {
+    let ready = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let release = std::rc::Rc::new(std::cell::Cell::new(false));
+    let (client, root, _, _) = pnp_test_stack(
+        io,
+        Box::new(PendingPnpBackend {
+            ready: ready.clone(),
+            release: release.clone(),
+        }),
+    );
+    let prepared = io
+        .prepare_external_pnp_to_device(
+            client,
+            root,
+            29,
+            PnpParameters::filter_resource_requirements(40).unwrap(),
+            &valid_requirements(),
+        )
+        .unwrap();
+    let invocation = io.begin_prepared_external_pnp(prepared).unwrap();
+    let backend = io
+        .driver(invocation.projection().driver_id)
+        .unwrap()
+        .backend
+        .0 as usize;
+    let returned = invocation
+        .invoke(|context, projection| io.backends[backend].dispatch_pnp_irp(context, projection));
+    let retained = match io.finish_external_pnp(returned).unwrap() {
+        ExternalPnpFinishResult::Retained(owner) => owner,
+        result => panic!("pending FILTER owner missing: {result:?}"),
+    };
+    let mut queued = ready.borrow_mut();
+    assert_eq!(queued.len(), 1);
+    queued[0].status = status;
+    queued[0].information = information;
+    drop(queued);
+    (retained, release)
+}
+
+fn valid_requirements() -> Vec<u8> {
+    let mut bytes = alloc::vec![0; 40];
+    bytes[0..4].copy_from_slice(&40u32.to_le_bytes());
+    bytes[28..32].copy_from_slice(&1u32.to_le_bytes());
+    bytes
+}
+
+#[test]
+fn filter_not_supported_borrowed_information_preserves_original_input_through_ack() {
+    let mut io = io();
+    let borrowed_pointer = 0x1234_5000;
+    let (retained, release) =
+        pending_filter_with_terminal(&mut io, NtStatus::NOT_SUPPORTED, borrowed_pointer);
+    let id = retained.irp_id();
+    let (refusal, output) = io
+        .prepare_external_pnp_filter_completion(retained, ExternalPnpFilterOutput::Original)
+        .unwrap_err();
+    assert_eq!(refusal.status(), NtStatus::PENDING);
+    release.set(true);
+    assert_eq!(io.pump(), 1);
+    let invocation = io
+        .prepare_external_pnp_filter_completion(refusal.into_owner(), output)
+        .unwrap();
+    assert_eq!(invocation.completion().information, borrowed_pointer);
+    assert!(io.take_completed_external_pnp_receipt(id).is_none());
+    let returned = invocation.invoke(|_| CompletionAcknowledgement::Acknowledged);
+    let (receipt, input, output) = io.finish_external_pnp_filter_completion(returned).unwrap();
+    assert_eq!(receipt.information(), borrowed_pointer);
+    assert_eq!(input, valid_requirements());
+    assert_eq!(output, ExternalPnpFilterOutput::Original);
+    assert!(io.irp(id).is_none());
+}
+
+#[test]
+fn successful_filter_pointer_requires_exact_copied_output_before_ack() {
+    let mut io = io();
+    let provider_pointer = 0x5678_9000;
+    let (retained, release) =
+        pending_filter_with_terminal(&mut io, NtStatus::SUCCESS, provider_pointer);
+    let id = retained.irp_id();
+    release.set(true);
+    assert_eq!(io.pump(), 1);
+    let (refusal, _) = io
+        .prepare_external_pnp_filter_completion(retained, ExternalPnpFilterOutput::Original)
+        .unwrap_err();
+    assert_eq!(refusal.status(), NtStatus::INVALID_PARAMETER);
+    assert!(io.completed_irp(id).is_some());
+    let (refusal, _) = io
+        .prepare_external_pnp_filter_completion(
+            refusal.into_owner(),
+            ExternalPnpFilterOutput::Copied {
+                provider_pointer: provider_pointer + 8,
+                bytes: valid_requirements(),
+            },
+        )
+        .unwrap_err();
+    assert_eq!(refusal.status(), NtStatus::INVALID_PARAMETER);
+    let invocation = io
+        .prepare_external_pnp_filter_completion(
+            refusal.into_owner(),
+            ExternalPnpFilterOutput::Copied {
+                provider_pointer,
+                bytes: alloc::vec![0x5a; 40],
+            },
+        )
+        .unwrap_err();
+    assert_eq!(invocation.0.status(), NtStatus::INVALID_PARAMETER);
+    let invocation = io
+        .prepare_external_pnp_filter_completion(
+            invocation.0.into_owner(),
+            ExternalPnpFilterOutput::Copied {
+                provider_pointer,
+                bytes: valid_requirements(),
+            },
+        )
+        .unwrap();
+    let returned = invocation.invoke(|_| CompletionAcknowledgement::Acknowledged);
+    let (receipt, input, output) = io.finish_external_pnp_filter_completion(returned).unwrap();
+    assert_eq!(receipt.information(), provider_pointer);
+    assert_eq!(input, valid_requirements());
+    assert_eq!(
+        output,
+        ExternalPnpFilterOutput::Copied {
+            provider_pointer,
+            bytes: valid_requirements(),
+        }
+    );
+    assert!(io.irp(id).is_none());
+}
+
+#[test]
+fn successful_filter_may_borrow_only_the_exact_retained_input_pointer() {
+    let mut io = io();
+    let input_pointer = 0x1234_5000;
+    let (retained, release) =
+        pending_filter_with_terminal(&mut io, NtStatus::SUCCESS, input_pointer);
+    let id = retained.irp_id();
+    release.set(true);
+    assert_eq!(io.pump(), 1);
+    let (refusal, _) = io
+        .prepare_external_pnp_filter_completion(
+            retained,
+            ExternalPnpFilterOutput::BorrowedInput {
+                provider_pointer: input_pointer + 8,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(refusal.status(), NtStatus::INVALID_PARAMETER);
+    assert!(io.completed_irp(id).is_some());
+    let invocation = io
+        .prepare_external_pnp_filter_completion(
+            refusal.into_owner(),
+            ExternalPnpFilterOutput::BorrowedInput {
+                provider_pointer: input_pointer,
+            },
+        )
+        .unwrap();
+    let returned = invocation.invoke(|_| CompletionAcknowledgement::Acknowledged);
+    let (receipt, input, output) = io.finish_external_pnp_filter_completion(returned).unwrap();
+    assert_eq!(receipt.information(), input_pointer);
+    assert_eq!(input, valid_requirements());
+    assert_eq!(
+        output,
+        ExternalPnpFilterOutput::BorrowedInput {
+            provider_pointer: input_pointer,
+        }
+    );
+}
+
 #[test]
 fn detached_pnp_completion_requires_actual_driver_terminal_before_ack_entry() {
     let mut io = io();
@@ -161,14 +333,20 @@ fn detached_pnp_retry_requires_proven_no_entry_and_revalidates_reserved_completi
     let id = retained.irp_id();
     release.set(true);
     assert_eq!(primary_io.pump(), 1);
-    let invocation = primary_io.prepare_external_pnp_completion(retained).unwrap();
+    let invocation = primary_io
+        .prepare_external_pnp_completion(retained)
+        .unwrap();
     let completion = *invocation.completion();
     let first = invocation.invoke(|_| ExternalFileIrpAcknowledgement::NotEntered {
         status: NtStatus::DEVICE_NOT_READY,
     });
-    let rejected = primary_io.finish_external_pnp_completion(first).unwrap_err();
+    let rejected = primary_io
+        .finish_external_pnp_completion(first)
+        .unwrap_err();
     assert_eq!(primary_io.completed_irp(id), Some(completion));
-    let retry = primary_io.retry_external_pnp_completion(rejected.into_owner()).unwrap();
+    let retry = primary_io
+        .retry_external_pnp_completion(rejected.into_owner())
+        .unwrap();
     assert_eq!(retry.completion(), &completion);
     let second = retry.invoke(|_| ExternalFileIrpAcknowledgement::Acknowledged);
     let (receipt, payload) = primary_io.finish_external_pnp_completion(second).unwrap();
@@ -191,8 +369,12 @@ fn detached_pnp_retry_requires_proven_no_entry_and_revalidates_reserved_completi
         assert_eq!(other_io.pump(), 1);
         let invocation = other_io.prepare_external_pnp_completion(retained).unwrap();
         let returned = invocation.invoke(|_| acknowledgement);
-        let rejected = other_io.finish_external_pnp_completion(returned).unwrap_err();
-        let rejected = other_io.retry_external_pnp_completion(rejected.into_owner()).unwrap_err();
+        let rejected = other_io
+            .finish_external_pnp_completion(returned)
+            .unwrap_err();
+        let rejected = other_io
+            .retry_external_pnp_completion(rejected.into_owner())
+            .unwrap_err();
         assert_eq!(rejected.owner().acknowledgement(), acknowledgement);
         assert!(other_io.irp(id).is_some());
     }
@@ -212,11 +394,15 @@ fn detached_pnp_no_entry_retry_rejects_changed_terminal_before_foreign_reentry()
     });
     let rejected = io.finish_external_pnp_completion(first).unwrap_err();
     io.irps.get_mut(id).unwrap().information += 1;
-    let rejected = io.retry_external_pnp_completion(rejected.into_owner()).unwrap_err();
+    let rejected = io
+        .retry_external_pnp_completion(rejected.into_owner())
+        .unwrap_err();
     assert_eq!(rejected.status(), NtStatus::INVALID_PARAMETER);
     assert_eq!(rejected.owner().payload(), &[0x63; 64]);
     io.irps.get_mut(id).unwrap().information = original;
-    let retry = io.retry_external_pnp_completion(rejected.into_owner()).unwrap();
+    let retry = io
+        .retry_external_pnp_completion(rejected.into_owner())
+        .unwrap();
     let second = retry.invoke(|_| ExternalFileIrpAcknowledgement::Acknowledged);
     assert!(io.finish_external_pnp_completion(second).is_ok());
 }
@@ -394,7 +580,10 @@ fn detached_pnp_completion_refuses_nonzero_information_before_ack_reservation() 
         assert_eq!(refusal.status(), NtStatus::NOT_SUPPORTED);
         assert_eq!(refusal.owner().payload(), payload);
         assert_eq!(io.completed_irp(id), Some(completion));
-        assert!(io.irp_mut(id).is_some(), "refusal must not reserve ACK ownership");
+        assert!(
+            io.irp_mut(id).is_some(),
+            "refusal must not reserve ACK ownership"
+        );
     }
 }
 
@@ -411,7 +600,10 @@ fn detached_pnp_completion_rechecks_canonical_result_shape_before_reservation() 
     stack.parameters = IoParameters::Pnp(PnpParameters::query_capabilities());
     let refusal = io.prepare_external_pnp_completion(retained).unwrap_err();
     assert_eq!(refusal.status(), NtStatus::NOT_SUPPORTED);
-    assert!(io.irp_mut(id).is_some(), "refusal must not reserve ACK ownership");
+    assert!(
+        io.irp_mut(id).is_some(),
+        "refusal must not reserve ACK ownership"
+    );
     assert_eq!(refusal.owner().payload(), &[0x63; 64]);
 }
 
@@ -431,7 +623,10 @@ fn detached_pnp_completion_refuses_a_different_status_only_minor() {
     let refusal = io.prepare_external_pnp_completion(retained).unwrap_err();
     assert_eq!(refusal.status(), NtStatus::NOT_SUPPORTED);
     assert_eq!(refusal.owner().payload(), &[0x63; 64]);
-    assert!(io.irp_mut(id).is_some(), "refusal must not reserve ACK ownership");
+    assert!(
+        io.irp_mut(id).is_some(),
+        "refusal must not reserve ACK ownership"
+    );
 }
 
 #[test]
@@ -450,5 +645,8 @@ fn detached_pnp_completion_refuses_changed_start_resource_extents() {
     let refusal = io.prepare_external_pnp_completion(retained).unwrap_err();
     assert_eq!(refusal.status(), NtStatus::NOT_SUPPORTED);
     assert_eq!(refusal.owner().payload(), &[0x63; 64]);
-    assert!(io.irp_mut(id).is_some(), "refusal must not reserve ACK ownership");
+    assert!(
+        io.irp_mut(id).is_some(),
+        "refusal must not reserve ACK ownership"
+    );
 }

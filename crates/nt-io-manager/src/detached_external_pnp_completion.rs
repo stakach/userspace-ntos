@@ -1,9 +1,95 @@
-//! Status-only StartDevice/lifecycle PnP completion ACK across foreign execution.
-//! Retained bytes are the original owned input, not a captured provider output. Queries returning
-//! output or pointers require a separate checked output/adoption contract before ACK can free them.
+//! Detached PnP completion ACK across foreign execution. START/lifecycle use a status-only
+//! contract; FILTER requires exact provider-pointer output capture before ACK. Other pointer or
+//! query results still require their own checked output/adoption contract.
 use super::*;
 use crate::completion_ack::{CompletionAckReservation, CompletionAcknowledgement};
 use crate::CompletedIrp;
+
+/// A FILTER result copied before the provider's pending IRP is acknowledged. `Original` never
+/// interprets a borrowed `IoStatus.Information` pointer as transferred ownership.
+#[derive(Debug, Eq, PartialEq)]
+pub enum ExternalPnpFilterOutput {
+    Original,
+    /// The provider returned the exact pointer to its retained input allocation.
+    /// Native adapters must prove this pointer against that allocation's generation.
+    BorrowedInput {
+        provider_pointer: u64,
+    },
+    Copied {
+        provider_pointer: u64,
+        bytes: Vec<u8>,
+    },
+}
+
+impl ExternalPnpFilterOutput {
+    fn matches(&self, completion: &CompletedIrp) -> bool {
+        if completion.status == NtStatus::NOT_SUPPORTED
+            || !completion.status.is_success()
+            || completion.information == 0
+        {
+            matches!(self, Self::Original)
+        } else {
+            match self {
+                Self::BorrowedInput { provider_pointer } => {
+                    *provider_pointer != 0 && *provider_pointer == completion.information
+                }
+                Self::Copied {
+                    provider_pointer,
+                    bytes,
+                } => {
+                    *provider_pointer == completion.information
+                        && nt_cm_resources::validate_io_resource_requirements_list_extent(bytes)
+                            == Ok(bytes.len())
+                }
+                Self::Original => false,
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+#[must_use = "invoke ACK only after the FILTER output is copied"]
+pub struct ExternalPnpFilterCompletionInvocation {
+    inner: ExternalPnpCompletionInvocation,
+    output: ExternalPnpFilterOutput,
+}
+
+#[derive(Debug)]
+#[must_use = "retain exact ACK result and copied output until local settlement"]
+pub struct ExternalPnpFilterCompletionReturn {
+    inner: ExternalPnpCompletionReturn,
+    output: ExternalPnpFilterOutput,
+}
+
+impl ExternalPnpFilterCompletionInvocation {
+    pub fn completion(&self) -> &CompletedIrp {
+        self.inner.completion()
+    }
+    pub fn backend_index(&self) -> usize {
+        self.inner.backend_index()
+    }
+    pub fn output(&self) -> &ExternalPnpFilterOutput {
+        &self.output
+    }
+    pub fn invoke<F>(self, invoke: F) -> ExternalPnpFilterCompletionReturn
+    where
+        F: FnOnce(&CompletedIrp) -> CompletionAcknowledgement,
+    {
+        ExternalPnpFilterCompletionReturn {
+            inner: self.inner.invoke(invoke),
+            output: self.output,
+        }
+    }
+}
+
+impl ExternalPnpFilterCompletionReturn {
+    pub fn output(&self) -> &ExternalPnpFilterOutput {
+        &self.output
+    }
+    pub fn acknowledgement(&self) -> CompletionAcknowledgement {
+        self.inner.acknowledgement()
+    }
+}
 
 #[derive(Debug)]
 #[must_use = "retain the rejected completion owner"]
@@ -114,19 +200,50 @@ impl<P: ObjectManagerPort> IoManager<P> {
         retained: RetainedExternalPnp,
     ) -> Result<ExternalPnpCompletionInvocation, ExternalPnpCompletionRejection<RetainedExternalPnp>>
     {
+        self.prepare_external_pnp_completion_inner(retained, None)
+    }
+
+    pub fn prepare_external_pnp_filter_completion(
+        &mut self,
+        retained: RetainedExternalPnp,
+        output: ExternalPnpFilterOutput,
+    ) -> Result<
+        ExternalPnpFilterCompletionInvocation,
+        (
+            ExternalPnpCompletionRejection<RetainedExternalPnp>,
+            ExternalPnpFilterOutput,
+        ),
+    > {
+        match self.prepare_external_pnp_completion_inner(retained, Some(&output)) {
+            Ok(inner) => Ok(ExternalPnpFilterCompletionInvocation { inner, output }),
+            Err(rejection) => Err((rejection, output)),
+        }
+    }
+
+    fn prepare_external_pnp_completion_inner(
+        &mut self,
+        retained: RetainedExternalPnp,
+        filter_output: Option<&ExternalPnpFilterOutput>,
+    ) -> Result<ExternalPnpCompletionInvocation, ExternalPnpCompletionRejection<RetainedExternalPnp>>
+    {
         let valid = (|| {
             self.validate_external_pnp_invocation(&retained.owner.invocation)?;
             if !matches!(&retained.owner.invocation.snapshot.projection.parameters,
-                IoParameters::Pnp(parameters) if parameters.has_status_only_result())
-            {
+            IoParameters::Pnp(parameters) if match filter_output {
+                Some(_) => parameters.minor == nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS,
+                None => parameters.has_status_only_result(),
+            }) {
                 return Err(NtStatus::NOT_SUPPORTED);
             }
             let id = retained.irp_id();
             let completion = self.completed_irp_snapshot(id).ok_or(NtStatus::PENDING)?;
             // This owner only carries a status result. A nonzero Information value could be a
             // provider-owned output pointer and must be adopted by a different contract.
-            if completion.information != 0 {
+            if filter_output.is_none() && completion.information != 0 {
                 return Err(NtStatus::NOT_SUPPORTED);
+            }
+            if filter_output.is_some_and(|output| !output.matches(&completion)) {
+                return Err(NtStatus::INVALID_PARAMETER);
             }
             let irp = self.irp(id).ok_or(NtStatus::INVALID_PARAMETER)?;
             if !irp.current_stack().is_some_and(|stack| {
@@ -135,7 +252,10 @@ impl<P: ObjectManagerPort> IoManager<P> {
                         && stack.minor == retained.owner.invocation.snapshot.minor
                         && stack.parameters
                             == retained.owner.invocation.snapshot.projection.parameters
-                        && parameters.has_status_only_result())
+                        && match filter_output {
+                            Some(_) => parameters.minor == nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS,
+                            None => parameters.has_status_only_result(),
+                        })
             }) {
                 return Err(NtStatus::NOT_SUPPORTED);
             }
@@ -239,21 +359,68 @@ impl<P: ObjectManagerPort> IoManager<P> {
             returned.acknowledgement,
             CompletionAcknowledgement::NotEntered { .. }
         ) {
-            self.validate_external_pnp_completion_return(&returned).and_then(|_| {
-                self.backends
-                    .get(returned.invocation.backend_index)
-                    .filter(|backend| !backend.is_faulted())
-                    .map(|_| ())
-                    .ok_or(NtStatus::DEVICE_NOT_CONNECTED)
-            })
+            self.validate_external_pnp_completion_return(&returned)
+                .and_then(|_| {
+                    self.backends
+                        .get(returned.invocation.backend_index)
+                        .filter(|backend| !backend.is_faulted())
+                        .map(|_| ())
+                        .ok_or(NtStatus::DEVICE_NOT_CONNECTED)
+                })
         } else {
             Err(NtStatus::INVALID_DEVICE_REQUEST)
         };
         if let Err(status) = valid {
-            return Err(ExternalPnpCompletionRejection { status, owner: returned });
+            return Err(ExternalPnpCompletionRejection {
+                status,
+                owner: returned,
+            });
         }
         Ok(returned
             .retry()
             .expect("validated no-entry ACK must permit retry"))
+    }
+
+    pub fn finish_external_pnp_filter_completion(
+        &mut self,
+        returned: ExternalPnpFilterCompletionReturn,
+    ) -> Result<
+        (ExternalPnpTerminalReceipt, Vec<u8>, ExternalPnpFilterOutput),
+        ExternalPnpCompletionRejection<ExternalPnpFilterCompletionReturn>,
+    > {
+        let ExternalPnpFilterCompletionReturn { inner, output } = returned;
+        match self.finish_external_pnp_completion(inner) {
+            Ok((receipt, input)) => Ok((receipt, input, output)),
+            Err(rejection) => {
+                let status = rejection.status();
+                Err(ExternalPnpCompletionRejection {
+                    status,
+                    owner: ExternalPnpFilterCompletionReturn {
+                        inner: rejection.into_owner(),
+                        output,
+                    },
+                })
+            }
+        }
+    }
+
+    pub fn retry_external_pnp_filter_completion(
+        &mut self,
+        returned: ExternalPnpFilterCompletionReturn,
+    ) -> Result<
+        ExternalPnpFilterCompletionInvocation,
+        ExternalPnpCompletionRejection<ExternalPnpFilterCompletionReturn>,
+    > {
+        let ExternalPnpFilterCompletionReturn { inner, output } = returned;
+        match self.retry_external_pnp_completion(inner) {
+            Ok(inner) => Ok(ExternalPnpFilterCompletionInvocation { inner, output }),
+            Err(rejection) => Err(ExternalPnpCompletionRejection {
+                status: rejection.status(),
+                owner: ExternalPnpFilterCompletionReturn {
+                    inner: rejection.into_owner(),
+                    output,
+                },
+            }),
+        }
     }
 }

@@ -196,6 +196,8 @@ pub use external_dispatch::{
     ExternalPnpFinishRejection, ExternalPnpFinishResult, ExternalPnpInvocation, ExternalPnpReturn,
     RetainedExternalPnp,
     ExternalPnpCompletionInvocation, ExternalPnpCompletionReturn, ExternalPnpCompletionRejection,
+    ExternalPnpFilterCompletionInvocation, ExternalPnpFilterCompletionReturn,
+    ExternalPnpFilterOutput,
     PreparedExternalPnpIrp, PreparedExternalPnpRejection,
 };
 pub use completion_ack::CompletionAcknowledgement;
