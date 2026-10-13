@@ -87,6 +87,7 @@ unsafe fn drain_instance(index: usize, inst: DriverInstance) -> Result<u64, nt_s
         0,
         0,
         false,
+        None,
         caller,
     )
 }

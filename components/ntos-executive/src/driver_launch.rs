@@ -34,6 +34,16 @@ pub(crate) mod hosted_ingress_sources;
 
 #[path = "hosted_thread_resources.rs"]
 mod hosted_thread_resources;
+#[path = "hosted_source_stack_lease.rs"]
+mod hosted_source_stack_lease;
+#[path = "hosted_connect_capture.rs"]
+mod hosted_connect_capture;
+#[path = "hosted_connect_work.rs"]
+mod hosted_connect_work;
+#[path = "hosted_rtl_registry_delete.rs"]
+mod hosted_rtl_registry_delete;
+#[path = "hosted_rtl_registry_write.rs"]
+mod hosted_rtl_registry_write;
 
 #[path = "hosted_primary_retirement.rs"]
 mod hosted_primary_retirement;
@@ -47,6 +57,13 @@ pub(crate) mod hosted_component_mmio_fault;
 mod hosted_exception_images;
 #[path = "hosted_zw_load_driver.rs"]
 mod hosted_zw_load_driver;
+#[path = "hosted_zw_enumerate_value_key.rs"]
+mod hosted_zw_enumerate_value_key;
+use hosted_zw_enumerate_value_key::HOSTED_REGISTRY_OP_ENUMERATE_VALUE;
+#[path = "hosted_device_object_pointer.rs"]
+mod hosted_device_object_pointer;
+#[path = "hosted_driver_reinitialization.rs"]
+mod hosted_driver_reinitialization;
 
 pub(crate) unsafe fn service_hosted_driver_zw_load_driver(
     channel: &crate::spawn_hosts::PumpChannel,
@@ -107,6 +124,12 @@ mod hosted_device_publication;
 use hosted_device_publication::{register_hosted_device_projection, ProjectionPublicationError};
 #[path = "hosted_device_retirement.rs"]
 mod hosted_device_retirement;
+#[path = "hosted_upper_filter_projection.rs"]
+mod hosted_upper_filter_projection;
+#[path = "hosted_upper_filter_alias.rs"]
+mod hosted_upper_filter_alias;
+#[path = "hosted_upper_filter_add_device.rs"]
+mod hosted_upper_filter_add_device;
 use hosted_device_retirement::{retire_hosted_device_projection, CanonicalRetirement};
 #[path = "hosted_file_lifecycle_owners.rs"]
 mod hosted_file_lifecycle_owners;
@@ -999,6 +1022,8 @@ pub const FSD_DISPATCH_ACK_COMPLETION: u64 = u64::MAX - 0x77D;
 pub const FSD_DISPATCH_VIDEO_RELATION_ACK: u64 = u64::MAX - 0x77E;
 pub const FSD_DISPATCH_CREATE_PDO_PROJECTION: u64 = u64::MAX - 0x77F;
 pub const FSD_DISPATCH_DRAIN_FILE_RETIREMENTS: u64 = u64::MAX - 0x781;
+pub const FSD_DISPATCH_DRIVER_REINIT: u64 = u64::MAX - 0x782;
+pub const FSD_DISPATCH_CLASS_LOWER_ALIAS: u64 = u64::MAX - 0x783;
 
 const HOSTED_INTERRUPT_OP_CONNECT: u64 = 1;
 const HOSTED_INTERRUPT_OP_DISCONNECT: u64 = 2;
@@ -5432,6 +5457,7 @@ const HOSTED_DEVICE_OP_START_PACKET: u64 = 23;
 const HOSTED_DEVICE_OP_START_PACKET_CALLBACK_RETURNED: u64 = 24;
 const HOSTED_DEVICE_OP_START_NEXT_PACKET: u64 = 25;
 const HOSTED_DEVICE_OP_START_NEXT_PACKET_CALLBACK_RETURNED: u64 = 26;
+const HOSTED_DEVICE_OP_REGISTER_DRIVER_REINIT: u64 = 27;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN: u64 = 0;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF: u64 = 2;
 const HOSTED_DEVICE_ARG_DATA_OFF: u64 = FSD_ARG_BYTES;
@@ -32708,6 +32734,14 @@ fn register_fsd_trampolines() -> bool {
         "RtlQueryRegistryValues",
         s_rtl_query_registry_values as *const () as usize as u64,
     );
+    reg.bind(
+        "RtlDeleteRegistryValue",
+        hosted_rtl_registry_delete::delete_registry_value as *const () as usize as u64,
+    );
+    reg.bind(
+        "RtlWriteRegistryValue",
+        hosted_rtl_registry_write::write_registry_value as *const () as usize as u64,
+    );
     // Io device/registration (control DEVICE_OBJECT + FS registration)
     reg.bind(
         "IoCreateDevice",
@@ -32862,6 +32896,14 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "IoGetRelatedDeviceObject",
         s_io_get_related_device_object as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoGetDeviceObjectPointer",
+        hosted_device_object_pointer::s_io_get_device_object_pointer as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoRegisterDriverReinitialization",
+        hosted_driver_reinitialization::register as *const () as usize as u64,
     );
     reg.bind(
         "IoGetAttachedDeviceReference",
@@ -33261,6 +33303,10 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "ZwEnumerateKey",
         s_zw_enumerate_key as *const () as usize as u64,
+    );
+    reg.bind(
+        "ZwEnumerateValueKey",
+        hosted_zw_enumerate_value_key::s_zw_enumerate_value_key as *const () as usize as u64,
     );
     reg.bind(
         "ZwQueryValueKey",
@@ -34346,6 +34392,9 @@ unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64
     if major == FSD_DISPATCH_DRAIN_FILE_RETIREMENTS {
         return (STATUS_SUCCESS, hosted_file_objects::drain());
     }
+    if major == FSD_DISPATCH_DRIVER_REINIT {
+        return hosted_driver_reinitialization::component_dispatch();
+    }
     let request_drv = match read_volatile((FSD_SHARED_VADDR + SH_DRVOBJ) as *const u64) {
         0 => req.drv,
         drv => drv,
@@ -34406,6 +34455,32 @@ unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64
             Err(status) => return (status, 0),
         };
         return (STATUS_SUCCESS, projection.device_object());
+    }
+    if major == FSD_DISPATCH_CLASS_LOWER_ALIAS {
+        let pdo = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
+        let lower = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
+        if !consumer_device_object_in_local_pool(pdo)
+            || !consumer_device_object_in_local_pool(lower)
+        {
+            return (STATUS_INVALID_PARAMETER, 0);
+        }
+        let type_flags = read_volatile((FSD_SHARED_VADDR + SH_REQ_INLEN) as *const u64);
+        let characteristics = read_volatile((FSD_SHARED_VADDR + SH_REQ_OUTLEN) as *const u64);
+        let stack_size = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
+        if characteristics > u32::MAX as u64 || stack_size > u8::MAX as u64 {
+            return (STATUS_INVALID_PARAMETER, 0);
+        }
+        return match hosted_upper_filter_alias::configure_class_lower_alias(
+            pdo,
+            lower,
+            type_flags as u32,
+            (type_flags >> 32) as u32,
+            characteristics as u32,
+            stack_size as u8,
+        ) {
+            Ok(observed_pdo) => (STATUS_SUCCESS, observed_pdo),
+            Err(status) => (status, 0),
+        };
     }
     if major == FSD_DISPATCH_ADD_DEVICE {
         let add_device = read_volatile((FSD_SHARED_VADDR + SH_ADD_DEVICE) as *const u64);
@@ -38445,6 +38520,7 @@ unsafe fn load_driver_reserved(
     print_str(b"\n");
     // Record the live instance and publish canonical driver/device route ids for callers.
     register_instance(&dc);
+    hosted_driver_reinitialization::run_pending_for_instance(instance, initial_system_driver_caller())?;
     Ok(dc)
 }
 
@@ -53314,11 +53390,17 @@ pub(crate) fn service_hosted_device(
             | HOSTED_DEVICE_OP_START_PACKET_CALLBACK_RETURNED
             | HOSTED_DEVICE_OP_START_NEXT_PACKET
             | HOSTED_DEVICE_OP_START_NEXT_PACKET_CALLBACK_RETURNED
+            | HOSTED_DEVICE_OP_REGISTER_DRIVER_REINIT
     ) {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
     }
     if op == HOSTED_DEVICE_OP_REPORT_POWER_STATE {
         return hosted_power_broker::service_report(ch, pdo_object, arg2, arg3, active_reply_cap, caller_badge);
+    }
+    if op == HOSTED_DEVICE_OP_REGISTER_DRIVER_REINIT {
+        return (hosted_driver_reinitialization::service_register(
+            ch, pdo_object, arg2, arg3, active_reply_cap,
+        ), 0, 0, 0);
     }
     if matches!(op, HOSTED_DEVICE_OP_CREATE | HOSTED_DEVICE_OP_ATTACH | HOSTED_DEVICE_OP_DETACH | HOSTED_DEVICE_OP_DELETE | HOSTED_DEVICE_OP_ATTACH_SAFE | HOSTED_DEVICE_OP_ROLLBACK_ATTACH_SAFE | HOSTED_DEVICE_OP_REGISTER_FILE_SYSTEM | HOSTED_DEVICE_OP_UNREGISTER_FILE_SYSTEM | HOSTED_DEVICE_OP_SET_START_IO_ATTRIBUTES) {
         let Some((_, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
@@ -56726,6 +56808,7 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
     if !hosted_file_retirements::instance_quiesced(i)
         || !hosted_file_owners::instance_quiesced(i)
         || !unsafe { hosted_add_device_rollback::instance_quiesced(i) }
+        || !hosted_upper_filter_projection::instance_quiesced(i)
     {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
@@ -56741,6 +56824,9 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
     unsafe {
         match retiring_domain {
             Some(domain) => {
+                if !instance(i).is_some_and(hosted_driver_reinitialization::instance_quiesced) {
+                    return Err(nt_status::NtStatus::DEVICE_BUSY);
+                }
                 let failures = begin_hosted_provider_dependency_retirement_for_instance(i, domain);
                 if failures != 0 {
                     print_str(b"[driver-launch] provider dispatch retirement blocked inst=");
@@ -57274,6 +57360,15 @@ pub(crate) fn service_hosted_file(
             )
         };
         return (status, object, granted as u64, attributes as u64);
+    }
+    if operation == 7 {
+        if file_id != 0 || address != 0 || request_id == 0 {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
+        let (status, device) = unsafe {
+            hosted_consumer_file_objects::related_top(ch, active_reply_cap, request_id)
+        };
+        return (status, device, 0, 0);
     }
     if operation == 5 || operation == 6 {
         if file_id != 0 || address != 0 {
@@ -59464,6 +59559,9 @@ fn service_hosted_driver_registry_sync(
                     Err(status) => (status, 0, 0),
                 }
             }
+            HOSTED_REGISTRY_OP_ENUMERATE_VALUE => {
+                hosted_zw_enumerate_value_key::service(caller, arg, a1, a2, a3)
+            }
             HOSTED_REGISTRY_OP_QUERY_HANDLE_VALUE => {
                 let Ok(slot) = driver_registry_handle_slot(caller, a1, 1) else {
                     return (STATUS_INVALID_HANDLE, 0, 0);
@@ -60822,6 +60920,7 @@ unsafe fn dispatch_device_projection_control_for_instance(
     pdo_object: u64,
     previous_device_head: u64,
     delete_pdo: bool,
+    class_projection: Option<hosted_upper_filter_projection::PreparedUpperFilterProjection>,
     caller: nt_process::native_handle::NativeHandleCaller,
 ) -> Result<u64, nt_status::NtStatus> {
     let inst = instance(index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
@@ -60831,10 +60930,10 @@ unsafe fn dispatch_device_projection_control_for_instance(
     let sh = inst.exec_shared_va;
     write_volatile((sh + SH_DRVOBJ) as *mut u64, driver_object);
     write_volatile((sh + SH_REQ_MAJOR) as *mut u64, selector);
-    write_volatile((sh + SH_REQ_MINOR) as *mut u64, u64::from(delete_pdo));
-    write_volatile((sh + SH_REQ_FSCTL) as *mut u64, previous_device_head);
-    write_volatile((sh + SH_REQ_INLEN) as *mut u64, 0);
-    write_volatile((sh + SH_REQ_OUTLEN) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_MINOR) as *mut u64, class_projection.map_or(u64::from(delete_pdo), |p| p.lower_stack_size as u64));
+    write_volatile((sh + SH_REQ_FSCTL) as *mut u64, class_projection.map_or(previous_device_head, |p| p.lower_object));
+    write_volatile((sh + SH_REQ_INLEN) as *mut u64, class_projection.map_or(0, |p| u64::from(p.lower_type) | (u64::from(p.lower_flags) << 32)));
+    write_volatile((sh + SH_REQ_OUTLEN) as *mut u64, class_projection.map_or(0, |p| p.lower_characteristics as u64));
     write_volatile((sh + SH_REQ_FILEID) as *mut u64, pdo_object);
     write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
     write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
@@ -60888,6 +60987,7 @@ unsafe fn create_hosted_pdo_projection(
         0,
         0,
         false,
+        None,
         caller,
     )?;
     if pdo_object == 0 {
@@ -61221,6 +61321,27 @@ where
         pdo_device_id,
         Some(bus_information),
         pdo_address,
+    )
+}
+
+/// Attach registry-selected class filters above an existing function FDO before START.
+pub(crate) unsafe fn attach_hosted_class_upper_filters(
+    instance_path: &str,
+    function_device_id: u64,
+    mount_generation: u64,
+    ordered_drivers: &[u64],
+) -> Result<(), nt_status::NtStatus> {
+    if ordered_drivers.is_empty() {
+        return Ok(());
+    }
+    let binding = hosted_device_binding_by_device_id(function_device_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    hosted_upper_filter_add_device::attach_ordered(
+        instance_path,
+        binding.pdo_device_id,
+        function_device_id,
+        mount_generation,
+        ordered_drivers,
     )
 }
 
@@ -64001,6 +64122,11 @@ pub(crate) unsafe fn unload_driver_by_name(
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     let domain = instance_domain_identity(inst).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    if !hosted_driver_reinitialization::instance_quiesced(inst)
+        || !hosted_upper_filter_projection::instance_quiesced(index)
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     hosted_file_retirements::preflight_unload(index, inst)?;
     io_manager_mut().can_unload_hosted_provider(domain)?;
 

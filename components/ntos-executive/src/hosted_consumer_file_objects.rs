@@ -36,9 +36,34 @@ struct Row {
     allocations: [Option<u64>; ALLOCATION_COUNT],
     device: Option<HostedDevicePointerRegistration>,
     device_owner: Option<DeviceOwner>,
+    related_top_owners: Vec<RelatedTopOwner>,
     file: Option<HostedFileIdentity>,
     projection: Option<ConsumerFileProjection>,
     phase: Phase,
+}
+
+enum RelatedTopOwner {
+    Registered(HostedDevicePointerRegistration),
+    Projected(DeviceOwner),
+}
+
+impl RelatedTopOwner {
+    fn registration(&self) -> HostedDevicePointerRegistration {
+        match self {
+            Self::Registered(registration) => *registration,
+            Self::Projected(owner) => owner.registration(),
+        }
+    }
+
+    unsafe fn release(&mut self) -> Result<(), i32> {
+        match self {
+            Self::Registered(registration) => io_manager_mut()
+                .dereference_hosted_device_pointer(*registration)
+                .map(|_| ())
+                .map_err(|status| status.raw()),
+            Self::Projected(owner) => release_device(owner),
+        }
+    }
 }
 
 struct Metadata {
@@ -173,6 +198,26 @@ fn metadata(file_id: FileId, device_id: DeviceId) -> Result<Metadata, i32> {
     })
 }
 
+fn related_top_metadata(device_id: DeviceId) -> Result<(Vec<u16>, WdmDeviceObjectInit), i32> {
+    let io = io_manager_mut();
+    let device = io.device(device_id).ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+    if device.delete_pending || device.stack_size == 0 {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    let driver = io.driver(device.driver_id).ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+    let name = copy_units(&driver.name.to_units())?;
+    Ok((
+        name,
+        WdmDeviceObjectInit {
+            flags: device.flags.bits(),
+            characteristics: device.characteristics.bits(),
+            device_type: device.device_type.0,
+            stack_size: device.stack_size,
+            ..Default::default()
+        },
+    ))
+}
+
 unsafe fn live_instance(id: u64) -> Result<DriverInstance, i32> {
     let owner = row(id);
     let inst = instance(owner.instance_index).ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
@@ -287,6 +332,10 @@ unsafe fn retire(id: u64) -> Result<(), i32> {
             Ok(HostedFileUnbindOutcome::AlreadyAbsent) => return Err(STATUS_INVALID_HANDLE),
             Err(status) => return Err(status.raw()),
         }
+    }
+    while let Some(owner) = row(id).related_top_owners.last_mut() {
+        owner.release()?;
+        row(id).related_top_owners.pop();
     }
     if let Some(owner) = row(id).device_owner.as_mut() {
         release_device(owner)?;
@@ -443,6 +492,7 @@ pub(super) unsafe fn reference_handle(
             allocations: [None; ALLOCATION_COUNT],
             device: None,
             device_owner: None,
+            related_top_owners: Vec::new(),
             file: None,
             projection: None,
             phase: Phase::Building,
@@ -491,6 +541,85 @@ pub(super) unsafe fn reference_pointer(
     })();
     match result {
         Ok(pointer) => (STATUS_SUCCESS, pointer),
+        Err(status) => (status, 0),
+    }
+}
+
+/// Resolve the File's canonical attachment top through a projection in the exact
+/// caller domain. The File's pointer reference pins every projected top until its
+/// final dereference, including after the temporary open handle has closed.
+pub(super) unsafe fn related_top(
+    ch: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    file_address: u64,
+) -> (i32, u64) {
+    let result = (|| -> Result<u64, i32> {
+        let (_, domain) = authenticate(ch, reply_cap)?;
+        let id = row_for_pointer(domain, file_address).ok_or(STATUS_INVALID_HANDLE)?;
+        live_instance(id)?;
+        let projection = row(id).projection.as_ref().ok_or(STATUS_INVALID_HANDLE)?;
+        if projection.pointer_reference_count() == 0 {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let file = projection.identity().file_id();
+        let top = io_manager_mut()
+            .related_device_for_file(file)
+            .map_err(|status| status.raw())?;
+        if row(id).device.is_some_and(|opening| opening.device_id() == top) {
+            let opening = row(id).device.ok_or(STATUS_INVALID_HANDLE)?;
+            return projection
+                .related_top_device_address(io_manager_mut(), opening)
+                .map_err(|status| status.raw());
+        }
+        if let Some(registration) = row(id)
+            .related_top_owners
+            .iter()
+            .map(RelatedTopOwner::registration)
+            .find(|registration| registration.device_id() == top)
+        {
+            return projection
+                .related_top_device_address(io_manager_mut(), registration)
+                .map_err(|status| status.raw());
+        }
+
+        // Reserve the owner slot before publication. If topology changes during
+        // validation, the row still retains the new pointer until File retirement.
+        row(id)
+            .related_top_owners
+            .try_reserve(1)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        let owner = if let Some(address) = io_manager_mut().hosted_device_address_by_identity(domain, top) {
+            let registration = io_manager_mut()
+                .hosted_device_pointer_registration(domain, address)
+                .ok_or(STATUS_INVALID_HANDLE)?;
+            io_manager_mut()
+                .reference_hosted_device_pointer(registration)
+                .map_err(|status| status.raw())?;
+            RelatedTopOwner::Registered(registration)
+        } else {
+            let (name, init) = related_top_metadata(top)?;
+            let (instance_index, _) = instance_for_pump_channel(ch, reply_cap)
+                .ok_or(STATUS_ACCESS_DENIED)?;
+            RelatedTopOwner::Projected(acquire_device(
+                instance_index,
+                domain,
+                file,
+                top,
+                &name,
+                init,
+            )?)
+        };
+        let registration = owner.registration();
+        row(id).related_top_owners.push(owner);
+        row(id)
+            .projection
+            .as_ref()
+            .ok_or(STATUS_INVALID_HANDLE)?
+            .related_top_device_address(io_manager_mut(), registration)
+            .map_err(|status| status.raw())
+    })();
+    match result {
+        Ok(address) => (STATUS_SUCCESS, address),
         Err(status) => (status, 0),
     }
 }

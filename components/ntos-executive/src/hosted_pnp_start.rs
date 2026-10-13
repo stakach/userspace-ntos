@@ -1649,6 +1649,96 @@ enum HostedPnpDevnodeProgress {
     },
 }
 
+unsafe fn resolve_upper_filter_drivers(
+    instance_id: &str,
+) -> Result<(u64, Vec<u64>), nt_status::NtStatus> {
+    let plan = config_manager_query_upper_filter_launch_plan(instance_id)
+        .map_err(nt_status::NtStatus)?;
+    let Some(plan) = plan else {
+        if config_manager_query_upper_filter_launch_plan(instance_id)
+            .map_err(nt_status::NtStatus)?
+            .is_some()
+        {
+            return Err(nt_status::NtStatus::DEVICE_NOT_READY);
+        }
+        return Ok((0, Vec::new()));
+    };
+    let mut driver_ids = Vec::new();
+    driver_ids
+        .try_reserve_exact(plan.bindings.len())
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+
+    for binding in &plan.bindings {
+        let driver_id = if let Some((driver_id, _)) =
+            driver_launch::loaded_driver_pnp_start_context(&binding.driver_object_path)
+        {
+            driver_id
+        } else {
+            if driver_launch::driver_id_by_name(&binding.driver_object_path).is_some() {
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
+            // DriverEntry is an irreversible native effect. Check the entire ordered policy and
+            // every resolved service again before entering it, then fence the result afterward.
+            if config_manager_query_upper_filter_launch_plan(instance_id)
+                .map_err(nt_status::NtStatus)?
+                .as_ref()
+                != Some(&plan)
+            {
+                return Err(nt_status::NtStatus::DEVICE_NOT_READY);
+            }
+            let image_path = registry_ascii_path(&binding.image_path)
+                .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+            let fs = crate::fs_loader::exec_fs().ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+            let loaded = driver_launch::load_driver(
+                &fs,
+                &image_path,
+                driver_launch::DriverClass::Device,
+                &binding.driver_object_path,
+                initial_system_driver_caller(),
+            )?;
+            if config_manager_query_upper_filter_launch_plan(instance_id)
+                .map_err(nt_status::NtStatus)?
+                .as_ref()
+                != Some(&plan)
+            {
+                return Err(nt_status::NtStatus::DEVICE_NOT_READY);
+            }
+            if driver_launch::loaded_driver_pnp_start_context(&binding.driver_object_path)
+                .map(|context| context.0)
+                != Some(loaded.driver_id)
+            {
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
+            loaded.driver_id
+        };
+        if driver_launch::driver_add_device(driver_id) == 0 {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        driver_ids.push(driver_id);
+    }
+    if config_manager_query_upper_filter_launch_plan(instance_id)
+        .map_err(nt_status::NtStatus)?
+        .as_ref()
+        != Some(&plan)
+    {
+        return Err(nt_status::NtStatus::DEVICE_NOT_READY);
+    }
+    for (binding, driver_id) in plan.bindings.iter().zip(&driver_ids) {
+        print_str(b"[pnp-upper-filter] devnode=");
+        print_str(instance_id.as_bytes());
+        print_str(b" generation=");
+        print_u64(plan.mount_generation);
+        print_str(b" service=");
+        print_str(binding.service_name.as_bytes());
+        print_str(b" driver-id=");
+        print_u64(*driver_id);
+        print_str(b" object=");
+        print_str(binding.driver_object_path.as_bytes());
+        print_str(b"\n");
+    }
+    Ok((plan.mount_generation, driver_ids))
+}
+
 unsafe fn start_one_devnode<H, C>(
     driver_id: u64,
     service_name: &str,
@@ -1807,29 +1897,45 @@ where
                     device_id,
                 );
             }
-            match config_manager_query_upper_filter_launch_plan(devnode.instance_id) {
-                Ok(Some(plan)) if !plan.bindings.is_empty() => {
-                    print_str(b"[pnp-upper-filter] devnode=");
-                    print_str(devnode.instance_id.as_bytes());
-                    print_str(b" generation=");
-                    print_u64(plan.mount_generation);
-                    print_str(b" services=");
-                    for (index, binding) in plan.bindings.iter().enumerate() {
-                        if index != 0 {
-                            print_str(b",");
-                        }
-                        print_str(binding.service_name.as_bytes());
-                    }
-                    print_str(b"\n");
-                }
+            let (filter_generation, upper_filter_driver_ids) = match resolve_upper_filter_drivers(devnode.instance_id) {
+                Ok(plan) => plan,
                 Err(status) => {
-                    print_str(b"[pnp-upper-filter] plan query failed status=0x");
-                    print_hex(status as u32);
+                    print_str(b"[pnp-upper-filter] resolve failed status=0x");
+                    print_hex(status.raw() as u32);
                     print_str(b" devnode=");
                     print_str(devnode.instance_id.as_bytes());
                     print_str(b"\n");
+                    return finish_filter_failure(
+                        device_id,
+                        resource_plan,
+                        service_name,
+                        devnode.instance_id,
+                        options,
+                        status,
+                        report,
+                    );
                 }
-                _ => {}
+            };
+            if let Err(status) = driver_launch::attach_hosted_class_upper_filters(
+                devnode.instance_id,
+                device_id,
+                filter_generation,
+                &upper_filter_driver_ids,
+            ) {
+                print_str(b"[pnp-upper-filter] AddDevice failed status=0x");
+                print_hex(status.raw() as u32);
+                print_str(b" devnode=");
+                print_str(devnode.instance_id.as_bytes());
+                print_str(b"\n");
+                return finish_filter_failure(
+                    device_id,
+                    resource_plan,
+                    service_name,
+                    devnode.instance_id,
+                    options,
+                    status,
+                    report,
+                );
             }
             let filter_outcome = match resource_plan.native_property_blobs().1 {
                 Some(requirements) => driver_launch::filter_hosted_device_resource_requirements(
