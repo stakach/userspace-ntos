@@ -463,6 +463,38 @@ mod tests {
     }
 
     #[test]
+    fn named_device_file_reference_survives_handle_close_and_resolves_current_top() {
+        let (mut io, identity, opening_device) = opened();
+        let base = opening_device.device_id();
+        let driver = io.device(base).unwrap().driver_id;
+        let top = io
+            .create_device(
+                driver,
+                None,
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let mut file = ConsumerFileProjection::new(&mut io, identity, opening_device).unwrap();
+        file.reference_by_handle(&mut io, identity).unwrap();
+        file.handle_closed(identity).unwrap();
+        assert!(!file.is_ready_to_retire());
+
+        io.attach_device_to_stack(top, base).unwrap();
+        let top_pointer = io.bind_hosted_device_pointer(identity.domain(), 0x7000, top).unwrap();
+        assert_eq!(
+            file.related_top_device_address(&io, opening_device),
+            Err(NtStatus::INVALID_DEVICE_REQUEST),
+        );
+        assert_eq!(file.related_top_device_address(&io, top_pointer), Ok(0x7000));
+        file.dereference(&mut io, identity).unwrap();
+        assert!(file.is_ready_to_retire());
+        file.retire(&mut io).unwrap();
+    }
+
+    #[test]
     fn stale_generation_cannot_mutate_replacement_projection() {
         let (mut io, first, device) = opened();
         let mut projection = ConsumerFileProjection::new(&mut io, first, device).unwrap();

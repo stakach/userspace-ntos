@@ -67,13 +67,15 @@ impl ConsumerDeviceProjection {
         if self.retired {
             return Err(NtStatus::DELETE_PENDING);
         }
+        let file_matches = io.file(file).is_some_and(|opened| {
+            opened.device_id == self.registration.device_id()
+                || io.related_device_for_file(file) == Ok(self.registration.device_id())
+        });
         if io.hosted_device_pointer_registration(
             self.registration.domain(),
             self.registration.address(),
         ) != Some(self.registration)
-            || io
-                .file(file)
-                .is_none_or(|file| file.device_id != self.registration.device_id())
+            || !file_matches
         {
             return Err(NtStatus::INVALID_HANDLE);
         }

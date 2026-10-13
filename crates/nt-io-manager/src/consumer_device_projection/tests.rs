@@ -88,6 +88,34 @@ fn sibling_file_retirement_preserves_exact_device_until_last_lease() {
 }
 
 #[test]
+fn attached_top_accepts_opening_file_only_while_canonical_stack_matches() {
+    let (mut io, opening, files) = fixture();
+    let driver = io.device(opening.device_id()).unwrap().driver_id;
+    let top = io
+        .create_device(
+            driver,
+            None,
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        )
+        .unwrap();
+    let top_pointer = io
+        .bind_hosted_device_pointer(opening.domain(), 0x7000, top)
+        .unwrap();
+    let mut owner = ConsumerDeviceProjection::new(&io, top_pointer).unwrap();
+    assert!(matches!(owner.acquire(&mut io, files[0]), Err(NtStatus::INVALID_HANDLE)));
+    assert_eq!(io.hosted_device_pointer_count(top_pointer), Ok(0));
+
+    io.attach_device_to_stack(top, opening.device_id()).unwrap();
+    let mut lease = owner.acquire(&mut io, files[0]).unwrap();
+    assert_eq!(io.hosted_device_pointer_count(top_pointer), Ok(1));
+    owner.release(&mut io, &mut lease).unwrap();
+    owner.begin_retirement(&mut io).unwrap();
+}
+
+#[test]
 fn stale_registration_and_foreign_lease_cannot_mutate_new_owner() {
     let (mut io, registration, files) = fixture();
     let mut old = ConsumerDeviceProjection::new(&io, registration).unwrap();

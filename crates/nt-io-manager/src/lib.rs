@@ -45,6 +45,7 @@ pub mod device_registry;
 mod directory_control;
 mod dispatch;
 mod driver;
+pub mod driver_reinitialization;
 mod driver_host;
 mod driver_peer;
 mod ea;

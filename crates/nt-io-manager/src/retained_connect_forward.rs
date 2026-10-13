@@ -289,6 +289,22 @@ impl RetainedConnectForward {
         Ok(())
     }
 
+    /// Cancel only before provider entry. The native adapter must separately release its source
+    /// IRP and stack leases after this exact target reference has been retired.
+    pub fn abort_before_enter<P>(
+        mut self,
+        io: &mut IoManager<P>,
+        observed: ConnectForwardIdentity,
+    ) -> Result<(), (ConnectForwardError, Self)> {
+        if self.identity != observed || self.phase != ConnectForwardPhase::Prepared {
+            return Err((ConnectForwardError::InvalidTransition, self));
+        }
+        if let Err(status) = self.target.release(io) {
+            return Err((ConnectForwardError::Target(status), self));
+        }
+        Ok(())
+    }
+
     /// A reused address with a new allocation generation cannot impersonate the
     /// CONNECT_DATA captured before the provider was entered.
     pub fn validate_payload<P>(
@@ -318,6 +334,8 @@ impl RetainedConnectForward {
         if self.phase != ConnectForwardPhase::Prepared {
             return Err(ConnectForwardError::InvalidTransition);
         }
+        let payload = self.payload.ok_or(ConnectForwardError::InvalidTransition)?;
+        payload.validate(io, self, payload.class_device.device_id())?;
         self.phase = ConnectForwardPhase::Entered;
         Ok(())
     }
@@ -405,6 +423,30 @@ mod tests {
         }).unwrap()
     }
 
+    fn capture_test_stack_payload(
+        io: &mut IoManager<MockObjectPort>,
+        forward: &mut RetainedConnectForward,
+        domain: crate::HostedDomainIdentity,
+        class: crate::DeviceId,
+    ) {
+        let class_registration = io.bind_hosted_device_pointer(domain, 0x7000, class).unwrap();
+        let mut snapshot = [0; 16];
+        snapshot[..8].copy_from_slice(&class_registration.address().to_le_bytes());
+        snapshot[8..].copy_from_slice(&0x9000_u64.to_le_bytes());
+        let payload = ConnectPayloadIdentity {
+            forward: forward.identity(),
+            buffer: ConnectBufferSource::Stack(ConnectStackRange {
+                domain, thread: 7, base: 0x7000, bytes: 0x1000, generation: 11,
+            }),
+            input_pointer: 0x7ff0,
+            input_length: 16,
+            snapshot,
+            class_device: class_registration,
+            class_service: 0x9000,
+        };
+        forward.capture_payload(io, payload, class).unwrap();
+    }
+
     #[test]
     fn pending_connect_retains_exact_owner_and_cannot_reenter() {
         let mut io = IoManager::new(MockObjectPort::new());
@@ -416,10 +458,13 @@ mod tests {
             driver, None, DeviceType::UNKNOWN,
             DeviceCharacteristics::empty(), DeviceFlags::empty(), 0,
         ).unwrap();
+        let class = io.create_device(driver, None, DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(), DeviceFlags::empty(), 0).unwrap();
         let domain = io.register_hosted_domain();
         io.bind_hosted_device_pointer(domain, 0x5000, device).unwrap();
         let target = HostedForwardTarget::capture(&mut io, domain, 0x5000).unwrap();
         let mut forward = RetainedConnectForward::new(source(domain, 3), target, ConnectControl::Keyboard);
+        capture_test_stack_payload(&mut io, &mut forward, domain, class);
         let identity = forward.identity();
         assert_eq!(identity.control.code(), 0x000b_0203);
         assert_eq!(forward.enter(&io, identity), Ok(()));
@@ -461,11 +506,14 @@ mod tests {
             driver, None, DeviceType::UNKNOWN,
             DeviceCharacteristics::empty(), DeviceFlags::empty(), 0,
         ).unwrap();
+        let class = io.create_device(driver, None, DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(), DeviceFlags::empty(), 0).unwrap();
         let domain = io.register_hosted_domain();
         io.bind_hosted_device_pointer(domain, 0x5000, first).unwrap();
         let wrong_target = io.bind_hosted_device_pointer(domain, 0x6000, second).unwrap();
         let target = HostedForwardTarget::capture(&mut io, domain, 0x5000).unwrap();
         let mut forward = RetainedConnectForward::new(source(domain, 1), target, ConnectControl::Mouse);
+        capture_test_stack_payload(&mut io, &mut forward, domain, class);
         let identity = forward.identity();
         assert_eq!(identity.control.code(), 0x000f_0203);
         assert_eq!(forward.enter(&io, ConnectForwardIdentity { target: wrong_target, ..identity }), Err(ConnectForwardError::WrongIdentity));
@@ -655,5 +703,37 @@ mod tests {
         let mut wrong_snapshot = payload;
         wrong_snapshot.snapshot[8] ^= 1;
         assert_eq!(wrong_snapshot.validate(&io, &retained, class), Err(ConnectForwardError::WrongIdentity));
+    }
+
+    #[test]
+    fn connect_dispatch_cannot_enter_without_exact_captured_stack_payload() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let driver = io.create_driver(&NtPath::parse_str(r"\Driver\CaptureFirst").unwrap(), Box::new(MockDriverBackend::new())).unwrap();
+        let lower = io.create_device(driver, None, DeviceType::UNKNOWN, DeviceCharacteristics::empty(), DeviceFlags::empty(), 0).unwrap();
+        let class = io.create_device(driver, None, DeviceType::UNKNOWN, DeviceCharacteristics::empty(), DeviceFlags::empty(), 0).unwrap();
+        let domain = io.register_hosted_domain();
+        io.bind_hosted_device_pointer(domain, 0x5000, lower).unwrap();
+        let class_registration = io.bind_hosted_device_pointer(domain, 0x6000, class).unwrap();
+        let mut forward = RetainedConnectForward::new(source(domain, 3),
+            HostedForwardTarget::capture(&mut io, domain, 0x5000).unwrap(), ConnectControl::Keyboard);
+        let identity = forward.identity();
+        assert_eq!(forward.enter(&io, identity), Err(ConnectForwardError::InvalidTransition));
+        let mut snapshot = [0; 16];
+        snapshot[..8].copy_from_slice(&class_registration.address().to_le_bytes());
+        snapshot[8..].copy_from_slice(&0x9000_u64.to_le_bytes());
+        let payload = ConnectPayloadIdentity {
+            forward: identity,
+            buffer: ConnectBufferSource::Stack(ConnectStackRange {
+                domain, thread: 9, base: 0x7000, bytes: 0x1000, generation: 12,
+            }),
+            input_pointer: 0x7ff0,
+            input_length: 16,
+            snapshot,
+            class_device: class_registration,
+            class_service: 0x9000,
+        };
+        assert_eq!(forward.capture_payload(&io, payload, class), Ok(()));
+        assert_eq!(forward.enter(&io, identity), Ok(()));
+        assert_eq!(forward.enter(&io, identity), Err(ConnectForwardError::InvalidTransition));
     }
 }

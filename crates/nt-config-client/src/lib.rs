@@ -16,6 +16,11 @@ mod retained_snapshot_integration;
 mod active_driver_service;
 mod registry_string;
 pub use registry_string::decode_terminated_reg_sz;
+mod rtl_registry_delete;
+pub use rtl_registry_delete::{
+    plan_rtl_registry_delete, plan_rtl_registry_write, RtlRegistryDeleteTarget,
+    RtlRegistryWritePlan,
+};
 mod driver_load_request;
 pub use driver_load_request::{
     capture_driver_service_name, decode_driver_service_name, inspect_driver_service_name,
