@@ -59417,9 +59417,8 @@ pub(crate) unsafe fn service_hosted_lower_pnp_forward(
     hosted_lower_pnp_work::service(ch, reply_cap, badge, operation, address, irp_or_minor)
 }
 
-/// Authenticate and capture the class CONNECT boundary before a port-domain projection exists.
-/// The source is explicitly aborted before provider entry; the real port dispatch is enabled
-/// only when its reverse device aliases and executable class callback are retained.
+/// Authenticate the class CONNECT and configure both reverse aliases in the actual port domain.
+/// The source and aliases are retired before provider entry until the class callback is live.
 pub(crate) unsafe fn service_hosted_connect_forward(
     ch: &crate::spawn_hosts::PumpChannel,
     reply_cap: u64,
@@ -59432,7 +59431,7 @@ pub(crate) unsafe fn service_hosted_connect_forward(
     if operation != 1 || address == 0 || irp == 0 {
         return Some((STATUS_INVALID_PARAMETER, false));
     }
-    let Some((_, inst)) = instance_for_pump_channel(ch, reply_cap) else {
+    let Some((class_index, inst)) = instance_for_pump_channel(ch, reply_cap) else {
         return Some((invalid, false));
     };
     let Some(domain) = instance_domain_identity(inst) else {
@@ -59468,7 +59467,66 @@ pub(crate) unsafe fn service_hosted_connect_forward(
         }
         return Some((invalid, false));
     }
-    print_str(b"[hosted-connect] captured exact class CONNECT; reverse projection pending\n");
+    let lower_origin = match hosted_upper_filter_projection::entered_lower_origin_registration(
+        domain, address,
+    ) {
+        Ok(Some(registration)) if registration.device_id() == target.device_id() => registration,
+        _ => {
+            print_str(b"[hosted-connect] exact port origin unavailable\n");
+            if captured.abort_unentered().is_err() {
+                core::mem::forget(captured);
+                crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_CONNECT_FORWARD_LABEL, 5, address, irp]);
+            }
+            return Some((invalid, false));
+        }
+    };
+    let Some(port_index) = driver_instances().and_then(|table| {
+        table.iter().copied().enumerate().find_map(|(index, candidate)| {
+            (candidate.used && instance_domain_identity(candidate) == Some(lower_origin.domain()))
+                .then_some(index)
+        })
+    }) else {
+        print_str(b"[hosted-connect] exact port instance unavailable\n");
+        if captured.abort_unentered().is_err() {
+            core::mem::forget(captured);
+            crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_CONNECT_FORWARD_LABEL, 6, address, irp]);
+        }
+        return Some((invalid, false));
+    };
+    let prepared = match hosted_reverse_class_projection::prepare(
+        class_index, port_index, port_registration, captured.payload().class_device,
+        lower_origin,
+    ) {
+        Ok(prepared) => prepared,
+        Err(status) => {
+            print_str(b"[hosted-connect] reverse alias preparation failed=");
+            print_hex(status.raw() as u32);
+            print_str(b"\n");
+            if captured.abort_unentered().is_err() {
+                core::mem::forget(captured);
+                crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_CONNECT_FORWARD_LABEL, 7, address, irp]);
+            }
+            return Some((invalid, false));
+        }
+    };
+    match hosted_reverse_class_projection::dispatch_configure(
+        prepared, crate::initial_system_driver_caller(),
+    ) {
+        Ok(configured) => {
+            if hosted_reverse_class_projection::abort_before_provider_entry(configured.owner_id)
+                .is_err()
+            {
+                core::mem::forget(captured);
+                crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_CONNECT_FORWARD_LABEL, 8, address, irp]);
+            }
+            print_str(b"[hosted-connect] reverse aliases configured and retired; provider entry pending\n");
+        }
+        Err(status) => {
+            print_str(b"[hosted-connect] reverse alias configuration failed=");
+            print_hex(status.raw() as u32);
+            print_str(b"\n");
+        }
+    }
     if captured.abort_unentered().is_err() {
         core::mem::forget(captured);
         crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_CONNECT_FORWARD_LABEL, 4, address, irp]);
