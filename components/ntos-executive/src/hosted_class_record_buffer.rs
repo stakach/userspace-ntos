@@ -117,6 +117,61 @@ impl ClassRecordBuffer {
         Ok((start, end))
     }
 
+    /// Transfer from a pinned port allocation without allocating or dereferencing the foreign
+    /// pointer outside the allocation lock. The caller must first validate the matching class
+    /// callback record and keep the source pin through the callback's terminal ACK.
+    pub(super) unsafe fn stage_pinned_port_range(
+        &mut self,
+        port_pin: &hosted_device_allocations::TemporaryPoolPin,
+        source_start: u64,
+        length: usize,
+    ) -> Result<(u64, u64), nt_status::NtStatus> {
+        if self.retired || self.uncertain || self.occupied || !self.generation_live() {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+        let source = port_pin.allocation();
+        let source_offset = source_start
+            .checked_sub(source.component_address)
+            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+        if length == 0
+            || length > hosted_class_callback_lane::MAX_RECORD_BYTES
+            || source_offset
+                .checked_add(length as u64)
+                .is_none_or(|end| end > source.capacity)
+        {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        let start = self.pin.allocation().component_address;
+        let end = start
+            .checked_add(length as u64)
+            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+        self.occupied = true;
+        let mut copied = 0usize;
+        let mut scratch = [0u8; 512];
+        while copied < length {
+            let count = (length - copied).min(scratch.len());
+            if let Err(status) = hosted_device_allocations::copy_temporary_pool_pin(
+                port_pin,
+                source_offset + copied as u64,
+                &mut scratch[..count],
+            ) {
+                self.retain_uncertain();
+                return Err(status);
+            }
+            if let Err(status) = hosted_device_allocations::write_temporary_pool_pin(
+                &self.pin,
+                copied as u64,
+                &scratch[..count],
+            ) {
+                self.retain_uncertain();
+                return Err(status);
+            }
+            copied += count;
+        }
+        self.length = length;
+        Ok((start, end))
+    }
+
     /// The callback's consumed count lives after the maximum record batch, so it cannot
     /// overlap records even when the batch occupies the full 24 KiB.
     pub(super) fn consumed_pointer(&self) -> Result<u64, nt_status::NtStatus> {

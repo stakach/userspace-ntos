@@ -391,8 +391,12 @@ impl HostedIrqRootSession {
     unsafe fn prepare_target_lane(
         &mut self,
         target: HostedIrqLaneView,
+        class: nt_hosted_runtime::HostedIrqTransactionClass,
     ) -> Result<HostedIrqPreparedTarget, nt_status::NtStatus> {
         if let Some(lane_index) = self.active_lane_index(target.identity) {
+            if self.lanes[lane_index].transaction.class != class {
+                return Err(nt_status::NtStatus(STATUS_POSSIBLE_DEADLOCK));
+            }
             let parent = self
                 .call_frames
                 .iter()
@@ -420,11 +424,6 @@ impl HostedIrqRootSession {
         self.lanes
             .try_reserve(1)
             .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-        let class = self
-            .lanes
-            .first()
-            .map(|lane| lane.transaction.class)
-            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
         let transaction = target
             .arena()
             .control
@@ -624,7 +623,7 @@ impl HostedIrqRootSession {
                 Ok(authority) => authority,
                 Err(status) => return fatal_service_result(status.raw()),
             };
-        let target = match self.prepare_target_lane(target_lane) {
+        let target = match self.prepare_target_lane(target_lane, self.lanes[lane_index].transaction.class) {
             Ok(target) => target,
             Err(status) => return fatal_service_result(status.raw()),
         };
@@ -699,7 +698,7 @@ impl HostedIrqRootSession {
                 Ok(authority) => authority,
                 Err(status) => return fatal_service_result(status.raw()),
             };
-        let target = match self.prepare_target_lane(target_lane) {
+        let target = match self.prepare_target_lane(target_lane, self.lanes[lane_index].transaction.class) {
             Ok(target) => target,
             Err(status) => return fatal_service_result(status.raw()),
         };
