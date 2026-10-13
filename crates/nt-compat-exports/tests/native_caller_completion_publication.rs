@@ -36,77 +36,112 @@ fn names(expression: &Expr) -> Vec<String> {
 fn original_caller_publication_waits_for_exact_forwarding_pin_retirement() {
     #[derive(Default)]
     struct Contract {
+        copy_claim: bool,
         gate: bool,
+        ready_restored: bool,
+        inside_gate: bool,
         candidate: bool,
+        selected_best: bool,
         publication: bool,
     }
     impl<'ast> Visit<'ast> for Contract {
-        fn visit_expr_if(&mut self, expression: &'ast syn::ExprIf) {
-            if let Expr::Unary(negated) = &*expression.cond {
-                if matches!(negated.op, syn::UnOp::Not(_)) {
-                    if let Expr::Call(call) = &*negated.expr {
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            if matches!(&local.pat, syn::Pat::Tuple(_))
+                && matches!(local.init.as_ref().map(|init| &*init.expr),
+                    Some(Expr::Try(try_expr)) if matches!(&*try_expr.expr,
+                        Expr::Path(path) if path.path.is_ident("best")))
+            {
+                assert!(self.gate && self.candidate,
+                    "publication must extract only an exactly admitted best candidate");
+                self.selected_best = true;
+            }
+            if matches!(&local.pat, syn::Pat::Ident(ident) if ident.ident == "publishable") {
+                assert!(self.copy_claim && !self.candidate && !self.publication,
+                    "exact pin admission must follow the COPY claim and precede selection");
+                struct GateCall<'ast>(Option<&'ast syn::ExprCall>);
+                impl<'ast> Visit<'ast> for GateCall<'ast> {
+                    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
                         if matches!(&*call.func, Expr::Path(path)
                             if path.path.segments.last().is_some_and(|part|
                                 part.ident == "caller_completion_publishable"))
                         {
-                            assert!(!self.candidate && !self.publication,
-                                "pin admission must precede candidate selection and publication");
-                            assert_eq!(call.args.len(), 7, "exact caller projection tuple");
-                            for (index, required) in [
-                                (0, "storage_instance"),
-                                (1, "node"),
-                                (2, "ready_state"),
-                                (3, "canonical_irp_id"),
-                                (4, "irp"),
-                                (5, "source_ticket_id"),
-                                (6, "source_ticket_generation"),
-                            ] {
-                                assert!(names(&call.args[index]).iter().any(|name| name == required),
-                                    "argument {index} must retain {required}");
-                            }
-                            let mut body = Names::default();
-                            body.visit_block(&expression.then_branch);
-                            for forbidden in ["acknowledge_pending_irp_completion",
-                                "release_pending_irp_graph_component", "store", "compare_exchange"] {
-                                assert!(!body.0.iter().any(|name| name == forbidden),
-                                    "a pinned completion must not acknowledge, free or publish");
-                            }
-                            struct Skip(bool);
-                            impl<'ast> Visit<'ast> for Skip {
-                                fn visit_expr_continue(&mut self, _: &'ast syn::ExprContinue) {
-                                    self.0 = true;
-                                }
-                            }
-                            let mut skip = Skip(false);
-                            skip.visit_block(&expression.then_branch);
-                            assert!(skip.0, "refusal must leave the node retained and scan another node");
-                            self.gate = true;
+                            assert!(self.0.is_none(), "one exact forwarding pin gate");
+                            self.0 = Some(call);
                         }
+                        syn::visit::visit_expr_call(self, call);
                     }
                 }
+                let mut gate_call = GateCall(None);
+                gate_call.visit_expr(&local.init.as_ref().expect("publishable initializer").expr);
+                let call = gate_call.0.expect("exact forwarding pin admission gate");
+                assert_eq!(call.args.len(), 7, "exact caller projection tuple");
+                for (index, required) in [
+                    (0, "storage_instance"),
+                    (1, "node"),
+                    (2, "ready_state"),
+                    (3, "canonical_irp_id"),
+                    (4, "irp"),
+                    (5, "source_ticket_id"),
+                    (6, "source_ticket_generation"),
+                ] {
+                    assert!(names(&call.args[index]).iter().any(|name| name == required),
+                        "argument {index} must retain {required}");
+                }
+                self.gate = true;
             }
-            syn::visit::visit_expr_if(self, expression);
+            syn::visit::visit_local(self, local);
+        }
+
+        fn visit_expr_if(&mut self, expression: &'ast syn::ExprIf) {
+            if matches!(&*expression.cond, Expr::Path(path) if path.path.is_ident("publishable")) {
+                assert!(self.gate && self.ready_restored,
+                    "candidate selection must follow exact pin admission and COPY restoration");
+                assert!(expression.else_branch.is_none(),
+                    "a pinned completion must not select or publish through an else branch");
+                self.inside_gate = true;
+                self.visit_block(&expression.then_branch);
+                self.inside_gate = false;
+            } else {
+                syn::visit::visit_expr_if(self, expression);
+            }
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if call.method == "compare_exchange" {
+                let arguments = call.args.iter().flat_map(names).collect::<Vec<_>>();
+                if arguments.iter().any(|name| name == "copying_state") {
+                    assert!(!self.gate, "COPY must be claimed before pin admission");
+                    self.copy_claim = true;
+                }
+                if arguments.iter().any(|name| name == "published_state") {
+                    assert!(self.gate && self.candidate && self.selected_best,
+                        "PUBLISHED transition must follow admitted best extraction");
+                    self.publication = true;
+                }
+            }
+            if call.method == "store"
+                && call.args.iter().any(|arg| names(arg).iter().any(|name| name == "ready_state"))
+            {
+                assert!(self.gate && !self.candidate,
+                    "COPY restoration must follow pin admission and precede selection");
+                self.ready_restored = true;
+            }
+            syn::visit::visit_expr_method_call(self, call);
         }
 
         fn visit_expr_assign(&mut self, assignment: &'ast syn::ExprAssign) {
             if matches!(&*assignment.left, Expr::Path(path) if path.path.is_ident("best")) {
-                assert!(self.gate, "original caller publication lacks exact forwarding pin gate");
+                assert!(self.inside_gate && self.ready_restored,
+                    "best candidate must be selected only inside the admitted pin branch");
                 self.candidate = true;
             }
             syn::visit::visit_expr_assign(self, assignment);
         }
-
-        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
-            if path.path.is_ident("HOSTED_IRP_PUBLISHED") {
-                assert!(self.gate, "READY must not become PUBLISHED while forwarding pins remain");
-                self.publication = true;
-            }
-            syn::visit::visit_expr_path(self, path);
-        }
     }
     let mut contract = Contract::default();
     contract.visit_item_fn(&poll("poll_hosted_completion_at_storage"));
-    assert!(contract.gate && contract.candidate && contract.publication);
+    assert!(contract.copy_claim && contract.gate && contract.ready_restored
+        && contract.candidate && contract.selected_best && contract.publication);
     let mut wrapper = Names::default();
     wrapper.visit_item_fn(&poll("poll_hosted_completion"));
     assert!(wrapper.0.iter().any(|name| name == "poll_hosted_completion_at_storage"));
