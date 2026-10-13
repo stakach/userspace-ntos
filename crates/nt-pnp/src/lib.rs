@@ -31,6 +31,11 @@ mod acpi_pci_scope_catalog;
 mod pci_interrupt_routes;
 mod pci_inventory;
 mod pci_bus_reported_resources;
+mod platform_bus_reported_resources;
+pub use platform_bus_reported_resources::{
+    admit_bus_reported_platform_resources, BusReportedPlatformResources,
+    BusReportedPlatformResourceError,
+};
 
 pub use pci_bus_reported_resources::{validate_pci_bus_reported_resources, PciBusResourceError};
 
