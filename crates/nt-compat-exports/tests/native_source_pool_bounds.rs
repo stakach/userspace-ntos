@@ -219,6 +219,37 @@ fn valid_pool_interior_retains_full_allocation_identity() {
 }
 
 #[test]
+fn pool_range_crossing_into_next_allocation_is_not_captured() {
+    let first = FSD_POOL_VADDR + POOL_DATA_OFF + 16;
+    reset(POOL_DATA_OFF + 0x60, 0x20, 7, false);
+    MEMORY.with(|memory| {
+        let mut memory = memory.borrow_mut();
+        memory.words.insert(instance().exec_pool_va + POOL_DATA_OFF + 0x30, 0x20);
+        memory.words.insert(instance().exec_pool_va + POOL_DATA_OFF + 0x38, 8);
+    });
+    let result = unsafe { mapped_memory_identity_unlocked(3, instance(), None, first + 0x1c, 8) };
+    assert_eq!(result, None, "a range spanning two live allocations has no single owner");
+    assert_eq!(MEMORY.with(|memory| memory.borrow().translations), 0,
+        "a rejected pool range cannot fall through to a mapped window");
+}
+
+#[test]
+fn recycled_pool_generation_invalidates_captured_identity() {
+    reset(POOL_DATA_OFF + 16 + 0x80, 0x80, 7, false);
+    let address = FSD_POOL_VADDR + POOL_DATA_OFF + 16 + 4;
+    let captured = unsafe { mapped_memory_identity_unlocked(3, instance(), None, address, 8) }
+        .expect("initial live pool allocation");
+    assert!(unsafe { memory_identity_matches_unlocked(3, instance(), captured) });
+
+    MEMORY.with(|memory| {
+        memory.borrow_mut().words.insert(instance().exec_pool_va + POOL_DATA_OFF + 8, 8);
+    });
+    assert!(!unsafe { memory_identity_matches_unlocked(3, instance(), captured) },
+        "the same address and capacity cannot stand in for the captured generation");
+    assert_eq!(MEMORY.with(|memory| memory.borrow().translations), 0);
+}
+
+#[test]
 fn pool_address_cannot_revalidate_as_generationless_mapped_range() {
     reset(POOL_DATA_OFF + 16 + 0x80, 0x80, 7, false);
     let address = FSD_POOL_VADDR + POOL_DATA_OFF + 16;
