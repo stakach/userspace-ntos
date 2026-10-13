@@ -183,6 +183,7 @@ impl HookPayloadIdentity {
         io: &IoManager<P>,
         retained_connect: &RetainedConnectForward,
         retained_class_target: &HostedForwardTarget,
+        expected_source: SourceIrpForwardIdentity,
         expected_source_device: HostedDevicePointerRegistration,
     ) -> Result<(), ConnectForwardError> {
         let class_id = self.connect.class_device.device_id();
@@ -207,18 +208,91 @@ impl HookPayloadIdentity {
             }
         };
         if source_domain == self.connect.forward.source.allocation().domain
+            || self.source != expected_source
+            || !matches!(retained_connect.phase(), ConnectForwardPhase::Entered | ConnectForwardPhase::Pending)
             || !source_live
             || self.input_length != required_bytes
             || self.input_pointer & 7 != 0
             || !buffer_live
             || self.class_target.domain() != source_domain
-            || self.class_target.device_id() != class_id
             || self.class_target != retained_class_target.registration()
-            || retained_class_target.validate(io).ok() != Some(class_id)
+            || retained_class_target.validate(io).ok() != Some(self.class_target.device_id())
+            || io.top_of_device_stack(expected_source_device.device_id()).ok()
+                != Some(self.class_target.device_id())
         {
             return Err(ConnectForwardError::WrongIdentity);
         }
         Ok(())
+    }
+}
+
+/// ReactOS i8042prt completes its pending CONNECT only after the reverse HOOK
+/// has returned (or its wait has observed completion). This records that order
+/// without treating the port's dispatch return as provider completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HookForwardPhase {
+    AwaitingHook,
+    Entered(SourceIrpForwardIdentity),
+    Terminal(SourceIrpForwardIdentity, NtStatus),
+    ConnectTerminal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct I8042ConnectHookSequence {
+    connect: ConnectForwardIdentity,
+    phase: HookForwardPhase,
+}
+
+impl I8042ConnectHookSequence {
+    pub const fn new(connect: ConnectForwardIdentity) -> Self {
+        Self { connect, phase: HookForwardPhase::AwaitingHook }
+    }
+
+    pub const fn phase(&self) -> HookForwardPhase { self.phase }
+
+    pub fn enter_hook<P>(
+        &mut self,
+        io: &IoManager<P>,
+        connect: &RetainedConnectForward,
+        hook: HookPayloadIdentity,
+        class_target: &HostedForwardTarget,
+        source: SourceIrpForwardIdentity,
+        source_device: HostedDevicePointerRegistration,
+    ) -> Result<(), ConnectForwardError> {
+        if self.phase != HookForwardPhase::AwaitingHook || connect.identity() != self.connect {
+            return Err(ConnectForwardError::InvalidTransition);
+        }
+        hook.validate(io, connect, class_target, source, source_device)?;
+        self.phase = HookForwardPhase::Entered(source);
+        Ok(())
+    }
+
+    pub fn observe_hook_terminal(
+        &mut self,
+        source: SourceIrpForwardIdentity,
+        status: NtStatus,
+    ) -> Result<(), ConnectForwardError> {
+        if self.phase != HookForwardPhase::Entered(source) || status == NtStatus::PENDING {
+            return Err(ConnectForwardError::InvalidTransition);
+        }
+        self.phase = HookForwardPhase::Terminal(source, status);
+        Ok(())
+    }
+
+    pub fn observe_connect_terminal<P>(
+        &mut self,
+        io: &IoManager<P>,
+        connect: &mut RetainedConnectForward,
+        status: NtStatus,
+    ) -> Result<ConnectForwardPhase, ConnectForwardError> {
+        if !matches!(self.phase, HookForwardPhase::Terminal(_, _))
+            || connect.identity() != self.connect
+        {
+            return Err(ConnectForwardError::InvalidTransition);
+        }
+        let phase = connect.observe_dispatch(io, self.connect, ConnectDispatchReturn::Terminal(status))?;
+        self.phase = HookForwardPhase::ConnectTerminal;
+        Ok(phase)
     }
 }
 
@@ -594,13 +668,16 @@ mod tests {
         let driver = io.create_driver(&NtPath::parse_str(r"\Driver\HookPayload").unwrap(), Box::new(MockDriverBackend::new())).unwrap();
         let lower = io.create_device(driver, None, DeviceType::UNKNOWN, DeviceCharacteristics::empty(), DeviceFlags::empty(), 0).unwrap();
         let class = io.create_device(driver, None, DeviceType::UNKNOWN, DeviceCharacteristics::empty(), DeviceFlags::empty(), 0).unwrap();
+        let main_class = io.create_device(driver, None, DeviceType::UNKNOWN, DeviceCharacteristics::empty(), DeviceFlags::empty(), 0).unwrap();
+        io.attach_device_to_stack(class, lower).unwrap();
         let port_domain = io.register_hosted_domain();
         let class_domain = io.register_hosted_domain();
         let lower_registration = io.bind_hosted_device_pointer(class_domain, 0x5000, lower).unwrap();
-        let class_registration = io.bind_hosted_device_pointer(class_domain, 0x6000, class).unwrap();
+        let class_registration = io.bind_hosted_device_pointer(class_domain, 0x6000, main_class).unwrap();
+        io.bind_hosted_device_pointer(class_domain, 0x6100, class).unwrap();
         let class_in_port = io.bind_hosted_device_pointer(port_domain, 0x7000, class).unwrap();
         let source_in_port = io.bind_hosted_device_pointer(port_domain, 0x8000, lower).unwrap();
-        let retained_connect = RetainedConnectForward::new(
+        let mut retained_connect = RetainedConnectForward::new(
             source(class_domain, 3),
             HostedForwardTarget::capture(&mut io, class_domain, 0x5000).unwrap(),
             ConnectControl::Keyboard,
@@ -618,9 +695,13 @@ mod tests {
             class_device: class_registration,
             class_service: 0x9000,
         };
+        retained_connect.capture_payload(&io, connect, main_class).unwrap();
+        retained_connect.enter(&io, retained_connect.identity()).unwrap();
+        retained_connect.observe_dispatch(&io, retained_connect.identity(), ConnectDispatchReturn::Pending).unwrap();
+        let hook_source = source(port_domain, 4);
         let hook = HookPayloadIdentity {
             connect,
-            source: source(port_domain, 4),
+            source: hook_source,
             buffer: HookBufferSource::Pool(ConnectBufferAllocation { domain: port_domain, base: 0xa000, bytes: 48, generation: 10 }),
             input_pointer: 0xa000,
             input_length: 48,
@@ -628,15 +709,32 @@ mod tests {
             class_target: class_in_port,
         };
         assert_eq!(hook.code(), 0x000b_3fc3);
-        assert_eq!(hook.validate(&io, &retained_connect, &retained_class_target, source_in_port), Ok(()));
+        assert_eq!(hook.validate(&io, &retained_connect, &retained_class_target, hook_source, source_in_port), Ok(()));
+        let mut sequence = I8042ConnectHookSequence::new(retained_connect.identity());
+        assert_eq!(
+            sequence.observe_connect_terminal(&io, &mut retained_connect, NtStatus::SUCCESS),
+            Err(ConnectForwardError::InvalidTransition),
+        );
+        let wrong_top = io.bind_hosted_device_pointer(port_domain, 0x7100, main_class).unwrap();
+        let wrong_top_target = HostedForwardTarget::capture(&mut io, port_domain, 0x7100).unwrap();
+        assert_eq!(
+            HookPayloadIdentity { class_target: wrong_top, ..hook }.validate(
+                &io, &retained_connect, &wrong_top_target, hook_source, source_in_port,
+            ),
+            Err(ConnectForwardError::WrongIdentity),
+        );
+        io.detach_device_from_stack(class).unwrap();
+        assert_eq!(hook.validate(&io, &retained_connect, &retained_class_target, hook_source, source_in_port), Err(ConnectForwardError::WrongIdentity));
+        io.attach_device_to_stack(class, lower).unwrap();
         for bad in [
             HookPayloadIdentity { input_pointer: 0xa020, ..hook },
             HookPayloadIdentity { input_length: 40, ..hook },
             HookPayloadIdentity { buffer: HookBufferSource::Pool(ConnectBufferAllocation { domain: port_domain, base: 0xa000, bytes: 48, generation: 0 }), ..hook },
             HookPayloadIdentity { source: source(class_domain, 4), ..hook },
+            HookPayloadIdentity { source: source(port_domain, 5), ..hook },
             HookPayloadIdentity { class_target: class_registration, ..hook },
         ] {
-            assert_eq!(bad.validate(&io, &retained_connect, &retained_class_target, source_in_port), Err(ConnectForwardError::WrongIdentity));
+            assert_eq!(bad.validate(&io, &retained_connect, &retained_class_target, hook_source, source_in_port), Err(ConnectForwardError::WrongIdentity));
         }
         // ReactOS i8042prt sends HOOK from KeyboardHook inside the port FDO extension.
         let extension_hook = HookPayloadIdentity {
@@ -650,14 +748,22 @@ mod tests {
             snapshot: [5; 48],
             ..hook
         };
-        assert_eq!(extension_hook.validate(&io, &retained_connect, &retained_class_target, source_in_port), Ok(()));
+        assert_eq!(extension_hook.validate(&io, &retained_connect, &retained_class_target, hook_source, source_in_port), Ok(()));
         for bad in [
             HookPayloadIdentity { buffer: HookBufferSource::DeviceExtension(HookDeviceExtensionRange { owner: class_in_port, base: 0xb000, bytes: 0x200, generation: 12 }), ..extension_hook },
             HookPayloadIdentity { buffer: HookBufferSource::DeviceExtension(HookDeviceExtensionRange { owner: source_in_port, base: 0xb000, bytes: 0x200, generation: 0 }), ..extension_hook },
             HookPayloadIdentity { input_pointer: 0xb1e0, ..extension_hook },
         ] {
-            assert_eq!(bad.validate(&io, &retained_connect, &retained_class_target, source_in_port), Err(ConnectForwardError::WrongIdentity));
+            assert_eq!(bad.validate(&io, &retained_connect, &retained_class_target, hook_source, source_in_port), Err(ConnectForwardError::WrongIdentity));
         }
+        assert_eq!(sequence.enter_hook(&io, &retained_connect, hook, &retained_class_target, hook_source, source_in_port), Ok(()));
+        assert_eq!(sequence.enter_hook(&io, &retained_connect, hook, &retained_class_target, hook_source, source_in_port), Err(ConnectForwardError::InvalidTransition));
+        assert_eq!(sequence.observe_hook_terminal(source(port_domain, 5), NtStatus::SUCCESS), Err(ConnectForwardError::InvalidTransition));
+        assert_eq!(sequence.observe_hook_terminal(hook_source, NtStatus::PENDING), Err(ConnectForwardError::InvalidTransition));
+        assert_eq!(sequence.observe_hook_terminal(hook_source, NtStatus::SUCCESS), Ok(()));
+        assert_eq!(sequence.observe_connect_terminal(&io, &mut retained_connect, NtStatus::SUCCESS), Ok(ConnectForwardPhase::Terminal(NtStatus::SUCCESS)));
+        assert_eq!(sequence.observe_connect_terminal(&io, &mut retained_connect, NtStatus::SUCCESS), Err(ConnectForwardError::InvalidTransition));
+        assert_eq!(hook.validate(&io, &retained_connect, &retained_class_target, hook_source, source_in_port), Err(ConnectForwardError::WrongIdentity));
     }
 
     #[test]
