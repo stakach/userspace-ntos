@@ -65,7 +65,8 @@ impl Drop for ManagerScope {
 
 mod hosted_device_allocations {
     pub(super) use super::native::{protect_allocation, protects_allocation,
-        registration, admit_retirement, admit_retirement_checked, finish_retirement};
+        registration, accepted_registration, record_accepted_registration, admit_retirement,
+        admit_retirement_checked, finish_retirement};
 
     pub(super) fn publish_registration(
         inst: super::DriverInstance,
@@ -282,6 +283,7 @@ fn actual_adapter_protects_exact_allocations_and_retains_uncertain_retirement() 
         native::protect_allocation(pool.inst, ADDRESS).unwrap();
         assert!(native::generic_free_admission(pool.inst, ADDRESS).is_err());
         assert!(native::generic_free_admission(pool.inst, ADDRESS + CAPACITY - 1).is_err());
+        native::record_accepted_registration(pool.inst, registration).unwrap();
         native::publish_registration(pool.inst, registration).unwrap();
         assert!(native::generic_free_admission(pool.inst, ADDRESS).is_err());
 
@@ -355,6 +357,35 @@ fn actual_adapter_protects_exact_allocations_and_retains_uncertain_retirement() 
     unsafe { publication_failure_preserves_canonical_owner(driver); }
     unsafe { late_rebind_refuses_actual_physical_retirement(driver); }
     unsafe { malformed_device_preflight_does_not_enter_retirement(); }
+    unsafe { stale_registration_cannot_retire_new_unregistered_storage(driver); }
+}
+
+unsafe fn stale_registration_cannot_retire_new_unregistered_storage(
+    driver: nt_io_manager::DriverId,
+) {
+    let device = io_manager_mut().create_device(driver, None, DeviceType::UNKNOWN,
+        DeviceCharacteristics::empty(), DeviceFlags::empty(), 0).unwrap();
+    let logical = io_manager_mut().register_hosted_domain();
+    let stale = io_manager_mut().bind_hosted_device_pointer(logical, ADDRESS, device).unwrap();
+    io_manager_mut().retire_hosted_device_pointer(stale).unwrap();
+    io_manager_mut().destroy_device(device).unwrap();
+
+    let physical = io_manager_mut().register_hosted_domain();
+    let pool = Pool::new(physical, 61, 0x9000);
+    let device_exec = pool.inst.exec_pool_va + PAYLOAD;
+    write_unaligned(device_exec as *mut i16, WDM_X64_IO_TYPE_DEVICE);
+    write_unaligned((device_exec + 2) as *mut u16, WDM_X64_DEVICE_OBJECT_SIZE as u16);
+    native::protect_allocation(pool.inst, ADDRESS).unwrap();
+    assert_eq!(native::registration(pool.inst, ADDRESS).unwrap(), None);
+    let before = pool._bytes.to_vec();
+    assert_eq!(retirement::retire_hosted_device_projection(pool.inst, ADDRESS,
+        retirement::CanonicalRetirement::Retired { registration: stale }, None),
+        Err(nt_status::NtStatus::INVALID_HANDLE));
+    assert_eq!(&*pool._bytes, before.as_slice());
+    assert!(native::protects_allocation(pool.inst, ADDRESS));
+    retirement::retire_hosted_device_projection(pool.inst, ADDRESS,
+        retirement::CanonicalRetirement::ConfirmedUnbound { domain: logical }, None).unwrap();
+    assert!(native::instance_quiesced(pool.inst));
 }
 
 unsafe fn malformed_device_preflight_does_not_enter_retirement() {
@@ -388,8 +419,11 @@ unsafe fn late_rebind_refuses_actual_physical_retirement(driver: nt_io_manager::
     write_unaligned((pool.inst.exec_pool_va + PAYLOAD + 2) as *mut u16, WDM_X64_DEVICE_OBJECT_SIZE as u16);
     native::protect_allocation(pool.inst, ADDRESS).unwrap();
     let original = io_manager_mut().bind_hosted_device_pointer(domain, ADDRESS, device).unwrap();
-    // Model accepted bind followed by refused catalog publication: no physical registration.
+    // Model accepted bind followed by refused catalog publication: the physical owner still
+    // records the exact accepted token before the later attach can fail.
+    native::record_accepted_registration(pool.inst, original).unwrap();
     assert_eq!(native::registration(pool.inst, ADDRESS).unwrap(), None);
+    assert_eq!(native::accepted_registration(pool.inst, ADDRESS).unwrap(), Some(original));
     io_manager_mut().retire_hosted_device_pointer(original).unwrap();
     let rebound = io_manager_mut().bind_hosted_device_pointer(domain, ADDRESS, device).unwrap();
     assert_ne!(rebound, original);
@@ -484,10 +518,11 @@ unsafe fn publication_failure_preserves_canonical_owner(driver: nt_io_manager::D
     io_manager_mut().release_hosted_device_projection_reference(&mut pin).unwrap();
     io_manager_mut().retire_hosted_device_pointer(accepted).unwrap();
     io_manager_mut().destroy_device(other).unwrap();
-    // Physical catalog never published this registration. Canonical retirement above, not None
-    // observation below, supplies the prerequisite to the failed-bind physical cleanup.
+    // Physical publication never completed, but the physical owner retained the accepted
+    // canonical token. Retirement attaches that token under the same checked exclusion.
     assert_eq!(native::registration(failed.inst, ADDRESS).unwrap(), None);
-    let retirement = native::admit_retirement(failed.inst, ADDRESS, None).unwrap();
+    assert_eq!(native::accepted_registration(failed.inst, ADDRESS).unwrap(), Some(accepted));
+    let retirement = native::admit_retirement(failed.inst, ADDRESS, Some(accepted)).unwrap();
     assert!(failed.free_locked(true));
     native::finish_retirement(retirement).unwrap();
 }

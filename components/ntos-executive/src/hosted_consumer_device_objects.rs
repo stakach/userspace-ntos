@@ -177,7 +177,7 @@ unsafe fn retire(id: u64) -> Result<(), i32> {
             if !hosted_device_allocations::protects_allocation(inst, address) {
                 hosted_device_allocations::protect_allocation_exact(inst, address, Some(identity)).map_err(|status| status.raw())?;
             }
-            let registration = hosted_device_allocations::registration(inst, address).map_err(|status| status.raw())?;
+            let registration = hosted_device_allocations::accepted_registration(inst, address).map_err(|status| status.raw())?;
             // Catalog provenance is checked only after the row-owned canonical retirement gate.
             // A failed catalog publication may leave None, but must never hide a live bind.
             if !row(id).canonical_retired || registration.is_some_and(|registration|

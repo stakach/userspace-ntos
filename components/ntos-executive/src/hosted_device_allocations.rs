@@ -9,6 +9,7 @@ struct Row {
     instance: DriverInstance,
     domain: HostedDomainIdentity,
     allocation: SourcePoolAllocationIdentity,
+    accepted: Option<HostedDevicePointerRegistration>,
     registration: Option<HostedDevicePointerRegistration>,
     owner: ProjectionAllocationOwner,
     retirement_pending: bool,
@@ -717,6 +718,7 @@ pub(super) unsafe fn protect_allocation_exact(
         instance: inst,
         domain,
         allocation: current,
+        accepted: None,
         registration: None,
         owner,
         retirement_pending: false,
@@ -739,11 +741,33 @@ pub(super) fn publish_registration(
     if row.retirement_pending {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
+    if row.accepted != Some(registration) {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
     if row.registration == Some(registration) {
         return Ok(());
     }
     ledger().attach_registration(&row.owner, registration)?;
     row.registration = Some(registration);
+    Ok(())
+}
+
+/// Retain the minted canonical token before fallible physical catalog publication. A failed
+/// later attach still leaves exact provenance for canonical cleanup and physical retirement.
+pub(super) fn record_accepted_registration(
+    inst: DriverInstance,
+    registration: HostedDevicePointerRegistration,
+) -> Result<(), nt_status::NtStatus> {
+    let _guard = lock();
+    let row = rows()
+        .iter_mut()
+        .find(|row| same_arena(row.instance, inst)
+            && row.allocation.component_address == registration.address())
+        .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if row.retirement_pending || row.accepted.is_some_and(|accepted| accepted != registration) {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    row.accepted = Some(registration);
     Ok(())
 }
 
@@ -817,8 +841,15 @@ pub(super) unsafe fn admit_retirement_checked<T>(
     if rows()[index].retirement_pending {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
+    if rows()[index].accepted != registration {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
     let checked = check(&RetirementPreflight { domain })?;
     let row = &mut rows()[index];
+    if row.registration.is_none() && registration.is_some() {
+        ledger().attach_registration(&row.owner, registration.unwrap())?;
+        row.registration = registration;
+    }
     ledger().begin_retirement(&row.owner, domain, current, registration)?;
     row.retirement_pending = true;
     Ok((LocalRetirement {
@@ -946,6 +977,20 @@ pub(super) fn registration(
         .iter()
         .find(|row| same_arena(row.instance, inst) && row.allocation.component_address == address)
         .map(|row| row.registration)
+        .ok_or(nt_status::NtStatus::INVALID_HANDLE)
+}
+
+/// Cleanup provenance includes a canonical bind accepted before a later physical publication
+/// refusal. Live callers use `registration`, which exposes only fully published rows.
+pub(super) fn accepted_registration(
+    inst: DriverInstance,
+    address: u64,
+) -> Result<Option<HostedDevicePointerRegistration>, nt_status::NtStatus> {
+    let _guard = lock();
+    rows()
+        .iter()
+        .find(|row| same_arena(row.instance, inst) && row.allocation.component_address == address)
+        .map(|row| row.accepted)
         .ok_or(nt_status::NtStatus::INVALID_HANDLE)
 }
 

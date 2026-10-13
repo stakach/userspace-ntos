@@ -41,8 +41,8 @@ pub(super) unsafe fn retire_hosted_device_projection(
         CanonicalRetirement::ConfirmedUnbound { .. } => None,
         CanonicalRetirement::Retired { registration } => Some(registration),
     };
-    let physical_registration = hosted_device_allocations::registration(inst, device_object)?;
-    if physical_registration.is_some() && physical_registration != registration {
+    let physical_registration = hosted_device_allocations::accepted_registration(inst, device_object)?;
+    if physical_registration != registration {
         return Err(nt_status::NtStatus::INVALID_HANDLE);
     }
     let (retirement, (device_exec, next_device, target_link, rollback_pdo_exec)) =
