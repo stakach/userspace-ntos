@@ -1,5 +1,11 @@
 # Lessons
 
+## Stage The Whole Public Export Chain
+- Before committing a tested crate change, inspect `git diff --cached` for every module
+  re-export between the new type and the crate root. Local tests can pass from uncommitted
+  files while CI's clean checkout fails to compile. Validate the staged tree as the unit
+  being pushed, then check exact-head CI.
+
 ## Resume Completed Agents Explicitly
 - A message to a completed agent does not start another turn. Use `followup_task` for
   implementation approval after its final response, then confirm the agent resumed.
