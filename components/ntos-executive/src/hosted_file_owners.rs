@@ -195,7 +195,10 @@ fn remove(id: u64) -> Result<Row, nt_status::NtStatus> {
     Ok(rows().swap_remove(index))
 }
 
-fn reserve(caller: nt_process::native_handle::NativeHandleCaller, output_capture: ExternalFileIrpOutputCapture) -> Result<u64, nt_status::NtStatus> {
+fn reserve(
+    caller: nt_process::native_handle::NativeHandleCaller,
+    output_capture: ExternalFileIrpOutputCapture,
+) -> Result<u64, nt_status::NtStatus> {
     let id = unsafe { NEXT_ID };
     let next = id
         .checked_add(1)
@@ -203,8 +206,9 @@ fn reserve(caller: nt_process::native_handle::NativeHandleCaller, output_capture
     rows()
         .try_reserve(1)
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    let requestor = unsafe { crate::with_provider_process_manager(|pm| pm.reference_native_requestor(caller)) }
-        .map_err(|status| nt_status::NtStatus(status as i32))?;
+    let requestor =
+        unsafe { crate::with_provider_process_manager(|pm| pm.reference_native_requestor(caller)) }
+            .map_err(|status| nt_status::NtStatus(status as i32))?;
     unsafe { NEXT_ID = next };
     rows().push(Row {
         caller,
@@ -467,7 +471,8 @@ pub(super) fn dispatch(
         }
     };
     row(id).flight = Flight::Dispatch;
-    let returned = hosted_file_dispatch::invoke(invocation, row(id).caller);
+    let returned =
+        hosted_file_dispatch::invoke(invocation, row(id).caller, policy.output_capture());
     let result = match io_manager_mut().finish_external_file_irp(returned) {
         Ok(result) => result,
         Err(rejection) => {
@@ -630,8 +635,33 @@ pub(super) fn copy_output(
     offset: u64,
     output: &mut [u8],
 ) -> Result<usize, nt_status::NtStatus> {
+    copy_captured(irp_id, offset, output, false)
+}
+
+/// Read the terminal Type3InputBuffer snapshot before ACK. Only the mutable METHOD_NEITHER
+/// policy can expose this range; an ordinary output copy must never index the input owner.
+pub(super) fn copy_mutable_input(
+    irp_id: IrpId,
+    offset: u64,
+    output: &mut [u8],
+) -> Result<usize, nt_status::NtStatus> {
+    copy_captured(irp_id, offset, output, true)
+}
+
+fn copy_captured(
+    irp_id: IrpId,
+    offset: u64,
+    output: &mut [u8],
+    mutable_input: bool,
+) -> Result<usize, nt_status::NtStatus> {
     let _durable = crate::allocator::enter_durable();
     let id = find(irp_id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if (row(id).output_capture
+        == nt_io_manager::detached_file_irp::ExternalFileIrpOutputCapture::MethodNeitherInput)
+        != mutable_input
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
     ensure_completion(id)?;
     let offset = usize::try_from(offset).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
     loop {
@@ -643,7 +673,12 @@ pub(super) fn copy_output(
                 let length = output.len().min(completion.capture_len() - offset);
                 let end = offset + length;
                 if end <= completion.captured_len() || length == 0 {
-                    output[..length].copy_from_slice(&completion.buffers().output()[offset..end]);
+                    let captured = if mutable_input {
+                        completion.buffers().input()
+                    } else {
+                        completion.buffers().output()
+                    };
+                    output[..length].copy_from_slice(&captured[offset..end]);
                     return Ok(length);
                 }
             }

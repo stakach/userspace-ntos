@@ -16,6 +16,37 @@ struct Row {
 static LOCK: AtomicU64 = AtomicU64::new(0);
 static mut LEDGER: ProjectionAllocationLedger = ProjectionAllocationLedger::new();
 static mut ROWS: Vec<Row> = Vec::new();
+// Short-lived foreign callback input/output ranges. A pin protects the whole exact pool
+// allocation, including interior pointers passed to the callback. A lost effect is quarantined.
+struct TemporaryPinRow {
+    id: u64,
+    instance: DriverInstance,
+    domain: HostedDomainIdentity,
+    allocation: SourcePoolAllocationIdentity,
+    uncertain: bool,
+}
+static mut TEMPORARY_PINS: Vec<TemporaryPinRow> = Vec::new();
+static mut NEXT_TEMPORARY_PIN_ID: u64 = 1;
+
+fn temporary_pins() -> &'static mut Vec<TemporaryPinRow> {
+    unsafe { &mut *core::ptr::addr_of_mut!(TEMPORARY_PINS) }
+}
+
+/// Exact physical pin receipt. Dropping this value does not release its pool exclusion.
+#[must_use = "retain through callback acknowledgement; quarantine uncertain effects"]
+pub(super) struct TemporaryPoolPin {
+    id: u64,
+    instance: DriverInstance,
+    domain: HostedDomainIdentity,
+    allocation: SourcePoolAllocationIdentity,
+    held: bool,
+}
+
+impl TemporaryPoolPin {
+    pub(super) fn allocation(&self) -> SourcePoolAllocationIdentity {
+        self.allocation
+    }
+}
 // FILE_OBJECT storage has the same pool exclusion requirement as Device projections. Its
 // constructor name is captured before the driver's CREATE callback can mutate FileName.Buffer.
 struct FileStorageRow {
@@ -131,6 +162,304 @@ unsafe fn allocation(
     })
 }
 
+/// Resolve an interior byte range to one live allocation while the caller holds the allocator
+/// lock. `allocation` itself deliberately accepts only a base address.
+unsafe fn allocation_containing(
+    inst: DriverInstance,
+    address: u64,
+    bytes: u64,
+) -> Result<SourcePoolAllocationIdentity, nt_status::NtStatus> {
+    validate_arena(inst)?;
+    if bytes == 0 {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let used = read_volatile(inst.exec_pool_va as *const u64);
+    if used < POOL_DATA_OFF || used > FSD_POOL_FRAMES * 0x1000 {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let offset = address
+        .checked_sub(FSD_POOL_VADDR)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let found = nt_io_manager::hosted_pool_range::walk_hosted_pool_allocation(
+        FSD_POOL_FRAMES * 0x1000,
+        used,
+        POOL_DATA_OFF,
+        offset,
+        bytes,
+        |header| {
+            if header.checked_add(8)? > used {
+                return None;
+            }
+            Some(read_volatile(
+                inst.exec_pool_va.checked_add(header)? as *const u64
+            ))
+        },
+    )
+    .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let base = FSD_POOL_VADDR
+        .checked_add(found.base)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let exact = allocation(inst, base)?;
+    if exact.capacity != found.capacity {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    Ok(exact)
+}
+
+/// Pin the exact live pool allocation containing a callback byte range before provider entry.
+/// The catalog lock is taken before the pool lock, matching all generic free admissions, so a
+/// successful capture cannot race the physical free. Multiple callbacks may pin one allocation;
+/// each receipt must be acknowledged separately before generic free is admitted again.
+pub(super) unsafe fn pin_temporary_pool_range(
+    inst: DriverInstance,
+    address: u64,
+    bytes: u64,
+) -> Result<TemporaryPoolPin, nt_status::NtStatus> {
+    let _durable = crate::allocator::enter_durable();
+    let _guard = lock();
+    let domain = validate_arena(inst)?;
+    let _pool =
+        hosted_instance_pool_lock(inst.exec_pool_va).ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    let exact = allocation_containing(inst, address, bytes)?;
+    if ledger().protects_address(domain, exact.component_address)
+        || rows().iter().any(|row| {
+            same_pool(row.instance, inst)
+                && row.allocation.component_address == exact.component_address
+        })
+        || file_rows().iter().any(|row| {
+            same_pool(row.instance, inst) && protects_file_member(row, exact.component_address)
+        })
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    temporary_pins()
+        .try_reserve(1)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let id = unsafe { NEXT_TEMPORARY_PIN_ID };
+    let next = id
+        .checked_add(1)
+        .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    temporary_pins().push(TemporaryPinRow {
+        id,
+        instance: inst,
+        domain,
+        allocation: exact,
+        uncertain: false,
+    });
+    unsafe {
+        NEXT_TEMPORARY_PIN_ID = next;
+    }
+    Ok(TemporaryPoolPin {
+        id,
+        instance: inst,
+        domain,
+        allocation: exact,
+        held: true,
+    })
+}
+
+/// A lost or ambiguous callback effect never permits pool reuse, even if a later address and
+/// contents appear unchanged. Keep this row until a separately proven terminal path exists.
+pub(super) fn retain_temporary_pool_pin_uncertain(pin: &TemporaryPoolPin) -> bool {
+    let _guard = lock();
+    let Some(row) = temporary_pins().iter_mut().find(|row| row.id == pin.id) else {
+        return false;
+    };
+    if !pin.held
+        || !same_arena(row.instance, pin.instance)
+        || row.domain != pin.domain
+        || row.allocation != pin.allocation
+    {
+        return false;
+    }
+    row.uncertain = true;
+    true
+}
+
+/// True also when the exact row has disappeared: callers must treat lost ownership as uncertain.
+pub(super) fn temporary_pool_pin_uncertain(pin: &TemporaryPoolPin) -> bool {
+    let _guard = lock();
+    !pin.held
+        || temporary_pins()
+            .iter()
+            .find(|row| {
+                row.id == pin.id
+                    && same_arena(row.instance, pin.instance)
+                    && row.domain == pin.domain
+                    && row.allocation == pin.allocation
+            })
+            .is_none_or(|row| row.uncertain)
+}
+
+/// Call only after the callback owner's real completion and reply acknowledgement have both
+/// succeeded. This primitive verifies the pin's exact allocation generation; it does not prove
+/// callback acknowledgement by itself. Failure retains the row and the caller's receipt.
+pub(super) unsafe fn release_temporary_pool_pin(
+    pin: &mut TemporaryPoolPin,
+) -> Result<(), nt_status::NtStatus> {
+    let _guard = lock();
+    if !pin.held {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    let index = temporary_pins()
+        .iter()
+        .position(|row| {
+            row.id == pin.id
+                && same_arena(row.instance, pin.instance)
+                && row.domain == pin.domain
+                && row.allocation == pin.allocation
+        })
+        .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if temporary_pins()[index].uncertain {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    let _pool = hosted_instance_pool_lock(pin.instance.exec_pool_va)
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    if allocation(pin.instance, pin.allocation.component_address)? != pin.allocation {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    temporary_pins().swap_remove(index);
+    pin.held = false;
+    Ok(())
+}
+
+/// Copy root-owned bytes into the pinned allocation before publishing it to a foreign class
+/// callback. The row is marked uncertain before the write, then restored only after its exact
+/// physical generation is revalidated under the same pool lock.
+pub(super) unsafe fn write_temporary_pool_pin(
+    pin: &TemporaryPoolPin,
+    offset: u64,
+    bytes: &[u8],
+) -> Result<(), nt_status::NtStatus> {
+    let _guard = lock();
+    if !pin.held
+        || bytes.is_empty()
+        || offset
+            .checked_add(bytes.len() as u64)
+            .is_none_or(|end| end > pin.allocation.capacity)
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let index = temporary_pins()
+        .iter()
+        .position(|row| {
+            row.id == pin.id
+                && same_arena(row.instance, pin.instance)
+                && row.domain == pin.domain
+                && row.allocation == pin.allocation
+        })
+        .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if temporary_pins()[index].uncertain {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    let _pool = hosted_instance_pool_lock(pin.instance.exec_pool_va)
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    if allocation(pin.instance, pin.allocation.component_address)? != pin.allocation {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    let exec = pin
+        .instance
+        .exec_pool_va
+        .checked_add(pin.allocation.component_address - FSD_POOL_VADDR)
+        .and_then(|base| base.checked_add(offset))
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    temporary_pins()[index].uncertain = true;
+    core::ptr::copy(bytes.as_ptr(), exec as *mut u8, bytes.len());
+    if allocation(pin.instance, pin.allocation.component_address)? != pin.allocation {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    temporary_pins()[index].uncertain = false;
+    Ok(())
+}
+
+/// Copy a live interior range while the exact pool generation and generic-free exclusion are
+/// held under the same catalog to pool lock order. The parked IRQ worker owns concurrent writes
+/// to callback records; this lease prevents physical reuse during the copy.
+pub(super) unsafe fn copy_temporary_pool_pin(
+    pin: &TemporaryPoolPin,
+    offset: u64,
+    destination: &mut [u8],
+) -> Result<(), nt_status::NtStatus> {
+    let _guard = lock();
+    if !pin.held
+        || destination.is_empty()
+        || offset
+            .checked_add(destination.len() as u64)
+            .is_none_or(|end| end > pin.allocation.capacity)
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let row = temporary_pins()
+        .iter()
+        .find(|row| {
+            row.id == pin.id
+                && same_arena(row.instance, pin.instance)
+                && row.domain == pin.domain
+                && row.allocation == pin.allocation
+                && !row.uncertain
+        })
+        .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    let _ = row;
+    let _pool = hosted_instance_pool_lock(pin.instance.exec_pool_va)
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    if allocation(pin.instance, pin.allocation.component_address)? != pin.allocation {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    let exec = pin
+        .instance
+        .exec_pool_va
+        .checked_add(pin.allocation.component_address - FSD_POOL_VADDR)
+        .and_then(|base| base.checked_add(offset))
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    core::ptr::copy_nonoverlapping(exec as *const u8, destination.as_mut_ptr(), destination.len());
+    if allocation(pin.instance, pin.allocation.component_address)? != pin.allocation {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    Ok(())
+}
+
+/// Free an allocation that root itself created and kept pinned for its entire lifetime. The
+/// owner must first finish every callback ACK. No other temporary pin may still refer to the
+/// allocation. An uncertain physical free leaves the row blocked and cannot be retried.
+pub(super) unsafe fn retire_owned_temporary_pool_allocation(
+    pin: &mut TemporaryPoolPin,
+) -> Result<(), nt_status::NtStatus> {
+    let _guard = lock();
+    if !pin.held {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    let index = temporary_pins()
+        .iter()
+        .position(|row| {
+            row.id == pin.id
+                && same_arena(row.instance, pin.instance)
+                && row.domain == pin.domain
+                && row.allocation == pin.allocation
+        })
+        .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if temporary_pins()[index].uncertain
+        || temporary_pins().iter().any(|row| {
+            row.id != pin.id
+                && same_pool(row.instance, pin.instance)
+                && row.allocation == pin.allocation
+        })
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    let _pool = hosted_instance_pool_lock(pin.instance.exec_pool_va)
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    if allocation(pin.instance, pin.allocation.component_address)? != pin.allocation {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    temporary_pins()[index].uncertain = true;
+    if !hosted_instance_pool_free_unlocked(pin.instance, pin.allocation.component_address) {
+        return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+    }
+    temporary_pins().swap_remove(index);
+    pin.held = false;
+    Ok(())
+}
+
 /// The returned lock spans the subsequent generic free, preventing publication in between.
 pub(super) fn generic_free_admission(
     inst: DriverInstance,
@@ -144,8 +473,11 @@ pub(super) fn generic_free_admission(
                 && address >= row.allocation.component_address
                 && address < row.allocation.component_address + row.allocation.capacity
         })
-        || file_rows().iter().any(|row| {
-            same_pool(row.instance, inst) && protects_file_member(row, address)
+        || file_rows()
+            .iter()
+            .any(|row| same_pool(row.instance, inst) && protects_file_member(row, address))
+        || temporary_pins().iter().any(|row| {
+            same_pool(row.instance, inst) && contains_allocation(row.allocation, address)
         })
     {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
@@ -191,6 +523,10 @@ pub(super) unsafe fn protect_file_storage(
             same_pool(row.instance, inst)
                 && (contains_allocation(row.allocation, address)
                     || contains_allocation(row.allocation, name_address))
+        }) || temporary_pins().iter().any(|row| {
+            same_pool(row.instance, inst)
+                && (contains_allocation(row.allocation, address)
+                    || contains_allocation(row.allocation, name_address))
         }) {
             return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
         }
@@ -212,8 +548,15 @@ pub(super) unsafe fn protect_file_storage(
             same_pool(row.instance, inst)
                 && (contains_allocation(row.allocation, address)
                     || name_address != 0 && contains_allocation(row.allocation, name_address))
+        }) || temporary_pins().iter().any(|row| {
+            same_pool(row.instance, inst)
+                && (contains_allocation(row.allocation, address)
+                    || name_address != 0 && contains_allocation(row.allocation, name_address))
         });
-        FileStorageCaptureError { status, no_root_owner: !owned }
+        FileStorageCaptureError {
+            status,
+            no_root_owner: !owned,
+        }
     })
 }
 
@@ -341,9 +684,16 @@ pub(super) unsafe fn protect_allocation_exact(
     }) {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
-    if file_rows().iter().any(|row| {
-        same_pool(row.instance, inst) && protects_file_member(row, address)
-    }) {
+    if file_rows()
+        .iter()
+        .any(|row| same_pool(row.instance, inst) && protects_file_member(row, address))
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    if temporary_pins()
+        .iter()
+        .any(|row| same_pool(row.instance, inst) && contains_allocation(row.allocation, address))
+    {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     if let Some(row) = rows()
@@ -423,9 +773,7 @@ impl RetirementPreflight {
     ) -> Result<u64, nt_status::NtStatus> {
         let row = rows()
             .iter()
-            .find(|row| {
-                row.domain == self.domain && row.allocation.component_address == address
-            })
+            .find(|row| row.domain == self.domain && row.allocation.component_address == address)
             .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
         if row.allocation.capacity < WDM_X64_DEVICE_OBJECT_SIZE as u64
             || allocation(row.instance, address)? != row.allocation
@@ -462,7 +810,9 @@ pub(super) unsafe fn admit_retirement_checked<T>(
     let current = allocation(inst, address)?;
     let index = rows()
         .iter()
-        .position(|row| same_arena(row.instance, inst) && row.allocation.component_address == address)
+        .position(|row| {
+            same_arena(row.instance, inst) && row.allocation.component_address == address
+        })
         .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
     if rows()[index].retirement_pending {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
@@ -478,7 +828,9 @@ pub(super) unsafe fn admit_retirement_checked<T>(
         },
         _pool: pool,
         _guard: guard,
-    }, checked))
+        },
+        checked,
+    ))
 }
 
 /// Called only by the exact native free owner after an acknowledged physical free.
@@ -601,6 +953,9 @@ pub(super) fn instance_quiesced(inst: DriverInstance) -> bool {
     let _guard = lock();
     !file_rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
         && !rows()
+            .iter()
+            .any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
+        && !temporary_pins()
         .iter()
         .any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
 }

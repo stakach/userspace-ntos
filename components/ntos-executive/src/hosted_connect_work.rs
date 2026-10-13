@@ -26,6 +26,7 @@ pub(super) struct RetainedConnectWork {
     terminal_status: Option<nt_status::NtStatus>,
     terminal_consumed: bool,
     source_retired: bool,
+    completion_acknowledged: bool,
 }
 
 impl RetainedConnectWork {
@@ -41,6 +42,7 @@ impl RetainedConnectWork {
             terminal_status: None,
             terminal_consumed: false,
             source_retired: false,
+            completion_acknowledged: false,
         }
     }
 
@@ -98,9 +100,18 @@ impl RetainedConnectWork {
         self.terminal_status
     }
 
+    /// An exact source continuation and its origin receipt have both completed. A provider
+    /// terminal alone cannot authorize retirement of the port-local pending IRP.
+    pub(super) fn acknowledged_source_payload(&self) -> Option<ConnectPayloadIdentity> {
+        self.completion_acknowledged.then_some(self.payload())
+    }
+
     /// A provider terminal is only one input to source completion. The source lane must run
     /// and acknowledge the class completion stack before any physical owner is retired.
     pub(super) unsafe fn complete_terminal(&mut self) -> bool {
+        if self.completion_acknowledged {
+            return true;
+        }
         let Some(status) = self.terminal_status() else {
             return false;
         };
@@ -148,7 +159,8 @@ impl RetainedConnectWork {
             }
             self.source_retired = true;
         }
-        self.origin.retire_receipt()
+        self.completion_acknowledged = self.origin.retire_receipt();
+        self.completion_acknowledged
     }
 
     /// Only the prepared state can be rolled back. A failed physical release leaves this

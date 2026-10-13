@@ -556,6 +556,22 @@ pub(super) unsafe fn begin_provider_entry(
     Ok(prepared)
 }
 
+/// Exact port FDO behind a published reverse class alias. The source HOOK IRP is allocated in
+/// this physical domain and its device-extension buffer belongs to this original port object.
+pub(super) unsafe fn port_source_for_hook(
+    id: u64,
+) -> Result<HostedDevicePointerRegistration, nt_status::NtStatus> {
+    let prepared = validate(id)?;
+    let row = owner(prepared.owner_id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if !row.provider_entered
+        || row.retirement_blocked
+        || row.projection.phase() != ReverseClassAliasPhase::Published
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    Ok(row.lower_origin)
+}
+
 /// A fully published projection may be aborted only before the provider entry. An incomplete
 /// or uncertain allocation remains owned; its effect cannot be reconstructed from a reply.
 pub(super) unsafe fn abort_before_provider_entry(id: u64) -> Result<(), nt_status::NtStatus> {

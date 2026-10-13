@@ -452,9 +452,8 @@ impl HostedIrqRootSession {
     ) -> Result<HostedProviderMarshalWindowSource, nt_status::NtStatus> {
         let lane = self.lane(target.lane_index)?;
         let transaction = self.lanes[target.lane_index].transaction;
-        let offset = nt_hosted_runtime::HostedIrqArenaLayout::dispatch_marshal_offset(
-            target.depth as usize,
-        )
+        let offset =
+            nt_hosted_runtime::HostedIrqArenaLayout::dispatch_marshal_offset(target.depth as usize)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
         let exec_base = lane.arena().dispatch[target.depth as usize]
             .root_idle_marshal_ptr(&lane.arena().control, lane.identity, transaction)
@@ -572,12 +571,8 @@ impl HostedIrqRootSession {
                 command,
             )
             .map_err(arena_status)?;
-        let frame = match self.push_call_frame(
-            source_lane_index,
-            service,
-            target.lane_index,
-            dispatch,
-        ) {
+        let frame =
+            match self.push_call_frame(source_lane_index, service, target.lane_index, dispatch) {
             Ok(frame) => frame,
             Err(status) => {
                 self.record_fault(
@@ -946,9 +941,7 @@ impl HostedIrqRootSession {
                     Err(InterruptActualLockError::Busy) => {
                         fatal_service_result(STATUS_POSSIBLE_DEADLOCK)
                     }
-                    Err(error) => {
-                        fatal_service_result(hosted_irq_actual_lock_status(error).raw())
-                    }
+                    Err(error) => fatal_service_result(hosted_irq_actual_lock_status(error).raw()),
                 }
             }
             nt_hosted_runtime::HostedIrqServiceKind::ReleaseActualLock => {
@@ -1099,9 +1092,7 @@ impl HostedIrqRootSession {
             nt_hosted_runtime::HostedIrqServiceKind::QueueDpc => {
                 self.queue_dpc_service(lane_index, command)
             }
-            nt_hosted_runtime::HostedIrqServiceKind::Mdl => {
-                self.mdl_service(lane_index, command)
-            }
+            nt_hosted_runtime::HostedIrqServiceKind::Mdl => self.mdl_service(lane_index, command),
             nt_hosted_runtime::HostedIrqServiceKind::PoolRetirement => {
                 self.pool_retirement_service(lane_index, command)
             }
@@ -1110,6 +1101,11 @@ impl HostedIrqRootSession {
             }
             nt_hosted_runtime::HostedIrqServiceKind::ProviderCallbackRequest => {
                 self.provider_callback_service(lane_index, service, command)
+            }
+            nt_hosted_runtime::HostedIrqServiceKind::ClassServiceRequest => {
+                // The callback thunk stays unpublished until the root owns exact port input,
+                // consumed-output and class execution leases for this service.
+                fatal_service_result(STATUS_INVALID_DEVICE_REQUEST)
             }
         }
     }
@@ -1357,16 +1353,22 @@ pub(super) unsafe fn dispatch_interrupt(
             0x4341_4c4c,
             0,
             0,
-            [session.call_frames.len() as u64, session.lanes.len() as u64, 0, 0],
+            [
+                session.call_frames.len() as u64,
+                session.lanes.len() as u64,
+                0,
+                0,
+            ],
         );
     }
     let finish = arena
         .control
         .root_finish_transaction(lane.identity, transaction)
         .map_err(arena_status);
-    let outer_release = session.outer_lock.take().map_or(Ok(()), |lease| {
-        release_hosted_irq_actual_lock_lease(lease)
-    });
+    let outer_release = session
+        .outer_lock
+        .take()
+        .map_or(Ok(()), |lease| release_hosted_irq_actual_lock_lease(lease));
     let result = result?;
     service_release?;
     finish?;

@@ -19,7 +19,7 @@ use nt_io_manager::{
 };
 
 const MAX_RECORDS: usize = 1024;
-const MAX_RECORD_BYTES: usize = 24 * MAX_RECORDS;
+pub(super) const MAX_RECORD_BYTES: usize = 24 * MAX_RECORDS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum LaneError {
@@ -46,6 +46,7 @@ pub(super) enum ConsumedOutputPin {
         allocation: SourcePoolAllocationIdentity,
     },
     Stack(ConnectStackRange),
+    IrqStack(super::hosted_irq_stack_lease::IrqStackRange),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,6 +124,9 @@ impl ConsumedOutputPin {
             {
                 (stack.base, stack.bytes)
             }
+            Self::IrqStack(stack) if stack.contains(domain, address, length) => {
+                (stack.base, stack.bytes)
+            }
             _ => return false,
         };
         base != 0
@@ -185,5 +189,23 @@ impl ClassCallbackMarshal {
 /// port publication, class image generation, and IRQ lane transaction to this permit.
 #[must_use = "retain the exact port and class generations through callback acknowledgement"]
 pub(super) struct ClassCallbackExecutionPermit {
-    _sealed: (),
+    // These values are installed only with a routed IRQ class execution lane and exact source
+    // memory leases. There is intentionally no constructor until that native owner exists.
+    cookie: u64,
+    port_address: u64,
+    port_class_alias: HostedDevicePointerRegistration,
+}
+
+impl ClassCallbackExecutionPermit {
+    pub(super) fn verifies(
+        &self,
+        cookie: u64,
+        port_address: u64,
+        port_class_alias: HostedDevicePointerRegistration,
+    ) -> bool {
+        self.cookie != 0
+            && self.cookie == cookie
+            && self.port_address == port_address
+            && self.port_class_alias == port_class_alias
+    }
 }
