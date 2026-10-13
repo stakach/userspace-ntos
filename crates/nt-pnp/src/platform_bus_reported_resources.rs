@@ -44,7 +44,7 @@ pub fn admit_bus_reported_platform_resources<'a>(
     }
 
     let descriptor_count = field_u32(raw_resources, 16)? as usize;
-    if descriptor_count != authorized_ports.len().checked_add(1).ok_or(invalid)? {
+    if descriptor_count == 0 {
         return Err(invalid);
     }
     let interface_type = field_u32(raw_resources, 4)? as i32;
@@ -52,7 +52,7 @@ pub fn admit_bus_reported_platform_resources<'a>(
     let slot_number = field_u32(resource_requirements, 12)?;
 
     let mut ports = Vec::new();
-    ports.try_reserve_exact(authorized_ports.len()).map_err(|_| invalid)?;
+    ports.try_reserve_exact(descriptor_count.saturating_sub(1)).map_err(|_| invalid)?;
     let mut candidates = Vec::new();
     candidates.try_reserve_exact(descriptor_count).map_err(|_| invalid)?;
     let mut raw_interrupt = None;
@@ -84,6 +84,15 @@ pub fn admit_bus_reported_platform_resources<'a>(
                             | CM_RESOURCE_PORT_POSITIVE_DECODE)
                         != 0
                     || !matches!(port.share, CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE | CM_RESOURCE_SHARE_DRIVER_EXCLUSIVE)
+                    || !authorized_ports.iter().any(|window| {
+                        window.start <= port.start
+                            && window.length != 0
+                            && window.start
+                                .checked_add(u64::from(window.length))
+                                .is_some_and(|window_end| {
+                                    end <= window_end && window_end <= u16::MAX as u64 + 1
+                                })
+                    })
                     || ports.iter().any(|previous: &PortDescriptor| {
                         let previous_end = previous.start + u64::from(previous.length);
                         port.start < previous_end && previous.start < end
@@ -122,20 +131,6 @@ pub fn admit_bus_reported_platform_resources<'a>(
             }
             _ => return Err(invalid),
         }
-    }
-    if ports.len() != authorized_ports.len()
-        || authorized_ports.iter().any(|authorized| {
-            ports.iter().filter(|port| {
-                port.start == authorized.start && port.length == authorized.length
-            }).count() != 1
-        })
-        || ports.iter().any(|port| {
-            authorized_ports.iter().filter(|authorized| {
-                port.start == authorized.start && port.length == authorized.length
-            }).count() != 1
-        })
-    {
-        return Err(invalid);
     }
     let raw_interrupt = raw_interrupt.ok_or(invalid)?;
     // ReactOS ACPI buspdo allocates the requirements list without clearing it and fills only

@@ -53,6 +53,9 @@ fn keyboard_keeps_exact_bus_bytes_and_requires_both_physical_ports() {
     assert_eq!(admitted.raw_interrupt.vector, 1);
     assert_eq!(admitted.translated_interrupt.vector, 33);
 
+    let root_port_control = [PlatformPortResource { start: 0, length: 0x1_0000 }];
+    assert!(admit_bus_reported_platform_resources(&raw, &requirements, &root_port_control, irq(1, 33)).is_ok());
+
     assert!(admit_bus_reported_platform_resources(&raw, &requirements, &ports[..1], irq(1, 33)).is_err());
     assert!(admit_bus_reported_platform_resources(&raw, &requirements, &ports, irq(12, 33)).is_err());
 }
