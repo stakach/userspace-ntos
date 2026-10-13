@@ -15246,6 +15246,25 @@ pub(crate) unsafe fn config_manager_query_driver_service(
         .query_driver_service(service_name)
 }
 
+pub(crate) unsafe fn config_manager_query_upper_filter_launch_plan(
+    instance_id: &str,
+) -> Result<Option<nt_config_client::UpperFilterLaunchPlanSnapshot>, i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    let plan = client.query_upper_filter_launch_plan(instance_id)?;
+    if LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) != expected_generation
+        || plan.as_ref().is_some_and(|plan| plan.mount_generation != expected_generation)
+    {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    Ok(plan)
+}
+
 pub(crate) unsafe fn config_manager_query_critical_device_binding(
     bus_id: &str,
 ) -> Result<Option<nt_config_client::CriticalDeviceBinding>, i32> {

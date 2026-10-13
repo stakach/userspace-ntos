@@ -1807,6 +1807,30 @@ where
                     device_id,
                 );
             }
+            match config_manager_query_upper_filter_launch_plan(devnode.instance_id) {
+                Ok(Some(plan)) if !plan.bindings.is_empty() => {
+                    print_str(b"[pnp-upper-filter] devnode=");
+                    print_str(devnode.instance_id.as_bytes());
+                    print_str(b" generation=");
+                    print_u64(plan.mount_generation);
+                    print_str(b" services=");
+                    for (index, binding) in plan.bindings.iter().enumerate() {
+                        if index != 0 {
+                            print_str(b",");
+                        }
+                        print_str(binding.service_name.as_bytes());
+                    }
+                    print_str(b"\n");
+                }
+                Err(status) => {
+                    print_str(b"[pnp-upper-filter] plan query failed status=0x");
+                    print_hex(status as u32);
+                    print_str(b" devnode=");
+                    print_str(devnode.instance_id.as_bytes());
+                    print_str(b"\n");
+                }
+                _ => {}
+            }
             let filter_outcome = match resource_plan.native_property_blobs().1 {
                 Some(requirements) => driver_launch::filter_hosted_device_resource_requirements(
                     device_id,
