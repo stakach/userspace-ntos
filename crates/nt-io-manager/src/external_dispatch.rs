@@ -25,7 +25,8 @@ mod detached;
 pub use detached::{ExternalPnpFinishRejection, ExternalPnpFinishResult, ExternalPnpInvocation,
     ExternalPnpReturn, RetainedExternalPnp};
 pub use detached::{ExternalPnpCompletionInvocation, ExternalPnpCompletionReturn,
-    ExternalPnpCompletionRejection};
+    ExternalPnpCompletionRejection, ExternalPnpFilterCompletionInvocation,
+    ExternalPnpFilterCompletionReturn, ExternalPnpFilterOutput};
 
 pub(crate) fn validate_external_parameter_layout(
     major: u8,
