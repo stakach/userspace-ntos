@@ -34,7 +34,8 @@ pub use namespace::{
     IOCTL_ACPI_ENUM_CHILDREN,
 };
 pub use pci_routing::{
-    parse_interrupt_resource_template, parse_pci_routing_table, resolve_pci_routing_table,
+    parse_interrupt_resource_template, parse_pci_routing_table, resolve_legacy_irq,
+    resolve_pci_routing_table,
     InterruptResource, InterruptSource, LegacyIrqOverride, PciInterruptLink, PciRouteSource,
     PciRoutingEntry, PciRoutingError, PciRoutingTable, ResolvedPciRoute,
 };

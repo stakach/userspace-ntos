@@ -31,6 +31,42 @@ pub struct AcceptedPdoPnpIdentity {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcceptedPdoLowerFilterProofError {
+    InvalidMinor,
+    WrongIdentity,
+    Consumed,
+}
+
+/// A one-use terminal proof for a function driver's lower accepted PDO edge.
+#[derive(Debug)]
+pub struct AcceptedPdoLowerFilterProof {
+    identity: AcceptedPdoPnpIdentity,
+    status: Option<NtStatus>,
+}
+
+impl AcceptedPdoLowerFilterProof {
+    pub fn new(
+        identity: AcceptedPdoPnpIdentity,
+        status: NtStatus,
+    ) -> Result<Self, AcceptedPdoLowerFilterProofError> {
+        if identity.minor != nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS {
+            return Err(AcceptedPdoLowerFilterProofError::InvalidMinor);
+        }
+        Ok(Self { identity, status: Some(status) })
+    }
+
+    pub fn take_for(
+        &mut self,
+        observed: AcceptedPdoPnpIdentity,
+    ) -> Result<NtStatus, AcceptedPdoLowerFilterProofError> {
+        if observed != self.identity {
+            return Err(AcceptedPdoLowerFilterProofError::WrongIdentity);
+        }
+        self.status.take().ok_or(AcceptedPdoLowerFilterProofError::Consumed)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AcceptedPdoPnpError {
     WrongIdentity,
     WrongOuter,

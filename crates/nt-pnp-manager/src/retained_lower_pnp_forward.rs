@@ -699,7 +699,10 @@ mod tests {
         provider: HostedDevicePointerRegistration,
     }
 
-    fn fixture(backend: Box<dyn DriverDispatchBackend>) -> Fixture {
+    fn fixture_with_bus(
+        backend: Box<dyn DriverDispatchBackend>,
+        bus_information: PnpBusInformation,
+    ) -> Fixture {
         let mut io = IoManager::new(MockObjectPort::new());
         let client = io.register_client();
         let backend_id = io.register_backend(backend);
@@ -762,11 +765,7 @@ mod tests {
             .claim_started_parent_relation(parent_pdo, prepared_relation.relation_identity())
             .unwrap();
         let properties = PdoProperties::enumerated(
-            PnpBusInformation {
-                bus_type_guid: GUID_BUS_TYPE_PCI,
-                legacy_bus_type: INTERFACE_TYPE_PCI_BUS,
-                bus_number: 0,
-            },
+            bus_information,
             PdoCapabilities {
                 removable: false,
                 eject_supported: false,
@@ -805,6 +804,17 @@ mod tests {
             consumer_address: 0x2000,
             provider,
         }
+    }
+
+    fn fixture(backend: Box<dyn DriverDispatchBackend>) -> Fixture {
+        fixture_with_bus(
+            backend,
+            PnpBusInformation {
+                bus_type_guid: GUID_BUS_TYPE_PCI,
+                legacy_bus_type: INTERFACE_TYPE_PCI_BUS,
+                bus_number: 0,
+            },
+        )
     }
 
     fn prepare(fixture: &mut Fixture) -> PreparedLowerPnpForward {
@@ -1133,6 +1143,84 @@ mod tests {
             terminal.retire(&mut fixture.io).unwrap(),
             NtStatus::NOT_SUPPORTED
         );
+        fixture.io.discard_prepared_external_pnp(outer).unwrap();
+    }
+
+    #[test]
+    fn accepted_acpi_child_filter_enters_its_provider_and_keeps_optional_pass_through() {
+        // ReactOS ACPI's PDO leaves this optional IRP's seeded status and borrowed input pointer.
+        let mut fixture = fixture_with_bus(
+            Box::new(PassThroughFilterBackend),
+            PnpBusInformation {
+                bus_type_guid: [
+                    0x8a, 0xa0, 0x91, 0xb0, 0x97, 0xba, 0xd0, 0x11,
+                    0xbd, 0x14, 0x00, 0xaa, 0x00, 0xb7, 0xb3, 0x2a,
+                ],
+                legacy_bus_type: 13,
+                bus_number: 0,
+            },
+        );
+        let pdo = fixture.provider.device_id();
+        let requirements = vec![0x5au8; 64];
+        let outer = fixture.io.prepare_external_pnp_owned_to_exact_device(
+            fixture.client,
+            pdo,
+            0,
+            PnpParameters::filter_resource_requirements(requirements.len() as u32).unwrap(),
+            requirements.clone(),
+        ).unwrap();
+        assert_eq!(fixture.io.irp(outer.irp_id()).unwrap().status, NtStatus::NOT_SUPPORTED);
+        let prepared = crate::PreparedAcceptedPdoPnp::filter(
+            &fixture.pnp,
+            &fixture.relations,
+            &fixture.providers,
+            &mut fixture.io,
+            outer.irp_id(),
+            pdo,
+            fixture.client,
+            0,
+            requirements,
+        ).unwrap();
+        let identity = prepared.identity();
+        let invocation = prepared.begin(
+            &fixture.pnp,
+            &fixture.relations,
+            &fixture.providers,
+            &mut fixture.io,
+            identity,
+        ).unwrap();
+        let mut provider_entries = 0;
+        let returned = invocation.invoke(|_, irp| {
+            provider_entries += 1;
+            assert_eq!(irp.status, NtStatus::NOT_SUPPORTED);
+            PnpBackendDispatch::Returned {
+                status: irp.status,
+                information: 0x1234_5000,
+            }
+        });
+        let terminal = match returned.finish(&mut fixture.io).unwrap() {
+            crate::AcceptedPdoPnpResult::Terminal(terminal) => terminal,
+            result => panic!("unexpected ACPI FILTER result: {result:?}"),
+        };
+        assert_eq!(provider_entries, 1);
+        assert_eq!(terminal.status(), NtStatus::NOT_SUPPORTED);
+        assert_eq!(terminal.information(), 0);
+        assert!(terminal.payload().is_none());
+        let mut proof = crate::AcceptedPdoLowerFilterProof::new(identity, terminal.status()).unwrap();
+        let wrong = crate::AcceptedPdoPnpIdentity {
+            outer_irp: IrpId(identity.outer_irp.raw() + 1),
+            ..identity
+        };
+        assert_eq!(
+            proof.take_for(wrong),
+            Err(crate::AcceptedPdoLowerFilterProofError::WrongIdentity),
+        );
+        assert_eq!(proof.take_for(identity), Ok(NtStatus::NOT_SUPPORTED));
+        assert_eq!(
+            proof.take_for(identity),
+            Err(crate::AcceptedPdoLowerFilterProofError::Consumed),
+        );
+        assert_eq!(terminal.retire(&mut fixture.io).unwrap(), NtStatus::NOT_SUPPORTED);
         fixture.io.discard_prepared_external_pnp(outer).unwrap();
     }
 

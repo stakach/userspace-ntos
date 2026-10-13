@@ -69,6 +69,7 @@ mod completion_retirement;
 mod projection_allocation;
 mod hosted_attached_device_reference;
 mod hosted_safe_attach;
+mod hosted_bus_pdo_publication;
 mod hosted_file_system_registry;
 pub mod hosted_pool_range;
 pub mod hosted_kernel_read_delivery;
