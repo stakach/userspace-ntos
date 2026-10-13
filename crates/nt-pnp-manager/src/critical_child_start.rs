@@ -1,7 +1,10 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::{BusRelationTable, DevnodeIdentity, ParentRelationIdentity, PnpManager};
+use crate::{
+    BusRelationTable, DevnodeIdentity, ParentRelationIdentity, PnpManager,
+    StartDeviceLifecycleReceipt,
+};
 
 /// One mounted SYSTEM hive's canonical child, published by an accepted BusRelations generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,6 +233,103 @@ impl CriticalChildStartQueue {
         Ok(entry)
     }
 
+    /// Return an unentered demand claim to the queue while another exact batch owns START.
+    /// A later claim receives a fresh token after that owner has finished.
+    pub fn defer(
+        &mut self,
+        claim: CriticalChildStartClaim,
+    ) -> Result<(), CriticalChildStartError> {
+        let entry = self.claimed_entry(claim)?;
+        entry.token = 0;
+        entry.state = CriticalChildStartState::Reserved;
+        Ok(())
+    }
+
+    /// Identify a current reserved row for the receipt's exact child generation before
+    /// validating the config owner's FDO. A retired row has already consumed its handoff.
+    pub fn has_exact_receipt_child(
+        &self,
+        pnp: &PnpManager,
+        relations: &BusRelationTable,
+        mount_identity: u64,
+        instance_id: &str,
+        receipt: &StartDeviceLifecycleReceipt,
+    ) -> Result<bool, CriticalChildStartError> {
+        let dispatch = receipt.dispatch();
+        let mut matching = self.entries.iter().filter(|entry| {
+            entry.instance_id == instance_id
+                && entry.key.mount_identity == mount_identity
+                && entry.key.child.pdo_object_id() == receipt.pdo_device_id()
+                && entry.key.child.devnode_id() == dispatch.devnode_id
+                && entry.key.child.generation() == dispatch.devnode_generation
+                && !matches!(entry.state, CriticalChildStartState::Retired(_))
+        });
+        let Some(entry) = matching.next() else {
+            return Ok(false);
+        };
+        if matching.next().is_some() {
+            return Err(CriticalChildStartError::ConflictingGeneration);
+        }
+        if entry.state != CriticalChildStartState::Reserved {
+            return Err(CriticalChildStartError::WrongPhase);
+        }
+        if Self::current_key(pnp, relations, mount_identity, receipt.pdo_device_id(), instance_id)?
+            != entry.key
+        {
+            return Err(CriticalChildStartError::StalePublication);
+        }
+        Ok(true)
+    }
+
+    /// Retire a reserved demand only when an independent config owner already completed the
+    /// same generation's canonical START and supplies its manager-minted terminal receipt.
+    pub fn retire_reserved_from_start(
+        &mut self,
+        pnp: &PnpManager,
+        relations: &BusRelationTable,
+        mount_identity: u64,
+        instance_id: &str,
+        receipt: &StartDeviceLifecycleReceipt,
+    ) -> Result<bool, CriticalChildStartError> {
+        if !self.has_exact_receipt_child(pnp, relations, mount_identity, instance_id, receipt)? {
+            return Ok(false);
+        }
+        let dispatch = receipt.dispatch();
+        let current_parent = pnp
+            .parent_relation_for_pdo(receipt.pdo_device_id())
+            .ok_or(CriticalChildStartError::StalePublication)?;
+        let Some(index) = self.entries.iter().position(|entry| {
+            entry.instance_id == instance_id
+                && entry.key.mount_identity == mount_identity
+                && entry.key.parent_relation == current_parent
+                && entry.key.child.pdo_object_id() == receipt.pdo_device_id()
+                && entry.key.child.devnode_id() == dispatch.devnode_id
+                && entry.key.child.generation() == dispatch.devnode_generation
+        }) else {
+            return Err(CriticalChildStartError::StalePublication);
+        };
+        let entry = &self.entries[index];
+        if dispatch.minor != crate::PnpMinor::StartDevice
+            || dispatch.canonical_irp_id == 0
+            || dispatch.devnode_id != entry.key.child.devnode_id()
+            || dispatch.devnode_generation != entry.key.child.generation()
+            || Self::current_key(
+                pnp,
+                relations,
+                mount_identity,
+                receipt.pdo_device_id(),
+                instance_id,
+            ) != Ok(entry.key)
+        {
+            return Err(CriticalChildStartError::StalePublication);
+        }
+        if entry.state != CriticalChildStartState::Reserved {
+            return Err(CriticalChildStartError::WrongPhase);
+        }
+        self.entries[index].state = CriticalChildStartState::Retired(receipt.start_status());
+        Ok(true)
+    }
+
     /// Record the terminal provider result before retiring the exact claim.
     pub fn complete(
         &mut self,
@@ -388,6 +488,170 @@ mod tests {
             Ok((key, CriticalChildStartState::Retired(0)))
         );
         assert_eq!(queue.claim_next(&pnp, &relations, 7), Ok(None));
+    }
+
+    #[test]
+    fn pending_config_batch_defers_demand_without_replaying_its_claim() {
+        let (pnp, relations, pdo, instance_id) = committed_child();
+        let mut queue = CriticalChildStartQueue::new();
+        let (key, _) = queue
+            .reserve_committed(&pnp, &relations, 7, pdo, &instance_id)
+            .unwrap();
+        let first = queue.claim_next(&pnp, &relations, 7).unwrap().unwrap();
+        assert_eq!(queue.defer(first), Ok(()));
+        assert_eq!(queue.state(key), Some(CriticalChildStartState::Reserved));
+        assert_eq!(queue.complete(first, 0), Err(CriticalChildStartError::InvalidClaim));
+        let second = queue.claim_next(&pnp, &relations, 7).unwrap().unwrap();
+        assert_ne!(first, second);
+        queue.complete(second, 0).unwrap();
+        assert_eq!(queue.retire(second), Ok(0));
+    }
+
+    #[test]
+    fn config_terminal_retires_only_same_generation_reserved_critical_start() {
+        let (pnp, relations, pdo, instance_id) = committed_child();
+        let mut queue = CriticalChildStartQueue::new();
+        let (key, _) = queue
+            .reserve_committed(&pnp, &relations, 7, pdo, &instance_id)
+            .unwrap();
+        let receipt = crate::StartDeviceLifecycleReceipt {
+            dispatch: crate::PnpDispatchIdentity {
+                devnode_id: key.child().devnode_id(),
+                devnode_generation: key.child().generation(),
+                dispatch_generation: 1,
+                canonical_irp_id: 0x4567,
+                minor: crate::PnpMinor::StartDevice,
+            },
+            pdo_device_id: pdo,
+            fdo_device_id: 0x7777,
+            origin_driver_id: 0x8888,
+            completion_driver_id: 0x8888,
+            completion_device_id: 0x7777,
+            driver_pending: false,
+            start_status: 0xc000_0010,
+        };
+        assert_eq!(
+            queue.retire_reserved_from_start(&pnp, &relations, 7, &instance_id, &receipt),
+            Ok(true),
+        );
+        assert_eq!(queue.state(key), Some(CriticalChildStartState::Retired(0xc000_0010)));
+        assert_eq!(queue.claim_next(&pnp, &relations, 7), Ok(None));
+    }
+
+    #[test]
+    fn config_terminal_skips_retired_prior_generation_with_reused_pdo() {
+        let (pnp, relations, pdo, instance_id) = committed_child();
+        let mut queue = CriticalChildStartQueue::new();
+        let (current, _) = queue
+            .reserve_committed(&pnp, &relations, 7, pdo, &instance_id)
+            .unwrap();
+        let mut prior = current;
+        prior.child = crate::DevnodeIdentity {
+            devnode_id: current.child().devnode_id(),
+            generation: current.child().generation().checked_add(1).unwrap(),
+            pdo_object_id: pdo,
+        };
+        queue.entries.insert(0, StartEntry {
+            key: prior,
+            instance_id: instance_id.clone(),
+            state: CriticalChildStartState::Retired(0),
+            token: 0,
+        });
+        let receipt = crate::StartDeviceLifecycleReceipt {
+            dispatch: crate::PnpDispatchIdentity {
+                devnode_id: current.child().devnode_id(),
+                devnode_generation: current.child().generation(),
+                dispatch_generation: 1,
+                canonical_irp_id: 0x4567,
+                minor: crate::PnpMinor::StartDevice,
+            },
+            pdo_device_id: pdo,
+            fdo_device_id: 0x7777,
+            origin_driver_id: 0x8888,
+            completion_driver_id: 0x8888,
+            completion_device_id: 0x7777,
+            driver_pending: false,
+            start_status: 0xc000_0010,
+        };
+        assert_eq!(
+            queue.retire_reserved_from_start(&pnp, &relations, 7, &instance_id, &receipt),
+            Ok(true),
+        );
+        assert_eq!(queue.state(current), Some(CriticalChildStartState::Retired(0xc000_0010)));
+        assert_eq!(queue.state(prior), Some(CriticalChildStartState::Retired(0)));
+    }
+
+    #[test]
+    fn root_start_without_critical_child_does_not_require_handoff() {
+        let (pnp, relations, pdo, instance_id) = committed_child();
+        let mut queue = CriticalChildStartQueue::new();
+        let child = pnp.devnode_identity_for_pdo(pdo).unwrap();
+        let receipt = crate::StartDeviceLifecycleReceipt {
+            dispatch: crate::PnpDispatchIdentity {
+                devnode_id: child.devnode_id(),
+                devnode_generation: child.generation(),
+                dispatch_generation: 1,
+                canonical_irp_id: 0x4567,
+                minor: crate::PnpMinor::StartDevice,
+            },
+            pdo_device_id: pdo,
+            fdo_device_id: 0x7777,
+            origin_driver_id: 0x8888,
+            completion_driver_id: 0x8888,
+            completion_device_id: 0x7777,
+            driver_pending: false,
+            start_status: 0,
+        };
+        assert_eq!(
+            queue.has_exact_receipt_child(&pnp, &relations, 7, &instance_id, &receipt),
+            Ok(false),
+        );
+        assert_eq!(
+            queue.retire_reserved_from_start(&pnp, &relations, 7, &instance_id, &receipt),
+            Ok(false),
+        );
+    }
+
+    #[test]
+    fn repeated_config_terminal_has_no_reserved_child_handoff() {
+        let (pnp, relations, pdo, instance_id) = committed_child();
+        let mut queue = CriticalChildStartQueue::new();
+        let (key, _) = queue
+            .reserve_committed(&pnp, &relations, 7, pdo, &instance_id)
+            .unwrap();
+        let receipt = crate::StartDeviceLifecycleReceipt {
+            dispatch: crate::PnpDispatchIdentity {
+                devnode_id: key.child().devnode_id(),
+                devnode_generation: key.child().generation(),
+                dispatch_generation: 1,
+                canonical_irp_id: 0x4567,
+                minor: crate::PnpMinor::StartDevice,
+            },
+            pdo_device_id: pdo,
+            fdo_device_id: 0x7777,
+            origin_driver_id: 0x8888,
+            completion_driver_id: 0x8888,
+            completion_device_id: 0x7777,
+            driver_pending: false,
+            start_status: 0,
+        };
+        assert_eq!(
+            queue.has_exact_receipt_child(&pnp, &relations, 7, &instance_id, &receipt),
+            Ok(true),
+        );
+        assert_eq!(
+            queue.retire_reserved_from_start(&pnp, &relations, 7, &instance_id, &receipt),
+            Ok(true),
+        );
+        assert_eq!(queue.state(key), Some(CriticalChildStartState::Retired(0)));
+        assert_eq!(
+            queue.has_exact_receipt_child(&pnp, &relations, 7, &instance_id, &receipt),
+            Ok(false),
+        );
+        assert_eq!(
+            queue.retire_reserved_from_start(&pnp, &relations, 7, &instance_id, &receipt),
+            Ok(false),
+        );
     }
 
     #[test]

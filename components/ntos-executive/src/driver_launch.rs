@@ -7454,6 +7454,11 @@ extern "win64" fn s_io_open_device_registry_key(
 pub(crate) const HOSTED_INTERFACE_TYPE_INTERNAL: u32 = 0;
 pub(crate) const HOSTED_INTERFACE_TYPE_PCIBUS: u32 = 5;
 pub(crate) const HOSTED_INTERFACE_TYPE_PNPBUS: u32 = 15;
+pub(crate) const HOSTED_INTERFACE_TYPE_INTERNAL_POWER_BUS: u32 = 13;
+const GUID_ACPI_INTERFACE_STANDARD: [u8; 16] = [
+    0x8a, 0xa0, 0x91, 0xb0, 0x97, 0xba, 0xd0, 0x11, 0xbd, 0x14, 0x00, 0xaa, 0x00, 0xb7,
+    0xb3, 0x2a,
+];
 const BUS_DATA_TYPE_PCI_CONFIGURATION: u32 = 4;
 
 #[derive(Clone, Copy)]
@@ -7469,6 +7474,18 @@ pub(crate) struct HostedBusIdentity {
 }
 
 impl HostedBusIdentity {
+    pub(crate) const fn acpi_child() -> Self {
+        Self {
+            interface_type: HOSTED_INTERFACE_TYPE_INTERNAL_POWER_BUS,
+            bus_number: 0,
+            address: u32::MAX,
+            pci_vendor_id: 0,
+            pci_device_id: 0,
+            pci_class: 0,
+            pci_config_irq_line: 0,
+            pci_irq_pin: 0,
+        }
+    }
     pub(crate) const fn root_bus() -> Self {
         Self {
             interface_type: HOSTED_INTERFACE_TYPE_PNPBUS,
@@ -8799,6 +8816,61 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
 
         if major != IRP_MJ_PNP {
             return nt_status::NtStatus::INVALID_DEVICE_REQUEST.raw();
+        }
+        if forwarded_minor == nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS as u64 {
+            let (label, status, accepted, _, _) = call_on4(
+                (FSD_SERVICE_LOWER_PNP_FORWARD_LABEL << 12) | 4,
+                3,
+                device,
+                irp,
+                0,
+            );
+            if label != 0 || accepted > 1 {
+                crate::provider_bugcheck::report(
+                    0xc4,
+                    [FSD_SERVICE_LOWER_PNP_FORWARD_LABEL, 3, irp, label],
+                );
+            }
+            if accepted == 0 {
+                if status as u32 as i32 != STATUS_SUCCESS {
+                    return status as u32 as i32;
+                }
+            } else {
+            write_unaligned(
+                (irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
+                current_location_after_forward,
+            );
+            write_unaligned((irp + 0xb8) as *mut u64, next);
+            write_unaligned(
+                (next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64,
+                device,
+            );
+            // An optional provider pass-through leaves the original borrowed requirements
+            // pointer intact. A terminal failure carries no replacement requirements.
+            if status as u32 as i32 != STATUS_NOT_SUPPORTED {
+                write_unaligned(
+                    (irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut i32,
+                    status as u32 as i32,
+                );
+                write_unaligned(
+                    (irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *mut u64,
+                    0,
+                );
+            }
+            let completion_status =
+                read_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const i32);
+            trace_wdm_forward_call(
+                device,
+                irp,
+                previous_location,
+                current_location_after_forward,
+                next,
+                forwarded_minor,
+                completion_status,
+            );
+            s_io_complete_request(irp, 0);
+            return completion_status;
+            }
         }
         if forwarded_minor == nt_pnp_abi::IRP_MN_START_DEVICE as u64 {
             let (label, classification, foreign, _, _) = call_on4(
@@ -39429,13 +39501,31 @@ unsafe fn initialize_hosted_relation_children() -> Result<(), nt_status::NtStatu
         let pdo_device_id = io_manager_mut()
             .hosted_device_by_identity(relation_domain, pdo_object)
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        if io_manager_mut()
+        let provider_driver_id = io_manager_mut()
             .device(pdo_device_id)
-            .is_none_or(|device| device.delete_pending)
-            || reported_children
-                .iter()
-                .any(|child: &nt_pnp_manager::BusReportedChild| {
-                    child.pdo_object_id == pdo_device_id.raw()
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .driver_id;
+        let provider_driver_object = io_manager_mut()
+            .hosted_driver_address_by_identity(relation_domain, provider_driver_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        validate_and_sync_hosted_device_projection(
+            relation_instance,
+            relation_domain,
+            pdo_object,
+            pdo_device_id,
+            provider_driver_id,
+            provider_driver_object,
+        )?;
+        io_manager_mut().validate_hosted_bus_pdo_publication(
+            relation_domain,
+            pdo_object,
+            pdo_device_id,
+            provider_driver_id,
+        )?;
+        if reported_children
+            .iter()
+            .any(|child: &nt_pnp_manager::BusReportedChild| {
+                child.pdo_object_id == pdo_device_id.raw()
                 })
         {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
@@ -43405,9 +43495,17 @@ unsafe fn drain_hosted_filter_requirements_transactions() -> usize {
                             index += 1;
                             continue;
                         }
+                        let Ok(proof) = nt_pnp_manager::AcceptedPdoLowerFilterProof::new(identity, status) else {
+                            let transaction = &mut hosted_filter_requirements_transactions_mut()[index];
+                            transaction.phase = HostedFilterRequirementsPhase::Indeterminate;
+                            transaction.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                            progress = progress.saturating_add(1);
+                            index += 1;
+                            continue;
+                        };
                         let prepared = {
                             let transaction = &mut hosted_filter_requirements_transactions_mut()[index];
-                            transaction.video_provider_proof = Some(status);
+                            transaction.video_provider_proof = Some(proof);
                             transaction.phase = HostedFilterRequirementsPhase::AwaitingCompletion;
                             transaction.video_outer_prepared.take().expect("VideoPort FILTER outer owner disappeared")
                         };
@@ -45675,14 +45773,14 @@ unsafe fn validate_and_sync_hosted_device_projection(
     {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
+    if io_manager_mut().hosted_device_by_identity(domain, device_object) != Some(device_id) {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
     let flags = DeviceFlags::from_bits_retain(read_unaligned((device_exec + 0x30) as *const u32));
     io_manager_mut()
         .device_mut(device_id)
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?
         .flags = flags;
-    if io_manager_mut().hosted_device_by_identity(domain, device_object) != Some(device_id) {
-        return Err(nt_status::NtStatus::INVALID_PARAMETER);
-    }
     Ok(())
 }
 
@@ -47462,14 +47560,25 @@ unsafe fn hosted_video_foreign_pci_pdo(
     Ok(true)
 }
 
-unsafe fn prepare_hosted_video_provider_filter(
+unsafe fn prepare_hosted_accepted_provider_filter(
     outer_irp: IrpId,
     binding: HostedDeviceBinding,
     requirements: &[u8],
 ) -> Result<Option<HostedVideoProviderOwner>, nt_status::NtStatus> {
-    if !hosted_video_foreign_pci_pdo(binding)? {
+    if hosted_root_bus_mut()
+        .pdo(nt_io_manager::DeviceId(binding.pdo_device_id))
+        .is_some()
+    {
         return Ok(None);
     }
+    hosted_accepted_pdo_provider_catalog()
+        .resolve(
+            hosted_pnp_manager_mut(),
+            hosted_bus_relations(),
+            io_manager_mut(),
+            binding.pdo_device_id,
+        )
+        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let payload = clone_pnp_resource_list(requirements)?;
     nt_pnp_manager::PreparedAcceptedPdoPnp::filter(
         hosted_pnp_manager_mut(),
@@ -47705,7 +47814,7 @@ struct HostedFilterRequirementsTransaction {
     allocation_instance: usize,
     video_provider: Option<HostedVideoProviderOwner>,
     video_outer_prepared: Option<nt_io_manager::PreparedExternalPnpIrp>,
-    video_provider_proof: Option<nt_status::NtStatus>,
+    video_provider_proof: Option<nt_pnp_manager::AcceptedPdoLowerFilterProof>,
     phase: HostedFilterRequirementsPhase,
     driver_status: Option<nt_status::NtStatus>,
     barrier_status: Option<nt_status::NtStatus>,
@@ -49180,6 +49289,80 @@ pub(crate) unsafe fn quarantine_hosted_critical_child_start(
     hosted_critical_child_starts_mut()
         .quarantine(claim)
         .expect("critical child lost its uncertain START claim");
+}
+
+pub(crate) unsafe fn defer_hosted_critical_child_start(
+    claim: nt_pnp_manager::CriticalChildStartClaim,
+) {
+    hosted_critical_child_starts_mut()
+        .defer(claim)
+        .expect("unentered critical child START lost its exact claim");
+}
+
+pub(crate) unsafe fn retire_hosted_critical_child_from_config_start(
+    instance_id: &str,
+    driver_id: u64,
+    status: nt_status::NtStatus,
+    receipt: &nt_pnp_manager::StartDeviceLifecycleReceipt,
+) -> Result<bool, nt_status::NtStatus> {
+    let mount_identity = crate::LIVE_CONFIG_MANAGER_SYSTEM_MOUNT
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?
+        .identity_token();
+    let has_child = hosted_critical_child_starts_mut()
+        .has_exact_receipt_child(
+            hosted_pnp_manager_mut(),
+            hosted_bus_relations(),
+            mount_identity,
+            instance_id,
+            receipt,
+        )
+        .map_err(|error| {
+            print_str(b"[critical-start] config handoff preflight error=");
+            print_str(match error {
+                nt_pnp_manager::CriticalChildStartError::StalePublication => b"stale",
+                nt_pnp_manager::CriticalChildStartError::WrongPhase => b"phase",
+                nt_pnp_manager::CriticalChildStartError::ConflictingGeneration => b"generation",
+                _ => b"other",
+            });
+            print_str(b"\n");
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST
+        })?;
+    if !has_child {
+        return Ok(false);
+    }
+    let binding = hosted_device_binding_by_device_id(receipt.fdo_device_id())
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if receipt.start_status() != status.raw() as u32
+        || receipt.completion_driver_id() != driver_id
+        || receipt.completion_device_id() != receipt.fdo_device_id()
+        || binding.driver_id != driver_id
+        || binding.device_id != receipt.fdo_device_id()
+        || binding.pdo_device_id != receipt.pdo_device_id()
+        || !hosted_pnp_start_receipt_matches_instance(receipt, instance_id)
+    {
+        print_str(b"[critical-start] config handoff binding mismatch status/driver/binding/pdo/instance=");
+        print_u64((receipt.start_status() != status.raw() as u32) as u64);
+        print_str(b"/");
+        print_u64((receipt.completion_driver_id() != driver_id
+            || receipt.completion_device_id() != receipt.fdo_device_id()) as u64);
+        print_str(b"/");
+        print_u64((binding.driver_id != driver_id || binding.device_id != receipt.fdo_device_id()) as u64);
+        print_str(b"/");
+        print_u64((binding.pdo_device_id != receipt.pdo_device_id()) as u64);
+        print_str(b"/");
+        print_u64((!hosted_pnp_start_receipt_matches_instance(receipt, instance_id)) as u64);
+        print_str(b"\n");
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    hosted_critical_child_starts_mut()
+        .retire_reserved_from_start(
+            hosted_pnp_manager_mut(),
+            hosted_bus_relations(),
+            mount_identity,
+            instance_id,
+            receipt,
+        )
+        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)
 }
 
 unsafe fn copy_hosted_device_relations_result(
@@ -52652,6 +52835,15 @@ unsafe fn clear_hosted_resource_projection(
     retire_hosted_irq_connections_for_binding(binding)?;
     let resource_state = hosted_device_resource_state_by_device_id(binding.device_id);
     if let Some(state) = resource_state {
+        if state.interface_type == HOSTED_INTERFACE_TYPE_INTERNAL_POWER_BUS {
+            if let Some(claim) = state.interrupt_claim {
+                crate::fence_acpi_child_projected_interrupt(
+                    binding.device_id,
+                    binding.projection_domain.cookie,
+                    claim,
+                )?;
+            }
+        }
         if state.interface_type == HOSTED_INTERFACE_TYPE_PCIBUS && state.pci_command_owned_bits != 0
         {
             crate::pnp::release_pci_command_for_resources(
@@ -52850,6 +53042,114 @@ pub(crate) fn service_hosted_root_pdo_pnp(
     match unsafe { hosted_root_bus_mut().dispatch_pnp_outcome(device_id, minor) } {
         nt_root_bus::RootPdoPnpDispatch::Handled(status) => (status, true),
         nt_root_bus::RootPdoPnpDispatch::Unhandled => (0, false),
+    }
+}
+
+/// Consume the already executed accepted provider FILTER terminal at the consumer's exact
+/// native lower PDO edge. This does not enter or replay the provider IRP.
+pub(crate) unsafe fn service_hosted_accepted_pdo_filter_terminal(
+    ch: &crate::spawn_hosts::PumpChannel,
+    pdo_object: u64,
+    source_irp: u64,
+    caller_badge: u64,
+    active_reply_cap: u64,
+) -> (i32, bool) {
+    let refused = (nt_status::NtStatus::INVALID_DEVICE_REQUEST.raw(), false);
+    if hosted_driver_pump_caller_tcb(ch, active_reply_cap, caller_badge).is_none() {
+        return refused;
+    }
+    let Ok((instance_index, inst, pdo)) =
+        authenticated_hosted_pdo(ch, pdo_object, active_reply_cap)
+    else {
+        return refused;
+    };
+    if hosted_root_bus_mut().pdo(pdo).is_some() {
+        return (STATUS_SUCCESS, false);
+    }
+    let Some(domain) = instance_domain_identity(inst) else {
+        return refused;
+    };
+    let Some(active) = (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS))
+        .as_ref()
+        .and_then(|rows| rows.last())
+        .copied()
+    else {
+        return refused;
+    };
+    if active.shared_va != ch.shared_va
+        || active.source_instance != instance_index
+        || !hosted_source_irp_ledger::active_caller_projection_matches(
+            instance_index,
+            active.transfer_id,
+            source_irp,
+            nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS,
+        )
+    {
+        return refused;
+    }
+    let binding = {
+        let Some(bindings) = hosted_device_bindings() else {
+            return refused;
+        };
+        let mut exact = bindings.iter().copied().filter(|binding| {
+            binding.used
+                && binding.projection_domain == domain
+                && binding.projection_instance == instance_index
+                && binding.pdo_object == pdo_object
+                && binding.pdo_device_id == pdo.raw()
+        });
+        let Some(binding) = exact.next() else {
+            return refused;
+        };
+        if exact.next().is_some() {
+            return refused;
+        }
+        binding
+    };
+    if binding.pdo_device_id != pdo.raw()
+        || binding.projection_domain != domain
+        || binding.projection_instance != instance_index
+        || hosted_device_binding_by_device_id(binding.device_id) != Some(binding)
+        || !io_manager_mut()
+            .hosted_device_pointer_registration(domain, pdo_object)
+            .is_some_and(|registration| registration.device_id() == pdo)
+    {
+        return refused;
+    }
+    let Ok(provider) = hosted_accepted_pdo_provider_catalog().resolve(
+        hosted_pnp_manager_mut(),
+        hosted_bus_relations(),
+        io_manager_mut(),
+        pdo.raw(),
+    ) else {
+        return refused;
+    };
+    if provider.provider().domain() == domain {
+        return refused;
+    }
+    let identity = nt_pnp_manager::AcceptedPdoPnpIdentity {
+        outer_irp: IrpId(active.transfer_id),
+        pdo,
+        minor: nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS,
+        provider,
+    };
+    let Some(transaction) = hosted_filter_requirements_transactions_mut()
+        .iter_mut()
+        .find(|transaction| {
+            transaction.irp_id == identity.outer_irp
+                && transaction.binding == binding
+                && transaction.phase == HostedFilterRequirementsPhase::AwaitingCompletion
+        })
+    else {
+        return refused;
+    };
+    match transaction
+        .video_provider_proof
+        .as_mut()
+        .map(|proof| proof.take_for(identity))
+    {
+        Some(Ok(status)) => (status.raw(), true),
+        _ => refused,
     }
 }
 
@@ -54883,6 +55183,21 @@ fn teardown_hosted_device_binding(binding: HostedDeviceBinding) -> bool {
     }
     if unsafe { validate_hosted_device_resources_revoked(binding) }.is_err() {
         return false;
+    }
+    let acpi_child_identity = match unsafe {
+        crate::acpi_child_interrupt_identity_for_fdo(
+            binding.device_id, binding.projection_domain.cookie,
+        )
+    } {
+        Ok(identity) => identity,
+        Err(_) => return false,
+    };
+    if let Some(identity) = acpi_child_identity {
+        if unsafe { crate::fence_acpi_child_interrupt(identity) }.is_err()
+            || unsafe { crate::retire_acpi_child_interrupt(identity) }.is_err()
+        {
+            return false;
+        }
     }
     let pointer_retired = unsafe { hosted_device_retirements_mut() }.iter().any(|retirement| {
         hosted_device_retirement_matches_binding(*retirement, binding)
@@ -62273,6 +62588,20 @@ unsafe fn dispatch_video_pnp_irp_for_instance(
                 .dispatch_pnp_outcome(nt_io_manager::DeviceId(binding.pdo_device_id), irp.minor)
                 .completion_or(irp.status.raw(), irp.information)
         } else {
+            let provider = hosted_accepted_pdo_provider_catalog()
+                .resolve(
+                    hosted_pnp_manager_mut(),
+                    hosted_bus_relations(),
+                    io_manager_mut(),
+                    binding.pdo_device_id,
+                )
+                .ok();
+            let identity = provider.map(|provider| nt_pnp_manager::AcceptedPdoPnpIdentity {
+                outer_irp: irp.irp_id,
+                pdo: nt_io_manager::DeviceId(binding.pdo_device_id),
+                minor: irp.minor,
+                provider,
+            });
             let proof = hosted_filter_requirements_transactions_mut()
                 .iter_mut()
                 .find(|transaction| {
@@ -62280,13 +62609,13 @@ unsafe fn dispatch_video_pnp_irp_for_instance(
                         && transaction.binding.pdo_device_id == binding.pdo_device_id
                         && transaction.binding.device_id == binding.device_id
                 })
-                .and_then(|transaction| transaction.video_provider_proof.take());
-            let Some(status) = proof else {
+                .and_then(|transaction| transaction.video_provider_proof.as_mut());
+            let Some(status) = identity.and_then(|identity| proof?.take_for(identity).ok()) else {
                 return PnpBackendDispatch::NotDispatched {
                     status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
                 };
             };
-            (status.raw(), 0)
+            (status.raw(), if status == nt_status::NtStatus::NOT_SUPPORTED { irp.information } else { 0 })
         };
         return PnpBackendDispatch::Returned {
             status: nt_status::NtStatus(status),
@@ -62687,6 +63016,122 @@ pub(crate) unsafe fn hosted_accepted_pci_resource_properties(
     Ok((raw_copy, requirements_copy))
 }
 
+pub(crate) struct HostedAcceptedAcpiChildResources {
+    pub raw_resources: Vec<u8>,
+    pub resource_requirements: Vec<u8>,
+    pub provider: nt_pnp_manager::AcceptedPdoProviderAuthority,
+    pub child: nt_pnp_manager::DevnodeIdentity,
+}
+
+/// The accepted ACPI PDO, rather than a registry identity, supplies the native resource bytes.
+pub(crate) unsafe fn hosted_accepted_acpi_child_resources(
+    instance_path: &str,
+    pdo_device_id: u64,
+) -> Result<Option<HostedAcceptedAcpiChildResources>, nt_status::NtStatus> {
+    let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+    let (raw_resources, resource_requirements) = {
+        let properties = hosted_pnp_manager_mut()
+            .enumerated_pdo_properties(pdo_device_id)
+            .ok_or(invalid)?;
+        let Some(bus) = properties.bus_information.as_ref() else {
+            return Err(invalid);
+        };
+        if bus.bus_type_guid != GUID_ACPI_INTERFACE_STANDARD
+            || bus.legacy_bus_type != HOSTED_INTERFACE_TYPE_INTERNAL_POWER_BUS
+        {
+            return Ok(None);
+        }
+        if bus.bus_number != 0 {
+            return Err(invalid);
+        }
+        let (nt_pnp_manager::PropertyBlobState::Present(raw), nt_pnp_manager::PropertyBlobState::Present(requirements)) =
+            (&properties.boot_resources_raw, &properties.resource_requirements)
+        else {
+            return Err(invalid);
+        };
+        (clone_pnp_resource_list(raw)?, clone_pnp_resource_list(requirements)?)
+    };
+    if hosted_bus_reported_device_id(instance_path) != Some(pdo_device_id) {
+        return Err(invalid);
+    }
+    let child = hosted_pnp_manager_mut()
+        .devnode_identity_for_pdo(pdo_device_id)
+        .ok_or(invalid)?;
+    let provider = hosted_accepted_pdo_provider_catalog()
+        .resolve(
+            hosted_pnp_manager_mut(),
+            hosted_bus_relations(),
+            io_manager_mut(),
+            pdo_device_id,
+        )
+        .map_err(|_| invalid)?;
+    Ok(Some(HostedAcceptedAcpiChildResources {
+        raw_resources,
+        resource_requirements,
+        provider,
+        child,
+    }))
+}
+
+pub(crate) unsafe fn hosted_acpi_child_interrupt_identity(
+    device_id: u64,
+    resources: &HostedAcceptedAcpiChildResources,
+) -> Result<crate::hosted_interrupt_authority::AcpiChildInterruptIdentity, nt_status::NtStatus> {
+    let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+    let binding = hosted_device_binding_by_device_id(device_id).ok_or(invalid)?;
+    if binding.device_id != device_id
+        || binding.pdo_device_id != resources.child.pdo_object_id()
+        || binding.projection_domain.cookie == 0
+        || hosted_pnp_manager_mut().devnode_identity_for_pdo(binding.pdo_device_id)
+            != Some(resources.child)
+        || hosted_pnp_manager_mut().fdo(resources.child.devnode_id()) != Some(device_id)
+        || hosted_accepted_pdo_provider_catalog()
+            .resolve(
+                hosted_pnp_manager_mut(), hosted_bus_relations(), io_manager_mut(),
+                binding.pdo_device_id,
+            ) != Ok(resources.provider)
+        || hosted_device_pointer_registration(
+            binding.projection_domain,
+            binding.device_object,
+            nt_io_manager::DeviceId(device_id),
+        ).is_err()
+        || io_manager_mut().device(nt_io_manager::DeviceId(device_id))
+            .is_none_or(|device| device.delete_pending || device.driver_id.raw() != binding.driver_id)
+    {
+        return Err(invalid);
+    }
+    let properties = hosted_pnp_manager_mut()
+        .enumerated_pdo_properties(binding.pdo_device_id)
+        .ok_or(invalid)?;
+    if !matches!(&properties.boot_resources_raw,
+        nt_pnp_manager::PropertyBlobState::Present(bytes) if bytes == &resources.raw_resources)
+        || !matches!(&properties.resource_requirements,
+            nt_pnp_manager::PropertyBlobState::Present(bytes) if bytes == &resources.resource_requirements)
+    {
+        return Err(invalid);
+    }
+    crate::hosted_interrupt_authority::AcpiChildInterruptIdentity::new(
+        resources.provider,
+        resources.child,
+        device_id,
+        binding.projection_domain.cookie,
+    )
+    .ok_or(invalid)
+}
+
+pub(crate) unsafe fn fence_hosted_acpi_child_interrupt_for_device(
+    device_id: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let binding = hosted_device_binding_by_device_id(device_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if let Some(identity) = crate::acpi_child_interrupt_identity_for_fdo(
+        device_id, binding.projection_domain.cookie,
+    )? {
+        crate::fence_acpi_child_interrupt(identity)?;
+    }
+    Ok(())
+}
+
 pub(crate) unsafe fn commit_hosted_device_resource_assignment(
     device_id: u64,
     raw_resource_list: &[u8],
@@ -62850,7 +63295,7 @@ pub(crate) unsafe fn filter_hosted_device_resource_requirements(
             .expect("owned prepared hosted PnP request could not be discarded");
         return Err(status);
     }
-    let video_provider = match prepare_hosted_video_provider_filter(
+    let video_provider = match prepare_hosted_accepted_provider_filter(
         irp_id,
         binding,
         resource_requirements,

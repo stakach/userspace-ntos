@@ -1,6 +1,31 @@
 use crate::*;
 use alloc::vec::Vec;
 
+static ACTIVE_HOSTED_START_BATCH_DRIVES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+struct ActiveHostedStartBatchDrive;
+
+impl ActiveHostedStartBatchDrive {
+    fn enter() -> Self {
+        ACTIVE_HOSTED_START_BATCH_DRIVES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for ActiveHostedStartBatchDrive {
+    fn drop(&mut self) {
+        assert_ne!(
+            ACTIVE_HOSTED_START_BATCH_DRIVES.fetch_sub(1, core::sync::atomic::Ordering::AcqRel),
+            0,
+        );
+    }
+}
+
+pub(crate) fn hosted_start_batch_drive_active() -> bool {
+    ACTIVE_HOSTED_START_BATCH_DRIVES.load(core::sync::atomic::Ordering::Acquire) != 0
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HostedPnpStartTrace {
     BootService,
@@ -223,6 +248,24 @@ impl OwnedHostedPnpStartBatch {
         &self.spec.driver_object_path
     }
 
+    pub(crate) unsafe fn owns_current_bus_child(
+        &self,
+        instance_id: &str,
+        child_pdo: u64,
+    ) -> bool {
+        self.spec.devnodes.iter().enumerate().any(|(index, devnode)| {
+            devnode.instance_id.eq_ignore_ascii_case(instance_id)
+                && driver_launch::hosted_bus_reported_device_id(instance_id) == Some(child_pdo)
+                && self.pending_filter.as_ref().is_none_or(|pending| {
+                    pending.devnode_index != index
+                        || driver_launch::hosted_function_device_id_for_instance(
+                            instance_id,
+                            self.coordinator.driver_id(),
+                        ) == Ok(pending.device_id)
+                })
+        })
+    }
+
     pub(crate) fn report(&self) -> HostedPnpStartReport {
         self.report
     }
@@ -262,6 +305,25 @@ impl OwnedHostedPnpStartBatch {
             );
             self.single_start_evidence = SingleStartEvidence::Lifecycle { receipt };
         }
+    }
+
+    unsafe fn retire_reserved_critical_start(
+        &self,
+        devnode_index: usize,
+        status: nt_status::NtStatus,
+        receipt: &nt_pnp_manager::StartDeviceLifecycleReceipt,
+    ) {
+        if self.options.trace != HostedPnpStartTrace::ConfigPnp {
+            return;
+        }
+        let instance_id = &self.spec.devnodes[devnode_index].instance_id;
+        driver_launch::retire_hosted_critical_child_from_config_start(
+            instance_id,
+            self.coordinator.driver_id(),
+            status,
+            receipt,
+        )
+        .expect("exact config START terminal could not retire its reserved critical child");
     }
 
     fn retain_start_dispatch(&mut self, irp_id: u64) {
@@ -408,6 +470,7 @@ impl OwnedHostedPnpStartBatch {
                     .dispatch_terminal(token)
                     .expect("terminal START did not match dispatched devnode");
                 if let Some(receipt) = receipt {
+                    self.retire_reserved_critical_start(devnode_index, status, &receipt);
                     self.retain_start_receipt(receipt);
                 }
                 if !status.is_success() {
@@ -456,6 +519,7 @@ impl OwnedHostedPnpStartBatch {
     }
 
     unsafe fn drive_inner(&mut self, pump_before_observe: bool) -> OwnedHostedPnpStartProgress {
+        let _active_drive = ActiveHostedStartBatchDrive::enter();
         loop {
             if let Some(refresh) = self.pending_relations {
                 if pump_before_observe {
@@ -600,6 +664,7 @@ impl OwnedHostedPnpStartBatch {
                                 &mut self.report,
                             );
                             if let Some(receipt) = receipt {
+                                self.retire_reserved_critical_start(devnode_index, status, &receipt);
                                 self.retain_start_receipt(receipt);
                             }
                             self.pending_device_id = 0;
@@ -1211,6 +1276,12 @@ pub(crate) enum PreparedHostedResourcePlan {
         window: HostedPnpPlatformResourceDescriptor,
         lease: nt_pnp_context::ContextLease,
     },
+    AcpiChild {
+        resources: driver_launch::HostedAcceptedAcpiChildResources,
+        ports: Vec<nt_cm_resources::PortDescriptor>,
+        interrupt: nt_cm_resources::InterruptDescriptor,
+        lease: nt_pnp_context::ContextLease,
+    },
     None,
 }
 
@@ -1229,13 +1300,18 @@ impl PreparedHostedResourcePlan {
                 Some(&grant.raw_boot_resources),
                 Some(&grant.resource_requirements),
             ),
+            Self::AcpiChild { resources, .. } => (
+                Some(&resources.raw_resources),
+                Some(&resources.resource_requirements),
+            ),
             Self::None => (None, None),
         }
     }
 
     unsafe fn release_context_lease(self) -> Result<(), nt_status::NtStatus> {
         let lease = match self {
-            Self::Pci { lease, .. } | Self::Platform { lease, .. } => lease,
+            Self::Pci { lease, .. } | Self::Platform { lease, .. }
+            | Self::AcpiChild { lease, .. } => lease,
             Self::BusReportedBusNumber { .. } | Self::None => return Ok(()),
         };
         release_hosted_pnp_context_lease(lease.into_identity())
@@ -1250,7 +1326,8 @@ impl PreparedHostedResourcePlan {
                     &bus_resources.device,
                 )
             }
-            Self::BusReportedBusNumber { .. } | Self::Platform { .. } | Self::None => {
+            Self::BusReportedBusNumber { .. } | Self::Platform { .. }
+            | Self::AcpiChild { .. } | Self::None => {
                 crate::hosted_pci_topology::HostedPciInterruptRouteAdmission::Current
             }
         }
@@ -1269,6 +1346,44 @@ unsafe fn release_context_lease_after_error(
 struct PreparedHostedDevnode {
     pdo_description: Option<driver_launch::HostedPdoDescription>,
     resource_plan: PreparedHostedResourcePlan,
+}
+
+fn acpi_child_reported_interrupt(
+    raw: &[u8],
+) -> Result<nt_pnp::PlatformInterruptResource, nt_status::NtStatus> {
+    let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+    if nt_cm_resources::validate_cm_resource_list_extent(raw).map_err(|_| invalid)? != raw.len()
+        || u32::from_le_bytes(raw.get(0..4).ok_or(invalid)?.try_into().unwrap()) != 1
+    {
+        return Err(invalid);
+    }
+    let count = u32::from_le_bytes(raw.get(16..20).ok_or(invalid)?.try_into().unwrap()) as usize;
+    let mut interrupt = None;
+    for index in 0..count {
+        let offset = 20usize.checked_add(index.checked_mul(nt_cm_resources::PARTIAL_DESCRIPTOR_SIZE)
+            .ok_or(invalid)?).ok_or(invalid)?;
+        let descriptor = raw.get(offset..offset + nt_cm_resources::PARTIAL_DESCRIPTOR_SIZE)
+            .ok_or(invalid)?;
+        if descriptor[0] == nt_cm_resources::CM_RESOURCE_TYPE_INTERRUPT {
+            if interrupt.is_some() { return Err(invalid); }
+            let level = u32::from_le_bytes(descriptor[4..8].try_into().unwrap());
+            let flags = u16::from_le_bytes(descriptor[2..4].try_into().unwrap());
+            if level == 0 || !matches!(flags,
+                nt_cm_resources::CM_RESOURCE_INTERRUPT_LATCHED
+                    | nt_cm_resources::CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE)
+            {
+                return Err(invalid);
+            }
+            interrupt = Some(nt_pnp::PlatformInterruptResource {
+                level,
+                vector: level,
+                affinity: 1,
+                latched: flags == nt_cm_resources::CM_RESOURCE_INTERRUPT_LATCHED,
+                shared: descriptor[1] == nt_cm_resources::CM_RESOURCE_SHARE_SHARED,
+            });
+        }
+    }
+    interrupt.ok_or(invalid)
 }
 
 unsafe fn prepare_current_hosted_devnode<H, C>(
@@ -1297,6 +1412,41 @@ where
     }
 
     let lease = acquire_hosted_pnp_context_lease()?;
+    if let Some(pdo) = bus_pdo {
+        let accepted = match driver_launch::hosted_accepted_acpi_child_resources(instance_id, pdo) {
+            Ok(accepted) => accepted,
+            Err(status) => return Err(release_context_lease_after_error(lease, status)),
+        };
+        if let Some(resources) = accepted {
+            let admitted = (|| {
+                let interrupt = acpi_child_reported_interrupt(&resources.raw_resources)?;
+                let admitted = nt_pnp::admit_bus_reported_platform_resources(
+                    &resources.raw_resources,
+                    &resources.resource_requirements,
+                    &[nt_pnp::PlatformPortResource { start: 0, length: u16::MAX as u32 + 1 }],
+                    interrupt,
+                ).map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+                let (gsi, _) = crate::resolve_hosted_legacy_irq(
+                    admitted.raw_interrupt.level,
+                    admitted.raw_interrupt.flags != nt_cm_resources::CM_RESOURCE_INTERRUPT_LATCHED,
+                )?;
+                if crate::resolve_platform_ioapic_gsi(gsi).is_none() {
+                    return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                }
+                Ok::<_, nt_status::NtStatus>((admitted.ports, admitted.raw_interrupt))
+            })();
+            let (ports, interrupt) = match admitted {
+                Ok(admitted) => admitted,
+                Err(status) => return Err(release_context_lease_after_error(lease, status)),
+            };
+            return Ok(PreparedHostedDevnode {
+                pdo_description: None,
+                resource_plan: PreparedHostedResourcePlan::AcpiChild {
+                    resources, ports, interrupt, lease,
+                },
+            });
+        }
+    }
     let context = match hosted_pnp_context_description(&lease) {
         Ok(context) => context,
         Err(status) => {
@@ -1612,8 +1762,14 @@ where
             };
         }
     }
+    let existing_stack = bus_pdo.and_then(|_| {
+        driver_launch::hosted_function_device_id_for_instance(devnode.instance_id, driver_id).ok()
+    });
+    let reused_stack = options.reuse_existing_stack || existing_stack.is_some();
     let add_device = if options.reuse_existing_stack {
         driver_launch::hosted_function_device_id_for_instance(devnode.instance_id, driver_id)
+    } else if let Some(device_id) = existing_stack {
+        Ok(device_id)
     } else {
         match bus_pdo {
             Some(pdo_device_id) => driver_launch::call_add_device_for_bus_pdo(
@@ -1641,7 +1797,7 @@ where
     };
     match add_device {
         Ok(device_id) => {
-            if !options.reuse_existing_stack {
+            if !reused_stack {
                 report.add_device = true;
                 report.add_device_count += 1;
                 print_add_device_success(
@@ -2020,6 +2176,8 @@ unsafe fn finish_started_devnode(
         report.start_ok = true;
         report.started += 1;
     } else {
+        driver_launch::fence_hosted_acpi_child_interrupt_for_device(device_id)
+            .expect("failed START could not fence its accepted ACPI child IRQ claim");
         report.failed += 1;
         remember_error(report, status);
     }

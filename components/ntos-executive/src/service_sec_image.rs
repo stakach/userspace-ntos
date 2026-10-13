@@ -24519,6 +24519,11 @@ unsafe fn pending_pnp_operation_redrive_all(nt_handler: &mut ExecNtHandler) -> u
 }
 
 unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u64 {
+    // A synchronous boot/config batch may reenter this pump between AddDevice and START,
+    // before its continuation has been published in pending_driver_starts.
+    if hosted_pnp_start::hosted_start_batch_drive_active() {
+        return 0;
+    }
     let Some(mount) = LIVE_CONFIG_MANAGER_SYSTEM_MOUNT else {
         return 0;
     };
@@ -24557,6 +24562,20 @@ unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u
                 continue;
             }
             nt_pnp_manager::ExistingDeviceStartDisposition::RequiresAction => {}
+        }
+        if nt_handler.pending_driver_starts.occupied_slots().any(|slot| {
+            nt_handler
+                .pending_driver_starts
+                .get(slot)
+                .is_some_and(|pending| {
+                    pending.batch.owns_current_bus_child(
+                        instance,
+                        claim.key().child().pdo_object_id(),
+                    )
+                })
+        }) {
+            driver_launch::defer_hosted_critical_child_start(claim);
+            break;
         }
         let spec = match live_config_existing_device_launch_spec(instance, SERVICE_DEMAND_START) {
             Ok(spec) if spec.class == driver_launch::DriverClass::Device && spec.devnodes.len() == 1 => spec,

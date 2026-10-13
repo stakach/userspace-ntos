@@ -172,9 +172,11 @@ video-device publication. A longer bounded guest reached real CSRSS, Winlogon,
 Services and setup.exe and created a 1024x768 display PDEV. Its same-run frame
 still shows only background and cursor; Userinit and Explorer have not run.
 The native `IoStartPacket`/`IoStartNextPacket` path now builds, and a resumed boot
-loaded i8042prt successfully. Its keyboard and mouse starts are currently blocked
-before AddDevice by ACPI child resource admission, so actual input callbacks remain
-unproven. Font cleanup and desktop acceptance remain unproven. Acceptance
+loaded i8042prt successfully. Its keyboard and mouse resource filtering now
+reaches START_DEVICE through accepted ACPI child PDOs. Both starts currently
+fail because the registry-selected kbdclass/mouclass upper filters have not
+attached and sent their real CONNECT requests, so input callbacks remain unproven.
+Font cleanup and desktop acceptance remain unproven. Acceptance
 requires strict native private-font
 cleanup and a separate fresh production Userinit/Explorer boot with real callbacks,
 GDI drawing, logs and screenshots. The [PCI video boot evidence](docs/evidence/issue306-pci-video-boot.json)

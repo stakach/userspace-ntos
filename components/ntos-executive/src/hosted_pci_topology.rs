@@ -166,6 +166,21 @@ pub(crate) unsafe fn install_hosted_pci_interrupt_overrides(
     Ok(())
 }
 
+/// Resolve a bus-reported ISA IRQ through the checksum-validated MADT override inventory.
+/// A CM interrupt descriptor has no polarity field, so only legacy IRQs with ISA default or
+/// explicit firmware polarity can be admitted here.
+pub(crate) unsafe fn resolve_hosted_legacy_irq(
+    irq: u32,
+    level_sensitive: bool,
+) -> Result<(u32, bool), nt_status::NtStatus> {
+    let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+    let authority = (*core::ptr::addr_of!(HOSTED_PCI_TOPOLOGY))
+        .as_ref()
+        .ok_or(invalid)?;
+    let overrides = authority.interrupt_overrides.as_ref().ok_or(invalid)?;
+    nt_acpi::resolve_legacy_irq(irq, level_sensitive, overrides).map_err(|_| invalid)
+}
+
 pub(crate) unsafe fn hosted_pci_topology_generations() -> Option<(u64, u64, u64)> {
     let authority = (*core::ptr::addr_of!(HOSTED_PCI_TOPOLOGY)).as_ref()?;
     Some((

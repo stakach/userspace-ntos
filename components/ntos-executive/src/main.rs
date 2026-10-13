@@ -13190,6 +13190,7 @@ unsafe fn map_hosted_pci_resource_root_alias(
 enum HostedDevnodeGrantKind {
     Pci { dev: u8, func: u8 },
     RootBus,
+    AcpiChild,
 }
 
 struct HostedDevnodeGrant {
@@ -13233,6 +13234,12 @@ fn print_hosted_devnode_grant(service: &[u8], devnode: &[u8], grant: &HostedDevn
         }
         HostedDevnodeGrantKind::RootBus => {
             print_str(b"[driver-launch] assigned root-bus resources service=");
+            print_str(service);
+            print_str(b" devnode=");
+            print_str(devnode);
+        }
+        HostedDevnodeGrantKind::AcpiChild => {
+            print_str(b"[driver-launch] assigned ACPI child resources service=");
             print_str(service);
             print_str(b" devnode=");
             print_str(devnode);
@@ -13754,6 +13761,112 @@ unsafe fn grant_hosted_platform_devnode_resources(
     }))
 }
 
+unsafe fn grant_hosted_acpi_child_devnode_resources(
+    device_id: u64,
+    resources: driver_launch::HostedAcceptedAcpiChildResources,
+    ports: Vec<nt_cm_resources::PortDescriptor>,
+    interrupt: nt_cm_resources::InterruptDescriptor,
+    context_lease: nt_pnp_context::ContextLeaseIdentity,
+    filtered_resource_requirements: alloc::vec::Vec<u8>,
+) -> Result<Option<HostedDevnodeGrant>, nt_status::NtStatus> {
+    let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+    if !filtered_resource_requirements.is_empty()
+        && filtered_resource_requirements != resources.resource_requirements
+    {
+        // A function filter's replacement list needs a separate checked adoption contract.
+        return Err(invalid);
+    }
+    let identity = driver_launch::hosted_acpi_child_interrupt_identity(device_id, &resources)?;
+    let admitted = nt_pnp::admit_bus_reported_platform_resources(
+        &resources.raw_resources,
+        &resources.resource_requirements,
+        &[nt_pnp::PlatformPortResource { start: 0, length: u16::MAX as u32 + 1 }],
+        nt_pnp::PlatformInterruptResource {
+            level: interrupt.level,
+            vector: interrupt.level,
+            affinity: 1,
+            latched: interrupt.flags == nt_cm_resources::CM_RESOURCE_INTERRUPT_LATCHED,
+            shared: interrupt.share == nt_cm_resources::CM_RESOURCE_SHARE_SHARED,
+        },
+    ).map_err(|_| invalid)?;
+    if admitted.ports != ports || admitted.raw_interrupt != interrupt {
+        return Err(invalid);
+    }
+    let mut translated = Vec::new();
+    translated.try_reserve_exact(resources.raw_resources.len())
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    translated.extend_from_slice(&resources.raw_resources);
+    let count = u32::from_le_bytes(translated.get(16..20).ok_or(invalid)?.try_into().unwrap()) as usize;
+    let mut interrupt_offset = None;
+    for index in 0..count {
+        let offset = 20 + index * nt_cm_resources::PARTIAL_DESCRIPTOR_SIZE;
+        if translated.get(offset).copied() == Some(nt_cm_resources::CM_RESOURCE_TYPE_INTERRUPT) {
+            if interrupt_offset.replace(offset).is_some() { return Err(invalid); }
+        }
+    }
+    let interrupt_offset = interrupt_offset.ok_or(invalid)?;
+    let mut port_grants = Vec::new();
+    port_grants.try_reserve_exact(ports.len())
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    for (index, port) in ports.iter().enumerate() {
+        port_grants.push(driver_launch::HostedPortResourceGrant {
+            resource_index: u8::try_from(index).map_err(|_| invalid)?,
+            raw_start: port.start,
+            translated_start: port.start,
+            length: port.length,
+            flags: port.flags,
+            share: port.share,
+            pci_flags: 0,
+            platform_reset: false,
+        });
+    }
+    ensure_acpi_child_interrupt_claim_inactive(identity)?;
+    let (gsi, active_low) = resolve_hosted_legacy_irq(
+        interrupt.level,
+        interrupt.flags != nt_cm_resources::CM_RESOURCE_INTERRUPT_LATCHED,
+    )?;
+    let assignment = claim_acpi_child_interrupt(
+        identity,
+        gsi,
+        interrupt.flags != nt_cm_resources::CM_RESOURCE_INTERRUPT_LATCHED,
+        active_low,
+        interrupt.share == nt_cm_resources::CM_RESOURCE_SHARE_SHARED,
+    )?;
+    translated[interrupt_offset + 8..interrupt_offset + 12]
+        .copy_from_slice(&assignment.route.vector.to_le_bytes());
+    translated[interrupt_offset + 12..interrupt_offset + 20]
+        .copy_from_slice(&1u64.to_le_bytes());
+    if let Err(status) = driver_launch::grant_hosted_device_resources(
+        device_id,
+        driver_launch::HostedBusIdentity::acpi_child(),
+        &[],
+        &port_grants,
+        assignment.route.gsi,
+        assignment.route.vector,
+        assignment.route.shared,
+        !assignment.route.level_sensitive,
+        assignment.route.active_low,
+        Some(assignment.claim),
+        1,
+        0, 0, 0, 0, 0, 0,
+        context_lease,
+    ) {
+        fence_acpi_child_interrupt(identity)?;
+        return Err(status);
+    }
+    Ok(Some(HostedDevnodeGrant {
+        kind: HostedDevnodeGrantKind::AcpiChild,
+        raw_resource_list: resources.raw_resources,
+        translated_resource_list: translated,
+        mmio_phys: 0,
+        mmio_len: 0,
+        io_port_base: ports.first().map(|port| port.start).unwrap_or(0),
+        io_port_len: ports.first().map(|port| port.length).unwrap_or(0),
+        vector: assignment.route.vector,
+        dma_len: 0,
+    }))
+}
+
 unsafe fn grant_hosted_devnode_resources(
     device_id: u64,
     plan: PreparedHostedResourcePlan,
@@ -13803,6 +13916,14 @@ unsafe fn grant_hosted_devnode_resources(
                 grant,
                 window,
                 context_lease,
+                filtered_resource_requirements,
+            );
+            settle_hosted_pnp_context_grant(device_id, context_lease, result)
+        }
+        PreparedHostedResourcePlan::AcpiChild { resources, ports, interrupt, lease } => {
+            let context_lease = lease.into_identity();
+            let result = grant_hosted_acpi_child_devnode_resources(
+                device_id, resources, ports, interrupt, context_lease,
                 filtered_resource_requirements,
             );
             settle_hosted_pnp_context_grant(device_id, context_lease, result)

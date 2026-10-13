@@ -1302,6 +1302,42 @@ pub(super) fn observed_projected_start_io_packet(
     )
 }
 
+/// Prove that a native lower-edge call still belongs to the exact active caller projection.
+/// The op6 row and live node generation prevent a recycled raw IRP address from consuming a
+/// staged provider terminal belonging to an earlier dispatch.
+pub(super) fn active_caller_projection_matches(
+    instance_index: usize,
+    canonical_irp_id: u64,
+    raw_irp: u64,
+    expected_minor: u8,
+) -> bool {
+    let _guard = lock();
+    let Some(row) = caller_projections().iter().find(|row| {
+        row.canonical_irp_id == canonical_irp_id
+            && row.allocation.component_address == raw_irp
+            && row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index)
+            && !row.terminal_started
+    }) else {
+        return false;
+    };
+    unsafe {
+        projected_node(
+            instance_index,
+            row.node,
+            canonical_irp_id,
+            raw_irp,
+            HOSTED_IRP_DISPATCHING,
+            Some(row.node_generation),
+        )
+        .is_some_and(|(_, entry)| {
+            entry.major == major::IRP_MJ_PNP
+                && entry.minor == expected_minor
+                && entry.source_ticket_id == row.ticket.id.get()
+                && entry.source_ticket_generation == row.ticket.generation.get()
+        })
+    }
+}
+
 /// Final physical node check for the StartIo queue commit. The caller already owns the exact
 /// source pin and hosted pool guard; no source-ledger lock may be taken in this order.
 pub(super) unsafe fn projected_start_io_node_matches_locked(

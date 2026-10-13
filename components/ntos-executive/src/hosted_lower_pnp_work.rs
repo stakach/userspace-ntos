@@ -249,6 +249,13 @@ pub(super) unsafe fn service(
         2 if source_irp == 0 => {
             acknowledge(ch, reply_cap, caller_badge, address).map(|status| (status, false))
         }
+        3 => Some(service_hosted_accepted_pdo_filter_terminal(
+            ch,
+            address,
+            source_irp,
+            caller_badge,
+            reply_cap,
+        )),
         _ => Some((STATUS_INVALID_PARAMETER_LOCAL, false)),
     }
 }
