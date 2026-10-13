@@ -40,6 +40,8 @@ mod hosted_source_stack_lease;
 mod hosted_connect_capture;
 #[path = "hosted_connect_work.rs"]
 mod hosted_connect_work;
+#[path = "hosted_class_callback_lane.rs"]
+mod hosted_class_callback_lane;
 #[path = "hosted_rtl_registry_delete.rs"]
 mod hosted_rtl_registry_delete;
 #[path = "hosted_rtl_registry_write.rs"]
