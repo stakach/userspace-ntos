@@ -128,6 +128,10 @@ mod hosted_device_retirement;
 mod hosted_upper_filter_projection;
 #[path = "hosted_upper_filter_alias.rs"]
 mod hosted_upper_filter_alias;
+#[path = "hosted_reverse_class_alias.rs"]
+mod hosted_reverse_class_alias;
+#[path = "hosted_reverse_class_projection.rs"]
+mod hosted_reverse_class_projection;
 #[path = "hosted_upper_filter_add_device.rs"]
 mod hosted_upper_filter_add_device;
 use hosted_device_retirement::{retire_hosted_device_projection, CanonicalRetirement};
@@ -1026,6 +1030,7 @@ pub const FSD_DISPATCH_CREATE_PDO_PROJECTION: u64 = u64::MAX - 0x77F;
 pub const FSD_DISPATCH_DRAIN_FILE_RETIREMENTS: u64 = u64::MAX - 0x781;
 pub const FSD_DISPATCH_DRIVER_REINIT: u64 = u64::MAX - 0x782;
 pub const FSD_DISPATCH_CLASS_LOWER_ALIAS: u64 = u64::MAX - 0x783;
+pub const FSD_DISPATCH_REVERSE_CLASS_ALIAS: u64 = u64::MAX - 0x784;
 
 const HOSTED_INTERRUPT_OP_CONNECT: u64 = 1;
 const HOSTED_INTERRUPT_OP_DISCONNECT: u64 = 2;
@@ -34504,6 +34509,39 @@ unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64
             stack_size as u8,
         ) {
             Ok(observed_pdo) => (STATUS_SUCCESS, observed_pdo),
+            Err(status) => (status, 0),
+        };
+    }
+    if major == FSD_DISPATCH_REVERSE_CLASS_ALIAS {
+        let port_do = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
+        let class_do = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
+        if !consumer_device_object_in_local_pool(port_do)
+            || !consumer_device_object_in_local_pool(class_do)
+        {
+            return (STATUS_INVALID_PARAMETER, 0);
+        }
+        let port_type_flags = read_volatile((FSD_SHARED_VADDR + SH_REQ_INLEN) as *const u64);
+        let class_type_flags = read_volatile((FSD_SHARED_VADDR + SH_REQ_OUTLEN) as *const u64);
+        let port_characteristics_stack = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
+        let class_characteristics_stack = read_volatile((FSD_SHARED_VADDR + SH_REQ_CONTROL_ID) as *const u64);
+        if port_characteristics_stack >> 40 != 0 || class_characteristics_stack >> 40 != 0 {
+            return (STATUS_INVALID_PARAMETER, 0);
+        }
+        let shape = |type_flags: u64, characteristics_stack: u64| {
+            hosted_reverse_class_alias::ClassAliasShape {
+                device_type: type_flags as u32,
+                flags: (type_flags >> 32) as u32,
+                characteristics: characteristics_stack as u32,
+                stack_size: (characteristics_stack >> 32) as u8,
+            }
+        };
+        return match hosted_reverse_class_alias::configure_reverse_class_aliases(
+            port_do,
+            class_do,
+            shape(port_type_flags, port_characteristics_stack),
+            shape(class_type_flags, class_characteristics_stack),
+        ) {
+            Ok(observed) => (STATUS_SUCCESS, observed),
             Err(status) => (status, 0),
         };
     }

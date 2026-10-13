@@ -131,6 +131,30 @@ pub(super) unsafe fn entered_lower_registration(
     Ok(Some((registration, row.class_driver)))
 }
 
+/// Resolve the original port-domain pointer behind an entered class-local lower alias. Reverse
+/// CONNECT projection must use this exact physical domain, never infer one from a driver id.
+pub(super) unsafe fn entered_lower_origin_registration(
+    domain: HostedDomainIdentity,
+    address: u64,
+) -> Result<Option<HostedDevicePointerRegistration>, nt_status::NtStatus> {
+    let Some((local, _)) = entered_lower_registration(domain, address)? else {
+        return Ok(None);
+    };
+    let row = owners().iter().find(|row| {
+        row.class_domain == domain
+            && row.phase == Phase::Entered
+            && row.lower_alias.is_some_and(|alias| alias.registration == Some(local))
+    }).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if io_manager_mut().hosted_device_pointer_registration(
+        row.lower_domain, row.lower_origin_registration.address(),
+    ) != Some(row.lower_origin_registration)
+        || row.lower_origin_registration.device_id() != local.device_id()
+    {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    Ok(Some(row.lower_origin_registration))
+}
+
 fn owners() -> &'static mut Vec<Owner> {
     unsafe { &mut *core::ptr::addr_of_mut!(OWNERS) }
 }
