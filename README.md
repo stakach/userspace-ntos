@@ -163,28 +163,16 @@ The desktop target hosts **real, unmodified GPL ReactOS binaries** on rust-micro
 Genuine Explorer and native acceptance are tracked in
 [issue #18](https://github.com/stakach/userspace-ntos/issues/18).
 The current [issue #18 diagnostic](https://github.com/stakach/userspace-ntos/issues/18)
-has advanced through ReactOS setup and real device installation after a resumed
-registry snapshot. ACPI and PCI bus relations now commit, and the PCI root driver
-starts. The live bochsmp PCI PDO now passes resource validation and reaches
-AddDevice. VideoPort now forwards FILTER and START to the accepted PCI provider;
-a bounded boot recorded successful bochsmp StartDevice, FindAdapter, and hosted
-video-device publication. A longer bounded guest reached real CSRSS, Winlogon,
-Services and setup.exe and created a 1024x768 display PDEV. Its same-run frame
-still shows only background and cursor; Userinit and Explorer have not run.
-The native `IoStartPacket`/`IoStartNextPacket` path now builds, and a resumed boot
-loaded i8042prt successfully. Its keyboard and mouse resource filtering now
-reaches START_DEVICE through accepted ACPI child PDOs. Both starts currently
-fail because the registry-selected kbdclass/mouclass upper filters have not
-attached and sent their real CONNECT requests, so input callbacks remain unproven.
-Font cleanup and desktop acceptance remain unproven. Acceptance
-requires strict native private-font
-cleanup and a separate fresh production Userinit/Explorer boot with real callbacks,
-GDI drawing, logs and screenshots. The [PCI video boot evidence](docs/evidence/issue306-pci-video-boot.json)
-records the bounded resumed diagnostic. Crate CI does not prove desktop boot. An earlier
-[bounded diagnostic boot](docs/evidence/issue18-registry-checkpoint-probe.json)
-verified live SYSTEM-journal checkpoint timing and inclusive I/O measurements; it
-was stopped after reproducing the input-driver gap and still rendered only background
-and cursor. To attempt a boot from a fresh clone:
+has reached real ReactOS CSRSS, Winlogon, Services, setup, a 1024x768 display
+PDEV, and registry-selected keyboard and mouse class filters. Both class CONNECT
+requests and their reverse HOOK calls completed on the exact native workers.
+The next observed blocker is PnP resource-filter forwarding from each class FDO
+to the i8042 FDO; the native bridge is being integrated. The same-run frame still
+shows background and cursor only. Genuine Explorer execution, input callbacks,
+and strict private-font cleanup remain unproven. Acceptance requires a fresh
+production Userinit/Explorer boot with real callbacks, GDI drawing, logs and a
+screenshot, plus strict native private-font cleanup. Crate CI and native builds
+do not prove desktop boot. To attempt a boot from a fresh clone:
 
 ```sh
 git clone --recursive https://github.com/stakach/userspace-ntos.git
