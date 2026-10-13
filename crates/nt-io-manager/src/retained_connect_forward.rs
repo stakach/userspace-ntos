@@ -36,6 +36,192 @@ pub struct ConnectForwardIdentity {
     pub control: ConnectControl,
 }
 
+/// A pool allocation containing the caller's METHOD_NEITHER CONNECT_DATA. The
+/// native adapter must prove liveness under the pool lock before capturing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectBufferAllocation {
+    pub domain: crate::HostedDomainIdentity,
+    pub base: u64,
+    pub bytes: u64,
+    pub generation: u64,
+}
+
+/// An authenticated live provider thread stack range. The native adapter owns
+/// the thread/stack lease and must keep it through synchronous completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectStackRange {
+    pub domain: crate::HostedDomainIdentity,
+    pub thread: u64,
+    pub base: u64,
+    pub bytes: u64,
+    pub generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectBufferSource {
+    Pool(ConnectBufferAllocation),
+    Stack(ConnectStackRange),
+}
+
+fn contains_range(base: u64, bytes: u64, pointer: u64, length: u64) -> bool {
+    base != 0
+        && bytes != 0
+        && pointer != 0
+        && length != 0
+        && base.checked_add(bytes).is_some_and(|end| {
+            pointer >= base
+                && pointer.checked_add(length).is_some_and(|requested_end| requested_end <= end)
+        })
+}
+
+impl ConnectBufferSource {
+    fn contains(self, domain: crate::HostedDomainIdentity, pointer: u64, length: u64) -> bool {
+        match self {
+            Self::Pool(allocation) => allocation.contains(domain, pointer, length),
+            Self::Stack(stack) => {
+                stack.domain == domain
+                    && stack.thread != 0
+                    && stack.generation != 0
+                    && contains_range(stack.base, stack.bytes, pointer, length)
+            }
+        }
+    }
+}
+
+impl ConnectBufferAllocation {
+    fn contains(self, domain: crate::HostedDomainIdentity, pointer: u64, length: u64) -> bool {
+        self.domain == domain
+            && self.generation != 0
+            && contains_range(self.base, self.bytes, pointer, length)
+    }
+}
+
+/// The exact source buffer and class callback pair observed before forwarding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectPayloadIdentity {
+    pub forward: ConnectForwardIdentity,
+    pub buffer: ConnectBufferSource,
+    pub input_pointer: u64,
+    pub input_length: u64,
+    /// Owned bytes copied under the source memory lease before provider entry.
+    pub snapshot: [u8; 16],
+    pub class_device: HostedDevicePointerRegistration,
+    pub class_service: u64,
+}
+
+impl ConnectPayloadIdentity {
+    pub const CONNECT_DATA_BYTES: u64 = 16;
+
+    /// `class_device` is the exact source-domain projection of the callback's
+    /// first argument; `expected_class_device` is its canonical device identity.
+    pub fn validate<P>(
+        self,
+        io: &IoManager<P>,
+        retained: &RetainedConnectForward,
+        expected_class_device: crate::DeviceId,
+    ) -> Result<(), ConnectForwardError> {
+        let source_domain = self.forward.source.allocation().domain;
+        let mut expected_snapshot = [0; 16];
+        expected_snapshot[..8].copy_from_slice(&self.class_device.address().to_le_bytes());
+        expected_snapshot[8..].copy_from_slice(&self.class_service.to_le_bytes());
+        if self.forward != retained.identity()
+            || self.forward.target.domain() != source_domain
+            || retained.target.validate(io).ok() != Some(self.forward.target.device_id())
+            || self.input_length != Self::CONNECT_DATA_BYTES
+            || self.input_pointer & 7 != 0
+            || !self.buffer.contains(source_domain, self.input_pointer, self.input_length)
+            || self.class_device.domain() != source_domain
+            || self.class_device.device_id() != expected_class_device
+            || io.hosted_device_pointer_registration(source_domain, self.class_device.address()) != Some(self.class_device)
+            || self.class_service == 0
+            || self.snapshot != expected_snapshot
+        {
+            return Err(ConnectForwardError::WrongIdentity);
+        }
+        Ok(())
+    }
+}
+
+/// The port driver's reverse HOOK request to the attached class device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HookPayloadIdentity {
+    pub connect: ConnectPayloadIdentity,
+    pub source: SourceIrpForwardIdentity,
+    pub buffer: HookBufferSource,
+    pub input_pointer: u64,
+    pub input_length: u64,
+    /// Owned bytes captured before forwarding; mouse uses the first 40 bytes.
+    pub snapshot: [u8; 48],
+    pub class_target: HostedDevicePointerRegistration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HookDeviceExtensionRange {
+    pub owner: HostedDevicePointerRegistration,
+    pub base: u64,
+    pub bytes: u64,
+    pub generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HookBufferSource {
+    Pool(ConnectBufferAllocation),
+    DeviceExtension(HookDeviceExtensionRange),
+}
+
+impl HookPayloadIdentity {
+    pub const fn code(self) -> u32 {
+        let device_type = match self.connect.forward.control {
+            ConnectControl::Keyboard => 0x0b,
+            ConnectControl::Mouse => 0x0f,
+        };
+        nt_io_abi::ioctl::ctl_code(device_type, 0x0ff0, nt_io_abi::ioctl::METHOD_NEITHER, 0)
+    }
+
+    pub fn validate<P>(
+        self,
+        io: &IoManager<P>,
+        retained_connect: &RetainedConnectForward,
+        retained_class_target: &HostedForwardTarget,
+        expected_source_device: HostedDevicePointerRegistration,
+    ) -> Result<(), ConnectForwardError> {
+        let class_id = self.connect.class_device.device_id();
+        self.connect.validate(io, retained_connect, class_id)?;
+        let source_domain = self.source.allocation().domain;
+        let required_bytes = match self.connect.forward.control {
+            ConnectControl::Keyboard => 48,
+            ConnectControl::Mouse => 40,
+        };
+        let source_live = expected_source_device.domain() == source_domain
+            && expected_source_device.device_id() == self.connect.forward.target.device_id()
+            && io.hosted_device_pointer_registration(source_domain, expected_source_device.address())
+                == Some(expected_source_device);
+        let buffer_live = match self.buffer {
+            HookBufferSource::Pool(allocation) => {
+                allocation.contains(source_domain, self.input_pointer, self.input_length)
+            }
+            HookBufferSource::DeviceExtension(extension) => {
+                extension.owner == expected_source_device
+                    && extension.generation != 0
+                    && contains_range(extension.base, extension.bytes, self.input_pointer, self.input_length)
+            }
+        };
+        if source_domain == self.connect.forward.source.allocation().domain
+            || !source_live
+            || self.input_length != required_bytes
+            || self.input_pointer & 7 != 0
+            || !buffer_live
+            || self.class_target.domain() != source_domain
+            || self.class_target.device_id() != class_id
+            || self.class_target != retained_class_target.registration()
+            || retained_class_target.validate(io).ok() != Some(class_id)
+        {
+            return Err(ConnectForwardError::WrongIdentity);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectForwardError {
     WrongIdentity,
@@ -66,6 +252,7 @@ pub enum ConnectForwardPhase {
 pub struct RetainedConnectForward {
     identity: ConnectForwardIdentity,
     target: HostedForwardTarget,
+    payload: Option<ConnectPayloadIdentity>,
     phase: ConnectForwardPhase,
 }
 
@@ -78,12 +265,42 @@ impl RetainedConnectForward {
                 control,
             },
             target,
+            payload: None,
             phase: ConnectForwardPhase::Prepared,
         }
     }
 
     pub const fn identity(&self) -> ConnectForwardIdentity { self.identity }
     pub const fn phase(&self) -> ConnectForwardPhase { self.phase }
+
+    /// Capture the identity of the separately pinned source pool allocation.
+    /// Native must keep that pin until the source CONNECT has completed.
+    pub fn capture_payload<P>(
+        &mut self,
+        io: &IoManager<P>,
+        payload: ConnectPayloadIdentity,
+        expected_class_device: crate::DeviceId,
+    ) -> Result<(), ConnectForwardError> {
+        if self.phase != ConnectForwardPhase::Prepared || self.payload.is_some() {
+            return Err(ConnectForwardError::InvalidTransition);
+        }
+        payload.validate(io, self, expected_class_device)?;
+        self.payload = Some(payload);
+        Ok(())
+    }
+
+    /// A reused address with a new allocation generation cannot impersonate the
+    /// CONNECT_DATA captured before the provider was entered.
+    pub fn validate_payload<P>(
+        &self,
+        io: &IoManager<P>,
+        observed: ConnectPayloadIdentity,
+    ) -> Result<(), ConnectForwardError> {
+        if self.payload != Some(observed) {
+            return Err(ConnectForwardError::WrongIdentity);
+        }
+        observed.validate(io, self, observed.class_device.device_id())
+    }
 
     /// The caller must first reserve and validate its source IRP and callback authority.
     pub fn enter<P>(
@@ -266,5 +483,177 @@ mod tests {
             Err(ConnectForwardError::InvalidTransition),
         );
         assert_eq!(forward.phase(), ConnectForwardPhase::Indeterminate(NtStatus::DEVICE_NOT_CONNECTED));
+    }
+
+    #[test]
+    fn connect_payload_requires_exact_live_buffer_and_class_callback_projection() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let driver = io.create_driver(&NtPath::parse_str(r"\Driver\ConnectPayload").unwrap(), Box::new(MockDriverBackend::new())).unwrap();
+        let lower = io.create_device(driver, None, DeviceType::UNKNOWN, DeviceCharacteristics::empty(), DeviceFlags::empty(), 0).unwrap();
+        let class = io.create_device(driver, None, DeviceType::UNKNOWN, DeviceCharacteristics::empty(), DeviceFlags::empty(), 0).unwrap();
+        let domain = io.register_hosted_domain();
+        let other = io.register_hosted_domain();
+        let lower_registration = io.bind_hosted_device_pointer(domain, 0x5000, lower).unwrap();
+        let class_registration = io.bind_hosted_device_pointer(domain, 0x6000, class).unwrap();
+        let wrong_class = io.bind_hosted_device_pointer(other, 0x6000, class).unwrap();
+        let mut retained = RetainedConnectForward::new(
+            source(domain, 3),
+            HostedForwardTarget::capture(&mut io, domain, 0x5000).unwrap(),
+            ConnectControl::Keyboard,
+        );
+        let mut snapshot = [0; 16];
+        snapshot[..8].copy_from_slice(&class_registration.address().to_le_bytes());
+        snapshot[8..].copy_from_slice(&0x9000_u64.to_le_bytes());
+        let payload = ConnectPayloadIdentity {
+            forward: ConnectForwardIdentity { source: source(domain, 3), target: lower_registration, control: ConnectControl::Keyboard },
+            buffer: ConnectBufferSource::Pool(ConnectBufferAllocation { domain, base: 0x8000, bytes: 0x20, generation: 9 }),
+            input_pointer: 0x8000,
+            input_length: ConnectPayloadIdentity::CONNECT_DATA_BYTES,
+            snapshot,
+            class_device: class_registration,
+            class_service: 0x9000,
+        };
+        assert_eq!(payload.validate(&io, &retained, class), Ok(()));
+        assert_eq!(retained.capture_payload(&io, payload, class), Ok(()));
+        assert_eq!(retained.validate_payload(&io, payload), Ok(()));
+        assert_eq!(
+            retained.validate_payload(&io, ConnectPayloadIdentity {
+                buffer: ConnectBufferSource::Pool(ConnectBufferAllocation { domain, base: 0x8000, bytes: 0x20, generation: 10 }),
+                ..payload
+            }),
+            Err(ConnectForwardError::WrongIdentity),
+        );
+        assert_eq!(
+            retained.capture_payload(&io, payload, class),
+            Err(ConnectForwardError::InvalidTransition),
+        );
+        for bad in [
+            ConnectPayloadIdentity { input_pointer: 0x8018, ..payload },
+            ConnectPayloadIdentity { input_length: 8, ..payload },
+            ConnectPayloadIdentity { buffer: ConnectBufferSource::Pool(ConnectBufferAllocation { domain, base: 0x8000, bytes: 0x20, generation: 0 }), ..payload },
+            ConnectPayloadIdentity { buffer: ConnectBufferSource::Pool(ConnectBufferAllocation { domain: other, base: 0x8000, bytes: 0x20, generation: 9 }), ..payload },
+            ConnectPayloadIdentity { class_device: wrong_class, ..payload },
+            ConnectPayloadIdentity { class_service: 0, ..payload },
+        ] {
+            assert_eq!(bad.validate(&io, &retained, class), Err(ConnectForwardError::WrongIdentity));
+        }
+        assert_eq!(payload.validate(&io, &retained, lower), Err(ConnectForwardError::WrongIdentity));
+    }
+
+    #[test]
+    fn reverse_hook_keeps_connect_class_pair_and_its_own_source_allocation() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let driver = io.create_driver(&NtPath::parse_str(r"\Driver\HookPayload").unwrap(), Box::new(MockDriverBackend::new())).unwrap();
+        let lower = io.create_device(driver, None, DeviceType::UNKNOWN, DeviceCharacteristics::empty(), DeviceFlags::empty(), 0).unwrap();
+        let class = io.create_device(driver, None, DeviceType::UNKNOWN, DeviceCharacteristics::empty(), DeviceFlags::empty(), 0).unwrap();
+        let port_domain = io.register_hosted_domain();
+        let class_domain = io.register_hosted_domain();
+        let lower_registration = io.bind_hosted_device_pointer(class_domain, 0x5000, lower).unwrap();
+        let class_registration = io.bind_hosted_device_pointer(class_domain, 0x6000, class).unwrap();
+        let class_in_port = io.bind_hosted_device_pointer(port_domain, 0x7000, class).unwrap();
+        let source_in_port = io.bind_hosted_device_pointer(port_domain, 0x8000, lower).unwrap();
+        let retained_connect = RetainedConnectForward::new(
+            source(class_domain, 3),
+            HostedForwardTarget::capture(&mut io, class_domain, 0x5000).unwrap(),
+            ConnectControl::Keyboard,
+        );
+        let retained_class_target = HostedForwardTarget::capture(&mut io, port_domain, 0x7000).unwrap();
+        let mut snapshot = [0; 16];
+        snapshot[..8].copy_from_slice(&class_registration.address().to_le_bytes());
+        snapshot[8..].copy_from_slice(&0x9000_u64.to_le_bytes());
+        let connect = ConnectPayloadIdentity {
+            forward: ConnectForwardIdentity { source: source(class_domain, 3), target: lower_registration, control: ConnectControl::Keyboard },
+            buffer: ConnectBufferSource::Pool(ConnectBufferAllocation { domain: class_domain, base: 0x8000, bytes: 0x20, generation: 9 }),
+            input_pointer: 0x8000,
+            input_length: 16,
+            snapshot,
+            class_device: class_registration,
+            class_service: 0x9000,
+        };
+        let hook = HookPayloadIdentity {
+            connect,
+            source: source(port_domain, 4),
+            buffer: HookBufferSource::Pool(ConnectBufferAllocation { domain: port_domain, base: 0xa000, bytes: 48, generation: 10 }),
+            input_pointer: 0xa000,
+            input_length: 48,
+            snapshot: [0; 48],
+            class_target: class_in_port,
+        };
+        assert_eq!(hook.code(), 0x000b_3fc3);
+        assert_eq!(hook.validate(&io, &retained_connect, &retained_class_target, source_in_port), Ok(()));
+        for bad in [
+            HookPayloadIdentity { input_pointer: 0xa020, ..hook },
+            HookPayloadIdentity { input_length: 40, ..hook },
+            HookPayloadIdentity { buffer: HookBufferSource::Pool(ConnectBufferAllocation { domain: port_domain, base: 0xa000, bytes: 48, generation: 0 }), ..hook },
+            HookPayloadIdentity { source: source(class_domain, 4), ..hook },
+            HookPayloadIdentity { class_target: class_registration, ..hook },
+        ] {
+            assert_eq!(bad.validate(&io, &retained_connect, &retained_class_target, source_in_port), Err(ConnectForwardError::WrongIdentity));
+        }
+        // ReactOS i8042prt sends HOOK from KeyboardHook inside the port FDO extension.
+        let extension_hook = HookPayloadIdentity {
+            buffer: HookBufferSource::DeviceExtension(HookDeviceExtensionRange {
+                owner: source_in_port,
+                base: 0xb000,
+                bytes: 0x200,
+                generation: 12,
+            }),
+            input_pointer: 0xb080,
+            snapshot: [5; 48],
+            ..hook
+        };
+        assert_eq!(extension_hook.validate(&io, &retained_connect, &retained_class_target, source_in_port), Ok(()));
+        for bad in [
+            HookPayloadIdentity { buffer: HookBufferSource::DeviceExtension(HookDeviceExtensionRange { owner: class_in_port, base: 0xb000, bytes: 0x200, generation: 12 }), ..extension_hook },
+            HookPayloadIdentity { buffer: HookBufferSource::DeviceExtension(HookDeviceExtensionRange { owner: source_in_port, base: 0xb000, bytes: 0x200, generation: 0 }), ..extension_hook },
+            HookPayloadIdentity { input_pointer: 0xb1e0, ..extension_hook },
+        ] {
+            assert_eq!(bad.validate(&io, &retained_connect, &retained_class_target, source_in_port), Err(ConnectForwardError::WrongIdentity));
+        }
+    }
+
+    #[test]
+    fn stack_local_connect_data_requires_owned_snapshot_and_exact_stack_generation() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let driver = io.create_driver(&NtPath::parse_str(r"\Driver\StackConnect").unwrap(), Box::new(MockDriverBackend::new())).unwrap();
+        let lower = io.create_device(driver, None, DeviceType::UNKNOWN, DeviceCharacteristics::empty(), DeviceFlags::empty(), 0).unwrap();
+        let class = io.create_device(driver, None, DeviceType::UNKNOWN, DeviceCharacteristics::empty(), DeviceFlags::empty(), 0).unwrap();
+        let domain = io.register_hosted_domain();
+        let lower_registration = io.bind_hosted_device_pointer(domain, 0x5000, lower).unwrap();
+        let class_registration = io.bind_hosted_device_pointer(domain, 0x6000, class).unwrap();
+        let mut retained = RetainedConnectForward::new(
+            source(domain, 3),
+            HostedForwardTarget::capture(&mut io, domain, 0x5000).unwrap(),
+            ConnectControl::Keyboard,
+        );
+        let mut snapshot = [0; 16];
+        snapshot[..8].copy_from_slice(&class_registration.address().to_le_bytes());
+        snapshot[8..].copy_from_slice(&0x9000_u64.to_le_bytes());
+        let payload = ConnectPayloadIdentity {
+            forward: ConnectForwardIdentity { source: source(domain, 3), target: lower_registration, control: ConnectControl::Keyboard },
+            buffer: ConnectBufferSource::Stack(ConnectStackRange { domain, thread: 7, base: 0x7000, bytes: 0x1000, generation: 11 }),
+            input_pointer: 0x7ff0,
+            input_length: 16,
+            snapshot,
+            class_device: class_registration,
+            class_service: 0x9000,
+        };
+        assert_eq!(retained.capture_payload(&io, payload, class), Ok(()));
+        assert_eq!(retained.validate_payload(&io, payload), Ok(()));
+        let reused = ConnectPayloadIdentity {
+            buffer: ConnectBufferSource::Stack(ConnectStackRange { domain, thread: 7, base: 0x7000, bytes: 0x1000, generation: 12 }),
+            ..payload
+        };
+        assert_eq!(retained.validate_payload(&io, reused), Err(ConnectForwardError::WrongIdentity));
+        for bad in [
+            ConnectPayloadIdentity { buffer: ConnectBufferSource::Stack(ConnectStackRange { domain, thread: 0, base: 0x7000, bytes: 0x1000, generation: 11 }), ..payload },
+            ConnectPayloadIdentity { buffer: ConnectBufferSource::Stack(ConnectStackRange { domain, thread: 7, base: 0x7000, bytes: 0x1000, generation: 0 }), ..payload },
+            ConnectPayloadIdentity { input_pointer: 0x7ff8, ..payload },
+        ] {
+            assert_eq!(bad.validate(&io, &retained, class), Err(ConnectForwardError::WrongIdentity));
+        }
+        let mut wrong_snapshot = payload;
+        wrong_snapshot.snapshot[8] ^= 1;
+        assert_eq!(wrong_snapshot.validate(&io, &retained, class), Err(ConnectForwardError::WrongIdentity));
     }
 }

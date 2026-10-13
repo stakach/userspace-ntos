@@ -1,11 +1,75 @@
 //! Canonical half of `IoAttachDeviceToDeviceStackSafe` for hosted drivers.
 
-use crate::{DeviceFlags, HostedDomainIdentity, IoManager};
+use crate::{
+    hosted_device_pointer::HostedDevicePointerRegistration, DeviceFlags, HostedDomainIdentity,
+    IoManager,
+};
 use nt_status::NtStatus;
 
 const STATUS_NO_SUCH_DEVICE: NtStatus = NtStatus(0xC000_000Eu32 as i32);
 
 impl<P> IoManager<P> {
+    /// Attach a hosted upper filter using the caller's exact live projections of its new FDO,
+    /// the stack PDO, and the lower device it observed before entry. The returned registration
+    /// is the lower projection to publish to the class driver.
+    pub fn attach_hosted_upper_filter_checked(
+        &mut self,
+        source: HostedDevicePointerRegistration,
+        pdo: HostedDevicePointerRegistration,
+        expected_lower: HostedDevicePointerRegistration,
+    ) -> Result<HostedDevicePointerRegistration, NtStatus> {
+        let domain = source.domain();
+        if pdo.domain() != domain || expected_lower.domain() != domain {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        for projection in [source, pdo, expected_lower] {
+            if self.hosted_device_pointer_registration(domain, projection.address())
+                != Some(projection)
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+        }
+
+        let source_device = self
+            .device(source.device_id())
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if self
+            .hosted_driver_address_by_identity(domain, source_device.driver_id)
+            .is_none()
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        if source_device.attached_to.is_some() || self.has_upper_attachment(source.device_id()) {
+            return Err(NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        if self
+            .device(pdo.device_id())
+            .ok_or(NtStatus::INVALID_PARAMETER)?
+            .attached_to
+            .is_some()
+        {
+            return Err(NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        let current_top = self
+            .top_of_device_stack(pdo.device_id())
+            .map_err(attach_status)?;
+        if current_top != expected_lower.device_id() || current_top == source.device_id() {
+            return Err(NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        if self
+            .device(current_top)
+            .is_some_and(|device| device.flags.contains(DeviceFlags::DEVICE_INITIALIZING))
+        {
+            return Err(STATUS_NO_SUCH_DEVICE);
+        }
+
+        let lower = self
+            .attach_device_to_stack(source.device_id(), pdo.device_id())
+            .map_err(attach_status)?;
+        assert_eq!(lower, expected_lower.device_id());
+        Ok(expected_lower)
+    }
+
     /// Native broker variant: compare the caller's observed lower projection before mutation.
     /// This prevents an obsolete local attachment walk from committing a different canonical
     /// edge after another stack change.
@@ -130,6 +194,144 @@ mod tests {
             DeviceFlags::empty(),
             0,
         ))
+    }
+
+    #[test]
+    fn class_upper_filter_attaches_above_foreign_function_with_exact_lower_projection() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let port_driver = io.register_driver(DriverRecord::new(
+            ObjectId::NULL,
+            NtPath::parse_str("\\Driver\\PortForClassAttach").unwrap(),
+            DriverBackendId(1),
+            MajorFunctionTable::new(),
+        ));
+        let class_driver = io.register_driver(DriverRecord::new(
+            ObjectId::NULL,
+            NtPath::parse_str("\\Driver\\ClassForClassAttach").unwrap(),
+            DriverBackendId(2),
+            MajorFunctionTable::new(),
+        ));
+        let pdo = add_device(&mut io, port_driver);
+        let function = add_device(&mut io, port_driver);
+        let class_fdo = add_device(&mut io, class_driver);
+        let port_domain = io.register_hosted_domain();
+        let class_domain = io.register_hosted_domain();
+        io.bind_hosted_driver_identity(class_domain, 0x8000, class_driver)
+            .unwrap();
+        io.bind_hosted_device_pointer(port_domain, 0x1000, function)
+            .unwrap();
+        let pdo_projection = io
+            .bind_hosted_device_pointer(class_domain, 0x2000, pdo)
+            .unwrap();
+        let lower_projection = io
+            .bind_hosted_device_pointer(class_domain, 0x3000, function)
+            .unwrap();
+        let class_projection = io
+            .bind_hosted_device_pointer(class_domain, 0x4000, class_fdo)
+            .unwrap();
+        io.attach_device_to_stack(function, pdo).unwrap();
+
+        assert_eq!(
+            io.attach_hosted_upper_filter_checked(
+                class_projection,
+                pdo_projection,
+                lower_projection,
+            ),
+            Ok(lower_projection)
+        );
+        assert_eq!(io.device(class_fdo).unwrap().attached_to, Some(function));
+        assert_eq!(io.top_of_device_stack(pdo), Ok(class_fdo));
+        assert_eq!(
+            io.attach_hosted_upper_filter_checked(
+                class_projection,
+                pdo_projection,
+                lower_projection,
+            ),
+            Err(NtStatus::INVALID_DEVICE_REQUEST)
+        );
+        assert_eq!(io.device(class_fdo).unwrap().attached_to, Some(function));
+    }
+
+    #[test]
+    fn class_upper_filter_rejects_stale_or_cross_domain_projections_before_mutation() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let driver = io.register_driver(DriverRecord::new(
+            ObjectId::NULL,
+            NtPath::parse_str("\\Driver\\ClassAttachFailures").unwrap(),
+            DriverBackendId(1),
+            MajorFunctionTable::new(),
+        ));
+        let pdo = add_device(&mut io, driver);
+        let function = add_device(&mut io, driver);
+        let replacement = add_device(&mut io, driver);
+        let class_fdo = add_device(&mut io, driver);
+        let class_domain = io.register_hosted_domain();
+        let foreign_domain = io.register_hosted_domain();
+        io.bind_hosted_driver_identity(class_domain, 0x8000, driver)
+            .unwrap();
+        let pdo_projection = io
+            .bind_hosted_device_pointer(class_domain, 0x2000, pdo)
+            .unwrap();
+        let old_lower = io
+            .bind_hosted_device_pointer(class_domain, 0x3000, function)
+            .unwrap();
+        let class_projection = io
+            .bind_hosted_device_pointer(class_domain, 0x4000, class_fdo)
+            .unwrap();
+        let foreign_lower = io
+            .bind_hosted_device_pointer(foreign_domain, 0x3000, function)
+            .unwrap();
+        io.attach_device_to_stack(function, pdo).unwrap();
+
+        assert_eq!(
+            io.attach_hosted_upper_filter_checked(class_projection, pdo_projection, foreign_lower),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        io.bind_hosted_device_pointer(class_domain, 0x5000, replacement)
+            .unwrap();
+        io.attach_device_to_stack(replacement, pdo).unwrap();
+        assert_eq!(
+            io.attach_hosted_upper_filter_checked(class_projection, pdo_projection, old_lower),
+            Err(NtStatus::INVALID_DEVICE_REQUEST)
+        );
+        assert_eq!(io.device(class_fdo).unwrap().attached_to, None);
+        assert_eq!(io.top_of_device_stack(pdo), Ok(replacement));
+    }
+
+    #[test]
+    fn class_upper_filter_rejects_replaced_registration_generation() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let driver = io.register_driver(DriverRecord::new(
+            ObjectId::NULL,
+            NtPath::parse_str("\\Driver\\ClassAttachGeneration").unwrap(),
+            DriverBackendId(1),
+            MajorFunctionTable::new(),
+        ));
+        let pdo = add_device(&mut io, driver);
+        let class_fdo = add_device(&mut io, driver);
+        let domain = io.register_hosted_domain();
+        io.bind_hosted_driver_identity(domain, 0x8000, driver)
+            .unwrap();
+        let pdo_projection = io.bind_hosted_device_pointer(domain, 0x2000, pdo).unwrap();
+        let stale_class = io
+            .bind_hosted_device_pointer(domain, 0x4000, class_fdo)
+            .unwrap();
+        io.unregister_hosted_device_pointer(stale_class).unwrap();
+        assert!(io.unbind_hosted_device_identity(domain, 0x4000, class_fdo));
+        let current_class = io
+            .bind_hosted_device_pointer(domain, 0x4000, class_fdo)
+            .unwrap();
+        assert_ne!(stale_class, current_class);
+
+        assert_eq!(
+            io.attach_hosted_upper_filter_checked(stale_class, pdo_projection, pdo_projection),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert_eq!(io.device(class_fdo).unwrap().attached_to, None);
+        assert_eq!(
+            io.attach_hosted_upper_filter_checked(current_class, pdo_projection, pdo_projection),
+            Ok(pdo_projection)
+        );
     }
 
     #[test]
