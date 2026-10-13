@@ -133,6 +133,8 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 matches!(&stack.parameters, IoParameters::Pnp(parameters)
                     if stack.minor == parameters.minor
                         && stack.minor == retained.owner.invocation.snapshot.minor
+                        && stack.parameters
+                            == retained.owner.invocation.snapshot.projection.parameters
                         && parameters.has_status_only_result())
             }) {
                 return Err(NtStatus::NOT_SUPPORTED);

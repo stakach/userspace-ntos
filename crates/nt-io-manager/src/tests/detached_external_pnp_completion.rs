@@ -433,3 +433,22 @@ fn detached_pnp_completion_refuses_a_different_status_only_minor() {
     assert_eq!(refusal.owner().payload(), &[0x63; 64]);
     assert!(io.irp_mut(id).is_some(), "refusal must not reserve ACK ownership");
 }
+
+#[test]
+fn detached_pnp_completion_refuses_changed_start_resource_extents() {
+    let mut io = io();
+    let (retained, release) = pending(&mut io);
+    let id = retained.irp_id();
+    release.set(true);
+    assert_eq!(io.pump(), 1);
+    let irp = io.irp_mut(id).unwrap();
+    let stack = &mut irp.stack[irp.current_location as usize];
+    // The total allocation and minor still match. Only the two resource-list extents have
+    // changed, so a minor-only status-result check cannot catch this stale retained input.
+    stack.parameters = IoParameters::Pnp(PnpParameters::start(16, 48).unwrap());
+
+    let refusal = io.prepare_external_pnp_completion(retained).unwrap_err();
+    assert_eq!(refusal.status(), NtStatus::NOT_SUPPORTED);
+    assert_eq!(refusal.owner().payload(), &[0x63; 64]);
+    assert!(io.irp_mut(id).is_some(), "refusal must not reserve ACK ownership");
+}
