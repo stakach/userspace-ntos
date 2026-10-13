@@ -257,6 +257,13 @@ impl UpperFilterAttachmentLedger {
         if observed_lower != claim.lower_device {
             return Err(UpperFilterAttachmentError::WrongLower);
         }
+        if self.plans.iter().any(|plan| {
+            plan.slots
+                .iter()
+                .any(|slot| slot.state == UpperFilterAttachmentState::Attached { filter_fdo })
+        }) {
+            return Err(UpperFilterAttachmentError::InvalidIdentity);
+        }
         let plan = self
             .plans
             .iter()
@@ -321,9 +328,8 @@ mod tests {
         INTERFACE_TYPE_PCI_BUS,
     };
 
-    fn committed_function_stack(pdo: u64, fdo: u64) -> PnpManager {
-        let mut pnp = PnpManager::new();
-        let properties = PdoProperties::enumerated(
+    fn properties() -> PdoProperties {
+        PdoProperties::enumerated(
             PnpBusInformation {
                 bus_type_guid: GUID_BUS_TYPE_PCI,
                 legacy_bus_type: INTERFACE_TYPE_PCI_BUS,
@@ -338,8 +344,12 @@ mod tests {
             PropertyBlobState::KnownNone,
             PropertyBlobState::KnownNone,
             PropertyBlobState::KnownNone,
-        );
-        pnp.register_enumerated_pdo(r"PCI\VEN_1234&DEV_5678\0001", pdo, properties)
+        )
+    }
+
+    fn committed_function_stack(pdo: u64, fdo: u64) -> PnpManager {
+        let mut pnp = PnpManager::new();
+        pnp.register_enumerated_pdo(r"PCI\VEN_1234&DEV_5678\0001", pdo, properties())
             .unwrap();
         pnp.commit_device_stack(pdo, fdo, 0x55).unwrap();
         pnp
@@ -440,6 +450,26 @@ mod tests {
         assert_eq!(
             ledger.release_unentered(retry),
             Err(UpperFilterAttachmentError::WrongPhase)
+        );
+    }
+
+    #[test]
+    fn one_filter_fdo_cannot_be_committed_to_two_devnode_plans() {
+        let mut pnp = committed_function_stack(0x1000, 0x2000);
+        pnp.register_enumerated_pdo(r"PCI\VEN_1234&DEV_5678\0002", 0x1100, properties())
+            .unwrap();
+        pnp.commit_device_stack(0x1100, 0x2100, 0x56).unwrap();
+        let mut ledger = UpperFilterAttachmentLedger::new();
+        let first_key = ledger.reserve(&pnp, 7, 0x1000, 0x2000, &[0x30]).unwrap();
+        let second_key = ledger.reserve(&pnp, 7, 0x1100, 0x2100, &[0x30]).unwrap();
+        let first = ledger.claim_next(&pnp, first_key).unwrap().unwrap();
+        ledger.mark_entered(&pnp, first).unwrap();
+        ledger.complete(&pnp, first, 0x3000, 0x2000).unwrap();
+        let second = ledger.claim_next(&pnp, second_key).unwrap().unwrap();
+        ledger.mark_entered(&pnp, second).unwrap();
+        assert_eq!(
+            ledger.complete(&pnp, second, 0x3000, 0x2100),
+            Err(UpperFilterAttachmentError::InvalidIdentity)
         );
     }
 }
