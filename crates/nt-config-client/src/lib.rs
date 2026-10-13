@@ -22,7 +22,7 @@ pub use driver_load_request::{
     DriverServiceNameBuffer, DRIVER_SERVICE_PATH_MAX_BYTES,
 };
 mod filter_policy;
-pub use filter_policy::DeviceFilterPolicySnapshot;
+pub use filter_policy::{DeviceFilterPolicySnapshot, UpperFilterLaunchPlanSnapshot};
 mod runtime_key;
 mod system_mount;
 pub use system_mount::{SystemHiveMount, SystemHiveMountState};
