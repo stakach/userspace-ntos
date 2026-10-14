@@ -409,6 +409,23 @@ fn fixture(owned: bool) -> (ClientFrameRegistry, ClientFrameRecord) {
 }
 
 #[test]
+fn borrowed_frame_reclaims_derived_caps_before_their_mapping_parent() {
+    let mut registry = ClientFrameRegistry::new();
+    registry.insert(7, MEMORY_PROCESS, 0x1000, 11, 0, 0, 13, false).unwrap();
+    let initial = registry.get(7, 0x1000).unwrap();
+    let started = registry.begin_reclaim_exact(initial, RELEASE).unwrap();
+    let mut io = Io::default();
+    registry.cleanup_reclaim_exact(started, RELEASE, &mut io).unwrap();
+    assert_eq!(
+        io.calls,
+        vec![
+            Call::Unmap(13), Call::Delete(13), Call::Recycle(13),
+            Call::Unmap(11), Call::Delete(11), Call::Recycle(11),
+        ]
+    );
+}
+
+#[test]
 fn each_failed_unmap_delete_or_recycle_retains_exact_progress_for_retry() {
     let expected = [
         Call::Unmap(11),
@@ -513,7 +530,12 @@ fn equal_cap_roles_are_normalized_and_canonical_owned_frame_is_never_deleted() {
                     .unwrap();
                 let mut expected = Vec::new();
                 let mut seen = Vec::new();
-                for cap in [11, alias, source] {
+                let order = if !owns && alias == 0 {
+                    [source, 11, 0]
+                } else {
+                    [11, alias, source]
+                };
+                for cap in order {
                     if cap == 0 || seen.contains(&cap) {
                         continue;
                     }

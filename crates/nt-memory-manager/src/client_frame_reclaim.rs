@@ -175,7 +175,14 @@ impl ClientFrameRegistry {
         if state.complete {
             return Ok(*row);
         }
-        for cap in [row.frame, row.alias_cap, row.source_cap] {
+        // Borrowed section mappings derive their source cap from the mapped frame cap. Retire
+        // that child first so deleting the parent cannot require a CSpace-wide MDB reparent scan.
+        let caps = if !row.owns_frame && row.alias_cap == 0 {
+            [row.source_cap, row.frame, 0]
+        } else {
+            [row.frame, row.alias_cap, row.source_cap]
+        };
+        for cap in caps {
             let mask = row.roles(cap);
             if mask == 0 {
                 continue;
