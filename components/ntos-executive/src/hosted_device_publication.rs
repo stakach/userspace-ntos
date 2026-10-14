@@ -38,6 +38,8 @@ pub(super) fn register_hosted_device_projection(
     }
     unsafe { hosted_device_allocations::protect_allocation(inst, address) }.map_err(|status|
         ProjectionPublicationError { status, retained: hosted_device_allocations::protects_allocation(inst, address), accepted: None, cleanup_unbound: !existing })?;
+    unsafe { hosted_device_allocations::stage_driver_object(inst, address) }.map_err(|status|
+        ProjectionPublicationError { status, retained: true, accepted: None, cleanup_unbound: !existing })?;
     let registration = io_manager_mut().bind_hosted_device_pointer(domain, address, device)
         .map_err(|status| ProjectionPublicationError { status, retained: true, accepted: None, cleanup_unbound: !existing })?;
     hosted_device_allocations::record_accepted_registration(inst, registration)

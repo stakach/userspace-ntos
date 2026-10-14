@@ -9,7 +9,9 @@ struct Row {
     instance: DriverInstance,
     domain: HostedDomainIdentity,
     allocation: SourcePoolAllocationIdentity,
+    staged_driver_object: Option<u64>,
     accepted: Option<HostedDevicePointerRegistration>,
+    accepted_driver_object: Option<u64>,
     registration: Option<HostedDevicePointerRegistration>,
     owner: ProjectionAllocationOwner,
     retirement_pending: bool,
@@ -718,7 +720,9 @@ pub(super) unsafe fn protect_allocation_exact(
         instance: inst,
         domain,
         allocation: current,
+        staged_driver_object: None,
         accepted: None,
+        accepted_driver_object: None,
         registration: None,
         owner,
         retirement_pending: false,
@@ -752,6 +756,37 @@ pub(super) fn publish_registration(
     Ok(())
 }
 
+/// Capture the constructor's list owner under both physical locks before canonical bind.
+/// A later provider mutation of DEVICE_OBJECT.DriverObject cannot redirect native unlink.
+pub(super) unsafe fn stage_driver_object(
+    inst: DriverInstance, address: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let _guard = lock();
+    let _pool = hosted_instance_pool_lock(inst.exec_pool_va)
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    let current = allocation(inst, address)?;
+    let row = rows()
+        .iter_mut()
+        .find(|row| same_arena(row.instance, inst)
+            && row.allocation.component_address == address)
+        .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if row.retirement_pending || row.accepted.is_some() || row.allocation != current
+        || current.capacity < WDM_X64_DEVICE_OBJECT_SIZE as u64 {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    let offset = address.checked_sub(FSD_POOL_VADDR)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let exec = inst.exec_pool_va.checked_add(offset)
+        .and_then(|base| base.checked_add(0x08))
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let driver_object = read_unaligned(exec as *const u64);
+    if driver_object == 0 {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    row.staged_driver_object = Some(driver_object);
+    Ok(())
+}
+
 /// Retain the minted canonical token before fallible physical catalog publication. A failed
 /// later attach still leaves exact provenance for canonical cleanup and physical retirement.
 pub(super) fn record_accepted_registration(
@@ -767,6 +802,9 @@ pub(super) fn record_accepted_registration(
     if row.retirement_pending || row.accepted.is_some_and(|accepted| accepted != registration) {
         return Err(nt_status::NtStatus::INVALID_HANDLE);
     }
+    let driver_object = row.staged_driver_object
+        .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    row.accepted_driver_object = Some(driver_object);
     row.accepted = Some(registration);
     Ok(())
 }
@@ -788,9 +826,13 @@ pub(super) struct LocalRetirement {
 /// The caller must perform no native effect until checked admission returns successfully.
 pub(super) struct RetirementPreflight {
     domain: HostedDomainIdentity,
+    accepted_driver_object: Option<u64>,
 }
 
 impl RetirementPreflight {
+    pub(super) fn accepted_driver_object(&self) -> Option<u64> {
+        self.accepted_driver_object
+    }
     pub(super) unsafe fn related_allocation_exec(
         &self,
         address: u64,
@@ -844,7 +886,10 @@ pub(super) unsafe fn admit_retirement_checked<T>(
     if rows()[index].accepted != registration {
         return Err(nt_status::NtStatus::INVALID_HANDLE);
     }
-    let checked = check(&RetirementPreflight { domain })?;
+    let checked = check(&RetirementPreflight {
+        domain,
+        accepted_driver_object: rows()[index].accepted_driver_object,
+    })?;
     let row = &mut rows()[index];
     if row.registration.is_none() && registration.is_some() {
         ledger().attach_registration(&row.owner, registration.unwrap())?;

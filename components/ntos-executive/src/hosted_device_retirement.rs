@@ -65,6 +65,12 @@ pub(super) unsafe fn retire_hosted_device_projection(
                     None => None,
                 };
                 let driver_object = read_unaligned((device_exec + 0x08) as *const u64);
+                // The projected header is writable by the provider. It cannot erase or
+                // redirect the list owner captured when its canonical bind was accepted.
+                if physical_registration.is_some()
+                    && preflight.accepted_driver_object() != Some(driver_object) {
+                    return Err(nt_status::NtStatus::INVALID_PARAMETER);
+                }
                 let next_device = read_unaligned((device_exec + 0x10) as *const u64);
                 let mut target_link = None;
                 if driver_object != 0 {
