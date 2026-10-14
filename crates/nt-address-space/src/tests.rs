@@ -2402,6 +2402,63 @@ fn image_view_fault_access_supports_execute_and_writecopy_cow() {
 }
 
 #[test]
+fn image_receive_fault_accepts_only_missing_user_read_or_execute() {
+    assert_eq!(x86_user_image_read_or_execute_not_present(0x4), Some(FaultAccess::Read));
+    assert_eq!(x86_user_image_read_or_execute_not_present(0x14), Some(FaultAccess::Execute));
+    for error in [0, 0x5, 0x6, 0x7, 0x15, 0x1c] {
+        assert_eq!(x86_user_image_read_or_execute_not_present(error), None);
+    }
+}
+
+#[test]
+fn image_receive_fault_accepts_only_exact_user_writecopy_protection_fault() {
+    use ImageFaultObservation::{NotPresent, Protection};
+    assert_eq!(
+        x86_user_image_receive_fault(0x4, PAGE_READONLY),
+        Some((FaultAccess::Read, NotPresent))
+    );
+    assert_eq!(
+        x86_user_image_receive_fault(0x14, PAGE_EXECUTE_READ),
+        Some((FaultAccess::Execute, NotPresent))
+    );
+    for protection in [PAGE_WRITECOPY, PAGE_EXECUTE_WRITECOPY] {
+        assert_eq!(
+            x86_user_image_receive_fault(0x7, protection),
+            Some((FaultAccess::Write, Protection))
+        );
+    }
+    for protection in [PAGE_READONLY, PAGE_EXECUTE_READ, PAGE_READWRITE,
+        PAGE_WRITECOPY | PAGE_GUARD] {
+        assert_eq!(x86_user_image_receive_fault(0x7, protection), None);
+    }
+    for error in [0x3, 0x5, 0x6, 0xf, 0x17, 0x1f] {
+        assert_eq!(x86_user_image_receive_fault(error, PAGE_WRITECOPY), None);
+    }
+}
+
+#[test]
+fn legacy_image_receive_cow_requires_exact_committed_owner_and_resident_mapping() {
+    let mapping = VmBasicInformation {
+        base_address: 0x140004000,
+        allocation_base: 0x140000000,
+        allocation_protect: PAGE_EXECUTE_WRITECOPY,
+        region_size: PAGE_SIZE,
+        state: MEM_COMMIT,
+        protect: PAGE_EXECUTE_WRITECOPY,
+        type_: MEM_IMAGE,
+    };
+    let status = |mapping, base, resident| legacy_image_receive_fault_status(
+        mapping, base, FaultAccess::Write, ImageFaultObservation::Protection, resident,
+    );
+    assert_eq!(status(mapping, 0x140000000, true), Ok(()));
+    assert_eq!(status(mapping, 0x140000000, false), Err(STATUS_ACCESS_VIOLATION));
+    assert_eq!(status(mapping, 0x150000000, true), Err(STATUS_ACCESS_VIOLATION));
+    assert_eq!(status(VmBasicInformation { state: MEM_RESERVE, ..mapping }, 0x140000000, true), Err(STATUS_ACCESS_VIOLATION));
+    assert_eq!(status(VmBasicInformation { type_: MEM_PRIVATE, ..mapping }, 0x140000000, true), Err(STATUS_ACCESS_VIOLATION));
+    assert_eq!(status(VmBasicInformation { protect: PAGE_EXECUTE_READ, ..mapping }, 0x140000000, true), Err(STATUS_ACCESS_VIOLATION));
+}
+
+#[test]
 fn image_view_fault_plan_tracks_writecopy_cow() {
     assert_eq!(
         image_view_fault_plan(PAGE_WRITECOPY, false),
