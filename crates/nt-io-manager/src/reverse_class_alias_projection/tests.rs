@@ -74,12 +74,13 @@ fn distinct_reverse_aliases_publish_once_and_hold_exact_sources() {
         ReverseClassAliasProjection::new(&mut io, identity.source_port_fdo, identity.source_main)
             .unwrap();
     assert_eq!(owner.stage(&io, identity), Ok(()));
-    assert_eq!(owner.begin_publication(&io, identity), Ok(()));
+    assert_eq!(owner.begin_publication(&mut io, identity), Ok(()));
     assert_eq!(
-        owner.begin_publication(&io, identity),
+        owner.begin_publication(&mut io, identity),
         Err(NtStatus::INVALID_PARAMETER)
     );
     assert_eq!(owner.complete_publication(&io, identity), Ok(()));
+    assert_eq!(owner.published_identity_without_manager(), Some(identity));
     assert_eq!(
         owner.alias_for_attached_traversal(&io),
         Ok(identity.alias_port_fdo)
@@ -96,12 +97,18 @@ fn distinct_reverse_aliases_publish_once_and_hold_exact_sources() {
         io.retire_hosted_device_pointer(identity.source_main),
         Err(NtStatus::DEVICE_BUSY)
     );
+    assert_eq!(
+        io.retire_hosted_device_pointer(identity.alias_main),
+        Err(NtStatus::DEVICE_BUSY)
+    );
     assert_eq!(owner.begin_retirement(), Ok(()));
+    assert_eq!(owner.published_identity_without_manager(), None);
     assert_eq!(
         owner.alias_for_attached_traversal(&io),
         Err(NtStatus::DELETE_PENDING)
     );
     assert_eq!(owner.finish_retirement(&mut io), Err(NtStatus::DEVICE_BUSY));
+    assert_eq!(owner.release_aliases_for_retirement(&mut io), Ok(()));
     io.retire_hosted_device_pointer(identity.alias_port_fdo)
         .unwrap();
     io.retire_hosted_device_pointer(identity.alias_main)
@@ -150,12 +157,12 @@ fn swapped_cross_domain_and_reused_generation_cannot_publish() {
         .unwrap();
     assert_ne!(replacement, identity.alias_main);
     assert_eq!(
-        owner.begin_publication(&io, identity),
+        owner.begin_publication(&mut io, identity),
         Err(NtStatus::INVALID_HANDLE)
     );
     assert_eq!(
         owner.begin_publication(
-            &io,
+            &mut io,
             ReverseClassAliasIdentity {
                 alias_main: replacement,
                 ..identity
@@ -172,14 +179,19 @@ fn uncertain_native_publication_blocks_replay_and_retirement() {
         ReverseClassAliasProjection::new(&mut io, identity.source_port_fdo, identity.source_main)
             .unwrap();
     owner.stage(&io, identity).unwrap();
-    owner.begin_publication(&io, identity).unwrap();
+    owner.begin_publication(&mut io, identity).unwrap();
     owner.block_uncertain().unwrap();
+    assert_eq!(owner.published_identity_without_manager(), None);
+    assert_eq!(
+        io.retire_hosted_device_pointer(identity.alias_main),
+        Err(NtStatus::DEVICE_BUSY)
+    );
     assert_eq!(
         owner.complete_publication(&io, identity),
         Err(NtStatus::INVALID_PARAMETER)
     );
     assert_eq!(
-        owner.begin_publication(&io, identity),
+        owner.begin_publication(&mut io, identity),
         Err(NtStatus::INVALID_PARAMETER)
     );
     assert_eq!(
@@ -218,7 +230,7 @@ fn uncertain_alias_reply_after_stage_blocks_provider_entry() {
     owner.stage(&io, identity).unwrap();
     owner.block_prepublication().unwrap();
     assert_eq!(
-        owner.begin_publication(&io, identity),
+        owner.begin_publication(&mut io, identity),
         Err(NtStatus::INVALID_PARAMETER)
     );
     assert_eq!(
@@ -238,9 +250,10 @@ fn failed_physical_revalidation_after_ack_closes_published_aliases() {
         ReverseClassAliasProjection::new(&mut io, identity.source_port_fdo, identity.source_main)
             .unwrap();
     owner.stage(&io, identity).unwrap();
-    owner.begin_publication(&io, identity).unwrap();
+    owner.begin_publication(&mut io, identity).unwrap();
     owner.complete_publication(&io, identity).unwrap();
     owner.block_uncertain().unwrap();
+    assert_eq!(owner.published_identity_without_manager(), None);
     assert_eq!(
         owner.alias_for_callback_first_argument(&io),
         Err(NtStatus::INVALID_PARAMETER)

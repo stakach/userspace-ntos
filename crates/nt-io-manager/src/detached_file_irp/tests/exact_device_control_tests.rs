@@ -61,7 +61,7 @@ fn control_buffers() -> ExternalFileIrpBuffers {
 
 #[test]
 fn method_neither_mutable_input_is_captured_before_ack_with_zero_output_length() {
-    for len in [40usize, 48] {
+    for len in [16usize, 40, 48] {
         let mut f = fixture();
         let mut request = request(&f, nt_io_abi::ioctl::METHOD_NEITHER, true);
         request.parameters = IoParameters::InternalDeviceControl(crate::DeviceControlParameters {

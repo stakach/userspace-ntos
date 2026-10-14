@@ -32,6 +32,7 @@ bitflags::bitflags! {
         const READ_ONLY_DEVICE = 0x0000_0002;
         const FLOPPY_DISKETTE = 0x0000_0004;
         const WRITE_ONCE_MEDIA = 0x0000_0008;
+        const AUTO_GENERATED_DEVICE_NAME = 0x0000_0080;
         const DEVICE_SECURE_OPEN = 0x0000_0100;
     }
 }

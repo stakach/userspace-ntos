@@ -1,6 +1,7 @@
 //! Owned PnP invocation across a foreign call, without a live I/O Manager borrow.
 
 use super::*;
+use crate::source_irp_auxiliary::SourcePoolAllocationIdentity;
 
 #[path = "detached_external_pnp_completion.rs"]
 mod completion;
@@ -40,6 +41,7 @@ pub struct ExternalPnpReturn {
 pub struct RetainedExternalPnp {
     owner: ExternalPnpReturn,
     outcome: ExternalPnpDispatchResult,
+    filter_input_allocation: Option<SourcePoolAllocationIdentity>,
 }
 
 impl RetainedExternalPnp {
@@ -51,6 +53,36 @@ impl RetainedExternalPnp {
     }
     pub fn outcome(&self) -> &ExternalPnpDispatchResult {
         &self.outcome
+    }
+
+    /// Bind the native input allocation observed before the provider's MajorFunction ran. The
+    /// adapter must keep it live and verify its physical identity and generation again when it
+    /// reports a borrowed terminal pointer.
+    pub fn bind_filter_input_allocation(
+        &mut self,
+        allocation: SourcePoolAllocationIdentity,
+    ) -> Result<(), NtStatus> {
+        let input_len = match &self.owner.invocation.snapshot.projection.parameters {
+            IoParameters::Pnp(parameters)
+                if parameters.minor == nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS =>
+            {
+                parameters.filter_resource_requirements_len()
+            }
+            _ => None,
+        };
+        if self.filter_input_allocation.is_some()
+            || !input_len.is_some_and(|len| {
+                len as usize == self.payload().len()
+                    && allocation.capacity >= u64::from(len)
+                    && allocation.component_address != 0
+                    && allocation.pool_generation != 0
+                    && allocation.component_address.checked_add(allocation.capacity).is_some()
+            })
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        self.filter_input_allocation = Some(allocation);
+        Ok(())
     }
 }
 
@@ -218,6 +250,7 @@ impl<P> IoManager<P> {
                     outcome,
                 },
                 outcome: result,
+                filter_input_allocation: None,
             }),
         })
     }

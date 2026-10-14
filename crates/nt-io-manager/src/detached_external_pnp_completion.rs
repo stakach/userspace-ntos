@@ -3,6 +3,7 @@
 //! query results still require their own checked output/adoption contract.
 use super::*;
 use crate::completion_ack::{CompletionAckReservation, CompletionAcknowledgement};
+use crate::source_irp_auxiliary::SourcePoolAllocationIdentity;
 use crate::CompletedIrp;
 
 /// A FILTER result copied before the provider's pending IRP is acknowledged. `Original` never
@@ -14,6 +15,7 @@ pub enum ExternalPnpFilterOutput {
     /// Native adapters must prove this pointer against that allocation's generation.
     BorrowedInput {
         provider_pointer: u64,
+        input_allocation: SourcePoolAllocationIdentity,
     },
     Copied {
         provider_pointer: u64,
@@ -22,7 +24,11 @@ pub enum ExternalPnpFilterOutput {
 }
 
 impl ExternalPnpFilterOutput {
-    fn matches(&self, completion: &CompletedIrp) -> bool {
+    fn matches(
+        &self,
+        completion: &CompletedIrp,
+        retained_input: Option<SourcePoolAllocationIdentity>,
+    ) -> bool {
         if completion.status == NtStatus::NOT_SUPPORTED
             || !completion.status.is_success()
             || completion.information == 0
@@ -30,9 +36,12 @@ impl ExternalPnpFilterOutput {
             matches!(self, Self::Original)
         } else {
             match self {
-                Self::BorrowedInput { provider_pointer } => {
-                    *provider_pointer != 0 && *provider_pointer == completion.information
-                }
+                Self::BorrowedInput {
+                    provider_pointer,
+                    input_allocation,
+                } => retained_input == Some(*input_allocation)
+                    && *provider_pointer == input_allocation.component_address
+                    && *provider_pointer == completion.information,
                 Self::Copied {
                     provider_pointer,
                     bytes,
@@ -248,7 +257,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
             if filter_output.is_none() && completion.information != 0 {
                 return Err(NtStatus::NOT_SUPPORTED);
             }
-            if filter_output.is_some_and(|output| !output.matches(&completion)) {
+            if filter_output.is_some_and(|output| {
+                !output.matches(&completion, retained.filter_input_allocation)
+            }) {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
             let irp = self.irp(id).ok_or(NtStatus::INVALID_PARAMETER)?;

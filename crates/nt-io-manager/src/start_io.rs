@@ -135,6 +135,7 @@ fn device<M: LockedStartIoMemory>(memory: &M, address: u64) -> Result<Device<M::
         || address.checked_add(0x150).is_none() || d.queue != address + 0xa0
         || d.extension < address + 0x150 || d.extension & 15 != 0 || d.extension.checked_add(0x50).is_none()
         || d.start_io == 0 { return Err(Error::InvalidDevice); }
+    memory.validate_device_owner(&d).map_err(Error::Memory)?;
     Ok(d)
 }
 fn packet<M: LockedStartIoMemory>(memory: &M, entry: u64, cancel: Option<u64>) -> Result<Packet<M::Owner>, Error<M::Error>> {

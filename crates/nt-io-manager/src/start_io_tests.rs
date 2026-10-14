@@ -212,6 +212,41 @@ fn refused_owner_or_duplicate_current_is_atomic_and_returns_lock_owner() {
     assert_eq!(m.bytes, before, "staged unlink cannot precede packet admission");
 }
 
+#[test]
+fn start_next_refuses_retired_device_owner_before_queue_or_deferred_effects() {
+    let mut queued = Memory::new();
+    queued.start(A, None);
+    queued.start(B, None);
+    queued.refuse_device_owner = true;
+    let before = queued.bytes.clone();
+    let commits = queued.commits;
+    let refusal = match start_next(&mut queued, D, None, true,
+        Some(CancelLock { token: 41u64, previous_irql: 2 })) {
+        Err(refusal) => refusal,
+        Ok(_) => panic!("retired device selected a queued IRP"),
+    };
+    assert_eq!(refusal.error, Error::Memory("retired device generation"));
+    assert_eq!(refusal.lock.unwrap().token, 41);
+    assert_eq!(queued.bytes, before);
+    assert_eq!(queued.commits, commits);
+
+    let mut deferred = Memory::new();
+    set_attributes(&mut deferred, D, true, false).unwrap();
+    deferred.start(A, None);
+    deferred.refuse_device_owner = true;
+    let before = deferred.bytes.clone();
+    let commits = deferred.commits;
+    let refusal = match start_next(&mut deferred, D, Some(7), true,
+        Some(CancelLock { token: 42u64, previous_irql: 2 })) {
+        Err(refusal) => refusal,
+        Ok(_) => panic!("retired device mutated deferred StartIo state"),
+    };
+    assert_eq!(refusal.error, Error::Memory("retired device generation"));
+    assert_eq!(refusal.lock.unwrap().token, 42);
+    assert_eq!(deferred.bytes, before);
+    assert_eq!(deferred.commits, commits);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CurrentPacketLifetime {
     address: u64,

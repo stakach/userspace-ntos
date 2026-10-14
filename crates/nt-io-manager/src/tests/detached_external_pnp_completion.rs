@@ -1,6 +1,7 @@
 //! Detached status-only PnP completion ownership regressions.
 use super::*;
 use crate::detached_file_irp::ExternalFileIrpAcknowledgement;
+use crate::source_irp_auxiliary::SourcePoolAllocationIdentity;
 
 fn pending(
     io: &mut IoManager<MockObjectPort>,
@@ -93,6 +94,17 @@ fn valid_requirements() -> Vec<u8> {
     bytes
 }
 
+fn filter_input_allocation(
+    component_address: u64,
+    pool_generation: u64,
+) -> SourcePoolAllocationIdentity {
+    SourcePoolAllocationIdentity {
+        component_address,
+        capacity: 40,
+        pool_generation,
+    }
+}
+
 #[test]
 fn filter_not_supported_borrowed_information_preserves_original_input_through_ack() {
     let mut io = io();
@@ -180,8 +192,10 @@ fn successful_filter_pointer_requires_exact_copied_output_before_ack() {
 fn successful_filter_may_borrow_only_the_exact_retained_input_pointer() {
     let mut io = io();
     let input_pointer = 0x1234_5000;
-    let (retained, release) =
+    let (mut retained, release) =
         pending_filter_with_terminal(&mut io, NtStatus::SUCCESS, input_pointer);
+    let input_allocation = filter_input_allocation(input_pointer, 7);
+    retained.bind_filter_input_allocation(input_allocation).unwrap();
     let id = retained.irp_id();
     release.set(true);
     assert_eq!(io.pump(), 1);
@@ -190,6 +204,7 @@ fn successful_filter_may_borrow_only_the_exact_retained_input_pointer() {
             retained,
             ExternalPnpFilterOutput::BorrowedInput {
                 provider_pointer: input_pointer + 8,
+                input_allocation,
             },
         )
         .unwrap_err();
@@ -200,6 +215,7 @@ fn successful_filter_may_borrow_only_the_exact_retained_input_pointer() {
             refusal.into_owner(),
             ExternalPnpFilterOutput::BorrowedInput {
                 provider_pointer: input_pointer,
+                input_allocation,
             },
         )
         .unwrap();
@@ -211,8 +227,90 @@ fn successful_filter_may_borrow_only_the_exact_retained_input_pointer() {
         output,
         ExternalPnpFilterOutput::BorrowedInput {
             provider_pointer: input_pointer,
+            input_allocation,
         }
     );
+}
+
+#[test]
+fn filter_pointer_equality_without_a_retained_input_allocation_is_not_borrow_authority() {
+    let mut io = io();
+    let arbitrary_pointer = 0x1234_6000;
+    let (retained, release) =
+        pending_filter_with_terminal(&mut io, NtStatus::SUCCESS, arbitrary_pointer);
+    let input_allocation = filter_input_allocation(arbitrary_pointer, 7);
+    let id = retained.irp_id();
+    release.set(true);
+    assert_eq!(io.pump(), 1);
+    let (refusal, output) = io
+        .prepare_external_pnp_filter_completion(
+            retained,
+            ExternalPnpFilterOutput::BorrowedInput {
+                provider_pointer: arbitrary_pointer,
+                input_allocation,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(refusal.status(), NtStatus::INVALID_PARAMETER);
+    assert_eq!(
+        output,
+        ExternalPnpFilterOutput::BorrowedInput {
+            provider_pointer: arbitrary_pointer,
+            input_allocation,
+        }
+    );
+    assert!(io.completed_irp(id).is_some());
+    assert!(io.irp(id).unwrap().completion_ack_reservation.is_none());
+}
+
+#[test]
+fn filter_borrow_rejects_reused_address_with_a_different_pool_generation() {
+    let mut io = io();
+    let input_pointer = 0x1234_6000;
+    let (mut retained, release) =
+        pending_filter_with_terminal(&mut io, NtStatus::SUCCESS, input_pointer);
+    retained
+        .bind_filter_input_allocation(filter_input_allocation(input_pointer, 7))
+        .unwrap();
+    let id = retained.irp_id();
+    release.set(true);
+    assert_eq!(io.pump(), 1);
+    let (refusal, output) = io
+        .prepare_external_pnp_filter_completion(
+            retained,
+            ExternalPnpFilterOutput::BorrowedInput {
+                provider_pointer: input_pointer,
+                input_allocation: filter_input_allocation(input_pointer, 8),
+            },
+        )
+        .unwrap_err();
+    assert_eq!(refusal.status(), NtStatus::INVALID_PARAMETER);
+    assert_eq!(refusal.owner().irp_id(), id);
+    assert!(matches!(output, ExternalPnpFilterOutput::BorrowedInput { .. }));
+    assert!(io.irp(id).unwrap().completion_ack_reservation.is_none());
+}
+
+#[test]
+fn filter_input_binding_rejects_short_or_wrapping_native_allocations() {
+    let mut io = io();
+    let (mut retained, _) = pending_filter_with_terminal(&mut io, NtStatus::SUCCESS, 0x1234_6000);
+    let status = retained
+        .bind_filter_input_allocation(SourcePoolAllocationIdentity {
+            component_address: 0x1234_6000,
+            capacity: 39,
+            pool_generation: 7,
+        })
+        .unwrap_err();
+    assert_eq!(status, NtStatus::INVALID_PARAMETER);
+    let status = retained
+        .bind_filter_input_allocation(SourcePoolAllocationIdentity {
+            component_address: u64::MAX - 7,
+            capacity: 40,
+            pool_generation: 7,
+        })
+        .unwrap_err();
+    assert_eq!(status, NtStatus::INVALID_PARAMETER);
+    assert_eq!(retained.payload(), valid_requirements());
 }
 
 #[test]

@@ -33,6 +33,8 @@ pub enum ReverseClassAliasPhase {
 pub struct ReverseClassAliasProjection {
     source_port_fdo: Option<HostedDeviceProjectionReference>,
     source_main: Option<HostedDeviceProjectionReference>,
+    alias_port_fdo: Option<HostedDeviceProjectionReference>,
+    alias_main: Option<HostedDeviceProjectionReference>,
     identity: Option<ReverseClassAliasIdentity>,
     phase: ReverseClassAliasPhase,
 }
@@ -56,13 +58,16 @@ impl ReverseClassAliasProjection {
         let main = match io.retain_hosted_device_projection_reference(source_main) {
             Ok(main) => main,
             Err(status) => {
-                port.release(io)?;
+                port.release(io)
+                    .expect("fresh alias projection pin changed before local rollback");
                 return Err(status);
             }
         };
         Ok(Self {
             source_port_fdo: Some(port),
             source_main: Some(main),
+            alias_port_fdo: None,
+            alias_main: None,
             identity: None,
             phase: ReverseClassAliasPhase::Prepared,
         })
@@ -70,6 +75,29 @@ impl ReverseClassAliasProjection {
 
     pub const fn phase(&self) -> ReverseClassAliasPhase {
         self.phase
+    }
+
+    /// An IRQ callback can inspect this already-owned identity without reborrowing the manager.
+    /// All four exact registrations remain pinned until publication stops and retirement releases
+    /// the aliases. Native admission must also validate the matching physical generations.
+    pub fn published_identity_without_manager(&self) -> Option<ReverseClassAliasIdentity> {
+        if self.phase != ReverseClassAliasPhase::Published {
+            return None;
+        }
+        let identity = self.identity?;
+        for (owner, registration) in [
+            (&self.source_port_fdo, identity.source_port_fdo),
+            (&self.source_main, identity.source_main),
+            (&self.alias_port_fdo, identity.alias_port_fdo),
+            (&self.alias_main, identity.alias_main),
+        ] {
+            if !owner.as_ref().is_some_and(|owner| {
+                owner.is_held() && owner.registration() == registration
+            }) {
+                return None;
+            }
+        }
+        Some(identity)
     }
 
     fn live<P>(io: &IoManager<P>, registration: HostedDevicePointerRegistration) -> bool {
@@ -146,7 +174,7 @@ impl ReverseClassAliasProjection {
     /// effect after this transition must call `block_uncertain`.
     pub fn begin_publication<P>(
         &mut self,
-        io: &IoManager<P>,
+        io: &mut IoManager<P>,
         identity: ReverseClassAliasIdentity,
     ) -> Result<(), NtStatus> {
         if self.phase != ReverseClassAliasPhase::Staged {
@@ -155,6 +183,16 @@ impl ReverseClassAliasProjection {
         if self.identity != Some(identity) || !self.valid_identity(io, identity) {
             return Err(NtStatus::INVALID_HANDLE);
         }
+        let mut port = io.retain_hosted_device_projection_reference(identity.alias_port_fdo)?;
+        let main = match io.retain_hosted_device_projection_reference(identity.alias_main) {
+            Ok(main) => main,
+            Err(status) => {
+                port.release(io)?;
+                return Err(status);
+            }
+        };
+        self.alias_port_fdo = Some(port);
+        self.alias_main = Some(main);
         self.phase = ReverseClassAliasPhase::Entered;
         Ok(())
     }
@@ -228,12 +266,32 @@ impl ReverseClassAliasProjection {
         Ok(())
     }
 
+    /// Called after native callback quiescence and before retiring either alias registration.
+    /// A refused release keeps its exact owner for reconciliation in the Retiring phase.
+    pub fn release_aliases_for_retirement<P>(&mut self, io: &mut IoManager<P>) -> Result<(), NtStatus> {
+        if self.phase != ReverseClassAliasPhase::Retiring {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        if let Some(port) = &mut self.alias_port_fdo {
+            port.release(io)?;
+            self.alias_port_fdo = None;
+        }
+        if let Some(main) = &mut self.alias_main {
+            main.release(io)?;
+            self.alias_main = None;
+        }
+        Ok(())
+    }
+
     /// Native must first retire both aliases and all their caller references.
     /// A failed source release leaves the remaining exact owner available for
     /// reconciliation; it cannot reopen publication.
     pub fn finish_retirement<P>(&mut self, io: &mut IoManager<P>) -> Result<(), NtStatus> {
         if self.phase != ReverseClassAliasPhase::Retiring {
             return Err(NtStatus::INVALID_PARAMETER);
+        }
+        if self.alias_port_fdo.is_some() || self.alias_main.is_some() {
+            return Err(NtStatus::DEVICE_BUSY);
         }
         let identity = self.identity.ok_or(NtStatus::INVALID_HANDLE)?;
         if io

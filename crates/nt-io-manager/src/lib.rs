@@ -91,6 +91,7 @@ pub mod retained_read_forward;
 pub mod retained_query_information_forward;
 pub mod retained_flush_forward;
 pub mod retained_connect_forward;
+pub mod retained_file_lifecycle_forward;
 pub mod class_service_callback;
 pub mod reverse_class_alias_projection;
 pub mod source_irp_ledger;
@@ -103,6 +104,7 @@ pub mod retained_file_query_progress;
 pub mod retained_file_close_progress;
 pub mod retained_source_progress;
 pub mod hosted_forward_progress;
+pub mod held_pnp_completion;
 pub mod win32k_async_read_wire;
 pub mod win32k_section_create_wire;
 pub mod win32k_mm_section_wire;
@@ -353,6 +355,8 @@ pub struct IoManager<P> {
     disconnected_client_retries: Vec<ClientId>,
     port: P,
     backends: Vec<Box<dyn DriverDispatchBackend>>,
+    #[cfg(test)]
+    test_reentrant_create_status: Option<nt_status::NtStatus>,
 }
 
 impl<P> IoManager<P> {
@@ -378,6 +382,8 @@ impl<P> IoManager<P> {
             disconnected_client_retries: Vec::new(),
             port,
             backends: Vec::new(),
+            #[cfg(test)]
+            test_reentrant_create_status: None,
         }
     }
 
@@ -910,6 +916,26 @@ impl<P> IoManager<P> {
             .unwrap_or(&[])
     }
 
+    /// Identify the exact current top eligible for a new attachment before entering a native
+    /// AddDevice call. A live IRP keeps the topology fixed until its terminal acknowledgement.
+    pub fn can_attach_new_device_above(&self, target: DeviceId) -> Result<DeviceId, NtStatus> {
+        let lower = match self.device(target) {
+            Some(device) if !device.delete_pending => self
+                .device(device.top_of_stack)
+                .map(|_| device.top_of_stack)
+                .ok_or(NtStatus::INVALID_PARAMETER)?,
+            Some(_) => return Err(NtStatus::DELETE_PENDING),
+            None => return Err(NtStatus::INVALID_PARAMETER),
+        };
+        if self.device(lower).is_some_and(|device| device.delete_pending) {
+            return Err(NtStatus::DELETE_PENDING);
+        }
+        if self.device_has_live_irps(lower) {
+            return Err(NtStatus::DEVICE_BUSY);
+        }
+        Ok(lower)
+    }
+
     /// Attach `source` above the current top of `target`'s device stack, returning the lower device
     /// that `source` attached to. This is the canonical record-level half of
     /// `IoAttachDeviceToDeviceStack`; guest-visible WDM pointers are translated by the driver host.
@@ -925,18 +951,11 @@ impl<P> IoManager<P> {
             Some(device) => (device.delete_pending, device.attached_to.is_some()),
             None => return Err(NtStatus::INVALID_PARAMETER),
         };
-        let lower = match self.device(target) {
-            Some(device) if !device.delete_pending => self
-                .device(device.top_of_stack)
-                .map(|_| device.top_of_stack)
-                .ok_or(NtStatus::INVALID_PARAMETER)?,
-            Some(_) => return Err(NtStatus::DELETE_PENDING),
-            None => return Err(NtStatus::INVALID_PARAMETER),
-        };
-        if source_delete_pending || self.device(lower).map(|d| d.delete_pending).unwrap_or(true) {
+        let lower = self.can_attach_new_device_above(target)?;
+        if source_delete_pending {
             return Err(NtStatus::DELETE_PENDING);
         }
-        if self.device_has_live_irps(source) || self.device_has_live_irps(lower) {
+        if self.device_has_live_irps(source) {
             return Err(NtStatus::DEVICE_BUSY);
         }
         if source_attached || self.has_upper_attachment(source) || lower == source {
@@ -1047,6 +1066,16 @@ impl<P> IoManager<P> {
             .any(|(_, irp)| irp.stack.iter().any(|location| location.device_id == id))
     }
 
+    /// Diagnostic witness for a Device stack mutation blocked by a live IRP.
+    pub fn attachment_live_irp_witness(&self, id: DeviceId) -> Option<IrpId> {
+        self.irps.iter().find_map(|(irp_id, irp)| {
+            irp.stack
+                .iter()
+                .any(|location| location.device_id == id)
+                .then_some(irp_id)
+        })
+    }
+
     fn recompute_device_stacks(&mut self) {
         let ids = self.devices.ids();
         let mut updates = Vec::new();
@@ -1149,6 +1178,7 @@ impl<P> IoManager<P> {
             return Err(NtStatus::DELETE_PENDING);
         }
         if is_create_major(record.origin_major) && record.file_id.is_some()
+            && record.subsidiary_file_lifecycle.is_none()
             && self.irps.iter().any(|(_, existing)| existing.file_id == record.file_id
                 && is_create_major(existing.origin_major)) {
             return Err(NtStatus::INVALID_PARAMETER);
@@ -1247,6 +1277,12 @@ impl<P> IoManager<P> {
                 .ok_or(NtStatus::INVALID_PARAMETER)?
                 .driver_id;
             let valid_state = match record.origin_major {
+                _ if record.subsidiary_file_lifecycle.is_some() => match record.origin_major {
+                    nt_io_abi::major::IRP_MJ_CREATE => file.state == FileState::CreateIrpDispatched,
+                    nt_io_abi::major::IRP_MJ_CLEANUP => file.state == FileState::CleanupPending,
+                    nt_io_abi::major::IRP_MJ_CLOSE => file.state == FileState::ClosePending,
+                    _ => false,
+                },
                 major if is_create_major(major) => file.state == FileState::Allocated,
                 nt_io_abi::major::IRP_MJ_CLEANUP => file.state == FileState::CleanupPending,
                 nt_io_abi::major::IRP_MJ_CLOSE => file.state == FileState::ClosePending,
@@ -1263,8 +1299,9 @@ impl<P> IoManager<P> {
                             ))),
             };
             if file.client_id != record.client_id
-                || file_driver != record.origin_driver_id
+                || (record.subsidiary_file_lifecycle.is_none() && file_driver != record.origin_driver_id)
                 || (record.origin_device_id != DeviceId::NULL
+                    && record.subsidiary_file_lifecycle.is_none()
                     && file.device_id != record.origin_device_id)
                 || !valid_state
             {
@@ -1362,11 +1399,11 @@ impl<P> IoManager<P> {
                 .checked_add(1)
                 .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
             let file = self.files.get_mut(file_id).expect("validated file");
-            if let Some(IoParameters::Create(parameters)) =
+            if record.subsidiary_file_lifecycle.is_none() { if let Some(IoParameters::Create(parameters)) =
                 record.current_stack().map(|stack| &stack.parameters)
             {
                 file.opened_case_sensitive = parameters.opened_case_sensitive;
-            }
+            } }
             file.outstanding_irp_refs += 1;
             if related_file.is_some() {
                 file.related_file = None;
@@ -4387,6 +4424,7 @@ mod tests {
             .unwrap();
         assert_eq!(om.attach_device_to_stack(middle, lower), Ok(lower));
         assert_eq!(om.attach_device_to_stack(top, lower), Ok(middle));
+        assert_eq!(om.can_attach_new_device_above(lower), Ok(top));
         let client = om.register_client();
         let mut buffer = [0u8; 4];
         let result = om
@@ -4414,6 +4452,10 @@ mod tests {
         assert_eq!(top_state.borrow().seen[0], (top_driver, top, 0, 3, irp));
         assert_eq!(
             om.attach_device_to_stack(late_filter, lower),
+            Err(NtStatus::DEVICE_BUSY)
+        );
+        assert_eq!(
+            om.can_attach_new_device_above(lower),
             Err(NtStatus::DEVICE_BUSY)
         );
         assert_eq!(om.detach_device_from_stack(top), Err(NtStatus::DEVICE_BUSY));
@@ -4479,6 +4521,7 @@ mod tests {
             (lower_driver, lower)
         );
         om.acknowledge_completed_irp(irp).unwrap();
+        assert_eq!(om.can_attach_new_device_above(lower), Ok(top));
         assert_eq!(om.attach_device_to_stack(late_filter, lower), Ok(top));
         assert_eq!(om.detach_device_from_stack(late_filter), Ok(top));
         assert_eq!(lower_state.borrow().acknowledged, [irp]);

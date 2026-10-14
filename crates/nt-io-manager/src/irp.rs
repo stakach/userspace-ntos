@@ -597,6 +597,8 @@ pub struct IrpRecord {
     pub(crate) external_pnp_terminal_receipt_claimed: bool,
     /// A detached dispatch owns retirement; ordinary free/ACK cannot consume it across IPC.
     pub(crate) detached_file_owner: bool,
+    /// Lower File lifecycle IRP owned by an entered outer IRP; never mutates the File state.
+    pub(crate) subsidiary_file_lifecycle: Option<IrpId>,
     pub(crate) completion_ack_reservation: Option<crate::completion_ack::CompletionAckReservation>,
     pub(crate) detached_file_intent: crate::detached_file_irp::ExternalFileIrpIntent,
     pub stack: Vec<IoStackLocation>,
@@ -637,6 +639,7 @@ impl IrpRecord {
             completion_origin: None,
             external_pnp_terminal_receipt_claimed: false,
             detached_file_owner: false,
+            subsidiary_file_lifecycle: None,
             completion_ack_reservation: None,
             detached_file_intent: crate::detached_file_irp::ExternalFileIrpIntent::default(),
             stack: Vec::new(),
@@ -695,7 +698,9 @@ impl IrpRecord {
         caller: DriverId,
         next_stack: IoStackLocation,
     ) -> Result<&IoStackLocation, NtStatus> {
-        if self.has_external_retirement_owner() { return Err(NtStatus::INVALID_DEVICE_REQUEST); }
+        if self.has_external_retirement_owner() {
+            return Err(NtStatus::INVALID_DEVICE_REQUEST);
+        }
         let current = self.current_stack().ok_or(NtStatus::INVALID_PARAMETER)?;
         if current.driver_id != caller {
             return Err(NtStatus::INVALID_PARAMETER);

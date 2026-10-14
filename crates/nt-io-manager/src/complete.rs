@@ -18,6 +18,11 @@ use crate::irp::{CancelState, IrpCompletionOrigin, IrpState};
 use crate::object_port::ObjectManagerPort;
 use crate::{DeviceId, DriverId, FileId, IoManager, IrpId};
 
+// Synchronous CREATE only needs a brief opportunity to consume an already-ready terminal
+// completion. A backend can keep reporting unrelated records, so this path must yield back to
+// the ordinary pump rather than holding the caller indefinitely.
+const CREATE_READY_COMPLETION_DRAIN_LIMIT: usize = 32;
+
 /// Stable terminal projection delivered to an I/O Manager consumer. The
 /// canonical IRP remains live until [`IoManager::acknowledge_completed_irp`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -95,29 +100,70 @@ impl<P: ObjectManagerPort> IoManager<P> {
             + self.retry_deferred_file_closes();
         for idx in 0..self.backends.len() {
             while let Some(completion) = self.backends[idx].poll_completion() {
-                let irp_id = completion.irp_id;
-                if self.publish_backend_completion(idx, completion) {
-                    progress += 1;
-                } else {
-                    if self.irp(irp_id).is_some_and(|irp| irp.has_external_retirement_owner()) {
-                        continue;
-                    }
-                    // Poll transfers one retained backend completion to the manager. If its
-                    // canonical identity is stale, foreign, or already terminal, it has no valid
-                    // consumer; release that exact backend owner instead of stranding it in a
-                    // backend-specific published state.
-                    if self.backends[idx].acknowledge_completion(irp_id).is_ok() {
-                        progress += 1;
-                    } else if !self.rejected_completion_acks.contains(&(idx, irp_id)) {
-                        self.rejected_completion_acks.push((idx, irp_id));
-                    }
-                }
+                progress += usize::from(self.publish_polled_backend_completion(idx, completion));
             }
         }
         progress += self.detect_driver_faults();
         self.reap_manager_owned_completions();
         progress += self.retry_disconnected_clients();
         progress
+    }
+
+    fn publish_polled_backend_completion(
+        &mut self,
+        backend_index: usize,
+        completion: DriverCompletion,
+    ) -> bool {
+        let irp_id = completion.irp_id;
+        if self.publish_backend_completion(backend_index, completion) {
+            return true;
+        }
+        if self
+            .irp(irp_id)
+            .is_some_and(|irp| irp.has_external_retirement_owner())
+        {
+            return false;
+        }
+        // Poll transfers a retained completion to the manager. A stale, foreign or already
+        // terminal identity has no valid consumer; release its exact backend owner.
+        if self.backends[backend_index]
+            .acknowledge_completion(irp_id)
+            .is_ok()
+        {
+            true
+        } else {
+            if !self
+                .rejected_completion_acks
+                .contains(&(backend_index, irp_id))
+            {
+                self.rejected_completion_acks.push((backend_index, irp_id));
+            }
+            false
+        }
+    }
+
+    /// A synchronous open can observe STATUS_PENDING after its native peer has already
+    /// published terminal CREATE. Drain only that driver's ready queue before deciding whether
+    /// the File handle must be withheld. Unrelated completions keep their normal published owner.
+    pub(crate) fn publish_ready_create_completion(&mut self, irp_id: IrpId) {
+        let Some(backend_index) = self
+            .irp(irp_id)
+            .and_then(|irp| irp.current_stack())
+            .and_then(|stack| self.driver(stack.driver_id))
+            .map(|driver| driver.backend.0 as usize)
+            .filter(|index| *index < self.backends.len())
+        else {
+            return;
+        };
+        for _ in 0..CREATE_READY_COMPLETION_DRAIN_LIMIT {
+            if self.completed_irp(irp_id).is_some() {
+                break;
+            }
+            let Some(completion) = self.backends[backend_index].poll_completion() else {
+                break;
+            };
+            self.publish_polled_backend_completion(backend_index, completion);
+        }
     }
 
     fn retry_disconnected_clients(&mut self) -> usize {
@@ -142,7 +188,10 @@ impl<P: ObjectManagerPort> IoManager<P> {
         let mut index = 0;
         while index < self.cancel_dispatch_retries.len() {
             let irp_id = self.cancel_dispatch_retries[index];
-            if self.irp(irp_id).is_some_and(|irp| irp.has_external_retirement_owner()) {
+            if self
+                .irp(irp_id)
+                .is_some_and(|irp| irp.has_external_retirement_owner())
+            {
                 self.cancel_dispatch_retries.swap_remove(index);
                 continue;
             }
@@ -184,7 +233,10 @@ impl<P: ObjectManagerPort> IoManager<P> {
         let mut index = 0;
         while index < self.rejected_completion_acks.len() {
             let (backend_index, irp_id) = self.rejected_completion_acks[index];
-            if self.irp(irp_id).is_some_and(|irp| irp.has_external_retirement_owner()) {
+            if self
+                .irp(irp_id)
+                .is_some_and(|irp| irp.has_external_retirement_owner())
+            {
                 index += 1;
                 continue;
             }
@@ -206,7 +258,12 @@ impl<P: ObjectManagerPort> IoManager<P> {
             return 0;
         }
         let mut completed = 0;
-        let end = self.files.iter().map(|(id, _)| id.slot() + 1).max().unwrap_or(0);
+        let end = self
+            .files
+            .iter()
+            .map(|(id, _)| id.slot() + 1)
+            .max()
+            .unwrap_or(0);
         if end == 0 {
             self.deferred_file_close_cursor = 0;
             return 0;
@@ -218,7 +275,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
         // one pump. Only the copied generation-bearing FileId survives a backend call.
         for _ in 0..64 {
             let limit = if wrapped { start } else { end };
-            let next = self.files.iter()
+            let next = self
+                .files
+                .iter()
                 .find(|(id, file)| {
                     file.close_retry_queued && id.slot() >= cursor && id.slot() < limit
                 })
@@ -232,7 +291,10 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 continue;
             };
             cursor = file_id.slot() + 1;
-            assert!(self.take_deferred_file_close(file_id), "selected live close retry");
+            assert!(
+                self.take_deferred_file_close(file_id),
+                "selected live close retry"
+            );
             if self.finish_deferred_file_close(file_id).is_ok() {
                 completed += 1;
             } else {
@@ -312,8 +374,14 @@ impl<P: ObjectManagerPort> IoManager<P> {
         {
             return false;
         }
-        if let Some(irp) = self.irp_mut(completion.irp_id).filter(|irp| irp.detached_file_owner) {
-            if matches!(irp.state, IrpState::Dispatched | IrpState::Pending | IrpState::CancelRequested) {
+        if let Some(irp) = self
+            .irp_mut(completion.irp_id)
+            .filter(|irp| irp.detached_file_owner)
+        {
+            if matches!(
+                irp.state,
+                IrpState::Dispatched | IrpState::Pending | IrpState::CancelRequested
+            ) {
                 irp.state = IrpState::Indeterminate;
                 irp.status = completion.status;
             }
@@ -330,7 +398,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         if completion.status == NtStatus::PENDING {
             return false;
         }
-        let (major, file_id) = {
+        let (major, file_id, subsidiary) = {
             let irp = match self.irp_mut(completion.irp_id) {
                 Some(irp) => irp,
                 None => return false,
@@ -338,8 +406,10 @@ impl<P: ObjectManagerPort> IoManager<P> {
             if !matches!(
                 irp.state,
                 IrpState::Dispatched | IrpState::Pending | IrpState::CancelRequested
-            ) && !(irp.detached_file_owner && irp.state == IrpState::Indeterminate
-                && origin == IrpCompletionOrigin::Driver) {
+            ) && !(irp.detached_file_owner
+                && irp.state == IrpState::Indeterminate
+                && origin == IrpCompletionOrigin::Driver)
+            {
                 return false;
             }
             irp.status = completion.status;
@@ -359,14 +429,18 @@ impl<P: ObjectManagerPort> IoManager<P> {
             if !irp.transition(IrpState::Completed) {
                 return false;
             }
-            (irp.origin_major, irp.file_id)
+            (
+                irp.origin_major,
+                irp.file_id,
+                irp.subsidiary_file_lifecycle.is_some(),
+            )
         };
 
         // Terminal CREATE publication, rather than transport acknowledgement, makes the File
         // usable. Completion consumers must be able to publish the new handle before ACK releases
         // the retained driver payload. A cancelled owner can lose the race to a successful CREATE;
         // preserve that driver's context while leaving its File on the deferred-close path.
-        if crate::is_create_major(major) {
+        if crate::is_create_major(major) && !subsidiary {
             if let Some(file) = file_id.and_then(|file_id| self.file_mut(file_id)) {
                 file.complete_create(completion.status, completion.file_context);
             }
@@ -397,7 +471,10 @@ impl<P: ObjectManagerPort> IoManager<P> {
         offset: u64,
         output: &mut [u8],
     ) -> Result<usize, NtStatus> {
-        if self.irp(irp_id).is_some_and(|irp| irp.has_external_retirement_owner()) {
+        if self
+            .irp(irp_id)
+            .is_some_and(|irp| irp.has_external_retirement_owner())
+        {
             return Err(NtStatus::DELETE_PENDING);
         }
         let (driver_id, information, output_capacity) = {
@@ -446,7 +523,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
             return Err(NtStatus::INVALID_PARAMETER);
         }
         let stack = irp.current_stack().ok_or(NtStatus::INVALID_PARAMETER)?;
-        let method = irp.device_control_method.ok_or(NtStatus::INVALID_PARAMETER)?;
+        let method = irp
+            .device_control_method
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
         let length = crate::device_control::device_control_output_len(
             method,
             irp.status,
@@ -502,7 +581,10 @@ impl<P: ObjectManagerPort> IoManager<P> {
         offset: u64,
         output: &mut [u8],
     ) -> Result<usize, NtStatus> {
-        if self.irp(irp_id).is_some_and(|irp| irp.has_external_retirement_owner()) {
+        if self
+            .irp(irp_id)
+            .is_some_and(|irp| irp.has_external_retirement_owner())
+        {
             return Err(NtStatus::DELETE_PENDING);
         }
         let (driver_id, output_capacity) = {
@@ -516,7 +598,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
             let stack = irp.current_stack().ok_or(NtStatus::INVALID_PARAMETER)?;
-            let method = irp.device_control_method.ok_or(NtStatus::INVALID_PARAMETER)?;
+            let method = irp
+                .device_control_method
+                .ok_or(NtStatus::INVALID_PARAMETER)?;
             if method != nt_io_abi::ioctl::METHOD_BUFFERED {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
@@ -538,7 +622,10 @@ impl<P: ObjectManagerPort> IoManager<P> {
         offset: u64,
         output: &mut [u8],
     ) -> Result<usize, NtStatus> {
-        if self.irp(irp_id).is_some_and(|irp| irp.has_external_retirement_owner()) {
+        if self
+            .irp(irp_id)
+            .is_some_and(|irp| irp.has_external_retirement_owner())
+        {
             return Err(NtStatus::DELETE_PENDING);
         }
         let (driver_id, payload_len) = {
@@ -610,7 +697,10 @@ impl<P: ObjectManagerPort> IoManager<P> {
         irp_id: IrpId,
         reclaim_faulted_backend: bool,
     ) -> Result<CompletedIrp, NtStatus> {
-        if self.irp(irp_id).is_some_and(|irp| irp.has_external_retirement_owner()) {
+        if self
+            .irp(irp_id)
+            .is_some_and(|irp| irp.has_external_retirement_owner())
+        {
             return Err(NtStatus::DELETE_PENDING);
         }
         if !self.completed_irps.contains(&irp_id) {
@@ -631,9 +721,12 @@ impl<P: ObjectManagerPort> IoManager<P> {
         } else {
             self.backends[backend_index].acknowledge_completion(irp_id)?;
         }
+        let subsidiary = self
+            .irp(irp_id)
+            .is_some_and(|irp| irp.subsidiary_file_lifecycle.is_some());
         self.retire_acknowledged_completion(&completed, None)?;
         if let Some(file_id) = completed.file_id {
-            if completed.major == major::IRP_MJ_CLEANUP {
+            if completed.major == major::IRP_MJ_CLEANUP && !subsidiary {
                 if let Some(file) = self.file_mut(file_id) {
                     if file.state == crate::FileState::CleanupPending {
                         file.transition(crate::FileState::CleanupComplete);
