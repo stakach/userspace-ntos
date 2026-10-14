@@ -463,6 +463,35 @@ fn detached_pnp_completion_changed_terminal_snapshot_keeps_ack_and_payload_until
 }
 
 #[test]
+fn detached_pnp_completion_changed_result_parameters_keep_accepted_ack_until_repaired() {
+    let mut io = io();
+    let (retained, release) = pending(&mut io);
+    let id = retained.irp_id();
+    release.set(true);
+    assert_eq!(io.pump(), 1);
+    let invocation = io.prepare_external_pnp_completion(retained).unwrap();
+    let expected = io.irp(id).unwrap().current_stack().unwrap().parameters.clone();
+    let returned = invocation.invoke(|_| ExternalFileIrpAcknowledgement::Acknowledged);
+
+    // The foreign ACK has happened. A changed input extent must retain the exact ACK owner,
+    // even though the terminal scalar snapshot and device route are unchanged.
+    let irp = io.irps.get_mut(id).unwrap();
+    irp.stack[irp.current_location as usize].parameters =
+        IoParameters::Pnp(PnpParameters::start(16, 48).unwrap());
+    let rejection = io.finish_external_pnp_completion(returned).unwrap_err();
+    assert_eq!(rejection.status(), NtStatus::INVALID_PARAMETER);
+    assert_eq!(rejection.owner().payload(), &[0x63; 64]);
+    assert!(io.completed_irp(id).is_some());
+    let returned = rejection.into_owner().retry().unwrap_err();
+
+    let irp = io.irps.get_mut(id).unwrap();
+    irp.stack[irp.current_location as usize].parameters = expected;
+    let (receipt, payload) = io.finish_external_pnp_completion(returned).unwrap();
+    assert_eq!(receipt.irp_id(), id);
+    assert_eq!(payload, alloc::vec![0x63; 64]);
+}
+
+#[test]
 fn detached_pnp_completion_reservation_fences_all_legacy_competitors_before_and_during_ack() {
     let mut io = io();
     let (retained, release) = pending(&mut io);

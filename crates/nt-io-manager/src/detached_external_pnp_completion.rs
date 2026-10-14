@@ -180,6 +180,12 @@ impl<P: ObjectManagerPort> IoManager<P> {
         let completion = &invocation.completion;
         let irp = self.irp(completion.id).ok_or(NtStatus::INVALID_PARAMETER)?;
         if irp.completion_ack_reservation != Some(invocation.reservation)
+            || !irp.current_stack().is_some_and(|stack| {
+                stack.major == nt_io_abi::major::IRP_MJ_PNP
+                    && stack.minor == invocation.owner.owner.invocation.snapshot.minor
+                    && stack.parameters
+                        == invocation.owner.owner.invocation.snapshot.projection.parameters
+            })
             || !invocation
                 .reservation
                 .matches(self.ownership_identity(), completion.id)
