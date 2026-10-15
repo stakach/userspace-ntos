@@ -20,6 +20,7 @@ const ADDRESS: u64 = FSD_POOL_VADDR + PAYLOAD;
 const CAPACITY: u64 = 0x200;
 const HOSTED_DMA_ADAPTER_SIZE: u64 = 0x40;
 const HOSTED_DMA_ADAPTER_SIGNATURE_OFFSET: u64 = 0x10;
+const HOSTED_KINTERRUPT_SIZE: u64 = 0x70;
 const POOL_FREE_LIST_MAX: u64 = FSD_POOL_FRAMES * 0x1000 / 16;
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -35,6 +36,9 @@ struct DriverInstance {
     pml4: u64,
     domain: HostedDomainIdentity,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HostedDeviceBinding(u64);
 
 fn instance_domain_identity(inst: DriverInstance) -> Option<HostedDomainIdentity> {
     Some(inst.domain)
@@ -337,6 +341,88 @@ fn dma_pair_retains_exact_members_across_mutation_refusal_and_retry() {
         REFUSE_DMA_FREE.with(|refuse| refuse.set(None));
         native::drain_dma_adapter_tombstones(pool.inst).unwrap();
         assert!(native::instance_quiesced(pool.inst));
+    }
+}
+
+#[test]
+fn interrupt_projection_tombstone_blocks_stale_pointer_aba_and_retries_exact_free() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let domain = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId::new(902, 1),
+        cookie: 902,
+    };
+    let pool = Pool::new(domain, 43, 0x902000);
+    let binding = HostedDeviceBinding(17);
+    unsafe {
+        let (first, generation) = native::provision_interrupt_projection(pool.inst, binding).unwrap();
+        assert_ne!(generation, 0);
+        assert_eq!(native::provision_interrupt_projection(pool.inst, binding),
+            Ok((first, generation)), "lost PROVISION reply must reuse the exact Prepared row");
+        assert!(native::generic_free_admission(pool.inst, first).is_err());
+        let first_exec = pool.inst.exec_pool_va + first - FSD_POOL_VADDR;
+        // A plausible allocation at the same address with another physical generation cannot
+        // satisfy the retained projection identity.
+        write_volatile((first_exec - 8) as *mut u64, generation + 1);
+        assert_eq!(native::validate_interrupt_projection(pool.inst, binding, first),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
+        write_volatile((first_exec - 8) as *mut u64, generation);
+        native::mark_interrupt_projection_effect_started(pool.inst, binding, first).unwrap();
+        assert_eq!(native::provision_interrupt_projection(pool.inst, binding),
+            Err(nt_status::NtStatus::DEVICE_BUSY),
+            "an uncertain canonical effect must not replay PROVISION");
+        native::bind_interrupt_projection(pool.inst, binding, first, 77, 3).unwrap();
+        assert_eq!(native::cancel_interrupt_projection_after_proven_no_effect(
+            pool.inst, binding, first), Err(nt_status::NtStatus::INVALID_HANDLE),
+            "an installed connection cannot be canceled as absent");
+        assert_eq!(native::interrupt_projection_connection_for_retirement(pool.inst, binding, first),
+            Ok(Some((77, 3))));
+        assert_eq!(native::cancel_prepared_interrupt_projection(pool.inst, binding, first),
+            Err(nt_status::NtStatus::INVALID_HANDLE),
+            "canonical publication cannot be canceled as a definite pre-effect refusal");
+
+        // The driver-writable projection can name another pool object. Canonical retirement
+        // records only the root's captured identity and never follows that byte.
+        write_unaligned(first_exec as *mut u64, ADDRESS);
+        native::mark_interrupt_projection_canonical_retired(pool.inst, binding, first, (77, 3)).unwrap();
+        assert_eq!(native::interrupt_projection_connection_for_retirement(pool.inst, binding, first),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
+        assert!(native::generic_free_admission(pool.inst, first).is_err());
+
+        let (second, _) = native::provision_interrupt_projection(pool.inst, binding).unwrap();
+        assert_ne!(second, first, "retired pointer must not ABA into the next connection");
+        native::cancel_prepared_interrupt_projection(pool.inst, binding, second).unwrap();
+        assert!(native::generic_free_admission(pool.inst, second).is_err());
+        let (third, _) = native::provision_interrupt_projection(pool.inst, binding).unwrap();
+        assert_ne!(third, second, "definite failed CONNECT must permit a fresh retry");
+        native::mark_interrupt_projection_effect_started(pool.inst, binding, third).unwrap();
+        native::admit_interrupt_projection_canonical_retirement(
+            pool.inst, binding, third, (78, 4),
+        ).unwrap();
+        native::mark_interrupt_projection_canonical_retired(
+            pool.inst, binding, third, (78, 4),
+        ).unwrap();
+        assert!(native::generic_free_admission(pool.inst, third).is_err());
+        let (fourth, _) = native::provision_interrupt_projection(pool.inst, binding).unwrap();
+        assert_ne!(fourth, third,
+            "an installed canonical route can be reconciled after final bind refusal");
+        native::mark_interrupt_projection_effect_started(pool.inst, binding, fourth).unwrap();
+        native::cancel_interrupt_projection_after_proven_no_effect(
+            pool.inst, binding, fourth,
+        ).unwrap();
+        let (fifth, _) = native::provision_interrupt_projection(pool.inst, binding).unwrap();
+        assert_ne!(fifth, fourth,
+            "a definitively absent canonical effect permits a fresh projection");
+        native::cancel_prepared_interrupt_projection(pool.inst, binding, fifth).unwrap();
+
+        REFUSE_DMA_FREE.with(|refuse| refuse.set(Some(first)));
+        assert_eq!(native::drain_interrupt_projection_tombstones(pool.inst),
+            Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED));
+        assert!(native::generic_free_admission(pool.inst, first).is_err());
+        REFUSE_DMA_FREE.with(|refuse| refuse.set(None));
+        native::drain_interrupt_projection_tombstones(pool.inst).unwrap();
+        assert!(native::instance_quiesced(pool.inst));
+        let _pool_lock = hosted_instance_pool_lock(pool.inst.exec_pool_va).unwrap();
+        assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(pool.inst, first), Some(true));
     }
 }
 
