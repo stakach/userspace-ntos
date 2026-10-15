@@ -1,0 +1,38 @@
+{
+  "issue": 18,
+  "profile": "font-cleanup",
+  "status": "strict font cleanup failed: no exact mapped view retired after process termination",
+  "source_commit": "5c304560 plus uncommitted native worktree",
+  "microkernel_commit": "e2ea42f",
+  "build_exit": 0,
+  "boot_bound_seconds": 3600,
+  "evidence": {
+    "raw_log": ".tmp/issue18-final-font-boot.log",
+    "archived_log": "docs/evidence/issue18-final-font-boot.log.gz",
+    "screenshot": "docs/images/issue18-final-font-explorer.png"
+  },
+  "sha256": {
+    "raw_log": "3d1648cde846c7ca6d7c6d070c50adf42c99f0c77cc7f666d89fa884c12e1d64",
+    "archived_log": "9fc61c88c2608cd082210aff302e2ccba36e26dfb8f7214f142fa3a582214741",
+    "screenshot": "cd52b0605ff5d5e14ba9c10d9c4f043edeaf6bc902367738b44fb1be9c502877"
+  },
+  "related_issues": [
+    18,
+    307
+  ],
+  "boot_result": "deliberate stop after the exact font failure was established; no timeout or pass claim",
+  "strict_parser_exit": 1,
+  "observations": [
+    "Fresh font-cleanup image restored the same SHA-verified 16 MiB persistence tail.",
+    "BootExecute setup registered the Run client and exited cleanly; genuine Userinit and Explorer launched.",
+    "Real font acceptance PID652/generation24 loaded one FR_PRIVATE font, then committed exit zero and was deleted.",
+    "A 1,563,256-byte file-backed Section map was published for that exact process; no exact unmap receipt occurred before deletion.",
+    "ReactOS GDI process-exit cleanup ran; pinned win32k source retains a SharedFace creator reference, preventing SharedMem from reaching zero. Issue #307 owns the upstream binary repair."
+  ],
+  "acceptance": {
+    "private_font_execution": "passed",
+    "canonical_terminal": "passed",
+    "exact_file_backed_unmap": "failed",
+    "strict_parser": "failed"
+  }
+}

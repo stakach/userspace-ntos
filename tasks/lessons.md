@@ -653,3 +653,9 @@ diagnosis-free failure.
 ## Respect Canonical Device Binding Cardinality In Tests
 - The I/O Manager permits one hosted pointer binding per canonical device. To test a wrong
   registration, create a second device rather than binding the original device twice.
+
+## Fix Upstream Source Instead Of Patching Vendor Binaries
+- When a pinned ReactOS binary has a source-level defect, prepare an upstream source pull request
+  with the native reproduction and reference accounting. Do not alter the binary locally.
+- Keep strict acceptance failed until an official fixed build is integrated and the native fixture
+  passes. Track the upstream dependency separately from already-proven desktop acceptance.

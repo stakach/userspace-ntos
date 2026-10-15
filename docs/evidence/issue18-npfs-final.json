@@ -1,0 +1,45 @@
+{
+  "issue": 18,
+  "profile": "production",
+  "status": "Explorer desktop passed; NPFS canonical lifecycle passed",
+  "source_commit": "5c304560 plus uncommitted native worktree",
+  "microkernel_commit": "e2ea42f",
+  "build_exit": 0,
+  "boot_bound_seconds": 3600,
+  "evidence": {
+    "raw_log": ".tmp/issue18-npfs-final-boot.log",
+    "archived_log": "docs/evidence/issue18-npfs-final-boot.log.gz",
+    "screenshot": "docs/images/issue18-npfs-final-explorer.png",
+    "logon_screenshot": "docs/images/issue18-npfs-final-logon.png"
+  },
+  "sha256": {
+    "raw_log": "937011f9ca131297b2f2e5ef0c5b253a32298206a354472a38af50571406bd8e",
+    "archived_log": "11708f18c9c7f14b565d59d933f8c48f2086dfa07df6672f8d4a6be6ae95cf2e",
+    "screenshot": "0c586360148c90fa89cdf00597f6c5da53830839de2fae950b4c586275c69f85",
+    "logon_screenshot": "1b6d9de3911168262cb5e995f207ff0608f3902a91007b0a663cd653dc31642c"
+  },
+  "related_issues": [
+    1,
+    17,
+    18,
+    283,
+    300,
+    303,
+    304,
+    306
+  ],
+  "boot_result": "launcher exit 0 through production success sentinel",
+  "observations": [
+    "Fresh production image, restored exact 16 MiB accepted persistence tail before boot.",
+    "Actual Winlogon login, Userinit PI17/PID576 and Explorer PI18/PID592 launched.",
+    "Same-run Explorer chrome/taskbar paint completed: three begin/end milestones; 107 direct GDI returns; 55 batch flushes / 82 records.",
+    "Native canonical NPFS File lifecycle passed. Broader executive summary was 234/294; unrelated failing gates are not counted as #18 acceptance."
+  ],
+  "acceptance": {
+    "native_file_lifecycle": "passed",
+    "explorer_process": "passed",
+    "explorer_callbacks": "passed",
+    "explorer_chrome": "passed",
+    "same_run_screenshot": "captured"
+  }
+}

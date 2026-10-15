@@ -162,17 +162,14 @@ in `extern-rootserver` mode (bring your own root task).
 The desktop target hosts **real, unmodified GPL ReactOS binaries** on rust-micro.
 Genuine Explorer and native acceptance are tracked in
 [issue #18](https://github.com/stakach/userspace-ntos/issues/18).
-The current [issue #18 diagnostic](https://github.com/stakach/userspace-ntos/issues/18)
-has reached real ReactOS CSRSS, Winlogon, Services, setup, a 1024x768 display
-PDEV, and registry-selected keyboard and mouse class filters. Both class CONNECT
-requests and their reverse HOOK calls completed on the exact native workers.
-The next observed blocker is PnP resource-filter forwarding from each class FDO
-to the i8042 FDO; the native bridge is being integrated. The same-run frame still
-shows background and cursor only. Genuine Explorer execution, input callbacks,
-and strict private-font cleanup remain unproven. Acceptance requires a fresh
-production Userinit/Explorer boot with real callbacks, GDI drawing, logs and a
-screenshot, plus strict native private-font cleanup. Crate CI and native builds
-do not prove desktop boot. To attempt a boot from a fresh clone:
+A production boot has executed the real ReactOS Winlogon, Userinit and Explorer,
+delivered keyboard input through the native class stack, and painted Explorer's
+taskbar and Start button. The issue records the fresh boot log and screenshot.
+The separate `font-cleanup` profile checks private font and Section-view
+retirement at process exit; it currently exposes a pinned ReactOS font-reference
+leak tracked in [issue #307](https://github.com/stakach/userspace-ntos/issues/307).
+Native build and crate tests alone do not prove
+desktop execution. To build and boot from a fresh clone:
 
 ```sh
 git clone --recursive https://github.com/stakach/userspace-ntos.git
