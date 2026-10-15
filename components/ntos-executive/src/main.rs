@@ -19507,21 +19507,23 @@ unsafe fn prepare_boot_system_hive_image() -> Result<BootSystemImageReport, Boot
         writable_fs::restore_boot_system_persistence().map_err(BootSystemImageError::Restore)?;
     let mut snapshot_generation = 0;
     let mut snapshot_bytes = 0;
-    let (primary, log) = match persistence {
-        writable_fs::BootSystemPersistence::Absent => (None, Vec::new()),
+    let (primary, log, wal_suffix) = match &persistence {
+        writable_fs::BootSystemPersistence::Absent => (None, &[][..], None),
         writable_fs::BootSystemPersistence::Restored(restored) => {
             snapshot_generation = restored.snapshot_generation;
             snapshot_bytes = restored.snapshot_bytes as u64;
-            (restored.primary, restored.log)
+            (restored.primary.as_deref(), restored.log.as_slice(), restored.wal_suffix)
         }
     };
     let installed = system_hive_regf();
-    let composed = nt_hive_regf::compose_boot_system_hive(
-        installed.as_ref(),
-        primary.as_deref(),
-        &log,
-        generated,
-    )
+    let composed = match wal_suffix {
+        Some(suffix) => nt_hive_regf::compose_boot_system_hive_with_wal_suffix(
+            installed.as_ref(), primary, log, generated, suffix,
+        ),
+        None => nt_hive_regf::compose_boot_system_hive(
+            installed.as_ref(), primary, log, generated,
+        ),
+    }
     .map_err(BootSystemImageError::Compose)?;
     let selected_control_set = composed
         .hive
@@ -19531,6 +19533,9 @@ unsafe fn prepare_boot_system_hive_image() -> Result<BootSystemImageReport, Boot
     let image =
         nt_hive_core::try_encode_image(&composed.hive).map_err(BootSystemImageError::Encode)?;
     let image_bytes = image.len() as u64;
+    if let writable_fs::BootSystemPersistence::Restored(restored) = persistence {
+        restored.publish().map_err(BootSystemImageError::Restore)?;
+    }
     *core::ptr::addr_of_mut!(BOOT_SYSTEM_HIVE_IMAGE) = Some(image);
     Ok(BootSystemImageReport {
         origin: composed.origin,

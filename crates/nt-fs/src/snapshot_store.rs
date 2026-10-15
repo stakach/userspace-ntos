@@ -240,6 +240,49 @@ pub struct StoredSnapshotMetadata {
     pub format: SnapshotReadFormat,
 }
 
+fn verify_recovered_wal_anchor<D: SnapshotBlockDevice>(
+    selected_base_serial: u64,
+    anchor: WalSnapshotAnchor,
+    wal: &crate::RegistryWal<D>,
+) -> Result<(), SnapshotBlockStoreError> {
+    let Some((incarnation, recovered_serial, _)) = wal.verified_prefix() else {
+        return Err(SnapshotBlockStoreError::Corrupt);
+    };
+    if incarnation != anchor.incarnation
+        || recovered_serial < anchor.serial
+        || wal.verified_record_end_lba(anchor.serial) != Some(anchor.end_lba)
+        || recovered_serial < selected_base_serial
+    {
+        return Err(SnapshotBlockStoreError::Corrupt);
+    }
+    Ok(())
+}
+
+fn verified_boot_system_log_suffix<D: SnapshotBlockDevice>(
+    selected_base_serial: u64,
+    anchor: WalSnapshotAnchor,
+    snapshot_log: &[u8],
+    wal: &crate::RegistryWal<D>,
+) -> Result<Vec<u8>, SnapshotBlockStoreError> {
+    verify_recovered_wal_anchor(selected_base_serial, anchor, wal)?;
+    let base = usize::try_from(selected_base_serial).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
+    let suffix = wal.records().get(base..).ok_or(SnapshotBlockStoreError::Corrupt)?;
+    let total = suffix
+        .iter()
+        .try_fold(snapshot_log.len(), |length, record| {
+            length.checked_add(record.payload.len())
+        })
+        .ok_or(SnapshotBlockStoreError::Corrupt)?;
+    let mut log = Vec::new();
+    log.try_reserve_exact(total)
+        .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
+    log.extend_from_slice(snapshot_log);
+    for record in suffix {
+        log.extend_from_slice(&record.payload);
+    }
+    Ok(log)
+}
+
 impl StoredWalSnapshot {
     /// Reject a WAL whose recovered committed prefix is shorter than either snapshot's
     /// acknowledged high-water. Later marked records may represent a pre-reply crash.
@@ -247,49 +290,31 @@ impl StoredWalSnapshot {
         &self,
         wal: &crate::RegistryWal<D>,
     ) -> Result<(), SnapshotBlockStoreError> {
-        let Some((incarnation, recovered_serial, _)) = wal.verified_prefix() else {
-            return Err(SnapshotBlockStoreError::Corrupt);
-        };
-        if incarnation != self.anchor.incarnation
-            || recovered_serial < self.anchor.serial
-            || wal.verified_record_end_lba(self.anchor.serial) != Some(self.anchor.end_lba)
-            || recovered_serial < self.selected_base_serial
-        {
-            return Err(SnapshotBlockStoreError::Corrupt);
-        }
-        Ok(())
+        verify_recovered_wal_anchor(self.selected_base_serial, self.anchor, wal)
     }
 
     /// Assemble the exact SYSTEM sidecar log to replay before CM imports the boot hive.
-    /// The selected snapshot already contains records through `selected_base_serial`;
-    /// appending them again could apply a mutation twice. The anchor check also rejects
-    /// a lost committed suffix before any WAL payload is exposed to the hive decoder.
     pub fn verified_boot_system_log<D: SnapshotBlockDevice>(
         &self,
         snapshot_log: &[u8],
         wal: &crate::RegistryWal<D>,
     ) -> Result<Vec<u8>, SnapshotBlockStoreError> {
-        self.verify_recovered_wal(wal)?;
-        let base = usize::try_from(self.selected_base_serial)
-            .map_err(|_| SnapshotBlockStoreError::Corrupt)?;
-        let suffix = wal
-            .records()
-            .get(base..)
-            .ok_or(SnapshotBlockStoreError::Corrupt)?;
-        let total = suffix
-            .iter()
-            .try_fold(snapshot_log.len(), |length, record| {
-                length.checked_add(record.payload.len())
-            })
-            .ok_or(SnapshotBlockStoreError::Corrupt)?;
-        let mut log = Vec::new();
-        log.try_reserve_exact(total)
-            .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
-        log.extend_from_slice(snapshot_log);
-        for record in suffix {
-            log.extend_from_slice(&record.payload);
-        }
-        Ok(log)
+        verified_boot_system_log_suffix(self.selected_base_serial, self.anchor, snapshot_log, wal)
+    }
+}
+
+impl StoredSnapshotMetadata {
+    /// Verify the selected streamed snapshot's WAL floor and return its exact unapplied SYSTEM
+    /// journal suffix. A legacy snapshot has no WAL anchor and cannot use this path.
+    pub fn verified_boot_system_log<D: SnapshotBlockDevice>(
+        &self,
+        snapshot_log: &[u8],
+        wal: &crate::RegistryWal<D>,
+    ) -> Result<Vec<u8>, SnapshotBlockStoreError> {
+        let SnapshotReadFormat::Wal { selected_base_serial, anchor } = self.format else {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        };
+        verified_boot_system_log_suffix(selected_base_serial, anchor, snapshot_log, wal)
     }
 }
 

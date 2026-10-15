@@ -1,5 +1,8 @@
 use super::registry_wal::{encode_record, scan_records, WalError};
-use super::{encode_log_record, try_replay_log, Hive, HiveKind, HiveLogOp};
+use super::{
+    complete_log_sequence_span, complete_log_sequence_span_from, encode_log_record,
+    try_replay_log, try_replay_log_complete, Hive, HiveKind, HiveLogOp,
+};
 
 #[test]
 fn complete_records_scan_only_in_exact_mount_generation_order() {
@@ -22,6 +25,50 @@ fn verified_wal_payload_composes_with_existing_hive_log_replay() {
     let mut hive = Hive::new(HiveKind::System);
     assert_eq!(try_replay_log(&mut hive, scan.records[0].payload, 0), Ok(1));
     assert!(hive.open_key("Recovered").is_some());
+}
+
+#[test]
+fn committed_wal_frame_cannot_hide_a_truncated_hive_log_mutation() {
+    let semantic = encode_log_record(&HiveLogOp::CreateKey { path: "Recovered" }, 1);
+    let envelope = encode_record(7, 10, &semantic[..semantic.len() - 1]).unwrap();
+    let scan = scan_records(&envelope, 7, 10).unwrap();
+    assert_eq!(scan.records.len(), 1, "the WAL frame and checksum are durable and valid");
+    assert_eq!(
+        complete_log_sequence_span(scan.records[0].payload),
+        Err(super::HiveLogReplayError::Truncated),
+    );
+    let mut hive = Hive::new(HiveKind::System);
+    assert_eq!(
+        try_replay_log_complete(&mut hive, scan.records[0].payload, 0),
+        Err(super::HiveLogReplayError::Truncated),
+    );
+    assert!(hive.open_key("Recovered").is_none());
+}
+
+#[test]
+fn committed_wal_payloads_require_contiguous_semantic_sequences() {
+    let first = encode_log_record(&HiveLogOp::CreateKey { path: "First" }, 11);
+    let skipped = encode_log_record(&HiveLogOp::CreateKey { path: "Skipped" }, 13);
+    let mut one_payload = first.clone();
+    one_payload.extend_from_slice(&skipped);
+    assert_eq!(
+        complete_log_sequence_span_from(&one_payload, 10),
+        Err(super::HiveLogReplayError::SequenceGap),
+        "a complete WAL frame cannot omit a semantic mutation inside its payload",
+    );
+    assert_eq!(complete_log_sequence_span_from(&first, 10), Ok((11, 11)));
+    assert_eq!(
+        complete_log_sequence_span_from(&skipped, 11),
+        Err(super::HiveLogReplayError::SequenceGap),
+        "separate committed WAL frames must also have adjacent semantic sequences",
+    );
+    let envelope = encode_record(7, 10, &skipped).unwrap();
+    let scan = scan_records(&envelope, 7, 10).unwrap();
+    assert_eq!(scan.records.len(), 1);
+    assert_eq!(
+        try_replay_log_complete(&mut Hive::new(HiveKind::System), scan.records[0].payload, 10),
+        Err(super::HiveLogReplayError::SequenceGap),
+    );
 }
 
 #[test]

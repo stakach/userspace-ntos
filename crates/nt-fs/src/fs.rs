@@ -3986,6 +3986,19 @@ impl FileSystem {
         }
     }
 
+    /// Decode the selected snapshot and return its paired format metadata under one read lease.
+    /// A WAL-bearing image remains private until its anchored suffix is recovered and replayed.
+    pub fn restore_volume_snapshot_with_metadata_from_store<D: SnapshotBlockDevice>(
+        store: &SnapshotBlockStore,
+        dev: &mut D,
+    ) -> Result<Option<(Self, StoredSnapshotMetadata)>, SnapshotBlockStoreError> {
+        store
+            .read_latest_streaming_with_metadata(dev, |reader| {
+                Ok(Self::new(MemFs::from_snapshot_reader(reader)?))
+            })
+            .map(|restored| restored.map(|(metadata, fs)| (fs, metadata)))
+    }
+
     /// Decode a snapshot before the native caller can replay WAL records. A v2 image is
     /// returned only after both slots prove the same empty WAL baseline; later v2 states
     /// require the WAL-aware boot path and may not be published from snapshot bytes alone.

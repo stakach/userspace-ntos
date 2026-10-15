@@ -410,10 +410,24 @@ static WRITABLE_FS_MOUNT_DIRTY: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_RUNTIME_DIRTY: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_SNAPSHOT_DIRTY: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED: AtomicBool = AtomicBool::new(false);
+/// The mounted filesystem's durable snapshot format, recorded before it is published.
+/// Current native checkpoint and CM journal writers are v1-only.
+static WRITABLE_FS_MOUNTED_WAL_FORMAT: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_SNAPSHOT_RESTORE_STATE: AtomicU64 = AtomicU64::new(0);
 const SNAPSHOT_RESTORE_UNREAD: u64 = 0;
 const SNAPSHOT_RESTORE_EMPTY: u64 = 1;
 const SNAPSHOT_RESTORE_CONSUMED: u64 = 2;
+
+fn legacy_snapshot_writes_allowed() -> bool {
+    !WRITABLE_FS_MOUNTED_WAL_FORMAT.load(Ordering::Acquire)
+}
+
+fn note_mounted_snapshot_format(format: nt_fs::SnapshotReadFormat) {
+    WRITABLE_FS_MOUNTED_WAL_FORMAT.store(
+        matches!(format, nt_fs::SnapshotReadFormat::Wal { .. }),
+        Ordering::Release,
+    );
+}
 
 pub(crate) static WRITABLE_FS_SNAPSHOT_RESTORES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_SNAPSHOT_RESTORE_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -545,13 +559,13 @@ fn print_snapshot_store_error(err: nt_fs::SnapshotBlockStoreError) {
 
 unsafe fn restore_snapshot_volume(
     dev: &mut snapshot_storage::Lease,
-) -> Result<Option<(nt_fs::FileSystem, u64, usize)>, u32> {
+) -> Result<Option<(nt_fs::FileSystem, nt_fs::StoredSnapshotMetadata)>, u32> {
     let store = dev.store();
     // A WAL-bearing snapshot cannot be published until its committed suffix has been
     // authenticated and replayed. The current native writer still uses legacy snapshots;
     // the pre-replay reader also admits a complete, empty-WAL v2 baseline.
     match nt_fs::FileSystem::restore_volume_snapshot_before_wal_replay_from_store(&store, dev) {
-        Ok(Some((fs, metadata))) => Ok(Some((fs, metadata.generation, metadata.payload_len))),
+        Ok(Some((fs, metadata))) => Ok(Some((fs, metadata))),
         Ok(None) => {
             WRITABLE_FS_SNAPSHOT_EMPTY_MOUNTS.fetch_add(1, Ordering::Relaxed);
             print_str(b"[writable-fs-snapshot] no stored snapshot in reserve sectors=");
@@ -569,7 +583,8 @@ unsafe fn restore_snapshot_volume(
     }
 }
 
-unsafe fn restore_snapshot_volume_once() -> Result<Option<(nt_fs::FileSystem, u64, usize)>, u32> {
+unsafe fn restore_snapshot_volume_once(
+) -> Result<Option<(nt_fs::FileSystem, nt_fs::StoredSnapshotMetadata)>, u32> {
     let mut dev = snapshot_storage::acquire()?;
     match WRITABLE_FS_SNAPSHOT_RESTORE_STATE.load(Ordering::Acquire) {
         SNAPSHOT_RESTORE_EMPTY => return Ok(None),
@@ -585,6 +600,38 @@ unsafe fn restore_snapshot_volume_once() -> Result<Option<(nt_fs::FileSystem, u6
         );
     }
     result
+}
+
+/// Return the decoded boot volume with the exact reserve lease that selected its metadata.
+/// The caller owns that lease through WAL recovery and CM import.
+unsafe fn restore_boot_snapshot_volume_once(
+) -> Result<Option<(nt_fs::FileSystem, nt_fs::StoredSnapshotMetadata, snapshot_storage::Lease)>, u32> {
+    let mut dev = snapshot_storage::acquire()?;
+    match WRITABLE_FS_SNAPSHOT_RESTORE_STATE.load(Ordering::Acquire) {
+        SNAPSHOT_RESTORE_EMPTY => return Ok(None),
+        SNAPSHOT_RESTORE_UNREAD => {}
+        _ => return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST),
+    }
+    let store = dev.store();
+    let restored = nt_fs::FileSystem::restore_volume_snapshot_with_metadata_from_store(&store, &mut dev)
+        .map_err(|error| {
+            WRITABLE_FS_SNAPSHOT_FAILURES.fetch_add(1, Ordering::Relaxed);
+            print_str(b"[writable-fs-snapshot] boot restore failed err=");
+            print_snapshot_store_error(error);
+            print_str(b"\n");
+            snapshot_store_error_status(error)
+        })?;
+    WRITABLE_FS_SNAPSHOT_RESTORE_STATE.store(
+        if restored.is_some() { SNAPSHOT_RESTORE_CONSUMED } else { SNAPSHOT_RESTORE_EMPTY },
+        Ordering::Release,
+    );
+    if restored.is_none() {
+        WRITABLE_FS_SNAPSHOT_EMPTY_MOUNTS.fetch_add(1, Ordering::Relaxed);
+        print_str(b"[writable-fs-snapshot] no stored snapshot in reserve sectors=");
+        print_u64(dev.sector_count());
+        print_str(b"\n");
+    }
+    Ok(restored.map(|(fs, metadata)| (fs, metadata, dev)))
 }
 
 unsafe fn snapshot_reserve_available() -> bool {
@@ -657,6 +704,9 @@ unsafe fn checkpoint_volume_snapshot(dev: &mut snapshot_storage::Lease) -> Resul
 /// Commit pending volume bytes. `Ok(true)` means a new durable snapshot was published, while
 /// `Ok(false)` means the volume was already clean.
 pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
+    if !legacy_snapshot_writes_allowed() {
+        return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+    }
     // Even a clean observation needs exclusion: another owner may have cleared the bit but not
     // yet finished its barrier. Refusal cannot consume dirty state or authorize caller completion.
     let mut dev = snapshot_storage::acquire()?;
@@ -936,8 +986,9 @@ unsafe fn writable_fs() -> Result<&'static mut nt_fs::FileSystem, u32> {
     }
     if (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_none() {
         let (fs, restored) = match restore_snapshot_volume_once() {
-            Ok(Some((fs, generation, bytes))) => {
-                note_restored_snapshot(generation, bytes, fs.node_count());
+            Ok(Some((fs, metadata))) => {
+                note_restored_snapshot(metadata.generation, metadata.payload_len, fs.node_count());
+                note_mounted_snapshot_format(metadata.format);
                 (fs, true)
             }
             Ok(None) => (nt_fs::FileSystem::new(nt_fs::MemFs::new()), false),
@@ -1002,6 +1053,33 @@ pub(crate) struct RestoredBootSystem {
     pub(crate) snapshot_bytes: usize,
     pub(crate) primary: Option<alloc::vec::Vec<u8>>,
     pub(crate) log: alloc::vec::Vec<u8>,
+    pub(crate) wal_suffix: Option<nt_hive_regf::BootSystemWalSuffix>,
+    fs: Option<nt_fs::FileSystem>,
+    format: nt_fs::SnapshotReadFormat,
+    _lease: snapshot_storage::Lease,
+}
+
+impl RestoredBootSystem {
+    /// Publish only after the caller has semantically composed and encoded the CM hive.
+    pub(crate) unsafe fn publish(mut self) -> Result<(), BootSystemRestoreError> {
+        let fs = self.fs.take().expect("unpublished boot filesystem");
+        let nodes = fs.node_count();
+        note_mounted_snapshot_format(self.format);
+        if install_writable_fs(fs, true).is_err() {
+            WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+            return Err(BootSystemRestoreError::MountBlocked);
+        }
+        note_restored_snapshot(self.snapshot_generation, self.snapshot_bytes, nodes);
+        Ok(())
+    }
+}
+
+impl Drop for RestoredBootSystem {
+    fn drop(&mut self) {
+        if self.fs.is_some() {
+            WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1010,6 +1088,8 @@ pub(crate) enum BootSystemRestoreError {
     MountBlocked,
     GeometryUnavailable,
     Snapshot(u32),
+    Wal(nt_fs::RegistryWalError),
+    WalSemantic(nt_hive_core::HiveLogReplayError),
     SystemStateMissing,
     PrimaryRead,
     LogRead,
@@ -1021,6 +1101,62 @@ fn owned_file_before_publish(
     read_error: BootSystemRestoreError,
 ) -> Result<Option<alloc::vec::Vec<u8>>, BootSystemRestoreError> {
     fs.try_file_bytes_owned(path).map_err(|_| read_error)
+}
+
+fn verified_boot_log(
+    metadata: nt_fs::StoredSnapshotMetadata,
+    log: alloc::vec::Vec<u8>,
+    lease: snapshot_storage::Lease,
+) -> Result<(alloc::vec::Vec<u8>, Option<nt_hive_regf::BootSystemWalSuffix>, snapshot_storage::Lease), BootSystemRestoreError> {
+    let nt_fs::SnapshotReadFormat::Wal { anchor, selected_base_serial } = metadata.format else {
+        return Ok((log, None, lease));
+    };
+    let range = snapshot_storage::owned_wal_region(lease)
+        .map_err(|(status, _lease)| BootSystemRestoreError::Snapshot(status))?;
+    let mut wal = nt_fs::RegistryWal::recover(range, anchor.incarnation)
+        .map_err(BootSystemRestoreError::Wal)?;
+    if wal.state() == nt_fs::RegistryWalState::RecoveredUncommitted {
+        if let Err(error) = wal.clear_recovered_tail() {
+            // A failed clearing barrier owns an uncertain physical effect. Retain its exact
+            // lease so no later mount or writer can reuse this reserve in the same boot.
+            core::mem::forget(wal);
+            return Err(BootSystemRestoreError::Wal(error));
+        }
+    }
+    let verified_log = metadata
+        .verified_boot_system_log(&log, &wal)
+        .map_err(|error| BootSystemRestoreError::Snapshot(snapshot_store_error_status(error)))?;
+    let base = usize::try_from(selected_base_serial)
+        .map_err(|_| BootSystemRestoreError::Snapshot(snapshot_store_error_status(nt_fs::SnapshotBlockStoreError::Corrupt)))?;
+    let suffix = wal.records().get(base..)
+        .ok_or(BootSystemRestoreError::Snapshot(snapshot_store_error_status(nt_fs::SnapshotBlockStoreError::Corrupt)))?;
+    let mut first_sequence = None;
+    let mut last_sequence = None;
+    for record in suffix {
+        let span = if let Some(previous) = last_sequence {
+            nt_hive_core::complete_log_sequence_span_from(&record.payload, previous)
+        } else {
+            nt_hive_core::complete_log_sequence_span(&record.payload)
+        };
+        let (first, last) = span.map_err(BootSystemRestoreError::WalSemantic)?;
+        first_sequence.get_or_insert(first);
+        last_sequence = Some(last);
+    }
+    let wal_suffix = first_sequence.zip(last_sequence).map(|(first_sequence, last_sequence)| {
+        nt_hive_regf::BootSystemWalSuffix {
+            snapshot_log_len: log.len(),
+            first_sequence,
+            last_sequence,
+        }
+    });
+    let lease = match wal.into_device() {
+        Ok(range) => range.into_device(),
+        Err(wal) => {
+            core::mem::forget(wal);
+            return Err(BootSystemRestoreError::Wal(nt_fs::RegistryWalError::InvalidState));
+        }
+    };
+    Ok((verified_log, wal_suffix, lease))
 }
 
 /// Restore and classify persisted SYSTEM state before publishing or provisioning the writable FS.
@@ -1047,27 +1183,29 @@ pub(crate) unsafe fn restore_boot_system_persistence(
     if !snapshot_reserve_available() {
         return Err(BootSystemRestoreError::GeometryUnavailable);
     }
-    let result = (|| match restore_snapshot_volume_once() {
-        Ok(Some((fs, generation, bytes))) => {
+    let result = (|| match restore_boot_snapshot_volume_once() {
+        Ok(Some((fs, metadata, lease))) => {
             let primary = owned_file_before_publish(
                 &fs,
                 CONFIG_SYSTEM_HIVE_PATH,
                 BootSystemRestoreError::PrimaryRead,
             )?;
             let log_path = alloc::format!("{}.LOG", CONFIG_SYSTEM_HIVE_PATH);
-            let log = owned_file_before_publish(&fs, &log_path, BootSystemRestoreError::LogRead)?
+            let snapshot_log = owned_file_before_publish(&fs, &log_path, BootSystemRestoreError::LogRead)?
                 .unwrap_or_default();
+            let (log, wal_suffix, lease) = verified_boot_log(metadata, snapshot_log, lease)?;
             if primary.is_none() && log.is_empty() {
                 return Err(BootSystemRestoreError::SystemStateMissing);
             }
-            let nodes = fs.node_count();
-            note_restored_snapshot(generation, bytes, nodes);
-            install_writable_fs(fs, true).map_err(|_| BootSystemRestoreError::MountBlocked)?;
             Ok(BootSystemPersistence::Restored(RestoredBootSystem {
-                snapshot_generation: generation,
-                snapshot_bytes: bytes,
+                snapshot_generation: metadata.generation,
+                snapshot_bytes: metadata.payload_len,
                 primary,
                 log,
+                wal_suffix,
+                fs: Some(fs),
+                format: metadata.format,
+                _lease: lease,
             }))
         }
         Ok(None) => Ok(BootSystemPersistence::Absent),

@@ -12,13 +12,67 @@ fn native_registry_mount_requires_wal_replay_admission() {
         + start;
     let restore = &source[start..end];
     assert!(
-        restore.contains("restore_volume_snapshot_before_wal_replay_from_store"),
-        "native boot must reject an advanced WAL snapshot until replay is owned"
+        restore.contains("restore_volume_snapshot_before_wal_replay_from_store")
+            || source.contains("verified_boot_system_log("),
+        "native boot must refuse an advanced WAL snapshot until its suffix is verified"
     );
     assert!(
         !restore.contains("restore_volume_snapshot_from_store("),
         "the format-blind reader could publish a snapshot without its committed WAL suffix"
     );
+}
+
+#[test]
+fn native_boot_verifies_wal_suffix_before_publishing_volume_for_cm_import() {
+    let source = include_str!("../../../components/ntos-executive/src/writable_fs.rs");
+    let fs_source = include_str!("../../nt-fs/src/fs.rs");
+    assert!(
+        fs_source.contains("read_latest_streaming_with_metadata(dev,"),
+        "boot must decode the selected payload and WAL metadata under one snapshot lease"
+    );
+    let boot = &source[source.find("fn verified_boot_log(").unwrap()
+        ..source.find("\n/// Whether the volume has been mounted").unwrap()];
+    assert!(
+        boot.contains("RegistryWal::recover("),
+        "boot must parse the disjoint WAL before publishing persisted SYSTEM state"
+    );
+    assert!(boot.contains("verified_boot_system_log(&log, &wal)"));
+    assert!(
+        boot.contains("complete_log_sequence_span(&record.payload)"),
+        "each committed WAL payload must contain complete semantic log records"
+    );
+    assert!(boot.contains("fs: Some(fs)"), "boot must retain the unpublished volume");
+
+    let main = include_str!("../../../components/ntos-executive/src/main.rs");
+    let prepare = &main[main.find("unsafe fn prepare_boot_system_hive_image()").unwrap()..];
+    let restore = prepare.find("restore_boot_system_persistence(").unwrap();
+    let import = prepare.find("compose_boot_system_hive(").unwrap();
+    let wal_import = prepare.find("compose_boot_system_hive_with_wal_suffix(").unwrap();
+    let publish = prepare.find("restored.publish()").unwrap();
+    assert!(restore < import, "CM import must consume the verified boot log");
+    assert!(wal_import < publish, "strict WAL replay must precede writable mount publication");
+    assert!(import < publish, "CM semantic replay must precede writable mount publication");
+}
+
+#[test]
+fn mounted_v2_volume_refuses_legacy_checkpoint_writers_before_effects() {
+    let writable = include_str!("../../../components/ntos-executive/src/writable_fs.rs");
+    let checkpoint = &writable[writable.find("pub(crate) unsafe fn checkpoint_dirty_volume()").unwrap()
+        ..writable.find("\n/// Reclaim immutable blob payloads").unwrap()];
+    let format_guard = checkpoint
+        .find("legacy_snapshot_writes_allowed()")
+        .expect("generic v1 checkpoint must guard mounted v2 format");
+    let clear_dirty = checkpoint.find("WRITABLE_FS_SNAPSHOT_DIRTY.swap(false").unwrap();
+    assert!(format_guard < clear_dirty, "v2 refusal must preserve dirty state");
+
+    let journal = include_str!("../../../components/ntos-executive/src/writable_fs/registry_journal.rs");
+    let admission = &journal[journal.find("pub(crate) unsafe fn admit(").unwrap()
+        ..journal.find("\n    pub(crate) fn context(").unwrap()];
+    let format_guard = admission
+        .find("legacy_snapshot_writes_allowed()")
+        .expect("CM v1 journal admission must guard mounted v2 format");
+    let effect = admission.find("snapshot_storage::acquire()").unwrap();
+    assert!(format_guard < effect, "v2 refusal must precede storage or file effects");
 }
 
 #[test]

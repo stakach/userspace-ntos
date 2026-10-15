@@ -1084,6 +1084,14 @@ pub struct ComposedBootSystemHive {
     pub replayed_sequence: u64,
 }
 
+/// Sequence proof for complete, individually checked WAL payloads appended to SYSTEM.LOG.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BootSystemWalSuffix {
+    pub snapshot_log_len: usize,
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+}
+
 /// Construct the one boot SYSTEM authority from persistence, installed media, and setup overlay.
 ///
 /// Installed REGF is the first-boot base and the baseline for a valid journal-only checkpoint. A
@@ -1094,6 +1102,41 @@ pub fn compose_boot_system_hive(
     persisted_primary: Option<&[u8]>,
     persisted_log: &[u8],
     generated_overlay_image: &[u8],
+) -> Result<ComposedBootSystemHive, BootSystemHiveComposeError> {
+    compose_boot_system_hive_inner(
+        installed,
+        persisted_primary,
+        persisted_log,
+        generated_overlay_image,
+        None,
+    )
+}
+
+/// Compose a recovered WAL suffix only if every acknowledged semantic sequence is applied.
+/// Snapshot LOG retains its torn-tail recovery behavior; the separately committed WAL suffix
+/// must be complete and advance the snapshot's replayed sequence.
+pub fn compose_boot_system_hive_with_wal_suffix(
+    installed: Option<&RegfHive<'_>>,
+    persisted_primary: Option<&[u8]>,
+    persisted_log: &[u8],
+    generated_overlay_image: &[u8],
+    suffix: BootSystemWalSuffix,
+) -> Result<ComposedBootSystemHive, BootSystemHiveComposeError> {
+    compose_boot_system_hive_inner(
+        installed,
+        persisted_primary,
+        persisted_log,
+        generated_overlay_image,
+        Some(suffix),
+    )
+}
+
+fn compose_boot_system_hive_inner(
+    installed: Option<&RegfHive<'_>>,
+    persisted_primary: Option<&[u8]>,
+    persisted_log: &[u8],
+    generated_overlay_image: &[u8],
+    wal_suffix: Option<BootSystemWalSuffix>,
 ) -> Result<ComposedBootSystemHive, BootSystemHiveComposeError> {
     let (mut base, origin) = match persisted_primary {
         Some(bytes) if bytes.starts_with(&nt_hive_core::HIVE_IMAGE_MAGIC) => (
@@ -1122,8 +1165,41 @@ pub fn compose_boot_system_hive(
         }
     };
     let base_sequence = base.sequence;
-    let replayed_sequence = nt_hive_core::try_replay_log(&mut base, persisted_log, base_sequence)
-        .map_err(BootSystemHiveComposeError::PersistedLog)?;
+    let replayed_sequence = if let Some(suffix) = wal_suffix {
+        let snapshot_log = persisted_log
+            .get(..suffix.snapshot_log_len)
+            .ok_or(BootSystemHiveComposeError::PersistedLog(
+                nt_hive_core::HiveLogReplayError::Truncated,
+            ))?;
+        let wal_log = persisted_log
+            .get(suffix.snapshot_log_len..)
+            .ok_or(BootSystemHiveComposeError::PersistedLog(
+                nt_hive_core::HiveLogReplayError::Truncated,
+            ))?;
+        let snapshot_sequence = nt_hive_core::try_replay_log(&mut base, snapshot_log, base_sequence)
+            .map_err(BootSystemHiveComposeError::PersistedLog)?;
+        if suffix.first_sequence <= snapshot_sequence {
+            return Err(BootSystemHiveComposeError::PersistedLog(
+                nt_hive_core::HiveLogReplayError::NonAdvancingSequence,
+            ));
+        }
+        if snapshot_sequence.checked_add(1) != Some(suffix.first_sequence) {
+            return Err(BootSystemHiveComposeError::PersistedLog(
+                nt_hive_core::HiveLogReplayError::SequenceGap,
+            ));
+        }
+        let last = nt_hive_core::try_replay_log_complete(&mut base, wal_log, snapshot_sequence)
+            .map_err(BootSystemHiveComposeError::PersistedLog)?;
+        if last != suffix.last_sequence {
+            return Err(BootSystemHiveComposeError::PersistedLog(
+                nt_hive_core::HiveLogReplayError::NonAdvancingSequence,
+            ));
+        }
+        last
+    } else {
+        nt_hive_core::try_replay_log(&mut base, persisted_log, base_sequence)
+            .map_err(BootSystemHiveComposeError::PersistedLog)?
+    };
     let generated = nt_hive_core::decode_image(generated_overlay_image)
         .map_err(BootSystemHiveComposeError::GeneratedOverlay)?;
     let hive = nt_hive_core::compose_system_hive_overlay_secured(&base, &generated)
@@ -2422,6 +2498,73 @@ mod tests {
             .open_key(r"ControlSet001\Services\GeneratedDriver")
             .is_none());
         assert_eq!(composed.hive.dirty_count(), 0);
+    }
+
+    #[test]
+    fn boot_system_wal_suffix_requires_complete_advancing_semantic_replay() {
+        let (installed_bytes, _) = secured_services_test_hive();
+        let installed = RegfHive::new(&installed_bytes).expect("installed REGF");
+        let record = nt_hive_core::encode_log_record(
+            &nt_hive_core::HiveLogOp::SetValue {
+                path: r"ControlSet001\Services\Npfs",
+                name: "Recovered",
+                value_type: RegistryValueType::Dword,
+                data: &7u32.to_le_bytes(),
+            },
+            1,
+        );
+        let proof = BootSystemWalSuffix {
+            snapshot_log_len: 0,
+            first_sequence: 1,
+            last_sequence: 1,
+        };
+        let generated = generated_overlay_image();
+        assert!(matches!(
+            compose_boot_system_hive_with_wal_suffix(
+                Some(&installed), None, &record[..record.len() - 1], &generated, proof,
+            ),
+            Err(BootSystemHiveComposeError::PersistedLog(
+                nt_hive_core::HiveLogReplayError::Truncated
+            ))
+        ));
+        let composed = compose_boot_system_hive_with_wal_suffix(
+            Some(&installed), None, &record, &generated, proof,
+        )
+        .expect("complete committed WAL mutation");
+        assert_eq!(composed.replayed_sequence, 1);
+        let key = composed.hive.open_key(r"ControlSet001\Services\Npfs").unwrap();
+        assert_eq!(composed.hive.query_dword(key, "Recovered"), Some(7));
+        assert!(matches!(
+            compose_boot_system_hive_with_wal_suffix(
+                Some(&installed), None, &record, &generated,
+                BootSystemWalSuffix { first_sequence: 0, ..proof },
+            ),
+            Err(BootSystemHiveComposeError::PersistedLog(
+                nt_hive_core::HiveLogReplayError::NonAdvancingSequence
+            ))
+        ));
+        let skipped = nt_hive_core::encode_log_record(
+            &nt_hive_core::HiveLogOp::SetValue {
+                path: r"ControlSet001\Services\Npfs",
+                name: "Skipped",
+                value_type: RegistryValueType::Dword,
+                data: &9u32.to_le_bytes(),
+            },
+            2,
+        );
+        assert!(matches!(
+            compose_boot_system_hive_with_wal_suffix(
+                Some(&installed), None, &skipped, &generated,
+                BootSystemWalSuffix {
+                    first_sequence: 2,
+                    last_sequence: 2,
+                    ..proof
+                },
+            ),
+            Err(BootSystemHiveComposeError::PersistedLog(
+                nt_hive_core::HiveLogReplayError::SequenceGap
+            ))
+        ));
     }
 
     #[test]

@@ -275,6 +275,76 @@ fn boot_system_log_refuses_erased_anchored_suffix() {
 }
 
 #[test]
+fn streamed_boot_snapshot_metadata_replays_only_verified_wal_suffix() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::new();
+    let manifest = WalSnapshotManifest {
+        incarnation: 77,
+        base_serial: 1,
+        high_water_serial: 2,
+        high_water_end_lba: 6,
+    };
+    store
+        .commit_next_with_wal_manifest(&mut disk, b"older", manifest)
+        .unwrap();
+    store
+        .commit_next_with_wal_manifest(&mut disk, b"newer", manifest)
+        .unwrap();
+    let (metadata, payload) = store
+        .read_latest_streaming_with_metadata(&mut disk, |reader| {
+            let mut payload = alloc::vec![0; reader.remaining()];
+            reader.read_exact(&mut payload)?;
+            Ok(payload)
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(payload, b"newer");
+    assert_eq!(metadata.generation, 2);
+
+    let mut wal = RegistryWal::recover(CachedDisk::with_sectors(16), 77).unwrap();
+    for journal in [b"already-in-snapshot".as_slice(), b"new-mutation".as_slice()] {
+        wal.begin(journal.to_vec()).unwrap();
+        wal.prepare().unwrap();
+        wal.commit().unwrap();
+    }
+    assert_eq!(
+        metadata.verified_boot_system_log(b"snapshot-log", &wal),
+        Ok(b"snapshot-lognew-mutation".to_vec())
+    );
+}
+
+#[test]
+fn streamed_boot_snapshot_metadata_refuses_missing_anchored_suffix() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::new();
+    let manifest = WalSnapshotManifest {
+        incarnation: 77,
+        base_serial: 0,
+        high_water_serial: 1,
+        high_water_end_lba: 3,
+    };
+    store
+        .commit_next_with_wal_manifest(&mut disk, b"older", manifest)
+        .unwrap();
+    store
+        .commit_next_with_wal_manifest(&mut disk, b"newer", manifest)
+        .unwrap();
+    let (metadata, _) = store
+        .read_latest_streaming_with_metadata(&mut disk, |reader| {
+            let mut payload = alloc::vec![0; reader.remaining()];
+            reader.read_exact(&mut payload)?;
+            Ok(payload)
+        })
+        .unwrap()
+        .unwrap();
+    let erased = RegistryWal::recover(CachedDisk::with_sectors(16), 77).unwrap();
+    assert_eq!(
+        metadata.verified_boot_system_log(b"snapshot-log", &erased),
+        Err(SnapshotBlockStoreError::Corrupt)
+    );
+}
+
+#[test]
 fn streamed_v2_checkpoint_preserves_a_complete_slot_at_each_write_barrier() {
     let manifest = base();
     for partial_flush in [false, true] {
