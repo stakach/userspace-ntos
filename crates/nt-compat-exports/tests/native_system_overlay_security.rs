@@ -5,6 +5,7 @@ use syn::{ExprCall, Item};
 struct OverlayCalls {
     secured: usize,
     raw: usize,
+    inner: usize,
 }
 
 impl<'ast> Visit<'ast> for OverlayCalls {
@@ -15,6 +16,8 @@ impl<'ast> Visit<'ast> for OverlayCalls {
                     self.secured += 1;
                 } else if name == "compose_system_hive_overlay" {
                     self.raw += 1;
+                } else if name == "compose_boot_system_hive_inner" {
+                    self.inner += 1;
                 }
             }
         }
@@ -25,10 +28,19 @@ impl<'ast> Visit<'ast> for OverlayCalls {
 #[test]
 fn boot_system_overlay_assigns_generated_security_before_publication() {
     let file = syn::parse_file(include_str!("../../nt-hive-regf/src/lib.rs")).unwrap();
+    for entrypoint in ["compose_boot_system_hive", "compose_boot_system_hive_with_wal_suffix"] {
+        let function = file.items.iter().find_map(|item| match item {
+            Item::Fn(function) if function.sig.ident == entrypoint => Some(function),
+            _ => None,
+        }).expect("boot SYSTEM composition entrypoint");
+        let mut calls = OverlayCalls::default();
+        calls.visit_block(&function.block);
+        assert_eq!(calls.inner, 1, "boot SYSTEM entrypoint must use shared composition");
+    }
     let function = file.items.iter().find_map(|item| match item {
-        Item::Fn(function) if function.sig.ident == "compose_boot_system_hive" => Some(function),
+        Item::Fn(function) if function.sig.ident == "compose_boot_system_hive_inner" => Some(function),
         _ => None,
-    }).expect("boot SYSTEM composition entrypoint");
+    }).expect("shared boot SYSTEM composition");
     let mut calls = OverlayCalls::default();
     calls.visit_block(&function.block);
     assert!(calls.secured != 0,

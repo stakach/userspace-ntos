@@ -216,6 +216,24 @@ fn wal_recovery_floor(
     Ok(anchor)
 }
 
+/// A torn payload may be replaced only when its still-valid v2 header cannot carry
+/// a higher recovery floor than the surviving payload. A damaged or unknown header
+/// has no such proof and remains a hard refusal.
+fn same_anchor_wal_companion(
+    selected_generation: u64,
+    selected: WalSnapshotManifest,
+    companion_generation: u64,
+    companion: WalSnapshotManifest,
+) -> Result<(), SnapshotBlockStoreError> {
+    if selected_generation == companion_generation
+        || selected.anchor() != companion.anchor()
+        || selected.base_serial < companion.base_serial
+    {
+        return Err(SnapshotBlockStoreError::Corrupt);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredWalSnapshot {
     pub snapshot: StoredSnapshot,
@@ -500,11 +518,22 @@ impl SnapshotBlockStore {
                     Some(SlotReadPlan { wal: None, .. }) => {
                         return Err(SnapshotBlockStoreError::Corrupt)
                     }
-                    Some(_) => Some(
-                        self.read_valid_slot_plan(dev, other_slot)?
-                            .and_then(|plan| plan.wal)
-                            .ok_or(SnapshotBlockStoreError::Corrupt)?,
-                    ),
+                    Some(other_plan) => {
+                        let manifest = other_plan.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
+                        match self.validate_slot_payload_crc(dev, other_plan) {
+                            Ok(()) => {}
+                            Err(SnapshotBlockStoreError::Corrupt) => {
+                                same_anchor_wal_companion(
+                                    selected.generation,
+                                    selected_manifest,
+                                    other_plan.generation,
+                                    manifest,
+                                )?;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                        Some(manifest)
+                    }
                 };
                 SnapshotReadFormat::Wal {
                     selected_base_serial: selected_manifest.base_serial,
@@ -624,31 +653,30 @@ impl SnapshotBlockStore {
         &self,
         dev: &mut D,
     ) -> Result<Option<StoredWalSnapshot>, SnapshotBlockStoreError> {
-        let a = self.read_slot(dev, 0);
-        let b = self.read_slot(dev, 1);
-        let (a, b) = match (a, b) {
-            (Ok(a), Ok(b)) => (a, b),
-            (Ok(Some(a)), Err(SnapshotBlockStoreError::Corrupt)) => (Some(a), None),
-            (Err(SnapshotBlockStoreError::Corrupt), Ok(Some(b))) => (None, Some(b)),
-            (Err(error), _) | (_, Err(error)) => return Err(error),
+        let Some((metadata, payload)) = self.read_latest_streaming_with_metadata(dev, |reader| {
+            let mut payload = Vec::new();
+            payload
+                .try_reserve_exact(reader.remaining())
+                .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
+            payload.resize(reader.remaining(), 0);
+            reader.read_exact(&mut payload)?;
+            Ok(payload)
+        })? else {
+            return Ok(None);
         };
-        let (selected, other) = match (a, b) {
-            (None, None) => return Ok(None),
-            (Some(a), Some(b)) if b.generation > a.generation => (b, Some(a)),
-            (Some(a), Some(b)) => (a, Some(b)),
-            (Some(a), None) | (None, Some(a)) => (a, None),
+        let SnapshotReadFormat::Wal {
+            selected_base_serial,
+            anchor,
+        } = metadata.format
+        else {
+            return Err(SnapshotBlockStoreError::Corrupt);
         };
-        let selected_manifest = selected.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
-        let other_manifest = other
-            .map(|other| other.wal.ok_or(SnapshotBlockStoreError::Corrupt))
-            .transpose()?;
-        let anchor = wal_recovery_floor(selected_manifest, other_manifest)?;
         Ok(Some(StoredWalSnapshot {
             snapshot: StoredSnapshot {
-                generation: selected.generation,
-                payload: selected.payload,
+                generation: metadata.generation,
+                payload,
             },
-            selected_base_serial: selected_manifest.base_serial,
+            selected_base_serial,
             anchor,
         }))
     }
@@ -734,6 +762,41 @@ impl SnapshotBlockStore {
         Ok(())
     }
 
+    /// Select the manifest for an unrelated mounted-volume checkpoint. The new payload
+    /// has not folded any additional SYSTEM records, so it inherits the selected payload's
+    /// base serial and the exact anchor present in both valid v2 headers. One companion
+    /// payload may be torn, but a half-advanced anchor must be repaired from the WAL
+    /// before either slot can be recycled.
+    pub fn current_wal_checkpoint_manifest<D: SnapshotBlockDevice>(
+        &self,
+        dev: &mut D,
+    ) -> Result<WalSnapshotManifest, SnapshotBlockStoreError> {
+        let first = self.read_valid_slot_plan(dev, 0);
+        let second = self.read_valid_slot_plan(dev, 1);
+        let selected = match (first, second) {
+            (Ok(Some(first)), Ok(Some(second))) => {
+                if first.generation > second.generation { first } else { second }
+            }
+            (Ok(Some(first)), Err(SnapshotBlockStoreError::Corrupt)) => first,
+            (Err(SnapshotBlockStoreError::Corrupt), Ok(Some(second))) => second,
+            (Err(error), _) if error != SnapshotBlockStoreError::Corrupt => return Err(error),
+            (_, Err(error)) if error != SnapshotBlockStoreError::Corrupt => return Err(error),
+            _ => return Err(SnapshotBlockStoreError::Corrupt),
+        };
+        let companion = self
+            .read_slot_plan(dev, 1 - selected.slot)?
+            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        let selected_manifest = selected.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
+        let companion_manifest = companion.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
+        same_anchor_wal_companion(
+            selected.generation,
+            selected_manifest,
+            companion.generation,
+            companion_manifest,
+        )?;
+        Ok(selected_manifest)
+    }
+
     /// Check only the two headers before a legacy journal append. The writer will validate
     /// payloads at its barrier; admission must cheaply reject a v2 or ambiguous slot without
     /// reading an entire volume image for every current v1 mutation.
@@ -801,6 +864,31 @@ impl SnapshotBlockStore {
                         if repair_empty_baseline && slot == target_slot =>
                     {
                         continue
+                    }
+                    Err(SnapshotBlockStoreError::Corrupt) if slot == target_slot => {
+                        // The selected payload is still complete. Recycle its torn companion
+                        // only if that companion's valid v2 header names the same WAL floor;
+                        // a newer or different floor cannot be discarded by this checkpoint.
+                        let selected = latest.ok_or(SnapshotBlockStoreError::Corrupt)?;
+                        let selected_manifest =
+                            selected.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
+                        let companion = self
+                            .read_slot_plan(dev, slot)?
+                            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+                        let companion_manifest =
+                            companion.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
+                        same_anchor_wal_companion(
+                            selected.generation,
+                            selected_manifest,
+                            companion.generation,
+                            companion_manifest,
+                        )?;
+                        if current.anchor() != selected_manifest.anchor()
+                            || current.base_serial < selected_manifest.base_serial
+                        {
+                            return Err(SnapshotBlockStoreError::Corrupt);
+                        }
+                        continue;
                     }
                     Err(error) => return Err(error),
                 };

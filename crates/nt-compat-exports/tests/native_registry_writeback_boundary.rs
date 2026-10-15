@@ -55,16 +55,7 @@ fn native_boot_verifies_wal_suffix_before_publishing_volume_for_cm_import() {
 }
 
 #[test]
-fn mounted_v2_volume_refuses_legacy_checkpoint_writers_before_effects() {
-    let writable = include_str!("../../../components/ntos-executive/src/writable_fs.rs");
-    let checkpoint = &writable[writable.find("pub(crate) unsafe fn checkpoint_dirty_volume()").unwrap()
-        ..writable.find("\n/// Reclaim immutable blob payloads").unwrap()];
-    let format_guard = checkpoint
-        .find("legacy_snapshot_writes_allowed()")
-        .expect("generic v1 checkpoint must guard mounted v2 format");
-    let clear_dirty = checkpoint.find("WRITABLE_FS_SNAPSHOT_DIRTY.swap(false").unwrap();
-    assert!(format_guard < clear_dirty, "v2 refusal must preserve dirty state");
-
+fn mounted_v2_volume_refuses_legacy_cm_journal_before_effects() {
     let journal = include_str!("../../../components/ntos-executive/src/writable_fs/registry_journal.rs");
     let admission = &journal[journal.find("pub(crate) unsafe fn admit(").unwrap()
         ..journal.find("\n    pub(crate) fn context(").unwrap()];
@@ -73,6 +64,25 @@ fn mounted_v2_volume_refuses_legacy_checkpoint_writers_before_effects() {
         .expect("CM v1 journal admission must guard mounted v2 format");
     let effect = admission.find("snapshot_storage::acquire()").unwrap();
     assert!(format_guard < effect, "v2 refusal must precede storage or file effects");
+}
+
+#[test]
+fn generic_checkpoint_uses_exact_v2_manifest_and_retains_uncertain_reserve() {
+    let writable = include_str!("../../../components/ntos-executive/src/writable_fs.rs");
+    let writer = &writable[writable.find("unsafe fn checkpoint_volume_snapshot(").unwrap()
+        ..writable.find("\n/// Commit pending volume bytes").unwrap()];
+    let checkpoint = &writable[writable.find("pub(crate) unsafe fn checkpoint_dirty_volume()").unwrap()
+        ..writable.find("\n/// Reclaim immutable blob payloads").unwrap()];
+    assert!(checkpoint.contains("current_wal_checkpoint_manifest"),
+        "the mounted v2 writer must derive the included base and anchor from both slots under its lease");
+    assert!(checkpoint.contains("let wal_manifest = if wal_format {"),
+        "every v2 checkpoint must select its manifest before the dirty swap, including a concurrent dirty transition");
+    assert!(writer.contains("commit_volume_snapshot_with_wal_manifest"),
+        "an unrelated dirty-file checkpoint must retain v2 format and WAL floor");
+    assert!(checkpoint.contains("core::mem::forget(dev)"),
+        "an uncertain v2 checkpoint must keep the exact reserve unavailable");
+    assert!(checkpoint.contains("WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true"),
+        "an uncertain v2 checkpoint must block later writes and success replies");
 }
 
 #[test]

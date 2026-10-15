@@ -411,7 +411,7 @@ static WRITABLE_FS_RUNTIME_DIRTY: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_SNAPSHOT_DIRTY: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED: AtomicBool = AtomicBool::new(false);
 /// The mounted filesystem's durable snapshot format, recorded before it is published.
-/// Current native checkpoint and CM journal writers are v1-only.
+/// Generic checkpoints preserve this format; CM journal mutation writes remain v1-only.
 static WRITABLE_FS_MOUNTED_WAL_FORMAT: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_SNAPSHOT_RESTORE_STATE: AtomicU64 = AtomicU64::new(0);
 const SNAPSHOT_RESTORE_UNREAD: u64 = 0;
@@ -678,7 +678,10 @@ unsafe fn install_writable_fs(mut fs: nt_fs::FileSystem, restored: bool) -> Resu
     Ok(())
 }
 
-unsafe fn checkpoint_volume_snapshot(dev: &mut snapshot_storage::Lease) -> Result<(u64, usize), u32> {
+unsafe fn checkpoint_volume_snapshot(
+    dev: &mut snapshot_storage::Lease,
+    wal_manifest: Option<nt_fs::WalSnapshotManifest>,
+) -> Result<(u64, usize), u32> {
     let Some(fs) = (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).as_ref() else {
         return Err(nt_fs::STATUS_INVALID_HANDLE);
     };
@@ -690,7 +693,11 @@ unsafe fn checkpoint_volume_snapshot(dev: &mut snapshot_storage::Lease) -> Resul
     print_str(b" written-sectors=");
     print_u64(WRITABLE_FS_SNAPSHOT_WRITE_SECTORS.load(Ordering::Relaxed));
     print_str(b"\n");
-    match fs.commit_volume_snapshot(&store, dev) {
+    let result = match wal_manifest {
+        Some(manifest) => fs.commit_volume_snapshot_with_wal_manifest(&store, dev, manifest),
+        None => fs.commit_volume_snapshot(&store, dev),
+    };
+    match result {
         Ok((generation, bytes)) => Ok((generation, bytes)),
         Err(err) => {
             print_str(b"[writable-fs-snapshot] commit failed err=");
@@ -704,16 +711,30 @@ unsafe fn checkpoint_volume_snapshot(dev: &mut snapshot_storage::Lease) -> Resul
 /// Commit pending volume bytes. `Ok(true)` means a new durable snapshot was published, while
 /// `Ok(false)` means the volume was already clean.
 pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
-    if !legacy_snapshot_writes_allowed() {
-        return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+    let wal_format = !legacy_snapshot_writes_allowed();
+    if wal_format && WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire) {
+        return Err(nt_fs::STATUS_DEVICE_NOT_READY);
     }
     // Even a clean observation needs exclusion: another owner may have cleared the bit but not
     // yet finished its barrier. Refusal cannot consume dirty state or authorize caller completion.
     let mut dev = snapshot_storage::acquire()?;
+    let wal_manifest = if wal_format {
+        match dev.store().current_wal_checkpoint_manifest(&mut dev) {
+            Ok(manifest) => Some(manifest),
+            Err(error) => {
+                // The reserve is still read-only here. Keep dirty state and prevent another
+                // writer from treating a damaged or partially advanced anchor as reusable.
+                WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+                return Err(snapshot_store_error_status(error));
+            }
+        }
+    } else {
+        None
+    };
     if !WRITABLE_FS_SNAPSHOT_DIRTY.swap(false, Ordering::AcqRel) {
         return Ok(false);
     }
-    match checkpoint_volume_snapshot(&mut dev) {
+    match checkpoint_volume_snapshot(&mut dev, wal_manifest) {
         Ok((generation, bytes)) => {
             WRITABLE_FS_SNAPSHOT_COMMITS.fetch_add(1, Ordering::Relaxed);
             WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION.store(generation, Ordering::Relaxed);
@@ -728,6 +749,12 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
         Err(status) => {
             WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
             WRITABLE_FS_SNAPSHOT_FAILURES.fetch_add(1, Ordering::Relaxed);
+            if wal_format {
+                // Any failed v2 snapshot write may have changed a slot. Retain the exact
+                // physical reserve and block the live mount until boot recovery decides it.
+                WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+                core::mem::forget(dev);
+            }
             print_str(b"[writable-fs-snapshot] dirty checkpoint retained after status=0x");
             print_hex(status);
             print_str(b"\n");

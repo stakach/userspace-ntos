@@ -26,6 +26,147 @@ fn two_v2_slots() -> (SnapshotBlockStore, CachedDisk) {
 }
 
 #[test]
+fn generic_v2_checkpoint_uses_selected_base_and_both_exact_anchor_copies() {
+    let (store, mut disk) = two_v2_slots();
+    assert_eq!(store.current_wal_checkpoint_manifest(&mut disk), Ok(base()));
+
+    let mut folded = base();
+    folded.base_serial = 1;
+    folded.high_water_serial = 1;
+    folded.high_water_end_lba = 3;
+    let (store, mut disk) = two_v2_slots();
+    let mut update = WalSnapshotAnchorUpdate::admit(
+        store,
+        disk,
+        WalSnapshotAnchor { incarnation: 77, serial: 1, end_lba: 3 },
+    )
+    .ok()
+    .unwrap();
+    update.advance().unwrap();
+    disk = update.into_device().unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, b"folded", folded).unwrap();
+    assert_eq!(store.current_wal_checkpoint_manifest(&mut disk), Ok(folded));
+
+    disk.events.clear();
+    let manifest = store.current_wal_checkpoint_manifest(&mut disk).unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, b"unrelated-file", manifest).unwrap();
+    disk.power_cut();
+    let restored = store.read_latest_wal(&mut disk).unwrap().unwrap();
+    assert_eq!(restored.snapshot.payload, b"unrelated-file");
+    assert_eq!(restored.selected_base_serial, 1);
+    assert_eq!(restored.anchor.serial, 1);
+}
+
+#[test]
+fn generic_v2_checkpoint_refuses_partial_anchor_and_legacy_pair_before_write() {
+    let (store, mut disk) = two_v2_slots();
+    disk.fail_event = Some(3);
+    let mut update = WalSnapshotAnchorUpdate::admit(
+        store,
+        disk,
+        WalSnapshotAnchor { incarnation: 77, serial: 1, end_lba: 3 },
+    )
+    .ok()
+    .unwrap();
+    assert_eq!(update.advance(), Err(SnapshotBlockStoreError::Io));
+    let mut disk = update.into_device_for_test();
+    disk.power_cut();
+    disk.fail_event = None;
+    disk.events.clear();
+    assert_eq!(store.current_wal_checkpoint_manifest(&mut disk), Err(SnapshotBlockStoreError::Corrupt));
+    assert!(!disk.events.iter().any(|event| matches!(event, Event::Write(_))));
+
+    let mut disk = CachedDisk::new();
+    store.commit_next(&mut disk, b"legacy").unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, b"mixed", base()).unwrap();
+    disk.events.clear();
+    assert_eq!(store.current_wal_checkpoint_manifest(&mut disk), Err(SnapshotBlockStoreError::Corrupt));
+    assert!(!disk.events.iter().any(|event| matches!(event, Event::Write(_))));
+}
+
+#[test]
+fn streamed_v2_boot_recovers_the_surviving_slot_after_a_torn_companion_payload() {
+    let (store, mut disk) = two_v2_slots();
+    // The generic writer first reuses slot 0. A failed payload barrier may persist that
+    // payload while leaving its old, checksum-valid v2 header in place.
+    disk.fail_event = Some(2);
+    disk.partial_flush = true;
+    assert_eq!(
+        store.commit_next_with_wal_manifest(&mut disk, b"third", base()),
+        Err(SnapshotBlockStoreError::Io)
+    );
+    disk.power_cut();
+    assert_eq!(store.read_latest_wal(&mut disk).unwrap().unwrap().snapshot.payload, b"newer");
+
+    let (metadata, payload) = store
+        .read_latest_streaming_with_metadata(&mut disk, |reader| {
+            let mut payload = alloc::vec![0; reader.remaining()];
+            reader.read_exact(&mut payload)?;
+            Ok(payload)
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.generation, 2);
+    assert_eq!(metadata.format, SnapshotReadFormat::Wal {
+        selected_base_serial: 0,
+        anchor: WalSnapshotAnchor { incarnation: 77, serial: 0, end_lba: 0 },
+    });
+    assert_eq!(payload, b"newer");
+}
+
+#[test]
+fn generic_v2_checkpoint_repairs_a_torn_same_anchor_companion_under_the_same_device() {
+    let (store, mut disk) = two_v2_slots();
+    disk.fail_event = Some(2);
+    disk.partial_flush = true;
+    assert_eq!(
+        store.commit_next_with_wal_manifest(&mut disk, b"third", base()),
+        Err(SnapshotBlockStoreError::Io)
+    );
+    disk.power_cut();
+    disk.events.clear();
+
+    let manifest = store.current_wal_checkpoint_manifest(&mut disk).unwrap();
+    assert_eq!(manifest, base());
+    store
+        .commit_next_with_wal_manifest(&mut disk, b"repaired", manifest)
+        .unwrap();
+    disk.power_cut();
+    let restored = store.read_latest_wal(&mut disk).unwrap().unwrap();
+    assert_eq!(restored.snapshot.payload, b"repaired");
+    assert_eq!(restored.anchor, WalSnapshotAnchor { incarnation: 77, serial: 0, end_lba: 0 });
+}
+
+#[test]
+fn torn_v2_companion_with_a_different_anchor_still_refuses_streaming_boot_and_checkpoint() {
+    let (store, mut disk) = two_v2_slots();
+    disk.fail_event = Some(3);
+    let mut update = WalSnapshotAnchorUpdate::admit(
+        store,
+        disk,
+        WalSnapshotAnchor { incarnation: 77, serial: 1, end_lba: 3 },
+    )
+    .ok()
+    .unwrap();
+    assert_eq!(update.advance(), Err(SnapshotBlockStoreError::Io));
+    let mut disk = update.into_device_for_test();
+    disk.power_cut();
+    disk.corrupt(1);
+    disk.events.clear();
+
+    assert_eq!(store.read_latest_wal(&mut disk), Err(SnapshotBlockStoreError::Corrupt));
+    assert_eq!(store.current_wal_checkpoint_manifest(&mut disk), Err(SnapshotBlockStoreError::Corrupt));
+    let mut decoded = false;
+    let result = store.read_latest_streaming_with_metadata(&mut disk, |_| {
+        decoded = true;
+        Ok(())
+    });
+    assert_eq!(result, Err(SnapshotBlockStoreError::Corrupt));
+    assert!(!decoded);
+    assert!(!disk.events.iter().any(|event| matches!(event, Event::Write(_))));
+}
+
+#[test]
 fn interrupted_empty_wal_baseline_can_repair_the_mixed_pair() {
     let store = SnapshotBlockStore::new(0, 16);
     let mut disk = CachedDisk::new();
