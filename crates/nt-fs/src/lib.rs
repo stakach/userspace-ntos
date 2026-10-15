@@ -84,6 +84,8 @@ pub use snapshot_store::{
 pub use snapshot_reserve::{SnapshotReserve, SnapshotReserveLease};
 pub use snapshot_region::{BoundedBlockRange, OwnedBoundedBlockRange};
 pub use registry_wal_store::{RegistryWal, RegistryWalError, RegistryWalRecord, RegistryWalState, RegistryWalVerifiedDevice, RegistryWalVerifiedPrefix};
+mod snapshot_baseline_repair;
+pub use snapshot_baseline_repair::WalSnapshotBaselineRepair;
 pub use status::*;
 pub use volume::*;
 

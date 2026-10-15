@@ -356,7 +356,8 @@ impl SnapshotBlockStore {
         let Some(plan) = self.latest_valid_slot(dev)? else {
             return Ok(None);
         };
-        self.read_selected_streaming(dev, plan, read_payload).map(Some)
+        self.read_selected_streaming(dev, plan, read_payload)
+            .map(Some)
     }
 
     /// Inspect the format of the same payload selected by the streaming reader without
@@ -407,14 +408,20 @@ impl SnapshotBlockStore {
             return Ok(None);
         };
         let metadata = self.metadata_for_selected(dev, plan)?;
-        if let SnapshotReadFormat::Wal { selected_base_serial, anchor } = metadata.format {
+        if let SnapshotReadFormat::Wal {
+            selected_base_serial,
+            anchor,
+        } = metadata.format
+        {
             if selected_base_serial != 0 || anchor.serial != 0 || anchor.end_lba != 0 {
                 return Err(SnapshotBlockStoreError::Corrupt);
             }
-            let first = self.read_valid_slot_plan(dev, 0)?
+            let first = self
+                .read_valid_slot_plan(dev, 0)?
                 .and_then(|plan| plan.wal)
                 .ok_or(SnapshotBlockStoreError::Corrupt)?;
-            let second = self.read_valid_slot_plan(dev, 1)?
+            let second = self
+                .read_valid_slot_plan(dev, 1)?
                 .and_then(|plan| plan.wal)
                 .ok_or(SnapshotBlockStoreError::Corrupt)?;
             if first != second || first.incarnation != anchor.incarnation {
@@ -515,6 +522,77 @@ impl SnapshotBlockStore {
         )
     }
 
+    /// Finish an interrupted v1-to-v2 baseline migration before any WAL record is admitted.
+    /// The caller must have verified that the disjoint WAL region is empty for `incarnation`.
+    /// A complete legacy pair returns `None` so its owner can begin migration explicitly.
+    /// A mixed pair is repairable only when its newer, payload-valid slot is an empty-WAL v2
+    /// checkpoint. The older legacy slot is replaced with the exact durable v2 payload.
+    pub(crate) fn repair_empty_wal_baseline<D: SnapshotBlockDevice>(
+        &self,
+        dev: &mut D,
+        incarnation: u64,
+    ) -> Result<Option<u64>, SnapshotBlockStoreError> {
+        if incarnation == 0 {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        // Stabilize any completed header before selecting a slot to overwrite.
+        dev.flush()?;
+        let a = self.read_slot(dev, 0);
+        let b = self.read_slot(dev, 1);
+        let empty = WalSnapshotManifest {
+            incarnation,
+            base_serial: 0,
+            high_water_serial: 0,
+            high_water_end_lba: 0,
+        };
+        let repair = match (a, b) {
+            (Ok(Some(a)), Ok(Some(b))) if a.wal.is_none() && b.wal.is_none() => return Ok(None),
+            (Ok(Some(a)), Ok(Some(b))) if a.wal == Some(empty) && b.wal == Some(empty) => {
+                if a.generation == b.generation {
+                    return Err(SnapshotBlockStoreError::Corrupt);
+                }
+                return Ok(Some(a.generation.max(b.generation)));
+            }
+            (Ok(Some(a)), Ok(Some(b))) => {
+                let (v2, legacy) = if a.wal == Some(empty) && b.wal.is_none() {
+                    (a, b)
+                } else if b.wal == Some(empty) && a.wal.is_none() {
+                    (b, a)
+                } else {
+                    return Err(SnapshotBlockStoreError::Corrupt);
+                };
+                if v2.generation <= legacy.generation {
+                    return Err(SnapshotBlockStoreError::Corrupt);
+                }
+                Ok(Some(v2))
+            }
+            (Ok(Some(v2)), Err(SnapshotBlockStoreError::Corrupt) | Ok(None))
+            | (Err(SnapshotBlockStoreError::Corrupt) | Ok(None), Ok(Some(v2)))
+                if v2.wal == Some(empty) =>
+            {
+                Ok(Some(v2))
+            }
+            (Err(error), _) | (_, Err(error)) if error != SnapshotBlockStoreError::Corrupt => {
+                Err(error)
+            }
+            _ => Err(SnapshotBlockStoreError::Corrupt),
+        }?;
+        let Some(v2) = repair else {
+            return Ok(None);
+        };
+        // The selected v2 payload was CRC checked before the companion is touched. This
+        // dedicated path may overwrite a torn companion that the normal v2 writer rejects.
+        self.commit_next_streaming_inner(
+            dev,
+            v2.payload.len(),
+            crc32c(&v2.payload),
+            Some(empty),
+            true,
+            |writer| writer.write_all(&v2.payload),
+        )
+        .map(Some)
+    }
+
     /// Select the valid payload by snapshot generation, but retain the highest durability
     /// floor from both valid v2 headers. A mixed v1/v2 pair cannot enter WAL recovery.
     pub fn read_latest_wal<D: SnapshotBlockDevice>(
@@ -536,7 +614,9 @@ impl SnapshotBlockStore {
             (Some(a), None) | (None, Some(a)) => (a, None),
         };
         let selected_manifest = selected.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
-        let other_manifest = other.map(|other| other.wal.ok_or(SnapshotBlockStoreError::Corrupt)).transpose()?;
+        let other_manifest = other
+            .map(|other| other.wal.ok_or(SnapshotBlockStoreError::Corrupt))
+            .transpose()?;
         let anchor = wal_recovery_floor(selected_manifest, other_manifest)?;
         Ok(Some(StoredWalSnapshot {
             snapshot: StoredSnapshot {
@@ -564,7 +644,7 @@ impl SnapshotBlockStore {
         D: SnapshotBlockDevice,
         F: FnOnce(&mut PayloadSectorWriter<'_, D>) -> Result<(), SnapshotBlockStoreError>,
     {
-        self.commit_next_streaming_inner(dev, payload_len, payload_crc, None, write_payload)
+        self.commit_next_streaming_inner(dev, payload_len, payload_crc, None, false, write_payload)
     }
 
     /// Stream a volume checkpoint with the WAL incarnation, included serial, and exact
@@ -593,6 +673,7 @@ impl SnapshotBlockStore {
             payload_len,
             payload_crc,
             Some(manifest),
+            false,
             write_payload,
         )
     }
@@ -603,6 +684,7 @@ impl SnapshotBlockStore {
         payload_len: usize,
         payload_crc: u32,
         wal: Option<WalSnapshotManifest>,
+        repair_empty_baseline: bool,
         write_payload: F,
     ) -> Result<u64, SnapshotBlockStoreError>
     where
@@ -628,11 +710,29 @@ impl SnapshotBlockStore {
         // before deciding which slot is safe to reuse.
         dev.flush()?;
         let latest = self.latest_commit_slot(dev)?;
+        let (target_slot, generation) = match latest {
+            Some(latest) => (
+                1 - latest.slot,
+                latest
+                    .generation
+                    .checked_add(1)
+                    .ok_or(SnapshotBlockStoreError::OutOfSpace)?,
+            ),
+            None => (0, 1),
+        };
         if let Some(current) = wal {
             // A partially advanced two-slot anchor may live only in the older generation.
             // Inspect both valid payloads before either can be recycled by a v2 commit.
             for slot in 0..2 {
-                let plan = self.read_valid_slot_plan(dev, slot)?;
+                let plan = match self.read_valid_slot_plan(dev, slot) {
+                    Ok(plan) => plan,
+                    Err(SnapshotBlockStoreError::Corrupt)
+                        if repair_empty_baseline && slot == target_slot =>
+                    {
+                        continue
+                    }
+                    Err(error) => return Err(error),
+                };
                 if let Some(previous) = plan.and_then(|plan| plan.wal) {
                     // A newer checkpoint may fold more of the WAL into its payload, but
                     // must never make recovery depend on records an earlier checkpoint
@@ -647,16 +747,6 @@ impl SnapshotBlockStore {
         } else if latest.is_some_and(|previous| previous.wal.is_some()) {
             return Err(SnapshotBlockStoreError::Corrupt);
         }
-        let (target_slot, generation) = match latest {
-            Some(latest) => (
-                1 - latest.slot,
-                latest
-                    .generation
-                    .checked_add(1)
-                    .ok_or(SnapshotBlockStoreError::OutOfSpace)?,
-            ),
-            None => (0, 1),
-        };
         let payload_sectors = payload_len.div_ceil(sector_size);
         let payload_sectors_u32 =
             u32::try_from(payload_sectors).map_err(|_| SnapshotBlockStoreError::OutOfSpace)?;

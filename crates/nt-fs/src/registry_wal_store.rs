@@ -67,6 +67,8 @@ impl<D> RegistryWalVerifiedDevice<D> {
     pub fn anchor(&self) -> WalSnapshotAnchor { self.prefix.anchor() }
     pub fn into_device(self) -> D { self.device }
 
+    pub(crate) fn device_mut(&mut self) -> &mut D { &mut self.device }
+
     pub(crate) fn into_parts(self) -> (D, RegistryWalVerifiedPrefix, Vec<u64>) {
         (self.device, self.prefix, self.record_end_lbas)
     }

@@ -1,5 +1,7 @@
 use super::*;
 use crate::RegistryWal;
+use crate::{OwnedBoundedBlockRange, SnapshotReserve, WalSnapshotBaselineRepair};
+extern crate std;
 
 fn base() -> WalSnapshotManifest {
     WalSnapshotManifest {
@@ -21,6 +23,138 @@ fn two_v2_slots() -> (SnapshotBlockStore, CachedDisk) {
         .unwrap();
     disk.events.clear();
     (store, disk)
+}
+
+#[test]
+fn interrupted_empty_wal_baseline_can_repair_the_mixed_pair() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::new();
+    store.commit_next(&mut disk, b"older").unwrap();
+    store.commit_next(&mut disk, b"current").unwrap();
+    store
+        .commit_next_with_wal_manifest(&mut disk, b"current", base())
+        .unwrap();
+    disk.power_cut();
+    assert_eq!(
+        store.read_latest_wal(&mut disk),
+        Err(SnapshotBlockStoreError::Corrupt)
+    );
+
+    assert_eq!(store.repair_empty_wal_baseline(&mut disk, 77), Ok(Some(4)));
+    disk.power_cut();
+    let restored = store.read_latest_wal(&mut disk).unwrap().unwrap();
+    assert_eq!(restored.snapshot.payload, b"current");
+    assert_eq!(restored.snapshot.generation, 4);
+    assert_eq!(restored.anchor.incarnation, 77);
+    assert_eq!(restored.anchor.serial, 0);
+}
+
+#[test]
+fn empty_wal_baseline_repair_survives_each_write_and_barrier_cut() {
+    let store = SnapshotBlockStore::new(0, 16);
+    for partial_flush in [false, true] {
+        for failed_event in 0..6 {
+            let mut disk = CachedDisk::new();
+            store.commit_next(&mut disk, b"legacy").unwrap();
+            store
+                .commit_next_with_wal_manifest(&mut disk, b"v2-baseline", base())
+                .unwrap();
+            disk.events.clear();
+            disk.fail_event = Some(failed_event);
+            disk.partial_flush = partial_flush;
+            let _ = store.repair_empty_wal_baseline(&mut disk, 77);
+            disk.power_cut();
+            store.repair_empty_wal_baseline(&mut disk, 77).unwrap();
+            disk.power_cut();
+            let selected = store.read_latest_wal(&mut disk).unwrap().unwrap();
+            assert_eq!(selected.snapshot.payload, b"v2-baseline");
+            assert_eq!(selected.anchor.serial, 0);
+        }
+    }
+}
+
+#[test]
+fn empty_wal_baseline_repair_refuses_stale_or_advanced_mixed_slots_before_write() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::new();
+    store.commit_next(&mut disk, b"legacy").unwrap();
+    store
+        .commit_next_with_wal_manifest(&mut disk, b"newer", base())
+        .unwrap();
+    disk.events.clear();
+    assert_eq!(
+        store.repair_empty_wal_baseline(&mut disk, 88),
+        Err(SnapshotBlockStoreError::Corrupt)
+    );
+    assert!(!disk
+        .events
+        .iter()
+        .any(|event| matches!(event, Event::Write(_))));
+
+    let mut advanced = base();
+    advanced.high_water_serial = 1;
+    advanced.high_water_end_lba = 3;
+    let mut disk = CachedDisk::new();
+    store.commit_next(&mut disk, b"legacy").unwrap();
+    store
+        .commit_next_with_wal_manifest(&mut disk, b"newer", advanced)
+        .unwrap();
+    disk.events.clear();
+    assert_eq!(
+        store.repair_empty_wal_baseline(&mut disk, 77),
+        Err(SnapshotBlockStoreError::Corrupt)
+    );
+    assert!(!disk
+        .events
+        .iter()
+        .any(|event| matches!(event, Event::Write(_))));
+}
+
+#[test]
+fn owned_empty_wal_baseline_repair_keeps_the_verified_physical_lease() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let reserve = SnapshotReserve::new(CachedDisk::with_sectors(32), 81, store);
+    let mut lease = reserve.try_acquire().unwrap();
+    store.commit_next(&mut lease, b"legacy").unwrap();
+    store
+        .commit_next_with_wal_manifest(&mut lease, b"baseline", base())
+        .unwrap();
+    let bounded = OwnedBoundedBlockRange::new(lease, 16, 16).ok().unwrap();
+    let verified = RegistryWal::recover(bounded, 77)
+        .unwrap()
+        .into_verified_device()
+        .unwrap()
+        .into_full_device();
+    let mut repair = WalSnapshotBaselineRepair::admit(store, verified).ok().unwrap();
+    assert!(reserve.try_acquire().is_none());
+    assert_eq!(repair.repair(), Ok(Some(3)));
+    let mut lease = repair.into_verified_device().unwrap().into_device();
+    assert_eq!(store.read_latest_wal(&mut lease).unwrap().unwrap().snapshot.payload, b"baseline");
+}
+
+#[test]
+fn uncertain_baseline_repair_retains_the_same_reserve_lease() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let reserve = SnapshotReserve::new(CachedDisk::with_sectors(32), 82, store);
+    let mut lease = reserve.try_acquire().unwrap();
+    store.commit_next(&mut lease, b"legacy").unwrap();
+    store
+        .commit_next_with_wal_manifest(&mut lease, b"baseline", base())
+        .unwrap();
+    let next = lease.test_device_mut().events.len();
+    lease.test_device_mut().fail_event = Some(next + 3);
+    lease.test_device_mut().partial_flush = true;
+    let bounded = OwnedBoundedBlockRange::new(lease, 16, 16).ok().unwrap();
+    let verified = RegistryWal::recover(bounded, 77)
+        .unwrap()
+        .into_verified_device()
+        .unwrap()
+        .into_full_device();
+    let mut repair = WalSnapshotBaselineRepair::admit(store, verified).ok().unwrap();
+    assert_eq!(repair.repair(), Err(SnapshotBlockStoreError::Io));
+    let retained = repair.into_verified_device().err().unwrap();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(retained))).is_err());
+    assert!(reserve.try_acquire().is_none());
 }
 
 fn one_committed_wal() -> RegistryWal<CachedDisk> {
@@ -50,7 +184,10 @@ fn boot_system_log_replays_only_suffix_after_selected_snapshot_base() {
     let selected = store.read_latest_wal(&mut disk).unwrap().unwrap();
 
     let mut wal = RegistryWal::recover(CachedDisk::with_sectors(16), 77).unwrap();
-    for payload in [b"already-in-snapshot".as_slice(), b"new-mutation".as_slice()] {
+    for payload in [
+        b"already-in-snapshot".as_slice(),
+        b"new-mutation".as_slice(),
+    ] {
         wal.begin(payload.to_vec()).unwrap();
         wal.prepare().unwrap();
         wal.commit().unwrap();
@@ -172,9 +309,17 @@ fn v2_checkpoint_cannot_regress_an_applied_wal_base() {
         store.commit_next_with_wal_manifest(&mut disk, b"regressed", manifest),
         Err(SnapshotBlockStoreError::Corrupt)
     );
-    assert!(!disk.events.iter().any(|event| matches!(event, Event::Write(_))));
+    assert!(!disk
+        .events
+        .iter()
+        .any(|event| matches!(event, Event::Write(_))));
     assert_eq!(
-        store.read_latest_wal(&mut disk).unwrap().unwrap().snapshot.payload,
+        store
+            .read_latest_wal(&mut disk)
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .payload,
         b"applied"
     );
 }
@@ -187,7 +332,10 @@ fn recovered_newer_snapshot_cannot_require_a_reclaimed_wal_prefix() {
         high_water_serial: 1,
         high_water_end_lba: 3,
     };
-    let newer = WalSnapshotManifest { base_serial: 0, ..older };
+    let newer = WalSnapshotManifest {
+        base_serial: 0,
+        ..older
+    };
     assert_eq!(
         wal_recovery_floor(newer, Some(older)),
         Err(SnapshotBlockStoreError::Corrupt)
@@ -353,7 +501,10 @@ fn metadata_selector_rejects_mixed_slots_before_streaming_payload() {
     store
         .commit_next_with_wal_manifest(&mut disk, b"candidate", base())
         .unwrap();
-    assert_eq!(store.read_latest_metadata(&mut disk), Err(SnapshotBlockStoreError::Corrupt));
+    assert_eq!(
+        store.read_latest_metadata(&mut disk),
+        Err(SnapshotBlockStoreError::Corrupt)
+    );
     let mut called = false;
     let result = store.read_latest_streaming_with_metadata(&mut disk, |_| {
         called = true;
@@ -372,7 +523,10 @@ fn damaged_v2_header_cannot_downgrade_to_valid_legacy_slot() {
         .commit_next_with_wal_manifest(&mut disk, b"candidate", base())
         .unwrap();
     disk.corrupt(8);
-    assert_eq!(store.read_latest_metadata(&mut disk), Err(SnapshotBlockStoreError::Corrupt));
+    assert_eq!(
+        store.read_latest_metadata(&mut disk),
+        Err(SnapshotBlockStoreError::Corrupt)
+    );
 }
 
 #[test]
