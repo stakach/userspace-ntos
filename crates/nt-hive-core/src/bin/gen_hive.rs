@@ -2417,7 +2417,8 @@ mod tests {
         let mut cm = import_generated_hive_config_manager(&hive);
 
         let devnodes_before = cm.devnode_count();
-        assert!(devnodes_before >= 1);
+        // Production waits for the native PCI bus relation instead of fabricating Enum devnodes.
+        assert_eq!(devnodes_before, 0);
         let stats = nt_hive_core::seed_reactos_network_setup_in_config_manager(&mut cm);
         assert_eq!(stats, nt_hive_core::ReactOsNetworkSetupSeedStats::default());
         assert_eq!(cm.devnode_count(), devnodes_before);

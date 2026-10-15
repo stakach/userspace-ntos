@@ -93,7 +93,11 @@ fn component_hold_snapshot_copies_existing_exact_owners_without_native_effects()
 fn pending_snapshot_uses_retained_selection_and_message_not_live_ipc_or_role_guess() {
     let audit = audit(HOSTED, "oldest_pending_snapshot");
     assert!(audit.immutable_owners.iter().any(|value| value == "CALLS"));
-    assert!(audit.calls.iter().any(|value| value == "oldest_external_ingress"));
+    assert!(audit.calls.iter().any(|value| value == "oldest_receive_external_ingress"));
+    for field in ["delivered", "released", "receive_settlement"] {
+        assert!(audit.fields.iter().any(|value| value == field),
+            "pending snapshot must select only rows still eligible for Receive: {field}");
+    }
     assert!(audit.fields.iter().any(|value| value == "binding"),
         "copy the retained full caller binding, not a current role/badge lookup");
     for method in ["reply", "executor", "admission_sequence", "message", "info", "registers"] {
@@ -110,32 +114,34 @@ fn pump_heartbeat_observes_only_after_runtime_receive_releases_its_borrow() {
     let receive = function(PUMP, "receive");
     struct BoundaryAudit(usize);
     impl<'ast> Visit<'ast> for BoundaryAudit {
-        fn visit_expr_match(&mut self, expression: &'ast syn::ExprMatch) {
-            let syn::Expr::Call(call) = &*expression.expr else {
-                syn::visit::visit_expr_match(self, expression);
-                return;
-            };
-            if !matches!(&*call.func, syn::Expr::Path(path)
-                if path.path.segments.iter().map(|s| s.ident.to_string()).collect::<Vec<_>>()
-                    == ["runtime", "receive"]) {
-                syn::visit::visit_expr_match(self, expression);
-                return;
+        fn visit_block(&mut self, block: &'ast syn::Block) {
+            for pair in block.stmts.windows(2) {
+                let syn::Stmt::Local(local) = &pair[0] else { continue; };
+                let syn::Pat::Ident(binding) = &local.pat else { continue; };
+                let Some(init) = &local.init else { continue; };
+                let syn::Expr::Call(call) = init.expr.as_ref() else { continue; };
+                if !matches!(&*call.func, syn::Expr::Path(path)
+                    if path.path.segments.iter().map(|s| s.ident.to_string()).collect::<Vec<_>>()
+                        == ["runtime", "receive"]) { continue; }
+                let syn::Stmt::Expr(syn::Expr::Match(expression), _) = &pair[1] else { continue; };
+                if !matches!(&*expression.expr, syn::Expr::Path(path)
+                    if path.path.get_ident() == Some(&binding.ident)) { continue; }
+                for arm in &expression.arms {
+                    let syn::Pat::TupleStruct(ok) = &arm.pat else { continue; };
+                    let Some(syn::Pat::TupleStruct(arrival)) = ok.elems.first() else { continue; };
+                    if !ok.path.is_ident("Ok") || !arrival.path.segments.last()
+                        .is_some_and(|segment| segment.ident == "Notification") { continue; }
+                    let mut audit = ObservationAudit::default();
+                    audit.visit_expr(&arm.body);
+                    let heartbeat = audit.calls.iter().position(|value| value == "census_tick_static")
+                        .expect("sample the existing heartbeat after the receive borrow ends");
+                    let event = audit.calls.iter().position(|value| value == "pump_handle_executive_event_badge").unwrap();
+                    assert!(heartbeat < event, "observe before event processing may nest");
+                    assert_eq!(audit.calls.iter().filter(|value| *value == "census_tick_static").count(), 1);
+                    self.0 += 1;
+                }
             }
-            for arm in &expression.arms {
-                let syn::Pat::TupleStruct(ok) = &arm.pat else { continue; };
-                let Some(syn::Pat::TupleStruct(arrival)) = ok.elems.first() else { continue; };
-                if !ok.path.is_ident("Ok") || !arrival.path.segments.last()
-                    .is_some_and(|segment| segment.ident == "Notification") { continue; }
-                let mut audit = ObservationAudit::default();
-                audit.visit_expr(&arm.body);
-                let heartbeat = audit.calls.iter().position(|value| value == "census_tick_static")
-                    .expect("sample the existing heartbeat after the receive borrow ends");
-                let event = audit.calls.iter().position(|value| value == "pump_handle_executive_event_badge").unwrap();
-                assert!(heartbeat < event, "observe before event processing may nest");
-                assert_eq!(audit.calls.iter().filter(|value| *value == "census_tick_static").count(), 1);
-                self.0 += 1;
-            }
-            syn::visit::visit_expr_match(self, expression);
+            syn::visit::visit_block(self, block);
         }
     }
     let mut boundaries = BoundaryAudit(0);

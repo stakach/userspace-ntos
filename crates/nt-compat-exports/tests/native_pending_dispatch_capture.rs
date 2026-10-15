@@ -40,7 +40,7 @@ fn initial_wait_snapshot_capture_has_one_policy_and_reparks_keep_saved_bytes() {
                 }
                 fn visit_expr_struct(&mut self, expression: &'ast syn::ExprStruct) {
                     let name = expression.path.segments.last().unwrap().ident.to_string();
-                    if matches!(name.as_str(), "PendingProviderWaitDispatch" | "PendingLpcWaitDispatch" | "PendingReceiveDispatch") {
+                    if matches!(name.as_str(), "PendingProviderWaitDispatch" | "PendingLpcWaitDispatch" | "PendingReceiveDispatch" | "PendingServiceWaitDispatch") {
                         self.constructor = Some(name);
                         for field in &expression.fields {
                             if let syn::Member::Named(name) = &field.member {
@@ -75,6 +75,7 @@ fn initial_wait_snapshot_capture_has_one_policy_and_reparks_keep_saved_bytes() {
                     "PendingProviderWaitDispatch" => "provider_wait_suspended",
                     "PendingLpcWaitDispatch" => "lpc_wait_suspended",
                     "PendingReceiveDispatch" => "receive_yield",
+                    "PendingServiceWaitDispatch" => "service_wait_yield",
                     _ => unreachable!(),
                 };
                 let mut condition = Condition(Vec::new());
@@ -89,8 +90,8 @@ fn initial_wait_snapshot_capture_has_one_policy_and_reparks_keep_saved_bytes() {
     let mut initial = InitialBranches(Vec::new());
     initial.visit_file(&bridge);
     initial.0.sort();
-    assert_eq!(initial.0, ["PendingLpcWaitDispatch", "PendingProviderWaitDispatch", "PendingReceiveDispatch"],
-        "initial Provider/LPC/Receive suspension must each use the canonical capture policy");
+    assert_eq!(initial.0, ["PendingLpcWaitDispatch", "PendingProviderWaitDispatch", "PendingReceiveDispatch", "PendingServiceWaitDispatch"],
+        "initial Provider/LPC/Receive/service wait suspension must each use the canonical capture policy");
 
     // Read at runtime so a missing module is a behavioral assertion, not a compile failure.
     let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"),

@@ -62,33 +62,65 @@ fn native_image_hardware_fault_admission_preserves_present_bit() {
     let service =
         syn::parse_file(&std::fs::read_to_string(root.join("service_sec_image.rs")).unwrap())
             .unwrap();
-    struct Admissions(usize);
+    struct Admissions { hardware: usize, captured: usize }
     impl<'a> Visit<'a> for Admissions {
         fn visit_expr_method_call(&mut self, call: &'a syn::ExprMethodCall) {
             if call.method == "service_native_image_page_residency" {
-                self.0 += 1;
                 let observation = call.args.last().expect("fault observation argument");
-                let syn::Expr::Call(decode) = observation else {
-                    panic!("native image admission must preserve the hardware Present bit, not pass true");
-                };
-                let names = names_in_expression(&decode.func);
-                assert!(
-                    names.ends_with(&["ImageFaultObservation".into(), "from_x86_error".into(),]),
-                    "hardware fault admission must decode the original x86 observation"
-                );
-                assert!(
-                    matches!(decode.args.first(), Some(syn::Expr::Path(path))
-                    if path.path.is_ident("m3")),
-                    "decode the actual fault error word"
-                );
-                assert_eq!(decode.args.len(), 1);
+                match observation {
+                    syn::Expr::Call(decode) => {
+                        self.hardware += 1;
+                        let names = names_in_expression(&decode.func);
+                        assert!(
+                            names.ends_with(&["ImageFaultObservation".into(), "from_x86_error".into(),]),
+                            "hardware fault admission must decode the original x86 observation"
+                        );
+                        assert!(
+                            matches!(decode.args.first(), Some(syn::Expr::Path(path))
+                            if path.path.is_ident("m3")),
+                            "decode the actual fault error word"
+                        );
+                        assert_eq!(decode.args.len(), 1);
+                    }
+                    syn::Expr::Field(field) => {
+                        self.captured += 1;
+                        assert!(matches!(&*field.base, syn::Expr::Path(path)
+                            if path.path.is_ident("image")));
+                        assert!(matches!(&field.member, syn::Member::Named(name)
+                            if name == "observation"));
+                    }
+                    _ => panic!("native image admission must preserve the hardware Present bit"),
+                }
             }
             syn::visit::visit_expr_method_call(self, call);
         }
     }
-    let mut admissions = Admissions(0);
+    let mut admissions = Admissions { hardware: 0, captured: 0 };
     admissions.visit_file(&service);
-    assert!(admissions.0 > 0, "inspect the real image fault admission");
+    assert_eq!(admissions.hardware, 1, "inspect the real hardware image fault admission");
+    assert_eq!(admissions.captured, 1, "inspect the deferred image fault admission");
+
+    let receive = syn::parse_file(
+        &std::fs::read_to_string(root.join("win32k_receive.rs")).unwrap(),
+    ).unwrap();
+    let capture = function(&receive, "native_image_fault_candidate");
+    struct CaptureDecode(bool);
+    impl<'a> Visit<'a> for CaptureDecode {
+        fn visit_expr_call(&mut self, call: &'a syn::ExprCall) {
+            if names_in_expression(&call.func).last().is_some_and(|name| name == "x86_user_image_receive_fault") {
+                assert!(matches!(call.args.first(), Some(syn::Expr::Index(index))
+                    if matches!(&*index.expr, syn::Expr::Path(path) if path.path.is_ident("registers"))
+                    && matches!(&*index.index, syn::Expr::Lit(lit) if matches!(&lit.lit, syn::Lit::Int(value) if value.base10_digits() == "3"))),
+                    "deferred admission must decode the original x86 fault word"
+                );
+                self.0 = true;
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
+    let mut capture_decode = CaptureDecode(false);
+    capture_decode.visit_block(&capture.block);
+    assert!(capture_decode.0);
 
     struct Signatures(usize);
     impl<'a> Visit<'a> for Signatures {

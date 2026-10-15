@@ -49,7 +49,7 @@ fn real_return(statement: &syn::Stmt) -> bool {
 }
 
 #[test]
-fn completed_gui_receipts_are_recorded_at_all_four_real_callback_returns() {
+fn completed_gui_receipts_are_recorded_at_all_six_real_callback_returns() {
     let complete = function(
         &source("win32k_glue.rs"),
         "complete_controlled_user_callback",
@@ -123,8 +123,8 @@ fn completed_gui_receipts_are_recorded_at_all_four_real_callback_returns() {
     let mut returns = Returns(0);
     returns.visit_item_fn(&complete);
     assert_eq!(
-        returns.0, 4,
-        "cover chained, provider wait, LPC wait and completed outer return"
+        returns.0, 6,
+        "cover chained, Receive, service, provider and LPC waits, and completed outer return"
     );
     struct Hooks(usize);
     impl<'ast> Visit<'ast> for Hooks {
@@ -137,7 +137,7 @@ fn completed_gui_receipts_are_recorded_at_all_four_real_callback_returns() {
     let mut hooks = Hooks(0);
     hooks.visit_file(&source("win32k_glue.rs"));
     assert_eq!(
-        hooks.0, 4,
+        hooks.0, 6,
         "no extra callback receipts at redirect or retry intent"
     );
 }
