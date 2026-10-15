@@ -6416,6 +6416,22 @@ impl ExecNtHandler {
         total_dirty
     }
 
+    /// Shutdown includes NtLoadKey mounts as well as the fixed boot hives. Stop at the first
+    /// refused checkpoint so its mount, source path, and dirty state remain available for retry.
+    pub(crate) fn checkpoint_dirty_dynamic_mutable_hives(&mut self) -> u32 {
+        for hive_sel in HIVE_SEL_DYNAMIC {
+            let dirty = self
+                .mutable_hives
+                .hive(hive_sel)
+                .map_or(0, |hive| hive.dirty_count());
+            let status = self.checkpoint_dynamic_mutable_hive(hive_sel, dirty);
+            if status != nt_fs::STATUS_SUCCESS {
+                return status;
+            }
+        }
+        nt_fs::STATUS_SUCCESS
+    }
+
     fn checkpoint_dynamic_mutable_hive(&mut self, hive_sel: u32, dirty_cells: usize) -> u32 {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         if self.mutable_hives.hive(hive_sel)
@@ -7008,6 +7024,32 @@ impl ExecNtHandler {
             NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
             return STATUS_UNSUCCESSFUL;
         }
+        let hive_sel = self.hive_mounts[index].sel;
+        let dirty = hive.dirty_count();
+        let status = self.checkpoint_dynamic_mutable_hive(hive_sel, dirty);
+        if status != nt_fs::STATUS_SUCCESS {
+            self.writable_fs_dirty = true;
+            self.writable_fs_commit_required = true;
+            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return status;
+        }
+        // `try_flush` checkpoints the image and log, but an earlier failed volume snapshot can
+        // still own dirty bytes. Never release the dynamic mount or slot on that refusal.
+        let commit_result = {
+            let _transient = crate::allocator::enter_transient();
+            let _alloc_ctx = crate::allocator::enter_context(
+                crate::allocator::ALLOC_CTX_WRITABLE_SNAPSHOT,
+            );
+            crate::writable_fs::checkpoint_dirty_volume()
+        };
+        if let Err(status) = commit_result {
+            self.writable_fs_dirty = true;
+            self.writable_fs_commit_required = true;
+            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return status;
+        }
+        self.complete_committed_mutable_hive_journal_snapshot(b"NtUnloadKey");
+        self.writable_fs_commit_required = false;
         let mount = self.hive_mounts.remove(index);
         if let Some(slot) = mount.slot {
             USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);

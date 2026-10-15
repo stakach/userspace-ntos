@@ -3088,12 +3088,18 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
 }
 
 fn checkpoint_boot_hives_at_quiesce(nt_handler: &mut ExecNtHandler) -> u32 {
+    let dynamic_status = nt_handler.checkpoint_dirty_dynamic_mutable_hives();
+    if dynamic_status != nt_fs::STATUS_SUCCESS {
+        return dynamic_status;
+    }
     if !unsafe { crate::writable_fs::writable_fs_mounted() } {
         return nt_fs::STATUS_SUCCESS;
     }
     let dirty_cells = nt_handler.boot_mutable_hive_dirty_cells();
     let pending_journal_records = nt_handler.mutable_hive_journal_pending_records;
-    if dirty_cells == 0 && pending_journal_records == 0 {
+    if dirty_cells == 0 && pending_journal_records == 0
+        && !nt_handler.writable_fs_commit_required
+    {
         return nt_fs::STATUS_SUCCESS;
     }
     print_str(b"[cm-flush] quiesce boot hive checkpoint dirty-cells=");
@@ -3124,7 +3130,10 @@ fn checkpoint_boot_hives_at_quiesce(nt_handler: &mut ExecNtHandler) -> u32 {
             let _ = unsafe { crate::writable_fs::compact_unreferenced_blobs() };
         }
         nt_handler.complete_committed_mutable_hive_journal_snapshot(b"quiesce");
+        nt_handler.writable_fs_commit_required = false;
     } else {
+        nt_handler.writable_fs_dirty = true;
+        nt_handler.writable_fs_commit_required = true;
         print_str(b"[writable-fs-snapshot] quiesce checkpoint status=0x");
         print_hex(snapshot_status);
         print_str(b"\n");
@@ -18356,7 +18365,10 @@ pub(crate) unsafe fn service_sec_image(
     nt_handler.loop_ctx = nt_handler.loop_ctx.map(|ctx| ctx.checkpoint_live());
     let quiesce_cm_status = checkpoint_boot_hives_at_quiesce(&mut nt_handler);
     if quiesce_cm_status != nt_fs::STATUS_SUCCESS {
-        stop = quiesce_cm_status as u64;
+        print_str(b"[cm-flush] shutdown hive durability refused status=0x");
+        print_hex(quiesce_cm_status);
+        print_str(b"\n");
+        park();
     }
     dump_all_hosted_thread_quiesce(
         &nt_handler,
