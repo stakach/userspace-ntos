@@ -4360,7 +4360,11 @@ impl ExecNtHandler {
             return Ok(outcome);
         }
         let generation =
-            self.persist_and_publish_system_mutations(expected_generation, &mutations)?;
+            self.persist_and_publish_system_mutations(
+                crate::boot_registry_mutation_work::BootRegistryStage::TimeZone,
+                expected_generation,
+                &mutations,
+            )?;
         print_str(b"[timezone-setup] ReactOS timezone index=");
         print_u64(selected_index as u64);
         print_str(b" selected from ");
@@ -4373,6 +4377,7 @@ impl ExecNtHandler {
 
     fn persist_and_publish_system_mutations(
         &mut self,
+        stage: crate::boot_registry_mutation_work::BootRegistryStage,
         expected_generation: u64,
         mutations: &[OwnedSystemHiveMutation],
     ) -> Result<u64, u32> {
@@ -4381,7 +4386,11 @@ impl ExecNtHandler {
             .map(OwnedSystemHiveMutation::as_client_mutation)
             .collect();
         let outcome = unsafe {
-            crate::persist_and_publish_system_hive_mutation(expected_generation, &client_mutations)
+            crate::boot_registry_mutation_work::publish_setup_system_mutation(
+                stage,
+                expected_generation,
+                &client_mutations,
+            )
         }?;
         if outcome.wake_device_action {
             unsafe { self.pnp_signal_pending_action() };
@@ -4408,7 +4417,7 @@ impl ExecNtHandler {
                 print_str(b"[network-setup] CM network-adapter plan query failed status=0x");
                 print_hex(status as u32);
                 print_str(b"\n");
-                return;
+                panic!("network setup requires a CM adapter plan");
             }
         };
         let expected_generation = network_adapters.mount_generation;
@@ -4454,30 +4463,31 @@ impl ExecNtHandler {
             let (mutations, failed) = target.finish();
             (stats, mutations, failed, hostname_present)
         };
+        if failed {
+            print_str(b"[network-setup] SYSTEM mutation collection rejected a non-SYSTEM path\n");
+            panic!("network setup SYSTEM mutation collection failed");
+        }
         if mutations.is_empty() {
             if hostname_present {
                 print_str(b"[network-setup] ReactOS network setup already present\n");
             } else {
                 print_str(b"[network-setup] ReactOS network setup not provisioned\n");
             }
-            if failed {
-                print_str(b"[network-setup] SYSTEM mutation collection unavailable\n");
-            }
-            return;
-        }
-        if failed {
-            print_str(b"[network-setup] SYSTEM mutation collection rejected a non-SYSTEM path\n");
             return;
         }
         let generation = match self
-            .persist_and_publish_system_mutations(expected_generation, &mutations)
+            .persist_and_publish_system_mutations(
+                crate::boot_registry_mutation_work::BootRegistryStage::Network,
+                expected_generation,
+                &mutations,
+            )
         {
             Ok(generation) => generation,
             Err(status) => {
                 print_str(b"[network-setup] CM-owned SYSTEM commit failed status=0x");
                 print_hex(status);
                 print_str(b"\n");
-                return;
+                panic!("network setup CM mutation did not reach exact ACK");
             }
         };
         print_str(b"[network-setup] HKLM\\SYSTEM committed through CM generation ");
@@ -4552,30 +4562,31 @@ impl ExecNtHandler {
             let (mutations, failed) = target.finish();
             (stats, mutations, failed, driver_present)
         };
+        if failed {
+            print_str(b"[print-setup] SYSTEM mutation collection rejected a non-SYSTEM path\n");
+            panic!("print setup SYSTEM mutation collection failed");
+        }
         if mutations.is_empty() {
             if driver_present {
                 print_str(b"[print-setup] ReactOS print setup already present\n");
             } else {
                 print_str(b"[print-setup] ReactOS print setup not provisioned\n");
             }
-            if failed {
-                print_str(b"[print-setup] SYSTEM mutation collection unavailable\n");
-            }
-            return;
-        }
-        if failed {
-            print_str(b"[print-setup] SYSTEM mutation collection rejected a non-SYSTEM path\n");
             return;
         }
         let generation = match self
-            .persist_and_publish_system_mutations(expected_generation, &mutations)
+            .persist_and_publish_system_mutations(
+                crate::boot_registry_mutation_work::BootRegistryStage::Print,
+                expected_generation,
+                &mutations,
+            )
         {
             Ok(generation) => generation,
             Err(status) => {
                 print_str(b"[print-setup] CM-owned SYSTEM commit failed status=0x");
                 print_hex(status);
                 print_str(b"\n");
-                return;
+                panic!("print setup CM mutation did not reach exact ACK");
             }
         };
         print_str(b"[print-setup] HKLM\\SYSTEM committed through CM generation ");
@@ -4760,27 +4771,18 @@ impl ExecNtHandler {
                 print_str(b"[locale-setup] installed NLS language query failed status=0x");
                 print_hex(status);
                 print_str(b"\n");
-                return;
+                panic!("locale setup requires installed NLS language");
             }
         };
         locale_id_ascii8(locale_id, &mut locale_ascii);
         let system_ascii = &locale_ascii[4..8];
-        if let (Some(locale_id), Some(langid)) =
-            (parse_hex_u32(&locale_ascii), parse_hex_u32(system_ascii))
-        {
-            NT_SYSTEM_DEFAULT_LOCALE.store(locale_id, Ordering::Relaxed);
-            NT_SESSION_DEFAULT_LOCALE.store(locale_id, Ordering::Relaxed);
-            NT_INSTALL_UI_LANGUAGE.store(langid & 0xffff, Ordering::Relaxed);
-            NT_DEFAULT_UI_LANGUAGE.store(langid & 0xffff, Ordering::Relaxed);
-            NT_PENDING_UI_LANGUAGE.store(0, Ordering::Relaxed);
-        }
         let mut user_locale = [0u8; 18];
         let Some(user_locale_len) = utf16le_ascii_z(&locale_ascii, &mut user_locale) else {
-            return;
+            panic!("locale setup user locale encoding failed");
         };
         let mut system_locale = [0u8; 10];
         let Some(system_locale_len) = utf16le_ascii_z(system_ascii, &mut system_locale) else {
-            return;
+            panic!("locale setup SYSTEM locale encoding failed");
         };
         // The target key must ALREADY exist in the prototype hive (hivedef.inf creates it empty);
         // creating it ourselves would be inventing structure rather than performing setup's step.
@@ -4790,22 +4792,9 @@ impl ExecNtHandler {
             .is_none()
         {
             print_str(b"[locale-setup] .Default\\Control Panel\\International absent -> skipped\n");
-            return;
+            panic!("locale setup requires the .Default international key");
         }
         trace_setup_provision_phase(b"locale-user-key-end", 1);
-        trace_setup_provision_phase(b"locale-user-value-begin", user_locale_len as u64);
-        let Some(user_locale_changed) = self.ensure_mutable_registry_value_by_path(
-            USER_INTERNATIONAL,
-            "Locale",
-            REG_SZ,
-            &user_locale[..user_locale_len],
-        ) else {
-            print_str(
-                b"[locale-setup] .Default\\Control Panel\\International mutable write failed\n",
-            );
-            return;
-        };
-        trace_setup_provision_phase(b"locale-user-value-end", user_locale_changed as u64);
         trace_setup_provision_phase(b"locale-system-key-begin", 0);
         let mut target = CollectSystemSetupSeedTarget::new(expected_generation);
         if !target.has_key(SYSTEM_NLS_LANGUAGE_PATH) {
@@ -4815,7 +4804,7 @@ impl ExecNtHandler {
             } else {
                 print_str(b"[locale-setup] HKLM\\...\\Nls\\Language absent -> no system locale\n");
             }
-            return;
+            panic!("locale setup requires the SYSTEM NLS language key");
         }
         trace_setup_provision_phase(b"locale-system-key-end", 1);
         trace_setup_provision_phase(b"locale-system-default-begin", system_locale_len as u64);
@@ -4838,13 +4827,17 @@ impl ExecNtHandler {
         let (mutations, failed) = target.finish();
         if failed {
             print_str(b"[locale-setup] SYSTEM mutation collection unavailable\n");
-            return;
+            panic!("locale setup SYSTEM mutation collection failed");
         }
         let system_generation = if mutations.is_empty() {
             None
         } else {
             match self
-                .persist_and_publish_system_mutations(expected_generation, &mutations)
+                .persist_and_publish_system_mutations(
+                    crate::boot_registry_mutation_work::BootRegistryStage::Locale,
+                    expected_generation,
+                    &mutations,
+                )
             {
                 Ok(generation) => {
                     Some(generation)
@@ -4853,7 +4846,7 @@ impl ExecNtHandler {
                     print_str(b"[locale-setup] CM-owned SYSTEM commit failed status=0x");
                     print_hex(status);
                     print_str(b"\n");
-                    return;
+                    panic!("locale setup CM mutation did not reach exact ACK");
                 }
             }
         };
@@ -4861,6 +4854,28 @@ impl ExecNtHandler {
             b"locale-install-language-end",
             install_language_changed as u64,
         );
+        trace_setup_provision_phase(b"locale-user-value-begin", user_locale_len as u64);
+        let Some(user_locale_changed) = self.ensure_mutable_registry_value_by_path(
+            USER_INTERNATIONAL,
+            "Locale",
+            REG_SZ,
+            &user_locale[..user_locale_len],
+        ) else {
+            print_str(
+                b"[locale-setup] .Default\\Control Panel\\International mutable write failed\n",
+            );
+            panic!("locale setup .Default publication failed after SYSTEM outcome");
+        };
+        trace_setup_provision_phase(b"locale-user-value-end", user_locale_changed as u64);
+        let locale_id = parse_hex_u32(&locale_ascii)
+            .expect("generated locale id must remain hexadecimal");
+        let langid = parse_hex_u32(system_ascii)
+            .expect("generated language id must remain hexadecimal");
+        NT_SYSTEM_DEFAULT_LOCALE.store(locale_id, Ordering::Relaxed);
+        NT_SESSION_DEFAULT_LOCALE.store(locale_id, Ordering::Relaxed);
+        NT_INSTALL_UI_LANGUAGE.store(langid & 0xffff, Ordering::Relaxed);
+        NT_DEFAULT_UI_LANGUAGE.store(langid & 0xffff, Ordering::Relaxed);
+        NT_PENDING_UI_LANGUAGE.store(0, Ordering::Relaxed);
         DEFAULT_USER_LOCALE_BYTES.store(user_locale_len as u64, Ordering::Relaxed);
         DEFAULT_USER_LOCALE_TYPE.store(REG_SZ as u64, Ordering::Relaxed);
         if user_locale_changed || system_default_changed || install_language_changed {

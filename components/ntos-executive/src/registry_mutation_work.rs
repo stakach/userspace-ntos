@@ -177,20 +177,20 @@ enum Phase {
 /// Owns the exact storage effect independently of the CM preparation and COMMIT receipt.
 /// The current protocol still makes a journal durable before entering CM publication.
 /// A failed or uncertain storage release leaves the same journal here for redrive.
-struct MutationPersistence {
+pub(crate) struct MutationPersistence {
     journal: Option<writable_fs::registry_journal::Journal<()>>,
 }
 
 impl MutationPersistence {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { journal: None }
     }
 
-    fn has_journal(&self) -> bool {
+    pub(crate) fn has_journal(&self) -> bool {
         self.journal.is_some()
     }
 
-    unsafe fn admit(&mut self, bytes: Vec<u8>) -> Result<(), u32> {
+    pub(crate) unsafe fn admit(&mut self, bytes: Vec<u8>) -> Result<(), u32> {
         assert!(self.journal.is_none(), "one storage owner per CM mutation");
         let journal = writable_fs::registry_journal::Journal::admit(bytes, ())
             .map_err(|(status, _, ())| status)?;
@@ -198,22 +198,22 @@ impl MutationPersistence {
         Ok(())
     }
 
-    fn make_durable(&mut self) -> Result<(), u32> {
+    pub(crate) fn make_durable(&mut self) -> Result<(), u32> {
         self.journal.as_mut().expect("admitted CM journal").make_durable()
     }
 
-    fn begin_publication(&mut self) -> Result<(), u32> {
+    pub(crate) fn begin_publication(&mut self) -> Result<(), u32> {
         if let Some(journal) = self.journal.as_mut() {
             journal.begin_publication()?;
         }
         Ok(())
     }
 
-    fn rollback(&mut self) -> Result<(), u32> {
+    pub(crate) fn rollback(&mut self) -> Result<(), u32> {
         self.journal.as_mut().expect("unpublished CM journal").rollback()
     }
 
-    unsafe fn release_after_publication(&mut self) -> Result<(), u32> {
+    pub(crate) unsafe fn release_after_publication(&mut self) -> Result<(), u32> {
         if let Some(journal) = self.journal.take() {
             match journal.release_after_publication() {
                 Ok(()) => {}
@@ -226,7 +226,7 @@ impl MutationPersistence {
         Ok(())
     }
 
-    unsafe fn release_rolled_back(&mut self) -> Result<(), u32> {
+    pub(crate) unsafe fn release_rolled_back(&mut self) -> Result<(), u32> {
         if let Some(journal) = self.journal.take() {
             match journal.release_rolled_back() {
                 Ok(()) => {}
@@ -264,6 +264,16 @@ static TRANSFERRED: AtomicBool = AtomicBool::new(false);
 static mut EXECUTING: Option<ProviderLogicalCaller> = None;
 static EXECUTING_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
 const RETRY_DELAY: u64 = 10_000_000;
+
+/// Includes work retained across a failed CM exchange or a storage effect. The bootstrap
+/// handoff must wait for this count and the journal owner before moving Ps into the handler.
+pub(crate) fn pending_count() -> u64 {
+    PENDING.load(Ordering::Acquire)
+}
+
+pub(crate) fn redrive_active() -> bool {
+    ACTIVE.load(Ordering::Acquire)
+}
 
 /// Failure returns both canonical owners unchanged; no CM mutation has been sent.
 pub(crate) unsafe fn submit_hosted(

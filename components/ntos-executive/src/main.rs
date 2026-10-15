@@ -86,6 +86,7 @@ pub(crate) use exec_handler::file_image_section;
 mod hosted_routed_image_capture;
 mod thread_context;
 mod thread_suspend;
+mod boot_registry_mutation_work;
 mod object_wait;
 use object_wait::*;
 mod object_wait_apc;

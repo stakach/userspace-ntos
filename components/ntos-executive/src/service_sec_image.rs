@@ -8466,6 +8466,10 @@ pub(crate) unsafe fn service_sec_image(
     // broker-owned SSNs continue through the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
     clear_service_delay_drain_context();
+    // Bootstrap still owns Ps here. Drain provider CM work and its journal before moving Ps into
+    // the handler, whose constructor runs setup with an exclusive mutable borrow.
+    boot_registry_mutation_work::drain_boot_registry_before_handler_constructor()
+        .expect("provider registry owner must quiesce before live setup");
     let mut nt_handler = initialize_exec_nt_handler_once(
         exe_image_catalog as *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
         driver_starts,
