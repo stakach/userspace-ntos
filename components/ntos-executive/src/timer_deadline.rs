@@ -80,6 +80,10 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
             DELAY_TIMER_SOURCE_HOSTED_FILE_RETRY,
         ),
         (owner.component_resume, DELAY_TIMER_SOURCE_COMPONENT_RESUME),
+        (
+            service_sec_image::system_wal_fold_next_deadline(),
+            DELAY_TIMER_SOURCE_SYSTEM_WAL_FOLD,
+        ),
         (watchdog_deadline(), DELAY_TIMER_SOURCE_WATCHDOG),
         (
             driver_launch::hosted_dpc_next_deadline(now.monotonic_100ns),

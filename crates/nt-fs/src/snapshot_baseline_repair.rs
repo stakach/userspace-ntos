@@ -116,6 +116,34 @@ impl<D: SnapshotBlockDevice> WalSnapshotBaselineRepair<D> {
         result
     }
 
+    /// Establish the first durable v2 volume on a proven empty reserve. A committed first
+    /// slot is boot-repairable if the second slot or its barrier is interrupted.
+    pub fn initialize(&mut self, fs: &FileSystem) -> Result<u64, SnapshotBlockStoreError> {
+        if self.phase != Phase::Ready {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        let verified = self.verified.as_mut().expect("retained verified WAL lease");
+        let incarnation = verified.anchor().incarnation;
+        let result = (|| {
+            if self.store.read_latest(verified.device_mut())?.is_some() {
+                return Err(SnapshotBlockStoreError::Corrupt);
+            }
+            let empty = WalSnapshotManifest {
+                incarnation,
+                base_serial: 0,
+                high_water_serial: 0,
+                high_water_end_lba: 0,
+            };
+            fs.commit_volume_snapshot_for_empty_wal_migration(
+                &self.store, verified.device_mut(), empty,
+            )?;
+            self.store.repair_empty_wal_baseline(verified.device_mut(), incarnation)?
+                .ok_or(SnapshotBlockStoreError::Corrupt)
+        })();
+        self.phase = if result.is_ok() { Phase::Complete } else { Phase::Uncertain };
+        result
+    }
+
     pub fn into_verified_device(mut self) -> Result<RegistryWalVerifiedDevice<D>, Self> {
         if self.phase == Phase::Complete {
             Ok(self.verified.take().expect("completed baseline repair"))

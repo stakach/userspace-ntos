@@ -396,6 +396,25 @@ impl SnapshotBlockStore {
         {
             return Ok(BootSnapshotRecovery::Resetting);
         }
+        // Only a genuinely empty companion proves first-boot initialization. A torn header
+        // could hide a newer WAL floor and must not be overwritten by this repair.
+        let single = match (&first, &second) {
+            (Ok(Some(v2)), Ok(None)) | (Ok(None), Ok(Some(v2))) => Some(*v2),
+            _ => None,
+        };
+        if let Some(v2) = single {
+            if let Some(wal) = v2.wal {
+                if wal.incarnation == 0 || wal.base_serial != 0
+                    || wal.high_water_serial != 0 || wal.high_water_end_lba != 0
+                {
+                    return Err(SnapshotBlockStoreError::Corrupt);
+                }
+                self.validate_slot_payload_crc(dev, v2)?;
+                return Ok(BootSnapshotRecovery::InterruptedEmptyBaseline {
+                    incarnation: wal.incarnation,
+                });
+            }
+        }
         let (Some(a), Some(b)) = (first.ok().flatten(), second.ok().flatten()) else {
             // A torn companion remains the normal reader's responsibility. It will only
             // select a surviving payload under the existing same-anchor rules.

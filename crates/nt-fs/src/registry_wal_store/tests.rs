@@ -477,6 +477,54 @@ fn verified_wal_device_advances_anchor_using_the_same_physical_lease() {
 }
 
 #[test]
+fn boot_anchor_repair_restores_torn_same_anchor_companion_before_advancing_suffix() {
+    use crate::{WalSnapshotAnchorUpdate, WalSnapshotManifest};
+
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::with_sectors(32);
+    let baseline = WalSnapshotManifest {
+        incarnation: 77,
+        base_serial: 0,
+        high_water_serial: 0,
+        high_water_end_lba: 0,
+    };
+    store.commit_next_with_wal_manifest(&mut disk, b"older", baseline).unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, b"newer", baseline).unwrap();
+    let owned = OwnedBoundedBlockRange::new(disk, 16, 16).ok().unwrap();
+    let mut wal = RegistryWal::recover(owned, 77).unwrap();
+    wal.begin(alloc::vec![7; 512]).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    let verified = wal.into_verified_device().unwrap().into_full_device();
+    let mut first = WalSnapshotAnchorUpdate::admit_verified_wal(store, verified).ok().unwrap();
+    first.advance().unwrap();
+    let disk = first.into_device().unwrap();
+    // A later interrupted snapshot write tears the older payload. The selected newer
+    // snapshot and its acknowledged WAL anchor remain valid after the power cut.
+    let owned = OwnedBoundedBlockRange::new(disk, 16, 16).ok().unwrap();
+    let mut wal = RegistryWal::recover(owned, 77).unwrap();
+    wal.device_mut_for_test().parent_device_mut().corrupt(1);
+    let mut verified = wal.into_verified_device().unwrap().into_full_device();
+    let restored = store.read_latest_wal(verified.device_mut()).unwrap().unwrap();
+    assert_eq!(restored.snapshot.payload, b"newer");
+    assert_eq!(restored.anchor.serial, 1);
+
+    let mut update = match WalSnapshotAnchorUpdate::admit_verified_wal(store, verified) {
+        Ok(update) => update,
+        Err((error, verified)) => {
+            core::mem::forget(verified);
+            panic!("same-anchor torn companion must be repairable before boot publication: {error:?}");
+        }
+    };
+    update.advance().unwrap();
+    let mut disk = update.into_device().unwrap();
+    let restored = store.read_latest_wal(&mut disk).unwrap().unwrap();
+    assert_eq!(restored.snapshot.payload, b"newer");
+    assert_eq!(restored.anchor.serial, 1);
+    assert_eq!(store.current_wal_checkpoint_manifest(&mut disk).unwrap().high_water_serial, 1);
+}
+
+#[test]
 fn rejected_anchor_admission_returns_verified_owner_with_lease_held() {
     use crate::{WalSnapshotAnchorUpdate, WalSnapshotManifest};
 

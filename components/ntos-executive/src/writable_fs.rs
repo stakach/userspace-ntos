@@ -42,6 +42,10 @@ pub(crate) mod registry_journal;
 #[path = "writable_fs/registry_wal.rs"]
 pub(crate) mod registry_wal;
 
+#[path = "writable_fs/system_wal_fold.rs"]
+mod system_wal_fold;
+pub(crate) use system_wal_fold::{fold_system_wal_if_dirty, system_wal_fold_ack_pending};
+
 #[path = "writable_fs/file_cleanup.rs"]
 mod file_cleanup;
 pub(crate) use file_cleanup::{
@@ -414,7 +418,7 @@ static WRITABLE_FS_RUNTIME_DIRTY: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_SNAPSHOT_DIRTY: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED: AtomicBool = AtomicBool::new(false);
 /// The mounted filesystem's durable snapshot format, recorded before it is published.
-/// Generic checkpoints preserve this format; CM journal mutation writes remain v1-only.
+/// Generic checkpoints preserve this format; CM mutations use the v2 WAL when mounted.
 static WRITABLE_FS_MOUNTED_WAL_FORMAT: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_SNAPSHOT_RESTORE_STATE: AtomicU64 = AtomicU64::new(0);
 const SNAPSHOT_RESTORE_UNREAD: u64 = 0;
@@ -423,6 +427,17 @@ const SNAPSHOT_RESTORE_CONSUMED: u64 = 2;
 
 pub(crate) fn legacy_snapshot_writes_allowed() -> bool {
     !WRITABLE_FS_MOUNTED_WAL_FORMAT.load(Ordering::Acquire)
+}
+
+pub(crate) fn system_wal_fold_blocked() -> bool {
+    WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire)
+}
+
+/// A legacy SYSTEM checkpoint may have changed a snapshot slot before a provider error was
+/// reported. Preserve its CM preparation and refuse all later mount writes until boot recovery.
+pub(crate) fn block_uncertain_system_checkpoint() {
+    WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+    WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
 }
 
 fn note_mounted_snapshot_format(format: nt_fs::SnapshotReadFormat) {
@@ -771,11 +786,61 @@ unsafe fn checkpoint_volume_snapshot(
     }
 }
 
+/// Prove the mounted SYSTEM WAL has a complete, paired durable prefix. Every v2 mutation
+/// crosses its marker and both anchor barriers before its caller receives success; the reserve
+/// lease excludes a mutation still crossing those barriers. NtFlushKey needs this durability
+/// fence even when no full snapshot fold is due.
+pub(crate) unsafe fn verify_durable_system_wal() -> Result<(), u32> {
+    ensure_mounted()?;
+    if legacy_snapshot_writes_allowed() || WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire) {
+        return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+    }
+    let mut lease = snapshot_storage::acquire()?;
+    let store = lease.store();
+    let manifest = store.current_wal_checkpoint_manifest(&mut lease)
+        .and_then(|manifest| {
+            store.validate_wal_journal_manifest(&mut lease, manifest)?;
+            Ok(manifest)
+        })
+        .map_err(|error| {
+            WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+            snapshot_store_error_status(error)
+        })?;
+    let expected = nt_fs::WalSnapshotAnchor {
+        incarnation: manifest.incarnation,
+        serial: manifest.high_water_serial,
+        end_lba: manifest.high_water_end_lba,
+    };
+    let range = snapshot_storage::owned_wal_region(lease).map_err(|(status, _lease)| {
+        WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+        status
+    })?;
+    let wal = nt_fs::RegistryWal::recover(range, manifest.incarnation).map_err(|_| {
+        WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+        nt_fs::STATUS_DATA_ERROR
+    })?;
+    if wal.state() != nt_fs::RegistryWalState::Ready || wal.settled_anchor() != Some(expected) {
+        WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+        core::mem::forget(wal);
+        return Err(nt_fs::STATUS_DATA_ERROR);
+    }
+    let range = match wal.into_device() {
+        Ok(range) => range,
+        Err(wal) => {
+            WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+            core::mem::forget(wal);
+            return Err(nt_fs::STATUS_DATA_ERROR);
+        }
+    };
+    drop(range);
+    Ok(())
+}
+
 /// Commit pending volume bytes. `Ok(true)` means a new durable snapshot was published, while
 /// `Ok(false)` means the volume was already clean.
 pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
     let wal_format = !legacy_snapshot_writes_allowed();
-    if wal_format && WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire) {
+    if WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire) {
         return Err(nt_fs::STATUS_DEVICE_NOT_READY);
     }
     // Even a clean observation needs exclusion: another owner may have cleared the bit but not
@@ -812,12 +877,10 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
         Err(status) => {
             WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
             WRITABLE_FS_SNAPSHOT_FAILURES.fetch_add(1, Ordering::Relaxed);
-            if wal_format {
-                // Any failed v2 snapshot write may have changed a slot. Retain the exact
-                // physical reserve and block the live mount until boot recovery decides it.
-                WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
-                core::mem::forget(dev);
-            }
+            // Either snapshot format can have changed a slot before reporting failure.
+            // Retain the physical reserve and let boot recovery choose the durable image.
+            WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+            core::mem::forget(dev);
             print_str(b"[writable-fs-snapshot] dirty checkpoint retained after status=0x");
             print_hex(status);
             print_str(b"\n");
@@ -1138,6 +1201,14 @@ pub(crate) enum BootSystemPersistence {
     Restored(RestoredBootSystem),
 }
 
+enum BootSystemReserveOwner {
+    Legacy(snapshot_storage::Lease),
+    Wal {
+        store: nt_fs::SnapshotBlockStore,
+        verified: nt_fs::RegistryWalVerifiedDevice<snapshot_storage::Lease>,
+    },
+}
+
 pub(crate) struct RestoredBootSystem {
     pub(crate) snapshot_generation: u64,
     pub(crate) snapshot_bytes: usize,
@@ -1146,7 +1217,7 @@ pub(crate) struct RestoredBootSystem {
     pub(crate) wal_suffix: Option<nt_hive_regf::BootSystemWalSuffix>,
     fs: Option<nt_fs::FileSystem>,
     format: nt_fs::SnapshotReadFormat,
-    _lease: Option<snapshot_storage::Lease>,
+    _lease: Option<BootSystemReserveOwner>,
 }
 
 fn replace_boot_file(fs: &mut nt_fs::FileSystem, path: &str, bytes: alloc::vec::Vec<u8>) -> Result<(), u32> {
@@ -1181,13 +1252,69 @@ fn fold_boot_system_sidecar(fs: &mut nt_fs::FileSystem, composed_image: &[u8]) -
     replace_boot_file(fs, &log_path, alloc::vec::Vec::new())
 }
 
-/// This admission has no constructor until all native CM mutation paths share the retained v2
-/// WAL owner. Boot can repair an interrupted migration, but cannot start one ahead of cutover.
-#[allow(dead_code)]
+/// Boot cutover is admitted only after native mutation, flush, and shutdown paths use the
+/// retained v2 WAL owner. A caller must finish the baseline before importing SYSTEM into CM.
 pub(crate) struct BootWalCutoverAdmission { _sealed: () }
 
+pub(crate) fn boot_wal_cutover_admission() -> BootWalCutoverAdmission {
+    BootWalCutoverAdmission { _sealed: () }
+}
+
+/// First boot has no legacy snapshot to migrate. Install the composed SYSTEM image into a new
+/// volume and commit both empty-WAL v2 slots under one verified reserve lease before publication.
+pub(crate) unsafe fn initialize_empty_boot_system_wal(
+    image: &[u8],
+    _admission: BootWalCutoverAdmission,
+) -> Result<u64, BootSystemRestoreError> {
+    let mut fs = nt_fs::FileSystem::new(nt_fs::MemFs::new());
+    // The fresh MemFs has no Config or Profiles parents. Stage the installed source tree into
+    // the same image that becomes the first durable baseline, then replace its SYSTEM primary.
+    provision_missing_installed_sources(&mut fs);
+    fold_boot_system_sidecar(&mut fs, image).map_err(BootSystemRestoreError::Snapshot)?;
+    let lease = snapshot_storage::acquire().map_err(BootSystemRestoreError::Snapshot)?;
+    snapshot_storage::wal_bounds(&lease).map_err(BootSystemRestoreError::Snapshot)?;
+    let store = lease.store();
+    let range = snapshot_storage::owned_wal_region(lease)
+        .map_err(|(status, _lease)| BootSystemRestoreError::Snapshot(status))?;
+    let wal = nt_fs::RegistryWal::recover(range, 1).map_err(BootSystemRestoreError::Wal)?;
+    if wal.state() != nt_fs::RegistryWalState::Ready
+        || wal.settled_anchor() != Some(nt_fs::WalSnapshotAnchor {
+            incarnation: 1, serial: 0, end_lba: 0,
+        })
+    {
+        core::mem::forget(wal);
+        return Err(BootSystemRestoreError::Wal(nt_fs::RegistryWalError::InvalidState));
+    }
+    let verified = match wal.into_verified_device() {
+        Ok(verified) => verified.into_full_device(),
+        Err(wal) => {
+            core::mem::forget(wal);
+            return Err(BootSystemRestoreError::Wal(nt_fs::RegistryWalError::InvalidState));
+        }
+    };
+    let mut initialization = nt_fs::WalSnapshotBaselineRepair::admit(store, verified)
+        .map_err(|(error, _verified)| BootSystemRestoreError::Snapshot(snapshot_store_error_status(error)))?;
+    let generation = match initialization.initialize(&fs) {
+        Ok(generation) => generation,
+        Err(error) => {
+            core::mem::forget(initialization);
+            return Err(BootSystemRestoreError::Snapshot(snapshot_store_error_status(error)));
+        }
+    };
+    drop(initialization.into_verified_device()
+        .expect("completed empty WAL initialization").into_device());
+    note_mounted_snapshot_format(nt_fs::SnapshotReadFormat::Wal {
+        selected_base_serial: 0,
+        anchor: nt_fs::WalSnapshotAnchor { incarnation: 1, serial: 0, end_lba: 0 },
+    });
+    if install_writable_fs(fs, true).is_err() {
+        WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+        return Err(BootSystemRestoreError::MountBlocked);
+    }
+    Ok(generation)
+}
+
 impl RestoredBootSystem {
-    #[allow(dead_code)]
     pub(crate) fn migrate_composed_boot_system(
         &mut self,
         composed_image: &[u8],
@@ -1195,7 +1322,10 @@ impl RestoredBootSystem {
     ) -> Result<(), BootSystemRestoreError> {
         let fs = self.fs.as_mut().expect("unpublished boot filesystem");
         if self.format == nt_fs::SnapshotReadFormat::Legacy {
-            let lease = self._lease.take().expect("retained boot reserve lease");
+            let BootSystemReserveOwner::Legacy(lease) = self._lease.take()
+                .expect("retained boot reserve lease") else {
+                unreachable!("legacy snapshot has a legacy reserve owner")
+            };
             snapshot_storage::wal_bounds(&lease)
                 .map_err(BootSystemRestoreError::Snapshot)?;
                 fold_boot_system_sidecar(fs, composed_image)
@@ -1231,9 +1361,11 @@ impl RestoredBootSystem {
                         return Err(BootSystemRestoreError::Snapshot(snapshot_store_error_status(error)));
                     }
                 };
-                self._lease = Some(migration.into_verified_device()
-                    .expect("completed WAL baseline migration")
-                    .into_device());
+                self._lease = Some(BootSystemReserveOwner::Legacy(
+                    migration.into_verified_device()
+                        .expect("completed WAL baseline migration")
+                        .into_device(),
+                ));
                 self.snapshot_generation = generation;
                 self.format = nt_fs::SnapshotReadFormat::Wal {
                     selected_base_serial: 0,
@@ -1245,6 +1377,20 @@ impl RestoredBootSystem {
 
     /// Publish only after the caller has semantically composed and encoded the CM hive.
     pub(crate) unsafe fn publish(mut self) -> Result<(), BootSystemRestoreError> {
+        if let Some(BootSystemReserveOwner::Wal { store, verified }) = self._lease.take() {
+            let mut update = match nt_fs::WalSnapshotAnchorUpdate::admit_verified_wal(store, verified) {
+                Ok(update) => update,
+                Err((error, verified)) => {
+                    core::mem::forget(verified);
+                    return Err(BootSystemRestoreError::Snapshot(snapshot_store_error_status(error)));
+                }
+            };
+            if let Err(error) = update.advance() {
+                core::mem::forget(update);
+                return Err(BootSystemRestoreError::Snapshot(snapshot_store_error_status(error)));
+            }
+            drop(update.into_device().expect("paired WAL anchors published"));
+        }
         let fs = self.fs.as_ref().expect("unpublished boot filesystem");
         let nodes = fs.node_count();
         note_mounted_snapshot_format(self.format);
@@ -1291,10 +1437,11 @@ fn verified_boot_log(
     metadata: nt_fs::StoredSnapshotMetadata,
     log: alloc::vec::Vec<u8>,
     lease: snapshot_storage::Lease,
-) -> Result<(alloc::vec::Vec<u8>, Option<nt_hive_regf::BootSystemWalSuffix>, snapshot_storage::Lease), BootSystemRestoreError> {
+) -> Result<(alloc::vec::Vec<u8>, Option<nt_hive_regf::BootSystemWalSuffix>, BootSystemReserveOwner), BootSystemRestoreError> {
     let nt_fs::SnapshotReadFormat::Wal { anchor, selected_base_serial } = metadata.format else {
-        return Ok((log, None, lease));
+        return Ok((log, None, BootSystemReserveOwner::Legacy(lease)));
     };
+    let store = lease.store();
     let range = snapshot_storage::owned_wal_region(lease)
         .map_err(|(status, _lease)| BootSystemRestoreError::Snapshot(status))?;
     let mut wal = nt_fs::RegistryWal::recover(range, anchor.incarnation)
@@ -1333,14 +1480,14 @@ fn verified_boot_log(
             last_sequence,
         }
     });
-    let lease = match wal.into_device() {
-        Ok(range) => range.into_device(),
+    let verified = match wal.into_verified_device() {
+        Ok(verified) => verified.into_full_device(),
         Err(wal) => {
             core::mem::forget(wal);
             return Err(BootSystemRestoreError::Wal(nt_fs::RegistryWalError::InvalidState));
         }
     };
-    Ok((verified_log, wal_suffix, lease))
+    Ok((verified_log, wal_suffix, BootSystemReserveOwner::Wal { store, verified }))
 }
 
 /// Restore and classify persisted SYSTEM state before publishing or provisioning the writable FS.

@@ -5,7 +5,8 @@
 use nt_config_client::{
     CmMutationBeginAttempt, CmMutationBeginAttempts, CmMutationBeginOperation,
     CmMutationPreparationOperation, CmMutationPreparationPhase, PreparedSystemHiveMutation,
-    SystemHiveMutationAbortReceipt, SystemHiveMutationCommitReceipt,
+    SystemHiveMutationAbortAcknowledgement, SystemHiveMutationAbortReceipt,
+    SystemHiveMutationAcknowledgement, SystemHiveMutationCommitReceipt,
     SystemHiveMutationPreparation,
 };
 
@@ -17,6 +18,7 @@ enum HostedRelationPublicationPhase {
     Admit,
     Durable,
     Commit,
+    DurableCommit,
     Reprepare,
     PostCommitRepair,
     FinishLocalPublication,
@@ -25,6 +27,7 @@ enum HostedRelationPublicationPhase {
     ReleaseBus,
     Rollback,
     Abort,
+    AbortStorage,
     AcknowledgeAbort,
     ReleaseRollback,
     AbortProvider,
@@ -70,7 +73,9 @@ struct HostedRelationPublication {
     prepared: Option<PreparedSystemHiveMutation>,
     persistence: crate::registry_mutation_work::MutationPersistence,
     receipt: Option<SystemHiveMutationCommitReceipt>,
+    acknowledgement: Option<SystemHiveMutationAcknowledgement>,
     abort_receipt: Option<SystemHiveMutationAbortReceipt>,
+    abort_acknowledgement: Option<SystemHiveMutationAbortAcknowledgement>,
     phase: HostedRelationPublicationPhase,
     commit_entered: bool,
     preparation_refused: bool,
@@ -262,10 +267,6 @@ unsafe fn advance_hosted_relation_publication(
                     owner.phase = Phase::Abort;
                     continue;
                 }
-                if prepared.durable_journal().is_empty() {
-                    owner.phase = Phase::Commit;
-                    continue;
-                }
                 let mut bytes = Vec::new();
                 if bytes.try_reserve_exact(prepared.durable_journal().len()).is_err() {
                     owner.refusal = nt_status::NtStatus::INSUFFICIENT_RESOURCES;
@@ -273,7 +274,7 @@ unsafe fn advance_hosted_relation_publication(
                     continue;
                 }
                 bytes.extend_from_slice(prepared.durable_journal());
-                if let Err(status) = owner.persistence.admit(bytes) {
+                if let Err(status) = owner.persistence.admit(prepared, bytes) {
                     owner.refusal = nt_status::NtStatus(status as i32);
                     owner.phase = Phase::Abort;
                     continue;
@@ -299,7 +300,16 @@ unsafe fn advance_hosted_relation_publication(
                     Ok(receipt) => receipt,
                     Err(_) => return owner.pending(),
                 };
-                let outcome = receipt.outcome();
+                owner.receipt = Some(receipt);
+                owner.phase = Phase::DurableCommit;
+            }
+            Phase::DurableCommit => {
+                if owner.persistence.commit_durable(
+                    owner.receipt.expect("retained relation COMMIT receipt"),
+                ).is_err() {
+                    return owner.pending();
+                }
+                let outcome = owner.receipt.expect("retained relation COMMIT receipt").outcome();
                 crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.fetch_max(
                     outcome.generation, Ordering::AcqRel,
                 );
@@ -308,7 +318,6 @@ unsafe fn advance_hosted_relation_publication(
                 {
                     crate::config_manager_request_device_action_wake();
                 }
-                owner.receipt = Some(receipt);
                 owner.phase = Phase::PostCommitRepair;
             }
             Phase::Reprepare => {
@@ -444,15 +453,21 @@ unsafe fn advance_hosted_relation_publication(
                 continue;
             }
             Phase::Acknowledge => {
-                if crate::cm_mutation_transport::acknowledge(
-                    owner.receipt.expect("retained relation COMMIT receipt"),
-                ).is_err() {
-                    return owner.pending();
+                if owner.acknowledgement.is_none() {
+                    let acknowledgement = match crate::cm_mutation_transport::acknowledge(
+                        owner.receipt.expect("retained relation COMMIT receipt"),
+                    ) {
+                        Ok(acknowledgement) => acknowledgement,
+                        Err(_) => return owner.pending(),
+                    };
+                    owner.acknowledgement = Some(acknowledgement);
                 }
                 owner.phase = Phase::Release;
             }
             Phase::Release => {
-                if owner.persistence.release_after_publication().is_err() {
+                if owner.persistence.release_after_publication(
+                    owner.acknowledgement.expect("retained relation COMMIT acknowledgement"),
+                ).is_err() {
                     return owner.pending();
                 }
                 owner.phase = Phase::ReleaseBus;
@@ -480,22 +495,32 @@ unsafe fn advance_hosted_relation_publication(
                     Err(_) => return owner.pending(),
                 };
                 owner.abort_receipt = Some(receipt);
-                owner.phase = Phase::AcknowledgeAbort;
+                owner.phase = Phase::AbortStorage;
             }
-            Phase::AcknowledgeAbort => {
-                if crate::cm_mutation_transport::acknowledge_abort(
-                    owner.abort_receipt.expect("retained relation abort receipt"),
+            Phase::AbortStorage => {
+                if owner.persistence.abort_after_receipt(
+                    owner.abort_receipt.expect("retained relation ABORT receipt"),
                 ).is_err() {
                     return owner.pending();
                 }
-                owner.phase = if owner.persistence.has_journal() {
-                    Phase::ReleaseRollback
-                } else {
-                    Phase::AbortProvider
-                };
+                owner.phase = Phase::AcknowledgeAbort;
+            }
+            Phase::AcknowledgeAbort => {
+                if owner.abort_acknowledgement.is_none() {
+                    let acknowledgement = match crate::cm_mutation_transport::acknowledge_abort(
+                        owner.abort_receipt.expect("retained relation abort receipt"),
+                    ) {
+                        Ok(acknowledgement) => acknowledgement,
+                        Err(_) => return owner.pending(),
+                    };
+                    owner.abort_acknowledgement = Some(acknowledgement);
+                }
+                owner.phase = Phase::ReleaseRollback;
             }
             Phase::ReleaseRollback => {
-                if owner.persistence.release_rolled_back().is_err() {
+                if owner.persistence.release_rolled_back(
+                    owner.abort_acknowledgement.expect("retained relation ABORT acknowledgement"),
+                ).is_err() {
                     return owner.pending();
                 }
                 owner.phase = Phase::AbortProvider;

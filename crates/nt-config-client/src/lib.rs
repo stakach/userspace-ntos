@@ -4506,6 +4506,19 @@ mod tests {
             .prepare_system_hive_checkpoint(2)
             .unwrap()
             .expect("aborted checkpoint must remain dirty");
+        // Simulate the server applying ACK while the caller loses the reply.
+        // The retained client checkpoint must remain usable for exact retry.
+        let lost_reply = client
+            .hive_checkpoint_call(
+                hive_checkpoint_transfer::ACK,
+                checkpoint.transfer_token,
+                checkpoint.mount_generation,
+                checkpoint.transfer_len,
+                0,
+                &mut [],
+            )
+            .unwrap();
+        assert_eq!(lost_reply.status, STATUS_SUCCESS);
         client
             .acknowledge_system_hive_checkpoint(&checkpoint)
             .unwrap();

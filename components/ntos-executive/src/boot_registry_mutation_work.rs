@@ -7,8 +7,8 @@ use crate::*;
 use nt_config_client::{
     CmMutationBeginAttempt, CmMutationBeginAttempts, CmMutationBeginOperation,
     CmMutationPreparationOperation, CmMutationPreparationPhase, PreparedSystemHiveMutation,
-    SystemHiveMutation, SystemHiveMutationAbortReceipt, SystemHiveMutationCommitReceipt,
-    SystemHiveMutationPreparation,
+    SystemHiveMutation, SystemHiveMutationAbortAcknowledgement, SystemHiveMutationAbortReceipt,
+    SystemHiveMutationAcknowledgement, SystemHiveMutationCommitReceipt, SystemHiveMutationPreparation,
 };
 
 use crate::registry_mutation_work::MutationPersistence;
@@ -27,17 +27,25 @@ pub(crate) enum BootRegistryStage {
 static mut BOOT_WORK: Option<BootSystemMutationWork<BootRegistryStage>> = None;
 static mut BOOT_STAGE: Option<BootRegistryStage> = None;
 
+pub(crate) struct DurableSystemHiveMutationOutcome {
+    pub generation: u64,
+    pub wake_device_action: bool,
+    pub journaled: bool,
+}
+
 enum Phase<C> {
     Begin(CmMutationBeginAttempt<C>),
     Prepare(SystemHiveMutationPreparation<C>),
     Admit,
     Durable,
     Commit,
+    CommitDurable,
     Acknowledge,
-    Release,
+    Release(SystemHiveMutationAcknowledgement),
     Abort,
+    AbortDurable(SystemHiveMutationAbortReceipt),
     AcknowledgeAbort(SystemHiveMutationAbortReceipt),
-    ReleaseRollback,
+    ReleaseRollback(SystemHiveMutationAbortAcknowledgement),
     Complete,
 }
 
@@ -180,22 +188,18 @@ impl<C> BootSystemMutationWork<C> {
                     return BootMutationProgress::Pending;
                 }
                 let journal = prepared.durable_journal();
-                if journal.is_empty() {
-                    self.phase = Some(Phase::Commit);
-                } else {
-                    let mut bytes = Vec::new();
-                    if bytes.try_reserve_exact(journal.len()).is_err() {
-                        self.status = 0xC000_009Au32 as i32;
+                let mut bytes = Vec::new();
+                if bytes.try_reserve_exact(journal.len()).is_err() {
+                    self.status = 0xC000_009Au32 as i32;
+                    self.phase = Some(Phase::Abort);
+                    return BootMutationProgress::Pending;
+                }
+                bytes.extend_from_slice(journal);
+                match self.persistence.admit(prepared, bytes) {
+                    Ok(()) => self.phase = Some(Phase::Durable),
+                    Err(status) => {
+                        self.status = status as i32;
                         self.phase = Some(Phase::Abort);
-                        return BootMutationProgress::Pending;
-                    }
-                    bytes.extend_from_slice(journal);
-                    match self.persistence.admit(bytes) {
-                        Ok(()) => self.phase = Some(Phase::Durable),
-                        Err(status) => {
-                            self.status = status as i32;
-                            self.phase = Some(Phase::Abort);
-                        }
                     }
                 }
             }
@@ -218,6 +222,14 @@ impl<C> BootSystemMutationWork<C> {
                 let Ok(receipt) = cm_mutation_transport::commit(prepared) else {
                     return BootMutationProgress::Blocked;
                 };
+                self.receipt = Some(receipt);
+                self.phase = Some(Phase::CommitDurable);
+            }
+            Phase::CommitDurable => {
+                let receipt = self.receipt.expect("retained CM COMMIT receipt");
+                if self.persistence.commit_durable(receipt).is_err() {
+                    return BootMutationProgress::Blocked;
+                }
                 let published = receipt.outcome();
                 LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.fetch_max(published.generation, Ordering::AcqRel);
                 let wake_device_action = published.has_pending_device_action
@@ -230,19 +242,18 @@ impl<C> BootSystemMutationWork<C> {
                     wake_device_action,
                     journaled: self.persistence.has_journal(),
                 });
-                self.receipt = Some(receipt);
                 self.phase = Some(Phase::Acknowledge);
             }
             Phase::Acknowledge => {
                 let receipt = self.receipt.expect("retained CM COMMIT receipt");
-                if cm_mutation_transport::acknowledge(receipt).is_ok() {
-                    self.phase = Some(Phase::Release);
-                } else {
+                let Ok(ack) = cm_mutation_transport::acknowledge(receipt) else {
                     return BootMutationProgress::Blocked;
-                }
+                };
+                self.phase = Some(Phase::Release(ack));
             }
-            Phase::Release => {
-                if self.persistence.release_after_publication().is_ok() {
+            Phase::Release(ack) => {
+                let ack = *ack;
+                if self.persistence.release_after_publication(ack).is_ok() {
                     self.phase = Some(Phase::Complete);
                 } else {
                     return BootMutationProgress::Blocked;
@@ -252,22 +263,28 @@ impl<C> BootSystemMutationWork<C> {
                 assert!(!self.commit_entered, "published CM work cannot abort");
                 let prepared = self.prepared.as_ref().expect("precommit CM preparation");
                 if let Ok(receipt) = cm_mutation_transport::abort(prepared) {
+                    self.phase = Some(Phase::AbortDurable(receipt));
+                } else {
+                    return BootMutationProgress::Blocked;
+                }
+            }
+            Phase::AbortDurable(receipt) => {
+                let receipt = *receipt;
+                if self.persistence.abort_after_receipt(receipt).is_ok() {
                     self.phase = Some(Phase::AcknowledgeAbort(receipt));
                 } else {
                     return BootMutationProgress::Blocked;
                 }
             }
             Phase::AcknowledgeAbort(receipt) => {
-                if cm_mutation_transport::acknowledge_abort(*receipt).is_ok() {
-                    self.phase = Some(Phase::ReleaseRollback);
-                } else {
+                let Ok(ack) = cm_mutation_transport::acknowledge_abort(*receipt) else {
                     return BootMutationProgress::Blocked;
-                }
+                };
+                self.phase = Some(Phase::ReleaseRollback(ack));
             }
-            Phase::ReleaseRollback => {
-                if !self.persistence.has_journal()
-                    || self.persistence.release_rolled_back().is_ok()
-                {
+            Phase::ReleaseRollback(ack) => {
+                let ack = *ack;
+                if self.persistence.release_rolled_back(ack).is_ok() {
                     self.phase = Some(Phase::Complete);
                 } else {
                     return BootMutationProgress::Blocked;

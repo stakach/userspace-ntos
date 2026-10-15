@@ -80,21 +80,17 @@ fn acknowledged_direct_journal_publication_reports_nonempty_durable_progress() {
 }
 
 #[test]
-fn cm_publication_reports_progress_only_after_acknowledged_commit() {
-    struct Audit { acknowledged: bool, found: usize, premature: usize }
+fn cm_publication_reports_progress_only_after_durable_commit() {
+    struct Audit { durable: bool, found: usize, premature: usize }
     impl<'ast> Visit<'ast> for Audit {
-        fn visit_expr_try(&mut self, expression: &'ast syn::ExprTry) {
-            if matches!(&*expression.expr, syn::Expr::Call(call)
-                if matches!(&*call.func, syn::Expr::Path(path)
-                    if path.path.segments.iter().map(|part| part.ident.to_string()).collect::<Vec<_>>()
-                        == ["cm_mutation_transport", "commit"]))
-            { self.acknowledged = true; }
-            syn::visit::visit_expr_try(self, expression);
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if call.method == "commit_durable" { self.durable = true; }
+            syn::visit::visit_expr_method_call(self, call);
         }
         fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
             if progress(call) {
                 self.found += 1;
-                self.premature += usize::from(!self.acknowledged);
+                self.premature += usize::from(!self.durable);
             }
             syn::visit::visit_expr_call(self, call);
         }
@@ -103,12 +99,12 @@ fn cm_publication_reports_progress_only_after_acknowledged_commit() {
     impl<'ast> Visit<'ast> for CommitArm {
         fn visit_arm(&mut self, arm: &'ast syn::Arm) {
             if matches!(&arm.pat, syn::Pat::Path(path)
-                if path.path.segments.last().is_some_and(|part| part.ident == "Commit"))
+                if path.path.segments.last().is_some_and(|part| part.ident == "CommitDurable"))
             {
-                let mut audit = Audit { acknowledged: false, found: 0, premature: 0 };
+                let mut audit = Audit { durable: false, found: 0, premature: 0 };
                 audit.visit_expr(&arm.body);
-                assert_eq!(audit.found, 1, "acknowledged CM publication must report sealed progress");
-                assert_eq!(audit.premature, 0, "prepare, durability and uncertain COMMIT are not publication ACKs");
+                assert_eq!(audit.found, 1, "durably anchored CM publication must report sealed progress");
+                assert_eq!(audit.premature, 0, "prepare and uncertain COMMIT are not durable publication");
                 self.found = true;
             }
             syn::visit::visit_arm(self, arm);
@@ -117,7 +113,7 @@ fn cm_publication_reports_progress_only_after_acknowledged_commit() {
     let file = parse(include_str!("../../../components/ntos-executive/src/registry_mutation_work.rs"));
     let mut audit = CommitArm { found: false };
     audit.visit_block(function(&file, "advance"));
-    assert!(audit.found, "audit the actual retained CM Commit phase");
+    assert!(audit.found, "audit the actual retained CM CommitDurable phase");
 }
 
 #[test]

@@ -124,19 +124,20 @@ fn writable_hive_provider_refuses_v2_system_log_append_before_file_effect() {
 }
 
 #[test]
-fn legacy_system_mutation_paths_refuse_v2_before_effects_and_abort_prepared_cm_work() {
+fn retired_one_shot_system_mutation_path_cannot_bypass_retained_owner() {
     let main = include_str!("../../../components/ntos-executive/src/main.rs");
-    let legacy = &main[main.find("pub(crate) unsafe fn persist_and_publish_system_hive_mutation(").unwrap()
-        ..main.find("\npub(crate) unsafe fn config_manager_prepare_system_hive_checkpoint(").unwrap()];
-    let guard = legacy.find("legacy_snapshot_writes_allowed()")
-        .expect("one-shot CM mutation must refuse mounted v2 before preparing CM or writing LOG");
-    let prepare = legacy.find("config_manager_prepare_system_hive_mutation(").unwrap();
-    assert!(guard < prepare);
+    assert!(!main.contains("fn persist_and_publish_system_hive_mutation("));
+    assert!(!main.contains("fn config_manager_publish_system_hive_mutation("));
 
     let worker = include_str!("../../../components/ntos-executive/src/registry_mutation_work.rs");
+    let owner = &worker[worker.find("pub(crate) struct MutationPersistence").unwrap()
+        ..worker.find("struct Work {").unwrap()];
+    assert!(owner.contains("ensure_mounted()") && owner.contains("legacy_snapshot_writes_allowed()"),
+        "retained CM work must classify a lazy restored volume before storage effects");
+    assert!(owner.contains("WalJournal::admit(prepared, bytes)"),
+        "v2 admission uses the exact CM preparation instead of legacy journal storage");
     let admit = &worker[worker.find("Phase::Admit => {").unwrap()..worker.find("Phase::Durable => {").unwrap()];
-    assert!(admit.contains("ensure_mounted()") && admit.contains("legacy_snapshot_writes_allowed()"),
-        "retained CM work must classify a lazy restored v2 volume before storage effects");
+    assert!(admit.contains("work.persistence.admit(prepared, bytes)"));
     assert!(admit.contains("work.phase = Phase::Abort"),
         "a refused v2 v1-storage admission must abort the still-prepared CM mutation");
 }
@@ -144,7 +145,7 @@ fn legacy_system_mutation_paths_refuse_v2_before_effects_and_abort_prepared_cm_w
 #[test]
 fn journal_bearing_cm_mutations_still_require_precommit_storage() {
     let source = include_str!("../../../components/ntos-executive/src/registry_mutation_work.rs");
-    let start = source.find("enum SystemMutationStorage {").unwrap();
+    let start = source.find("fn system_mutation_storage(").unwrap();
     let end = source[start..].find("\nenum Phase {").unwrap() + start;
     let seam = &source[start..end];
     syn::parse_str::<syn::File>(seam).expect("native storage seam parses");
@@ -154,9 +155,9 @@ fn journal_bearing_cm_mutations_still_require_precommit_storage() {
          {seam}\n\
          fn main() {{\n\
              let empty = PreparedSystemHiveMutation {{ journal: Vec::new() }};\n\
-             assert!(matches!(system_mutation_storage(&empty), Ok(SystemMutationStorage::NoJournal)));\n\
+             assert!(matches!(system_mutation_storage(&empty), Ok(bytes) if bytes.is_empty()));\n\
              let prepared = PreparedSystemHiveMutation {{ journal: vec![1, 2, 3] }};\n\
-             assert!(matches!(system_mutation_storage(&prepared), Ok(SystemMutationStorage::PrecommitJournal(bytes)) if bytes == [1, 2, 3]));\n\
+             assert!(matches!(system_mutation_storage(&prepared), Ok(bytes) if bytes == [1, 2, 3]));\n\
          }}"
     );
     let directory = std::env::temp_dir().join(format!(
@@ -187,57 +188,124 @@ fn journal_bearing_cm_mutations_still_require_precommit_storage() {
 #[test]
 fn cm_persistence_owner_retains_refused_release_for_exact_retry() {
     let source = include_str!("../../../components/ntos-executive/src/registry_mutation_work.rs");
-    let start = source.find("struct MutationPersistence {").unwrap();
+    let start = source.find("enum PersistenceOwner {").unwrap();
     let end = source[start..].find("\nstruct Work {").unwrap() + start;
     let owner = &source[start..end];
     syn::parse_str::<syn::File>(owner).expect("native persistence owner parses");
-    let harness = format!(r#"
-        mod writable_fs {{ pub mod registry_journal {{
-            pub struct Journal<C> {{ pub context: C, pub phase: u8, pub refuse_release: bool }}
-            impl Journal<()> {{
-                pub unsafe fn admit(_: Vec<u8>, context: ()) -> Result<Self, (u32, Vec<u8>, ())> {{
-                    Ok(Self {{ context, phase: 0, refuse_release: true }})
-                }}
-                pub fn make_durable(&mut self) -> Result<(), u32> {{
-                    assert_eq!(self.phase, 0); self.phase = 1; Ok(())
-                }}
-                pub fn begin_publication(&mut self) -> Result<&mut (), u32> {{
-                    assert_eq!(self.phase, 1); self.phase = 2; Ok(&mut self.context)
-                }}
-                pub fn rollback(&mut self) -> Result<(), u32> {{
-                    assert_eq!(self.phase, 1); self.phase = 3; Ok(())
-                }}
-                pub unsafe fn release_after_publication(mut self) -> Result<(), Self> {{
-                    assert_eq!(self.phase, 2);
-                    if self.refuse_release {{ self.refuse_release = false; Err(self) }} else {{ Ok(()) }}
-                }}
-                pub unsafe fn release_rolled_back(mut self) -> Result<(), Self> {{
-                    assert_eq!(self.phase, 3);
-                    if self.refuse_release {{ self.refuse_release = false; Err(self) }} else {{ Ok(()) }}
-                }}
-            }}
-        }} }}
-        {owner}
-        fn main() {{ unsafe {{
+    let harness = String::from(r#"
+        use std::vec::Vec;
+        #[derive(Clone, Copy, PartialEq, Eq)] struct SystemHiveMutationStorageBinding(u8);
+        struct PreparedSystemHiveMutation(SystemHiveMutationStorageBinding);
+        impl PreparedSystemHiveMutation {
+            fn storage_binding(&self) -> SystemHiveMutationStorageBinding { self.0 }
+        }
+        #[derive(Clone, Copy, PartialEq, Eq)] struct SystemHiveMutationCommitReceipt(u8);
+        impl SystemHiveMutationCommitReceipt {
+            fn matches_storage_binding(self, binding: SystemHiveMutationStorageBinding) -> bool { self.0 == binding.0 }
+        }
+        #[derive(Clone, Copy, PartialEq, Eq)] struct SystemHiveMutationAbortReceipt(u8);
+        impl SystemHiveMutationAbortReceipt {
+            fn matches_storage_binding(self, binding: SystemHiveMutationStorageBinding) -> bool { self.0 == binding.0 }
+        }
+        #[derive(Clone, Copy)] struct SystemHiveMutationAcknowledgement(SystemHiveMutationCommitReceipt);
+        impl SystemHiveMutationAcknowledgement {
+            fn receipt(self) -> SystemHiveMutationCommitReceipt { self.0 }
+        }
+        #[derive(Clone, Copy)] struct SystemHiveMutationAbortAcknowledgement(SystemHiveMutationAbortReceipt);
+        impl SystemHiveMutationAbortAcknowledgement {
+            fn receipt(self) -> SystemHiveMutationAbortReceipt { self.0 }
+        }
+        mod nt_fs {
+            pub const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
+            pub const STATUS_DATA_ERROR: u32 = 0xC000_003E;
+        }
+        mod writable_fs {
+            use super::*;
+            pub fn ensure_mounted() -> Result<(), u32> { Ok(()) }
+            pub static LEGACY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+            pub fn legacy_snapshot_writes_allowed() -> bool {
+                LEGACY.load(std::sync::atomic::Ordering::Relaxed)
+            }
+            pub mod registry_journal {
+                use super::*;
+                pub struct Journal<C> { pub context: C, pub phase: u8, pub refuse_release: bool }
+                impl Journal<()> {
+                    pub unsafe fn admit(_: Vec<u8>, context: ()) -> Result<Self, (u32, Vec<u8>, ())> {
+                        Ok(Self { context, phase: 0, refuse_release: true })
+                    }
+                    pub fn make_durable(&mut self) -> Result<(), u32> {
+                        assert_eq!(self.phase, 0); self.phase = 1; Ok(())
+                    }
+                    pub fn begin_publication(&mut self) -> Result<&mut (), u32> {
+                        assert_eq!(self.phase, 1); self.phase = 2; Ok(&mut self.context)
+                    }
+                    pub fn rollback(&mut self) -> Result<(), u32> {
+                        assert_eq!(self.phase, 1); self.phase = 3; Ok(())
+                    }
+                    pub unsafe fn release_after_publication(mut self) -> Result<(), Self> {
+                        assert_eq!(self.phase, 2);
+                        if self.refuse_release { self.refuse_release = false; Err(self) } else { Ok(()) }
+                    }
+                    pub unsafe fn release_rolled_back(mut self) -> Result<(), Self> {
+                        assert_eq!(self.phase, 3);
+                        if self.refuse_release { self.refuse_release = false; Err(self) } else { Ok(()) }
+                    }
+                }
+            }
+            pub mod registry_wal {
+                use super::*;
+                pub struct Journal;
+                impl Journal {
+                    pub unsafe fn admit(_: &PreparedSystemHiveMutation, _: Vec<u8>) -> Result<Self, u32> { Ok(Self) }
+                    pub fn prepare(&mut self) -> Result<(), u32> { Ok(()) }
+                    pub fn commit_marker(&mut self, _: SystemHiveMutationCommitReceipt) -> Result<(), u32> { Ok(()) }
+                    pub fn anchor(&mut self) -> Result<(), u32> { Ok(()) }
+                    pub fn abort_prepared(&mut self, _: SystemHiveMutationAbortReceipt) -> Result<(), u32> { Ok(()) }
+                    pub fn release_after_ack(self, _: SystemHiveMutationAcknowledgement) -> Result<(), Self> { Ok(()) }
+                    pub fn release_after_abort(self, _: SystemHiveMutationAbortAcknowledgement) -> Result<(), Self> { Ok(()) }
+                }
+            }
+        }
+        use writable_fs::registry_wal::Journal as WalJournal;
+    "#) + owner + r#"
+        fn main() { unsafe {
+            let prepared = PreparedSystemHiveMutation(SystemHiveMutationStorageBinding(7));
+            let receipt = SystemHiveMutationCommitReceipt(7);
+            let ack = SystemHiveMutationAcknowledgement(receipt);
             let mut committed = MutationPersistence::new();
-            committed.admit(vec![1]).unwrap();
+            committed.admit(&prepared, vec![1]).unwrap();
             committed.make_durable().unwrap();
             committed.begin_publication().unwrap();
-            assert_eq!(committed.release_after_publication(), Err(0xC000_000D));
+            committed.commit_durable(receipt).unwrap();
+            assert_eq!(committed.release_after_publication(ack), Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST));
             assert!(committed.has_journal());
-            committed.release_after_publication().unwrap();
+            committed.release_after_publication(ack).unwrap();
             assert!(!committed.has_journal());
 
+            let receipt = SystemHiveMutationAbortReceipt(8);
+            let ack = SystemHiveMutationAbortAcknowledgement(receipt);
+            let prepared = PreparedSystemHiveMutation(SystemHiveMutationStorageBinding(8));
             let mut aborted = MutationPersistence::new();
-            aborted.admit(vec![2]).unwrap();
+            aborted.admit(&prepared, vec![2]).unwrap();
             aborted.make_durable().unwrap();
             aborted.rollback().unwrap();
-            assert_eq!(aborted.release_rolled_back(), Err(0xC000_000D));
+            aborted.abort_after_receipt(receipt).unwrap();
+            assert_eq!(aborted.release_rolled_back(ack), Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST));
             assert!(aborted.has_journal());
-            aborted.release_rolled_back().unwrap();
+            aborted.release_rolled_back(ack).unwrap();
             assert!(!aborted.has_journal());
-        }} }}
-    "#);
+
+            writable_fs::LEGACY.store(false, std::sync::atomic::Ordering::Relaxed);
+            let prepared = PreparedSystemHiveMutation(SystemHiveMutationStorageBinding(9));
+            let receipt = SystemHiveMutationCommitReceipt(9);
+            let ack = SystemHiveMutationAcknowledgement(receipt);
+            let mut volatile = MutationPersistence::new();
+            volatile.admit(&prepared, Vec::new()).unwrap();
+            assert!(!volatile.has_journal());
+            volatile.commit_durable(receipt).unwrap();
+            volatile.release_after_publication(ack).unwrap();
+        } }
+    "#;
     let directory = std::env::temp_dir().join(format!(
         "nt-registry-persistence-owner-{}",
         std::process::id()
@@ -429,4 +497,76 @@ fn hosted_relation_budget_edge_finishes_catalog_before_yield() {
         "the same pump step that publishes PnP must finish catalog and terminal owners");
     assert!(!success.contains("continue;"),
         "a 16-step budget edge must not yield after PnP before catalog publication");
+}
+
+#[test]
+fn hosted_relation_v2_wal_barriers_precede_local_publication_and_ack() {
+    let helper = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"), "/../../components/ntos-executive/src/hosted_relation_publication.rs"
+    )).expect("retained relation publication helper must exist");
+    let advance = source_block(&helper, "unsafe fn advance_hosted_relation_publication(");
+    let durable = advance.find("owner.persistence.make_durable(").unwrap();
+    let cm_commit = advance.find("cm_mutation_transport::commit(").unwrap();
+    let durable_commit = advance.find("owner.persistence.commit_durable(")
+        .expect("exact CM receipt must authorize marker and paired-header barriers");
+    let local = advance.find("commit_prospective_relation_with_lease(").unwrap();
+    let ack = advance.find("cm_mutation_transport::acknowledge(").unwrap();
+    let storage_release = advance.find("owner.persistence.release_after_publication(")
+        .expect("exact CM acknowledgement must release the retained WAL reserve");
+    let bus_release = advance.find("release_publication_lease(").unwrap();
+    assert!(durable < cm_commit && cm_commit < durable_commit
+        && durable_commit < local && local < ack && ack < storage_release
+        && storage_release < bus_release,
+        "PREPARE→WAL barrier→CM COMMIT→marker→two anchors→PnP→ACK→release ordering");
+    assert!(advance.contains("Phase::DurableCommit"),
+        "uncertain marker or anchor must retain the exact publication owner for redrive");
+}
+
+#[test]
+fn hosted_relation_v2_abort_keeps_wal_owner_through_acknowledged_cancel() {
+    let helper = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"), "/../../components/ntos-executive/src/hosted_relation_publication.rs"
+    )).expect("retained relation publication helper must exist");
+    let advance = source_block(&helper, "unsafe fn advance_hosted_relation_publication(");
+    let abort = advance.find("cm_mutation_transport::abort(").unwrap();
+    let wal_abort = advance.find("owner.persistence.abort_after_receipt(")
+        .expect("exact CM abort receipt must authorize WAL prepare rollback");
+    let ack_abort = advance.find("cm_mutation_transport::acknowledge_abort(").unwrap();
+    let release = advance.find("owner.persistence.release_rolled_back(")
+        .expect("confirmed CM abort acknowledgement must release the WAL reserve");
+    let providers = advance.rfind("batch.abort(io_manager_mut())").unwrap();
+    let bus = advance.rfind("release_publication_lease(").unwrap();
+    assert!(abort < wal_abort && wal_abort < ack_abort && ack_abort < release
+        && release < providers && providers < bus,
+        "abort receipt, WAL rollback, ACK_ABORT, provider cleanup and bus release must be retained");
+}
+
+#[test]
+fn hosted_relation_publishes_generation_only_after_wal_anchor() {
+    let helper = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"), "/../../components/ntos-executive/src/hosted_relation_publication.rs"
+    )).expect("retained relation publication helper must exist");
+    let advance = source_block(&helper, "unsafe fn advance_hosted_relation_publication(");
+    let barrier = advance.find("owner.persistence.commit_durable(").unwrap();
+    let generation = advance.find("LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.fetch_max(").unwrap();
+    let wake = advance.find("config_manager_request_device_action_wake()").unwrap();
+    let local = advance.find("commit_prospective_relation_with_lease(").unwrap();
+    assert!(barrier < generation && barrier < wake && generation < local && wake < local,
+        "CM generation and device wake must follow the marker and both WAL anchors");
+}
+
+#[test]
+fn hosted_relation_zero_durable_journal_keeps_semantic_cm_commit() {
+    let helper = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"), "/../../components/ntos-executive/src/hosted_relation_publication.rs"
+    )).expect("retained relation publication helper must exist");
+    let advance = source_block(&helper, "unsafe fn advance_hosted_relation_publication(");
+    let admit = source_block(advance, "Phase::Admit => {");
+    assert!(admit.contains("validate_storage(prepared)")
+        && admit.contains("owner.persistence.admit(prepared, bytes)"),
+        "a volatile-only mutation needs exact NoStorage admission and CM COMMIT");
+    assert!(!admit.contains("prepared.durable_journal().is_empty()"),
+        "empty durable bytes alone must not turn a semantic mutation into ABORT");
+    assert!(advance.contains("Phase::Commit"),
+        "semantic CM publication must continue after NoStorage admission");
 }

@@ -15,6 +15,7 @@ pub struct WalSnapshotAnchorUpdate<D: SnapshotBlockDevice> {
     device: Option<D>,
     store: SnapshotBlockStore,
     headers: [SlotHeader; 2],
+    torn_companion_source: Option<SlotReadPlan>,
     phase: Phase,
 }
 
@@ -45,7 +46,7 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
         device: D,
         next: WalSnapshotAnchor,
     ) -> Result<Self, (SnapshotBlockStoreError, D)> {
-        Self::admit_checked(store, device, next, |current| {
+        Self::admit_checked(store, device, next, false, |current| {
             if current[0] != current[1]
                 || next.incarnation != current[0].incarnation
                 || current[0].serial.checked_add(1) != Some(next.serial)
@@ -66,7 +67,7 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
     ) -> Result<Self, (SnapshotBlockStoreError, crate::RegistryWalVerifiedDevice<D>)> {
         let (device, prefix, record_end_lbas) = verified.into_parts();
         let next = prefix.anchor();
-        let result = Self::admit_checked(store, device, next, |current| {
+        let result = Self::admit_checked(store, device, next, true, |current| {
             for anchor in current {
                 let exact_end = if anchor.serial == 0 {
                     Some(0)
@@ -102,7 +103,7 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
         next: WalSnapshotAnchor,
         wal: &crate::RegistryWal<W>,
     ) -> Result<Self, (SnapshotBlockStoreError, D)> {
-        Self::admit_checked(store, device, next, |current| {
+        Self::admit_checked(store, device, next, true, |current| {
             let Some((incarnation, recovered_serial, _)) = wal.verified_prefix() else {
                 return Err(SnapshotBlockStoreError::Corrupt);
             };
@@ -125,27 +126,61 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
         store: SnapshotBlockStore,
         mut device: D,
         next: WalSnapshotAnchor,
+        allow_torn_companion: bool,
         check: F,
     ) -> Result<Self, (SnapshotBlockStoreError, D)>
     where
         F: FnOnce([WalSnapshotAnchor; 2]) -> Result<(), SnapshotBlockStoreError>,
     {
         let plans = (|| {
-            let a = store
-                .read_valid_slot_plan(&mut device, 0)?
-                .ok_or(SnapshotBlockStoreError::Corrupt)?;
-            let b = store
-                .read_valid_slot_plan(&mut device, 1)?
-                .ok_or(SnapshotBlockStoreError::Corrupt)?;
+            let first = store.read_valid_slot_plan(&mut device, 0);
+            let second = store.read_valid_slot_plan(&mut device, 1);
+            let (plans, torn_companion_source) = match (first, second) {
+                (Ok(Some(a)), Ok(Some(b))) => ([a, b], None),
+                (Ok(Some(selected)), Err(SnapshotBlockStoreError::Corrupt))
+                | (Err(SnapshotBlockStoreError::Corrupt), Ok(Some(selected))) => {
+                    if !allow_torn_companion {
+                        return Err(SnapshotBlockStoreError::Corrupt);
+                    }
+                    let companion_slot = 1 - selected.slot;
+                    let companion = store.read_slot_plan(&mut device, companion_slot)?
+                        .ok_or(SnapshotBlockStoreError::Corrupt)?;
+                    let selected_wal = selected.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
+                    let companion_wal = companion.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
+                    same_anchor_wal_companion(
+                        selected.generation, selected_wal,
+                        companion.generation, companion_wal,
+                    )?;
+                    let repaired = SlotReadPlan {
+                        slot: companion_slot,
+                        generation: selected.generation.max(companion.generation)
+                            .checked_add(1).ok_or(SnapshotBlockStoreError::OutOfSpace)?,
+                        payload_len: selected.payload_len,
+                        payload_crc: selected.payload_crc,
+                        payload_sectors: selected.payload_sectors,
+                        wal: Some(selected_wal),
+                        resetting: false,
+                    };
+                    let plans = if selected.slot == 0 {
+                        [selected, repaired]
+                    } else {
+                        [repaired, selected]
+                    };
+                    (plans, Some(selected))
+                }
+                (Err(error), _) | (_, Err(error)) => return Err(error),
+                _ => return Err(SnapshotBlockStoreError::Corrupt),
+            };
+            let [a, b] = plans;
             if a.resetting || b.resetting {
                 return Err(SnapshotBlockStoreError::Corrupt);
             }
             let am = a.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
             let bm = b.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
             check([am.anchor(), bm.anchor()])?;
-            Ok::<_, SnapshotBlockStoreError>([a, b])
+            Ok::<_, SnapshotBlockStoreError>((plans, torn_companion_source))
         })();
-        let plans = match plans {
+        let (plans, torn_companion_source) = match plans {
             Ok(plans) => plans,
             Err(error) => return Err((error, device)),
         };
@@ -167,6 +202,7 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
             device: Some(device),
             store,
             headers,
+            torn_companion_source,
             phase: Phase::Pending,
         })
     }
@@ -188,6 +224,23 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
                 .try_reserve_exact(sector_size)
                 .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
             sector.resize(sector_size, 0);
+            if let Some(source) = self.torn_companion_source {
+                let target = 1 - source.slot;
+                let source_lba = self.store.slot_lba(slot_sectors, source.slot)?;
+                let target_lba = self.store.slot_lba(slot_sectors, target)?;
+                for index in 0..source.payload_sectors {
+                    device.read_sector(source_lba + 1 + u64::from(index), &mut sector)?;
+                    device.write_sector(target_lba + 1 + u64::from(index), &sector)?;
+                }
+                device.flush()?;
+                sector.fill(0);
+                let repaired = self.headers[target as usize];
+                let mut old_anchor = repaired;
+                old_anchor.wal = source.wal;
+                encode_header(&mut sector, old_anchor);
+                device.write_sector(target_lba, &sector)?;
+                device.flush()?;
+            }
             for header in self.headers {
                 sector.fill(0);
                 encode_header(&mut sector, header);

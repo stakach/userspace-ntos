@@ -2998,9 +2998,66 @@ fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
     status
 }
 
+const SYSTEM_WAL_FOLD_INTERVAL_100NS: u64 = 5 * 10_000_000;
+static SYSTEM_WAL_LAST_FOLD_100NS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn system_wal_fold_next_deadline() -> Option<u64> {
+    if !unsafe { crate::writable_fs::writable_fs_mounted() }
+        || crate::writable_fs::legacy_snapshot_writes_allowed()
+    {
+        return None;
+    }
+    let last = SYSTEM_WAL_LAST_FOLD_100NS.load(Ordering::Relaxed);
+    (last != 0).then(|| last.saturating_add(SYSTEM_WAL_FOLD_INTERVAL_100NS))
+}
+
+/// Coalesce CM-owned SYSTEM mutations independently of ordinary file snapshot dirtiness.
+/// A busy CM or reserve owner defers this background attempt; a physical uncertainty blocks
+/// the mounted volume and must reach the service loop as a durability refusal.
+fn maybe_fold_system_wal() -> Result<(), u32> {
+    if !unsafe { crate::writable_fs::writable_fs_mounted() }
+        || crate::writable_fs::legacy_snapshot_writes_allowed()
+    {
+        return Ok(());
+    }
+    let now = monotonic_time_100ns();
+    let last = SYSTEM_WAL_LAST_FOLD_100NS.load(Ordering::Relaxed);
+    if last == 0 {
+        SYSTEM_WAL_LAST_FOLD_100NS.store(now, Ordering::Relaxed);
+        unsafe { rearm_registered_active_delay_timer() };
+        return Ok(());
+    }
+    if now.saturating_sub(last) < SYSTEM_WAL_FOLD_INTERVAL_100NS {
+        return Ok(());
+    }
+    let _transient = allocator::enter_transient();
+    let _alloc_ctx = allocator::enter_context(allocator::ALLOC_CTX_WRITABLE_SNAPSHOT);
+    let result = unsafe { crate::writable_fs::fold_system_wal_if_dirty() };
+    SYSTEM_WAL_LAST_FOLD_100NS.store(now, Ordering::Relaxed);
+    unsafe { rearm_registered_active_delay_timer() };
+    match result {
+        Ok(_) => Ok(()),
+        Err(_status) if crate::writable_fs::system_wal_fold_ack_pending() => Ok(()),
+        Err(_status) if !crate::writable_fs::system_wal_fold_blocked() => Ok(()),
+        Err(status) => Err(status),
+    }
+}
+
 fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
     nt_handler.sweep_directory_security_bodies();
     nt_handler.sweep_data_section_security();
+    // A completed physical fold can be waiting only for its exact CM ACK. It still owns the
+    // reserve, so redrive that receipt before any ordinary snapshot tries to acquire it.
+    if crate::writable_fs::system_wal_fold_ack_pending() {
+        if unsafe { crate::writable_fs::fold_system_wal_if_dirty() }.is_err() {
+            // The completed fold is durable, but the CM ACK result is uncertain. Keep its
+            // physical reserve and token, and let the next timer wake retry this exact ACK.
+            // An ordinary checkpoint cannot acquire the reserve until that proof arrives.
+            SYSTEM_WAL_LAST_FOLD_100NS.store(monotonic_time_100ns(), Ordering::Relaxed);
+            unsafe { rearm_registered_active_delay_timer() };
+            return nt_fs::STATUS_SUCCESS;
+        }
+    }
     // The journal owns the mounted volume, including all dirty state, until its terminal proof.
     // Leave maintenance flags untouched; an unavailable volume is neither clean nor absent.
     if crate::writable_fs::registry_journal::owns_volume() {
@@ -3084,6 +3141,13 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
         nt_handler.writable_fs_dirty = true;
         nt_handler.writable_fs_commit_required = true;
     }
+    if checkpoint_status == nt_fs::STATUS_SUCCESS {
+        if let Err(status) = maybe_fold_system_wal() {
+            nt_handler.writable_fs_dirty = true;
+            nt_handler.writable_fs_commit_required = true;
+            return status;
+        }
+    }
     checkpoint_status
 }
 
@@ -3094,6 +3158,12 @@ fn checkpoint_boot_hives_at_quiesce(nt_handler: &mut ExecNtHandler) -> u32 {
     }
     if !unsafe { crate::writable_fs::writable_fs_mounted() } {
         return nt_fs::STATUS_SUCCESS;
+    }
+    if !crate::writable_fs::legacy_snapshot_writes_allowed() {
+        let fold = unsafe { crate::writable_fs::fold_system_wal_if_dirty() };
+        if let Err(status) = fold {
+            return status;
+        }
     }
     let dirty_cells = nt_handler.boot_mutable_hive_dirty_cells();
     let pending_journal_records = nt_handler.mutable_hive_journal_pending_records;

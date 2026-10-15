@@ -193,3 +193,80 @@ fn locale_local_publication_waits_for_confirmed_system_outcome() {
             "locale refusal must not advance to later setup stages: {marker}");
     }
 }
+
+#[test]
+fn boot_owner_uses_v2_marker_anchors_and_typed_terminal_ack() {
+    let owner = source("boot_registry_mutation_work.rs");
+    let advance = owner.find("pub(crate) unsafe fn advance(").expect("boot owner drive");
+    let end = owner[advance..].find("pub(crate) unsafe fn publish_boot_system_mutation(")
+        .unwrap() + advance;
+    let drive = &owner[advance..end];
+    let prepare = drive.find("self.persistence.make_durable()")
+        .expect("WAL PREPARE must be durable before CM COMMIT");
+    let commit = drive.find("cm_mutation_transport::commit(prepared)")
+        .expect("retained CM COMMIT receipt");
+    let durability = drive.find("self.persistence.commit_durable(receipt)")
+        .expect("typed receipt authorizes WAL marker and both anchors");
+    let ack = drive.find("cm_mutation_transport::acknowledge(receipt)")
+        .expect("CM exact acknowledgement follows both anchors");
+    let release = drive.find("self.persistence.release_after_publication(ack)")
+        .expect("typed exact ACK releases the storage owner");
+    assert!(prepare < commit && commit < durability && durability < ack
+        && ack < release, "boot CM/WAL effect order must be linear and retained");
+    assert!(drive.contains("BootMutationProgress::Blocked"),
+        "uncertain physical effects must retain this owner");
+    let storage = source("registry_mutation_work.rs");
+    assert!(storage.contains("commit_marker(receipt)") && storage.contains(".anchor()"),
+        "shared storage API must durably write marker and both anchors before CM ACK");
+}
+
+#[test]
+fn boot_owner_aborts_prepared_wal_only_after_cm_abort_receipt() {
+    let owner = source("boot_registry_mutation_work.rs");
+    let abort = owner.find("Phase::Abort =>").expect("precommit abort phase");
+    let tail = &owner[abort..];
+    let receipt = tail.find("cm_mutation_transport::abort(prepared)")
+        .expect("CM abort receipt");
+    let wal_abort = tail.find("self.persistence.abort_after_receipt(receipt)")
+        .expect("typed receipt authorizes WAL abort");
+    let ack = tail.find("cm_mutation_transport::acknowledge_abort(")
+        .expect("exact CM abort ACK");
+    let release = tail.find("self.persistence.release_rolled_back(ack)")
+        .expect("typed abort ACK releases WAL owner");
+    assert!(receipt < wal_abort && wal_abort < ack && ack < release,
+        "abort cannot release storage before receipt and exact ACK");
+    assert!(tail.contains("assert!(!self.commit_entered"),
+        "no abort after possible COMMIT effect");
+}
+
+#[test]
+fn empty_durable_preparation_commits_without_a_storage_writer() {
+    let client = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../nt-config-client/src/mutation_begin/upload/tests.rs"),
+    ).expect("CM no-op preparation contract");
+    assert!(client.contains("real_noop_preparation_has_zero_journal_and_never_issues_pull"));
+
+    let server = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../nt-config-server/src/mutation_commit.rs"),
+    ).expect("CM COMMIT validation");
+    assert!(server.contains("request.semantic_journal_len != 0"),
+        "CM COMMIT authority is the semantic journal, not durable storage length");
+
+    let owner = source("boot_registry_mutation_work.rs");
+    let admit = owner.find("Phase::Admit =>").expect("boot storage admission");
+    let durable = owner[admit..].find("Phase::Durable =>").unwrap() + admit;
+    let block = &owner[admit..durable];
+    assert!(block.contains("self.persistence.admit(prepared, bytes)"),
+        "the empty preparation needs a retained NoStorage owner");
+    assert!(!block.contains("if journal.is_empty()")
+        || !block[block.find("if journal.is_empty()").unwrap()..].contains("Phase::Abort"),
+        "valid empty durability must not automatically abort a volatile or no-op mutation");
+    let storage = source("registry_mutation_work.rs");
+    assert!(storage.contains("NoStorage"),
+        "shared persistence must represent exact COMMIT/ACK with no physical WAL effect");
+    assert!(owner.contains("cm_mutation_transport::commit(prepared)")
+        && owner.contains("cm_mutation_transport::acknowledge(receipt)"),
+        "CM retains and acknowledges the exact semantic publication");
+}

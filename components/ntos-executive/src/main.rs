@@ -3053,6 +3053,7 @@ const DELAY_TIMER_SOURCE_COMPONENT_RESUME: u64 = 18;
 const DELAY_TIMER_SOURCE_HOSTED_DPC: u64 = 19;
 const DELAY_TIMER_SOURCE_REGISTRY_MUTATION: u64 = 20;
 const DELAY_TIMER_SOURCE_SECTION_METADATA: u64 = 21;
+const DELAY_TIMER_SOURCE_SYSTEM_WAL_FOLD: u64 = 22;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -15670,123 +15671,6 @@ pub(crate) unsafe fn config_manager_enumerate_leased_system_hive_value(
 
 /// Use the generation captured with the caller's registry decisions. Never substitute the live
 /// generation here: CM must reject stale authorization, absence checks, and read/modify/write data.
-pub(crate) unsafe fn config_manager_prepare_system_hive_mutation(
-    expected_generation: u64,
-    mutations: &[nt_config_client::SystemHiveMutation<'_>],
-) -> Result<nt_config_client::PreparedSystemHiveMutation, i32> {
-    if expected_generation == 0 {
-        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
-    }
-    let client = CONFIG_CLIENT_PTR
-        .as_mut()
-        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
-    let mount = LIVE_CONFIG_MANAGER_SYSTEM_MOUNT.ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
-    let prepared = client.prepare_system_hive_mutation_for_mount(
-        mount,
-        expected_generation,
-        mutations,
-    )?;
-    if prepared.mount() != mount
-        || prepared.expected_generation() != expected_generation
-        || prepared.next_generation() != expected_generation.checked_add(1).unwrap_or(0)
-    {
-        client.abort_prepared_system_hive_mutation(&prepared);
-        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
-    }
-    Ok(prepared)
-}
-
-pub(crate) unsafe fn config_manager_publish_system_hive_mutation(
-    prepared: &nt_config_client::PreparedSystemHiveMutation,
-) -> Result<(u64, bool), i32> {
-    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
-    if expected_generation == 0 || prepared.expected_generation() != expected_generation {
-        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
-    }
-    let client = CONFIG_CLIENT_PTR
-        .as_mut()
-        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
-    let outcome = client.publish_system_hive_mutation(prepared)?;
-    if outcome.generation != prepared.next_generation() {
-        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
-    }
-    LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.store(outcome.generation, Ordering::Release);
-    let was_pending =
-        CONFIG_DEVICE_ACTION_PENDING.swap(outcome.has_pending_device_action, Ordering::AcqRel);
-    Ok((
-        outcome.generation,
-        outcome.has_pending_device_action && !was_pending,
-    ))
-}
-
-pub(crate) unsafe fn config_manager_abort_system_hive_mutation(
-    prepared: &nt_config_client::PreparedSystemHiveMutation,
-) {
-    if let Some(client) = CONFIG_CLIENT_PTR.as_mut() {
-        client.abort_prepared_system_hive_mutation(prepared);
-    }
-}
-
-pub(crate) struct DurableSystemHiveMutationOutcome {
-    pub generation: u64,
-    pub wake_device_action: bool,
-    pub journaled: bool,
-}
-
-/// Persist one complete CM-validated SYSTEM mutation before publishing its semantic generation.
-/// All executive callers share this path so registry syscalls and PnP topology have identical
-/// append, flush, abort, and rollback ownership.
-pub(crate) unsafe fn persist_and_publish_system_hive_mutation(
-    expected_generation: u64,
-    mutations: &[nt_config_client::SystemHiveMutation<'_>],
-) -> Result<DurableSystemHiveMutationOutcome, u32> {
-    const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
-
-    writable_fs::ensure_mounted()?;
-    if !writable_fs::legacy_snapshot_writes_allowed() {
-        // The file-backed publisher cannot retain an uncertain CM COMMIT together with
-        // its WAL marker and both header anchors. Leave v2 mutations to the WAL owner.
-        return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
-    }
-    let mut provider =
-        writable_fs::WritableHiveIoProvider::new(writable_fs::CONFIG_SYSTEM_HIVE_PATH);
-    // Establish a readable rollback baseline before acquiring CM's sole writer preparation.
-    let previous_log_len = provider.log_len().map_err(|_| STATUS_UNSUCCESSFUL)?;
-    let prepared =
-        config_manager_prepare_system_hive_mutation(expected_generation, mutations)
-            .map_err(|status| status as u32)?;
-    let journaled = !prepared.durable_journal().is_empty();
-    let journal_result = if journaled {
-        nt_hive_core::HiveIoProvider::append_log_record(&mut provider, prepared.durable_journal())
-            .and_then(|()| nt_hive_core::HiveIoProvider::flush_log(&mut provider))
-    } else {
-        Ok(())
-    };
-    if journal_result.is_err() {
-        let _ = provider.truncate_log_to(previous_log_len);
-        config_manager_abort_system_hive_mutation(&prepared);
-        return Err(STATUS_UNSUCCESSFUL);
-    }
-
-    let (generation, wake_device_action) =
-        match config_manager_publish_system_hive_mutation(&prepared) {
-            Ok(outcome) => outcome,
-            Err(status) => {
-                let rollback = provider.truncate_log_to(previous_log_len);
-                config_manager_abort_system_hive_mutation(&prepared);
-                if rollback.is_err() {
-                    return Err(STATUS_UNSUCCESSFUL);
-                }
-                return Err(status as u32);
-            }
-        };
-    Ok(DurableSystemHiveMutationOutcome {
-        generation,
-        wake_device_action,
-        journaled,
-    })
-}
-
 pub(crate) unsafe fn config_manager_prepare_system_hive_checkpoint(
 ) -> Result<Option<nt_config_client::PreparedSystemHiveCheckpoint>, i32> {
     let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
@@ -19540,8 +19424,17 @@ unsafe fn prepare_boot_system_hive_image() -> Result<BootSystemImageReport, Boot
     let image =
         nt_hive_core::try_encode_image(&composed.hive).map_err(BootSystemImageError::Encode)?;
     let image_bytes = image.len() as u64;
-    if let writable_fs::BootSystemPersistence::Restored(restored) = persistence {
-        restored.publish().map_err(BootSystemImageError::Restore)?;
+    match persistence {
+        writable_fs::BootSystemPersistence::Absent => {
+            snapshot_generation = writable_fs::initialize_empty_boot_system_wal(
+                &image, writable_fs::boot_wal_cutover_admission(),
+            ).map_err(BootSystemImageError::Restore)?;
+        }
+        writable_fs::BootSystemPersistence::Restored(mut restored) => {
+            restored.migrate_composed_boot_system(&image, writable_fs::boot_wal_cutover_admission())
+                .map_err(BootSystemImageError::Restore)?;
+            restored.publish().map_err(BootSystemImageError::Restore)?;
+        }
     }
     *core::ptr::addr_of_mut!(BOOT_SYSTEM_HIVE_IMAGE) = Some(image);
     Ok(BootSystemImageReport {

@@ -9,6 +9,22 @@ use crate::provider_local_event::trace as trace_provider_local_event;
 use nt_io_abi::major;
 use nt_io_manager::{LocalFileObject, PendingFileRoute};
 
+struct RetainedV1SystemCheckpointAck {
+    prepared: nt_config_client::PreparedSystemHiveCheckpoint,
+    image_len: usize,
+    phase: V1SystemCheckpointPhase,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum V1SystemCheckpointPhase {
+    Persisting,
+    Acknowledging,
+}
+
+// The CM preparation is installed before any image or snapshot effect. A physical uncertainty
+// fences the mount; an uncertain ACK retains the same token for exact retry.
+static mut RETAINED_V1_SYSTEM_CHECKPOINT_ACK: Option<RetainedV1SystemCheckpointAck> = None;
+
 #[path = "lpc_connection_views.rs"]
 pub(crate) mod lpc_connection_views;
 
@@ -5940,8 +5956,67 @@ impl ExecNtHandler {
         Ok(mounted)
     }
 
+    fn retry_retained_system_hive_checkpoint_ack(&mut self) -> Option<u32> {
+        let retained = unsafe { (&*core::ptr::addr_of!(RETAINED_V1_SYSTEM_CHECKPOINT_ACK)).as_ref() }?;
+        if retained.phase != V1SystemCheckpointPhase::Acknowledging {
+            return Some(nt_fs::STATUS_DEVICE_NOT_READY);
+        }
+        if let Err(status) = unsafe {
+            crate::config_manager_acknowledge_system_hive_checkpoint(&retained.prepared)
+        } {
+            REG_FLUSH_KEY_BOOT_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            print_str(b"[cm-flush] retained CM-owned SYSTEM checkpoint ACK pending status=0x");
+            print_hex(status as u32);
+            print_str(b"\n");
+            return Some(status as u32);
+        }
+        let retained = unsafe { (&mut *core::ptr::addr_of_mut!(RETAINED_V1_SYSTEM_CHECKPOINT_ACK)).take() }
+            .expect("confirmed retained SYSTEM checkpoint ACK");
+        self.writable_fs_dirty = true;
+        self.writable_fs_commit_required = true;
+        REG_FLUSH_KEY_BOOT_HIVE_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
+        REG_FLUSH_KEY_BOOT_HIVE_BYTES.store(retained.image_len as u64, Ordering::Relaxed);
+        print_str(b"[cm-flush] CM-owned SYSTEM checkpoint ");
+        print_u64(retained.image_len as u64);
+        print_str(b"B generation=");
+        print_u64(retained.prepared.mount_generation);
+        print_str(b" sequence=");
+        print_u64(retained.prepared.hive_sequence);
+        print_str(b" path=");
+        print_ascii_str(crate::writable_fs::CONFIG_SYSTEM_HIVE_PATH);
+        print_str(b"\n");
+        Some(nt_fs::STATUS_SUCCESS)
+    }
+
+    fn retain_system_hive_checkpoint_for_persistence(
+        prepared: nt_config_client::PreparedSystemHiveCheckpoint,
+        image_len: usize,
+    ) {
+        let pending = unsafe { &mut *core::ptr::addr_of_mut!(RETAINED_V1_SYSTEM_CHECKPOINT_ACK) };
+        assert!(pending.is_none(), "retained SYSTEM checkpoint ACK cannot be replaced");
+        *pending = Some(RetainedV1SystemCheckpointAck {
+            prepared,
+            image_len,
+            phase: V1SystemCheckpointPhase::Persisting,
+        });
+    }
+
     fn checkpoint_system_hive_from_config_manager(&mut self) -> u32 {
-        let mut prepared = match unsafe { crate::config_manager_prepare_system_hive_checkpoint() } {
+        if let Some(status) = self.retry_retained_system_hive_checkpoint_ack() {
+            return status;
+        }
+        if let Err(status) = unsafe { crate::writable_fs::ensure_mounted() } {
+            return status;
+        }
+        if !crate::writable_fs::legacy_snapshot_writes_allowed() {
+            // A v2 mutation is acknowledged only after its WAL marker and both snapshot
+            // anchors are durable. Prove that exact prefix under the reserve lease; a full
+            // image fold belongs to background checkpointing and bounded WAL reclamation.
+            return unsafe { crate::writable_fs::verify_durable_system_wal() }
+                .err()
+                .unwrap_or(nt_fs::STATUS_SUCCESS);
+        }
+        let prepared = match unsafe { crate::config_manager_prepare_system_hive_checkpoint() } {
             Ok(Some(prepared)) => prepared,
             Ok(None) => return nt_fs::STATUS_SUCCESS,
             Err(status) => {
@@ -5950,7 +6025,10 @@ impl ExecNtHandler {
             }
         };
         let image_len = prepared.image.len();
-        let image = core::mem::take(&mut prepared.image);
+        Self::retain_system_hive_checkpoint_for_persistence(prepared, image_len);
+        let retained = unsafe { (&mut *core::ptr::addr_of_mut!(RETAINED_V1_SYSTEM_CHECKPOINT_ACK)).as_mut() }
+            .expect("installed SYSTEM checkpoint persistence owner");
+        let image = core::mem::take(&mut retained.prepared.image);
         let mut provider = crate::writable_fs::WritableHiveIoProvider::new(
             crate::writable_fs::CONFIG_SYSTEM_HIVE_PATH,
         );
@@ -5960,38 +6038,16 @@ impl ExecNtHandler {
                 .and_then(|()| nt_hive_core::HiveIoProvider::truncate_log(&mut provider))
                 .and_then(|()| nt_hive_core::HiveIoProvider::flush_log(&mut provider));
         if let Err(err) = persist {
-            unsafe { crate::config_manager_abort_system_hive_checkpoint(&prepared) };
+            crate::writable_fs::block_uncertain_system_checkpoint();
             REG_FLUSH_KEY_BOOT_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
             print_str(b"[cm-flush] CM-owned SYSTEM checkpoint persistence failed path=");
             print_ascii_str(crate::writable_fs::CONFIG_SYSTEM_HIVE_PATH);
             print_str(b"\n");
             return Self::mutable_hive_journal_status(err);
         }
-        if let Err(status) =
-            unsafe { crate::config_manager_acknowledge_system_hive_checkpoint(&prepared) }
-        {
-            unsafe { crate::config_manager_abort_system_hive_checkpoint(&prepared) };
-            REG_FLUSH_KEY_BOOT_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
-            print_str(b"[cm-flush] CM-owned SYSTEM checkpoint acknowledgement failed status=0x");
-            print_hex(status as u32);
-            print_str(b"\n");
-            return status as u32;
-        }
-
-        self.writable_fs_dirty = true;
-        self.writable_fs_commit_required = true;
-        REG_FLUSH_KEY_BOOT_HIVE_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
-        REG_FLUSH_KEY_BOOT_HIVE_BYTES.store(image_len as u64, Ordering::Relaxed);
-        print_str(b"[cm-flush] CM-owned SYSTEM checkpoint ");
-        print_u64(image_len as u64);
-        print_str(b"B generation=");
-        print_u64(prepared.mount_generation);
-        print_str(b" sequence=");
-        print_u64(prepared.hive_sequence);
-        print_str(b" path=");
-        print_ascii_str(crate::writable_fs::CONFIG_SYSTEM_HIVE_PATH);
-        print_str(b"\n");
-        nt_fs::STATUS_SUCCESS
+        retained.phase = V1SystemCheckpointPhase::Acknowledging;
+        self.retry_retained_system_hive_checkpoint_ack()
+            .expect("installed SYSTEM checkpoint ACK owner")
     }
 
     fn checkpoint_non_system_boot_mutable_hive(
@@ -6260,6 +6316,11 @@ impl ExecNtHandler {
         let system_status = self.checkpoint_system_hive_from_config_manager();
         if system_status != nt_fs::STATUS_SUCCESS {
             return system_status;
+        }
+        if !crate::writable_fs::legacy_snapshot_writes_allowed() {
+            if let Err(status) = unsafe { crate::writable_fs::fold_system_wal_if_dirty() } {
+                return status;
+            }
         }
         let mut total_dirty = 0usize;
         for hive_sel in [

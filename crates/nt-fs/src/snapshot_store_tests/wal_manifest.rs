@@ -347,6 +347,47 @@ fn owned_migration_commits_current_volume_to_both_v2_slots_before_releasing_leas
 }
 
 #[test]
+fn owned_empty_reserve_initialization_creates_two_v2_slots_before_release() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let reserve = SnapshotReserve::new(CachedDisk::with_sectors(32), 85, store);
+    let fs = crate::FileSystem::new(crate::MemFs::new());
+    let expected = fs.export_volume_snapshot().unwrap();
+    let lease = reserve.try_acquire().unwrap();
+    let wal = OwnedBoundedBlockRange::new(lease, 16, 16).ok().unwrap();
+    let verified = RegistryWal::recover(wal, 77).unwrap()
+        .into_verified_device().unwrap().into_full_device();
+    let mut initialization = WalSnapshotBaselineRepair::admit(store, verified).ok().unwrap();
+    assert!(reserve.try_acquire().is_none());
+    assert_eq!(initialization.initialize(&fs), Ok(2));
+    let mut lease = initialization.into_verified_device().unwrap().into_device();
+    lease.test_device_mut().power_cut();
+    let selected = store.read_latest_wal(&mut lease).unwrap().unwrap();
+    assert_eq!(selected.snapshot.payload, expected);
+    assert_eq!(selected.anchor.incarnation, 77);
+    assert_eq!(selected.anchor.serial, 0);
+    assert_eq!(store.current_wal_checkpoint_manifest(&mut lease), Ok(base()));
+}
+
+#[test]
+fn first_boot_single_v2_slot_is_repaired_after_power_loss() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::with_sectors(32);
+    store.commit_next_with_wal_manifest(&mut disk, b"first-boot", base()).unwrap();
+    disk.power_cut();
+    assert_eq!(store.boot_recovery_state(&mut disk),
+        Ok(BootSnapshotRecovery::InterruptedEmptyBaseline { incarnation: 77 }));
+    let wal = OwnedBoundedBlockRange::new(disk, 16, 16).ok().unwrap();
+    let verified = RegistryWal::recover(wal, 77).unwrap()
+        .into_verified_device().unwrap().into_full_device();
+    let mut repair = WalSnapshotBaselineRepair::admit(store, verified).ok().unwrap();
+    assert_eq!(repair.repair(), Ok(Some(2)));
+    let mut disk = repair.into_verified_device().unwrap().into_device();
+    disk.power_cut();
+    assert_eq!(store.current_wal_checkpoint_manifest(&mut disk), Ok(base()));
+    assert_eq!(store.read_latest_wal(&mut disk).unwrap().unwrap().snapshot.payload, b"first-boot");
+}
+
+#[test]
 fn composed_system_primary_and_empty_sidecar_survive_migration_crash_cuts() {
     const PRIMARY: &str = r"\??\C:\SYSTEM";
     const LOG: &str = r"\??\C:\SYSTEM.LOG";
