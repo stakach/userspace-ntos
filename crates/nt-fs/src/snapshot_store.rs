@@ -16,6 +16,10 @@ pub use payload_writer::PayloadSectorWriter;
 mod wal_anchor;
 pub use wal_anchor::WalSnapshotAnchorUpdate;
 
+#[path = "snapshot_epoch_rollover.rs"]
+mod epoch_rollover;
+pub use epoch_rollover::WalSnapshotEpochRollover;
+
 #[cfg(test)]
 #[path = "snapshot_store_tests.rs"]
 mod tests;
@@ -25,6 +29,8 @@ const STORE_VERSION: u16 = 1;
 const HEADER_LEN: usize = 48;
 const WAL_STORE_VERSION: u16 = 2;
 const WAL_HEADER_LEN: usize = 80;
+const WAL_RESET_VERSION: u16 = 3;
+const WAL_RESET_HEADER_LEN: usize = 84;
 
 /// Errors reported by the snapshot block store.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -132,6 +138,7 @@ struct SlotHeader {
     payload_crc: u32,
     payload_sectors: u32,
     wal: Option<WalSnapshotManifest>,
+    resetting: bool,
 }
 
 #[derive(Clone)]
@@ -139,6 +146,7 @@ struct SlotSnapshot {
     generation: u64,
     payload: Vec<u8>,
     wal: Option<WalSnapshotManifest>,
+    resetting: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -146,6 +154,7 @@ struct SlotSummary {
     slot: u32,
     generation: u64,
     wal: Option<WalSnapshotManifest>,
+    resetting: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -156,6 +165,7 @@ struct SlotReadPlan {
     payload_crc: u32,
     payload_sectors: u32,
     wal: Option<WalSnapshotManifest>,
+    resetting: bool,
 }
 
 /// V2 snapshot-header metadata. End LBA is relative to the disjoint WAL view.
@@ -507,6 +517,9 @@ impl SnapshotBlockStore {
     ) -> Result<StoredSnapshotMetadata, SnapshotBlockStoreError> {
         let other_slot = 1 - selected.slot;
         let other_header = self.read_slot_plan(dev, other_slot)?;
+        if selected.resetting || other_header.is_some_and(|header| header.resetting) {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
         let format = match (selected.wal, other_header) {
             // A legacy payload may fall back from a companion legacy payload whose CRC is bad.
             // A damaged header remains ambiguous because its format cannot be trusted.
@@ -593,6 +606,11 @@ impl SnapshotBlockStore {
         dev.flush()?;
         let a = self.read_slot(dev, 0);
         let b = self.read_slot(dev, 1);
+        if a.as_ref().ok().and_then(Option::as_ref).is_some_and(|slot| slot.resetting)
+            || b.as_ref().ok().and_then(Option::as_ref).is_some_and(|slot| slot.resetting)
+        {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
         let empty = WalSnapshotManifest {
             incarnation,
             base_serial: 0,
@@ -752,6 +770,9 @@ impl SnapshotBlockStore {
             return Err(SnapshotBlockStoreError::Corrupt);
         }
         for previous in [first, second] {
+            if previous.resetting {
+                return Err(SnapshotBlockStoreError::Corrupt);
+            }
             let previous = previous.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
             if previous.anchor() != manifest.anchor()
                 || previous.base_serial > manifest.base_serial
@@ -786,6 +807,9 @@ impl SnapshotBlockStore {
         let companion = self
             .read_slot_plan(dev, 1 - selected.slot)?
             .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        if selected.resetting || companion.resetting {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
         let selected_manifest = selected.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
         let companion_manifest = companion.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
         same_anchor_wal_companion(
@@ -844,6 +868,9 @@ impl SnapshotBlockStore {
         // before deciding which slot is safe to reuse.
         dev.flush()?;
         let latest = self.latest_commit_slot(dev)?;
+        if latest.is_some_and(|slot| slot.resetting) {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
         let (target_slot, generation) = match latest {
             Some(latest) => (
                 1 - latest.slot,
@@ -892,6 +919,9 @@ impl SnapshotBlockStore {
                     }
                     Err(error) => return Err(error),
                 };
+                if plan.is_some_and(|plan| plan.resetting) {
+                    return Err(SnapshotBlockStoreError::Corrupt);
+                }
                 if let Some(previous) = plan.and_then(|plan| plan.wal) {
                     // A newer checkpoint may fold more of the WAL into its payload, but
                     // must never make recovery depend on records an earlier checkpoint
@@ -937,6 +967,7 @@ impl SnapshotBlockStore {
                 payload_crc,
                 payload_sectors: payload_sectors_u32,
                 wal,
+                resetting: false,
             },
         );
         dev.write_sector(slot_base, &sector)?;
@@ -1019,6 +1050,7 @@ impl SnapshotBlockStore {
             generation: header.generation,
             payload,
             wal: header.wal,
+            resetting: header.resetting,
         }))
     }
 
@@ -1057,6 +1089,7 @@ impl SnapshotBlockStore {
             payload_crc: header.payload_crc,
             payload_sectors: header.payload_sectors,
             wal: header.wal,
+            resetting: header.resetting,
         }))
     }
 
@@ -1132,6 +1165,7 @@ impl SnapshotBlockStore {
                         slot: plan.slot,
                         generation: plan.generation,
                         wal: plan.wal,
+                        resetting: plan.resetting,
                     }))
                 }
                 Err(SnapshotBlockStoreError::Corrupt) => corrupt = true,
@@ -1232,7 +1266,9 @@ impl<D: SnapshotBlockDevice> SnapshotPayloadReader for PayloadSectorReader<'_, D
 }
 
 fn encode_header(out: &mut [u8], header: SlotHeader) {
-    let len = if header.wal.is_some() {
+    let len = if header.resetting {
+        WAL_RESET_HEADER_LEN
+    } else if header.wal.is_some() {
         WAL_HEADER_LEN
     } else {
         HEADER_LEN
@@ -1242,7 +1278,9 @@ fn encode_header(out: &mut [u8], header: SlotHeader) {
     put_u16(&mut out[8..10], len as u16);
     put_u16(
         &mut out[10..12],
-        if header.wal.is_some() {
+        if header.resetting {
+            WAL_RESET_VERSION
+        } else if header.wal.is_some() {
             WAL_STORE_VERSION
         } else {
             STORE_VERSION
@@ -1259,6 +1297,9 @@ fn encode_header(out: &mut [u8], header: SlotHeader) {
         put_u64(&mut out[52..60], wal.base_serial);
         put_u64(&mut out[60..68], wal.high_water_serial);
         put_u64(&mut out[68..76], wal.high_water_end_lba);
+    }
+    if header.resetting {
+        put_u32(&mut out[76..80], 1);
     }
     let crc = crc32c(&out[..len - 4]);
     put_u32(&mut out[len - 4..len], crc);
@@ -1279,6 +1320,9 @@ fn decode_header(bytes: &[u8]) -> Result<Option<SlotHeader>, SnapshotBlockStoreE
     let len = match (version, header_len as usize) {
         (STORE_VERSION, HEADER_LEN) => HEADER_LEN,
         (WAL_STORE_VERSION, WAL_HEADER_LEN) if bytes.len() >= WAL_HEADER_LEN => WAL_HEADER_LEN,
+        (WAL_RESET_VERSION, WAL_RESET_HEADER_LEN) if bytes.len() >= WAL_RESET_HEADER_LEN => {
+            WAL_RESET_HEADER_LEN
+        }
         _ => return Err(SnapshotBlockStoreError::Corrupt),
     };
     if bytes.len() < len {
@@ -1288,7 +1332,11 @@ fn decode_header(bytes: &[u8]) -> Result<Option<SlotHeader>, SnapshotBlockStoreE
     if crc32c(&bytes[..len - 4]) != header_crc {
         return Err(SnapshotBlockStoreError::Corrupt);
     }
-    let wal = if version == WAL_STORE_VERSION {
+    let resetting = version == WAL_RESET_VERSION;
+    if resetting && read_u32(&bytes[76..80]) != 1 {
+        return Err(SnapshotBlockStoreError::Corrupt);
+    }
+    let wal = if version == WAL_STORE_VERSION || resetting {
         let manifest = WalSnapshotManifest {
             incarnation: read_u64(&bytes[44..52]),
             base_serial: read_u64(&bytes[52..60]),
@@ -1309,6 +1357,7 @@ fn decode_header(bytes: &[u8]) -> Result<Option<SlotHeader>, SnapshotBlockStoreE
         payload_sectors: read_u32(&bytes[36..40]),
         slot: read_u32(&bytes[40..44]),
         wal,
+        resetting,
     }))
 }
 

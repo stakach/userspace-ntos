@@ -79,7 +79,7 @@ pub use snapshot_store::{
     PayloadSectorReader, PayloadSectorWriter, SnapshotBlockDevice, SnapshotBlockStore,
     SnapshotBlockStoreError, SnapshotPayloadReader, SnapshotPayloadSink, SnapshotReadFormat,
     StoredSnapshot, StoredSnapshotMetadata, StoredWalSnapshot, WalSnapshotAnchor,
-    WalSnapshotAnchorUpdate, WalSnapshotManifest,
+    WalSnapshotAnchorUpdate, WalSnapshotEpochRollover, WalSnapshotManifest,
 };
 pub use snapshot_reserve::{SnapshotReserve, SnapshotReserveLease};
 pub use snapshot_region::{BoundedBlockRange, OwnedBoundedBlockRange};

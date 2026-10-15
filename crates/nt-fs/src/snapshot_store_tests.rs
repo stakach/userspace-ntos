@@ -10,6 +10,9 @@ mod batched_writes;
 #[path = "snapshot_store_tests/wal_manifest.rs"]
 mod wal_manifest;
 
+#[path = "snapshot_store_tests/wal_epoch_rollover.rs"]
+mod wal_epoch_rollover;
+
 fn two_generations() -> (SnapshotBlockStore, CachedDisk) {
     let store = SnapshotBlockStore::new(0, 16);
     let mut dev = CachedDisk::new();
@@ -156,6 +159,7 @@ fn generation_exhaustion_cannot_report_invisible_success() {
         payload_crc: crc32c(b"second"),
         payload_sectors: 1,
         wal: None,
+        resetting: false,
     };
     encode_header(&mut dev.cache[8 * 512..9 * 512], header);
     dev.stable.copy_from_slice(&dev.cache);

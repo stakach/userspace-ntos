@@ -137,6 +137,9 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
             let b = store
                 .read_valid_slot_plan(&mut device, 1)?
                 .ok_or(SnapshotBlockStoreError::Corrupt)?;
+            if a.resetting || b.resetting {
+                return Err(SnapshotBlockStoreError::Corrupt);
+            }
             let am = a.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
             let bm = b.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
             check([am.anchor(), bm.anchor()])?;
@@ -157,6 +160,7 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
                 payload_crc: plan.payload_crc,
                 payload_sectors: plan.payload_sectors,
                 wal: Some(wal),
+                resetting: false,
             }
         });
         Ok(Self {
