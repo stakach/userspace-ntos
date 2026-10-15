@@ -133,6 +133,58 @@ fn owned_empty_wal_baseline_repair_keeps_the_verified_physical_lease() {
 }
 
 #[test]
+fn owned_migration_commits_current_volume_to_both_v2_slots_before_releasing_lease() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let reserve = SnapshotReserve::new(CachedDisk::with_sectors(32), 83, store);
+    let fs = crate::FileSystem::new(crate::MemFs::new());
+    let expected = fs.export_volume_snapshot().unwrap();
+    let mut lease = reserve.try_acquire().unwrap();
+    fs.commit_volume_snapshot(&store, &mut lease).unwrap();
+    fs.commit_volume_snapshot(&store, &mut lease).unwrap();
+    let wal = OwnedBoundedBlockRange::new(lease, 16, 16).ok().unwrap();
+    let verified = RegistryWal::recover(wal, 77)
+        .unwrap()
+        .into_verified_device()
+        .unwrap()
+        .into_full_device();
+    let mut migration = WalSnapshotBaselineRepair::admit(store, verified).ok().unwrap();
+    assert!(reserve.try_acquire().is_none());
+    assert_eq!(migration.migrate(&fs), Ok(4));
+    let mut lease = migration.into_verified_device().unwrap().into_device();
+    lease.test_device_mut().power_cut();
+    let selected = store.read_latest_wal(&mut lease).unwrap().unwrap();
+    assert_eq!(selected.snapshot.payload, expected);
+    assert_eq!(selected.snapshot.generation, 4);
+    assert_eq!(selected.anchor.incarnation, 77);
+    assert_eq!(selected.anchor.serial, 0);
+    drop(lease);
+    assert!(reserve.try_acquire().is_some());
+}
+
+#[test]
+fn failed_first_v2_migration_write_retains_the_exact_lease() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let reserve = SnapshotReserve::new(CachedDisk::with_sectors(32), 84, store);
+    let fs = crate::FileSystem::new(crate::MemFs::new());
+    let mut lease = reserve.try_acquire().unwrap();
+    fs.commit_volume_snapshot(&store, &mut lease).unwrap();
+    fs.commit_volume_snapshot(&store, &mut lease).unwrap();
+    let fail = lease.test_device_mut().events.len() + 2;
+    lease.test_device_mut().fail_event = Some(fail);
+    let wal = OwnedBoundedBlockRange::new(lease, 16, 16).ok().unwrap();
+    let verified = RegistryWal::recover(wal, 77)
+        .unwrap()
+        .into_verified_device()
+        .unwrap()
+        .into_full_device();
+    let mut migration = WalSnapshotBaselineRepair::admit(store, verified).ok().unwrap();
+    assert_eq!(migration.migrate(&fs), Err(SnapshotBlockStoreError::Io));
+    let retained = migration.into_verified_device().err().unwrap();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(retained))).is_err());
+    assert!(reserve.try_acquire().is_none());
+}
+
+#[test]
 fn uncertain_baseline_repair_retains_the_same_reserve_lease() {
     let store = SnapshotBlockStore::new(0, 16);
     let reserve = SnapshotReserve::new(CachedDisk::with_sectors(32), 82, store);

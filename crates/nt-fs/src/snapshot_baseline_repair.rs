@@ -1,6 +1,9 @@
 //! Exact-lease repair of an interrupted empty-WAL snapshot baseline migration.
 
-use crate::{RegistryWalVerifiedDevice, SnapshotBlockDevice, SnapshotBlockStore, SnapshotBlockStoreError};
+use crate::{
+    FileSystem, RegistryWalVerifiedDevice, SnapshotBlockDevice, SnapshotBlockStore,
+    SnapshotBlockStoreError, WalSnapshotManifest,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -65,6 +68,46 @@ impl<D: SnapshotBlockDevice> WalSnapshotBaselineRepair<D> {
         let verified = self.verified.as_mut().expect("retained verified WAL lease");
         let incarnation = verified.anchor().incarnation;
         let result = self.store.repair_empty_wal_baseline(verified.device_mut(), incarnation);
+        self.phase = if result.is_ok() {
+            Phase::Complete
+        } else {
+            Phase::Uncertain
+        };
+        result
+    }
+
+    /// Migrate a mounted legacy volume and finish both empty-WAL v2 slots under one lease.
+    /// The caller must hold the filesystem exclusively until this returns: its current tree
+    /// becomes the durable baseline. A reboot after any error must recover the storage state
+    /// before the lease can be reused; this owner cannot replay an uncertain snapshot write.
+    pub fn migrate(&mut self, fs: &FileSystem) -> Result<u64, SnapshotBlockStoreError> {
+        if self.phase != Phase::Ready {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        let verified = self.verified.as_mut().expect("retained verified WAL lease");
+        let incarnation = verified.anchor().incarnation;
+        let result = (|| {
+            let state = self
+                .store
+                .repair_empty_wal_baseline(verified.device_mut(), incarnation)?;
+            if let Some(generation) = state {
+                return Ok(generation);
+            }
+            let manifest = WalSnapshotManifest {
+                incarnation,
+                base_serial: 0,
+                high_water_serial: 0,
+                high_water_end_lba: 0,
+            };
+            fs.commit_volume_snapshot_with_wal_manifest(
+                &self.store,
+                verified.device_mut(),
+                manifest,
+            )?;
+            self.store
+                .repair_empty_wal_baseline(verified.device_mut(), incarnation)?
+                .ok_or(SnapshotBlockStoreError::Corrupt)
+        })();
         self.phase = if result.is_ok() {
             Phase::Complete
         } else {
