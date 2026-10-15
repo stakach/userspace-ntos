@@ -54,6 +54,77 @@ fn reboot_bytes(disk: &mut CachedDisk) -> Vec<u8> {
     fs.try_file_bytes_owned(PATH).unwrap().unwrap()
 }
 
+fn legacy_v2_admission_status(
+    fs: &mut FileSystem,
+    disk: &mut CachedDisk,
+    store: SnapshotBlockStore,
+    existing: bool,
+) -> (u32, u32) {
+    let result = if existing {
+        SnapshotJournal::open(fs, disk, store, PATH, b"tail".to_vec(), 59)
+    } else {
+        SnapshotJournal::create(fs, disk, store, PATH, b"first".to_vec(), 59)
+    };
+    match result {
+        Ok(work) => {
+            drop(work);
+            panic!("borrowed legacy journal admitted on v2 volume");
+        }
+        Err(error) => (error.status, error.context),
+    }
+}
+
+fn unavailable_read_admission(
+    fs: &mut FileSystem,
+    disk: &mut CachedDisk,
+    store: SnapshotBlockStore,
+    drops: &Rc<Cell<usize>>,
+) -> SnapshotJournalOpenError<Caller> {
+    match SnapshotJournal::open(
+        fs,
+        disk,
+        store,
+        PATH,
+        b"new".to_vec(),
+        Caller(drops.clone()),
+    ) {
+        Ok(work) => {
+            drop(work);
+            panic!("unreadable snapshot header admitted");
+        }
+        Err(error) => error,
+    }
+}
+
+#[test]
+fn borrowed_legacy_journal_refuses_v2_slots_before_file_effects() {
+    for existing in [false, true] {
+        let mut fs = FileSystem::new(MemFs::new());
+        assert!(fs.provision_directory(r"\??\C:\Config"));
+        if existing {
+            assert!(fs.provision_file(PATH, BASE));
+        }
+        let mut disk = CachedDisk::new();
+        let store = SnapshotBlockStore::new(0, disk.sector_count());
+        let manifest = WalSnapshotManifest {
+            incarnation: 77,
+            base_serial: 0,
+            high_water_serial: 0,
+            high_water_end_lba: 0,
+        };
+        for _ in 0..2 {
+            fs.commit_volume_snapshot_with_wal_manifest(&store, &mut disk, manifest)
+                .unwrap();
+        }
+        disk.events.clear();
+        let (status, context) = legacy_v2_admission_status(&mut fs, &mut disk, store, existing);
+        assert_eq!(status, STATUS_DATA_ERROR);
+        assert_eq!(context, 59);
+        assert!(disk.events.is_empty());
+        assert_eq!(fs.try_file_len(PATH).unwrap().is_some(), existing);
+    }
+}
+
 #[test]
 fn snapshot_is_durable_before_publication_and_keeps_complete_caller() {
     let (mut fs, mut disk, store) = fixture();
@@ -268,11 +339,26 @@ fn writer_conflict_retains_unwritten_inputs() {
 }
 
 #[test]
-fn unavailable_snapshot_reads_do_not_count_as_durable_or_repeat_append() {
+fn unavailable_snapshot_header_at_admission_retains_all_inputs_without_effects() {
     let (mut fs, mut disk, store) = fixture();
     let drops = Rc::new(Cell::new(0));
     disk.fail_read = Some(0);
+    let error = unavailable_read_admission(&mut fs, &mut disk, store, &drops);
+    assert_eq!(error.status, STATUS_DEVICE_NOT_READY);
+    assert_eq!(error.journal, b"new");
+    assert_eq!(drops.get(), 0);
+    assert!(disk.events.is_empty());
+    assert_eq!(fs.try_file_bytes_owned(PATH).unwrap().unwrap(), BASE);
+    drop(error.context);
+    assert_eq!(drops.get(), 1);
+}
+
+#[test]
+fn unavailable_snapshot_reads_do_not_count_as_durable_or_repeat_append() {
+    let (mut fs, mut disk, store) = fixture();
+    let drops = Rc::new(Cell::new(0));
     let mut work = open(&mut fs, &mut disk, store, b"new", &drops);
+    work.dev.fail_read = Some(0);
     assert!(matches!(
         work.make_durable(),
         Err(SnapshotJournalError::Snapshot(_))

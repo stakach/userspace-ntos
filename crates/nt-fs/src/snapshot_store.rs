@@ -678,6 +678,52 @@ impl SnapshotBlockStore {
         )
     }
 
+    /// Admit a journal checkpoint only after both payload-valid slots name the same WAL
+    /// anchor. A mixed migration or half-advanced anchor needs recovery under this device
+    /// owner before a new journal effect can begin.
+    pub(crate) fn validate_wal_journal_manifest<D: SnapshotBlockDevice>(
+        &self,
+        dev: &mut D,
+        manifest: WalSnapshotManifest,
+    ) -> Result<(), SnapshotBlockStoreError> {
+        if !manifest.valid() {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        let first = self
+            .read_valid_slot_plan(dev, 0)?
+            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        let second = self
+            .read_valid_slot_plan(dev, 1)?
+            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        if first.generation == second.generation {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        for previous in [first, second] {
+            let previous = previous.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
+            if previous.anchor() != manifest.anchor()
+                || previous.base_serial > manifest.base_serial
+            {
+                return Err(SnapshotBlockStoreError::Corrupt);
+            }
+        }
+        Ok(())
+    }
+
+    /// Check only the two headers before a legacy journal append. The writer will validate
+    /// payloads at its barrier; admission must cheaply reject a v2 or ambiguous slot without
+    /// reading an entire volume image for every current v1 mutation.
+    pub(crate) fn validate_legacy_journal_format<D: SnapshotBlockDevice>(
+        &self,
+        dev: &mut D,
+    ) -> Result<(), SnapshotBlockStoreError> {
+        for slot in 0..2 {
+            if self.read_slot_plan(dev, slot)?.is_some_and(|plan| plan.wal.is_some()) {
+                return Err(SnapshotBlockStoreError::Corrupt);
+            }
+        }
+        Ok(())
+    }
+
     fn commit_next_streaming_inner<D, F>(
         &self,
         dev: &mut D,

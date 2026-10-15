@@ -22,6 +22,7 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
             path,
             journal,
             context,
+            None,
         )
         .map_err(|error| SnapshotJournalOpenError {
             status: error.status,
@@ -32,16 +33,18 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
 
     pub(super) fn create_storage(
         fs: StorageOwner<'a, FileSystem>,
-        dev: StorageOwner<'a, D>,
+        mut dev: StorageOwner<'a, D>,
         store: SnapshotBlockStore,
         path: &str,
         journal: Vec<u8>,
         context: C,
+        wal_manifest: Option<WalSnapshotManifest>,
     ) -> Result<Self, StorageAdmissionError<'a, D, C>> {
         let admit = (|| {
             if journal.is_empty() {
                 return Err(STATUS_INVALID_PARAMETER);
             }
+            admit_snapshot_format(store, &mut *dev, wal_manifest)?;
             u64::try_from(journal.len()).map_err(|_| STATUS_DATA_ERROR)?;
             if fs.try_file_len(path)?.is_some() {
                 return Err(STATUS_OBJECT_NAME_COLLISION);
@@ -65,6 +68,7 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
                 fs,
                 dev,
                 store,
+                wal_manifest,
                 handle: INVALID_HANDLE,
                 file_id: 0,
                 original_end: 0,
@@ -151,9 +155,7 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
             Ok(Some(_)) => return Err(SnapshotJournalError::ChangedExtent),
             Err(status) => return Err(SnapshotJournalError::File(status)),
         }
-        self.fs
-            .commit_volume_snapshot(&self.store, &mut *self.dev)
-            .map_err(SnapshotJournalError::Snapshot)?;
+        self.checkpoint()?;
         self.phase = RolledBack;
         Ok(())
     }

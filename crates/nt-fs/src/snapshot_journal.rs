@@ -33,6 +33,42 @@ pub enum SnapshotJournalError {
     ChangedExtent,
 }
 
+fn snapshot_admission_status(error: SnapshotBlockStoreError) -> u32 {
+    match error {
+        SnapshotBlockStoreError::Corrupt => STATUS_DATA_ERROR,
+        SnapshotBlockStoreError::Io => STATUS_DEVICE_NOT_READY,
+        SnapshotBlockStoreError::InvalidGeometry => STATUS_INVALID_PARAMETER,
+        SnapshotBlockStoreError::OutOfMemory | SnapshotBlockStoreError::OutOfSpace => {
+            STATUS_INSUFFICIENT_RESOURCES
+        }
+    }
+}
+
+fn admit_snapshot_format<D: SnapshotBlockDevice>(
+    store: SnapshotBlockStore,
+    dev: &mut D,
+    wal_manifest: Option<WalSnapshotManifest>,
+) -> Result<(), u32> {
+    match wal_manifest {
+        Some(manifest) => {
+            // No caller may claim that a mounted volume includes an anchored WAL suffix
+            // until a replay/fold owner proves the exact applied serial and source tree.
+            if manifest.base_serial != 0
+                || manifest.high_water_serial != 0
+                || manifest.high_water_end_lba != 0
+            {
+                return Err(STATUS_DATA_ERROR);
+            }
+            store
+                .validate_wal_journal_manifest(dev, manifest)
+                .map_err(snapshot_admission_status)
+        }
+        None => store
+            .validate_legacy_journal_format(dev)
+            .map_err(snapshot_admission_status),
+    }
+}
+
 /// Returned before any journal write. Neither the input journal nor caller state is lost.
 #[derive(Debug)]
 pub struct SnapshotJournalOpenError<C> {
@@ -87,6 +123,7 @@ pub struct SnapshotJournal<'a, D: SnapshotBlockDevice, C> {
     fs: StorageOwner<'a, FileSystem>,
     dev: StorageOwner<'a, D>,
     store: SnapshotBlockStore,
+    wal_manifest: Option<WalSnapshotManifest>,
     handle: u64,
     file_id: u64,
     original_end: usize,
@@ -117,6 +154,7 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
             path,
             journal,
             context,
+            None,
         )
         .map_err(|error| SnapshotJournalOpenError {
             status: error.status,
@@ -127,16 +165,18 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
 
     fn open_storage(
         mut fs: StorageOwner<'a, FileSystem>,
-        dev: StorageOwner<'a, D>,
+        mut dev: StorageOwner<'a, D>,
         store: SnapshotBlockStore,
         path: &str,
         journal: Vec<u8>,
         context: C,
+        wal_manifest: Option<WalSnapshotManifest>,
     ) -> Result<Self, StorageAdmissionError<'a, D, C>> {
         let admit = (|| {
             if journal.is_empty() {
                 return Err(STATUS_INVALID_PARAMETER);
             }
+            admit_snapshot_format(store, &mut *dev, wal_manifest)?;
             let original_end = fs.try_file_len(path)?.ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
             let original_end = usize::try_from(original_end).map_err(|_| STATUS_DATA_ERROR)?;
             let final_end = original_end
@@ -173,6 +213,7 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
                 fs,
                 dev,
                 store,
+                wal_manifest,
                 handle,
                 file_id,
                 original_end,
@@ -194,6 +235,16 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
     }
     pub fn durability(&self) -> Option<&SnapshotJournalDurability> {
         self.durability.as_ref()
+    }
+
+    fn checkpoint(&mut self) -> Result<(u64, usize), SnapshotJournalError> {
+        match self.wal_manifest {
+            Some(manifest) => self
+                .fs
+                .commit_volume_snapshot_with_wal_manifest(&self.store, &mut *self.dev, manifest),
+            None => self.fs.commit_volume_snapshot(&self.store, &mut *self.dev),
+        }
+        .map_err(SnapshotJournalError::Snapshot)
     }
 
     // Check the entire observed tail, not just its length. Only our own append/truncate can alter
@@ -270,10 +321,7 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
         } else if observed != self.journal.len() {
             return Err(SnapshotJournalError::ChangedExtent);
         }
-        let (snapshot_generation, snapshot_bytes) = self
-            .fs
-            .commit_volume_snapshot(&self.store, &mut *self.dev)
-            .map_err(SnapshotJournalError::Snapshot)?;
+        let (snapshot_generation, snapshot_bytes) = self.checkpoint()?;
         self.durability = Some(SnapshotJournalDurability {
             snapshot_generation,
             snapshot_bytes,
@@ -322,9 +370,7 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
         if status != STATUS_SUCCESS {
             return Err(SnapshotJournalError::File(status));
         }
-        self.fs
-            .commit_volume_snapshot(&self.store, &mut *self.dev)
-            .map_err(SnapshotJournalError::Snapshot)?;
+        self.checkpoint()?;
         self.phase = RolledBack;
         Ok(())
     }
