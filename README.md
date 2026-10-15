@@ -230,8 +230,8 @@ The [feature-off production scanout](docs/images/desktop-production.png) records
 genuine Explorer taskbar and Start-button rendering after a fresh profile setup.
 The [source-instrumented scanout](docs/images/desktop-source-irp.png) accompanies
 the strict native source-IRP completion and retirement gate on the same kernel code.
-This is desktop-chrome evidence, not a complete executive-gate pass; remaining
-whole-OS acceptance is tracked in [issue #18](https://github.com/stakach/userspace-ntos/issues/18).
+The complete executive gate and genuine Explorer acceptance were subsequently
+verified in [issue #18](https://github.com/stakach/userspace-ntos/issues/18).
 
 `--desktop` opens a QEMU window using the real ReactOS `win32k.sys`, display driver,
 and font stack. Boot readiness is the Explorer chrome gate, not the earlier
