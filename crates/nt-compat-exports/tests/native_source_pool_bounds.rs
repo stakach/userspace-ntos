@@ -7,7 +7,8 @@ fn function_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let start = source.find(start).expect("actual native function start");
     let length = source[start..].find(end).expect("next native function");
     let function = &source[start..start + length];
-    syn::parse_str::<syn::ItemFn>(function).expect("extract a complete unchanged native function");
+    syn::parse_str::<syn::ItemFn>(function)
+        .unwrap_or_else(|error| panic!("extract a complete unchanged native function {start}: {error}"));
     function
 }
 
@@ -59,7 +60,7 @@ fn actual_native_source_pool_bounds_and_fallback_behavior() {
             "unsafe fn hosted_pool_allocation_exec_va(",
             "\nfn component_pool_to_exec_va(",
         ),
-        function_between(
+        functions_between(
             driver,
             "unsafe fn hosted_instance_pool_alloc(",
             "\nunsafe fn hosted_instance_pool_free_unlocked(",
