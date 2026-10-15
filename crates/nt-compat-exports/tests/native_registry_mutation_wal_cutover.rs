@@ -51,3 +51,28 @@ fn main_worker_durably_marks_and_anchors_before_local_publication_and_exact_ack(
     assert!(drive.contains("abort_after_receipt(*receipt)"));
     assert!(drive.contains("release_rolled_back(*ack)"));
 }
+
+#[test]
+fn live_wal_admission_consumes_mount_bound_continuation_without_reboot_tail_scan() {
+    let source = include_str!("../../../components/ntos-executive/src/writable_fs/registry_wal.rs");
+    let admit = &source[source.find("pub(crate) unsafe fn admit(").unwrap()
+        ..source.find("pub(crate) fn prepare(&mut self)").unwrap()];
+    assert!(admit.contains("snapshot_storage::take_wal_continuation"));
+    assert!(admit.contains("RegistryWal::resume_from_continuation"));
+    assert!(!admit.contains("RegistryWal::recover("),
+        "live mutations must not reread the unused 16 MiB WAL tail");
+    let release = &source[source.find("pub(crate) fn release_after_ack").unwrap()..];
+    assert!(release.contains("snapshot_storage::install_wal_continuation"),
+        "only a settled exact CM ACK may publish the next live continuation");
+}
+
+#[test]
+fn pci_relation_publication_accepts_the_mounted_wal_format() {
+    let source = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    let publish = &source[source.find("unsafe fn publish_hosted_bus_relations()").unwrap()
+        ..source.find("unsafe fn complete_hosted_relation_probe_without_publication(").unwrap()];
+    assert!(publish.contains("MutationPersistence::new()"),
+        "PCI relation publication must retain the shared CM storage owner");
+    assert!(!publish.contains("if !crate::writable_fs::legacy_snapshot_writes_allowed()"),
+        "a v2 SYSTEM mount must not reject PCI PDO publication before CM admission");
+}

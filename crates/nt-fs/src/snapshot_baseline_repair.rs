@@ -151,4 +151,14 @@ impl<D: SnapshotBlockDevice> WalSnapshotBaselineRepair<D> {
             Err(self)
         }
     }
+
+    /// A completed two-slot empty baseline may seed the in-process WAL continuation.
+    pub fn into_continuation(mut self) -> Result<(D, crate::RegistryWalContinuation), Self> {
+        if self.phase != Phase::Complete {
+            return Err(self);
+        }
+        Ok(crate::RegistryWalContinuation::from_verified(
+            self.verified.take().expect("completed baseline verified WAL"),
+        ))
+    }
 }

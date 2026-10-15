@@ -27,12 +27,13 @@ fn v2_fold_owns_cm_checkpoint_and_exact_reserve_until_two_slots_and_rollover() {
         assert!(fold.contains(contract), "native fold lost {contract}");
     }
     let image = fold.find("replace_boot_file(").unwrap();
-    let first = fold.find("commit_volume_snapshot_with_wal_manifest(").unwrap();
-    let second = fold[first + 1..].find("commit_volume_snapshot_with_wal_manifest(")
+    let capture = fold.find("export_volume_snapshot(").expect("one folded image capture");
+    let first = fold.find("commit_next_with_wal_manifest(").unwrap();
+    let second = fold[first + 1..].find("commit_next_with_wal_manifest(")
         .expect("second folded snapshot slot") + first + 1;
     let rollover = fold.find("WalSnapshotEpochRollover::admit(").unwrap();
     let ack = fold.find("config_manager_acknowledge_system_hive_checkpoint(").unwrap();
-    assert!(image < first && first < second && second < rollover && rollover < ack,
+    assert!(image < capture && capture < first && first < second && second < rollover && rollover < ack,
         "CM image fold, two slots, epoch rollover and CM ACK must retain one order");
     assert!(!fold.contains("config_manager_abort_system_hive_checkpoint("),
         "an uncertain physical fold cannot abandon its CM checkpoint");
@@ -96,4 +97,31 @@ fn pending_cm_ack_redrives_before_generic_snapshot_or_timer_gate() {
     assert!(early.contains("SYSTEM_WAL_LAST_FOLD_100NS.store(monotonic_time_100ns()")
         && early.contains("rearm_registered_active_delay_timer()"),
         "a refused ACK must move its timer deadline forward instead of rearming a past deadline");
+}
+
+#[test]
+fn small_fold_keeps_anchored_epoch_and_reserves_rollover_for_capacity() {
+    let fold = source("writable_fs/system_wal_fold.rs");
+    let first = fold.find("commit_next_with_wal_manifest(").unwrap();
+    let second = fold[first + 1..].find("commit_next_with_wal_manifest(").unwrap() + first + 1;
+    let decision = fold.find("if needs_epoch_rollover(manifest.high_water_end_lba, sectors)")
+        .expect("capacity gate after two folded slots");
+    let rollover = fold.find("WalSnapshotEpochRollover::admit(").unwrap();
+    assert!(first < second && second < decision && decision < rollover);
+    assert!(fold.contains("wal_sectors.saturating_sub(wal_sectors / 4)"),
+        "routine small folds must not erase the WAL epoch");
+    assert!(fold.contains("work.old_continuation.take()")
+        && fold.contains("work.next_continuation.is_some()"),
+        "no rollover reuses the exact anchored token after CM ACK");
+}
+
+#[test]
+fn fold_lease_preserves_batched_reserve_io() {
+    let fold = source("writable_fs/system_wal_fold.rs");
+    let adapter = &fold[fold.find("impl SnapshotBlockDevice for FoldLease").unwrap()
+        ..fold.find("fn block(").unwrap()];
+    assert!(adapter.contains("fn write_sectors(") && adapter.contains("self.0.write_sectors(lba, data)"),
+        "epoch erase must use the reserve's batched AHCI write path");
+    assert!(adapter.contains("fn read_sectors(") && adapter.contains("self.0.read_sectors(lba, out)"),
+        "WAL reads must preserve the reserve's batched AHCI read path");
 }

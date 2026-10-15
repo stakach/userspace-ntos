@@ -95,9 +95,10 @@ fn generic_checkpoint_uses_exact_v2_manifest_and_retains_uncertain_reserve() {
     assert!(checkpoint.contains("current_wal_checkpoint_manifest"),
         "the mounted v2 writer must derive the included base and anchor from both slots under its lease");
     assert!(checkpoint.contains("let wal_manifest = if wal_format {"),
-        "every v2 checkpoint must select its manifest before the dirty swap, including a concurrent dirty transition");
-    assert!(writer.contains("commit_volume_snapshot_with_wal_manifest"),
-        "an unrelated dirty-file checkpoint must retain v2 format and WAL floor");
+        "every dirty v2 checkpoint must select its manifest under the reserve lease");
+    assert!(writer.contains("commit_next_with_wal_manifest")
+        && checkpoint.contains("capture_volume_snapshot()"),
+        "an unrelated dirty-file checkpoint must freeze its image and retain the v2 WAL floor");
     assert!(checkpoint.contains("core::mem::forget(dev)"),
         "an uncertain v2 checkpoint must keep the exact reserve unavailable");
     assert!(checkpoint.contains("WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true"),

@@ -321,17 +321,24 @@ pub(crate) unsafe fn publish_boot_system_mutation(
 
     let mut completion = None;
     crate::bootstrap_receive::drive(stage, || {
-        let work = (*work_slot).as_mut().expect("retained boot CM mutation");
-        match work.advance() {
-            BootMutationProgress::Pending | BootMutationProgress::Blocked => Ok(None),
-            BootMutationProgress::Complete(completed_stage, outcome) => {
-                assert_eq!(completed_stage, stage, "wrong boot CM continuation");
-                *work_slot = None;
-                *stage_slot = None;
-                completion = Some(outcome);
-                Ok(Some(true))
+        // A successful Query, BEGIN, PREPARE or storage barrier leaves this owner ready for
+        // another immediate phase. Sleeping after two bootstrap passes can park it forever:
+        // no external event is required to make the next phase runnable.
+        for _ in 0..1024 {
+            let work = (*work_slot).as_mut().expect("retained boot CM mutation");
+            match work.advance() {
+                BootMutationProgress::Pending => continue,
+                BootMutationProgress::Blocked => return Ok(None),
+                BootMutationProgress::Complete(completed_stage, outcome) => {
+                    assert_eq!(completed_stage, stage, "wrong boot CM continuation");
+                    *work_slot = None;
+                    *stage_slot = None;
+                    completion = Some(outcome);
+                    return Ok(Some(true));
+                }
             }
         }
+        Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32)
     })?;
     completion.expect("acknowledged boot CM mutation").map_err(|status| status as u32)
 }

@@ -6,13 +6,13 @@ fn v2_system_wal_owner_admits_exact_paired_anchor_before_any_write() {
     let admit = &source[source.find("pub(crate) unsafe fn admit(").unwrap()
         ..source.find("\n    pub(crate) fn prepare(").unwrap()];
     let mount = admit.find("ensure_mounted()").unwrap();
-    let manifest = admit.find("current_wal_checkpoint_manifest").unwrap();
-    let paired = admit.find("validate_wal_journal_manifest").unwrap();
-    let recovered = admit.find("RegistryWal::recover").unwrap();
-    let exact = admit.find("wal.settled_anchor()").unwrap();
+    let paired = admit.find("current_paired_wal_journal_manifest").unwrap();
+    let exact = admit.find("snapshot_storage::take_wal_continuation(&lease, expected)").unwrap();
+    let resumed = admit.find("RegistryWal::resume_from_continuation").unwrap();
     let begin = admit.find("wal.begin(").unwrap();
-    assert!(mount < manifest && manifest < paired && paired < recovered
-        && recovered < exact && exact < begin);
+    assert!(mount < paired && paired < exact && exact < resumed && resumed < begin);
+    assert!(!admit.contains("RegistryWal::recover"),
+        "a live mutation must consume boot's mount-bound proof, not rescan the WAL tail");
     assert!(admit.contains("legacy_snapshot_writes_allowed()"));
 }
 

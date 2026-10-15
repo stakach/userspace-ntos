@@ -14,6 +14,7 @@ pub(crate) struct CachedDisk {
     pub(crate) events: Vec<Event>,
     pub(crate) fail_event: Option<usize>,
     pub(crate) fail_read: Option<u64>,
+    pub(crate) read_attempts: usize,
     pub(crate) partial_flush: bool,
 }
 
@@ -30,6 +31,7 @@ impl CachedDisk {
             events: Vec::new(),
             fail_event: None,
             fail_read: None,
+            read_attempts: 0,
             partial_flush: false,
         }
     }
@@ -61,6 +63,7 @@ impl SnapshotBlockDevice for CachedDisk {
     }
 
     fn read_sector(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError> {
+        self.read_attempts += 1;
         if self.fail_read == Some(lba) {
             return Err(SnapshotBlockStoreError::Io);
         }

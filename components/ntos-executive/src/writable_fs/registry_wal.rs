@@ -3,7 +3,8 @@
 use super::*;
 use nt_fs::{
     OwnedBoundedBlockRange, RegistryWal, RegistryWalError, RegistryWalState,
-    RegistryWalVerifiedDevice, WalSnapshotAnchor, WalSnapshotAnchorUpdate,
+    RegistryWalContinuation, RegistryWalVerifiedDevice, WalSnapshotAnchor,
+    WalSnapshotAnchorUpdate,
 };
 
 type WalDevice = OwnedBoundedBlockRange<snapshot_storage::Lease>;
@@ -12,7 +13,8 @@ enum Stage {
     Wal(RegistryWal<WalDevice>),
     Verified(RegistryWalVerifiedDevice<snapshot_storage::Lease>),
     Anchoring(WalSnapshotAnchorUpdate<snapshot_storage::Lease>),
-    Anchored(snapshot_storage::Lease),
+    Anchored(snapshot_storage::Lease, RegistryWalContinuation),
+    Aborted(snapshot_storage::Lease, RegistryWalContinuation),
 }
 
 /// Keeps the exact reserve unavailable until both header barriers and the matching CM ACK.
@@ -49,6 +51,26 @@ fn status(error: RegistryWalError) -> u32 {
     }
 }
 
+/// Return an untouched live proof to its exact mounted reserve. If that identity has changed,
+/// retain the lease and proof instead of permitting a fresh scan to hide the contradiction.
+fn restore_continuation(
+    lease: snapshot_storage::Lease,
+    continuation: RegistryWalContinuation,
+) -> Result<(), u32> {
+    match snapshot_storage::install_wal_continuation(&lease, continuation) {
+        Ok(()) => {
+            drop(lease);
+            Ok(())
+        }
+        Err((status, continuation)) => {
+            WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+            core::mem::forget(continuation);
+            core::mem::forget(lease);
+            Err(status)
+        }
+    }
+}
+
 impl Journal {
     /// Admit only the mounted v2 pair whose exact anchored WAL prefix was recovered.
     /// This performs no sector write; on any ambiguous prefix, the lease stays closed.
@@ -68,31 +90,37 @@ impl Journal {
         }
         let mut lease = snapshot_storage::acquire()?;
         let store = lease.store();
-        let manifest = store.current_wal_checkpoint_manifest(&mut lease)
-            .map_err(snapshot_store_error_status)?;
-        // The generic checkpoint may repair a same-anchor torn companion payload.
-        // A WAL marker cannot: its subsequent two-header anchor needs both payloads.
-        store.validate_wal_journal_manifest(&mut lease, manifest)
+        // A WAL marker needs two intact payloads for its later two-header anchor.
+        let manifest = store.current_paired_wal_journal_manifest(&mut lease)
             .map_err(snapshot_store_error_status)?;
         let expected = WalSnapshotAnchor {
             incarnation: manifest.incarnation,
             serial: manifest.high_water_serial,
             end_lba: manifest.high_water_end_lba,
         };
-        let range = snapshot_storage::owned_wal_region(lease)
-            .map_err(|(status, _lease)| status)?;
-        let mut wal = RegistryWal::recover(range, manifest.incarnation).map_err(status)?;
-        if wal.state() != RegistryWalState::Ready || wal.settled_anchor() != Some(expected) {
-            // A committed but unanchored prefix or a recovered unmarked tail needs the
-            // boot replay/repair owner. Letting another writer proceed could recycle it.
-            WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
-            core::mem::forget(wal);
-            return Err(nt_fs::STATUS_DATA_ERROR);
-        }
+        let continuation = snapshot_storage::take_wal_continuation(&lease, expected)?;
+        let range = match snapshot_storage::owned_wal_region(lease) {
+            Ok(range) => range,
+            Err((error, lease)) => {
+                restore_continuation(lease, continuation)?;
+                return Err(error);
+            }
+        };
+        // Boot's full scan and paired-header barrier minted this one-use, mount-bound proof.
+        // No physical WAL writer can intervene while the reserve lease is held here.
+        let mut wal = match RegistryWal::resume_from_continuation(range, continuation, expected) {
+            Ok(wal) => wal,
+            Err((error, range, continuation)) => {
+                restore_continuation(range.into_device(), continuation)?;
+                WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+                return Err(status(error));
+            }
+        };
         if let Err(error) = wal.begin(bytes) {
             // BEGIN is reservation only. Its failure leaves no physical effect.
-            let range = wal.into_device().expect("failed WAL reservation has no effect");
-            drop(range);
+            let (range, continuation) = wal.into_continuation()
+                .expect("failed WAL reservation has no effect");
+            restore_continuation(range.into_device(), continuation)?;
             return Err(status(error));
         }
         Ok(Self {
@@ -156,8 +184,9 @@ impl Journal {
         };
         update.advance().map_err(snapshot_store_error_status)?;
         let Some(Stage::Anchoring(update)) = self.stage.take() else { unreachable!() };
-        let lease = update.into_device().expect("both WAL anchors durably advanced");
-        self.stage = Some(Stage::Anchored(lease));
+        let (lease, continuation) = update.into_continuation()
+            .expect("both WAL anchors durably advanced");
+        self.stage = Some(Stage::Anchored(lease, continuation));
         Ok(())
     }
 
@@ -189,14 +218,22 @@ impl Journal {
         mut self,
         ack: nt_config_client::SystemHiveMutationAcknowledgement,
     ) -> Result<(), Self> {
-        if !matches!(self.stage.as_ref(), Some(Stage::Anchored(_)))
+        if !matches!(self.stage.as_ref(), Some(Stage::Anchored(_, _)))
             || self.commit_receipt != Some(ack.receipt())
         {
             return Err(self);
         }
-        let Some(Stage::Anchored(lease)) = self.stage.take() else { unreachable!() };
-        drop(lease);
-        Ok(())
+        let Some(Stage::Anchored(lease, continuation)) = self.stage.take() else { unreachable!() };
+        match snapshot_storage::install_wal_continuation(&lease, continuation) {
+            Ok(()) => {
+                drop(lease);
+                Ok(())
+            }
+            Err((_status, continuation)) => {
+                self.stage = Some(Stage::Anchored(lease, continuation));
+                Err(self)
+            }
+        }
     }
 
     pub(crate) fn release_after_abort(
@@ -206,15 +243,26 @@ impl Journal {
         if self.abort_receipt != Some(ack.receipt()) {
             return Err(self);
         }
-        let Some(Stage::Wal(wal)) = self.stage.as_ref() else {
+        if matches!(self.stage.as_ref(), Some(Stage::Wal(wal)) if wal.state() == RegistryWalState::Ready) {
+            let Some(Stage::Wal(wal)) = self.stage.take() else { unreachable!() };
+            let (range, continuation) = wal.into_continuation()
+                .expect("confirmed WAL abort is settled");
+            self.stage = Some(Stage::Aborted(range.into_device(), continuation));
+        }
+        let Some(Stage::Aborted(lease, continuation)) = self.stage.take() else {
             return Err(self);
         };
-        if wal.state() != RegistryWalState::Ready {
-            return Err(self);
+        match snapshot_storage::install_wal_continuation(&lease, continuation) {
+            Ok(()) => {
+                drop(lease);
+                Ok(())
+            }
+            Err((_status, continuation)) => {
+                // The exact abort was acknowledged, but native authority publication failed.
+                // Keep the lease and proof in this owner for the same terminal redrive.
+                self.stage = Some(Stage::Aborted(lease, continuation));
+                Err(self)
+            }
         }
-        let Some(Stage::Wal(wal)) = self.stage.take() else { unreachable!() };
-        let range = wal.into_device().expect("confirmed WAL abort is settled");
-        drop(range);
-        Ok(())
     }
 }

@@ -26,6 +26,20 @@ fn two_v2_slots() -> (SnapshotBlockStore, CachedDisk) {
 }
 
 #[test]
+fn paired_wal_journal_manifest_requires_two_payload_valid_slots() {
+    let (store, mut disk) = two_v2_slots();
+    disk.read_attempts = 0;
+    assert_eq!(store.current_paired_wal_journal_manifest(&mut disk), Ok(base()));
+    assert_eq!(disk.read_attempts, 4, "one header and one payload read per slot");
+
+    disk.corrupt(1);
+    assert_eq!(
+        store.current_paired_wal_journal_manifest(&mut disk),
+        Err(SnapshotBlockStoreError::Corrupt)
+    );
+}
+
+#[test]
 fn generic_v2_checkpoint_uses_selected_base_and_both_exact_anchor_copies() {
     let (store, mut disk) = two_v2_slots();
     assert_eq!(store.current_wal_checkpoint_manifest(&mut disk), Ok(base()));

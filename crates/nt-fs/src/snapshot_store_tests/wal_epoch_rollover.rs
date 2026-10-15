@@ -1,6 +1,72 @@
 use super::*;
 use crate::{OwnedBoundedBlockRange, RegistryWal, SnapshotReserve, WalSnapshotEpochRollover};
 
+struct BatchCountDisk {
+    inner: CachedDisk,
+    single_writes: usize,
+    range_writes: usize,
+}
+
+impl SnapshotBlockDevice for BatchCountDisk {
+    fn sector_size(&self) -> usize { self.inner.sector_size() }
+    fn sector_count(&self) -> u64 { self.inner.sector_count() }
+    fn read_sector(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError> {
+        self.inner.read_sector(lba, out)
+    }
+    fn write_sector(&mut self, lba: u64, data: &[u8]) -> Result<(), SnapshotBlockStoreError> {
+        self.single_writes += 1;
+        self.inner.write_sector(lba, data)
+    }
+    fn write_sectors(&mut self, lba: u64, data: &[u8]) -> Result<(), SnapshotBlockStoreError> {
+        self.range_writes += 1;
+        self.inner.write_sectors(lba, data)
+    }
+    fn flush(&mut self) -> Result<(), SnapshotBlockStoreError> { self.inner.flush() }
+}
+
+#[test]
+fn rollover_erases_large_old_wal_in_bounded_reverse_ranges() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let reserve = SnapshotReserve::new(BatchCountDisk {
+        inner: CachedDisk::with_sectors(16 + 128),
+        single_writes: 0,
+        range_writes: 0,
+    }, 83u64, store);
+    let mut lease = reserve.try_acquire().unwrap();
+    let initial = WalSnapshotManifest {
+        incarnation: 77, base_serial: 0,
+        high_water_serial: 0, high_water_end_lba: 0,
+    };
+    store.commit_next_with_wal_manifest(&mut lease, b"old", initial).unwrap();
+    store.commit_next_with_wal_manifest(&mut lease, b"old", initial).unwrap();
+    let range = OwnedBoundedBlockRange::new(lease, 16, 128).ok().unwrap();
+    let mut wal = RegistryWal::recover(range, 77).unwrap();
+    wal.begin(alloc::vec![7; 512]).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    let verified = wal.into_verified_device().unwrap().into_full_device();
+    let mut anchor = WalSnapshotAnchorUpdate::admit_verified_wal(store, verified).ok().unwrap();
+    anchor.advance().unwrap();
+    let mut lease = anchor.into_device().unwrap();
+    let folded = WalSnapshotManifest {
+        incarnation: 77, base_serial: 1,
+        high_water_serial: 1, high_water_end_lba: 3,
+    };
+    store.commit_next_with_wal_manifest(&mut lease, b"folded", folded).unwrap();
+    store.commit_next_with_wal_manifest(&mut lease, b"folded", folded).unwrap();
+    let range = OwnedBoundedBlockRange::new(lease, 16, 128).ok().unwrap();
+    let verified = RegistryWal::recover(range, 77).unwrap().into_verified_device().unwrap();
+    let mut rollover = WalSnapshotEpochRollover::admit(store, verified, 88).ok().unwrap();
+    rollover.device_mut_for_test().test_device_mut().single_writes = 0;
+    rollover.device_mut_for_test().test_device_mut().range_writes = 0;
+    rollover.publish_resetting().unwrap();
+    rollover.finish().unwrap();
+    let (mut lease, next) = rollover.into_continuation().ok().unwrap();
+    assert_eq!(next.anchor(), WalSnapshotAnchor { incarnation: 88, serial: 0, end_lba: 0 });
+    assert!(lease.test_device_mut().range_writes >= 1);
+    assert!(lease.test_device_mut().single_writes < 16);
+}
+
 fn old_epoch(folded: bool) -> (SnapshotBlockStore, SnapshotReserve<CachedDisk, u64>) {
     let store = SnapshotBlockStore::new(0, 16);
     let reserve = SnapshotReserve::new(CachedDisk::with_sectors(32), 83, store);

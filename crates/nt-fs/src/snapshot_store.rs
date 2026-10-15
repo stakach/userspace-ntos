@@ -882,6 +882,35 @@ impl SnapshotBlockStore {
         Ok(())
     }
 
+    /// Select a journal admission manifest while validating each snapshot payload once.
+    /// Both slots must be intact before a WAL marker can advance their shared anchor.
+    pub fn current_paired_wal_journal_manifest<D: SnapshotBlockDevice>(
+        &self,
+        dev: &mut D,
+    ) -> Result<WalSnapshotManifest, SnapshotBlockStoreError> {
+        let first = self.read_valid_slot_plan(dev, 0)?
+            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        let second = self.read_valid_slot_plan(dev, 1)?
+            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        if first.resetting || second.resetting {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        let (selected, companion) = if first.generation > second.generation {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let manifest = selected.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
+        let other = companion.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
+        if !manifest.valid() || !other.valid() {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        same_anchor_wal_companion(
+            selected.generation, manifest, companion.generation, other,
+        )?;
+        Ok(manifest)
+    }
+
     /// Select the manifest for an unrelated mounted-volume checkpoint. The new payload
     /// has not folded any additional SYSTEM records, so it inherits the selected payload's
     /// base serial and the exact anchor present in both valid v2 headers. One companion

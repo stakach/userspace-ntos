@@ -16,6 +16,7 @@ pub struct WalSnapshotAnchorUpdate<D: SnapshotBlockDevice> {
     store: SnapshotBlockStore,
     headers: [SlotHeader; 2],
     torn_companion_source: Option<SlotReadPlan>,
+    continuation: Option<crate::RegistryWalContinuation>,
     phase: Phase,
 }
 
@@ -86,7 +87,12 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
             Ok(())
         });
         match result {
-            Ok(update) => Ok(update),
+            Ok(mut update) => {
+                update.continuation = Some(crate::RegistryWalContinuation::from_parts(
+                    prefix, record_end_lbas,
+                ));
+                Ok(update)
+            }
             Err((error, device)) => Err((
                 error,
                 crate::RegistryWalVerifiedDevice::from_parts(device, prefix, record_end_lbas),
@@ -203,6 +209,7 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
             store,
             headers,
             torn_companion_source,
+            continuation: None,
             phase: Phase::Pending,
         })
     }
@@ -264,6 +271,18 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
         } else {
             Err(self)
         }
+    }
+
+    /// Return the exact prefix only after both snapshot headers have crossed their
+    /// durable barriers. Ordinary numeric-anchor admission cannot mint a continuation.
+    pub fn into_continuation(mut self) -> Result<(D, crate::RegistryWalContinuation), Self> {
+        if self.phase != Phase::Complete || self.continuation.is_none() {
+            return Err(self);
+        }
+        Ok((
+            self.device.take().expect("retained anchor device"),
+            self.continuation.take().expect("verified WAL prefix"),
+        ))
     }
 
     #[cfg(test)]

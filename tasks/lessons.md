@@ -660,6 +660,13 @@ diagnosis-free failure.
 - Keep strict acceptance failed until an official fixed build is integrated and the native fixture
   passes. Track the upstream dependency separately from already-proven desktop acceptance.
 
+## Resolve Next-Issue Scope From The Active Issue List
+- When a user asks to continue with the next issue, check the current open issue list and explicit
+  dependency status before choosing it. A failure already waiting on an upstream pull request is
+  not a new implementation target unless the user names it.
+- If the user corrects that choice, record the excluded issue and continue the remaining requested
+  issues without reopening the dependency as a local binary patch.
+
 ## Keep CI Contracts Independent Of Unstaged References
 - `references/` is an ignored research checkout; crate CI fetches only a sparse pinned subset.
   Read other reference files to derive a contract, but do not use compile-time `include_str!` or

@@ -42539,11 +42539,6 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
         // Classify the lazy mount before retaining provider resources or entering CM.
         crate::writable_fs::ensure_mounted()
             .map_err(|status| hosted_relation_error_from_config(status as i32))?;
-        if !crate::writable_fs::legacy_snapshot_writes_allowed() {
-            return Err(HostedRelationPublishError::Barrier(
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-            ));
-        }
         let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
         let mount_identity = crate::LIVE_CONFIG_MANAGER_SYSTEM_MOUNT
             .ok_or(HostedRelationPublishError::Retry)?

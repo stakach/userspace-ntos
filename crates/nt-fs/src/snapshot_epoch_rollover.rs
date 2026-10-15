@@ -191,6 +191,18 @@ impl<D: SnapshotBlockDevice> WalSnapshotEpochRollover<D> {
         }
     }
 
+    /// The completed RESETTING, erase, and paired READY barriers establish a fresh
+    /// all-zero WAL epoch without a second full-tail recovery scan in this process.
+    pub fn into_continuation(mut self) -> Result<(D, crate::RegistryWalContinuation), Self> {
+        if self.phase != Phase::Complete {
+            return Err(self);
+        }
+        Ok((
+            self.device.take().expect("completed rollover device"),
+            crate::RegistryWalContinuation::empty(self.next_incarnation),
+        ))
+    }
+
     #[cfg(test)]
     pub(crate) fn device_mut_for_test(&mut self) -> &mut D {
         self.device.as_mut().expect("test rollover device")
@@ -245,14 +257,26 @@ fn erase_old_wal<D: SnapshotBlockDevice>(
     start: u64,
     sectors: u64,
 ) -> Result<(), SnapshotBlockStoreError> {
+    const BATCH_SECTORS: usize = 64;
     let size = device.sector_size();
+    let batch_bytes = size.checked_mul(BATCH_SECTORS)
+        .ok_or(SnapshotBlockStoreError::InvalidGeometry)?;
     let mut zero = Vec::new();
-    zero.try_reserve_exact(size).map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
-    zero.resize(size, 0);
-    for offset in (1..sectors).rev() {
-        device.write_sector(start + offset, &zero)?;
+    zero.try_reserve_exact(batch_bytes).map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
+    zero.resize(batch_bytes, 0);
+    // Erase bounded ranges from the end toward sector zero. RESETTING headers have
+    // already crossed both barriers, so any partial range write remains recoverable.
+    let mut remaining = sectors;
+    while remaining > 1 {
+        let count = (remaining - 1).min(BATCH_SECTORS as u64);
+        let offset = remaining - count;
+        let bytes = usize::try_from(count).ok()
+            .and_then(|count| count.checked_mul(size))
+            .ok_or(SnapshotBlockStoreError::InvalidGeometry)?;
+        device.write_sectors(start + offset, &zero[..bytes])?;
+        remaining = offset;
     }
     device.flush()?;
-    device.write_sector(start, &zero)?;
+    device.write_sector(start, &zero[..size])?;
     device.flush()
 }

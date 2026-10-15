@@ -63,6 +63,34 @@ pub struct RegistryWalVerifiedDevice<D> {
     record_end_lbas: Vec<u64>,
 }
 
+/// Move-only proof of the settled WAL prefix for another use of the same physical reserve.
+/// A caller must separately prove the paired snapshot headers still name this anchor.
+#[must_use = "bind this continuation to the same reserve and paired snapshot anchor"]
+pub struct RegistryWalContinuation {
+    prefix: RegistryWalVerifiedPrefix,
+    record_end_lbas: Vec<u64>,
+}
+
+impl RegistryWalContinuation {
+    pub fn anchor(&self) -> WalSnapshotAnchor { self.prefix.anchor() }
+
+    pub(crate) fn from_parts(prefix: RegistryWalVerifiedPrefix, record_end_lbas: Vec<u64>) -> Self {
+        Self { prefix, record_end_lbas }
+    }
+
+    pub(crate) fn empty(incarnation: u64) -> Self {
+        Self {
+            prefix: RegistryWalVerifiedPrefix { incarnation, serial: 0, end_lba: 0 },
+            record_end_lbas: Vec::new(),
+        }
+    }
+
+    pub(crate) fn from_verified<D>(verified: RegistryWalVerifiedDevice<D>) -> (D, Self) {
+        let (device, prefix, record_end_lbas) = verified.into_parts();
+        (device, Self { prefix, record_end_lbas })
+    }
+}
+
 impl<D> RegistryWalVerifiedDevice<D> {
     pub fn anchor(&self) -> WalSnapshotAnchor { self.prefix.anchor() }
     pub fn into_device(self) -> D { self.device }
@@ -224,6 +252,53 @@ fn payload_sectors(len: usize, size: usize) -> Result<u64, RegistryWalError> {
 }
 
 impl<D: SnapshotBlockDevice> RegistryWal<D> {
+    /// Resume an in-process WAL owner without scanning the zero-filled suffix. The caller
+    /// must hold the same exclusive physical reserve that produced the continuation and
+    /// must have checked both snapshot headers against `anchored` under that lease.
+    /// A reboot must call `recover`, which scans and validates the whole tail again.
+    ///
+    /// # Safety
+    /// `device` must be the exact WAL range of the original reserve, exclusively owned
+    /// since the continuation was minted. The paired snapshot headers must durably name
+    /// `anchored`; a bare numeric anchor is not physical identity or authority.
+    pub unsafe fn resume_from_continuation(
+        device: D,
+        continuation: RegistryWalContinuation,
+        anchored: WalSnapshotAnchor,
+    ) -> Result<Self, (RegistryWalError, D, RegistryWalContinuation)> {
+        let size = device.sector_size();
+        let count = device.sector_count();
+        let prefix = continuation.prefix;
+        let serial_count = usize::try_from(prefix.serial).ok();
+        let mut previous = 0u64;
+        let boundaries_valid = continuation.record_end_lbas.iter().all(|&end| {
+            let valid = end >= previous.saturating_add(3) && end <= count;
+            previous = end;
+            valid
+        });
+        let valid = size >= HEADER_BYTES && count >= 3
+            && prefix.incarnation != 0
+            && prefix.anchor() == anchored
+            && serial_count == Some(continuation.record_end_lbas.len())
+            && boundaries_valid
+            && previous == prefix.end_lba
+            && prefix.serial.checked_add(1).is_some();
+        if !valid {
+            return Err((RegistryWalError::Corrupt, device, continuation));
+        }
+        Ok(Self {
+            device: Some(device),
+            incarnation: prefix.incarnation,
+            cursor: prefix.end_lba,
+            next_serial: prefix.serial + 1,
+            records: Vec::new(),
+            record_end_lbas: continuation.record_end_lbas,
+            pending: None,
+            recovered_tail_sectors: None,
+            state: RegistryWalState::Ready,
+        })
+    }
+
     /// Recover only the contiguous, checksum-verified committed prefix. A valid prepared
     /// record without a marker is an unacknowledged tail and may be reused after reboot.
     pub fn recover(mut device: D, incarnation: u64) -> Result<Self, RegistryWalError> {
@@ -344,6 +419,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
         })
     }
 
+    /// Recovered payloads, or records appended since an in-process continuation resumed.
     pub fn records(&self) -> &[RegistryWalRecord] {
         &self.records
     }
@@ -370,7 +446,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
         ) {
             return None;
         }
-        let serial = self.records.last().map_or(0, |record| record.serial);
+        let serial = self.next_serial.checked_sub(1)?;
         Some((self.incarnation, serial, self.cursor))
     }
 
@@ -611,6 +687,13 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
             prefix,
             core::mem::take(&mut self.record_end_lbas),
         ))
+    }
+
+    /// Return a settled in-process prefix after a pre-effect refusal or confirmed abort.
+    /// The token cannot authorize another write until paired headers are checked again.
+    pub fn into_continuation(self) -> Result<(D, RegistryWalContinuation), Self> {
+        let verified = self.into_verified_device()?;
+        Ok(RegistryWalContinuation::from_verified(verified))
     }
 
     #[cfg(test)]

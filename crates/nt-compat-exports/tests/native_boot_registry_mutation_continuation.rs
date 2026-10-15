@@ -221,6 +221,20 @@ fn boot_owner_uses_v2_marker_anchors_and_typed_terminal_ack() {
 }
 
 #[test]
+fn bootstrap_mutation_drains_immediate_cm_progress_before_receive() {
+    let owner = source("boot_registry_mutation_work.rs");
+    let publish = owner.find("pub(crate) unsafe fn publish_boot_system_mutation(")
+        .expect("bootstrap mutation entry");
+    let end = owner[publish..].find("pub(crate) unsafe fn drain_boot_registry_before_handler_constructor(")
+        .unwrap() + publish;
+    let drive = &owner[publish..end];
+    assert!(drive.contains("BootMutationProgress::Pending => continue"),
+        "a successful CM Query or BEGIN must advance again before bootstrap receive can park");
+    assert!(drive.contains("BootMutationProgress::Blocked => return Ok(None)"),
+        "only an externally blocked owner may yield to bootstrap receive");
+}
+
+#[test]
 fn boot_owner_aborts_prepared_wal_only_after_cm_abort_receipt() {
     let owner = source("boot_registry_mutation_work.rs");
     let abort = owner.find("Phase::Abort =>").expect("precommit abort phase");
