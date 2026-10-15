@@ -20,6 +20,8 @@ const ADDRESS: u64 = FSD_POOL_VADDR + PAYLOAD;
 const CAPACITY: u64 = 0x200;
 const HOSTED_DMA_ADAPTER_SIZE: u64 = 0x40;
 const HOSTED_DMA_ADAPTER_SIGNATURE_OFFSET: u64 = 0x10;
+const HOSTED_SG_CONTEXT_SIZE: u64 = 0x30;
+const HOSTED_SG_LIST_SIZE_ONE: u64 = 0x28;
 const HOSTED_KINTERRUPT_SIZE: u64 = 0x70;
 const POOL_FREE_LIST_MAX: u64 = FSD_POOL_FRAMES * 0x1000 / 16;
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -341,6 +343,187 @@ fn dma_pair_retains_exact_members_across_mutation_refusal_and_retry() {
         REFUSE_DMA_FREE.with(|refuse| refuse.set(None));
         native::drain_dma_adapter_tombstones(pool.inst).unwrap();
         assert!(native::instance_quiesced(pool.inst));
+    }
+}
+
+#[test]
+fn dma_private_graph_retires_captured_members_and_mapping_once() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let mut io = IoManager::new(MockObjectPort::new());
+    let domain = io.register_hosted_domain();
+    MANAGER.with(|manager| manager.set(&mut io));
+    let _manager_scope = ManagerScope;
+    let pool = Pool::new(domain, 90, 0xe000);
+    unsafe {
+        let (map, context, list) = native::provision_dma_private_graph(
+            pool.inst, 777, 1, native::DmaPrivateKind::ScatterGatherOwned, 0,
+        ).unwrap();
+        assert_ne!(map, context);
+        assert_ne!(context, list);
+        native::record_dma_private_mapping(pool.inst, 777, map, 0x1000, 0x2000, 64,
+            || Ok(501)).unwrap();
+        native::record_dma_private_mapping(pool.inst, 777, map, 0x2000, 0x3000, 64,
+            || Ok(502)).unwrap();
+        let map_exec = pool.inst.exec_pool_va + map - FSD_POOL_VADDR;
+        let context_exec = pool.inst.exec_pool_va + context - FSD_POOL_VADDR;
+        let list_exec = pool.inst.exec_pool_va + list - FSD_POOL_VADDR;
+        // Both driver-visible links are mutable and name another allocation.
+        write_unaligned((context_exec + 8) as *mut u64, ADDRESS);
+        write_unaligned((list_exec + 8) as *mut u64, ADDRESS);
+        assert!(native::generic_free_admission(pool.inst, map).is_err());
+        assert!(native::generic_free_admission(pool.inst, context).is_err());
+        assert!(native::generic_free_admission(pool.inst, list).is_err());
+        let original_generation = read_volatile((map_exec - 8) as *const u64);
+        write_volatile((map_exec - 8) as *mut u64, original_generation + 1);
+        let mut releases = Vec::new();
+        assert_eq!(native::retire_dma_private_graph(pool.inst, 777, list, true, |_| {
+            releases.push(0);
+            Ok(())
+        }), Err(nt_status::NtStatus::INVALID_HANDLE));
+        assert!(releases.is_empty());
+        write_volatile((map_exec - 8) as *mut u64, original_generation);
+        assert_eq!(native::retire_dma_private_graph(pool.inst, 777, list, true, |id| {
+            releases.push(id);
+            if id == 502 { Err(nt_status::NtStatus::DEVICE_BUSY) } else { Ok(()) }
+        }), Err(nt_status::NtStatus::DEVICE_BUSY));
+        assert_eq!(releases, vec![501, 502]);
+        native::retire_dma_private_graph(pool.inst, 777, list, true, |id| {
+            releases.push(id);
+            Ok(())
+        }).unwrap();
+        assert_eq!(releases, vec![501, 502, 502], "retry cannot replay acknowledged release");
+        {
+            let _pool = hosted_instance_pool_lock(pool.inst.exec_pool_va).unwrap();
+            assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(pool.inst, context), Some(false));
+            assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(pool.inst, ADDRESS), Some(false));
+        }
+        assert!(native::generic_free_admission(pool.inst, map).is_err());
+        assert!(native::generic_free_admission(pool.inst, list).is_err());
+        assert!(!native::instance_quiesced(pool.inst));
+        REFUSE_DMA_FREE.with(|refuse| refuse.set(Some(context)));
+        assert_eq!(native::drain_dma_private_tombstones(pool.inst),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
+        assert!(!native::instance_quiesced(pool.inst));
+        REFUSE_DMA_FREE.with(|refuse| refuse.set(None));
+        native::drain_dma_private_tombstones(pool.inst).unwrap();
+        assert!(native::instance_quiesced(pool.inst));
+    }
+}
+
+#[test]
+fn dma_private_mapping_id_has_one_graph_owner() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let domain = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId::new(903, 1),
+        cookie: 903,
+    };
+    let pool = Pool::new(domain, 91, 0xe100);
+    unsafe {
+        let (first, _, _) = native::provision_dma_private_graph(
+            pool.inst, 778, 1, native::DmaPrivateKind::Map, 0,
+        ).unwrap();
+        let (second, _, _) = native::provision_dma_private_graph(
+            pool.inst, 778, 2, native::DmaPrivateKind::Map, 0,
+        ).unwrap();
+        assert_ne!(first, second);
+        let mut registrations = 0;
+        assert_eq!(native::record_dma_private_mapping(
+            pool.inst, 778, first, 0x1000, 0x2000, 64,
+            || { registrations += 1; Ok(501) },
+        ), Ok(501));
+        // A lost MAP_TRANSFER reply leaves the canonical mapping live without a shared
+        // record. A second token must not acquire the same manager mapping ID.
+        assert_eq!(native::record_dma_private_mapping(
+            pool.inst, 778, second, 0x1000, 0x2000, 64,
+            || { registrations += 1; Ok(501) },
+        ), Err(nt_status::NtStatus::OBJECT_NAME_COLLISION));
+        assert_eq!(registrations, 1, "cross-graph replay cannot call the manager");
+        assert_eq!(native::record_dma_private_mapping(
+            pool.inst, 778, first, 0x1000, 0x2000, 64,
+            || { registrations += 1; Ok(501) },
+        ), Ok(501));
+        assert_eq!(registrations, 1, "same graph reuses its authoritative mapping ID");
+        let mut releases = Vec::new();
+        native::retire_dma_private_graph(pool.inst, 778, first, false,
+            |id| { releases.push(id); Ok(()) }).unwrap();
+        native::retire_dma_private_graph(pool.inst, 778, second, false,
+            |id| { releases.push(id); Ok(()) }).unwrap();
+        assert_eq!(releases, vec![501]);
+        native::drain_dma_private_tombstones(pool.inst).unwrap();
+    }
+}
+
+#[test]
+fn dma_private_replay_receipt_binds_exact_lease_mapping_and_lifetime() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let domain = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId::new(905, 1),
+        cookie: 905,
+    };
+    let pool = Pool::new(domain, 93, 0xe300);
+    unsafe {
+        let (first, _, _) = native::provision_dma_private_graph(
+            pool.inst, 781, 1, native::DmaPrivateKind::Map, 0,
+        ).unwrap();
+        let (second, _, _) = native::provision_dma_private_graph(
+            pool.inst, 782, 2, native::DmaPrivateKind::Map, 0,
+        ).unwrap();
+        native::record_dma_private_mapping(pool.inst, 781, first, 0x1000, 0x2000, 64,
+            || Ok(601)).unwrap();
+        native::record_dma_private_mapping(pool.inst, 782, second, 0x2000, 0x3000, 64,
+            || Ok(602)).unwrap();
+
+        // The shared record tuple alone cannot authorize replay under another device's
+        // adapter. The receipt names both the root lease and its saved manager mapping ID.
+        assert_eq!(native::dma_private_mapping_receipt(pool.inst, first, 0x1000, 0x2000, 64),
+            Some((781, 601)));
+        assert_eq!(native::dma_private_mapping_receipt(pool.inst, second, 0x2000, 0x3000, 64),
+            Some((782, 602)));
+        assert_eq!(native::dma_private_mapping_receipt(pool.inst, first, 0x2000, 0x3000, 64), None);
+        assert_eq!(native::dma_private_mapping_receipt(pool.inst, second, 0x1000, 0x2000, 64), None);
+
+        native::retire_dma_private_graph(pool.inst, 781, first, false, |_| Ok(())).unwrap();
+        assert_eq!(native::dma_private_mapping_receipt(pool.inst, first, 0x1000, 0x2000, 64), None,
+            "a stale shared record cannot recreate a released manager mapping");
+        native::retire_dma_private_graph(pool.inst, 782, second, false, |_| Ok(())).unwrap();
+        native::drain_dma_private_tombstones(pool.inst).unwrap();
+    }
+}
+
+#[test]
+fn dma_private_retirement_replays_only_exact_tombstone_receipt() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let domain = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId::new(904, 1),
+        cookie: 904,
+    };
+    let pool = Pool::new(domain, 92, 0xe200);
+    unsafe {
+        let (map, _, _) = native::provision_dma_private_graph(
+            pool.inst, 779, 1, native::DmaPrivateKind::Map, 0,
+        ).unwrap();
+        let (_, _, list) = native::provision_dma_private_graph(
+            pool.inst, 779, 2, native::DmaPrivateKind::ScatterGatherOwned, 0,
+        ).unwrap();
+        let mut releases = 0;
+        native::retire_dma_private_graph(pool.inst, 779, map, false,
+            |_| { releases += 1; Ok(()) }).unwrap();
+        native::retire_dma_private_graph(pool.inst, 779, list, true,
+            |_| { releases += 1; Ok(()) }).unwrap();
+        // If the successful reply was lost, repeating the same operation acknowledges the
+        // retained exact address. Neither a foreign lease nor the opposite operation may.
+        native::retire_dma_private_graph(pool.inst, 779, map, false,
+            |_| { releases += 1; Ok(()) }).unwrap();
+        native::retire_dma_private_graph(pool.inst, 779, list, true,
+            |_| { releases += 1; Ok(()) }).unwrap();
+        assert_eq!(releases, 0, "receipt replay cannot release a manager mapping again");
+        assert_eq!(native::retire_dma_private_graph(pool.inst, 780, map, false, |_| Ok(())),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
+        assert_eq!(native::retire_dma_private_graph(pool.inst, 779, map, true, |_| Ok(())),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
+        assert_eq!(native::retire_dma_private_graph(pool.inst, 779, list, false, |_| Ok(())),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
+        native::drain_dma_private_tombstones(pool.inst).unwrap();
     }
 }
 

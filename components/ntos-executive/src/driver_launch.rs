@@ -10910,6 +10910,14 @@ const HOSTED_DMA_SERVICE_REQUEST_ADAPTER: u64 = 1;
 const HOSTED_DMA_SERVICE_RELEASE_ADAPTER: u64 = 2;
 const HOSTED_DMA_SERVICE_PROVISION_ADAPTER: u64 = 3;
 const HOSTED_DMA_SERVICE_QUERY_GRANT: u64 = 4;
+const HOSTED_DMA_SERVICE_ALLOC_MAP: u64 = 5;
+const HOSTED_DMA_SERVICE_ALLOC_SG_GET: u64 = 6;
+const HOSTED_DMA_SERVICE_ALLOC_SG_BUILD: u64 = 7;
+const HOSTED_DMA_SERVICE_MAP_TRANSFER: u64 = 8;
+const HOSTED_DMA_SERVICE_FREE_MAP: u64 = 9;
+const HOSTED_DMA_SERVICE_PUT_SG: u64 = 10;
+const HOSTED_DMA_SERVICE_QUERY_SG: u64 = 11;
+static HOSTED_DMA_PRIVATE_REQUEST_NEXT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 struct HostedDmaAdapterMetadata {
@@ -11308,6 +11316,66 @@ unsafe fn dma_copy_bytes(dst: u64, src: u64, len: u64) {
     }
 }
 
+unsafe fn dma_allocate_private_graph(
+    adapter: u64, operation: u64, argument: u64, size: u64,
+) -> Option<(u64, u64, u64)> {
+    let request_id = HOSTED_DMA_PRIVATE_REQUEST_NEXT.fetch_add(1, Ordering::AcqRel)
+        .checked_add(1)?;
+    let (_label, status, map, context, list) = call_on5(
+        (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+        adapter,
+        operation << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+        request_id, argument, size,
+    );
+    (status as u32 as i32 == STATUS_SUCCESS && map != 0).then_some((map, context, list))
+}
+
+unsafe fn dma_retire_map_token(adapter: u64, map: u64) -> bool {
+    let (_label, status, _, _, _) = call_on5(
+        (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+        adapter,
+        HOSTED_DMA_SERVICE_FREE_MAP << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+        map, 0, 0,
+    );
+    status as u32 as i32 == STATUS_SUCCESS
+}
+
+unsafe fn dma_retire_sg_list(adapter: u64, list: u64) -> bool {
+    let (_label, status, _, _, _) = call_on5(
+        (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+        adapter,
+        HOSTED_DMA_SERVICE_PUT_SG << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+        list, 0, 0,
+    );
+    status as u32 as i32 == STATUS_SUCCESS
+}
+
+unsafe fn dma_query_sg_members(adapter: u64, list: u64) -> Option<(u64, u64)> {
+    let (_label, status, map, context, _) = call_on5(
+        (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+        adapter,
+        HOSTED_DMA_SERVICE_QUERY_SG << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+        list, 0, 0,
+    );
+    (status as u32 as i32 == STATUS_SUCCESS && map != 0 && context != 0)
+        .then_some((map, context))
+}
+
+unsafe fn dma_clear_records_for_map(map_register_base: u64) {
+    let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
+    let mut i = 0u64;
+    while i < capacity {
+        if let Some(record) = dma_allocation_record(FSD_SHARED_VADDR, i) {
+            let kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
+            let token = read_volatile((record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *const u64);
+            if kind == HOSTED_DMA_RECORD_KIND_MAP_TRANSFER && token == map_register_base {
+                clear_dma_allocation_record(record);
+            }
+        }
+        i += 1;
+    }
+}
+
 extern "win64" fn s_dma_allocate_adapter_channel(
     adapter: u64,
     device_object: u64,
@@ -11323,7 +11391,7 @@ extern "win64" fn s_dma_allocate_adapter_channel(
         {
             return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
         }
-        let map_register = dma_allocate_map_register_token(number_of_map_registers);
+        let map_register = dma_allocate_map_register_token(adapter, number_of_map_registers);
         if map_register == 0 {
             return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
         }
@@ -11333,7 +11401,7 @@ extern "win64" fn s_dma_allocate_adapter_channel(
         ) as u32;
         if action == 2 {
             // DeallocateObject: the caller did not retain the map-register token.
-            pool_free(map_register);
+            let _ = dma_retire_map_token(adapter, map_register);
         }
         0
     }
@@ -11488,6 +11556,21 @@ extern "win64" fn s_dma_map_transfer(
         } else {
             core::ptr::write_bytes(bounce_va as *mut u8, 0, mapped_len as usize);
         }
+        if map_register_base & HOSTED_DMA_SERVICE_OPERATION_MASK != 0 {
+            write_unaligned(length, 0);
+            return 0;
+        }
+        let (_label, mapped_status, mapping_id, _, _) = call_on5(
+            (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+            adapter,
+            (HOSTED_DMA_SERVICE_MAP_TRANSFER << HOSTED_DMA_SERVICE_OPERATION_SHIFT)
+                | map_register_base,
+            logical, bounce_va, mapped_len,
+        );
+        if mapped_status as u32 as i32 != STATUS_SUCCESS || mapping_id == 0 {
+            write_unaligned(length, 0);
+            return 0;
+        }
         write_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *mut u64, logical);
         write_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *mut u64, mapped_len);
         write_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *mut u64, bounce_va);
@@ -11592,7 +11675,7 @@ extern "win64" fn s_dma_flush_adapter_buffers(
 }
 
 extern "win64" fn s_dma_free_map_registers(
-    _adapter: u64,
+    adapter: u64,
     map_register_base: u64,
     _number_of_map_registers: u32,
 ) {
@@ -11600,22 +11683,10 @@ extern "win64" fn s_dma_free_map_registers(
         if map_register_base == 0 {
             return;
         }
-        let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
-        let mut i = 0u64;
-        while i < capacity {
-            if let Some(record) = dma_allocation_record(FSD_SHARED_VADDR, i) {
-                let kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
-                let token =
-                    read_volatile((record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *const u64);
-                if kind == HOSTED_DMA_RECORD_KIND_MAP_TRANSFER && token == map_register_base {
-                    clear_dma_allocation_record(record);
-                }
-            }
-            i += 1;
+        if !dma_retire_map_token(adapter, map_register_base) {
+            return;
         }
-        if read_unaligned(map_register_base as *const u64) == HOSTED_DMA_MAP_REGISTER_SIGNATURE {
-            pool_free(map_register_base);
-        }
+        dma_clear_records_for_map(map_register_base);
     }
 }
 
@@ -11638,14 +11709,14 @@ const HOSTED_SG_CONTEXT_LIST_OWNED: u64 = 0x29;
 const HOSTED_SG_LIST_SIZE_ONE: u64 = 0x28;
 const HOSTED_SG_ELEMENT_OFFSET: u64 = 0x10;
 
-unsafe fn dma_allocate_map_register_token(number_of_map_registers: u32) -> u64 {
+unsafe fn dma_allocate_map_register_token(adapter: u64, number_of_map_registers: u32) -> u64 {
     if number_of_map_registers == 0 || number_of_map_registers > 64 {
         return 0;
     }
-    let map_register = pool_alloc_zeroed(0x20);
-    if map_register == 0 {
-        return 0;
-    }
+    let Some((map_register, _, _)) = dma_allocate_private_graph(
+        adapter, HOSTED_DMA_SERVICE_ALLOC_MAP, number_of_map_registers as u64, 0,
+    ) else { return 0; };
+    core::ptr::write_bytes(map_register as *mut u8, 0, 0x20);
     write_unaligned(map_register as *mut u64, HOSTED_DMA_MAP_REGISTER_SIGNATURE);
     write_unaligned((map_register + 8) as *mut u32, number_of_map_registers);
     map_register
@@ -11659,8 +11730,11 @@ unsafe fn dma_prepare_one_element_sg_list(
     write_to_device: u8,
     sg_list: u64,
     list_owned: u8,
+    map_register: u64,
+    sg_context: u64,
 ) -> i32 {
-    if length == 0 || sg_list == 0 || dma_active_adapter_and_grant(adapter).is_none() {
+    if length == 0 || sg_list == 0 || map_register == 0 || sg_context == 0
+        || dma_active_adapter_and_grant(adapter).is_none() {
         trace_hosted_dma_sg(
             b"prepare",
             b"bad-input",
@@ -11675,29 +11749,10 @@ unsafe fn dma_prepare_one_element_sg_list(
         );
         return STATUS_INVALID_PARAMETER;
     }
-    let map_register = dma_allocate_map_register_token(1);
-    let sg_context = pool_alloc_zeroed(HOSTED_SG_CONTEXT_SIZE);
-    if map_register == 0 || sg_context == 0 {
-        if map_register != 0 {
-            pool_free(map_register);
-        }
-        if sg_context != 0 {
-            pool_free(sg_context);
-        }
-        trace_hosted_dma_sg(
-            b"prepare",
-            b"alloc-failed",
-            STATUS_INSUFFICIENT_RESOURCES,
-            adapter,
-            mdl,
-            current_va,
-            length,
-            sg_list,
-            map_register,
-            0,
-        );
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
+    core::ptr::write_bytes(map_register as *mut u8, 0, 0x20);
+    core::ptr::write_bytes(sg_context as *mut u8, 0, HOSTED_SG_CONTEXT_SIZE as usize);
+    write_unaligned(map_register as *mut u64, HOSTED_DMA_MAP_REGISTER_SIGNATURE);
+    write_unaligned((map_register + 8) as *mut u32, 1);
     let mut mapped_len = length;
     let logical = s_dma_map_transfer(
         adapter,
@@ -11708,8 +11763,6 @@ unsafe fn dma_prepare_one_element_sg_list(
         write_to_device,
     ) as u64;
     if logical == 0 || mapped_len == 0 {
-        pool_free(sg_context);
-        pool_free(map_register);
         trace_hosted_dma_sg(
             b"prepare",
             b"map-failed",
@@ -11799,8 +11852,9 @@ extern "win64" fn s_dma_get_scatter_gather_list(
             );
             return STATUS_INVALID_PARAMETER;
         }
-        let sg_list = pool_alloc_zeroed(HOSTED_SG_LIST_SIZE_ONE);
-        if sg_list == 0 {
+        let Some((map_register, sg_context, sg_list)) = dma_allocate_private_graph(
+            adapter, HOSTED_DMA_SERVICE_ALLOC_SG_GET, 0, 0,
+        ) else {
             trace_hosted_dma_sg(
                 b"get",
                 b"list-alloc-failed",
@@ -11814,7 +11868,8 @@ extern "win64" fn s_dma_get_scatter_gather_list(
                 0,
             );
             return STATUS_INSUFFICIENT_RESOURCES;
-        }
+        };
+        core::ptr::write_bytes(sg_list as *mut u8, 0, HOSTED_SG_LIST_SIZE_ONE as usize);
         let status = dma_prepare_one_element_sg_list(
             adapter,
             mdl,
@@ -11823,9 +11878,11 @@ extern "win64" fn s_dma_get_scatter_gather_list(
             write_to_device,
             sg_list,
             1,
+            map_register,
+            sg_context,
         );
         if status != 0 {
-            pool_free(sg_list);
+            let _ = dma_retire_sg_list(adapter, sg_list);
             trace_hosted_dma_sg(
                 b"get",
                 b"prepare-failed",
@@ -11905,6 +11962,13 @@ extern "win64" fn s_dma_build_scatter_gather_list(
         if scatter_gather_length < HOSTED_SG_LIST_SIZE_ONE as u32 {
             return 0xC000_0023u32 as i32; // STATUS_BUFFER_TOO_SMALL
         }
+        let Some((map_register, sg_context, list)) = dma_allocate_private_graph(
+            adapter, HOSTED_DMA_SERVICE_ALLOC_SG_BUILD,
+            scatter_gather_buffer, scatter_gather_length as u64,
+        ) else { return STATUS_INSUFFICIENT_RESOURCES; };
+        if list != scatter_gather_buffer {
+            return STATUS_INVALID_HANDLE;
+        }
         let status = dma_prepare_one_element_sg_list(
             adapter,
             mdl,
@@ -11913,8 +11977,11 @@ extern "win64" fn s_dma_build_scatter_gather_list(
             write_to_device,
             scatter_gather_buffer,
             0,
+            map_register,
+            sg_context,
         );
         if status != 0 {
+            let _ = dma_retire_sg_list(adapter, scatter_gather_buffer);
             return status;
         }
         call_hosted_pe(
@@ -11948,20 +12015,13 @@ extern "win64" fn s_dma_put_scatter_gather_list(
         if scatter_gather == 0 {
             return;
         }
-        let sg_context = read_unaligned((scatter_gather + 8) as *const u64);
-        if sg_context == 0
-            || read_unaligned(sg_context as *const u64) != HOSTED_SG_CONTEXT_SIGNATURE
-        {
-            return;
-        }
-        let map_register =
-            read_unaligned((sg_context + HOSTED_SG_CONTEXT_MAP_REGISTER) as *const u64);
+        let Some((map_register, sg_context)) = dma_query_sg_members(adapter, scatter_gather)
+        else { return; };
         let mdl = read_unaligned((sg_context + HOSTED_SG_CONTEXT_MDL) as *const u64);
         let current_va = read_unaligned((sg_context + HOSTED_SG_CONTEXT_CURRENT_VA) as *const u64);
         let length = read_unaligned((sg_context + HOSTED_SG_CONTEXT_LENGTH) as *const u32);
         let stored_write_to_device =
             read_unaligned((sg_context + HOSTED_SG_CONTEXT_WRITE_TO_DEVICE) as *const u8);
-        let list_owned = read_unaligned((sg_context + HOSTED_SG_CONTEXT_LIST_OWNED) as *const u8);
         let direction = if write_to_device != 0 {
             write_to_device
         } else {
@@ -11969,10 +12029,8 @@ extern "win64" fn s_dma_put_scatter_gather_list(
         };
         let _ =
             s_dma_flush_adapter_buffers(adapter, mdl, map_register, current_va, length, direction);
-        s_dma_free_map_registers(adapter, map_register, 1);
-        pool_free(sg_context);
-        if list_owned != 0 {
-            pool_free(scatter_gather);
+        if dma_retire_sg_list(adapter, scatter_gather) {
+            dma_clear_records_for_map(map_register);
         }
     }
 }
@@ -49444,6 +49502,10 @@ unsafe fn release_hosted_dma_adapter_lease(
     {
         return Err(nt_status::NtStatus::ACCESS_DENIED);
     }
+    hosted_device_allocations::retire_dma_private_lease(inst, lease.lease_id, |mapping_id| {
+        hosted_dma_manager_mut().free_mapping_for_owner(lease.owner, mapping_id)
+            .map_err(hosted_dma_status)
+    })?;
     hosted_device_allocations::retire_dma_adapter_pair(
         inst, lease.lease_id, adapter_address,
         || hosted_dma_manager_mut()
@@ -49483,6 +49545,10 @@ unsafe fn revoke_hosted_dma_adapter_leases(
             continue;
         }
         if hosted_device_allocations::has_dma_adapter_pair(lease.lease_id) {
+            hosted_device_allocations::retire_dma_private_lease(inst, lease.lease_id, |mapping_id| {
+                hosted_dma_manager_mut().free_mapping_for_owner(lease.owner, mapping_id)
+                    .map_err(hosted_dma_status)
+            })?;
             hosted_device_allocations::retire_dma_adapter_pair(
                 inst, lease.lease_id, lease.adapter_address.unwrap_or(0),
                 || hosted_dma_manager_mut()
@@ -58414,6 +58480,7 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
             return Err(nt_status::NtStatus::DEVICE_BUSY);
         }
         unsafe { hosted_device_allocations::drain_dma_adapter_tombstones(inst)? };
+        unsafe { hosted_device_allocations::drain_dma_private_tombstones(inst)? };
         unsafe { hosted_device_allocations::drain_interrupt_projection_tombstones(inst)? };
         if !hosted_device_allocations::instance_quiesced(inst) {
             return Err(nt_status::NtStatus::DEVICE_BUSY);
@@ -59155,6 +59222,107 @@ pub(crate) fn service_hosted_driver_dma_adapter(
         };
         current.adapter_address = Some(adapter);
         return (STATUS_SUCCESS, adapter, ops, lease.lease_id);
+    }
+    if matches!(operation,
+        HOSTED_DMA_SERVICE_ALLOC_MAP | HOSTED_DMA_SERVICE_ALLOC_SG_GET
+            | HOSTED_DMA_SERVICE_ALLOC_SG_BUILD | HOSTED_DMA_SERVICE_MAP_TRANSFER
+            | HOSTED_DMA_SERVICE_FREE_MAP | HOSTED_DMA_SERVICE_PUT_SG
+            | HOSTED_DMA_SERVICE_QUERY_SG)
+    {
+        let Some((_index, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        };
+        let Some(domain) = instance_domain_identity(inst) else {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        };
+        let Some(lease) = (unsafe { hosted_dma_adapter_leases_mut() }).iter().copied()
+            .find(|lease| lease.consumer_domain == domain
+                && lease.adapter_address == Some(pdo_object)) else {
+            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
+        };
+        if unsafe { io_manager_mut().hosted_device_pointer_registration(
+            lease.pdo_registration.domain(), lease.pdo_registration.address()) }
+            != Some(lease.pdo_registration)
+            || !unsafe { hosted_dma_pdo_generation_is_live(
+                lease.pdo_registration.device_id().raw(), lease.pdo_generation) }
+        {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        }
+        let result = match operation {
+            HOSTED_DMA_SERVICE_ALLOC_MAP | HOSTED_DMA_SERVICE_ALLOC_SG_GET
+                | HOSTED_DMA_SERVICE_ALLOC_SG_BUILD => {
+                let kind = match operation {
+                    HOSTED_DMA_SERVICE_ALLOC_MAP => hosted_device_allocations::DmaPrivateKind::Map,
+                    HOSTED_DMA_SERVICE_ALLOC_SG_GET => hosted_device_allocations::DmaPrivateKind::ScatterGatherOwned,
+                    _ => hosted_device_allocations::DmaPrivateKind::ScatterGatherBorrowed,
+                };
+                if words[1] == 0 || operation == HOSTED_DMA_SERVICE_ALLOC_MAP
+                    && (words[2] == 0 || words[2] > 64 || words[3] != 0)
+                    || operation == HOSTED_DMA_SERVICE_ALLOC_SG_GET
+                        && (words[2] != 0 || words[3] != 0)
+                    || operation == HOSTED_DMA_SERVICE_ALLOC_SG_BUILD
+                        && (words[2] == 0 || words[3] < HOSTED_SG_LIST_SIZE_ONE)
+                {
+                    return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+                }
+                let borrowed = if operation == HOSTED_DMA_SERVICE_ALLOC_SG_BUILD { words[2] } else { 0 };
+                unsafe { hosted_device_allocations::provision_dma_private_graph(
+                    inst, lease.lease_id, words[1], kind, borrowed) }
+            }
+            HOSTED_DMA_SERVICE_MAP_TRANSFER => {
+                let map = words[0];
+                let (logical, backing, length) = (words[1], words[2], words[3]);
+                let Some((grant_va, grant_len, grant_logical)) = lease.grant else {
+                    return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+                };
+                let valid = logical.checked_sub(grant_logical)
+                    .zip(backing.checked_sub(grant_va))
+                    .is_some_and(|(logical_offset, backing_offset)|
+                        logical_offset == backing_offset
+                        && length != 0 && logical_offset <= grant_len
+                        && length <= grant_len - logical_offset);
+                if !valid { return (STATUS_INVALID_PARAMETER, 0, 0, 0); }
+                return match unsafe { hosted_device_allocations::record_dma_private_mapping(
+                    inst, lease.lease_id, map, logical, backing, length,
+                    || hosted_dma_manager_mut().ensure_mapping_at(
+                        lease.owner, lease.adapter_id, logical, backing, length)
+                        .map(|mapping| mapping.mapping_id).map_err(hosted_dma_status),
+                ) } {
+                    Ok(mapping_id) => (STATUS_SUCCESS, mapping_id, 0, 0),
+                    Err(status) => (status.raw(), 0, 0, 0),
+                };
+            }
+            HOSTED_DMA_SERVICE_FREE_MAP | HOSTED_DMA_SERVICE_PUT_SG => {
+                if words[0] != 0 || words[1] == 0 || words[2] != 0 || words[3] != 0 {
+                    return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+                }
+                return match unsafe { hosted_device_allocations::retire_dma_private_graph(
+                    inst, lease.lease_id, words[1], operation == HOSTED_DMA_SERVICE_PUT_SG,
+                    |mapping_id| hosted_dma_manager_mut()
+                        .free_mapping_for_owner(lease.owner, mapping_id)
+                        .map_err(hosted_dma_status),
+                ) } {
+                    Ok(()) => (STATUS_SUCCESS, 0, 0, 0),
+                    Err(status) => (status.raw(), 0, 0, 0),
+                };
+            }
+            HOSTED_DMA_SERVICE_QUERY_SG => {
+                if words[0] != 0 || words[1] == 0 || words[2] != 0 || words[3] != 0 {
+                    return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+                }
+                return match unsafe { hosted_device_allocations::dma_private_sg_members(
+                    inst, lease.lease_id, words[1])
+                } {
+                    Ok((map, context)) => (STATUS_SUCCESS, map, context, 0),
+                    Err(status) => (status.raw(), 0, 0, 0),
+                };
+            }
+            _ => unreachable!(),
+        };
+        return match result {
+            Ok((map, context, list)) => (STATUS_SUCCESS, map, context, list),
+            Err(status) => (status.raw(), 0, 0, 0),
+        };
     }
     if operation != HOSTED_DMA_SERVICE_REQUEST_ADAPTER {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
@@ -64486,15 +64654,32 @@ unsafe fn replay_hosted_dma_allocation_records(
                     if source_va == 0 || map_register == 0 {
                         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
                     }
-                    hosted_dma_manager_mut()
-                        .ensure_mapping_at(
-                            hosted_dma_owner(binding),
-                            dma_adapter_id,
-                            logical,
-                            va,
-                            len,
+                    let inst = instance(binding.projection_instance)
+                        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+                    let (lease_id, mapping_id) =
+                        hosted_device_allocations::dma_private_mapping_receipt(
+                            inst, map_register, logical, va, len,
+                        ).ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+                    let lease = hosted_dma_adapter_leases_mut().iter().copied()
+                        .find(|lease| lease.lease_id == lease_id)
+                        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+                    if lease.owner != hosted_dma_owner(binding)
+                        || lease.consumer_domain != binding.projection_domain
+                        || lease.adapter_id != dma_adapter_id
+                        || lease.grant != Some((dma_grant_va, dma_grant_len, dma_grant_logical))
+                        || hosted_device_pointer_registration(
+                            binding.projection_domain, binding.pdo_object,
+                            nt_io_manager::DeviceId(binding.pdo_device_id),
+                        )? != lease.pdo_registration
+                        || !hosted_dma_pdo_generation_is_live(
+                            binding.pdo_device_id, lease.pdo_generation,
                         )
-                        .map_err(hosted_dma_status)?;
+                        || !hosted_dma_manager_mut().mapping_matches(
+                            lease.owner, mapping_id, logical, va, len,
+                        )
+                    {
+                        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                    }
                 }
                 _ => return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
             }

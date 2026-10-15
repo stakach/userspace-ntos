@@ -7,6 +7,9 @@ use nt_io_manager::{
 
 #[path = "hosted_dma_adapter_pair.rs"]
 mod dma_adapter_pair;
+#[path = "hosted_dma_private_graph.rs"]
+mod dma_private_graph;
+pub(super) use dma_private_graph::Kind as DmaPrivateKind;
 #[path = "hosted_interrupt_projection.rs"]
 mod interrupt_projection;
 
@@ -101,6 +104,53 @@ pub(super) unsafe fn drain_dma_adapter_tombstones(
     inst: DriverInstance,
 ) -> Result<(), nt_status::NtStatus> {
     dma_adapter_pair::drain_dma_adapter_tombstones(inst)
+}
+
+pub(super) unsafe fn provision_dma_private_graph(
+    inst: DriverInstance, lease_id: u64, request_id: u64, kind: DmaPrivateKind,
+    borrowed_list: u64,
+) -> Result<(u64, u64, u64), nt_status::NtStatus> {
+    dma_private_graph::provision(inst, lease_id, request_id, kind, borrowed_list)
+}
+
+pub(super) unsafe fn record_dma_private_mapping(
+    inst: DriverInstance, lease_id: u64, map: u64, logical: u64,
+    backing: u64, length: u64,
+    register: impl FnOnce() -> Result<u64, nt_status::NtStatus>,
+) -> Result<u64, nt_status::NtStatus> {
+    dma_private_graph::record_mapping(inst, lease_id, map, logical, backing, length, register)
+}
+
+pub(super) unsafe fn dma_private_mapping_receipt(
+    inst: DriverInstance, map: u64, logical: u64, backing: u64, length: u64,
+) -> Option<(u64, u64)> {
+    dma_private_graph::mapping_receipt(inst, map, logical, backing, length)
+}
+
+pub(super) unsafe fn retire_dma_private_graph(
+    inst: DriverInstance, lease_id: u64, address: u64, whole_graph: bool,
+    release: impl FnMut(u64) -> Result<(), nt_status::NtStatus>,
+) -> Result<(), nt_status::NtStatus> {
+    dma_private_graph::retire(inst, lease_id, address, whole_graph, release)
+}
+
+pub(super) unsafe fn dma_private_sg_members(
+    inst: DriverInstance, lease_id: u64, list: u64,
+) -> Result<(u64, u64), nt_status::NtStatus> {
+    dma_private_graph::sg_members(inst, lease_id, list)
+}
+
+pub(super) unsafe fn retire_dma_private_lease(
+    inst: DriverInstance, lease_id: u64,
+    release: impl FnMut(u64) -> Result<(), nt_status::NtStatus>,
+) -> Result<(), nt_status::NtStatus> {
+    dma_private_graph::retire_lease(inst, lease_id, release)
+}
+
+pub(super) unsafe fn drain_dma_private_tombstones(
+    inst: DriverInstance,
+) -> Result<(), nt_status::NtStatus> {
+    dma_private_graph::drain_tombstones(inst)
 }
 
 struct Row {
@@ -324,6 +374,7 @@ pub(super) unsafe fn pin_temporary_pool_range(
     let exact = allocation_containing(inst, address, bytes)?;
     if ledger().protects_address(domain, exact.component_address)
         || dma_adapter_pair::protects(inst, exact.component_address)
+        || dma_private_graph::protects(inst, exact.component_address)
         || interrupt_projection::protects(inst, exact.component_address)
         || rows().iter().any(|row| {
             same_pool(row.instance, inst)
@@ -572,6 +623,7 @@ pub(super) fn generic_free_admission(
     let domain = validate_arena(inst)?;
     if ledger().protects_address(domain, address)
         || dma_adapter_pair::protects(inst, address)
+        || dma_private_graph::protects(inst, address)
         || interrupt_projection::protects(inst, address)
         || rows().iter().any(|row| {
             same_pool(row.instance, inst)
@@ -621,8 +673,10 @@ pub(super) unsafe fn protect_file_storage(
         }
         let name = allocation(inst, name_address)?;
         if dma_adapter_pair::protects(inst, address)
+            || dma_private_graph::protects(inst, address)
             || interrupt_projection::protects(inst, address)
             || dma_adapter_pair::protects(inst, name_address)
+            || dma_private_graph::protects(inst, name_address)
             || interrupt_projection::protects(inst, name_address)
             || file_rows().iter().any(|row| {
             (row.domain == domain || same_pool(row.instance, inst))
@@ -658,7 +712,9 @@ pub(super) unsafe fn protect_file_storage(
                 && (contains_allocation(row.allocation, address)
                     || name_address != 0 && contains_allocation(row.allocation, name_address))
         }) || interrupt_projection::protects(inst, address)
+            || dma_private_graph::protects(inst, address)
             || name_address != 0 && interrupt_projection::protects(inst, name_address)
+            || name_address != 0 && dma_private_graph::protects(inst, name_address)
             || temporary_pins().iter().any(|row| {
             same_pool(row.instance, inst)
                 && (contains_allocation(row.allocation, address)
@@ -791,6 +847,7 @@ pub(super) unsafe fn protect_allocation_exact(
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
     if dma_adapter_pair::protects(inst, address)
+        || dma_private_graph::protects(inst, address)
         || interrupt_projection::protects(inst, address) {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
@@ -1163,6 +1220,7 @@ pub(super) fn accepted_registration(
 pub(super) fn instance_quiesced(inst: DriverInstance) -> bool {
     let _guard = lock();
     !dma_adapter_pair::owns_pool(inst)
+        && !dma_private_graph::owns_pool(inst)
         && !interrupt_projection::owns_pool(inst)
         && !file_rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
         && !rows()
@@ -1176,6 +1234,7 @@ pub(super) fn instance_quiesced(inst: DriverInstance) -> bool {
 pub(super) fn instance_ready_to_drain_dma_tombstones(inst: DriverInstance) -> bool {
     let _guard = lock();
     !dma_adapter_pair::has_live_pair(inst)
+        && !dma_private_graph::has_live_graph(inst)
         && !interrupt_projection::has_live(inst)
         && !file_rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
         && !rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
@@ -1185,6 +1244,7 @@ pub(super) fn instance_ready_to_drain_dma_tombstones(inst: DriverInstance) -> bo
 pub(super) fn protects_allocation(inst: DriverInstance, address: u64) -> bool {
     let _guard = lock();
     dma_adapter_pair::protects(inst, address)
+        || dma_private_graph::protects(inst, address)
         || interrupt_projection::protects(inst, address)
         || rows().iter().any(|row| {
         (same_arena(row.instance, inst) || same_pool(row.instance, inst))
