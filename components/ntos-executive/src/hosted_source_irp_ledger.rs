@@ -1187,10 +1187,11 @@ pub(super) fn service(
                 {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 }
-                row.released_members |= bit; // record ownership before the physical effect
                 if !unsafe { hosted_instance_pool_free_unlocked(inst, member_address) } {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 }
+                // A definite refusal leaves the captured member pending for exact retry.
+                row.released_members |= bit;
                 (STATUS_SUCCESS, 0, 0)
             } else if op == 10 {
                 let Some(row) = caller_projections().iter_mut().find(|candidate| {
@@ -1203,10 +1204,11 @@ pub(super) fn service(
                 {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 }
-                row.replacement_released = true; // terminal ownership before physical effect
                 if !unsafe { hosted_instance_pool_free_unlocked(inst, member_address) } {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 }
+                // The local free is synchronous under the source and pool locks.
+                row.replacement_released = true;
                 (STATUS_SUCCESS, 0, 0)
             } else {
                 let Some(row) = caller_projections().iter().find(|candidate| candidate.ticket == ticket)

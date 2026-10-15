@@ -237,8 +237,15 @@ fn caller_graph_release_keeps_exact_pool_generation_checks() {
         "ordinary provider frees must exclude only the captured live generation");
     assert!(ledger.contains("exact_pool_identity_unlocked(inst, member_address, 1)"),
         "terminal release must revalidate the captured physical generation");
-    assert!(ledger.contains("row.released_members |= bit"),
-        "retain terminal ownership before physical release");
+    let retirement = ledger.split("} else if op == 9 {").nth(1).unwrap();
+    let initial_release = retirement.split("} else if op == 10 {").next().unwrap();
+    assert!(initial_release.find("hosted_instance_pool_free_unlocked(inst, member_address)").unwrap()
+        < initial_release.find("row.released_members |= bit").unwrap(),
+        "a definite refused free must leave its exact member pending for retry");
+    let replacement_release = retirement.split("} else if op == 10 {").nth(1).unwrap();
+    assert!(replacement_release.find("hosted_instance_pool_free_unlocked(inst, member_address)").unwrap()
+        < replacement_release.find("row.replacement_released = true").unwrap(),
+        "a definite refused replacement free must leave its exact generation pending for retry");
     assert!(ledger.contains("row.released_members != (1u16 << row.graph.initial_members().len()) - 1"),
         "source retirement must wait for every initial member");
 }
