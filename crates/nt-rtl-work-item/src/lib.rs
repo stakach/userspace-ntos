@@ -925,6 +925,11 @@ impl WorkerFleet {
         if state == WorkerState::Stopping {
             return Ok(StopDecision::AlreadyStopping);
         }
+        // The worker can finish its first idle wait before its creator commits the start
+        // handshake. It is alive but cannot retire while its slot is still Starting.
+        if state == WorkerState::Starting && id.role == WorkerRole::Completion {
+            return Ok(StopDecision::Busy);
+        }
         if state != WorkerState::Running {
             return Err(FleetError::InvalidTransition);
         }
@@ -1702,6 +1707,19 @@ mod tests {
             fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters),
             EnsureWorker::WaitForStart
         );
+    }
+
+    #[test]
+    fn starting_worker_cannot_retire_before_creator_finishes_handshake() {
+        let mut fleet = WorkerFleet::new();
+        let counters = PoolCounters::new();
+        let worker = reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters));
+
+        assert_eq!(fleet.request_stop(worker.id, &counters), Ok(StopDecision::Busy));
+        assert_eq!(fleet.state(worker.id), Ok(WorkerState::Starting));
+
+        finish_worker(&mut fleet, worker);
+        assert_eq!(fleet.request_stop(worker.id, &counters), Ok(StopDecision::KeepMinimum));
     }
 
     #[test]
