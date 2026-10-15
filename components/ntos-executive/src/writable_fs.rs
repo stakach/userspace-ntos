@@ -418,7 +418,7 @@ const SNAPSHOT_RESTORE_UNREAD: u64 = 0;
 const SNAPSHOT_RESTORE_EMPTY: u64 = 1;
 const SNAPSHOT_RESTORE_CONSUMED: u64 = 2;
 
-fn legacy_snapshot_writes_allowed() -> bool {
+pub(crate) fn legacy_snapshot_writes_allowed() -> bool {
     !WRITABLE_FS_MOUNTED_WAL_FORMAT.load(Ordering::Acquire)
 }
 
@@ -1969,10 +1969,25 @@ impl WritableHiveIoProvider {
             .map_err(|_| nt_hive_core::HiveIoError::Io)
     }
 
+    fn require_legacy_file_mutation(&self) -> Result<(), nt_hive_core::HiveIoError> {
+        if !self.image_path.eq_ignore_ascii_case(CONFIG_SYSTEM_HIVE_PATH) {
+            return Ok(());
+        }
+        // The format bit is set by mount. Checking it before a lazy mount would mistake
+        // a restored v2 volume for an empty legacy volume.
+        unsafe { ensure_mounted() }.map_err(|_| nt_hive_core::HiveIoError::Io)?;
+        if legacy_snapshot_writes_allowed() {
+            Ok(())
+        } else {
+            Err(nt_hive_core::HiveIoError::NotSupported)
+        }
+    }
+
     pub(crate) fn truncate_log_to(
         &mut self,
         length: usize,
     ) -> Result<(), nt_hive_core::HiveIoError> {
+        self.require_legacy_file_mutation()?;
         let length = u64::try_from(length).map_err(|_| nt_hive_core::HiveIoError::Io)?;
         hive_io_status(unsafe { truncate_file_to(&self.log_path, length) })
     }
@@ -2001,6 +2016,7 @@ impl nt_hive_core::HiveIoProvider for WritableHiveIoProvider {
         &mut self,
         bytes: alloc::vec::Vec<u8>,
     ) -> Result<(), nt_hive_core::HiveIoError> {
+        self.require_legacy_file_mutation()?;
         hive_io_status(unsafe { write_file_atomic_owned(&self.image_path, bytes) })
     }
 
@@ -2011,11 +2027,13 @@ impl nt_hive_core::HiveIoProvider for WritableHiveIoProvider {
     }
 
     fn append_log_record(&mut self, bytes: &[u8]) -> Result<(), nt_hive_core::HiveIoError> {
+        self.require_legacy_file_mutation()?;
         let _scope = crate::allocator::enter_scope(b"memfs.hive-journal-append");
         hive_io_status(unsafe { append_file(&self.log_path, bytes) })
     }
 
     fn truncate_log(&mut self) -> Result<(), nt_hive_core::HiveIoError> {
+        self.require_legacy_file_mutation()?;
         hive_io_status(unsafe { truncate_file(&self.log_path) })
     }
 

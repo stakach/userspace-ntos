@@ -15741,6 +15741,11 @@ pub(crate) unsafe fn persist_and_publish_system_hive_mutation(
     const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 
     writable_fs::ensure_mounted()?;
+    if !writable_fs::legacy_snapshot_writes_allowed() {
+        // The file-backed publisher cannot retain an uncertain CM COMMIT together with
+        // its WAL marker and both header anchors. Leave v2 mutations to the WAL owner.
+        return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+    }
     let mut provider =
         writable_fs::WritableHiveIoProvider::new(writable_fs::CONFIG_SYSTEM_HIVE_PATH);
     // Establish a readable rollback baseline before acquiring CM's sole writer preparation.

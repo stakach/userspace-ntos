@@ -727,6 +727,15 @@ unsafe fn advance(
             match system_mutation_storage(prepared).map_err(|status| status as i32)? {
                 SystemMutationStorage::NoJournal => work.phase = Phase::Commit,
                 SystemMutationStorage::PrecommitJournal(bytes) => {
+                    // Mount first: the format bit is unknown before lazy restore. A v2
+                    // refusal is pre-COMMIT and has made no storage effect, so CM can
+                    // acknowledge an exact abort while the caller retains its Reply.
+                    writable_fs::ensure_mounted().map_err(|status| status as i32)?;
+                    if !writable_fs::legacy_snapshot_writes_allowed() {
+                        work.status = nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+                        work.phase = Phase::Abort;
+                        return Ok(false);
+                    }
                     work.persistence.admit(bytes).map_err(|status| status as i32)?;
                     work.phase = Phase::Durable;
                 }

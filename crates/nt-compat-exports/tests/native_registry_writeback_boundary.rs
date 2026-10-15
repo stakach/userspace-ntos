@@ -86,6 +86,43 @@ fn generic_checkpoint_uses_exact_v2_manifest_and_retains_uncertain_reserve() {
 }
 
 #[test]
+fn writable_hive_provider_refuses_v2_system_log_append_before_file_effect() {
+    let source = include_str!("../../../components/ntos-executive/src/writable_fs.rs");
+    let guard = &source[source.find("fn require_legacy_file_mutation(").unwrap()
+        ..source.find("\n    pub(crate) fn truncate_log_to(").unwrap()];
+    assert!(guard.contains("CONFIG_SYSTEM_HIVE_PATH") && guard.contains("legacy_snapshot_writes_allowed()"),
+        "the file mutation gate must distinguish SYSTEM v2 from unrelated hive logs");
+    assert!(guard.contains("ensure_mounted()"),
+        "a lazy restored v2 volume must be classified before its legacy provider writes");
+    let provider = &source[source.find("impl nt_hive_core::HiveIoProvider for WritableHiveIoProvider {").unwrap()
+        ..source.find("\n/// `NtFlushBuffersFile` on a writable-volume file object.").unwrap()];
+    let append = &provider[provider.find("fn append_log_record(").unwrap()
+        ..provider.find("\n    fn truncate_log(").unwrap()];
+    let guard = append.find("require_legacy_file_mutation()")
+        .expect("the ordinary SYSTEM.LOG provider must refuse mounted v2 before any append");
+    let effect = append.find("append_file(").expect("legacy provider append effect");
+    assert!(guard < effect, "v2 refusal must precede the file append");
+}
+
+#[test]
+fn legacy_system_mutation_paths_refuse_v2_before_effects_and_abort_prepared_cm_work() {
+    let main = include_str!("../../../components/ntos-executive/src/main.rs");
+    let legacy = &main[main.find("pub(crate) unsafe fn persist_and_publish_system_hive_mutation(").unwrap()
+        ..main.find("\npub(crate) unsafe fn config_manager_prepare_system_hive_checkpoint(").unwrap()];
+    let guard = legacy.find("legacy_snapshot_writes_allowed()")
+        .expect("one-shot CM mutation must refuse mounted v2 before preparing CM or writing LOG");
+    let prepare = legacy.find("config_manager_prepare_system_hive_mutation(").unwrap();
+    assert!(guard < prepare);
+
+    let worker = include_str!("../../../components/ntos-executive/src/registry_mutation_work.rs");
+    let admit = &worker[worker.find("Phase::Admit => {").unwrap()..worker.find("Phase::Durable => {").unwrap()];
+    assert!(admit.contains("ensure_mounted()") && admit.contains("legacy_snapshot_writes_allowed()"),
+        "retained CM work must classify a lazy restored v2 volume before storage effects");
+    assert!(admit.contains("work.phase = Phase::Abort"),
+        "a refused v2 v1-storage admission must abort the still-prepared CM mutation");
+}
+
+#[test]
 fn journal_bearing_cm_mutations_still_require_precommit_storage() {
     let source = include_str!("../../../components/ntos-executive/src/registry_mutation_work.rs");
     let start = source.find("enum SystemMutationStorage {").unwrap();
