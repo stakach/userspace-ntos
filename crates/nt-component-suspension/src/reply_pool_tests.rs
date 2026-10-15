@@ -116,6 +116,57 @@ fn same_lane_is_not_ready_for_a_second_dispatch_while_first_reply_is_owned() {
 }
 
 #[test]
+fn independent_worker_admits_while_primary_call_remains_occupied() {
+    let mut lanes = Lanes::new(2, 2);
+    let mut peers = PeerRegistry::new(20, 2);
+    let (primary_lane, mut primary_registration) = lanes.allocate_shared_staged(&mut peers, 1, 2, LaneBinding {
+        executor_id: 10,
+        receive_endpoint: 20,
+        reply_object: 30,
+    }).unwrap();
+    let (worker_lane, mut registration) = lanes.allocate_shared_staged(&mut peers, 1, 2, LaneBinding {
+        executor_id: 11,
+        receive_endpoint: 20,
+        reply_object: 31,
+    }).unwrap();
+    let primary = peers.publish_lane(&mut primary_registration, 1, 2, &lanes).unwrap();
+    let worker = peers.publish_lane(&mut registration, 1, 2, &lanes).unwrap();
+    for (lane, reply) in [(primary_lane, 30), (worker_lane, 31)] {
+        lanes.begin_startup(lane, reply,
+            |_, _| Ok::<_, u8>(ReplyBindingObservation::Free)).unwrap();
+        lanes.complete_startup(lane, reply,
+            |_, _| Ok::<_, u8>(ReplyBindingObservation::BoundToTarget)).unwrap();
+    }
+    let mut receiver = IngressReceiver::new(20, 40, 3).unwrap();
+    let mut pool = IngressReplyPool::new(20, 3).unwrap();
+    for reply in [41, 42, 43] {
+        pool.insert(ComponentIngress::new(20, reply).unwrap(), &receiver, &lanes, free)
+            .ok().unwrap();
+    }
+    call(&mut receiver, &lanes);
+    pool.retain(&mut receiver, &lanes, &mut peers, primary.badge(), free, bound)
+        .unwrap();
+    let primary_dispatch = pool.admit(&mut receiver, primary, &mut lanes, &peers, 1, 2,
+        |_, reply| Ok::<_, u8>(if reply == 30 {
+            ReplyBindingObservation::Free
+        } else {
+            ReplyBindingObservation::BoundToTarget
+        }),
+    ).unwrap();
+    assert!(!pool.ready_for_admission(&receiver, primary, &lanes));
+
+    receiver.begin_receive_for_owner(&lanes,
+        crate::IngressExecutionOwner::Dispatch(primary_dispatch)).unwrap();
+    receiver.capture(456).unwrap();
+    receiver.resolve(IngressReceiveDisposition::Call).unwrap();
+    pool.retain(&mut receiver, &lanes, &mut peers, worker.badge(), free, bound)
+        .unwrap();
+    assert_eq!(receiver.next_unadmitted(worker).map(|(_, message)| *message), Some(456));
+    assert!(pool.ready_for_admission(&receiver, worker, &lanes));
+    assert!(!pool.ready_for_admission(&receiver, primary, &lanes));
+}
+
+#[test]
 fn completed_lane_reuses_its_physical_reply_after_next_call_is_retained() {
     let (mut lanes, mut peers, route, mut owner, _) = setup();
     let mut pool = IngressReplyPool::new(20, 2).unwrap();

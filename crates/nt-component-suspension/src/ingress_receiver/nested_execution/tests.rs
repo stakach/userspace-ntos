@@ -43,6 +43,189 @@ fn child_settlement() -> crate::ExternalSettlement {
 }
 
 #[test]
+fn settled_receive_allows_a_later_nested_scope_before_dispatch_completes() {
+    let mut f = Fixture::new();
+    let (route, dispatch) = f.parent(1);
+    let owner = receive_owner(dispatch);
+    let reply = f.lanes.binding(dispatch.lane()).unwrap().reply_object;
+    f.lanes
+        .reserve_receive_capacity(dispatch.lane(), reply, owner)
+        .unwrap();
+    let mut receive = f
+        .receiver
+        .suspend_for_nested_execution(route, dispatch, &mut f.lanes, &f.peers, bound)
+        .unwrap();
+    let settled = child_settlement();
+    let key = crate::SuspensionKey::receive(settled.admission_key().admission_sequence());
+    f.lanes
+        .admit_receive_owned(&receive, key, 1, owner, settled.admission_key(), 123)
+        .unwrap();
+    f.lanes
+        .begin_receive_restore(&receive, key, owner, &settled, 0)
+        .unwrap();
+    f.receiver
+        .resume_nested_execution(&mut receive, &mut f.lanes, &f.peers, bound)
+        .unwrap();
+
+    // The Receive continuation remains on the stack while its component pump resumes.
+    // Another hosted work item may need a separate nested scope before that pump completes.
+    let frame = f.lanes.frame(dispatch.lane(), key).unwrap().unwrap().clone();
+    let mut work = f
+        .receiver
+        .suspend_for_nested_execution(route, dispatch, &mut f.lanes, &f.peers, bound)
+        .unwrap();
+    assert_ne!(receive.identity(), work.identity());
+    f.receiver
+        .resume_nested_execution(&mut work, &mut f.lanes, &f.peers, bound)
+        .unwrap();
+    assert_eq!(f.lanes.frame(dispatch.lane(), key).unwrap(), Some(&frame));
+    assert_eq!(f.lanes.active_dispatch_identity(dispatch.lane()), Ok(Some(dispatch)));
+}
+
+#[test]
+fn receive_can_repark_as_exact_service_wait() {
+    let mut f = Fixture::new();
+    let (route, dispatch) = f.parent(1);
+    let owner = receive_owner(dispatch);
+    let lane = dispatch.lane();
+    let reply = f.lanes.binding(lane).unwrap().reply_object;
+    f.lanes.reserve_receive_capacity(lane, reply, owner).unwrap();
+    let mut receive = f.receiver
+        .suspend_for_nested_execution(route, dispatch, &mut f.lanes, &f.peers, bound)
+        .unwrap();
+    let settled = child_settlement();
+    let old = crate::SuspensionKey::receive(settled.admission_key().admission_sequence());
+    f.lanes.admit_receive_owned(&receive, old, 1, owner, settled.admission_key(), 123).unwrap();
+    f.lanes.begin_receive_restore(&receive, old, owner, &settled, 0).unwrap();
+    f.receiver.resume_nested_execution(&mut receive, &mut f.lanes, &f.peers, bound).unwrap();
+    f.lanes.suspend_running(lane, reply, 41).unwrap();
+    let next = crate::SuspensionKey::service_wait(2);
+    let before = f.lanes.frame(lane, old).unwrap().unwrap().clone();
+    assert_eq!(
+        f.lanes.rearm_service_wait_external_owned(lane, reply, dispatch, 42, old, next, 2, owner, 456),
+        Err((crate::LaneError::InvalidPhase, 456)),
+    );
+    assert_eq!(f.lanes.frame(lane, old).unwrap(), Some(&before));
+    assert_eq!(
+        f.lanes.rearm_service_wait_external_owned(lane, reply, dispatch, 41, old, next, 2, owner, 456),
+        Ok(123),
+    );
+    assert_eq!(f.lanes.external_top(lane), Ok(Some(41)));
+    assert_eq!(f.lanes.phase(lane), Ok(crate::LanePhase::Suspended));
+    assert_eq!(f.lanes.frame(lane, next).unwrap().unwrap().continuation, 456);
+    assert_eq!(f.lanes.frame(lane, next).unwrap().unwrap().phase, crate::SuspensionPhase::Waiting);
+}
+
+#[test]
+fn resumed_service_wait_can_reuse_its_frame_for_sealed_receive_child() {
+    let mut f = Fixture::new();
+    let (route, dispatch) = f.parent(1);
+    let owner = receive_owner(dispatch);
+    let lane = dispatch.lane();
+    let reply = f.lanes.binding(lane).unwrap().reply_object;
+    let old = crate::SuspensionKey::service_wait(1);
+    f.lanes.suspend_running(lane, reply, 41).unwrap();
+    f.lanes.admit_service_wait_external_owned(lane, reply, dispatch, 41, old, 1, owner, 123).unwrap();
+    f.lanes.resume_external(lane, reply, 41).unwrap();
+    f.lanes.retire_service_wait_external_running(lane, reply, dispatch, 41, old, owner).unwrap();
+    f.lanes.select(old, 0).unwrap();
+    f.lanes.begin_resume(lane, reply, old).unwrap();
+    f.lanes.reserve_receive_rearm_capacity(lane, reply, old, owner).unwrap();
+    let mut receive = f.receiver
+        .suspend_for_nested_execution(route, dispatch, &mut f.lanes, &f.peers, bound)
+        .unwrap();
+    let settled = child_settlement();
+    let next = crate::SuspensionKey::receive(settled.admission_key().admission_sequence());
+    let before = f.lanes.frame(lane, old).unwrap().unwrap().clone();
+    let wrong = crate::SuspensionKey::receive(next.id + 1);
+    assert_eq!(
+        f.lanes.rearm_receive_owned(&receive, old, wrong, 2, owner, settled.admission_key(), 456),
+        Err((crate::LaneError::InvalidIdentity, 456)),
+    );
+    assert_eq!(f.lanes.frame(lane, old).unwrap(), Some(&before));
+    assert_eq!(
+        f.lanes.rearm_receive_owned(&receive, old, next, 2, owner, settled.admission_key(), 456),
+        Ok(123),
+    );
+    assert_eq!(f.lanes.frame(lane, old).unwrap(), None);
+    assert_eq!(f.lanes.frame(lane, next).unwrap().unwrap().continuation, 456);
+    assert!(matches!(f.lanes.frame(lane, next).unwrap().unwrap().phase, crate::SuspensionPhase::Waiting));
+    assert_ne!(f.lanes.frame(lane, next).unwrap(), Some(&before));
+    assert!(f.receiver.resume_nested_execution(&mut receive, &mut f.lanes, &f.peers, bound).is_err());
+    f.lanes.begin_receive_restore(&receive, next, owner, &settled, 0).unwrap();
+    f.receiver.resume_nested_execution(&mut receive, &mut f.lanes, &f.peers, bound).unwrap();
+}
+
+#[test]
+fn resumed_provider_and_lpc_waits_can_reuse_their_frame_for_receive() {
+    for old in [crate::SuspensionKey::provider_wait(1), crate::SuspensionKey::lpc_request(1)] {
+        let mut f = Fixture::new();
+        let (route, dispatch) = f.parent(1);
+        let owner = receive_owner(dispatch);
+        let lane = dispatch.lane();
+        let reply = f.lanes.binding(lane).unwrap().reply_object;
+        f.lanes.admit_running(lane, reply, old, 1, owner, 123).unwrap();
+        f.lanes.select(old, 0).unwrap();
+        f.lanes.begin_resume(lane, reply, old).unwrap();
+        f.lanes.reserve_receive_rearm_capacity(lane, reply, old, owner).unwrap();
+        let mut receive = f.receiver
+            .suspend_for_nested_execution(route, dispatch, &mut f.lanes, &f.peers, bound)
+            .unwrap();
+        let settled = child_settlement();
+        let next = crate::SuspensionKey::receive(settled.admission_key().admission_sequence());
+        let before = f.lanes.frame(lane, old).unwrap().unwrap().clone();
+        let mut wrong_owner = owner;
+        wrong_owner.provider_generation += 1;
+        assert!(matches!(
+            f.lanes.rearm_receive_owned(&receive, old, next, 2, wrong_owner, settled.admission_key(), 456),
+            Err((_, 456)),
+        ));
+        assert_eq!(f.lanes.frame(lane, old).unwrap(), Some(&before));
+        assert_eq!(
+            f.lanes.rearm_receive_owned(&receive, old, next, 2, owner, settled.admission_key(), 456),
+            Ok(123),
+        );
+        assert_eq!(f.lanes.frame(lane, next).unwrap().unwrap().continuation, 456);
+        assert!(f.receiver.resume_nested_execution(&mut receive, &mut f.lanes, &f.peers, bound).is_err());
+        f.lanes.begin_receive_restore(&receive, next, owner, &settled, 0).unwrap();
+        f.receiver.resume_nested_execution(&mut receive, &mut f.lanes, &f.peers, bound).unwrap();
+    }
+}
+
+#[test]
+fn callback_to_receive_transfers_only_its_exact_external_token() {
+    let mut f = Fixture::new();
+    let (route, dispatch) = f.parent(1);
+    let owner = receive_owner(dispatch);
+    let lane = dispatch.lane();
+    let reply = f.lanes.binding(lane).unwrap().reply_object;
+    f.lanes.suspend_running(lane, reply, 10).unwrap();
+    f.lanes.resume_external(lane, reply, 10).unwrap();
+    f.lanes.reserve_receive_capacity(lane, reply, owner).unwrap();
+    let mut receive = f.receiver
+        .suspend_for_nested_execution(route, dispatch, &mut f.lanes, &f.peers, bound)
+        .unwrap();
+    let settled = child_settlement();
+    let key = crate::SuspensionKey::receive(settled.admission_key().admission_sequence());
+    assert_eq!(
+        f.lanes.transfer_callback_to_receive_owned(
+            &receive, 11, key, 1, owner, settled.admission_key(), 123,
+        ),
+        Err((crate::LaneError::InvalidPhase, 123)),
+    );
+    assert_eq!(f.lanes.external_top(lane), Ok(Some(10)));
+    assert_eq!(f.lanes.suspension_count(lane), Ok(0));
+    f.lanes.transfer_callback_to_receive_owned(
+        &receive, 10, key, 1, owner, settled.admission_key(), 123,
+    ).unwrap();
+    assert_eq!(f.lanes.external_top(lane), Ok(None));
+    assert_eq!(f.lanes.frame(lane, key).unwrap().unwrap().continuation, 123);
+    assert!(f.receiver.resume_nested_execution(&mut receive, &mut f.lanes, &f.peers, bound).is_err());
+    f.lanes.begin_receive_restore(&receive, key, owner, &settled, 0).unwrap();
+    f.receiver.resume_nested_execution(&mut receive, &mut f.lanes, &f.peers, bound).unwrap();
+}
+
+#[test]
 fn repeated_receive_reuses_full_depth_slot_and_requires_a_new_settlement() {
     let mut f = Fixture::new();
     f.lanes = Lanes::new(4, 1);
@@ -95,6 +278,16 @@ fn repeated_receive_reuses_full_depth_slot_and_requires_a_new_settlement() {
         f.lanes.active_dispatch_identity(dispatch.lane()),
         Ok(Some(dispatch))
     );
+    let second_identity = second.identity();
+    let waiting = f.lanes.frame(dispatch.lane(), next_key).unwrap().unwrap().clone();
+    assert!(matches!(
+        f.receiver
+            .resume_nested_execution(&mut second, &mut f.lanes, &f.peers, bound),
+        Err(NestedExecutionError::WrongOwner)
+    ));
+    assert_eq!(second.identity(), second_identity);
+    assert!(!second.is_consumed());
+    assert_eq!(f.lanes.frame(dispatch.lane(), next_key).unwrap(), Some(&waiting));
     assert!(f
         .receiver
         .resume_nested_execution(&mut second, &mut f.lanes, &f.peers, no_query)

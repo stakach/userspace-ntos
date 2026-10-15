@@ -4,13 +4,13 @@ use crate::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReceiveAdmission {
-    scope: NestedExecutionIdentity,
+    pub(crate) scope: NestedExecutionIdentity,
     child: ExternalAdmissionKey,
     pub(crate) restored: bool,
 }
 
 impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
-    /// Reuse the restored Receive's frame slot; reserve terminal handoff before the next hold.
+    /// Reuse any resumed component wait frame; reserve handoff before the next hold.
     pub fn reserve_receive_rearm_capacity(
         &mut self,
         handle: LaneHandle,
@@ -29,9 +29,11 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         if frame.key != completed_key {
             return Err(LaneError::Suspension(SuspensionError::NotTop));
         }
-        if completed_key.kind != SuspensionKind::Receive
-            || frame.owner != owner
-            || !frame.receive.is_some_and(|admission| admission.restored)
+        if frame.owner != owner
+            || match completed_key.kind {
+                SuspensionKind::Receive => !frame.receive.is_some_and(|admission| admission.restored),
+                SuspensionKind::ServiceWait | SuspensionKind::ProviderWait | SuspensionKind::LpcRequest => frame.receive.is_some(),
+            }
             || !matches!(frame.phase, SuspensionPhase::Resuming { .. })
         {
             return Err(LaneError::InvalidPhase);
@@ -47,7 +49,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             .map_err(|_| LaneError::NoCapacity)
     }
 
-    /// Replace one settled Receive with a freshly held child, without allocating or running it.
+    /// Replace one resumed component wait with a freshly held child.
     /// Every rejection preserves the current frame and returns the offered continuation.
     pub fn rearm_receive_owned(
         &mut self,
@@ -67,7 +69,6 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             return Err((error, continuation));
         }
         if next_key.kind != SuspensionKind::Receive
-            || completed_key.kind != SuspensionKind::Receive
             || next_key.id != child.admission_sequence()
             || admission_sequence == 0
         {
@@ -96,19 +97,21 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         if frame.key != completed_key {
             return Err((LaneError::Suspension(SuspensionError::NotTop), continuation));
         }
-        let Some(previous) = frame.receive else {
-            return Err((LaneError::InvalidPhase, continuation));
-        };
         if frame.owner != owner
-            || !previous.restored
             || !matches!(frame.phase, SuspensionPhase::Resuming { .. })
-            || previous.scope.dispatch() != scope.dispatch()
-            || previous.scope.route() != scope.route()
-            || previous.scope.sequence() >= scope.identity().sequence()
-            || previous.child == child
             || admission_sequence <= frame.admission_sequence
         {
             return Err((LaneError::WrongBinding, continuation));
+        }
+        match (completed_key.kind, frame.receive) {
+            (SuspensionKind::Receive, Some(previous))
+                if previous.restored
+                    && previous.scope.dispatch() == scope.dispatch()
+                    && previous.scope.route() == scope.route()
+                    && previous.scope.sequence() < scope.identity().sequence()
+                    && previous.child != child => {}
+            (SuspensionKind::ServiceWait | SuspensionKind::ProviderWait | SuspensionKind::LpcRequest, None) => {}
+            _ => return Err((LaneError::WrongBinding, continuation)),
         }
         if lane.external_tokens.len() >= lane.external_tokens.capacity() {
             return Err((LaneError::NoCapacity, continuation));
@@ -225,15 +228,50 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         Ok(())
     }
 
+    /// Replace a completed callback's exact external token with its held Receive child.
+    /// The child remains sealed by the ordinary Receive settlement and nested scope checks.
+    pub fn transfer_callback_to_receive_owned(
+        &mut self,
+        scope: &NestedExecutionScope,
+        callback_token: u64,
+        key: SuspensionKey,
+        admission_sequence: u64,
+        owner: SuspensionOwner,
+        child: ExternalAdmissionKey,
+        continuation: C,
+    ) -> Result<(), (LaneError, C)> {
+        if callback_token == 0 {
+            return Err((LaneError::InvalidIdentity, continuation));
+        }
+        if let Err(error) = self.validate_receive_scope(scope) {
+            return Err((error, continuation));
+        }
+        let handle = scope.dispatch().lane();
+        if self.lane(handle).expect("validated receive lane")
+            .external_tokens.last().copied() != Some(callback_token)
+        {
+            return Err((LaneError::InvalidPhase, continuation));
+        }
+        self.admit_receive_owned(scope, key, admission_sequence, owner, child, continuation)?;
+        self.lane_mut(handle).expect("admitted receive lane").external_tokens.pop();
+        Ok(())
+    }
+
     pub(crate) fn receive_scope_restorable(&self, scope: &NestedExecutionScope) -> bool {
         let Ok(lane) = self.lane(scope.dispatch().lane()) else {
             return false;
         };
+        // A settled Receive frame outlives its physical parent scope while the component pump
+        // continues. A later ordinary nested scope may restore on the same dispatch; an
+        // unsettled child, another route, or a future scope must still fence restoration.
         lane.suspensions.frames().iter().all(|frame| {
             (frame.key.kind != SuspensionKind::Receive && frame.receive.is_none())
                 || (frame.key.kind == SuspensionKind::Receive
                     && frame.receive.is_some_and(|admission| {
-                        admission.scope == scope.identity() && admission.restored
+                        admission.restored
+                            && admission.scope.route() == scope.route()
+                            && admission.scope.dispatch() == scope.dispatch()
+                            && admission.scope.sequence() <= scope.identity().sequence()
                     })
                     && matches!(frame.phase, SuspensionPhase::Resuming { .. }))
         })
