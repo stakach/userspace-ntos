@@ -156,15 +156,22 @@ fn sector_is_zero(bytes: &[u8]) -> bool {
 fn zero_suffix<D: SnapshotBlockDevice>(
     device: &mut D,
     start: u64,
-    sector: &mut [u8],
 ) -> Result<bool, RegistryWalError> {
-    for lba in start..device.sector_count() {
-        device
-            .read_sector(lba, sector)
-            .map_err(RegistryWalError::Storage)?;
-        if !sector_is_zero(sector) {
+    // The caller already read and checked `start`. Range reads preserve full-tail validation
+    // while allowing the native AHCI device to amortize commands over several sectors.
+    const BATCH_SECTORS: usize = 64;
+    let size = device.sector_size();
+    let bytes = size.checked_mul(BATCH_SECTORS).ok_or(RegistryWalError::InvalidGeometry)?;
+    let mut batch = sector_buffer(bytes)?;
+    let mut lba = start + 1;
+    while lba < device.sector_count() {
+        let sectors = (device.sector_count() - lba).min(BATCH_SECTORS as u64) as usize;
+        let span = sectors * size;
+        device.read_sectors(lba, &mut batch[..span]).map_err(RegistryWalError::Storage)?;
+        if !sector_is_zero(&batch[..span]) {
             return Ok(false);
         }
+        lba += sectors as u64;
     }
     Ok(true)
 }
@@ -235,7 +242,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
                 .read_sector(cursor, &mut sector)
                 .map_err(RegistryWalError::Storage)?;
             if sector_is_zero(&sector) {
-                if !zero_suffix(&mut device, cursor, &mut sector)? {
+                if !zero_suffix(&mut device, cursor)? {
                     return Err(RegistryWalError::Corrupt);
                 }
                 break;
@@ -272,7 +279,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
                 .read_sector(marker_lba, &mut sector)
                 .map_err(RegistryWalError::Storage)?;
             if sector_is_zero(&sector) {
-                if !zero_suffix(&mut device, marker_lba, &mut sector)? {
+                if !zero_suffix(&mut device, marker_lba)? {
                     return Err(RegistryWalError::Corrupt);
                 }
                 recovered_tail_sectors = Some(payload_count);

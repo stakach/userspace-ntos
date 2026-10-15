@@ -2,9 +2,58 @@ use super::*;
 use crate::snapshot_test_device::CachedDisk;
 use crate::{BoundedBlockRange, OwnedBoundedBlockRange, SnapshotBlockStore, SnapshotReserve, WalSnapshotAnchor};
 extern crate std;
+use alloc::rc::Rc;
+use core::cell::Cell;
 
 fn disk() -> CachedDisk {
     CachedDisk::with_sectors(32)
+}
+
+struct BatchedZeroDisk {
+    inner: CachedDisk,
+    singles: Rc<Cell<usize>>,
+    batches: Rc<Cell<usize>>,
+}
+
+impl SnapshotBlockDevice for BatchedZeroDisk {
+    fn sector_size(&self) -> usize { self.inner.sector_size() }
+    fn sector_count(&self) -> u64 { self.inner.sector_count() }
+    fn read_sector(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError> {
+        self.singles.set(self.singles.get() + 1);
+        self.inner.read_sector(lba, out)
+    }
+    fn read_sectors(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError> {
+        self.batches.set(self.batches.get() + 1);
+        self.inner.read_sectors(lba, out)
+    }
+    fn write_sector(&mut self, lba: u64, data: &[u8]) -> Result<(), SnapshotBlockStoreError> {
+        self.inner.write_sector(lba, data)
+    }
+    fn flush(&mut self) -> Result<(), SnapshotBlockStoreError> { self.inner.flush() }
+}
+
+#[test]
+fn empty_tail_recovery_uses_bounded_range_reads_and_checks_the_last_sector() {
+    let singles = Rc::new(Cell::new(0));
+    let batches = Rc::new(Cell::new(0));
+    let make_disk = |inner| BatchedZeroDisk {
+        inner,
+        singles: singles.clone(),
+        batches: batches.clone(),
+    };
+    let wal = RegistryWal::recover(make_disk(CachedDisk::with_sectors(65)), 77).unwrap();
+    assert_eq!(wal.settled_anchor().unwrap().serial, 0);
+    assert!(batches.get() > 0, "the zero suffix must use range reads");
+    assert!(singles.get() < 65, "the zero suffix must not issue a command per sector");
+
+    let mut corrupt = CachedDisk::with_sectors(65);
+    corrupt.cache[64 * 512 + 511] = 1;
+    assert!(matches!(RegistryWal::recover(make_disk(corrupt), 77), Err(RegistryWalError::Corrupt)));
+
+    let mut failed = CachedDisk::with_sectors(65);
+    failed.fail_read = Some(64);
+    assert!(matches!(RegistryWal::recover(make_disk(failed), 77),
+        Err(RegistryWalError::Storage(SnapshotBlockStoreError::Io))));
 }
 
 #[test]
