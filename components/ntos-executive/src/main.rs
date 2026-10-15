@@ -975,9 +975,10 @@ pub const SSN_NT_QUEUE_APC_THREAD: u64 = 188;
 /// completed (`CM_BOOT_FLAG_SMSS`), and winlogon later accepts the boot control set. The executive
 /// records that CM state and rejects invalid/repeated transitions.
 pub const SSN_NT_INITIALIZE_REGISTRY: u64 = 96;
-/// NtSetValueKey — registry value writes are routed to mounted mutable hives or volatile overlay
-/// keys, then checkpointed by `NtFlushKey` / lazy-writer state rather than acknowledged
-/// synthetically.
+/// NtSetValueKey — mounted persistent-hive mutations enter the retained v1 journal before CM
+/// COMMIT and ACK; volatile overlay keys remain ephemeral. A future v2 WAL owner will make
+/// COMMIT durable before ACK, while `NtFlushKey` and lazy work fold acknowledged state into a
+/// snapshot.
 pub const SSN_NT_SET_VALUE_KEY: u64 = 256;
 /// `NtFlushKey(IN HANDLE KeyHandle)` — `references/reactos/ntoskrnl/config/ntapi.c:1085`
 /// (`sysfuncs.lst` line 84 → SSN 83, one argument).

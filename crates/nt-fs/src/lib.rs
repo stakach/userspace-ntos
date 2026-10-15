@@ -76,7 +76,7 @@ pub use path::{
 };
 pub use query::*;
 pub use snapshot_store::{
-    PayloadSectorReader, PayloadSectorWriter, SnapshotBlockDevice, SnapshotBlockStore,
+    BootSnapshotRecovery, PayloadSectorReader, PayloadSectorWriter, SnapshotBlockDevice, SnapshotBlockStore,
     SnapshotBlockStoreError, SnapshotPayloadReader, SnapshotPayloadSink, SnapshotReadFormat,
     StoredSnapshot, StoredSnapshotMetadata, StoredWalSnapshot, WalSnapshotAnchor,
     WalSnapshotAnchorUpdate, WalSnapshotEpochRollover, WalSnapshotManifest,

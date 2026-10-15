@@ -211,6 +211,30 @@ fn interrupted_empty_wal_baseline_can_repair_the_mixed_pair() {
 }
 
 #[test]
+fn boot_recovery_probe_identifies_only_an_empty_wal_migration() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::with_sectors(32);
+    store.commit_next(&mut disk, b"older").unwrap();
+    store.commit_next(&mut disk, b"current").unwrap();
+    assert_eq!(store.boot_recovery_state(&mut disk), Ok(BootSnapshotRecovery::Ready));
+    store.commit_next_with_wal_manifest(&mut disk, b"current", base()).unwrap();
+    disk.power_cut();
+    disk.events.clear();
+    assert_eq!(store.boot_recovery_state(&mut disk), Ok(BootSnapshotRecovery::InterruptedEmptyBaseline { incarnation: 77 }));
+    assert!(!disk.events.iter().any(|event| matches!(event, Event::Write(_))));
+
+    let mut advanced = base();
+    advanced.high_water_serial = 1;
+    advanced.high_water_end_lba = 3;
+    let mut disk = CachedDisk::with_sectors(32);
+    store.commit_next(&mut disk, b"legacy").unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, b"newer", advanced).unwrap();
+    disk.events.clear();
+    assert_eq!(store.boot_recovery_state(&mut disk), Err(SnapshotBlockStoreError::Corrupt));
+    assert!(!disk.events.iter().any(|event| matches!(event, Event::Write(_))));
+}
+
+#[test]
 fn empty_wal_baseline_repair_survives_each_write_and_barrier_cut() {
     let store = SnapshotBlockStore::new(0, 16);
     for partial_flush in [false, true] {
@@ -320,6 +344,60 @@ fn owned_migration_commits_current_volume_to_both_v2_slots_before_releasing_leas
     assert_eq!(selected.anchor.serial, 0);
     drop(lease);
     assert!(reserve.try_acquire().is_some());
+}
+
+#[test]
+fn composed_system_primary_and_empty_sidecar_survive_migration_crash_cuts() {
+    const PRIMARY: &str = r"\??\C:\SYSTEM";
+    const LOG: &str = r"\??\C:\SYSTEM.LOG";
+    fn replace(fs: &mut crate::FileSystem, path: &str, bytes: &[u8]) {
+        let opened = fs.zw_create_file(
+            path, crate::FILE_WRITE_DATA | crate::SYNCHRONIZE, 0, 0,
+            crate::FILE_OPEN_IF, crate::FILE_NON_DIRECTORY_FILE,
+        );
+        assert_eq!(opened.status, crate::STATUS_SUCCESS);
+        assert_eq!(fs.replace_file_data_owned(opened.handle, bytes.to_vec()), crate::STATUS_SUCCESS);
+        assert_eq!(fs.zw_close(opened.handle), crate::STATUS_SUCCESS);
+    }
+    let store = SnapshotBlockStore::new(0, 128);
+    for partial_flush in [false, true] {
+        for failed_event in 0..8 {
+            let mut fs = crate::FileSystem::new(crate::MemFs::new());
+            replace(&mut fs, PRIMARY, b"old-primary");
+            replace(&mut fs, LOG, b"complete-v1-sidecar");
+            let mut disk = CachedDisk::with_sectors(256);
+            fs.commit_volume_snapshot(&store, &mut disk).unwrap();
+            fs.commit_volume_snapshot(&store, &mut disk).unwrap();
+
+            // This is the image after semantic composition of the v1 primary and LOG.
+            replace(&mut fs, PRIMARY, b"composed-system-image");
+            replace(&mut fs, LOG, b"");
+            disk.events.clear();
+            disk.fail_event = Some(failed_event);
+            disk.partial_flush = partial_flush;
+            let _ = fs.commit_volume_snapshot_with_wal_manifest(&store, &mut disk, base());
+            disk.power_cut();
+            disk.fail_event = None;
+            match store.boot_recovery_state(&mut disk).unwrap() {
+                BootSnapshotRecovery::Ready
+                | BootSnapshotRecovery::InterruptedEmptyBaseline { incarnation: 77 } => {}
+                state => panic!("unexpected recovery state: {state:?}"),
+            }
+            let range = OwnedBoundedBlockRange::new(disk, 128, 128).ok().unwrap();
+            let verified = RegistryWal::recover(range, 77).unwrap()
+                .into_verified_device().unwrap().into_full_device();
+            let mut migration = WalSnapshotBaselineRepair::admit(store, verified).ok().unwrap();
+            migration.migrate(&fs).unwrap();
+            let mut disk = migration.into_verified_device().unwrap().into_device();
+            disk.power_cut();
+            let (restored, metadata) = crate::FileSystem::restore_volume_snapshot_with_metadata_from_store(
+                &store, &mut disk,
+            ).unwrap().unwrap();
+            assert_eq!(restored.try_file_bytes_owned(PRIMARY).unwrap(), Some(b"composed-system-image".to_vec()));
+            assert_eq!(restored.try_file_bytes_owned(LOG).unwrap(), Some(alloc::vec::Vec::new()));
+            assert!(matches!(metadata.format, SnapshotReadFormat::Wal { selected_base_serial: 0, .. }));
+        }
+    }
 }
 
 #[test]

@@ -261,6 +261,14 @@ pub enum SnapshotReadFormat {
     },
 }
 
+/// Recovery required before the native boot reader may decode or publish a snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootSnapshotRecovery {
+    Ready,
+    InterruptedEmptyBaseline { incarnation: u64 },
+    Resetting,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoredSnapshotMetadata {
     pub generation: u64,
@@ -366,6 +374,50 @@ impl SnapshotBlockStore {
             .ok()
             .and_then(|sectors| sectors.checked_mul(sector_size))
             .ok_or(SnapshotBlockStoreError::InvalidGeometry)
+    }
+
+    /// Classify states requiring an exact-lease repair before the boot payload is decoded.
+    /// This probe performs no writes and never guesses an incarnation from a torn header.
+    pub fn boot_recovery_state<D: SnapshotBlockDevice>(
+        &self,
+        dev: &mut D,
+    ) -> Result<BootSnapshotRecovery, SnapshotBlockStoreError> {
+        let first = self.read_slot_plan(dev, 0);
+        let second = self.read_slot_plan(dev, 1);
+        for slot in [&first, &second] {
+            if let Err(error) = slot {
+                if *error != SnapshotBlockStoreError::Corrupt {
+                    return Err(*error);
+                }
+            }
+        }
+        if first.as_ref().ok().and_then(|slot| *slot).is_some_and(|slot| slot.resetting)
+            || second.as_ref().ok().and_then(|slot| *slot).is_some_and(|slot| slot.resetting)
+        {
+            return Ok(BootSnapshotRecovery::Resetting);
+        }
+        let (Some(a), Some(b)) = (first.ok().flatten(), second.ok().flatten()) else {
+            // A torn companion remains the normal reader's responsibility. It will only
+            // select a surviving payload under the existing same-anchor rules.
+            return Ok(BootSnapshotRecovery::Ready);
+        };
+        let (v2, legacy) = match (a.wal, b.wal) {
+            (Some(_), None) => (a, b),
+            (None, Some(_)) => (b, a),
+            _ => return Ok(BootSnapshotRecovery::Ready),
+        };
+        let wal = v2.wal.expect("identified WAL header");
+        if v2.generation <= legacy.generation || wal.incarnation == 0
+            || wal.base_serial != 0 || wal.high_water_serial != 0
+            || wal.high_water_end_lba != 0
+        {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        self.validate_slot_payload_crc(dev, v2)?;
+        self.validate_slot_payload_crc(dev, legacy)?;
+        Ok(BootSnapshotRecovery::InterruptedEmptyBaseline {
+            incarnation: wal.incarnation,
+        })
     }
 
     pub fn read_latest<D: SnapshotBlockDevice>(
@@ -619,6 +671,9 @@ impl SnapshotBlockStore {
         };
         let repair = match (a, b) {
             (Ok(Some(a)), Ok(Some(b))) if a.wal.is_none() && b.wal.is_none() => return Ok(None),
+            (Ok(Some(legacy)), Ok(None) | Err(SnapshotBlockStoreError::Corrupt))
+            | (Ok(None) | Err(SnapshotBlockStoreError::Corrupt), Ok(Some(legacy)))
+                if legacy.wal.is_none() => return Ok(None),
             (Ok(Some(a)), Ok(Some(b))) if a.wal == Some(empty) && b.wal == Some(empty) => {
                 if a.generation == b.generation {
                     return Err(SnapshotBlockStoreError::Corrupt);
@@ -746,6 +801,31 @@ impl SnapshotBlockStore {
             Some(manifest),
             false,
             write_payload,
+        )
+    }
+
+    pub(crate) fn commit_next_streaming_for_empty_wal_migration<D, F>(
+        &self,
+        dev: &mut D,
+        payload_len: usize,
+        payload_crc: u32,
+        manifest: WalSnapshotManifest,
+        write_payload: F,
+    ) -> Result<u64, SnapshotBlockStoreError>
+    where
+        D: SnapshotBlockDevice,
+        F: FnOnce(&mut PayloadSectorWriter<'_, D>) -> Result<(), SnapshotBlockStoreError>,
+    {
+        if !manifest.valid() || manifest.base_serial != 0
+            || manifest.high_water_serial != 0 || manifest.high_water_end_lba != 0
+            || dev.sector_size() < WAL_HEADER_LEN
+        {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        // Admission and empty-WAL proof belong to WalSnapshotBaselineRepair. This path may
+        // recycle a torn legacy companion after a previous first-slot migration cut.
+        self.commit_next_streaming_inner(
+            dev, payload_len, payload_crc, Some(manifest), true, write_payload,
         )
     }
 

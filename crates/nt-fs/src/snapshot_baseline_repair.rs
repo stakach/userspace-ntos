@@ -99,7 +99,7 @@ impl<D: SnapshotBlockDevice> WalSnapshotBaselineRepair<D> {
                 high_water_serial: 0,
                 high_water_end_lba: 0,
             };
-            fs.commit_volume_snapshot_with_wal_manifest(
+            fs.commit_volume_snapshot_for_empty_wal_migration(
                 &self.store,
                 verified.device_mut(),
                 manifest,

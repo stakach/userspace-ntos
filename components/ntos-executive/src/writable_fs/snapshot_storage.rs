@@ -11,6 +11,13 @@ pub(super) const BUSY: u32 = 0x8000_0011;
 const SNAPSHOT_SECTORS: u64 = crate::fs_loader::WRITABLE_SNAPSHOT_RESERVE_SECTORS as u64;
 const WAL_SECTORS: u64 = SNAPSHOT_SECTORS;
 
+pub(super) fn wal_bounds(lease: &Lease) -> Result<(u64, u64), u32> {
+    if lease.sector_count() < SNAPSHOT_SECTORS + WAL_SECTORS {
+        return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+    }
+    Ok((SNAPSHOT_SECTORS, WAL_SECTORS))
+}
+
 /// Boot-only publication, before the executable filesystem identity becomes visible. This slot
 /// cannot be replaced; copied Fat32 values elsewhere never grant snapshot device access.
 pub(crate) unsafe fn publish(fat: Fat32, mount: SectionMountId) -> Result<(), u32> {

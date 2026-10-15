@@ -1149,6 +1149,7 @@ impl MemFs {
         store: &SnapshotBlockStore,
         dev: &mut D,
         wal: Option<WalSnapshotManifest>,
+        empty_wal_migration: bool,
     ) -> Result<(u64, usize), SnapshotBlockStoreError> {
         let mut payload_crc_sink = SnapshotCrcSink::new();
         let record_count = self.write_snapshot_payload_to_sink(&mut payload_crc_sink)?;
@@ -1174,6 +1175,13 @@ impl MemFs {
             Ok(())
         };
         let generation = match wal {
+            Some(manifest) if empty_wal_migration => store.commit_next_streaming_for_empty_wal_migration(
+                dev,
+                total_len,
+                store_payload_crc,
+                manifest,
+                write_payload,
+            )?,
             Some(manifest) => store.commit_next_streaming_with_wal_manifest(
                 dev,
                 total_len,
@@ -3957,7 +3965,7 @@ impl FileSystem {
         store: &SnapshotBlockStore,
         dev: &mut D,
     ) -> Result<(u64, usize), SnapshotBlockStoreError> {
-        self.volume.commit_snapshot_to_store(store, dev, None)
+        self.volume.commit_snapshot_to_store(store, dev, None, false)
     }
 
     /// Commit the same streaming volume image with an explicit WAL manifest. Every
@@ -3969,7 +3977,16 @@ impl FileSystem {
         dev: &mut D,
         manifest: WalSnapshotManifest,
     ) -> Result<(u64, usize), SnapshotBlockStoreError> {
-        self.volume.commit_snapshot_to_store(store, dev, Some(manifest))
+        self.volume.commit_snapshot_to_store(store, dev, Some(manifest), false)
+    }
+
+    pub(crate) fn commit_volume_snapshot_for_empty_wal_migration<D: SnapshotBlockDevice>(
+        &self,
+        store: &SnapshotBlockStore,
+        dev: &mut D,
+        manifest: WalSnapshotManifest,
+    ) -> Result<(u64, usize), SnapshotBlockStoreError> {
+        self.volume.commit_snapshot_to_store(store, dev, Some(manifest), true)
     }
 
     /// Restore the durable volume tree from a block-backed snapshot store without allocating the
