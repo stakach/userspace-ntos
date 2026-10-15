@@ -77,7 +77,7 @@ unsafe fn pool_range_identity_unlocked(
     if bytes == 0 || component_address < FSD_POOL_VADDR {
         return None;
     }
-    let used = read_volatile(inst.exec_pool_va as *const u64);
+    let used = hosted_pool_used(inst.exec_pool_va);
     if used < POOL_DATA_OFF || used > FSD_POOL_FRAMES.checked_mul(0x1000)? {
         return None;
     }

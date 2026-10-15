@@ -2764,7 +2764,9 @@ pub(crate) unsafe fn pool_alloc(size: u64) -> u64 {
             break;
         }
         steps += 1;
-        let cap = read_volatile((cur - 16) as *const u64);
+        let Some(cap) = component_pool_allocation_capacity(cur) else {
+            break;
+        };
         if cap >= size {
             let Some(generation) = next_component_pool_generation(FSD_POOL_VADDR) else {
                 return 0;
@@ -2778,16 +2780,22 @@ pub(crate) unsafe fn pool_alloc(size: u64) -> u64 {
         cur = read_volatile((cur - 8) as *const u64);
     }
     // bump
-    let ctr = FSD_POOL_VADDR as *mut u64;
-    let mut off = read_volatile(ctr);
+    let mut off = hosted_pool_used(FSD_POOL_VADDR);
     if off < POOL_DATA_OFF {
         off = POOL_DATA_OFF;
     }
+    if off > FSD_POOL_FRAMES * 0x1000 {
+        return 0;
+    }
     // 16-byte header + 16-align the returned block
-    let hdr = (FSD_POOL_VADDR + off + 15) & !15;
-    let block = hdr + 16;
+    let Some(hdr) = FSD_POOL_VADDR.checked_add(off).and_then(|at| at.checked_add(15))
+        .map(|at| at & !15)
+    else {
+        return 0;
+    };
+    let Some(block) = hdr.checked_add(16) else { return 0; };
     let cap = FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000;
-    if size == 0 || block + size > cap {
+    if size == 0 || block.checked_add(size).is_none_or(|end| end > cap) {
         print_str(b"[fsd-host] POOL EXHAUSTED size=0x");
         print_hex(size as u32);
         print_str(b"\n");
@@ -2796,9 +2804,9 @@ pub(crate) unsafe fn pool_alloc(size: u64) -> u64 {
     let Some(generation) = next_component_pool_generation(FSD_POOL_VADDR) else {
         return 0;
     };
-    write_volatile(ctr, (block + size) - FSD_POOL_VADDR);
     write_volatile((block - 16) as *mut u64, size); // capacity header
     write_volatile((block - 8) as *mut u64, generation);
+    hosted_pool_publish_used(FSD_POOL_VADDR, (block + size) - FSD_POOL_VADDR);
     block
 }
 
@@ -2838,6 +2846,9 @@ unsafe fn pool_free_locked(p: u64) -> bool {
     let mut cur = read_volatile(head_slot);
     let mut steps = 0u64;
     while cur != 0 && steps < POOL_FREE_LIST_MAX {
+        if component_pool_allocation_capacity(cur).is_none() {
+            return false;
+        }
         if steps == 4096 && POOL_LONG_WALKS < 8 {
             POOL_LONG_WALKS += 1;
             print_str(b"[fsd-pool] LONG free-list walk p=");
@@ -3695,45 +3706,58 @@ unsafe fn pipe_ccb_view(fid: u64) -> Option<PipeCcbView> {
     pipe_ccb_view_in_pool(fid, FSD_POOL_VADDR)
 }
 
+/// The bump cursor publishes fully written pool headers to readers outside the allocator lock.
+unsafe fn hosted_pool_used(pool_view_base: u64) -> u64 {
+    (&*(pool_view_base as *const AtomicU64)).load(Ordering::Acquire)
+}
+
+unsafe fn hosted_pool_publish_used(pool_view_base: u64, used: u64) {
+    (&*(pool_view_base as *const AtomicU64)).store(used, Ordering::Release);
+}
+
 fn component_pool_end() -> u64 {
     FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000
 }
 
 unsafe fn component_pool_allocation_capacity(component_va: u64) -> Option<u64> {
-    if component_va < FSD_POOL_VADDR + POOL_DATA_OFF + 16
-        || component_va & 15 != 0
-        || component_va >= component_pool_end()
-    {
-        return None;
-    }
-    let bump = read_volatile(FSD_POOL_VADDR as *const u64);
-    let used_end = FSD_POOL_VADDR.checked_add(bump.min(FSD_POOL_FRAMES * 0x1000))?;
-    let capacity = read_volatile((component_va - 16) as *const u64);
-    if capacity == 0 || component_va.checked_add(capacity)? > used_end {
-        return None;
-    }
-    Some(capacity)
+    pool_allocation_range_in_view(FSD_POOL_VADDR, component_va).map(|(_, capacity)| capacity)
 }
 
-unsafe fn hosted_pool_allocation_exec_range(
-    exec_pool_va: u64,
+unsafe fn pool_allocation_range_in_view(
+    pool_view_base: u64,
     component_va: u64,
 ) -> Option<(u64, u64)> {
-    if exec_pool_va == 0
+    if pool_view_base == 0
         || component_va < FSD_POOL_VADDR + POOL_DATA_OFF + 16
         || component_va & 15 != 0
         || component_va >= component_pool_end()
     {
         return None;
     }
-    let exec_va = exec_pool_va.checked_add(component_va - FSD_POOL_VADDR)?;
-    let bump = read_volatile(exec_pool_va as *const u64);
-    let used_end = exec_pool_va.checked_add(bump.min(FSD_POOL_FRAMES * 0x1000))?;
-    let capacity = read_volatile((exec_va - 16) as *const u64);
-    if capacity == 0 || exec_va.checked_add(capacity)? > used_end {
+    let offset = component_va.checked_sub(FSD_POOL_VADDR)?;
+    let used = hosted_pool_used(pool_view_base);
+    let allocation = nt_io_manager::hosted_pool_range::walk_hosted_pool_allocation(
+        FSD_POOL_FRAMES * 0x1000,
+        used,
+        POOL_DATA_OFF,
+        offset,
+        1,
+        |header| {
+            let address = pool_view_base.checked_add(header)?;
+            Some(read_volatile(address as *const u64))
+        },
+    )?;
+    if allocation.base != offset {
         return None;
     }
-    Some((exec_va, capacity))
+    Some((pool_view_base.checked_add(offset)?, allocation.capacity))
+}
+
+unsafe fn hosted_pool_allocation_exec_range(
+    exec_pool_va: u64,
+    component_va: u64,
+) -> Option<(u64, u64)> {
+    pool_allocation_range_in_view(exec_pool_va, component_va)
 }
 
 unsafe fn hosted_pool_allocation_exec_va(
@@ -3911,16 +3935,13 @@ unsafe fn hosted_instance_pool_alloc(inst: DriverInstance, size: u64) -> Option<
             break;
         }
         steps += 1;
-        if cur < FSD_POOL_VADDR + POOL_DATA_OFF || cur >= component_pool_end {
-            break;
-        }
-        let Some(cur_exec) = inst.exec_pool_va.checked_add(cur - FSD_POOL_VADDR) else {
+        let Some((cur_exec, cap)) = hosted_pool_allocation_exec_range(inst.exec_pool_va, cur)
+        else {
             break;
         };
         if cur_exec < inst.exec_pool_va + 16 || cur_exec >= exec_pool_end {
             break;
         }
-        let cap = read_volatile((cur_exec - 16) as *const u64);
         let next = read_volatile((cur_exec - 8) as *const u64);
         if cap >= size {
             let generation = next_component_pool_generation(inst.exec_pool_va)?;
@@ -3932,8 +3953,7 @@ unsafe fn hosted_instance_pool_alloc(inst: DriverInstance, size: u64) -> Option<
         cur = next;
     }
 
-    let ctr_exec = inst.exec_pool_va;
-    let mut off = read_volatile(ctr_exec as *const u64);
+    let mut off = hosted_pool_used(inst.exec_pool_va);
     if off < POOL_DATA_OFF {
         off = POOL_DATA_OFF;
     }
@@ -3948,9 +3968,9 @@ unsafe fn hosted_instance_pool_alloc(inst: DriverInstance, size: u64) -> Option<
         return None;
     }
     let generation = next_component_pool_generation(inst.exec_pool_va)?;
-    write_volatile(ctr_exec as *mut u64, end - FSD_POOL_VADDR);
     write_volatile((block_exec - 16) as *mut u64, size);
     write_volatile((block_exec - 8) as *mut u64, generation);
+    hosted_pool_publish_used(inst.exec_pool_va, end - FSD_POOL_VADDR);
     Some(block)
 }
 
@@ -3975,17 +3995,17 @@ unsafe fn hosted_instance_pool_free_unlocked(inst: DriverInstance, p: u64) -> bo
             FSD_POOL_DOUBLE_FREES.fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        if cur < FSD_POOL_VADDR + POOL_DATA_OFF || cur >= component_pool_end() {
-            break;
-        }
-        let Some(cur_exec) = inst.exec_pool_va.checked_add(cur - FSD_POOL_VADDR) else {
-            break;
-        };
+        let Some((cur_exec, _)) = hosted_pool_allocation_exec_range(inst.exec_pool_va, cur)
+        else { return false; };
         if cur_exec < inst.exec_pool_va + 16 {
-            break;
+            return false;
         }
         cur = read_volatile((cur_exec - 8) as *const u64);
         steps += 1;
+    }
+    if cur != 0 {
+        FSD_POOL_LIST_CYCLES.fetch_add(1, Ordering::Relaxed);
+        return false;
     }
     write_volatile(
         (p_exec - 8) as *mut u64,
@@ -4015,18 +4035,13 @@ unsafe fn hosted_instance_pool_allocation_is_free_unlocked(
     let mut current = read_volatile(head_slot_exec as *const u64);
     let mut steps = 0u64;
     while current != 0 {
-        if steps >= POOL_FREE_LIST_MAX
-            || current < FSD_POOL_VADDR + POOL_DATA_OFF + 16
-            || current >= component_pool_end()
-        {
+        if steps >= POOL_FREE_LIST_MAX {
             return None;
         }
         if current == p {
             return Some(true);
         }
-        let current_exec = inst
-            .exec_pool_va
-            .checked_add(current.checked_sub(FSD_POOL_VADDR)?)?;
+        let (current_exec, _) = hosted_pool_allocation_exec_range(inst.exec_pool_va, current)?;
         if current_exec < inst.exec_pool_va + POOL_DATA_OFF + 16 || current_exec >= exec_pool_end {
             return None;
         }
@@ -8043,7 +8058,7 @@ unsafe fn publish_safe_attach_output(output: u64, device: u64) -> Result<(), i32
     if output >= FSD_POOL_VADDR + POOL_DATA_OFF && end <= component_pool_end() {
         let _pool_guard = component_pool_lock();
         let used_end = FSD_POOL_VADDR
-            .checked_add(read_volatile(FSD_POOL_VADDR as *const u64))
+            .checked_add(hosted_pool_used(FSD_POOL_VADDR))
             .filter(|used_end| *used_end <= component_pool_end())
             .ok_or(STATUS_INVALID_PARAMETER)?;
         let mut header = FSD_POOL_VADDR + POOL_DATA_OFF;
@@ -34520,7 +34535,7 @@ unsafe fn fsd_post_driver_entry(status: i32, drv: u64) {
     );
     write_volatile((FSD_SHARED_VADDR + SH_ADD_DEVICE) as *mut u64, add_device);
     // Pool high-water (diagnostic; not read by the executive — parity with the old inline entry).
-    let pool_used = read_volatile(FSD_POOL_VADDR as *const u64);
+    let pool_used = hosted_pool_used(FSD_POOL_VADDR);
     write_volatile((FSD_SHARED_VADDR + SH_POOL_USED) as *mut u64, pool_used);
     print_str(b"[fsd-host] DriverEntry returned status=0x");
     print_hex(status as u32);

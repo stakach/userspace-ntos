@@ -120,7 +120,7 @@ unsafe fn allocation(
     address: u64,
 ) -> Result<SourcePoolAllocationIdentity, nt_status::NtStatus> {
     validate_arena(inst)?;
-    let used = read_volatile(inst.exec_pool_va as *const u64);
+    let used = hosted_pool_used(inst.exec_pool_va);
     if used < POOL_DATA_OFF || used > FSD_POOL_FRAMES * 0x1000 {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
@@ -176,7 +176,7 @@ unsafe fn allocation_containing(
     if bytes == 0 {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
-    let used = read_volatile(inst.exec_pool_va as *const u64);
+    let used = hosted_pool_used(inst.exec_pool_va);
     if used < POOL_DATA_OFF || used > FSD_POOL_FRAMES * 0x1000 {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
