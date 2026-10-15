@@ -1074,6 +1074,7 @@ pub const FSD_DISPATCH_DRIVER_REINIT: u64 = u64::MAX - 0x782;
 pub const FSD_DISPATCH_CLASS_LOWER_ALIAS: u64 = u64::MAX - 0x783;
 pub const FSD_DISPATCH_REVERSE_CLASS_ALIAS: u64 = u64::MAX - 0x784;
 
+const HOSTED_INTERRUPT_OP_PROVISION: u64 = 0;
 const HOSTED_INTERRUPT_OP_CONNECT: u64 = 1;
 const HOSTED_INTERRUPT_OP_DISCONNECT: u64 = 2;
 const HOSTED_INTERRUPT_OP_ACQUIRE_LOCK: u64 = 3;
@@ -1171,6 +1172,7 @@ const HOSTED_IRP_START_IO_SELECTING: u64 = 19;
 struct PendingIrp {
     irp: u64,
     file_object: u64,
+    created_file_storage: Option<hosted_file_objects::CreatedFileStorage>,
     data: u64,
     aux_data: u64,
     mdl: u64,
@@ -2190,13 +2192,31 @@ unsafe fn tombstone_pending_irp_owner(node: u64, consuming_state: u64) {
     }
 }
 
+unsafe fn source_irp_release_disposition(entry: PendingIrp, member: u64) -> Option<(u64, u64)> {
+    let (words, status, first, second, _) = call_on4_raw(
+        (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
+        12,
+        entry.source_ticket_id,
+        entry.source_ticket_generation,
+        member,
+    );
+    (words == 3 && status as u32 as i32 == STATUS_SUCCESS).then_some((first, second))
+}
+
+unsafe fn free_pre_entry_created_file_storage(
+    storage: hosted_file_objects::CreatedFileStorage,
+) {
+    // Ownership is entered into the component store before either member is released.
+    let _retired = hosted_file_objects::retire_created_file_storage(storage);
+}
+
 unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
     if entry.source_ticket_id != 0 && entry.major as u64 == IRP_MJ_PNP
         && entry.minor as u64 == IRP_MN_START_DEVICE
     {
     }
     if entry.source_ticket_id != 0 {
-        let (words, status, member_count, replacement_address, _) = call_on4_raw(
+        let (words, status, mut member_count, mut replacement_address, _) = call_on4_raw(
             (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
             7,
             entry.source_ticket_id,
@@ -2204,10 +2224,13 @@ unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
             entry.irp,
         );
         if words != 3 || status as u32 as i32 != STATUS_SUCCESS {
-            crate::provider_bugcheck::report(
-                0xc4,
-                [FSD_SERVICE_SOURCE_IRP_LABEL, 7, entry.irp, status],
-            );
+            let Some((count, replacement)) = source_irp_release_disposition(entry, 12) else {
+                crate::provider_bugcheck::report(
+                    0xc4, [FSD_SERVICE_SOURCE_IRP_LABEL, 7, entry.irp, status],
+                );
+            };
+            member_count = count;
+            replacement_address = replacement;
         }
         if member_count == 0 || member_count > 10 {
             crate::provider_bugcheck::report(
@@ -2224,10 +2247,11 @@ unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
                 index,
             );
             if words != 3 || status as u32 as i32 != STATUS_SUCCESS {
-                crate::provider_bugcheck::report(
-                    0xc4,
-                    [FSD_SERVICE_SOURCE_IRP_LABEL, 9, index, status],
-                );
+                if source_irp_release_disposition(entry, index) != Some((1, 0)) {
+                    crate::provider_bugcheck::report(
+                        0xc4, [FSD_SERVICE_SOURCE_IRP_LABEL, 9, index, status],
+                    );
+                }
             }
         }
         if replacement_address != 0 {
@@ -2239,15 +2263,12 @@ unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
                 replacement_address,
             );
             if words != 3 || status as u32 as i32 != STATUS_SUCCESS {
-                crate::provider_bugcheck::report(
-                    0xc4,
-                    [
-                        FSD_SERVICE_SOURCE_IRP_LABEL,
-                        10,
-                        replacement_address,
-                        status,
-                    ],
-                );
+                if source_irp_release_disposition(entry, 10) != Some((1, 0)) {
+                    crate::provider_bugcheck::report(
+                        0xc4,
+                        [FSD_SERVICE_SOURCE_IRP_LABEL, 10, replacement_address, status],
+                    );
+                }
             }
         }
         let (words, status, _, _, _) = call_on4_raw(
@@ -2258,17 +2279,43 @@ unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
             entry.irp,
         );
         if words != 3 || status as u32 as i32 != STATUS_SUCCESS {
-            crate::provider_bugcheck::report(
-                0xc4,
-                [FSD_SERVICE_SOURCE_IRP_LABEL, 8, entry.irp, status],
+            if source_irp_release_disposition(entry, 11) != Some((1, 0)) {
+                crate::provider_bugcheck::report(
+                    0xc4, [FSD_SERVICE_SOURCE_IRP_LABEL, 8, entry.irp, status],
+                );
+            }
+        }
+        let (words, status, _, _, _) = call_on4_raw(
+            (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
+            13,
+            entry.source_ticket_id,
+            entry.source_ticket_generation,
+            0,
+        );
+        if words != 3 || status as u32 as i32 != STATUS_SUCCESS {
+            // Receipt disposal is metadata only and idempotent for this exact ticket.
+            let (retry_words, retry_status, _, _, _) = call_on4_raw(
+                (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
+                13,
+                entry.source_ticket_id,
+                entry.source_ticket_generation,
+                0,
             );
+            if retry_words != 3 || retry_status as u32 as i32 != STATUS_SUCCESS {
+                crate::provider_bugcheck::report(
+                    0xc4, [FSD_SERVICE_SOURCE_IRP_LABEL, 13, entry.irp, retry_status],
+                );
+            }
         }
     } else {
         // No root ticket exists yet; the constructor still owns this local graph.
         for allocation in entry.allocation_graph().allocations() {
             match allocation.release_kind {
                 nt_io_manager::pending_irp_graph::GraphReleaseKind::FileStorage => {
-                    hosted_file_objects::free_file_storage(allocation.pointer);
+                    let storage = entry.created_file_storage
+                        .expect("unticketed File release lost its constructor allocation receipt");
+                    assert_eq!(storage.file, allocation.pointer);
+                    hosted_file_objects::retire_created_file_storage(storage);
                 }
                 nt_io_manager::pending_irp_graph::GraphReleaseKind::Pool => {
                     pool_free(allocation.pointer);
@@ -2946,6 +2993,12 @@ unsafe fn pool_free_exact(p: u64, generation: u64) -> bool {
         && component_pool_allocation_capacity(p).is_some()
         && read_volatile((p - 8) as *const u64) == generation
         && pool_free_locked(p)
+}
+
+unsafe fn component_pool_allocation_generation(p: u64) -> Option<u64> {
+    component_pool_allocation_capacity(p)?;
+    let generation = read_volatile((p - 8) as *const u64);
+    (generation != 0).then_some(generation)
 }
 
 unsafe fn pool_free_locked(p: u64) -> bool {
@@ -4045,6 +4098,14 @@ unsafe fn hosted_instance_pool_alloc(inst: DriverInstance, size: u64) -> Option<
         return None;
     }
     let _guard = hosted_instance_pool_lock(inst.exec_pool_va)?;
+    hosted_instance_pool_alloc_unlocked(inst, size)
+}
+
+/// Caller holds the shared pool lock, allowing allocation and owner publication to be atomic.
+unsafe fn hosted_instance_pool_alloc_unlocked(inst: DriverInstance, size: u64) -> Option<u64> {
+    if inst.exec_pool_va == 0 || size == 0 {
+        return None;
+    }
     let pool_bytes = FSD_POOL_FRAMES.checked_mul(0x1000)?;
     let exec_pool_end = inst.exec_pool_va.checked_add(pool_bytes)?;
     let component_pool_end = component_pool_end();
@@ -10464,9 +10525,19 @@ extern "win64" fn s_io_connect_interrupt(
             );
             return status;
         }
-        let projection = pool_alloc_zeroed(HOSTED_KINTERRUPT_SIZE);
-        if projection == 0 {
-            let status = 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
+        let (_label, provision_status, projection, _pool_generation, _) = call_on4(
+            (FSD_SERVICE_INTERRUPT_LABEL << 12) | 2,
+            HOSTED_INTERRUPT_OP_PROVISION,
+            0,
+            0,
+            0,
+        );
+        if provision_status as u32 as i32 != STATUS_SUCCESS || projection == 0 {
+            let status = if provision_status as u32 as i32 == STATUS_SUCCESS {
+                0xC000_009Au32 as i32 // STATUS_INSUFFICIENT_RESOURCES
+            } else {
+                provision_status as u32 as i32
+            };
             trace_hosted_io_connect_interrupt(
                 interrupt_obj_out as u64,
                 service_routine,
@@ -10554,7 +10625,8 @@ extern "win64" fn s_io_connect_interrupt(
                 (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
                 0,
             );
-            pool_free(projection);
+            // Root retains the exact provisioned allocation while a failed or uncertain
+            // connection is reconciled. Component-local free has no ownership authority.
             trace_hosted_io_connect_interrupt(
                 interrupt_obj_out as u64,
                 service_routine,
@@ -10641,7 +10713,6 @@ extern "win64" fn s_io_disconnect_interrupt(pkinterrupt: u64) {
                 0,
             );
             clear_dpc_diagnostics(FSD_SHARED_VADDR);
-            pool_free(pkinterrupt);
         }
     }
 }
@@ -10704,38 +10775,43 @@ fn project_hosted_dma_adapter(
         {
             return 0;
         }
-        let adapter_id = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_ID) as *const u64);
-        let grant_va = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_VA) as *const u64);
-        let grant_len = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LEN) as *const u64);
-        let grant_logical = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LOGICAL) as *const u64);
-        if adapter_id == 0
-            || adapter_id != granted_adapter_id
+        let (_label, pair_status, adapter, ops, pair_lease_id) = call_on5(
+            (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+            granted_lease_id,
+            HOSTED_DMA_SERVICE_PROVISION_ADAPTER << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+            0, 0, 0,
+        );
+        if pair_status as u32 as i32 != STATUS_SUCCESS
+            || pair_lease_id != granted_lease_id
+            || adapter == 0 || ops == 0 || adapter == ops
+        {
+            return 0;
+        }
+        let (_label, grant_status, grant_va, grant_len, grant_logical) = call_on5(
+            (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+            granted_lease_id,
+            HOSTED_DMA_SERVICE_QUERY_GRANT << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+            0, 0, 0,
+        );
+        let adapter_id = granted_adapter_id;
+        if grant_status as u32 as i32 != STATUS_SUCCESS
             || grant_va == 0
             || grant_len == 0
             || grant_logical == 0
         {
             return 0;
         }
-        let active_adapter = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *const u64);
-        if dma_adapter_blob_matches(active_adapter, adapter_id)
-            && read_unaligned((active_adapter + HOSTED_DMA_ADAPTER_LEASE_ID_OFFSET) as *const u64)
+        if dma_adapter_blob_matches(adapter, adapter_id)
+            && read_unaligned((adapter + HOSTED_DMA_ADAPTER_LEASE_ID_OFFSET) as *const u64)
                 == granted_lease_id
         {
             if !number_of_map_registers.is_null() {
                 write_unaligned(number_of_map_registers, granted_map_registers as u32);
             }
-            return active_adapter;
+            return adapter;
         }
 
-        let ops = pool_alloc(0x100);
-        if ops == 0 {
-            return 0;
-        }
-        let adapter = pool_alloc(HOSTED_DMA_ADAPTER_SIZE);
-        if adapter == 0 {
-            pool_free(ops);
-            return 0;
-        }
+        // The root returned both exact addresses for this authenticated lease.
 
         // DMA_OPERATIONS: publish the NT5 WDM operations needed by NDIS bus-master DMA. Later
         // post-NT5 extended entries stay NULL and therefore fail closed if a driver requires them.
@@ -10844,16 +10920,12 @@ fn project_hosted_dma_adapter(
 /// `PutDmaAdapter` — release the component-local adapter projection.
 extern "win64" fn s_dma_put_adapter(adapter: u64) {
     unsafe {
-        if dma_adapter_blob_id(adapter).is_none() {
-            return;
-        }
-        let lease_id = read_unaligned((adapter + HOSTED_DMA_ADAPTER_LEASE_ID_OFFSET) as *const u64);
-        if lease_id == 0 {
+        if adapter == 0 {
             return;
         }
         let (_label, status, _, _, _) = call_on5(
             (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
-            lease_id,
+            adapter,
             HOSTED_DMA_SERVICE_RELEASE_ADAPTER << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
             0,
             0,
@@ -10863,15 +10935,6 @@ extern "win64" fn s_dma_put_adapter(adapter: u64) {
             return;
         }
         let active = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *const u64);
-        let ops = read_unaligned((adapter + HOSTED_DMA_ADAPTER_OPS_OFFSET) as *const u64);
-        write_unaligned(
-            (adapter + HOSTED_DMA_ADAPTER_SIGNATURE_OFFSET) as *mut u64,
-            0,
-        );
-        pool_free(adapter);
-        if ops != 0 {
-            pool_free(ops);
-        }
         if adapter == active {
             write_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *mut u64, 0);
             write_volatile((FSD_SHARED_VADDR + SH_DMA_OPS_BLOB) as *mut u64, 0);
@@ -10897,6 +10960,16 @@ const HOSTED_DMA_SERVICE_OPERATION_SHIFT: u64 = 56;
 const HOSTED_DMA_SERVICE_OPERATION_MASK: u64 = 0xff << HOSTED_DMA_SERVICE_OPERATION_SHIFT;
 const HOSTED_DMA_SERVICE_REQUEST_ADAPTER: u64 = 1;
 const HOSTED_DMA_SERVICE_RELEASE_ADAPTER: u64 = 2;
+const HOSTED_DMA_SERVICE_PROVISION_ADAPTER: u64 = 3;
+const HOSTED_DMA_SERVICE_QUERY_GRANT: u64 = 4;
+const HOSTED_DMA_SERVICE_ALLOC_MAP: u64 = 5;
+const HOSTED_DMA_SERVICE_ALLOC_SG_GET: u64 = 6;
+const HOSTED_DMA_SERVICE_ALLOC_SG_BUILD: u64 = 7;
+const HOSTED_DMA_SERVICE_MAP_TRANSFER: u64 = 8;
+const HOSTED_DMA_SERVICE_FREE_MAP: u64 = 9;
+const HOSTED_DMA_SERVICE_PUT_SG: u64 = 10;
+const HOSTED_DMA_SERVICE_QUERY_SG: u64 = 11;
+static HOSTED_DMA_PRIVATE_REQUEST_NEXT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 struct HostedDmaAdapterMetadata {
@@ -11295,6 +11368,66 @@ unsafe fn dma_copy_bytes(dst: u64, src: u64, len: u64) {
     }
 }
 
+unsafe fn dma_allocate_private_graph(
+    adapter: u64, operation: u64, argument: u64, size: u64,
+) -> Option<(u64, u64, u64)> {
+    let request_id = HOSTED_DMA_PRIVATE_REQUEST_NEXT.fetch_add(1, Ordering::AcqRel)
+        .checked_add(1)?;
+    let (_label, status, map, context, list) = call_on5(
+        (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+        adapter,
+        operation << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+        request_id, argument, size,
+    );
+    (status as u32 as i32 == STATUS_SUCCESS && map != 0).then_some((map, context, list))
+}
+
+unsafe fn dma_retire_map_token(adapter: u64, map: u64) -> bool {
+    let (_label, status, _, _, _) = call_on5(
+        (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+        adapter,
+        HOSTED_DMA_SERVICE_FREE_MAP << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+        map, 0, 0,
+    );
+    status as u32 as i32 == STATUS_SUCCESS
+}
+
+unsafe fn dma_retire_sg_list(adapter: u64, list: u64) -> bool {
+    let (_label, status, _, _, _) = call_on5(
+        (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+        adapter,
+        HOSTED_DMA_SERVICE_PUT_SG << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+        list, 0, 0,
+    );
+    status as u32 as i32 == STATUS_SUCCESS
+}
+
+unsafe fn dma_query_sg_members(adapter: u64, list: u64) -> Option<(u64, u64)> {
+    let (_label, status, map, context, _) = call_on5(
+        (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+        adapter,
+        HOSTED_DMA_SERVICE_QUERY_SG << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+        list, 0, 0,
+    );
+    (status as u32 as i32 == STATUS_SUCCESS && map != 0 && context != 0)
+        .then_some((map, context))
+}
+
+unsafe fn dma_clear_records_for_map(map_register_base: u64) {
+    let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
+    let mut i = 0u64;
+    while i < capacity {
+        if let Some(record) = dma_allocation_record(FSD_SHARED_VADDR, i) {
+            let kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
+            let token = read_volatile((record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *const u64);
+            if kind == HOSTED_DMA_RECORD_KIND_MAP_TRANSFER && token == map_register_base {
+                clear_dma_allocation_record(record);
+            }
+        }
+        i += 1;
+    }
+}
+
 extern "win64" fn s_dma_allocate_adapter_channel(
     adapter: u64,
     device_object: u64,
@@ -11310,7 +11443,7 @@ extern "win64" fn s_dma_allocate_adapter_channel(
         {
             return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
         }
-        let map_register = dma_allocate_map_register_token(number_of_map_registers);
+        let map_register = dma_allocate_map_register_token(adapter, number_of_map_registers);
         if map_register == 0 {
             return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
         }
@@ -11320,7 +11453,7 @@ extern "win64" fn s_dma_allocate_adapter_channel(
         ) as u32;
         if action == 2 {
             // DeallocateObject: the caller did not retain the map-register token.
-            pool_free(map_register);
+            let _ = dma_retire_map_token(adapter, map_register);
         }
         0
     }
@@ -11475,6 +11608,21 @@ extern "win64" fn s_dma_map_transfer(
         } else {
             core::ptr::write_bytes(bounce_va as *mut u8, 0, mapped_len as usize);
         }
+        if map_register_base & HOSTED_DMA_SERVICE_OPERATION_MASK != 0 {
+            write_unaligned(length, 0);
+            return 0;
+        }
+        let (_label, mapped_status, mapping_id, _, _) = call_on5(
+            (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+            adapter,
+            (HOSTED_DMA_SERVICE_MAP_TRANSFER << HOSTED_DMA_SERVICE_OPERATION_SHIFT)
+                | map_register_base,
+            logical, bounce_va, mapped_len,
+        );
+        if mapped_status as u32 as i32 != STATUS_SUCCESS || mapping_id == 0 {
+            write_unaligned(length, 0);
+            return 0;
+        }
         write_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *mut u64, logical);
         write_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *mut u64, mapped_len);
         write_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *mut u64, bounce_va);
@@ -11579,7 +11727,7 @@ extern "win64" fn s_dma_flush_adapter_buffers(
 }
 
 extern "win64" fn s_dma_free_map_registers(
-    _adapter: u64,
+    adapter: u64,
     map_register_base: u64,
     _number_of_map_registers: u32,
 ) {
@@ -11587,22 +11735,10 @@ extern "win64" fn s_dma_free_map_registers(
         if map_register_base == 0 {
             return;
         }
-        let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
-        let mut i = 0u64;
-        while i < capacity {
-            if let Some(record) = dma_allocation_record(FSD_SHARED_VADDR, i) {
-                let kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
-                let token =
-                    read_volatile((record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *const u64);
-                if kind == HOSTED_DMA_RECORD_KIND_MAP_TRANSFER && token == map_register_base {
-                    clear_dma_allocation_record(record);
-                }
-            }
-            i += 1;
+        if !dma_retire_map_token(adapter, map_register_base) {
+            return;
         }
-        if read_unaligned(map_register_base as *const u64) == HOSTED_DMA_MAP_REGISTER_SIGNATURE {
-            pool_free(map_register_base);
-        }
+        dma_clear_records_for_map(map_register_base);
     }
 }
 
@@ -11625,14 +11761,14 @@ const HOSTED_SG_CONTEXT_LIST_OWNED: u64 = 0x29;
 const HOSTED_SG_LIST_SIZE_ONE: u64 = 0x28;
 const HOSTED_SG_ELEMENT_OFFSET: u64 = 0x10;
 
-unsafe fn dma_allocate_map_register_token(number_of_map_registers: u32) -> u64 {
+unsafe fn dma_allocate_map_register_token(adapter: u64, number_of_map_registers: u32) -> u64 {
     if number_of_map_registers == 0 || number_of_map_registers > 64 {
         return 0;
     }
-    let map_register = pool_alloc_zeroed(0x20);
-    if map_register == 0 {
-        return 0;
-    }
+    let Some((map_register, _, _)) = dma_allocate_private_graph(
+        adapter, HOSTED_DMA_SERVICE_ALLOC_MAP, number_of_map_registers as u64, 0,
+    ) else { return 0; };
+    core::ptr::write_bytes(map_register as *mut u8, 0, 0x20);
     write_unaligned(map_register as *mut u64, HOSTED_DMA_MAP_REGISTER_SIGNATURE);
     write_unaligned((map_register + 8) as *mut u32, number_of_map_registers);
     map_register
@@ -11646,8 +11782,11 @@ unsafe fn dma_prepare_one_element_sg_list(
     write_to_device: u8,
     sg_list: u64,
     list_owned: u8,
+    map_register: u64,
+    sg_context: u64,
 ) -> i32 {
-    if length == 0 || sg_list == 0 || dma_active_adapter_and_grant(adapter).is_none() {
+    if length == 0 || sg_list == 0 || map_register == 0 || sg_context == 0
+        || dma_active_adapter_and_grant(adapter).is_none() {
         trace_hosted_dma_sg(
             b"prepare",
             b"bad-input",
@@ -11662,29 +11801,10 @@ unsafe fn dma_prepare_one_element_sg_list(
         );
         return STATUS_INVALID_PARAMETER;
     }
-    let map_register = dma_allocate_map_register_token(1);
-    let sg_context = pool_alloc_zeroed(HOSTED_SG_CONTEXT_SIZE);
-    if map_register == 0 || sg_context == 0 {
-        if map_register != 0 {
-            pool_free(map_register);
-        }
-        if sg_context != 0 {
-            pool_free(sg_context);
-        }
-        trace_hosted_dma_sg(
-            b"prepare",
-            b"alloc-failed",
-            STATUS_INSUFFICIENT_RESOURCES,
-            adapter,
-            mdl,
-            current_va,
-            length,
-            sg_list,
-            map_register,
-            0,
-        );
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
+    core::ptr::write_bytes(map_register as *mut u8, 0, 0x20);
+    core::ptr::write_bytes(sg_context as *mut u8, 0, HOSTED_SG_CONTEXT_SIZE as usize);
+    write_unaligned(map_register as *mut u64, HOSTED_DMA_MAP_REGISTER_SIGNATURE);
+    write_unaligned((map_register + 8) as *mut u32, 1);
     let mut mapped_len = length;
     let logical = s_dma_map_transfer(
         adapter,
@@ -11695,8 +11815,6 @@ unsafe fn dma_prepare_one_element_sg_list(
         write_to_device,
     ) as u64;
     if logical == 0 || mapped_len == 0 {
-        pool_free(sg_context);
-        pool_free(map_register);
         trace_hosted_dma_sg(
             b"prepare",
             b"map-failed",
@@ -11786,8 +11904,9 @@ extern "win64" fn s_dma_get_scatter_gather_list(
             );
             return STATUS_INVALID_PARAMETER;
         }
-        let sg_list = pool_alloc_zeroed(HOSTED_SG_LIST_SIZE_ONE);
-        if sg_list == 0 {
+        let Some((map_register, sg_context, sg_list)) = dma_allocate_private_graph(
+            adapter, HOSTED_DMA_SERVICE_ALLOC_SG_GET, 0, 0,
+        ) else {
             trace_hosted_dma_sg(
                 b"get",
                 b"list-alloc-failed",
@@ -11801,7 +11920,8 @@ extern "win64" fn s_dma_get_scatter_gather_list(
                 0,
             );
             return STATUS_INSUFFICIENT_RESOURCES;
-        }
+        };
+        core::ptr::write_bytes(sg_list as *mut u8, 0, HOSTED_SG_LIST_SIZE_ONE as usize);
         let status = dma_prepare_one_element_sg_list(
             adapter,
             mdl,
@@ -11810,9 +11930,11 @@ extern "win64" fn s_dma_get_scatter_gather_list(
             write_to_device,
             sg_list,
             1,
+            map_register,
+            sg_context,
         );
         if status != 0 {
-            pool_free(sg_list);
+            let _ = dma_retire_sg_list(adapter, sg_list);
             trace_hosted_dma_sg(
                 b"get",
                 b"prepare-failed",
@@ -11892,6 +12014,13 @@ extern "win64" fn s_dma_build_scatter_gather_list(
         if scatter_gather_length < HOSTED_SG_LIST_SIZE_ONE as u32 {
             return 0xC000_0023u32 as i32; // STATUS_BUFFER_TOO_SMALL
         }
+        let Some((map_register, sg_context, list)) = dma_allocate_private_graph(
+            adapter, HOSTED_DMA_SERVICE_ALLOC_SG_BUILD,
+            scatter_gather_buffer, scatter_gather_length as u64,
+        ) else { return STATUS_INSUFFICIENT_RESOURCES; };
+        if list != scatter_gather_buffer {
+            return STATUS_INVALID_HANDLE;
+        }
         let status = dma_prepare_one_element_sg_list(
             adapter,
             mdl,
@@ -11900,8 +12029,11 @@ extern "win64" fn s_dma_build_scatter_gather_list(
             write_to_device,
             scatter_gather_buffer,
             0,
+            map_register,
+            sg_context,
         );
         if status != 0 {
+            let _ = dma_retire_sg_list(adapter, scatter_gather_buffer);
             return status;
         }
         call_hosted_pe(
@@ -11935,20 +12067,13 @@ extern "win64" fn s_dma_put_scatter_gather_list(
         if scatter_gather == 0 {
             return;
         }
-        let sg_context = read_unaligned((scatter_gather + 8) as *const u64);
-        if sg_context == 0
-            || read_unaligned(sg_context as *const u64) != HOSTED_SG_CONTEXT_SIGNATURE
-        {
-            return;
-        }
-        let map_register =
-            read_unaligned((sg_context + HOSTED_SG_CONTEXT_MAP_REGISTER) as *const u64);
+        let Some((map_register, sg_context)) = dma_query_sg_members(adapter, scatter_gather)
+        else { return; };
         let mdl = read_unaligned((sg_context + HOSTED_SG_CONTEXT_MDL) as *const u64);
         let current_va = read_unaligned((sg_context + HOSTED_SG_CONTEXT_CURRENT_VA) as *const u64);
         let length = read_unaligned((sg_context + HOSTED_SG_CONTEXT_LENGTH) as *const u32);
         let stored_write_to_device =
             read_unaligned((sg_context + HOSTED_SG_CONTEXT_WRITE_TO_DEVICE) as *const u8);
-        let list_owned = read_unaligned((sg_context + HOSTED_SG_CONTEXT_LIST_OWNED) as *const u8);
         let direction = if write_to_device != 0 {
             write_to_device
         } else {
@@ -11956,10 +12081,8 @@ extern "win64" fn s_dma_put_scatter_gather_list(
         };
         let _ =
             s_dma_flush_adapter_buffers(adapter, mdl, map_register, current_va, length, direction);
-        s_dma_free_map_registers(adapter, map_register, 1);
-        pool_free(sg_context);
-        if list_owned != 0 {
-            pool_free(scatter_gather);
+        if dma_retire_sg_list(adapter, scatter_gather) {
+            dma_clear_records_for_map(map_register);
         }
     }
 }
@@ -36069,6 +36192,7 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     if uses_file_object && fo == 0 {
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
+    let mut created_file_storage = None;
     if owns_fo {
         let Some(name_len) = create_file_name_len.checked_add(2) else {
             pool_free(fo);
@@ -36099,6 +36223,12 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
             pool_free(name);
             pool_free(fo);
             return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
+        }
+        created_file_storage = hosted_file_objects::capture_created_file_storage(fo);
+        if created_file_storage.is_none() {
+            pool_free(name);
+            pool_free(fo);
+            return (STATUS_INVALID_HANDLE, 0);
         }
     } else if uses_file_object {
         // The open's FILE_OBJECT: npfs owns its contents (FsContext/FsContext2/Flags/PrivateCacheMap
@@ -36135,7 +36265,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     let data = pool_alloc_zeroed(data_len);
     if data == 0 {
         if owns_fo {
-            hosted_file_objects::free_file_storage(fo);
+            free_pre_entry_created_file_storage(
+                created_file_storage.expect("CREATE lost its constructor storage"),
+            );
         }
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
@@ -36145,7 +36277,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         if aux_data == 0 {
             pool_free_request_buffers(data, 0, 0);
             if owns_fo {
-                hosted_file_objects::free_file_storage(fo);
+                free_pre_entry_created_file_storage(
+                    created_file_storage.expect("CREATE lost its constructor storage"),
+                );
             }
             return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
         }
@@ -36163,7 +36297,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     {
         pool_free_request_buffers(data, aux_data, 0);
         if owns_fo {
-            hosted_file_objects::free_file_storage(fo);
+            free_pre_entry_created_file_storage(
+                created_file_storage.expect("CREATE lost its constructor storage"),
+            );
         }
         return (0xC000_0001u32 as i32, 0); // STATUS_UNSUCCESSFUL
     }
@@ -36176,7 +36312,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         if aux_data == 0 {
             pool_free_request_buffers(data, 0, 0);
             if owns_fo {
-                hosted_file_objects::free_file_storage(fo);
+                free_pre_entry_created_file_storage(
+                    created_file_storage.expect("CREATE lost its constructor storage"),
+                );
             }
             return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
         }
@@ -36208,7 +36346,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     {
         pool_free_request_buffers(data, aux_data, 0);
         if owns_fo {
-            hosted_file_objects::free_file_storage(fo);
+            free_pre_entry_created_file_storage(
+                created_file_storage.expect("CREATE lost its constructor storage"),
+            );
         }
         return (0xC000_0001u32 as i32, 0); // STATUS_UNSUCCESSFUL
     }
@@ -36222,7 +36362,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         if mdl == 0 {
             pool_free_request_buffers(data, aux_data, 0);
             if owns_fo {
-                hosted_file_objects::free_file_storage(fo);
+                free_pre_entry_created_file_storage(
+                    created_file_storage.expect("CREATE lost its constructor storage"),
+                );
             }
             return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
         }
@@ -36316,7 +36458,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     if irp == 0 {
         pool_free_request_buffers(data, aux_data, mdl);
         if owns_fo {
-            hosted_file_objects::free_file_storage(fo);
+            free_pre_entry_created_file_storage(
+                created_file_storage.expect("CREATE lost its constructor storage"),
+            );
         }
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
@@ -36345,7 +36489,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    hosted_file_objects::free_file_storage(fo);
+                    free_pre_entry_created_file_storage(
+                        created_file_storage.expect("CREATE lost its constructor storage"),
+                    );
                 }
                 return (0xC000_009Au32 as i32, 0);
             }
@@ -36356,7 +36502,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    hosted_file_objects::free_file_storage(fo);
+                    free_pre_entry_created_file_storage(
+                        created_file_storage.expect("CREATE lost its constructor storage"),
+                    );
                 }
                 return (0xC000_009Au32 as i32, 0);
             }
@@ -36390,7 +36538,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                     pool_free(irp);
                     pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
-                        hosted_file_objects::free_file_storage(fo);
+                        free_pre_entry_created_file_storage(
+                            created_file_storage.expect("CREATE lost its constructor storage"),
+                        );
                     }
                     return (0xC000_009Au32 as i32, 0);
                 }
@@ -36417,7 +36567,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                     pool_free(irp);
                     pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
-                        hosted_file_objects::free_file_storage(fo);
+                        free_pre_entry_created_file_storage(
+                            created_file_storage.expect("CREATE lost its constructor storage"),
+                        );
                     }
                     return (0xC000_009Au32 as i32, 0);
                 }
@@ -36487,7 +36639,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                     pool_free(irp);
                     pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
-                        hosted_file_objects::free_file_storage(fo);
+                        free_pre_entry_created_file_storage(
+                            created_file_storage.expect("CREATE lost its constructor storage"),
+                        );
                     }
                     return (STATUS_INVALID_PARAMETER, 0);
                 }
@@ -36530,7 +36684,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 pool_free(irp);
                 pool_free_request_buffers(data, 0, mdl);
                 if owns_fo {
-                    hosted_file_objects::free_file_storage(fo);
+                    free_pre_entry_created_file_storage(
+                        created_file_storage.expect("CREATE lost its constructor storage"),
+                    );
                 }
                 return (0xC000_009Au32 as i32, 0);
             }
@@ -36558,7 +36714,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    hosted_file_objects::free_file_storage(fo);
+                    free_pre_entry_created_file_storage(
+                        created_file_storage.expect("CREATE lost its constructor storage"),
+                    );
                 }
                 return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
             }
@@ -36569,7 +36727,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                     pool_free(irp);
                     pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
-                        hosted_file_objects::free_file_storage(fo);
+                        free_pre_entry_created_file_storage(
+                            created_file_storage.expect("CREATE lost its constructor storage"),
+                        );
                     }
                     return (0xC000_000Du32 as i32, 0);
                 };
@@ -36581,7 +36741,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                     pool_free(irp);
                     pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
-                        hosted_file_objects::free_file_storage(fo);
+                        free_pre_entry_created_file_storage(
+                            created_file_storage.expect("CREATE lost its constructor storage"),
+                        );
                     }
                     return (0xC000_000Du32 as i32, 0);
                 };
@@ -36590,7 +36752,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                     pool_free(irp);
                     pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
-                        hosted_file_objects::free_file_storage(fo);
+                        free_pre_entry_created_file_storage(
+                            created_file_storage.expect("CREATE lost its constructor storage"),
+                        );
                     }
                     return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
                 }
@@ -36627,7 +36791,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    hosted_file_objects::free_file_storage(fo);
+                    free_pre_entry_created_file_storage(
+                        created_file_storage.expect("CREATE lost its constructor storage"),
+                    );
                 }
                 return (STATUS_INVALID_PARAMETER, 0);
             }
@@ -36644,7 +36810,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    hosted_file_objects::free_file_storage(fo);
+                    free_pre_entry_created_file_storage(
+                        created_file_storage.expect("CREATE lost its constructor storage"),
+                    );
                 }
                 return (STATUS_INVALID_PARAMETER, 0);
             }
@@ -36657,7 +36825,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    hosted_file_objects::free_file_storage(fo);
+                    free_pre_entry_created_file_storage(
+                        created_file_storage.expect("CREATE lost its constructor storage"),
+                    );
                 }
                 return (STATUS_INVALID_PARAMETER, 0);
             }
@@ -36677,7 +36847,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    hosted_file_objects::free_file_storage(fo);
+                    free_pre_entry_created_file_storage(
+                        created_file_storage.expect("CREATE lost its constructor storage"),
+                    );
                 }
                 return (STATUS_INVALID_PARAMETER, 0);
             }
@@ -36694,7 +36866,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    hosted_file_objects::free_file_storage(fo);
+                    free_pre_entry_created_file_storage(
+                        created_file_storage.expect("CREATE lost its constructor storage"),
+                    );
                 }
                 return (STATUS_INVALID_PARAMETER, 0);
             }
@@ -36717,7 +36891,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    hosted_file_objects::free_file_storage(fo);
+                    free_pre_entry_created_file_storage(
+                        created_file_storage.expect("CREATE lost its constructor storage"),
+                    );
                 }
                 return (STATUS_INVALID_PARAMETER, 0);
             }
@@ -36753,7 +36929,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         pool_free(irp);
         pool_free_request_buffers(data, aux_data, mdl);
         if owns_fo {
-            hosted_file_objects::free_file_storage(fo);
+            free_pre_entry_created_file_storage(
+                created_file_storage.expect("CREATE lost its constructor storage"),
+            );
         }
         return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
     }
@@ -36802,7 +36980,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         );
         pool_free_request_buffers(data, aux_data, mdl);
         if owns_fo {
-            hosted_file_objects::free_file_storage(fo);
+            free_pre_entry_created_file_storage(
+                created_file_storage.expect("CREATE lost its constructor storage"),
+            );
         }
         return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
     }
@@ -36830,6 +37010,7 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     let initial_owner = PendingIrp {
         irp,
         file_object: fo,
+        created_file_storage,
         data,
         aux_data,
         mdl,
@@ -36861,7 +37042,10 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     };
     // Publish the FileId -> FILE_OBJECT binding before entering the driver. A create handler may
     // complete or issue nested work inline, so registering after MajorFunction returns is too late.
-    let fo_registered = !owns_fo || fo_register(canonical_file_id, fo);
+    let fo_registered = !owns_fo || fo_register(
+        canonical_file_id,
+        created_file_storage.expect("CREATE lost its constructor storage"),
+    );
     if !fo_registered {
         let state = pending_irp_owner_state(owner_node).load(Ordering::Acquire);
         let consuming = hosted_irp_state_with_kind(state, HOSTED_IRP_CONSUMING);
@@ -47946,6 +48130,8 @@ enum HostedDmaPdoGeneration {
 struct HostedDmaAdapterLease {
     lease_id: u64,
     adapter_id: u64,
+    adapter_address: Option<u64>,
+    grant: Option<(u64, u64, u64)>,
     owner: DmaOwner,
     consumer_domain: HostedDomainIdentity,
     pdo_registration: nt_io_manager::HostedDevicePointerRegistration,
@@ -49395,6 +49581,8 @@ unsafe fn retain_hosted_dma_adapter_lease(
     leases.push(HostedDmaAdapterLease {
         lease_id,
         adapter_id,
+        adapter_address: None,
+        grant: None,
         owner,
         consumer_domain: binding.projection_domain,
         pdo_registration,
@@ -49405,12 +49593,14 @@ unsafe fn retain_hosted_dma_adapter_lease(
 
 unsafe fn release_hosted_dma_adapter_lease(
     consumer_domain: HostedDomainIdentity,
-    lease_id: u64,
+    inst: DriverInstance,
+    adapter_address: u64,
 ) -> Result<(), nt_status::NtStatus> {
     let leases = hosted_dma_adapter_leases_mut();
     let index = leases
         .iter()
-        .position(|lease| lease.lease_id == lease_id)
+        .position(|lease| lease.adapter_address == Some(adapter_address)
+            && lease.consumer_domain == consumer_domain)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let lease = leases[index];
     if lease.consumer_domain != consumer_domain
@@ -49425,16 +49615,67 @@ unsafe fn release_hosted_dma_adapter_lease(
     {
         return Err(nt_status::NtStatus::ACCESS_DENIED);
     }
-    hosted_dma_manager_mut()
-        .put_adapter_for_owner(lease.owner, lease.adapter_id)
-        .map_err(hosted_dma_status)?;
+    hosted_device_allocations::retire_dma_private_lease(inst, lease.lease_id, |mapping_id| {
+        hosted_dma_manager_mut().free_mapping_for_owner(lease.owner, mapping_id)
+            .map_err(hosted_dma_status)
+    })?;
+    hosted_device_allocations::retire_dma_adapter_pair(
+        inst, lease.lease_id, adapter_address,
+        || hosted_dma_manager_mut()
+            .put_adapter_for_owner(lease.owner, lease.adapter_id)
+            .map_err(hosted_dma_status),
+    )?;
     leases.remove(index);
     Ok(())
 }
 
-unsafe fn revoke_hosted_dma_adapter_leases(binding: HostedDeviceBinding) {
+/// A definite pre-publication allocation refusal owns no physical pair. Retain the lease if
+/// its local manager put refuses; no component pointer was ever handed out.
+unsafe fn release_unpublished_hosted_dma_adapter_lease(lease_id: u64) {
+    if hosted_device_allocations::has_dma_adapter_pair(lease_id) { return; }
+    let leases = hosted_dma_adapter_leases_mut();
+    let Some(index) = leases.iter().position(|lease| lease.lease_id == lease_id
+        && lease.adapter_address.is_none()) else { return; };
+    let lease = leases[index];
+    if hosted_dma_manager_mut()
+        .put_adapter_for_owner(lease.owner, lease.adapter_id).is_ok()
+    {
+        leases.remove(index);
+    }
+}
+
+unsafe fn revoke_hosted_dma_adapter_leases(
+    binding: HostedDeviceBinding,
+) -> Result<(), nt_status::NtStatus> {
     let owner = hosted_dma_owner(binding);
-    hosted_dma_adapter_leases_mut().retain(|lease| lease.owner != owner);
+    let inst = instance(binding.projection_instance)
+        .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    let mut index = 0;
+    while index < hosted_dma_adapter_leases_mut().len() {
+        let lease = hosted_dma_adapter_leases_mut()[index];
+        if lease.owner != owner {
+            index += 1;
+            continue;
+        }
+        if hosted_device_allocations::has_dma_adapter_pair(lease.lease_id) {
+            hosted_device_allocations::retire_dma_private_lease(inst, lease.lease_id, |mapping_id| {
+                hosted_dma_manager_mut().free_mapping_for_owner(lease.owner, mapping_id)
+                    .map_err(hosted_dma_status)
+            })?;
+            hosted_device_allocations::retire_dma_adapter_pair(
+                inst, lease.lease_id, lease.adapter_address.unwrap_or(0),
+                || hosted_dma_manager_mut()
+                    .put_adapter_for_owner(lease.owner, lease.adapter_id)
+                    .map_err(hosted_dma_status),
+            )?;
+        } else {
+            hosted_dma_manager_mut()
+                .put_adapter_for_owner(lease.owner, lease.adapter_id)
+                .map_err(hosted_dma_status)?;
+        }
+        hosted_dma_adapter_leases_mut().remove(index);
+    }
+    Ok(())
 }
 
 unsafe fn hosted_device_bindings_mut() -> &'static mut Vec<HostedDeviceBinding> {
@@ -51561,7 +51802,8 @@ unsafe fn finish_hosted_start_publication(irp_id: IrpId) -> Result<(), nt_status
             .mmio_usage_published = true;
     }
     if !interrupt_usage_published {
-        publish_hosted_interrupt_connection_from_shared(binding, sh)?;
+        let mut effect_started = false;
+        publish_hosted_interrupt_connection_from_shared(binding, sh, &mut effect_started)?;
         hosted_pnp_transactions_mut()
             .iter_mut()
             .find(|transaction| transaction.irp_id == irp_id)
@@ -53503,18 +53745,29 @@ unsafe fn retire_hosted_irq_connections_for_binding(
     binding: HostedDeviceBinding,
 ) -> Result<(), nt_status::NtStatus> {
     loop {
-        let Some(interrupt_id) = hosted_irq_connections().and_then(|connections| {
+        let Some(connection) = hosted_irq_connections().and_then(|connections| {
             connections
                 .iter()
                 .find(|connection| connection.binding == binding)
-                .map(|connection| connection.route.tokens.interrupt_id)
+                .copied()
         }) else {
             return retire_hosted_irq_lane_if_unreferenced(
                 binding.projection_instance,
                 binding.projection_domain,
             );
         };
-        retire_hosted_irq_connection(binding, interrupt_id)?;
+        let projection_inst = instance(binding.projection_instance)
+            .filter(|inst| instance_domain_identity(*inst) == Some(binding.projection_domain))
+            .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+        hosted_device_allocations::admit_interrupt_projection_canonical_retirement(
+            projection_inst, binding, connection.interrupt_object,
+            (connection.route.tokens.interrupt_id, connection.grant.grant_generation),
+        )?;
+        retire_hosted_irq_connection(binding, connection.route.tokens.interrupt_id)?;
+        hosted_device_allocations::mark_interrupt_projection_canonical_retired(
+            projection_inst, binding, connection.interrupt_object,
+            (connection.route.tokens.interrupt_id, connection.grant.grant_generation),
+        )?;
     }
 }
 
@@ -54294,7 +54547,7 @@ unsafe fn clear_hosted_resource_projection(
     }
     retire_hosted_device_port_caps(binding)?;
     let _ = hosted_resource_manager_mut().revoke_owner(hosted_resource_owner(binding));
-    revoke_hosted_dma_adapter_leases(binding);
+    revoke_hosted_dma_adapter_leases(binding)?;
     let _ = hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
     clear_shared_address_resources(sh);
     write_volatile((sh + SH_RESOURCE_PDO_OBJECT) as *mut u64, 0);
@@ -58336,6 +58589,14 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     if let Some(inst) = inst {
+        if !hosted_device_allocations::instance_ready_to_drain_dma_tombstones(inst) {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+        unsafe { hosted_device_allocations::drain_dma_adapter_tombstones(inst)? };
+        unsafe { hosted_device_allocations::drain_dma_private_tombstones(inst)? };
+        unsafe { hosted_device_allocations::drain_interrupt_projection_tombstones(inst)? };
+        hosted_device_allocations::drain_file_storage_acknowledgements(inst)?;
+        hosted_source_irp_ledger::drain_caller_terminal_acks(i)?;
         if !hosted_device_allocations::instance_quiesced(inst) {
             return Err(nt_status::NtStatus::DEVICE_BUSY);
         }
@@ -58795,7 +59056,7 @@ pub(crate) fn service_hosted_file(
             (status, object, 0, 0)
         };
     }
-    if !matches!(operation, 1..=3 | 9)
+    if !matches!(operation, 1..=3 | 9..=11)
         || file_id == 0
         || address == 0
         || address & 7 != 0
@@ -58803,7 +59064,7 @@ pub(crate) fn service_hosted_file(
             .checked_add(WDM_X64_FILE_OBJECT_SIZE as u64)
             .is_none()
         || (matches!(operation, 3 | 9) && request_id != 0)
-        || (matches!(operation, 1 | 2) && request_id == 0)
+        || (matches!(operation, 1 | 2 | 10 | 11) && request_id == 0)
     {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
     }
@@ -58927,6 +59188,12 @@ pub(crate) fn service_hosted_file(
         9 => unsafe {
             hosted_device_allocations::retire_file_storage(instance, file_id, address).map(|_| 0)
         },
+        10 => hosted_device_allocations::file_storage_retirement_disposition(
+            instance, file_id, address, request_id,
+        ),
+        11 => hosted_device_allocations::acknowledge_file_storage_retirement(
+            instance, file_id, address, request_id,
+        ).map(|_| 0),
         _ => unreachable!("validated File service operation"),
     };
     match result {
@@ -59024,8 +59291,157 @@ pub(crate) fn service_hosted_driver_dma_adapter(
         let Some(domain) = instance_domain_identity(inst) else {
             return (STATUS_ACCESS_DENIED, 0, 0, 0);
         };
-        return match unsafe { release_hosted_dma_adapter_lease(domain, pdo_object) } {
+        return match unsafe { release_hosted_dma_adapter_lease(domain, inst, pdo_object) } {
             Ok(()) => (STATUS_SUCCESS, 0, 0, 0),
+            Err(status) => (status.raw(), 0, 0, 0),
+        };
+    }
+    if operation == HOSTED_DMA_SERVICE_PROVISION_ADAPTER
+        || operation == HOSTED_DMA_SERVICE_QUERY_GRANT {
+        if words != [0; 4] || pdo_object == 0 {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
+        let Some((_instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        };
+        let Some(domain) = instance_domain_identity(inst) else {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        };
+        let lease = (unsafe { hosted_dma_adapter_leases_mut() }).iter().copied()
+            .find(|lease| lease.lease_id == pdo_object
+                && lease.consumer_domain == domain);
+        let Some(lease) = lease else {
+            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
+        };
+        if unsafe { io_manager_mut().hosted_device_pointer_registration(
+            lease.pdo_registration.domain(), lease.pdo_registration.address()) }
+            != Some(lease.pdo_registration)
+            || !unsafe { hosted_dma_pdo_generation_is_live(
+                lease.pdo_registration.device_id().raw(), lease.pdo_generation) }
+        {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        }
+        if operation == HOSTED_DMA_SERVICE_QUERY_GRANT {
+            return match lease.grant {
+                Some((va, len, logical)) => (STATUS_SUCCESS, va, len, logical),
+                None => (STATUS_DEVICE_NOT_READY, 0, 0, 0),
+            };
+        }
+        let (adapter, ops) = match unsafe {
+            hosted_device_allocations::provision_dma_adapter_pair(inst, lease.lease_id)
+        } {
+            Ok(pair) => pair,
+            Err(status) => {
+                unsafe { release_unpublished_hosted_dma_adapter_lease(lease.lease_id) };
+                return (status.raw(), 0, 0, 0);
+            }
+        };
+        let Some(current) = (unsafe { hosted_dma_adapter_leases_mut() })
+            .iter_mut().find(|current| current.lease_id == lease.lease_id
+                && current.consumer_domain == domain) else {
+            return (STATUS_INVALID_HANDLE, 0, 0, 0);
+        };
+        current.adapter_address = Some(adapter);
+        return (STATUS_SUCCESS, adapter, ops, lease.lease_id);
+    }
+    if matches!(operation,
+        HOSTED_DMA_SERVICE_ALLOC_MAP | HOSTED_DMA_SERVICE_ALLOC_SG_GET
+            | HOSTED_DMA_SERVICE_ALLOC_SG_BUILD | HOSTED_DMA_SERVICE_MAP_TRANSFER
+            | HOSTED_DMA_SERVICE_FREE_MAP | HOSTED_DMA_SERVICE_PUT_SG
+            | HOSTED_DMA_SERVICE_QUERY_SG)
+    {
+        let Some((_index, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        };
+        let Some(domain) = instance_domain_identity(inst) else {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        };
+        let Some(lease) = (unsafe { hosted_dma_adapter_leases_mut() }).iter().copied()
+            .find(|lease| lease.consumer_domain == domain
+                && lease.adapter_address == Some(pdo_object)) else {
+            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
+        };
+        if unsafe { io_manager_mut().hosted_device_pointer_registration(
+            lease.pdo_registration.domain(), lease.pdo_registration.address()) }
+            != Some(lease.pdo_registration)
+            || !unsafe { hosted_dma_pdo_generation_is_live(
+                lease.pdo_registration.device_id().raw(), lease.pdo_generation) }
+        {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        }
+        let result = match operation {
+            HOSTED_DMA_SERVICE_ALLOC_MAP | HOSTED_DMA_SERVICE_ALLOC_SG_GET
+                | HOSTED_DMA_SERVICE_ALLOC_SG_BUILD => {
+                let kind = match operation {
+                    HOSTED_DMA_SERVICE_ALLOC_MAP => hosted_device_allocations::DmaPrivateKind::Map,
+                    HOSTED_DMA_SERVICE_ALLOC_SG_GET => hosted_device_allocations::DmaPrivateKind::ScatterGatherOwned,
+                    _ => hosted_device_allocations::DmaPrivateKind::ScatterGatherBorrowed,
+                };
+                if words[1] == 0 || operation == HOSTED_DMA_SERVICE_ALLOC_MAP
+                    && (words[2] == 0 || words[2] > 64 || words[3] != 0)
+                    || operation == HOSTED_DMA_SERVICE_ALLOC_SG_GET
+                        && (words[2] != 0 || words[3] != 0)
+                    || operation == HOSTED_DMA_SERVICE_ALLOC_SG_BUILD
+                        && (words[2] == 0 || words[3] < HOSTED_SG_LIST_SIZE_ONE)
+                {
+                    return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+                }
+                let borrowed = if operation == HOSTED_DMA_SERVICE_ALLOC_SG_BUILD { words[2] } else { 0 };
+                unsafe { hosted_device_allocations::provision_dma_private_graph(
+                    inst, lease.lease_id, words[1], kind, borrowed) }
+            }
+            HOSTED_DMA_SERVICE_MAP_TRANSFER => {
+                let map = words[0];
+                let (logical, backing, length) = (words[1], words[2], words[3]);
+                let Some((grant_va, grant_len, grant_logical)) = lease.grant else {
+                    return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+                };
+                let valid = logical.checked_sub(grant_logical)
+                    .zip(backing.checked_sub(grant_va))
+                    .is_some_and(|(logical_offset, backing_offset)|
+                        logical_offset == backing_offset
+                        && length != 0 && logical_offset <= grant_len
+                        && length <= grant_len - logical_offset);
+                if !valid { return (STATUS_INVALID_PARAMETER, 0, 0, 0); }
+                return match unsafe { hosted_device_allocations::record_dma_private_mapping(
+                    inst, lease.lease_id, map, logical, backing, length,
+                    || hosted_dma_manager_mut().ensure_mapping_at(
+                        lease.owner, lease.adapter_id, logical, backing, length)
+                        .map(|mapping| mapping.mapping_id).map_err(hosted_dma_status),
+                ) } {
+                    Ok(mapping_id) => (STATUS_SUCCESS, mapping_id, 0, 0),
+                    Err(status) => (status.raw(), 0, 0, 0),
+                };
+            }
+            HOSTED_DMA_SERVICE_FREE_MAP | HOSTED_DMA_SERVICE_PUT_SG => {
+                if words[0] != 0 || words[1] == 0 || words[2] != 0 || words[3] != 0 {
+                    return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+                }
+                return match unsafe { hosted_device_allocations::retire_dma_private_graph(
+                    inst, lease.lease_id, words[1], operation == HOSTED_DMA_SERVICE_PUT_SG,
+                    |mapping_id| hosted_dma_manager_mut()
+                        .free_mapping_for_owner(lease.owner, mapping_id)
+                        .map_err(hosted_dma_status),
+                ) } {
+                    Ok(()) => (STATUS_SUCCESS, 0, 0, 0),
+                    Err(status) => (status.raw(), 0, 0, 0),
+                };
+            }
+            HOSTED_DMA_SERVICE_QUERY_SG => {
+                if words[0] != 0 || words[1] == 0 || words[2] != 0 || words[3] != 0 {
+                    return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+                }
+                return match unsafe { hosted_device_allocations::dma_private_sg_members(
+                    inst, lease.lease_id, words[1])
+                } {
+                    Ok((map, context)) => (STATUS_SUCCESS, map, context, 0),
+                    Err(status) => (status.raw(), 0, 0, 0),
+                };
+            }
+            _ => unreachable!(),
+        };
+        return match result {
+            Ok((map, context, list)) => (STATUS_SUCCESS, map, context, list),
             Err(status) => (status.raw(), 0, 0, 0),
         };
     }
@@ -59264,6 +59680,15 @@ pub(crate) fn service_hosted_driver_dma_adapter(
             return (status.raw(), 0, 0, 0);
         }
     };
+    let grant = (window.dma_va, window.dma_len, window.dma_logical);
+    let Some(lease) = (unsafe { hosted_dma_adapter_leases_mut() })
+        .iter_mut().find(|lease| lease.lease_id == lease_id) else {
+        return (STATUS_INVALID_HANDLE, 0, 0, 0);
+    };
+    if lease.grant.is_some_and(|existing| existing != grant) {
+        return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
+    }
+    lease.grant = Some(grant);
     (
         STATUS_SUCCESS,
         adapter.adapter_id,
@@ -59982,9 +60407,31 @@ pub(crate) fn service_hosted_driver_interrupt(
             grant_generation: 0,
         };
     }
+    if operation == HOSTED_INTERRUPT_OP_PROVISION {
+        if interrupt_object != 0 || old_irql != 0 {
+            return HostedDriverInterruptServiceResult::Reply {
+                status: STATUS_INVALID_PARAMETER,
+                interrupt_id: 0,
+                grant_generation: 0,
+            };
+        }
+        return match unsafe {
+            hosted_device_allocations::provision_interrupt_projection(inst, binding)
+        } {
+            Ok((address, pool_generation)) => HostedDriverInterruptServiceResult::Reply {
+                status: STATUS_SUCCESS,
+                interrupt_id: address,
+                grant_generation: pool_generation,
+            },
+            Err(status) => HostedDriverInterruptServiceResult::Reply {
+                status: status.raw(),
+                interrupt_id: 0,
+                grant_generation: 0,
+            },
+        };
+    }
     let sh = ch.shared_va;
-    let active = unsafe { read_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64) };
-    if interrupt_object == 0 || active != interrupt_object {
+    if interrupt_object == 0 {
         return HostedDriverInterruptServiceResult::Reply {
             status: STATUS_INVALID_PARAMETER,
             interrupt_id: 0,
@@ -59993,7 +60440,28 @@ pub(crate) fn service_hosted_driver_interrupt(
     }
     match operation {
         HOSTED_INTERRUPT_OP_CONNECT => unsafe {
-            match publish_hosted_interrupt_connection_from_shared(binding, sh) {
+            if hosted_device_allocations::validate_interrupt_projection(
+                inst, binding, interrupt_object,
+            ).is_err() {
+                return HostedDriverInterruptServiceResult::Reply {
+                    status: STATUS_INVALID_HANDLE,
+                    interrupt_id: 0,
+                    grant_generation: 0,
+                };
+            }
+            if read_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64)
+                != interrupt_object {
+                let status = hosted_device_allocations::cancel_prepared_interrupt_projection(
+                    inst, binding, interrupt_object,
+                ).err().map_or(STATUS_INVALID_HANDLE, |status| status.raw());
+                return HostedDriverInterruptServiceResult::Reply {
+                    status,
+                    interrupt_id: 0,
+                    grant_generation: 0,
+                };
+            }
+            let mut effect_started = false;
+            match publish_hosted_interrupt_connection_from_shared(binding, sh, &mut effect_started) {
                 Ok(()) => {
                     let interrupt_id = read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
                     let grant_generation = hosted_irq_connections()
@@ -60007,8 +60475,25 @@ pub(crate) fn service_hosted_driver_interrupt(
                         .map(|connection| connection.grant.grant_generation)
                         .unwrap_or(0);
                     if interrupt_id == 0 || grant_generation == 0 {
+                        if !effect_started {
+                            if let Err(status) = hosted_device_allocations::cancel_prepared_interrupt_projection(
+                                inst, binding, interrupt_object,
+                            ) {
+                                return HostedDriverInterruptServiceResult::Reply {
+                                    status: status.raw(), interrupt_id: 0, grant_generation: 0,
+                                };
+                            }
+                        }
                         HostedDriverInterruptServiceResult::Reply {
                             status: STATUS_INVALID_DEVICE_REQUEST,
+                            interrupt_id: 0,
+                            grant_generation: 0,
+                        }
+                    } else if let Err(status) = hosted_device_allocations::bind_interrupt_projection(
+                        inst, binding, interrupt_object, interrupt_id, grant_generation,
+                    ) {
+                        HostedDriverInterruptServiceResult::Reply {
+                            status: status.raw(),
                             interrupt_id: 0,
                             grant_generation: 0,
                         }
@@ -60020,33 +60505,57 @@ pub(crate) fn service_hosted_driver_interrupt(
                         }
                     }
                 }
-                Err(status) => HostedDriverInterruptServiceResult::Reply {
-                    status: status.raw(),
-                    interrupt_id: 0,
-                    grant_generation: 0,
+                Err(status) => {
+                    if !effect_started {
+                        if let Err(cancel_status) = hosted_device_allocations::cancel_prepared_interrupt_projection(
+                            inst, binding, interrupt_object,
+                        ) {
+                            return HostedDriverInterruptServiceResult::Reply {
+                                status: cancel_status.raw(), interrupt_id: 0, grant_generation: 0,
+                            };
+                        }
+                    }
+                    HostedDriverInterruptServiceResult::Reply {
+                        status: status.raw(),
+                        interrupt_id: 0,
+                        grant_generation: 0,
+                    }
                 },
             }
         },
         HOSTED_INTERRUPT_OP_DISCONNECT => unsafe {
-            let interrupt_id = read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
-            let connection_present = hosted_irq_connections().is_some_and(|connections| {
-                connections.iter().any(|connection| {
-                    connection.route.tokens.interrupt_id == interrupt_id
-                        && connection.binding == binding
+            let connection = hosted_irq_connections().and_then(|connections| {
+                connections.iter().copied().find(|connection| {
+                    connection.binding == binding
+                        && connection.interrupt_object == interrupt_object
                 })
             });
-            if interrupt_id == 0 || !connection_present {
+            let Some(connection) = connection else {
                 return HostedDriverInterruptServiceResult::Reply {
-                    status: STATUS_INVALID_DEVICE_REQUEST,
+                    status: STATUS_INVALID_HANDLE,
                     interrupt_id: 0,
                     grant_generation: 0,
                 };
-            }
-            if let Err(status) = retire_hosted_irq_connection(binding, interrupt_id) {
+            };
+            let identity = (connection.route.tokens.interrupt_id,
+                connection.grant.grant_generation);
+            if let Err(status) = hosted_device_allocations::admit_interrupt_projection_canonical_retirement(
+                inst, binding, interrupt_object, identity,
+            ) {
                 return HostedDriverInterruptServiceResult::Reply {
-                    status: status.raw(),
-                    interrupt_id: 0,
-                    grant_generation: 0,
+                    status: status.raw(), interrupt_id: 0, grant_generation: 0,
+                };
+            }
+            if let Err(status) = retire_hosted_irq_connection(binding, identity.0) {
+                return HostedDriverInterruptServiceResult::Reply {
+                    status: status.raw(), interrupt_id: 0, grant_generation: 0,
+                };
+            }
+            if let Err(status) = hosted_device_allocations::mark_interrupt_projection_canonical_retired(
+                inst, binding, interrupt_object, identity,
+            ) {
+                return HostedDriverInterruptServiceResult::Reply {
+                    status: status.raw(), interrupt_id: 0, grant_generation: 0,
                 };
             }
             write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
@@ -64266,15 +64775,32 @@ unsafe fn replay_hosted_dma_allocation_records(
                     if source_va == 0 || map_register == 0 {
                         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
                     }
-                    hosted_dma_manager_mut()
-                        .ensure_mapping_at(
-                            hosted_dma_owner(binding),
-                            dma_adapter_id,
-                            logical,
-                            va,
-                            len,
+                    let inst = instance(binding.projection_instance)
+                        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+                    let (lease_id, mapping_id) =
+                        hosted_device_allocations::dma_private_mapping_receipt(
+                            inst, map_register, logical, va, len,
+                        ).ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+                    let lease = hosted_dma_adapter_leases_mut().iter().copied()
+                        .find(|lease| lease.lease_id == lease_id)
+                        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+                    if lease.owner != hosted_dma_owner(binding)
+                        || lease.consumer_domain != binding.projection_domain
+                        || lease.adapter_id != dma_adapter_id
+                        || lease.grant != Some((dma_grant_va, dma_grant_len, dma_grant_logical))
+                        || hosted_device_pointer_registration(
+                            binding.projection_domain, binding.pdo_object,
+                            nt_io_manager::DeviceId(binding.pdo_device_id),
+                        )? != lease.pdo_registration
+                        || !hosted_dma_pdo_generation_is_live(
+                            binding.pdo_device_id, lease.pdo_generation,
                         )
-                        .map_err(hosted_dma_status)?;
+                        || !hosted_dma_manager_mut().mapping_matches(
+                            lease.owner, mapping_id, logical, va, len,
+                        )
+                    {
+                        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                    }
                 }
                 _ => return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
             }
@@ -64322,6 +64848,7 @@ unsafe fn record_hosted_mmio_usage(
 unsafe fn publish_hosted_interrupt_connection_from_shared(
     binding: HostedDeviceBinding,
     sh: u64,
+    effect_started: &mut bool,
 ) -> Result<(), nt_status::NtStatus> {
     let interrupt_object = read_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64);
     let service_routine = read_volatile((sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *const u64);
@@ -64337,6 +64864,9 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
     let projection_inst = instance(binding.projection_instance)
         .filter(|instance| instance_domain_identity(*instance) == Some(binding.projection_domain))
         .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    hosted_device_allocations::validate_interrupt_projection(
+        projection_inst, binding, interrupt_object,
+    )?;
     let projection = hosted_pool_allocation_exec_va(
         projection_inst.exec_pool_va,
         interrupt_object,
@@ -64395,7 +64925,19 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
             if projected_interrupt_id != 0 || projected_grant_generation != 0 {
                 return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
             }
+            let old_identity = (retiring.route.tokens.interrupt_id,
+                retiring.grant.grant_generation);
+            hosted_device_allocations::admit_interrupt_projection_canonical_retirement(
+                projection_inst, binding, retiring.interrupt_object, old_identity,
+            )?;
+            hosted_device_allocations::mark_interrupt_projection_effect_started(
+                projection_inst, binding, interrupt_object,
+            )?;
+            *effect_started = true;
             retire_hosted_irq_connection(binding, existing)?;
+            hosted_device_allocations::mark_interrupt_projection_canonical_retired(
+                projection_inst, binding, retiring.interrupt_object, old_identity,
+            )?;
             write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
             refresh_hosted_device_resource_state(binding, sh);
         }
@@ -64433,15 +64975,34 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
         refresh_hosted_device_resource_state(binding, sh);
-        return install_hosted_irq_connection(binding, tokens);
+        hosted_device_allocations::mark_interrupt_projection_effect_started(
+            projection_inst, binding, interrupt_object,
+        )?;
+        *effect_started = true;
+        install_hosted_irq_connection(binding, tokens)?;
+        return hosted_device_allocations::bind_interrupt_projection(
+            projection_inst, binding, interrupt_object, existing, grant_generation,
+        );
     }
 
     let interrupt_id = hosted_interrupt_resource_id(binding.device_id)
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     let owner = hosted_resource_owner(binding);
-    let connected_tokens = hosted_resource_manager_mut()
-        .connect_interrupt_exact(owner, interrupt_id, request)
-        .map_err(hosted_hal_status)?;
+    hosted_device_allocations::mark_interrupt_projection_effect_started(
+        projection_inst, binding, interrupt_object,
+    )?;
+    *effect_started = true;
+    let connected_tokens = match hosted_resource_manager_mut()
+        .connect_interrupt_exact(owner, interrupt_id, request) {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            // Every connect_interrupt_exact error precedes its first state mutation.
+            hosted_device_allocations::cancel_interrupt_projection_after_proven_no_effect(
+                projection_inst, binding, interrupt_object,
+            )?;
+            return Err(hosted_hal_status(error));
+        }
+    };
     let connected = connected_tokens.interrupt_id;
     if connected == 0 {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
@@ -64465,10 +65026,18 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
             Ok(()) | Err(HalError::StaleId) => {}
             Err(error) => return Err(hosted_hal_status(error)),
         }
+        // There is no installed root connection, and exact resource-manager rollback
+        // acknowledged absence. The escaped projection remains a tombstone for ABA safety.
+        hosted_device_allocations::cancel_interrupt_projection_after_proven_no_effect(
+            projection_inst, binding, interrupt_object,
+        )?;
         write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
         refresh_hosted_device_resource_state(binding, sh);
         return Err(status);
     }
+    hosted_device_allocations::bind_interrupt_projection(
+        projection_inst, binding, interrupt_object, connected, connected_tokens.grant_generation,
+    )?;
     Ok(())
 }
 

@@ -5,6 +5,154 @@ use nt_io_manager::{
     HostedDevicePointerRegistration, ProjectionAllocationLedger, ProjectionAllocationOwner,
 };
 
+#[path = "hosted_dma_adapter_pair.rs"]
+mod dma_adapter_pair;
+#[path = "hosted_dma_private_graph.rs"]
+mod dma_private_graph;
+pub(super) use dma_private_graph::Kind as DmaPrivateKind;
+#[path = "hosted_interrupt_projection.rs"]
+mod interrupt_projection;
+
+pub(super) unsafe fn provision_interrupt_projection(
+    inst: DriverInstance, binding: HostedDeviceBinding,
+) -> Result<(u64, u64), nt_status::NtStatus> {
+    interrupt_projection::provision(inst, binding)
+}
+
+pub(super) unsafe fn validate_interrupt_projection(
+    inst: DriverInstance, binding: HostedDeviceBinding, address: u64,
+) -> Result<(), nt_status::NtStatus> {
+    interrupt_projection::validate(inst, binding, address)
+}
+
+pub(super) unsafe fn bind_interrupt_projection(
+    inst: DriverInstance, binding: HostedDeviceBinding, address: u64,
+    interrupt_id: u64, grant_generation: u64,
+) -> Result<(), nt_status::NtStatus> {
+    interrupt_projection::bind(inst, binding, address, interrupt_id, grant_generation)
+}
+
+pub(super) unsafe fn mark_interrupt_projection_effect_started(
+    inst: DriverInstance, binding: HostedDeviceBinding, address: u64,
+) -> Result<(), nt_status::NtStatus> {
+    interrupt_projection::mark_effect_started(inst, binding, address)
+}
+
+pub(super) fn admit_interrupt_projection_canonical_retirement(
+    inst: DriverInstance, binding: HostedDeviceBinding, address: u64,
+    connection: (u64, u64),
+) -> Result<(), nt_status::NtStatus> {
+    interrupt_projection::admits_canonical_retirement(inst, binding, address, connection)
+}
+
+pub(super) unsafe fn interrupt_projection_connection_for_retirement(
+    inst: DriverInstance, binding: HostedDeviceBinding, address: u64,
+) -> Result<Option<(u64, u64)>, nt_status::NtStatus> {
+    interrupt_projection::connection_for_retirement(inst, binding, address)
+}
+
+pub(super) fn mark_interrupt_projection_canonical_retired(
+    inst: DriverInstance, binding: HostedDeviceBinding, address: u64,
+    connection: (u64, u64),
+) -> Result<(), nt_status::NtStatus> {
+    interrupt_projection::mark_canonical_retired(inst, binding, address, connection)
+}
+
+pub(super) unsafe fn retire_interrupt_projection_physical(
+    inst: DriverInstance, binding: HostedDeviceBinding, address: u64,
+) -> Result<(), nt_status::NtStatus> {
+    interrupt_projection::retire_physical(inst, binding, address)
+}
+
+pub(super) unsafe fn cancel_prepared_interrupt_projection(
+    inst: DriverInstance, binding: HostedDeviceBinding, address: u64,
+) -> Result<(), nt_status::NtStatus> {
+    interrupt_projection::cancel_prepared(inst, binding, address)
+}
+
+pub(super) unsafe fn cancel_interrupt_projection_after_proven_no_effect(
+    inst: DriverInstance, binding: HostedDeviceBinding, address: u64,
+) -> Result<(), nt_status::NtStatus> {
+    interrupt_projection::cancel_after_proven_no_effect(inst, binding, address)
+}
+
+pub(super) unsafe fn drain_interrupt_projection_tombstones(
+    inst: DriverInstance,
+) -> Result<(), nt_status::NtStatus> {
+    interrupt_projection::drain_tombstones(inst)
+}
+
+pub(super) unsafe fn provision_dma_adapter_pair(
+    inst: DriverInstance, lease_id: u64,
+) -> Result<(u64, u64), nt_status::NtStatus> {
+    dma_adapter_pair::provision_dma_adapter_pair(inst, lease_id)
+}
+
+pub(super) unsafe fn retire_dma_adapter_pair(
+    inst: DriverInstance, lease_id: u64, adapter_address: u64,
+    put: impl FnOnce() -> Result<(), nt_status::NtStatus>,
+) -> Result<(), nt_status::NtStatus> {
+    dma_adapter_pair::retire_dma_adapter_pair(inst, lease_id, adapter_address, put)
+}
+
+pub(super) fn has_dma_adapter_pair(lease_id: u64) -> bool {
+    let _catalog = lock();
+    dma_adapter_pair::has_lease(lease_id)
+}
+
+pub(super) unsafe fn drain_dma_adapter_tombstones(
+    inst: DriverInstance,
+) -> Result<(), nt_status::NtStatus> {
+    dma_adapter_pair::drain_dma_adapter_tombstones(inst)
+}
+
+pub(super) unsafe fn provision_dma_private_graph(
+    inst: DriverInstance, lease_id: u64, request_id: u64, kind: DmaPrivateKind,
+    borrowed_list: u64,
+) -> Result<(u64, u64, u64), nt_status::NtStatus> {
+    dma_private_graph::provision(inst, lease_id, request_id, kind, borrowed_list)
+}
+
+pub(super) unsafe fn record_dma_private_mapping(
+    inst: DriverInstance, lease_id: u64, map: u64, logical: u64,
+    backing: u64, length: u64,
+    register: impl FnOnce() -> Result<u64, nt_status::NtStatus>,
+) -> Result<u64, nt_status::NtStatus> {
+    dma_private_graph::record_mapping(inst, lease_id, map, logical, backing, length, register)
+}
+
+pub(super) unsafe fn dma_private_mapping_receipt(
+    inst: DriverInstance, map: u64, logical: u64, backing: u64, length: u64,
+) -> Option<(u64, u64)> {
+    dma_private_graph::mapping_receipt(inst, map, logical, backing, length)
+}
+
+pub(super) unsafe fn retire_dma_private_graph(
+    inst: DriverInstance, lease_id: u64, address: u64, whole_graph: bool,
+    release: impl FnMut(u64) -> Result<(), nt_status::NtStatus>,
+) -> Result<(), nt_status::NtStatus> {
+    dma_private_graph::retire(inst, lease_id, address, whole_graph, release)
+}
+
+pub(super) unsafe fn dma_private_sg_members(
+    inst: DriverInstance, lease_id: u64, list: u64,
+) -> Result<(u64, u64), nt_status::NtStatus> {
+    dma_private_graph::sg_members(inst, lease_id, list)
+}
+
+pub(super) unsafe fn retire_dma_private_lease(
+    inst: DriverInstance, lease_id: u64,
+    release: impl FnMut(u64) -> Result<(), nt_status::NtStatus>,
+) -> Result<(), nt_status::NtStatus> {
+    dma_private_graph::retire_lease(inst, lease_id, release)
+}
+
+pub(super) unsafe fn drain_dma_private_tombstones(
+    inst: DriverInstance,
+) -> Result<(), nt_status::NtStatus> {
+    dma_private_graph::drain_tombstones(inst)
+}
+
 struct Row {
     instance: DriverInstance,
     domain: HostedDomainIdentity,
@@ -65,8 +213,20 @@ struct FileStorageRow {
     file_freed: bool,
 }
 static mut FILE_ROWS: Vec<FileStorageRow> = Vec::new();
+#[derive(Clone, Copy)]
+struct FileStorageAck {
+    instance: DriverInstance,
+    domain: HostedDomainIdentity,
+    file_id: u64,
+    file: SourcePoolAllocationIdentity,
+    name: SourcePoolAllocationIdentity,
+}
+static mut FILE_ACKS: Vec<FileStorageAck> = Vec::new();
 fn file_rows() -> &'static mut Vec<FileStorageRow> {
     unsafe { &mut *core::ptr::addr_of_mut!(FILE_ROWS) }
+}
+fn file_acks() -> &'static mut Vec<FileStorageAck> {
+    unsafe { &mut *core::ptr::addr_of_mut!(FILE_ACKS) }
 }
 fn contains_allocation(identity: SourcePoolAllocationIdentity, address: u64) -> bool {
     address >= identity.component_address
@@ -225,6 +385,9 @@ pub(super) unsafe fn pin_temporary_pool_range(
         hosted_instance_pool_lock(inst.exec_pool_va).ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
     let exact = allocation_containing(inst, address, bytes)?;
     if ledger().protects_address(domain, exact.component_address)
+        || dma_adapter_pair::protects(inst, exact.component_address)
+        || dma_private_graph::protects(inst, exact.component_address)
+        || interrupt_projection::protects(inst, exact.component_address)
         || rows().iter().any(|row| {
             same_pool(row.instance, inst)
                 && row.allocation.component_address == exact.component_address
@@ -471,6 +634,9 @@ pub(super) fn generic_free_admission(
     let guard = lock();
     let domain = validate_arena(inst)?;
     if ledger().protects_address(domain, address)
+        || dma_adapter_pair::protects(inst, address)
+        || dma_private_graph::protects(inst, address)
+        || interrupt_projection::protects(inst, address)
         || rows().iter().any(|row| {
             same_pool(row.instance, inst)
                 && address >= row.allocation.component_address
@@ -518,7 +684,13 @@ pub(super) unsafe fn protect_file_storage(
             return Err(nt_status::NtStatus::INVALID_PARAMETER);
         }
         let name = allocation(inst, name_address)?;
-        if file_rows().iter().any(|row| {
+        if dma_adapter_pair::protects(inst, address)
+            || dma_private_graph::protects(inst, address)
+            || interrupt_projection::protects(inst, address)
+            || dma_adapter_pair::protects(inst, name_address)
+            || dma_private_graph::protects(inst, name_address)
+            || interrupt_projection::protects(inst, name_address)
+            || file_rows().iter().any(|row| {
             (row.domain == domain || same_pool(row.instance, inst))
                 && (protects_file_member(row, address)
                     || protects_file_member(row, name_address))
@@ -551,7 +723,11 @@ pub(super) unsafe fn protect_file_storage(
             same_pool(row.instance, inst)
                 && (contains_allocation(row.allocation, address)
                     || name_address != 0 && contains_allocation(row.allocation, name_address))
-        }) || temporary_pins().iter().any(|row| {
+        }) || interrupt_projection::protects(inst, address)
+            || dma_private_graph::protects(inst, address)
+            || name_address != 0 && interrupt_projection::protects(inst, name_address)
+            || name_address != 0 && dma_private_graph::protects(inst, name_address)
+            || temporary_pins().iter().any(|row| {
             same_pool(row.instance, inst)
                 && (contains_allocation(row.allocation, address)
                     || name_address != 0 && contains_allocation(row.allocation, name_address))
@@ -657,7 +833,60 @@ pub(super) unsafe fn retire_file_storage(
         }
         row.file_freed = true;
     }
+    // Keep the exact physical receipt until the component has observed this result. A lost
+    // op9 reply cannot be interpreted as permission to issue another physical free.
+    Ok(())
+}
+
+pub(super) fn file_storage_retirement_disposition(
+    inst: DriverInstance, file_id: u64, address: u64, file_generation: u64,
+) -> Result<u64, nt_status::NtStatus> {
+    let _guard = lock();
+    let domain = validate_arena(inst)?;
+    let row = file_rows().iter().find(|row| {
+        same_arena(row.instance, inst) && row.domain == domain
+            && row.file_id == file_id && row.file.component_address == address
+            && row.file.pool_generation == file_generation && row.canonical_unbound
+    }).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    Ok(u64::from(row.name_freed) | (u64::from(row.file_freed) << 1))
+}
+
+pub(super) fn acknowledge_file_storage_retirement(
+    inst: DriverInstance, file_id: u64, address: u64, file_generation: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let _durable = crate::allocator::enter_durable();
+    let _guard = lock();
+    let domain = validate_arena(inst)?;
+    let Some(index) = file_rows().iter().position(|row| {
+        same_arena(row.instance, inst) && row.domain == domain
+            && row.file_id == file_id && row.file.component_address == address
+            && row.file.pool_generation == file_generation && row.canonical_unbound
+            && row.name_freed && row.file_freed
+    }) else {
+        return if file_acks().iter().any(|ack| {
+            same_arena(ack.instance, inst) && ack.domain == domain
+                && ack.file_id == file_id && ack.file.component_address == address
+                && ack.file.pool_generation == file_generation
+        }) { Ok(()) } else { Err(nt_status::NtStatus::INVALID_HANDLE) };
+    };
+    let row = &file_rows()[index];
+    file_acks().try_reserve(1).map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    file_acks().push(FileStorageAck {
+        instance: row.instance, domain: row.domain, file_id: row.file_id,
+        file: row.file, name: row.name,
+    });
     file_rows().swap_remove(index);
+    Ok(())
+}
+
+pub(super) fn drain_file_storage_acknowledgements(
+    inst: DriverInstance,
+) -> Result<(), nt_status::NtStatus> {
+    let _guard = lock();
+    if file_rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst)) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    file_acks().retain(|ack| !same_arena(ack.instance, inst));
     Ok(())
 }
 
@@ -681,6 +910,11 @@ pub(super) unsafe fn protect_allocation_exact(
     let current = allocation(inst, address)?;
     if expected.is_some_and(|expected| expected != current) {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    if dma_adapter_pair::protects(inst, address)
+        || dma_private_graph::protects(inst, address)
+        || interrupt_projection::protects(inst, address) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     if rows().iter().any(|row| {
         (row.domain == domain || same_pool(row.instance, inst)) && !same_arena(row.instance, inst)
@@ -1050,7 +1284,10 @@ pub(super) fn accepted_registration(
 
 pub(super) fn instance_quiesced(inst: DriverInstance) -> bool {
     let _guard = lock();
-    !file_rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
+    !dma_adapter_pair::owns_pool(inst)
+        && !dma_private_graph::owns_pool(inst)
+        && !interrupt_projection::owns_pool(inst)
+        && !file_rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
         && !rows()
             .iter()
             .any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
@@ -1059,9 +1296,22 @@ pub(super) fn instance_quiesced(inst: DriverInstance) -> bool {
         .any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
 }
 
+pub(super) fn instance_ready_to_drain_dma_tombstones(inst: DriverInstance) -> bool {
+    let _guard = lock();
+    !dma_adapter_pair::has_live_pair(inst)
+        && !dma_private_graph::has_live_graph(inst)
+        && !interrupt_projection::has_live(inst)
+        && !file_rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
+        && !rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
+        && !temporary_pins().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
+}
+
 pub(super) fn protects_allocation(inst: DriverInstance, address: u64) -> bool {
     let _guard = lock();
-    rows().iter().any(|row| {
+    dma_adapter_pair::protects(inst, address)
+        || dma_private_graph::protects(inst, address)
+        || interrupt_projection::protects(inst, address)
+        || rows().iter().any(|row| {
         (same_arena(row.instance, inst) || same_pool(row.instance, inst))
             && address >= row.allocation.component_address
             && address < row.allocation.component_address + row.allocation.capacity

@@ -660,6 +660,11 @@ diagnosis-free failure.
 - Keep strict acceptance failed until an official fixed build is integrated and the native fixture
   passes. Track the upstream dependency separately from already-proven desktop acceptance.
 
+## Resolve The Next Actionable Issue From The User's Queue
+- A newly discovered issue awaiting an upstream pull request is not automatically the user's
+  "next issue." Check the active issue queue and ask which work item they mean when several
+  independent issues remain open, then continue implementation on the selected item.
+
 ## Keep CI Contracts Independent Of Unstaged References
 - `references/` is an ignored research checkout; crate CI fetches only a sparse pinned subset.
   Read other reference files to derive a contract, but do not use compile-time `include_str!` or

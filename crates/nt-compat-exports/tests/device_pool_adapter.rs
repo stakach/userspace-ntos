@@ -18,6 +18,11 @@ const POOL_DATA_OFF: u64 = 0x1000;
 const PAYLOAD: u64 = POOL_DATA_OFF + 16;
 const ADDRESS: u64 = FSD_POOL_VADDR + PAYLOAD;
 const CAPACITY: u64 = 0x200;
+const HOSTED_DMA_ADAPTER_SIZE: u64 = 0x40;
+const HOSTED_DMA_ADAPTER_SIGNATURE_OFFSET: u64 = 0x10;
+const HOSTED_SG_CONTEXT_SIZE: u64 = 0x30;
+const HOSTED_SG_LIST_SIZE_ONE: u64 = 0x28;
+const HOSTED_KINTERRUPT_SIZE: u64 = 0x70;
 const POOL_FREE_LIST_MAX: u64 = FSD_POOL_FRAMES * 0x1000 / 16;
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -33,6 +38,9 @@ struct DriverInstance {
     pml4: u64,
     domain: HostedDomainIdentity,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HostedDeviceBinding(u64);
 
 fn instance_domain_identity(inst: DriverInstance) -> Option<HostedDomainIdentity> {
     Some(inst.domain)
@@ -52,7 +60,10 @@ thread_local! {
     static PUBLICATION_PIN: RefCell<Option<nt_io_manager::HostedDeviceProjectionReference>> = const { RefCell::new(None) };
     static REFUSE_FILE_FREE: Cell<bool> = const { Cell::new(false) };
     static REFUSE_DEVICE_FREE: Cell<bool> = const { Cell::new(false) };
+    static REFUSE_DMA_FREE: Cell<Option<u64>> = const { Cell::new(None) };
     static GUARDED_READ: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+    static ALLOC_FAIL_CALL: Cell<u64> = const { Cell::new(0) };
+    static ALLOC_CALLS: Cell<u64> = const { Cell::new(0) };
 }
 
 unsafe fn read_unaligned<T>(pointer: *const T) -> T {
@@ -111,6 +122,9 @@ mod retirement;
 
 unsafe fn hosted_instance_pool_free_unlocked(inst: DriverInstance, address: u64) -> bool {
     assert_pool_locked(inst.exec_pool_va);
+    if REFUSE_DMA_FREE.with(|refuse| refuse.get()) == Some(address) {
+        return false;
+    }
     if address == ADDRESS && (REFUSE_FILE_FREE.with(|refuse| refuse.get())
         || REFUSE_DEVICE_FREE.with(|refuse| refuse.get())) {
         return false;
@@ -124,6 +138,25 @@ unsafe fn hosted_instance_pool_free_unlocked(inst: DriverInstance, address: u64)
     write_volatile(head, address);
     EVENTS.with(|events| events.borrow_mut().push("free"));
     true
+}
+
+unsafe fn hosted_instance_pool_alloc_unlocked(inst: DriverInstance, size: u64) -> Option<u64> {
+    assert_pool_locked(inst.exec_pool_va);
+    let call = ALLOC_CALLS.with(|calls| {
+        let call = calls.get() + 1;
+        calls.set(call);
+        call
+    });
+    if ALLOC_FAIL_CALL.with(|fail| fail.get()) == call { return None; }
+    let used = hosted_pool_used(inst.exec_pool_va);
+    let header = (used + 15) & !15;
+    let block = header.checked_add(16)?;
+    let end = block.checked_add(size)?;
+    if end > FSD_POOL_FRAMES * 0x1000 { return None; }
+    write_volatile((inst.exec_pool_va + header) as *mut u64, size);
+    write_volatile((inst.exec_pool_va + header + 8) as *mut u64, 100 + call);
+    write_volatile(inst.exec_pool_va as *mut u64, end);
+    Some(FSD_POOL_VADDR + block)
 }
 
 fn yield_now() {
@@ -230,6 +263,353 @@ unsafe fn populate_device_driver_list(pool: &Pool) -> u64 {
 }
 
 #[test]
+fn dma_pair_retains_exact_members_across_mutation_refusal_and_retry() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let mut io = IoManager::new(MockObjectPort::new());
+    let domain = io.register_hosted_domain();
+    MANAGER.with(|manager| manager.set(&mut io));
+    let _manager_scope = ManagerScope;
+    let pool = Pool::new(domain, 89, 0xd000);
+    unsafe {
+        let device_exec = pool.inst.exec_pool_va + PAYLOAD;
+        write_unaligned(device_exec as *mut i16, WDM_X64_IO_TYPE_DEVICE);
+        write_unaligned((device_exec + 2) as *mut u16, WDM_X64_DEVICE_OBJECT_SIZE as u16);
+        native::protect_allocation(pool.inst, ADDRESS).unwrap();
+
+        // The second allocation refuses before publication. Its first member and empty
+        // lease row must be fully released, so a fresh lease may be provisioned.
+        ALLOC_CALLS.with(|calls| calls.set(0));
+        ALLOC_FAIL_CALL.with(|fail| fail.set(2));
+        assert_eq!(native::provision_dma_adapter_pair(pool.inst, 991),
+            Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES));
+        ALLOC_FAIL_CALL.with(|fail| fail.set(0));
+        assert!(!native::has_dma_adapter_pair(991));
+
+        let (adapter, ops) = native::provision_dma_adapter_pair(pool.inst, 992).unwrap();
+        assert_ne!(adapter, ops);
+        assert!(native::generic_free_admission(pool.inst, adapter).is_err());
+        assert!(native::generic_free_admission(pool.inst, ops).is_err());
+        // The provider-writable field names an unrelated protected Device. Retirement
+        // must use the two row-captured physical identities, never this field.
+        let adapter_exec = pool.inst.exec_pool_va + adapter - FSD_POOL_VADDR;
+        write_unaligned((adapter_exec + 8) as *mut u64, ADDRESS);
+        let device_before = read_unaligned(device_exec as *const i16);
+        let ops_exec = pool.inst.exec_pool_va + ops - FSD_POOL_VADDR;
+        let original_generation = read_volatile((ops_exec - 8) as *const u64);
+        write_volatile((ops_exec - 8) as *mut u64, original_generation + 1);
+        let mut puts = 0;
+        assert_eq!(native::retire_dma_adapter_pair(pool.inst, 992, adapter, || {
+            puts += 1;
+            Ok(())
+        }), Err(nt_status::NtStatus::INVALID_HANDLE));
+        assert_eq!(puts, 0, "stale physical generation cannot put the lease");
+        write_volatile((ops_exec - 8) as *mut u64, original_generation);
+        assert_eq!(native::retire_dma_adapter_pair(pool.inst, 992, adapter, || {
+            puts += 1;
+            Err(nt_status::NtStatus::DEVICE_BUSY)
+        }), Err(nt_status::NtStatus::DEVICE_BUSY));
+        assert_eq!(puts, 1);
+        assert!(native::generic_free_admission(pool.inst, ops).is_err());
+        REFUSE_DMA_FREE.with(|refuse| refuse.set(Some(ops)));
+        assert_eq!(native::retire_dma_adapter_pair(pool.inst, 992, adapter, || {
+            puts += 1;
+            Ok(())
+        }), Err(nt_status::NtStatus::INVALID_HANDLE));
+        assert_eq!(puts, 2, "the refused logical put has no effect and can retry");
+        assert!(native::has_dma_adapter_pair(992));
+        REFUSE_DMA_FREE.with(|refuse| refuse.set(None));
+        native::retire_dma_adapter_pair(pool.inst, 992, adapter, || {
+            puts += 1;
+            Ok(())
+        }).unwrap();
+        assert_eq!(puts, 2, "physical retry must not replay acknowledged logical put");
+        assert!(!native::has_dma_adapter_pair(992));
+        assert!(native::protects_allocation(pool.inst, adapter));
+        assert!(native::generic_free_admission(pool.inst, adapter).is_err());
+        assert!(!native::instance_quiesced(pool.inst));
+        let (next_adapter, _) = native::provision_dma_adapter_pair(pool.inst, 993).unwrap();
+        assert_ne!(next_adapter, adapter, "retired raw adapter address must not be reused");
+        assert_eq!(native::retire_dma_adapter_pair(pool.inst, 992, adapter, || Ok(())),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
+        native::retire_dma_adapter_pair(pool.inst, 993, next_adapter, || Ok(())).unwrap();
+        assert_eq!(read_unaligned(device_exec as *const i16), device_before);
+        assert!(native::protects_allocation(pool.inst, ADDRESS));
+        retirement::retire_hosted_device_projection(pool.inst, ADDRESS,
+            retirement::CanonicalRetirement::ConfirmedUnbound { domain }, None).unwrap();
+        REFUSE_DMA_FREE.with(|refuse| refuse.set(Some(adapter)));
+        assert_eq!(native::drain_dma_adapter_tombstones(pool.inst),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
+        assert!(!native::instance_quiesced(pool.inst));
+        REFUSE_DMA_FREE.with(|refuse| refuse.set(None));
+        native::drain_dma_adapter_tombstones(pool.inst).unwrap();
+        assert!(native::instance_quiesced(pool.inst));
+    }
+}
+
+#[test]
+fn dma_private_graph_retires_captured_members_and_mapping_once() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let mut io = IoManager::new(MockObjectPort::new());
+    let domain = io.register_hosted_domain();
+    MANAGER.with(|manager| manager.set(&mut io));
+    let _manager_scope = ManagerScope;
+    let pool = Pool::new(domain, 90, 0xe000);
+    unsafe {
+        let (map, context, list) = native::provision_dma_private_graph(
+            pool.inst, 777, 1, native::DmaPrivateKind::ScatterGatherOwned, 0,
+        ).unwrap();
+        assert_ne!(map, context);
+        assert_ne!(context, list);
+        native::record_dma_private_mapping(pool.inst, 777, map, 0x1000, 0x2000, 64,
+            || Ok(501)).unwrap();
+        native::record_dma_private_mapping(pool.inst, 777, map, 0x2000, 0x3000, 64,
+            || Ok(502)).unwrap();
+        let map_exec = pool.inst.exec_pool_va + map - FSD_POOL_VADDR;
+        let context_exec = pool.inst.exec_pool_va + context - FSD_POOL_VADDR;
+        let list_exec = pool.inst.exec_pool_va + list - FSD_POOL_VADDR;
+        // Both driver-visible links are mutable and name another allocation.
+        write_unaligned((context_exec + 8) as *mut u64, ADDRESS);
+        write_unaligned((list_exec + 8) as *mut u64, ADDRESS);
+        assert!(native::generic_free_admission(pool.inst, map).is_err());
+        assert!(native::generic_free_admission(pool.inst, context).is_err());
+        assert!(native::generic_free_admission(pool.inst, list).is_err());
+        let original_generation = read_volatile((map_exec - 8) as *const u64);
+        write_volatile((map_exec - 8) as *mut u64, original_generation + 1);
+        let mut releases = Vec::new();
+        assert_eq!(native::retire_dma_private_graph(pool.inst, 777, list, true, |_| {
+            releases.push(0);
+            Ok(())
+        }), Err(nt_status::NtStatus::INVALID_HANDLE));
+        assert!(releases.is_empty());
+        write_volatile((map_exec - 8) as *mut u64, original_generation);
+        assert_eq!(native::retire_dma_private_graph(pool.inst, 777, list, true, |id| {
+            releases.push(id);
+            if id == 502 { Err(nt_status::NtStatus::DEVICE_BUSY) } else { Ok(()) }
+        }), Err(nt_status::NtStatus::DEVICE_BUSY));
+        assert_eq!(releases, vec![501, 502]);
+        native::retire_dma_private_graph(pool.inst, 777, list, true, |id| {
+            releases.push(id);
+            Ok(())
+        }).unwrap();
+        assert_eq!(releases, vec![501, 502, 502], "retry cannot replay acknowledged release");
+        {
+            let _pool = hosted_instance_pool_lock(pool.inst.exec_pool_va).unwrap();
+            assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(pool.inst, context), Some(false));
+            assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(pool.inst, ADDRESS), Some(false));
+        }
+        assert!(native::generic_free_admission(pool.inst, map).is_err());
+        assert!(native::generic_free_admission(pool.inst, list).is_err());
+        assert!(!native::instance_quiesced(pool.inst));
+        REFUSE_DMA_FREE.with(|refuse| refuse.set(Some(context)));
+        assert_eq!(native::drain_dma_private_tombstones(pool.inst),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
+        assert!(!native::instance_quiesced(pool.inst));
+        REFUSE_DMA_FREE.with(|refuse| refuse.set(None));
+        native::drain_dma_private_tombstones(pool.inst).unwrap();
+        assert!(native::instance_quiesced(pool.inst));
+    }
+}
+
+#[test]
+fn dma_private_mapping_id_has_one_graph_owner() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let domain = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId::new(903, 1),
+        cookie: 903,
+    };
+    let pool = Pool::new(domain, 91, 0xe100);
+    unsafe {
+        let (first, _, _) = native::provision_dma_private_graph(
+            pool.inst, 778, 1, native::DmaPrivateKind::Map, 0,
+        ).unwrap();
+        let (second, _, _) = native::provision_dma_private_graph(
+            pool.inst, 778, 2, native::DmaPrivateKind::Map, 0,
+        ).unwrap();
+        assert_ne!(first, second);
+        let mut registrations = 0;
+        assert_eq!(native::record_dma_private_mapping(
+            pool.inst, 778, first, 0x1000, 0x2000, 64,
+            || { registrations += 1; Ok(501) },
+        ), Ok(501));
+        // A lost MAP_TRANSFER reply leaves the canonical mapping live without a shared
+        // record. A second token must not acquire the same manager mapping ID.
+        assert_eq!(native::record_dma_private_mapping(
+            pool.inst, 778, second, 0x1000, 0x2000, 64,
+            || { registrations += 1; Ok(501) },
+        ), Err(nt_status::NtStatus::OBJECT_NAME_COLLISION));
+        assert_eq!(registrations, 1, "cross-graph replay cannot call the manager");
+        assert_eq!(native::record_dma_private_mapping(
+            pool.inst, 778, first, 0x1000, 0x2000, 64,
+            || { registrations += 1; Ok(501) },
+        ), Ok(501));
+        assert_eq!(registrations, 1, "same graph reuses its authoritative mapping ID");
+        let mut releases = Vec::new();
+        native::retire_dma_private_graph(pool.inst, 778, first, false,
+            |id| { releases.push(id); Ok(()) }).unwrap();
+        native::retire_dma_private_graph(pool.inst, 778, second, false,
+            |id| { releases.push(id); Ok(()) }).unwrap();
+        assert_eq!(releases, vec![501]);
+        native::drain_dma_private_tombstones(pool.inst).unwrap();
+    }
+}
+
+#[test]
+fn dma_private_replay_receipt_binds_exact_lease_mapping_and_lifetime() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let domain = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId::new(905, 1),
+        cookie: 905,
+    };
+    let pool = Pool::new(domain, 93, 0xe300);
+    unsafe {
+        let (first, _, _) = native::provision_dma_private_graph(
+            pool.inst, 781, 1, native::DmaPrivateKind::Map, 0,
+        ).unwrap();
+        let (second, _, _) = native::provision_dma_private_graph(
+            pool.inst, 782, 2, native::DmaPrivateKind::Map, 0,
+        ).unwrap();
+        native::record_dma_private_mapping(pool.inst, 781, first, 0x1000, 0x2000, 64,
+            || Ok(601)).unwrap();
+        native::record_dma_private_mapping(pool.inst, 782, second, 0x2000, 0x3000, 64,
+            || Ok(602)).unwrap();
+
+        // The shared record tuple alone cannot authorize replay under another device's
+        // adapter. The receipt names both the root lease and its saved manager mapping ID.
+        assert_eq!(native::dma_private_mapping_receipt(pool.inst, first, 0x1000, 0x2000, 64),
+            Some((781, 601)));
+        assert_eq!(native::dma_private_mapping_receipt(pool.inst, second, 0x2000, 0x3000, 64),
+            Some((782, 602)));
+        assert_eq!(native::dma_private_mapping_receipt(pool.inst, first, 0x2000, 0x3000, 64), None);
+        assert_eq!(native::dma_private_mapping_receipt(pool.inst, second, 0x1000, 0x2000, 64), None);
+
+        native::retire_dma_private_graph(pool.inst, 781, first, false, |_| Ok(())).unwrap();
+        assert_eq!(native::dma_private_mapping_receipt(pool.inst, first, 0x1000, 0x2000, 64), None,
+            "a stale shared record cannot recreate a released manager mapping");
+        native::retire_dma_private_graph(pool.inst, 782, second, false, |_| Ok(())).unwrap();
+        native::drain_dma_private_tombstones(pool.inst).unwrap();
+    }
+}
+
+#[test]
+fn dma_private_retirement_replays_only_exact_tombstone_receipt() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let domain = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId::new(904, 1),
+        cookie: 904,
+    };
+    let pool = Pool::new(domain, 92, 0xe200);
+    unsafe {
+        let (map, _, _) = native::provision_dma_private_graph(
+            pool.inst, 779, 1, native::DmaPrivateKind::Map, 0,
+        ).unwrap();
+        let (_, _, list) = native::provision_dma_private_graph(
+            pool.inst, 779, 2, native::DmaPrivateKind::ScatterGatherOwned, 0,
+        ).unwrap();
+        let mut releases = 0;
+        native::retire_dma_private_graph(pool.inst, 779, map, false,
+            |_| { releases += 1; Ok(()) }).unwrap();
+        native::retire_dma_private_graph(pool.inst, 779, list, true,
+            |_| { releases += 1; Ok(()) }).unwrap();
+        // If the successful reply was lost, repeating the same operation acknowledges the
+        // retained exact address. Neither a foreign lease nor the opposite operation may.
+        native::retire_dma_private_graph(pool.inst, 779, map, false,
+            |_| { releases += 1; Ok(()) }).unwrap();
+        native::retire_dma_private_graph(pool.inst, 779, list, true,
+            |_| { releases += 1; Ok(()) }).unwrap();
+        assert_eq!(releases, 0, "receipt replay cannot release a manager mapping again");
+        assert_eq!(native::retire_dma_private_graph(pool.inst, 780, map, false, |_| Ok(())),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
+        assert_eq!(native::retire_dma_private_graph(pool.inst, 779, map, true, |_| Ok(())),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
+        assert_eq!(native::retire_dma_private_graph(pool.inst, 779, list, false, |_| Ok(())),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
+        native::drain_dma_private_tombstones(pool.inst).unwrap();
+    }
+}
+
+#[test]
+fn interrupt_projection_tombstone_blocks_stale_pointer_aba_and_retries_exact_free() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let domain = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId::new(902, 1),
+        cookie: 902,
+    };
+    let pool = Pool::new(domain, 43, 0x902000);
+    let binding = HostedDeviceBinding(17);
+    unsafe {
+        let (first, generation) = native::provision_interrupt_projection(pool.inst, binding).unwrap();
+        assert_ne!(generation, 0);
+        assert_eq!(native::provision_interrupt_projection(pool.inst, binding),
+            Ok((first, generation)), "lost PROVISION reply must reuse the exact Prepared row");
+        assert!(native::generic_free_admission(pool.inst, first).is_err());
+        let first_exec = pool.inst.exec_pool_va + first - FSD_POOL_VADDR;
+        // A plausible allocation at the same address with another physical generation cannot
+        // satisfy the retained projection identity.
+        write_volatile((first_exec - 8) as *mut u64, generation + 1);
+        assert_eq!(native::validate_interrupt_projection(pool.inst, binding, first),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
+        write_volatile((first_exec - 8) as *mut u64, generation);
+        native::mark_interrupt_projection_effect_started(pool.inst, binding, first).unwrap();
+        assert_eq!(native::provision_interrupt_projection(pool.inst, binding),
+            Err(nt_status::NtStatus::DEVICE_BUSY),
+            "an uncertain canonical effect must not replay PROVISION");
+        native::bind_interrupt_projection(pool.inst, binding, first, 77, 3).unwrap();
+        assert_eq!(native::cancel_interrupt_projection_after_proven_no_effect(
+            pool.inst, binding, first), Err(nt_status::NtStatus::INVALID_HANDLE),
+            "an installed connection cannot be canceled as absent");
+        assert_eq!(native::interrupt_projection_connection_for_retirement(pool.inst, binding, first),
+            Ok(Some((77, 3))));
+        assert_eq!(native::cancel_prepared_interrupt_projection(pool.inst, binding, first),
+            Err(nt_status::NtStatus::INVALID_HANDLE),
+            "canonical publication cannot be canceled as a definite pre-effect refusal");
+
+        // The driver-writable projection can name another pool object. Canonical retirement
+        // records only the root's captured identity and never follows that byte.
+        write_unaligned(first_exec as *mut u64, ADDRESS);
+        native::mark_interrupt_projection_canonical_retired(pool.inst, binding, first, (77, 3)).unwrap();
+        assert_eq!(native::interrupt_projection_connection_for_retirement(pool.inst, binding, first),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
+        assert!(native::generic_free_admission(pool.inst, first).is_err());
+
+        let (second, _) = native::provision_interrupt_projection(pool.inst, binding).unwrap();
+        assert_ne!(second, first, "retired pointer must not ABA into the next connection");
+        native::cancel_prepared_interrupt_projection(pool.inst, binding, second).unwrap();
+        assert!(native::generic_free_admission(pool.inst, second).is_err());
+        let (third, _) = native::provision_interrupt_projection(pool.inst, binding).unwrap();
+        assert_ne!(third, second, "definite failed CONNECT must permit a fresh retry");
+        native::mark_interrupt_projection_effect_started(pool.inst, binding, third).unwrap();
+        native::admit_interrupt_projection_canonical_retirement(
+            pool.inst, binding, third, (78, 4),
+        ).unwrap();
+        native::mark_interrupt_projection_canonical_retired(
+            pool.inst, binding, third, (78, 4),
+        ).unwrap();
+        assert!(native::generic_free_admission(pool.inst, third).is_err());
+        let (fourth, _) = native::provision_interrupt_projection(pool.inst, binding).unwrap();
+        assert_ne!(fourth, third,
+            "an installed canonical route can be reconciled after final bind refusal");
+        native::mark_interrupt_projection_effect_started(pool.inst, binding, fourth).unwrap();
+        native::cancel_interrupt_projection_after_proven_no_effect(
+            pool.inst, binding, fourth,
+        ).unwrap();
+        let (fifth, _) = native::provision_interrupt_projection(pool.inst, binding).unwrap();
+        assert_ne!(fifth, fourth,
+            "a definitively absent canonical effect permits a fresh projection");
+        native::cancel_prepared_interrupt_projection(pool.inst, binding, fifth).unwrap();
+
+        REFUSE_DMA_FREE.with(|refuse| refuse.set(Some(first)));
+        assert_eq!(native::drain_interrupt_projection_tombstones(pool.inst),
+            Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED));
+        assert!(native::generic_free_admission(pool.inst, first).is_err());
+        REFUSE_DMA_FREE.with(|refuse| refuse.set(None));
+        native::drain_interrupt_projection_tombstones(pool.inst).unwrap();
+        assert!(native::instance_quiesced(pool.inst));
+        let _pool_lock = hosted_instance_pool_lock(pool.inst.exec_pool_va).unwrap();
+        assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(pool.inst, first), Some(true));
+    }
+}
+
+#[test]
 fn actual_file_broker_frees_constructor_name_after_driver_replaces_field() {
     let _serial = TEST_LOCK.lock().unwrap();
     let domain = HostedDomainIdentity {
@@ -272,10 +652,20 @@ fn actual_file_broker_frees_constructor_name_after_driver_replaces_field() {
         REFUSE_FILE_FREE.with(|refuse| refuse.set(true));
         assert_eq!(native::retire_file_storage(pool.inst, 41, ADDRESS),
             Err(nt_status::NtStatus::INVALID_HANDLE));
+        assert_eq!(native::file_storage_retirement_disposition(pool.inst, 41, ADDRESS, 17), Ok(1));
+        assert_eq!(native::file_storage_retirement_disposition(pool.inst, 41, ADDRESS, 18),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
         REFUSE_FILE_FREE.with(|refuse| refuse.set(false));
         drop(native::generic_free_admission(pool.inst, name_a).unwrap());
         assert!(native::generic_free_admission(pool.inst, ADDRESS).is_err());
         native::retire_file_storage(pool.inst, 41, ADDRESS).unwrap();
+        assert_eq!(native::file_storage_retirement_disposition(pool.inst, 41, ADDRESS, 17), Ok(3));
+        assert_eq!(native::acknowledge_file_storage_retirement(pool.inst, 41, ADDRESS, 18),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
+        native::acknowledge_file_storage_retirement(pool.inst, 41, ADDRESS, 17).unwrap();
+        native::acknowledge_file_storage_retirement(pool.inst, 41, ADDRESS, 17).unwrap();
+        assert_eq!(native::acknowledge_file_storage_retirement(pool.inst, 42, ADDRESS, 17),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
         let _lock = hosted_instance_pool_lock(exec).unwrap();
         assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(pool.inst, name_a), Some(true));
         assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(pool.inst, ADDRESS), Some(true));
@@ -283,6 +673,16 @@ fn actual_file_broker_frees_constructor_name_after_driver_replaces_field() {
     }
     let refused = unsafe { native::protect_file_storage(pool.inst, 41, ADDRESS) }.err().unwrap();
     assert!(refused.no_root_owner);
+}
+
+#[test]
+fn file_ack_tombstone_uses_durable_storage_before_reserve() {
+    let source = include_str!("../../../components/ntos-executive/src/hosted_device_allocations.rs");
+    let acknowledge = source.split("pub(super) fn acknowledge_file_storage_retirement(")
+        .nth(1).unwrap().split("pub(super) fn drain_file_storage_acknowledgements").next().unwrap();
+    let durable = acknowledge.find("crate::allocator::enter_durable()").unwrap();
+    let reserve = acknowledge.find("file_acks().try_reserve(1)").unwrap();
+    assert!(durable < reserve, "a retained ACK vector must outlive transient request storage");
 }
 
 #[test]
@@ -477,6 +877,16 @@ unsafe fn unlinked_pdo_with_no_driver_list_can_retire(driver: nt_io_manager::Dri
     native::record_accepted_registration(pool.inst, registration).unwrap();
     io_manager_mut().retire_hosted_device_pointer(registration).unwrap();
     io_manager_mut().destroy_device(device).unwrap();
+    // A provider may write the projected header after its unlinked ownership was accepted.
+    // That must not turn a fabricated list successor into a physical-free permission.
+    write_unaligned((device_exec + 0x10) as *mut u64, ADDRESS + CAPACITY + 16);
+    let before = pool._bytes.to_vec();
+    assert_eq!(retirement::retire_hosted_device_projection(pool.inst, ADDRESS,
+        retirement::CanonicalRetirement::Retired { registration }, None),
+        Err(nt_status::NtStatus::INVALID_PARAMETER));
+    assert_eq!(&*pool._bytes, before.as_slice());
+    assert!(native::protects_allocation(pool.inst, ADDRESS));
+    write_unaligned((device_exec + 0x10) as *mut u64, 0);
     retirement::retire_hosted_device_projection(pool.inst, ADDRESS,
         retirement::CanonicalRetirement::Retired { registration }, None).unwrap();
     assert!(native::instance_quiesced(pool.inst));

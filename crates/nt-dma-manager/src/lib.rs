@@ -969,6 +969,22 @@ impl DmaManager {
         self.register_mapping_at(owner, adapter_id, logical_base, backing_va, length)
     }
 
+    /// Verify an already registered packet mapping by its canonical ID and exact range.
+    /// Replaying a shared projection must never create a mapping after its owner retired it.
+    pub fn mapping_matches(
+        &self,
+        owner: DmaOwner,
+        mapping_id: u64,
+        logical_base: u64,
+        backing_va: u64,
+        length: u64,
+    ) -> bool {
+        self.mappings.iter().any(|mapping| mapping.active
+            && mapping.id == mapping_id && mapping.owner == owner
+            && mapping.logical_base == logical_base && mapping.backing_va == backing_va
+            && mapping.length == length)
+    }
+
     /// `FreeMapRegisters` / `PutScatterGatherList` — release a mapping (spec §12.4).
     pub fn free_mapping(&mut self, mapping_id: u64) -> Result<(), DmaError> {
         let m = self
@@ -1507,6 +1523,21 @@ mod tests {
             d.ensure_mapping_at(owner(), a, 0x3000, 0x6_1000, 512),
             Err(DmaError::LogicalViolation)
         );
+    }
+
+    #[test]
+    fn broker_mapping_receipt_cannot_resurrect_released_or_foreign_mapping() {
+        let mut d = DmaManager::new();
+        let owner_a = owner();
+        let owner_b = DmaOwner::new(2, 200, 20);
+        let adapter = d.register_adapter(owner_a, true, 4096, true);
+        let mapping = d.register_mapping_at(owner_a, adapter, 0x3000, 0x6_0000, 512).unwrap();
+        assert!(d.mapping_matches(owner_a, mapping.mapping_id, 0x3000, 0x6_0000, 512));
+        assert!(!d.mapping_matches(owner_b, mapping.mapping_id, 0x3000, 0x6_0000, 512));
+        assert!(!d.mapping_matches(owner_a, mapping.mapping_id + 1, 0x3000, 0x6_0000, 512));
+        assert!(!d.mapping_matches(owner_a, mapping.mapping_id, 0x3000, 0x6_0000, 511));
+        d.free_mapping_for_owner(owner_a, mapping.mapping_id).unwrap();
+        assert!(!d.mapping_matches(owner_a, mapping.mapping_id, 0x3000, 0x6_0000, 512));
     }
 
     #[test]
