@@ -477,6 +477,16 @@ unsafe fn unlinked_pdo_with_no_driver_list_can_retire(driver: nt_io_manager::Dri
     native::record_accepted_registration(pool.inst, registration).unwrap();
     io_manager_mut().retire_hosted_device_pointer(registration).unwrap();
     io_manager_mut().destroy_device(device).unwrap();
+    // A provider may write the projected header after its unlinked ownership was accepted.
+    // That must not turn a fabricated list successor into a physical-free permission.
+    write_unaligned((device_exec + 0x10) as *mut u64, ADDRESS + CAPACITY + 16);
+    let before = pool._bytes.to_vec();
+    assert_eq!(retirement::retire_hosted_device_projection(pool.inst, ADDRESS,
+        retirement::CanonicalRetirement::Retired { registration }, None),
+        Err(nt_status::NtStatus::INVALID_PARAMETER));
+    assert_eq!(&*pool._bytes, before.as_slice());
+    assert!(native::protects_allocation(pool.inst, ADDRESS));
+    write_unaligned((device_exec + 0x10) as *mut u64, 0);
     retirement::retire_hosted_device_projection(pool.inst, ADDRESS,
         retirement::CanonicalRetirement::Retired { registration }, None).unwrap();
     assert!(native::instance_quiesced(pool.inst));
