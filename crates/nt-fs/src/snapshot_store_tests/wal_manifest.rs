@@ -138,6 +138,26 @@ fn generic_v2_checkpoint_repairs_a_torn_same_anchor_companion_under_the_same_dev
 }
 
 #[test]
+fn wal_writer_refuses_torn_companion_before_marking_any_record() {
+    let (store, mut disk) = two_v2_slots();
+    disk.fail_event = Some(2);
+    disk.partial_flush = true;
+    assert_eq!(
+        store.commit_next_with_wal_manifest(&mut disk, b"third", base()),
+        Err(SnapshotBlockStoreError::Io)
+    );
+    disk.power_cut();
+    disk.events.clear();
+    let manifest = store.current_wal_checkpoint_manifest(&mut disk).unwrap();
+    assert_eq!(manifest, base());
+    assert_eq!(
+        store.validate_wal_journal_manifest(&mut disk, manifest),
+        Err(SnapshotBlockStoreError::Corrupt)
+    );
+    assert!(!disk.events.iter().any(|event| matches!(event, Event::Write(_))));
+}
+
+#[test]
 fn torn_v2_companion_with_a_different_anchor_still_refuses_streaming_boot_and_checkpoint() {
     let (store, mut disk) = two_v2_slots();
     disk.fail_event = Some(3);

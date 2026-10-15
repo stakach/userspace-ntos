@@ -4,6 +4,35 @@ use crate::SystemHiveMutation;
 use alloc::vec::Vec;
 
 #[test]
+fn storage_receipts_bind_to_the_exact_preparation_across_equal_generations() {
+    let mut first = client(1);
+    let mut second = client(1);
+    let a = prepare(&mut first, 1, "StorageA");
+    let b = prepare(&mut second, 1, "StorageB");
+    let a_binding = a.storage_binding();
+    let b_binding = b.storage_binding();
+    let a_receipt = first.commit_system_hive_mutation_retained(&a).unwrap();
+    let b_receipt = second.commit_system_hive_mutation_retained(&b).unwrap();
+    assert!(a_receipt.matches_storage_binding(a_binding));
+    assert!(b_receipt.matches_storage_binding(b_binding));
+    assert!(!a_receipt.matches_storage_binding(b_binding));
+    assert!(!b_receipt.matches_storage_binding(a_binding));
+
+    let mut third = client(1);
+    let mut fourth = client(1);
+    let c = prepare(&mut third, 1, "StorageC");
+    let d = prepare(&mut fourth, 1, "StorageD");
+    let c_binding = c.storage_binding();
+    let d_binding = d.storage_binding();
+    let c_abort = third.abort_prepared_system_hive_mutation_retained(&c).unwrap();
+    let d_abort = fourth.abort_prepared_system_hive_mutation_retained(&d).unwrap();
+    assert!(c_abort.matches_storage_binding(c_binding));
+    assert!(d_abort.matches_storage_binding(d_binding));
+    assert!(!c_abort.matches_storage_binding(d_binding));
+    assert!(!d_abort.matches_storage_binding(c_binding));
+}
+
+#[test]
 fn lost_commit_and_ack_replies_preserve_exact_publication_and_durable_replay() {
     let mut client = client(1);
     let device = r"\Registry\Machine\System\CurrentControlSet\Enum\ROOT\DEVICE\0000";
@@ -218,6 +247,7 @@ fn invalid_prepared_identity_is_rejected_without_transport() {
     // Malformed wire identities are crate-private fixtures, not cloneable public preparations.
     let mut invalid = core::array::from_fn::<_, 4, _>(|_| PreparedSystemHiveMutation {
         mount: prepared.mount,
+        storage_nonce: prepared.storage_nonce,
         expected_generation: prepared.expected_generation,
         next_generation: prepared.next_generation,
         lease_token: prepared.lease_token,

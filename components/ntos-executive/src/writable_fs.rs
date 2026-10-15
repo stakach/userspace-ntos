@@ -39,6 +39,9 @@ pub(crate) mod snapshot_storage;
 #[path = "writable_fs/registry_journal.rs"]
 pub(crate) mod registry_journal;
 
+#[path = "writable_fs/registry_wal.rs"]
+pub(crate) mod registry_wal;
+
 #[path = "writable_fs/file_cleanup.rs"]
 mod file_cleanup;
 pub(crate) use file_cleanup::{

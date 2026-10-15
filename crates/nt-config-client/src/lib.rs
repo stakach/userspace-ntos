@@ -64,6 +64,7 @@ pub use mutation_commit::{
     SystemHiveMutationCommitReceipt, SystemHiveMutationAcknowledgement,
     SystemHiveMutationAcknowledgementDisposition,
     SystemHiveMutationAbortReceipt, SystemHiveMutationAbortAcknowledgement,
+    SystemHiveMutationStorageBinding,
 };
 
 mod snapshot_publication;
@@ -290,6 +291,7 @@ mod value_upload_tests {
 #[must_use = "retain the preparation until its publication or confirmed cleanup"]
 pub struct PreparedSystemHiveMutation {
     mount: SystemHiveMount,
+    storage_nonce: u64,
     expected_generation: u64,
     next_generation: u64,
     lease_token: u64,
@@ -309,6 +311,9 @@ impl PreparedSystemHiveMutation {
     }
     pub fn durable_journal(&self) -> &[u8] {
         &self.durable_journal
+    }
+    pub fn storage_binding(&self) -> SystemHiveMutationStorageBinding {
+        SystemHiveMutationStorageBinding::for_prepared(self)
     }
 }
 
@@ -2211,6 +2216,7 @@ impl<B: Backend> ConfigClient<B> {
         }
         Ok(PreparedSystemHiveMutation {
             mount,
+            storage_nonce: mutation_commit::next_storage_nonce(),
             expected_generation,
             next_generation: prepare.detail0,
             lease_token: token,

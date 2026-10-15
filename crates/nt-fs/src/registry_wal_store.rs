@@ -344,6 +344,17 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
         self.state
     }
 
+    /// The exact committed endpoint is observable only when no write or recovered tail
+    /// still owns an uncertain effect. Native admission compares this with both v2 headers
+    /// before reserving another serial.
+    pub fn settled_anchor(&self) -> Option<WalSnapshotAnchor> {
+        if self.state != RegistryWalState::Ready {
+            return None;
+        }
+        let (incarnation, serial, end_lba) = self.verified_prefix()?;
+        Some(WalSnapshotAnchor { incarnation, serial, end_lba })
+    }
+
     /// Only a scanned or settled WAL prefix can satisfy an external durability anchor.
     pub(crate) fn verified_prefix(&self) -> Option<(u64, u64, u64)> {
         if !matches!(
@@ -428,6 +439,17 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
             payload,
         });
         self.state = RegistryWalState::PendingPrepare;
+        Ok(())
+    }
+
+    /// Cancel a reservation before PREPARE starts. No sector has been touched, so this
+    /// is the only pending state that can release its device without a clearing barrier.
+    pub fn cancel_pending(&mut self) -> Result<(), RegistryWalError> {
+        if self.state != RegistryWalState::PendingPrepare {
+            return Err(RegistryWalError::InvalidState);
+        }
+        self.pending = None;
+        self.state = RegistryWalState::Ready;
         Ok(())
     }
 

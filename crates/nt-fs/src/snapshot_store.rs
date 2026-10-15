@@ -734,7 +734,7 @@ impl SnapshotBlockStore {
     /// Admit a journal checkpoint only after both payload-valid slots name the same WAL
     /// anchor. A mixed migration or half-advanced anchor needs recovery under this device
     /// owner before a new journal effect can begin.
-    pub(crate) fn validate_wal_journal_manifest<D: SnapshotBlockDevice>(
+    pub fn validate_wal_journal_manifest<D: SnapshotBlockDevice>(
         &self,
         dev: &mut D,
         manifest: WalSnapshotManifest,

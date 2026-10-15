@@ -8,6 +8,35 @@ fn disk() -> CachedDisk {
 }
 
 #[test]
+fn settled_wal_anchor_is_exact_and_unavailable_during_an_effect() {
+    let mut wal = RegistryWal::recover(self::disk(), 77).unwrap();
+    assert_eq!(wal.settled_anchor(), Some(WalSnapshotAnchor {
+        incarnation: 77, serial: 0, end_lba: 0,
+    }));
+    wal.begin(alloc::vec![0x51; 512]).unwrap();
+    assert_eq!(wal.settled_anchor(), None);
+    wal.prepare().unwrap();
+    assert_eq!(wal.settled_anchor(), None);
+    wal.commit().unwrap();
+    assert_eq!(wal.settled_anchor(), Some(WalSnapshotAnchor {
+        incarnation: 77, serial: 1, end_lba: 3,
+    }));
+}
+
+#[test]
+fn unstarted_wal_record_can_be_cancelled_without_reusing_an_effect() {
+    let mut wal = RegistryWal::recover(self::disk(), 77).unwrap();
+    wal.begin(alloc::vec![0x51; 512]).unwrap();
+    wal.cancel_pending().unwrap();
+    assert_eq!(wal.state(), RegistryWalState::Ready);
+    assert!(wal.records().is_empty());
+    assert_eq!(wal.settled_anchor(), Some(WalSnapshotAnchor {
+        incarnation: 77, serial: 0, end_lba: 0,
+    }));
+    assert!(wal.into_device().is_ok());
+}
+
+#[test]
 fn only_marked_records_survive_each_power_cut_boundary() {
     let mut wal = RegistryWal::recover(self::disk(), 77).unwrap();
     wal.begin(alloc::vec![0x51; 600]).unwrap();

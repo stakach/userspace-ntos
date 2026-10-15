@@ -2,18 +2,53 @@
 //! success from a transport failure, a newer mount generation, or a missing server identity.
 
 use crate::{
-    Backend, ConfigClient, PreparedSystemHiveMutation, SystemHivePublishOutcome,
+    Backend, ConfigClient, PreparedSystemHiveMutation, SystemHiveMount, SystemHivePublishOutcome,
     STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
 };
+use core::sync::atomic::{AtomicU64, Ordering};
 use nt_config_abi::{
     hive_mount, hive_mutation_commit_disposition as disposition,
     hive_mutation_commit_operation as operation, opcode, CmHiveMutationCommitReply,
     CmHiveMutationCommitRequest, CM_ABI_VERSION,
 };
 
+static NEXT_STORAGE_NONCE: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_storage_nonce() -> u64 {
+    NEXT_STORAGE_NONCE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+        .expect("SYSTEM mutation storage nonce exhausted")
+}
+
+/// Process-local identity of one immutable CM preparation. The nonce prevents a receipt
+/// from another client incarnation with reused wire numbers authorizing this storage owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SystemHiveMutationStorageBinding {
+    mount: SystemHiveMount,
+    nonce: u64,
+    mutation_token: u64,
+    expected_generation: u64,
+    next_generation: u64,
+    semantic_journal_len: u32,
+}
+
+impl SystemHiveMutationStorageBinding {
+    pub(crate) fn for_prepared(prepared: &PreparedSystemHiveMutation) -> Self {
+        Self {
+            mount: prepared.mount,
+            nonce: prepared.storage_nonce,
+            mutation_token: prepared.lease_token,
+            expected_generation: prepared.expected_generation,
+            next_generation: prepared.next_generation,
+            semantic_journal_len: prepared.semantic_journal_len,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[must_use = "retain the publication result until its exact receipt is acknowledged"]
 pub struct SystemHiveMutationCommitReceipt {
+    storage_binding: SystemHiveMutationStorageBinding,
     mutation_token: u64,
     expected_generation: u64,
     semantic_journal_len: u32,
@@ -25,6 +60,10 @@ pub struct SystemHiveMutationCommitReceipt {
 impl SystemHiveMutationCommitReceipt {
     pub const fn outcome(self) -> SystemHivePublishOutcome {
         self.outcome
+    }
+
+    pub fn matches_storage_binding(self, binding: SystemHiveMutationStorageBinding) -> bool {
+        self.storage_binding == binding
     }
 }
 
@@ -60,11 +99,18 @@ impl SystemHiveMutationAcknowledgement {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[must_use = "retain the abort receipt until its exact acknowledgement"]
 pub struct SystemHiveMutationAbortReceipt {
+    storage_binding: SystemHiveMutationStorageBinding,
     mutation_token: u64,
     expected_generation: u64,
     semantic_journal_len: u32,
     bank: u64,
     generation: u64,
+}
+
+impl SystemHiveMutationAbortReceipt {
+    pub fn matches_storage_binding(self, binding: SystemHiveMutationStorageBinding) -> bool {
+        self.storage_binding == binding
+    }
 }
 
 /// Typed proof that this abort result was acknowledged; commit receipts cannot substitute for it.
@@ -125,6 +171,7 @@ impl<B: Backend> ConfigClient<B> {
             return Err(STATUS_INVALID_PARAMETER);
         }
         Ok(SystemHiveMutationCommitReceipt {
+            storage_binding: prepared.storage_binding(),
             mutation_token: body.mutation_token,
             expected_generation: body.expected_generation,
             semantic_journal_len: body.semantic_journal_len,
@@ -180,6 +227,7 @@ impl<B: Backend> ConfigClient<B> {
             return Err(STATUS_INVALID_PARAMETER);
         }
         Ok(SystemHiveMutationAbortReceipt {
+            storage_binding: prepared.storage_binding(),
             mutation_token: body.mutation_token,
             expected_generation: body.expected_generation,
             semantic_journal_len: body.semantic_journal_len,
