@@ -333,11 +333,11 @@ pub(crate) unsafe fn run() {
     assert_eq!(message.info(), (NESTED << 12) | 4);
     assert_eq!(message.registers(), [17, 29, 43, 71]);
     ingress::adopt(first, incoming).expect("nested Call adoption");
-    let parent = ingress::nested::park_current().expect("park real outer continuation");
+    let mut parent = ingress::nested::park_current().expect("park real outer continuation");
     assert!(parent.is_some());
     dispatch_once(second);
     dispatch_once(worker);
-    ingress::nested::restore(parent).expect("restore exact parked owner");
+    ingress::nested::restore(&mut parent).expect("restore exact parked owner");
     let reply = ingress::current_reply(first).unwrap();
     ingress::reply(first, reply, &[0]).expect("resume real outer continuation");
     receive(first);

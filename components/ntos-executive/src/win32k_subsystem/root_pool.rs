@@ -46,7 +46,9 @@ fn pool_error(error: shared_pool::PoolError) -> RootPoolError {
 }
 
 unsafe fn validate_packet_range(lease: ProviderPoolPacketLease) -> Result<(), RootPoolError> {
-    if !provider_pool_contains(lease.pointer)
+    let provider = crate::current_win32k_provider_domain().ok_or(RootPoolError::InvalidIdentity)?;
+    if provider != lease.provider
+        || !provider_pool_contains(lease.pointer)
         || lease.length == 0
         || lease.length as u64 > lease.capacity
         || !lease.pointer.checked_add(lease.capacity).is_some_and(|end| {
@@ -109,8 +111,8 @@ pub(crate) unsafe fn try_allocate_root_provider_pool_allocation(
     if length == 0 || length as u64 >= WIN32K_POOL_FRAMES * 0x1000 {
         return Err(RootPoolError::InsufficientResources);
     }
-    let provider = registered_provider_wait_domain().ok_or(RootPoolError::InvalidIdentity)?;
-    if !provider_pool_ready() {
+    let provider = crate::current_win32k_provider_domain().ok_or(RootPoolError::InvalidIdentity)?;
+    if registered_provider_wait_domain() != Some(provider) || !provider_pool_ready() {
         return Err(RootPoolError::InvalidIdentity);
     }
     let _pool = try_provider_pool_lock().ok_or(RootPoolError::BusyNoEffect)?;
@@ -179,7 +181,10 @@ pub(crate) unsafe fn allocate_root_provider_pool_allocation(
     if length == 0 {
         return None;
     }
-    let provider = registered_provider_wait_domain()?;
+    let provider = crate::current_win32k_provider_domain()?;
+    if registered_provider_wait_domain() != Some(provider) {
+        return None;
+    }
     let _pool = provider_pool_lock()?;
     let mut memory = ProviderPoolMemory;
     let allocation = shared_pool::allocate(&mut memory, length as u64, true).ok()?;
@@ -216,5 +221,17 @@ pub(crate) unsafe fn allocate_root_provider_pool_allocation(
 pub(crate) unsafe fn retire_root_provider_pool_allocation(
     allocation: RootProviderPoolAllocation,
 ) -> bool {
+    if crate::current_win32k_provider_domain() != Some(allocation.packet.provider) {
+        return false;
+    }
     retire_pinned_root_provider_pool_packet(allocation.packet, allocation.pin)
+}
+
+/// Root catalog admission precedes any read of the optional shared GUI arena.
+pub(crate) fn root_provider_pool_census() -> Option<ProviderPoolCensus> {
+    let provider = crate::current_win32k_provider_domain()?;
+    if registered_provider_wait_domain() != Some(provider) {
+        return None;
+    }
+    Some(provider_pool_census())
 }

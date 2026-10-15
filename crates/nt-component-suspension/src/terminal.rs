@@ -224,6 +224,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         }
         if lane.terminal.is_some()
             || lane.resume_epoch == 0
+            || frame.receive.is_some_and(|admission| !admission.restored)
             || !matches!(frame.phase, SuspensionPhase::Resuming { .. })
         {
             return Err(LaneError::InvalidPhase);
@@ -467,6 +468,12 @@ impl<C, R: Clone, T> ComponentSuspensionLanes<C, R, T> {
         reply_object: u64,
         local_retirement: Result<(), u32>,
     ) -> Result<Option<RetiredTerminal<C, R, T>>, LaneError> {
+        // An admitted shared Call still owns the physical dispatch after semantic delivery.
+        // Only finish_shared_terminal may transfer its authority back to ingress completion.
+        let lane = self.lane(identity.lane())?;
+        if lane.shared_peer.is_some() && lane.dispatch.is_some() {
+            return Err(LaneError::InvalidPhase);
+        }
         self.finish_terminal_with_execution(identity, reply_object, local_retirement, false)
     }
 

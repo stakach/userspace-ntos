@@ -1,5 +1,8 @@
 use super::*;
-use crate::{AccessToken, CapturedClientToken, SecurityImpersonationLevel, TokenType};
+use crate::{
+    AccessToken, CapturedClientToken, SecurityImpersonationLevel, TokenType,
+    ACCESS_SYSTEM_SECURITY, MAXIMUM_ALLOWED, STATUS_PRIVILEGE_NOT_HELD,
+};
 
 fn subject(token: &AccessToken) -> CapturedSubjectTokens<'_> {
     CapturedSubjectTokens {

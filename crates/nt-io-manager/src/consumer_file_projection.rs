@@ -18,6 +18,7 @@ pub struct ConsumerFileMetadata {
     pub file_name: Vec<u16>,
     pub create_options: u32,
     pub opened_case_sensitive: bool,
+    pub mode: crate::FileModeState,
 }
 
 pub fn consumer_file_metadata<P>(
@@ -38,6 +39,7 @@ pub fn consumer_file_metadata<P>(
         file_name,
         create_options: file.create_options.bits(),
         opened_case_sensitive: file.opened_case_sensitive(),
+        mode: file.mode_state(),
     })
 }
 
@@ -75,6 +77,11 @@ pub fn write_consumer_wdm_file_object<P>(
         },
     )
     .map_err(|_| NtStatus::INVALID_PARAMETER)?;
+    // A consumer may be published after a mode SET. CREATE admission remains immutable,
+    // but every new projection must begin with the current canonical File mode.
+    let flags = u32::from_le_bytes(bytes[0x50..0x54].try_into().unwrap());
+    let mode_flags = metadata.mode.wdm_mode_flags()?;
+    bytes[0x50..0x54].copy_from_slice(&((flags & !0x1003e) | mode_flags).to_le_bytes());
     // Normal CREATE has completed before a consumer receives this projection. The base
     // WDM writer also serves pre-CREATE objects, whose Event must remain unsignaled.
     bytes[0x9c..0xa0].copy_from_slice(&1u32.to_le_bytes());
@@ -456,6 +463,38 @@ mod tests {
     }
 
     #[test]
+    fn named_device_file_reference_survives_handle_close_and_resolves_current_top() {
+        let (mut io, identity, opening_device) = opened();
+        let base = opening_device.device_id();
+        let driver = io.device(base).unwrap().driver_id;
+        let top = io
+            .create_device(
+                driver,
+                None,
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let mut file = ConsumerFileProjection::new(&mut io, identity, opening_device).unwrap();
+        file.reference_by_handle(&mut io, identity).unwrap();
+        file.handle_closed(identity).unwrap();
+        assert!(!file.is_ready_to_retire());
+
+        io.attach_device_to_stack(top, base).unwrap();
+        let top_pointer = io.bind_hosted_device_pointer(identity.domain(), 0x7000, top).unwrap();
+        assert_eq!(
+            file.related_top_device_address(&io, opening_device),
+            Err(NtStatus::INVALID_DEVICE_REQUEST),
+        );
+        assert_eq!(file.related_top_device_address(&io, top_pointer), Ok(0x7000));
+        file.dereference(&mut io, identity).unwrap();
+        assert!(file.is_ready_to_retire());
+        file.retire(&mut io).unwrap();
+    }
+
+    #[test]
     fn stale_generation_cannot_mutate_replacement_projection() {
         let (mut io, first, device) = opened();
         let mut projection = ConsumerFileProjection::new(&mut io, first, device).unwrap();
@@ -470,6 +509,34 @@ mod tests {
         assert_eq!(projection.dereference(&mut io, second), Err(NtStatus::INVALID_HANDLE));
         assert_eq!(projection.pointer_reference_count(), 0);
         assert!(!projection.is_ready_to_retire());
+    }
+
+    #[test]
+    fn retained_owner_release_requires_exact_consumer_domain_after_handle_close() {
+        let (mut io, identity, device) = opened();
+        let mut projection = ConsumerFileProjection::new(&mut io, identity, device).unwrap();
+        projection.reference_by_handle(&mut io, identity).unwrap();
+        projection.handle_closed(identity).unwrap();
+
+        let foreign_domain = io.register_hosted_domain();
+        let foreign = io.bind_hosted_file_identity(
+            foreign_domain, identity.address(), identity.file_id(),
+        ).unwrap();
+        let references = io.file_reference_count(identity.file_id());
+        assert_eq!(projection.dereference(&mut io, foreign), Err(NtStatus::INVALID_HANDLE));
+        assert_eq!(projection.pointer_reference_count(), 1);
+        assert_eq!(io.file_reference_count(identity.file_id()), references);
+        assert_eq!(io.hosted_device_pointer_count(device), Ok(1));
+
+        // Retirement is legitimately pending until this already-owned pointer is released.
+        assert_eq!(projection.retire(&mut io), Err(NtStatus::DEVICE_BUSY));
+        projection.dereference(&mut io, identity).unwrap();
+        projection.retire(&mut io).unwrap();
+        assert_eq!(projection.pointer_reference_count(), 0);
+        assert_eq!(io.file_reference_count(identity.file_id()), references - 1);
+        assert_eq!(io.hosted_device_pointer_count(device), Ok(0));
+        assert_eq!(io.hosted_file_by_identity(identity.domain(), identity.address()), None);
+        assert_eq!(io.hosted_file_by_identity(foreign_domain, identity.address()), Some(identity.file_id()));
     }
 
     #[test]

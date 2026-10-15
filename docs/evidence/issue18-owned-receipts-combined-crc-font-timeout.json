@@ -1,0 +1,44 @@
+{
+  "issue": 18,
+  "source_commit": "5da15b0a83ea6af579aebe0b82408d4e73575a31",
+  "microkernel_commit": "2debcee98856ea648924c9ddf0c20a491750668b",
+  "profile": "font-cleanup",
+  "boot_bound_seconds": 3600,
+  "build_exit": 0,
+  "launcher_exit": 124,
+  "collector_exit": 0,
+  "collector_frames": 357,
+  "collector_final_slot": 0,
+  "image_matched_font_parser_exit": 1,
+  "exact_head_ci": 37441516366,
+  "termination": "The original one-hour deadline expired during genuine setup component registration. No deadline extension or startup bypass was used. Guest and collector final exits were consumed before the strict parser and subsequent local regression suite ran.",
+  "preboot_sha256": {
+    "rootserver": "4126cf64beb46d3cce2dcfd90304b7800a832aed66feae102efe5fe8d2973e60",
+    "microkernel": "fc0e1ca81c3130a8603f879771ff819edf9dc3fd5a59da2eb7a4d83790d9bb37",
+    "staged_esp_kernel": "f148ca228efcb73aa79fc50729d2ab2833a1665ec583087468c8190028258503",
+    "disk": "ef25e7ed2491eb087a8bb5d1efc1c16b7d24c6f6124fca2c8ab643bad3584596",
+    "ntdll": "5c1a33cb4fbab7d10bb85490c0da83d24beca935487321590e246842fc4aff1c",
+    "font_acceptance": "1729483e54eba2e8b891beeae4dca6d3881f2f1ac45cbce90ba74c4e4908e6f3",
+    "font_run_setup": "f2238bde4b0d68808f01b1e7f5ce95817e03063db1a4616a63d15716e0bb85b5"
+  },
+  "artifact_sha256": {
+    "raw_log": "48bba5605323ebb960b5b7a196eb7f645a454a71a60c1d90b4c8cd62d43ee69b",
+    "archived_log": "c497b44702f497d5ff186c41d02abe7841e96421594cb750e41ee60064faeae9",
+    "collector_log": "153fdccb7d858a62645363d2b39515c473120661ab24c9bc3c8fa0bedf000931",
+    "archived_collector_log": "cef92a7d15d82d83c0d4742f27b05f51f5d921083f267602c0681fd0d1f6d747",
+    "screenshot": "53ad5f5ac610f375103c4b38bc9dcda1b85defd34e60860272a02fff0da0c9cb"
+  },
+  "observations": [
+    "The genuine BootExecute font-setup process registered and read back the ordinary Explorer Run entry, then terminated and retired. Font-acceptance PID-QUERY never appeared; the strengthened image-matched parser failed for missing execution. The final screenshot contains background and cursor only, not Explorer chrome.",
+    "Actual device-install helpers completed and retired. Repeated installations matched ReactOS's initial device-list snapshot followed by its independent arrival queue, not an observed automatic failure retry. Exact PI11/TID472 set the no-pending-install event437 at log lines597984/597993; the worker then waited on event438 and setup's status-window thread452 terminated at598127/598128. Setup PI15/TID260 subsequently registered components through real registry/filesystem operations.",
+    "The repeated provider TEB fault at RIP0x100006f12c8 resolves in the executed ELF to select_win32k_client_context reading TEB+0x60. Lines7977-7985 join one occurrence to successful CSRSS syscall completion and subsequent waits; the signature alone is not an unrecoverable fault or input-READ receipt. Individual later faults lack exact attachment-generation outcomes.",
+    "The first128 missing-registry-value observations were exhausted during early enumeration. Their absence during later installation cannot identify the cause of DevInstallW error2. No alloc-oom or terminal provider-bugcheck receipt appeared; this does not prove the exact former60528-byte allocation frontier passed.",
+    "Final census118: heap watermark56588488/live56570008, reusable2150096/largest2131616; scratch peak1728888/4194304. Dispatch122673/1115147Mtick; disk read1915159attempts/6152228sectors/37141Mtick, write1413855attempts/5641195sectors/30901Mtick, barriers9468/1484Mtick; recorded disk failures zero. The final committed volume snapshot reports generation3519 and1469377bytes. Aggregate counters do not establish wall-clock dominance or an exact former failure operation.",
+    "Exact-head crate CI, focused regressions, independent reviews and the full native build passed for the routed string free, Section provenance, generic query observer and CRC composition increments. Those results are not font cleanup or desktop proof. Separate fresh production Userinit/Explorer acceptance remains required."
+  ],
+  "evidence": {
+    "log": "docs/evidence/issue18-owned-receipts-combined-crc-font-timeout.log.gz",
+    "collector_log": "docs/evidence/issue18-owned-receipts-combined-crc-font-timeout-qmp.log.gz",
+    "screenshot": "docs/images/owned-receipts-combined-crc-font-timeout.png"
+  }
+}

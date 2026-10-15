@@ -5,12 +5,14 @@
 
 use super::*;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
+use nt_io_manager::hosted_forward_progress::HostedForwardWorkProgress;
 use nt_io_manager::{
     detached_file_irp::{ExternalFileIrpDispatchPolicy, ExternalFileIrpRequest},
     retained_write_forward::{
         RetainedWriteForward, TerminalWriteForward, WriteCompletion, WriteForwardOutcome,
         WriteForwardResult,
     },
+    source_irp_ledger::SourceIrpForwardIdentity,
     IoParameters, ReadWriteParameters,
 };
 use nt_process::native_handle::{NativeHandleCaller, NativeThreadProcessReference};
@@ -51,7 +53,7 @@ struct RetainedAck {
 }
 
 static mut WORK: Vec<Option<Work>> = Vec::new();
-static mut EXECUTING: Vec<(usize, DriverInstance, u64)> = Vec::new();
+static mut EXECUTING: Vec<(usize, DriverInstance, SourceIrpForwardIdentity, bool)> = Vec::new();
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 
 fn status_for_capture(error: hosted_write_capture::CaptureError) -> i32 {
@@ -68,16 +70,16 @@ fn status_for_capture(error: hosted_write_capture::CaptureError) -> i32 {
     }
 }
 
-fn source_work_index(source_instance: DriverInstance, source_irp_address: u64) -> Option<usize> {
+fn source_work_index(source_instance: DriverInstance, incoming: SourceIrpForwardIdentity) -> Option<usize> {
     let active = unsafe { &*core::ptr::addr_of!(EXECUTING) }
         .iter()
-        .find(|(_, instance, address)| {
+        .find(|(_, instance, identity, source_pin_owned)| {
             instance.pml4 == source_instance.pml4
                 && instance.hosted_domain_id == source_instance.hosted_domain_id
                 && instance.hosted_domain_cookie == source_instance.hosted_domain_cookie
-                && *address == source_irp_address
+                && identity.duplicates_owned(incoming, *source_pin_owned)
         })
-        .map(|(index, _, _)| *index);
+        .map(|(index, _, _, _)| *index);
     if active.is_some() {
         return active;
     }
@@ -89,9 +91,46 @@ fn source_work_index(source_instance: DriverInstance, source_irp_address: u64) -
                     && work.source_instance.exec_pool_va == source_instance.exec_pool_va
                     && work.source_instance.hosted_domain_id == source_instance.hosted_domain_id
                     && work.source_instance.hosted_domain_cookie == source_instance.hosted_domain_cookie
-                    && work.source.source_irp_address() == source_irp_address
+                    && work.source.source_identity().duplicates_owned(incoming, work.source.source_pin_owned())
             })
         })
+}
+
+fn source_ack_work_index(source_instance: DriverInstance, source_irp_address: u64) -> Option<usize> {
+    unsafe { &*core::ptr::addr_of!(WORK) }.iter().position(|slot| {
+        slot.as_ref().is_some_and(|work| {
+            !work.source_released && work.source.source_pin_owned()
+                && work.source_instance.pml4 == source_instance.pml4
+                && work.source_instance.exec_pool_va == source_instance.exec_pool_va
+                && work.source_instance.hosted_domain_id == source_instance.hosted_domain_id
+                && work.source_instance.hosted_domain_cookie == source_instance.hosted_domain_cookie
+                && work.source.source_irp_address() == source_irp_address
+                && work.source.validate_source().is_ok()
+        })
+    })
+}
+
+unsafe fn reconcile_source_acks(route: nt_component_suspension::peer_registry::PeerRoute) -> bool {
+    let count = (&*core::ptr::addr_of!(WORK)).len();
+    for index in 0..count {
+        let rows = &mut *core::ptr::addr_of_mut!(WORK);
+        let Some(work) = rows[index].as_ref() else { continue; };
+        let Some(ack) = work.ack.as_ref().filter(|ack| ack.route == route) else { continue; };
+        if !work.source_released || work.actor.is_held() || !ack.reply_entered {
+            return false;
+        }
+        match runtime::reconcile_retained_service_reply(
+            ack.route, ack.dispatch, ack.reply, ack.token,
+        ) {
+            Ok(true) => {},
+            _ => return false,
+        }
+        if runtime::retire_stopped_acknowledged_retained_service(
+            ack.route, ack.dispatch, ack.reply, ack.token,
+        ).is_err() { return false; }
+        rows[index] = None;
+    }
+    true
 }
 
 /// `None` retains the authenticated source Call. A duplicate cannot dispatch again.
@@ -108,7 +147,10 @@ pub(super) unsafe fn submit(
     if hosted_driver_pump_caller_tcb(ch, active_reply_cap, caller_badge).is_none() {
         return Some(STATUS_INVALID_HANDLE_LOCAL);
     }
-    if source_work_index(source_instance, source_irp_address).is_some() {
+    let Some(route) = runtime::channel_route(ch).ok().flatten() else {
+        return Some(STATUS_INVALID_HANDLE_LOCAL);
+    };
+    if !reconcile_source_acks(route) {
         return Some(STATUS_DEVICE_BUSY_LOCAL);
     }
     let mut source = match hosted_write_capture::capture(
@@ -117,6 +159,11 @@ pub(super) unsafe fn submit(
         Ok(source) => source,
         Err(error) => return Some(status_for_capture(error)),
     };
+    let identity = source.source_identity();
+    if source_work_index(source_instance, identity).is_some() {
+        source.release().expect("duplicate WRITE capture rollback");
+        return Some(STATUS_DEVICE_BUSY_LOCAL);
+    }
     let Some((target_index, _, _)) =
         hosted_driver_device_route_by_device_id(source.device_id().raw())
     else {
@@ -128,10 +175,6 @@ pub(super) unsafe fn submit(
     let Some(provider_instance) = instance(provider_index) else {
         source.release().expect("unentered WRITE provider rejection");
         return Some(STATUS_INVALID_DEVICE_REQUEST_LOCAL);
-    };
-    let Some(route) = runtime::channel_route(ch).ok().flatten() else {
-        source.release().expect("unentered WRITE route rollback");
-        return Some(STATUS_INVALID_HANDLE_LOCAL);
     };
     let Ok(dispatch) = runtime::dispatch(route) else {
         source.release().expect("unentered WRITE dispatch rollback");
@@ -161,7 +204,7 @@ pub(super) unsafe fn submit(
             (row.is_none()
                 && !(&*core::ptr::addr_of!(EXECUTING))
                     .iter()
-                    .any(|(active, _, _)| *active == index))
+                    .any(|(active, _, _, _)| *active == index))
             .then_some(index)
         });
     if slot.is_none() && (&mut *core::ptr::addr_of_mut!(WORK)).try_reserve(1).is_err() {
@@ -206,6 +249,34 @@ pub(super) unsafe fn submit(
 }
 
 impl Work {
+    fn progress(&self) -> HostedForwardWorkProgress {
+        HostedForwardWorkProgress {
+            initial_status: self.initial_status,
+            canonical_irp: self.canonical_irp.map(|irp| irp.raw()),
+            retained: self.retained.is_some(),
+            terminal: self.terminal.is_some(),
+            completion: self.completion.is_some(),
+            source_released: self.source_released,
+            source_published: false,
+            cancel_requested: self.cancel_requested,
+            actor_held: self.actor.is_held(),
+            reply_entered: self.reply_entered,
+            origin: None,
+            ack: self.ack.as_ref().map(|ack| ack.reply_entered),
+        }
+    }
+
+    unsafe fn release_source(&mut self) -> bool {
+        if self.source_released { return true; }
+        if self.source.release().is_err() { return false; }
+        self.source_released = true;
+        let identity = self.source.source_identity();
+        for (_, _, active, source_pin_owned) in &mut *core::ptr::addr_of_mut!(EXECUTING) {
+            if *active == identity { *source_pin_owned = false; }
+        }
+        true
+    }
+
     unsafe fn ready_for_nested_step(&self) -> bool {
         if let Some(ack) = &self.ack { return !ack.reply_entered; }
         if self.reply_entered { return false; }
@@ -219,10 +290,7 @@ impl Work {
     }
 
     unsafe fn release_unentered_owners(&mut self) -> bool {
-        if !self.source_released {
-            if self.source.release().is_err() { return false; }
-            self.source_released = true;
-        }
+        if !self.release_source() { return false; }
         !self.actor.is_held() || self.actor_release().is_ok()
     }
 
@@ -376,10 +444,7 @@ impl Work {
             if acknowledge_completed_irp(irp.raw()).is_err() { return false; }
             self.canonical_irp = None;
         }
-        if !self.source_released {
-            if self.source.release().is_err() { return false; }
-            self.source_released = true;
-        }
+        if !self.release_source() { return false; }
         !self.actor.is_held() || self.actor_release().is_ok()
     }
 
@@ -463,7 +528,7 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
     let start = CURSOR.load(Ordering::Relaxed) as usize % count;
     let Some((index, mut work)) = (0..count).find_map(|step| {
         let index = (start + step) % count;
-        if (&*core::ptr::addr_of!(EXECUTING)).iter().any(|(active, _, _)| *active == index) {
+        if (&*core::ptr::addr_of!(EXECUTING)).iter().any(|(active, _, _, _)| *active == index) {
             return None;
         }
         if nested_ready_only && !(&*core::ptr::addr_of!(WORK))[index]
@@ -477,13 +542,15 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
         return false;
     }
     (&mut *core::ptr::addr_of_mut!(EXECUTING)).push((
-        index, work.source_instance, work.source.source_irp_address(),
+        index, work.source_instance, work.source.source_identity(), work.source.source_pin_owned(),
     ));
     CURSOR.store(index as u64 + 1, Ordering::Relaxed);
+    let before = work.progress();
     let done = work.advance(handler);
+    let progressed = HostedForwardWorkProgress::advanced(before, work.progress(), done);
     if !done { (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work); }
     assert_eq!((&mut *core::ptr::addr_of_mut!(EXECUTING)).pop().map(|row| row.0), Some(index));
-    true
+    progressed
 }
 
 pub(super) unsafe fn redrive(handler: *mut ExecNtHandler) {
@@ -492,13 +559,16 @@ pub(super) unsafe fn redrive(handler: *mut ExecNtHandler) {
 
 pub(super) unsafe fn nested_work_ready() -> bool {
     (&*core::ptr::addr_of!(WORK)).iter().enumerate().any(|(index, row)| {
-        !(&*core::ptr::addr_of!(EXECUTING)).iter().any(|(active, _, _)| *active == index)
+        !(&*core::ptr::addr_of!(EXECUTING)).iter().any(|(active, _, _, _)| *active == index)
             && row.as_ref().is_some_and(|work| work.ready_for_nested_step())
     })
 }
 
 pub(super) unsafe fn redrive_nested_ready(handler: *mut ExecNtHandler) -> bool {
-    redrive_one(handler, true)
+    let attempts = (&*core::ptr::addr_of!(WORK)).len();
+    nt_io_manager::hosted_forward_progress::redrive_ready_pass(attempts, || {
+        redrive_one(handler, true)
+    })
 }
 
 /// A new authenticated Call acknowledges `IoFreeIrp` issued by the source completion routine.
@@ -514,10 +584,10 @@ pub(super) unsafe fn acknowledge(
     if hosted_driver_pump_caller_tcb(ch, reply_cap, caller_badge).is_none() {
         return Some(STATUS_INVALID_HANDLE_LOCAL);
     }
-    let Some(index) = source_work_index(source_instance, source_irp_address) else {
+    let Some(index) = source_ack_work_index(source_instance, source_irp_address) else {
         return Some(STATUS_INVALID_HANDLE_LOCAL);
     };
-    if (&*core::ptr::addr_of!(EXECUTING)).iter().any(|(active, _, _)| *active == index) {
+    if (&*core::ptr::addr_of!(EXECUTING)).iter().any(|(active, _, _, _)| *active == index) {
         return Some(STATUS_DEVICE_BUSY_LOCAL);
     }
     let Some(work) = (&mut *core::ptr::addr_of_mut!(WORK))[index].as_mut() else {

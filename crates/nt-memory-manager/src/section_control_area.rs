@@ -4,6 +4,13 @@ use super::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SectionMountId(u64);
 
+impl SectionMountId {
+    /// Stable scalar observation of this mounted-volume incarnation.
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
 pub struct SectionMountIds {
     next: u64,
 }

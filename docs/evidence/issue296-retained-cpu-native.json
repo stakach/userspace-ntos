@@ -1,0 +1,30 @@
+{
+  "issue": 296,
+  "upstream_pull_request": "https://github.com/stakach/rust-micro/pull/17",
+  "tested_source_commit": "80a424e",
+  "merged_microkernel_commit": "2debcee98856ea648924c9ddf0c20a491750668b",
+  "host_tests": {"passed": 9, "failed": 0, "exit": 0},
+  "previous_source_plumbing_regression_exit": 101,
+  "build_exit": 0,
+  "native_exit": 0,
+  "native_bound_seconds": 1200,
+  "rootserver_checks": {"passed": 16, "failed": 0},
+  "observed_syscall_idle_backedges": 71,
+  "exact_head_ci": [37423038943, 37423068267],
+  "artifact_sha256": {
+    "microkernel": "f54ba4194bd7bc17f54463dee6e9d9100e611cd2ef947c3eb4141af0ff20178d",
+    "microtest_rootserver": "51c03900b7f1128fba47a675496657a9f2e258a7e62084406f134ff45a5e37a3",
+    "disk": "8dc88faabe307aacc8822ef70da983d609b7a2b1bf8ba1bcb680fa04ec5b2a23",
+    "raw_log": "85c27e78f667d2daf847f0bc544e9a3c93ed14e0a93bf40edb6aaf00e757fc55",
+    "archived_log": "b88aa35cd210f0ccd450245c9e9d822bca586f462c554443c581d21aa74e7419"
+  },
+  "observations": [
+    "Each non-migrating BKL acquisition samples hardware identity once and passes it into every retirement/quiescence poll, including nested IF-clear waits. Standalone IPI service still samples hardware at its own entry. User GS and TCB affinity are never ownership authority.",
+    "Independent source review found no blocker. Mailbox synchronization, exact owner release and physical all-context CR4 flush before ACK are unchanged. No deferred acknowledgements or root-ASID-only invalidation.",
+    "Actual native SMP/global-retirement/quiescence kernel specs and all16 rootserver checks passed; owned AP syscall idle probe completed64 retirement rounds,20000 observation calls and2 replies. The live no-thread syscall backedge counter recorded71 before real guest completion.",
+    "New source-plumbing regression fails against the previous smp/quiescence sources. This is a source contract, not execution of old hardware behavior. Actual-module host tests passed before and after focused formatting; native build preceded whitespace-only formatting of the BKL module.",
+    "Initial image staging correctly refused production/font-cleanup mismatch. Successful build used the explicit existing font-cleanup profile; the microtest rootserver is not an NT desktop acceptance process. Production extern-rootserver builds omit spec-only observer/probe code.",
+    "Both exact-head upstream host CI runs passed before squash merge. A fresh NT image and unchanged strict parser remain required. This receipt makes no total-boot performance, font cleanup or desktop claim."
+  ],
+  "evidence": {"log": "docs/evidence/issue296-retained-cpu-native.log.gz"}
+}

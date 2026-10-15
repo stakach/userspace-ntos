@@ -16,9 +16,10 @@ use nt_hive_core::{
     import_control_set_critical_device_database_into_config_manager,
     import_control_set_enum_into_config_manager, import_control_set_network_into_config_manager,
     import_control_set_services_into_config_manager,
+    seed_reactos_network_adapter_bindings_into_target,
     seed_reactos_network_bindings_from_config_manager_into_target,
-    seed_reactos_network_setup_into_target, CellId, Hive, HiveKind, ReactOsSetupSeedTarget,
-    RegistryValueType,
+    seed_reactos_network_setup_into_target, CellId, Hive, HiveKind,
+    ReactOsNetworkAdapterBinding, ReactOsSetupSeedTarget, RegistryValueType,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -34,9 +35,9 @@ const E1000_INTERFACE_NAME: &str = "E1000_0000";
 const E1000_DRIVER_DESC: &str = "ReactOS Intel PRO/1000 Adapter";
 const DC21X4_DRIVER_DESC: &str = "Intel 21143-based PCI Ethernet Adapter";
 const BOCHS_INF_RELATIVE_PATH: &str = "rust-micro/.tmp/reactos/reactos/inf/bochsmp.inf";
+#[cfg(test)]
 const BOCHS_INSTANCE_ID: &str = r"PCI\VEN_1234&DEV_1111\3&11583659&0&08";
 const BOCHS_DRIVER_KEY_INDEX: &str = "0000";
-const BOCHS_PDO_NAME: &str = r"\Device\NTPNP_PCI0002";
 #[cfg(test)]
 const GENERATED_HIVE_STORAGE_WINDOW: usize = 7 * 4096;
 
@@ -51,6 +52,8 @@ enum GeneratedHiveProfile {
     SehTerminalExitIntegration,
     MupProviderIntegration,
     SourceIrpIntegration,
+    FileAcceptance,
+    FontCleanup,
 }
 
 fn generated_hive_profile_from_name(name: &str) -> Option<GeneratedHiveProfile> {
@@ -63,6 +66,8 @@ fn generated_hive_profile_from_name(name: &str) -> Option<GeneratedHiveProfile> 
         "seh-terminal-exit" => Some(GeneratedHiveProfile::SehTerminalExitIntegration),
         "mup-provider" => Some(GeneratedHiveProfile::MupProviderIntegration),
         "source-irp-integration" => Some(GeneratedHiveProfile::SourceIrpIntegration),
+        "file-acceptance" => Some(GeneratedHiveProfile::FileAcceptance),
+        "font-cleanup" => Some(GeneratedHiveProfile::FontCleanup),
         _ => None,
     }
 }
@@ -71,7 +76,7 @@ fn generated_hive_profile_from_env() -> GeneratedHiveProfile {
     match std::env::var("NTOS_IMAGE_PROFILE") {
         Ok(value) => generated_hive_profile_from_name(&value).unwrap_or_else(|| {
             panic!(
-                "unsupported NTOS_IMAGE_PROFILE '{value}'; supported: production, pending-start, live-device-action, seh-driver, seh-terminal-unhandled, seh-terminal-exit, mup-provider, source-irp-integration"
+                "unsupported NTOS_IMAGE_PROFILE '{value}'; supported: production, pending-start, live-device-action, seh-driver, seh-terminal-unhandled, seh-terminal-exit, mup-provider, source-irp-integration, file-acceptance, font-cleanup"
             )
         }),
         Err(std::env::VarError::NotPresent) => GeneratedHiveProfile::Production,
@@ -609,11 +614,32 @@ fn import_generated_hive_config_manager(hive: &Hive) -> ConfigManager {
     cm
 }
 
-fn seed_generated_network_setup(hive: &mut Hive) {
+fn seed_generated_network_setup(hive: &mut Hive, adapters: &[GeneratedNetworkAdapter]) {
     let cm = import_generated_hive_config_manager(hive);
     let mut target = GeneratedHiveSetupSeedTarget { hive };
     let mut stats = seed_reactos_network_setup_into_target(&mut target);
     seed_reactos_network_bindings_from_config_manager_into_target(&mut target, &cm, &mut stats);
+    let native_pending: Vec<_> = adapters
+        .iter()
+        .filter(|adapter| cm.devnode(&adapter.instance_id).is_none())
+        .map(|adapter| {
+            let class_key_path = format!(
+                r"\Registry\Machine\System\CurrentControlSet\Control\Class\{}",
+                adapter.driver_key
+            );
+            ReactOsNetworkAdapterBinding {
+                instance_id: String::new(),
+                linkage_key_path: format!(r"{}\Linkage", class_key_path),
+                class_key_path,
+                interface_name: adapter.root_device.clone(),
+                device_name: adapter.export_name.clone(),
+                tcpip_export_name: format!(r"\Device\Tcpip_{}", adapter.root_device),
+                driver_desc: adapter.driver_desc.to_string(),
+                component_id: adapter.hardware_ids[0].to_string(),
+            }
+        })
+        .collect();
+    seed_reactos_network_adapter_bindings_into_target(&mut target, &native_pending, &mut stats);
 }
 
 fn workspace_relative_path(relative: &str) -> PathBuf {
@@ -955,42 +981,21 @@ fn install_display_miniport(
     );
 
     let driver_key = format!(r"{}\{}", install.class_guid, BOCHS_DRIVER_KEY_INDEX);
-    let devnode = hive.create_key(&format!(r"ControlSet001\Enum\{}", BOCHS_INSTANCE_ID));
+    let policy = hive.create_key(&format!(
+        r"ControlSet001\Control\CriticalDeviceDatabase\{}",
+        install.hardware_id.replace('\\', "#")
+    ));
     hive.set_value(
-        devnode,
+        policy,
         "Service",
         RegistryValueType::Sz,
         utf16le_sz(&install.service_name),
     );
     hive.set_value(
-        devnode,
-        "PdoName",
+        policy,
+        "ClassGUID",
         RegistryValueType::Sz,
-        utf16le_sz(BOCHS_PDO_NAME),
-    );
-    hive.set_value(
-        devnode,
-        "Driver",
-        RegistryValueType::Sz,
-        utf16le_sz(&driver_key),
-    );
-    hive.set_value(
-        devnode,
-        "DeviceDesc",
-        RegistryValueType::Sz,
-        utf16le_sz(&install.device_desc),
-    );
-    hive.set_value(
-        devnode,
-        "HardwareID",
-        RegistryValueType::MultiSz,
-        encode_multi_sz(&[install.hardware_id.as_str()]),
-    );
-    hive.set_value(
-        devnode,
-        "CompatibleIDs",
-        RegistryValueType::MultiSz,
-        encode_multi_sz(&[r"PCI\CC_030000", r"PCI\CC_0300"]),
+        utf16le_sz(&install.class_guid),
     );
 
     let class_key = hive.create_key(&format!(r"ControlSet001\Control\Class\{}", driver_key));
@@ -1128,6 +1133,16 @@ fn build_hive_with_configuration(
     hive.set_dword(select, "Default", 1);
     hive.set_dword(select, "LastKnownGood", 1);
     hive.set_dword(select, "Failed", 0);
+    if profile == GeneratedHiveProfile::FileAcceptance {
+        let manager = hive.create_key(r"ControlSet001\Control\Session Manager");
+        hive.set_value(manager, "BootExecute", RegistryValueType::MultiSz,
+            encode_multi_sz(&["file_acceptance"]));
+    }
+    if profile == GeneratedHiveProfile::FontCleanup {
+        let manager = hive.create_key(r"ControlSet001\Control\Session Manager");
+        hive.set_value(manager, "BootExecute", RegistryValueType::MultiSz,
+            encode_multi_sz(&["font_run_setup"]));
+    }
     // A recognizable marker the executive reads back: ...\NtosTest\Answer = REG_DWORD 42.
     let key = hive.create_key(r"ControlSet001\Services\NtosTest");
     hive.set_dword(key, "Answer", 42);
@@ -1249,10 +1264,10 @@ fn build_hive_with_configuration(
     }
 
     let initial_network_devnodes = match profile {
-        GeneratedHiveProfile::Production
-        | GeneratedHiveProfile::PendingStartIntegration
+        GeneratedHiveProfile::PendingStartIntegration
         | GeneratedHiveProfile::MupProviderIntegration
         | GeneratedHiveProfile::SourceIrpIntegration
+        | GeneratedHiveProfile::FileAcceptance
         | GeneratedHiveProfile::SehDriverIntegration
         | GeneratedHiveProfile::SehTerminalUnhandledIntegration
         | GeneratedHiveProfile::SehTerminalExitIntegration => {
@@ -1265,9 +1280,10 @@ fn build_hive_with_configuration(
             );
             1
         }
+        GeneratedHiveProfile::Production | GeneratedHiveProfile::FontCleanup => 0,
     };
     install_generated_network_adapters(&mut hive, &network_adapters, initial_network_devnodes);
-    seed_generated_network_setup(&mut hive);
+    seed_generated_network_setup(&mut hive, &network_adapters);
 
     let bochs = bochs_display_install_from_staged_inf()
         .expect("staged ReactOS bochsmp.inf must describe the display miniport");
@@ -1452,6 +1468,25 @@ mod tests {
     }
 
     #[test]
+    fn file_acceptance_profile_is_native_bootexecute_only() {
+        assert_eq!(generated_hive_profile_from_name("file-acceptance"),
+                   Some(GeneratedHiveProfile::FileAcceptance));
+        let path = r"ControlSet001\Control\Session Manager";
+        let production = build_hive();
+        assert!(production.open_key(path)
+            .and_then(|key| production.query_value(key, "BootExecute")).is_none());
+        let hive = build_hive_with_configuration(
+            generated_e1000_adapters(1), GeneratedDisplayMode::DEFAULT,
+            GeneratedHiveProfile::FileAcceptance,
+        );
+        let manager = hive.open_key(path).unwrap();
+        assert_eq!(hive.query_value(manager, "BootExecute"),
+            Some((RegistryValueType::MultiSz, encode_multi_sz(&["file_acceptance"]).as_slice())));
+        assert!(hive.open_key(r"ControlSet001\Services\SourceIrpProbeTarget").is_none());
+        assert!(hive.open_key(r"ControlSet001\Services\NtosMupProviderTest").is_none());
+    }
+
+    #[test]
     fn source_irp_profile_declares_metadata_without_production_fixture() {
         assert!(build_hive().open_key(r"ControlSet001\Services\SourceIrpProbeTarget").is_none());
         let hive = build_hive_with_configuration(
@@ -1474,6 +1509,95 @@ mod tests {
         }
         assert_eq!(generated_hive_profile_from_name("source-irp-integration"),
                    Some(GeneratedHiveProfile::SourceIrpIntegration));
+    }
+
+    #[test]
+    fn font_cleanup_profile_uses_native_setup_without_replacing_the_shell() {
+        assert_eq!(generated_hive_profile_from_name("font-cleanup"),
+                   Some(GeneratedHiveProfile::FontCleanup));
+        let production = build_hive();
+        let hive = build_hive_with_configuration(
+            generated_e1000_adapters(1), GeneratedDisplayMode::DEFAULT,
+            GeneratedHiveProfile::FontCleanup,
+        );
+        let path = r"ControlSet001\Control\Session Manager";
+        assert!(production.open_key(path)
+            .and_then(|key| production.query_value(key, "BootExecute")).is_none());
+        let manager = hive.open_key(path).expect("native test setup command");
+        assert_eq!(hive.query_value(manager, "BootExecute"),
+            Some((RegistryValueType::MultiSz, encode_multi_sz(&["font_run_setup"]).as_slice())));
+        // SOFTWARE Run is installed by public NT registry calls, not a wrong SYSTEM namespace.
+        assert!(hive.open_key(r"Software\Microsoft\Windows\CurrentVersion\Run").is_none());
+        assert!(hive.query_value(manager, "Shell").is_none());
+        assert!(hive.query_value(manager, "Userinit").is_none());
+        for service in ["SourceIrpProbeTarget", "NtosMupProviderTest", "SehDriverTest"] {
+            assert!(hive.open_key(&format!(r"ControlSet001\Services\{}", service)).is_none());
+        }
+    }
+
+    #[test]
+    fn production_and_font_overlays_preserve_imported_livecd_startup() {
+        let mut imported = Hive::new(HiveKind::System);
+        let select = imported.create_key("Select");
+        imported.set_dword(select, "Current", 2);
+        let setup = imported.create_key("Setup");
+        imported.set_dword(setup, "SetupType", 1);
+        imported.set_dword(setup, "SystemSetupInProgress", 1);
+        let command = utf16le_sz("setup -mini");
+        imported.set_value(setup, "CmdLine", RegistryValueType::ExpandSz, command.clone());
+        let plugplay = imported.create_key(r"ControlSet002\Services\PlugPlay");
+        imported.set_dword(plugplay, "Start", 3);
+        let manager = imported.create_key(r"ControlSet002\Control\Session Manager");
+        imported.set_value(
+            manager,
+            "BootExecute",
+            RegistryValueType::MultiSz,
+            encode_multi_sz(&[]),
+        );
+        imported.finish_clean_import();
+
+        // ReactOS winlogon RunSetup consumes this real CmdLine; syssetup InstallLiveCD
+        // then launches userinit. Generated driver/test metadata must not bypass that path.
+        // This fixture intentionally has an empty imported BootExecute list and does not
+        // assert preservation/merging semantics for a populated list.
+        for profile in [
+            GeneratedHiveProfile::Production,
+            GeneratedHiveProfile::FontCleanup,
+        ] {
+            let generated = build_hive_with_configuration(
+                generated_e1000_adapters(1),
+                GeneratedDisplayMode::DEFAULT,
+                profile,
+            );
+            let composed = compose_system_hive_overlay(&imported, &generated)
+                .expect("compose generated overlay with imported LiveCD SYSTEM");
+            assert_eq!(composed.current_control_set().unwrap().number(), 2);
+            let setup = composed
+                .open_key("Setup")
+                .expect("imported Setup key retained");
+            assert_eq!(composed.query_dword(setup, "SetupType"), Some(1));
+            assert_eq!(composed.query_dword(setup, "SystemSetupInProgress"), Some(1));
+            assert_eq!(
+                composed.query_value(setup, "CmdLine"),
+                Some((RegistryValueType::ExpandSz, command.as_slice()))
+            );
+            let plugplay = composed
+                .open_key(r"ControlSet002\Services\PlugPlay")
+                .expect("imported PlugPlay service retained");
+            assert_eq!(composed.query_dword(plugplay, "Start"), Some(3));
+            let manager = composed
+                .open_key(r"ControlSet002\Control\Session Manager")
+                .expect("selected control set retains Session Manager");
+            let expected = match profile {
+                GeneratedHiveProfile::Production => encode_multi_sz(&[]),
+                GeneratedHiveProfile::FontCleanup => encode_multi_sz(&["font_run_setup"]),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                composed.query_value(manager, "BootExecute"),
+                Some((RegistryValueType::MultiSz, expected.as_slice()))
+            );
+        }
     }
 
     #[test]
@@ -1642,6 +1766,44 @@ mod tests {
     }
 
     #[test]
+    fn production_and_font_cleanup_pci_services_wait_for_native_relation_identity() {
+        for profile in [GeneratedHiveProfile::Production, GeneratedHiveProfile::FontCleanup] {
+            let hive = build_hive_with_configuration(
+                generated_e1000_adapters(1),
+                GeneratedDisplayMode::DEFAULT,
+                profile,
+            );
+            for instance in [E1000_INSTANCE_ID, BOCHS_INSTANCE_ID] {
+                assert!(
+                    hive.open_key(&format!(r"ControlSet001\Enum\{}", instance)).is_none(),
+                    "{profile:?} generated PCI instance must not compete with a native bus relation"
+                );
+            }
+            let bochs_policy = hive
+                .open_key(r"ControlSet001\Control\CriticalDeviceDatabase\PCI#VEN_1234&DEV_1111")
+                .expect("native Bochs PCI hardware ID must select its installed miniport");
+            assert_eq!(
+                hive.query_value(bochs_policy, "Service"),
+                Some((RegistryValueType::Sz, utf16le_sz("bochsmp").as_slice()))
+            );
+            let cm = import_generated_hive_config_manager(&hive);
+            let e1000 = cm
+                .resolve_critical_device_id(r"PCI\VEN_8086&DEV_100E")
+                .unwrap()
+                .expect("E1000 native hardware ID must select its service");
+            assert_eq!(e1000.service_name.as_deref(), Some("E1000"));
+            let tcpip_linkage = cm
+                .registry()
+                .open_key(r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Linkage")
+                .expect("network setup must survive removal of fabricated Enum instances");
+            assert_eq!(
+                cm.registry().query_multi_string(tcpip_linkage, "Bind"),
+                Some(vec![String::from(E1000_EXPORT_NAME)])
+            );
+        }
+    }
+
+    #[test]
     fn generated_hive_declares_registry_selected_e1000_pci_driver() {
         let hive = build_hive();
         let key = hive
@@ -1666,17 +1828,17 @@ mod tests {
         );
 
         let dn = hive
-            .open_key(&format!(r"ControlSet001\Enum\{}", E1000_INSTANCE_ID))
-            .expect("devnode key");
+            .open_key(r"ControlSet001\Control\CriticalDeviceDatabase\PCI#VEN_8086&DEV_100E")
+            .expect("native PCI hardware policy");
         assert_eq!(
             hive.query_value(dn, "Service"),
             Some((RegistryValueType::Sz, utf16le_sz("E1000").as_slice()))
         );
         assert_eq!(
-            hive.query_value(dn, "Driver"),
+            hive.query_value(dn, "ClassGUID"),
             Some((
                 RegistryValueType::Sz,
-                utf16le_sz(E1000_DRIVER_KEY).as_slice()
+                utf16le_sz(NET_CLASS_GUID).as_slice()
             ))
         );
 
@@ -1732,7 +1894,7 @@ mod tests {
         ]);
         let mut hive = Hive::new(HiveKind::System);
         install_generated_network_adapters(&mut hive, &adapters, adapters.len());
-        seed_generated_network_setup(&mut hive);
+        seed_generated_network_setup(&mut hive, &adapters);
 
         let service = hive
             .open_key(r"ControlSet001\Services\dc21x4")
@@ -2032,7 +2194,7 @@ mod tests {
         let adapters = generated_e1000_adapters(2);
         let mut hive = Hive::new(HiveKind::System);
         install_generated_network_adapters(&mut hive, &adapters, adapters.len());
-        seed_generated_network_setup(&mut hive);
+        seed_generated_network_setup(&mut hive, &adapters);
 
         let tcpip_linkage = hive
             .open_key(r"ControlSet001\Services\Tcpip\Linkage")
@@ -2128,17 +2290,17 @@ mod tests {
         );
 
         let devnode = hive
-            .open_key(&format!(r"ControlSet001\Enum\{}", BOCHS_INSTANCE_ID))
-            .expect("display devnode");
+            .open_key(r"ControlSet001\Control\CriticalDeviceDatabase\PCI#VEN_1234&DEV_1111")
+            .expect("display hardware policy");
         assert_eq!(
             hive.query_value(devnode, "Service"),
             Some((RegistryValueType::Sz, utf16le_sz("bochsmp").as_slice()))
         );
         assert_eq!(
-            hive.query_value(devnode, "HardwareID"),
+            hive.query_value(devnode, "ClassGUID"),
             Some((
-                RegistryValueType::MultiSz,
-                encode_multi_sz(&[r"PCI\VEN_1234&DEV_1111"]).as_slice()
+                RegistryValueType::Sz,
+                utf16le_sz("{4D36E968-E325-11CE-BFC1-08002BE10318}").as_slice()
             ))
         );
 
@@ -2214,6 +2376,7 @@ mod tests {
             (GeneratedHiveProfile::SehTerminalExitIntegration, 1),
             (GeneratedHiveProfile::MupProviderIntegration, 1),
             (GeneratedHiveProfile::SourceIrpIntegration, 1),
+            (GeneratedHiveProfile::FontCleanup, 1),
         ] {
             let bytes = encode_image(&build_hive_with_configuration(
                 generated_e1000_adapters(count),
@@ -2254,7 +2417,8 @@ mod tests {
         let mut cm = import_generated_hive_config_manager(&hive);
 
         let devnodes_before = cm.devnode_count();
-        assert!(devnodes_before >= 1);
+        // Production waits for the native PCI bus relation instead of fabricating Enum devnodes.
+        assert_eq!(devnodes_before, 0);
         let stats = nt_hive_core::seed_reactos_network_setup_in_config_manager(&mut cm);
         assert_eq!(stats, nt_hive_core::ReactOsNetworkSetupSeedStats::default());
         assert_eq!(cm.devnode_count(), devnodes_before);
@@ -2267,9 +2431,11 @@ mod tests {
             cm.registry().query_multi_string(tcpip_linkage, "Bind"),
             Some(vec![String::from(E1000_EXPORT_NAME)])
         );
+        assert!(cm.devnode(E1000_INSTANCE_ID).is_none());
         let e1000 = cm
-            .devnode(E1000_INSTANCE_ID)
-            .expect("generated E1000 devnode");
-        assert_eq!(e1000.service.as_deref(), Some("E1000"));
+            .resolve_critical_device_id(r"PCI\VEN_8086&DEV_100E")
+            .unwrap()
+            .expect("native E1000 policy");
+        assert_eq!(e1000.service_name.as_deref(), Some("E1000"));
     }
 }

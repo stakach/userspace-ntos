@@ -1,0 +1,15 @@
+[package]
+name = "nt-page-storage"
+description = "Fallible page-bounded metadata storage with stable leaf elements. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+allocation-observation = []
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

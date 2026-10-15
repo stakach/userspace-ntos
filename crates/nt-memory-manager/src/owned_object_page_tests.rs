@@ -174,6 +174,137 @@ fn page() -> OwnedObjectPage<u64, Target> {
 }
 
 #[test]
+fn non_root_retirement_preserves_root_backing_and_initialization() {
+    let mut page = page();
+    let mut io = Backend::default();
+    page.construct(&mut io).unwrap();
+    page.map_alias(A, 3, &mut io).unwrap();
+    page.map_alias(B, 1, &mut io).unwrap();
+    let root = page.live_alias(ROOT);
+    let a = page.live_alias(A).unwrap().0;
+    let b = page.live_alias(B).unwrap().0;
+    let initializations = io.count("initialize");
+    page.retire_non_root_aliases(&mut io).unwrap();
+    assert!(page.non_root_aliases_drained());
+    assert_eq!(page.live_alias(ROOT), root);
+    assert!(page.is_initialized() && io.backing);
+    assert_eq!(io.bytes, 77);
+    assert_eq!(io.count("initialize"), initializations);
+    assert_eq!(io.count("release"), 0);
+    assert!(!page.owns_cap(a) && !page.owns_cap(b));
+    assert_eq!(io.caps.len(), 1);
+    // This operation is not whole-body retirement; a separately authorized new alias is legal.
+    page.map_alias(A, 3, &mut io).unwrap();
+    assert!(!page.non_root_aliases_drained());
+    page.retire(&mut io).unwrap();
+}
+
+#[test]
+fn non_root_retirement_retains_each_target_failure_without_replaying_acks() {
+    for target in [A, B] {
+        for failed in ["unmap", "delete", "recycle"] {
+            let mut page = page();
+            let mut io = Backend::default();
+            page.construct(&mut io).unwrap();
+            page.map_alias(A, 3, &mut io).unwrap();
+            page.map_alias(B, 1, &mut io).unwrap();
+            let root = page.live_alias(ROOT);
+            let retained = page.live_alias(target).unwrap().0;
+            io.fail.push((failed, target));
+            assert_eq!(page.retire_non_root_aliases(&mut io), Err(FAILED));
+            assert!(!page.non_root_aliases_drained());
+            assert!(page.owns_cap(retained));
+            assert_eq!(page.live_alias(ROOT), root);
+            assert!(page.is_initialized() && io.backing);
+            if target == B {
+                assert_eq!(page.live_alias(A), None);
+                assert!(!io.caps.values().any(|cap| cap.target == A));
+            }
+            io.fail.clear();
+            page.retire_non_root_aliases(&mut io).unwrap();
+            assert!(page.non_root_aliases_drained());
+            assert_eq!(page.live_alias(ROOT), root);
+            for owner in [A, B] {
+                for operation in ["unmap", "delete", "recycle"] {
+                    let calls = io
+                        .calls
+                        .iter()
+                        .filter(|call| call.0 == operation && call.2 == owner)
+                        .count();
+                    assert_eq!(
+                        calls,
+                        if owner == target && operation == failed {
+                            2
+                        } else {
+                            1
+                        }
+                    );
+                }
+            }
+            assert_eq!(io.count("release"), 0);
+            assert_eq!(io.count("initialize"), 1);
+            let calls = io.calls.len();
+            page.retire_non_root_aliases(&mut io).unwrap();
+            assert_eq!(io.calls.len(), calls);
+            page.retire(&mut io).unwrap();
+        }
+    }
+}
+
+#[test]
+fn non_root_retirement_drains_failed_copy_and_map_candidates() {
+    for failed in ["copy", "map"] {
+        let mut page = page();
+        let mut io = Backend::default();
+        page.construct(&mut io).unwrap();
+        page.map_alias(B, 1, &mut io).unwrap();
+        io.fail = vec![(failed, A), ("recycle", A)];
+        assert_eq!(page.map_alias(A, 3, &mut io), Err(FAILED));
+        let candidate = *io.caps.iter().find(|(_, cap)| cap.target == A).unwrap().0;
+        assert!(page.owns_cap(candidate));
+        io.fail.clear();
+        page.retire_non_root_aliases(&mut io).unwrap();
+        assert!(page.non_root_aliases_drained());
+        assert!(!page.owns_cap(candidate));
+        assert!(page.live_alias(ROOT).is_some() && io.backing && page.is_initialized());
+        assert_eq!(
+            io.calls
+                .iter()
+                .filter(|call| call.0 == "unmap" && call.2 == A)
+                .count(),
+            0
+        );
+        assert_eq!(
+            io.calls
+                .iter()
+                .filter(|call| call.0 == "delete" && call.2 == A)
+                .count(),
+            usize::from(failed == "map")
+        );
+        assert_eq!(io.count("release"), 0);
+        page.retire(&mut io).unwrap();
+    }
+}
+
+#[test]
+fn non_root_retirement_of_unconstructed_or_empty_page_has_no_effects() {
+    let mut page = page();
+    let mut io = Backend::default();
+    page.retire_non_root_aliases(&mut io).unwrap();
+    page.retire_non_root_aliases(&mut io).unwrap();
+    assert!(io.calls.is_empty());
+    assert!(!page.is_initialized() && !io.backing);
+    page.construct(&mut io).unwrap();
+    let root = page.live_alias(ROOT);
+    let calls = io.calls.len();
+    page.retire_non_root_aliases(&mut io).unwrap();
+    assert_eq!(io.calls.len(), calls);
+    assert_eq!(page.live_alias(ROOT), root);
+    assert!(page.is_initialized() && io.backing);
+    page.retire(&mut io).unwrap();
+}
+
+#[test]
 fn exact_target_retirement_preserves_root_backing_and_other_targets() {
     let mut page = page();
     let mut io = Backend::default();

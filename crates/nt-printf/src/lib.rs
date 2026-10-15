@@ -2,6 +2,8 @@
 
 #![no_std]
 
+pub mod record;
+
 /// ABI type the formatter needs from the variadic argument source.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ArgumentKind {

@@ -47,6 +47,8 @@ type OperationIdentity = (nt_component_suspension::peer_registry::PeerRoute, u64
 static mut ACTIVE: Vec<OperationIdentity> = Vec::new();
 static mut COMPLETED: Vec<OperationIdentity> = Vec::new();
 static CURSOR: AtomicU64 = AtomicU64::new(0);
+static NESTED_READ_TRACE: AtomicU64 = AtomicU64::new(0);
+static NESTED_READY_TRACE: AtomicU64 = AtomicU64::new(0);
 
 fn wire_status(error: wire::AsyncReadWireError) -> i32 {
     match error {
@@ -283,6 +285,32 @@ pub(crate) unsafe fn submit(
 }
 
 impl Work {
+    unsafe fn ready_for_nested_step(&self) -> bool {
+        if !self.entered {
+            return false;
+        }
+        if !self.reply_entered {
+            return true;
+        }
+        if !self.reply_acked {
+            return runtime::retained_service_reply_acknowledged(
+                self.route, self.dispatch, self.reply, self.token,
+            ).unwrap_or(false);
+        }
+        if self.inline_error {
+            return true;
+        }
+        if self.ack_claimed || self.cancel_ack_claimed {
+            return false;
+        }
+        if self.terminal_captured {
+            return true;
+        }
+        self.irp
+            .is_some_and(|irp| nested_file_irp_completion_ready_exact(irp.raw()))
+            || self.terminal.is_some()
+    }
+
     fn cancelled(&self) -> bool {
         unsafe {
             runtime::retained_service_cancelled(self.route, self.dispatch, self.reply, self.token)
@@ -606,6 +634,18 @@ impl Work {
             .file_completion
             .set_signaled(self.file.file_id(), true)
             .expect("terminal win32k read File event");
+        let trace = NESTED_READ_TRACE.fetch_add(1, Ordering::Relaxed);
+        if trace < 8 {
+            print_str(b"[win32k-async-read] file-event token=");
+            print_u64(self.token);
+            print_str(b" irp=");
+            print_u64(self.irp.map_or(0, |irp| irp.raw()));
+            print_str(b" status=");
+            print_u64(status as u64);
+            print_str(b" information=");
+            print_u64(information);
+            print_str(b"\n");
+        }
         let mut objects = (*handler).dispatcher_objects(None);
         crate::service_sec_image::provider_wait_select_ready(&mut objects);
         self.delivery
@@ -637,11 +677,11 @@ impl Work {
     }
 }
 
-pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) {
+unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> bool {
     let _durable = crate::allocator::enter_durable();
     let count = (&*core::ptr::addr_of!(WORK)).len();
     if count == 0 {
-        return;
+        return false;
     }
     let start = CURSOR.load(Ordering::Relaxed) as usize % count;
     let Some((index, mut work)) = (0..count).find_map(|step| {
@@ -649,22 +689,37 @@ pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) {
         if (&*core::ptr::addr_of!(EXECUTING)).contains(&index) {
             return None;
         }
+        if nested_ready_only && !(&*core::ptr::addr_of!(WORK))[index]
+            .as_ref().is_some_and(|work| work.ready_for_nested_step())
+        {
+            return None;
+        }
         (&mut *core::ptr::addr_of_mut!(WORK))[index]
             .take()
             .map(|work| (index, work))
     }) else {
-        return;
+        return false;
     };
     if (&mut *core::ptr::addr_of_mut!(EXECUTING))
         .try_reserve(1)
         .is_err()
     {
         (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
-        return;
+        return false;
     }
     (&mut *core::ptr::addr_of_mut!(EXECUTING)).push(index);
     CURSOR.store(index as u64 + 1, Ordering::Relaxed);
+    let before = (
+        work.entered, work.reply_entered, work.reply_acked, work.irp,
+        work.terminal, work.terminal_captured, work.ack_claimed,
+        work.cancel_ack_claimed,
+    );
     let done = work.advance(handler);
+    let progressed = done || before != (
+        work.entered, work.reply_entered, work.reply_acked, work.irp,
+        work.terminal, work.terminal_captured, work.ack_claimed,
+        work.cancel_ack_claimed,
+    );
     if !done {
         (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
     }
@@ -672,4 +727,24 @@ pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) {
         (&mut *core::ptr::addr_of_mut!(EXECUTING)).pop(),
         Some(index)
     );
+    progressed
+}
+
+pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) {
+    let _ = redrive_one(handler, false);
+}
+
+pub(super) unsafe fn nested_work_ready() -> bool {
+    (&*core::ptr::addr_of!(WORK)).iter().enumerate().any(|(index, row)| {
+        !(&*core::ptr::addr_of!(EXECUTING)).contains(&index)
+            && row.as_ref().is_some_and(|work| work.ready_for_nested_step())
+    })
+}
+
+pub(super) unsafe fn redrive_nested_ready(handler: *mut ExecNtHandler) -> bool {
+    let trace = NESTED_READY_TRACE.fetch_add(1, Ordering::Relaxed);
+    if trace < 8 {
+        print_str(b"[win32k-async-read] nested-ready\n");
+    }
+    redrive_one(handler, true)
 }

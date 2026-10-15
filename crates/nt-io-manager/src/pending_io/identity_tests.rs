@@ -135,7 +135,7 @@ fn local_zero_file_namespaces_have_full_non_busy_owner_identity() {
         let pending = PendingFileIo {
             route: PendingFileRoute::Local(file),
             irp_id: 10 + index as u64,
-            operation: PendingFileIoOperation::LocalInline(PendingLocalInline::default()),
+            operation: PendingFileIoOperation::OwnedInline(PendingOwnedInline::default()),
             ..transfer()
         };
         let reservation = table.reserve().unwrap();

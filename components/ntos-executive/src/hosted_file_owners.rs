@@ -6,7 +6,7 @@ use nt_io_manager::detached_file_irp::{
     ExternalFileIrpCompletionInvocation, ExternalFileIrpCompletionReturn,
     ExternalFileIrpCopyReturn, ExternalFileIrpDispatchPolicy, ExternalFileIrpOutputCapture,
     ExternalFileIrpRequest, ExternalFileIrpResult, ExternalFileIrpReturn, ExternalFileIrpTerminal,
-    PreparedExternalFileIrp, RetainedExternalFileIrp,
+    ExternalFileIrpTerminalReceipt, PreparedExternalFileIrp, RetainedExternalFileIrp,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -70,7 +70,12 @@ struct Row {
     primary_driver: Option<nt_io_manager::DriverId>,
     stack: Vec<(nt_io_manager::DeviceId, nt_io_manager::DriverId)>,
     authorities: Vec<Authority>,
+    projection_owners: Vec<nt_io_manager::HostedDeviceProjectionReference>,
+    /// A completed canonical retirement cannot be replayed if projection release refuses.
+    terminal_receipt: Option<ExternalFileIrpTerminalReceipt>,
+    settled_buffers: Option<ExternalFileIrpBuffers>,
     completion_storage: Option<(usize, usize)>,
+    port_connect_control_storage: Option<usize>,
     flight: Flight,
     payload: Option<Payload>,
     blocked_status: Option<nt_status::NtStatus>,
@@ -155,17 +160,79 @@ fn find(irp_id: IrpId) -> Option<u64> {
         .map(|row| row.id)
 }
 
-fn remove(id: u64) {
+/// Bind a port CONNECT's mutable input copy and ACK to its captured physical store before
+/// native entry. A synchronous completion may need both controls before dispatch returns.
+fn mark_port_connect_control(
+    irp: IrpId, device: nt_io_manager::DeviceId,
+) -> Result<(), nt_status::NtStatus> {
+    let id = find(irp).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    let owner = row(id);
+    let storage = owner.completion_storage
+        .ok_or(nt_status::NtStatus::INVALID_HANDLE)?.1;
+    if owner.primary_device != Some(device)
+        || owner.port_connect_control_storage.is_some()
+        || !owner.authorities.iter().all(|authority| authority.live())
+    { return Err(nt_status::NtStatus::INVALID_HANDLE); }
+    owner.port_connect_control_storage = Some(storage);
+    Ok(())
+}
+
+/// A matching numeric IRP alone cannot authorize a worker control. The detached owner must be
+/// in the corresponding copy/ACK flight and retain the same physical completion store.
+pub(super) unsafe fn active_port_connect_control(storage: usize, irp: IrpId, operation: u64) -> bool {
+    let Some(id) = find(irp) else { return false; };
+    let owner = row(id);
+    let matching_flight = match operation {
+        FSD_DISPATCH_COPY_MUTABLE_INPUT => matches!(owner.flight, Flight::Copy | Flight::Dispatch),
+        FSD_DISPATCH_ACK_COMPLETION => matches!(owner.flight, Flight::Acknowledge | Flight::Dispatch),
+        _ => false,
+    };
+    matching_flight && owner.irp_id == Some(irp)
+        && owner.completion_storage.is_some_and(|(_, physical)| physical == storage)
+        && owner.port_connect_control_storage == Some(storage)
+        && owner.authorities.iter().all(|authority| authority.live())
+}
+
+fn release_projection_owners(id: u64) -> Result<(), nt_status::NtStatus> {
+    for owner in &mut row(id).projection_owners {
+        if owner.is_held() {
+            io_manager_mut().release_hosted_device_projection_reference(owner)?;
+        }
+    }
+    Ok(())
+}
+
+fn quarantine_release(id: u64, status: nt_status::NtStatus) {
+    let owner = row(id);
+    owner.flight = Flight::Blocked;
+    owner.blocked_status = Some(status);
+    owner.retry_after = 0;
+    owner.work_ready = false;
+}
+
+fn remove(id: u64) -> Result<Row, nt_status::NtStatus> {
+    if let Err(status) = release_projection_owners(id) {
+        quarantine_release(id, status);
+        return Err(status);
+    }
     let index = rows()
         .iter()
         .position(|row| row.id == id)
         .expect("File IRP owner missing");
-    unsafe { crate::with_provider_process_manager(|pm| rows()[index].requestor.release(pm)) }
-        .expect("retired IRP retains its original requestor reference pair");
-    rows().swap_remove(index);
+    if let Err(status) =
+        unsafe { crate::with_provider_process_manager(|pm| rows()[index].requestor.release(pm)) }
+    {
+        let status = nt_status::NtStatus(status as i32);
+        quarantine_release(id, status);
+        return Err(status);
+    }
+    Ok(rows().swap_remove(index))
 }
 
-fn reserve(caller: nt_process::native_handle::NativeHandleCaller, output_capture: ExternalFileIrpOutputCapture) -> Result<u64, nt_status::NtStatus> {
+fn reserve(
+    caller: nt_process::native_handle::NativeHandleCaller,
+    output_capture: ExternalFileIrpOutputCapture,
+) -> Result<u64, nt_status::NtStatus> {
     let id = unsafe { NEXT_ID };
     let next = id
         .checked_add(1)
@@ -173,8 +240,9 @@ fn reserve(caller: nt_process::native_handle::NativeHandleCaller, output_capture
     rows()
         .try_reserve(1)
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    let requestor = unsafe { crate::with_provider_process_manager(|pm| pm.reference_native_requestor(caller)) }
-        .map_err(|status| nt_status::NtStatus(status as i32))?;
+    let requestor =
+        unsafe { crate::with_provider_process_manager(|pm| pm.reference_native_requestor(caller)) }
+            .map_err(|status| nt_status::NtStatus(status as i32))?;
     unsafe { NEXT_ID = next };
     rows().push(Row {
         caller,
@@ -185,7 +253,11 @@ fn reserve(caller: nt_process::native_handle::NativeHandleCaller, output_capture
         primary_driver: None,
         stack: Vec::new(),
         authorities: Vec::new(),
+        projection_owners: Vec::new(),
+        terminal_receipt: None,
+        settled_buffers: None,
         completion_storage: None,
+        port_connect_control_storage: None,
         flight: Flight::Preparing,
         payload: None,
         blocked_status: None,
@@ -231,14 +303,23 @@ fn capture_route(id: u64, prepared: &PreparedExternalFileIrp) -> Result<(), nt_s
     authorities
         .try_reserve_exact(capacity)
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    for (_, driver_id) in &stack {
+    let mut registrations = Vec::new();
+    registrations
+        .try_reserve_exact(stack.len())
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    row(id)
+        .projection_owners
+        .try_reserve_exact(stack.len())
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    for (device_id, driver_id) in &stack {
         let Some((index, _)) = instance_by_driver_id(driver_id.raw()) else {
             continue;
         };
         let dependent =
             Authority::capture(index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
         add_authority(&mut authorities, dependent);
-        if let Some(route) = unsafe { hosted_provider_dispatch_route_for_instance(index) } {
+        let provider_route = unsafe { hosted_provider_dispatch_route_for_instance(index) };
+        let physical = if let Some(route) = provider_route {
             let provider = Authority::capture(route.provider_instance)
                 .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
             if dependent.domain != route.dependent_domain
@@ -247,6 +328,19 @@ fn capture_route(id: u64, prepared: &PreparedExternalFileIrp) -> Result<(), nt_s
                 return Err(nt_status::NtStatus::INVALID_PARAMETER);
             }
             add_authority(&mut authorities, provider);
+            provider
+        } else {
+            dependent
+        };
+        let registration = capture_projection_registration(
+            *device_id,
+            *driver_id,
+            dependent,
+            physical,
+            provider_route.is_some(),
+        )?;
+        if !registrations.contains(&registration) {
+            registrations.push(registration);
         }
     }
     if !authorities
@@ -260,7 +354,58 @@ fn capture_route(id: u64, prepared: &PreparedExternalFileIrp) -> Result<(), nt_s
     let (dependent, _) = instance_by_driver_id(prepared.route().driver_id().raw())
         .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     row(id).completion_storage = Some((dependent, hosted_completion_storage_instance(dependent)));
+    // All ownership storage is reserved and every projection resolved before acquiring any pin.
+    // These manager calls are outside foreign execution; publish each pin before the next refusal.
+    for registration in registrations {
+        let owner = io_manager_mut().retain_hosted_device_projection_reference(registration)?;
+        row(id).projection_owners.push(owner);
+    }
     Ok(())
+}
+
+fn capture_projection_registration(
+    device: nt_io_manager::DeviceId,
+    driver: nt_io_manager::DriverId,
+    dependent: Authority,
+    physical: Authority,
+    provider_hosted: bool,
+) -> Result<nt_io_manager::HostedDevicePointerRegistration, nt_status::NtStatus> {
+    if dependent.driver_id != driver.raw()
+        || io_manager_mut()
+            .device(device)
+            .is_none_or(|record| record.driver_id != driver)
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let address = if let Some(binding) = hosted_device_binding_by_device_id(device.raw()) {
+        if binding.instance != dependent.instance
+            || binding.driver_id != driver.raw()
+            || binding.projection_instance != physical.instance
+            || binding.projection_domain != physical.domain
+        {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        binding.device_object
+    } else {
+        if provider_hosted {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        // Direct hosted devices use the canonical domain/address publication, not a guessed PDO.
+        io_manager_mut()
+            .hosted_device_address_by_identity(physical.domain, device)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+    };
+    let registration = io_manager_mut()
+        .hosted_device_pointer_registration(physical.domain, address)
+        .filter(|registration| registration.device_id() == device)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let inst = instance(physical.instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    if !physical.live()
+        || hosted_device_allocations::registration(inst, address) != Ok(Some(registration))
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    Ok(registration)
 }
 
 fn live_route(id: u64) -> bool {
@@ -294,12 +439,16 @@ fn retry_later(id: u64, payload: Payload, status: nt_status::NtStatus) {
     row(id).retry_after = monotonic_time_100ns().saturating_add(1_000_000);
 }
 
-fn discard(id: u64, prepared: PreparedExternalFileIrp) {
+fn discard(id: u64, prepared: PreparedExternalFileIrp) -> Result<(), nt_status::NtStatus> {
     match io_manager_mut().discard_prepared_external_file_irp(prepared) {
-        Ok(_) => remove(id),
+        Ok(buffers) => {
+            row(id).settled_buffers = Some(buffers);
+            remove(id).map(|_| ())
+        }
         Err(rejection) => {
             let (status, owner) = rejection.into_parts();
             block(id, Payload::Prepared(owner), status);
+            Err(status)
         }
     }
 }
@@ -324,6 +473,30 @@ pub(super) fn dispatch(
     initial_output: &[u8],
     policy: ExternalFileIrpDispatchPolicy,
 ) -> Result<DispatchResult, nt_status::NtStatus> {
+    dispatch_with_port_connect(caller, request, input, initial_output, policy, None)
+}
+
+pub(super) fn dispatch_port_connect(
+    caller: nt_process::native_handle::NativeHandleCaller,
+    request: ExternalFileIrpRequest,
+    input: &[u8],
+    device: nt_io_manager::DeviceId,
+) -> Result<DispatchResult, nt_status::NtStatus> {
+    dispatch_with_port_connect(
+        caller, request, input, &[],
+        ExternalFileIrpDispatchPolicy::MutableMethodNeitherInputAtDevice,
+        Some(device),
+    )
+}
+
+fn dispatch_with_port_connect(
+    caller: nt_process::native_handle::NativeHandleCaller,
+    request: ExternalFileIrpRequest,
+    input: &[u8],
+    initial_output: &[u8],
+    policy: ExternalFileIrpDispatchPolicy,
+    port_connect_device: Option<nt_io_manager::DeviceId>,
+) -> Result<DispatchResult, nt_status::NtStatus> {
     let _durable = crate::allocator::enter_durable();
     let copy = |source: &[u8]| -> Result<Vec<u8>, nt_status::NtStatus> {
         let mut bytes = Vec::new();
@@ -339,25 +512,32 @@ pub(super) fn dispatch(
     let prepared = match preparation {
         Ok(prepared) => prepared,
         Err(status) => {
-            remove(id);
+            remove(id)?;
             return Err(status);
         }
     };
     if let Err(status) = capture_route(id, &prepared) {
-        discard(id, prepared);
+        discard(id, prepared)?;
         return Err(status);
     }
     let irp_id = prepared.irp_id();
+    if let Some(device) = port_connect_device {
+        if let Err(status) = mark_port_connect_control(irp_id, device) {
+            discard(id, prepared)?;
+            return Err(status);
+        }
+    }
     let invocation = match io_manager_mut().begin_prepared_external_file_irp(prepared) {
         Ok(invocation) => invocation,
         Err(rejection) => {
             let (status, prepared) = rejection.into_parts();
-            discard(id, prepared);
+            discard(id, prepared)?;
             return Err(status);
         }
     };
     row(id).flight = Flight::Dispatch;
-    let returned = hosted_file_dispatch::invoke(invocation, row(id).caller);
+    let returned =
+        hosted_file_dispatch::invoke(invocation, row(id).caller, policy.output_capture());
     let result = match io_manager_mut().finish_external_file_irp(returned) {
         Ok(result) => result,
         Err(rejection) => {
@@ -368,7 +548,9 @@ pub(super) fn dispatch(
     };
     match result {
         ExternalFileIrpResult::NotEntered { status, prepared } => {
-            discard(id, prepared);
+            if discard(id, prepared).is_err() {
+                return Ok(DispatchResult::Outstanding { irp_id });
+            }
             Err(status)
         }
         ExternalFileIrpResult::Returned(terminal) => {
@@ -376,12 +558,20 @@ pub(super) fn dispatch(
             match io_manager_mut().retire_external_file_irp_terminal(terminal) {
                 Ok((receipt, buffers)) => {
                     assert!(io_manager_mut().accepts_external_file_irp_receipt(&receipt));
-                    remove(id);
+                    row(id).terminal_receipt = Some(receipt);
+                    row(id).settled_buffers = Some(buffers);
+                    let mut retired = match remove(id) {
+                        Ok(retired) => retired,
+                        Err(_) => return Ok(DispatchResult::Outstanding { irp_id }),
+                    };
                     Ok(DispatchResult::Returned {
                         status: completion.status,
                         information: completion.information,
                         file_context: completion.file_context,
-                        buffers,
+                        buffers: retired
+                            .settled_buffers
+                            .take()
+                            .expect("retired File buffers missing"),
                     })
                 }
                 Err(rejection) => {
@@ -408,6 +598,24 @@ pub(super) fn dispatch(
 
 pub(super) fn contains(irp_id: IrpId) -> bool {
     find(irp_id).is_some()
+}
+
+/// The one canonical detached packet currently executing on an exact Device target. A
+/// concurrent same-target dispatch is ambiguous to a nested native lower-edge call and is
+/// refused until its own source identity can be selected independently.
+pub(super) fn unique_executing_device_irp(
+    target: nt_io_manager::DeviceId,
+) -> Option<IrpId> {
+    let mut found = None;
+    for row in rows().iter().filter(|row| {
+        row.flight == Flight::Dispatch && row.primary_device == Some(target)
+    }) {
+        let id = row.irp_id?;
+        if found.replace(id).is_some() {
+            return None;
+        }
+    }
+    found
 }
 
 fn ensure_completion(id: u64) -> Result<(), nt_status::NtStatus> {
@@ -510,8 +718,33 @@ pub(super) fn copy_output(
     offset: u64,
     output: &mut [u8],
 ) -> Result<usize, nt_status::NtStatus> {
+    copy_captured(irp_id, offset, output, false)
+}
+
+/// Read the terminal Type3InputBuffer snapshot before ACK. Only the mutable METHOD_NEITHER
+/// policy can expose this range; an ordinary output copy must never index the input owner.
+pub(super) fn copy_mutable_input(
+    irp_id: IrpId,
+    offset: u64,
+    output: &mut [u8],
+) -> Result<usize, nt_status::NtStatus> {
+    copy_captured(irp_id, offset, output, true)
+}
+
+fn copy_captured(
+    irp_id: IrpId,
+    offset: u64,
+    output: &mut [u8],
+    mutable_input: bool,
+) -> Result<usize, nt_status::NtStatus> {
     let _durable = crate::allocator::enter_durable();
     let id = find(irp_id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if (row(id).output_capture
+        == nt_io_manager::detached_file_irp::ExternalFileIrpOutputCapture::MethodNeitherInput)
+        != mutable_input
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
     ensure_completion(id)?;
     let offset = usize::try_from(offset).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
     loop {
@@ -523,7 +756,12 @@ pub(super) fn copy_output(
                 let length = output.len().min(completion.capture_len() - offset);
                 let end = offset + length;
                 if end <= completion.captured_len() || length == 0 {
-                    output[..length].copy_from_slice(&completion.buffers().output()[offset..end]);
+                    let captured = if mutable_input {
+                        completion.buffers().input()
+                    } else {
+                        completion.buffers().output()
+                    };
+                    output[..length].copy_from_slice(&captured[offset..end]);
                     return Ok(length);
                 }
             }
@@ -535,6 +773,23 @@ pub(super) fn copy_output(
 }
 
 pub(super) fn acknowledge(irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
+    acknowledge_with_buffers(irp_id).map(|_| ())
+}
+
+/// The port CONNECT caller retains the actual 16-byte Type3InputBuffer returned by its provider.
+pub(super) fn acknowledge_port_connect(irp_id: IrpId) -> Result<[u8; 16], nt_status::NtStatus> {
+    let id = find(irp_id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if row(id).port_connect_control_storage.is_none() {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    let buffers = acknowledge_with_buffers(irp_id)?;
+    let mut input = [0u8; 16];
+    assert_eq!(buffers.input().len(), input.len(), "validated CONNECT input length changed");
+    input.copy_from_slice(buffers.input());
+    Ok(input)
+}
+
+fn acknowledge_with_buffers(irp_id: IrpId) -> Result<ExternalFileIrpBuffers, nt_status::NtStatus> {
     let _durable = crate::allocator::enter_durable();
     let id = find(irp_id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
     ensure_completion(id)?;
@@ -564,6 +819,13 @@ pub(super) fn acknowledge(irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
         }
         copy_chunk(id)?;
     }
+    if row(id).port_connect_control_storage.is_some() {
+        if let Some(Payload::Completion(completion)) = row(id).payload.as_ref() {
+            if completion.buffers().input().len() != 16 {
+                return Err(nt_status::NtStatus::INVALID_PARAMETER);
+            }
+        }
+    }
     let payload = row(id).payload.take().expect("File ACK owner missing");
     let invocation = match payload {
         Payload::Completion(completion) => {
@@ -578,10 +840,13 @@ pub(super) fn acknowledge(irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
         }
         Payload::Acknowledgement(returned) => {
             match io_manager_mut().finish_external_file_irp_completion(returned) {
-                Ok((receipt, _)) => {
+                Ok((receipt, buffers)) => {
                     assert!(receipt.backend_acknowledged());
-                    remove(id);
-                    return Ok(());
+                    row(id).terminal_receipt = Some(receipt);
+                    row(id).settled_buffers = Some(buffers);
+                    let mut retired = remove(id)?;
+                    return Ok(retired.settled_buffers.take()
+                        .expect("acknowledged File buffers missing"));
                 }
                 Err(rejection) => {
                     let (status, returned) = rejection.into_parts();
@@ -611,11 +876,14 @@ pub(super) fn acknowledge(irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
     }
     let returned = hosted_file_dispatch::acknowledge(invocation);
     match io_manager_mut().finish_external_file_irp_completion(returned) {
-        Ok((receipt, _)) => {
+        Ok((receipt, buffers)) => {
             assert!(receipt.backend_acknowledged());
             assert!(io_manager_mut().accepts_external_file_irp_receipt(&receipt));
-            remove(id);
-            Ok(())
+            row(id).terminal_receipt = Some(receipt);
+            row(id).settled_buffers = Some(buffers);
+            let mut retired = remove(id)?;
+            Ok(retired.settled_buffers.take()
+                .expect("acknowledged File buffers missing"))
         }
         Err(rejection) => {
             let (status, returned) = rejection.into_parts();

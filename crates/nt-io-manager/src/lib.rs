@@ -28,6 +28,13 @@ mod close;
 mod complete;
 mod completion_unwind;
 mod device;
+pub mod device_queue;
+pub mod start_io;
+pub mod start_io_current;
+pub mod start_io_native_owner;
+pub mod start_io_queued;
+pub mod start_io_selection;
+pub mod start_io_native_transaction;
 pub mod device_power;
 mod device_file_name;
 mod device_reference;
@@ -38,6 +45,7 @@ pub mod device_registry;
 mod directory_control;
 mod dispatch;
 mod driver;
+pub mod driver_reinitialization;
 mod driver_host;
 mod driver_peer;
 mod ea;
@@ -57,8 +65,12 @@ mod hosted_file;
 #[cfg(test)]
 mod hosted_file_lifetime_tests;
 mod hosted_device_pointer;
+mod completion_ack;
+mod completion_retirement;
+mod projection_allocation;
 mod hosted_attached_device_reference;
 mod hosted_safe_attach;
+mod hosted_bus_pdo_publication;
 mod hosted_file_system_registry;
 pub mod hosted_pool_range;
 pub mod hosted_kernel_read_delivery;
@@ -70,6 +82,7 @@ pub mod io_create_file_capture;
 pub mod io_create_file_reply;
 pub mod provider_create_delivery;
 pub mod consumer_file_projection;
+pub mod consumer_device_projection;
 pub mod hosted_forward_target;
 pub mod redir_query_path;
 pub mod retained_query_path_forward;
@@ -77,6 +90,10 @@ pub mod retained_write_forward;
 pub mod retained_read_forward;
 pub mod retained_query_information_forward;
 pub mod retained_flush_forward;
+pub mod retained_connect_forward;
+pub mod retained_file_lifecycle_forward;
+pub mod class_service_callback;
+pub mod reverse_class_alias_projection;
 pub mod source_irp_ledger;
 pub mod source_irp_auxiliary;
 pub mod provider_source_irp;
@@ -86,6 +103,8 @@ pub mod file_read_query_wire;
 pub mod retained_file_query_progress;
 pub mod retained_file_close_progress;
 pub mod retained_source_progress;
+pub mod hosted_forward_progress;
+pub mod held_pnp_completion;
 pub mod win32k_async_read_wire;
 pub mod win32k_section_create_wire;
 pub mod win32k_mm_section_wire;
@@ -106,6 +125,7 @@ mod open;
 mod owned_file_metadata;
 pub mod owned_file_lifecycle;
 mod pending_io;
+pub mod pending_irp_graph;
 mod pending_set_file_name;
 mod pipe;
 mod projection;
@@ -141,7 +161,9 @@ pub use completion_unwind::{
 pub use device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
 pub use device_reference::DeviceReference;
 pub use file_reference::FileReference;
-pub use hosted_device_pointer::{HostedDevicePointerReference, HostedDevicePointerRegistration};
+pub use hosted_device_pointer::{HostedDevicePointerReference, HostedDevicePointerRegistration,
+    HostedDeviceProjectionReference};
+pub use projection_allocation::{ProjectionAllocationLedger, ProjectionAllocationOwner};
 pub use device_property_query::{
     query_device_property, PropertyQueryReply, PropertyQueryRequest, PropertyQueryResult,
     PropertyQueryTransport, PROPERTY_QUERY_CHUNK_BYTES,
@@ -173,8 +195,14 @@ pub use ea::{
 };
 pub use external_dispatch::{
     ExternalDispatchResult, ExternalPnpDispatchResult, ExternalPnpTerminalReceipt,
+    ExternalPnpFinishRejection, ExternalPnpFinishResult, ExternalPnpInvocation, ExternalPnpReturn,
+    RetainedExternalPnp,
+    ExternalPnpCompletionInvocation, ExternalPnpCompletionReturn, ExternalPnpCompletionRejection,
+    ExternalPnpFilterCompletionInvocation, ExternalPnpFilterCompletionReturn,
+    ExternalPnpFilterOutput,
     PreparedExternalPnpIrp, PreparedExternalPnpRejection,
 };
+pub use completion_ack::CompletionAcknowledgement;
 pub use file::{CreateOptions, FileRecord, FileState, ShareAccess};
 pub use file_mode::FileModeState;
 pub use file_information::{
@@ -211,14 +239,16 @@ pub use pending_io::{
     FileIoBusyOwner, PendingFileBusy, PendingFileBusyError, PendingFileBusyPhase,
     PendingFileBusyReleaseAttempt, PendingFileBusyWakeAttempt,
     PendingFileCreate, PendingFileIo, PendingFileIoOperation, PendingFileIoParkError,
+    CreateOutputSettlement, PendingCreateOutput, PendingCreateOutputAction, PendingCreateOutputObservation,
     LocalFlushMode, PendingFileIoIdentity, PendingFileIoReservation, PendingFileIoTable, PendingLocalBuffered,
-    PendingLocalByteLock, PendingLocalDirectoryNotify, PendingLocalFlush, PendingLocalInline,
+    PendingLocalByteLock, PendingLocalDirectoryNotify, PendingLocalFlush, PendingOwnedInline,
+    PendingOwnedModePrecommit,
     PendingSetFileNameOperation,
     IO_DELIVERY_APC_PUBLISHED, IO_DELIVERY_BACKEND_ACKED, IO_DELIVERY_BUFFER_PUBLISHED,
     IO_DELIVERY_CREATE_COMMITTED,
     IO_DELIVERY_EVENT_PUBLISHED, IO_DELIVERY_FILE_LOCK_RELEASED, IO_DELIVERY_FILE_PUBLISHED,
     IO_DELIVERY_HANDLE_PUBLISHED, IO_DELIVERY_IOCP_PUBLISHED, IO_DELIVERY_IOSB_FAULTED,
-    IO_DELIVERY_IOSB_PUBLISHED, IO_DELIVERY_LOCAL_REFERENCE_RELEASED, IO_DELIVERY_OUTPUT_FAULTED,
+    IO_DELIVERY_IOSB_PUBLISHED, IO_DELIVERY_OWNED_REFERENCE_RELEASED, IO_DELIVERY_OUTPUT_FAULTED,
     IO_DELIVERY_REPLY_CLAIMED, IO_DELIVERY_REPLY_PUBLISHED, IO_DELIVERY_USER_APC_STAGED,
 };
 pub use pending_set_file_name::{
@@ -260,6 +290,7 @@ pub use synchronous_io::{
     SynchronousFileRetryStats,
     SynchronousFileRetryView, SynchronousFileWaitIdentity, SynchronousFileWaitReservation,
     SynchronousFileWaitState, SynchronousFileWaitTable, SynchronousFileWaiter,
+    FileTransferParameters, FileTransferEvent,
 };
 pub use volume_information::{
     query_volume_information_contract, set_volume_information_contract,
@@ -272,7 +303,8 @@ pub use wdm_x64::{
     write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
     write_wdm_irp_completion_targets,
     write_wdm_open_device_projection,
-    WdmDeviceObjectInit, WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit,
+    WdmDeviceObjectInit, WdmDeviceObjectAllocationLayout, WDM_X64_DEVICE_OBJECT_EXTENSION_SIZE,
+    WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit,
     WdmIoStackParameters, WdmIrpInit, WdmLayoutError, WdmOpenDeviceProjectionInit,
     WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_OFFSET, WDM_X64_DRIVER_EXTENSION_SIZE,
     WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET,
@@ -323,6 +355,8 @@ pub struct IoManager<P> {
     disconnected_client_retries: Vec<ClientId>,
     port: P,
     backends: Vec<Box<dyn DriverDispatchBackend>>,
+    #[cfg(test)]
+    test_reentrant_create_status: Option<nt_status::NtStatus>,
 }
 
 impl<P> IoManager<P> {
@@ -348,6 +382,8 @@ impl<P> IoManager<P> {
             disconnected_client_retries: Vec::new(),
             port,
             backends: Vec::new(),
+            #[cfg(test)]
+            test_reentrant_create_status: None,
         }
     }
 
@@ -880,6 +916,26 @@ impl<P> IoManager<P> {
             .unwrap_or(&[])
     }
 
+    /// Identify the exact current top eligible for a new attachment before entering a native
+    /// AddDevice call. A live IRP keeps the topology fixed until its terminal acknowledgement.
+    pub fn can_attach_new_device_above(&self, target: DeviceId) -> Result<DeviceId, NtStatus> {
+        let lower = match self.device(target) {
+            Some(device) if !device.delete_pending => self
+                .device(device.top_of_stack)
+                .map(|_| device.top_of_stack)
+                .ok_or(NtStatus::INVALID_PARAMETER)?,
+            Some(_) => return Err(NtStatus::DELETE_PENDING),
+            None => return Err(NtStatus::INVALID_PARAMETER),
+        };
+        if self.device(lower).is_some_and(|device| device.delete_pending) {
+            return Err(NtStatus::DELETE_PENDING);
+        }
+        if self.device_has_live_irps(lower) {
+            return Err(NtStatus::DEVICE_BUSY);
+        }
+        Ok(lower)
+    }
+
     /// Attach `source` above the current top of `target`'s device stack, returning the lower device
     /// that `source` attached to. This is the canonical record-level half of
     /// `IoAttachDeviceToDeviceStack`; guest-visible WDM pointers are translated by the driver host.
@@ -895,18 +951,11 @@ impl<P> IoManager<P> {
             Some(device) => (device.delete_pending, device.attached_to.is_some()),
             None => return Err(NtStatus::INVALID_PARAMETER),
         };
-        let lower = match self.device(target) {
-            Some(device) if !device.delete_pending => self
-                .device(device.top_of_stack)
-                .map(|_| device.top_of_stack)
-                .ok_or(NtStatus::INVALID_PARAMETER)?,
-            Some(_) => return Err(NtStatus::DELETE_PENDING),
-            None => return Err(NtStatus::INVALID_PARAMETER),
-        };
-        if source_delete_pending || self.device(lower).map(|d| d.delete_pending).unwrap_or(true) {
+        let lower = self.can_attach_new_device_above(target)?;
+        if source_delete_pending {
             return Err(NtStatus::DELETE_PENDING);
         }
-        if self.device_has_live_irps(source) || self.device_has_live_irps(lower) {
+        if self.device_has_live_irps(source) {
             return Err(NtStatus::DEVICE_BUSY);
         }
         if source_attached || self.has_upper_attachment(source) || lower == source {
@@ -1017,6 +1066,16 @@ impl<P> IoManager<P> {
             .any(|(_, irp)| irp.stack.iter().any(|location| location.device_id == id))
     }
 
+    /// Diagnostic witness for a Device stack mutation blocked by a live IRP.
+    pub fn attachment_live_irp_witness(&self, id: DeviceId) -> Option<IrpId> {
+        self.irps.iter().find_map(|(irp_id, irp)| {
+            irp.stack
+                .iter()
+                .any(|location| location.device_id == id)
+                .then_some(irp_id)
+        })
+    }
+
     fn recompute_device_stacks(&mut self) {
         let ids = self.devices.ids();
         let mut updates = Vec::new();
@@ -1115,7 +1174,11 @@ impl<P> IoManager<P> {
 
     /// Allocate an IRP record, assigning + returning its id.
     pub fn allocate_irp(&mut self, mut record: IrpRecord) -> Result<IrpId, NtStatus> {
+        if record.completion_ack_reservation.is_some() {
+            return Err(NtStatus::DELETE_PENDING);
+        }
         if is_create_major(record.origin_major) && record.file_id.is_some()
+            && record.subsidiary_file_lifecycle.is_none()
             && self.irps.iter().any(|(_, existing)| existing.file_id == record.file_id
                 && is_create_major(existing.origin_major)) {
             return Err(NtStatus::INVALID_PARAMETER);
@@ -1214,6 +1277,12 @@ impl<P> IoManager<P> {
                 .ok_or(NtStatus::INVALID_PARAMETER)?
                 .driver_id;
             let valid_state = match record.origin_major {
+                _ if record.subsidiary_file_lifecycle.is_some() => match record.origin_major {
+                    nt_io_abi::major::IRP_MJ_CREATE => file.state == FileState::CreateIrpDispatched,
+                    nt_io_abi::major::IRP_MJ_CLEANUP => file.state == FileState::CleanupPending,
+                    nt_io_abi::major::IRP_MJ_CLOSE => file.state == FileState::ClosePending,
+                    _ => false,
+                },
                 major if is_create_major(major) => file.state == FileState::Allocated,
                 nt_io_abi::major::IRP_MJ_CLEANUP => file.state == FileState::CleanupPending,
                 nt_io_abi::major::IRP_MJ_CLOSE => file.state == FileState::ClosePending,
@@ -1230,8 +1299,9 @@ impl<P> IoManager<P> {
                             ))),
             };
             if file.client_id != record.client_id
-                || file_driver != record.origin_driver_id
+                || (record.subsidiary_file_lifecycle.is_none() && file_driver != record.origin_driver_id)
                 || (record.origin_device_id != DeviceId::NULL
+                    && record.subsidiary_file_lifecycle.is_none()
                     && file.device_id != record.origin_device_id)
                 || !valid_state
             {
@@ -1329,11 +1399,11 @@ impl<P> IoManager<P> {
                 .checked_add(1)
                 .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
             let file = self.files.get_mut(file_id).expect("validated file");
-            if let Some(IoParameters::Create(parameters)) =
+            if record.subsidiary_file_lifecycle.is_none() { if let Some(IoParameters::Create(parameters)) =
                 record.current_stack().map(|stack| &stack.parameters)
             {
                 file.opened_case_sensitive = parameters.opened_case_sensitive;
-            }
+            } }
             file.outstanding_irp_refs += 1;
             if related_file.is_some() {
                 file.related_file = None;
@@ -1372,10 +1442,13 @@ impl<P> IoManager<P> {
         self.irps.get(id)
     }
     pub fn irp_mut(&mut self, id: IrpId) -> Option<&mut IrpRecord> {
+        if self.irp(id).is_some_and(|irp| irp.completion_ack_reservation.is_some()) {
+            return None;
+        }
         self.irps.get_mut(id)
     }
     pub fn free_irp(&mut self, id: IrpId) -> Option<IrpRecord> {
-        if self.irp(id).is_some_and(|irp| irp.detached_file_owner) {
+        if self.irp(id).is_some_and(|irp| irp.detached_file_owner || irp.completion_ack_reservation.is_some()) {
             return None;
         }
         let record = self.irps.remove(id)?;
@@ -1466,6 +1539,8 @@ mod tests {
     extern crate std;
 
     mod exact_external_pnp;
+    mod detached_external_pnp;
+    mod detached_external_pnp_completion;
 
     use super::*;
     use nt_io_abi::{ioctl, major};
@@ -2577,6 +2652,14 @@ mod tests {
         assert_eq!(id.id_type(), Some(nt_pnp_abi::BUS_QUERY_INSTANCE_ID));
         assert_eq!(id.relation_type(), None);
         assert_eq!(id.input_len(), 0);
+        let text = PnpParameters::query_device_text(1, 0x0409);
+        assert_eq!(text.minor, nt_pnp_abi::IRP_MN_QUERY_DEVICE_TEXT);
+        assert_eq!(text.device_text(), Some((1, 0x0409)));
+        assert_eq!(text.wire_parameter_words(), (1, 0x0409));
+        assert_eq!(text.wire_argument(), None);
+        assert_eq!(text.input_len(), 0);
+        assert_eq!(text.output_len(), 0);
+        assert_eq!(id.device_text(), None);
         for minor in [
             nt_pnp_abi::IRP_MN_QUERY_RESOURCES,
             nt_pnp_abi::IRP_MN_QUERY_RESOURCE_REQUIREMENTS,
@@ -3302,6 +3385,29 @@ mod tests {
         let request = control.last_request().unwrap();
         assert_eq!(request.minor, nt_pnp_abi::IRP_MN_QUERY_ID);
         assert_eq!(request.ioctl_code, nt_pnp_abi::BUS_QUERY_INSTANCE_ID);
+
+        let text = PnpParameters::query_device_text(1, 0x0409);
+        let _ = io
+            .build_and_dispatch_external_to_device(
+                client,
+                device,
+                None,
+                0,
+                0,
+                major::IRP_MJ_PNP,
+                IoParameters::Pnp(text),
+                0,
+                0,
+                &mut empty,
+            )
+            .unwrap();
+        let request = control.last_request().unwrap();
+        assert_eq!(request.minor, nt_pnp_abi::IRP_MN_QUERY_DEVICE_TEXT);
+        assert_eq!(request.ioctl_code, 0);
+        assert_eq!(request.input_len, 0);
+        assert_eq!(request.output_len, 0);
+        assert_eq!(request.parameter_offset, 1);
+        assert_eq!(request.parameter_len, 0x0409);
 
         let capabilities = PnpParameters::query_capabilities();
         let mut capability_buffer = [0u8; nt_pnp_abi::DEVICE_CAPABILITIES_X64_SIZE];
@@ -4318,6 +4424,7 @@ mod tests {
             .unwrap();
         assert_eq!(om.attach_device_to_stack(middle, lower), Ok(lower));
         assert_eq!(om.attach_device_to_stack(top, lower), Ok(middle));
+        assert_eq!(om.can_attach_new_device_above(lower), Ok(top));
         let client = om.register_client();
         let mut buffer = [0u8; 4];
         let result = om
@@ -4345,6 +4452,10 @@ mod tests {
         assert_eq!(top_state.borrow().seen[0], (top_driver, top, 0, 3, irp));
         assert_eq!(
             om.attach_device_to_stack(late_filter, lower),
+            Err(NtStatus::DEVICE_BUSY)
+        );
+        assert_eq!(
+            om.can_attach_new_device_above(lower),
             Err(NtStatus::DEVICE_BUSY)
         );
         assert_eq!(om.detach_device_from_stack(top), Err(NtStatus::DEVICE_BUSY));
@@ -4410,6 +4521,7 @@ mod tests {
             (lower_driver, lower)
         );
         om.acknowledge_completed_irp(irp).unwrap();
+        assert_eq!(om.can_attach_new_device_above(lower), Ok(top));
         assert_eq!(om.attach_device_to_stack(late_filter, lower), Ok(top));
         assert_eq!(om.detach_device_from_stack(late_filter), Ok(top));
         assert_eq!(lower_state.borrow().acknowledged, [irp]);
@@ -8051,14 +8163,14 @@ mod tests {
         assert_eq!(le_u64(&driver, WDM_X64_DRIVER_EXTENSION_OFFSET), 0x7777);
         assert_eq!(le_u64(&driver, WDM_X64_DRIVER_UNLOAD_OFFSET), 0x8888);
 
-        let mut dev = [0xCC; WDM_X64_DEVICE_OBJECT_SIZE + 16];
+        let mut dev = [0xCC; WDM_X64_DEVICE_OBJECT_SIZE + 16 + WDM_X64_DEVICE_OBJECT_EXTENSION_SIZE];
         write_wdm_device_object(
             &mut dev,
             WdmDeviceObjectInit {
-                size_field: (WDM_X64_DEVICE_OBJECT_SIZE + 16) as u16,
+                device_object_address: 0x1000_0000,
+                driver_extension_size: 16,
                 driver_object: 0x1111,
                 next_device: 0x2222,
-                device_extension: 0x3333,
                 flags: 0x4455_6677,
                 characteristics: 0x8899_aabb,
                 device_type: 0x44,
@@ -8072,10 +8184,14 @@ mod tests {
         assert_eq!(le_u64(&dev, 0x10), 0x2222);
         assert_eq!(le_u32(&dev, 0x30), 0x4455_6677);
         assert_eq!(le_u32(&dev, 0x34), 0x8899_aabb);
-        assert_eq!(le_u64(&dev, 0x40), 0x3333);
+        assert_eq!(le_u64(&dev, 0x40), 0x1000_0000 + WDM_X64_DEVICE_OBJECT_SIZE as u64);
         assert_eq!(le_u32(&dev, 0x48), 0x44);
         assert_eq!(dev[0x4c], 3);
-        assert!(dev.iter().skip(WDM_X64_DEVICE_OBJECT_SIZE).all(|b| *b == 0));
+        let kernel_offset = WDM_X64_DEVICE_OBJECT_SIZE + 16;
+        assert!(dev[WDM_X64_DEVICE_OBJECT_SIZE..kernel_offset].iter().all(|b| *b == 0));
+        assert_eq!(le_u64(&dev, 0x138), 0x1000_0000 + kernel_offset as u64);
+        assert_eq!(le_u16(&dev, kernel_offset), 13);
+        assert_eq!(le_u64(&dev, kernel_offset + 8), 0x1000_0000);
 
         let mut file = [0xCC; WDM_X64_FILE_OBJECT_SIZE];
         write_wdm_file_object(
@@ -8106,7 +8222,7 @@ mod tests {
     #[test]
     fn wdm_x64_open_device_projection_wires_backlinks() {
         let mut driver = [0xCC; WDM_X64_DRIVER_OBJECT_SIZE + WDM_X64_DRIVER_EXTENSION_SIZE];
-        let mut device = [0xCC; WDM_X64_DEVICE_OBJECT_SIZE];
+        let mut device = [0xCC; WDM_X64_DEVICE_OBJECT_SIZE + WDM_X64_DEVICE_OBJECT_EXTENSION_SIZE];
         let mut file = [0xCC; WDM_X64_FILE_OBJECT_SIZE];
 
         write_wdm_open_device_projection(
@@ -8589,6 +8705,26 @@ mod tests {
         assert_eq!(stack[0x01], nt_pnp_abi::IRP_MN_QUERY_ID);
         assert_eq!(le_u32(&stack, 0x08), nt_pnp_abi::BUS_QUERY_HARDWARE_IDS);
         assert_eq!(le_u64(&stack, 0x28), 0x5555);
+
+        write_wdm_io_stack_location(
+            &mut stack,
+            WdmIoStackLocationInit {
+                major: major::IRP_MJ_PNP,
+                minor: nt_pnp_abi::IRP_MN_QUERY_DEVICE_TEXT,
+                device_object: 0x5556,
+                parameters: WdmIoStackParameters::PnpQueryDeviceText {
+                    text_type: 1,
+                    locale_id: 0x0409,
+                },
+                ..WdmIoStackLocationInit::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(stack[0x01], nt_pnp_abi::IRP_MN_QUERY_DEVICE_TEXT);
+        assert_eq!(le_u32(&stack, 0x08), 1);
+        assert_eq!(le_u32(&stack, 0x0c), 0);
+        assert_eq!(le_u32(&stack, 0x10), 0x0409);
+        assert_eq!(le_u64(&stack, 0x28), 0x5556);
 
         write_wdm_io_stack_location(
             &mut stack,

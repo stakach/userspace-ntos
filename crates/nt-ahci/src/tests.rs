@@ -95,6 +95,15 @@ fn flush_selection_uses_valid_advertised_capabilities() {
 }
 
 #[test]
+fn physical_lba48_capacity_requires_valid_identify_capability_and_count() {
+    assert_eq!(lba48_sector_count(0x4400, [0, 8, 0, 0]), Some(524_288));
+    assert_eq!(lba48_sector_count(0x4000, [0, 8, 0, 0]), None);
+    assert_eq!(lba48_sector_count(0xc400, [0, 8, 0, 0]), None);
+    assert_eq!(lba48_sector_count(0x4400, [0; 4]), None);
+    assert_eq!(lba48_sector_count(0x4400, [0, 0, 0, 1]), None);
+}
+
+#[test]
 fn flush_has_no_dma_payload_or_stale_task_file() {
     for (command, opcode) in [(FlushCommand::Cache, 0xe7), (FlushCommand::CacheExt, 0xea)] {
         let mut port = Port::new();

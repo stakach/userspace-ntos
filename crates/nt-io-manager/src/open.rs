@@ -46,8 +46,432 @@ enum DriverInstallKind {
 
 #[cfg(test)]
 mod open_with_details_tests {
+    extern crate std;
+
     use super::*;
+    use crate::dispatch::{DispatchContext, DriverCompletion, IrpProjection};
     use crate::{MockDriverBackend, MockObjectPort};
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+    use std::vec::Vec;
+
+    struct QueuedCreateBackend {
+        first: Option<IrpId>,
+        ready: VecDeque<DriverCompletion>,
+        acks: Rc<RefCell<Vec<IrpId>>>,
+    }
+
+    impl DriverDispatchBackend for QueuedCreateBackend {
+        fn dispatch_irp(
+            &mut self,
+            _ctx: DispatchContext<'_>,
+            irp: &IrpProjection,
+        ) -> Result<DispatchOutcome, NtStatus> {
+            if irp.major == major::IRP_MJ_CREATE {
+                if let Some(first) = self.first {
+                    for id in [first, irp.irp_id] {
+                        self.ready.push_back(DriverCompletion {
+                            irp_id: id,
+                            status: NtStatus::SUCCESS,
+                            information: 0,
+                            file_context: Some(id.raw()),
+                        });
+                    }
+                } else {
+                    self.first = Some(irp.irp_id);
+                }
+                Ok(DispatchOutcome::Pending)
+            } else {
+                Ok(DispatchOutcome::Completed {
+                    status: NtStatus::SUCCESS,
+                    information: 0,
+                    file_context: None,
+                })
+            }
+        }
+
+        fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> { Ok(()) }
+
+        fn poll_completion(&mut self) -> Option<DriverCompletion> { self.ready.pop_front() }
+
+        fn acknowledge_completion(&mut self, irp_id: IrpId) -> Result<(), NtStatus> {
+            self.acks.borrow_mut().push(irp_id);
+            Ok(())
+        }
+    }
+
+    struct EndlessUnrelatedBackend {
+        target: Rc<RefCell<Option<IrpId>>>,
+        polls: Rc<Cell<usize>>,
+        acks: Rc<RefCell<Vec<IrpId>>>,
+    }
+
+    impl DriverDispatchBackend for EndlessUnrelatedBackend {
+        fn dispatch_irp(
+            &mut self,
+            _ctx: DispatchContext<'_>,
+            irp: &IrpProjection,
+        ) -> Result<DispatchOutcome, NtStatus> {
+            if irp.major == major::IRP_MJ_CREATE {
+                *self.target.borrow_mut() = Some(irp.irp_id);
+                Ok(DispatchOutcome::Pending)
+            } else {
+                Ok(DispatchOutcome::Completed {
+                    status: NtStatus::SUCCESS,
+                    information: 0,
+                    file_context: None,
+                })
+            }
+        }
+
+        fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> { Ok(()) }
+
+        fn poll_completion(&mut self) -> Option<DriverCompletion> {
+            let count = self.polls.get() + 1;
+            assert!(count <= 64, "synchronous open must not poll an unbounded backend");
+            self.polls.set(count);
+            Some(DriverCompletion {
+                irp_id: IrpId::new(999_999, 1),
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            })
+        }
+
+        fn acknowledge_completion(&mut self, irp_id: IrpId) -> Result<(), NtStatus> {
+            self.acks.borrow_mut().push(irp_id);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ready_create_drain_preserves_unrelated_completion_owner() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let client = io.register_client();
+        let acks = Rc::new(RefCell::new(Vec::new()));
+        let driver = io.create_driver(
+            &path(r"\Driver\QueuedCreate"),
+            Box::new(QueuedCreateBackend { first: None, ready: VecDeque::new(), acks: acks.clone() }),
+        ).unwrap();
+        let device_path = path(r"\Device\QueuedCreate");
+        io.create_device(driver, Some(&device_path), DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(), DeviceFlags::BUFFERED_IO, 0).unwrap();
+        assert_eq!(io.open(client, &device_path, AccessMask::GENERIC_READ,
+            ShareAccess::READ, CreateOptions::NON_DIRECTORY_FILE, 1), Err(NtStatus::PENDING));
+        let first = io.irps.iter().next().unwrap().0;
+        let (handle, _file, _device, _object) = io.open_with_details(client, &device_path,
+            AccessMask::GENERIC_READ, ShareAccess::READ, CreateOptions::NON_DIRECTORY_FILE, 1)
+            .expect("target CREATE behind unrelated completion must become visible");
+        assert!(io.completed_irp(first).is_some(), "unrelated completion remains published");
+        assert_eq!(acks.borrow().len(), 1, "only target CREATE is acknowledged");
+        assert_ne!(acks.borrow()[0], first);
+        io.close(client, handle).unwrap();
+    }
+
+    #[test]
+    fn endless_unrelated_ready_queue_returns_pending_without_target_ack() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let client = io.register_client();
+        let target = Rc::new(RefCell::new(None));
+        let polls = Rc::new(Cell::new(0));
+        let acks = Rc::new(RefCell::new(Vec::new()));
+        let driver = io.create_driver(
+            &path(r"\Driver\EndlessCreate"),
+            Box::new(EndlessUnrelatedBackend {
+                target: target.clone(), polls: polls.clone(), acks: acks.clone(),
+            }),
+        ).unwrap();
+        let device_path = path(r"\Device\EndlessCreate");
+        io.create_device(driver, Some(&device_path), DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(), DeviceFlags::BUFFERED_IO, 0).unwrap();
+        assert_eq!(io.open(client, &device_path, AccessMask::GENERIC_READ,
+            ShareAccess::READ, CreateOptions::NON_DIRECTORY_FILE, 1), Err(NtStatus::PENDING));
+        let target = target.borrow().expect("CREATE was dispatched");
+        assert!(polls.get() > 0 && polls.get() <= 64);
+        assert!(io.irp(target).is_some(), "pending CREATE keeps canonical IRP");
+        assert!(!acks.borrow().contains(&target), "target completion was never polled or ACKed");
+    }
+
+    struct ReentrantCreateBackend {
+        create_irp: Rc<RefCell<Option<IrpId>>>,
+        acks: Rc<Cell<usize>>,
+        reject_ack: bool,
+        lifecycle_dispatches: Rc<Cell<usize>>,
+    }
+
+    impl DriverDispatchBackend for ReentrantCreateBackend {
+        fn dispatch_irp(
+            &mut self,
+            _ctx: DispatchContext<'_>,
+            irp: &IrpProjection,
+        ) -> Result<DispatchOutcome, NtStatus> {
+            if irp.major == major::IRP_MJ_CREATE {
+                *self.create_irp.borrow_mut() = Some(irp.irp_id);
+                Ok(DispatchOutcome::Pending)
+            } else {
+                if matches!(irp.major, major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE) {
+                    self.lifecycle_dispatches
+                        .set(self.lifecycle_dispatches.get() + 1);
+                }
+                Ok(DispatchOutcome::Completed {
+                    status: NtStatus::SUCCESS,
+                    information: 0,
+                    file_context: None,
+                })
+            }
+        }
+
+        fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
+            Ok(())
+        }
+
+        fn acknowledge_completion(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
+            self.acks.set(self.acks.get() + 1);
+            if self.reject_ack {
+                Err(NtStatus::UNSUCCESSFUL)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct ReadyAfterPendingCreateBackend {
+        create_irp: Rc<RefCell<Option<IrpId>>>,
+        acks: Rc<Cell<usize>>,
+        ready: Option<DriverCompletion>,
+    }
+
+    impl DriverDispatchBackend for ReadyAfterPendingCreateBackend {
+        fn dispatch_irp(
+            &mut self,
+            _ctx: DispatchContext<'_>,
+            irp: &IrpProjection,
+        ) -> Result<DispatchOutcome, NtStatus> {
+            if irp.major == major::IRP_MJ_CREATE {
+                *self.create_irp.borrow_mut() = Some(irp.irp_id);
+                self.ready = Some(DriverCompletion {
+                    irp_id: irp.irp_id,
+                    status: NtStatus::SUCCESS,
+                    information: 0,
+                    file_context: Some(0x5669_6465_6f),
+                });
+                Ok(DispatchOutcome::Pending)
+            } else {
+                Ok(DispatchOutcome::Completed {
+                    status: NtStatus::SUCCESS,
+                    information: 0,
+                    file_context: None,
+                })
+            }
+        }
+
+        fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
+            Ok(())
+        }
+
+        fn poll_completion(&mut self) -> Option<DriverCompletion> {
+            self.ready.take()
+        }
+
+        fn acknowledge_completion(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
+            self.acks.set(self.acks.get() + 1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pending_return_with_ready_create_completion_opens_exact_file() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let client = io.register_client();
+        let create_irp = Rc::new(RefCell::new(None));
+        let acks = Rc::new(Cell::new(0));
+        let driver = io
+            .create_driver(
+                &path(r"\Driver\ReadyPendingOpen"),
+                Box::new(ReadyAfterPendingCreateBackend {
+                    create_irp: create_irp.clone(),
+                    acks: acks.clone(),
+                    ready: None,
+                }),
+            )
+            .unwrap();
+        let device_path = path(r"\Device\ReadyPendingOpen");
+        let device = io
+            .create_device(
+                driver,
+                Some(&device_path),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let (handle, file, resolved_device, object) = io
+            .open_with_details(
+                client,
+                &device_path,
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::NON_DIRECTORY_FILE,
+                1,
+            )
+            .expect("ready terminal CREATE must open the exact File");
+        let irp = create_irp.borrow().expect("CREATE must reach the backend");
+        assert_eq!(resolved_device, device);
+        assert_eq!(io.file(file).unwrap().object_id, object);
+        assert_eq!(io.file(file).unwrap().state, FileState::Open);
+        assert_eq!(io.file(file).unwrap().driver_context, Some(0x5669_6465_6f));
+        assert!(io.irp(irp).is_none());
+        assert_eq!(acks.get(), 1);
+        assert_eq!(io.port().live_handle_count(), 1);
+        io.close(client, handle).unwrap();
+    }
+
+    #[test]
+    fn reentrant_create_completion_returns_exact_open_file_and_acknowledges_irp() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let client = io.register_client();
+        let create_irp = Rc::new(RefCell::new(None));
+        let acks = Rc::new(Cell::new(0));
+        let driver = io
+            .create_driver(
+                &path(r"\Driver\ReentrantOpen"),
+                Box::new(ReentrantCreateBackend {
+                    create_irp: create_irp.clone(),
+                    acks: acks.clone(),
+                    reject_ack: false,
+                    lifecycle_dispatches: Rc::new(Cell::new(0)),
+                }),
+            )
+            .unwrap();
+        let device_path = path(r"\Device\ReentrantOpen");
+        let device = io
+            .create_device(
+                driver,
+                Some(&device_path),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        io.test_reentrant_create_status = Some(NtStatus::SUCCESS);
+        let (handle, file, resolved_device, object) = io
+            .open_with_details(
+                client,
+                &device_path,
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::NON_DIRECTORY_FILE,
+                1,
+            )
+            .unwrap();
+        let irp = create_irp.borrow().expect("CREATE must reach the backend");
+        assert_eq!(resolved_device, device);
+        assert_eq!(io.file(file).unwrap().object_id, object);
+        assert_eq!(io.file(file).unwrap().state, FileState::Open);
+        assert!(io.irp(irp).is_none(), "ACK must retire the exact CREATE IRP");
+        assert_eq!(acks.get(), 1);
+        assert_eq!(io.port().live_handle_count(), 1);
+        io.close(client, handle).unwrap();
+        assert_eq!(io.port().live_handle_count(), 0);
+    }
+
+    #[test]
+    fn genuinely_pending_create_does_not_publish_a_file_handle() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let client = io.register_client();
+        let create_irp = Rc::new(RefCell::new(None));
+        let acks = Rc::new(Cell::new(0));
+        let driver = io
+            .create_driver(
+                &path(r"\Driver\PendingOpenDetails"),
+                Box::new(ReentrantCreateBackend {
+                    create_irp: create_irp.clone(),
+                    acks: acks.clone(),
+                    reject_ack: false,
+                    lifecycle_dispatches: Rc::new(Cell::new(0)),
+                }),
+            )
+            .unwrap();
+        let device_path = path(r"\Device\PendingOpenDetails");
+        io.create_device(
+            driver,
+            Some(&device_path),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            io.open_with_details(
+                client,
+                &device_path,
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::NON_DIRECTORY_FILE,
+                1,
+            ),
+            Err(NtStatus::PENDING)
+        );
+        let irp = create_irp.borrow().expect("CREATE must reach the backend");
+        assert!(io.irp(irp).is_some(), "pending CREATE retains its canonical IRP");
+        assert_eq!(acks.get(), 0);
+        assert_eq!(io.port().live_handle_count(), 0);
+    }
+
+    #[test]
+    fn rejected_reentrant_create_ack_retains_irp_without_reentering_driver() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let client = io.register_client();
+        let create_irp = Rc::new(RefCell::new(None));
+        let acks = Rc::new(Cell::new(0));
+        let lifecycle_dispatches = Rc::new(Cell::new(0));
+        let driver = io
+            .create_driver(
+                &path(r"\Driver\RejectedCreateAck"),
+                Box::new(ReentrantCreateBackend {
+                    create_irp: create_irp.clone(),
+                    acks: acks.clone(),
+                    reject_ack: true,
+                    lifecycle_dispatches: lifecycle_dispatches.clone(),
+                }),
+            )
+            .unwrap();
+        let device_path = path(r"\Device\RejectedCreateAck");
+        io.create_device(
+            driver,
+            Some(&device_path),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        )
+        .unwrap();
+        io.test_reentrant_create_status = Some(NtStatus::SUCCESS);
+        assert_eq!(
+            io.open_with_details(
+                client,
+                &device_path,
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::NON_DIRECTORY_FILE,
+                1,
+            ),
+            Err(NtStatus::UNSUCCESSFUL)
+        );
+        let irp = create_irp.borrow().expect("CREATE must reach the backend");
+        let file = io.irp(irp).unwrap().file_id.unwrap();
+        assert_eq!(io.irp(irp).unwrap().state, IrpState::Completed);
+        assert!(io.completed_irp(irp).is_some());
+        assert!(io.manager_owned_irps.contains(&irp));
+        assert_eq!(io.file(file).unwrap().state, FileState::CleanupPending);
+        assert_eq!(acks.get(), 1);
+        assert_eq!(io.port().live_handle_count(), 0);
+        assert_eq!(lifecycle_dispatches.get(), 0);
+    }
 
     fn path(name: &str) -> NtPath {
         NtPath::parse_str(name).unwrap()
@@ -528,6 +952,12 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 return Err(status);
             }
         };
+        // Reentrant IoCompleteRequest may finish CREATE inside dispatch. Reserve the fallback
+        // retirement slot before that native effect so an ACK failure can never orphan its IRP.
+        if let Err(status) = self.reserve_manager_owned_irp_slot() {
+            self.cleanup_failed_open(client, file_id, handle, irp_id)?;
+            return Err(status);
+        }
         self.irp_mut(irp_id)
             .unwrap()
             .transition(IrpState::Initialized);
@@ -540,15 +970,53 @@ impl<P: ObjectManagerPort> IoManager<P> {
 
         let mut empty: [u8; 0] = [];
         let outcome = self.dispatch(irp_id, &mut empty);
+        if matches!(outcome, Ok(DispatchOutcome::Pending))
+            && self.irp(irp_id).is_some_and(|irp| irp.state == IrpState::Dispatched)
+        {
+            self.publish_ready_create_completion(irp_id);
+        }
 
-        // A re-entrant completion may have published the IRP before dispatch
-        // returned. Preserve that canonical completion and let the consumer ACK
-        // it; this synchronous API cannot return a live handle in that case.
+        // A reentrant IoCompleteRequest can publish terminal CREATE before dispatch returns.
+        // Its canonical completion has already moved the File to Open or Closed. The original
+        // handle is valid only after the exact backend acknowledges that completion.
         if self
             .irp(irp_id)
             .map(|irp| irp.state != IrpState::Dispatched)
             .unwrap_or(true)
         {
+            if let Some(completed) = self.completed_irp(irp_id) {
+                assert_eq!(completed.file_id, Some(file_id));
+                assert_eq!(completed.client_id, client);
+                assert_eq!(completed.major, major::IRP_MJ_CREATE);
+                let status = completed.status;
+                if let Err(ack_status) = self.acknowledge_completed_irp_strict(irp_id) {
+                    self.claim_manager_owned_irp(client, irp_id)
+                        .expect("pre-reserved CREATE retirement owner disappeared");
+                    if self.file(file_id).is_some_and(|file| file.state == FileState::Open) {
+                        self.port.close_handle(client, handle)
+                            .expect("unpublished CREATE handle could not close after ACK failure");
+                        self.queue_external_file_release(client, file_id)
+                            .expect("completed CREATE File could not queue release after ACK failure");
+                    } else {
+                        self.port.close_handle(client, handle)
+                            .expect("unpublished CREATE handle could not close after ACK failure");
+                        if let Some(file) = self.file_mut(file_id) {
+                            file.close_deferred = true;
+                        }
+                        self.queue_deferred_file_close(file_id);
+                    }
+                    return Err(ack_status);
+                }
+                if crate::file::create_terminal_opens_file(status)
+                    && self.file(file_id).is_some_and(|file| file.state == FileState::Open)
+                {
+                    return Ok(handle);
+                }
+                self.port.close_handle(client, handle)
+                    .expect("failed CREATE handle could not close after ACK");
+                self.release_external_file(client, file_id)?;
+                return Err(status);
+            }
             if let Some(file) = self.file_mut(file_id) {
                 file.transition(FileState::ClosePending);
                 file.close_deferred = true;
@@ -624,7 +1092,20 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 .ok_or(NtStatus::INVALID_PARAMETER)?
                 .driver_id
         };
-        self.dispatch_to_driver(driver_id, irp_id, system_buffer)
+        let outcome = self.dispatch_to_driver(driver_id, irp_id, system_buffer);
+        #[cfg(test)]
+        if let Some(status) = self.test_reentrant_create_status.take() {
+            assert!(self.publish_driver_completion(
+                driver_id,
+                crate::dispatch::DriverCompletion {
+                    irp_id,
+                    status,
+                    information: 0,
+                    file_context: Some(0x1234),
+                }
+            ));
+        }
+        outcome
     }
 
     fn cleanup_failed_open(

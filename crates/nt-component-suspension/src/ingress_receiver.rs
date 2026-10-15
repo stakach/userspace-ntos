@@ -138,7 +138,7 @@ mod bootstrap_adoption;
 pub use bootstrap_adoption::BootstrapAdoptionError;
 mod nested_execution;
 mod parked_reply;
-pub use nested_execution::{NestedExecutionError, NestedExecutionScope};
+pub use nested_execution::{NestedExecutionError, NestedExecutionIdentity, NestedExecutionScope};
 mod bootstrap_completion;
 mod stopped_route;
 pub use stopped_route::{CancelledStoppedCall, StoppedRouteError};
@@ -327,6 +327,10 @@ impl<M> IngressReceiver<M> {
     /// Includes the currently owned receive Reply even before its next reservation begins.
     pub fn excludes_reply(&self, reply: u64) -> bool {
         self.ingress.reply() == reply || self.store.excludes_reply(reply)
+    }
+
+    pub fn retained_reply_owner(&self, reply: u64) -> Option<crate::RetainedReplyOwner> {
+        self.store.reply_owner(reply)
     }
 
     pub fn phase(&self) -> Option<ReservedReceivePhase> {

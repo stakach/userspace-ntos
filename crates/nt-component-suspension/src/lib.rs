@@ -16,9 +16,15 @@ static NEXT_DISPATCH_EPOCH: AtomicU64 = AtomicU64::new(1);
 mod terminal;
 mod external_stop;
 mod external_ingress;
-pub use external_ingress::{ExternalIngress, ExternalIngressError, ExternalRestartObservation};
+pub use external_ingress::{
+    ExternalAdmissionKey, ExternalIngress, ExternalIngressError, ExternalRestartObservation,
+    ExternalSettlement,
+};
 mod external_selection;
-pub use external_selection::oldest_external_ingress;
+pub use external_selection::{
+    oldest_external_ingress, oldest_receive_external_ingress,
+    oldest_receive_external_ingress_matching, ExternalReceiveState,
+};
 mod ingress;
 pub mod badge;
 pub mod source_registry;
@@ -35,7 +41,7 @@ mod retained_dispatch;
 mod retained_work;
 mod reserved_receive;
 mod ingress_receiver;
-pub use ingress_receiver::{NestedExecutionError, NestedExecutionScope};
+pub use ingress_receiver::{NestedExecutionError, NestedExecutionIdentity, NestedExecutionScope};
 pub use ingress_receiver::{CancelledStoppedCall, StoppedRouteError};
 mod reply_pool;
 mod ingress_resources;
@@ -48,7 +54,7 @@ pub use startup::StartupError;
 pub use startup::StartupStopError;
 pub use startup::StartupDetachError;
 pub use startup::StartupDeleteError;
-pub use retained_work::{RetainedWork, RetainedWorkCheckout, RetainedWorkError, RetainedWorkFinishError, RetainedWorkReservation};
+pub use retained_work::{RetainedReplyKind, RetainedReplyOwner, RetainedWork, RetainedWorkCheckout, RetainedWorkError, RetainedWorkFinishError, RetainedWorkReservation};
 pub use retained_dispatch::{RetainedDispatch, RetainedDispatchError};
 pub use retained_ingress::{RetainedIngress, RetainedIngressError};
 pub use lane_peer::PeerLaneError;
@@ -62,6 +68,7 @@ pub use ingress::{
     IngressReplyObservation, IngressReceiveDisposition,
 };
 mod resume_pass;
+mod receive_suspension;
 pub use resume_pass::ResumePass;
 mod resume_wake;
 pub use resume_wake::{ResumeDemand, ResumeWake, ResumeWakeError, ResumeWakePass};
@@ -74,6 +81,8 @@ pub use terminal::{
 pub enum SuspensionKind {
     ProviderWait,
     LpcRequest,
+    ServiceWait,
+    Receive,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,6 +92,9 @@ pub struct SuspensionKey {
 }
 
 impl SuspensionKey {
+    pub const fn receive(id: u64) -> Self {
+        Self { kind: SuspensionKind::Receive, id }
+    }
     pub const fn provider_wait(id: u64) -> Self {
         Self {
             kind: SuspensionKind::ProviderWait,
@@ -95,6 +107,10 @@ impl SuspensionKey {
             kind: SuspensionKind::LpcRequest,
             id,
         }
+    }
+
+    pub const fn service_wait(id: u64) -> Self {
+        Self { kind: SuspensionKind::ServiceWait, id }
     }
 
     pub const fn is_valid(self) -> bool {
@@ -120,6 +136,7 @@ pub struct SuspensionFrame<C, R> {
     pub owner: SuspensionOwner,
     pub phase: SuspensionPhase<R>,
     pub continuation: C,
+    receive: Option<receive_suspension::ReceiveAdmission>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -350,6 +367,12 @@ impl<C, R> ComponentSuspensionStack<C, R> {
     }
 
     pub fn get_mut(&mut self, key: SuspensionKey) -> Option<&mut SuspensionFrame<C, R>> {
+        self.get_mut_internal(key).filter(|frame| {
+            frame.key.kind != SuspensionKind::Receive && frame.receive.is_none()
+        })
+    }
+
+    fn get_mut_internal(&mut self, key: SuspensionKey) -> Option<&mut SuspensionFrame<C, R>> {
         self.frames.iter_mut().find(|frame| frame.key == key)
     }
 
@@ -363,6 +386,8 @@ impl<C, R> ComponentSuspensionStack<C, R> {
         }
         self.frames.iter().find_map(|frame| {
             (scope.matches(frame.owner)
+                && frame.key.kind != SuspensionKind::Receive
+                && frame.receive.is_none()
                 && matches!(
                     frame.phase,
                     SuspensionPhase::Waiting | SuspensionPhase::Selected { .. }
@@ -390,6 +415,9 @@ impl<C, R> ComponentSuspensionStack<C, R> {
         owner: SuspensionOwner,
         continuation: C,
     ) -> Result<(), (SuspensionError, C)> {
+        if key.kind == SuspensionKind::Receive {
+            return Err((SuspensionError::InvalidPhase, continuation));
+        }
         self.admit_owned_with_capacity(key, admission_sequence, owner, continuation, |frames| {
             frames.try_reserve(1).map_err(|_| SuspensionError::NoCapacity)
         })
@@ -424,11 +452,14 @@ impl<C, R> ComponentSuspensionStack<C, R> {
             owner,
             phase: SuspensionPhase::Waiting,
             continuation,
+            receive: None,
         });
         Ok(())
     }
 
     pub fn rollback_admission(&mut self, key: SuspensionKey) -> Result<C, SuspensionError> {
+        if key.kind == SuspensionKind::Receive { return Err(SuspensionError::InvalidPhase); }
+        if self.get(key).is_some_and(|frame| frame.receive.is_some()) { return Err(SuspensionError::InvalidPhase); }
         let frame = self.frames.last().ok_or(SuspensionError::NotFound)?;
         if frame.key != key {
             return Err(SuspensionError::NotTop);
@@ -440,6 +471,8 @@ impl<C, R> ComponentSuspensionStack<C, R> {
     }
 
     pub fn select(&mut self, key: SuspensionKey, completion: R) -> Result<(), SuspensionError> {
+        if key.kind == SuspensionKind::Receive { return Err(SuspensionError::InvalidPhase); }
+        if self.get(key).is_some_and(|frame| frame.receive.is_some()) { return Err(SuspensionError::InvalidPhase); }
         let frame = self
             .frames
             .iter_mut()
@@ -453,6 +486,8 @@ impl<C, R> ComponentSuspensionStack<C, R> {
     }
 
     pub fn cancel(&mut self, key: SuspensionKey, completion: R) -> Result<(), SuspensionError> {
+        if key.kind == SuspensionKind::Receive { return Err(SuspensionError::InvalidPhase); }
+        if self.get(key).is_some_and(|frame| frame.receive.is_some()) { return Err(SuspensionError::InvalidPhase); }
         let frame = self
             .frames
             .iter_mut()
@@ -491,6 +526,8 @@ impl<C, R: Clone> ComponentSuspensionStack<C, R> {
         &mut self,
         key: SuspensionKey,
     ) -> Result<SuspensionResume<R>, SuspensionError> {
+        if key.kind == SuspensionKind::Receive { return Err(SuspensionError::InvalidPhase); }
+        if self.get(key).is_some_and(|frame| frame.receive.is_some()) { return Err(SuspensionError::InvalidPhase); }
         let frame = self.frames.last_mut().ok_or(SuspensionError::NotFound)?;
         if frame.key != key {
             return Err(SuspensionError::NotTop);
@@ -543,6 +580,9 @@ impl<C, R: Clone> ComponentSuspensionStack<C, R> {
         owner: SuspensionOwner,
         continuation: C,
     ) -> Result<C, (SuspensionError, C)> {
+        if next_key.kind == SuspensionKind::Receive {
+            return Err((SuspensionError::InvalidPhase, continuation));
+        }
         if !next_key.is_valid() || admission_sequence == 0 || !owner.is_valid() {
             return Err((SuspensionError::InvalidIdentity, continuation));
         }
@@ -555,12 +595,16 @@ impl<C, R: Clone> ComponentSuspensionStack<C, R> {
         if frame.key != completed_key {
             return Err((SuspensionError::NotTop, continuation));
         }
+        if frame.receive.is_some_and(|admission| !admission.restored) {
+            return Err((SuspensionError::InvalidPhase, continuation));
+        }
         if !matches!(frame.phase, SuspensionPhase::Resuming { .. }) || frame.owner != owner {
             return Err((SuspensionError::InvalidPhase, continuation));
         }
         frame.key = next_key;
         frame.admission_sequence = admission_sequence;
         frame.phase = SuspensionPhase::Waiting;
+        frame.receive = None;
         Ok(core::mem::replace(&mut frame.continuation, continuation))
     }
 
@@ -575,6 +619,9 @@ impl<C, R: Clone> ComponentSuspensionStack<C, R> {
         }
         if frame.owner != owner {
             return Err(SuspensionError::InvalidIdentity);
+        }
+        if frame.receive.is_some_and(|admission| !admission.restored) {
+            return Err(SuspensionError::InvalidPhase);
         }
         let (completion, cancelled) = match &frame.phase {
             SuspensionPhase::Resuming {
@@ -845,7 +892,34 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         if lane.terminal.is_some() {
             return Err(LaneError::InvalidPhase);
         }
-        Ok(lane.suspensions.get_mut(key))
+        let frame = lane.suspensions.get_mut_internal(key);
+        if frame.as_ref().is_some_and(|frame| {
+            frame.key.kind == SuspensionKind::Receive || frame.receive.is_some()
+        }) {
+            return Err(LaneError::InvalidPhase);
+        }
+        Ok(frame)
+    }
+
+    /// Update captured continuation state without exposing settlement, owner or phase metadata.
+    /// A terminal effect retains exclusive access until its checked completion.
+    pub fn continuation_mut(
+        &mut self,
+        handle: LaneHandle,
+        key: SuspensionKey,
+        owner: SuspensionOwner,
+    ) -> Result<Option<&mut C>, LaneError> {
+        let lane = self.lane_mut(handle)?;
+        if lane.terminal.is_some() {
+            return Err(LaneError::InvalidPhase);
+        }
+        let Some(frame) = lane.suspensions.get_mut_internal(key) else {
+            return Ok(None);
+        };
+        if frame.owner != owner {
+            return Err(LaneError::WrongBinding);
+        }
+        Ok(Some(&mut frame.continuation))
     }
 
     pub fn locate(&self, key: SuspensionKey) -> Option<(LaneHandle, &SuspensionFrame<C, R>)> {
@@ -942,6 +1016,151 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         Ok(())
     }
 
+    /// Admit a service wait after its provider has already parked the exact external token.
+    /// The token remains owned by the same suspended dispatch until ACK resume retires it.
+    pub fn admit_service_wait_external_owned(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        dispatch: LaneDispatchIdentity,
+        external_token: u64,
+        key: SuspensionKey,
+        admission_sequence: u64,
+        owner: SuspensionOwner,
+        continuation: C,
+    ) -> Result<(), (LaneError, C)> {
+        if key.kind != SuspensionKind::ServiceWait || external_token == 0 {
+            return Err((LaneError::InvalidIdentity, continuation));
+        }
+        if let Err(error) = self.validate_service_wait_external(
+            handle, reply_object, dispatch, external_token,
+        ).and_then(|()| self.validate_dispatch_owner(handle, owner)) {
+            return Err((error, continuation));
+        }
+        if self.slots.iter().any(|slot| slot.lane.as_ref().is_some_and(|lane| {
+            lane.suspensions.get(key).is_some()
+                || lane.suspensions.frames().iter().any(|frame| frame.owner.same_dispatch(owner))
+        })) {
+            return Err((LaneError::Suspension(SuspensionError::DuplicateIdentity), continuation));
+        }
+        self.lane_mut(handle)
+            .expect("validated service wait lane")
+            .suspensions
+            .admit_owned(key, admission_sequence, owner, continuation)
+            .map_err(|(error, continuation)| (LaneError::Suspension(error), continuation))
+    }
+
+    /// Transfer a completed callback's lower external token into a new service-wait frame.
+    /// The newly parked service token remains on top throughout the transfer.
+    pub fn transfer_callback_to_service_wait_external_owned(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        dispatch: LaneDispatchIdentity,
+        callback_token: u64,
+        service_token: u64,
+        key: SuspensionKey,
+        admission_sequence: u64,
+        owner: SuspensionOwner,
+        continuation: C,
+    ) -> Result<(), (LaneError, C)> {
+        if callback_token == 0 || callback_token == service_token {
+            return Err((LaneError::InvalidIdentity, continuation));
+        }
+        if let Err(error) = self.validate_service_wait_external(
+            handle, reply_object, dispatch, service_token,
+        ) {
+            return Err((error, continuation));
+        }
+        let lane = self.lane(handle).expect("validated service wait lane");
+        if lane.external_tokens.len() < 2
+            || lane.external_tokens[lane.external_tokens.len() - 2] != callback_token
+        {
+            return Err((LaneError::InvalidPhase, continuation));
+        }
+        self.admit_service_wait_external_owned(
+            handle, reply_object, dispatch, service_token, key,
+            admission_sequence, owner, continuation,
+        )?;
+        let lane = self.lane_mut(handle).expect("admitted service wait lane");
+        let callback_index = lane.external_tokens.len() - 2;
+        lane.external_tokens.remove(callback_index);
+        Ok(())
+    }
+
+    /// Replace any resumed component wait or settled Receive after an exact external park.
+    /// Both the new external token and the old continuation survive a rejected rearm.
+    pub fn rearm_service_wait_external_owned(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        dispatch: LaneDispatchIdentity,
+        external_token: u64,
+        completed_key: SuspensionKey,
+        next_key: SuspensionKey,
+        admission_sequence: u64,
+        owner: SuspensionOwner,
+        continuation: C,
+    ) -> Result<C, (LaneError, C)>
+    where
+        R: Clone,
+    {
+        if next_key.kind != SuspensionKind::ServiceWait
+            || external_token == 0
+        {
+            return Err((LaneError::InvalidIdentity, continuation));
+        }
+        if let Err(error) = self.validate_service_wait_external(
+            handle, reply_object, dispatch, external_token,
+        ).and_then(|()| self.validate_dispatch_owner(handle, owner)) {
+            return Err((error, continuation));
+        }
+        if self.slots.iter().any(|slot| slot.lane.as_ref().is_some_and(|lane| {
+            lane.suspensions.get(next_key).is_some()
+        })) {
+            return Err((LaneError::Suspension(SuspensionError::DuplicateIdentity), continuation));
+        }
+        if completed_key.kind == SuspensionKind::Receive {
+            let lane = self.lane(handle).expect("validated service wait lane");
+            let restored_on_route = lane.suspensions.top()
+                .filter(|frame| frame.key == completed_key)
+                .and_then(|frame| frame.receive)
+                .is_some_and(|receive| receive.restored
+                    && receive.scope.dispatch() == dispatch
+                    && lane.shared_peer == Some(receive.scope.route()));
+            if !restored_on_route {
+                return Err((LaneError::WrongBinding, continuation));
+            }
+        }
+        self.lane_mut(handle)
+            .expect("validated service wait lane")
+            .suspensions
+            .rearm_owned(completed_key, next_key, admission_sequence, owner, continuation)
+            .map_err(|(error, continuation)| (LaneError::Suspension(error), continuation))
+    }
+
+    fn validate_service_wait_external(
+        &self,
+        handle: LaneHandle,
+        reply_object: u64,
+        dispatch: LaneDispatchIdentity,
+        external_token: u64,
+    ) -> Result<(), LaneError> {
+        self.validate(handle, reply_object)?;
+        if dispatch.lane() != handle || !self.is_dispatch_identity_active(dispatch) {
+            return Err(LaneError::InvalidIdentity);
+        }
+        let lane = self.lane(handle)?;
+        if self.execution_busy()
+            || lane.phase != LanePhase::Suspended
+            || lane.external_tokens.last().copied() != Some(external_token)
+            || lane.terminal.is_some()
+        {
+            return Err(LaneError::InvalidPhase);
+        }
+        Ok(())
+    }
+
     /// Reacquire the execution token for a lane parked by [`Self::suspend_running`].
     pub fn resume_external(
         &mut self,
@@ -1033,6 +1252,47 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         Ok(())
     }
 
+    /// Consume an acknowledged external service wait and leave its typed continuation eligible
+    /// for selection. No unrelated dispatch can enter between external ACK and typed resume.
+    pub fn retire_service_wait_external_running(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        dispatch: LaneDispatchIdentity,
+        external_token: u64,
+        key: SuspensionKey,
+        owner: SuspensionOwner,
+    ) -> Result<(), LaneError> {
+        if key.kind != SuspensionKind::ServiceWait || external_token == 0 {
+            return Err(LaneError::InvalidIdentity);
+        }
+        self.validate_running(handle, reply_object)?;
+        if dispatch.lane() != handle || !self.is_dispatch_identity_active(dispatch) {
+            return Err(LaneError::InvalidIdentity);
+        }
+        self.validate_dispatch_owner(handle, owner)?;
+        let lane = self.lane_mut(handle)?;
+        if lane.external_tokens.last().copied() != Some(external_token)
+            || lane.terminal.is_some()
+        {
+            return Err(LaneError::InvalidPhase);
+        }
+        let frame = lane.suspensions.top().ok_or(LaneError::Suspension(SuspensionError::NotFound))?;
+        if frame.key != key {
+            return Err(LaneError::Suspension(SuspensionError::NotTop));
+        }
+        if frame.owner != owner {
+            return Err(LaneError::WrongBinding);
+        }
+        if !matches!(frame.phase, SuspensionPhase::Waiting) {
+            return Err(LaneError::Suspension(SuspensionError::InvalidPhase));
+        }
+        lane.external_tokens.pop();
+        lane.phase = LanePhase::Suspended;
+        self.running = None;
+        Ok(())
+    }
+
     pub fn replace_external_running(
         &mut self,
         handle: LaneHandle,
@@ -1092,6 +1352,9 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         owner: SuspensionOwner,
         continuation: C,
     ) -> Result<(), (LaneError, C)> {
+        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::ServiceWait) {
+            return Err((LaneError::InvalidPhase, continuation));
+        }
         if external_token == 0 {
             return Err((LaneError::InvalidIdentity, continuation));
         }
@@ -1160,6 +1423,9 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         owner: SuspensionOwner,
         continuation: C,
     ) -> Result<(), (LaneError, C)> {
+        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::ServiceWait) {
+            return Err((LaneError::InvalidPhase, continuation));
+        }
         if let Err(error) = self
             .validate_running(handle, reply_object)
             .and_then(|()| self.validate_dispatch_owner(handle, owner))
@@ -1215,6 +1481,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
     }
 
     pub fn select(&mut self, key: SuspensionKey, completion: R) -> Result<(), LaneError> {
+        if key.kind == SuspensionKind::Receive { return Err(LaneError::InvalidPhase); }
         let handle = self
             .lane_for_key(key)
             .ok_or(LaneError::Suspension(SuspensionError::NotFound))?;
@@ -1228,6 +1495,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
     }
 
     pub fn cancel(&mut self, key: SuspensionKey, completion: R) -> Result<(), LaneError> {
+        if key.kind == SuspensionKind::Receive { return Err(LaneError::InvalidPhase); }
         let handle = self
             .lane_for_key(key)
             .ok_or(LaneError::Suspension(SuspensionError::NotFound))?;
@@ -1348,6 +1616,7 @@ impl<C, R: Clone, T> ComponentSuspensionLanes<C, R, T> {
         key: SuspensionKey,
         reserve: impl FnOnce(&mut Vec<u64>) -> Result<(), LaneError>,
     ) -> Result<SuspensionResume<R>, LaneError> {
+        if key.kind == SuspensionKind::Receive { return Err(LaneError::InvalidPhase); }
         if self.execution_busy() {
             return Err(LaneError::Busy);
         }
@@ -1419,6 +1688,9 @@ impl<C, R: Clone, T> ComponentSuspensionLanes<C, R, T> {
         owner: SuspensionOwner,
         continuation: C,
     ) -> Result<C, (LaneError, C)> {
+        if matches!(next_key.kind, SuspensionKind::Receive | SuspensionKind::ServiceWait) {
+            return Err((LaneError::InvalidPhase, continuation));
+        }
         if let Err(error) = self
             .validate_running(handle, reply_object)
             .and_then(|()| self.validate_dispatch_owner(handle, owner))

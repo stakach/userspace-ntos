@@ -32,6 +32,49 @@ pub trait Backend {
     fn call(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> LpcReply;
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RetainedRequestPortOutcome {
+    Queued,
+    Refused(NtStatus),
+}
+
+fn decode_retained_request_outcome(
+    reply: LpcReply,
+    bytes: &[u8],
+    endpoint: u64,
+    process: u64,
+    thread: u64,
+) -> Result<RetainedRequestPortOutcome, NtStatus> {
+    use nt_lpc_abi::{retained_request_disposition as disposition, LpcRetainedRequestOutcome};
+    if reply.status != NtStatus::SUCCESS.raw() {
+        return Err(NtStatus(reply.status));
+    }
+    if reply.information as usize != size_of::<LpcRetainedRequestOutcome>()
+        || bytes.len() != size_of::<LpcRetainedRequestOutcome>()
+    {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+    let certificate: LpcRetainedRequestOutcome =
+        bytemuck::try_pod_read_unaligned(bytes).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+    if certificate.abi_size as usize != bytes.len()
+        || certificate.reserved != 0
+        || certificate.endpoint_handle != endpoint
+        || certificate.client_process != process
+        || certificate.client_thread != thread
+    {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+    match certificate.disposition {
+        disposition::QUEUED if certificate.status == NtStatus::SUCCESS.raw() as u32 => {
+            Ok(RetainedRequestPortOutcome::Queued)
+        }
+        disposition::REFUSED if certificate.status >> 30 == 3 => Ok(
+            RetainedRequestPortOutcome::Refused(NtStatus(certificate.status as i32)),
+        ),
+        _ => Err(NtStatus::INVALID_PARAMETER),
+    }
+}
+
 /// The outcome of a connect: either the connection completed (a client comm-port
 /// `handle`) or it is `pending` a receiver (path B — the executive parks the
 /// connector, `connection_id` identifies which to wake on complete).
@@ -343,6 +386,127 @@ impl<B: Backend> LpcClient<B> {
             .backend
             .call(opcode::LPC_OP_CLOSE_PORT, bytemuck::bytes_of(&req), &mut []);
         NtStatus(reply.status).to_result()
+    }
+
+    fn endpoint_transition(
+        &mut self,
+        opcode: u16,
+        handle: u64,
+    ) -> Result<Option<nt_lpc_abi::LpcEndpointLifetime>, NtStatus> {
+        let request = nt_lpc_abi::LpcClosePortRequest {
+            abi_size: size_of::<nt_lpc_abi::LpcClosePortRequest>() as u16,
+            port_handle: handle,
+            ..Default::default()
+        };
+        let mut out = [0u8; size_of::<nt_lpc_abi::LpcEndpointLifetime>()];
+        let reply = self
+            .backend
+            .call(opcode, bytemuck::bytes_of(&request), &mut out);
+        let snapshot = Self::decode_endpoint_lifetime(reply, &out)?;
+        if snapshot.endpoint == 0 {
+            if snapshot.connection_id != 0
+                || snapshot.owner_process != 0
+                || snapshot.endpoint_handle != 0
+                || snapshot.user_open != 0
+                || snapshot.kernel_references != 0
+                || snapshot.construction_references != 0
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            return Ok(None);
+        }
+        if opcode == opcode::LPC_OP_CLOSE_PORT_WITH_LIFETIME && snapshot.endpoint_handle != handle {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(Some(snapshot))
+    }
+
+    fn decode_endpoint_lifetime(
+        reply: LpcReply,
+        out: &[u8],
+    ) -> Result<nt_lpc_abi::LpcEndpointLifetime, NtStatus> {
+        NtStatus(reply.status).to_result()?;
+        if reply.information as usize != size_of::<nt_lpc_abi::LpcEndpointLifetime>() {
+            return Err(NtStatus::BUFFER_TOO_SMALL);
+        }
+        let snapshot: nt_lpc_abi::LpcEndpointLifetime =
+            bytemuck::try_pod_read_unaligned(out).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+        if snapshot.abi_size as usize != size_of::<nt_lpc_abi::LpcEndpointLifetime>()
+            || snapshot.user_open > 1
+            || snapshot.construction_references > 1
+            || !matches!(
+                snapshot.endpoint,
+                0 | nt_lpc_abi::handle_endpoint::CLIENT_COMM_PORT
+                    | nt_lpc_abi::handle_endpoint::SERVER_COMM_PORT
+            )
+            || (snapshot.endpoint != 0 && snapshot.connection_id == 0)
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(snapshot)
+    }
+
+    pub fn close_port_with_lifetime(
+        &mut self,
+        port_handle: u64,
+    ) -> Result<Option<nt_lpc_abi::LpcEndpointLifetime>, NtStatus> {
+        self.endpoint_transition(opcode::LPC_OP_CLOSE_PORT_WITH_LIFETIME, port_handle)
+    }
+
+    /// Close canonical user handles after the executive has authenticated process teardown.
+    /// Repetition after acknowledged completion is harmless; retained kernel references remain.
+    pub fn close_process_ports(&mut self, owner_process: u64) -> Result<u64, NtStatus> {
+        let request = nt_lpc_abi::LpcCloseProcessPortsRequest {
+            abi_size: size_of::<nt_lpc_abi::LpcCloseProcessPortsRequest>() as u16,
+            owner_process,
+            ..Default::default()
+        };
+        let reply = self.backend.call(
+            opcode::LPC_OP_CLOSE_PROCESS_PORTS,
+            bytemuck::bytes_of(&request),
+            &mut [],
+        );
+        NtStatus(reply.status).to_result()?;
+        Ok(reply.detail0)
+    }
+
+    pub fn release_port_object_with_lifetime(
+        &mut self,
+        retained: u64,
+    ) -> Result<Option<nt_lpc_abi::LpcEndpointLifetime>, NtStatus> {
+        self.endpoint_transition(opcode::LPC_OP_RELEASE_PORT_OBJECT_WITH_LIFETIME, retained)
+    }
+
+    /// Read exact canonical endpoint references; an unavailable/malformed response is not
+    /// deletion evidence. The snapshot itself holds no endpoint reference.
+    pub fn query_endpoint_lifetime(
+        &mut self,
+        connection_id: u64,
+        endpoint: u16,
+        owner_process: u64,
+    ) -> Result<nt_lpc_abi::LpcEndpointLifetime, NtStatus> {
+        let request = nt_lpc_abi::LpcEndpointLifetimeRequest {
+            abi_size: size_of::<nt_lpc_abi::LpcEndpointLifetimeRequest>() as u16,
+            endpoint,
+            connection_id,
+            owner_process,
+            ..Default::default()
+        };
+        let mut out = [0u8; size_of::<nt_lpc_abi::LpcEndpointLifetime>()];
+        let reply = self.backend.call(
+            opcode::LPC_OP_QUERY_ENDPOINT_LIFETIME,
+            bytemuck::bytes_of(&request),
+            &mut out,
+        );
+        let snapshot = Self::decode_endpoint_lifetime(reply, &out)?;
+        if snapshot.connection_id != connection_id
+            || snapshot.endpoint != endpoint
+            || snapshot.owner_process != owner_process
+            || endpoint == 0
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(snapshot)
     }
 
     /// Acquire a broker-owned kernel endpoint referencing one live connection port. The returned
@@ -733,6 +897,36 @@ impl<B: Backend> LpcClient<B> {
         .map(|_| ())
     }
 
+    /// Distinguish acknowledged queue publication from a checked no-enqueue refusal.
+    /// Any transport or certificate error leaves the attempted effect unresolved.
+    pub fn retained_request_port_outcome(
+        &mut self,
+        endpoint_handle: u64,
+        message: &[u8],
+        client_process: u64,
+        client_thread: u64,
+    ) -> Result<RetainedRequestPortOutcome, NtStatus> {
+        let header = size_of::<LpcMessageRequest>();
+        let request = LpcMessageRequest {
+            abi_size: header as u16,
+            _reserved: 0,
+            _reserved2: 0,
+            port_handle: endpoint_handle,
+            msg_offset: header as u32,
+            msg_len_bytes: u32_len(message.len())?,
+            client_process,
+            client_thread,
+        };
+        let buf = pack_bytes::<LPC_MESSAGE_BUF_LEN, _>(&request, message)?;
+        let mut out = [0u8; size_of::<nt_lpc_abi::LpcRetainedRequestOutcome>()];
+        let reply = self.backend.call(
+            opcode::LPC_OP_RETAINED_REQUEST_PORT_OUTCOME,
+            buf.as_slice(),
+            &mut out,
+        );
+        decode_retained_request_outcome(reply, &out, endpoint_handle, client_process, client_thread)
+    }
+
     fn begin_request_wait_reply_on(
         &mut self,
         opcode: u16,
@@ -1034,6 +1228,259 @@ mod tests {
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()
+    }
+
+    #[test]
+    fn retained_request_outcome_requires_exact_checked_certificate() {
+        use nt_lpc_abi::{retained_request_disposition as d, LpcRetainedRequestOutcome};
+        let queued = LpcRetainedRequestOutcome {
+            abi_size: size_of::<LpcRetainedRequestOutcome>() as u16,
+            disposition: d::QUEUED,
+            status: NtStatus::SUCCESS.raw() as u32,
+            endpoint_handle: 17,
+            client_process: 42,
+            client_thread: 43,
+            reserved: 0,
+        };
+        let reply = LpcReply {
+            status: NtStatus::SUCCESS.raw(),
+            information: size_of::<LpcRetainedRequestOutcome>() as u32,
+            ..Default::default()
+        };
+        assert_eq!(
+            decode_retained_request_outcome(reply, bytemuck::bytes_of(&queued), 17, 42, 43),
+            Ok(RetainedRequestPortOutcome::Queued)
+        );
+        let refused = LpcRetainedRequestOutcome {
+            disposition: d::REFUSED,
+            status: NtStatus::PORT_DISCONNECTED.raw() as u32,
+            ..queued
+        };
+        assert_eq!(
+            decode_retained_request_outcome(reply, bytemuck::bytes_of(&refused), 17, 42, 43),
+            Ok(RetainedRequestPortOutcome::Refused(
+                NtStatus::PORT_DISCONNECTED
+            ))
+        );
+        for bad in [
+            LpcRetainedRequestOutcome {
+                abi_size: 0,
+                ..queued
+            },
+            LpcRetainedRequestOutcome {
+                reserved: 1,
+                ..queued
+            },
+            LpcRetainedRequestOutcome {
+                endpoint_handle: 18,
+                ..queued
+            },
+            LpcRetainedRequestOutcome {
+                client_process: 44,
+                ..queued
+            },
+            LpcRetainedRequestOutcome {
+                client_thread: 44,
+                ..queued
+            },
+            LpcRetainedRequestOutcome {
+                disposition: 0,
+                ..queued
+            },
+            LpcRetainedRequestOutcome {
+                status: NtStatus::PORT_DISCONNECTED.raw() as u32,
+                ..queued
+            },
+            LpcRetainedRequestOutcome {
+                status: NtStatus::SUCCESS.raw() as u32,
+                ..refused
+            },
+            LpcRetainedRequestOutcome {
+                status: NtStatus::PENDING.raw() as u32,
+                ..refused
+            },
+            LpcRetainedRequestOutcome {
+                status: 0x4000_0000,
+                ..refused
+            },
+            LpcRetainedRequestOutcome {
+                status: 0x8000_0005,
+                ..refused
+            },
+        ] {
+            assert_eq!(
+                decode_retained_request_outcome(reply, bytemuck::bytes_of(&bad), 17, 42, 43),
+                Err(NtStatus::INVALID_PARAMETER)
+            );
+        }
+        for bad_reply in [
+            LpcReply {
+                information: 0,
+                ..reply
+            },
+            LpcReply {
+                information: 41,
+                ..reply
+            },
+        ] {
+            assert_eq!(
+                decode_retained_request_outcome(
+                    bad_reply,
+                    bytemuck::bytes_of(&refused),
+                    17,
+                    42,
+                    43
+                ),
+                Err(NtStatus::INVALID_PARAMETER)
+            );
+        }
+        assert_eq!(
+            decode_retained_request_outcome(
+                LpcReply {
+                    status: NtStatus::PORT_DISCONNECTED.raw(),
+                    ..reply
+                },
+                bytemuck::bytes_of(&refused),
+                17,
+                42,
+                43
+            ),
+            Err(NtStatus::PORT_DISCONNECTED),
+            "raw status is unresolved, not a Refused certificate"
+        );
+    }
+
+    #[test]
+    fn retained_request_outcome_uses_dedicated_operation_and_captured_actor() {
+        struct OutcomeBackend(nt_lpc_abi::LpcRetainedRequestOutcome);
+        impl Backend for OutcomeBackend {
+            fn call(&mut self, op: u16, input: &[u8], output: &mut [u8]) -> LpcReply {
+                assert_eq!(op, opcode::LPC_OP_RETAINED_REQUEST_PORT_OUTCOME);
+                let request: LpcMessageRequest = bytemuck::pod_read_unaligned(&input[..40]);
+                assert_eq!(
+                    (
+                        request.port_handle,
+                        request.client_process,
+                        request.client_thread
+                    ),
+                    (17, 42, 43)
+                );
+                assert_eq!(request.abi_size, 40);
+                assert_eq!(request.msg_offset, 40);
+                assert_eq!(input.len(), 40 + request.msg_len_bytes as usize);
+                output.copy_from_slice(bytemuck::bytes_of(&self.0));
+                LpcReply {
+                    information: 40,
+                    ..Default::default()
+                }
+            }
+        }
+        let certificate = nt_lpc_abi::LpcRetainedRequestOutcome {
+            abi_size: 40,
+            disposition: nt_lpc_abi::retained_request_disposition::REFUSED,
+            status: NtStatus::PORT_DISCONNECTED.raw() as u32,
+            endpoint_handle: 17,
+            client_process: 42,
+            client_thread: 43,
+            reserved: 0,
+        };
+        let mut client = LpcClient::new(OutcomeBackend(certificate));
+        assert_eq!(
+            client.retained_request_port_outcome(17, &nt_lpc_abi::client_died_message(7), 42, 43),
+            Ok(RetainedRequestPortOutcome::Refused(
+                NtStatus::PORT_DISCONNECTED
+            ))
+        );
+    }
+
+    #[test]
+    fn endpoint_snapshot_decoder_refuses_foreign_and_malformed_deletion_evidence() {
+        let valid = nt_lpc_abi::LpcEndpointLifetime {
+            abi_size: size_of::<nt_lpc_abi::LpcEndpointLifetime>() as u16,
+            endpoint: nt_lpc_abi::handle_endpoint::CLIENT_COMM_PORT,
+            connection_id: 7,
+            owner_process: 42,
+            endpoint_handle: 91,
+            ..Default::default()
+        };
+        for invalid in [
+            nt_lpc_abi::LpcEndpointLifetime {
+                owner_process: 43,
+                ..valid
+            },
+            nt_lpc_abi::LpcEndpointLifetime {
+                connection_id: 8,
+                ..valid
+            },
+            nt_lpc_abi::LpcEndpointLifetime {
+                endpoint: nt_lpc_abi::handle_endpoint::SERVER_COMM_PORT,
+                ..valid
+            },
+            nt_lpc_abi::LpcEndpointLifetime {
+                user_open: 2,
+                ..valid
+            },
+            nt_lpc_abi::LpcEndpointLifetime {
+                construction_references: 2,
+                ..valid
+            },
+            nt_lpc_abi::LpcEndpointLifetime {
+                abi_size: 0,
+                ..valid
+            },
+        ] {
+            let mut client = LpcClient::new(ImmediateBackend {
+                reply: LpcReply {
+                    status: 0,
+                    information: size_of::<nt_lpc_abi::LpcEndpointLifetime>() as u32,
+                    ..Default::default()
+                },
+                bytes: bytemuck::bytes_of(&invalid).to_vec(),
+            });
+            assert_eq!(
+                client.query_endpoint_lifetime(
+                    7,
+                    nt_lpc_abi::handle_endpoint::CLIENT_COMM_PORT,
+                    42
+                ),
+                Err(NtStatus::INVALID_PARAMETER)
+            );
+        }
+        let mut client = LpcClient::new(ImmediateBackend {
+            reply: LpcReply {
+                status: 0,
+                information: 1,
+                ..Default::default()
+            },
+            bytes: bytemuck::bytes_of(&valid).to_vec(),
+        });
+        assert_eq!(
+            client.query_endpoint_lifetime(7, nt_lpc_abi::handle_endpoint::CLIENT_COMM_PORT, 42),
+            Err(NtStatus::BUFFER_TOO_SMALL)
+        );
+    }
+
+    #[test]
+    fn close_snapshot_requires_the_actual_closed_endpoint_handle() {
+        let snapshot = nt_lpc_abi::LpcEndpointLifetime {
+            abi_size: size_of::<nt_lpc_abi::LpcEndpointLifetime>() as u16,
+            endpoint: nt_lpc_abi::handle_endpoint::CLIENT_COMM_PORT,
+            connection_id: 7,
+            endpoint_handle: 92,
+            ..Default::default()
+        };
+        let mut client = LpcClient::new(ImmediateBackend {
+            reply: LpcReply {
+                status: 0,
+                information: size_of::<nt_lpc_abi::LpcEndpointLifetime>() as u32,
+                ..Default::default()
+            },
+            bytes: bytemuck::bytes_of(&snapshot).to_vec(),
+        });
+        assert_eq!(
+            client.close_port_with_lifetime(91),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Backing and handle ownership for native generic data-section creation.
 
 use super::*;
+use crate::local_section_file;
 use nt_process::native_handle::NativeHandleCaller;
 
 pub(crate) struct RoutedSectionAdmission {
@@ -17,6 +18,9 @@ pub(crate) struct ReservedGenericDataSection {
 }
 
 impl ReservedGenericDataSection {
+    pub(crate) fn identity(&self) -> nt_memory_manager::SectionIdentity {
+        self.identity
+    }
     pub(crate) fn value(&self) -> u64 {
         self.publication.value()
     }
@@ -33,6 +37,7 @@ impl ReservedGenericDataSection {
     }
 
     pub(crate) fn abort(&mut self, handler: &mut ExecNtHandler) {
+        handler.withdraw_data_section_name(self.identity);
         let sections = unsafe {
             &mut *handler
                 .loop_ctx
@@ -45,6 +50,7 @@ impl ReservedGenericDataSection {
             Ok(Some(self.index as nt_process::SectionId)),
         );
         sections.clear_section(self.index);
+        handler.sweep_data_section_security();
     }
 
     pub(crate) fn into_object_reference(
@@ -52,17 +58,26 @@ impl ReservedGenericDataSection {
         handler: &mut ExecNtHandler,
     ) -> Result<(nt_memory_manager::SectionReference, u64, u32), u32> {
         let sections = unsafe {
-            &mut *handler.loop_ctx.expect("reserved Section context").generic_sections
+            &mut *handler
+                .loop_ctx
+                .expect("reserved Section context")
+                .generic_sections
         };
         assert_eq!(sections.section_identity(self.index), Some(self.identity));
-        let protection = sections.section(self.index).expect("reserved Section").protection;
+        let protection = sections
+            .section(self.index)
+            .expect("reserved Section")
+            .protection;
         let Some(reference) = sections.retain_section(self.identity) else {
             self.abort(handler);
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
         };
         // The object reference must fence backing lifetime before canceling its invisible handle.
-        if self.publication.abort(&mut handler.pm) != Ok(Some(self.index as nt_process::SectionId)) {
-            unsafe { crate::provider_bugcheck::report(0xc4, [self.index as u64, self.size, 0, 91]); }
+        if self.publication.abort(&mut handler.pm) != Ok(Some(self.index as nt_process::SectionId))
+        {
+            unsafe {
+                crate::provider_bugcheck::report(0xc4, [self.index as u64, self.size, 0, 91]);
+            }
         }
         let sections = unsafe { &mut *handler.loop_ctx.expect("Section context").generic_sections };
         assert_eq!(sections.section_identity(self.index), Some(self.identity));
@@ -72,17 +87,14 @@ impl ReservedGenericDataSection {
 }
 
 impl ExecNtHandler {
-    pub(crate) fn native_section_owner_pi(
-        &self,
-        caller: NativeHandleCaller,
-    ) -> Result<usize, u32> {
+    pub(crate) fn native_section_owner_pi(&self, caller: NativeHandleCaller) -> Result<usize, u32> {
         (0..MAX_PI)
             .find(|&pi| self.pm_pid_for_pi(pi) == Some(caller.effective_process()))
             .ok_or(nt_fs::STATUS_INVALID_HANDLE)
     }
 
-    /// Reserve a real section and an invisible native handle. The caller must publish only after
-    /// output delivery, or abort to retire the section and its retained backing reference.
+    /// Reserve a real section and an invisible native handle. Publish at the admitted commit
+    /// boundary, or abort before commit to retire the section and retained backing reference.
     pub(crate) unsafe fn reserve_generic_data_section(
         &mut self,
         caller: NativeHandleCaller,
@@ -95,6 +107,7 @@ impl ExecNtHandler {
         sec_file: u64,
         mut routed_admission: Option<RoutedSectionAdmission>,
     ) -> Result<ReservedGenericDataSection, u32> {
+        let _durable = allocator::enter_durable();
         const STATUS_INVALID_FILE_FOR_SECTION: u32 = 0xC000_0020;
         nt_memory_manager::data_section::data_section_file_access(page_protection)?;
         if self.pm_pid_for_pi(owner_pi) != Some(caller.effective_process()) {
@@ -102,6 +115,7 @@ impl ExecNtHandler {
         }
         let generic_sections = self.loop_ctx.ok_or(0xC000_00A3u32)?.generic_sections;
         let mut routed_lease = None;
+        let mut local_lease = None;
         let (backing, backing_size) = if sec_file == 0 && routed_admission.is_none() {
             if maxsize == 0 {
                 return Err(0xC000_00F2); // STATUS_INVALID_PARAMETER_4
@@ -120,7 +134,9 @@ impl ExecNtHandler {
                     admission.capture.granted_access(),
                 )
             } else {
-                let source = self.pm.lookup_native_section_file_source(caller, sec_file)?;
+                let source = self
+                    .pm
+                    .lookup_native_section_file_source(caller, sec_file)?;
                 (source.object(), source.granted_access())
             };
             nt_memory_manager::data_section::check_data_section_file_access(
@@ -133,19 +149,14 @@ impl ExecNtHandler {
                     size,
                     object_id,
                 } => {
-                    let open = self.readonly_file_opens.get(object_id)?;
-                    if open.first_cluster != first_cluster || open.size != size {
-                        return Err(nt_fs::STATUS_INVALID_HANDLE);
-                    }
-                    if open.metadata.is_directory {
-                        return Err(STATUS_INVALID_FILE_FOR_SECTION);
-                    }
-                    let identity = exec_fs_file_identity(open.metadata.file_id)
-                        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-                    (
-                        GenericSectionBacking::disk(first_cluster, size, identity),
-                        None,
-                    )
+                    let (backing, lease) = local_section_file::reserve_disk_source(
+                        self,
+                        object_id,
+                        first_cluster,
+                        size,
+                    )?;
+                    local_lease = Some(lease);
+                    (backing, None)
                 }
                 nt_process::HandleObject::OverlayFile(file_id) => {
                     (crate::writable_fs::section_backing(file_id)?, None)
@@ -178,6 +189,9 @@ impl ExecNtHandler {
                 _ => return Err(STATUS_INVALID_FILE_FOR_SECTION),
             };
             if let Err(status) = (&*generic_sections).validate_file_creation(backing, maxsize) {
+                if let Some(lease) = local_lease {
+                    local_section_file::cancel_unbound(self, lease)?;
+                }
                 if let Some(lease) = routed_lease {
                     crate::hosted_routed_section_capture::cancel_unbound(lease)
                         .expect("failed routed Section admission retains its File reference");
@@ -187,11 +201,27 @@ impl ExecNtHandler {
             match routed_size {
                 Some(size) => (backing, size),
                 None => {
-                    service_prepare_data_section_file(backing, maxsize, page_protection, access)?
+                    match service_prepare_data_section_file(
+                        backing,
+                        maxsize,
+                        page_protection,
+                        access,
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(status) => {
+                            if let Some(lease) = local_lease {
+                                local_section_file::cancel_unbound(self, lease)?;
+                            }
+                            return Err(status);
+                        }
+                    }
                 }
             }
         };
         if let Err(status) = (&*generic_sections).validate_backing_extent(backing) {
+            if let Some(lease) = local_lease {
+                local_section_file::cancel_unbound(self, lease)?;
+            }
             if let Some(lease) = routed_lease {
                 crate::hosted_routed_section_capture::cancel_unbound(lease)
                     .expect("failed routed Section extent retains its File reference");
@@ -201,6 +231,9 @@ impl ExecNtHandler {
         let mut publication = match self.pm.reserve_native_section_handle(caller, attributes) {
             Ok(publication) => publication,
             Err(status) => {
+                if let Some(lease) = local_lease {
+                    local_section_file::cancel_unbound(self, lease)?;
+                }
                 if let Some(lease) = routed_lease {
                     crate::hosted_routed_section_capture::cancel_unbound(lease)
                         .expect("failed Section handle reservation retains its File reference");
@@ -236,11 +269,17 @@ impl ExecNtHandler {
             publication
                 .abort(&mut self.pm)
                 .expect("empty Section reservation aborts");
+            if let Some(lease) = local_lease {
+                local_section_file::cancel_unbound(self, lease)?;
+            }
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
         };
         let identity = generic_sections
             .section_identity(index)
             .expect("new Section has an exact identity");
+        if let Some(lease) = local_lease {
+            assert!(local_section_file::bind(lease, identity));
+        }
         if let Some(lease) = routed_lease {
             assert!(crate::hosted_routed_section_capture::bind(lease, identity));
         }

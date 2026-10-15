@@ -23,6 +23,9 @@ pub enum ExternalFileIrpOutputCapture {
     /// Ordinary IOCTL completion: status-gated buffered output or full direct/neither writeback.
     DeviceControl,
     BufferedDeviceControlCapacity,
+    /// The driver modified its METHOD_NEITHER Type3InputBuffer. Capture the exact input bytes
+    /// independently of IoStatus.Information; output length must be zero.
+    MethodNeitherInput,
 }
 impl ExternalFileIrpOutputCapture {
     pub(super) fn required_len(
@@ -69,6 +72,27 @@ impl ExternalFileIrpOutputCapture {
                             == nt_io_abi::ioctl::METHOD_BUFFERED =>
                     {
                         Ok(capacity)
+                    }
+                    _ => Err(NtStatus::INVALID_PARAMETER),
+                }
+            }
+            Self::MethodNeitherInput => {
+                if owner.buffers.output.len() != 0
+                    || !matches!(
+                        owner.projection.major,
+                        major::IRP_MJ_DEVICE_CONTROL | major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+                    )
+                {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
+                match &owner.projection.parameters {
+                    IoParameters::DeviceControl(p) | IoParameters::InternalDeviceControl(p)
+                        if nt_io_abi::ioctl::method(p.ioctl_code)
+                            == nt_io_abi::ioctl::METHOD_NEITHER
+                            && p.input_len as usize == owner.buffers.input.len()
+                            && p.output_len == 0 =>
+                    {
+                        Ok(owner.buffers.input.len())
                     }
                     _ => Err(NtStatus::INVALID_PARAMETER),
                 }
@@ -157,6 +181,9 @@ impl ExternalFileIrpCopyInvocation {
     }
     pub fn completion(&self) -> &CompletedIrp {
         &self.completion.completion
+    }
+    pub fn capture_kind(&self) -> ExternalFileIrpOutputCapture {
+        self.completion.capture
     }
     pub fn offset(&self) -> usize {
         self.completion.captured
@@ -425,7 +452,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
             staging,
         } = returned.invocation;
         let end = completion.captured + staging.len();
-        completion.owner.buffers.output[completion.captured..end].copy_from_slice(&staging);
+        let target = match completion.capture {
+            ExternalFileIrpOutputCapture::MethodNeitherInput => &mut completion.owner.buffers.input,
+            _ => &mut completion.owner.buffers.output,
+        };
+        target[completion.captured..end].copy_from_slice(&staging);
         completion.captured = end;
         Ok(completion)
     }

@@ -1,5 +1,8 @@
 //! Host composition of the query producer, canonical owner, peer wire and WDM projection.
 
+#[path = "seeded_query_provider/kernel.rs"]
+mod kernel;
+
 use std::mem::size_of;
 
 use nt_io_abi::{initial_output_required, major, IrpDispatchRequest, IO_ABI_VERSION};

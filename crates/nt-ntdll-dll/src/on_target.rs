@@ -24,6 +24,10 @@
 
 extern crate alloc;
 
+#[cfg(target_arch = "x86_64")]
+#[path = "dll_relocation.rs"]
+mod dll_relocation;
+
 use core::{
     ffi::c_void,
     marker::PhantomData,
@@ -1572,8 +1576,6 @@ static mut PENDING_IMPORT_REFERENCE_INCREMENTS:
 static mut IMPORT_REFERENCE_COUNT_PTRS: [u64; MODULE_TABLE_CAP] = [0; MODULE_TABLE_CAP];
 #[cfg(target_arch = "x86_64")]
 static mut IMPORT_REFERENCE_NEXT_COUNTS: [u16; MODULE_TABLE_CAP] = [0; MODULE_TABLE_CAP];
-#[cfg(target_arch = "x86_64")]
-static mut IMPORT_REFERENCE_DEFER_BASES: [u64; MODULE_TABLE_CAP] = [0; MODULE_TABLE_CAP];
 
 /// Balances future per-thread attach and detach callouts. No current thread is committed until the
 /// secondary-thread initialization path begins issuing DLL_THREAD_ATTACH.
@@ -2141,6 +2143,7 @@ unsafe fn snap_descriptor_against(
     dep_base: u64,
     table: *mut ModuleTable,
     out: &mut SnapResult,
+    expansion: &mut nt_ntdll::loader::reference_graph::ReferenceExpansion<MODULE_TABLE_CAP>,
 ) {
     // SAFETY: caller contract — mapped images, writable IAT.
     unsafe {
@@ -2172,11 +2175,21 @@ unsafe fn snap_descriptor_against(
                     table,
                     &mut out.status,
                     0,
+                    expansion,
                 )
             } else {
                 // by ordinal.
                 let ord = (thunk & 0xffff) as u32;
-                resolve_export_addr(dep_base, true, &[], ord, table, &mut out.status, 0)
+                resolve_export_addr(
+                    dep_base,
+                    true,
+                    &[],
+                    ord,
+                    table,
+                    &mut out.status,
+                    0,
+                    expansion,
+                )
             };
             if out.status != 0 {
                 core::ptr::write_unaligned(
@@ -2284,6 +2297,7 @@ unsafe fn resolve_export_addr(
     table: *mut ModuleTable,
     load_status: &mut u32,
     depth: u32,
+    expansion: &mut nt_ntdll::loader::reference_graph::ReferenceExpansion<MODULE_TABLE_CAP>,
 ) -> u64 {
     if depth > 8 {
         if *load_status == 0 {
@@ -2349,6 +2363,7 @@ unsafe fn resolve_export_addr(
                 table,
                 &mut sink,
                 depth + 1,
+                expansion,
             );
             tbase = loaded.base;
             if sink.status != 0 {
@@ -2377,9 +2392,27 @@ unsafe fn resolve_export_addr(
                 }
                 ord = ord * 10 + (c - b'0') as u32;
             }
-            resolve_export_addr(tbase, true, &[], ord, table, load_status, depth + 1)
+            resolve_export_addr(
+                tbase,
+                true,
+                &[],
+                ord,
+                table,
+                load_status,
+                depth + 1,
+                expansion,
+            )
         } else {
-            resolve_export_addr(tbase, false, sym_part, 0, table, load_status, depth + 1)
+            resolve_export_addr(
+                tbase,
+                false,
+                sym_part,
+                0,
+                table,
+                load_status,
+                depth + 1,
+                expansion,
+            )
         }
     }
 }
@@ -2464,11 +2497,18 @@ unsafe fn load_dependent_dll(open_name_lc: &[u8]) -> u64 {
         return 0;
     }
 
+    let load = match unsafe { dll_relocation::DllLoad::reserve(open_name_lc) } {
+        Ok(load) => load,
+        Err(_) => {
+            unsafe { syscall4(SSN_NT_CLOSE, section, 0, 0, 0) };
+            return 0;
+        }
+    };
+
     // NtMapViewOfSection(Section, NtCurrentProcess(), &BaseAddress, ZeroBits=0, CommitSize=0,
     //                    &SectionOffset=NULL, &ViewSize, InheritDisposition=1, AllocationType=0,
-    //                    Protect=PAGE_EXECUTE_READ). The executive writes the DLL's fixed registry
-    // base into *BaseAddress and its extent into *ViewSize. *BaseAddress MUST be a stack local (the
-    // executive writes it through its stack mirror).
+    //                    Protect=PAGE_EXECUTE_READ). The canonical image mapper supplies the base
+    // and extent; the in-process loader, not the kernel, applies any required relocation.
     let mut base_address: u64 = 0;
     let mut view_size: u64 = 0;
     // SAFETY: on-target syscall; stack-local out-params.
@@ -2488,6 +2528,14 @@ unsafe fn load_dependent_dll(open_name_lc: &[u8]) -> u64 {
     };
     unsafe { syscall4(SSN_NT_CLOSE, section, 0, 0, 0) };
     if (st as i32) < 0 {
+        report_file_map_failure(
+            nt_ntdll::loader::file_map_failure::FileMapFailureStage::MapView,
+            st as u32,
+        );
+        let _ = unsafe { load.finish(base_address, view_size, st as u32) };
+        return 0;
+    }
+    if unsafe { load.finish(base_address, view_size, st as u32) }.is_err() {
         return 0;
     }
     base_address
@@ -2555,6 +2603,7 @@ unsafe fn load_and_snap_dependency(
     table: *mut ModuleTable,
     out: &mut SnapResult,
     depth: u32,
+    expansion: &mut nt_ntdll::loader::reference_graph::ReferenceExpansion<MODULE_TABLE_CAP>,
 ) -> DependencySnap {
     let existing = unsafe { (&*table).find(name_lc) };
     if existing != 0 {
@@ -2590,7 +2639,7 @@ unsafe fn load_and_snap_dependency(
             increment_existing_reference: false,
         };
     }
-    unsafe { snap_module(base, ntdll_base, table, out, depth) };
+    unsafe { snap_module(base, ntdll_base, table, out, depth, expansion) };
     if out.status == 0 {
         DependencySnap {
             base,
@@ -2607,96 +2656,54 @@ unsafe fn load_and_snap_dependency(
 #[cfg(target_arch = "x86_64")]
 unsafe fn publish_import_reference_edges(
     import_edges: &nt_ntdll::loader::lifecycle::ImportReferenceLedger<MODULE_TABLE_CAP>,
+    expansion: &mut nt_ntdll::loader::reference_graph::ReferenceExpansion<MODULE_TABLE_CAP>,
 ) -> u32 {
     let count_ptrs = core::ptr::addr_of_mut!(IMPORT_REFERENCE_COUNT_PTRS).cast::<u64>();
     let next_counts = core::ptr::addr_of_mut!(IMPORT_REFERENCE_NEXT_COUNTS).cast::<u16>();
-    let defer_bases = core::ptr::addr_of_mut!(IMPORT_REFERENCE_DEFER_BASES).cast::<u64>();
-    let table = core::ptr::addr_of!(MODULE_TABLE);
-    let mut visited = [0u64; MODULE_TABLE_CAP];
-    let mut visited_count = 0usize;
-    for edge in import_edges.as_slice() {
-        if edge.increment_existing {
-            // LdrpUpdateLoadCount recurses through an imported DLL's already-loaded dependencies.
-            // The matching release path does the same, so incrementing only the immediate import can
-            // over-release transitive dependencies when a runtime DLL is later unloaded.
-            let status = unsafe {
-                collect_reference_modules_dfs(table, edge.base, &mut visited, &mut visited_count)
-            };
-            if status != 0 {
-                return status;
-            }
-        }
+    let mut acquisitions = nt_ntdll::loader::lifecycle::ReferenceReleaseLedger::new();
+    if let Err(status) = expansion.collect_imports(
+        &mut NativeReferenceGraph {
+            table: core::ptr::addr_of!(MODULE_TABLE),
+        },
+        import_edges,
+        &mut acquisitions,
+    ) {
+        return status;
     }
 
+    // Preflight deferred weights as well as live counts before publishing either.
+    let mut pending_after =
+        unsafe { (&*core::ptr::addr_of!(PENDING_IMPORT_REFERENCE_INCREMENTS)).clone() };
     let mut planned = 0usize;
-    let mut deferred = 0usize;
-    for &base in &visited[..visited_count] {
-        if unsafe { ldr_entry_for_base(base) } == 0 {
-            if deferred == MODULE_TABLE_CAP {
+    for reference in acquisitions.as_slice() {
+        if unsafe { ldr_entry_for_base(reference.base) } == 0 {
+            if !pending_after.record_many(reference.base, reference.releases) {
                 return STATUS_NO_MEMORY as u32;
             }
-            unsafe { core::ptr::write(defer_bases.add(deferred), base) };
-            deferred += 1;
             continue;
         }
-        let (count_ptr, next) =
-            match unsafe { crate::exports::ldr_plan_module_reference(base, false) } {
-                Ok(plan) => plan,
-                Err(status) => return status,
-            };
+        let (count_ptr, next) = match unsafe {
+            crate::exports::ldr_plan_module_references(reference.base, false, reference.releases)
+        } {
+            Ok(plan) => plan,
+            Err(status) => return status,
+        };
         unsafe {
             core::ptr::write(count_ptrs.add(planned), count_ptr as u64);
             core::ptr::write(next_counts.add(planned), next);
         }
         planned += 1;
     }
-
-    let pending = unsafe { &*core::ptr::addr_of!(PENDING_IMPORT_REFERENCE_INCREMENTS) };
-    let mut needed = 0usize;
-    let mut index = 0usize;
-    while index < deferred {
-        let base = unsafe { core::ptr::read(defer_bases.add(index)) };
-        if !pending.contains(base) {
-            let mut already_needed = false;
-            let mut prior = 0usize;
-            while prior < index {
-                if unsafe { core::ptr::read(defer_bases.add(prior)) } == base {
-                    already_needed = true;
-                    break;
-                }
-                prior += 1;
-            }
-            if !already_needed {
-                needed += 1;
-            }
-        }
-        index += 1;
-    }
-    if needed > pending.remaining_capacity() {
-        return STATUS_NO_MEMORY as u32;
-    }
-
-    let mut index = 0usize;
-    while index < planned {
+    for index in 0..planned {
         unsafe {
             let count_ptr = core::ptr::read(count_ptrs.add(index)) as *mut u16;
             let next = core::ptr::read(next_counts.add(index));
             core::ptr::write_unaligned(count_ptr, next);
         }
-        index += 1;
     }
-    let pending = unsafe { &mut *core::ptr::addr_of_mut!(PENDING_IMPORT_REFERENCE_INCREMENTS) };
-    let mut index = 0usize;
-    while index < deferred {
-        let base = unsafe { core::ptr::read(defer_bases.add(index)) };
-        if !pending.record(base) {
-            return STATUS_NO_MEMORY as u32;
-        }
-        index += 1;
-    }
+    unsafe { *core::ptr::addr_of_mut!(PENDING_IMPORT_REFERENCE_INCREMENTS) = pending_after };
     0
 }
-
 #[cfg(target_arch = "x86_64")]
 unsafe fn publish_pending_import_reference_edges() -> u32 {
     let count_ptrs = core::ptr::addr_of_mut!(IMPORT_REFERENCE_COUNT_PTRS).cast::<u64>();
@@ -2980,13 +2987,14 @@ pub unsafe fn ldrp_drive(image_base: u64, ntdll_base: u64, startup_reserved: u64
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn snap_all_imports(image_base: u64, ntdll_base: u64) -> SnapResult {
     let mut out = SnapResult::default();
+    let mut expansion = nt_ntdll::loader::reference_graph::ReferenceExpansion::new();
     // SAFETY: single-threaded loader context — MODULE_TABLE is touched only on the main thread while
     // LdrpInitialize runs (no other thread exists yet). The recursive helper honours the contract.
     unsafe {
         let table = core::ptr::addr_of_mut!(MODULE_TABLE);
         (&mut *table).insert(b"ntdll", ntdll_base);
         (&mut *table).set_imports_ready(ntdll_base);
-        snap_module(image_base, ntdll_base, table, &mut out, 0);
+        snap_module(image_base, ntdll_base, table, &mut out, 0, &mut expansion);
     }
     out
 }
@@ -3003,6 +3011,7 @@ unsafe fn snap_module(
     table: *mut ModuleTable,
     out: &mut SnapResult,
     depth: u32,
+    expansion: &mut nt_ntdll::loader::reference_graph::ReferenceExpansion<MODULE_TABLE_CAP>,
 ) {
     if out.status != 0 {
         unsafe { (&mut *table).set_imports_failed(image_base) };
@@ -3016,6 +3025,13 @@ unsafe fn snap_module(
         return; // corrupt graph: a simple path cannot exceed the table's unique-module capacity
     }
     if unsafe { (&*table).imports_ready(image_base) } {
+        return;
+    }
+    // This fresh snap accounts for its own imports. Later incoming edges still increment
+    // its count, but must not expand those imports again within the same load operation.
+    if let Err(status) = expansion.mark_snapped(image_base) {
+        out.status = status;
+        unsafe { (&mut *table).set_imports_failed(image_base) };
         return;
     }
     unsafe { (&mut *table).begin_imports(image_base) };
@@ -3068,7 +3084,14 @@ unsafe fn snap_module(
                     increment_existing_reference: dep_base != 0,
                 };
                 if dep_base == 0 {
-                    edge = load_and_snap_dependency(dep_name, ntdll_base, table, out, depth + 1);
+                    edge = load_and_snap_dependency(
+                        dep_name,
+                        ntdll_base,
+                        table,
+                        out,
+                        depth + 1,
+                        expansion,
+                    );
                     dep_base = edge.base;
                     if out.status != 0 {
                         core::ptr::write_unaligned(
@@ -3080,7 +3103,9 @@ unsafe fn snap_module(
                     }
                 }
                 if dep_base != 0 {
-                    snap_descriptor_against(image_base, ilt_rva, ft, dep_base, table, out);
+                    snap_descriptor_against(
+                        image_base, ilt_rva, ft, dep_base, table, out, expansion,
+                    );
                     if out.status != 0 {
                         return;
                     }
@@ -3110,7 +3135,7 @@ unsafe fn snap_module(
             return;
         }
         if out.status == 0 {
-            let reference_status = publish_import_reference_edges(import_edges.as_ref());
+            let reference_status = publish_import_reference_edges(import_edges.as_ref(), expansion);
             if reference_status != 0 {
                 out.status = reference_status;
                 return;
@@ -3853,7 +3878,8 @@ pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void)
                 // Snap the freshly-loaded DLL's own imports (ntdll + any deps) so it can run.
                 let ntdll_base = (&*table_ptr).find(b"ntdll");
                 let mut out = SnapResult::default();
-                snap_module(loaded, ntdll_base, table_ptr, &mut out, 0);
+                let mut expansion = nt_ntdll::loader::reference_graph::ReferenceExpansion::new();
+                snap_module(loaded, ntdll_base, table_ptr, &mut out, 0, &mut expansion);
                 if out.status != 0 {
                     return out.status;
                 }
@@ -3912,15 +3938,16 @@ pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void)
 pub unsafe fn ldr_add_ref_dll(base: u64, pin: bool) -> u32 {
     let mut visited = [0u64; MODULE_TABLE_CAP];
     let mut visited_count = 0usize;
-    let status = unsafe {
-        collect_reference_modules_dfs(
-            core::ptr::addr_of!(MODULE_TABLE),
-            base,
-            &mut visited,
-            &mut visited_count,
-        )
-    };
-    if status != 0 {
+    let mut acquisitions = nt_ntdll::loader::lifecycle::ReferenceReleaseLedger::new();
+    if let Err(status) = nt_ntdll::loader::reference_graph::collect_reference_acquisitions(
+        &mut NativeReferenceGraph {
+            table: core::ptr::addr_of!(MODULE_TABLE),
+        },
+        base,
+        &mut acquisitions,
+        &mut visited,
+        &mut visited_count,
+    ) {
         return status;
     }
 
@@ -3929,8 +3956,10 @@ pub unsafe fn ldr_add_ref_dll(base: u64, pin: bool) -> u32 {
     // non-pinned dependencies.
     let mut count_ptrs = [0u64; MODULE_TABLE_CAP];
     let mut next_counts = [0u16; MODULE_TABLE_CAP];
-    for (index, &module) in visited[..visited_count].iter().enumerate() {
-        match unsafe { crate::exports::ldr_plan_module_reference(module, pin) } {
+    for (index, reference) in acquisitions.as_slice().iter().enumerate() {
+        match unsafe {
+            crate::exports::ldr_plan_module_references(reference.base, pin, reference.releases)
+        } {
             Ok((count_ptr, next)) => {
                 count_ptrs[index] = count_ptr as u64;
                 next_counts[index] = next;
@@ -3938,7 +3967,7 @@ pub unsafe fn ldr_add_ref_dll(base: u64, pin: bool) -> u32 {
             Err(status) => return status,
         }
     }
-    for index in 0..visited_count {
+    for index in 0..acquisitions.as_slice().len() {
         unsafe {
             core::ptr::write_unaligned(count_ptrs[index] as *mut u16, next_counts[index]);
         }
@@ -4114,6 +4143,33 @@ unsafe fn detach_module_for_unload(table: *mut ModuleTable, base: u64) -> u32 {
 }
 
 #[cfg(target_arch = "x86_64")]
+struct NativeReferenceGraph {
+    table: *const ModuleTable,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl nt_ntdll::loader::reference_graph::ReferenceGraph for NativeReferenceGraph {
+    fn dependency_at(&mut self, base: u64, ordinal: usize) -> Result<Option<u64>, u32> {
+        let (imports_rva, _) = unsafe { data_directory(base, 1) };
+        if imports_rva == 0 {
+            return Ok(None);
+        }
+        if ordinal >= MODULE_TABLE_CAP {
+            return Err(0xc000_007b);
+        }
+        let descriptor = base + imports_rva as u64 + ordinal as u64 * 20;
+        let name_rva = unsafe { rd32(descriptor, 12) };
+        let first_thunk = unsafe { rd32(descriptor, 16) };
+        if name_rva == 0 || first_thunk == 0 {
+            return Ok(None);
+        }
+        let mut name = [0u8; 32];
+        let length = unsafe { import_desc_basename(base, name_rva, &mut name) };
+        Ok(Some(unsafe { (&*self.table).find(&name[..length]) }))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 unsafe fn collect_reference_releases(
     table: *const ModuleTable,
     base: u64,
@@ -4121,106 +4177,15 @@ unsafe fn collect_reference_releases(
     visited: &mut [u64; MODULE_TABLE_CAP],
     visited_count: &mut usize,
 ) -> u32 {
-    if visited[..*visited_count].contains(&base) {
-        return 0;
-    }
-    if *visited_count >= MODULE_TABLE_CAP {
-        return 0xC000_0017;
-    }
-    visited[*visited_count] = base;
-    *visited_count += 1;
-
-    let mut dependencies = [0u64; MODULE_TABLE_CAP];
-    let mut dependency_count = 0usize;
-    let (imports_rva, _) = unsafe { data_directory(base, 1) };
-    if imports_rva != 0 {
-        let mut descriptor = base + imports_rva as u64;
-        let mut descriptor_count = 0usize;
-        loop {
-            let name_rva = unsafe { rd32(descriptor, 12) };
-            let first_thunk = unsafe { rd32(descriptor, 16) };
-            if name_rva == 0 || first_thunk == 0 {
-                break;
-            }
-            let mut name = [0u8; 32];
-            let length = unsafe { import_desc_basename(base, name_rva, &mut name) };
-            let dependency = unsafe { (&*table).find(&name[..length]) };
-            if dependency >= 0x1_0000 && !dependencies[..dependency_count].contains(&dependency) {
-                if dependency_count == MODULE_TABLE_CAP {
-                    return 0xC000_0017;
-                }
-                dependencies[dependency_count] = dependency;
-                dependency_count += 1;
-            }
-            descriptor += 20;
-            descriptor_count += 1;
-            if descriptor_count >= MODULE_TABLE_CAP {
-                return 0xC000_007B;
-            }
-        }
-    }
-    let mut index = 0usize;
-    while index < dependency_count {
-        let dependency = dependencies[index];
-        if !ledger.record(dependency) {
-            return 0xC000_0017;
-        }
-        let status = unsafe {
-            collect_reference_releases(table, dependency, ledger, visited, visited_count)
-        };
-        if status != 0 {
-            return status;
-        }
-        index += 1;
-    }
-    0
-}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn collect_reference_modules_dfs(
-    table: *const ModuleTable,
-    base: u64,
-    visited: &mut [u64; MODULE_TABLE_CAP],
-    visited_count: &mut usize,
-) -> u32 {
-    if visited[..*visited_count].contains(&base) {
-        return 0;
-    }
-    if *visited_count >= MODULE_TABLE_CAP {
-        return 0xC000_0017; // STATUS_NO_MEMORY: bounded graph capacity exhausted.
-    }
-    visited[*visited_count] = base;
-    *visited_count += 1;
-
-    let (imports_rva, _) = unsafe { data_directory(base, 1) };
-    if imports_rva != 0 {
-        let mut descriptor = base + imports_rva as u64;
-        let mut descriptor_count = 0usize;
-        loop {
-            let name_rva = unsafe { rd32(descriptor, 12) };
-            let first_thunk = unsafe { rd32(descriptor, 16) };
-            if name_rva == 0 || first_thunk == 0 {
-                break;
-            }
-            let mut name = [0u8; 32];
-            let length = unsafe { import_desc_basename(base, name_rva, &mut name) };
-            let dependency = unsafe { (&*table).find(&name[..length]) };
-            if dependency >= 0x1_0000 {
-                let status = unsafe {
-                    collect_reference_modules_dfs(table, dependency, visited, visited_count)
-                };
-                if status != 0 {
-                    return status;
-                }
-            }
-            descriptor += 20;
-            descriptor_count += 1;
-            if descriptor_count >= MODULE_TABLE_CAP {
-                return 0xC000_007B; // STATUS_INVALID_IMAGE_FORMAT
-            }
-        }
-    }
-    0
+    nt_ntdll::loader::reference_graph::collect_reference_releases(
+        &mut NativeReferenceGraph { table },
+        base,
+        ledger,
+        visited,
+        visited_count,
+    )
+    .err()
+    .unwrap_or(0)
 }
 
 /// `LdrGetDllHandle` in-process driver — return the base of an already-loaded module (does NOT load).
@@ -4273,9 +4238,19 @@ pub unsafe fn ldr_get_procedure_address(
     // forwarder STRING, faulting on the first call).
     let addr = unsafe {
         let table = core::ptr::addr_of_mut!(MODULE_TABLE);
+        let mut expansion = nt_ntdll::loader::reference_graph::ReferenceExpansion::new();
         if name.is_null() {
             let mut load_status = 0;
-            let address = resolve_export_addr(base, true, &[], ordinal, table, &mut load_status, 0);
+            let address = resolve_export_addr(
+                base,
+                true,
+                &[],
+                ordinal,
+                table,
+                &mut load_status,
+                0,
+                &mut expansion,
+            );
             if load_status != 0 {
                 return load_status;
             }
@@ -4293,8 +4268,16 @@ pub unsafe fn ldr_get_procedure_address(
                     nb[i] = core::ptr::read_unaligned((buffer as *const u8).add(i));
                 }
                 let mut load_status = 0;
-                let address =
-                    resolve_export_addr(base, false, &nb[..l], 0, table, &mut load_status, 0);
+                let address = resolve_export_addr(
+                    base,
+                    false,
+                    &nb[..l],
+                    0,
+                    table,
+                    &mut load_status,
+                    0,
+                    &mut expansion,
+                );
                 if load_status != 0 {
                     return load_status;
                 }
@@ -4480,9 +4463,12 @@ unsafe fn native_syscall8(
 #[allow(clippy::too_many_arguments)]
 unsafe fn native_map_view(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 6]) -> u64 {
     unsafe {
-        native_invoke(SSN_NT_MAP_VIEW_OF_SECTION, &[
-            a1, a2, a3, a4, tail[0], tail[1], tail[2], tail[3], tail[4], tail[5],
-        ])
+        native_invoke(
+            SSN_NT_MAP_VIEW_OF_SECTION,
+            &[
+                a1, a2, a3, a4, tail[0], tail[1], tail[2], tail[3], tail[4], tail[5],
+            ],
+        )
     }
 }
 
@@ -4495,9 +4481,10 @@ unsafe fn native_map_view(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 6]) ->
 #[allow(clippy::too_many_arguments)]
 unsafe fn native_secure_connect_port(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 5]) -> u64 {
     unsafe {
-        native_invoke(SSN_NT_SECURE_CONNECT_PORT, &[
-            a1, a2, a3, a4, tail[0], tail[1], tail[2], tail[3], tail[4],
-        ])
+        native_invoke(
+            SSN_NT_SECURE_CONNECT_PORT,
+            &[a1, a2, a3, a4, tail[0], tail[1], tail[2], tail[3], tail[4]],
+        )
     }
 }
 
@@ -10388,10 +10375,7 @@ unsafe fn rtl_get_registry_handle(
             full.as_ptr(),
             full.len(),
         );
-        core::ptr::write(
-            oa.as_mut_ptr().add(0x18) as *mut u32,
-            OBJ_CASE_INSENSITIVE,
-        );
+        core::ptr::write(oa.as_mut_ptr().add(0x18) as *mut u32, OBJ_CASE_INSENSITIVE);
     }
     let status = if create {
         unsafe {
@@ -11897,6 +11881,17 @@ struct ObjectAttributes {
     security_qos: u64,
 }
 
+#[cfg(target_arch = "x86_64")]
+fn report_file_map_failure(
+    stage: nt_ntdll::loader::file_map_failure::FileMapFailureStage,
+    status: u32,
+) {
+    if let Some(record) = nt_ntdll::loader::file_map_failure::record_failure(stage, status) {
+        // SAFETY: the owned stack record remains mapped throughout synchronous debug capture.
+        unsafe { crate::dbg_print_bytes(record.bytes().as_ptr(), record.bytes().len()) };
+    }
+}
+
 /// `RtlpMapFile` (process.c:20): NtOpenFile(image) → NtCreateSection(SEC_IMAGE) → NtClose(file). On
 /// success `*section` holds the SEC_IMAGE handle.
 ///
@@ -11931,6 +11926,10 @@ unsafe fn rtlp_map_file(image_file_name: *const u8, attributes: u32, section: *m
         )
     } as u32;
     if (st as i32) < 0 {
+        report_file_map_failure(
+            nt_ntdll::loader::file_map_failure::FileMapFailureStage::Open,
+            st,
+        );
         return st;
     }
     // NtCreateSection(&Section, SECTION_ALL_ACCESS, OA=NULL, MaxSize=NULL, PAGE_EXECUTE, SEC_IMAGE,
@@ -11953,6 +11952,13 @@ unsafe fn rtlp_map_file(image_file_name: *const u8, attributes: u32, section: *m
     // SAFETY: on-target; 27 = NtClose.
     unsafe {
         syscall4(27, h_file, 0, 0, 0);
+    }
+    if (st as i32) < 0 {
+        report_file_map_failure(
+            nt_ntdll::loader::file_map_failure::FileMapFailureStage::CreateSection,
+            st,
+        );
+        return st;
     }
     st
 }

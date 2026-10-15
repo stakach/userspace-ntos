@@ -157,6 +157,7 @@ enum PnpParameterKind {
     Start(PnpStartParameters),
     QueryDeviceRelations { relation_type: u32 },
     QueryId { id_type: u32 },
+    QueryDeviceText { text_type: u32, locale_id: u32 },
     QueryInformation,
     QueryCapabilities,
     FilterResourceRequirements { input_len: u32 },
@@ -207,6 +208,16 @@ impl PnpParameters {
         }
     }
 
+    pub const fn query_device_text(text_type: u32, locale_id: u32) -> Self {
+        Self {
+            minor: nt_pnp_abi::IRP_MN_QUERY_DEVICE_TEXT,
+            kind: PnpParameterKind::QueryDeviceText {
+                text_type,
+                locale_id,
+            },
+        }
+    }
+
     /// Construct a PnP query whose result is returned through `IoStatus.Information` and whose
     /// stack-location parameter union is empty.
     pub fn query_information(minor: u8) -> Result<Self, NtStatus> {
@@ -252,6 +263,14 @@ impl PnpParameters {
         }
     }
 
+    pub(crate) fn has_status_only_result(self) -> bool {
+        match self.kind {
+            PnpParameterKind::Start(_) => self.minor == nt_pnp_abi::IRP_MN_START_DEVICE,
+            PnpParameterKind::Lifecycle => Self::is_lifecycle_minor(self.minor),
+            _ => false,
+        }
+    }
+
     pub const fn relation_type(self) -> Option<u32> {
         match self.kind {
             PnpParameterKind::QueryDeviceRelations { relation_type } => Some(relation_type),
@@ -263,6 +282,31 @@ impl PnpParameters {
         match self.kind {
             PnpParameterKind::QueryId { id_type } => Some(id_type),
             _ => None,
+        }
+    }
+
+    pub const fn device_text(self) -> Option<(u32, u32)> {
+        match self.kind {
+            PnpParameterKind::QueryDeviceText {
+                text_type,
+                locale_id,
+            } => Some((text_type, locale_id)),
+            _ => None,
+        }
+    }
+
+    /// Minor-specific words carried separately from the buffered payload.
+    pub const fn wire_parameter_words(self) -> (u32, u32) {
+        match self.kind {
+            PnpParameterKind::Start(start) => (
+                start.raw_resource_list_len,
+                start.translated_resource_list_len,
+            ),
+            PnpParameterKind::QueryDeviceText {
+                text_type,
+                locale_id,
+            } => (text_type, locale_id),
+            _ => (0, 0),
         }
     }
 
@@ -553,6 +597,9 @@ pub struct IrpRecord {
     pub(crate) external_pnp_terminal_receipt_claimed: bool,
     /// A detached dispatch owns retirement; ordinary free/ACK cannot consume it across IPC.
     pub(crate) detached_file_owner: bool,
+    /// Lower File lifecycle IRP owned by an entered outer IRP; never mutates the File state.
+    pub(crate) subsidiary_file_lifecycle: Option<IrpId>,
+    pub(crate) completion_ack_reservation: Option<crate::completion_ack::CompletionAckReservation>,
     pub(crate) detached_file_intent: crate::detached_file_irp::ExternalFileIrpIntent,
     pub stack: Vec<IoStackLocation>,
     pub current_location: u8,
@@ -592,6 +639,8 @@ impl IrpRecord {
             completion_origin: None,
             external_pnp_terminal_receipt_claimed: false,
             detached_file_owner: false,
+            subsidiary_file_lifecycle: None,
+            completion_ack_reservation: None,
             detached_file_intent: crate::detached_file_irp::ExternalFileIrpIntent::default(),
             stack: Vec::new(),
             current_location: 0,
@@ -637,6 +686,10 @@ impl IrpRecord {
         self.stack.get(self.current_location as usize)
     }
 
+    pub(crate) fn has_external_retirement_owner(&self) -> bool {
+        self.detached_file_owner || self.completion_ack_reservation.is_some()
+    }
+
     /// Publish the next lower stack location and advance ownership. The caller must own the current
     /// frame, while the supplied frame must preserve the precomputed lower driver/device/File
     /// identity. Stale, skipped, or cross-stack forwarding is rejected without changing the cursor.
@@ -645,7 +698,9 @@ impl IrpRecord {
         caller: DriverId,
         next_stack: IoStackLocation,
     ) -> Result<&IoStackLocation, NtStatus> {
-        if self.detached_file_owner { return Err(NtStatus::INVALID_DEVICE_REQUEST); }
+        if self.has_external_retirement_owner() {
+            return Err(NtStatus::INVALID_DEVICE_REQUEST);
+        }
         let current = self.current_stack().ok_or(NtStatus::INVALID_PARAMETER)?;
         if current.driver_id != caller {
             return Err(NtStatus::INVALID_PARAMETER);

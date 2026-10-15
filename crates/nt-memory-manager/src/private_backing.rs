@@ -9,7 +9,6 @@ pub fn private_backing_pages<'a>(
 ) -> impl Iterator<Item = u64> + 'a {
     let frames = resident
         .records()
-        .iter()
         .filter(move |record| record.pi == owner && record.owns_frame)
         .map(|record| record.page);
     let pages = transition.pages_for_owner(owner).filter(move |page| {

@@ -221,6 +221,67 @@ fn uncertain_reply_is_retained_and_never_replayed() {
 }
 
 #[test]
+fn exact_source_continuation_acknowledges_only_an_attempted_uncertain_parked_reply() {
+    let (mut lanes, mut peers, route, dispatch, other, mut receiver, _pending) = fixture();
+    assert!(receiver
+        .acknowledge_parked_stored_from_source_continuation(
+            route, dispatch, 40, 77, &lanes, &peers,
+        )
+        .is_err());
+    assert_eq!(
+        receiver.reply_parked_stored(route, dispatch, 77, &lanes, &peers, bound, |_| {
+            IngressReplyObservation::Indeterminate
+        }),
+        Ok(IngressReplyObservation::Indeterminate)
+    );
+    for (reply, token, epoch) in [(41, 77, dispatch.epoch()), (40, 78, dispatch.epoch()),
+        (40, 77, dispatch.epoch() + 1)] {
+        assert!(receiver
+            .acknowledge_parked_stored_from_source_continuation(
+                route,
+                LaneDispatchIdentity { lane: dispatch.lane(), epoch },
+                reply, token, &lanes, &peers,
+            )
+            .is_err());
+    }
+    let foreign_peers = PeerRegistry::new(20, 2);
+    assert!(receiver
+        .acknowledge_parked_stored_from_source_continuation(
+            route, dispatch, 40, 77, &lanes, &foreign_peers,
+        )
+        .is_err());
+    assert_eq!(receiver.stored_reply_acknowledged(route, dispatch, 40), Ok(false));
+    receiver
+        .acknowledge_parked_stored_from_source_continuation(
+            route, dispatch, 40, 77, &lanes, &peers,
+        )
+        .unwrap();
+    assert_eq!(receiver.stored_reply_acknowledged(route, dispatch, 40), Ok(true));
+    assert_eq!(lanes.running(), Some(other));
+    assert_eq!(lanes.external_top(dispatch.lane()), Ok(Some(77)));
+    assert_eq!(peers.state(route).unwrap().1, 1);
+    assert!(receiver
+        .reply_parked_stored(route, dispatch, 77, &lanes, &peers, bound, no_invoke)
+        .is_err());
+    assert!(receiver
+        .acknowledge_parked_stored_from_source_continuation(
+            route, dispatch, 40, 77, &lanes, &peers,
+        )
+        .is_err());
+    lanes.finish_dispatch(other, 70).unwrap();
+    lanes.resume_external(dispatch.lane(), 40, 77).unwrap();
+    lanes.retire_external_running(dispatch.lane(), 40, 77).unwrap();
+    assert_eq!(
+        receiver.complete_stored(route, dispatch, &mut lanes, &mut peers, |_, reply| {
+            assert_eq!(reply, 40);
+            Ok::<_, u8>(ReplyBindingObservation::Free)
+        }),
+        Ok(123)
+    );
+    assert_eq!(peers.state(route).unwrap().1, 0);
+}
+
+#[test]
 fn query_failure_and_nonbound_do_not_acknowledge_or_invoke() {
     let (lanes, peers, route, dispatch, other, mut receiver, _pending) = fixture();
     assert!(receiver

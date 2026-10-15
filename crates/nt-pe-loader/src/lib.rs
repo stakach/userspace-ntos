@@ -14,15 +14,20 @@ extern crate alloc;
 mod exports;
 mod headers;
 mod image;
+mod image_header_capture;
 mod image_page_fill;
 pub mod immutable_support_image;
-pub mod system_module;
-pub mod system_image_request;
-pub mod load_failure;
-pub mod module_namespace;
 mod imports;
+mod layout;
+pub mod load_failure;
+mod mapped_relocations;
+pub mod module_namespace;
+mod relocation_snapshot;
 mod relocs;
 mod rva;
+mod snapshot_capacity;
+pub mod system_image_request;
+pub mod system_module;
 
 pub use exports::ExportedSymbol;
 pub use headers::{
@@ -30,9 +35,16 @@ pub use headers::{
     DIRECTORY_ENTRY_RESOURCE, DIRECTORY_ENTRY_TLS,
 };
 pub use image::MappedImage;
-pub use image_page_fill::{ImagePageFileSpan, ImagePageFillPlan, IMAGE_PAGE_SIZE};
+pub use image_header_capture::{capture_image_layout, ImageHeaderCaptureError};
+pub use image_page_fill::{
+    ImagePageFileSpan, ImagePageFillPlan, ImagePageReadError, IMAGE_PAGE_SIZE,
+};
 pub use imports::{ImportRef, ImportedDll};
+pub use layout::PeLayout;
+pub use mapped_relocations::{plan_mapped_relocations, MappedRelocationPlan};
+pub use relocation_snapshot::relocate_file_snapshot;
 pub use relocs::{RelocKind, Relocation};
+pub use snapshot_capacity::reserve_file_snapshot_capacity;
 
 /// A valid `__security_cookie` (`/GS`) seed. MSVC's x64 `__security_check_cookie`
 /// validates that the cookie's **top 16 bits are zero** (`rol rcx,0x10; test cx,0xffff`)
@@ -162,11 +174,14 @@ pub enum PeError {
     ImportTableInvalid,
     /// The base-relocation table is malformed.
     RelocationInvalid,
-    /// A base-relocation type this loader does not implement (only `DIR64` +
-    /// `ABSOLUTE` are supported).
+    /// A rebased mapped image explicitly stripped its relocation information.
+    RelocationsStripped,
+    /// A base-relocation type outside NT's ABSOLUTE/HIGH/LOW/HIGHLOW/DIR64 set.
     UnsupportedRelocation(u16),
     /// A relocation / IAT patch target is out of the mapped image.
     PatchOutOfBounds,
+    /// A checked relocation plan could not reserve its owned storage.
+    InsufficientResources,
 }
 
 /// Which PE directory prevented a loader-writable page classification.
@@ -235,14 +250,14 @@ pub fn image_directory_entry(
     directory: usize,
 ) -> Result<Option<(usize, u32)>, PeError> {
     let pe = PeFile::parse(image)?;
-    if directory >= pe.headers.number_of_rva_and_sizes as usize {
+    if directory >= pe.headers().number_of_rva_and_sizes as usize {
         return Ok(None);
     }
-    let entry = pe.headers.data_directory(directory);
+    let entry = pe.headers().data_directory(directory);
     if entry.virtual_address == 0 {
         return Ok(None);
     }
-    let offset = if mapped_as_image || entry.virtual_address < pe.headers.size_of_headers {
+    let offset = if mapped_as_image || entry.virtual_address < pe.headers().size_of_headers {
         entry.virtual_address as usize
     } else {
         rva::rva_to_file_offset(pe.sections(), entry.virtual_address)?
@@ -254,18 +269,16 @@ pub fn image_directory_entry(
 /// A parsed (but not yet mapped) PE image, borrowing the raw file bytes.
 pub struct PeFile<'a> {
     bytes: &'a [u8],
-    headers: Headers,
-    sections: [Section; headers::MAX_SECTIONS],
-    section_count: usize,
+    layout: PeLayout,
 }
 
 impl core::fmt::Debug for PeFile<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PeFile")
-            .field("entry_point_rva", &self.headers.entry_point_rva)
-            .field("image_base", &self.headers.image_base)
-            .field("size_of_image", &self.headers.size_of_image)
-            .field("sections", &self.section_count)
+            .field("entry_point_rva", &self.layout.headers.entry_point_rva)
+            .field("image_base", &self.layout.headers.image_base)
+            .field("size_of_image", &self.layout.headers.size_of_image)
+            .field("sections", &self.layout.section_count)
             .finish()
     }
 }
@@ -273,19 +286,18 @@ impl core::fmt::Debug for PeFile<'_> {
 impl<'a> PeFile<'a> {
     /// Parse + validate the headers and section table of `bytes`.
     pub fn parse(bytes: &'a [u8]) -> Result<PeFile<'a>, PeError> {
-        let headers = Headers::parse(bytes)?;
-        let section_count = headers.number_of_sections as usize;
-        let mut sections = [Section::default(); headers::MAX_SECTIONS];
-        let table = headers.section_table_offset();
-        for (i, section) in sections.iter_mut().enumerate().take(section_count) {
-            *section = Section::parse(bytes, table + i * 40)?;
-        }
         Ok(PeFile {
             bytes,
-            headers,
-            sections,
-            section_count,
+            layout: PeLayout::parse(bytes)?,
         })
+    }
+
+    pub fn layout(&self) -> &PeLayout {
+        &self.layout
+    }
+
+    pub fn into_layout(self) -> PeLayout {
+        self.layout
     }
 
     /// The raw file bytes.
@@ -293,69 +305,69 @@ impl<'a> PeFile<'a> {
         self.bytes
     }
     pub fn headers(&self) -> &Headers {
-        &self.headers
+        &self.layout.headers
     }
     pub fn sections(&self) -> &[Section] {
-        &self.sections[..self.section_count]
+        &self.layout.sections[..self.layout.section_count]
     }
     /// The preferred load address from the optional header.
     pub fn image_base(&self) -> u64 {
-        self.headers.image_base
+        self.layout.headers.image_base
     }
     /// The virtual size of the mapped image.
     pub fn size_of_image(&self) -> u32 {
-        self.headers.size_of_image
+        self.layout.headers.size_of_image
     }
     /// Raw PE32+ `SizeOfStackReserve`, read from the checked optional header.
     /// No defaults, alignment, allocation limits or reserve/commit policy are applied.
     pub fn size_of_stack_reserve(&self) -> u64 {
-        self.headers.size_of_stack_reserve
+        self.layout.headers.size_of_stack_reserve
     }
     /// Raw PE32+ `SizeOfStackCommit`, read from the checked optional header.
     /// This can be zero or exceed reserve; the stack allocator must validate its sizing policy.
     pub fn size_of_stack_commit(&self) -> u64 {
-        self.headers.size_of_stack_commit
+        self.layout.headers.size_of_stack_commit
     }
     /// The entry-point RVA (`DriverEntry`).
     pub fn entry_point_rva(&self) -> u32 {
-        self.headers.entry_point_rva
+        self.layout.headers.entry_point_rva
     }
     /// The image subsystem (IMAGE_SUBSYSTEM_*: 1=NATIVE, 2=WINDOWS_GUI, 3=WINDOWS_CUI, …).
     pub fn subsystem(&self) -> u16 {
-        self.headers.subsystem
+        self.layout.headers.subsystem
     }
     /// The COFF debug-info pair `(PointerToSymbolTable, NumberOfSymbols)` — exactly what
     /// `DbgkMapViewOfSection` reads out of `RtlImageNtHeader(BaseOfDll)->FileHeader` and reports to
     /// a debugger as `DBGKM_LOAD_DLL.{DebugInfoFileOffset, DebugInfoSize}`.
     pub fn debug_info(&self) -> (u32, u32) {
         (
-            self.headers.pointer_to_symbol_table,
-            self.headers.number_of_symbols,
+            self.layout.headers.pointer_to_symbol_table,
+            self.layout.headers.number_of_symbols,
         )
     }
 
     /// The required subsystem version `(major, minor)`.
     pub fn subsystem_version(&self) -> (u16, u16) {
         (
-            self.headers.major_subsystem_version,
-            self.headers.minor_subsystem_version,
+            self.layout.headers.major_subsystem_version,
+            self.layout.headers.minor_subsystem_version,
         )
     }
 
     /// Parse the import table (spec §7.2). Returns one [`ImportedDll`] per imported
     /// module with its named/ordinal functions + IAT slot RVAs.
     pub fn imports(&self) -> Result<alloc::vec::Vec<ImportedDll>, PeError> {
-        imports::parse_imports(self.bytes, &self.headers, self.sections())
+        imports::parse_imports(self.bytes, &self.layout.headers, self.sections())
     }
 
     /// Parse the export directory (spec §13.6). Returns the module's named exports with RVAs.
     pub fn exports(&self) -> Result<alloc::vec::Vec<ExportedSymbol>, PeError> {
-        exports::parse_exports(self.bytes, &self.headers, self.sections())
+        exports::parse_exports(self.bytes, &self.layout.headers, self.sections())
     }
 
     /// Look up one named export without allocating the complete export list.
     pub fn export_rva_by_name(&self, name: &str) -> Result<Option<u32>, PeError> {
-        exports::export_rva_by_name(self.bytes, &self.headers, self.sections(), name)
+        exports::export_rva_by_name(self.bytes, &self.layout.headers, self.sections(), name)
     }
 
     /// Read a NUL-terminated ASCII string at `rva` (via the section table). Used by the loader to
@@ -369,10 +381,10 @@ impl<'a> PeFile<'a> {
     /// points into the raw file and is followed by the validated NUL byte, which lets loader APIs
     /// pass the original ANSI import name to a callback without changing non-UTF-8 bytes.
     pub fn cstr_bytes_at_rva(&self, rva: u32) -> Result<&'a [u8], PeError> {
-        if rva < self.headers.size_of_headers {
+        if rva < self.layout.headers.size_of_headers {
             const MAX_NAME_LEN: usize = 512;
             let start = rva as usize;
-            let header_end = (self.headers.size_of_headers as usize).min(self.bytes.len());
+            let header_end = (self.layout.headers.size_of_headers as usize).min(self.bytes.len());
             let bytes = self
                 .bytes
                 .get(start..header_end)
@@ -390,7 +402,10 @@ impl<'a> PeFile<'a> {
     /// True if the image has a TLS directory (data dir 9) — its TLS callbacks must run around
     /// `DLL_PROCESS_ATTACH`. The loader records this; invoking the callbacks is a live seam.
     pub fn has_tls_directory(&self) -> bool {
-        let dir = self.headers.data_directory(headers::DIRECTORY_ENTRY_TLS);
+        let dir = self
+            .layout
+            .headers
+            .data_directory(headers::DIRECTORY_ENTRY_TLS);
         dir.virtual_address != 0 && dir.size != 0
     }
 
@@ -399,7 +414,9 @@ impl<'a> PeFile<'a> {
     pub fn bytes_at_rva(&self, rva: u32, len: usize) -> Option<&'a [u8]> {
         let length = u32::try_from(len).ok()?;
         let end_rva = rva.checked_add(length)?;
-        if rva < self.headers.size_of_headers && end_rva <= self.headers.size_of_headers {
+        if rva < self.layout.headers.size_of_headers
+            && end_rva <= self.layout.headers.size_of_headers
+        {
             return self.bytes.get(rva as usize..end_rva as usize);
         }
         let section = self.sections().iter().find(|section| {
@@ -417,7 +434,7 @@ impl<'a> PeFile<'a> {
 
     /// Parse the base-relocation table (spec §7.2).
     pub fn relocations(&self) -> Result<alloc::vec::Vec<Relocation>, PeError> {
-        relocs::parse_relocations(self.bytes, &self.headers, self.sections())
+        relocs::parse_relocations(self.bytes, &self.layout.headers, self.sections())
     }
 
     /// The RVA of the image's `__security_cookie` (`/GS`), read from the load-config
@@ -426,7 +443,7 @@ impl<'a> PeFile<'a> {
     /// is left 0, so a loader must seed it before calling `DriverEntry`.
     fn security_cookie_rva_checked_at_base(&self, image_base: u64) -> Result<Option<u32>, PeError> {
         let dir = self
-            .headers
+            .headers()
             .data_directory(headers::DIRECTORY_ENTRY_LOAD_CONFIG);
         if dir.virtual_address == 0 || dir.size < 96 {
             return Ok(None);
@@ -439,11 +456,11 @@ impl<'a> PeFile<'a> {
         if cookie_va == 0 {
             return Ok(None);
         }
-        image_va_to_rva(cookie_va, image_base, self.headers.size_of_image)
+        image_va_to_rva(cookie_va, image_base, self.layout.headers.size_of_image)
     }
 
     fn security_cookie_rva_checked(&self) -> Result<Option<u32>, PeError> {
-        self.security_cookie_rva_checked_at_base(self.headers.image_base)
+        self.security_cookie_rva_checked_at_base(self.layout.headers.image_base)
     }
 
     pub fn security_cookie_rva(&self) -> Option<u32> {
@@ -453,7 +470,7 @@ impl<'a> PeFile<'a> {
     /// The RVA of the TLS index word (`IMAGE_TLS_DIRECTORY64.AddressOfIndex`) the user-mode loader
     /// writes while attaching this image. `Ok(None)` means there is no TLS directory or no index word.
     pub fn tls_index_rva(&self) -> Result<Option<u32>, PeError> {
-        self.tls_index_rva_at_base(self.headers.image_base)
+        self.tls_index_rva_at_base(self.layout.headers.image_base)
     }
 
     /// The RVA of the TLS index word for image bytes whose absolute VA fields have already been
@@ -465,7 +482,10 @@ impl<'a> PeFile<'a> {
     /// preferred ImageBase. Those callers must pass the runtime image base here so TLS index pages
     /// remain private instead of being misclassified as malformed or clean.
     pub fn tls_index_rva_at_base(&self, image_base: u64) -> Result<Option<u32>, PeError> {
-        let dir = self.headers.data_directory(headers::DIRECTORY_ENTRY_TLS);
+        let dir = self
+            .layout
+            .headers
+            .data_directory(headers::DIRECTORY_ENTRY_TLS);
         if dir.virtual_address == 0 || dir.size == 0 {
             return Ok(None);
         }
@@ -483,7 +503,7 @@ impl<'a> PeFile<'a> {
         if index_va == 0 {
             return Ok(None);
         }
-        image_va_to_rva(index_va, image_base, self.headers.size_of_image)
+        image_va_to_rva(index_va, image_base, self.layout.headers.size_of_image)
     }
 
     /// Classify whether the 4 KiB page containing `rva` carries bytes the loader is expected to
@@ -493,7 +513,7 @@ impl<'a> PeFile<'a> {
         &self,
         rva: u32,
     ) -> Result<LoaderWritablePageState, LoaderWritablePageError> {
-        self.loader_writable_page_state_at_base(rva, self.headers.image_base)
+        self.loader_writable_page_state_at_base(rva, self.layout.headers.image_base)
     }
 
     /// Classify loader-written state for image bytes relocated in place to `image_base`.
@@ -503,12 +523,12 @@ impl<'a> PeFile<'a> {
         image_base: u64,
     ) -> Result<LoaderWritablePageState, LoaderWritablePageError> {
         let page = rva & !0x0fffu32;
-        if imports::page_has_iat_slot(self.bytes, &self.headers, self.sections(), page)
+        if imports::page_has_iat_slot(self.bytes, &self.layout.headers, self.sections(), page)
             .map_err(LoaderWritablePageError::Import)?
         {
             return Ok(LoaderWritablePageState::Iat);
         }
-        if relocs::page_has_relocation(self.bytes, &self.headers, self.sections(), page)
+        if relocs::page_has_relocation(self.bytes, &self.layout.headers, self.sections(), page)
             .map_err(LoaderWritablePageError::Relocation)?
         {
             return Ok(LoaderWritablePageState::Relocation);
@@ -535,7 +555,7 @@ impl<'a> PeFile<'a> {
     /// SEC_IMAGE can safely share plain write-copy pages only when this returns `Ok(false)`. On any
     /// parse error, callers should keep the page private.
     pub fn page_has_loader_writable_state(&self, rva: u32) -> Result<bool, PeError> {
-        self.page_has_loader_writable_state_at_base(rva, self.headers.image_base)
+        self.page_has_loader_writable_state_at_base(rva, self.layout.headers.image_base)
     }
 
     /// True when the page contains loader-written state in image bytes relocated to `image_base`.
@@ -594,31 +614,7 @@ impl<'a> PeFile<'a> {
     /// pages, then receive private pages when loader fixups or runtime writes
     /// touch them.
     pub fn image_protection_at(&self, rva: u32) -> ImageProtection {
-        if rva < page_align_up(self.headers.size_of_headers) {
-            return ImageProtection::ReadOnly;
-        }
-        for s in self.sections() {
-            let start = s.virtual_address;
-            let size = page_align_up(s.virtual_size.max(s.size_of_raw_data));
-            if rva >= start && rva - start < size {
-                if !s.is_shared() {
-                    return if s.is_executable() {
-                        ImageProtection::ExecuteWriteCopy
-                    } else {
-                        ImageProtection::WriteCopy
-                    };
-                }
-                return match (s.is_executable(), s.is_readable(), s.is_writable()) {
-                    (true, _, true) => ImageProtection::ExecuteReadWrite,
-                    (true, true, false) => ImageProtection::ExecuteRead,
-                    (true, false, false) => ImageProtection::Execute,
-                    (false, _, true) => ImageProtection::ReadWrite,
-                    (false, true, false) => ImageProtection::ReadOnly,
-                    (false, false, false) => ImageProtection::ReadOnly,
-                };
-            }
-        }
-        ImageProtection::ReadOnly
+        self.layout.image_protection_at(rva)
     }
 
     /// Plan one SEC_IMAGE page from raw file offsets without reading its payload.
@@ -629,7 +625,7 @@ impl<'a> PeFile<'a> {
         page_rva: u32,
         file_size: u64,
     ) -> Result<ImagePageFillPlan, PeError> {
-        image_page_fill::plan(self, page_rva, file_size)
+        self.layout.image_page_fill_plan(page_rva, file_size)
     }
 
     /// Map the image into a fresh buffer at `load_base`, copying headers +
@@ -638,10 +634,6 @@ impl<'a> PeFile<'a> {
     pub fn map(&self, load_base: u64) -> Result<MappedImage, PeError> {
         MappedImage::build(self, load_base)
     }
-}
-
-fn page_align_up(n: u32) -> u32 {
-    n.saturating_add(0x0fff) & !0x0fffu32
 }
 
 fn rva_range_intersects_page(rva: u32, len: u32, page_start: u32) -> bool {

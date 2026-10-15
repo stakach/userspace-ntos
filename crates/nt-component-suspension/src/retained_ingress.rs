@@ -71,6 +71,19 @@ impl<M> RetainedIngress<M> {
         }
         Ok(observation)
     }
+
+    /// The caller has independently authenticated a continuation of the exact source Call.
+    /// Only an already attempted, indeterminate Reply can be acknowledged this way. The
+    /// retained message and peer reservation remain owned until the normal dispatch finish.
+    pub(crate) fn acknowledge_attempted_reply_from_source_continuation(
+        &mut self,
+    ) -> Result<(), IngressError> {
+        let attempt = self.reply_attempt.as_mut().ok_or(IngressError::NotReady)?;
+        let message = self.ingress.observe_reply(attempt, IngressReplyObservation::Acknowledged)?;
+        self.completed = Some(message.ok_or(IngressError::WrongAttempt)?);
+        self.reply_attempt = None;
+        Ok(())
+    }
     pub(crate) fn is_held(&self) -> bool {
         self.admitted.is_none() && self.completed.is_none() && self.ingress.is_held()
     }

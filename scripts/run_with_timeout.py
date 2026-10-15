@@ -72,7 +72,7 @@ def main() -> int:
     parser.add_argument("--completion-text")
     parser.add_argument("--completion-grace-seconds", type=float, default=5.0)
     parser.add_argument("--failure-file")
-    parser.add_argument("--failure-text")
+    parser.add_argument("--failure-text", action="append", default=[])
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -90,6 +90,8 @@ def main() -> int:
         parser.error("--completion-grace-seconds cannot be negative")
     if bool(args.failure_file) != bool(args.failure_text):
         parser.error("--failure-file and --failure-text must be specified together")
+    if any(not marker for marker in args.failure_text):
+        parser.error("failure markers must be nonempty")
 
     ready_path = Path(args.ready_file) if args.ready_file else None
     ready_marker = args.ready_text.encode() if args.ready_text else None
@@ -106,22 +108,25 @@ def main() -> int:
         completion_offset = 0
     completion_tail = b""
     failure_path = Path(args.failure_file) if args.failure_file else None
-    failure_marker = args.failure_text.encode() if args.failure_text else None
+    failure_markers = [marker.encode() for marker in args.failure_text]
     try:
         failure_offset = failure_path.stat().st_size if failure_path else 0
     except FileNotFoundError:
         failure_offset = 0
-    failure_tail = b""
+    failure_offsets = [failure_offset for _ in failure_markers]
+    failure_tails = [b"" for _ in failure_markers]
     status_messages: list[str] = []
 
     def failure_observed() -> bool:
-        nonlocal failure_offset, failure_tail
-        if failure_path is None or failure_marker is None:
+        if failure_path is None:
             return False
-        failed, failure_offset, failure_tail = ready_marker_observed(
-            failure_path, failure_marker, failure_offset, failure_tail
-        )
-        return failed
+        for index, marker in enumerate(failure_markers):
+            failed, failure_offsets[index], failure_tails[index] = ready_marker_observed(
+                failure_path, marker, failure_offsets[index], failure_tails[index]
+            )
+            if failed:
+                return True
+        return False
 
     def flush_status_messages() -> None:
         for message in status_messages:

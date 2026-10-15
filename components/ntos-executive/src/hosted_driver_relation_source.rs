@@ -87,6 +87,8 @@ impl DriverRelationSource {
 
     /// Only after canonical ACK and after transferring the caller's independent PDO reference.
     pub(super) unsafe fn retire(mut self) -> bool {
+        let Ok(_projection) = hosted_device_allocations::generic_free_admission(self.inst, self.pointer)
+        else { return false };
         let Some(_guard) = hosted_instance_pool_lock(self.inst.exec_pool_va) else { return false };
         let Some((mapped, capacity)) =
             hosted_pool_allocation_exec_range(self.inst.exec_pool_va, self.pointer)

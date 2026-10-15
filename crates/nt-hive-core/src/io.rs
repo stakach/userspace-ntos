@@ -9,6 +9,10 @@ use crate::codec::{
 };
 use crate::hive::{Hive, HiveKind};
 
+#[path = "io_set_value.rs"]
+mod set_value;
+pub use set_value::{HiveSetValueError, HiveSetValueReceipt};
+
 /// Why a hive I/O operation failed (spec §10).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HiveIoError {
@@ -255,6 +259,9 @@ impl<P: HiveIoProvider> HiveManager<P> {
     /// Journal + apply one mutation (spec §13.2): append the log record (flushed in Strict mode),
     /// then apply it to `hive`. On an I/O fault the mutation is not applied.
     pub fn mutate(&mut self, hive: &mut Hive, op: HiveLogOp) -> Result<(), HiveIoError> {
+        if hive.retained_value_journal().is_some() {
+            return Err(HiveIoError::Io);
+        }
         let seq = self.next_log_sequence;
         let rec = encode_log_record(&op, seq);
         self.provider.append_log_record(&rec)?;
@@ -281,6 +288,9 @@ impl<P: HiveIoProvider> HiveManager<P> {
     where
         F: FnOnce(&mut Hive) -> bool,
     {
+        if hive.retained_value_journal().is_some() {
+            return Err(HiveIoError::Io);
+        }
         let seq = self.next_log_sequence;
         let rec = encode_log_record(&op, seq);
         self.provider.append_log_record(&rec)?;
@@ -297,6 +307,9 @@ impl<P: HiveIoProvider> HiveManager<P> {
     /// Checkpoint / lazy flush (spec §13.4): write a fresh image + truncate the log + clear the
     /// dirty set. Leaves the previous image intact on a write fault (spec §18.1).
     pub fn flush(&mut self, hive: &mut Hive) -> Result<(), HiveIoError> {
+        if hive.retained_value_journal().is_some() {
+            return Err(HiveIoError::Io);
+        }
         let previous_generation = hive.generation;
         hive.generation = hive.generation.saturating_add(1);
         let bytes = encode_image(hive);
@@ -316,6 +329,9 @@ impl<P: HiveIoProvider> HiveManager<P> {
     /// of panicking. I/O failures preserve the previous image and the current log, matching
     /// [`Self::flush`].
     pub fn try_flush(&mut self, hive: &mut Hive) -> Result<(), HiveFlushError> {
+        if hive.retained_value_journal().is_some() {
+            return Err(HiveFlushError::Io(HiveIoError::Io));
+        }
         let previous_generation = hive.generation;
         hive.generation = hive.generation.saturating_add(1);
         let bytes = match try_encode_image(hive) {
@@ -347,3 +363,7 @@ impl<P: HiveIoProvider> HiveManager<P> {
         self.provider
     }
 }
+
+#[cfg(test)]
+#[path = "io_set_value_tests.rs"]
+mod set_value_tests;

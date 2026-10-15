@@ -18,9 +18,11 @@ extern crate alloc;
 
 pub mod copy;
 pub mod native_output;
+pub mod private_fault;
 pub mod commitment;
 pub mod protection;
 pub mod query;
+pub mod image_view_placement;
 pub mod scratch;
 
 use alloc::collections::BTreeMap;
@@ -1227,6 +1229,32 @@ pub fn mapped_view_fault_access_status(protection: u32, access: FaultAccess) -> 
 
 pub fn image_view_fault_access_status(protection: u32, access: FaultAccess) -> Result<(), u32> {
     if !image_protection_allows_fault_access(protection, access) {
+        return Err(STATUS_ACCESS_VIOLATION);
+    }
+    Ok(())
+}
+
+/// A present fault can promote a legacy PE image only when a current resident mapping
+/// supplies the bytes to copy. Missing-page faults retain the usual demand-fill path.
+pub fn legacy_image_receive_fault_status(
+    mapping: VmBasicInformation,
+    allocation_base: u64,
+    access: FaultAccess,
+    observation: ImageFaultObservation,
+    resident_mapping: bool,
+) -> Result<(), u32> {
+    if mapping.allocation_base != allocation_base
+        || mapping.state != MEM_COMMIT
+        || mapping.type_ != MEM_IMAGE
+    {
+        return Err(STATUS_ACCESS_VIOLATION);
+    }
+    image_view_fault_access_status(mapping.protect, access)?;
+    if observation == ImageFaultObservation::Protection
+        && (access != FaultAccess::Write
+            || !image_view_fault_plan(mapping.protect, true).copy_on_write
+            || !resident_mapping)
+    {
         return Err(STATUS_ACCESS_VIOLATION);
     }
     Ok(())
@@ -2561,6 +2589,53 @@ pub enum FaultAccess {
     Write,
     Execute,
     Lock,
+}
+
+/// Decode the two user, not-present image faults that may request a page fill.
+pub const fn x86_user_image_read_or_execute_not_present(error: u64) -> Option<FaultAccess> {
+    match error {
+        0x4 => Some(FaultAccess::Read),
+        0x14 => Some(FaultAccess::Execute),
+        _ => None,
+    }
+}
+
+/// Why image residency was requested, independently of the requested access.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ImageFaultObservation {
+    /// A checked software copy or residency request, not a hardware fault.
+    CopyAccess,
+    NotPresent,
+    Protection,
+}
+
+impl ImageFaultObservation {
+    /// Preserve x86 fault provenance; reserved-bit faults must never demand-fill.
+    pub const fn from_x86_error(error: u64) -> Self {
+        if error & ((1 << 0) | (1 << 3)) != 0 {
+            Self::Protection
+        } else {
+            Self::NotPresent
+        }
+    }
+}
+
+/// Decode only image faults the Receive child pager can service without changing the fault's
+/// meaning. Present user writes require a committed writecopy image mapping at the caller.
+pub const fn x86_user_image_receive_fault(
+    error: u64,
+    protection: u32,
+) -> Option<(FaultAccess, ImageFaultObservation)> {
+    if let Some(access) = x86_user_image_read_or_execute_not_present(error) {
+        return Some((access, ImageFaultObservation::NotPresent));
+    }
+    if error == 0x7
+        && protection & PAGE_GUARD == 0
+        && matches!(protection & 0xff, PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)
+    {
+        return Some((FaultAccess::Write, ImageFaultObservation::Protection));
+    }
+    None
 }
 
 /// Which access rights an MDL lock requires (spec §15.2).

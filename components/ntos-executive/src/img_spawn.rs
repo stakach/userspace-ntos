@@ -337,7 +337,11 @@ pub(crate) unsafe fn image_page_protection(
 }
 
 pub(crate) fn image_rva_protection(pe: &nt_pe_loader::PeFile, rva: u32) -> u32 {
-    match pe.image_protection_at(rva) {
+    image_protection_to_nt(pe.image_protection_at(rva))
+}
+
+pub(crate) fn image_protection_to_nt(protection: nt_pe_loader::ImageProtection) -> u32 {
+    match protection {
         nt_pe_loader::ImageProtection::ReadOnly => nt_address_space::PAGE_READONLY,
         nt_pe_loader::ImageProtection::ReadWrite => nt_address_space::PAGE_READWRITE,
         nt_pe_loader::ImageProtection::WriteCopy => nt_address_space::PAGE_WRITECOPY,
@@ -370,6 +374,18 @@ pub(crate) unsafe fn register_image_committed_mappings(
     image_base: u64,
 ) -> bool {
     let image_size = image_extent(pe);
+    register_image_range_committed_mappings(pi, pe, image_base, image_size)
+}
+
+unsafe fn register_image_layout_committed_mappings(
+    pi: u64, pe: &nt_pe_loader::PeFile, layout: nt_exe_image::ProcessImageLayout,
+) -> bool {
+    register_image_range_committed_mappings(pi, pe, layout.base(), layout.size())
+}
+
+unsafe fn register_image_range_committed_mappings(
+    pi: u64, pe: &nt_pe_loader::PeFile, image_base: u64, image_size: u64,
+) -> bool {
     let Some(image_end) = image_base.checked_add(image_size) else {
         return false;
     };
@@ -484,6 +500,7 @@ impl HostedProcessVspaceCaps {
 #[derive(Clone, Copy)]
 pub(crate) struct SecImageSpawn {
     pub(crate) lifetime: nt_memory_manager::MemoryLifetime,
+    pub(crate) layout: nt_exe_image::ProcessImageLayout,
     pub(crate) pml4: u64,
     pub(crate) main_tcb: u64,
     pub(crate) main_mechanism: HostedThreadMechanismCaps,
@@ -855,18 +872,45 @@ pub(crate) unsafe fn fill_image_page(pe: &nt_pe_loader::PeFile, rva: u32, dst: u
     RW_NX // gap between sections — a zero page
 }
 
-/// Demand-load a PE via SEC_IMAGE: build a fresh VSpace, RESERVE the image VA (page tables present,
-/// image pages ABSENT), map a stack + IPC buffer, and prepare the entry point. The caller decides
-/// whether the initial TCB starts immediately; child processes normally remain suspended until their
-/// creator resumes the typed initial-thread handle returned by `NtResumeThread`.
-unsafe fn reserve_sec_image_page_tables(pi: u64, pml4: u64, image_va: u64, extent: u64) -> u64 {
-    let span = extent.max(0x1000);
-    let start = image_va & !0x1f_ffff;
-    let end = image_va.saturating_add(span - 1) & !0x1f_ffff;
+/// Reject preferred image placement that overlaps constructor-owned user mappings.
+pub(crate) fn validate_hosted_main_image_layout(
+    layout: nt_exe_image::ProcessImageLayout,
+    ntdll: Option<(u64, u64)>,
+    setup_env: bool,
+) -> Result<(), u32> {
+    if layout.base() & 0xffff != 0 || layout.size() & 0xfff != 0
+        || layout.end() > USER_ADDRESS_LIMIT {
+        return Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES);
+    }
+    let overlaps = |base: u64, size: u64| {
+        base.checked_add(size).is_none_or(|end| base < layout.end() && layout.base() < end)
+    };
+    if overlaps(WORK_CLUSTER_BASE, 0x20_0000)
+        || ntdll.is_some_and(|(base, size)| overlaps(base, size))
+        || (setup_env && (overlaps(KUSER_VA, 0x1000)
+            || overlaps(HOSTED_CLIENT_ENV_BASE, 0x20_0000)
+            || overlaps(HOSTED_MAIN_STACK_ALLOCATION_BASE,
+                STACK_BASE + STACK_FRAMES * 0x1000 - HOSTED_MAIN_STACK_ALLOCATION_BASE)
+            || overlaps(TP_WORKER_SLOT0_REGION_BASE, TP_WORKER_SLOT_COUNT as u64 * TP_WORKER_EXEC_STRIDE)))
+    {
+        return Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES);
+    }
+    Ok(())
+}
+
+unsafe fn reserve_sec_image_layout_page_tables(
+    pi: u64, lifetime: nt_memory_manager::MemoryLifetime,
+    caps: &HostedProcessVspaceCaps, layout: nt_exe_image::ProcessImageLayout,
+) -> u64 {
+    let start = layout.base() & !0x1f_ffff;
+    let end = (layout.end() - 1) & !0x1f_ffff;
     let mut mapped = 0u64;
     let mut va = start;
     loop {
-        map_initial_process_page_table(pi, pml4, va, b"image-pt");
+        user_image_paging::ensure_spawn_user_paging_parents(
+            pi as usize, caps.generation, lifetime, *caps, va,
+        ).expect("main image requires exact spawn-owned parent paging");
+        map_initial_process_page_table(pi, caps.pml4, va, b"image-pt");
         mapped += 1;
         if va == end {
             break;
@@ -876,11 +920,14 @@ unsafe fn reserve_sec_image_page_tables(pi: u64, pml4: u64, image_va: u64, exten
     mapped
 }
 
+/// Demand-load a PE via SEC_IMAGE with absent image pages and an exact admitted layout.
+/// Child processes remain suspended until their creator resumes the typed initial thread.
 pub(crate) unsafe fn spawn_sec_image(
     pi: u64,
     generation: u64,
     lifetime: nt_memory_manager::MemoryLifetime,
     pe: &nt_pe_loader::PeFile,
+    layout: nt_exe_image::ProcessImageLayout,
     fault_ep_c: u64,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
     setup_env: bool,
@@ -901,6 +948,11 @@ pub(crate) unsafe fn spawn_sec_image(
     ldrpinit_rva: u64,
 ) -> SecImageSpawn {
     assert!(lifetime.is_valid(), "SEC_IMAGE spawn requires exact memory lifetime");
+    assert_eq!(layout.size(), u64::from(pe.size_of_image()));
+    assert_eq!(layout.entry_rva(), pe.entry_point_rva());
+    validate_hosted_main_image_layout(
+        layout, ntdll.map(|(base, pe)| (base, image_extent(pe))), setup_env,
+    ).expect("SEC_IMAGE layout must be admitted before native construction");
     if let nt_memory_manager::MemoryLifetime::Process(process) = lifetime {
         assert_eq!(u64::from(process.pid), client_process_id, "SEC_IMAGE PID differs from owner");
     }
@@ -915,6 +967,7 @@ pub(crate) unsafe fn spawn_sec_image(
     .expect("SEC_IMAGE spawn requires completed prior frame and pagefile retirement");
     assert!(
         client_frame_registry_process_is_empty(pi)
+            && user_image_paging::spawn_process_available(pi as usize)
             && client_copyin_frame_process_is_empty(pi)
             && shared_image_mapping_process_is_empty(pi as usize)
             && kuser_page_alias_get(pi as usize) == 0
@@ -939,7 +992,7 @@ pub(crate) unsafe fn spawn_sec_image(
     // `seL4_DeleteFirst` phantom out-of-memory on the next commit at that VA. See `vspace_assign_asid`.
     checked_spawn_asid(pml4);
     trace_spawn_phase(pi, b"vspace");
-    let main_image_size = image_extent(pe);
+    let main_image_size = layout.size();
     let pdpt = alloc_slot();
     spawn_paging_retype(pdpt, OBJ_X86_PDPT, b"image-pdpt");
     let pd = alloc_slot();
@@ -949,16 +1002,30 @@ pub(crate) unsafe fn spawn_sec_image(
     // The image VA's page tables — but NOT the image pages. Touching the image faults in.
     checked_spawn_paging_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4, b"pdpt");
     checked_spawn_paging_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4, b"pd");
-    let image_pts = reserve_sec_image_page_tables(pi, pml4, PE_LOAD_BASE, main_image_size);
+    if setup_env {
+        let kuser_pdpt = alloc_slot();
+        vspace_caps.kuser_pdpt = kuser_pdpt;
+        spawn_paging_retype(kuser_pdpt, OBJ_X86_PDPT, b"kuser-pdpt");
+        let kuser_pd = alloc_slot();
+        vspace_caps.kuser_pd = kuser_pd;
+        spawn_paging_retype(kuser_pd, OBJ_X86_PAGE_DIRECTORY, b"kuser-pd");
+        checked_spawn_paging_map(
+            kuser_pdpt, LBL_X86_PDPT_MAP, KUSER_VA, pml4, b"kuser-pdpt",
+        );
+        checked_spawn_paging_map(
+            kuser_pd, LBL_X86_PAGE_DIRECTORY_MAP, KUSER_VA, pml4, b"kuser-pd",
+        );
+    }
+    let image_pts = reserve_sec_image_layout_page_tables(pi, lifetime, &vspace_caps, layout);
     if pi == 6 {
         EXPLORER_IMAGE_PAGE_TABLES.store(image_pts, Ordering::Relaxed);
     }
-    if !register_image_committed_mappings(pi, pe, PE_LOAD_BASE) {
+    if !register_image_layout_committed_mappings(pi, pe, layout) {
         print_str(b"[spawn-vad] image committed mapping failed pi=");
         print_u64(pi);
         print_str(b" base=0x");
-        print_hex((PE_LOAD_BASE >> 32) as u32);
-        print_hex(PE_LOAD_BASE as u32);
+        print_hex((layout.base() >> 32) as u32);
+        print_hex(layout.base() as u32);
         print_str(b" size=0x");
         print_hex((main_image_size >> 32) as u32);
         print_hex(main_image_size as u32);
@@ -1199,7 +1266,7 @@ pub(crate) unsafe fn spawn_sec_image(
             b"peb-scratch",
         );
         zero_scratch_page(scr + 0x1000);
-        core::ptr::write_volatile((scr + 0x1000 + 0x10) as *mut u64, PE_LOAD_BASE); // ImageBaseAddress
+        core::ptr::write_volatile((scr + 0x1000 + 0x10) as *mut u64, layout.base()); // ImageBaseAddress
         core::ptr::write_volatile((scr + 0x1000 + 0x20) as *mut u64, SMSS_PARAMS_VA);
         core::ptr::write_volatile(
             (scr + 0x1000 + 0xBC) as *mut u32,
@@ -1474,17 +1541,9 @@ pub(crate) unsafe fn spawn_sec_image(
             nt_address_space::PAGE_READWRITE,
             b"params-env",
         );
-        // KUSER_SHARED_DATA at 0x7FFE0000 (PML4[0] — a fresh PT chain; the image is PML4[2]).
+        // KUSER_SHARED_DATA uses the constructor-owned parents installed before image paging.
         // LdrpInitialize reads it early (e.g. 0x7FFE0274); an unmapped read would #PF. A zeroed
         // page satisfies the early reads (a real cookie/NtGlobalFlag can be filled in later).
-        let kpdpt = alloc_slot();
-        spawn_paging_retype(kpdpt, OBJ_X86_PDPT, b"kuser-pdpt");
-        let kpd = alloc_slot();
-        spawn_paging_retype(kpd, OBJ_X86_PAGE_DIRECTORY, b"kuser-pd");
-        vspace_caps.kuser_pdpt = kpdpt;
-        vspace_caps.kuser_pd = kpd;
-        checked_spawn_paging_map(kpdpt, LBL_X86_PDPT_MAP, KUSER_VA, pml4, b"kuser-pdpt");
-        checked_spawn_paging_map(kpd, LBL_X86_PAGE_DIRECTORY_MAP, KUSER_VA, pml4, b"kuser-pd");
         map_initial_process_page_table(pi, pml4, KUSER_VA, b"kuser-pt");
         // Build the KUSER page via a scratch mapping so we can populate the fields the Win32 create
         // path reads. KUSER_SHARED_DATA.ImageNumberLow(@0x260)/ImageNumberHigh(@0x262) bound the
@@ -1561,7 +1620,7 @@ pub(crate) unsafe fn spawn_sec_image(
         let eff_ldrp = effective_ldrp_rva(ldrpinit_rva);
         if eff_ldrp != 0 {
             tb.extend_from_slice(&[0x49, 0xB8]); // movabs r8, imm64
-            tb.extend_from_slice(&PE_LOAD_BASE.to_le_bytes()); // R8 = child image base
+            tb.extend_from_slice(&layout.base().to_le_bytes()); // R8 = child image base
         } else {
             tb.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d  (SystemArgument2)
         }
@@ -1579,7 +1638,7 @@ pub(crate) unsafe fn spawn_sec_image(
         tb.extend_from_slice(&[0x48, 0xB9]);
         tb.extend_from_slice(&SMSS_PEB_VA.to_le_bytes()); // movabs rcx, PEB
         tb.extend_from_slice(&[0x48, 0xB8]);
-        tb.extend_from_slice(&(PE_LOAD_BASE + pe.entry_point_rva() as u64).to_le_bytes()); // movabs rax, entry
+        tb.extend_from_slice(&layout.entry().to_le_bytes()); // movabs rax, entry
         tb.extend_from_slice(&[0xFF, 0xD0]); // call rax  (enter smss)
         tb.extend_from_slice(&[0xEB, 0xFE]); // jmp $
         for (j, &b) in tb.iter().enumerate() {
@@ -1605,7 +1664,7 @@ pub(crate) unsafe fn spawn_sec_image(
         trace_spawn_phase(pi, b"env");
         SMSS_TRAMP_VA
     } else {
-        PE_LOAD_BASE + pe.entry_point_rva() as u64
+        layout.entry()
     };
     trace_spawn_phase(pi, b"thread-objects");
     let raw = alloc_slot();
@@ -1673,6 +1732,7 @@ pub(crate) unsafe fn spawn_sec_image(
     trace_spawn_phase(pi, b"done");
     SecImageSpawn {
         lifetime,
+        layout,
         pml4,
         main_tcb: tcb,
         main_mechanism: HostedThreadMechanismCaps::new(raw, cnode, sched_context),
@@ -1680,7 +1740,7 @@ pub(crate) unsafe fn spawn_sec_image(
         main_runtime: MainThreadRuntime {
             process_id: client_process_id,
             thread_id: client_thread_id,
-            entry: PE_LOAD_BASE + pe.entry_point_rva() as u64,
+            entry: layout.entry(),
             teb: setup_env.then_some(SMSS_TEB_VA),
             teb_alias: setup_env.then_some(scr_base),
             create_time_100ns: nt_system_time_100ns() as i64,
@@ -1689,31 +1749,13 @@ pub(crate) unsafe fn spawn_sec_image(
     }
 }
 
-/// Read a u64 from a SEC_IMAGE process VA. Fixed mirrors are the fast path; recorded frames cover
-/// dynamically grown stacks and other mapped private pages.
+/// Read a u64 through the process's recorded frame backing.
 pub(crate) unsafe fn smss_stack_read(stack_va: u64) -> u64 {
     let mut bytes = [0u8; 8];
     if smss_copyin(stack_va, &mut bytes) {
         u64::from_le_bytes(bytes)
     } else {
         0
-    }
-}
-/// Translate a SEC_IMAGE process VA to its executive mirror VA (stack or heap window), or None if
-/// the range isn't covered by a mirror. The executive's copyin/copyout base: a userspace broker
-/// can't walk smss's page tables, so it reaches smss memory through the same frames it mapped.
-#[inline(always)]
-pub(crate) unsafe fn smss_mirror(va: u64, len: u64) -> Option<u64> {
-    hosted_thread_memory_access(ACTIVE_CLIENT_PI.load(Ordering::Relaxed), va, len).ok()?;
-    let end = va.checked_add(len)?;
-    let stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
-    let stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
-    if va >= stack_base && end <= stack_base + stack_size {
-        Some(ACTIVE_STACK_MIRROR.load(Ordering::Relaxed) + (va - stack_base))
-    } else if va >= SMSS_ALLOC_VA && end <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
-        Some(ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed) + (va - SMSS_ALLOC_VA))
-    } else {
-        None
     }
 }
 /// Copy `dst.len()` bytes IN from a SEC_IMAGE process VA (the executive's ProbeForRead+copyin).
@@ -1723,19 +1765,13 @@ pub(crate) unsafe fn smss_copyin(va: u64, dst: &mut [u8]) -> bool {
         || hosted_thread_memory_access(ACTIVE_CLIENT_PI.load(Ordering::Relaxed), va, dst.len() as u64).is_err() {
         return false;
     }
-    match smss_mirror(va, dst.len() as u64) {
-        Some(m) => {
-            core::ptr::copy_nonoverlapping(m as *const u8, dst.as_mut_ptr(), dst.len());
-            true
-        }
-        None => recorded_frame_copyin(
-            ACTIVE_CLIENT_PI.load(Ordering::Relaxed),
-            None,
-            va,
-            dst,
-            ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
-        ),
-    }
+    recorded_frame_copyin(
+        ACTIVE_CLIENT_PI.load(Ordering::Relaxed),
+        None,
+        va,
+        dst,
+        ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
+    )
 }
 /// Copy `src.len()` bytes OUT to a SEC_IMAGE process VA (the executive's copyout).
 /// Image pages use their current recorded frame, not an inferred fixed mirror address.
@@ -1745,28 +1781,7 @@ pub(crate) unsafe fn smss_copyout(va: u64, src: &[u8]) -> bool {
         || hosted_thread_memory_access(pi, va, src.len() as u64).is_err() {
         return false;
     }
-    if has_managed_section_page(pi, va, src.len()) {
-        return recorded_frame_copyout(pi, va, src, ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed));
-    }
-    match smss_mirror(va, src.len() as u64) {
-        Some(m) => {
-            core::ptr::copy_nonoverlapping(src.as_ptr(), m as *mut u8, src.len());
-            true
-        }
-        None => recorded_frame_copyout(
-            ACTIVE_CLIENT_PI.load(Ordering::Relaxed),
-            va,
-            src,
-            ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
-        ),
-    }
-}
-
-unsafe fn has_managed_section_page(pi: u64, va: u64, length: usize) -> bool {
-    nt_address_space::page_chunks(va, length).is_some_and(|mut chunks| {
-        chunks.any(|chunk| crate::process_committed_mapping_basic_information(pi, chunk.page_base)
-            .is_some_and(|info| info.type_ == nt_address_space::MEM_MAPPED))
-    })
+    recorded_frame_copyout(pi, va, src, ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed))
 }
 
 unsafe fn with_recorded_frame_alias(
@@ -1895,41 +1910,22 @@ unsafe fn recorded_frame_copyout_impl(pi: u64, va: u64, src: &[u8], scratch_base
     }
     true
 }
-/// Historical demand-fill scratch lookup for callers that have already validated backing.
-/// Image copies must use the current frame record, not this fill-order bookkeeping.
-pub(crate) unsafe fn scratch_for(
-    va: u64,
-    filled_pages: &[u64],
-    nfilled: usize,
-    scratch_base: u64,
-) -> Option<u64> {
-    let page = va & !0xFFFu64;
-    for i in 0..nfilled.min(filled_pages.len()) {
-        if filled_pages[i] == page {
-            return Some(scratch_base + i as u64 * 0x1000 + (va & 0xFFF));
-        }
-    }
-    None
-}
-
 unsafe fn unregistered_image_mapping(pi: u64, page: u64) -> bool {
     process_committed_mapping_basic_information(pi, page)
         .is_some_and(|info| info.type_ == nt_address_space::MEM_IMAGE)
 }
 
 /// Copy resident client bytes, selecting exact private or shared process mappings first.
-/// Missing committed image mappings and reclaiming records are rejected. Nonimage bootstrap
-/// mirrors and copy-in prefetches remain supported. This never faults in a new page.
+/// Missing committed image mappings and reclaiming records are rejected. Registered copy-in
+/// prefetches remain supported. This never faults in a new page.
 #[inline(always)]
 pub(crate) unsafe fn client_copyin_mapped(
     pi: u64,
     va: u64,
     dst: &mut [u8],
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> bool {
-    client_copyin_process_mapped_pi_unchecked(pi, va, dst, filled_pages, nfilled, scratch_base, true)
+    client_copyin_process_mapped_pi_unchecked(pi, va, dst, scratch_base)
 }
 
 /// Legacy active-client bootstrap path. Callers with a process witness use the exact variant.
@@ -1938,29 +1934,23 @@ unsafe fn client_copyin_process_mapped_pi_unchecked(
     pi: u64,
     va: u64,
     dst: &mut [u8],
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
-    allow_active_mirrors: bool,
 ) -> bool {
     client_copyin_process_mapped_impl(
-        pi, None, va, dst, filled_pages, nfilled, scratch_base, allow_active_mirrors,
+        pi, None, va, dst, scratch_base,
     )
 }
 
-/// Exact process copy-in. Remote callers disable active mirrors because hosted VAs are reused.
+/// Exact process copy-in. The captured lifetime prevents hosted VA reuse from changing backing.
 pub(crate) unsafe fn client_copyin_process_mapped_for(
     pi: u64,
     process: nt_memory_manager::ProcessIdentity,
     va: u64,
     dst: &mut [u8],
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
-    allow_active_mirrors: bool,
 ) -> bool {
     client_copyin_process_mapped_impl(
-        pi, Some(process), va, dst, filled_pages, nfilled, scratch_base, allow_active_mirrors,
+        pi, Some(process), va, dst, scratch_base,
     )
 }
 
@@ -1969,10 +1959,7 @@ unsafe fn client_copyin_process_mapped_impl(
     process: Option<nt_memory_manager::ProcessIdentity>,
     va: u64,
     dst: &mut [u8],
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
-    allow_active_mirrors: bool,
 ) -> bool {
     if crate::temporary_frame_alias::drain().is_err()
         || hosted_thread_memory_access(pi, va, dst.len() as u64).is_err() {
@@ -2039,17 +2026,7 @@ unsafe fn client_copyin_process_mapped_impl(
         if unregistered_image_mapping(pi, current & !0xfff) {
             return false;
         }
-        let mirrored = if !allow_active_mirrors
-            || ACTIVE_CLIENT_PI.load(Ordering::Relaxed) != pi
-            || pi == 2 && wl_listener_stack_contains(current, chunk)
-        {
-            None
-        } else {
-            smss_mirror(current, chunk as u64)
-        };
-        let source = if let Some(source) = mirrored {
-            source
-        } else {
+        let source = {
             let page = current & !0xfff;
             let persistent_alias = if process.is_some() {
                 prefetch.map_or(0, |page| page.alias)
@@ -2059,11 +2036,7 @@ unsafe fn client_copyin_process_mapped_impl(
             if persistent_alias != 0 {
                 persistent_alias + (current & 0xfff)
             } else {
-                if let Some(source) = scratch_for(current, filled_pages, nfilled, scratch_base) {
-                    source
-                } else {
-                    return false;
-                }
+                return false;
             }
         };
         core::ptr::copy_nonoverlapping(source as *const u8, dst.as_mut_ptr().add(copied), chunk);
@@ -2076,12 +2049,10 @@ unsafe fn client_copyin_process_mapped_impl(
 pub(crate) unsafe fn client_read_u64_mapped(
     pi: u64,
     va: u64,
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> Option<u64> {
     let mut bytes = [0u8; 8];
-    client_copyin_mapped(pi, va, &mut bytes, filled_pages, nfilled, scratch_base)
+    client_copyin_mapped(pi, va, &mut bytes, scratch_base)
         .then(|| u64::from_le_bytes(bytes))
 }
 
@@ -2089,24 +2060,12 @@ pub(crate) unsafe fn client_write_mapped(
     pi: u64,
     va: u64,
     src: &[u8],
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> bool {
     if hosted_thread_memory_access(pi, va, src.len() as u64).is_err() {
         return false;
     }
-    if has_managed_section_page(pi, va, src.len()) {
-        // Preserve the first managed-memory refusal, including consumed guard exceptions.
-        return client_copyout_mapped(pi, va, src, filled_pages, nfilled, scratch_base);
-    }
-    if pi == 2 && wl_listener_stack_contains(va, src.len()) {
-        return client_copyout_mapped(pi, va, src, filled_pages, nfilled, scratch_base);
-    }
-    if client_copyout_mapped(pi, va, src, filled_pages, nfilled, scratch_base) {
-        return true;
-    }
-    ACTIVE_CLIENT_PI.load(Ordering::Relaxed) == pi && smss_copyout(va, src)
+    client_copyout_mapped(pi, va, src, scratch_base)
 }
 
 /// Copy out under the process lifetime captured when the syscall entered. A failed exact
@@ -2132,10 +2091,9 @@ pub(crate) unsafe fn client_write_process_mapped_for(
     };
     let mut copied = 0usize;
     for chunk in chunks {
-        let prefetch = match client_copyin_frame_lookup_for(pi, process, chunk.page_base) {
-            Ok(prefetch) => prefetch,
-            Err(_) => return false,
-        };
+        if client_copyin_frame_lookup_for(pi, process, chunk.page_base).is_err() {
+            return false;
+        }
         if handler.capture_process_identity(pi_index) != Some(process)
             || handler
                 .prepare_copy_page(pi_index, chunk.page_base, nt_address_space::FaultAccess::Write)
@@ -2169,24 +2127,7 @@ pub(crate) unsafe fn client_write_process_mapped_for(
                     return false;
                 }
             }
-            nt_memory_manager::ClientCopyoutBacking::Unrecorded => {
-                if prefetch.is_some() || unregistered_image_mapping(pi, chunk.page_base) {
-                    return false;
-                }
-                let current = chunk.page_base + chunk.page_offset as u64;
-                let destination = (ACTIVE_CLIENT_PI.load(Ordering::Relaxed) == pi
-                    && !(pi == 2 && wl_listener_stack_contains(current, chunk.length)))
-                .then(|| smss_mirror(current, chunk.length as u64))
-                .flatten();
-                let Some(destination) = destination else {
-                    return false;
-                };
-                core::ptr::copy_nonoverlapping(
-                    source.as_ptr(),
-                    destination as *mut u8,
-                    chunk.length,
-                );
-            }
+            nt_memory_manager::ClientCopyoutBacking::Unrecorded => return false,
         }
         copied += chunk.length;
     }
@@ -2197,16 +2138,12 @@ pub(crate) unsafe fn client_write_u64_mapped(
     pi: u64,
     va: u64,
     value: u64,
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> bool {
     client_write_mapped(
         pi,
         va,
         &value.to_le_bytes(),
-        filled_pages,
-        nfilled,
         scratch_base,
     )
 }
@@ -2218,11 +2155,9 @@ pub(crate) unsafe fn client_copyout_mapped(
     pi: u64,
     va: u64,
     src: &[u8],
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> bool {
-    client_copyout_mapped_impl(pi, va, src, filled_pages, nfilled, scratch_base, false)
+    client_copyout_mapped_impl(pi, va, src, scratch_base, false)
 }
 
 /// Only for the checked native-copy engine, after its own protection/residency/COW admission.
@@ -2230,19 +2165,15 @@ pub(crate) unsafe fn client_copyout_mapped_admitted(
     pi: u64,
     va: u64,
     src: &[u8],
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
 ) -> bool {
-    client_copyout_mapped_impl(pi, va, src, filled_pages, nfilled, scratch_base, true)
+    client_copyout_mapped_impl(pi, va, src, scratch_base, true)
 }
 
 unsafe fn client_copyout_mapped_impl(
     pi: u64,
     va: u64,
     src: &[u8],
-    filled_pages: &[u64],
-    nfilled: usize,
     scratch_base: u64,
     admitted: bool,
 ) -> bool {
@@ -2275,14 +2206,7 @@ unsafe fn client_copyout_mapped_impl(
             copied += chunk;
             continue;
         }
-        if unregistered_image_mapping(pi, page) {
-            return false;
-        }
-        let Some(destination) = scratch_for(current, filled_pages, nfilled, scratch_base) else {
-            return false;
-        };
-        core::ptr::copy_nonoverlapping(src.as_ptr().add(copied), destination as *mut u8, chunk);
-        copied += chunk;
+        return false;
     }
     true
 }

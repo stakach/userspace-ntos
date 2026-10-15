@@ -10,21 +10,38 @@
 
 extern crate alloc;
 
+mod accepted_pdo_filter_edge;
+mod accepted_pdo_pnp;
 mod accepted_pdo_provider;
 mod bus_properties;
 mod bus_relations;
 mod critical_child_start;
+pub mod device_text;
+mod fdo_forward_path;
+mod filter_resource_requirements;
 mod relation_owners;
+mod retained_filter_fdo_forward;
 mod retained_lower_pnp_forward;
+mod retained_start_fdo_forward;
+#[cfg(test)]
+mod retained_start_fdo_forward_tests;
+pub mod returned_pnp_buffer;
 mod target_device_relation;
+mod upper_filter_attachment;
 
+pub use accepted_pdo_filter_edge::*;
+pub use accepted_pdo_pnp::*;
 pub use accepted_pdo_provider::*;
 pub use bus_properties::*;
 pub use bus_relations::*;
 pub use critical_child_start::*;
+pub use filter_resource_requirements::*;
 pub use relation_owners::*;
+pub use retained_filter_fdo_forward::*;
 pub use retained_lower_pnp_forward::*;
+pub use retained_start_fdo_forward::*;
 pub use target_device_relation::*;
+pub use upper_filter_attachment::*;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -1048,6 +1065,8 @@ struct PendingPnpDispatch {
     generation: u64,
     canonical_irp_id: u64,
     minor: PnpMinor,
+    prior_state: DeviceState,
+    prior_negotiation: Option<PnpNegotiation>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1917,6 +1936,7 @@ impl PnpManager {
             return Err(PnpError::DispatchInFlight);
         }
         let prior_state = devnode.state;
+        let prior_negotiation = devnode.negotiation;
         let allowed = match minor {
             PnpMinor::StartDevice => matches!(
                 prior_state,
@@ -1986,6 +2006,8 @@ impl PnpManager {
             generation: dispatch_generation,
             canonical_irp_id,
             minor,
+            prior_state,
+            prior_negotiation,
         });
         self.next_dispatch_gen = next_dispatch_generation;
         Ok(PnpDispatchToken {
@@ -2009,19 +2031,10 @@ impl PnpManager {
         completed_canonical_irp_id: u64,
         status_success: bool,
     ) -> Result<DeviceState, PnpError> {
-        let devnode = self
-            .find_mut(token.devnode_id)
-            .ok_or(PnpError::StaleDispatch)?;
-        let pending = devnode.pending_dispatch.ok_or(PnpError::StaleDispatch)?;
-        if devnode.generation != token.devnode_generation
-            || pending.generation != token.dispatch_generation
-            || completed_canonical_irp_id == 0
-            || pending.canonical_irp_id != completed_canonical_irp_id
-            || pending.canonical_irp_id != token.canonical_irp_id
-            || pending.minor != token.minor
-        {
-            return Err(PnpError::StaleDispatch);
-        }
+        let devnode = self.checked_pending_dispatch(token, completed_canonical_irp_id)?;
+        let pending = devnode
+            .pending_dispatch
+            .expect("checked pending PnP dispatch");
         devnode.state = match pending.minor {
             PnpMinor::StartDevice => {
                 if status_success {
@@ -2061,6 +2074,44 @@ impl PnpManager {
         }
         devnode.pending_dispatch = None;
         Ok(devnode.state)
+    }
+
+    /// Restore the pre-begin lifecycle only when the caller has proved that the canonical IRP
+    /// never entered any provider. An uncertain foreign entry must retain the dispatch token.
+    pub fn abort_pnp_dispatch(
+        &mut self,
+        token: &PnpDispatchToken,
+        canonical_irp_id: u64,
+    ) -> Result<DeviceState, PnpError> {
+        let devnode = self.checked_pending_dispatch(token, canonical_irp_id)?;
+        let pending = devnode
+            .pending_dispatch
+            .take()
+            .expect("checked pending PnP dispatch");
+        devnode.state = pending.prior_state;
+        devnode.negotiation = pending.prior_negotiation;
+        Ok(devnode.state)
+    }
+
+    fn checked_pending_dispatch(
+        &mut self,
+        token: &PnpDispatchToken,
+        canonical_irp_id: u64,
+    ) -> Result<&mut Devnode, PnpError> {
+        let devnode = self
+            .find_mut(token.devnode_id)
+            .ok_or(PnpError::StaleDispatch)?;
+        let pending = devnode.pending_dispatch.ok_or(PnpError::StaleDispatch)?;
+        if devnode.generation != token.devnode_generation
+            || pending.generation != token.dispatch_generation
+            || canonical_irp_id == 0
+            || pending.canonical_irp_id != canonical_irp_id
+            || pending.canonical_irp_id != token.canonical_irp_id
+            || pending.minor != token.minor
+        {
+            return Err(PnpError::StaleDispatch);
+        }
+        Ok(devnode)
     }
 
     /// Complete one canonical START dispatch and mint its immutable lifecycle receipt.
@@ -3187,6 +3238,58 @@ mod tests {
             begin_pnp(&mut indeterminate, pdo, PnpMinor::RemoveDevice),
             Err(PnpError::DispatchInFlight)
         );
+    }
+
+    #[test]
+    fn abort_pnp_dispatch_restores_only_the_exact_pre_entry_owner() {
+        let mut p = PnpManager::new();
+        let pdo = 0x5a00;
+        let id = assigned_pci_devnode(&mut p, pdo);
+        let start = begin_pnp(&mut p, pdo, PnpMinor::StartDevice).unwrap();
+        let wrong_generation = PnpDispatchToken {
+            devnode_id: start.devnode_id,
+            devnode_generation: start.devnode_generation,
+            dispatch_generation: start.dispatch_generation + 1,
+            canonical_irp_id: start.canonical_irp_id,
+            minor: start.minor,
+        };
+        assert_eq!(
+            p.abort_pnp_dispatch(&wrong_generation, start.canonical_irp_id),
+            Err(PnpError::StaleDispatch)
+        );
+        assert_eq!(
+            p.abort_pnp_dispatch(&start, start.canonical_irp_id + 1),
+            Err(PnpError::StaleDispatch)
+        );
+        assert_eq!(p.state(id), Some(StartIrpSent));
+        assert!(p.pnp_dispatch_in_flight(id));
+        assert_eq!(
+            p.abort_pnp_dispatch(&start, start.canonical_irp_id),
+            Ok(ResourcesAssigned)
+        );
+        assert!(!p.pnp_dispatch_in_flight(id));
+        assert_eq!(
+            p.abort_pnp_dispatch(&start, start.canonical_irp_id),
+            Err(PnpError::StaleDispatch)
+        );
+        let next = begin_pnp(&mut p, pdo, PnpMinor::StartDevice).unwrap();
+        assert!(next.dispatch_generation > start.dispatch_generation);
+
+        let mut p = PnpManager::new();
+        let id = assigned_pci_devnode(&mut p, pdo);
+        let start = begin_pnp(&mut p, pdo, PnpMinor::StartDevice).unwrap();
+        complete_pnp(&mut p, &start, true).unwrap();
+        let query = begin_pnp(&mut p, pdo, PnpMinor::QueryRemoveDevice).unwrap();
+        complete_pnp(&mut p, &query, true).unwrap();
+        let before = p.find(id).unwrap().negotiation;
+        let surprise = begin_pnp(&mut p, pdo, PnpMinor::SurpriseRemoval).unwrap();
+        assert_eq!(p.find(id).unwrap().negotiation, None);
+        assert_eq!(
+            p.abort_pnp_dispatch(&surprise, surprise.canonical_irp_id),
+            Ok(QueryRemovePending)
+        );
+        assert_eq!(p.find(id).unwrap().negotiation, before);
+        assert!(begin_pnp(&mut p, pdo, PnpMinor::RemoveDevice).is_ok());
     }
 
     #[test]

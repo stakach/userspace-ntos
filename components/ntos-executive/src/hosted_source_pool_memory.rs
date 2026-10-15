@@ -29,7 +29,7 @@ impl SourcePoolMemory {
             return None;
         }
         let lock = hosted_instance_pool_lock(source.exec_pool_va)?;
-        let used = read_volatile(source.exec_pool_va as *const u64);
+        let used = hosted_pool_used(source.exec_pool_va);
         if used < POOL_DATA_OFF || used > FSD_POOL_FRAMES.checked_mul(0x1000)? {
             return None;
         }
@@ -56,6 +56,7 @@ impl SourcePoolMemory {
         let offset = address.checked_sub(FSD_POOL_VADDR)?;
         let length = u64::try_from(length).ok()?;
         let allocation = nt_io_manager::hosted_pool_range::walk_hosted_pool_allocation(
+            FSD_POOL_FRAMES * 0x1000,
             self.used,
             POOL_DATA_OFF,
             offset,

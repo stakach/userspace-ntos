@@ -7,6 +7,7 @@
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use nt_config_store::codec::{crc32c, crc32c_combine, Crc32c};
 
 use crate::directory::{
     query_directory_by_index, DirectoryEntry, DirectoryQueryResult, DirectoryQueryState,
@@ -16,9 +17,13 @@ use crate::fat_directory::FileShortName;
 use crate::path::{normalize_separators, MountManager, MEMFS_VOLUME};
 use crate::snapshot_store::{
     SnapshotBlockDevice, SnapshotBlockStore, SnapshotBlockStoreError, SnapshotPayloadReader,
-    SnapshotPayloadSink,
+    SnapshotPayloadSink, StoredSnapshotMetadata, WalSnapshotManifest,
 };
 use crate::status::*;
+
+#[cfg(test)]
+#[path = "snapshot_crc_compatibility_tests.rs"]
+mod snapshot_crc_compatibility_tests;
 
 #[path = "optional_file.rs"]
 mod optional_file;
@@ -270,39 +275,6 @@ impl FileData {
             }
         }
     }
-}
-
-struct Crc32c {
-    crc: u32,
-}
-
-impl Crc32c {
-    fn new() -> Self {
-        Self { crc: 0xFFFF_FFFF }
-    }
-
-    fn update(&mut self, data: &[u8]) {
-        for &b in data {
-            self.crc ^= b as u32;
-            for _ in 0..8 {
-                self.crc = if self.crc & 1 != 0 {
-                    (self.crc >> 1) ^ 0x82F6_3B78
-                } else {
-                    self.crc >> 1
-                };
-            }
-        }
-    }
-
-    fn finish(self) -> u32 {
-        !self.crc
-    }
-}
-
-fn crc32c(data: &[u8]) -> u32 {
-    let mut crc = Crc32c::new();
-    crc.update(data);
-    crc.finish()
 }
 
 struct SnapshotCrcSink {
@@ -1176,6 +1148,7 @@ impl MemFs {
         &self,
         store: &SnapshotBlockStore,
         dev: &mut D,
+        wal: Option<WalSnapshotManifest>,
     ) -> Result<(u64, usize), SnapshotBlockStoreError> {
         let mut payload_crc_sink = SnapshotCrcSink::new();
         let record_count = self.write_snapshot_payload_to_sink(&mut payload_crc_sink)?;
@@ -1190,23 +1163,26 @@ impl MemFs {
         let mut header = [0u8; MEMFS_SNAPSHOT_HEADER_LEN];
         Self::write_snapshot_header(&mut header, record_count, payload_len_u64, payload_crc);
 
-        let mut store_crc_sink = SnapshotCrcSink::new();
-        store_crc_sink.write_all(&header)?;
-        let written_records = self.write_snapshot_payload_to_sink(&mut store_crc_sink)?;
-        let (store_payload_crc, store_payload_len) = store_crc_sink.finish();
-        if written_records != record_count || store_payload_len != total_len {
-            return Err(SnapshotBlockStoreError::Corrupt);
-        }
+        let store_payload_crc = crc32c_combine(crc32c(&header), payload_crc, payload_len_u64);
 
-        let generation =
-            store.commit_next_streaming(dev, total_len, store_payload_crc, |writer| {
-                writer.write_all(&header)?;
-                let written_records = self.write_snapshot_payload_to_sink(writer)?;
-                if written_records != record_count {
-                    return Err(SnapshotBlockStoreError::Corrupt);
-                }
-                Ok(())
-            })?;
+        let write_payload = |writer: &mut crate::snapshot_store::PayloadSectorWriter<'_, D>| {
+            writer.write_all(&header)?;
+            let written_records = self.write_snapshot_payload_to_sink(writer)?;
+            if written_records != record_count {
+                return Err(SnapshotBlockStoreError::Corrupt);
+            }
+            Ok(())
+        };
+        let generation = match wal {
+            Some(manifest) => store.commit_next_streaming_with_wal_manifest(
+                dev,
+                total_len,
+                store_payload_crc,
+                manifest,
+                write_payload,
+            )?,
+            None => store.commit_next_streaming(dev, total_len, store_payload_crc, write_payload)?,
+        };
         Ok((generation, total_len))
     }
 
@@ -3433,8 +3409,9 @@ struct FileObject {
     current_offset: u64,
     /// `FILE_OBJECT::Event` state shared by every duplicated process handle.
     signaled: bool,
-    /// Create options retained as `FILE_OBJECT` mode flags for `FileModeInformation`.
+    /// Immutable CREATE admission options.
     create_options: u32,
+    mode_state: crate::FileModeState,
     /// One share claim belongs to this open description, until final-handle cleanup completes.
     share: FileShareAccess,
     open_privileges: FileOpenPrivileges,
@@ -3980,7 +3957,19 @@ impl FileSystem {
         store: &SnapshotBlockStore,
         dev: &mut D,
     ) -> Result<(u64, usize), SnapshotBlockStoreError> {
-        self.volume.commit_snapshot_to_store(store, dev)
+        self.volume.commit_snapshot_to_store(store, dev, None)
+    }
+
+    /// Commit the same streaming volume image with an explicit WAL manifest. Every
+    /// mounted-volume checkpoint can use this contract once native WAL recovery and
+    /// mutation ordering are active; the caller must supply the exact folded serial.
+    pub fn commit_volume_snapshot_with_wal_manifest<D: SnapshotBlockDevice>(
+        &self,
+        store: &SnapshotBlockStore,
+        dev: &mut D,
+        manifest: WalSnapshotManifest,
+    ) -> Result<(u64, usize), SnapshotBlockStoreError> {
+        self.volume.commit_snapshot_to_store(store, dev, Some(manifest))
     }
 
     /// Restore the durable volume tree from a block-backed snapshot store without allocating the
@@ -3995,6 +3984,18 @@ impl FileSystem {
             Some((generation, bytes, fs)) => Ok(Some((fs, generation, bytes))),
             None => Ok(None),
         }
+    }
+
+    /// Decode a snapshot before the native caller can replay WAL records. A v2 image is
+    /// returned only after both slots prove the same empty WAL baseline; later v2 states
+    /// require the WAL-aware boot path and may not be published from snapshot bytes alone.
+    pub fn restore_volume_snapshot_before_wal_replay_from_store<D: SnapshotBlockDevice>(
+        store: &SnapshotBlockStore,
+        dev: &mut D,
+    ) -> Result<Option<(Self, StoredSnapshotMetadata)>, SnapshotBlockStoreError> {
+        store.read_latest_streaming_before_wal_replay(dev, |reader| {
+            Ok(Self::new(MemFs::from_snapshot_reader(reader)?))
+        }).map(|restored| restored.map(|(metadata, fs)| (fs, metadata)))
     }
 
     /// Restore a file system from a durable volume snapshot, with a fresh handle table and the
@@ -4792,7 +4793,8 @@ impl FileSystem {
 
     /// `ZwSetInformationFile` (spec §19) for the classes a writable volume must serve:
     /// `FileBasicInformation` (attributes), disposition classes (delete-on-close),
-    /// `FilePositionInformation`, and `FileEndOfFileInformation` / `FileAllocationInformation`
+    /// `FilePositionInformation`, `FileModeInformation`, and
+    /// `FileEndOfFileInformation` / `FileAllocationInformation`
     /// (truncate/extend). Returns the NTSTATUS; unhandled classes are reported honestly.
     pub fn zw_set_information_file(&mut self, handle: u64, class: u32, data: &[u8]) -> u32 {
         let Some(obj) = self.obj(handle) else {
@@ -4800,6 +4802,23 @@ impl FileSystem {
         };
         let node_id = obj.node_id;
         match class {
+            FILE_MODE_INFORMATION => {
+                if data.len() < 4 {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                let requested = u32::from_le_bytes(data[..4].try_into().unwrap());
+                let next = match obj.mode_state.transition(requested) {
+                    Ok(next) => next,
+                    Err(status) => return status.raw() as u32,
+                };
+                debug_assert_eq!(
+                    next.io_mode().map(|mode| mode.is_synchronous()),
+                    crate::FileModeState::from_create_options(obj.create_options)
+                        .io_mode().map(|mode| mode.is_synchronous()),
+                );
+                self.obj_mut(handle).expect("validated local File body").mode_state = next;
+                STATUS_SUCCESS
+            }
             FILE_BASIC_INFORMATION => {
                 if data.len() < 40 {
                     return STATUS_INFO_LENGTH_MISMATCH;
@@ -5037,8 +5056,7 @@ impl FileSystem {
 
     /// I/O-Manager-owned `FileModeInformation` for this live `FILE_OBJECT`.
     pub fn file_mode(&self, handle: u64) -> Option<u32> {
-        self.obj(handle)
-            .map(|obj| crate::file_mode_from_create_options(obj.create_options))
+        self.obj(handle).map(|obj| obj.mode_state.query_bits())
     }
 
     /// Create every missing directory along `path`, and return whether the leaf is a directory.

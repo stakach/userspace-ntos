@@ -1,6 +1,6 @@
 //! DOS + PE/COFF + optional-header + section-table parsing (spec §7.2).
 
-use crate::{bytes_at, u16_at, u32_at, u64_at, PeError};
+use crate::{u16_at, u32_at, u64_at, PeError};
 
 pub const IMAGE_DOS_SIGNATURE: u16 = 0x5A4D; // "MZ"
 pub const IMAGE_NT_SIGNATURE: u32 = 0x0000_4550; // "PE\0\0"
@@ -70,16 +70,32 @@ pub struct Headers {
 impl Headers {
     /// Parse + validate the DOS, NT, and optional headers of `b`.
     pub fn parse(b: &[u8]) -> Result<Headers, PeError> {
+        let nt_offset = Self::capture_nt_offset(b)?;
+        Self::parse_nt_window(b, nt_offset, nt_offset, b.len() as u64)
+    }
+
+    pub(crate) fn capture_nt_offset(b: &[u8]) -> Result<usize, PeError> {
         if u16_at(b, 0)? != IMAGE_DOS_SIGNATURE {
             return Err(PeError::BadDosSignature);
         }
-        let nt_offset = u32_at(b, 0x3C)? as usize;
-        if u32_at(b, nt_offset)? != IMAGE_NT_SIGNATURE {
+        Ok(u32_at(b, 0x3C)? as usize)
+    }
+
+    /// `position` is relative to this captured window; `nt_offset` remains the real File offset.
+    /// Declared optional padding must fit the authenticated File, but only decoded fields
+    /// must be resident in the window. The section table has its own original offset.
+    pub(crate) fn parse_nt_window(
+        b: &[u8],
+        position: usize,
+        nt_offset: usize,
+        file_size: u64,
+    ) -> Result<Headers, PeError> {
+        if u32_at(b, position)? != IMAGE_NT_SIGNATURE {
             return Err(PeError::BadNtSignature);
         }
 
         // File (COFF) header at nt_offset + 4.
-        let fh = nt_offset.checked_add(4).ok_or(PeError::Truncated)?;
+        let fh = position.checked_add(4).ok_or(PeError::Truncated)?;
         let machine = u16_at(b, fh)?;
         if machine != IMAGE_FILE_MACHINE_AMD64 {
             return Err(PeError::UnsupportedMachine(machine));
@@ -97,7 +113,13 @@ impl Headers {
         // Optional header (PE32+) at fh + 20.
         let oh = fh.checked_add(20).ok_or(PeError::Truncated)?;
         let optional_size = size_of_optional_header as usize;
-        bytes_at(b, oh, optional_size)?;
+        let optional_end = nt_offset
+            .checked_add(24)
+            .and_then(|offset| offset.checked_add(optional_size))
+            .ok_or(PeError::Truncated)?;
+        if optional_end as u64 > file_size {
+            return Err(PeError::Truncated);
+        }
         if optional_size < 112 {
             return Err(PeError::Truncated);
         }

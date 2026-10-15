@@ -9,6 +9,8 @@ use alloc::vec::Vec;
 mod file_io_serialization;
 pub use file_io_serialization::FileIoSerialization;
 mod file_mode;
+mod file_create_output;
+pub use file_create_output::{file_create_output_plan, FileCreateOutputPlan};
 
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
 pub const STATUS_TIMEOUT: u32 = 0x0000_0102;

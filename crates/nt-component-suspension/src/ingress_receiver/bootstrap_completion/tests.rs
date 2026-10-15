@@ -24,6 +24,20 @@ fn fixture(
     LaneDispatchIdentity,
     IngressReceiver<ReceivedMessage>,
 ) {
+    fixture_words(info, wrong_badge, [0; 5])
+}
+
+fn fixture_words(
+    info: u64,
+    wrong_badge: bool,
+    words: [u64; 5],
+) -> (
+    Lanes,
+    PeerRegistry,
+    PeerRoute,
+    LaneDispatchIdentity,
+    IngressReceiver<ReceivedMessage>,
+) {
     let mut lanes = Lanes::new(1, 2);
     let mut peers = PeerRegistry::new(20, 1);
     let (_, mut registration) = lanes
@@ -50,8 +64,8 @@ fn fixture(
         .capture(ReceivedMessage::new(
             if wrong_badge { 0 } else { route.badge() },
             info,
-            [0; 4],
-            IpcBufferSnapshot::capture(|_| 0),
+            [words[0], words[1], words[2], words[3]],
+            IpcBufferSnapshot::capture(|index| if index == 5 { words[4] } else { 0 }),
         ))
         .ok()
         .unwrap();
@@ -87,6 +101,120 @@ fn first_completion_ends_bootstrap_without_reply_or_synthetic_ack() {
     assert!(receiver
         .complete_bootstrap_from_message(route, dispatch, 40, 7, &mut lanes, &peers, no_query)
         .is_err());
+}
+
+#[test]
+fn exact_five_word_bootstrap_protocol_settles_without_reply_or_aliasing_current_cap() {
+    let words = [1, 0x10000000006, 9, 0x10011444000, 17];
+    let (mut lanes, peers, route, dispatch, mut receiver) =
+        fixture_words(7 << 12 | 5, false, words);
+    receiver
+        .complete_bootstrap_protocol_from_message(
+            route, dispatch, 40, 7, &words, &mut lanes, &peers, proof,
+        )
+        .unwrap();
+    assert_eq!(lanes.phase(dispatch.lane()), Ok(LanePhase::Idle));
+    assert_eq!(lanes.binding(dispatch.lane()).unwrap().reply_object, 30);
+    assert!(receiver.store.stored_reply(route, 40).unwrap().is_held());
+    assert_eq!(peers.state(route).unwrap().1, 1);
+}
+
+#[test]
+fn zero_word_wrapper_remains_strict_against_startup_publication() {
+    let words = [1, 2, 3, 4, 5];
+    let (mut lanes, peers, route, dispatch, mut receiver) =
+        fixture_words(7 << 12 | 5, false, words);
+    assert!(receiver
+        .complete_bootstrap_from_message(route, dispatch, 40, 7, &mut lanes, &peers, no_query,)
+        .is_err());
+    assert_eq!(
+        lanes.active_dispatch_identity(dispatch.lane()),
+        Ok(Some(dispatch))
+    );
+    assert!(receiver.store.stored_reply(route, 40).unwrap().is_held());
+}
+
+#[test]
+fn malformed_five_word_bootstrap_preserves_retained_lane_and_call() {
+    let words = [1, 2, 3, 4, 5];
+    for (info, actual) in [
+        (7 << 12 | 4, words),
+        (7 << 12, words),
+        (7 << 12 | 6, words),
+        (7 << 12 | 5 | (1 << 7), words),
+        (7 << 12 | 5 | (1 << 9), words),
+        (7 << 12 | 5, [9, 2, 3, 4, 5]),
+        (7 << 12 | 5, [1, 9, 3, 4, 5]),
+        (7 << 12 | 5, [1, 2, 9, 4, 5]),
+        (7 << 12 | 5, [1, 2, 3, 9, 5]),
+        (7 << 12 | 5, [1, 2, 3, 4, 9]),
+    ] {
+        let (mut lanes, peers, route, dispatch, mut receiver) = fixture_words(info, false, actual);
+        assert!(receiver
+            .complete_bootstrap_protocol_from_message(
+                route, dispatch, 40, 7, &words, &mut lanes, &peers, no_query,
+            )
+            .is_err());
+        assert_eq!(
+            lanes.active_dispatch_identity(dispatch.lane()),
+            Ok(Some(dispatch))
+        );
+        assert_eq!(lanes.binding(dispatch.lane()).unwrap().reply_object, 30);
+        assert!(receiver.store.stored_reply(route, 40).unwrap().is_held());
+        assert_eq!(peers.state(route).unwrap().1, 1);
+    }
+    let (mut lanes, peers, route, dispatch, mut receiver) = fixture_words(7 << 12 | 5, true, words);
+    assert!(receiver
+        .complete_bootstrap_protocol_from_message(
+            route, dispatch, 40, 7, &words, &mut lanes, &peers, no_query,
+        )
+        .is_err());
+    assert_eq!(
+        lanes.active_dispatch_identity(dispatch.lane()),
+        Ok(Some(dispatch))
+    );
+    assert!(receiver.store.stored_reply(route, 40).unwrap().is_held());
+}
+
+#[test]
+fn five_word_bootstrap_requires_current_free_and_distinct_incoming_bound() {
+    let words = [1, 2, 3, 4, 5];
+    for current_bound in [false, true] {
+        let (mut lanes, peers, route, dispatch, mut receiver) =
+            fixture_words(7 << 12 | 5, false, words);
+        assert!(receiver
+            .complete_bootstrap_protocol_from_message(
+                route,
+                dispatch,
+                40,
+                7,
+                &words,
+                &mut lanes,
+                &peers,
+                |_, reply| Ok::<_, u8>(if reply == 30 && current_bound {
+                    ReplyBindingObservation::BoundToTarget
+                } else {
+                    ReplyBindingObservation::Free
+                }),
+            )
+            .is_err());
+        assert_eq!(
+            lanes.active_dispatch_identity(dispatch.lane()),
+            Ok(Some(dispatch))
+        );
+        assert!(receiver.store.stored_reply(route, 40).unwrap().is_held());
+    }
+    let (mut lanes, peers, route, dispatch, mut receiver) =
+        fixture_words(7 << 12 | 5, false, words);
+    assert!(receiver
+        .complete_bootstrap_protocol_from_message(
+            route, dispatch, 30, 7, &words, &mut lanes, &peers, no_query,
+        )
+        .is_err());
+    assert_eq!(
+        lanes.active_dispatch_identity(dispatch.lane()),
+        Ok(Some(dispatch))
+    );
 }
 
 #[test]

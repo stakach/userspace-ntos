@@ -18,7 +18,11 @@ mod job_token;
 mod native_acl;
 pub mod native_acl_inheritance;
 mod native_sd;
+mod object_security;
+mod object_creation_grant;
+mod directory_security;
 mod port;
+mod section_security;
 pub mod se_exports;
 mod sid;
 pub mod subject_context;
@@ -63,7 +67,8 @@ pub use key_open::{authorize_key_open, authorize_key_backup_restore, prepare_key
 pub use key_creation::{prepare_key_creation_security, KeyCreationAudit, KeyHandleSecurityAudit, PreparedKeyCreationSecurity};
 pub use native_acl_inheritance::{inherit_native_acl, NativeAclInheritance};
 pub use native_sd::{
-    assign_registry_root_security, mounted_hive_root_security, KEY_GENERIC_MAPPING,
+    assign_registry_root_security, assign_object_directory_root_security, assign_security_directory_security,
+    assign_dos_devices_directory_security, mounted_hive_root_security, KEY_GENERIC_MAPPING,
     assign_object_security, assign_object_security_with_audit, capture_object_type_list,
     capture_security_descriptor_bytes, capture_security_descriptor_for_access,
     security_descriptor_bytes_for_access,
@@ -84,6 +89,13 @@ pub use native_sd::{
 pub use port::{
     validate_secure_port_connect, SecurePortConnectSecurity, STATUS_SERVER_SID_MISMATCH,
 };
+pub use section_security::{
+    assign_section_security, authorize_section_open, SECTION_GENERIC_MAPPING,
+};
+pub use directory_security::{
+    assign_directory_security, authorize_directory_open, DIRECTORY_GENERIC_MAPPING,
+};
+pub use object_creation_grant::{prepare_object_creation_grant, ObjectCreationPrivilegeAudit};
 pub use sid::{write_native_sid_sddl_utf16, Luid, Sid, STATUS_INVALID_SID};
 pub use subject_context::{
     CapturedClientToken, CapturedSubjectContext, CapturedSubjectTokens, SubjectClientIdentity,

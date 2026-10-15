@@ -19,7 +19,7 @@ fn provider() -> PendingFileIo {
 fn local() -> PendingFileIo {
     PendingFileIo {
         route: PendingFileRoute::Local(LocalFileObject::Overlay(3)),
-        operation: PendingFileIoOperation::LocalInline(PendingLocalInline {
+        operation: PendingFileIoOperation::OwnedInline(PendingOwnedInline {
             status: 0x8000_0005,
             information: 41,
         }),
@@ -39,14 +39,14 @@ fn local_fault_preserves_terminal_and_destination_without_publishing() {
     let retained = table.get(slot).unwrap();
     assert_eq!(retained.iosb_va, IOSB);
     assert_eq!(retained.operation, original.operation);
-    assert_eq!(retained.local_terminal_result(), Some((0x8000_0005, 41)));
+    assert_eq!(retained.owned_terminal_result(), Some((0x8000_0005, 41)));
     assert_eq!(retained.delivery_state & IO_DELIVERY_IOSB_PUBLISHED, 0);
     assert!(table.completion_surfaces_settled_exact(slot, IRP));
     assert!(table.finish_exact(slot, IRP).is_none());
     table.mark_backend_acked_exact(slot, IRP).unwrap();
     assert!(table.finish_exact(slot, IRP).is_none());
     table
-        .mark_local_reference_released_exact(slot, IRP)
+        .mark_owned_reference_released_exact(slot, IRP)
         .unwrap();
     let finished = table.finish_exact(slot, IRP).unwrap();
     assert_eq!(finished.iosb_va, IOSB);
@@ -111,7 +111,7 @@ fn absent_destination_abandonment_and_retirement_progress_reject_faults() {
 
     for progress in [
         IO_DELIVERY_BACKEND_ACKED,
-        IO_DELIVERY_LOCAL_REFERENCE_RELEASED,
+        IO_DELIVERY_OWNED_REFERENCE_RELEASED,
     ] {
         let mut table = PendingFileIoTable::new();
         let slot = table.park(local()).unwrap();
@@ -167,7 +167,7 @@ fn provider_fault_does_not_skip_payload_signals_apc_reply_or_file_lock() {
     assert!(table.finish_exact(slot, IRP).is_none());
     table.mark_backend_acked_exact(slot, IRP).unwrap();
     assert!(table
-        .mark_local_reference_released_exact(slot, IRP)
+        .mark_owned_reference_released_exact(slot, IRP)
         .is_none());
     let finished = table.finish_exact(slot, IRP).unwrap();
     assert_eq!(finished.iosb_va, IOSB);
@@ -207,11 +207,17 @@ fn create_fault_does_not_skip_commit_or_user_handle_publication() {
         ..provider()
     };
     let slot = table.park(request).unwrap();
-    table.mark_iosb_faulted_exact(slot, IRP, IOSB).unwrap();
+    assert!(table.mark_iosb_faulted_exact(slot, IRP, IOSB).is_none());
     assert!(table.mark_backend_acked_exact(slot, IRP).is_none());
     table.commit_create_exact(slot, IRP, 0, 1, 2).unwrap();
     assert!(table.mark_backend_acked_exact(slot, IRP).is_none());
-    table.mark_create_handle_published_exact(slot, IRP).unwrap();
+    let identity = table.identity(slot).unwrap();
+    table.observe_create_output_exact(identity, IRP, PendingCreateOutputAction::CommitHandle,
+        PendingCreateOutputObservation::Succeeded).unwrap();
+    table.observe_create_output_exact(identity, IRP, PendingCreateOutputAction::Handle,
+        PendingCreateOutputObservation::Succeeded).unwrap();
+    table.observe_create_output_exact(identity, IRP, PendingCreateOutputAction::Information,
+        PendingCreateOutputObservation::UserFault(0xc000_0005)).unwrap();
     table.mark_backend_acked_exact(slot, IRP).unwrap();
     let finished = table.finish_exact(slot, IRP).unwrap();
     let PendingFileIoOperation::Create(create) = finished.operation else {

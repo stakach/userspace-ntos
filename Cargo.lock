@@ -178,6 +178,7 @@ name = "nt-address-space"
 version = "0.1.0"
 dependencies = [
  "nt-cache-manager",
+ "nt-io-completion",
  "nt-memory-manager",
 ]
 
@@ -217,9 +218,20 @@ version = "0.1.0"
 name = "nt-compat-exports"
 version = "0.1.0"
 dependencies = [
+ "nt-ahci",
+ "nt-driver-runtime",
+ "nt-exe-image",
+ "nt-fs",
+ "nt-io-manager",
  "nt-kernel-abi",
  "nt-kernel-exec",
+ "nt-memory-manager",
+ "nt-pe-loader",
+ "nt-printf",
  "nt-process",
+ "nt-status",
+ "nt-types",
+ "nt-user-host",
  "syn",
 ]
 
@@ -347,6 +359,7 @@ dependencies = [
  "nt-config-store",
  "nt-hive-core",
  "nt-io-completion",
+ "nt-status",
 ]
 
 [[package]]
@@ -359,6 +372,7 @@ version = "0.1.0"
 dependencies = [
  "nt-config-manager",
  "nt-config-store",
+ "nt-page-storage",
  "nt-security",
 ]
 
@@ -410,6 +424,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags",
  "nt-address-space",
+ "nt-cm-resources",
  "nt-driver-runtime",
  "nt-fs",
  "nt-io-abi",
@@ -571,6 +586,10 @@ dependencies = [
  "nt-status",
  "nt-types",
 ]
+
+[[package]]
+name = "nt-page-storage"
+version = "0.1.0"
 
 [[package]]
 name = "nt-pe-loader"
@@ -781,6 +800,7 @@ dependencies = [
  "nt-memory-manager",
  "nt-ntdll-layout",
  "nt-object-manager",
+ "nt-page-storage",
  "nt-pe-loader",
  "nt-process",
  "nt-provider-wait",

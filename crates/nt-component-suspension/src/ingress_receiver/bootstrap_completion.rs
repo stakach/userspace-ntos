@@ -17,6 +17,30 @@ impl IngressReceiver<ReceivedMessage> {
         completion_label: u64,
         lanes: &mut ComponentSuspensionLanes<C, R, T>,
         peers: &PeerRegistry,
+        query: impl FnMut(u64, u64) -> Result<ReplyBindingObservation, E>,
+    ) -> Result<(), StoredCompletionError<E>> {
+        self.complete_bootstrap_protocol_from_message(
+            route,
+            dispatch,
+            completion_reply,
+            completion_label,
+            &[],
+            lanes,
+            peers,
+            query,
+        )
+    }
+
+    /// Bootstrap completion with an independently validated exact protocol tuple.
+    pub fn complete_bootstrap_protocol_from_message<C, R, T, E>(
+        &mut self,
+        route: PeerRoute,
+        dispatch: LaneDispatchIdentity,
+        completion_reply: u64,
+        completion_label: u64,
+        expected_words: &[u64],
+        lanes: &mut ComponentSuspensionLanes<C, R, T>,
+        peers: &PeerRegistry,
         mut query: impl FnMut(u64, u64) -> Result<ReplyBindingObservation, E>,
     ) -> Result<(), StoredCompletionError<E>> {
         if self.phase().is_some()
@@ -60,10 +84,15 @@ impl IngressReceiver<ReceivedMessage> {
             .stored_reply(route, completion_reply)
             .map_err(StoredCompletionError::Store)?;
         if !completion.is_held()
+            || expected_words.len() > 120
             || completion_label == 0
             || completion_label > (u64::MAX >> 12)
             || completion.message().badge() != route.badge()
-            || completion.message().info() != completion_label << 12
+            || completion.message().info() != (completion_label << 12) | expected_words.len() as u64
+            || expected_words
+                .iter()
+                .enumerate()
+                .any(|(index, word)| completion.message().word(index) != Some(*word))
         {
             return Err(StoredCompletionError::InvalidCompletionMessage);
         }

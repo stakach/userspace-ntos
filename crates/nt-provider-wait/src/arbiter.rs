@@ -836,7 +836,7 @@ mod tests {
     }
 
     fn file(slot: u64) -> ProviderWaitObject {
-        ProviderWaitObject::new(ProviderWaitObjectType::File, slot, 1)
+        ProviderWaitObject::new(ProviderWaitObjectType::File, (1u64 << 40) | slot, 1)
     }
 
     fn request(
@@ -918,7 +918,7 @@ mod tests {
         assert_eq!(arbiter.poll(&mut backend, &poll, identity), Ok(1));
         assert_eq!(backend.lease_count(), 0);
 
-        backend.events.get_mut(&(2, 1)).unwrap().signaled = false;
+        backend.events.get_mut(&(file(2).object_id, 1)).unwrap().signaled = false;
         let blocking = request(
             identity,
             28,

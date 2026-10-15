@@ -1,0 +1,30 @@
+{
+  "native_commit": "9adb8bfdf73c3d189054a8df2317469c325dcbf1",
+  "microkernel_commit": "92c4e2b330019c7c8afb1544b3cbf8ca1219eb73",
+  "profile": "font-cleanup",
+  "command": "env -u NTOS_MUP_PROVIDER_KERNEL_ONLY -u NTDLL_FEATURES NTOS_IMAGE_PROFILE=font-cleanup IMAGE_MIB=256 PERSIST_IMAGE_MIB=16 BOOT_TIMEOUT_SECONDS=3600 RUN_LOG=$PWD/.tmp/issue18-livecd-setup-font-boot.log ./run.sh --desktop -qmp unix:$PWD/.tmp/issue18-livecd-setup-font-qmp.sock,server=on,wait=off",
+  "boot_limit_seconds": 3600,
+  "termination": "Root stopped QEMU with SIGTERM after approximately 19 minutes at a USER-object pointer-reference underflow. This was not a successful guest verdict.",
+  "launcher_exit": 1,
+  "collector_exit": 0,
+  "collector_frames": 106,
+  "font_parser_exit": 1,
+  "font_parser_failure": "Missing font-acceptance PID-QUERY; the Explorer Run-key client did not execute.",
+  "guest_summary": null,
+  "explorer_desktop_proven": false,
+  "screenshot": "../images/livecd-setup-user-reference-failure.png",
+  "screenshot_sha256": "fcdd6d4f55822e3e2fc5b96638b4044908255cd4688978b6161c966051a0119c",
+  "root_viewed_screenshot": true,
+  "raw_log_sha256": "72a7ca46ceabcabe032c0a9b3028fb23fd0627c7d5dcb754fe1c6e5d5b6c6a13",
+  "archived_log": "issue18-livecd-setup-user-reference-failure.log.gz",
+  "rootserver_sha256": "8e7d7da9a6b304c9abaf1e974baf601dfbbaa628b6a0c2a4512930ac6b133213",
+  "disk_sha256_after_termination": "925aed7f37f8678fe45e5c9aee5707741f6e56a3f67c1be95e8e00ac33c5d52e",
+  "observations": [
+    "The same-run final screenshot contains only a blue background, with no Explorer chrome or icons.",
+    "The image preserves the imported LiveCD SYSTEM Setup policy; the kernel did not force installed-logon startup.",
+    "The setup fixture completed its real Run-key operations and exited; its Explorer client did not execute.",
+    "EventLog GUI initialization preceded the USER-object pointer-reference underflow at win32k_subsystem.rs:4302. The failing object body and PE caller were not recorded, so that ordering is not proof of their identities.",
+    "No executive out-of-memory failure was recorded before termination.",
+    "i8042prt admission still rejected unresolved IoStartNextPacket, and real keyboard/mouse reads failed. No hardware-input proof was obtained."
+  ]
+}

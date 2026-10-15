@@ -28,7 +28,7 @@ fn append_inner(
         return Err(STATUS_INVALID_PARAMETER);
     }
     let class = class_name
-        .map(|class| checked_mutation_utf16(class, CM_MAX_HIVE_VALUE_NAME_UNITS))
+        .map(|class| checked_bounded_utf16(class, CM_MAX_HIVE_VALUE_NAME_UNITS))
         .transpose()?;
     let class_bytes = class.as_deref().unwrap_or(&[]);
     let descriptor_len = u32::try_from(descriptor.len()).map_err(|_| STATUS_INVALID_PARAMETER)?;

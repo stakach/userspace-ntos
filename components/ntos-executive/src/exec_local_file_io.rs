@@ -2,7 +2,30 @@
 
 use super::*;
 
+/// Pin the admitted local body across user-memory probes without borrowing the handler.
+/// A later pending operation acquires its own reference before this temporary pin is released.
+pub(super) struct LocalFileIoReference {
+    handler: *mut ExecNtHandler,
+    file_object: LocalFileObject,
+}
+
+impl Drop for LocalFileIoReference {
+    fn drop(&mut self) {
+        // The serialized handler outlives this syscall-local guard; no borrow crosses a callback.
+        unsafe { (&mut *self.handler).release_local_file_io_reference(self.file_object) };
+    }
+}
+
 impl ExecNtHandler {
+    /// The handler must remain at this address until the syscall-local guard is dropped.
+    pub(super) unsafe fn capture_local_file_io_reference(
+        &mut self,
+        file_object: LocalFileObject,
+    ) -> Result<LocalFileIoReference, u32> {
+        self.retain_local_file_io_reference(file_object)?;
+        Ok(LocalFileIoReference { handler: self, file_object })
+    }
+
     pub(super) unsafe fn reserved_local_file_io_id(&self) -> Result<u64, u32> {
         let pending = &*core::ptr::addr_of!(PENDING_FILE_IO);
         self.pending_file_io_reservation
@@ -30,6 +53,49 @@ impl ExecNtHandler {
         Ok(request_id)
     }
 
+    pub(super) unsafe fn begin_referenced_local_file_io(
+        &mut self,
+        reference: &LocalFileIoReference,
+    ) -> Result<u64, u32> {
+        self.validate_local_file_io_reference(reference)?;
+        let request_id = self.reserve_local_file_io_delivery()?;
+        self.begin_local_file_io_from_reference(reference)?;
+        Ok(request_id)
+    }
+
+    fn validate_local_file_io_reference(
+        &mut self,
+        reference: &LocalFileIoReference,
+    ) -> Result<(), u32> {
+        if !core::ptr::eq(reference.handler, self as *mut Self) {
+            return Err(nt_fs::STATUS_INVALID_HANDLE);
+        }
+        Ok(())
+    }
+
+    fn begin_local_file_io_from_reference(
+        &mut self,
+        reference: &LocalFileIoReference,
+    ) -> Result<(), u32> {
+        self.validate_local_file_io_reference(reference)?;
+        match reference.file_object {
+            LocalFileObject::Overlay(file_id) => unsafe {
+                return crate::writable_fs::begin_referenced_file_io(file_id);
+            },
+            LocalFileObject::ReadonlyFile(object_id) => {
+                self.readonly_file_opens.retain_referenced_io(object_id)?;
+            }
+            LocalFileObject::ReadonlyDirectory(object_id) => {
+                self.directory_opens.retain_referenced_io(object_id)?;
+            }
+        }
+        if let Err(status) = self.set_local_file_object_signaled(reference.file_object, false) {
+            self.release_local_file_io_reference(reference.file_object);
+            return Err(status);
+        }
+        Ok(())
+    }
+
     pub(super) unsafe fn reserve_local_file_io_output(
         &mut self,
         capacity: usize,
@@ -51,6 +117,17 @@ impl ExecNtHandler {
     ) -> Result<u64, u32> {
         let request_id = self.reserve_local_file_io_output(capacity)?;
         self.begin_local_file_io(file_object)?;
+        Ok(request_id)
+    }
+
+    pub(super) unsafe fn begin_referenced_local_buffered_io(
+        &mut self,
+        reference: &LocalFileIoReference,
+        capacity: usize,
+    ) -> Result<u64, u32> {
+        self.validate_local_file_io_reference(reference)?;
+        let request_id = self.reserve_local_file_io_output(capacity)?;
+        self.begin_local_file_io_from_reference(reference)?;
         Ok(request_id)
     }
 
@@ -203,8 +280,8 @@ impl ExecNtHandler {
             route: PendingFileRoute::Local(file_object),
             irp_id: request_id,
             major,
-            operation: nt_io_manager::PendingFileIoOperation::LocalInline(
-                nt_io_manager::PendingLocalInline {
+            operation: nt_io_manager::PendingFileIoOperation::OwnedInline(
+                nt_io_manager::PendingOwnedInline {
                     status,
                     information,
                 },
@@ -314,7 +391,7 @@ impl ExecNtHandler {
             return Ok(pending);
         }
         let (status, information) = pending
-            .local_terminal_result()
+            .owned_terminal_result()
             .expect("buffered local output has no terminal result");
         let length = if nt_io_completion::file_io_status_copies_output(status) {
             u32::try_from(information).expect("local buffered result exceeds ULONG")

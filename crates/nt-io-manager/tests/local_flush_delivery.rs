@@ -184,8 +184,8 @@ impl Work {
             .restore_reply_cap_exact(self.slot, self.id, REPLY)
             .unwrap();
         assert_eq!(
-            self.pending().local_syscall_status(),
-            before.local_syscall_status()
+            self.pending().owned_syscall_status(),
+            before.owned_syscall_status()
         );
         assert!(self.table.finish_exact(self.slot, self.id).is_none());
         assert_eq!(
@@ -201,14 +201,14 @@ impl Work {
         assert!(self.table.finish_exact(self.slot, self.id).is_none());
         self.fs.zw_release_io_reference(self.handle).unwrap();
         self.table
-            .mark_local_reference_released_exact(self.slot, self.id)
+            .mark_owned_reference_released_exact(self.slot, self.id)
             .unwrap();
         let result = self.table.finish_exact(self.slot, self.id).unwrap();
         assert_eq!(
-            result.local_terminal_result(),
-            before.local_terminal_result()
+            result.owned_terminal_result(),
+            before.owned_terminal_result()
         );
-        assert_eq!(result.local_syscall_status(), before.local_syscall_status());
+        assert_eq!(result.owned_syscall_status(), before.owned_syscall_status());
         assert_eq!(
             self.effects,
             Effects {
@@ -240,7 +240,7 @@ impl Memory {
         pending: PendingFileIo,
         failure: Option<(usize, MemoryCopyFailure)>,
     ) -> Result<(), MemoryCopyFailure> {
-        let (status, information) = pending.local_terminal_result().unwrap();
+        let (status, information) = pending.owned_terminal_result().unwrap();
         let mut store = 0;
         publish_file_io_status_checked(pending.iosb_va, status, information, |address, bytes| {
             let index = store;
@@ -295,7 +295,7 @@ fn flush_mode_status_matrix_controls_iosb_and_file_without_fake_completion_surfa
             } else {
                 assert_eq!(memory.calls, 0);
             }
-            assert_eq!(work.pending().local_syscall_status(), Some(status));
+            assert_eq!(work.pending().owned_syscall_status(), Some(status));
             work.finish();
             assert_eq!(
                 work.fs.zw_is_file_signaled(work.handle),
@@ -358,11 +358,11 @@ fn completed_writeback_survives_both_iosb_store_failures_and_closed_file_deliver
                     assert_eq!(work.pending().iosb_va, IOSB);
                 }
                 assert_eq!(
-                    work.pending().local_terminal_result(),
+                    work.pending().owned_terminal_result(),
                     Some((STATUS_SUCCESS, 0))
                 );
                 assert_eq!(
-                    work.pending().local_syscall_status(),
+                    work.pending().owned_syscall_status(),
                     Some(if !retry && mode == LocalFlushMode::SynchronousApi {
                         AV
                     } else {
@@ -394,8 +394,8 @@ fn async_open_final_iosb_reports_original_error_unless_its_own_store_faults() {
         work.table
             .mark_local_flush_iosb_faulted_exact(work.slot, work.id, IOSB, GUARD)
             .unwrap();
-        assert_eq!(work.pending().local_terminal_result(), Some((IO_ERROR, 0)));
-        assert_eq!(work.pending().local_syscall_status(), Some(GUARD));
+        assert_eq!(work.pending().owned_terminal_result(), Some((IO_ERROR, 0)));
+        assert_eq!(work.pending().owned_syscall_status(), Some(GUARD));
         assert_eq!(&memory.bytes[..4], &[0xcc; 4]);
         assert_eq!(
             &memory.bytes[8..],
@@ -440,10 +440,10 @@ fn thread_abandonment_after_iosb_retry_releases_owned_reply_and_reference_withou
         assert!(work.table.finish_exact(work.slot, work.id).is_none());
         work.fs.zw_release_io_reference(work.handle).unwrap();
         work.table
-            .mark_local_reference_released_exact(work.slot, work.id)
+            .mark_owned_reference_released_exact(work.slot, work.id)
             .unwrap();
         let retired = work.table.finish_exact(work.slot, work.id).unwrap();
-        assert_eq!(retired.local_terminal_result(), Some((STATUS_SUCCESS, 0)));
+        assert_eq!(retired.owned_terminal_result(), Some((STATUS_SUCCESS, 0)));
         assert_eq!(
             work.effects,
             Effects {

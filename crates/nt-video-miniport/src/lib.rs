@@ -9,17 +9,30 @@
 
 pub mod caller_aperture;
 pub mod caller_memory;
+mod child_ids;
 pub mod mode_evidence;
+pub mod video_children;
 mod control;
 pub use control::{classify_start_io_status, VideoControlCompletion, VideoControlProtocolError};
 mod lifecycle;
 mod pnp;
+pub use child_ids::{write_monitor_child_id, MonitorChildIdError, MonitorChildIdResult};
 pub use lifecycle::{
     validate_device_control_requestor, VideoAdapterDiscoveryState,
     VideoHardwareInitializationState, VideoOpenAction, VideoOpenCompletion, VideoPortDeviceState,
     VideoPortDeviceStateCell, VideoPortLifecycleError, VIDEO_PORT_DEVICE_STATE_SIZE,
 };
-pub use pnp::owns_target_device_relation;
+pub use pnp::{
+    owns_target_device_relation, video_port_bus_relations_action, video_port_relation_owner,
+    VideoPortBusRelationsAction, VideoPortRelationOwner,
+};
+pub use video_children::{
+    classify_video_child_callback_status, VideoChildCallbackAction, VideoChildCallbackError,
+    VideoChildEnumInfoError, VideoChildEnumInfoX64, DISPLAY_ADAPTER_HW_ID,
+    VIDEO_CHILD_DESCRIPTOR_SIZE, VIDEO_CHILD_ENUM_INFO_X64_SIZE, VIDEO_CHILD_TYPE_MONITOR,
+    VIDEO_CHILD_TYPE_NON_PRIMARY_CHIP, VIDEO_CHILD_TYPE_OTHER, VIDEO_CHILD_TYPE_VIDEO_CHIP,
+    VIDEO_ENUM_INVALID_DEVICE, VIDEO_ENUM_MORE_DEVICES, VIDEO_ENUM_NO_MORE_DEVICES,
+};
 
 pub const FILE_DEVICE_VIDEO: u32 = 0x23;
 

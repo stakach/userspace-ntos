@@ -533,6 +533,18 @@ impl<T> PendingOperationTable<T> {
         }
     }
 
+    /// Read only the owner published under this exact slot generation.
+    pub fn get_exact(&self, reservation: PendingOperationReservation) -> Option<&T> {
+        match self.slots.get(reservation.slot) {
+            Some(Slot::Occupied { generation, value })
+                if *generation == reservation.generation =>
+            {
+                Some(value)
+            }
+            _ => None,
+        }
+    }
+
     pub fn get_mut(&mut self, slot: usize) -> Option<&mut T> {
         match self.slots.get_mut(slot) {
             Some(Slot::Occupied { value, .. }) => Some(value),
@@ -576,6 +588,23 @@ mod tests {
         let replacement = table.reserve().unwrap();
         assert_eq!(replacement.slot(), 0);
         assert_ne!(replacement, first);
+    }
+
+    #[test]
+    fn exact_occupied_reservation_survives_slot_reuse_without_confusing_owners() {
+        let mut table = PendingOperationTable::<u32>::with_capacity(2);
+        let retired = table.reserve().unwrap();
+        let predecessor = table.reserve().unwrap();
+        table.publish(predecessor, 29).unwrap();
+        table.cancel(retired).unwrap();
+        let child = table.reserve().unwrap();
+        assert!(child.slot() < predecessor.slot());
+        assert_eq!(table.get_exact(predecessor), Some(&29));
+        assert_eq!(table.get_exact(child), None);
+        table.publish(child, 30).unwrap();
+        assert_eq!(table.get_exact(retired), None);
+        assert_eq!(table.get_exact(child), Some(&30));
+        assert_eq!(table.get_exact(predecessor), Some(&29));
     }
 
     #[test]

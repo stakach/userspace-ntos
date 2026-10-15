@@ -26,7 +26,7 @@ fn finish(table: &mut PendingFileIoTable, slot: usize, irp: u64) {
     table.mark_backend_acked_exact(slot, irp).unwrap();
     assert!(table.finish_exact(slot, irp).is_none());
     table
-        .mark_local_reference_released_exact(slot, irp)
+        .mark_owned_reference_released_exact(slot, irp)
         .unwrap();
     table.finish_exact(slot, irp).unwrap();
     assert!(table.local_outputs[slot].is_none());
@@ -255,7 +255,7 @@ fn empty_success_and_noncopying_statuses_require_explicit_empty_settlement() {
         );
         assert_eq!(table.advance_output_exact(slot, id, 0, 0), Some(0));
         assert_eq!(
-            table.get(slot).unwrap().local_terminal_result(),
+            table.get(slot).unwrap().owned_terminal_result(),
             Some((status, information))
         );
         finish(&mut table, slot, id);
@@ -294,7 +294,7 @@ fn permanent_output_fault_preserves_information_prefix_and_inline_policy() {
             .settle_local_output_fault_exact(slot, id, pending.output_va, status)
             .unwrap();
         let settled = table.get(slot).unwrap();
-        assert_eq!(settled.local_terminal_result(), Some((status, 4)));
+        assert_eq!(settled.owned_terminal_result(), Some((status, 4)));
         assert_eq!(settled.output_offset, 2);
         assert_eq!(settled.output_va, pending.output_va);
         assert_eq!(settled.delivery_state, IO_DELIVERY_OUTPUT_FAULTED);
@@ -371,7 +371,7 @@ fn abandonment_keeps_terminal_storage_until_final_reference_retirement() {
     assert_eq!(table.abandon_thread_transfers_with(pending.tid, |_| {}), 1);
     assert!(table.local_outputs[slot].is_some());
     assert_eq!(
-        table.get(slot).unwrap().local_terminal_result(),
+        table.get(slot).unwrap().owned_terminal_result(),
         Some((0, 4))
     );
     assert!(table

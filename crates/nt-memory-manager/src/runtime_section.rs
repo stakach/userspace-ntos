@@ -70,6 +70,7 @@ pub struct GenericSectionBacking {
     pub file_size: u32,
     pub overlay_file_id: u64,
     pub routed_lease: Option<RoutedSectionLease>,
+    pub local_lease: Option<RoutedSectionLease>,
     pub file: Option<SectionFileIdentity>,
     pub file_extent: u64,
 }
@@ -82,6 +83,7 @@ impl GenericSectionBacking {
             file_size: 0,
             overlay_file_id: 0,
             routed_lease: None,
+            local_lease: None,
             file: None,
             file_extent: 0,
         }
@@ -94,6 +96,7 @@ impl GenericSectionBacking {
             file_size: 0,
             overlay_file_id: 0,
             routed_lease: None,
+            local_lease: None,
             file: None,
             file_extent: 0,
         }
@@ -106,6 +109,7 @@ impl GenericSectionBacking {
             file_size,
             overlay_file_id: 0,
             routed_lease: None,
+            local_lease: None,
             file: Some(file),
             file_extent: file_size as u64,
         }
@@ -118,6 +122,7 @@ impl GenericSectionBacking {
             file_size: 0,
             overlay_file_id: file_id,
             routed_lease: None,
+            local_lease: None,
             file: Some(file),
             file_extent,
         }
@@ -134,6 +139,7 @@ impl GenericSectionBacking {
             file_size: 0,
             overlay_file_id: 0,
             routed_lease: Some(lease),
+            local_lease: None,
             file: Some(file),
             file_extent,
         }
@@ -490,15 +496,25 @@ impl GenericSectionTable {
         }
         match backing.kind {
             GENERIC_SECTION_BACKING_ANON
-                if backing.file.is_none() && backing.routed_lease.is_none() => {}
+                if backing.file.is_none()
+                    && backing.routed_lease.is_none()
+                    && backing.local_lease.is_none() => {}
             GENERIC_SECTION_BACKING_DISK | GENERIC_SECTION_BACKING_OVERLAY
                 if backing.file.is_some()
                     && backing.routed_lease.is_none()
+                    && (backing.kind == GENERIC_SECTION_BACKING_DISK
+                        || backing.local_lease.is_none())
+                    && !backing.local_lease.is_some_and(|lease| {
+                        self.sections.iter().any(|section| {
+                            section.backing.local_lease == Some(lease)
+                        })
+                    })
                     && size <= backing.file_extent
                     && backing.file_extent <= crate::data_section::MAX_DATA_SECTION_SIZE => {}
             GENERIC_SECTION_BACKING_ROUTED
                 if backing.file.is_some()
                     && backing.routed_lease.is_some()
+                    && backing.local_lease.is_none()
                     && backing.overlay_file_id == 0
                     && backing.first_cluster == 0
                     && backing.file_size == 0

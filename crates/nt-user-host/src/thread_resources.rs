@@ -329,6 +329,21 @@ impl<const STACK: usize> ThreadMemoryResources<STACK> {
         stack.chain(other)
     }
 
+    /// Target mapping identity, not physical backing ownership. Only IPC maps its owner directly.
+    pub(crate) fn expected_mapping_cap(&self, page: u64) -> Option<u64> {
+        let layout = self.layout?;
+        self.backing_pages()
+            .find(|(backed_page, _, _)| *backed_page == page)
+            .map(|(_, owner, aliases)| {
+                if page == layout.ipc.base {
+                    owner
+                } else {
+                    aliases[0]
+                }
+            })
+            .filter(|cap| *cap != 0)
+    }
+
     /// One physical owner per private page; copied target/mirror caps are aliases. Includes absent
     /// construction slots as zero, then validates and removes them. Registry and mechanism caps are
     /// intentionally not inferred: the native adapter must capture those additional owners exactly.

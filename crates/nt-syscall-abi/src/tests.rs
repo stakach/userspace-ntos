@@ -2,6 +2,34 @@
 
 use super::*;
 
+#[test]
+fn native_request_keeps_exact_arguments_when_nested_ipc_reuses_receive_buffer() {
+    let mut receive_words = [0u64; NT_NATIVE_REQUEST_WORDS];
+    receive_words[4] = 1; // KeyValueFullInformation
+    receive_words[5] = 0x1000_1234; // output buffer
+    receive_words[6] = 2048;
+    receive_words[7] = 0x1000_5678; // result length
+    let request = NativeSyscallRequest::capture(
+        native_syscall_message_info(6),
+        [77, 0x7000, 0xc, 14],
+        |index| receive_words[index],
+    )
+    .unwrap();
+
+    // A provider Call on the root TCB reuses the mutable IPC bank before NT dispatch.
+    receive_words[4] = 0x24;
+    receive_words[5..8].fill(u64::MAX);
+    assert_eq!(request.length(), 8);
+    assert_eq!(request.argument(0), Some(0xc));
+    assert_eq!(request.argument(1), Some(14));
+    assert_eq!(request.argument(2), Some(1));
+    assert_eq!(request.argument(3), Some(0x1000_1234));
+    assert_eq!(request.argument(4), Some(2048));
+    assert_eq!(request.argument(5), Some(0x1000_5678));
+    assert_eq!(request.argument(6), None);
+    assert!(NativeSyscallRequest::capture(0, [77, 0, 0, 0], |_| unreachable!()).is_none());
+}
+
 /// The exact count of `Nt*` services in the shared table: the current hosted ReactOS import set,
 /// ntdll-internal services (`NtSecureConnectPort`, `NtCallbackReturn`), and registry hive
 /// load/unload variants that route to real executive CM functionality.

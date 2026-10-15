@@ -34,6 +34,7 @@ fn create(irp: u64) -> PendingFileIo {
             status: nt_status::NtStatus::PENDING.raw() as u32,
             information: 0,
             handle_value: 0,
+            output: PendingCreateOutput::default(),
         }),
         tid: 13,
         iosb_va: 0x2000,
@@ -163,12 +164,7 @@ fn exact_create_removal_refuses_transfer_and_claimed_create() {
     };
     let create_slot = table.park(request).unwrap();
     table.commit_create_exact(create_slot, 14, 0, 1, 6).unwrap();
-    table
-        .mark_create_handle_published_exact(create_slot, 14)
-        .unwrap();
-    table
-        .mark_delivery_exact(create_slot, 14, IO_DELIVERY_IOSB_PUBLISHED)
-        .unwrap();
+    table.settle_test_create(create_slot, 14);
     assert_eq!(table.claim_reply_cap_exact(create_slot, 14), Some(Some(77)));
     let claimed = table.get(create_slot).unwrap();
     assert_eq!(table.take_create_exact(create_slot, 14), None);

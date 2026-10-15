@@ -2,6 +2,40 @@
 
 use super::*;
 
+pub(crate) unsafe fn file_io_mode(file_id: u64) -> Result<nt_io_completion::FileIoMode, u32> {
+    let mode = mounted_namespace_fs()?.ok_or(nt_fs::STATUS_INVALID_HANDLE)?
+        .file_mode(file_id).ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+    nt_fs::FileModeState::from_create_options(mode).io_mode().map_err(|status| status.raw() as u32)
+}
+
+/// Mode belongs to the referenced runtime File body, not to persistent filesystem metadata.
+pub(crate) unsafe fn set_file_mode(file_id: u64, requested: u32) -> Result<(), u32> {
+    let fs = mounted_namespace_fs()?.ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+    let status = fs.zw_set_information_file(file_id, nt_fs::FILE_MODE_INFORMATION,
+        &requested.to_le_bytes());
+    if status == nt_fs::STATUS_SUCCESS { Ok(()) } else { Err(status) }
+}
+
+pub(crate) unsafe fn acquire_file_io(
+    file_id: u64,
+    tid: u64,
+    mode: nt_io_completion::FileIoMode,
+) -> Result<nt_io_completion::FileIoAcquireResult, u32> {
+    mounted_namespace_fs()?.ok_or(nt_fs::STATUS_INVALID_HANDLE)?
+        .zw_acquire_file_io_with_mode(file_id, tid, mode)
+}
+
+pub(crate) unsafe fn adopt_file_io(file_id: u64, tid: u64) -> Result<(), u32> {
+    mounted_namespace_fs()?.ok_or(nt_fs::STATUS_INVALID_HANDLE)?.zw_adopt_file_io(file_id, tid)
+}
+
+pub(crate) unsafe fn release_file_io(file_id: u64, tid: u64) -> Result<u32, u32> {
+    let fs = mounted_namespace_fs()?.ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+    let result = fs.zw_release_file_io(file_id, tid).map(|release| release.waiters);
+    publish_file_cleanup_effects(fs);
+    result
+}
+
 pub(crate) unsafe fn file_io_waiter_count(file_id: u64) -> Result<u32, u32> {
     mounted_namespace_fs()?
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?

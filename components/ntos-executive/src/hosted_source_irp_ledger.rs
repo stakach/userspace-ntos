@@ -1,6 +1,8 @@
 //! Root-owned lifetime authority for driver-allocated and caller-projected source IRPs.
 
 use super::*;
+use nt_io_manager::pending_irp_graph::captured::{CapturedGraph, GraphRoles, PreparedInventory};
+use nt_io_manager::pending_irp_graph::GraphReleaseKind;
 use nt_io_manager::retained_query_path_forward::SourceIrpTicket;
 use nt_io_manager::source_irp_auxiliary::{
     SourceIrpAuxiliary, SourceIrpAuxiliaryError, SourceIrpAuxiliaryLedger, SourceIrpAuxiliaryPhase,
@@ -8,7 +10,12 @@ use nt_io_manager::source_irp_auxiliary::{
     SourcePoolAllocationIdentity,
 };
 use nt_io_manager::source_irp_ledger::{
-    SourceIrpAllocation, SourceIrpLedger, SourceIrpLedgerError, SourceIrpOwner, SourceIrpRetirement,
+    SourceIrpAllocation, SourceIrpForwardIdentity, SourceIrpLedger, SourceIrpLedgerError,
+    SourceIrpOwner, SourceIrpRetirement,
+    SourcePoolFreeAdmission,
+};
+use nt_io_manager::start_io_native_owner::{
+    PendingStartIoNodeIdentity, PendingStartIoQueueIdentity, StartIoAdmission,
 };
 
 static LOCK: AtomicU64 = AtomicU64::new(0);
@@ -16,13 +23,17 @@ static mut LEDGER: SourceIrpLedger = SourceIrpLedger::new();
 static mut AUXILIARY: SourceIrpAuxiliaryLedger = SourceIrpAuxiliaryLedger::new();
 static mut CALLER_PROJECTIONS: Option<Vec<CallerProjection>> = None;
 
-#[derive(Clone, Copy)]
 struct CallerProjection {
     ticket: SourceIrpTicket,
     allocation: SourceIrpAllocation,
     node: u64,
     node_generation: u64,
     canonical_irp_id: u64,
+    graph: CapturedGraph,
+    terminal_started: bool,
+    released_members: u16,
+    replacement: Option<SourcePoolAllocationIdentity>,
+    replacement_released: bool,
 }
 
 fn caller_projections() -> &'static mut Vec<CallerProjection> {
@@ -66,9 +77,13 @@ unsafe fn pool_range_identity_unlocked(
     if bytes == 0 || component_address < FSD_POOL_VADDR {
         return None;
     }
-    let used = read_volatile(inst.exec_pool_va as *const u64);
+    let used = hosted_pool_used(inst.exec_pool_va);
+    if used < POOL_DATA_OFF || used > FSD_POOL_FRAMES.checked_mul(0x1000)? {
+        return None;
+    }
     let offset = component_address.checked_sub(FSD_POOL_VADDR)?;
     let allocation = nt_io_manager::hosted_pool_range::walk_hosted_pool_allocation(
+        FSD_POOL_FRAMES * 0x1000,
         used,
         POOL_DATA_OFF,
         offset,
@@ -100,6 +115,50 @@ unsafe fn exact_pool_identity_unlocked(
     (identity.component_address == component_address).then_some(identity)
 }
 
+/// Capture constructor-owned graph members under the root pool lock, before the driver can
+/// mutate an IRP field or recycle an allocation address. A File slot has its own physical owner.
+unsafe fn capture_projected_graph_unlocked(
+    inst: DriverInstance,
+    source: SourceIrpAllocation,
+    entry: PendingIrp,
+) -> Option<PreparedInventory> {
+    if entry.owns_fo || entry.completion.completed().is_some() {
+        return None;
+    }
+    let pointers = entry.allocation_pointers();
+    let graph = entry.allocation_graph();
+    let mut members = [SourcePoolAllocationIdentity {
+        component_address: 0,
+        capacity: 0,
+        pool_generation: 0,
+    }; 10];
+    let mut count = 0;
+    for candidate in graph.allocations() {
+        if candidate.release_kind != GraphReleaseKind::Pool {
+            return None;
+        }
+        members[count] = exact_pool_identity_unlocked(inst, candidate.pointer, 1)?;
+        count += 1;
+    }
+    PreparedInventory::prepare(source, pointers, 0, &members[..count]).ok()
+}
+
+/// Caller-owned children are excluded from generic pool free while their captured physical
+/// generation remains live. The caller holds the source ledger and shared pool locks.
+unsafe fn caller_graph_protects_current_member_unlocked(
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    address: u64,
+) -> bool {
+    let Some(current) = pool_range_identity_unlocked(inst, address, 1) else {
+        return false;
+    };
+    caller_projections().iter().any(|row| {
+        row.allocation.domain == domain && (row.graph.protects_current_member(current)
+            || !row.replacement_released && row.replacement == Some(current))
+    })
+}
+
 unsafe fn mapped_memory_identity_unlocked(
     instance_index: usize,
     inst: DriverInstance,
@@ -107,7 +166,12 @@ unsafe fn mapped_memory_identity_unlocked(
     component_address: u64,
     bytes: u64,
 ) -> Option<SourceMemoryIdentity> {
-    if let Some(allocation) = pool_range_identity_unlocked(inst, component_address, bytes) {
+    // A pool address needs an exact live allocation identity. The generic window
+    // translation cannot establish allocation lifetime or generation.
+    if (FSD_POOL_VADDR..FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000)
+        .contains(&component_address)
+    {
+        let allocation = pool_range_identity_unlocked(inst, component_address, bytes)?;
         return Some(SourceMemoryIdentity::Pool {
             allocation,
             component_address,
@@ -145,6 +209,11 @@ unsafe fn memory_identity_matches_unlocked(
             bytes,
             exec_address,
         } => {
+            if (FSD_POOL_VADDR..FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000)
+                .contains(&component_address)
+            {
+                return false;
+            }
             component_to_exec_va_for_instance(instance_index, inst, component_address, bytes)
                 .or_else(|| {
                     hosted_driver_runtime_for_worker_component_range(
@@ -578,13 +647,13 @@ unsafe fn projected_registration(
     node: u64,
     canonical_irp_id: u64,
     raw_irp: u64,
-) -> Option<(SourceIrpAllocation, u64)> {
+) -> Option<(SourceIrpAllocation, u64, PendingIrp)> {
     let active = active_hosted_irp_transfer_mut(ch.shared_va, canonical_irp_id)?;
     if !ch.caps.dispatch_server
         || active.source_instance != instance_index
-        || read_volatile((inst.exec_shared_va + SH_REQ_CONTROL_ID) as *const u64)
+        || read_volatile((ch.shared_va + SH_REQ_CONTROL_ID) as *const u64)
             != canonical_irp_id
-        || read_volatile((inst.exec_shared_va + SH_ACTIVE_IRP) as *const u64) != raw_irp
+        || read_volatile((ch.shared_va + SH_ACTIVE_IRP) as *const u64) != raw_irp
     {
         return None;
     }
@@ -606,7 +675,7 @@ unsafe fn projected_registration(
         .checked_add((stack_count as u64).checked_mul(WDM_X64_IO_STACK_LOCATION_SIZE as u64)?)?;
     let mut allocation = allocation_unlocked(instance_index, inst, raw_irp, bytes, stack_count)?;
     allocation.owner = SourceIrpOwner::HostedCaller(instance_index);
-    Some((allocation, node_generation))
+    Some((allocation, node_generation, entry))
 }
 
 /// Allocation lifetime effects shared by authenticated ordinary and IRQ arena ingress.
@@ -626,9 +695,16 @@ pub(super) fn retire_allocation(
         return (STATUS_INVALID_HANDLE, 0, 0);
     }
     let _guard = lock();
+    let _projection_guard = match hosted_device_allocations::generic_free_admission(inst, component_address) {
+        Ok(guard) => guard,
+        Err(status) => return (status.raw(), 0, 0),
+    };
     let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
         return (STATUS_INVALID_HANDLE, 0, 0);
     };
+    if unsafe { caller_graph_protects_current_member_unlocked(inst, domain, component_address) } {
+        return (nt_status::NtStatus::PENDING.raw(), 0, 0);
+    }
     if op == 3
         && auxiliary().protected_pool_child(
             SourceIrpOwner::HostedDriver(instance_index),
@@ -638,21 +714,22 @@ pub(super) fn retire_allocation(
     {
         return (nt_status::NtStatus::PENDING.raw(), 0, 0);
     }
-    let owner = ledger().allocation_for(
-        SourceIrpOwner::HostedDriver(instance_index),
-        domain,
-        component_address,
-    );
-    let Some(owner) = owner else {
-        return if op == 3
-            && unsafe { hosted_instance_pool_allocation_is_free_unlocked(inst, component_address) }
-                == Some(false)
-            && unsafe { hosted_instance_pool_free_unlocked(inst, component_address) }
-        {
-            (STATUS_SUCCESS, 0, 0)
-        } else {
-            (STATUS_INVALID_HANDLE, 0, 0)
-        };
+    let owner = match ledger().pool_free_admission(instance_index, domain, component_address) {
+        Ok(SourcePoolFreeAdmission::Unregistered) => {
+            return if op == 3
+                && unsafe { hosted_instance_pool_allocation_is_free_unlocked(inst, component_address) }
+                    == Some(false)
+                && unsafe { hosted_instance_pool_free_unlocked(inst, component_address) }
+            {
+                (STATUS_SUCCESS, 0, 0)
+            } else {
+                (STATUS_INVALID_HANDLE, 0, 0)
+            };
+        }
+        Ok(SourcePoolFreeAdmission::DriverOwned(owner)) => owner,
+        Ok(SourcePoolFreeAdmission::Protected(_)) | Err(_) => {
+            return (STATUS_INVALID_HANDLE, 0, 0);
+        }
     };
     if allocation_unlocked(instance_index, inst, component_address, owner.bytes, owner.stack_count)
         != Some(owner)
@@ -684,9 +761,7 @@ pub(super) fn retire_allocation(
             (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get())
         }
         Ok(SourceIrpRetirement::Deferred(ticket)) => (
-            nt_status::NtStatus::PENDING.raw(),
-            ticket.id.get(),
-            ticket.generation.get(),
+            nt_status::NtStatus::PENDING.raw(), ticket.id.get(), ticket.generation.get(),
         ),
         Err(SourceIrpLedgerError::Pinned) => (nt_status::NtStatus::DELETE_PENDING.raw(), 0, 0),
         Err(_) => (STATUS_INVALID_HANDLE, 0, 0),
@@ -827,8 +902,13 @@ pub(super) fn service(
             else {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             };
-            let Some((allocation, node_generation)) = (unsafe {
+            let Some((allocation, node_generation, entry)) = (unsafe {
                 projected_registration(instance_index, inst, ch, node, canonical_irp_id, raw_irp)
+            }) else {
+                return (STATUS_INVALID_PARAMETER, 0, 0);
+            };
+            let Some(prepared_graph) = (unsafe {
+                capture_projected_graph_unlocked(inst, allocation, entry)
             }) else {
                 return (STATUS_INVALID_PARAMETER, 0, 0);
             };
@@ -859,40 +939,121 @@ pub(super) fn service(
                 }
                 Err(_) => return (STATUS_INVALID_PARAMETER, 0, 0),
             };
+            let source = SourceIrpForwardIdentity::new(ticket, allocation)
+                .expect("issued caller ticket lost its physical source");
+            let graph = prepared_graph.bind(source)
+                .expect("issued caller ticket changed the prepared graph source");
             caller_projections().push(CallerProjection {
                 ticket,
                 allocation,
                 node,
                 node_generation,
                 canonical_irp_id,
+                graph,
+                terminal_started: false,
+                released_members: 0,
+                replacement: None,
+                replacement_released: false,
             });
+            unsafe { active_hosted_irp_transfer_mut(ch.shared_va, canonical_irp_id) }
+                .expect("registered caller source lost its active dispatch")
+                .source_registered = true;
             (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get())
         }
-        7 | 8 => {
+        11 => {
+            // An op6 ticket exists for every projected caller IRP. Only a live physical
+            // forward/StartIo pin requires the inline terminal to use READY publication.
+            let node = component_address;
+            let canonical_irp_id = bytes;
+            let raw_irp = stack_count;
+            let _guard = lock();
+            let Some(row) = caller_projections().iter().find(|row| {
+                row.node == node
+                    && row.canonical_irp_id == canonical_irp_id
+                    && row.allocation.component_address == raw_irp
+                    && row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index)
+            }) else {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            };
+            let node_generation = row.node_generation;
+            let ticket = row.ticket;
+            let allocation = row.allocation;
+            let Some((_, entry)) = (unsafe {
+                projected_node(
+                    instance_index,
+                    node,
+                    canonical_irp_id,
+                    raw_irp,
+                    HOSTED_IRP_COMPLETED_DISPATCH,
+                    Some(node_generation),
+                )
+            }) else {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            };
+            if entry.source_ticket_id != ticket.id.get()
+                || entry.source_ticket_generation != ticket.generation.get()
+            {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            }
+            match ledger().retirement_ready(ticket, allocation) {
+                Ok(()) => (STATUS_SUCCESS, 0, 0),
+                Err(SourceIrpLedgerError::Pinned) => (STATUS_SUCCESS, 1, 0),
+                Err(_) => (STATUS_INVALID_HANDLE, 0, 0),
+            }
+        }
+        7 | 8 | 9 | 10 => {
             let Some(domain) = instance_domain_identity(inst) else {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             };
             let Some(ticket) = SourceIrpTicket::new(domain, component_address, bytes) else {
                 return (STATUS_INVALID_PARAMETER, 0, 0);
             };
-            let raw_irp = stack_count;
+            // The committed StartIo path holds FIRST_PACKET_LOCK across its local WDM write
+            // and row publication, then takes the hosted pool lock. Acquire in that same order
+            // before this op7 terminal observation so neither path can see a half publication.
+            let _first_packet_guard = (op == 7).then(hosted_start_io::lock_first_packets);
             let _guard = lock();
-            let Some(row) = caller_projections()
+            let member_index = if op == 9 {
+                let Ok(index) = usize::try_from(stack_count) else {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                };
+                index
+            } else {
+                0
+            };
+            let (raw_irp, member_address) = if op == 9 {
+                let Some(row) = caller_projections().iter().find(|row| row.ticket == ticket) else {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                };
+                let Some(member) = row.graph.initial_members().get(member_index) else {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                };
+                (row.allocation.component_address, member.allocation.component_address)
+            } else if op == 10 {
+                let Some(row) = caller_projections().iter().find(|row| row.ticket == ticket) else {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                };
+                (row.allocation.component_address, stack_count)
+            } else {
+                (stack_count, stack_count)
+            };
+            let Some((row_owner, row_node, row_canonical_irp_id, row_generation, source_allocation)) = caller_projections()
                 .iter()
                 .find(|row| row.ticket == ticket && row.allocation.component_address == raw_irp)
-                .copied()
+                .map(|row| (row.allocation.owner, row.node, row.canonical_irp_id,
+                    row.node_generation, row.allocation))
             else {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             };
-            if row.allocation.owner != SourceIrpOwner::HostedCaller(instance_index)
+            if row_owner != SourceIrpOwner::HostedCaller(instance_index)
                 || unsafe {
                     projected_node(
                         instance_index,
-                        row.node,
-                        row.canonical_irp_id,
+                        row_node,
+                        row_canonical_irp_id,
                         raw_irp,
                         HOSTED_IRP_CONSUMING,
-                        Some(row.node_generation),
+                        Some(row_generation),
                     )
                 }
                 .is_none_or(|(_, entry)| {
@@ -902,6 +1063,36 @@ pub(super) fn service(
             {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             }
+            let completion = if op == 7 {
+                unsafe {
+                    projected_node(instance_index, row_node, row_canonical_irp_id, raw_irp,
+                        HOSTED_IRP_CONSUMING, Some(row_generation))
+                }.and_then(|(_, entry)| entry.completion.completed())
+            } else {
+                None
+            };
+            let replacement_address = if op == 7 {
+                completion.map(|completion| completion.reclaim).filter(|reclaim| {
+                    *reclaim != 0 && !caller_projections().iter().any(|row|
+                        row.ticket == ticket && row.graph.initial_members().iter().any(|member|
+                            member.allocation.component_address == *reclaim))
+                })
+            } else {
+                None
+            };
+            let free_address = if op == 9 || op == 10 {
+                Some(member_address)
+            } else {
+                replacement_address
+            };
+            let _projection_guard = if let Some(address) = free_address {
+                match hosted_device_allocations::generic_free_admission(inst, address) {
+                    Ok(guard) => Some(guard),
+                    Err(status) => return (status.raw(), 0, 0),
+                }
+            } else {
+                None
+            };
             let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) })
             else {
                 return (STATUS_INVALID_HANDLE, 0, 0);
@@ -911,28 +1102,127 @@ pub(super) fn service(
                     instance_index,
                     inst,
                     raw_irp,
-                    row.allocation.bytes,
-                    row.allocation.stack_count,
+                    source_allocation.bytes,
+                    source_allocation.stack_count,
                 );
                 if let Some(allocation) = current.as_mut() {
                     allocation.owner = SourceIrpOwner::HostedCaller(instance_index);
                 }
-                if current != Some(row.allocation) {
+                if current != Some(source_allocation) {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 }
-                match ledger().begin_hosted_caller_retirement(ticket, row.allocation) {
-                    Ok(()) => (STATUS_SUCCESS, 0, 0),
+                let Some(completion) = completion else { return (STATUS_INVALID_HANDLE, 0, 0); };
+                let replacement = if completion.reclaim == 0 {
+                    None
+                } else {
+                    if completion.flags & IRP_DEALLOCATE_BUFFER == 0 {
+                        return (STATUS_INVALID_HANDLE, 0, 0);
+                    }
+                    let original = caller_projections().iter().find(|row| row.ticket == ticket)
+                        .and_then(|row| row.graph.initial_members().iter().copied().find(|member|
+                            member.allocation.component_address == completion.reclaim));
+                    if let Some(member) = original {
+                        if !member.roles.intersects(GraphRoles::DATA | GraphRoles::AUX_DATA)
+                            || unsafe { exact_pool_identity_unlocked(inst, completion.reclaim, 1) }
+                                != Some(member.allocation)
+                        {
+                            return (STATUS_INVALID_HANDLE, 0, 0);
+                        }
+                        None
+                    } else {
+                        let reclaim = completion.reclaim;
+                        if ledger().pool_free_admission(instance_index, domain, reclaim)
+                            != Ok(SourcePoolFreeAdmission::Unregistered)
+                            || auxiliary().owns_pool_child_in_domain(domain, reclaim)
+                            || unsafe { caller_graph_protects_current_member_unlocked(inst, domain, reclaim) }
+                            || caller_projections().iter().any(|candidate|
+                                candidate.allocation.domain == domain
+                                    && candidate.replacement.is_some_and(|identity|
+                                        identity.component_address == reclaim))
+                        {
+                            return (STATUS_INVALID_HANDLE, 0, 0);
+                        }
+                        Some(match unsafe { exact_pool_identity_unlocked(inst, reclaim, 1) } {
+                            Some(identity) => identity,
+                            None => return (STATUS_INVALID_HANDLE, 0, 0),
+                        })
+                    }
+                };
+                let Some(observed) = PendingStartIoNodeIdentity::new(
+                    row_node, row_generation, row_canonical_irp_id, raw_irp, ticket,
+                ) else { return (STATUS_INVALID_HANDLE, 0, 0); };
+                if hosted_start_io::observe_terminal_before_retirement(ledger(), observed).is_err() {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                }
+                match ledger().begin_hosted_caller_retirement(ticket, source_allocation) {
+                    Ok(()) => {
+                        let row = caller_projections().iter_mut()
+                            .find(|candidate| candidate.ticket == ticket)
+                            .expect("entered caller projection");
+                        row.replacement = replacement;
+                        row.terminal_started = true;
+                        (STATUS_SUCCESS, row.graph.initial_members().len() as u64,
+                            row.replacement.map_or(0, |identity| identity.component_address))
+                    }
                     Err(SourceIrpLedgerError::Pinned) => {
                         (nt_status::NtStatus::DELETE_PENDING.raw(), 0, 0)
                     }
                     Err(_) => (STATUS_INVALID_HANDLE, 0, 0),
                 }
+            } else if op == 9 {
+                let Some(row) = caller_projections().iter_mut().find(|candidate| {
+                    candidate.ticket == ticket && candidate.allocation.component_address == raw_irp
+                }) else { return (STATUS_INVALID_HANDLE, 0, 0); };
+                if !row.terminal_started {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                }
+                // The ticket and index select one immutable captured member. The
+                // native caller cannot substitute a completion-time graph address.
+                let Some(member) = row.graph.initial_members().get(member_index).copied()
+                else { return (STATUS_INVALID_HANDLE, 0, 0); };
+                let bit = 1u16 << member_index;
+                if row.released_members & bit != 0
+                    || unsafe { exact_pool_identity_unlocked(inst, member_address, 1) }
+                        != Some(member.allocation)
+                {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                }
+                row.released_members |= bit; // record ownership before the physical effect
+                if !unsafe { hosted_instance_pool_free_unlocked(inst, member_address) } {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                }
+                (STATUS_SUCCESS, 0, 0)
+            } else if op == 10 {
+                let Some(row) = caller_projections().iter_mut().find(|candidate| {
+                    candidate.ticket == ticket && candidate.allocation.component_address == raw_irp
+                }) else { return (STATUS_INVALID_HANDLE, 0, 0); };
+                let Some(replacement) = row.replacement else { return (STATUS_INVALID_HANDLE, 0, 0); };
+                if !row.terminal_started || row.replacement_released
+                    || replacement.component_address != member_address
+                    || unsafe { exact_pool_identity_unlocked(inst, member_address, 1) } != Some(replacement)
+                {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                }
+                row.replacement_released = true; // terminal ownership before physical effect
+                if !unsafe { hosted_instance_pool_free_unlocked(inst, member_address) } {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                }
+                (STATUS_SUCCESS, 0, 0)
             } else {
-                if unsafe { hosted_instance_pool_allocation_is_free_unlocked(inst, raw_irp) }
-                    != Some(true)
-                    || ledger()
-                        .finish_hosted_caller_retirement(ticket, row.allocation)
-                        .is_err()
+                let Some(row) = caller_projections().iter().find(|candidate| candidate.ticket == ticket)
+                else { return (STATUS_INVALID_HANDLE, 0, 0); };
+                if !row.terminal_started
+                    || row.released_members != (1u16 << row.graph.initial_members().len()) - 1
+                    || row.replacement.is_some() && !row.replacement_released
+                {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                }
+                // Each op9 result settled under this lock with the exact captured
+                // generation. The pool may have reused the source address meanwhile;
+                // its current free-list state is no longer the old owner's proof.
+                if ledger()
+                    .finish_hosted_caller_retirement(ticket, row.allocation)
+                    .is_err()
                 {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 }
@@ -946,6 +1236,335 @@ pub(super) fn service(
         }
         _ => (STATUS_INVALID_PARAMETER, 0, 0),
     }
+}
+
+/// Admit only an op6-published caller packet. This obtains real source and device pins, but it
+/// does not enqueue the packet or authorize a callback. The native StartIo adapter must recheck
+/// the node phase while it owns the physical queue lock before its eventual local WDM commit.
+pub(super) fn admit_projected_start_io_packet(
+    instance_index: usize,
+    inst: DriverInstance,
+    observed: PendingStartIoNodeIdentity,
+    dispatch_device: nt_io_manager::HostedDevicePointerRegistration,
+) -> Result<StartIoAdmission, i32> {
+    let _source_guard = lock();
+    let _pool_guard = unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }
+        .ok_or(STATUS_INVALID_HANDLE)?;
+    let (generation, entry) = unsafe {
+        projected_node(
+            instance_index,
+            observed.node,
+            observed.canonical_irp_id,
+            observed.raw_irp,
+            HOSTED_IRP_DISPATCHING,
+            Some(observed.generation),
+        )
+    }
+    .ok_or(STATUS_INVALID_HANDLE)?;
+    if generation != observed.generation
+        || entry.source_ticket_id != observed.source.id.get()
+        || entry.source_ticket_generation != observed.source.generation.get()
+    {
+        return Err(STATUS_INVALID_HANDLE);
+    }
+    let source = caller_projections()
+        .iter()
+        .find(|row| {
+            row.node == observed.node
+                && row.node_generation == observed.generation
+                && row.canonical_irp_id == observed.canonical_irp_id
+                && row.ticket == observed.source
+                && row.allocation.component_address == observed.raw_irp
+                && row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index)
+                && !row.terminal_started
+        })
+        .map(|row| row.allocation)
+        .ok_or(STATUS_INVALID_HANDLE)?;
+    let mut physical = allocation_unlocked(
+        instance_index,
+        inst,
+        source.component_address,
+        source.bytes,
+        source.stack_count,
+    )
+    .ok_or(STATUS_INVALID_HANDLE)?;
+    physical.owner = SourceIrpOwner::HostedCaller(instance_index);
+    if physical != source {
+        return Err(STATUS_INVALID_HANDLE);
+    }
+    let registered = PendingStartIoQueueIdentity::new(observed, dispatch_device)
+        .ok_or(STATUS_INVALID_HANDLE)?;
+    StartIoAdmission::acquire_projected(
+        io_manager_mut(),
+        ledger(),
+        source,
+        registered,
+        observed,
+        dispatch_device,
+    )
+    .map_err(|_| STATUS_INVALID_HANDLE)
+}
+
+/// Reconstruct the component's packet observation from the root-issued op6 row. The caller's
+/// node address is only a selector; its ticket, generation and canonical ID come from this row
+/// and are revalidated by `admit_projected_start_io_packet` before any queue effect.
+pub(super) fn observed_projected_start_io_packet(
+    instance_index: usize,
+    node: u64,
+    raw_irp: u64,
+) -> Option<PendingStartIoNodeIdentity> {
+    let _guard = lock();
+    let row = caller_projections().iter().find(|row| {
+        row.node == node
+            && row.allocation.component_address == raw_irp
+            && row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index)
+            && !row.terminal_started
+    })?;
+    let (generation, entry) = unsafe {
+        projected_node(
+            instance_index,
+            row.node,
+            row.canonical_irp_id,
+            raw_irp,
+            HOSTED_IRP_DISPATCHING,
+            Some(row.node_generation),
+        )
+    }?;
+    if entry.source_ticket_id != row.ticket.id.get()
+        || entry.source_ticket_generation != row.ticket.generation.get()
+    {
+        return None;
+    }
+    PendingStartIoNodeIdentity::new(
+        node,
+        generation,
+        row.canonical_irp_id,
+        raw_irp,
+        row.ticket,
+    )
+}
+
+/// Prove that a native lower-edge call still belongs to the exact active caller projection.
+/// The op6 row and live node generation prevent a recycled raw IRP address from consuming a
+/// staged provider terminal belonging to an earlier dispatch.
+pub(super) fn active_caller_projection_matches(
+    instance_index: usize,
+    canonical_irp_id: u64,
+    raw_irp: u64,
+    expected_minor: u8,
+) -> bool {
+    let _guard = lock();
+    let Some(row) = caller_projections().iter().find(|row| {
+        row.canonical_irp_id == canonical_irp_id
+            && row.allocation.component_address == raw_irp
+            && row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index)
+            && !row.terminal_started
+    }) else {
+        return false;
+    };
+    unsafe {
+        projected_node(
+            instance_index,
+            row.node,
+            canonical_irp_id,
+            raw_irp,
+            HOSTED_IRP_DISPATCHING,
+            Some(row.node_generation),
+        )
+        .is_some_and(|(_, entry)| {
+            entry.major == major::IRP_MJ_PNP
+                && entry.minor == expected_minor
+                && entry.source_ticket_id == row.ticket.id.get()
+                && entry.source_ticket_generation == row.ticket.generation.get()
+        })
+    }
+}
+
+/// Resolve the exact canonical outer IRP while its source packet is still in the
+/// caller's entered dispatch. A raw IRP address or FileId alone cannot identify
+/// this owner after node or pool reuse.
+pub(super) fn active_caller_file_lifecycle_outer(
+    instance_index: usize,
+    ticket: SourceIrpTicket,
+    allocation: SourceIrpAllocation,
+    major: u8,
+    file: nt_io_manager::FileId,
+) -> Option<nt_io_manager::IrpId> {
+    if !matches!(major, major::IRP_MJ_CREATE | major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE)
+        || allocation.owner != SourceIrpOwner::HostedCaller(instance_index)
+    {
+        return None;
+    }
+    let _guard = lock();
+    let row = caller_projections().iter().find(|row| {
+        row.ticket == ticket && row.allocation == allocation && !row.terminal_started
+    })?;
+    let (_, entry) = unsafe {
+        projected_node(
+            instance_index,
+            row.node,
+            row.canonical_irp_id,
+            allocation.component_address,
+            HOSTED_IRP_DISPATCHING,
+            Some(row.node_generation),
+        )
+    }?;
+    if entry.major != major
+        || entry.canonical_file_id != file.0
+        || entry.source_ticket_id != ticket.id.get()
+        || entry.source_ticket_generation != ticket.generation.get()
+        || entry.completion.completed().is_some()
+    {
+        return None;
+    }
+    Some(nt_io_manager::IrpId(row.canonical_irp_id))
+}
+
+/// Bind a nested internal-control lower call to the exact FSD caller packet currently inside
+/// its class MajorFunction. The canonical id, op6 ticket, pending-node generation and raw IRP
+/// must all match; a same-shaped packet at a recycled address cannot borrow this authority.
+pub(super) fn active_caller_internal_control_matches(
+    instance_index: usize,
+    canonical_irp_id: u64,
+    raw_irp: u64,
+    ticket: SourceIrpTicket,
+    allocation: SourceIrpAllocation,
+) -> bool {
+    let _guard = lock();
+    let Some(row) = caller_projections().iter().find(|row| {
+        row.canonical_irp_id == canonical_irp_id
+            && row.allocation.component_address == raw_irp
+            && row.allocation == allocation
+            && row.ticket == ticket
+            && row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index)
+            && !row.terminal_started
+    }) else {
+        return false;
+    };
+    unsafe {
+        projected_node(
+            instance_index,
+            row.node,
+            canonical_irp_id,
+            raw_irp,
+            HOSTED_IRP_DISPATCHING,
+            Some(row.node_generation),
+        )
+        .is_some_and(|(_, entry)| {
+            entry.major == major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+                && entry.control_method == nt_io_abi::ioctl::METHOD_NEITHER as u8
+                && entry.source_ticket_id == ticket.id.get()
+                && entry.source_ticket_generation == ticket.generation.get()
+                && entry.completion.completed().is_none()
+        })
+    }
+}
+
+/// Final physical node check for the StartIo queue commit. The caller already owns the exact
+/// source pin and hosted pool guard; no source-ledger lock may be taken in this order.
+pub(super) unsafe fn projected_start_io_node_matches_locked(
+    instance_index: usize,
+    observed: PendingStartIoNodeIdentity,
+    terminal_ready: bool,
+) -> bool {
+    let kinds: &[u64] = if terminal_ready {
+        &[HOSTED_IRP_READY, HOSTED_IRP_PUBLISHED]
+    } else {
+        &[HOSTED_IRP_DISPATCHING]
+    };
+    kinds.iter().any(|&kind| projected_node(
+        instance_index, observed.node, observed.canonical_irp_id, observed.raw_irp,
+        kind, Some(observed.generation),
+    ).is_some_and(|(_, entry)| {
+        entry.source_ticket_id == observed.source.id.get()
+            && entry.source_ticket_generation == observed.source.generation.get()
+            && (!terminal_ready || entry.completion.completed().is_some())
+    }))
+}
+
+/// A linked packet may be selected only while its exact caller node is still dispatching or
+/// pending. READY/COMPLETED means another path ended this source before WDM dequeue.
+pub(super) unsafe fn projected_start_io_queued_node_matches_locked(
+    instance_index: usize,
+    observed: PendingStartIoNodeIdentity,
+) -> bool {
+    [HOSTED_IRP_DISPATCHING, HOSTED_IRP_PENDING].iter().any(|&kind| {
+        projected_node(instance_index, observed.node, observed.canonical_irp_id,
+            observed.raw_irp, kind, Some(observed.generation))
+            .is_some_and(|(_, entry)| {
+                entry.source_ticket_id == observed.source.id.get()
+                    && entry.source_ticket_generation == observed.source.generation.get()
+                    && entry.completion.completed().is_none()
+            })
+    })
+}
+
+/// A current packet may be withdrawn by Next before terminal completion. Its retained source
+/// pin keeps the physical allocation alive; the exact pending generation is still checked under
+/// the caller's FIRST→source→pool lock chain.
+pub(super) unsafe fn projected_start_io_live_node_matches_locked(
+    instance_index: usize,
+    observed: PendingStartIoNodeIdentity,
+) -> bool {
+    [HOSTED_IRP_DISPATCHING, HOSTED_IRP_PENDING].iter().any(|&kind| {
+        projected_node(instance_index, observed.node, observed.canonical_irp_id,
+            observed.raw_irp, kind, Some(observed.generation))
+            .is_some_and(|(_, entry)| {
+                entry.source_ticket_id == observed.source.id.get()
+                    && entry.source_ticket_generation == observed.source.generation.get()
+                    && entry.completion.completed().is_none()
+            })
+    })
+}
+
+pub(super) unsafe fn projected_start_io_copying_node_matches_locked(
+    instance_index: usize,
+    observed: PendingStartIoNodeIdentity,
+) -> bool {
+    projected_node(instance_index, observed.node, observed.canonical_irp_id,
+        observed.raw_irp, HOSTED_IRP_COPYING, Some(observed.generation))
+        .is_some_and(|(_, entry)| {
+            entry.source_ticket_id == observed.source.id.get()
+                && entry.source_ticket_generation == observed.source.generation.get()
+                && entry.completion.completed().is_some()
+        })
+}
+
+pub(super) fn projected_start_io_terminal_ready(
+    instance_index: usize,
+    observed: PendingStartIoNodeIdentity,
+) -> bool {
+    let _guard = lock();
+    caller_projections().iter().any(|row| {
+        row.node == observed.node
+            && row.node_generation == observed.generation
+            && row.canonical_irp_id == observed.canonical_irp_id
+            && row.ticket == observed.source
+            && row.allocation.component_address == observed.raw_irp
+            && row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index)
+            && !row.terminal_started
+    }) && unsafe { projected_start_io_node_matches_locked(instance_index, observed, true) }
+}
+
+/// Checked no-effect release. A failed device release leaves the source pin held; callers retain
+/// both values and retry only this local release, never a WDM queue effect or foreign Reply.
+pub(super) fn release_projected_start_io_packet(
+    registration: nt_io_manager::HostedDevicePointerRegistration,
+    identity: SourceIrpForwardIdentity,
+    device: &mut nt_io_manager::HostedDeviceProjectionReference,
+    source: &mut nt_io_manager::start_io_native_owner::StartIoSourcePin,
+) -> Result<(), i32> {
+    let _guard = lock();
+    if device.registration() != registration
+        || source.identity() != identity
+        || !ledger().admits_forward(identity.ticket(), identity.allocation())
+    {
+        return Err(STATUS_INVALID_HANDLE);
+    }
+    if device.is_held() {
+        device.release(io_manager_mut()).map_err(|status| status.raw())?;
+    }
+    source.release(ledger()).map_err(|_| STATUS_INVALID_HANDLE)
 }
 
 pub(super) fn pin(
@@ -1005,6 +1624,7 @@ pub(super) fn matches(
         SourceIrpOwner::HostedDriver(instance) | SourceIrpOwner::HostedCaller(instance)
             if instance == instance_index
     ) || !ledger().matches(owner.owner, owner, ticket)
+        || !ledger().admits_forward(ticket, owner)
     {
         return false;
     }
@@ -1048,6 +1668,139 @@ pub(super) fn mdl_release_allowed(
 pub(super) fn unpin(ticket: SourceIrpTicket) -> bool {
     let _guard = lock();
     ledger().unpin(ticket).is_ok()
+}
+
+unsafe fn caller_terminal_ready_unlocked(ticket: SourceIrpTicket, allocation: SourceIrpAllocation) -> bool {
+    let SourceIrpOwner::HostedCaller(instance_index) = allocation.owner else { return false; };
+    let Some(inst) = instance(instance_index) else { return false; };
+    if instance_domain_identity(inst) != Some(allocation.domain) { return false; }
+    let mut current = allocation_unlocked(instance_index, inst, allocation.component_address,
+        allocation.bytes, allocation.stack_count);
+    if let Some(current) = current.as_mut() { current.owner = allocation.owner; }
+    if current != Some(allocation) { return false; }
+    let Some((node, canonical_irp_id, node_generation)) = caller_projections().iter()
+        .find(|row| row.ticket == ticket && row.allocation == allocation)
+        .map(|row| (row.node, row.canonical_irp_id, row.node_generation))
+    else { return false; };
+    if !ledger().admits_forward(ticket, allocation) { return false; }
+    [HOSTED_IRP_COMPLETED_DISPATCH, HOSTED_IRP_COMPLETED_CANCEL, HOSTED_IRP_READY,
+        HOSTED_IRP_PUBLISHED, HOSTED_IRP_COPYING, HOSTED_IRP_CONSUMING].iter().any(|kind| {
+        projected_node(instance_index, node, canonical_irp_id,
+            allocation.component_address, *kind, Some(node_generation))
+            .is_some_and(|(_, entry)| entry.source_ticket_id == ticket.id.get()
+                && entry.source_ticket_generation == ticket.generation.get()
+                && entry.completion.completed().is_some())
+    })
+}
+
+pub(super) fn caller_terminal_ready(ticket: SourceIrpTicket, allocation: SourceIrpAllocation) -> bool {
+    let _guard = lock();
+    let SourceIrpOwner::HostedCaller(index) = allocation.owner else { return false; };
+    let Some(inst) = instance(index) else { return false; };
+    if instance_domain_identity(inst) != Some(allocation.domain) { return false; }
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else { return false; };
+    unsafe { caller_terminal_ready_unlocked(ticket, allocation) }
+}
+
+/// Keep the original canonical consumer out of graph retirement while a forwarding owner is live.
+pub(super) fn caller_completion_publishable(
+    instance_index: usize, node: u64, node_generation: u64, canonical_irp_id: u64,
+    raw_irp: u64, ticket_id: u64, ticket_generation: u64,
+) -> bool {
+    // First packet publication and callback-return ACK use FIRST before the source and pool
+    // locks. A READY claim remains component-owned while this exact terminal observation runs.
+    let _first_packet_guard = hosted_start_io::lock_first_packets();
+    let _guard = lock();
+    let Some(inst) = instance(instance_index) else { return false; };
+    let Some(domain) = instance_domain_identity(inst) else { return false; };
+    if ticket_id == 0 && ticket_generation == 0 {
+        return !caller_projections().iter().any(|row|
+            row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index)
+                && row.allocation.domain == domain
+                && (row.node == node || row.allocation.component_address == raw_irp));
+    }
+    let Some(ticket) = SourceIrpTicket::new(domain, ticket_id, ticket_generation) else { return false; };
+    let Some(row_allocation) = caller_projections().iter().find(|row|
+        row.ticket == ticket && row.node == node && row.node_generation == node_generation
+            && row.canonical_irp_id == canonical_irp_id && row.allocation.component_address == raw_irp
+            && row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index))
+        .map(|row| row.allocation)
+    else { return false; };
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
+        return false;
+    };
+    let valid_ready = unsafe {
+        projected_node(instance_index, node, canonical_irp_id, raw_irp,
+            HOSTED_IRP_COPYING, Some(node_generation))
+    }.is_some_and(|(_, entry)| {
+        entry.source_ticket_id == ticket_id
+            && entry.source_ticket_generation == ticket_generation
+            && entry.completion.completed().is_some()
+    });
+    if !valid_ready || !unsafe { caller_terminal_ready_unlocked(ticket, row_allocation) } {
+        return false;
+    }
+    let Some(observed) = PendingStartIoNodeIdentity::new(
+        node, node_generation, canonical_irp_id, raw_irp, ticket,
+    ) else { return false; };
+    // An active DriverStartIo callback retains its only physical source guard. The exact
+    // completion remains READY and the next poll retries after callback-return ACK.
+    let queued = match hosted_start_io::settle_queued_terminal_locked(
+        ledger(), instance_index, inst, observed,
+    ) {
+        Ok(queued) => queued,
+        Err(_) => return false,
+    };
+    if !queued && hosted_start_io::observe_terminal_before_retirement(ledger(), observed).is_err() {
+        return false;
+    }
+    ledger().retirement_ready(ticket, row_allocation).is_ok()
+}
+
+/// The pool lock is acquired before releasing any pin. A lock refusal has no ownership effect.
+/// Driver free is local under both locks; any failure after the final claim is nonreplayable.
+pub(super) fn release_pending_terminal(ticket: SourceIrpTicket, allocation: SourceIrpAllocation) -> bool {
+    let _guard = lock();
+    let index = match allocation.owner {
+        SourceIrpOwner::HostedDriver(index) | SourceIrpOwner::HostedCaller(index) => index,
+        SourceIrpOwner::Win32k => return false,
+    };
+    let Some(inst) = instance(index) else { return false; };
+    if instance_domain_identity(inst) != Some(allocation.domain) { return false; }
+    let Ok(_projection_guard) = hosted_device_allocations::generic_free_admission(
+        inst, allocation.component_address,
+    ) else { return false; };
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else { return false; };
+    let mut current = allocation_unlocked(index, inst, allocation.component_address,
+        allocation.bytes, allocation.stack_count);
+    if let Some(current) = current.as_mut() { current.owner = allocation.owner; }
+    if current != Some(allocation) { return false; }
+    if matches!(allocation.owner, SourceIrpOwner::HostedCaller(_)) {
+        if !unsafe { caller_terminal_ready_unlocked(ticket, allocation) } { return false; }
+        return ledger().release_hosted_caller_terminal_pin(ticket, allocation).is_ok();
+    }
+    match auxiliary().snapshot(ticket, allocation) {
+        Ok((owner, phase)) if unsafe { auxiliary_matches_unlocked(index, inst, owner, phase) } => {}
+        Err(SourceIrpAuxiliaryError::NotFound) => {}
+        _ => return false,
+    }
+    match ledger().begin_deferred_driver_retirement(ticket, allocation) {
+        Ok(SourceIrpRetirement::Deferred(_)) => return true,
+        Ok(SourceIrpRetirement::Retired(exact)) if exact == ticket => {}
+        _ => return false,
+    }
+    if !unsafe { hosted_instance_pool_free_unlocked(inst, allocation.component_address) }
+        || ledger().retire(ticket, allocation).is_err()
+    {
+        unsafe { crate::provider_bugcheck::report(0xc4,
+            [FSD_SERVICE_SOURCE_IRP_LABEL, 2, allocation.component_address, ticket.id.get()]); }
+    }
+    match auxiliary().retire(ticket, allocation) {
+        Ok(_) | Err(SourceIrpAuxiliaryError::NotFound) => {}
+        Err(_) => unsafe { crate::provider_bugcheck::report(0xc4,
+            [FSD_SERVICE_SOURCE_IRP_LABEL, 6, allocation.component_address, ticket.id.get()]); },
+    }
+    true
 }
 
 pub(super) fn arm_deferred_free(ticket: SourceIrpTicket) -> bool {

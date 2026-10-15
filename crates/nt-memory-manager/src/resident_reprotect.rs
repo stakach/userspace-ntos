@@ -2,7 +2,7 @@ use crate::{
     ClientFrameRecord, ClientFrameRegistry, MemoryLifetime, ProcessIdentity, STATUS_INVALID_HANDLE,
 };
 
-/// Distinguish a nonresident page from a frame retained by another process generation.
+/// Distinguish an absent page from a frame retained for another lifetime or reclamation.
 pub fn admit_resident_reprotect(
     pi: u64,
     process: ProcessIdentity,
@@ -13,7 +13,9 @@ pub fn admit_resident_reprotect(
         return Err(STATUS_INVALID_HANDLE);
     }
     match frames.get(pi, page) {
-        Some(record) if record.lifetime != MemoryLifetime::Process(process) => {
+        Some(record)
+            if record.lifetime != MemoryLifetime::Process(process) || !record.is_resident() =>
+        {
             Err(STATUS_INVALID_HANDLE)
         }
         record => Ok(record),

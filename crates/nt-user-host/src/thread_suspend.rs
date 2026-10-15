@@ -246,6 +246,31 @@ impl<R: Copy + Eq> ThreadSuspendOwner<R> {
         Ok(())
     }
 
+    /// Certify that this exact owner remains never-started after a settled construction failure.
+    /// Dormant alone is insufficient: an acknowledged or uncertain Start retains that state
+    /// until its local commit finishes. This check neither cancels ownership nor invokes IPC.
+    pub fn validate_unstarted_idle(
+        &self,
+        pm: &ProcessManager,
+        binding: ThreadBinding<R>,
+        lifetime: ThreadLifetime,
+    ) -> Result<(), ThreadSuspendError> {
+        self.validate_owner(pm, binding, lifetime)?;
+        if self.pending.is_some() || pm.has_thread_suspend_control(lifetime.thread_id()) {
+            return Err(ThreadSuspendError::Busy);
+        }
+        if self.state != ThreadExecutionState::Dormant
+            || pm
+                .thread(lifetime.thread_id())
+                .ok_or(ThreadSuspendError::OwnerChanged)?
+                .suspend_count
+                != 0
+        {
+            return Err(ThreadSuspendError::InconsistentState);
+        }
+        Ok(())
+    }
+
     /// Reserve PM count admission before native entry. Even local/nested changes remain retained
     /// until finish. Validate physical/count consistency before creating the reservation.
     pub fn prepare(

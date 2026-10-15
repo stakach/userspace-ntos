@@ -8,6 +8,7 @@ use nt_user_host::thread_alias_journal::ThreadAliasMapping as Mapping;
 
 pub(crate) static W32_CONNECTED_MASK: AtomicU64 = AtomicU64::new(0);
 pub(crate) static W32_CLIENT_PI: AtomicU64 = AtomicU64::new(u64::MAX);
+pub(crate) static ATTACH_SWITCHES: AtomicU64 = AtomicU64::new(0);
 
 static mut ATTACHED_OWNER: Option<WindowOwner> = None;
 static mut MAPPINGS: Vec<Mapping> = Vec::new();
@@ -230,6 +231,7 @@ pub(crate) unsafe fn w32_client_attach(owner: WindowOwner) -> bool {
     }) {
         return false;
     }
+    #[cfg(feature = "debug-trace")]
     let detached = mappings.len();
     if prev == Some(owner) {
         let mappings = &mut *core::ptr::addr_of_mut!(MAPPINGS);
@@ -259,14 +261,18 @@ pub(crate) unsafe fn w32_client_attach(owner: WindowOwner) -> bool {
             return false;
         }
     }
-    print_str(b"[w32attach] client ");
-    print_u64(prev.map_or(u32::MAX as u64, |old| old.pi as u64));
-    print_str(b" -> ");
-    print_u64(owner.pi as u64);
-    print_str(b" (detached ");
-    print_u64(detached as u64);
-    print_str(b" client pages)\n");
+    #[cfg(feature = "debug-trace")]
+    {
+        print_str(b"[w32attach] client ");
+        print_u64(prev.map_or(u32::MAX as u64, |old| old.pi as u64));
+        print_str(b" -> ");
+        print_u64(owner.pi as u64);
+        print_str(b" (detached ");
+        print_u64(detached as u64);
+        print_str(b" client pages)\n");
+    }
     *core::ptr::addr_of_mut!(ATTACHED_OWNER) = Some(owner);
+    ATTACH_SWITCHES.fetch_add(1, Ordering::Relaxed);
     true
 }
 

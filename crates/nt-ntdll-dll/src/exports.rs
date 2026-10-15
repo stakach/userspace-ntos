@@ -7759,9 +7759,10 @@ pub(crate) unsafe fn ldr_record_unload_event_for_entry(entry: u64) {
 
 /// Plan an increment or pin of the canonical loader entry load count for `base`.
 #[cfg(target_arch = "x86_64")]
-pub(crate) unsafe fn ldr_plan_module_reference(
+pub(crate) unsafe fn ldr_plan_module_references(
     base: u64,
     pin: bool,
+    references: u32,
 ) -> Result<(*mut u16, u16), NtStatus> {
     let entry = unsafe { find_ldr_entry_for_base(base) };
     if entry == 0 {
@@ -7771,7 +7772,7 @@ pub(crate) unsafe fn ldr_plan_module_reference(
     let load_count = unsafe { core::ptr::read_unaligned(load_count_ptr) };
     Ok((
         load_count_ptr,
-        nt_ntdll::loader::lifecycle::plan_reference_add(load_count, pin),
+        nt_ntdll::loader::lifecycle::plan_reference_add_many(load_count, pin, references),
     ))
 }
 

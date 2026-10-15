@@ -127,7 +127,7 @@ fn invalid_final_file_addresses_do_not_mutate_any_projection() {
         );
         assert_eq!(bytes, [0xa5; WDM_X64_FILE_OBJECT_SIZE]);
         let mut driver = [0xa5; WDM_X64_DRIVER_OBJECT_SIZE];
-        let mut device = [0xa5; WDM_X64_DEVICE_OBJECT_SIZE];
+        let mut device = [0xa5; WDM_X64_DEVICE_OBJECT_SIZE + WDM_X64_DEVICE_OBJECT_EXTENSION_SIZE];
         assert_eq!(
             write_wdm_open_device_projection(
                 &mut driver,
@@ -147,7 +147,10 @@ fn invalid_final_file_addresses_do_not_mutate_any_projection() {
             Err(WdmLayoutError::InvalidField)
         );
         assert_eq!(driver, [0xa5; WDM_X64_DRIVER_OBJECT_SIZE]);
-        assert_eq!(device, [0xa5; WDM_X64_DEVICE_OBJECT_SIZE]);
+        assert_eq!(
+            device,
+            [0xa5; WDM_X64_DEVICE_OBJECT_SIZE + WDM_X64_DEVICE_OBJECT_EXTENSION_SIZE]
+        );
         assert_eq!(bytes, [0xa5; WDM_X64_FILE_OBJECT_SIZE]);
     }
 }
@@ -155,7 +158,7 @@ fn invalid_final_file_addresses_do_not_mutate_any_projection() {
 #[test]
 fn open_device_projection_uses_canonical_device_and_file_metadata() {
     let mut driver = [0xa5; WDM_X64_DRIVER_OBJECT_SIZE];
-    let mut device = [0xa5; WDM_X64_DEVICE_OBJECT_SIZE];
+    let mut device = [0xa5; WDM_X64_DEVICE_OBJECT_SIZE + WDM_X64_DEVICE_OBJECT_EXTENSION_SIZE];
     let mut file = [0xa5; WDM_X64_FILE_OBJECT_SIZE];
     write_wdm_open_device_projection(
         &mut driver,
@@ -199,7 +202,7 @@ fn open_device_projection_uses_canonical_device_and_file_metadata() {
 #[test]
 fn invalid_open_device_projection_metadata_leaves_all_outputs_untouched() {
     let mut driver = [0xa5; WDM_X64_DRIVER_OBJECT_SIZE];
-    let mut device = [0xa5; WDM_X64_DEVICE_OBJECT_SIZE];
+    let mut device = [0xa5; WDM_X64_DEVICE_OBJECT_SIZE + WDM_X64_DEVICE_OBJECT_EXTENSION_SIZE];
     let mut file = [0xa5; WDM_X64_FILE_OBJECT_SIZE];
     let mut init = WdmOpenDeviceProjectionInit {
         file_object_address: 0x4000,
@@ -254,7 +257,10 @@ fn invalid_open_device_projection_metadata_leaves_all_outputs_untouched() {
             Err(WdmLayoutError::InvalidField)
         );
         assert_eq!(driver, [0xa5; WDM_X64_DRIVER_OBJECT_SIZE]);
-        assert_eq!(device, [0xa5; WDM_X64_DEVICE_OBJECT_SIZE]);
+        assert_eq!(
+            device,
+            [0xa5; WDM_X64_DEVICE_OBJECT_SIZE + WDM_X64_DEVICE_OBJECT_EXTENSION_SIZE]
+        );
         assert_eq!(file, [0xa5; WDM_X64_FILE_OBJECT_SIZE]);
     }
     init.device_stack_size = 1;

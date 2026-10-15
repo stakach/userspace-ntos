@@ -148,6 +148,20 @@ impl CompletionOwnerPhase {
             _ => None,
         }
     }
+
+    /// A terminal caller packet remains asynchronous while an exact lower-forward owner
+    /// holds its source allocation. Its READY publisher waits for that owner to release
+    /// the pin before the caller can consume the graph.
+    pub const fn dispatch_return_with_retained_source(
+        self,
+        returned_pending: bool,
+        retained_source: bool,
+    ) -> Option<Self> {
+        match self {
+            Self::CompletedDispatch if retained_source => Some(Self::Ready),
+            _ => self.dispatch_return(returned_pending),
+        }
+    }
 }
 
 /// Stateful bottom-to-top traversal of a fixed NT IRP stack snapshot.
@@ -475,6 +489,29 @@ mod tests {
         let completed = claim.release(CompletionClaimRelease::Terminal, false);
         assert_eq!(completed.dispatch_return(false), None);
         assert!(CompletionOwnerClaim::begin(completed).is_none());
+    }
+
+    #[test]
+    fn completed_nonpending_dispatch_with_retained_source_waits_for_exact_publication() {
+        let claim = CompletionOwnerClaim::begin(CompletionOwnerPhase::Dispatching).unwrap();
+        let mut payload = crate::RetainedIrpCompletion::pending();
+        payload.complete(17, 0, 0, 0, 0, 0, 0).unwrap();
+        let completed = claim.release(CompletionClaimRelease::Terminal, false);
+
+        assert_eq!(
+            completed.dispatch_return_with_retained_source(false, true),
+            Some(CompletionOwnerPhase::Ready)
+        );
+        assert_eq!(
+            completed.dispatch_return_with_retained_source(false, false),
+            None
+        );
+        assert_eq!(
+            completed.dispatch_return_with_retained_source(true, true),
+            Some(CompletionOwnerPhase::Ready)
+        );
+        assert!(payload.completed().is_some());
+        assert!(CompletionOwnerClaim::begin(CompletionOwnerPhase::Ready).is_none());
     }
 
     #[test]

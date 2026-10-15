@@ -36,7 +36,7 @@ fn park(table: &mut PendingFileIoTable, status: u32, mode: LocalFlushMode) -> (u
 fn retire(table: &mut PendingFileIoTable, slot: usize, id: u64) -> PendingFileIo {
     assert!(table.finish_exact(slot, id).is_none());
     assert!(table
-        .mark_local_reference_released_exact(slot, id)
+        .mark_owned_reference_released_exact(slot, id)
         .is_none());
     if table.get(slot).unwrap().signal_file {
         assert!(table.claim_reply_cap_exact(slot, id).is_none());
@@ -49,9 +49,9 @@ fn retire(table: &mut PendingFileIoTable, slot: usize, id: u64) -> PendingFileIo
     assert!(table.completion_surfaces_settled_exact(slot, id));
     table.mark_backend_acked_exact(slot, id).unwrap();
     assert!(table.finish_exact(slot, id).is_none());
-    table.mark_local_reference_released_exact(slot, id).unwrap();
+    table.mark_owned_reference_released_exact(slot, id).unwrap();
     assert!(table
-        .mark_local_reference_released_exact(slot, id)
+        .mark_owned_reference_released_exact(slot, id)
         .is_none());
     let completed = table.finish_exact(slot, id).unwrap();
     assert!(table.finish_exact(slot, id).is_none());
@@ -191,7 +191,7 @@ fn mode_status_and_permanent_fault_matrix_preserves_backing_result() {
                 let (slot, id) = park(&mut table, status, mode);
                 let original = table.get(slot).unwrap();
                 assert!(original.is_local());
-                assert_eq!(original.local_terminal_result(), Some((status, 0)));
+                assert_eq!(original.owned_terminal_result(), Some((status, 0)));
                 assert!(table.mark_iosb_faulted_exact(slot, id, IOSB).is_none());
                 let expected = if original.iosb_va != 0 {
                     assert!(table.claim_reply_cap_exact(slot, id).is_none());
@@ -228,11 +228,11 @@ fn mode_status_and_permanent_fault_matrix_preserves_backing_result() {
                 };
                 let pending = table.get(slot).unwrap();
                 assert_eq!(pending.iosb_va, original.iosb_va);
-                assert_eq!(pending.local_terminal_result(), Some((status, 0)));
-                assert_eq!(pending.local_syscall_status(), Some(expected));
+                assert_eq!(pending.owned_terminal_result(), Some((status, 0)));
+                assert_eq!(pending.owned_syscall_status(), Some(expected));
                 let completed = retire(&mut table, slot, id);
-                assert_eq!(completed.local_terminal_result(), Some((status, 0)));
-                assert_eq!(completed.local_syscall_status(), Some(expected));
+                assert_eq!(completed.owned_terminal_result(), Some((status, 0)));
+                assert_eq!(completed.owned_syscall_status(), Some(expected));
             }
         }
     }
@@ -263,13 +263,13 @@ fn fault_settlement_rejects_wrong_identity_status_and_every_settled_state() {
         IO_DELIVERY_REPLY_CLAIMED,
         IO_DELIVERY_REPLY_PUBLISHED,
         IO_DELIVERY_BACKEND_ACKED,
-        IO_DELIVERY_LOCAL_REFERENCE_RELEASED,
+        IO_DELIVERY_OWNED_REFERENCE_RELEASED,
     ] {
         table.slots[slot].as_mut().unwrap().delivery_state = state;
         assert!(table
             .mark_local_flush_iosb_faulted_exact(slot, id, IOSB, ACCESS_VIOLATION)
             .is_none());
-        assert_eq!(table.get(slot).unwrap().local_syscall_status(), Some(0));
+        assert_eq!(table.get(slot).unwrap().owned_syscall_status(), Some(0));
     }
     table.slots[slot] = original;
     table
@@ -298,15 +298,15 @@ fn retry_preserves_source_and_return_override_through_reply_and_reference_busy()
     assert_eq!(table.claim_reply_cap_exact(slot, id), Some(Some(CAP)));
     assert_eq!(table.restore_reply_cap_exact(slot, id, CAP), Some(()));
     assert_eq!(
-        table.get(slot).unwrap().local_syscall_status(),
+        table.get(slot).unwrap().owned_syscall_status(),
         Some(ACCESS_VIOLATION)
     );
     assert!(table
         .mark_local_flush_iosb_faulted_exact(slot, id, IOSB, GUARD_PAGE)
         .is_none());
     let completed = retire(&mut table, slot, id);
-    assert_eq!(completed.local_terminal_result(), Some((DEVICE_ERROR, 0)));
-    assert_eq!(completed.local_syscall_status(), Some(ACCESS_VIOLATION));
+    assert_eq!(completed.owned_terminal_result(), Some((DEVICE_ERROR, 0)));
+    assert_eq!(completed.owned_syscall_status(), Some(ACCESS_VIOLATION));
 }
 
 #[test]
@@ -322,9 +322,9 @@ fn abandonment_preserves_terminal_disposition_until_ack_and_reference_release() 
         assert_eq!(table.abandon_thread_transfers_with(7, |_| {}), 1);
         let abandoned = table.get(slot).unwrap();
         assert!(abandoned.consumer_abandoned);
-        assert_eq!(abandoned.local_terminal_result(), Some((0, 0)));
+        assert_eq!(abandoned.owned_terminal_result(), Some((0, 0)));
         assert_eq!(
-            abandoned.local_syscall_status(),
+            abandoned.owned_syscall_status(),
             Some(if fault_first { ACCESS_VIOLATION } else { 0 })
         );
         assert!(table
@@ -333,7 +333,7 @@ fn abandonment_preserves_terminal_disposition_until_ack_and_reference_release() 
         assert!(table.claim_reply_cap_exact(slot, id).is_none());
         table.mark_backend_acked_exact(slot, id).unwrap();
         assert!(table.finish_exact(slot, id).is_none());
-        table.mark_local_reference_released_exact(slot, id).unwrap();
+        table.mark_owned_reference_released_exact(slot, id).unwrap();
         assert!(table.finish_exact(slot, id).is_some());
     }
 }
@@ -342,7 +342,7 @@ fn abandonment_preserves_terminal_disposition_until_ack_and_reference_release() 
 fn flush_fault_api_cannot_rewrite_other_local_or_provider_operations() {
     for operation in [
         PendingFileIoOperation::Transfer,
-        PendingFileIoOperation::LocalInline(PendingLocalInline {
+        PendingFileIoOperation::OwnedInline(PendingOwnedInline {
             status: DEVICE_ERROR,
             information: 12,
         }),
@@ -359,7 +359,7 @@ fn flush_fault_api_cannot_rewrite_other_local_or_provider_operations() {
             .is_none());
         assert_eq!(table.get(slot), Some(pending));
         assert_eq!(
-            pending.local_syscall_status(),
+            pending.owned_syscall_status(),
             if pending.is_local() {
                 Some(DEVICE_ERROR)
             } else {

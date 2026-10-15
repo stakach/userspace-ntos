@@ -6,6 +6,10 @@ use nt_driver_runtime::{decode_file_projection_reply, FileProjectionSlot};
 struct Row {
     projection: FileProjectionSlot,
     in_flight: bool,
+    storage_retirement_attempted: bool,
+    constructor_name: u64,
+    file_generation: u64,
+    name_generation: u64,
 }
 
 struct FileObjectStore {
@@ -88,9 +92,27 @@ pub(super) unsafe fn fo_register(file: u64, address: u64) -> bool {
     let Some(projection) = FileProjectionSlot::new(file, address) else {
         return false;
     };
+    // This field is trustworthy only before the first driver callback. Preserve the constructor
+    // association for a root-proven pre-entry refusal; normal retirement uses the root broker.
+    let constructor_name = read_unaligned((address + FILE_NAME_BUFFER_OFFSET) as *const u64);
+    if constructor_name == 0 || constructor_name == address
+        || component_pool_allocation_capacity(address).is_none()
+        || component_pool_allocation_capacity(constructor_name).is_none()
+    {
+        return false;
+    }
+    let file_generation = read_volatile((address - 8) as *const u64);
+    let name_generation = read_volatile((constructor_name - 8) as *const u64);
+    if file_generation == 0 || name_generation == 0 {
+        return false;
+    }
     let row = Some(Row {
         projection,
         in_flight: false,
+        storage_retirement_attempted: false,
+        constructor_name,
+        file_generation,
+        name_generation,
     });
     if let Some(index) = rows().iter().position(Option::is_none) {
         rows_mut()[index] = row;
@@ -115,6 +137,32 @@ unsafe fn service(
     decode_file_projection_reply(info, status, generation, [reserved0, reserved1], op)
 }
 
+pub(super) unsafe fn retire_file_storage(file: u64, address: u64) -> bool {
+    let (words, status, value, reserved0, reserved1) = call_on4_raw(
+        (FSD_SERVICE_FILE_LABEL << 12) | 4,
+        9,
+        0,
+        file,
+        address,
+    );
+    words == 4 && status as u32 as i32 == STATUS_SUCCESS
+        && value == 0 && reserved0 == 0 && reserved1 == 0
+}
+
+pub(super) fn pre_entry_no_root_owner(
+    words: u64, status: u64, generation: u64, reserved0: u64, reserved1: u64,
+) -> bool {
+    words == 4 && status <= u32::MAX as u64
+        && (status as u32 as i32) < 0 && generation == 0
+        && reserved0 == 1 && reserved1 == 0
+}
+
+pub(super) unsafe fn retire_unpublished_file_storage(
+    name: u64, name_generation: u64, file: u64, file_generation: u64,
+) -> bool {
+    pool_free_exact(name, name_generation) && pool_free_exact(file, file_generation)
+}
+
 pub(super) unsafe fn fo_bind(file: u64, irp: u64) -> Result<(), i32> {
     let index = index_for_file(file).ok_or(STATUS_INVALID_HANDLE)?;
     let row = rows_mut()[index].as_mut().ok_or(STATUS_INVALID_HANDLE)?;
@@ -123,11 +171,35 @@ pub(super) unsafe fn fo_bind(file: u64, irp: u64) -> Result<(), i32> {
     }
     let snapshot = row.projection;
     row.in_flight = true;
-    let reply = service(1, irp, snapshot);
+    let (words, status, generation, reserved0, reserved1) = call_on4_raw(
+        (FSD_SERVICE_FILE_LABEL << 12) | 4,
+        1,
+        irp,
+        snapshot.file_id(),
+        snapshot.address(),
+    );
+    let no_root_owner = pre_entry_no_root_owner(words, status, generation, reserved0, reserved1);
+    let reply = if no_root_owner {
+        Some(Err(status as u32 as i32))
+    } else {
+        decode_file_projection_reply(words, status, generation, [reserved0, reserved1], 1)
+    };
     let row = rows_mut()[index]
         .as_mut()
         .expect("in-flight File publication lost its owner");
     row.in_flight = false;
+    if no_root_owner {
+        row.storage_retirement_attempted = true;
+        let name = row.constructor_name;
+        let name_generation = row.name_generation;
+        let file_generation = row.file_generation;
+        if retire_unpublished_file_storage(
+            name, name_generation, snapshot.address(), file_generation,
+        ) {
+            rows_mut()[index] = None;
+        }
+        return Err(status as u32 as i32);
+    }
     match reply {
         Some(Ok(generation)) if row.projection.publish(snapshot, generation) => {
             FSD_FO_OPENS.fetch_add(1, Ordering::Relaxed);
@@ -169,7 +241,7 @@ unsafe fn retire_one(index: usize) -> bool {
     let Some(row) = rows_mut().get_mut(index).and_then(Option::as_mut) else {
         return false;
     };
-    if !row.projection.is_retiring() || row.in_flight {
+    if !row.projection.is_retiring() || row.in_flight || row.storage_retirement_attempted {
         return false;
     }
     row.in_flight = true;
@@ -199,8 +271,13 @@ unsafe fn retire_one(index: usize) -> bool {
     if !retired || row.projection != snapshot {
         return false;
     }
+    // The root captured the constructor's two physical allocations before driver entry.
+    // Claim a single broker attempt before IPC: an ambiguous reply cannot authorize replay.
+    row.storage_retirement_attempted = true;
+    if !retire_file_storage(snapshot.file_id(), snapshot.address()) {
+        return false;
+    }
     rows_mut()[index] = None;
-    free_file_storage(snapshot.address());
     publish_retirements();
     true
 }
@@ -220,7 +297,8 @@ pub(super) unsafe fn drain() -> u64 {
         scanned += 1;
         if rows()[index]
             .as_ref()
-            .is_some_and(|row| row.projection.is_retiring() && !row.in_flight)
+            .is_some_and(|row| row.projection.is_retiring() && !row.in_flight
+                && !row.storage_retirement_attempted)
         {
             attempted += 1;
             retired += u64::from(retire_one(index));

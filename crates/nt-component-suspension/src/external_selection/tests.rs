@@ -146,3 +146,110 @@ fn external_order_is_global_across_receiver_stores_not_local_slots() {
     assert!(older.admission_sequence() < newer.admission_sequence());
     assert_eq!(oldest_external_ingress([(0, &newer), (5, &older)]), Some(5));
 }
+
+#[test]
+fn receive_selection_skips_older_sealed_call_without_transferring_its_reply() {
+    let lanes = Lanes::new(1, 2);
+    let mut receiver = IngressReceiver::new(20, 30, 2).unwrap();
+    let older = retain(&mut receiver, &lanes, ComponentIngress::new(20, 31).unwrap(), 7);
+    let younger = retain(&mut receiver, &lanes, ComponentIngress::new(20, 32).unwrap(), 8);
+    assert!(older.admission_sequence() < younger.admission_sequence());
+
+    for _ in 0..2 {
+        assert_eq!(
+            oldest_receive_external_ingress([
+                (4, &older, ExternalReceiveState { settlement_prepared: true, ..Default::default() }),
+                (90, &younger, ExternalReceiveState::default()),
+            ]),
+            Some(90),
+        );
+    }
+    assert!(receiver.excludes_reply(older.reply()));
+    assert!(receiver.excludes_reply(younger.reply()));
+    assert!(older.can_park() && younger.can_park());
+}
+
+#[test]
+fn receive_selection_skips_older_stop_entered_call_and_preserves_ordinal_order() {
+    let lanes = Lanes::new(1, 2);
+    let mut receiver = IngressReceiver::new(20, 30, 3).unwrap();
+    let mut older = retain(&mut receiver, &lanes, ComponentIngress::new(20, 31).unwrap(), 7);
+    let middle = retain(&mut receiver, &lanes, ComponentIngress::new(20, 32).unwrap(), 8);
+    let younger = retain(&mut receiver, &lanes, ComponentIngress::new(20, 33).unwrap(), 9);
+    assert!(older.admission_sequence() < middle.admission_sequence());
+    assert!(middle.admission_sequence() < younger.admission_sequence());
+    assert_eq!(older.stop_owned(|_| Err::<(), u8>(7)), Err(crate::ExternalIngressError::Stop(7)));
+    assert!(older.stop_started() && !older.can_park());
+
+    assert_eq!(
+        oldest_receive_external_ingress([
+            (4, &older, ExternalReceiveState::default()),
+            (1, &younger, ExternalReceiveState::default()),
+            (90, &middle, ExternalReceiveState::default()),
+        ]),
+        Some(90),
+    );
+    assert!(receiver.excludes_reply(older.reply()));
+    assert!(receiver.excludes_reply(middle.reply()));
+    assert!(receiver.excludes_reply(younger.reply()));
+}
+
+#[test]
+fn receive_fault_selection_keeps_older_ordinary_call_and_selects_younger_fault() {
+    let lanes = Lanes::new(1, 2);
+    let mut receiver = IngressReceiver::new(20, 30, 2).unwrap();
+    let ordinary = retain(&mut receiver, &lanes, ComponentIngress::new(20, 31).unwrap(), 0x4e54_007);
+    let fault = retain(&mut receiver, &lanes, ComponentIngress::new(20, 32).unwrap(), (6 << 12) | 4);
+    assert!(ordinary.admission_sequence() < fault.admission_sequence());
+    assert_eq!(
+        oldest_receive_external_ingress_matching([
+            (2, &ordinary, ExternalReceiveState::default()),
+            (9, &fault, ExternalReceiveState::default()),
+        ], |call| *call.message() == ((6 << 12) | 4)),
+        Some(9),
+    );
+    assert!(receiver.excludes_reply(ordinary.reply()));
+    assert!(receiver.excludes_reply(fault.reply()));
+    assert!(ordinary.can_park() && fault.can_park());
+}
+
+#[test]
+fn receive_fault_selection_orders_matching_calls_by_admission_not_slot() {
+    let lanes = Lanes::new(1, 2);
+    let mut receiver = IngressReceiver::new(20, 30, 3).unwrap();
+    let ordinary = retain(&mut receiver, &lanes, ComponentIngress::new(20, 31).unwrap(), 0x4e54_007);
+    let first_fault = retain(&mut receiver, &lanes, ComponentIngress::new(20, 32).unwrap(), (6 << 12) | 4);
+    let later_fault = retain(&mut receiver, &lanes, ComponentIngress::new(20, 33).unwrap(), (6 << 12) | 4);
+    assert!(first_fault.admission_sequence() < later_fault.admission_sequence());
+    assert_eq!(
+        oldest_receive_external_ingress_matching([
+            (1, &later_fault, ExternalReceiveState::default()),
+            (2, &ordinary, ExternalReceiveState::default()),
+            (90, &first_fault, ExternalReceiveState::default()),
+        ], |call| *call.message() == ((6 << 12) | 4)),
+        Some(90),
+    );
+    assert!(receiver.excludes_reply(first_fault.reply()));
+    assert!(receiver.excludes_reply(later_fault.reply()));
+}
+
+#[test]
+fn receive_fault_selection_skips_sealed_and_stop_entered_older_faults() {
+    let lanes = Lanes::new(1, 2);
+    let mut receiver = IngressReceiver::new(20, 30, 3).unwrap();
+    let sealed = retain(&mut receiver, &lanes, ComponentIngress::new(20, 31).unwrap(), (6 << 12) | 4);
+    let mut stopped = retain(&mut receiver, &lanes, ComponentIngress::new(20, 32).unwrap(), (6 << 12) | 4);
+    let eligible = retain(&mut receiver, &lanes, ComponentIngress::new(20, 33).unwrap(), (6 << 12) | 4);
+    assert_eq!(stopped.stop_owned(|_| Err::<(), u8>(7)), Err(crate::ExternalIngressError::Stop(7)));
+    assert_eq!(
+        oldest_receive_external_ingress_matching([
+            (3, &sealed, ExternalReceiveState { settlement_prepared: true, ..Default::default() }),
+            (8, &stopped, ExternalReceiveState::default()),
+            (13, &eligible, ExternalReceiveState::default()),
+        ], |call| *call.message() == ((6 << 12) | 4)),
+        Some(13),
+    );
+    assert!(receiver.excludes_reply(sealed.reply()));
+    assert!(receiver.excludes_reply(stopped.reply()));
+    assert!(receiver.excludes_reply(eligible.reply()));
+}

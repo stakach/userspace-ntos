@@ -65,11 +65,18 @@ impl<const N: usize> ReferenceReleaseLedger<N> {
     }
 
     pub fn record(&mut self, base: u64) -> bool {
+        self.record_many(base, 1)
+    }
+
+    pub fn record_many(&mut self, base: u64, references: u32) -> bool {
+        if references == 0 {
+            return false;
+        }
         if let Some(entry) = self.entries[..self.len]
             .iter_mut()
             .find(|entry| entry.base == base)
         {
-            let Some(next) = entry.releases.checked_add(1) else {
+            let Some(next) = entry.releases.checked_add(references) else {
                 return false;
             };
             entry.releases = next;
@@ -78,7 +85,10 @@ impl<const N: usize> ReferenceReleaseLedger<N> {
         if self.len == N {
             return false;
         }
-        self.entries[self.len] = ReferenceRelease { base, releases: 1 };
+        self.entries[self.len] = ReferenceRelease {
+            base,
+            releases: references,
+        };
         self.len += 1;
         true
     }

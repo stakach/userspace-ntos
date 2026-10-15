@@ -323,10 +323,6 @@ fn invalid_owners_and_exhaustion_do_not_mutate_live_rows() {
             key: FileIoWaitKey::Hosted(0),
             ..owner()
         },
-        FileIoBusyOwner {
-            key: FileIoWaitKey::LocalOverlay(17),
-            ..owner()
-        },
         FileIoBusyOwner { tid: 0, ..owner() },
         FileIoBusyOwner {
             tid: u64::MAX,

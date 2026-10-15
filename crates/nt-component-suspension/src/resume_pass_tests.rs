@@ -413,3 +413,27 @@ fn physical_busy_suppression_retains_wake_until_token_release() {
         .unwrap();
     assert_eq!(wake.next_deadline(), Some(210));
 }
+
+#[test]
+fn ready_terminal_schedules_resume_without_another_resumable_frame() {
+    let mut lanes = Lanes::new(1, 2);
+    let lane = add(&mut lanes, 1, 1, false);
+    let reply = lanes.binding(lane).unwrap().reply_object;
+    let frame = lanes.top(lane).unwrap().unwrap();
+    let (key, owner) = (frame.key, frame.owner);
+    lanes.begin_resume(lane, reply, key).unwrap();
+    lanes
+        .retain_terminal_running(lane, reply, key, owner, ())
+        .unwrap();
+    assert!(lanes.next_resumable().is_none());
+    assert!(!lanes.execution_busy());
+
+    let mut wake = ResumeWake::new(10, 40).unwrap();
+    wake.reconcile_demand(
+        ResumeDemand::observe(lanes.execution_busy(), false, || {
+            lanes.next_resumable().is_some() || lanes.next_terminal().is_some()
+        }),
+        100,
+    );
+    assert!(wake.begin_pass(100).unwrap().is_some());
+}

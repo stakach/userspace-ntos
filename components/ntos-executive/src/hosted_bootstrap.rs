@@ -40,6 +40,7 @@ impl HostedBootstrapManifestEntry {
             process_name: core::str::from_utf8(self.leaf)
                 .expect("hosted bootstrap image manifest leaf is ASCII"),
             role: self.role,
+            observation: None,
             nt_image_path: self.nt_image_path,
             command_line: self.command_line,
             image_root: self.image_root,

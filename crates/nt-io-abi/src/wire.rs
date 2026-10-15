@@ -88,6 +88,7 @@ pub struct IrpDispatchRequest {
     pub abi_size: u16,
     pub major: u8,
     pub minor: u8,
+    /// Root-authenticated dispatch kind; see `IRP_DISPATCH_SUBSIDIARY_FILE_LIFECYCLE`.
     pub _reserved0: u16,
     pub flags: u32,
     /// Raw `Parameters.SetFile` control union. For rename/link this is the

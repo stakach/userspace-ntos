@@ -1,0 +1,41 @@
+{
+  "issue": 18,
+  "source_commit": "2565df1242fe9423f134c57d08bf692e953a34d3",
+  "microkernel_commit": "33024e487fcbb802707fd8486107f596bc7e145f",
+  "profile": "font-cleanup",
+  "boot_bound_seconds": 3600,
+  "build_exit": 0,
+  "launcher_exit": 124,
+  "collector_exit": 0,
+  "collector_frames": 104,
+  "collector_final_slot": 1,
+  "strict_font_parser_exit": 1,
+  "termination": "Original one-hour deadline expired; the supervisor terminated the guest process group. No guest completion sentinel.",
+  "preboot_sha256": {
+    "rootserver": "54f04fee666b43872aee127417eddb2d60231975fa125bfe5325bfbd02825fb3",
+    "microkernel": "88e3e700b97a0d3479a51a57380d7ac24fdaeebe43703bfeec81cda3f803d094",
+    "disk": "5c6c785f0b8c7de55536d494fb7d8c9c6b1229cc27d77bdd553097ecfcf50e33",
+    "ntdll": "6b621e789fd6feea323e5e2003c242e31c8b1a8e818956bf4a870b16a97491a3",
+    "font_acceptance": "1729483e54eba2e8b891beeae4dca6d3881f2f1ac45cbce90ba74c4e4908e6f3",
+    "font_run_setup": "f2238bde4b0d68808f01b1e7f5ce95817e03063db1a4616a63d15716e0bb85b5"
+  },
+  "artifact_sha256": {
+    "raw_log": "06a663a50ee6ed0e6dde0417eeda4d6eab6d1eb9eea2d4d8437727b31ed2f9a8",
+    "archived_log": "6726559016bb4d5ed2df69d0bbb1c501c705ae52f6d88a016feb9cdbd81c877c",
+    "screenshot": "53ad5f5ac610f375103c4b38bc9dcda1b85defd34e60860272a02fff0da0c9cb"
+  },
+  "observations": [
+    "Fresh full native build exited zero. Exact-head parent CI37416847582 passed. The image includes indexed client-frame retirement and merged microkernel BKL ownership fix PR16; its extern-rootserver build does not contain the spec-only idle observer.",
+    "Real setup registered the acceptance Run value and exited. The strict parser reported missing PID-QUERY: the font acceptance process did not start. No Userinit/Explorer acceptance or desktop proof was obtained.",
+    "Genuine device-install helpers progressed through process-slot17 generation97, with each retired through canonical process deletion. DevInstallW error2 is not a proven diagnosis; missing PDO text and returned-buffer lifetime safety are tracked separately in issue294.",
+    "The first large process close recorded2728Mtick, versus3439Mtick in the previous four-CPU attempt. Different exact process lifetimes and overall unchanged acceptance prevent a total-boot speed claim.",
+    "The screenshot collector was restarted on the same live guest to add optional read-only register sampling. The original collector deliberately exited130 after254 frames; the replacement exited0 after104 frames. The guest image and original boot deadline were unchanged. A separate QMP connection timed out before issuing any stop command; no guest pause occurred.",
+    "Register snapshots showed hardware LAPIC-ID reads in syscall dispatch and BKL polling. These perturbing, non-atomic snapshots are not an unbiased profile or proof of bottleneck dominance. Issue296 tracks retaining trusted physical identity per acquisition without user GS authority or weakened translation retirement.",
+    "Final printed census118: heap watermark62901416/live62780264 of62914560 nominal durable bytes, reusable134144/largest52584; scratch peak1728888 of4194304. Log line649711 records an actual fallible allocation refusal:60528bytes during NtSetValueKey, requested-end62961944 beyond committed durablecap62914408. The active setup process is pi15/pid256/Hosted(10), not a driver inferred from the hot badge. Dispatch120519/1086155Mtick; disk read1515793attempts/4486026sectors/29540Mtick, write969726attempts/3867879sectors/21456Mtick, barriers7341/1071Mtick; all disk failure counters zero. Census hot-badge39 is an overflow bucket, not a unique driver identity.",
+    "Same-run final screenshot shows only background and cursor. No allocation abort or terminal provider bugcheck was observed, but strict private-font cleanup and separately fresh production desktop validation remain incomplete."
+  ],
+  "evidence": {
+    "log": "docs/evidence/issue18-indexed-bkl-font-timeout.log.gz",
+    "screenshot": "docs/images/indexed-bkl-font-timeout.png"
+  }
+}

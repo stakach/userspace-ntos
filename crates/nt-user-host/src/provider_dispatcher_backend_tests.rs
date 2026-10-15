@@ -18,6 +18,7 @@ const PROVIDER: ProviderDomainIdentity = ProviderDomainIdentity {
     domain: 7,
     generation: 3,
 };
+const FILE_ID: u64 = (1u64 << 40) | 401;
 
 #[derive(Default)]
 struct Backing {
@@ -49,7 +50,7 @@ impl ProviderEventBacking for Backing {
         process: Option<EventObjectOwner>,
     ) -> Result<u64, u32> {
         if owner != self::owner()
-            || object != ProviderWaitObject::new(ProviderWaitObjectType::File, 401, 2)
+            || object != ProviderWaitObject::new(ProviderWaitObjectType::File, FILE_ID, 2)
             || process != Some(EventObjectOwner::new(42, 4))
         {
             return Err(INVALID_PARAMETER);
@@ -370,13 +371,13 @@ fn selector_scope_reuses_lease_and_retires_backing_only_after_last_release() {
 #[test]
 fn file_wait_requires_backing_admission_and_releases_without_consuming_signal() {
     let mut state = DispatcherState::new(1, 1);
-    let file = ProviderWaitObject::new(ProviderWaitObjectType::File, 401, 2);
+    let file = ProviderWaitObject::new(ProviderWaitObjectType::File, FILE_ID, 2);
     let access = ProviderDispatcherAccess::hosted(owner(), 42).unwrap();
     let mut objects = backend(&mut state, Some(access));
     assert_eq!(
         objects.acquire_dispatcher_wait(
             owner(),
-            ProviderWaitObject::new(ProviderWaitObjectType::File, 401, 3)
+            ProviderWaitObject::new(ProviderWaitObjectType::File, FILE_ID, 3)
         ),
         Err(INVALID_PARAMETER)
     );
@@ -416,7 +417,7 @@ fn file_wait_requires_backing_admission_and_releases_without_consuming_signal() 
 fn file_wait_all_remains_parked_until_backing_reports_ready() {
     let mut state = DispatcherState::new(1, 1);
     let (_, event) = event(&mut state);
-    let file = ProviderWaitObject::new(ProviderWaitObjectType::File, 401, 2);
+    let file = ProviderWaitObject::new(ProviderWaitObjectType::File, FILE_ID, 2);
     let mut objects = backend(
         &mut state,
         Some(ProviderDispatcherAccess::hosted(owner(), 42).unwrap()),

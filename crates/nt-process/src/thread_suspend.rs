@@ -207,12 +207,13 @@ impl ProcessManager {
     /// Update the underlying wait/run state while preserving counted suspension. Suspended is a
     /// projection, not an independently writable dispatcher state; use suspend_thread for it.
     pub fn set_thread_state(&mut self, tid: ThreadId, state: ThreadState) -> Result<(), u32> {
+        let initial_creation_pending = self.has_initial_thread_creation_pending_for(tid);
         let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
         if thread.state == ThreadState::Terminated || state == ThreadState::Suspended {
             return Err(STATUS_INVALID_PARAMETER);
         }
         if matches!(state, ThreadState::Initialized | ThreadState::Terminated)
-            && thread.pending_suspend_control.is_some()
+            && (thread.pending_suspend_control.is_some() || initial_creation_pending)
         {
             return Err(STATUS_DEVICE_BUSY);
         }

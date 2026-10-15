@@ -237,6 +237,24 @@ impl SourceIrpAuxiliaryLedger {
         })
     }
 
+    /// Terminal buffer adoption must not take storage retained by any source owner in
+    /// this physical domain, including auxiliary rows already completing.
+    pub fn owns_pool_child_in_domain(
+        &self,
+        domain: HostedDomainIdentity,
+        component_address: u64,
+    ) -> bool {
+        self.rows.iter().any(|row| {
+            let child = &row.auxiliary;
+            child.source.domain == domain
+                && (child.system_buffer.is_some_and(|buffer| buffer.component_address == component_address)
+                    || child.mdl.is_some_and(|mdl| mdl.pool.component_address == component_address)
+                    || child.transfer_buffer.and_then(SourceMemoryIdentity::pool_address) == Some(component_address)
+                    || child.completion.event.pool_address() == Some(component_address)
+                    || child.completion.iosb.pool_address() == Some(component_address))
+        })
+    }
+
     pub fn retire(
         &mut self,
         ticket: SourceIrpTicket,
@@ -323,6 +341,18 @@ mod tests {
             auxiliary.source.domain,
             auxiliary.system_buffer.unwrap().component_address,
         ));
+    }
+
+    #[test]
+    fn terminal_adoption_excludes_auxiliary_storage_across_completion_phase() {
+        let mut ledger = SourceIrpAuxiliaryLedger::new();
+        let auxiliary = auxiliary();
+        let address = auxiliary.system_buffer.unwrap().component_address;
+        ledger.register(auxiliary).unwrap();
+        assert!(ledger.owns_pool_child_in_domain(auxiliary.source.domain, address));
+        ledger.begin_completion(auxiliary.ticket, auxiliary.source).unwrap();
+        assert!(ledger.owns_pool_child_in_domain(auxiliary.source.domain, address));
+        assert!(!ledger.owns_pool_child_in_domain(auxiliary.source.domain, address + 0x1000));
     }
 
     #[test]

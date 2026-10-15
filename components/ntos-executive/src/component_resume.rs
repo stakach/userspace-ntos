@@ -5,7 +5,7 @@ use nt_component_suspension::{LaneResume, ResumeDemand, ResumePass, ResumeWake, 
 
 #[path = "component_resume_execute.rs"]
 mod execute;
-pub(super) use execute::run_hosted;
+pub(super) use execute::{run_hosted, run_receive};
 
 #[path = "component_resume_bootstrap.rs"]
 mod bootstrap;
@@ -78,10 +78,41 @@ unsafe fn next_in_pass(pm: &nt_process::ProcessManager, pass: &mut ResumePass) -
     candidate(resume)
 }
 
+/// ACK plus a retained next Call transfers the external service token to its
+/// waiting syscall continuation. Neither observation alone authorizes resume.
+unsafe fn select_ready_service_waits() {
+    let waits: Vec<_> = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+        .frames()
+        .filter_map(|(lane, frame)| {
+            let ComponentNativeContinuation::Hosted(hosted) = frame.continuation else {
+                return None;
+            };
+            let PendingComponentDispatch::ServiceWait(pending) = hosted.pending else {
+                return None;
+            };
+            (pending.yielded.route.identity().lane == lane)
+                .then_some((frame.key, frame.owner, pending))
+        })
+        .collect();
+    for (key, owner, pending) in waits {
+        let yielded = pending.yielded;
+        let ready = crate::spawn_hosts::shared_ingress::owner::runtime::resume_service_component_wait(
+            yielded.route, yielded.dispatch, yielded.reply, yielded.token, key, owner,
+        );
+        if matches!(ready, Ok(true)) {
+            (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                .select(key, ComponentSuspensionCompletion::receive_ready())
+                .expect("ACKed service wait retains its typed continuation");
+        }
+    }
+}
+
 /// Finish currently selected hosted admissions before a caller reply, never fresh reparks.
 /// Kernel continuations remain a barrier for the ordinary runtime/kernel owner.
 pub(super) unsafe fn drain_hosted_ready(handler: *mut ExecNtHandler) -> u64 {
-    if is_running() {
+    if is_running()
+        || crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+    {
         return 0;
     }
     let Some(ctx) = (*handler).loop_ctx else {
@@ -89,10 +120,17 @@ pub(super) unsafe fn drain_hosted_ready(handler: *mut ExecNtHandler) -> u64 {
     };
     let _message = crate::ipc_message::SavedMessageBuffer::capture();
     let _durable = allocator::enter_durable();
+    select_ready_service_waits();
     let mut pass = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).resume_pass();
     let mut drained = 0;
     loop {
+        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+            break;
+        }
         drained += component_terminal::drain(&mut *handler, &mut *ctx.procs, &mut *ctx.pfilled);
+        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+            break;
+        }
         let Some(candidate) = next_in_pass(&(*handler).pm, &mut pass) else {
             break;
         };
@@ -103,7 +141,9 @@ pub(super) unsafe fn drain_hosted_ready(handler: *mut ExecNtHandler) -> u64 {
             break;
         }
     }
-    if (*handler).lpc_endpoint_progress {
+    if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+        && (*handler).lpc_endpoint_progress
+    {
         let _ = lpc_endpoint_redrive_all(&mut *handler);
     }
     drained
@@ -146,7 +186,17 @@ unsafe fn observe_demand(pm: &nt_process::ProcessManager) -> ResumeDemand {
     ResumeDemand::observe(
         component_execution_is_busy(),
         kernel_provider_activation::has_stopped_wait_work(pm),
-        || next_ready(pm).is_some() || kernel_provider_activation::has_ready_completions(),
+        || {
+            next_ready(pm).is_some()
+                || kernel_provider_activation::has_ready_completions()
+                || (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+                    .next_terminal_if(|_, terminal| {
+                        terminal.frame.continuation.hosted().is_some_and(|hosted| {
+                            hosted.return_target.can_resume()
+                        })
+                    })
+                    .is_some()
+        },
     )
 }
 
@@ -227,9 +277,15 @@ fn report_retained(status: u32) {
 /// process, lane and activation borrows below are local to memory operations or terminal delivery;
 /// none survives the selected driver pump. Received message registers survive the entire pass.
 pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
-    if !runtime_ready(handler) || is_running() {
+    if !runtime_ready(handler)
+        || is_running()
+        || crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+    {
         return;
     }
+    // A hosted terminal may own the shared execution fence while awaiting the separately
+    // retained final Call. Settle that exact return before the ordinary busy-lane gate.
+    let _ = component_terminal::drain_shared_returns();
     if component_execution_is_busy()
         && !kernel_provider_activation::has_stopped_wait_work(&(*handler).pm)
     {
@@ -237,6 +293,7 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
     }
     let _message = crate::ipc_message::SavedMessageBuffer::capture();
     let _durable = allocator::enter_durable();
+    select_ready_service_waits();
     reconcile(&mut *handler);
     let mut ticket = match (&mut *core::ptr::addr_of_mut!(WAKE)).begin_pass(monotonic_time_100ns())
     {
@@ -250,7 +307,13 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
     kernel_provider_activation::publish_runtime_waits(&mut *handler);
     let mut pass = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).resume_pass();
     let mut progressed = drain_terminals(handler);
-    while let Some(candidate) = next_in_pass(&(*handler).pm, &mut pass) {
+    loop {
+        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+            break;
+        }
+        let Some(candidate) = next_in_pass(&(*handler).pm, &mut pass) else {
+            break;
+        };
         match candidate.continuation {
             ComponentNativeContinuation::Hosted(_) => {
                 progressed |= run_hosted(handler, candidate).is_some();
@@ -274,9 +337,14 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
                 kernel_provider_activation::publish_runtime_waits(&mut *handler);
             }
         }
+        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+            break;
+        }
         progressed |= drain_terminals(handler);
     }
-    if (*handler).lpc_endpoint_progress {
+    if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+        && (*handler).lpc_endpoint_progress
+    {
         // Component-originated LPC work bypasses the ordinary syscall post-action.
         let _ = lpc_endpoint_redrive_all(&mut *handler);
     }

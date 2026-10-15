@@ -62,6 +62,35 @@ mod tests {
     use crate::{MemoryLifetime, ProcessGeneration};
 
     #[test]
+    fn primary_and_grown_worker_copyout_use_exact_records_not_mirror_geometry() {
+        let process = ProcessIdentity { pid: 304, generation: ProcessGeneration::Hosted(2) };
+        let stale = ProcessIdentity { generation: ProcessGeneration::Hosted(1), ..process };
+        let mut frames = ClientFrameRegistry::new();
+        let primary = 0x100105c0000;
+        let grown = 0x1003011d000;
+        frames.insert(7, MemoryLifetime::Process(process), primary,
+            11, 0x10164000000, 12, 0, true).unwrap();
+        frames.insert(7, MemoryLifetime::Process(process), grown,
+            21, 0, 0, 22, true).unwrap();
+        for (page, expected_frame, expected_alias) in [(primary, 11, 0x10164000000), (grown, 21, 0)] {
+            let ClientCopyoutBacking::Resident(record) =
+                admit_client_copyout_backing(7, process, page, &frames, None).unwrap()
+            else { panic!("installed stack page must keep its exact backing"); };
+            assert_eq!(record.frame, expected_frame);
+            assert_eq!(record.alias, expected_alias);
+            if page == grown {
+                assert_eq!(record.source_cap, 22,
+                    "grown backing retains authority for a temporary alias without a primary mirror");
+            }
+            assert_eq!(admit_client_copyout_backing(7, stale, page, &frames, None),
+                Err(STATUS_INVALID_HANDLE));
+        }
+        assert_eq!(admit_client_copyout_backing(7, process, grown - 0x1000, &frames, None),
+            Ok(ClientCopyoutBacking::Unrecorded),
+            "a nearby stack address supplies no mapped mirror authority");
+    }
+
+    #[test]
     fn copyin_rejects_foreign_rows_before_source_selection() {
         let old = ProcessIdentity {
             pid: 42,

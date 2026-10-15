@@ -1,83 +1,25 @@
-//! Canonical mutable File mode, independent of the original CREATE options.
+//! I/O manager adapter for the shared mutable FILE_OBJECT mode policy.
 
 use crate::CreateOptions;
 use nt_io_completion::FileIoMode;
 use nt_status::NtStatus;
 
-const SYNCHRONOUS: u32 = nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT;
-const VALID_SET_FLAGS: u32 = nt_fs::FILE_WRITE_THROUGH | nt_fs::FILE_SEQUENTIAL_ONLY | SYNCHRONOUS;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FileModeState {
-    bits: u32,
-}
+pub struct FileModeState(nt_fs::FileModeState);
 
 impl FileModeState {
-    /// Capture initial mode without changing CREATE admission. Invalid simultaneous sync flags
-    /// remain observable, but cannot become an I/O policy or an accepted mode transition.
     pub const fn from_create_options(options: CreateOptions) -> Self {
-        Self {
-            bits: nt_fs::file_mode_from_create_options(options.bits()),
-        }
+        Self(nt_fs::FileModeState::from_create_options(options.bits()))
     }
 
-    pub const fn query_bits(self) -> u32 {
-        self.bits
-    }
+    pub const fn query_bits(self) -> u32 { self.0.query_bits() }
 
-    /// Translate already-admitted canonical mode, not a fresh handle grant.
-    pub fn io_mode(self) -> Result<FileIoMode, NtStatus> {
-        match self.bits & SYNCHRONOUS {
-            0 => Ok(FileIoMode::Asynchronous),
-            nt_fs::FILE_SYNCHRONOUS_IO_ALERT => Ok(FileIoMode::SynchronousAlertable),
-            nt_fs::FILE_SYNCHRONOUS_IO_NONALERT => Ok(FileIoMode::SynchronousNonAlertable),
-            _ => Err(NtStatus::INVALID_PARAMETER),
-        }
-    }
+    pub fn io_mode(self) -> Result<FileIoMode, NtStatus> { self.0.io_mode() }
 
-    /// Canonical mode bits in NT FILE_OBJECT.Flags numbering, not the provider's full Flags word.
-    pub fn wdm_mode_flags(self) -> Result<u32, NtStatus> {
-        let io_mode = self.io_mode()?;
-        let mut flags = 0;
-        if io_mode.is_synchronous() {
-            flags |= 0x0000_0002;
-        }
-        if io_mode.is_alertable() {
-            flags |= 0x0000_0004;
-        }
-        if self.bits & nt_fs::FILE_NO_INTERMEDIATE_BUFFERING != 0 {
-            flags |= 0x0000_0008;
-        }
-        if self.bits & nt_fs::FILE_WRITE_THROUGH != 0 {
-            flags |= 0x0000_0010;
-        }
-        if self.bits & nt_fs::FILE_SEQUENTIAL_ONLY != 0 {
-            flags |= 0x0000_0020;
-        }
-        if self.bits & nt_fs::FILE_DELETE_ON_CLOSE != 0 {
-            flags |= 0x0001_0000;
-        }
-        Ok(flags)
-    }
+    pub fn wdm_mode_flags(self) -> Result<u32, NtStatus> { self.0.wdm_mode_flags() }
 
-    /// NT5 FileModeInformation permits only mask 0x36. Sync-vs-async, unbuffered, and
-    /// delete-on-close state cannot change; unbuffered Files also retain write-through.
     pub fn transition(self, requested: u32) -> Result<Self, NtStatus> {
-        let was_synchronous = self.io_mode()?.is_synchronous();
-        let requested_sync = requested & SYNCHRONOUS;
-        if requested & !VALID_SET_FLAGS != 0
-            || requested_sync == SYNCHRONOUS
-            || (requested_sync != 0) != was_synchronous
-        {
-            return Err(NtStatus::INVALID_PARAMETER);
-        }
-        let mut mutable = nt_fs::FILE_SEQUENTIAL_ONLY | SYNCHRONOUS;
-        if self.bits & nt_fs::FILE_NO_INTERMEDIATE_BUFFERING == 0 {
-            mutable |= nt_fs::FILE_WRITE_THROUGH;
-        }
-        Ok(Self {
-            bits: (self.bits & !mutable) | (requested & mutable),
-        })
+        self.0.transition(requested).map(Self)
     }
 }
 

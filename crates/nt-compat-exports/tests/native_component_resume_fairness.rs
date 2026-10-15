@@ -50,3 +50,26 @@ fn pre_reply_component_drain_uses_admission_bounded_resume_pass() {
     assert!(!calls.0.iter().any(|name| name == "next_ready"),
         "fresh rearmed admissions cannot join an already executing pass");
 }
+
+#[test]
+fn returned_hosted_terminal_remains_outer_resume_demand() {
+    let module = syn::parse_file(include_str!(
+        "../../../components/ntos-executive/src/component_resume.rs"
+    ))
+    .unwrap();
+    let observe = module
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Fn(function) if function.sig.ident == "observe_demand" => Some(function),
+            _ => None,
+        })
+        .expect("outer resume demand observation");
+    let mut calls = Calls(Vec::new());
+    calls.visit_block(&observe.block);
+    assert!(calls.0.iter().any(|name| name == "next_ready"));
+    assert!(calls.0.iter().any(|name| name == "next_terminal_if"),
+        "a returned hosted terminal must schedule delivery even when no frame remains resumable");
+    assert!(calls.0.iter().any(|name| name == "can_resume"),
+        "only live or abandoned hosted return targets may schedule terminal delivery");
+}

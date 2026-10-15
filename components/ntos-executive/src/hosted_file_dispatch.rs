@@ -8,13 +8,22 @@ use nt_io_manager::detached_file_irp::{
     ExternalFileIrpAckInvocation, ExternalFileIrpAcknowledgement, ExternalFileIrpCancelInvocation,
     ExternalFileIrpCancelOutcome, ExternalFileIrpCancelReturn, ExternalFileIrpCompletionReturn,
     ExternalFileIrpCopyInvocation, ExternalFileIrpCopyOutcome, ExternalFileIrpCopyReturn,
-    ExternalFileIrpInvocation, ExternalFileIrpOutcome, ExternalFileIrpReturn,
+    ExternalFileIrpInvocation, ExternalFileIrpOutcome, ExternalFileIrpOutputCapture,
+    ExternalFileIrpReturn,
 };
 
-pub(super) fn invoke(mut invocation: ExternalFileIrpInvocation, caller: nt_process::native_handle::NativeHandleCaller) -> ExternalFileIrpReturn {
+/// Root's completion-storage selector copies the retained Type3InputBuffer before ACK.
+pub(super) const FSD_DISPATCH_COPY_MUTABLE_INPUT: u64 = super::FSD_DISPATCH_COPY_MUTABLE_INPUT;
+
+pub(super) fn invoke(
+    mut invocation: ExternalFileIrpInvocation,
+    caller: nt_process::native_handle::NativeHandleCaller,
+    capture: ExternalFileIrpOutputCapture,
+) -> ExternalFileIrpReturn {
     let projection = invocation.projection().clone();
     let route = invocation.route();
     let Some((instance_index, _)) = instance_by_driver_id(route.driver_id().raw()) else {
+        print_str(b"[hosted-file] detached invoke missing driver instance\n");
         return invocation.returned(ExternalFileIrpOutcome::NotEntered {
             status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
         });
@@ -38,11 +47,66 @@ pub(super) fn invoke(mut invocation: ExternalFileIrpInvocation, caller: nt_proce
             status,
             information,
             file_context,
-        } => ExternalFileIrpOutcome::Returned {
+        } => {
+            if capture == ExternalFileIrpOutputCapture::MethodNeitherInput {
+                let expected = invocation.input_mut().len() as u64;
+                let copied = control(
+                    instance_index,
+                    invocation.irp_id(),
+                    FSD_DISPATCH_COPY_MUTABLE_INPUT,
+                    0,
+                    invocation.input_mut(),
+                );
+                if !matches!(copied, HostedIrpTransportResult::Returned {
+                    status: nt_status::NtStatus::SUCCESS,
+                    information,
+                    file_context: 0,
+                } if information == expected)
+                {
+                    let transport_status = match copied {
+                        HostedIrpTransportResult::NotDispatched { status }
+                        | HostedIrpTransportResult::Indeterminate {
+                            transport_status: status,
+                        }
+                        | HostedIrpTransportResult::Returned { status, .. } => status,
+                    };
+                    return invocation
+                        .returned(ExternalFileIrpOutcome::Indeterminate { transport_status });
+                }
+                // Synchronous completion already released the IRP graph. The sidecar survives
+                // until this exact copy is acknowledged through the same terminal selector.
+                let ack = control(
+                    instance_index,
+                    invocation.irp_id(),
+                    FSD_DISPATCH_ACK_COMPLETION,
+                    0,
+                    &mut [],
+                );
+                if !matches!(
+                    ack,
+                    HostedIrpTransportResult::Returned {
+                        status: nt_status::NtStatus::SUCCESS,
+                        information: 0,
+                        file_context: 0,
+                    }
+                ) {
+                    let transport_status = match ack {
+                        HostedIrpTransportResult::NotDispatched { status }
+                        | HostedIrpTransportResult::Indeterminate {
+                            transport_status: status,
+                        }
+                        | HostedIrpTransportResult::Returned { status, .. } => status,
+                    };
+                    return invocation
+                        .returned(ExternalFileIrpOutcome::Indeterminate { transport_status });
+                }
+            }
+            ExternalFileIrpOutcome::Returned {
             status,
             information,
             file_context: major::is_create_major(projection.major).then_some(file_context),
-        },
+            }
+        }
         HostedIrpTransportResult::Indeterminate { transport_status } => {
             ExternalFileIrpOutcome::Indeterminate { transport_status }
         }
@@ -120,7 +184,11 @@ pub(super) fn copy(mut invocation: ExternalFileIrpCopyInvocation) -> ExternalFil
     let result = control(
         instance_index,
         irp_id,
-        FSD_DISPATCH_COPY_COMPLETION,
+        if invocation.capture_kind() == ExternalFileIrpOutputCapture::MethodNeitherInput {
+            FSD_DISPATCH_COPY_MUTABLE_INPUT
+        } else {
+            FSD_DISPATCH_COPY_COMPLETION
+        },
         offset,
         invocation.staging_mut(),
     );
@@ -150,7 +218,9 @@ pub(super) fn copy(mut invocation: ExternalFileIrpCopyInvocation) -> ExternalFil
     invocation.returned(outcome)
 }
 
-fn acknowledgement_result(result: HostedIrpTransportResult) -> ExternalFileIrpAcknowledgement {
+pub(super) fn acknowledgement_result(
+    result: HostedIrpTransportResult,
+) -> ExternalFileIrpAcknowledgement {
     match result {
         HostedIrpTransportResult::NotDispatched { status } => {
             ExternalFileIrpAcknowledgement::NotEntered { status }
@@ -225,7 +295,10 @@ pub(super) fn control(
 ) -> HostedIrpTransportResult {
     if !matches!(
         operation,
-        FSD_DISPATCH_ACK_COMPLETION | FSD_DISPATCH_COPY_COMPLETION | FSD_DISPATCH_CANCEL_IRP
+        FSD_DISPATCH_ACK_COMPLETION
+            | FSD_DISPATCH_COPY_COMPLETION
+            | FSD_DISPATCH_COPY_MUTABLE_INPUT
+            | FSD_DISPATCH_CANCEL_IRP
     ) || irp_id.raw() == 0
     {
         return HostedIrpTransportResult::NotDispatched {
@@ -274,6 +347,51 @@ pub(super) fn control(
     result
 }
 
+/// Issue a retained PnP ACK to its captured physical completion store. The dependent driver
+/// route is deliberately not resolved again: it may now name a different provider publication.
+pub(super) fn control_exact_storage(
+    storage_instance: usize,
+    storage_domain: HostedDomainIdentity,
+    irp_id: IrpId,
+    operation: u64,
+    offset: u64,
+    output: &mut [u8],
+) -> HostedIrpTransportResult {
+    if operation != FSD_DISPATCH_ACK_COMPLETION
+        || irp_id.raw() == 0
+        || instance(storage_instance).is_none_or(|inst| {
+            !inst.ready || instance_domain_identity(inst) != Some(storage_domain)
+        })
+        || io_manager_mut().hosted_domain_identity(storage_domain.domain_id)
+            != Some(storage_domain)
+        || unsafe { hosted_provider_dispatch_route_for_instance(storage_instance) }.is_some()
+    {
+        return HostedIrpTransportResult::NotDispatched {
+            status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+        };
+    }
+    unsafe {
+        dispatch_irp_for_instance_exact(
+            storage_instance,
+            operation,
+            0,
+            0,
+            irp_id.raw(),
+            0,
+            offset,
+            0,
+            0,
+            None,
+            &[],
+            output,
+            Some(crate::initial_system_driver_caller()),
+        )
+    }
+    .unwrap_or(HostedIrpTransportResult::NotDispatched {
+        status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+    })
+}
+
 pub(super) fn execute(
     instance_index: usize,
     caller: Option<nt_process::native_handle::NativeHandleCaller>,
@@ -310,8 +428,17 @@ pub(super) fn execute(
             output,
             caller,
         )
+    };
+    if result.is_none() {
+        print_str(b"[hosted-file] exact dispatch unavailable instance/device/irp=");
+        print_u64(instance_index as u64);
+        print_str(b"/");
+        print_hex_u64(projection.device_id.raw());
+        print_str(b"/");
+        print_hex_u64(projection.irp_id.raw());
+        print_str(b"\n");
     }
-    .unwrap_or(HostedIrpTransportResult::NotDispatched {
+    let result = result.unwrap_or(HostedIrpTransportResult::NotDispatched {
         status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
     });
     if projection.major == major::IRP_MJ_CREATE

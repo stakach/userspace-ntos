@@ -293,6 +293,9 @@ pub(super) unsafe fn release_unenrolled(instance_index: usize, inst: DriverInsta
     let Some(domain) = instance_domain_identity(inst) else {
         return false;
     };
+    if hosted_source_stack_lease::blocks_primary_retirement(instance_index, domain, inst.tcb, inst.pml4) {
+        return false;
+    }
     if hosted_video_caller_aperture::blocks_domain_retirement(
         crate::spawn_hosts::shared_ingress::owner::runtime::PhysicalDomain::Hosted(domain)) { return false; }
     if hosted_ingress_sources::primary_enrollment(instance_index).is_some()
@@ -355,6 +358,9 @@ pub(super) unsafe fn release(instance_index: usize, inst: DriverInstance) -> boo
     let Some(domain) = instance_domain_identity(inst) else {
         return false;
     };
+    if hosted_source_stack_lease::blocks_primary_retirement(instance_index, domain, inst.tcb, inst.pml4) {
+        return false;
+    }
     if hosted_video_caller_aperture::blocks_domain_retirement(
         crate::spawn_hosts::shared_ingress::owner::runtime::PhysicalDomain::Hosted(domain)) { return false; }
     let Some(enrollment) = hosted_ingress_sources::primary_enrollment(instance_index) else {

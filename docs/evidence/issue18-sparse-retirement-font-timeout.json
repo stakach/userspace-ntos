@@ -1,0 +1,38 @@
+{
+  "issue": 18,
+  "source_commit": "f32182c0159d896742269d263f9cb973c3638209",
+  "microkernel_commit": "eeaab1f8ba24e2c9b6bbeaab6b87dd177eb18015",
+  "profile": "font-cleanup",
+  "boot_bound_seconds": 3600,
+  "launcher_exit": 124,
+  "collector_exit": 0,
+  "collector_frames": 359,
+  "collector_final_slot": 0,
+  "strict_font_parser_exit": 1,
+  "termination": "Original one-hour boot deadline expired; supervisor terminated the process group. No guest summary or sentinel.",
+  "preboot_sha256": {
+    "rootserver": "571d8a127a3deca5b054e3bab53771703683715027fc2aed4ac0d3a2ba9a75eb",
+    "microkernel": "05e4edf2c9c112571663f806ee12a6a6c4b67760c7f404a59f3f8aac4451ee86",
+    "disk": "cef51df7ad7eb0b72e7ded572dfb613da0aab899cba77e5973b2fd7659428fb3",
+    "ntdll": "5c1a33cb4fbab7d10bb85490c0da83d24beca935487321590e246842fc4aff1c",
+    "font_acceptance": "1729483e54eba2e8b891beeae4dca6d3881f2f1ac45cbce90ba74c4e4908e6f3",
+    "font_run_setup": "f2238bde4b0d68808f01b1e7f5ce95817e03063db1a4616a63d15716e0bb85b5"
+  },
+  "artifact_sha256": {
+    "raw_log": "04da1d0a27fbf30917d756f2ab930d64047a04cbf3d245c287184ee79a8179d5",
+    "archived_log": "d91d22ec7fb5097e170bb8fd9de0df1c31ce3fd4f61aef1b8ff4ab20586f68cd",
+    "screenshot": "53ad5f5ac610f375103c4b38bc9dcda1b85defd34e60860272a02fff0da0c9cb"
+  },
+  "observations": [
+    "Complete native font image build exited zero. Exact-head crate CI37402072493 succeeded. MemoryManager546, AHCI15 and focused native9 tests passed separately.",
+    "Real font-run setup fixture registered its Run value and exited successfully; the font acceptance executable itself did not produce its required PID-QUERY receipt.",
+    "Real low-address Section base0x50000000 size0xa0000 ownerPI15 was mapped. The matching codepage20127 mutations committed generations1146/1147, followed by codepage28591 generation1149 and mscat32 demand load. These operations follow the former codepage20127 generation1145 allocation abort. No allocation abort occurred in this run.",
+    "Final printed census118 reports disk read1285501attempts/3582114requested sectors, write1541666attempts/2968883requested sectors, barrier6120attempts, all zero recorded failures. Final later snapshot generation2212 committed1105905bytes. The snapshot sector counter subsequently exceeded3330000; census values are an earlier sample, not final totals.",
+    "Helpers still report DevInstallW error2; successful process retirement is not successful device installation. QMP JIT snapshots show roughly1GiB cache capacity and zero translation-block cache flushes, not evidence that translation retirement is free.",
+    "Same-run final screenshot shows background and cursor only. No strict font terminal receipt, Userinit/Explorer execution or desktop proof exists. Deadline was not extended."
+  ],
+  "evidence": {
+    "log": "docs/evidence/issue18-sparse-retirement-font-timeout.log.gz",
+    "screenshot": "docs/images/sparse-retirement-font-timeout.png"
+  }
+}

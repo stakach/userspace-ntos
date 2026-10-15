@@ -1,0 +1,105 @@
+{
+  "parent_commit_at_capture": "2656a64506f7b7ced1acce3e2fbd5e1a7d7d6eb7",
+  "microkernel_base_commit": "1a0985b6f0d636b7299f4e7cd6271a226c2c0ffa",
+  "microkernel_candidate_commit": "7768fe4a545538edcfc7efee9be398f9479502aa",
+  "merged_microkernel_commit": "254aca0c408bfab28037f2e1dfa85e9a7bd4d8f1",
+  "merged_pull_request": "https://github.com/stakach/rust-micro/pull/14",
+  "merge_verification": "Root fetched the published squash merge and consumed git diff 7768fe4a545538edcfc7efee9be398f9479502aa..254aca0c408bfab28037f2e1dfa85e9a7bd4d8f1 --exit-code with exit0. Tested candidate and adopted merge have identical trees.",
+  "build_command": "env NTOS_IMAGE_PROFILE=font-cleanup IMAGE_MIB=256 PERSIST_IMAGE_MIB=16 ./scripts/build_kernel.sh microtest (working directory rust-micro)",
+  "guest_command": "gtimeout -k 10s 600s ./scripts/run_specs.sh (working directory rust-micro)",
+  "scope": "Native x86-64 microkernel specifications for fresh FrameMap insertion and post-clear physical paging-table translation retirement. Not an NT desktop or font acceptance run.",
+  "validation_owner": "Root agent consumed all build and guest exit statuses serially. This archive operation ran no builds or tests.",
+  "architecture_reference": {
+    "title": "Intel 64 and IA-32 Architectures Software Developer's Manual, Volume 3, section 4.10.4.3",
+    "url": "https://cdrdv2-public.intel.com/819714/253668-sdm-vol-3a.pdf",
+    "constraint": "Absent-to-present insertion can omit invalidation only when prior present-to-absent withdrawal has retired translations. This change does not infer translation absence from a capability's mapping metadata."
+  },
+  "production_change": "The actual leaf mutation reports InsertedAbsent or ReplacedPresent under BKL. FrameMap skips retirement only for InsertedAbsent; present replacements retain the existing synchronous all-online-CPU retirement. Explicit paging-structure Unmap retires all contexts after physically clearing the table, even if best-effort detach cannot find its recorded parent. The extracted retirement implementation preserves the existing CR4.PGE global/all-PCID flush and every target CPU's acknowledgement; AArch64 behavior is unchanged.",
+  "source_review": "Independent source review found no blocker. Original exact source-capability, root, ASID, range and rights validation remain. No scheduler/current-CPU guess replaces translation retirement authority.",
+  "builds": [
+    {
+      "phase": "fresh-map-red-build",
+      "session": 8845,
+      "exit": 0,
+      "source_log": ".tmp/issue18-frame-map-red-build.log",
+      "raw_log_sha256": "e0338f668bea4323fd98cde81e53e9d825e995723c62a207b29ab42ef766123b",
+      "archived_log": "issue18-frame-map-red-build.log.gz",
+      "archived_log_sha256": "0890fe25c151116d9f0c0c055245bf9719163182aeb4829e90c414288827b929"
+    },
+    {
+      "phase": "post-clear-security-red-build",
+      "session": 40268,
+      "exit": 0,
+      "source_log": ".tmp/issue18-table-clear-red-build.log",
+      "raw_log_sha256": "3ca905b4edd1d2f9d4b57144ca59d7753d8337d86fe1a78b28324897b941bd3f",
+      "archived_log": "issue18-table-clear-red-build.log.gz",
+      "archived_log_sha256": "31a23d2f1652ab3e07c7a09d971d89de07b05980c3202e3af5bbb4747dab80da"
+    },
+    {
+      "phase": "green-build",
+      "session": 54006,
+      "exit": 0,
+      "source_log": ".tmp/issue18-frame-map-green-build.log",
+      "raw_log_sha256": "f3f7b63b5c40ce5b3a51fe325f3650f6a0773c4e56c181796f1c9d3352f4b2d9",
+      "archived_log": "issue18-frame-map-green-build.log.gz",
+      "archived_log_sha256": "a73aeb78133e2d12406b15c3b058d564562096edc0b6f3535084976fc1e591e2"
+    }
+  ],
+  "attempts": [
+    {
+      "phase": "fresh-map-red",
+      "session": 47860,
+      "exit": 255,
+      "outcome": "Intended assertion failure: an absent insertion performed translation retirement. Log line246 reports panic at src/invocation/frame_mapping_retirement_specs.rs:20.",
+      "source_log": ".tmp/issue18-frame-map-red.log",
+      "raw_log_sha256": "3190fd119de65e415715e4cad6cbd70053a9222bc7e0852d93cbeb0d79aae5ed",
+      "archived_log": "issue18-frame-map-red.log.gz",
+      "archived_log_sha256": "e90f431607e3bdbcc5e003c3a580f00d3bfed9dc10d57605a593f60e36592712"
+    },
+    {
+      "phase": "post-clear-security-red",
+      "session": 79794,
+      "exit": 255,
+      "outcome": "Intended prerequisite failure: physical table clearing lacked completed post-clear retirement when its recorded parent was absent. Log line246 reports panic at src/invocation/table_clear_retirement_specs.rs:95.",
+      "source_log": ".tmp/issue18-table-clear-red.log",
+      "raw_log_sha256": "55ae287905465ad4abbc7e82133f5c94240d853b07ac0c49a7e51bf6f3646016",
+      "archived_log": "issue18-table-clear-red.log.gz",
+      "archived_log_sha256": "454112f508cb54beeaa6ba07c17a9d9a3fa28562064064930cce255fed76b70b"
+    },
+    {
+      "phase": "green",
+      "session": 48843,
+      "exit": 0,
+      "outcome": "Post-clear retirement at line246 and frame-map retirement at247 passed; All specs passed at380, microtest summary 15 passed/0 failed at417, and successful sentinel at419.",
+      "source_log": ".tmp/issue18-frame-map-green.log",
+      "raw_log_sha256": "233db2b980ce42025fe772bf7fdcd5f12c7c8fc537f7cc1e094065ffa2ca0672",
+      "archived_log": "issue18-frame-map-green.log.gz",
+      "archived_log_sha256": "f8abf9d9a94de536bc1e8cfdb40f64c0718fdf4f06f14d22c724f26d52bed6f3"
+    },
+    {
+      "phase": "green-repeat",
+      "session": 63836,
+      "exit": 0,
+      "outcome": "Unchanged-artifact repeat: post-clear retirement at246, frame-map retirement at247, All specs passed at380, microtest summary 15 passed/0 failed at417, and successful sentinel at419.",
+      "source_log": ".tmp/issue18-frame-map-green-repeat.log",
+      "raw_log_sha256": "1fd3efeb1fb64ef6f8b5203f17c76d50949166fe06365e62c71ae8c629a78319",
+      "archived_log": "issue18-frame-map-green-repeat.log.gz",
+      "archived_log_sha256": "9f2003e984afeab67f0fadc504775327111f2b3f83b9d9cec0cb8795e7df7e90"
+    }
+  ],
+  "artifacts_captured_before_next_build": {
+    "kernel_path": "rust-micro/target/mykernel-x86/release/mykernel-rust",
+    "kernel_sha256": "e88276894feee7c32c0f75682d41c7dc49f2c2c325354ad314e639ef2ab28efb",
+    "disk_path": "rust-micro/.tmp/disk.img",
+    "disk_sha256": "3155a1b982019f38e1c48e12734684ce923081f17eabee3db7576ea38d25371f",
+    "rootserver_path": "rust-micro/.tmp/rootserver.elf",
+    "rootserver_sha256": "04f665e90ec6142f969c576c0511f3e18f452a652a3d7e8b5024018da816fa0c",
+    "qualification": "Current spec/microtest artifacts captured during the repeat, before any further build. No RED artifact hash or NT executive desktop result is inferred."
+  },
+  "limitations": [
+    "The native tests establish mapping-retirement behavior, not a measured desktop boot speedup.",
+    "Issue286 IPC capability-transfer provenance is unchanged and remains open.",
+    "Issue287 early-startup failure is not resolved by these successful runs.",
+    "No font acceptance or genuine Explorer execution/rendering proof is claimed; prior desktop-frontier archives remain unchanged."
+  ]
+}

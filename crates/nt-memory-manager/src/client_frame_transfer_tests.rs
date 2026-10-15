@@ -22,7 +22,7 @@ fn fixture() -> (ClientFrameRegistry, Vec<ClientFrameRecord>) {
             )
             .unwrap();
     }
-    let records = registry.records().to_vec();
+    let records = registry.records().copied().collect::<Vec<_>>();
     (registry, records)
 }
 
@@ -46,7 +46,10 @@ fn transfer_retains_every_selected_row_until_final_commit() {
     assert_eq!(registry.get(8, 0x1000), Some(records[2]));
     registry.finish_transfer(transfer).unwrap();
     assert!(registry.is_process_empty(7));
-    assert_eq!(registry.records(), &records[2..]);
+    assert_eq!(
+        registry.records().copied().collect::<Vec<_>>(),
+        &records[2..]
+    );
 }
 
 #[test]
@@ -67,7 +70,7 @@ fn empty_or_duplicate_selections_leave_all_rows_unchanged() {
             registry.prepare_transfer_exact(&[records[0], records[1], duplicate]),
             Err(ClientFrameTransferError::DuplicateRecord),
         ));
-        assert_eq!(registry.records(), records);
+        assert_eq!(registry.records().copied().collect::<Vec<_>>(), records);
     }
 }
 
@@ -80,12 +83,12 @@ fn stale_or_missing_members_refuse_the_entire_selection() {
         } else {
             assert!(registry.touch(7, 0x2000));
         }
-        let before = registry.records().to_vec();
+        let before = registry.records().copied().collect::<Vec<_>>();
         assert!(matches!(
             registry.prepare_transfer_exact(&records[..2]),
             Err(ClientFrameTransferError::StaleRecord)
         ));
-        assert_eq!(registry.records(), before);
+        assert_eq!(registry.records().copied().collect::<Vec<_>>(), before);
         assert_eq!(registry.get(7, 0x1000), Some(records[0]));
     }
 }
@@ -114,14 +117,14 @@ fn allocation_failure_does_not_change_rows_or_consume_an_attempt() {
         )),
         Err(ClientFrameTransferError::InsufficientResources),
     ));
-    assert_eq!(registry.records(), records);
+    assert_eq!(registry.records().copied().collect::<Vec<_>>(), records);
     assert_eq!(counter.load(Ordering::Relaxed), 17);
     // Even an unusable supplied journal cannot trigger an allocation after the first row changes.
     assert!(matches!(
         registry.prepare_transfer_with(&records, &counter, |_| Ok(Vec::new())),
         Err(ClientFrameTransferError::InsufficientResources),
     ));
-    assert_eq!(registry.records(), records);
+    assert_eq!(registry.records().copied().collect::<Vec<_>>(), records);
     assert_eq!(counter.load(Ordering::Relaxed), 17);
 }
 
@@ -134,7 +137,7 @@ fn transfer_identity_exhaustion_never_wraps_or_claims_rows() {
             registry.prepare_transfer_with(&records, &counter, storage),
             Err(ClientFrameTransferError::IdentityExhausted),
         ));
-        assert_eq!(registry.records(), records);
+        assert_eq!(registry.records().copied().collect::<Vec<_>>(), records);
         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 }
@@ -161,7 +164,7 @@ fn ordinary_removal_and_exact_mutation_cannot_steal_transferred_rows() {
         assert_eq!(registry.get(held.pi, held.page), Some(held));
     }
     registry.finish_transfer(transfer).unwrap();
-    assert!(registry.records().is_empty());
+    assert!(registry.is_empty());
 }
 
 #[test]
@@ -215,8 +218,8 @@ fn wrong_registry_completion_returns_owner_intact_for_retry() {
     let (error, transfer) = other.finish_transfer(transfer).unwrap_err();
     assert_eq!(error, ClientFrameTransferError::StaleRecord);
     assert_eq!(transfer.records(), held);
-    assert_eq!(registry.records(), held);
-    assert_eq!(other.records(), other_records);
+    assert_eq!(registry.records().copied().collect::<Vec<_>>(), held);
+    assert_eq!(other.records().copied().collect::<Vec<_>>(), other_records);
     registry.finish_transfer(transfer).unwrap();
 }
 
@@ -229,18 +232,21 @@ fn final_commit_validates_the_whole_batch_before_removing_any_member() {
     registry.records[2].transfer_id = NonZeroU64::new(u64::MAX);
     let (error, transfer) = registry.finish_transfer(transfer).unwrap_err();
     assert_eq!(error, ClientFrameTransferError::StaleRecord);
-    assert_eq!(&registry.records()[..2], &held[..2]);
-    assert_eq!(registry.records().len(), 3);
+    assert_eq!(
+        &registry.records().copied().collect::<Vec<_>>()[..2],
+        &held[..2]
+    );
+    assert_eq!(registry.len(), 3);
     registry.records[2] = held[2];
     registry.finish_transfer(transfer).unwrap();
-    assert!(registry.records().is_empty());
+    assert!(registry.is_empty());
 }
 
 #[test]
 fn dropping_a_transfer_retains_its_unavailable_placeholders() {
     let (mut registry, records) = fixture();
     drop(registry.prepare_transfer_exact(&records).unwrap());
-    assert_eq!(registry.records().len(), records.len());
+    assert_eq!(registry.len(), records.len());
     for record in records {
         assert!(!registry.get(record.pi, record.page).unwrap().is_resident());
         assert_eq!(registry.take(record.pi, record.page), None);
@@ -269,7 +275,7 @@ fn unrelated_vector_growth_and_swap_removal_do_not_change_transfer_ownership() {
     registry.take(8, 0x1000).unwrap();
     registry.finish_transfer(transfer).unwrap();
     assert!(registry.is_process_empty(7));
-    assert_eq!(registry.records().len(), 50);
+    assert_eq!(registry.len(), 50);
 }
 
 #[test]
@@ -280,7 +286,10 @@ fn independent_transfers_finish_without_releasing_each_others_rows() {
     assert_ne!(first.id, second.id);
     let second_record = second.records()[0];
     registry.finish_transfer(first).unwrap();
-    assert_eq!(registry.records(), &[second_record]);
+    assert_eq!(
+        registry.records().copied().collect::<Vec<_>>(),
+        &[second_record]
+    );
     registry.finish_transfer(second).unwrap();
 }
 

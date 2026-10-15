@@ -82,6 +82,14 @@ pub enum AcquireResult {
     WouldBlock,
 }
 
+/// Bounded read-only ownership view for diagnosing a rejected native acquire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResourceOwnershipSnapshot {
+    pub exclusive: bool,
+    pub owner_count: usize,
+    pub owners: [(u64, u32); 4],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 struct NativeOwnerEntry {
@@ -228,6 +236,19 @@ impl ExecutiveResourceStore {
         self.resources
             .iter()
             .position(|resource| resource.address == address)
+    }
+
+    pub fn ownership_snapshot(&self, address: u64) -> Option<ResourceOwnershipSnapshot> {
+        let state = &self.resources[self.index_of(address)?];
+        let mut owners = [(0, 0); 4];
+        for (slot, owner) in owners.iter_mut().zip(state.owners.iter()) {
+            *slot = (owner.thread, owner.recursion);
+        }
+        Some(ResourceOwnershipSnapshot {
+            exclusive: state.exclusive,
+            owner_count: state.owners.len(),
+            owners,
+        })
     }
 
     /// Initializes caller-owned native `ERESOURCE` storage and registers its ownership state.

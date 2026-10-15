@@ -32,7 +32,7 @@ impl Memory {
     }
 
     fn publish(&mut self, pending: PendingFileIo) -> Result<(), MemoryCopyFailure> {
-        let (status, information) = pending.local_terminal_result().unwrap();
+        let (status, information) = pending.owned_terminal_result().unwrap();
         publish_file_io_status_checked(pending.iosb_va, status, information, |address, bytes| {
             let index = self.writes.len();
             self.writes.push((address, bytes.len()));
@@ -72,7 +72,7 @@ fn fixture() -> (FileSystem, u64, PendingFileIoTable, usize) {
                 irp_id: ID,
                 tid: 70,
                 major: nt_io_abi::major::IRP_MJ_WRITE,
-                operation: PendingFileIoOperation::LocalInline(PendingLocalInline {
+                operation: PendingFileIoOperation::OwnedInline(PendingOwnedInline {
                     status: result.0,
                     information: result.1 as u64,
                 }),
@@ -127,7 +127,7 @@ fn finish_other_surfaces(
         (for_apc.apc_routine, for_apc.apc_context, for_apc.iosb_va),
         (APC, APC_CONTEXT, IOSB)
     );
-    assert_eq!(for_apc.local_terminal_result(), Some((STATUS_SUCCESS, 4)));
+    assert_eq!(for_apc.owned_terminal_result(), Some((STATUS_SUCCESS, 4)));
     table
         .mark_delivery_exact(slot, ID, IO_DELIVERY_APC_PUBLISHED)
         .unwrap();
@@ -144,15 +144,15 @@ fn finish_other_surfaces(
     assert_eq!(fs.zw_close(handle), STATUS_SUCCESS);
     assert!(fs.query_file_object_information(handle).is_ok());
     assert!(table
-        .mark_local_reference_released_exact(slot, ID + 1)
+        .mark_owned_reference_released_exact(slot, ID + 1)
         .is_none());
     assert!(table.finish_exact(slot, ID).is_none());
     fs.zw_release_io_reference(handle).unwrap();
-    table.mark_local_reference_released_exact(slot, ID).unwrap();
+    table.mark_owned_reference_released_exact(slot, ID).unwrap();
     let retired = table.finish_exact(slot, ID).unwrap();
     assert_eq!(
-        retired.local_terminal_result(),
-        original.local_terminal_result()
+        retired.owned_terminal_result(),
+        original.owned_terminal_result()
     );
     assert_eq!(retired.iosb_va, original.iosb_va);
     assert_eq!(
@@ -206,8 +206,8 @@ fn same_access_violation_retries_or_settles_according_to_typed_copy_failure() {
                 );
                 assert_eq!(faulted.delivery_state & IO_DELIVERY_IOSB_PUBLISHED, 0);
                 assert_eq!(
-                    faulted.local_terminal_result(),
-                    before.local_terminal_result()
+                    faulted.owned_terminal_result(),
+                    before.owned_terminal_result()
                 );
                 assert_eq!(faulted.iosb_va, IOSB);
                 assert!(table
@@ -232,7 +232,7 @@ fn permanent_guard_fault_does_not_claim_iosb_publication_or_replace_terminal_res
         assert_partial(&memory, failed_store);
         table.mark_iosb_faulted_exact(slot, ID, IOSB).unwrap();
         let faulted = table.get(slot).unwrap();
-        assert_eq!(faulted.local_terminal_result(), Some((STATUS_SUCCESS, 4)));
+        assert_eq!(faulted.owned_terminal_result(), Some((STATUS_SUCCESS, 4)));
         assert_eq!(faulted.delivery_state & IO_DELIVERY_IOSB_PUBLISHED, 0);
         assert!(table.mark_iosb_faulted_exact(slot, ID, IOSB).is_none());
         finish_other_surfaces(&mut fs, handle, &mut table, slot);

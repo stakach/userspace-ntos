@@ -29,6 +29,165 @@ fn identity(lanes: &Lanes, lane: LaneHandle) -> LaneDispatchIdentity {
 }
 
 #[test]
+fn service_wait_admission_preserves_exact_external_ownership() {
+    let mut lanes = Lanes::new(2, 4);
+    let lane = lanes.allocate(binding(1)).unwrap();
+    let peer = lanes.allocate(binding(2)).unwrap();
+    let reply = binding(1).reply_object;
+    lanes.begin_dispatch(lane, reply).unwrap();
+    let dispatch = identity(&lanes, lane);
+    assert_eq!(
+        lanes.admit_running_owned(lane, reply, SuspensionKey::service_wait(7), 1, owner(1), 99),
+        Err((LaneError::InvalidPhase, 99)),
+    );
+    lanes.suspend_running(lane, reply, 41).unwrap();
+    let key = SuspensionKey::service_wait(7);
+    let stale = LaneHandle { generation: lane.generation + 1, ..lane };
+    for (handle, bound_reply, job, token, expected) in [
+        (stale, reply, dispatch, 41, LaneError::StaleGeneration),
+        (lane, binding(2).reply_object, dispatch, 41, LaneError::WrongBinding),
+        (lane, reply, LaneDispatchIdentity { lane: peer, epoch: dispatch.epoch() }, 41, LaneError::InvalidIdentity),
+        (lane, reply, dispatch, 42, LaneError::InvalidPhase),
+    ] {
+        assert_eq!(
+            lanes.admit_service_wait_external_owned(handle, bound_reply, job, token, key, 1, owner(1), 99),
+            Err((expected, 99)),
+        );
+        assert_eq!(lanes.external_top(lane), Ok(Some(41)));
+        assert_eq!(lanes.suspension_count(lane), Ok(0));
+    }
+    let invalid_owner = SuspensionOwner { provider_generation: 0, ..owner(1) };
+    assert_eq!(
+        lanes.admit_service_wait_external_owned(lane, reply, dispatch, 41, key, 1, invalid_owner, 99),
+        Err((LaneError::Suspension(SuspensionError::InvalidIdentity), 99)),
+    );
+    lanes.admit_service_wait_external_owned(lane, reply, dispatch, 41, key, 1, owner(1), 99).unwrap();
+    assert_eq!(lanes.running(), None);
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::Suspended));
+    assert_eq!(lanes.external_top(lane), Ok(Some(41)));
+    assert_eq!(lanes.top(lane).unwrap().unwrap().key, key);
+    assert_eq!(
+        lanes.admit_service_wait_external_owned(lane, reply, dispatch, 41, key, 2, owner(2), 100),
+        Err((LaneError::Suspension(SuspensionError::DuplicateIdentity), 100)),
+    );
+    lanes.resume_external(lane, reply, 41).unwrap();
+    assert_eq!(lanes.running(), Some(lane));
+    assert_eq!(lanes.external_top(lane), Ok(Some(41)));
+    assert_eq!(
+        lanes.retire_service_wait_external_running(lane, reply, dispatch, 42, key, owner(1)),
+        Err(LaneError::InvalidPhase),
+    );
+    assert_eq!(
+        lanes.retire_service_wait_external_running(lane, reply, dispatch, 41, key, owner(2)),
+        Err(LaneError::WrongBinding),
+    );
+    lanes.retire_service_wait_external_running(lane, reply, dispatch, 41, key, owner(1)).unwrap();
+    assert_eq!(lanes.running(), None);
+    assert_eq!(lanes.external_top(lane), Ok(None));
+    lanes.select(key, 0).unwrap();
+    lanes.begin_resume(lane, reply, key).unwrap();
+    assert_eq!(lanes.running(), Some(lane));
+}
+
+#[test]
+fn service_wait_rearm_after_exact_new_external_park_preserves_both_continuations() {
+    let mut lanes = Lanes::new(1, 4);
+    let lane = lanes.allocate(binding(1)).unwrap();
+    let reply = binding(1).reply_object;
+    lanes.begin_dispatch(lane, reply).unwrap();
+    let dispatch = identity(&lanes, lane);
+    lanes.suspend_running(lane, reply, 41).unwrap();
+    let old = SuspensionKey::service_wait(1);
+    let next = SuspensionKey::service_wait(2);
+    lanes.admit_service_wait_external_owned(lane, reply, dispatch, 41, old, 1, owner(1), 99).unwrap();
+    lanes.resume_external(lane, reply, 41).unwrap();
+    lanes.retire_service_wait_external_running(lane, reply, dispatch, 41, old, owner(1)).unwrap();
+    lanes.select(old, 0).unwrap();
+    lanes.begin_resume(lane, reply, old).unwrap();
+    lanes.suspend_running(lane, reply, 42).unwrap();
+    for (job, token, completed, new, caller, expected) in [
+        (LaneDispatchIdentity { lane, epoch: dispatch.epoch() + 1 }, 42, old, next, owner(1), LaneError::InvalidIdentity),
+        (dispatch, 43, old, next, owner(1), LaneError::InvalidPhase),
+        (dispatch, 42, old, old, owner(1), LaneError::Suspension(SuspensionError::DuplicateIdentity)),
+        (dispatch, 42, old, next, owner(2), LaneError::Suspension(SuspensionError::InvalidPhase)),
+    ] {
+        assert_eq!(
+            lanes.rearm_service_wait_external_owned(lane, reply, job, token, completed, new, 2, caller, 100),
+            Err((expected, 100)),
+        );
+        assert_eq!(lanes.external_top(lane), Ok(Some(42)));
+        assert_eq!(lanes.top(lane).unwrap().unwrap().key, old);
+        assert_eq!(lanes.top(lane).unwrap().unwrap().continuation, 99);
+    }
+    assert_eq!(
+        lanes.rearm_service_wait_external_owned(lane, reply, dispatch, 42, old, next, 2, owner(1), 100),
+        Ok(99),
+    );
+    assert_eq!(lanes.running(), None);
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::Suspended));
+    assert_eq!(lanes.external_top(lane), Ok(Some(42)));
+    assert_eq!(lanes.top(lane).unwrap().unwrap().key, next);
+    assert_eq!(lanes.top(lane).unwrap().unwrap().phase, SuspensionPhase::Waiting);
+}
+
+#[test]
+fn resumed_provider_and_lpc_waits_can_repark_as_service_wait() {
+    for old in [SuspensionKey::provider_wait(1), SuspensionKey::lpc_request(1)] {
+        let mut lanes = Lanes::new(1, 4);
+        let lane = lanes.allocate(binding(1)).unwrap();
+        let reply = binding(1).reply_object;
+        lanes.begin_dispatch(lane, reply).unwrap();
+        let dispatch = identity(&lanes, lane);
+        lanes.admit_running(lane, reply, old, 1, owner(1), 99).unwrap();
+        lanes.select(old, 0).unwrap();
+        lanes.begin_resume(lane, reply, old).unwrap();
+        lanes.suspend_running(lane, reply, 41).unwrap();
+        let next = SuspensionKey::service_wait(2);
+        let before = lanes.top(lane).unwrap().unwrap().clone();
+        assert_eq!(
+            lanes.rearm_service_wait_external_owned(lane, reply, dispatch, 42, old, next, 2, owner(1), 100),
+            Err((LaneError::InvalidPhase, 100)),
+        );
+        assert_eq!(lanes.top(lane).unwrap(), Some(&before));
+        assert_eq!(
+            lanes.rearm_service_wait_external_owned(lane, reply, dispatch, 41, old, next, 2, owner(1), 100),
+            Ok(99),
+        );
+        assert_eq!(lanes.phase(lane), Ok(LanePhase::Suspended));
+        assert_eq!(lanes.external_top(lane), Ok(Some(41)));
+        assert_eq!(lanes.top(lane).unwrap().unwrap().key, next);
+    }
+}
+
+#[test]
+fn callback_to_service_wait_transfers_only_the_exact_lower_external_token() {
+    let mut lanes = Lanes::new(1, 4);
+    let lane = lanes.allocate(binding(1)).unwrap();
+    let reply = binding(1).reply_object;
+    lanes.begin_dispatch(lane, reply).unwrap();
+    let dispatch = identity(&lanes, lane);
+    lanes.suspend_running(lane, reply, 10).unwrap();
+    lanes.resume_external(lane, reply, 10).unwrap();
+    lanes.suspend_running(lane, reply, 41).unwrap();
+    let key = SuspensionKey::service_wait(7);
+    assert_eq!(
+        lanes.transfer_callback_to_service_wait_external_owned(
+            lane, reply, dispatch, 11, 41, key, 1, owner(1), 99,
+        ),
+        Err((LaneError::InvalidPhase, 99)),
+    );
+    assert_eq!(lanes.external_depth(lane), Ok(2));
+    assert_eq!(lanes.suspension_count(lane), Ok(0));
+    lanes.transfer_callback_to_service_wait_external_owned(
+        lane, reply, dispatch, 10, 41, key, 1, owner(1), 99,
+    ).unwrap();
+    assert_eq!(lanes.external_depth(lane), Ok(1));
+    assert_eq!(lanes.external_top(lane), Ok(Some(41)));
+    assert_eq!(lanes.top(lane).unwrap().unwrap().key, key);
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::Suspended));
+}
+
+#[test]
 fn idle_completion_and_next_job_have_distinct_authority() {
     let mut lanes = Lanes::new(1, 4);
     let lane = lanes.allocate(binding(1)).unwrap();

@@ -1,4 +1,4 @@
-//! Static native suspension fixture validation through the executive's PE loader.
+//! Static native fixture validation through the executive's PE loader.
 use std::{collections::BTreeSet, path::Path, process::ExitCode};
 
 use nt_pe_loader::{ImportRef, PeFile};
@@ -19,11 +19,20 @@ const IMPORTS: [&str; 12] = [
     "NtTerminateProcess",
 ];
 
+const FILE_IMPORTS: &[&str] = &[
+    "NtCreateFile", "NtOpenFile", "NtReadFile", "NtWriteFile", "NtQueryInformationFile",
+    "NtSetInformationFile", "NtDuplicateObject",
+    "NtAllocateVirtualMemory", "NtProtectVirtualMemory", "NtFreeVirtualMemory",
+    "NtCreateEvent", "NtWaitForSingleObject", "NtClose", "NtDisplayString", "NtTerminateProcess",
+    "NtTerminateThread", "RtlCreateUserThread", "NtOpenKey", "NtQueryKey",
+    "NtQueryInformationProcess",
+];
+
 fn require(condition: bool, message: &str) -> Result<(), String> {
     condition.then_some(()).ok_or_else(|| message.to_owned())
 }
 
-fn verify(exe_path: &Path, dll_path: &Path) -> Result<(), String> {
+fn verify(exe_path: &Path, dll_path: &Path, expected_imports: &[&str]) -> Result<(), String> {
     let exe_bytes = std::fs::read(exe_path).map_err(|e| format!("fixture: {e}"))?;
     let dll_bytes = std::fs::read(dll_path).map_err(|e| format!("ntdll: {e}"))?;
     let exe = PeFile::parse(&exe_bytes).map_err(|e| format!("fixture parse: {e:?}"))?;
@@ -124,26 +133,28 @@ fn verify(exe_path: &Path, dll_path: &Path) -> Result<(), String> {
         require(actual == address, &format!("{name} IAT readback mismatch"))?;
     }
     require(
-        seen == IMPORTS.into_iter().collect(),
-        &format!("fixture import set differs from the exact twelve APIs: {seen:?}"),
+        seen == expected_imports.iter().copied().collect(),
+        &format!("fixture import set differs from its exact declared APIs: {seen:?}"),
     )?;
     println!(
-        "PASS static artifact: AMD64 native PE, twelve exact ntdll imports bound by nt-pe-loader"
+        "PASS static artifact: AMD64 native PE, exact ntdll imports bound by nt-pe-loader"
     );
     println!("nonpreferred mapping: fixture={exe_base:#x} ntdll={dll_base:#x}");
     println!("fixture SHA256 {:x}", Sha256::digest(&exe_bytes));
     println!("ntdll SHA256 {:x}", Sha256::digest(&dll_bytes));
-    println!("Guest execution and suspension acceptance have NOT been run by this verifier.");
+    println!("Guest execution and native acceptance have NOT been run by this verifier.");
     Ok(())
 }
 
 fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.len() != 2 {
-        eprintln!("usage: nt-native-test-verify <thread_suspend.exe> <our-ntdll.dll>");
+    let expected_imports: &[&str] = if args.len() == 2 { &IMPORTS }
+        else if args.len() == 3 && args[2] == "file-acceptance" { FILE_IMPORTS }
+        else {
+        eprintln!("usage: nt-native-test-verify <fixture.exe> <our-ntdll.dll> [file-acceptance]");
         return ExitCode::FAILURE;
-    }
-    match verify(Path::new(&args[0]), Path::new(&args[1])) {
+    };
+    match verify(Path::new(&args[0]), Path::new(&args[1]), expected_imports) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("FAIL static artifact: {error}");

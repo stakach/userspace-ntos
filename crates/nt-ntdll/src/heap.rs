@@ -1116,6 +1116,90 @@ impl<B: Backing> Heap<B> {
         self.free(payload);
         Some(dst)
     }
+
+    /// Move one live block to a different segment of the same logical heap. Allocation and
+    /// metadata installation finish before the source is retired, so exhaustion leaves it live.
+    ///
+    /// # Safety
+    /// `payload` must be a live allocation in `self`; `destination` must belong to the same
+    /// logical heap and have disjoint backing storage.
+    pub unsafe fn relocate_to(
+        &mut self,
+        destination: &mut Self,
+        payload: *mut u8,
+        new_size: usize,
+        flags: u32,
+    ) -> Option<*mut u8> {
+        let old_size = self.size_of(payload)?;
+        let info = self.user_info(payload)?;
+        let allocation_flags = if info.has_user_value {
+            (flags & !HEAP_SETTABLE_USER_FLAGS) | HEAP_SETTABLE_USER_VALUE | info.user_flags
+        } else {
+            flags
+        };
+        let moved = destination.allocate_with_flags(new_size, allocation_flags)?;
+        if info.has_user_value && !destination.set_user_value(moved, info.user_value) {
+            let _ = destination.free(moved);
+            return None;
+        }
+        core::ptr::copy_nonoverlapping(payload, moved, old_size.min(new_size));
+        if !self.free(payload) {
+            let _ = destination.free(moved);
+            return None;
+        }
+        Some(moved)
+    }
+}
+
+/// Reallocate within a logical process heap made of one primary heap and occupied peer slots.
+/// A caller may create a new segment only after this returns `None`.
+///
+/// # Safety
+/// `payload` must be a live allocation in the primary or exactly one peer. All backing regions
+/// must be disjoint, and the caller must exclude concurrent heap mutation for the whole operation.
+pub unsafe fn reallocate_in_process_segments<B: Backing, const N: usize>(
+    primary: &mut Heap<B>,
+    peers: &mut [Option<Heap<B>>; N],
+    payload: *mut u8,
+    new_size: usize,
+    flags: u32,
+    in_place_only: bool,
+) -> Option<*mut u8> {
+    if primary.size_of(payload).is_some() {
+        if let Some(result) = primary.reallocate_with_flags(payload, new_size, flags, in_place_only)
+        {
+            return Some(result);
+        }
+        if !in_place_only {
+            for peer in peers.iter_mut().filter_map(Option::as_mut) {
+                if let Some(result) = primary.relocate_to(peer, payload, new_size, flags) {
+                    return Some(result);
+                }
+            }
+        }
+        return None;
+    }
+
+    let owner_index = peers
+        .iter()
+        .position(|entry| entry.as_ref().is_some_and(|heap| heap.size_of(payload).is_some()))?;
+    let (before, owner_and_after) = peers.split_at_mut(owner_index);
+    let (owner_slot, after) = owner_and_after.split_first_mut()?;
+    let owner = owner_slot.as_mut()?;
+    if let Some(result) = owner.reallocate_with_flags(payload, new_size, flags, in_place_only) {
+        return Some(result);
+    }
+    if !in_place_only {
+        if let Some(result) = owner.relocate_to(primary, payload, new_size, flags) {
+            return Some(result);
+        }
+        for peer in before.iter_mut().chain(after.iter_mut()).filter_map(Option::as_mut) {
+            if let Some(result) = owner.relocate_to(peer, payload, new_size, flags) {
+                return Some(result);
+            }
+        }
+    }
+    None
 }
 
 /// Result of attempting to remove a private heap from a [`HeapRegistry`].
@@ -2019,6 +2103,95 @@ mod tests {
             assert!(core::slice::from_raw_parts(r, 32)
                 .iter()
                 .all(|&x| x == 0x33)); // preserved
+        }
+    }
+
+    #[test]
+    fn realloc_moves_to_free_peer_segment_when_owner_is_full() {
+        let mut owner = heap(1024);
+        let mut peer = heap(1024);
+        let old = owner
+            .allocate_with_flags(16, HEAP_SETTABLE_USER_VALUE | 0x200)
+            .unwrap();
+        // LookupInit's third hash entry grows 16 -> 24 bytes. The next live block prevents
+        // in-place growth, and the remaining tail cannot hold another complete block.
+        let _blocker = owner.allocate(928).unwrap();
+        let peer_blocker = peer.allocate(976).unwrap();
+        // SAFETY: all pointers are exact live allocations in their named heaps.
+        unsafe {
+            core::ptr::write_bytes(old, 0x5a, 16);
+            assert!(owner.set_user_value(old, 0x1234));
+            assert!(owner.reallocate_with_flags(old, 24, 0, false).is_none());
+            assert!(owner.relocate_to(&mut peer, old, 24, 0).is_none());
+            assert_eq!(owner.size_of(old), Some(16));
+            assert_eq!(owner.user_info(old).unwrap().user_value, 0x1234);
+            assert!(peer.free(peer_blocker));
+
+            let moved = owner.relocate_to(&mut peer, old, 24, HEAP_ZERO_MEMORY).unwrap();
+            assert_eq!(owner.size_of(old), None);
+            assert_eq!(peer.size_of(moved), Some(24));
+            assert_eq!(peer.user_info(moved).unwrap().user_value, 0x1234);
+            assert_eq!(peer.user_info(moved).unwrap().user_flags, 0x200);
+            assert!(core::slice::from_raw_parts(moved, 16).iter().all(|&b| b == 0x5a));
+            assert!(core::slice::from_raw_parts(moved.add(16), 8)
+                .iter()
+                .all(|&b| b == 0));
+        }
+    }
+
+    #[test]
+    fn process_realloc_uses_occupied_peer_when_all_segment_slots_are_taken() {
+        let mut primary = heap(1024);
+        let _primary_blocker = primary.allocate(976).unwrap();
+        let mut peers: [Option<_>; 8] = core::array::from_fn(|_| Some(heap(1024)));
+        let owner = peers[0].as_mut().unwrap();
+        let old = owner
+            .allocate_with_flags(16, HEAP_SETTABLE_USER_VALUE | 0x200)
+            .unwrap();
+        let _owner_blocker = owner.allocate(928).unwrap();
+        assert!(unsafe { owner.set_user_value(old, 0x1234) });
+        unsafe { core::ptr::write_bytes(old, 0x5a, 16) };
+        let mut last_peer_blocker = core::ptr::null_mut();
+        for (index, peer) in peers[1..].iter_mut().enumerate() {
+            let blocker = peer.as_mut().unwrap().allocate(976).unwrap();
+            if index == 6 {
+                last_peer_blocker = blocker;
+            }
+        }
+        assert!(unsafe { peers[7].as_mut().unwrap().free(last_peer_blocker) });
+        assert!(peers.iter().all(Option::is_some));
+
+        unsafe {
+            assert!(reallocate_in_process_segments(
+                &mut primary,
+                &mut peers,
+                old,
+                24,
+                HEAP_ZERO_MEMORY,
+                true,
+            )
+            .is_none());
+            assert_eq!(peers[0].as_ref().unwrap().size_of(old), Some(16));
+
+            let moved = reallocate_in_process_segments(
+                &mut primary,
+                &mut peers,
+                old,
+                24,
+                HEAP_ZERO_MEMORY,
+                false,
+            )
+            .unwrap();
+            assert_eq!(peers[0].as_ref().unwrap().size_of(old), None);
+            assert_eq!(peers[7].as_ref().unwrap().size_of(moved), Some(24));
+            let metadata = peers[7].as_ref().unwrap().user_info(moved).unwrap();
+            assert!(metadata.has_user_value);
+            assert_eq!(metadata.user_value, 0x1234);
+            assert_eq!(metadata.user_flags, 0x200);
+            assert!(core::slice::from_raw_parts(moved, 16).iter().all(|&byte| byte == 0x5a));
+            assert!(core::slice::from_raw_parts(moved.add(16), 8)
+                .iter()
+                .all(|&byte| byte == 0));
         }
     }
 

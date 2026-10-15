@@ -1,0 +1,42 @@
+{
+  "issue": 18,
+  "related_issue": 302,
+  "source_commit": "6a97ed61a94621eca21e31afe359d0231f968cf5",
+  "microkernel_commit": "2debcee98856ea648924c9ddf0c20a491750668b",
+  "profile": "font-cleanup",
+  "boot_bound_seconds": 900,
+  "build_exit": 0,
+  "launcher_exit": 130,
+  "collector_exit": 0,
+  "collector_frames": 27,
+  "collector_final_slot": 0,
+  "exact_head_ci": 37469580734,
+  "termination": "Stopped deliberately after the real checkpoint hook emitted receipts and the known unresolved IoStartNextPacket import recurred. The 900-second bound was not extended or reached. Guest and collector final exits were consumed before the next source regression run. This was diagnostic coverage, not a complete font or desktop acceptance attempt.",
+  "preboot_sha256": {
+    "rootserver": "8df516d4738b3019c22010d18b58ae0348dcd9ca6866f99057c9bca4cf4a521e",
+    "microkernel": "fc0e1ca81c3130a8603f879771ff819edf9dc3fd5a59da2eb7a4d83790d9bb37",
+    "staged_esp_kernel": "f148ca228efcb73aa79fc50729d2ab2833a1665ec583087468c8190028258503",
+    "disk": "634b4363fa785a23cb83865c71ceaa2084c4f2ff4e216aade5d24bc60af04a60",
+    "ntdll": "5c1a33cb4fbab7d10bb85490c0da83d24beca935487321590e246842fc4aff1c",
+    "font_acceptance": "1729483e54eba2e8b891beeae4dca6d3881f2f1ac45cbce90ba74c4e4908e6f3",
+    "font_run_setup": "f2238bde4b0d68808f01b1e7f5ce95817e03063db1a4616a63d15716e0bb85b5"
+  },
+  "artifact_sha256": {
+    "raw_log": "4048dd3ae138c8da3933bfb41ffe1b16a55cb722b26511bb401b74cb6929c6d9",
+    "collector_log": "06a03d672a714dbd178fced6deb5bcb44b933c945a33f4e45de2348c831d1412",
+    "archived_log": "30234695c10a06cb1fa0e91436b38794ea30677e027477d083f984ff01a88c19",
+    "archived_collector_log": "0e3bec2af97d5400e0b070fead9a059063d9bf9b971473e4a39dc6215236765f",
+    "screenshot": "53ad5f5ac610f375103c4b38bc9dcda1b85defd34e60860272a02fff0da0c9cb"
+  },
+  "observations": [
+    "The actual retained SYSTEM-journal make_durable path emitted bounded registry-checkpoint receipts with admitted mount1, journal extent, direct phase transition and retained snapshot proof. This is live native instrumentation, not only a dormant adapter or formatter fixture.",
+    "Lifetime receipt53 reports journal176 bytes, AppendPending to Durable, successful result, snapshot generation329 and snapshot591819 bytes, elapsed169310 100ns units (16.931ms), read291 attempts/1158 requested sectors, write290 attempts/1157 requested sectors, and three barriers. Recorded command failures are zero. Counters are inclusive observations and requested sectors, not exclusive per-operation completion authority or transferred/durable byte accounting; this sample does not establish overall boot-time dominance.",
+    "The new source ownership and native allocation-inventory changes compiled in the full image, with exact-head crate CI successful. The fresh boot still rejects i8042prt.sys on unresolved IoStartNextPacket. No new native fault-injection result is claimed.",
+    "The explicitly inspected final same-run screenshot is background and cursor only. Strict font terminal acceptance and separate genuine production Userinit/Explorer desktop proof remain open. Source-only File projection adoption tests prepared after launch were not part of this image."
+  ],
+  "evidence": {
+    "log": "docs/evidence/issue18-registry-checkpoint-probe.log.gz",
+    "collector_log": "docs/evidence/issue18-registry-checkpoint-probe-qmp.log.gz",
+    "screenshot": "docs/images/registry-checkpoint-probe.png"
+  }
+}

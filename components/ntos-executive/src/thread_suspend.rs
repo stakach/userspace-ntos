@@ -92,82 +92,109 @@ pub(crate) unsafe fn publish_dormant(handler: &ExecNtHandler, tid: u64) -> Resul
     Ok(())
 }
 
+/// An entered invocation is not a failed admission unless its retained owner proves no effects.
+pub(crate) enum InitialThreadStartOutcome {
+    Committed,
+    RefusedNoEffects(u32),
+    Retained(u32),
+}
+
 /// Admit the first NtCreateThread against its exact, never-started main TCB. Publish the dormant
 /// owner only after count admission succeeds, then retain it through physical and PM ACKs.
 pub(crate) unsafe fn create_initial_thread(
     handler: &mut ExecNtHandler,
-    tid: nt_process::ThreadId,
+    lifetime: nt_process::ThreadLifetime,
     create_suspended: bool,
-) -> Result<(), u32> {
-    let lifetime = handler
-        .pm
-        .thread_lifetime(tid)
-        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-    let binding = handler
-        .thread_runtime
-        .executable_by_tid(u64::from(tid))
-        .ok_or(nt_process::STATUS_DEVICE_BUSY)?
-        .binding();
-    let invocation = {
-        let table = &*handler.thread_runtime.table;
-        let runtime = table
-            .entries
-            .iter()
-            .filter_map(|slot| slot.owner())
-            .find(|owner| owner.binding() == binding)
-            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        let mut slot = runtime
-            .suspension
-            .owner
-            .try_borrow_mut()
-            .map_err(|_| nt_process::STATUS_DEVICE_BUSY)?;
-        if handler
-            .pm
-            .thread(tid)
-            .ok_or(nt_process::STATUS_INVALID_HANDLE)?
-            .suspend_count
-            != 0
-        {
-            return Err(nt_process::STATUS_DEVICE_BUSY);
+    binding: nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
+) -> InitialThreadStartOutcome {
+    let tid = lifetime.thread_id();
+    let mut prepared = false;
+    let result = (|| -> Result<(), u32> {
+        if binding.tid != u64::from(tid) || !handler.pm.validate_thread_lifetime(lifetime) {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
         }
-        let mut fresh = if slot.is_none() {
-            Some(Owner::dormant(binding, lifetime).map_err(status)?)
-        } else {
-            None
+        let invocation = {
+            let table = &*handler.thread_runtime.table;
+            let runtime = table
+                .entries
+                .iter()
+                .filter_map(|slot| slot.owner())
+                .find(|owner| owner.binding() == binding)
+                .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+            let mut slot = runtime
+                .suspension
+                .owner
+                .try_borrow_mut()
+                .map_err(|_| nt_process::STATUS_DEVICE_BUSY)?;
+            if handler
+                .pm
+                .thread(tid)
+                .ok_or(nt_process::STATUS_INVALID_HANDLE)?
+                .suspend_count
+                != 0
+            {
+                return Err(nt_process::STATUS_DEVICE_BUSY);
+            }
+            let mut fresh = if slot.is_none() {
+                Some(Owner::dormant(binding, lifetime).map_err(status)?)
+            } else {
+                None
+            };
+            let owner = slot
+                .as_mut()
+                .or(fresh.as_mut())
+                .expect("existing or unpublished dormant owner");
+            if owner.execution_state() != ThreadExecutionState::Dormant || owner.is_pending() {
+                return Err(nt_process::STATUS_DEVICE_BUSY);
+            }
+            let phase = if create_suspended {
+                owner.prepare(
+                    &mut handler.pm,
+                    binding,
+                    lifetime,
+                    ThreadSuspendOperation::Suspend,
+                )
+            } else {
+                owner.prepare_initial_start(&mut handler.pm, binding, lifetime)
+            }
+            .map_err(status)?;
+            prepared = true;
+            if let Some(owner) = fresh {
+                *slot = Some(owner);
+            }
+            if phase == ThreadSuspendPhase::Prepared {
+                Some(
+                    slot.as_mut()
+                        .expect("admitted startup owner published")
+                        .begin()
+                        .map_err(status)?,
+                )
+            } else {
+                None
+            }
         };
-        let owner = slot
-            .as_mut()
-            .or(fresh.as_mut())
-            .expect("existing or unpublished dormant owner");
-        if owner.execution_state() != ThreadExecutionState::Dormant || owner.is_pending() {
-            return Err(nt_process::STATUS_DEVICE_BUSY);
+        finish_control(handler, binding, lifetime, invocation).map(|_| ())
+    })();
+    match result {
+        Ok(()) => InitialThreadStartOutcome::Committed,
+        Err(status) if !prepared => InitialThreadStartOutcome::RefusedNoEffects(status),
+        Err(status) => {
+            let settled_rejection = entry(handler, u64::from(tid))
+                .filter(|runtime| runtime.binding() == binding)
+                .and_then(|runtime| {
+                    let slot = runtime.suspension.owner.try_borrow().ok()?;
+                    Some(slot.as_ref()?.validate_unstarted_idle(
+                        &handler.pm, binding, lifetime,
+                    ).is_ok())
+                })
+                .unwrap_or(false);
+            if settled_rejection {
+                InitialThreadStartOutcome::RefusedNoEffects(status)
+            } else {
+                InitialThreadStartOutcome::Retained(status)
+            }
         }
-        let phase = if create_suspended {
-            owner.prepare(
-                &mut handler.pm,
-                binding,
-                lifetime,
-                ThreadSuspendOperation::Suspend,
-            )
-        } else {
-            owner.prepare_initial_start(&mut handler.pm, binding, lifetime)
-        }
-        .map_err(status)?;
-        if let Some(owner) = fresh {
-            *slot = Some(owner);
-        }
-        if phase == ThreadSuspendPhase::Prepared {
-            Some(
-                slot.as_mut()
-                    .expect("admitted startup owner published")
-                    .begin()
-                    .map_err(status)?,
-            )
-        } else {
-            None
-        }
-    };
-    finish_control(handler, binding, lifetime, invocation).map(|_| ())
+    }
 }
 
 /// Called only after retirement has acknowledged deletion of this runtime's TCB.

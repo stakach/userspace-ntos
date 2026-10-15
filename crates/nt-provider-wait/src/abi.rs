@@ -11,7 +11,8 @@ pub const PROVIDER_WAIT_SHARED_MAGIC: u32 = u32::from_le_bytes(*b"PWS1");
 pub const PROVIDER_WAIT_RESULT_MAGIC: u32 = u32::from_le_bytes(*b"PWR1");
 pub const PROVIDER_WAIT_MAX_OBJECTS: usize = 64;
 pub const PROVIDER_WAIT_OBJECT_FLAG_NONE: u32 = 0;
-/// Canonical object IDs are transported as a one-based form of `nt_types::ObjectId::slot()`.
+/// Dispatcher object IDs use a one-based `nt_types::ObjectId::slot()`; File IDs carry their
+/// complete `nt_io_abi::FileId` generation/slot packing and are validated separately.
 pub const PROVIDER_WAIT_MAX_OBJECT_ID: u64 = 1u64 << 40;
 pub const PROVIDER_WAIT_MAX_OBJECT_GENERATION: u64 = (1u64 << 24) - 1;
 
@@ -530,10 +531,15 @@ impl ProviderWaitRequest {
 
         let objects = &self.objects[..count];
         for (index, object) in objects.iter().enumerate() {
-            if object.typed().is_none()
+            let object_type = object.typed();
+            let valid_id = match object_type {
+                Some(ProviderWaitObjectType::File) => object.object_id >> 40 != 0,
+                Some(_) => object.object_id <= PROVIDER_WAIT_MAX_OBJECT_ID,
+                None => false,
+            };
+            if !valid_id
                 || object.flags != PROVIDER_WAIT_OBJECT_FLAG_NONE
                 || object.object_id == 0
-                || object.object_id > PROVIDER_WAIT_MAX_OBJECT_ID
                 || object.object_generation == 0
                 || object.object_generation > PROVIDER_WAIT_MAX_OBJECT_GENERATION
             {
@@ -763,6 +769,28 @@ mod tests {
     }
 
     #[test]
+    fn file_wait_identity_keeps_packed_file_generation_and_binding_generation() {
+        let mut request = ProviderWaitRequest::empty();
+        let file_id = (9u64 << 40) | 59;
+        let file = ProviderWaitObject::new(ProviderWaitObjectType::File, file_id, 21);
+        request.begin(metadata(), &[file]).unwrap();
+        assert_eq!(request.validate().unwrap().objects, &[file]);
+
+        let event = ProviderWaitObject::new(ProviderWaitObjectType::Event, file_id, 21);
+        assert_eq!(request.begin(metadata(), &[event]), Err(ProviderWaitAbiError::InvalidObject));
+
+        // File slots are zero-based; the generation field is what makes the raw ID live.
+        let first_file = ProviderWaitObject::new(ProviderWaitObjectType::File, 1u64 << 40, 1);
+        request.begin(metadata(), &[first_file]).unwrap();
+        let missing_file_generation =
+            ProviderWaitObject::new(ProviderWaitObjectType::File, 59, 21);
+        assert_eq!(
+            request.begin(metadata(), &[missing_file_generation]),
+            Err(ProviderWaitAbiError::InvalidObject)
+        );
+    }
+
+    #[test]
     fn timeout_forms_are_exact() {
         let object = ProviderWaitObject::new(ProviderWaitObjectType::Event, 4, 2);
         let mut request = ProviderWaitRequest::empty();
@@ -789,7 +817,7 @@ mod tests {
 
     #[test]
     fn owner_and_boolean_wire_values_are_validated() {
-        let object = ProviderWaitObject::new(ProviderWaitObjectType::File, 8, 1);
+        let object = ProviderWaitObject::new(ProviderWaitObjectType::File, (1u64 << 40) | 8, 1);
         let mut request = ProviderWaitRequest::empty();
         request.begin(metadata(), &[object]).unwrap();
         request.header.provider_generation = 0;

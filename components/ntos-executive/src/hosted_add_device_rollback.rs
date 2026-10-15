@@ -28,6 +28,9 @@ struct Owner {
     pdo: u64,
     pdo_created: bool,
     pdo_registration: Option<nt_io_manager::HostedDevicePointerRegistration>,
+    pdo_canonical_retired: bool,
+    pdo_confirmed_unbound: bool,
+    pdo_allocation: Option<nt_io_manager::source_irp_auxiliary::SourcePoolAllocationIdentity>,
     driver_id: u64,
     driver_object: u64,
     previous_head: u64,
@@ -145,6 +148,9 @@ pub(super) unsafe fn reserve(
         pdo: 0,
         pdo_created: false,
         pdo_registration: None,
+        pdo_canonical_retired: false,
+        pdo_confirmed_unbound: true,
+        pdo_allocation: None,
         driver_id,
         driver_object: 0,
         previous_head: 0,
@@ -187,11 +193,17 @@ pub(super) unsafe fn set_pdo(
     created: bool,
     registration: Option<nt_io_manager::HostedDevicePointerRegistration>,
 ) {
+    let allocation = if created && owner(reservation.0).pdo_allocation.is_none() {
+        instance(owner(reservation.0).instance)
+            .and_then(|inst| hosted_device_allocations::capture_allocation(inst, address).ok())
+    } else { owner(reservation.0).pdo_allocation };
     let row = owner(reservation.0);
     assert!(row.phase == Phase::Preparing && address != 0);
     row.pdo = address;
     row.pdo_created = created;
     row.pdo_registration = registration;
+    if registration.is_some() { row.pdo_confirmed_unbound = false; }
+    row.pdo_allocation = allocation;
 }
 
 pub(super) unsafe fn begin_dispatch(reservation: &Reservation) {
@@ -321,6 +333,72 @@ pub(super) unsafe fn record_created(
         destroyed: false,
         projection_retired: false,
     });
+}
+
+/// The FDO registration minted by this exact AddDevice dispatch remains owned by this rollback
+/// row until stack publication commits. A canonical lookup alone cannot establish that owner.
+pub(super) unsafe fn owns_created_registration(
+    reservation: &Reservation,
+    registration: nt_io_manager::HostedDevicePointerRegistration,
+) -> bool {
+    let row = owner(reservation.0);
+    row.phase == Phase::Preparing
+        && row.created.iter().any(|created| {
+            created.registration == registration
+                && !created.pointer_retired
+                && !created.destroyed
+                && !created.projection_retired
+        })
+}
+
+/// Prove that the active class AddDevice created one live PortDO FDO above the exact canonical
+/// lower device. CONNECT is forwarded to a lower alias, while the PortDO itself is a distinct
+/// class-owned object. The exact provider channel and callback phase are part of this proof.
+pub(super) unsafe fn inflight_created_above_lower(
+    domain: HostedDomainIdentity,
+    ch: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    lower: nt_io_manager::DeviceId,
+    class_driver: nt_io_manager::DriverId,
+) -> Result<Option<nt_io_manager::HostedDevicePointerRegistration>, nt_status::NtStatus> {
+    let Some((phase, dispatch_context_held)) = owners()
+        .iter()
+        .find(|row| row.domain == domain)
+        .map(|row| (row.phase, row.dispatch_context_held))
+    else {
+        return Ok(None);
+    };
+    if phase != Phase::Dispatching || !dispatch_context_held {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    admit_mutation(domain, ch, reply_cap, badge)?;
+    let row = owners()
+        .iter()
+        .find(|row| row.domain == domain)
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    if nt_io_manager::DriverId(row.driver_id) != class_driver {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    let mut match_registration = None;
+    for created in &row.created {
+        let registration = created.registration;
+        if registration.domain() != domain
+            || created.pointer_retired || created.destroyed || created.projection_retired
+            || io_manager_mut().hosted_device_pointer_registration(domain, registration.address())
+                != Some(registration)
+        {
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
+        if io_manager_mut().device(registration.device_id()).is_some_and(|canonical| {
+            canonical.driver_id == class_driver && canonical.attached_to == Some(lower)
+        }) {
+            if match_registration.replace(registration).is_some() {
+                return Err(nt_status::NtStatus::INVALID_HANDLE);
+            }
+        }
+    }
+    Ok(match_registration)
 }
 
 pub(super) unsafe fn record_retired(registration: nt_io_manager::HostedDevicePointerRegistration) {
@@ -470,9 +548,9 @@ unsafe fn advance_inner(id: u64) -> Result<(), nt_status::NtStatus> {
         }
     }
     if let Some(registration) = owner(id).pdo_registration {
-        if owner(id).pdo_created {
+        if owner(id).pdo_created && !owner(id).pdo_canonical_retired {
             io_manager_mut().retire_hosted_device_pointer(registration)?;
-            owner(id).pdo_registration = None;
+            owner(id).pdo_canonical_retired = true;
         }
     }
     let (instance, driver_object, pdo, previous_head, delete_pdo) = {
@@ -486,19 +564,61 @@ unsafe fn advance_inner(id: u64) -> Result<(), nt_status::NtStatus> {
         )
     };
     if pdo != 0 {
+        if delete_pdo && !owner(id).pdo_canonical_retired && !owner(id).pdo_confirmed_unbound {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+        let inst = super::instance(instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+        let mut expected = Vec::new();
+        expected.try_reserve_exact(owner(id).created.len() + usize::from(delete_pdo))
+            .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        for device in &owner(id).created {
+            if !device.projection_retired { expected.push(device.registration.address()); }
+        }
+        if delete_pdo { expected.push(pdo); }
+        if delete_pdo && !hosted_device_allocations::protects_allocation(inst, pdo) {
+            let original = owner(id).pdo_allocation.ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+            if original.component_address != pdo { return Err(nt_status::NtStatus::INVALID_PARAMETER); }
+            hosted_device_allocations::protect_allocation_exact(inst, pdo, Some(original))?;
+        }
+        hosted_device_allocations::validate_rollback_allocations(inst, driver_object, pdo,
+            previous_head, delete_pdo, &expected)?;
+        // Check every original logical owner before any physical chain or PDO attachment effect.
+        for device in &owner(id).created {
+            if !device.projection_retired {
+                hosted_device_retirement::validate_canonical_retirement(device.registration.address(),
+                    &CanonicalRetirement::Retired { registration: device.registration })?;
+            }
+        }
+        if delete_pdo {
+            let canonical = match owner(id).pdo_registration {
+                Some(registration) if owner(id).pdo_canonical_retired => CanonicalRetirement::Retired { registration },
+                None if owner(id).pdo_confirmed_unbound => CanonicalRetirement::ConfirmedUnbound { domain: owner(id).domain },
+                _ => return Err(nt_status::NtStatus::DEVICE_BUSY),
+            };
+            hosted_device_retirement::validate_canonical_retirement(pdo, &canonical)?;
+        }
         owner(id).phase = Phase::ProjectionInFlight;
-        let result = rollback_hosted_add_device_projection(
-            instance,
-            driver_object,
-            pdo,
-            previous_head,
-            delete_pdo,
-            crate::initial_system_driver_caller(),
-        );
-        if let Err(error) = result {
-            // This mutating RPC has no replay receipt. Retain its owner without resending it.
-            block_id(id, error);
-            return Err(error);
+        for index in 0..owner(id).created.len() {
+            let device = owner(id).created[index];
+            if device.projection_retired { continue; }
+            if let Err(error) = retire_hosted_device_projection(inst, device.registration.address(),
+                CanonicalRetirement::Retired { registration: device.registration }, Some(pdo)) {
+                block_id(id, error);
+                return Err(error);
+            }
+            owner(id).created[index].projection_retired = true;
+        }
+        if delete_pdo {
+            let canonical = match owner(id).pdo_registration {
+                Some(registration) if owner(id).pdo_canonical_retired => CanonicalRetirement::Retired { registration },
+                None if owner(id).pdo_confirmed_unbound => CanonicalRetirement::ConfirmedUnbound { domain: owner(id).domain },
+                _ => return Err(nt_status::NtStatus::DEVICE_BUSY),
+            };
+            if let Err(error) = retire_hosted_device_projection(inst, pdo, canonical, None) {
+                block_id(id, error);
+                return Err(error);
+            }
+            owner(id).pdo_created = false;
         }
     }
     let (power_prepared, registry_identity, shared, provider_shared) = {

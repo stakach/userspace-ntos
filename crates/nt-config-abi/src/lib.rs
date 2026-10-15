@@ -10,6 +10,7 @@
 
 pub mod mutation_begin;
 pub mod key_value_information;
+pub mod key_value_copy;
 
 /// The Configuration Manager's SURT opcode range.
 pub const CM_OPCODE_MIN: u16 = 0x2100;
@@ -331,6 +332,8 @@ pub mod device_action_kind {
     pub const ARRIVAL: u16 = 1;
     pub const CHANGE: u16 = 2;
     pub const REMOVAL: u16 = 3;
+    /// Input-only bus presence intent; never appears in a delivered event.
+    pub const ENSURE_PRESENT: u16 = 4;
 }
 
 pub mod device_action_service {

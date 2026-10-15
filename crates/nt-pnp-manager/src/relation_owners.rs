@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::{DevnodeIdentity, DeviceRelationInvalidation};
+use crate::{DeviceRelationInvalidation, DevnodeIdentity};
 
 /// An exact queue generation owns one authenticated projection, even across a requeue.
 pub struct RelationOwnerLedger<Owner> {
@@ -54,7 +54,9 @@ impl<Owner: Copy + Eq> RelationOwnerLedger<Owner> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DeviceRelationInvalidationDisposition, DeviceRelationInvalidationQueue, PnpManager};
+    use crate::{
+        DeviceRelationInvalidationDisposition, DeviceRelationInvalidationQueue, PnpManager,
+    };
 
     #[test]
     fn owner_survives_coalescing_and_requeue_until_exact_completion() {
@@ -67,7 +69,10 @@ mod tests {
         let first = queue.enqueue(parent, 0).unwrap();
         owners.record(first.invalidation, 0xabc);
         let coalesced = queue.enqueue(parent, 0).unwrap();
-        assert_eq!(coalesced.disposition, DeviceRelationInvalidationDisposition::Coalesced);
+        assert_eq!(
+            coalesced.disposition,
+            DeviceRelationInvalidationDisposition::Coalesced
+        );
         assert_eq!(owners.owner(coalesced.invalidation), Some(0xabc));
         assert!(owners.conflicting_projection(parent, 0, 0xdef));
         assert!(!owners.conflicting_projection(parent, 0, 0xabc));
@@ -75,7 +80,10 @@ mod tests {
         let claim = queue.claim_front().unwrap();
         owners.reserve().unwrap();
         let next = queue.enqueue(parent, 0).unwrap();
-        assert_eq!(next.disposition, DeviceRelationInvalidationDisposition::Requeued);
+        assert_eq!(
+            next.disposition,
+            DeviceRelationInvalidationDisposition::Requeued
+        );
         owners.record(next.invalidation, 0xabc);
         assert!(matches!(
             queue.complete(claim).unwrap(),

@@ -49,12 +49,13 @@ pub(super) unsafe fn begin(
     handle: u64,
     domain: HostedDomainIdentity,
     pml4: u64,
+    additional_resources: usize,
 ) -> Option<usize> {
     let _durable = crate::allocator::enter_durable();
     let mut resources = Vec::new();
-    resources
-        .try_reserve_exact(FSD_WORKER_STACK_FRAMES as usize * 2 + 16)
-        .ok()?;
+    let capacity = (FSD_WORKER_STACK_FRAMES as usize).checked_mul(2)?
+        .checked_add(16)?.checked_add(additional_resources)?;
+    resources.try_reserve_exact(capacity).ok()?;
     let owners = &mut *core::ptr::addr_of_mut!(OWNERS);
     owners.try_reserve(1).ok()?;
     let id = owners.len();
@@ -213,11 +214,34 @@ pub(super) unsafe fn matches(id: usize, runtime: HostedDriverThreadRuntime) -> b
         && row.shared_entered
 }
 
+/// The append-only construction receipt is the worker stack mapping generation. Both aliases
+/// remain owned by this row until retirement, which is fenced by source stack leases.
+pub(super) unsafe fn stack_live(runtime: HostedDriverThreadRuntime) -> bool {
+    let row = owner(runtime.construction);
+    row.instance == runtime.instance
+        && row.handle == runtime.handle
+        && row.domain == runtime.domain
+        && row.pml4 == runtime.pml4
+        && row.tcb == runtime.tcb
+        && row.ready
+        && row.shared_entered
+        && !row.stopped
+        && !row.entered
+        && !row.finished
+        && row.thread.is_some()
+        && row.resources.iter().any(|resource| {
+            matches!(resource, Resource::TransferredReply(reply) if *reply == runtime.reply_cap)
+        })
+}
+
 /// No root/child alias may be released until transport retirement has acknowledged Stop and
 /// drained the exact peer. Each entered cleanup effect is permanently fenced on failure.
 pub(super) unsafe fn retire(id: usize, shared_retired: bool) -> bool {
     if owner(id).finished {
         return true;
+    }
+    if hosted_source_stack_lease::blocks_worker_retirement(id) {
+        return false;
     }
     if owner(id).entered || (owner(id).shared_entered && !shared_retired) {
         return false;

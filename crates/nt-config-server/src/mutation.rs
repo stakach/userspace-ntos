@@ -332,6 +332,7 @@ pub(crate) fn decode_mutation_journal(bytes: &[u8]) -> Option<Vec<HiveMutation>>
                         device_action_kind::ARRIVAL,
                         device_action_kind::CHANGE,
                         device_action_kind::REMOVAL,
+                        device_action_kind::ENSURE_PRESENT,
                     ]
                     .iter()
                     .any(|kind| header.value_type == u32::from(*kind))

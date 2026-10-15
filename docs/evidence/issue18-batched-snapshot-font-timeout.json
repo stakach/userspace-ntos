@@ -1,0 +1,38 @@
+{
+  "issue": 18,
+  "source_commit": "d12e6e8168960c2fbd01136e97fe035fb8c1b1c1",
+  "microkernel_commit": "eeaab1f8ba24e2c9b6bbeaab6b87dd177eb18015",
+  "profile": "font-cleanup",
+  "boot_bound_seconds": 3600,
+  "launcher_exit": 124,
+  "collector_exit": 0,
+  "collector_frames": 359,
+  "collector_final_slot": 0,
+  "strict_font_parser_exit": 1,
+  "termination": "Original one-hour boot deadline expired; supervisor terminated the process group. No guest summary or sentinel.",
+  "preboot_sha256": {
+    "rootserver": "28dd0c82ed37d7b78b422581a5e489870a25215e9a521fcea80b53965b522baf",
+    "microkernel": "05e4edf2c9c112571663f806ee12a6a6c4b67760c7f404a59f3f8aac4451ee86",
+    "disk": "98dad9bda093e44d8caf8790c4461b7a64f0f5dac8f3c2cfe723ea9c7802941e",
+    "ntdll": "5c1a33cb4fbab7d10bb85490c0da83d24beca935487321590e246842fc4aff1c",
+    "font_acceptance": "1729483e54eba2e8b891beeae4dca6d3881f2f1ac45cbce90ba74c4e4908e6f3",
+    "font_run_setup": "f2238bde4b0d68808f01b1e7f5ce95817e03063db1a4616a63d15716e0bb85b5"
+  },
+  "artifact_sha256": {
+    "raw_log": "a85bc97bafc1d371e700d04dfb7d81609fb67d99a328326cf1e9b45ec92bdc08",
+    "archived_log": "fb969f42cd8ddea94848b3c93180621bbe2f5ddd2280e6528121f2cea96c876d",
+    "screenshot": "53ad5f5ac610f375103c4b38bc9dcda1b85defd34e60860272a02fff0da0c9cb"
+  },
+  "observations": [
+    "Complete native font image build exited zero. Exact-head crate CI37408393611 succeeded. Serial crate tests: nt-fs302, nt-config-store8, nt-config-client194 passed; independent source review found no blocking writer issues.",
+    "Real font-run setup registered its Run value and exited zero; no strict font PID-QUERY receipt appeared. The parser exited1. No allocation abort or terminal provider bugcheck appeared before the deadline.",
+    "Four-sector snapshot batches were observed in the guest. An exact matched early frontier reduced write requests from15329 to9744 and write ticks from321M to205M, while dispatch time and wall time remained essentially unchanged. This is not proof of improved total boot performance.",
+    "The setup process reached codepage20127 registry operations and mscat32 demand load after helper retirement. The final printed snapshot committed generation2418 with1212164bytes.",
+    "Last printed census118: disk read1438398attempts/4189533requested sectors/28234Mtick, write896501attempts/3575599requested sectors/20165Mtick, barrier6951attempts/993Mtick, all zero recorded failures. Executive dispatch114812/1122114Mtick; client switches164513. Counters describe requested effects, not proven durability or final totals.",
+    "Same-run final screenshot shows background and cursor only. No Userinit/Explorer execution or desktop proof. The original deadline was not extended. Full-volume snapshot amplification and translation-retirement cost remain investigation targets; neither is proven to explain the complete wall time."
+  ],
+  "evidence": {
+    "log": "docs/evidence/issue18-batched-snapshot-font-timeout.log.gz",
+    "screenshot": "docs/images/batched-snapshot-font-timeout.png"
+  }
+}

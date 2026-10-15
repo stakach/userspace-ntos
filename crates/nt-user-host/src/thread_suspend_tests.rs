@@ -294,6 +294,170 @@ fn dormant_zero_count_and_nested_counts_only_start_on_final_resume() {
 }
 
 #[test]
+fn unstarted_idle_certificate_accepts_only_fresh_or_settled_rejected_start() {
+    let mut f = Fixture::new(true);
+    assert_eq!(
+        f.owner.validate_unstarted_idle(&f.pm, f.binding, f.lifetime),
+        Ok(())
+    );
+    f.owner
+        .prepare_initial_start(&mut f.pm, f.binding, f.lifetime)
+        .unwrap();
+    let invocation = f.owner.begin().unwrap();
+    f.owner
+        .record(invocation, ThreadSuspendOutcome::Rejected { status: 2 })
+        .unwrap();
+    assert_eq!(
+        f.owner.validate_unstarted_idle(&f.pm, f.binding, f.lifetime),
+        Err(ThreadSuspendError::Busy)
+    );
+    assert_eq!(f.finish().rejection, Some(2));
+    assert_eq!(
+        f.owner.validate_unstarted_idle(&f.pm, f.binding, f.lifetime),
+        Ok(())
+    );
+}
+
+#[test]
+fn unstarted_idle_certificate_refuses_every_unsettled_control_phase() {
+    for phase in [
+        ThreadSuspendPhase::Local,
+        ThreadSuspendPhase::Prepared,
+        ThreadSuspendPhase::Invoking,
+        ThreadSuspendPhase::Acknowledged,
+        ThreadSuspendPhase::Rejected(2),
+        ThreadSuspendPhase::Indeterminate(ThreadSuspendError::Indeterminate(3)),
+    ] {
+        let mut f = Fixture::new(true);
+        if phase == ThreadSuspendPhase::Local {
+            assert_eq!(f.prepare(ThreadSuspendOperation::Suspend), phase);
+        } else {
+            f.owner
+                .prepare_initial_start(&mut f.pm, f.binding, f.lifetime)
+                .unwrap();
+            if phase != ThreadSuspendPhase::Prepared {
+                let invocation = f.owner.begin().unwrap();
+                let outcome = match phase {
+                    ThreadSuspendPhase::Invoking => {
+                        drop(invocation);
+                        None
+                    }
+                    ThreadSuspendPhase::Acknowledged => Some((
+                        invocation,
+                        ThreadSuspendOutcome::Acknowledged { generation: None },
+                    )),
+                    ThreadSuspendPhase::Rejected(status) => {
+                        Some((invocation, ThreadSuspendOutcome::Rejected { status }))
+                    }
+                    ThreadSuspendPhase::Indeterminate(_) => Some((
+                        invocation,
+                        ThreadSuspendOutcome::Indeterminate { status: 3 },
+                    )),
+                    _ => unreachable!(),
+                };
+                if let Some((invocation, outcome)) = outcome {
+                    f.owner.record(invocation, outcome).unwrap();
+                }
+            }
+        }
+        assert_eq!(f.owner.phase(), phase);
+        assert_eq!(f.owner.execution_state(), ThreadExecutionState::Dormant);
+        assert_eq!(f.count(), 0);
+        assert_eq!(
+            f.owner.validate_unstarted_idle(&f.pm, f.binding, f.lifetime),
+            Err(ThreadSuspendError::Busy),
+            "unsettled {phase:?} must retain construction ownership"
+        );
+        assert_eq!(f.owner.phase(), phase);
+        assert!(f.pm.has_thread_suspend_control(f.lifetime.thread_id()));
+    }
+}
+
+#[test]
+fn unstarted_idle_certificate_refuses_wrong_binding_lifetime_or_manager() {
+    let mut f = Fixture::new(true);
+    let mut wrong_binding = f.binding;
+    wrong_binding.tcb += 1;
+    assert_eq!(
+        f.owner.validate_unstarted_idle(&f.pm, wrong_binding, f.lifetime),
+        Err(ThreadSuspendError::OwnerChanged)
+    );
+    wrong_binding = f.binding;
+    wrong_binding.process.generation = ProcessGeneration::Hosted(8);
+    assert_eq!(
+        f.owner.validate_unstarted_idle(&f.pm, wrong_binding, f.lifetime),
+        Err(ThreadSuspendError::OwnerChanged)
+    );
+    let other_tid = f
+        .pm
+        .create_thread(f.lifetime.process_id(), 0x2000, 0, false)
+        .unwrap();
+    let other_lifetime = f.pm.thread_lifetime(other_tid).unwrap();
+    assert_eq!(
+        f.owner.validate_unstarted_idle(&f.pm, f.binding, other_lifetime),
+        Err(ThreadSuspendError::OwnerChanged)
+    );
+    let other = ProcessManager::new();
+    assert_eq!(
+        f.owner.validate_unstarted_idle(&other, f.binding, f.lifetime),
+        Err(ThreadSuspendError::OwnerChanged)
+    );
+    assert_eq!(
+        f.owner.validate_unstarted_idle(&f.pm, f.binding, f.lifetime),
+        Ok(())
+    );
+}
+
+#[test]
+fn unstarted_idle_certificate_refuses_created_suspended_running_and_held_owners() {
+    let mut dormant = Fixture::new(true);
+    assert_eq!(
+        dormant.prepare(ThreadSuspendOperation::Suspend),
+        ThreadSuspendPhase::Local
+    );
+    assert_eq!(dormant.finish().count, 1);
+    assert_eq!(dormant.owner.execution_state(), ThreadExecutionState::Dormant);
+    assert_eq!(
+        dormant.owner.validate_unstarted_idle(
+            &dormant.pm,
+            dormant.binding,
+            dormant.lifetime
+        ),
+        Err(ThreadSuspendError::InconsistentState)
+    );
+    let mut running = Fixture::new(false);
+    assert_eq!(
+        running.owner.validate_unstarted_idle(&running.pm, running.binding, running.lifetime),
+        Err(ThreadSuspendError::InconsistentState)
+    );
+    running.acquire(7);
+    assert_eq!(
+        running.owner.validate_unstarted_idle(&running.pm, running.binding, running.lifetime),
+        Err(ThreadSuspendError::InconsistentState)
+    );
+}
+
+#[test]
+fn unstarted_idle_certificate_refuses_external_pm_control_reservation() {
+    let mut f = Fixture::new(true);
+    let reserved = f
+        .pm
+        .prepare_thread_suspend_control(f.lifetime, ThreadSuspendOperation::Resume)
+        .unwrap();
+    assert_eq!(f.owner.phase(), ThreadSuspendPhase::Idle);
+    assert_eq!(
+        f.owner.validate_unstarted_idle(&f.pm, f.binding, f.lifetime),
+        Err(ThreadSuspendError::Busy)
+    );
+    assert!(f.pm.has_thread_suspend_control(f.lifetime.thread_id()));
+    f.pm.cancel_thread_suspend_control(&reserved).unwrap();
+    assert_eq!(
+        f.owner.validate_unstarted_idle(&f.pm, f.binding, f.lifetime),
+        Ok(())
+    );
+}
+
+#[test]
 fn initial_start_requires_exact_dormant_zero_count_and_no_reservation() {
     let mut f = Fixture::new(true);
     let mut wrong = f.binding;
@@ -490,8 +654,16 @@ fn failed_initial_start_local_commit_retains_start_ack_without_reinvocation() {
     assert!(f.owner.begin().is_err());
     assert_eq!(f.owner.execution_state(), ThreadExecutionState::Dormant);
     assert!(f.pm.has_thread_suspend_control(f.lifetime.thread_id()));
+    assert_eq!(
+        f.owner.validate_unstarted_idle(&f.pm, f.binding, f.lifetime),
+        Err(ThreadSuspendError::Busy)
+    );
     assert_eq!(f.finish().count, 0);
     assert_eq!(f.owner.execution_state(), ThreadExecutionState::Running);
+    assert_eq!(
+        f.owner.validate_unstarted_idle(&f.pm, f.binding, f.lifetime),
+        Err(ThreadSuspendError::InconsistentState)
+    );
 }
 
 #[test]

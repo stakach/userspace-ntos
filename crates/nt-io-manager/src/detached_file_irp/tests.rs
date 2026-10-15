@@ -613,6 +613,33 @@ fn rejected_ack_can_retry_but_unknown_ack_cannot_be_replayed() {
 }
 
 #[test]
+fn not_entered_ack_keeps_the_exact_completed_irp_until_backend_acknowledges() {
+    let mut f = fixture();
+    let owner = pending(&mut f, false);
+    let id = owner.irp_id();
+    complete(&mut f, id);
+    let completion = f.io.prepare_external_file_irp_completion(owner).unwrap();
+    let invocation = capture_and_ack(&mut f, completion);
+    let returned = invocation.acknowledged(ExternalFileIrpAcknowledgement::NotEntered {
+        status: NtStatus::DEVICE_BUSY,
+    });
+    let returned = f.io.finish_external_file_irp_completion(returned)
+        .unwrap_err().into_owner();
+    assert_eq!(returned.acknowledgement(),
+        ExternalFileIrpAcknowledgement::NotEntered { status: NtStatus::DEVICE_BUSY });
+    assert!(f.io.completed_irp(id).is_some());
+    assert!(f.io.irp(id).is_some());
+    let invocation = returned.retry().unwrap();
+    assert_eq!(invocation.irp_id(), id);
+    let (receipt, _) = f.io.finish_external_file_irp_completion(
+        invocation.acknowledged(ExternalFileIrpAcknowledgement::Acknowledged),
+    ).unwrap();
+    assert_eq!(receipt.completion().id, id);
+    assert!(receipt.backend_acknowledged());
+    assert!(f.io.irp(id).is_none());
+}
+
+#[test]
 fn indeterminate_outer_return_retains_owner_and_accepts_real_late_completion() {
     let mut f = fixture();
     let owner = pending(&mut f, true);

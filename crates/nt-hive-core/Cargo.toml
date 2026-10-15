@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 nt-config-manager = { workspace = true }
 nt-config-store = { workspace = true }
+nt-page-storage = { workspace = true }
 
 [dev-dependencies]
 nt-security = { workspace = true }

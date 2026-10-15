@@ -136,6 +136,7 @@ pub struct ExternalFileIrpTerminal {
 pub struct ExternalFileIrpCompletionInvocation {
     owner: Owner,
     completion: CompletedIrp,
+    capture: ExternalFileIrpOutputCapture,
     captured: usize,
     capture_len: usize,
 }
@@ -146,13 +147,7 @@ pub struct ExternalFileIrpCompletionReturn {
     acknowledgement: ExternalFileIrpAcknowledgement,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ExternalFileIrpAcknowledgement {
-    Acknowledged,
-    NotEntered { status: NtStatus },
-    Rejected { status: NtStatus },
-    Indeterminate { transport_status: NtStatus },
-}
+pub use crate::completion_ack::CompletionAcknowledgement as ExternalFileIrpAcknowledgement;
 
 #[derive(Debug)]
 #[must_use = "recover the unchanged owner"]
@@ -249,7 +244,7 @@ owner_accessors!(ExternalFileIrpCompletionInvocation, owner);
 mod operations;
 pub use operations::*;
 mod policy;
-pub use policy::ExternalFileIrpDispatchPolicy;
+pub use policy::{ExternalFileIrpDispatchPolicy, MAX_MUTABLE_METHOD_NEITHER_INPUT};
 
 impl ExternalFileIrpInvocation {
     pub fn buffers_mut(&mut self) -> ExternalFileIrpBufferView<'_> {
@@ -263,6 +258,11 @@ impl ExternalFileIrpInvocation {
             owner: self.0,
             outcome,
         }
+    }
+    /// Mutable METHOD_NEITHER input writeback is admitted only by the dispatch policy. Native
+    /// code fills this from the exact completed Type3InputBuffer before consuming the owner.
+    pub fn input_mut(&mut self) -> &mut [u8] {
+        &mut self.0.buffers.input
     }
 }
 impl RetainedExternalFileIrp {
@@ -293,11 +293,7 @@ impl ExternalFileIrpCompletionInvocation {
 impl ExternalFileIrpCompletionReturn {
     /// Only a failed ACK can be executed again. An accepted ACK remains durable for local retry.
     pub fn retry(self) -> Result<ExternalFileIrpAckInvocation, Self> {
-        if matches!(
-            self.acknowledgement,
-            ExternalFileIrpAcknowledgement::NotEntered { .. }
-                | ExternalFileIrpAcknowledgement::Rejected { .. }
-        ) {
+        if self.acknowledgement.permits_retry() {
             Ok(self.invocation)
         } else {
             Err(self)
@@ -844,14 +840,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 assert!(record.transition(IrpState::Completed));
                 if crate::is_create_major(owner.projection.major) {
                     let file = self.file_mut(owner.projection.file_id.unwrap()).unwrap();
-                    if crate::file::create_terminal_opens_file(status) {
-                        file.driver_context = file_context;
-                        if file.state == FileState::CreateIrpDispatched {
-                            assert!(file.transition(FileState::Open));
-                        }
-                    } else if file.state == FileState::CreateIrpDispatched {
-                        assert!(file.transition(FileState::Closed));
-                    }
+                    file.complete_create(status, file_context);
                 }
                 let completion = self
                     .completed_irp_snapshot(id)
@@ -937,6 +926,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             Ok((completion, capture_len)) => Ok(ExternalFileIrpCompletionInvocation {
                 owner: retained.owner,
                 completion,
+                capture,
                 captured: 0,
                 capture_len,
             }),
@@ -966,14 +956,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 {
                     return Err(NtStatus::INVALID_PARAMETER);
                 }
-                match returned.acknowledgement {
-                    ExternalFileIrpAcknowledgement::Acknowledged => Ok(()),
-                    ExternalFileIrpAcknowledgement::NotEntered { status }
-                    | ExternalFileIrpAcknowledgement::Rejected { status } => Err(status),
-                    ExternalFileIrpAcknowledgement::Indeterminate { transport_status } => {
-                        Err(transport_status)
-                    }
-                }
+                returned.acknowledgement.checked_status()
             });
         if let Err(status) = valid {
             return Err(ExternalFileIrpRejection {

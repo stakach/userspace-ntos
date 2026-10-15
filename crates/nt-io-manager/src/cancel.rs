@@ -126,6 +126,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
     /// already-terminal requests are successful no-ops; a different owner is
     /// denied.
     pub fn cancel(&mut self, client: ClientId, irp_id: IrpId) -> Result<(), NtStatus> {
+        if self.irp(irp_id).is_some_and(|irp| irp.completion_ack_reservation.is_some()) {
+            return Err(NtStatus::DELETE_PENDING);
+        }
         if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
             return self
                 .queue_detached_file_irp_intent(client, irp_id, false)
@@ -176,6 +179,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
     /// already-terminal generation, and an existing CancelRequested owner is
     /// not redispatched to its backend.
     pub fn cancel_if_pending(&mut self, client: ClientId, irp_id: IrpId) -> Result<bool, NtStatus> {
+        if self.irp(irp_id).is_some_and(|irp| irp.completion_ack_reservation.is_some()) {
+            return Err(NtStatus::DELETE_PENDING);
+        }
         if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
             return self.queue_detached_file_irp_intent(client, irp_id, false);
         }
@@ -204,6 +210,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
         client: ClientId,
         irp_id: IrpId,
     ) -> Result<(), NtStatus> {
+        if self.irp(irp_id).is_some_and(|irp| irp.completion_ack_reservation.is_some()) {
+            return Err(NtStatus::DELETE_PENDING);
+        }
         if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
             return self
                 .queue_detached_file_irp_intent(client, irp_id, true)
@@ -222,6 +231,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
         client: ClientId,
         irp_id: IrpId,
     ) -> Result<(), NtStatus> {
+        if self.irp(irp_id).is_some_and(|irp| irp.completion_ack_reservation.is_some()) {
+            return Err(NtStatus::DELETE_PENDING);
+        }
         if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
             return self
                 .queue_detached_file_irp_intent(client, irp_id, true)
@@ -264,7 +276,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         client: ClientId,
         irp_id: IrpId,
     ) -> Result<(), NtStatus> {
-        if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
+        if self.irp(irp_id).is_some_and(|irp| irp.has_external_retirement_owner()) {
             return Err(NtStatus::DELETE_PENDING);
         }
         let owner = match self.irp(irp_id) {

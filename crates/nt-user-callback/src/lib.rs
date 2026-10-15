@@ -1,6 +1,8 @@
 #![no_std]
 
 mod message_output;
+mod dispatch_return;
+pub use dispatch_return::{DispatchReturn, DispatchReturnError, DispatchReturnReceipt};
 mod windowproc;
 pub use message_output::{
     message_dispatch_output_length, message_dispatch_output_length_matches_result,
@@ -47,6 +49,24 @@ pub struct CallbackHeader {
 }
 
 impl CallbackHeader {
+    /// Match the physical dispatch and client carried by a retained callback header.
+    /// The caller must separately authenticate the client's lifetime generation.
+    pub const fn matches_dispatch_identity(
+        &self,
+        dispatch_id: u64,
+        client_pi: u32,
+        client_tid: u64,
+        client_badge: u64,
+    ) -> bool {
+        self.magic == CALLBACK_MAGIC
+            && self.version == CALLBACK_VERSION
+            && self.kind == CALLBACK_KIND_USER_MODE
+            && self.dispatch_id == dispatch_id
+            && self.client_pi == client_pi
+            && self.client_tid == client_tid
+            && self.client_badge == client_badge
+    }
+
     pub const fn idle(
         dispatch_id: u64,
         client_pi: u32,
@@ -2353,6 +2373,19 @@ pub fn walk_gdi_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_header_requires_exact_dispatch_and_client_identity() {
+        let header = CallbackHeader::idle(48, 7, 100, 618);
+        assert!(header.matches_dispatch_identity(48, 7, 100, 618));
+        assert!(!header.matches_dispatch_identity(49, 7, 100, 618));
+        assert!(!header.matches_dispatch_identity(48, 8, 100, 618));
+        assert!(!header.matches_dispatch_identity(48, 7, 96, 618));
+        assert!(!header.matches_dispatch_identity(48, 7, 100, 617));
+        let mut invalid = header;
+        invalid.magic = 0;
+        assert!(!invalid.matches_dispatch_identity(48, 7, 100, 618));
+    }
 
     fn request() -> CallbackHeader {
         let mut header = CallbackHeader::idle(7, 2, 44, 4);

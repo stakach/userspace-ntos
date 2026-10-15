@@ -1,0 +1,93 @@
+{
+  "base_commit": "114f56e0043a2258bc1165871b2df4ed7b1303b2",
+  "candidate": "Client-frame storage changes in the working tree on the base commit, pending their containing commit at archival time.",
+  "microkernel_commit": "1a0985b6f0d636b7299f4e7cd6271a226c2c0ffa",
+  "scope": "Bounded client-frame registry backing allocations, crate validation, native source checks, and a feature-off executive build. No post-fix guest run is included.",
+  "prior_boot_evidence": "issue18-client-frame-growth-allocation-failure.json",
+  "change": "Replace contiguous retained-record backing with 256-record chunks. Expose allocation-free iteration and copied indexed access; update existing native and thread-lifetime consumers without changing exact frame-owner identities. Reservation refusal may retain empty backing chunks but cannot change published ownership.",
+  "focused_storage_tests": [
+    "Large registry growth beyond16384 records bounds each record-backing allocation to at most64KiB and preserves existing records.",
+    "Initial reservation for16384 records uses bounded record-backing allocations.",
+    "Impossible reservation preserves exact reclaim and transfer owners and records its allocation refusal.",
+    "Cross-chunk swap removal preserves held record identities and dense indexed access.",
+    "Injected later-chunk allocation refusal preserves existing owners and permits reuse only of retained empty backing storage."
+  ],
+  "validation_owner": "Root consumed all build/test exits serially. The archival agent read results and compressed logs; it ran no builds or tests.",
+  "attempts": [
+    {
+      "phase": "red",
+      "exit": 101,
+      "passed": 1,
+      "failed": 2,
+      "outcome": "The actual contiguous-storage implementation failed both bounded-backing assertions. The impossible-reservation ownership test passed.",
+      "raw_log_sha256": "bea91e5997e9e2c292df1a619d02ac9a97fce182333663c9afc28d26b497a48c",
+      "archived_log": "issue18-client-frame-storage-red.log.gz",
+      "archived_log_sha256": "b33610d5ce36e90601a46c9d7870d62fc839ee267a070721dd16bb742c601dc5"
+    },
+    {
+      "phase": "initial-full-mm-compile-failure",
+      "exit": 101,
+      "outcome": "The implementation's first full MM validation did not compile: existing client-frame lifetime tests relied on the removed parent Vec import. Root added an explicit alloc::vec::Vec test import. This attempt has no executed test verdict.",
+      "raw_log_sha256": "e163677a78bde1d01e5d947a29606f942c59b57a3efc8f59c83ba73c58921123",
+      "archived_log": "issue18-client-frame-storage-compile-failure.log.gz",
+      "archived_log_sha256": "d7994c318267c9712a773c98794781e49fb8ed80b87b90cf650b0b411f333557"
+    },
+    {
+      "phase": "full-mm-green",
+      "session": 67920,
+      "exit": 0,
+      "passed": 528,
+      "failed": 0,
+      "outcome": "All MM tests passed, including all five storage regressions.",
+      "raw_log_sha256": "259308c3539763295215f397a95b74d6dc8d97e08c38536f833b3e24ad07edc5",
+      "archived_log": "issue18-client-frame-storage-mm.log.gz",
+      "archived_log_sha256": "37ebc02993f41d38b368a9b5a1b97a3d9b8aad81b242b6b60f7d8b8135eddb39"
+    },
+    {
+      "phase": "user-host-green",
+      "session": 19396,
+      "exit": 0,
+      "unit_passed": 872,
+      "integration_passed": 74,
+      "compile_fail_doc_passed": 22,
+      "failed": 0,
+      "raw_log_sha256": "fd443ec528d9757c26ae9bf9e384de5414fe0d134398dc8d428e8a472e8cc7b3",
+      "archived_log": "issue18-client-frame-storage-user-host.log.gz",
+      "archived_log_sha256": "03705f86e7a7373db460625806336277d2484d2fb6280c9cf7490776da99ba43"
+    },
+    {
+      "phase": "native-source-green",
+      "session": 53958,
+      "exit": 0,
+      "callback_checks_passed": 5,
+      "native_acceptance_checks_passed": 144,
+      "diagnostics_checks_passed": 2,
+      "failed": 0,
+      "outcome": "Source checks only, not execution of the NT guest.",
+      "raw_log_sha256": "2bc230387ff0abb6523949112cfb80553404e2661ce85f911ffa5693a34ae5d9",
+      "archived_log": "issue18-client-frame-storage-source.log.gz",
+      "archived_log_sha256": "ee93a8c1b967b8372f9aa88718cdc8f4b07b02bba213c9412e6650bfd06c36e6"
+    },
+    {
+      "phase": "feature-off-executive-build",
+      "session": 98552,
+      "exit": 0,
+      "command": "env -u NTOS_MUP_PROVIDER_KERNEL_ONLY -u NTDLL_FEATURES NTOS_IMAGE_PROFILE=production ./components/ntos-executive/build.sh",
+      "outcome": "Executive and production hive staged successfully. This build did not launch a guest or establish a new disk-image boot result.",
+      "raw_log_sha256": "15346cf2fc0c24263ff48c962f9b1128d293c8b9124073a6cadee0f1729c682c",
+      "archived_log": "issue18-client-frame-storage-native-build.log.gz",
+      "archived_log_sha256": "5424c505685630cdc108462d097c00a11c294eee5e3d49c669993f74c76e9580"
+    }
+  ],
+  "staged_rootserver_path": "rust-micro/.tmp/rootserver.elf",
+  "staged_rootserver_bytes": 9445128,
+  "staged_rootserver_sha256": "94252bfb522531c623a9acaa56d5d678bc995827b8cfdd02aa3250edbd62b57e",
+  "post_fix_guest_executed": false,
+  "font_acceptance_proven": false,
+  "explorer_desktop_proven": false,
+  "limitations": [
+    "Bounded record chunks remove the observed whole-registry growth allocation; aggregate allocation and the chunk-directory allocation remain fallible.",
+    "The previous native allocation failure is not declared resolved by a fresh guest run in this record.",
+    "No disk hash, screenshot, font acceptance, or desktop verdict from a prior boot is presented as post-fix evidence."
+  ]
+}

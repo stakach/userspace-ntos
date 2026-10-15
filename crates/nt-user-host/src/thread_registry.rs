@@ -102,7 +102,7 @@ impl<const STACK: usize> ThreadRegistrySnapshot<STACK> {
                 if !row.is_resident() {
                     return Err(ThreadRegistryError::UnavailableRecord { page });
                 }
-                if row.frame != owner && row.frame != aliases[0] {
+                if Some(row.frame) != resources.expected_mapping_cap(page) {
                     return Err(ThreadRegistryError::WrongFrame { page });
                 }
                 records.push(row);

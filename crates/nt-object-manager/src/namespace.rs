@@ -156,24 +156,6 @@ impl ObjectManager {
                 &UnicodeString::from_str("Restricted"),
                 true,
             )?;
-            self.create_symbolic_link(
-                &base_named_objects,
-                &UnicodeString::from_str("Global"),
-                NtPath::parse_str("\\BaseNamedObjects")?,
-                true,
-            )?;
-            self.create_symbolic_link(
-                &base_named_objects,
-                &UnicodeString::from_str("Local"),
-                NtPath::parse_str("\\BaseNamedObjects")?,
-                true,
-            )?;
-            self.create_symbolic_link(
-                &base_named_objects,
-                &UnicodeString::from_str("Session"),
-                NtPath::parse_str("\\Sessions\\BnoLinks")?,
-                true,
-            )?;
         }
         if let Some(sessions) = sessions {
             self.create_directory(&sessions, &UnicodeString::from_str("BnoLinks"), true)?;

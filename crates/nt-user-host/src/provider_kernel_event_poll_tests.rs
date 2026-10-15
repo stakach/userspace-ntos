@@ -248,7 +248,12 @@ fn event_poll_rejects_every_non_event_type_and_mixed_array() {
         for mixed in [false, true] {
             let mut request = request(&f);
             let index = usize::from(mixed);
-            request.objects[index] = nt_provider_wait::ProviderWaitObject::new(object_type, 82, 1);
+            let object_id = if object_type == ProviderWaitObjectType::File {
+                (1u64 << 40) | 82
+            } else {
+                82
+            };
+            request.objects[index] = nt_provider_wait::ProviderWaitObject::new(object_type, object_id, 1);
             request.header.object_count = index as u32 + 1;
             request.header.request_size +=
                 (index * core::mem::size_of::<nt_provider_wait::ProviderWaitObject>()) as u32;

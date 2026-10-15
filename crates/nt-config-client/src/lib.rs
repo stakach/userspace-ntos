@@ -16,13 +16,18 @@ mod retained_snapshot_integration;
 mod active_driver_service;
 mod registry_string;
 pub use registry_string::decode_terminated_reg_sz;
+mod rtl_registry_delete;
+pub use rtl_registry_delete::{
+    plan_rtl_registry_delete, plan_rtl_registry_write, RtlRegistryDeleteTarget,
+    RtlRegistryWritePlan,
+};
 mod driver_load_request;
 pub use driver_load_request::{
     capture_driver_service_name, decode_driver_service_name, inspect_driver_service_name,
     DriverServiceNameBuffer, DRIVER_SERVICE_PATH_MAX_BYTES,
 };
 mod filter_policy;
-pub use filter_policy::DeviceFilterPolicySnapshot;
+pub use filter_policy::{DeviceFilterPolicySnapshot, UpperFilterLaunchPlanSnapshot};
 mod runtime_key;
 mod system_mount;
 pub use system_mount::{SystemHiveMount, SystemHiveMountState};
@@ -418,6 +423,8 @@ pub enum DeviceActionKind {
     Arrival,
     Change,
     Removal,
+    /// Input-only intent resolved by CM against its mounted Enum snapshot.
+    EnsurePresent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -549,11 +556,32 @@ pub struct LeasedHiveValue {
 struct SnapshotReader<'a> {
     bytes: &'a [u8],
     offset: usize,
+    allocation_failed: bool,
 }
 
 impl<'a> SnapshotReader<'a> {
     fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
+        Self {
+            bytes,
+            offset: 0,
+            allocation_failed: false,
+        }
+    }
+
+    fn failure_status(&self) -> i32 {
+        if self.allocation_failed {
+            STATUS_INSUFFICIENT_RESOURCES
+        } else {
+            STATUS_INVALID_PARAMETER
+        }
+    }
+
+    fn reserve<T>(&mut self, values: &mut Vec<T>, count: usize) -> Option<()> {
+        if values.try_reserve_exact(count).is_err() {
+            self.allocation_failed = true;
+            return None;
+        }
+        Some(())
     }
 
     fn take(&mut self, len: usize) -> Option<&'a [u8]> {
@@ -582,7 +610,14 @@ impl<'a> SnapshotReader<'a> {
 
     fn string_with_len(&mut self, len: u32) -> Option<String> {
         let bytes = self.take(usize::try_from(len).ok()?)?;
-        Some(core::str::from_utf8(bytes).ok()?.into())
+        let text = core::str::from_utf8(bytes).ok()?;
+        let mut owned = String::new();
+        if owned.try_reserve_exact(text.len()).is_err() {
+            self.allocation_failed = true;
+            return None;
+        }
+        owned.push_str(text);
+        Some(owned)
     }
 
     fn string(&mut self) -> Option<String> {
@@ -600,7 +635,11 @@ impl<'a> SnapshotReader<'a> {
     }
 
     fn blob_with_len(&mut self, len: u32) -> Option<Vec<u8>> {
-        Some(Vec::from(self.take(usize::try_from(len).ok()?)?))
+        let bytes = self.take(usize::try_from(len).ok()?)?;
+        let mut owned = Vec::new();
+        self.reserve(&mut owned, bytes.len())?;
+        owned.extend_from_slice(bytes);
+        Some(owned)
     }
 
     fn blob(&mut self) -> Option<Vec<u8>> {
@@ -626,11 +665,15 @@ impl<'a> SnapshotReader<'a> {
     }
 }
 
-fn decode_hive_key_snapshot(bytes: &[u8]) -> Option<HiveKeySnapshot> {
+fn decode_hive_key_snapshot(bytes: &[u8]) -> Result<HiveKeySnapshot, i32> {
     if bytes.len() < CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES {
-        return None;
+        return Err(STATUS_INVALID_PARAMETER);
     }
     let mut reader = SnapshotReader::new(bytes);
+    read_hive_key_snapshot(&mut reader).ok_or_else(|| reader.failure_status())
+}
+
+fn read_hive_key_snapshot(reader: &mut SnapshotReader<'_>) -> Option<HiveKeySnapshot> {
     if reader.u32()? != CM_HIVE_KEY_SNAPSHOT_MAGIC
         || reader.u16()? != CM_HIVE_KEY_SNAPSHOT_VERSION
         || reader.u16()? != 0
@@ -644,7 +687,7 @@ fn decode_hive_key_snapshot(bytes: &[u8]) -> Option<HiveKeySnapshot> {
     let class_name = reader.optional_string()?;
     let security_descriptor = reader.optional_blob()?;
     let mut subkeys = Vec::new();
-    subkeys.try_reserve_exact(subkey_count).ok()?;
+    reader.reserve(&mut subkeys, subkey_count)?;
     for _ in 0..subkey_count {
         subkeys.push(HiveSubkeySnapshot {
             name: reader.string()?,
@@ -652,7 +695,7 @@ fn decode_hive_key_snapshot(bytes: &[u8]) -> Option<HiveKeySnapshot> {
         });
     }
     let mut values = Vec::new();
-    values.try_reserve_exact(value_count).ok()?;
+    reader.reserve(&mut values, value_count)?;
     for _ in 0..value_count {
         values.push(HiveValueSnapshot {
             name: reader.string()?,
@@ -1109,7 +1152,7 @@ fn decode_network_adapter_plan(bytes: &[u8]) -> Option<NetworkAdapterPlanSnapsho
 
 mod child_creation;
 
-fn checked_mutation_utf16(s: &str, max_units: usize) -> Result<Vec<u8>, i32> {
+fn checked_bounded_utf16(s: &str, max_units: usize) -> Result<Vec<u8>, i32> {
     let units = s.encode_utf16().count();
     if units > max_units || s.contains('\0') {
         return Err(STATUS_INVALID_PARAMETER);
@@ -1140,8 +1183,8 @@ fn append_hive_mutation_record(
     name: &str,
     data: &[u8],
 ) -> Result<(), i32> {
-    let path = checked_mutation_utf16(path, CM_MAX_HIVE_PATH_UNITS)?;
-    let name = checked_mutation_utf16(name, CM_MAX_HIVE_VALUE_NAME_UNITS)?;
+    let path = checked_bounded_utf16(path, CM_MAX_HIVE_PATH_UNITS)?;
+    let name = checked_bounded_utf16(name, CM_MAX_HIVE_VALUE_NAME_UNITS)?;
     let path_len_bytes = u32::try_from(path.len()).map_err(|_| STATUS_INVALID_PARAMETER)?;
     let name_len_bytes = u32::try_from(name.len()).map_err(|_| STATUS_INVALID_PARAMETER)?;
     let data_len_bytes = u32::try_from(data.len()).map_err(|_| STATUS_INVALID_PARAMETER)?;
@@ -1227,7 +1270,7 @@ fn encode_hive_mutation_journal(mutations: &[SystemHiveMutation<'_>]) -> Result<
             )?,
             SystemHiveMutation::SetKeyClass { path, class_name } => {
                 let class_data = class_name
-                    .map(|class| checked_mutation_utf16(class, CM_MAX_HIVE_VALUE_NAME_UNITS))
+                    .map(|class| checked_bounded_utf16(class, CM_MAX_HIVE_VALUE_NAME_UNITS))
                     .transpose()?;
                 append_hive_mutation_record(
                     &mut journal,
@@ -1259,6 +1302,7 @@ fn encode_hive_mutation_journal(mutations: &[SystemHiveMutation<'_>]) -> Result<
                     DeviceActionKind::Arrival => device_action_kind::ARRIVAL,
                     DeviceActionKind::Change => device_action_kind::CHANGE,
                     DeviceActionKind::Removal => device_action_kind::REMOVAL,
+                    DeviceActionKind::EnsurePresent => device_action_kind::ENSURE_PRESENT,
                 };
                 append_hive_mutation_record(
                     &mut journal,
@@ -2473,7 +2517,7 @@ impl<B: Backend> ConfigClient<B> {
             }
             value.extend_from_slice(&reply_bytes[..written]);
             if value.len() == total {
-                return decode_hive_key_snapshot(&value).ok_or(STATUS_INVALID_PARAMETER);
+                return decode_hive_key_snapshot(&value);
             }
             if token == 0 {
                 token = response.detail1;
@@ -2645,13 +2689,10 @@ impl<B: Backend> ConfigClient<B> {
 
     /// Read a complete immutable snapshot of one key in the CM-owned mounted SYSTEM hive.
     pub fn query_system_hive_key(&mut self, path: &str) -> Result<HiveKeySnapshot, i32> {
-        let path_bytes = utf16_bytes(path);
-        if path_bytes.is_empty()
-            || path_bytes.len() > CM_MAX_HIVE_PATH_UNITS * 2
-            || path.chars().any(|ch| ch == '\0')
-        {
+        if path.is_empty() {
             return Err(STATUS_INVALID_PARAMETER);
         }
+        let path_bytes = checked_bounded_utf16(path, CM_MAX_HIVE_PATH_UNITS)?;
         let mut value = Vec::new();
         let mut expected_total = None;
         let mut token = 0u64;
@@ -2711,7 +2752,7 @@ impl<B: Backend> ConfigClient<B> {
             }
             value.extend_from_slice(&reply_bytes[..written]);
             if value.len() == total {
-                return decode_hive_key_snapshot(&value).ok_or(STATUS_INVALID_PARAMETER);
+                return decode_hive_key_snapshot(&value);
             }
             if token == 0 {
                 token = response.detail1;

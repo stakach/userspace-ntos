@@ -1,13 +1,15 @@
 //! The single owned backend for the executable mount's physical snapshot reserve.
 
 use super::*;
-use nt_fs::{SnapshotReserve, SnapshotReserveLease};
+use nt_fs::{BoundedBlockRange, OwnedBoundedBlockRange, SnapshotBlockDevice, SnapshotReserve, SnapshotReserveLease};
 use nt_memory_manager::SectionMountId;
 
 type Reserve = SnapshotReserve<AhciSnapshotDevice, SectionMountId>;
 pub(super) type Lease = SnapshotReserveLease<'static, AhciSnapshotDevice, SectionMountId>;
 static mut RESERVE: Option<Reserve> = None;
 pub(super) const BUSY: u32 = 0x8000_0011;
+const SNAPSHOT_SECTORS: u64 = crate::fs_loader::WRITABLE_SNAPSHOT_RESERVE_SECTORS as u64;
+const WAL_SECTORS: u64 = SNAPSHOT_SECTORS;
 
 /// Boot-only publication, before the executable filesystem identity becomes visible. This slot
 /// cannot be replaced; copied Fat32 values elsewhere never grant snapshot device access.
@@ -17,10 +19,32 @@ pub(crate) unsafe fn publish(fat: Fat32, mount: SectionMountId) -> Result<(), u3
         return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
     }
     if let Some(device) = AhciSnapshotDevice::from_backing(fat)? {
-        let store = nt_fs::SnapshotBlockStore::new(0, u64::from(device.sectors));
+        let store = nt_fs::SnapshotBlockStore::new(0, SNAPSHOT_SECTORS);
         *slot = Some(SnapshotReserve::new(device, mount, store));
     }
     Ok(())
+}
+
+/// A disjoint tail view under the snapshot backend's existing exclusive mount lease.
+/// No registry write path uses this region until append/recovery ownership is implemented.
+#[allow(dead_code)]
+pub(super) fn wal_region(lease: &mut Lease) -> Result<Option<BoundedBlockRange<'_, Lease>>, u32> {
+    if lease.sector_count() < SNAPSHOT_SECTORS + WAL_SECTORS {
+        return Ok(None);
+    }
+    BoundedBlockRange::new(lease, SNAPSHOT_SECTORS, WAL_SECTORS)
+        .map(Some)
+        .map_err(|_| nt_fs::STATUS_INVALID_PARAMETER)
+}
+
+/// Move the exact reserve lease into a bounded WAL owner. Once a record write begins,
+/// uncertainty must retain this owner so the reserve cannot be reused by a new writer.
+#[allow(dead_code)]
+pub(super) fn owned_wal_region(
+    lease: Lease,
+) -> Result<OwnedBoundedBlockRange<Lease>, (u32, Lease)> {
+    OwnedBoundedBlockRange::new(lease, SNAPSHOT_SECTORS, WAL_SECTORS)
+        .map_err(|(_, lease)| (nt_fs::STATUS_INVALID_PARAMETER, lease))
 }
 
 pub(super) unsafe fn acquire() -> Result<Lease, u32> {
@@ -43,12 +67,24 @@ pub(super) struct AhciSnapshotDevice {
 
 impl AhciSnapshotDevice {
     fn from_backing(fat: Fat32) -> Result<Option<Self>, u32> {
-        let Some((start_lba, sectors)) = crate::fs_loader::writable_snapshot_reserve(&fat) else {
+        let Some((start_lba, snapshot_sectors)) = crate::fs_loader::writable_snapshot_reserve(&fat) else {
             return Ok(None);
         };
-        start_lba
-            .checked_add(u64::from(sectors))
+        let physical_sectors = unsafe { crate::ahci_maintenance::physical_sector_count(&fat) }
+            .map_err(|_| nt_fs::STATUS_DEVICE_NOT_READY)?;
+        let snapshot_end = start_lba
+            .checked_add(u64::from(snapshot_sectors))
             .ok_or(nt_fs::STATUS_INVALID_PARAMETER)?;
+        if snapshot_end > physical_sectors {
+            return Ok(None);
+        }
+        let wal_end = snapshot_end.checked_add(WAL_SECTORS)
+            .ok_or(nt_fs::STATUS_INVALID_PARAMETER)?;
+        let sectors = if wal_end <= physical_sectors {
+            snapshot_sectors + WAL_SECTORS as u32
+        } else {
+            snapshot_sectors
+        };
         Ok(Some(Self {
             fat,
             start_lba,
@@ -117,6 +153,7 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
             let absolute = self.absolute_lba(lba + sector_index as u64)?;
             let byte_start = sector_index * sector_size;
             let byte_end = byte_start + chunk_sectors * sector_size;
+            let started = self.fat.census.then(disk_census_ticks);
             let tfd = unsafe {
                 ahci_read_sectors(
                     self.fat.ahci_vaddr,
@@ -126,6 +163,12 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
                     chunk_sectors as u32,
                 )
             };
+            crate::fs_loader::disk_census_record(
+                nt_ahci::IoOperation::Read,
+                started,
+                chunk_sectors as u64,
+                tfd & nt_ahci::TASK_FILE_FAILURE != 0,
+            );
             if tfd & nt_ahci::TASK_FILE_FAILURE != 0 {
                 return Err(nt_fs::SnapshotBlockStoreError::Io);
             }
@@ -175,6 +218,7 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
             let absolute = self.absolute_lba(relative_lba)?;
             let byte_start = sector_index * sector_size;
             let byte_end = byte_start + chunk_sectors * sector_size;
+            let started = self.fat.census.then(disk_census_ticks);
             let tfd = unsafe {
                 ahci_write_sectors(
                     self.fat.ahci_vaddr,
@@ -184,6 +228,12 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
                     &data[byte_start..byte_end],
                 )
             };
+            crate::fs_loader::disk_census_record(
+                nt_ahci::IoOperation::Write,
+                started,
+                chunk_sectors as u64,
+                tfd & nt_ahci::TASK_FILE_FAILURE != 0,
+            );
             if tfd & nt_ahci::TASK_FILE_FAILURE != 0 {
                 return Err(nt_fs::SnapshotBlockStoreError::Io);
             }

@@ -27,7 +27,7 @@ fn terminal(status: u32, major: u8, synchronous: bool, event: u64) -> PendingFil
         irp_id: REQUEST,
         tid: 37,
         major,
-        operation: PendingFileIoOperation::LocalInline(PendingLocalInline {
+        operation: PendingFileIoOperation::OwnedInline(PendingOwnedInline {
             status,
             information: 0,
         }),
@@ -86,7 +86,7 @@ fn granted_lock_survives_surface_reply_and_reference_release_retries() {
     // The real operation is already done. A failed IOSB copy changes no progress or lock state.
     assert_eq!(locks.active_count(), 1);
     assert_eq!(
-        table.get(slot).unwrap().local_terminal_result(),
+        table.get(slot).unwrap().owned_terminal_result(),
         Some((0, 0))
     );
     assert!(table.finish_exact(slot, REQUEST).is_none());
@@ -113,7 +113,7 @@ fn granted_lock_survives_surface_reply_and_reference_release_retries() {
     table.restore_reply_cap_exact(slot, REQUEST, REPLY).unwrap();
     assert!(table.finish_exact(slot, REQUEST).is_none());
     assert_eq!(
-        table.get(slot).unwrap().local_terminal_result(),
+        table.get(slot).unwrap().owned_terminal_result(),
         Some((0, 0))
     );
     reply_and_ack(&mut table, slot);
@@ -125,7 +125,7 @@ fn granted_lock_survives_surface_reply_and_reference_release_retries() {
     assert!(table.finish_exact(slot, REQUEST).is_none());
     fs.zw_release_io_reference(handle).unwrap();
     table
-        .mark_local_reference_released_exact(slot, REQUEST)
+        .mark_owned_reference_released_exact(slot, REQUEST)
         .unwrap();
     table.finish_exact(slot, REQUEST).unwrap();
     assert_eq!(locks.active_count(), 0);
@@ -172,12 +172,12 @@ fn failed_notification_leaves_file_and_event_unsignaled_for_every_open_mode() {
                 0
             );
             assert_eq!(
-                table.get(slot).unwrap().local_terminal_result(),
+                table.get(slot).unwrap().owned_terminal_result(),
                 Some((status, 0))
             );
             fs.zw_release_io_reference(handle).unwrap();
             table
-                .mark_local_reference_released_exact(slot, REQUEST)
+                .mark_owned_reference_released_exact(slot, REQUEST)
                 .unwrap();
             table.finish_exact(slot, REQUEST).unwrap();
             assert_eq!(fs.zw_is_file_signaled(handle), Ok(false));
@@ -238,13 +238,13 @@ fn inline_warnings_keep_completion_surfaces_and_file_signal_policy() {
                 );
                 fs.zw_release_io_reference(handle).unwrap();
                 table
-                    .mark_local_reference_released_exact(slot, REQUEST)
+                    .mark_owned_reference_released_exact(slot, REQUEST)
                     .unwrap();
                 assert_eq!(
                     table
                         .finish_exact(slot, REQUEST)
                         .unwrap()
-                        .local_terminal_result(),
+                        .owned_terminal_result(),
                     Some((status, 0))
                 );
                 assert_eq!(fs.zw_close(handle), STATUS_SUCCESS);
@@ -278,7 +278,7 @@ fn abandonment_preserves_terminal_operation_and_releases_only_after_ack() {
     assert!(fs.query_file_object_information(handle).is_ok());
     let retained = table.get(slot).unwrap();
     assert!(retained.consumer_abandoned);
-    assert_eq!(retained.local_terminal_result(), Some((0, 0)));
+    assert_eq!(retained.owned_terminal_result(), Some((0, 0)));
     assert_eq!(retained.iosb_va, 0);
     assert_eq!(retained.apc_routine, 0);
     if retained.signal_file {
@@ -291,7 +291,7 @@ fn abandonment_preserves_terminal_operation_and_releases_only_after_ack() {
     assert!(table.finish_exact(slot, REQUEST).is_none());
     fs.zw_release_io_reference(handle).unwrap();
     table
-        .mark_local_reference_released_exact(slot, REQUEST)
+        .mark_owned_reference_released_exact(slot, REQUEST)
         .unwrap();
     table.finish_exact(slot, REQUEST).unwrap();
     assert_eq!(

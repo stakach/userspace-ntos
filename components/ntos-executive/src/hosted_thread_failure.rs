@@ -3,6 +3,55 @@ use super::*;
 use nt_user_host::thread_binding::ThreadBinding;
 use nt_user_host::thread_construction::{MemoryConstructionProgress, ThreadConstructionInventory};
 
+pub(crate) enum ThreadConstructionError {
+    Native(u64),
+    NtStatus(u32),
+    Codec(nt_thread_start::amd64_context::CodecError),
+    Admission(&'static str),
+}
+
+pub(crate) fn record_hosted_thread_construction_failure(
+    binding: &ThreadBinding<HostedThreadRole>,
+    phase: &'static [u8],
+    error: ThreadConstructionError,
+    target: u64,
+) {
+    use core::fmt::Write;
+    let mut record = nt_printf::record::RecordBuffer::<512>::new();
+    let (generation_kind, generation) = match binding.process.generation {
+        nt_types::ProcessGeneration::Hosted(value) => ("hosted", value),
+        nt_types::ProcessGeneration::Temporary(value) => ("temporary", value),
+    };
+    let _ = write!(record,
+        "[thread-construction-failure] pi={} pid={} generation-kind={} generation={} tid={} badge={} phase={} target=0x{:016x}",
+        binding.pi, binding.process.pid, generation_kind, generation, binding.tid, binding.badge,
+        core::str::from_utf8(phase).expect("static construction phase"), target);
+    match error {
+        ThreadConstructionError::Native(error) => {
+            let _ = write!(record, " error-kind=native error=0x{error:016x}");
+        }
+        ThreadConstructionError::NtStatus(status) => {
+            let _ = write!(record, " error-kind=nt status=0x{status:08x}");
+        }
+        ThreadConstructionError::Codec(error) => {
+            let _ = write!(
+                record,
+                " error-kind=codec error={error:?} status=0x{:08x}",
+                error.status()
+            );
+        }
+        ThreadConstructionError::Admission(reason) => {
+            let _ = write!(record, " error-kind=admission reason={reason}");
+        }
+    }
+    let _ = writeln!(record);
+    sel4_rt::print_record(if record.overflowed() {
+        b"[thread-construction-failure] record-truncated\n"
+    } else {
+        record.bytes()
+    });
+}
+
 #[derive(Debug)]
 pub(crate) enum ThreadReconciliationError {
     OwnerChanged,

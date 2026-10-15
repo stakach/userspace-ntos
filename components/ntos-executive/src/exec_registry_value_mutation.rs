@@ -85,11 +85,13 @@ impl ExecNtHandler {
     }
 
     pub(super) unsafe fn nt_set_value_key_admitted(&mut self, args: &[u64]) -> u32 {
+        let _capture_scope = allocator::enter_scope(b"registry.set-value-capture");
         let key = match self.resolve_registry_key(args[0], 2) {
             Ok(key) => key,
             Err(status) => return status,
         };
         let mut retained = if self.cm_system_key_target(key).is_some() {
+            let _scope = allocator::enter_scope(b"registry.set-value-retain-cm");
             match crate::registry_mutation_work::retain_hosted_existing(self, key) {
                 Ok(retained) => Some(retained),
                 Err(status) => return status,
@@ -117,6 +119,7 @@ impl ExecNtHandler {
                 return status;
             }
         }
+        let _mutation_scope = allocator::enter_scope(b"registry.set-value-mutation");
         if let Some(retained) = retained {
             if nt_hive_core::RegistryValueType::from_u32(nt_ulong_arg(args[3])).is_none() {
                 retained.abort(self);

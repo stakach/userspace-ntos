@@ -104,7 +104,7 @@ fn partial_copy_and_late_surface_retries_retain_exact_fsd_bytes_until_ack() {
         .unwrap();
     assert!(io.complete_local_directory_notify_exact(IRP, notify.raw(), 0, information, true));
     assert_eq!(
-        io.get(slot).unwrap().local_terminal_result(),
+        io.get(slot).unwrap().owned_terminal_result(),
         Some((0, information as u64))
     );
     publish_surfaces(&mut io, slot);
@@ -121,12 +121,12 @@ fn partial_copy_and_late_surface_retries_retain_exact_fsd_bytes_until_ack() {
     for _ in 0..3 {
         assert!(fsd.completion_exact(notify, &IRP).unwrap().is_none());
         assert_eq!(
-            io.get(slot).unwrap().local_terminal_result(),
+            io.get(slot).unwrap().owned_terminal_result(),
             Some((0, information as u64))
         );
         assert!(io.finish_exact(slot, IRP).is_none());
     }
-    io.mark_local_reference_released_exact(slot, IRP).unwrap();
+    io.mark_owned_reference_released_exact(slot, IRP).unwrap();
     assert!(io.finish_exact(slot, IRP).is_some());
     assert!(io.finish_exact(slot, IRP).is_none());
     assert!(fsd.acknowledge_completion(notify, &IRP).is_err());
@@ -148,7 +148,7 @@ fn consumer_teardown_after_change_keeps_nonempty_terminal_result_for_ack() {
     fsd.acknowledge_completion(notify, &IRP).unwrap();
     io.mark_backend_acked_exact(slot, IRP).unwrap();
     assert!(io.finish_exact(slot, IRP).is_none());
-    io.mark_local_reference_released_exact(slot, IRP).unwrap();
+    io.mark_owned_reference_released_exact(slot, IRP).unwrap();
     assert!(io.finish_exact(slot, IRP).unwrap().consumer_abandoned);
 }
 
@@ -169,9 +169,9 @@ fn cancel_and_cleanup_results_follow_the_same_retained_delivery_lifecycle() {
         publish_surfaces(&mut io, slot);
         fsd.acknowledge_completion(notify, &IRP).unwrap();
         io.mark_backend_acked_exact(slot, IRP).unwrap();
-        io.mark_local_reference_released_exact(slot, IRP).unwrap();
+        io.mark_owned_reference_released_exact(slot, IRP).unwrap();
         assert_eq!(
-            io.finish_exact(slot, IRP).unwrap().local_terminal_result(),
+            io.finish_exact(slot, IRP).unwrap().owned_terminal_result(),
             Some((status, 0))
         );
     }

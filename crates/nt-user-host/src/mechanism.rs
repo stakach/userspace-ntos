@@ -25,6 +25,10 @@ pub struct ProcessMechanism {
     pub generation: u64,
 }
 
+#[cfg(test)]
+#[path = "process_deletion_rundown_tests.rs"]
+mod process_deletion_rundown_tests;
+
 /// Exact hosted-process identity retained while Object Manager references drain after Ps exit.
 ///
 /// A process index can be reused after final deletion, so neither `pi` nor PID alone is a safe
@@ -39,6 +43,9 @@ pub struct ProcessDeletionCandidate {
     /// canonical lookup withdrawal and before final Process retirement. False means no provider
     /// destructor is part of this identity.
     pub provider_objects: bool,
+    /// The broker acknowledged this exact process's endpoint rundown. Subsequent reference
+    /// barriers retain that fact without re-entering the broker.
+    pub lpc_rundown_acknowledged: bool,
     pub phase: ProcessDeletionPhase,
     /// Payload returned exactly once by final Process retirement. Zero means that no external
     /// reference of that kind remains to be returned by the executive.
@@ -81,6 +88,7 @@ impl ProcessDeletionCandidate {
             pid: 0,
             generation: 0,
             provider_objects: false,
+            lpc_rundown_acknowledged: false,
             phase: ProcessDeletionPhase::AwaitingReferences,
             pending_primary_token: 0,
             pending_exception_port: 0,
@@ -94,6 +102,7 @@ impl ProcessDeletionCandidate {
             pid: mechanism.pid,
             generation: mechanism.generation,
             provider_objects,
+            lpc_rundown_acknowledged: false,
             phase: ProcessDeletionPhase::AwaitingReferences,
             pending_primary_token: 0,
             pending_exception_port: 0,
@@ -158,6 +167,7 @@ impl<const N: usize> ProcessDeletionCandidateTable<N> {
         }
         if candidate.pid == 0
             || candidate.generation == 0
+            || candidate.lpc_rundown_acknowledged
             || candidate.phase != ProcessDeletionPhase::AwaitingReferences
             || candidate.pending_primary_token != 0
             || candidate.pending_exception_port != 0
@@ -174,6 +184,30 @@ impl<const N: usize> ProcessDeletionCandidateTable<N> {
         }
         *slot = candidate;
         Ok(true)
+    }
+
+    /// Record successful broker rundown without advancing past outstanding process references.
+    /// The caller must hold the actual acknowledgement; stale snapshots never erase progress.
+    pub fn acknowledge_lpc_rundown_exact(
+        &mut self,
+        expected: ProcessDeletionCandidate,
+    ) -> Result<ProcessDeletionCandidate, MechanismError> {
+        let Some(slot) = self.slots.get_mut(expected.pi) else {
+            return Err(MechanismError::SlotOutOfRange);
+        };
+        if !slot.is_live() {
+            return Err(MechanismError::InvalidIdentity);
+        }
+        if *slot != expected {
+            return Err(MechanismError::StaleIdentity);
+        }
+        if expected.phase != ProcessDeletionPhase::AwaitingReferences
+            || expected.lpc_rundown_acknowledged
+        {
+            return Err(MechanismError::InvalidIdentity);
+        }
+        slot.lpc_rundown_acknowledged = true;
+        Ok(*slot)
     }
 
     /// Advance one exact live candidate by one phase. Skips, regressions, and stale snapshots are
@@ -316,7 +350,7 @@ impl<const N: usize> ProcessDeletionCandidateTable<N> {
                 ProcessDeletionPhase::AwaitingReferences | ProcessDeletionPhase::RetiringMechanism
             )
             || (expected.phase == ProcessDeletionPhase::AwaitingReferences
-                && expected.deleted_threads != 0)
+                && (expected.deleted_threads != 0 || expected.lpc_rundown_acknowledged))
         {
             return Err(MechanismError::InvalidIdentity);
         }
@@ -870,6 +904,7 @@ mod tests {
             pid: 12,
             generation: 3,
             provider_objects: true,
+            lpc_rundown_acknowledged: false,
             phase: ProcessDeletionPhase::AwaitingReferences,
             pending_primary_token: 0,
             pending_exception_port: 0,

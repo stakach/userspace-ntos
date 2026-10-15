@@ -95,6 +95,56 @@ pub struct LegacyIrqOverride {
     pub active_low: Option<bool>,
 }
 
+/// Resolve a legacy bus IRQ using validated MADT overrides. Conforming ISA polarity and
+/// trigger mode are active high and edge triggered.
+pub fn resolve_legacy_irq(
+    irq: u32,
+    level_sensitive: bool,
+    overrides: &[LegacyIrqOverride],
+) -> Result<(u32, bool), PciRoutingError> {
+    let irq = u8::try_from(irq)
+        .ok()
+        .filter(|irq| *irq < 16)
+        .ok_or(PciRoutingError::InvalidRoutingEntry)?;
+    let route = overrides.iter().find(|route| route.irq == irq);
+    if route.and_then(|route| route.level_sensitive).unwrap_or(false) != level_sensitive {
+        return Err(PciRoutingError::ConflictingLegacyIrqOverride);
+    }
+    Ok((
+        route.map(|route| route.gsi).unwrap_or(u32::from(irq)),
+        route.and_then(|route| route.active_low).unwrap_or(false),
+    ))
+}
+
+#[cfg(test)]
+mod legacy_irq_tests {
+    use super::{resolve_legacy_irq, LegacyIrqOverride, PciRoutingError};
+
+    #[test]
+    fn isa_default_and_madt_override_preserve_trigger_and_polarity() {
+        assert_eq!(resolve_legacy_irq(1, false, &[]), Ok((1, false)));
+        assert_eq!(
+            resolve_legacy_irq(1, true, &[]),
+            Err(PciRoutingError::ConflictingLegacyIrqOverride),
+        );
+        let override_irq = LegacyIrqOverride {
+            irq: 1,
+            gsi: 19,
+            level_sensitive: Some(true),
+            active_low: Some(true),
+        };
+        assert_eq!(resolve_legacy_irq(1, true, &[override_irq]), Ok((19, true)));
+        assert_eq!(
+            resolve_legacy_irq(1, false, &[override_irq]),
+            Err(PciRoutingError::ConflictingLegacyIrqOverride),
+        );
+        assert_eq!(
+            resolve_legacy_irq(16, false, &[override_irq]),
+            Err(PciRoutingError::InvalidRoutingEntry),
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolvedPciRoute {
     pub segment: u16,

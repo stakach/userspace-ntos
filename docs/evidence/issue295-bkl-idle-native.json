@@ -1,0 +1,35 @@
+{
+  "issue": 295,
+  "parent_source_commit": "b57f0f98ba9a70088c560d2d49e235975c139075",
+  "microkernel_source_commit": "851c300cd5533ed211fccb5d8b2dda3e43058ed1",
+  "microkernel_pull_request": "https://github.com/stakach/rust-micro/pull/16",
+  "profile": "standalone microkernel specs with microtest rootserver",
+  "staged_image_profile": "font-cleanup",
+  "qemu_cpus": 4,
+  "boot_bound_seconds": 3600,
+  "build_exit": 0,
+  "launcher_exit": 0,
+  "host_tests_passed": 6,
+  "rootserver_tests_passed": 16,
+  "rootserver_tests_failed": 0,
+  "syscall_idle_backedges": 70,
+  "probe_retirement_rounds": 64,
+  "probe_observation_calls": 20000,
+  "probe_ipc_replies": 2,
+  "artifact_sha256": {
+    "microkernel": "34e785e4e23b97b648f3d852a9ef1dba7a6c210e732b064dd8b1dfcc0e0985bb",
+    "rootserver": "51c03900b7f1128fba47a675496657a9f2e258a7e62084406f134ff45a5e37a3",
+    "disk": "70be947fc9cb749faf3d84e96581bb2a7e4310a38bd307e1dcc46ffaef5faaeb",
+    "raw_log": "f818d1c3f4683306dcafef3ba265706bf44ed8aa10925003ae732948123db659",
+    "archived_log": "e2e6bc7246ac5999bf993a4dee8dc5413c3d7b532e66dd1b833bad8bc12d01e4"
+  },
+  "observations": [
+    "The old atomic lock failed the deterministic foreign-owner release regression before the fix. Owner-checked release now preserves foreign ownership, and the no-thread syscall backedge retains its reacquired BKL until the next single release.",
+    "All native kernel specs passed, including existing SMP quiescence and translation-retirement contracts. The new fixture maps and unmaps an exactly owned frame in a separate owned VSpace, generating ordinary retirement IPIs; it does not inject a test-only interrupt or write the observation counter.",
+    "The counter is incremented only by the actual no-thread syscall idle backedge, after asserting current CPU ownership. A positive same-run count proves target branch execution; the bounded userspace pauses make no elapsed-time assertion.",
+    "Independent source review cleared compressed paging ABI, retained exact capabilities and leaf-first cleanup. The fixture and observation are spec-only. This is microkernel correctness evidence, not strict NT font cleanup, desktop rendering or a measured NT performance improvement."
+  ],
+  "evidence": {
+    "log": "docs/evidence/issue295-bkl-idle-native.log.gz"
+  }
+}

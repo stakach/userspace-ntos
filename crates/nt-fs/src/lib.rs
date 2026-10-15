@@ -17,6 +17,7 @@ mod directory;
 mod fat_directory;
 mod fat_directory_walk;
 mod file_backing;
+mod file_mode;
 mod flush;
 mod fs;
 mod hive_provider;
@@ -30,6 +31,8 @@ mod path;
 mod query;
 mod snapshot_store;
 mod snapshot_reserve;
+mod snapshot_region;
+mod registry_wal_store;
 #[cfg(test)]
 mod snapshot_test_device;
 mod status;
@@ -41,6 +44,7 @@ pub use directory::*;
 pub use fat_directory::*;
 pub use fat_directory_walk::*;
 pub use file_backing::FileBacking;
+pub use file_mode::FileModeState;
 pub use flush::file_flush_access_allowed;
 pub use fs::{
     installed_file_open_action, layered_file_open_decision,
@@ -73,9 +77,15 @@ pub use path::{
 pub use query::*;
 pub use snapshot_store::{
     PayloadSectorReader, PayloadSectorWriter, SnapshotBlockDevice, SnapshotBlockStore,
-    SnapshotBlockStoreError, SnapshotPayloadReader, SnapshotPayloadSink, StoredSnapshot,
+    SnapshotBlockStoreError, SnapshotPayloadReader, SnapshotPayloadSink, SnapshotReadFormat,
+    StoredSnapshot, StoredSnapshotMetadata, StoredWalSnapshot, WalSnapshotAnchor,
+    WalSnapshotAnchorUpdate, WalSnapshotManifest,
 };
 pub use snapshot_reserve::{SnapshotReserve, SnapshotReserveLease};
+pub use snapshot_region::{BoundedBlockRange, OwnedBoundedBlockRange};
+pub use registry_wal_store::{RegistryWal, RegistryWalError, RegistryWalRecord, RegistryWalState, RegistryWalVerifiedDevice, RegistryWalVerifiedPrefix};
+mod snapshot_baseline_repair;
+pub use snapshot_baseline_repair::WalSnapshotBaselineRepair;
 pub use status::*;
 pub use volume::*;
 

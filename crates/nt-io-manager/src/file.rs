@@ -52,7 +52,7 @@ pub(crate) fn create_terminal_opens_file(status: nt_status::NtStatus) -> bool {
 
 #[cfg(test)]
 mod create_terminal_tests {
-    use super::create_terminal_opens_file;
+    use super::{create_terminal_opens_file, FileRecord, FileState};
     use nt_status::NtStatus;
 
     #[test]
@@ -60,6 +60,44 @@ mod create_terminal_tests {
         assert!(create_terminal_opens_file(NtStatus::SUCCESS));
         assert!(!create_terminal_opens_file(NtStatus::REPARSE));
         assert!(!create_terminal_opens_file(NtStatus::ACCESS_DENIED));
+    }
+
+    #[test]
+    fn terminal_create_preserves_abandoned_success_but_closes_failure_and_reparse() {
+        for abandoned in [false, true] {
+            for status in [NtStatus::SUCCESS, NtStatus::ACCESS_DENIED, NtStatus::REPARSE] {
+                let mut file = FileRecord::new(
+                    nt_types::ObjectId(1), nt_types::ClientId(1), crate::DeviceId::NULL,
+                    nt_types::AccessMask::GENERIC_READ, crate::ShareAccess::empty(),
+                    crate::CreateOptions::empty(), nt_types::UnicodeString::from_str("child"),
+                );
+                file.state = if abandoned { FileState::ClosePending } else { FileState::CreateIrpDispatched };
+                file.close_deferred = abandoned;
+                file.complete_create(status, Some(0x1234));
+                let opened = status == NtStatus::SUCCESS;
+                assert_eq!(file.state, if opened {
+                    if abandoned { FileState::ClosePending } else { FileState::Open }
+                } else { FileState::Closed });
+                assert_eq!(file.driver_context, opened.then_some(0x1234));
+                assert_eq!(file.close_deferred, abandoned);
+                assert!(!file.cleanup_dispatched && !file.close_dispatched);
+            }
+        }
+    }
+
+    #[test]
+    fn early_create_failure_preserves_existing_context_and_deferred_owner() {
+        let mut file = FileRecord::new(
+            nt_types::ObjectId(1), nt_types::ClientId(1), crate::DeviceId::NULL,
+            nt_types::AccessMask::GENERIC_READ, crate::ShareAccess::empty(),
+            crate::CreateOptions::empty(), nt_types::UnicodeString::from_str("child"),
+        );
+        file.driver_context = Some(0x5678);
+        file.close_deferred = true;
+        file.complete_create(NtStatus::ACCESS_DENIED, Some(0x1234));
+        assert_eq!(file.state, FileState::Closed);
+        assert_eq!(file.driver_context, Some(0x5678));
+        assert!(file.close_deferred);
     }
 }
 
@@ -143,6 +181,19 @@ pub struct FileRecord {
 }
 
 impl FileRecord {
+    /// Terminal CREATE alone determines whether the driver opened this File. Abandonment
+    /// preserves CLOSE for a successful race, but a failed unopened File needs no driver CLOSE.
+    pub(crate) fn complete_create(&mut self, status: nt_status::NtStatus, context: Option<u64>) {
+        if create_terminal_opens_file(status) {
+            self.driver_context = context;
+            if self.state == FileState::CreateIrpDispatched {
+                assert!(self.transition(FileState::Open));
+            }
+        } else if self.state != FileState::Closed {
+            assert!(self.transition(FileState::Closed), "failed CREATE has an invalid File state");
+        }
+    }
+
     /// A freshly-allocated file record (id filled in by the store's caller).
     pub fn new(
         object_id: ObjectId,

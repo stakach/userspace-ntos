@@ -10,6 +10,7 @@ pub enum CreateChildError {
     EmptySecurityDescriptor,
     InsufficientResources,
     ChildMustBeVolatile,
+    RetainedPublication,
 }
 
 fn copy_slice<T: Copy>(source: &[T]) -> Result<Vec<T>, CreateChildError> {
@@ -74,6 +75,9 @@ impl HiveTransaction<'_> {
         security_descriptor: Vec<u8>,
         volatile: bool,
     ) -> Result<CellId, CreateChildError> {
+        if self.hive.pending_value_journal.is_some() {
+            return Err(CreateChildError::RetainedPublication);
+        }
         if name.is_empty() || name.contains(['\\', '\0']) {
             return Err(CreateChildError::InvalidName);
         }

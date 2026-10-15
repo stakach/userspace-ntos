@@ -31,7 +31,32 @@ pub struct NestedExecutionScope {
     consumed: bool,
 }
 
+/// Sealed equality witness for an actual nested scope. It does not authorize execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NestedExecutionIdentity {
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    sequence: u64,
+}
+
+impl NestedExecutionIdentity {
+    pub(crate) const fn sequence(self) -> u64 { self.sequence }
+    pub const fn dispatch(self) -> LaneDispatchIdentity {
+        self.dispatch
+    }
+    pub const fn route(self) -> PeerRoute {
+        self.route
+    }
+}
+
 impl NestedExecutionScope {
+    pub const fn identity(&self) -> NestedExecutionIdentity {
+        NestedExecutionIdentity {
+            route: self.route,
+            dispatch: self.dispatch,
+            sequence: self.sequence,
+        }
+    }
     pub const fn dispatch(&self) -> LaneDispatchIdentity {
         self.dispatch
     }
@@ -159,6 +184,9 @@ impl<M> IngressReceiver<M> {
     ) -> Result<(), NestedExecutionError<E>> {
         if scope.consumed {
             return Err(NestedExecutionError::Consumed);
+        }
+        if !lanes.receive_scope_restorable(scope) {
+            return Err(NestedExecutionError::WrongOwner);
         }
         if lanes.execution_busy() || lanes.slots.iter().any(|slot| slot.lane.as_ref()
             .is_some_and(|lane| matches!(lane.phase, LanePhase::NestedExecution(sequence) if sequence > scope.sequence))) {

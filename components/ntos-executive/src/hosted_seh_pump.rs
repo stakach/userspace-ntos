@@ -250,6 +250,7 @@ impl SehPump {
         Some(())
     }
 
+    #[inline(never)]
     pub(super) fn call(
         &mut self,
         channel: &PumpChannel,

@@ -607,13 +607,21 @@ fn io_address_requirement_matches(
     let maximum = read_u64(bytes, descriptor + 24).map_err(IoResourceAssignmentError::Malformed)?;
     let flags = u16::from_le_bytes([bytes[descriptor + 4], bytes[descriptor + 5]]);
     let end = candidate_start.checked_add(candidate_length.saturating_sub(1) as u64);
+    // BAR is broker metadata on the candidate, not a native PCI requirement flag.
+    // Preserve the candidate's other resource attributes while matching a bus PDO list.
+    let marker = if bytes[descriptor + 1] == CM_RESOURCE_TYPE_MEMORY {
+        CM_RESOURCE_MEMORY_BAR
+    } else {
+        CM_RESOURCE_PORT_BAR
+    };
     Ok(length != 0
         && alignment != 0
         && maximum >= minimum
         && candidate_length == length
         && candidate_start >= minimum
         && candidate_start % alignment as u64 == 0
-        && candidate_flags == flags
+        && (candidate_flags == flags
+            || (candidate_flags & marker != 0 && candidate_flags & !marker == flags))
         && candidate_share == bytes[descriptor + 2]
         && end.is_some_and(|end| end <= maximum))
 }
@@ -676,6 +684,7 @@ fn select_io_resource_groups(
     candidates: &[CmResourceDescriptor],
     used: &mut [bool],
     selected: &mut Vec<usize>,
+    require_all_candidates: bool,
 ) -> Result<bool, IoResourceAssignmentError> {
     const UNCHOSEN: usize = usize::MAX;
     const SKIPPED: usize = usize::MAX - 1;
@@ -692,9 +701,15 @@ fn select_io_resource_groups(
     let mut group_index = 0usize;
     loop {
         if group_index == groups.len() {
-            selected.clear();
-            selected.extend(chosen.iter().copied().filter(|choice| *choice < SKIPPED));
-            return Ok(true);
+            if !require_all_candidates || used.iter().all(|used| *used) {
+                selected.clear();
+                selected.extend(chosen.iter().copied().filter(|choice| *choice < SKIPPED));
+                return Ok(true);
+            }
+            if group_index == 0 {
+                return Ok(false);
+            }
+            group_index -= 1;
         }
         if chosen[group_index] < SKIPPED {
             used[chosen[group_index]] = false;
@@ -771,6 +786,43 @@ pub fn select_io_resource_assignment(
     slot_number: u32,
     candidates: &[CmResourceDescriptor],
 ) -> Result<Option<Vec<usize>>, IoResourceAssignmentError> {
+    select_io_resource_assignment_inner(
+        bytes,
+        interface_type,
+        bus_number,
+        slot_number,
+        candidates,
+        false,
+    )
+}
+
+/// Select an alternative that assigns every supplied physical candidate. Later alternatives
+/// remain eligible when an earlier one satisfies only part of a bus PDO's reported resources.
+pub fn select_complete_io_resource_assignment(
+    bytes: &[u8],
+    interface_type: i32,
+    bus_number: u32,
+    slot_number: u32,
+    candidates: &[CmResourceDescriptor],
+) -> Result<Option<Vec<usize>>, IoResourceAssignmentError> {
+    select_io_resource_assignment_inner(
+        bytes,
+        interface_type,
+        bus_number,
+        slot_number,
+        candidates,
+        true,
+    )
+}
+
+fn select_io_resource_assignment_inner(
+    bytes: &[u8],
+    interface_type: i32,
+    bus_number: u32,
+    slot_number: u32,
+    candidates: &[CmResourceDescriptor],
+    require_all_candidates: bool,
+) -> Result<Option<Vec<usize>>, IoResourceAssignmentError> {
     let extent = validate_io_resource_requirements_list_extent(bytes)
         .map_err(IoResourceAssignmentError::Malformed)?;
     if extent != bytes.len() {
@@ -829,6 +881,7 @@ pub fn select_io_resource_assignment(
             candidates,
             &mut used,
             &mut selected,
+            require_all_candidates,
         )? {
             return Ok(Some(selected));
         }

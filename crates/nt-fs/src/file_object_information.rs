@@ -38,7 +38,7 @@ impl FileSystem {
         Ok(FileObjectInformation {
             metadata,
             current_offset: object.current_offset,
-            mode: crate::file_mode_from_create_options(object.create_options),
+            mode: object.mode_state.query_bits(),
         })
     }
 

@@ -58,6 +58,10 @@ struct Wait {
 #[derive(Clone, Copy)]
 enum ServiceCompletion {
     Status(i32),
+    HostedForward {
+        disposition: nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply,
+        token: u64,
+    },
     QueryPath {
         status: i32,
         accepted: bool,
@@ -79,6 +83,10 @@ impl ServiceCompletion {
     fn words(self) -> (u64, [u64; 4]) {
         match self {
             Self::Status(status) => (1, [status as u32 as u64, 0, 0, 0]),
+            Self::HostedForward { disposition, token } => {
+                let (status, kind) = disposition.words().expect("exact hosted forward disposition");
+                (3, [status as u32 as u64, kind, token, 0])
+            }
             Self::QueryPath { status, accepted } => {
                 (2, [status as u32 as u64, u64::from(accepted), 0, 0])
             }
@@ -309,6 +317,17 @@ pub(crate) unsafe fn retained_service_reply_not_entered(
     Ok(wait.phase == WaitPhase::Parked)
 }
 
+pub(crate) unsafe fn wake_hosted_forward_service(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+    disposition: nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply,
+) -> Result<(), Error> {
+    wake_with_completion(route, dispatch, reply, token,
+        ServiceCompletion::HostedForward { disposition, token })
+}
+
 pub(crate) unsafe fn wake_query_path_service(
     route: PeerRoute,
     dispatch: LaneDispatchIdentity,
@@ -433,6 +452,48 @@ pub(crate) unsafe fn reconcile_retained_service_reply(
         wait.resume_retry_at = crate::monotonic_time_100ns();
     }
     Ok(acknowledged)
+}
+
+/// The exact source continuation arrived after a Pending Reply. This causal observation can
+/// resolve an uncertain native send without invoking the Reply again. The caller must first
+/// authenticate the source TCB and retained source IRP for this dispatch.
+pub(crate) unsafe fn acknowledge_hosted_forward_source_continuation(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+) -> Result<(), Error> {
+    let wait = wait_exact(route, dispatch, reply, token).ok_or(Error::Admission)?;
+    if wait.kind != WaitKind::RetainedSemantic {
+        return Err(Error::Admission);
+    }
+    match (wait.phase, wait.completion) {
+        (WaitPhase::Acknowledged | WaitPhase::Resumed | WaitPhase::CompletedAcknowledged
+            | WaitPhase::StoppedAcknowledged | WaitPhase::Finished,
+            Some(ServiceCompletion::HostedForward {
+            disposition: nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply::Pending,
+            token: completion_token,
+        })) if completion_token == token => return Ok(()),
+        (WaitPhase::ReplyEntered, Some(ServiceCompletion::HostedForward {
+            disposition: nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply::Pending,
+            token: completion_token,
+        })) if completion_token == token => {},
+        _ => return Err(Error::Admission),
+    }
+    let owner = owner();
+    owner.receiver.as_mut().expect("ready receiver")
+        .acknowledge_parked_stored_from_source_continuation(
+            route, dispatch, reply, token, lanes(),
+            owner.peers.as_ref().expect("ready peers"),
+        )
+        .map_err(|_| Error::Retirement)?;
+    let wait = wait_exact(route, dispatch, reply, token).ok_or(Error::Retirement)?;
+    if wait.phase != WaitPhase::ReplyEntered {
+        return Err(Error::Retirement);
+    }
+    wait.phase = WaitPhase::Acknowledged;
+    wait.resume_retry_at = crate::monotonic_time_100ns();
+    Ok(())
 }
 
 unsafe fn wake_with_completion(
@@ -560,6 +621,144 @@ pub(crate) unsafe fn retained_service_resume_next_deadline() -> Option<u64> {
 
 /// Finalize ACK bookkeeping when this continuation can reacquire root execution. A primary
 /// remains in its dispatch; an autonomous service finishes only its one Call invocation.
+/// Observe a suspended persistent worker's acknowledged service without advancing it.
+pub(crate) unsafe fn retained_service_resume_ready(
+    route: PeerRoute,
+    expected_dispatch: LaneDispatchIdentity,
+) -> Result<bool, Error> {
+    let source = physical_source(route)?;
+    if !matches!(source.domain, PhysicalDomain::Hosted(_))
+        || !matches!(source.kind, PhysicalSourceKind::DispatchWorker { .. })
+        || dispatch(route)? != expected_dispatch
+    {
+        return Err(Error::Admission);
+    }
+    let Some((reply, token, phase)) = (&*core::ptr::addr_of!(WAITS)).iter()
+        .find(|wait| wait.route == route && wait.dispatch == expected_dispatch
+            && matches!(wait.phase, WaitPhase::Acknowledged | WaitPhase::Resumed))
+        .map(|wait| (wait.reply, wait.token, wait.phase))
+    else { return Ok(false); };
+    if current_reply(route)? != reply {
+        return Err(Error::Admission);
+    }
+    if phase == WaitPhase::Acknowledged
+        && !lanes().can_resume_external(route.identity().lane, reply, token)
+            .map_err(|_| Error::Admission)?
+    {
+        return Ok(false);
+    }
+    // Reply ACK alone is not execution readiness. The next Call must already be retained.
+    Ok(next_message(route)?.is_some())
+}
+
+/// Read-only witness for the one service wait that currently suspends this dispatch lane.
+/// The caller must still authenticate the provider's physical source and live dispatch.
+pub(crate) unsafe fn parked_service_wait_identity(
+    route: PeerRoute,
+    expected_dispatch: LaneDispatchIdentity,
+) -> Result<Option<(u64, u64)>, Error> {
+    if dispatch(route)? != expected_dispatch
+        || lanes().phase(route.identity().lane) != Ok(nt_component_suspension::LanePhase::Suspended)
+    {
+        return Ok(None);
+    }
+    let Some(wait) = (&*core::ptr::addr_of!(WAITS)).iter().find(|wait| {
+        wait.route == route
+            && wait.dispatch == expected_dispatch
+            && wait.phase == WaitPhase::Parked
+    }) else {
+        return Ok(None);
+    };
+    if current_reply(route)? != wait.reply
+        || lanes().external_top(route.identity().lane).map_err(|_| Error::Admission)?
+            != Some(wait.token)
+    {
+        return Err(Error::Admission);
+    }
+    Ok(Some((wait.reply, wait.token)))
+}
+
+/// Readiness for the exact saved wait, before entering any resume effect.
+pub(crate) unsafe fn service_wait_resume_ready_exact(
+    route: PeerRoute,
+    expected_dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+) -> Result<bool, Error> {
+    if dispatch(route)? != expected_dispatch || current_reply(route)? != reply {
+        return Err(Error::Admission);
+    }
+    if !(&*core::ptr::addr_of!(WAITS)).iter().any(|wait| {
+        wait.route == route
+            && wait.dispatch == expected_dispatch
+            && wait.reply == reply
+            && wait.token == token
+            && wait.phase == WaitPhase::Acknowledged
+    }) {
+        return Ok(false);
+    }
+    if !lanes().can_resume_external(route.identity().lane, reply, token)
+        .map_err(|_| Error::Admission)?
+    {
+        return Ok(false);
+    }
+    Ok(next_message(route)?.is_some())
+}
+
+/// The acknowledged external token was transferred to the typed continuation. The wait row may
+/// already be reused, so the exact resuming frame is the durable authority for the receive half.
+pub(crate) unsafe fn service_wait_resume_completed_exact(
+    route: PeerRoute,
+    expected_dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+) -> Result<bool, Error> {
+    if dispatch(route)? != expected_dispatch || current_reply(route)? != reply {
+        return Err(Error::Admission);
+    }
+    let key = nt_component_suspension::SuspensionKey::service_wait(token);
+    let resumed = lanes().frame(route.identity().lane, key)
+        .map_err(|_| Error::Admission)?
+        .is_some_and(|frame| matches!(frame.phase, nt_component_suspension::SuspensionPhase::Resuming { .. }));
+    Ok(resumed
+        && lanes().running() == Some(route.identity().lane)
+        && lanes().external_top(route.identity().lane).map_err(|_| Error::Admission)? != Some(token))
+}
+
+/// Transfer an acknowledged provider service wait to its already retained syscall
+/// continuation. The external token and typed frame must identify the same live dispatch.
+pub(crate) unsafe fn resume_service_component_wait(
+    route: PeerRoute,
+    expected_dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+    key: nt_component_suspension::SuspensionKey,
+    frame_owner: nt_component_suspension::SuspensionOwner,
+) -> Result<bool, Error> {
+    if !matches!(physical_source(route)?.domain, PhysicalDomain::Provider { .. })
+        || !service_wait_resume_ready_exact(route, expected_dispatch, reply, token)?
+    {
+        return Ok(false);
+    }
+    let lane = route.identity().lane;
+    lanes().resume_external(lane, reply, token).map_err(|_| Error::Admission)?;
+    lanes()
+        .retire_service_wait_external_running(
+            lane, reply, expected_dispatch, token, key, frame_owner,
+        )
+        .map_err(|_| Error::Retirement)?;
+    let wait = wait_exact(route, expected_dispatch, reply, token).ok_or(Error::Retirement)?;
+    if wait.phase != WaitPhase::Acknowledged {
+        return Err(Error::Retirement);
+    }
+    wait.phase = if wait.kind == WaitKind::RetainedSemantic && !wait.semantic_retired {
+        WaitPhase::CompletedAcknowledged
+    } else {
+        WaitPhase::Finished
+    };
+    Ok(true)
+}
+
 pub(crate) unsafe fn resume_service(route: PeerRoute) -> Result<bool, Error> {
     let source = physical_source(route)?;
     let Some((dispatch, reply, token, phase)) = (&*core::ptr::addr_of!(WAITS))
