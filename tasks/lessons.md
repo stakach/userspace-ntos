@@ -659,3 +659,8 @@ diagnosis-free failure.
   with the native reproduction and reference accounting. Do not alter the binary locally.
 - Keep strict acceptance failed until an official fixed build is integrated and the native fixture
   passes. Track the upstream dependency separately from already-proven desktop acceptance.
+
+## Keep CI Contracts Independent Of Local References
+- `references/` is an ignored research checkout and is absent from crate CI. Read it to derive a
+  contract, but do not use compile-time `include_str!` or `include_bytes!` from it in workspace tests.
+- Verify new source tests in the same clean-checkout conditions as CI before calling a head ready.

@@ -2,13 +2,6 @@
 
 #[test]
 fn registration_publishes_the_exact_pdo_interface_before_class_start_open() {
-    let reference = include_str!(
-        "../../../references/reactos/drivers/input/kbdclass/kbdclass.c"
-    );
-    let class_start = &reference[reference.find("case IRP_MN_START_DEVICE:").unwrap()..];
-    assert!(class_start.find("ZwOpenFile(").unwrap()
-        < class_start.find("IoSetDeviceInterfaceState(").unwrap());
-
     let driver = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
     let registration = &driver[driver
         .find("unsafe fn register_hosted_device_interface(")
