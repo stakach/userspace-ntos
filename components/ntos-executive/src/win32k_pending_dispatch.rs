@@ -10,6 +10,35 @@ pub(crate) struct ReceiveYield {
     pub replaces: Option<nt_component_suspension::SuspensionKey>,
 }
 
+/// A dispatch worker's exact retained service wait while the win32k syscall pump yields its
+/// receive half to the root. This does not represent a nested parent or a provider completion.
+#[derive(Clone, Copy)]
+pub(crate) struct ServiceWaitYield {
+    pub route: nt_component_suspension::peer_registry::PeerRoute,
+    pub dispatch: nt_component_suspension::LaneDispatchIdentity,
+    pub reply: u64,
+    pub token: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PendingServiceWaitDispatch {
+    pub yielded: ServiceWaitYield,
+    pub pump: crate::spawn_hosts::PumpResult,
+    pub channel: crate::spawn_hosts::PumpChannel,
+    pub dispatch: nt_user_callback::DispatchContext,
+    pub client: Win32kClientContext,
+    /// The parent callback token, when NtCallbackReturn resumed this pump.
+    pub callback_token: Option<u64>,
+    pub arg_snapshot_len: u32,
+    pub arg_snapshot: [u8; COMPLETED_ARG_SNAPSHOT_BYTES],
+}
+
+pub(super) static mut SERVICE_WAIT_PENDING_DISPATCH: Option<PendingServiceWaitDispatch> = None;
+
+pub(crate) unsafe fn take_pending_service_wait_dispatch() -> Option<PendingServiceWaitDispatch> {
+    core::ptr::replace(core::ptr::addr_of_mut!(SERVICE_WAIT_PENDING_DISPATCH), None)
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct PendingReceiveDispatch {
     pub yielded: ReceiveYield,
@@ -17,6 +46,7 @@ pub(crate) struct PendingReceiveDispatch {
     pub channel: crate::spawn_hosts::PumpChannel,
     pub dispatch: nt_user_callback::DispatchContext,
     pub client: Win32kClientContext,
+    pub callback_token: Option<u64>,
     pub arg_snapshot_len: u32,
     pub arg_snapshot: [u8; COMPLETED_ARG_SNAPSHOT_BYTES],
 }
@@ -58,6 +88,8 @@ pub(crate) enum ProviderWaitPumpCompletion {
     Completed(CompletedWin32kDispatch),
     Reparked(PendingProviderWaitDispatch),
     LpcReparked(PendingLpcWaitDispatch),
+    ReceiveReparked(PendingReceiveDispatch),
+    ServiceReparked(PendingServiceWaitDispatch),
     UserCallbackSuspended,
     Failed(i32),
 }
@@ -66,6 +98,8 @@ pub(crate) enum LpcWaitPumpCompletion {
     Completed(CompletedWin32kDispatch),
     ProviderReparked(PendingProviderWaitDispatch),
     Reparked(PendingLpcWaitDispatch),
+    ReceiveReparked(PendingReceiveDispatch),
+    ServiceReparked(PendingServiceWaitDispatch),
     UserCallbackSuspended,
     Failed(i32),
 }

@@ -1485,6 +1485,11 @@ fn dispatch_depth_leave() {
 const REQUEST_TAG_LEN: u64 = 1;
 static PUMP_DEADMAN_UNWINDS: AtomicU64 = AtomicU64::new(0);
 
+/// Active receive scopes and the request kind/SEH state at delivered IRQ notifications.
+pub(crate) fn pump_receive_census() -> (u64, u64, u64, u64, u64, u64) {
+    shared_pump::receive_census()
+}
+
 pub(crate) unsafe fn pump_handle_executive_event_badge(badge: u64) -> (bool, bool, bool) {
     let timer = crate::badge_has_delay_timer(badge);
     let irq_lines = crate::driver_launch::latch_hosted_irq_badge(badge);
@@ -1527,6 +1532,7 @@ struct PumpMessage {
     m4: u64,
     scheduler_yield: bool,
     receive_yield: Option<crate::win32k_glue::ReceiveYield>,
+    service_wait_yield: Option<crate::win32k_glue::ServiceWaitYield>,
 }
 
 impl PumpMessage {
@@ -1549,6 +1555,7 @@ impl PumpMessage {
             received: Some(received),
             scheduler_yield: false,
             receive_yield: None,
+            service_wait_yield: None,
         }
     }
 
@@ -1579,6 +1586,7 @@ impl PumpMessage {
             m4: 0,
             scheduler_yield: false,
             receive_yield: None,
+            service_wait_yield: None,
         }
     }
 
@@ -1597,6 +1605,7 @@ impl PumpMessage {
             m4: 0,
             scheduler_yield: false,
             receive_yield: None,
+            service_wait_yield: None,
         }
     }
 
@@ -1615,6 +1624,7 @@ impl PumpMessage {
             m4: 0,
             scheduler_yield: true,
             receive_yield: None,
+            service_wait_yield: None,
         }
     }
 
@@ -1623,6 +1633,16 @@ impl PumpMessage {
             shared_reply: None, service_finished: false, received: None,
             badge: 0, mi: 0, m0: 0, m1: 0, m2: 0, m3: 0, m4: 0,
             scheduler_yield: false, receive_yield: Some(yielded),
+            service_wait_yield: None,
+        }
+    }
+
+    fn hosted_service_wait_yield(yielded: crate::win32k_glue::ServiceWaitYield) -> Self {
+        Self {
+            shared_reply: None, service_finished: false, received: None,
+            badge: 0, mi: 0, m0: 0, m1: 0, m2: 0, m3: 0, m4: 0,
+            scheduler_yield: false, receive_yield: None,
+            service_wait_yield: Some(yielded),
         }
     }
 }
@@ -1674,6 +1694,7 @@ struct PumpLoopOutcome {
     lpc_wait_suspended: bool,
     scheduler_yielded: bool,
     receive_yield: Option<crate::win32k_glue::ReceiveYield>,
+    service_wait_yield: Option<crate::win32k_glue::ServiceWaitYield>,
     wall_ip: u64,
     wall_addr: u64,
     wall_label: u64,
@@ -1694,6 +1715,7 @@ impl PumpLoopOutcome {
             lpc_wait_suspended: false,
             scheduler_yielded: false,
             receive_yield: None,
+            service_wait_yield: None,
             wall_ip: 0,
             wall_addr: 0,
             wall_label: 0,
@@ -1826,6 +1848,7 @@ pub(crate) struct PumpResult {
     /// reply object with the same accounting; do not replay an initial request or callback resume.
     pub scheduler_yielded: bool,
     pub receive_yield: Option<crate::win32k_glue::ReceiveYield>,
+    pub service_wait_yield: Option<crate::win32k_glue::ServiceWaitYield>,
     /// Wall diagnostics (only meaningful when `!completed`).
     pub wall_ip: u64,
     pub wall_addr: u64,
@@ -1854,6 +1877,7 @@ impl PumpResult {
             lpc_wait_suspended: false,
             scheduler_yielded: false,
             receive_yield: None,
+            service_wait_yield: None,
             wall_ip: 0,
             wall_addr: 0,
             wall_label: 0,
@@ -1869,6 +1893,18 @@ impl PumpResult {
     fn is_receive_yield(&self) -> bool {
         self.reply_cap != 0
             && (self.scheduler_yielded || self.receive_yield.is_some())
+            && self.service_wait_yield.is_none()
+            && !self.completed
+            && !self.callback_suspended
+            && !self.provider_wait_suspended
+            && !self.lpc_wait_suspended
+    }
+
+    fn is_service_wait_yield(&self) -> bool {
+        self.reply_cap != 0
+            && self.service_wait_yield.is_some()
+            && self.receive_yield.is_none()
+            && !self.scheduler_yielded
             && !self.completed
             && !self.callback_suspended
             && !self.provider_wait_suspended
@@ -2063,7 +2099,7 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
             msg = hosted_irq_reply_recv(ch, ch.reply_cap, 0, [0; 4], identity, expected_badge);
             continue;
         }
-        if label == 3 && ch.caps.io_port_faults {
+        if label == 3 {
             if let Some(next_ip) = pump_service_io_port_fault(ch, msg.m0, msg.m3) {
                 msg = hosted_irq_reply_recv(
                     ch, ch.reply_cap, 1, [next_ip, 0, 0, 0], identity, expected_badge,
@@ -2127,6 +2163,34 @@ pub(crate) unsafe fn component_pump_continue_receive(
     {
         return Err(nt_process::STATUS_INVALID_PARAMETER);
     }
+    component_pump_continue_receive_half(ch, previous)
+}
+
+/// Resume only the receive half after the exact external service wait has been ACKed and
+/// retired by the root owner. Its prior request and service Reply must never be sent again.
+pub(crate) unsafe fn component_pump_continue_service_wait(
+    ch: &PumpChannel,
+    previous: &PumpResult,
+) -> Result<PumpResult, u32> {
+    if !previous.is_service_wait_yield()
+        || !previous.service_wait_yield.is_some_and(|yielded|
+            previous.reply_cap == yielded.reply
+                && crate::win32k_glue::service_wait_continuation_is_current(ch, yielded))
+    {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    component_pump_continue_receive_half(ch, previous)
+}
+
+unsafe fn component_pump_continue_receive_half(
+    ch: &PumpChannel,
+    previous: &PumpResult,
+) -> Result<PumpResult, u32> {
+    if let Some(yielded) = previous.receive_yield {
+        crate::win32k_glue::trace_receive_phase(
+            b"resume-enter", yielded.parent, yielded.child, yielded.owner,
+        );
+    }
     crate::provider_bugcheck::stop_if_pending();
     let mut reply_cap = previous.reply_cap;
     let Some(mut seh) = hosted_seh_pump::SehLease::claim(ch, reply_cap, false) else {
@@ -2135,11 +2199,22 @@ pub(crate) unsafe fn component_pump_continue_receive(
         outcome.wall_label = nt_unwind::seh_transport::RAISE_LABEL;
         return Ok(pump_finish_slice(ch, outcome, reply_cap));
     };
+    if let Some(yielded) = previous.receive_yield {
+        crate::win32k_glue::trace_receive_phase(
+            b"resume-before-recv", yielded.parent, yielded.child, yielded.owner,
+        );
+    }
     let first = pump_recv(ch, reply_cap);
+    if let Some(yielded) = previous.receive_yield {
+        crate::win32k_glue::trace_receive_phase(
+            b"resume-after-recv", yielded.parent, yielded.child, yielded.owner,
+        );
+    }
     let mut outcome = component_pump_loop(ch, first, &mut reply_cap, previous.accounting, &mut seh.pump);
     let suspended = outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended;
     if !seh.finish(ch, reply_cap, suspended) {
-        assert!(outcome.receive_yield.is_none(), "receive yield retained with failed SEH retirement");
+        assert!(outcome.receive_yield.is_none() && outcome.service_wait_yield.is_none(),
+            "receive yield retained with failed SEH retirement");
         outcome.callback_suspended = false;
         outcome.provider_wait_suspended = false;
         outcome.lpc_wait_suspended = false;
@@ -2290,7 +2365,8 @@ unsafe fn component_pump_enter(
     let mut outcome = component_pump_loop(ch, first, &mut reply_cap, accounting, &mut seh.pump);
     let suspended = outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended;
     if !seh.finish(ch, reply_cap, suspended) {
-        assert!(outcome.receive_yield.is_none(), "receive yield retained with failed SEH retirement");
+        assert!(outcome.receive_yield.is_none() && outcome.service_wait_yield.is_none(),
+            "receive yield retained with failed SEH retirement");
         outcome.callback_suspended = false;
         outcome.provider_wait_suspended = false;
         outcome.lpc_wait_suspended = false;
@@ -2378,6 +2454,11 @@ unsafe fn component_pump_loop(
             outcome.receive_yield = Some(yielded);
             break;
         }
+        if let Some(yielded) = msg.service_wait_yield {
+            assert!(!seh.retained(), "retained exception cannot yield a service wait");
+            outcome.service_wait_yield = Some(yielded);
+            break;
+        }
         if msg.scheduler_yield {
             if seh.retained() {
                 msg = pump_recv_retained_seh(ch);
@@ -2387,6 +2468,15 @@ unsafe fn component_pump_loop(
             break;
         }
         let label = msg.label();
+        // The current PDO may have no port resource while a live sibling PDO
+        // in the same driver instance owns the controller port. The decoder
+        // and exact hosted grant selector decide whether this GP is I/O.
+        if label == 3 {
+            if let Some(next_ip) = pump_service_io_port_fault(ch, msg.m0, msg.m3) {
+                pump_reply_recv_into!(ch, *reply_cap, msg, 1, next_ip);
+                continue;
+            }
+        }
         if label == crate::provider_bugcheck::BUGCHECK_LABEL {
             match crate::provider_bugcheck::accept(
                 ch,
@@ -2409,6 +2499,8 @@ unsafe fn component_pump_loop(
             }
             let hosted_starting =
                 crate::driver_launch::hosted_source_completion_lane::startup_expected(ch).is_some();
+            let class_starting =
+                crate::driver_launch::hosted_class_irp_lane::startup_expected(ch).is_some();
             if hosted_starting
                 && !crate::driver_launch::hosted_source_completion_lane::validate_startup_ready(
                     ch,
@@ -2418,7 +2510,15 @@ unsafe fn component_pump_loop(
                 outcome.wall(msg);
                 break;
             }
-            let starting = hosted_starting
+            if class_starting
+                && !crate::driver_launch::hosted_class_irp_lane::validate_startup_ready(
+                    ch, [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4],
+                )
+            {
+                outcome.wall(msg);
+                break;
+            }
+            let starting = hosted_starting || class_starting
                 || (ch.caps.kind == ReqKind::Syscall
                     && ch.initial == InitialAction::RecvFirst
                     && crate::win32k_glue::win32k_physical_lane_for_channel(
@@ -3581,7 +3681,9 @@ unsafe fn component_pump_loop(
             || label == crate::driver_launch::FSD_SERVICE_FLUSH_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_QUERY_INFORMATION_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_LOWER_PNP_FORWARD_LABEL
-            || label == crate::driver_launch::FSD_SERVICE_CONNECT_FORWARD_LABEL)
+            || label == crate::driver_launch::FSD_SERVICE_LOWER_FILE_FORWARD_LABEL
+            || label == crate::driver_launch::FSD_SERVICE_CONNECT_FORWARD_LABEL
+            || label == crate::driver_launch::FSD_SERVICE_HOOK_FORWARD_LABEL)
             && ch.caps.kind == ReqKind::Irp
         {
             let reply = if msg.mi
@@ -3609,8 +3711,16 @@ unsafe fn component_pump_loop(
                         crate::driver_launch::service_hosted_lower_pnp_forward(
                             ch, *reply_cap, msg.badge, msg.m0, msg.m1, msg.m2,
                         )
+                    } else if label == crate::driver_launch::FSD_SERVICE_LOWER_FILE_FORWARD_LABEL {
+                        crate::driver_launch::service_hosted_lower_file_forward(
+                            ch, *reply_cap, msg.badge, msg.m0, msg.m1, msg.m2,
+                        )
                     } else if label == crate::driver_launch::FSD_SERVICE_CONNECT_FORWARD_LABEL {
                         crate::driver_launch::service_hosted_connect_forward(
+                            ch, *reply_cap, msg.badge, msg.m0, msg.m1, msg.m2,
+                        )
+                    } else if label == crate::driver_launch::FSD_SERVICE_HOOK_FORWARD_LABEL {
+                        crate::driver_launch::service_hosted_hook_forward(
                             ch, *reply_cap, msg.badge, msg.m0, msg.m1, msg.m2,
                         )
                     } else {
@@ -3623,12 +3733,24 @@ unsafe fn component_pump_loop(
                 Some((STATUS_INVALID_PARAMETER_I32, false))
             };
             if let Some((status, accepted)) = reply {
-                pump_reply_recv4_into!(ch, *reply_cap, msg, 2,
-                    status as u32 as u64, u64::from(accepted), 0, 0);
-            } else if shared_pump::service_wait_yields(ch) {
-                outcome.provider_wait_suspended = true;
-                break;
+                if label == crate::driver_launch::FSD_SERVICE_LOWER_PNP_FORWARD_LABEL
+                    && msg.m0 == 3
+                {
+                    // The native FILTER caller reads m2 as its ACK token. An
+                    // inline accepted-PDO proof has no token; overwrite m2 rather
+                    // than preserving the incoming raw IRP argument.
+                    pump_reply_recv4_into!(ch, *reply_cap, msg, 3,
+                        status as u32 as u64, u64::from(accepted), 0, 0);
+                } else {
+                    pump_reply_recv4_into!(ch, *reply_cap, msg, 2,
+                        status as u32 as u64, u64::from(accepted), 0, 0);
+                }
             } else {
+                let yields = shared_pump::service_wait_yields(ch);
+                if yields {
+                    outcome.provider_wait_suspended = true;
+                    break;
+                }
                 msg = pump_recv(ch, *reply_cap);
             }
             continue;
@@ -3826,10 +3948,6 @@ unsafe fn component_pump_loop(
             pump_reply_recv_into!(ch, *reply_cap, msg, 0, 0);
             continue;
         } else if label == 3 && ch.caps.io_port_faults {
-            if let Some(next_ip) = pump_service_io_port_fault(ch, msg.m0, msg.m3) {
-                pump_reply_recv_into!(ch, *reply_cap, msg, 1, next_ip);
-                continue;
-            }
             if (ch.caps.kind == ReqKind::Irp
                 || (ch.caps.kind == ReqKind::Syscall
                     && crate::win32k_seh_image::linkage(ch, *reply_cap).is_some()))
@@ -4475,7 +4593,7 @@ unsafe fn pump_finish_slice(
 ) -> PumpResult {
     use nt_user_host::component_pump::PumpDepthDisposition;
     match outcome.accounting.after_slice(
-        outcome.scheduler_yielded || outcome.receive_yield.is_some(),
+        outcome.scheduler_yielded || outcome.receive_yield.is_some() || outcome.service_wait_yield.is_some(),
         outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended,
     ) {
         PumpDepthDisposition::None | PumpDepthDisposition::Retained => {}
@@ -4500,6 +4618,7 @@ unsafe fn pump_suspend_walled_component(ch: &PumpChannel, outcome: PumpLoopOutco
         && !outcome.lpc_wait_suspended
         && !outcome.scheduler_yielded
         && outcome.receive_yield.is_none()
+        && outcome.service_wait_yield.is_none()
     {
         pump_wall_state_diag(ch, outcome);
         crate::print_str(b"[pump] WALL label=");
@@ -4578,6 +4697,7 @@ unsafe fn pump_result_from_outcome(
         || outcome.lpc_wait_suspended
         || outcome.scheduler_yielded
         || outcome.receive_yield.is_some()
+        || outcome.service_wait_yield.is_some()
     {
         let status = nt_user_callback::STATUS_PENDING;
         (status, status as u32 as u64)
@@ -4606,6 +4726,7 @@ unsafe fn pump_result_from_outcome(
         lpc_wait_suspended: outcome.lpc_wait_suspended,
         scheduler_yielded: outcome.scheduler_yielded,
         receive_yield: outcome.receive_yield,
+        service_wait_yield: outcome.service_wait_yield,
         wall_ip: outcome.wall_ip,
         wall_addr: outcome.wall_addr,
         wall_label: outcome.wall_label,

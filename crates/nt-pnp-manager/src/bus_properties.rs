@@ -54,6 +54,21 @@ pub fn copy_pnp_device_text_x64(bytes: &[u8]) -> Result<Vec<u8>, BusPropertyCopy
     Ok(copied)
 }
 
+/// The mandatory DeviceDesc path also accepts a provider's empty string, so PiSetDevNodeText
+/// can apply its reference-defined fallback after the physical allocation has been copied.
+pub fn copy_pnp_required_device_text_x64(bytes: &[u8]) -> Result<Vec<u8>, BusPropertyCopyError> {
+    if bytes.len() >= 2 && bytes[..2] == [0, 0] {
+        let mut empty = Vec::new();
+        empty
+            .try_reserve_exact(2)
+            .map_err(|_| BusPropertyCopyError::InsufficientResources)?;
+        empty.extend_from_slice(&[0, 0]);
+        Ok(empty)
+    } else {
+        copy_pnp_device_text_x64(bytes)
+    }
+}
+
 /// An immutable bus-owned boot resource assignment that needs no HAL translation.
 ///
 /// A PCI root bridge reported by ACPI has one `CmResourceTypeBusNumber` boot descriptor and no
@@ -454,8 +469,17 @@ mod tests {
             .collect();
         let copied = copy_pnp_device_text_x64(&source).expect("terminated provider text");
         assert_eq!(copied, &source[..source.len() - 2]);
-        assert_eq!(copy_pnp_device_text_x64(&source[..source.len() - 4]), Err(BusPropertyCopyError::Truncated));
-        assert_eq!(copy_pnp_device_text_x64(&[0, 0]), Err(BusPropertyCopyError::Malformed));
-        assert_eq!(copy_pnp_device_text_x64(&[0x00, 0xd8, 0, 0]), Err(BusPropertyCopyError::Malformed));
+        assert_eq!(
+            copy_pnp_device_text_x64(&source[..source.len() - 4]),
+            Err(BusPropertyCopyError::Truncated)
+        );
+        assert_eq!(
+            copy_pnp_device_text_x64(&[0, 0]),
+            Err(BusPropertyCopyError::Malformed)
+        );
+        assert_eq!(
+            copy_pnp_device_text_x64(&[0x00, 0xd8, 0, 0]),
+            Err(BusPropertyCopyError::Malformed)
+        );
     }
 }

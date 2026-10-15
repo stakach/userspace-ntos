@@ -41,3 +41,21 @@ fn root_pdo_backend_preserves_unhandled_device_text_result() {
         "the root backend cannot report synthetic success for every PnP minor"
     );
 }
+
+#[test]
+fn accepted_bus_children_apply_required_description_policy_before_publication() {
+    let queried_children = body(
+        "unsafe fn store_hosted_bus_property(",
+        "unsafe fn publish_hosted_bus_relations(",
+    );
+    assert!(
+        queried_children
+            .contains("plan_required_device_description_from_verified_publication("),
+        "an accepted child with an unsupported or empty PDO text result needs the verified \
+         PiSetDevNodeText fallback before its Enum key becomes visible"
+    );
+    assert!(
+        queried_children.contains("\"DeviceDesc\""),
+        "the required description must be part of the durable child publication"
+    );
+}

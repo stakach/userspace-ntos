@@ -23,6 +23,7 @@ pub(super) fn invoke(
     let projection = invocation.projection().clone();
     let route = invocation.route();
     let Some((instance_index, _)) = instance_by_driver_id(route.driver_id().raw()) else {
+        print_str(b"[hosted-file] detached invoke missing driver instance\n");
         return invocation.returned(ExternalFileIrpOutcome::NotEntered {
             status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
         });
@@ -427,8 +428,17 @@ pub(super) fn execute(
             output,
             caller,
         )
+    };
+    if result.is_none() {
+        print_str(b"[hosted-file] exact dispatch unavailable instance/device/irp=");
+        print_u64(instance_index as u64);
+        print_str(b"/");
+        print_hex_u64(projection.device_id.raw());
+        print_str(b"/");
+        print_hex_u64(projection.irp_id.raw());
+        print_str(b"\n");
     }
-    .unwrap_or(HostedIrpTransportResult::NotDispatched {
+    let result = result.unwrap_or(HostedIrpTransportResult::NotDispatched {
         status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
     });
     if projection.major == major::IRP_MJ_CREATE

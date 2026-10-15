@@ -358,7 +358,7 @@ pub(super) unsafe fn prepare(
             owner(id).unwrap().phase = Phase::Blocked;
             return Err(status);
         }
-        match register_hosted_device_projection(class_inst, class_domain, address, device) {
+        match register_unlinked_hosted_device_projection(class_inst, class_domain, address, device) {
             Ok(registration) => {
                 if device == pdo {
                     owner(id).unwrap().pdo_alias.as_mut().unwrap().registration =

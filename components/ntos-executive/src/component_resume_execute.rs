@@ -73,6 +73,12 @@ pub(crate) unsafe fn run_hosted(
                 win32k_glue::ProviderWaitPumpCompletion::LpcReparked(pending) => {
                     ComponentPumpCompletion::Reparked(PendingComponentDispatch::Lpc(pending))
                 }
+                win32k_glue::ProviderWaitPumpCompletion::ReceiveReparked(pending) => {
+                    ComponentPumpCompletion::Reparked(PendingComponentDispatch::Receive(pending))
+                }
+                win32k_glue::ProviderWaitPumpCompletion::ServiceReparked(pending) => {
+                    ComponentPumpCompletion::Reparked(PendingComponentDispatch::ServiceWait(pending))
+                }
                 win32k_glue::ProviderWaitPumpCompletion::UserCallbackSuspended => {
                     ComponentPumpCompletion::UserCallbackSuspended
                 }
@@ -97,6 +103,12 @@ pub(crate) unsafe fn run_hosted(
                 win32k_glue::LpcWaitPumpCompletion::Reparked(pending) => {
                     ComponentPumpCompletion::Reparked(PendingComponentDispatch::Lpc(pending))
                 }
+                win32k_glue::LpcWaitPumpCompletion::ReceiveReparked(pending) => {
+                    ComponentPumpCompletion::Reparked(PendingComponentDispatch::Receive(pending))
+                }
+                win32k_glue::LpcWaitPumpCompletion::ServiceReparked(pending) => {
+                    ComponentPumpCompletion::Reparked(PendingComponentDispatch::ServiceWait(pending))
+                }
                 win32k_glue::LpcWaitPumpCompletion::UserCallbackSuspended => {
                     ComponentPumpCompletion::UserCallbackSuspended
                 }
@@ -107,6 +119,30 @@ pub(crate) unsafe fn run_hosted(
         }
         PendingComponentDispatch::Receive(_) => {
             unreachable!("Receive requires its sealed child boundary")
+        }
+        PendingComponentDispatch::ServiceWait(pending) => {
+            match win32k_glue::resume_suspended_service_wait_component(pending) {
+                win32k_glue::ServiceWaitPumpCompletion::Restored(completion) => match completion {
+                    win32k_glue::ProviderWaitPumpCompletion::Completed(dispatch) =>
+                        ComponentPumpCompletion::Completed(dispatch),
+                    win32k_glue::ProviderWaitPumpCompletion::Reparked(pending) =>
+                        ComponentPumpCompletion::Reparked(PendingComponentDispatch::Provider(pending)),
+                    win32k_glue::ProviderWaitPumpCompletion::LpcReparked(pending) =>
+                        ComponentPumpCompletion::Reparked(PendingComponentDispatch::Lpc(pending)),
+                    win32k_glue::ProviderWaitPumpCompletion::ReceiveReparked(pending) =>
+                        ComponentPumpCompletion::Reparked(PendingComponentDispatch::Receive(pending)),
+                    win32k_glue::ProviderWaitPumpCompletion::ServiceReparked(pending) =>
+                        ComponentPumpCompletion::Reparked(PendingComponentDispatch::ServiceWait(pending)),
+                    win32k_glue::ProviderWaitPumpCompletion::UserCallbackSuspended =>
+                        ComponentPumpCompletion::UserCallbackSuspended,
+                    win32k_glue::ProviderWaitPumpCompletion::Failed(status) =>
+                        ComponentPumpCompletion::Failed(status),
+                },
+                win32k_glue::ServiceWaitPumpCompletion::ServiceReparked(pending) =>
+                    ComponentPumpCompletion::Reparked(PendingComponentDispatch::ServiceWait(pending)),
+                win32k_glue::ServiceWaitPumpCompletion::ReceiveReparked(pending) =>
+                    ComponentPumpCompletion::Reparked(PendingComponentDispatch::Receive(pending)),
+            }
         }
     };
     finish_hosted_resume(
@@ -225,6 +261,26 @@ pub(crate) unsafe fn run_receive(
             );
             return None;
         }
+        win32k_glue::ReceivePumpCompletion::ServiceReparked(next) => {
+            let yielded = next.yielded;
+            let next_owner = service_wait_expected_owner(next)
+                .expect("restored Receive retains its service wait provider identity");
+            let next_key = component_suspension_key(PendingComponentDispatch::ServiceWait(next));
+            let next_continuation = ComponentNativeContinuation::Hosted(HostedNativeContinuation {
+                pending: PendingComponentDispatch::ServiceWait(next),
+                return_target: continuation.return_target,
+            });
+            (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                .rearm_service_wait_external_owned(
+                    lane, yielded.reply, yielded.dispatch, yielded.token,
+                    frame.key, next_key, next_dispatcher_wait_sequence(), next_owner,
+                    next_continuation,
+                )
+                .unwrap_or_else(|(error, _)| {
+                    panic!("Receive to service wait transfer lost exact owner: {:?}", error)
+                });
+            return None;
+        }
         win32k_glue::ReceivePumpCompletion::Deferred(boundary) => {
             // No callback input or capability has been captured into this reserved storage.
             // The exact Parent, child permit and Resuming frame remain retained by their owners.
@@ -240,6 +296,12 @@ pub(crate) unsafe fn run_receive(
         }
         win32k_glue::ProviderWaitPumpCompletion::LpcReparked(pending) => {
             ComponentPumpCompletion::Reparked(PendingComponentDispatch::Lpc(pending))
+        }
+        win32k_glue::ProviderWaitPumpCompletion::ReceiveReparked(pending) => {
+            ComponentPumpCompletion::Reparked(PendingComponentDispatch::Receive(pending))
+        }
+        win32k_glue::ProviderWaitPumpCompletion::ServiceReparked(pending) => {
+            ComponentPumpCompletion::Reparked(PendingComponentDispatch::ServiceWait(pending))
         }
         win32k_glue::ProviderWaitPumpCompletion::UserCallbackSuspended => {
             ComponentPumpCompletion::UserCallbackSuspended
@@ -341,6 +403,49 @@ unsafe fn finish_hosted_resume(
             return Some(ComponentSuspensionRuntimeOutcome::Terminal);
         }
         ComponentPumpCompletion::Reparked(next) => {
+            if let PendingComponentDispatch::Receive(pending) = next {
+                assert!(pending.yielded.replaces == Some(resume.key)
+                    && pending.yielded.owner == frame.owner,
+                    "service wait to Receive retains exact prior owner");
+                let next_key = component_suspension_key(next);
+                let sequence = next_dispatcher_wait_sequence();
+                let mut next_continuation = continuation;
+                next_continuation.pending = next;
+                crate::spawn_hosts::shared_ingress::owner::runtime::with_bound_receive_scope(
+                    pending.yielded.parent,
+                    |scope| {
+                        (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                            .rearm_receive_owned(
+                                scope, resume.key, next_key, sequence, frame.owner,
+                                pending.yielded.child,
+                                ComponentNativeContinuation::Hosted(next_continuation),
+                            )
+                            .map(|_| ())
+                            .map_err(|_| crate::spawn_hosts::shared_ingress::owner::runtime::Error::Admission)
+                    },
+                )
+                .expect("service wait to Receive retains sealed child and continuation");
+                return Some(ComponentSuspensionRuntimeOutcome::Parked);
+            }
+            if let PendingComponentDispatch::ServiceWait(pending) = next {
+                let yielded = pending.yielded;
+                let next_owner = service_wait_expected_owner(pending)
+                    .expect("reparked service wait retains admitted provider identity");
+                let next_key = component_suspension_key(next);
+                let sequence = next_dispatcher_wait_sequence();
+                let mut next_continuation = continuation;
+                next_continuation.pending = next;
+                (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                    .rearm_service_wait_external_owned(
+                        lane, yielded.reply, yielded.dispatch, yielded.token,
+                        resume.key, next_key, sequence, next_owner,
+                        ComponentNativeContinuation::Hosted(next_continuation),
+                    )
+                    .unwrap_or_else(|(error, _)| {
+                        panic!("service wait repark lost exact owner: {:?}", error)
+                    });
+                return Some(ComponentSuspensionRuntimeOutcome::Parked);
+            }
             if matches!(next, PendingComponentDispatch::Provider(_)) {
                 PROVIDER_WAIT_REARMS.fetch_add(1, Ordering::Relaxed);
             }
@@ -479,8 +584,8 @@ unsafe fn finish_hosted_resume(
                         return Some(ComponentSuspensionRuntimeOutcome::Parked);
                     }
                 }
-                PendingComponentDispatch::Receive(_) => {
-                    unreachable!("Receive is not a readiness wait")
+                PendingComponentDispatch::Receive(_) | PendingComponentDispatch::ServiceWait(_) => {
+                    unreachable!("nested and service waits transfer before readiness admission")
                 }
             }
         }

@@ -75,6 +75,7 @@ struct Row {
     terminal_receipt: Option<ExternalFileIrpTerminalReceipt>,
     settled_buffers: Option<ExternalFileIrpBuffers>,
     completion_storage: Option<(usize, usize)>,
+    port_connect_control_storage: Option<usize>,
     flight: Flight,
     payload: Option<Payload>,
     blocked_status: Option<nt_status::NtStatus>,
@@ -159,6 +160,39 @@ fn find(irp_id: IrpId) -> Option<u64> {
         .map(|row| row.id)
 }
 
+/// Bind a port CONNECT's mutable input copy and ACK to its captured physical store before
+/// native entry. A synchronous completion may need both controls before dispatch returns.
+fn mark_port_connect_control(
+    irp: IrpId, device: nt_io_manager::DeviceId,
+) -> Result<(), nt_status::NtStatus> {
+    let id = find(irp).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    let owner = row(id);
+    let storage = owner.completion_storage
+        .ok_or(nt_status::NtStatus::INVALID_HANDLE)?.1;
+    if owner.primary_device != Some(device)
+        || owner.port_connect_control_storage.is_some()
+        || !owner.authorities.iter().all(|authority| authority.live())
+    { return Err(nt_status::NtStatus::INVALID_HANDLE); }
+    owner.port_connect_control_storage = Some(storage);
+    Ok(())
+}
+
+/// A matching numeric IRP alone cannot authorize a worker control. The detached owner must be
+/// in the corresponding copy/ACK flight and retain the same physical completion store.
+pub(super) unsafe fn active_port_connect_control(storage: usize, irp: IrpId, operation: u64) -> bool {
+    let Some(id) = find(irp) else { return false; };
+    let owner = row(id);
+    let matching_flight = match operation {
+        FSD_DISPATCH_COPY_MUTABLE_INPUT => matches!(owner.flight, Flight::Copy | Flight::Dispatch),
+        FSD_DISPATCH_ACK_COMPLETION => matches!(owner.flight, Flight::Acknowledge | Flight::Dispatch),
+        _ => false,
+    };
+    matching_flight && owner.irp_id == Some(irp)
+        && owner.completion_storage.is_some_and(|(_, physical)| physical == storage)
+        && owner.port_connect_control_storage == Some(storage)
+        && owner.authorities.iter().all(|authority| authority.live())
+}
+
 fn release_projection_owners(id: u64) -> Result<(), nt_status::NtStatus> {
     for owner in &mut row(id).projection_owners {
         if owner.is_held() {
@@ -223,6 +257,7 @@ fn reserve(
         terminal_receipt: None,
         settled_buffers: None,
         completion_storage: None,
+        port_connect_control_storage: None,
         flight: Flight::Preparing,
         payload: None,
         blocked_status: None,
@@ -438,6 +473,30 @@ pub(super) fn dispatch(
     initial_output: &[u8],
     policy: ExternalFileIrpDispatchPolicy,
 ) -> Result<DispatchResult, nt_status::NtStatus> {
+    dispatch_with_port_connect(caller, request, input, initial_output, policy, None)
+}
+
+pub(super) fn dispatch_port_connect(
+    caller: nt_process::native_handle::NativeHandleCaller,
+    request: ExternalFileIrpRequest,
+    input: &[u8],
+    device: nt_io_manager::DeviceId,
+) -> Result<DispatchResult, nt_status::NtStatus> {
+    dispatch_with_port_connect(
+        caller, request, input, &[],
+        ExternalFileIrpDispatchPolicy::MutableMethodNeitherInputAtDevice,
+        Some(device),
+    )
+}
+
+fn dispatch_with_port_connect(
+    caller: nt_process::native_handle::NativeHandleCaller,
+    request: ExternalFileIrpRequest,
+    input: &[u8],
+    initial_output: &[u8],
+    policy: ExternalFileIrpDispatchPolicy,
+    port_connect_device: Option<nt_io_manager::DeviceId>,
+) -> Result<DispatchResult, nt_status::NtStatus> {
     let _durable = crate::allocator::enter_durable();
     let copy = |source: &[u8]| -> Result<Vec<u8>, nt_status::NtStatus> {
         let mut bytes = Vec::new();
@@ -462,6 +521,12 @@ pub(super) fn dispatch(
         return Err(status);
     }
     let irp_id = prepared.irp_id();
+    if let Some(device) = port_connect_device {
+        if let Err(status) = mark_port_connect_control(irp_id, device) {
+            discard(id, prepared)?;
+            return Err(status);
+        }
+    }
     let invocation = match io_manager_mut().begin_prepared_external_file_irp(prepared) {
         Ok(invocation) => invocation,
         Err(rejection) => {
@@ -533,6 +598,24 @@ pub(super) fn dispatch(
 
 pub(super) fn contains(irp_id: IrpId) -> bool {
     find(irp_id).is_some()
+}
+
+/// The one canonical detached packet currently executing on an exact Device target. A
+/// concurrent same-target dispatch is ambiguous to a nested native lower-edge call and is
+/// refused until its own source identity can be selected independently.
+pub(super) fn unique_executing_device_irp(
+    target: nt_io_manager::DeviceId,
+) -> Option<IrpId> {
+    let mut found = None;
+    for row in rows().iter().filter(|row| {
+        row.flight == Flight::Dispatch && row.primary_device == Some(target)
+    }) {
+        let id = row.irp_id?;
+        if found.replace(id).is_some() {
+            return None;
+        }
+    }
+    found
 }
 
 fn ensure_completion(id: u64) -> Result<(), nt_status::NtStatus> {
@@ -690,6 +773,23 @@ fn copy_captured(
 }
 
 pub(super) fn acknowledge(irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
+    acknowledge_with_buffers(irp_id).map(|_| ())
+}
+
+/// The port CONNECT caller retains the actual 16-byte Type3InputBuffer returned by its provider.
+pub(super) fn acknowledge_port_connect(irp_id: IrpId) -> Result<[u8; 16], nt_status::NtStatus> {
+    let id = find(irp_id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if row(id).port_connect_control_storage.is_none() {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    let buffers = acknowledge_with_buffers(irp_id)?;
+    let mut input = [0u8; 16];
+    assert_eq!(buffers.input().len(), input.len(), "validated CONNECT input length changed");
+    input.copy_from_slice(buffers.input());
+    Ok(input)
+}
+
+fn acknowledge_with_buffers(irp_id: IrpId) -> Result<ExternalFileIrpBuffers, nt_status::NtStatus> {
     let _durable = crate::allocator::enter_durable();
     let id = find(irp_id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
     ensure_completion(id)?;
@@ -719,6 +819,13 @@ pub(super) fn acknowledge(irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
         }
         copy_chunk(id)?;
     }
+    if row(id).port_connect_control_storage.is_some() {
+        if let Some(Payload::Completion(completion)) = row(id).payload.as_ref() {
+            if completion.buffers().input().len() != 16 {
+                return Err(nt_status::NtStatus::INVALID_PARAMETER);
+            }
+        }
+    }
     let payload = row(id).payload.take().expect("File ACK owner missing");
     let invocation = match payload {
         Payload::Completion(completion) => {
@@ -737,8 +844,9 @@ pub(super) fn acknowledge(irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
                     assert!(receipt.backend_acknowledged());
                     row(id).terminal_receipt = Some(receipt);
                     row(id).settled_buffers = Some(buffers);
-                    remove(id)?;
-                    return Ok(());
+                    let mut retired = remove(id)?;
+                    return Ok(retired.settled_buffers.take()
+                        .expect("acknowledged File buffers missing"));
                 }
                 Err(rejection) => {
                     let (status, returned) = rejection.into_parts();
@@ -773,8 +881,9 @@ pub(super) fn acknowledge(irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
             assert!(io_manager_mut().accepts_external_file_irp_receipt(&receipt));
             row(id).terminal_receipt = Some(receipt);
             row(id).settled_buffers = Some(buffers);
-            remove(id)?;
-            Ok(())
+            let mut retired = remove(id)?;
+            Ok(retired.settled_buffers.take()
+                .expect("acknowledged File buffers missing"))
         }
         Err(rejection) => {
             let (status, returned) = rejection.into_parts();

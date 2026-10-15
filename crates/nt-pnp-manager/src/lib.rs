@@ -10,20 +10,26 @@
 
 extern crate alloc;
 
+mod accepted_pdo_filter_edge;
 mod accepted_pdo_pnp;
 mod accepted_pdo_provider;
 mod bus_properties;
 mod bus_relations;
 mod critical_child_start;
 pub mod device_text;
+mod fdo_forward_path;
 mod filter_resource_requirements;
 mod relation_owners;
 mod retained_filter_fdo_forward;
 mod retained_lower_pnp_forward;
+mod retained_start_fdo_forward;
+#[cfg(test)]
+mod retained_start_fdo_forward_tests;
 pub mod returned_pnp_buffer;
 mod target_device_relation;
 mod upper_filter_attachment;
 
+pub use accepted_pdo_filter_edge::*;
 pub use accepted_pdo_pnp::*;
 pub use accepted_pdo_provider::*;
 pub use bus_properties::*;
@@ -33,6 +39,7 @@ pub use filter_resource_requirements::*;
 pub use relation_owners::*;
 pub use retained_filter_fdo_forward::*;
 pub use retained_lower_pnp_forward::*;
+pub use retained_start_fdo_forward::*;
 pub use target_device_relation::*;
 pub use upper_filter_attachment::*;
 

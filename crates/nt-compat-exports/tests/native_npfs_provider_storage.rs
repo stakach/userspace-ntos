@@ -73,8 +73,12 @@ fn predicate_invocation_is_distinct_from_a_bare_function_reference() {
 #[test]
 fn actual_irp_dispatch_does_not_audit_or_repair_provider_private_queues() {
     let file = source("driver_launch.rs");
+    let mut entry = Effects::default();
+    entry.visit_block(&function(&file, "run_irp").block);
+    assert!(entry.calls.iter().any(|name| name == "run_irp_with_bank"),
+        "ordinary dispatch must enter the same bank-aware ownership path");
     let mut effects = Effects::default();
-    effects.visit_block(&function(&file, "run_irp").block);
+    effects.visit_block(&function(&file, "run_irp_with_bank").block);
     for forbidden in ["audit_ccb", "audit_data_queue", "queue_dump"] {
         assert!(
             !effects.calls.iter().any(|name| name == forbidden),

@@ -100,8 +100,7 @@ fn resolve_request(
 ) -> Result<CapturedCreate, u32> {
     let case_insensitive = request.object_attributes & 0x40 != 0;
     let (device_id, related_file_id, related_file, relative_name) = if request.root_directory == 0 {
-        let (device_id, relative_name) =
-            resolve_absolute_name(&request.name, case_insensitive)?;
+        let (device_id, relative_name) = resolve_absolute_name(&request.name, case_insensitive)?;
         (device_id, None, None, relative_name)
     } else {
         let (file_id, device_id) = unsafe {

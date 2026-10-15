@@ -1810,7 +1810,10 @@ mod tests {
         );
         assert_eq!(queue.discard_pending_sync(ticket, action), Ok(()));
         assert!(!queue.contains(action));
-        assert_eq!(queue.sync_status(ticket), Err(DeviceRelationInvalidationError::StaleTicket));
+        assert_eq!(
+            queue.sync_status(ticket),
+            Err(DeviceRelationInvalidationError::StaleTicket)
+        );
         let claimed = queue.claim_front().unwrap();
         assert_eq!(claimed, other);
         assert_eq!(
@@ -1836,7 +1839,10 @@ mod tests {
             queue.complete_terminal(claim, nt_status::NtStatus::UNSUCCESSFUL),
             Ok(DeviceRelationInvalidationCompletion::Drained)
         );
-        assert_eq!(queue.take_sync_status(ticket), Ok(nt_status::NtStatus::UNSUCCESSFUL));
+        assert_eq!(
+            queue.take_sync_status(ticket),
+            Ok(nt_status::NtStatus::UNSUCCESSFUL)
+        );
         let async_claim = queue.claim_front().unwrap();
         assert_eq!(async_claim, later);
         assert_eq!(

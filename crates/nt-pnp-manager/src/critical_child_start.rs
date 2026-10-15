@@ -233,15 +233,21 @@ impl CriticalChildStartQueue {
         Ok(entry)
     }
 
-    /// Return an unentered demand claim to the queue while another exact batch owns START.
-    /// A later claim receives a fresh token after that owner has finished.
-    pub fn defer(
-        &mut self,
-        claim: CriticalChildStartClaim,
-    ) -> Result<(), CriticalChildStartError> {
-        let entry = self.claimed_entry(claim)?;
+    /// Return an unentered demand claim behind other reserved children while another exact
+    /// batch owns START. A later claim receives a fresh token after that owner has finished.
+    pub fn defer(&mut self, claim: CriticalChildStartClaim) -> Result<(), CriticalChildStartError> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.key == claim.key && entry.token == claim.token)
+            .ok_or(CriticalChildStartError::InvalidClaim)?;
+        if self.entries[index].state != CriticalChildStartState::Claimed {
+            return Err(CriticalChildStartError::WrongPhase);
+        }
+        let mut entry = self.entries.remove(index);
         entry.token = 0;
         entry.state = CriticalChildStartState::Reserved;
+        self.entries.push(entry);
         Ok(())
     }
 
@@ -273,8 +279,13 @@ impl CriticalChildStartQueue {
         if entry.state != CriticalChildStartState::Reserved {
             return Err(CriticalChildStartError::WrongPhase);
         }
-        if Self::current_key(pnp, relations, mount_identity, receipt.pdo_device_id(), instance_id)?
-            != entry.key
+        if Self::current_key(
+            pnp,
+            relations,
+            mount_identity,
+            receipt.pdo_device_id(),
+            instance_id,
+        )? != entry.key
         {
             return Err(CriticalChildStartError::StalePublication);
         }
@@ -393,7 +404,7 @@ mod tests {
     };
     use alloc::vec;
 
-    fn committed_child() -> (PnpManager, BusRelationTable, u64, String) {
+    fn committed_children(include_second: bool) -> (PnpManager, BusRelationTable, Vec<(u64, String)>) {
         let mut pnp = PnpManager::new();
         let parent = pnp.create_service_bound_devnode_without_resources(
             r"ROOT\TEST_BUS\0000",
@@ -410,17 +421,27 @@ mod tests {
         ] {
             pnp.transition(parent, state).unwrap();
         }
-        let child = BusReportedChild::new(
+        let first = BusReportedChild::new(
             0x1234,
             r"ACPI\PNP0303",
             "0001",
             &[r"ACPI\PNP0303"],
             &[] as &[&str],
         );
+        let mut children = vec![first];
+        if include_second {
+            children.push(BusReportedChild::new(
+                0x1235,
+                r"PCI\VEN_1234&DEV_1111",
+                "0002",
+                &[r"PCI\VEN_1234&DEV_1111"],
+                &[] as &[&str],
+            ));
+        }
         let mut relations = BusRelationTable::new();
         relations.seed_bus_relations(0x9000, &[]).unwrap();
         let prepared_relation = relations
-            .prepare_bus_relations(0x9000, &[child.clone()])
+            .prepare_bus_relations(0x9000, &children)
             .unwrap();
         let parent_relation = pnp
             .claim_started_parent_relation(0x9000, prepared_relation.relation_identity())
@@ -441,18 +462,30 @@ mod tests {
             PropertyBlobState::KnownNone,
             PropertyBlobState::KnownNone,
         );
-        let instance_id = child.enum_instance_path();
+        let identities: Vec<_> = children
+            .iter()
+            .map(|child| (child.pdo_object_id, child.enum_instance_path()))
+            .collect();
         let prepared_child = pnp
-            .prepare_enumerated_pdo_batch(vec![EnumeratedPdoRecord::new(
-                instance_id.clone(),
-                child.pdo_object_id,
-                properties,
+            .prepare_enumerated_pdo_batch(
+                identities
+                    .iter()
+                    .map(|(pdo, instance_id)| {
+                        EnumeratedPdoRecord::new(instance_id.clone(), *pdo, properties.clone())
+                            .with_parent_relation(parent_relation)
+                    })
+                    .collect(),
             )
-            .with_parent_relation(parent_relation)])
             .unwrap();
         pnp.commit_enumerated_pdo_batch(prepared_child).unwrap();
         relations.commit_bus_relations(prepared_relation).unwrap();
-        (pnp, relations, child.pdo_object_id, instance_id)
+        (pnp, relations, identities)
+    }
+
+    fn committed_child() -> (PnpManager, BusRelationTable, u64, String) {
+        let (pnp, relations, mut children) = committed_children(false);
+        let (pdo, instance_id) = children.pop().unwrap();
+        (pnp, relations, pdo, instance_id)
     }
 
     #[test]
@@ -500,11 +533,43 @@ mod tests {
         let first = queue.claim_next(&pnp, &relations, 7).unwrap().unwrap();
         assert_eq!(queue.defer(first), Ok(()));
         assert_eq!(queue.state(key), Some(CriticalChildStartState::Reserved));
-        assert_eq!(queue.complete(first, 0), Err(CriticalChildStartError::InvalidClaim));
+        assert_eq!(
+            queue.complete(first, 0),
+            Err(CriticalChildStartError::InvalidClaim)
+        );
         let second = queue.claim_next(&pnp, &relations, 7).unwrap().unwrap();
         assert_ne!(first, second);
         queue.complete(second, 0).unwrap();
         assert_eq!(queue.retire(second), Ok(0));
+    }
+
+    #[test]
+    fn deferred_config_child_does_not_starve_later_bus_child() {
+        let (pnp, relations, children) = committed_children(true);
+        let mut queue = CriticalChildStartQueue::new();
+        let (mouse_pdo, mouse_instance) = &children[0];
+        let (pci_pdo, pci_instance) = &children[1];
+        let (mouse_key, _) = queue
+            .reserve_committed(&pnp, &relations, 7, *mouse_pdo, mouse_instance)
+            .unwrap();
+        let (pci_key, _) = queue
+            .reserve_committed(&pnp, &relations, 7, *pci_pdo, pci_instance)
+            .unwrap();
+
+        let first = queue.claim_next(&pnp, &relations, 7).unwrap().unwrap();
+        assert_eq!(first.key(), mouse_key);
+        queue.defer(first).unwrap();
+        assert_eq!(queue.state(mouse_key), Some(CriticalChildStartState::Reserved));
+        assert_eq!(queue.complete(first, 0), Err(CriticalChildStartError::InvalidClaim));
+
+        let second = queue.claim_next(&pnp, &relations, 7).unwrap().unwrap();
+        assert_eq!(second.key(), pci_key);
+        queue.complete(second, 0).unwrap();
+        assert_eq!(queue.retire(second), Ok(0));
+
+        let reclaimed = queue.claim_next(&pnp, &relations, 7).unwrap().unwrap();
+        assert_eq!(reclaimed.key(), mouse_key);
+        assert_ne!(reclaimed, first);
     }
 
     #[test]
@@ -534,7 +599,10 @@ mod tests {
             queue.retire_reserved_from_start(&pnp, &relations, 7, &instance_id, &receipt),
             Ok(true),
         );
-        assert_eq!(queue.state(key), Some(CriticalChildStartState::Retired(0xc000_0010)));
+        assert_eq!(
+            queue.state(key),
+            Some(CriticalChildStartState::Retired(0xc000_0010))
+        );
         assert_eq!(queue.claim_next(&pnp, &relations, 7), Ok(None));
     }
 
@@ -551,12 +619,15 @@ mod tests {
             generation: current.child().generation().checked_add(1).unwrap(),
             pdo_object_id: pdo,
         };
-        queue.entries.insert(0, StartEntry {
-            key: prior,
-            instance_id: instance_id.clone(),
-            state: CriticalChildStartState::Retired(0),
-            token: 0,
-        });
+        queue.entries.insert(
+            0,
+            StartEntry {
+                key: prior,
+                instance_id: instance_id.clone(),
+                state: CriticalChildStartState::Retired(0),
+                token: 0,
+            },
+        );
         let receipt = crate::StartDeviceLifecycleReceipt {
             dispatch: crate::PnpDispatchIdentity {
                 devnode_id: current.child().devnode_id(),
@@ -577,8 +648,14 @@ mod tests {
             queue.retire_reserved_from_start(&pnp, &relations, 7, &instance_id, &receipt),
             Ok(true),
         );
-        assert_eq!(queue.state(current), Some(CriticalChildStartState::Retired(0xc000_0010)));
-        assert_eq!(queue.state(prior), Some(CriticalChildStartState::Retired(0)));
+        assert_eq!(
+            queue.state(current),
+            Some(CriticalChildStartState::Retired(0xc000_0010))
+        );
+        assert_eq!(
+            queue.state(prior),
+            Some(CriticalChildStartState::Retired(0))
+        );
     }
 
     #[test]

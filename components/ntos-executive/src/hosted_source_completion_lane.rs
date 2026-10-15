@@ -278,6 +278,7 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
         shared,
         Some(HostedWorkerSharedBankSpec {
             offset: BANK_OFFSET,
+            arg_offset: None,
         }),
     )
     .ok_or(STATUS_INSUFFICIENT_RESOURCES as u32)?;

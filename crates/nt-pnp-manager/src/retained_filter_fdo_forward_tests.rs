@@ -253,7 +253,7 @@ fn exact_lower_fdo_receives_optional_filter_and_source_completion_precedes_retir
 }
 
 #[test]
-fn synchronous_borrowed_success_and_bad_capture_keep_the_same_entered_owner() {
+fn synchronous_borrow_is_rejected_and_copied_success_keeps_the_same_entered_owner() {
     let mut f = fixture();
     let prepared = prepare(&mut f);
     let identity = prepared.identity();
@@ -277,14 +277,27 @@ fn synchronous_borrowed_success_and_bad_capture_keep_the_same_entered_owner() {
         .into_return()
         .with_output(ExternalPnpFilterOutput::BorrowedInput {
             provider_pointer: 0x1234_5000,
+            input_allocation: nt_io_manager::source_irp_auxiliary::SourcePoolAllocationIdentity {
+                component_address: 0x1234_5000,
+                capacity: 40,
+                pool_generation: 7,
+            },
+        });
+    let refusal = returned.finish(&mut f.io).unwrap_err();
+    assert_eq!(refusal.error(), FilterFdoForwardError::InvalidOutput);
+    let returned = refusal
+        .into_return()
+        .with_output(ExternalPnpFilterOutput::Copied {
+            provider_pointer: 0x1234_5000,
+            bytes: valid_requirements(),
         });
     let mut terminal = match returned.finish(&mut f.io).unwrap() {
         FilterFdoForwardResult::Terminal(terminal) => terminal,
-        outcome => panic!("borrowed FILTER did not terminate: {outcome:?}"),
+        outcome => panic!("copied FILTER did not terminate: {outcome:?}"),
     };
     assert_eq!(
         terminal.return_action(),
-        FilterRequirementsReturnAction::UseOriginal
+        FilterRequirementsReturnAction::CopyProviderOutput { information: 0x1234_5000 }
     );
     assert_eq!(terminal.original_requirements(), valid_requirements());
     terminal.mark_source_completed(identity).unwrap();

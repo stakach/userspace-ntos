@@ -876,6 +876,21 @@ pub(crate) fn hosted_thread_fixed_stack_geometry(pi: usize, badge: u64) -> (u64,
     (layout.stack().base, frames)
 }
 
+/// Deny-only stack hint for nested ingress. The root stack pager revalidates this exact row.
+pub(crate) fn hosted_thread_user_stack_for_binding(
+    binding: nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
+) -> Option<(u64, u64)> {
+    let table = unsafe { &*core::ptr::addr_of!(HOSTED_THREAD_RUNTIME_WORK) };
+    let runtime = table.executable_by_badge(binding.badge)?;
+    if runtime.binding() != binding
+        || runtime.user_stack_allocation_base == 0
+        || runtime.user_stack_base <= runtime.user_stack_allocation_base
+    {
+        return None;
+    }
+    Some((runtime.user_stack_allocation_base, runtime.user_stack_base))
+}
+
 /// Deny-only query for ordinary memory paths, including copies already borrowing ExecNtHandler.
 /// No allocation, IPC or callbacks may occur during this short table borrow. Cleanup backends
 /// holding a mutable slot must use retained capabilities directly, never recurse through here.

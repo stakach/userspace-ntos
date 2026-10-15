@@ -175,9 +175,11 @@ pub(crate) struct OwnedHostedPnpStartBatch {
     coordinator: nt_driver_start::DriverStartBatch,
     report: HostedPnpStartReport,
     pending_device_id: u64,
+    pending_filter_admission: Option<PendingHostedFilterAdmission>,
     pending_filter: Option<PendingHostedPnpFilter>,
     pending_relations: Option<driver_launch::HostedPnpRelationRefresh>,
     pending_bus_relation_devnode: Option<usize>,
+    bootstrap_required_bus_pdos: Vec<usize>,
     single_start_evidence: SingleStartEvidence,
 }
 
@@ -202,6 +204,12 @@ struct PendingHostedPnpFilter {
     irp_id: u64,
     resource_plan: PreparedHostedResourcePlan,
     ownership_lost: Option<nt_status::NtStatus>,
+}
+
+struct PendingHostedFilterAdmission {
+    devnode_index: usize,
+    device_id: u64,
+    resource_plan: PreparedHostedResourcePlan,
 }
 
 impl OwnedHostedPnpStartBatch {
@@ -237,11 +245,41 @@ impl OwnedHostedPnpStartBatch {
             coordinator,
             report,
             pending_device_id: 0,
+            pending_filter_admission: None,
             pending_filter: None,
             pending_relations: None,
             pending_bus_relation_devnode: None,
+            bootstrap_required_bus_pdos: Vec::new(),
             single_start_evidence: SingleStartEvidence::NotDispatched,
         }
+    }
+
+    /// An earlier registry-selected enumerator is still starting. Its relation, rather than this
+    /// batch's registry instance string, must supply the exact child PDO before dispatch.
+    pub(crate) fn require_bootstrap_bus_pdos(&mut self, devnodes: Vec<usize>) {
+        assert!(self.coordinator.phase() == nt_driver_start::BatchPhase::Ready);
+        assert!(devnodes.iter().all(|index| *index < self.spec.devnodes.len()));
+        self.bootstrap_required_bus_pdos = devnodes;
+    }
+
+    pub(crate) fn service_name(&self) -> &str {
+        &self.spec.service_name
+    }
+
+    /// A predecessor lost exact ownership before this batch entered native AddDevice/START.
+    pub(crate) fn fail_unentered_bootstrap_barrier(
+        &mut self,
+        status: nt_status::NtStatus,
+    ) -> OwnedHostedPnpStartProgress {
+        assert!(self.coordinator.phase() == nt_driver_start::BatchPhase::Ready);
+        self.coordinator.stop().expect("unentered boot START could not stop");
+        if self.report.first_error == 0 {
+            self.report.first_error = status.raw() as u32;
+        }
+        OwnedHostedPnpStartProgress::Complete(Err(HostedPnpStartBatchFailure {
+            status,
+            teardown_blocked: false,
+        }))
     }
 
     pub(crate) fn driver_object_path(&self) -> &str {
@@ -256,12 +294,15 @@ impl OwnedHostedPnpStartBatch {
         self.spec.devnodes.iter().enumerate().any(|(index, devnode)| {
             devnode.instance_id.eq_ignore_ascii_case(instance_id)
                 && driver_launch::hosted_bus_reported_device_id(instance_id) == Some(child_pdo)
-                && self.pending_filter.as_ref().is_none_or(|pending| {
-                    pending.devnode_index != index
+                && [
+                    self.pending_filter.as_ref().map(|pending| (pending.devnode_index, pending.device_id)),
+                    self.pending_filter_admission.as_ref().map(|pending| (pending.devnode_index, pending.device_id)),
+                ].into_iter().flatten().all(|(pending_index, device_id)| {
+                    pending_index != index
                         || driver_launch::hosted_function_device_id_for_instance(
                             instance_id,
                             self.coordinator.driver_id(),
-                        ) == Ok(pending.device_id)
+                        ) == Ok(device_id)
                 })
         })
     }
@@ -362,7 +403,8 @@ impl OwnedHostedPnpStartBatch {
     }
 
     pub(crate) fn needs_completion_redrive(&self) -> bool {
-        self.pending_filter
+        self.pending_filter_admission.is_some()
+            || self.pending_filter
             .as_ref()
             .is_some_and(|pending| pending.ownership_lost.is_none())
             || self.pending_relations.is_some()
@@ -410,6 +452,15 @@ impl OwnedHostedPnpStartBatch {
                 return Some(OwnedHostedPnpStartProgress::AwaitingCompletion);
             }
             HostedPnpDevnodeProgress::ResourceAdmissionPending => {
+                return Some(OwnedHostedPnpStartProgress::AwaitingCompletion);
+            }
+            HostedPnpDevnodeProgress::FilterAdmissionPending { device_id, resource_plan } => {
+                assert!(self.pending_filter_admission.is_none());
+                self.pending_filter_admission = Some(PendingHostedFilterAdmission {
+                    devnode_index,
+                    device_id,
+                    resource_plan,
+                });
                 return Some(OwnedHostedPnpStartProgress::AwaitingCompletion);
             }
             HostedPnpDevnodeProgress::FilterPending {
@@ -512,6 +563,7 @@ impl OwnedHostedPnpStartBatch {
                 ))
             }
             HostedPnpDevnodeProgress::BusRelationPending
+            | HostedPnpDevnodeProgress::FilterAdmissionPending { .. }
             | HostedPnpDevnodeProgress::FilterPending { .. }
             | HostedPnpDevnodeProgress::FilterOwnershipLost { .. }
             | HostedPnpDevnodeProgress::ResourceAdmissionPending => unreachable!(),
@@ -543,6 +595,22 @@ impl OwnedHostedPnpStartBatch {
                 }
                 continue;
             }
+            if let Some(pending) = self.pending_filter_admission.take() {
+                let devnode_index = pending.devnode_index;
+                let devnode = &self.spec.devnodes[devnode_index];
+                let progress = filter_attached_devnode(
+                    pending.device_id,
+                    pending.resource_plan,
+                    &self.spec.service_name,
+                    &devnode.instance_id,
+                    self.options,
+                    &mut self.report,
+                );
+                if let Some(outcome) = self.apply_devnode_progress(devnode_index, progress) {
+                    return outcome;
+                }
+                continue;
+            }
             if let Some(pending) = self.pending_filter.as_ref() {
                 if let Some(status) = pending.ownership_lost {
                     return OwnedHostedPnpStartProgress::OwnershipLost(
@@ -560,6 +628,9 @@ impl OwnedHostedPnpStartBatch {
                 let irp_id = pending.irp_id;
                 let outcome = driver_launch::observe_hosted_filter_resource_requirements(irp_id);
                 match outcome {
+                    Ok(driver_launch::HostedFilterRequirementsOutcome::AdmissionPending) => {
+                        panic!("entered FILTER IRP reverted to pre-dispatch admission");
+                    }
                     Ok(driver_launch::HostedFilterRequirementsOutcome::Pending { .. }) => {
                         return OwnedHostedPnpStartProgress::AwaitingCompletion;
                     }
@@ -718,7 +789,8 @@ impl OwnedHostedPnpStartBatch {
                             hardware_ids: &devnode.hardware_ids,
                             compatible_ids: &devnode.compatible_ids,
                         },
-                        self.pending_bus_relation_devnode == Some(devnode_index),
+                        self.pending_bus_relation_devnode == Some(devnode_index)
+                            || self.bootstrap_required_bus_pdos.contains(&devnode_index),
                         self.options,
                         &mut self.report,
                     );
@@ -1282,6 +1354,10 @@ pub(crate) enum PreparedHostedResourcePlan {
         interrupt: nt_cm_resources::InterruptDescriptor,
         lease: nt_pnp_context::ContextLease,
     },
+    AcpiChildNoResources {
+        provider: nt_pnp_manager::AcceptedPdoProviderAuthority,
+        child: nt_pnp_manager::DevnodeIdentity,
+    },
     None,
 }
 
@@ -1304,7 +1380,7 @@ impl PreparedHostedResourcePlan {
                 Some(&resources.raw_resources),
                 Some(&resources.resource_requirements),
             ),
-            Self::None => (None, None),
+            Self::AcpiChildNoResources { .. } | Self::None => (None, None),
         }
     }
 
@@ -1312,7 +1388,8 @@ impl PreparedHostedResourcePlan {
         let lease = match self {
             Self::Pci { lease, .. } | Self::Platform { lease, .. }
             | Self::AcpiChild { lease, .. } => lease,
-            Self::BusReportedBusNumber { .. } | Self::None => return Ok(()),
+            Self::BusReportedBusNumber { .. } | Self::AcpiChildNoResources { .. }
+            | Self::None => return Ok(()),
         };
         release_hosted_pnp_context_lease(lease.into_identity())
     }
@@ -1327,7 +1404,8 @@ impl PreparedHostedResourcePlan {
                 )
             }
             Self::BusReportedBusNumber { .. } | Self::Platform { .. }
-            | Self::AcpiChild { .. } | Self::None => {
+            | Self::AcpiChild { .. } | Self::AcpiChildNoResources { .. }
+            | Self::None => {
                 crate::hosted_pci_topology::HostedPciInterruptRouteAdmission::Current
             }
         }
@@ -1401,9 +1479,11 @@ where
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     if let Some(pdo_device_id) = bus_pdo {
-        if let Some(resources) =
-            driver_launch::prepare_hosted_bus_pdo_bus_number_start(instance_id, pdo_device_id)?
-        {
+        let bus_number = driver_launch::prepare_hosted_bus_pdo_bus_number_start(
+            instance_id, pdo_device_id,
+        )?;
+
+        if let Some(resources) = bus_number {
             return Ok(PreparedHostedDevnode {
                 pdo_description: None,
                 resource_plan: PreparedHostedResourcePlan::BusReportedBusNumber { resources },
@@ -1415,29 +1495,52 @@ where
     if let Some(pdo) = bus_pdo {
         let accepted = match driver_launch::hosted_accepted_acpi_child_resources(instance_id, pdo) {
             Ok(accepted) => accepted,
-            Err(status) => return Err(release_context_lease_after_error(lease, status)),
+            Err(status) => {
+                driver_launch::trace_hosted_bus_resource_refusal(
+                    b"accepted-acpi", instance_id, pdo, status,
+                );
+                return Err(release_context_lease_after_error(lease, status));
+            }
         };
-        if let Some(resources) = accepted {
+
+        if let Some(driver_launch::AcceptedAcpiChildResources::NoResources { provider, child }) = accepted {
+            release_hosted_pnp_context_lease(lease.into_identity())?;
+            return Ok(PreparedHostedDevnode {
+                pdo_description: None,
+                resource_plan: PreparedHostedResourcePlan::AcpiChildNoResources { provider, child },
+            });
+        }
+
+        if let Some(driver_launch::AcceptedAcpiChildResources::Present(resources)) = accepted {
             let admitted = (|| {
                 let interrupt = acpi_child_reported_interrupt(&resources.raw_resources)?;
+
                 let admitted = nt_pnp::admit_bus_reported_platform_resources(
                     &resources.raw_resources,
                     &resources.resource_requirements,
                     &[nt_pnp::PlatformPortResource { start: 0, length: u16::MAX as u32 + 1 }],
                     interrupt,
                 ).map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+
                 let (gsi, _) = crate::resolve_hosted_legacy_irq(
                     admitted.raw_interrupt.level,
                     admitted.raw_interrupt.flags != nt_cm_resources::CM_RESOURCE_INTERRUPT_LATCHED,
                 )?;
+
                 if crate::resolve_platform_ioapic_gsi(gsi).is_none() {
                     return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
                 }
+
                 Ok::<_, nt_status::NtStatus>((admitted.ports, admitted.raw_interrupt))
             })();
             let (ports, interrupt) = match admitted {
                 Ok(admitted) => admitted,
-                Err(status) => return Err(release_context_lease_after_error(lease, status)),
+                Err(status) => {
+                    driver_launch::trace_hosted_bus_resource_refusal(
+                        b"acpi-resource-admission", instance_id, pdo, status,
+                    );
+                    return Err(release_context_lease_after_error(lease, status));
+                }
             };
             return Ok(PreparedHostedDevnode {
                 pdo_description: None,
@@ -1453,12 +1556,14 @@ where
             return Err(release_context_lease_after_error(lease, status));
         }
     };
-    if let Some(device) = nt_pnp::find_pci_device_for_devnode(
+    let pci_device = nt_pnp::find_pci_device_for_devnode(
         &context.pci_devices,
         instance_id,
         hardware_ids,
         compatible_ids,
-    ) {
+    );
+
+    if let Some(device) = pci_device {
         let window = context
             .pci_windows
             .iter()
@@ -1483,7 +1588,9 @@ where
                 device,
             ) {
                 Ok(properties) => Some(properties),
-                Err(status) => return Err(release_context_lease_after_error(lease, status)),
+                Err(status) => {
+                    return Err(release_context_lease_after_error(lease, status));
+                }
             },
             None => None,
         };
@@ -1522,12 +1629,13 @@ where
         });
     }
 
-    if let Some(window) = context
+    let platform_window = context
         .platform_windows
         .iter()
         .find(|window| window.matches_devnode(instance_id, hardware_ids, compatible_ids))
-        .cloned()
-    {
+        .cloned();
+
+    if let Some(window) = platform_window {
         let mut platform_memory = Vec::new();
         platform_memory
             .try_reserve_exact(window.memory.len())
@@ -1599,6 +1707,8 @@ where
 
     release_hosted_pnp_context_lease(lease.into_identity())?;
 
+
+
     Ok(PreparedHostedDevnode {
         pdo_description: Some(driver_launch::HostedPdoDescription {
             bus_information: nt_pnp_manager::PnpBusInformation {
@@ -1622,6 +1732,10 @@ where
 enum HostedPnpDevnodeProgress {
     BusRelationPending,
     ResourceAdmissionPending,
+    FilterAdmissionPending {
+        device_id: u64,
+        resource_plan: PreparedHostedResourcePlan,
+    },
     Terminal {
         device_id: u64,
         status: nt_status::NtStatus,
@@ -1753,7 +1867,9 @@ where
     C: AsRef<str>,
 {
     let bus_pdo = driver_launch::hosted_bus_reported_device_id(devnode.instance_id);
-    if bus_pdo.is_none() && driver_launch::hosted_bus_relation_pending() {
+    let relation_pending = bus_pdo.is_none() && driver_launch::hosted_bus_relation_pending();
+
+    if bus_pdo.is_none() && relation_pending {
         return HostedPnpDevnodeProgress::BusRelationPending;
     }
     let prepared = match prepare_current_hosted_devnode(
@@ -1765,6 +1881,9 @@ where
     ) {
         Ok(prepared) => prepared,
         Err(status) => {
+            driver_launch::trace_hosted_bus_resource_refusal(
+                b"prepare", devnode.instance_id, bus_pdo.unwrap_or(0), status,
+            );
             record_terminal_start_failure(report, status);
             print_resource_preparation_failure(
                 options.trace,
@@ -1810,6 +1929,9 @@ where
                 .release_context_lease()
                 .err()
                 .unwrap_or(status);
+            driver_launch::trace_hosted_bus_resource_refusal(
+                b"interrupt-route", devnode.instance_id, bus_pdo.unwrap_or(0), status,
+            );
             report.attempted += 1;
             record_terminal_start_failure(report, status);
             print_resource_preparation_failure(
@@ -1825,7 +1947,6 @@ where
             };
         }
     }
-    report.attempted += 1;
     if let Some(pdo_device_id) = bus_pdo {
         let (raw_boot_resources, resource_requirements) = resource_plan.native_property_blobs();
         if let Err(status) = driver_launch::validate_hosted_bus_pdo_resource_properties(
@@ -1838,6 +1959,10 @@ where
                 .release_context_lease()
                 .err()
                 .unwrap_or(status);
+            driver_launch::trace_hosted_bus_resource_refusal(
+                b"property-match", devnode.instance_id, pdo_device_id, status,
+            );
+            report.attempted += 1;
             record_terminal_start_failure(report, status);
             print_resource_preparation_failure(
                 options.trace,
@@ -1855,6 +1980,56 @@ where
     let existing_stack = bus_pdo.and_then(|_| {
         driver_launch::hosted_function_device_id_for_instance(devnode.instance_id, driver_id).ok()
     });
+    if !options.reuse_existing_stack && existing_stack.is_none() {
+        if let Some(pdo_device_id) = bus_pdo {
+            match driver_launch::hosted_bus_pdo_attach_admission(
+                devnode.instance_id,
+                pdo_device_id,
+            ) {
+                Ok(()) => {}
+                Err(nt_status::NtStatus::DEVICE_BUSY) => {
+                    return match resource_plan.release_context_lease() {
+                        Ok(()) => HostedPnpDevnodeProgress::ResourceAdmissionPending,
+                        Err(status) => {
+                            report.attempted += 1;
+                            record_terminal_start_failure(report, status);
+                            print_resource_preparation_failure(
+                                options.trace,
+                                service_name,
+                                devnode.instance_id,
+                                status,
+                            );
+                            HostedPnpDevnodeProgress::Terminal {
+                                device_id: 0,
+                                status,
+                                receipt: None,
+                            }
+                        }
+                    };
+                }
+                Err(status) => {
+                    let status = resource_plan
+                        .release_context_lease()
+                        .err()
+                        .unwrap_or(status);
+                    report.attempted += 1;
+                    record_terminal_start_failure(report, status);
+                    print_resource_preparation_failure(
+                        options.trace,
+                        service_name,
+                        devnode.instance_id,
+                        status,
+                    );
+                    return HostedPnpDevnodeProgress::Terminal {
+                        device_id: 0,
+                        status,
+                        receipt: None,
+                    };
+                }
+            }
+        }
+    }
+    report.attempted += 1;
     let reused_stack = options.reuse_existing_stack || existing_stack.is_some();
     let add_device = if options.reuse_existing_stack {
         driver_launch::hosted_function_device_id_for_instance(devnode.instance_id, driver_id)
@@ -1937,58 +2112,14 @@ where
                     report,
                 );
             }
-            let filter_outcome = match resource_plan.native_property_blobs().1 {
-                Some(requirements) => driver_launch::filter_hosted_device_resource_requirements(
-                    device_id,
-                    requirements,
-                ),
-                None => {
-                    driver_launch::commit_hosted_no_resource_requirements(device_id).map(|()| {
-                        driver_launch::HostedFilterRequirementsOutcome::Filtered {
-                            requirements: Vec::new(),
-                        }
-                    })
-                }
-            };
-            match filter_outcome {
-                Ok(driver_launch::HostedFilterRequirementsOutcome::Filtered { requirements }) => {
-                    start_filtered_devnode(
-                        device_id,
-                        resource_plan,
-                        requirements,
-                        service_name,
-                        devnode.instance_id,
-                        options,
-                        report,
-                    )
-                }
-                Ok(driver_launch::HostedFilterRequirementsOutcome::Failed(status))
-                | Err(status) => finish_filter_failure(
-                    device_id,
-                    resource_plan,
-                    service_name,
-                    devnode.instance_id,
-                    options,
-                    status,
-                    report,
-                ),
-                Ok(driver_launch::HostedFilterRequirementsOutcome::Pending { irp_id }) => {
-                    HostedPnpDevnodeProgress::FilterPending {
-                        device_id,
-                        irp_id,
-                        resource_plan,
-                    }
-                }
-                Ok(driver_launch::HostedFilterRequirementsOutcome::Indeterminate {
-                    irp_id,
-                    transport_status,
-                }) => HostedPnpDevnodeProgress::FilterOwnershipLost {
-                    device_id,
-                    irp_id,
-                    resource_plan,
-                    transport_status,
-                },
-            }
+            filter_attached_devnode(
+                device_id,
+                resource_plan,
+                service_name,
+                devnode.instance_id,
+                options,
+                report,
+            )
         }
         Err(status) => {
             let status = resource_plan
@@ -2006,6 +2137,80 @@ where
     }
 }
 
+/// Continue FILTER for the already attached stack. AdmissionPending retains this exact FDO and
+/// context lease; a later drive retries only FILTER, never native AddDevice or upper filters.
+unsafe fn filter_attached_devnode(
+    device_id: u64,
+    resource_plan: PreparedHostedResourcePlan,
+    service_name: &str,
+    instance_id: &str,
+    options: HostedPnpStartOptions,
+    report: &mut HostedPnpStartReport,
+) -> HostedPnpDevnodeProgress {
+    if driver_launch::hosted_filter_resource_admission_pending() {
+        return HostedPnpDevnodeProgress::FilterAdmissionPending { device_id, resource_plan };
+    }
+    if let PreparedHostedResourcePlan::AcpiChildNoResources { provider, child } = &resource_plan {
+        if let Err(status) = driver_launch::validate_hosted_accepted_acpi_no_resources(
+            instance_id, device_id, *provider, *child,
+        ) {
+            return finish_filter_failure(
+                device_id, resource_plan, service_name, instance_id, options, status, report,
+            );
+        }
+    }
+    let filter_outcome = match resource_plan.native_property_blobs().1 {
+        Some(requirements) => driver_launch::filter_hosted_device_resource_requirements(
+            device_id,
+            requirements,
+        ),
+        None => driver_launch::commit_hosted_no_resource_requirements(device_id).map(|()| {
+            driver_launch::HostedFilterRequirementsOutcome::Filtered {
+                requirements: Vec::new(),
+            }
+        }),
+    };
+    match filter_outcome {
+        Ok(driver_launch::HostedFilterRequirementsOutcome::AdmissionPending) => {
+            HostedPnpDevnodeProgress::FilterAdmissionPending { device_id, resource_plan }
+        }
+        Ok(driver_launch::HostedFilterRequirementsOutcome::Filtered { requirements }) => {
+            start_filtered_devnode(
+                device_id,
+                resource_plan,
+                requirements,
+                service_name,
+                instance_id,
+                options,
+                report,
+            )
+        }
+        Ok(driver_launch::HostedFilterRequirementsOutcome::Failed(status)) | Err(status) => {
+            finish_filter_failure(
+                device_id,
+                resource_plan,
+                service_name,
+                instance_id,
+                options,
+                status,
+                report,
+            )
+        }
+        Ok(driver_launch::HostedFilterRequirementsOutcome::Pending { irp_id }) => {
+            HostedPnpDevnodeProgress::FilterPending { device_id, irp_id, resource_plan }
+        }
+        Ok(driver_launch::HostedFilterRequirementsOutcome::Indeterminate {
+            irp_id,
+            transport_status,
+        }) => HostedPnpDevnodeProgress::FilterOwnershipLost {
+            device_id,
+            irp_id,
+            resource_plan,
+            transport_status,
+        },
+    }
+}
+
 unsafe fn finish_filter_failure(
     device_id: u64,
     resource_plan: PreparedHostedResourcePlan,
@@ -2015,13 +2220,26 @@ unsafe fn finish_filter_failure(
     status: nt_status::NtStatus,
     report: &mut HostedPnpStartReport,
 ) -> HostedPnpDevnodeProgress {
-    let status = driver_launch::rollback_hosted_device_start(device_id)
-        .err()
-        .unwrap_or(status);
-    let status = resource_plan
-        .release_context_lease()
-        .err()
-        .unwrap_or(status);
+    let original_status = status;
+    let rollback_status = driver_launch::rollback_hosted_device_start(device_id).err();
+    let status = rollback_status.unwrap_or(status);
+    let lease_status = resource_plan.release_context_lease().err();
+    let status = lease_status.unwrap_or(status);
+    static FILTER_FAILURE_DIAGNOSTIC_COUNT: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    if FILTER_FAILURE_DIAGNOSTIC_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+        print_str(b"[hosted-filter-failure] device/original/rollback/lease/final=");
+        print_u64(device_id);
+        for diagnostic_status in [
+            Some(original_status), rollback_status, lease_status, Some(status),
+        ] {
+            print_str(b"/0x");
+            print_hex(diagnostic_status.unwrap_or(nt_status::NtStatus::SUCCESS).raw() as u32);
+        }
+        print_str(b" devnode=");
+        print_str(instance_id.as_bytes());
+        print_str(b"\n");
+    }
     record_terminal_start_failure(report, status);
     print_resource_grant_failure(options.trace, service_name, instance_id, status);
     HostedPnpDevnodeProgress::Terminal {
@@ -2057,24 +2275,31 @@ unsafe fn start_filtered_devnode(
                     &grant.raw_resource_list,
                     &grant.translated_resource_list,
                 ),
-                Err(status) => CanonicalStartDisposition::Terminal {
-                    status: rollback_pre_dispatch_start(device_id, status),
-                    waited: false,
-                    receipt: None,
-                },
+                Err(status) => {
+                    trace_canonical_start_failure(b"assignment", device_id, status);
+                    CanonicalStartDisposition::Terminal {
+                        status: rollback_pre_dispatch_start(device_id, status),
+                        waited: false,
+                        receipt: None,
+                    }
+                }
             }
         }
         Ok(None) => {
             match driver_launch::commit_hosted_device_resource_assignment(device_id, &[], &[]) {
                 Ok(()) => canonical_start_status(device_id, &[], &[]),
-                Err(status) => CanonicalStartDisposition::Terminal {
-                    status: rollback_pre_dispatch_start(device_id, status),
-                    waited: false,
-                    receipt: None,
-                },
+                Err(status) => {
+                    trace_canonical_start_failure(b"empty-assignment", device_id, status);
+                    CanonicalStartDisposition::Terminal {
+                        status: rollback_pre_dispatch_start(device_id, status),
+                        waited: false,
+                        receipt: None,
+                    }
+                }
             }
         }
         Err(status) => {
+            trace_canonical_start_failure(b"grant", device_id, status);
             let status = rollback_pre_dispatch_start(device_id, status);
             print_resource_grant_failure(options.trace, service_name, instance_id, status);
             CanonicalStartDisposition::Terminal {
@@ -2167,6 +2392,7 @@ unsafe fn canonical_start_status(
             }
         }
         Ok(driver_launch::HostedPnpStartOutcome::Failed { status, receipt }) => {
+            trace_canonical_start_failure(b"driver-returned", device_id, status);
             CanonicalStartDisposition::Terminal {
                 status,
                 waited: false,
@@ -2188,17 +2414,33 @@ unsafe fn canonical_start_status(
         Ok(driver_launch::HostedPnpStartOutcome::RepairRequired { irp_id, .. }) => {
             observe_canonical_start(irp_id, false, true)
         }
-        Err(failure) if failure.rollback_safe => CanonicalStartDisposition::Terminal {
-            status: rollback_pre_dispatch_start(device_id, failure.status),
-            waited: false,
-            receipt: None,
-        },
-        Err(failure) => CanonicalStartDisposition::Terminal {
-            status: failure.status,
-            waited: false,
-            receipt: None,
-        },
+        Err(failure) if failure.rollback_safe => {
+            trace_canonical_start_failure(b"pre-dispatch", device_id, failure.status);
+            CanonicalStartDisposition::Terminal {
+                status: rollback_pre_dispatch_start(device_id, failure.status),
+                waited: false,
+                receipt: None,
+            }
+        }
+        Err(failure) => {
+            trace_canonical_start_failure(b"unretired-owner", device_id, failure.status);
+            CanonicalStartDisposition::Terminal {
+                status: failure.status,
+                waited: false,
+                receipt: None,
+            }
+        }
     }
+}
+
+fn trace_canonical_start_failure(stage: &[u8], device_id: u64, status: nt_status::NtStatus) {
+    print_str(b"[canonical-start-failure] stage=");
+    print_str(stage);
+    print_str(b" device=");
+    print_u64(device_id);
+    print_str(b" status=0x");
+    print_hex(status.raw() as u32);
+    print_str(b"\n");
 }
 
 unsafe fn observe_canonical_start(
@@ -2254,6 +2496,7 @@ unsafe fn rollback_pre_dispatch_start(
     original_status: nt_status::NtStatus,
 ) -> nt_status::NtStatus {
     if let Err(status) = driver_launch::rollback_hosted_device_start(device_id) {
+        trace_canonical_start_failure(b"rollback", device_id, status);
         return status;
     }
     original_status

@@ -125,7 +125,9 @@ fn detached_file_row_owns_exact_projection_stack_before_native_invoke() {
             "capture authentic physical {physical}, not only canonical DeviceId"
         );
     }
-    let dispatch = evidence(&function(&file, "dispatch").unwrap().block);
+    let entry = evidence(&function(&file, "dispatch").unwrap().block);
+    assert!(has(&entry.calls, "dispatch_with_port_connect"));
+    let dispatch = evidence(&function(&file, "dispatch_with_port_connect").unwrap().block);
     let capture = dispatch
         .calls
         .iter()
@@ -220,7 +222,9 @@ fn detached_file_pending_and_uncertain_paths_keep_projection_ownership() {
         retained: 0,
         invalid: false,
     };
-    arms.visit_block(&function(&file, "dispatch").unwrap().block);
+    let entry = evidence(&function(&file, "dispatch").unwrap().block);
+    assert!(has(&entry.calls, "dispatch_with_port_connect"));
+    arms.visit_block(&function(&file, "dispatch_with_port_connect").unwrap().block);
     assert_eq!(arms.retained, 2);
     assert!(
         !arms.invalid,
@@ -254,7 +258,9 @@ fn source_irp_rpc_cannot_reborrow_manager_for_projection_ownership() {
 #[test]
 fn detached_file_removal_follows_canonical_terminal_and_real_backend_ack() {
     let file = syn::parse_file(OWNERS).unwrap();
-    let dispatch = evidence(&function(&file, "dispatch").unwrap().block);
+    let entry = evidence(&function(&file, "dispatch").unwrap().block);
+    assert!(has(&entry.calls, "dispatch_with_port_connect"));
+    let dispatch = evidence(&function(&file, "dispatch_with_port_connect").unwrap().block);
     let terminal = dispatch
         .calls
         .iter()
@@ -263,7 +269,9 @@ fn detached_file_removal_follows_canonical_terminal_and_real_backend_ack() {
     assert!(dispatch.calls[terminal..]
         .iter()
         .any(|call| call == "accepts_external_file_irp_receipt"));
-    let ack = evidence(&function(&file, "acknowledge").unwrap().block);
+    let entry = evidence(&function(&file, "acknowledge").unwrap().block);
+    assert!(has(&entry.calls, "acknowledge_with_buffers"));
+    let ack = evidence(&function(&file, "acknowledge_with_buffers").unwrap().block);
     let retire = ack
         .calls
         .iter()

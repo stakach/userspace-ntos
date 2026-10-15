@@ -35,6 +35,7 @@ enum Phase {
     Captured,
     Entered,
     Pending,
+    SequenceTerminal(nt_status::NtStatus),
     Terminal(nt_status::NtStatus),
     SourcePublished(nt_status::NtStatus),
     Retired,
@@ -53,6 +54,7 @@ pub(super) struct HookWork {
     source_stack_address: u64,
     source_stack: IoStackLocation,
     source_pinned: bool,
+    target_released: bool,
     reverse_owner_id: u64,
     source_device: HostedDevicePointerRegistration,
     source_device_allocation: SourcePoolAllocationIdentity,
@@ -94,6 +96,10 @@ fn next_stack(allocation: SourceIrpAllocation, irp: &Irp) -> Option<u64> {
 }
 
 impl HookWork {
+    pub(super) fn class_target_registration(&self) -> HostedDevicePointerRegistration {
+        self.class_target.registration()
+    }
+
     pub(super) fn source_identity(&self) -> SourceIrpForwardIdentity {
         self.payload.source
     }
@@ -232,6 +238,7 @@ impl HookWork {
                 source_stack_address: stack_address,
                 source_stack: stack,
                 source_pinned: true,
+                target_released: false,
                 reverse_owner_id,
                 source_device,
                 source_device_allocation: source_alloc,
@@ -299,13 +306,12 @@ impl HookWork {
         updated: &[u8],
         completed_irp: Option<IrpId>,
     ) -> Result<(SourceIrpForwardIdentity, nt_status::NtStatus), HookError> {
-        if !matches!(self.phase, Phase::Entered | Phase::Pending)
+        if !matches!(self.phase, Phase::Entered | Phase::Pending | Phase::SequenceTerminal(_))
             || status == nt_status::NtStatus::PENDING
             || updated.len() != self.payload.input_length as usize
             || completed_irp != self.pending_irp
             || !self.validate_source()
         {
-            self.phase = Phase::Blocked;
             return Err(HookError::WrongPhase);
         }
         if let Some(irp_id) = completed_irp {
@@ -327,16 +333,23 @@ impl HookWork {
                 return Err(HookError::WrongSource);
             }
         }
-        if sequence
-            .observe_hook_terminal(self.payload.source, status)
-            .is_err()
-        {
-            self.phase = Phase::Blocked;
-            return Err(HookError::WrongPhase);
+        if let Phase::SequenceTerminal(previous) = self.phase {
+            if previous != status {
+                self.phase = Phase::Blocked;
+                return Err(HookError::WrongPhase);
+            }
+        } else {
+            if sequence
+                .observe_hook_terminal(self.payload.source, status)
+                .is_err()
+            {
+                self.phase = Phase::Blocked;
+                return Err(HookError::WrongPhase);
+            }
+            self.phase = Phase::SequenceTerminal(status);
         }
         let memory = SourcePoolMemory::new(self.source_instance).ok_or(HookError::WrongSource)?;
         if !memory.write(self.payload.input_pointer, updated) {
-            self.phase = Phase::Blocked;
             return Err(HookError::WrongSource);
         }
         self.phase = Phase::Terminal(status);
@@ -369,7 +382,6 @@ impl HookWork {
             return Err(HookError::WrongPhase);
         };
         if !self.validate_source() {
-            self.phase = Phase::Blocked;
             return Err(HookError::WrongSource);
         }
         let memory = SourcePoolMemory::new(self.source_instance).ok_or(HookError::WrongSource)?;
@@ -377,10 +389,14 @@ impl HookWork {
         if !memory.write(
             self.source_irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET as u64,
             &status_bytes,
-        ) || !memory.write(
+        ) {
+            return Err(HookError::WrongSource);
+        }
+        if !memory.write(
             self.source_irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET as u64,
             &0u64.to_le_bytes(),
         ) {
+            // The status write already happened; never replay an uncertain partial publish.
             self.phase = Phase::Blocked;
             return Err(HookError::WrongSource);
         }
@@ -391,6 +407,16 @@ impl HookWork {
         }
         self.phase = Phase::SourcePublished(status);
         Ok(status)
+    }
+
+    /// Only a failure before publication's first native write leaves terminal publication
+    /// retryable. An uncertain write or deferred-free arm moves the work to Blocked instead.
+    pub(super) fn terminal_publication_retryable(&self) -> bool {
+        matches!(self.phase, Phase::Terminal(_))
+    }
+
+    pub(super) fn terminal_observation_retryable(&self) -> bool {
+        matches!(self.phase, Phase::Entered | Phase::Pending | Phase::SequenceTerminal(_))
     }
 
     /// Called only after the port component's exact source completion and retained reply ACK.
@@ -413,20 +439,20 @@ impl HookWork {
         }
         if let Some(irp_id) = self.pending_irp {
             if acknowledge_completed_irp_strict(irp_id.raw()).is_err() {
-                self.phase = Phase::Blocked;
                 return Err(HookError::WrongSource);
             }
             self.pending_irp = None;
         }
-        if self.class_target.release(io_manager_mut()).is_err() {
-            self.phase = Phase::Blocked;
-            return Err(HookError::WrongAlias);
+        if !self.target_released {
+            if self.class_target.release(io_manager_mut()).is_err() {
+                return Err(HookError::WrongAlias);
+            }
+            self.target_released = true;
         }
         if !hosted_source_irp_ledger::release_pending_terminal(
             self.source_ticket,
             self.source_allocation,
         ) {
-            self.phase = Phase::Blocked;
             return Err(HookError::WrongSource);
         }
         self.source_pinned = false;

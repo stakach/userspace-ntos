@@ -1714,7 +1714,7 @@ pub fn seed_reactos_network_adapter_bindings_into_target<T: ReactOsSetupSeedTarg
         ) {
             stats.network_connection_values += 1;
         }
-        if set_setup_sz_if_missing(
+        if !adapter.instance_id.is_empty() && set_setup_sz_if_missing(
             target,
             &connection_path,
             "PnpInstanceID",

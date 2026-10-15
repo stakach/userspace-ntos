@@ -7,7 +7,7 @@ type Binding = nt_user_host::thread_binding::ThreadBinding<crate::HostedThreadRo
 
 struct ReceiveSettlement {
     barrier: nt_user_host::receive_child_barrier::ReceiveChildBarrier<crate::HostedThreadRole>,
-    observation: crate::exec_handler::private_residency::ResidentReadFaultCapture,
+    observation: crate::win32k_glue::ReceiveFaultCapture,
     provider_tcb: u64,
     provider_pml4: u64,
     // Copied at admission for diagnostics only; the barrier owns restoration authority.
@@ -24,7 +24,7 @@ pub(crate) struct ReceiveSettlementBoundary {
 
 #[derive(Clone, Copy)]
 pub(crate) struct ReceiveChildObservation {
-    pub resident: crate::exec_handler::private_residency::ResidentReadFaultCapture,
+    pub observation: crate::win32k_glue::ReceiveFaultCapture,
     pub parent: nt_component_suspension::NestedExecutionIdentity,
     pub child: nt_component_suspension::ExternalAdmissionKey,
     pub provider_tcb: u64,
@@ -62,13 +62,16 @@ pub(crate) struct PendingSnapshot {
 
 pub(super) unsafe fn oldest_pending_snapshot() -> Option<PendingSnapshot> {
     let rows = &*core::ptr::addr_of!(CALLS);
-    let index = nt_component_suspension::oldest_external_ingress(
+    let index = nt_component_suspension::oldest_receive_external_ingress(
         rows.iter().enumerate().filter_map(|(index, row)| {
             let row = row.as_ref()?;
-            if row.delivered {
-                return None;
-            }
-            row.call.as_ref().map(|call| (index, call))
+            row.call
+                .as_ref()
+                .map(|call| (index, call, nt_component_suspension::ExternalReceiveState {
+                    delivered: row.delivered,
+                    released: row.released,
+                    settlement_prepared: row.receive_settlement.is_some(),
+                }))
         }),
     )?;
     let row = rows[index].as_ref()?;
@@ -165,16 +168,29 @@ pub(crate) unsafe fn take_hosted_with(
     if crate::writable_fs::registry_journal::owns_volume() {
         return Ok(None);
     }
+    let pending_receive = receive_child_pending();
     let Some(index) = nt_component_suspension::oldest_external_ingress(
         (&*core::ptr::addr_of!(CALLS))
             .iter()
             .enumerate()
             .filter_map(|(index, row)| {
                 let row = row.as_ref()?;
-                if row.delivered {
+                if row.delivered || row.released || row.completion.is_some() {
                     return None;
                 }
-                row.call.as_ref().map(|call| (index, call))
+                let call = row.call.as_ref().filter(|call| call.can_park())?;
+                if pending_receive {
+                    let receive = row.receive_settlement.as_ref()?;
+                    if receive.transferred
+                        || receive.parent.is_none()
+                        || receive.barrier.admission_key() != call.admission_key()
+                    {
+                        return None;
+                    }
+                } else if row.receive_settlement.is_some() {
+                    return None;
+                }
+                Some((index, call))
             }),
     ) else {
         return Ok(None);
@@ -204,9 +220,7 @@ pub(crate) unsafe fn take_hosted_with(
 /// Return an unexecuted root delivery to its existing physical ingress owner. No syscall has
 /// been admitted yet, so replay restores the original full message rather than captured argv.
 pub(crate) unsafe fn defer_hosted_delivery(reply: u64, badge: u64) -> Result<(), Error> {
-    if !crate::writable_fs::registry_journal::owns_volume()
-        || crate::REPLY_MAIN_SLOT.load(Ordering::Relaxed) != reply
-    {
+    if crate::REPLY_MAIN_SLOT.load(Ordering::Relaxed) != reply {
         return Err(Error::PhysicalIdentity);
     }
     let index = (&*core::ptr::addr_of!(CALLS))
@@ -228,6 +242,13 @@ pub(crate) unsafe fn defer_hosted_delivery(reply: u64, badge: u64) -> Result<(),
         .as_ref()
         .unwrap()
         .binding;
+    // A Receive child can become selected while root redrives an already delivered,
+    // unrelated Call. Return that untouched Call to its exact ingress owner first.
+    if !crate::writable_fs::registry_journal::owns_volume()
+        && (!receive_child_pending() || receive_child_is_current(binding, reply))
+    {
+        return Err(Error::PhysicalIdentity);
+    }
     if crate::service_sec_image::hosted_ingress_binding(badge) != Some(binding) {
         return Err(Error::PhysicalIdentity);
     }
@@ -480,7 +501,7 @@ fn receive_settlement_consumed(row: &HostedCall) -> bool {
 
 pub(crate) unsafe fn prepare_receive_settlement(
     snapshot: PendingSnapshot,
-    observation: crate::exec_handler::private_residency::ResidentReadFaultCapture,
+    observation: crate::win32k_glue::ReceiveFaultCapture,
     provider_tcb: u64,
     provider_pml4: u64,
     trace_owner: nt_component_suspension::SuspensionOwner,
@@ -567,7 +588,7 @@ pub(crate) unsafe fn receive_child_observation(
                 .filter(|receive| !receive.transferred)
                 .and_then(|receive| {
                     Some(ReceiveChildObservation {
-                        resident: receive.observation,
+                        observation: receive.observation,
                         parent: receive.parent.as_ref()?.identity(),
                         child: receive.barrier.admission_key(),
                         provider_tcb: receive.provider_tcb,

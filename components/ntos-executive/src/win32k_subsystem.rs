@@ -233,6 +233,7 @@ static mut WIN32K_LOCAL_EVENTS: Option<nt_provider_wait::ProviderLocalEventCatal
 static mut WIN32K_LOCAL_TIMERS: Option<nt_provider_wait::ProviderLocalTimerCatalog> = None;
 static mut WIN32K_STACK_EVENT_ACTIVATIONS:
     Option<nt_provider_wait::ProviderStackActivationCatalog> = None;
+static mut WIN32K_HOSTED_WAIT_HEADERS: Vec<HostedWaitHeaderRecord> = Vec::new();
 // Provider-local receipts survive a stopped secondary stack without inferring absence from it.
 static mut WIN32K_SECONDARY_STACK_PUBLICATIONS:
     [nt_provider_wait::ProviderStackLanePublication; WIN32K_LANE_CAPACITY] =
@@ -275,6 +276,86 @@ impl Drop for ProviderMetadataGuard {
 }
 
 type ProviderStackEventActivation = nt_provider_wait::ProviderStackEventActivation;
+
+#[derive(Clone, Copy)]
+struct HostedWaitHeaderRecord {
+    activation: ProviderStackEventActivation,
+    owner: nt_provider_wait::ProviderWaitOwner,
+    header: nt_user_callback::CallbackHeader,
+}
+
+fn hosted_wait_header_matches_owner(
+    header: &nt_user_callback::CallbackHeader,
+    owner: nt_provider_wait::ProviderWaitOwner,
+) -> bool {
+    let nt_provider_wait::SuspensionCaller::Hosted(client) = owner.caller else {
+        return false;
+    };
+    header.matches_dispatch_identity(
+        owner.dispatch_id,
+        client.client_pi,
+        client.client_tid,
+        client.client_badge,
+    )
+}
+
+unsafe fn retain_hosted_wait_header(
+    activation: ProviderStackEventActivation,
+    owner: nt_provider_wait::ProviderWaitOwner,
+    header: nt_user_callback::CallbackHeader,
+) -> bool {
+    if !hosted_wait_header_matches_owner(&header, owner) {
+        return false;
+    }
+    let records = &mut *core::ptr::addr_of_mut!(WIN32K_HOSTED_WAIT_HEADERS);
+    if records.iter().any(|record| record.activation == activation)
+        || records.try_reserve(1).is_err()
+    {
+        return false;
+    }
+    records.push(HostedWaitHeaderRecord { activation, owner, header });
+    true
+}
+
+unsafe fn retained_hosted_wait_header(
+    activation: ProviderStackEventActivation,
+    owner: nt_provider_wait::ProviderWaitOwner,
+) -> Option<nt_user_callback::CallbackHeader> {
+    let _metadata = ProviderMetadataGuard::acquire();
+    (&*core::ptr::addr_of!(WIN32K_HOSTED_WAIT_HEADERS))
+        .iter()
+        .find(|record| record.activation == activation && record.owner == owner)
+        .map(|record| record.header)
+}
+
+unsafe fn refresh_hosted_wait_header(header: nt_user_callback::CallbackHeader) -> bool {
+    let Some(activation) = active_provider_stack_event_activation() else {
+        return false;
+    };
+    let Some(owner) = current_provider_wait_owner() else {
+        return false;
+    };
+    if !hosted_wait_header_matches_owner(&header, owner) {
+        return false;
+    }
+    let _metadata = ProviderMetadataGuard::acquire();
+    let records = &mut *core::ptr::addr_of_mut!(WIN32K_HOSTED_WAIT_HEADERS);
+    let Some(record) = records
+        .iter_mut()
+        .find(|record| record.activation == activation && record.owner == owner)
+    else {
+        return false;
+    };
+    record.header = header;
+    true
+}
+
+unsafe fn retire_hosted_wait_header(activation: ProviderStackEventActivation) {
+    let records = &mut *core::ptr::addr_of_mut!(WIN32K_HOSTED_WAIT_HEADERS);
+    if let Some(index) = records.iter().position(|record| record.activation == activation) {
+        records.swap_remove(index);
+    }
+}
 
 struct ProviderStackEventActivationGuard {
     activation: ProviderStackEventActivation,
@@ -506,8 +587,10 @@ pub const SH_REQ_TOKEN_USER_SID_PTR: u64 = 0x1C8; // in: component VA of native 
 pub const WIN32K_TOKEN_USER_SID_MAX: usize = 68; // SID header + 15 sub-authorities
 pub const SH_REQ_GENERATION: u64 = 0x1F8; // in: exact hosted-process identity generation
 pub const SH_DISPATCH_RETURN: u64 = 0x1D0; // out: correlated operation provenance, kind committed last
+pub const SH_REQ_BATCH_RECORDS: u64 = 0x1F0; // out: real batch records flushed by this completed dispatch
 const _: () = assert!(SH_REQ_TOKEN_USER_SID_PTR + 8 <= SH_DISPATCH_RETURN);
-const _: () = assert!(SH_DISPATCH_RETURN + 32 <= SH_REQ_GENERATION);
+const _: () = assert!(SH_DISPATCH_RETURN + 32 <= SH_REQ_BATCH_RECORDS);
+const _: () = assert!(SH_REQ_BATCH_RECORDS + 8 <= SH_REQ_GENERATION);
 pub const WIN32K_REQUEST_SSDT: u64 = 0;
 pub const WIN32K_REQUEST_PS_PROVIDER: u64 = 1;
 pub const WIN32K_REQUEST_SOURCE_PNP_TERMINAL: u64 = 2;
@@ -654,6 +737,7 @@ unsafe fn initialize_provider_local_event_tracking() -> bool {
     *core::ptr::addr_of_mut!(WIN32K_LOCAL_EVENTS) = Some(events);
     *core::ptr::addr_of_mut!(WIN32K_LOCAL_TIMERS) = Some(timers);
     *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS) = Some(stack_activations);
+    (&mut *core::ptr::addr_of_mut!(WIN32K_HOSTED_WAIT_HEADERS)).clear();
     *core::ptr::addr_of_mut!(WIN32K_DRIVER_STACK_EVENT_ACTIVATION) = None;
     PROVIDER_LOCAL_EVENT_INITIALIZATIONS.store(0, Ordering::Relaxed);
     true
@@ -702,6 +786,7 @@ unsafe fn active_provider_stack_event_activation() -> Option<ProviderStackEventA
 unsafe fn begin_provider_stack_event_activation(
     dispatch_id: u64,
     owner: Option<nt_provider_wait::ProviderWaitOwner>,
+    header: nt_user_callback::CallbackHeader,
 ) -> Option<ProviderStackEventActivationGuard> {
     let _metadata = ProviderMetadataGuard::acquire();
     let activations = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS)).as_mut()?;
@@ -711,6 +796,12 @@ unsafe fn begin_provider_stack_event_activation(
         activations.begin_for_stack_pointer(current_stack_pointer(), dispatch_id)
     }
     .ok()?;
+    if let Some(owner) = owner {
+        if !retain_hosted_wait_header(activation, owner, header) {
+            let _ = activations.finish(activation);
+            return None;
+        }
+    }
     Some(ProviderStackEventActivationGuard { activation })
 }
 
@@ -4629,9 +4720,13 @@ unsafe fn finish_provider_stack_event_activation(
         return false;
     }
     let _metadata = ProviderMetadataGuard::acquire();
-    (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
+    let finished = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
         .as_mut()
-        .is_some_and(|activations| activations.finish(activation).is_ok())
+        .is_some_and(|activations| activations.finish(activation).is_ok());
+    if finished {
+        retire_hosted_wait_header(activation);
+    }
+    finished
 }
 
 unsafe fn retire_existing_provider_local_event(body: u64) -> bool {
@@ -5435,6 +5530,8 @@ extern "win64" fn s_ke_wait_for_single_object(
 }
 
 static PROVIDER_WAIT_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static PROVIDER_WAIT_INVALID_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static PROVIDER_WAIT_RESOLVE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static LPC_WAIT_NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn trace_provider_wait_component(stage: &[u8], value0: u64, value1: u64, value2: u64) {
@@ -5455,6 +5552,51 @@ fn trace_provider_wait_component(stage: &[u8], value0: u64, value1: u64, value2:
     print_str(b" v2=0x");
     print_hex((value2 >> 32) as u32);
     print_hex(value2 as u32);
+    print_str(b"\n");
+}
+
+fn trace_invalid_provider_wait_request(
+    wait_id: u64,
+    error: nt_provider_wait::ProviderWaitAbiError,
+    objects: &[nt_provider_wait::ProviderWaitObject],
+) {
+    let n = PROVIDER_WAIT_INVALID_TRACE_N.fetch_add(1, Ordering::Relaxed);
+    if n >= 8 {
+        return;
+    }
+    let error_name: &[u8] = match error {
+        nt_provider_wait::ProviderWaitAbiError::InvalidHeader => b"invalid-header",
+        nt_provider_wait::ProviderWaitAbiError::InvalidIdentity => b"invalid-identity",
+        nt_provider_wait::ProviderWaitAbiError::InvalidObjectCount => b"invalid-object-count",
+        nt_provider_wait::ProviderWaitAbiError::InvalidWaitType => b"invalid-wait-type",
+        nt_provider_wait::ProviderWaitAbiError::InvalidWaitMode => b"invalid-wait-mode",
+        nt_provider_wait::ProviderWaitAbiError::InvalidAlertable => b"invalid-alertable",
+        nt_provider_wait::ProviderWaitAbiError::InvalidTimeout => b"invalid-timeout",
+        nt_provider_wait::ProviderWaitAbiError::InvalidObject => b"invalid-object",
+        nt_provider_wait::ProviderWaitAbiError::DuplicateObject => b"duplicate-object",
+        nt_provider_wait::ProviderWaitAbiError::DirtyTail => b"dirty-tail",
+    };
+    print_str(b"[win32k-provider-wait-invalid] #");
+    print_u64(n + 1);
+    print_str(b" wait=");
+    print_u64(wait_id);
+    print_str(b" error=");
+    print_str(error_name);
+    print_str(b" count=");
+    print_u64(objects.len() as u64);
+    for (index, object) in objects.iter().take(4).enumerate() {
+        print_str(b" object[");
+        print_u64(index as u64);
+        print_str(b"]={type:");
+        print_u64(object.object_type as u64);
+        print_str(b",id:");
+        print_u64(object.object_id);
+        print_str(b",generation:");
+        print_u64(object.object_generation);
+        print_str(b",flags:");
+        print_u64(object.flags as u64);
+        print_str(b"}");
+    }
     print_str(b"\n");
 }
 
@@ -5481,8 +5623,35 @@ struct ProviderWaitAdmission {
     count: usize,
 }
 
+struct ProviderWaitResolutionFailure {
+    kind: &'static [u8],
+    status: i32,
+}
+
+fn trace_provider_wait_resolution_reject(
+    dispatch_id: u64,
+    index: usize,
+    body: u64,
+    failure: ProviderWaitResolutionFailure,
+) {
+    if PROVIDER_WAIT_RESOLVE_TRACE_N.fetch_add(1, Ordering::Relaxed) >= 8 {
+        return;
+    }
+    print_str(b"[win32k-provider-wait-resolution] dispatch=");
+    print_u64(dispatch_id);
+    print_str(b" index=");
+    print_u64(index as u64);
+    print_str(b" body=");
+    print_win32k_hex64(body);
+    print_str(b" type=");
+    print_str(failure.kind);
+    print_str(b" status=");
+    print_hex(failure.status as u32);
+    print_str(b"\n");
+}
+
 impl ProviderWaitAdmission {
-    unsafe fn resolve(bodies: &[u64]) -> Option<Self> {
+    unsafe fn resolve(bodies: &[u64], dispatch_id: u64) -> Option<Self> {
         let mut admission = Self {
             objects: [nt_provider_wait::ProviderWaitObject::EMPTY; nt_provider_wait::PROVIDER_WAIT_MAX_OBJECTS],
             leases: [None; nt_provider_wait::PROVIDER_WAIT_MAX_OBJECTS],
@@ -5491,12 +5660,16 @@ impl ProviderWaitAdmission {
         if bodies.is_empty() || bodies.len() > nt_provider_wait::PROVIDER_WAIT_MAX_OBJECTS {
             return None;
         }
-        for &body in bodies {
-            let Some((object, lease)) = provider_wait_object_for_dispatcher(body) else {
-                if !admission.release() {
-                    park();
+        for (index, &body) in bodies.iter().enumerate() {
+            let (object, lease) = match provider_wait_object_for_dispatcher(body) {
+                Ok(object) => object,
+                Err(failure) => {
+                    trace_provider_wait_resolution_reject(dispatch_id, index, body, failure);
+                    if !admission.release() {
+                        park();
+                    }
+                    return None;
                 }
-                return None;
             };
             admission.objects[admission.count] = object;
             admission.leases[admission.count] = lease;
@@ -5572,7 +5745,7 @@ unsafe fn provider_wait_backing_active(
 
 unsafe fn provider_wait_object_for_dispatcher(
     object_body: u64,
-) -> Option<(nt_provider_wait::ProviderWaitObject, Option<ProviderWaitLease>)> {
+) -> Result<(nt_provider_wait::ProviderWaitObject, Option<ProviderWaitLease>), ProviderWaitResolutionFailure> {
     {
         let _metadata = ProviderMetadataGuard::acquire();
         match (&mut *core::ptr::addr_of_mut!(WIN32K_EVENT_PROJECTIONS))
@@ -5587,10 +5760,10 @@ unsafe fn provider_wait_object_for_dispatcher(
                     slot,
                     u64::from(id.0.generation().0),
                 );
-                return Some((canonical, Some(ProviderWaitLease::ProjectedEvent(lease))));
+                return Ok((canonical, Some(ProviderWaitLease::ProjectedEvent(lease))));
             }
             Ok(None) => {}
-            Err(_) => return None,
+            Err(_) => return Err(ProviderWaitResolutionFailure { kind: b"projected-event", status: STATUS_INVALID_HANDLE_I32 }),
         }
     }
     {
@@ -5605,12 +5778,12 @@ unsafe fn provider_wait_object_for_dispatcher(
                         snapshot.storage.backing,
                     )
                 {
-                    return None;
+                    return Err(ProviderWaitResolutionFailure { kind: b"local-event-backing", status: STATUS_INVALID_HANDLE_I32 });
                 }
                 let lease = events
                     .acquire_lease(snapshot.id, nt_provider_wait::ProviderLocalEventLeaseKind::Wait)
-                    .ok()?;
-                return Some((lease.canonical, Some(ProviderWaitLease::Event(lease))));
+                    .map_err(|_| ProviderWaitResolutionFailure { kind: b"local-event-lease", status: STATUS_INVALID_HANDLE_I32 })?;
+                return Ok((lease.canonical, Some(ProviderWaitLease::Event(lease))));
             }
         }
         if let Some(timers) = provider_local_timers_mut() {
@@ -5623,15 +5796,16 @@ unsafe fn provider_wait_object_for_dispatcher(
                         snapshot.storage.backing,
                     )
                 {
-                    return None;
+                    return Err(ProviderWaitResolutionFailure { kind: b"local-timer-backing", status: STATUS_INVALID_HANDLE_I32 });
                 }
-                let lease = timers.acquire_operation(snapshot.id).ok()?;
-                return Some((lease.canonical, Some(ProviderWaitLease::Timer(lease))));
+                let lease = timers.acquire_operation(snapshot.id)
+                    .map_err(|_| ProviderWaitResolutionFailure { kind: b"local-timer-lease", status: STATUS_INVALID_HANDLE_I32 })?;
+                return Ok((lease.canonical, Some(ProviderWaitLease::Timer(lease))));
             }
         }
     }
     if !provider_pool_contains(object_body) {
-        return None;
+        return Err(ProviderWaitResolutionFailure { kind: b"outside-provider-pool", status: STATUS_INVALID_HANDLE_I32 });
     }
     let (status, file_id, generation, token) = win32k_file_object_broker_call(
         W32_FILE_OBJECT_WAIT_IDENTITY,
@@ -5643,7 +5817,7 @@ unsafe fn provider_wait_object_for_dispatcher(
         if token != 0 {
             park();
         }
-        return None;
+        return Err(ProviderWaitResolutionFailure { kind: b"file-event", status });
     }
     if file_id == 0 || generation == 0 || token == 0 {
         park();
@@ -5653,7 +5827,7 @@ unsafe fn provider_wait_object_for_dispatcher(
         file_id,
         generation,
     );
-    Some((canonical, Some(ProviderWaitLease::File(token))))
+    Ok((canonical, Some(ProviderWaitLease::File(token))))
 }
 
 unsafe fn current_provider_wait_owner() -> Option<nt_provider_wait::ProviderWaitOwner> {
@@ -5709,12 +5883,12 @@ unsafe fn provider_wait_rendezvous(
         1 => true,
         _ => return 0xC000_000Du32 as i32,
     };
-    let Some(mut admission) = ProviderWaitAdmission::resolve(bodies) else {
+    let Some(mut admission) = ProviderWaitAdmission::resolve(bodies, owner.dispatch_id) else {
         return 0xC000_000Du32 as i32;
     };
     let page = WIN32K_PROVIDER_WAIT_VADDR as *mut nt_provider_wait::ProviderWaitSharedPage;
     let mut request = nt_provider_wait::ProviderWaitRequest::empty();
-    if request
+    if let Err(error) = request
         .begin(
             nt_provider_wait::ProviderWaitRequestMetadata {
                 wait_id,
@@ -5727,8 +5901,12 @@ unsafe fn provider_wait_rendezvous(
             },
             &admission.objects[..admission.count],
     )
-    .is_err()
     {
+        trace_invalid_provider_wait_request(
+            wait_id,
+            error,
+            &admission.objects[..admission.count],
+        );
         if !admission.release() {
             park();
         }
@@ -5825,7 +6003,7 @@ extern "win64" fn s_ke_wait_for_multiple_objects(
     for index in 0..count as usize {
         bodies[index] = unsafe { read_unaligned((object_array + index as u64 * 8) as *const u64) };
     }
-    unsafe {
+    let status = unsafe {
         provider_wait_rendezvous(
             &bodies[..count as usize],
             wait_type,
@@ -5833,7 +6011,8 @@ extern "win64" fn s_ke_wait_for_multiple_objects(
             alertable,
             timeout,
         )
-    }
+    };
+    status
 }
 
 extern "win64" fn s_eng_get_tick_count() -> u32 {
@@ -10442,6 +10621,25 @@ fn reject_resource_sync(
     print_win32k_hex64(resource);
     print_str(b" current-thread=0x");
     print_win32k_hex64(thread);
+    if let Some(snapshot) = executive_resources_mut().ownership_snapshot(resource) {
+        print_str(b" store-mode=");
+        print_str(if snapshot.exclusive {
+            b"exclusive" as &[u8]
+        } else {
+            b"shared"
+        });
+        print_str(b" store-owners=");
+        print_u64(snapshot.owner_count as u64);
+        for (owner, recursion) in snapshot.owners.iter().take(snapshot.owner_count.min(4)) {
+            print_str(b" [");
+            print_win32k_hex64(*owner);
+            print_str(b"/");
+            print_u64(*recursion as u64);
+            print_str(b"]");
+        }
+    } else {
+        print_str(b" store=unregistered");
+    }
     if resource != 0 && resource & 7 == 0 {
         unsafe {
             let active_count = read_unaligned(
@@ -14201,6 +14399,11 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
         if nt_user_callback::validate_reply(&request, &reply).is_err() {
             return 0xC000_0001u32 as i32;
         }
+        if current_provider_wait_owner().is_some_and(|owner| {
+            matches!(owner.caller, nt_provider_wait::SuspensionCaller::Hosted(_))
+        }) && !refresh_hosted_wait_header(reply) {
+            return 0xC000_000Du32 as i32;
+        }
         // The validated Reply header is the legal predecessor of the next callback request.
         // Restore the caller's execution context without replacing that header with this
         // callback's earlier Request state.
@@ -16172,7 +16375,7 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         None
     };
     let Some(_stack_event_activation) =
-        begin_provider_stack_event_activation(header.dispatch_id, owner)
+        begin_provider_stack_event_activation(header.dispatch_id, owner, header)
     else {
         let status = 0xC000_009Au32;
         return (status as i32, status as u64);
@@ -16359,6 +16562,40 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     if read_volatile(t as *const u64) == 0 {
         write_volatile(t as *mut u64, ethread);
     }
+    // KiSystemCallHandler flushes the current user's GDI batch before calling the requested
+    // win32k SSDT entry. Both effects belong to one physical dispatch so a callback, fault, or
+    // service wait retains the original syscall and Reply rather than an independent flush call.
+    let mut flushed_records = 0u64;
+    if user_origin && ssn != SSN_GDI_BATCH_FLUSH_CALLOUT && crate::GDI_USER_BATCH_FLUSH {
+        let count = read_volatile(
+            (client_teb + nt_user_callback::TEB_GDI_BATCH_COUNT) as *const u32,
+        );
+        if count != 0 {
+            let status = {
+                let _kernel_mode = thread_execution::PreviousModeScope::enter(
+                    nt_kernel_abi::ps_reactos_x64::ThreadPreviousMode::KernelMode,
+                );
+                write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, client_teb);
+                let status = dispatch_gdi_batch_flush_callout(client_pi, client_teb);
+                write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, teb_context);
+                status
+            };
+            if status != 0 {
+                return (status as u32 as i32, status);
+            }
+            let remaining = read_volatile(
+                (client_teb + nt_user_callback::TEB_GDI_BATCH_COUNT) as *const u32,
+            );
+            let offset = read_volatile(
+                (client_teb + nt_user_callback::TEB_GDI_TEB_BATCH_OFFSET) as *const u32,
+            );
+            if remaining != 0 || offset != 0 {
+                let status = 0xC000_0206u32 as u64;
+                return (status as u32 as i32, status);
+            }
+            flushed_records = u64::from(count);
+        }
+    }
     let paint_window_valid = paint_stage_valid && resolve_window_handle(a0) != 0;
     let result = if ssn == SSN_GDI_BATCH_FLUSH_CALLOUT {
         dispatch_gdi_batch_flush_callout(client_pi, client_teb)
@@ -16436,6 +16673,12 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
             output_length,
         );
     }
+    // Publish only after the original SSN returns. A nested dispatch may use the same shared
+    // slot while this stack is suspended; this final write restores the exact parent's receipt.
+    write_volatile(
+        (WIN32K_SHARED_VADDR + SH_REQ_BATCH_RECORDS) as *mut u64,
+        flushed_records,
+    );
     (result as u32 as i32, result)
 }
 

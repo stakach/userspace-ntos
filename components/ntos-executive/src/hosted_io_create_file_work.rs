@@ -186,7 +186,14 @@ impl Work {
 
     unsafe fn ready_for_nested_step(&self) -> bool {
         if self.cancelled() { return true; }
-        if self.reply_entered { return false; }
+        // The outer win32k invocation may still be pumping nested providers after the
+        // CREATE Reply was consumed. Its exact acknowledgement is enough to finish the
+        // backend IRP here; an uncertain Reply remains retained without another send.
+        if self.reply_entered {
+            return runtime::retained_service_reply_acknowledged(
+                self.route, self.dispatch, self.reply, self.token,
+            ).unwrap_or(false);
+        }
         if self.reply_completion.is_some() || self.delivery.is_none() { return true; }
         match self.delivery.as_ref().unwrap().phase() {
             Phase::Prepared | Phase::Terminal | Phase::Aborted => true,

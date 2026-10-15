@@ -163,7 +163,10 @@ fn fsd_pipe_and_control_diagnostics_delegate_captured_records() {
     }
     let mut calls = ProducerCalls { pipe: 0, control: 0, old_markers: 0 };
     calls.visit_block(&function(&driver, "trace_pipe_rw_result").block);
-    calls.visit_block(&function(&driver, "run_irp").block);
+    let mut entry = Calls::default();
+    entry.visit_block(&function(&driver, "run_irp").block);
+    assert!(entry.0.iter().any(|call| call == "run_irp_with_bank"));
+    calls.visit_block(&function(&driver, "run_irp_with_bank").block);
     assert_eq!(calls.pipe, 1, "captured pipe snapshots need one atomic diagnostic producer");
     assert_eq!(calls.control, 1, "captured control failure needs one atomic diagnostic producer");
     assert_eq!(calls.old_markers, 0, "component sites must not emit fragmented record prefixes");

@@ -37,6 +37,8 @@ struct Record {
     control: ConnectControl,
     binding: HostedExecutableThunkBinding,
     run_va: u64,
+    buffer: hosted_class_record_buffer::ClassRecordBuffer,
+    buffer_retired: bool,
 }
 
 static mut RECORDS: Vec<Record> = Vec::new();
@@ -97,6 +99,9 @@ pub(super) unsafe fn publish(
     {
         return Err(nt_status::NtStatus::INVALID_HANDLE);
     }
+    // Class drivers have no interrupt connection of their own. Their callback still needs a
+    // dedicated IRQ worker to run at DISPATCH_LEVEL while i8042's DPC stays parked.
+    ensure_hosted_irq_lane(class_instance, class_domain)?;
     let owner = HostedProviderObjectOwner::new(
         port_domain.domain_id.raw(),
         port_domain.cookie,
@@ -122,6 +127,13 @@ pub(super) unsafe fn publish(
         abort_instance_executable_thunk(port_instance, reservation);
         return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
     }
+    let buffer = match hosted_class_record_buffer::ClassRecordBuffer::preallocate(class_instance) {
+        Ok(buffer) => buffer,
+        Err(status) => {
+            abort_instance_executable_thunk(port_instance, reservation);
+            return Err(status);
+        }
+    };
     let binding = reservation.address(port_instance).binding;
     records().push(Record {
         cookie,
@@ -139,6 +151,8 @@ pub(super) unsafe fn publish(
         class_image_frames: class_inst.image_frames,
         binding,
         run_va: reservation.run_va,
+        buffer,
+        buffer_retired: false,
     });
     unsafe {
         NEXT_COOKIE = next;
@@ -162,6 +176,47 @@ pub(super) unsafe fn publish(
             generation: class_domain.cookie,
         },
     })
+}
+
+/// CONNECT may publish the thunk only after this owner has reserved its class-domain buffer.
+/// IRQ ingress separately pins each DPC input and stack output at the moment of invocation.
+pub(super) unsafe fn issue_permit(
+    thunk: PublishedClassServiceThunk,
+) -> Result<hosted_class_callback_lane::ClassCallbackExecutionPermit, nt_status::NtStatus> {
+    let row = record(thunk.cookie).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if row.phase != Phase::Published
+        || row.run_va != thunk.port_address
+        || row.port_alias_main != thunk.port_class_alias
+        || row.class_domain != thunk.class_service.domain
+        || row.class_service != thunk.class_service.address
+        || row.buffer.domain() != row.class_domain
+        || !hosted_irq_lanes().is_some_and(|lanes| {
+            lanes.iter().any(|lane| {
+                lane.projection_instance == row.class_instance
+                    && lane.domain == row.class_domain
+                    && lane.state == HostedIrqLaneState::Ready
+                    && lane.tcb_resumed
+                    && !lane.ingress_retired
+            })
+        })
+        || hosted_reverse_class_projection::validate(row.reverse_owner_id)
+            .map_or(true, |projected| projected.class_do_registration != row.port_alias_main)
+    {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    hosted_class_callback_lane::ClassCallbackExecutionPermit::installed(
+        thunk.cookie,
+        thunk.port_address,
+        thunk.port_class_alias,
+    )
+    .ok_or(nt_status::NtStatus::INVALID_HANDLE)
+}
+
+pub(super) fn buffer(cookie: u64) -> Option<&'static mut hosted_class_record_buffer::ClassRecordBuffer> {
+    records()
+        .iter_mut()
+        .find(|row| row.cookie == cookie)
+        .map(|row| &mut row.buffer)
 }
 
 /// CONNECT may publish the thunk address to i8042 only when a separate IRQ execution owner has
@@ -199,26 +254,21 @@ fn encode(cookie: u64, class_domain: HostedDomainIdentity, gate: u64, out: &mut 
     true
 }
 
-/// Root-side admission for the dedicated IRQ service. The caller must then acquire exact port
-/// input and consumed-output memory leases and retain the class execution transaction. This
-/// function returns no execution permit; its purpose is to reject stale executable slots.
-pub(super) unsafe fn admit_irq_request(
-    cookie: u64,
+pub(super) type ClassServiceAdmission = (
+    usize,
+    usize,
+    HostedDevicePointerRegistration,
+    HostedDevicePointerRegistration,
+    u64,
+    ConnectControl,
+);
+
+unsafe fn validate_binding(
+    row: &Record,
+    projected: hosted_reverse_class_projection::PreparedReverseClassProjection,
     class_domain: HostedDomainIdentity,
     port_class_alias: u64,
-) -> Result<
-    (
-        usize,
-        usize,
-        HostedDevicePointerRegistration,
-        HostedDevicePointerRegistration,
-        u64,
-        ConnectControl,
-    ),
-    nt_status::NtStatus,
-> {
-    let row = record(cookie).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
-    let projected = hosted_reverse_class_projection::validate(row.reverse_owner_id)?;
+) -> Result<ClassServiceAdmission, nt_status::NtStatus> {
     if row.phase != Phase::Published
         || row.class_domain != class_domain
         || projected.class_do_registration != row.port_alias_main
@@ -229,9 +279,7 @@ pub(super) unsafe fn admit_irq_request(
             inst.image_frame_base != row.class_image_frame_base
                 || inst.image_frames != row.class_image_frames
         })
-        || io_manager_mut()
-            .hosted_device_pointer_registration(row.class_domain, row.class_main.address())
-            != Some(row.class_main)
+        || projected.source_main_registration != row.class_main
     {
         return Err(nt_status::NtStatus::INVALID_HANDLE);
     }
@@ -245,6 +293,37 @@ pub(super) unsafe fn admit_irq_request(
     ))
 }
 
+/// CONNECT preparation runs before the port provider is entered. Validate its already-published
+/// thunk and exact canonical registrations while a manager borrow is available at this boundary.
+pub(super) unsafe fn validate_pre_entry(
+    cookie: u64,
+    class_domain: HostedDomainIdentity,
+    port_class_alias: u64,
+) -> Result<ClassServiceAdmission, nt_status::NtStatus> {
+    let row = record(cookie).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    let projected = hosted_reverse_class_projection::validate(row.reverse_owner_id)?;
+    if io_manager_mut()
+        .hosted_device_pointer_registration(row.class_domain, row.class_main.address())
+        != Some(row.class_main)
+    {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    validate_binding(row, projected, class_domain, port_class_alias)
+}
+
+/// Root-side admission for the dedicated IRQ service. The caller must then acquire exact port
+/// input and consumed-output memory leases and retain the class execution transaction. This
+/// function returns no execution permit; its purpose is to reject stale executable slots.
+pub(super) unsafe fn admit_irq_request(
+    cookie: u64,
+    class_domain: HostedDomainIdentity,
+    port_class_alias: u64,
+) -> Result<ClassServiceAdmission, nt_status::NtStatus> {
+    let row = record(cookie).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    let projected = hosted_reverse_class_projection::validate_irq(row.reverse_owner_id)?;
+    validate_binding(row, projected, class_domain, port_class_alias)
+}
+
 /// Stop any new ingress when source completion or disconnect becomes uncertain.
 pub(super) fn block(cookie: u64) {
     if let Some(row) = records().iter_mut().find(|row| row.cookie == cookie) {
@@ -252,10 +331,42 @@ pub(super) fn block(cookie: u64) {
     }
 }
 
+/// The caller must have proven that the port can no longer call this address: either CONNECT
+/// never entered port code, or a real disconnect has completed with every callback ACKed.
+/// Blocking ingress first also rejects a racing stale invocation before either owner is freed.
+pub(super) unsafe fn retire_after_quiescence(cookie: u64) -> Result<(), nt_status::NtStatus> {
+    let row = records()
+        .iter_mut()
+        .find(|row| row.cookie == cookie)
+        .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    row.phase = Phase::Blocked;
+    if !row.buffer_retired {
+        row.buffer.retire()?;
+        row.buffer_retired = true;
+    }
+    if !release_instance_executable_thunk_binding(row.binding, true) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    let index = records()
+        .iter()
+        .position(|row| row.cookie == cookie)
+        .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    records().swap_remove(index);
+    Ok(())
+}
+
 pub(super) fn instance_quiesced(index: usize) -> bool {
     records()
         .iter()
         .all(|row| row.port_instance != index && row.class_instance != index)
+}
+
+pub(super) fn references_irq_lane(instance_index: usize, domain: HostedDomainIdentity) -> bool {
+    records().iter().any(|row| {
+        row.class_instance == instance_index
+            && row.class_domain == domain
+            && row.phase != Phase::Reserved
+    })
 }
 
 core::arch::global_asm!(

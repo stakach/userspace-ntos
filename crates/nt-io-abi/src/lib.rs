@@ -33,6 +33,10 @@ pub use wire::{
 /// ABI version of this wire contract; bumped on any incompatible change.
 pub const IO_ABI_VERSION: u32 = 15;
 
+/// Root-authenticated `IrpDispatchRequest._reserved0` value for a canonical subsidiary File
+/// lifecycle IRP. Native retains an inline terminal until physical completion ACK.
+pub const IRP_DISPATCH_SUBSIDIARY_FILE_LIFECYCLE: u16 = 1;
+
 /// Validate original canonical File CREATE options separately from mutable stack options.
 /// CREATE, named-pipe CREATE, and mailslot CREATE carry only the low 24 option bits and cannot
 /// select both synchronous modes. This checks wire provenance, not full CREATE admission.

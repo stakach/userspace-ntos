@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 
 use nt_io_manager::{
     hosted_forward_target::HostedForwardTarget, retained_query_path_forward::SourceIrpTicket,
+    source_irp_auxiliary::SourcePoolAllocationIdentity,
     CompletedIrp, CompletionAcknowledgement, DispatchContext, ExternalPnpDispatchResult,
     ExternalPnpFilterCompletionInvocation, ExternalPnpFilterCompletionReturn,
     ExternalPnpFilterOutput, ExternalPnpFinishResult, ExternalPnpInvocation, ExternalPnpReturn,
@@ -19,7 +20,10 @@ use nt_io_manager::{
 use nt_status::NtStatus;
 use nt_types::ClientId;
 
-use crate::{filter_requirements_return_action, FilterRequirementsReturnAction, PnpManager};
+use crate::{
+    fdo_forward_path::{validate_fdo_forward_path, FdoForwardPathError},
+    filter_requirements_return_action, FilterRequirementsReturnAction, PnpManager,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FilterFdoForwardIdentity {
@@ -106,12 +110,15 @@ fn validate_path<P>(
     client: ClientId,
     requestor_tid: u64,
 ) -> Result<(), FilterFdoForwardError> {
-    if identity.source.domain != identity.upper.domain()
-        || identity.upper.domain() == identity.lower.domain()
-        || identity.upper.device_id() == identity.lower.device_id()
-    {
+    if identity.source.domain != identity.upper.domain() {
         return Err(FilterFdoForwardError::SameDomain);
     }
+    validate_fdo_forward_path(pnp, io, identity.upper, identity.lower, identity.devnode).map_err(
+        |error| match error {
+            FdoForwardPathError::SameDomain => FilterFdoForwardError::SameDomain,
+            FdoForwardPathError::WrongStack => FilterFdoForwardError::WrongLower,
+        },
+    )?;
     let source = io
         .irp(identity.source_irp)
         .ok_or(FilterFdoForwardError::WrongSource)?;
@@ -136,14 +143,6 @@ fn validate_path<P>(
         || lower.file_id.is_some()
     {
         return Err(FilterFdoForwardError::WrongSource);
-    }
-    if io
-        .device(upper.device_id)
-        .and_then(|device| device.attached_to)
-        != Some(lower.device_id)
-        || pnp.fdo(identity.devnode) != Some(lower.device_id.raw())
-    {
-        return Err(FilterFdoForwardError::WrongLower);
     }
     Ok(())
 }
@@ -457,7 +456,9 @@ impl FilterFdoReturn {
             information,
         } = self.returned.outcome()
         {
-            if !valid_output(*status, *information, &self.output) {
+            if matches!(&self.output, ExternalPnpFilterOutput::BorrowedInput { .. })
+                || !valid_output(*status, *information, &self.output)
+            {
                 return Err(FilterFdoFinishRejection {
                     error: FilterFdoForwardError::InvalidOutput,
                     returned: self,
@@ -559,7 +560,9 @@ fn finish_terminal(
             },
         };
     }
-    if !valid_output(status, information, &output) {
+    if (!expected_pending && matches!(&output, ExternalPnpFilterOutput::BorrowedInput { .. }))
+        || !valid_output(status, information, &output)
+    {
         return FilterFdoForwardResult::Rejected {
             error: FilterFdoForwardError::InvalidOutput,
             retained: RetainedFilterFdoForward {
@@ -587,7 +590,7 @@ fn valid_output(status: NtStatus, information: u64, output: &ExternalPnpFilterOu
             matches!(output, ExternalPnpFilterOutput::Original)
         }
         FilterRequirementsReturnAction::CopyProviderOutput { information } => match output {
-            ExternalPnpFilterOutput::BorrowedInput { provider_pointer } => {
+            ExternalPnpFilterOutput::BorrowedInput { provider_pointer, .. } => {
                 *provider_pointer != 0 && *provider_pointer == information
             }
             ExternalPnpFilterOutput::Copied {
@@ -615,6 +618,18 @@ impl RetainedFilterFdoForward {
     }
     pub const fn has_rejected_terminal(&self) -> bool {
         self.rejected_terminal.is_some()
+    }
+    /// Bind the exact provider-domain input allocation captured before dispatch. A later
+    /// borrowed terminal must present the same generation-bearing allocation identity.
+    pub fn bind_provider_filter_input_allocation(
+        &mut self,
+        allocation: SourcePoolAllocationIdentity,
+    ) -> Result<(), FilterFdoForwardError> {
+        self.detached
+            .as_mut()
+            .ok_or(FilterFdoForwardError::WrongTerminal)?
+            .bind_filter_input_allocation(allocation)
+            .map_err(FilterFdoForwardError::Lower)
     }
     pub fn prepare_completion<P: ObjectManagerPort>(
         mut self,

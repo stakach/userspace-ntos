@@ -17,9 +17,12 @@ pub(crate) mod nested;
 #[path = "component_ingress_services.rs"]
 mod services;
 pub(crate) use services::{
-    acknowledge_retained_service_cancellation, cancel_parked_service, finish_autonomous,
+    acknowledge_hosted_forward_source_continuation, acknowledge_retained_service_cancellation,
+    cancel_parked_service, finish_autonomous,
     next_service_wait_token, park_retained_service, park_service, reconcile_retained_service_reply,
     resume_acknowledged_retained_services, resume_service, retained_service_resume_ready, retained_service_cancelled,
+    parked_service_wait_identity, service_wait_resume_ready_exact, service_wait_resume_completed_exact,
+    resume_service_component_wait,
     retained_service_owner_stopped, retained_service_owner_stopped_at_broker,
     retained_service_reply_acknowledged,
     retained_service_reply_not_entered, retained_service_resume_next_deadline,

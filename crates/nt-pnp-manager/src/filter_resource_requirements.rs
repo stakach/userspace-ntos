@@ -8,7 +8,9 @@ pub enum FilterRequirementsReturnAction {
     /// The driver left the requirements unchanged; use the caller's owned copy.
     UseOriginal,
     /// The driver returned a provider allocation that must be copied and released by its owner.
-    CopyProviderOutput { information: u64 },
+    CopyProviderOutput {
+        information: u64,
+    },
     Barrier(NtStatus),
 }
 

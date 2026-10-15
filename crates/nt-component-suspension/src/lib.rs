@@ -21,7 +21,10 @@ pub use external_ingress::{
     ExternalSettlement,
 };
 mod external_selection;
-pub use external_selection::oldest_external_ingress;
+pub use external_selection::{
+    oldest_external_ingress, oldest_receive_external_ingress,
+    oldest_receive_external_ingress_matching, ExternalReceiveState,
+};
 mod ingress;
 pub mod badge;
 pub mod source_registry;

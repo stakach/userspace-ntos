@@ -7,7 +7,7 @@
 
 use super::*;
 use nt_io_abi::major;
-use nt_io_manager::detached_file_irp::{ExternalFileIrpDispatchPolicy, ExternalFileIrpRequest};
+use nt_io_manager::detached_file_irp::ExternalFileIrpRequest;
 use nt_io_manager::retained_connect_forward::ConnectPayloadIdentity;
 use nt_io_manager::{DeviceControlParameters, HostedDevicePointerRegistration, IoParameters};
 use nt_types::ClientId;
@@ -33,6 +33,7 @@ pub(super) struct PortLocalConnect {
     class_alias: HostedDevicePointerRegistration,
     thunk: hosted_class_callback_thunk::PublishedClassServiceThunk,
     pending_irp: Option<nt_io_manager::IrpId>,
+    returned_input: Option<[u8; 16]>,
     phase: PortConnectPhase,
 }
 
@@ -48,7 +49,7 @@ impl PortLocalConnect {
         let aliases = hosted_reverse_class_projection::validate(reverse_owner_id)?;
         let class_alias = aliases.class_do_registration;
         let (_, _, admitted_alias, admitted_class, admitted_service, admitted_control) =
-            hosted_class_callback_thunk::admit_irq_request(
+            hosted_class_callback_thunk::validate_pre_entry(
                 thunk.cookie,
                 source.forward.source.allocation().domain,
                 class_alias.address(),
@@ -79,6 +80,7 @@ impl PortLocalConnect {
             class_alias,
             thunk,
             pending_irp: None,
+            returned_input: None,
             phase: PortConnectPhase::Prepared,
         })
     }
@@ -91,6 +93,10 @@ impl PortLocalConnect {
     }
     pub(super) const fn reverse_owner_id(&self) -> u64 {
         self.reverse_owner_id
+    }
+
+    pub(super) const fn thunk(&self) -> hosted_class_callback_thunk::PublishedClassServiceThunk {
+        self.thunk
     }
 
     /// The permit is deliberately sealed until the IRQ callback service and both physical
@@ -141,17 +147,21 @@ impl PortLocalConnect {
         // Mark possible entry before invoking the detached owner. An uncertain transport result
         // cannot put this object back in Prepared or authorize a replay.
         self.phase = PortConnectPhase::Entered;
-        match hosted_file_owners::dispatch(
+        match hosted_file_owners::dispatch_port_connect(
             caller,
             request,
             &input,
-            &[],
-            ExternalFileIrpDispatchPolicy::DeviceControlAtDevice,
+            self.port_device.device_id(),
         ) {
-            Ok(hosted_file_owners::DispatchResult::Returned { status, .. }) => {
+            Ok(hosted_file_owners::DispatchResult::Returned { status, buffers, .. }) => {
                 if status == nt_status::NtStatus::PENDING {
                     return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
                 }
+                let mut returned = [0u8; 16];
+                assert_eq!(buffers.input().len(), returned.len(),
+                    "validated CONNECT input length changed");
+                returned.copy_from_slice(buffers.input());
+                self.returned_input = Some(returned);
                 self.phase = PortConnectPhase::Terminal(status);
             }
             Ok(hosted_file_owners::DispatchResult::Outstanding { irp_id }) => {
@@ -178,6 +188,9 @@ impl PortLocalConnect {
                 _ => None,
             });
         };
+        // A nested HOOK source may have finished while the outer CONNECT pump is parked.
+        // Drive the I/O Manager before observing this exact canonical IRP.
+        pump_io_manager();
         if unsafe { io_manager_mut().completed_irp(irp_id) }.is_none() {
             return Ok(None);
         }
@@ -201,8 +214,11 @@ impl PortLocalConnect {
         match self.phase {
             PortConnectPhase::Terminal(_) => {
                 if let Some(irp_id) = self.pending_irp {
-                    hosted_file_owners::acknowledge(irp_id)?;
+                    self.returned_input = Some(hosted_file_owners::acknowledge_port_connect(irp_id)?);
                     self.pending_irp = None;
+                }
+                if self.returned_input.is_none() {
+                    return Err(nt_status::NtStatus::INVALID_PARAMETER);
                 }
                 // A synchronous terminal was retired by detached dispatch itself.
                 self.phase = PortConnectPhase::Acknowledged;

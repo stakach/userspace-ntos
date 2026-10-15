@@ -1116,7 +1116,6 @@ fn nt_long_arg(value: u64) -> i32 {
     nt_ulong_arg(value) as i32
 }
 
-
 #[allow(clippy::too_many_arguments)]
 fn trace_named_pipe_io(
     pi: usize,
@@ -17604,45 +17603,9 @@ impl ExecNtHandler {
                 if self.service_native_image_page_residency(target_pi, plan.page, plan.access, nt_address_space::ImageFaultObservation::CopyAccess)?.is_some() {
                     return Ok(());
                 }
-                let image = process_committed_image_allocation(target_pi as u64, plan.page)
-                    .ok_or(nt_address_space::STATUS_NOT_COMMITTED)?;
-                let base = image.allocation_base;
-                let _image_reader = if base == target.img_base {
-                    let _durable = crate::allocator::enter_durable();
-                    let image = (&*ctx.exe_image_catalog).get_by_pi(target_pi)
-                        .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?;
-                    Some(crate::hosted_loaded_images::HostedImageReadScope::capture(
-                        ctx.hosted_loaded_images, nt_exe_image::SpawnTarget::from_image(image),
-                    ).map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?)
-                } else { None };
-                let pe = if base == target.img_base {
-                    (&*ctx.hosted_loaded_images)
-                        .pe_by_pi(target_pi)
-                        .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?
-                } else if !ctx.ntdll_pe.is_null() && base == ctx.nt_base {
-                    &*ctx.ntdll_pe
-                } else {
-                    let reg = &*ctx.reg;
-                    let (index, _) = reg
-                        .dll_for_page(target_pi, base)
-                        .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?;
-                    ctx.dll_pes()
-                        .get(index)
-                        .and_then(|slot| slot.as_ref())
-                        .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?
-                };
-                service_image_page_residency(
-                    self,
-                    target_pi,
-                    plan.page,
-                    base,
-                    pe,
-                    target.pml4,
-                    target.scratch_base,
-                    plan.access,
-                    false,
-                    &mut *ctx.filled_pages,
-                    &mut *ctx.faults,
+                crate::service_sec_image::service_legacy_image_page_residency(
+                    self, target_pi, plan.page, plan.access,
+                    nt_address_space::ImageFaultObservation::CopyAccess,
                 )
             }
         }
@@ -18865,6 +18828,8 @@ impl ExecNtHandler {
                         reservation,
                         PendingDriverStart {
                             batch,
+                            reservation,
+                            bootstrap_predecessors: alloc::vec::Vec::new(),
                             owner: PendingDriverStartOwner::User {
                                 request: None,
                                 reply: None,

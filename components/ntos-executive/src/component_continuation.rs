@@ -7,6 +7,7 @@ pub(super) enum PendingComponentDispatch {
     Provider(win32k_glue::PendingProviderWaitDispatch),
     Lpc(win32k_glue::PendingLpcWaitDispatch),
     Receive(win32k_glue::PendingReceiveDispatch),
+    ServiceWait(win32k_glue::PendingServiceWaitDispatch),
 }
 
 impl PendingComponentDispatch {
@@ -15,6 +16,7 @@ impl PendingComponentDispatch {
             Self::Provider(pending) => pending.client,
             Self::Lpc(pending) => pending.client,
             Self::Receive(pending) => pending.client,
+            Self::ServiceWait(pending) => pending.client,
         }
     }
 }

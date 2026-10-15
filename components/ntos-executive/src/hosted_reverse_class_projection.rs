@@ -76,6 +76,8 @@ pub(super) fn instance_quiesced(index: usize) -> bool {
 #[derive(Clone, Copy)]
 pub(super) struct PreparedReverseClassProjection {
     pub(super) owner_id: u64,
+    pub(super) source_port_do_registration: HostedDevicePointerRegistration,
+    pub(super) source_main_registration: HostedDevicePointerRegistration,
     pub(super) port_domain_port_do: u64,
     pub(super) port_domain_class_do: u64,
     pub(super) port_do_shape: hosted_reverse_class_alias::ClassAliasShape,
@@ -244,7 +246,7 @@ pub(super) unsafe fn prepare(
             return Err(status);
         }
         let source = if is_port_do { class_port } else { class_main };
-        match register_hosted_device_projection(port_inst, port_domain, alias, source.device_id()) {
+        match register_unlinked_hosted_device_projection(port_inst, port_domain, alias, source.device_id()) {
             Ok(registration) => {
                 let member = if is_port_do {
                     &mut owner(id).unwrap().port_do
@@ -353,6 +355,55 @@ pub(super) unsafe fn validate(
     }
     Ok(PreparedReverseClassProjection {
         owner_id: id,
+        source_port_do_registration: row.port_do.source,
+        source_main_registration: row.class_do.source,
+        port_domain_port_do: row.port_do.alias.unwrap(),
+        port_domain_class_do: row.class_do.alias.unwrap(),
+        port_do_shape: row.port_do.shape,
+        class_do_shape: row.class_do.shape,
+        port_do_registration: row.port_do.alias_registration.unwrap(),
+        class_do_registration: row.class_do.alias_registration.unwrap(),
+    })
+}
+
+/// IRQ admission runs while an unrelated I/O Manager dispatch may still hold its mutable borrow.
+/// Publication checked the canonical stack and registrations before provider entry; the
+/// projection owner pins all four exact registrations until callback quiescence. Recheck the
+/// owner phase and physical generations here without entering the I/O Manager.
+pub(super) unsafe fn validate_irq(
+    id: u64,
+) -> Result<PreparedReverseClassProjection, nt_status::NtStatus> {
+    let row = owner(id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if !row.provider_entered || row.retirement_blocked
+        || row.projection.published_identity_without_manager() != Some(row.identity()?)
+        || instance(row.class_instance).and_then(instance_domain_identity) != Some(row.class_domain)
+        || instance(row.port_instance).and_then(instance_domain_identity) != Some(row.port_domain)
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let class_inst = instance(row.class_instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    let port_inst = instance(row.port_instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    for member in [row.port_do, row.class_do] {
+        let alias = member.alias.ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+        let allocation = member.alias_allocation.ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+        let registration = member.alias_registration.ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+        if registration.domain() != row.port_domain
+            || registration.address() != alias
+            || registration.device_id() != member.source.device_id()
+            || member.source.domain() != row.class_domain
+            || hosted_device_allocations::capture_allocation(class_inst, member.source.address())?
+                != member.source_allocation
+            || hosted_device_allocations::capture_allocation(port_inst, alias)? != allocation
+            || !hosted_device_allocations::protects_allocation(class_inst, member.source.address())
+            || !hosted_device_allocations::protects_allocation(port_inst, alias)
+        {
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
+    }
+    Ok(PreparedReverseClassProjection {
+        owner_id: id,
+        source_port_do_registration: row.port_do.source,
+        source_main_registration: row.class_do.source,
         port_domain_port_do: row.port_do.alias.unwrap(),
         port_domain_class_do: row.class_do.alias.unwrap(),
         port_do_shape: row.port_do.shape,
@@ -615,6 +666,7 @@ unsafe fn retire_acknowledged_aliases(id: u64) -> Result<(), nt_status::NtStatus
         }
     }
     row.projection.begin_retirement()?;
+    row.projection.release_aliases_for_retirement(io_manager_mut())?;
     // From here, every failure retains this row. An uncertain native free may have modified
     // bytes or allocator state, so this operation is deliberately not retryable.
     for is_port_do in [true, false] {

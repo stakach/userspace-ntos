@@ -4,16 +4,122 @@ use super::shared_ingress::owner::runtime;
 use super::*;
 use nt_component_suspension::peer_registry::PeerRoute;
 
+// Counts only entered receive scopes and observed IRQ notifications. Periodic census reads these
+// atomics without walking the hosted ingress table or changing receive ownership.
+static ACTIVE_IRP_RECEIVES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SYSCALL_RECEIVES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_RETAINED_SEH_RECEIVES: AtomicU64 = AtomicU64::new(0);
+static IRQ_IRP_RECEIVES: AtomicU64 = AtomicU64::new(0);
+static IRQ_SYSCALL_RECEIVES: AtomicU64 = AtomicU64::new(0);
+static IRQ_RETAINED_SEH_RECEIVES: AtomicU64 = AtomicU64::new(0);
+
+struct ReceiveCensusScope {
+    kind: ReqKind,
+    retained_seh: bool,
+}
+
+impl ReceiveCensusScope {
+    fn enter(kind: ReqKind, retained_seh: bool) -> Self {
+        match kind {
+            ReqKind::Irp => { ACTIVE_IRP_RECEIVES.fetch_add(1, Ordering::Relaxed); }
+            ReqKind::Syscall => { ACTIVE_SYSCALL_RECEIVES.fetch_add(1, Ordering::Relaxed); }
+        }
+        if retained_seh {
+            ACTIVE_RETAINED_SEH_RECEIVES.fetch_add(1, Ordering::Relaxed);
+        }
+        Self { kind, retained_seh }
+    }
+}
+
+impl Drop for ReceiveCensusScope {
+    fn drop(&mut self) {
+        match self.kind {
+            ReqKind::Irp => { ACTIVE_IRP_RECEIVES.fetch_sub(1, Ordering::Relaxed); }
+            ReqKind::Syscall => { ACTIVE_SYSCALL_RECEIVES.fetch_sub(1, Ordering::Relaxed); }
+        }
+        if self.retained_seh {
+            ACTIVE_RETAINED_SEH_RECEIVES.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub(super) fn receive_census() -> (u64, u64, u64, u64, u64, u64) {
+    (
+        ACTIVE_IRP_RECEIVES.load(Ordering::Relaxed),
+        ACTIVE_SYSCALL_RECEIVES.load(Ordering::Relaxed),
+        ACTIVE_RETAINED_SEH_RECEIVES.load(Ordering::Relaxed),
+        IRQ_IRP_RECEIVES.load(Ordering::Relaxed),
+        IRQ_SYSCALL_RECEIVES.load(Ordering::Relaxed),
+        IRQ_RETAINED_SEH_RECEIVES.load(Ordering::Relaxed),
+    )
+}
+
+/// Run the established bounded IRQ/DPC scheduler while the exact dispatch remains parked.
+/// The scheduler owns its nested execution hold and restores it before this receiver can wait;
+/// neither this checkpoint nor its caller sends or replays the retained Reply.
+unsafe fn service_inline_irq_checkpoint(
+    ch: &PumpChannel,
+    route: PeerRoute,
+) -> Result<(), runtime::Error> {
+    if runtime::channel_route(ch)? != Some(route)
+        || !matches!(runtime::receive_owner(route)?, nt_component_suspension::IngressExecutionOwner::Dispatch(_))
+    {
+        return Err(runtime::Error::PhysicalIdentity);
+    }
+    let dispatch = runtime::dispatch(route)?;
+    let reply = runtime::current_reply(route)?;
+    let scope = crate::driver_launch::ComponentSchedulerScope::enter();
+    scope.service_irq_yield(ch.shared_va);
+    if runtime::channel_route(ch)? != Some(route)
+        || runtime::dispatch(route)? != dispatch
+        || runtime::current_reply(route)? != reply
+        || !matches!(runtime::receive_owner(route)?, nt_component_suspension::IngressExecutionOwner::Dispatch(current) if current == dispatch)
+    {
+        return Err(runtime::Error::PhysicalIdentity);
+    }
+    Ok(())
+}
+
+/// A physical IRQ bit is independent of the ordinary request kind and kernel-yield capability.
+unsafe fn inline_irq_work_pending() -> bool {
+    crate::driver_launch::hosted_irq_work_pending()
+        || crate::driver_launch::hosted_driver_dpc_activation_pending()
+        || crate::dispatcher_bootstrap::timer_work_pending()
+}
+
 pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: bool) -> PumpMessage {
+    let _census_scope = ReceiveCensusScope::enter(ch.caps.kind, retained_seh);
+    // A retained exception walk and an ordinary syscall channel without kernel IRQ yield cannot
+    // return a scheduler continuation. Give already-latched work one isolated pass here instead.
+    let inline_irq_checkpoint =
+        retained_seh || (ch.caps.kind == ReqKind::Syscall && !ch.caps.kernel_irq_yield);
+    let mut irq_checkpoint = inline_irq_checkpoint && inline_irq_work_pending();
     loop {
         if !retained_seh {
             match crate::win32k_glue::prepare_receive_yield(ch) {
                 Ok(Some(yielded)) => return PumpMessage::hosted_receive_yield(yielded),
                 Ok(None) => {}
-                Err(_) => panic!("receive-yield preparation retains exact ingress ownership"),
+                Err(error) => {
+                    crate::print_str(b"[receive-yield-failure] propagated-error=");
+                    crate::print_str(match error {
+                        runtime::Error::PhysicalIdentity => b"physical",
+                        runtime::Error::Admission => b"admission",
+                        runtime::Error::Capacity => b"capacity",
+                        runtime::Error::Receive => b"receive",
+                        _ => b"other",
+                    });
+                    crate::print_str(b"\n");
+                    panic!("receive-yield preparation retains exact ingress ownership");
+                }
+            }
+            match crate::win32k_glue::prepare_service_wait_yield(ch) {
+                Ok(Some(yielded)) => return PumpMessage::hosted_service_wait_yield(yielded),
+                Ok(None) => {}
+                Err(_) => panic!("service-wait yield lost its exact physical ownership"),
             }
         }
         crate::registry_mutation_work::redrive_provider();
+        let connect_ready = crate::driver_launch::nested_hosted_connect_forward_ready();
         if crate::driver_launch::nested_hosted_driver_create_ready()
             || crate::driver_launch::nested_hosted_query_path_ready()
             || crate::driver_launch::nested_hosted_write_ready()
@@ -21,7 +127,11 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: b
             || crate::driver_launch::nested_hosted_flush_ready()
             || crate::driver_launch::nested_hosted_query_information_ready()
             || crate::driver_launch::nested_hosted_lower_pnp_ready()
+            || crate::driver_launch::nested_hosted_start_fdo_ready()
+            || connect_ready
+            || crate::driver_launch::nested_hosted_hook_forward_ready()
             || crate::driver_launch::nested_hosted_kernel_file_read_query_ready()
+            || crate::driver_launch::nested_hosted_win32k_async_read_ready()
             || crate::hosted_routed_file_close_work::nested_work_ready()
             || crate::driver_launch::nested_hosted_file_lifecycle_work_ready()
             || crate::driver_launch::nested_win32k_source_work_ready()
@@ -89,6 +199,16 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: b
         {
             return PumpMessage::scheduler_yield();
         }
+        if inline_irq_checkpoint && irq_checkpoint {
+            if service_inline_irq_checkpoint(ch, route).is_err() {
+                crate::print_str(b"[pump-ingress] inline IRQ checkpoint lost its route\n");
+                return PumpMessage::transport_wall();
+            }
+            // Deferred IRQ bits may remain set. This pass belongs to the observed arrival only;
+            // inspect new Calls before waiting, then await another notification to retry.
+            irq_checkpoint = false;
+            continue;
+        }
         let execution = match runtime::receive_owner(route) {
             Ok(execution) => execution,
             Err(_) => {
@@ -96,7 +216,8 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: b
                 return PumpMessage::transport_wall();
             }
         };
-        match runtime::receive(execution, ch.tcb, true) {
+        let arrival = runtime::receive(execution, ch.tcb, true);
+        match arrival {
             Ok(runtime::Arrival::Hosted) => {}
             Ok(runtime::Arrival::Call { .. }) => {
                 // The coordinator retains unrelated Calls for their exact source. Inspect only
@@ -105,13 +226,25 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: b
             Ok(runtime::Arrival::Notification(message)) => {
                 crate::census_tick_static(crate::monotonic_time_100ns());
                 let (event, _, irq) = pump_handle_executive_event_badge(message.badge());
+                if irq {
+                    match ch.caps.kind {
+                        ReqKind::Irp => { IRQ_IRP_RECEIVES.fetch_add(1, Ordering::Relaxed); }
+                        ReqKind::Syscall => { IRQ_SYSCALL_RECEIVES.fetch_add(1, Ordering::Relaxed); }
+                    }
+                    if retained_seh {
+                        IRQ_RETAINED_SEH_RECEIVES.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 if !event {
                     continue;
                 }
                 if pump_deadman_tripped() {
                     return PumpMessage::deadman_wall();
                 }
-                if !retained_seh && pump_scheduler_work_pending(ch, irq) {
+                if inline_irq_checkpoint && (irq || inline_irq_work_pending()) {
+                    irq_checkpoint = true;
+                }
+                if !inline_irq_checkpoint && pump_scheduler_work_pending(ch, irq) {
                     return PumpMessage::scheduler_yield();
                 }
             }
@@ -134,6 +267,13 @@ pub(super) unsafe fn autonomous(ch: &PumpChannel) -> bool {
 pub(super) unsafe fn service_wait_yields(ch: &PumpChannel) -> bool {
     if autonomous(ch) { return true; }
     if ch.caps.kind != ReqKind::Irp { return false; }
+    // The class HOOK worker runs inside an earlier AddDevice/CONNECT pump. Keep receiving on
+    // this exact worker while its lower source is redriven; returning a provider-wait slice to
+    // ordinary IRP dispatch would misclassify the live continuation as a transport wall.
+    if crate::driver_launch::hosted_class_irp_lane::is_channel(ch) { return false; }
+    // The exact class source has already parked its CONNECT Call. Its retained owner must
+    // redrive the port provider before this receiver can deliver the first service Reply.
+    if crate::driver_launch::parked_hosted_connect_source_channel(ch) { return false; }
     matches!(runtime::channel_route(ch).and_then(|route| route.ok_or(runtime::Error::UnknownPeer))
         .and_then(|route| runtime::physical_source(route)),
         Ok(source) if matches!(source.domain, runtime::PhysicalDomain::Hosted(_))

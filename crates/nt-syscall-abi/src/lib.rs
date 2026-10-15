@@ -85,6 +85,54 @@ pub const fn native_syscall_message_info(argc: u8) -> u64 {
     (NT_NATIVE_SYSCALL_LABEL << 12) | native_syscall_request_len(argc)
 }
 
+/// The largest native request emitted by the generated NT stubs (two prefix words and up to
+/// fourteen arguments). Capture these words before the receiver performs any nested IPC.
+pub const NT_NATIVE_REQUEST_WORDS: usize =
+    NT_NATIVE_SYSCALL_PREFIX_WORDS as usize + MAX_STUB_ARGS as usize;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeSyscallRequest {
+    length: usize,
+    words: [u64; NT_NATIVE_REQUEST_WORDS],
+}
+
+impl NativeSyscallRequest {
+    /// Fast message registers are passed by value; `read_tail` reads MR4 and later from the
+    /// current receive. No caller may use the mutable IPC buffer as the request after this call.
+    pub fn capture(
+        info: u64,
+        registers: [u64; 4],
+        mut read_tail: impl FnMut(usize) -> u64,
+    ) -> Option<Self> {
+        if info >> 12 != NT_NATIVE_SYSCALL_LABEL {
+            return None;
+        }
+        let length = (info & 0x7f) as usize;
+        let mut words = [0; NT_NATIVE_REQUEST_WORDS];
+        for index in 0..length.min(NT_NATIVE_REQUEST_WORDS) {
+            words[index] = if index < registers.len() {
+                registers[index]
+            } else {
+                read_tail(index)
+            };
+        }
+        Some(Self { length, words })
+    }
+
+    pub const fn length(&self) -> usize {
+        self.length
+    }
+
+    pub fn word(&self, index: usize) -> Option<u64> {
+        (index < self.length).then(|| self.words.get(index).copied()).flatten()
+    }
+
+    pub fn argument(&self, index: usize) -> Option<u64> {
+        index.checked_add(NT_NATIVE_SYSCALL_PREFIX_WORDS as usize)
+            .and_then(|word| self.word(word))
+    }
+}
+
 /// Private executive-to-ntdll reply marker requesting that a parked native seL4-Call syscall be
 /// reissued with the restored request MRs. It is deliberately outside the 32-bit NTSTATUS domain.
 pub const NT_NATIVE_RETRY_REPLY: u64 = 0x4E54_5254_5259_0001;

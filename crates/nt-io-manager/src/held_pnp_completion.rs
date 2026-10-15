@@ -159,13 +159,42 @@ impl<const CAPACITY: usize> HeldPnpCompletionTable<CAPACITY> {
         }
     }
 
+    /// Record the direct completion walk only after it returned Terminal. A callback that
+    /// returned MoreProcessingRequired must use `arm` and a later `terminal` instead.
+    pub fn direct_terminal(&mut self, identity: HeldPnpIdentity) -> Result<(), HeldPnpError> {
+        let row = self.exact_slot_mut(identity)?
+            .as_mut().ok_or(HeldPnpError::NotFound)?;
+        if row.acknowledgement.operation != 8 || !row.bound || row.armed || row.acknowledging {
+            return Err(HeldPnpError::WrongPhase);
+        }
+        // A terminal IoCompleteRequest may have raced the direct dispatch return.
+        row.terminal_seen = true;
+        row.acknowledging = true;
+        Ok(())
+    }
+
+    /// Source-side START ACK admission proof. An exact row in Bound or Armed phase alone
+    /// cannot authorize provider/source retirement, even if the pending node is READY.
+    pub fn start_terminal_evidence(&self, identity: HeldPnpIdentity, operation: u64) -> bool {
+        self.rows.iter().flatten().any(|row| {
+            row.acknowledgement.identity == identity
+                && row.acknowledgement.operation == 8
+                && row.bound && row.terminal_seen && row.acknowledging
+                && match operation {
+                    7 => !row.armed,
+                    8 => row.armed,
+                    _ => false,
+                }
+        })
+    }
+
     /// Retire only after the exact direct or held ACK actually succeeded. The
     /// caller retains the row when the ACK result is uncertain.
     pub fn retire_exact(&mut self, identity: HeldPnpIdentity) -> Result<(), HeldPnpError> {
         let slot = self.exact_slot_mut(identity)?;
         if !slot.as_ref().is_some_and(|row| {
             row.bound && ((!row.armed && !row.terminal_seen && !row.acknowledging)
-                || (row.armed && row.terminal_seen && row.acknowledging)
+                || (row.terminal_seen && row.acknowledging)
             )
         }) {
             return Err(HeldPnpError::WrongPhase);
@@ -218,6 +247,31 @@ mod tests {
             identity: HeldPnpIdentity { irp, token },
             operation: 8,
         }
+    }
+
+    #[test]
+    fn start_ack_requires_exact_direct_or_held_terminal_evidence() {
+        let mut table = HeldPnpCompletionTable::<2>::new();
+        let direct = HeldPnpIdentity { irp: 0x1000, token: 0x51 };
+        table.reserve(direct.irp, 8).unwrap();
+        table.bind(direct.irp, direct.token).unwrap();
+        assert!(!table.start_terminal_evidence(direct, 7));
+        assert!(!table.start_terminal_evidence(direct, 8));
+        table.direct_terminal(direct).unwrap();
+        assert!(table.start_terminal_evidence(direct, 7));
+        assert!(!table.start_terminal_evidence(direct, 8));
+        assert!(!table.start_terminal_evidence(HeldPnpIdentity { token: 0x52, ..direct }, 7));
+        table.retire_exact(direct).unwrap();
+        assert!(!table.start_terminal_evidence(direct, 7));
+
+        let held = HeldPnpIdentity { irp: 0x2000, token: 0x61 };
+        table.reserve(held.irp, 8).unwrap();
+        table.bind(held.irp, held.token).unwrap();
+        assert_eq!(table.arm(held.irp, held.token), Ok(None));
+        assert!(!table.start_terminal_evidence(held, 8));
+        assert_eq!(table.terminal(held.irp), Ok(Some(ack(held.irp, held.token))));
+        assert!(table.start_terminal_evidence(held, 8));
+        assert!(!table.start_terminal_evidence(held, 7));
     }
 
     #[test]

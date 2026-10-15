@@ -253,20 +253,26 @@ impl HostedForwardOrigin {
         source_terminal_published: bool,
     ) -> bool {
         if self.reply_entered {
-            return self.disposition == Some(disposition);
+            return self.phase != OriginCallPhase::Indeterminate
+                && self.disposition == Some(disposition);
         }
         if !hosted_forward_dispatch_reply_ready(disposition, source_terminal_published) {
             return false;
         }
         self.disposition = Some(disposition);
         self.reply_entered = true;
-        let _ = runtime::wake_hosted_forward_service(
+        if runtime::wake_hosted_forward_service(
             self.route,
             self.dispatch,
             self.reply,
             self.token,
             disposition,
-        );
+        ).is_err() {
+            // The Reply may have been affected despite the failed acknowledgement. Retain the
+            // exact origin and prohibit a second wake or provider entry.
+            self.phase = OriginCallPhase::Indeterminate;
+            return false;
+        }
         true
     }
 
@@ -276,19 +282,13 @@ impl HostedForwardOrigin {
         if token != self.token
             || !self.pending()
             || !self.reply_entered
-            || self.phase != OriginCallPhase::Calling
+            || !matches!(self.phase, OriginCallPhase::Calling | OriginCallPhase::Indeterminate)
         {
             return Err(STATUS_INVALID_DEVICE_REQUEST);
         }
-        if !matches!(
-            runtime::reconcile_retained_service_reply(
-                self.route,
-                self.dispatch,
-                self.reply,
-                self.token,
-            ),
-            Ok(true)
-        ) {
+        if runtime::acknowledge_hosted_forward_source_continuation(
+            self.route, self.dispatch, self.reply, self.token,
+        ).is_err() {
             return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
         }
         self.phase = OriginCallPhase::Armed(self.token);

@@ -11,6 +11,8 @@ const TERMINAL: &str =
     include_str!("../../../../components/ntos-executive/src/component_terminal.rs");
 const OBSERVER: &str =
     include_str!("../../../../components/ntos-executive/src/desktop_observation.rs");
+const WIN32K: &str =
+    include_str!("../../../../components/ntos-executive/src/win32k_subsystem.rs");
 
 #[test]
 fn shell_report_selects_historical_parent_from_unique_live_explorer() {
@@ -206,70 +208,26 @@ fn explorer_compound_gate_consumes_exact_live_launch_and_gui_receipts() {
 
 #[test]
 fn desktop_batch_evidence_requires_completed_flush_and_retains_original_caller() {
-    let file = syn::parse_file(MAIN).expect("actual executive source must parse");
-    let flush = function(&file, "ke_gdi_flush_user_batch");
-    let statements = &flush.block.stmts;
-    let capture = statements
-        .iter()
-        .position(|statement| {
-            let syn::Stmt::Local(local) = statement else {
-                return false;
-            };
-            let Some(initializer) = &local.init else {
-                return false;
-            };
-            matches!(&*initializer.expr, syn::Expr::Field(field)
-            if matches!(&field.member, syn::Member::Named(name) if name == "logical_caller"))
-        })
-        .expect("retain the exact caller before invoking the reentrant batch provider");
-    let dispatch = statements
-        .iter()
-        .position(|statement| {
-            let mut evidence = Evidence::default();
-            evidence.visit_stmt(statement);
-            evidence
-                .calls
-                .iter()
-                .any(|call| call == "win32k_flush_user_gdi_batch")
-        })
-        .expect("invoke the real batch provider");
-    assert!(capture < dispatch);
-    let completion = statements
-        .iter()
-        .enumerate()
-        .find_map(|(index, statement)| {
-            let syn::Stmt::Expr(syn::Expr::If(branch), _) = statement else {
-                return None;
-            };
-            let mut condition = Evidence::default();
-            condition.visit_expr(&branch.cond);
-            let mut body = Evidence::default();
-            body.visit_block(&branch.then_branch);
-            body.calls
-                .iter()
-                .any(|call| call == "service_observe_desktop_gui_for")
-                .then_some((index, branch, condition))
-        })
-        .expect("only acknowledged batch completion can publish desktop evidence");
-    assert!(completion.0 > dispatch);
-    assert!(completion.2.names.iter().any(|name| name == "ok"));
-    assert!(completion.2.names.iter().any(|name| name == "status"));
-    let syn::Expr::Binary(and) = &*completion.1.cond else {
-        panic!("completion must require both a real return and successful status");
-    };
-    assert!(matches!(and.op, syn::BinOp::And(_)));
-    assert!(matches!(&*and.left, syn::Expr::Path(path) if path.path.is_ident("ok")));
-    let syn::Expr::Binary(status) = &*and.right else {
-        panic!("require successful status")
-    };
-    assert!(matches!(status.op, syn::BinOp::Eq(_)));
-    assert!(matches!(&*status.right, syn::Expr::Lit(literal)
-        if matches!(&literal.lit, syn::Lit::Int(integer) if integer.base10_parse::<u32>().ok() == Some(0))));
-    let mut facts = Evidence::default();
-    facts.visit_block(&completion.1.then_branch);
-    for required in ["batch_caller", "BatchFlush", "BatchRecords"] {
-        assert!(facts.names.iter().any(|name| name == required));
-    }
+    let provider = syn::parse_file(WIN32K).expect("actual provider source must parse");
+    let dispatch = function(&provider, "win32k_dispatch");
+    let mut evidence = Evidence::default();
+    evidence.visit_block(&dispatch.block);
+    assert!(evidence.calls.iter().any(|name| name == "dispatch_gdi_batch_flush_callout"));
+    assert!(evidence.calls.iter().any(|name| name == "dispatch_ssn"));
+    let flush = WIN32K.find("dispatch_gdi_batch_flush_callout(client_pi, client_teb)").unwrap();
+    let syscall = WIN32K.find("dispatch_ssn(ssn, a0, a1, a2, a3)").unwrap();
+    assert!(flush < syscall, "batch must execute before the original SSN on one provider lane");
+    assert!(WIN32K.contains("user_origin && ssn != SSN_GDI_BATCH_FLUSH_CALLOUT"),
+        "only an authenticated user-origin syscall may run the entry batch prelude");
+    assert!(WIN32K.contains("SH_REQ_BATCH_RECORDS"),
+        "the provider must publish a count with the original dispatch return");
+    assert!(!SERVICE.contains("crate::ke_gdi_flush_user_batch(client, gdi_teb_alias)"),
+        "an independent pre-dispatch call can suspend before the original SSN");
+    assert!(SERVICE.contains("let inline_batch_records = win32k_glue::completed_gdi_batch_records"));
+    assert!(SERVICE.contains("observe_completed_gdi_batch_flush(nt_handler, dispatch.logical_caller, dispatch.batch_records)"),
+        "resumed completion must carry the original caller and recorded count");
+    assert!(MAIN.contains("callback-return flush suspended"),
+        "the separate callback-return path must expose a suspended flush");
 }
 
 fn withdraws_loop_context(statement: &syn::Stmt) -> bool {

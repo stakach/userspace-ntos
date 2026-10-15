@@ -17,6 +17,22 @@ pub(super) struct ProviderConnectProjection {
     _sealed: (),
 }
 
+impl ProviderConnectProjection {
+    pub(super) unsafe fn admitted(
+        reverse_owner_id: u64,
+        thunk: hosted_class_callback_thunk::PublishedClassServiceThunk,
+        permit: &hosted_class_callback_lane::ClassCallbackExecutionPermit,
+    ) -> Result<Self, nt_status::NtStatus> {
+        let aliases = hosted_reverse_class_projection::validate(reverse_owner_id)?;
+        if aliases.class_do_registration != thunk.port_class_alias
+            || !hosted_class_callback_thunk::verify_permit(permit, thunk)
+        {
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
+        Ok(Self { _sealed: () })
+    }
+}
+
 #[must_use = "retain the source Reply, IRP, stack, target and projection through terminal ACK"]
 pub(super) struct RetainedConnectWork {
     source: hosted_connect_capture::CapturedConnect,
@@ -48,6 +64,42 @@ impl RetainedConnectWork {
 
     pub(super) fn payload(&self) -> ConnectPayloadIdentity {
         self.source.payload()
+    }
+
+    pub(super) fn source_identity(&self) -> nt_io_manager::source_irp_ledger::SourceIrpForwardIdentity {
+        self.source.source_identity()
+    }
+
+    pub(super) fn source_irp_address(&self) -> u64 {
+        self.source.source_irp_address()
+    }
+
+    pub(super) fn source_pin_owned(&self) -> bool {
+        self.source.source_pin_owned()
+    }
+
+    pub(super) unsafe fn completion_command(&self) -> Result<hosted_source_completion_lane::SourceCompletionCommand, hosted_connect_capture::CaptureError> {
+        self.source.completion_command(self.origin.token)
+    }
+
+    pub(super) unsafe fn validate_source(&self) -> Result<(), hosted_connect_capture::CaptureError> {
+        self.source.validate_source()
+    }
+
+    pub(super) fn origin_mut(&mut self) -> &mut hosted_forward_origin::HostedForwardOrigin {
+        &mut self.origin
+    }
+
+    pub(super) fn forward(&self) -> Option<&nt_io_manager::retained_connect_forward::RetainedConnectForward> {
+        self.source.forward_ref()
+    }
+
+    pub(super) fn forward_mut(&mut self) -> Option<&mut nt_io_manager::retained_connect_forward::RetainedConnectForward> {
+        self.source.forward_mut()
+    }
+
+    pub(super) fn set_terminal_after_hook(&mut self, status: nt_status::NtStatus) {
+        self.terminal_status = Some(status);
     }
 
     /// The source allocation and stack snapshot are checked again immediately before the

@@ -20,11 +20,11 @@ pub(super) unsafe fn service(
     if hosted_driver_pump_caller_tcb(channel, reply_cap, caller_badge).is_none()
         || source_irp == 0
         || security_context == 0
-        || read_volatile((source.exec_shared_va + SH_ACTIVE_IRP) as *const u64) != source_irp
+        || read_volatile((channel.shared_va + SH_ACTIVE_IRP) as *const u64) != source_irp
     {
         return (STATUS_INVALID_HANDLE_LOCAL, 0, 0);
     }
-    let transfer_id = read_volatile((source.exec_shared_va + SH_REQ_CONTROL_ID) as *const u64);
+    let transfer_id = read_volatile((channel.shared_va + SH_REQ_CONTROL_ID) as *const u64);
     let (thread, canonical_irp) = {
         let Some(active) = active_hosted_irp_transfer_mut(channel.shared_va, transfer_id) else {
             return (STATUS_INVALID_HANDLE_LOCAL, 0, 0);
@@ -58,7 +58,7 @@ pub(super) unsafe fn service(
     else {
         return (STATUS_INVALID_HANDLE_LOCAL, 0, 0);
     };
-    let iosl = read_volatile((source.exec_shared_va + SH_ACTIVE_IOSL) as *const u64);
+    let iosl = read_volatile((channel.shared_va + SH_ACTIVE_IOSL) as *const u64);
     if stack_count == 0
         || iosl < source_irp + WDM_X64_IRP_SIZE as u64
         || iosl.checked_add(WDM_X64_IO_STACK_LOCATION_SIZE as u64)

@@ -13,10 +13,36 @@ const INGRESS: &str = include_str!("../../../components/ntos-executive/src/execu
 const RECEIVE: &str = include_str!("../../../components/ntos-executive/src/win32k_receive.rs");
 const RESUME: &str =
     include_str!("../../../components/ntos-executive/src/component_resume_execute.rs");
+const RESUME_OUTER: &str =
+    include_str!("../../../components/ntos-executive/src/component_resume.rs");
 const NESTED: &str =
     include_str!("../../../components/ntos-executive/src/component_ingress_nested.rs");
 const VSPACE: &str =
     include_str!("../../../components/ntos-executive/src/component_receive_vspace.rs");
+const HOSTED_RUNTIME: &str =
+    include_str!("../../../components/ntos-executive/src/hosted_thread_runtime.rs");
+const SERVICE_LOOP: &str =
+    include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
+
+#[test]
+fn child_created_during_unrelated_ingress_is_selected_before_fault_observation() {
+    let before_admission = SERVICE_LOOP
+        .split("let event_runtime = match (ingress")
+        .next()
+        .expect("hosted event admission");
+    let late_boundary = before_admission
+        .rsplit("finalize_service_loop_state(&mut nt_handler)")
+        .next()
+        .expect("late work checkpoint");
+    assert!(late_boundary.contains("receive_child_pending()"));
+    assert!(late_boundary.contains("receive_child_is_current("));
+    assert!(late_boundary.contains("defer_hosted_delivery("));
+    assert!(late_boundary.contains("component_recv!("));
+    let defer = HOSTED.split("pub(crate) unsafe fn defer_hosted_delivery(")
+        .nth(1).expect("exact unexecuted delivery handoff");
+    assert!(defer.contains("receive_child_pending()"));
+    assert!(defer.contains("receive_child_is_current("));
+}
 
 #[derive(Default)]
 struct Audit {
@@ -59,6 +85,19 @@ impl<'ast> Visit<'ast> for Audit {
             .extend(path.path.segments.iter().map(|part| part.ident.to_string()));
         syn::visit::visit_expr_path(self, path);
     }
+
+    fn visit_pat(&mut self, pat: &'ast syn::Pat) {
+        let path = match pat {
+            syn::Pat::Path(path) => Some(&path.path),
+            syn::Pat::TupleStruct(path) => Some(&path.path),
+            _ => None,
+        };
+        if let Some(path) = path {
+            self.variants
+                .extend(path.segments.iter().map(|part| part.ident.to_string()));
+        }
+        syn::visit::visit_pat(self, pat);
+    }
 }
 
 fn function<'a>(source: &'a syn::File, name: &str) -> &'a syn::ItemFn {
@@ -80,6 +119,112 @@ fn call_position(audit: &Audit, name: &str) -> usize {
     let position = audit.calls.iter().position(|call| call == name);
     assert!(position.is_some(), "actual boundary must invoke {name}");
     position.unwrap()
+}
+
+fn oldest_pending_selection() -> &'static str {
+    HOSTED
+        .split("pub(super) unsafe fn oldest_pending_snapshot()")
+        .nth(1)
+        .expect("Receive selection boundary")
+        .split("let row = rows[index]")
+        .next()
+        .expect("selection must precede snapshot construction")
+}
+
+#[test]
+fn sealed_receive_child_delivery_preempts_ordinary_older_call() {
+    let selection = HOSTED
+        .split("pub(crate) unsafe fn take_hosted_with(")
+        .nth(1)
+        .expect("hosted delivery selector")
+        .split("/// Return an unexecuted root delivery")
+        .next()
+        .expect("delivery selector boundary");
+    let pending = selection.find("let pending_receive = receive_child_pending();")
+        .expect("snapshot sealed Receive ownership before choosing a root delivery");
+    let branch = selection.find("if pending_receive {")
+        .expect("a sealed child must exclude unrelated ordinary Calls");
+    let child = selection.find("let receive = row.receive_settlement.as_ref()?;")
+        .expect("only a row with the sealed child owner may be delivered");
+    let ticket = selection.find("receive.barrier.admission_key() != call.admission_key()")
+        .expect("delivery must authenticate the exact child admission ticket");
+    let ordinary = selection.find("} else if row.receive_settlement.is_some() {")
+        .expect("ordinary selection must exclude a prepared child");
+    let selected = selection.find("Some((index, call))")
+        .expect("the authenticated row is the only selected delivery");
+    assert!(pending < branch && branch < child && child < ticket && ticket < ordinary
+        && ordinary < selected,
+        "the sealed child filter must run before oldest-admission selection");
+    assert!(selection[child..ordinary].contains("receive.transferred")
+        && selection[child..ordinary].contains("receive.parent.is_none()"),
+        "delivery requires an untransferred child with its retained physical parent");
+    let root_receive = INGRESS.split("pub(crate) unsafe fn receive(").nth(1)
+        .expect("root receive delivery boundary");
+    assert!(root_receive.contains("take_hosted_with("),
+        "root delivery must use the sealed-child-priority selector");
+}
+
+#[test]
+fn receive_selection_excludes_undelivered_prepared_child() {
+    let selection = oldest_pending_selection();
+    assert!(
+        selection.contains("settlement_prepared: row.receive_settlement.is_some()"),
+        "native selection must pass the sealed settlement state into the pure selector"
+    );
+}
+
+#[test]
+fn receive_selection_excludes_stop_entered_child() {
+    let selection = oldest_pending_selection();
+    assert!(
+        selection.contains("oldest_receive_external_ingress("),
+        "native selection must delegate Call park eligibility to the pure Receive selector"
+    );
+}
+
+#[test]
+fn selected_receive_child_excludes_pre_reply_sibling_resume() {
+    let source = syn::parse_file(RESUME_OUTER).unwrap();
+    let drain = function(&source, "drain_hosted_ready");
+    let first = drain.block.stmts.first().expect("pre-reply resume exclusion");
+    let syn::Stmt::Expr(syn::Expr::If(guard), _) = first else {
+        panic!("Receive child exclusion must precede any terminal or sibling pump work");
+    };
+    let mut condition = Audit::default();
+    condition.visit_expr(&guard.cond);
+    assert!(condition.calls.iter().any(|name| name == "receive_child_pending"),
+        "a selected child must settle before pre-reply drain can run another provider lane");
+    assert!(matches!(guard.then_branch.stmts.last(), Some(syn::Stmt::Expr(
+        syn::Expr::Return(_), _
+    ))), "child exclusion must leave the drain before it selects a sibling");
+}
+
+#[test]
+fn receive_child_claimed_during_resume_pass_blocks_the_next_sibling() {
+    let source = syn::parse_file(RESUME_OUTER).unwrap();
+    for name in ["drain_hosted_ready", "run_outer"] {
+        let resume = function(&source, name);
+        let loop_body = resume.block.stmts.iter().find_map(|stmt| match stmt {
+            syn::Stmt::Expr(syn::Expr::Loop(loop_expr), _) => Some(&loop_expr.body),
+            _ => None,
+        }).unwrap_or_else(|| panic!("{name} must recheck child ownership each resume iteration"));
+        let Some(syn::Stmt::Expr(syn::Expr::If(guard), _)) = loop_body.stmts.first() else {
+            panic!("{name} must check the claimed child before the next candidate");
+        };
+        let mut condition = Audit::default();
+        condition.visit_expr(&guard.cond);
+        assert!(condition.calls.iter().any(|call| call == "receive_child_pending"),
+            "{name} must observe a child claimed by the preceding provider resume");
+        assert!(matches!(guard.then_branch.stmts.last(), Some(syn::Stmt::Expr(
+            syn::Expr::Break(_), _
+        ))), "{name} must leave the resume pass while the exact child is pending");
+        let mut remainder = Audit::default();
+        for stmt in loop_body.stmts.iter().skip(1) {
+            remainder.visit_stmt(stmt);
+        }
+        assert!(remainder.calls.iter().any(|call| call == "next_in_pass"),
+            "{name} must select its next candidate only after the child check");
+    }
 }
 
 #[test]
@@ -390,6 +535,113 @@ fn receive_admission_requires_resident_snapshot_and_actual_vspace_separation_bef
         call_position(&current, "capture_process_identity")
             < call_position(&current, "validate_pair")
     );
+}
+
+#[test]
+fn receive_guard_fault_uses_the_same_sealed_child_and_root_stack_policy() {
+    let source = syn::parse_file(RECEIVE).unwrap();
+    let prepare = audit(function(&source, "prepare_receive_yield"));
+    let park = call_position(&prepare, "park_current");
+    assert!(call_position(&prepare, "stack_guard_fault_candidate") < park);
+    assert!(call_position(&prepare, "validate_pair") < park);
+    assert!(call_position(&prepare, "prepare_receive_settlement") < park);
+
+    let candidate = audit(function(&source, "stack_guard_fault_candidate"));
+    assert!(call_position(&candidate, "hosted_thread_user_stack_for_binding")
+        < call_position(&candidate, "extent_at"));
+    let runtime = syn::parse_file(HOSTED_RUNTIME).unwrap();
+    let stack = audit(function(&runtime, "hosted_thread_user_stack_for_binding"));
+    call_position(&stack, "executable_by_badge");
+    call_position(&stack, "binding");
+    assert!(stack.fields.iter().any(|field| field == "user_stack_allocation_base"));
+    assert!(stack.fields.iter().any(|field| field == "user_stack_base"));
+
+    let hosted = syn::parse_file(HOSTED).unwrap();
+    let settlement = audit(function(&hosted, "receive_child_observation"));
+    assert!(settlement.fields.iter().any(|field| field == "observation"));
+    assert!(settlement.calls.iter().any(|call| call == "admission_key"));
+
+    let root = syn::parse_file(include_str!("../../../components/ntos-executive/src/service_sec_image.rs")).unwrap();
+    let service = audit(function(&root, "service_receive_child_fault"));
+    call_position(&service, "service_hosted_stack_growth");
+    call_position(&service, "service_captured_private_read_fault");
+    assert!(service.variants.iter().any(|variant| variant == "StackGuard"));
+    assert!(service.variants.iter().any(|variant| variant == "Grown"));
+}
+
+#[test]
+fn receive_native_image_read_and_execute_are_deny_only_typed_child_captures() {
+    let source = syn::parse_file(RECEIVE).unwrap();
+    let prepare = audit(function(&source, "prepare_receive_yield"));
+    assert!(call_position(&prepare, "native_image_fault_candidate")
+        < call_position(&prepare, "park_current"));
+    assert!(prepare.variants.iter().any(|variant| variant == "NativeImage"));
+
+    let candidate = audit(function(&source, "native_image_fault_candidate"));
+    assert!(candidate.fields.iter().any(|field| field == "process"));
+    call_position(&candidate, "x86_user_image_receive_fault");
+    call_position(&candidate, "process_committed_mapping_basic_information");
+    assert!(candidate.variants.iter().any(|variant| variant == "MEM_IMAGE"));
+    assert!(candidate.variants.iter().any(|variant| variant == "MEM_COMMIT"));
+
+    struct RootImageAccess(bool);
+    impl<'ast> Visit<'ast> for RootImageAccess {
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if call.method == "service_native_image_page_residency" {
+                self.0 |= call.args.iter().nth(2).is_some_and(|argument| {
+                    matches!(argument, syn::Expr::Field(field)
+                        if matches!(&field.member, syn::Member::Named(name) if name == "access")
+                            && matches!(field.base.as_ref(), syn::Expr::Path(path)
+                                if path.path.is_ident("image")))
+                });
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+    let root = syn::parse_file(include_str!("../../../components/ntos-executive/src/service_sec_image.rs")).unwrap();
+    let mut root_access = RootImageAccess(false);
+    root_access.visit_item_fn(function(&root, "service_receive_child_fault"));
+    assert!(root_access.0, "root must use the validated captured read or execute access");
+}
+
+#[test]
+fn receive_native_image_writecopy_carries_protection_observation_to_exact_root_view() {
+    let source = syn::parse_file(RECEIVE).unwrap();
+    let candidate = audit(function(&source, "native_image_fault_candidate"));
+    call_position(&candidate, "x86_user_image_receive_fault");
+    call_position(&candidate, "process_committed_mapping_basic_information");
+    let capture = source.items.iter().find_map(|item| match item {
+        Item::Struct(row) if row.ident == "NativeImageFaultCapture" => Some(row),
+        _ => None,
+    }).expect("typed image child capture");
+    assert!(capture.fields.iter().any(|field| field.ident.as_ref().is_some_and(|name| name == "observation")));
+
+    let root = syn::parse_file(include_str!("../../../components/ntos-executive/src/service_sec_image.rs")).unwrap();
+    let service = audit(function(&root, "service_receive_child_fault"));
+    call_position(&service, "capture_process_identity");
+    call_position(&service, "process_committed_mapping_basic_information");
+    assert!(service.fields.iter().any(|field| field == "information"),
+        "root must reject a mapping changed since the child capture");
+    assert!(service.fields.iter().any(|field| field == "observation"),
+        "root must pass the captured Protection observation to the image pager");
+    call_position(&service, "service_native_image_page_residency");
+}
+
+#[test]
+fn receive_image_fault_routes_exact_main_executable_after_native_view_miss() {
+    let root = syn::parse_file(SERVICE_LOOP).unwrap();
+    let receive = audit(function(&root, "service_receive_child_fault"));
+    let native = call_position(&receive, "service_native_image_page_residency");
+    let legacy = call_position(&receive, "service_legacy_image_page_residency");
+    assert!(native < legacy, "a native Section view retains first ownership claim");
+    assert!(receive.fields.iter().any(|field| field == "observation"));
+
+    let legacy_service = audit(function(&root, "service_legacy_image_page_residency"));
+    for required in ["for_process", "process_committed_image_allocation",
+        "capture", "pe_by_pi", "legacy_image_receive_fault_status",
+        "service_image_page_residency"] {
+        call_position(&legacy_service, required);
+    }
 }
 
 #[test]

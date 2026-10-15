@@ -562,10 +562,20 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler, queue: &mut nt_delay_e
 }
 
 /// Bootstrap and provider pumps may progress provider work without inventing a hosted handler.
+#[inline(never)]
 pub(crate) unsafe fn redrive_provider() {
+    // Keep the common empty/already-running path out of redrive_inner's large Work frame.
+    // Nested hosted pumps can reach this call several times on the rootserver stack.
+    if PENDING.load(Ordering::Acquire) == 0
+        || monotonic_time_100ns() < NEXT.load(Ordering::Acquire)
+        || ACTIVE.load(Ordering::Acquire)
+    {
+        return;
+    }
     redrive_inner(None);
 }
 
+#[inline(never)]
 unsafe fn redrive_inner(mut context: HostedContext<'_>) {
     if PENDING.load(Ordering::Acquire) == 0
         || monotonic_time_100ns() < NEXT.load(Ordering::Acquire)

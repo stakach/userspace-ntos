@@ -146,6 +146,8 @@ pub enum HostedIrqServiceKind {
     /// Port DPC calls the generation-bound class service thunk. Root must capture both the
     /// input records and consumed-count output before scheduling class-domain execution.
     ClassServiceRequest = 8,
+    TimerCancel = 9,
+    TimerSet = 10,
 }
 
 impl HostedIrqServiceKind {
@@ -159,6 +161,8 @@ impl HostedIrqServiceKind {
             6 => Some(Self::Mdl),
             7 => Some(Self::PoolRetirement),
             8 => Some(Self::ClassServiceRequest),
+            9 => Some(Self::TimerCancel),
+            10 => Some(Self::TimerSet),
             _ => None,
         }
     }
@@ -502,6 +506,19 @@ impl HostedIrqServiceCommand {
                         && matches!(self.arguments[0], 2 | 3)
                         && self.arguments[1] != 0
                         && self.arguments[2..].iter().all(|argument| *argument == 0)
+                }
+                HostedIrqServiceKind::TimerCancel => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 1
+                        && self.arguments[0] != 0
+                        && self.arguments[1..].iter().all(|argument| *argument == 0)
+                }
+                HostedIrqServiceKind::TimerSet => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 4
+                        && self.arguments[0] != 0
+                        && self.arguments[2] <= u32::MAX as u64
+                        && self.arguments[4..].iter().all(|argument| *argument == 0)
                 }
                 HostedIrqServiceKind::ProviderImport
                 | HostedIrqServiceKind::ProviderCallbackRequest => {
@@ -1435,7 +1452,8 @@ struct HostedIrqSlotPage {
     result_faulted: AtomicU32,
     result_values: [AtomicU64; HOSTED_IRQ_ARENA_RESULT_CAP],
     marshal: UnsafeCell<[u8; HOSTED_IRQ_ARENA_MARSHAL_BYTES]>,
-    padding: [u8; 1768],
+    last_ack_sequence: AtomicU64,
+    padding: [u8; 1760],
 }
 
 // The page state machine is the synchronization boundary for the shared marshal bytes. Root is the
@@ -1488,7 +1506,8 @@ impl HostedIrqSlotPage {
             result_faulted: AtomicU32::new(0),
             result_values: [const { AtomicU64::new(0) }; HOSTED_IRQ_ARENA_RESULT_CAP],
             marshal: UnsafeCell::new([0; HOSTED_IRQ_ARENA_MARSHAL_BYTES]),
-            padding: [0; 1768],
+            last_ack_sequence: AtomicU64::new(0),
+            padding: [0; 1760],
         }
     }
 
@@ -1936,6 +1955,7 @@ impl HostedIrqSlotPage {
             );
             return Err(error);
         }
+        self.last_ack_sequence.store(token.sequence, Ordering::Release);
         self.state.store(SLOT_IDLE, Ordering::Release);
         Ok(())
     }
@@ -2250,6 +2270,30 @@ impl HostedIrqServicePage {
         self.0
             .acknowledge(control, identity, token, HostedIrqLaneDirection::Service)
     }
+
+    /// Root may retire resources retained across a service only after the worker has
+    /// acknowledged this token. Sequence numbers increase on each reuse of the slot, so a
+    /// later acknowledged service also proves every earlier service was acknowledged.
+    pub fn root_acknowledged(
+        &self,
+        identity: HostedIrqLaneIdentity,
+        token: HostedIrqArenaToken,
+    ) -> Result<bool, HostedIrqArenaError> {
+        if self.0.identity() != Some(identity) {
+            return Err(HostedIrqArenaError::InvalidIdentity);
+        }
+        if token.direction != HostedIrqLaneDirection::Service
+            || self.0.direction as u32 != HostedIrqLaneDirection::Service as u32
+            || token.lane_generation != identity.lane_generation
+            || token.transaction == 0
+            || token.sequence == 0
+            || token.depth as usize >= HOSTED_IRQ_ARENA_DEPTH
+            || self.0.depth.load(Ordering::Acquire) != token.depth as u32
+        {
+            return Err(HostedIrqArenaError::StaleToken);
+        }
+        Ok(self.0.last_ack_sequence.load(Ordering::Acquire) >= token.sequence)
+    }
 }
 
 /// Aggregate pointer view of the fixed 33-page mapping. It intentionally has no constructor: the
@@ -2422,7 +2466,9 @@ mod tests {
             Some(HostedIrqServiceKind::PoolRetirement)
         );
         assert_eq!(HostedIrqServiceKind::from_raw(8), Some(HostedIrqServiceKind::ClassServiceRequest));
-        assert_eq!(HostedIrqServiceKind::from_raw(9), None);
+        assert_eq!(HostedIrqServiceKind::from_raw(9), Some(HostedIrqServiceKind::TimerCancel));
+        assert_eq!(HostedIrqServiceKind::from_raw(10), Some(HostedIrqServiceKind::TimerSet));
+        assert_eq!(HostedIrqServiceKind::from_raw(11), None);
         assert!(HostedIrqServiceKind::ProviderCallbackRequest.may_request_nested_dispatch());
         assert!(HostedIrqServiceKind::ClassServiceRequest.may_request_nested_dispatch());
         assert!(!HostedIrqServiceKind::ProviderImport.may_request_nested_dispatch());
@@ -2482,6 +2528,39 @@ mod tests {
         assert!(class.valid());
         class.arguments[4] = 1;
         assert!(!class.valid());
+    }
+
+    #[test]
+    fn irq_timer_services_keep_cancel_and_set_arguments_distinct() {
+        let cancel_kind = HostedIrqServiceKind::from_raw(9).expect("typed IRQ timer cancel");
+        let set_kind = HostedIrqServiceKind::from_raw(10).expect("typed IRQ timer set");
+        assert_ne!(cancel_kind, set_kind);
+        assert!(!cancel_kind.may_request_nested_dispatch());
+        assert!(!set_kind.may_request_nested_dispatch());
+
+        let mut cancel = service();
+        cancel.kind = cancel_kind;
+        cancel.authority_cookie = 0;
+        cancel.argument_count = 1;
+        cancel.arguments = [0x2000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(cancel.valid());
+        cancel.arguments[1] = 1;
+        assert!(!cancel.valid(), "cancel must not carry hidden arguments");
+        cancel.arguments[1] = 0;
+        cancel.arguments[0] = 0;
+        assert!(!cancel.valid(), "cancel needs an exact timer object");
+
+        let mut set = service();
+        set.kind = set_kind;
+        set.authority_cookie = 0;
+        set.argument_count = 4;
+        set.arguments = [0x2000, (-15_000_000i64) as u64, 0, 0x3000, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(set.valid());
+        set.arguments[0] = 0;
+        assert!(!set.valid(), "set needs an exact timer object");
+        set.arguments[0] = 0x2000;
+        set.arguments[4] = 1;
+        assert!(!set.valid(), "set must not carry hidden arguments");
     }
 
     fn service() -> HostedIrqServiceCommand {
@@ -2821,8 +2900,25 @@ mod tests {
         service_page
             .root_complete(&control, identity(), service_token, success(0x55))
             .unwrap();
+        assert_eq!(service_page.root_acknowledged(identity(), service_token), Ok(false));
         service_page
             .worker_acknowledge(&control, identity(), service_token)
+            .unwrap();
+        assert_eq!(service_page.root_acknowledged(identity(), service_token), Ok(true));
+        let mut wrong_depth = service_token;
+        wrong_depth.depth = 1;
+        assert_eq!(service_page.root_acknowledged(identity(), wrong_depth), Err(HostedIrqArenaError::StaleToken));
+        let next_token = service_page
+            .worker_publish(&control, identity(), transaction, 0, service())
+            .unwrap();
+        assert_eq!(service_page.root_acknowledged(identity(), service_token), Ok(true));
+        assert_eq!(service_page.root_acknowledged(identity(), next_token), Ok(false));
+        service_page.root_begin(&control, identity(), next_token).unwrap();
+        service_page
+            .root_complete(&control, identity(), next_token, success(0))
+            .unwrap();
+        service_page
+            .worker_acknowledge(&control, identity(), next_token)
             .unwrap();
         dispatch_page
             .worker_complete(&control, identity(), dispatch_token, success(1))

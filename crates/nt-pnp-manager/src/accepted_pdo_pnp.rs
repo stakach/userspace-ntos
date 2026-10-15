@@ -11,8 +11,9 @@ use nt_io_manager::{
     hosted_forward_target::HostedForwardTarget, CompletedIrp, CompletionAcknowledgement, DeviceId,
     DispatchContext, ExternalPnpCompletionInvocation, ExternalPnpCompletionReturn,
     ExternalPnpDispatchResult, ExternalPnpFinishResult, ExternalPnpInvocation, ExternalPnpReturn,
-    ExternalPnpTerminalReceipt, IoManager, IrpId, IrpProjection, ObjectManagerPort,
-    PnpBackendDispatch, PnpParameters, PreparedExternalPnpIrp, RetainedExternalPnp,
+    ExternalPnpFilterCompletionInvocation, ExternalPnpFilterCompletionReturn,
+    ExternalPnpFilterOutput, ExternalPnpTerminalReceipt, IoManager, IrpId, IrpProjection,
+    ObjectManagerPort, PnpBackendDispatch, PnpParameters, PreparedExternalPnpIrp, RetainedExternalPnp,
 };
 use nt_status::NtStatus;
 use nt_types::ClientId;
@@ -52,7 +53,10 @@ impl AcceptedPdoLowerFilterProof {
         if identity.minor != nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS {
             return Err(AcceptedPdoLowerFilterProofError::InvalidMinor);
         }
-        Ok(Self { identity, status: Some(status) })
+        Ok(Self {
+            identity,
+            status: Some(status),
+        })
     }
 
     pub fn take_for(
@@ -62,7 +66,9 @@ impl AcceptedPdoLowerFilterProof {
         if observed != self.identity {
             return Err(AcceptedPdoLowerFilterProofError::WrongIdentity);
         }
-        self.status.take().ok_or(AcceptedPdoLowerFilterProofError::Consumed)
+        self.status
+            .take()
+            .ok_or(AcceptedPdoLowerFilterProofError::Consumed)
     }
 }
 
@@ -191,7 +197,13 @@ pub struct AcceptedPdoPnpReturn {
 pub struct AcceptedPdoPnpCompletionInvocation {
     owner: Owner,
     provider_irp: IrpId,
-    invocation: ExternalPnpCompletionInvocation,
+    invocation: AcceptedPdoCompletionInvocation,
+}
+
+#[derive(Debug)]
+enum AcceptedPdoCompletionInvocation {
+    Start(ExternalPnpCompletionInvocation),
+    Filter(ExternalPnpFilterCompletionInvocation),
 }
 
 #[derive(Debug)]
@@ -199,7 +211,13 @@ pub struct AcceptedPdoPnpCompletionInvocation {
 pub struct AcceptedPdoPnpCompletionReturn {
     owner: Owner,
     provider_irp: IrpId,
-    returned: ExternalPnpCompletionReturn,
+    returned: AcceptedPdoCompletionReturn,
+}
+
+#[derive(Debug)]
+enum AcceptedPdoCompletionReturn {
+    Start(ExternalPnpCompletionReturn),
+    Filter(ExternalPnpFilterCompletionReturn),
 }
 
 #[derive(Debug)]
@@ -592,10 +610,10 @@ fn finish_terminal(
     let output_valid = if identity.minor == nt_pnp_abi::IRP_MN_START_DEVICE {
         information == 0
     } else {
-        // ReactOS PCI PDO passes FILTER through, retaining the input-list pointer with
-        // STATUS_NOT_SUPPORTED. A new successful provider allocation must be copied by a
-        // distinct owner before it can be published; this owner deliberately retains it.
-        !status.is_success()
+        // The native completion owner maps only its authenticated borrowed input pointer to
+        // zero canonical Information. A successful new provider allocation remains retained
+        // until a distinct copy-and-release owner can publish its bytes.
+        !status.is_success() || information == 0 && payload.is_none()
     };
     if !valid || !output_valid {
         return AcceptedPdoPnpResult::Rejected {
@@ -635,12 +653,15 @@ impl RetainedAcceptedPdoPnp {
     pub const fn has_rejected_terminal(&self) -> bool {
         self.rejected_receipt.is_some()
     }
+    pub fn rejected_terminal_receipt(&self) -> Option<&ExternalPnpTerminalReceipt> {
+        self.rejected_receipt.as_ref()
+    }
     pub fn rejected_payload(&self) -> Option<&[u8]> {
         self.rejected_payload.as_deref()
     }
 
-    /// Only status-only START has the detached completion ACK contract. A pending FILTER or
-    /// indeterminate provider remains owned until its output and effect can be settled.
+    /// Pending START and FILTER use the same exact completion ACK. FILTER can retire only if its
+    /// terminal carries no new output allocation; uncertain or rejected terminals stay owned.
     pub fn prepare_completion<P: ObjectManagerPort>(
         mut self,
         io: &mut IoManager<P>,
@@ -652,7 +673,15 @@ impl RetainedAcceptedPdoPnp {
         let Some(detached) = self.detached.take() else {
             return Err((AcceptedPdoPnpError::WrongTerminal, self));
         };
-        match io.prepare_external_pnp_completion(detached) {
+        let prepared = if self.owner.identity.minor == nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS {
+            io.prepare_external_pnp_filter_completion(detached, ExternalPnpFilterOutput::Original)
+                .map(AcceptedPdoCompletionInvocation::Filter)
+                .map_err(|(rejection, _)| rejection)
+        } else {
+            io.prepare_external_pnp_completion(detached)
+                .map(AcceptedPdoCompletionInvocation::Start)
+        };
+        match prepared {
             Ok(invocation) => Ok(AcceptedPdoPnpCompletionInvocation {
                 owner: self.owner,
                 provider_irp: self.provider_irp,
@@ -672,10 +701,16 @@ impl AcceptedPdoPnpCompletionInvocation {
         self.owner.identity
     }
     pub fn completion(&self) -> &CompletedIrp {
-        self.invocation.completion()
+        match &self.invocation {
+            AcceptedPdoCompletionInvocation::Start(invocation) => invocation.completion(),
+            AcceptedPdoCompletionInvocation::Filter(invocation) => invocation.completion(),
+        }
     }
     pub fn backend_index(&self) -> usize {
-        self.invocation.backend_index()
+        match &self.invocation {
+            AcceptedPdoCompletionInvocation::Start(invocation) => invocation.backend_index(),
+            AcceptedPdoCompletionInvocation::Filter(invocation) => invocation.backend_index(),
+        }
     }
 
     pub fn invoke<F>(self, invoke: F) -> AcceptedPdoPnpCompletionReturn
@@ -690,7 +725,14 @@ impl AcceptedPdoPnpCompletionInvocation {
         AcceptedPdoPnpCompletionReturn {
             owner,
             provider_irp,
-            returned: invocation.invoke(invoke),
+            returned: match invocation {
+                AcceptedPdoCompletionInvocation::Start(invocation) => {
+                    AcceptedPdoCompletionReturn::Start(invocation.invoke(invoke))
+                }
+                AcceptedPdoCompletionInvocation::Filter(invocation) => {
+                    AcceptedPdoCompletionReturn::Filter(invocation.invoke(invoke))
+                }
+            },
         }
     }
 }
@@ -709,17 +751,33 @@ impl AcceptedPdoPnpCompletionReturn {
             provider_irp,
             returned,
         } = self;
-        let (receipt, _owned_input) = match io.finish_external_pnp_completion(returned) {
+        let settled = match returned {
+            AcceptedPdoCompletionReturn::Start(returned) => io
+                .finish_external_pnp_completion(returned)
+                .map(|(receipt, input)| (receipt, input))
+                .map_err(|rejection| {
+                    (
+                        rejection.status(),
+                        AcceptedPdoCompletionReturn::Start(rejection.into_owner()),
+                    )
+                }),
+            AcceptedPdoCompletionReturn::Filter(returned) => io
+                .finish_external_pnp_filter_completion(returned)
+                .map(|(receipt, input, _output)| (receipt, input))
+                .map_err(|rejection| {
+                    (
+                        rejection.status(),
+                        AcceptedPdoCompletionReturn::Filter(rejection.into_owner()),
+                    )
+                }),
+        };
+        let (receipt, _owned_input) = match settled {
             Ok(terminal) => terminal,
-            Err(rejection) => {
+            Err((status, returned)) => {
                 return Err(AcceptedPdoPnpCompletionRejection {
-                    error: AcceptedPdoPnpError::Provider(rejection.status()),
-                    returned: Self {
-                        owner,
-                        provider_irp,
-                        returned: rejection.into_owner(),
-                    },
-                })
+                    error: AcceptedPdoPnpError::Provider(status),
+                    returned: Self { owner, provider_irp, returned },
+                });
             }
         };
         let result = finish_terminal(

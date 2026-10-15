@@ -1201,7 +1201,28 @@ fn component_expected_owner(
         PendingComponentDispatch::Provider(pending) => provider_wait_expected_owner(pending),
         PendingComponentDispatch::Lpc(pending) => lpc_wait_expected_owner(pending),
         PendingComponentDispatch::Receive(pending) => Some(pending.yielded.owner),
+        PendingComponentDispatch::ServiceWait(pending) => service_wait_expected_owner(pending),
     }
+}
+
+fn service_wait_expected_owner(
+    pending: win32k_glue::PendingServiceWaitDispatch,
+) -> Option<nt_provider_wait::ProviderWaitOwner> {
+    let identity = crate::current_win32k_provider_domain()?;
+    let owner = nt_provider_wait::ProviderWaitOwner {
+        provider_domain: identity.domain,
+        provider_generation: identity.generation,
+        caller: nt_component_suspension::SuspensionCaller::Hosted(
+            nt_component_suspension::SuspensionHostedClient {
+                client_pi: pending.client.pi,
+                client_generation: pending.client.generation,
+                client_tid: pending.client.tid,
+                client_badge: pending.client.badge,
+            },
+        ),
+        dispatch_id: pending.dispatch.dispatch_id,
+    };
+    owner.is_valid().then_some(owner)
 }
 
 fn provider_wait_key(wait_id: u64) -> nt_component_suspension::SuspensionKey {
@@ -1220,6 +1241,9 @@ fn component_suspension_key(
         }
         PendingComponentDispatch::Receive(pending) => {
             nt_component_suspension::SuspensionKey::receive(pending.yielded.child.admission_sequence())
+        }
+        PendingComponentDispatch::ServiceWait(pending) => {
+            nt_component_suspension::SuspensionKey::service_wait(pending.yielded.token)
         }
     }
 }
@@ -1626,11 +1650,17 @@ unsafe fn provider_wait_admit_current(
     true
 }
 
-unsafe fn receive_admit_current(pending: win32k_glue::PendingReceiveDispatch) -> bool {
-    if pending.yielded.replaces.is_some() { return false; }
-    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else { return false; };
-    let Ok(return_target) = HostedReturnTarget::new(REPLY_MAIN_SLOT.load(Ordering::Relaxed), None)
-        else { return false; };
+unsafe fn receive_admit_retained(
+    pending: win32k_glue::PendingReceiveDispatch,
+    reply_cap: u64,
+    callback_transfer: Option<ComponentCallbackTransfer>,
+) -> bool {
+    if pending.yielded.replaces.is_some()
+        || pending.callback_token != callback_transfer.map(|transfer| transfer.token)
+    { return false; }
+    let Ok(return_target) = HostedReturnTarget::new(
+        reply_cap, callback_transfer.map(|transfer| transfer.context),
+    ) else { return false; };
     let key = nt_component_suspension::SuspensionKey::receive(pending.yielded.child.admission_sequence());
     let sequence = next_dispatcher_wait_sequence();
     let continuation = ComponentNativeContinuation::Hosted(HostedNativeContinuation {
@@ -1638,13 +1668,76 @@ unsafe fn receive_admit_current(pending: win32k_glue::PendingReceiveDispatch) ->
     });
     let admitted = crate::spawn_hosts::shared_ingress::owner::runtime::with_bound_receive_scope(
         pending.yielded.parent, |scope| {
-            (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                .admit_receive_owned(scope, key, sequence, pending.yielded.owner,
-                    pending.yielded.child, continuation)
+            let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+            let admitted = if let Some(transfer) = callback_transfer {
+                lanes.transfer_callback_to_receive_owned(
+                    scope, transfer.token, key, sequence, pending.yielded.owner,
+                    pending.yielded.child, continuation,
+                )
+            } else {
+                lanes.admit_receive_owned(
+                    scope, key, sequence, pending.yielded.owner,
+                    pending.yielded.child, continuation,
+                )
+            };
+            admitted
                 .map_err(|_| crate::spawn_hosts::shared_ingress::owner::runtime::Error::Protocol)
         },
     );
-    if admitted.is_err() { return false; }
+    admitted.is_ok()
+}
+
+unsafe fn receive_admit_current(pending: win32k_glue::PendingReceiveDispatch) -> bool {
+    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else { return false; };
+    if pending.callback_token.is_some()
+        || !receive_admit_retained(pending, REPLY_MAIN_SLOT.load(Ordering::Relaxed), None)
+    {
+        return false;
+    }
+    reply_park.commit();
+    true
+}
+
+unsafe fn service_wait_admit_retained(
+    pending: win32k_glue::PendingServiceWaitDispatch,
+    reply_cap: u64,
+    callback_transfer: Option<ComponentCallbackTransfer>,
+) -> bool {
+    if pending.callback_token != callback_transfer.map(|transfer| transfer.token) {
+        return false;
+    }
+    let Ok(return_target) = HostedReturnTarget::new(
+        reply_cap, callback_transfer.map(|transfer| transfer.context),
+    ) else { return false; };
+    let Some(owner) = service_wait_expected_owner(pending) else { return false; };
+    let yielded = pending.yielded;
+    let key = nt_component_suspension::SuspensionKey::service_wait(yielded.token);
+    let sequence = next_dispatcher_wait_sequence();
+    let continuation = ComponentNativeContinuation::Hosted(HostedNativeContinuation {
+        pending: PendingComponentDispatch::ServiceWait(pending), return_target,
+    });
+    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+    let admitted = if let Some(transfer) = callback_transfer {
+        lanes.transfer_callback_to_service_wait_external_owned(
+            yielded.route.identity().lane, yielded.reply, yielded.dispatch,
+            transfer.token, yielded.token, key, sequence, owner, continuation,
+        )
+    } else {
+        lanes.admit_service_wait_external_owned(
+            yielded.route.identity().lane, yielded.reply, yielded.dispatch,
+            yielded.token, key, sequence, owner, continuation,
+        )
+    };
+    admitted.is_ok()
+}
+
+unsafe fn service_wait_admit_current(pending: win32k_glue::PendingServiceWaitDispatch) -> bool {
+    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else { return false; };
+    if pending.callback_token.is_some()
+        || !service_wait_admit_retained(pending, REPLY_MAIN_SLOT.load(Ordering::Relaxed), None)
+    {
+        return false;
+    }
     reply_park.commit();
     true
 }
@@ -1757,7 +1850,8 @@ unsafe fn component_suspension_cancel_scope(
             .phase
             .clone();
         let external_cancelled = match wait_key.kind {
-            nt_component_suspension::SuspensionKind::Receive => return false,
+            nt_component_suspension::SuspensionKind::Receive
+            | nt_component_suspension::SuspensionKind::ServiceWait => return false,
             nt_component_suspension::SuspensionKind::ProviderWait => {
                 (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER))
                     .cancel(nt_handler, wait_key.id, 0xC000_0120u32 as i32)
@@ -2138,9 +2232,38 @@ unsafe fn process_completed_user_callback_outer_dispatch(
         );
         observe_completed_dialog_modal_dispatch(dispatch, completion_badge, completion_tid);
     }
+    observe_completed_gdi_batch_flush(nt_handler, dispatch.logical_caller, dispatch.batch_records);
     observe_completed_desktop_dispatch(nt_handler, dispatch.logical_caller,
         dispatch.ssn, dispatch.args, dispatch.status, dispatch.dispatch_return);
     true
+}
+
+/// The provider publishes this count only after its real BatchFlushRoutine and original SSN
+/// return on the same physical lane. Call here after the original Reply/output settlement so a
+/// suspended prelude cannot become desktop evidence.
+fn observe_completed_gdi_batch_flush(
+    nt_handler: &mut ExecNtHandler,
+    original_caller: Option<nt_user_host::provider_logical_caller::ProviderLogicalCaller>,
+    records: u64,
+) {
+    if records == 0 { return; }
+    let Some(caller) = original_caller else { return; };
+    GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed);
+    GDI_BATCH_RECORDS_FLUSHED.fetch_add(records, Ordering::Relaxed);
+    nt_handler.observe_desktop_gui_for(caller, DesktopGuiFact::BatchFlush, 1);
+    nt_handler.observe_desktop_gui_for(caller, DesktopGuiFact::BatchRecords, records);
+    let explorer = hosted_process_runtime_for_pi(caller.pi())
+        .is_some_and(|runtime| {
+            runtime.observation_role == nt_exe_image::HostedProcessRole::InteractiveShell
+                && caller.process().generation
+                    == nt_user_host::process_identity::ProcessGeneration::Hosted(runtime.generation)
+        });
+    if explorer {
+        if EXPLORER_GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed) == 0 {
+            note_boot_progress(BootProgress::ExplorerGdiBatchObserved);
+        }
+        EXPLORER_GDI_BATCH_RECORDS.fetch_add(records, Ordering::Relaxed);
+    }
 }
 
 /// Only settled provider output reaches this boundary, for inline and retained continuations.
@@ -2307,6 +2430,38 @@ unsafe fn drain_deferred_user_callback_returns(
                 } => {
                     assert!(lpc_wait_admit_retained(
                         nt_handler,
+                        pending,
+                        deferred.reply_cap,
+                        Some(ComponentCallbackTransfer {
+                            token: callback_token,
+                            context: callback_context,
+                        }),
+                    ));
+                    retained_reply = true;
+                    let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
+                }
+                win32k_glue::CompletedUserCallback::ReceiveSuspended {
+                    pending,
+                    callback_token,
+                    callback_context,
+                } => {
+                    assert!(receive_admit_retained(
+                        pending,
+                        deferred.reply_cap,
+                        Some(ComponentCallbackTransfer {
+                            token: callback_token,
+                            context: callback_context,
+                        }),
+                    ));
+                    retained_reply = true;
+                    let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
+                }
+                win32k_glue::CompletedUserCallback::ServiceWaitSuspended {
+                    pending,
+                    callback_token,
+                    callback_context,
+                } => {
+                    assert!(service_wait_admit_retained(
                         pending,
                         deferred.reply_cap,
                         Some(ComponentCallbackTransfer {
@@ -3470,7 +3625,7 @@ pub(crate) unsafe fn service_image_page_residency(
     Ok(())
 }
 
-fn vm_fault_access_from_x86_error(error_code: u64) -> nt_address_space::FaultAccess {
+pub(crate) fn vm_fault_access_from_x86_error(error_code: u64) -> nt_address_space::FaultAccess {
     if error_code & 0x10 != 0 {
         nt_address_space::FaultAccess::Execute
     } else if error_code & 0x2 != 0 {
@@ -3479,6 +3634,135 @@ fn vm_fault_access_from_x86_error(error_code: u64) -> nt_address_space::FaultAcc
         nt_address_space::FaultAccess::Read
     }
 }
+
+/// Serve the committed PE images owned by the hosted executable loader or DLL registry.
+/// Native Section views are resolved first by callers; this path keeps the original PE
+/// reader, process generation, VAD, and resident COW backing tied to the selected process.
+pub(crate) unsafe fn service_legacy_image_page_residency(
+    handler: &mut ExecNtHandler,
+    pi: usize,
+    page: u64,
+    access: nt_address_space::FaultAccess,
+    observation: nt_address_space::ImageFaultObservation,
+) -> Result<(), u32> {
+    let ctx = handler.loop_ctx.and_then(|ctx| ctx.for_process(pi))
+        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let target = (&*ctx.procs).get(pi).copied()
+        .filter(|target| target.pml4 != 0 && target.scratch_base != 0)
+        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let process = handler.capture_process_identity(pi)
+        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let allocation = process_committed_image_allocation(pi as u64, page)
+        .ok_or(nt_address_space::STATUS_NOT_COMMITTED)?;
+    let base = allocation.allocation_base;
+    let info = process_committed_mapping_basic_information(pi as u64, page)
+        .ok_or(nt_address_space::STATUS_NOT_COMMITTED)?;
+    let resident_mapping = if observation == nt_address_space::ImageFaultObservation::Protection {
+        (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY))
+            .get(pi as u64, page)
+            .is_some_and(|record| record.is_resident()
+                && record.lifetime == nt_memory_manager::MemoryLifetime::Process(process))
+            || shared_image_mapping_contains_for(pi as u64, process, page)?
+    } else {
+        false
+    };
+    nt_address_space::legacy_image_receive_fault_status(
+        info, base, access, observation, resident_mapping,
+    )?;
+    let _image_reader = if base == target.img_base {
+        let _durable = crate::allocator::enter_durable();
+        let image = (&*ctx.exe_image_catalog).get_by_pi(pi)
+            .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?;
+        Some(crate::hosted_loaded_images::HostedImageReadScope::capture(
+            ctx.hosted_loaded_images, nt_exe_image::SpawnTarget::from_image(image),
+        ).map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?)
+    } else {
+        None
+    };
+    let pe = if base == target.img_base {
+        (&*ctx.hosted_loaded_images).pe_by_pi(pi)
+            .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?
+    } else if !ctx.ntdll_pe.is_null() && base == ctx.nt_base {
+        &*ctx.ntdll_pe
+    } else {
+        let (index, _) = (&*ctx.reg).dll_for_page(pi, base)
+            .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?;
+        ctx.dll_pes().get(index).and_then(|slot| slot.as_ref())
+            .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?
+    };
+    service_image_page_residency(
+        handler, pi, page, base, pe, target.pml4, target.scratch_base,
+        access, observation != nt_address_space::ImageFaultObservation::CopyAccess,
+        &mut *ctx.filled_pages, &mut *ctx.faults,
+    )
+}
+
+/// The outer boundary alone owns the handler and may service a retained Receive child.
+unsafe fn service_receive_child_fault(
+    handler: &mut ExecNtHandler,
+    capture: crate::win32k_glue::ReceiveFaultCapture,
+    binding: nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
+    pml4: u64,
+    scratch_base: u64,
+) -> Result<(), u32> {
+    match capture {
+        crate::win32k_glue::ReceiveFaultCapture::Resident(resident) => {
+            handler.service_captured_private_read_fault(resident, binding)
+        }
+        crate::win32k_glue::ReceiveFaultCapture::StackGuard(guard) => {
+            if guard.child != binding
+                || handler.capture_process_identity(binding.pi) != Some(binding.process)
+            {
+                return Err(nt_process::STATUS_INVALID_HANDLE);
+            }
+            let page = guard.address & !(nt_address_space::PAGE_SIZE - 1);
+            let map = process_vm_region_map(binding.pi)
+                .ok_or(nt_address_space::STATUS_ACCESS_VIOLATION)?;
+            let extent = map.extent_at(page)
+                .ok_or(nt_address_space::STATUS_ACCESS_VIOLATION)?;
+            if extent.allocation_base != guard.allocation_base
+                || extent.type_ != nt_address_space::MEM_PRIVATE
+                || extent.state != nt_address_space::VmExtentState::Committed
+                || map.protection_at(page) != Some(guard.protection)
+            {
+                return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
+            }
+            match crate::hosted_stack_growth::service_hosted_stack_growth(
+                handler,
+                binding.pi,
+                binding.badge,
+                guard.address,
+                pml4,
+                scratch_base,
+                vm_fault_access_from_x86_error(guard.error_code),
+            )? {
+                Some(nt_thread_start::stack_vad::StackVadOutcome::Grown) => Ok(()),
+                _ => Err(nt_address_space::STATUS_ACCESS_VIOLATION),
+            }
+        }
+        crate::win32k_glue::ReceiveFaultCapture::NativeImage(image) => {
+            if image.child != binding
+                || handler.capture_process_identity(binding.pi) != Some(binding.process)
+                || process_committed_mapping_basic_information(binding.pi as u64, image.page)
+                    != Some(image.information)
+            {
+                return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
+            }
+            match handler.service_native_image_page_residency(
+                binding.pi,
+                image.page,
+                image.access,
+                image.observation,
+            )? {
+                Some(()) => Ok(()),
+                None => service_legacy_image_page_residency(
+                    handler, binding.pi, image.page, image.access, image.observation,
+                ),
+            }
+        }
+    }
+}
+
 
 unsafe fn service_private_guard_page_fault(
     nt_handler: &mut ExecNtHandler,
@@ -4954,25 +5238,56 @@ pub(crate) unsafe fn drain_nested_pump_timer_delivery() -> bool {
     true
 }
 
-/// Run locally ready retained File work while the exact parent invocation is parked.
-/// These work runners hold no handler borrow across nested provider dispatch.
+/// CONNECT and HOOK own their source Replies and provider projections directly. Their nested
+/// redrive does not borrow the File handler used by the other hosted work runners.
+unsafe fn redrive_nested_hosted_input_work() -> bool {
+    let start = crate::driver_launch::nested_hosted_start_fdo_ready()
+        && crate::driver_launch::redrive_nested_hosted_start_fdo();
+    let connect = crate::driver_launch::nested_hosted_connect_forward_ready()
+        && crate::driver_launch::redrive_nested_hosted_connect_forward();
+    let hook = crate::driver_launch::nested_hosted_hook_forward_ready()
+        && crate::driver_launch::redrive_nested_hosted_hook_forward();
+    start || connect || hook
+}
+
+/// Run locally ready retained work while the exact parent invocation is parked. The File
+/// handler is required only by runners that actually borrow it across their local step.
 pub(crate) unsafe fn redrive_nested_hosted_file_work() -> bool {
     let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
-    if handler.is_null() { return false; }
-    let create = crate::driver_launch::redrive_nested_hosted_driver_create(handler);
-    let query = crate::driver_launch::redrive_nested_hosted_query_path(handler);
-    let write = crate::driver_launch::redrive_nested_hosted_write(handler);
-    let read = crate::driver_launch::redrive_nested_hosted_read(handler);
-    let flush = crate::driver_launch::redrive_nested_hosted_flush(handler);
-    let query_information = crate::driver_launch::redrive_nested_hosted_query_information(handler);
-    let lower_pnp = crate::driver_launch::redrive_nested_hosted_lower_pnp(handler);
-    let kernel_file_query = crate::driver_launch::redrive_nested_hosted_kernel_file_read_query(handler);
-    let lifecycle = crate::driver_launch::redrive_nested_hosted_file_lifecycle_work();
-    let close = crate::hosted_routed_file_close_work::redrive_nested_ready(handler);
-    let source = crate::driver_launch::redrive_nested_win32k_source_work(handler);
-    let section = crate::provider_section_broker::redrive_nested_ready(handler);
+    if handler.is_null() { return redrive_nested_hosted_input_work(); }
+    // Check each owner just before entering its runner. The runner can reserve a large Work
+    // frame even when it finds no ready row, and this sweep also runs inside nested pumps.
+    let create = crate::driver_launch::nested_hosted_driver_create_ready()
+        && crate::driver_launch::redrive_nested_hosted_driver_create(handler);
+    let query = crate::driver_launch::nested_hosted_query_path_ready()
+        && crate::driver_launch::redrive_nested_hosted_query_path(handler);
+    let write = crate::driver_launch::nested_hosted_write_ready()
+        && crate::driver_launch::redrive_nested_hosted_write(handler);
+    let read = crate::driver_launch::nested_hosted_read_ready()
+        && crate::driver_launch::redrive_nested_hosted_read(handler);
+    let flush = crate::driver_launch::nested_hosted_flush_ready()
+        && crate::driver_launch::redrive_nested_hosted_flush(handler);
+    let query_information = crate::driver_launch::nested_hosted_query_information_ready()
+        && crate::driver_launch::redrive_nested_hosted_query_information(handler);
+    let lower_pnp = crate::driver_launch::nested_hosted_lower_pnp_ready()
+        && crate::driver_launch::redrive_nested_hosted_lower_pnp(handler);
+    let lower_file = crate::driver_launch::nested_hosted_lower_file_ready()
+        && crate::driver_launch::redrive_nested_hosted_lower_file(handler);
+    let input = redrive_nested_hosted_input_work();
+    let kernel_file_query = crate::driver_launch::nested_hosted_kernel_file_read_query_ready()
+        && crate::driver_launch::redrive_nested_hosted_kernel_file_read_query(handler);
+    let win32k_async_read = crate::driver_launch::nested_hosted_win32k_async_read_ready()
+        && crate::driver_launch::redrive_nested_hosted_win32k_async_read(handler);
+    let lifecycle = crate::driver_launch::nested_hosted_file_lifecycle_work_ready()
+        && crate::driver_launch::redrive_nested_hosted_file_lifecycle_work();
+    let close = crate::hosted_routed_file_close_work::nested_work_ready()
+        && crate::hosted_routed_file_close_work::redrive_nested_ready(handler);
+    let source = crate::driver_launch::nested_win32k_source_work_ready()
+        && crate::driver_launch::redrive_nested_win32k_source_work(handler);
+    let section = crate::provider_section_broker::nested_work_ready()
+        && crate::provider_section_broker::redrive_nested_ready(handler);
     crate::provider_mm_section_objects::redrive(handler);
-    create || query || write || read || flush || query_information || lower_pnp || kernel_file_query || lifecycle || close || source || section
+    create || query || write || read || flush || query_information || lower_pnp || lower_file || input || kernel_file_query || win32k_async_read || lifecycle || close || source || section
 }
 
 pub(crate) unsafe fn watchdog_defer_if_hosted_work_can_run(site: &[u8]) -> bool {
@@ -8559,7 +8874,10 @@ pub(crate) unsafe fn service_sec_image(
     // milestone window requests bounded stall validation, not proof of a deadlock. Evaluate it
     // only without an owned client ingress: every accepted Call must reach dispatch and its
     // exact reply/park boundary before validation may stop the service loop.
-    const STALL_BUDGET_100NS: u64 = 45 * 10_000_000; // 45 s of NO forward progress
+    // TCG device setup can spend more than 45 seconds between finite publication
+    // milestones. Keep this diagnostic window finite while the installer frontier
+    // is investigated; the outer boot harness bounds the whole run to one hour.
+    const STALL_BUDGET_100NS: u64 = 180 * 10_000_000;
     let progress_epoch = boot_progress_epoch;
     let mut last_progress_epoch = progress_epoch();
     let mut last_progress_t = monotonic_time_100ns();
@@ -8569,14 +8887,6 @@ pub(crate) unsafe fn service_sec_image(
     // consecutive loop tops to the badge that was serviced in between, and count the iterations.
     let mut census_prev_t = last_progress_t;
     let mut census_prev_badge = usize::MAX;
-    // SLOW-EVENT NAMING. The badge census says WHICH process burned the wall-clock but not WHICH
-    // request did it, and a single loop iteration can run for minutes with nothing else logged —
-    // a silent gap in the serial log with no way to attribute it. Remember the message identity
-    // that is being serviced so the next loop top can name any iteration that ran long.
-    let mut census_prev_mi = 0u64;
-    let mut census_prev_m0 = 0u64;
-    const SLOW_EVENT_100NS: u64 = 10_000_000; // 1 s
-    let mut slow_events_traced = 0u64;
     // …and dump that census every `CENSUS_PERIOD_100NS`, so a boot that never quiesces (killed by
     // the harness at RUNEXIT=124, before the gate/final census ever runs) STILL says where its
     // wall-clock went. Successive dumps turn a runaway into a measurable RATE. The clock is a
@@ -8685,6 +8995,14 @@ pub(crate) unsafe fn service_sec_image(
             };
             (badge, mi, m0, m1, m2, m3) = received;
         }
+        // Receive ownership is captured before any deferred provider, timer, or driver work can
+        // reuse the root TCB's IPC buffer. Fast MRs are already value locals; keep native tail
+        // arguments as values too, instead of reading the live buffer after maintenance.
+        let native_ingress_request = nt_syscall_abi::NativeSyscallRequest::capture(
+            mi,
+            [m0, m1, m2, m3],
+            |index| unsafe { get_recv_mr(index) },
+        );
         // A selected child is serviced before unrelated work can enter the held provider or
         // change its attachment. Its ordinary fault handler still performs fresh admission.
         let ingress;
@@ -8716,7 +9034,10 @@ pub(crate) unsafe fn service_sec_image(
             crate::driver_launch::redrive_hosted_read_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_flush_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_query_information_forward(nt_handler as *mut _);
+            crate::driver_launch::redrive_hosted_connect_forward();
+            crate::driver_launch::redrive_hosted_hook_forward();
             crate::driver_launch::redrive_hosted_lower_pnp_forward(nt_handler as *mut _);
+            crate::driver_launch::redrive_hosted_lower_file_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_accepted_pdo_provider_retirement();
             crate::driver_launch::redrive_hosted_driver_zw_fs_control_file(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_driver_zw_write_file(nt_handler as *mut _);
@@ -8844,24 +9165,10 @@ pub(crate) unsafe fn service_sec_image(
                 if census_prev_badge != usize::MAX {
                     let elapsed = now.wrapping_sub(census_prev_t);
                     BADGE_TIME_100NS[census_prev_badge].fetch_add(elapsed, Ordering::Relaxed);
-                    if elapsed >= SLOW_EVENT_100NS && slow_events_traced < 64 {
-                        slow_events_traced += 1;
-                        print_str(b"[slow-event] badge=");
-                        print_u64(census_prev_badge as u64);
-                        print_str(b" label=0x");
-                        print_hex((census_prev_mi >> 12) as u32);
-                        print_str(b" m0=0x");
-                        print_hex(census_prev_m0 as u32);
-                        print_str(b" took_ms=");
-                        print_u64(elapsed / 10_000);
-                        print_str(b"\n");
-                    }
                 }
                 BADGE_EVENTS[slot].fetch_add(1, Ordering::Relaxed);
                 BADGE_LAST_T[slot].store(now, Ordering::Relaxed);
                 census_prev_badge = slot;
-                census_prev_mi = mi;
-                census_prev_m0 = m0;
                 census_prev_t = now;
                 crate::LOOP_QUIESCE_TICKS.fetch_add(
                     crate::disk_census_ticks().wrapping_sub(quiesce_started),
@@ -8908,7 +9215,7 @@ pub(crate) unsafe fn service_sec_image(
                         procs,
                         pfilled,
                     );
-                    print_str(b"[quiesce] no boot milestone for ~45s wall-clock -> run gate\n");
+                    print_str(b"[quiesce] no boot milestone for ~180s wall-clock -> run gate\n");
                     stop = m1;
                     break;
                 }
@@ -9058,15 +9365,32 @@ pub(crate) unsafe fn service_sec_image(
             stop = durability_status as u64;
             break;
         }
-        // Only this outer owner can leave all executive/scratch borrows before a resume pump.
-        // Any absorbed timer deliveries have already been processed above.
-        component_resume::run_outer(core::ptr::from_mut(&mut *nt_handler));
+        // This delivery still owns its Reply and captured message. An outer resume can select
+        // a different Receive child, so leave that work to a boundary without this ingress.
         } else {
             ingress = Some(nt_handler.admit_hosted_thread_ingress(badge)
                 .expect("selected Receive child retains its current ingress binding"));
             assert!(crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_is_current(
                 ingress.as_ref().unwrap().binding(), REPLY_MAIN_SLOT.load(Ordering::Relaxed),
             ), "only the exact selected Receive child may run while its parent is held");
+        }
+        // Redrive above can select a Receive child after this iteration already admitted an
+        // unrelated delivery. Return that unexecuted Call to its owner and receive the child.
+        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+            && !ingress.as_ref().is_some_and(|admitted| {
+                crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_is_current(
+                    admitted.binding(), REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                )
+            })
+        {
+            if ingress.is_some() {
+                crate::spawn_hosts::shared_ingress::owner::runtime::defer_hosted_delivery(
+                    REPLY_MAIN_SLOT.load(Ordering::Relaxed), badge,
+                ).expect("unexecuted unrelated Call retains its exact ingress owner");
+            }
+            let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+            (badge, mi, m0, m1, m2, m3) = received;
+            continue 'service_loop;
         }
         // Deferred work may retire a process/thread. Revalidate the complete binding before
         // selecting any role, LPC context, stack mirror or process memory state.
@@ -9077,24 +9401,30 @@ pub(crate) unsafe fn service_sec_image(
         if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
             let observed = crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_observation(
                 event_runtime.binding(), REPLY_MAIN_SLOT.load(Ordering::Relaxed),
-            ).expect("selected Receive child owns its exact resident observation");
+            ).expect("selected Receive child owns its exact fault observation");
             assert!(receive_vspace::validate_current(&nt_handler, event_runtime.binding(), observed),
                 "Receive child and held provider require exact distinct current VSpace objects");
-            nt_handler.service_captured_private_read_fault(observed.resident, event_runtime.binding())
-                .expect("changed or uncertain Receive residency retains child Call and parent");
+            service_receive_child_fault(
+                &mut nt_handler,
+                observed.observation,
+                event_runtime.binding(),
+                procs[event_runtime.pi].pml4,
+                procs[event_runtime.pi].scratch_base,
+            )
+            .expect("changed or uncertain Receive fault retains child Call and parent");
             thread_wait_state_clear_badge_running(&mut nt_handler, badge);
             wait_parked = wait_parked_owner_mask(&nt_handler);
             if procs[event_runtime.pi].faults == 0 { procs[event_runtime.pi].first = m1; }
             procs[event_runtime.pi].faults += 1;
             note_boot_progress(BootProgress::PageMappingPublished);
             win32k_glue::trace_receive_phase(
-                b"resident-revalidated",
+                b"fault-serviced",
                 observed.parent,
                 observed.child,
                 observed.trace_owner,
             );
             // No attachment, process scratch, provider, timer or legacy fault policy runs here.
-            // The ordinary canonical pager revalidated the same captured resident frame.
+            // The canonical root pager revalidated the captured resident frame or stack guard.
             let outcome = crate::executive_ingress::reply_receive(
                 REPLY_MAIN_SLOT.load(Ordering::Relaxed), 0, 0, 0, 0, 0,
             );
@@ -10972,18 +11302,20 @@ pub(crate) unsafe fn service_sec_image(
         // result→MR0→the caller's r10, which our native stub reads as NTSTATUS.
         let native_call_transport = (mi >> 12) == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL;
         if native_call_transport {
+            let request = native_ingress_request
+                .expect("native ingress lost its owned argument words");
             const NATIVE_TAIL_STAGE_MR: usize = 32;
             let ssn = m0; // MR0
             let rsp = m1; // MR1 = caller rsp (diagnostics and stack-resident pointer validation)
             let arg1 = m2; // MR2
             let arg2 = m3; // MR3
-            let arg3 = get_recv_mr(4); // MR4 (IPC buffer)
-            let arg4 = get_recv_mr(5); // MR5 (IPC buffer)
+            let arg3 = request.word(4).unwrap_or(0); // MR4 (owned receive)
+            let arg4 = request.word(5).unwrap_or(0); // MR5 (owned receive)
             let request_len = (mi & 0x7f) as usize;
-            for request_mr in 6..request_len {
+            for request_mr in 6..request_len.min(nt_syscall_abi::NT_NATIVE_REQUEST_WORDS) {
                 set_recv_mr(
                     NATIVE_TAIL_STAGE_MR + request_mr - 6,
-                    get_recv_mr(request_mr),
+                    request.word(request_mr).expect("captured native request lost a word"),
                 );
             }
             // Stage the fault-frame register slots the `==2` arm reads: R10@9=arg1, R8@7=arg3,
@@ -11508,6 +11840,82 @@ pub(crate) unsafe fn service_sec_image(
                                     m3 = nm3;
                                     continue;
                                 }
+                                win32k_glue::CompletedUserCallback::ReceiveSuspended {
+                                    pending,
+                                    callback_token,
+                                    callback_context,
+                                } => {
+                                    let dispatch_id = pending.dispatch.dispatch_id;
+                                    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
+                                        panic!("callback Receive must retain its original Reply");
+                                    };
+                                    assert!(receive_admit_retained(
+                                        pending,
+                                        REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                                        Some(ComponentCallbackTransfer {
+                                            token: callback_token,
+                                            context: callback_context,
+                                        }),
+                                    ));
+                                    reply_park.commit();
+                                    procs[pi].faults = faults;
+                                    procs[pi].first = first;
+                                    procs[pi].ntfaults = ntfaults;
+                                    pfilled[pi] = *filled_pages;
+                                    let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
+                                    if component_suspension_owns_hosted_dispatch(dispatch_id) {
+                                        mark_wait_parked!(pi, resume_ip);
+                                    }
+                                    let _ = finalize_service_loop_state(&mut nt_handler);
+                                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                                    let (nb, nmi, nm0, nm1, nm2, nm3) =
+                                        component_recv!(fault_ep, new_reply);
+                                    badge = nb;
+                                    mi = nmi;
+                                    m0 = nm0;
+                                    m1 = nm1;
+                                    m2 = nm2;
+                                    m3 = nm3;
+                                    continue;
+                                }
+                                win32k_glue::CompletedUserCallback::ServiceWaitSuspended {
+                                    pending,
+                                    callback_token,
+                                    callback_context,
+                                } => {
+                                    let dispatch_id = pending.dispatch.dispatch_id;
+                                    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
+                                        panic!("callback service wait must retain its original Reply");
+                                    };
+                                    assert!(service_wait_admit_retained(
+                                        pending,
+                                        REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                                        Some(ComponentCallbackTransfer {
+                                            token: callback_token,
+                                            context: callback_context,
+                                        }),
+                                    ));
+                                    reply_park.commit();
+                                    procs[pi].faults = faults;
+                                    procs[pi].first = first;
+                                    procs[pi].ntfaults = ntfaults;
+                                    pfilled[pi] = *filled_pages;
+                                    let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
+                                    if component_suspension_owns_hosted_dispatch(dispatch_id) {
+                                        mark_wait_parked!(pi, resume_ip);
+                                    }
+                                    let _ = finalize_service_loop_state(&mut nt_handler);
+                                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                                    let (nb, nmi, nm0, nm1, nm2, nm3) =
+                                        component_recv!(fault_ep, new_reply);
+                                    badge = nb;
+                                    mi = nmi;
+                                    m0 = nm0;
+                                    m1 = nm1;
+                                    m2 = nm2;
+                                    m3 = nm3;
+                                    continue;
+                                }
                             };
                             drain_deferred_user_callback_returns(
                                 &mut nt_handler,
@@ -11707,12 +12115,16 @@ pub(crate) unsafe fn service_sec_image(
                         argv[..n].copy_from_slice(&arguments);
                     }
                 } else if native_call_transport {
-                    const NATIVE_TAIL_STAGE_MR: usize = 32;
-                    if (mi & 0x7f) < nt_syscall_abi::native_syscall_request_len(n as u8) {
+                    let request = native_ingress_request
+                        .expect("native dispatch lost its owned argument words");
+                    if request.length() < nt_syscall_abi::native_syscall_request_len(n as u8) as usize
+                        || n > nt_syscall_abi::MAX_STUB_ARGS as usize
+                    {
                         stack_args_valid = false;
                     } else {
-                        for i in 4..n {
-                            argv[i] = get_recv_mr(NATIVE_TAIL_STAGE_MR + i - 4);
+                        for (index, argument) in argv.iter_mut().take(n).enumerate() {
+                            *argument = request.argument(index)
+                                .expect("validated native request lost an argument");
                         }
                     }
                 } else {
@@ -15845,7 +16257,7 @@ pub(crate) unsafe fn service_sec_image(
                     let gdi_teb_alias = dispatch_client.logical_caller
                         .and_then(|logical| nt_handler.hosted_gui_thread_teb_alias_for(logical))
                         .unwrap_or(0);
-                    crate::ke_gdi_flush_user_batch(client, gdi_teb_alias);
+                    crate::observe_gdi_batch_before_dispatch(client, gdi_teb_alias);
                     let open_dcw_staged_stack =
                         m0 == 0x10de && open_dcw_stack_arg_count == open_dcw_stack_args.len();
                     let build_hwnd_list_staged_stack = m0 == 0x101b
@@ -15955,6 +16367,9 @@ pub(crate) unsafe fn service_sec_image(
                         paint_output_claim,
                         client,
                         &mut dispatch_return,
+                    );
+                    let inline_batch_records = win32k_glue::completed_gdi_batch_records(
+                        dispatch_return, r.0, r.1,
                     );
                     if explorer_direct_gdi_draw && r.1 {
                         if EXPLORER_DIRECT_GDI_DRAW_RETURNS.fetch_add(1, Ordering::Relaxed) == 0 {
@@ -16271,6 +16686,8 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                     if r.1 {
+                        observe_completed_gdi_batch_flush(&mut nt_handler, client.logical_caller,
+                            inline_batch_records);
                         observe_completed_desktop_dispatch(&mut nt_handler, client.logical_caller,
                             m0, [a0, a1, a2, a3], r.0, dispatch_return);
                     }
@@ -16414,6 +16831,12 @@ pub(crate) unsafe fn service_sec_image(
                     component_suspension_admitted_dispatch_id = pending.dispatch.dispatch_id;
                     component_suspension_park_request = receive_admit_current(pending);
                     assert!(component_suspension_park_request, "Receive retains parked parent and original client Reply");
+                    redirected_user_callback = true;
+                } else if let Some(pending) = win32k_glue::take_pending_service_wait_dispatch() {
+                    component_suspension_admitted_dispatch_id = pending.dispatch.dispatch_id;
+                    component_suspension_park_request = service_wait_admit_current(pending);
+                    assert!(component_suspension_park_request,
+                        "service wait retains exact external token and original client Reply");
                     redirected_user_callback = true;
                 } else if let Some(pending) = win32k_glue::take_pending_provider_wait_dispatch() {
                     component_suspension_admitted_dispatch_id = pending.dispatch.dispatch_id;
@@ -24223,7 +24646,12 @@ unsafe fn pending_driver_start_transfer(
     };
     nt_handler
         .pending_driver_starts
-        .publish(reservation, PendingDriverStart { batch, owner })
+        .publish(reservation, PendingDriverStart {
+            batch,
+            reservation,
+            bootstrap_predecessors: alloc::vec::Vec::new(),
+            owner,
+        })
         .expect("reserved driver START continuation rejected its exact batch");
     reply_park.commit();
 }
@@ -24338,11 +24766,50 @@ fn record_pending_start_reply(
 unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     let mut completed = 0u64;
     for slot in 0..nt_handler.pending_driver_starts.slot_count() {
+        let bootstrap_barrier = {
+            let table = &nt_handler.pending_driver_starts;
+            let Some(pending) = table.get(slot) else {
+                continue;
+            };
+            if !matches!(&pending.owner, PendingDriverStartOwner::Boot { .. }) {
+                0u8
+            } else if pending.bootstrap_predecessors.iter().any(|predecessor| {
+                table.get_exact(*predecessor).is_some_and(|older| {
+                    matches!(
+                        &older.owner,
+                        PendingDriverStartOwner::Boot {
+                            report_published: true,
+                            ..
+                        }
+                    )
+                })
+            }) {
+                // An uncertain predecessor keeps its exact slot and cannot publish a child PDO.
+                2
+            } else if pending.bootstrap_predecessors.iter().any(|predecessor| {
+                table.get_exact(*predecessor).is_some_and(|older| {
+                    matches!(&older.owner, PendingDriverStartOwner::Boot { .. })
+                })
+            }) {
+                1
+            } else {
+                0
+            }
+        };
+        if bootstrap_barrier == 1 {
+            continue;
+        }
         let progress = {
             let Some(pending) = nt_handler.pending_driver_starts.get_mut(slot) else {
                 continue;
             };
-            pending.batch.drive_after_completion_pump()
+            if bootstrap_barrier == 2 {
+                pending.batch.fail_unentered_bootstrap_barrier(
+                    nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                )
+            } else {
+                pending.batch.drive_after_completion_pump()
+            }
         };
         match progress {
             OwnedHostedPnpStartProgress::AwaitingCompletion => {}
@@ -24528,7 +24995,13 @@ unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u
         return 0;
     };
     let mut progress = 0u64;
+    let mut first_deferred = None;
     for _ in 0..8 {
+        // A terminal bus START can queue its initial relations during the redrive above or
+        // during an earlier iteration. Admit no sibling START before that query dispatches.
+        if driver_launch::hosted_bus_relation_pending() {
+            break;
+        }
         let claim = match driver_launch::claim_hosted_critical_child_start(mount.identity_token()) {
             Ok(Some(claim)) => claim,
             Ok(None) => break,
@@ -24538,7 +25011,12 @@ unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u
             }
             Err(_) => break,
         };
-        progress += 1;
+        // A deferred owner moves to the tail. Stop after one pass over the current queue
+        // rather than reclaiming the same pending batch repeatedly in this pump.
+        if first_deferred == Some(claim.key()) {
+            driver_launch::defer_hosted_critical_child_start(claim);
+            break;
+        }
         let instance = driver_launch::hosted_critical_child_instance_id(claim)
             .expect("critical child claim lost its instance identity");
         print_str(b"[pnp-critical-start] instance=");
@@ -24548,6 +25026,7 @@ unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u
         match nt_pnp_manager::existing_device_start_disposition(state) {
             nt_pnp_manager::ExistingDeviceStartDisposition::AlreadyStarted => {
                 driver_launch::complete_hosted_critical_child_start(claim, 0);
+                progress += 1;
                 continue;
             }
             nt_pnp_manager::ExistingDeviceStartDisposition::Busy => {
@@ -24555,10 +25034,12 @@ unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u
                     claim,
                     nt_status::NtStatus::DEVICE_BUSY.raw() as u32,
                 );
+                progress += 1;
                 continue;
             }
             nt_pnp_manager::ExistingDeviceStartDisposition::NoSuchDevice => {
                 driver_launch::complete_hosted_critical_child_start(claim, 0xC000_000E);
+                progress += 1;
                 continue;
             }
             nt_pnp_manager::ExistingDeviceStartDisposition::RequiresAction => {}
@@ -24575,8 +25056,12 @@ unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u
                 })
         }) {
             driver_launch::defer_hosted_critical_child_start(claim);
-            break;
+            if first_deferred.is_none() {
+                first_deferred = Some(claim.key());
+            }
+            continue;
         }
+        progress += 1;
         let spec = match live_config_existing_device_launch_spec(instance, SERVICE_DEMAND_START) {
             Ok(spec) if spec.class == driver_launch::DriverClass::Device && spec.devnodes.len() == 1 => spec,
             Ok(_) => {
@@ -24657,6 +25142,8 @@ unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u
                     reservation,
                     PendingDriverStart {
                         batch,
+                        reservation,
+                        bootstrap_predecessors: alloc::vec::Vec::new(),
                         owner: PendingDriverStartOwner::CriticalChild { claim: Some(claim) },
                     },
                 ).expect("pending critical START rejected its pre-reserved continuation");
@@ -24667,6 +25154,8 @@ unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u
                     reservation,
                     PendingDriverStart {
                         batch,
+                        reservation,
+                        bootstrap_predecessors: alloc::vec::Vec::new(),
                         owner: PendingDriverStartOwner::CriticalChild { claim: None },
                     },
                 ).expect("uncertain critical START lost its retained continuation");

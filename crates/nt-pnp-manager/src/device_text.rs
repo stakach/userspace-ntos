@@ -16,6 +16,26 @@ pub const DEVICE_TEXT_DESCRIPTION: u32 = 0;
 pub const DEVICE_TEXT_LOCATION_INFORMATION: u32 = 1;
 pub const REG_SZ: u32 = 1;
 
+/// ReactOS PiSetDevNodeText's description when a PDO supplies no device text.
+pub fn reactos_unknown_device_description(
+) -> Result<DeviceTextRegistryValue, DeviceTextPublicationError> {
+    const UNKNOWN_DEVICE: &[u16] = &[
+        0x0055, 0x006e, 0x006b, 0x006e, 0x006f, 0x0077, 0x006e, 0x0020, 0x0064, 0x0065,
+        0x0076, 0x0069, 0x0063, 0x0065, 0,
+    ];
+    let mut data = Vec::new();
+    data.try_reserve_exact(UNKNOWN_DEVICE.len() * 2)
+        .map_err(|_| DeviceTextPublicationError::InsufficientResources)?;
+    for unit in UNKNOWN_DEVICE {
+        data.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(DeviceTextRegistryValue {
+        name: "DeviceDesc",
+        value_type: REG_SZ,
+        data,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceTextPublicationError {
     ForeignOrRetiredTicket,
@@ -163,28 +183,31 @@ pub fn plan_required_device_description(
         read,
         description_exists,
     )?;
+    plan_required_device_description_from_verified_publication(
+        publication,
+        description_exists,
+    )
+}
+
+/// Apply the mandatory description rule to an already verified PDO text result.
+///
+/// A native caller using a different retained-IRP path must authenticate the exact completed
+/// PDO request and copy any returned text from its live physical allocation before calling this.
+/// The returned value belongs in the same durable Enum mutation as the child's arrival action.
+pub fn plan_required_device_description_from_verified_publication(
+    publication: DeviceTextPublication,
+    description_exists: bool,
+) -> Result<DeviceTextPublication, DeviceTextPublicationError> {
     match publication {
         DeviceTextPublication::NoText(NoDeviceText::Unsupported(_))
-        | DeviceTextPublication::NoText(NoDeviceText::Empty) if description_exists => {
+        | DeviceTextPublication::NoText(NoDeviceText::Empty)
+            if description_exists =>
+        {
             Ok(DeviceTextPublication::KeepExistingDescription)
         }
         DeviceTextPublication::NoText(NoDeviceText::Unsupported(_))
         | DeviceTextPublication::NoText(NoDeviceText::Empty) => {
-            let mut data = Vec::new();
-            const UNKNOWN_DEVICE: &[u16] = &[
-                0x0055, 0x006e, 0x006b, 0x006e, 0x006f, 0x0077, 0x006e, 0x0020, 0x0064,
-                0x0065, 0x0076, 0x0069, 0x0063, 0x0065, 0,
-            ];
-            data.try_reserve_exact(UNKNOWN_DEVICE.len() * 2)
-                .map_err(|_| DeviceTextPublicationError::InsufficientResources)?;
-            for unit in UNKNOWN_DEVICE {
-                data.extend_from_slice(&unit.to_le_bytes());
-            }
-            Ok(DeviceTextPublication::Write(DeviceTextRegistryValue {
-                name: "DeviceDesc",
-                value_type: REG_SZ,
-                data,
-            }))
+            Ok(DeviceTextPublication::Write(reactos_unknown_device_description()?))
         }
         other => Ok(other),
     }

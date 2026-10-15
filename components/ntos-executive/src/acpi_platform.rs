@@ -939,6 +939,16 @@ pub(crate) unsafe fn publish_acpi_root_devnode_from_registry_policy(
     let compatible = encode_registry_multi_sz(&[ACPI_ROOT_COMPATIBLE_ID])?;
     let class = encode_registry_sz(&policy.class_guid)?;
     let service = encode_registry_sz(service)?;
+    // The firmware root has no returned PDO text. ReactOS still publishes the mandatory
+    // DeviceDesc before user-mode PnP installation, using its no-text fallback.
+    let description = nt_pnp_manager::device_text::reactos_unknown_device_description()
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let has_description = existing.as_ref().is_some_and(|snapshot| {
+        snapshot
+            .values
+            .iter()
+            .any(|value| value.name.eq_ignore_ascii_case(description.name))
+    });
     let values = [
         (
             "HardwareID",
@@ -960,9 +970,17 @@ pub(crate) unsafe fn publish_acpi_root_devnode_from_registry_policy(
             nt_config_manager::RegistryValueType::Sz as u32,
             service.as_slice(),
         ),
+        (
+            description.name,
+            description.value_type,
+            description.data.as_slice(),
+        ),
     ];
     if existing.as_ref().is_some_and(|snapshot| {
         values.iter().all(|(name, value_type, data)| {
+            if has_description && name.eq_ignore_ascii_case(description.name) {
+                return true;
+            }
             snapshot.values.iter().any(|value| {
                 value.name.eq_ignore_ascii_case(name)
                     && value.value_type == *value_type
@@ -974,7 +992,7 @@ pub(crate) unsafe fn publish_acpi_root_devnode_from_registry_policy(
     }
     let mut mutations = Vec::new();
     mutations
-        .try_reserve_exact(5)
+        .try_reserve_exact(values.len() + usize::from(existing.is_none()))
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     if existing.is_none() {
         mutations.push(nt_config_client::SystemHiveMutation::CreateKey {
@@ -982,6 +1000,18 @@ pub(crate) unsafe fn publish_acpi_root_devnode_from_registry_policy(
         });
     }
     for (name, value_type, data) in values {
+        if has_description && name.eq_ignore_ascii_case(description.name) {
+            continue;
+        }
+        if existing.as_ref().is_some_and(|snapshot| {
+            snapshot.values.iter().any(|value| {
+                value.name.eq_ignore_ascii_case(name)
+                    && value.value_type == value_type
+                    && value.data == data
+            })
+        }) {
+            continue;
+        }
         mutations.push(nt_config_client::SystemHiveMutation::SetValue {
             path: ACPI_ROOT_ENUM_PATH,
             name,

@@ -651,9 +651,9 @@ unsafe fn projected_registration(
     let active = active_hosted_irp_transfer_mut(ch.shared_va, canonical_irp_id)?;
     if !ch.caps.dispatch_server
         || active.source_instance != instance_index
-        || read_volatile((inst.exec_shared_va + SH_REQ_CONTROL_ID) as *const u64)
+        || read_volatile((ch.shared_va + SH_REQ_CONTROL_ID) as *const u64)
             != canonical_irp_id
-        || read_volatile((inst.exec_shared_va + SH_ACTIVE_IRP) as *const u64) != raw_irp
+        || read_volatile((ch.shared_va + SH_ACTIVE_IRP) as *const u64) != raw_irp
     {
         return None;
     }
@@ -761,9 +761,7 @@ pub(super) fn retire_allocation(
             (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get())
         }
         Ok(SourceIrpRetirement::Deferred(ticket)) => (
-            nt_status::NtStatus::PENDING.raw(),
-            ticket.id.get(),
-            ticket.generation.get(),
+            nt_status::NtStatus::PENDING.raw(), ticket.id.get(), ticket.generation.get(),
         ),
         Err(SourceIrpLedgerError::Pinned) => (nt_status::NtStatus::DELETE_PENDING.raw(), 0, 0),
         Err(_) => (STATUS_INVALID_HANDLE, 0, 0),
@@ -957,7 +955,51 @@ pub(super) fn service(
                 replacement: None,
                 replacement_released: false,
             });
+            unsafe { active_hosted_irp_transfer_mut(ch.shared_va, canonical_irp_id) }
+                .expect("registered caller source lost its active dispatch")
+                .source_registered = true;
             (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get())
+        }
+        11 => {
+            // An op6 ticket exists for every projected caller IRP. Only a live physical
+            // forward/StartIo pin requires the inline terminal to use READY publication.
+            let node = component_address;
+            let canonical_irp_id = bytes;
+            let raw_irp = stack_count;
+            let _guard = lock();
+            let Some(row) = caller_projections().iter().find(|row| {
+                row.node == node
+                    && row.canonical_irp_id == canonical_irp_id
+                    && row.allocation.component_address == raw_irp
+                    && row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index)
+            }) else {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            };
+            let node_generation = row.node_generation;
+            let ticket = row.ticket;
+            let allocation = row.allocation;
+            let Some((_, entry)) = (unsafe {
+                projected_node(
+                    instance_index,
+                    node,
+                    canonical_irp_id,
+                    raw_irp,
+                    HOSTED_IRP_COMPLETED_DISPATCH,
+                    Some(node_generation),
+                )
+            }) else {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            };
+            if entry.source_ticket_id != ticket.id.get()
+                || entry.source_ticket_generation != ticket.generation.get()
+            {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            }
+            match ledger().retirement_ready(ticket, allocation) {
+                Ok(()) => (STATUS_SUCCESS, 0, 0),
+                Err(SourceIrpLedgerError::Pinned) => (STATUS_SUCCESS, 1, 0),
+                Err(_) => (STATUS_INVALID_HANDLE, 0, 0),
+            }
         }
         7 | 8 | 9 | 10 => {
             let Some(domain) = instance_domain_identity(inst) else {
@@ -1334,6 +1376,86 @@ pub(super) fn active_caller_projection_matches(
                 && entry.minor == expected_minor
                 && entry.source_ticket_id == row.ticket.id.get()
                 && entry.source_ticket_generation == row.ticket.generation.get()
+        })
+    }
+}
+
+/// Resolve the exact canonical outer IRP while its source packet is still in the
+/// caller's entered dispatch. A raw IRP address or FileId alone cannot identify
+/// this owner after node or pool reuse.
+pub(super) fn active_caller_file_lifecycle_outer(
+    instance_index: usize,
+    ticket: SourceIrpTicket,
+    allocation: SourceIrpAllocation,
+    major: u8,
+    file: nt_io_manager::FileId,
+) -> Option<nt_io_manager::IrpId> {
+    if !matches!(major, major::IRP_MJ_CREATE | major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE)
+        || allocation.owner != SourceIrpOwner::HostedCaller(instance_index)
+    {
+        return None;
+    }
+    let _guard = lock();
+    let row = caller_projections().iter().find(|row| {
+        row.ticket == ticket && row.allocation == allocation && !row.terminal_started
+    })?;
+    let (_, entry) = unsafe {
+        projected_node(
+            instance_index,
+            row.node,
+            row.canonical_irp_id,
+            allocation.component_address,
+            HOSTED_IRP_DISPATCHING,
+            Some(row.node_generation),
+        )
+    }?;
+    if entry.major != major
+        || entry.canonical_file_id != file.0
+        || entry.source_ticket_id != ticket.id.get()
+        || entry.source_ticket_generation != ticket.generation.get()
+        || entry.completion.completed().is_some()
+    {
+        return None;
+    }
+    Some(nt_io_manager::IrpId(row.canonical_irp_id))
+}
+
+/// Bind a nested internal-control lower call to the exact FSD caller packet currently inside
+/// its class MajorFunction. The canonical id, op6 ticket, pending-node generation and raw IRP
+/// must all match; a same-shaped packet at a recycled address cannot borrow this authority.
+pub(super) fn active_caller_internal_control_matches(
+    instance_index: usize,
+    canonical_irp_id: u64,
+    raw_irp: u64,
+    ticket: SourceIrpTicket,
+    allocation: SourceIrpAllocation,
+) -> bool {
+    let _guard = lock();
+    let Some(row) = caller_projections().iter().find(|row| {
+        row.canonical_irp_id == canonical_irp_id
+            && row.allocation.component_address == raw_irp
+            && row.allocation == allocation
+            && row.ticket == ticket
+            && row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index)
+            && !row.terminal_started
+    }) else {
+        return false;
+    };
+    unsafe {
+        projected_node(
+            instance_index,
+            row.node,
+            canonical_irp_id,
+            raw_irp,
+            HOSTED_IRP_DISPATCHING,
+            Some(row.node_generation),
+        )
+        .is_some_and(|(_, entry)| {
+            entry.major == major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+                && entry.control_method == nt_io_abi::ioctl::METHOD_NEITHER as u8
+                && entry.source_ticket_id == ticket.id.get()
+                && entry.source_ticket_generation == ticket.generation.get()
+                && entry.completion.completed().is_none()
         })
     }
 }

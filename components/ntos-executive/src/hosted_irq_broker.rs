@@ -50,6 +50,16 @@ struct HostedIrqRootSession {
         nt_hosted_runtime::HostedIrqGrantIdentity,
     )>,
     service_locks: Vec<InterruptActualLockLease>,
+    class_acks: Vec<ClassCallbackAck>,
+}
+
+struct ClassCallbackAck {
+    cookie: u64,
+    lane: nt_hosted_runtime::HostedIrqLaneIdentity,
+    token: nt_hosted_runtime::HostedIrqArenaToken,
+    grant: nt_hosted_runtime::HostedIrqGrantIdentity,
+    input: hosted_device_allocations::TemporaryPoolPin,
+    output: hosted_irq_stack_lease::IrqStackLeaseId,
 }
 
 fn arena_status(error: nt_hosted_runtime::HostedIrqArenaError) -> nt_status::NtStatus {
@@ -762,6 +772,361 @@ impl HostedIrqRootSession {
         service_result(STATUS_SUCCESS, Some(value))
     }
 
+    unsafe fn class_callback_service(
+        &mut self,
+        lane_index: usize,
+        service: nt_hosted_runtime::HostedIrqArenaToken,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        use nt_io_manager::class_service_callback::{ClassServiceBinding, ClassServiceThunk};
+
+        let source = match self.lane(lane_index) {
+            Ok(lane) => lane,
+            Err(status) => return fatal_service_result(status.raw()),
+        };
+        if self.lanes[lane_index].transaction.class
+            != nt_hosted_runtime::HostedIrqTransactionClass::Dpc
+            || !self.has_dpc_dispatch_grant(source, command.grant)
+            || command.argument_count != 4
+            || command.authority_cookie != command.target_domain_cookie
+            || command.arguments[1] >= command.arguments[2]
+        {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let class_domain = HostedDomainIdentity {
+            domain_id: nt_io_manager::HostedDomainId(command.target_domain_id),
+            cookie: command.target_domain_cookie,
+        };
+        let (port_index, class_index, port_alias, class_main, routine, control) =
+            match hosted_class_callback_thunk::admit_irq_request(
+                command.service_id,
+                class_domain,
+                command.arguments[0],
+            ) {
+                Ok(binding) => binding,
+                Err(status) => return fatal_service_result(status.raw()),
+            };
+        let port_domain = HostedDomainIdentity {
+            domain_id: nt_io_manager::HostedDomainId(source.identity.domain_id),
+            cookie: source.identity.domain_cookie,
+        };
+        if port_index != source.projection_instance
+            || port_alias.domain() != port_domain
+            || class_main.domain() != class_domain
+            || instance(class_index).and_then(instance_domain_identity) != Some(class_domain)
+        {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let Some(target_lane) = hosted_irq_lanes().and_then(|lanes| {
+            lanes.iter().find(|row| {
+                row.projection_instance == class_index
+                    && row.domain == class_domain
+                    && row.state == HostedIrqLaneState::Ready
+            })
+        }) else {
+            return fatal_service_result(nt_status::NtStatus::DEVICE_NOT_CONNECTED.raw());
+        };
+        let target_lane = match lane_view_for_domain(
+            class_index,
+            class_domain,
+            target_lane.identity.lane_generation,
+        ) {
+            Ok(lane) => lane,
+            Err(status) => return fatal_service_result(status.raw()),
+        };
+        let target = match self.prepare_target_lane(
+            target_lane,
+            nt_hosted_runtime::HostedIrqTransactionClass::Callback,
+        ) {
+            Ok(target) => target,
+            Err(status) => return fatal_service_result(status.raw()),
+        };
+        if self.class_acks.try_reserve(1).is_err() {
+            let _ = self.finish_target_lane(target);
+            return fatal_service_result(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        let Some(port_instance) = instance(port_index) else {
+            let _ = self.finish_target_lane(target);
+            return fatal_service_result(nt_status::NtStatus::DEVICE_NOT_CONNECTED.raw());
+        };
+        let length = command.arguments[2] - command.arguments[1];
+        let mut input = match hosted_device_allocations::pin_temporary_pool_range(
+            port_instance,
+            command.arguments[1],
+            length,
+        ) {
+            Ok(pin) => pin,
+            Err(status) => {
+                let _ = self.finish_target_lane(target);
+                return fatal_service_result(status.raw());
+            }
+        };
+        let (output, output_range) = match hosted_irq_stack_lease::capture(
+            port_index,
+            source.identity,
+            service,
+            command,
+            command.arguments[3],
+        ) {
+            Ok(lease) => lease,
+            Err(status) => {
+                let _ = hosted_device_allocations::release_temporary_pool_pin(&mut input);
+                let _ = self.finish_target_lane(target);
+                return fatal_service_result(status.raw());
+            }
+        };
+        let binding = ClassServiceBinding {
+            class: class_main,
+            port: port_alias,
+            control,
+            thunk: ClassServiceThunk {
+                domain: class_domain,
+                address: routine,
+                generation: class_domain.cookie,
+            },
+        };
+        let callback = hosted_class_callback_lane::ClassCallbackRecord {
+            port_domain,
+            class_domain,
+            port_device: port_alias,
+            class_device: class_main,
+            thunk: binding.thunk,
+            input_pin: hosted_class_callback_lane::PortInputPin {
+                domain: port_domain,
+                allocation: input.allocation(),
+            },
+            input_start: command.arguments[1],
+            input_end: command.arguments[2],
+            output_pin: hosted_class_callback_lane::ConsumedOutputPin::IrqStack(output_range),
+            output_address: command.arguments[3],
+            control,
+        };
+        let bytes = match callback.validate(binding) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                let _ = hosted_irq_stack_lease::abort_unentered(
+                    output, source.identity, service, command.grant,
+                );
+                let _ = hosted_device_allocations::release_temporary_pool_pin(&mut input);
+                let _ = self.finish_target_lane(target);
+                return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+            }
+        };
+        let Some(buffer) = hosted_class_callback_thunk::buffer(command.service_id) else {
+            let _ = hosted_irq_stack_lease::abort_unentered(
+                output, source.identity, service, command.grant,
+            );
+            let _ = hosted_device_allocations::release_temporary_pool_pin(&mut input);
+            let _ = self.finish_target_lane(target);
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        let (start, end) = match buffer.stage_pinned_port_range(
+            &input, command.arguments[1], bytes,
+        ) {
+            Ok(range) => range,
+            Err(status) => {
+                buffer.retain_uncertain();
+                let _ = hosted_device_allocations::retain_temporary_pool_pin_uncertain(&input);
+                let _ = hosted_irq_stack_lease::retain_indeterminate(output);
+                let _ = self.finish_target_lane(target);
+                return fatal_service_result(status.raw());
+            }
+        };
+        let consumed_pointer = match buffer.zero_consumed() {
+            Ok(pointer) => pointer,
+            Err(status) => {
+                buffer.retain_uncertain();
+                let _ = hosted_device_allocations::retain_temporary_pool_pin_uncertain(&input);
+                let _ = hosted_irq_stack_lease::retain_indeterminate(output);
+                let _ = self.finish_target_lane(target);
+                return fatal_service_result(status.raw());
+            }
+        };
+        let Some(target_grant) = nt_hosted_runtime::HostedIrqGrantIdentity::for_lane(
+            target_lane.identity, class_main.generation(),
+        ) else {
+            buffer.retain_uncertain();
+            let _ = hosted_device_allocations::retain_temporary_pool_pin_uncertain(&input);
+            let _ = hosted_irq_stack_lease::retain_indeterminate(output);
+            let _ = self.finish_target_lane(target);
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        let mut arguments = [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        arguments[..4].copy_from_slice(&[class_main.address(), start, end, consumed_pointer]);
+        let dispatch = self.dispatch_class_callback(
+            lane_index, service, target, command.service_id, routine, target_grant, arguments,
+        );
+        let finish = self.finish_target_lane(target);
+        let consumed = match (dispatch, finish) {
+            (Ok(()), Ok(())) => match hosted_class_callback_thunk::buffer(command.service_id)
+                .ok_or(nt_status::NtStatus::INVALID_HANDLE)
+                .and_then(|buffer| buffer.read_consumed())
+            {
+                Ok(count) if count <= (bytes / match control {
+                    nt_io_manager::retained_connect_forward::ConnectControl::Keyboard => 12,
+                    nt_io_manager::retained_connect_forward::ConnectControl::Mouse => 24,
+                }) as u32 => count,
+                Ok(_) => {
+                    if let Some(buffer) = hosted_class_callback_thunk::buffer(command.service_id) {
+                        buffer.retain_uncertain();
+                    }
+                    let _ = hosted_device_allocations::retain_temporary_pool_pin_uncertain(&input);
+                    let _ = hosted_irq_stack_lease::retain_indeterminate(output);
+                    hosted_class_callback_thunk::block(command.service_id);
+                    return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+                }
+                Err(status) => {
+                    if let Some(buffer) = hosted_class_callback_thunk::buffer(command.service_id) {
+                        buffer.retain_uncertain();
+                    }
+                    let _ = hosted_device_allocations::retain_temporary_pool_pin_uncertain(&input);
+                    let _ = hosted_irq_stack_lease::retain_indeterminate(output);
+                    hosted_class_callback_thunk::block(command.service_id);
+                    return fatal_service_result(status.raw());
+                }
+            },
+            (Err(status), _) | (_, Err(status)) => {
+                if let Some(buffer) = hosted_class_callback_thunk::buffer(command.service_id) {
+                    buffer.retain_uncertain();
+                }
+                let _ = hosted_device_allocations::retain_temporary_pool_pin_uncertain(&input);
+                let _ = hosted_irq_stack_lease::retain_indeterminate(output);
+                hosted_class_callback_thunk::block(command.service_id);
+                return fatal_service_result(status.raw());
+            }
+        };
+        if let Err(status) = hosted_irq_stack_lease::write_consumed(
+            output, source.identity, service, command.grant, consumed,
+        ) {
+            if let Some(buffer) = hosted_class_callback_thunk::buffer(command.service_id) {
+                buffer.retain_uncertain();
+            }
+            let _ = hosted_device_allocations::retain_temporary_pool_pin_uncertain(&input);
+            let _ = hosted_irq_stack_lease::retain_indeterminate(output);
+            hosted_class_callback_thunk::block(command.service_id);
+            return fatal_service_result(status.raw());
+        }
+        self.class_acks.push(ClassCallbackAck {
+            cookie: command.service_id,
+            lane: source.identity,
+            token: service,
+            grant: command.grant,
+            input,
+            output,
+        });
+        service_result(STATUS_SUCCESS, None)
+    }
+
+    unsafe fn dispatch_class_callback(
+        &mut self,
+        source_index: usize,
+        service: nt_hosted_runtime::HostedIrqArenaToken,
+        target: HostedIrqPreparedTarget,
+        cookie: u64,
+        routine: u64,
+        grant: nt_hosted_runtime::HostedIrqGrantIdentity,
+        arguments: [u64; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP],
+    ) -> Result<(), nt_status::NtStatus> {
+        let lane = self.lane(target.lane_index)?;
+        self.call_frames
+            .try_reserve(1)
+            .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        let transaction = self.lanes[target.lane_index].transaction;
+        let dispatch = lane.arena().dispatch[target.depth as usize]
+            .root_publish(
+                &lane.arena().control,
+                lane.identity,
+                transaction,
+                target.depth,
+                nt_hosted_runtime::HostedIrqDispatchCommand {
+                    kind: nt_hosted_runtime::HostedIrqDispatchKind::ClassServiceCallback,
+                    work_id: cookie,
+                    routine,
+                    object: 0,
+                    context: 0,
+                    entry_irql: DISPATCH_LEVEL,
+                    synchronize_irql: DISPATCH_LEVEL,
+                    grant,
+                    argument_count: 4,
+                    arguments,
+                },
+            )
+            .map_err(arena_status)?;
+        let frame = self.push_call_frame(source_index, service, target.lane_index, dispatch)?;
+        let result = self.drive_dispatch(target.lane_index, dispatch);
+        let pop = self.pop_call_frame(frame);
+        let result = result?;
+        pop?;
+        if result.faulted || result.status != STATUS_SUCCESS || result.value_count != 0 {
+            return Err(if result.status == STATUS_SUCCESS {
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST
+            } else {
+                nt_status::NtStatus(result.status)
+            });
+        }
+        Ok(())
+    }
+
+    fn quarantine_class_ack(&mut self, index: usize) {
+        let receipt = self.class_acks.swap_remove(index);
+        if let Some(buffer) = hosted_class_callback_thunk::buffer(receipt.cookie) {
+            buffer.retain_uncertain();
+        }
+        let _ = hosted_device_allocations::retain_temporary_pool_pin_uncertain(&receipt.input);
+        let _ = hosted_irq_stack_lease::retain_indeterminate(receipt.output);
+        hosted_class_callback_thunk::block(receipt.cookie);
+    }
+
+    fn quarantine_unacknowledged_class_callbacks(&mut self) -> bool {
+        let leaked = !self.class_acks.is_empty();
+        while !self.class_acks.is_empty() {
+            self.quarantine_class_ack(self.class_acks.len() - 1);
+        }
+        leaked
+    }
+
+    unsafe fn retire_class_ack(
+        &mut self,
+        index: usize,
+        source: HostedIrqLaneView,
+    ) -> Result<(), nt_status::NtStatus> {
+        use nt_io_manager::CompletionAcknowledgement;
+
+        let receipt = &self.class_acks[index];
+        let acknowledged = source.arena().service[receipt.token.depth as usize]
+            .root_acknowledged(source.identity, receipt.token)
+            .map_err(arena_status)?;
+        if !acknowledged || receipt.lane != source.identity {
+            self.quarantine_class_ack(index);
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        let receipt = &self.class_acks[index];
+        if !hosted_irq_stack_lease::release_after_ack(
+            receipt.output,
+            receipt.lane,
+            receipt.token,
+            receipt.grant,
+            CompletionAcknowledgement::Acknowledged,
+        ) {
+            self.quarantine_class_ack(index);
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
+        let cookie = self.class_acks[index].cookie;
+        if hosted_class_callback_thunk::buffer(cookie)
+            .is_none_or(|buffer| buffer.acknowledge_callback().is_err()) {
+            self.quarantine_class_ack(index);
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
+        if let Err(status) = hosted_device_allocations::release_temporary_pool_pin(
+            &mut self.class_acks[index].input,
+        ) {
+            self.quarantine_class_ack(index);
+            return Err(status);
+        }
+        self.class_acks.swap_remove(index);
+        Ok(())
+    }
+
     unsafe fn record_fault(
         &self,
         lane_index: usize,
@@ -1042,6 +1407,53 @@ impl HostedIrqRootSession {
         service_result(status, None)
     }
 
+    unsafe fn timer_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let Ok(lane) = self.lane(lane_index) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        let (service_id, argument_count) = match command.kind {
+            nt_hosted_runtime::HostedIrqServiceKind::TimerCancel =>
+                (FSD_SERVICE_KE_CANCEL_TIMER_LABEL, 1),
+            nt_hosted_runtime::HostedIrqServiceKind::TimerSet =>
+                (FSD_SERVICE_KE_SET_TIMER_LABEL, 4),
+            _ => return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST),
+        };
+        if command.service_id != service_id
+            || command.target_domain_id != lane.identity.domain_id
+            || command.target_domain_cookie != lane.identity.domain_cookie
+            || command.authority_cookie != 0
+            || command.argument_count != argument_count
+            || command.arguments[0] == 0
+            || (argument_count == 1 && command.arguments[1..].iter().any(|arg| *arg != 0))
+            || (argument_count == 4 && (command.arguments[2] > u32::MAX as u64
+                || command.arguments[4..].iter().any(|arg| *arg != 0)))
+        {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let root_dpc_grant = self.has_dpc_dispatch_grant(lane, command.grant);
+        if !root_dpc_grant && !lane_has_service_grant(lane, command.grant) {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let previous = service_hosted_irq_lane_timer(
+            lane.projection_instance,
+            lane.identity.domain_id,
+            lane.identity.domain_cookie,
+            command.kind,
+            command.arguments[0],
+            command.arguments[1] as i64,
+            command.arguments[2] as u32,
+            command.arguments[3],
+        );
+        match previous {
+            Ok(previous) => service_result(STATUS_SUCCESS, Some(previous as u64)),
+            Err(status) => fatal_service_result(status.raw()),
+        }
+    }
+
     unsafe fn pool_retirement_service(
         &mut self,
         lane_index: usize,
@@ -1092,6 +1504,10 @@ impl HostedIrqRootSession {
                 self.queue_dpc_service(lane_index, command)
             }
             nt_hosted_runtime::HostedIrqServiceKind::Mdl => self.mdl_service(lane_index, command),
+            nt_hosted_runtime::HostedIrqServiceKind::TimerCancel
+            | nt_hosted_runtime::HostedIrqServiceKind::TimerSet => {
+                self.timer_service(lane_index, command)
+            }
             nt_hosted_runtime::HostedIrqServiceKind::PoolRetirement => {
                 self.pool_retirement_service(lane_index, command)
             }
@@ -1102,9 +1518,7 @@ impl HostedIrqRootSession {
                 self.provider_callback_service(lane_index, service, command)
             }
             nt_hosted_runtime::HostedIrqServiceKind::ClassServiceRequest => {
-                // The callback thunk stays unpublished until the root owns exact port input,
-                // consumed-output and class execution leases for this service.
-                fatal_service_result(STATUS_INVALID_DEVICE_REQUEST)
+                self.class_callback_service(lane_index, service, command)
             }
         }
     }
@@ -1173,10 +1587,38 @@ impl HostedIrqRootSession {
                 command.arguments[..4].try_into().unwrap_or([0; 4]),
             );
         }
-        arena.service[service.depth as usize]
+        if result.status == STATUS_SUCCESS
+            && command.kind == nt_hosted_runtime::HostedIrqServiceKind::ClassServiceRequest
+            && !self.class_acks.iter().any(|receipt| {
+                receipt.lane == lane.identity && receipt.token == service
+            })
+        {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        if let Err(error) = arena.service[service.depth as usize]
             .root_complete(&arena.control, lane.identity, service, result)
-            .map_err(arena_status)?;
-        self.exchange(lane_index, service)
+        {
+            if let Some(index) = self.class_acks.iter().position(|receipt| {
+                receipt.lane == lane.identity && receipt.token == service
+            }) {
+                self.quarantine_class_ack(index);
+            }
+            return Err(arena_status(error));
+        }
+        let exchange = self.exchange(lane_index, service);
+        if let Some(index) = self.class_acks.iter().position(|receipt| {
+            receipt.lane == lane.identity && receipt.token == service
+        }) {
+            if exchange.is_err() || self.retire_class_ack(index, lane).is_err() {
+                if let Some(index) = self.class_acks.iter().position(|receipt| {
+                    receipt.lane == lane.identity && receipt.token == service
+                }) {
+                    self.quarantine_class_ack(index);
+                }
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
+        }
+        exchange
     }
 
     unsafe fn drive_dispatch(
@@ -1313,6 +1755,7 @@ pub(super) unsafe fn dispatch_interrupt(
         outer_lock: Some(outer_lock),
         dpc_grant: None,
         service_locks: Vec::new(),
+        class_acks: Vec::new(),
     };
     let result = session.drive_dispatch(0, dispatch);
     let dispatch_faulted = result
@@ -1332,6 +1775,7 @@ pub(super) unsafe fn dispatch_interrupt(
     }
     let leaked_service_lock = !session.service_locks.is_empty();
     let leaked_recursive_state = !session.call_frames.is_empty() || session.lanes.len() != 1;
+    let leaked_class_callback = session.quarantine_unacknowledged_class_callbacks();
     let service_release = session.release_service_locks();
     if leaked_service_lock {
         session.record_fault(
@@ -1372,7 +1816,7 @@ pub(super) unsafe fn dispatch_interrupt(
     service_release?;
     finish?;
     outer_release?;
-    if leaked_service_lock || leaked_recursive_state || dispatch_faulted {
+    if leaked_service_lock || leaked_recursive_state || leaked_class_callback || dispatch_faulted {
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
     }
     Ok(HostedIrqRootDispatchOutcome::Completed(result))
@@ -1671,10 +2115,12 @@ unsafe fn dispatch_next_dpc(
         outer_lock: None,
         dpc_grant: Some((lane.identity, grant)),
         service_locks: Vec::new(),
+        class_acks: Vec::new(),
     };
     let result = session.drive_dispatch(0, dispatch);
     let leaked_service_lock = !session.service_locks.is_empty();
     let leaked_recursive_state = !session.call_frames.is_empty() || session.lanes.len() != 1;
+    let leaked_class_callback = session.quarantine_unacknowledged_class_callbacks();
     let service_release = session.release_service_locks();
     let finish = arena
         .control
@@ -1704,6 +2150,7 @@ unsafe fn dispatch_next_dpc(
     }
     if leaked_service_lock
         || leaked_recursive_state
+        || leaked_class_callback
         || result.faulted
         || result.status != STATUS_SUCCESS
         || result.value_count != 0

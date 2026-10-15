@@ -54,6 +54,10 @@ impl CapturedConnect {
         self.forward.as_mut()
     }
 
+    pub(super) fn forward_ref(&self) -> Option<&RetainedConnectForward> {
+        self.forward.as_ref()
+    }
+
     pub(super) fn source_pin_owned(&self) -> bool {
         self.source_pinned
     }

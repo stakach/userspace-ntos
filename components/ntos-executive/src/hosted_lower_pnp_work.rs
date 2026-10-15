@@ -46,6 +46,7 @@ static mut WORK: Vec<Option<Work>> = Vec::new();
 static mut EXECUTING: Vec<(usize, DriverInstance, u64)> = Vec::new();
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 
+
 fn status_for_capture(error: hosted_lower_pnp_capture::CaptureError) -> i32 {
     use hosted_lower_pnp_capture::CaptureError;
     match error {
@@ -349,7 +350,8 @@ impl Work {
         let Some(route) = hosted_ingress_sources::primary_route(index) else {
             return true;
         };
-        !matches!(runtime::ready_for_admission(route), Ok(false))
+        let ready = !matches!(runtime::ready_for_admission(route), Ok(false));
+        ready
     }
 
     unsafe fn ready_for_nested_step(&self) -> bool {
@@ -361,6 +363,9 @@ impl Work {
         }
         if self.initial_status.is_none() {
             return self.provider_dispatch_ready();
+        }
+        if self.retained.is_some() {
+            pump_io_manager();
         }
         self.terminal.is_some()
             || self.retained.as_ref().is_some_and(|retained| {
@@ -446,7 +451,9 @@ impl Work {
             return;
         };
         match retained.complete(io_manager_mut(), identity, receipt) {
-            LowerPnpForwardResult::Terminal(terminal) => self.terminal = Some(terminal),
+            LowerPnpForwardResult::Terminal(terminal) => {
+                self.terminal = Some(terminal)
+            }
             LowerPnpForwardResult::Retained(retained)
             | LowerPnpForwardResult::Rejected { retained, .. } => self.retained = Some(retained),
             LowerPnpForwardResult::NotEntered { .. } => {

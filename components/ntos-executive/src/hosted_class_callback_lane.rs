@@ -5,10 +5,9 @@
 //! bytes. The input range is half-open; the output is a four-byte count, often on the port
 //! thread stack. The port's pointers cannot be passed into the class address space.
 //!
-//! This module defines the bounded transport and exact lease witnesses. The executable gate is
-//! deliberately closed until a dedicated port thunk, class execution selector, and IRQ scheduler
-//! path have been connected. In particular, the existing provider/NDIS callback gate is not a
-//! substitute: it has different authority and argument marshalling rules.
+//! This module defines the bounded transport and exact lease witnesses used by the dedicated
+//! port thunk and class IRQ dispatch. The provider/NDIS callback gate has different authority
+//! and argument marshalling rules.
 
 use alloc::vec::Vec;
 use nt_io_manager::{
@@ -185,18 +184,28 @@ impl ClassCallbackMarshal {
     }
 }
 
-/// No constructor yet: no callback can enter class code until a dedicated thunk binds its exact
-/// port publication, class image generation, and IRQ lane transaction to this permit.
+/// Publication receipt for a class callback endpoint. The native thunk owner constructs this
+/// only after its exact reverse aliases and class-domain record buffer are live.
 #[must_use = "retain the exact port and class generations through callback acknowledgement"]
 pub(super) struct ClassCallbackExecutionPermit {
-    // These values are installed only with a routed IRQ class execution lane and exact source
-    // memory leases. There is intentionally no constructor until that native owner exists.
     cookie: u64,
     port_address: u64,
     port_class_alias: HostedDevicePointerRegistration,
 }
 
 impl ClassCallbackExecutionPermit {
+    pub(super) fn installed(
+        cookie: u64,
+        port_address: u64,
+        port_class_alias: HostedDevicePointerRegistration,
+    ) -> Option<Self> {
+        (cookie != 0 && port_address != 0 && port_class_alias.address() != 0).then_some(Self {
+            cookie,
+            port_address,
+            port_class_alias,
+        })
+    }
+
     pub(super) fn verifies(
         &self,
         cookie: u64,

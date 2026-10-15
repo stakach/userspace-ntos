@@ -35,6 +35,7 @@ mod termination_port_notifications;
 use termination_port_notifications::notify_thread_termination_ports;
 pub(crate) use acpi_platform::*;
 mod cm_server;
+mod ring_channel_completion;
 mod cm_key_ownership;
 mod cm_mutation_transport;
 mod registry_mutation_work;
@@ -3392,7 +3393,7 @@ pub(crate) unsafe fn winlogon_credential_observe_text_out(string: u64, count: u6
 /// The same READ-BACK, from UTF-16 bytes already in the executive's hands. `via` names the transport
 /// the render request arrived on, because there are now two REAL ones: a dispatched
 /// `NtGdiExtTextOutW`, and a `GdiBCTextOut` record in the caller's own `GdiTebBatch` (which
-/// `ke_gdi_flush_user_batch` reads through the executive's TEB alias). Both carry the SAME evidence —
+/// `observe_gdi_batch_before_dispatch` reads through the executive's TEB alias). Both carry the SAME evidence —
 /// the live `EDITSTATE.text` buffer the edit control renders — so the assertion is about the
 /// control's content, not about which of gdi32's two code paths happened to carry it.
 pub(crate) unsafe fn winlogon_credential_observe_text_bytes(bytes: &[u8], count: u64, via: &[u8]) {
@@ -7078,6 +7079,34 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
     print_str(b"/");
     print_u64(TIMER_TICKS_SPURIOUS.load(Ordering::Relaxed));
     {
+        let (received, pending, serviced, deferred, acknowledged) =
+            driver_launch::hosted_irq_delivery_census();
+        print_str(b" irq=latched/");
+        print_u64(received);
+        print_str(b" pending/");
+        print_u64(pending);
+        print_str(b" serviced/");
+        print_u64(serviced);
+        print_str(b" deferred/");
+        print_u64(deferred);
+        print_str(b" acked/");
+        print_u64(acknowledged);
+        let (active_irp, active_syscall, active_seh, irq_irp, irq_syscall, irq_seh) =
+            spawn_hosts::pump_receive_census();
+        print_str(b" pump-active=irp/");
+        print_u64(active_irp);
+        print_str(b" syscall/");
+        print_u64(active_syscall);
+        print_str(b" retained-seh/");
+        print_u64(active_seh);
+        print_str(b" irq-pump=irp/");
+        print_u64(irq_irp);
+        print_str(b" syscall/");
+        print_u64(irq_syscall);
+        print_str(b" retained-seh/");
+        print_u64(irq_seh);
+    }
+    {
         let (sw, st, mw, mt, outstanding) = driver_launch::hosted_driver_wait_census();
         print_str(b" drvwait=");
         print_u64(sw);
@@ -10211,8 +10240,9 @@ pub(crate) use nt_user_callback::{
 pub(crate) static GDI_BATCH_FLUSHES: AtomicU64 = AtomicU64::new(0);
 /// Batch records handed to win32k's registered `BatchFlushRoutine`.
 pub(crate) static GDI_BATCH_RECORDS_FLUSHED: AtomicU64 = AtomicU64::new(0);
-/// Calls to the registered win32k batch flush routine that failed or walled.
+/// Completed calls to the registered win32k batch flush routine that failed.
 pub(crate) static GDI_BATCH_FLUSH_FAILURES: AtomicU64 = AtomicU64::new(0);
+static GDI_CALLBACK_BATCH_SUSPENSIONS: AtomicU64 = AtomicU64::new(0);
 /// High-water `GdiTebBatch.Offset` ever OBSERVED at a win32k system call. With the kernel step in
 /// place this must stay `<= GDI_BATCH_BUF_SIZE`; without it, it grew past the TEB's second page.
 pub(crate) static GDI_BATCH_MAX_OFFSET: AtomicU64 = AtomicU64::new(0);
@@ -10222,16 +10252,15 @@ pub(crate) static EXPLORER_DIRECT_GDI_DRAW_RETURNS: AtomicU64 = AtomicU64::new(0
 pub(crate) static EXPLORER_GDI_BATCH_FLUSHES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_GDI_BATCH_RECORDS: AtomicU64 = AtomicU64::new(0);
 
-/// `KeGdiFlushUserBatch` — run at the win32k system-call entry for hosted client `client`, exactly
-/// where `KiSystemCallHandler` runs it. The executive reads the live TEB only to decide whether
-/// there is a batch and to keep the existing proof/readback counters; execution and clearing are
-/// delegated to win32k's registered `BatchFlushRoutine`.
-pub(crate) unsafe fn ke_gdi_flush_user_batch(
+/// Capture only the caller's live batch bytes before the provider consumes them. The registered
+/// BatchFlushRoutine runs in the same provider dispatch as the original win32k syscall; this
+/// observer never starts a second dispatch or publishes completion evidence.
+pub(crate) unsafe fn observe_gdi_batch_before_dispatch(
     client: win32k_glue::Win32kClientContext,
     teb_alias: u64,
-) {
+) -> u32 {
     if !GDI_USER_BATCH_FLUSH || client.teb == 0 || teb_alias == 0 {
-        return;
+        return 0;
     }
     // Main hosted processes use the historical env-scratch layout: page 1 at `alias + 0`, page 2 at
     // `alias + 0x5000`. Real worker TEB mirrors are contiguous.
@@ -10239,7 +10268,7 @@ pub(crate) unsafe fn ke_gdi_flush_user_batch(
     let count_field = (teb_alias + tail_bias + TEB_GDI_BATCH_COUNT) as *const u32;
     let count = core::ptr::read_volatile(count_field);
     if count == 0 {
-        return;
+        return 0;
     }
     let offset_field = (teb_alias + GDI_TEB_BATCH_OFFSET) as *const u32;
     let offset = core::ptr::read_volatile(offset_field);
@@ -10247,18 +10276,6 @@ pub(crate) unsafe fn ke_gdi_flush_user_batch(
     if offset as u64 > previous {
         GDI_BATCH_MAX_OFFSET.store(offset as u64, Ordering::Relaxed);
     }
-    let observation_role = hosted_process_runtime_for_pi(client.pi as usize)
-        .filter(|runtime| runtime.generation == client.generation)
-        .map(|runtime| runtime.observation_role);
-    if observation_role == Some(nt_exe_image::HostedProcessRole::InteractiveShell) {
-        let first_flush = EXPLORER_GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed) == 0;
-        EXPLORER_GDI_BATCH_RECORDS.fetch_add(count as u64, Ordering::Relaxed);
-        if first_flush {
-            note_boot_progress(BootProgress::ExplorerGdiBatchObserved);
-        }
-    }
-    GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed);
-    GDI_BATCH_RECORDS_FLUSHED.fetch_add(count as u64, Ordering::Relaxed);
     // Keep the existing host-tested walk as a measurement/readback hook; win32k performs the draw.
     let buffer = teb_alias + GDI_TEB_BATCH_BUFFER;
     let mut records = [0u8; nt_user_callback::GDI_BATCH_BUF_SIZE as usize];
@@ -10276,34 +10293,65 @@ pub(crate) unsafe fn ke_gdi_flush_user_batch(
             }
         }
     });
-    // Keep the original caller receipt across the provider call; nested callbacks can change
-    // the ambient thread. Only acknowledged completion is desktop drawing evidence.
-    let batch_caller = client.logical_caller;
-    let (status, ok) = win32k_glue::win32k_flush_user_gdi_batch(client);
-    if ok && status as u32 == 0 {
-        if let Some(caller) = batch_caller {
+    count
+}
+
+/// A user callback can batch more drawing before `NtCallbackReturn` resumes win32k. Keep its
+/// established callback-return ordering until that continuation has a same-lane prelude owner.
+pub(crate) unsafe fn ke_gdi_flush_user_batch(
+    client: win32k_glue::Win32kClientContext,
+    teb_alias: u64,
+) {
+    let count = observe_gdi_batch_before_dispatch(client, teb_alias);
+    if count == 0 {
+        return;
+    }
+    let original_caller = client.logical_caller;
+    let (status, completed) = win32k_glue::win32k_flush_user_gdi_batch(client);
+    if completed && status as u32 == 0 {
+        GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed);
+        GDI_BATCH_RECORDS_FLUSHED.fetch_add(u64::from(count), Ordering::Relaxed);
+        if let Some(caller) = original_caller {
             service_sec_image::service_observe_desktop_gui_for(
                 caller, desktop_observation::DesktopGuiFact::BatchFlush, 1,
             );
             service_sec_image::service_observe_desktop_gui_for(
-                caller, desktop_observation::DesktopGuiFact::BatchRecords, count as u64,
+                caller, desktop_observation::DesktopGuiFact::BatchRecords, u64::from(count),
             );
+            if hosted_process_runtime_for_pi(caller.pi())
+                .is_some_and(|runtime| {
+                    runtime.observation_role == nt_exe_image::HostedProcessRole::InteractiveShell
+                        && caller.process().generation
+                            == nt_user_host::process_identity::ProcessGeneration::Hosted(
+                                runtime.generation,
+                            )
+                })
+            {
+                if EXPLORER_GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed) == 0 {
+                    note_boot_progress(BootProgress::ExplorerGdiBatchObserved);
+                }
+                EXPLORER_GDI_BATCH_RECORDS.fetch_add(u64::from(count), Ordering::Relaxed);
+            }
         }
-    }
-    if !ok || status as u32 != 0 {
-        let failures = GDI_BATCH_FLUSH_FAILURES.fetch_add(1, Ordering::Relaxed);
-        if failures < 8 {
-            print_str(b"[gdi-batch] BatchFlushRoutine failed pi=");
+    } else if !completed && status as u32 == nt_user_callback::STATUS_PENDING as u32 {
+        let suspensions = GDI_CALLBACK_BATCH_SUSPENSIONS.fetch_add(1, Ordering::Relaxed);
+        if suspensions < 8 {
+            print_str(b"[gdi-batch] callback-return flush suspended pi=");
             print_u64(client.pi as u64);
             print_str(b" tid=");
             print_u64(client.tid);
-            print_str(b" teb=0x");
-            print_hex_u64(client.teb);
-            print_str(if ok {
-                b" status=0x"
-            } else {
-                b" WALL status=0x"
-            });
+            print_str(b" status=0x");
+            print_hex(status as u32);
+            print_str(b"\n");
+        }
+    } else {
+        let failures = GDI_BATCH_FLUSH_FAILURES.fetch_add(1, Ordering::Relaxed);
+        if failures < 8 {
+            print_str(b"[gdi-batch] callback-return flush failed pi=");
+            print_u64(client.pi as u64);
+            print_str(b" tid=");
+            print_u64(client.tid);
+            print_str(b" status=0x");
             print_hex(status as u32);
             print_str(b"\n");
         }
@@ -13536,6 +13584,11 @@ unsafe fn grant_hosted_pci_devnode_resources(
             platform_reset: false,
         });
     }
+    let interrupt_irql = interrupt
+        .map(|resource| u8::try_from(resource.level))
+        .transpose()
+        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+        .unwrap_or(0);
     let resource_grant = driver_launch::grant_hosted_device_resources(
         device_id,
         driver_launch::HostedBusIdentity::pci(
@@ -13552,6 +13605,7 @@ unsafe fn grant_hosted_pci_devnode_resources(
         &port_grants,
         interrupt_route.map(|route| route.gsi).unwrap_or(0),
         interrupt_route.map(|route| route.vector).unwrap_or(0),
+        interrupt_irql,
         interrupt_route.map(|route| route.shared).unwrap_or(false),
         interrupt_route
             .map(|route| !route.level_sensitive)
@@ -13719,6 +13773,8 @@ unsafe fn grant_hosted_platform_devnode_resources(
             platform_reset: resource.platform_reset,
         });
     }
+    let interrupt_irql = u8::try_from(interrupt.level)
+        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     driver_launch::grant_hosted_device_resources(
         device_id,
         driver_launch::HostedBusIdentity::root_bus(),
@@ -13726,6 +13782,7 @@ unsafe fn grant_hosted_platform_devnode_resources(
         &port_grants,
         raw_interrupt.level,
         interrupt.vector,
+        interrupt_irql,
         window.interrupt_shared,
         window.interrupt_latched,
         window.interrupt_active_low,
@@ -13836,6 +13893,15 @@ unsafe fn grant_hosted_acpi_child_devnode_resources(
         .copy_from_slice(&assignment.route.vector.to_le_bytes());
     translated[interrupt_offset + 12..interrupt_offset + 20]
         .copy_from_slice(&1u64.to_le_bytes());
+    let translated_interrupt_level = u32::from_le_bytes(
+        translated[interrupt_offset + 4..interrupt_offset + 8]
+            .try_into()
+            .map_err(|_| invalid)?,
+    );
+    if translated_interrupt_level != interrupt.level {
+        return Err(invalid);
+    }
+    let interrupt_irql = u8::try_from(translated_interrupt_level).map_err(|_| invalid)?;
     if let Err(status) = driver_launch::grant_hosted_device_resources(
         device_id,
         driver_launch::HostedBusIdentity::acpi_child(),
@@ -13843,6 +13909,7 @@ unsafe fn grant_hosted_acpi_child_devnode_resources(
         &port_grants,
         assignment.route.gsi,
         assignment.route.vector,
+        interrupt_irql,
         assignment.route.shared,
         !assignment.route.level_sensitive,
         assignment.route.active_low,
@@ -13928,7 +13995,8 @@ unsafe fn grant_hosted_devnode_resources(
             );
             settle_hosted_pnp_context_grant(device_id, context_lease, result)
         }
-        PreparedHostedResourcePlan::None => {
+        PreparedHostedResourcePlan::AcpiChildNoResources { .. }
+        | PreparedHostedResourcePlan::None => {
             if filtered_resource_requirements.is_empty() {
                 Ok(None)
             } else {
@@ -14771,9 +14839,13 @@ struct RingChannel<'a> {
     req_vaddr: u64,
     rep_vaddr: u64,
     next_id: u64,
+    completion_inbox: ring_channel_completion::CompletionInbox<OwnedSurtCompletion>,
+}
+struct OwnedSurtCompletion {
+    cqe: SurtCqe,
+    payload: Vec<u8>,
 }
 static SURT_CLIENT_TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
-static SURT_CLIENT_TIMER_DRAINS: AtomicU64 = AtomicU64::new(0);
 static SURT_CLIENT_WAIT_WAKES: AtomicU64 = AtomicU64::new(0);
 const SURT_STATUS_INVALID_BUFFER_SIZE: i32 = 0xC000_0206u32 as i32;
 
@@ -14785,6 +14857,12 @@ impl RingChannel<'_> {
         if in_buf.len() > REP_DATA_LEN {
             return (SURT_STATUS_INVALID_BUFFER_SIZE, 0, 0, 0, 0);
         }
+        let id = self.next_id;
+        if !self.completion_inbox.begin(id) {
+            // Neither shared frame can be reused while an earlier request is in flight.
+            return (nt_status::NtStatus::DEVICE_BUSY.raw(), 0, 0, 0, 0);
+        }
+        self.next_id = self.next_id.checked_add(1).expect("SURT request identity exhausted");
         // SAFETY: single request in flight; the ring push/pop orders these writes.
         unsafe {
             let dst = self.req_vaddr as *mut u8;
@@ -14792,8 +14870,6 @@ impl RingChannel<'_> {
                 core::ptr::write_volatile(dst.add(i), *b);
             }
         }
-        let id = self.next_id;
-        self.next_id += 1;
         let sqe = SurtSqe {
             opcode,
             len: in_buf.len() as u32,
@@ -14806,41 +14882,76 @@ impl RingChannel<'_> {
         }
         let _ = self.sq.notify_consumer(&self.signal);
         let mut out = (0i32, 0u32, 0u64, 0u64, 0u64);
+        let mut completed = false;
         loop {
             if WATCHDOG_TRIPPED.load(Ordering::Acquire) == 2 {
                 out.0 = nt_status::NtStatus::UNSUCCESSFUL.raw();
                 break;
             }
+            if let Some(owned) = self.completion_inbox.take(id) {
+                let cqe = owned.cqe;
+                out = (cqe.status, cqe.flags, cqe.information, cqe.detail0, cqe.detail1);
+                let n = (cqe.information as usize).min(out_buf.len()).min(owned.payload.len());
+                out_buf[..n].copy_from_slice(&owned.payload[..n]);
+                completed = true;
+                break;
+            }
             match self.cq.try_pop() {
                 Ok(Some(cqe)) => {
-                    if cqe.request_id == id {
-                        out = (
-                            cqe.status,
-                            cqe.flags,
-                            cqe.information,
-                            cqe.detail0,
-                            cqe.detail1,
+                    if cqe.request_id != id {
+                        // Capture the payload before another service call can reuse the reply
+                        // frame. The inbox preserves the exact request identity and bytes.
+                        let mut captured = cqe;
+                        let n = (captured.information as usize).min(REP_DATA_LEN);
+                        let mut payload = Vec::new();
+                        if payload.try_reserve_exact(n).is_err() {
+                            captured.status = nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw();
+                            captured.information = 0;
+                        } else {
+                            payload.resize(n, 0);
+                            unsafe {
+                                let src = self.rep_vaddr as *const u8;
+                                for (i, slot) in payload.iter_mut().enumerate() {
+                                    *slot = core::ptr::read_volatile(src.add(i));
+                                }
+                            }
+                        }
+                        let _ = self.completion_inbox.accept(
+                            id,
+                            captured.request_id,
+                            OwnedSurtCompletion { cqe: captured, payload },
                         );
-                        break;
+                        continue;
                     }
+                    out = (cqe.status, cqe.flags, cqe.information, cqe.detail0, cqe.detail1);
+                    let n = (cqe.information as usize).min(out_buf.len()).min(REP_DATA_LEN);
+                    unsafe {
+                        let src = self.rep_vaddr as *const u8;
+                        for (i, slot) in out_buf.iter_mut().enumerate().take(n) {
+                            *slot = core::ptr::read_volatile(src.add(i));
+                        }
+                    }
+                    completed = true;
+                    break;
                 }
                 Ok(None) => match self.cq.prepare_wait() {
                     Ok(WaitDecision::Ready) => {}
                     Ok(WaitDecision::Block) => unsafe {
                         self.wait_completion_timer_aware();
                     },
-                    Err(_) => break,
+                    Err(_) => {
+                        out.0 = nt_status::NtStatus::UNSUCCESSFUL.raw();
+                        break;
+                    }
                 },
-                Err(_) => break,
+                Err(_) => {
+                    out.0 = nt_status::NtStatus::UNSUCCESSFUL.raw();
+                    break;
+                }
             }
         }
-        let n = (out.2 as usize).min(out_buf.len()).min(REP_DATA_LEN);
-        // SAFETY: reply frame holds `n` result bytes.
-        unsafe {
-            let src = self.rep_vaddr as *const u8;
-            for (i, slot) in out_buf.iter_mut().enumerate().take(n) {
-                *slot = core::ptr::read_volatile(src.add(i));
-            }
+        if completed {
+            self.completion_inbox.finish(id);
         }
         out
     }
@@ -14849,9 +14960,8 @@ impl RingChannel<'_> {
         let (_rax, badge, _info, _payload) = ep_recv(self.wait_cptr);
         let timer = badge_has_delay_timer(badge);
         let irq_lines = driver_launch::latch_hosted_irq_badge(badge);
-        if irq_lines != 0 {
-            let _ = driver_launch::drain_pending_hosted_irqs();
-        }
+        // Both timer and IRQ work remain pending until the shared request/reply frame owner has
+        // copied its completion. Pumping them here can reenter this channel before that point.
         if EXEC_DEADMAN_WATCHDOG {
             if timer {
                 watchdog_on_tick();
@@ -14862,14 +14972,7 @@ impl RingChannel<'_> {
         if timer {
             let n = SURT_CLIENT_TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
             DELAY_TIMER_TICKS_PENDING.fetch_add(1, Ordering::Relaxed);
-            if drain_nested_pump_timer_delivery() {
-                let drains = SURT_CLIENT_TIMER_DRAINS.fetch_add(1, Ordering::Relaxed);
-                if drains < 8 {
-                    print_str(b"[surt-client] timer-aware wait drained delay tick\n");
-                }
-            } else {
-                delay_timer_nested_ack();
-            }
+            delay_timer_nested_ack();
             if n < 8 {
                 print_str(b"[surt-client] HPET tick landed while waiting for completion\n");
             }
@@ -20468,8 +20571,54 @@ struct HostedPciGrantDiscoveryReport {
     selected_devnodes: u64,
     existing_grants: u64,
     claimed_grants: u64,
-    missing_memory_bar: u64,
+    barless_devnodes: u64,
     claim_failures: u64,
+}
+
+/// A PCI function may need its BAR authority before its native bus PDO exists. Select it from
+/// current PCI inventory and registry critical-driver policy, or an already enumerated launch
+/// plan. Neither source invents an Enum instance identity.
+unsafe fn hosted_pci_selected_for_context(
+    device: &nt_pnp::PciDevice,
+    pci_devices: &[nt_pnp::PciDevice],
+    plans: &[&InlineDriverLaunchPlan],
+) -> bool {
+    if hosted_pci_selected_from_launch_plans(device, pci_devices, plans) {
+        return true;
+    }
+    let candidates = [
+        alloc::format!(r"PCI\VEN_{:04X}&DEV_{:04X}", device.vendor, device.device),
+        alloc::format!(r"PCI\CC_{:06X}", device.class),
+        alloc::format!(r"PCI\CC_{:04X}", device.class >> 8),
+    ];
+    candidates.iter().any(|id| {
+        config_manager_query_critical_device_binding(id)
+            .ok()
+            .flatten()
+            .is_some_and(|binding| binding.service_name.is_some())
+    })
+}
+
+fn hosted_pci_selected_from_launch_plans(
+    device: &nt_pnp::PciDevice,
+    pci_devices: &[nt_pnp::PciDevice],
+    plans: &[&InlineDriverLaunchPlan],
+) -> bool {
+    plans.iter().any(|plan| {
+        plan.as_slice().iter().any(|spec| {
+            plan.devnodes_for(spec).iter().any(|devnode| {
+                nt_pnp::find_pci_device_for_devnode(
+                    pci_devices,
+                    devnode.instance_id.as_str(),
+                    plan.hardware_ids_for(devnode),
+                    plan.compatible_ids_for(devnode),
+                ).is_some_and(|selected| {
+                    (selected.bus, selected.dev, selected.func)
+                        == (device.bus, device.dev, device.func)
+                })
+            })
+        })
+    })
 }
 
 fn hosted_pci_request_id(device: &nt_pnp::PciDevice) -> u64 {
@@ -20624,9 +20773,14 @@ pub(crate) unsafe fn request_hosted_pnp_pci_dma_window(
     commit_hosted_pnp_pci_dma_window(context_lease, bus, dev, func, dma, owner)
 }
 
+fn hosted_pci_resource_bar_eligible(device: &nt_pnp::PciDevice) -> bool {
+    device.first_memory_bar().is_some() || device.first_io_bar().is_some()
+}
+
 unsafe fn claim_hosted_pci_memory_grants(
     bi: &BootInfo,
     device: &nt_pnp::PciDevice,
+    boot_storage_bar: Option<BootStorageBarClaim>,
 ) -> Option<Vec<HostedPciMemoryGrant>> {
     let count = device
         .bars
@@ -20641,8 +20795,24 @@ unsafe fn claim_hosted_pci_memory_grants(
         .filter(|bar| bar.is_present() && !bar.is_io)
     {
         let requested_pages = bar.size.div_ceil(0x1000).max(1);
-        let run = existing_boot_framebuffer_bar_cap_run(bar.base, requested_pages)
-            .or_else(|| claim_device_frame_caps(bi, bar.base, requested_pages))?;
+        let run = if let Some(existing) = boot_storage_bar.filter(|existing| existing.phys == bar.base) {
+            // P2 already retyped this device untyped for the isolated storage host.
+            // A different PCI identity or incomplete claim cannot borrow the cap or safely
+            // retype the same physical device untyped a second time.
+            (existing.bus == device.bus
+                && existing.dev == device.dev
+                && existing.func == device.func
+                && existing.bar_index == bar.index
+                && existing.run.base != 0
+                && existing.run.pages >= requested_pages)
+                .then_some(DeviceFrameCapRun {
+                    base: existing.run.base,
+                    pages: requested_pages,
+                })?
+        } else {
+            existing_boot_framebuffer_bar_cap_run(bar.base, requested_pages)
+                .or_else(|| claim_device_frame_caps(bi, bar.base, requested_pages))?
+        };
         grants.push(HostedPciMemoryGrant {
             bar_index: bar.index,
             phys: bar.base,
@@ -20658,38 +20828,24 @@ unsafe fn discover_hosted_pci_hardware_grants_for_launch_plans(
     bi: &BootInfo,
     pci_devices: &[nt_pnp::PciDevice],
     plans: &[&InlineDriverLaunchPlan],
+    boot_storage_bar: Option<BootStorageBarClaim>,
     grants: &mut Vec<HostedPciHardwareGrant>,
 ) -> HostedPciGrantDiscoveryReport {
     let mut report = HostedPciGrantDiscoveryReport::default();
-    let mut seen = Vec::new();
-    for plan in plans {
-        for spec in plan.as_slice() {
-            for devnode in plan.devnodes_for(spec) {
-                let hardware_refs = plan.hardware_ids_for(devnode);
-                let compatible_refs = plan.compatible_ids_for(devnode);
-                let Some(device) = nt_pnp::find_pci_device_for_devnode(
-                    pci_devices,
-                    devnode.instance_id.as_str(),
-                    hardware_refs,
-                    compatible_refs,
-                ) else {
-                    continue;
-                };
-                let key = (device.bus, device.dev, device.func);
-                if seen.iter().any(|existing| *existing == key) {
+    for device in pci_devices {
+                if !hosted_pci_selected_for_context(device, pci_devices, plans) {
                     continue;
                 }
-                seen.push(key);
                 report.selected_devnodes += 1;
                 if grants.iter().any(|grant| grant.matches(device)) {
                     report.existing_grants += 1;
                     continue;
                 }
-                if device.first_memory_bar().is_none() && device.first_io_bar().is_none() {
-                    report.missing_memory_bar += 1;
+                if !hosted_pci_resource_bar_eligible(device) {
+                    report.barless_devnodes += 1;
                     continue;
                 }
-                let Some(memory) = claim_hosted_pci_memory_grants(bi, device) else {
+                let Some(memory) = claim_hosted_pci_memory_grants(bi, device, boot_storage_bar) else {
                     report.claim_failures += 1;
                     continue;
                 };
@@ -20699,8 +20855,6 @@ unsafe fn discover_hosted_pci_hardware_grants_for_launch_plans(
                 };
                 grants.push(grant);
                 report.claimed_grants += 1;
-            }
-        }
     }
     report
 }
@@ -20714,6 +20868,81 @@ struct HostedPciWindowPublishReport {
     selected_platform_devnodes: u64,
     published_platform_windows: u64,
     missing_platform_grants: u64,
+}
+
+unsafe fn publish_selected_hosted_pci_window(
+    device: &nt_pnp::PciDevice,
+    grants: &[HostedPciHardwareGrant],
+    context_owner: &mut HostedPnpContextOwner,
+    windows: &mut Vec<HostedPnpPciResourceDescriptor>,
+    report: &mut HostedPciWindowPublishReport,
+) {
+    report.selected_devnodes += 1;
+    if !hosted_pci_resource_bar_eligible(device)
+        || windows.iter().any(|window| window.matches(device))
+    {
+        return;
+    }
+    let Some(grant) = grants.iter().find(|grant| grant.matches(device)) else {
+        report.missing_grants += 1;
+        return;
+    };
+    if grant.memory.is_empty() && device.first_io_bar().is_none() {
+        report.missing_grants += 1;
+        return;
+    }
+    let checkpoint = context_owner.checkpoint();
+    let mut memory = Vec::new();
+    if memory.try_reserve_exact(grant.memory.len()).is_err() {
+        report.missing_grants += 1;
+        return;
+    }
+    for memory_grant in &grant.memory {
+        let map_pages = hosted_pci_eager_mmio_map_pages(device, memory_grant);
+        let Some(map_bytes) = map_pages.checked_mul(0x1000) else {
+            report.pci_va_exhausted = true;
+            break;
+        };
+        let Some(va) = reserve_hosted_pnp_component_span(context_owner, map_bytes) else {
+            report.pci_va_exhausted = true;
+            break;
+        };
+        let Some(seed_va) = reserve_hosted_pnp_root_seed_span(context_owner, map_bytes) else {
+            report.pci_va_exhausted = true;
+            break;
+        };
+        if !map_hosted_pci_resource_root_alias(
+            context_owner,
+            memory_grant.frame_base,
+            map_pages,
+            seed_va,
+        ) {
+            break;
+        }
+        memory.push(HostedPnpPciMemoryDescriptor {
+            bar_index: memory_grant.bar_index,
+            phys: memory_grant.phys,
+            len: memory_grant.len,
+            frame_base: memory_grant.frame_base,
+            pages: memory_grant.pages,
+            map_pages,
+            va,
+            seed_va,
+        });
+    }
+    if memory.len() != grant.memory.len() {
+        let _ = context_owner.rollback_to(checkpoint);
+        report.missing_grants += 1;
+        return;
+    }
+    let Some(window) = HostedPnpPciResourceDescriptor::new(
+        device.bus, device.dev, device.func, memory, 0, 0, 0, 0, 0, 0,
+    ) else {
+        let _ = context_owner.rollback_to(checkpoint);
+        report.missing_grants += 1;
+        return;
+    };
+    windows.push(window);
 }
 
 unsafe fn publish_hosted_pnp_context_for_launch_plans(
@@ -20825,88 +21054,13 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                     hardware_refs,
                     compatible_refs,
                 ) {
-                    report.selected_devnodes += 1;
-                    if windows.iter().any(|window| window.matches(device)) {
-                        continue;
-                    }
-                    let Some(grant) = grants.iter().find(|grant| grant.matches(device)) else {
-                        report.missing_grants += 1;
-                        continue;
-                    };
-                    if grant.memory.is_empty() && device.first_io_bar().is_none() {
-                        report.missing_grants += 1;
-                        continue;
-                    }
-                    let owner_checkpoint = context_owner.checkpoint();
-                    let mut memory = Vec::new();
-                    if memory.try_reserve_exact(grant.memory.len()).is_err() {
-                        report.missing_grants += 1;
-                        continue;
-                    }
-                    let mut memory_failed = false;
-                    for memory_grant in &grant.memory {
-                        let map_pages = hosted_pci_eager_mmio_map_pages(device, memory_grant);
-                        let Some(map_bytes) = map_pages.checked_mul(0x1000) else {
-                            report.pci_va_exhausted = true;
-                            memory_failed = true;
-                            break;
-                        };
-                        let Some(va) =
-                            reserve_hosted_pnp_component_span(&mut context_owner, map_bytes)
-                        else {
-                            report.pci_va_exhausted = true;
-                            memory_failed = true;
-                            break;
-                        };
-                        let Some(seed_va) =
-                            reserve_hosted_pnp_root_seed_span(&mut context_owner, map_bytes)
-                        else {
-                            report.pci_va_exhausted = true;
-                            memory_failed = true;
-                            break;
-                        };
-                        if !map_hosted_pci_resource_root_alias(
-                            &mut context_owner,
-                            memory_grant.frame_base,
-                            map_pages,
-                            seed_va,
-                        ) {
-                            memory_failed = true;
-                            break;
-                        }
-                        memory.push(HostedPnpPciMemoryDescriptor {
-                            bar_index: memory_grant.bar_index,
-                            phys: memory_grant.phys,
-                            len: memory_grant.len,
-                            frame_base: memory_grant.frame_base,
-                            pages: memory_grant.pages,
-                            map_pages,
-                            va,
-                            seed_va,
-                        });
-                    }
-                    if memory_failed {
-                        let _ = context_owner.rollback_to(owner_checkpoint);
-                        report.missing_grants += 1;
-                        continue;
-                    }
-                    let Some(window) = HostedPnpPciResourceDescriptor::new(
-                        device.bus,
-                        device.dev,
-                        device.func,
-                        memory,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ) else {
-                        let _ = context_owner.rollback_to(owner_checkpoint);
-                        report.missing_grants += 1;
-                        continue;
-                    };
-                    windows.push(window);
+                    publish_selected_hosted_pci_window(
+                        device,
+                        grants,
+                        &mut context_owner,
+                        &mut windows,
+                        &mut report,
+                    );
                     continue;
                 }
 
@@ -20921,6 +21075,20 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                     continue;
                 }
             }
+        }
+    }
+    for device in pci_devices {
+        if hosted_pci_selected_for_context(device, pci_devices, plans)
+            && !hosted_pci_selected_from_launch_plans(device, pci_devices, plans)
+            && !windows.iter().any(|window| window.matches(device))
+        {
+            publish_selected_hosted_pci_window(
+                device,
+                grants,
+                &mut context_owner,
+                &mut windows,
+                &mut report,
+            );
         }
     }
     report.published_windows = windows.len() as u64;
@@ -23220,7 +23388,42 @@ unsafe fn launch_boot_driver_service(
                     return None;
                 }
             };
-            Some((owned, reservation))
+            let mut predecessors = alloc::vec::Vec::new();
+            let mut dependent_devnodes = alloc::vec::Vec::new();
+            for (index, devnode) in owned.devnodes.iter().enumerate() {
+                let Some((enumerator, _)) = devnode.instance_id.split_once('\\') else {
+                    continue;
+                };
+                let mut dependent = false;
+                // Every occupied Boot row predates this unpublished reservation. Physical slot
+                // indices are not launch order because the table reuses empty slots.
+                for earlier_slot in 0..driver_starts.pending.slot_count() {
+                    let Some(pending) = driver_starts.pending.get(earlier_slot) else {
+                        continue;
+                    };
+                    if matches!(&pending.owner, PendingDriverStartOwner::Boot { .. })
+                        && pending.batch.service_name().eq_ignore_ascii_case(enumerator)
+                    {
+                        dependent = true;
+                        if predecessors.contains(&pending.reservation) {
+                            continue;
+                        }
+                        if predecessors.try_reserve(1).is_err() {
+                            driver_starts.pending.cancel(reservation).expect("boot START reservation disappeared");
+                            return None;
+                        }
+                        predecessors.push(pending.reservation);
+                    }
+                }
+                if dependent {
+                    if dependent_devnodes.try_reserve(1).is_err() {
+                        driver_starts.pending.cancel(reservation).expect("boot START reservation disappeared");
+                        return None;
+                    }
+                    dependent_devnodes.push(index);
+                }
+            }
+            Some((owned, reservation, predecessors, dependent_devnodes))
         } else {
             None
         };
@@ -23231,7 +23434,7 @@ unsafe fn launch_boot_driver_service(
         spec.driver_object_path.as_str(),
         initial_system_driver_caller(),
     ) else {
-        if let Some((_, reservation)) = prepared_start {
+        if let Some((_, reservation, _, _)) = prepared_start {
             driver_starts
                 .pending
                 .cancel(reservation)
@@ -23239,11 +23442,17 @@ unsafe fn launch_boot_driver_service(
         }
         return None;
     };
-    let Some((owned, reservation)) = prepared_start else {
+    let Some((owned, reservation, predecessors, dependent_devnodes)) = prepared_start else {
         return Some((dc, HostedPnpStartReport::default()));
     };
     let mut batch = OwnedHostedPnpStartBatch::new(&dc, owned, options);
-    let report = match batch.drive() {
+    batch.require_bootstrap_bus_pdos(dependent_devnodes);
+    let progress = if predecessors.is_empty() {
+        batch.drive()
+    } else {
+        OwnedHostedPnpStartProgress::AwaitingCompletion
+    };
+    let report = match progress {
         OwnedHostedPnpStartProgress::Complete(_) => {
             driver_starts
                 .pending
@@ -23260,6 +23469,8 @@ unsafe fn launch_boot_driver_service(
                     reservation,
                     PendingDriverStart {
                         batch,
+                        reservation,
+                        bootstrap_predecessors: predecessors,
                         owner: PendingDriverStartOwner::Boot {
                             target,
                             report_published: false,
@@ -23278,6 +23489,8 @@ unsafe fn launch_boot_driver_service(
                     reservation,
                     PendingDriverStart {
                         batch,
+                        reservation,
+                        bootstrap_predecessors: predecessors,
                         owner: PendingDriverStartOwner::Boot {
                             target,
                             report_published: true,
@@ -23568,6 +23781,8 @@ enum PendingDriverStartOwner {
 
 struct PendingDriverStart {
     batch: OwnedHostedPnpStartBatch,
+    reservation: nt_driver_start::PendingOperationReservation,
+    bootstrap_predecessors: alloc::vec::Vec<nt_driver_start::PendingOperationReservation>,
     owner: PendingDriverStartOwner,
 }
 
@@ -27204,6 +27419,7 @@ unsafe fn stand_up_service(
         req_vaddr: req_v,
         rep_vaddr: rep_v,
         next_id: 1,
+        completion_inbox: ring_channel_completion::CompletionInbox::new(),
     }
 }
 
@@ -27245,6 +27461,16 @@ unsafe fn claim_device_pages(bi: &BootInfo, paddr: u64, vaddr: u64, n: u64) -> u
 struct DeviceFrameCapRun {
     base: u64,
     pages: u64,
+}
+
+#[derive(Clone, Copy)]
+struct BootStorageBarClaim {
+    bus: u8,
+    dev: u8,
+    func: u8,
+    bar_index: u8,
+    phys: u64,
+    run: DeviceFrameCapRun,
 }
 
 fn existing_boot_framebuffer_bar_cap_run(
@@ -28662,6 +28888,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut found_storage = false;
     let (mut storage_bar5, mut storage_irq) = (0u32, 0u32);
     let (mut storage_bus, mut storage_dev, mut storage_func) = (0u8, 0u8, 0u8);
+    let mut boot_storage_bar_claim = None;
     for d in &pci_devices {
         count += 1;
         let (bus, dev, func) = (d.bus, d.dev, d.func);
@@ -28741,6 +28968,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let ahci_frame = claim_device_pages(bi, ahci_bar, AHCI_VADDR, 1);
         check(b"exec_ahci_abar_claimed", ahci_frame != 0, &mut passed);
         if ahci_frame != 0 {
+            boot_storage_bar_claim = Some(BootStorageBarClaim {
+                bus: storage_bus,
+                dev: storage_dev,
+                func: storage_func,
+                bar_index: 5,
+                phys: ahci_bar,
+                run: DeviceFrameCapRun {
+                    base: ahci_frame,
+                    pages: 1,
+                },
+            });
             // The DMA frame: AHCI command list + FIS + command table + the data buffer.
             let dma_frame = alloc_slot();
             let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, dma_frame);
@@ -29545,6 +29783,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             config_pnp_plan,
             config_demand_pnp_plan,
         ],
+        boot_storage_bar_claim,
         &mut hosted_pci_hardware_grants,
     );
     print_str(b"[driver-launch] hosted PCI grant discovery selected=");
@@ -29553,8 +29792,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(hosted_pci_grant_discovery.existing_grants);
     print_str(b" claimed=");
     print_u64(hosted_pci_grant_discovery.claimed_grants);
-    print_str(b" missing-mmio=");
-    print_u64(hosted_pci_grant_discovery.missing_memory_bar);
+    print_str(b" barless=");
+    print_u64(hosted_pci_grant_discovery.barless_devnodes);
     print_str(b" claim-failures=");
     print_u64(hosted_pci_grant_discovery.claim_failures);
     print_str(b"\n");
@@ -29563,7 +29802,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         hosted_pci_grant_discovery.selected_devnodes
             == hosted_pci_grant_discovery.existing_grants
                 + hosted_pci_grant_discovery.claimed_grants
-            && hosted_pci_grant_discovery.missing_memory_bar == 0
+                + hosted_pci_grant_discovery.barless_devnodes
             && hosted_pci_grant_discovery.claim_failures == 0,
         &mut passed,
     );
@@ -30969,10 +31208,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     panic!("win32k KUSER paging setup failed");
                 }
                 let kuser_map_cap = copy_cap(kuser_frame);
+                // ReactOS win32k updates LastSystemRITEventTickCount through this kernel alias
+                // on input. Process KUSER aliases remain read only.
                 let kuser_map = page_map_r(
                     kuser_map_cap,
                     win32k_subsystem::WIN32K_KUSER_SHARED_DATA_VA,
-                    2 | PAGE_EXECUTE_NEVER,
+                    RW_NX,
                     sc.pml4,
                 );
                 if kuser_map != 0 {

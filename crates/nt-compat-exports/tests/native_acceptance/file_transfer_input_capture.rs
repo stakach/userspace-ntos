@@ -106,11 +106,31 @@ fn promoted_transfer_restores_original_arguments_without_fresh_tail_capture() {
                     assert!(!retained.0.iter().any(|(name, _)| matches!(name.as_str(),
                         "client_copyin_mapped" | "get_recv_mr" | "xas_read")),
                         "a promoted request cannot reread the original user stack or retry tail");
-                    let mut fresh = Calls::default();
-                    fresh.visit_expr(&expression.else_branch.as_ref()
-                        .expect("fresh admission retains its ordinary argument capture").1);
-                    assert!(fresh.0.iter().any(|(name, _)| name == "client_copyin_mapped"));
-                    assert!(fresh.0.iter().any(|(name, _)| name == "get_recv_mr"));
+                    let Some((_, fresh)) = &expression.else_branch else {
+                        panic!("fresh admission must retain argument capture");
+                    };
+                    let syn::Expr::If(native) = &**fresh else {
+                        panic!("fresh native and ordinary transports must be distinct");
+                    };
+                    assert!(matches!(&*native.cond, syn::Expr::Path(path)
+                        if path.path.is_ident("native_call_transport")));
+                    let mut native_calls = Calls::default();
+                    native_calls.visit_block(&native.then_branch);
+                    assert!(native_calls.0.iter().any(|(name, _)| name == "argument"),
+                        "native fresh admission must read owned ingress arguments");
+                    assert!(native_calls.0.iter().any(|(name, _)| name == "native_syscall_request_len"),
+                        "native ingress must validate its argument extent");
+                    assert!(!native_calls.0.iter().any(|(name, _)| matches!(name.as_str(),
+                        "client_copyin_mapped" | "get_recv_mr" | "xas_read")),
+                        "native ingress must not reread user memory or transport registers");
+                    let mut ordinary_calls = Calls::default();
+                    ordinary_calls.visit_expr(&native.else_branch.as_ref()
+                        .expect("ordinary fresh transport captures stack arguments").1);
+                    assert!(ordinary_calls.0.iter().any(|(name, _)| name == "client_copyin_mapped"),
+                        "ordinary fresh admission must capture stack arguments");
+                    assert!(!ordinary_calls.0.iter().any(|(name, _)| matches!(name.as_str(),
+                        "argument" | "get_recv_mr")),
+                        "ordinary stack capture must not use native ingress words");
                     struct CountGuard(bool);
                     impl<'ast> Visit<'ast> for CountGuard {
                         fn visit_expr_if(&mut self, expression: &'ast syn::ExprIf) {
