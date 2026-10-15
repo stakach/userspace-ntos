@@ -1,0 +1,38 @@
+{
+  "issue": 18,
+  "related_issues": [
+    1
+  ],
+  "image_source_head_at_build": "2e2a82d9",
+  "source_state": "uncommitted native integration tree; artifact hashes identify the built binaries",
+  "profile": "production",
+  "boot_bound_seconds": 3600,
+  "launcher_exit": 143,
+  "launcher_stop_reason": "Stopped after genuine login frame and evidence of masked keyboard IRQ1 with no further key delivery; no Explorer execution",
+  "restored_snapshot_generation": 4583,
+  "login_screen_rendered": true,
+  "keyboard_login_completed": false,
+  "desktop_acceptance": false,
+  "font_cleanup_acceptance": false,
+  "artifact_sha256": {
+    "historical_completed_setup_archive": "27d7a07c4d09ca764b25eb73ee0b1a8e49f2431b14e97b3fd6c5717108b06f81",
+    "restored_legacy_tail": "f50c92d1544a1b9d0343a5e70417649fb5329e169d72e2c83a4b96b8e848b4fa",
+    "rootserver": "7115edc4895457bf8679f3d0cde6f74069816fa2d40149d34961ef9c56fed88a",
+    "ntdll": "3e15a74d0d1c69f37478b77ee72db19ea8f65cd3a713229951c555e03b4d6e17",
+    "native_build_log": "85675e551acb07299365fd2bfb7fc20accded9557c1f2c8e8a66aad122defbdf",
+    "raw_boot_log": "48e7af5dac99cad529d7ad5da30e52ee6395c3da0a9eb6cb55b65d7b7e99a67e",
+    "archived_boot_log": "ad4535809e1b9913584da716404b5b6bd73a7e03050ee15915d5942894c63560",
+    "login_screenshot": "1b6d9de3911168262cb5e995f207ff0608f3902a91007b0a663cd653dc31642c",
+    "postboot_snapshot_tail": "e51b47bcbbe17d613454779ff48a25e26fff158efb0653d05c27c882d456c1f0"
+  },
+  "observations": [
+    "Fresh current-code native image restored durable snapshot generation 4583 from an older completed-setup production disk tail.",
+    "Current-code Winlogon drew the real ReactOS Logon dialog, captured through QMP at approximately 15 minutes.",
+    "QMP keyboard Shift and Tab reached i8042 and kbdclass, but later letter input did not reach the guest; IOAPIC pin 1 was masked and census events stayed at 22631 across samples 31 through 34.",
+    "No genuine Userinit or Explorer process and no shell-chrome pass occurred; this evidence proves login rendering only."
+  ],
+  "evidence": {
+    "log": "docs/evidence/issue18-current-reactos-login.log.gz",
+    "screenshot": "docs/images/issue18-current-reactos-login.png"
+  }
+}
