@@ -51,10 +51,13 @@ pub(super) unsafe fn retire_hosted_device_projection(
                 let (device_exec, capacity) =
                     hosted_pool_allocation_exec_range(inst.exec_pool_va, device_object)
                         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-                let projected_size = read_unaligned((device_exec + 2) as *const u16) as u64;
                 if capacity < WDM_X64_DEVICE_OBJECT_SIZE as u64
                     || hosted_instance_pool_allocation_is_free_unlocked(inst, device_object) != Some(false)
-                    || read_unaligned(device_exec as *const i16) != WDM_X64_IO_TYPE_DEVICE
+                {
+                    return Err(nt_status::NtStatus::INVALID_PARAMETER);
+                }
+                let projected_size = read_unaligned((device_exec + 2) as *const u16) as u64;
+                if read_unaligned(device_exec as *const i16) != WDM_X64_IO_TYPE_DEVICE
                     || projected_size < WDM_X64_DEVICE_OBJECT_SIZE as u64
                     || projected_size > capacity
                 {
@@ -117,17 +120,30 @@ pub(super) unsafe fn retire_hosted_device_projection(
                 Ok((device_exec, next_device, target_link, rollback_pdo_exec))
             },
         )?;
+    let attached_pdo = rollback_pdo_exec.and_then(|pdo_exec| {
+        (read_unaligned((pdo_exec + 0x18) as *const u64) == device_object)
+            .then(|| (pdo_exec, read_unaligned((device_exec + 0x4c) as *const u8)))
+    });
     if let Some(target_link) = target_link {
         write_unaligned(target_link as *mut u64, next_device);
     }
-    if let Some(pdo_exec) = rollback_pdo_exec {
-        if read_unaligned((pdo_exec + 0x18) as *const u64) == device_object {
-            write_unaligned((pdo_exec + 0x18) as *mut u64, 0);
-            write_unaligned((device_exec + 0x4c) as *mut u8, 1);
-        }
+    if let Some((pdo_exec, _)) = attached_pdo {
+        write_unaligned((pdo_exec + 0x18) as *mut u64, 0);
+        write_unaligned((device_exec + 0x4c) as *mut u8, 1);
     }
     write_unaligned(device_exec as *mut u16, 0);
     if !hosted_instance_pool_free_unlocked(inst, device_object) {
+        // The allocator returns false before touching the free list. Keep the physical
+        // retirement pending, but restore every native link and header changed above so
+        // a refused free cannot strand a live Device in a half-retired projection.
+        write_unaligned(device_exec as *mut u16, WDM_X64_IO_TYPE_DEVICE as u16);
+        if let Some((pdo_exec, prior_flag)) = attached_pdo {
+            write_unaligned((device_exec + 0x4c) as *mut u8, prior_flag);
+            write_unaligned((pdo_exec + 0x18) as *mut u64, device_object);
+        }
+        if let Some(target_link) = target_link {
+            write_unaligned(target_link as *mut u64, device_object);
+        }
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
     }
     hosted_device_allocations::finish_retirement(retirement)?;

@@ -758,8 +758,14 @@ pub(super) fn publish_registration(
 
 /// Capture the constructor's list owner under both physical locks before canonical bind.
 /// A later provider mutation of DEVICE_OBJECT.DriverObject cannot redirect native unlink.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DeviceListOwner {
+    Linked,
+    Unlinked,
+}
+
 pub(super) unsafe fn stage_driver_object(
-    inst: DriverInstance, address: u64,
+    inst: DriverInstance, address: u64, list_owner: DeviceListOwner,
 ) -> Result<(), nt_status::NtStatus> {
     let _guard = lock();
     let _pool = hosted_instance_pool_lock(inst.exec_pool_va)
@@ -780,7 +786,10 @@ pub(super) unsafe fn stage_driver_object(
         .and_then(|base| base.checked_add(0x08))
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     let driver_object = read_unaligned(exec as *const u64);
-    if driver_object == 0 {
+    let next_device = read_unaligned((exec + 8) as *const u64);
+    if (list_owner == DeviceListOwner::Linked && driver_object == 0)
+        || (list_owner == DeviceListOwner::Unlinked
+            && (driver_object != 0 || next_device != 0)) {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
     row.staged_driver_object = Some(driver_object);

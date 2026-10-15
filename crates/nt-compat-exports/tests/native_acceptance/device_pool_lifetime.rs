@@ -69,12 +69,35 @@ fn physical_device_retirement_checks_captured_owner_before_mutating_or_freeing()
 fn ordinary_and_pdo_publication_capture_physical_owner_before_canonical_bind() {
     let file = syn::parse_file(DRIVER).unwrap();
     let publication = syn::parse_file(PUBLICATION).unwrap();
-    let found = calls(function(&publication, "register_hosted_device_projection"));
+    for (name, expected_owner) in [
+        ("register_hosted_device_projection", "Linked"),
+        ("register_unlinked_hosted_device_projection", "Unlinked"),
+    ] {
+        let wrapper = function(&publication, name);
+        let found = calls(wrapper);
+        assert_eq!(found.len(), 1, "{name} must only delegate to physical publication");
+        assert_eq!(found[0], "register_with_list_owner");
+        let Some(syn::Stmt::Expr(syn::Expr::Call(delegate), _)) = wrapper.block.stmts.last() else {
+            panic!("{name} must delegate with an explicit list owner");
+        };
+        let Some(syn::Expr::Path(owner)) = delegate.args.last() else {
+            panic!("{name} must pass a list owner");
+        };
+        assert_eq!(owner.path.segments.last().unwrap().ident, expected_owner);
+    }
+    let found = calls(function(&publication, "register_with_list_owner"));
     assert!(
-        position(&found, "protect_allocation") < position(&found, "bind_hosted_device_pointer")
+        position(&found, "protect_allocation") < position(&found, "stage_driver_object")
     );
     assert!(
-        position(&found, "bind_hosted_device_pointer") < position(&found, "publish_registration")
+        position(&found, "stage_driver_object") < position(&found, "bind_hosted_device_pointer")
+    );
+    assert!(
+        position(&found, "bind_hosted_device_pointer")
+            < position(&found, "record_accepted_registration")
+    );
+    assert!(
+        position(&found, "record_accepted_registration") < position(&found, "publish_registration")
     );
     for name in [
         "service_hosted_device",
