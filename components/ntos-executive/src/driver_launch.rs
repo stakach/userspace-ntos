@@ -1172,6 +1172,7 @@ const HOSTED_IRP_START_IO_SELECTING: u64 = 19;
 struct PendingIrp {
     irp: u64,
     file_object: u64,
+    created_file_storage: Option<hosted_file_objects::CreatedFileStorage>,
     data: u64,
     aux_data: u64,
     mdl: u64,
@@ -2191,13 +2192,31 @@ unsafe fn tombstone_pending_irp_owner(node: u64, consuming_state: u64) {
     }
 }
 
+unsafe fn source_irp_release_disposition(entry: PendingIrp, member: u64) -> Option<(u64, u64)> {
+    let (words, status, first, second, _) = call_on4_raw(
+        (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
+        12,
+        entry.source_ticket_id,
+        entry.source_ticket_generation,
+        member,
+    );
+    (words == 3 && status as u32 as i32 == STATUS_SUCCESS).then_some((first, second))
+}
+
+unsafe fn free_pre_entry_created_file_storage(
+    storage: hosted_file_objects::CreatedFileStorage,
+) {
+    // Ownership is entered into the component store before either member is released.
+    let _retired = hosted_file_objects::retire_created_file_storage(storage);
+}
+
 unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
     if entry.source_ticket_id != 0 && entry.major as u64 == IRP_MJ_PNP
         && entry.minor as u64 == IRP_MN_START_DEVICE
     {
     }
     if entry.source_ticket_id != 0 {
-        let (words, status, member_count, replacement_address, _) = call_on4_raw(
+        let (words, status, mut member_count, mut replacement_address, _) = call_on4_raw(
             (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
             7,
             entry.source_ticket_id,
@@ -2205,10 +2224,13 @@ unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
             entry.irp,
         );
         if words != 3 || status as u32 as i32 != STATUS_SUCCESS {
-            crate::provider_bugcheck::report(
-                0xc4,
-                [FSD_SERVICE_SOURCE_IRP_LABEL, 7, entry.irp, status],
-            );
+            let Some((count, replacement)) = source_irp_release_disposition(entry, 12) else {
+                crate::provider_bugcheck::report(
+                    0xc4, [FSD_SERVICE_SOURCE_IRP_LABEL, 7, entry.irp, status],
+                );
+            };
+            member_count = count;
+            replacement_address = replacement;
         }
         if member_count == 0 || member_count > 10 {
             crate::provider_bugcheck::report(
@@ -2225,10 +2247,11 @@ unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
                 index,
             );
             if words != 3 || status as u32 as i32 != STATUS_SUCCESS {
-                crate::provider_bugcheck::report(
-                    0xc4,
-                    [FSD_SERVICE_SOURCE_IRP_LABEL, 9, index, status],
-                );
+                if source_irp_release_disposition(entry, index) != Some((1, 0)) {
+                    crate::provider_bugcheck::report(
+                        0xc4, [FSD_SERVICE_SOURCE_IRP_LABEL, 9, index, status],
+                    );
+                }
             }
         }
         if replacement_address != 0 {
@@ -2240,15 +2263,12 @@ unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
                 replacement_address,
             );
             if words != 3 || status as u32 as i32 != STATUS_SUCCESS {
-                crate::provider_bugcheck::report(
-                    0xc4,
-                    [
-                        FSD_SERVICE_SOURCE_IRP_LABEL,
-                        10,
-                        replacement_address,
-                        status,
-                    ],
-                );
+                if source_irp_release_disposition(entry, 10) != Some((1, 0)) {
+                    crate::provider_bugcheck::report(
+                        0xc4,
+                        [FSD_SERVICE_SOURCE_IRP_LABEL, 10, replacement_address, status],
+                    );
+                }
             }
         }
         let (words, status, _, _, _) = call_on4_raw(
@@ -2259,17 +2279,43 @@ unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
             entry.irp,
         );
         if words != 3 || status as u32 as i32 != STATUS_SUCCESS {
-            crate::provider_bugcheck::report(
-                0xc4,
-                [FSD_SERVICE_SOURCE_IRP_LABEL, 8, entry.irp, status],
+            if source_irp_release_disposition(entry, 11) != Some((1, 0)) {
+                crate::provider_bugcheck::report(
+                    0xc4, [FSD_SERVICE_SOURCE_IRP_LABEL, 8, entry.irp, status],
+                );
+            }
+        }
+        let (words, status, _, _, _) = call_on4_raw(
+            (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
+            13,
+            entry.source_ticket_id,
+            entry.source_ticket_generation,
+            0,
+        );
+        if words != 3 || status as u32 as i32 != STATUS_SUCCESS {
+            // Receipt disposal is metadata only and idempotent for this exact ticket.
+            let (retry_words, retry_status, _, _, _) = call_on4_raw(
+                (FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,
+                13,
+                entry.source_ticket_id,
+                entry.source_ticket_generation,
+                0,
             );
+            if retry_words != 3 || retry_status as u32 as i32 != STATUS_SUCCESS {
+                crate::provider_bugcheck::report(
+                    0xc4, [FSD_SERVICE_SOURCE_IRP_LABEL, 13, entry.irp, retry_status],
+                );
+            }
         }
     } else {
         // No root ticket exists yet; the constructor still owns this local graph.
         for allocation in entry.allocation_graph().allocations() {
             match allocation.release_kind {
                 nt_io_manager::pending_irp_graph::GraphReleaseKind::FileStorage => {
-                    hosted_file_objects::free_file_storage(allocation.pointer);
+                    let storage = entry.created_file_storage
+                        .expect("unticketed File release lost its constructor allocation receipt");
+                    assert_eq!(storage.file, allocation.pointer);
+                    hosted_file_objects::retire_created_file_storage(storage);
                 }
                 nt_io_manager::pending_irp_graph::GraphReleaseKind::Pool => {
                     pool_free(allocation.pointer);
@@ -2947,6 +2993,12 @@ unsafe fn pool_free_exact(p: u64, generation: u64) -> bool {
         && component_pool_allocation_capacity(p).is_some()
         && read_volatile((p - 8) as *const u64) == generation
         && pool_free_locked(p)
+}
+
+unsafe fn component_pool_allocation_generation(p: u64) -> Option<u64> {
+    component_pool_allocation_capacity(p)?;
+    let generation = read_volatile((p - 8) as *const u64);
+    (generation != 0).then_some(generation)
 }
 
 unsafe fn pool_free_locked(p: u64) -> bool {
@@ -36140,6 +36192,7 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     if uses_file_object && fo == 0 {
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
+    let mut created_file_storage = None;
     if owns_fo {
         let Some(name_len) = create_file_name_len.checked_add(2) else {
             pool_free(fo);
@@ -36170,6 +36223,12 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
             pool_free(name);
             pool_free(fo);
             return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
+        }
+        created_file_storage = hosted_file_objects::capture_created_file_storage(fo);
+        if created_file_storage.is_none() {
+            pool_free(name);
+            pool_free(fo);
+            return (STATUS_INVALID_HANDLE, 0);
         }
     } else if uses_file_object {
         // The open's FILE_OBJECT: npfs owns its contents (FsContext/FsContext2/Flags/PrivateCacheMap
@@ -36206,7 +36265,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     let data = pool_alloc_zeroed(data_len);
     if data == 0 {
         if owns_fo {
-            hosted_file_objects::free_file_storage(fo);
+            free_pre_entry_created_file_storage(
+                created_file_storage.expect("CREATE lost its constructor storage"),
+            );
         }
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
@@ -36216,7 +36277,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         if aux_data == 0 {
             pool_free_request_buffers(data, 0, 0);
             if owns_fo {
-                hosted_file_objects::free_file_storage(fo);
+                free_pre_entry_created_file_storage(
+                    created_file_storage.expect("CREATE lost its constructor storage"),
+                );
             }
             return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
         }
@@ -36234,7 +36297,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     {
         pool_free_request_buffers(data, aux_data, 0);
         if owns_fo {
-            hosted_file_objects::free_file_storage(fo);
+            free_pre_entry_created_file_storage(
+                created_file_storage.expect("CREATE lost its constructor storage"),
+            );
         }
         return (0xC000_0001u32 as i32, 0); // STATUS_UNSUCCESSFUL
     }
@@ -36247,7 +36312,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         if aux_data == 0 {
             pool_free_request_buffers(data, 0, 0);
             if owns_fo {
-                hosted_file_objects::free_file_storage(fo);
+                free_pre_entry_created_file_storage(
+                    created_file_storage.expect("CREATE lost its constructor storage"),
+                );
             }
             return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
         }
@@ -36279,7 +36346,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     {
         pool_free_request_buffers(data, aux_data, 0);
         if owns_fo {
-            hosted_file_objects::free_file_storage(fo);
+            free_pre_entry_created_file_storage(
+                created_file_storage.expect("CREATE lost its constructor storage"),
+            );
         }
         return (0xC000_0001u32 as i32, 0); // STATUS_UNSUCCESSFUL
     }
@@ -36293,7 +36362,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         if mdl == 0 {
             pool_free_request_buffers(data, aux_data, 0);
             if owns_fo {
-                hosted_file_objects::free_file_storage(fo);
+                free_pre_entry_created_file_storage(
+                    created_file_storage.expect("CREATE lost its constructor storage"),
+                );
             }
             return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
         }
@@ -36387,7 +36458,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     if irp == 0 {
         pool_free_request_buffers(data, aux_data, mdl);
         if owns_fo {
-            hosted_file_objects::free_file_storage(fo);
+            free_pre_entry_created_file_storage(
+                created_file_storage.expect("CREATE lost its constructor storage"),
+            );
         }
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
@@ -36416,7 +36489,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    hosted_file_objects::free_file_storage(fo);
+                    free_pre_entry_created_file_storage(
+                        created_file_storage.expect("CREATE lost its constructor storage"),
+                    );
                 }
                 return (0xC000_009Au32 as i32, 0);
             }
@@ -36427,7 +36502,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    hosted_file_objects::free_file_storage(fo);
+                    free_pre_entry_created_file_storage(
+                        created_file_storage.expect("CREATE lost its constructor storage"),
+                    );
                 }
                 return (0xC000_009Au32 as i32, 0);
             }
@@ -36461,7 +36538,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                     pool_free(irp);
                     pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
-                        hosted_file_objects::free_file_storage(fo);
+                        free_pre_entry_created_file_storage(
+                            created_file_storage.expect("CREATE lost its constructor storage"),
+                        );
                     }
                     return (0xC000_009Au32 as i32, 0);
                 }
@@ -36488,7 +36567,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                     pool_free(irp);
                     pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
-                        hosted_file_objects::free_file_storage(fo);
+                        free_pre_entry_created_file_storage(
+                            created_file_storage.expect("CREATE lost its constructor storage"),
+                        );
                     }
                     return (0xC000_009Au32 as i32, 0);
                 }
@@ -36558,7 +36639,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                     pool_free(irp);
                     pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
-                        hosted_file_objects::free_file_storage(fo);
+                        free_pre_entry_created_file_storage(
+                            created_file_storage.expect("CREATE lost its constructor storage"),
+                        );
                     }
                     return (STATUS_INVALID_PARAMETER, 0);
                 }
@@ -36601,7 +36684,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 pool_free(irp);
                 pool_free_request_buffers(data, 0, mdl);
                 if owns_fo {
-                    hosted_file_objects::free_file_storage(fo);
+                    free_pre_entry_created_file_storage(
+                        created_file_storage.expect("CREATE lost its constructor storage"),
+                    );
                 }
                 return (0xC000_009Au32 as i32, 0);
             }
@@ -36629,7 +36714,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    hosted_file_objects::free_file_storage(fo);
+                    free_pre_entry_created_file_storage(
+                        created_file_storage.expect("CREATE lost its constructor storage"),
+                    );
                 }
                 return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
             }
@@ -36640,7 +36727,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                     pool_free(irp);
                     pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
-                        hosted_file_objects::free_file_storage(fo);
+                        free_pre_entry_created_file_storage(
+                            created_file_storage.expect("CREATE lost its constructor storage"),
+                        );
                     }
                     return (0xC000_000Du32 as i32, 0);
                 };
@@ -36652,7 +36741,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                     pool_free(irp);
                     pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
-                        hosted_file_objects::free_file_storage(fo);
+                        free_pre_entry_created_file_storage(
+                            created_file_storage.expect("CREATE lost its constructor storage"),
+                        );
                     }
                     return (0xC000_000Du32 as i32, 0);
                 };
@@ -36661,7 +36752,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                     pool_free(irp);
                     pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
-                        hosted_file_objects::free_file_storage(fo);
+                        free_pre_entry_created_file_storage(
+                            created_file_storage.expect("CREATE lost its constructor storage"),
+                        );
                     }
                     return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
                 }
@@ -36698,7 +36791,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    hosted_file_objects::free_file_storage(fo);
+                    free_pre_entry_created_file_storage(
+                        created_file_storage.expect("CREATE lost its constructor storage"),
+                    );
                 }
                 return (STATUS_INVALID_PARAMETER, 0);
             }
@@ -36715,7 +36810,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    hosted_file_objects::free_file_storage(fo);
+                    free_pre_entry_created_file_storage(
+                        created_file_storage.expect("CREATE lost its constructor storage"),
+                    );
                 }
                 return (STATUS_INVALID_PARAMETER, 0);
             }
@@ -36728,7 +36825,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    hosted_file_objects::free_file_storage(fo);
+                    free_pre_entry_created_file_storage(
+                        created_file_storage.expect("CREATE lost its constructor storage"),
+                    );
                 }
                 return (STATUS_INVALID_PARAMETER, 0);
             }
@@ -36748,7 +36847,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    hosted_file_objects::free_file_storage(fo);
+                    free_pre_entry_created_file_storage(
+                        created_file_storage.expect("CREATE lost its constructor storage"),
+                    );
                 }
                 return (STATUS_INVALID_PARAMETER, 0);
             }
@@ -36765,7 +36866,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    hosted_file_objects::free_file_storage(fo);
+                    free_pre_entry_created_file_storage(
+                        created_file_storage.expect("CREATE lost its constructor storage"),
+                    );
                 }
                 return (STATUS_INVALID_PARAMETER, 0);
             }
@@ -36788,7 +36891,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 pool_free(irp);
                 pool_free_request_buffers(data, aux_data, mdl);
                 if owns_fo {
-                    hosted_file_objects::free_file_storage(fo);
+                    free_pre_entry_created_file_storage(
+                        created_file_storage.expect("CREATE lost its constructor storage"),
+                    );
                 }
                 return (STATUS_INVALID_PARAMETER, 0);
             }
@@ -36824,7 +36929,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         pool_free(irp);
         pool_free_request_buffers(data, aux_data, mdl);
         if owns_fo {
-            hosted_file_objects::free_file_storage(fo);
+            free_pre_entry_created_file_storage(
+                created_file_storage.expect("CREATE lost its constructor storage"),
+            );
         }
         return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
     }
@@ -36873,7 +36980,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         );
         pool_free_request_buffers(data, aux_data, mdl);
         if owns_fo {
-            hosted_file_objects::free_file_storage(fo);
+            free_pre_entry_created_file_storage(
+                created_file_storage.expect("CREATE lost its constructor storage"),
+            );
         }
         return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
     }
@@ -36901,6 +37010,7 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     let initial_owner = PendingIrp {
         irp,
         file_object: fo,
+        created_file_storage,
         data,
         aux_data,
         mdl,
@@ -36932,7 +37042,10 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     };
     // Publish the FileId -> FILE_OBJECT binding before entering the driver. A create handler may
     // complete or issue nested work inline, so registering after MajorFunction returns is too late.
-    let fo_registered = !owns_fo || fo_register(canonical_file_id, fo);
+    let fo_registered = !owns_fo || fo_register(
+        canonical_file_id,
+        created_file_storage.expect("CREATE lost its constructor storage"),
+    );
     if !fo_registered {
         let state = pending_irp_owner_state(owner_node).load(Ordering::Acquire);
         let consuming = hosted_irp_state_with_kind(state, HOSTED_IRP_CONSUMING);
@@ -58482,6 +58595,8 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
         unsafe { hosted_device_allocations::drain_dma_adapter_tombstones(inst)? };
         unsafe { hosted_device_allocations::drain_dma_private_tombstones(inst)? };
         unsafe { hosted_device_allocations::drain_interrupt_projection_tombstones(inst)? };
+        hosted_device_allocations::drain_file_storage_acknowledgements(inst)?;
+        hosted_source_irp_ledger::drain_caller_terminal_acks(i)?;
         if !hosted_device_allocations::instance_quiesced(inst) {
             return Err(nt_status::NtStatus::DEVICE_BUSY);
         }
@@ -58941,7 +59056,7 @@ pub(crate) fn service_hosted_file(
             (status, object, 0, 0)
         };
     }
-    if !matches!(operation, 1..=3 | 9)
+    if !matches!(operation, 1..=3 | 9..=11)
         || file_id == 0
         || address == 0
         || address & 7 != 0
@@ -58949,7 +59064,7 @@ pub(crate) fn service_hosted_file(
             .checked_add(WDM_X64_FILE_OBJECT_SIZE as u64)
             .is_none()
         || (matches!(operation, 3 | 9) && request_id != 0)
-        || (matches!(operation, 1 | 2) && request_id == 0)
+        || (matches!(operation, 1 | 2 | 10 | 11) && request_id == 0)
     {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
     }
@@ -59073,6 +59188,12 @@ pub(crate) fn service_hosted_file(
         9 => unsafe {
             hosted_device_allocations::retire_file_storage(instance, file_id, address).map(|_| 0)
         },
+        10 => hosted_device_allocations::file_storage_retirement_disposition(
+            instance, file_id, address, request_id,
+        ),
+        11 => hosted_device_allocations::acknowledge_file_storage_retirement(
+            instance, file_id, address, request_id,
+        ).map(|_| 0),
         _ => unreachable!("validated File service operation"),
     };
     match result {

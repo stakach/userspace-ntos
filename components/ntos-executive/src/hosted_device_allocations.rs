@@ -213,8 +213,20 @@ struct FileStorageRow {
     file_freed: bool,
 }
 static mut FILE_ROWS: Vec<FileStorageRow> = Vec::new();
+#[derive(Clone, Copy)]
+struct FileStorageAck {
+    instance: DriverInstance,
+    domain: HostedDomainIdentity,
+    file_id: u64,
+    file: SourcePoolAllocationIdentity,
+    name: SourcePoolAllocationIdentity,
+}
+static mut FILE_ACKS: Vec<FileStorageAck> = Vec::new();
 fn file_rows() -> &'static mut Vec<FileStorageRow> {
     unsafe { &mut *core::ptr::addr_of_mut!(FILE_ROWS) }
+}
+fn file_acks() -> &'static mut Vec<FileStorageAck> {
+    unsafe { &mut *core::ptr::addr_of_mut!(FILE_ACKS) }
 }
 fn contains_allocation(identity: SourcePoolAllocationIdentity, address: u64) -> bool {
     address >= identity.component_address
@@ -821,7 +833,60 @@ pub(super) unsafe fn retire_file_storage(
         }
         row.file_freed = true;
     }
+    // Keep the exact physical receipt until the component has observed this result. A lost
+    // op9 reply cannot be interpreted as permission to issue another physical free.
+    Ok(())
+}
+
+pub(super) fn file_storage_retirement_disposition(
+    inst: DriverInstance, file_id: u64, address: u64, file_generation: u64,
+) -> Result<u64, nt_status::NtStatus> {
+    let _guard = lock();
+    let domain = validate_arena(inst)?;
+    let row = file_rows().iter().find(|row| {
+        same_arena(row.instance, inst) && row.domain == domain
+            && row.file_id == file_id && row.file.component_address == address
+            && row.file.pool_generation == file_generation && row.canonical_unbound
+    }).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    Ok(u64::from(row.name_freed) | (u64::from(row.file_freed) << 1))
+}
+
+pub(super) fn acknowledge_file_storage_retirement(
+    inst: DriverInstance, file_id: u64, address: u64, file_generation: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let _durable = crate::allocator::enter_durable();
+    let _guard = lock();
+    let domain = validate_arena(inst)?;
+    let Some(index) = file_rows().iter().position(|row| {
+        same_arena(row.instance, inst) && row.domain == domain
+            && row.file_id == file_id && row.file.component_address == address
+            && row.file.pool_generation == file_generation && row.canonical_unbound
+            && row.name_freed && row.file_freed
+    }) else {
+        return if file_acks().iter().any(|ack| {
+            same_arena(ack.instance, inst) && ack.domain == domain
+                && ack.file_id == file_id && ack.file.component_address == address
+                && ack.file.pool_generation == file_generation
+        }) { Ok(()) } else { Err(nt_status::NtStatus::INVALID_HANDLE) };
+    };
+    let row = &file_rows()[index];
+    file_acks().try_reserve(1).map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    file_acks().push(FileStorageAck {
+        instance: row.instance, domain: row.domain, file_id: row.file_id,
+        file: row.file, name: row.name,
+    });
     file_rows().swap_remove(index);
+    Ok(())
+}
+
+pub(super) fn drain_file_storage_acknowledgements(
+    inst: DriverInstance,
+) -> Result<(), nt_status::NtStatus> {
+    let _guard = lock();
+    if file_rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst)) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    file_acks().retain(|ack| !same_arena(ack.instance, inst));
     Ok(())
 }
 

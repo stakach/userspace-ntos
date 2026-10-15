@@ -652,10 +652,20 @@ fn actual_file_broker_frees_constructor_name_after_driver_replaces_field() {
         REFUSE_FILE_FREE.with(|refuse| refuse.set(true));
         assert_eq!(native::retire_file_storage(pool.inst, 41, ADDRESS),
             Err(nt_status::NtStatus::INVALID_HANDLE));
+        assert_eq!(native::file_storage_retirement_disposition(pool.inst, 41, ADDRESS, 17), Ok(1));
+        assert_eq!(native::file_storage_retirement_disposition(pool.inst, 41, ADDRESS, 18),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
         REFUSE_FILE_FREE.with(|refuse| refuse.set(false));
         drop(native::generic_free_admission(pool.inst, name_a).unwrap());
         assert!(native::generic_free_admission(pool.inst, ADDRESS).is_err());
         native::retire_file_storage(pool.inst, 41, ADDRESS).unwrap();
+        assert_eq!(native::file_storage_retirement_disposition(pool.inst, 41, ADDRESS, 17), Ok(3));
+        assert_eq!(native::acknowledge_file_storage_retirement(pool.inst, 41, ADDRESS, 18),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
+        native::acknowledge_file_storage_retirement(pool.inst, 41, ADDRESS, 17).unwrap();
+        native::acknowledge_file_storage_retirement(pool.inst, 41, ADDRESS, 17).unwrap();
+        assert_eq!(native::acknowledge_file_storage_retirement(pool.inst, 42, ADDRESS, 17),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
         let _lock = hosted_instance_pool_lock(exec).unwrap();
         assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(pool.inst, name_a), Some(true));
         assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(pool.inst, ADDRESS), Some(true));
@@ -663,6 +673,16 @@ fn actual_file_broker_frees_constructor_name_after_driver_replaces_field() {
     }
     let refused = unsafe { native::protect_file_storage(pool.inst, 41, ADDRESS) }.err().unwrap();
     assert!(refused.no_root_owner);
+}
+
+#[test]
+fn file_ack_tombstone_uses_durable_storage_before_reserve() {
+    let source = include_str!("../../../components/ntos-executive/src/hosted_device_allocations.rs");
+    let acknowledge = source.split("pub(super) fn acknowledge_file_storage_retirement(")
+        .nth(1).unwrap().split("pub(super) fn drain_file_storage_acknowledgements").next().unwrap();
+    let durable = acknowledge.find("crate::allocator::enter_durable()").unwrap();
+    let reserve = acknowledge.find("file_acks().try_reserve(1)").unwrap();
+    assert!(durable < reserve, "a retained ACK vector must outlive transient request storage");
 }
 
 #[test]
