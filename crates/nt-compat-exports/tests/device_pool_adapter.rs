@@ -18,6 +18,8 @@ const POOL_DATA_OFF: u64 = 0x1000;
 const PAYLOAD: u64 = POOL_DATA_OFF + 16;
 const ADDRESS: u64 = FSD_POOL_VADDR + PAYLOAD;
 const CAPACITY: u64 = 0x200;
+const HOSTED_DMA_ADAPTER_SIZE: u64 = 0x40;
+const HOSTED_DMA_ADAPTER_SIGNATURE_OFFSET: u64 = 0x10;
 const POOL_FREE_LIST_MAX: u64 = FSD_POOL_FRAMES * 0x1000 / 16;
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -52,7 +54,10 @@ thread_local! {
     static PUBLICATION_PIN: RefCell<Option<nt_io_manager::HostedDeviceProjectionReference>> = const { RefCell::new(None) };
     static REFUSE_FILE_FREE: Cell<bool> = const { Cell::new(false) };
     static REFUSE_DEVICE_FREE: Cell<bool> = const { Cell::new(false) };
+    static REFUSE_DMA_FREE: Cell<Option<u64>> = const { Cell::new(None) };
     static GUARDED_READ: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+    static ALLOC_FAIL_CALL: Cell<u64> = const { Cell::new(0) };
+    static ALLOC_CALLS: Cell<u64> = const { Cell::new(0) };
 }
 
 unsafe fn read_unaligned<T>(pointer: *const T) -> T {
@@ -111,6 +116,9 @@ mod retirement;
 
 unsafe fn hosted_instance_pool_free_unlocked(inst: DriverInstance, address: u64) -> bool {
     assert_pool_locked(inst.exec_pool_va);
+    if REFUSE_DMA_FREE.with(|refuse| refuse.get()) == Some(address) {
+        return false;
+    }
     if address == ADDRESS && (REFUSE_FILE_FREE.with(|refuse| refuse.get())
         || REFUSE_DEVICE_FREE.with(|refuse| refuse.get())) {
         return false;
@@ -124,6 +132,25 @@ unsafe fn hosted_instance_pool_free_unlocked(inst: DriverInstance, address: u64)
     write_volatile(head, address);
     EVENTS.with(|events| events.borrow_mut().push("free"));
     true
+}
+
+unsafe fn hosted_instance_pool_alloc_unlocked(inst: DriverInstance, size: u64) -> Option<u64> {
+    assert_pool_locked(inst.exec_pool_va);
+    let call = ALLOC_CALLS.with(|calls| {
+        let call = calls.get() + 1;
+        calls.set(call);
+        call
+    });
+    if ALLOC_FAIL_CALL.with(|fail| fail.get()) == call { return None; }
+    let used = hosted_pool_used(inst.exec_pool_va);
+    let header = (used + 15) & !15;
+    let block = header.checked_add(16)?;
+    let end = block.checked_add(size)?;
+    if end > FSD_POOL_FRAMES * 0x1000 { return None; }
+    write_volatile((inst.exec_pool_va + header) as *mut u64, size);
+    write_volatile((inst.exec_pool_va + header + 8) as *mut u64, 100 + call);
+    write_volatile(inst.exec_pool_va as *mut u64, end);
+    Some(FSD_POOL_VADDR + block)
 }
 
 fn yield_now() {
@@ -227,6 +254,90 @@ unsafe fn populate_device_driver_list(pool: &Pool) -> u64 {
     write_unaligned((device_exec + 2) as *mut u16, WDM_X64_DEVICE_OBJECT_SIZE as u16);
     write_unaligned((device_exec + 8) as *mut u64, driver_address);
     driver_address
+}
+
+#[test]
+fn dma_pair_retains_exact_members_across_mutation_refusal_and_retry() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let mut io = IoManager::new(MockObjectPort::new());
+    let domain = io.register_hosted_domain();
+    MANAGER.with(|manager| manager.set(&mut io));
+    let _manager_scope = ManagerScope;
+    let pool = Pool::new(domain, 89, 0xd000);
+    unsafe {
+        let device_exec = pool.inst.exec_pool_va + PAYLOAD;
+        write_unaligned(device_exec as *mut i16, WDM_X64_IO_TYPE_DEVICE);
+        write_unaligned((device_exec + 2) as *mut u16, WDM_X64_DEVICE_OBJECT_SIZE as u16);
+        native::protect_allocation(pool.inst, ADDRESS).unwrap();
+
+        // The second allocation refuses before publication. Its first member and empty
+        // lease row must be fully released, so a fresh lease may be provisioned.
+        ALLOC_CALLS.with(|calls| calls.set(0));
+        ALLOC_FAIL_CALL.with(|fail| fail.set(2));
+        assert_eq!(native::provision_dma_adapter_pair(pool.inst, 991),
+            Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES));
+        ALLOC_FAIL_CALL.with(|fail| fail.set(0));
+        assert!(!native::has_dma_adapter_pair(991));
+
+        let (adapter, ops) = native::provision_dma_adapter_pair(pool.inst, 992).unwrap();
+        assert_ne!(adapter, ops);
+        assert!(native::generic_free_admission(pool.inst, adapter).is_err());
+        assert!(native::generic_free_admission(pool.inst, ops).is_err());
+        // The provider-writable field names an unrelated protected Device. Retirement
+        // must use the two row-captured physical identities, never this field.
+        let adapter_exec = pool.inst.exec_pool_va + adapter - FSD_POOL_VADDR;
+        write_unaligned((adapter_exec + 8) as *mut u64, ADDRESS);
+        let device_before = read_unaligned(device_exec as *const i16);
+        let ops_exec = pool.inst.exec_pool_va + ops - FSD_POOL_VADDR;
+        let original_generation = read_volatile((ops_exec - 8) as *const u64);
+        write_volatile((ops_exec - 8) as *mut u64, original_generation + 1);
+        let mut puts = 0;
+        assert_eq!(native::retire_dma_adapter_pair(pool.inst, 992, adapter, || {
+            puts += 1;
+            Ok(())
+        }), Err(nt_status::NtStatus::INVALID_HANDLE));
+        assert_eq!(puts, 0, "stale physical generation cannot put the lease");
+        write_volatile((ops_exec - 8) as *mut u64, original_generation);
+        assert_eq!(native::retire_dma_adapter_pair(pool.inst, 992, adapter, || {
+            puts += 1;
+            Err(nt_status::NtStatus::DEVICE_BUSY)
+        }), Err(nt_status::NtStatus::DEVICE_BUSY));
+        assert_eq!(puts, 1);
+        assert!(native::generic_free_admission(pool.inst, ops).is_err());
+        REFUSE_DMA_FREE.with(|refuse| refuse.set(Some(ops)));
+        assert_eq!(native::retire_dma_adapter_pair(pool.inst, 992, adapter, || {
+            puts += 1;
+            Ok(())
+        }), Err(nt_status::NtStatus::INVALID_HANDLE));
+        assert_eq!(puts, 2, "the refused logical put has no effect and can retry");
+        assert!(native::has_dma_adapter_pair(992));
+        REFUSE_DMA_FREE.with(|refuse| refuse.set(None));
+        native::retire_dma_adapter_pair(pool.inst, 992, adapter, || {
+            puts += 1;
+            Ok(())
+        }).unwrap();
+        assert_eq!(puts, 2, "physical retry must not replay acknowledged logical put");
+        assert!(!native::has_dma_adapter_pair(992));
+        assert!(native::protects_allocation(pool.inst, adapter));
+        assert!(native::generic_free_admission(pool.inst, adapter).is_err());
+        assert!(!native::instance_quiesced(pool.inst));
+        let (next_adapter, _) = native::provision_dma_adapter_pair(pool.inst, 993).unwrap();
+        assert_ne!(next_adapter, adapter, "retired raw adapter address must not be reused");
+        assert_eq!(native::retire_dma_adapter_pair(pool.inst, 992, adapter, || Ok(())),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
+        native::retire_dma_adapter_pair(pool.inst, 993, next_adapter, || Ok(())).unwrap();
+        assert_eq!(read_unaligned(device_exec as *const i16), device_before);
+        assert!(native::protects_allocation(pool.inst, ADDRESS));
+        retirement::retire_hosted_device_projection(pool.inst, ADDRESS,
+            retirement::CanonicalRetirement::ConfirmedUnbound { domain }, None).unwrap();
+        REFUSE_DMA_FREE.with(|refuse| refuse.set(Some(adapter)));
+        assert_eq!(native::drain_dma_adapter_tombstones(pool.inst),
+            Err(nt_status::NtStatus::INVALID_HANDLE));
+        assert!(!native::instance_quiesced(pool.inst));
+        REFUSE_DMA_FREE.with(|refuse| refuse.set(None));
+        native::drain_dma_adapter_tombstones(pool.inst).unwrap();
+        assert!(native::instance_quiesced(pool.inst));
+    }
 }
 
 #[test]

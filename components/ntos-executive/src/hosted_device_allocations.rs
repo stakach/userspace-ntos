@@ -5,6 +5,33 @@ use nt_io_manager::{
     HostedDevicePointerRegistration, ProjectionAllocationLedger, ProjectionAllocationOwner,
 };
 
+#[path = "hosted_dma_adapter_pair.rs"]
+mod dma_adapter_pair;
+
+pub(super) unsafe fn provision_dma_adapter_pair(
+    inst: DriverInstance, lease_id: u64,
+) -> Result<(u64, u64), nt_status::NtStatus> {
+    dma_adapter_pair::provision_dma_adapter_pair(inst, lease_id)
+}
+
+pub(super) unsafe fn retire_dma_adapter_pair(
+    inst: DriverInstance, lease_id: u64, adapter_address: u64,
+    put: impl FnOnce() -> Result<(), nt_status::NtStatus>,
+) -> Result<(), nt_status::NtStatus> {
+    dma_adapter_pair::retire_dma_adapter_pair(inst, lease_id, adapter_address, put)
+}
+
+pub(super) fn has_dma_adapter_pair(lease_id: u64) -> bool {
+    let _catalog = lock();
+    dma_adapter_pair::has_lease(lease_id)
+}
+
+pub(super) unsafe fn drain_dma_adapter_tombstones(
+    inst: DriverInstance,
+) -> Result<(), nt_status::NtStatus> {
+    dma_adapter_pair::drain_dma_adapter_tombstones(inst)
+}
+
 struct Row {
     instance: DriverInstance,
     domain: HostedDomainIdentity,
@@ -225,6 +252,7 @@ pub(super) unsafe fn pin_temporary_pool_range(
         hosted_instance_pool_lock(inst.exec_pool_va).ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
     let exact = allocation_containing(inst, address, bytes)?;
     if ledger().protects_address(domain, exact.component_address)
+        || dma_adapter_pair::protects(inst, exact.component_address)
         || rows().iter().any(|row| {
             same_pool(row.instance, inst)
                 && row.allocation.component_address == exact.component_address
@@ -471,6 +499,7 @@ pub(super) fn generic_free_admission(
     let guard = lock();
     let domain = validate_arena(inst)?;
     if ledger().protects_address(domain, address)
+        || dma_adapter_pair::protects(inst, address)
         || rows().iter().any(|row| {
             same_pool(row.instance, inst)
                 && address >= row.allocation.component_address
@@ -518,7 +547,9 @@ pub(super) unsafe fn protect_file_storage(
             return Err(nt_status::NtStatus::INVALID_PARAMETER);
         }
         let name = allocation(inst, name_address)?;
-        if file_rows().iter().any(|row| {
+        if dma_adapter_pair::protects(inst, address)
+            || dma_adapter_pair::protects(inst, name_address)
+            || file_rows().iter().any(|row| {
             (row.domain == domain || same_pool(row.instance, inst))
                 && (protects_file_member(row, address)
                     || protects_file_member(row, name_address))
@@ -681,6 +712,9 @@ pub(super) unsafe fn protect_allocation_exact(
     let current = allocation(inst, address)?;
     if expected.is_some_and(|expected| expected != current) {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    if dma_adapter_pair::protects(inst, address) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     if rows().iter().any(|row| {
         (row.domain == domain || same_pool(row.instance, inst)) && !same_arena(row.instance, inst)
@@ -1050,7 +1084,8 @@ pub(super) fn accepted_registration(
 
 pub(super) fn instance_quiesced(inst: DriverInstance) -> bool {
     let _guard = lock();
-    !file_rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
+    !dma_adapter_pair::owns_pool(inst)
+        && !file_rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
         && !rows()
             .iter()
             .any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
@@ -1059,9 +1094,17 @@ pub(super) fn instance_quiesced(inst: DriverInstance) -> bool {
         .any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
 }
 
+pub(super) fn instance_ready_to_drain_dma_tombstones(inst: DriverInstance) -> bool {
+    let _guard = lock();
+    !dma_adapter_pair::has_live_pair(inst)
+        && !file_rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
+        && !rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
+        && !temporary_pins().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
+}
+
 pub(super) fn protects_allocation(inst: DriverInstance, address: u64) -> bool {
     let _guard = lock();
-    rows().iter().any(|row| {
+    dma_adapter_pair::protects(inst, address) || rows().iter().any(|row| {
         (same_arena(row.instance, inst) || same_pool(row.instance, inst))
             && address >= row.allocation.component_address
             && address < row.allocation.component_address + row.allocation.capacity

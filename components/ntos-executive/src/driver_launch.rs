@@ -4045,6 +4045,14 @@ unsafe fn hosted_instance_pool_alloc(inst: DriverInstance, size: u64) -> Option<
         return None;
     }
     let _guard = hosted_instance_pool_lock(inst.exec_pool_va)?;
+    hosted_instance_pool_alloc_unlocked(inst, size)
+}
+
+/// Caller holds the shared pool lock, allowing allocation and owner publication to be atomic.
+unsafe fn hosted_instance_pool_alloc_unlocked(inst: DriverInstance, size: u64) -> Option<u64> {
+    if inst.exec_pool_va == 0 || size == 0 {
+        return None;
+    }
     let pool_bytes = FSD_POOL_FRAMES.checked_mul(0x1000)?;
     let exec_pool_end = inst.exec_pool_va.checked_add(pool_bytes)?;
     let component_pool_end = component_pool_end();
@@ -10704,38 +10712,43 @@ fn project_hosted_dma_adapter(
         {
             return 0;
         }
-        let adapter_id = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_ID) as *const u64);
-        let grant_va = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_VA) as *const u64);
-        let grant_len = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LEN) as *const u64);
-        let grant_logical = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LOGICAL) as *const u64);
-        if adapter_id == 0
-            || adapter_id != granted_adapter_id
+        let (_label, pair_status, adapter, ops, pair_lease_id) = call_on5(
+            (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+            granted_lease_id,
+            HOSTED_DMA_SERVICE_PROVISION_ADAPTER << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+            0, 0, 0,
+        );
+        if pair_status as u32 as i32 != STATUS_SUCCESS
+            || pair_lease_id != granted_lease_id
+            || adapter == 0 || ops == 0 || adapter == ops
+        {
+            return 0;
+        }
+        let (_label, grant_status, grant_va, grant_len, grant_logical) = call_on5(
+            (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+            granted_lease_id,
+            HOSTED_DMA_SERVICE_QUERY_GRANT << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+            0, 0, 0,
+        );
+        let adapter_id = granted_adapter_id;
+        if grant_status as u32 as i32 != STATUS_SUCCESS
             || grant_va == 0
             || grant_len == 0
             || grant_logical == 0
         {
             return 0;
         }
-        let active_adapter = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *const u64);
-        if dma_adapter_blob_matches(active_adapter, adapter_id)
-            && read_unaligned((active_adapter + HOSTED_DMA_ADAPTER_LEASE_ID_OFFSET) as *const u64)
+        if dma_adapter_blob_matches(adapter, adapter_id)
+            && read_unaligned((adapter + HOSTED_DMA_ADAPTER_LEASE_ID_OFFSET) as *const u64)
                 == granted_lease_id
         {
             if !number_of_map_registers.is_null() {
                 write_unaligned(number_of_map_registers, granted_map_registers as u32);
             }
-            return active_adapter;
+            return adapter;
         }
 
-        let ops = pool_alloc(0x100);
-        if ops == 0 {
-            return 0;
-        }
-        let adapter = pool_alloc(HOSTED_DMA_ADAPTER_SIZE);
-        if adapter == 0 {
-            pool_free(ops);
-            return 0;
-        }
+        // The root returned both exact addresses for this authenticated lease.
 
         // DMA_OPERATIONS: publish the NT5 WDM operations needed by NDIS bus-master DMA. Later
         // post-NT5 extended entries stay NULL and therefore fail closed if a driver requires them.
@@ -10844,16 +10857,12 @@ fn project_hosted_dma_adapter(
 /// `PutDmaAdapter` — release the component-local adapter projection.
 extern "win64" fn s_dma_put_adapter(adapter: u64) {
     unsafe {
-        if dma_adapter_blob_id(adapter).is_none() {
-            return;
-        }
-        let lease_id = read_unaligned((adapter + HOSTED_DMA_ADAPTER_LEASE_ID_OFFSET) as *const u64);
-        if lease_id == 0 {
+        if adapter == 0 {
             return;
         }
         let (_label, status, _, _, _) = call_on5(
             (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
-            lease_id,
+            adapter,
             HOSTED_DMA_SERVICE_RELEASE_ADAPTER << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
             0,
             0,
@@ -10863,15 +10872,6 @@ extern "win64" fn s_dma_put_adapter(adapter: u64) {
             return;
         }
         let active = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *const u64);
-        let ops = read_unaligned((adapter + HOSTED_DMA_ADAPTER_OPS_OFFSET) as *const u64);
-        write_unaligned(
-            (adapter + HOSTED_DMA_ADAPTER_SIGNATURE_OFFSET) as *mut u64,
-            0,
-        );
-        pool_free(adapter);
-        if ops != 0 {
-            pool_free(ops);
-        }
         if adapter == active {
             write_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *mut u64, 0);
             write_volatile((FSD_SHARED_VADDR + SH_DMA_OPS_BLOB) as *mut u64, 0);
@@ -10897,6 +10897,8 @@ const HOSTED_DMA_SERVICE_OPERATION_SHIFT: u64 = 56;
 const HOSTED_DMA_SERVICE_OPERATION_MASK: u64 = 0xff << HOSTED_DMA_SERVICE_OPERATION_SHIFT;
 const HOSTED_DMA_SERVICE_REQUEST_ADAPTER: u64 = 1;
 const HOSTED_DMA_SERVICE_RELEASE_ADAPTER: u64 = 2;
+const HOSTED_DMA_SERVICE_PROVISION_ADAPTER: u64 = 3;
+const HOSTED_DMA_SERVICE_QUERY_GRANT: u64 = 4;
 
 #[derive(Clone, Copy)]
 struct HostedDmaAdapterMetadata {
@@ -47946,6 +47948,8 @@ enum HostedDmaPdoGeneration {
 struct HostedDmaAdapterLease {
     lease_id: u64,
     adapter_id: u64,
+    adapter_address: Option<u64>,
+    grant: Option<(u64, u64, u64)>,
     owner: DmaOwner,
     consumer_domain: HostedDomainIdentity,
     pdo_registration: nt_io_manager::HostedDevicePointerRegistration,
@@ -49395,6 +49399,8 @@ unsafe fn retain_hosted_dma_adapter_lease(
     leases.push(HostedDmaAdapterLease {
         lease_id,
         adapter_id,
+        adapter_address: None,
+        grant: None,
         owner,
         consumer_domain: binding.projection_domain,
         pdo_registration,
@@ -49405,12 +49411,14 @@ unsafe fn retain_hosted_dma_adapter_lease(
 
 unsafe fn release_hosted_dma_adapter_lease(
     consumer_domain: HostedDomainIdentity,
-    lease_id: u64,
+    inst: DriverInstance,
+    adapter_address: u64,
 ) -> Result<(), nt_status::NtStatus> {
     let leases = hosted_dma_adapter_leases_mut();
     let index = leases
         .iter()
-        .position(|lease| lease.lease_id == lease_id)
+        .position(|lease| lease.adapter_address == Some(adapter_address)
+            && lease.consumer_domain == consumer_domain)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let lease = leases[index];
     if lease.consumer_domain != consumer_domain
@@ -49425,16 +49433,59 @@ unsafe fn release_hosted_dma_adapter_lease(
     {
         return Err(nt_status::NtStatus::ACCESS_DENIED);
     }
-    hosted_dma_manager_mut()
-        .put_adapter_for_owner(lease.owner, lease.adapter_id)
-        .map_err(hosted_dma_status)?;
+    hosted_device_allocations::retire_dma_adapter_pair(
+        inst, lease.lease_id, adapter_address,
+        || hosted_dma_manager_mut()
+            .put_adapter_for_owner(lease.owner, lease.adapter_id)
+            .map_err(hosted_dma_status),
+    )?;
     leases.remove(index);
     Ok(())
 }
 
-unsafe fn revoke_hosted_dma_adapter_leases(binding: HostedDeviceBinding) {
+/// A definite pre-publication allocation refusal owns no physical pair. Retain the lease if
+/// its local manager put refuses; no component pointer was ever handed out.
+unsafe fn release_unpublished_hosted_dma_adapter_lease(lease_id: u64) {
+    if hosted_device_allocations::has_dma_adapter_pair(lease_id) { return; }
+    let leases = hosted_dma_adapter_leases_mut();
+    let Some(index) = leases.iter().position(|lease| lease.lease_id == lease_id
+        && lease.adapter_address.is_none()) else { return; };
+    let lease = leases[index];
+    if hosted_dma_manager_mut()
+        .put_adapter_for_owner(lease.owner, lease.adapter_id).is_ok()
+    {
+        leases.remove(index);
+    }
+}
+
+unsafe fn revoke_hosted_dma_adapter_leases(
+    binding: HostedDeviceBinding,
+) -> Result<(), nt_status::NtStatus> {
     let owner = hosted_dma_owner(binding);
-    hosted_dma_adapter_leases_mut().retain(|lease| lease.owner != owner);
+    let inst = instance(binding.projection_instance)
+        .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    let mut index = 0;
+    while index < hosted_dma_adapter_leases_mut().len() {
+        let lease = hosted_dma_adapter_leases_mut()[index];
+        if lease.owner != owner {
+            index += 1;
+            continue;
+        }
+        if hosted_device_allocations::has_dma_adapter_pair(lease.lease_id) {
+            hosted_device_allocations::retire_dma_adapter_pair(
+                inst, lease.lease_id, lease.adapter_address.unwrap_or(0),
+                || hosted_dma_manager_mut()
+                    .put_adapter_for_owner(lease.owner, lease.adapter_id)
+                    .map_err(hosted_dma_status),
+            )?;
+        } else {
+            hosted_dma_manager_mut()
+                .put_adapter_for_owner(lease.owner, lease.adapter_id)
+                .map_err(hosted_dma_status)?;
+        }
+        hosted_dma_adapter_leases_mut().remove(index);
+    }
+    Ok(())
 }
 
 unsafe fn hosted_device_bindings_mut() -> &'static mut Vec<HostedDeviceBinding> {
@@ -54294,7 +54345,7 @@ unsafe fn clear_hosted_resource_projection(
     }
     retire_hosted_device_port_caps(binding)?;
     let _ = hosted_resource_manager_mut().revoke_owner(hosted_resource_owner(binding));
-    revoke_hosted_dma_adapter_leases(binding);
+    revoke_hosted_dma_adapter_leases(binding)?;
     let _ = hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
     clear_shared_address_resources(sh);
     write_volatile((sh + SH_RESOURCE_PDO_OBJECT) as *mut u64, 0);
@@ -58336,6 +58387,10 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     if let Some(inst) = inst {
+        if !hosted_device_allocations::instance_ready_to_drain_dma_tombstones(inst) {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+        unsafe { hosted_device_allocations::drain_dma_adapter_tombstones(inst)? };
         if !hosted_device_allocations::instance_quiesced(inst) {
             return Err(nt_status::NtStatus::DEVICE_BUSY);
         }
@@ -59024,10 +59079,58 @@ pub(crate) fn service_hosted_driver_dma_adapter(
         let Some(domain) = instance_domain_identity(inst) else {
             return (STATUS_ACCESS_DENIED, 0, 0, 0);
         };
-        return match unsafe { release_hosted_dma_adapter_lease(domain, pdo_object) } {
+        return match unsafe { release_hosted_dma_adapter_lease(domain, inst, pdo_object) } {
             Ok(()) => (STATUS_SUCCESS, 0, 0, 0),
             Err(status) => (status.raw(), 0, 0, 0),
         };
+    }
+    if operation == HOSTED_DMA_SERVICE_PROVISION_ADAPTER
+        || operation == HOSTED_DMA_SERVICE_QUERY_GRANT {
+        if words != [0; 4] || pdo_object == 0 {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
+        let Some((_instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        };
+        let Some(domain) = instance_domain_identity(inst) else {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        };
+        let lease = (unsafe { hosted_dma_adapter_leases_mut() }).iter().copied()
+            .find(|lease| lease.lease_id == pdo_object
+                && lease.consumer_domain == domain);
+        let Some(lease) = lease else {
+            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
+        };
+        if unsafe { io_manager_mut().hosted_device_pointer_registration(
+            lease.pdo_registration.domain(), lease.pdo_registration.address()) }
+            != Some(lease.pdo_registration)
+            || !unsafe { hosted_dma_pdo_generation_is_live(
+                lease.pdo_registration.device_id().raw(), lease.pdo_generation) }
+        {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        }
+        if operation == HOSTED_DMA_SERVICE_QUERY_GRANT {
+            return match lease.grant {
+                Some((va, len, logical)) => (STATUS_SUCCESS, va, len, logical),
+                None => (STATUS_DEVICE_NOT_READY, 0, 0, 0),
+            };
+        }
+        let (adapter, ops) = match unsafe {
+            hosted_device_allocations::provision_dma_adapter_pair(inst, lease.lease_id)
+        } {
+            Ok(pair) => pair,
+            Err(status) => {
+                unsafe { release_unpublished_hosted_dma_adapter_lease(lease.lease_id) };
+                return (status.raw(), 0, 0, 0);
+            }
+        };
+        let Some(current) = (unsafe { hosted_dma_adapter_leases_mut() })
+            .iter_mut().find(|current| current.lease_id == lease.lease_id
+                && current.consumer_domain == domain) else {
+            return (STATUS_INVALID_HANDLE, 0, 0, 0);
+        };
+        current.adapter_address = Some(adapter);
+        return (STATUS_SUCCESS, adapter, ops, lease.lease_id);
     }
     if operation != HOSTED_DMA_SERVICE_REQUEST_ADAPTER {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
@@ -59264,6 +59367,15 @@ pub(crate) fn service_hosted_driver_dma_adapter(
             return (status.raw(), 0, 0, 0);
         }
     };
+    let grant = (window.dma_va, window.dma_len, window.dma_logical);
+    let Some(lease) = (unsafe { hosted_dma_adapter_leases_mut() })
+        .iter_mut().find(|lease| lease.lease_id == lease_id) else {
+        return (STATUS_INVALID_HANDLE, 0, 0, 0);
+    };
+    if lease.grant.is_some_and(|existing| existing != grant) {
+        return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
+    }
+    lease.grant = Some(grant);
     (
         STATUS_SUCCESS,
         adapter.adapter_id,
