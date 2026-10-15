@@ -2,6 +2,25 @@
 
 use std::process::Command;
 
+fn source_block<'a>(source: &'a str, marker: &str) -> &'a str {
+    let start = source.find(marker).unwrap_or_else(|| panic!("missing source block: {marker}"));
+    let open = source[start..].find('{').expect("source block body") + start;
+    let mut depth = 0usize;
+    for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[start..=open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unterminated source block: {marker}");
+}
+
 #[test]
 fn native_registry_mount_requires_wal_replay_admission() {
     let source = include_str!("../../../components/ntos-executive/src/writable_fs.rs");
@@ -242,4 +261,172 @@ fn cm_persistence_owner_retains_refused_release_for_exact_retry() {
     let result = Command::new(&binary).output().unwrap();
     let _ = std::fs::remove_dir_all(directory);
     assert!(result.status.success(), "persistence owner lost a refused release");
+}
+
+#[test]
+fn hosted_relation_query_owns_publication_before_cm_transport() {
+    let driver = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    let query = source_block(driver, "struct HostedDeviceRelationQuery {");
+    assert!(query.contains("publication: Option<HostedRelationPublication>"),
+        "the already-retained relation query must own PnP preparation and CM progress");
+    let start = source_block(driver, "unsafe fn start_hosted_device_relation_query() -> usize {");
+    assert!(start.contains("publication: None"), "a new query starts without a publication owner");
+
+    let publish = source_block(driver, "unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishError> {");
+    assert!(publish.contains("query.publication.as_mut()"),
+        "a retry must redrive the installed publication instead of preparing another provider batch");
+    let install = publish.find("query.publication = Some(")
+        .expect("install the exact PnP and CM owner in the query before transport");
+    let before_install = &publish[..install];
+    assert!(!before_install.contains("cm_mutation_transport::begin(")
+        && !before_install.contains("cm_mutation_transport::prepare(")
+        && !before_install.contains("cm_mutation_transport::commit(")
+        && !before_install.contains("advance_hosted_relation_publication("),
+        "first CM transport/advance must follow installation of the relation owner");
+    assert!(publish[install..].contains("advance_hosted_relation_publication("),
+        "the installed publication must be advanced by the relation pump");
+}
+
+#[test]
+fn hosted_relation_uncertain_cm_keeps_provider_batch_and_invalidation_claim() {
+    let driver = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    let publish = source_block(driver, "unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishError> {");
+    assert!(!publish.contains("crate::persist_and_publish_system_hive_mutation("),
+        "the one-shot CM path cannot distinguish an uncertain reply from a confirmed refusal");
+    let pending = source_block(publish, "HostedRelationPublicationProgress::Pending => {");
+    assert!(pending.contains("Err(HostedRelationPublishError::Retry)"),
+        "uncertain CM progress must return Retry for the same query owner");
+    for forbidden in ["publication.take()", "provider_batch.abort(", "complete_terminal(",
+        "set_hosted_relation_query_disposition("] {
+        assert!(!pending.contains(forbidden), "pending CM arm may not release {forbidden}");
+    }
+    let pump = source_block(driver, "unsafe fn drain_hosted_device_relation_query() -> usize {");
+    assert!(pump.contains("Err(HostedRelationPublishError::Retry) => return progress"),
+        "pending CM progress must retain the relation query and invalidation claim");
+}
+
+#[test]
+fn hosted_relation_definite_preparation_refusal_cancels_exact_token() {
+    let helper = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"), "/../../components/ntos-executive/src/hosted_relation_publication.rs"
+    )).expect("retained relation publication helper must exist");
+    let owner = source_block(&helper, "struct HostedRelationPublication {");
+    assert!(owner.contains("SystemHiveMutationPreparation"),
+        "the preparation token must remain owned through cancellation");
+    let advance = source_block(&helper, "unsafe fn advance_hosted_relation_publication(");
+    let prepare = source_block(advance, "Phase::Prepare => {");
+    assert!(prepare.contains("CmMutationPreparationPhase::Cancelled")
+        || (prepare.contains("CmMutationPreparationPhase as P")
+            && prepare.contains("P::Cancelled")));
+    for required in ["take_cancelled()",
+        "CmMutationPreparationOperation::Cancel",
+        "CmMutationPreparationOperation::AcknowledgeCancellation"] {
+        assert!(prepare.contains(required),
+            "a definite preparation refusal must retain and cancel the exact CM token: {required}");
+    }
+    assert!(prepare.contains("Phase::AbortProvider"),
+        "only an acknowledged cancellation may release the provider batch");
+}
+
+#[test]
+fn hosted_relation_local_publication_precedes_exact_cm_ack() {
+    let helper = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"), "/../../components/ntos-executive/src/hosted_relation_publication.rs"
+    )).expect("retained relation publication helper must exist");
+    let owner = source_block(&helper, "struct HostedRelationPublication {");
+    for field in ["PreparedBusRelations", "PreparedEnumeratedPdoBatch",
+        "PreparedAcceptedPdoProviderBatch", "CmMutationBeginAttempt",
+        "SystemHiveMutationPreparation", "SystemHiveMutationCommitReceipt"] {
+        assert!(owner.contains(field), "retained relation publication is missing {field}");
+    }
+    let advance = source_block(&helper, "unsafe fn advance_hosted_relation_publication(");
+    let local = source_block(&helper, "unsafe fn finish_hosted_relation_local_publication(");
+    let cm_commit = advance.find("cm_mutation_transport::commit(")
+        .expect("CM COMMIT needs an exact retained receipt");
+    let publication = advance.find("commit_prospective_relation_with_lease(")
+        .expect("prevalidate and publish the retained devnode, bus, and provider owners together");
+    let finish = advance.find("finish_hosted_relation_local_publication(owner)")
+        .expect("finish local publication in the same PnP step");
+    let catalog = local.find("try_commit_hosted_acpi_pci_relation_sources(")
+        .expect("publish the retained ACPI catalog after preflight");
+    let claim = local.find(".complete_terminal(")
+        .expect("complete the exact invalidation claim from the owner");
+    let ack = advance.find("cm_mutation_transport::acknowledge(")
+        .expect("acknowledge the exact retained CM COMMIT receipt");
+    assert!(cm_commit < publication && publication < finish && finish < ack
+        && catalog < claim,
+        "the exact CM receipt must remain owned until local PnP publication finishes before ACK");
+    assert!(advance.contains("PostCommitRepair"),
+        "fallible PnP publication after CM COMMIT requires a retained repair phase");
+    assert!(advance.contains("Phase::Reprepare")
+        && advance.contains("batch.abort(io_manager_mut())")
+        && advance.contains("prepare_bus_relations(")
+        && advance.contains("prepare_relation("),
+        "drift after CM COMMIT must release the old exact provider lease and reprepare all owners");
+}
+
+#[test]
+fn hosted_relation_preflights_terminal_owners_before_pnp_effects() {
+    let helper = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"), "/../../components/ntos-executive/src/hosted_relation_publication.rs"
+    )).expect("retained relation publication helper must exist");
+    let repair = source_block(&helper, "Phase::PostCommitRepair => {");
+    let pnp_effect = repair.find("commit_prospective_relation_with_lease(")
+        .expect("combined PnP publication must remain retained");
+    for admission in ["validate_prospective_reservations(",
+        "preview_complete_terminal(", "validate_hosted_pci_relation_completion("] {
+        let index = repair.find(admission)
+            .unwrap_or_else(|| panic!("missing pre-effect terminal admission: {admission}"));
+        assert!(index < pnp_effect,
+            "{admission} must refuse before any PnP/provider publication");
+    }
+    assert!(repair.contains("Phase::Reprepare"),
+        "a pre-effect terminal refusal must retain the CM receipt for forward repair");
+}
+
+#[test]
+fn hosted_relation_retains_same_bus_exclusion_through_cm_ack() {
+    let helper = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"), "/../../components/ntos-executive/src/hosted_relation_publication.rs"
+    )).expect("retained relation publication helper must exist");
+    let owner = source_block(&helper, "struct HostedRelationPublication {");
+    assert!(owner.contains("BusRelationPublicationLease"),
+        "the relation owner must retain exact same-bus exclusion through uncertain CM effects");
+    let advance = source_block(&helper, "unsafe fn advance_hosted_relation_publication(");
+    assert!(advance.contains("commit_prospective_relation_with_lease("),
+        "only the retained relation owner may publish while the bus is excluded");
+    let ack = advance.find("cm_mutation_transport::acknowledge(").unwrap();
+    let release = advance.find("release_publication_lease(")
+        .expect("the bus lease must be released after exact CM ACK");
+    assert!(ack < release);
+}
+
+#[test]
+fn hosted_relation_never_reenters_pnp_commit_after_local_publication() {
+    let helper = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"), "/../../components/ntos-executive/src/hosted_relation_publication.rs"
+    )).expect("retained relation publication helper must exist");
+    let advance = source_block(&helper, "unsafe fn advance_hosted_relation_publication(");
+    let precommit = source_block(advance, "Phase::PostCommitRepair => {");
+    let terminal = source_block(advance, "Phase::FinishLocalPublication => {");
+    assert!(precommit.contains("commit_prospective_relation_with_lease(")
+        && precommit.contains("owner.phase = Phase::FinishLocalPublication"),
+        "successful PnP/provider commit must enter a forward-only terminal phase");
+    assert!(!terminal.contains("commit_prospective_relation_with_lease(")
+        && !terminal.contains("Phase::Reprepare"),
+        "catalog or terminal refusal after PnP publication must retain exact state without replay");
+}
+
+#[test]
+fn hosted_relation_budget_edge_finishes_catalog_before_yield() {
+    let helper = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"), "/../../components/ntos-executive/src/hosted_relation_publication.rs"
+    )).expect("retained relation publication helper must exist");
+    let advance = source_block(&helper, "unsafe fn advance_hosted_relation_publication(");
+    let post = source_block(advance, "Phase::PostCommitRepair => {");
+    let success = source_block(post, "Ok(()) => {");
+    assert!(success.contains("finish_hosted_relation_local_publication(owner)"),
+        "the same pump step that publishes PnP must finish catalog and terminal owners");
+    assert!(!success.contains("continue;"),
+        "a 16-step budget edge must not yield after PnP before catalog publication");
 }

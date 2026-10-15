@@ -470,6 +470,24 @@ impl AcpiPciScopeCatalog {
         &mut self,
         prepared: PreparedAcpiPciScopeCatalogUpdate,
     ) -> Result<u64, AcpiPciScopeError> {
+        self.try_commit_owned(prepared).map_err(|(error, _prepared)| error)
+    }
+
+    /// Refusal returns the exact unpublished catalog update for retained publication repair.
+    pub fn try_commit_owned(
+        &mut self,
+        prepared: PreparedAcpiPciScopeCatalogUpdate,
+    ) -> Result<u64, (AcpiPciScopeError, PreparedAcpiPciScopeCatalogUpdate)> {
+        if let Err(error) = self.validate_owned(&prepared) {
+            return Err((error, prepared));
+        }
+        Ok(self.publish_owned_validated(prepared))
+    }
+
+    pub fn validate_owned(
+        &self,
+        prepared: &PreparedAcpiPciScopeCatalogUpdate,
+    ) -> Result<(), AcpiPciScopeError> {
         let expected_target = if prepared.changed {
             self.generation.wrapping_add(1)
         } else {
@@ -480,10 +498,14 @@ impl AcpiPciScopeCatalog {
         {
             return Err(AcpiPciScopeError::StaleCatalog);
         }
+        Ok(())
+    }
+
+    fn publish_owned_validated(&mut self, prepared: PreparedAcpiPciScopeCatalogUpdate) -> u64 {
         self.generation = prepared.target_generation;
         self.sources = prepared.next_sources;
         self.link_candidates = prepared.next_link_candidates;
-        Ok(self.generation)
+        self.generation
     }
 
     /// Correlate accepted provider facts to exact retained PCI bridge resources. This does not

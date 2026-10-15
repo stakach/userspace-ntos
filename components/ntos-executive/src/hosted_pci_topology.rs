@@ -428,6 +428,27 @@ pub(crate) unsafe fn note_hosted_pci_relation_completion(
     Ok(authority.reconcile_ready)
 }
 
+pub(crate) unsafe fn validate_hosted_pci_relation_completion(
+    relation_owner: AcpiPciProviderEndpoint,
+    invalidation: nt_pnp_manager::DeviceRelationInvalidation,
+    _completion: nt_pnp_manager::DeviceRelationInvalidationCompletion,
+    pci_catalog_will_publish: bool,
+) -> Result<(), nt_status::NtStatus> {
+    let Some(authority) = (*core::ptr::addr_of!(HOSTED_PCI_TOPOLOGY)).as_ref() else {
+        return Ok(());
+    };
+    if authority.dirty_relations.iter().any(|dirty| {
+        dirty.endpoint == relation_owner && dirty.invalidation == invalidation
+    }) {
+        return Ok(());
+    }
+    if pci_catalog_will_publish || authority.scopes.relation_has_sources(relation_owner) {
+        Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+    } else {
+        Ok(())
+    }
+}
+
 pub(crate) unsafe fn note_hosted_pci_relation_failure(
     relation_owner: AcpiPciProviderEndpoint,
     invalidation: nt_pnp_manager::DeviceRelationInvalidation,
@@ -719,8 +740,24 @@ pub(crate) unsafe fn prepare_hosted_acpi_pci_relation_facts(
 pub(crate) unsafe fn commit_hosted_acpi_pci_relation_sources(
     prepared: PreparedAcpiPciScopeCatalogUpdate,
 ) -> Result<u64, nt_status::NtStatus> {
-    let authority = (*core::ptr::addr_of_mut!(HOSTED_PCI_TOPOLOGY))
-        .as_mut()
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    authority.scopes.commit(prepared).map_err(scope_status)
+    try_commit_hosted_acpi_pci_relation_sources(prepared)
+        .map_err(|(status, _prepared)| status)
+}
+
+pub(crate) unsafe fn try_commit_hosted_acpi_pci_relation_sources(
+    prepared: PreparedAcpiPciScopeCatalogUpdate,
+) -> Result<u64, (nt_status::NtStatus, PreparedAcpiPciScopeCatalogUpdate)> {
+    let Some(authority) = (*core::ptr::addr_of_mut!(HOSTED_PCI_TOPOLOGY)).as_mut() else {
+        return Err((nt_status::NtStatus::INVALID_DEVICE_REQUEST, prepared));
+    };
+    authority.scopes.try_commit_owned(prepared)
+        .map_err(|(error, prepared)| (scope_status(error), prepared))
+}
+
+pub(crate) unsafe fn validate_hosted_acpi_pci_relation_sources(
+    prepared: &PreparedAcpiPciScopeCatalogUpdate,
+) -> Result<(), nt_status::NtStatus> {
+    let authority = (*core::ptr::addr_of!(HOSTED_PCI_TOPOLOGY))
+        .as_ref().ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    authority.scopes.validate_owned(prepared).map_err(scope_status)
 }
