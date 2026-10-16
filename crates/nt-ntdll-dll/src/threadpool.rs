@@ -187,14 +187,22 @@ unsafe fn post(work: *mut Work) -> u32 {
         return STATUS_NO_MEMORY;
     }
     unsafe { core::ptr::write(ticket, WorkTicket { work, sequence }) };
-    let status = unsafe {
-        crate::exports::rtl_queue_work_item(dispatch_ticket as *mut c_void, ticket.cast(), 0)
-    };
-    // The existing queue API reports only NTSTATUS, not whether a failed native submission
-    // definitely had no effect. A late completion may still enter `dispatch_ticket`, so retain the
-    // ticket and work reference on error. They are quarantined until an actual callback consumes
-    // them; native outcome tracking can later reclaim definitive no-effect submissions.
-    status
+    match unsafe {
+        crate::on_target::rtl_queue_work_item_checked(dispatch_ticket as u64, ticket as u64, 0)
+    } {
+        crate::on_target::QueueWorkItemOutcome::Queued => STATUS_SUCCESS,
+        crate::on_target::QueueWorkItemOutcome::NoEffect(status) => {
+            // The exact failed native reply proves no callback can consume this ticket.
+            let _ = unsafe { crate::process_heap_free(ticket.cast()) };
+            unsafe { finish_submission(work) };
+            status
+        }
+        crate::on_target::QueueWorkItemOutcome::Indeterminate(_) => {
+            // Keep both the ticket and work reference. Returning a scalar error would invite
+            // the caller to replay a submission whose callback may already be queued.
+            unsafe { core::arch::asm!("ud2", options(noreturn)) }
+        }
+    }
 }
 
 /// # Safety

@@ -4215,6 +4215,51 @@ pub unsafe fn ldr_get_dll_handle(dll_name: *const c_void, dll_handle: *mut *mut 
     0
 }
 
+/// Copy the recorded full path for a mapped module. The loader lock is held by the caller.
+///
+/// # Safety
+/// `name` is a writable x64 UNICODE_STRING; a nonzero `MaximumLength` requires a writable
+/// `Buffer`. The Ldr entries and their name buffers have process lifetime.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn ldr_get_dll_full_name(module: *mut c_void, name: *mut c_void) -> u32 {
+    if name.is_null() {
+        return 0xC000_000D; // STATUS_INVALID_PARAMETER
+    }
+    let base = if module.is_null() {
+        unsafe { EXE_BASE }
+    } else {
+        module as u64
+    };
+    let state = unsafe { &*core::ptr::addr_of!(LDR_STATE) };
+    let entry = state.entry_vas[..state.count.min(LDR_MAX_ENTRIES)]
+        .iter()
+        .copied()
+        .find(|&entry| unsafe { core::ptr::read_unaligned((entry + 0x30) as *const u64) } == base);
+    let Some(entry) = entry else {
+        return 0xC000_0135; // STATUS_DLL_NOT_FOUND
+    };
+    let src_len = unsafe { core::ptr::read_unaligned((entry + 0x48) as *const u16) } as usize;
+    let src = unsafe { core::ptr::read_unaligned((entry + 0x50) as *const u64) } as *const u8;
+    let max_len = unsafe { core::ptr::read_unaligned((name as *const u8).add(2) as *const u16) }
+        as usize;
+    let dst = unsafe { core::ptr::read_unaligned((name as *const u8).add(8) as *const u64) }
+        as *mut u8;
+    if max_len != 0 && dst.is_null() {
+        return 0xC000_000D;
+    }
+    let copied = src_len.min(max_len);
+    if copied != 0 {
+        unsafe { core::ptr::copy_nonoverlapping(src, dst, copied) };
+    }
+    unsafe { core::ptr::write_unaligned(name as *mut u16, copied as u16) };
+    if max_len >= src_len + 2 {
+        unsafe { core::ptr::write_unaligned(dst.add(src_len) as *mut u16, 0) };
+        0
+    } else {
+        0xC000_0023 // STATUS_BUFFER_TOO_SMALL, including a full but unterminated copy.
+    }
+}
+
 /// `LdrGetProcedureAddress` in-process driver — resolve an export (by name via the `ANSI_STRING`, or
 /// by ordinal if `name` is NULL) in the mapped module at `base_address`.
 ///
@@ -8547,21 +8592,48 @@ pub unsafe extern "C" fn on_target_export_anchor() {
     core::hint::black_box(anchors);
 }
 
+/// The observable ownership result of one work-item post. A returned native Nt* status comes
+/// from an exact seL4 reply; malformed post-entry replies stop in the stub and cannot grant
+/// cleanup authority. The indeterminate case is retained for transports that can return without
+/// such a reply, and must never be mapped to `NoEffect` by a caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueWorkItemOutcome {
+    NoEffect(u32),
+    Queued,
+    Indeterminate(u32),
+}
+
 pub unsafe fn rtl_queue_work_item(function: u64, context: u64, flags: u32) -> u32 {
+    match unsafe { rtl_queue_work_item_checked(function, context, flags) } {
+        QueueWorkItemOutcome::NoEffect(status) => status,
+        QueueWorkItemOutcome::Queued => STATUS_SUCCESS_U32,
+        // A scalar NTSTATUS would invite replay of a possibly posted callback. Current native
+        // stubs stop before this branch on a malformed post-entry reply; preserve that rule.
+        QueueWorkItemOutcome::Indeterminate(_) => unsafe {
+            core::arch::asm!("ud2", options(noreturn))
+        },
+    }
+}
+
+pub unsafe fn rtl_queue_work_item_checked(
+    function: u64,
+    context: u64,
+    flags: u32,
+) -> QueueWorkItemOutcome {
     if function == 0 {
-        return STATUS_INVALID_PARAMETER_U32;
+        return QueueWorkItemOutcome::NoEffect(STATUS_INVALID_PARAMETER_U32);
     }
     let work_flags = nt_rtl_work_item::WorkItemFlags::from_bits_retain(flags);
     let status = unsafe { initialize_work_pool() };
     if !nt_rtl_work_item::nt_success(status) {
-        return status;
+        return QueueWorkItemOutcome::NoEffect(status);
     }
 
     let packet_address = unsafe {
         crate::process_heap_alloc(core::mem::size_of::<nt_rtl_work_item::WorkItemPacket>())
     };
     if packet_address.is_null() {
-        return STATUS_NO_MEMORY as u32;
+        return QueueWorkItemOutcome::NoEffect(STATUS_NO_MEMORY as u32);
     }
     let mut token_handle = 0u64;
     if work_flags.transfers_impersonation() {
@@ -8578,7 +8650,7 @@ pub unsafe fn rtl_queue_work_item(function: u64, context: u64, flags: u32) -> u3
             nt_rtl_work_item::normalize_token_capture(work_flags, token_status, token_handle);
         if !nt_rtl_work_item::nt_success(capture.status()) {
             let _ = unsafe { crate::process_heap_free(packet_address) };
-            return capture.status();
+            return QueueWorkItemOutcome::NoEffect(capture.status());
         }
         token_handle = capture.token_handle();
     }
@@ -8600,13 +8672,13 @@ pub unsafe fn rtl_queue_work_item(function: u64, context: u64, flags: u32) -> u3
             let _ = unsafe { syscall4(SSN_NT_CLOSE, token_handle, 0, 0, 0) };
         }
         let _ = unsafe { crate::process_heap_free(packet_address) };
-        return STATUS_QUOTA_EXCEEDED_U32;
+        return QueueWorkItemOutcome::NoEffect(STATUS_QUOTA_EXCEEDED_U32);
     };
 
     let status = unsafe { start_completion_worker_for(work_flags) };
     if !nt_rtl_work_item::nt_success(status) {
         let _ = unsafe { cleanup_failed_submission(submission) };
-        return status;
+        return QueueWorkItemOutcome::NoEffect(status);
     }
     let port = WORK_POOL_PORT.load(Ordering::Acquire);
     let status = unsafe {
@@ -8624,10 +8696,10 @@ pub unsafe fn rtl_queue_work_item(function: u64, context: u64, flags: u32) -> u3
         let _queued = submission.commit_queue_success();
         unsafe { commit_completion_worker_persistent_floor_if_needed(work_flags) };
         unsafe { rtl_async_wake() };
-        STATUS_SUCCESS_U32
+        QueueWorkItemOutcome::Queued
     } else {
         let _ = unsafe { cleanup_failed_submission(submission) };
-        status
+        QueueWorkItemOutcome::NoEffect(status)
     }
 }
 
