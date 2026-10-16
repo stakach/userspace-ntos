@@ -32,6 +32,7 @@ mod component_heap;
 mod debug_traps;
 mod alpc_selftest;
 mod native_alpc_create;
+mod kuser_active_console;
 mod termination_port_notifications;
 use termination_port_notifications::notify_thread_termination_ports;
 pub(crate) use acpi_platform::*;

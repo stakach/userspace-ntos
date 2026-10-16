@@ -33,8 +33,16 @@ pub use fresh_hosted_thread::FreshHostedThreadPreparation;
 mod fresh_hosted_thread_tests;
 pub use initial_thread_creation::InitialThreadCreationPlan;
 pub mod native_handle;
+mod native_font_mitigation;
 mod native_object_handle_flags;
+mod native_peb_state;
+mod native_priority_class;
+mod process_session;
 mod native_wow64_state;
+#[cfg(test)]
+mod native_font_mitigation_tests;
+#[cfg(test)]
+mod native_peb_state_tests;
 #[cfg(test)]
 mod native_wow64_state_tests;
 pub mod native_handle_search;
@@ -687,11 +695,21 @@ pub struct NtProcess {
     /// Terminal Services session identity reported by
     /// `NtQueryInformationProcess(ProcessSessionInformation)`.
     pub session_id: u32,
+    /// MM session-space provenance. The numeric ProcessSessionInformation value alone cannot
+    /// distinguish an unattached process from a member of session zero.
+    session_space: Option<u32>,
+    /// The session manager's leader designation survives detachment of its session space.
+    session_leader: bool,
     pub image_file_name: String,
     pub address_space_id: AddressSpaceId,
+    /// Nonreused creation identity returned by PsGetProcessSequenceNumber.
+    creation_sequence: u64,
     pub image_section: Option<SectionId>,
     /// Architecture proven by a parsed process image; absent for unadmitted image-less processes.
     architecture_proof: Option<native_wow64_state::ProcessArchitectureProof>,
+    /// Creation-time ProcessFontDisablePolicy. No mutation is accepted until class 52 has an
+    /// exact captured input contract, so new processes retain the NT default (no restriction).
+    font_disable_policy_flags: u32,
     pub threads: ThreadIdSet,
     pub main_thread: Option<ThreadId>,
     initial_creation: initial_thread_creation::InitialThreadCreationState,
@@ -1190,6 +1208,7 @@ pub struct ProcessManager {
     sections: Vec<Option<ImageSection>>,
     next_cid: u32,
     next_asid: u32,
+    next_process_sequence: u64,
     /// win32k's registered callouts (`PsEstablishWin32Callouts`), once attached.
     win32_callouts: Option<Win32Callouts>,
     /// The live `DEBUG_OBJECT` table (the user-mode debugging plane). See [`dbgk`].
@@ -1216,6 +1235,7 @@ impl ProcessManager {
         ProcessManager {
             next_cid: FIRST_CLIENT_ID, // cid 0 is reserved; allocation does not designate System.
             next_asid: 1,
+            next_process_sequence: 1,
             module_limit: DEFAULT_TRACKED_MODULES,
             ..Default::default()
         }
@@ -1324,6 +1344,10 @@ impl ProcessManager {
         let pid = allocate_client_id(&mut self.next_cid);
         let asid = self.next_asid;
         self.next_asid += 1;
+        let creation_sequence = self.next_process_sequence;
+        self.next_process_sequence = creation_sequence
+            .checked_add(1)
+            .expect("nt-process creation sequence exhausted");
         let state = if image_section.is_some() {
             ProcessState::Ready // image already laid out
         } else {
@@ -1337,6 +1361,9 @@ impl ProcessManager {
             .and_then(|pid| self.processes.get(&pid))
             .map(|process| process.session_id)
             .unwrap_or(0);
+        let session_space = parent
+            .and_then(|pid| self.processes.get(&pid))
+            .and_then(|process| process.session_space);
         let affinity_mask = parent
             .and_then(|pid| self.processes.get(&pid))
             .map(|process| process.affinity_mask)
@@ -1362,10 +1389,14 @@ impl ProcessManager {
                 process_id: pid,
                 parent,
                 session_id,
+                session_space,
+                session_leader: false,
                 image_file_name: image_file_name.into(),
                 address_space_id: asid,
+                creation_sequence,
                 image_section,
                 architecture_proof,
+                font_disable_policy_flags: 0,
                 threads: ThreadIdSet::new(),
                 main_thread: None,
                 initial_creation: initial_thread_creation::InitialThreadCreationState::Unclaimed,
@@ -2295,6 +2326,18 @@ impl ProcessManager {
         self.processes.iter().find_map(|(&pid, process)| {
             (process.kernel_process_object == Some(eprocess)).then_some(pid)
         })
+    }
+
+    /// Return the creation identity of the exact live process owning this published EPROCESS.
+    /// A PID, retired body, or unpublished pointer cannot authorize the lookup.
+    pub fn process_sequence_for_kernel_process_object(&self, eprocess: u64) -> Result<u64, u32> {
+        let pid = self
+            .pid_for_kernel_process_object(eprocess)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        self.processes
+            .get(&pid)
+            .map(|process| process.creation_sequence)
+            .ok_or(STATUS_INVALID_HANDLE)
     }
 
     /// Resolve an `EPROCESS` projection back to the Process Manager's live state.

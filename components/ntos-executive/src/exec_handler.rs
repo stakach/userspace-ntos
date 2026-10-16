@@ -35764,15 +35764,15 @@ impl ExecNtHandler {
                             SYSTEM_SESSION_NEXT_ID.store(u32::MAX, Ordering::Relaxed);
                             return STATUS_INSUFFICIENT_RESOURCES;
                         }
-                        if !self.xas_try_write_buf(buffer, &session_id.to_le_bytes()) {
-                            return STATUS_ACCESS_VIOLATION;
-                        }
-                        if let Err(status) = self.pm.set_process_session_id(pid, session_id) {
+                        if let Err(status) = self.pm.create_process_session(pid, session_id) {
                             return status;
                         }
                         if session_id < u64::BITS {
                             SYSTEM_SESSION_ACTIVE_MASK
                                 .fetch_or(1u64 << session_id, Ordering::Relaxed);
+                        }
+                        if !self.xas_try_write_buf(buffer, &session_id.to_le_bytes()) {
+                            return STATUS_ACCESS_VIOLATION;
                         }
                         0
                     }
@@ -35785,27 +35785,17 @@ impl ExecNtHandler {
                             return STATUS_ACCESS_VIOLATION;
                         }
                         let session_id = u32::from_le_bytes(encoded);
-                        let was_active = if session_id < u64::BITS {
-                            let bit = 1u64 << session_id;
-                            SYSTEM_SESSION_ACTIVE_MASK.fetch_and(!bit, Ordering::Relaxed) & bit != 0
-                        } else {
-                            false
-                        };
                         let Some(pid) = self.pm_pid_for_pi(self.pi) else {
                             return STATUS_INVALID_HANDLE;
                         };
-                        let current_session = self
-                            .pm
-                            .process(pid)
-                            .map(|process| process.session_id)
-                            .unwrap_or(0);
-                        if current_session != session_id && !was_active {
-                            return STATUS_INVALID_PARAMETER;
+                        if let Err(status) = self.pm.delete_process_session(pid, session_id) {
+                            return status;
                         }
-                        match self.pm.set_process_session_id(pid, 0) {
-                            Ok(()) => 0,
-                            Err(status) => status,
+                        if session_id < u64::BITS {
+                            SYSTEM_SESSION_ACTIVE_MASK
+                                .fetch_and(!(1u64 << session_id), Ordering::Relaxed);
                         }
+                        0
                     }
                 }
             },

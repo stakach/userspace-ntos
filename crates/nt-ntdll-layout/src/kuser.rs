@@ -109,6 +109,19 @@ pub fn initialize_page(
     );
 }
 
+/// Construct a new process snapshot with the currently published console ID.
+pub fn initialize_page_with_active_console(
+    page: &mut [u8; PAGE_SIZE],
+    information: StaticInformation,
+    interrupt_time_100ns: u64,
+    system_time_100ns: u64,
+    system_root: &[u8],
+    active_console_id: u32,
+) {
+    initialize_page(page, information, interrupt_time_100ns, system_time_100ns, system_root);
+    write_active_console_id(page, active_console_id);
+}
+
 /// Read the active console session from one complete shared-data page snapshot.
 pub fn read_active_console_id(page: &[u8; PAGE_SIZE]) -> u32 {
     u32::from_le_bytes(
@@ -126,6 +139,15 @@ pub fn read_active_console_id(page: &[u8; PAGE_SIZE]) -> u32 {
 pub fn write_active_console_id(page: &mut [u8; PAGE_SIZE], session_id: u32) {
     page[ACTIVE_CONSOLE_ID..ACTIVE_CONSOLE_ID + 4]
         .copy_from_slice(&session_id.to_le_bytes());
+}
+
+/// Publish the console ID to an already mapped KUSER page with one aligned store.
+///
+/// # Safety
+/// `page` must be a writable, 4-byte-aligned KUSER page owned by the caller.
+pub unsafe fn publish_active_console_id(page: *mut u8, session_id: u32) {
+    debug_assert_eq!(page as usize & 3, 0);
+    unsafe { core::ptr::write_volatile(page.add(ACTIVE_CONSOLE_ID) as *mut u32, session_id) };
 }
 
 /// Publish the effective timezone fields consumed directly through `KUSER_SHARED_DATA`.

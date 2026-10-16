@@ -176,6 +176,13 @@ mod win32k_subsystem {
     pub const W32_PS_OP_QUERY_WOW64_PROCESS: u64 = 12;
     pub const W32_PS_OP_QUERY_PROCESS_JOB: u64 = 13;
     pub const W32_PS_OP_QUERY_JOB_UI_RESTRICTIONS: u64 = 14;
+    pub const W32_PS_OP_QUERY_MITIGATION_FLAGS: u64 = 15;
+    pub const W32_PS_OP_QUERY_PROCESS_PEB: u64 = 16;
+    pub const W32_PS_OP_QUERY_PROCESS_PEB32: u64 = 17;
+    pub const W32_PS_OP_QUERY_PROCESS_SEQUENCE: u64 = 18;
+    pub const W32_PS_OP_QUERY_PROCESS_PRIORITY_CLASS: u64 = 19;
+    pub const W32_PS_OP_SET_PROCESS_PRIORITY_CLASS: u64 = 20;
+    pub const W32_PS_OP_QUERY_PROCESS_SESSION_ID_EX: u64 = 21;
 }
 mod sel4_rt {
     pub fn yield_now() {}
@@ -215,6 +222,114 @@ fn thread_references(pm: &nt_process::ProcessManager, tid: u32) -> u32 {
     pm.process_object_delete_blockers(pid)
         .unwrap()
         .thread_kernel_pointer_references
+}
+
+#[test]
+fn process_sequence_broker_uses_exact_published_eprocess_identity() {
+    let (mut pm, _, pid, _) = fixture();
+    let sequence = pm.process_sequence_for_kernel_process_object(0x3000).unwrap();
+    let query = |pm: &mut nt_process::ProcessManager, body, value| {
+        provider_ps::dispatch(
+            pm,
+            win32k_subsystem::W32_PS_OP_QUERY_PROCESS_SEQUENCE,
+            body,
+            value,
+            refuse_job_materialization,
+            |_, _| panic!("scalar sequence query cannot project a body"),
+        )
+    };
+    assert_eq!(query(&mut pm, 0x3000, 0), (0, sequence, 0, 0));
+    assert_eq!(
+        query(&mut pm, u64::from(pid), 0),
+        (nt_process::STATUS_INVALID_HANDLE as i32, 0, 0, 0)
+    );
+    assert_eq!(
+        query(&mut pm, 0x3000, 1),
+        (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0)
+    );
+}
+
+#[test]
+fn process_session_id_ex_broker_preserves_unattached_and_attached_zero_provenance() {
+    let (mut pm, _, pid, _) = fixture();
+    let query = |pm: &mut nt_process::ProcessManager, body, value| {
+        provider_ps::dispatch(
+            pm,
+            win32k_subsystem::W32_PS_OP_QUERY_PROCESS_SESSION_ID_EX,
+            body,
+            value,
+            refuse_job_materialization,
+            |_, _| panic!("scalar session query cannot project a body"),
+        )
+    };
+    assert_eq!(query(&mut pm, 0x3000, 0), (0, u64::from(u32::MAX), 0, 0));
+    pm.attach_process_session(pid, 0).unwrap();
+    assert_eq!(query(&mut pm, 0x3000, 0), (0, 0, 0, 0));
+    assert_eq!(
+        query(&mut pm, u64::from(pid), 0),
+        (nt_process::STATUS_INVALID_HANDLE as i32, 0, 0, 0)
+    );
+    assert_eq!(
+        query(&mut pm, 0x3000, 1),
+        (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0)
+    );
+}
+
+#[test]
+fn process_priority_class_broker_uses_exact_body_and_preserves_scheduler_state() {
+    let (mut pm, _, pid, _) = fixture();
+    let base_priority = pm.process(pid).unwrap().base_priority();
+    let dispatch = |pm: &mut nt_process::ProcessManager, op, body, value| {
+        provider_ps::dispatch(
+            pm,
+            op,
+            body,
+            value,
+            refuse_job_materialization,
+            |_, _| panic!("priority class scalar broker cannot project a body"),
+        )
+    };
+    let query = win32k_subsystem::W32_PS_OP_QUERY_PROCESS_PRIORITY_CLASS;
+    let set = win32k_subsystem::W32_PS_OP_SET_PROCESS_PRIORITY_CLASS;
+    assert_eq!(
+        dispatch(&mut pm, query, 0x3000, 0),
+        (0, u64::from(nt_process::PROCESS_PRIORITY_CLASS_NORMAL), 0, 0)
+    );
+    assert_eq!(
+        dispatch(
+            &mut pm,
+            set,
+            0x3000,
+            u64::from(nt_process::PROCESS_PRIORITY_CLASS_HIGH),
+        ),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(
+        dispatch(&mut pm, query, 0x3000, 0),
+        (0, u64::from(nt_process::PROCESS_PRIORITY_CLASS_HIGH), 0, 0)
+    );
+    assert_eq!(pm.process(pid).unwrap().base_priority(), base_priority);
+    assert!(!pm.process(pid).unwrap().foreground());
+    assert_eq!(
+        dispatch(&mut pm, query, u64::from(pid), 0),
+        (nt_process::STATUS_INVALID_HANDLE as i32, 0, 0, 0)
+    );
+    assert_eq!(
+        dispatch(&mut pm, set, u64::from(pid), 2),
+        (nt_process::STATUS_INVALID_HANDLE as i32, 0, 0, 0)
+    );
+    assert_eq!(
+        dispatch(&mut pm, set, 0x3000, 256),
+        (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0)
+    );
+    assert_eq!(
+        dispatch(&mut pm, query, 0x3000, 1),
+        (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0)
+    );
+    assert_eq!(
+        dispatch(&mut pm, query, 0x3000, 0),
+        (0, u64::from(nt_process::PROCESS_PRIORITY_CLASS_HIGH), 0, 0)
+    );
 }
 
 #[test]

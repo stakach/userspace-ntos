@@ -53,6 +53,34 @@ pub(crate) fn dispatch(
         W32_PS_OP_QUERY_WOW64_PROCESS if value == 0 => pm
             .wow64_pointer_for_kernel_process_object(object)
             .map(|pointer| (pointer, 0, 0)),
+        W32_PS_OP_QUERY_MITIGATION_FLAGS => u32::try_from(value)
+            .map_err(|_| INVALID_PARAMETER)
+            .and_then(|selector| {
+                pm.process_mitigation_policy_flags_by_kernel_object(object, selector)
+            })
+            .map(|flags| (u64::from(flags), 0, 0)),
+        W32_PS_OP_QUERY_PROCESS_PEB if value == 0 => pm
+            .peb_for_kernel_process_object(object)
+            .map(|peb| (peb, 0, 0)),
+        W32_PS_OP_QUERY_PROCESS_PEB32 if value == 0 => pm
+            .peb32_for_kernel_process_object(object)
+            .map(|peb32| (peb32, 0, 0)),
+        W32_PS_OP_QUERY_PROCESS_SEQUENCE if value == 0 => pm
+            .process_sequence_for_kernel_process_object(object)
+            .map(|sequence| (sequence, 0, 0)),
+        W32_PS_OP_QUERY_PROCESS_PRIORITY_CLASS if value == 0 => pm
+            .priority_class_for_kernel_process_object(object)
+            .map(|priority_class| (u64::from(priority_class), 0, 0)),
+        W32_PS_OP_QUERY_PROCESS_SESSION_ID_EX if value == 0 => pm
+            .kernel_process_session_id_ex(object)
+            .map(|session_id| (u64::from(session_id), 0, 0))
+            .ok_or(INVALID_HANDLE),
+        W32_PS_OP_SET_PROCESS_PRIORITY_CLASS => u8::try_from(value)
+            .map_err(|_| INVALID_PARAMETER)
+            .and_then(|priority_class| {
+                pm.set_priority_class_for_kernel_process_object(object, priority_class)
+            })
+            .map(|()| (0, 0, 0)),
         W32_PS_OP_SET_THREAD_PRIORITY => pm
             .set_kernel_thread_priority(object, value as u32 as i32)
             .map(|previous| (u64::from(previous as u32), 0, 0)),

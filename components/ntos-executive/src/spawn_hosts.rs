@@ -3153,6 +3153,19 @@ unsafe fn component_pump_loop(
                 out3
             );
             continue;
+        } else if label == crate::win32k_subsystem::W32_ACTIVE_CONSOLE_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let status = if shared_pump::authenticated_badge(ch, msg.badge)
+                && msg.mi == ((crate::win32k_subsystem::W32_ACTIVE_CONSOLE_LABEL << 12) | 1)
+                && *reply_cap == ch.reply_cap
+            {
+                unsafe { crate::kuser_active_console::service(ch, msg.m0) }
+            } else {
+                nt_process::STATUS_INVALID_PARAMETER
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 4, status as u64, 0, 0, 0);
+            continue;
         } else if label == crate::win32k_subsystem::W32_ATOM_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {

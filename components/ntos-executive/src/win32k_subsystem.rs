@@ -102,6 +102,8 @@ pub(crate) unsafe fn allocate_source_target_relation() -> Option<SourceRelationA
 
 #[path = "win32k_subsystem/provider_input.rs"]
 mod provider_input;
+#[path = "win32k_subsystem/native_assertion.rs"]
+mod native_assertion;
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
 use nt_compat_exports::{
     ssdt::{
@@ -1394,6 +1396,13 @@ pub const W32_PS_OP_QUERY_OBJECT_HANDLE_FLAGS: u64 = 11;
 pub const W32_PS_OP_QUERY_WOW64_PROCESS: u64 = 12;
 pub const W32_PS_OP_QUERY_PROCESS_JOB: u64 = 13;
 pub const W32_PS_OP_QUERY_JOB_UI_RESTRICTIONS: u64 = 14;
+pub const W32_PS_OP_QUERY_MITIGATION_FLAGS: u64 = 15;
+pub const W32_PS_OP_QUERY_PROCESS_PEB: u64 = 16;
+pub const W32_PS_OP_QUERY_PROCESS_PEB32: u64 = 17;
+pub const W32_PS_OP_QUERY_PROCESS_SEQUENCE: u64 = 18;
+pub const W32_PS_OP_QUERY_PROCESS_PRIORITY_CLASS: u64 = 19;
+pub const W32_PS_OP_SET_PROCESS_PRIORITY_CLASS: u64 = 20;
+pub const W32_PS_OP_QUERY_PROCESS_SESSION_ID_EX: u64 = 21;
 /// Bounded global-atom requests. The executive owns the one native atom table; win32k stages only
 /// explicit-length UTF-16 input and receives the resulting 16-bit atom.
 pub const W32_ATOM_LABEL: u64 = 0x77E;
@@ -1428,6 +1437,8 @@ pub const W32_PROCESS_ATTACH_LABEL: u64 = 0x7a4;
 pub const W32_SOURCE_PNP_LABEL: u64 = 0x7a5;
 pub const W32_SOURCE_FSD_LABEL: u64 = 0x7a8;
 pub const W32_SOURCE_ARMED_LABEL: u64 = 0x7aa;
+/// Win32k's trusted RtlSetActiveConsoleId request to the executive KUSER owner.
+pub const W32_ACTIVE_CONSOLE_LABEL: u64 = 0x7ab;
 pub const W32_ATTACH_PLAIN: u64 = 1;
 pub const W32_ATTACH_DETACH: u64 = 2;
 pub const W32_ATTACH_STACK: u64 = 3;
@@ -3494,6 +3505,25 @@ unsafe fn win32k_ps_broker_call(op: u64, object: u64, value: u64) -> (i32, u64, 
     (status as u32 as i32, out1, out2, out3)
 }
 
+/// The pinned native setter receives a 32-bit session ID and returns void.
+/// Root owns every KUSER alias, including aliases created after this call.
+extern "win64" fn s_rtl_set_active_console_id(session_id: u32) {
+    let (words, status, _, _, _) = unsafe {
+        crate::driver_launch::call_on4_raw(
+            (W32_ACTIVE_CONSOLE_LABEL << 12) | 1,
+            u64::from(session_id), 0, 0, 0,
+        )
+    };
+    if words != 4 || status != 0 {
+        unsafe {
+            crate::provider_bugcheck::report(
+                0xc4,
+                [W32_ACTIVE_CONSOLE_LABEL, u64::from(session_id), words, status],
+            )
+        }
+    }
+}
+
 unsafe fn win32k_file_object_broker_call(
     operation: u64,
     object: u64,
@@ -3619,12 +3649,89 @@ extern "win64" fn s_ps_get_process_wow64_process(process: u64) -> u64 {
     pointer
 }
 
+/// `PsGetProcessMitigationPolicyFlags` consults the exact Process Manager EPROCESS identity.
+/// The pinned win32k calls selector 9 (ProcessFontDisablePolicy) and checks bit 0.
+extern "win64" fn s_ps_get_process_mitigation_policy_flags(process: u64, selector: u32) -> u32 {
+    let (status, flags, _, _) = unsafe {
+        win32k_ps_broker_call(W32_PS_OP_QUERY_MITIGATION_FLAGS, process, u64::from(selector))
+    };
+    if status != 0 {
+        reject_ps_broker("mitigation policy query", status);
+    }
+    if flags > u32::MAX as u64 {
+        reject_ps_broker("mitigation policy query width", STATUS_INVALID_PARAMETER_I32);
+    }
+    flags as u32
+}
+
+extern "win64" fn s_ps_get_process_peb(process: u64) -> u64 {
+    let (status, peb, _, _) = unsafe { win32k_ps_broker_call(W32_PS_OP_QUERY_PROCESS_PEB, process, 0) };
+    if status != 0 {
+        reject_ps_broker("process PEB query", status);
+    }
+    peb
+}
+
+extern "win64" fn s_ps_get_process_peb32(process: u64) -> u64 {
+    let (status, peb32, _, _) =
+        unsafe { win32k_ps_broker_call(W32_PS_OP_QUERY_PROCESS_PEB32, process, 0) };
+    if status != 0 {
+        reject_ps_broker("process PEB32 query", status);
+    }
+    peb32
+}
+
+extern "win64" fn s_ps_get_process_priority_class(process: u64) -> u32 {
+    let (status, priority_class, _, _) = unsafe {
+        win32k_ps_broker_call(W32_PS_OP_QUERY_PROCESS_PRIORITY_CLASS, process, 0)
+    };
+    if status != 0 {
+        reject_ps_broker("process priority class query", status);
+    }
+    if priority_class > u8::MAX as u64 {
+        reject_ps_broker("process priority class query width", STATUS_INVALID_PARAMETER_I32);
+    }
+    priority_class as u32
+}
+
+extern "win64" fn s_ps_set_process_priority_class(process: u64, priority_class: u32) {
+    let (status, _, _, _) = unsafe {
+        win32k_ps_broker_call(
+            W32_PS_OP_SET_PROCESS_PRIORITY_CLASS,
+            process,
+            u64::from(priority_class),
+        )
+    };
+    if status != 0 {
+        reject_ps_broker("process priority class update", status);
+    }
+}
+
+extern "win64" fn s_ps_get_process_sequence_number(process: u64) -> u64 {
+    let (status, sequence, _, _) =
+        unsafe { win32k_ps_broker_call(W32_PS_OP_QUERY_PROCESS_SEQUENCE, process, 0) };
+    if status != 0 {
+        reject_ps_broker("process sequence query", status);
+    }
+    sequence
+}
+
 extern "win64" fn s_ps_get_current_process_wow64_process() -> u64 {
     s_ps_get_process_wow64_process(s_current_process())
 }
 
 extern "win64" fn s_ps_get_process_session_id(process: u64) -> u32 {
     query_kernel_process_state(process).1
+}
+
+extern "win64" fn s_ps_get_process_session_id_ex(process: u64) -> u32 {
+    let (status, session_id, _, _) = unsafe {
+        win32k_ps_broker_call(W32_PS_OP_QUERY_PROCESS_SESSION_ID_EX, process, 0)
+    };
+    if status != 0 {
+        reject_ps_broker("process session ID Ex query", status);
+    }
+    session_id as u32
 }
 
 extern "win64" fn s_ps_get_current_process_session_id() -> u32 {
@@ -14984,6 +15091,7 @@ fn register_trampolines() -> bool {
     reg.bind("ProbeForRead", s_probe_for_read as usize as u64);
     reg.bind("ProbeForWrite", s_probe_for_write as usize as u64);
     reg.bind("RtlGetVersion", s_rtl_get_version as usize as u64);
+    reg.bind("RtlSetActiveConsoleId", s_rtl_set_active_console_id as usize as u64);
     reg.bind("KeDelayExecutionThread", s_ke_delay_execution_thread as usize as u64);
     reg.bind("KeQueryTimeIncrement", crate::driver_launch::s_ke_query_time_increment as usize as u64);
     reg.bind("RtlUnicodeToMultiByteN", s_rtl_unicode_to_multibyte_n as usize as u64);
@@ -15457,6 +15565,7 @@ fn register_trampolines() -> bool {
     reg.bind("RtlMoveMemory", s_memmove as usize as u64);
     reg.bind("memset", s_memset as usize as u64);
     reg.bind("RtlFillMemory", s_memset as usize as u64);
+    reg.bind("RtlAssert", native_assertion::rtl_assert as usize as u64);
     // --- batch 4: Ps identity + per-process win32-slots (set by win32k's process callout) ---
     reg.bind(
         "PsGetCurrentProcessId",
@@ -15474,11 +15583,33 @@ fn register_trampolines() -> bool {
     );
     reg.bind("PsGetProcessImageFileName", s_ps_get_process_image_file_name as usize as u64);
     reg.bind("PsGetProcessWow64Process", s_ps_get_process_wow64_process as usize as u64);
+    reg.bind("PsGetProcessPeb", s_ps_get_process_peb as usize as u64);
+    reg.bind("PsGetProcessPeb32", s_ps_get_process_peb32 as usize as u64);
+    reg.bind(
+        "PsGetProcessPriorityClass",
+        s_ps_get_process_priority_class as usize as u64,
+    );
+    reg.bind(
+        "PsSetProcessPriorityClass",
+        s_ps_set_process_priority_class as usize as u64,
+    );
+    reg.bind(
+        "PsGetProcessSequenceNumber",
+        s_ps_get_process_sequence_number as usize as u64,
+    );
+    reg.bind(
+        "PsGetProcessMitigationPolicyFlags",
+        s_ps_get_process_mitigation_policy_flags as usize as u64,
+    );
     reg.bind(
         "PsGetCurrentProcessWow64Process",
         s_ps_get_current_process_wow64_process as usize as u64,
     );
     reg.bind("PsGetProcessSessionId", s_ps_get_process_session_id as usize as u64);
+    reg.bind(
+        "PsGetProcessSessionIdEx",
+        s_ps_get_process_session_id_ex as usize as u64,
+    );
     reg.bind("PsIsSystemProcess", s_ps_is_system_process as *const () as usize as u64);
     reg.bind(
         "PsGetCurrentThreadId",
