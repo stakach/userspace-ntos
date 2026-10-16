@@ -126,10 +126,11 @@ use crate::*;
 // --- component VA layout (identical in executive-load + host-run views) ----------------------
 
 /// The relocated/loaded win32k image (VIRTUAL layout), mapped W^X in the host. size_of_image
-/// is 0x220000 (544 frames); place it in its own 2-PT window well clear of everything else.
+/// is 0x285000 (645 frames) in the pinned LiberNT release. The image and its SEH support code
+/// share a two-page-table window clear of the executive's auxiliary data region.
 pub const WIN32K_CODE_VA: u64 = 0x0000_0100_0680_0000;
-/// win32k image frame count (size_of_image 0x220000 / 0x1000).
-pub const WIN32K_IMAGE_FRAMES: u64 = 0x220;
+/// Pinned LiberNT win32k.sys SizeOfImage (0x285000) in 4 KiB frames.
+pub const WIN32K_IMAGE_FRAMES: u64 = 0x285;
 const WIN32K_IMAGE_BYTES: u64 = WIN32K_IMAGE_FRAMES * 0x1000;
 /// Pool arena used by the `ExAllocatePool*` trampolines and component-owned GUI objects. It is
 /// pre-mapped because provider pointers must remain directly dereferenceable, but allocation is a
@@ -6052,6 +6053,38 @@ extern "win64" fn s_rtl_are_all_accesses_granted(granted: u32, desired: u32) -> 
 
 extern "win64" fn s_rtl_nt_status_to_dos_error(status: u32) -> u32 {
     nt_compat_exports::rtl::nt_status_to_dos_error(status)
+}
+
+extern "win64" fn s_ex_acquire_rundown_protection(run_ref: *const nt_kernel_exec::ExRundownRef) -> u8 {
+    assert!(!run_ref.is_null(), "ExAcquireRundownProtection null descriptor");
+    unsafe { (&*run_ref).acquire() as u8 }
+}
+
+extern "win64" fn s_ex_initialize_rundown_protection(run_ref: *const nt_kernel_exec::ExRundownRef) {
+    assert!(!run_ref.is_null(), "ExInitializeRundownProtection null descriptor");
+    unsafe { (&*run_ref).initialize() }
+}
+
+extern "win64" fn s_ex_reinitialize_rundown_protection(run_ref: *const nt_kernel_exec::ExRundownRef) {
+    assert!(!run_ref.is_null(), "ExReInitializeRundownProtection null descriptor");
+    assert!(unsafe { (&*run_ref).reinitialize() }, "ExReInitializeRundownProtection requires completed rundown");
+}
+
+extern "win64" fn s_ex_release_rundown_protection(run_ref: *const nt_kernel_exec::ExRundownRef) {
+    assert!(!run_ref.is_null(), "ExReleaseRundownProtection null descriptor");
+    let _ = unsafe { (&*run_ref).release() };
+}
+
+extern "win64" fn s_ex_wait_for_rundown_protection_release(run_ref: *const nt_kernel_exec::ExRundownRef) {
+    assert!(!run_ref.is_null(), "ExWaitForRundownProtectionRelease null descriptor");
+    let reference = unsafe { &*run_ref };
+    let waiter = nt_kernel_exec::ExRundownWaitBlock::new();
+    if unsafe { reference.begin_wait(&waiter) } {
+        while waiter.remaining() != 0 {
+            crate::yield_now();
+        }
+        unsafe { reference.finish_wait(&waiter) };
+    }
 }
 
 extern "win64" fn s_ex_system_time_to_local_time(system_time: u64, local_time: u64) {
@@ -14615,6 +14648,11 @@ fn register_trampolines() -> bool {
     reg.bind("RtlGetVersion", s_rtl_get_version as usize as u64);
     reg.bind("ExRaiseAccessViolation", seh.access_violation_va);
     reg.bind("ExRaiseStatus", seh.raise_va);
+    reg.bind("ExAcquireRundownProtection", s_ex_acquire_rundown_protection as usize as u64);
+    reg.bind("ExInitializeRundownProtection", s_ex_initialize_rundown_protection as usize as u64);
+    reg.bind("ExReInitializeRundownProtection", s_ex_reinitialize_rundown_protection as usize as u64);
+    reg.bind("ExReleaseRundownProtection", s_ex_release_rundown_protection as usize as u64);
+    reg.bind("ExWaitForRundownProtectionRelease", s_ex_wait_for_rundown_protection_release as usize as u64);
     reg.bind("RtlUnwindEx", seh.unwind_entry_va);
     reg.bind("RtlUnwind", seh.legacy_unwind_va);
     reg.bind(

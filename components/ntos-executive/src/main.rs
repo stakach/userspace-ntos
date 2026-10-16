@@ -1318,11 +1318,10 @@ pub const NTDLL_VISTA_WIN32BUF_OFFSET: u64 = 0x670000; // ntdll_vista ~56 KiB (e
                                                        // winlogon.exe's two extra static imports (the rest of its Win32 stack is shared with csrss above).
 pub const USERENV_WIN32BUF_OFFSET: u64 = 0x680000; // userenv ~166 KiB (file 0x297C0)
 pub const MPR_WIN32BUF_OFFSET: u64 = 0x6C0000; // mpr ~107 KiB (ends ~0x6DAC00)
-/// Raw win32k.sys staging buffer (2,208,192 B). Its own 2 MiB-aligned window past WIN32BUF, with
-/// 2 page tables (544 frames = 0x220000 spans two 2 MiB PTs). The storage host reads win32k.sys
-/// off disk into here; the executive parses+loads it into the win32k-service component.
+/// Raw win32k.sys staging buffer for the pinned 2,088,960-byte LiberNT file. Its virtual PE
+/// image is larger and receives a separate frame run at WIN32K_CODE_VA.
 pub const WIN32KBUF_VADDR: u64 = 0x0000_0100_0600_0000;
-pub const WIN32KBUF_FRAMES: u64 = 544; // 0x220 — matches win32k.sys size_of_image
+pub const WIN32KBUF_FRAMES: u64 = 544; // 0x220 — covers the released raw file
 /// Fault-endpoint badge for the second hosted process (csrss). smss's fault cap is an unbadged
 /// copy (badge 0); csrss's is minted at this badge so the single service loop can tell them apart.
 pub const CSRSS_BADGE: u64 = 2;
@@ -12024,6 +12023,34 @@ unsafe fn alloc_frame() -> u64 {
         recycle_deleted_root_slot(slot);
     }
     panic!("frame allocation failed");
+}
+
+/// Reserve a durable, consecutive cap run before retyping any frame. A sequence of scalar
+/// `alloc_frame()` calls may draw from the recycled-slot stack and cannot be indexed as base+i.
+unsafe fn alloc_frame_run(count: u64) -> u64 {
+    assert!(count > 0, "empty frame run");
+    let base = try_alloc_slot_run(count).expect("contiguous root frame cap run unavailable");
+    root_slot_pin_run(base, count);
+    for index in 0..count {
+        let error = untyped_retype_r(
+            CAP_INIT_UNTYPED,
+            OBJ_X86_4K_PAGE,
+            PAGING_BITS,
+            1,
+            base + index,
+        );
+        if error != 0 {
+            print_str(b"[frame-run] retype failed index=");
+            print_u64(index);
+            print_str(b" count=");
+            print_u64(count);
+            print_str(b" error=");
+            print_u64(error);
+            print_str(b"\n");
+            panic!("contiguous root frame retype failed");
+        }
+    }
+    base
 }
 
 unsafe fn vm_frame_acquire(scratch_base: u64) -> Result<u64, u32> {
@@ -28997,10 +29024,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             check(b"exec_ahci_dma_frame_io_mapped", map_err == 0, &mut passed);
             // Shared storage run: page 0 carries AHCI IOVA + verdict/size metadata + imports.bin;
             // the remaining pages carry the generated SYSTEM.DAT hive.
-            let shared_start = alloc_frame();
-            for _ in 1..STORAGE_SHARED_FRAMES {
-                let _ = alloc_frame();
-            }
+            let shared_start = alloc_frame_run(STORAGE_SHARED_FRAMES);
             for i in 0..STORAGE_SHARED_FRAMES {
                 let _ = page_map(
                     copy_cap(shared_start + i),
@@ -29053,10 +29077,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 EXPLORER_STACK_MIRROR_VA,
                 CAP_INIT_THREAD_VSPACE,
             );
-            let fb_start = alloc_frame();
-            for _ in 1..FILEBUF_FRAMES {
-                let _ = alloc_frame();
-            }
+            let fb_start = alloc_frame_run(FILEBUF_FRAMES);
             for i in 0..FILEBUF_FRAMES {
                 let _ = page_map(
                     copy_cap(fb_start + i),
@@ -29090,10 +29111,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 SRVBUF_VADDR,
                 CAP_INIT_THREAD_VSPACE,
             );
-            let srvbuf_start = alloc_frame();
-            for _ in 1..SRVBUF_FRAMES {
-                let _ = alloc_frame();
-            }
+            let srvbuf_start = alloc_frame_run(SRVBUF_FRAMES);
             for i in 0..SRVBUF_FRAMES {
                 let _ = page_map(
                     copy_cap(srvbuf_start + i),
@@ -29114,10 +29132,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     CAP_INIT_THREAD_VSPACE,
                 );
             }
-            let win32buf_start = alloc_frame();
-            for _ in 1..WIN32BUF_FRAMES {
-                let _ = alloc_frame();
-            }
+            let win32buf_start = alloc_frame_run(WIN32BUF_FRAMES);
             for i in 0..WIN32BUF_FRAMES {
                 let _ = page_map(
                     copy_cap(win32buf_start + i),
@@ -29138,10 +29153,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     CAP_INIT_THREAD_VSPACE,
                 );
             }
-            let win32kbuf_start = alloc_frame();
-            for _ in 1..WIN32KBUF_FRAMES {
-                let _ = alloc_frame();
-            }
+            let win32kbuf_start = alloc_frame_run(WIN32KBUF_FRAMES);
             for i in 0..WIN32KBUF_FRAMES {
                 let _ = page_map(
                     copy_cap(win32kbuf_start + i),
@@ -29161,10 +29173,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 WINLOGONBUF_VADDR,
                 CAP_INIT_THREAD_VSPACE,
             );
-            let winlogonbuf_start = alloc_frame();
-            for _ in 1..WINLOGONBUF_FRAMES {
-                let _ = alloc_frame();
-            }
+            let winlogonbuf_start = alloc_frame_run(WINLOGONBUF_FRAMES);
             for i in 0..WINLOGONBUF_FRAMES {
                 let _ = page_map(
                     copy_cap(winlogonbuf_start + i),
@@ -29183,10 +29192,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
                 let _ =
                     paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, vaddr, CAP_INIT_THREAD_VSPACE);
-                let start = alloc_frame();
-                for _ in 1..frames {
-                    let _ = alloc_frame();
-                }
+                let start = alloc_frame_run(frames);
                 for i in 0..frames {
                     let _ = page_map(
                         copy_cap(start + i),
@@ -29209,10 +29215,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             .into_iter()
             .enumerate()
             {
-                let start = alloc_frame();
-                for _ in 1..frames {
-                    let _ = alloc_frame();
-                }
+                let start = alloc_frame_run(frames);
                 for i in 0..frames {
                     let _ = page_map(
                         copy_cap(start + i),
@@ -29241,10 +29244,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 HIVEBUF_VADDR,
                 CAP_INIT_THREAD_VSPACE,
             );
-            let hivebuf_start = alloc_frame();
-            for _ in 1..HIVEBUF_FRAMES {
-                let _ = alloc_frame();
-            }
+            let hivebuf_start = alloc_frame_run(HIVEBUF_FRAMES);
             for i in 0..HIVEBUF_FRAMES {
                 let _ = page_map(
                     copy_cap(hivebuf_start + i),
@@ -29260,10 +29260,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 (SAMHIVEBUF_FRAMES, SAMHIVEBUF_VADDR, &SAMHIVEBUF_START),
                 (DEFHIVEBUF_FRAMES, DEFHIVEBUF_VADDR, &DEFHIVEBUF_START),
             ] {
-                let start = alloc_frame();
-                for _ in 1..frames {
-                    let _ = alloc_frame();
-                }
+                let start = alloc_frame_run(frames);
                 for i in 0..frames {
                     let _ = page_map(
                         copy_cap(start + i),
@@ -29285,10 +29282,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     SWHIVEBUF_VADDR,
                     CAP_INIT_THREAD_VSPACE,
                 );
-                let start = alloc_frame();
-                for _ in 1..SWHIVEBUF_FRAMES {
-                    let _ = alloc_frame();
-                }
+                let start = alloc_frame_run(SWHIVEBUF_FRAMES);
                 for i in 0..SWHIVEBUF_FRAMES {
                     let _ = page_map(
                         copy_cap(start + i),
@@ -30637,7 +30631,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             &mut passed,
         );
         if win32k_size > 0 && win32kbuf_start != 0 {
-            // Executive-side PTs + frames: CODE (544 frames, 2 PTs, mapped RW to load into),
+            // Executive-side PTs + frames: CODE (645 frames, 2 PTs, mapped RW to load into),
             // POOL, DATA, and the shared handoff page. DATA + SHARED are mapped in the executive
             // (load_into writes the cells + the entry rva); POOL is also mapped because the
             // executive-side win32k bridge allocates provider-owned object bodies there.
@@ -30651,10 +30645,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     CAP_INIT_THREAD_VSPACE,
                 );
             }
-            let code_base = alloc_frame();
-            for _ in 1..win32k_subsystem::WIN32K_IMAGE_FRAMES {
-                let _ = alloc_frame();
-            }
+            let code_base = alloc_frame_run(win32k_subsystem::WIN32K_IMAGE_FRAMES);
             for i in 0..win32k_subsystem::WIN32K_IMAGE_FRAMES {
                 let _ = page_map(
                     copy_cap(code_base + i),
@@ -30668,10 +30659,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             )
                 .expect("win32k exception linkage PE missing or invalid");
             let seh_frames = seh_image.frame_count();
-            let seh_base = alloc_frame();
-            for _ in 1..seh_frames {
-                let _ = alloc_frame();
-            }
+            let seh_base = alloc_frame_run(seh_frames);
             for frame in 0..seh_frames {
                 let _ = page_map(
                     copy_cap(seh_base + frame),
@@ -30682,10 +30670,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             }
             seh_image.install().expect("win32k exception linkage installation failed");
             seh_image.publish_imports().expect("win32k exception linkage import publication failed");
-            let pool_base = alloc_frame();
-            for _ in 1..win32k_subsystem::WIN32K_POOL_FRAMES {
-                let _ = alloc_frame();
-            }
+            let pool_base = alloc_frame_run(win32k_subsystem::WIN32K_POOL_FRAMES);
             WIN32K_POOL_FRAME_BASE.store(pool_base, Ordering::Relaxed);
             for page_table in 0..(win32k_subsystem::WIN32K_POOL_FRAMES + 511) / 512 {
                 let pt = alloc_slot();
@@ -30709,41 +30694,23 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_str(b"[win32k-svc] provider pool initialization failed\n");
                 park();
             }
-            let data_base = alloc_frame();
-            for _ in 1..win32k_subsystem::WIN32K_DATA_FRAMES {
-                let _ = alloc_frame();
-            }
+            let data_base = alloc_frame_run(win32k_subsystem::WIN32K_DATA_FRAMES);
             let shared = alloc_frame();
             // A provider wait can outlive and nest with the ordinary syscall/callback frames.
             let provider_wait_frame = alloc_frame();
             // The cross-AS arg-marshal frame(s) — mapped in both the executive and the component.
-            let arg_base = alloc_frame();
-            for _ in 1..win32k_subsystem::WIN32K_ARG_FRAMES {
-                let _ = alloc_frame();
-            }
+            let arg_base = alloc_frame_run(win32k_subsystem::WIN32K_ARG_FRAMES);
             // Pointer-free kernel LPC staging. The executive owns the isolated LPC broker caps;
             // win32k reaches them only through its component-pump service boundary.
-            let lpc_request_base = alloc_frame();
-            for _ in 1..win32k_subsystem::WIN32K_LPC_FRAMES {
-                let _ = alloc_frame();
-            }
+            let lpc_request_base = alloc_frame_run(win32k_subsystem::WIN32K_LPC_FRAMES);
             // Pointer-free staging for native global-atom services redirected to win32k's
             // job-private atom namespace.
-            let job_atom_base = alloc_frame();
-            for _ in 1..win32k_subsystem::WIN32K_JOB_ATOM_FRAMES {
-                let _ = alloc_frame();
-            }
+            let job_atom_base = alloc_frame_run(win32k_subsystem::WIN32K_JOB_ATOM_FRAMES);
             // Pointer-free registry staging. CM channels and leased-key state remain in the
             // executive while win32k carries only bounded bytes and opaque handles.
-            let registry_request_base = alloc_frame();
-            for _ in 1..win32k_subsystem::WIN32K_REGISTRY_FRAMES {
-                let _ = alloc_frame();
-            }
+            let registry_request_base = alloc_frame_run(win32k_subsystem::WIN32K_REGISTRY_FRAMES);
             // Bulk provider argument staging for large GDI client buffers.
-            let bulk_arg_base = alloc_frame();
-            for _ in 1..win32k_subsystem::WIN32K_BULK_ARG_FRAMES {
-                let _ = alloc_frame();
-            }
+            let bulk_arg_base = alloc_frame_run(win32k_subsystem::WIN32K_BULK_ARG_FRAMES);
             // KUSER_SHARED_DATA for win32k's kernel-mode high canonical mapping. It is initialized
             // through an executive scratch alias below, then mapped into the component after its
             // high-VA paging chain exists.
@@ -30752,10 +30719,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // RO-map it into GUI clients. Phase 2A also maps the same frames RW into the executive at
             // their server VAs: callback policy must resolve HWND through gSharedInfo's handle table
             // without dereferencing an unmapped raw component address.
-            let heap_base = alloc_frame();
-            for _ in 1..win32k_subsystem::WIN32K_HEAP_FRAMES {
-                let _ = alloc_frame();
-            }
+            let heap_base = alloc_frame_run(win32k_subsystem::WIN32K_HEAP_FRAMES);
             WIN32K_HEAP_FRAME_BASE.store(heap_base, Ordering::Relaxed);
             for page_table in 0..(win32k_subsystem::WIN32K_HEAP_FRAMES + 511) / 512 {
                 let pt = alloc_slot();

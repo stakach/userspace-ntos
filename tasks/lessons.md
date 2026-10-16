@@ -685,3 +685,7 @@ diagnosis-free failure.
 ## Verify Live Input Before Requesting Desktop Interaction
 - A visible Winlogon frame does not prove that keyboard input reaches i8042 and kbdclass. Send a bounded QMP key event and verify the IRQ and class callback before asking a person to type credentials.
 - When replaying a shorter accepted persistence tail into a larger reserve, clear the entire reserve first. Stale bytes in the unused half can change recovery and invalidate the boot comparison.
+
+## Keep The Kernel Interface In Our Ntdll
+- For a replacement userspace release, stage this project's source-built `ntdll.dll` as the kernel interface and retain the release's unrelated drivers, including `acpi.sys`.
+- Compare exported names against the pinned release `ntdll.dll` and check installed PE imports before boot. Export coverage is an admission gate; live calls and desktop behavior need separate proof.

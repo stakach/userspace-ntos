@@ -25,6 +25,7 @@ mod event;
 mod event_deferred_signal;
 mod event_object;
 mod event_wait;
+mod ex_rundown;
 pub mod executive_sync;
 pub mod gdi_bitmap;
 mod hosted_dpc;
@@ -82,6 +83,7 @@ pub use event_wait::{
     acquire_projected_provider_event_wait, acquire_provider_local_event_wait,
     consume_provider_event_wait, provider_event_wait_is_ready, ProviderEventWaitError,
 };
+pub use ex_rundown::{ExRundownRef, ExRundownRelease, ExRundownWaitBlock};
 pub use event_object::{
     EventLeaseId, EventLeaseKind, EventObjectError, EventObjectId, EventObjectOwner,
     EventObjectRegistry, EventObjectSnapshot, PendingEventSignal, ProviderEventProjectionCatalog,
