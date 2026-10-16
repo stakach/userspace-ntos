@@ -3,7 +3,7 @@
 use super::*;
 use nt_pnp::acpi_hal_route_callback::{PciRouteCallback, PciRouteCallbackLedger};
 
-pub(crate) const LABEL: u64 = 0x7CB;
+pub(crate) const LABEL: u64 = 0x7CF;
 static mut CALLBACKS: Option<PciRouteCallbackLedger> = None;
 
 /// `VOID HalpRegisterPciRouteQuery(PHAL_ACPI_PCI_ROUTE_QUERY Provider)`.

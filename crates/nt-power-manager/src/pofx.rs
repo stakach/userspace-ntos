@@ -20,6 +20,8 @@ pub enum PofxError {
     AlreadyStarted,
     UnbalancedIdle,
     ReferenceOverflow,
+    CallbacksPending,
+    UnknownCallback,
     InsufficientResources,
 }
 
@@ -46,6 +48,7 @@ struct Registration {
     pdo: u64,
     started: bool,
     components: Vec<ComponentSnapshot>,
+    callbacks: Vec<u64>,
 }
 
 /// One authority for PoFx registration identities and activation counts.
@@ -53,6 +56,7 @@ struct Registration {
 pub struct PofxManager {
     registrations: Vec<Registration>,
     next_handle: u64,
+    next_callback: u64,
 }
 
 impl PofxManager {
@@ -97,6 +101,7 @@ impl PofxManager {
             pdo,
             started: false,
             components,
+            callbacks: Vec::new(),
         });
         self.next_handle = next;
         Ok(handle)
@@ -212,6 +217,48 @@ impl PofxManager {
             .ok_or(PofxError::InvalidComponent)
     }
 
+    pub fn started(&self, owner: u64, handle: PofxHandle) -> Result<bool, PofxError> {
+        Ok(self.registration(owner, handle)?.started)
+    }
+
+    /// A retained ticket precedes every native callback invocation. If its
+    /// result is uncertain, the ticket stays outstanding and blocks rundown.
+    pub fn begin_callback(&mut self, owner: u64, handle: PofxHandle) -> Result<u64, PofxError> {
+        let next = self.next_callback.checked_add(1)
+            .ok_or(PofxError::InsufficientResources)?;
+        self.registration_mut(owner, handle)?.callbacks.try_reserve(1)
+            .map_err(|_| PofxError::InsufficientResources)?;
+        self.registration_mut(owner, handle)?.callbacks.push(next);
+        self.next_callback = next;
+        Ok(next)
+    }
+
+    pub fn complete_callback(
+        &mut self,
+        owner: u64,
+        handle: PofxHandle,
+        ticket: u64,
+    ) -> Result<(), PofxError> {
+        let registration = self.registration_mut(owner, handle)?;
+        let position = registration.callbacks.iter().position(|&value| value == ticket)
+            .ok_or(PofxError::UnknownCallback)?;
+        registration.callbacks.remove(position);
+        Ok(())
+    }
+
+    pub fn callback_quiesced(
+        &self,
+        owner: u64,
+        handle: PofxHandle,
+    ) -> Result<bool, PofxError> {
+        Ok(self.registration(owner, handle)?.callbacks.is_empty())
+    }
+
+    pub fn callbacks_quiesced(&self, owner: u64) -> bool {
+        self.registrations.iter().filter(|registration| registration.owner == owner)
+            .all(|registration| registration.callbacks.is_empty())
+    }
+
     /// Native integration must first quiesce every callback and prevent new
     /// calls from entering this record. Removal then revokes the handle.
     pub fn unregister(&mut self, owner: u64, handle: PofxHandle) -> Result<(), PofxError> {
@@ -222,6 +269,9 @@ impl PofxManager {
             .ok_or(PofxError::UnknownHandle)?;
         if self.registrations[position].owner != owner {
             return Err(PofxError::WrongOwner);
+        }
+        if !self.registrations[position].callbacks.is_empty() {
+            return Err(PofxError::CallbacksPending);
         }
         self.registrations.remove(position);
         Ok(())

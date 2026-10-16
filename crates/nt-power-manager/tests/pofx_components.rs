@@ -71,3 +71,31 @@ fn distinct_registrations_cannot_change_each_others_counts() {
     pofx.unregister(OWNER, first).unwrap();
     assert_eq!(pofx.component(OWNER + 1, second, 0).unwrap().references, 0);
 }
+
+#[test]
+fn live_registration_without_callback_does_not_block_owner_retirement() {
+    let mut pofx = PofxManager::new();
+    let handle = pofx.register(OWNER, PDO, 1).unwrap();
+    pofx.activate(OWNER, handle, 0).unwrap();
+
+    // The owning driver still has a PoFx handle and component reference, but
+    // no native callback was dispatched. Provider teardown may revoke them.
+    assert!(pofx.callbacks_quiesced(OWNER));
+    pofx.unregister(OWNER, handle).unwrap();
+    assert!(pofx.callbacks_quiesced(OWNER));
+    assert_ne!(pofx.register(OWNER, PDO, 1).unwrap(), handle);
+}
+
+#[test]
+fn executing_or_uncertain_callback_retains_registration_until_settled() {
+    let mut pofx = PofxManager::new();
+    let handle = pofx.register(OWNER, PDO, 1).unwrap();
+    let ticket = pofx.begin_callback(OWNER, handle).unwrap();
+    assert!(!pofx.callbacks_quiesced(OWNER));
+    assert_eq!(pofx.unregister(OWNER, handle), Err(PofxError::CallbacksPending));
+    // A missing native acknowledgement leaves the exact callback ticket held.
+    assert!(!pofx.callbacks_quiesced(OWNER));
+    pofx.complete_callback(OWNER, handle, ticket).unwrap();
+    assert!(pofx.callbacks_quiesced(OWNER));
+    pofx.unregister(OWNER, handle).unwrap();
+}

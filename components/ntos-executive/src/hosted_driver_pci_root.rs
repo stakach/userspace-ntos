@@ -5,7 +5,7 @@ use nt_pnp::acpi_hal_pci_root::{
     PciRootDescriptor, PciRootLedger, PciRootOwner, HAL_ACPI_PCI_ROOT_INFO_BYTES,
 };
 
-pub(crate) const LABEL: u64 = 0x7CA;
+pub(crate) const LABEL: u64 = 0x7CE;
 static mut ROOTS: Option<PciRootLedger> = None;
 
 fn owner(inst: DriverInstance) -> PciRootOwner {

@@ -326,9 +326,12 @@ mod hosted_driver_crt_wide_sort;
 mod hosted_driver_cache_invalidation;
 #[path = "hosted_driver_pnp_notification.rs"]
 mod hosted_driver_pnp_notification;
+#[path = "hosted_driver_pofx.rs"]
+mod hosted_driver_pofx;
 #[path = "hosted_driver_device_state.rs"]
 mod hosted_driver_device_state;
 pub(crate) use hosted_driver_pnp_notification::service as service_hosted_driver_pnp_notification;
+pub(crate) use hosted_driver_pofx::service as service_hosted_driver_pofx;
 pub(crate) use hosted_driver_pnp_notification::wake_due as hosted_driver_pnp_notification_wake_due;
 #[path = "hosted_io_create_file_ingress.rs"]
 mod hosted_io_create_file_ingress;
@@ -1170,6 +1173,7 @@ pub const FSD_SERVICE_DYNAMIC_OBJECT_INSERT_LABEL: u64 = hosted_driver_dynamic_o
 pub const FSD_SERVICE_DYNAMIC_OBJECT_REFERENCE_LABEL: u64 = hosted_driver_dynamic_object::REFERENCE_LABEL;
 pub const FSD_SERVICE_DYNAMIC_OBJECT_DEREFERENCE_LABEL: u64 = hosted_driver_dynamic_delete::DEREFERENCE_LABEL;
 pub const FSD_SERVICE_PS_HANDLE_REFERENCE_LABEL: u64 = hosted_driver_ps_handle_reference::LABEL;
+pub const FSD_SERVICE_POFX_LABEL: u64 = hosted_driver_pofx::LABEL;
 const _: () = {
     let labels = [
         FSD_SERVICE_SOURCE_IRP_LABEL,
@@ -1209,6 +1213,9 @@ const _: () = {
         FSD_SERVICE_DYNAMIC_OBJECT_REFERENCE_LABEL,
         FSD_SERVICE_DYNAMIC_OBJECT_DEREFERENCE_LABEL,
         FSD_SERVICE_PS_HANDLE_REFERENCE_LABEL,
+        FSD_SERVICE_POFX_LABEL,
+        FSD_SERVICE_PCI_ROOT_LABEL,
+        FSD_SERVICE_PCI_ROUTE_QUERY_LABEL,
     ];
     let mut i = 0;
     while i < labels.len() {
@@ -34044,6 +34051,17 @@ fn register_fsd_trampolines() -> bool {
         "PoSetPowerState",
         s_po_set_power_state as *const () as usize as u64,
     );
+    reg.bind("PoFxRegisterDevice", hosted_driver_pofx::register_device as *const () as usize as u64);
+    reg.bind("PoFxUnregisterDevice", hosted_driver_pofx::unregister_device as *const () as usize as u64);
+    reg.bind("PoFxActivateComponent", hosted_driver_pofx::activate as *const () as usize as u64);
+    reg.bind("PoFxIdleComponent", hosted_driver_pofx::idle as *const () as usize as u64);
+    reg.bind("PoFxSetComponentLatency", hosted_driver_pofx::set_latency as *const () as usize as u64);
+    reg.bind("PoFxSetComponentResidency", hosted_driver_pofx::set_residency as *const () as usize as u64);
+    reg.bind("PoFxCompleteIdleCondition", hosted_driver_pofx::complete_idle_condition as *const () as usize as u64);
+    reg.bind("PoFxCompleteIdleState", hosted_driver_pofx::complete_idle_state as *const () as usize as u64);
+    reg.bind("PoFxCompleteDevicePowerNotRequired", hosted_driver_pofx::complete_device_power_not_required as *const () as usize as u64);
+    reg.bind("PoFxReportDevicePoweredOn", hosted_driver_pofx::report_device_powered_on as *const () as usize as u64);
+    reg.bind("PoFxPowerControl", hosted_driver_pofx::power_control as *const () as usize as u64);
     reg.bind(
         "IoGetDmaAdapter",
         s_io_get_dma_adapter as *const () as usize as u64,
@@ -58054,6 +58072,7 @@ unsafe fn hosted_driver_device_lifetime_quiesced(
         && interface_queries_quiesced
         && unsafe { hosted_driver_device_state::retire_domain(domain) }
         && hosted_driver_pnp_notification::quiesced(domain)
+        && hosted_driver_pofx::quiesced(domain)
 }
 
 fn hosted_driver_thread_error_status(error: HostedDriverThreadError) -> i32 {
@@ -58681,6 +58700,7 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
             hosted_device_property_transfers_mut().remove_domain(domain);
             hosted_driver_device_interfaces::retire_domain(domain);
             hosted_driver_pnp_notification::retire_domain(domain);
+            hosted_driver_pofx::retire_domain(domain);
         }
     }
     if let Some(domain) = retiring_domain {
