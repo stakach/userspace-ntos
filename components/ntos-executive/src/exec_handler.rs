@@ -3985,6 +3985,7 @@ impl ExecNtHandler {
         write_field!(delay_requested, false);
         write_field!(delay_interval_100ns, 0);
         write_field!(delay_alertable, false);
+        write_field!(thread_alert_wait, None);
         write_field!(io_completion_park_port, -1);
         write_field!(io_completion_key_out, 0);
         write_field!(io_completion_apc_out, 0);
@@ -22766,7 +22767,7 @@ impl ExecNtHandler {
         Ok(i64::from_le_bytes(bytes))
     }
 
-    fn wait_timeout_interval(&self, timeout_ptr: u64) -> Result<Option<i64>, u32> {
+    pub(crate) fn wait_timeout_interval(&self, timeout_ptr: u64) -> Result<Option<i64>, u32> {
         if timeout_ptr == 0 {
             return Ok(None);
         }
@@ -35889,6 +35890,12 @@ impl ExecNtHandler {
             NativeService::NtTestAlert => match unsafe { self.try_deliver_current_user_apc(0) } {
                 Ok(_) => 0,
                 Err(status) => status,
+            },
+            NativeService::NtAlertThreadByThreadId => unsafe {
+                crate::thread_alert::alert(self, args[0])
+            },
+            NativeService::NtWaitForAlertByThreadId => unsafe {
+                crate::thread_alert::begin_wait(self, args[1])
             },
             NativeService::NtQuerySecurityObject => unsafe {
                 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;

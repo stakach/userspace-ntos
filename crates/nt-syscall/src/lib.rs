@@ -233,6 +233,8 @@ pub enum NativeService {
     NtSetInformationThread,
     NtSetInformationProcess,
     NtTestAlert,
+    NtAlertThreadByThreadId,
+    NtWaitForAlertByThreadId,
     NtFlushInstructionCache,
     NtCreateKeyedEvent,
     NtReleaseKeyedEvent,
@@ -456,6 +458,8 @@ impl NativeService {
             NtSetInformationThread => "NtSetInformationThread",
             NtSetInformationProcess => "NtSetInformationProcess",
             NtTestAlert => "NtTestAlert",
+            NtAlertThreadByThreadId => "NtAlertThreadByThreadId",
+            NtWaitForAlertByThreadId => "NtWaitForAlertByThreadId",
             NtFlushInstructionCache => "NtFlushInstructionCache",
             NtCreateKeyedEvent => "NtCreateKeyedEvent",
             NtReleaseKeyedEvent => "NtReleaseKeyedEvent",
@@ -721,6 +725,8 @@ impl NativeService {
         NativeService::NtCreateProcessEx,
         NativeService::NtQueryMutant,
         NativeService::NtQueryTimer,
+        NativeService::NtAlertThreadByThreadId,
+        NativeService::NtWaitForAlertByThreadId,
     ];
 }
 

@@ -32,6 +32,7 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
             DELAY_TIMER_SOURCE_IO_COMPLETION,
         ),
         (owner.user_timer, DELAY_TIMER_SOURCE_USER_TIMER),
+        (thread_alert::next_deadline(now), DELAY_TIMER_SOURCE_THREAD_ALERT),
         (
             service_sec_image::provider_wait_next_deadline(now),
             DELAY_TIMER_SOURCE_PROVIDER_WAIT,

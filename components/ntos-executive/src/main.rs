@@ -89,6 +89,7 @@ mod thread_context;
 mod thread_suspend;
 mod boot_registry_mutation_work;
 mod object_wait;
+mod thread_alert;
 use object_wait::*;
 mod object_wait_apc;
 mod object_wait_reply;
@@ -971,6 +972,8 @@ pub const SSN_NT_SET_INFO_THREAD: u64 = 238;
 pub const SSN_NT_SET_INFO_PROCESS: u64 = 237;
 /// ntdll's NtTestAlert SSN (LdrpInitialize drains pending APCs before the image entry).
 pub const SSN_NT_TEST_ALERT: u64 = 268;
+pub const SSN_NT_ALERT_THREAD_BY_THREAD_ID: u64 = 0x406;
+pub const SSN_NT_WAIT_FOR_ALERT_BY_THREAD_ID: u64 = 0x4ad;
 /// ntdll's NtQueueApcThread SSN (RTL work items queue user APCs to alertable worker threads).
 pub const SSN_NT_QUEUE_APC_THREAD: u64 = 188;
 /// NtInitializeRegistry — smss tells the Config Manager that boot registry initialization has
@@ -3059,6 +3062,7 @@ const DELAY_TIMER_SOURCE_HOSTED_DPC: u64 = 19;
 const DELAY_TIMER_SOURCE_REGISTRY_MUTATION: u64 = 20;
 const DELAY_TIMER_SOURCE_SECTION_METADATA: u64 = 21;
 const DELAY_TIMER_SOURCE_SYSTEM_WAL_FOLD: u64 = 22;
+const DELAY_TIMER_SOURCE_THREAD_ALERT: u64 = 23;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -16920,6 +16924,7 @@ unsafe fn delay_timer_drain_due_work(
         + subdrain!(2, keyed_wait_wake_due(handler, now))
         + subdrain!(3, keyed_release_wait_wake_due(handler, now))
         + subdrain!(4, io_completion_wake_due(handler, now))
+        + thread_alert::redrive(handler)
         + subdrain!(5, user_timer_wake_due(handler, now))
         + timer_hosted_driver_wake_due(now)
         + subdrain!(9, handler.job_time_sample_due(now_100ns))
@@ -18127,6 +18132,7 @@ unsafe fn terminate_hosted_thread_mechanism(
         return false;
     }
     delay_cancel_thread(delay_queue, handler, tid);
+    if !thread_alert::cancel_thread(handler, tid) { return false; }
     io_completion_cancel_thread(handler, tid);
     let _ = handler.user_timer_cancel_thread(tid);
     delay_timer_rearm(delay_queue, handler);
@@ -23101,6 +23107,8 @@ struct ExecNtHandler {
     delay_requested: bool,
     delay_interval_100ns: i64,
     delay_alertable: bool,
+    /// Owned NtWaitForAlertByThreadId admission; the loop binds its live Reply after dispatch.
+    thread_alert_wait: Option<nt_delay_execution::Deadline>,
     /// Blocking completion remove side signal. `-1` means no park request; nonnegative is the
     /// retained completion-port id to publish at the reply-cap park site.
     io_completion_park_port: i64,
@@ -24982,6 +24990,8 @@ fn build_nt_table() -> NativeServiceTable {
                 SSN_NT_SET_INFO_PROCESS as u32,
             ),
             (NativeService::NtTestAlert, SSN_NT_TEST_ALERT as u32),
+            (NativeService::NtAlertThreadByThreadId, SSN_NT_ALERT_THREAD_BY_THREAD_ID as u32),
+            (NativeService::NtWaitForAlertByThreadId, SSN_NT_WAIT_FOR_ALERT_BY_THREAD_ID as u32),
             (
                 NativeService::NtQueueApcThread,
                 SSN_NT_QUEUE_APC_THREAD as u32,

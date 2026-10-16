@@ -12101,6 +12101,7 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_keyed_release_wait_key: u64 = u64::MAX;
             let mut park_keyed_release_wait_deadline = nt_delay_execution::Deadline::Infinite;
             let mut park_delay_deadline: Option<nt_delay_execution::Deadline> = None;
+            let mut park_thread_alert_deadline: Option<nt_delay_execution::Deadline> = None;
             let mut park_io_completion_port: i64 = -1;
             let mut park_io_completion_key_out: u64 = 0;
             let mut park_io_completion_apc_out: u64 = 0;
@@ -12255,6 +12256,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.delay_requested = false;
                 nt_handler.delay_interval_100ns = 0;
                 nt_handler.delay_alertable = false;
+                nt_handler.thread_alert_wait = None;
                 nt_handler.io_completion_park_port = -1;
                 nt_handler.io_completion_key_out = 0;
                 nt_handler.io_completion_apc_out = 0;
@@ -12820,6 +12822,8 @@ pub(crate) unsafe fn service_sec_image(
                         park_delay_deadline = Some(deadline);
                     }
                 }
+                park_thread_alert_deadline = nt_handler.thread_alert_wait.take();
+                thread_alert::redrive(&mut nt_handler);
                 if nt_handler.io_completion_park_port >= 0 {
                     park_io_completion_port = nt_handler.io_completion_park_port;
                     park_io_completion_key_out = nt_handler.io_completion_key_out;
@@ -17871,6 +17875,27 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 print_str(b"[delay] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n");
                 result = 0xC000_009A;
+            }
+            if let Some(deadline) = park_thread_alert_deadline {
+                let timed = deadline != nt_delay_execution::Deadline::Infinite;
+                if timed && !delay_timer_init() {
+                    result = nt_fs::STATUS_INSUFFICIENT_RESOURCES as u64;
+                } else if thread_alert::park(&mut nt_handler, deadline, reply_main) {
+                    delay_timer_rearm_after_park(delay_queue, &mut nt_handler, timed);
+                    thread_alert::redrive(&mut nt_handler);
+                    let _ = finalize_service_loop_state(&mut nt_handler);
+                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let received = component_recv!(fault_ep, new_reply);
+                    badge = received.0;
+                    mi = received.1;
+                    m0 = received.2;
+                    m1 = received.3;
+                    m2 = received.4;
+                    m3 = received.5;
+                    continue;
+                } else {
+                    result = nt_fs::STATUS_INSUFFICIENT_RESOURCES as u64;
+                }
             }
             // Keyed-event release park (`NtReleaseKeyedEvent`): if no wait side is already parked,
             // the release side waits for a future `NtWaitForKeyedEvent` on the same key.

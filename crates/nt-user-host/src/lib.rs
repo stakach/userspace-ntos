@@ -12,6 +12,7 @@ extern crate alloc;
 
 pub mod commit_release;
 pub mod object_wait;
+pub mod thread_alert;
 pub mod current_apc;
 pub mod dispatcher_state;
 pub mod bootstrap_store;
