@@ -45,6 +45,9 @@ pub mod exports;
 /// See [`security_exports`].
 pub mod security_exports;
 
+/// Private-namespace boundary descriptor construction and SID ownership.
+pub mod boundary;
+
 /// Process-local USER client procedure tables registered by the released user32.dll.
 pub mod user_pfn;
 
@@ -54,11 +57,20 @@ pub mod performance;
 /// The released kernel32's precise NT system-time query.
 pub mod system_time_precise;
 
+/// Named PE export lookup used by the released WOW64 support libraries.
+pub mod find_exported_routine;
+
 /// The x64 ntdll thread entry used by the released kernel32.dll.
 pub mod user_thread_start;
 
 /// Extended processor-state feature query from the mapped NT shared-data page.
 pub mod extended_features;
+
+/// Process-local address waits backed by native thread-alert syscalls.
+pub mod wait_address;
+
+/// Windows x64 extended-context ABI over the currently supported legacy context.
+pub mod extended_context;
 
 /// Step 4.B — the on-target IN-PROCESS loader drive (real heap + import snap). See [`on_target`].
 #[cfg(target_arch = "x86_64")]
@@ -1291,14 +1303,24 @@ static KEEP_EXPORTS: unsafe extern "C" fn() = exports::EXPORT_ANCHOR_FN;
 static KEEP_SECURITY_EXPORTS: unsafe extern "C" fn() = security_exports::SECURITY_EXPORT_ANCHOR_FN;
 
 #[used]
+static KEEP_BOUNDARY_EXPORTS: unsafe extern "C" fn() = boundary::BOUNDARY_EXPORT_ANCHOR_FN;
+
+#[used]
 static KEEP_USER_PFN_EXPORTS: unsafe extern "C" fn() = user_pfn::USER_PFN_EXPORT_ANCHOR_FN;
 
 #[used]
 static KEEP_PERFORMANCE_EXPORTS: unsafe extern "C" fn() = performance::PERFORMANCE_EXPORT_ANCHOR_FN;
 
 #[used]
+static KEEP_WAIT_ADDRESS_EXPORTS: unsafe extern "C" fn() = wait_address::WAIT_ADDRESS_EXPORT_ANCHOR_FN;
+
+#[used]
 static KEEP_SYSTEM_TIME_PRECISE_EXPORTS: unsafe extern "C" fn() =
     system_time_precise::SYSTEM_TIME_PRECISE_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_FIND_EXPORTED_ROUTINE: unsafe extern "C" fn() =
+    find_exported_routine::FIND_EXPORTED_ROUTINE_ANCHOR_FN;
 
 #[used]
 static KEEP_USER_THREAD_START_EXPORTS: unsafe extern "C" fn() =
@@ -1307,6 +1329,10 @@ static KEEP_USER_THREAD_START_EXPORTS: unsafe extern "C" fn() =
 #[used]
 static KEEP_EXTENDED_FEATURES_EXPORTS: unsafe extern "C" fn() =
     extended_features::EXTENDED_FEATURES_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_EXTENDED_CONTEXT_EXPORTS: unsafe extern "C" fn() =
+    extended_context::EXTENDED_CONTEXT_EXPORT_ANCHOR_FN;
 
 /// Anchor private on-target entrypoints that are still discovered dynamically from ntdll exports.
 #[used]
