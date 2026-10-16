@@ -654,6 +654,12 @@ fn bochs_inf_candidates() -> Vec<PathBuf> {
         out.push(cwd.join(BOCHS_INF_RELATIVE_PATH));
     }
     out.push(workspace_relative_path(BOCHS_INF_RELATIVE_PATH));
+    // Host tests run in CI without a downloaded disk image. This is the exact
+    // pinned source INF (its hash is recorded in rust-micro's manifest).
+    #[cfg(test)]
+    out.push(workspace_relative_path(
+        "crates/nt-hive-core/fixtures/libernt/bochsmp.inf",
+    ));
     out
 }
 
