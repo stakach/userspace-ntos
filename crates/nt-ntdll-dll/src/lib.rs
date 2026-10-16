@@ -51,6 +51,9 @@ pub mod user_pfn;
 /// Native performance counter wrappers used by the released kernel32.dll.
 pub mod performance;
 
+/// The released kernel32's precise NT system-time query.
+pub mod system_time_precise;
+
 /// The x64 ntdll thread entry used by the released kernel32.dll.
 pub mod user_thread_start;
 
@@ -1292,6 +1295,10 @@ static KEEP_USER_PFN_EXPORTS: unsafe extern "C" fn() = user_pfn::USER_PFN_EXPORT
 
 #[used]
 static KEEP_PERFORMANCE_EXPORTS: unsafe extern "C" fn() = performance::PERFORMANCE_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_SYSTEM_TIME_PRECISE_EXPORTS: unsafe extern "C" fn() =
+    system_time_precise::SYSTEM_TIME_PRECISE_EXPORT_ANCHOR_FN;
 
 #[used]
 static KEEP_USER_THREAD_START_EXPORTS: unsafe extern "C" fn() =
