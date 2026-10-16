@@ -51,6 +51,9 @@ pub mod user_pfn;
 /// Native performance counter wrappers used by the released kernel32.dll.
 pub mod performance;
 
+/// Extended processor-state feature query from the mapped NT shared-data page.
+pub mod extended_features;
+
 /// Step 4.B — the on-target IN-PROCESS loader drive (real heap + import snap). See [`on_target`].
 #[cfg(target_arch = "x86_64")]
 pub mod on_target;
@@ -1286,6 +1289,10 @@ static KEEP_USER_PFN_EXPORTS: unsafe extern "C" fn() = user_pfn::USER_PFN_EXPORT
 
 #[used]
 static KEEP_PERFORMANCE_EXPORTS: unsafe extern "C" fn() = performance::PERFORMANCE_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_EXTENDED_FEATURES_EXPORTS: unsafe extern "C" fn() =
+    extended_features::EXTENDED_FEATURES_EXPORT_ANCHOR_FN;
 
 /// Anchor private on-target entrypoints that are still discovered dynamically from ntdll exports.
 #[used]

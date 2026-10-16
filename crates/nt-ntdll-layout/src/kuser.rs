@@ -30,6 +30,8 @@ pub const NUMBER_OF_PHYSICAL_PAGES: usize = 0x2e8;
 pub const TICK_COUNT: usize = 0x320;
 pub const COOKIE: usize = 0x330;
 pub const ACTIVE_PROCESSOR_COUNT: usize = 0x3c0;
+/// NT 10 x64 `KUSER_SHARED_DATA.XState.EnabledFeatures` in the pinned LiberNT ABI.
+pub const XSTATE_ENABLED_FEATURES: usize = 0x3d8;
 
 pub const PROCESSOR_FEATURE_COUNT: usize = 64;
 pub const TICK_COUNT_MULTIPLIER_ONE_MS: u32 = 1 << 24;
@@ -156,6 +158,16 @@ pub unsafe fn read_tick_count(page: *const u8) -> u32 {
     let multiplier =
         unsafe { core::ptr::read_volatile(page.add(TICK_COUNT_MULTIPLIER) as *const u32) };
     tick_count_to_milliseconds(ticks, multiplier)
+}
+
+/// Return the enabled XState bits requested by the caller. The host publishes zero
+/// until it supplies an OS-backed extended-state save/restore contract.
+///
+/// # Safety
+/// `page` identifies a readable native `KUSER_SHARED_DATA` page.
+pub unsafe fn read_enabled_extended_features(page: *const u8, mask: u64) -> u64 {
+    let enabled = unsafe { core::ptr::read_volatile(page.add(XSTATE_ENABLED_FEATURES) as *const u64) };
+    enabled & mask
 }
 
 /// Publish the dynamic clocks consumed directly through `KUSER_SHARED_DATA`.
@@ -305,6 +317,18 @@ mod tests {
         const PF_XSAVE_ENABLED: usize = 17;
         let features = processor_features(u32::MAX);
         assert_eq!(features[PF_XSAVE_ENABLED], 0);
+    }
+
+    #[test]
+    fn enabled_extended_features_reads_the_pinned_nt10_field_and_masks_it() {
+        #[repr(align(8))]
+        struct AlignedPage([u8; PAGE_SIZE]);
+
+        let mut page = AlignedPage([0u8; PAGE_SIZE]);
+        assert_eq!(unsafe { read_enabled_extended_features(page.0.as_ptr(), !0) }, 0);
+        page.0[XSTATE_ENABLED_FEATURES..XSTATE_ENABLED_FEATURES + 8]
+            .copy_from_slice(&0b1011u64.to_le_bytes());
+        assert_eq!(unsafe { read_enabled_extended_features(page.0.as_ptr(), 0b0110) }, 0b0010);
     }
 
     #[test]
