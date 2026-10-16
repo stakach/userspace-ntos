@@ -72,6 +72,7 @@ impl NtThread {
             affinity_mask,
             priority: base_priority,
             base_priority,
+            quantum_reset: 0,
             ideal_processor: 0,
             break_on_termination: false,
             disable_boost: false,
@@ -113,6 +114,7 @@ impl ProcessManager {
         }
         let affinity_mask = process.affinity_mask;
         let base_priority = process.base_priority;
+        let quantum_reset = process.quantum_reset;
         let tid = self.next_cid;
         let next = tid
             .checked_add(CLIENT_ID_GRANULARITY)
@@ -131,6 +133,7 @@ impl ProcessManager {
             affinity_mask,
             base_priority,
         )?;
+        thread.quantum_reset = quantum_reset;
         self.threads
             .entries
             .try_reserve_exact(table_reserve)

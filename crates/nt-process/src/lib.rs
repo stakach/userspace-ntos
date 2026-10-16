@@ -37,6 +37,8 @@ mod native_font_mitigation;
 mod native_object_handle_flags;
 mod native_peb_state;
 mod native_priority_class;
+mod native_priority_by_class;
+pub use native_priority_by_class::{ProcessPriorityByClassPlan, ProcessPriorityQuantumPolicy, ProcessSchedulingState, ThreadSchedulingState};
 mod process_session;
 mod native_wow64_state;
 #[cfg(test)]
@@ -749,6 +751,10 @@ pub struct NtProcess {
     affinity_mask: u64,
     /// `KPROCESS.BasePriority`, surfaced through `ProcessBasicInformation`.
     base_priority: i32,
+    /// `KPROCESS.QuantumReset`; zero until an admitted scheduler policy sets it.
+    quantum_reset: u8,
+    /// `EPROCESS.Vm.Flags.MemoryPriority`; creation begins at background priority.
+    memory_priority: u8,
     /// `EPROCESS.PriorityClass`. ReactOS initializes new processes to NORMAL (2).
     priority_class: u8,
     /// Foreground/background priority mode carried by `PROCESS_PRIORITY_CLASS.Foreground` and
@@ -1097,6 +1103,8 @@ pub struct NtThread {
     priority: i32,
     /// `KTHREAD.BasePriority`.
     base_priority: i32,
+    /// `KTHREAD.QuantumReset`; inherited from the owning process on thread activation.
+    quantum_reset: u8,
     /// `KTHREAD.IdealProcessor`.
     ideal_processor: u64,
     /// `ThreadBreakOnTermination`, initially clear and not inherited from the process.
@@ -1187,6 +1195,8 @@ pub struct Win32Callouts {
 /// The Process Manager: processes, threads, and image sections (spec §5, §9-§13).
 #[derive(Default)]
 pub struct ProcessManager {
+    /// Move-stable owner identity for prepared process scheduler transitions.
+    priority_plan_manager_identity: u64,
     /// Lazily assigned, move-stable identity for suspend-control plans.
     suspend_manager_identity: u64,
     /// Move-stable owner identity for exact queued user-APC claims.
@@ -1415,6 +1425,8 @@ impl ProcessManager {
                 peb_base_address: 0,
                 affinity_mask,
                 base_priority,
+                quantum_reset: 0,
+                memory_priority: 0,
                 priority_class,
                 foreground,
                 exception_port_endpoint: None,
@@ -2208,11 +2220,13 @@ impl ProcessManager {
         }
         let affinity_mask = proc.affinity_mask;
         let base_priority = proc.base_priority;
+        let quantum_reset = proc.quantum_reset;
         let tid = self.next_cid;
-        let thread = NtThread::try_construct(
+        let mut thread = NtThread::try_construct(
             tid, pid, start_address, parameter, is_system_thread, state,
             affinity_mask, base_priority,
         )?;
+        thread.quantum_reset = quantum_reset;
         let allocated = allocate_client_id(&mut self.next_cid);
         debug_assert_eq!(allocated, tid);
         proc.threads.insert(tid);
@@ -3455,6 +3469,7 @@ impl ProcessManager {
         }
         let affinity_mask = process.affinity_mask;
         let base_priority = process.base_priority;
+        let quantum_reset = process.quantum_reset;
         let reusable = match current.state {
             ThreadState::Initialized => {
                 current.wait_references == 0
@@ -3511,6 +3526,7 @@ impl ProcessManager {
         thread.affinity_mask = affinity_mask;
         thread.priority = base_priority;
         thread.base_priority = base_priority;
+        thread.quantum_reset = quantum_reset;
         thread.ideal_processor = 0;
         thread.security_descriptor.clear();
         thread
