@@ -64,10 +64,18 @@ fn bootstrap_ack_barriers_keep_acpi_before_driver_plan_and_setup_in_order() {
 #[test]
 fn acpi_boot_receive_refusal_retains_one_owner_and_blocks_driver_selection() {
     let acpi = source("acpi_platform.rs");
+    let policy_start = acpi.find("unsafe fn acpi_root_registry_policy(")
+        .expect("ACPI root policy selection");
     let start = acpi.find("pub(crate) unsafe fn publish_acpi_root_devnode_from_registry_policy(")
         .expect("ACPI root publication");
+    let policy = &acpi[policy_start..start];
+    assert!(policy.contains("config_manager_query_critical_device_binding("),
+        "the existing critical-device lookup must remain a registry policy input");
+    assert!(policy.contains("acpi_root_driver_database_policy(expected_generation)"),
+        "the mounted DriverDatabase must supply policy when the critical key is absent");
     let acpi = &acpi[start..];
-    let decision = acpi.find("config_manager_query_critical_device_binding(").unwrap();
+    let decision = acpi.find("acpi_root_registry_policy(expected_generation)?")
+        .expect("one selected ACPI root policy before mutation");
     let gate = acpi.find("publish_boot_system_mutation(")
         .expect("ACPI boot must install retained CM work");
     assert!(decision < gate, "policy is captured once before retained work");
