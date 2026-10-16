@@ -25203,6 +25203,7 @@ zw_alias!(
     nt_remove_process_debug
 );
 zw_alias!(zw_replace_key, "ZwReplaceKey", nt_replace_key);
+zw_alias!(zw_rename_key, "ZwRenameKey", nt_rename_key);
 zw_alias!(zw_reply_port, "ZwReplyPort", nt_reply_port);
 zw_alias!(
     zw_reply_wait_receive_port,
@@ -25339,6 +25340,7 @@ zw_alias!(
     nt_set_thread_execution_state
 );
 zw_alias!(zw_set_timer, "ZwSetTimer", nt_set_timer);
+zw_alias!(zw_set_timer_resolution, "ZwSetTimerResolution", nt_set_timer_resolution);
 zw_alias!(zw_set_uuid_seed, "ZwSetUuidSeed", nt_set_uuid_seed);
 zw_alias!(zw_set_value_key, "ZwSetValueKey", nt_set_value_key);
 zw_alias!(
@@ -25370,6 +25372,7 @@ zw_alias!(
     nt_terminate_thread
 );
 zw_alias!(zw_test_alert, "ZwTestAlert", nt_test_alert);
+zw_alias!(zw_trace_event, "ZwTraceEvent", nt_trace_event);
 zw_alias!(zw_unload_driver, "ZwUnloadDriver", nt_unload_driver);
 zw_alias!(zw_unload_key, "ZwUnloadKey", nt_unload_key);
 zw_alias!(zw_unload_key2, "ZwUnloadKey2", nt_unload_key2);
@@ -25434,6 +25437,199 @@ zw_alias!(
     "ZwAlpcSendWaitReceivePort",
     nt_alpc_send_wait_receive_port
 );
+zw_alias!(zw_cancel_io_file_ex, "ZwCancelIoFileEx", nt_cancel_io_file_ex);
+zw_alias!(zw_compare_objects, "ZwCompareObjects", nt_compare_objects);
+zw_alias!(zw_create_low_box_token, "ZwCreateLowBoxToken", nt_create_low_box_token);
+zw_alias!(zw_create_private_namespace, "ZwCreatePrivateNamespace", nt_create_private_namespace);
+zw_alias!(zw_create_user_process, "ZwCreateUserProcess", nt_create_user_process);
+zw_alias!(zw_delete_private_namespace, "ZwDeletePrivateNamespace", nt_delete_private_namespace);
+zw_alias!(zw_get_nls_section_ptr, "ZwGetNlsSectionPtr", nt_get_nls_section_ptr);
+zw_alias!(zw_open_private_namespace, "ZwOpenPrivateNamespace", nt_open_private_namespace);
+zw_alias!(zw_query_system_information_ex, "ZwQuerySystemInformationEx", nt_query_system_information_ex);
+zw_alias!(zw_remove_io_completion_ex, "ZwRemoveIoCompletionEx", nt_remove_io_completion_ex);
+zw_alias!(zw_set_information_virtual_memory, "ZwSetInformationVirtualMemory", nt_set_information_virtual_memory);
+zw_alias!(zw_trace_control, "ZwTraceControl", nt_trace_control);
+
+zw_alias!(zw_acquire_cmf_view_ownership, "ZwAcquireCMFViewOwnership", nt_acquire_cmf_view_ownership);
+zw_alias!(zw_add_boot_entry, "ZwAddBootEntry", nt_add_boot_entry);
+zw_alias!(zw_add_driver_entry, "ZwAddDriverEntry", nt_add_driver_entry);
+zw_alias!(zw_alert_multiple_thread_by_thread_id, "ZwAlertMultipleThreadByThreadId", nt_alert_multiple_thread_by_thread_id);
+zw_alias!(zw_alert_resume_thread, "ZwAlertResumeThread", nt_alert_resume_thread);
+zw_alias!(zw_alert_thread, "ZwAlertThread", nt_alert_thread);
+zw_alias!(zw_alert_thread_by_thread_id, "ZwAlertThreadByThreadId", nt_alert_thread_by_thread_id);
+zw_alias!(zw_allocate_reserve_object, "ZwAllocateReserveObject", nt_allocate_reserve_object);
+zw_alias!(zw_allocate_uuids, "ZwAllocateUuids", nt_allocate_uuids);
+zw_alias!(zw_allocate_virtual_memory_ex, "ZwAllocateVirtualMemoryEx", nt_allocate_virtual_memory_ex);
+zw_alias!(zw_alpc_cancel_message, "ZwAlpcCancelMessage", nt_alpc_cancel_message);
+zw_alias!(zw_alpc_connect_port_ex, "ZwAlpcConnectPortEx", nt_alpc_connect_port_ex);
+zw_alias!(zw_alpc_create_port_section, "ZwAlpcCreatePortSection", nt_alpc_create_port_section);
+zw_alias!(zw_alpc_create_resource_reserve, "ZwAlpcCreateResourceReserve", nt_alpc_create_resource_reserve);
+zw_alias!(zw_alpc_create_section_view, "ZwAlpcCreateSectionView", nt_alpc_create_section_view);
+zw_alias!(zw_alpc_create_security_context, "ZwAlpcCreateSecurityContext", nt_alpc_create_security_context);
+zw_alias!(zw_alpc_delete_port_section, "ZwAlpcDeletePortSection", nt_alpc_delete_port_section);
+zw_alias!(zw_alpc_delete_resource_reserve, "ZwAlpcDeleteResourceReserve", nt_alpc_delete_resource_reserve);
+zw_alias!(zw_alpc_delete_section_view, "ZwAlpcDeleteSectionView", nt_alpc_delete_section_view);
+zw_alias!(zw_alpc_delete_security_context, "ZwAlpcDeleteSecurityContext", nt_alpc_delete_security_context);
+zw_alias!(zw_alpc_disconnect_port, "ZwAlpcDisconnectPort", nt_alpc_disconnect_port);
+zw_alias!(zw_alpc_impersonate_client_container_of_port, "ZwAlpcImpersonateClientContainerOfPort", nt_alpc_impersonate_client_container_of_port);
+zw_alias!(zw_alpc_impersonate_client_of_port, "ZwAlpcImpersonateClientOfPort", nt_alpc_impersonate_client_of_port);
+zw_alias!(zw_alpc_open_sender_process, "ZwAlpcOpenSenderProcess", nt_alpc_open_sender_process);
+zw_alias!(zw_alpc_open_sender_thread, "ZwAlpcOpenSenderThread", nt_alpc_open_sender_thread);
+zw_alias!(zw_alpc_query_information, "ZwAlpcQueryInformation", nt_alpc_query_information);
+zw_alias!(zw_alpc_query_information_message, "ZwAlpcQueryInformationMessage", nt_alpc_query_information_message);
+zw_alias!(zw_alpc_revoke_security_context, "ZwAlpcRevokeSecurityContext", nt_alpc_revoke_security_context);
+zw_alias!(zw_alpc_set_information, "ZwAlpcSetInformation", nt_alpc_set_information);
+zw_alias!(zw_are_mapped_files_the_same, "ZwAreMappedFilesTheSame", nt_are_mapped_files_the_same);
+zw_alias!(zw_associate_wait_completion_packet, "ZwAssociateWaitCompletionPacket", nt_associate_wait_completion_packet);
+zw_alias!(zw_cancel_synchronous_io_file, "ZwCancelSynchronousIoFile", nt_cancel_synchronous_io_file);
+zw_alias!(zw_cancel_wait_completion_packet, "ZwCancelWaitCompletionPacket", nt_cancel_wait_completion_packet);
+zw_alias!(zw_commit_complete, "ZwCommitComplete", nt_commit_complete);
+zw_alias!(zw_commit_enlistment, "ZwCommitEnlistment", nt_commit_enlistment);
+zw_alias!(zw_commit_transaction, "ZwCommitTransaction", nt_commit_transaction);
+zw_alias!(zw_compact_keys, "ZwCompactKeys", nt_compact_keys);
+zw_alias!(zw_compare_tokens, "ZwCompareTokens", nt_compare_tokens);
+zw_alias!(zw_compress_key, "ZwCompressKey", nt_compress_key);
+zw_alias!(zw_continue_ex, "ZwContinueEx", nt_continue_ex);
+zw_alias!(zw_convert_between_auxiliary_counter_and_performance_counter, "ZwConvertBetweenAuxiliaryCounterAndPerformanceCounter", nt_convert_between_auxiliary_counter_and_performance_counter);
+zw_alias!(zw_create_enlistment, "ZwCreateEnlistment", nt_create_enlistment);
+zw_alias!(zw_create_event_pair, "ZwCreateEventPair", nt_create_event_pair);
+zw_alias!(zw_create_key_transacted, "ZwCreateKeyTransacted", nt_create_key_transacted);
+zw_alias!(zw_create_profile, "ZwCreateProfile", nt_create_profile);
+zw_alias!(zw_create_resource_manager, "ZwCreateResourceManager", nt_create_resource_manager);
+zw_alias!(zw_create_section_ex, "ZwCreateSectionEx", nt_create_section_ex);
+zw_alias!(zw_create_thread_ex, "ZwCreateThreadEx", nt_create_thread_ex);
+zw_alias!(zw_create_transaction, "ZwCreateTransaction", nt_create_transaction);
+zw_alias!(zw_create_transaction_manager, "ZwCreateTransactionManager", nt_create_transaction_manager);
+zw_alias!(zw_create_wait_completion_packet, "ZwCreateWaitCompletionPacket", nt_create_wait_completion_packet);
+zw_alias!(zw_create_waitable_port, "ZwCreateWaitablePort", nt_create_waitable_port);
+zw_alias!(zw_create_wnf_state_name, "ZwCreateWnfStateName", nt_create_wnf_state_name);
+zw_alias!(zw_create_worker_factory, "ZwCreateWorkerFactory", nt_create_worker_factory);
+zw_alias!(zw_delete_boot_entry, "ZwDeleteBootEntry", nt_delete_boot_entry);
+zw_alias!(zw_delete_driver_entry, "ZwDeleteDriverEntry", nt_delete_driver_entry);
+zw_alias!(zw_delete_file, "ZwDeleteFile", nt_delete_file);
+zw_alias!(zw_delete_wnf_state_data, "ZwDeleteWnfStateData", nt_delete_wnf_state_data);
+zw_alias!(zw_delete_wnf_state_name, "ZwDeleteWnfStateName", nt_delete_wnf_state_name);
+zw_alias!(zw_enumerate_boot_entries, "ZwEnumerateBootEntries", nt_enumerate_boot_entries);
+zw_alias!(zw_enumerate_driver_entries, "ZwEnumerateDriverEntries", nt_enumerate_driver_entries);
+zw_alias!(zw_enumerate_system_environment_values_ex, "ZwEnumerateSystemEnvironmentValuesEx", nt_enumerate_system_environment_values_ex);
+zw_alias!(zw_enumerate_transaction_object, "ZwEnumerateTransactionObject", nt_enumerate_transaction_object);
+zw_alias!(zw_extend_section, "ZwExtendSection", nt_extend_section);
+zw_alias!(zw_flush_buffers_file_ex, "ZwFlushBuffersFileEx", nt_flush_buffers_file_ex);
+zw_alias!(zw_flush_install_ui_language, "ZwFlushInstallUILanguage", nt_flush_install_ui_language);
+zw_alias!(zw_flush_process_write_buffers, "ZwFlushProcessWriteBuffers", nt_flush_process_write_buffers);
+zw_alias!(zw_flush_write_buffer, "ZwFlushWriteBuffer", nt_flush_write_buffer);
+zw_alias!(zw_freeze_registry, "ZwFreezeRegistry", nt_freeze_registry);
+zw_alias!(zw_freeze_transactions, "ZwFreezeTransactions", nt_freeze_transactions);
+zw_alias!(zw_get_current_processor_number, "ZwGetCurrentProcessorNumber", nt_get_current_processor_number);
+zw_alias!(zw_get_current_processor_number_ex, "ZwGetCurrentProcessorNumberEx", nt_get_current_processor_number_ex);
+zw_alias!(zw_get_mui_registry_info, "ZwGetMUIRegistryInfo", nt_get_mui_registry_info);
+zw_alias!(zw_get_next_process, "ZwGetNextProcess", nt_get_next_process);
+zw_alias!(zw_get_next_thread, "ZwGetNextThread", nt_get_next_thread);
+zw_alias!(zw_get_notification_resource_manager, "ZwGetNotificationResourceManager", nt_get_notification_resource_manager);
+zw_alias!(zw_initialize_nls_files, "ZwInitializeNlsFiles", nt_initialize_nls_files);
+zw_alias!(zw_is_ui_language_comitted, "ZwIsUILanguageComitted", nt_is_ui_language_comitted);
+zw_alias!(zw_lock_product_activation_keys, "ZwLockProductActivationKeys", nt_lock_product_activation_keys);
+zw_alias!(zw_lock_registry_key, "ZwLockRegistryKey", nt_lock_registry_key);
+zw_alias!(zw_map_cmf_module, "ZwMapCMFModule", nt_map_cmf_module);
+zw_alias!(zw_map_view_of_section_ex, "ZwMapViewOfSectionEx", nt_map_view_of_section_ex);
+zw_alias!(zw_modify_boot_entry, "ZwModifyBootEntry", nt_modify_boot_entry);
+zw_alias!(zw_modify_driver_entry, "ZwModifyDriverEntry", nt_modify_driver_entry);
+zw_alias!(zw_notify_change_directory_file_ex, "ZwNotifyChangeDirectoryFileEx", nt_notify_change_directory_file_ex);
+zw_alias!(zw_notify_change_multiple_keys, "ZwNotifyChangeMultipleKeys", nt_notify_change_multiple_keys);
+zw_alias!(zw_open_enlistment, "ZwOpenEnlistment", nt_open_enlistment);
+zw_alias!(zw_open_key_ex, "ZwOpenKeyEx", nt_open_key_ex);
+zw_alias!(zw_open_key_transacted, "ZwOpenKeyTransacted", nt_open_key_transacted);
+zw_alias!(zw_open_key_transacted_ex, "ZwOpenKeyTransactedEx", nt_open_key_transacted_ex);
+zw_alias!(zw_open_keyed_event, "ZwOpenKeyedEvent", nt_open_keyed_event);
+zw_alias!(zw_open_resource_manager, "ZwOpenResourceManager", nt_open_resource_manager);
+zw_alias!(zw_open_session, "ZwOpenSession", nt_open_session);
+zw_alias!(zw_open_transaction, "ZwOpenTransaction", nt_open_transaction);
+zw_alias!(zw_open_transaction_manager, "ZwOpenTransactionManager", nt_open_transaction_manager);
+zw_alias!(zw_pre_prepare_complete, "ZwPrePrepareComplete", nt_pre_prepare_complete);
+zw_alias!(zw_pre_prepare_enlistment, "ZwPrePrepareEnlistment", nt_pre_prepare_enlistment);
+zw_alias!(zw_prepare_complete, "ZwPrepareComplete", nt_prepare_complete);
+zw_alias!(zw_prepare_enlistment, "ZwPrepareEnlistment", nt_prepare_enlistment);
+zw_alias!(zw_propagation_complete, "ZwPropagationComplete", nt_propagation_complete);
+zw_alias!(zw_propagation_failed, "ZwPropagationFailed", nt_propagation_failed);
+zw_alias!(zw_query_boot_entry_order, "ZwQueryBootEntryOrder", nt_query_boot_entry_order);
+zw_alias!(zw_query_boot_options, "ZwQueryBootOptions", nt_query_boot_options);
+zw_alias!(zw_query_directory_file_ex, "ZwQueryDirectoryFileEx", nt_query_directory_file_ex);
+zw_alias!(zw_query_driver_entry_order, "ZwQueryDriverEntryOrder", nt_query_driver_entry_order);
+zw_alias!(zw_query_information_by_name, "ZwQueryInformationByName", nt_query_information_by_name);
+zw_alias!(zw_query_information_enlistment, "ZwQueryInformationEnlistment", nt_query_information_enlistment);
+zw_alias!(zw_query_information_port, "ZwQueryInformationPort", nt_query_information_port);
+zw_alias!(zw_query_information_resource_manager, "ZwQueryInformationResourceManager", nt_query_information_resource_manager);
+zw_alias!(zw_query_information_transaction, "ZwQueryInformationTransaction", nt_query_information_transaction);
+zw_alias!(zw_query_information_transaction_manager, "ZwQueryInformationTransactionManager", nt_query_information_transaction_manager);
+zw_alias!(zw_query_information_worker_factory, "ZwQueryInformationWorkerFactory", nt_query_information_worker_factory);
+zw_alias!(zw_query_interval_profile, "ZwQueryIntervalProfile", nt_query_interval_profile);
+zw_alias!(zw_query_license_value, "ZwQueryLicenseValue", nt_query_license_value);
+zw_alias!(zw_query_multiple_value_key, "ZwQueryMultipleValueKey", nt_query_multiple_value_key);
+zw_alias!(zw_query_open_sub_keys, "ZwQueryOpenSubKeys", nt_query_open_sub_keys);
+zw_alias!(zw_query_open_sub_keys_ex, "ZwQueryOpenSubKeysEx", nt_query_open_sub_keys_ex);
+zw_alias!(zw_query_port_information_process, "ZwQueryPortInformationProcess", nt_query_port_information_process);
+zw_alias!(zw_query_system_environment_value, "ZwQuerySystemEnvironmentValue", nt_query_system_environment_value);
+zw_alias!(zw_query_timer_resolution, "ZwQueryTimerResolution", nt_query_timer_resolution);
+zw_alias!(zw_query_wnf_state_data, "ZwQueryWnfStateData", nt_query_wnf_state_data);
+zw_alias!(zw_query_wnf_state_name_information, "ZwQueryWnfStateNameInformation", nt_query_wnf_state_name_information);
+zw_alias!(zw_queue_apc_thread_ex, "ZwQueueApcThreadEx", nt_queue_apc_thread_ex);
+zw_alias!(zw_queue_apc_thread_ex2, "ZwQueueApcThreadEx2", nt_queue_apc_thread_ex2);
+zw_alias!(zw_read_only_enlistment, "ZwReadOnlyEnlistment", nt_read_only_enlistment);
+zw_alias!(zw_read_request_data, "ZwReadRequestData", nt_read_request_data);
+zw_alias!(zw_recover_enlistment, "ZwRecoverEnlistment", nt_recover_enlistment);
+zw_alias!(zw_recover_resource_manager, "ZwRecoverResourceManager", nt_recover_resource_manager);
+zw_alias!(zw_recover_transaction_manager, "ZwRecoverTransactionManager", nt_recover_transaction_manager);
+zw_alias!(zw_register_protocol_address_information, "ZwRegisterProtocolAddressInformation", nt_register_protocol_address_information);
+zw_alias!(zw_release_cmf_view_ownership, "ZwReleaseCMFViewOwnership", nt_release_cmf_view_ownership);
+zw_alias!(zw_release_worker_factory_worker, "ZwReleaseWorkerFactoryWorker", nt_release_worker_factory_worker);
+zw_alias!(zw_rename_transaction_manager, "ZwRenameTransactionManager", nt_rename_transaction_manager);
+zw_alias!(zw_replace_partition_unit, "ZwReplacePartitionUnit", nt_replace_partition_unit);
+zw_alias!(zw_reply_wait_receive_port_ex, "ZwReplyWaitReceivePortEx", nt_reply_wait_receive_port_ex);
+zw_alias!(zw_reply_wait_reply_port, "ZwReplyWaitReplyPort", nt_reply_wait_reply_port);
+zw_alias!(zw_request_port, "ZwRequestPort", nt_request_port);
+zw_alias!(zw_rollback_complete, "ZwRollbackComplete", nt_rollback_complete);
+zw_alias!(zw_rollback_enlistment, "ZwRollbackEnlistment", nt_rollback_enlistment);
+zw_alias!(zw_rollback_transaction, "ZwRollbackTransaction", nt_rollback_transaction);
+zw_alias!(zw_rollforward_transaction_manager, "ZwRollforwardTransactionManager", nt_rollforward_transaction_manager);
+zw_alias!(zw_save_merged_keys, "ZwSaveMergedKeys", nt_save_merged_keys);
+zw_alias!(zw_set_boot_entry_order, "ZwSetBootEntryOrder", nt_set_boot_entry_order);
+zw_alias!(zw_set_boot_options, "ZwSetBootOptions", nt_set_boot_options);
+zw_alias!(zw_set_driver_entry_order, "ZwSetDriverEntryOrder", nt_set_driver_entry_order);
+zw_alias!(zw_set_event_boost_priority, "ZwSetEventBoostPriority", nt_set_event_boost_priority);
+zw_alias!(zw_set_high_event_pair, "ZwSetHighEventPair", nt_set_high_event_pair);
+zw_alias!(zw_set_high_wait_low_event_pair, "ZwSetHighWaitLowEventPair", nt_set_high_wait_low_event_pair);
+zw_alias!(zw_set_information_enlistment, "ZwSetInformationEnlistment", nt_set_information_enlistment);
+zw_alias!(zw_set_information_key, "ZwSetInformationKey", nt_set_information_key);
+zw_alias!(zw_set_information_resource_manager, "ZwSetInformationResourceManager", nt_set_information_resource_manager);
+zw_alias!(zw_set_information_transaction, "ZwSetInformationTransaction", nt_set_information_transaction);
+zw_alias!(zw_set_information_transaction_manager, "ZwSetInformationTransactionManager", nt_set_information_transaction_manager);
+zw_alias!(zw_set_information_worker_factory, "ZwSetInformationWorkerFactory", nt_set_information_worker_factory);
+zw_alias!(zw_set_interval_profile, "ZwSetIntervalProfile", nt_set_interval_profile);
+zw_alias!(zw_set_io_completion_ex, "ZwSetIoCompletionEx", nt_set_io_completion_ex);
+zw_alias!(zw_set_ldt_entries, "ZwSetLdtEntries", nt_set_ldt_entries);
+zw_alias!(zw_set_low_event_pair, "ZwSetLowEventPair", nt_set_low_event_pair);
+zw_alias!(zw_set_low_wait_high_event_pair, "ZwSetLowWaitHighEventPair", nt_set_low_wait_high_event_pair);
+zw_alias!(zw_set_system_environment_value, "ZwSetSystemEnvironmentValue", nt_set_system_environment_value);
+zw_alias!(zw_shutdown_worker_factory, "ZwShutdownWorkerFactory", nt_shutdown_worker_factory);
+zw_alias!(zw_single_phase_reject, "ZwSinglePhaseReject", nt_single_phase_reject);
+zw_alias!(zw_start_profile, "ZwStartProfile", nt_start_profile);
+zw_alias!(zw_stop_profile, "ZwStopProfile", nt_stop_profile);
+zw_alias!(zw_subscribe_wnf_state_change, "ZwSubscribeWnfStateChange", nt_subscribe_wnf_state_change);
+zw_alias!(zw_system_debug_control, "ZwSystemDebugControl", nt_system_debug_control);
+zw_alias!(zw_thaw_registry, "ZwThawRegistry", nt_thaw_registry);
+zw_alias!(zw_thaw_transactions, "ZwThawTransactions", nt_thaw_transactions);
+zw_alias!(zw_translate_file_path, "ZwTranslateFilePath", nt_translate_file_path);
+zw_alias!(zw_unmap_view_of_section_ex, "ZwUnmapViewOfSectionEx", nt_unmap_view_of_section_ex);
+zw_alias!(zw_unsubscribe_wnf_state_change, "ZwUnsubscribeWnfStateChange", nt_unsubscribe_wnf_state_change);
+zw_alias!(zw_update_wnf_state_data, "ZwUpdateWnfStateData", nt_update_wnf_state_data);
+zw_alias!(zw_vdm_control, "ZwVdmControl", nt_vdm_control);
+zw_alias!(zw_wait_for_alert_by_thread_id, "ZwWaitForAlertByThreadId", nt_wait_for_alert_by_thread_id);
+zw_alias!(zw_wait_for_multiple_objects32, "ZwWaitForMultipleObjects32", nt_wait_for_multiple_objects32);
+zw_alias!(zw_wait_for_work_via_worker_factory, "ZwWaitForWorkViaWorkerFactory", nt_wait_for_work_via_worker_factory);
+zw_alias!(zw_wait_high_event_pair, "ZwWaitHighEventPair", nt_wait_high_event_pair);
+zw_alias!(zw_wait_low_event_pair, "ZwWaitLowEventPair", nt_wait_low_event_pair);
+zw_alias!(zw_worker_factory_worker_ready, "ZwWorkerFactoryWorkerReady", nt_worker_factory_worker_ready);
+zw_alias!(zw_write_request_data, "ZwWriteRequestData", nt_write_request_data);
 
 // =================================================================================================
 // BATCH 4 — Rtl* string / convert family the Win32 stack imports.
@@ -30262,6 +30458,201 @@ pub unsafe extern "C" fn export_anchor() {
         zw_write_virtual_memory as *const () as usize,
         zw_yield_execution as *const () as usize,
         zw_create_keyed_event as *const () as usize,
+        zw_rename_key as *const () as usize,
+        zw_set_timer_resolution as *const () as usize,
+        zw_trace_event as *const () as usize,
+        zw_cancel_io_file_ex as *const () as usize,
+        zw_compare_objects as *const () as usize,
+        zw_create_low_box_token as *const () as usize,
+        zw_create_private_namespace as *const () as usize,
+        zw_create_user_process as *const () as usize,
+        zw_delete_private_namespace as *const () as usize,
+        zw_get_nls_section_ptr as *const () as usize,
+        zw_open_private_namespace as *const () as usize,
+        zw_query_system_information_ex as *const () as usize,
+        zw_remove_io_completion_ex as *const () as usize,
+        zw_set_information_virtual_memory as *const () as usize,
+        zw_trace_control as *const () as usize,
+        zw_acquire_cmf_view_ownership as *const () as usize,
+        zw_add_boot_entry as *const () as usize,
+        zw_add_driver_entry as *const () as usize,
+        zw_alert_multiple_thread_by_thread_id as *const () as usize,
+        zw_alert_resume_thread as *const () as usize,
+        zw_alert_thread as *const () as usize,
+        zw_alert_thread_by_thread_id as *const () as usize,
+        zw_allocate_reserve_object as *const () as usize,
+        zw_allocate_uuids as *const () as usize,
+        zw_allocate_virtual_memory_ex as *const () as usize,
+        zw_alpc_cancel_message as *const () as usize,
+        zw_alpc_connect_port_ex as *const () as usize,
+        zw_alpc_create_port_section as *const () as usize,
+        zw_alpc_create_resource_reserve as *const () as usize,
+        zw_alpc_create_section_view as *const () as usize,
+        zw_alpc_create_security_context as *const () as usize,
+        zw_alpc_delete_port_section as *const () as usize,
+        zw_alpc_delete_resource_reserve as *const () as usize,
+        zw_alpc_delete_section_view as *const () as usize,
+        zw_alpc_delete_security_context as *const () as usize,
+        zw_alpc_disconnect_port as *const () as usize,
+        zw_alpc_impersonate_client_container_of_port as *const () as usize,
+        zw_alpc_impersonate_client_of_port as *const () as usize,
+        zw_alpc_open_sender_process as *const () as usize,
+        zw_alpc_open_sender_thread as *const () as usize,
+        zw_alpc_query_information as *const () as usize,
+        zw_alpc_query_information_message as *const () as usize,
+        zw_alpc_revoke_security_context as *const () as usize,
+        zw_alpc_set_information as *const () as usize,
+        zw_are_mapped_files_the_same as *const () as usize,
+        zw_associate_wait_completion_packet as *const () as usize,
+        zw_cancel_synchronous_io_file as *const () as usize,
+        zw_cancel_wait_completion_packet as *const () as usize,
+        zw_commit_complete as *const () as usize,
+        zw_commit_enlistment as *const () as usize,
+        zw_commit_transaction as *const () as usize,
+        zw_compact_keys as *const () as usize,
+        zw_compare_tokens as *const () as usize,
+        zw_compress_key as *const () as usize,
+        zw_continue_ex as *const () as usize,
+        zw_convert_between_auxiliary_counter_and_performance_counter as *const () as usize,
+        zw_create_enlistment as *const () as usize,
+        zw_create_event_pair as *const () as usize,
+        zw_create_key_transacted as *const () as usize,
+        zw_create_profile as *const () as usize,
+        zw_create_resource_manager as *const () as usize,
+        zw_create_section_ex as *const () as usize,
+        zw_create_thread_ex as *const () as usize,
+        zw_create_transaction as *const () as usize,
+        zw_create_transaction_manager as *const () as usize,
+        zw_create_wait_completion_packet as *const () as usize,
+        zw_create_waitable_port as *const () as usize,
+        zw_create_wnf_state_name as *const () as usize,
+        zw_create_worker_factory as *const () as usize,
+        zw_delete_boot_entry as *const () as usize,
+        zw_delete_driver_entry as *const () as usize,
+        zw_delete_file as *const () as usize,
+        zw_delete_wnf_state_data as *const () as usize,
+        zw_delete_wnf_state_name as *const () as usize,
+        zw_enumerate_boot_entries as *const () as usize,
+        zw_enumerate_driver_entries as *const () as usize,
+        zw_enumerate_system_environment_values_ex as *const () as usize,
+        zw_enumerate_transaction_object as *const () as usize,
+        zw_extend_section as *const () as usize,
+        zw_flush_buffers_file_ex as *const () as usize,
+        zw_flush_install_ui_language as *const () as usize,
+        zw_flush_process_write_buffers as *const () as usize,
+        zw_flush_write_buffer as *const () as usize,
+        zw_freeze_registry as *const () as usize,
+        zw_freeze_transactions as *const () as usize,
+        zw_get_current_processor_number as *const () as usize,
+        zw_get_current_processor_number_ex as *const () as usize,
+        zw_get_mui_registry_info as *const () as usize,
+        zw_get_next_process as *const () as usize,
+        zw_get_next_thread as *const () as usize,
+        zw_get_notification_resource_manager as *const () as usize,
+        zw_initialize_nls_files as *const () as usize,
+        zw_is_ui_language_comitted as *const () as usize,
+        zw_lock_product_activation_keys as *const () as usize,
+        zw_lock_registry_key as *const () as usize,
+        zw_map_cmf_module as *const () as usize,
+        zw_map_view_of_section_ex as *const () as usize,
+        zw_modify_boot_entry as *const () as usize,
+        zw_modify_driver_entry as *const () as usize,
+        zw_notify_change_directory_file_ex as *const () as usize,
+        zw_notify_change_multiple_keys as *const () as usize,
+        zw_open_enlistment as *const () as usize,
+        zw_open_key_ex as *const () as usize,
+        zw_open_key_transacted as *const () as usize,
+        zw_open_key_transacted_ex as *const () as usize,
+        zw_open_keyed_event as *const () as usize,
+        zw_open_resource_manager as *const () as usize,
+        zw_open_session as *const () as usize,
+        zw_open_transaction as *const () as usize,
+        zw_open_transaction_manager as *const () as usize,
+        zw_pre_prepare_complete as *const () as usize,
+        zw_pre_prepare_enlistment as *const () as usize,
+        zw_prepare_complete as *const () as usize,
+        zw_prepare_enlistment as *const () as usize,
+        zw_propagation_complete as *const () as usize,
+        zw_propagation_failed as *const () as usize,
+        zw_query_boot_entry_order as *const () as usize,
+        zw_query_boot_options as *const () as usize,
+        zw_query_directory_file_ex as *const () as usize,
+        zw_query_driver_entry_order as *const () as usize,
+        zw_query_information_by_name as *const () as usize,
+        zw_query_information_enlistment as *const () as usize,
+        zw_query_information_port as *const () as usize,
+        zw_query_information_resource_manager as *const () as usize,
+        zw_query_information_transaction as *const () as usize,
+        zw_query_information_transaction_manager as *const () as usize,
+        zw_query_information_worker_factory as *const () as usize,
+        zw_query_interval_profile as *const () as usize,
+        zw_query_license_value as *const () as usize,
+        zw_query_multiple_value_key as *const () as usize,
+        zw_query_open_sub_keys as *const () as usize,
+        zw_query_open_sub_keys_ex as *const () as usize,
+        zw_query_port_information_process as *const () as usize,
+        zw_query_system_environment_value as *const () as usize,
+        zw_query_timer_resolution as *const () as usize,
+        zw_query_wnf_state_data as *const () as usize,
+        zw_query_wnf_state_name_information as *const () as usize,
+        zw_queue_apc_thread_ex as *const () as usize,
+        zw_queue_apc_thread_ex2 as *const () as usize,
+        zw_read_only_enlistment as *const () as usize,
+        zw_read_request_data as *const () as usize,
+        zw_recover_enlistment as *const () as usize,
+        zw_recover_resource_manager as *const () as usize,
+        zw_recover_transaction_manager as *const () as usize,
+        zw_register_protocol_address_information as *const () as usize,
+        zw_release_cmf_view_ownership as *const () as usize,
+        zw_release_worker_factory_worker as *const () as usize,
+        zw_rename_transaction_manager as *const () as usize,
+        zw_replace_partition_unit as *const () as usize,
+        zw_reply_wait_receive_port_ex as *const () as usize,
+        zw_reply_wait_reply_port as *const () as usize,
+        zw_request_port as *const () as usize,
+        zw_rollback_complete as *const () as usize,
+        zw_rollback_enlistment as *const () as usize,
+        zw_rollback_transaction as *const () as usize,
+        zw_rollforward_transaction_manager as *const () as usize,
+        zw_save_merged_keys as *const () as usize,
+        zw_set_boot_entry_order as *const () as usize,
+        zw_set_boot_options as *const () as usize,
+        zw_set_driver_entry_order as *const () as usize,
+        zw_set_event_boost_priority as *const () as usize,
+        zw_set_high_event_pair as *const () as usize,
+        zw_set_high_wait_low_event_pair as *const () as usize,
+        zw_set_information_enlistment as *const () as usize,
+        zw_set_information_key as *const () as usize,
+        zw_set_information_resource_manager as *const () as usize,
+        zw_set_information_transaction as *const () as usize,
+        zw_set_information_transaction_manager as *const () as usize,
+        zw_set_information_worker_factory as *const () as usize,
+        zw_set_interval_profile as *const () as usize,
+        zw_set_io_completion_ex as *const () as usize,
+        zw_set_ldt_entries as *const () as usize,
+        zw_set_low_event_pair as *const () as usize,
+        zw_set_low_wait_high_event_pair as *const () as usize,
+        zw_set_system_environment_value as *const () as usize,
+        zw_shutdown_worker_factory as *const () as usize,
+        zw_single_phase_reject as *const () as usize,
+        zw_start_profile as *const () as usize,
+        zw_stop_profile as *const () as usize,
+        zw_subscribe_wnf_state_change as *const () as usize,
+        zw_system_debug_control as *const () as usize,
+        zw_thaw_registry as *const () as usize,
+        zw_thaw_transactions as *const () as usize,
+        zw_translate_file_path as *const () as usize,
+        zw_unmap_view_of_section_ex as *const () as usize,
+        zw_unsubscribe_wnf_state_change as *const () as usize,
+        zw_update_wnf_state_data as *const () as usize,
+        zw_vdm_control as *const () as usize,
+        zw_wait_for_alert_by_thread_id as *const () as usize,
+        zw_wait_for_multiple_objects32 as *const () as usize,
+        zw_wait_for_work_via_worker_factory as *const () as usize,
+        zw_wait_high_event_pair as *const () as usize,
+        zw_wait_low_event_pair as *const () as usize,
+        zw_worker_factory_worker_ready as *const () as usize,
+        zw_write_request_data as *const () as usize,
     ];
     #[cfg(target_arch = "x86_64")]
     core::hint::black_box(anchors3);

@@ -33,8 +33,89 @@ fn native_request_keeps_exact_arguments_when_nested_ipc_reuses_receive_buffer() 
 /// The exact count of `Nt*` services in the shared table: the current hosted ReactOS import set,
 /// ntdll-internal services (`NtSecureConnectPort`, `NtCallbackReturn`), and registry hive
 /// load/unload variants that route to real executive CM functionality.
-const REQUIRED_NT_COUNT: usize = 230;
-const REQUIRED_ZW_COUNT: usize = 230;
+const REQUIRED_NT_COUNT: usize = 425;
+const REQUIRED_ZW_COUNT: usize = 425;
+
+#[test]
+fn released_libernt_native_export_extension_has_exact_bounds_and_arities() {
+    // Pinned source: LiberNT 8e478a22 dll/ntdll/def/ntdll.spec. The 16/17-argument
+    // audit services need a wider executive argv and are intentionally not in this slice.
+    assert_eq!(LIBERNT_FULL_EXPORT_SSN_BASE, 0x400);
+    assert_eq!(LIBERNT_FULL_EXPORT_SSN_BASE + 180, 0x4b4);
+    assert!(LIBERNT_FULL_EXPORT_SSN_BASE > LIBERNT_BASE_SSN + 11);
+    assert!(LIBERNT_FULL_EXPORT_SSN_BASE + 179 < 0x1000);
+    let new_services = NT_SYSCALLS.iter().filter(|e| {
+        (LIBERNT_FULL_EXPORT_SSN_BASE..LIBERNT_FULL_EXPORT_SSN_BASE + 180).contains(&e.ssn)
+    });
+    assert_eq!(new_services.clone().count(), 180);
+    for service in new_services {
+        assert!(exact_argc_of(service.name).is_some(), "{} lacks exact arity", service.name);
+        let alias = ZW_ALIASES.iter().find(|alias| alias.nt_name == service.name)
+            .unwrap_or_else(|| panic!("{} lacks Zw alias", service.name));
+        assert_eq!(alias.ssn, service.ssn);
+        assert_eq!(exact_argc_of(alias.zw_name), exact_argc_of(service.name));
+    }
+    for (name, arity) in [
+        ("NtCreateThreadEx", 11),
+        ("NtAllocateVirtualMemoryEx", 7),
+        ("NtAlpcConnectPortEx", 11),
+        ("NtWaitForWorkViaWorkerFactory", 2),
+        ("NtQueryPortInformationProcess", 0),
+    ] {
+        assert_eq!(exact_argc_of(name), Some(arity), "{name}");
+    }
+}
+
+/// Imports read from the pinned LiberNT 8e478a22 kernel32.dll and advapi32.dll. The
+/// arities come from Wine ntdll.spec, except the private-namespace entries from the
+/// ReactOS ntdll.spec and NtTraceEvent from ReactOS exfuncs.h.
+#[test]
+fn libernt_kernel32_and_advapi32_native_imports_have_exact_abi() {
+    let services = [
+        ("NtRenameKey", 200, 2),
+        ("NtSetTimerResolution", 254, 3),
+        ("NtTraceEvent", 269, 4),
+        ("NtCancelIoFileEx", 0x300, 3),
+        ("NtCompareObjects", 0x301, 2),
+        ("NtCreateLowBoxToken", 0x302, 9),
+        ("NtCreatePrivateNamespace", 0x303, 4),
+        ("NtCreateUserProcess", 0x304, 11),
+        ("NtDeletePrivateNamespace", 0x305, 1),
+        ("NtGetNlsSectionPtr", 0x306, 5),
+        ("NtOpenPrivateNamespace", 0x307, 4),
+        ("NtQuerySystemInformationEx", 0x308, 6),
+        ("NtRemoveIoCompletionEx", 0x309, 6),
+        ("NtSetInformationVirtualMemory", 0x30a, 6),
+        ("NtTraceControl", 0x30b, 6),
+    ];
+    for (name, ssn, argc) in services {
+        assert_eq!(ssn_of(name), Some(ssn), "missing {name}");
+        assert_eq!(exact_argc_of(name), Some(argc), "wrong arity for {name}");
+        assert_eq!(name_of(ssn), Some(name), "wrong service at {ssn:#x}");
+        let alias = ZW_ALIASES.iter().find(|alias| alias.nt_name == name)
+            .unwrap_or_else(|| panic!("missing Zw alias for {name}"));
+        assert!(alias.zw_name.starts_with("Zw"));
+        assert_eq!(&alias.zw_name[2..], &name[2..]);
+        assert_eq!(ssn_of(alias.zw_name), Some(ssn));
+        assert_eq!(exact_argc_of(alias.zw_name), Some(argc));
+    }
+}
+
+#[test]
+fn libernt_private_native_numbers_cannot_enter_win32k_shadow_dispatch() {
+    // The executive uses 0x1000 as its win32k shadow-table boundary even for
+    // native-call messages after it normalizes them into UnknownSyscall frames.
+    // ReactOS sysfuncs.lst occupies SSNs 0..=295.
+    assert!(LIBERNT_BASE_SSN > 295);
+    assert!(LIBERNT_BASE_SSN + 11 < 0x1000);
+    let private = NT_SYSCALLS.iter().filter(|service| {
+        (LIBERNT_BASE_SSN..LIBERNT_BASE_SSN + 12).contains(&service.ssn)
+    });
+    assert_eq!(private.clone().count(), 12);
+    for service in private {
+        assert!(service.ssn < 0x1000, "{} collides with win32k", service.name);
+    }
+}
 
 #[test]
 fn libernt_smss_alpc_imports_have_distinct_native_services() {
@@ -209,9 +290,7 @@ fn every_service_has_an_exact_arity() {
             e.name
         );
     }
-    // NtCreateThreadEx is an executive-hosted compatibility service on this target but is not in
-    // the pinned ReactOS system-service-number table.
-    assert_eq!(NT_ARGC.len(), NT_SYSCALLS.len() + 1);
+    assert_eq!(NT_ARGC.len(), NT_SYSCALLS.len());
 }
 
 #[test]
@@ -254,18 +333,25 @@ fn no_duplicate_argc_names() {
 }
 
 #[test]
-fn alpc_services_are_above_the_legacy_range() {
-    let legacy_max = NT_SYSCALLS
-        .iter()
-        .filter(|e| !e.name.starts_with("NtAlpc"))
-        .map(|e| e.ssn)
-        .max()
-        .unwrap();
-    assert!(ALPC_SSN_BASE > legacy_max);
-    assert!(NT_SYSCALLS
-        .iter()
-        .filter(|e| e.name.starts_with("NtAlpc"))
-        .all(|e| e.ssn >= ALPC_SSN_BASE));
+fn live_alpc_services_use_only_the_reserved_native_range() {
+    assert_eq!(ALPC_SSN_BASE, 0x700);
+    let live = NT_SYSCALLS.iter().filter(|e| {
+        (ALPC_SSN_BASE..ALPC_SSN_BASE + 4).contains(&e.ssn)
+    });
+    assert_eq!(live.clone().count(), 4);
+    for service in live {
+        assert!(service.name.starts_with("NtAlpc"));
+    }
+    for service in NT_SYSCALLS.iter().filter(|e| {
+        e.name.starts_with("NtAlpc") && !(ALPC_SSN_BASE..ALPC_SSN_BASE + 4).contains(&e.ssn)
+    }) {
+        assert!(
+            (LIBERNT_FULL_EXPORT_SSN_BASE..LIBERNT_FULL_EXPORT_SSN_BASE + 180)
+                .contains(&service.ssn),
+            "{} escaped the LiberNT extension range",
+            service.name
+        );
+    }
 }
 
 #[test]
