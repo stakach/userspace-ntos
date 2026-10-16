@@ -78,6 +78,9 @@ mod hosted_zw_load_driver;
 #[path = "hosted_zw_enumerate_value_key.rs"]
 mod hosted_zw_enumerate_value_key;
 use hosted_zw_enumerate_value_key::HOSTED_REGISTRY_OP_ENUMERATE_VALUE;
+#[path = "hosted_zw_query_key.rs"]
+mod hosted_zw_query_key;
+use hosted_zw_query_key::HOSTED_REGISTRY_OP_QUERY_KEY;
 #[path = "hosted_device_object_pointer.rs"]
 mod hosted_device_object_pointer;
 #[path = "hosted_driver_reinitialization.rs"]
@@ -90,6 +93,14 @@ pub(crate) unsafe fn service_hosted_driver_zw_load_driver(
     reply_cap: u64,
 ) -> i32 {
     hosted_zw_load_driver::service(channel, service_name, badge, reply_cap)
+}
+pub(crate) unsafe fn service_hosted_driver_zw_unload_driver(
+    channel: &crate::spawn_hosts::PumpChannel,
+    service_name: u64,
+    badge: u64,
+    reply_cap: u64,
+) -> i32 {
+    hosted_zw_load_driver::service_unload(channel, service_name, badge, reply_cap)
 }
 #[path = "hosted_image_paging.rs"]
 mod hosted_image_paging;
@@ -224,6 +235,88 @@ pub(crate) mod hosted_consumer_file_objects;
 mod hosted_consumer_device_objects;
 #[path = "hosted_io_create_file_adapter.rs"]
 mod hosted_io_create_file_adapter;
+#[path = "hosted_driver_interrupt_ex.rs"]
+mod hosted_driver_interrupt_ex;
+#[path = "hosted_driver_uuid.rs"]
+mod hosted_driver_uuid;
+pub(crate) use hosted_driver_uuid::service_hosted_driver_uuid_create;
+#[path = "hosted_driver_device_enumeration.rs"]
+mod hosted_driver_device_enumeration;
+#[path = "hosted_driver_push_lock.rs"]
+mod hosted_driver_push_lock;
+#[path = "hosted_driver_gop.rs"]
+mod hosted_driver_gop;
+pub(crate) use hosted_driver_gop::service_hosted_driver_gop_query;
+pub(crate) use hosted_driver_gop::service_hosted_driver_display_ownership_lost;
+#[path = "hosted_driver_device_interfaces.rs"]
+mod hosted_driver_device_interfaces;
+#[path = "hosted_driver_device_property_data.rs"]
+mod hosted_driver_device_property_data;
+#[path = "hosted_driver_device_property_write.rs"]
+mod hosted_driver_device_property_write;
+pub(crate) use hosted_driver_device_property_write::service as service_hosted_driver_device_property_write;
+#[path = "hosted_driver_create_driver.rs"]
+mod hosted_driver_create_driver;
+pub(crate) use hosted_driver_create_driver::service as service_hosted_driver_create_driver;
+#[path = "hosted_driver_processor_mask.rs"]
+mod hosted_driver_processor_mask;
+#[path = "hosted_driver_thermal_request.rs"]
+mod hosted_driver_thermal_request;
+#[path = "hosted_driver_process_bitness.rs"]
+mod hosted_driver_process_bitness;
+#[path = "hosted_driver_rtl_integer.rs"]
+mod hosted_driver_rtl_integer;
+#[path = "hosted_driver_queued_spin_lock.rs"]
+mod hosted_driver_queued_spin_lock;
+#[path = "hosted_driver_crt_memchr.rs"]
+mod hosted_driver_crt_memchr;
+#[path = "hosted_driver_crt_strchr.rs"]
+mod hosted_driver_crt_strchr;
+#[path = "hosted_driver_thread_priority.rs"]
+pub(crate) mod hosted_driver_thread_priority;
+#[path = "hosted_driver_worker_priority.rs"]
+mod hosted_driver_worker_priority;
+#[path = "hosted_driver_hal_idt_irql.rs"]
+mod hosted_driver_hal_idt_irql;
+#[path = "hosted_driver_process_attach.rs"]
+pub(crate) mod hosted_driver_process_attach;
+#[path = "hosted_driver_spin_lock.rs"]
+mod hosted_driver_spin_lock;
+#[path = "hosted_driver_hal_target_info.rs"]
+mod hosted_driver_hal_target_info;
+#[path = "hosted_driver_hal_cache.rs"]
+mod hosted_driver_hal_cache;
+#[path = "hosted_driver_physical_mdl.rs"]
+mod hosted_driver_physical_mdl;
+#[path = "hosted_driver_process_identity.rs"]
+pub(crate) mod hosted_driver_process_identity;
+#[path = "hosted_driver_directory_object.rs"]
+pub(crate) mod hosted_driver_directory_object;
+#[path = "hosted_driver_create_event.rs"]
+pub(crate) mod hosted_driver_create_event;
+#[path = "hosted_driver_process_notify.rs"]
+pub(crate) mod hosted_driver_process_notify;
+#[path = "hosted_driver_dynamic_type.rs"]
+pub(crate) mod hosted_driver_dynamic_type;
+#[path = "hosted_driver_process_state.rs"]
+mod hosted_driver_process_state;
+#[path = "hosted_driver_ps_handle_reference.rs"]
+pub(crate) mod hosted_driver_ps_handle_reference;
+#[path = "hosted_driver_create_mdl.rs"]
+mod hosted_driver_create_mdl;
+#[path = "hosted_driver_pci_root.rs"]
+pub(crate) mod hosted_driver_pci_root;
+pub(crate) const FSD_SERVICE_PCI_ROOT_LABEL: u64 = hosted_driver_pci_root::LABEL;
+#[path = "hosted_driver_crt_wide_sort.rs"]
+mod hosted_driver_crt_wide_sort;
+#[path = "hosted_driver_cache_invalidation.rs"]
+mod hosted_driver_cache_invalidation;
+#[path = "hosted_driver_pnp_notification.rs"]
+mod hosted_driver_pnp_notification;
+#[path = "hosted_driver_device_state.rs"]
+mod hosted_driver_device_state;
+pub(crate) use hosted_driver_pnp_notification::service as service_hosted_driver_pnp_notification;
+pub(crate) use hosted_driver_pnp_notification::wake_due as hosted_driver_pnp_notification_wake_due;
 #[path = "hosted_io_create_file_ingress.rs"]
 mod hosted_io_create_file_ingress;
 #[path = "hosted_io_create_file_work.rs"]
@@ -422,7 +515,8 @@ use nt_video_miniport::{
 
 // Pure, driver-agnostic ntoskrnl byte/string primitives shared with the Subsystem (win32k) class.
 use crate::ntoskrnl_shared::{
-    s_ex_query_depth_slist, s_exp_interlocked_pop_entry_slist, s_exp_interlocked_push_entry_slist,
+    s_ex_query_depth_slist, s_exp_interlocked_flush_slist, s_exp_interlocked_pop_entry_slist, s_exp_interlocked_push_entry_slist,
+    s_initialize_slist_head,
     s_memcpy, s_memmove, s_memset, s_rtl_compare_memory, s_rtl_integer_to_unicode_string,
     s_rtl_unicode_string_to_integer, s_rtl_upcase_unicode_char, s_stricmp, s_wcschr, s_wcsicmp,
     s_wcslen, s_wcsnicmp,
@@ -513,6 +607,7 @@ const _: () = assert!(
 const FSD_DATA_MM_SYSTEM_RANGE_START_OFF: u64 = 0x200;
 const FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_OFF: u64 = 0x208;
 const FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_OFF: u64 = 0x210;
+const FSD_DATA_KD_DEBUGGER_NOT_PRESENT_OFF: u64 = 0x218;
 const FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_OFF: u64 = 0x300;
 const FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_OFF: u64 = 0x340;
 const FSD_DATA_SE_EXPORTS_CELL_OFF: u64 = 0x400;
@@ -524,6 +619,15 @@ const FSD_DATA_LOADER_BLOCK_OFF: u64 = 0x810;
 const FSD_DATA_LOADER_CONFIG_ROOT_OFF: u64 = 0x910;
 const FSD_DATA_LOADER_ACPI_NODE_OFF: u64 = 0x958;
 const FSD_DATA_LOADER_ACPI_IDENTIFIER_OFF: u64 = 0x9A0;
+// Pinned ACPI's sole HAL_PRIVATE_DISPATCH IAT use checks HalUnmaskInterrupt at +0x1f8.
+// Keep the whole version-32 table resident in the provider data frame. A null optional slot
+// advertises that this HAL operation is unavailable; ACPI itself returns STATUS_NOT_SUPPORTED.
+const FSD_DATA_HAL_PRIVATE_DISPATCH_OFF: u64 = 0xC00;
+const FSD_DATA_HAL_PRIVATE_DISPATCH_BYTES: u64 = 0x400;
+const FSD_DATA_HAL_PRIVATE_DISPATCH_VERSION: u32 = 32;
+const FSD_DATA_HAL_PRIVATE_DISPATCH_VA: u64 =
+    FSD_DATA_VADDR + FSD_DATA_HAL_PRIVATE_DISPATCH_OFF;
+const _: () = assert!(FSD_DATA_HAL_PRIVATE_DISPATCH_OFF + FSD_DATA_HAL_PRIVATE_DISPATCH_BYTES <= 0x1000);
 const FSD_DATA_LOADER_ACPI_CONFIG_OFF: u64 = 0x2000;
 const FSD_DATA_LOADER_CONFIG_CAPACITY: usize =
     nt_compat_exports::configuration::LOADER_ACPI_CONFIGURATION_FIXED_BYTES
@@ -540,6 +644,8 @@ const FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_OFF;
 const FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_OFF;
+const FSD_DATA_KD_DEBUGGER_NOT_PRESENT_VA: u64 =
+    FSD_DATA_VADDR + FSD_DATA_KD_DEBUGGER_NOT_PRESENT_OFF;
 const FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_OFF;
 const FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_VA: u64 =
@@ -1029,6 +1135,22 @@ pub const FSD_SERVICE_LOWER_PNP_FORWARD_LABEL: u64 = 0x7A6;
 pub const FSD_SERVICE_CONNECT_FORWARD_LABEL: u64 = 0x7A7;
 pub const FSD_SERVICE_HOOK_FORWARD_LABEL: u64 = 0x7A8;
 pub const FSD_SERVICE_LOWER_FILE_FORWARD_LABEL: u64 = 0x7A9;
+pub const FSD_SERVICE_REMOVE_DPC_LABEL: u64 = 0x7BA;
+pub const FSD_SERVICE_ZW_UNLOAD_DRIVER_LABEL: u64 = 0x7BB;
+pub const FSD_SERVICE_UUID_CREATE_LABEL: u64 = 0x7BC;
+pub const FSD_SERVICE_GOP_QUERY_LABEL: u64 = 0x7BD;
+pub const FSD_SERVICE_DISPLAY_OWNERSHIP_LABEL: u64 = 0x7BE;
+pub const FSD_SERVICE_PNP_NOTIFICATION_LABEL: u64 = 0x7BF;
+pub const FSD_SERVICE_PROPERTY_WRITE_LABEL: u64 = 0x7C0;
+pub const FSD_SERVICE_CREATE_DRIVER_LABEL: u64 = 0x7C1;
+pub const FSD_SERVICE_KE_SET_PRIORITY_THREAD_LABEL: u64 = 0x7C2;
+pub const FSD_SERVICE_KE_STACK_ATTACH_LABEL: u64 = 0x7C3;
+pub const FSD_SERVICE_PS_IDENTITY_LABEL: u64 = hosted_driver_process_identity::LABEL;
+pub const FSD_SERVICE_DIRECTORY_OBJECT_LABEL: u64 = hosted_driver_directory_object::LABEL;
+pub const FSD_SERVICE_CREATE_EVENT_LABEL: u64 = hosted_driver_create_event::LABEL;
+pub const FSD_SERVICE_PROCESS_NOTIFY_LABEL: u64 = hosted_driver_process_notify::LABEL;
+pub const FSD_SERVICE_DYNAMIC_TYPE_LABEL: u64 = hosted_driver_dynamic_type::LABEL;
+pub const FSD_SERVICE_PS_HANDLE_REFERENCE_LABEL: u64 = hosted_driver_ps_handle_reference::LABEL;
 const _: () = {
     let labels = [
         FSD_SERVICE_SOURCE_IRP_LABEL,
@@ -1048,6 +1170,22 @@ const _: () = {
         FSD_SERVICE_CONNECT_FORWARD_LABEL,
         FSD_SERVICE_HOOK_FORWARD_LABEL,
         FSD_SERVICE_LOWER_FILE_FORWARD_LABEL,
+        FSD_SERVICE_REMOVE_DPC_LABEL,
+        FSD_SERVICE_ZW_UNLOAD_DRIVER_LABEL,
+        FSD_SERVICE_UUID_CREATE_LABEL,
+        FSD_SERVICE_GOP_QUERY_LABEL,
+        FSD_SERVICE_DISPLAY_OWNERSHIP_LABEL,
+        FSD_SERVICE_PNP_NOTIFICATION_LABEL,
+        FSD_SERVICE_PROPERTY_WRITE_LABEL,
+        FSD_SERVICE_CREATE_DRIVER_LABEL,
+        FSD_SERVICE_KE_SET_PRIORITY_THREAD_LABEL,
+        FSD_SERVICE_KE_STACK_ATTACH_LABEL,
+        FSD_SERVICE_PS_IDENTITY_LABEL,
+        FSD_SERVICE_DIRECTORY_OBJECT_LABEL,
+        FSD_SERVICE_CREATE_EVENT_LABEL,
+        FSD_SERVICE_PROCESS_NOTIFY_LABEL,
+        FSD_SERVICE_DYNAMIC_TYPE_LABEL,
+        FSD_SERVICE_PS_HANDLE_REFERENCE_LABEL,
     ];
     let mut i = 0;
     while i < labels.len() {
@@ -1075,6 +1213,7 @@ pub const FSD_DISPATCH_VIDEO_RELATION_ACK: u64 = u64::MAX - 0x77E;
 pub const FSD_DISPATCH_CREATE_PDO_PROJECTION: u64 = u64::MAX - 0x77F;
 pub const FSD_DISPATCH_DRAIN_FILE_RETIREMENTS: u64 = u64::MAX - 0x781;
 pub const FSD_DISPATCH_DRIVER_REINIT: u64 = u64::MAX - 0x782;
+pub const FSD_DISPATCH_PNP_NOTIFICATION: u64 = u64::MAX - 0x786;
 pub const FSD_DISPATCH_CLASS_LOWER_ALIAS: u64 = u64::MAX - 0x783;
 pub const FSD_DISPATCH_REVERSE_CLASS_ALIAS: u64 = u64::MAX - 0x784;
 
@@ -1128,6 +1267,7 @@ const IRP_MJ_INTERNAL_DEVICE_CONTROL: u64 = major::IRP_MJ_INTERNAL_DEVICE_CONTRO
 const IRP_MJ_PNP: u64 = major::IRP_MJ_PNP as u64;
 const IRP_MN_START_DEVICE: u64 = 0x00;
 const IRP_MN_QUERY_DEVICE_RELATIONS: u64 = nt_pnp_abi::IRP_MN_QUERY_DEVICE_RELATIONS as u64;
+const IRP_MN_QUERY_PNP_DEVICE_STATE: u64 = nt_pnp_abi::IRP_MN_QUERY_PNP_DEVICE_STATE as u64;
 const IRP_MN_QUERY_ID: u64 = nt_pnp_abi::IRP_MN_QUERY_ID as u64;
 const IRP_MN_QUERY_RESOURCES: u64 = nt_pnp_abi::IRP_MN_QUERY_RESOURCES as u64;
 const IRP_MN_QUERY_RESOURCE_REQUIREMENTS: u64 =
@@ -4927,7 +5067,7 @@ extern "win64" fn s_ke_set_timer_ex(timer: u64, due_time: u64, period: i32, dpc:
 }
 
 #[inline]
-fn read_ordered_tsc() -> u64 {
+pub(crate) fn read_ordered_tsc() -> u64 {
     let low: u32;
     let high: u32;
     unsafe {
@@ -5133,6 +5273,13 @@ unsafe fn initialize_hosted_loader_block(exec_data_va: u64) {
 }
 
 unsafe fn initialize_hosted_driver_data_exports(exec_data_va: u64) {
+    let hal_private = exec_data_va + FSD_DATA_HAL_PRIVATE_DISPATCH_OFF;
+    core::ptr::write_bytes(
+        hal_private as *mut u8,
+        0,
+        FSD_DATA_HAL_PRIVATE_DISPATCH_BYTES as usize,
+    );
+    write_unaligned(hal_private as *mut u32, FSD_DATA_HAL_PRIVATE_DISPATCH_VERSION);
     core::ptr::write(
         (exec_data_va + FSD_DATA_HELD_PNP_COMPLETIONS_OFF) as *mut HostedHeldPnpCompletions,
         HostedHeldPnpCompletions::new(),
@@ -5158,6 +5305,12 @@ unsafe fn initialize_hosted_driver_data_exports(exec_data_va: u64) {
     );
     write_volatile(ex_event_object_type_body as *mut u64, 0x4556_454e_5459_5045); // "EVENTYPE"
 
+    let kd_debugger_not_present = exec_data_va + FSD_DATA_KD_DEBUGGER_NOT_PRESENT_OFF;
+    write_volatile(
+        kd_debugger_not_present as *mut u8,
+        u8::from(!hosted_kd_debug::kernel_debugger_connected()),
+    );
+
     let se_exports_cell = exec_data_va + FSD_DATA_SE_EXPORTS_CELL_OFF;
     let se_exports_struct = exec_data_va + FSD_DATA_SE_EXPORTS_STRUCT_OFF;
     let se_sid_pool = exec_data_va + FSD_DATA_SE_SID_POOL_OFF;
@@ -5182,9 +5335,14 @@ unsafe fn initialize_hosted_driver_data_exports(exec_data_va: u64) {
 
 fn fsd_data_export_addr(name: &str) -> Option<u64> {
     Some(match name {
+        "HalPrivateDispatchTable" => FSD_DATA_HAL_PRIVATE_DISPATCH_VA,
         "MmSystemRangeStart" => FSD_DATA_MM_SYSTEM_RANGE_START_VA,
+        "KdDebuggerNotPresent" => FSD_DATA_KD_DEBUGGER_NOT_PRESENT_VA,
         "IoFileObjectType" => FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_VA,
         "ExEventObjectType" => FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_VA,
+        "PsInitialSystemProcess" => hosted_driver_process_state::INITIAL_SYSTEM_PROCESS_CELL_VA,
+        "PsProcessType" => hosted_driver_process_state::PROCESS_TYPE_CELL_VA,
+        "PsThreadType" => hosted_driver_process_state::THREAD_TYPE_CELL_VA,
         "SeExports" => FSD_DATA_SE_EXPORTS_CELL_VA,
         "KeLoaderBlock" => FSD_DATA_KE_LOADER_BLOCK_CELL_VA,
         _ => return None,
@@ -5595,6 +5753,18 @@ extern "win64" fn s_swprintf_body(dst: u64, fmt: u64, a0: u64, a1: u64, caller_r
     unsafe { format_wide_driver(dst, usize::MAX, fmt, &mut args) }
 }
 
+#[no_mangle]
+extern "win64" fn s_snwprintf_body(
+    dst: u64,
+    count: usize,
+    fmt: u64,
+    a0: u64,
+    caller_rsp: u64,
+) -> i32 {
+    let mut args = Win64PrintfArguments::new([a0, 0, 0], 1, caller_rsp);
+    unsafe { format_wide_driver(dst, count, fmt, &mut args) }
+}
+
 core::arch::global_asm!(
     ".text",
     ".globl hosted_sprintf_gate",
@@ -5621,12 +5791,21 @@ core::arch::global_asm!(
     "call s_swprintf_body",
     "add rsp, 0x38",
     "ret",
+    ".globl hosted_snwprintf_gate",
+    "hosted_snwprintf_gate:",
+    "mov r11, rsp",
+    "sub rsp, 0x38",
+    "mov [rsp + 0x20], r11",
+    "call s_snwprintf_body",
+    "add rsp, 0x38",
+    "ret",
 );
 
 extern "win64" {
     fn hosted_sprintf_gate();
     fn hosted_snprintf_gate();
     fn hosted_swprintf_gate();
+    fn hosted_snwprintf_gate();
 }
 
 extern "win64" fn s_vsnwprintf(dst: u64, count: usize, fmt: u64, va_list: u64) -> i32 {
@@ -5699,6 +5878,10 @@ const HOSTED_DEVICE_OP_START_PACKET_CALLBACK_RETURNED: u64 = 24;
 const HOSTED_DEVICE_OP_START_NEXT_PACKET: u64 = 25;
 const HOSTED_DEVICE_OP_START_NEXT_PACKET_CALLBACK_RETURNED: u64 = 26;
 const HOSTED_DEVICE_OP_REGISTER_DRIVER_REINIT: u64 = 27;
+const HOSTED_DEVICE_OP_GET_INTERFACE_BEGIN: u64 = 28;
+const HOSTED_DEVICE_OP_GET_INTERFACE_PULL: u64 = 29;
+const HOSTED_DEVICE_OP_GET_INTERFACE_ABORT: u64 = 30;
+const HOSTED_DEVICE_OP_INVALIDATE_STATE: u64 = 31;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN: u64 = 0;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF: u64 = 2;
 const HOSTED_DEVICE_ARG_DATA_OFF: u64 = FSD_ARG_BYTES;
@@ -12964,15 +13147,6 @@ extern "win64" fn s_init_small_struct(p: u64) -> i32 {
     0
 }
 
-/// `void KeInitializeSpinLock(PKSPIN_LOCK)` — a KSPIN_LOCK is pointer-sized storage.
-extern "win64" fn s_ke_initialize_spin_lock(lock: u64) {
-    unsafe {
-        if lock != 0 {
-            write_unaligned(lock as *mut u64, 0);
-        }
-    }
-}
-
 #[inline]
 unsafe fn hosted_current_irql() -> u8 {
     if let Some((arena, identity, _, _, _)) = hosted_irq_lane_context() {
@@ -13615,48 +13789,6 @@ extern "win64" fn s_ex_try_to_acquire_fast_mutex(mutex: u64) -> u8 {
 /// `KIRQL KeGetCurrentIrql()`.
 extern "win64" fn s_ke_get_current_irql() -> u8 {
     unsafe { hosted_current_irql() }
-}
-
-/// `KIRQL KeAcquireSpinLockRaiseToDpc(PKSPIN_LOCK)`.
-///
-/// The hosted NT ABI exposes one logical processor (`KeNumberProcessors == 1`). NT UP spinlocks
-/// therefore provide exclusion by raising IRQL; no inter-processor lock word is acquired. This is
-/// also what permits a protocol receive indication to synchronously re-enter NDIS send code while
-/// the outer indication is at `DISPATCH_LEVEL`.
-extern "win64" fn s_ke_acquire_spin_lock_raise_to_dpc(lock: u64) -> u8 {
-    unsafe {
-        if lock == 0 {
-            return hosted_current_irql();
-        }
-        let old_irql = hosted_raise_irql(DISPATCH_LEVEL);
-        compiler_fence(Ordering::SeqCst);
-        old_irql
-    }
-}
-
-/// `void KeReleaseSpinLock(PKSPIN_LOCK, KIRQL)`.
-extern "win64" fn s_ke_release_spin_lock(lock: u64, old_irql: u8) {
-    unsafe {
-        if lock == 0 {
-            return;
-        }
-        compiler_fence(Ordering::SeqCst);
-        hosted_lower_irql(old_irql);
-    }
-}
-
-/// `VOID KeAcquireSpinLockAtDpcLevel(PKSPIN_LOCK)` -- barrier-only on the hosted UP ABI.
-extern "win64" fn s_ke_acquire_spin_lock_at_dpc_level(lock: u64) {
-    if lock != 0 {
-        compiler_fence(Ordering::SeqCst);
-    }
-}
-
-/// `VOID KeReleaseSpinLockFromDpcLevel(PKSPIN_LOCK)` -- barrier-only on the hosted UP ABI.
-extern "win64" fn s_ke_release_spin_lock_from_dpc_level(lock: u64) {
-    if lock != 0 {
-        compiler_fence(Ordering::SeqCst);
-    }
 }
 
 /// `void KeInitializeEvent(PRKEVENT, EVENT_TYPE, BOOLEAN)`.
@@ -14636,6 +14768,40 @@ extern "win64" fn s_ke_insert_queue_dpc(dpc: u64, arg1: u64, arg2: u64) -> u8 {
             return 0;
         }
         return inserted as u8;
+    }
+}
+
+/// `BOOLEAN KeRemoveQueueDpc(PRKDPC)` removes only a still queued KDPC. Root owns the
+/// generation-fenced queue; component memory is a projection, never the scheduling authority.
+extern "win64" fn s_ke_remove_queue_dpc(dpc: u64) -> u8 {
+    if dpc == 0 {
+        return 0;
+    }
+    unsafe {
+        if let Some((_, identity, _, _, grant)) = hosted_irq_lane_context() {
+            let removed = hosted_irq_lane_service(nt_hosted_runtime::HostedIrqServiceCommand {
+                kind: nt_hosted_runtime::HostedIrqServiceKind::RemoveDpc,
+                service_id: dpc,
+                target_domain_id: identity.domain_id,
+                target_domain_cookie: identity.domain_cookie,
+                authority_cookie: 0,
+                grant,
+                argument_count: 0,
+                arguments: [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP],
+            });
+            if removed.faulted || removed.status != STATUS_SUCCESS
+                || removed.value_count != 1 || removed.values[0] > 1
+            {
+                hosted_irq_lane_protocol_fault(dpc);
+            }
+            return removed.values[0] as u8;
+        }
+        let (_, status, removed, _, _) =
+            call_on4((FSD_SERVICE_REMOVE_DPC_LABEL << 12) | 1, dpc, 0, 0, 0);
+        if status as u32 as i32 != STATUS_SUCCESS || removed > 1 {
+            return 0;
+        }
+        removed as u8
     }
 }
 
@@ -15740,6 +15906,9 @@ extern "win64" fn s_obf_reference_object(object: u64) -> u64 {
             );
         }
         if !consumer_file_object_in_local_pool(object) {
+            if let Some(references) = hosted_driver_process_identity::retain_process_if_known(object) {
+                return references;
+            }
             return object;
         }
         let (info, status, reference, _, _) =
@@ -15760,6 +15929,12 @@ extern "win64" fn s_obf_dereference_object(object: u64) -> u64 {
             );
         }
         if !consumer_file_object_in_local_pool(object) {
+            if let Some(references) = hosted_driver_ps_handle_reference::release_if_owned(object) {
+                return references;
+            }
+            if let Some(references) = hosted_driver_process_identity::release_process_if_owned(object) {
+                return references;
+            }
             return 0;
         }
         let (info, status, _, _, _) =
@@ -15782,6 +15957,13 @@ extern "win64" fn s_ob_reference_object_by_handle(
 ) -> i32 {
     if handle == 0 || object_out == 0 || access_mode > 1 {
         return STATUS_INVALID_HANDLE;
+    }
+    if object_type == nt_object_manager::object_type::process_object_type_addr()
+        || object_type == nt_object_manager::object_type::thread_object_type_addr()
+    {
+        return hosted_driver_ps_handle_reference::ob_reference_object_by_handle(
+            handle, desired_access, object_type, access_mode, object_out, handle_information,
+        );
     }
     if object_type != 0 && object_type != FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_VA {
         return nt_process::native_handle::STATUS_OBJECT_TYPE_MISMATCH as i32;
@@ -33469,6 +33651,8 @@ fn register_fsd_trampolines() -> bool {
         crate::debug_traps::DbgBreakPointWithStatus as *const () as usize as u64,
     );
     bind_kd_debug_export(reg);
+    reg.bind("RtlAssert", crate::hosted_driver_assertion::rtl_assert as usize as u64);
+    crate::ex_rundown_exports::bind_ex_rundown_exports(reg);
     // pool (ExAllocatePool* → the FSD arena)
     reg.bind(
         "ExAllocatePoolWithTag",
@@ -33529,6 +33713,10 @@ fn register_fsd_trampolines() -> bool {
         s_rtl_unicode_string_to_integer as *const () as usize as u64,
     );
     reg.bind(
+        "RtlCharToInteger",
+        hosted_driver_rtl_integer::char_to_integer as *const () as usize as u64,
+    );
+    reg.bind(
         "RtlAnsiStringToUnicodeString",
         s_rtl_ansi_string_to_unicode_string as *const () as usize as u64,
     );
@@ -33578,6 +33766,10 @@ fn register_fsd_trampolines() -> bool {
         s_io_create_device as *const () as usize as u64,
     );
     reg.bind(
+        "IoEnumerateDeviceObjectList",
+        hosted_driver_device_enumeration::s_io_enumerate_device_object_list as *const () as usize as u64,
+    );
+    reg.bind(
         "IoCheckShareAccess",
         driver_share_access::check as *const () as usize as u64,
     );
@@ -33614,6 +33806,46 @@ fn register_fsd_trampolines() -> bool {
         s_io_get_device_property as *const () as usize as u64,
     );
     reg.bind(
+        "IoGetDevicePropertyData",
+        hosted_driver_device_property_data::s_io_get_device_property_data as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoSetDevicePropertyData",
+        hosted_driver_device_property_write::set as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoCreateDriver",
+        hosted_driver_create_driver::create as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeQueryActiveProcessors",
+        hosted_driver_processor_mask::query_active_processors as *const () as usize as u64,
+    );
+    reg.bind(
+        "PoCreateThermalRequest",
+        hosted_driver_thermal_request::create as *const () as usize as u64,
+    );
+    reg.bind(
+        "PoGetThermalRequestSupport",
+        hosted_driver_thermal_request::support as *const () as usize as u64,
+    );
+    reg.bind(
+        "PoSetThermalPassiveCooling",
+        hosted_driver_thermal_request::set_passive as *const () as usize as u64,
+    );
+    reg.bind(
+        "PoSetThermalActiveCooling",
+        hosted_driver_thermal_request::set_active as *const () as usize as u64,
+    );
+    reg.bind(
+        "PoDeleteThermalRequest",
+        hosted_driver_thermal_request::delete as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoIs32bitProcess",
+        hosted_driver_process_bitness::io_is_32bit_process as *const () as usize as u64,
+    );
+    reg.bind(
         "IoWMIOpenBlock",
         hosted_wmi::open_block as *const () as usize as u64,
     );
@@ -33626,8 +33858,28 @@ fn register_fsd_trampolines() -> bool {
         s_io_invalidate_device_relations as *const () as usize as u64,
     );
     reg.bind(
+        "IoInvalidateDeviceState",
+        hosted_driver_device_state::invalidate as *const () as usize as u64,
+    );
+    reg.bind(
         "IoRegisterDeviceInterface",
         s_io_register_device_interface as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoRegisterPlugPlayNotification",
+        hosted_driver_pnp_notification::register as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoUnregisterPlugPlayNotification",
+        hosted_driver_pnp_notification::unregister as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoUnregisterPlugPlayNotificationEx",
+        hosted_driver_pnp_notification::unregister_ex as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoGetDeviceInterfaces",
+        hosted_driver_device_interfaces::s_io_get_device_interfaces as *const () as usize as u64,
     );
     reg.bind(
         "IoSetDeviceInterfaceState",
@@ -33829,6 +34081,18 @@ fn register_fsd_trampolines() -> bool {
         s_mm_map_locked_pages_specify_cache as *const () as usize as u64,
     );
     reg.bind(
+        "MmAllocatePagesForMdlEx",
+        hosted_driver_physical_mdl::mm_allocate_pages_for_mdl_ex as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmCreateMdl",
+        hosted_driver_create_mdl::mm_create_mdl as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmFreePagesFromMdl",
+        hosted_driver_physical_mdl::mm_free_pages_from_mdl as *const () as usize as u64,
+    );
+    reg.bind(
         "MmAllocateContiguousMemorySpecifyCache",
         s_mm_allocate_contiguous_memory_specify_cache as *const () as usize as u64,
     );
@@ -33901,8 +34165,60 @@ fn register_fsd_trampolines() -> bool {
         s_io_connect_interrupt as *const () as usize as u64,
     );
     reg.bind(
+        "IoConnectInterruptEx",
+        hosted_driver_interrupt_ex::s_io_connect_interrupt_ex as *const () as usize as u64,
+    );
+    reg.bind(
         "IoDisconnectInterrupt",
         s_io_disconnect_interrupt as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoDisconnectInterruptEx",
+        hosted_driver_interrupt_ex::s_io_disconnect_interrupt_ex as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExGetPreviousMode",
+        hosted_io_create_file_adapter::s_ex_get_previous_mode as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExUuidCreate",
+        hosted_driver_uuid::s_ex_uuid_create as *const () as usize as u64,
+    );
+    reg.bind(
+        "InbvGetGopFrameBufferInfo",
+        hosted_driver_gop::s_inbv_get_gop_frame_buffer_info as *const () as usize as u64,
+    );
+    reg.bind(
+        "InbvHasValidGopFrameBuffer",
+        hosted_driver_gop::s_inbv_has_valid_gop_frame_buffer as *const () as usize as u64,
+    );
+    reg.bind(
+        "InbvNotifyDisplayOwnershipLost",
+        hosted_driver_gop::s_inbv_notify_display_ownership_lost as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExfAcquirePushLockExclusive",
+        hosted_driver_push_lock::acquire_exclusive as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExfAcquirePushLockShared",
+        hosted_driver_push_lock::acquire_shared as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExfReleasePushLockExclusive",
+        hosted_driver_push_lock::release_exclusive as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExfReleasePushLockShared",
+        hosted_driver_push_lock::release_shared as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExfReleasePushLock",
+        hosted_driver_push_lock::release_generic as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExfTryToWakePushLock",
+        hosted_driver_push_lock::try_to_wake as *const () as usize as u64,
     );
     reg.bind(
         "IoCreateSymbolicLink",
@@ -34033,6 +34349,27 @@ fn register_fsd_trampolines() -> bool {
     // CRT / Rtl mem intrinsics (REAL — silent corruption otherwise)
     reg.bind("memcpy", s_memcpy as *const () as usize as u64);
     reg.bind("memmove", s_memmove as *const () as usize as u64);
+    reg.bind("memchr", hosted_driver_crt_memchr::memchr as *const () as usize as u64);
+    reg.bind("strchr", hosted_driver_crt_strchr::strchr as *const () as usize as u64);
+    reg.bind("qsort", hosted_driver_crt_wide_sort::qsort as *const () as usize as u64);
+    reg.bind("wcscmp", hosted_driver_crt_wide_sort::wcscmp as *const () as usize as u64);
+    reg.bind("wcsrchr", hosted_driver_crt_wide_sort::wcsrchr as *const () as usize as u64);
+    reg.bind(
+        "HalConvertDeviceIdtToIrql",
+        hosted_driver_hal_idt_irql::hal_convert_device_idt_to_irql as *const () as usize as u64,
+    );
+    reg.bind(
+        "HalGetInterruptTargetInformation",
+        hosted_driver_hal_target_info::hal_get_interrupt_target_information as *const () as usize as u64,
+    );
+    reg.bind(
+        "HalGetMemoryCachingRequirements",
+        hosted_driver_hal_cache::hal_get_memory_caching_requirements as *const () as usize as u64,
+    );
+    reg.bind(
+        "HalpConfigurePciRootBridge",
+        hosted_driver_pci_root::halp_configure_pci_root_bridge as *const () as usize as u64,
+    );
     reg.bind("RtlCopyMemory", s_memcpy as *const () as usize as u64);
     reg.bind("RtlMoveMemory", s_memmove as *const () as usize as u64);
     reg.bind("memset", s_memset as *const () as usize as u64);
@@ -34059,6 +34396,8 @@ fn register_fsd_trampolines() -> bool {
         "swprintf",
         hosted_swprintf_gate as *const () as usize as u64,
     );
+    reg.bind("_swprintf", hosted_swprintf_gate as *const () as usize as u64);
+    reg.bind("_snwprintf", hosted_snwprintf_gate as *const () as usize as u64);
     reg.bind("_vsnwprintf", s_vsnwprintf as *const () as usize as u64);
     reg.bind("wcslen", s_wcslen as *const () as usize as u64);
     reg.bind("wcsstr", s_wcsstr as *const () as usize as u64);
@@ -34121,8 +34460,20 @@ fn register_fsd_trampolines() -> bool {
     );
     reg.bind("ZwClose", s_zw_close as *const () as usize as u64);
     reg.bind(
+        "ZwCreateDirectoryObject",
+        hosted_driver_directory_object::zw_create_directory_object as *const () as usize as u64,
+    );
+    reg.bind(
+        "ZwCreateEvent",
+        hosted_driver_create_event::zw_create_event as *const () as usize as u64,
+    );
+    reg.bind(
         "ZwLoadDriver",
         hosted_zw_load_driver::s_zw_load_driver as *const () as usize as u64,
+    );
+    reg.bind(
+        "ZwUnloadDriver",
+        hosted_zw_load_driver::s_zw_unload_driver as *const () as usize as u64,
     );
     reg.bind(
         "NtClose",
@@ -34142,6 +34493,7 @@ fn register_fsd_trampolines() -> bool {
         "ZwQueryValueKey",
         s_zw_query_value_key as *const () as usize as u64,
     );
+    reg.bind("ZwQueryKey", hosted_zw_query_key::s_zw_query_key as *const () as usize as u64);
     reg.bind(
         "ZwSetValueKey",
         s_zw_set_value_key as *const () as usize as u64,
@@ -34211,6 +34563,14 @@ fn register_fsd_trampolines() -> bool {
         s_exp_interlocked_pop_entry_slist as *const () as usize as u64,
     );
     reg.bind(
+        "ExpInterlockedFlushSList",
+        s_exp_interlocked_flush_slist as *const () as usize as u64,
+    );
+    reg.bind(
+        "InitializeSListHead",
+        s_initialize_slist_head as *const () as usize as u64,
+    );
+    reg.bind(
         "ExQueueWorkItem",
         s_ex_queue_work_item as *const () as usize as u64,
     );
@@ -34221,23 +34581,39 @@ fn register_fsd_trampolines() -> bool {
     );
     reg.bind(
         "KeInitializeSpinLock",
-        s_ke_initialize_spin_lock as *const () as usize as u64,
+        hosted_driver_spin_lock::initialize as *const () as usize as u64,
     );
     reg.bind(
         "KeAcquireSpinLockRaiseToDpc",
-        s_ke_acquire_spin_lock_raise_to_dpc as *const () as usize as u64,
+        hosted_driver_spin_lock::acquire_raise_to_dpc as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeAcquireInStackQueuedSpinLock",
+        hosted_driver_queued_spin_lock::acquire as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeInvalidateRangeAllCaches",
+        hosted_driver_cache_invalidation::invalidate as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeReleaseInStackQueuedSpinLock",
+        hosted_driver_queued_spin_lock::release as *const () as usize as u64,
     );
     reg.bind(
         "KeAcquireSpinLockAtDpcLevel",
-        s_ke_acquire_spin_lock_at_dpc_level as *const () as usize as u64,
+        hosted_driver_spin_lock::acquire_at_dpc as *const () as usize as u64,
     );
     reg.bind(
         "KeReleaseSpinLock",
-        s_ke_release_spin_lock as *const () as usize as u64,
+        hosted_driver_spin_lock::release_restore_irql as *const () as usize as u64,
     );
     reg.bind(
         "KeReleaseSpinLockFromDpcLevel",
-        s_ke_release_spin_lock_from_dpc_level as *const () as usize as u64,
+        hosted_driver_spin_lock::release_from_dpc as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeTryToAcquireSpinLockAtDpcLevel",
+        hosted_driver_spin_lock::try_acquire_at_dpc as *const () as usize as u64,
     );
     reg.bind(
         "KeGetCurrentIrql",
@@ -34252,6 +34628,18 @@ fn register_fsd_trampolines() -> bool {
         s_ke_initialize_event as *const () as usize as u64,
     );
     reg.bind("KeSetEvent", s_ke_set_event as *const () as usize as u64);
+    reg.bind(
+        "KeSetPriorityThread",
+        hosted_driver_thread_priority::ke_set_priority_thread as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeStackAttachProcess",
+        hosted_driver_process_attach::ke_stack_attach_process as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeUnstackDetachProcess",
+        hosted_driver_process_attach::ke_unstack_detach_process as *const () as usize as u64,
+    );
     reg.bind(
         "KeResetEvent",
         s_ke_reset_event as *const () as usize as u64,
@@ -34316,6 +34704,10 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "KeInsertQueueDpc",
         s_ke_insert_queue_dpc as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeRemoveQueueDpc",
+        s_ke_remove_queue_dpc as *const () as usize as u64,
     );
     reg.bind(
         "KeFlushQueuedDpcs",
@@ -34527,6 +34919,34 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "PsGetCurrentProcessId",
         s_ps_get_current_process_id as *const () as usize as u64,
+    );
+    reg.bind(
+        "PsGetProcessId",
+        hosted_driver_process_identity::ps_get_process_id as *const () as usize as u64,
+    );
+    reg.bind(
+        "PsLookupProcessByProcessId",
+        hosted_driver_process_identity::ps_lookup_process_by_process_id as *const () as usize as u64,
+    );
+    reg.bind(
+        "PsGetProcessExitStatus",
+        hosted_driver_process_state::ps_get_process_exit_status as *const () as usize as u64,
+    );
+    reg.bind(
+        "PsIsSystemProcess",
+        hosted_driver_process_state::ps_is_system_process as *const () as usize as u64,
+    );
+    reg.bind(
+        "PsIsThreadTerminating",
+        hosted_driver_process_state::ps_is_thread_terminating as *const () as usize as u64,
+    );
+    reg.bind(
+        "PsSetCreateProcessNotifyRoutineEx",
+        hosted_driver_process_notify::ps_set_create_process_notify_routine_ex as *const () as usize as u64,
+    );
+    reg.bind(
+        "ObCreateObjectType",
+        hosted_driver_dynamic_type::ob_create_object_type as *const () as usize as u64,
     );
     reg.bind(
         "PsGetCurrentThreadId",
@@ -35227,6 +35647,9 @@ unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64
     }
     if major == FSD_DISPATCH_DRIVER_REINIT {
         return hosted_driver_reinitialization::component_dispatch();
+    }
+    if major == FSD_DISPATCH_PNP_NOTIFICATION {
+        return hosted_driver_pnp_notification::component_dispatch();
     }
     let request_drv = match read_volatile((FSD_SHARED_VADDR + SH_DRVOBJ) as *const u64) {
         0 => req.drv,
@@ -36713,6 +37136,7 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 minor,
                 IRP_MN_QUERY_RESOURCES
                     | IRP_MN_QUERY_RESOURCE_REQUIREMENTS
+                    | IRP_MN_QUERY_PNP_DEVICE_STATE
                     | IRP_MN_QUERY_BUS_INFORMATION
             ) =>
         {
@@ -38959,6 +39383,8 @@ unsafe fn load_driver_reserved(
             .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     }
     initialize_hosted_driver_data_exports(win.data_va);
+    hosted_driver_process_state::initialize_data_cells(win.data_va)
+        .map_err(|status| nt_status::NtStatus(status as i32))?;
 
     // 3. Parse + copy + relocate + IAT-patch (HEAP-FREE, records W^X rights). Load bytes into the
     //    per-instance executive window (code_va) but relocate for the component execution VA (run_va).
@@ -39239,6 +39665,20 @@ unsafe fn load_driver_reserved(
             print_str(b"[driver-launch] primary route enrollment failed\n");
             nt_status::NtStatus::UNSUCCESSFUL
         })?;
+    unsafe {
+        hosted_driver_process_notify::publish_image(instance, primary_run_va, u64::from(image_len))
+            .map_err(|status| nt_status::NtStatus(status as i32))?;
+        if let Some(images) = (&*core::ptr::addr_of!(HOSTED_DEP_IMAGES)).as_ref() {
+            for image in images.iter().filter(|image| image.present) {
+                hosted_driver_process_notify::publish_image(
+                    instance,
+                    image.run_va,
+                    u64::from(image.image_len),
+                )
+                .map_err(|status| nt_status::NtStatus(status as i32))?;
+            }
+        }
+    }
     if !hosted_pretransport_retirement::transport_registered(instance) {
         panic!("hosted driver pre-transport ownership handoff failed");
     }
@@ -44875,6 +45315,7 @@ pub(crate) fn pump_hosted_io_completions() -> usize {
         .saturating_add(unsafe { drain_hosted_device_retirements() })
         .saturating_add(unsafe { hosted_add_device_rollback::drain() })
         .saturating_add(unsafe { drain_hosted_pnp_completions() })
+        .saturating_add(unsafe { hosted_driver_device_state::drain() })
         .saturating_add(unsafe { drain_hosted_filter_requirements_transactions() })
         .saturating_add(unsafe { drain_hosted_device_relation_query() })
         .saturating_add(unsafe { drain_hosted_acpi_pci_route_query() })
@@ -47209,6 +47650,11 @@ unsafe fn set_hosted_device_interface_state(
     {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
+    hosted_driver_pnp_notification::set_hosted_device_interface_state(
+        registration.class_guid,
+        registration.symbolic_link,
+        enable,
+    )?;
     slot.enabled = enable;
     Ok(())
 }
@@ -54634,6 +55080,10 @@ pub(crate) fn service_hosted_device(
             | HOSTED_DEVICE_OP_START_NEXT_PACKET
             | HOSTED_DEVICE_OP_START_NEXT_PACKET_CALLBACK_RETURNED
             | HOSTED_DEVICE_OP_REGISTER_DRIVER_REINIT
+            | HOSTED_DEVICE_OP_GET_INTERFACE_BEGIN
+            | HOSTED_DEVICE_OP_GET_INTERFACE_PULL
+            | HOSTED_DEVICE_OP_GET_INTERFACE_ABORT
+            | HOSTED_DEVICE_OP_INVALIDATE_STATE
     ) {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
     }
@@ -54645,6 +55095,15 @@ pub(crate) fn service_hosted_device(
             arg3,
             active_reply_cap,
             caller_badge,
+        );
+    }
+    if matches!(op,
+        HOSTED_DEVICE_OP_GET_INTERFACE_BEGIN
+            | HOSTED_DEVICE_OP_GET_INTERFACE_PULL
+            | HOSTED_DEVICE_OP_GET_INTERFACE_ABORT
+    ) {
+        return hosted_driver_device_interfaces::service(
+            ch, op, pdo_object, arg2, arg3, caller_badge, active_reply_cap,
         );
     }
     if op == HOSTED_DEVICE_OP_REGISTER_DRIVER_REINIT {
@@ -54660,6 +55119,12 @@ pub(crate) fn service_hosted_device(
             0,
             0,
         );
+    }
+    if op == HOSTED_DEVICE_OP_INVALIDATE_STATE {
+        if arg2 != 0 || arg3 != 0 {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
+        return (hosted_driver_device_state::enqueue(ch, pdo_object, active_reply_cap), 0, 0, 0);
     }
     if matches!(
         op,
@@ -57592,12 +58057,17 @@ unsafe fn hosted_driver_device_lifetime_quiesced(
     let property_transfers_quiesced = (*core::ptr::addr_of!(HOSTED_DEVICE_PROPERTY_TRANSFERS))
         .as_ref()
         .is_none_or(|transfers| !transfers.domain_busy(domain));
+    let interface_queries_quiesced =
+        hosted_driver_device_interfaces::transfers_quiesced(domain);
     bindings_quiesced
         && hosted_add_device_rollback::lifetime_quiesced(instance, driver_id, domain)
         && retirements_quiesced
         && interfaces_quiesced
         && resource_maps_quiesced
         && property_transfers_quiesced
+        && interface_queries_quiesced
+        && unsafe { hosted_driver_device_state::retire_domain(domain) }
+        && hosted_driver_pnp_notification::quiesced(domain)
 }
 
 fn hosted_driver_thread_error_status(error: HostedDriverThreadError) -> i32 {
@@ -58100,6 +58570,10 @@ pub(crate) struct HostedVideoRouteInfo {
 }
 
 fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
+    if unsafe { hosted_driver_process_notify::blocks_instance_retirement(i)
+        || hosted_driver_dynamic_type::blocks_instance_retirement(i) } {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     if let Some(inst) = instance(i) {
         if instance_domain_identity(inst).is_some_and(|domain| unsafe {
             hosted_video_caller_aperture::blocks_domain_retirement(
@@ -58218,6 +58692,8 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
     if let Some(domain) = retiring_domain {
         unsafe {
             hosted_device_property_transfers_mut().remove_domain(domain);
+            hosted_driver_device_interfaces::retire_domain(domain);
+            hosted_driver_pnp_notification::retire_domain(domain);
         }
     }
     if let Some(domain) = retiring_domain {
@@ -58436,6 +58912,10 @@ fn finish_instance_physical_release(
             return Err(status);
         }
         hosted_exception_images::retire(i, domain);
+    }
+    unsafe {
+        hosted_driver_process_notify::retire_instance_images(i)
+            .map_err(|status| nt_status::NtStatus(status as i32))?;
     }
     let t = unsafe { driver_instances_mut() };
     if i < t.len() {
@@ -61094,7 +61574,24 @@ fn service_hosted_driver_registry_sync(
                 )
             }
             HOSTED_REGISTRY_OP_CLOSE => {
-                finish_driver_registry_close(ch, close_driver_registry_handle(caller, a1))
+                let registry_close = close_driver_registry_handle(caller, a1);
+                if matches!(
+                    &registry_close,
+                    Err(nt_process::native_handle::NativePsCloseError::Status(
+                        nt_process::native_handle::STATUS_OBJECT_TYPE_MISMATCH
+                    ))
+                ) {
+                    let handler = match crate::service_sec_image::registry_live_handler_pointer() {
+                        Ok(handler) => handler,
+                        Err(status) => return (status as i32, 0, 0),
+                    };
+                    return match (&mut *handler).close_native_table_handle(caller, a1) {
+                        Ok(true) => (STATUS_SUCCESS, 0, 0),
+                        Ok(false) => (STATUS_INVALID_HANDLE, 0, 0),
+                        Err(status) => (status as i32, 0, 0),
+                    };
+                }
+                finish_driver_registry_close(ch, registry_close)
             }
             HOSTED_REGISTRY_OP_ENUMERATE_KEY => {
                 let Ok(slot) = driver_registry_handle_slot(caller, a1, 8) else {
@@ -61156,6 +61653,9 @@ fn service_hosted_driver_registry_sync(
             }
             HOSTED_REGISTRY_OP_ENUMERATE_VALUE => {
                 hosted_zw_enumerate_value_key::service(caller, arg, a1, a2, a3)
+            }
+            HOSTED_REGISTRY_OP_QUERY_KEY => {
+                hosted_zw_query_key::service(caller, arg, a1, a2)
             }
             HOSTED_REGISTRY_OP_QUERY_HANDLE_VALUE => {
                 let Ok(slot) = driver_registry_handle_slot(caller, a1, 1) else {
@@ -62075,6 +62575,67 @@ unsafe fn queue_hosted_driver_dpc(
     Ok(queued)
 }
 
+/// Remove the exact root queue entry before clearing its provider-visible KDPC projection.
+/// The descriptor address is translated only through this instance's retained mappings.
+pub(crate) unsafe fn remove_hosted_driver_dpc(
+    instance_index: usize,
+    owner: Option<HostedDpcOwner>,
+    dpc: u64,
+) -> Result<bool, nt_status::NtStatus> {
+    let inst = instance(instance_index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    let domain = instance_domain_identity(inst).ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let exec_dpc = hosted_driver_component_object_exec_va(instance_index, inst, dpc, KDPC_SIZE)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let projected = read_unaligned((exec_dpc + KDPC_QUEUED_OFFSET) as *const u8) != 0;
+    let Some(owner) = owner else {
+        return if projected { Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST) } else { Ok(false) };
+    };
+    if owner.domain_id != domain.domain_id.raw()
+        || owner.domain_cookie != domain.cookie
+        || hosted_irq_lane_generation(instance_index, domain) != Some(owner.lane_generation)
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let table = hosted_dpcs_mut();
+    let snapshot = table.snapshot_registered(owner, dpc).map_err(hosted_dpc_status)?;
+    let queued = snapshot.is_some_and(|snapshot| snapshot.queued);
+    if queued != projected {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    if !queued {
+        return Ok(false);
+    }
+    let removed = table.remove_registered(owner, dpc).map_err(hosted_dpc_status)?;
+    if !removed {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    write_unaligned((exec_dpc + KDPC_QUEUED_OFFSET) as *mut u8, 0);
+    Ok(true)
+}
+
+pub(crate) fn service_hosted_driver_remove_dpc(
+    ch: &crate::spawn_hosts::PumpChannel,
+    dpc: u64,
+    active_reply_cap: u64,
+    caller_badge: u64,
+) -> (i32, u64) {
+    let Some((instance_index, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        return (STATUS_INVALID_PARAMETER, 0);
+    };
+    if hosted_driver_caller(instance_index, inst, caller_badge).is_none() {
+        return (STATUS_INVALID_PARAMETER, 0);
+    }
+    let owner = unsafe {
+        instance_domain_identity(inst)
+            .and_then(|domain| hosted_irq_lane_generation(instance_index, domain)
+                .and_then(|generation| HostedDpcOwner::new(domain.domain_id.raw(), domain.cookie, generation)))
+    };
+    match unsafe { remove_hosted_driver_dpc(instance_index, owner, dpc) } {
+        Ok(removed) => (STATUS_SUCCESS, removed as u64),
+        Err(status) => (status.raw(), 0),
+    }
+}
+
 pub(crate) fn service_hosted_driver_queue_dpc(
     ch: &crate::spawn_hosts::PumpChannel,
     dpc: u64,
@@ -62495,19 +63056,25 @@ pub(crate) fn service_hosted_driver_ps_get_current_thread_id(
         };
     }
     let result = unsafe { crate::provider_registry_caller::resolve(ch).and_then(|caller| {
-        if matches!(selector, 1 | 2 | 5) {
+        if matches!(selector, 1 | 2 | 5 | 6) {
             crate::service_sec_image::with_provider_process_manager(|pm| {
                 pm.validate_native_handle_caller(caller)?;
                 let thread = caller.original_thread();
-                    Ok((
-                        u64::from(thread.process_id()),
-                        u64::from(thread.thread_id()),
-                        0,
-                        0,
-                        pm.thread(thread.thread_id())
+                let process = if selector == 6 {
+                    u64::from(pm.process_wow64_pointer(thread.process_id())? != 0)
+                } else { 0 };
+                let teb = if selector == 5 {
+                    pm.thread(thread.thread_id())
                             .ok_or(nt_process::STATUS_INVALID_HANDLE)?
-                            .teb_base,
-                    ))
+                            .teb_base
+                } else { 0 };
+                Ok((
+                    u64::from(thread.process_id()),
+                    u64::from(thread.thread_id()),
+                    process,
+                    0,
+                    teb,
+                ))
             })
         } else { driver_ps_context::project(inst, caller) }
     }) };
@@ -62515,7 +63082,8 @@ pub(crate) fn service_hosted_driver_ps_get_current_thread_id(
         Ok((pid, tid, process, thread, teb)) => match selector {
             1 => (STATUS_SUCCESS, tid), 2 => (STATUS_SUCCESS, pid),
             3 => (STATUS_SUCCESS, thread), 4 => (STATUS_SUCCESS, process),
-            5 => (STATUS_SUCCESS, teb), _ => (STATUS_INVALID_PARAMETER, 0),
+            5 => (STATUS_SUCCESS, teb), 6 => (STATUS_SUCCESS, process),
+            _ => (STATUS_INVALID_PARAMETER, 0),
         },
         Err(status) => (status as i32, 0),
     }

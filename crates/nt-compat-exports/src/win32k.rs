@@ -109,6 +109,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("PsIsSystemThread", Partial, "live ETHREAD system-thread identity queried through the executive Ps broker"),
     e("PsGetProcessWin32WindowStation", Partial, "Win32 per-process/thread context pointer-slot in nt-process (ProcessManager win32 accessors)"),
     e("PsSetProcessWindowStation", Partial, "Win32 per-process/thread context pointer-slot in nt-process (ProcessManager win32 accessors)"),
+    e("PsInitialSystemProcess", Partial, "data export: exact bootstrap EPROCESS body retained in the shared executive image and mapped into hosted driver VSpaces"),
     e("PsProcessType", Partial, "data export: EPROCESS/ETHREAD object-type pointer (nt-object-manager)"),
     e("PsJobType", Implemented, "data export: canonical job OBJECT_TYPE pointer"),
     e("PsGetCurrentProcessWin32Process", Partial, "Win32 per-process/thread context pointer-slot in nt-process (ProcessManager win32 accessors)"),

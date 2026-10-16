@@ -694,6 +694,11 @@ pub(super) fn retire_allocation(
     {
         return (STATUS_INVALID_HANDLE, 0, 0);
     }
+    if op == 3 && unsafe {
+        hosted_driver_dynamic_type::owns_type_allocation(instance_index, component_address)
+    } {
+        return (nt_status::NtStatus::DELETE_PENDING.raw(), 0, 0);
+    }
     let _guard = lock();
     let _projection_guard = match hosted_device_allocations::generic_free_admission(inst, component_address) {
         Ok(guard) => guard,

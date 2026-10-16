@@ -62,6 +62,61 @@ pub struct ZwAlias {
 /// Native code imports ntdll by export name, leaving this numbering under our control.
 pub const ALPC_SSN_BASE: u32 = 0x700;
 
+/// ALPC services exported by this project's ntdll and admitted on its native
+/// Call transport. The released DLL's own service numbers are not authority.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum NativeAlpcService {
+    AcceptConnectPort,
+    ConnectPort,
+    CreatePort,
+    SendWaitReceivePort,
+}
+
+impl NativeAlpcService {
+    pub const fn argument_count(self) -> usize {
+        match self {
+            Self::AcceptConnectPort => 9,
+            Self::ConnectPort => 11,
+            Self::CreatePort => 3,
+            Self::SendWaitReceivePort => 8,
+        }
+    }
+
+    pub const fn from_call(ssn: u64, native_call_transport: bool) -> Option<Self> {
+        if !native_call_transport {
+            return None;
+        }
+        match ssn {
+            n if n == ALPC_SSN_BASE as u64 => Some(Self::AcceptConnectPort),
+            n if n == (ALPC_SSN_BASE + 1) as u64 => Some(Self::ConnectPort),
+            n if n == (ALPC_SSN_BASE + 2) as u64 => Some(Self::CreatePort),
+            n if n == (ALPC_SSN_BASE + 3) as u64 => Some(Self::SendWaitReceivePort),
+            _ => None,
+        }
+    }
+}
+
+/// The executive's native ingress choice. ALPC has a retained Reply owner and
+/// therefore enters before the ordinary dispatcher registration gate.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum NativeIngressRoute {
+    Alpc(NativeAlpcService),
+    Table,
+}
+
+impl NativeIngressRoute {
+    pub const fn select(ssn: u64, native_call_transport: bool,
+        table_registered: bool) -> Option<Self> {
+        if let Some(service) = NativeAlpcService::from_call(ssn, native_call_transport) {
+            Some(Self::Alpc(service))
+        } else if table_registered {
+            Some(Self::Table)
+        } else {
+            None
+        }
+    }
+}
+
 /// Private service-number range for the additional native exports imported by the pinned
 /// LiberNT kernel32.dll and advapi32.dll. These names have no ReactOS sysfuncs.lst number;
 /// this range is internal to our ntdll/executive pair and is never LiberNT's own numbering.

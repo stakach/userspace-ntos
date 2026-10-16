@@ -387,6 +387,35 @@ fn live_alpc_services_use_only_the_reserved_native_range() {
 }
 
 #[test]
+fn native_alpc_create_route_requires_our_ntdll_transport_and_number() {
+    use crate::NativeAlpcService;
+
+    assert_eq!(
+        NativeAlpcService::from_call(u64::from(ALPC_SSN_BASE + 2), true),
+        Some(NativeAlpcService::CreatePort),
+    );
+    assert_eq!(NativeAlpcService::from_call(114, true), None);
+    assert_eq!(NativeAlpcService::from_call(u64::from(ALPC_SSN_BASE + 2), false), None);
+    assert_eq!(NativeAlpcService::from_call(u64::from(ALPC_SSN_BASE + 3), true),
+        Some(NativeAlpcService::SendWaitReceivePort));
+}
+
+#[test]
+fn native_alpc_ingress_precedes_dispatcher_table_lookup() {
+    use crate::{NativeAlpcService, NativeIngressRoute};
+    assert_eq!(
+        NativeIngressRoute::select(u64::from(ALPC_SSN_BASE + 3), true, false),
+        Some(NativeIngressRoute::Alpc(NativeAlpcService::SendWaitReceivePort)),
+    );
+    assert_eq!(
+        NativeIngressRoute::select(u64::from(ALPC_SSN_BASE + 1), true, false),
+        Some(NativeIngressRoute::Alpc(NativeAlpcService::ConnectPort)),
+    );
+    assert_eq!(NativeIngressRoute::select(u64::from(ALPC_SSN_BASE + 3), false, false), None);
+    assert_eq!(NativeIngressRoute::select(0x32, true, true), Some(NativeIngressRoute::Table));
+}
+
+#[test]
 fn native_ipc_buffer_selects_main_and_worker_layouts() {
     assert_eq!(
         native_ipc_buffer_va(NT_NATIVE_SEC_IMAGE_MAIN_TEB_VA),

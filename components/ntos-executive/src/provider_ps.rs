@@ -81,9 +81,6 @@ pub(crate) fn dispatch(
                 pm.set_priority_class_for_kernel_process_object(object, priority_class)
             })
             .map(|()| (0, 0, 0)),
-        W32_PS_OP_SET_THREAD_PRIORITY => pm
-            .set_kernel_thread_priority(object, value as u32 as i32)
-            .map(|previous| (u64::from(previous as u32), 0, 0)),
         W32_PS_OP_LOOKUP_PROCESS => nt_process::ProcessId::try_from(object)
             .map_err(|_| INVALID_PARAMETER)
             .and_then(|pid| pm.lookup_kernel_process_by_id(pid))

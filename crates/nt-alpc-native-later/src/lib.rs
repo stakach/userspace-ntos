@@ -11,7 +11,8 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 use nt_alpc_abi::{
     AlpcAcceptConnectCheckedRequest, AlpcAcceptConnectRequest, AlpcCheckedInvocation,
-    AlpcConnectPortCheckedRequest, AlpcConnectPortRequest, AlpcPortAttributes,
+    AlpcConnectPortAuthorizedRequest, AlpcConnectPortCheckedRequest,
+    AlpcConnectPortRequest, AlpcPortAttributes,
     AlpcSendReceiveCheckedRequest, AlpcSendReceiveRequest,
 };
 
@@ -38,7 +39,8 @@ pub struct ReceiveTarget {
     pub message: u64,
     pub capacity: usize,
     pub size_pointer: u64,
-    pub attributes: Option<u64>,
+    /// Destination and allocation mask captured before the service effect.
+    pub attributes: Option<(u64, u32)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -57,6 +59,9 @@ pub struct CapturedConnectPort {
     pub name: Vec<u16>,
     pub port_attributes: Option<[u8; 72]>,
     pub message: Option<Vec<u8>>,
+    /// Original writable message, its capacity, and the size field. The
+    /// message bytes above are copied input and never reread after submission.
+    pub message_target: Option<(u64, usize, u64)>,
     pub send_attributes: Option<CapturedAttributes>,
     pub timeout: Option<i64>,
 }
@@ -68,6 +73,8 @@ pub struct CapturedAcceptConnect {
     pub connection_id: u32,
     pub port_context: u64,
     pub accept: bool,
+    /// Complete copied connection-request message, retained across acceptance.
+    pub message: Vec<u8>,
 }
 
 fn invocation(caller: NativeCaller, token: (u64, u64)) -> Result<AlpcCheckedInvocation, u32> {
@@ -107,11 +114,15 @@ impl CapturedSendWaitReceive {
         let header = AlpcSendReceiveCheckedRequest {
             send_receive: AlpcSendReceiveRequest {
                 abi_size: u16::try_from(base).map_err(|_| STATUS_INVALID_PARAMETER)?,
-                flags: self.flags,
+                flags: self.flags | if self.receive.as_ref().is_some_and(|target| target.attributes.is_some()) {
+                    nt_alpc_abi::send_flag::RECV_ATTRIBUTES
+                } else { 0 },
                 port_handle: self.port,
                 message_offset: if send.is_empty() { 0 } else { u32_len(base)? },
                 message_len_bytes: u32_len(send.len())?,
-                valid_attributes: self.send_attributes.as_ref().map_or(0, |a| a.valid),
+                valid_attributes: self.receive.as_ref()
+                    .and_then(|target| target.attributes.map(|(_, allocated)| allocated))
+                    .unwrap_or_else(|| self.send_attributes.as_ref().map_or(0, |a| a.valid)),
                 attr_offset: if attrs.is_empty() { 0 } else { u32_len(attr_offset)? },
                 attr_len_bytes: u32_len(attrs.len())?,
                 ..Default::default()
@@ -124,8 +135,23 @@ impl CapturedSendWaitReceive {
 
 impl CapturedConnectPort {
     pub fn checked_wire(&self, caller: NativeCaller, token: (u64, u64)) -> Result<Vec<u8>, u32> {
+        self.checked_wire_for(caller, token, None)
+    }
+
+    pub fn checked_wire_authorized(&self, caller: NativeCaller, token: (u64, u64),
+        target_listen_handle: u64) -> Result<Vec<u8>, u32> {
+        if target_listen_handle == 0 { return Err(STATUS_INVALID_PARAMETER); }
+        self.checked_wire_for(caller, token, Some(target_listen_handle))
+    }
+
+    fn checked_wire_for(&self, caller: NativeCaller, token: (u64, u64),
+        target_listen_handle: Option<u64>) -> Result<Vec<u8>, u32> {
         let invocation = invocation(caller, token)?;
-        let base = size_of::<AlpcConnectPortCheckedRequest>();
+        let base = if target_listen_handle.is_some() {
+            size_of::<AlpcConnectPortAuthorizedRequest>()
+        } else {
+            size_of::<AlpcConnectPortCheckedRequest>()
+        };
         let mut name = Vec::new();
         name.try_reserve_exact(self.name.len().checked_mul(2).ok_or(STATUS_INVALID_PARAMETER)?)
             .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
@@ -152,15 +178,21 @@ impl CapturedConnectPort {
             has_port_attributes: u32::from(port_attributes.is_some()),
             _reserved: 0,
         };
-        checked_bytes(&header, &[&name, message, attrs])
+        match target_listen_handle {
+            Some(target_listen_handle) => checked_bytes(&AlpcConnectPortAuthorizedRequest {
+                checked: header, target_listen_handle, access_granted: 1, _reserved: 0,
+            }, &[&name, message, attrs]),
+            None => checked_bytes(&header, &[&name, message, attrs]),
+        }
     }
 }
 
 impl CapturedAcceptConnect {
     pub fn checked_wire(&self, caller: NativeCaller, token: (u64, u64)) -> Result<Vec<u8>, u32> {
+        let base = size_of::<AlpcAcceptConnectCheckedRequest>();
         let header = AlpcAcceptConnectCheckedRequest {
             accept: AlpcAcceptConnectRequest {
-                abi_size: size_of::<AlpcAcceptConnectCheckedRequest>() as u16,
+                abi_size: base as u16,
                 accept: u16::from(self.accept),
                 connection_id: self.connection_id as u64,
                 port_context: self.port_context,
@@ -168,8 +200,10 @@ impl CapturedAcceptConnect {
             },
             invocation: invocation(caller, token)?,
             listen_port: self.listen_port,
+            message_offset: if self.message.is_empty() { 0 } else { u32_len(base)? },
+            message_len_bytes: u32_len(self.message.len())?,
         };
-        checked_bytes(&header, &[])
+        checked_bytes(&header, &[&self.message])
     }
 }
 
@@ -242,10 +276,17 @@ pub fn capture_send_wait_receive(
         if !probe_output(receive, capacity) || !probe_output(receive_size, 8) {
             return Err(STATUS_ACCESS_VIOLATION);
         }
-        // Receiving attributes requires a separate bounded native buffer size
-        // contract; never hand a bare pointer to the service.
-        if receive_attrs != 0 { return Err(STATUS_NOT_SUPPORTED); }
-        Some(ReceiveTarget { message: receive, capacity, size_pointer: receive_size, attributes: None })
+        let attributes = if receive_attrs == 0 { None } else {
+            let mut header = [0u8; 8];
+            if !read(receive_attrs, &mut header) { return Err(STATUS_ACCESS_VIOLATION); }
+            let allocated = u32::from_le_bytes(header[..4].try_into().unwrap());
+            let valid = u32::from_le_bytes(header[4..8].try_into().unwrap());
+            if valid & !allocated != 0 { return Err(STATUS_INVALID_PARAMETER); }
+            if allocated != CONTEXT_ATTR { return Err(STATUS_NOT_SUPPORTED); }
+            if !probe_output(receive_attrs, 8 + 32) { return Err(STATUS_ACCESS_VIOLATION); }
+            Some((receive_attrs, allocated))
+        };
+        Some(ReceiveTarget { message: receive, capacity, size_pointer: receive_size, attributes })
     };
     Ok(CapturedSendWaitReceive { port, flags: flags as u32, send_message, send_attributes,
         receive, timeout: copy_timeout(timeout, &mut read)? })
@@ -282,7 +323,7 @@ pub fn capture_connect_port(
         if !read(attributes, &mut copied) { return Err(STATUS_ACCESS_VIOLATION); }
         Some(copied)
     };
-    let message = if message_pointer == 0 { None } else {
+    let (message, message_target) = if message_pointer == 0 { (None, None) } else {
         let mut size = [0u8; 8];
         if !read(message_size, &mut size) { return Err(STATUS_ACCESS_VIOLATION); }
         let capacity = usize::try_from(u64::from_le_bytes(size)).map_err(|_| STATUS_INVALID_PARAMETER)?;
@@ -291,10 +332,10 @@ pub fn capture_connect_port(
         if !probe_output(message_pointer, capacity) || !probe_output(message_size, 8) {
             return Err(STATUS_ACCESS_VIOLATION);
         }
-        Some(copied)
+        (Some(copied), Some((message_pointer, capacity, message_size)))
     };
     let send_attributes = if send_attrs == 0 { None } else { Some(copy_attributes(send_attrs, &mut read)?) };
-    Ok(CapturedConnectPort { output, name, port_attributes, message, send_attributes,
+    Ok(CapturedConnectPort { output, name, port_attributes, message, message_target, send_attributes,
         timeout: copy_timeout(timeout, &mut read)? })
 }
 
@@ -317,7 +358,8 @@ pub fn capture_accept_connect(
     if connection_id == 0 || connection_id != expected_connection_id {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    Ok(CapturedAcceptConnect { output, listen_port, connection_id, port_context: context, accept: accept != 0 })
+    Ok(CapturedAcceptConnect { output, listen_port, connection_id, port_context: context,
+        accept: accept != 0, message: copied })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -365,6 +407,7 @@ pub struct RetainedLater {
     reply_cap: u64,
     request: Vec<u8>,
     phase: Phase,
+    reply_attempted: bool,
 }
 
 impl RetainedLater {
@@ -375,7 +418,8 @@ impl RetainedLater {
             || caller.badge == 0 || caller.tcb == 0 || token == (0, 0)
             || reply_cap == 0 || request.is_empty()
         { return Err(RetainedError::InvalidIdentity); }
-        Ok(Self { caller, token, reply_cap, request, phase: Phase::Prepared })
+        Ok(Self { caller, token, reply_cap, request, phase: Phase::Prepared,
+            reply_attempted: false })
     }
     pub fn caller(&self) -> NativeCaller { self.caller }
     pub fn token(&self) -> (u64, u64) { self.token }
@@ -407,10 +451,36 @@ impl RetainedLater {
         self.phase = Phase::Terminal { request_id, result };
         Ok(())
     }
+    /// An exact STATUS_PENDING CQE consumed this SQE but did not complete the
+    /// syscall. The checked service token keeps its send half reserved; the
+    /// executive may submit a fresh SQE solely to poll the same receive.
+    pub fn continue_pending(&mut self, request_id: u64, caller: NativeCaller)
+        -> Result<(), RetainedError>
+    {
+        if caller != self.caller { return Err(RetainedError::WrongCaller); }
+        match self.phase {
+            Phase::Submitted(id) if id == request_id => {
+                self.phase = Phase::Prepared;
+                Ok(())
+            }
+            Phase::Submitted(_) | Phase::Terminal { .. } => Err(RetainedError::WrongRequest),
+            Phase::Prepared => Err(RetainedError::WrongPhase),
+        }
+    }
     pub fn no_effect(&mut self, request_id: u64, caller: NativeCaller, status: i32)
         -> Result<(), RetainedError>
     {
+        if status >= 0 { return Err(RetainedError::WrongPhase); }
         self.complete(request_id, caller, TerminalLater::no_effect(status))
+    }
+    /// Mark the only permitted physical Reply attempt before entering IPC.
+    /// A false transport return does not establish that no delivery occurred.
+    pub fn begin_reply(&mut self) -> Result<(), RetainedError> {
+        if self.reply_attempted || self.terminal().is_none() {
+            return Err(RetainedError::WrongPhase);
+        }
+        self.reply_attempted = true;
+        Ok(())
     }
     pub fn finish_after_reply(self, acknowledged: bool) -> Result<(), Self> {
         if acknowledged && self.terminal().is_some() { Ok(()) } else { Err(self) }

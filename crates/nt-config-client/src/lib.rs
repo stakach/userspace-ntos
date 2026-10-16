@@ -97,7 +97,7 @@ use nt_config_abi::{
     hive_mutation_kind, hive_mutation_transfer, key_flags, launch_plan_kind, launch_plan_transfer,
     leased_hive_record_kind, network_plan_kind, opcode, pnp_query_kind, pnp_query_transfer,
     raw_value_query_transfer, raw_value_transfer, win32_service_plan_kind,
-    win32_service_process_kind, CmDeviceActionRequest, CmDevicePropertyRequest,
+    win32_service_process_kind, CmDeviceActionRequest, CmDevicePropertyRequest, CmDevpropSetRequest,
     CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveCheckpointHeader, CmHiveCheckpointRequest,
     CmHiveExportHeader, CmHiveImportRequest, CmHivePathRequest, CmHiveKeyRequest,
     CmHiveMutationRecord, CmHiveMutationRequest, CmKeyRequest, CmLaunchPlanRequest,
@@ -1787,6 +1787,41 @@ impl<B: Backend> ConfigClient<B> {
         } else {
             Err(reply.status)
         }
+    }
+
+    /// Publish a bounded typed DEVPROPKEY value for an existing CM devnode.
+    pub fn set_device_devprop(
+        &mut self,
+        instance: &str,
+        fmtid: [u8; 16],
+        pid: u32,
+        property_type: u32,
+        data: &[u8],
+    ) -> Result<(), i32> {
+        let instance_bytes = utf16_bytes(instance);
+        let header_size = core::mem::size_of::<CmDevpropSetRequest>();
+        if instance_bytes.is_empty() || instance_bytes.len() > CM_MAX_INSTANCE_UNITS * 2
+            || instance.chars().any(|ch| ch == '\0') || data.len() > 1024
+        { return Err(STATUS_INVALID_PARAMETER); }
+        let mut request = Vec::new();
+        request.try_reserve_exact(header_size + instance_bytes.len() + data.len())
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        let header = CmDevpropSetRequest {
+            abi_size: header_size as u16,
+            abi_version: CM_ABI_VERSION,
+            property_type,
+            fmtid,
+            pid,
+            instance_offset: header_size as u32,
+            instance_len_bytes: instance_bytes.len() as u32,
+            data_offset: (header_size + instance_bytes.len()) as u32,
+            data_len: data.len() as u32,
+        };
+        request.extend_from_slice(header.as_bytes());
+        request.extend_from_slice(&instance_bytes);
+        request.extend_from_slice(data);
+        let response = self.backend.call(opcode::CM_OP_SET_DEVICE_DEVPROP, &request, &mut []);
+        if response.status == STATUS_SUCCESS { Ok(()) } else { Err(response.status) }
     }
 
     /// Query a legacy device property by stable devnode instance path. Errors retain the exact

@@ -5166,6 +5166,9 @@ pub(crate) unsafe fn service_win32k_ps_request(
     {
         return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
     }
+    if native_thread_priority::is_priority_effect_op(op) {
+        return native_thread_priority::dispatch(handler, op, object, value);
+    }
     provider_ps::dispatch(
         &mut handler.pm,
         op,
@@ -5174,6 +5177,25 @@ pub(crate) unsafe fn service_win32k_ps_request(
         |pm, job| unsafe { crate::exec_handler::native_job_bodies::ensure(pm, job) },
         |pm, body| provider_ps_projection::grant(target, pm, body),
     )
+}
+
+/// Execute a hosted driver's checked thread-priority request against the same retained
+/// PM/native TCB owner as win32k. The caller was authenticated by the driver ingress service.
+pub(crate) unsafe fn service_hosted_driver_thread_priority(
+    thread: u64,
+    priority: i32,
+) -> (i32, u64) {
+    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    if handler.is_null() {
+        return (0xC000_00A3u32 as i32, 0);
+    }
+    let (status, previous, _, _) = native_thread_priority::dispatch(
+        &mut *handler,
+        win32k_subsystem::W32_PS_OP_SET_THREAD_PRIORITY,
+        thread,
+        priority as u32 as u64,
+    );
+    (status, previous)
 }
 
 /// Serialized memory-only ownership operation, across the bootstrap-to-live Ps store transfer.
@@ -6658,6 +6680,7 @@ unsafe fn spawn_requested_hosted_exe(
     let creator_pid = nt_handler
         .pm_pid_for_pi(request.creator_pi)
         .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let initial_priority = native_thread_priority::initial_priority(&nt_handler.pm, u64::from(child_tid))?;
     let child_spawn = spawn_hosted_sec_image_for_image(
         spec.image,
         nt_memory_manager::MemoryLifetime::Process(
@@ -6673,6 +6696,7 @@ unsafe fn spawn_requested_hosted_exe(
         0,
         child_pid as u64,
         child_tid as u64,
+        initial_priority,
     );
     procs[pi].pid = child_pid as u64;
     procs[pi].pml4 = child_spawn.pml4;
@@ -9161,6 +9185,10 @@ pub(crate) unsafe fn service_sec_image(
         crate::cm_snapshot_ownership::retry_cleanup(monotonic_time_100ns());
         {
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
+            crate::native_alpc_create_work::redrive(&mut nt_handler);
+            crate::native_alpc_close_work::redrive(&mut nt_handler);
+            crate::native_alpc_connect_accept_work::redrive(&mut nt_handler);
+            crate::native_alpc_send_receive_work::redrive(&mut nt_handler);
             crate::registry_mutation_work::redrive(&mut nt_handler, delay_queue);
             crate::section_metadata_work::redrive(&mut nt_handler, delay_queue);
             crate::section_pagein_work::redrive(&mut nt_handler);
@@ -9313,6 +9341,8 @@ pub(crate) unsafe fn service_sec_image(
                     Ordering::Relaxed,
                 );
                 census_tick_static(now);
+                if CENSUS_LAST_DUMP.load(Ordering::Relaxed) == now {
+                }
             }
             if ep != last_progress_epoch {
                 last_progress_epoch = ep;
@@ -12229,7 +12259,9 @@ pub(crate) unsafe fn service_sec_image(
             // dispatcher -> real handler; otherwise fall through to the broker match. The x64 native
             // ABI passes args in r10(=rcx),rdx,r8,r9 then the stack; here we forward the register
             // args (sized to the service's max) — pointer/stack args come with the copyin layer.
-            if let Some(entry) = nt_dispatcher.table().lookup(m0 as u32) {
+            let table_entry = nt_dispatcher.table().lookup(m0 as u32);
+            if let Some(route) = nt_syscall_abi::NativeIngressRoute::select(
+                m0, native_call_transport, table_entry.is_some()) {
                 let origin = SyscallOrigin::new(1, 1, ProcessorMode::UserMode);
                 // x64 native syscall args: arg1=R10 (the stub's `mov r10,rcx`; RCX itself is the
                 // syscall return address), arg2=RDX, arg3=R8, arg4=R9, then arg5+ on the caller's
@@ -12240,7 +12272,11 @@ pub(crate) unsafe fn service_sec_image(
                 argv[1] = m3; // RDX
                 argv[2] = get_recv_mr(7); // R8
                 argv[3] = get_recv_mr(8); // R9
-                let n = (entry.max_args as usize).min(argv.len());
+                let n = match route {
+                    nt_syscall_abi::NativeIngressRoute::Alpc(service) => service.argument_count(),
+                    nt_syscall_abi::NativeIngressRoute::Table => table_entry
+                        .expect("table route lost registered service").max_args as usize,
+                }.min(argv.len());
                 let mut stack_args_valid = true;
                 let retained_arguments = nt_handler.active_synchronous_file_retry.as_ref()
                     .and_then(|ingress| ingress.waiter().transfer_parameters)
@@ -12361,12 +12397,6 @@ pub(crate) unsafe fn service_sec_image(
                     panic!("previous syscall leaked an LPC request continuation reservation");
                 }
                 let _ = lpc_connect_completion_drain(&mut nt_handler);
-                // ALPC last-mile item (a): NtAlpc* SSNs are registered in the dispatcher via this
-                // recognizer. DORMANT — `ALPC_HOST_PRESENT` is never set at boot (no ALPC binary
-                // yet), and the Win7 ALPC SSNs collide with the live ReactOS SSN space, so it can
-                // never fire for the 3 live ReactOS processes → byte-identical boot. When active it
-                // routes a real ALPC process's NtAlpc* syscall to the unified port-service ALPC
-                // adapter (skipping the native ReactOS dispatch).
                 if !stack_args_valid {
                     if m0 as u32 == SSN_NT_QUERY_KEY as u32 {
                         let arguments = [argv[0], argv[1], argv[2], argv[3], argv[4]];
@@ -12379,9 +12409,176 @@ pub(crate) unsafe fn service_sec_image(
                     .is_some_and(|ingress| !ingress.matches_handle(argv[0]))
                 {
                     result = nt_fs::STATUS_INVALID_PARAMETER as u64;
-                } else if let Some(st) = try_route_alpc_ssn(m0, &[], &mut [0u8; 8]) {
-                    result = st;
+                } else if nt_syscall_abi::NativeAlpcService::from_call(m0, native_call_transport)
+                    == Some(nt_syscall_abi::NativeAlpcService::CreatePort)
+                {
                     handled = true;
+                    static ALPC_CREATE_INGRESS_TRACE: AtomicU64 = AtomicU64::new(0);
+                    if ALPC_CREATE_INGRESS_TRACE.fetch_add(1, Ordering::Relaxed) < 8 {
+                        print_str(b"[native-alpc-create-ingress] badge=");
+                        print_u64(badge);
+                        print_str(b" output=0x");
+                        print_hex_u64(argv[0]);
+                        print_str(b" object_attributes=0x");
+                        print_hex_u64(argv[1]);
+                        print_str(b" port_attributes=0x");
+                        print_hex_u64(argv[2]);
+                        print_str(b"\n");
+                    }
+                    match crate::native_alpc_create_work::begin(&mut nt_handler,
+                        [argv[0], argv[1], argv[2]]) {
+                        Err(status) => result = status as u64,
+                        Ok(()) => {
+                            thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
+                            {
+                                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                                crate::native_alpc_create_work::redrive(&mut nt_handler);
+                            }
+                            let _ = finalize_service_loop_state(&mut nt_handler);
+                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
+                    }
+                } else if nt_syscall_abi::NativeAlpcService::from_call(m0, native_call_transport)
+                    == Some(nt_syscall_abi::NativeAlpcService::ConnectPort)
+                {
+                    handled = true;
+                    match crate::native_alpc_connect_accept_work::begin_connect(&mut nt_handler,
+                        [argv[0], argv[1], argv[2], argv[3], argv[4], argv[5], argv[6],
+                            argv[7], argv[8], argv[9], argv[10]]) {
+                        Err(status) => result = status as u64,
+                        Ok(()) => {
+                            thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
+                            {
+                                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                                crate::native_alpc_connect_accept_work::redrive(&mut nt_handler);
+                            }
+                            let _ = finalize_service_loop_state(&mut nt_handler);
+                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
+                    }
+                } else if nt_syscall_abi::NativeAlpcService::from_call(m0, native_call_transport)
+                    == Some(nt_syscall_abi::NativeAlpcService::AcceptConnectPort)
+                {
+                    handled = true;
+                    match crate::native_alpc_connect_accept_work::begin_accept(&mut nt_handler,
+                        [argv[0], argv[1], argv[2], argv[3], argv[4], argv[5], argv[6],
+                            argv[7], argv[8]]) {
+                        Err(status) => result = status as u64,
+                        Ok(()) => {
+                            thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
+                            {
+                                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                                crate::native_alpc_connect_accept_work::redrive(&mut nt_handler);
+                            }
+                            let _ = finalize_service_loop_state(&mut nt_handler);
+                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
+                    }
+                } else if nt_syscall_abi::NativeAlpcService::from_call(m0, native_call_transport)
+                    == Some(nt_syscall_abi::NativeAlpcService::SendWaitReceivePort)
+                {
+                    handled = true;
+                    let ingress = crate::native_alpc_send_receive_work::begin(&mut nt_handler,
+                        [argv[0], argv[1], argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]]);
+                    static ALPC_SEND_INGRESS_TRACE: AtomicU64 = AtomicU64::new(0);
+                    let trace = ALPC_SEND_INGRESS_TRACE.fetch_add(1, Ordering::Relaxed);
+                    if trace < 16 {
+                        let mut return_bytes = [0u8; 8];
+                        let return_readable = nt_handler.xas_read(sp, &mut return_bytes);
+                        print_str(b"[native-alpc-send-ingress] #");
+                        print_u64(trace);
+                        print_str(b" badge=");
+                        print_u64(badge);
+                        print_str(b" port=0x");
+                        print_hex_u64(argv[0]);
+                        print_str(b" raw-mr2=0x");
+                        print_hex_u64(native_ingress_request
+                            .and_then(|request| request.word(2)).unwrap_or(0));
+                        print_str(b" caller=0x");
+                        print_hex_u64(if return_readable { u64::from_le_bytes(return_bytes) }
+                            else { 0 });
+                        print_str(b" flags=0x");
+                        print_hex_u64(argv[1]);
+                        print_str(b" send=0x");
+                        print_hex_u64(argv[2]);
+                        print_str(b" receive=0x");
+                        print_hex_u64(argv[4]);
+                        print_str(b" size=0x");
+                        print_hex_u64(argv[5]);
+                        print_str(b" timeout=0x");
+                        print_hex_u64(argv[7]);
+                        print_str(b" status=0x");
+                        print_hex_u64(ingress.as_ref().err().copied().unwrap_or(0x103) as u64);
+                        print_str(b"\n");
+                    }
+                    match ingress {
+                        Err(status) => result = status as u64,
+                        Ok(()) => {
+                            thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
+                            {
+                                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                                crate::native_alpc_send_receive_work::redrive(&mut nt_handler);
+                            }
+                            let _ = finalize_service_loop_state(&mut nt_handler);
+                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
+                    }
+                } else if native_call_transport && m0 as u32 == SSN_NT_CLOSE as u32
+                    && crate::native_alpc_close_work::recognizes(&nt_handler, argv[0])
+                {
+                    handled = true;
+                    match crate::native_alpc_close_work::begin(&mut nt_handler, argv[0]) {
+                        Err(status) => result = status as u64,
+                        Ok(()) => {
+                            thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
+                            {
+                                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                                crate::native_alpc_close_work::redrive(&mut nt_handler);
+                            }
+                            let _ = finalize_service_loop_state(&mut nt_handler);
+                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
+                    }
                 } else {
                     crate::probe_reset();
                     let dispatch_started = crate::disk_census_ticks();
@@ -23804,6 +24001,12 @@ unsafe fn spawn_requested_tp_worker(
     print_u64(badge);
     print_str(b" tid=");
     print_u64(tid);
+    if pi == 0 {
+        print_str(b" start_rcx=0x");
+        print_hex_u64(start.rcx);
+        print_str(b" start_rdx=0x");
+        print_hex_u64(start.rdx);
+    }
     print_str(b" tcb=0x");
     print_hex(tcb as u32);
     if let Some(kind) = role.rpc_worker_kind() {

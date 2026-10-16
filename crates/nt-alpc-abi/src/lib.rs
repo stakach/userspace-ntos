@@ -207,6 +207,15 @@ pub mod opcode {
     pub const ALPC_OP_LOOKUP_CREATE_PORT: u16 = 0x230e;
     /// Close only the result of an exact checked create after caller copyout failed.
     pub const ALPC_OP_CLOSE_CREATED_PORT: u16 = 0x230f;
+    /// Retire an exact terminal checked send/receive record after the native
+    /// executive has retained its output and before it replies to the caller.
+    pub const ALPC_OP_ACK_SEND_RECEIVE: u16 = 0x2310;
+    /// Exact cleanup of a checked Connect/Accept communication endpoint.
+    pub const ALPC_OP_CLOSE_LATER_PORT: u16 = 0x2311;
+    /// Retire a terminal checked Connect result after native publication/copyout.
+    pub const ALPC_OP_ACK_CONNECT_PORT: u16 = 0x2312;
+    /// Retire a terminal checked Accept result after native publication/copyout.
+    pub const ALPC_OP_ACK_ACCEPT_CONNECT: u16 = 0x2313;
 }
 
 /// `AlpcSendReceiveRequest.flags` bits.
@@ -261,6 +270,16 @@ pub struct AlpcCreatePortCheckedRequest {
 pub struct AlpcCreatePortOwnedRequest {
     pub checked: AlpcCreatePortCheckedRequest,
     pub attributes: AlpcPortAttributes,
+}
+
+/// Checked native create with an owned self-relative security descriptor.
+/// The descriptor follows the UTF-16 name in the same exact invocation bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AlpcCreatePortSecuredRequest {
+    pub owned: AlpcCreatePortOwnedRequest,
+    pub security_offset: u32,
+    pub security_len_bytes: u32,
 }
 
 /// Read the result of a prior checked create. Absence is inconclusive if a ring
@@ -370,6 +389,17 @@ pub struct AlpcConnectPortCheckedRequest {
     pub _reserved: u32,
 }
 
+/// Executive-authorized checked connect. The grant is valid only for the
+/// specified live listen handle, not for a name that may be replaced.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AlpcConnectPortAuthorizedRequest {
+    pub checked: AlpcConnectPortCheckedRequest,
+    pub target_listen_handle: u64,
+    pub access_granted: u32,
+    pub _reserved: u32,
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct AlpcAcceptConnectCheckedRequest {
@@ -377,12 +407,24 @@ pub struct AlpcAcceptConnectCheckedRequest {
     pub invocation: AlpcCheckedInvocation,
     /// Native listen-port handle; the service must bind it to `connection_id`.
     pub listen_port: u64,
+    /// Optional copied native PORT_MESSAGE carrying server connection info.
+    pub message_offset: u32,
+    pub message_len_bytes: u32,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct AlpcSendReceiveCheckedRequest {
     pub send_receive: AlpcSendReceiveRequest,
+    pub invocation: AlpcCheckedInvocation,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AlpcAcknowledgeSendReceiveRequest {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub _reserved2: u32,
     pub invocation: AlpcCheckedInvocation,
 }
 
@@ -475,6 +517,7 @@ const _: () = {
     assert!(size_of::<AlpcCreatePortRequest>() == 24);
     assert!(size_of::<AlpcCreatePortCheckedRequest>() == 64);
     assert!(size_of::<AlpcCreatePortOwnedRequest>() == 136);
+    assert!(size_of::<AlpcCreatePortSecuredRequest>() == 144);
     assert!(size_of::<AlpcLookupCreatePortRequest>() == 48);
     assert!(size_of::<AlpcCloseCreatedPortRequest>() == 56);
     assert!(size_of::<AlpcConnectPortRequest>() == 40);
@@ -482,7 +525,8 @@ const _: () = {
     assert!(size_of::<AlpcSendReceiveRequest>() == 40);
     assert!(size_of::<AlpcCheckedInvocation>() == 40);
     assert!(size_of::<AlpcConnectPortCheckedRequest>() == 160);
-    assert!(size_of::<AlpcAcceptConnectCheckedRequest>() == 72);
+    assert!(size_of::<AlpcConnectPortAuthorizedRequest>() == 176);
+    assert!(size_of::<AlpcAcceptConnectCheckedRequest>() == 80);
     assert!(size_of::<AlpcSendReceiveCheckedRequest>() == 80);
     assert!(size_of::<AlpcCreatePortSectionRequest>() == 32);
     assert!(size_of::<AlpcCreateSectionViewRequest>() == 32);

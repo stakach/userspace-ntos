@@ -1372,6 +1372,39 @@ impl HostedIrqRootSession {
         result
     }
 
+    unsafe fn remove_dpc_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let Ok(lane) = self.lane(lane_index) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        if command.target_domain_id != lane.identity.domain_id
+            || command.target_domain_cookie != lane.identity.domain_cookie
+            || command.argument_count != 0
+        {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let root_dpc_grant = self
+            .dpc_grant
+            .is_some_and(|(identity, grant)| identity == lane.identity && grant == command.grant);
+        if !root_dpc_grant && !lane_has_service_grant(lane, command.grant) {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let Some(owner) = HostedDpcOwner::new(
+            lane.identity.domain_id,
+            lane.identity.domain_cookie,
+            lane.identity.lane_generation,
+        ) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        match remove_hosted_driver_dpc(lane.projection_instance, Some(owner), command.service_id) {
+            Ok(removed) => service_result(STATUS_SUCCESS, Some(removed as u64)),
+            Err(status) => fatal_service_result(status.raw()),
+        }
+    }
+
     unsafe fn mdl_service(
         &mut self,
         lane_index: usize,
@@ -1502,6 +1535,9 @@ impl HostedIrqRootSession {
             }
             nt_hosted_runtime::HostedIrqServiceKind::QueueDpc => {
                 self.queue_dpc_service(lane_index, command)
+            }
+            nt_hosted_runtime::HostedIrqServiceKind::RemoveDpc => {
+                self.remove_dpc_service(lane_index, command)
             }
             nt_hosted_runtime::HostedIrqServiceKind::Mdl => self.mdl_service(lane_index, command),
             nt_hosted_runtime::HostedIrqServiceKind::TimerCancel

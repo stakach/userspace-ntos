@@ -2,8 +2,8 @@
 
 use nt_unwind::exception_walk::{ExceptionFunction, ExceptionImageError, ExceptionImageReader};
 use nt_unwind::{
-    walk_captured_kernel_frame_chain, CapturedKernelCallSite, Context, ImageReader,
-    RuntimeFunction, StackReader,
+    walk_captured_kernel_frame_chain, walk_captured_kernel_frame_chain_with_stop,
+    CapturedKernelCallSite, Context, FrameChainStop, ImageReader, RuntimeFunction, StackReader,
 };
 
 const IMAGE: u64 = 0x0000_0100_0680_0000;
@@ -114,4 +114,42 @@ fn mismatched_or_retired_ingress_cannot_authorize_a_frame_walk() {
         )
         .is_err());
     }
+}
+
+#[test]
+fn continuation_requires_a_proven_stack_boundary_not_an_unknown_kernel_pc() {
+    let foreign = LaneStack { live: true };
+    let captured = CapturedKernelCallSite::from_entry(
+        captured_context(PROVIDER_PC, 0x2000), ENTRY_RSP, STACK_LOW, STACK_HIGH,
+        &AdmittedImage, &foreign,
+    ).unwrap();
+    let mut callers = [0u64; 4];
+    let stopped = walk_captured_kernel_frame_chain_with_stop(
+        captured, &mut callers, 0, &AdmittedImage, &foreign,
+    ).unwrap();
+    assert_eq!(stopped.count, 2);
+    assert_eq!(stopped.stop, FrameChainStop::UnknownImage);
+    assert!(!stopped.stop.authorizes_attached_user());
+
+    struct BoundaryStack;
+    impl StackReader for BoundaryStack {
+        fn read_u64(&self, address: u64) -> Option<u64> {
+            match address {
+                0x2ff0 => Some(PROVIDER_PC),
+                0x2ff8 => Some(IMAGE + 0x3010),
+                _ => None,
+            }
+        }
+    }
+    let boundary = BoundaryStack;
+    let captured = CapturedKernelCallSite::from_entry(
+        captured_context(PROVIDER_PC, 0x2ff8), 0x2ff0, STACK_LOW, STACK_HIGH,
+        &AdmittedImage, &boundary,
+    ).unwrap();
+    let stopped = walk_captured_kernel_frame_chain_with_stop(
+        captured, &mut callers, 0, &AdmittedImage, &boundary,
+    ).unwrap();
+    assert_eq!(stopped.count, 0);
+    assert_eq!(stopped.stop, FrameChainStop::StackBoundary);
+    assert!(stopped.stop.authorizes_attached_user());
 }

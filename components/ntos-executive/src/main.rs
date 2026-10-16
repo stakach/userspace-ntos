@@ -32,6 +32,11 @@ mod component_heap;
 mod debug_traps;
 mod alpc_selftest;
 mod native_alpc_create;
+mod native_alpc_create_work;
+mod native_alpc_close_work;
+mod native_alpc_port_security;
+mod native_alpc_connect_accept_work;
+mod native_alpc_send_receive_work;
 mod kuser_active_console;
 mod termination_port_notifications;
 use termination_port_notifications::notify_thread_termination_ports;
@@ -71,11 +76,16 @@ mod hosted_stack_growth;
 mod local_section_file;
 mod native_image_source_io;
 mod storage_host;
+mod boot_probe_thread_retirement;
 mod bootstrap_image;
 mod system_modules;
 mod video_device;
 mod win32k_pe;
+mod ex_rundown_exports;
+mod win32k_frame_capture;
 mod win32k_seh_image;
+mod win32k_cr8_publication;
+mod hosted_win32k_cr8_fault;
 mod win32k_session_runtime;
 mod win32k_subsystem;
 pub(crate) use service_sec_image::*;
@@ -140,6 +150,7 @@ mod provider_dispatcher_backend;
 mod provider_file_wait;
 mod ps_object_retirement;
 mod provider_ps;
+mod native_thread_priority;
 mod provider_ps_projection;
 mod sec_image_diagnostic;
 mod fault_stack_diagnostics;
@@ -177,6 +188,7 @@ mod win32k_glue;
 pub(crate) use win32k_glue::*;
 pub(crate) use win32k_session_runtime::*;
 mod driver_launch;
+mod hosted_driver_assertion;
 pub(crate) use driver_launch::*;
 
 use core::panic::PanicInfo;
@@ -15123,6 +15135,25 @@ pub(crate) unsafe fn object_manager_lookup_path(path: &str) -> Result<u64, nt_st
     client.lookup(path, true).map(|id| id.0)
 }
 
+pub(crate) unsafe fn object_manager_create_session_namespace(
+    session_id: u32,
+) -> Result<nt_object_client::SessionNamespace, nt_status::NtStatus> {
+    let client = OBJECT_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    client.create_session_namespace(session_id)
+}
+
+pub(crate) unsafe fn object_manager_retire_session_namespace_exact(
+    session_id: u32,
+    owned: nt_object_client::SessionNamespace,
+) -> Result<(), nt_status::NtStatus> {
+    let client = OBJECT_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    client.retire_session_namespace_exact(session_id, owned)
+}
+
 pub(crate) unsafe fn object_manager_create_symbolic_link_path(
     link: &str,
     target: &str,
@@ -15141,6 +15172,21 @@ pub(crate) unsafe fn object_manager_create_symbolic_link_path_with_permanence(
     client
         .create_symbolic_link(link, target, permanent)
         .map(|id| id.0)
+}
+
+pub(crate) unsafe fn object_manager_create_or_open_symbolic_link_path(
+    link: &str,
+    target: &str,
+    permanent: bool,
+    open_if: bool,
+    case_insensitive: bool,
+) -> Result<(u64, bool), nt_status::NtStatus> {
+    let client = OBJECT_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    client
+        .create_or_open_symbolic_link(link, target, permanent, open_if, case_insensitive)
+        .map(|(id, existing)| (id.0, existing))
 }
 
 pub(crate) unsafe fn object_manager_delete_symbolic_link_path(
@@ -15381,6 +15427,17 @@ pub(crate) unsafe fn config_manager_query_device_property(
             required_len: 0,
         })?;
     client.query_device_property(instance, property, out)
+}
+
+pub(crate) unsafe fn config_manager_set_device_devprop(
+    instance: &str,
+    fmtid: [u8; 16],
+    pid: u32,
+    property_type: u32,
+    data: &[u8],
+) -> Result<(), i32> {
+    let client = CONFIG_CLIENT_PTR.as_mut().ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    client.set_device_devprop(instance, fmtid, pid, property_type, data)
 }
 
 pub(crate) unsafe fn config_manager_query_active_driver_service_by_registry_path(
@@ -16979,6 +17036,7 @@ unsafe fn delay_timer_drain_due_work(
         + timer_retry_wake_due(now_100ns)
         + service_sec_image::component_resume::wake_due(&handler.pm, now_100ns)
         + driver_launch::hosted_dpc_wake_due(now_100ns)
+        + driver_launch::hosted_driver_pnp_notification_wake_due()
         + watchdog_tick
 }
 
@@ -23267,6 +23325,9 @@ struct ExecNtHandler {
     /// resolve TID -> TCB; the old TCB atomics are synchronized mirrors for global glue that has not
     /// been threaded through `ExecNtHandler` yet.
     thread_runtime: HostedThreadRuntimes,
+    /// Native TCB priority effects and their PM plan remain owned until exact acknowledgment.
+    priority_transition_owner: Option<native_thread_priority::NativePriorityOwner>,
+    native_alpc_secured_ports: native_alpc_port_security::SecuredPortRegistry,
     desktop_observations: DesktopObservations,
     /// Session-scoped win32k state observed from provider-owned objects and reused only through
     /// explicit session/runtime lookup.
@@ -24700,68 +24761,6 @@ struct LpcStaticSecurityContext {
     level: nt_security::SecurityImpersonationLevel,
 }
 
-// ===================== ALPC last-mile item (a): register the NtAlpc* SSNs =========================
-// SSNs EXTRACTED (not hardcoded — the rootserver-constant-drift trap) from references/ntdll.dll (a
-// real Windows x64 ntdll, the Win7-pivot target; ReactOS ros-ntdll.dll, which the LIVE smss/csrss/
-// winlogon run, exports NO NtAlpc* at all — ALPC is Vista+ and ReactOS has only kernel-less stubs).
-//   NtAlpcAcceptConnectPort=111 NtAlpcConnectPort=113 NtAlpcCreatePort=114 NtAlpcCreatePortSection=115
-//   NtAlpcCreateSectionView=117 NtAlpcDisconnectPort=123 NtAlpcSendWaitReceivePort=130
-// ★ CONSTANT-DRIFT / COLLISION FINDING (load-bearing): the Win7 ALPC SSN block (111..131) OVERLAPS
-// the live ReactOS SSN space — e.g. Win7 NtAlpcConnectPort=113 == the live ReactOS NtMapViewOfSection
-// =113 (registered in build_nt_table). So the ALPC route MUST NOT be merged into build_nt_table nor
-// fired on a raw m0 for the 3 live ReactOS processes (that would HIJACK live NtMapViewOfSection etc.).
-// It is a DEDICATED recognizer, gated by ALPC-PROCESS IDENTITY (`ALPC_HOST_PRESENT`, never set at
-// boot — no ALPC binary yet), so it is DORMANT (byte-identical boot) yet genuinely wired into the
-// fault dispatcher. The recognizer + the SSN→adapter routing are proven by counted specs
-// (exec_alpc_ssn_registered / exec_alpc_ssn_routes_to_adapter); a live hosted caller arrives with a
-// real ALPC binary running the Win7 ntdll (whose ntdll then defines the authoritative SSNs).
-pub const SSN_NT_ALPC_ACCEPT_CONNECT_PORT: u64 = 111;
-pub const SSN_NT_ALPC_CONNECT_PORT: u64 = 113;
-pub const SSN_NT_ALPC_CREATE_PORT: u64 = 114;
-pub const SSN_NT_ALPC_CREATE_PORT_SECTION: u64 = 115;
-pub const SSN_NT_ALPC_CREATE_SECTION_VIEW: u64 = 117;
-pub const SSN_NT_ALPC_DISCONNECT_PORT: u64 = 123;
-pub const SSN_NT_ALPC_SEND_WAIT_RECEIVE_PORT: u64 = 130;
-
-/// Set true ONLY when a real ALPC binary (running the Win7 ntdll) is hosted. Never set at boot, so
-/// `try_route_alpc_ssn` is dormant — the Win7 ALPC SSNs can never hijack the live ReactOS SSN space.
-static ALPC_HOST_PRESENT: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Recognizer: map a Win7 `NtAlpc*` SSN to its unified port-service ALPC wire opcode (0x2300 block).
-/// This IS the registration of the NtAlpc* SSNs in the executive's dispatch logic.
-pub fn alpc_ssn_to_opcode(ssn: u64) -> Option<u16> {
-    use nt_alpc_abi::opcode as aop;
-    Some(match ssn {
-        SSN_NT_ALPC_CREATE_PORT => aop::ALPC_OP_CREATE_PORT,
-        SSN_NT_ALPC_CONNECT_PORT => aop::ALPC_OP_CONNECT_PORT,
-        SSN_NT_ALPC_ACCEPT_CONNECT_PORT => aop::ALPC_OP_ACCEPT_CONNECT,
-        SSN_NT_ALPC_SEND_WAIT_RECEIVE_PORT => aop::ALPC_OP_SEND_RECEIVE,
-        SSN_NT_ALPC_DISCONNECT_PORT => aop::ALPC_OP_DISCONNECT_PORT,
-        SSN_NT_ALPC_CREATE_PORT_SECTION => aop::ALPC_OP_CREATE_PORT_SECTION,
-        SSN_NT_ALPC_CREATE_SECTION_VIEW => aop::ALPC_OP_CREATE_SECTION_VIEW,
-        _ => return None,
-    })
-}
-
-/// Fault-dispatcher hook: if a hosted ALPC process (running the Win7 ntdll) issued an `NtAlpc*`
-/// syscall, translate its SSN → the ALPC adapter opcode and route it to the unified port service
-/// over the shared ring (`LPC_CLIENT`), returning the NTSTATUS. DORMANT unless `ALPC_HOST_PRESENT`
-/// (never set at boot) — so it can NEVER fire for the 3 live ReactOS processes whose SSN space
-/// collides with the Win7 ALPC SSNs. The per-binary marshalling of the native ALPC arg blocks
-/// (PORT_MESSAGE + ALPC_MESSAGE_ATTRIBUTES from the fault register/stack image) is the shim that
-/// lands with a real ALPC binary; the recognizer + adapter routing here are proven by counted specs.
-unsafe fn try_route_alpc_ssn(ssn: u64, req: &[u8], out: &mut [u8]) -> Option<u64> {
-    if !ALPC_HOST_PRESENT.load(Ordering::Relaxed) {
-        return None;
-    }
-    let op = alpc_ssn_to_opcode(ssn)?;
-    #[allow(static_mut_refs)]
-    let lpc = LPC_CLIENT.as_mut()?;
-    let (status, _f, _i, _d0, _d1) = lpc.backend_mut().0.raw(op, req, out);
-    Some(status as u64)
-}
-
 /// Build the service table mapping smss's ntdll SSNs -> NativeService, for ONLY the services the
 /// real handler implements. `table.lookup(ssn).is_some()` is the routing switch: present -> real
 /// dispatcher, absent -> broker fallback. Grows as each syscall family is implemented for real.
@@ -25489,17 +25488,27 @@ unsafe fn spawn_user_thread(
 
 /// Create a NEW thread in an EXISTING VSpace `pml4` (NtCreateThreadEx): a fresh stack + IPC
 /// buffer + CNode (fault ep) at bumped user vaddrs, starting at `entry`. The thread shares the
-/// caller's address space (so it sees the caller's mappings). Returns the TCB cap.
-unsafe fn spawn_thread_in(pml4: u64, entry: u64) -> u64 {
-    let Some(stack_base) = user_alloc_bump(0x4000) else {
-        return 0;
-    };
+/// caller's address space (so it sees the caller's mappings). This boot proof retains every
+/// private cap until its exact TCB is suspended and retired.
+struct SyntheticSecondSpawn {
+    tcb: u64,
+    cnode: u64,
+    raw_cnode: u64,
+    sched_context: u64,
+    ipc_buffer: u64,
+    fault_endpoint: u64,
+    stack_frames: [u64; 4],
+}
+
+unsafe fn spawn_thread_in(pml4: u64, entry: u64) -> SyntheticSecondSpawn {
+    let stack_base = user_alloc_bump(0x4000).expect("synthetic second stack VA unavailable");
+    let mut stack_frames = [0u64; 4];
     for i in 0..4u64 {
-        let _ = page_map(alloc_frame(), stack_base + i * 0x1000, RW_NX, pml4);
+        let frame = alloc_frame();
+        stack_frames[i as usize] = frame;
+        let _ = page_map(frame, stack_base + i * 0x1000, RW_NX, pml4);
     }
-    let Some(ipcbuf_va) = user_alloc_bump(0x1000) else {
-        return 0;
-    };
+    let ipcbuf_va = user_alloc_bump(0x1000).expect("synthetic second IPC VA unavailable");
     let ipcbuf = alloc_frame();
     let _ = page_map(ipcbuf, ipcbuf_va, RW_NX, pml4);
     let fault_ep = make_object(OBJ_ENDPOINT);
@@ -25520,7 +25529,7 @@ unsafe fn spawn_thread_in(pml4: u64, entry: u64) -> u64 {
         cnode,
         LBL_CNODE_COPY << 12,
         CT_FAULT,
-        copy_cap(fault_ep),
+        fault_ep,
         0,
     );
     let tcb = alloc_slot();
@@ -25536,16 +25545,13 @@ unsafe fn spawn_thread_in(pml4: u64, entry: u64) -> u64 {
     );
     let _ = tcb_write_registers(tcb, entry, stack_base + 0x4000 - 16, 0);
     let _ = tcb_set_priority(tcb, 100);
-    if let Err(e_sc) = attach_sched_context(tcb) {
-        print_str(b"[thread-life] legacy SC attach failed tcb=0x");
-        print_hex(tcb as u32);
-        print_str(b" error=");
-        print_u64(e_sc);
-        print_str(b"\n");
-        park();
+    let sched_context = attach_sched_context(tcb)
+        .expect("synthetic second SC attach failed");
+    assert_eq!(tcb_resume_r(tcb), 0, "synthetic second TCB resume failed");
+    SyntheticSecondSpawn {
+        tcb, cnode, raw_cnode: raw, sched_context, ipc_buffer: ipcbuf,
+        fault_endpoint: fault_ep, stack_frames,
     }
-    let _ = tcb_resume(tcb);
-    tcb
 }
 
 /// Parameters describing a hosted second thread for [`spawn_hosted_thread`]. All VAs in the
@@ -25560,14 +25566,6 @@ struct HostedUserThreadContext<'a> {
     initial_teb: nt_thread_start::InitialTeb64,
     stack_origin: ThreadStackOrigin,
 }
-
-/// Initial seL4 priority for every hosted Windows user thread.
-///
-/// NT priority changes belong to the thread scheduler interface, not to spawn-site boot ordering.
-/// Keeping process mains, RPC listeners, and thread-pool workers in the same initial class also
-/// preserves round-robin progress when a busy GUI/RPC worker repeatedly blocks and wakes on the
-/// executive endpoint.
-const HOSTED_USER_THREAD_PRIORITY: u8 = 100;
 
 struct HostedThread<'a> {
     /// The target process's VSpace (PML4) cap — the thread runs here, sharing the main thread's
@@ -25603,9 +25601,6 @@ struct HostedThread<'a> {
     /// The `ClientId` written into the TEB (`0,0` leaves the TEB's zero-fill).
     cid_proc: u64,
     cid_thread: u64,
-    /// Initial scheduling priority. Hosted Windows threads begin in the same base class; real NT
-    /// priority changes are applied through the scheduler API after creation.
-    prio: u8,
     /// NATIVE seL4-Call transport (ntdll_plan Step 6.A / BATCH 6). When set, this thread runs on
     /// OUR ntdll's native transport: its explicit `Call(CT_FAULT, label=0x4E54)` dispatches natively
     /// with MR0=SSN even though the thread also has rust-micro's hosted-syscalls flag. Raw ReactOS DLL
@@ -25706,6 +25701,15 @@ unsafe fn spawn_hosted_thread(
     ) else {
         return Err(HostedThreadSpawnFailure::Unstarted);
     };
+    if binding.process.pid != u32::try_from(t.cid_proc).unwrap_or(0)
+        || handler.capture_process_identity(binding.pi) != Some(binding.process)
+    {
+        return Err(HostedThreadSpawnFailure::Unstarted);
+    }
+    let initial_priority = match native_thread_priority::initial_priority(&handler.pm, t.cid_thread) {
+        Ok(priority) => priority,
+        Err(_) => return Err(HostedThreadSpawnFailure::Unstarted),
+    };
     if !hosted_thread_client_frame_keys_available(t, layout) {
         return Err(HostedThreadSpawnFailure::Unstarted);
     }
@@ -25716,7 +25720,7 @@ unsafe fn spawn_hosted_thread(
         Ok(prepared) => prepared,
         Err(_) => return Err(HostedThreadSpawnFailure::Unstarted),
     };
-    let mut spawned = spawn_hosted_thread_mechanism(t, resources, binding)?;
+    let mut spawned = spawn_hosted_thread_mechanism(t, resources, binding, initial_priority)?;
     spawned.attach_commitment(prepared);
     Ok(spawned)
 }
@@ -25725,6 +25729,7 @@ unsafe fn spawn_hosted_thread_mechanism(
     t: &HostedThread,
     mut resources: HostedThreadResources,
     binding: nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
+    initial_priority: u8,
 ) -> HostedThreadSpawnResult {
     use nt_user_host::thread_construction::{MemoryConstructionProgress, Role, ThreadConstructionInventory};
     let mut construction = ThreadConstructionInventory::empty();
@@ -26157,14 +26162,7 @@ unsafe fn spawn_hosted_thread_mechanism(
     if e_gs != 0 {
         return failed!(b"tcb-set-gs", ThreadConstructionError::Native(e_gs), t.teb_va);
     }
-    let e_priority = tcb_set_priority_r(
-        tcb,
-        if t.prio != 0 {
-            t.prio as u64
-        } else {
-            HOSTED_USER_THREAD_PRIORITY as u64
-        },
-    );
+    let e_priority = tcb_set_priority_r(tcb, u64::from(initial_priority));
     if e_priority != 0 { return failed!(b"tcb-set-priority", ThreadConstructionError::Native(e_priority), tcb); }
     if t.diag {
         print_str(b"[spawn-diag] tcb=0x");
@@ -26850,6 +26848,8 @@ static FB_WIDTH: AtomicU64 = AtomicU64::new(0);
 static FB_HEIGHT: AtomicU64 = AtomicU64::new(0);
 static FB_SCANLINE: AtomicU64 = AtomicU64::new(0);
 static FB_SIZE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Validated Simpleboot RGB mask layout of the captured boot scanout.
+static FB_TYPE: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Latest validated `IOCTL_VIDEO_QUERY_CURRENT_MODE` reply. The zero size denotes that the display
 /// stack has not published a current mode yet, in which case the boot GOP geometry remains active.
 static ACTIVE_FB_WIDTH: AtomicU64 = AtomicU64::new(0);
@@ -26938,14 +26938,15 @@ fn active_framebuffer_geometry() -> Option<(u64, u64, u64, u64)> {
 /// Run the native-syscall service loop for the isolated user thread, routing each
 /// Ob syscall to the isolated Object Manager service via `client`, backing
 /// NtAllocateVirtualMemory with real frames mapped into `user_pml4`, and demand-paging
-/// file-backed section views (backed by `file_frame`) on VMFault. Returns `(serviced, verdict)`.
+/// file-backed section views (backed by `file_frame`) on VMFault. Returns the exact synthetic
+/// second thread owner with its verdict so the caller can retire it after checking the marker.
 unsafe fn service_user_syscalls<B, CB>(
     user_fault_ep: u64,
     client: &mut ObjectClient<B>,
     cm: &mut ConfigClient<CB>,
     user_pml4: u64,
     file_frame: u64,
-) -> (u64, u64)
+) -> (u64, u64, Option<SyntheticSecondSpawn>)
 where
     B: nt_object_client::Backend,
     CB: nt_config_client::Backend,
@@ -26989,6 +26990,7 @@ where
     let mut view_count = 0usize;
     let mut serviced = 0u64;
     let mut verdict = 0u64;
+    let mut second_spawn = None;
     let (_z, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(user_fault_ep);
     loop {
         // A VMFault (page fault, label 6) from the user thread: demand-page the faulting page
@@ -27133,8 +27135,10 @@ where
                 // Create a new thread in the CALLER's VSpace at start routine `arg1` (the way
                 // RtlCreateUserProcess/smss launch a process's main thread). Returns a handle.
                 NativeService::NtCreateThreadEx => {
-                    let _tcb = spawn_thread_in(user_pml4, arg1);
-                    1 // handle
+                    if second_spawn.is_some() { 0 } else {
+                        second_spawn = Some(spawn_thread_in(user_pml4, arg1));
+                        1 // this synthetic handle is never exported
+                    }
                 }
                 _ => 0,
             }
@@ -27206,7 +27210,7 @@ where
         m2 = nm2;
         m3 = nm3;
     }
-    (serviced, verdict)
+    (serviced, verdict, second_spawn)
 }
 
 /// Service the blocking-wait demo: two threads (waiter + signaler) fault here, dispatched by
@@ -28274,7 +28278,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_str(b"\n");
     }
     let user_pml4 = spawn_user_thread(user_entry, user_fault_ep_c, copy_cap(sysarg), 100, 0);
-    let (serviced, verdict) =
+    let (serviced, verdict, second_spawn) =
         service_user_syscalls(user_fault_ep, &mut *c, &mut *cm, user_pml4, ff);
     check(
         b"exec_syscall_frontend_serviced",
@@ -28417,6 +28421,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_str(b"\n");
     check(b"exec_nt_create_thread", th != 0, &mut passed);
     check(b"exec_nt_second_thread_ran", t2 == 0x7EAD2, &mut passed);
+    boot_probe_thread_retirement::retire_synthetic_second(
+        second_spawn.expect("synthetic second thread was not created"),
+    );
 
     // --- P3 demand paging: the user thread mapped a file-backed section view (VA reserved, page
     // NOT mapped) and read it; the read #PF'd, the executive faulted the page in from the
@@ -28534,7 +28541,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let pe_fault_c = copy_cap(pe_fault);
             let pe_sysarg = alloc_frame();
             let pe_pml4 = spawn_pe_thread(&mapped, pe_fault_c, pe_sysarg);
-            let (srv, verdict) = service_user_syscalls(pe_fault, &mut *c, &mut *cm, pe_pml4, 0);
+            let (srv, verdict, _) = service_user_syscalls(pe_fault, &mut *c, &mut *cm, pe_pml4, 0);
             pe_serviced = srv;
             pe_verdict = verdict;
         }
@@ -28633,6 +28640,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             0,
             0,
             0,
+            100, // isolated SEC_IMAGE diagnostic has no canonical PM thread
         );
         if ensure_executive_paging(BOOT_SEC_IMAGE_SCRATCH_BASE) {
             let (v, f) = sec_image_diagnostic::run(
@@ -28810,6 +28818,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     FB_HEIGHT.store(fb_h, Ordering::Relaxed);
                     FB_SCANLINE.store(fb_scan, Ordering::Relaxed);
                     FB_SIZE_BYTES.store(fb_size, Ordering::Relaxed);
+                    FB_TYPE.store(fb_type as u64, Ordering::Relaxed);
                     FB_BAR_FRAME_COUNT.store(run.pages, Ordering::Release);
                 }
             }
@@ -29309,7 +29318,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 ISR_DONE_BADGE,
             );
             let sfault = make_object(OBJ_ENDPOINT);
-            spawn_storage_host(
+            let storage_component = spawn_storage_host(
                 storage_host::storage_host_entry,
                 sresult_badged,
                 sfault,
@@ -29327,7 +29336,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 win32kbuf_start,
                 winlogonbuf_start,
             );
-            let _ = sfault;
             let (_z, _b, _s, _m) = ep_recv(sresult);
             let verdict = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 8) as *const u32);
             // Capture the NLS table sizes the host reported.
@@ -29407,8 +29415,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 (verdict & 0x200) != 0,
                 &mut passed,
             );
+            boot_probe_thread_retirement::retire_storage_host(
+                storage_component, sresult_badged, sresult, sfault,
+            );
 
-            // --- P7-A: EXECUTIVE-SIDE FS-BY-PATH — the storage host has now PARKED, so the executive
+            // --- P7-A: EXECUTIVE-SIDE FS-BY-PATH — the one-shot storage host has retired, so the executive
             // drives the same (idle) AHCI HBA itself to resolve ANY \reactos path on demand. It
             // already owns the AHCI BAR (mapped at AHCI_VADDR) + the DMA frame cap + the VT-d IO
             // mapping (AHCI_IOVA); it only needs a CPU-side mapping of that DMA frame. Map it at
@@ -29608,7 +29619,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let ld_sysarg = alloc_frame();
             let faults_before = DEMAND_FAULTS.load(Ordering::Relaxed);
             let ld_pml4 = spawn_user_thread(loader_entry, ld_fault_c, copy_cap(ld_sysarg), 100, 0);
-            let (_srv, verdict) = service_user_syscalls(ld_fault, &mut *c, &mut *cm, ld_pml4, ldff);
+            let (_srv, verdict, _) = service_user_syscalls(ld_fault, &mut *c, &mut *cm, ld_pml4, ldff);
             ld_magic = verdict;
             ld_faults = DEMAND_FAULTS.load(Ordering::Relaxed) - faults_before;
         }
@@ -31776,10 +31787,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_u64(provider_sharing.singleton_conflicts);
         print_str(b"\n");
     }
-    // --- P3 ReactOS-binary pipeline: the storage host read a REAL, redistributable (GPL)
-    // ReactOS x64 smss.exe off the disk into the file buffer. Parse it through the REAL
-    // PE-load path (nt-pe-loader) and validate our SEC_IMAGE page-fill against it — a genuine
-    // Windows-family binary flowing through the machinery we built.
+    // The storage host read the installed SMSS image into the file buffer. Validate its PE
+    // shape and SEC_IMAGE page-fill without pinning a particular release's section count or RVA.
     let smss_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x20) as *const u32);
     if found_storage && smss_size > 0 {
         let smss = core::slice::from_raw_parts(FILEBUF_VADDR as *const u8, smss_size as usize);
@@ -31813,7 +31822,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 }
                 // SEC_IMAGE fill validation: fill the .text page (RVA 0x1000) via our RVA->file
                 // translation and compare to the file's .text raw bytes. Match => our loader
-                // maps a real 6-section x64 binary correctly.
+                // maps the installed x64 binary correctly.
                 let (scratch_frame, scratch_frame_error) = alloc_frame_r();
                 let (scratch, scratch_map) = if scratch_frame_error == 0 {
                     map_boot_proof_alias(scratch_frame)
@@ -31843,7 +31852,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         }
                     }
                 }
-                print_str(b"[ntos-exec] REAL ReactOS smss.exe loaded: PE32+ x64, sections=");
+                print_str(b"[ntos-exec] installed smss.exe loaded: PE32+ x64, sections=");
                 print_u64(nsec as u64);
                 print_str(b" entry=0x");
                 print_hex(entry);
@@ -31854,7 +31863,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_str(b"\n");
                 check(
                     b"exec_reactos_smss_parsed",
-                    nsec == 6 && entry == 0x12ee0,
+                    nsec != 0 && entry != 0 && entry < pe.size_of_image(),
                     &mut passed,
                 );
                 check(
@@ -31871,11 +31880,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let imports_size =
                     core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x24) as *const u32);
                 let mut resolved = 0u32;
+                let mut expected = 0u32;
                 if imports_size >= 4 {
                     let count = core::ptr::read_volatile(
                         (STORAGE_SHARED_VADDR + STORAGE_IMPORTS_IMAGE_OFFSET) as *const u32,
                     );
-                    for i in 0..count as u64 {
+                    if count > 0 && count <= (imports_size - 4) / 8 {
+                        expected = count;
+                    }
+                    for i in 0..expected as u64 {
                         let ent = STORAGE_SHARED_VADDR + STORAGE_IMPORTS_IMAGE_OFFSET + 4 + i * 8;
                         let off = core::ptr::read_volatile(ent as *const u32) as u64;
                         let rva = core::ptr::read_volatile((ent + 4) as *const u32) as u64;
@@ -31895,7 +31908,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_str(b"\n");
                 check(
                     b"exec_reactos_imports_resolved",
-                    resolved == 103,
+                    expected != 0 && resolved == expected,
                     &mut passed,
                 );
 
@@ -31968,6 +31981,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         .expect("session manager requires a valid fault endpoint capability");
                     let smss_client_id = ps_bootstrap::hosted_main_client_id(smss_image.pi)
                         .expect("SMSS must own its canonical ClientId before spawn");
+                    let smss_priority = ps_bootstrap::with_process_manager(|pm| {
+                        native_thread_priority::initial_priority(pm, u64::from(smss_client_id.unique_thread))
+                    }).expect("SMSS TCB priority must match its canonical PM thread");
                     let spawn = spawn_hosted_sec_image_for_image(
                         smss_image,
                         nt_memory_manager::MemoryLifetime::Process(
@@ -31988,6 +32004,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         smss_ldrp_rva,
                         u64::from(smss_client_id.unique_process),
                         u64::from(smss_client_id.unique_thread),
+                        smss_priority,
                     );
                     print_str(b"[diag-smss] spawn returned pml4=0x");
                     print_hex((spawn.pml4 >> 32) as u32);
@@ -32993,7 +33010,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 }
             }
             Err(_) => {
-                print_str(b"[ntos-exec] ReactOS smss.exe PARSE FAILED\n");
+                print_str(b"[ntos-exec] installed smss.exe PARSE FAILED\n");
                 check(b"exec_reactos_smss_parsed", false, &mut passed);
                 check(b"exec_reactos_smss_imports_ntdll", false, &mut passed);
                 check(b"exec_reactos_sec_image_fill", false, &mut passed);

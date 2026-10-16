@@ -23,7 +23,8 @@ fn send_capture_owns_message_and_attributes_after_guest_mutation() {
     let args = [77, 0, 64, 160, 0, 0, 0, 0];
     let captured = capture_send_wait_receive(args, |p, b| read_image(&image, p, b), |_, _| true).unwrap();
     image[104] = b'X';
-    image[160] = 0;
+    image[160] = 0xff;
+    assert_eq!(image[160], 0xff);
     assert_eq!(&captured.send_message.as_ref().unwrap()[40..], b"ping");
     assert_eq!(captured.send_attributes.as_ref().unwrap().allocated, 0x2000_0000);
     assert_eq!(captured.send_attributes.as_ref().unwrap().bytes[0], 0);
@@ -51,6 +52,21 @@ fn receive_capture_requires_bounded_writable_output_and_size() {
 }
 
 #[test]
+fn smss_receive_context_attribute_is_bounded_and_retained_before_effect() {
+    let mut image = [0u8; 512];
+    image[32..40].copy_from_slice(&128u64.to_le_bytes());
+    image[256..260].copy_from_slice(&CONTEXT_ATTR.to_le_bytes());
+    let captured = capture_send_wait_receive([77, 0, 0, 0, 128, 32, 256, 0],
+        |p, b| read_image(&image, p, b),
+        |p, n| (p == 128 && n == 128) || (p == 32 && n == 8) || (p == 256 && n == 40))
+        .unwrap();
+    assert_eq!(captured.receive.unwrap().attributes, Some((256, CONTEXT_ATTR)));
+    image[256..260].copy_from_slice(&0x8000_0000u32.to_le_bytes());
+    assert_eq!(capture_send_wait_receive([77, 0, 0, 0, 128, 32, 256, 0],
+        |p, b| read_image(&image, p, b), |_, _| true), Err(STATUS_NOT_SUPPORTED));
+}
+
+#[test]
 fn connect_capture_owns_name_and_rejects_unmodeled_security_inputs() {
     let mut image = [0u8; 512];
     image[64..66].copy_from_slice(&20u16.to_le_bytes());
@@ -62,6 +78,13 @@ fn connect_capture_owns_name_and_rejects_unmodeled_security_inputs() {
     let captured = capture_connect_port([16,64,0,0,0,0,0,0,0,0,0], |p,b| read_image(&image,p,b), |p,n| p == 16 && n == 8).unwrap();
     image[128] = 0;
     assert_eq!(captured.name, "\\SmApiPort".encode_utf16().collect::<Vec<_>>());
+    let authorized = captured.checked_wire_authorized(caller(), (7, 8), 91).unwrap();
+    let head: nt_alpc_abi::AlpcConnectPortAuthorizedRequest =
+        bytemuck::pod_read_unaligned(&authorized[..core::mem::size_of::<nt_alpc_abi::AlpcConnectPortAuthorizedRequest>()]);
+    assert_eq!(head.target_listen_handle, 91);
+    assert_eq!(head.access_granted, 1);
+    assert_eq!(head.checked.connect.name_offset as usize,
+        core::mem::size_of::<nt_alpc_abi::AlpcConnectPortAuthorizedRequest>());
     assert_eq!(capture_connect_port([16,64,0,0,0,256,0,0,0,0,0], |p,b| read_image(&image,p,b), |_,_| true), Err(STATUS_NOT_SUPPORTED));
 }
 
@@ -74,9 +97,34 @@ fn accept_capture_requires_connection_request_and_owned_output() {
     image[88..92].copy_from_slice(&59u32.to_le_bytes());
     let captured = capture_accept_connect([16,77,0,0,0,0,64,0,1], 59, |p,b| read_image(&image,p,b), |p,n| p == 16 && n == 8).unwrap();
     assert_eq!(captured.connection_id, 59);
+    assert_eq!(captured.message, image[64..104]);
+    image[64] = 0xff;
+    assert_eq!(captured.message[0], 0);
     assert_eq!(capture_accept_connect([16,77,0,0,0,0,64,0,1], 60, |p,b| read_image(&image,p,b), |_,_| true), Err(STATUS_INVALID_PARAMETER));
     image[68..70].copy_from_slice(&1u16.to_le_bytes());
     assert_eq!(capture_accept_connect([16,77,0,0,0,0,64,0,1], 59, |p,b| read_image(&image,p,b), |_,_| true), Err(STATUS_INVALID_PARAMETER));
+}
+
+#[test]
+fn connect_capture_retains_response_addresses_for_exact_copyout() {
+    let mut image = [0u8; 512];
+    image[64..66].copy_from_slice(&20u16.to_le_bytes());
+    image[66..68].copy_from_slice(&22u16.to_le_bytes());
+    image[72..80].copy_from_slice(&128u64.to_le_bytes());
+    for (i, unit) in "\\SmApiPort".encode_utf16().enumerate() {
+        image[128 + 2*i..130 + 2*i].copy_from_slice(&unit.to_le_bytes());
+    }
+    image[240..242].copy_from_slice(&5u16.to_le_bytes());
+    image[242..244].copy_from_slice(&45u16.to_le_bytes());
+    image[280..285].copy_from_slice(b"hello");
+    image[300..308].copy_from_slice(&128u64.to_le_bytes());
+    let captured = capture_connect_port([16,64,0,0,0,0,240,300,0,0,0],
+        |p,b| read_image(&image,p,b), |_,_| true).unwrap();
+    assert_eq!(captured.message_target, Some((240, 128, 300)));
+    image[240] = 0xff;
+    assert_eq!(image[240], 0xff);
+    assert_eq!(captured.message.as_ref().unwrap()[0], 5);
+    assert_eq!(&captured.message.as_ref().unwrap()[40..], b"hello");
 }
 
 #[test]
@@ -114,6 +162,34 @@ fn terminal_reply_failure_and_no_effect_keep_or_release_correctly() {
 }
 
 #[test]
+fn retained_later_rejects_success_as_no_effect_and_attempts_reply_once() {
+    let mut pending = RetainedLater::new(caller(), (7, 11), 33, vec![3]).unwrap();
+    pending.begin(43).unwrap();
+    assert_eq!(pending.no_effect(43, caller(), 0), Err(RetainedError::WrongPhase));
+    assert_eq!(pending.observe(43, caller()), Ok(None));
+    pending.complete(43, caller(), TerminalLater::service(0, 0, 0, 0, vec![])).unwrap();
+    assert_eq!(pending.begin_reply(), Ok(()));
+    assert_eq!(pending.begin_reply(), Err(RetainedError::WrongPhase));
+    let pending = pending.finish_after_reply(false).err().unwrap();
+    assert_eq!(pending.reply_cap(), 33);
+    assert!(pending.finish_after_reply(true).is_ok());
+}
+
+#[test]
+fn exact_pending_receive_can_poll_again_without_releasing_its_reply() {
+    let mut pending = RetainedLater::new(caller(), (7, 12), 34, vec![4]).unwrap();
+    pending.begin(44).unwrap();
+    assert_eq!(pending.continue_pending(45, caller()), Err(RetainedError::WrongRequest));
+    assert_eq!(pending.continue_pending(44, caller()), Ok(()));
+    assert_eq!(pending.reply_cap(), 34);
+    assert_eq!(pending.request(), &[4]);
+    assert_eq!(pending.begin(45), Ok(()));
+    assert_eq!(pending.observe(44, caller()), Err(RetainedError::WrongRequest));
+    pending.complete(45, caller(), TerminalLater::service(0, 0, 0, 0, vec![])).unwrap();
+    assert_eq!(pending.begin_reply(), Ok(()));
+}
+
+#[test]
 fn checked_send_wire_carries_exact_owner_token_and_copied_payload() {
     use nt_alpc_abi::AlpcSendReceiveCheckedRequest;
     let captured = CapturedSendWaitReceive {
@@ -134,7 +210,8 @@ fn checked_connect_and_accept_wires_bind_owner_and_connection() {
     use nt_alpc_abi::{AlpcAcceptConnectCheckedRequest, AlpcConnectPortCheckedRequest};
     let connect = CapturedConnectPort {
         output: 16, name: "\\SmApiPort".encode_utf16().collect(),
-        port_attributes: None, message: None, send_attributes: None, timeout: None,
+        port_attributes: None, message: None, message_target: None,
+        send_attributes: None, timeout: None,
     };
     let wire = connect.checked_wire(caller(), (7,9)).unwrap();
     let header: AlpcConnectPortCheckedRequest = bytemuck::pod_read_unaligned(&wire[..160]);
@@ -145,13 +222,17 @@ fn checked_connect_and_accept_wires_bind_owner_and_connection() {
     assert_eq!(wire.len(), 180);
     let accept = CapturedAcceptConnect {
         output: 16, listen_port: 77, connection_id: 59, port_context: 44, accept: true,
+        message: vec![0; 40],
     };
     let wire = accept.checked_wire(caller(), (7,10)).unwrap();
-    let header: AlpcAcceptConnectCheckedRequest = bytemuck::pod_read_unaligned(&wire[..72]);
-    assert_eq!(header.accept.abi_size, 72);
+    let header: AlpcAcceptConnectCheckedRequest = bytemuck::pod_read_unaligned(&wire[..80]);
+    assert_eq!(header.accept.abi_size, 80);
     assert_eq!(header.accept.connection_id, 59);
     assert_eq!(header.listen_port, 77);
     assert_eq!(header.invocation.invocation_lo, 10);
+    assert_eq!(header.message_offset, 80);
+    assert_eq!(header.message_len_bytes, 40);
+    assert_eq!(&wire[80..], &[0; 40]);
 }
 
 #[test]

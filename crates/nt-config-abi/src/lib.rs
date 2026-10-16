@@ -107,6 +107,8 @@ pub mod opcode {
     pub const CM_OP_ENUMERATE_KEY: u16 = 0x2130;
     /// Query one legacy device property by stable devnode instance path.
     pub const CM_OP_QUERY_DEVICE_PROPERTY: u16 = 0x2140;
+    /// Publish one typed DEVPROPKEY value for an existing devnode instance.
+    pub const CM_OP_SET_DEVICE_DEVPROP: u16 = 0x2142;
     /// Resolve one live driver service and all registry-bound devnodes.
     pub const CM_OP_QUERY_DRIVER_SERVICE: u16 = 0x2141;
     /// Atomically import and publish one mounted `nt-hive-core` SYSTEM image.
@@ -538,6 +540,21 @@ pub struct CmDevicePropertyRequest {
     pub instance_offset: u32,
     pub instance_len_bytes: u32,
     pub transfer_token: u64,
+}
+
+/// One bounded typed property write. The instance UTF-16 bytes precede the value bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmDevpropSetRequest {
+    pub abi_size: u16,
+    pub abi_version: u16,
+    pub property_type: u32,
+    pub fmtid: [u8; 16],
+    pub pid: u32,
+    pub instance_offset: u32,
+    pub instance_len_bytes: u32,
+    pub data_offset: u32,
+    pub data_len: u32,
 }
 
 /// `query_driver_service`: one service name plus an immutable snapshot-bank cursor.
@@ -1019,6 +1036,7 @@ wire!(CmRawValueRequest);
 wire!(CmRawValueTransferRequest);
 wire!(CmRawValueQueryRequest);
 wire!(CmDevicePropertyRequest);
+wire!(CmDevpropSetRequest);
 wire!(CmDriverServiceRequest);
 wire!(CmRetainedSnapshotRequest);
 wire!(CmRetainedSnapshotReply);

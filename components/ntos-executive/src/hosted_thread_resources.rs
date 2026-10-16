@@ -34,6 +34,7 @@ struct Construction {
     thread: Option<nt_process::ThreadLifetime>,
     caller: Option<nt_process::native_handle::NativeHandleCaller>,
     reference: Option<nt_process::native_handle::NativeThreadProcessReference>,
+    priority_plan: Option<nt_process::KernelThreadPriorityPlan>,
 }
 
 static mut OWNERS: Vec<Construction> = Vec::new();
@@ -77,6 +78,7 @@ pub(super) unsafe fn begin(
         thread: None,
         caller: None,
         reference: None,
+        priority_plan: None,
     });
     Some(id)
 }
@@ -115,6 +117,55 @@ pub(super) unsafe fn registry_caller(
         pm.validate_native_handle_caller(caller)?;
         Ok(caller)
     })
+}
+
+/// Retain the canonical PM plan before changing this exact worker's native TCB. The actor
+/// cannot retire or accept a second priority effect until the first one commits.
+pub(super) unsafe fn prepare_priority(
+    runtime: HostedDriverThreadRuntime,
+    lifetime: nt_process::ThreadLifetime,
+    thread: u64,
+    priority: i32,
+) -> Result<(i32, i32), u32> {
+    if !matches(runtime.construction, runtime) {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    let row = owner(runtime.construction);
+    if row.stopped || row.finished || row.priority_plan.is_some()
+        || row.thread != Some(lifetime) || row.tcb != runtime.tcb
+    {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    let plan = crate::service_sec_image::with_provider_process_manager(|pm| {
+        if !pm.validate_thread_lifetime(lifetime)
+            || pm.thread_kernel_object(lifetime.thread_id()) != Some(thread)
+        {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        pm.prepare_kernel_thread_priority(thread, priority)
+    })?;
+    let result = (plan.previous(), plan.next());
+    row.priority_plan = Some(plan);
+    Ok(result)
+}
+
+/// Acknowledged native effect precedes PM commit. On a post-effect refusal the plan remains
+/// owned, preventing retry, retirement, or TCB reuse with uncertain scheduler state.
+pub(super) unsafe fn commit_priority(
+    runtime: HostedDriverThreadRuntime,
+    lifetime: nt_process::ThreadLifetime,
+) -> Result<i32, u32> {
+    if !matches(runtime.construction, runtime) { return Err(nt_process::STATUS_INVALID_HANDLE); }
+    let row = owner(runtime.construction);
+    if row.stopped || row.thread != Some(lifetime) || row.tcb != runtime.tcb {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    let plan = row.priority_plan.as_ref().ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let previous = crate::service_sec_image::with_provider_process_manager(|pm| {
+        pm.commit_kernel_thread_priority_retained(plan)
+    })?;
+    row.priority_plan = None;
+    Ok(previous)
 }
 
 pub(super) unsafe fn initialize_kpcr(
@@ -239,6 +290,9 @@ pub(super) unsafe fn stack_live(runtime: HostedDriverThreadRuntime) -> bool {
 pub(super) unsafe fn retire(id: usize, shared_retired: bool) -> bool {
     if owner(id).finished {
         return true;
+    }
+    if owner(id).priority_plan.is_some() {
+        return false;
     }
     if hosted_source_stack_lease::blocks_worker_retirement(id) {
         return false;

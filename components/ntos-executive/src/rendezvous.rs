@@ -71,7 +71,6 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
             fault_ep: ThreadFaultEndpoint::Badged { source: main_fault_ep, badge },
             cid_proc,
             cid_thread,
-            prio: HOSTED_USER_THREAD_PRIORITY,
             // The worker shares its owner's native transport, with a private TEB-derived IPC buffer.
             native: true,
             diag: false,
@@ -254,7 +253,6 @@ pub(crate) unsafe fn spawn_slot_thread(
             fault_ep,
             cid_proc,
             cid_thread,
-            prio: HOSTED_USER_THREAD_PRIORITY,
             native,
             diag: false,
         },
@@ -300,7 +298,6 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
             },
             cid_proc,
             cid_thread,
-            prio: HOSTED_USER_THREAD_PRIORITY,
             native: true,
             diag: false,
         },
@@ -346,7 +343,6 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
             },
             cid_proc,
             cid_thread,
-            prio: HOSTED_USER_THREAD_PRIORITY,
             native: true,
             diag: false,
         },
@@ -392,7 +388,6 @@ pub(crate) unsafe fn spawn_lsass_listener2_thread(
             },
             cid_proc,
             cid_thread,
-            prio: HOSTED_USER_THREAD_PRIORITY,
             // BATCH 24: native transport (mirror listener1) — lsass runs on our native ntdll.
             native: true,
             diag: false,
@@ -437,7 +432,6 @@ pub(crate) unsafe fn spawn_lsass_listener3_thread(
             },
             cid_proc,
             cid_thread,
-            prio: HOSTED_USER_THREAD_PRIORITY,
             // BATCH 24: native transport (mirror listener1) — lsass runs on our native ntdll.
             native: true,
             diag: false,

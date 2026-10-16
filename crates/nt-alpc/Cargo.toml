@@ -15,6 +15,7 @@ std = ["nt-status/std"]
 nt-status = { workspace = true }
 nt-port-core = { workspace = true }
 nt-alpc-abi = { workspace = true }
+nt-security = { workspace = true }
 bytemuck = { version = "1", default-features = false }
 
 [dev-dependencies]

@@ -38,7 +38,9 @@ mod native_object_handle_flags;
 mod native_peb_state;
 mod native_priority_class;
 mod native_priority_by_class;
+mod native_thread_priority;
 pub use native_priority_by_class::{ProcessPriorityByClassPlan, ProcessPriorityQuantumPolicy, ProcessSchedulingState, ThreadSchedulingState};
+pub use native_thread_priority::KernelThreadPriorityPlan;
 mod process_session;
 mod native_wow64_state;
 #[cfg(test)]
@@ -55,6 +57,8 @@ mod registry_key_handle;
 mod object_directory_handle;
 mod routed_file_handle;
 pub mod process_object_retirement;
+mod process_exit_notify;
+pub use process_exit_notify::{ProcessExitNotification, ProcessExitNotifyOwner};
 pub mod thread_suspend;
 mod thread_termination_port;
 pub use thread_termination_port::{ThreadTerminationPortPhase, ThreadTerminationPortSnapshot, ThreadTerminationPortTicket};
@@ -835,6 +839,8 @@ pub struct ProcessObjectDeletion {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProcessObjectDeleteBlockers {
     pub state: Option<ProcessState>,
+    /// Pending or in-flight kernel process-exit callbacks retain this EPROCESS.
+    pub process_exit_notifications: usize,
     pub process_wait_references: u32,
     pub process_kernel_pointer_references: u32,
     pub debug_port_present: bool,
@@ -855,6 +861,7 @@ pub struct ProcessObjectDeleteBlockers {
 impl ProcessObjectDeleteBlockers {
     pub const fn delete_ready(self) -> bool {
         matches!(self.state, Some(ProcessState::Terminated))
+            && self.process_exit_notifications == 0
             && self.process_wait_references == 0
             && self.process_kernel_pointer_references == 0
             && !self.debug_port_present
@@ -949,6 +956,7 @@ pub enum HandleObject {
     /// invocation token and process incarnation remain attached to NtClose.
     AlpcPort {
         service_handle: u64,
+        kind: native_alpc_port::AlpcPortKind,
         owner_generation: u64,
         invocation_hi: u64,
         invocation_lo: u64,
@@ -1231,6 +1239,8 @@ pub struct ProcessManager {
     dbgk: DebugObjectStore,
     /// Ps job objects and their exact process membership, accounting, and limit policy.
     jobs: job::JobStore,
+    /// Provider callbacks have independent image and EPROCESS lifetime ownership.
+    process_exit_notify: process_exit_notify::ProcessExitNotifyLedger,
     /// One-time bootstrap designation with counted process/thread reference ownership.
     initial_system: Option<initial_system::InitialSystemRoot>,
     /// The IMAGE views mapped into each process — the modelled `PEB->Ldr` module list. A `pid` of
@@ -1255,6 +1265,38 @@ impl ProcessManager {
             module_limit: DEFAULT_TRACKED_MODULES,
             ..Default::default()
         }
+    }
+
+    /// Admit a process-exit callback after the host proves `callback` belongs to the exact loaded
+    /// provider image instance. Registration keeps that image instance live until removal.
+    pub fn register_process_exit_notify(
+        &mut self,
+        owner: ProcessExitNotifyOwner,
+        callback: u64,
+    ) -> Result<(), u32> {
+        self.process_exit_notify.register(owner, callback)
+    }
+
+    /// Remove a callback only after all pending and in-flight invocations have completed.
+    pub fn unregister_process_exit_notify(
+        &mut self,
+        owner: ProcessExitNotifyOwner,
+        callback: u64,
+    ) -> Result<(), u32> {
+        self.process_exit_notify.unregister(owner, callback)
+    }
+
+    /// Claim a process-exit callout once. The host calls it at PASSIVE_LEVEL with the retained
+    /// EPROCESS pointer, PID, and a null `CreateInfo`, then completes this exact ticket.
+    pub fn take_process_exit_notification(&mut self) -> Option<ProcessExitNotification> {
+        self.process_exit_notify.take()
+    }
+
+    pub fn complete_process_exit_notification(
+        &mut self,
+        notification: ProcessExitNotification,
+    ) -> Result<(), u32> {
+        self.process_exit_notify.complete(notification)
     }
 
     /// Pre-allocate the module-tracking table for `capacity` IMAGE views and cap it there, so a
@@ -3680,16 +3722,20 @@ impl ProcessManager {
         }
         // The last user-thread exit cascades into process termination. Check that boundary before
         // publishing this thread's exit, so a retained control on a system peer cannot split it.
-        if !target.is_system_thread
+        let last_user_thread = !target.is_system_thread
             && !self.threads.values().any(|other| {
                 other.thread_id != tid && other.process_id == target.process_id
                     && !other.is_system_thread
                     && !matches!(other.state, ThreadState::Initialized | ThreadState::Terminated)
-            })
+            });
+        if last_user_thread
             && (self.has_process_suspend_control(target.process_id)
                 || self.has_initial_thread_creation_pending(target.process_id))
         {
             return Err(STATUS_DEVICE_BUSY);
+        }
+        if last_user_thread && target.state != ThreadState::Terminated {
+            self.preflight_process_exit_notify(target.process_id)?;
         }
         let (pid, was_system, transitioned) = {
             let t = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
@@ -3786,15 +3832,21 @@ impl ProcessManager {
         if self.has_process_suspend_control(pid) || self.has_initial_thread_creation_pending(pid) {
             return Err(STATUS_DEVICE_BUSY);
         }
-        let (thread_count, section) = {
-            let proc = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        let (thread_count, section, sequence, process_object) = {
+            let proc = self.processes.get(&pid).ok_or(STATUS_INVALID_HANDLE)?;
             if proc.state == ProcessState::Terminated {
                 return Ok(());
             }
+            (proc.threads.len(), proc.image_section, proc.creation_sequence,
+             proc.kernel_process_object.unwrap_or(0))
+        };
+        self.preflight_process_exit_notify(pid)?;
+        {
+            let proc = self.processes.get_mut(&pid).expect("preflight preserves process identity");
             proc.state = ProcessState::Terminated;
             proc.exit_status = Some(exit_status);
-            (proc.threads.len(), proc.image_section)
-        };
+        }
+        self.process_exit_notify.queue_exit(pid, sequence, process_object, exit_status);
         for index in 0..thread_count {
             let Some(tid) = self
                 .processes
@@ -3835,6 +3887,14 @@ impl ProcessManager {
             .unwrap_or(0);
         let _ = self.report_debug_message(pid, main, DbgKmMessage::ExitProcess { exit_status });
         Ok(())
+    }
+
+    fn preflight_process_exit_notify(&mut self, pid: ProcessId) -> Result<(), u32> {
+        let process = self.processes.get(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        if self.process_exit_notify.has_registrations() && process.kernel_process_object.is_none() {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.process_exit_notify.preflight_exit()
     }
 
     /// ReactOS/NT `NtTerminateProcess(NULL, status)` suicide phase: terminate every other thread in
@@ -4143,6 +4203,8 @@ impl ProcessManager {
         let process = self.processes.get(&pid)?;
         let mut blockers = ProcessObjectDeleteBlockers {
             state: Some(process.state),
+            process_exit_notifications: self.process_exit_notify
+                .pending_for_process(pid, process.creation_sequence),
             process_wait_references: process.wait_references,
             process_kernel_pointer_references: process.kernel_pointer_references,
             debug_port_present: process.debug_port.is_some(),

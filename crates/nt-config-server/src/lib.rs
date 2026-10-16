@@ -24,6 +24,7 @@ mod snapshot;
 mod system_hive_path;
 mod system_mount;
 mod mutation_preparation;
+mod devprop_set;
 
 use alloc::rc::Rc;
 use alloc::string::String;
@@ -42,7 +43,7 @@ use nt_config_abi::{
     launch_plan_kind, launch_plan_transfer, leased_hive_record_kind, network_plan_kind, opcode,
     pnp_query_kind, pnp_query_transfer, raw_value_query_transfer, raw_value_transfer, read_utf16,
     win32_service_plan_kind, win32_service_process_kind, CmDeviceActionRequest,
-    CmDevicePropertyRequest, CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveCheckpointHeader,
+    CmDevicePropertyRequest, CmDevpropSetRequest, CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveCheckpointHeader,
     CmHiveCheckpointRequest, CmHiveExportHeader, CmHiveImportRequest, CmHivePathRequest,
     CmHiveKeyRequest, CmHiveMutationRequest, CmKeyRequest, CmLaunchPlanRequest,
     CmLeasedHiveKeyRequest, CmLeasedHiveRecordRequest, CmPnpQueryRequest, CmRawValueQueryRequest,
@@ -68,7 +69,7 @@ use nt_config_abi::{
     CM_WIN32_SERVICE_PLAN_SNAPSHOT_VERSION,
 };
 use nt_config_manager::{
-    device_property, ConfigManager, CriticalDeviceBindingError, DeviceActionEvent,
+    device_property, devprop_type, DevPropKey, PropertyValue, ConfigManager, CriticalDeviceBindingError, DeviceActionEvent,
     DeviceActionIntent, DeviceActionJournal, DeviceActionJournalError, DeviceActionKind,
     DevicePropertySource, DriverServiceBinding, DriverServiceClass, RegistryTransaction,
     RegistryValueType, Win32ServiceProcessKind, Win32ServiceProcessLaunch, SERVICE_BOOT_START,
@@ -1194,6 +1195,7 @@ impl CmServer {
             opcode::CM_OP_QUERY_VALUE_TRANSFER => self.op_query_value_transfer(in_buf, out_buf),
             opcode::CM_OP_ENUMERATE_KEY => self.op_enumerate_key(in_buf, out_buf),
             opcode::CM_OP_QUERY_DEVICE_PROPERTY => self.op_query_device_property(in_buf, out_buf),
+            opcode::CM_OP_SET_DEVICE_DEVPROP => self.op_set_device_devprop(in_buf),
             opcode::CM_OP_QUERY_DRIVER_SERVICE => self.op_query_driver_service(in_buf, out_buf),
             opcode::CM_OP_RETAINED_SNAPSHOT => {
                 self.op_retained_snapshot(in_buf, out_buf)

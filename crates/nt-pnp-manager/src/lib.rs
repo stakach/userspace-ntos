@@ -1081,6 +1081,8 @@ struct Devnode {
     instance_id: Option<String>,
     service: Option<String>,
     state: DeviceState,
+    /// Last successful QUERY_PNP_DEVICE_STATE result for this exact incarnation.
+    pnp_device_state: u32,
     pdo_object_id: u64,
     fdo_object_id: u64,
     driver_id: u64,
@@ -1273,6 +1275,7 @@ impl PnpManager {
             instance_id: instance_id.map(ToString::to_string),
             service: service.map(ToString::to_string),
             state: DeviceState::Enumerated,
+            pnp_device_state: 0,
             pdo_object_id,
             fdo_object_id: 0,
             driver_id: 0,
@@ -1331,6 +1334,44 @@ impl PnpManager {
                 && devnode.pdo_object_id == identity.pdo_object_id
                 && devnode.state == DeviceState::Started
         })
+    }
+
+    /// Commit only a terminal driver's state query to the same started PDO generation.
+    pub fn set_queried_pnp_device_state(
+        &mut self,
+        identity: DevnodeIdentity,
+        state: u32,
+    ) -> Result<(), PnpError> {
+        if state & !nt_pnp_abi::PNP_DEVICE_STATE_KNOWN_MASK != 0 {
+            return Err(PnpError::InvalidIdentity);
+        }
+        let node = self.devnodes.iter_mut().find(|node| {
+            node.id == identity.devnode_id
+                && node.generation == identity.generation
+                && node.pdo_object_id == identity.pdo_object_id
+                && node.state == DeviceState::Started
+        }).ok_or(PnpError::StaleId)?;
+        node.pnp_device_state = state;
+        Ok(())
+    }
+
+    pub fn queried_pnp_device_state(&self, identity: DevnodeIdentity) -> Option<u32> {
+        self.devnodes.iter().find(|node| {
+            node.id == identity.devnode_id
+                && node.generation == identity.generation
+                && node.pdo_object_id == identity.pdo_object_id
+                && node.state != DeviceState::Removed
+        }).map(|node| node.pnp_device_state)
+    }
+
+    pub fn devnode_dont_display_in_ui(&self, identity: DevnodeIdentity) -> Option<bool> {
+        self.queried_pnp_device_state(identity)
+            .map(|bits| bits & nt_pnp_abi::PNP_DEVICE_DONT_DISPLAY_IN_UI != 0)
+    }
+
+    pub fn devnode_not_disableable(&self, identity: DevnodeIdentity) -> Option<bool> {
+        self.queried_pnp_device_state(identity)
+            .map(|bits| bits & nt_pnp_abi::PNP_DEVICE_NOT_DISABLEABLE != 0)
     }
 
     pub fn claim_started_parent_relation(
@@ -1651,6 +1692,7 @@ impl PnpManager {
                 instance_id: Some(record.instance_id),
                 service: None,
                 state: DeviceState::Enumerated,
+                pnp_device_state: 0,
                 pdo_object_id: record.pdo_object_id,
                 fdo_object_id: 0,
                 driver_id: 0,
@@ -2546,6 +2588,31 @@ mod tests {
             p.transition(id, state).unwrap();
         }
         id
+    }
+
+    #[test]
+    fn queried_device_state_updates_only_the_exact_started_pdo_generation() {
+        let mut pnp = PnpManager::new();
+        let pdo = 0x4455;
+        create_started_parent(&mut pnp, pdo);
+        let identity = pnp.devnode_identity_for_pdo(pdo).unwrap();
+        assert_eq!(pnp.devnode_dont_display_in_ui(identity), Some(false));
+        assert_eq!(pnp.devnode_not_disableable(identity), Some(false));
+
+        let stale = DevnodeIdentity { generation: identity.generation + 1, ..identity };
+        let flags = nt_pnp_abi::PNP_DEVICE_DONT_DISPLAY_IN_UI
+            | nt_pnp_abi::PNP_DEVICE_NOT_DISABLEABLE;
+        assert_eq!(pnp.set_queried_pnp_device_state(stale, flags), Err(PnpError::StaleId));
+        assert_eq!(pnp.queried_pnp_device_state(identity), Some(0));
+        assert_eq!(pnp.set_queried_pnp_device_state(identity, 0x200),
+            Err(PnpError::InvalidIdentity));
+        assert_eq!(pnp.set_queried_pnp_device_state(identity, flags), Ok(()));
+        assert_eq!(pnp.devnode_dont_display_in_ui(identity), Some(true));
+        assert_eq!(pnp.devnode_not_disableable(identity), Some(true));
+
+        assert_eq!(pnp.set_queried_pnp_device_state(identity, 0), Ok(()));
+        assert_eq!(pnp.devnode_dont_display_in_ui(identity), Some(false));
+        assert_eq!(pnp.devnode_not_disableable(identity), Some(false));
     }
 
     fn pci_properties() -> PdoProperties {

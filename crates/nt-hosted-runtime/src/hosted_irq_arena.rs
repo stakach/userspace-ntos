@@ -148,6 +148,7 @@ pub enum HostedIrqServiceKind {
     ClassServiceRequest = 8,
     TimerCancel = 9,
     TimerSet = 10,
+    RemoveDpc = 11,
 }
 
 impl HostedIrqServiceKind {
@@ -163,6 +164,7 @@ impl HostedIrqServiceKind {
             8 => Some(Self::ClassServiceRequest),
             9 => Some(Self::TimerCancel),
             10 => Some(Self::TimerSet),
+            11 => Some(Self::RemoveDpc),
             _ => None,
         }
     }
@@ -493,6 +495,11 @@ impl HostedIrqServiceCommand {
                 }
                 HostedIrqServiceKind::QueueDpc => {
                     self.authority_cookie == 0 && self.argument_count == 4 && self.arguments[0] != 0
+                }
+                HostedIrqServiceKind::RemoveDpc => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 0
+                        && self.arguments.iter().all(|argument| *argument == 0)
                 }
                 HostedIrqServiceKind::Mdl => {
                     self.authority_cookie == 0
@@ -2468,7 +2475,8 @@ mod tests {
         assert_eq!(HostedIrqServiceKind::from_raw(8), Some(HostedIrqServiceKind::ClassServiceRequest));
         assert_eq!(HostedIrqServiceKind::from_raw(9), Some(HostedIrqServiceKind::TimerCancel));
         assert_eq!(HostedIrqServiceKind::from_raw(10), Some(HostedIrqServiceKind::TimerSet));
-        assert_eq!(HostedIrqServiceKind::from_raw(11), None);
+        assert_eq!(HostedIrqServiceKind::from_raw(11), Some(HostedIrqServiceKind::RemoveDpc));
+        assert_eq!(HostedIrqServiceKind::from_raw(12), None);
         assert!(HostedIrqServiceKind::ProviderCallbackRequest.may_request_nested_dispatch());
         assert!(HostedIrqServiceKind::ClassServiceRequest.may_request_nested_dispatch());
         assert!(!HostedIrqServiceKind::ProviderImport.may_request_nested_dispatch());
@@ -2499,6 +2507,15 @@ mod tests {
         queue_dpc.arguments[0] = 43;
         queue_dpc.argument_count = 3;
         assert!(!queue_dpc.valid());
+
+        let mut remove_dpc = service();
+        remove_dpc.kind = HostedIrqServiceKind::RemoveDpc;
+        remove_dpc.authority_cookie = 0;
+        remove_dpc.argument_count = 0;
+        remove_dpc.arguments = [0; HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        assert!(remove_dpc.valid());
+        remove_dpc.arguments[0] = 1;
+        assert!(!remove_dpc.valid());
 
         let mut mdl = service();
         mdl.kind = HostedIrqServiceKind::Mdl;

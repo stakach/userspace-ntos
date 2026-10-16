@@ -13,8 +13,12 @@ use crate::{handle_to_slot, HandleObject, HandleReservation, HandleSlot, Process
 static NEXT_MANAGER_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AlpcPortKind { Created, Later }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AlpcPortIdentity {
     pub service_handle: u64,
+    pub kind: AlpcPortKind,
     pub owner_process: ProcessId,
     pub owner_generation: u64,
     pub invocation_hi: u64,
@@ -23,7 +27,7 @@ pub struct AlpcPortIdentity {
 
 impl AlpcPortIdentity {
     fn object(self) -> HandleObject {
-        HandleObject::AlpcPort { service_handle: self.service_handle,
+        HandleObject::AlpcPort { service_handle: self.service_handle, kind: self.kind,
             owner_generation: self.owner_generation, invocation_hi: self.invocation_hi,
             invocation_lo: self.invocation_lo }
     }
@@ -39,6 +43,7 @@ pub struct NativeAlpcPortPublication {
     reservation: HandleReservation,
     owner_generation: u64,
     token: (u64, u64),
+    kind: AlpcPortKind,
     phase: PublicationPhase,
 }
 
@@ -72,14 +77,49 @@ impl ProcessManager {
 
     pub fn reserve_native_alpc_port_handle(&mut self, caller: NativeHandleCaller,
         owner_generation: u64, token: (u64, u64)) -> Result<NativeAlpcPortPublication, u32> {
+        self.reserve_native_alpc_port_handle_kind(caller, owner_generation, token,
+            AlpcPortKind::Created)
+    }
+
+    pub fn reserve_native_alpc_later_port_handle(&mut self, caller: NativeHandleCaller,
+        owner_generation: u64, token: (u64, u64)) -> Result<NativeAlpcPortPublication, u32> {
+        self.reserve_native_alpc_port_handle_kind(caller, owner_generation, token,
+            AlpcPortKind::Later)
+    }
+
+    fn reserve_native_alpc_port_handle_kind(&mut self, caller: NativeHandleCaller,
+        owner_generation: u64, token: (u64, u64), kind: AlpcPortKind)
+        -> Result<NativeAlpcPortPublication, u32> {
         self.validate_native_handle_caller(caller)?;
         if owner_generation == 0 || token == (0, 0) { return Err(STATUS_INVALID_PARAMETER); }
         let owner = caller.effective_process();
         admit_running_owner(self, owner)?;
         let manager = self.alpc_manager_identity()?;
         let reservation = self.try_reserve_handle_slot(owner)?;
-        Ok(NativeAlpcPortPublication { manager, reservation, owner_generation, token,
+        Ok(NativeAlpcPortPublication { manager, reservation, owner_generation, token, kind,
             phase: PublicationPhase::Reserved })
+    }
+
+    /// Resolve a published ALPC port without changing its table lifetime.
+    /// Native ALPC requests use the service handle only after validating the
+    /// physical caller and exact process incarnation that published it.
+    pub fn lookup_native_alpc_port(&self, caller: NativeHandleCaller,
+        value: u64, owner_generation: u64) -> Result<AlpcPortIdentity, u32> {
+        let NativeHandleScope::Table { owner, handle, kernel: false } =
+            self.decode_native_handle(caller, value)?
+        else { return Err(STATUS_INVALID_HANDLE); };
+        if owner != caller.effective_process() || owner_generation == 0 {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let HandleObject::AlpcPort { service_handle, kind,
+            owner_generation: bound_generation, invocation_hi, invocation_lo } =
+            self.lookup_handle(owner, handle).ok_or(STATUS_INVALID_HANDLE)?
+        else { return Err(STATUS_INVALID_HANDLE); };
+        if bound_generation != owner_generation || service_handle == 0 {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        Ok(AlpcPortIdentity { service_handle, kind, owner_process: owner,
+            owner_generation, invocation_hi, invocation_lo })
     }
 
     /// Hide the exact table entry until a checked service close is known.
@@ -93,7 +133,7 @@ impl ProcessManager {
         if owner != caller.effective_process() {
             return Err(NativeCloseError::Status(STATUS_ACCESS_DENIED));
         }
-        let HandleObject::AlpcPort { service_handle,
+        let HandleObject::AlpcPort { service_handle, kind,
             owner_generation: bound_generation, invocation_hi, invocation_lo } = target.object()
         else { return Err(NativeCloseError::Status(STATUS_INVALID_HANDLE)); };
         if owner_generation == 0 || owner_generation != bound_generation {
@@ -129,7 +169,7 @@ impl ProcessManager {
         process.next_handle_reservation_generation = next;
         Ok(NativeAlpcPortClose { manager,
             reservation: HandleReservation { process_id: owner, handle, generation },
-            identity: AlpcPortIdentity { service_handle, owner_process: owner,
+            identity: AlpcPortIdentity { service_handle, kind, owner_process: owner,
                 owner_generation, invocation_hi, invocation_lo },
             value, pending: true })
     }
@@ -151,7 +191,8 @@ impl NativeAlpcPortPublication {
             return Err(STATUS_INVALID_PARAMETER);
         }
         admit_running_owner(pm, self.owner_process())?;
-        let identity = AlpcPortIdentity { service_handle, owner_process: self.owner_process(),
+        let identity = AlpcPortIdentity { service_handle, kind: self.kind,
+            owner_process: self.owner_process(),
             owner_generation: self.owner_generation, invocation_hi: self.token.0,
             invocation_lo: self.token.1 };
         pm.bind_reserved_handle(self.reservation, identity.object(), 0)?;
@@ -258,7 +299,8 @@ mod tests {
         publication.bind(&mut pm, 0x4c50_0001).unwrap();
         assert_eq!(pm.lookup_handle(pid, value as u32), None);
         assert_eq!(publication.abort(&mut pm), Ok(Some(AlpcPortIdentity {
-            service_handle: 0x4c50_0001, owner_process: pid, owner_generation: 7,
+            service_handle: 0x4c50_0001, kind: AlpcPortKind::Created,
+            owner_process: pid, owner_generation: 7,
             invocation_hi: 11, invocation_lo: 13,
         })));
         assert_eq!(pm.handle_reservation_count(pid), 0);
@@ -267,9 +309,38 @@ mod tests {
         let value = publication.value();
         assert_eq!(publication.publish(&mut pm), Ok(value));
         assert_eq!(pm.lookup_handle(pid, value as u32), Some(HandleObject::AlpcPort {
-            service_handle: 0x4c50_0002, owner_generation: 7,
+            service_handle: 0x4c50_0002, kind: AlpcPortKind::Created, owner_generation: 7,
             invocation_hi: 17, invocation_lo: 19,
         }));
+    }
+
+    #[test]
+    fn published_port_resolves_without_hiding_or_closing_its_exact_handle() {
+        let (mut pm, caller, pid) = fixture();
+        let mut publication = pm.reserve_native_alpc_port_handle(caller, 7, (11, 13)).unwrap();
+        publication.bind(&mut pm, 0x4c50_0001).unwrap();
+        let value = publication.value();
+        assert_eq!(pm.lookup_native_alpc_port(caller, value, 7), Err(STATUS_INVALID_HANDLE));
+        publication.publish(&mut pm).unwrap();
+        let identity = pm.lookup_native_alpc_port(caller, value, 7).unwrap();
+        assert_eq!(identity.service_handle, 0x4c50_0001);
+        assert_eq!(identity.owner_process, pid);
+        assert_eq!(identity.kind, AlpcPortKind::Created);
+        assert_eq!((identity.invocation_hi, identity.invocation_lo), (11, 13));
+        assert_eq!(pm.lookup_native_alpc_port(caller, value, 8), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(pm.lookup_native_alpc_port(caller, value, 7), Ok(identity));
+        assert_eq!(pm.lookup_handle(pid, value as u32), Some(identity.object()));
+    }
+
+    #[test]
+    fn later_port_close_identity_retains_distinct_service_opcode_kind() {
+        let (mut pm, caller, _) = fixture();
+        let mut publication = pm.reserve_native_alpc_later_port_handle(caller, 7, (11, 13)).unwrap();
+        publication.bind(&mut pm, 0x4c50_0001).unwrap();
+        let value = publication.publish(&mut pm).unwrap();
+        let mut close = pm.begin_native_alpc_port_close(caller, value, 7).unwrap();
+        assert_eq!(close.identity().kind, AlpcPortKind::Later);
+        assert_eq!(close.reconcile(&mut pm, None), Ok(None));
     }
 
     #[test]

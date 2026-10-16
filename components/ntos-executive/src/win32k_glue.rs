@@ -7005,12 +7005,19 @@ pub(crate) unsafe fn tcb_read_rip(tcb: u64) -> u64 {
 /// `get_recv_mr`). Valid rcx/r11 only for #exception-captured threads (`use_iretq_resume`), which an
 /// int3-stopped hosted thread is. Used to recover the EXCEPTION_RECORD ptr (RCX) at RtlRaiseException.
 pub(crate) unsafe fn tcb_read_regs20(tcb: u64, out: &mut [u64; 20]) {
+    let _ = tcb_read_regs20_checked(tcb, out);
+}
+
+/// Read the exact 20-word saved user context only after the seL4 reply confirms success.
+/// Callers requiring unwind authority must use this result, not the compatibility wrapper above.
+pub(crate) unsafe fn tcb_read_regs20_checked(tcb: u64, out: &mut [u64; 20]) -> bool {
     let (r0, r1, r2, r3): (u64, u64, u64, u64);
+    let reply_info: u64;
     core::arch::asm!(
         "syscall",
         inout("rdx") SYS_CALL as u64 => _,
         inout("rdi") tcb => _,
-        inout("rsi") (2u64 << 12) | 20 => _, // TCBReadRegisters, msginfo.length=20 (label<<12 | len)
+        inout("rsi") (2u64 << 12) | 20 => reply_info, // TCBReadRegisters, msginfo.length=20
         inout("r10") 0u64 => r0,   // MR0 in / word 0 (rip) out
         inout("r8") 20u64 => r1,   // MR1 = count(20) in / word 1 (rsp) out
         in("r12") 0u64,
@@ -7020,6 +7027,9 @@ pub(crate) unsafe fn tcb_read_regs20(tcb: u64, out: &mut [u64; 20]) {
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
+    if !nt_unwind::user_frame_source::UserTrapRegisters::exact_sel4_reply(reply_info) {
+        return false;
+    }
     out[0] = r0;
     out[1] = r1;
     out[2] = r2;
@@ -7028,6 +7038,7 @@ pub(crate) unsafe fn tcb_read_regs20(tcb: u64, out: &mut [u64; 20]) {
     for (i, slot) in out.iter_mut().enumerate().take(20).skip(4) {
         *slot = crate::get_recv_mr(i);
     }
+    true
 }
 
 pub(crate) const TCB_DEBUG_STATE_WORDS: usize = 29;

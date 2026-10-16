@@ -58,6 +58,7 @@ pub struct RetainedCreate {
     phase: Phase,
     delivery: Delivery,
     process_slot: ProcessSlot,
+    reply_attempted: bool,
 }
 
 impl RetainedCreate {
@@ -75,7 +76,7 @@ impl RetainedCreate {
         }
         Ok(Self { owner, token, reply_cap, process_handle, request,
             phase: Phase::Prepared, delivery: Delivery::NotRequired,
-            process_slot: ProcessSlot::Reserved })
+            process_slot: ProcessSlot::Reserved, reply_attempted: false })
     }
 
     pub fn owner(&self) -> CreateOwner { self.owner }
@@ -96,6 +97,9 @@ impl RetainedCreate {
     pub fn no_effect(&mut self, status: i32) -> Result<(), RetainedCreateError> {
         if !matches!(self.phase, Phase::Submitted(_)) {
             return Err(RetainedCreateError::WrongPhase);
+        }
+        if status >= 0 {
+            return Err(RetainedCreateError::InvalidResult);
         }
         self.phase = Phase::Terminal(TerminalCreate {
             status, handle: 0, service_effect_possible: false,
@@ -199,6 +203,16 @@ impl RetainedCreate {
         match self.phase { Phase::Terminal(result) => Some(result), _ => None }
     }
 
+    /// Record the one possible Reply effect before entering the native send.
+    /// An indeterminate send can later be reconciled, but never repeated.
+    pub fn begin_reply(&mut self) -> Result<(), RetainedCreateError> {
+        if self.reply_attempted || self.reply_status().is_none() {
+            return Err(RetainedCreateError::WrongPhase);
+        }
+        self.reply_attempted = true;
+        Ok(())
+    }
+
     /// A failed Reply send returns the whole owner unchanged for retry.
     pub fn finish_after_reply(self, acknowledged: bool) -> Result<(), Self> {
         if acknowledged && self.reply_status().is_some() { Ok(()) } else { Err(self) }
@@ -247,6 +261,20 @@ mod tests {
     }
 
     #[test]
+    fn no_effect_requires_failure_and_keeps_the_reply_owned_after_invalid_status() {
+        let mut call = call();
+        call.begin(41).unwrap();
+        // An SQE rejected before publication cannot legitimately create a
+        // port. Treating that path as success would return a zero handle.
+        assert_eq!(call.no_effect(0), Err(RetainedCreateError::InvalidResult));
+        assert_eq!(call.no_effect(1), Err(RetainedCreateError::InvalidResult));
+        assert_eq!(call.uncertain(41), Ok(()));
+        assert_eq!(call.reply_cap(), 300);
+        assert_eq!(call.request(), &[1, 2, 3]);
+        assert_eq!(call.reply_status(), None);
+    }
+
+    #[test]
     fn failed_reply_ack_keeps_caller_and_completed_request() {
         let mut call = call();
         call.begin(41).unwrap();
@@ -256,6 +284,23 @@ mod tests {
         let call = call.finish_after_reply(false).err().unwrap();
         assert_eq!(call.reply_cap(), 300);
         assert_eq!(call.request(), &[1, 2, 3]);
+        assert!(call.finish_after_reply(true).is_ok());
+    }
+
+    #[test]
+    fn indeterminate_reply_attempt_cannot_send_a_second_time() {
+        let mut call = call();
+        call.begin(41).unwrap();
+        call.complete(41, 0, 55).unwrap();
+        call.copyout(4, true).unwrap();
+        call.process_handle_published(4).unwrap();
+        assert_eq!(call.begin_reply(), Ok(()));
+        assert_eq!(call.begin_reply(), Err(RetainedCreateError::WrongPhase));
+        let mut call = call.finish_after_reply(false).err().unwrap();
+        assert_eq!(call.begin_reply(), Err(RetainedCreateError::WrongPhase));
+        assert_eq!(call.reply_cap(), 300);
+        assert_eq!(call.request(), &[1, 2, 3]);
+        // A later positive read-only reconciliation may retire the owner.
         assert!(call.finish_after_reply(true).is_ok());
     }
 

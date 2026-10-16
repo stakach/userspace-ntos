@@ -869,6 +869,17 @@ impl MountedVolumeBackend {
 }
 
 impl DriverDispatchBackend for MountedVolumeBackend {
+    fn immutable_file_extent(&self, file_id: nt_io_manager::FileId, file_context: u64) -> Option<u64> {
+        let context = nt_fs::LayeredOpenContextId::from_raw(file_context);
+        let extent = self.opens.immutable_installed_file_extent(context, file_id.raw())?;
+        let binding = self.bindings.get(context_index(context)?)?.as_ref()?;
+        if binding.context != context || binding.is_directory || binding.overlay_open {
+            return None;
+        }
+        self.shares.get(binding.installed_open?).ok()?;
+        Some(extent)
+    }
+
     fn dispatch_irp(
         &mut self,
         ctx: DispatchContext<'_>,

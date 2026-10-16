@@ -526,6 +526,15 @@ impl PortCore {
             .map(|p| p.api)
     }
 
+    /// The exact live listen handle currently published under this name.
+    /// A closed and replaced port has a different handle even if its name matches.
+    pub fn named_listen_port_handle(&self, name: &[u16]) -> Option<u64> {
+        let folded = fold_name(name);
+        self.ports.iter()
+            .find(|port| port.user_open && port.named && port.name == folded)
+            .map(|port| port.handle)
+    }
+
     /// Resolve a port-core handle to the live listen/communication endpoint it names.
     pub fn handle_info(&self, handle: u64) -> Option<PortHandleInfo<'_>> {
         if handle == 0 {
@@ -867,6 +876,15 @@ impl PortCore {
             connection_id: conn_id,
             msg_type: port_message_type::CONNECTION_REQUEST,
         })
+    }
+
+    /// Inspect the next connection request without changing its delivery state.
+    /// A native receiver uses this to check its output capacity before dequeue.
+    pub fn peek_pending_connection(&self, port_handle: u64) -> Option<(u64, usize)> {
+        let port = self.ports.iter().find(|port| port.user_open && port.handle == port_handle)?;
+        let connection_id = *port.pending.first()?;
+        let connection = self.connections.iter().find(|connection| connection.id == connection_id)?;
+        Some((connection_id, connection.conn_info.len()))
     }
 
     /// Accept (or refuse) a pending connection. On accept, returns the server
@@ -2011,6 +2029,37 @@ impl PortCore {
                 security: connection.security,
             })
             .ok_or(NtStatus::REPLY_MESSAGE_MISMATCH)
+    }
+
+    /// Inspect the next queued message length without consuming it. The search
+    /// order matches `receive_message` so native copyout can reject short buffers.
+    pub fn peek_receive_message_len(&self, handle: u64) -> Option<usize> {
+        if let Some(connection) = self.connections.iter().find(|connection|
+            handle != 0 && connection.client_open && connection.client_handle == handle)
+        {
+            return connection.client_inbox.first().map(|stored| stored.message.bytes.len());
+        }
+        if let Some(connection) = self.connections.iter().find(|connection|
+            handle != 0 && connection.server_open && connection.server_handle == handle
+                && connection.server_api == PortApi::Alpc)
+        {
+            return connection.server_inbox.first().map(|stored| stored.message.bytes.len());
+        }
+        let port = self.ports.iter().find(|port| port.user_open && port.handle == handle)
+            .or_else(|| self.connection_port_index_for_server_handle(handle)
+                .and_then(|index| self.ports.get(index)))?;
+        port.datagrams.first().map(|stored| stored.message.bytes.len())
+            .or_else(|| self.kernel_endpoints.iter()
+                .find(|endpoint| endpoint.port_object_id == port.object_id
+                    && !endpoint.server_inbox.is_empty())
+                .and_then(|endpoint| endpoint.server_inbox.first())
+                .map(|stored| stored.message.bytes.len()))
+            .or_else(|| self.connections.iter()
+                .find(|connection| connection.server_open
+                    && connection.port_object_id == port.object_id
+                    && !connection.server_inbox.is_empty())
+                .and_then(|connection| connection.server_inbox.first())
+                .map(|stored| stored.message.bytes.len()))
     }
 
     /// Receive the next `PORT_MESSAGE` for the endpoint identified by `handle`.

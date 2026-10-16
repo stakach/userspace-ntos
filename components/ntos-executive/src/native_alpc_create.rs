@@ -7,6 +7,7 @@ use nt_process::native_alpc_port::{AlpcPortIdentity, NativeAlpcPortPublication};
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 static NEXT_ALPC_CREATE_INVOCATION: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct PreparedCreatePort {
@@ -29,12 +30,15 @@ pub(crate) struct PendingCreatePort {
     process_generation: u64,
     retained: RetainedCreate,
     publication: NativeAlpcPortPublication,
+    name: alloc::vec::Vec<u16>,
+    security_descriptor: Option<alloc::vec::Vec<u8>>,
 }
 
 impl PendingCreatePort {
     pub(crate) fn request(&self) -> &[u8] { self.retained.request() }
     pub(crate) fn reply_cap(&self) -> u64 { self.retained.reply_cap() }
     pub(crate) fn token(&self) -> (u64, u64) { self.retained.token() }
+    pub(crate) fn thread_id(&self) -> u64 { self.retained.owner().thread_id }
     pub(crate) fn process_handle(&self) -> u64 { self.publication.value() }
 
     pub(crate) fn begin(&mut self, request_id: u64) -> Result<(), u32> {
@@ -91,10 +95,24 @@ impl PendingCreatePort {
             self.abort_bound(&mut handler.pm)?;
             return Ok(());
         }
+        if let Some(descriptor) = self.security_descriptor.take() {
+            let service_handle = self.retained.terminal()
+                .filter(|result| result.status == 0)
+                .map(|result| result.handle).ok_or(STATUS_INVALID_HANDLE)?;
+            if let Err(error) = handler.native_alpc_secured_ports.register(
+                core::mem::take(&mut self.name), descriptor, service_handle,
+            ) {
+                self.abort_bound(&mut handler.pm)?;
+                return Err(error);
+            }
+        }
         match self.publication.publish(&mut handler.pm) {
             Ok(published) => self.retained.process_handle_published(published)
                 .map_err(|_| STATUS_INVALID_HANDLE),
             Err(error) => {
+                if let Some(result) = self.retained.terminal() {
+                    handler.native_alpc_secured_ports.retire(result.handle);
+                }
                 self.abort_bound(&mut handler.pm)?;
                 Err(error)
             }
@@ -140,6 +158,9 @@ impl PendingCreatePort {
     }
 
     pub(crate) fn reply_status(&self) -> Option<i32> { self.retained.reply_status() }
+    pub(crate) fn begin_reply(&mut self) -> Result<(), u32> {
+        self.retained.begin_reply().map_err(|_| STATUS_INVALID_PARAMETER)
+    }
     pub(crate) fn finish_after_reply(self, acknowledged: bool) -> Result<(), Self> {
         if acknowledged && self.retained.reply_status().is_some() { Ok(()) } else { Err(self) }
     }
@@ -166,11 +187,55 @@ impl crate::ExecNtHandler {
             .filter(|generation| *generation != 0)
             .ok_or(STATUS_INVALID_PARAMETER)?;
         let output_valid = self.probe_user_output(args[0], 8);
-        let captured = nt_alpc_native_capture::capture(
+        let mut captured = nt_alpc_native_capture::capture(
             args,
             |address, out| self.xas_read(address, out),
             |_, _| output_valid,
         )?;
+        if let Some(creator) = captured.security_descriptor_bytes.as_deref() {
+            let primary = self.pm.process_primary_token(process_id as nt_process::ProcessId)
+                .ok_or(STATUS_INVALID_HANDLE)?;
+            let client = self.pm.thread_impersonation(thread_id as nt_process::ThreadId)
+                .map(|context| nt_security::SubjectClientIdentity {
+                    token: context.token, level: context.level,
+                });
+            let mut subject = nt_security::CapturedSubjectContext::capture(
+                &mut self.token_store, primary, client, process_id)?;
+            let mut audit = nt_security::SecurityAssignmentAudit::default();
+            let assigned = {
+                subject.resolve(&self.token_store).and_then(|tokens|
+                    nt_security::assign_object_security_with_audit(
+                    &nt_security::ObjectSecurityAssignment {
+                        primary: tokens.primary,
+                        client: tokens.client.as_ref().map(|client|
+                            nt_security::SecurityAssignmentClient {
+                                token: client.token, level: client.level,
+                            }),
+                        creator: Some(creator), parent: None,
+                        mapping: &nt_security::PORT_GENERIC_MAPPING,
+                        is_container: false,
+                        mode: nt_security::ProcessorMode::UserMode,
+                        object_type: None,
+                        inheritance: nt_security::SecurityAssignmentInheritance::Legacy,
+                    }, &mut audit))
+            };
+            subject.release(&mut self.token_store)?;
+            static CREATE_SECURITY_TRACE: AtomicU64 = AtomicU64::new(0);
+            if CREATE_SECURITY_TRACE.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::print_str(b"[native-alpc-security] create control=0x");
+                crate::print_hex(u16::from_le_bytes([creator[2], creator[3]]) as u32);
+                crate::print_str(b" status=0x");
+                crate::print_hex(assigned.as_ref().err().copied().unwrap_or(0));
+                crate::print_str(b" SeSecurityPrivilege=");
+                crate::print_u64(match audit.security {
+                    Some(nt_security::SecurityAssignmentPrivilegeOutcome::Granted) => 1,
+                    Some(nt_security::SecurityAssignmentPrivilegeOutcome::Denied) => 0,
+                    None => 2,
+                });
+                crate::print_str(b"\n");
+            }
+            captured.security_descriptor_bytes = Some(assigned?);
+        }
         Ok(PreparedCreatePort {
             pi,
             badge,
@@ -202,6 +267,9 @@ impl crate::ExecNtHandler {
         let owner = CreateOwner { process_id: prepared.process_id,
             thread_id: prepared.thread_id, process_generation: prepared.process_generation };
         let request = prepared.captured.checked_wire(owner, token)?;
+        if request.len() > crate::REP_DATA_LEN {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
         let mut publication = self.pm.reserve_native_alpc_port_handle(
             caller, prepared.process_generation, token)?;
         let retained = match RetainedCreate::new(owner, token, reply_cap,
@@ -214,6 +282,7 @@ impl crate::ExecNtHandler {
         };
         Ok(PendingCreatePort { pi: prepared.pi, output: prepared.captured.output,
             process_id: prepared.process_id, process_generation: prepared.process_generation,
-            retained, publication })
+            retained, publication, name: prepared.captured.name,
+            security_descriptor: prepared.captured.security_descriptor_bytes })
     }
 }

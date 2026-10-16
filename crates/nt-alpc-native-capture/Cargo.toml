@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 nt-alpc-abi = { path = "../nt-alpc-abi" }
+nt-security = { path = "../nt-security" }
 bytemuck = { version = "1", default-features = false }
 
 [features]

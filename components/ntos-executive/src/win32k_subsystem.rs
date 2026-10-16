@@ -805,6 +805,11 @@ unsafe fn begin_provider_stack_event_activation(
             return None;
         }
     }
+    if !crate::win32k_cr8_publication::publish(activation, nt_kernel_exec::PASSIVE_LEVEL) {
+        if owner.is_some() { retire_hosted_wait_header(activation); }
+        let _ = activations.finish(activation);
+        return None;
+    }
     Some(ProviderStackEventActivationGuard { activation })
 }
 
@@ -863,6 +868,11 @@ unsafe fn capture_kernel_provider_stack_activation() -> Option<ProviderStackEven
         .as_mut()?
         .begin_kernel_for_stack_pointer(current_stack_pointer(), provider, descriptor)
         .ok()?;
+    if !crate::win32k_cr8_publication::publish(activation, nt_kernel_exec::PASSIVE_LEVEL) {
+        let _ = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
+            .as_mut()?.finish(activation);
+        return None;
+    }
     Some(ProviderStackEventActivationGuard { activation })
 }
 
@@ -1403,6 +1413,7 @@ pub const W32_PS_OP_QUERY_PROCESS_SEQUENCE: u64 = 18;
 pub const W32_PS_OP_QUERY_PROCESS_PRIORITY_CLASS: u64 = 19;
 pub const W32_PS_OP_SET_PROCESS_PRIORITY_CLASS: u64 = 20;
 pub const W32_PS_OP_QUERY_PROCESS_SESSION_ID_EX: u64 = 21;
+pub const W32_PS_OP_SET_PROCESS_PRIORITY_BY_CLASS: u64 = 22;
 /// Bounded global-atom requests. The executive owns the one native atom table; win32k stages only
 /// explicit-length UTF-16 input and receives the resulting 16-bit atom.
 pub const W32_ATOM_LABEL: u64 = 0x77E;
@@ -1440,6 +1451,8 @@ pub const W32_SOURCE_ARMED_LABEL: u64 = 0x7aa;
 /// Win32k's trusted RtlSetActiveConsoleId request to the executive KUSER owner.
 pub const W32_ACTIVE_CONSOLE_LABEL: u64 = 0x7ab;
 pub const W32_PROCESS_QUERY_LABEL: u64 = 0x7ac;
+/// Native frame-chain capture under the exact paused win32k physical lane.
+pub const W32_FRAME_CHAIN_LABEL: u64 = 0x7ad;
 pub const W32_ATTACH_PLAIN: u64 = 1;
 pub const W32_ATTACH_DETACH: u64 = 2;
 pub const W32_ATTACH_STACK: u64 = 3;
@@ -1479,7 +1492,6 @@ pub const W32_FILE_OBJECT_RELATED_DEVICE: u64 = 4;
 pub const W32_FILE_OBJECT_WAIT_IDENTITY: u64 = 5;
 pub const W32_FILE_OBJECT_DEVICE_NAME: u64 = 6;
 pub const W32_FILE_OBJECT_RELEASE_WAIT: u64 = 7;
-pub const W32_FILE_OBJECT_OPEN_DEVICE: u64 = 8;
 /// Root-authenticated kernel activation handoff before entering provider code.
 pub const W32_KERNEL_ACTIVATION_LABEL: u64 = 0x78E;
 pub const W32_MM_SECURE_OP_SECURE: u64 = 1;
@@ -3561,6 +3573,31 @@ unsafe fn win32k_ps_broker_call(op: u64, object: u64, value: u64) -> (i32, u64, 
     (status as u32 as i32, out1, out2, out3)
 }
 
+/// Called only from the naked Win64 frame-capture shim after it has placed its fixed packet on
+/// the provider stack. The executive authenticates and reads that packet using the paused lane;
+/// this routine treats the reply as a count and never exposes an executive pointer to win32k.
+#[unsafe(no_mangle)]
+unsafe extern "win64" fn win32k_native_frame_chain_bridge(packet_va: u64) -> u32 {
+    let (words, count, _, _, _) = unsafe {
+        crate::driver_launch::call_on4_raw(
+            (W32_FRAME_CHAIN_LABEL << 12) | 1,
+            packet_va,
+            0,
+            0,
+            0,
+        )
+    };
+    if words != 1 || count > nt_unwind::kernel_frame_ingress::FRAME_CHAIN_RESULT_CAPACITY as u64 {
+        unsafe {
+            crate::provider_bugcheck::report(
+                0xc4,
+                [W32_FRAME_CHAIN_LABEL, packet_va, words, count],
+            )
+        }
+    }
+    count as u32
+}
+
 /// The pinned native setter receives a 32-bit session ID and returns void.
 /// Root owns every KUSER alias, including aliases created after this call.
 extern "win64" fn s_rtl_set_active_console_id(session_id: u32) {
@@ -3760,6 +3797,15 @@ extern "win64" fn s_ps_set_process_priority_class(process: u64, priority_class: 
     };
     if status != 0 {
         reject_ps_broker("process priority class update", status);
+    }
+}
+
+extern "win64" fn s_ps_set_process_priority_by_class(process: u64, mode: u32) {
+    let (status, _, _, _) = unsafe {
+        win32k_ps_broker_call(W32_PS_OP_SET_PROCESS_PRIORITY_BY_CLASS, process, u64::from(mode))
+    };
+    if status != 0 {
+        reject_ps_broker("process priority by class update", status);
     }
 }
 
@@ -4378,7 +4424,7 @@ use nt_object_manager::win32k_ob::{
 static mut OBJ_TABLE: ObHandleTable = ObHandleTable::new();
 
 pub(crate) mod object_security;
-mod directory_object;
+pub(crate) mod directory_object;
 mod file_close;
 mod file_open;
 mod section_create;
@@ -4954,13 +5000,22 @@ unsafe fn finish_provider_stack_event_activation(
         return false;
     }
     let _metadata = ProviderMetadataGuard::acquire();
-    let finished = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
+    let (finished, parent) = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
         .as_mut()
-        .is_some_and(|activations| activations.finish(activation).is_ok());
+        .map(|activations| {
+            let finished = activations.finish(activation).is_ok();
+            let parent = if finished {
+                activations.active(activation.lane).ok().and_then(|parent| {
+                    activations.current_irql(parent).ok().map(|irql| (parent, irql))
+                })
+            } else { None };
+            (finished, parent)
+        })
+        .unwrap_or((false, None));
     if finished {
         retire_hosted_wait_header(activation);
     }
-    finished
+    finished && crate::win32k_cr8_publication::retire(activation, parent)
 }
 
 unsafe fn retire_existing_provider_local_event(body: u64) -> bool {
@@ -6291,6 +6346,20 @@ extern "win64" fn s_rtl_nt_status_to_dos_error(status: u32) -> u32 {
 extern "win64" fn s_ke_delay_execution_thread(_wait_mode: u32, _alertable: u8, interval: *const i64) -> i32 {
     assert!(!interval.is_null(), "KeDelayExecutionThread null interval");
     let interval = unsafe { read_unaligned(interval) };
+    if interval <= 0 {
+        // The win32k provider can wait while the executive's HPET clock and
+        // dispatch timer are serviced in a different lane. Its calibrated TSC
+        // is an independent monotonic source for a finite relative delay.
+        return match nt_kernel_exec::stall::wait_relative_100ns(
+            interval,
+            crate::platform_tsc_frequency_hz(),
+            crate::driver_launch::read_ordered_tsc,
+            crate::yield_now,
+        ) {
+            Some(()) => 0,
+            None => STATUS_NOT_SUPPORTED_I32,
+        };
+    }
     let deadline = nt_delay_execution::Deadline::from_nt_timeout(Some(interval), crate::nt_time_snapshot());
     while !deadline.is_due(crate::nt_time_snapshot()) {
         crate::yield_now();
@@ -6474,38 +6543,6 @@ unsafe fn drain_win32k_ex_work() {
         let Some(work) = work else { break; };
         let routine: extern "win64" fn(u64) = core::mem::transmute(work.routine as *const ());
         routine(work.parameter);
-    }
-}
-
-extern "win64" fn s_ex_acquire_rundown_protection(run_ref: *const nt_kernel_exec::ExRundownRef) -> u8 {
-    assert!(!run_ref.is_null(), "ExAcquireRundownProtection null descriptor");
-    unsafe { (&*run_ref).acquire() as u8 }
-}
-
-extern "win64" fn s_ex_initialize_rundown_protection(run_ref: *const nt_kernel_exec::ExRundownRef) {
-    assert!(!run_ref.is_null(), "ExInitializeRundownProtection null descriptor");
-    unsafe { (&*run_ref).initialize() }
-}
-
-extern "win64" fn s_ex_reinitialize_rundown_protection(run_ref: *const nt_kernel_exec::ExRundownRef) {
-    assert!(!run_ref.is_null(), "ExReInitializeRundownProtection null descriptor");
-    assert!(unsafe { (&*run_ref).reinitialize() }, "ExReInitializeRundownProtection requires completed rundown");
-}
-
-extern "win64" fn s_ex_release_rundown_protection(run_ref: *const nt_kernel_exec::ExRundownRef) {
-    assert!(!run_ref.is_null(), "ExReleaseRundownProtection null descriptor");
-    let _ = unsafe { (&*run_ref).release() };
-}
-
-extern "win64" fn s_ex_wait_for_rundown_protection_release(run_ref: *const nt_kernel_exec::ExRundownRef) {
-    assert!(!run_ref.is_null(), "ExWaitForRundownProtectionRelease null descriptor");
-    let reference = unsafe { &*run_ref };
-    let waiter = nt_kernel_exec::ExRundownWaitBlock::new();
-    if unsafe { reference.begin_wait(&waiter) } {
-        while waiter.remaining() != 0 {
-            crate::yield_now();
-        }
-        unsafe { reference.finish_wait(&waiter) };
     }
 }
 
@@ -14724,23 +14761,76 @@ extern "win64" fn s_io_get_device_object_pointer(
         if length > maximum || length & 1 != 0 || buffer == 0 {
             return STATUS_INVALID_PARAMETER_I32;
         }
-        let packet = pool_alloc(length as u64);
-        if packet == 0 {
-            return STATUS_INSUFFICIENT_RESOURCES_I32;
+        // Use the same typed native File handle and per-open consumer projection as every
+        // other win32k File reference. The named Device's actual driver (including dxgkrnl)
+        // owns CREATE; no VideoPort-only projection or synthetic device is involved.
+        #[repr(C)]
+        struct ObjectAttributes {
+            length: u32,
+            _padding: u32,
+            root_directory: u64,
+            object_name: u64,
+            attributes: u32,
+            _padding2: u32,
+            security_descriptor: u64,
+            security_qos: u64,
         }
-        core::ptr::copy_nonoverlapping(buffer as *const u8, packet as *mut u8, length);
-        let (status, file, device, _) = win32k_file_object_broker_call(
-            W32_FILE_OBJECT_OPEN_DEVICE,
-            packet,
-            access,
-            length as u64,
+        let attributes = ObjectAttributes {
+            length: core::mem::size_of::<ObjectAttributes>() as u32,
+            _padding: 0,
+            root_directory: 0,
+            object_name: name,
+            attributes: 0x200, // OBJ_KERNEL_HANDLE
+            _padding2: 0,
+            security_descriptor: 0,
+            security_qos: 0,
+        };
+        let mut handle = 0u64;
+        let mut iosb = nt_kernel_abi::IoStatusBlock::default();
+        let status = file_open::open(
+            &mut handle as *mut u64 as u64,
+            access as u32,
+            &attributes as *const ObjectAttributes as u64,
+            &mut iosb as *mut nt_kernel_abi::IoStatusBlock as u64,
+            0,
+            0x40, // FILE_NON_DIRECTORY_FILE
         );
-        assert!(provider_pool_free(packet), "device-name packet retirement failed");
-        if status == 0 {
-            core::ptr::write_unaligned(fileobj_out, file);
-            core::ptr::write_unaligned(devobj_out, device);
+        if status != 0 {
+            return status;
         }
-        status
+        if handle == 0 {
+            return STATUS_INVALID_HANDLE_I32;
+        }
+        let mut file = 0u64;
+        let reference_status = s_ob_reference_object_by_handle(
+            handle,
+            0,
+            0,
+            0, // KernelMode
+            &mut file as *mut u64,
+            core::ptr::null_mut(),
+        );
+        let close_status = s_zw_close(handle);
+        assert_eq!(close_status, 0, "temporary device File close remained uncertain");
+        if reference_status != 0 {
+            return reference_status;
+        }
+        if file == 0 {
+            return STATUS_INVALID_HANDLE_I32;
+        }
+        let (related_status, device, _, _) = win32k_file_object_broker_call(
+            W32_FILE_OBJECT_RELATED_DEVICE,
+            file,
+            0,
+            0,
+        );
+        if related_status != 0 || device == 0 {
+            s_ob_dereference_object(file);
+            return if related_status != 0 { related_status } else { STATUS_INVALID_HANDLE_I32 };
+        }
+        core::ptr::write_unaligned(fileobj_out, file);
+        core::ptr::write_unaligned(devobj_out, device);
+        0
     }
 }
 
@@ -14760,27 +14850,6 @@ extern "win64" fn s_io_get_related_device_object(file_object: u64) -> u64 {
     }
 }
 
-
-/// win32k's KeGetCurrentIrql helper RVA — `mov rax, cr8` (bytes 44 0F 20 C0) followed by `ret`. The
-/// unique CR8 access in the image (verified by opcode scan).
-const KE_GET_CURRENT_IRQL_RVA: u64 = 0x305c0;
-
-/// Redirect the exact privileged helper to activation-local IRQL. No padding beyond its five
-/// bytes is assumed; a changed image or unreachable target rejects loading before execution.
-unsafe fn patch_ke_get_current_irql() -> bool {
-    let p = WIN32K_CODE_VA + KE_GET_CURRENT_IRQL_RVA;
-    let original = core::slice::from_raw_parts(p as *const u8, 5);
-    let Ok(patch) = nt_kernel_exec::cr8_getter_patch::plan_cr8_getter_redirect(
-        original, p, irql::read_cr8 as *const () as u64,
-    ) else {
-        print_str(b"[win32k] reject image: invalid KeGetCurrentIrql redirect\n");
-        return false;
-    };
-    for (index, byte) in patch.iter().enumerate() {
-        write_volatile((p + index as u64) as *mut u8, *byte);
-    }
-    true
-}
 
 // --- win32k -> client user-mode callback bridge (KeUserModeCallback) --------------------------
 //
@@ -15163,11 +15232,7 @@ fn register_trampolines() -> bool {
     reg.bind("RtlMultiByteToUnicodeSize", s_rtl_multibyte_to_unicode_size as usize as u64);
     reg.bind("ExRaiseAccessViolation", seh.access_violation_va);
     reg.bind("ExRaiseStatus", seh.raise_va);
-    reg.bind("ExAcquireRundownProtection", s_ex_acquire_rundown_protection as usize as u64);
-    reg.bind("ExInitializeRundownProtection", s_ex_initialize_rundown_protection as usize as u64);
-    reg.bind("ExReInitializeRundownProtection", s_ex_reinitialize_rundown_protection as usize as u64);
-    reg.bind("ExReleaseRundownProtection", s_ex_release_rundown_protection as usize as u64);
-    reg.bind("ExWaitForRundownProtectionRelease", s_ex_wait_for_rundown_protection_release as usize as u64);
+    crate::ex_rundown_exports::bind_ex_rundown_exports(reg);
     reg.bind("RtlUnwindEx", seh.unwind_entry_va);
     reg.bind("RtlUnwind", seh.legacy_unwind_va);
     reg.bind("PsDereferencePrimaryToken", s_ps_dereference_primary_token as usize as u64);
@@ -15625,6 +15690,10 @@ fn register_trampolines() -> bool {
     reg.bind("memset", s_memset as usize as u64);
     reg.bind("RtlFillMemory", s_memset as usize as u64);
     reg.bind("RtlAssert", native_assertion::rtl_assert as usize as u64);
+    reg.bind(
+        "RtlWalkFrameChain",
+        crate::win32k_frame_capture::rtl_walk_frame_chain as usize as u64,
+    );
     // --- batch 4: Ps identity + per-process win32-slots (set by win32k's process callout) ---
     reg.bind(
         "PsGetCurrentProcessId",
@@ -15651,6 +15720,10 @@ fn register_trampolines() -> bool {
     reg.bind(
         "PsSetProcessPriorityClass",
         s_ps_set_process_priority_class as usize as u64,
+    );
+    reg.bind(
+        "PsSetProcessPriorityByClass",
+        s_ps_set_process_priority_by_class as usize as u64,
     );
     reg.bind(
         "PsGetProcessSequenceNumber",
@@ -16479,11 +16552,6 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize, nls_sizes: [usize; 3]) ->
             }
             desc_rva += 20;
         }
-    }
-
-    // CR8 is privileged; its getter must observe the exact executing provider activation.
-    if !patch_ke_get_current_irql() {
-        return None;
     }
 
     // NOTE: the FIRST-LIGHT binary patch (`patch_skip_cursor_tail`) that made

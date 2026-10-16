@@ -1,4 +1,5 @@
 use crate::ObjectManager;
+use crate::{session_namespace_ownership, SessionNamespaceOwnership};
 use nt_status::NtStatus;
 use nt_types::{CaseSensitivity, NtPath, UnicodeString};
 
@@ -12,6 +13,24 @@ fn bootstrapped() -> ObjectManager {
     let mut manager = ObjectManager::new();
     manager.bootstrap_namespace().unwrap();
     manager
+}
+
+#[test]
+fn smss_reserves_bootstrap_session_zero_before_numbered_sessions() {
+    // Pinned LiberNT SMSS calls SystemSessionCreate/Detach to reserve ID 0
+    // before it launches the first GUI session. The kernel already owns this
+    // namespace, including the BaseNamedObjects link.
+    let mut manager = bootstrapped();
+    let session_zero = manager.lookup_path(&path("\\Sessions\\0"), CI).unwrap().id();
+    let bno = manager.lookup_link(&path("\\Sessions\\0\\BaseNamedObjects"), CI).unwrap().id();
+    assert_eq!(session_namespace_ownership(0), SessionNamespaceOwnership::Bootstrap);
+    assert_eq!(manager.lookup_path(&path("\\Sessions\\0"), CI).unwrap().id(), session_zero);
+    assert_eq!(manager.lookup_link(&path("\\Sessions\\0\\BaseNamedObjects"), CI).unwrap().id(), bno);
+    assert_eq!(session_namespace_ownership(1), SessionNamespaceOwnership::Numbered);
+    let (session_one, windows_one) = manager.create_session_namespace(1).unwrap();
+    assert_eq!(manager.lookup_path(&path("\\Sessions\\1"), CI).unwrap().id(), session_one);
+    assert_eq!(manager.lookup_path(&path("\\Sessions\\1\\Windows"), CI).unwrap().id(), windows_one);
+    assert_eq!(manager.lookup_path(&path("\\Sessions\\0"), CI).unwrap().id(), session_zero);
 }
 
 #[test]

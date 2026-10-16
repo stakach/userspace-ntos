@@ -250,6 +250,47 @@ impl HostedDpcTable {
         }
     }
 
+    /// Remove the currently registered queue entry for this exact owner and provider KDPC.
+    /// The generation is discovered in the root-owned table, never trusted from provider memory.
+    pub fn remove_registered(
+        &mut self,
+        owner: HostedDpcOwner,
+        dpc_token: u64,
+    ) -> Result<bool, HostedDpcError> {
+        if HostedDpcOwner::new(owner.domain_id, owner.domain_cookie, owner.lane_generation)
+            != Some(owner)
+            || dpc_token == 0
+        {
+            return Err(HostedDpcError::InvalidIdentity);
+        }
+        let identity = self.records.iter()
+            .find(|record| record.live && record.identity.owner == owner && record.identity.dpc_token == dpc_token)
+            .map(|record| record.identity)
+            .ok_or(HostedDpcError::NotRegistered)?;
+        self.remove(identity)
+    }
+
+    /// Inspect a provider KDPC without trusting a projected generation or touching queue state.
+    pub fn snapshot_registered(
+        &self,
+        owner: HostedDpcOwner,
+        dpc_token: u64,
+    ) -> Result<Option<HostedDpcSnapshot>, HostedDpcError> {
+        if HostedDpcOwner::new(owner.domain_id, owner.domain_cookie, owner.lane_generation)
+            != Some(owner)
+            || dpc_token == 0
+        {
+            return Err(HostedDpcError::InvalidIdentity);
+        }
+        let Some(identity) = self.records.iter()
+            .find(|record| record.live && record.identity.owner == owner && record.identity.dpc_token == dpc_token)
+            .map(|record| record.identity)
+        else {
+            return Ok(None);
+        };
+        self.snapshot(identity).map(Some)
+    }
+
     pub fn begin_next(
         &mut self,
         owner: HostedDpcOwner,
@@ -525,5 +566,23 @@ mod tests {
         assert_eq!(table.queued_count(first_owner), 0);
         assert_eq!(table.retire_owner(first_owner), Ok(1));
         assert!(!table.has_owner(first_owner));
+    }
+
+    #[test]
+    fn remove_registered_dpc_checks_owner_and_current_generation() {
+        let mut table = HostedDpcTable::new();
+        let first_owner = owner(7);
+        let other_owner = owner(9);
+        let identity = table.register(first_owner, 0x1000, 0x2000, 0x3000).unwrap();
+        table.queue(identity, 0, 0).unwrap();
+        assert_eq!(table.remove_registered(other_owner, 0x1000), Err(HostedDpcError::NotRegistered));
+        assert!(table.snapshot(identity).unwrap().queued);
+        assert_eq!(table.remove_registered(first_owner, 0x1000), Ok(true));
+        assert_eq!(table.remove_registered(first_owner, 0x1000), Ok(false));
+        let replacement = table.register(first_owner, 0x1000, 0x2001, 0x3000).unwrap();
+        assert_ne!(replacement.generation, identity.generation);
+        table.queue(replacement, 1, 2).unwrap();
+        assert_eq!(table.remove(identity), Err(HostedDpcError::NotRegistered));
+        assert_eq!(table.remove_registered(first_owner, 0x1000), Ok(true));
     }
 }

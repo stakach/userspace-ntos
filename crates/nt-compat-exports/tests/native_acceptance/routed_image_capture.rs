@@ -64,9 +64,23 @@ impl<'ast> Visit<'ast> for Extent {
 }
 
 #[test]
-fn routed_image_publishes_only_after_exact_eof_not_first_parseable_header() {
+fn routed_image_publishes_only_after_exact_eof_or_immutable_extent() {
     struct Publication { exact: bool, guarded: bool, count: usize }
     impl<'ast> Visit<'ast> for Publication {
+        fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+            let previous = self.exact;
+            if let Some((_, guard)) = &arm.guard {
+                let mut extent = Extent::default();
+                extent.visit_expr(guard);
+                let mut calls = Calls::default();
+                calls.visit_expr(&arm.body);
+                self.exact |= extent.eof && extent.equality
+                    && calls.0.iter().any(|name| name == "capture_image_layout")
+                    && calls.0.iter().any(|name| name == "read_retained");
+            }
+            self.visit_expr(&arm.body);
+            self.exact = previous;
+        }
         fn visit_expr_if(&mut self, branch: &'ast syn::ExprIf) {
             let mut extent = Extent::default();
             extent.visit_expr(&branch.cond);
@@ -88,9 +102,11 @@ fn routed_image_publishes_only_after_exact_eof_not_first_parseable_header() {
     let mut publication = Publication { exact: false, guarded: true, count: 0 };
     publication.visit_arm(&phase("HeaderDispatch"));
     assert!(publication.count != 0 && publication.guarded,
-        "parseable headers are not a process image snapshot: retained capture must reach exact canonical EOF before Publish");
+        "publication requires exact canonical EOF or an identity-bound immutable extent with a retained layout read");
     let mut calls = Calls::default();
     calls.visit_arm(&phase("HeaderDispatch"));
+    assert!(calls.0.iter().any(|name| name == "immutable_file_extent"),
+        "the layout-only path needs an attested immutable File extent");
     let reserve = calls.0.iter().position(|name| name == "reserve_file_snapshot_capacity")
         .expect("fallible capture storage admission remains required");
     let read = calls.0.iter().position(|name| name == "build_and_dispatch_external_to_device")

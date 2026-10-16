@@ -40,6 +40,8 @@ fn pinned_win32k_rundown_imports_have_native_export_bindings() {
     }
 
     let source = include_str!("../../../components/ntos-executive/src/win32k_subsystem.rs");
+    assert!(source.contains("crate::ex_rundown_exports::bind_ex_rundown_exports(reg);"));
+    let source = include_str!("../../../components/ntos-executive/src/ex_rundown_exports.rs");
     for name in RUNDOWN_IMPORTS {
         assert!(
             source.contains(&format!("reg.bind(\"{name}\","))

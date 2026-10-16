@@ -8,8 +8,9 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use nt_alpc_abi::{AlpcCreatePortCheckedRequest, AlpcCreatePortOwnedRequest,
-    AlpcCreatePortRequest, AlpcPortAttributes};
+    AlpcCreatePortRequest, AlpcCreatePortSecuredRequest, AlpcPortAttributes};
 
 mod retained_create;
 pub use retained_create::{CreateOwner, RetainedCreate, RetainedCreateError, TerminalCreate};
@@ -27,6 +28,7 @@ pub struct CapturedCreatePort {
     pub root_directory: u64,
     pub object_flags: u32,
     pub security_descriptor: u64,
+    pub security_descriptor_bytes: Option<Vec<u8>>,
     pub name: Vec<u16>,
     pub attributes: [u8; 72],
 }
@@ -57,7 +59,8 @@ impl CapturedCreatePort {
         {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        if self.root_directory != 0 || self.security_descriptor != 0 {
+        if self.root_directory != 0
+            || (self.security_descriptor != 0 && self.security_descriptor_bytes.is_none()) {
             return Err(STATUS_NOT_SUPPORTED);
         }
         // OBJ_CASE_INSENSITIVE is already the port core's name comparison rule.
@@ -86,10 +89,15 @@ impl CapturedCreatePort {
         {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let header_size = core::mem::size_of::<AlpcCreatePortOwnedRequest>();
+        let descriptor = self.security_descriptor_bytes.as_deref().unwrap_or(&[]);
+        let header_size = if descriptor.is_empty() {
+            core::mem::size_of::<AlpcCreatePortOwnedRequest>()
+        } else {
+            core::mem::size_of::<AlpcCreatePortSecuredRequest>()
+        };
         let name_len_bytes = self.name.len() * 2;
         let mut wire = Vec::new();
-        wire.try_reserve_exact(header_size + name_len_bytes)
+        wire.try_reserve_exact(header_size + name_len_bytes + descriptor.len())
             .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         let request = AlpcCreatePortOwnedRequest {
             checked: AlpcCreatePortCheckedRequest {
@@ -109,10 +117,20 @@ impl CapturedCreatePort {
             },
             attributes,
         };
-        wire.extend_from_slice(bytemuck::bytes_of(&request));
+        if descriptor.is_empty() {
+            wire.extend_from_slice(bytemuck::bytes_of(&request));
+        } else {
+            let secured = AlpcCreatePortSecuredRequest {
+                owned: request,
+                security_offset: (header_size + name_len_bytes) as u32,
+                security_len_bytes: descriptor.len() as u32,
+            };
+            wire.extend_from_slice(bytemuck::bytes_of(&secured));
+        }
         for unit in &self.name {
             wire.extend_from_slice(&unit.to_le_bytes());
         }
+        wire.extend_from_slice(descriptor);
         Ok(wire)
     }
 }
@@ -134,6 +152,7 @@ pub fn capture(
         root_directory: 0,
         object_flags: 0,
         security_descriptor: 0,
+        security_descriptor_bytes: None,
         name: Vec::new(),
         attributes: [0; 72],
     };
@@ -148,6 +167,17 @@ pub fn capture(
         captured.root_directory = u64::from_le_bytes(oa[8..16].try_into().unwrap());
         captured.object_flags = u32::from_le_bytes(oa[24..28].try_into().unwrap());
         captured.security_descriptor = u64::from_le_bytes(oa[32..40].try_into().unwrap());
+        if captured.security_descriptor != 0 {
+            struct Reader<R>(RefCell<R>);
+            impl<R: FnMut(u64, &mut [u8]) -> bool> nt_security::ClientMemory for Reader<R> {
+                fn read(&self, va: u64, dst: &mut [u8]) -> bool {
+                    (self.0.borrow_mut())(va, dst)
+                }
+            }
+            captured.security_descriptor_bytes = Some(
+                nt_security::capture_security_descriptor_bytes(
+                    &Reader(RefCell::new(&mut read)), captured.security_descriptor)?);
+        }
         let name_pointer = u64::from_le_bytes(oa[16..24].try_into().unwrap());
         if name_pointer != 0 {
             let mut unicode = [0u8; 16];
@@ -265,6 +295,46 @@ mod tests {
         assert_eq!(request.attributes.max_message_length, 328);
         assert_eq!(request.attributes.max_pool_usage, 8192);
         assert_eq!(&wire[size..], &memory[160..180]);
+    }
+
+    #[test]
+    fn smss_absolute_port_security_is_owned_before_create_submission() {
+        let mut memory = image().to_vec();
+        memory.resize(1024, 0);
+        // Pinned LiberNT SMSS supplies an absolute x64 security descriptor with
+        // a DACL and a mandatory-label SACL in OBJECT_ATTRIBUTES.
+        memory[96..104].copy_from_slice(&400u64.to_le_bytes());
+        memory[400] = 1;
+        memory[402..404].copy_from_slice(&0x14u16.to_le_bytes());
+        memory[424..432].copy_from_slice(&512u64.to_le_bytes());
+        memory[432..440].copy_from_slice(&448u64.to_le_bytes());
+        for (offset, ace_type, authority) in [(448, 0u8, 1u8), (512, 0x11u8, 16u8)] {
+            memory[offset] = 2;
+            memory[offset + 2..offset + 4].copy_from_slice(&28u16.to_le_bytes());
+            memory[offset + 4..offset + 6].copy_from_slice(&1u16.to_le_bytes());
+            memory[offset + 8] = ace_type;
+            memory[offset + 10..offset + 12].copy_from_slice(&20u16.to_le_bytes());
+            memory[offset + 12..offset + 16].copy_from_slice(&1u32.to_le_bytes());
+            memory[offset + 16] = 1;
+            memory[offset + 17] = 1;
+            memory[offset + 23] = authority;
+        }
+        let captured = capture([16, 64, 256], |address, out| {
+            let Some(bytes) = memory.get(address as usize..address as usize + out.len()) else {
+                return false;
+            };
+            out.copy_from_slice(bytes);
+            true
+        }, |address, size| address == 16 && size == 8).unwrap();
+        let owned = captured.security_descriptor_bytes.as_ref().unwrap();
+        assert_eq!(owned[0], 1);
+        assert_ne!(u16::from_le_bytes(owned[2..4].try_into().unwrap()) & 0x8000, 0);
+        assert_ne!(u32::from_le_bytes(owned[12..16].try_into().unwrap()), 0);
+        assert_ne!(u32::from_le_bytes(owned[16..20].try_into().unwrap()), 0);
+        memory[448..540].fill(0);
+        let owner = CreateOwner { process_id: 41, thread_id: 51, process_generation: 61 };
+        let wire = captured.checked_wire(owner, (71, 81)).unwrap();
+        assert!(wire.windows(owned.len()).any(|part| part == owned));
     }
 
     #[test]

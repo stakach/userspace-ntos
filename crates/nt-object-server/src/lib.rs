@@ -23,6 +23,7 @@ use nt_object_abi::{
     ObDereferenceObjectRequest, ObLookupPathRequest, ObOpenObjectRequest, ObQueryObjectInfo,
     ObReferenceFileHandleRequest,
     ObReferenceHandleRequest, ObReply, ObDirectoryHandleRequest, ObQueryDirectoryRequest,
+    ObCreateSessionNamespaceRequest, ObRetireSessionNamespaceRequest,
 };
 use nt_object_manager::{ClientKind, ComponentId, ObjectBody, ObjectManager, ObjectRef};
 use nt_status::NtStatus;
@@ -112,6 +113,8 @@ impl Server {
             opcode::OB_OP_CREATE_DIRECTORY => self.op_create_directory(in_buf),
             opcode::OB_OP_CREATE_DIRECTORY_HANDLE => self.op_directory_handle(client, in_buf, true),
             opcode::OB_OP_OPEN_DIRECTORY_HANDLE => self.op_directory_handle(client, in_buf, false),
+            opcode::OB_OP_CREATE_SESSION_NAMESPACE => self.op_create_session_namespace(client, in_buf),
+            opcode::OB_OP_RETIRE_SESSION_NAMESPACE_EXACT => self.op_retire_session_namespace(client, in_buf),
             opcode::OB_OP_QUERY_DIRECTORY => self.op_query_directory(client, in_buf, out_buf),
             opcode::OB_OP_CREATE_SYMBOLIC_LINK => self.op_create_symlink(in_buf),
             opcode::OB_OP_QUERY_SYMBOLIC_LINK => self.op_query_symlink(in_buf, out_buf),
@@ -294,6 +297,40 @@ impl Server {
         }
     }
 
+    fn op_create_session_namespace(
+        &mut self,
+        client: ClientId,
+        buf: &[u8],
+    ) -> Result<ObReply, NtStatus> {
+        if self.om.client_mode(client)? != AccessMode::KernelMode {
+            return Err(NtStatus::ACCESS_DENIED);
+        }
+        let req: ObCreateSessionNamespaceRequest = read_req(buf)?;
+        check_size::<ObCreateSessionNamespaceRequest>(req.abi_size)?;
+        if req.reserved != 0 { return Err(NtStatus::INVALID_PARAMETER); }
+        let (session, windows) = self.om.create_session_namespace(req.session_id)?;
+        Ok(reply(NtStatus::SUCCESS, 0, session.0, windows.0))
+    }
+
+    fn op_retire_session_namespace(
+        &mut self,
+        client: ClientId,
+        buf: &[u8],
+    ) -> Result<ObReply, NtStatus> {
+        if self.om.client_mode(client)? != AccessMode::KernelMode {
+            return Err(NtStatus::ACCESS_DENIED);
+        }
+        let req: ObRetireSessionNamespaceRequest = read_req(buf)?;
+        check_size::<ObRetireSessionNamespaceRequest>(req.abi_size)?;
+        if req.reserved != 0 || req.session_object_id == 0 || req.windows_object_id == 0 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        self.om.retire_session_namespace_exact(
+            req.session_id, ObjectId(req.session_object_id), ObjectId(req.windows_object_id),
+        )?;
+        Ok(ok())
+    }
+
     fn op_query_directory(&mut self, client: ClientId, buf: &[u8], out: &mut [u8])
         -> Result<ObReply, NtStatus>
     {
@@ -389,13 +426,34 @@ impl Server {
 
     fn op_create_symlink(&mut self, buf: &[u8]) -> Result<ObReply, NtStatus> {
         let req: ObCreateSymbolicLinkRequest = read_req(buf)?;
+        check_size::<ObCreateSymbolicLinkRequest>(req.abi_size)?;
+        if u32::from(req.obj_attributes)
+            & !(ObjAttrFlags::PERMANENT | ObjAttrFlags::OPEN_IF | ObjAttrFlags::CASE_INSENSITIVE)
+                .bits()
+            != 0
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         let link_path = read_path(buf, req.link_offset, req.link_len_bytes)?;
         let target = read_unicode(buf, req.target_offset, req.target_len_bytes)?;
         let (parent, leaf) = self.split_parent(&link_path)?;
         let permanent = permanent_of(req.obj_attributes);
-        let link = self
+        let link = match self
             .om
-            .create_symbolic_link_target(&parent, &leaf, target, permanent)?;
+            .create_symbolic_link_target(&parent, &leaf, target.clone(), permanent)
+        {
+            Ok(link) => link,
+            Err(NtStatus::OBJECT_NAME_COLLISION)
+                if u32::from(req.obj_attributes) & ObjAttrFlags::OPEN_IF.bits() != 0 =>
+            {
+                let existing = self.om.lookup_link(&link_path, case_of(req.obj_attributes))?;
+                if self.om.query_symbolic_link(&existing)? != target {
+                    return Err(NtStatus::OBJECT_NAME_COLLISION);
+                }
+                return Ok(reply(NtStatus::OBJECT_NAME_EXISTS, 0, existing.id().0, 0));
+            }
+            Err(status) => return Err(status),
+        };
         Ok(reply(NtStatus::SUCCESS, 0, link.id().0, 0))
     }
 

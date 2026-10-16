@@ -59,8 +59,7 @@ fn unsigned_to_char(value: u64, base: u32) -> Option<Vec<u8>> {
 
 /// `RtlCharToInteger`: parse an ASCII unsigned integer in `base` (`0` auto-detects `0x`).
 pub fn char_to_integer(s: &[u8], base: u32) -> Option<u32> {
-    let wide: Vec<u16> = s.iter().map(|&b| b as u16).collect();
-    unicode_string_to_integer(&wide, base)
+    nt_compat_exports::rtl::char_to_integer(s, base)
 }
 
 /// `RtlInt64ToUnicodeString`: format a 64-bit `value` in `base` (2/8/10/16) as UTF-16 units.

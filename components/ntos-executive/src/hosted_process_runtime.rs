@@ -13,7 +13,6 @@ pub(crate) struct HostedProcessRuntime {
     pub(crate) pi: usize,
     pub(crate) generation: u64,
     pub(crate) observation_role: nt_exe_image::HostedProcessRole,
-    pub(crate) priority: u64,
     pub(crate) env_scratch_va: u64,
     pub(crate) stack_mirror_va: u64,
     pub(crate) heap_mirror_va: u64,
@@ -150,7 +149,6 @@ struct HostedProcessAddressLayout {
     heap_mirror_va: u64,
 }
 
-const HOSTED_PROCESS_DEFAULT_PRIORITY: u64 = 100;
 const SMSS_ENV_SCRATCH_VA: u64 = 0x0000_0100_1074_0000;
 const CSRSS_ENV_SCRATCH_VA: u64 = 0x0000_0100_1078_0000;
 const HOSTED_DYNAMIC_FIRST_PI: usize = 7;
@@ -340,7 +338,6 @@ fn runtime_for_image(
         pi: image.pi,
         generation: image.generation,
         observation_role: image.observation_role(),
-        priority: HOSTED_PROCESS_DEFAULT_PRIORITY,
         env_scratch_va: layout.env_scratch_va,
         stack_mirror_va: layout.stack_mirror_va,
         heap_mirror_va: layout.heap_mirror_va,
@@ -392,6 +389,7 @@ pub(crate) unsafe fn spawn_hosted_sec_image_for_image(
     ldrpinit_rva: u64,
     client_process_id: u64,
     client_thread_id: u64,
+    initial_priority: u8,
 ) -> img_spawn::SecImageSpawn {
     let runtime = expect_hosted_process_runtime(image.pi);
     spawn_sec_image(
@@ -403,7 +401,7 @@ pub(crate) unsafe fn spawn_hosted_sec_image_for_image(
         fault_ep_c,
         ntdll,
         setup_env,
-        runtime.priority,
+        u64::from(initial_priority),
         runtime.env_scratch_va,
         runtime.stack_mirror_va,
         runtime.heap_mirror_va,

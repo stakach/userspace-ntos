@@ -100,6 +100,9 @@ impl ThreadPriorityByClassEffect {
     pub const fn kernel_object(&self) -> Option<u64> {
         self.kernel_object
     }
+    pub const fn state(&self) -> ThreadState {
+        self.state
+    }
     pub const fn expected(&self) -> ThreadSchedulingState {
         self.expected
     }
@@ -138,6 +141,17 @@ impl ProcessPriorityByClassPlan {
 }
 
 impl ProcessManager {
+    pub(crate) fn ensure_priority_plan_manager_identity(&mut self) -> Result<u64, u32> {
+        if self.priority_plan_manager_identity == 0 {
+            self.priority_plan_manager_identity = NEXT_MANAGER
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_add(1)
+                })
+                .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        }
+        Ok(self.priority_plan_manager_identity)
+    }
+
     pub fn process_scheduling_state_for_kernel_object(
         &self,
         eprocess: u64,
@@ -309,15 +323,9 @@ impl ProcessManager {
         let creation_sequence = process.creation_sequence;
         let process_state = process.state;
 
-        if self.priority_plan_manager_identity == 0 {
-            self.priority_plan_manager_identity = NEXT_MANAGER
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                    value.checked_add(1)
-                })
-                .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-        }
+        let manager = self.ensure_priority_plan_manager_identity()?;
         Ok(ProcessPriorityByClassPlan {
-            manager: self.priority_plan_manager_identity,
+            manager,
             eprocess,
             pid,
             creation_sequence,
@@ -334,6 +342,14 @@ impl ProcessManager {
     pub fn commit_process_priority_by_class(
         &mut self,
         plan: ProcessPriorityByClassPlan,
+    ) -> Result<(), u32> {
+        self.commit_process_priority_by_class_retained(&plan)
+    }
+
+    /// Checked commit that leaves the caller's plan owned across a stale post-effect refusal.
+    pub fn commit_process_priority_by_class_retained(
+        &mut self,
+        plan: &ProcessPriorityByClassPlan,
     ) -> Result<(), u32> {
         if self.priority_plan_manager_identity != plan.manager
             || self.pid_for_kernel_process_object(plan.eprocess) != Some(plan.pid)
@@ -392,7 +408,7 @@ impl ProcessManager {
         process.base_priority = plan.next.base_priority;
         process.quantum_reset = plan.next.quantum_reset;
         process.memory_priority = plan.next.memory_priority;
-        for effect in plan.threads {
+        for effect in &plan.threads {
             let thread = self.threads.get_mut(&effect.lifetime.thread_id()).unwrap();
             thread.base_priority = effect.next.base_priority;
             thread.priority = effect.next.priority;

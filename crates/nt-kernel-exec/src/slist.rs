@@ -12,6 +12,20 @@ const SEQUENCE_MASK: u64 = !DEPTH_MASK;
 const HEADER_FLAGS: u64 = 0b11;
 const POINTER_MASK: u64 = !0x0f;
 
+/// Initialize the aligned 16-byte x64 header to the ReactOS/NT empty-list encoding.
+/// Returns false for an invalid address or alignment, leaving memory untouched.
+///
+/// # Safety
+/// `head` must point to a writable 16-byte region when non-null and aligned.
+pub unsafe fn initialize(head: *mut u8) -> bool {
+    if head.is_null() || (head as usize) & 0x0f != 0 {
+        return false;
+    }
+    write_unaligned(head as *mut u64, 0);
+    write_unaligned(head.add(8) as *mut u64, 0);
+    true
+}
+
 /// Return the current `SLIST_HEADER.Depth` value.
 ///
 /// # Safety
@@ -69,6 +83,26 @@ pub unsafe fn pop(head: *mut u8) -> u64 {
     entry
 }
 
+/// Detach the current chain and return its first entry, leaving an empty native header.
+/// Existing entry links remain owned by the caller after detachment.
+///
+/// # Safety
+/// `head` must address a writable 16-byte x64 `SLIST_HEADER`.
+pub unsafe fn flush(head: *mut u8) -> u64 {
+    if head.is_null() {
+        return 0;
+    }
+    let region = read_unaligned(head.add(8) as *const u64);
+    let first = region & POINTER_MASK;
+    if first == 0 {
+        return 0;
+    }
+    let alignment = read_unaligned(head as *const u64);
+    write_unaligned(head as *mut u64, alignment & SEQUENCE_MASK);
+    write_unaligned(head.add(8) as *mut u64, HEADER_FLAGS);
+    first
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +154,37 @@ mod tests {
             assert_eq!(push(header.as_mut_ptr() as *mut u8, 0x123), 0);
         }
         assert_eq!(header, [0, 0]);
+    }
+
+    #[test]
+    fn flush_returns_old_chain_and_preserves_entry_links() {
+        let mut header = [0u64; 2];
+        let mut first = Entry { next: 0, payload: 1 };
+        let mut second = Entry { next: 0, payload: 2 };
+        let first_ptr = &mut first as *mut Entry as u64;
+        let second_ptr = &mut second as *mut Entry as u64;
+        unsafe {
+            push(header.as_mut_ptr() as *mut u8, first_ptr);
+            push(header.as_mut_ptr() as *mut u8, second_ptr);
+            assert_eq!(flush(header.as_mut_ptr() as *mut u8), second_ptr);
+            assert_eq!(second.next, first_ptr);
+            assert_eq!(query_depth(header.as_ptr() as *const u8), 0);
+            assert_eq!(header[1], HEADER_FLAGS);
+            assert_eq!(flush(header.as_mut_ptr() as *mut u8), 0);
+            assert_eq!(pop(header.as_mut_ptr() as *mut u8), 0);
+        }
+    }
+
+    #[test]
+    fn initialize_clears_native_header_before_first_push() {
+        #[repr(align(16))]
+        struct Header([u64; 2]);
+        let mut header = Header([u64::MAX; 2]);
+        assert!(unsafe { initialize(header.0.as_mut_ptr() as *mut u8) });
+        assert_eq!(header.0, [0, 0]);
+        let mut entry = Entry { next: 0, payload: 7 };
+        assert_eq!(unsafe { push(header.0.as_mut_ptr() as *mut u8, &mut entry as *mut Entry as u64) }, 0);
+        assert_eq!(unsafe { query_depth(header.0.as_ptr() as *const u8) }, 1);
+        assert!(!unsafe { initialize((header.0.as_mut_ptr() as *mut u8).add(8)) });
     }
 }

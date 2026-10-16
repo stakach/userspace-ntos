@@ -8,6 +8,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 static FIRST_INVOCATION_TRACED: AtomicBool = AtomicBool::new(false);
 
+/// No kernel-debugger transport is registered by this host. Process debug
+/// ports are a different NT facility and do not change the KD presence byte.
+pub(super) const fn kernel_debugger_connected() -> bool { false }
+
 pub(super) extern "win64" fn s_kd_system_debug_control(
     command: u32,
     _input_buffer: u64,

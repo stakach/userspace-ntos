@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
     exception_walk::{ExceptionWalk, WalkMode, WalkOutcome, WalkStep},
+    user_image_catalog::OnDemandUserImageCatalog,
     Context, ExceptionRecord, StackReader,
 };
 use alloc::{vec, vec::Vec};
@@ -873,4 +874,60 @@ fn admitted_catalog_drives_real_nonleaf_then_leaf_exception_walk() {
         walk.step(&catalog, &Stack).unwrap(),
         WalkStep::Complete(WalkOutcome::Unhandled { .. })
     ));
+}
+
+#[test]
+fn on_demand_user_catalog_loads_only_an_exact_executable_image() {
+    use core::cell::Cell;
+
+    let loads = Cell::new(0usize);
+    let images = OnDemandUserImageCatalog::new(2, |pc| {
+        loads.set(loads.get() + 1);
+        let base = if (BASE..BASE + 0x4000).contains(&pc) {
+            BASE
+        } else if (BASE + 0x8000..BASE + 0xc000).contains(&pc) {
+            BASE + 0x8000
+        } else {
+            return Err(ExceptionImageError::UnknownImage);
+        };
+        AdmittedExceptionImage::from_mapped_image(base, mapped_pe())
+            .map_err(|_| ExceptionImageError::UnreadableImage)
+    })
+    .expect("bounded catalog");
+    assert!(matches!(
+        images.lookup_exception_function(BASE + 0x1010),
+        Ok(ExceptionFunction::Function { image_base: BASE, .. })
+    ));
+    assert_eq!(loads.get(), 1);
+    assert_eq!(images.lookup_exception_function(BASE + 0x1110), Ok(ExceptionFunction::Leaf));
+    assert_eq!(loads.get(), 1);
+    // An admitted image's non-executable section is never a reason to ask another owner.
+    assert_eq!(images.lookup_exception_function(BASE + 0x3010), Err(ExceptionImageError::UnknownImage));
+    assert_eq!(loads.get(), 1);
+    assert!(images.lookup_exception_function(BASE + 0x9010).is_ok());
+    assert_eq!(images.image_count(), 2);
+    assert_eq!(loads.get(), 2);
+}
+
+#[test]
+fn on_demand_user_catalog_rejects_wrong_owner_and_capacity_without_replacing_images() {
+    use core::cell::Cell;
+
+    let loads = Cell::new(0usize);
+    let images = OnDemandUserImageCatalog::new(1, |_| {
+        loads.set(loads.get() + 1);
+        // This captured source has authority only for the first image even if a foreign PC is
+        // numerically near it. The catalog must check that the returned image contains the PC.
+        AdmittedExceptionImage::from_mapped_image(BASE, mapped_pe())
+            .map_err(|_| ExceptionImageError::UnreadableImage)
+    })
+    .unwrap();
+    assert_eq!(images.lookup_exception_function(BASE + 0x9010), Err(ExceptionImageError::UnknownImage));
+    assert_eq!(images.image_count(), 0);
+    assert_eq!(loads.get(), 1);
+    assert!(images.lookup_exception_function(BASE + 0x1010).is_ok());
+    assert_eq!(images.image_count(), 1);
+    assert_eq!(images.lookup_exception_function(BASE + 0x9010), Err(ExceptionImageError::UnreadableImage));
+    assert_eq!(loads.get(), 2);
+    assert!(images.lookup_exception_function(BASE + 0x1010).is_ok());
 }

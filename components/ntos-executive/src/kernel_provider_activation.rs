@@ -188,6 +188,17 @@ fn authenticated_channel_caller(
     Ok(caller)
 }
 
+/// Root-owned dispatch epoch for an exact stopped kernel-originated provider fault.
+pub(crate) unsafe fn fault_dispatch_id(
+    channel: &spawn_hosts::PumpChannel,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+) -> Option<u64> {
+    let caller = authenticated_channel_caller(channel).ok()?;
+    let owner = caller.owner();
+    (owner.dispatch_id == dispatch.epoch() && owner.dispatch_id != 0)
+        .then_some(owner.dispatch_id)
+}
+
 /// Recover native registry authority only from the exact retained, currently executing job.
 pub(crate) unsafe fn registry_caller(
     channel: &spawn_hosts::PumpChannel,
@@ -389,6 +400,23 @@ pub(super) unsafe fn service_ps(
         Ok(target) => target,
         Err(status) => return (status as i32, 0, 0, 0),
     };
+    if native_thread_priority::is_priority_effect_op(op) {
+        let admitted = with_provider_process_manager(|pm| {
+            (&*core::ptr::addr_of!(ACTIVATIONS)).validate(
+                caller, pm,
+                &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
+                &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
+            )
+        });
+        if let Err(status) = admitted {
+            return (status as i32, 0, 0, 0);
+        }
+        let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+        if handler.is_null() {
+            return (0xc000_00a3u32 as i32, 0, 0, 0);
+        }
+        return native_thread_priority::dispatch(&mut *handler, op, object, value);
+    }
     match with_provider_process_manager(|pm| {
         (&*core::ptr::addr_of!(ACTIVATIONS)).validate(
             caller,

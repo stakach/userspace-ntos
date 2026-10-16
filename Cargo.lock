@@ -196,6 +196,7 @@ dependencies = [
  "nt-lpc-client",
  "nt-lpc-server",
  "nt-port-core",
+ "nt-security",
  "nt-status",
 ]
 
@@ -212,6 +213,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "nt-alpc-abi",
+ "nt-security",
 ]
 
 [[package]]

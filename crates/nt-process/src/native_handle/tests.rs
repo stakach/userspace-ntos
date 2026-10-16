@@ -27,6 +27,58 @@ fn fixture() -> (
     (pm, user, kernel, pid, tid)
 }
 
+#[test]
+fn driver_created_event_and_directory_handles_close_only_in_their_exact_owner() {
+    let (mut pm, _user, kernel, owner, _) = fixture();
+    let foreign = pm.create_process("foreign", None, None);
+    let foreign_thread = pm.create_thread(foreign, 0, 0, false).unwrap();
+    let foreign_caller = pm
+        .capture_native_handle_caller(
+            pm.thread_lifetime(foreign_thread).unwrap(),
+            AccessMode::KernelMode,
+        )
+        .unwrap();
+
+    let event = HandleObject::Event(nt_types::ObjectId(0xE1));
+    let event_handle = u64::from(pm.insert_handle(owner, event, 0).unwrap());
+    let mut directory = pm.reserve_native_object_directory_handle(kernel, 0).unwrap();
+    directory.bind(&mut pm, 0xD1, 1).unwrap();
+    let directory_handle = directory.publish(&mut pm).unwrap();
+    let directory_object = HandleObject::ObjectDirectory(0xD1);
+
+    for handle in [event_handle, directory_handle] {
+        assert_eq!(
+            pm.close_native_registry_key_handle(kernel, handle),
+            Err(NativeCloseError::Status(STATUS_OBJECT_TYPE_MISMATCH)),
+        );
+        assert_eq!(
+            pm.close_native_handle(foreign_caller, handle).unwrap_err(),
+            NativeCloseError::Status(STATUS_INVALID_HANDLE),
+        );
+    }
+    assert_eq!(pm.handle_object_count(event), 1);
+    assert_eq!(pm.handle_object_count(directory_object), 1);
+
+    assert_eq!(
+        pm.close_native_handle(kernel, event_handle).unwrap().into_object(),
+        event,
+    );
+    assert_eq!(
+        pm.close_native_handle(kernel, directory_handle).unwrap().into_object(),
+        directory_object,
+    );
+    assert_eq!(pm.handle_object_count(event), 0);
+    assert_eq!(pm.handle_object_count(directory_object), 0);
+    assert_eq!(
+        pm.close_native_handle(kernel, event_handle).unwrap_err(),
+        NativeCloseError::Status(STATUS_INVALID_HANDLE),
+    );
+    assert_eq!(
+        pm.close_native_handle(kernel, directory_handle).unwrap_err(),
+        NativeCloseError::Status(STATUS_INVALID_HANDLE),
+    );
+}
+
 fn counts(pm: &ProcessManager, pid: ProcessId, tid: crate::ThreadId) -> (u32, u32) {
     (
         pm.process(pid).unwrap().kernel_pointer_references,
@@ -40,6 +92,7 @@ fn alpc_port_handle_cannot_escape_its_exact_service_owner_through_duplicate() {
     let other = pm.create_process("other", None, None);
     let object = HandleObject::AlpcPort {
         service_handle: 0x4c50_0001,
+        kind: crate::native_alpc_port::AlpcPortKind::Created,
         owner_generation: 7,
         invocation_hi: 11,
         invocation_lo: 13,

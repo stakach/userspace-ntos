@@ -5027,6 +5027,10 @@ mod tests {
     }
 
     impl DriverDispatchBackend for KernelFileRouteBackend {
+        fn immutable_file_extent(&self, _file_id: FileId, file_context: u64) -> Option<u64> {
+            (file_context == 0xfeed).then_some(4)
+        }
+
         fn dispatch_irp(
             &mut self,
             ctx: DispatchContext<'_>,
@@ -5177,6 +5181,15 @@ mod tests {
         ));
         assert_eq!(om.file(file).unwrap().state, FileState::Open);
         assert_eq!(om.external_file_context(client, file), Ok(Some(0xfeed)));
+        assert_eq!(om.immutable_file_extent(client, file, device, 0xfeed), Ok(Some(4)));
+        assert_eq!(
+            om.immutable_file_extent(client, file, device, 0xbeef),
+            Err(NtStatus::INVALID_HANDLE)
+        );
+        assert_eq!(
+            om.immutable_file_extent(client, file, DeviceId::NULL, 0xfeed),
+            Err(NtStatus::INVALID_HANDLE)
+        );
 
         let mut metadata = [0; 4];
         assert!(matches!(

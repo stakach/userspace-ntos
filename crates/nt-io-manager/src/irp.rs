@@ -225,6 +225,7 @@ impl PnpParameters {
             minor,
             nt_pnp_abi::IRP_MN_QUERY_RESOURCES
                 | nt_pnp_abi::IRP_MN_QUERY_RESOURCE_REQUIREMENTS
+                | nt_pnp_abi::IRP_MN_QUERY_PNP_DEVICE_STATE
                 | nt_pnp_abi::IRP_MN_QUERY_BUS_INFORMATION
         ) {
             return Err(NtStatus::INVALID_PARAMETER);
@@ -267,6 +268,8 @@ impl PnpParameters {
         match self.kind {
             PnpParameterKind::Start(_) => self.minor == nt_pnp_abi::IRP_MN_START_DEVICE,
             PnpParameterKind::Lifecycle => Self::is_lifecycle_minor(self.minor),
+            PnpParameterKind::QueryInformation =>
+                self.minor == nt_pnp_abi::IRP_MN_QUERY_PNP_DEVICE_STATE,
             _ => false,
         }
     }

@@ -192,6 +192,13 @@ pub extern "win64" fn s_ke_query_performance_counter(frequency: *mut u64) -> u64
     crate::monotonic_time_100ns()
 }
 
+/// `VOID InitializeSListHead(PSLIST_HEADER)`.
+pub extern "win64" fn s_initialize_slist_head(head: *mut u8) {
+    if !unsafe { nt_kernel_exec::slist::initialize(head) } {
+        unsafe { crate::provider_bugcheck::report(0xc4, [0x534c_494e, 0, 0, 0]) }
+    }
+}
+
 /// `PSLIST_ENTRY ExpInterlockedPushEntrySList(PSLIST_HEADER, PSLIST_ENTRY)`.
 pub extern "win64" fn s_exp_interlocked_push_entry_slist(head: *mut u8, entry: u64) -> u64 {
     unsafe { nt_kernel_exec::slist::push(head, entry) }
@@ -200,6 +207,11 @@ pub extern "win64" fn s_exp_interlocked_push_entry_slist(head: *mut u8, entry: u
 /// `PSLIST_ENTRY ExpInterlockedPopEntrySList(PSLIST_HEADER)`.
 pub extern "win64" fn s_exp_interlocked_pop_entry_slist(head: *mut u8) -> u64 {
     unsafe { nt_kernel_exec::slist::pop(head) }
+}
+
+/// `PSLIST_ENTRY ExpInterlockedFlushSList(PSLIST_HEADER)`.
+pub extern "win64" fn s_exp_interlocked_flush_slist(head: *mut u8) -> u64 {
+    unsafe { nt_kernel_exec::slist::flush(head) }
 }
 
 /// `USHORT ExQueryDepthSList(PSLIST_HEADER)`.
