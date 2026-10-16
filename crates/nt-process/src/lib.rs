@@ -1105,6 +1105,12 @@ pub struct NtThread {
     base_priority: i32,
     /// `KTHREAD.QuantumReset`; inherited from the owning process on thread activation.
     quantum_reset: u8,
+    /// Signed `KTHREAD.Quantum`, replenished from QuantumReset on a priority transition.
+    quantum: i8,
+    /// Signed dynamic boost still outstanding in `KTHREAD.PriorityDecrement`.
+    priority_decrement: i8,
+    /// Signed `KTHREAD.Saturation`: zero, positive ceiling, or negative floor.
+    saturation: i8,
     /// `KTHREAD.IdealProcessor`.
     ideal_processor: u64,
     /// `ThreadBreakOnTermination`, initially clear and not inherited from the process.
@@ -2227,6 +2233,7 @@ impl ProcessManager {
             affinity_mask, base_priority,
         )?;
         thread.quantum_reset = quantum_reset;
+        thread.quantum = quantum_reset as i8;
         let allocated = allocate_client_id(&mut self.next_cid);
         debug_assert_eq!(allocated, tid);
         proc.threads.insert(tid);
@@ -3108,7 +3115,7 @@ impl ProcessManager {
         let pid = if handle == u64::MAX {
             caller_pid
         } else {
-            let handle = handle as Handle;
+            let handle = Handle::try_from(handle).map_err(|_| STATUS_INVALID_HANDLE)?;
             let pid = match self.lookup_handle(caller_pid, handle) {
                 Some(HandleObject::Process(pid)) => pid,
                 _ => return Err(STATUS_INVALID_HANDLE),
@@ -3527,6 +3534,9 @@ impl ProcessManager {
         thread.priority = base_priority;
         thread.base_priority = base_priority;
         thread.quantum_reset = quantum_reset;
+        thread.quantum = quantum_reset as i8;
+        thread.priority_decrement = 0;
+        thread.saturation = 0;
         thread.ideal_processor = 0;
         thread.security_descriptor.clear();
         thread

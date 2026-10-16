@@ -1439,6 +1439,7 @@ pub const W32_SOURCE_FSD_LABEL: u64 = 0x7a8;
 pub const W32_SOURCE_ARMED_LABEL: u64 = 0x7aa;
 /// Win32k's trusted RtlSetActiveConsoleId request to the executive KUSER owner.
 pub const W32_ACTIVE_CONSOLE_LABEL: u64 = 0x7ab;
+pub const W32_PROCESS_QUERY_LABEL: u64 = 0x7ac;
 pub const W32_ATTACH_PLAIN: u64 = 1;
 pub const W32_ATTACH_DETACH: u64 = 2;
 pub const W32_ATTACH_STACK: u64 = 3;
@@ -1795,6 +1796,41 @@ unsafe fn provider_pool_allocation_capacity(p: u64) -> Option<u64> {
     shared_pool::allocation_capacity(&ProviderPoolMemory, p - WIN32K_POOL_VADDR).ok()
 }
 
+pub(crate) unsafe fn provider_pool_allocation_identity(p: u64) -> Option<shared_pool::AllocationIdentity> {
+    if !provider_pool_contains(p) { return None; }
+    let _guard = provider_pool_lock()?;
+    shared_pool::allocation_identity(&ProviderPoolMemory, p - WIN32K_POOL_VADDR).ok()
+}
+
+/// Reacquire the component's exact packet after a synchronous reply. A stale address may now
+/// name a different allocation; its generation cannot authorize decoding or freeing it.
+pub(crate) unsafe fn pin_component_provider_pool_packet_exact(
+    pointer: u64,
+    length: usize,
+    generation: u64,
+) -> Option<SharedPoolPin> {
+    if !provider_pool_contains(pointer) || generation == 0 || length == 0 { return None; }
+    let provider = registered_provider_wait_domain()?;
+    let _guard = provider_pool_lock()?;
+    let mut memory = ProviderPoolMemory;
+    let offset = pointer - WIN32K_POOL_VADDR;
+    let identity = shared_pool::allocation_identity(&memory, offset).ok()?;
+    if identity.allocation_generation != generation
+        || shared_pool::allocation_capacity(&memory, offset).ok()? < length as u64
+    {
+        return None;
+    }
+    let native = shared_pool::pin_exclusive(&mut memory, identity).ok()?;
+    Some(SharedPoolPin { provider, allocation: identity, native })
+}
+
+pub(crate) unsafe fn release_component_provider_pool_packet_exact(pin: SharedPoolPin) -> bool {
+    if registered_provider_wait_domain() != Some(pin.provider) { return false; }
+    let Some(_guard) = provider_pool_lock() else { return false; };
+    let mut memory = ProviderPoolMemory;
+    shared_pool::release_pin(&mut memory, pin.native).is_ok()
+}
+
 pub(crate) unsafe fn copy_provider_pool_allocation(p: u64, length: usize) -> Result<Vec<u8>, u32> {
     if !provider_pool_contains(p) || length == 0 || length as u64 >= WIN32K_POOL_FRAMES * 0x1000 {
         return Err(0xC000_000D);
@@ -1860,6 +1896,26 @@ pub(crate) unsafe fn retire_pinned_root_provider_pool_packet(
         || shared_pool::allocation_capacity(&memory, offset) != Ok(lease.capacity) { return false; }
     // Validation and freeing are one physical-lock operation; never expose an unpinned gap.
     shared_pool::retire_pinned(&mut memory, pin.native).is_ok()
+}
+
+/// Release a pin on a component-owned packet after its exact response is published. The component
+/// retains allocation ownership and frees it only after the synchronous broker call returns.
+pub(crate) unsafe fn release_component_provider_pool_packet_pin(
+    lease: ProviderPoolPacketLease,
+    pin: SharedPoolPin,
+) -> bool {
+    if registered_provider_wait_domain() != Some(lease.provider)
+        || pin.provider != lease.provider
+        || pin.allocation != lease.allocation
+    {
+        return false;
+    }
+    let Some(_pool) = provider_pool_lock() else { return false; };
+    let mut memory = ProviderPoolMemory;
+    let offset = lease.pointer - WIN32K_POOL_VADDR;
+    shared_pool::allocation_identity(&memory, offset) == Ok(lease.allocation)
+        && shared_pool::allocation_capacity(&memory, offset) == Ok(lease.capacity)
+        && shared_pool::release_pin(&mut memory, pin.native).is_ok()
 }
 
 mod root_pool;
@@ -4336,6 +4392,8 @@ mod file_ioctl;
 pub(crate) mod file_ioctl_target;
 mod file_object_query;
 mod object_handle_flags;
+#[path = "win32k_subsystem/process_information_query.rs"]
+mod process_information_query;
 pub(crate) use object_security::census as object_security_census;
 pub(crate) use object_security::print_assignment_stats as print_object_security_assignment_stats;
 
@@ -15532,6 +15590,7 @@ fn register_trampolines() -> bool {
     reg.bind("ZwQueryValueKey", s_zw_query_value_key as usize as u64);
     reg.bind("NtQueryValueKey", s_nt_query_value_key as usize as u64);
     reg.bind("ZwQueryKey", s_zw_query_key as usize as u64);
+    reg.bind("ZwQueryInformationProcess", process_information_query::query_information_process as usize as u64);
     reg.bind(
         "ZwEnumerateValueKey",
         s_zw_enumerate_value_key as usize as u64,

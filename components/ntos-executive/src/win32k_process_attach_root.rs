@@ -60,6 +60,29 @@ pub(super) unsafe fn select_effective_client(
     select(record.state.current()).is_ok()
 }
 
+/// Capture the exact process whose aliases are selected for this logical win32k invocation.
+/// An attach in progress or a mismatched shared client window cannot supply handle authority.
+pub(crate) unsafe fn current_query_process(
+    caller: ProviderLogicalCaller,
+    vspace: u64,
+) -> Option<WindowOwner> {
+    let original = WindowOwner {
+        pi: caller.pi(),
+        process: caller.process(),
+        vspace,
+    };
+    let records = &*core::ptr::addr_of!(THREAD_ATTACHMENTS);
+    let record = match records.iter().find(|record| record.caller == AttachCaller::Logical(caller)) {
+        Some(record) => Some((
+            record.state.original().owner?,
+            record.state.current().owner?,
+            record.inflight.is_some(),
+        )),
+        None => None,
+    };
+    crate::process_information_bridge::selected_effective_owner(original, record, attached_owner())
+}
+
 pub(crate) unsafe fn retire_thread_attach(client: Win32kClientContext) -> bool {
     let records = &mut *core::ptr::addr_of_mut!(THREAD_ATTACHMENTS);
     let Some(index) = records.iter().position(|record| {

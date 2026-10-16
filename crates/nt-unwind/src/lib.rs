@@ -30,6 +30,7 @@ pub mod exception_images;
 pub mod exception_snapshot;
 pub mod exception_walk;
 pub mod hardware_fault;
+pub mod kernel_frame_ingress;
 pub mod raw_context;
 pub mod raw_exception;
 pub mod seh_linkage_image;

@@ -51,6 +51,8 @@ mod provider_registry_caller;
 mod provider_directory_broker;
 mod provider_section_broker;
 mod provider_service_ingress;
+mod process_information_bridge;
+mod process_information_capture;
 mod provider_section_cleanup;
 mod provider_section_receipts;
 mod registry_query_diagnostics;

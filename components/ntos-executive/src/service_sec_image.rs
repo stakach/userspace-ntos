@@ -51,6 +51,9 @@ mod hosted_gui_client_info;
 #[path = "provider_file_objects.rs"]
 mod provider_file_objects;
 pub(crate) use provider_file_objects::service_win32k_file_object_request;
+#[path = "process_information_native.rs"]
+mod process_information_native;
+pub(crate) use process_information_native::service_win32k_process_query_request;
 
 pub(crate) static FILE_IO_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
 static FILE_IO_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);

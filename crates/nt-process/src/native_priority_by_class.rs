@@ -24,8 +24,38 @@ pub struct ProcessPriorityQuantumPolicy {
 }
 
 impl ProcessPriorityQuantumPolicy {
+    /// Select the ReactOS quantum table from the admitted
+    /// `PriorityControl\Win32PrioritySeparation` DWORD and the memory manager's NT-as-system
+    /// classification. This is a pure selection; the executive must supply both live inputs.
+    pub fn from_priority_separation(raw: u32, nt_as_system: bool) -> Self {
+        let separation = ((raw & 3) as u8).min(2);
+        let fixed = match raw & 0x0c {
+            0x04 => false,
+            0x08 => true,
+            _ => nt_as_system,
+        };
+        let long = match raw & 0x30 {
+            0x10 => true,
+            0x20 => false,
+            _ => nt_as_system,
+        };
+        let foreground_quantums = match (fixed, long) {
+            (false, false) => [6, 12, 18],
+            (false, true) => [12, 24, 36],
+            (true, false) => [18, 18, 18],
+            (true, true) => [36, 36, 36],
+        };
+        Self {
+            foreground_quantums,
+            priority_separation: separation,
+            use_job_scheduling_classes: fixed && long,
+        }
+    }
+
     fn validate(self) -> Result<(), u32> {
-        if self.priority_separation > 2 || self.foreground_quantums.contains(&0) {
+        if self.priority_separation > 2
+            || self.foreground_quantums.iter().any(|&quantum| quantum == 0 || quantum > i8::MAX as u8)
+        {
             return Err(STATUS_INVALID_PARAMETER);
         }
         Ok(())
@@ -47,6 +77,9 @@ pub struct ThreadSchedulingState {
     pub base_priority: i32,
     pub priority: i32,
     pub quantum_reset: u8,
+    pub quantum: i8,
+    pub priority_decrement: i8,
+    pub saturation: i8,
 }
 
 /// One exact ETHREAD activation and its proposed scheduler projection. The executive can use
@@ -66,6 +99,9 @@ impl ThreadPriorityByClassEffect {
     }
     pub const fn kernel_object(&self) -> Option<u64> {
         self.kernel_object
+    }
+    pub const fn expected(&self) -> ThreadSchedulingState {
+        self.expected
     }
     pub const fn next(&self) -> ThreadSchedulingState {
         self.next
@@ -124,6 +160,9 @@ impl ProcessManager {
             base_priority: thread.base_priority,
             priority: thread.priority,
             quantum_reset: thread.quantum_reset,
+            quantum: thread.quantum,
+            priority_decrement: thread.priority_decrement,
+            saturation: thread.saturation,
         })
     }
 
@@ -225,7 +264,36 @@ impl ProcessManager {
                 base_priority: thread.base_priority,
                 priority: thread.priority,
                 quantum_reset: thread.quantum_reset,
+                quantum: thread.quantum,
+                priority_decrement: thread.priority_decrement,
+                saturation: thread.saturation,
             };
+            // KeSetPriorityAndQuantumProcess changes QuantumReset before checking saturation.
+            // Within the same priority range a saturated thread retains its priority, current
+            // quantum, and decrement; crossing ranges permits a saturated priority transition.
+            let mut next_thread = expected_thread;
+            if base_priority != process.base_priority {
+                next_thread.quantum_reset = next.quantum_reset;
+                let apply_priority = thread.saturation == 0
+                    || if base_priority >= LOW_REALTIME_PRIORITY {
+                        process.base_priority < LOW_REALTIME_PRIORITY
+                    } else {
+                        process.base_priority >= LOW_REALTIME_PRIORITY
+                    };
+                if apply_priority {
+                    let selected_base = match thread.saturation.cmp(&0) {
+                        core::cmp::Ordering::Greater if base_priority >= LOW_REALTIME_PRIORITY => HIGH_PRIORITY,
+                        core::cmp::Ordering::Greater => LOW_REALTIME_PRIORITY - 1,
+                        core::cmp::Ordering::Less if base_priority >= LOW_REALTIME_PRIORITY => LOW_REALTIME_PRIORITY,
+                        core::cmp::Ordering::Less => 1,
+                        core::cmp::Ordering::Equal => next_base,
+                    };
+                    next_thread.base_priority = selected_base;
+                    next_thread.priority = selected_base;
+                    next_thread.quantum = next_thread.quantum_reset as i8;
+                    next_thread.priority_decrement = 0;
+                }
+            }
             threads.push(ThreadPriorityByClassEffect {
                 lifetime: ThreadLifetime {
                     thread_id: *tid,
@@ -234,15 +302,7 @@ impl ProcessManager {
                 },
                 kernel_object: thread.kernel_thread_object,
                 expected: expected_thread,
-                next: if base_priority == process.base_priority {
-                    expected_thread
-                } else {
-                    ThreadSchedulingState {
-                        base_priority: next_base,
-                        priority: next_base,
-                        quantum_reset: next.quantum_reset,
-                    }
-                },
+                next: next_thread,
                 state: thread.state,
             });
         }
@@ -320,6 +380,9 @@ impl ProcessManager {
                 || thread.base_priority != effect.expected.base_priority
                 || thread.priority != effect.expected.priority
                 || thread.quantum_reset != effect.expected.quantum_reset
+                || thread.quantum != effect.expected.quantum
+                || thread.priority_decrement != effect.expected.priority_decrement
+                || thread.saturation != effect.expected.saturation
             {
                 return Err(STATUS_INVALID_PARAMETER);
             }
@@ -334,6 +397,9 @@ impl ProcessManager {
             thread.base_priority = effect.next.base_priority;
             thread.priority = effect.next.priority;
             thread.quantum_reset = effect.next.quantum_reset;
+            thread.quantum = effect.next.quantum;
+            thread.priority_decrement = effect.next.priority_decrement;
+            thread.saturation = effect.next.saturation;
         }
         Ok(())
     }
@@ -348,5 +414,97 @@ impl ProcessManager {
         let plan =
             self.prepare_process_priority_by_class_for_kernel_object(eprocess, mode, policy)?;
         self.commit_process_priority_by_class(plan)
+    }
+}
+
+#[cfg(test)]
+mod reactos_scheduler_regressions {
+    use super::*;
+    use crate::{PROCESS_PRIORITY_CLASS_HIGH, PROCESS_PRIORITY_CLASS_REALTIME};
+
+    fn policy() -> ProcessPriorityQuantumPolicy {
+        ProcessPriorityQuantumPolicy {
+            foreground_quantums: [12, 18, 24],
+            priority_separation: 2,
+            use_job_scheduling_classes: false,
+        }
+    }
+
+    #[test]
+    fn changed_base_resets_quantum_and_decrement_after_unboosted_transition() {
+        let mut pm = ProcessManager::new();
+        let pid = pm.create_process("gui.exe", None, None);
+        pm.set_process_base_priority(pid, 8).unwrap();
+        let tid = pm.create_thread(pid, 0, 0, false).unwrap();
+        pm.threads.get_mut(&tid).unwrap().quantum = 3;
+        pm.threads.get_mut(&tid).unwrap().priority_decrement = 2;
+        assert!(pm.publish_process_kernel_object(pid, 0x1000));
+        pm.set_priority_class_for_kernel_process_object(0x1000, PROCESS_PRIORITY_CLASS_HIGH).unwrap();
+
+        let plan = pm.prepare_process_priority_by_class_for_kernel_object(0x1000, 0, policy()).unwrap();
+        let next = plan.thread_effects()[0].next();
+        assert_eq!((next.base_priority, next.priority, next.quantum_reset), (13, 13, 24));
+        assert_eq!((next.quantum, next.priority_decrement, next.saturation), (24, 0, 0));
+        pm.commit_process_priority_by_class(plan).unwrap();
+        assert_eq!(pm.thread_scheduling_state(tid).unwrap(), next);
+    }
+
+    #[test]
+    fn saturation_in_same_priority_range_skips_priority_and_quantum_reset_only() {
+        let mut pm = ProcessManager::new();
+        let pid = pm.create_process("gui.exe", None, None);
+        pm.set_process_base_priority(pid, 8).unwrap();
+        let tid = pm.create_thread(pid, 0, 0, false).unwrap();
+        let thread = pm.threads.get_mut(&tid).unwrap();
+        thread.saturation = 1;
+        thread.quantum = 3;
+        thread.priority_decrement = 2;
+        assert!(pm.publish_process_kernel_object(pid, 0x1000));
+        pm.set_priority_class_for_kernel_process_object(0x1000, PROCESS_PRIORITY_CLASS_HIGH).unwrap();
+
+        let plan = pm.prepare_process_priority_by_class_for_kernel_object(0x1000, 0, policy()).unwrap();
+        let next = plan.thread_effects()[0].next();
+        assert_eq!((next.base_priority, next.priority, next.quantum_reset), (8, 8, 24));
+        assert_eq!((next.quantum, next.priority_decrement, next.saturation), (3, 2, 1));
+        pm.commit_process_priority_by_class(plan).unwrap();
+        assert_eq!(pm.thread_scheduling_state(tid).unwrap(), next);
+    }
+
+    #[test]
+    fn crossing_into_realtime_applies_positive_saturation_to_realtime_ceiling() {
+        let mut pm = ProcessManager::new();
+        let pid = pm.create_process("gui.exe", None, None);
+        pm.set_process_base_priority(pid, 8).unwrap();
+        let tid = pm.create_thread(pid, 0, 0, false).unwrap();
+        let thread = pm.threads.get_mut(&tid).unwrap();
+        thread.saturation = 1;
+        thread.quantum = 3;
+        thread.priority_decrement = 2;
+        assert!(pm.publish_process_kernel_object(pid, 0x1000));
+        pm.set_priority_class_for_kernel_process_object(0x1000, PROCESS_PRIORITY_CLASS_REALTIME).unwrap();
+
+        let plan = pm.prepare_process_priority_by_class_for_kernel_object(0x1000, 0, policy()).unwrap();
+        let next = plan.thread_effects()[0].next();
+        assert_eq!((next.base_priority, next.priority, next.quantum_reset), (HIGH_PRIORITY, HIGH_PRIORITY, 24));
+        assert_eq!((next.quantum, next.priority_decrement, next.saturation), (24, 0, 1));
+        pm.commit_process_priority_by_class(plan).unwrap();
+        assert_eq!(pm.thread_scheduling_state(tid).unwrap(), next);
+    }
+
+    #[test]
+    fn captured_quantum_and_saturation_changes_refuse_stale_commit() {
+        let mut pm = ProcessManager::new();
+        let pid = pm.create_process("gui.exe", None, None);
+        pm.set_process_base_priority(pid, 8).unwrap();
+        let tid = pm.create_thread(pid, 0, 0, false).unwrap();
+        assert!(pm.publish_process_kernel_object(pid, 0x1000));
+        pm.set_priority_class_for_kernel_process_object(0x1000, PROCESS_PRIORITY_CLASS_HIGH).unwrap();
+        let plan = pm.prepare_process_priority_by_class_for_kernel_object(0x1000, 0, policy()).unwrap();
+        pm.threads.get_mut(&tid).unwrap().saturation = -1;
+        let before = pm.thread_scheduling_state(tid).unwrap();
+        let process_before = pm.process_scheduling_state_for_kernel_object(0x1000).unwrap();
+        assert_eq!(pm.commit_process_priority_by_class(plan), Err(STATUS_INVALID_PARAMETER));
+        assert_eq!(pm.thread_scheduling_state(tid).unwrap(), before);
+        assert_eq!(pm.process_scheduling_state_for_kernel_object(0x1000).unwrap(), process_before);
     }
 }
