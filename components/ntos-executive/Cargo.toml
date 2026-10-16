@@ -44,6 +44,7 @@ nt-lpc-server = { path = "../../crates/nt-lpc-server" }
 nt-lpc-client = { path = "../../crates/nt-lpc-client" }
 # The ALPC adapter over the same nt-port-core — a peer of the LPC adapter (the bridge).
 nt-alpc-abi = { path = "../../crates/nt-alpc-abi" }
+nt-alpc-native-capture = { path = "../../crates/nt-alpc-native-capture" }
 nt-alpc = { path = "../../crates/nt-alpc" }
 bytemuck = { version = "1", default-features = false }
 nt-syscall = { path = "../../crates/nt-syscall" }
