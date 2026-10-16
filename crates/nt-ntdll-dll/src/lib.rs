@@ -60,6 +60,9 @@ pub mod system_time_precise;
 /// Named PE export lookup used by the released WOW64 support libraries.
 pub mod find_exported_routine;
 
+/// Explicit unsupported entries declared as stubs by the reference source spec.
+pub mod source_declared_stubs;
+
 /// The x64 ntdll thread entry used by the released kernel32.dll.
 pub mod user_thread_start;
 
@@ -1321,6 +1324,10 @@ static KEEP_SYSTEM_TIME_PRECISE_EXPORTS: unsafe extern "C" fn() =
 #[used]
 static KEEP_FIND_EXPORTED_ROUTINE: unsafe extern "C" fn() =
     find_exported_routine::FIND_EXPORTED_ROUTINE_ANCHOR_FN;
+
+#[used]
+static KEEP_SOURCE_DECLARED_STUBS: unsafe extern "C" fn() =
+    source_declared_stubs::SOURCE_STUB_EXPORT_ANCHOR_FN;
 
 #[used]
 static KEEP_USER_THREAD_START_EXPORTS: unsafe extern "C" fn() =
