@@ -8461,6 +8461,8 @@ pub(crate) unsafe fn service_sec_image(
     scratch_base: u64,
     ntdll: (u64, &nt_pe_loader::PeFile),
     driver_starts: DriverStartBootstrap,
+    boot_system_pnp_plan: &InlineDriverLaunchPlan,
+    demand_pnp_plan: &InlineDriverLaunchPlan,
 ) -> (
     u64,
     u64,
@@ -8661,6 +8663,10 @@ pub(crate) unsafe fn service_sec_image(
         );
     }
     KUSER_CLOCK_INIT_OK.store(true, Ordering::Release);
+    launch_live_pnp_plans(
+        nt_handler as *mut ExecNtHandler,
+        &[boot_system_pnp_plan, demand_pnp_plan],
+    );
     // Per-hosted-process state, indexed by fault badge (0 = smss, 1 = csrss). The SINGLE service
     // loop multiplexes both: each thread faults through a fault-EP cap minted with its badge, so the
     // recv badge selects whose VSpace / image / scratch / fault-bookkeeping to use. Slot 1 (csrss)

@@ -23402,35 +23402,38 @@ impl DriverStartBootstrap {
     }
 }
 
-unsafe fn launch_boot_driver_service(
-    fs: &Fat32,
+struct PreparedBootDriverStart {
+    owned: DriverServiceLaunchSpec,
+    reservation: nt_driver_start::PendingOperationReservation,
+    predecessors: alloc::vec::Vec<nt_driver_start::PendingOperationReservation>,
+    dependent_devnodes: alloc::vec::Vec<usize>,
+}
+
+/// Reserve the exact START continuation before DriverEntry can have native effects. This
+/// function borrows the table only during preparation, so a live handler can serve nested
+/// provider calls while DriverEntry and AddDevice execute.
+fn prepare_boot_driver_start(
     spec: &InlineDriverLaunchSpec,
     plan: &InlineDriverLaunchPlan,
-    options: HostedPnpStartOptions,
-    driver_starts: &mut DriverStartBootstrap,
-) -> Option<(driver_launch::DriverComponent, HostedPnpStartReport)> {
-    let target = BootDriverStartReportTarget {
-        trace: options.trace,
-        pci: inline_launch_spec_has_pci_devnode(plan.devnodes_for(spec)),
-    };
-    let prepared_start =
-        if spec.class == driver_launch::DriverClass::Device && spec.devnode_count != 0 {
+    pending: &mut nt_driver_start::PendingOperationTable<PendingDriverStart>,
+) -> Result<Option<PreparedBootDriverStart>, ()> {
+    let prepared_start = if spec.class == driver_launch::DriverClass::Device && spec.devnode_count != 0 {
             let owned = match owned_driver_launch_spec_from_inline(spec, plan) {
                 Some(owned) => owned,
                 None => {
                     print_str(b"[driver-launch] boot START ownership allocation failed service=");
                     print_str(spec.service_name.as_bytes());
                     print_str(b"\n");
-                    return None;
+                    return Err(());
                 }
             };
-            let reservation = match driver_starts.pending.reserve() {
+            let reservation = match pending.reserve() {
                 Ok(reservation) => reservation,
                 Err(_) => {
                     print_str(b"[driver-launch] boot START continuation reserve failed service=");
                     print_str(spec.service_name.as_bytes());
                     print_str(b"\n");
-                    return None;
+                    return Err(());
                 }
             };
             let mut predecessors = alloc::vec::Vec::new();
@@ -23442,36 +23445,112 @@ unsafe fn launch_boot_driver_service(
                 let mut dependent = false;
                 // Every occupied Boot row predates this unpublished reservation. Physical slot
                 // indices are not launch order because the table reuses empty slots.
-                for earlier_slot in 0..driver_starts.pending.slot_count() {
-                    let Some(pending) = driver_starts.pending.get(earlier_slot) else {
+                for earlier_slot in 0..pending.slot_count() {
+                    let Some(earlier) = pending.get(earlier_slot) else {
                         continue;
                     };
-                    if matches!(&pending.owner, PendingDriverStartOwner::Boot { .. })
-                        && pending.batch.service_name().eq_ignore_ascii_case(enumerator)
+                    if matches!(&earlier.owner, PendingDriverStartOwner::Boot { .. })
+                        && earlier.batch.service_name().eq_ignore_ascii_case(enumerator)
                     {
                         dependent = true;
-                        if predecessors.contains(&pending.reservation) {
+                        if predecessors.contains(&earlier.reservation) {
                             continue;
                         }
                         if predecessors.try_reserve(1).is_err() {
-                            driver_starts.pending.cancel(reservation).expect("boot START reservation disappeared");
-                            return None;
+                            pending.cancel(reservation).expect("boot START reservation disappeared");
+                            return Err(());
                         }
-                        predecessors.push(pending.reservation);
+                        predecessors.push(earlier.reservation);
                     }
                 }
                 if dependent {
                     if dependent_devnodes.try_reserve(1).is_err() {
-                        driver_starts.pending.cancel(reservation).expect("boot START reservation disappeared");
-                        return None;
+                        pending.cancel(reservation).expect("boot START reservation disappeared");
+                        return Err(());
                     }
                     dependent_devnodes.push(index);
                 }
             }
-            Some((owned, reservation, predecessors, dependent_devnodes))
+            Some(PreparedBootDriverStart { owned, reservation, predecessors, dependent_devnodes })
         } else {
             None
         };
+    Ok(prepared_start)
+}
+
+struct DrivenBootDriverStart {
+    batch: OwnedHostedPnpStartBatch,
+    reservation: nt_driver_start::PendingOperationReservation,
+    predecessors: alloc::vec::Vec<nt_driver_start::PendingOperationReservation>,
+    progress: OwnedHostedPnpStartProgress,
+}
+
+/// Drive callbacks with no mutable borrow of the pending table. The pre-reserved continuation
+/// remains owned by the caller until `publish_boot_driver_start` consumes this result.
+unsafe fn drive_boot_driver_start(
+    dc: &driver_launch::DriverComponent,
+    prepared: PreparedBootDriverStart,
+    options: HostedPnpStartOptions,
+) -> DrivenBootDriverStart {
+    let PreparedBootDriverStart { owned, reservation, predecessors, dependent_devnodes } = prepared;
+    let mut batch = OwnedHostedPnpStartBatch::new(dc, owned, options);
+    batch.require_bootstrap_bus_pdos(dependent_devnodes);
+    let progress = if predecessors.is_empty() {
+        batch.drive()
+    } else {
+        OwnedHostedPnpStartProgress::AwaitingCompletion
+    };
+    DrivenBootDriverStart { batch, reservation, predecessors, progress }
+}
+
+/// Publish the generation-exact result under its pre-reserved slot. An uncertain START retains
+/// its batch and ownership barrier rather than replaying the native callback.
+fn publish_boot_driver_start(
+    driven: DrivenBootDriverStart,
+    target: BootDriverStartReportTarget,
+    pending: &mut nt_driver_start::PendingOperationTable<PendingDriverStart>,
+    reports: &mut BootDriverStartReports,
+) -> HostedPnpStartReport {
+    let DrivenBootDriverStart { batch, reservation, predecessors, progress } = driven;
+    let report = match progress {
+        OwnedHostedPnpStartProgress::Complete(_) => {
+            pending.cancel(reservation).expect("synchronous boot START lost its continuation reservation");
+            reports.merge(target, batch.report());
+            batch.report()
+        }
+        OwnedHostedPnpStartProgress::AwaitingCompletion => {
+            let report = batch.report();
+            pending.publish(reservation, PendingDriverStart {
+                batch, reservation, bootstrap_predecessors: predecessors,
+                owner: PendingDriverStartOwner::Boot { target, report_published: false },
+            }).expect("pending boot START rejected its pre-reserved owner");
+            report
+        }
+        OwnedHostedPnpStartProgress::OwnershipLost(_) => {
+            let report = batch.report();
+            reports.merge(target, batch.report());
+            pending.publish(reservation, PendingDriverStart {
+                batch, reservation, bootstrap_predecessors: predecessors,
+                owner: PendingDriverStartOwner::Boot { target, report_published: true },
+            }).expect("indeterminate boot START rejected its barrier owner");
+            report
+        }
+    };
+    report
+}
+
+unsafe fn launch_boot_driver_service(
+    fs: &Fat32,
+    spec: &InlineDriverLaunchSpec,
+    plan: &InlineDriverLaunchPlan,
+    options: HostedPnpStartOptions,
+    driver_starts: &mut DriverStartBootstrap,
+) -> Option<(driver_launch::DriverComponent, HostedPnpStartReport)> {
+    let target = BootDriverStartReportTarget {
+        trace: options.trace,
+        pci: inline_launch_spec_has_pci_devnode(plan.devnodes_for(spec)),
+    };
+    let prepared_start = prepare_boot_driver_start(spec, plan, &mut driver_starts.pending).ok()?;
     let Ok(dc) = load_driver(
         fs,
         spec.image_path.as_bytes(),
@@ -23479,74 +23558,89 @@ unsafe fn launch_boot_driver_service(
         spec.driver_object_path.as_str(),
         initial_system_driver_caller(),
     ) else {
-        if let Some((_, reservation, _, _)) = prepared_start {
+        if let Some(prepared) = prepared_start {
             driver_starts
                 .pending
-                .cancel(reservation)
+                .cancel(prepared.reservation)
                 .expect("failed boot driver load lost its START reservation");
         }
         return None;
     };
-    let Some((owned, reservation, predecessors, dependent_devnodes)) = prepared_start else {
+    let Some(prepared) = prepared_start else {
         return Some((dc, HostedPnpStartReport::default()));
     };
-    let mut batch = OwnedHostedPnpStartBatch::new(&dc, owned, options);
-    batch.require_bootstrap_bus_pdos(dependent_devnodes);
-    let progress = if predecessors.is_empty() {
-        batch.drive()
-    } else {
-        OwnedHostedPnpStartProgress::AwaitingCompletion
-    };
-    let report = match progress {
-        OwnedHostedPnpStartProgress::Complete(_) => {
-            driver_starts
-                .pending
-                .cancel(reservation)
-                .expect("synchronous boot START lost its continuation reservation");
-            driver_starts.reports.merge(target, batch.report());
-            batch.report()
-        }
-        OwnedHostedPnpStartProgress::AwaitingCompletion => {
-            let report = batch.report();
-            driver_starts
-                .pending
-                .publish(
-                    reservation,
-                    PendingDriverStart {
-                        batch,
-                        reservation,
-                        bootstrap_predecessors: predecessors,
-                        owner: PendingDriverStartOwner::Boot {
-                            target,
-                            report_published: false,
-                        },
-                    },
-                )
-                .expect("pending boot START rejected its pre-reserved owner");
-            report
-        }
-        OwnedHostedPnpStartProgress::OwnershipLost(_) => {
-            let report = batch.report();
-            driver_starts.reports.merge(target, batch.report());
-            driver_starts
-                .pending
-                .publish(
-                    reservation,
-                    PendingDriverStart {
-                        batch,
-                        reservation,
-                        bootstrap_predecessors: predecessors,
-                        owner: PendingDriverStartOwner::Boot {
-                            target,
-                            report_published: true,
-                        },
-                    },
-                )
-                .expect("indeterminate boot START rejected its barrier owner");
-            report
-        }
-    };
+    let driven = drive_boot_driver_start(&dc, prepared, options);
+    let report = publish_boot_driver_start(driven, target,
+        &mut driver_starts.pending, &mut driver_starts.reports);
     Some((dc, report))
+}
+
+/// Registry-selected PnP DriverEntry may open another provider device (as BasicDisplay opens
+/// DxgKrnl). Run both Start classes after the live File handler is registered, preserving their
+/// plan order and the exact resource windows that bootstrap published for each devnode.
+unsafe fn launch_live_pnp_plans(
+    handler: *mut ExecNtHandler,
+    plans: &[&InlineDriverLaunchPlan],
+) {
+    if plans.iter().all(|plan| plan.as_slice().is_empty()) { return; }
+    let Some(fs) = exec_fs() else {
+        print_str(b"[driver-launch] live PnP launch has no filesystem\n");
+        return;
+    };
+    for &plan in plans {
+        for spec in plan.as_slice() {
+            print_str(b"[driver-launch] launching live PnP service ");
+            print_str(spec.service_name.as_bytes());
+            print_str(b" path=");
+            print_str(spec.image_path.as_bytes());
+            print_str(b" devnodes=");
+            print_u64(spec.devnode_count as u64);
+            print_str(b"\n");
+            let options = HostedPnpStartOptions::config_pnp();
+            let target = BootDriverStartReportTarget {
+                trace: options.trace,
+                pci: inline_launch_spec_has_pci_devnode(plan.devnodes_for(spec)),
+            };
+            let prepared = match prepare_boot_driver_start(
+                spec, plan, &mut (*handler).pending_driver_starts,
+            ) {
+                Ok(prepared) => prepared,
+                Err(()) => continue,
+            };
+            // No handler field borrow crosses DriverEntry. Nested CREATE uses this live handler.
+            let loaded = load_driver(
+                &fs,
+                spec.image_path.as_bytes(),
+                spec.class,
+                spec.driver_object_path.as_str(),
+                initial_system_driver_caller(),
+            );
+            let Ok(dc) = loaded else {
+                if let Some(prepared) = prepared {
+                    (*handler).pending_driver_starts.cancel(prepared.reservation)
+                        .expect("failed live PnP driver load lost START reservation");
+                }
+                print_str(b"[driver-launch] live PnP load failed service=");
+                print_str(spec.service_name.as_bytes());
+                print_str(b"\n");
+                continue;
+            };
+            let Some(prepared) = prepared else { continue; };
+            let driven = drive_boot_driver_start(&dc, prepared, options);
+            let report = publish_boot_driver_start(
+                driven, target,
+                &mut (*handler).pending_driver_starts,
+                &mut (*handler).boot_driver_start_reports,
+            );
+            print_str(b"[driver-launch] live PnP START attempted/terminal/pending=");
+            print_u64(report.attempted);
+            print_str(b"/");
+            print_u64(report.terminal);
+            print_str(b"/");
+            print_u64(report.pending);
+            print_str(b"\n");
+        }
+    }
 }
 
 fn report_deferred_generic_hardware_checks(
@@ -31526,267 +31620,23 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     #[cfg(feature = "mup-provider-kernel-only")]
     print_str(b"[mup-provider-gate] kernel-only native service loop; win32k admission deferred\n");
 
-    // --- B3: start registry-selected PnP drivers against their discovered devnodes and
-    // generation-owned resources.
+    // Registry-selected PnP plans, PCI grants, and resource windows are already captured.
+    // DriverEntry runs after the live File handler exists, because a driver can synchronously
+    // open another provider's device during initialization. Both Start classes use that phase.
     let mut generic_hw_registry_selected = false;
-    let mut generic_hw_io_out32 = false;
-    let mut generic_hw_video_route_published = false;
     let mut generic_hw_selected = 0u64;
-    let mut generic_hw_attempted = 0u64;
-    let mut generic_hw_terminal = 0u64;
-    let mut generic_hw_add_device_count = 0u64;
-    let mut generic_hw_started = 0u64;
-    let mut generic_hw_failed = 0u64;
-    let mut generic_hw_pending = 0u64;
-    let mut generic_hw_pending_observed = 0u64;
-    let mut generic_hw_indeterminate = 0u64;
-    let mut generic_hw_video_route_attempted = 0u64;
-    let mut generic_hw_video_route_published_count = 0u64;
-    let mut generic_hw_first_error = 0u32;
-    let mut generic_hw_first_indeterminate = 0u32;
     let mut generic_pci_registry_selected = false;
-    let mut generic_pci_provider_domain_bound = false;
     let mut generic_pci_selected = 0u64;
-    let mut generic_pci_attempted = 0u64;
-    let mut generic_pci_provider_export_requests = 0u64;
-    let mut generic_pci_provider_export_completions = 0u64;
-    let mut generic_pci_provider_export_rejections = 0u64;
-    let mut generic_pci_add_device_count = 0u64;
-    let mut generic_pci_started = 0u64;
-    let mut generic_pci_resource_accessed = false;
-    let mut generic_pci_first_error = 0u32;
-    // A present devnode demand-loads its registry-selected function driver when no Driver object is
-    // loaded yet. This is the kernel PnP IopLoadDriver path, independent of a user NtLoadDriver
-    // request; Start=3 remains loadable here and only a disabled service is excluded by selection.
-    let config_pnp_launch_plans = [config_pnp_plan, config_demand_pnp_plan];
-    if config_pnp_launch_plans
-        .iter()
-        .any(|plan| !plan.as_slice().is_empty())
-    {
-        if let Some(fs) = exec_fs() {
-            for config_plan in config_pnp_launch_plans {
-                for config_spec in config_plan.as_slice() {
-                    let config_devnodes = config_plan.devnodes_for(config_spec);
-                    let spec_has_pci_devnode = inline_launch_spec_has_pci_devnode(config_devnodes);
-                    let spec_devnodes = config_spec.devnode_count as u64;
-                    generic_hw_selected += spec_devnodes;
-                    generic_hw_registry_selected |= config_spec.devnode_count != 0;
-                    generic_pci_registry_selected |= spec_has_pci_devnode;
-                    if spec_has_pci_devnode {
-                        generic_pci_selected += spec_devnodes;
-                    }
-                    print_str(b"[driver-launch] launching PnP service ");
-                    print_str(config_spec.service_name.as_bytes());
-                    print_str(b" from config hive path=");
-                    print_str(config_spec.image_path.as_bytes());
-                    print_str(b" object=");
-                    print_str(config_spec.driver_object_path.as_bytes());
-                    print_str(b" devnodes=");
-                    print_u64(config_spec.devnode_count as u64);
-                    print_str(b"\n");
-
-                    let provider_before = driver_launch::hosted_provider_sharing_evidence();
-                    if let Some((_dc, start_report)) = launch_boot_driver_service(
-                        &fs,
-                        config_spec,
-                        config_plan,
-                        HostedPnpStartOptions::config_pnp(),
-                        &mut driver_start_bootstrap,
-                    ) {
-                        let provider_after = driver_launch::hosted_provider_sharing_evidence();
-                        generic_hw_attempted += start_report.attempted;
-                        generic_hw_terminal += start_report.terminal;
-                        generic_hw_add_device_count += start_report.add_device_count;
-                        generic_hw_started += start_report.started;
-                        generic_hw_failed += start_report.failed;
-                        generic_hw_pending += start_report.pending;
-                        generic_hw_pending_observed += start_report.pending_observed;
-                        generic_hw_indeterminate += start_report.indeterminate;
-                        if generic_hw_first_error == 0 && start_report.first_error != 0 {
-                            generic_hw_first_error = start_report.first_error;
-                        }
-                        if generic_hw_first_indeterminate == 0
-                            && start_report.first_indeterminate != 0
-                        {
-                            generic_hw_first_indeterminate = start_report.first_indeterminate;
-                        }
-                        if spec_has_pci_devnode {
-                            generic_pci_attempted += start_report.attempted;
-                            generic_pci_add_device_count += start_report.add_device_count;
-                            generic_pci_started += start_report.started;
-                            generic_pci_provider_domain_bound |=
-                                provider_after.provider_domain_bindings != 0;
-                            generic_pci_provider_export_requests =
-                                generic_pci_provider_export_requests.saturating_add(
-                                    provider_after
-                                        .provider_export_requests
-                                        .saturating_sub(provider_before.provider_export_requests),
-                                );
-                            generic_pci_provider_export_completions =
-                                generic_pci_provider_export_completions.saturating_add(
-                                    provider_after.provider_export_completions.saturating_sub(
-                                        provider_before.provider_export_completions,
-                                    ),
-                                );
-                            generic_pci_provider_export_rejections =
-                                generic_pci_provider_export_rejections.saturating_add(
-                                    provider_after
-                                        .provider_export_rejections
-                                        .saturating_sub(provider_before.provider_export_rejections),
-                                );
-                            generic_pci_resource_accessed |= start_report.mmio_mapped
-                                || start_report.io_port_out32
-                                || start_report.interrupt_delivered
-                                || start_report.dma_common;
-                            if generic_pci_first_error == 0 && start_report.first_error != 0 {
-                                generic_pci_first_error = start_report.first_error;
-                            }
-                        }
-                        generic_hw_io_out32 |= start_report.io_port_out32;
-                        generic_hw_video_route_published |= start_report.video_route_published;
-                        generic_hw_video_route_attempted +=
-                            start_report.video_route_attempted_count;
-                        generic_hw_video_route_published_count +=
-                            start_report.video_route_published_count;
-                    } else {
-                        print_str(
-                            b"[driver-launch] registry-selected PnP driver launch returned None service=",
-                        );
-                        print_str(config_spec.service_name.as_bytes());
-                        print_str(b" (not staged / load failed)\n");
-                    }
-                }
+    for plan in [config_pnp_plan, config_demand_pnp_plan] {
+        for spec in plan.as_slice() {
+            let devnodes = spec.devnode_count as u64;
+            generic_hw_selected += devnodes;
+            generic_hw_registry_selected |= spec.devnode_count != 0;
+            if inline_launch_spec_has_pci_devnode(plan.devnodes_for(spec)) {
+                generic_pci_registry_selected = true;
+                generic_pci_selected += devnodes;
             }
-        } else {
-            print_str(b"[driver-launch] registry-selected PnP launch has no filesystem\n");
         }
-    } else {
-        print_str(b"[driver-launch] config hive has no installed PnP driver binding\n");
-    }
-    let generic_hw_gates_deferred = generic_hw_pending != 0
-        || generic_hw_indeterminate != 0
-        || !driver_start_bootstrap.pending.is_empty();
-    if !generic_hw_gates_deferred && generic_hw_selected != 0 {
-        print_str(b"[driver-launch] config PnP hardware summary selected=");
-        print_u64(generic_hw_selected);
-        print_str(b" attempted=");
-        print_u64(generic_hw_attempted);
-        print_str(b" add=");
-        print_u64(generic_hw_add_device_count);
-        print_str(b" started=");
-        print_u64(generic_hw_started);
-        print_str(b" terminal/failed/pending/pending-observed/indeterminate=");
-        print_u64(generic_hw_terminal);
-        print_str(b"/");
-        print_u64(generic_hw_failed);
-        print_str(b"/");
-        print_u64(generic_hw_pending);
-        print_str(b"/");
-        print_u64(generic_hw_pending_observed);
-        print_str(b"/");
-        print_u64(generic_hw_indeterminate);
-        print_str(b" first_error=0x");
-        print_hex(generic_hw_first_error);
-        print_str(b" first_indeterminate=0x");
-        print_hex(generic_hw_first_indeterminate);
-        print_str(b" pci_selected=");
-        print_u64(generic_pci_selected);
-        print_str(b" pci_attempted=");
-        print_u64(generic_pci_attempted);
-        print_str(b" pci_provider_domain=");
-        print_u64(generic_pci_provider_domain_bound as u64);
-        print_str(b" pci_provider_exports=");
-        print_u64(generic_pci_provider_export_completions);
-        print_str(b"/");
-        print_u64(generic_pci_provider_export_requests);
-        print_str(b" pci_provider_rejections=");
-        print_u64(generic_pci_provider_export_rejections);
-        print_str(b" pci_add=");
-        print_u64(generic_pci_add_device_count);
-        print_str(b" pci_started=");
-        print_u64(generic_pci_started);
-        print_str(b" pci_resource_accessed=");
-        print_u64(generic_pci_resource_accessed as u64);
-        print_str(b" pci_first_error=0x");
-        print_hex(generic_pci_first_error);
-        print_str(b" io_out32=");
-        print_u64(generic_hw_io_out32 as u64);
-        print_str(b" video_route=");
-        print_u64(generic_hw_video_route_published as u64);
-        print_str(b" video_route_attempted=");
-        print_u64(generic_hw_video_route_attempted);
-        print_str(b" video_route_published=");
-        print_u64(generic_hw_video_route_published_count);
-        print_str(b"\n");
-    }
-    let provider_sharing = driver_launch::hosted_provider_sharing_evidence();
-    if !generic_hw_gates_deferred
-        && (provider_sharing.primary_services != 0
-            || provider_sharing.private_dependencies != 0
-            || provider_sharing.singleton_providers != 0
-            || provider_sharing.provider_domain_bindings != 0)
-    {
-        print_str(b"[driver-launch] hosted provider sharing primary=");
-        print_u64(provider_sharing.primary_services);
-        print_str(b" primary-bytes=");
-        print_u64(provider_sharing.primary_service_image_bytes);
-        print_str(b" private-deps=");
-        print_u64(provider_sharing.private_dependencies);
-        print_str(b" private-bytes=");
-        print_u64(provider_sharing.private_dependency_image_bytes);
-        print_str(b" private-deps-with-primary=");
-        print_u64(provider_sharing.private_dependencies_with_primary_provider);
-        print_str(b" first-private-primary-inst=");
-        print_u64(provider_sharing.first_private_dependency_with_primary_instance);
-        print_str(b" duplicate-private-deps=");
-        print_u64(provider_sharing.duplicate_private_dependencies);
-        print_str(b" unique-primary-provider-matches=");
-        print_u64(provider_sharing.unique_primary_provider_matches);
-        print_str(b" overflow=");
-        print_u64(provider_sharing.overflowed_load_records);
-        print_str(b" singletons=");
-        print_u64(provider_sharing.singleton_providers);
-        print_str(b" provider-domains=");
-        print_u64(provider_sharing.provider_domain_bindings);
-        print_str(b" exports=");
-        print_u64(provider_sharing.provider_export_completions);
-        print_str(b"/");
-        print_u64(provider_sharing.provider_export_requests);
-        print_str(b" export-rejections=");
-        print_u64(provider_sharing.provider_export_rejections);
-        print_str(b" callbacks=");
-        print_u64(provider_sharing.provider_callback_completions);
-        print_str(b"/");
-        print_u64(provider_sharing.provider_callback_requests);
-        print_str(b" packet-array=");
-        print_u64(provider_sharing.provider_packet_array_export_completions);
-        print_str(b"/");
-        print_u64(provider_sharing.provider_packet_array_export_requests);
-        print_str(b" packet-array-rx=");
-        print_u64(provider_sharing.provider_packet_array_protocol_receive_completions);
-        print_str(b"/");
-        print_u64(provider_sharing.provider_packet_array_protocol_receive_requests);
-        print_str(b" packet-array-rx-packet=");
-        print_u64(provider_sharing.provider_packet_array_protocol_receive_packet_completions);
-        print_str(b"/");
-        print_u64(provider_sharing.provider_packet_array_protocol_receive_packet_requests);
-        print_str(b" rx=");
-        print_u64(provider_sharing.provider_protocol_receive_completions);
-        print_str(b"/");
-        print_u64(provider_sharing.provider_protocol_receive_requests);
-        print_str(b" rx-complete=");
-        print_u64(provider_sharing.provider_protocol_receive_complete_completions);
-        print_str(b"/");
-        print_u64(provider_sharing.provider_protocol_receive_complete_requests);
-        print_str(b" rx-packet=");
-        print_u64(provider_sharing.provider_protocol_receive_packet_completions);
-        print_str(b"/");
-        print_u64(provider_sharing.provider_protocol_receive_packet_requests);
-        print_str(b" singleton-overflows=");
-        print_u64(provider_sharing.singleton_overflows);
-        print_str(b" singleton-conflicts=");
-        print_u64(provider_sharing.singleton_conflicts);
-        print_str(b"\n");
     }
     // The storage host read the installed SMSS image into the file buffer. Validate its PE
     // shape and SEC_IMAGE page-fill without pinning a particular release's section count or RVA.
@@ -32043,6 +31893,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         SCRATCH_BASE,
                         (NTDLL_BASE, smss_ntdll_pe),
                         driver_start_bootstrap,
+                        config_pnp_plan,
+                        config_demand_pnp_plan,
                     );
                     desktop_acceptance = desktop_report;
                     // The service has returned its exclusive borrow. Final observations read only
