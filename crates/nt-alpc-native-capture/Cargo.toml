@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[dependencies]
+nt-alpc-abi = { path = "../nt-alpc-abi" }
+bytemuck = { version = "1", default-features = false }
+
 [features]
 default = []
 

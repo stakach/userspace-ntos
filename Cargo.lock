@@ -209,6 +209,18 @@ dependencies = [
 [[package]]
 name = "nt-alpc-native-capture"
 version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "nt-alpc-abi",
+]
+
+[[package]]
+name = "nt-alpc-native-later"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "nt-alpc-abi",
+]
 
 [[package]]
 name = "nt-cache-manager"

@@ -1,15 +1,15 @@
-//! Owned native arguments for a future checked `NtAlpcCreatePort` dispatch.
+//! Owned native arguments for a checked `NtAlpcCreatePort` dispatch.
 //!
-//! This crate only captures caller memory. A security descriptor pointer and
-//! RootDirectory handle still require policy validation before submission.
-//! Submission must retain the original Reply and request across an uncertain
-//! SURT completion before it can be enabled.
+//! Capture and wire encoding have no port-service effect. Submission must retain
+//! the original Reply and request across an uncertain SURT completion.
 
 #![no_std]
 
 extern crate alloc;
 
 use alloc::vec::Vec;
+use nt_alpc_abi::{AlpcCreatePortCheckedRequest, AlpcCreatePortOwnedRequest,
+    AlpcCreatePortRequest, AlpcPortAttributes};
 
 mod retained_create;
 pub use retained_create::{CreateOwner, RetainedCreate, RetainedCreateError, TerminalCreate};
@@ -18,6 +18,7 @@ const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
+const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 const MAX_NAME_BYTES: usize = 2048;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -36,11 +37,83 @@ impl CapturedCreatePort {
     }
 
     pub fn max_message_length(&self) -> u64 {
-        u64::from_le_bytes(self.attributes[24..32].try_into().unwrap())
+        u64::from_le_bytes(self.attributes[16..24].try_into().unwrap())
     }
 
     pub fn max_pool_usage(&self) -> u64 {
-        u64::from_le_bytes(self.attributes[40..48].try_into().unwrap())
+        u64::from_le_bytes(self.attributes[32..40].try_into().unwrap())
+    }
+
+    /// Encode only the policy this port service can honor. A RootDirectory or
+    /// SecurityDescriptor must be resolved/checked by the executive before it
+    /// can be passed to the service; silently dropping either grants authority.
+    pub fn checked_wire(
+        &self,
+        owner: CreateOwner,
+        token: (u64, u64),
+    ) -> Result<Vec<u8>, u32> {
+        if owner.process_id == 0 || owner.thread_id == 0 || owner.process_generation == 0
+            || token == (0, 0)
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if self.root_directory != 0 || self.security_descriptor != 0 {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
+        // OBJ_CASE_INSENSITIVE is already the port core's name comparison rule.
+        // Other object flags need namespace/handle policy not represented here.
+        if self.object_flags & !0x40 != 0 {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
+        if self.name.len() > MAX_NAME_BYTES / 2 {
+            return Err(STATUS_OBJECT_NAME_INVALID);
+        }
+        let attributes: AlpcPortAttributes = bytemuck::pod_read_unaligned(&self.attributes);
+        if attributes.flags != 0 || attributes.max_message_length > u32::MAX as u64
+            || attributes.max_pool_usage > u32::MAX as u64
+            || attributes.memory_bandwidth != 0 || attributes.max_section_size != 0
+            || attributes.max_view_size != 0 || attributes.max_total_section_size != 0
+            || attributes.dup_object_types != 0 || attributes.reserved != 0
+        {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
+        let qos = attributes.security_qos;
+        if (qos.length != 0 && qos.length != 12)
+            || (qos.length == 0 && (qos.impersonation_level != 0
+                || qos.context_tracking_mode != 0 || qos.effective_only != 0))
+            || qos.impersonation_level > 3 || qos.context_tracking_mode > 1
+            || qos.effective_only > 1 || qos._pad != 0
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let header_size = core::mem::size_of::<AlpcCreatePortOwnedRequest>();
+        let name_len_bytes = self.name.len() * 2;
+        let mut wire = Vec::new();
+        wire.try_reserve_exact(header_size + name_len_bytes)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        let request = AlpcCreatePortOwnedRequest {
+            checked: AlpcCreatePortCheckedRequest {
+                create: AlpcCreatePortRequest {
+                    abi_size: header_size as u16,
+                    port_flags: attributes.flags,
+                    max_message_length: attributes.max_message_length as u32,
+                    name_offset: header_size as u32,
+                    name_len_bytes: name_len_bytes as u32,
+                    ..Default::default()
+                },
+                owner_process: owner.process_id,
+                owner_thread: owner.thread_id,
+                owner_generation: owner.process_generation,
+                invocation_hi: token.0,
+                invocation_lo: token.1,
+            },
+            attributes,
+        };
+        wire.extend_from_slice(bytemuck::bytes_of(&request));
+        for unit in &self.name {
+            wire.extend_from_slice(&unit.to_le_bytes());
+        }
+        Ok(wire)
     }
 }
 
@@ -120,8 +193,8 @@ mod tests {
         for (index, unit) in "\\SmApiPort".encode_utf16().enumerate() {
             memory[160 + index * 2..162 + index * 2].copy_from_slice(&unit.to_le_bytes());
         }
-        memory[256 + 24..256 + 32].copy_from_slice(&328u64.to_le_bytes());
-        memory[256 + 40..256 + 48].copy_from_slice(&8192u64.to_le_bytes());
+        memory[256 + 16..256 + 24].copy_from_slice(&328u64.to_le_bytes());
+        memory[256 + 32..256 + 40].copy_from_slice(&8192u64.to_le_bytes());
         memory
     }
 
@@ -135,7 +208,7 @@ mod tests {
             true
         }, |address, size| address == 16 && size == 8).unwrap();
         assert_eq!(captured.name, "\\SmApiPort".encode_utf16().collect::<Vec<_>>());
-        assert_eq!(u64::from_le_bytes(captured.attributes[24..32].try_into().unwrap()), 328);
+        assert_eq!(u64::from_le_bytes(captured.attributes[16..24].try_into().unwrap()), 328);
         assert_eq!(captured.max_message_length(), 328);
         assert_eq!(captured.max_pool_usage(), 8192);
         memory[160] = 0;
@@ -170,5 +243,46 @@ mod tests {
         assert!(captured.name.is_empty());
         assert_eq!(captured.root_directory, 0);
         assert_eq!(captured.attributes, [0; 72]);
+    }
+
+    #[test]
+    fn checked_wire_keeps_exact_owner_token_limits_and_name() {
+        let memory = image();
+        let captured = capture([16, 64, 256], |address, out| {
+            out.copy_from_slice(&memory[address as usize..address as usize + out.len()]);
+            true
+        }, |_, _| true).unwrap();
+        let owner = CreateOwner { process_id: 41, thread_id: 51, process_generation: 61 };
+        let wire = captured.checked_wire(owner, (71, 81)).unwrap();
+        let size = core::mem::size_of::<AlpcCreatePortOwnedRequest>();
+        let request: AlpcCreatePortOwnedRequest = bytemuck::pod_read_unaligned(&wire[..size]);
+        assert_eq!(request.checked.create.abi_size as usize, size);
+        assert_eq!(request.checked.create.name_offset as usize, size);
+        assert_eq!(request.checked.create.name_len_bytes, 20);
+        assert_eq!((request.checked.owner_process, request.checked.owner_thread,
+            request.checked.owner_generation), (41, 51, 61));
+        assert_eq!((request.checked.invocation_hi, request.checked.invocation_lo), (71, 81));
+        assert_eq!(request.attributes.max_message_length, 328);
+        assert_eq!(request.attributes.max_pool_usage, 8192);
+        assert_eq!(&wire[size..], &memory[160..180]);
+    }
+
+    #[test]
+    fn unsupported_authority_and_limits_have_no_wire() {
+        let mut captured = capture([16, 0, 0], |_, _| unreachable!(), |_, _| true).unwrap();
+        let owner = CreateOwner { process_id: 1, thread_id: 2, process_generation: 3 };
+        captured.root_directory = 9;
+        assert_eq!(captured.checked_wire(owner, (4, 5)), Err(STATUS_NOT_SUPPORTED));
+        captured.root_directory = 0;
+        captured.security_descriptor = 9;
+        assert_eq!(captured.checked_wire(owner, (4, 5)), Err(STATUS_NOT_SUPPORTED));
+        captured.security_descriptor = 0;
+        captured.object_flags = 0x10;
+        assert_eq!(captured.checked_wire(owner, (4, 5)), Err(STATUS_NOT_SUPPORTED));
+        captured.object_flags = 0x40;
+        captured.attributes[48..56].copy_from_slice(&1u64.to_le_bytes());
+        assert_eq!(captured.checked_wire(owner, (4, 5)), Err(STATUS_NOT_SUPPORTED));
+        captured.attributes[48..56].fill(0);
+        assert_eq!(captured.checked_wire(owner, (0, 0)), Err(STATUS_INVALID_PARAMETER));
     }
 }

@@ -20,6 +20,7 @@ members = [
     "crates/nt-lpc-client",
     "crates/nt-alpc-abi",
     "crates/nt-alpc-native-capture",
+    "crates/nt-alpc-native-later",
     "crates/nt-alpc",
     "crates/nt-io-abi",
     "crates/nt-io-manager",

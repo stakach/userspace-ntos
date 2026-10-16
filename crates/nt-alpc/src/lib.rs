@@ -427,6 +427,9 @@ impl AlpcServer {
 
     fn op_connect_port(&mut self, core: &mut PortCore, buf: &[u8]) -> Result<AlpcReply, NtStatus> {
         let req: AlpcConnectPortRequest = read_req(buf)?;
+        if req.abi_size as usize != size_of::<AlpcConnectPortRequest>() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         let name = read_name(buf, req.name_offset, req.name_len_bytes)?;
         // The ALPC connect PORT_MESSAGE payload IS the connection-info blob (the
         // bridge passthrough); an LPC host will read these bytes as its blob.
@@ -451,6 +454,9 @@ impl AlpcServer {
         buf: &[u8],
     ) -> Result<AlpcReply, NtStatus> {
         let req: AlpcAcceptConnectRequest = read_req(buf)?;
+        if req.abi_size as usize != size_of::<AlpcAcceptConnectRequest>() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         let accept = req.accept != 0;
         let sh = core.accept(req.connection_id, accept, req.port_context)?;
         if !accept {
@@ -474,6 +480,9 @@ impl AlpcServer {
         out_buf: &mut [u8],
     ) -> Result<AlpcReply, NtStatus> {
         let req: AlpcSendReceiveRequest = read_req(buf)?;
+        if req.abi_size as usize != size_of::<AlpcSendReceiveRequest>() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
 
         // Send half (skipped for a pure receive op or a zero-length send).
         if op == opcode::ALPC_OP_SEND_RECEIVE && req.message_len_bytes != 0 {

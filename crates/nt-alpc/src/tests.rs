@@ -443,6 +443,42 @@ fn alpc_create_and_connect_auto_accept() {
 }
 
 #[test]
+fn unchecked_service_rejects_checked_later_requests_before_effects() {
+    let mut core = PortCore::new();
+    let mut alpc = AlpcServer::new();
+    let mut out = [0u8; 64];
+    let connect = nt_alpc_abi::AlpcConnectPortCheckedRequest {
+        connect: AlpcConnectPortRequest {
+            abi_size: size_of::<nt_alpc_abi::AlpcConnectPortCheckedRequest>() as u16,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let accept = nt_alpc_abi::AlpcAcceptConnectCheckedRequest {
+        accept: AlpcAcceptConnectRequest {
+            abi_size: size_of::<nt_alpc_abi::AlpcAcceptConnectCheckedRequest>() as u16,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let send = nt_alpc_abi::AlpcSendReceiveCheckedRequest {
+        send_receive: AlpcSendReceiveRequest {
+            abi_size: size_of::<nt_alpc_abi::AlpcSendReceiveCheckedRequest>() as u16,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    for (opcode, request) in [
+        (aop::ALPC_OP_CONNECT_PORT, bytes(&connect)),
+        (aop::ALPC_OP_ACCEPT_CONNECT, bytes(&accept)),
+        (aop::ALPC_OP_SEND_RECEIVE, bytes(&send)),
+    ] {
+        let reply = alpc.dispatch(&mut core, opcode, &request, &mut out);
+        assert_eq!(reply.status, NtStatus::INVALID_PARAMETER.0);
+    }
+}
+
+#[test]
 fn alpc_malformed_does_not_panic() {
     let mut core = PortCore::new();
     let mut alpc = AlpcServer::new();
