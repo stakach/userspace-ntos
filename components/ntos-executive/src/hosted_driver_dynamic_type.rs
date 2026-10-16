@@ -54,7 +54,7 @@ pub(super) extern "win64" fn ob_create_object_type(
         if init.length as usize != core::mem::size_of::<ObjectTypeInitializer>() {
             return STATUS_INVALID_PARAMETER;
         }
-        if init.methods[3] == 0 || init.methods.iter().enumerate().any(|(i, &method)| i != 3 && method != 0) {
+        if !init.supports_hosted_delete() {
             return STATUS_NOT_SUPPORTED;
         }
         let _guard = component_device_reply_lock();
@@ -100,10 +100,10 @@ pub(super) extern "win64" fn ob_create_object_type(
             pool_free(type_pointer);
             return status;
         }
-        let Ok(native_index) = u32::try_from(index) else {
+        let Ok(native_index) = u8::try_from(index) else {
             crate::provider_bugcheck::report(0xc4, [LABEL, type_pointer, index, raw]);
         };
-        write_unaligned((type_pointer + core::mem::offset_of!(ObjectType, index) as u64) as *mut u32, native_index);
+        write_unaligned((type_pointer + core::mem::offset_of!(ObjectType, index) as u64) as *mut u8, native_index);
         write_unaligned(output, type_pointer);
         STATUS_SUCCESS
     }
@@ -143,18 +143,18 @@ pub(crate) fn service(
         ) else { return (STATUS_INVALID_PARAMETER, 0); };
         let init = read_volatile(inst.exec_arg_va as *const ObjectTypeInitializer);
         let name_length = read_volatile((inst.exec_arg_va + ARG_NAME_LENGTH) as *const u16) as usize;
-        if init.length as usize != core::mem::size_of::<ObjectTypeInitializer>()
-            || init.methods[3] == 0
-            || init.methods.iter().enumerate().any(|(i, &method)| i != 3 && method != 0)
+        if !init.supports_hosted_delete()
             || name_length == 0 || name_length % 2 != 0 || name_length > NAME_CAP_UNITS * 2
         { return (STATUS_INVALID_PARAMETER, 0); }
         let Some(image) = hosted_driver_process_notify::published_image_for_callback(index, inst, init.methods[3])
         else { return (STATUS_INVALID_PARAMETER, 0); };
         let type_info = exec_pointer + core::mem::offset_of!(ObjectType, type_info) as u64;
-        let captured_init = read_volatile(type_info as *const ObjectTypeInitializer);
-        if captured_init.methods[3] != init.methods[3]
-            || captured_init.length != init.length
-            || read_volatile((exec_pointer + core::mem::offset_of!(ObjectType, name) as u64 + 8) as *const u64)
+        // The body and IPC copy must describe one exact initializer. A changed scalar or flag
+        // cannot authorize a different permanent type under the same physical allocation.
+        if (0..core::mem::size_of::<ObjectTypeInitializer>()).any(|offset| {
+            read_volatile((type_info + offset as u64) as *const u8)
+                != read_volatile((inst.exec_arg_va + offset as u64) as *const u8)
+        }) || read_volatile((exec_pointer + core::mem::offset_of!(ObjectType, name) as u64 + 8) as *const u64)
                 != type_pointer + TYPE_BODY_BYTES
         { return (STATUS_INVALID_PARAMETER, 0); }
         let mut name = Vec::new();
@@ -187,8 +187,8 @@ pub(crate) fn service(
             valid_access_mask: init.valid_access_mask,
             pool_type: init.pool_type,
             default_nonpaged_pool_charge: init.default_nonpaged_pool_charge,
-            use_default_object: init.use_default_object != 0,
-            security_required: init.security_required != 0,
+            use_default_object: init.use_default_object(),
+            security_required: init.security_required(),
         };
         let bindings = &mut *core::ptr::addr_of_mut!(BINDINGS);
         if bindings.iter().any(|row| row.instance == index && row.pool_pointer == type_pointer) {
@@ -197,7 +197,7 @@ pub(crate) fn service(
         if bindings.try_reserve(1).is_err() { return (STATUS_INSUFFICIENT_RESOURCES, 0); }
         let registry = (&mut *core::ptr::addr_of_mut!(REGISTRY))
             .get_or_insert_with(HostedDynamicTypeRegistry::new);
-        if registry.type_count() >= u32::MAX as usize - 26 {
+        if registry.type_count() >= (u8::MAX as usize - 26) {
             return (STATUS_INSUFFICIENT_RESOURCES, 0);
         }
         let type_id = match registry.register(owner, definition) {
