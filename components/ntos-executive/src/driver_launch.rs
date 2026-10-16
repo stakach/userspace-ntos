@@ -35446,6 +35446,7 @@ unsafe extern "win64" fn fsd_invalid_device_request(_devobj: u64, irp: u64) -> i
             STATUS_INVALID_DEVICE_REQUEST_I32,
         );
         write_unaligned((irp + 0x38) as *mut u64, 0);
+        s_io_complete_request(irp, 0);
     }
     STATUS_INVALID_DEVICE_REQUEST_I32
 }
