@@ -1100,7 +1100,10 @@ pub const SSN_NT_DELETE_VALUE_KEY: u64 = 68;
 /// Security-token SSNs. The Ex opens differ only by their handle-attribute argument.
 pub const SSN_NT_ACCESS_CHECK: u64 = 1;
 pub const SSN_NT_ACCESS_CHECK_BY_TYPE: u64 = 3;
+pub const SSN_NT_ACCESS_CHECK_BY_TYPE_AND_AUDIT_ALARM: u64 = 4;
 pub const SSN_NT_ACCESS_CHECK_BY_TYPE_RESULT_LIST: u64 = 5;
+pub const SSN_NT_ACCESS_CHECK_BY_TYPE_RESULT_LIST_AND_AUDIT_ALARM: u64 = 6;
+pub const SSN_NT_ACCESS_CHECK_BY_TYPE_RESULT_LIST_AND_AUDIT_ALARM_BY_HANDLE: u64 = 7;
 pub const SSN_NT_DUPLICATE_TOKEN: u64 = 72;
 pub const SSN_NT_FILTER_TOKEN: u64 = 79;
 /// NtCreateToken — lsasrv's `LsapLogonUser` mints the interactive logon token here
@@ -24961,8 +24964,20 @@ fn build_nt_table() -> NativeServiceTable {
                 SSN_NT_ACCESS_CHECK_BY_TYPE as u32,
             ),
             (
+                NativeService::NtAccessCheckByTypeAndAuditAlarm,
+                SSN_NT_ACCESS_CHECK_BY_TYPE_AND_AUDIT_ALARM as u32,
+            ),
+            (
                 NativeService::NtAccessCheckByTypeResultList,
                 SSN_NT_ACCESS_CHECK_BY_TYPE_RESULT_LIST as u32,
+            ),
+            (
+                NativeService::NtAccessCheckByTypeResultListAndAuditAlarm,
+                SSN_NT_ACCESS_CHECK_BY_TYPE_RESULT_LIST_AND_AUDIT_ALARM as u32,
+            ),
+            (
+                NativeService::NtAccessCheckByTypeResultListAndAuditAlarmByHandle,
+                SSN_NT_ACCESS_CHECK_BY_TYPE_RESULT_LIST_AND_AUDIT_ALARM_BY_HANDLE as u32,
             ),
             (
                 NativeService::NtMakeTemporaryObject,

@@ -154,7 +154,10 @@ pub enum NativeService {
     NtCreateToken,
     NtAccessCheck,
     NtAccessCheckByType,
+    NtAccessCheckByTypeAndAuditAlarm,
     NtAccessCheckByTypeResultList,
+    NtAccessCheckByTypeResultListAndAuditAlarm,
+    NtAccessCheckByTypeResultListAndAuditAlarmByHandle,
     // System information (§16.5, §7.1)
     NtQuerySystemInformation,
     NtQuerySystemTime,
@@ -403,7 +406,10 @@ impl NativeService {
             NtCreateToken => "NtCreateToken",
             NtAccessCheck => "NtAccessCheck",
             NtAccessCheckByType => "NtAccessCheckByType",
+            NtAccessCheckByTypeAndAuditAlarm => "NtAccessCheckByTypeAndAuditAlarm",
             NtAccessCheckByTypeResultList => "NtAccessCheckByTypeResultList",
+            NtAccessCheckByTypeResultListAndAuditAlarm => "NtAccessCheckByTypeResultListAndAuditAlarm",
+            NtAccessCheckByTypeResultListAndAuditAlarmByHandle => "NtAccessCheckByTypeResultListAndAuditAlarmByHandle",
             NtQuerySystemInformation => "NtQuerySystemInformation",
             NtQuerySystemTime => "NtQuerySystemTime",
             NtSetSystemTime => "NtSetSystemTime",
@@ -727,6 +733,9 @@ impl NativeService {
         NativeService::NtQueryTimer,
         NativeService::NtAlertThreadByThreadId,
         NativeService::NtWaitForAlertByThreadId,
+        NativeService::NtAccessCheckByTypeAndAuditAlarm,
+        NativeService::NtAccessCheckByTypeResultListAndAuditAlarm,
+        NativeService::NtAccessCheckByTypeResultListAndAuditAlarmByHandle,
     ];
 }
 

@@ -78,6 +78,12 @@ pub mod crt_printf_safe;
 pub mod crt_scan;
 pub mod crt_state;
 
+/// Intrusive dynamic hash-table ABI with process-heap-owned buckets.
+pub mod hash_table;
+
+/// UTF-8, system-time, and security-error compatibility entries.
+pub mod misc_rtl_exports;
+
 /// Query whether a process handle names the current process.
 pub mod current_process;
 

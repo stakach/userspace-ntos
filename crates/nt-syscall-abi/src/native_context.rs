@@ -10,7 +10,7 @@ pub const NATIVE_CONTEXT_VERSION: u32 = 1;
 pub const NATIVE_CONTEXT_BYTES: usize = 176;
 pub const NATIVE_CONTEXT_ALIGNMENT: u64 = 16;
 pub const NATIVE_CONTEXT_REGISTER_COUNT: usize = 18;
-pub const NATIVE_CONTEXT_MAX_ARGS: u8 = 16;
+pub const NATIVE_CONTEXT_MAX_ARGS: u8 = 17;
 pub const NATIVE_CONTEXT_PREFIX_WORDS: u64 = 2;
 
 pub const VERSION_OFFSET: usize = 0;

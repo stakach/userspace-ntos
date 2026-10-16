@@ -96,7 +96,7 @@ pub const fn native_syscall_message_info(argc: u8) -> u64 {
 }
 
 /// The largest native request emitted by the generated NT stubs (two prefix words and up to
-/// fourteen arguments). Capture these words before the receiver performs any nested IPC.
+/// seventeen arguments). Capture these words before the receiver performs any nested IPC.
 pub const NT_NATIVE_REQUEST_WORDS: usize =
     NT_NATIVE_SYSCALL_PREFIX_WORDS as usize + MAX_STUB_ARGS as usize;
 
@@ -235,7 +235,10 @@ pub const NT_SYSCALLS: &[NtSyscall] = &[
     n("NtAccessCheck", 1),
     n("NtAccessCheckAndAuditAlarm", 2),
     n("NtAccessCheckByType", 3),
+    n("NtAccessCheckByTypeAndAuditAlarm", 4),
     n("NtAccessCheckByTypeResultList", 5),
+    n("NtAccessCheckByTypeResultListAndAuditAlarm", 6),
+    n("NtAccessCheckByTypeResultListAndAuditAlarmByHandle", 7),
     n("NtAddAtom", 8),
     n("NtAdjustGroupsToken", 11),
     n("NtAdjustPrivilegesToken", 12),
@@ -669,11 +672,14 @@ pub const ZW_ALIASES: &[ZwAlias] = &[
         2,
     ),
     z("ZwAccessCheckByType", "NtAccessCheckByType", 3),
+    z("ZwAccessCheckByTypeAndAuditAlarm", "NtAccessCheckByTypeAndAuditAlarm", 4),
     z(
         "ZwAccessCheckByTypeResultList",
         "NtAccessCheckByTypeResultList",
         5,
     ),
+    z("ZwAccessCheckByTypeResultListAndAuditAlarm", "NtAccessCheckByTypeResultListAndAuditAlarm", 6),
+    z("ZwAccessCheckByTypeResultListAndAuditAlarmByHandle", "NtAccessCheckByTypeResultListAndAuditAlarmByHandle", 7),
     z("ZwAddAtom", "NtAddAtom", 8),
     z("ZwAdjustGroupsToken", "NtAdjustGroupsToken", 11),
     z("ZwAdjustPrivilegesToken", "NtAdjustPrivilegesToken", 12),
@@ -1216,7 +1222,10 @@ pub const NT_ARGC: &[(&str, u8)] = &[
     ("NtAccessCheck", 8),
     ("NtAccessCheckAndAuditAlarm", 11),
     ("NtAccessCheckByType", 11),
+    ("NtAccessCheckByTypeAndAuditAlarm", 16),
     ("NtAccessCheckByTypeResultList", 11),
+    ("NtAccessCheckByTypeResultListAndAuditAlarm", 16),
+    ("NtAccessCheckByTypeResultListAndAuditAlarmByHandle", 17),
     ("NtAddAtom", 3),
     ("NtAdjustGroupsToken", 6),
     ("NtAdjustPrivilegesToken", 6),
@@ -1639,9 +1648,10 @@ pub const NT_ARGC: &[(&str, u8)] = &[
     ("NtAlpcSendWaitReceivePort", 8),
 ];
 
-/// The maximum stub-arg count our marshaller supports (the widest NT service, `NtCreateNamedPipeFile`
-/// = 14). A gatherer that lacks an exact arity uses this as a conservative sweep bound.
-pub const MAX_STUB_ARGS: u8 = 14;
+/// The maximum stub-arg count our marshaller supports (the widest NT service,
+/// `NtAccessCheckByTypeResultListAndAuditAlarmByHandle` = 17). A gatherer that lacks
+/// an exact arity uses this as a conservative sweep bound.
+pub const MAX_STUB_ARGS: u8 = 17;
 
 /// Return the exact parameter count of a known `Nt*`/`Zw*` service.
 pub fn exact_argc_of(name: &str) -> Option<u8> {

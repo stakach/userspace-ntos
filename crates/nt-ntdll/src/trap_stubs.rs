@@ -106,6 +106,9 @@ macro_rules! define_stub_arity {
     ($fn:ident, $name:literal, $ssn:literal, 16) => {
         define_typed_stub!($fn, $name, $ssn, 16, (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15));
     };
+    ($fn:ident, $name:literal, $ssn:literal, 17) => {
+        define_typed_stub!($fn, $name, $ssn, 17, (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16));
+    };
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
@@ -127,6 +130,7 @@ macro_rules! invoke_stub_arity {
     ($fn:ident, 14, $args:ident) => { unsafe { $fn($args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7], $args[8], $args[9], $args[10], $args[11], $args[12], $args[13]) } };
     ($fn:ident, 15, $args:ident) => { unsafe { $fn($args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7], $args[8], $args[9], $args[10], $args[11], $args[12], $args[13], $args[14]) } };
     ($fn:ident, 16, $args:ident) => { unsafe { $fn($args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7], $args[8], $args[9], $args[10], $args[11], $args[12], $args[13], $args[14], $args[15]) } };
+    ($fn:ident, 17, $args:ident) => { unsafe { $fn($args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7], $args[8], $args[9], $args[10], $args[11], $args[12], $args[13], $args[14], $args[15], $args[16]) } };
 }
 
 macro_rules! define_typed_stub {
@@ -162,14 +166,14 @@ macro_rules! define_typed_stub {
                 native_seh!(".seh_pushreg r12"),
                 "push r13",
                 native_seh!(".seh_pushreg r13"),
-                "sub rsp, 128",
-                native_seh!(".seh_stackalloc 128"),
+                "sub rsp, 144",
+                native_seh!(".seh_stackalloc 144"),
                 native_seh!(".seh_endprologue"),
                 "mov [rsp], rcx",
                 "mov [rsp + 8], rdx",
                 "mov [rsp + 16], r8",
                 "mov [rsp + 24], r9",
-                "lea rsi, [rsp + 208]", // entry RSP + 0x28: fifth Windows argument
+                "lea rsi, [rsp + 224]", // entry RSP + 0x28: fifth Windows argument
                 "lea rdi, [rsp + 32]",
                 concat!("mov ecx, ", stringify!($argc)),
                 "sub ecx, 4",
@@ -199,7 +203,7 @@ macro_rules! define_typed_stub {
                 "6:",
                 "mov r9, [rsp]",
                 "mov r15, [rsp + 8]",
-                "lea r8, [rsp + 168]", // original Windows entry RSP, not helper geometry
+                "lea r8, [rsp + 184]", // original Windows entry RSP, not helper geometry
                 concat!("mov r10d, ", stringify!($ssn)),
                 "mov edi, 6",
                 "mov esi, {msginfo}",
@@ -219,7 +223,7 @@ macro_rules! define_typed_stub {
                 "ud2",
                 "7:",
                 "mov rax, r10",
-                "add rsp, 128",
+                "add rsp, 144",
                 "pop r13",
                 "pop r12",
                 "pop r15",
@@ -298,7 +302,10 @@ generate_trap_stubs! {
     (nt_access_check, "NtAccessCheck", 1, 8),
     (nt_access_check_and_audit_alarm, "NtAccessCheckAndAuditAlarm", 2, 11),
     (nt_access_check_by_type, "NtAccessCheckByType", 3, 11),
+    (nt_access_check_by_type_and_audit_alarm, "NtAccessCheckByTypeAndAuditAlarm", 4, 16),
     (nt_access_check_by_type_result_list, "NtAccessCheckByTypeResultList", 5, 11),
+    (nt_access_check_by_type_result_list_and_audit_alarm, "NtAccessCheckByTypeResultListAndAuditAlarm", 6, 16),
+    (nt_access_check_by_type_result_list_and_audit_alarm_by_handle, "NtAccessCheckByTypeResultListAndAuditAlarmByHandle", 7, 17),
     (nt_add_atom, "NtAddAtom", 8, 3),
     (nt_adjust_groups_token, "NtAdjustGroupsToken", 11, 6),
     (nt_adjust_privileges_token, "NtAdjustPrivilegesToken", 12, 6),
@@ -793,6 +800,10 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn generated_entries_have_callable_windows_signatures() {
+        let _: unsafe extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+            nt_access_check_by_type_and_audit_alarm;
+        let _: unsafe extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+            nt_access_check_by_type_result_list_and_audit_alarm_by_handle;
         let _: unsafe extern "win64" fn() -> u64 = nt_yield_execution;
         let _: unsafe extern "win64" fn(u64) -> u64 = nt_close;
         let _: unsafe extern "win64" fn(u64, u64, u64, u64, u64, u64) -> u64 = nt_open_file;

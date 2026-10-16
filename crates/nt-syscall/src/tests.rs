@@ -251,6 +251,35 @@ fn access_check_by_type_services_keep_native_identities() {
 }
 
 #[test]
+fn wide_audit_services_reject_short_vectors_without_truncating_argument_seventeen() {
+    struct Capture(Vec<u64>);
+    impl NativeSyscallHandler for Capture {
+        fn handle(&mut self, _: &NativeCallContext, args: &[u64], _: &mut Vec<u8>) -> u32 {
+            self.0.extend_from_slice(args);
+            STATUS_SUCCESS
+        }
+    }
+    for (service, ssn, argc) in [
+        (NativeService::NtAccessCheckByTypeAndAuditAlarm, 4, 16),
+        (NativeService::NtAccessCheckByTypeResultListAndAuditAlarm, 6, 16),
+        (NativeService::NtAccessCheckByTypeResultListAndAuditAlarmByHandle, 7, 17),
+    ] {
+        assert_eq!(service.arg_count(), (argc, argc));
+        let table = NativeServiceTable::from_numbers(UserlandAbiProfile::Windows7, &[(service, ssn)]);
+        let dispatcher = NativeSyscallDispatcher::new(table);
+        let args: Vec<u64> = (0..argc as u64).map(|i| 0x100 + i).collect();
+        let mut capture = Capture(Vec::new());
+        let result = dispatcher.dispatch(ssn, &args, &origin(ProcessorMode::UserMode), &mut capture);
+        assert_eq!(result.status, STATUS_SUCCESS);
+        assert_eq!(capture.0, args);
+        let mut capture = Capture(Vec::new());
+        let short = dispatcher.dispatch(ssn, &args[..args.len() - 1], &origin(ProcessorMode::UserMode), &mut capture);
+        assert_eq!(short.status, STATUS_INVALID_PARAMETER);
+        assert!(capture.0.is_empty());
+    }
+}
+
+#[test]
 fn flush_key_is_a_single_handle_registry_service() {
     // `NtFlushKey(IN HANDLE KeyHandle)` — ReactOS `ntoskrnl/config/ntapi.c:1085`, one argument,
     // SSN 83 (`sysfuncs.lst` line 84). rpcrt4's ncacn_np server handoff reaches it through

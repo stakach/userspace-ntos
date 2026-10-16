@@ -24673,9 +24673,24 @@ zw_alias!(
     nt_access_check_by_type
 );
 zw_alias!(
+    zw_access_check_by_type_and_audit_alarm,
+    "ZwAccessCheckByTypeAndAuditAlarm",
+    nt_access_check_by_type_and_audit_alarm
+);
+zw_alias!(
     zw_access_check_by_type_result_list,
     "ZwAccessCheckByTypeResultList",
     nt_access_check_by_type_result_list
+);
+zw_alias!(
+    zw_access_check_by_type_result_list_and_audit_alarm,
+    "ZwAccessCheckByTypeResultListAndAuditAlarm",
+    nt_access_check_by_type_result_list_and_audit_alarm
+);
+zw_alias!(
+    zw_access_check_by_type_result_list_and_audit_alarm_by_handle,
+    "ZwAccessCheckByTypeResultListAndAuditAlarmByHandle",
+    nt_access_check_by_type_result_list_and_audit_alarm_by_handle
 );
 zw_alias!(zw_add_atom, "ZwAddAtom", nt_add_atom);
 zw_alias!(
@@ -30243,7 +30258,10 @@ pub unsafe extern "C" fn export_anchor() {
         zw_access_check as *const () as usize,
         zw_access_check_and_audit_alarm as *const () as usize,
         zw_access_check_by_type as *const () as usize,
+        zw_access_check_by_type_and_audit_alarm as *const () as usize,
         zw_access_check_by_type_result_list as *const () as usize,
+        zw_access_check_by_type_result_list_and_audit_alarm as *const () as usize,
+        zw_access_check_by_type_result_list_and_audit_alarm_by_handle as *const () as usize,
         zw_add_atom as *const () as usize,
         zw_adjust_groups_token as *const () as usize,
         zw_adjust_privileges_token as *const () as usize,

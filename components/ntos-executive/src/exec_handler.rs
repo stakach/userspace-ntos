@@ -35497,6 +35497,12 @@ impl ExecNtHandler {
             NativeService::NtAccessCheckByTypeResultList => unsafe {
                 self.nt_access_check_by_type(ctx, args, true)
             },
+            // The audit variants require the audited object/client-token policy and audit
+            // record side effect. Keep the exact ABI and reject the operation until that
+            // policy is implemented; an ordinary access check would falsely report success.
+            NativeService::NtAccessCheckByTypeAndAuditAlarm
+            | NativeService::NtAccessCheckByTypeResultListAndAuditAlarm
+            | NativeService::NtAccessCheckByTypeResultListAndAuditAlarmByHandle => 0xC000_0002,
             NativeService::NtPrivilegeCheck => unsafe { self.nt_privilege_check(ctx, args) },
             NativeService::NtImpersonateAnonymousToken => unsafe {
                 self.nt_impersonate_anonymous_token(args[0])

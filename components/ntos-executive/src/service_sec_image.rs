@@ -12180,12 +12180,12 @@ pub(crate) unsafe fn service_sec_image(
                 // syscall return address), arg2=RDX, arg3=R8, arg4=R9, then arg5+ on the caller's
                 // stack at [rsp+0x28], [rsp+0x30], … RDX rides in m3; R8/R9/R10 + the stack come
                 // from the IPC buffer / stack mirror.
-                let mut argv = [0u64; 16];
+                let mut argv = [0u64; nt_syscall_abi::MAX_STUB_ARGS as usize];
                 argv[0] = get_recv_mr(9); // R10
                 argv[1] = m3; // RDX
                 argv[2] = get_recv_mr(7); // R8
                 argv[3] = get_recv_mr(8); // R9
-                let n = (entry.max_args as usize).min(16);
+                let n = (entry.max_args as usize).min(argv.len());
                 let mut stack_args_valid = true;
                 let retained_arguments = nt_handler.active_synchronous_file_retry.as_ref()
                     .and_then(|ingress| ingress.waiter().transfer_parameters)

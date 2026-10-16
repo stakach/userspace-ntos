@@ -33,13 +33,45 @@ fn native_request_keeps_exact_arguments_when_nested_ipc_reuses_receive_buffer() 
 /// The exact count of `Nt*` services in the shared table: the current hosted ReactOS import set,
 /// ntdll-internal services (`NtSecureConnectPort`, `NtCallbackReturn`), and registry hive
 /// load/unload variants that route to real executive CM functionality.
-const REQUIRED_NT_COUNT: usize = 425;
-const REQUIRED_ZW_COUNT: usize = 425;
+const REQUIRED_NT_COUNT: usize = 428;
+const REQUIRED_ZW_COUNT: usize = 428;
+
+#[test]
+fn released_libernt_audit_exports_preserve_every_stack_argument() {
+    // ReactOS sysfuncs.lst and ntifs.template.h specify 16, 16, and 17 arguments.
+    // The final out-pointer must survive both the native Call capture and Zw aliasing.
+    for (name, alias, ssn, argc) in [
+        ("NtAccessCheckByTypeAndAuditAlarm", "ZwAccessCheckByTypeAndAuditAlarm", 4, 16),
+        ("NtAccessCheckByTypeResultListAndAuditAlarm", "ZwAccessCheckByTypeResultListAndAuditAlarm", 6, 16),
+        ("NtAccessCheckByTypeResultListAndAuditAlarmByHandle", "ZwAccessCheckByTypeResultListAndAuditAlarmByHandle", 7, 17),
+    ] {
+        assert_eq!(ssn_of(name), Some(ssn));
+        assert_eq!(exact_argc_of(name), Some(argc));
+        assert_eq!(ssn_of(alias), Some(ssn));
+        assert_eq!(exact_argc_of(alias), Some(argc));
+        let mut args = [0u64; 17];
+        for (i, arg) in args.iter_mut().take(argc as usize).enumerate() {
+            *arg = i as u64 + 0x100;
+        }
+        let mut words = [0u64; NT_NATIVE_REQUEST_WORDS];
+        words[0] = ssn as u64;
+        words[1] = 0x1234;
+        words[2..2 + argc as usize].copy_from_slice(&args[..argc as usize]);
+        let request = NativeSyscallRequest::capture(
+            native_syscall_message_info(argc),
+            words[..4].try_into().unwrap(),
+            |index| words[index],
+        ).unwrap();
+        assert_eq!(request.length(), native_syscall_request_len(argc) as usize);
+        for (index, arg) in args.iter().take(argc as usize).enumerate() {
+            assert_eq!(request.argument(index), Some(*arg));
+        }
+    }
+}
 
 #[test]
 fn released_libernt_native_export_extension_has_exact_bounds_and_arities() {
-    // Pinned source: LiberNT 8e478a22 dll/ntdll/def/ntdll.spec. The 16/17-argument
-    // audit services need a wider executive argv and are intentionally not in this slice.
+    // Pinned source: LiberNT 8e478a22 dll/ntdll/def/ntdll.spec.
     assert_eq!(LIBERNT_FULL_EXPORT_SSN_BASE, 0x400);
     assert_eq!(LIBERNT_FULL_EXPORT_SSN_BASE + 180, 0x4b4);
     assert!(LIBERNT_FULL_EXPORT_SSN_BASE > LIBERNT_BASE_SSN + 11);
