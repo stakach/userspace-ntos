@@ -63,6 +63,9 @@ pub mod find_exported_routine;
 /// Explicit unsupported entries declared as stubs by the reference source spec.
 pub mod source_declared_stubs;
 
+/// Bounds-checked CRT string helpers exported by the released DLL.
+pub mod safe_strings;
+
 /// The x64 ntdll thread entry used by the released kernel32.dll.
 pub mod user_thread_start;
 
@@ -1328,6 +1331,9 @@ static KEEP_FIND_EXPORTED_ROUTINE: unsafe extern "C" fn() =
 #[used]
 static KEEP_SOURCE_DECLARED_STUBS: unsafe extern "C" fn() =
     source_declared_stubs::SOURCE_STUB_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_SAFE_STRINGS: unsafe extern "C" fn() = safe_strings::SAFE_STRINGS_EXPORT_ANCHOR_FN;
 
 #[used]
 static KEEP_USER_THREAD_START_EXPORTS: unsafe extern "C" fn() =
