@@ -33,8 +33,23 @@ fn native_request_keeps_exact_arguments_when_nested_ipc_reuses_receive_buffer() 
 /// The exact count of `Nt*` services in the shared table: the current hosted ReactOS import set,
 /// ntdll-internal services (`NtSecureConnectPort`, `NtCallbackReturn`), and registry hive
 /// load/unload variants that route to real executive CM functionality.
-const REQUIRED_NT_COUNT: usize = 226;
-const REQUIRED_ZW_COUNT: usize = 226;
+const REQUIRED_NT_COUNT: usize = 230;
+const REQUIRED_ZW_COUNT: usize = 230;
+
+#[test]
+fn libernt_smss_alpc_imports_have_distinct_native_services() {
+    let services = [
+        ("NtAlpcAcceptConnectPort", ALPC_SSN_BASE, 9),
+        ("NtAlpcConnectPort", ALPC_SSN_BASE + 1, 11),
+        ("NtAlpcCreatePort", ALPC_SSN_BASE + 2, 3),
+        ("NtAlpcSendWaitReceivePort", ALPC_SSN_BASE + 3, 8),
+    ];
+    for (name, ssn, argc) in services {
+        assert_eq!(ssn_of(name), Some(ssn), "missing {name}");
+        assert_eq!(exact_argc_of(name), Some(argc), "wrong arity for {name}");
+        assert_eq!(name_of(ssn), Some(name), "wrong service at {ssn:#x}");
+    }
+}
 
 #[test]
 fn required_counts() {
@@ -239,15 +254,18 @@ fn no_duplicate_argc_names() {
 }
 
 #[test]
-fn alpc_seam_is_reserved_above_the_reactos_range() {
-    // ALPC is documented-but-unassigned; its reserved base is well clear of every real SSN.
-    let max = NT_SYSCALLS.iter().map(|e| e.ssn).max().unwrap();
-    assert!(
-        ALPC_SSN_BASE > max,
-        "ALPC base must not collide with real SSNs"
-    );
-    // Nothing in the current table sits in the ALPC reserved space.
-    assert!(NT_SYSCALLS.iter().all(|e| e.ssn < ALPC_SSN_BASE));
+fn alpc_services_are_above_the_legacy_range() {
+    let legacy_max = NT_SYSCALLS
+        .iter()
+        .filter(|e| !e.name.starts_with("NtAlpc"))
+        .map(|e| e.ssn)
+        .max()
+        .unwrap();
+    assert!(ALPC_SSN_BASE > legacy_max);
+    assert!(NT_SYSCALLS
+        .iter()
+        .filter(|e| e.name.starts_with("NtAlpc"))
+        .all(|e| e.ssn >= ALPC_SSN_BASE));
 }
 
 #[test]

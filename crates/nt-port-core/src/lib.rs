@@ -653,6 +653,30 @@ impl PortCore {
         owner: ClientId,
         limits: PortLimits,
     ) -> Result<u64, NtStatus> {
+        self.create_port_with_owner_and_limits_policy(name, api, owner, limits, false)
+    }
+
+    /// Create a port with a unique name, preserving the caller's owner identity.
+    /// An already open named port is a collision even when its spelling differs only by case.
+    /// Unnamed ports always receive a fresh handle.
+    pub fn create_port_with_owner_and_limits_checked(
+        &mut self,
+        name: &[u16],
+        api: PortApi,
+        owner: ClientId,
+        limits: PortLimits,
+    ) -> Result<u64, NtStatus> {
+        self.create_port_with_owner_and_limits_policy(name, api, owner, limits, true)
+    }
+
+    fn create_port_with_owner_and_limits_policy(
+        &mut self,
+        name: &[u16],
+        api: PortApi,
+        owner: ClientId,
+        limits: PortLimits,
+        refuse_existing_name: bool,
+    ) -> Result<u64, NtStatus> {
         if limits.max_connection_info as usize > MAX_CONNINFO
             || limits.max_message > u16::MAX as u32
         {
@@ -666,6 +690,9 @@ impl PortCore {
                 .iter()
                 .position(|port| port.user_open && port.name == name)
             {
+                if refuse_existing_name {
+                    return Err(NtStatus::OBJECT_NAME_COLLISION);
+                }
                 return Ok(self.ports[port_index].handle);
             }
         }
@@ -2491,6 +2518,25 @@ mod tests {
         let a = core.create_port(&utf16("\\SmApiPort"), PortApi::Lpc);
         let b = core.create_port(&utf16("\\smapiport"), PortApi::Lpc);
         assert_eq!(a, b, "named ports fold + dedup");
+    }
+
+    #[test]
+    fn checked_create_refuses_existing_folded_name_without_transferring_ownership() {
+        let mut core = PortCore::new();
+        let first_owner = ClientId { process: 7, thread: 11 };
+        let other_owner = ClientId { process: 8, thread: 12 };
+        let first = core
+            .create_port_with_owner_and_limits_checked(
+                &utf16("\\SmApiPort"), PortApi::Alpc, first_owner, PortLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            core.create_port_with_owner_and_limits_checked(
+                &utf16("\\smapiport"), PortApi::Alpc, other_owner, PortLimits::default(),
+            ),
+            Err(NtStatus::OBJECT_NAME_COLLISION),
+        );
+        assert_eq!(core.handle_info(first).unwrap().server_id, first_owner);
     }
 
     #[test]

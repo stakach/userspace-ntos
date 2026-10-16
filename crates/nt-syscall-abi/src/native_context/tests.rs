@@ -93,7 +93,7 @@ fn exact_arity_lookup_never_truncates_unknown_or_large_ssn() {
         u64::MAX,
         u64::from(u32::MAX),
         (1 << 32) | SSN,
-        u64::from(crate::ALPC_SSN_BASE),
+        u64::from(crate::ALPC_SSN_BASE + 4),
     ] {
         assert_eq!(
             exact_native_context_argc(ssn),

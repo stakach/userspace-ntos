@@ -520,6 +520,10 @@ generate_trap_stubs! {
     (nt_write_virtual_memory, "NtWriteVirtualMemory", 287, 5),
     (nt_yield_execution, "NtYieldExecution", 288, 0),
     (nt_create_keyed_event, "NtCreateKeyedEvent", 289, 4),
+    (nt_alpc_accept_connect_port, "NtAlpcAcceptConnectPort", 4096, 9),
+    (nt_alpc_connect_port, "NtAlpcConnectPort", 4097, 11),
+    (nt_alpc_create_port, "NtAlpcCreatePort", 4098, 3),
+    (nt_alpc_send_wait_receive_port, "NtAlpcSendWaitReceivePort", 4099, 8),
 }
 
 /// Look up a generated trap stub's metadata by export name.
@@ -599,5 +603,12 @@ mod tests {
         let _: unsafe extern "win64" fn(u64, u64, u64, u64, u64, u64) -> u64 = nt_open_file;
         let _: unsafe extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
             nt_map_view_of_section;
+        let _: unsafe extern "win64" fn(u64, u64, u64) -> u64 = nt_alpc_create_port;
+        let _: unsafe extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+            nt_alpc_accept_connect_port;
+        let _: unsafe extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+            nt_alpc_connect_port;
+        let _: unsafe extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+            nt_alpc_send_wait_receive_port;
     }
 }

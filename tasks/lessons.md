@@ -1,5 +1,14 @@
 # Lessons
 
+## Keep The Kernel-Facing DLL When Changing Userspace Media
+- An installed distribution supplies the user-mode image and drivers, but this project's
+  source-built `ntdll.dll` is the interface to its NT kernel personality. Stage our DLL
+  in the generated image and leave the release archive and its `acpi.sys` untouched.
+- Compare the built DLL's named exports and ordinals with the distribution DLL before
+  booting. Gate on missing names; report ordinal differences separately when the pinned
+  installed binaries import by name. Generate import fixups against the DLL actually
+  staged, and fail on gaps.
+
 ## Stage The Whole Public Export Chain
 - Before committing a tested crate change, inspect `git diff --cached` for every module
   re-export between the new type and the crate root. Local tests can pass from uncommitted

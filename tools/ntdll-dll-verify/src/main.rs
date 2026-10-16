@@ -5,6 +5,7 @@
 //! - `ntdll-dll-verify [path-to-dll]` (defaults to `.tmp/nt-ntdll.dll`)
 //! - `ntdll-dll-verify --wine-manifest [path-to-ntdll.spec]`
 //! - `ntdll-dll-verify --wine-report [path-to-dll]`
+//! - `ntdll-dll-verify --compare-exports <reference-dll> <built-dll>` (names gate; ordinals report)
 //!
 //! If our own loader can read it — headers, export directory, relocations — then the executive can
 //! load it in-boot. Exits non-zero on any failure so the build script / CI can gate on it.
@@ -26,6 +27,27 @@ const PE32PLUS_MAGIC: u16 = 0x020b;
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let first = args.next();
+    if first.as_deref() == Some("--compare-exports") {
+        let Some(reference) = args.next() else {
+            eprintln!("!! --compare-exports requires a reference DLL and a built DLL");
+            return ExitCode::FAILURE;
+        };
+        let Some(built) = args.next() else {
+            eprintln!("!! --compare-exports requires a built DLL");
+            return ExitCode::FAILURE;
+        };
+        if let Some(extra) = args.next() {
+            eprintln!("!! unexpected argument {extra:?}");
+            return ExitCode::FAILURE;
+        }
+        return match compare_exports(Path::new(&reference), Path::new(&built)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("!! {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if matches!(first.as_deref(), Some("--wine-manifest" | "--wine-report")) {
         let mode = first.as_deref().unwrap();
         let path = args.next().unwrap_or_else(|| match mode {
@@ -320,6 +342,42 @@ fn main() -> ExitCode {
     } else {
         eprintln!("!! verification FAILED");
         ExitCode::FAILURE
+    }
+}
+
+fn compare_exports(reference: &Path, built: &Path) -> Result<(), String> {
+    use std::collections::BTreeMap;
+
+    fn read_exports(path: &Path) -> Result<BTreeMap<String, u16>, String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let pe = PeFile::parse(&bytes).map_err(|e| format!("{}: {e:?}", path.display()))?;
+        let exports = pe.exports().map_err(|e| format!("{}: {e:?}", path.display()))?;
+        Ok(exports.into_iter().map(|e| (e.name, e.ordinal)).collect())
+    }
+
+    let expected = read_exports(reference)?;
+    let actual = read_exports(built)?;
+    let missing: Vec<_> = expected.keys().filter(|name| !actual.contains_key(*name)).collect();
+    let wrong_ordinal: Vec<_> = expected
+        .iter()
+        .filter_map(|(name, ordinal)| {
+            actual.get(name).filter(|found| *found != ordinal).map(|found| (name, ordinal, found))
+        })
+        .collect();
+    println!(
+        "LiberNT ntdll exports: {} reference, {} built; {} missing names, {} ordinal mismatches",
+        expected.len(), actual.len(), missing.len(), wrong_ordinal.len()
+    );
+    for name in missing.iter().take(30) {
+        eprintln!("   missing: {name}");
+    }
+    for (name, expected, found) in wrong_ordinal.iter().take(30) {
+        eprintln!("   ordinal: {name} expected {expected}, found {found}");
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err("source-built ntdll is missing installed LiberNT export names".into())
     }
 }
 

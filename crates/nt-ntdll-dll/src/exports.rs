@@ -6210,6 +6210,17 @@ pub unsafe extern "C" fn swprintf(buf: *mut u16, format: *const u16, args: ...) 
     unsafe { format_wide_va(buf, i32::MAX as usize, format, args) }
 }
 
+/// The legacy CRT spelling used by LiberNT's `smss.exe`. Like `swprintf`, this
+/// takes no destination size and returns the number of UTF-16 units written.
+#[export_name = "_swprintf"]
+pub unsafe extern "C" fn underscore_swprintf(
+    buf: *mut u16,
+    format: *const u16,
+    args: ...,
+) -> i32 {
+    unsafe { format_wide_va(buf, i32::MAX as usize, format, args) }
+}
+
 #[export_name = "vsprintf"]
 pub unsafe extern "C" fn vsprintf(buf: *mut u8, format: *const u8, args: VaList<'_>) -> i32 {
     unsafe { format_narrow_va(buf, i32::MAX as usize, format, args) }
@@ -25411,6 +25422,18 @@ zw_alias!(
     "ZwCreateKeyedEvent",
     nt_create_keyed_event
 );
+zw_alias!(
+    zw_alpc_accept_connect_port,
+    "ZwAlpcAcceptConnectPort",
+    nt_alpc_accept_connect_port
+);
+zw_alias!(zw_alpc_connect_port, "ZwAlpcConnectPort", nt_alpc_connect_port);
+zw_alias!(zw_alpc_create_port, "ZwAlpcCreatePort", nt_alpc_create_port);
+zw_alias!(
+    zw_alpc_send_wait_receive_port,
+    "ZwAlpcSendWaitReceivePort",
+    nt_alpc_send_wait_receive_port
+);
 
 // =================================================================================================
 // BATCH 4 — Rtl* string / convert family the Win32 stack imports.
@@ -29731,6 +29754,7 @@ pub unsafe extern "C" fn export_anchor() {
         sprintf as usize,
         snprintf as usize,
         swprintf as usize,
+        underscore_swprintf as usize,
         vsprintf as usize,
         vsnprintf as usize,
         vsnwprintf as usize,

@@ -21,11 +21,11 @@
 //! unchanged. Verified anchors (asserted in the tests): `NtClose = 27`, `NtCreateFile = 39`,
 //! `NtOpenFile = 122`, `NtProtectVirtualMemory = 143`, `NtAllocateVirtualMemory = 18`, …
 //!
-//! ## The ALPC seam (reserved, NOT assigned)
+//! ## The ALPC seam
 //!
-//! ReactOS exports **no** `NtAlpc*` (ALPC is the Win7-only future surface; nothing in the
-//! current hosted set imports it). ALPC is therefore the *one* place we are free to renumber —
-//! but we do NOT assign numbers yet. See [`ALPC_SSN_BASE`] for the documented reserved range.
+//! ReactOS implements no `NtAlpc*` service. LiberNT SMSS imports ALPC calls, so our ntdll
+//! assigns them private SSNs above the legacy range. These numbers are internal to our
+//! ntdll/executive pair, independent of the released LiberNT ntdll's numbering.
 //!
 //! `no_std`, pure data — every table is `const`; the whole thing is host-testable.
 
@@ -55,12 +55,10 @@ pub struct ZwAlias {
     pub ssn: u32,
 }
 
-/// The reserved base SSN for the (future, Win7-only) ALPC surface.
+/// Base SSN for the ALPC surface implemented by our native ntdll/executive pair.
 ///
-/// **RESERVED, NOT ASSIGNED.** ReactOS `sysfuncs.lst` tops out at SSN 295; the real Nt* range we
-/// use is `0..=292`. When the Win7 pivot lands `NtAlpc*` we assign them from this base (well clear
-/// of every ReactOS SSN), which is legal precisely because ntdll import-by-name lets us choose.
-/// No entry uses this yet; it exists so the choice is documented at the ABI seam, not ad-hoc.
+/// ReactOS `sysfuncs.lst` tops out at SSN 295; our ALPC services start here to avoid collisions.
+/// Native code imports ntdll by export name, leaving this service numbering under our control.
 pub const ALPC_SSN_BASE: u32 = 0x1000;
 
 /// ntdll_plan Step 6.A — the msginfo LABEL that marks a REQUEST as an NT native seL4-Call syscall
@@ -447,6 +445,10 @@ pub const NT_SYSCALLS: &[NtSyscall] = &[
     n("NtCreateKeyedEvent", 289),
     n("NtReleaseKeyedEvent", 291),
     n("NtWaitForKeyedEvent", 292),
+    n("NtAlpcAcceptConnectPort", ALPC_SSN_BASE),
+    n("NtAlpcConnectPort", ALPC_SSN_BASE + 1),
+    n("NtAlpcCreatePort", ALPC_SSN_BASE + 2),
+    n("NtAlpcSendWaitReceivePort", ALPC_SSN_BASE + 3),
 ];
 
 /// The `Zw*` aliases for every `Nt*` service exported by our ntdll. Each is the
@@ -790,6 +792,10 @@ pub const ZW_ALIASES: &[ZwAlias] = &[
     z("ZwWriteVirtualMemory", "NtWriteVirtualMemory", 287),
     z("ZwYieldExecution", "NtYieldExecution", 288),
     z("ZwCreateKeyedEvent", "NtCreateKeyedEvent", 289),
+    z("ZwAlpcAcceptConnectPort", "NtAlpcAcceptConnectPort", ALPC_SSN_BASE),
+    z("ZwAlpcConnectPort", "NtAlpcConnectPort", ALPC_SSN_BASE + 1),
+    z("ZwAlpcCreatePort", "NtAlpcCreatePort", ALPC_SSN_BASE + 2),
+    z("ZwAlpcSendWaitReceivePort", "NtAlpcSendWaitReceivePort", ALPC_SSN_BASE + 3),
 ];
 
 /// The parameter count (number of register-width arguments) of each `Nt*` service.
@@ -1031,6 +1037,10 @@ pub const NT_ARGC: &[(&str, u8)] = &[
     ("NtWriteFileGather", 9),
     ("NtWriteVirtualMemory", 5),
     ("NtYieldExecution", 0),
+    ("NtAlpcAcceptConnectPort", 9),
+    ("NtAlpcConnectPort", 11),
+    ("NtAlpcCreatePort", 3),
+    ("NtAlpcSendWaitReceivePort", 8),
 ];
 
 /// The maximum stub-arg count our marshaller supports (the widest NT service, `NtCreateNamedPipeFile`
