@@ -57,6 +57,9 @@ pub mod performance;
 /// The released kernel32's precise NT system-time query.
 pub mod system_time_precise;
 
+/// Shared-data interrupt clock and native dynamic time-zone query.
+pub mod time_exports;
+
 /// Named PE export lookup used by the released WOW64 support libraries.
 pub mod find_exported_routine;
 
@@ -68,6 +71,12 @@ pub mod source_declared_stubs;
 
 /// Bounds-checked CRT string helpers exported by the released DLL.
 pub mod safe_strings;
+
+/// No-CRT floating-point, formatting, scanning, and nonlocal state exports.
+pub mod crt_math;
+pub mod crt_printf_safe;
+pub mod crt_scan;
+pub mod crt_state;
 
 /// Query whether a process handle names the current process.
 pub mod current_process;
@@ -1351,6 +1360,9 @@ static KEEP_UNICODE_NORMALIZATION_EXPORTS: unsafe extern "C" fn() =
 #[used]
 static KEEP_SYSTEM_TIME_PRECISE_EXPORTS: unsafe extern "C" fn() =
     system_time_precise::SYSTEM_TIME_PRECISE_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_TIME_EXPORTS: unsafe extern "C" fn() = time_exports::TIME_EXPORT_ANCHOR_FN;
 
 #[used]
 static KEEP_FIND_EXPORTED_ROUTINE: unsafe extern "C" fn() =

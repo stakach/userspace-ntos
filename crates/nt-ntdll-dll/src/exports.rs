@@ -6138,7 +6138,7 @@ fn printf_result(result: Result<usize, ()>) -> i32 {
     }
 }
 
-unsafe fn format_narrow_va(
+pub(crate) unsafe fn format_narrow_va(
     buffer: *mut u8,
     capacity: usize,
     format: *const u8,
@@ -6165,7 +6165,7 @@ unsafe fn format_narrow_va(
     printf_result(result)
 }
 
-unsafe fn format_wide_va(
+pub(crate) unsafe fn format_wide_va(
     buffer: *mut u16,
     capacity: usize,
     format: *const u16,
