@@ -1028,7 +1028,7 @@ static NT_WAIT_FOR_DEBUG_EVENT_SERVICE_ENTRY: ExecServiceHandler =
 #[used]
 static NT_QUERY_ATTRIBUTES_FILE_SERVICE_ENTRY: ExecServiceHandler =
     exec_nt_query_attributes_file_service_entry;
-const SETUP_UNATTEND_PATH: &[u8] = b"reactos\\unattend.inf";
+const SETUP_UNATTEND_PATH: &[u8] = crate::installed_layout::UNATTEND;
 const SYSTEM_NLS_LANGUAGE_PATH: &str =
     r"\Registry\Machine\System\CurrentControlSet\Control\Nls\Language";
 const NT_DEFAULT_LOCALE_ID: u32 = 0x0409;
@@ -2529,7 +2529,7 @@ fn dynamic_hosted_nt_image_path(
     out: &mut [u8; nt_exe_image::MAX_NT_IMAGE_PATH],
 ) -> Option<(usize, nt_exe_image::HostedImageRoot)> {
     let (prefix, root) = if volume_relative
-        .strip_prefix(br"reactos\system32\")
+        .strip_prefix(crate::installed_layout::SYSTEM32_PREFIX)
         .is_some_and(|suffix| suffix.eq_ignore_ascii_case(leaf))
     {
         (
@@ -2537,7 +2537,7 @@ fn dynamic_hosted_nt_image_path(
             nt_exe_image::HostedImageRoot::System32,
         )
     } else if volume_relative
-        .strip_prefix(br"reactos\")
+        .strip_prefix(crate::installed_layout::ROOT_PREFIX)
         .is_some_and(|suffix| suffix.eq_ignore_ascii_case(leaf))
     {
         (
@@ -2598,7 +2598,7 @@ unsafe fn admit_dynamic_hosted_exe(
         return None;
     }
     let role = role?;
-    let volume_relative = nt_fs::nt_path_to_volume_relative(name16, b"reactos")?;
+    let volume_relative = nt_fs::nt_path_to_volume_relative(name16, crate::installed_layout::ROOT)?;
     let leaf = nt_exe_image::canonical_exe_leaf(&volume_relative)?;
     if !folded_name
         .windows(leaf.len())
@@ -4603,7 +4603,7 @@ impl ExecNtHandler {
             let stats = nt_hive_core::seed_reactos_user_profile_shell_folders_into_target(
                 &mut target,
                 r"\Registry\User\.Default",
-                r"C:\Profiles\Default User",
+                crate::installed_layout::DOS_DEFAULT_PROFILE,
                 "%USERPROFILE%",
             );
             (stats, target.changed(), target.failed, target.last_status)
@@ -9967,13 +9967,13 @@ impl ExecNtHandler {
     }
 
     fn readonly_volume_metadata(name16: &[u16]) -> Option<crate::fs_loader::FatOpenMetadata> {
-        nt_fs::nt_path_to_volume_relative(name16, b"reactos").and_then(|path| unsafe {
+        nt_fs::nt_path_to_volume_relative(name16, crate::installed_layout::ROOT).and_then(|path| unsafe {
             exec_fs().and_then(|fs| crate::fs_loader::fat_open_path_metadata(&fs, &path))
         })
     }
 
     fn readonly_volume_entry(name16: &[u16]) -> Option<(u32, u32, u8)> {
-        let path = nt_fs::nt_path_to_volume_relative(name16, b"reactos")?;
+        let path = nt_fs::nt_path_to_volume_relative(name16, crate::installed_layout::ROOT)?;
         unsafe {
             let fs = exec_fs()?;
             if path.is_empty() {
@@ -10014,7 +10014,7 @@ impl ExecNtHandler {
     }
 
     fn readonly_disk_open_miss_status(name16: &[u16]) -> Option<u32> {
-        let path = nt_fs::nt_path_to_volume_relative(name16, b"reactos")?;
+        let path = nt_fs::nt_path_to_volume_relative(name16, crate::installed_layout::ROOT)?;
         let fs = unsafe { exec_fs() }?;
         if path.is_empty() {
             return Some(nt_fs::STATUS_NOT_A_DIRECTORY);
@@ -15447,14 +15447,14 @@ impl ExecNtHandler {
             .unwrap_or(true);
         let prefix = if win32_path {
             if system32 {
-                b"C:\\ReactOS\\System32\\" as &[u8]
+                crate::installed_layout::DOS_SYSTEM32_PREFIX
             } else {
-                b"C:\\ReactOS\\"
+                crate::installed_layout::DOS_ROOT_PREFIX
             }
         } else if system32 {
-            b"\\Device\\Harddisk0\\Partition1\\reactos\\system32\\" as &[u8]
+            crate::installed_layout::DEVICE_SYSTEM32_PREFIX
         } else {
-            b"\\Device\\Harddisk0\\Partition1\\reactos\\" as &[u8]
+            crate::installed_layout::DEVICE_ROOT_PREFIX
         };
         let mut n = 0usize;
         for &byte in prefix.iter().chain(process.image_file_name.as_bytes()) {
@@ -30426,7 +30426,7 @@ impl ExecNtHandler {
             };
             let mut path = [0u8; 96];
             let mut n = 0usize;
-            for &c in b"reactos\\" {
+            for &c in crate::installed_layout::ROOT_PREFIX {
                 path[n] = c;
                 n += 1;
             }
@@ -33044,7 +33044,7 @@ impl ExecNtHandler {
                                         .as_deref()
                                         .is_some_and(is_profile_list_sid_key_canon)
                                 {
-                                    const EXPECTED: &[u8] = b"%SystemDrive%\\Profiles\\Administrator";
+                                    const EXPECTED: &[u8] = crate::installed_layout::ADMIN_PROFILE_VALUE;
                                     let exact = ty == 2
                                         && data.len() == (EXPECTED.len() + 1) * 2
                                         && data

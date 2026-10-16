@@ -1079,12 +1079,11 @@ pub(crate) unsafe fn spawn_storage_host(
         };
         n += 1;
     }
-    // NLS + SYSTEM-hive buffers share one page table; the first descriptor creates it.
+    // NLS and the small hives share one page table; the first descriptor creates it.
     for (index, (start, vaddr, frames)) in [
         (nls_ansi_start, NLS_ANSI_VADDR, NLS_ANSI_FRAMES),
         (nls_oem_start, NLS_OEM_VADDR, NLS_OEM_FRAMES),
         (nls_case_start, NLS_CASE_VADDR, NLS_CASE_FRAMES),
-        (hivebuf_start, HIVEBUF_VADDR, HIVEBUF_FRAMES),
         (
             SECHIVEBUF_START.load(Ordering::Relaxed),
             SECHIVEBUF_VADDR,
@@ -1113,6 +1112,14 @@ pub(crate) unsafe fn spawn_storage_host(
         };
         n += 1;
     }
+    regions[n] = Region {
+        source: FrameSource::Alias(hivebuf_start),
+        base_va: HIVEBUF_VADDR,
+        count: HIVEBUF_FRAMES,
+        rights: Rights::Uniform(RW_NX),
+        pts: 1,
+    };
+    n += 1;
     // The SOFTWARE hive buffer (471040 B) — its own 2 MiB window + dedicated PT, mirroring the
     // executive-side mapping (it does not fit in the shared 0xA0-0xC0 input page table).
     regions[n] = Region {

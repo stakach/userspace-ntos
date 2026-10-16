@@ -114,6 +114,7 @@ mod section_metadata_work;
 mod section_pagein_work;
 pub(crate) use fs_loader::*;
 mod hosted_bootstrap;
+mod installed_layout;
 pub(crate) use hosted_bootstrap::*;
 mod hosted_loaded_images;
 pub(crate) use hosted_loaded_images::*;
@@ -1286,7 +1287,8 @@ pub const WINSRV_SRVBUF_OFFSET: u64 = 0x10000; // 64 KiB in — clear of basesrv
 /// SRVBUF), dual-mapped host<->exec like SRVBUF. Size reported at STORAGE_SHARED+0x94; the executive
 /// parses it PE32+ and spawns it as the 3rd hosted process when smss's RtlCreateUserProcess creates it.
 pub const WINLOGONBUF_VADDR: u64 = 0x0000_0100_1420_0000; // own PT, past SRVBUF (0x1400)
-pub const WINLOGONBUF_FRAMES: u64 = 64; // 256 KiB — holds the 229888 B winlogon.exe
+pub const WINLOGONBUF_FRAMES: u64 = 80; // holds the installed 274432 B winlogon.exe
+const _: () = assert!(WINLOGONBUF_FRAMES * 0x1000 >= 274_432);
 /// The Win32 client stack (kernel32 ~2.66 MiB + user32 ~1.12 MiB + gdi32 ~326 KiB) that winsrv.dll
 /// statically imports. These are too large for the SRVBUF, so they get their own fresh 6 MiB region
 /// (3 PTs), dual-mapped host<->exec like SRVBUF. Sizes reported at STORAGE_SHARED +0x4c/+0x50/+0x54.
@@ -1990,8 +1992,10 @@ pub const NLS_CASE_FRAMES: u64 = 4;
 /// The installed ReactOS SYSTEM registry hive (::ROSSYS.HIV, ~204 KiB regf), read off the disk by
 /// the isolated storage host into these shared frames. Boot composition imports it once and hands
 /// the resulting image to isolated CM; it is not a runtime executive registry view.
-pub const HIVEBUF_VADDR: u64 = 0x0000_0100_10B5_0000;
-pub const HIVEBUF_FRAMES: u64 = 64; // 256 KiB
+pub const HIVEBUF_VADDR: u64 = 0x0000_0100_10C0_0000;
+pub const HIVEBUF_FRAMES: u64 = 288; // installed SYSTEM hive is 1122304 B
+const _: () = assert!(HIVEBUF_FRAMES * 0x1000 >= 1_122_304);
+const _: () = assert!(HIVEBUF_FRAMES * 0x1000 <= 0x20_0000);
 /// The real ReactOS **SECURITY** hive (`\reactos\system32\config\security`, 8 KiB regf) — the LSA
 /// policy database's on-disk backing store. Read BY PATH off the image by the isolated storage
 /// host, exactly like the SYSTEM hive, and mounted read-only at `\Registry\Machine\SECURITY`.
@@ -2022,8 +2026,8 @@ const _: () = assert!(DEFHIVEBUF_VADDR + DEFHIVEBUF_FRAMES * 0x1000 <= 0x0000_01
 /// leftover of the shared 0xA0-0xC0 input page table: it gets its OWN 2 MiB window + dedicated PT
 /// below the process-mirror region (0x1200_0000).
 pub const SWHIVEBUF_VADDR: u64 = 0x0000_0100_10E0_0000;
-pub const SWHIVEBUF_FRAMES: u64 = 128; // 512 KiB (the staged hive is 471040 B = 115 pages)
-const _: () = assert!(SWHIVEBUF_FRAMES * 0x1000 >= 471_040);
+pub const SWHIVEBUF_FRAMES: u64 = 480; // installed SOFTWARE hive is 1961984 B
+const _: () = assert!(SWHIVEBUF_FRAMES * 0x1000 >= 1_961_984);
 const _: () = assert!(SWHIVEBUF_VADDR & 0x1F_FFFF == 0); // 2 MiB aligned -> exactly one PT window
 const _: () = assert!(SWHIVEBUF_FRAMES * 0x1000 <= 0x20_0000);
 /// The same NLS frames shared into smss (own PT at the 0xE0_0000 2 MiB region). The PEB's
@@ -4251,7 +4255,7 @@ unsafe fn writable_overlay_spec(passed: &mut u64, report: &DesktopAcceptanceRepo
     let attr_queries = OVERLAY_ATTR_QUERIES.load(Ordering::Relaxed);
     let restored = snapshot_restore_seen();
     let restored_profile_source =
-        restored && PROFILE_SOURCE_DIRS.load(Ordering::Relaxed) >= 45 && copied_profile_probe_ok();
+        restored && PROFILE_SOURCE_DIRS.load(Ordering::Relaxed) >= 2 && copied_profile_probe_ok();
     print_str(b"[writable-fs] mounted=");
     print_u64(writable_fs_mounted() as u64);
     print_str(b" restored=");
@@ -5347,22 +5351,8 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
     );
 }
 
-/// ═══ `CopyDirectory` REALLY RAN — the profile tree was COPIED, not just created ═════════════════
-///
-/// `userenv!CreateUserProfileExW` seeds a new profile by calling
-/// `CopyDirectory(C:\Profiles\<user>, C:\Profiles\Default User)` (`profile.c:1000`), which
-/// `FindFirstFileW`s the source, `CreateDirectoryExW`s every subdirectory and `CopyFileW`s every
-/// file, recursing. Before this batch it returned at its FIRST `CreateDirectoryExW` with
-/// `Error: 87`, because `NtQueryInformationFile` served exactly ONE information class.
-///
-/// The proof here is by CONTENT and by STRUCTURE, never by non-failure:
-///   * the DESTINATION copy of a real ISO file reads back off the LIVE writable volume with the
-///     source's exact 9 bytes — `CopyFileW` genuinely read the `Default User` original and wrote
-///     those bytes into `C:\Profiles\<user>\My Documents\livecd_start.cmd`;
-///   * the destination subdirectories BELOW `C:\Profiles\<user>` can only come from
-///     `CopyDirectory`'s recursion (winlogon itself creates only the root and the per-user
-///     directory, which the sibling spec already accounts for);
-///   * and it happened off the REAL interactive logon, under the SID `NtCreateToken` minted.
+/// The installed `Users\Default` source has directories but no regular files. A real
+/// AppData directory under the logged-on user's profile proves that `CopyDirectory` ran.
 unsafe fn winlogon_profile_copied_spec(passed: &mut u64) {
     use crate::writable_fs::*;
     let dirs = PROFILE_COPY_DIRS.load(Ordering::Relaxed);
@@ -5372,14 +5362,14 @@ unsafe fn winlogon_profile_copied_spec(passed: &mut u64) {
     let user_dir_exists = directory_exists_at(COPIED_PROFILE_DIR);
     let copied_ntuser = hive_image_len_at(COPIED_PROFILE_NTUSER_DAT) as u64;
     let copied_this_boot =
-        dirs >= 15 && files >= 1 && PROFILE_USER_DIR_CREATED.load(Ordering::Relaxed) >= 1;
+        dirs >= 1 && PROFILE_USER_DIR_CREATED.load(Ordering::Relaxed) >= 1;
     let copied_from_restored_volume =
         restored && user_dir_exists && content_ok && copied_ntuser > 0;
     print_str(b"[wl-profile-copy] CopyDirectory: subdirectories created=");
     print_u64(dirs);
     print_str(b" files copied=");
     print_u64(files);
-    print_str(b" destination-content-matches-source=");
+    print_str(b" destination-AppData-dir=");
     print_u64(content_ok as u64);
     print_str(b" restored-dir=");
     print_u64(user_dir_exists as u64);
@@ -5500,46 +5490,22 @@ fn synchronous_file_retry_spec(passed: &mut u64) {
         passed);
 }
 
-/// ═══ THE PROFILE SOURCE — the ISO's OWN `Profiles/` TREE, WHICH OUR STAGING WAS DROPPING ══════
-///
-/// `CreateUserProfileExW` seeds a new profile by COPYING `C:\Profiles\Default User`
-/// (`profile.c:1000` → `CopyDirectory` → `FindFirstFileW`), and that copy failed at
-/// `profile.c:1002  Error: 3` (ERROR_PATH_NOT_FOUND) because the disk image had no profile tree.
-///
-/// **The tree was never missing from the media — it was missing from our STAGING.** The ReactOS
-/// LiveCD ISO carries a real 76-entry `Profiles/` tree (`Default User/…`, `All Users/…`) as a
-/// TOP-LEVEL sibling of `reactos/`, and every extraction in `fetch_reactos.sh` was scoped to
-/// `reactos`, so it never reached the image. It is now extracted and laid down at `::Profiles` —
-/// exactly where `%SystemDrive%\Profiles` (the real SOFTWARE hive's `ProfileList\ProfilesDirectory`)
-/// resolves — and the executive MATERIALISES it onto the writable volume at mount, by walking it
-/// off the read-only FAT volume with the same reader every hosted binary is loaded with.
-///
-/// The proof is by CONTENT and by ENUMERATION, off the LIVE volume: the tree's real directory and
-/// file counts, `Default User`'s real child list through the same record encoder `FindFirstFileW`
-/// reaches, and a REAL staged file's bytes (`Default User\My Documents\livecd_start.cmd` is the
-/// ISO's 9-byte `@start %1`). Nothing here is synthesised — every byte came off the image.
-/// Read the STAGED `\Profiles` tree straight off the read-only FAT volume, BY PATH — independent of
-/// the writable overlay. Returns (is `Default User` a real directory?, does a real file inside it
-/// hold the ISO's exact bytes?). This is what proves the staging gap is closed on the IMAGE.
+/// Check the installed `Users\Default` source directly on the read-only image.
+/// The writable layer copies that tree before winlogon creates a user profile.
 unsafe fn staged_profiles_by_path() -> (bool, bool) {
     let Some(fat) = crate::fs_loader::exec_fs() else {
         return (false, false);
     };
-    let is_dir = crate::fs_loader::fat_open_path_entry(&fat, b"Profiles\\Default User")
-        .is_some_and(|(_, _, attr)| attr & 0x10 != 0);
-    let mut probe_ok = false;
-    if let Some((cluster, size, attr)) = crate::fs_loader::fat_open_path_entry(
+    let is_dir = crate::fs_loader::fat_open_path_entry(
         &fat,
-        b"Profiles\\Default User\\My Documents\\livecd_start.cmd",
-    ) {
-        if attr & 0x10 == 0 && size == 9 {
-            let mut bytes = [0u8; 9];
-            if crate::fs_loader::fat_read_file(&fat, cluster, size, bytes.as_mut_ptr() as u64) == 9
-            {
-                probe_ok = &bytes == b"@start %1";
-            }
-        }
-    }
+        crate::installed_layout::PROFILE_DEFAULT_SOURCE,
+    )
+        .is_some_and(|(_, _, attr)| attr & 0x10 != 0);
+    let probe_ok = crate::fs_loader::fat_open_path_entry(
+        &fat,
+        crate::installed_layout::PROFILE_DEFAULT_APPDATA_SOURCE,
+    )
+    .is_some_and(|(_, _, attr)| attr & 0x10 != 0);
     (is_dir, probe_ok)
 }
 
@@ -5553,9 +5519,9 @@ unsafe fn default_user_profile_spec(passed: &mut u64) {
     // The one file this executive deliberately adds to the ISO's own `Default User` tree.
     let provisioned_ntuser = (NTUSER_DAT_PROVISIONED.load(Ordering::Relaxed) != 0) as u64;
     let (staged_default_user_dir, staged_probe_ok) = staged_profiles_by_path();
-    print_str(b"[profile-source] on-image \\Profiles: `Default User` dir=");
+    print_str(b"[profile-source] on-image \\Users: `Default` dir=");
     print_u64(staged_default_user_dir as u64);
-    print_str(b" probe-file-bytes-match=");
+    print_str(b" AppData-dir=");
     print_u64(staged_probe_ok as u64);
     print_str(b" | materialised: dirs=");
     print_u64(dirs);
@@ -5563,9 +5529,9 @@ unsafe fn default_user_profile_spec(passed: &mut u64) {
     print_u64(files);
     print_str(b" bytes=");
     print_u64(bytes);
-    print_str(b" `Default User` entries=");
+    print_str(b" `Default` entries=");
     print_u64(entries);
-    print_str(b" probe-content-ok=");
+    print_str(b" AppData-provisioned=");
     print_u64(probe);
     print_str(b" ntuser.dat=");
     print_u64(crate::writable_fs::NTUSER_DAT_PROVISIONED.load(Ordering::Relaxed));
@@ -5573,24 +5539,14 @@ unsafe fn default_user_profile_spec(passed: &mut u64) {
     print_str(b"\n");
     check(
         b"exec_default_user_profile_staged",
-        // The ISO's real tree is really ON THE IMAGE, resolvable BY PATH through the ordinary
-        // read-only FAT reader: `\Profiles\Default User` is a directory, and a REAL file inside it
-        // (`My Documents\livecd_start.cmd`) reads back with the ISO's exact 9 bytes.
+        // The source directory and its AppData child must exist on the installed image.
         staged_default_user_dir && staged_probe_ok
-            // When the runtime materialisation is ON, the whole tree really came across too — all
-            // 45 directories and all 31 files (5307 bytes of genuine `.lnk`/`.cmd` content),
-            // `Default User` enumerating `.`, `..` and its 15 real children through the same `Zw*`
-            // record encoder `FindFirstFileW` reaches, and the same file readable off the volume.
-            //
-            // ★ Plus EXACTLY ONE deliberate addition when `PROVISION_NTUSER_DAT` is on: the
-            // `ntuser.dat` the LiveCD's skipped setup step would have left in this profile (see
-            // `writable_fs::PROVISION_NTUSER_DAT`). The counts stay EXACT — they are the ISO tree's
-            // own numbers plus that one file — so a staging regression still turns this spec red.
+            // The writable source must include both installed profile roots and Public files.
             && (!crate::writable_fs::PROVISION_DEFAULT_USER_PROFILE
-                || (dirs >= 45
-                    && files >= 31 + provisioned_ntuser
-                    && bytes >= 5307 + crate::writable_fs::NTUSER_DAT_PROVISIONED.load(Ordering::Relaxed)
-                    && entries == 17 + provisioned_ntuser
+                || (dirs >= 2
+                    && files >= 1 + provisioned_ntuser
+                    && bytes >= crate::writable_fs::NTUSER_DAT_PROVISIONED.load(Ordering::Relaxed)
+                    && entries >= 3 + provisioned_ntuser
                     && probe == 1)),
         passed,
     );
@@ -5688,7 +5644,7 @@ unsafe fn software_hive_mount_spec(passed: &mut u64) {
                     val_type = ty as u64;
                     val_len = data.len() as u64;
                     // REG_EXPAND_SZ `%SystemDrive%\Profiles` + NUL, UTF-16LE = 46 bytes.
-                    const EXPECT: &[u8] = b"%SystemDrive%\\Profiles";
+                    const EXPECT: &[u8] = crate::installed_layout::PROFILE_DIRECTORY_VALUE;
                     val_ok = ty == 2
                         && data.len() == (EXPECT.len() + 1) * 2
                         && data
@@ -5776,7 +5732,7 @@ unsafe fn winlogon_profile_directory_spec(passed: &mut u64) {
     let profile_path_proven = profile_image_path_sets != 0 || profile_image_path_readbacks != 0;
     let copied_this_boot = crate::writable_fs::PROFILE_USER_DIR_CREATED.load(Ordering::Relaxed)
         != 0
-        && crate::writable_fs::PROFILE_COPY_FILES.load(Ordering::Relaxed) != 0;
+        && crate::writable_fs::PROFILE_COPY_DIRS.load(Ordering::Relaxed) != 0;
     let copied_from_restored_volume = crate::writable_fs::snapshot_restore_seen()
         && crate::writable_fs::directory_exists_at(crate::writable_fs::COPIED_PROFILE_DIR)
         && crate::writable_fs::copied_profile_probe_ok()
@@ -19424,19 +19380,19 @@ fn normalize_registry_ascii_path(path: &[u8]) -> Option<Vec<u8>> {
 
     let mut out = Vec::new();
     if let Some(rest) = s.strip_prefix(b"%systemroot%\\") {
-        let prefix = b"reactos\\";
+        let prefix = crate::installed_layout::ROOT_PREFIX;
         out.try_reserve_exact(prefix.len().checked_add(rest.len())?)
             .ok()?;
         out.extend_from_slice(prefix);
         out.extend_from_slice(rest);
     } else if let Some(rest) = s.strip_prefix(b"systemroot\\") {
-        let prefix = b"reactos\\";
+        let prefix = crate::installed_layout::ROOT_PREFIX;
         out.try_reserve_exact(prefix.len().checked_add(rest.len())?)
             .ok()?;
         out.extend_from_slice(prefix);
         out.extend_from_slice(rest);
     } else if s.starts_with(b"system32\\") {
-        let prefix = b"reactos\\";
+        let prefix = crate::installed_layout::ROOT_PREFIX;
         out.try_reserve_exact(prefix.len().checked_add(s.len())?)
             .ok()?;
         out.extend_from_slice(prefix);
@@ -29258,8 +29214,21 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             NLS_ANSI_START.store(nls_starts[0], Ordering::Relaxed);
             NLS_OEM_START.store(nls_starts[1], Ordering::Relaxed);
             NLS_CASE_START.store(nls_starts[2], Ordering::Relaxed);
-            // The real SYSTEM hive buffer (64 frames, shares the 0xA0-0xC0 PT), mapped in the
-            // executive; the same frames are granted to the storage host in spawn_storage_host.
+            // The installed SYSTEM hive needs a dedicated 2 MiB page-table window.
+            let hivebuf_pt = alloc_slot();
+            let _ = untyped_retype(
+                CAP_INIT_UNTYPED,
+                OBJ_X86_PAGE_TABLE,
+                PAGING_BITS,
+                1,
+                hivebuf_pt,
+            );
+            let _ = paging_struct_map(
+                hivebuf_pt,
+                LBL_X86_PAGE_TABLE_MAP,
+                HIVEBUF_VADDR,
+                CAP_INIT_THREAD_VSPACE,
+            );
             let hivebuf_start = alloc_frame();
             for _ in 1..HIVEBUF_FRAMES {
                 let _ = alloc_frame();
@@ -29273,7 +29242,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 );
             }
             HIVEBUF_START.store(hivebuf_start, Ordering::Relaxed);
-            // The real SECURITY + SAM hive buffers (8 frames each, same 0xA0-0xC0 PT as HIVEBUF).
+            // SECURITY, SAM, and DEFAULT remain in the shared 0xA0-0xC0 input window.
             for (frames, vaddr, slot) in [
                 (SECHIVEBUF_FRAMES, SECHIVEBUF_VADDR, &SECHIVEBUF_START),
                 (SAMHIVEBUF_FRAMES, SAMHIVEBUF_VADDR, &SAMHIVEBUF_START),
@@ -29443,7 +29412,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let mut generic_loader_ok = false;
             if let Some(fs) = fat32_mount(AHCI_VADDR, AHCI_DMA_VADDR, AHCI_IOVA)
                 .and_then(|fs| publish_exec_fs(fs).ok().map(|()| fs)) {
-                if let Some((va, sz)) = load_file_to_pool(&fs, b"reactos\\system32\\version.dll") {
+                if let Some((va, sz)) = load_file_to_pool(&fs, crate::installed_layout::VERSION_DLL) {
                     let bytes = core::slice::from_raw_parts(va as *const u8, sz as usize);
                     let mz = sz >= 2 && bytes[0] == b'M' && bytes[1] == b'Z';
                     let parsed = nt_pe_loader::PeFile::parse(bytes).is_ok();
@@ -30924,7 +30893,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 match win32k_subsystem::load_into(WIN32KBUF_VADDR, win32k_size, nls_sizes) {
                     Some(entry_rva) => {
                         let _ = register_system_module(
-                            b"reactos\\system32\\win32k.sys",
+                            crate::installed_layout::WIN32K,
                             win32k_subsystem::WIN32K_CODE_VA,
                             win32k_image_size,
                         );
@@ -31957,7 +31926,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // IAT -> NTDLL_BASE+0x48f00 -> ntdll's .text page faults in and REAL NTDLL CODE
                 // EXECUTES. It runs until it derefs the (null) process params -> a safe stop.
                 let ntdll_source =
-                    bootstrap_image::load_installed(b"reactos\\system32\\ntdll.dll");
+                    bootstrap_image::load_installed(crate::installed_layout::NTDLL);
                 check(
                     b"exec_ntdll_loaded_from_fs_by_path",
                     ntdll_source.is_some(),

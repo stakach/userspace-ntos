@@ -6169,7 +6169,7 @@ fn system32_driver_path(driver_leaf: &[u8], out: &mut [u8]) -> Option<usize> {
     if !system32_driver_leaf_is_safe(driver_leaf) {
         return None;
     }
-    let prefix = b"reactos\\system32\\";
+    let prefix = crate::installed_layout::SYSTEM32_PREFIX;
     let len = prefix.len().checked_add(driver_leaf.len())?;
     if len > out.len() {
         return None;

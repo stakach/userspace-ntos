@@ -3,7 +3,7 @@
 A from-scratch reimplementation of the **Windows NT kernel personality in user
 space**, running on the [rust-micro](https://github.com/stakach/rust-micro) seL4
 microkernel. The personality and matching `ntdll.dll` are implemented in Rust;
-ReactOS supplies the hosted drivers, applications and shell.
+The pinned LiberNT installed image supplies the hosted drivers, applications and shell.
 
 NT's executive is a set of cooperating subsystems (Object Manager, Memory
 Manager, Process/Thread manager, I/O manager, …) layered over a small kernel.
@@ -157,103 +157,23 @@ Expected boot output:
 it as the kernel's rootserver, and drives the kernel's build+image+QEMU pipeline
 in `extern-rootserver` mode (bring your own root task).
 
-## Running the hosted ReactOS desktop (quick start)
+## Building and running the hosted desktop
 
-The desktop target hosts **real, unmodified GPL ReactOS binaries** on rust-micro.
-Genuine Explorer and native acceptance are tracked in
-[issue #18](https://github.com/stakach/userspace-ntos/issues/18).
-A production boot has executed the real ReactOS Winlogon, Userinit and Explorer,
-delivered keyboard input through the native class stack, and painted Explorer's
-taskbar and Start button. The issue records the fresh boot log and screenshot.
-The separate `font-cleanup` profile checks private font and Section-view
-retirement at process exit; it currently exposes a pinned ReactOS font-reference
-leak tracked in [issue #307](https://github.com/stakach/userspace-ntos/issues/307).
-Native build and crate tests alone do not prove
-desktop execution. To build and boot from a fresh clone:
+The hosted system uses the [pinned LiberNT AMD64 installed release](rust-micro/vendor/libernt/manifest.txt) as its filesystem source. `./run.sh` verifies the archive and contained disk image, extracts the installed `Windows` and `Users` tree, builds this repository's Rust `ntdll.dll` and NT executive, and packs a new UEFI boot image with the rust-micro kernel. The release image and its `acpi.sys` are not modified. The generated image stages our kernel-facing `ntdll.dll` at `Windows/system32/ntdll.dll`.
 
 ```sh
 git clone --recursive https://github.com/stakach/userspace-ntos.git
 cd userspace-ntos
-./run.sh                # headless serial gate (default)
-./run.sh --desktop      # boot with a QEMU window so you SEE the painted desktop
-./run.sh --build-only   # stage the boot image without launching QEMU
+./run.sh --build-only   # verify media, build, and pack the boot image
+./run.sh                # headless serial and Explorer acceptance gate
+./run.sh --desktop      # same gate with a QEMU display window
 ```
 
-`./run.sh` (at the repo root — distinct from `scripts/run.sh` above) is a
-self-contained launcher that:
+The launcher needs Rust nightly with `rust-src`, QEMU and OVMF, a C compiler, Python 3, `bsdtar`, and `7zz`. The first run downloads the pinned release; later runs use the verified cache under `rust-micro/.tmp/libernt/`. The generated image is `rust-micro/.tmp/disk.img`. Keep at least several gigabytes free for the archive, extracted tree, build output, and image. Set `BOOT_TIMEOUT_SECONDS` to a value up to 3600 to bound a boot attempt.
 
-1. **Preflight-checks every prerequisite** (QEMU, a C compiler, `tar`,
-   `bsdtar`/libarchive, `python3`, the Rust **nightly**
-   toolchain + `rust-src`, and OVMF/edk2 UEFI firmware). If anything is missing
-   it prints a per-platform `brew install …` / `apt install …` remediation table
-   and stops — no cryptic mid-build failure.
-2. **Checks out the `rust-micro` submodule** if you forgot `--recursive`.
-3. **Fetches the ReactOS binaries** on first run (a ~30 MiB GPL ReactOS x64
-   livecd, `reactos-livecd-0.4.17-dev-933-ga9fc819`, from
-   [iso.reactos.org](https://iso.reactos.org/livecd/); cached under
-   `rust-micro/.tmp/reactos/`, extracted with `bsdtar`). Override the URL with
-   `REACTOS_7Z_URL=…`. ReactOS is GPL, so its binaries are freely
-   redistributable — the executive loads them via `SEC_IMAGE` and runs their
-   real user-mode binaries through this project's Rust `ntdll.dll` implementation.
-   The requested dev-933 archive currently contains an ISO byte-identical to
-   the earlier dev-478 archive; its label does not yet imply a newer payload.
-4. **Builds** the Rust `ntdll.dll`, `ntos-executive` (the NT executive that
-   hosts the ReactOS processes), the verified `nt-seh-linkage.dll` support image,
-   and the kernel, then packs the FAT32/UEFI disk image. The support image is
-   mapped into hosted driver domains. The native SEH bridge runs driver C filters,
-   termination handlers, explicit target and collided unwinds, and provider CPU-fault
-   handlers on the interrupted component thread. Verify these paths with
-   `bash scripts/run-seh-driver-integration.sh`,
-   `bash scripts/run-seh-terminal-integration.sh`, and
-   `bash scripts/run-seh-fault-integration.sh`; pass `--desktop` to also require
-   the full Explorer gate.
-5. **Boots QEMU.**
+The cutover is tracked in [issue #310](https://github.com/stakach/userspace-ntos/issues/310). Its current source-built ntdll lacks some LiberNT exports, so the build deliberately stops at the export comparison until that ABI is implemented. A crate build or image pack alone is not desktop proof: acceptance requires genuine Winlogon, Userinit, and Explorer execution, an Explorer screenshot, and the complete headless verdict. [Issue #18](https://github.com/stakach/userspace-ntos/issues/18) records the previous ReactOS desktop acceptance; it does not establish a LiberNT desktop boot.
 
-Periodic census separates disk read, write and barrier attempts, requested sectors,
-errors and elapsed TSC ticks; these are not durability receipts or wall-clock times.
-Successful win32k client switches remain counted, with per-switch text available
-in executive builds using the `debug-trace` feature.
-Filesystem snapshots use the shared CRC32C codec and bounded whole-sector staging;
-coalescing encoder fragments preserves the existing durability barriers.
-New images reserve 16 MiB for the existing snapshot slots and 16 MiB for a future
-registry append log. Set `PERSIST_IMAGE_MIB=16` to build a legacy snapshot-only
-image; the append area is not yet used for registry writes.
-
-### Desktop Acceptance
-
-Headless mode streams the serial log and checks the complete executive summary,
-the success sentinel, and `PASS exec_explorer_shell_chrome_painted`. This gate
-requires genuine Explorer execution, client callbacks, GDI drawing, and varied
-framebuffer pixels. Background painting or a login dialog alone is not desktop proof.
-
-The [feature-off production scanout](docs/images/desktop-production.png) records
-genuine Explorer taskbar and Start-button rendering after a fresh profile setup.
-The [source-instrumented scanout](docs/images/desktop-source-irp.png) accompanies
-the strict native source-IRP completion and retirement gate on the same kernel code.
-This is desktop-chrome evidence, not a complete executive-gate pass; remaining
-whole-OS acceptance is tracked in [issue #18](https://github.com/stakach/userspace-ntos/issues/18).
-
-`--desktop` opens a QEMU window using the real ReactOS `win32k.sys`, display driver,
-and font stack. Boot readiness is the Explorer chrome gate, not the earlier
-`desktop-bg match` message. The launcher bounds boot to one hour and allows a short
-inspection interval after readiness; close the window to quit. Use headless mode
-for an automated pass/fail result.
-
-**Expected run time:** the headless gate can take several minutes under QEMU TCG, especially on
-Apple Silicon, and DLL-loading phases can be quiet for tens of seconds. `--desktop` opens the
-window before win32k paints it; wait for `PASS exec_explorer_shell_chrome_painted`.
-The first run also adds the one-time ReactOS download and a full `cargo` build.
-
-**Gotchas:**
-
-- The kernel is a **git submodule** (`rust-micro`); the build target is
-  `userspace-ntos/rust-micro`, not any standalone checkout. A clone without
-  `--recursive` needs `git submodule update --init --recursive` (the launcher
-  does this for you).
-- Some ReactOS binaries are only staged onto the disk image **if they were
-  fetched first** — a fresh clone that skips the fetch step boots the kernel
-  *without* the hosted processes. Always let `./run.sh` run the fetch (it is
-  idempotent and cached).
+Run focused crate checks with `cargo test --workspace --locked`. Native integration and QEMU validation share generated artifacts, so run them serially. For a release refresh, update the URL, source revision, and SHA-256 values in the [media manifest](rust-micro/vendor/libernt/manifest.txt), then rerun `./run.sh --build-only` and the desktop acceptance gate. Do not edit the published release binaries.
 
 ## Updating the kernel
 
@@ -272,3 +192,5 @@ Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 reimplementation of NT *concepts*; it contains no Microsoft code and is not
 affiliated with or endorsed by Microsoft. "Windows" and "Windows NT" are
 trademarks of Microsoft Corporation.
+
+The downloaded LiberNT userspace is distributed under [LiberNT's own licenses](https://github.com/ahmedarif193/LiberNT), including GPL-3.0 and licenses retained from ReactOS. It is fetched separately and is not part of this repository's source license.

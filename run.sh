@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # run.sh — one-command launcher for the rust-micro kernel hosting the REAL
-# ReactOS user-space stack: Simpleboot -> rust-micro (seL4-style microkernel) ->
+# LiberNT user-space stack: Simpleboot -> rust-micro (seL4-style microkernel) ->
 # smss -> csrss -> winlogon -> win32k -> a PAINTED Windows desktop.
 #
 #   ./run.sh              # headless serial gate; requires the complete Explorer shell proof
@@ -11,7 +11,7 @@
 # What it does (idempotent + re-runnable):
 #   [1/5] preflight — verify every required tool + the Rust nightly toolchain
 #   [2/5] submodule — check out rust-micro if missing
-#   [3/5] fetch     — download the GPL ReactOS livecd binaries (first run only)
+#   [3/5] fetch     — download the pinned LiberNT installed image (first run only)
 #   [4/5] build     — build the ntos-executive + kernel + pack the disk image
 #   [5/5] run       — boot QEMU (headless gate, or a display window with --desktop)
 set -euo pipefail
@@ -156,6 +156,7 @@ check_tool dd                 "(base system)"           "(coreutils)"
 check_tool tar                "(base system)"           "apt install tar"
 check_tool curl               "brew install curl"       "apt install curl"
 check_tool bsdtar             "brew install libarchive" "apt install libarchive-tools"
+check_tool 7zz                "brew install sevenzip"    "apt install 7zip"
 check_tool python3            "brew install python"     "apt install python3"
 check_tool cargo              "install rustup: https://rustup.rs" "install rustup: https://rustup.rs"
 check_tool rustup             "install rustup: https://rustup.rs" "install rustup: https://rustup.rs"
@@ -218,16 +219,18 @@ if [ ! -e "$RM/scripts/build_kernel.sh" ]; then
   git submodule update --init --recursive
 fi
 
-# ---- [3/5] verify/fetch the pinned ReactOS binaries ---------------------
-say "[3/5] checking ReactOS binaries..."
-"$RM/scripts/fetch_reactos.sh"
-"$RM/scripts/verify_reactos_acpi_provider.sh"
+# ---- [3/5] verify/fetch the pinned LiberNT installed image -------------
+say "[3/5] checking LiberNT userspace..."
+"$RM/scripts/fetch_libernt.sh"
 
 # ---- [4/5] build the executive + kernel + disk image --------------------
-say "[4/5] building ntos-executive + kernel + disk image..."
+say "[4/5] building ntdll + ntos-executive + kernel + disk image..."
 ensure_no_qemu_lane_running
 ensure_boot_image_available "$BOOT_IMAGE"
 "$ROOT/scripts/build_ntdll_dll.sh"
+cargo run -q -p ntdll-dll-verify -- --compare-exports \
+  "$RM/.tmp/libernt/tree/Windows/system32/ntdll.dll" \
+  "$ROOT/.tmp/nt-ntdll.dll"
 "$ROOT/components/ntos-executive/build.sh"
 ( cd "$RM" && ./scripts/build_kernel.sh extern-rootserver )
 
@@ -269,7 +272,7 @@ if [ "$GRAPHICS" = 1 ]; then
   fi
   if verdict="$(complete_boot_verdict "$RUN_LOG" "$rc")"; then
     read -r passed total <<< "$verdict"
-    say "SUCCESS — the visible ReactOS desktop completed its full gate ($passed/$total checks)."
+    say "SUCCESS — the visible LiberNT desktop completed its full gate ($passed/$total checks)."
     say "         Log: $RUN_LOG"
     exit 0
   fi
@@ -280,7 +283,7 @@ fi
 
 say "[5/5] booting QEMU (headless serial gate)..."
 say "      Success = every executive check passes and Explorer shell chrome reaches the framebuffer."
-say "      Tip: ./run.sh --desktop to SEE the painted ReactOS desktop in a window."
+say "      Tip: ./run.sh --desktop to SEE the painted LiberNT desktop in a window."
 say "      Boot validation timeout: ${BOOT_TIMEOUT_SECONDS}s (hard maximum: 3600s)."
 # run_specs execs QEMU; the kernel signals the result through isa-debug-exit:
 #   host exit 3 = kernel qemu_exit(0) = PASS ((0<<1|1)<<1|1),  255 = panic.
@@ -308,7 +311,7 @@ if [ "$rc" = 125 ]; then
 fi
 if verdict="$(complete_boot_verdict "$RUN_LOG" "$rc")"; then
   read -r passed total <<< "$verdict"
-  say "SUCCESS — the ReactOS stack booted and Explorer painted the complete shell ($passed/$total checks)."
+  say "SUCCESS — the LiberNT stack booted and Explorer painted the complete shell ($passed/$total checks)."
   say "         Log: $RUN_LOG"
   say "         Run ./run.sh --desktop to view it."
   exit 0

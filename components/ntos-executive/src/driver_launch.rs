@@ -18089,7 +18089,7 @@ static mut FSD_EXPORTS_READY: bool = false;
 
 const HOSTED_DEP_PROVIDER_MAX: usize = 64;
 const HOSTED_DEP_PATH_MAX: usize = 96;
-const HOSTED_DRIVER_DEP_PATH_PREFIX: &[u8] = b"reactos\\system32\\drivers\\";
+const HOSTED_DRIVER_DEP_PATH_PREFIX: &[u8] = crate::installed_layout::DRIVERS_PREFIX;
 const MAX_RAW_IMPORT_DESCRIPTORS: u32 = 256;
 const MAX_LOADED_EXPORT_NAMES: u32 = 1024;
 const HOSTED_EXECUTABLE_THUNK_FRAMES: u64 = 1;
@@ -37834,7 +37834,7 @@ fn frames_for_image_len(len: u64) -> Option<u64> {
     Some(align_up_4k(len)? / 0x1000)
 }
 
-const HOSTED_AUXILIARY_PE_PATH: &[u8] = b"reactos\\system32\\nt-seh-linkage.dll";
+const HOSTED_AUXILIARY_PE_PATH: &[u8] = crate::installed_layout::SEH_LINKAGE;
 
 fn hosted_auxiliary_pe(source: &[u8]) -> Option<nt_pe_loader::PeFile<'_>> {
     let pe = nt_pe_loader::PeFile::parse(source).ok()?;
@@ -46889,7 +46889,7 @@ pub(crate) fn probe_kernel_volume_file(device_path: &str) -> bool {
         return false;
     };
     let client = ClientId(IO_MANAGER_COMPONENT_ID);
-    let name = nt_types::UnicodeString::from_str("reactos\\Fonts\\arial.ttf");
+    let name = nt_types::UnicodeString::from_str(crate::installed_layout::ARIAL_STR);
     let Ok(file) = io_manager_mut().allocate_external_file(
         client,
         device,

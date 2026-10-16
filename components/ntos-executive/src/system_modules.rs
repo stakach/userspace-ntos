@@ -193,12 +193,12 @@ fn canonical_module_path_parts(path: &[u8]) -> Option<(&'static [u8], &[u8])> {
     }
 
     let system_root = b"\\SystemRoot\\";
-    let reactos_prefix = b"reactos";
-    if path.len() > reactos_prefix.len()
-        && ascii_eq_ignore_case(&path[..reactos_prefix.len()], reactos_prefix)
-        && (path[reactos_prefix.len()] == b'\\' || path[reactos_prefix.len()] == b'/')
+    let installed_prefix = crate::installed_layout::ROOT;
+    if path.len() > installed_prefix.len()
+        && ascii_eq_ignore_case(&path[..installed_prefix.len()], installed_prefix)
+        && (path[installed_prefix.len()] == b'\\' || path[installed_prefix.len()] == b'/')
     {
-        return Some((system_root.as_slice(), &path[reactos_prefix.len() + 1..]));
+        return Some((system_root.as_slice(), &path[installed_prefix.len() + 1..]));
     }
     Some((&[], path))
 }

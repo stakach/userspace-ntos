@@ -84,11 +84,11 @@ pub(crate) unsafe fn load_installed(name: &str, pml4: u64) -> Result<(u64, u32),
         return Err(LoadFailure::InvalidImage);
     }
     let fs = exec_fs().ok_or(LoadFailure::NativeFailure)?;
-    let mut path = b"reactos\\system32\\".to_vec();
+    let mut path = crate::installed_layout::SYSTEM32_PREFIX.to_vec();
     path.extend_from_slice(name.as_bytes());
     let location = fat_open_path(&fs, &path)
         .or_else(|| {
-            let mut driver_path = b"reactos\\system32\\drivers\\".to_vec();
+            let mut driver_path = crate::installed_layout::DRIVERS_PREFIX.to_vec();
             driver_path.extend_from_slice(name.as_bytes());
             fat_open_path(&fs, &driver_path)
         })

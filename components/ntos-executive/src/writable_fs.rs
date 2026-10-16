@@ -51,25 +51,25 @@ use file_cleanup::publish_file_cleanup_effects;
 /// The namespace subtrees served by the writable volume, as canonical volume-relative paths
 /// (lowercase, `\`-separated, no leading separator — the form `nt_path_to_volume_relative` emits).
 ///
-/// `profiles` is `%SystemDrive%\Profiles`, the `ProfilesDirectory` the real SOFTWARE hive names and
+/// `users` is `%SystemDrive%\Users`, the `ProfilesDirectory` the installed SOFTWARE hive names and
 /// the tree winlogon's `LoadUserProfileW` -> `CreateUserProfileW` builds.
 ///
-/// `reactos\system32\config` is the installed-system state directory. Ordinary services can create
+/// `windows\system32\config` is the installed-system state directory. Ordinary services can create
 /// their own state files there through `NtCreateFile` rather than hitting the read-only FAT reader.
 /// Boot hive source files stay on the FAT volume until the Configuration Manager flushes a live
 /// mutable hive checkpoint into the writable layer. EventLog's `AppEvent.Evt`/`SecEvent.Evt`/
 /// `SysEvent.Evt` files are the first real users.
 ///
-/// `reactos\bootstat.dat` is an exact installed mutable file. ReactOS RTL opens, reads, writes and
+/// `windows\bootstat.dat` is an exact installed mutable file. The RTL opens, reads, writes and
 /// flushes it through ordinary file syscalls; it has no executive-private backing object.
 pub(crate) const WRITABLE_PREFIXES: &[&[u8]] = &[
-    b"profiles",
-    b"reactos\\system32\\config",
-    b"reactos\\bootstat.dat",
+    crate::installed_layout::USERS,
+    crate::installed_layout::CONFIG,
+    crate::installed_layout::BOOTSTAT,
 ];
 
-const BOOT_STATUS_PATH: &str = r"\??\C:\ReactOS\bootstat.dat";
-const BOOT_STATUS_VOLUME_RELATIVE: &[u8] = b"reactos\\bootstat.dat";
+const BOOT_STATUS_PATH: &str = crate::installed_layout::NT_BOOTSTAT;
+const BOOT_STATUS_VOLUME_RELATIVE: &[u8] = crate::installed_layout::BOOTSTAT;
 const BOOT_STATUS_DATA_SIZE: usize = 0x88;
 
 fn initial_boot_status_data() -> [u8; BOOT_STATUS_DATA_SIZE] {
@@ -87,81 +87,23 @@ fn initial_boot_status_data() -> [u8; BOOT_STATUS_DATA_SIZE] {
 /// specs go red. Nothing else in the executive changes.
 pub(crate) const WRITABLE_OVERLAY_MOUNTED: bool = true;
 
-/// ★ THE PROFILE SOURCE — **the ISO's OWN `Profiles/` tree, which our staging was dropping.**
-///
-/// `CreateUserProfileExW` seeds a new user's profile by COPYING `C:\Profiles\Default User`
-/// (`profile.c:1000` → `CopyDirectory` → `FindFirstFileW("C:\Profiles\Default User\*.*")`), and
-/// that copy failed at `profile.c:1002  Error: 3` (ERROR_PATH_NOT_FOUND) because the image had no
-/// profile tree at all.
-///
-/// The tree was NOT missing from the media — it was missing from OUR STAGING. The ReactOS LiveCD
-/// ISO carries a real 76-entry `Profiles/` tree (`Default User/…`, `All Users/…`) as a **top-level
-/// sibling of `reactos/`**, and every extraction in `fetch_reactos.sh` was scoped to `reactos`, so
-/// it never reached the disk image. `fetch_reactos.sh` now extracts it and `make_image.sh` lays it
-/// down at `::Profiles` — exactly where `%SystemDrive%\Profiles` (the real SOFTWARE hive's
-/// `ProfileList\ProfilesDirectory`) resolves. The image builder also applies the tiny ReactOS setup
-/// physical-directory delta that the LiveCD cache lacks (`Default User\Local Settings\Temp`), so
-/// winlogon's real profile copy sees installed-volume content rather than a query/create fallback.
-///
-/// **Composition with the writable volume.** `C:\Profiles` is a writable-volume prefix
-/// ([`WRITABLE_PREFIXES`]) while the staged tree is on the READ-ONLY FAT volume, so the two must
-/// compose. The chosen composition is **materialise-at-mount**: when the writable volume is first
-/// touched, the executive walks the staged `\Profiles` tree off the FAT volume and recreates it —
-/// directories AND file contents — on the writable volume. That was picked over a union/read-through
-/// layer because it is strictly simpler and leaves ONE code path: after mount every hosted-process
-/// syscall sees a single, coherent, writable `C:\Profiles`, so `CopyDirectory` can enumerate and
-/// read the source and write the destination with no per-operation layer arbitration, and a later
-/// FAT32 write-through milestone replaces the backing without touching any of it. The cost is the
-/// tree's bytes in RAM, which for this tree is ~76 nodes plus setup-created empty directories and
-/// ~360 bytes of file content.
-///
-/// ★ **ON since batch 58.** It shipped `false` for one batch on the belief that the profile flow
-/// blew the TCG time budget ("post-logon UI work grows ~2.5x"). That was WRONG: host-side
-/// timestamps showed the boot going COMPLETELY SILENT for the last 245 s behind a blocking
-/// `NtUserGetMessage` that win32k could never answer — a deadlock, not a budget. With that fixed
-/// the boot quiesces in 319-329 s of the ~555 s window with
-/// the flow ON, and `userenv!CopyDirectory` really runs: 20 subdirectories created below
-/// `C:\Profiles\<user>` and 2 files copied byte-exact from the ISO's `Default User`
-/// (`exec_winlogon_profile_copied`). Materialisation itself is unchanged and still measured at
-/// `dirs=45 files=31 bytes=5307` with `Default User` enumerating its real 17 records.
+/// Materialise the installed `Users` tree into the writable volume before profile creation.
+/// `CreateUserProfileExW` copies `C:\Users\Default` through ordinary file APIs, so the source
+/// directories and the destination must share the writable namespace.
 pub(crate) const PROVISION_DEFAULT_USER_PROFILE: bool = true;
 
-/// ★ THE SETUP STEP THE LIVECD SKIPS — `Default User\ntuser.dat`, from real setup hive state.
-///
-/// `CreateUserProfileExW` copies `C:\Profiles\Default User` into the new profile and then calls
-/// `RegLoadKeyW(HKEY_USERS, <SID>, "<profile>\ntuser.dat")` (`profile.c:1088`). On this image that
-/// returned **`Error: 2` (ERROR_FILE_NOT_FOUND)**: there is **no `ntuser.dat` anywhere on the
-/// ISO**, because a LiveCD never runs the setup step that creates one — ReactOS setup
-/// (`base/setup/lib/registry.c`, `CreateUserHive`/`InstallHives`) copies
-/// `system32\config\default` — the `$$$PROTO.HIV` prototype, i.e. the very hive the kernel mounts
-/// as `HKEY_USERS\.DEFAULT` — into the Default User profile as `ntuser.dat`. This performs THAT
-/// step from THAT prototype hive. The executive first imports the genuine `config\default` regf into
-/// the live mutable hive authority, applies the installed-system setup writes ReactOS normally makes
-/// there, and serializes that live `.Default` hive image into the source profile. Nothing is answered
-/// by registry fallback: winlogon's real `CopyDirectory` copies an ordinary file, and `NtLoadKey`
-/// mounts the copied hive image.
-///
-/// **Why the `Default User` profile and not the user's.** winlogon must stay the actor: dropping
-/// the file into `C:\Profiles\Administrator` directly would make `LoadUserProfileW`'s
-/// `GetFileAttributesW(<profile>\ntuser.dat)` probe (`profile.c:2088`) SUCCEED, which SKIPS
-/// `CreateUserProfileW` entirely — no `CreateDirectoryW`, no `CopyDirectory`, i.e. it would delete
-/// the very behaviour `exec_winlogon_profile_directories_created` and
-/// `exec_winlogon_profile_copied` measure. Placed in the SOURCE profile instead, winlogon's own
-/// `CopyDirectory` → `CopyFileW` carries it across, through the real `NtCreateFile`/`NtReadFile`/
-/// `NtWriteFile` path, and the destination hive is winlogon's own output.
-///
-/// ★ BYPASS SWITCH: `false` restores the pre-batch state — the copied profile has no `ntuser.dat`
-/// and `RegLoadKeyW` returns `Error: 2` again (`exec_profile_ntuser_dat_present` FAILs).
+/// Provide the default profile's `ntuser.dat` from the live setup-provisioned `.Default`
+/// hive. Winlogon's own `CopyDirectory` copies it to the newly created user profile.
 pub(crate) const PROVISION_NTUSER_DAT: bool = true;
 
 /// The `ntuser.dat` source profile and destination the copy must produce.
-pub(crate) const DEFAULT_USER_NTUSER_DAT: &str = r"\??\C:\Profiles\Default User\ntuser.dat";
-pub(crate) const COPIED_PROFILE_NTUSER_DAT: &str = r"\??\C:\Profiles\Administrator\ntuser.dat";
+pub(crate) const DEFAULT_USER_NTUSER_DAT: &str = crate::installed_layout::NT_DEFAULT_NTUSER;
+pub(crate) const COPIED_PROFILE_NTUSER_DAT: &str = crate::installed_layout::NT_ADMIN_NTUSER;
 
-/// Bytes of the `ntuser.dat` really provisioned into the `Default User` profile (0 = not present).
+/// Bytes of the `ntuser.dat` really provisioned into the `Default` profile (0 = not present).
 pub(crate) static NTUSER_DAT_PROVISIONED: AtomicU64 = AtomicU64::new(0);
 
-/// The setup-provisioned `.Default` hive image to install into `Default User\ntuser.dat`.
+/// The setup-provisioned `.Default` hive image to install into `Default\ntuser.dat`.
 ///
 /// This is populated by the registry setup path after the mutable `.Default` hive has received
 /// ReactOS setup's locale and shell-folder writes. If it is absent, no profile hive is provisioned:
@@ -332,33 +274,30 @@ pub(crate) unsafe fn set_default_user_ntuser_dat_image(image: alloc::vec::Vec<u8
 }
 
 /// The staged tree's FAT root name, and its mount point on the writable volume.
-pub(crate) const STAGED_PROFILES_DIR: &[u8] = b"Profiles";
-pub(crate) const PROFILES_VOLUME_ROOT_RELATIVE: &[u8] = b"profiles";
-pub(crate) const STAGED_CONFIG_DIR: &[u8] = br"reactos\system32\config";
-pub(crate) const CONFIG_VOLUME_ROOT_RELATIVE: &[u8] = b"reactos\\system32\\config";
-pub(crate) const CONFIG_SYSTEM_HIVE_RELATIVE: &[u8] = b"reactos\\system32\\config\\system";
-pub(crate) const CONFIG_SOFTWARE_HIVE_RELATIVE: &[u8] = b"reactos\\system32\\config\\software";
-pub(crate) const CONFIG_SECURITY_HIVE_RELATIVE: &[u8] = b"reactos\\system32\\config\\security";
-pub(crate) const CONFIG_SAM_HIVE_RELATIVE: &[u8] = b"reactos\\system32\\config\\sam";
-pub(crate) const CONFIG_DEFAULT_HIVE_RELATIVE: &[u8] = b"reactos\\system32\\config\\default";
-pub(crate) const CONFIG_SYSTEM_HIVE_PATH: &str = r"\??\C:\ReactOS\System32\Config\SYSTEM";
-pub(crate) const CONFIG_SOFTWARE_HIVE_PATH: &str = r"\??\C:\ReactOS\System32\Config\SOFTWARE";
-pub(crate) const CONFIG_SECURITY_HIVE_PATH: &str = r"\??\C:\ReactOS\System32\Config\SECURITY";
-pub(crate) const CONFIG_SAM_HIVE_PATH: &str = r"\??\C:\ReactOS\System32\Config\SAM";
-pub(crate) const CONFIG_DEFAULT_HIVE_PATH: &str = r"\??\C:\ReactOS\System32\Config\DEFAULT";
-/// The profile-source directory `CreateUserProfileExW` copies, and a REAL file inside it whose
-/// content the spec reads back (`livecd_start.cmd` is 9 bytes: `@start %1`).
-pub(crate) const PROFILE_ROOT_DIR: &str = r"\??\C:\Profiles";
-pub(crate) const DEFAULT_USER_PROFILE_DIR: &str = r"\??\C:\Profiles\Default User";
+pub(crate) const STAGED_PROFILES_DIR: &[u8] = crate::installed_layout::USERS_SOURCE;
+pub(crate) const PROFILES_VOLUME_ROOT_RELATIVE: &[u8] = crate::installed_layout::USERS;
+pub(crate) const STAGED_CONFIG_DIR: &[u8] = crate::installed_layout::CONFIG;
+pub(crate) const CONFIG_VOLUME_ROOT_RELATIVE: &[u8] = crate::installed_layout::CONFIG;
+pub(crate) const CONFIG_SYSTEM_HIVE_RELATIVE: &[u8] = crate::installed_layout::CONFIG_SYSTEM;
+pub(crate) const CONFIG_SOFTWARE_HIVE_RELATIVE: &[u8] = crate::installed_layout::CONFIG_SOFTWARE;
+pub(crate) const CONFIG_SECURITY_HIVE_RELATIVE: &[u8] = crate::installed_layout::CONFIG_SECURITY;
+pub(crate) const CONFIG_SAM_HIVE_RELATIVE: &[u8] = crate::installed_layout::CONFIG_SAM;
+pub(crate) const CONFIG_DEFAULT_HIVE_RELATIVE: &[u8] = crate::installed_layout::CONFIG_DEFAULT;
+pub(crate) const CONFIG_SYSTEM_HIVE_PATH: &str = crate::installed_layout::NT_CONFIG_SYSTEM;
+pub(crate) const CONFIG_SOFTWARE_HIVE_PATH: &str = crate::installed_layout::NT_CONFIG_SOFTWARE;
+pub(crate) const CONFIG_SECURITY_HIVE_PATH: &str = crate::installed_layout::NT_CONFIG_SECURITY;
+pub(crate) const CONFIG_SAM_HIVE_PATH: &str = crate::installed_layout::NT_CONFIG_SAM;
+pub(crate) const CONFIG_DEFAULT_HIVE_PATH: &str = crate::installed_layout::NT_CONFIG_DEFAULT;
+/// The installed profile-source directory that `CreateUserProfileExW` copies.
+pub(crate) const PROFILE_ROOT_DIR: &str = crate::installed_layout::NT_USERS;
+pub(crate) const DEFAULT_USER_PROFILE_DIR: &str = crate::installed_layout::NT_DEFAULT_PROFILE;
 pub(crate) const DEFAULT_USER_PROBE_FILE: &str =
-    r"\??\C:\Profiles\Default User\My Documents\livecd_start.cmd";
+    crate::installed_layout::NT_DEFAULT_PROFILE_APPDATA;
 
-/// The DESTINATION path `CopyDirectory` must have produced for the probe file, and the source
-/// bytes it must contain. The user directory is the real profile name `CreateUserProfileExW`
-/// derived from the logged-on account, so this is the copy's own output path, not a fabrication.
-pub(crate) const COPIED_PROFILE_DIR: &str = r"\??\C:\Profiles\Administrator";
+/// The destination AppData directory that `CopyDirectory` must have produced.
+pub(crate) const COPIED_PROFILE_DIR: &str = crate::installed_layout::NT_ADMIN_PROFILE;
 pub(crate) const COPIED_PROFILE_PROBE_FILE: &str =
-    r"\??\C:\Profiles\Administrator\My Documents\livecd_start.cmd";
+    crate::installed_layout::NT_ADMIN_PROFILE_APPDATA;
 
 /// Whether an existing directory is present on the live writable volume, read by path.
 ///
@@ -373,30 +312,31 @@ pub(crate) unsafe fn directory_exists_at(path: &str) -> bool {
     }
 }
 
-/// Whether `CopyDirectory` really wrote the SOURCE file's exact bytes to its DESTINATION path —
-/// read back off the LIVE writable volume, by content.
+/// Whether `CopyDirectory` recreated the installed profile's AppData directory.
 ///
 /// # Safety
 /// Single-threaded executive; borrows the mounted volume for the duration of the read.
 pub(crate) unsafe fn copied_profile_probe_ok() -> bool {
     match writable_fs() {
-        Ok(fs) => fs.file_bytes(COPIED_PROFILE_PROBE_FILE) == Some(b"@start %1"),
+        Ok(fs) => fs
+            .query_attributes(COPIED_PROFILE_PROBE_FILE)
+            .is_some_and(|info| info.is_directory),
         Err(_) => false,
     }
 }
 
-/// Directories / files / content bytes really materialised from the staged `\Profiles` tree.
+/// Directories / files / content bytes materialised from the staged `\Users` tree.
 pub(crate) static PROFILE_SOURCE_DIRS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PROFILE_SOURCE_FILES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PROFILE_SOURCE_BYTES: AtomicU64 = AtomicU64::new(0);
-/// A REAL staged file's content, read back off the LIVE volume (`livecd_start.cmd` == `@start %1`).
+/// The installed Default AppData directory, read back off the writable volume.
 pub(crate) static PROFILE_SOURCE_PROBE_OK: AtomicU64 = AtomicU64::new(0);
-/// Directory entries `Default User` really enumerates (`.`, `..` + its 15 real children), read back
+/// Directory entries `Default` really enumerates, read back
 /// through the SAME `Zw*` record encoder `NtQueryDirectoryFile` — and so `FindFirstFileW` — uses.
 pub(crate) static PROFILE_SOURCE_ENTRIES: AtomicU64 = AtomicU64::new(0);
 
 /// Directories / files / content bytes really materialised from the staged
-/// `\reactos\system32\config` tree.
+/// `\windows\system32\config` tree.
 pub(crate) static CONFIG_SOURCE_DIRS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static CONFIG_SOURCE_FILES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static CONFIG_SOURCE_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -480,15 +420,15 @@ pub(crate) fn note_directory_create(pi: usize, relative: &[u8], created: bool) {
         return;
     }
     let depth = relative.iter().filter(|byte| **byte == b'\\').count();
-    if relative == b"profiles" {
+    if relative == crate::installed_layout::USERS {
         if created {
             PROFILE_ROOT_CREATED.fetch_add(1, Ordering::Relaxed);
         } else {
             PROFILE_ROOT_COLLIDED.fetch_add(1, Ordering::Relaxed);
         }
-    } else if created && depth == 1 && relative.starts_with(b"profiles\\") {
+    } else if created && depth == 1 && relative.starts_with(crate::installed_layout::USERS_PREFIX) {
         PROFILE_USER_DIR_CREATED.fetch_add(1, Ordering::Relaxed);
-    } else if created && depth >= 2 && relative.starts_with(b"profiles\\") {
+    } else if created && depth >= 2 && relative.starts_with(crate::installed_layout::USERS_PREFIX) {
         // Anything DEEPER than `profiles\<user>` can only have been made by `CopyDirectory`'s
         // recursion (`userenv!directory.c:124  CreateDirectoryExW(src, dst, NULL)`) — winlogon
         // itself only ever creates the root and the per-user directory.
@@ -501,7 +441,7 @@ pub(crate) fn note_directory_create(pi: usize, relative: &[u8], created: bool) {
 /// a create that the volume really reported as `FILE_CREATED`.
 pub(crate) fn note_profile_file_create(pi: usize, relative: &[u8]) {
     if pi == 2
-        && relative.starts_with(b"profiles\\")
+        && relative.starts_with(crate::installed_layout::USERS_PREFIX)
         && relative.iter().filter(|byte| **byte == b'\\').count() >= 2
     {
         PROFILE_COPY_FILES.fetch_add(1, Ordering::Relaxed);
@@ -759,8 +699,8 @@ fn append_ascii_utf16_name(
 
 fn restored_profile_source_tree_stats(fs: &mut nt_fs::FileSystem) -> StagedTreeStats {
     const SOURCE_ROOTS: [&str; 2] = [
-        r"\??\C:\Profiles\Default User",
-        r"\??\C:\Profiles\All Users",
+        crate::installed_layout::NT_DEFAULT_PROFILE,
+        crate::installed_layout::NT_PUBLIC_PROFILE,
     ];
     const DIRECTORY_NAME_OFFSET: usize = 64;
     const FILE_ATTRIBUTES_OFFSET: usize = 56;
@@ -870,7 +810,8 @@ fn refresh_live_profile_source_proofs(fs: &mut nt_fs::FileSystem) {
     PROFILE_SOURCE_FILES.store(stats.files, Ordering::Relaxed);
     PROFILE_SOURCE_BYTES.store(stats.bytes, Ordering::Relaxed);
     PROFILE_SOURCE_PROBE_OK.store(
-        (fs.file_bytes(DEFAULT_USER_PROBE_FILE) == Some(b"@start %1")) as u64,
+        fs.query_attributes(DEFAULT_USER_PROBE_FILE)
+            .is_some_and(|info| info.is_directory) as u64,
         Ordering::Relaxed,
     );
     PROFILE_SOURCE_ENTRIES.store(
@@ -1165,7 +1106,7 @@ pub(crate) fn writable_path_into(
     if !WRITABLE_OVERLAY_MOUNTED {
         return None;
     }
-    nt_fs::writable_mount_relative_into(name, b"reactos", WRITABLE_PREFIXES, folded, relative)
+    nt_fs::writable_mount_relative_into(name, crate::installed_layout::ROOT, WRITABLE_PREFIXES, folded, relative)
 }
 
 /// Classify an NT object name into the local fixed C: volume without allocating. Unlike
@@ -1179,7 +1120,7 @@ pub(crate) fn volume_path_into(
     if !WRITABLE_OVERLAY_MOUNTED {
         return None;
     }
-    nt_fs::nt_path_to_volume_relative_into(name, b"reactos", folded, relative)
+    nt_fs::nt_path_to_volume_relative_into(name, crate::installed_layout::ROOT, folded, relative)
 }
 
 /// `NtCreateFile` / `NtOpenFile` against the writable volume. Returns
@@ -2370,7 +2311,10 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
     PROFILE_SOURCE_FILES.store(stats.files, Ordering::Relaxed);
     PROFILE_SOURCE_BYTES.store(stats.bytes, Ordering::Relaxed);
     // Read a REAL staged file back off the live volume, by content.
-    if fs.file_bytes(DEFAULT_USER_PROBE_FILE) == Some(b"@start %1") {
+    if fs
+        .query_attributes(DEFAULT_USER_PROBE_FILE)
+        .is_some_and(|info| info.is_directory)
+    {
         PROFILE_SOURCE_PROBE_OK.store(1, Ordering::Relaxed);
     }
     // ★ THE SETUP STEP THE LIVECD SKIPS (see `PROVISION_NTUSER_DAT`): give the `Default User`

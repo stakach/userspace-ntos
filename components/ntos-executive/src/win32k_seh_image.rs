@@ -14,7 +14,7 @@ pub(crate) const IMAGE_VA: u64 = crate::win32k_subsystem::WIN32K_CODE_VA
     + crate::win32k_subsystem::WIN32K_IMAGE_FRAMES * 0x1000;
 pub(crate) const MAX_FRAMES: usize = 16;
 const RX: u64 = 2;
-const SUPPORT_PATH: &[u8] = b"reactos\\system32\\nt-seh-linkage.dll";
+const SUPPORT_PATH: &[u8] = crate::installed_layout::SEH_LINKAGE;
 
 struct Published {
     pml4: u64,

@@ -13,6 +13,7 @@ extern crate alloc;
 
 mod byte_lock;
 mod boot_paths;
+mod bounded_read;
 mod directory;
 mod fat_directory;
 mod fat_directory_walk;
@@ -40,6 +41,7 @@ mod volume;
 
 pub use byte_lock::*;
 pub use boot_paths::*;
+pub use bounded_read::published_file_size;
 pub use directory::*;
 pub use fat_directory::*;
 pub use fat_directory_walk::*;

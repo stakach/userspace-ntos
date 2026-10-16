@@ -8427,10 +8427,10 @@ pub(crate) unsafe fn service_sec_image(
     // bootstrap consumers. Ordinary File opens do not populate this store: canonical SEC_IMAGE
     // admission captures the opened File, and image residency reads that retained source.
     const DLL_PINS: [(&[u8], &[u8]); DLL_PIN_COUNT] = [
-        (b"csrsrv", b"reactos\\system32\\csrsrv.dll"),
-        (b"kernel32_vista", b"reactos\\system32\\kernel32_vista.dll"),
-        (b"advapi32_vista", b"reactos\\system32\\advapi32_vista.dll"),
-        (b"ntdll_vista", b"reactos\\system32\\ntdll_vista.dll"),
+        (b"csrsrv", crate::installed_layout::CSRSRV),
+        (b"kernel32_vista", crate::installed_layout::KERNEL32_VISTA),
+        (b"advapi32_vista", crate::installed_layout::ADVAPI32_VISTA),
+        (b"ntdll_vista", crate::installed_layout::NTDLL_VISTA),
     ];
     // Bootstrap parsed-PE storage lives for the whole service loop.
     let dll_pe_store = reset_service_dll_pe_store_work();

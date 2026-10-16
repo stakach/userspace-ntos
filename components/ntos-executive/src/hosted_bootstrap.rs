@@ -58,7 +58,7 @@ impl HostedBootstrapManifestEntry {
 }
 
 const SMSS_BOOTSTRAP_MANIFEST: HostedBootstrapManifestEntry = HostedBootstrapManifestEntry {
-    disk_path: b"reactos\\system32\\smss.exe",
+    disk_path: crate::installed_layout::SMSS,
     stem: b"smss.exe",
     top_badge: nt_exe_image::SMSS_TOP_BADGE,
     leaf: b"smss.exe",
@@ -71,7 +71,7 @@ const SMSS_BOOTSTRAP_MANIFEST: HostedBootstrapManifestEntry = HostedBootstrapMan
 
 const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
     HostedBootstrapManifestEntry {
-        disk_path: b"reactos\\system32\\csrss.exe",
+        disk_path: crate::installed_layout::CSRSS,
         stem: b"csrss.exe",
         top_badge: nt_exe_image::CSRSS_TOP_BADGE,
         leaf: b"csrss.exe",
@@ -82,7 +82,7 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         probe_fragment: b"csrss",
     },
     HostedBootstrapManifestEntry {
-        disk_path: b"reactos\\system32\\winlogon.exe",
+        disk_path: crate::installed_layout::WINLOGON,
         stem: b"winlogon.exe",
         top_badge: nt_exe_image::WINLOGON_TOP_BADGE,
         leaf: b"winlogon.exe",
@@ -93,7 +93,7 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         probe_fragment: b"winlogon",
     },
     HostedBootstrapManifestEntry {
-        disk_path: b"reactos\\system32\\services.exe",
+        disk_path: crate::installed_layout::SERVICES,
         stem: b"services.exe",
         top_badge: nt_exe_image::SERVICES_TOP_BADGE,
         leaf: b"services.exe",
@@ -104,7 +104,7 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         probe_fragment: b"services",
     },
     HostedBootstrapManifestEntry {
-        disk_path: b"reactos\\system32\\lsass.exe",
+        disk_path: crate::installed_layout::LSASS,
         stem: b"lsass.exe",
         top_badge: nt_exe_image::LSASS_TOP_BADGE,
         leaf: b"lsass.exe",
@@ -115,7 +115,7 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         probe_fragment: b"lsass",
     },
     HostedBootstrapManifestEntry {
-        disk_path: br"reactos\system32\userinit.exe",
+        disk_path: crate::installed_layout::USERINIT,
         stem: b"userinit.exe",
         top_badge: nt_exe_image::USERINIT_TOP_BADGE,
         leaf: b"userinit.exe",
@@ -126,7 +126,7 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         probe_fragment: b"userinit",
     },
     HostedBootstrapManifestEntry {
-        disk_path: br"reactos\explorer.exe",
+        disk_path: crate::installed_layout::EXPLORER,
         stem: b"explorer.exe",
         top_badge: nt_exe_image::EXPLORER_TOP_BADGE,
         leaf: b"explorer.exe",

@@ -503,13 +503,13 @@ unsafe fn system32_cache_candidate_count(fs: &Fat32, system32_cluster: u32) -> u
 }
 
 unsafe fn system32_cache_build(fs: &Fat32) -> bool {
-    let Some(reactos) = fat_find_open_metadata(fs, fs.root_cl, b"reactos") else {
+    let Some(installed_root) = fat_find_open_metadata(fs, fs.root_cl, crate::installed_layout::ROOT) else {
         return false;
     };
-    if !reactos.metadata.is_directory {
+    if !installed_root.metadata.is_directory {
         return false;
     }
-    let Some(system32) = fat_find_open_metadata(fs, reactos.first_cluster, b"system32") else {
+    let Some(system32) = fat_find_open_metadata(fs, installed_root.first_cluster, b"system32") else {
         return false;
     };
     if !system32.metadata.is_directory {
@@ -595,8 +595,8 @@ unsafe fn system32_cache_lookup_metadata(fs: &Fat32, leaf: &[u8]) -> Option<FatO
 }
 
 fn system32_leaf_from_volume_path(path: &[u8]) -> Option<&[u8]> {
-    const PREFIX: &[u8] = b"reactos\\system32\\";
-    const ALT_PREFIX: &[u8] = b"reactos/system32/";
+    const PREFIX: &[u8] = crate::installed_layout::SYSTEM32_PREFIX;
+    const ALT_PREFIX: &[u8] = crate::installed_layout::SYSTEM32_SLASH_PREFIX;
     let leaf = if path.len() > PREFIX.len() && path[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
         &path[PREFIX.len()..]
     } else if path.len() > ALT_PREFIX.len()
@@ -981,7 +981,7 @@ unsafe fn open_sys32_path(fs: &Fat32, leaf: &[u8], use_system32_cache: bool) -> 
     }
     let mut path = [0u8; 160];
     let mut n = 0usize;
-    for &c in b"reactos\\system32\\" {
+    for &c in crate::installed_layout::SYSTEM32_PREFIX {
         path[n] = c;
         n += 1;
     }
@@ -1035,7 +1035,7 @@ pub(crate) unsafe fn query_nt_path_metadata_into(
     folded: &mut [u8],
     relative: &mut [u8],
 ) -> Option<nt_fs::FileMetadata> {
-    let len = nt_fs::nt_path_to_volume_relative_into(name, b"reactos", folded, relative)?;
+    let len = nt_fs::nt_path_to_volume_relative_into(name, crate::installed_layout::ROOT, folded, relative)?;
     let fs = exec_fs()?;
     fat_open_path_metadata(&fs, &relative[..len]).map(|entry| entry.metadata)
 }

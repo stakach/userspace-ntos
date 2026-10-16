@@ -34,7 +34,7 @@ const E1000_EXPORT_NAME: &str = r"\Device\E1000_0000";
 const E1000_INTERFACE_NAME: &str = "E1000_0000";
 const E1000_DRIVER_DESC: &str = "ReactOS Intel PRO/1000 Adapter";
 const DC21X4_DRIVER_DESC: &str = "Intel 21143-based PCI Ethernet Adapter";
-const BOCHS_INF_RELATIVE_PATH: &str = "rust-micro/.tmp/reactos/reactos/inf/bochsmp.inf";
+const BOCHS_INF_RELATIVE_PATH: &str = "rust-micro/.tmp/libernt/bochsmp.inf";
 #[cfg(test)]
 const BOCHS_INSTANCE_ID: &str = r"PCI\VEN_1234&DEV_1111\3&11583659&0&08";
 const BOCHS_DRIVER_KEY_INDEX: &str = "0000";
@@ -1286,7 +1286,7 @@ fn build_hive_with_configuration(
     seed_generated_network_setup(&mut hive, &network_adapters);
 
     let bochs = bochs_display_install_from_staged_inf()
-        .expect("staged ReactOS bochsmp.inf must describe the display miniport");
+        .expect("pinned LiberNT bochsmp.inf must describe the display miniport");
     install_display_miniport(&mut hive, &bochs, display_mode.validate());
 
     hive
