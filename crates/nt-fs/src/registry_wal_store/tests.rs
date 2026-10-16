@@ -2,9 +2,87 @@ use super::*;
 use crate::snapshot_test_device::CachedDisk;
 use crate::{BoundedBlockRange, OwnedBoundedBlockRange, SnapshotBlockStore, SnapshotReserve, WalSnapshotAnchor};
 extern crate std;
+use alloc::rc::Rc;
+use core::cell::Cell;
 
 fn disk() -> CachedDisk {
     CachedDisk::with_sectors(32)
+}
+
+struct BatchedZeroDisk {
+    inner: CachedDisk,
+    singles: Rc<Cell<usize>>,
+    batches: Rc<Cell<usize>>,
+}
+
+impl SnapshotBlockDevice for BatchedZeroDisk {
+    fn sector_size(&self) -> usize { self.inner.sector_size() }
+    fn sector_count(&self) -> u64 { self.inner.sector_count() }
+    fn read_sector(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError> {
+        self.singles.set(self.singles.get() + 1);
+        self.inner.read_sector(lba, out)
+    }
+    fn read_sectors(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError> {
+        self.batches.set(self.batches.get() + 1);
+        self.inner.read_sectors(lba, out)
+    }
+    fn write_sector(&mut self, lba: u64, data: &[u8]) -> Result<(), SnapshotBlockStoreError> {
+        self.inner.write_sector(lba, data)
+    }
+    fn flush(&mut self) -> Result<(), SnapshotBlockStoreError> { self.inner.flush() }
+}
+
+#[test]
+fn empty_tail_recovery_uses_bounded_range_reads_and_checks_the_last_sector() {
+    let singles = Rc::new(Cell::new(0));
+    let batches = Rc::new(Cell::new(0));
+    let make_disk = |inner| BatchedZeroDisk {
+        inner,
+        singles: singles.clone(),
+        batches: batches.clone(),
+    };
+    let wal = RegistryWal::recover(make_disk(CachedDisk::with_sectors(65)), 77).unwrap();
+    assert_eq!(wal.settled_anchor().unwrap().serial, 0);
+    assert!(batches.get() > 0, "the zero suffix must use range reads");
+    assert!(singles.get() < 65, "the zero suffix must not issue a command per sector");
+
+    let mut corrupt = CachedDisk::with_sectors(65);
+    corrupt.cache[64 * 512 + 511] = 1;
+    assert!(matches!(RegistryWal::recover(make_disk(corrupt), 77), Err(RegistryWalError::Corrupt)));
+
+    let mut failed = CachedDisk::with_sectors(65);
+    failed.fail_read = Some(64);
+    assert!(matches!(RegistryWal::recover(make_disk(failed), 77),
+        Err(RegistryWalError::Storage(SnapshotBlockStoreError::Io))));
+}
+
+#[test]
+fn settled_wal_anchor_is_exact_and_unavailable_during_an_effect() {
+    let mut wal = RegistryWal::recover(self::disk(), 77).unwrap();
+    assert_eq!(wal.settled_anchor(), Some(WalSnapshotAnchor {
+        incarnation: 77, serial: 0, end_lba: 0,
+    }));
+    wal.begin(alloc::vec![0x51; 512]).unwrap();
+    assert_eq!(wal.settled_anchor(), None);
+    wal.prepare().unwrap();
+    assert_eq!(wal.settled_anchor(), None);
+    wal.commit().unwrap();
+    assert_eq!(wal.settled_anchor(), Some(WalSnapshotAnchor {
+        incarnation: 77, serial: 1, end_lba: 3,
+    }));
+}
+
+#[test]
+fn unstarted_wal_record_can_be_cancelled_without_reusing_an_effect() {
+    let mut wal = RegistryWal::recover(self::disk(), 77).unwrap();
+    wal.begin(alloc::vec![0x51; 512]).unwrap();
+    wal.cancel_pending().unwrap();
+    assert_eq!(wal.state(), RegistryWalState::Ready);
+    assert!(wal.records().is_empty());
+    assert_eq!(wal.settled_anchor(), Some(WalSnapshotAnchor {
+        incarnation: 77, serial: 0, end_lba: 0,
+    }));
+    assert!(wal.into_device().is_ok());
 }
 
 #[test]
@@ -448,6 +526,54 @@ fn verified_wal_device_advances_anchor_using_the_same_physical_lease() {
 }
 
 #[test]
+fn boot_anchor_repair_restores_torn_same_anchor_companion_before_advancing_suffix() {
+    use crate::{WalSnapshotAnchorUpdate, WalSnapshotManifest};
+
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::with_sectors(32);
+    let baseline = WalSnapshotManifest {
+        incarnation: 77,
+        base_serial: 0,
+        high_water_serial: 0,
+        high_water_end_lba: 0,
+    };
+    store.commit_next_with_wal_manifest(&mut disk, b"older", baseline).unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, b"newer", baseline).unwrap();
+    let owned = OwnedBoundedBlockRange::new(disk, 16, 16).ok().unwrap();
+    let mut wal = RegistryWal::recover(owned, 77).unwrap();
+    wal.begin(alloc::vec![7; 512]).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    let verified = wal.into_verified_device().unwrap().into_full_device();
+    let mut first = WalSnapshotAnchorUpdate::admit_verified_wal(store, verified).ok().unwrap();
+    first.advance().unwrap();
+    let disk = first.into_device().unwrap();
+    // A later interrupted snapshot write tears the older payload. The selected newer
+    // snapshot and its acknowledged WAL anchor remain valid after the power cut.
+    let owned = OwnedBoundedBlockRange::new(disk, 16, 16).ok().unwrap();
+    let mut wal = RegistryWal::recover(owned, 77).unwrap();
+    wal.device_mut_for_test().parent_device_mut().corrupt(1);
+    let mut verified = wal.into_verified_device().unwrap().into_full_device();
+    let restored = store.read_latest_wal(verified.device_mut()).unwrap().unwrap();
+    assert_eq!(restored.snapshot.payload, b"newer");
+    assert_eq!(restored.anchor.serial, 1);
+
+    let mut update = match WalSnapshotAnchorUpdate::admit_verified_wal(store, verified) {
+        Ok(update) => update,
+        Err((error, verified)) => {
+            core::mem::forget(verified);
+            panic!("same-anchor torn companion must be repairable before boot publication: {error:?}");
+        }
+    };
+    update.advance().unwrap();
+    let mut disk = update.into_device().unwrap();
+    let restored = store.read_latest_wal(&mut disk).unwrap().unwrap();
+    assert_eq!(restored.snapshot.payload, b"newer");
+    assert_eq!(restored.anchor.serial, 1);
+    assert_eq!(store.current_wal_checkpoint_manifest(&mut disk).unwrap().high_water_serial, 1);
+}
+
+#[test]
 fn rejected_anchor_admission_returns_verified_owner_with_lease_held() {
     use crate::{WalSnapshotAnchorUpdate, WalSnapshotManifest};
 
@@ -514,4 +640,118 @@ fn uncertain_anchor_write_keeps_the_original_wal_reserve_lease() {
     assert!(reserve.try_acquire().is_none());
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(retained))).is_err());
     assert!(reserve.try_acquire().is_none());
+}
+
+#[test]
+fn anchored_continuation_resumes_without_scanning_zero_wal_suffix() {
+    use crate::{WalSnapshotAnchorUpdate, WalSnapshotManifest};
+
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::with_sectors(32);
+    let baseline = WalSnapshotManifest {
+        incarnation: 77, base_serial: 0,
+        high_water_serial: 0, high_water_end_lba: 0,
+    };
+    store.commit_next_with_wal_manifest(&mut disk, b"older", baseline).unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, b"newer", baseline).unwrap();
+    let range = OwnedBoundedBlockRange::new(disk, 16, 16).ok().unwrap();
+    let mut wal = RegistryWal::recover(range, 77).unwrap();
+    wal.begin(alloc::vec![7; 512]).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    let verified = wal.into_verified_device().unwrap().into_full_device();
+    let mut update = WalSnapshotAnchorUpdate::admit_verified_wal(store, verified).ok().unwrap();
+    update.advance().unwrap();
+    let (mut disk, continuation) = update.into_continuation().ok().unwrap();
+    let anchored = continuation.anchor();
+    assert_eq!(anchored, WalSnapshotAnchor { incarnation: 77, serial: 1, end_lba: 3 });
+    // Full reboot recovery must read this sector to prove an all-zero suffix. In-process
+    // continuation already has that proof and must not read the tail again.
+    disk.fail_read = Some(16 + anchored.end_lba);
+    let range = OwnedBoundedBlockRange::new(disk, 16, 16).ok().unwrap();
+    let mut wal = unsafe { RegistryWal::resume_from_continuation(range, continuation, anchored) }
+        .ok().unwrap();
+    wal.begin(alloc::vec![8; 512]).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    assert_eq!(wal.settled_anchor().unwrap().serial, 2);
+    let range = wal.into_device().unwrap();
+    let mut disk = range.into_device();
+    disk.fail_read = None;
+    disk.power_cut();
+    let range = OwnedBoundedBlockRange::new(disk, 16, 16).ok().unwrap();
+    let recovered = RegistryWal::recover(range, 77).unwrap();
+    assert_eq!(recovered.records().len(), 2);
+}
+
+#[test]
+fn continuation_refuses_stale_anchor_without_consuming_owner_or_token() {
+    use crate::{WalSnapshotAnchorUpdate, WalSnapshotManifest};
+
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::with_sectors(32);
+    let baseline = WalSnapshotManifest {
+        incarnation: 77, base_serial: 0,
+        high_water_serial: 0, high_water_end_lba: 0,
+    };
+    store.commit_next_with_wal_manifest(&mut disk, b"older", baseline).unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, b"newer", baseline).unwrap();
+    let range = OwnedBoundedBlockRange::new(disk, 16, 16).ok().unwrap();
+    let wal = RegistryWal::recover(range, 77).unwrap();
+    let verified = wal.into_verified_device().unwrap().into_full_device();
+    let mut update = WalSnapshotAnchorUpdate::admit_verified_wal(store, verified).ok().unwrap();
+    update.advance().unwrap();
+    let (disk, continuation) = update.into_continuation().ok().unwrap();
+    let range = OwnedBoundedBlockRange::new(disk, 16, 16).ok().unwrap();
+    let stale = WalSnapshotAnchor { incarnation: 77, serial: 1, end_lba: 3 };
+    let (error, range, continuation) = unsafe {
+        RegistryWal::resume_from_continuation(range, continuation, stale)
+    }.err().unwrap();
+    assert_eq!(error, RegistryWalError::Corrupt);
+    assert_eq!(continuation.anchor().serial, 0);
+    let wal = unsafe {
+        RegistryWal::resume_from_continuation(range, continuation,
+            WalSnapshotAnchor { incarnation: 77, serial: 0, end_lba: 0 })
+    }.ok().unwrap();
+    assert_eq!(wal.settled_anchor().unwrap().serial, 0);
+}
+
+#[test]
+fn folded_snapshot_pair_preserves_same_epoch_continuation_for_next_append() {
+    use crate::{WalSnapshotAnchorUpdate, WalSnapshotManifest};
+
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::with_sectors(32);
+    let initial = WalSnapshotManifest {
+        incarnation: 77, base_serial: 0,
+        high_water_serial: 0, high_water_end_lba: 0,
+    };
+    store.commit_next_with_wal_manifest(&mut disk, b"old", initial).unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, b"new", initial).unwrap();
+    let range = OwnedBoundedBlockRange::new(disk, 16, 16).ok().unwrap();
+    let mut wal = RegistryWal::recover(range, 77).unwrap();
+    wal.begin(alloc::vec![7; 512]).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    let verified = wal.into_verified_device().unwrap().into_full_device();
+    let mut update = WalSnapshotAnchorUpdate::admit_verified_wal(store, verified).ok().unwrap();
+    update.advance().unwrap();
+    let (mut disk, continuation) = update.into_continuation().ok().unwrap();
+    let folded = WalSnapshotManifest {
+        incarnation: 77, base_serial: 1,
+        high_water_serial: 1, high_water_end_lba: 3,
+    };
+    store.commit_next_with_wal_manifest(&mut disk, b"folded", folded).unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, b"folded", folded).unwrap();
+    assert_eq!(store.current_wal_checkpoint_manifest(&mut disk), Ok(folded));
+    disk.fail_read = Some(19);
+    let range = OwnedBoundedBlockRange::new(disk, 16, 16).ok().unwrap();
+    let mut wal = unsafe {
+        RegistryWal::resume_from_continuation(range, continuation,
+            WalSnapshotAnchor { incarnation: 77, serial: 1, end_lba: 3 })
+    }.ok().unwrap();
+    wal.begin(alloc::vec![8; 512]).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    assert_eq!(wal.settled_anchor().unwrap().serial, 2);
 }

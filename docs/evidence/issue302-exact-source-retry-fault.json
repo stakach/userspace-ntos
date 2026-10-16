@@ -1,0 +1,9 @@
+{
+  "source": "cleaned issue302 working tree after full workspace tests and native build",
+  "boot_log": "issue302-exact-source-retry-fault.log.gz",
+  "screenshot": "issue302-exact-source-retry-fault.png",
+  "result": "Explorer parked at guest null dereference while processing icon handle 0x200ba; boot stopped by QMP before one-hour bound",
+  "explorer_fault_log_line": 73142,
+  "registry_evidence": "SYSTEM/SOFTWARE/SECURITY/SAM/DEFAULT replayed from the durable tail before interactive logon",
+  "qemu_orphan_check": "no qemu-system or run_specs process after QMP quit"
+}

@@ -50,6 +50,11 @@ impl<D: SnapshotBlockDevice> OwnedBoundedBlockRange<D> {
 
     pub fn into_device(self) -> D { self.device }
 
+    /// Physical start of this exact owned subrange in its parent device.
+    pub fn start_lba(&self) -> u64 { self.start }
+
+    pub(crate) fn parent_device_mut(&mut self) -> &mut D { &mut self.device }
+
     fn absolute(&self, lba: u64, bytes: usize) -> Result<u64, SnapshotBlockStoreError> {
         absolute(&self.device, self.start, self.sectors, lba, bytes)
     }

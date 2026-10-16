@@ -9,6 +9,22 @@ use crate::provider_local_event::trace as trace_provider_local_event;
 use nt_io_abi::major;
 use nt_io_manager::{LocalFileObject, PendingFileRoute};
 
+struct RetainedV1SystemCheckpointAck {
+    prepared: nt_config_client::PreparedSystemHiveCheckpoint,
+    image_len: usize,
+    phase: V1SystemCheckpointPhase,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum V1SystemCheckpointPhase {
+    Persisting,
+    Acknowledging,
+}
+
+// The CM preparation is installed before any image or snapshot effect. A physical uncertainty
+// fences the mount; an uncertain ACK retains the same token for exact retry.
+static mut RETAINED_V1_SYSTEM_CHECKPOINT_ACK: Option<RetainedV1SystemCheckpointAck> = None;
+
 #[path = "lpc_connection_views.rs"]
 pub(crate) mod lpc_connection_views;
 
@@ -4360,7 +4376,11 @@ impl ExecNtHandler {
             return Ok(outcome);
         }
         let generation =
-            self.persist_and_publish_system_mutations(expected_generation, &mutations)?;
+            self.persist_and_publish_system_mutations(
+                crate::boot_registry_mutation_work::BootRegistryStage::TimeZone,
+                expected_generation,
+                &mutations,
+            )?;
         print_str(b"[timezone-setup] ReactOS timezone index=");
         print_u64(selected_index as u64);
         print_str(b" selected from ");
@@ -4373,6 +4393,7 @@ impl ExecNtHandler {
 
     fn persist_and_publish_system_mutations(
         &mut self,
+        stage: crate::boot_registry_mutation_work::BootRegistryStage,
         expected_generation: u64,
         mutations: &[OwnedSystemHiveMutation],
     ) -> Result<u64, u32> {
@@ -4381,7 +4402,11 @@ impl ExecNtHandler {
             .map(OwnedSystemHiveMutation::as_client_mutation)
             .collect();
         let outcome = unsafe {
-            crate::persist_and_publish_system_hive_mutation(expected_generation, &client_mutations)
+            crate::boot_registry_mutation_work::publish_setup_system_mutation(
+                stage,
+                expected_generation,
+                &client_mutations,
+            )
         }?;
         if outcome.wake_device_action {
             unsafe { self.pnp_signal_pending_action() };
@@ -4408,7 +4433,7 @@ impl ExecNtHandler {
                 print_str(b"[network-setup] CM network-adapter plan query failed status=0x");
                 print_hex(status as u32);
                 print_str(b"\n");
-                return;
+                panic!("network setup requires a CM adapter plan");
             }
         };
         let expected_generation = network_adapters.mount_generation;
@@ -4454,30 +4479,31 @@ impl ExecNtHandler {
             let (mutations, failed) = target.finish();
             (stats, mutations, failed, hostname_present)
         };
+        if failed {
+            print_str(b"[network-setup] SYSTEM mutation collection rejected a non-SYSTEM path\n");
+            panic!("network setup SYSTEM mutation collection failed");
+        }
         if mutations.is_empty() {
             if hostname_present {
                 print_str(b"[network-setup] ReactOS network setup already present\n");
             } else {
                 print_str(b"[network-setup] ReactOS network setup not provisioned\n");
             }
-            if failed {
-                print_str(b"[network-setup] SYSTEM mutation collection unavailable\n");
-            }
-            return;
-        }
-        if failed {
-            print_str(b"[network-setup] SYSTEM mutation collection rejected a non-SYSTEM path\n");
             return;
         }
         let generation = match self
-            .persist_and_publish_system_mutations(expected_generation, &mutations)
+            .persist_and_publish_system_mutations(
+                crate::boot_registry_mutation_work::BootRegistryStage::Network,
+                expected_generation,
+                &mutations,
+            )
         {
             Ok(generation) => generation,
             Err(status) => {
                 print_str(b"[network-setup] CM-owned SYSTEM commit failed status=0x");
                 print_hex(status);
                 print_str(b"\n");
-                return;
+                panic!("network setup CM mutation did not reach exact ACK");
             }
         };
         print_str(b"[network-setup] HKLM\\SYSTEM committed through CM generation ");
@@ -4552,30 +4578,31 @@ impl ExecNtHandler {
             let (mutations, failed) = target.finish();
             (stats, mutations, failed, driver_present)
         };
+        if failed {
+            print_str(b"[print-setup] SYSTEM mutation collection rejected a non-SYSTEM path\n");
+            panic!("print setup SYSTEM mutation collection failed");
+        }
         if mutations.is_empty() {
             if driver_present {
                 print_str(b"[print-setup] ReactOS print setup already present\n");
             } else {
                 print_str(b"[print-setup] ReactOS print setup not provisioned\n");
             }
-            if failed {
-                print_str(b"[print-setup] SYSTEM mutation collection unavailable\n");
-            }
-            return;
-        }
-        if failed {
-            print_str(b"[print-setup] SYSTEM mutation collection rejected a non-SYSTEM path\n");
             return;
         }
         let generation = match self
-            .persist_and_publish_system_mutations(expected_generation, &mutations)
+            .persist_and_publish_system_mutations(
+                crate::boot_registry_mutation_work::BootRegistryStage::Print,
+                expected_generation,
+                &mutations,
+            )
         {
             Ok(generation) => generation,
             Err(status) => {
                 print_str(b"[print-setup] CM-owned SYSTEM commit failed status=0x");
                 print_hex(status);
                 print_str(b"\n");
-                return;
+                panic!("print setup CM mutation did not reach exact ACK");
             }
         };
         print_str(b"[print-setup] HKLM\\SYSTEM committed through CM generation ");
@@ -4760,27 +4787,18 @@ impl ExecNtHandler {
                 print_str(b"[locale-setup] installed NLS language query failed status=0x");
                 print_hex(status);
                 print_str(b"\n");
-                return;
+                panic!("locale setup requires installed NLS language");
             }
         };
         locale_id_ascii8(locale_id, &mut locale_ascii);
         let system_ascii = &locale_ascii[4..8];
-        if let (Some(locale_id), Some(langid)) =
-            (parse_hex_u32(&locale_ascii), parse_hex_u32(system_ascii))
-        {
-            NT_SYSTEM_DEFAULT_LOCALE.store(locale_id, Ordering::Relaxed);
-            NT_SESSION_DEFAULT_LOCALE.store(locale_id, Ordering::Relaxed);
-            NT_INSTALL_UI_LANGUAGE.store(langid & 0xffff, Ordering::Relaxed);
-            NT_DEFAULT_UI_LANGUAGE.store(langid & 0xffff, Ordering::Relaxed);
-            NT_PENDING_UI_LANGUAGE.store(0, Ordering::Relaxed);
-        }
         let mut user_locale = [0u8; 18];
         let Some(user_locale_len) = utf16le_ascii_z(&locale_ascii, &mut user_locale) else {
-            return;
+            panic!("locale setup user locale encoding failed");
         };
         let mut system_locale = [0u8; 10];
         let Some(system_locale_len) = utf16le_ascii_z(system_ascii, &mut system_locale) else {
-            return;
+            panic!("locale setup SYSTEM locale encoding failed");
         };
         // The target key must ALREADY exist in the prototype hive (hivedef.inf creates it empty);
         // creating it ourselves would be inventing structure rather than performing setup's step.
@@ -4790,22 +4808,9 @@ impl ExecNtHandler {
             .is_none()
         {
             print_str(b"[locale-setup] .Default\\Control Panel\\International absent -> skipped\n");
-            return;
+            panic!("locale setup requires the .Default international key");
         }
         trace_setup_provision_phase(b"locale-user-key-end", 1);
-        trace_setup_provision_phase(b"locale-user-value-begin", user_locale_len as u64);
-        let Some(user_locale_changed) = self.ensure_mutable_registry_value_by_path(
-            USER_INTERNATIONAL,
-            "Locale",
-            REG_SZ,
-            &user_locale[..user_locale_len],
-        ) else {
-            print_str(
-                b"[locale-setup] .Default\\Control Panel\\International mutable write failed\n",
-            );
-            return;
-        };
-        trace_setup_provision_phase(b"locale-user-value-end", user_locale_changed as u64);
         trace_setup_provision_phase(b"locale-system-key-begin", 0);
         let mut target = CollectSystemSetupSeedTarget::new(expected_generation);
         if !target.has_key(SYSTEM_NLS_LANGUAGE_PATH) {
@@ -4815,7 +4820,7 @@ impl ExecNtHandler {
             } else {
                 print_str(b"[locale-setup] HKLM\\...\\Nls\\Language absent -> no system locale\n");
             }
-            return;
+            panic!("locale setup requires the SYSTEM NLS language key");
         }
         trace_setup_provision_phase(b"locale-system-key-end", 1);
         trace_setup_provision_phase(b"locale-system-default-begin", system_locale_len as u64);
@@ -4838,13 +4843,17 @@ impl ExecNtHandler {
         let (mutations, failed) = target.finish();
         if failed {
             print_str(b"[locale-setup] SYSTEM mutation collection unavailable\n");
-            return;
+            panic!("locale setup SYSTEM mutation collection failed");
         }
         let system_generation = if mutations.is_empty() {
             None
         } else {
             match self
-                .persist_and_publish_system_mutations(expected_generation, &mutations)
+                .persist_and_publish_system_mutations(
+                    crate::boot_registry_mutation_work::BootRegistryStage::Locale,
+                    expected_generation,
+                    &mutations,
+                )
             {
                 Ok(generation) => {
                     Some(generation)
@@ -4853,7 +4862,7 @@ impl ExecNtHandler {
                     print_str(b"[locale-setup] CM-owned SYSTEM commit failed status=0x");
                     print_hex(status);
                     print_str(b"\n");
-                    return;
+                    panic!("locale setup CM mutation did not reach exact ACK");
                 }
             }
         };
@@ -4861,6 +4870,28 @@ impl ExecNtHandler {
             b"locale-install-language-end",
             install_language_changed as u64,
         );
+        trace_setup_provision_phase(b"locale-user-value-begin", user_locale_len as u64);
+        let Some(user_locale_changed) = self.ensure_mutable_registry_value_by_path(
+            USER_INTERNATIONAL,
+            "Locale",
+            REG_SZ,
+            &user_locale[..user_locale_len],
+        ) else {
+            print_str(
+                b"[locale-setup] .Default\\Control Panel\\International mutable write failed\n",
+            );
+            panic!("locale setup .Default publication failed after SYSTEM outcome");
+        };
+        trace_setup_provision_phase(b"locale-user-value-end", user_locale_changed as u64);
+        let locale_id = parse_hex_u32(&locale_ascii)
+            .expect("generated locale id must remain hexadecimal");
+        let langid = parse_hex_u32(system_ascii)
+            .expect("generated language id must remain hexadecimal");
+        NT_SYSTEM_DEFAULT_LOCALE.store(locale_id, Ordering::Relaxed);
+        NT_SESSION_DEFAULT_LOCALE.store(locale_id, Ordering::Relaxed);
+        NT_INSTALL_UI_LANGUAGE.store(langid & 0xffff, Ordering::Relaxed);
+        NT_DEFAULT_UI_LANGUAGE.store(langid & 0xffff, Ordering::Relaxed);
+        NT_PENDING_UI_LANGUAGE.store(0, Ordering::Relaxed);
         DEFAULT_USER_LOCALE_BYTES.store(user_locale_len as u64, Ordering::Relaxed);
         DEFAULT_USER_LOCALE_TYPE.store(REG_SZ as u64, Ordering::Relaxed);
         if user_locale_changed || system_default_changed || install_language_changed {
@@ -5925,8 +5956,67 @@ impl ExecNtHandler {
         Ok(mounted)
     }
 
+    fn retry_retained_system_hive_checkpoint_ack(&mut self) -> Option<u32> {
+        let retained = unsafe { (&*core::ptr::addr_of!(RETAINED_V1_SYSTEM_CHECKPOINT_ACK)).as_ref() }?;
+        if retained.phase != V1SystemCheckpointPhase::Acknowledging {
+            return Some(nt_fs::STATUS_DEVICE_NOT_READY);
+        }
+        if let Err(status) = unsafe {
+            crate::config_manager_acknowledge_system_hive_checkpoint(&retained.prepared)
+        } {
+            REG_FLUSH_KEY_BOOT_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            print_str(b"[cm-flush] retained CM-owned SYSTEM checkpoint ACK pending status=0x");
+            print_hex(status as u32);
+            print_str(b"\n");
+            return Some(status as u32);
+        }
+        let retained = unsafe { (&mut *core::ptr::addr_of_mut!(RETAINED_V1_SYSTEM_CHECKPOINT_ACK)).take() }
+            .expect("confirmed retained SYSTEM checkpoint ACK");
+        self.writable_fs_dirty = true;
+        self.writable_fs_commit_required = true;
+        REG_FLUSH_KEY_BOOT_HIVE_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
+        REG_FLUSH_KEY_BOOT_HIVE_BYTES.store(retained.image_len as u64, Ordering::Relaxed);
+        print_str(b"[cm-flush] CM-owned SYSTEM checkpoint ");
+        print_u64(retained.image_len as u64);
+        print_str(b"B generation=");
+        print_u64(retained.prepared.mount_generation);
+        print_str(b" sequence=");
+        print_u64(retained.prepared.hive_sequence);
+        print_str(b" path=");
+        print_ascii_str(crate::writable_fs::CONFIG_SYSTEM_HIVE_PATH);
+        print_str(b"\n");
+        Some(nt_fs::STATUS_SUCCESS)
+    }
+
+    fn retain_system_hive_checkpoint_for_persistence(
+        prepared: nt_config_client::PreparedSystemHiveCheckpoint,
+        image_len: usize,
+    ) {
+        let pending = unsafe { &mut *core::ptr::addr_of_mut!(RETAINED_V1_SYSTEM_CHECKPOINT_ACK) };
+        assert!(pending.is_none(), "retained SYSTEM checkpoint ACK cannot be replaced");
+        *pending = Some(RetainedV1SystemCheckpointAck {
+            prepared,
+            image_len,
+            phase: V1SystemCheckpointPhase::Persisting,
+        });
+    }
+
     fn checkpoint_system_hive_from_config_manager(&mut self) -> u32 {
-        let mut prepared = match unsafe { crate::config_manager_prepare_system_hive_checkpoint() } {
+        if let Some(status) = self.retry_retained_system_hive_checkpoint_ack() {
+            return status;
+        }
+        if let Err(status) = unsafe { crate::writable_fs::ensure_mounted() } {
+            return status;
+        }
+        if !crate::writable_fs::legacy_snapshot_writes_allowed() {
+            // A v2 mutation is acknowledged only after its WAL marker and both snapshot
+            // anchors are durable. Prove that exact prefix under the reserve lease; a full
+            // image fold belongs to background checkpointing and bounded WAL reclamation.
+            return unsafe { crate::writable_fs::verify_durable_system_wal() }
+                .err()
+                .unwrap_or(nt_fs::STATUS_SUCCESS);
+        }
+        let prepared = match unsafe { crate::config_manager_prepare_system_hive_checkpoint() } {
             Ok(Some(prepared)) => prepared,
             Ok(None) => return nt_fs::STATUS_SUCCESS,
             Err(status) => {
@@ -5935,7 +6025,10 @@ impl ExecNtHandler {
             }
         };
         let image_len = prepared.image.len();
-        let image = core::mem::take(&mut prepared.image);
+        Self::retain_system_hive_checkpoint_for_persistence(prepared, image_len);
+        let retained = unsafe { (&mut *core::ptr::addr_of_mut!(RETAINED_V1_SYSTEM_CHECKPOINT_ACK)).as_mut() }
+            .expect("installed SYSTEM checkpoint persistence owner");
+        let image = core::mem::take(&mut retained.prepared.image);
         let mut provider = crate::writable_fs::WritableHiveIoProvider::new(
             crate::writable_fs::CONFIG_SYSTEM_HIVE_PATH,
         );
@@ -5945,38 +6038,16 @@ impl ExecNtHandler {
                 .and_then(|()| nt_hive_core::HiveIoProvider::truncate_log(&mut provider))
                 .and_then(|()| nt_hive_core::HiveIoProvider::flush_log(&mut provider));
         if let Err(err) = persist {
-            unsafe { crate::config_manager_abort_system_hive_checkpoint(&prepared) };
+            crate::writable_fs::block_uncertain_system_checkpoint();
             REG_FLUSH_KEY_BOOT_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
             print_str(b"[cm-flush] CM-owned SYSTEM checkpoint persistence failed path=");
             print_ascii_str(crate::writable_fs::CONFIG_SYSTEM_HIVE_PATH);
             print_str(b"\n");
             return Self::mutable_hive_journal_status(err);
         }
-        if let Err(status) =
-            unsafe { crate::config_manager_acknowledge_system_hive_checkpoint(&prepared) }
-        {
-            unsafe { crate::config_manager_abort_system_hive_checkpoint(&prepared) };
-            REG_FLUSH_KEY_BOOT_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
-            print_str(b"[cm-flush] CM-owned SYSTEM checkpoint acknowledgement failed status=0x");
-            print_hex(status as u32);
-            print_str(b"\n");
-            return status as u32;
-        }
-
-        self.writable_fs_dirty = true;
-        self.writable_fs_commit_required = true;
-        REG_FLUSH_KEY_BOOT_HIVE_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
-        REG_FLUSH_KEY_BOOT_HIVE_BYTES.store(image_len as u64, Ordering::Relaxed);
-        print_str(b"[cm-flush] CM-owned SYSTEM checkpoint ");
-        print_u64(image_len as u64);
-        print_str(b"B generation=");
-        print_u64(prepared.mount_generation);
-        print_str(b" sequence=");
-        print_u64(prepared.hive_sequence);
-        print_str(b" path=");
-        print_ascii_str(crate::writable_fs::CONFIG_SYSTEM_HIVE_PATH);
-        print_str(b"\n");
-        nt_fs::STATUS_SUCCESS
+        retained.phase = V1SystemCheckpointPhase::Acknowledging;
+        self.retry_retained_system_hive_checkpoint_ack()
+            .expect("installed SYSTEM checkpoint ACK owner")
     }
 
     fn checkpoint_non_system_boot_mutable_hive(
@@ -5995,6 +6066,11 @@ impl ExecNtHandler {
         }
         if dirty_cells == 0 {
             return nt_fs::STATUS_SUCCESS;
+        }
+        if !crate::writable_fs::legacy_snapshot_writes_allowed() {
+            if let Err(status) = unsafe { crate::writable_fs::fold_system_wal_if_dirty() } {
+                return status;
+            }
         }
         let Some(file_path) = Self::boot_mutable_hive_checkpoint_path(hive_sel) else {
             return STATUS_INVALID_HANDLE;
@@ -6246,6 +6322,11 @@ impl ExecNtHandler {
         if system_status != nt_fs::STATUS_SUCCESS {
             return system_status;
         }
+        if !crate::writable_fs::legacy_snapshot_writes_allowed() {
+            if let Err(status) = unsafe { crate::writable_fs::fold_system_wal_if_dirty() } {
+                return status;
+            }
+        }
         let mut total_dirty = 0usize;
         for hive_sel in [
             HIVE_SEL_SOFTWARE,
@@ -6401,6 +6482,22 @@ impl ExecNtHandler {
         total_dirty
     }
 
+    /// Shutdown includes NtLoadKey mounts as well as the fixed boot hives. Stop at the first
+    /// refused checkpoint so its mount, source path, and dirty state remain available for retry.
+    pub(crate) fn checkpoint_dirty_dynamic_mutable_hives(&mut self) -> u32 {
+        for hive_sel in HIVE_SEL_DYNAMIC {
+            let dirty = self
+                .mutable_hives
+                .hive(hive_sel)
+                .map_or(0, |hive| hive.dirty_count());
+            let status = self.checkpoint_dynamic_mutable_hive(hive_sel, dirty);
+            if status != nt_fs::STATUS_SUCCESS {
+                return status;
+            }
+        }
+        nt_fs::STATUS_SUCCESS
+    }
+
     fn checkpoint_dynamic_mutable_hive(&mut self, hive_sel: u32, dirty_cells: usize) -> u32 {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         if self.mutable_hives.hive(hive_sel)
@@ -6410,6 +6507,11 @@ impl ExecNtHandler {
         }
         if dirty_cells == 0 {
             return nt_fs::STATUS_SUCCESS;
+        }
+        if !crate::writable_fs::legacy_snapshot_writes_allowed() {
+            if let Err(status) = unsafe { crate::writable_fs::fold_system_wal_if_dirty() } {
+                return status;
+            }
         }
         let Some(file_path) = self
             .hive_mounts
@@ -6993,6 +7095,32 @@ impl ExecNtHandler {
             NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
             return STATUS_UNSUCCESSFUL;
         }
+        let hive_sel = self.hive_mounts[index].sel;
+        let dirty = hive.dirty_count();
+        let status = self.checkpoint_dynamic_mutable_hive(hive_sel, dirty);
+        if status != nt_fs::STATUS_SUCCESS {
+            self.writable_fs_dirty = true;
+            self.writable_fs_commit_required = true;
+            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return status;
+        }
+        // `try_flush` checkpoints the image and log, but an earlier failed volume snapshot can
+        // still own dirty bytes. Never release the dynamic mount or slot on that refusal.
+        let commit_result = {
+            let _transient = crate::allocator::enter_transient();
+            let _alloc_ctx = crate::allocator::enter_context(
+                crate::allocator::ALLOC_CTX_WRITABLE_SNAPSHOT,
+            );
+            crate::writable_fs::checkpoint_dirty_volume()
+        };
+        if let Err(status) = commit_result {
+            self.writable_fs_dirty = true;
+            self.writable_fs_commit_required = true;
+            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return status;
+        }
+        self.complete_committed_mutable_hive_journal_snapshot(b"NtUnloadKey");
+        self.writable_fs_commit_required = false;
         let mount = self.hive_mounts.remove(index);
         if let Some(slot) = mount.slot {
             USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);

@@ -884,6 +884,22 @@ impl Hive {
         self.clean_sequence = self.sequence;
     }
 
+    /// One durable journal record owns one sequence even when applying it creates several
+    /// intermediate cells or encounters an already-present key. Keep the in-memory clock and
+    /// cell write clocks within that record's sequence before admitting the next append.
+    pub(crate) fn align_logged_sequence(&mut self, sequence: u64) {
+        if self.sequence > sequence {
+            for cell in self.cells.iter_mut().filter_map(|cell| cell.as_mut()) {
+                let written = match cell {
+                    Cell::Key(key) => &mut key.last_write_sequence,
+                    Cell::Value(value) => &mut value.last_write_sequence,
+                };
+                *written = (*written).min(sequence);
+            }
+        }
+        self.sequence = sequence;
+    }
+
     /// Commit one externally persisted checkpoint image for this exact live state.
     ///
     /// Checkpoint transports must exclude mutation while the image is in flight. A stale sequence

@@ -1,0 +1,24 @@
+{
+  "issue": 302,
+  "profile": "production",
+  "status": "v2 SYSTEM WAL boot reached Explorer execution; shell paint gate did not complete within the bound",
+  "source_commit": "08bf94f8e58513f5489b1163e4c7966a9c890298",
+  "microkernel_commit": "0a968a45d74f3283cdd00b7526e211b97f9c17b7",
+  "boot_bound_seconds": 3600,
+  "launcher_exit": 124,
+  "evidence": {
+    "raw_log": "/tmp/issue302-efficient-resume.log",
+    "archived_log": "docs/evidence/issue302-v2-system-wal-explorer-started-timeout.log.gz"
+  },
+  "sha256": {
+    "raw_log": "cddc2660f41dcc377b27ea53894a73b036a13dfd6cc06934ff347ee96cf73a28",
+    "archived_log": "3c29b09cb2bb730bed9537c9c3def61ae495a02f32a9622cdd01e8cff7c4d04a"
+  },
+  "observations": [
+    "The sole QEMU process was stopped by the configured deadline; no QEMU or timeout wrapper remained afterward.",
+    "The final periodic census was #118 at 3614740 guest milliseconds with 504318 events and Explorer present at process identity 0x0000001b/293.",
+    "ReactOS completed its first-run PnP install queue and launched Explorer. The captured display still showed only the blue background, and no PASS exec_explorer_shell_chrome_painted marker appeared.",
+    "No terminal provider bugcheck, disk read failure, disk write failure, or registry checkpoint corruption appeared.",
+    "Successful non-SYSTEM hive journal mutations still caused whole-volume snapshots; the v2 SYSTEM WAL cutover does not yet address that path. This run is progress evidence, not desktop acceptance or a controlled speedup measurement."
+  ]
+}

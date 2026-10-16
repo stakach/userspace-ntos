@@ -1019,10 +1019,16 @@ pub(crate) unsafe fn publish_acpi_root_devnode_from_registry_policy(
             data,
         });
     }
-    let outcome = persist_and_publish_system_hive_mutation(expected_generation, &mutations)
-        .map_err(|status| nt_status::NtStatus(status as i32))?;
-    if outcome.wake_device_action {
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-    }
+    // A bootstrap receive refusal here means the early root dispatcher lost its owner or a
+    // physical component invocation is still entered. Neither condition can be repaired by
+    // retrying registry decisions. The exact CM work remains installed for owner-led diagnosis.
+    let outcome = crate::boot_registry_mutation_work::publish_boot_system_mutation(
+        crate::boot_registry_mutation_work::BootRegistryStage::AcpiRoot,
+        expected_generation,
+        &mutations,
+    )
+    .map_err(|status| nt_status::NtStatus(status as i32))?;
+    assert_eq!(outcome.generation, expected_generation + 1,
+        "ACPI root CM ACK returned the wrong generation");
     Ok(())
 }

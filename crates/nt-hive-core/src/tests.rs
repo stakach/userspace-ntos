@@ -1411,6 +1411,96 @@ fn hive_image_compacts_sparse_cell_ids_on_decode() {
 }
 
 #[test]
+fn large_sparse_hive_decode_preserves_forward_links_and_shared_blobs() {
+    const COUNT: usize = 8192;
+    const FIRST_CELL: usize = 10_000;
+    let mut hive = Hive {
+        pending_value_journal: None,
+        cells: nt_page_storage::PageSequence::new(),
+        value_blobs: Vec::new(),
+        root: CellId(64),
+        next_id: (FIRST_CELL + COUNT * 2) as u64,
+        kind: HiveKind::System,
+        generation: 7,
+        sequence: 9,
+        clean_sequence: 9,
+    };
+    hive.cells.resize_with(FIRST_CELL + COUNT * 2, || None);
+    hive.cells[64] = Some(Cell::Key(KeyCell {
+        kind: crate::KeyKind::Ordinary,
+        volatile: false,
+        id: CellId(64),
+        parent: None,
+        name: String::new(),
+        subkeys: (1..COUNT)
+            .map(|i| CellId((FIRST_CELL + i * 2) as u64))
+            .collect(),
+        values: Vec::new(),
+        class_name: None,
+        security_descriptor: None,
+        last_write_sequence: 1,
+    }));
+    for i in 0..COUNT {
+        let key_id = CellId((FIRST_CELL + i * 2) as u64);
+        let value_id = CellId(key_id.0 + 1);
+        hive.cells[key_id.0 as usize] = Some(Cell::Key(KeyCell {
+            kind: crate::KeyKind::Ordinary,
+            volatile: false,
+            id: key_id,
+            parent: Some(if i == 0 {
+                CellId((FIRST_CELL + 2) as u64)
+            } else {
+                CellId(64)
+            }),
+            name: alloc::format!("Key{i:05}"),
+            subkeys: if i == 1 {
+                alloc::vec![CellId(FIRST_CELL as u64)]
+            } else {
+                Vec::new()
+            },
+            values: alloc::vec![value_id],
+            class_name: None,
+            security_descriptor: None,
+            last_write_sequence: 2,
+        }));
+        let data = if i % 2 == 0 {
+            b"shared".to_vec()
+        } else {
+            (i as u64).to_le_bytes().to_vec()
+        };
+        hive.value_blobs.push(Rc::new(data));
+        hive.cells[value_id.0 as usize] = Some(Cell::Value(ValueCell {
+            id: value_id,
+            parent_key: key_id,
+            name: String::from("Data"),
+            value_type: RegistryValueType::Binary,
+            data_blob: i,
+            last_write_sequence: 3,
+        }));
+    }
+
+    let decoded = decode_image(&encode_image(&hive)).expect("decode large sparse hive");
+    assert_eq!(decoded.root(), CellId(0));
+    assert_eq!(decoded.cell_count(), 1 + COUNT * 2);
+    assert_eq!(decoded.cells.len(), 1 + COUNT * 2);
+    assert_eq!(decoded.value_blobs.len(), 1 + COUNT / 2);
+    for i in [0, 1, COUNT / 2, COUNT - 1] {
+        let path = if i == 0 {
+            String::from("Key00001\\Key00000")
+        } else {
+            alloc::format!("Key{i:05}")
+        };
+        let key = decoded.open_key(&path).unwrap();
+        let expected = if i % 2 == 0 {
+            b"shared".to_vec()
+        } else {
+            (i as u64).to_le_bytes().to_vec()
+        };
+        assert_eq!(decoded.query_value(key, "Data").unwrap().1, expected.as_slice());
+    }
+}
+
+#[test]
 fn manager_boot_mutate_flush_survives_restart() {
     let mut mgr = HiveManager::new(MemoryHiveIoProvider::new());
     let mut hive = mgr.boot(HiveKind::System).unwrap(); // fresh

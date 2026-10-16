@@ -11,7 +11,10 @@ use nt_io_manager::{
 };
 use nt_status::NtStatus;
 
-use crate::{BusRelationTable, ParentRelationIdentity, PnpManager};
+use crate::{
+    BusRelationPublicationLease, BusRelationTable, ParentRelationIdentity, PnpManager,
+    PreparedBusRelations, PreparedEnumeratedPdoBatch,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AcceptedPdoProviderError {
@@ -448,6 +451,152 @@ impl AcceptedPdoProviderCatalog {
             return Err((error, prepared));
         }
 
+        self.publish_relation_validated(prepared);
+        Ok(())
+    }
+
+    /// Admit a provider batch against the complete prospective PnP publication. No table has
+    /// changed yet, so a refusal can return all exact owners to the retained caller.
+    pub fn validate_prospective_relation<P>(
+        &self,
+        pnp: &PnpManager,
+        relations: &BusRelationTable,
+        io: &IoManager<P>,
+        devnodes: &PreparedEnumeratedPdoBatch,
+        relation: &PreparedBusRelations,
+        prepared: &PreparedAcceptedPdoProviderBatch,
+    ) -> Result<(), AcceptedPdoProviderError> {
+        self.validate_prospective_relation_for_lease(
+            pnp, relations, io, devnodes, relation, prepared, None,
+        )
+    }
+
+    fn validate_prospective_relation_for_lease<P>(
+        &self,
+        pnp: &PnpManager,
+        relations: &BusRelationTable,
+        io: &IoManager<P>,
+        devnodes: &PreparedEnumeratedPdoBatch,
+        relation: &PreparedBusRelations,
+        prepared: &PreparedAcceptedPdoProviderBatch,
+        lease: Option<BusRelationPublicationLease>,
+    ) -> Result<(), AcceptedPdoProviderError> {
+        let relation_valid = match lease {
+            Some(lease) => relations.validate_bus_relations_with_lease(relation, lease),
+            None => relations.validate_bus_relations(relation),
+        };
+        if self.generation != prepared.base_generation
+            || prepared.next_generation != self.generation.saturating_add(1)
+            || prepared.parent_relation.relation() != relation.relation_identity()
+            || !pnp.relation_parent_is_started(prepared.parent_relation)
+            || pnp.validate_enumerated_pdo_batch(devnodes).is_err()
+            || relation_valid.is_err()
+            || relation.children().len() != prepared.rows.len()
+        {
+            return Err(AcceptedPdoProviderError::StaleRelation);
+        }
+        for child in relation.children() {
+            if !prepared.rows.iter().any(|row| {
+                let authority = match row {
+                    PreparedProviderRow::Existing { authority, .. }
+                    | PreparedProviderRow::New { authority, .. } => authority,
+                };
+                authority.pdo_object_id == child.pdo_object_id
+            }) {
+                return Err(AcceptedPdoProviderError::StaleRelation);
+            }
+        }
+        for row in &prepared.rows {
+            let (authority, target) = match row {
+                PreparedProviderRow::Existing { row_index, authority } => {
+                    let current = self.rows.get(*row_index)
+                        .ok_or(AcceptedPdoProviderError::StaleRelation)?;
+                    if current.authority.pdo_object_id != authority.pdo_object_id
+                        || current.authority.provider != authority.provider
+                    {
+                        return Err(AcceptedPdoProviderError::StaleRelation);
+                    }
+                    (*authority, &current.target)
+                }
+                PreparedProviderRow::New { authority, target } => (*authority, target),
+            };
+            if devnodes.parent_relation_for_pdo(authority.pdo_object_id)
+                != Some(prepared.parent_relation)
+                || authority.parent_relation != prepared.parent_relation
+                || io.hosted_device_pointer_registration(
+                    authority.provider.domain(), authority.provider.address(),
+                ) != Some(authority.provider)
+            {
+                return Err(AcceptedPdoProviderError::StaleRelation);
+            }
+            target.validate(io).map_err(AcceptedPdoProviderError::Provider)?;
+        }
+        Ok(())
+    }
+
+    /// Refuse the whole prospective publication before any PnP or provider row changes.
+    pub fn commit_prospective_relation<P>(
+        &mut self,
+        pnp: &mut PnpManager,
+        relations: &mut BusRelationTable,
+        io: &IoManager<P>,
+        devnodes: PreparedEnumeratedPdoBatch,
+        relation: PreparedBusRelations,
+        providers: PreparedAcceptedPdoProviderBatch,
+    ) -> Result<(), (AcceptedPdoProviderError, PreparedEnumeratedPdoBatch,
+                     PreparedBusRelations, PreparedAcceptedPdoProviderBatch)> {
+        self.commit_prospective_relation_for_lease(
+            pnp, relations, io, devnodes, relation, providers, None,
+        )
+    }
+
+    pub fn commit_prospective_relation_with_lease<P>(
+        &mut self,
+        pnp: &mut PnpManager,
+        relations: &mut BusRelationTable,
+        io: &IoManager<P>,
+        devnodes: PreparedEnumeratedPdoBatch,
+        relation: PreparedBusRelations,
+        providers: PreparedAcceptedPdoProviderBatch,
+        lease: BusRelationPublicationLease,
+    ) -> Result<(), (AcceptedPdoProviderError, PreparedEnumeratedPdoBatch,
+                     PreparedBusRelations, PreparedAcceptedPdoProviderBatch)> {
+        self.commit_prospective_relation_for_lease(
+            pnp, relations, io, devnodes, relation, providers, Some(lease),
+        )
+    }
+
+    fn commit_prospective_relation_for_lease<P>(
+        &mut self,
+        pnp: &mut PnpManager,
+        relations: &mut BusRelationTable,
+        io: &IoManager<P>,
+        devnodes: PreparedEnumeratedPdoBatch,
+        relation: PreparedBusRelations,
+        providers: PreparedAcceptedPdoProviderBatch,
+        lease: Option<BusRelationPublicationLease>,
+    ) -> Result<(), (AcceptedPdoProviderError, PreparedEnumeratedPdoBatch,
+                     PreparedBusRelations, PreparedAcceptedPdoProviderBatch)> {
+        if let Err(error) = self.validate_prospective_relation_for_lease(
+            pnp, relations, io, &devnodes, &relation, &providers, lease,
+        ) {
+            return Err((error, devnodes, relation, providers));
+        }
+        // The validation and both publications hold exclusive borrows and perform no IPC.
+        let published = match lease {
+            Some(lease) => pnp.commit_enumerated_bus_relation_with_lease(
+                relations, devnodes, relation, lease,
+            ),
+            None => pnp.commit_enumerated_bus_relation(relations, devnodes, relation),
+        };
+        if published.is_err() {
+            unreachable!("validated PnP relation changed without an intervening operation");
+        }
+        self.publish_relation_validated(providers);
+        Ok(())
+    }
+
+    fn publish_relation_validated(&mut self, prepared: PreparedAcceptedPdoProviderBatch) {
         for row in prepared.rows {
             match row {
                 PreparedProviderRow::Existing {
@@ -460,7 +609,6 @@ impl AcceptedPdoProviderCatalog {
             }
         }
         self.generation = prepared.next_generation;
-        Ok(())
     }
 
     /// Resolve only the current accepted relation and exact live provider registration.

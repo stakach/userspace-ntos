@@ -676,6 +676,41 @@ impl DeviceRelationInvalidationQueue {
         }
     }
 
+    /// Predict the exact terminal disposition while the claimed row remains owned. Callers can
+    /// admit every other local terminal action before making any publication effect.
+    pub fn preview_complete_terminal(
+        &self,
+        claim: DeviceRelationInvalidation,
+        status: nt_status::NtStatus,
+    ) -> Result<DeviceRelationInvalidationCompletion, DeviceRelationInvalidationError> {
+        if status == nt_status::NtStatus::PENDING {
+            return Err(DeviceRelationInvalidationError::InvalidTerminalStatus);
+        }
+        let index = self.claimed_row_index(claim)?;
+        let waiter = self.sync_waiters.iter()
+            .find(|waiter| waiter.ticket.0 == claim.sequence);
+        if waiter.is_some_and(|waiter| waiter.status.is_some()) {
+            return Err(DeviceRelationInvalidationError::StaleTicket);
+        }
+        let row = &self.rows[index];
+        match row.state {
+            DeviceRelationInvalidationState::Claimed {
+                requeue_sequence: Some(sequence), ..
+            } => Ok(DeviceRelationInvalidationCompletion::Requeued(
+                DeviceRelationInvalidation {
+                    parent: row.parent,
+                    pdo_device_id: row.pdo_device_id,
+                    relation_type: row.relation_type,
+                    sequence,
+                },
+            )),
+            DeviceRelationInvalidationState::Claimed { .. } => {
+                Ok(DeviceRelationInvalidationCompletion::Drained)
+            }
+            _ => unreachable!("claimed row changed during terminal preview"),
+        }
+    }
+
     fn complete_claim(&mut self, index: usize) -> DeviceRelationInvalidationCompletion {
         match self.rows[index].state {
             DeviceRelationInvalidationState::Claimed {
@@ -890,6 +925,13 @@ pub struct PreparedBusRelations {
     changes: Vec<BusRelationChange>,
 }
 
+/// Exclusive same-bus publication authority retained across an external CM transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BusRelationPublicationLease {
+    bus_object_id: u64,
+    nonce: u64,
+}
+
 impl PreparedBusRelations {
     pub fn changes(&self) -> &[BusRelationChange] {
         &self.changes
@@ -913,6 +955,16 @@ impl PreparedBusRelations {
             generation: self.relation_generation,
         }
     }
+
+    pub fn children(&self) -> &[BusReportedChild] {
+        &self.next_children
+    }
+
+    /// A retained CM mutation may only rebase onto a relation with the same complete semantic
+    /// delta. Generation drift alone is harmless; a changed delta needs a new CM transaction.
+    pub fn same_semantic_changes(&self, other: &Self) -> bool {
+        self.bus_object_id == other.bus_object_id && self.changes == other.changes
+    }
 }
 
 /// Last accepted complete child relation set for every bus. Preparing a relation query reserves
@@ -922,6 +974,8 @@ impl PreparedBusRelations {
 pub struct BusRelationTable {
     generation: u64,
     buses: Vec<AcceptedBusRelations>,
+    publication_leases: Vec<BusRelationPublicationLease>,
+    next_publication_nonce: u64,
 }
 
 impl BusRelationTable {
@@ -931,6 +985,36 @@ impl BusRelationTable {
 
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub fn reserve_publication_lease(
+        &mut self,
+        bus_object_id: u64,
+    ) -> Result<BusRelationPublicationLease, BusRelationError> {
+        if bus_object_id == 0 {
+            return Err(BusRelationError::InvalidBus);
+        }
+        if self.publication_leases.iter().any(|lease| lease.bus_object_id == bus_object_id) {
+            return Err(BusRelationError::StaleTransaction);
+        }
+        let nonce = self.next_publication_nonce.checked_add(1)
+            .ok_or(BusRelationError::GenerationExhausted)?;
+        self.publication_leases.try_reserve(1)
+            .map_err(|_| BusRelationError::InsufficientResources)?;
+        let lease = BusRelationPublicationLease { bus_object_id, nonce };
+        self.publication_leases.push(lease);
+        self.next_publication_nonce = nonce;
+        Ok(lease)
+    }
+
+    pub fn release_publication_lease(
+        &mut self,
+        lease: BusRelationPublicationLease,
+    ) -> Result<(), BusRelationError> {
+        let index = self.publication_leases.iter().position(|active| *active == lease)
+            .ok_or(BusRelationError::StaleTransaction)?;
+        self.publication_leases.remove(index);
+        Ok(())
     }
 
     pub fn accepted_children(&self, bus_object_id: u64) -> Option<&[BusReportedChild]> {
@@ -992,6 +1076,9 @@ impl BusRelationTable {
     ) -> Result<u64, BusRelationError> {
         if bus_object_id == 0 {
             return Err(BusRelationError::InvalidBus);
+        }
+        if self.publication_leases.iter().any(|lease| lease.bus_object_id == bus_object_id) {
+            return Err(BusRelationError::StaleTransaction);
         }
         if self
             .buses
@@ -1125,6 +1212,57 @@ impl BusRelationTable {
         &mut self,
         prepared: PreparedBusRelations,
     ) -> Result<u64, BusRelationError> {
+        self.try_commit_bus_relations(prepared)
+            .map_err(|(error, _prepared)| error)
+    }
+
+    /// Refusal returns the exact unpublished relation for retained post-CM repair.
+    pub fn try_commit_bus_relations(
+        &mut self,
+        prepared: PreparedBusRelations,
+    ) -> Result<u64, (BusRelationError, PreparedBusRelations)> {
+        if let Err(error) = self.validate_bus_relations(&prepared) {
+            return Err((error, prepared));
+        }
+        Ok(self.publish_bus_relations_validated(prepared))
+    }
+
+    pub fn try_commit_bus_relations_with_lease(
+        &mut self,
+        prepared: PreparedBusRelations,
+        lease: BusRelationPublicationLease,
+    ) -> Result<u64, (BusRelationError, PreparedBusRelations)> {
+        if let Err(error) = self.validate_bus_relations_with_lease(&prepared, lease) {
+            return Err((error, prepared));
+        }
+        Ok(self.publish_bus_relations_validated(prepared))
+    }
+
+    pub fn validate_bus_relations(
+        &self,
+        prepared: &PreparedBusRelations,
+    ) -> Result<(), BusRelationError> {
+        self.validate_bus_relations_for_lease(prepared, None)
+    }
+
+    pub fn validate_bus_relations_with_lease(
+        &self,
+        prepared: &PreparedBusRelations,
+        lease: BusRelationPublicationLease,
+    ) -> Result<(), BusRelationError> {
+        self.validate_bus_relations_for_lease(prepared, Some(lease))
+    }
+
+    fn validate_bus_relations_for_lease(
+        &self,
+        prepared: &PreparedBusRelations,
+        lease: Option<BusRelationPublicationLease>,
+    ) -> Result<(), BusRelationError> {
+        let active = self.publication_leases.iter()
+            .find(|active| active.bus_object_id == prepared.bus_object_id).copied();
+        if active != lease {
+            return Err(BusRelationError::StaleTransaction);
+        }
         if prepared.base_generation != self.generation
             || prepared.next_generation != self.generation.saturating_add(1)
         {
@@ -1132,18 +1270,27 @@ impl BusRelationTable {
         }
         if let Some(bus) = self
             .buses
-            .iter_mut()
+            .iter()
             .find(|bus| bus.bus_object_id == prepared.bus_object_id)
         {
             if prepared.relation_generation != bus.relation_generation.saturating_add(1) {
                 return Err(BusRelationError::StaleTransaction);
             }
+        } else if prepared.relation_generation != 1 || self.buses.len() >= self.buses.capacity() {
+            return Err(BusRelationError::StaleTransaction);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn publish_bus_relations_validated(&mut self, prepared: PreparedBusRelations) -> u64 {
+        if let Some(bus) = self
+            .buses
+            .iter_mut()
+            .find(|bus| bus.bus_object_id == prepared.bus_object_id)
+        {
             bus.children = prepared.next_children;
             bus.relation_generation = prepared.relation_generation;
         } else {
-            if prepared.relation_generation != 1 {
-                return Err(BusRelationError::StaleTransaction);
-            }
             debug_assert!(self.buses.len() < self.buses.capacity());
             self.buses.push(AcceptedBusRelations {
                 bus_object_id: prepared.bus_object_id,
@@ -1152,7 +1299,7 @@ impl BusRelationTable {
             });
         }
         self.generation = prepared.next_generation;
-        Ok(self.generation)
+        self.generation
     }
 }
 
@@ -1568,6 +1715,39 @@ mod tests {
         assert_eq!(table.current_relation_identity(2).unwrap().generation(), 2);
         assert!(table.relation_contains(table.current_relation_identity(1).unwrap(), 10));
         assert!(!table.relation_contains(table.current_relation_identity(2).unwrap(), 10));
+    }
+
+    #[test]
+    fn same_bus_rebase_cannot_erase_committed_cm_removal() {
+        let mut table = BusRelationTable::new();
+        let a = child(10, "0001", &["A"]);
+        let b = child(20, "0002", &["B"]);
+        table.seed_bus_relations(1, &[b.clone()]).unwrap();
+        let original = table.prepare_bus_relations(1, &[a.clone()]).unwrap();
+        assert!(original.changes().iter().any(|change| {
+            change.kind == BusRelationChangeKind::Removal && change.child == b
+        }));
+        // A different publisher changes this same bus while the original CM write is retained.
+        let intervening = table.prepare_bus_relations(1, &[a.clone()]).unwrap();
+        table.commit_bus_relations(intervening).unwrap();
+        let refreshed = table.prepare_bus_relations(1, &[a]).unwrap();
+        assert!(!refreshed.same_semantic_changes(&original));
+    }
+
+    #[test]
+    fn retained_cm_publication_excludes_same_bus_intervening_commit() {
+        let mut table = BusRelationTable::new();
+        let a = child(10, "0001", &["A"]);
+        let b = child(20, "0002", &["B"]);
+        table.seed_bus_relations(1, &[]).unwrap();
+        let original = table.prepare_bus_relations(1, &[a.clone()]).unwrap();
+        let lease = table.reserve_publication_lease(1).unwrap();
+        let intervening = table.prepare_bus_relations(1, &[b]).unwrap();
+        assert_eq!(table.commit_bus_relations(intervening), Err(BusRelationError::StaleTransaction));
+        assert!(table.accepted_children(1).unwrap().is_empty());
+        assert!(table.try_commit_bus_relations_with_lease(original, lease).is_ok());
+        assert_eq!(table.accepted_children(1).unwrap(), [a].as_slice());
+        table.release_publication_lease(lease).unwrap();
     }
 
     #[test]

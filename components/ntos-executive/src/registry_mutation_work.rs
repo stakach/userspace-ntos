@@ -8,6 +8,7 @@ use nt_process::RegistryKeyHandlePublication;
 use nt_process::native_handle::NativeThreadProcessReference;
 use nt_user_host::provider_logical_caller::ProviderLogicalCaller;
 use nt_thread_start::amd64_context::UserApcContinuation;
+use writable_fs::registry_wal::Journal as WalJournal;
 
 struct HostedCaller {
     completion: HostedCompletion,
@@ -130,25 +131,12 @@ impl Caller {
 
 type HostedContext<'a> = Option<(&'a mut ExecNtHandler, &'a mut nt_delay_execution::Queue)>;
 
-/// Storage admission for the current CM COMMIT protocol. A journal-bearing mutation must
-/// retain its exact snapshot owner and pass its barrier before entering COMMIT. Lazy hive
-/// writeback needs a separate CM publication/replay contract before it can replace this path.
-enum SystemMutationStorage {
-    NoJournal,
-    PrecommitJournal(Vec<u8>),
-}
-
-fn system_mutation_storage(
-    prepared: &PreparedSystemHiveMutation,
-) -> Result<SystemMutationStorage, u32> {
+fn system_mutation_storage(prepared: &PreparedSystemHiveMutation) -> Result<Vec<u8>, u32> {
     let journal = prepared.durable_journal();
-    if journal.is_empty() {
-        return Ok(SystemMutationStorage::NoJournal);
-    }
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(journal.len()).map_err(|_| 0xC000_009Au32)?;
     bytes.extend_from_slice(journal);
-    Ok(SystemMutationStorage::PrecommitJournal(bytes))
+    Ok(bytes)
 }
 
 enum Phase {
@@ -158,12 +146,15 @@ enum Phase {
     Admit,
     Durable,
     Commit,
+    CommitDurable,
     Open,
     Acknowledge,
+    ReleasePublication(SystemHiveMutationAcknowledgement),
     Abort,
     Rollback,
+    DurableAbort(SystemHiveMutationAbortReceipt),
     AcknowledgeAbort(SystemHiveMutationAbortReceipt),
-    ReleaseRollback,
+    ReleaseRollback(SystemHiveMutationAbortAcknowledgement),
     Complete,
     ReadyReply,
     ReplyEntered,
@@ -174,65 +165,174 @@ enum Phase {
     ProviderReplyEntered,
 }
 
-/// Owns the exact storage effect independently of the CM preparation and COMMIT receipt.
-/// The current protocol still makes a journal durable before entering CM publication.
-/// A failed or uncertain storage release leaves the same journal here for redrive.
-struct MutationPersistence {
-    journal: Option<writable_fs::registry_journal::Journal<()>>,
+enum PersistenceOwner {
+    Unadmitted,
+    NoStorage,
+    Legacy(writable_fs::registry_journal::Journal<()>),
+    Wal(WalJournal),
+}
+
+/// One retained storage owner, chosen from the mounted snapshot format before CM COMMIT.
+/// The exact CM receipt and typed acknowledgement are required to release either format.
+pub(crate) struct MutationPersistence {
+    owner: PersistenceOwner,
+    binding: Option<SystemHiveMutationStorageBinding>,
+    commit_receipt: Option<SystemHiveMutationCommitReceipt>,
+    abort_receipt: Option<SystemHiveMutationAbortReceipt>,
+    marker_complete: bool,
 }
 
 impl MutationPersistence {
-    fn new() -> Self {
-        Self { journal: None }
+    pub(crate) fn new() -> Self {
+        Self {
+            owner: PersistenceOwner::Unadmitted,
+            binding: None,
+            commit_receipt: None,
+            abort_receipt: None,
+            marker_complete: false,
+        }
     }
 
-    fn has_journal(&self) -> bool {
-        self.journal.is_some()
+    pub(crate) fn has_journal(&self) -> bool {
+        matches!(&self.owner, PersistenceOwner::Legacy(_) | PersistenceOwner::Wal(_))
     }
 
-    unsafe fn admit(&mut self, bytes: Vec<u8>) -> Result<(), u32> {
-        assert!(self.journal.is_none(), "one storage owner per CM mutation");
-        let journal = writable_fs::registry_journal::Journal::admit(bytes, ())
-            .map_err(|(status, _, ())| status)?;
-        self.journal = Some(journal);
+    pub(crate) unsafe fn admit(
+        &mut self,
+        prepared: &PreparedSystemHiveMutation,
+        bytes: Vec<u8>,
+    ) -> Result<(), u32> {
+        assert!(matches!(&self.owner, PersistenceOwner::Unadmitted), "one storage owner per CM mutation");
+        writable_fs::ensure_mounted()?;
+        if bytes.is_empty() {
+            // Volatile-only and idempotent CM mutations have semantic work but no durable
+            // journal. They still COMMIT and ACK; no WAL serial is consumed.
+            self.owner = PersistenceOwner::NoStorage;
+            self.binding = Some(prepared.storage_binding());
+            return Ok(());
+        }
+        self.owner = if writable_fs::legacy_snapshot_writes_allowed() {
+            let journal = writable_fs::registry_journal::Journal::admit(bytes, ())
+                .map_err(|(status, _, ())| status)?;
+            PersistenceOwner::Legacy(journal)
+        } else {
+            let wal = WalJournal::admit(prepared, bytes)?;
+            PersistenceOwner::Wal(wal)
+        };
+        self.binding = Some(prepared.storage_binding());
         Ok(())
     }
 
-    fn make_durable(&mut self) -> Result<(), u32> {
-        self.journal.as_mut().expect("admitted CM journal").make_durable()
+    pub(crate) fn make_durable(&mut self) -> Result<(), u32> {
+        match &mut self.owner {
+            PersistenceOwner::Legacy(journal) => journal.make_durable(),
+            PersistenceOwner::Wal(wal) => wal.prepare(),
+            PersistenceOwner::NoStorage | PersistenceOwner::Unadmitted => Ok(()),
+        }
     }
 
-    fn begin_publication(&mut self) -> Result<(), u32> {
-        if let Some(journal) = self.journal.as_mut() {
+    pub(crate) fn begin_publication(&mut self) -> Result<(), u32> {
+        if let PersistenceOwner::Legacy(journal) = &mut self.owner {
             journal.begin_publication()?;
         }
         Ok(())
     }
 
-    fn rollback(&mut self) -> Result<(), u32> {
-        self.journal.as_mut().expect("unpublished CM journal").rollback()
-    }
-
-    unsafe fn release_after_publication(&mut self) -> Result<(), u32> {
-        if let Some(journal) = self.journal.take() {
-            match journal.release_after_publication() {
-                Ok(()) => {}
-                Err(journal) => {
-                    self.journal = Some(journal);
-                    return Err(0xC000_000D);
-                }
+    pub(crate) fn commit_durable(
+        &mut self,
+        receipt: SystemHiveMutationCommitReceipt,
+    ) -> Result<(), u32> {
+        let binding = self.binding.ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
+        if !receipt.matches_storage_binding(binding)
+            || self.abort_receipt.is_some()
+            || self.commit_receipt.is_some_and(|previous| previous != receipt)
+        {
+            return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+        }
+        self.commit_receipt = Some(receipt);
+        if let PersistenceOwner::Wal(wal) = &mut self.owner {
+            if !self.marker_complete {
+                wal.commit_marker(receipt)?;
+                self.marker_complete = true;
             }
+            wal.anchor()?;
         }
         Ok(())
     }
 
-    unsafe fn release_rolled_back(&mut self) -> Result<(), u32> {
-        if let Some(journal) = self.journal.take() {
-            match journal.release_rolled_back() {
+    pub(crate) fn rollback(&mut self) -> Result<(), u32> {
+        match &mut self.owner {
+            PersistenceOwner::Legacy(journal) => journal.rollback(),
+            PersistenceOwner::Wal(_) | PersistenceOwner::NoStorage | PersistenceOwner::Unadmitted => Ok(()),
+        }
+    }
+
+    pub(crate) fn abort_after_receipt(
+        &mut self,
+        receipt: SystemHiveMutationAbortReceipt,
+    ) -> Result<(), u32> {
+        if self.binding.is_some_and(|binding| !receipt.matches_storage_binding(binding))
+            || self.commit_receipt.is_some()
+            || self.abort_receipt.is_some_and(|previous| previous != receipt)
+        {
+            return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+        }
+        self.abort_receipt = Some(receipt);
+        if let PersistenceOwner::Wal(wal) = &mut self.owner {
+            wal.abort_prepared(receipt)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) unsafe fn release_after_publication(
+        &mut self,
+        ack: SystemHiveMutationAcknowledgement,
+    ) -> Result<(), u32> {
+        if self.commit_receipt != Some(ack.receipt()) {
+            return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+        }
+        match core::mem::replace(&mut self.owner, PersistenceOwner::Unadmitted) {
+            PersistenceOwner::NoStorage => {}
+            PersistenceOwner::Unadmitted => return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST),
+            PersistenceOwner::Legacy(journal) => match journal.release_after_publication() {
                 Ok(()) => {}
                 Err(journal) => {
-                    self.journal = Some(journal);
-                    return Err(0xC000_000D);
+                    self.owner = PersistenceOwner::Legacy(journal);
+                    return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+                }
+            },
+            PersistenceOwner::Wal(wal) => match wal.release_after_ack(ack) {
+                Ok(()) => {}
+                Err(wal) => {
+                    self.owner = PersistenceOwner::Wal(wal);
+                    return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+                }
+            },
+        }
+        Ok(())
+    }
+
+    pub(crate) unsafe fn release_rolled_back(
+        &mut self,
+        ack: SystemHiveMutationAbortAcknowledgement,
+    ) -> Result<(), u32> {
+        if self.abort_receipt != Some(ack.receipt()) {
+            return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+        }
+        match core::mem::replace(&mut self.owner, PersistenceOwner::Unadmitted) {
+            PersistenceOwner::NoStorage | PersistenceOwner::Unadmitted => {}
+            PersistenceOwner::Legacy(journal) => match journal.release_rolled_back() {
+                Ok(()) => {}
+                Err(journal) => {
+                    self.owner = PersistenceOwner::Legacy(journal);
+                    return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+                }
+            },
+            PersistenceOwner::Wal(wal) => match wal.release_after_abort(ack) {
+                Ok(()) => {}
+                Err(wal) => {
+                    self.owner = PersistenceOwner::Wal(wal);
+                    return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
                 }
             }
         }
@@ -264,6 +364,16 @@ static TRANSFERRED: AtomicBool = AtomicBool::new(false);
 static mut EXECUTING: Option<ProviderLogicalCaller> = None;
 static EXECUTING_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
 const RETRY_DELAY: u64 = 10_000_000;
+
+/// Includes work retained across a failed CM exchange or a storage effect. The bootstrap
+/// handoff must wait for this count and the journal owner before moving Ps into the handler.
+pub(crate) fn pending_count() -> u64 {
+    PENDING.load(Ordering::Acquire)
+}
+
+pub(crate) fn redrive_active() -> bool {
+    ACTIVE.load(Ordering::Acquire)
+}
 
 /// Failure returns both canonical owners unchanged; no CM mutation has been sent.
 pub(crate) unsafe fn submit_hosted(
@@ -724,11 +834,17 @@ unsafe fn advance(
                 work.phase = Phase::Abort;
                 return Ok(false);
             }
-            match system_mutation_storage(prepared).map_err(|status| status as i32)? {
-                SystemMutationStorage::NoJournal => work.phase = Phase::Commit,
-                SystemMutationStorage::PrecommitJournal(bytes) => {
-                    work.persistence.admit(bytes).map_err(|status| status as i32)?;
-                    work.phase = Phase::Durable;
+            let bytes = system_mutation_storage(prepared).map_err(|status| status as i32)?;
+            match work.persistence.admit(prepared, bytes) {
+                Ok(()) => {
+                    work.phase = if work.persistence.has_journal() { Phase::Durable } else { Phase::Commit };
+                }
+                Err(status) if status == nt_status::NtStatus::DEVICE_BUSY.raw() as u32 => {
+                    return Err(status as i32)
+                }
+                Err(status) => {
+                    work.status = status;
+                    work.phase = Phase::Abort;
                 }
             }
         }
@@ -751,6 +867,12 @@ unsafe fn advance(
                 work.commit_entered = true;
             }
             let receipt = cm_mutation_transport::commit(work.prepared.as_ref().unwrap())?;
+            work.receipt = Some(receipt);
+            work.phase = Phase::CommitDurable;
+        }
+        Phase::CommitDurable => {
+            let receipt = work.receipt.expect("retained CM COMMIT receipt");
+            work.persistence.commit_durable(receipt).map_err(|status| status as i32)?;
             let outcome = receipt.outcome();
             CM_RUNTIME_SYSTEM_MUTATION_COMMITS.fetch_add(1, Ordering::Relaxed);
             note_boot_progress(BootProgress::DurableRegistryPublication);
@@ -792,7 +914,6 @@ unsafe fn advance(
                     config_manager_request_device_action_wake();
                 }
             }
-            work.receipt = Some(receipt);
             work.phase = Phase::Open;
         }
         Phase::Open => {
@@ -852,8 +973,11 @@ unsafe fn advance(
             work.phase = Phase::Acknowledge;
         }
         Phase::Acknowledge => {
-            cm_mutation_transport::acknowledge(work.receipt.unwrap())?;
-            work.persistence.release_after_publication().map_err(|status| status as i32)?;
+            let ack = cm_mutation_transport::acknowledge(work.receipt.unwrap())?;
+            work.phase = Phase::ReleasePublication(ack);
+        }
+        Phase::ReleasePublication(ack) => {
+            work.persistence.release_after_publication(*ack).map_err(|status| status as i32)?;
             if let Caller::Hosted(HostedCaller {
                 completion: HostedCompletion::SystemLocale { locale_id, .. }, ..
             }) = &work.caller {
@@ -865,18 +989,22 @@ unsafe fn advance(
         }
         Phase::Abort => {
             let receipt = cm_mutation_transport::abort(work.prepared.as_ref().unwrap())?;
-            work.phase = Phase::AcknowledgeAbort(receipt);
+            work.phase = Phase::DurableAbort(receipt);
         }
         Phase::Rollback => {
             work.persistence.rollback().map_err(|status| status as i32)?;
             work.phase = Phase::Abort;
         }
-        Phase::AcknowledgeAbort(receipt) => {
-            cm_mutation_transport::acknowledge_abort(*receipt)?;
-            work.phase = Phase::ReleaseRollback;
+        Phase::DurableAbort(receipt) => {
+            work.persistence.abort_after_receipt(*receipt).map_err(|status| status as i32)?;
+            work.phase = Phase::AcknowledgeAbort(*receipt);
         }
-        Phase::ReleaseRollback => {
-            work.persistence.release_rolled_back().map_err(|status| status as i32)?;
+        Phase::AcknowledgeAbort(receipt) => {
+            let ack = cm_mutation_transport::acknowledge_abort(*receipt)?;
+            work.phase = Phase::ReleaseRollback(ack);
+        }
+        Phase::ReleaseRollback(ack) => {
+            work.persistence.release_rolled_back(*ack).map_err(|status| status as i32)?;
             work.phase = Phase::Complete;
         }
         Phase::Complete => {

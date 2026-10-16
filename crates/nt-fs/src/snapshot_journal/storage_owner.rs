@@ -85,6 +85,30 @@ impl<D: SnapshotBlockDevice + 'static, C> OwnedSnapshotJournal<D, C> {
             path,
             journal,
             context,
+            None,
+        ))
+    }
+
+    /// Use an already recovered two-slot v2 baseline for every journal checkpoint,
+    /// including rollback. Admission rejects mixed slots before any journal write.
+    /// The caller must supply the exact WAL anchor and folded base for this mounted volume.
+    pub fn open_with_wal_manifest(
+        filesystem: FileSystem,
+        device: D,
+        store: SnapshotBlockStore,
+        path: &str,
+        journal: Vec<u8>,
+        context: C,
+        manifest: WalSnapshotManifest,
+    ) -> Result<Self, OwnedSnapshotJournalOpenError<D, C>> {
+        Self::admitted(SnapshotJournal::open_storage(
+            StorageOwner::Owned(filesystem),
+            StorageOwner::Owned(device),
+            store,
+            path,
+            journal,
+            context,
+            Some(manifest),
         ))
     }
 
@@ -103,6 +127,29 @@ impl<D: SnapshotBlockDevice + 'static, C> OwnedSnapshotJournal<D, C> {
             path,
             journal,
             context,
+            None,
+        ))
+    }
+
+    /// Admit creation against the same recovered v2 baseline and retain that manifest
+    /// through both the forward checkpoint and durable absence rollback.
+    pub fn create_with_wal_manifest(
+        filesystem: FileSystem,
+        device: D,
+        store: SnapshotBlockStore,
+        path: &str,
+        journal: Vec<u8>,
+        context: C,
+        manifest: WalSnapshotManifest,
+    ) -> Result<Self, OwnedSnapshotJournalOpenError<D, C>> {
+        Self::admitted(SnapshotJournal::create_storage(
+            StorageOwner::Owned(filesystem),
+            StorageOwner::Owned(device),
+            store,
+            path,
+            journal,
+            context,
+            Some(manifest),
         ))
     }
 
@@ -173,4 +220,5 @@ impl<D: SnapshotBlockDevice + 'static, C> OwnedSnapshotJournal<D, C> {
 }
 
 #[cfg(test)]
+#[path = "storage_owner/tests.rs"]
 mod tests;

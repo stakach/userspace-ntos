@@ -1164,6 +1164,39 @@ impl PreparedEnumeratedPdoBatch {
     pub fn devnode_id(&self, index: usize) -> Option<u64> {
         self.records.get(index).map(PreparedEnumeratedPdo::id)
     }
+
+    pub(crate) fn parent_relation_for_pdo(
+        &self,
+        pdo_object_id: u64,
+    ) -> Option<ParentRelationIdentity> {
+        self.records.iter().find_map(|entry| {
+            let record = match entry {
+                PreparedEnumeratedPdo::Existing { record, .. }
+                | PreparedEnumeratedPdo::New { record, .. } => record,
+            };
+            (record.pdo_object_id == pdo_object_id).then_some(record.parent_relation).flatten()
+        })
+    }
+
+    pub(crate) fn prospective_child(
+        &self,
+        pdo_object_id: u64,
+    ) -> Option<(DevnodeIdentity, &str, ParentRelationIdentity)> {
+        self.records.iter().find_map(|entry| {
+            let (record, id, generation) = match entry {
+                PreparedEnumeratedPdo::Existing { record, id, generation }
+                | PreparedEnumeratedPdo::New { record, id, generation } => {
+                    (record, *id, *generation)
+                }
+            };
+            (record.pdo_object_id == pdo_object_id).then(|| {
+                record.parent_relation.map(|parent| (
+                    DevnodeIdentity { devnode_id: id, generation, pdo_object_id },
+                    record.instance_id.as_str(), parent,
+                ))
+            }).flatten()
+        })
+    }
 }
 
 /// Whether the v0.1 state machine permits `from -> to` (spec §8.2/§8.3). `Failed` is
@@ -1479,10 +1512,17 @@ impl PnpManager {
         &mut self,
         prepared: PreparedEnumeratedPdoBatch,
     ) -> Result<(), PnpError> {
-        let committed_len = self
-            .devnodes
-            .len()
-            .checked_add(prepared.new_count)
+        self.try_commit_enumerated_pdo_batch(prepared)
+            .map_err(|(error, _prepared)| error)
+    }
+
+    /// Refusal returns the exact unpublished batch for retained publication repair.
+    /// Every validation completes before the first devnode is changed.
+    pub fn validate_enumerated_pdo_batch(
+        &self,
+        prepared: &PreparedEnumeratedPdoBatch,
+    ) -> Result<(), PnpError> {
+        let committed_len = self.devnodes.len().checked_add(prepared.new_count)
             .ok_or(PnpError::StalePublication)?;
         if self.devnodes.len() != prepared.base_devnode_count
             || self.next_id != prepared.base_next_id
@@ -1496,33 +1536,24 @@ impl PnpManager {
                 PreparedEnumeratedPdo::Existing { record, .. }
                 | PreparedEnumeratedPdo::New { record, .. } => record,
             };
-            if record
-                .parent_relation
+            if record.parent_relation
                 .is_some_and(|identity| !self.relation_parent_is_started(identity))
             {
                 return Err(PnpError::StalePublication);
             }
             match entry {
-                PreparedEnumeratedPdo::Existing {
-                    record,
-                    id,
-                    generation,
-                } => {
-                    let existing = self
-                        .matching_enumerated_pdo(record)
+                PreparedEnumeratedPdo::Existing { record, id, generation } => {
+                    let existing = self.matching_enumerated_pdo(record)
                         .map_err(|_| PnpError::StalePublication)?
                         .filter(|devnode| {
                             devnode.id == *id
                                 && devnode.generation == *generation
                                 && devnode.state != DeviceState::Removed
                         });
-                    if existing.is_none() {
-                        return Err(PnpError::StalePublication);
-                    }
+                    if existing.is_none() { return Err(PnpError::StalePublication); }
                 }
                 PreparedEnumeratedPdo::New { record, .. } => {
-                    if self
-                        .matching_enumerated_pdo(record)
+                    if self.matching_enumerated_pdo(record)
                         .map_err(|_| PnpError::StalePublication)?
                         .is_some()
                     {
@@ -1531,7 +1562,67 @@ impl PnpManager {
                 }
             }
         }
+        Ok(())
+    }
 
+    pub fn try_commit_enumerated_pdo_batch(
+        &mut self,
+        prepared: PreparedEnumeratedPdoBatch,
+    ) -> Result<(), (PnpError, PreparedEnumeratedPdoBatch)> {
+        if let Err(error) = self.validate_enumerated_pdo_batch(&prepared) {
+            return Err((error, prepared));
+        }
+        self.publish_enumerated_pdo_batch_validated(prepared);
+        Ok(())
+    }
+
+    /// Validate both prepared owners before changing either PnP table. The exclusive borrows
+    /// prevent a generation change between admission and the allocation-free publications.
+    pub fn commit_enumerated_bus_relation(
+        &mut self,
+        relations: &mut BusRelationTable,
+        devnodes: PreparedEnumeratedPdoBatch,
+        relation: PreparedBusRelations,
+    ) -> Result<(), (PnpError, PreparedEnumeratedPdoBatch, PreparedBusRelations)> {
+        self.commit_enumerated_bus_relation_for_lease(relations, devnodes, relation, None)
+    }
+
+    pub fn commit_enumerated_bus_relation_with_lease(
+        &mut self,
+        relations: &mut BusRelationTable,
+        devnodes: PreparedEnumeratedPdoBatch,
+        relation: PreparedBusRelations,
+        lease: BusRelationPublicationLease,
+    ) -> Result<(), (PnpError, PreparedEnumeratedPdoBatch, PreparedBusRelations)> {
+        self.commit_enumerated_bus_relation_for_lease(relations, devnodes, relation, Some(lease))
+    }
+
+    fn commit_enumerated_bus_relation_for_lease(
+        &mut self,
+        relations: &mut BusRelationTable,
+        devnodes: PreparedEnumeratedPdoBatch,
+        relation: PreparedBusRelations,
+        lease: Option<BusRelationPublicationLease>,
+    ) -> Result<(), (PnpError, PreparedEnumeratedPdoBatch, PreparedBusRelations)> {
+        if let Err(error) = self.validate_enumerated_pdo_batch(&devnodes) {
+            return Err((error, devnodes, relation));
+        }
+        let relation_valid = match lease {
+            Some(lease) => relations.validate_bus_relations_with_lease(&relation, lease),
+            None => relations.validate_bus_relations(&relation),
+        };
+        if relation_valid.is_err() {
+            return Err((PnpError::StalePublication, devnodes, relation));
+        }
+        self.publish_enumerated_pdo_batch_validated(devnodes);
+        relations.publish_bus_relations_validated(relation);
+        Ok(())
+    }
+
+    fn publish_enumerated_pdo_batch_validated(
+        &mut self,
+        prepared: PreparedEnumeratedPdoBatch,
+    ) {
         for entry in prepared.records {
             let (record, id, generation) = match entry {
                 PreparedEnumeratedPdo::Existing {
@@ -1573,7 +1664,6 @@ impl PnpManager {
         }
         self.next_id = prepared.committed_next_id;
         self.next_gen = prepared.committed_next_gen;
-        Ok(())
     }
 
     /// Publish the immutable bus/capability state owned by one enumerated canonical PDO before a
@@ -2740,6 +2830,86 @@ mod tests {
             ),
             Err(PnpError::StalePublication)
         );
+    }
+
+    #[test]
+    fn bus_generation_drift_during_cm_prepare_refuses_before_devnode_effect() {
+        let mut pnp = PnpManager::new();
+        let parent_pdo = 0x9000;
+        create_started_parent(&mut pnp, parent_pdo);
+        let child = BusReportedChild::new(
+            0x1234, r"PCI\VEN_1234&DEV_5678", "0001",
+            &[r"PCI\VEN_1234&DEV_5678"], &[] as &[&str],
+        );
+        let mut relations = BusRelationTable::new();
+        relations.seed_bus_relations(parent_pdo, &[]).unwrap();
+        let prepared_relation = relations
+            .prepare_bus_relations(parent_pdo, core::slice::from_ref(&child)).unwrap();
+        let parent_relation = pnp
+            .claim_started_parent_relation(parent_pdo, prepared_relation.relation_identity())
+            .unwrap();
+        let prepared_devnodes = pnp.prepare_enumerated_pdo_batch(vec![
+            EnumeratedPdoRecord::new(
+                child.enum_instance_path(), child.pdo_object_id, pci_properties(),
+            ).with_parent_relation(parent_relation),
+        ]).unwrap();
+
+        // An unrelated bus may advance the global generation during retained CM preparation.
+        relations.seed_bus_relations(0xa000, &[]).unwrap();
+        let unrelated = relations.prepare_bus_relations(0xa000, &[]).unwrap();
+        relations.commit_bus_relations(unrelated).unwrap();
+
+        let (_error, _devnodes, _relation) = pnp
+            .commit_enumerated_bus_relation(&mut relations, prepared_devnodes, prepared_relation)
+            .unwrap_err();
+        assert!(pnp.devnode_for_pdo(child.pdo_object_id).is_none());
+        assert!(relations.accepted_children(parent_pdo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn post_commit_relation_repair_rebases_without_duplicate_devnode() {
+        let mut pnp = PnpManager::new();
+        let parent_pdo = 0x9000;
+        create_started_parent(&mut pnp, parent_pdo);
+        let child = BusReportedChild::new(
+            0x1234, r"PCI\VEN_1234&DEV_5678", "0001",
+            &[r"PCI\VEN_1234&DEV_5678"], &[] as &[&str],
+        );
+        let mut relations = BusRelationTable::new();
+        relations.seed_bus_relations(parent_pdo, &[]).unwrap();
+        let prepared_relation = relations
+            .prepare_bus_relations(parent_pdo, core::slice::from_ref(&child)).unwrap();
+        let parent_relation = pnp
+            .claim_started_parent_relation(parent_pdo, prepared_relation.relation_identity())
+            .unwrap();
+        let prepared_devnodes = pnp.prepare_enumerated_pdo_batch(vec![
+            EnumeratedPdoRecord::new(
+                child.enum_instance_path(), child.pdo_object_id, pci_properties(),
+            ).with_parent_relation(parent_relation),
+        ]).unwrap();
+        relations.seed_bus_relations(0xa000, &[]).unwrap();
+        let unrelated = relations.prepare_bus_relations(0xa000, &[]).unwrap();
+        relations.commit_bus_relations(unrelated).unwrap();
+
+        let (_error, _old_devnodes, _old_relation) = pnp
+            .commit_enumerated_bus_relation(&mut relations, prepared_devnodes, prepared_relation)
+            .unwrap_err();
+        assert!(pnp.devnode_for_pdo(child.pdo_object_id).is_none());
+        let refreshed_relation = relations
+            .prepare_bus_relations(parent_pdo, core::slice::from_ref(&child)).unwrap();
+        let refreshed_parent = pnp
+            .claim_started_parent_relation(parent_pdo, refreshed_relation.relation_identity())
+            .unwrap();
+        let refreshed_devnodes = pnp.prepare_enumerated_pdo_batch(vec![
+            EnumeratedPdoRecord::new(
+                child.enum_instance_path(), child.pdo_object_id, pci_properties(),
+            ).with_parent_relation(refreshed_parent),
+        ]).unwrap();
+        assert!(pnp.commit_enumerated_bus_relation(
+            &mut relations, refreshed_devnodes, refreshed_relation,
+        ).is_ok());
+        assert!(pnp.devnode_for_pdo(child.pdo_object_id).is_some());
+        assert_eq!(relations.accepted_children(parent_pdo).unwrap().len(), 1);
     }
 
     #[test]

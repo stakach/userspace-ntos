@@ -215,9 +215,10 @@ Successful win32k client switches remain counted, with per-switch text available
 in executive builds using the `debug-trace` feature.
 Filesystem snapshots use the shared CRC32C codec and bounded whole-sector staging;
 coalescing encoder fragments preserves the existing durability barriers.
-New images reserve 16 MiB for the existing snapshot slots and 16 MiB for a future
-registry append log. Set `PERSIST_IMAGE_MIB=16` to build a legacy snapshot-only
-image; the append area is not yet used for registry writes.
+New images reserve 16 MiB for snapshot slots and 16 MiB for the SYSTEM registry
+write-ahead log. Registry mutations append durable records and background folds
+reclaim the log; `NtFlushKey` verifies its durable boundary. Set
+`PERSIST_IMAGE_MIB=16` to build a legacy snapshot-only image.
 
 ### Desktop Acceptance
 
@@ -230,8 +231,9 @@ The [feature-off production scanout](docs/images/desktop-production.png) records
 genuine Explorer taskbar and Start-button rendering after a fresh profile setup.
 The [source-instrumented scanout](docs/images/desktop-source-irp.png) accompanies
 the strict native source-IRP completion and retirement gate on the same kernel code.
-This is desktop-chrome evidence, not a complete executive-gate pass; remaining
-whole-OS acceptance is tracked in [issue #18](https://github.com/stakach/userspace-ntos/issues/18).
+The complete native Explorer gate and its review were accepted in
+[issue #18](https://github.com/stakach/userspace-ntos/issues/18) and
+[PR #281](https://github.com/stakach/userspace-ntos/pull/281).
 
 `--desktop` opens a QEMU window using the real ReactOS `win32k.sys`, display driver,
 and font stack. Boot readiness is the Explorer chrome gate, not the earlier
