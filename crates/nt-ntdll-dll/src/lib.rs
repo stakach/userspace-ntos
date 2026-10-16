@@ -72,6 +72,9 @@ pub mod safe_strings;
 /// Query whether a process handle names the current process.
 pub mod current_process;
 
+/// Native architecture queries and WOW64 cross-process work-list ABI.
+pub mod wow64;
+
 /// The x64 ntdll thread entry used by the released kernel32.dll.
 pub mod user_thread_start;
 
@@ -80,6 +83,9 @@ pub mod extended_features;
 
 /// Process MUI overrides and the native NLS locale-file mapping used by kernelbase.
 pub mod locale_exports;
+
+/// UTF-16 normalization and IDN ABI entries used by the released kernelbase.
+pub mod unicode_normalization;
 
 /// Process-local address waits backed by native thread-alert syscalls.
 pub mod wait_address;
@@ -1337,6 +1343,10 @@ static KEEP_PERFORMANCE_EXPORTS: unsafe extern "C" fn() = performance::PERFORMAN
 
 #[used]
 static KEEP_WAIT_ADDRESS_EXPORTS: unsafe extern "C" fn() = wait_address::WAIT_ADDRESS_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_UNICODE_NORMALIZATION_EXPORTS: unsafe extern "C" fn() =
+    unicode_normalization::UNICODE_NORMALIZATION_EXPORT_ANCHOR_FN;
 
 #[used]
 static KEEP_SYSTEM_TIME_PRECISE_EXPORTS: unsafe extern "C" fn() =
