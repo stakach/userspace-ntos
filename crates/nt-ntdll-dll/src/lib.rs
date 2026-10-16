@@ -51,6 +51,9 @@ pub mod user_pfn;
 /// Native performance counter wrappers used by the released kernel32.dll.
 pub mod performance;
 
+/// The x64 ntdll thread entry used by the released kernel32.dll.
+pub mod user_thread_start;
+
 /// Extended processor-state feature query from the mapped NT shared-data page.
 pub mod extended_features;
 
@@ -1289,6 +1292,10 @@ static KEEP_USER_PFN_EXPORTS: unsafe extern "C" fn() = user_pfn::USER_PFN_EXPORT
 
 #[used]
 static KEEP_PERFORMANCE_EXPORTS: unsafe extern "C" fn() = performance::PERFORMANCE_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_USER_THREAD_START_EXPORTS: unsafe extern "C" fn() =
+    user_thread_start::USER_THREAD_START_EXPORT_ANCHOR_FN;
 
 #[used]
 static KEEP_EXTENDED_FEATURES_EXPORTS: unsafe extern "C" fn() =
