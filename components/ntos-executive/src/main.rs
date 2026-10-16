@@ -14805,11 +14805,92 @@ struct OwnedSurtCompletion {
     cqe: SurtCqe,
     payload: Vec<u8>,
 }
+
+/// A checked call distinguishes failure before submission from a reply that
+/// remains owned after submission. An indeterminate result is never an NTSTATUS.
+enum RingCallOutcome {
+    NoEffect(i32),
+    Completed(i32, u32, u64, u64, u64),
+    Indeterminate { request_id: u64 },
+}
 static SURT_CLIENT_TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 static SURT_CLIENT_WAIT_WAKES: AtomicU64 = AtomicU64::new(0);
 const SURT_STATUS_INVALID_BUFFER_SIZE: i32 = 0xC000_0206u32 as i32;
 
 impl RingChannel<'_> {
+    /// Submit through the existing synchronous transport while exposing its
+    /// exact completion identity. The caller must retain its Reply and input
+    /// request when this returns `Indeterminate`.
+    fn raw_owned(
+        &mut self,
+        opcode: u16,
+        in_buf: &[u8],
+        out_buf: &mut [u8],
+    ) -> RingCallOutcome {
+        if in_buf.len() > REP_DATA_LEN {
+            return RingCallOutcome::NoEffect(SURT_STATUS_INVALID_BUFFER_SIZE);
+        }
+        if self.completion_inbox.active_request().is_some() {
+            return RingCallOutcome::NoEffect(nt_status::NtStatus::DEVICE_BUSY.raw());
+        }
+        let request_id = self.next_id;
+        let (status, flags, information, detail0, detail1) =
+            self.raw(opcode, in_buf, out_buf);
+        if self.completion_inbox.active_request() == Some(request_id) {
+            RingCallOutcome::Indeterminate { request_id }
+        } else {
+            RingCallOutcome::Completed(status, flags, information, detail0, detail1)
+        }
+    }
+
+    /// Retire only the exact in-flight request. A missing or unusable CQE keeps
+    /// the shared frames and the caller's retained Reply owned by the request.
+    fn poll_owned(
+        &mut self,
+        request_id: u64,
+        out_buf: &mut [u8],
+    ) -> Option<(i32, u32, u64, u64, u64)> {
+        assert_eq!(self.completion_inbox.active_request(), Some(request_id));
+        let completion = if let Some(owned) = self.completion_inbox.take(request_id) {
+            Some(owned)
+        } else {
+            match self.cq.try_pop() {
+                Ok(Some(mut cqe)) => {
+                    let mut payload = Vec::new();
+                    let n = (cqe.information as usize).min(REP_DATA_LEN);
+                    if payload.try_reserve_exact(n).is_err() {
+                        // The CQE itself is exact and terminal. Preserve its
+                        // identity and detail words, but never expose success
+                        // without the payload that the service returned.
+                        cqe.status = nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw();
+                        cqe.information = 0;
+                    } else {
+                        payload.resize(n, 0);
+                        unsafe {
+                            let src = self.rep_vaddr as *const u8;
+                            for (index, slot) in payload.iter_mut().enumerate() {
+                                *slot = core::ptr::read_volatile(src.add(index));
+                            }
+                        }
+                    }
+                    self.completion_inbox.accept(
+                        request_id,
+                        cqe.request_id,
+                        OwnedSurtCompletion { cqe, payload },
+                    )
+                }
+                Ok(None) | Err(_) => None,
+            }
+        }?;
+        let cqe = completion.cqe;
+        let n = (cqe.information as usize)
+            .min(out_buf.len())
+            .min(completion.payload.len());
+        out_buf[..n].copy_from_slice(&completion.payload[..n]);
+        self.completion_inbox.finish(request_id);
+        Some((cqe.status, cqe.flags, cqe.information, cqe.detail0, cqe.detail1))
+    }
+
     /// One synchronous request/reply: stage `in_buf` in the request frame, push the
     /// SQE, wait for the matching completion, copy the reply payload out. Returns
     /// `(status, flags, information, detail0, detail1)`.

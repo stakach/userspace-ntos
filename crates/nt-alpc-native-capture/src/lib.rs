@@ -11,6 +11,9 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+mod retained_create;
+pub use retained_create::{CreateOwner, RetainedCreate, RetainedCreateError, TerminalCreate};
+
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
@@ -25,6 +28,20 @@ pub struct CapturedCreatePort {
     pub security_descriptor: u64,
     pub name: Vec<u16>,
     pub attributes: [u8; 72],
+}
+
+impl CapturedCreatePort {
+    pub fn port_flags(&self) -> u32 {
+        u32::from_le_bytes(self.attributes[0..4].try_into().unwrap())
+    }
+
+    pub fn max_message_length(&self) -> u64 {
+        u64::from_le_bytes(self.attributes[24..32].try_into().unwrap())
+    }
+
+    pub fn max_pool_usage(&self) -> u64 {
+        u64::from_le_bytes(self.attributes[40..48].try_into().unwrap())
+    }
 }
 
 /// Capture the three native arguments into executive-owned storage, with no
@@ -104,6 +121,7 @@ mod tests {
             memory[160 + index * 2..162 + index * 2].copy_from_slice(&unit.to_le_bytes());
         }
         memory[256 + 24..256 + 32].copy_from_slice(&328u64.to_le_bytes());
+        memory[256 + 40..256 + 48].copy_from_slice(&8192u64.to_le_bytes());
         memory
     }
 
@@ -118,6 +136,8 @@ mod tests {
         }, |address, size| address == 16 && size == 8).unwrap();
         assert_eq!(captured.name, "\\SmApiPort".encode_utf16().collect::<Vec<_>>());
         assert_eq!(u64::from_le_bytes(captured.attributes[24..32].try_into().unwrap()), 328);
+        assert_eq!(captured.max_message_length(), 328);
+        assert_eq!(captured.max_pool_usage(), 8192);
         memory[160] = 0;
         assert_eq!(memory[160], 0);
         assert_eq!(captured.name[0], b'\\' as u16);
