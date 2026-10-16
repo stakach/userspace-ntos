@@ -72,8 +72,20 @@ pub mod user_thread_start;
 /// Extended processor-state feature query from the mapped NT shared-data page.
 pub mod extended_features;
 
+/// Process MUI overrides and the native NLS locale-file mapping used by kernelbase.
+pub mod locale_exports;
+
 /// Process-local address waits backed by native thread-alert syscalls.
 pub mod wait_address;
+
+/// Work callback ownership and cancellation state, separately host-testable.
+mod threadpool_state;
+
+/// Object threadpool work exports on the existing native completion-port worker.
+pub mod threadpool;
+
+/// Fail-closed Tp ABI entries awaiting native timer, wait, IO, ALPC, and pool ownership.
+pub mod threadpool_unavailable;
 
 /// Windows x64 extended-context ABI over the currently supported legacy context.
 pub mod extended_context;
