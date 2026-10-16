@@ -5,13 +5,18 @@ use std::process::Command;
 #[test]
 fn acpi_root_publication_prepares_description_before_device_install() {
     let source = include_str!("../../../components/ntos-executive/src/acpi_platform.rs");
-    let constants_start = source.find("pub(crate) const ACPI_ROOT_INSTANCE_PATH:")
+    let constants_start = source
+        .find("pub(crate) const ACPI_ROOT_INSTANCE_PATH:")
         .expect("native ACPI root identity constants");
-    let constants_end = source[constants_start..].find("\n#[derive(Clone, Copy)]")
-        .expect("end of native ACPI root identity constants") + constants_start;
+    let constants_end = source[constants_start..]
+        .find("\n#[derive(Clone, Copy)]")
+        .expect("end of native ACPI root identity constants")
+        + constants_start;
     let constants = &source[constants_start..constants_end];
     syn::parse_file(constants).expect("extract complete native ACPI root identity constants");
-    let functions = &source[source.find("fn encode_registry_sz(").expect("native ACPI root encoder")..];
+    let functions = &source[source
+        .find("fn encode_registry_sz(")
+        .expect("native ACPI root encoder")..];
     syn::parse_file(functions).expect("extract complete native ACPI root publication functions");
     let harness = format!("{constants}\n{PORTS}\n{functions}\n{CASES}");
     let directory = std::env::temp_dir().join(format!(
@@ -34,7 +39,10 @@ fn acpi_root_publication_prepares_description_before_device_install() {
         "native ACPI root fixture must compile:\n{}",
         String::from_utf8_lossy(&compiled.stderr)
     );
-    let result = Command::new(&binary).args(["cases::", "--nocapture"]).output().unwrap();
+    let result = Command::new(&binary)
+        .args(["cases::", "--nocapture"])
+        .output()
+        .unwrap();
     let _ = std::fs::remove_dir_all(directory);
     assert!(
         result.status.success(),
@@ -45,6 +53,7 @@ fn acpi_root_publication_prepares_description_before_device_install() {
 }
 
 const PORTS: &str = r#"
+extern crate alloc;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -61,7 +70,7 @@ mod nt_status {
 }
 mod nt_config_manager {
     #[repr(u32)]
-    pub enum RegistryValueType { Sz = 1, MultiSz = 7 }
+    pub enum RegistryValueType { Sz = 1, Binary = 3, MultiSz = 7 }
 }
 mod nt_pnp_manager {
     pub mod device_text {
@@ -94,8 +103,11 @@ mod nt_config_client {
         pub data: Vec<u8>,
     }
     #[derive(Clone)]
+    pub struct HiveSubkeySnapshot { pub name: String }
+    #[derive(Clone)]
     pub struct HiveKeySnapshot {
         pub mount_generation: u64,
+        pub subkeys: Vec<HiveSubkeySnapshot>,
         pub values: Vec<HiveValueSnapshot>,
     }
     pub enum SystemHiveMutation<'a> {
@@ -112,6 +124,8 @@ enum RecordedMutation {
 #[derive(Default)]
 struct CmState {
     existing: Option<nt_config_client::HiveKeySnapshot>,
+    libernt_driver_database: bool,
+    ambiguous_driver_packages: bool,
     writes: Vec<RecordedMutation>,
 }
 thread_local! { static CM: RefCell<CmState> = RefCell::new(CmState::default()); }
@@ -121,6 +135,7 @@ fn config_manager_query_critical_device_binding(
     id: &str,
 ) -> Result<Option<nt_config_client::CriticalDeviceBinding>, i32> {
     assert_eq!(id, ACPI_ROOT_COMPATIBLE_ID);
+    if CM.with(|cm| cm.borrow().libernt_driver_database) { return Ok(None); }
     Ok(Some(nt_config_client::CriticalDeviceBinding {
         mount_generation: 7,
         class_guid: "{4D36E97D-E325-11CE-BFC1-08002BE10318}".into(),
@@ -130,6 +145,46 @@ fn config_manager_query_critical_device_binding(
 fn config_manager_query_system_hive_key(
     path: &str,
 ) -> Result<nt_config_client::HiveKeySnapshot, i32> {
+    if CM.with(|cm| cm.borrow().libernt_driver_database) {
+        let package = "acpi.inf_amd64_54fdab1b0f600624";
+        let duplicate = "acpi.inf_amd64_other";
+        let ambiguous = CM.with(|cm| cm.borrow().ambiguous_driver_packages);
+        let root = r"\Registry\Machine\System\DriverDatabase";
+        let version = [0xff, 0xff, 9, 0, 0, 0, 0, 0,
+            0x7d, 0xe9, 0x36, 0x4d, 0x25, 0xe3, 0xce, 0x11,
+            0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18];
+        let value = |name: &str, value_type: u32, data: Vec<u8>| nt_config_client::HiveValueSnapshot {
+            name: name.into(), value_type, data,
+        };
+        let sz = |text: &str| text.encode_utf16().chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes).collect();
+        let snapshot = |subkeys: Vec<nt_config_client::HiveSubkeySnapshot>,
+                        values: Vec<nt_config_client::HiveValueSnapshot>| nt_config_client::HiveKeySnapshot {
+            mount_generation: 7, subkeys, values,
+        };
+        let entry = match path.strip_prefix(root) {
+            Some(r"\DeviceIds\*PNP0C08") => Some(snapshot(vec![], vec![
+                value("acpi.inf", 3, vec![1, 0xff, 0, 0])])),
+            Some(r"\DriverPackages") => Some(snapshot(
+                [package, duplicate].into_iter().take(if ambiguous { 2 } else { 1 })
+                    .map(|name| nt_config_client::HiveSubkeySnapshot { name: name.into() })
+                    .collect(), vec![])),
+            Some(r"\DriverPackages\acpi.inf_amd64_54fdab1b0f600624") =>
+                Some(snapshot(vec![], vec![value("Version", 3, version.to_vec())])),
+            Some(r"\DriverPackages\acpi.inf_amd64_other") if ambiguous =>
+                Some(snapshot(vec![], vec![value("Version", 3, version.to_vec())])),
+            Some(r"\DriverPackages\acpi.inf_amd64_54fdab1b0f600624\Descriptors\*PNP0C08") =>
+                Some(snapshot(vec![], vec![value("Configuration", 1, sz("ACPI_Inst.NT"))])),
+            Some(r"\DriverPackages\acpi.inf_amd64_other\Descriptors\*PNP0C08") if ambiguous =>
+                Some(snapshot(vec![], vec![value("Configuration", 1, sz("ACPI_Inst.NT"))])),
+            Some(r"\DriverPackages\acpi.inf_amd64_54fdab1b0f600624\Configurations\ACPI_Inst.NT") =>
+                Some(snapshot(vec![], vec![value("Service", 1, sz("acpi"))])),
+            Some(r"\DriverPackages\acpi.inf_amd64_other\Configurations\ACPI_Inst.NT") if ambiguous =>
+                Some(snapshot(vec![], vec![value("Service", 1, sz("acpi"))])),
+            _ => None,
+        };
+        if let Some(snapshot) = entry { return Ok(snapshot); }
+    }
     assert_eq!(path, ACPI_ROOT_ENUM_PATH);
     CM.with(|cm| cm.borrow().existing.clone())
         .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.raw())
@@ -211,6 +266,7 @@ fn existing_enum_key_without_description_is_completed() {
         *cm.borrow_mut() = CmState {
             existing: Some(nt_config_client::HiveKeySnapshot {
                 mount_generation: 7,
+                subkeys: vec![],
                 values: [
                     ("HardwareID", nt_config_manager::RegistryValueType::MultiSz as u32,
                         super::encode_registry_multi_sz(&[ACPI_ROOT_HARDWARE_ID]).unwrap()),
@@ -223,6 +279,8 @@ fn existing_enum_key_without_description_is_completed() {
                     name: name.into(), value_type, data,
                 }).collect(),
             }),
+            libernt_driver_database: false,
+            ambiguous_driver_packages: false,
             writes: Vec::new(),
         };
     });
@@ -242,6 +300,7 @@ fn existing_device_description_survives_policy_refresh() {
         *cm.borrow_mut() = CmState {
             existing: Some(nt_config_client::HiveKeySnapshot {
                 mount_generation: 7,
+                subkeys: vec![],
                 values: [
                     ("DeviceDesc", nt_config_manager::RegistryValueType::Sz as u32,
                         real_description.clone()),
@@ -251,6 +310,8 @@ fn existing_device_description_survives_policy_refresh() {
                     name: name.into(), value_type, data,
                 }).collect(),
             }),
+            libernt_driver_database: false,
+            ambiguous_driver_packages: false,
             writes: Vec::new(),
         };
     });
@@ -260,6 +321,33 @@ fn existing_device_description_survives_policy_refresh() {
     assert!(!writes.iter().any(|write| matches!(write,
         RecordedMutation::SetValue { name, .. } if name.eq_ignore_ascii_case("DeviceDesc")
     )), "the firmware root's real description must survive a policy refresh");
+}
+
+#[test]
+fn libernt_driver_database_binding_publishes_acpi_root_without_critical_device_key() {
+    CM.with(|cm| *cm.borrow_mut() = CmState {
+        libernt_driver_database: true,
+        ..CmState::default()
+    });
+    unsafe { publish_acpi_root_devnode_from_registry_policy().unwrap() };
+    let writes = CM.with(|cm| cm.borrow().writes.clone());
+    assert!(writes.contains(&value("Service", &sz("acpi"))));
+    assert!(writes.contains(&value("ClassGUID", &sz("{4D36E97D-E325-11CE-BFC1-08002BE10318}"))));
+    assert_description(&writes);
+}
+
+#[test]
+fn ambiguous_driver_database_packages_do_not_publish_acpi_root() {
+    CM.with(|cm| *cm.borrow_mut() = CmState {
+        libernt_driver_database: true,
+        ambiguous_driver_packages: true,
+        ..CmState::default()
+    });
+    assert_eq!(
+        unsafe { publish_acpi_root_devnode_from_registry_policy() },
+        Err(nt_status::NtStatus::INVALID_PARAMETER),
+    );
+    assert!(CM.with(|cm| cm.borrow().writes.is_empty()));
 }
 }
 "#;
