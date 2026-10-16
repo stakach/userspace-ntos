@@ -183,6 +183,7 @@ impl Journal {
             return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
         };
         update.advance().map_err(snapshot_store_error_status)?;
+        SYSTEM_WAL_FOLD_REQUIRED.store(true, Ordering::Release);
         let Some(Stage::Anchoring(update)) = self.stage.take() else { unreachable!() };
         let (lease, continuation) = update.into_continuation()
             .expect("both WAL anchors durably advanced");

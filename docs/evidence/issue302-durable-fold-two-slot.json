@@ -1,0 +1,24 @@
+{
+  "issue": 302,
+  "profile": "production GUI, resumed from a payload-valid v7 snapshot",
+  "source": "08bf94f8 plus the uncommitted mixed-hive WAL and durable-fold increment",
+  "bound_seconds": 3600,
+  "stop": "QMP quit after 1255 seconds of guest progress to inspect persistence and switch to the accepted #18 production tail",
+  "result": "No Explorer paint claim. Both saved v7 snapshot slots contain a payload-valid UNTHIVE1 SYSTEM primary after native execution.",
+  "last_census": {
+    "number": 38,
+    "guest_ms": 1255111,
+    "events": 30611
+  },
+  "saved_reserve": {
+    "path": "/tmp/issue302-durable-20m-tail.bin",
+    "sha256": "7ddec99c293926e921d9231e527b29831c0b411a669773c872380963ae49e92c",
+    "slot_0": { "format_version": 7, "payload_bytes": 1469354, "system_primary_bytes": 344184, "magic": "UNTHIVE1" },
+    "slot_1": { "format_version": 7, "payload_bytes": 1469181, "system_primary_bytes": 344184, "magic": "UNTHIVE1" }
+  },
+  "log": {
+    "archived": "docs/evidence/issue302-durable-fold-two-slot.log.gz",
+    "raw_sha256": "d6d8dc5f9e00039a65124a07f82d0630179d6416b6a3bae9663928f7e212d0c8",
+    "archived_sha256": "fab65248f1efaa48f46e85764f98c1149480616a8c2c3251d9c9af8b3c6821a4"
+  }
+}

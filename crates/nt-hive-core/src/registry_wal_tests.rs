@@ -1,8 +1,123 @@
 use super::registry_wal::{encode_record, scan_records, WalError};
 use super::{
     complete_log_sequence_span, complete_log_sequence_span_from, encode_log_record,
-    try_replay_log, try_replay_log_complete, Hive, HiveKind, HiveLogOp,
+    try_replay_log, try_replay_log_complete, validate_first_hive_wal_append,
+    Hive, HiveKind, HiveLogOp, HiveManager, MemoryHiveIoProvider,
 };
+
+#[test]
+fn replay_uses_durable_record_sequence_after_a_noop_and_multikey_apply() {
+    let mut hive = Hive::new(HiveKind::Software);
+    hive.create_key("Existing");
+    hive.finish_clean_import();
+    let noop = encode_log_record(&HiveLogOp::CreateKey { path: "Existing" }, 1);
+    assert_eq!(try_replay_log(&mut hive, &noop, 0), Ok(1));
+    assert_eq!(hive.sequence, 1, "the next append must use the durable sequence 2");
+    let mut nested_hive = Hive::new(HiveKind::Software);
+    let nested = encode_log_record(&HiveLogOp::CreateKey { path: "A\\B" }, 1);
+    assert_eq!(try_replay_log(&mut nested_hive, &nested, 0), Ok(1));
+    assert_eq!(nested_hive.sequence, 1, "one record owns one sequence despite creating two cells");
+    nested_hive.clear_dirty();
+    assert_eq!(nested_hive.dirty_count(), 0, "replayed cells belong to the durable baseline");
+    hive.clear_dirty();
+    assert_eq!(hive.dirty_count(), 0, "replayed cells belong to the durable baseline");
+
+    let provider = MemoryHiveIoProvider::new();
+    let mut manager = HiveManager::for_live_hive(provider, &hive);
+    manager.mutate_with_live_apply(
+        &mut hive, HiveLogOp::CreateKey { path: "Existing" },
+        |hive| { hive.create_key("Existing"); true },
+    ).unwrap();
+    assert_eq!(hive.sequence, 2, "a durable no-op record still advances the next live sequence");
+}
+
+#[test]
+fn manager_appends_after_replayed_noop_and_compound_record_survive_restart() {
+    use super::{encode_image, HiveIoProvider, RegistryValueType};
+
+    let mut original = Hive::new(HiveKind::Software);
+    original.create_key("Existing");
+    original.finish_clean_import();
+    let mut provider = MemoryHiveIoProvider::with_image(encode_image(&original));
+    provider.append_log_record(&encode_log_record(
+        &HiveLogOp::CreateKey { path: "Existing" }, 1,
+    )).unwrap();
+    provider.append_log_record(&encode_log_record(
+        &HiveLogOp::CreateKey { path: "A\\B" }, 2,
+    )).unwrap();
+
+    let mut manager = HiveManager::new(provider);
+    let mut live = manager.boot(HiveKind::Software).unwrap();
+    assert_eq!(live.sequence, 2);
+    manager.mutate(&mut live, HiveLogOp::SetValue {
+        path: "A\\B", name: "Answer", value_type: RegistryValueType::Dword,
+        data: &42u32.to_le_bytes(),
+    }).unwrap();
+    assert_eq!(live.sequence, 3);
+
+    manager.provider_mut().crash();
+    let mut rebooted_manager = HiveManager::new(manager.into_provider());
+    let rebooted = rebooted_manager.boot(HiveKind::Software).unwrap();
+    let key = rebooted.open_key("A\\B").unwrap();
+    assert_eq!(rebooted.sequence, 3);
+    assert_eq!(rebooted.query_dword(key, "Answer"), Some(42));
+}
+
+#[test]
+fn first_typed_hive_wal_append_bridges_primary_and_complete_sidecar() {
+    let record = |sequence| encode_log_record(
+        &HiveLogOp::CreateKey { path: "Recovered" }, sequence,
+    );
+    let mut old_sidecar = record(5);
+    old_sidecar.extend_from_slice(&record(6));
+    old_sidecar.extend_from_slice(&record(7));
+    old_sidecar.extend_from_slice(&record(8));
+    assert_eq!(validate_first_hive_wal_append(7, &old_sidecar, &record(9)), Ok(9));
+    assert_eq!(validate_first_hive_wal_append(7, &old_sidecar[..old_sidecar.len() - record(8).len()], &record(8)), Ok(8));
+    assert_eq!(validate_first_hive_wal_append(7, &[], &record(8)), Ok(8));
+    assert_eq!(validate_first_hive_wal_append(7, &[], &record(9)), Err(super::HiveLogReplayError::SequenceGap));
+    assert_eq!(validate_first_hive_wal_append(7, &old_sidecar, &record(10)), Err(super::HiveLogReplayError::SequenceGap));
+    assert_eq!(validate_first_hive_wal_append(7, &record(9), &record(10)), Err(super::HiveLogReplayError::SequenceGap));
+    assert_eq!(
+        validate_first_hive_wal_append(7, &old_sidecar[..old_sidecar.len() - 1], &record(9)),
+        Err(super::HiveLogReplayError::Truncated),
+    );
+}
+
+#[test]
+fn first_append_accepts_complete_legacy_duplicate_before_next_sequence() {
+    let record = |sequence| encode_log_record(
+        &HiveLogOp::CreateKey { path: "Recovered" }, sequence,
+    );
+    let mut sidecar = record(1);
+    sidecar.extend_from_slice(&record(2));
+    sidecar.extend_from_slice(&record(2));
+    assert_eq!(validate_first_hive_wal_append(0, &sidecar, &record(3)), Ok(3));
+    assert_eq!(
+        validate_first_hive_wal_append(0, &sidecar, &record(4)),
+        Err(super::HiveLogReplayError::SequenceGap),
+    );
+    sidecar.push(0x48);
+    assert_eq!(
+        validate_first_hive_wal_append(0, &sidecar, &record(3)),
+        Err(super::HiveLogReplayError::Truncated),
+    );
+}
+
+#[test]
+fn first_append_after_fold_rejects_a_same_length_rewritten_sidecar() {
+    let record = |sequence| encode_log_record(
+        &HiveLogOp::CreateKey { path: "Recovered" }, sequence,
+    );
+    let former = record(8);
+    let rewritten = record(6);
+    assert_eq!(former.len(), rewritten.len());
+    assert_eq!(validate_first_hive_wal_append(7, &former, &record(9)), Ok(9));
+    assert_eq!(
+        validate_first_hive_wal_append(7, &rewritten, &record(9)),
+        Err(super::HiveLogReplayError::SequenceGap),
+    );
+}
 
 #[test]
 fn complete_records_scan_only_in_exact_mount_generation_order() {

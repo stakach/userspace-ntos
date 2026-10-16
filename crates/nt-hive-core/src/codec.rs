@@ -1,6 +1,8 @@
 //! Hive image + log codecs (spec §11-§12). Versioned, checksummed, explicit TLV (never Rust
 //! struct layout), reusing the `nt-config-store` byte primitives + CRC-32C.
 
+use alloc::collections::BTreeMap;
+use alloc::rc::Rc;
 use alloc::vec::Vec;
 
 use nt_config_store::codec::{crc32c, Reader};
@@ -398,10 +400,27 @@ fn put_u64_at(out: &mut [u8], v: u64) {
     out.copy_from_slice(&v.to_le_bytes());
 }
 
-fn compact_cell_id(map: &[(CellId, CellId)], raw: CellId) -> Option<CellId> {
-    map.iter()
-        .find(|(existing, _)| *existing == raw)
-        .map(|(_, mapped)| *mapped)
+fn compact_cell_id(map: &BTreeMap<CellId, CellId>, raw: CellId) -> Option<CellId> {
+    map.get(&raw).copied()
+}
+
+fn intern_decoded_value_data(
+    hive: &mut Hive,
+    index: &mut BTreeMap<(usize, u32), Vec<usize>>,
+    data: Vec<u8>,
+) -> usize {
+    let bucket = index.entry((data.len(), crc32c(&data))).or_default();
+    if let Some(existing) = bucket
+        .iter()
+        .copied()
+        .find(|&existing| hive.value_blobs[existing].as_slice() == data.as_slice())
+    {
+        return existing;
+    }
+    let blob = hive.value_blobs.len();
+    hive.value_blobs.push(Rc::new(data));
+    bucket.push(blob);
+    blob
 }
 
 /// Decode a hive image into a fresh [`Hive`], validating both CRCs + the schema (spec §11).
@@ -439,7 +458,8 @@ pub fn decode_image(bytes: &[u8]) -> Result<Hive, HiveDecodeError> {
     // Rebuild the arena with compact CellIds. Older images can contain REGF cell offsets as
     // CellIds; preserving them would inflate the restored `Vec<Option<Cell>>` into a sparse arena.
     let mut hive = Hive::empty(kind, CellId(0), generation, sequence);
-    let mut id_map: Vec<(CellId, CellId)> = Vec::new();
+    let mut id_map: BTreeMap<CellId, CellId> = BTreeMap::new();
+    let mut blob_index: BTreeMap<(usize, u32), Vec<usize>> = BTreeMap::new();
     let mut next_id = 0u64;
     map_decoded_cell_id(&mut id_map, CellId(root_cell), &mut next_id);
     let mut pr = Reader::new(payload);
@@ -491,7 +511,7 @@ pub fn decode_image(bytes: &[u8]) -> Result<Hive, HiveDecodeError> {
                     return Err(HiveDecodeError::Truncated);
                 };
                 let id = map_decoded_cell_id(&mut id_map, raw_id, &mut next_id);
-                let data_blob = hive.intern_value_data(data);
+                let data_blob = intern_decoded_value_data(&mut hive, &mut blob_index, data);
                 hive.insert_value(ValueCell {
                     id,
                     parent_key,
@@ -807,13 +827,17 @@ pub fn image_value_len_if_valid(
     Ok(0)
 }
 
-fn map_decoded_cell_id(map: &mut Vec<(CellId, CellId)>, raw: CellId, next: &mut u64) -> CellId {
+fn map_decoded_cell_id(
+    map: &mut BTreeMap<CellId, CellId>,
+    raw: CellId,
+    next: &mut u64,
+) -> CellId {
     if let Some(mapped) = compact_cell_id(map, raw) {
         return mapped;
     }
     let mapped = CellId(*next);
     *next = next.saturating_add(1);
-    map.push((raw, mapped));
+    map.insert(raw, mapped);
     mapped
 }
 
@@ -1005,6 +1029,7 @@ pub fn replay_log(hive: &mut Hive, bytes: &[u8], base: u64) -> u64 {
             if apply_log(hive, op, payload).is_err() {
                 break;
             }
+            hive.align_logged_sequence(sequence);
             last = sequence;
         }
     }
@@ -1083,6 +1108,7 @@ fn try_replay_log_with_tail_policy(
         }
         if sequence > last {
             apply_log(hive, op, payload)?;
+            hive.align_logged_sequence(sequence);
             last = sequence;
         }
     }
@@ -1120,6 +1146,34 @@ pub fn complete_log_sequence_span_from(
     previous_sequence: u64,
 ) -> Result<(u64, u64), HiveLogReplayError> {
     complete_log_sequence_span_inner(bytes, Some(previous_sequence))
+}
+
+/// Admit the first typed WAL append after a primary image and its existing sidecar.
+///
+/// A primary checkpoint may have reached disk before the old sidecar was truncated. Complete
+/// records already covered by that newer primary are harmless, as are complete duplicate records
+/// left by the legacy writer. Every newly advancing record must bridge the primary sequence
+/// exactly. A torn sidecar cannot become an interior tail once a durable WAL record follows it.
+pub fn validate_first_hive_wal_append(
+    primary_sequence: u64,
+    sidecar: &[u8],
+    candidate: &[u8],
+) -> Result<u64, HiveLogReplayError> {
+    let mut previous = primary_sequence;
+    let mut reader = Reader::new(sidecar);
+    while !reader.is_empty() {
+        let Some(record) = next_verified_log_record(sidecar, &mut reader)? else {
+            return Err(HiveLogReplayError::Truncated);
+        };
+        validate_log_payload(record.op, record.payload)?;
+        if record.sequence > previous {
+            if previous.checked_add(1) != Some(record.sequence) {
+                return Err(HiveLogReplayError::SequenceGap);
+            }
+            previous = record.sequence;
+        }
+    }
+    complete_log_sequence_span_from(candidate, previous).map(|(_, last)| last)
 }
 
 fn complete_log_sequence_span_inner(

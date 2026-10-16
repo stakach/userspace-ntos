@@ -22,6 +22,17 @@ fn source_block<'a>(source: &'a str, marker: &str) -> &'a str {
 }
 
 #[test]
+fn completed_relation_publications_reuse_one_cm_begin_requester() {
+    let admission = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    let relation = include_str!("../../../components/ntos-executive/src/hosted_relation_publication.rs");
+    let admission = source_block(admission, "unsafe fn publish_hosted_bus_relations(");
+    assert!(admission.contains("reserve_relation_mutation_begin("));
+    assert!(!admission.contains("CmMutationBeginAttempts::new()"));
+    assert!(relation.contains("static mut RELATION_BEGIN_ATTEMPTS: CmMutationBeginAttempts"));
+    assert!(!relation.contains("attempts: CmMutationBeginAttempts,"));
+}
+
+#[test]
 fn native_registry_mount_requires_wal_replay_admission() {
     let source = include_str!("../../../components/ntos-executive/src/writable_fs.rs");
     let start = source.find("unsafe fn restore_snapshot_volume(").unwrap();
@@ -55,10 +66,17 @@ fn native_boot_verifies_wal_suffix_before_publishing_volume_for_cm_import() {
         boot.contains("RegistryWal::recover("),
         "boot must parse the disjoint WAL before publishing persisted SYSTEM state"
     );
-    assert!(boot.contains("verified_boot_system_log(&log, &wal)"));
+    assert!(boot.contains("wal.verified_prefix()")
+        && boot.contains("wal.verified_record_end_lba(anchor.serial)"),
+        "boot must bind the selected snapshot anchor to the recovered physical WAL prefix");
     assert!(
-        boot.contains("complete_log_sequence_span(&record.payload)"),
-        "each committed WAL payload must contain complete semantic log records"
+        boot.contains("decode_volume_wal_payload(&record.payload)")
+            && boot.contains("complete_log_sequence_span(bytes)")
+            && boot.contains("complete_log_sequence_span_from(bytes, previous)")
+            && boot.contains("hive_wal::validate_first_record(")
+            && boot.contains("payload.expected_log_len, payload.record")
+            && boot.contains("fs.replay_hive_log_wal_payload(payload)"),
+        "boot must route mixed records and verify complete contiguous hive journals before publication"
     );
     assert!(boot.contains("fs: Some(fs)"), "boot must retain the unpublished volume");
 
@@ -71,6 +89,35 @@ fn native_boot_verifies_wal_suffix_before_publishing_volume_for_cm_import() {
     assert!(restore < import, "CM import must consume the verified boot log");
     assert!(wal_import < publish, "strict WAL replay must precede writable mount publication");
     assert!(import < publish, "CM semantic replay must precede writable mount publication");
+}
+
+#[test]
+fn retained_wal_files_and_checkpoint_images_escape_transient_request_scope() {
+    let fold = include_str!("../../../components/ntos-executive/src/writable_fs/system_wal_fold.rs");
+    let commit = include_str!("../../../components/ntos-executive/src/writable_fs/hive_wal.rs");
+    let fold_entry = source_block(fold, "pub(crate) unsafe fn fold_system_wal_if_dirty(");
+    let commit_entry = source_block(commit, "pub(super) unsafe fn commit_non_system_hive_log_wal(");
+    assert!(fold_entry.find("allocator::enter_durable()").expect("durable fold admission")
+        < fold_entry.find("config_manager_prepare_system_hive_checkpoint()")
+            .expect("CM checkpoint transfer"),
+        "CM image transferred into the mounted filesystem must outlive the transient timer scope");
+    assert!(commit_entry.find("allocator::enter_durable()").expect("durable log admission")
+        < commit_entry.find("prepare_log_baseline(path, record)").expect("log baseline"),
+        "retained log catalog and WAL replay bytes must be allocated durably");
+}
+
+#[test]
+fn folded_hive_log_cache_requires_a_new_baseline_before_reuse() {
+    let source = include_str!("../../../components/ntos-executive/src/writable_fs/hive_wal.rs");
+    let fold = source_block(source, "pub(super) unsafe fn note_volume_wal_folded(");
+    let baseline = source_block(source, "unsafe fn prepare_log_baseline(");
+    assert!(fold.contains("baseline.has_wal_records = false"));
+    assert!(baseline.contains(
+        "entry.has_wal_records && entry.file_id == file_id && entry.expected_len == length"
+    ), "a fold releases write protection, so file ID and length cannot authenticate cached bytes");
+    assert!(baseline.contains("checkpoint_dirty_volume()?")
+        && baseline.contains("validate_first_record(writable_fs()?, path, length, record)?"),
+        "the first append after a fold must establish and verify a fresh durable baseline");
 }
 
 #[test]

@@ -299,6 +299,9 @@ impl FileSystem {
         }
         let object = self.handles[index].as_ref().unwrap();
         let entry_id = object.entry_id;
+        if object.delete_pending && self.wal_protected_subtree(object.node_id) {
+            return Err(STATUS_ACCESS_DENIED);
+        }
         let node = self.volume.node(object.node_id).ok_or(STATUS_DATA_ERROR)?;
         let filter = if node.is_dir {
             crate::FILE_NOTIFY_CHANGE_DIR_NAME

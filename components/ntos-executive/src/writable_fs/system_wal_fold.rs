@@ -8,7 +8,7 @@ use super::*;
 use nt_fs::SnapshotBlockDevice;
 
 struct FoldWork {
-    prepared: nt_config_client::PreparedSystemHiveCheckpoint,
+    prepared: Option<nt_config_client::PreparedSystemHiveCheckpoint>,
     lease: snapshot_storage::Lease,
     old_continuation: Option<nt_fs::RegistryWalContinuation>,
     next_continuation: Option<nt_fs::RegistryWalContinuation>,
@@ -72,6 +72,9 @@ fn needs_epoch_rollover(high_water_end_lba: u64, wal_sectors: u64) -> bool {
 /// Background/shutdown checkpoint boundary. A clean CM observation has no image to fold.
 /// An ambiguous ACK may be retried; an uncertain physical fold refuses reentry.
 pub(crate) unsafe fn fold_system_wal_if_dirty() -> Result<bool, u32> {
+    // The timer invokes this under a rewindable transient scope. CM checkpoint bytes and the
+    // folded live file survive that scope; allocate every retained owner and image durably.
+    let _durable = crate::allocator::enter_durable();
     if let Some(work) = (*core::ptr::addr_of!(FOLD_WORK)).as_ref() {
         return match work.phase {
             Phase::Acknowledging => acknowledge_retained(),
@@ -91,10 +94,17 @@ pub(crate) unsafe fn fold_system_wal_if_dirty() -> Result<bool, u32> {
             snapshot_store_error_status(error)
         })?;
     let prepared = match crate::config_manager_prepare_system_hive_checkpoint() {
-        Ok(Some(prepared)) => prepared,
-        Ok(None) => return Ok(false),
+        Ok(prepared) => prepared,
         Err(status) => return Err(status as u32),
     };
+    if prepared.is_none() && SYSTEM_WAL_FOLD_REQUIRED.load(Ordering::Acquire) {
+        return Err(block(nt_fs::STATUS_DATA_ERROR));
+    }
+    // Other mutable hives share this physical WAL. Their records also need a two-slot fold
+    // before an image checkpoint truncates a sidecar or the epoch is reclaimed.
+    if prepared.is_none() && manifest.base_serial == manifest.high_water_serial {
+        return Ok(false);
+    }
     let anchored = nt_fs::WalSnapshotAnchor {
         incarnation: manifest.incarnation,
         serial: manifest.high_water_serial,
@@ -129,11 +139,19 @@ unsafe fn fold_retained(
     let fs = (&mut *core::ptr::addr_of_mut!(EXEC_WRITABLE_FS))
         .as_mut().ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
 
-    // The CM image is the full post-WAL state. Keep its exact preparation token in FOLD_WORK.
-    let image = core::mem::take(&mut work.prepared.image);
-    replace_boot_file(fs, CONFIG_SYSTEM_HIVE_PATH, image)?;
-    let log_path = alloc::format!("{}.LOG", CONFIG_SYSTEM_HIVE_PATH);
-    replace_boot_file(fs, &log_path, alloc::vec::Vec::new())?;
+    // A CM preparation is the full post-WAL SYSTEM state. A non-SYSTEM-only epoch has no
+    // SYSTEM image to replace; the frozen volume already holds its exact hive log appends.
+    if let Some(prepared) = work.prepared.as_mut() {
+        if nt_hive_core::image_len_if_valid(&prepared.image).ok()
+            != Some(prepared.image.len())
+        {
+            return Err(nt_fs::STATUS_DATA_ERROR);
+        }
+        let image = core::mem::take(&mut prepared.image);
+        replace_boot_file(fs, CONFIG_SYSTEM_HIVE_PATH, image)?;
+        let log_path = alloc::format!("{}.LOG", CONFIG_SYSTEM_HIVE_PATH);
+        replace_boot_file(fs, &log_path, alloc::vec::Vec::new())?;
+    }
 
     let folded = nt_fs::WalSnapshotManifest {
         incarnation: manifest.incarnation,
@@ -214,8 +232,10 @@ unsafe fn acknowledge_retained() -> Result<bool, u32> {
     let work = (&*core::ptr::addr_of!(FOLD_WORK)).as_ref()
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
     debug_assert!(work.phase == Phase::Acknowledging);
-    if let Err(status) = crate::config_manager_acknowledge_system_hive_checkpoint(&work.prepared) {
-        return Err(block(status as u32));
+    if let Some(prepared) = work.prepared.as_ref() {
+        if let Err(status) = crate::config_manager_acknowledge_system_hive_checkpoint(prepared) {
+            return Err(block(status as u32));
+        }
     }
     (&mut *core::ptr::addr_of_mut!(FOLD_WORK)).as_mut()
         .expect("acknowledged fold owner").phase = Phase::Installing;
@@ -243,7 +263,12 @@ unsafe fn install_retained() -> Result<bool, u32> {
     // The two folded slots are already durable. Keep any unrelated mounted-volume dirty work
     // visible to the ordinary snapshot checkpoint; a boolean cannot prove there was no writer
     // while CM processed the ACK.
+    (&mut *core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).as_mut()
+        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
+        .release_wal_log_protection_after_fold();
+    hive_wal::note_volume_wal_folded();
     *core::ptr::addr_of_mut!(FOLD_WORK) = None;
+    SYSTEM_WAL_FOLD_REQUIRED.store(false, Ordering::Release);
     WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(false, Ordering::Release);
     Ok(true)
 }

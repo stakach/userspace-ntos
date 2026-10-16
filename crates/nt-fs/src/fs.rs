@@ -20,10 +20,17 @@ use crate::snapshot_store::{
     SnapshotPayloadSink, StoredSnapshotMetadata, WalSnapshotManifest,
 };
 use crate::status::*;
+use crate::volume_wal_payload::{
+    validate_hive_log, HiveLogWalPayload, HiveLogWalReplay, HiveLogWalReplayError,
+};
 
 #[cfg(test)]
 #[path = "snapshot_crc_compatibility_tests.rs"]
 mod snapshot_crc_compatibility_tests;
+
+#[cfg(test)]
+#[path = "wal_log_protection_tests.rs"]
+mod wal_log_protection_tests;
 
 #[path = "optional_file.rs"]
 mod optional_file;
@@ -56,7 +63,9 @@ const MEMFS_SNAPSHOT_VERSION_V2: u16 = 2;
 const MEMFS_SNAPSHOT_VERSION_V3: u16 = 3;
 const MEMFS_SNAPSHOT_VERSION_V4: u16 = 4;
 const MEMFS_SNAPSHOT_VERSION_V5: u16 = 5;
-const MEMFS_SNAPSHOT_VERSION: u16 = 6;
+const MEMFS_SNAPSHOT_VERSION_V6: u16 = 6;
+// V7 stores the allocator high-water in the root record's otherwise unused node key.
+const MEMFS_SNAPSHOT_VERSION: u16 = 7;
 const MEMFS_SNAPSHOT_HEADER_LEN: usize = 32;
 const SNAP_SHORT_NAME_STORAGE_LEN: usize = 1 + MAX_SHORT_NAME * 2;
 const MEMFS_ALLOCATION_UNIT: u64 = 0x1000;
@@ -727,6 +736,7 @@ impl MemFs {
                 | MEMFS_SNAPSHOT_VERSION_V3
                 | MEMFS_SNAPSHOT_VERSION_V4
                 | MEMFS_SNAPSHOT_VERSION_V5
+                | MEMFS_SNAPSHOT_VERSION_V6
                 | MEMFS_SNAPSHOT_VERSION
         ) {
             return Err(MemFsSnapshotError::UnsupportedVersion);
@@ -837,6 +847,8 @@ impl MemFs {
         let mut r = SnapshotReader::new(payload);
         let mut seen = 0u32;
         let mut hardlink_nodes = Vec::new();
+        let mut next_file_id = None;
+        let mut max_node_file_id = 0;
         while !r.is_empty() {
             let kind = r.u8()?;
             let attributes = r.u32()?;
@@ -867,7 +879,7 @@ impl MemFs {
             };
             let extent_count =
                 usize::try_from(r.u32()?).map_err(|_| MemFsSnapshotError::InvalidRecord)?;
-            let short_name = if info.version >= MEMFS_SNAPSHOT_VERSION {
+            let short_name = if info.version >= MEMFS_SNAPSHOT_VERSION_V6 {
                 decode_snapshot_short_name(r.take(SNAP_SHORT_NAME_STORAGE_LEN)?)
                     .ok_or(MemFsSnapshotError::InvalidRecord)?
             } else {
@@ -880,7 +892,8 @@ impl MemFs {
                 if info.version < MEMFS_SNAPSHOT_VERSION_V3
                     || seen != 0
                     || kind != SNAP_REC_DIR
-                    || node_key != 0
+                    || (info.version >= MEMFS_SNAPSHOT_VERSION && node_key == 0)
+                    || (info.version < MEMFS_SNAPSHOT_VERSION && node_key != 0)
                     || logical_len != 0
                     || allocation_size != 0
                     || valid_data_length != 0
@@ -895,6 +908,9 @@ impl MemFs {
                 root.last_access_time = times[1];
                 root.last_write_time = times[2];
                 root.change_time = times[3];
+                if info.version >= MEMFS_SNAPSHOT_VERSION {
+                    next_file_id = Some(node_key);
+                }
                 seen = 1;
                 continue;
             }
@@ -926,6 +942,7 @@ impl MemFs {
                 _ => return Err(MemFsSnapshotError::InvalidRecord),
             };
             let file_id = if info.version >= MEMFS_SNAPSHOT_VERSION_V2 {
+                max_node_file_id = max_node_file_id.max(node_key);
                 Some(node_key)
             } else {
                 None
@@ -972,6 +989,12 @@ impl MemFs {
         if seen != info.record_count {
             return Err(MemFsSnapshotError::InvalidRecord);
         }
+        if let Some(next_file_id) = next_file_id {
+            if max_node_file_id >= next_file_id {
+                return Err(MemFsSnapshotError::InvalidRecord);
+            }
+            fs.next_file_id = next_file_id;
+        }
         Ok(fs)
     }
 
@@ -995,6 +1018,8 @@ impl MemFs {
         let mut r = SnapshotStreamReader::new(source);
         let mut seen = 0u32;
         let mut hardlink_nodes = Vec::new();
+        let mut next_file_id = None;
+        let mut max_node_file_id = 0;
         while r.remaining() != 0 {
             let kind = r.u8()?;
             let attributes = r.u32()?;
@@ -1025,7 +1050,7 @@ impl MemFs {
             };
             let extent_count =
                 usize::try_from(r.u32()?).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
-            let short_name = if header.info.version >= MEMFS_SNAPSHOT_VERSION {
+            let short_name = if header.info.version >= MEMFS_SNAPSHOT_VERSION_V6 {
                 let encoded = r.vec(SNAP_SHORT_NAME_STORAGE_LEN)?;
                 decode_snapshot_short_name(&encoded).ok_or(SnapshotBlockStoreError::Corrupt)?
             } else {
@@ -1038,7 +1063,8 @@ impl MemFs {
                 if header.info.version < MEMFS_SNAPSHOT_VERSION_V3
                     || seen != 0
                     || kind != SNAP_REC_DIR
-                    || node_key != 0
+                    || (header.info.version >= MEMFS_SNAPSHOT_VERSION && node_key == 0)
+                    || (header.info.version < MEMFS_SNAPSHOT_VERSION && node_key != 0)
                     || logical_len != 0
                     || allocation_size != 0
                     || valid_data_length != 0
@@ -1053,6 +1079,9 @@ impl MemFs {
                 root.last_access_time = times[1];
                 root.last_write_time = times[2];
                 root.change_time = times[3];
+                if header.info.version >= MEMFS_SNAPSHOT_VERSION {
+                    next_file_id = Some(node_key);
+                }
                 seen = 1;
                 continue;
             }
@@ -1086,6 +1115,9 @@ impl MemFs {
                 SNAP_REC_FILE => false,
                 _ => return Err(SnapshotBlockStoreError::Corrupt),
             };
+            if header.info.version >= MEMFS_SNAPSHOT_VERSION_V2 {
+                max_node_file_id = max_node_file_id.max(node_key);
+            }
             let (id, entry_id) = fs
                 .restore_snapshot_node(
                     path,
@@ -1136,6 +1168,12 @@ impl MemFs {
         }
         if seen != header.info.record_count {
             return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        if let Some(next_file_id) = next_file_id {
+            if max_node_file_id >= next_file_id {
+                return Err(SnapshotBlockStoreError::Corrupt);
+            }
+            fs.next_file_id = next_file_id;
         }
         let (payload_crc, payload_read) = r.finish();
         if payload_read != payload_len || payload_crc != header.payload_crc {
@@ -1467,7 +1505,14 @@ impl MemFs {
         });
         put_u32(out, node.attributes);
         put_u32(out, path_len);
-        put_u64(out, node.file_id);
+        put_u64(
+            out,
+            if path.is_empty() {
+                self.next_file_id
+            } else {
+                node.file_id
+            },
+        );
         put_u64(out, node.creation_time);
         put_u64(out, node.last_access_time);
         put_u64(out, node.last_write_time);
@@ -1525,7 +1570,14 @@ impl MemFs {
         };
         put_u32_at(&mut header[1..5], node.attributes);
         put_u32_at(&mut header[5..9], path_len);
-        put_u64_at(&mut header[9..17], node.file_id);
+        put_u64_at(
+            &mut header[9..17],
+            if path.is_empty() {
+                self.next_file_id
+            } else {
+                node.file_id
+            },
+        );
         put_u64_at(&mut header[17..25], node.creation_time);
         put_u64_at(&mut header[25..33], node.last_access_time);
         put_u64_at(&mut header[33..41], node.last_write_time);
@@ -3775,6 +3827,8 @@ pub struct FileSystem {
     volume: MemFs,
     mounts: MountManager,
     handles: Vec<Option<FileObject>>,
+    /// Live log nodes still covered by an unfurled volume WAL suffix.
+    wal_protected_logs: Vec<u64>,
     notifications: crate::DirectoryNotifyTable<u64>,
     pending_file_cleanup_count: usize,
     file_cleanup_effects: FileCleanupEffects,
@@ -3798,6 +3852,7 @@ impl FileSystem {
             volume,
             mounts: MountManager::new(),
             handles: Vec::new(),
+            wal_protected_logs: Vec::new(),
             notifications: crate::DirectoryNotifyTable::new(),
             pending_file_cleanup_count: 0,
             file_cleanup_effects: FileCleanupEffects::default(),
@@ -4140,6 +4195,9 @@ impl FileSystem {
         else {
             return STATUS_INVALID_HANDLE;
         };
+        if self.wal_protected_subtree(source) {
+            return STATUS_ACCESS_DENIED;
+        }
         if target.is_empty() || self.to_relative(target).is_some() {
             return STATUS_INVALID_PARAMETER;
         }
@@ -4149,6 +4207,9 @@ impl FileSystem {
         let Some(new_name) = self.rename_target_name(handle, root, target) else {
             return STATUS_INSUFFICIENT_RESOURCES;
         };
+        if self.wal_protected_target_name(&new_name) {
+            return STATUS_ACCESS_DENIED;
+        }
         let status = match root {
             FileRenameRoot::SourceParent => {
                 if target.starts_with('\\') {
@@ -4249,12 +4310,18 @@ impl FileSystem {
         else {
             return STATUS_INVALID_HANDLE;
         };
+        if self.wal_protected_subtree(source) {
+            return STATUS_ACCESS_DENIED;
+        }
         if target.is_empty() || self.to_relative(target).is_some() {
             return STATUS_INVALID_PARAMETER;
         }
         let Some(new_name) = self.rename_target_name(handle, root, target) else {
             return STATUS_INSUFFICIENT_RESOURCES;
         };
+        if self.wal_protected_target_name(&new_name) {
+            return STATUS_ACCESS_DENIED;
+        }
         let status = match root {
             FileRenameRoot::SourceParent => {
                 if target.starts_with('\\') {
@@ -4626,6 +4693,9 @@ impl FileSystem {
         if self.volume.is_dir(node_id) {
             return (STATUS_INVALID_DEVICE_REQUEST, 0);
         }
+        if self.wal_protected_node(node_id) {
+            return (STATUS_ACCESS_DENIED, 0);
+        }
         let offset = byte_offset.unwrap_or(obj.current_offset);
         let n = self.volume.write_at(node_id, offset, data);
         if !data.is_empty() && n == 0 {
@@ -4655,6 +4725,9 @@ impl FileSystem {
         let node_id = obj.node_id;
         if self.volume.is_dir(node_id) {
             return (STATUS_INVALID_DEVICE_REQUEST, 0);
+        }
+        if self.wal_protected_node(node_id) {
+            return (STATUS_ACCESS_DENIED, 0);
         }
         if data.is_empty() {
             return (STATUS_SUCCESS, 0);
@@ -4687,6 +4760,9 @@ impl FileSystem {
         let Some(rel) = self.to_relative(&normalize_separators(path)) else {
             return (STATUS_OBJECT_PATH_NOT_FOUND, 0);
         };
+        if self.volume.lookup(&rel).is_some_and(|node_id| self.wal_protected_node(node_id)) {
+            return (STATUS_ACCESS_DENIED, 0);
+        }
         let (node_id, _, _) =
             match self
                 .volume
@@ -4721,6 +4797,9 @@ impl FileSystem {
         let node_id = obj.node_id;
         if self.volume.is_dir(node_id) {
             return STATUS_INVALID_DEVICE_REQUEST;
+        }
+        if self.wal_protected_node(node_id) {
+            return STATUS_ACCESS_DENIED;
         }
         let len = data.len() as u64;
         if !self.volume.set_file_data_owned(node_id, data) {
@@ -4831,6 +4910,15 @@ impl FileSystem {
             return STATUS_INVALID_HANDLE;
         };
         let node_id = obj.node_id;
+        if self.wal_protected_subtree(node_id)
+            && matches!(class,
+                FILE_DISPOSITION_INFORMATION | FILE_DISPOSITION_INFORMATION_EX
+                | FILE_END_OF_FILE_INFORMATION | FILE_ALLOCATION_INFORMATION
+                | FILE_VALID_DATA_LENGTH_INFORMATION | FILE_SHORT_NAME_INFORMATION
+                | FILE_RENAME_INFORMATION | FILE_LINK_INFORMATION)
+        {
+            return STATUS_ACCESS_DENIED;
+        }
         match class {
             FILE_MODE_INFORMATION => {
                 if data.len() < 4 {
@@ -5211,6 +5299,109 @@ impl FileSystem {
     pub fn file_len(&self, path: &str) -> Option<u64> {
         let rel = self.to_relative(&normalize_separators(path))?;
         self.volume.file_len(&rel)
+    }
+
+    /// Stable node identity for an existing file. Missing paths and directories have no file id.
+    pub fn existing_file_id(&self, path: &str) -> Option<u64> {
+        self.query_metadata(path).filter(|metadata| !metadata.is_directory)
+            .map(|metadata| metadata.file_id)
+    }
+
+    /// Retain the exact log node and name while an anchored WAL suffix refers to its bytes.
+    /// The caller must establish the durable baseline before its first physical WAL effect.
+    pub fn protect_wal_log(&mut self, path: &str, file_id: u64) -> Result<(), u32> {
+        let rel = self.to_relative(&normalize_separators(path))
+            .ok_or(STATUS_OBJECT_PATH_NOT_FOUND)?;
+        let node_id = self.volume.lookup(&rel).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+        let node = self.volume.node(node_id).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+        if node.is_dir || node.file_id != file_id || node.link_count != 1
+            || self.handles.iter().flatten()
+                .any(|object| object.node_id == node_id && object.delete_pending)
+        {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        if !self.wal_protected_logs.contains(&node_id) {
+            self.wal_protected_logs.try_reserve(1)
+                .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+            self.wal_protected_logs.push(node_id);
+        }
+        Ok(())
+    }
+
+    /// Release names only after a durable two-slot fold covers every anchored WAL record.
+    pub fn release_wal_log_protection_after_fold(&mut self) {
+        self.wal_protected_logs.clear();
+    }
+
+    fn wal_protected_node(&self, node_id: u64) -> bool {
+        self.wal_protected_logs.contains(&node_id)
+    }
+
+    fn wal_protected_subtree(&self, ancestor: u64) -> bool {
+        self.wal_protected_logs.iter().copied().any(|mut node_id| {
+            loop {
+                if node_id == ancestor { return true; }
+                let Some(node) = self.volume.node(node_id) else { return false; };
+                if node_id == 0 || node.parent == node_id { return false; }
+                node_id = node.parent;
+            }
+        })
+    }
+
+    fn wal_protected_target_name(&self, name: &str) -> bool {
+        self.volume.lookup(name.trim_start_matches('\\'))
+            .is_some_and(|node_id| self.wal_protected_subtree(node_id))
+    }
+
+    /// Apply one committed hive-log WAL record to an unpublished snapshot. The physical WAL
+    /// already proves durability; this method checks the exact file and prior byte position.
+    /// A newer snapshot may already include the record, in which case matching bytes are skipped.
+    pub fn replay_hive_log_wal_payload(
+        &mut self,
+        payload: HiveLogWalPayload<'_>,
+    ) -> Result<HiveLogWalReplay, HiveLogWalReplayError> {
+        validate_hive_log(payload).map_err(|_| HiveLogWalReplayError::InvalidPayload)?;
+        let rel = self.to_relative(&normalize_separators(payload.path))
+            .ok_or(HiveLogWalReplayError::MissingFile)?;
+        let node_id = self.volume.lookup(&rel).ok_or(HiveLogWalReplayError::MissingFile)?;
+        let node = self.volume.node(node_id).ok_or(HiveLogWalReplayError::MissingFile)?;
+        if node.is_dir {
+            return Err(HiveLogWalReplayError::MissingFile);
+        }
+        if node.file_id != payload.file_id {
+            return Err(HiveLogWalReplayError::ForeignIdentity);
+        }
+        let length = self.volume.size(node_id);
+        if length < payload.expected_log_len {
+            return Err(HiveLogWalReplayError::UnexpectedLength);
+        }
+        if length == payload.expected_log_len {
+            if self.volume.append_at_end(node_id, payload.record) != payload.record.len() {
+                return Err(HiveLogWalReplayError::OutOfMemory);
+            }
+            let end = self.volume.size(node_id);
+            self.volume.ensure_allocation_covers_eof(node_id);
+            self.volume.mark_data_initialized_through(node_id, end);
+            self.volume.touch_write(node_id);
+            return Ok(HiveLogWalReplay::Appended);
+        }
+        let record_end = payload.expected_log_len + payload.record.len() as u64;
+        if length < record_end {
+            return Err(HiveLogWalReplayError::ContradictoryBytes);
+        }
+        let mut checked = 0usize;
+        let mut chunk = [0u8; 512];
+        while checked < payload.record.len() {
+            let take = chunk.len().min(payload.record.len() - checked);
+            let offset = payload.expected_log_len + checked as u64;
+            if self.volume.read_at_into(node_id, offset, &mut chunk[..take]) != take
+                || chunk[..take] != payload.record[checked..checked + take]
+            {
+                return Err(HiveLogWalReplayError::ContradictoryBytes);
+            }
+            checked += take;
+        }
+        Ok(HiveLogWalReplay::AlreadyPresent)
     }
 
     /// A file's bytes by folded volume-relative path.

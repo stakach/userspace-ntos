@@ -672,3 +672,7 @@ diagnosis-free failure.
   Read other reference files to derive a contract, but do not use compile-time `include_str!` or
   `include_bytes!` from paths that CI does not stage.
 - Verify new source tests in the same sparse-checkout conditions as CI before calling a head ready.
+
+## Verify Live Input Before Requesting Desktop Interaction
+- A visible Winlogon frame does not prove that keyboard input reaches i8042 and kbdclass. Send a bounded QMP key event and verify the IRQ and class callback before asking a person to type credentials.
+- When replaying a shorter accepted persistence tail into a larger reserve, clear the entire reserve first. Stale bytes in the unused half can change recovery and invalidate the boot comparison.

@@ -2329,6 +2329,52 @@ fn snapshot_block_store_rejects_bad_geometry_oversize_and_corruption() {
 }
 
 #[test]
+fn memfs_snapshot_preserves_deleted_file_id_high_water() {
+    let mut fs = FileSystem::new(MemFs::new());
+    let deleted_path = r"\??\C:\deleted.txt";
+    let created = fs.zw_create_file(
+        deleted_path,
+        FILE_READ_DATA | DELETE,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(created.status, STATUS_SUCCESS);
+    let deleted_id = fs.existing_file_id(deleted_path).unwrap();
+    assert_eq!(
+        fs.zw_set_information_file(created.handle, FILE_DISPOSITION_INFORMATION, &[1]),
+        STATUS_SUCCESS
+    );
+    assert_eq!(fs.zw_close(created.handle), STATUS_SUCCESS);
+    assert_eq!(fs.existing_file_id(deleted_path), None);
+
+    let snapshot = fs.export_volume_snapshot().unwrap();
+    let buffered = FileSystem::from_volume_snapshot(&snapshot).unwrap();
+    let store = SnapshotBlockStore::new(2, 48);
+    let mut dev = MemoryBlockDevice::new(512, 56);
+    fs.commit_volume_snapshot(&store, &mut dev).unwrap();
+    let streamed = FileSystem::restore_volume_snapshot_from_store(&store, &mut dev)
+        .unwrap()
+        .unwrap()
+        .0;
+
+    for mut restored in [buffered, streamed] {
+        let replacement = r"\??\C:\replacement.txt";
+        let opened = restored.zw_create_file(
+            replacement,
+            FILE_READ_DATA,
+            0,
+            0,
+            FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE,
+        );
+        assert_eq!(opened.status, STATUS_SUCCESS);
+        assert!(restored.existing_file_id(replacement).unwrap() > deleted_id);
+    }
+}
+
+#[test]
 fn memfs_snapshot_restores_from_block_store_payload() {
     let mut fs = FileSystem::new(MemFs::new());
     let dir = fs.zw_create_file(
@@ -3565,7 +3611,7 @@ fn writable_volume_hardlinks_share_nodes_and_retain_exact_entries() {
     );
 
     let snapshot = fs.export_volume_snapshot().unwrap();
-    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 6);
+    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 7);
     let mut restored = FileSystem::from_volume_snapshot(&snapshot).unwrap();
     assert!(!restored.initialize_timestamps(300));
     let restored_alias = restored.zw_create_file(
@@ -3702,7 +3748,7 @@ fn file_allocation_information_is_distinct_from_end_of_file_and_persists() {
     assert_eq!(preallocated.allocation_size, 16384);
 
     let snapshot = fs.export_volume_snapshot().unwrap();
-    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 6);
+    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 7);
     let mut restored = FileSystem::from_volume_snapshot(&snapshot).unwrap();
     let reopened = restored.zw_create_file(
         r"\??\C:\allocation\state.bin",
@@ -3828,7 +3874,7 @@ fn valid_data_length_is_privileged_monotonic_node_state_and_persists() {
     }
 
     let snapshot = fs.export_volume_snapshot().unwrap();
-    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 6);
+    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 7);
     let mut restored = FileSystem::from_volume_snapshot(&snapshot).unwrap();
     let reopened = restored.zw_create_file(
         r"\??\C:\vdl\state.bin",
@@ -4016,7 +4062,7 @@ fn short_names_are_entry_owned_collision_checked_enumerated_and_persisted() {
     );
 
     let snapshot = fs.export_volume_snapshot().unwrap();
-    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 6);
+    assert_eq!(MemFs::snapshot_info(&snapshot).unwrap().version, 7);
     let mut restored = FileSystem::from_volume_snapshot(&snapshot).unwrap();
     let restored_alias = restored.zw_create_file(
         r"\??\C:\aliases\LONGDO~1.TXT",
@@ -4117,7 +4163,7 @@ fn memfs_snapshot_v6_reader_accepts_version_five_without_short_name_storage() {
         MemFs::snapshot_info(&fs.export_volume_snapshot().unwrap())
             .unwrap()
             .version,
-        6
+        7
     );
 }
 

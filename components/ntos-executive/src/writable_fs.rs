@@ -42,6 +42,9 @@ pub(crate) mod registry_journal;
 #[path = "writable_fs/registry_wal.rs"]
 pub(crate) mod registry_wal;
 
+#[path = "writable_fs/hive_wal.rs"]
+mod hive_wal;
+
 #[path = "writable_fs/system_wal_fold.rs"]
 mod system_wal_fold;
 pub(crate) use system_wal_fold::{fold_system_wal_if_dirty, system_wal_fold_ack_pending};
@@ -417,6 +420,9 @@ static WRITABLE_FS_MOUNT_DIRTY: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_RUNTIME_DIRTY: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_SNAPSHOT_DIRTY: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED: AtomicBool = AtomicBool::new(false);
+// A v2 fold may advance the global WAL base only after any SYSTEM suffix is represented by
+// an exact CM checkpoint image. Boot replay can leave such a suffix even before a new mutation.
+static SYSTEM_WAL_FOLD_REQUIRED: AtomicBool = AtomicBool::new(false);
 /// The mounted filesystem's durable snapshot format, recorded before it is published.
 /// Generic checkpoints preserve this format; CM mutations use the v2 WAL when mounted.
 static WRITABLE_FS_MOUNTED_WAL_FORMAT: AtomicBool = AtomicBool::new(false);
@@ -1474,6 +1480,7 @@ fn verified_boot_log(
     metadata: nt_fs::StoredSnapshotMetadata,
     log: alloc::vec::Vec<u8>,
     lease: snapshot_storage::Lease,
+    fs: &mut nt_fs::FileSystem,
 ) -> Result<(alloc::vec::Vec<u8>, Option<nt_hive_regf::BootSystemWalSuffix>, BootSystemReserveOwner), BootSystemRestoreError> {
     let nt_fs::SnapshotReadFormat::Wal { anchor, selected_base_serial } = metadata.format else {
         return Ok((log, None, BootSystemReserveOwner::Legacy(lease)));
@@ -1491,28 +1498,81 @@ fn verified_boot_log(
             return Err(BootSystemRestoreError::Wal(error));
         }
     }
-    let verified_log = metadata
-        .verified_boot_system_log(&log, &wal)
-        .map_err(|error| BootSystemRestoreError::Snapshot(snapshot_store_error_status(error)))?;
+    // The serial belongs to the physical volume, not to SYSTEM. Other hive journals can
+    // interleave with legacy raw SYSTEM records, so the old SYSTEM-only concatenation would
+    // feed their typed framing into CM. Authenticate the exact recovered prefix before routing
+    // any record into the still-unpublished filesystem.
+    let Some((incarnation, recovered_serial, _)) = wal.verified_prefix() else {
+        return Err(BootSystemRestoreError::Snapshot(nt_fs::STATUS_DATA_ERROR));
+    };
+    if incarnation != anchor.incarnation
+        || recovered_serial < anchor.serial
+        || recovered_serial < selected_base_serial
+        || wal.verified_record_end_lba(anchor.serial) != Some(anchor.end_lba)
+    {
+        return Err(BootSystemRestoreError::Snapshot(nt_fs::STATUS_DATA_ERROR));
+    }
     let base = usize::try_from(selected_base_serial)
         .map_err(|_| BootSystemRestoreError::Snapshot(snapshot_store_error_status(nt_fs::SnapshotBlockStoreError::Corrupt)))?;
     let suffix = wal.records().get(base..)
         .ok_or(BootSystemRestoreError::Snapshot(snapshot_store_error_status(nt_fs::SnapshotBlockStoreError::Corrupt)))?;
+    let snapshot_log_len = log.len();
+    let mut verified_log = log;
     let mut first_sequence = None;
     let mut last_sequence = None;
+    let mut hive_sequences: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
     for record in suffix {
-        let span = if let Some(previous) = last_sequence {
-            nt_hive_core::complete_log_sequence_span_from(&record.payload, previous)
-        } else {
-            nt_hive_core::complete_log_sequence_span(&record.payload)
-        };
-        let (first, last) = span.map_err(BootSystemRestoreError::WalSemantic)?;
-        first_sequence.get_or_insert(first);
-        last_sequence = Some(last);
+        match nt_fs::decode_volume_wal_payload(&record.payload)
+            .map_err(|_| BootSystemRestoreError::Snapshot(nt_fs::STATUS_DATA_ERROR))?
+        {
+            nt_fs::VolumeWalPayload::System(bytes) => {
+                let span = if let Some(previous) = last_sequence {
+                    nt_hive_core::complete_log_sequence_span_from(bytes, previous)
+                } else {
+                    nt_hive_core::complete_log_sequence_span(bytes)
+                };
+                let (first, last) = span.map_err(BootSystemRestoreError::WalSemantic)?;
+                verified_log.try_reserve(bytes.len()).map_err(|_| {
+                    BootSystemRestoreError::Snapshot(nt_fs::STATUS_INSUFFICIENT_RESOURCES)
+                })?;
+                verified_log.extend_from_slice(bytes);
+                first_sequence.get_or_insert(first);
+                last_sequence = Some(last);
+            }
+            nt_fs::VolumeWalPayload::HiveLog(payload) => {
+                // The sector CRC covers the frame. Prove the contained hive record itself is
+                // complete before appending it at its exact persisted file identity/offset.
+                let previous = hive_sequences.iter_mut()
+                    .find(|(file_id, _)| *file_id == payload.file_id);
+                if let Some((_, previous_sequence)) = previous {
+                    let span = nt_hive_core::complete_log_sequence_span_from(
+                        payload.record, *previous_sequence,
+                    ).map_err(BootSystemRestoreError::WalSemantic)?;
+                    *previous_sequence = span.1;
+                } else {
+                    let last = hive_wal::validate_first_record(
+                        fs, payload.path, payload.expected_log_len, payload.record,
+                    )
+                        .map_err(BootSystemRestoreError::Snapshot)?;
+                    hive_sequences.try_reserve(1).map_err(|_| {
+                        BootSystemRestoreError::Snapshot(nt_fs::STATUS_INSUFFICIENT_RESOURCES)
+                    })?;
+                    hive_sequences.push((payload.file_id, last));
+                }
+                fs.replay_hive_log_wal_payload(payload)
+                    .map_err(|error| BootSystemRestoreError::Snapshot(match error {
+                        nt_fs::HiveLogWalReplayError::OutOfMemory =>
+                            nt_fs::STATUS_INSUFFICIENT_RESOURCES,
+                        _ => nt_fs::STATUS_DATA_ERROR,
+                    }))?;
+                fs.protect_wal_log(payload.path, payload.file_id)
+                    .map_err(BootSystemRestoreError::Snapshot)?;
+            }
+        }
     }
     let wal_suffix = first_sequence.zip(last_sequence).map(|(first_sequence, last_sequence)| {
         nt_hive_regf::BootSystemWalSuffix {
-            snapshot_log_len: log.len(),
+            snapshot_log_len,
             first_sequence,
             last_sequence,
         }
@@ -1552,7 +1612,7 @@ pub(crate) unsafe fn restore_boot_system_persistence(
         return Err(BootSystemRestoreError::GeometryUnavailable);
     }
     let result = (|| match restore_boot_snapshot_volume_once() {
-        Ok(Some((fs, metadata, lease))) => {
+        Ok(Some((mut fs, metadata, lease))) => {
             let primary = owned_file_before_publish(
                 &fs,
                 CONFIG_SYSTEM_HIVE_PATH,
@@ -1561,7 +1621,8 @@ pub(crate) unsafe fn restore_boot_system_persistence(
             let log_path = alloc::format!("{}.LOG", CONFIG_SYSTEM_HIVE_PATH);
             let snapshot_log = owned_file_before_publish(&fs, &log_path, BootSystemRestoreError::LogRead)?
                 .unwrap_or_default();
-            let (log, wal_suffix, lease) = verified_boot_log(metadata, snapshot_log, lease)?;
+            let (log, wal_suffix, lease) = verified_boot_log(metadata, snapshot_log, lease, &mut fs)?;
+            SYSTEM_WAL_FOLD_REQUIRED.store(wal_suffix.is_some(), Ordering::Release);
             if primary.is_none() && log.is_empty() {
                 return Err(BootSystemRestoreError::SystemStateMissing);
             }
@@ -2295,6 +2356,7 @@ fn hive_io_status(status: u32) -> Result<(), nt_hive_core::HiveIoError> {
 pub(crate) struct WritableHiveIoProvider {
     image_path: alloc::string::String,
     log_path: alloc::string::String,
+    staged_v2_log: Option<alloc::vec::Vec<u8>>,
 }
 
 impl WritableHiveIoProvider {
@@ -2302,7 +2364,14 @@ impl WritableHiveIoProvider {
         Self {
             image_path: alloc::string::String::from(image_path),
             log_path: alloc::format!("{}.LOG", image_path),
+            staged_v2_log: None,
         }
+    }
+
+    fn uses_v2_hive_wal(&self) -> Result<bool, nt_hive_core::HiveIoError> {
+        unsafe { ensure_mounted() }.map_err(|_| nt_hive_core::HiveIoError::Io)?;
+        Ok(!self.image_path.eq_ignore_ascii_case(CONFIG_SYSTEM_HIVE_PATH)
+            && !legacy_snapshot_writes_allowed())
     }
 
     pub(crate) fn log_len(&self) -> Result<usize, nt_hive_core::HiveIoError> {
@@ -2369,12 +2438,25 @@ impl nt_hive_core::HiveIoProvider for WritableHiveIoProvider {
 
     fn append_log_record(&mut self, bytes: &[u8]) -> Result<(), nt_hive_core::HiveIoError> {
         self.require_legacy_file_mutation()?;
+        if self.uses_v2_hive_wal()? {
+            if self.staged_v2_log.is_some() || bytes.is_empty() {
+                return Err(nt_hive_core::HiveIoError::Io);
+            }
+            let mut staged = alloc::vec::Vec::new();
+            staged.try_reserve_exact(bytes.len()).map_err(|_| nt_hive_core::HiveIoError::Io)?;
+            staged.extend_from_slice(bytes);
+            self.staged_v2_log = Some(staged);
+            return Ok(());
+        }
         let _scope = crate::allocator::enter_scope(b"memfs.hive-journal-append");
         hive_io_status(unsafe { append_file(&self.log_path, bytes) })
     }
 
     fn truncate_log(&mut self) -> Result<(), nt_hive_core::HiveIoError> {
         self.require_legacy_file_mutation()?;
+        if self.staged_v2_log.is_some() {
+            return Err(nt_hive_core::HiveIoError::Io);
+        }
         hive_io_status(unsafe { truncate_file(&self.log_path) })
     }
 
@@ -2387,6 +2469,10 @@ impl nt_hive_core::HiveIoProvider for WritableHiveIoProvider {
     }
 
     fn flush_log(&mut self) -> Result<(), nt_hive_core::HiveIoError> {
+        if let Some(staged) = self.staged_v2_log.take() {
+            let status = unsafe { hive_wal::commit_non_system_hive_log_wal(&self.log_path, &staged) };
+            return hive_io_status(status);
+        }
         unsafe { checkpoint_dirty_volume() }
             .map(|_| ())
             .map_err(|_| nt_hive_core::HiveIoError::Io)

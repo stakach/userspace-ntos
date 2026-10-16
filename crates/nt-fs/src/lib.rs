@@ -33,6 +33,7 @@ mod snapshot_store;
 mod snapshot_reserve;
 mod snapshot_region;
 mod registry_wal_store;
+mod volume_wal_payload;
 #[cfg(test)]
 mod snapshot_test_device;
 mod status;
@@ -84,6 +85,7 @@ pub use snapshot_store::{
 pub use snapshot_reserve::{SnapshotReserve, SnapshotReserveLease};
 pub use snapshot_region::{BoundedBlockRange, OwnedBoundedBlockRange};
 pub use registry_wal_store::{RegistryWal, RegistryWalContinuation, RegistryWalError, RegistryWalRecord, RegistryWalState, RegistryWalVerifiedDevice, RegistryWalVerifiedPrefix};
+pub use volume_wal_payload::{decode_volume_wal_payload, encode_hive_log_wal_payload, HiveLogWalPayload, HiveLogWalReplay, HiveLogWalReplayError, VolumeWalPayload, VolumeWalPayloadError};
 mod snapshot_baseline_repair;
 pub use snapshot_baseline_repair::WalSnapshotBaselineRepair;
 pub use status::*;

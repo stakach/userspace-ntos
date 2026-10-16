@@ -67,7 +67,6 @@ struct HostedRelationPublication {
     invalidation_completion: Option<nt_pnp_manager::DeviceRelationInvalidationCompletion>,
     route_reconciliation_ready: Option<bool>,
     _mutations: Vec<HostedRelationRegistryMutation>,
-    attempts: CmMutationBeginAttempts,
     attempt: Option<CmMutationBeginAttempt<()>>,
     preparation: Option<SystemHiveMutationPreparation<()>>,
     prepared: Option<PreparedSystemHiveMutation>,
@@ -80,6 +79,23 @@ struct HostedRelationPublication {
     commit_entered: bool,
     preparation_refused: bool,
     refusal: nt_status::NtStatus,
+}
+
+// The server's requester grant survives an acknowledged publication. Reuse that exact bank
+// across successive bus relation queries so completed owners do not consume fresh grants.
+static mut RELATION_BEGIN_ATTEMPTS: CmMutationBeginAttempts = CmMutationBeginAttempts::new();
+
+pub(super) unsafe fn reserve_relation_mutation_begin(
+    mount: nt_config_client::SystemHiveMount,
+    expected_generation: u64,
+    mutations: &[nt_config_client::SystemHiveMutation<'_>],
+) -> Result<CmMutationBeginAttempt<()>, (i32, ())> {
+    (&mut *core::ptr::addr_of_mut!(RELATION_BEGIN_ATTEMPTS))
+        .reserve(mount, expected_generation, mutations, ())
+}
+
+unsafe fn relation_begin_attempts() -> &'static mut CmMutationBeginAttempts {
+    &mut *core::ptr::addr_of_mut!(RELATION_BEGIN_ATTEMPTS)
 }
 
 impl HostedRelationPublication {
@@ -177,7 +193,7 @@ unsafe fn advance_hosted_relation_publication(
                 let attempt = owner.attempt.as_mut().expect("retained relation BEGIN");
                 if attempt.is_acknowledged() {
                     if attempt.outcome_status() == Some(0) {
-                        let upload = match owner.attempts.take_upload(attempt) {
+                        let upload = match relation_begin_attempts().take_upload(attempt) {
                             Ok(upload) => upload,
                             Err(_) => return owner.pending(),
                         };
@@ -186,7 +202,7 @@ unsafe fn advance_hosted_relation_publication(
                         owner.phase = Phase::Prepare;
                         continue;
                     }
-                    let (status, ()) = match owner.attempts.take_failure(attempt) {
+                    let (status, ()) = match relation_begin_attempts().take_failure(attempt) {
                         Ok(failure) => failure,
                         Err(_) => return owner.pending(),
                     };
@@ -202,12 +218,12 @@ unsafe fn advance_hosted_relation_publication(
                 } else {
                     CmMutationBeginOperation::Acknowledge
                 };
-                let mut exchange = match owner.attempts.begin_exchange(attempt, operation) {
+                let mut exchange = match relation_begin_attempts().begin_exchange(attempt, operation) {
                     Ok(exchange) => exchange,
                     Err(_) => return owner.pending(),
                 };
                 let response = crate::cm_mutation_transport::begin(&exchange);
-                if owner.attempts.complete_exchange(attempt, &mut exchange, response).is_err() {
+                if relation_begin_attempts().complete_exchange(attempt, &mut exchange, response).is_err() {
                     return owner.pending();
                 }
             }

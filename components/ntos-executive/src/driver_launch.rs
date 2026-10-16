@@ -42697,7 +42697,6 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
             }
         };
 
-        let mut attempts = nt_config_client::CmMutationBeginAttempts::new();
         let (phase, attempt) = if mutations.is_empty() {
             (HostedRelationPublicationPhase::PostCommitRepair, None)
         } else {
@@ -42705,7 +42704,7 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
                 .map(HostedRelationRegistryMutation::as_client_mutation).collect();
             let mount = crate::LIVE_CONFIG_MANAGER_SYSTEM_MOUNT
                 .expect("validated SYSTEM mount disappeared before relation BEGIN");
-            match attempts.reserve(mount, expected_generation, &client_mutations, ()) {
+            match reserve_relation_mutation_begin(mount, expected_generation, &client_mutations) {
                 Ok(attempt) => (HostedRelationPublicationPhase::Begin, Some(attempt)),
                 Err((status, ())) => {
                     provider_batch.abort(io_manager_mut())
@@ -42735,7 +42734,7 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
             critical_starts, critical_start_index: 0,
             catalog_update, pci_catalog_published: false,
             invalidation_completion: None, route_reconciliation_ready: None,
-            _mutations: mutations, attempts, attempt, preparation: None, prepared: None,
+            _mutations: mutations, attempt, preparation: None, prepared: None,
             persistence: crate::registry_mutation_work::MutationPersistence::new(),
             receipt: None, acknowledgement: None,
             abort_receipt: None, abort_acknowledgement: None,

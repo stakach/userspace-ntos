@@ -439,7 +439,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
     }
 
     /// Only a scanned or settled WAL prefix can satisfy an external durability anchor.
-    pub(crate) fn verified_prefix(&self) -> Option<(u64, u64, u64)> {
+    pub fn verified_prefix(&self) -> Option<(u64, u64, u64)> {
         if !matches!(
             self.state,
             RegistryWalState::Ready | RegistryWalState::RecoveredUncommitted
@@ -451,7 +451,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
     }
 
     /// Exact end of one parsed committed frame, including its marker sector.
-    pub(crate) fn verified_record_end_lba(&self, serial: u64) -> Option<u64> {
+    pub fn verified_record_end_lba(&self, serial: u64) -> Option<u64> {
         self.verified_prefix()?;
         if serial == 0 {
             return Some(0);

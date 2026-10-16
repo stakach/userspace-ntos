@@ -6067,6 +6067,11 @@ impl ExecNtHandler {
         if dirty_cells == 0 {
             return nt_fs::STATUS_SUCCESS;
         }
+        if !crate::writable_fs::legacy_snapshot_writes_allowed() {
+            if let Err(status) = unsafe { crate::writable_fs::fold_system_wal_if_dirty() } {
+                return status;
+            }
+        }
         let Some(file_path) = Self::boot_mutable_hive_checkpoint_path(hive_sel) else {
             return STATUS_INVALID_HANDLE;
         };
@@ -6502,6 +6507,11 @@ impl ExecNtHandler {
         }
         if dirty_cells == 0 {
             return nt_fs::STATUS_SUCCESS;
+        }
+        if !crate::writable_fs::legacy_snapshot_writes_allowed() {
+            if let Err(status) = unsafe { crate::writable_fs::fold_system_wal_if_dirty() } {
+                return status;
+            }
         }
         let Some(file_path) = self
             .hive_mounts
