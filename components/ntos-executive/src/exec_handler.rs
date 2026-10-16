@@ -9,6 +9,9 @@ use crate::provider_local_event::trace as trace_provider_local_event;
 use nt_io_abi::major;
 use nt_io_manager::{LocalFileObject, PendingFileRoute};
 
+#[path = "native_job_bodies.rs"]
+pub(crate) mod native_job_bodies;
+
 struct RetainedV1SystemCheckpointAck {
     prepared: nt_config_client::PreparedSystemHiveCheckpoint,
     image_len: usize,
@@ -9635,6 +9638,9 @@ impl ExecNtHandler {
     ) -> Result<usize, u32> {
         let child_pi = image.pi;
         let name = image.process_name;
+        let ctx = self.loop_ctx.ok_or(nt_process::STATUS_INVALID_IMAGE_FORMAT)?;
+        let (validated_pe, _) = unsafe { (&*ctx.hosted_loaded_images).pe_and_pool_for_image(image) }
+            .ok_or(nt_process::STATUS_INVALID_IMAGE_FORMAT)?;
         let selected_job = self
             .pm
             .select_child_job(Some(parent), flags, job_member_level)?;
@@ -9701,6 +9707,11 @@ impl ExecNtHandler {
                 return Err(status);
             }
         };
+        if let Err(status) = self.pm.admit_validated_process_image(pid, validated_pe) {
+            let _ = self.token_store.release(token);
+            self.rollback_hosted_process_creation(child_pi, pid);
+            return Err(status);
+        }
         self.drain_job_notifications();
         for inherited in inherited_handles {
             if let Err(status) = self.retain_external_handle_reference(inherited.object) {
@@ -15831,12 +15842,12 @@ impl ExecNtHandler {
                 0x04
             }
             26 => {
-                let _pid = self.pm.resolve_process_handle(
+                let pid = self.pm.resolve_process_handle(
                     caller_pid,
                     handle,
                     nt_process::PROCESS_QUERY_INFORMATION,
                 )?;
-                put_u64(&mut output, 0, 0);
+                put_u64(&mut output, 0, self.pm.process_wow64_pointer(pid)?);
                 0x08
             }
             28 => {
@@ -24899,6 +24910,7 @@ impl ExecNtHandler {
     }
 
     fn drain_job_destructions(&mut self) {
+        unsafe { native_job_bodies::redrive(); }
         while let Some(destruction) = self.pm.take_job_destruction() {
             let provider_flags = self.job_token_policies.flags(destruction.id);
             let security_ready = self
@@ -24917,6 +24929,16 @@ impl ExecNtHandler {
                 print_hex(destruction.security_limits);
                 print_str(b"/0x");
                 print_hex(provider_flags);
+                print_str(b" status=0x");
+                print_hex(status);
+                print_str(b"\n");
+                let restored = self.pm.restore_job_destruction(destruction);
+                debug_assert!(restored);
+                break;
+            }
+            if let Err(status) = unsafe { native_job_bodies::prepare_retirement(destruction) } {
+                print_str(b"[ps-job] PEJOB retirement preflight failed id=");
+                print_u64(destruction.id as u64);
                 print_str(b" status=0x");
                 print_hex(status);
                 print_str(b"\n");
@@ -24955,6 +24977,7 @@ impl ExecNtHandler {
                 let _ = self.io_completion_ports.release(association.port_id);
             }
             self.unlink_job_namespace(destruction.id);
+            unsafe { native_job_bodies::commit_retirement(destruction); }
         }
     }
 

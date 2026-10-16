@@ -9,6 +9,10 @@ pub(crate) fn dispatch(
     op: u64,
     object: u64,
     value: u64,
+    mut materialize_job: impl FnMut(
+        &mut nt_process::ProcessManager,
+        nt_process::job::JobId,
+    ) -> Result<u64, u32>,
     mut project: impl FnMut(&nt_process::ProcessManager, u64) -> Result<(), u32>,
 ) -> (i32, u64, u64, u64) {
     use win32k_subsystem::*;
@@ -46,6 +50,9 @@ pub(crate) fn dispatch(
             };
             Ok((kind, 0, 0))
         }
+        W32_PS_OP_QUERY_WOW64_PROCESS if value == 0 => pm
+            .wow64_pointer_for_kernel_process_object(object)
+            .map(|pointer| (pointer, 0, 0)),
         W32_PS_OP_SET_THREAD_PRIORITY => pm
             .set_kernel_thread_priority(object, value as u32 as i32)
             .map(|previous| (u64::from(previous as u32), 0, 0)),
@@ -77,6 +84,18 @@ pub(crate) fn dispatch(
                 sel4_rt::yield_now();
                 Ok((0, 0, 0))
             }),
+        W32_PS_OP_QUERY_PROCESS_JOB if value == 0 => pm
+            .pid_for_kernel_process_object(object)
+            .ok_or(INVALID_HANDLE)
+            .and_then(|pid| match pm.process_job(pid) {
+                Some(job) => materialize_job(pm, job).map(|body| (body, 0, 0)),
+                None => Ok((0, 0, 0)),
+            }),
+        W32_PS_OP_QUERY_JOB_UI_RESTRICTIONS if value == 0 => pm
+            .job_for_kernel_object(object)
+            .ok_or(INVALID_HANDLE)
+            .and_then(|job| pm.job_ui_restrictions(job))
+            .map(|restrictions| (u64::from(restrictions), 0, 0)),
         _ => Err(INVALID_PARAMETER),
     };
     match result {

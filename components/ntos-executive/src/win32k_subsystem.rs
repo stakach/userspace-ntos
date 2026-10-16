@@ -1391,6 +1391,9 @@ pub const W32_PS_OP_YIELD_EXECUTION: u64 = 8;
 pub const W32_PS_OP_QUERY_OBJECT_KIND: u64 = 9;
 pub const W32_PS_OP_SET_OBJECT_HANDLE_FLAGS: u64 = 10;
 pub const W32_PS_OP_QUERY_OBJECT_HANDLE_FLAGS: u64 = 11;
+pub const W32_PS_OP_QUERY_WOW64_PROCESS: u64 = 12;
+pub const W32_PS_OP_QUERY_PROCESS_JOB: u64 = 13;
+pub const W32_PS_OP_QUERY_JOB_UI_RESTRICTIONS: u64 = 14;
 /// Bounded global-atom requests. The executive owns the one native atom table; win32k stages only
 /// explicit-length UTF-16 input and receives the resulting 16-bit atom.
 pub const W32_ATOM_LABEL: u64 = 0x77E;
@@ -3575,8 +3578,53 @@ fn query_kernel_thread_state(thread: u64) -> (u32, u32, u64) {
     (exit_status as u32, freeze_count as u32, flags_and_priority)
 }
 
+extern "win64" fn s_ps_get_process_job(process: u64) -> u64 {
+    let (status, body, _, _) =
+        unsafe { win32k_ps_broker_call(W32_PS_OP_QUERY_PROCESS_JOB, process, 0) };
+    if status != 0 {
+        reject_ps_broker("process job query", status);
+    }
+    body
+}
+
+extern "win64" fn s_ps_get_job_ui_restrictions_class(job: u64) -> u32 {
+    let (status, restrictions, _, _) =
+        unsafe { win32k_ps_broker_call(W32_PS_OP_QUERY_JOB_UI_RESTRICTIONS, job, 0) };
+    if status != 0 || restrictions > u32::MAX as u64 {
+        reject_ps_broker("job UI restrictions query", status);
+    }
+    restrictions as u32
+}
+
 extern "win64" fn s_ps_get_process_exit_status(process: u64) -> i32 {
     query_kernel_process_state(process).0 as i32
+}
+
+/// Return a pointer into the exact published Ps body. The process name is
+/// projected before that body is aliased into win32k's address space.
+extern "win64" fn s_ps_get_process_image_file_name(process: u64) -> u64 {
+    let _ = query_kernel_process_state(process);
+    process + nt_kernel_abi::ps_reactos_x64::EPROCESS_IMAGE_FILE_NAME as u64
+}
+
+/// Query the Process Manager's exact EPROCESS/image admission authority. A native AMD64 image
+/// proves a null WOW64_PROCESS pointer; an unadmitted or foreign body is a visible error.
+extern "win64" fn s_ps_get_process_wow64_process(process: u64) -> u64 {
+    let (status, pointer, _, _) = unsafe {
+        win32k_ps_broker_call(W32_PS_OP_QUERY_WOW64_PROCESS, process, 0)
+    };
+    if status != 0 {
+        reject_ps_broker("WOW64 process query", status);
+    }
+    pointer
+}
+
+extern "win64" fn s_ps_get_current_process_wow64_process() -> u64 {
+    s_ps_get_process_wow64_process(s_current_process())
+}
+
+extern "win64" fn s_ps_get_process_session_id(process: u64) -> u32 {
+    query_kernel_process_state(process).1
 }
 
 extern "win64" fn s_ps_get_current_process_session_id() -> u32 {
@@ -15419,6 +15467,18 @@ fn register_trampolines() -> bool {
         s_current_thread_process_id as usize as u64,
     );
     reg.bind("PsGetProcessId", s_ps_get_process_id as usize as u64);
+    reg.bind("PsGetProcessJob", s_ps_get_process_job as usize as u64);
+    reg.bind(
+        "PsGetJobUIRestrictionsClass",
+        s_ps_get_job_ui_restrictions_class as usize as u64,
+    );
+    reg.bind("PsGetProcessImageFileName", s_ps_get_process_image_file_name as usize as u64);
+    reg.bind("PsGetProcessWow64Process", s_ps_get_process_wow64_process as usize as u64);
+    reg.bind(
+        "PsGetCurrentProcessWow64Process",
+        s_ps_get_current_process_wow64_process as usize as u64,
+    );
+    reg.bind("PsGetProcessSessionId", s_ps_get_process_session_id as usize as u64);
     reg.bind("PsIsSystemProcess", s_ps_is_system_process as *const () as usize as u64);
     reg.bind(
         "PsGetCurrentThreadId",

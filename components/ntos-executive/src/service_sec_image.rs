@@ -5163,9 +5163,14 @@ pub(crate) unsafe fn service_win32k_ps_request(
     {
         return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
     }
-    provider_ps::dispatch(&mut handler.pm, op, object, value, |pm, body| {
-        provider_ps_projection::grant(target, pm, body)
-    })
+    provider_ps::dispatch(
+        &mut handler.pm,
+        op,
+        object,
+        value,
+        |pm, job| unsafe { crate::exec_handler::native_job_bodies::ensure(pm, job) },
+        |pm, body| provider_ps_projection::grant(target, pm, body),
+    )
 }
 
 /// Serialized memory-only ownership operation, across the bootstrap-to-live Ps store transfer.
@@ -8534,6 +8539,21 @@ pub(crate) unsafe fn service_sec_image(
         );
     }
     print_str(b"[sec-init] bootstrap-image-load end\n");
+    // Seeded Ps objects precede image loading. Admit each exact process only after its attached
+    // executable has passed PE parsing; win32k Ps WOW64 queries must never infer x64 from a name.
+    for pi in 0..HOSTED_PROCESS_MANAGER_SEED_COUNT {
+        let image = exe_image_catalog
+            .get_by_pi(pi)
+            .expect("seeded Ps process retains its hosted image identity");
+        let (validated_pe, _) = unsafe { hosted_loaded_images.pe_and_pool_for_image(image) }
+            .expect("seeded Ps process needs its exact parsed executable");
+        let cid = ps_bootstrap::hosted_main_client_id(pi)
+            .expect("seeded Ps process retains its exact main client ID");
+        unsafe { ps_bootstrap::with_process_manager(|pm| {
+            pm.admit_validated_process_image(cid.unique_process, validated_pe)
+        }) }
+        .expect("seeded Ps process architecture admission failed");
+    }
     // Retain the existing bootstrap DLL registry and its parsed pool-backed images for legacy
     // bootstrap consumers. Ordinary File opens do not populate this store: canonical SEC_IMAGE
     // admission captures the opened File, and image residency reads that retained source.

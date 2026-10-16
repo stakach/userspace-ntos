@@ -21,6 +21,7 @@ use nt_security::TokenId;
 
 pub mod dbgk;
 pub mod job;
+pub mod kernel_job_body;
 pub mod job_abi;
 mod initial_system;
 mod initial_thread_creation;
@@ -33,6 +34,9 @@ mod fresh_hosted_thread_tests;
 pub use initial_thread_creation::InitialThreadCreationPlan;
 pub mod native_handle;
 mod native_object_handle_flags;
+mod native_wow64_state;
+#[cfg(test)]
+mod native_wow64_state_tests;
 pub mod native_handle_search;
 mod native_section_file_source;
 mod native_section_handle;
@@ -686,6 +690,8 @@ pub struct NtProcess {
     pub image_file_name: String,
     pub address_space_id: AddressSpaceId,
     pub image_section: Option<SectionId>,
+    /// Architecture proven by a parsed process image; absent for unadmitted image-less processes.
+    architecture_proof: Option<native_wow64_state::ProcessArchitectureProof>,
     pub threads: ThreadIdSet,
     pub main_thread: Option<ThreadId>,
     initial_creation: initial_thread_creation::InitialThreadCreationState,
@@ -1343,6 +1349,9 @@ impl ProcessManager {
             .and_then(|pid| self.processes.get(&pid))
             .map(|process| process.priority_class)
             .unwrap_or(PROCESS_PRIORITY_CLASS_NORMAL);
+        let architecture_proof = image_section
+            .and_then(|section| self.image_section(section))
+            .map(|_| native_wow64_state::ProcessArchitectureProof::Amd64Image);
         let foreground = parent
             .and_then(|pid| self.processes.get(&pid))
             .map(|process| process.foreground)
@@ -1356,6 +1365,7 @@ impl ProcessManager {
                 image_file_name: image_file_name.into(),
                 address_space_id: asid,
                 image_section,
+                architecture_proof,
                 threads: ThreadIdSet::new(),
                 main_thread: None,
                 initial_creation: initial_thread_creation::InitialThreadCreationState::Unclaimed,
@@ -5437,6 +5447,8 @@ mod thread_lifetime_tests;
 
 #[cfg(test)]
 mod kernel_object_publication_tests;
+#[cfg(test)]
+mod kernel_job_body_tests;
 
 #[cfg(test)]
 mod initial_thread_runtime_tests;

@@ -17,6 +17,8 @@ pub const KTHREAD_BYTES: usize = 0x328;
 
 pub const EPROCESS_UNIQUE_PROCESS_ID: usize = 0xd0;
 pub const EPROCESS_WIN32_PROCESS: usize = 0x1d8;
+/// Address returned by PsGetProcessImageFileName for this NT layout.
+pub const EPROCESS_IMAGE_FILE_NAME: usize = 0x260;
 pub const EPROCESS_THREAD_LIST_HEAD: usize = 0x288;
 pub const EPROCESS_PEB: usize = 0x2b8;
 pub const KTHREAD_APC_STATE: usize = 0x48;
@@ -107,6 +109,8 @@ pub struct ProcessInitialization {
     pub process_id: u64,
     /// An actual PEB address, or NULL for processes such as System.
     pub peb: GuestAddr,
+    /// Exact process basename, bounded and NUL-terminated by the Ps owner.
+    pub image_file_name: [u8; 16],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,6 +177,8 @@ pub fn initialize_process(
     empty_lists(output, init.body, PROCESS_LIST_HEADS);
     write_u64(output, EPROCESS_UNIQUE_PROCESS_ID, init.process_id);
     write_u64(output, EPROCESS_PEB, init.peb.0);
+    output[EPROCESS_IMAGE_FILE_NAME..EPROCESS_IMAGE_FILE_NAME + 16]
+        .copy_from_slice(&init.image_file_name);
     Ok(())
 }
 

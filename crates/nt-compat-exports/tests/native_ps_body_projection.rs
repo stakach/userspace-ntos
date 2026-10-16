@@ -173,12 +173,22 @@ mod win32k_subsystem {
     pub const W32_PS_OP_RELEASE_POINTER: u64 = 7;
     pub const W32_PS_OP_YIELD_EXECUTION: u64 = 8;
     pub const W32_PS_OP_QUERY_OBJECT_KIND: u64 = 9;
+    pub const W32_PS_OP_QUERY_WOW64_PROCESS: u64 = 12;
+    pub const W32_PS_OP_QUERY_PROCESS_JOB: u64 = 13;
+    pub const W32_PS_OP_QUERY_JOB_UI_RESTRICTIONS: u64 = 14;
 }
 mod sel4_rt {
     pub fn yield_now() {}
 }
 #[path = "../../../components/ntos-executive/src/provider_ps.rs"]
 mod provider_ps;
+
+fn refuse_job_materialization(
+    _: &mut nt_process::ProcessManager,
+    _: nt_process::job::JobId,
+) -> Result<u64, u32> {
+    Err(nt_process::STATUS_INVALID_HANDLE)
+}
 
 fn fixture() -> (nt_process::ProcessManager, u32, u32, u32) {
     let mut pm = nt_process::ProcessManager::new();
@@ -217,6 +227,7 @@ fn canonical_object_kind_does_not_depend_on_gui_conversion_or_change_references(
             win32k_subsystem::W32_PS_OP_QUERY_OBJECT_KIND,
             body,
             0,
+            refuse_job_materialization,
             |_, _| panic!("read-only classification cannot grant or retain backing"),
         );
         assert_eq!(result, (0, kind, 0, 0));
@@ -276,6 +287,7 @@ fn actual_cross_thread_lookup_acknowledges_exact_body_with_acquired_reference() 
         win32k_subsystem::W32_PS_OP_LOOKUP_THREAD,
         u64::from(other_tid),
         0,
+        refuse_job_materialization,
         |pm, body| {
             observed = Some(body);
             assert_eq!(thread_references(pm, other_tid), before + 1);
@@ -296,6 +308,7 @@ fn actual_process_lookup_acknowledges_projection_before_publication() {
         win32k_subsystem::W32_PS_OP_LOOKUP_PROCESS,
         u64::from(pid),
         0,
+        refuse_job_materialization,
         |pm, body| {
             observed = Some(body);
             assert_eq!(process_references(pm, pid), before + 1);
@@ -328,10 +341,17 @@ fn actual_lookup_projection_rejection_restores_counts_and_publishes_no_pointer()
                 0x4000,
             )
         };
-        let result = provider_ps::dispatch(&mut pm, op, object, 0, |_, body| {
-            assert_eq!(body, expected);
-            Err(0xc000009au32)
-        });
+        let result = provider_ps::dispatch(
+            &mut pm,
+            op,
+            object,
+            0,
+            refuse_job_materialization,
+            |_, body| {
+                assert_eq!(body, expected);
+                Err(0xc000009au32)
+            },
+        );
         assert_eq!(result, (0xc000009au32 as i32, 0, 0, 0));
         let after = if process {
             process_references(&pm, pid)
@@ -351,6 +371,7 @@ fn actual_pointer_retain_projects_and_failed_projection_releases_only_new_refere
         win32k_subsystem::W32_PS_OP_RETAIN_POINTER,
         0x4000,
         0,
+        refuse_job_materialization,
         |_, body| {
             assert_eq!(body, 0x4000);
             Ok(())
@@ -362,6 +383,7 @@ fn actual_pointer_retain_projects_and_failed_projection_releases_only_new_refere
         win32k_subsystem::W32_PS_OP_RETAIN_POINTER,
         0x4000,
         0,
+        refuse_job_materialization,
         |_, body| {
             assert_eq!(body, 0x4000);
             Err(0xc000000du32)
@@ -379,6 +401,7 @@ fn invalid_lookup_does_not_invoke_projection() {
         win32k_subsystem::W32_PS_OP_LOOKUP_THREAD,
         u64::MAX,
         0,
+        refuse_job_materialization,
         |_, _| panic!("invalid lookup cannot authorize projection"),
     );
     assert_ne!(result.0, 0);

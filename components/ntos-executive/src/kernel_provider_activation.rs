@@ -396,9 +396,14 @@ pub(super) unsafe fn service_ps(
             &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
             &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
         )?;
-        Ok(provider_ps::dispatch(pm, op, object, value, |pm, body| {
-            provider_ps_projection::grant(target, pm, body)
-        }))
+        Ok(provider_ps::dispatch(
+            pm,
+            op,
+            object,
+            value,
+            |pm, job| unsafe { crate::exec_handler::native_job_bodies::ensure(pm, job) },
+            |pm, body| provider_ps_projection::grant(target, pm, body),
+        ))
     }) {
         Ok(result) => result,
         Err(status) => (status as i32, 0, 0, 0),
