@@ -69,7 +69,7 @@ fn auxiliary() -> &'static mut SourceIrpAuxiliaryLedger {
     unsafe { &mut *core::ptr::addr_of_mut!(AUXILIARY) }
 }
 
-unsafe fn pool_range_identity_unlocked(
+pub(super) unsafe fn pool_range_identity_unlocked(
     inst: DriverInstance,
     component_address: u64,
     bytes: u64,
@@ -106,7 +106,7 @@ unsafe fn pool_range_identity_unlocked(
     })
 }
 
-unsafe fn exact_pool_identity_unlocked(
+pub(super) unsafe fn exact_pool_identity_unlocked(
     inst: DriverInstance,
     component_address: u64,
     bytes: u64,
@@ -720,6 +720,13 @@ pub(super) fn retire_allocation(
     {
         return (nt_status::NtStatus::PENDING.raw(), 0, 0);
     }
+    let mutex_pool = if op == 3 {
+        unsafe { exact_pool_identity_unlocked(inst, component_address, 1) }
+            .map(|identity| (identity.component_address, identity.pool_generation))
+    } else { None };
+    if mutex_pool.is_some_and(|pool| !hosted_driver_kmutex::pool_free_admission(domain, pool)) {
+        return (nt_status::NtStatus::DELETE_PENDING.raw(), 0, 0);
+    }
     let owner = match ledger().pool_free_admission(instance_index, domain, component_address) {
         Ok(SourcePoolFreeAdmission::Unregistered) => {
             return if op == 3
@@ -727,6 +734,7 @@ pub(super) fn retire_allocation(
                     == Some(false)
                 && unsafe { hosted_instance_pool_free_unlocked(inst, component_address) }
             {
+                if let Some(pool) = mutex_pool { hosted_driver_kmutex::pool_freed(domain, pool); }
                 (STATUS_SUCCESS, 0, 0)
             } else {
                 (STATUS_INVALID_HANDLE, 0, 0)
@@ -747,6 +755,7 @@ pub(super) fn retire_allocation(
             if !unsafe { hosted_instance_pool_free_unlocked(inst, component_address) } {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             }
+            if let Some(pool) = mutex_pool { hosted_driver_kmutex::pool_freed(domain, pool); }
             if ledger().retire(ticket, owner).is_err() {
                 unsafe {
                     crate::provider_bugcheck::report(

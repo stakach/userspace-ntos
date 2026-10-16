@@ -27,7 +27,7 @@ fn actual_native_source_pool_bounds_and_fallback_behavior() {
         function_between(
             ledger,
             "unsafe fn pool_range_identity_unlocked(",
-            "\nunsafe fn exact_pool_identity_unlocked(",
+            "\npub(super) unsafe fn exact_pool_identity_unlocked(",
         ),
         function_between(
             ledger,

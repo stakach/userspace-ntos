@@ -30,6 +30,7 @@ mod ex_work_queue;
 pub mod executive_sync;
 pub mod gdi_bitmap;
 mod hosted_dpc;
+pub mod hosted_kmutex;
 pub mod hosted_process_exit_notify;
 mod interrupt;
 mod interrupt_lock;

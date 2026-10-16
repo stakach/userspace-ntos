@@ -3691,6 +3691,18 @@ unsafe fn component_pump_loop(
             };
             pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, value, 0, 0);
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_KMUTEX_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, value) = if msg.mi == ((crate::driver_launch::FSD_SERVICE_KMUTEX_LABEL << 12) | 2)
+                || msg.mi == ((crate::driver_launch::FSD_SERVICE_KMUTEX_LABEL << 12) | 3)
+            {
+                crate::driver_launch::service_hosted_driver_kmutex(
+                    ch, msg.m0, msg.m1, msg.m2, msg.badge, *reply_cap,
+                )
+            } else { (STATUS_INVALID_PARAMETER_I32, 0) };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, value, 0, 0);
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_PROPERTY_WRITE_LABEL
             && ch.caps.kind == ReqKind::Irp
         {

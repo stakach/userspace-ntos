@@ -332,12 +332,15 @@ mod hosted_driver_pofx;
 mod hosted_driver_power_setting;
 #[path = "hosted_driver_luid.rs"]
 mod hosted_driver_luid;
+#[path = "hosted_driver_kmutex.rs"]
+mod hosted_driver_kmutex;
 #[path = "hosted_driver_device_state.rs"]
 mod hosted_driver_device_state;
 pub(crate) use hosted_driver_pnp_notification::service as service_hosted_driver_pnp_notification;
 pub(crate) use hosted_driver_pofx::service as service_hosted_driver_pofx;
 pub(crate) use hosted_driver_power_setting::service as service_hosted_driver_power_setting;
 pub(crate) use hosted_driver_luid::service as service_hosted_driver_luid;
+pub(crate) use hosted_driver_kmutex::service as service_hosted_driver_kmutex;
 pub(crate) use hosted_driver_pnp_notification::wake_due as hosted_driver_pnp_notification_wake_due;
 #[path = "hosted_io_create_file_ingress.rs"]
 mod hosted_io_create_file_ingress;
@@ -1182,6 +1185,7 @@ pub const FSD_SERVICE_PS_HANDLE_REFERENCE_LABEL: u64 = hosted_driver_ps_handle_r
 pub const FSD_SERVICE_POFX_LABEL: u64 = hosted_driver_pofx::LABEL;
 pub const FSD_SERVICE_POWER_SETTING_LABEL: u64 = hosted_driver_power_setting::LABEL;
 pub const FSD_SERVICE_LUID_LABEL: u64 = hosted_driver_luid::LABEL;
+pub const FSD_SERVICE_KMUTEX_LABEL: u64 = hosted_driver_kmutex::LABEL;
 const _: () = {
     let labels = [
         FSD_SERVICE_SOURCE_IRP_LABEL,
@@ -1224,6 +1228,7 @@ const _: () = {
         FSD_SERVICE_POFX_LABEL,
         FSD_SERVICE_POWER_SETTING_LABEL,
         FSD_SERVICE_LUID_LABEL,
+        FSD_SERVICE_KMUTEX_LABEL,
         FSD_SERVICE_PCI_ROOT_LABEL,
         FSD_SERVICE_PCI_ROUTE_QUERY_LABEL,
     ];
@@ -5000,10 +5005,6 @@ extern "win64" fn s_zero() -> u64 {
 }
 
 extern "win64" fn s_void() {}
-
-extern "win64" fn s_ke_release_mutex(_mutex: u64, _wait: u8) -> i32 {
-    1
-}
 
 unsafe fn hosted_irq_timer_service(
     kind: nt_hosted_runtime::HostedIrqServiceKind,
@@ -13959,6 +13960,17 @@ unsafe fn hosted_dispatcher_ready(object: u64) -> Result<bool, i32> {
     Err(STATUS_INVALID_PARAMETER)
 }
 
+unsafe fn hosted_dispatcher_ready_for(
+    object: u64,
+    key: Option<nt_kernel_exec::hosted_kmutex::KmutexKey>,
+    thread: u64,
+) -> Result<bool, i32> {
+    match key {
+        Some(key) => hosted_driver_kmutex::ready(object, key, thread),
+        None => hosted_dispatcher_ready(object),
+    }
+}
+
 unsafe fn hosted_dispatcher_consume(object: u64) -> bool {
     let object_type = read_unaligned(object as *const u8);
     if object_type == kevent::EVENT_NOTIFICATION_OBJECT {
@@ -13981,23 +13993,38 @@ unsafe fn hosted_dispatcher_consume(object: u64) -> bool {
     false
 }
 
+unsafe fn hosted_dispatcher_consume_for(
+    object: u64,
+    key: Option<nt_kernel_exec::hosted_kmutex::KmutexKey>,
+    thread: u64,
+    owner: u64,
+) -> bool {
+    match key {
+        Some(key) => hosted_driver_kmutex::acquire(object, key, thread, owner) == Ok(true),
+        None => hosted_dispatcher_consume(object),
+    }
+}
+
 unsafe fn hosted_dispatcher_wait_ready(
     objects: &[u64],
+    keys: &[Option<nt_kernel_exec::hosted_kmutex::KmutexKey>],
+    thread: u64,
     wait_all: bool,
 ) -> Result<Option<u32>, i32> {
-    if objects.is_empty() || objects.len() > HOSTED_DRIVER_WAIT_OBJECT_MAX as usize {
+    if objects.is_empty() || objects.len() != keys.len()
+        || objects.len() > HOSTED_DRIVER_WAIT_OBJECT_MAX as usize {
         return Err(STATUS_INVALID_PARAMETER);
     }
     if wait_all {
-        for &object in objects {
-            if !hosted_dispatcher_ready(object)? {
+        for (&object, &key) in objects.iter().zip(keys) {
+            if !hosted_dispatcher_ready_for(object, key, thread)? {
                 return Ok(None);
             }
         }
         Ok(Some(0))
     } else {
-        for (index, &object) in objects.iter().enumerate() {
-            if hosted_dispatcher_ready(object)? {
+        for (index, (&object, &key)) in objects.iter().zip(keys).enumerate() {
+            if hosted_dispatcher_ready_for(object, key, thread)? {
                 return Ok(Some(index as u32));
             }
         }
@@ -14007,12 +14034,15 @@ unsafe fn hosted_dispatcher_wait_ready(
 
 unsafe fn hosted_dispatcher_wait_consume(
     objects: &[u64],
+    keys: &[Option<nt_kernel_exec::hosted_kmutex::KmutexKey>],
+    thread: u64,
+    owner: u64,
     wait_all: bool,
     ready_index: u32,
 ) -> bool {
     if wait_all {
-        for &object in objects {
-            if !hosted_dispatcher_consume(object) {
+        for (&object, &key) in objects.iter().zip(keys) {
+            if !hosted_dispatcher_consume_for(object, key, thread, owner) {
                 return false;
             }
         }
@@ -14021,7 +14051,7 @@ unsafe fn hosted_dispatcher_wait_consume(
         let Some(&object) = objects.get(ready_index as usize) else {
             return false;
         };
-        hosted_dispatcher_consume(object)
+        hosted_dispatcher_consume_for(object, keys[ready_index as usize], thread, owner)
     }
 }
 
@@ -14248,11 +14278,14 @@ fn park_hosted_driver_wait(
     route: nt_component_suspension::peer_registry::PeerRoute,
     active_reply_cap: u64,
     objects: Vec<u64>,
+    keys: Vec<Option<nt_kernel_exec::hosted_kmutex::KmutexKey>>,
+    owner_body: u64,
     wait_all: bool,
     api_multiple: bool,
     deadline: nt_kernel_exec::Deadline,
 ) -> Option<HostedDriverWaitServiceResult> {
-    if objects.is_empty() || objects.len() > HOSTED_DRIVER_WAIT_OBJECT_MAX as usize {
+    if objects.is_empty() || objects.len() != keys.len()
+        || objects.len() > HOSTED_DRIVER_WAIT_OBJECT_MAX as usize {
         return None;
     }
     if deadline != nt_kernel_exec::Deadline::Infinite
@@ -14285,6 +14318,8 @@ fn park_hosted_driver_wait(
         thread_handle,
         reply_cap: active_reply_cap,
         objects,
+        keys,
+        owner_body,
         wait_all,
         api_multiple,
         deadline,
@@ -14576,7 +14611,8 @@ fn wake_hosted_driver_waiters_for_instance(instance: usize) -> u64 {
                     waiter.instance == instance
                         && waiter.wake_status.is_none()
                         && matches!(
-                            hosted_dispatcher_wait_ready(&waiter.objects, waiter.wait_all),
+                            hosted_dispatcher_wait_ready(&waiter.objects, &waiter.keys,
+                                waiter.thread_handle, waiter.wait_all),
                             Ok(Some(_))
                         )
                 })
@@ -14589,7 +14625,8 @@ fn wake_hosted_driver_waiters_for_instance(instance: usize) -> u64 {
         let waiter = unsafe { hosted_driver_waiters_mut().remove(index) };
         let wait_is_multiple = waiter.api_multiple;
         let ready_status =
-            match unsafe { hosted_dispatcher_wait_ready(&waiter.objects, waiter.wait_all) } {
+            match unsafe { hosted_dispatcher_wait_ready(&waiter.objects, &waiter.keys,
+                waiter.thread_handle, waiter.wait_all) } {
                 Ok(Some(status)) => status,
                 _ => {
                     record_hosted_driver_wait_wake_error(wait_is_multiple);
@@ -14600,7 +14637,8 @@ fn wake_hosted_driver_waiters_for_instance(instance: usize) -> u64 {
                 }
             };
         let consumed = unsafe {
-            hosted_dispatcher_wait_consume(&waiter.objects, waiter.wait_all, ready_status)
+            hosted_dispatcher_wait_consume(&waiter.objects, &waiter.keys,
+                waiter.thread_handle, waiter.owner_body, waiter.wait_all, ready_status)
         };
         if !consumed {
             record_hosted_driver_wait_wake_error(wait_is_multiple);
@@ -34829,14 +34867,10 @@ fn register_fsd_trampolines() -> bool {
         "ExTryToAcquireFastMutex",
         s_ex_try_to_acquire_fast_mutex as *const () as usize as u64,
     );
-    reg.bind(
-        "KeInitializeMutex",
-        s_init_small_struct as *const () as usize as u64,
-    );
-    reg.bind(
-        "KeReleaseMutex",
-        s_ke_release_mutex as *const () as usize as u64,
-    );
+    reg.bind("KeInitializeMutex",
+        hosted_driver_kmutex::initialize as *const () as usize as u64);
+    reg.bind("KeReleaseMutex",
+        hosted_driver_kmutex::release as *const () as usize as u64);
     reg.bind(
         "KeInitializeSemaphore",
         s_ke_initialize_semaphore as *const () as usize as u64,
@@ -57708,6 +57742,8 @@ struct HostedDriverRawWaiter {
     thread_handle: u64,
     reply_cap: u64,
     objects: Vec<u64>,
+    keys: Vec<Option<nt_kernel_exec::hosted_kmutex::KmutexKey>>,
+    owner_body: u64,
     wait_all: bool,
     api_multiple: bool,
     deadline: nt_kernel_exec::Deadline,
@@ -58086,6 +58122,7 @@ unsafe fn hosted_driver_device_lifetime_quiesced(
         && unsafe { hosted_driver_device_state::retire_domain(domain) }
         && hosted_driver_pnp_notification::quiesced(domain)
         && hosted_driver_pofx::quiesced(domain)
+        && hosted_driver_kmutex::quiesced(domain)
 }
 
 fn hosted_driver_thread_error_status(error: HostedDriverThreadError) -> i32 {
@@ -58714,6 +58751,7 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
             hosted_driver_device_interfaces::retire_domain(domain);
             hosted_driver_pnp_notification::retire_domain(domain);
             hosted_driver_pofx::retire_domain(domain);
+            hosted_driver_kmutex::retire_domain(domain);
         }
     }
     if let Some(domain) = retiring_domain {
@@ -62138,10 +62176,23 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
         }
         return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
     };
+    let key = instance_domain_identity(inst)
+        .and_then(|domain| hosted_driver_kmutex::key_for(domain, exec_object));
+    if unsafe { read_unaligned(exec_object as *const u8) } == 2 && key.is_none() {
+        return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
+    }
+    let owner_body = if key.is_some() {
+        match hosted_driver_kmutex::owner_body(ch, inst) {
+            Some(owner) => owner,
+            None => return HostedDriverWaitServiceResult::Reply(STATUS_ACCESS_DENIED),
+        }
+    } else { 0 };
     unsafe {
-        match hosted_dispatcher_ready(exec_object) {
+        match hosted_dispatcher_ready_for(exec_object, key, thread_handle) {
             Ok(true) => {
-                hosted_dispatcher_consume(exec_object);
+                if !hosted_dispatcher_consume_for(exec_object, key, thread_handle, owner_body) {
+                    return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
+                }
                 HOSTED_DRIVER_WAIT_SINGLE_READY.fetch_add(1, Ordering::Relaxed);
                 HostedDriverWaitServiceResult::Reply(STATUS_SUCCESS)
             }
@@ -62165,12 +62216,19 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
                     return HostedDriverWaitServiceResult::Reply(STATUS_INSUFFICIENT_RESOURCES);
                 }
                 objects.push(exec_object);
+                let mut keys = Vec::new();
+                if keys.try_reserve_exact(1).is_err() {
+                    return HostedDriverWaitServiceResult::Reply(STATUS_INSUFFICIENT_RESOURCES);
+                }
+                keys.push(key);
                 let Some(parked) = park_hosted_driver_wait(
                     instance,
                     thread_handle,
                     caller.route,
                     active_reply_cap,
                     objects,
+                    keys,
+                    owner_body,
                     false,
                     false,
                     deadline,
@@ -62276,6 +62334,10 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
         HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS.fetch_add(1, Ordering::Relaxed);
         return HostedDriverWaitServiceResult::Reply(STATUS_INSUFFICIENT_RESOURCES);
     }
+    let mut keys = Vec::new();
+    if keys.try_reserve_exact(count as usize).is_err() {
+        return HostedDriverWaitServiceResult::Reply(STATUS_INSUFFICIENT_RESOURCES);
+    }
     let mut index = 0u32;
     while index < count {
         let component_object =
@@ -62300,9 +62362,21 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
             }
             return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
         };
+        let key = instance_domain_identity(inst)
+            .and_then(|domain| hosted_driver_kmutex::key_for(domain, exec_object));
+        if unsafe { read_unaligned(exec_object as *const u8) } == 2 && key.is_none() {
+            return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
+        }
         objects.push(exec_object);
+        keys.push(key);
         index += 1;
     }
+    let owner_body = if keys.iter().any(Option::is_some) {
+        match hosted_driver_kmutex::owner_body(ch, inst) {
+            Some(owner) => owner,
+            None => return HostedDriverWaitServiceResult::Reply(STATUS_ACCESS_DENIED),
+        }
+    } else { 0 };
 
     let wait_all = wait_type == 0;
     if wait_all && hosted_driver_wait_all_has_duplicate(&objects) {
@@ -62311,9 +62385,10 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
     }
 
     unsafe {
-        match hosted_dispatcher_wait_ready(&objects, wait_all) {
+        match hosted_dispatcher_wait_ready(&objects, &keys, thread_handle, wait_all) {
             Ok(Some(status)) => {
-                if !hosted_dispatcher_wait_consume(&objects, wait_all, status) {
+                if !hosted_dispatcher_wait_consume(&objects, &keys,
+                    thread_handle, owner_body, wait_all, status) {
                     HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS.fetch_add(1, Ordering::Relaxed);
                     return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
                 }
@@ -62340,6 +62415,8 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
                     caller.route,
                     active_reply_cap,
                     objects,
+                    keys,
+                    owner_body,
                     wait_all,
                     true,
                     deadline,

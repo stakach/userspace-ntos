@@ -59,14 +59,18 @@ pub struct MutantStore {
 }
 
 impl MutantStore {
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self { mutants: Vec::new() }
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             mutants: Vec::with_capacity(capacity),
         }
+    }
+
+    pub fn try_reserve(&mut self, additional: usize) -> bool {
+        self.mutants.try_reserve(additional).is_ok()
     }
 
     pub fn initialize(&mut self, identity: u64, initial_owner: Option<u64>) {
