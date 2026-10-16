@@ -19,6 +19,8 @@ pub struct TerminalCreate {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetainedCreateError {
     InvalidIdentity,
+    InvalidResult,
+    CleanupFailed,
     WrongPhase,
     WrongRequest,
 }
@@ -28,6 +30,15 @@ enum Phase {
     Prepared,
     Submitted(u64),
     Terminal(TerminalCreate),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Delivery {
+    NotRequired,
+    NeedsCopyout,
+    Published,
+    NeedsClose(u64),
+    Closed,
 }
 
 /// Holds the original Reply capability and checked wire bytes until the exact
@@ -40,6 +51,7 @@ pub struct RetainedCreate {
     reply_cap: u64,
     request: Vec<u8>,
     phase: Phase,
+    delivery: Delivery,
 }
 
 impl RetainedCreate {
@@ -54,7 +66,8 @@ impl RetainedCreate {
         {
             return Err(RetainedCreateError::InvalidIdentity);
         }
-        Ok(Self { owner, token, reply_cap, request, phase: Phase::Prepared })
+        Ok(Self { owner, token, reply_cap, request, phase: Phase::Prepared,
+            delivery: Delivery::NotRequired })
     }
 
     pub fn owner(&self) -> CreateOwner { self.owner }
@@ -99,10 +112,53 @@ impl RetainedCreate {
         handle: u64,
     ) -> Result<(), RetainedCreateError> {
         self.uncertain(request_id)?;
+        if (status == 0) != (handle != 0) {
+            return Err(RetainedCreateError::InvalidResult);
+        }
         self.phase = Phase::Terminal(TerminalCreate {
             status, handle, service_effect_possible: true,
         });
+        self.delivery = if status == 0 { Delivery::NeedsCopyout } else { Delivery::NotRequired };
         Ok(())
+    }
+
+    /// Record the checked write to the original caller's output address. A
+    /// failed write leaves the exact service handle owned until close succeeds.
+    pub fn copyout(&mut self, written: bool) -> Result<(), RetainedCreateError> {
+        if self.delivery != Delivery::NeedsCopyout {
+            return Err(RetainedCreateError::WrongPhase);
+        }
+        let Some(result) = self.terminal() else { return Err(RetainedCreateError::WrongPhase) };
+        self.delivery = if written { Delivery::Published } else { Delivery::NeedsClose(result.handle) };
+        Ok(())
+    }
+
+    pub fn cleanup_handle(&self) -> Option<u64> {
+        match self.delivery { Delivery::NeedsClose(handle) => Some(handle), _ => None }
+    }
+
+    /// Only an acknowledged close of the same service handle retires a failed
+    /// copyout. A timeout or failed close leaves the original Reply retained.
+    pub fn cleanup_complete(&mut self, handle: u64, status: i32) -> Result<(), RetainedCreateError> {
+        if self.delivery != Delivery::NeedsClose(handle) {
+            return Err(RetainedCreateError::WrongRequest);
+        }
+        if status != 0 {
+            return Err(RetainedCreateError::CleanupFailed);
+        }
+        self.delivery = Delivery::Closed;
+        Ok(())
+    }
+
+    /// None means the original Reply is still owned by copyout or cleanup.
+    pub fn reply_status(&self) -> Option<i32> {
+        let result = self.terminal()?;
+        match self.delivery {
+            Delivery::NotRequired => Some(result.status),
+            Delivery::Published => Some(result.status),
+            Delivery::Closed => Some(0xC000_0005u32 as i32),
+            Delivery::NeedsCopyout | Delivery::NeedsClose(_) => None,
+        }
     }
 
     pub fn terminal(&self) -> Option<TerminalCreate> {
@@ -111,7 +167,7 @@ impl RetainedCreate {
 
     /// A failed Reply send returns the whole owner unchanged for retry.
     pub fn finish_after_reply(self, acknowledged: bool) -> Result<(), Self> {
-        if acknowledged && self.terminal().is_some() { Ok(()) } else { Err(self) }
+        if acknowledged && self.reply_status().is_some() { Ok(()) } else { Err(self) }
     }
 }
 
@@ -138,6 +194,7 @@ mod tests {
         let mut call = call.finish_after_reply(true).err().unwrap();
         call.complete(41, 0, 0xabc).unwrap();
         assert_eq!(call.terminal().unwrap().handle, 0xabc);
+        call.copyout(true).unwrap();
         assert!(call.finish_after_reply(true).is_ok());
     }
 
@@ -159,9 +216,39 @@ mod tests {
         let mut call = call();
         call.begin(41).unwrap();
         call.complete(41, 0, 55).unwrap();
+        call.copyout(true).unwrap();
         let call = call.finish_after_reply(false).err().unwrap();
         assert_eq!(call.reply_cap(), 300);
         assert_eq!(call.request(), &[1, 2, 3]);
+        assert!(call.finish_after_reply(true).is_ok());
+    }
+
+    #[test]
+    fn successful_create_requires_copyout_or_exact_close_before_reply() {
+        let mut call = call();
+        call.begin(41).unwrap();
+        call.complete(41, 0, 55).unwrap();
+        // The service has published handle 55, but the caller has not received
+        // it. Acknowledging STATUS_SUCCESS here would orphan that handle.
+        let call = call.finish_after_reply(true).err().expect("unpublished handle retained");
+        assert_eq!(call.reply_cap(), 300);
+        assert_eq!(call.terminal().unwrap().handle, 55);
+        assert_eq!(call.reply_status(), None);
+    }
+
+    #[test]
+    fn failed_copyout_retains_exact_handle_until_checked_close() {
+        let mut call = call();
+        call.begin(41).unwrap();
+        call.complete(41, 0, 55).unwrap();
+        call.copyout(false).unwrap();
+        assert_eq!(call.cleanup_handle(), Some(55));
+        assert_eq!(call.cleanup_complete(56, 0), Err(RetainedCreateError::WrongRequest));
+        assert_eq!(call.cleanup_complete(55, 0xC000_0001u32 as i32),
+            Err(RetainedCreateError::CleanupFailed));
+        assert_eq!(call.reply_status(), None);
+        assert!(call.cleanup_complete(55, 0).is_ok());
+        assert_eq!(call.reply_status(), Some(0xC000_0005u32 as i32));
         assert!(call.finish_after_reply(true).is_ok());
     }
 }

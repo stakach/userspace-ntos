@@ -205,6 +205,8 @@ pub mod opcode {
     pub const ALPC_OP_READ_SECTION_VIEW: u16 = 0x230d;
     /// Look up the recorded result of one checked port-create invocation.
     pub const ALPC_OP_LOOKUP_CREATE_PORT: u16 = 0x230e;
+    /// Close only the result of an exact checked create after caller copyout failed.
+    pub const ALPC_OP_CLOSE_CREATED_PORT: u16 = 0x230f;
 }
 
 /// `AlpcSendReceiveRequest.flags` bits.
@@ -269,6 +271,22 @@ pub struct AlpcLookupCreatePortRequest {
     pub abi_size: u16,
     pub _reserved: u16,
     pub _reserved2: u32,
+    pub owner_process: u64,
+    pub owner_thread: u64,
+    pub owner_generation: u64,
+    pub invocation_hi: u64,
+    pub invocation_lo: u64,
+}
+
+/// Exact cleanup authority for a checked create. The service verifies every
+/// identity field against its durable create-result record before closing.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AlpcCloseCreatedPortRequest {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub _reserved2: u32,
+    pub handle: u64,
     pub owner_process: u64,
     pub owner_thread: u64,
     pub owner_generation: u64,
@@ -458,6 +476,7 @@ const _: () = {
     assert!(size_of::<AlpcCreatePortCheckedRequest>() == 64);
     assert!(size_of::<AlpcCreatePortOwnedRequest>() == 136);
     assert!(size_of::<AlpcLookupCreatePortRequest>() == 48);
+    assert!(size_of::<AlpcCloseCreatedPortRequest>() == 56);
     assert!(size_of::<AlpcConnectPortRequest>() == 40);
     assert!(size_of::<AlpcAcceptConnectRequest>() == 24);
     assert!(size_of::<AlpcSendReceiveRequest>() == 40);

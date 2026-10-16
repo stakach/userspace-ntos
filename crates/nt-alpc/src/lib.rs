@@ -53,7 +53,8 @@ use bytemuck::Pod;
 use nt_alpc_abi::{
     msg_attr_flag, opcode, send_flag, AlpcAcceptConnectRequest, AlpcConnectPortRequest,
     AlpcContextAttr, AlpcCreatePortCheckedRequest, AlpcCreatePortOwnedRequest,
-    AlpcCreatePortRequest, AlpcCreatePortSectionRequest, AlpcCreateSectionViewRequest,
+    AlpcCloseCreatedPortRequest, AlpcCreatePortRequest, AlpcCreatePortSectionRequest,
+    AlpcCreateSectionViewRequest,
     AlpcDataViewAttr, AlpcHandleAttr, AlpcHandleRequest, AlpcLookupCreatePortRequest,
     AlpcMessageAttributes, AlpcPortAttributes, AlpcReply, AlpcSecurityAttr, AlpcSendReceiveRequest,
     AlpcTokenAttr, AlpcViewIoRequest,
@@ -189,6 +190,7 @@ struct CreatePortResult {
     attributes: Option<AlpcPortAttributes>,
     name: Vec<u16>,
     result: AlpcReply,
+    closed: bool,
 }
 
 /// The ALPC service: the `NtAlpc*` ABI adapter. It borrows a shared
@@ -240,6 +242,7 @@ impl AlpcServer {
             opcode::ALPC_OP_PING => Ok(ok()),
             opcode::ALPC_OP_CREATE_PORT => self.op_create_port(core, in_buf),
             opcode::ALPC_OP_LOOKUP_CREATE_PORT => self.op_lookup_create_port(core, in_buf),
+            opcode::ALPC_OP_CLOSE_CREATED_PORT => self.op_close_created_port(core, in_buf),
             opcode::ALPC_OP_CONNECT_PORT => self.op_connect_port(core, in_buf),
             opcode::ALPC_OP_ACCEPT_CONNECT => self.op_accept_connect(core, in_buf),
             opcode::ALPC_OP_SEND_RECEIVE | opcode::ALPC_OP_RECEIVE => {
@@ -381,8 +384,46 @@ impl AlpcServer {
             attributes,
             name,
             result,
+            closed: false,
         });
         Ok(result)
+    }
+
+    fn op_close_created_port(
+        &mut self,
+        core: &mut PortCore,
+        buf: &[u8],
+    ) -> Result<AlpcReply, NtStatus> {
+        let req: AlpcCloseCreatedPortRequest = read_req(buf)?;
+        if req.abi_size as usize != size_of::<AlpcCloseCreatedPortRequest>()
+            || req._reserved != 0 || req._reserved2 != 0 || req.handle == 0
+            || req.owner_process == 0 || req.owner_thread == 0 || req.owner_generation == 0
+            || (req.invocation_hi, req.invocation_lo) == (0, 0)
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let saved = self.create_results.iter_mut().find(|saved| {
+            saved.token == (req.invocation_hi, req.invocation_lo)
+        }).ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
+        if saved.owner != (ClientId { process: req.owner_process, thread: req.owner_thread })
+            || saved.owner_generation != req.owner_generation
+            || saved.result.status != NtStatus::SUCCESS.0
+            || saved.result.detail0 != req.handle
+        {
+            return Err(NtStatus::OBJECT_NAME_COLLISION);
+        }
+        if saved.closed {
+            return Ok(ok());
+        }
+        let info = core.handle_info(req.handle).ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+        if info.endpoint != PortHandleEndpoint::ListenPort
+            || info.api != PortApi::Alpc || info.server_id != saved.owner
+        {
+            return Err(NtStatus::INVALID_PORT_HANDLE);
+        }
+        core.close_port_checked(req.handle)?;
+        saved.closed = true;
+        Ok(ok())
     }
 
     fn op_lookup_create_port(&self, core: &PortCore, buf: &[u8]) -> Result<AlpcReply, NtStatus> {
@@ -417,6 +458,9 @@ impl AlpcServer {
     }
 
     fn live_create_result(&self, core: &PortCore, saved: &CreatePortResult) -> AlpcReply {
+        if saved.closed {
+            return reply(NtStatus::INVALID_PORT_HANDLE, 0, 0, 0);
+        }
         if saved.result.status == NtStatus::SUCCESS.0
             && core.handle_info(saved.result.detail0).is_none()
         {

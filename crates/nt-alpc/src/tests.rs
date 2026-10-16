@@ -5,7 +5,8 @@ use super::*;
 
 use nt_alpc_abi::{
     msg_attr_flag, msg_type, opcode as aop, port_flag, AlpcAcceptConnectRequest,
-    AlpcConnectPortRequest, AlpcContextAttr, AlpcCreatePortRequest, AlpcCreatePortSectionRequest,
+    AlpcCloseCreatedPortRequest, AlpcConnectPortRequest, AlpcContextAttr, AlpcCreatePortRequest,
+    AlpcCreatePortSectionRequest,
     AlpcCreateSectionViewRequest, AlpcDataViewAttr, AlpcHandleRequest, AlpcSendReceiveRequest,
     AlpcViewIoRequest, PortMessage,
 };
@@ -276,6 +277,51 @@ fn checked_create_reconciles_only_exact_owner_token_and_request() {
         same_owner_new_token.status,
         nt_status::NtStatus::OBJECT_NAME_COLLISION.0
     );
+}
+
+#[test]
+fn checked_created_port_close_requires_exact_owner_token_and_handle() {
+    let mut core = PortCore::new();
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId { process: 7, thread: 11 };
+    let name = utf16("\\SmApiPortClose");
+    let create = enc_checked_create_port(&name, owner, (3, 9));
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &create, &mut []);
+    assert_eq!(created.status, SUCCESS);
+    let exact = AlpcCloseCreatedPortRequest {
+        abi_size: size_of::<AlpcCloseCreatedPortRequest>() as u16,
+        handle: created.detail0,
+        owner_process: owner.process,
+        owner_thread: owner.thread,
+        owner_generation: 1,
+        invocation_hi: 3,
+        invocation_lo: 9,
+        ..Default::default()
+    };
+    for changed in [
+        AlpcCloseCreatedPortRequest { owner_process: 8, ..exact },
+        AlpcCloseCreatedPortRequest { owner_generation: 2, ..exact },
+        AlpcCloseCreatedPortRequest { invocation_lo: 10, ..exact },
+        AlpcCloseCreatedPortRequest { handle: created.detail0 + 1, ..exact },
+    ] {
+        assert_ne!(alpc.dispatch(&mut core, aop::ALPC_OP_CLOSE_CREATED_PORT,
+            &bytes(&changed), &mut []).status, SUCCESS);
+        assert!(core.handle_info(created.detail0).is_some());
+    }
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_CLOSE_CREATED_PORT,
+        &bytes(&exact), &mut []).status, SUCCESS);
+    assert!(core.handle_info(created.detail0).is_none());
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_CLOSE_CREATED_PORT,
+        &bytes(&exact), &mut []).status, SUCCESS);
+    // Closed state is authoritative for both reconciliation routes, even if
+    // a later service allocation were ever to reuse this numeric handle.
+    let lookup = alpc.dispatch(&mut core, aop::ALPC_OP_LOOKUP_CREATE_PORT,
+        &enc_create_lookup(owner, (3, 9)), &mut []);
+    assert_eq!(lookup.status, nt_status::NtStatus::INVALID_PORT_HANDLE.0);
+    assert_eq!(lookup.detail0, 0);
+    let replay = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &create, &mut []);
+    assert_eq!(replay.status, nt_status::NtStatus::INVALID_PORT_HANDLE.0);
+    assert_eq!(replay.detail0, 0);
 }
 
 #[test]
