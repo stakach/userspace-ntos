@@ -45,6 +45,12 @@ pub mod exports;
 /// See [`security_exports`].
 pub mod security_exports;
 
+/// Process-local USER client procedure tables registered by the released user32.dll.
+pub mod user_pfn;
+
+/// Native performance counter wrappers used by the released kernel32.dll.
+pub mod performance;
+
 /// Step 4.B — the on-target IN-PROCESS loader drive (real heap + import snap). See [`on_target`].
 #[cfg(target_arch = "x86_64")]
 pub mod on_target;
@@ -1274,6 +1280,12 @@ static KEEP_EXPORTS: unsafe extern "C" fn() = exports::EXPORT_ANCHOR_FN;
 /// pattern as [`KEEP_EXPORTS`].
 #[used]
 static KEEP_SECURITY_EXPORTS: unsafe extern "C" fn() = security_exports::SECURITY_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_USER_PFN_EXPORTS: unsafe extern "C" fn() = user_pfn::USER_PFN_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_PERFORMANCE_EXPORTS: unsafe extern "C" fn() = performance::PERFORMANCE_EXPORT_ANCHOR_FN;
 
 /// Anchor private on-target entrypoints that are still discovered dynamically from ntdll exports.
 #[used]
