@@ -689,6 +689,7 @@ diagnosis-free failure.
 ## Keep The Kernel Interface In Our Ntdll
 - For a replacement userspace release, stage this project's source-built `ntdll.dll` as the kernel interface and retain the release's unrelated drivers, including `acpi.sys`.
 - Compare exported names against the pinned release `ntdll.dll` and check installed PE imports before boot. Export coverage is an admission gate; live calls and desktop behavior need separate proof.
+- Treat named export coverage as the DLL compatibility requirement when the installed binaries import by name. Audit ordinal imports separately; differing export ordinal numbers alone do not require replacing the source-built kernel interface.
 
 ## Test Native Boundaries Through Their Domain Contracts
 - A source-string assertion that only repeats the intended implementation is not a useful regression. Prove filtering, generation, ownership, and selector behavior in the relevant domain or protocol tests, then verify native wiring with a build and boot.
