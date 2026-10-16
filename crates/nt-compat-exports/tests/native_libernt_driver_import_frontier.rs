@@ -572,3 +572,20 @@ fn pinned_dxg_contiguous_release_uses_exact_physical_allocation_owner() {
         && adapter.contains("pool_free")
         && adapter.contains("provider_bugcheck"));
 }
+
+#[test]
+fn pinned_dxg_physical_memory_ranges_copy_boot_ram_and_terminate() {
+    assert!(native_imports("dxgkrnl.sys").contains("MmGetPhysicalMemoryRanges"));
+    let launch = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    assert!(launch.contains("reg.bind(\n        \"MmGetPhysicalMemoryRanges\","));
+    let adapter = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../components/ntos-executive/src/hosted_driver_physical_ranges.rs"
+    ))
+    .expect("the native physical memory range adapter must exist");
+    assert!(adapter.contains("loader_firmware_memory_map")
+        && adapter.contains("pool_alloc")
+        && adapter.contains("pool_free")
+        && adapter.contains("physical_memory_ranges_from_firmware"),
+        "caller-owned array must copy boot-proven RAM and end in a zero pair");
+}

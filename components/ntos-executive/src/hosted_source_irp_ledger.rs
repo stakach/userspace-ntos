@@ -696,6 +696,7 @@ pub(super) fn retire_allocation(
     }
     if op == 3 && unsafe {
         hosted_driver_dynamic_type::owns_type_allocation(instance_index, component_address)
+            || hosted_driver_dynamic_type::owns_object_allocation(instance_index, component_address)
     } {
         return (nt_status::NtStatus::DELETE_PENDING.raw(), 0, 0);
     }

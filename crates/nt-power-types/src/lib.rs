@@ -7,6 +7,8 @@
 
 #![no_std]
 
+pub mod pofx;
+
 /// `POWER_STATE_TYPE` (spec §6.1).
 pub const POWER_STATE_TYPE_SYSTEM: u32 = 0;
 pub const POWER_STATE_TYPE_DEVICE: u32 = 1;

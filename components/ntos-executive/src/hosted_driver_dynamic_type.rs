@@ -7,7 +7,7 @@
 
 use super::*;
 use nt_object_manager::hosted_dynamic_type::{
-    DynamicTypeDefinition, DynamicTypeId, DynamicTypeOwner, HostedDynamicTypeRegistry,
+    DynamicObjectLease, DynamicTypeDefinition, DynamicTypeId, DynamicTypeOwner, HostedDynamicTypeRegistry,
 };
 use nt_object_manager::object_type::{ObjectType, ObjectTypeInitializer};
 
@@ -233,4 +233,106 @@ pub(super) unsafe fn owns_type_allocation(instance_index: usize, pointer: u64) -
     (&*core::ptr::addr_of!(BINDINGS)).iter().any(|row| {
         row.instance == instance_index && row.pool_pointer == pointer
     })
+}
+
+/// A driver's ExFreePool cannot recycle a registered object body before its exact
+/// DeleteProcedure ticket completes, including while callback delivery is uncertain.
+pub(super) unsafe fn owns_object_allocation(instance_index: usize, pointer: u64) -> bool {
+    let Some(inst) = instance(instance_index) else { return false; };
+    let Some(registry) = (&*core::ptr::addr_of!(REGISTRY)).as_ref() else { return false; };
+    (&*core::ptr::addr_of!(BINDINGS)).iter().any(|row| {
+        row.instance == instance_index
+            && row.owner.domain_id == inst.hosted_domain_id
+            && row.owner.domain_cookie == inst.hosted_domain_cookie
+            && registry.owner(row.type_id) == Some(row.owner)
+            && registry.owns_live_body(row.type_id, pointer)
+    })
+}
+
+/// Resolve the exact persistent `OBJECT_TYPE` allocation registered by this physical driver
+/// incarnation. The native adapter must not infer type authority from a mutable `Index` field.
+pub(super) unsafe fn type_binding_for_instance(
+    instance_index: usize,
+    type_pointer: u64,
+    inst: DriverInstance,
+) -> Option<DynamicTypeId> {
+    let row = (&*core::ptr::addr_of!(BINDINGS)).iter().find(|row| {
+        row.instance == instance_index && row.pool_pointer == type_pointer
+            && row.owner.domain_id == inst.hosted_domain_id
+            && row.owner.domain_cookie == inst.hosted_domain_cookie
+    })?;
+    let registry = (&*core::ptr::addr_of!(REGISTRY)).as_ref()?;
+    (registry.owner(row.type_id) == Some(row.owner)).then_some(row.type_id)
+}
+
+/// The broker calls this only after authenticating the caller and an exact live pool allocation.
+pub(super) unsafe fn publish_object_for_instance(
+    instance_index: usize,
+    type_pointer: u64,
+    inst: DriverInstance,
+    body: u64,
+) -> Result<DynamicObjectLease, nt_status::NtStatus> {
+    let ty = type_binding_for_instance(instance_index, type_pointer, inst)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    (&mut *core::ptr::addr_of_mut!(REGISTRY)).as_mut()
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?
+        .publish_object(ty, body)
+}
+
+pub(super) unsafe fn pending_object_for_instance(
+    instance_index: usize,
+    inst: DriverInstance,
+    body: u64,
+) -> Option<DynamicObjectLease> {
+    let registry = (&*core::ptr::addr_of!(REGISTRY)).as_ref()?;
+    let lease = registry.pending_object_for_body(body)?;
+    let owner = registry.owner(lease.type_id())?;
+    (&*core::ptr::addr_of!(BINDINGS)).iter().any(|row| {
+        row.instance == instance_index && row.type_id == lease.type_id()
+            && row.owner == owner
+            && owner.domain_id == inst.hosted_domain_id
+            && owner.domain_cookie == inst.hosted_domain_cookie
+    }).then_some(lease)
+}
+
+pub(super) unsafe fn object_for_instance(
+    instance_index: usize,
+    inst: DriverInstance,
+    body: u64,
+    generation: u64,
+) -> Option<DynamicObjectLease> {
+    let registry = (&*core::ptr::addr_of!(REGISTRY)).as_ref()?;
+    let lease = registry.object_for_body(body, generation)?;
+    let owner = registry.owner(lease.type_id())?;
+    (&*core::ptr::addr_of!(BINDINGS)).iter().any(|row| {
+        row.instance == instance_index && row.type_id == lease.type_id()
+            && row.owner == owner
+            && owner.domain_id == inst.hosted_domain_id
+            && owner.domain_cookie == inst.hosted_domain_cookie
+    }).then_some(lease)
+}
+
+pub(super) unsafe fn registry_mut() -> Option<&'static mut HostedDynamicTypeRegistry> {
+    (&mut *core::ptr::addr_of_mut!(REGISTRY)).as_mut()
+}
+
+/// Bind a pending object generation to the same physical image and domain that registered its
+/// type. The numeric callback address alone never selects a driver instance.
+pub(super) unsafe fn pending_delete_binding(
+    lease: DynamicObjectLease,
+) -> Option<(usize, DriverInstance, u64)> {
+    let registry = (&*core::ptr::addr_of!(REGISTRY)).as_ref()?;
+    let owner = registry.owner(lease.type_id())?;
+    let callback = registry.definition(lease.type_id())?.delete_procedure;
+    let row = (&*core::ptr::addr_of!(BINDINGS)).iter().find(|row| {
+        row.type_id == lease.type_id() && row.owner == owner
+    })?;
+    let inst = instance(row.instance)?;
+    if inst.hosted_domain_id != owner.domain_id
+        || inst.hosted_domain_cookie != owner.domain_cookie
+        || hosted_driver_process_notify::published_image_for_callback(row.instance, inst, callback)
+            .is_none_or(|image| image.run_base != owner.image_base
+                || image.publication_generation != owner.image_generation)
+    { return None; }
+    Some((row.instance, inst, callback))
 }

@@ -3049,6 +3049,10 @@ fn maybe_fold_system_wal() -> Result<(), u32> {
 fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
     nt_handler.sweep_directory_security_bodies();
     nt_handler.sweep_data_section_security();
+    // A hosted import can consume its last object reference while its primary Call still owns
+    // the Reply. The dynamic delete drain waits for that primary's exact ready receipt, then
+    // invokes DeleteProcedure on a separate PASSIVE worker.
+    unsafe { driver_launch::hosted_driver_dynamic_delete::drain(); }
     // A completed physical fold can be waiting only for its exact CM ACK. It still owns the
     // reserve, so redrive that receipt before any ordinary snapshot tries to acquire it.
     if crate::writable_fs::system_wal_fold_ack_pending() {

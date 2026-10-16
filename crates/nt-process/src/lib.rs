@@ -944,6 +944,9 @@ pub enum HandleObject {
     RegistryKey(u32),
     /// Executive-owned object-directory identity; Ps owns only the typed handle reference.
     ObjectDirectory(u64),
+    /// A native dynamic object body registered with Object Manager. The generation prevents a
+    /// recycled pool address from inheriting an older handle's authority.
+    DynamicObject { body: u64, generation: u64 },
     /// A process primary access token. The id is the owning process id.
     Token(ProcessId),
     /// A stable, independently owned token object.

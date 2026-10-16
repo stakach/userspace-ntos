@@ -24,6 +24,7 @@ extern crate alloc;
 
 pub mod page_lock;
 pub mod create_mdl;
+pub mod contiguous;
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};

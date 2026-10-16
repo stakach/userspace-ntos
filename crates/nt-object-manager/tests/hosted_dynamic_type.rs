@@ -65,6 +65,7 @@ fn deletion_is_one_shot_and_keeps_callback_owner_live_until_completion() {
     let mut registry = HostedDynamicTypeRegistry::new();
     let ty = registry.register(owner, dxgk_type(callback)).unwrap();
     let object = registry.publish_object(ty, 0xFFFF_9000_0000_1000).unwrap();
+    registry.fail_insert(object).unwrap();
     let ticket = registry.take_delete(object).unwrap();
 
     assert_eq!(ticket.owner, owner);

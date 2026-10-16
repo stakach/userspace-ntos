@@ -58,6 +58,20 @@ pub struct DynamicObjectLease {
     body: u64,
 }
 
+impl DynamicObjectLease {
+    pub const fn generation(self) -> u64 { self.generation }
+    pub const fn body(self) -> u64 { self.body }
+    pub const fn type_id(self) -> DynamicTypeId { self.type_id }
+}
+
+/// An authenticated process-table identity, never assembled from driver-supplied arguments.
+/// A PID alone can be reused; the creation sequence distinguishes successive process objects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DynamicHandleOwner {
+    pub process_id: u32,
+    pub creation_sequence: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DynamicDeleteTicket {
     pub owner: DynamicTypeOwner,
@@ -74,6 +88,9 @@ struct RegisteredType {
 
 struct ObjectRow {
     lease: DynamicObjectLease,
+    creator_reference: bool,
+    handle: Option<(DynamicHandleOwner, u64)>,
+    borrowed_references: u64,
     in_flight: bool,
 }
 
@@ -143,14 +160,132 @@ impl HostedDynamicTypeRegistry {
         let next = self.next_object.checked_add(1).ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
         self.objects.try_reserve(1).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
         let lease = DynamicObjectLease { type_id, generation: next, body };
-        self.objects.push(ObjectRow { lease, in_flight: false });
+        self.objects.push(ObjectRow {
+            lease,
+            creator_reference: true,
+            handle: None,
+            borrowed_references: 0,
+            in_flight: false,
+        });
         self.next_object = next;
         Ok(lease)
     }
 
-    /// Claim the delete callback once. An uncertain call remains in flight and cannot be retried.
+    /// Resolve an exact live object incarnation. A recycled body address cannot stand in for a
+    /// previous lease because generations are never reused.
+    pub fn object_for_body(&self, body: u64, generation: u64) -> Option<DynamicObjectLease> {
+        self.objects.iter().find(|row| {
+            row.lease.body == body && row.lease.generation == generation && !row.in_flight
+        }).map(|row| row.lease)
+    }
+
+    pub fn object_for_handle(
+        &self, owner: DynamicHandleOwner, handle: u64,
+    ) -> Option<DynamicObjectLease> {
+        self.objects.iter().find(|row| row.handle == Some((owner, handle)) && !row.in_flight)
+            .map(|row| row.lease)
+    }
+
+    pub fn pending_object_for_body(&self, body: u64) -> Option<DynamicObjectLease> {
+        self.objects.iter().find(|row| {
+            row.lease.body == body && row.creator_reference && !row.in_flight
+        }).map(|row| row.lease)
+    }
+
+    /// Transfer the sole creator reference to an inserted handle. The caller must supply a
+    /// concrete handle already reserved for this object; duplicate numeric handles cannot name
+    /// two live dynamic objects in this ledger.
+    pub fn insert_object(
+        &mut self,
+        lease: DynamicObjectLease,
+        owner: DynamicHandleOwner,
+        handle: u64,
+    ) -> Result<(), NtStatus> {
+        if handle == 0 || owner.process_id == 0 || owner.creation_sequence == 0
+            || self.objects.iter().any(|row| row.handle == Some((owner, handle))) {
+            return Err(NtStatus::INVALID_HANDLE);
+        }
+        let row = self.objects.iter_mut().find(|row| row.lease == lease)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if !row.creator_reference || row.in_flight {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        row.handle = Some((owner, handle));
+        row.creator_reference = false;
+        Ok(())
+    }
+
+    /// `ObInsertObject` consumes the creator reference even if handle publication fails. The
+    /// native broker must invoke the type's delete procedure before freeing the body.
+    pub fn fail_insert(&mut self, lease: DynamicObjectLease) -> Result<(), NtStatus> {
+        let row = self.objects.iter_mut().find(|row| row.lease == lease)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if !row.creator_reference || row.in_flight {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        row.creator_reference = false;
+        Ok(())
+    }
+
+    /// Return a typed body reference and retain it independently of the handle. A later close
+    /// cannot delete the body until every borrowed reference is released.
+    pub fn reference_handle(
+        &mut self,
+        owner: DynamicHandleOwner,
+        handle: u64,
+        expected_type: DynamicTypeId,
+    ) -> Result<DynamicObjectLease, NtStatus> {
+        let row = self.objects.iter_mut().find(|row| row.handle == Some((owner, handle)))
+            .ok_or(NtStatus::INVALID_HANDLE)?;
+        if row.lease.type_id != expected_type {
+            return Err(NtStatus::OBJECT_TYPE_MISMATCH);
+        }
+        row.borrowed_references = row.borrowed_references.checked_add(1)
+            .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+        Ok(row.lease)
+    }
+
+    pub fn close_handle(&mut self, owner: DynamicHandleOwner, handle: u64) -> Result<(), NtStatus> {
+        let row = self.objects.iter_mut().find(|row| row.handle == Some((owner, handle)))
+            .ok_or(NtStatus::INVALID_HANDLE)?;
+        row.handle = None;
+        Ok(())
+    }
+
+    /// Process rundown has already removed this exact generation from its canonical table.
+    /// Its table walk does not expose the numeric handle, so the lease is the close receipt.
+    pub fn close_removed_object(&mut self, lease: DynamicObjectLease) -> Result<(), NtStatus> {
+        let row = self.objects.iter_mut().find(|row| row.lease == lease)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if row.handle.is_none() || row.in_flight {
+            return Err(NtStatus::INVALID_HANDLE);
+        }
+        row.handle = None;
+        Ok(())
+    }
+
+    pub fn dereference_object(&mut self, lease: DynamicObjectLease) -> Result<(), NtStatus> {
+        let row = self.objects.iter_mut().find(|row| row.lease == lease)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if row.borrowed_references == 0 || row.in_flight {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        row.borrowed_references -= 1;
+        Ok(())
+    }
+
+    pub fn borrowed_references(&self, lease: DynamicObjectLease) -> Option<u64> {
+        self.objects.iter().find(|row| row.lease == lease && !row.in_flight)
+            .map(|row| row.borrowed_references)
+    }
+
+    /// Claim the delete callback once the creator, handle, and borrowed references are all gone.
+    /// An uncertain call remains in flight and cannot be retried.
     pub fn take_delete(&mut self, lease: DynamicObjectLease) -> Option<DynamicDeleteTicket> {
-        let row = self.objects.iter_mut().find(|row| row.lease == lease && !row.in_flight)?;
+        let row = self.objects.iter_mut().find(|row| {
+            row.lease == lease && !row.creator_reference && row.handle.is_none()
+                && row.borrowed_references == 0 && !row.in_flight
+        })?;
         let ty = self.types.iter().find(|ty| ty.id == lease.type_id)?;
         row.in_flight = true;
         Some(DynamicDeleteTicket {
@@ -160,6 +295,28 @@ impl HostedDynamicTypeRegistry {
             lease,
         })
     }
+
+    /// The object rows are the durable pending queue. Claim only after a delivery lane is ready.
+    pub fn next_ready_delete(&self) -> Option<DynamicObjectLease> {
+        self.objects.iter().find(|row| {
+            !row.creator_reference && row.handle.is_none()
+                && row.borrowed_references == 0 && !row.in_flight
+        }).map(|row| row.lease)
+    }
+
+    pub fn lease_for_live_body(&self, body: u64) -> Option<DynamicObjectLease> {
+        self.objects.iter().find(|row| row.lease.body == body && !row.in_flight)
+            .map(|row| row.lease)
+    }
+
+    /// Includes a callback already in flight. Its body cannot enter the pool free list until
+    /// DeleteProcedure has definitely returned and the ledger has completed that exact ticket.
+    pub fn owns_live_body(&self, type_id: DynamicTypeId, body: u64) -> bool {
+        self.objects.iter().any(|row| {
+            row.lease.type_id == type_id && row.lease.body == body
+        })
+    }
+
 
     /// Called only after the native provider callback has definitely returned. The type itself
     /// remains registered and continues to retain the provider image.

@@ -141,6 +141,11 @@ pub const NTOSKRNL: &[ExportDescriptor] = &[
         Implemented,
         "isolated VSpace mappings and assigned MMIO projections",
     ),
+    e(
+        "MmGetPhysicalMemoryRanges",
+        Implemented,
+        "fresh caller-owned copy of boot-published usable physical RAM runs",
+    ),
     e("IoAllocateMdl", Unsupported, ""),
     e("MmProbeAndLockPages", Unsupported, ""),
     e("MmUnlockPages", Unsupported, ""),

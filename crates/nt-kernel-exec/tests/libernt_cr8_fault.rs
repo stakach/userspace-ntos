@@ -1,7 +1,30 @@
 //! Pinned LiberNT `win32k.sys` (SHA-256 cce42491d4093ba391c25ae2612bbd714ce28f95aa6a56a127e9f55736be187f).
 //! The old ReactOS helper RVA is code in this image; CR8 reads occur at several instruction sites.
 
-use nt_kernel_exec::x86_cr8::{decode_cr8_read, project_cr8_read, Cr8ActivationIdentity, Cr8Read, PublishedCr8Irql};
+use nt_kernel_exec::x86_cr8::{decode_cr8_read, decode_cr8_write, project_cr8_read, project_cr8_write, Cr8ActivationIdentity, Cr8Read, Cr8Write, PublishedCr8Irql};
+
+#[test]
+fn generic_driver_cr8_write_projects_only_rip_and_exact_irql() {
+    assert_eq!(decode_cr8_write(&[0x44, 0x0f, 0x22, 0xc0]),
+        Some(Cr8Write { register: 0, len: 4 }));
+    assert_eq!(decode_cr8_write(&[0x45, 0x0f, 0x22, 0xc1]),
+        Some(Cr8Write { register: 9, len: 4 }));
+    for bytes in [&[0x0f, 0x22, 0xc0][..], &[0x44, 0x0f, 0x22, 0xd0][..],
+        &[0x44, 0x0f, 0x20, 0xc0][..]] {
+        assert_eq!(decode_cr8_write(bytes), None);
+    }
+    let mut regs = [0u64; 20];
+    regs[0] = 0x1000;
+    regs[3] = 15; // RAX = HIGH_LEVEL in the stopped seL4 context.
+    let result = project_cr8_write(&mut regs, decode_cr8_write(&[0x44, 0x0f, 0x22, 0xc0]).unwrap());
+    assert_eq!(result, Some((15, 1)));
+    assert_eq!(regs[0], 0x1004);
+    assert_eq!(regs[3], 15);
+    regs[0] = 0x2000;
+    regs[3] = 16;
+    assert_eq!(project_cr8_write(&mut regs, Cr8Write { register: 0, len: 4 }), None);
+    assert_eq!(regs[0], 0x2000);
+}
 
 #[test]
 fn pinned_libernt_image_rejects_old_fixed_rva_patch_but_exposes_cr8_reads() {

@@ -1248,6 +1248,12 @@ fn trace_handle_object_for(nt: &ExecNtHandler, handle: u64) {
         Some(nt_process::HandleObject::DiskFile { .. }) => print_str(b"disk-file"),
         Some(nt_process::HandleObject::Directory { .. }) => print_str(b"directory"),
         Some(nt_process::HandleObject::ObjectDirectory(_)) => print_str(b"object-directory"),
+        Some(nt_process::HandleObject::DynamicObject { body, generation }) => {
+            print_str(b"dynamic-object body=0x");
+            print_hex_u64(body);
+            print_str(b" generation=0x");
+            print_hex_u64(generation);
+        }
         Some(nt_process::HandleObject::IoCompletion(_)) => print_str(b"io-completion"),
         Some(nt_process::HandleObject::RegistryKey(_)) => print_str(b"registry-key"),
         Some(nt_process::HandleObject::Process(_)) => print_str(b"process"),
@@ -16776,6 +16782,7 @@ impl ExecNtHandler {
                 nt_process::HandleObject::IoCompletion(_) => b"IoCompletion",
                 nt_process::HandleObject::RegistryKey(_) => b"Key",
                 nt_process::HandleObject::ObjectDirectory(_) => b"Directory",
+                nt_process::HandleObject::DynamicObject { .. } => b"Object",
                 nt_process::HandleObject::Token(_) | nt_process::HandleObject::TokenObject(_) => {
                     b"Token"
                 }
@@ -20433,6 +20440,10 @@ impl ExecNtHandler {
             nt_process::HandleObject::RegistryKey(target) => {
                 self.release_registry_key_target(target);
             }
+            nt_process::HandleObject::DynamicObject { body, generation } => {
+                unsafe { driver_launch::hosted_driver_dynamic_delete::close_removed_object(body, generation) }
+                    .expect("removed dynamic object retains its exact ledger lease");
+            }
             _ => {}
         }
     }
@@ -20582,7 +20593,14 @@ impl ExecNtHandler {
                 closed.handle(),
             );
         }
-        self.release_handle_object(closed.into_object());
+        let dynamic_closed = if let nt_process::HandleObject::DynamicObject { body, generation } = closed.object() {
+            unsafe { driver_launch::hosted_driver_dynamic_delete::close_native_handle(
+                &self.pm, closed.table_owner(), closed.handle(), body, generation,
+            ) }.expect("canonical dynamic close retains exact ledger handle owner");
+            true
+        } else { false };
+        let object = closed.into_object();
+        if !dynamic_closed { self.release_handle_object(object); }
         if lifecycle_executor.is_some() {
             driver_launch::pump_hosted_file_lifecycle();
         }

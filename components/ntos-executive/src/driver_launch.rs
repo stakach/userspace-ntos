@@ -298,6 +298,10 @@ pub(crate) mod hosted_driver_create_event;
 pub(crate) mod hosted_driver_process_notify;
 #[path = "hosted_driver_dynamic_type.rs"]
 pub(crate) mod hosted_driver_dynamic_type;
+#[path = "hosted_driver_dynamic_object.rs"]
+pub(crate) mod hosted_driver_dynamic_object;
+#[path = "hosted_driver_dynamic_delete.rs"]
+pub(crate) mod hosted_driver_dynamic_delete;
 #[path = "hosted_driver_process_state.rs"]
 mod hosted_driver_process_state;
 #[path = "hosted_driver_ps_handle_reference.rs"]
@@ -307,6 +311,15 @@ mod hosted_driver_create_mdl;
 #[path = "hosted_driver_pci_root.rs"]
 pub(crate) mod hosted_driver_pci_root;
 pub(crate) const FSD_SERVICE_PCI_ROOT_LABEL: u64 = hosted_driver_pci_root::LABEL;
+#[path = "hosted_driver_pci_route_query.rs"]
+pub(crate) mod hosted_driver_pci_route_query;
+pub(crate) const FSD_SERVICE_PCI_ROUTE_QUERY_LABEL: u64 = hosted_driver_pci_route_query::LABEL;
+#[path = "hosted_driver_contiguous_memory.rs"]
+mod hosted_driver_contiguous_memory;
+#[path = "hosted_driver_physical_ranges.rs"]
+mod hosted_driver_physical_ranges;
+#[path = "hosted_driver_cr8_fault.rs"]
+pub(crate) mod hosted_driver_cr8_fault;
 #[path = "hosted_driver_crt_wide_sort.rs"]
 mod hosted_driver_crt_wide_sort;
 #[path = "hosted_driver_cache_invalidation.rs"]
@@ -619,6 +632,8 @@ const FSD_DATA_LOADER_BLOCK_OFF: u64 = 0x810;
 const FSD_DATA_LOADER_CONFIG_ROOT_OFF: u64 = 0x910;
 const FSD_DATA_LOADER_ACPI_NODE_OFF: u64 = 0x958;
 const FSD_DATA_LOADER_ACPI_IDENTIFIER_OFF: u64 = 0x9A0;
+// The released LiberNT acpi.sys reads KeLoaderBlock->ConfigurationRoot at +0xb0 (PE RVA 0xb560).
+const FSD_LOADER_CONFIGURATION_ROOT_OFF: u64 = 0xB0;
 // Pinned ACPI's sole HAL_PRIVATE_DISPATCH IAT use checks HalUnmaskInterrupt at +0x1f8.
 // Keep the whole version-32 table resident in the provider data frame. A null optional slot
 // advertises that this HAL operation is unavailable; ACPI itself returns STATUS_NOT_SUPPORTED.
@@ -1150,6 +1165,10 @@ pub const FSD_SERVICE_DIRECTORY_OBJECT_LABEL: u64 = hosted_driver_directory_obje
 pub const FSD_SERVICE_CREATE_EVENT_LABEL: u64 = hosted_driver_create_event::LABEL;
 pub const FSD_SERVICE_PROCESS_NOTIFY_LABEL: u64 = hosted_driver_process_notify::LABEL;
 pub const FSD_SERVICE_DYNAMIC_TYPE_LABEL: u64 = hosted_driver_dynamic_type::LABEL;
+pub const FSD_SERVICE_DYNAMIC_OBJECT_LABEL: u64 = hosted_driver_dynamic_object::LABEL;
+pub const FSD_SERVICE_DYNAMIC_OBJECT_INSERT_LABEL: u64 = hosted_driver_dynamic_object::INSERT_LABEL;
+pub const FSD_SERVICE_DYNAMIC_OBJECT_REFERENCE_LABEL: u64 = hosted_driver_dynamic_object::REFERENCE_LABEL;
+pub const FSD_SERVICE_DYNAMIC_OBJECT_DEREFERENCE_LABEL: u64 = hosted_driver_dynamic_delete::DEREFERENCE_LABEL;
 pub const FSD_SERVICE_PS_HANDLE_REFERENCE_LABEL: u64 = hosted_driver_ps_handle_reference::LABEL;
 const _: () = {
     let labels = [
@@ -1185,6 +1204,10 @@ const _: () = {
         FSD_SERVICE_CREATE_EVENT_LABEL,
         FSD_SERVICE_PROCESS_NOTIFY_LABEL,
         FSD_SERVICE_DYNAMIC_TYPE_LABEL,
+        FSD_SERVICE_DYNAMIC_OBJECT_LABEL,
+        FSD_SERVICE_DYNAMIC_OBJECT_INSERT_LABEL,
+        FSD_SERVICE_DYNAMIC_OBJECT_REFERENCE_LABEL,
+        FSD_SERVICE_DYNAMIC_OBJECT_DEREFERENCE_LABEL,
         FSD_SERVICE_PS_HANDLE_REFERENCE_LABEL,
     ];
     let mut i = 0;
@@ -5222,9 +5245,10 @@ unsafe fn initialize_hosted_loader_block(exec_data_va: u64) {
     core::ptr::write_bytes(acpi as *mut u8, 0, 0x48);
     core::ptr::write_bytes(config as *mut u8, 0, FSD_DATA_LOADER_CONFIG_CAPACITY);
 
-    // NT 5.2 LOADER_PARAMETER_BLOCK: initialize the three list heads and publish the real ARC
-    // configuration root at offset 0x60.
-    for list_off in [0u64, 0x10, 0x20] {
+    // Pinned LiberNT Win10 loader block: version header, six list heads, and ARC root at +0xb0.
+    write_unaligned(block as *mut u32, 10);
+    write_unaligned((block + 0x08) as *mut u32, 0x100);
+    for list_off in [0x10u64, 0x20, 0x30, 0x40, 0x50, 0x60] {
         write_unaligned(
             (block + list_off) as *mut u64,
             FSD_DATA_LOADER_BLOCK_VA + list_off,
@@ -5234,7 +5258,10 @@ unsafe fn initialize_hosted_loader_block(exec_data_va: u64) {
             FSD_DATA_LOADER_BLOCK_VA + list_off,
         );
     }
-    write_unaligned((block + 0x60) as *mut u64, FSD_DATA_LOADER_CONFIG_ROOT_VA);
+    write_unaligned(
+        (block + FSD_LOADER_CONFIGURATION_ROOT_OFF) as *mut u64,
+        FSD_DATA_LOADER_CONFIG_ROOT_VA,
+    );
 
     // CONFIGURATION_COMPONENT_DATA root: SystemClass / MaximumType, with the firmware ACPI node as
     // its child. CONFIGURATION_COMPONENT_DATA is 0x48 bytes on NT amd64.
@@ -5245,8 +5272,14 @@ unsafe fn initialize_hosted_loader_block(exec_data_va: u64) {
 
     // Firmware child: AdapterClass / MultiFunctionAdapter, matching the FreeLdr ACPI BIOS node.
     write_unaligned((acpi + 0x00) as *mut u64, FSD_DATA_LOADER_CONFIG_ROOT_VA);
-    write_unaligned((acpi + 0x18) as *mut u32, 3); // AdapterClass
-    write_unaligned((acpi + 0x1C) as *mut u32, 12); // MultiFunctionAdapter
+    write_unaligned(
+        (acpi + 0x18) as *mut u32,
+        nt_compat_exports::configuration::ARC_ADAPTER_CLASS,
+    );
+    write_unaligned(
+        (acpi + 0x1C) as *mut u32,
+        nt_compat_exports::configuration::ARC_MULTIFUNCTION_ADAPTER,
+    );
     write_unaligned((acpi + 0x2C) as *mut u32, u32::MAX); // AffinityMask
     write_unaligned((acpi + 0x34) as *mut u32, 10);
     write_unaligned(
@@ -7070,6 +7103,9 @@ extern "win64" fn s_ex_free_pool_tag(p: u64, _tag: u64) {
 extern "win64" fn s_ex_free_pool(p: u64) {
     if p == 0 {
         return;
+    }
+    if unsafe { hosted_driver_contiguous_memory::owns_allocation(p) } {
+        unsafe { crate::provider_bugcheck::report(0xc4, [0x434f_4e54, p, 3, 0]); }
     }
     let status = unsafe { hosted_source_retirement::retire(3, p) };
     if status != STATUS_SUCCESS && status as u32 != STATUS_PENDING {
@@ -10367,25 +10403,6 @@ extern "win64" fn s_mm_unmap_locked_pages(_base: u64, mdl: u64) {
             flags & !nt_mdl::MDL_MAPPED_TO_SYSTEM_VA,
         );
     }
-}
-
-/// `PVOID MmAllocateContiguousMemorySpecifyCache(...)`.
-extern "win64" fn s_mm_allocate_contiguous_memory_specify_cache(
-    number_of_bytes: u64,
-    _lowest: u64,
-    _highest: u64,
-    _boundary: u64,
-    _cache_type: u32,
-) -> u64 {
-    unsafe { pool_alloc(number_of_bytes) }
-}
-
-extern "win64" fn s_mm_free_contiguous_memory_specify_cache(
-    base: u64,
-    _number_of_bytes: u64,
-    _cache_type: u32,
-) {
-    s_ex_free_pool(base);
 }
 
 extern "win64" fn s_mm_allocate_non_cached_memory(number_of_bytes: u64) -> u64 {
@@ -15935,6 +15952,9 @@ extern "win64" fn s_obf_dereference_object(object: u64) -> u64 {
             if let Some(references) = hosted_driver_process_identity::release_process_if_owned(object) {
                 return references;
             }
+            if let Some(references) = hosted_driver_dynamic_object::dereference_if_dynamic(object) {
+                return references;
+            }
             return 0;
         }
         let (info, status, _, _, _) =
@@ -15965,8 +15985,13 @@ extern "win64" fn s_ob_reference_object_by_handle(
             handle, desired_access, object_type, access_mode, object_out, handle_information,
         );
     }
-    if object_type != 0 && object_type != FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_VA {
-        return nt_process::native_handle::STATUS_OBJECT_TYPE_MISMATCH as i32;
+    if object_type != FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_VA {
+        let dynamic = hosted_driver_dynamic_object::reference_object_by_handle(
+            handle, desired_access, object_type, access_mode, object_out, handle_information,
+        );
+        if object_type != 0 || dynamic != STATUS_INVALID_HANDLE {
+            return dynamic;
+        }
     }
     unsafe {
         let (info, status, object, granted_access, attributes) = call_on4_raw(
@@ -34094,11 +34119,15 @@ fn register_fsd_trampolines() -> bool {
     );
     reg.bind(
         "MmAllocateContiguousMemorySpecifyCache",
-        s_mm_allocate_contiguous_memory_specify_cache as *const () as usize as u64,
+        hosted_driver_contiguous_memory::mm_allocate_contiguous_memory_specify_cache as *const () as usize as u64,
     );
     reg.bind(
         "MmFreeContiguousMemorySpecifyCache",
-        s_mm_free_contiguous_memory_specify_cache as *const () as usize as u64,
+        hosted_driver_contiguous_memory::mm_free_contiguous_memory_specify_cache as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmFreeContiguousMemory",
+        hosted_driver_contiguous_memory::mm_free_contiguous_memory as *const () as usize as u64,
     );
     reg.bind(
         "MmAllocateNonCachedMemory",
@@ -34115,6 +34144,10 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "MmGetPhysicalAddress",
         s_mm_get_physical_address as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmGetPhysicalMemoryRanges",
+        hosted_driver_physical_ranges::mm_get_physical_memory_ranges as *const () as usize as u64,
     );
     reg.bind(
         "MmUnmapIoSpace",
@@ -34369,6 +34402,10 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "HalpConfigurePciRootBridge",
         hosted_driver_pci_root::halp_configure_pci_root_bridge as *const () as usize as u64,
+    );
+    reg.bind(
+        "HalpRegisterPciRouteQuery",
+        hosted_driver_pci_route_query::halp_register_pci_route_query as *const () as usize as u64,
     );
     reg.bind("RtlCopyMemory", s_memcpy as *const () as usize as u64);
     reg.bind("RtlMoveMemory", s_memmove as *const () as usize as u64);
@@ -34947,6 +34984,14 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "ObCreateObjectType",
         hosted_driver_dynamic_type::ob_create_object_type as *const () as usize as u64,
+    );
+    reg.bind(
+        "ObCreateObject",
+        hosted_driver_dynamic_object::ob_create_object as *const () as usize as u64,
+    );
+    reg.bind(
+        "ObInsertObject",
+        hosted_driver_dynamic_object::ob_insert_object as *const () as usize as u64,
     );
     reg.bind(
         "PsGetCurrentThreadId",
@@ -38785,68 +38830,9 @@ unsafe fn load_pe_into(
         }
     }
 
-    // CR8 transform (documented; the win32k `KeGetCurrentIrql`-cr8 precedent): a kernel driver reads
-    // the current IRQL as `mov %cr8, %reg` — a privileged instruction that #GPs in the component's
-    // usermode context. ReactOS x64 helpers use `44 0f 20 c0; c3` (`mov %cr8,%rax; ret`); expand that
-    // helper in place to `movzx eax, byte ptr [rip+SH_HOSTED_CURRENT_IRQL]; ret`, so DPC delivery can
-    // report DISPATCH_LEVEL while ordinary dispatch remains PASSIVE_LEVEL. Short inline reads that do
-    // not have a helper-sized padding budget are still neutralized to PASSIVE_LEVEL. CR8 writes are
-    // nopped; hosted IRQL transitions are owned by the ntoskrnl import trampolines and DPC pump.
-    {
-        let scan = (size_of_image as u64).min(cap);
-        let mut p = 0u64;
-        while p + 4 <= scan {
-            let b0 = read_unaligned((dst_va + p) as *const u8);
-            let b1 = read_unaligned((dst_va + p + 1) as *const u8);
-            let b2 = read_unaligned((dst_va + p + 2) as *const u8);
-            // REX prefix (0x40..0x4f), then 0F 20 (mov %cr,%reg): if the ModRM names cr8 (reg field
-            // == 0, with REX.R providing the high bit → cr8), rewrite to xor eax,eax; nop; nop.
-            if (b0 & 0xF0) == 0x40 && b1 == 0x0F && b2 == 0x20 {
-                let modrm = read_unaligned((dst_va + p + 3) as *const u8);
-                // ModRM = 11 000 rrr (reg field 000 = crN, rm = dest GPR). REX.R (b0 & 4) selects cr8.
-                if (modrm & 0xC0) == 0xC0 && (modrm & 0x38) == 0x00 {
-                    if (b0 & 0x04) != 0
-                        && modrm == 0xC0
-                        && p + 8 <= scan
-                        && read_unaligned((dst_va + p + 4) as *const u8) == 0xC3
-                    {
-                        let target = FSD_SHARED_VADDR + SH_HOSTED_CURRENT_IRQL;
-                        let next_rip = run_va + p + 7;
-                        let disp = target as i64 - next_rip as i64;
-                        if disp >= i32::MIN as i64 && disp <= i32::MAX as i64 {
-                            let d = disp as u32;
-                            write_unaligned((dst_va + p) as *mut u8, 0x0F); // movzx eax, byte ptr [rip+disp32]
-                            write_unaligned((dst_va + p + 1) as *mut u8, 0xB6);
-                            write_unaligned((dst_va + p + 2) as *mut u8, 0x05);
-                            write_unaligned((dst_va + p + 3) as *mut u8, d as u8);
-                            write_unaligned((dst_va + p + 4) as *mut u8, (d >> 8) as u8);
-                            write_unaligned((dst_va + p + 5) as *mut u8, (d >> 16) as u8);
-                            write_unaligned((dst_va + p + 6) as *mut u8, (d >> 24) as u8);
-                            write_unaligned((dst_va + p + 7) as *mut u8, 0xC3); // ret
-                            p += 8;
-                            continue;
-                        }
-                    }
-                    write_unaligned((dst_va + p) as *mut u8, 0x31); // xor
-                    write_unaligned((dst_va + p + 1) as *mut u8, 0xC0); // eax,eax
-                    write_unaligned((dst_va + p + 2) as *mut u8, 0xB0); // mov al,
-                    write_unaligned((dst_va + p + 3) as *mut u8, PASSIVE_LEVEL);
-                    p += 4;
-                    continue;
-                }
-            }
-            // 0F 22 (mov %reg,%cr): a KeRaise/LowerIrql write to cr8 → neutralize to nops (3 bytes;
-            // an optional REX makes it 4). Rewrite the 0F 22 ModRM triple to nops.
-            if b0 == 0x0F && b1 == 0x22 {
-                write_unaligned((dst_va + p) as *mut u8, 0x90);
-                write_unaligned((dst_va + p + 1) as *mut u8, 0x90);
-                write_unaligned((dst_va + p + 2) as *mut u8, 0x90);
-                p += 3;
-                continue;
-            }
-            p += 1;
-        }
-    }
+    // Inline CR8 reads and writes stay in the immutable driver image. Their #GP
+    // is decoded at the authenticated fault boundary, where the stopped lane's
+    // source-owned IRQL is projected and the original Reply is retained.
 
     // Seed a valid /GS cookie when the image declares one through the PE load-config directory.
     // MSVC's GsDriverEntry wrapper fastfails with int 0x29 if this is left at the CRT default.
@@ -58570,7 +58556,8 @@ pub(crate) struct HostedVideoRouteInfo {
 }
 
 fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
-    if unsafe { hosted_driver_process_notify::blocks_instance_retirement(i)
+    if unsafe { instance(i).is_some_and(|inst| hosted_driver_pci_route_query::blocks_instance_retirement(inst))
+        || hosted_driver_process_notify::blocks_instance_retirement(i)
         || hosted_driver_dynamic_type::blocks_instance_retirement(i) } {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }

@@ -7,6 +7,35 @@ pub struct Cr8Read {
     pub len: u8,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Cr8Write {
+    pub register: u8,
+    pub len: u8,
+}
+
+pub fn decode_cr8_write(bytes: &[u8]) -> Option<Cr8Write> {
+    let rex = *bytes.first()?;
+    if !(0x44..=0x4f).contains(&rex) || rex & 0x04 == 0 { return None; }
+    if bytes.get(1..3)? != [0x0f, 0x22] { return None; }
+    let modrm = *bytes.get(3)?;
+    if modrm & 0xf8 != 0xc0 { return None; }
+    Some(Cr8Write {
+        register: (modrm & 7) + if rex & 1 != 0 { 8 } else { 0 },
+        len: 4,
+    })
+}
+
+pub fn project_cr8_write(registers: &mut [u64; 20], write: Cr8Write) -> Option<(u8, u64)> {
+    const GPR_TO_SEL4: [usize; 16] = [3, 5, 6, 4, 1, 9, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17];
+    if write.len != 4 { return None; }
+    let source = *GPR_TO_SEL4.get(write.register as usize)?;
+    let irql = u8::try_from(registers[source]).ok()?;
+    if irql > 15 { return None; }
+    let next_ip = registers[0].checked_add(write.len as u64)?;
+    registers[0] = next_ip;
+    Some((irql, 1))
+}
+
 /// Exact component activation identity published beside the IRQL. The physical lane owner must
 /// supply its expected lane ID; a stale activation generation cannot authorize a later fault.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
