@@ -571,39 +571,21 @@ unsafe fn rtl_unicode_to_mb_n_dbcs(
         if to_mb.is_null() {
             return (STATUS_INVALID_PARAMETER, 0);
         }
-        let mut written = 0usize;
-        let mut consumed = 0usize;
-        let units = bytes_in_unicode as usize / 2;
-        let capacity = mb_size as usize;
-        while consumed < units && written < capacity {
-            let mut unit = core::ptr::read(unicode_str.add(consumed));
-            if upcase {
-                unit = nls_upcase_unit(unit);
-            }
-            let mb = if unit < 0x80 {
-                unit
-            } else {
-                core::ptr::read_unaligned(to_mb.add(unit as usize))
-            };
-            let high = (mb >> 8) as u8;
-            let low = (mb & 0xFF) as u8;
-            if high != 0 {
-                if capacity - written < 2 {
-                    break;
-                }
-                core::ptr::write(mb_str.add(written), high);
-                core::ptr::write(mb_str.add(written + 1), low);
-                written += 2;
-            } else {
-                core::ptr::write(mb_str.add(written), low);
-                written += 1;
-            }
-            consumed += 1;
-        }
+        let source = if bytes_in_unicode == 0 { &[] } else {
+            core::slice::from_raw_parts(unicode_str, bytes_in_unicode as usize / 2)
+        };
+        let output = if mb_size == 0 { &mut [] } else {
+            core::slice::from_raw_parts_mut(mb_str, mb_size as usize)
+        };
+        let table = core::slice::from_raw_parts(to_mb, 0x1_0000);
+        let Some(progress) = nt_nls::unicode_to_multibyte_dbcs_mapped_into(
+            source, table, output,
+            |unit| if upcase { nls_upcase_unit(unit) } else { unit },
+        ) else { return (STATUS_INVALID_PARAMETER, 0); };
         if !bytes_out.is_null() {
-            core::ptr::write(bytes_out, written as u32);
+            core::ptr::write(bytes_out, progress.bytes_written as u32);
         }
-        (STATUS_SUCCESS, consumed)
+        (STATUS_SUCCESS, progress.units_consumed)
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -635,20 +617,12 @@ unsafe fn rtl_multibyte_to_unicode_size_dbcs(
         if lead_info.is_null() {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let mut src = 0usize;
-        let mut units = 0usize;
-        let len = byte_len as usize;
-        while src < len {
-            let byte = core::ptr::read(bytes.add(src));
-            src += 1;
-            if byte >= 0x80 && core::ptr::read_unaligned(lead_info.add(byte as usize)) != 0 {
-                if src < len {
-                    src += 1;
-                }
-            }
-            units += 1;
-        }
-        Ok((units * 2) as u32)
+        let source = if byte_len == 0 { &[] } else {
+            core::slice::from_raw_parts(bytes, byte_len as usize)
+        };
+        let leads = core::slice::from_raw_parts(lead_info, 256);
+        nt_nls::multibyte_to_unicode_size(source, Some(leads))
+            .ok_or(STATUS_INVALID_PARAMETER)
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -673,20 +647,13 @@ unsafe fn rtl_unicode_to_multibyte_size_dbcs(
         if to_mb.is_null() {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let mut bytes = 0u32;
-        for i in 0..(bytes_in_unicode as usize / 2) {
-            let mut unit = core::ptr::read(unicode_str.add(i));
-            if upcase {
-                unit = nls_upcase_unit(unit);
-            }
-            let mb = if unit < 0x80 {
-                unit
-            } else {
-                core::ptr::read_unaligned(to_mb.add(unit as usize))
-            };
-            bytes = bytes.saturating_add(if (mb >> 8) != 0 { 2 } else { 1 });
-        }
-        Ok(bytes)
+        let source = if bytes_in_unicode == 0 { &[] } else {
+            core::slice::from_raw_parts(unicode_str, bytes_in_unicode as usize / 2)
+        };
+        let table = core::slice::from_raw_parts(to_mb, 0x1_0000);
+        nt_nls::unicode_to_multibyte_dbcs_size(source, table,
+            |unit| if upcase { nls_upcase_unit(unit) } else { unit })
+            .ok_or(STATUS_INVALID_PARAMETER)
     }
     #[cfg(not(target_arch = "x86_64"))]
     {

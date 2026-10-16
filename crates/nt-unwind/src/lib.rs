@@ -369,6 +369,10 @@ pub enum FrameWalkError {
     StackRead,
     /// A covering runtime function had unreadable or invalid unwind metadata.
     UnwindData,
+    /// The starting PC has no authenticated executable-image ownership.
+    UnknownImage,
+    /// An admitted image reported unreadable or corrupt exception metadata.
+    ImageLookup(exception_walk::ExceptionImageError),
 }
 
 /// Restrict stack reads to one active thread or provider lane before consulting the backing reader.
@@ -447,6 +451,75 @@ pub fn walk_frame_chain(
             return Ok(index);
         }
 
+        control_pc = context.rip;
+        if index >= frames_to_skip {
+            callers[index - frames_to_skip] = control_pc;
+        }
+    }
+    Ok(total)
+}
+
+/// Walk a hosted kernel component's frame chain through admitted PE images.
+///
+/// The caller supplies an already captured x64 context, authenticated physical
+/// lane stack bounds, and an immutable catalog of admitted executable images.
+/// Only a PC positively classified as an image leaf may pop a return address
+/// without `.pdata`; an unknown PC ends a proven chain and can never become a
+/// guessed leaf. The catalog must cover every PE image executable in the lane.
+///
+/// The return count includes successfully skipped frames, matching ReactOS.
+pub fn walk_kernel_frame_chain<I: exception_walk::ExceptionImageReader>(
+    mut context: Context,
+    callers: &mut [u64],
+    frames_to_skip: usize,
+    stack_low: u64,
+    stack_high: u64,
+    image: &I,
+    stack: &dyn StackReader,
+) -> Result<usize, FrameWalkError> {
+    use exception_walk::{ExceptionFunction, ExceptionImageError};
+
+    let bounded = BoundedStack::new(stack, stack_low, stack_high)?;
+    let total = frames_to_skip
+        .checked_add(callers.len())
+        .ok_or(FrameWalkError::CountOverflow)?;
+    let mut control_pc = context.rip;
+
+    for index in 0..total {
+        let frame = match image.lookup_exception_function(control_pc) {
+            Ok(frame) => frame,
+            Err(ExceptionImageError::UnknownImage) if index > 0 => return Ok(index),
+            Err(ExceptionImageError::UnknownImage) => return Err(FrameWalkError::UnknownImage),
+            Err(error) => return Err(FrameWalkError::ImageLookup(error)),
+        };
+        match frame {
+            ExceptionFunction::Function { image_base, function } => {
+                virtual_unwind(
+                    unw_flag::NHANDLER,
+                    image_base,
+                    control_pc,
+                    function,
+                    &mut context,
+                    image,
+                    &bounded,
+                )
+                .ok_or(FrameWalkError::UnwindData)?;
+            }
+            ExceptionFunction::Leaf => {
+                let rsp = context.rsp();
+                context.rip = bounded.read_u64(rsp).ok_or(FrameWalkError::StackRead)?;
+                context.set_rsp(rsp.checked_add(8).ok_or(FrameWalkError::StackRead)?);
+            }
+        }
+
+        if context.rsp() <= stack_low || context.rsp() >= stack_high {
+            return Ok(index);
+        }
+        match image.lookup_exception_function(context.rip) {
+            Ok(_) => {}
+            Err(ExceptionImageError::UnknownImage) => return Ok(index),
+            Err(error) => return Err(FrameWalkError::ImageLookup(error)),
+        }
         control_pc = context.rip;
         if index >= frames_to_skip {
             callers[index - frames_to_skip] = control_pc;

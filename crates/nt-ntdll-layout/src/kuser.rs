@@ -26,6 +26,9 @@ pub const PRODUCT_TYPE_IS_VALID: usize = 0x268;
 pub const NT_MAJOR_VERSION: usize = 0x26c;
 pub const NT_MINOR_VERSION: usize = 0x270;
 pub const PROCESSOR_FEATURES: usize = 0x274;
+/// Session ID of the active physical console, shared with every process.
+/// The pinned LiberNT kernel's `RtlSetActiveConsoleId` writes this field.
+pub const ACTIVE_CONSOLE_ID: usize = 0x2d8;
 pub const NUMBER_OF_PHYSICAL_PAGES: usize = 0x2e8;
 pub const TICK_COUNT: usize = 0x320;
 pub const COOKIE: usize = 0x330;
@@ -104,6 +107,25 @@ pub fn initialize_page(
         ACTIVE_PROCESSOR_COUNT,
         information.active_processor_count,
     );
+}
+
+/// Read the active console session from one complete shared-data page snapshot.
+pub fn read_active_console_id(page: &[u8; PAGE_SIZE]) -> u32 {
+    u32::from_le_bytes(
+        page[ACTIVE_CONSOLE_ID..ACTIVE_CONSOLE_ID + 4]
+            .try_into()
+            .expect("the active-console field fits in a KUSER page"),
+    )
+}
+
+/// Publish the active console session into one complete shared-data page snapshot.
+///
+/// A native publisher must atomically update every live process alias and the
+/// kernel alias under its own ownership protocol. This byte-slice operation is
+/// for constructing or updating an exclusively owned snapshot.
+pub fn write_active_console_id(page: &mut [u8; PAGE_SIZE], session_id: u32) {
+    page[ACTIVE_CONSOLE_ID..ACTIVE_CONSOLE_ID + 4]
+        .copy_from_slice(&session_id.to_le_bytes());
 }
 
 /// Publish the effective timezone fields consumed directly through `KUSER_SHARED_DATA`.

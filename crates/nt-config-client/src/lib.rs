@@ -2824,7 +2824,9 @@ impl<B: Backend> ConfigClient<B> {
         let shape_valid = match query_kind {
             pnp_query_kind::ENUMERATE_DEVNODE => instance.is_empty() && auxiliary.is_empty(),
             pnp_query_kind::INTERFACE_LINKS => {
-                !instance.is_empty() && selector == 0 && auxiliary.len() == 16
+                !instance.is_empty()
+                    && selector <= pnp_query_kind::INTERFACE_LINKS_INCLUDE_NONACTIVE
+                    && auxiliary.len() == 16
             }
             pnp_query_kind::DYNAMIC_PROPERTY | pnp_query_kind::RELATED_DEVICE => {
                 !instance.is_empty() && auxiliary.is_empty()
@@ -4700,6 +4702,20 @@ mod tests {
             .unwrap()
             .symbolic_link
             .clone();
+        let disabled = client
+            .backend
+            .server
+            .config_mut()
+            .register_interface(boot_devnode, interface_guid, "disabled", false)
+            .unwrap();
+        let disabled_link = client
+            .backend
+            .server
+            .config()
+            .interface(disabled)
+            .unwrap()
+            .symbolic_link
+            .clone();
         let critical = client
             .backend
             .server
@@ -4842,7 +4858,20 @@ mod tests {
                 &interface_guid_bytes,
             )
             .expect("enabled interface links");
-        assert_eq!(interfaces.strings, vec![expected_link]);
+        assert_eq!(interfaces.strings, vec![expected_link.clone()]);
+        let all_interfaces = client
+            .query_pnp(
+                pnp_query_kind::INTERFACE_LINKS,
+                pnp_query_kind::INTERFACE_LINKS_INCLUDE_NONACTIVE,
+                r"ROOT\BOOTDEV\0000",
+                &interface_guid_bytes,
+            )
+            .expect("all interface links");
+        assert_eq!(all_interfaces.strings, vec![expected_link, disabled_link]);
+        assert_eq!(
+            client.query_pnp(pnp_query_kind::INTERFACE_LINKS, 2, r"ROOT\BOOTDEV\0000", &interface_guid_bytes),
+            Err(STATUS_INVALID_PARAMETER)
+        );
         let network = client
             .query_network_adapter_plan()
             .expect("network adapter plan");

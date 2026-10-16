@@ -25,6 +25,8 @@ pub mod job_abi;
 mod initial_system;
 mod initial_thread_creation;
 mod fresh_hosted_thread;
+#[cfg(test)]
+mod kernel_process_exports_tests;
 pub use fresh_hosted_thread::FreshHostedThreadPreparation;
 #[cfg(test)]
 mod fresh_hosted_thread_tests;
@@ -750,6 +752,19 @@ pub struct NtProcess {
     /// allocation-free ordinary inserts.
     handles: Vec<HandleSlot>,
     next_handle_reservation_generation: u64,
+}
+
+/// Ps-owned values needed by kernel exports for one exact process identity.
+/// Native adapters resolve and retain the EPROCESS body before looking up its PID; this view
+/// borrows the authoritative process state and never owns or fabricates native object pointers.
+#[derive(Debug, PartialEq, Eq)]
+pub struct KernelProcessExportState<'a> {
+    pub image_file_name: &'a str,
+    pub peb_base_address: u64,
+    pub session_id: u32,
+    pub priority_class: u8,
+    pub foreground: bool,
+    pub job: Option<job::JobId>,
 }
 
 /// References returned by the Process Manager's EPROCESS delete procedure. Their backing stores
@@ -1712,6 +1727,24 @@ impl ProcessManager {
     pub fn process(&self, pid: ProcessId) -> Option<&NtProcess> {
         self.processes.get(&pid)
     }
+
+    /// Project PsGetProcess* export values from the process manager's authoritative state.
+    /// Job membership lives in the job store, so callers must not infer it from EPROCESS bytes.
+    pub fn kernel_process_export_state(
+        &self,
+        pid: ProcessId,
+    ) -> Option<KernelProcessExportState<'_>> {
+        let process = self.process(pid)?;
+        Some(KernelProcessExportState {
+            image_file_name: &process.image_file_name,
+            peb_base_address: process.peb_base_address,
+            session_id: process.session_id,
+            priority_class: process.priority_class,
+            foreground: process.foreground,
+            job: self.jobs.job_for_process(pid),
+        })
+    }
+
     /// Return the initialized per-process pointer cookie, or zero before its first query.
     pub fn process_cookie(&self, pid: ProcessId) -> Option<u32> {
         self.processes
@@ -2193,6 +2226,7 @@ impl ProcessManager {
     fn can_publish_process_kernel_object(&self, pid: ProcessId, eprocess: u64) -> bool {
         if eprocess == 0
             || self.retired_kernel_body_is_reserved(eprocess)
+            || self.jobs.reserves_kernel_object(eprocess)
             || self.processes.iter().any(|(&owner, process)| {
                 owner != pid && process.kernel_process_object == Some(eprocess)
             })
@@ -2334,6 +2368,7 @@ impl ProcessManager {
     fn can_publish_thread_kernel_object(&self, tid: ThreadId, ethread: u64) -> bool {
         if ethread == 0
             || self.retired_kernel_body_is_reserved(ethread)
+            || self.jobs.reserves_kernel_object(ethread)
             || self.threads.iter().any(|(&owner, thread)| {
                 owner != tid && thread.kernel_thread_object == Some(ethread)
             })
@@ -3809,6 +3844,33 @@ impl ProcessManager {
 
     pub fn job_exists(&self, id: job::JobId) -> bool {
         self.jobs.contains(id)
+    }
+
+    /// Bind the native PEJOB body to one exact live job in the shared kernel-object
+    /// pointer namespace. A second kind of object cannot claim the same body.
+    pub fn publish_job_kernel_object(&mut self, id: job::JobId, body: u64) -> bool {
+        if body == 0
+            || self.retired_kernel_body_is_reserved(body)
+            || self
+                .processes
+                .values()
+                .any(|process| process.kernel_process_object == Some(body))
+            || self
+                .threads
+                .values()
+                .any(|thread| thread.kernel_thread_object == Some(body))
+        {
+            return false;
+        }
+        self.jobs.publish_kernel_job_object(id, body)
+    }
+
+    pub fn job_kernel_object(&self, id: job::JobId) -> Option<u64> {
+        self.jobs.kernel_job_object(id)
+    }
+
+    pub fn job_for_kernel_object(&self, body: u64) -> Option<job::JobId> {
+        self.jobs.job_for_kernel_object(body)
     }
 
     pub fn release_job_handle(&mut self, id: job::JobId) -> Result<job::JobCloseAction, u32> {

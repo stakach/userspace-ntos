@@ -752,6 +752,16 @@ impl ObHandleTable {
         }
     }
 
+    /// `ObGetObjectType` for a canonical USER object body. Unknown, retired, ambiguous, and
+    /// unrecognized `Other` bodies have no provable type identity and must not return a pointer.
+    pub fn object_type_addr_by_body(&self, body: u64) -> Option<u64> {
+        match self.kind_by_body(body)? {
+            ObKind::Desktop => Some(crate::object_type::desktop_object_type_addr()),
+            ObKind::WindowStation => Some(crate::object_type::window_station_object_type_addr()),
+            ObKind::Other => None,
+        }
+    }
+
     /// Acquire one pointer reference by object body, as `ObReferenceObject` does.
     pub fn reference_by_body(&mut self, body: u64) -> Option<u32> {
         match self.unique_body_location(body)? {
@@ -1259,6 +1269,34 @@ mod tests {
         assert_eq!(t.kind_by_body(0xD00D_0000), Some(ObKind::Desktop));
         assert_eq!(t.kind_by_body(0x5700_0000), Some(ObKind::WindowStation));
         assert_eq!(t.kind_by_body(0xDEAD), None);
+    }
+
+    #[test]
+    fn object_type_lookup_uses_exact_live_body_and_refuses_unknown_kind() {
+        use crate::object_type::{desktop_object_type_addr, window_station_object_type_addr};
+        let mut table = ObHandleTable::new();
+        let desktop = 0xD00D_0000;
+        let station = 0x5700_0000;
+        let other = 0xBEEF_0000;
+        table.register(ObKind::Desktop, desktop);
+        table.register(ObKind::WindowStation, station);
+        table.register(ObKind::Other, other);
+
+        assert_eq!(table.object_type_addr_by_body(desktop), Some(desktop_object_type_addr()));
+        assert_eq!(table.object_type_addr_by_body(station), Some(window_station_object_type_addr()));
+        assert_eq!(table.object_type_addr_by_body(other), None);
+        assert_eq!(table.object_type_addr_by_body(0xDEAD_0000), None);
+        assert_eq!(table.object_type_addr_by_body(0), None);
+
+        let provisional = 0xCAFE_0000;
+        assert!(table.latch_pending(ObKind::Desktop, provisional));
+        assert_eq!(table.object_type_addr_by_body(provisional), Some(desktop_object_type_addr()));
+        assert_eq!(
+            table.release_pending_by_body(provisional),
+            Some(PendingObjectRelease::Final(ObKind::Desktop))
+        );
+        assert_eq!(table.object_type_addr_by_body(provisional), None);
+        assert_eq!(table.object_type_addr_by_body(station), Some(window_station_object_type_addr()));
     }
 
     #[test]

@@ -242,6 +242,7 @@ dependencies = [
  "nt-kernel-abi",
  "nt-kernel-exec",
  "nt-memory-manager",
+ "nt-object-manager",
  "nt-pe-loader",
  "nt-printf",
  "nt-process",

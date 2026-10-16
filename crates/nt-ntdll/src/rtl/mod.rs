@@ -19,7 +19,7 @@ pub mod activation_redirection;
 pub mod activation_section;
 pub mod activation_settings;
 pub mod atom;
-pub mod avl_table;
+pub use nt_compat_exports::avl_table;
 pub mod bitmap;
 pub mod compression;
 pub mod convert;

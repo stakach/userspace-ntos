@@ -1,8 +1,9 @@
 //! Real, const-constructible NT `OBJECT_TYPE`s for the win32k data-export globals.
 //!
 //! win32k.sys imports a handful of `POBJECT_TYPE` **data** globals from `ntoskrnl.exe`
-//! (`PsProcessType`, `PsThreadType`, `ExDesktopObjectType`, `ExWindowStationObjectType`,
-//! `ExEventObjectType`, `LpcPortObjectType`, `IoDeviceObjectType`). Each is a pointer to an `OBJECT_TYPE` struct that
+//! (`PsProcessType`, `PsThreadType`, `PsJobType`, `MmSectionObjectType`,
+//! `ExDesktopObjectType`, `ExWindowStationObjectType`, `ExEventObjectType`,
+//! `LpcPortObjectType`, `IoDeviceObjectType`). Each is a pointer to an `OBJECT_TYPE` struct that
 //! ntoskrnl creates at boot; win32k treats the pointed-at struct as its **type identity** and — for
 //! the desktop / window-station types — *writes* its own `TypeInfo` fields into it during
 //! `InitDesktopImpl` / `InitWindowStationImpl` (see
@@ -182,6 +183,10 @@ pub const INDEX_THREAD: u32 = 8;
 pub const INDEX_EVENT: u32 = 12;
 /// `LpcPortObjectType` index.
 pub const INDEX_PORT: u32 = 21;
+/// `MmSectionObjectType` index in this native descriptor catalog.
+pub const INDEX_SECTION: u32 = 22;
+/// `PsJobType` index in this native descriptor catalog.
+pub const INDEX_JOB: u32 = 23;
 /// `ExDesktopObjectType` index.
 pub const INDEX_DESKTOP: u32 = 24;
 /// `ExWindowStationObjectType` index.
@@ -216,6 +221,16 @@ static NAME_EVENT: [u16; 5] = [
     b't' as u16,
 ];
 static NAME_PORT: [u16; 4] = [b'P' as u16, b'o' as u16, b'r' as u16, b't' as u16];
+static NAME_SECTION: [u16; 7] = [
+    b'S' as u16,
+    b'e' as u16,
+    b'c' as u16,
+    b't' as u16,
+    b'i' as u16,
+    b'o' as u16,
+    b'n' as u16,
+];
+static NAME_JOB: [u16; 3] = [b'J' as u16, b'o' as u16, b'b' as u16];
 static NAME_DEVICE: [u16; 6] = [
     b'D' as u16,
     b'e' as u16,
@@ -260,6 +275,10 @@ pub static mut THREAD_OBJECT_TYPE: ObjectType = ObjectType::new(&NAME_THREAD, IN
 pub static mut EVENT_OBJECT_TYPE: ObjectType = ObjectType::new(&NAME_EVENT, INDEX_EVENT);
 /// `LpcPortObjectType` — the LPC port object type.
 pub static mut PORT_OBJECT_TYPE: ObjectType = ObjectType::new(&NAME_PORT, INDEX_PORT);
+/// `MmSectionObjectType` — the section object type identity and access policy.
+pub static mut SECTION_OBJECT_TYPE: ObjectType = section_object_type();
+/// `PsJobType` — the job object type identity and access policy.
+pub static mut JOB_OBJECT_TYPE: ObjectType = job_object_type();
 /// `ExDesktopObjectType` — the win32k desktop object type.
 pub static mut DESKTOP_OBJECT_TYPE: ObjectType = ObjectType::new(&NAME_DESKTOP, INDEX_DESKTOP);
 /// `ExWindowStationObjectType` — the win32k window-station object type.
@@ -273,6 +292,35 @@ pub static mut WINDOW_STATION_OBJECT_TYPE: ObjectType =
 /// IopDeleteDevice/IopParseDevice/IopGetSetSecurityObject entry points. Its method slots remain
 /// unset, and publishing its identity does not implement generic Ob creation, parsing or security.
 pub static mut DEVICE_OBJECT_TYPE: ObjectType = device_object_type();
+
+const fn section_object_type() -> ObjectType {
+    let mut object_type = ObjectType::new(&NAME_SECTION, INDEX_SECTION);
+    let info = &mut object_type.type_info;
+    info.use_default_object = 1;
+    info.invalid_attributes = 0x0000_0100; // OBJ_OPENLINK
+    info.generic_mapping = GenericMapping {
+        generic_read: 0x0002_0005,    // STANDARD_RIGHTS_READ | SECTION_MAP_READ | SECTION_QUERY
+        generic_write: 0x0002_0002,   // STANDARD_RIGHTS_WRITE | SECTION_MAP_WRITE
+        generic_execute: 0x0002_0008, // STANDARD_RIGHTS_EXECUTE | SECTION_MAP_EXECUTE
+        generic_all: 0x000F_001F,     // SECTION_ALL_ACCESS
+    };
+    info.valid_access_mask = 0x000F_001F;
+    info.pool_type = 1; // PagedPool
+    object_type
+}
+
+const fn job_object_type() -> ObjectType {
+    let mut object_type = ObjectType::new(&NAME_JOB, INDEX_JOB);
+    let info = &mut object_type.type_info;
+    info.generic_mapping = GenericMapping {
+        generic_read: 0x0002_0004,    // STANDARD_RIGHTS_READ | JOB_OBJECT_QUERY
+        generic_write: 0x0002_000B,   // STANDARD_RIGHTS_WRITE | assign | set | terminate
+        generic_execute: 0x0012_0000, // STANDARD_RIGHTS_EXECUTE | SYNCHRONIZE
+        generic_all: 0x001F_001F,     // JOB_OBJECT_ALL_ACCESS
+    };
+    info.valid_access_mask = 0x001F_001F;
+    object_type
+}
 
 const fn device_object_type() -> ObjectType {
     let mut object_type = ObjectType::new(&NAME_DEVICE, INDEX_DEVICE);
@@ -309,6 +357,14 @@ pub fn event_object_type_addr() -> u64 {
 pub fn port_object_type_addr() -> u64 {
     core::ptr::addr_of!(PORT_OBJECT_TYPE) as u64
 }
+/// Address of the [`MmSectionObjectType`](SECTION_OBJECT_TYPE) static.
+pub fn section_object_type_addr() -> u64 {
+    core::ptr::addr_of!(SECTION_OBJECT_TYPE) as u64
+}
+/// Address of the [`PsJobType`](JOB_OBJECT_TYPE) static.
+pub fn job_object_type_addr() -> u64 {
+    core::ptr::addr_of!(JOB_OBJECT_TYPE) as u64
+}
 /// Address of the [`ExDesktopObjectType`](DESKTOP_OBJECT_TYPE) static.
 pub fn desktop_object_type_addr() -> u64 {
     core::ptr::addr_of!(DESKTOP_OBJECT_TYPE) as u64
@@ -344,6 +400,8 @@ mod tests {
             INDEX_THREAD,
             INDEX_EVENT,
             INDEX_PORT,
+            INDEX_SECTION,
+            INDEX_JOB,
             INDEX_DESKTOP,
             INDEX_WINDOW_STATION,
             INDEX_DEVICE,
@@ -362,6 +420,8 @@ mod tests {
             thread_object_type_addr(),
             event_object_type_addr(),
             port_object_type_addr(),
+            section_object_type_addr(),
+            job_object_type_addr(),
             desktop_object_type_addr(),
             window_station_object_type_addr(),
             device_object_type_addr(),
@@ -371,6 +431,43 @@ mod tests {
             for b in &addrs[i + 1..] {
                 assert_ne!(a, b, "each type must be a distinct object");
             }
+        }
+    }
+
+    #[test]
+    fn section_and_job_data_exports_have_distinct_real_type_identities() {
+        let section = section_object_type_addr();
+        let job = job_object_type_addr();
+        assert_ne!(section, 0);
+        assert_ne!(job, 0);
+        assert_ne!(section, job);
+        for existing in [
+            process_object_type_addr(),
+            thread_object_type_addr(),
+            event_object_type_addr(),
+            port_object_type_addr(),
+            desktop_object_type_addr(),
+            window_station_object_type_addr(),
+            device_object_type_addr(),
+        ] {
+            assert_ne!(section, existing);
+            assert_ne!(job, existing);
+        }
+        // SAFETY: the statics are const-initialized; the test reads identity fields only.
+        unsafe {
+            let section = &*(section as *const ObjectType);
+            let job = &*(job as *const ObjectType);
+            assert_eq!(section.name_units(), &['S' as u16, 'e' as u16, 'c' as u16, 't' as u16, 'i' as u16, 'o' as u16, 'n' as u16]);
+            assert_eq!(job.name_units(), &['J' as u16, 'o' as u16, 'b' as u16]);
+            assert_eq!(section.index(), INDEX_SECTION);
+            assert_eq!(job.index(), INDEX_JOB);
+            assert_ne!(section.index(), job.index());
+            assert_eq!(section.type_info.use_default_object, 1);
+            assert_eq!(section.type_info.invalid_attributes, 0x100);
+            assert_eq!(section.type_info.valid_access_mask, 0x000F_001F);
+            assert_eq!(section.type_info.generic_mapping.generic_all, 0x000F_001F);
+            assert_eq!(job.type_info.valid_access_mask, 0x001F_001F);
+            assert_eq!(job.type_info.generic_mapping.generic_all, 0x001F_001F);
         }
     }
 

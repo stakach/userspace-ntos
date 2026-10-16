@@ -189,6 +189,12 @@ pub fn equal_unicode(a: &[u16], b: &[u16], case_insensitive: bool) -> bool {
     compare_unicode(a, b, case_insensitive) == core::cmp::Ordering::Equal
 }
 
+/// `RtlPrefixUnicodeString`: compare a counted UTF-16 prefix, including embedded NUL units.
+pub fn prefix_unicode(prefix: &[u16], string: &[u16], case_insensitive: bool) -> bool {
+    prefix.len() <= string.len()
+        && equal_unicode(prefix, &string[..prefix.len()], case_insensitive)
+}
+
 /// `RtlUpcaseUnicodeChar`: upper-case a single code unit. Covers ASCII a-z and
 /// Latin-1 supplement à-þ (the ranges win32k needs for class-name folding);
 /// other code units pass through unchanged.

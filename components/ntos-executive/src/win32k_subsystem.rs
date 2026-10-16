@@ -1398,6 +1398,7 @@ pub const W32_ATOM_OP_ADD_INTEGER: u64 = 2;
 /// and owns the opaque lease; win32k receives no mutable MM state or raw executive pointer.
 pub const W32_MM_SECURE_LABEL: u64 = 0x77F;
 pub const W32_DEVICE_PROPERTY_LABEL: u64 = 0x780;
+pub const W32_DEVICE_INTERFACES_LABEL: u64 = 0x784;
 pub const W32_DEVICE_POINTER_LABEL: u64 = 0x781;
 /// Pointer-free staged Object Manager directory requests.
 pub const W32_DIRECTORY_LABEL: u64 = 0x782;
@@ -3654,6 +3655,14 @@ extern "win64" fn s_ps_reference_primary_token(process: u64) -> u64 {
         }
         token
     }
+}
+
+extern "win64" fn s_ps_dereference_primary_token(token: u64) {
+    let Some(index) = (unsafe { token_context_index(token) }) else {
+        panic!("PsDereferencePrimaryToken rejected unknown token {token:#x}");
+    };
+    unsafe { release_primary_token_pointer(index) }
+        .unwrap_or_else(|status| reject_ps_broker("primary token pointer release", status));
 }
 
 /// `PACCESS_TOKEN PsReferenceImpersonationToken(...)` — no hosted win32k caller currently carries a
@@ -6053,6 +6062,195 @@ extern "win64" fn s_rtl_are_all_accesses_granted(granted: u32, desired: u32) -> 
 
 extern "win64" fn s_rtl_nt_status_to_dos_error(status: u32) -> u32 {
     nt_compat_exports::rtl::nt_status_to_dos_error(status)
+}
+
+extern "win64" fn s_ke_delay_execution_thread(_wait_mode: u32, _alertable: u8, interval: *const i64) -> i32 {
+    assert!(!interval.is_null(), "KeDelayExecutionThread null interval");
+    let interval = unsafe { read_unaligned(interval) };
+    let deadline = nt_delay_execution::Deadline::from_nt_timeout(Some(interval), crate::nt_time_snapshot());
+    while !deadline.is_due(crate::nt_time_snapshot()) {
+        crate::yield_now();
+    }
+    0 // STATUS_SUCCESS after the full relative or absolute deadline elapsed.
+}
+
+extern "win64" fn s_rtl_unicode_to_multibyte_n(
+    destination: *mut u8,
+    capacity: u32,
+    written: *mut u32,
+    source: *const u16,
+    source_bytes: u32,
+) -> i32 {
+    if source_bytes & 1 != 0 {
+        return STATUS_INVALID_PARAMETER_2;
+    }
+    let units = source_bytes as usize / 2;
+    let count = units.min(capacity as usize);
+    if (units != 0 && source.is_null()) || (count != 0 && destination.is_null()) {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    unsafe {
+        let state = win32k_nls_state();
+        let table = nls_unicode_to_byte_table(NLS_ANSI_VADDR, state.ansi_wide_byte_offset);
+        let input = if units == 0 { &[] } else { core::slice::from_raw_parts(source, units) };
+        let output = if count == 0 { &mut [] } else { core::slice::from_raw_parts_mut(destination, count) };
+        let Some(converted) = nt_nls::unicode_to_custom_cp_into(table, count, input, false, output) else {
+            nls_contract_trap();
+        };
+        if !written.is_null() { write_unaligned(written, converted as u32); }
+    }
+    0
+}
+
+type Win32kAvlTable = nt_compat_exports::avl_table::RtlAvlTable;
+
+extern "win64" fn s_rtl_initialize_generic_table_avl(
+    table: *mut Win32kAvlTable,
+    compare: Option<nt_compat_exports::avl_table::CompareRoutine>,
+    allocate: Option<nt_compat_exports::avl_table::AllocateRoutine>,
+    free: Option<nt_compat_exports::avl_table::FreeRoutine>,
+    context: *mut core::ffi::c_void,
+) {
+    unsafe { nt_compat_exports::avl_table::initialize_generic_table_avl(table, compare, allocate, free, context) }
+}
+
+extern "win64" fn s_rtl_insert_element_generic_table_avl(
+    table: *mut Win32kAvlTable,
+    buffer: *mut core::ffi::c_void,
+    buffer_size: u32,
+    new_element: *mut u8,
+) -> *mut core::ffi::c_void {
+    unsafe { nt_compat_exports::avl_table::insert_element_generic_table_avl(table, buffer, buffer_size, new_element) }
+}
+
+extern "win64" fn s_rtl_lookup_element_generic_table_avl(
+    table: *mut Win32kAvlTable,
+    buffer: *mut core::ffi::c_void,
+) -> *mut core::ffi::c_void {
+    unsafe { nt_compat_exports::avl_table::lookup_element_generic_table_avl(table, buffer) }
+}
+
+extern "win64" fn s_rtl_delete_element_generic_table_avl(
+    table: *mut Win32kAvlTable,
+    buffer: *mut core::ffi::c_void,
+) -> u8 {
+    unsafe { nt_compat_exports::avl_table::delete_element_generic_table_avl(table, buffer) as u8 }
+}
+
+extern "win64" fn s_rtl_prefix_unicode_string(
+    prefix: *const u8,
+    string: *const u8,
+    case_insensitive: u8,
+) -> u8 {
+    unsafe {
+        unsafe fn counted_unicode<'a>(descriptor: *const u8) -> Option<&'a [u16]> {
+            if descriptor.is_null() { return None; }
+            let length = unsafe { read_unaligned(descriptor as *const u16) } as usize;
+            let maximum = unsafe { read_unaligned(descriptor.add(2) as *const u16) } as usize;
+            let buffer = unsafe { read_unaligned(descriptor.add(8) as *const u64) } as *const u16;
+            if length > maximum || length & 1 != 0 || (length != 0 && buffer.is_null()) {
+                return None;
+            }
+            Some(if length == 0 { &[] } else { unsafe { core::slice::from_raw_parts(buffer, length / 2) } })
+        }
+        let first = counted_unicode(prefix).expect("RtlPrefixUnicodeString invalid prefix");
+        let second = counted_unicode(string).expect("RtlPrefixUnicodeString invalid string");
+        nt_compat_exports::rtl::prefix_unicode(first, second, case_insensitive != 0) as u8
+    }
+}
+
+extern "win64" fn s_rtl_set_sacl_security_descriptor(
+    descriptor: *mut u8,
+    present: u8,
+    sacl: u64,
+    defaulted: u8,
+) -> i32 {
+    if descriptor.is_null() { return STATUS_ACCESS_VIOLATION_I32; }
+    let storage = unsafe { core::slice::from_raw_parts_mut(descriptor, 0x28) };
+    nt_security::raw_rtl::set_absolute_sacl(storage, present != 0, sacl, defaulted != 0)
+        .map(|()| 0)
+        .unwrap_or_else(|status| status as i32)
+}
+
+extern "win64" fn s_rtl_sub_authority_sid(sid: u64, index: u32) -> u64 {
+    let Some(offset) = nt_security::raw_rtl::sub_authority_offset(index) else {
+        panic!("RtlSubAuthoritySid index exceeds NT SID limit");
+    };
+    let Some(length) = (unsafe { sid_len_from_ptr(sid) }) else {
+        panic!("RtlSubAuthoritySid invalid SID");
+    };
+    assert!(offset + 4 <= length, "RtlSubAuthoritySid index exceeds SID authority count");
+    sid + offset as u64
+}
+
+extern "win64" fn s_rtl_multibyte_to_unicode_size(
+    output_bytes: *mut u32,
+    source: *const u8,
+    source_bytes: u32,
+) -> i32 {
+    if output_bytes.is_null() || (source_bytes != 0 && source.is_null()) {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    unsafe {
+        let _ = win32k_nls_state(); // The published ANSI page is validated SBCS CP1252.
+        let input = if source_bytes == 0 { &[] } else { core::slice::from_raw_parts(source, source_bytes as usize) };
+        let Some(size) = nt_nls::multibyte_to_unicode_size(input, None) else {
+            return STATUS_INVALID_PARAMETER_I32;
+        };
+        write_unaligned(output_bytes, size);
+    }
+    0
+}
+
+const WIN32K_EX_WORK_CAPACITY: usize = 64;
+static WIN32K_EX_WORK_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static mut WIN32K_EX_WORK_QUEUE: nt_kernel_exec::ExWorkQueue<WIN32K_EX_WORK_CAPACITY> =
+    nt_kernel_exec::ExWorkQueue::new();
+
+struct Win32kExWorkGuard;
+
+impl Win32kExWorkGuard {
+    fn acquire() -> Self {
+        while WIN32K_EX_WORK_BUSY
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        Self
+    }
+}
+
+impl Drop for Win32kExWorkGuard {
+    fn drop(&mut self) {
+        WIN32K_EX_WORK_BUSY.store(false, Ordering::Release);
+    }
+}
+
+extern "win64" fn s_ex_queue_work_item(work_item: u64, queue_type: u32) {
+    assert_ne!(work_item, 0, "ExQueueWorkItem null item");
+    let routine = unsafe { read_unaligned((work_item + 0x10) as *const u64) };
+    let parameter = unsafe { read_unaligned((work_item + 0x18) as *const u64) };
+    let _guard = Win32kExWorkGuard::acquire();
+    unsafe { (&mut *core::ptr::addr_of_mut!(WIN32K_EX_WORK_QUEUE)).enqueue(work_item, routine, parameter, queue_type) }
+        .unwrap_or_else(|error| panic!("ExQueueWorkItem admission failed: {error:?}"));
+}
+
+/// Run queued work outside the admission lock, at PASSIVE_LEVEL and with the System projection.
+/// A bounded drain prevents a callback that repeatedly requeues itself from starving dispatch.
+unsafe fn drain_win32k_ex_work() {
+    if irql::get_current() != nt_kernel_exec::PASSIVE_LEVEL {
+        return;
+    }
+    for _ in 0..WIN32K_EX_WORK_CAPACITY {
+        let work = {
+            let _guard = Win32kExWorkGuard::acquire();
+            (&mut *core::ptr::addr_of_mut!(WIN32K_EX_WORK_QUEUE)).take_ready()
+        };
+        let Some(work) = work else { break; };
+        let routine: extern "win64" fn(u64) = core::mem::transmute(work.routine as *const ());
+        routine(work.parameter);
+    }
 }
 
 extern "win64" fn s_ex_acquire_rundown_protection(run_ref: *const nt_kernel_exec::ExRundownRef) -> u8 {
@@ -14615,6 +14813,8 @@ fn register_trampolines() -> bool {
     if !reg.reserve_initial(DRIVER_EXPORT_INITIAL_RESERVE) {
         return false;
     }
+    crate::driver_launch::bind_kd_debug_export(reg);
+    reg.bind("ExQueueWorkItem", s_ex_queue_work_item as usize as u64);
     reg.bind(
         "DbgBreakPoint",
         crate::debug_traps::DbgBreakPoint as *const () as usize as u64,
@@ -14646,6 +14846,17 @@ fn register_trampolines() -> bool {
     reg.bind("ProbeForRead", s_probe_for_read as usize as u64);
     reg.bind("ProbeForWrite", s_probe_for_write as usize as u64);
     reg.bind("RtlGetVersion", s_rtl_get_version as usize as u64);
+    reg.bind("KeDelayExecutionThread", s_ke_delay_execution_thread as usize as u64);
+    reg.bind("KeQueryTimeIncrement", crate::driver_launch::s_ke_query_time_increment as usize as u64);
+    reg.bind("RtlUnicodeToMultiByteN", s_rtl_unicode_to_multibyte_n as usize as u64);
+    reg.bind("RtlInitializeGenericTableAvl", s_rtl_initialize_generic_table_avl as usize as u64);
+    reg.bind("RtlInsertElementGenericTableAvl", s_rtl_insert_element_generic_table_avl as usize as u64);
+    reg.bind("RtlLookupElementGenericTableAvl", s_rtl_lookup_element_generic_table_avl as usize as u64);
+    reg.bind("RtlDeleteElementGenericTableAvl", s_rtl_delete_element_generic_table_avl as usize as u64);
+    reg.bind("RtlPrefixUnicodeString", s_rtl_prefix_unicode_string as usize as u64);
+    reg.bind("RtlSetSaclSecurityDescriptor", s_rtl_set_sacl_security_descriptor as usize as u64);
+    reg.bind("RtlSubAuthoritySid", s_rtl_sub_authority_sid as usize as u64);
+    reg.bind("RtlMultiByteToUnicodeSize", s_rtl_multibyte_to_unicode_size as usize as u64);
     reg.bind("ExRaiseAccessViolation", seh.access_violation_va);
     reg.bind("ExRaiseStatus", seh.raise_va);
     reg.bind("ExAcquireRundownProtection", s_ex_acquire_rundown_protection as usize as u64);
@@ -14655,6 +14866,7 @@ fn register_trampolines() -> bool {
     reg.bind("ExWaitForRundownProtectionRelease", s_ex_wait_for_rundown_protection_release as usize as u64);
     reg.bind("RtlUnwindEx", seh.unwind_entry_va);
     reg.bind("RtlUnwind", seh.legacy_unwind_va);
+    reg.bind("PsDereferencePrimaryToken", s_ps_dereference_primary_token as usize as u64);
     reg.bind(
         "RtlAreAllAccessesGranted",
         s_rtl_are_all_accesses_granted as usize as u64,
@@ -15227,6 +15439,10 @@ fn register_trampolines() -> bool {
         crate::driver_launch::win32k_device_properties::io_get_device_property as *const () as u64,
     );
     reg.bind(
+        "IoGetDeviceInterfaces",
+        crate::driver_launch::win32k_device_interfaces::io_get_device_interfaces as *const () as u64,
+    );
+    reg.bind(
         "IoBuildDeviceIoControlRequest",
         source_irp::build_device_io_control_request as *const () as u64,
     );
@@ -15377,8 +15593,8 @@ fn register_trampolines() -> bool {
     reg.bind("SePrivilegeCheck", s_se_privilege_check as usize as u64);
     // --- batch 4: DATA EXPORTS folded in as data-cell resolutions. The IAT slot points at the
     // cell (WIN32K_DATA_VADDR page 1); load_into writes each cell's VALUE from DATA_EXPORTS. The
-    // 8 object-type/Se/Nls cells still hold placeholder pointers (backlog: real OBJECT_TYPEs);
-    // the 3 Mm cells hold architectural x64 constants. Contract declared in
+    // object-type cells hold canonical OBJECT_TYPE pointers; KUSER holds its checked writable
+    // component alias, and the 3 Mm boundaries hold architectural x64 constants. Declared in
     // nt_compat_exports::win32k_resolve::WIN32K_DATA_EXPORTS.
     let mut di = 0usize;
     while di < DATA_EXPORTS.len() {
@@ -15424,7 +15640,7 @@ pub(crate) fn export_addr_for_module(module: &str, name: &str) -> u64 {
     unsafe { (&*core::ptr::addr_of!(WIN32K_EXPORTS)).lookup_module(module, name).unwrap_or(0) }
 }
 
-/// (name, cell value). The six **object-type** cells (`Ps*Type`, `Ex*ObjectType`, `LpcPortObjectType`)
+/// (name, cell value). The **object-type** cells
 /// now resolve at runtime to the address of a **real** `nt_object_manager::object_type` `OBJECT_TYPE`
 /// static (see [`object_type_cell_value`]) — their `0` here is a placeholder overridden in
 /// `load_into`. `SeExports` now points at a **real** `nt_security::se_exports` `SE_EXPORTS` struct
@@ -15443,6 +15659,9 @@ const DATA_EXPORTS: &[(&str, u64)] = &[
     ("MmSystemRangeStart", 0xFFFF_0800_0000_0000),
     ("MmUserProbeAddress", 0x0000_7FFF_FFFF_0000),
     ("MmHighestUserAddress", 0x0000_7FFF_FFFF_EFFF),
+    ("MmSectionObjectType", 0),
+    ("PsJobType", 0),
+    ("MmWriteableSharedUserData", WIN32K_KUSER_SHARED_DATA_VA),
 ];
 
 /// Resolve an object-type data-export name to the address of its **real** `OBJECT_TYPE` static, or
@@ -15460,6 +15679,8 @@ fn object_type_cell_value(name: &str) -> Option<u64> {
         "ExWindowStationObjectType" => ot::window_station_object_type_addr(),
         "ExEventObjectType" => ot::event_object_type_addr(),
         "LpcPortObjectType" => ot::port_object_type_addr(),
+        "MmSectionObjectType" => ot::section_object_type_addr(),
+        "PsJobType" => ot::job_object_type_addr(),
         _ => return None,
     })
 }
@@ -15818,7 +16039,7 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize, nls_sizes: [usize; 3]) ->
         }
     }
 
-    // Initialise the data-export cells (page 1). The six object-type cells resolve to their real
+    // Initialise the data-export cells (page 1). Object-type cells resolve to their real
     // `OBJECT_TYPE` statics (win32k writes/uses them as typed identities); the rest hold their
     // Se/Nls placeholder addresses or Mm constants. The page-0 placeholder region is now only used
     // by the Se/Nls cells.
@@ -16090,6 +16311,9 @@ unsafe fn win32k_post_driver_entry(status: i32, drv: u64) {
         print_str(b"[win32k-event] DriverEntry stack activation identity missing\n");
         park();
     };
+    if status >= 0 {
+        drain_win32k_ex_work();
+    }
     if !finish_provider_stack_event_activation(driver_activation) {
         print_str(b"[win32k-event] DriverEntry stack Event retirement failed\n");
         park();
@@ -16418,6 +16642,8 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         let status = 0xC000_009Au32;
         return (status as i32, status as u64);
     };
+    assert!(select_initial_system_context(), "work callbacks require System projection");
+    drain_win32k_ex_work();
     if event_reclaim_pending_marker().load(Ordering::Acquire) != 0
         && !drain_retired_event_provider_bodies()
     {

@@ -313,6 +313,8 @@ pub mod pnp_query_kind {
     pub const DEVICE_EXISTS: u16 = 1;
     pub const ENUMERATE_DEVNODE: u16 = 2;
     pub const INTERFACE_LINKS: u16 = 3;
+    /// `INTERFACE_LINKS` selector: include registered interfaces that are currently disabled.
+    pub const INTERFACE_LINKS_INCLUDE_NONACTIVE: u32 = 1;
     pub const DYNAMIC_PROPERTY: u16 = 4;
     pub const RELATED_DEVICE: u16 = 5;
     pub const DEVICE_DEPTH: u16 = 6;

@@ -611,6 +611,22 @@ impl ProcessManager {
         })
     }
 
+    /// `ObSetHandleAttributes`: update one entry in the authenticated caller's exact table.
+    /// Tagged kernel handles belong to System's table; pseudo handles have no mutable entry.
+    pub fn set_native_handle_flags(
+        &mut self,
+        caller: NativeHandleCaller,
+        value: u64,
+        flags: HandleFlags,
+    ) -> Result<(), u32> {
+        let NativeHandleScope::Table { owner, handle, .. } =
+            self.decode_native_handle(caller, value)?
+        else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        self.set_handle_flags(owner, handle, flags)
+    }
+
     /// Retain an authenticated kernel caller's original thread and owning process together.
     /// Preflight both projections and checked increments before the first mutation. The pair
     /// does not use CurrentProcess: attachment must never substitute a different owning process.

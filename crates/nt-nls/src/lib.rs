@@ -181,6 +181,97 @@ pub fn custom_cp_to_unicode_into(
     Some(count)
 }
 
+/// Required UTF-16 output bytes for a counted multibyte string.
+///
+/// `lead_byte_info` is the native 256-word lead-byte table for DBCS, or `None`
+/// for SBCS. A trailing lead byte consumes one replacement character, matching
+/// the RTL sizing pass. Malformed tables and overflowing output sizes fail.
+pub fn multibyte_to_unicode_size(bytes: &[u8], lead_byte_info: Option<&[u16]>) -> Option<u32> {
+    if let Some(leads) = lead_byte_info {
+        if leads.len() < 256 { return None; }
+    }
+    let mut source = 0usize;
+    let mut units = 0usize;
+    while source < bytes.len() {
+        let byte = bytes[source];
+        source += 1;
+        if let Some(leads) = lead_byte_info {
+            if byte >= 0x80 && leads[byte as usize] != 0 && source < bytes.len() {
+                source += 1;
+            }
+        }
+        units += 1;
+    }
+    units.checked_mul(2).and_then(|size| u32::try_from(size).ok())
+}
+
+/// Progress of one bounded Unicode-to-DBCS conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DbcsConversion {
+    pub bytes_written: usize,
+    pub units_consumed: usize,
+}
+
+/// Convert UTF-16 through the native 65,536-word Unicode-to-DBCS table.
+///
+/// An output buffer with one byte left never receives half of a two-byte
+/// character. ASCII uses the direct single-byte mapping, as ntdll does.
+pub fn unicode_to_multibyte_dbcs_mapped_into<F>(
+    unicode: &[u16],
+    unicode_to_dbcs: &[u16],
+    output: &mut [u8],
+    map: F,
+) -> Option<DbcsConversion>
+where
+    F: Fn(u16) -> u16,
+{
+    if unicode_to_dbcs.len() < 0x1_0000 { return None; }
+    let mut progress = DbcsConversion { bytes_written: 0, units_consumed: 0 };
+    for &source in unicode {
+        let unit = map(source);
+        let encoded = if unit < 0x80 { unit } else { unicode_to_dbcs[unit as usize] };
+        let width = if encoded >> 8 != 0 { 2 } else { 1 };
+        if output.len() - progress.bytes_written < width { break; }
+        if width == 2 {
+            output[progress.bytes_written] = (encoded >> 8) as u8;
+            progress.bytes_written += 1;
+        }
+        output[progress.bytes_written] = encoded as u8;
+        progress.bytes_written += 1;
+        progress.units_consumed += 1;
+    }
+    Some(progress)
+}
+
+/// Byte count for the win32k `RtlUnicodeToMultiByteN` import's DBCS core.
+pub fn unicode_to_multibyte_dbcs_into(
+    unicode: &[u16],
+    unicode_to_dbcs: &[u16],
+    output: &mut [u8],
+) -> Option<usize> {
+    unicode_to_multibyte_dbcs_mapped_into(unicode, unicode_to_dbcs, output, |unit| unit)
+        .map(|progress| progress.bytes_written)
+}
+
+/// Required byte count for a counted UTF-16 string encoded through a DBCS table.
+pub fn unicode_to_multibyte_dbcs_size<F>(
+    unicode: &[u16],
+    unicode_to_dbcs: &[u16],
+    map: F,
+) -> Option<u32>
+where
+    F: Fn(u16) -> u16,
+{
+    if unicode_to_dbcs.len() < 0x1_0000 { return None; }
+    let mut count = 0u32;
+    for &source in unicode {
+        let unit = map(source);
+        let encoded = if unit < 0x80 { unit } else { unicode_to_dbcs[unit as usize] };
+        count = count.checked_add(if encoded >> 8 != 0 { 2 } else { 1 })?;
+    }
+    Some(count)
+}
+
 /// The bootstrap Unicode uppercase mapping used when no mapped case table is supplied.
 ///
 /// This matches the existing ntdll `RtlUpcaseUnicodeChar` ASCII and Latin-1 behavior.

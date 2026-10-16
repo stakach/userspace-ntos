@@ -67,6 +67,8 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("MmUserProbeAddress", Partial, "data export: fixed x64 system/user address boundary constant"),
     e("MmMapViewInSessionSpace", Partial, "section create/map routed to nt-memory-manager (system/session views share the host AS)"),
     e("MmHighestUserAddress", Partial, "data export: fixed x64 system/user address boundary constant"),
+    e("MmSectionObjectType", Implemented, "data export: canonical section OBJECT_TYPE pointer"),
+    e("MmWriteableSharedUserData", Implemented, "data export: writable kernel alias of the mapped KUSER_SHARED_DATA frame"),
     // --- Ob ---
     e("ObfReferenceObject", Partial, "typed USER/Event/LPC/Token/video File/Device references plus brokered EPROCESS/ETHREAD pointer references"),
     e("ObCloseHandle", Partial, "object reference/handle/security ops routed to nt-object-manager"),
@@ -108,6 +110,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("PsGetProcessWin32WindowStation", Partial, "Win32 per-process/thread context pointer-slot in nt-process (ProcessManager win32 accessors)"),
     e("PsSetProcessWindowStation", Partial, "Win32 per-process/thread context pointer-slot in nt-process (ProcessManager win32 accessors)"),
     e("PsProcessType", Partial, "data export: EPROCESS/ETHREAD object-type pointer (nt-object-manager)"),
+    e("PsJobType", Implemented, "data export: canonical job OBJECT_TYPE pointer"),
     e("PsGetCurrentProcessWin32Process", Partial, "Win32 per-process/thread context pointer-slot in nt-process (ProcessManager win32 accessors)"),
     e("PsThreadType", Partial, "data export: EPROCESS/ETHREAD object-type pointer (nt-object-manager)"),
     // --- Ke ---

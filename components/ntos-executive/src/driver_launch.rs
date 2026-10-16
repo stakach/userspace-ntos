@@ -123,6 +123,8 @@ pub(crate) mod device_property;
 
 #[path = "win32k_device_properties.rs"]
 pub(crate) mod win32k_device_properties;
+#[path = "win32k_device_interfaces.rs"]
+pub(crate) mod win32k_device_interfaces;
 #[path = "win32k_device_consumer.rs"]
 pub(crate) mod win32k_device_consumer;
 #[path = "win32k_file_owners.rs"]
@@ -14636,7 +14638,7 @@ extern "win64" fn s_ke_insert_queue_dpc(dpc: u64, arg1: u64, arg2: u64) -> u8 {
 }
 
 /// `ULONG KeQueryTimeIncrement()`.
-extern "win64" fn s_ke_query_time_increment() -> u32 {
+pub(crate) extern "win64" fn s_ke_query_time_increment() -> u32 {
     156_250
 }
 
@@ -16801,6 +16803,13 @@ pub(crate) fn bind_debug_exports(reg: &mut DriverExportRegistry) {
     reg.bind(
         "DbgPrintEx",
         hosted_dbg_print_ex_gate as *const () as usize as u64,
+    );
+}
+
+pub(crate) fn bind_kd_debug_export(reg: &mut DriverExportRegistry) {
+    reg.bind(
+        "KdSystemDebugControl",
+        hosted_kd_debug::s_kd_system_debug_control as *const () as usize as u64,
     );
 }
 
@@ -33457,10 +33466,7 @@ fn register_fsd_trampolines() -> bool {
         "DbgBreakPointWithStatus",
         crate::debug_traps::DbgBreakPointWithStatus as *const () as usize as u64,
     );
-    reg.bind(
-        "KdSystemDebugControl",
-        hosted_kd_debug::s_kd_system_debug_control as *const () as usize as u64,
-    );
+    bind_kd_debug_export(reg);
     // pool (ExAllocatePool* → the FSD arena)
     reg.bind(
         "ExAllocatePoolWithTag",
@@ -54563,6 +54569,28 @@ pub(crate) unsafe fn win32k_pdo_driver_key_property_snapshot(
         return Err(STATUS_INVALID_DEVICE_REQUEST);
     }
     Ok(value)
+}
+
+/// Copy the instance path only while this projected PDO still owns the same PnP incarnation.
+pub(crate) unsafe fn win32k_pdo_instance_path(
+    device: nt_io_manager::DeviceId,
+    expected: nt_pnp_manager::DevnodeIdentity,
+) -> Result<String, i32> {
+    let pnp = hosted_pnp_manager_mut();
+    if pnp.devnode_identity_for_pdo(device.raw()) != Some(expected) {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    let source = pnp
+        .instance_id(expected.devnode_id())
+        .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+    let mut path = String::new();
+    path.try_reserve_exact(source.len())
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    path.push_str(source);
+    if pnp.devnode_identity_for_pdo(device.raw()) != Some(expected) {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    Ok(path)
 }
 
 pub(crate) fn service_hosted_device(

@@ -111,6 +111,58 @@ fn strict_native_scope_never_truncates_or_confuses_pseudo_handles() {
 }
 
 #[test]
+fn native_handle_attribute_change_targets_only_the_decoded_owner() {
+    let (mut pm, user, kernel, pid, _) = fixture();
+    let system = pm.initial_system_identity().unwrap().process_id();
+    let user_handle = pm
+        .insert_handle(pid, HandleObject::Opaque(0x101), 0)
+        .unwrap();
+    let system_handle = pm
+        .insert_handle(system, HandleObject::Opaque(0x202), 0)
+        .unwrap();
+    assert_eq!(user_handle, system_handle);
+
+    let user_flags = HandleFlags {
+        inherit: true,
+        protect_from_close: false,
+    };
+    let kernel_flags = HandleFlags {
+        inherit: false,
+        protect_from_close: true,
+    };
+    assert_eq!(
+        pm.set_native_handle_flags(user, u64::from(user_handle) | 1, user_flags),
+        Ok(())
+    );
+    assert_eq!(pm.handle_flags(pid, user_handle), Some(user_flags));
+    assert_eq!(
+        pm.handle_flags(system, system_handle),
+        Some(HandleFlags::default())
+    );
+
+    assert_eq!(
+        pm.set_native_handle_flags(
+            kernel,
+            KERNEL_HANDLE_TAG | u64::from(system_handle) | 2,
+            kernel_flags,
+        ),
+        Ok(())
+    );
+    assert_eq!(pm.handle_flags(system, system_handle), Some(kernel_flags));
+    assert_eq!(pm.handle_flags(pid, user_handle), Some(user_flags));
+
+    assert_eq!(
+        pm.set_native_handle_flags(user, KERNEL_HANDLE_TAG | u64::from(system_handle), user_flags),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(
+        pm.set_native_handle_flags(kernel, u64::MAX, user_flags),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(pm.handle_flags(system, system_handle), Some(kernel_flags));
+}
+
+#[test]
 fn real_user_handles_enforce_type_and_grants_before_reference_acquisition() {
     let (mut pm, user, kernel, pid, tid) = fixture();
     let handle = pm

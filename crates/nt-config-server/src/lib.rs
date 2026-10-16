@@ -3447,7 +3447,9 @@ impl CmServer {
         let shape_valid = match req.query_kind {
             pnp_query_kind::ENUMERATE_DEVNODE => instance.is_empty() && auxiliary.is_empty(),
             pnp_query_kind::INTERFACE_LINKS => {
-                !instance.is_empty() && req.selector == 0 && auxiliary.len() == 16
+                !instance.is_empty()
+                    && req.selector <= pnp_query_kind::INTERFACE_LINKS_INCLUDE_NONACTIVE
+                    && auxiliary.len() == 16
             }
             pnp_query_kind::DYNAMIC_PROPERTY | pnp_query_kind::RELATED_DEVICE => {
                 !instance.is_empty() && auxiliary.is_empty()
@@ -3493,7 +3495,11 @@ impl CmServer {
                         };
                         let Some(links) = self
                             .cm
-                            .pnp_enabled_interface_links_by_guid_bytes(guid, &instance)
+                            .pnp_interface_links_by_guid_bytes(
+                                guid,
+                                &instance,
+                                req.selector == pnp_query_kind::INTERFACE_LINKS_INCLUDE_NONACTIVE,
+                            )
                         else {
                             return reply(STATUS_NO_SUCH_DEVICE, 0);
                         };
