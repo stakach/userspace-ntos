@@ -37,6 +37,7 @@ mod interrupt_rundown;
 mod irql;
 pub mod kevent;
 mod lookaside;
+pub mod luid;
 mod mutant;
 pub mod np_prefix;
 pub mod provider_pool;

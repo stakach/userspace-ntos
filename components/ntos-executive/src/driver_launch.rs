@@ -330,11 +330,14 @@ mod hosted_driver_pnp_notification;
 mod hosted_driver_pofx;
 #[path = "hosted_driver_power_setting.rs"]
 mod hosted_driver_power_setting;
+#[path = "hosted_driver_luid.rs"]
+mod hosted_driver_luid;
 #[path = "hosted_driver_device_state.rs"]
 mod hosted_driver_device_state;
 pub(crate) use hosted_driver_pnp_notification::service as service_hosted_driver_pnp_notification;
 pub(crate) use hosted_driver_pofx::service as service_hosted_driver_pofx;
 pub(crate) use hosted_driver_power_setting::service as service_hosted_driver_power_setting;
+pub(crate) use hosted_driver_luid::service as service_hosted_driver_luid;
 pub(crate) use hosted_driver_pnp_notification::wake_due as hosted_driver_pnp_notification_wake_due;
 #[path = "hosted_io_create_file_ingress.rs"]
 mod hosted_io_create_file_ingress;
@@ -1178,6 +1181,7 @@ pub const FSD_SERVICE_DYNAMIC_OBJECT_DEREFERENCE_LABEL: u64 = hosted_driver_dyna
 pub const FSD_SERVICE_PS_HANDLE_REFERENCE_LABEL: u64 = hosted_driver_ps_handle_reference::LABEL;
 pub const FSD_SERVICE_POFX_LABEL: u64 = hosted_driver_pofx::LABEL;
 pub const FSD_SERVICE_POWER_SETTING_LABEL: u64 = hosted_driver_power_setting::LABEL;
+pub const FSD_SERVICE_LUID_LABEL: u64 = hosted_driver_luid::LABEL;
 const _: () = {
     let labels = [
         FSD_SERVICE_SOURCE_IRP_LABEL,
@@ -1219,6 +1223,7 @@ const _: () = {
         FSD_SERVICE_PS_HANDLE_REFERENCE_LABEL,
         FSD_SERVICE_POFX_LABEL,
         FSD_SERVICE_POWER_SETTING_LABEL,
+        FSD_SERVICE_LUID_LABEL,
         FSD_SERVICE_PCI_ROOT_LABEL,
         FSD_SERVICE_PCI_ROUTE_QUERY_LABEL,
     ];
@@ -34069,6 +34074,7 @@ fn register_fsd_trampolines() -> bool {
     reg.bind("PoFxPowerControl", hosted_driver_pofx::power_control as *const () as usize as u64);
     reg.bind("PoRegisterPowerSettingCallback", hosted_driver_power_setting::register as *const () as usize as u64);
     reg.bind("PoUnregisterPowerSettingCallback", hosted_driver_power_setting::unregister as *const () as usize as u64);
+    reg.bind("ZwAllocateLocallyUniqueId", hosted_driver_luid::allocate as *const () as usize as u64);
     reg.bind(
         "IoGetDmaAdapter",
         s_io_get_dma_adapter as *const () as usize as u64,

@@ -26353,7 +26353,8 @@ pub(crate) static LSA_LOGON_CLIENT_READS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LSA_API_MASK: AtomicU64 = AtomicU64::new(0);
 /// `ExpLuid` — the kernel's global locally-unique-id counter (`ntoskrnl/ex/uuid.c:43`), seeded at
 /// `0x3e9` with `ExpLuidIncrement = 1`. `NtAllocateLocallyUniqueId` post-increments it.
-pub(crate) static EXP_LUID: AtomicU64 = AtomicU64::new(0x3e9);
+pub(crate) static EXP_LUID: nt_kernel_exec::luid::LocalLuidAllocator =
+    nt_kernel_exec::luid::LocalLuidAllocator::new(0x3e9);
 /// The `*LsaHandle` winlogon's `LsaRegisterLogonProcess` ended up holding (0 = none).
 pub(crate) static WINLOGON_LSA_PORT_HANDLE: AtomicU64 = AtomicU64::new(0);
 /// Set when winlogon's blocked `NtConnectPort(\LsaAuthenticationPort)` was woken with SUCCESS.

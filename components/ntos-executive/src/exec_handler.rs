@@ -31892,7 +31892,9 @@ impl ExecNtHandler {
                 if args[0] == 0 {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                let luid = EXP_LUID.fetch_add(1, Ordering::Relaxed);
+                let Some(luid) = EXP_LUID.allocate() else {
+                    return 0xC000_0095; // STATUS_INTEGER_OVERFLOW: never reissue a LUID.
+                };
                 if unsafe { !self.xas_write_u64(args[0], luid) } {
                     self.queue_write(args[0], luid);
                 }
