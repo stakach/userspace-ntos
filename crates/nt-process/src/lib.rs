@@ -32,9 +32,11 @@ pub use fresh_hosted_thread::FreshHostedThreadPreparation;
 mod fresh_hosted_thread_tests;
 pub use initial_thread_creation::InitialThreadCreationPlan;
 pub mod native_handle;
+mod native_object_handle_flags;
 pub mod native_handle_search;
 mod native_section_file_source;
 mod native_section_handle;
+pub mod native_alpc_port;
 mod registry_key_handle;
 mod object_directory_handle;
 mod routed_file_handle;
@@ -767,6 +769,23 @@ pub struct KernelProcessExportState<'a> {
     pub job: Option<job::JobId>,
 }
 
+impl KernelProcessExportState<'_> {
+    /// The stable, NUL-terminated `EPROCESS.ImageFileName[16]` value for an ASCII basename.
+    /// The native owner copies these bytes into its EPROCESS body. Non-ASCII names need the
+    /// active ANSI code page, which belongs to NLS rather than the Process Manager.
+    pub fn eprocess_image_file_name(&self) -> Option<[u8; 16]> {
+        let basename = self.image_file_name.rsplit('\\').next()?;
+        if !basename.is_ascii() {
+            return None;
+        }
+        let mut field = [0; 16];
+        let bytes = basename.as_bytes();
+        let len = bytes.len().min(field.len() - 1);
+        field[..len].copy_from_slice(&bytes[..len]);
+        Some(field)
+    }
+}
+
 /// References returned by the Process Manager's EPROCESS delete procedure. Their backing stores
 /// live outside this crate, so the executive releases them after the policy object is no longer
 /// reachable. Job membership is released internally because Ps owns both sides of that relation.
@@ -896,6 +915,14 @@ pub enum HandleObject {
     DebugObject(DebugObjectId),
     /// A Process Manager job object.
     Job(job::JobId),
+    /// A process-owned ALPC listen handle backed by the port service. The
+    /// invocation token and process incarnation remain attached to NtClose.
+    AlpcPort {
+        service_handle: u64,
+        owner_generation: u64,
+        invocation_hi: u64,
+        invocation_lo: u64,
+    },
     /// An object the executive still models ad-hoc (port/event/file/token/key/…) during the
     /// process-hosting convergence — the handle-table entry is real (per-process, closable) even
     /// though the target isn't yet an `nt-process` object. The `u64` is the executive's opaque tag.
@@ -1148,6 +1175,8 @@ pub struct ProcessManager {
     routed_file_publication_identity: u64,
     /// Move-stable owner identity for staged Section handle publication.
     section_publication_identity: u64,
+    /// Move-stable owner identity for exact ALPC port handle publication.
+    alpc_publication_identity: u64,
     processes: IdTable<NtProcess>,
     threads: IdTable<NtThread>,
     /// Withdrawn Ps objects remain owned until their exact cleanup ticket is finished.
@@ -5104,7 +5133,7 @@ impl ProcessManager {
             .enumerate()
             .filter_map(|(slot, entry)| entry.entry().map(|entry| (slot, entry)))
         {
-            if entry.flags.inherit {
+            if entry.flags.inherit && !matches!(entry.object, HandleObject::AlpcPort { .. }) {
                 inherited.push(InheritedHandle {
                     handle: slot_to_handle(slot),
                     object: entry.object,
@@ -5125,6 +5154,7 @@ impl ProcessManager {
         inherited: InheritedHandle,
     ) -> Result<Handle, u32> {
         match inherited.object {
+            HandleObject::AlpcPort { .. } => return Err(STATUS_ACCESS_DENIED),
             HandleObject::Process(target) if !self.processes.contains_key(&target) => {
                 return Err(STATUS_INVALID_HANDLE);
             }
@@ -5205,6 +5235,9 @@ impl ProcessManager {
             .get_mut(slot)
             .and_then(HandleSlot::entry_mut)
             .ok_or(STATUS_INVALID_HANDLE)?;
+        if flags.inherit && matches!(entry.object, HandleObject::AlpcPort { .. }) {
+            return Err(STATUS_ACCESS_DENIED);
+        }
         entry.flags = flags;
         Ok(())
     }
@@ -5336,6 +5369,9 @@ impl ProcessManager {
                 .ok_or(STATUS_INVALID_HANDLE)?;
             (e.object, e.granted_access, e.flags)
         };
+        if matches!(object, HandleObject::AlpcPort { .. }) {
+            return Err(STATUS_ACCESS_DENIED);
+        }
         let new_handle = self.insert_handle(dst_pid, object, desired_access.unwrap_or(access))?;
         self.set_handle_flags(dst_pid, new_handle, flags)?;
         Ok(new_handle)

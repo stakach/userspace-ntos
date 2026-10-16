@@ -361,6 +361,8 @@ pub const OB_SECURITY_DESCRIPTOR_MAX: usize = 1024;
 struct ObjectEntry {
     kind: ObKind,
     body: u64,
+    /// ObjectHandleFlagInformation belongs to the handle, not the shared object body.
+    handle_flags: [u8; 2],
     pointer_count: u32,
     handle_count: u32,
     security_len: usize,
@@ -390,6 +392,7 @@ impl ObjectEntry {
         Self {
             kind,
             body,
+            handle_flags: [0, 0],
             // A published USER object starts with one handle. ObInsertObject consumes the creator
             // reference while establishing that handle, so the initial pointer and handle counts
             // are both one.
@@ -474,6 +477,13 @@ impl ObjectEntry {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct AliasEntry {
+    kind: ObKind,
+    body: u64,
+    handle_flags: [u8; 2],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct NamedDesktopEntry {
     root_body: u64,
     leaf_len: u8,
@@ -522,7 +532,7 @@ pub struct ObHandleTable {
     winsta_handle: u64,
     winsta_body: u64,
     /// USER-object aliases minted for `NtDuplicateObject`, indexed by a high-range external handle.
-    aliases: [Option<(ObKind, u64)>; OB_ALIASES_LEN],
+    aliases: [Option<AliasEntry>; OB_ALIASES_LEN],
     /// Named DESKTOP objects under WINDOWSTATION directories. Real Ob lookup uses the root directory
     /// handle and leaf name; this compact table preserves that semantic without allocating.
     named_desktops: [Option<NamedDesktopEntry>; OB_NAMED_DESKTOPS_LEN],
@@ -672,13 +682,18 @@ impl ObHandleTable {
         if !canonical.transfer_pointer_to_handle() {
             return None;
         }
-        self.aliases[index] = Some((kind, body));
+        self.aliases[index] = Some(AliasEntry {
+            kind,
+            body,
+            handle_flags: [0, 0],
+        });
         Some(OB_ALIAS_HANDLE_BASE + (index as u64) * 4)
     }
 
     /// Create a distinct alias for an existing win32k object.
     pub fn duplicate(&mut self, handle: u64) -> Option<u64> {
         let (kind, body) = self.lookup(handle)?;
+        let handle_flags = self.handle_flags(handle)?;
         let index = self.aliases.iter().position(Option::is_none)?;
         let canonical = self
             .slots
@@ -688,7 +703,11 @@ impl ObHandleTable {
         if !canonical.open_handle() {
             return None;
         }
-        self.aliases[index] = Some((kind, body));
+        self.aliases[index] = Some(AliasEntry {
+            kind,
+            body,
+            handle_flags,
+        });
         Some(OB_ALIAS_HANDLE_BASE + (index as u64) * 4)
     }
 
@@ -698,9 +717,17 @@ impl ObHandleTable {
         let Some(index) = Self::alias_index(handle) else {
             return false;
         };
-        let Some((kind, body)) = self.aliases.get(index).copied().flatten() else {
+        let Some(AliasEntry {
+            kind,
+            body,
+            handle_flags,
+        }) = self.aliases.get(index).copied().flatten()
+        else {
             return false;
         };
+        if handle_flags[1] != 0 {
+            return false;
+        }
         let Some(canonical) = self
             .slots
             .iter_mut()
@@ -720,7 +747,7 @@ impl ObHandleTable {
     /// handle. Only values in the exact canonical or alias ranges can resolve.
     pub fn lookup(&self, handle: u64) -> Option<(ObKind, u64)> {
         if let Some(index) = Self::alias_index(handle) {
-            return self.aliases[index];
+            return self.aliases[index].map(|entry| (entry.kind, entry.body));
         }
         let index = Self::canonical_index(handle)?;
         self.slots
@@ -728,6 +755,40 @@ impl ObHandleTable {
             .copied()
             .flatten()
             .map(ObjectEntry::pair)
+    }
+
+    /// Query exact live USER handle flags (Inherit, ProtectFromClose). Aliases each own flags.
+    pub fn handle_flags(&self, handle: u64) -> Option<[u8; 2]> {
+        if let Some(index) = Self::alias_index(handle) {
+            return self.aliases[index].map(|entry| entry.handle_flags);
+        }
+        let index = Self::canonical_index(handle)?;
+        Some(self.slots.get(index)?.as_ref()?.handle_flags)
+    }
+
+    /// `OBJECT_HANDLE_INFORMATION.HandleAttributes` for one exact live USER handle.
+    pub fn handle_attributes(&self, handle: u64) -> Option<u32> {
+        let [inherit, protect_from_close] = self.handle_flags(handle)?;
+        Some(u32::from(inherit != 0) * 2 | u32::from(protect_from_close != 0))
+    }
+
+    /// Set the two ObjectHandleFlagInformation bytes for the exact live USER handle.
+    pub fn set_handle_flags(&mut self, handle: u64, flags: [u8; 2]) -> bool {
+        if let Some(index) = Self::alias_index(handle) {
+            let Some(entry) = self.aliases[index].as_mut() else {
+                return false;
+            };
+            entry.handle_flags = flags;
+            return true;
+        }
+        let Some(index) = Self::canonical_index(handle) else {
+            return false;
+        };
+        let Some(entry) = self.slots[index].as_mut() else {
+            return false;
+        };
+        entry.handle_flags = flags;
+        true
     }
 
     /// Resolve a handle to its body, or 0 if it is not a registered win32k object handle.
@@ -863,7 +924,7 @@ impl ObHandleTable {
 
     fn canonical_slot_index(&self, handle: u64) -> Option<usize> {
         if let Some(index) = Self::alias_index(handle) {
-            let (kind, body) = self.aliases[index]?;
+            let AliasEntry { kind, body, .. } = self.aliases[index]?;
             return self
                 .slots
                 .iter()
@@ -1372,6 +1433,53 @@ mod tests {
         assert_eq!(t.lookup(original), Some((ObKind::Desktop, 0xD00D_0000)));
         assert!(!t.close(duplicate));
         assert_eq!(t.duplicate(original), Some(duplicate));
+    }
+
+    #[test]
+    fn user_handle_flags_follow_exact_live_handle_not_shared_object_body() {
+        let mut t = ObHandleTable::new();
+        let station = t.register(ObKind::WindowStation, 0x5700_0000);
+        let desktop = t.register(ObKind::Desktop, 0xD00D_0000);
+        let alias = t.duplicate(station).unwrap();
+
+        assert_eq!(t.handle_flags(station), Some([0, 0]));
+        assert_eq!(t.handle_flags(alias), Some([0, 0]));
+        assert!(t.set_handle_flags(station, [1, 0]));
+        assert_eq!(t.handle_flags(station), Some([1, 0]));
+        assert_eq!(t.handle_flags(alias), Some([0, 0]));
+        assert_eq!(t.handle_flags(desktop), Some([0, 0]));
+
+        let inherited = t.duplicate(station).unwrap();
+        assert_eq!(t.handle_flags(inherited), Some([1, 0]));
+        assert!(t.set_handle_flags(alias, [0, 1]));
+        assert_eq!(t.handle_flags(alias), Some([0, 1]));
+        assert_eq!(t.handle_flags(station), Some([1, 0]));
+        assert!(!t.close(alias));
+        assert!(t.set_handle_flags(alias, [0, 0]));
+        assert!(!t.set_handle_flags(OB_HANDLE_BASE + 4 * 31, [1, 1]));
+        assert_eq!(t.handle_flags(OB_ALIAS_HANDLE_BASE + 4 * 31), None);
+
+        assert!(t.close(inherited));
+        assert_eq!(t.handle_flags(inherited), None);
+        assert!(!t.set_handle_flags(inherited, [1, 0]));
+        assert!(t.close(alias));
+        assert_eq!(t.handle_flags(alias), None);
+    }
+
+    #[test]
+    fn user_reference_handle_attributes_project_exact_handle_flags() {
+        let mut table = ObHandleTable::new();
+        let desktop = table.register(ObKind::Desktop, 0xD00D_0000);
+        let alias = table.duplicate(desktop).unwrap();
+
+        assert_eq!(table.handle_attributes(desktop), Some(0));
+        assert_eq!(table.handle_attributes(alias), Some(0));
+        assert!(table.set_handle_flags(desktop, [1, 0]));
+        assert!(table.set_handle_flags(alias, [0, 1]));
+        assert_eq!(table.handle_attributes(desktop), Some(0x2)); // OBJ_INHERIT
+        assert_eq!(table.handle_attributes(alias), Some(0x1)); // OBJ_PROTECT_CLOSE
+        assert_eq!(table.handle_attributes(OB_ALIAS_HANDLE_BASE + 4 * 31), None);
+        assert_eq!(table.handle_attributes(0), None);
     }
 
     #[test]

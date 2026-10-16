@@ -1389,6 +1389,8 @@ pub const W32_PS_OP_RETAIN_POINTER: u64 = 6;
 pub const W32_PS_OP_RELEASE_POINTER: u64 = 7;
 pub const W32_PS_OP_YIELD_EXECUTION: u64 = 8;
 pub const W32_PS_OP_QUERY_OBJECT_KIND: u64 = 9;
+pub const W32_PS_OP_SET_OBJECT_HANDLE_FLAGS: u64 = 10;
+pub const W32_PS_OP_QUERY_OBJECT_HANDLE_FLAGS: u64 = 11;
 /// Bounded global-atom requests. The executive owns the one native atom table; win32k stages only
 /// explicit-length UTF-16 input and receives the resulting 16-bit atom.
 pub const W32_ATOM_LABEL: u64 = 0x77E;
@@ -1397,6 +1399,7 @@ pub const W32_ATOM_OP_ADD_INTEGER: u64 = 2;
 /// Process-scoped `MmSecureVirtualMemory` leases. The executive validates the current client VAD
 /// and owns the opaque lease; win32k receives no mutable MM state or raw executive pointer.
 pub const W32_MM_SECURE_LABEL: u64 = 0x77F;
+pub const W32_MM_QUERY_PAGE_LABEL: u64 = 0x785;
 pub const W32_DEVICE_PROPERTY_LABEL: u64 = 0x780;
 pub const W32_DEVICE_INTERFACES_LABEL: u64 = 0x784;
 pub const W32_DEVICE_POINTER_LABEL: u64 = 0x781;
@@ -4177,6 +4180,7 @@ mod file_read;
 mod file_ioctl;
 pub(crate) mod file_ioctl_target;
 mod file_object_query;
+mod object_handle_flags;
 pub(crate) use object_security::census as object_security_census;
 pub(crate) use object_security::print_assignment_stats as print_object_security_assignment_stats;
 
@@ -4215,6 +4219,13 @@ pub(crate) unsafe fn set_user_object_security_descriptor(handle: u64, descriptor
 /// the host-tested crate, which compares against those static addresses.
 fn classify_type(obj_type: u64) -> Option<ObKind> {
     nt_object_manager::win32k_ob::classify(obj_type)
+}
+
+/// `ObGetObjectType` receives an object body, not a handle. The USER ledger owns both
+/// published window stations/desktops and provisional bodies before `ObInsertObject`.
+/// An unknown or untyped body has no authoritative `OBJECT_TYPE` pointer.
+extern "win64" fn s_ob_get_object_type(object: u64) -> u64 {
+    unsafe { (&*core::ptr::addr_of!(OBJ_TABLE)).object_type_addr_by_body(object) }.unwrap_or(0)
 }
 
 unsafe fn ps_projection_object_type(object: u64) -> Option<u64> {
@@ -7767,6 +7778,7 @@ extern "win64" fn s_ob_reference_object_by_handle(
             }
         }
     };
+    let handle_attributes = table.handle_attributes(handle).unwrap_or(0);
     if unsafe { ps_projection_object_type(obj).is_some() } {
         let (status, _, _, _) =
             unsafe { win32k_ps_broker_call(W32_PS_OP_RETAIN_POINTER, obj, 0) };
@@ -7778,7 +7790,7 @@ extern "win64" fn s_ob_reference_object_by_handle(
     if !handle_info.is_null() {
         unsafe {
             // OBJECT_HANDLE_INFORMATION { ULONG HandleAttributes; ACCESS_MASK GrantedAccess; }
-            write_unaligned(handle_info as *mut u32, 0);
+            write_unaligned(handle_info as *mut u32, handle_attributes);
             write_unaligned(handle_info.add(4) as *mut u32, granted_access);
         }
     }
@@ -8000,13 +8012,14 @@ pub(crate) unsafe fn capture_lpc_wait_request() -> Option<Win32kLpcWaitRequest> 
     request.validate().then_some(request)
 }
 
-/// `LpcRequestWaitReplyPort` parks the physical win32k dispatch while the retained CSR port's
-/// user-mode server processes the request. Nested dispatches are serviced on the same component
-/// stack until the executive resumes this exact generation.
-extern "win64" fn s_lpc_request_wait_reply_port(
+/// Park the physical win32k dispatch while the retained CSR port's user-mode server processes
+/// the request. Nested dispatches run on this component stack until the exact generation resumes.
+fn lpc_request_wait_reply_retained(
     port_object: u64,
     request: *const u8,
     reply: *mut u8,
+    receive_capacity: usize,
+    actual_receive_length: Option<*mut usize>,
 ) -> i32 {
     irql::require_wait(nt_provider_wait::ProviderWaitTimeoutKind::Infinite);
     if port_object == 0
@@ -8069,30 +8082,41 @@ extern "win64" fn s_lpc_request_wait_reply_port(
                     let result_generation =
                         read_volatile((sh + LPC_WAIT_RESULT_GENERATION) as *const u64);
                     core::sync::atomic::compiler_fence(Ordering::Acquire);
-                    if result_generation != generation
-                    {
-                        return 0xC000_0001u32 as i32;
-                    }
-                    let status = read_volatile((sh + LPC_SERVICE_STATUS) as *const i32);
+                    let mut status = if result_generation == generation {
+                        read_volatile((sh + LPC_SERVICE_STATUS) as *const i32)
+                    } else {
+                        0xC000_0001u32 as i32
+                    };
                     if status == 0 {
                         let reply_len =
                             read_volatile((sh + LPC_SERVICE_MESSAGE_LEN) as *const u32) as usize;
-                        if reply_len < nt_lpc_abi::PORT_MESSAGE_HEADER_LEN
-                            || reply_len > nt_lpc_abi::PORT_MESSAGE_MAX_LEN
-                            || nt_lpc_abi::port_message_total_length(
-                                read_volatile((sh + LPC_SERVICE_MESSAGE) as *const u32)
-                                    .to_le_bytes(),
-                            ) != Some(reply_len)
-                            || read_volatile((sh + LPC_SERVICE_MESSAGE + 4) as *const u16)
-                                != nt_lpc_abi::msg_type::LPC_REPLY
-                        {
-                            return STATUS_INVALID_PARAMETER_I32;
+                        if reply_len > nt_lpc_abi::PORT_MESSAGE_MAX_LEN {
+                            status = STATUS_INVALID_PARAMETER_I32;
+                        } else {
+                            let reply_bytes = core::slice::from_raw_parts(
+                                (sh + LPC_SERVICE_MESSAGE) as *const u8,
+                                reply_len,
+                            );
+                            match nt_lpc_abi::kernel_sync_reply_length(reply_bytes, receive_capacity) {
+                                Ok(_) => {
+                                    core::ptr::copy_nonoverlapping(
+                                        (sh + LPC_SERVICE_MESSAGE) as *const u8,
+                                        reply,
+                                        reply_len,
+                                    );
+                                    if let Some(length) = actual_receive_length {
+                                        write_unaligned(length, reply_len);
+                                    }
+                                }
+                                Err(nt_lpc_abi::KernelSyncError::BufferTooSmall) => {
+                                    if let Some(length) = actual_receive_length {
+                                        write_unaligned(length, reply_len);
+                                    }
+                                    status = STATUS_BUFFER_TOO_SMALL_I32;
+                                }
+                                Err(_) => status = STATUS_INVALID_PARAMETER_I32,
+                            }
                         }
-                        core::ptr::copy_nonoverlapping(
-                            (sh + LPC_SERVICE_MESSAGE) as *const u8,
-                            reply,
-                            reply_len,
-                        );
                     }
                     if !restore_user_callback_request_context(wait_context) {
                         return STATUS_INVALID_PARAMETER_I32;
@@ -8111,10 +8135,73 @@ extern "win64" fn s_lpc_request_wait_reply_port(
                     write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut i32, status);
                     outgoing = W32_DISPATCH_LABEL << 12;
                 }
-                _ => return 0xC000_0001u32 as i32,
+                _ => {
+                    let _ = restore_user_callback_request_context(wait_context);
+                    return 0xC000_0001u32 as i32;
+                }
             }
         }
     }
+}
+
+extern "win64" fn s_lpc_request_wait_reply_port(
+    port_object: u64,
+    request: *const u8,
+    reply: *mut u8,
+) -> i32 {
+    lpc_request_wait_reply_retained(
+        port_object,
+        request,
+        reply,
+        nt_lpc_abi::PORT_MESSAGE_MAX_LEN,
+        None,
+    )
+}
+
+/// Pinned LiberNT NDK contract: `(Port, Flags, Send, Receive, BufferLength, Timeout)`.
+/// Only the synchronous retained-port request is admitted by this bridge. Its receive bound is
+/// preserved across the physical wait, and the actual length is published only from the reply.
+extern "win64" fn s_lpc_send_wait_receive_port(
+    port_object: u64,
+    flags: u32,
+    send: *const u8,
+    receive: *mut u8,
+    buffer_length: *mut usize,
+    timeout: *const i64,
+) -> i32 {
+    if port_object == 0
+        || !unsafe { (&*core::ptr::addr_of!(WIN32K_LPC_PORT_REFERENCES)).contains(port_object) }
+    {
+        return STATUS_INVALID_HANDLE_I32;
+    }
+    if send.is_null() || receive.is_null() || buffer_length.is_null() {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    let header = unsafe { read_unaligned(send as *const u32) }.to_le_bytes();
+    let Some(send_length) = nt_lpc_abi::port_message_total_length(header) else {
+        return STATUS_INVALID_PARAMETER_I32;
+    };
+    let receive_capacity = unsafe { read_unaligned(buffer_length) };
+    let request = unsafe { core::slice::from_raw_parts(send, send_length) };
+    match nt_lpc_abi::kernel_sync_send_length(
+        flags,
+        request,
+        receive_capacity,
+        !timeout.is_null(),
+    ) {
+        Ok(_) => {}
+        Err(nt_lpc_abi::KernelSyncError::UnsupportedFlags)
+        | Err(nt_lpc_abi::KernelSyncError::UnsupportedTimeout) => return STATUS_NOT_SUPPORTED_I32,
+        Err(nt_lpc_abi::KernelSyncError::BufferTooSmall) => return STATUS_BUFFER_TOO_SMALL_I32,
+        Err(_) => return STATUS_INVALID_PARAMETER_I32,
+    }
+    lpc_request_wait_reply_retained(
+        port_object,
+        send,
+        receive,
+        receive_capacity,
+        Some(buffer_length),
+    )
 }
 
 extern "win64" fn s_ps_get_process_winsta(process: u64) -> u64 {
@@ -8182,6 +8269,9 @@ extern "win64" fn s_ob_close_handle(handle: u64, _mode: u64) -> i32 {
         };
     }
     let table = unsafe { &mut *core::ptr::addr_of_mut!(OBJ_TABLE) };
+    if table.handle_flags(handle).is_some_and(|flags| flags[1] != 0) {
+        return 0xC000_0235u32 as i32; // STATUS_HANDLE_NOT_CLOSABLE
+    }
     if table.close(handle) || table.lookup(handle).is_some() {
         0
     } else {
@@ -14968,6 +15058,11 @@ fn register_trampolines() -> bool {
         object_security::assign_export as *const () as usize as u64,
     );
     reg.bind("ObCloseHandle", s_ob_close_handle as usize as u64);
+    reg.bind("ObGetObjectType", s_ob_get_object_type as usize as u64);
+    reg.bind(
+        "ObSetHandleAttributes",
+        object_handle_flags::set_handle_attributes as *const () as usize as u64,
+    );
     reg.bind("ObReferenceObject", s_ob_reference_object as usize as u64);
     reg.bind("ObDereferenceObject", s_ob_dereference_object as usize as u64);
     reg.bind("ObfReferenceObject", s_ob_reference_object as usize as u64);
@@ -14998,6 +15093,10 @@ fn register_trampolines() -> bool {
     reg.bind(
         "LpcRequestWaitReplyPort",
         s_lpc_request_wait_reply_port as *const () as usize as u64,
+    );
+    reg.bind(
+        "LpcSendWaitReceivePort",
+        s_lpc_send_wait_receive_port as *const () as usize as u64,
     );
     reg.bind("ZwCreateEvent", s_zw_create_event as usize as u64);
     reg.bind("NtCreateEvent", s_zw_create_event as usize as u64);
@@ -15259,6 +15358,7 @@ fn register_trampolines() -> bool {
     reg.bind("ZwReadFile", file_read::read as *const () as usize as u64);
     reg.bind("ZwDeviceIoControlFile", file_ioctl::device_io_control_file as *const () as usize as u64);
     reg.bind("ZwQueryObject", file_object_query::query_object as *const () as usize as u64);
+    reg.bind("ZwSetInformationObject", object_handle_flags::set_information_object as *const () as usize as u64);
     reg.bind("ZwOpenKey", s_zw_open_key as usize as u64);
     reg.bind("NtOpenKey", s_nt_open_key as usize as u64);
     reg.bind(
@@ -15441,6 +15541,10 @@ fn register_trampolines() -> bool {
     reg.bind(
         "IoGetDeviceInterfaces",
         crate::driver_launch::win32k_device_interfaces::io_get_device_interfaces as *const () as u64,
+    );
+    reg.bind(
+        "MmIsAddressValid",
+        crate::driver_launch::win32k_address_validity::mm_is_address_valid as *const () as u64,
     );
     reg.bind(
         "IoBuildDeviceIoControlRequest",

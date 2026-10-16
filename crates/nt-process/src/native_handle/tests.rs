@@ -35,6 +35,22 @@ fn counts(pm: &ProcessManager, pid: ProcessId, tid: crate::ThreadId) -> (u32, u3
 }
 
 #[test]
+fn alpc_port_handle_cannot_escape_its_exact_service_owner_through_duplicate() {
+    let (mut pm, _user, _kernel, owner, _) = fixture();
+    let other = pm.create_process("other", None, None);
+    let object = HandleObject::AlpcPort {
+        service_handle: 0x4c50_0001,
+        owner_generation: 7,
+        invocation_hi: 11,
+        invocation_lo: 13,
+    };
+    let handle = pm.insert_handle(owner, object, 0).unwrap();
+    assert_eq!(pm.duplicate_handle(owner, handle, other), Err(STATUS_ACCESS_DENIED));
+    assert_eq!(pm.lookup_handle(owner, handle), Some(object));
+    assert_eq!(pm.handle_count(other), 0);
+}
+
+#[test]
 fn strict_native_scope_never_truncates_or_confuses_pseudo_handles() {
     let (pm, user, kernel, pid, _) = fixture();
     assert_eq!(

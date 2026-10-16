@@ -125,6 +125,8 @@ pub(crate) mod device_property;
 pub(crate) mod win32k_device_properties;
 #[path = "win32k_device_interfaces.rs"]
 pub(crate) mod win32k_device_interfaces;
+#[path = "win32k_address_validity.rs"]
+pub(crate) mod win32k_address_validity;
 #[path = "win32k_device_consumer.rs"]
 pub(crate) mod win32k_device_consumer;
 #[path = "win32k_file_owners.rs"]

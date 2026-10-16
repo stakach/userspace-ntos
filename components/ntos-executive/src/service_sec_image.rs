@@ -5105,6 +5105,38 @@ pub(crate) unsafe fn service_win32k_ps_request(
     if logical_caller.is_some() && channel.kernel_caller.is_some() {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
     }
+    if matches!(
+        op,
+        win32k_subsystem::W32_PS_OP_SET_OBJECT_HANDLE_FLAGS
+            | win32k_subsystem::W32_PS_OP_QUERY_OBJECT_HANDLE_FLAGS
+    ) {
+        if (op == win32k_subsystem::W32_PS_OP_SET_OBJECT_HANDLE_FLAGS
+            && value > u16::MAX as u64)
+            || (op == win32k_subsystem::W32_PS_OP_QUERY_OBJECT_HANDLE_FLAGS && value != 0)
+        {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
+        if let Err(status) = provider_ps_projection::authenticated_target(channel) {
+            return (status as i32, 0, 0, 0);
+        }
+        let caller = match provider_registry_caller::resolve(channel) {
+            Ok(caller) => caller,
+            Err(status) => return (status as i32, 0, 0, 0),
+        };
+        if op == win32k_subsystem::W32_PS_OP_QUERY_OBJECT_HANDLE_FLAGS {
+            return match with_provider_process_manager(|pm| {
+                pm.query_native_object_handle_flag_information(caller, object)
+            }) {
+                Ok(encoded) => (0, u16::from_le_bytes(encoded) as u64, 0, 0),
+                Err(status) => (status as i32, 0, 0, 0),
+            };
+        }
+        let encoded = (value as u16).to_le_bytes();
+        let result = with_provider_process_manager(|pm| {
+            pm.set_native_object_handle_flag_information(caller, object, &encoded)
+        });
+        return (result.err().unwrap_or(0) as i32, 0, 0, 0);
+    }
     if let Some(caller) = channel.kernel_caller {
         return kernel_provider_activation::service_ps(channel, caller, op, object, value);
     }

@@ -53,3 +53,32 @@ fn kernel_process_export_state_reads_current_job_ui_restrictions() {
     );
     assert_eq!(manager.job_ui_restrictions(job), Ok(0x1));
 }
+
+#[test]
+fn eprocess_image_file_name_is_bounded_basename_from_exact_process() {
+    let mut manager = ProcessManager::new();
+    let explorer = manager.create_process("\\SystemRoot\\System32\\Explorer.EXE", None, None);
+    let long = manager.create_process("\\Device\\HarddiskVolume1\\verylongprogram.exe", None, None);
+    let unicode = manager.create_process("\\Device\\HarddiskVolume1\\café.exe", None, None);
+
+    let explorer_name = manager
+        .kernel_process_export_state(explorer)
+        .unwrap()
+        .eprocess_image_file_name()
+        .unwrap();
+    assert_eq!(&explorer_name[..13], b"Explorer.EXE\0");
+    assert_eq!(&explorer_name[13..], &[0; 3]);
+
+    let long_name = manager
+        .kernel_process_export_state(long)
+        .unwrap()
+        .eprocess_image_file_name()
+        .unwrap();
+    assert_eq!(&long_name[..15], b"verylongprogram");
+    assert_eq!(long_name[15], 0);
+
+    // The Process Manager does not own the active ANSI code page; a non-ASCII
+    // basename needs conversion by the native NLS owner before publication.
+    assert_eq!(manager.kernel_process_export_state(unicode).unwrap().eprocess_image_file_name(), None);
+    assert!(manager.kernel_process_export_state(u32::MAX).is_none());
+}

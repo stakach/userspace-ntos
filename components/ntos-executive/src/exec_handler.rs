@@ -1251,6 +1251,10 @@ fn trace_handle_object_for(nt: &ExecNtHandler, handle: u64) {
         Some(nt_process::HandleObject::TokenObject(_)) => print_str(b"token-object"),
         Some(nt_process::HandleObject::DebugObject(_)) => print_str(b"debug-object"),
         Some(nt_process::HandleObject::Job(_)) => print_str(b"job"),
+        Some(nt_process::HandleObject::AlpcPort { service_handle, .. }) => {
+            print_str(b"alpc-port service=0x");
+            print_hex_u64(service_handle);
+        }
         None => print_str(b"missing"),
     }
 }
@@ -16736,6 +16740,7 @@ impl ExecNtHandler {
                 }
                 nt_process::HandleObject::DebugObject(_) => b"DebugObject",
                 nt_process::HandleObject::Job(_) => b"Job",
+                nt_process::HandleObject::AlpcPort { .. } => b"ALPC Port",
                 nt_process::HandleObject::Opaque(tag)
                     if tag & SEMAPHORE_HANDLE_TAG_MASK == SEMAPHORE_HANDLE_TAG =>
                 {
@@ -20456,6 +20461,11 @@ impl ExecNtHandler {
             Err(nt_process::STATUS_INVALID_HANDLE) => return Ok(false),
             Err(status) => return Err(status),
         };
+        // A service-owned ALPC port stays in the table until an exact checked
+        // close completes. Generic NtClose cannot silently discard this owner.
+        if matches!(target.object(), nt_process::HandleObject::AlpcPort { .. }) {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
         let cleanup_file = match target.object() {
             nt_process::HandleObject::File(file_id)
             | nt_process::HandleObject::RoutedFile { file_id, .. } => self

@@ -36,10 +36,14 @@ enum Phase {
 enum Delivery {
     NotRequired,
     NeedsCopyout,
+    NeedsPublication,
     Published,
     NeedsClose(u64),
     Closed,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessSlot { Reserved, Published, Aborted }
 
 /// Holds the original Reply capability and checked wire bytes until the exact
 /// CQE is known and a terminal reply is acknowledged. This is a state owner,
@@ -49,9 +53,11 @@ pub struct RetainedCreate {
     owner: CreateOwner,
     token: (u64, u64),
     reply_cap: u64,
+    process_handle: u64,
     request: Vec<u8>,
     phase: Phase,
     delivery: Delivery,
+    process_slot: ProcessSlot,
 }
 
 impl RetainedCreate {
@@ -59,20 +65,23 @@ impl RetainedCreate {
         owner: CreateOwner,
         token: (u64, u64),
         reply_cap: u64,
+        process_handle: u64,
         request: Vec<u8>,
     ) -> Result<Self, RetainedCreateError> {
         if owner.process_id == 0 || owner.thread_id == 0 || owner.process_generation == 0
-            || token == (0, 0) || reply_cap == 0 || request.is_empty()
+            || token == (0, 0) || reply_cap == 0 || process_handle == 0 || request.is_empty()
         {
             return Err(RetainedCreateError::InvalidIdentity);
         }
-        Ok(Self { owner, token, reply_cap, request, phase: Phase::Prepared,
-            delivery: Delivery::NotRequired })
+        Ok(Self { owner, token, reply_cap, process_handle, request,
+            phase: Phase::Prepared, delivery: Delivery::NotRequired,
+            process_slot: ProcessSlot::Reserved })
     }
 
     pub fn owner(&self) -> CreateOwner { self.owner }
     pub fn token(&self) -> (u64, u64) { self.token }
     pub fn reply_cap(&self) -> u64 { self.reply_cap }
+    pub fn process_handle(&self) -> u64 { self.process_handle }
     pub fn request(&self) -> &[u8] { &self.request }
 
     /// Call before offering the SQE; the same ID must be used by the ring.
@@ -124,12 +133,37 @@ impl RetainedCreate {
 
     /// Record the checked write to the original caller's output address. A
     /// failed write leaves the exact service handle owned until close succeeds.
-    pub fn copyout(&mut self, written: bool) -> Result<(), RetainedCreateError> {
-        if self.delivery != Delivery::NeedsCopyout {
+    pub fn copyout(&mut self, handle: u64, written: bool) -> Result<(), RetainedCreateError> {
+        if self.delivery != Delivery::NeedsCopyout || self.process_slot != ProcessSlot::Reserved {
             return Err(RetainedCreateError::WrongPhase);
         }
+        if handle != self.process_handle { return Err(RetainedCreateError::WrongRequest); }
         let Some(result) = self.terminal() else { return Err(RetainedCreateError::WrongPhase) };
-        self.delivery = if written { Delivery::Published } else { Delivery::NeedsClose(result.handle) };
+        self.delivery = if written { Delivery::NeedsPublication } else { Delivery::NeedsClose(result.handle) };
+        Ok(())
+    }
+
+    /// The exact hidden process-table slot became visible after copyout.
+    pub fn process_handle_published(&mut self, handle: u64) -> Result<(), RetainedCreateError> {
+        if self.delivery != Delivery::NeedsPublication || self.process_slot != ProcessSlot::Reserved {
+            return Err(RetainedCreateError::WrongPhase);
+        }
+        if handle != self.process_handle { return Err(RetainedCreateError::WrongRequest); }
+        self.process_slot = ProcessSlot::Published;
+        self.delivery = Delivery::Published;
+        Ok(())
+    }
+
+    /// The exact invisible slot was canceled. If copyout had succeeded but
+    /// publication failed, the service handle still needs checked close.
+    pub fn process_handle_aborted(&mut self, handle: u64) -> Result<(), RetainedCreateError> {
+        if self.process_slot != ProcessSlot::Reserved { return Err(RetainedCreateError::WrongPhase); }
+        if handle != self.process_handle { return Err(RetainedCreateError::WrongRequest); }
+        if matches!(self.delivery, Delivery::NeedsCopyout | Delivery::NeedsPublication) {
+            let Some(result) = self.terminal() else { return Err(RetainedCreateError::WrongPhase) };
+            self.delivery = Delivery::NeedsClose(result.handle);
+        }
+        self.process_slot = ProcessSlot::Aborted;
         Ok(())
     }
 
@@ -153,11 +187,11 @@ impl RetainedCreate {
     /// None means the original Reply is still owned by copyout or cleanup.
     pub fn reply_status(&self) -> Option<i32> {
         let result = self.terminal()?;
-        match self.delivery {
-            Delivery::NotRequired => Some(result.status),
-            Delivery::Published => Some(result.status),
-            Delivery::Closed => Some(0xC000_0005u32 as i32),
-            Delivery::NeedsCopyout | Delivery::NeedsClose(_) => None,
+        match (self.delivery, self.process_slot) {
+            (Delivery::NotRequired, ProcessSlot::Aborted) => Some(result.status),
+            (Delivery::Published, ProcessSlot::Published) => Some(result.status),
+            (Delivery::Closed, ProcessSlot::Aborted) => Some(0xC000_0005u32 as i32),
+            _ => None,
         }
     }
 
@@ -178,7 +212,7 @@ mod tests {
     fn call() -> RetainedCreate {
         RetainedCreate::new(
             CreateOwner { process_id: 4, thread_id: 8, process_generation: 12 },
-            (12, 99), 300, alloc::vec![1, 2, 3],
+            (12, 99), 300, 4, alloc::vec![1, 2, 3],
         ).unwrap()
     }
 
@@ -194,7 +228,8 @@ mod tests {
         let mut call = call.finish_after_reply(true).err().unwrap();
         call.complete(41, 0, 0xabc).unwrap();
         assert_eq!(call.terminal().unwrap().handle, 0xabc);
-        call.copyout(true).unwrap();
+        call.copyout(4, true).unwrap();
+        call.process_handle_published(4).unwrap();
         assert!(call.finish_after_reply(true).is_ok());
     }
 
@@ -216,7 +251,8 @@ mod tests {
         let mut call = call();
         call.begin(41).unwrap();
         call.complete(41, 0, 55).unwrap();
-        call.copyout(true).unwrap();
+        call.copyout(4, true).unwrap();
+        call.process_handle_published(4).unwrap();
         let call = call.finish_after_reply(false).err().unwrap();
         assert_eq!(call.reply_cap(), 300);
         assert_eq!(call.request(), &[1, 2, 3]);
@@ -241,7 +277,8 @@ mod tests {
         let mut call = call();
         call.begin(41).unwrap();
         call.complete(41, 0, 55).unwrap();
-        call.copyout(false).unwrap();
+        call.copyout(4, false).unwrap();
+        call.process_handle_aborted(4).unwrap();
         assert_eq!(call.cleanup_handle(), Some(55));
         assert_eq!(call.cleanup_complete(56, 0), Err(RetainedCreateError::WrongRequest));
         assert_eq!(call.cleanup_complete(55, 0xC000_0001u32 as i32),
@@ -250,5 +287,54 @@ mod tests {
         assert!(call.cleanup_complete(55, 0).is_ok());
         assert_eq!(call.reply_status(), Some(0xC000_0005u32 as i32));
         assert!(call.finish_after_reply(true).is_ok());
+    }
+
+    #[test]
+    fn copied_process_handle_must_be_published_before_success_reply() {
+        let mut call = call();
+        call.begin(41).unwrap();
+        call.complete(41, 0, 55).unwrap();
+        // Service handle 55 is owned by the port service. The value copied to
+        // the caller is a reserved process-table handle, still invisible here.
+        call.copyout(4, true).unwrap();
+        let call = call.finish_after_reply(true).err()
+            .expect("copyout alone cannot publish a process handle");
+        assert_eq!(call.reply_cap(), 300);
+        assert_eq!(call.terminal().unwrap().handle, 55);
+    }
+
+    #[test]
+    fn wrong_or_unpublished_process_handle_never_completes_success() {
+        let mut call = call();
+        call.begin(41).unwrap();
+        call.complete(41, 0, 55).unwrap();
+        assert_eq!(call.copyout(8, true), Err(RetainedCreateError::WrongRequest));
+        call.copyout(4, true).unwrap();
+        assert_eq!(call.process_handle_published(8), Err(RetainedCreateError::WrongRequest));
+        assert_eq!(call.reply_status(), None);
+        call.process_handle_published(4).unwrap();
+        assert_eq!(call.reply_status(), Some(0));
+    }
+
+    #[test]
+    fn failed_service_create_requires_releasing_reserved_process_handle() {
+        let mut call = call();
+        call.begin(41).unwrap();
+        call.complete(41, 0xC000_0035u32 as i32, 0).unwrap();
+        assert_eq!(call.reply_status(), None);
+        call.process_handle_aborted(4).unwrap();
+        assert_eq!(call.reply_status(), Some(0xC000_0035u32 as i32));
+    }
+
+    #[test]
+    fn failed_process_binding_keeps_service_handle_for_checked_close() {
+        let mut call = call();
+        call.begin(41).unwrap();
+        call.complete(41, 0, 55).unwrap();
+        call.process_handle_aborted(4).unwrap();
+        assert_eq!(call.cleanup_handle(), Some(55));
+        assert_eq!(call.reply_status(), None);
+        call.cleanup_complete(55, 0).unwrap();
+        assert_eq!(call.reply_status(), Some(0xC000_0005u32 as i32));
     }
 }

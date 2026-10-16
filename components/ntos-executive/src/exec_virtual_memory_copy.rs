@@ -188,7 +188,7 @@ impl ExecNtHandler {
         self.process_memory_write_status(pi, address, input).is_ok()
     }
 
-    pub(super) unsafe fn process_memory_write_status(
+    pub(crate) unsafe fn process_memory_write_status(
         &mut self,
         pi: usize,
         address: u64,
