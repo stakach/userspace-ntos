@@ -57,6 +57,175 @@ fn enc_create_port(name: &[u16], flags: u32) -> Vec<u8> {
     b
 }
 
+fn enc_checked_create_port(
+    name: &[u16],
+    owner: nt_port_core::ClientId,
+    token: (u64, u64),
+) -> Vec<u8> {
+    let hdr = size_of::<nt_alpc_abi::AlpcCreatePortCheckedRequest>() as u32;
+    let req = nt_alpc_abi::AlpcCreatePortCheckedRequest {
+        create: AlpcCreatePortRequest {
+            abi_size: hdr as u16,
+            max_message_length: 0x1000,
+            name_offset: hdr,
+            name_len_bytes: (name.len() * 2) as u32,
+            ..Default::default()
+        },
+        owner_process: owner.process,
+        owner_thread: owner.thread,
+        owner_generation: 1,
+        invocation_hi: token.0,
+        invocation_lo: token.1,
+    };
+    let mut b = bytes(&req);
+    push_utf16(&mut b, name);
+    b
+}
+
+fn enc_create_lookup(owner: nt_port_core::ClientId, token: (u64, u64)) -> Vec<u8> {
+    bytes(&nt_alpc_abi::AlpcLookupCreatePortRequest {
+        abi_size: size_of::<nt_alpc_abi::AlpcLookupCreatePortRequest>() as u16,
+        owner_process: owner.process,
+        owner_thread: owner.thread,
+        owner_generation: 1,
+        invocation_hi: token.0,
+        invocation_lo: token.1,
+        ..Default::default()
+    })
+}
+
+#[test]
+fn checked_create_reconciles_only_exact_owner_token_and_request() {
+    let mut core = PortCore::new();
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId {
+        process: 7,
+        thread: 11,
+    };
+    let intruder = nt_port_core::ClientId {
+        process: 8,
+        thread: 12,
+    };
+    let name = utf16("\\SmApiPort");
+    let request = enc_checked_create_port(&name, owner, (3, 9));
+    let first = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &request, &mut []);
+    assert_eq!(first.status, SUCCESS);
+    assert_eq!(core.handle_info(first.detail0).unwrap().server_id, owner);
+    let again = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &request, &mut []);
+    assert_eq!(again, first);
+    let found = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_LOOKUP_CREATE_PORT,
+        &enc_create_lookup(owner, (3, 9)),
+        &mut [],
+    );
+    assert_eq!(found, first);
+    let wrong_owner = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_LOOKUP_CREATE_PORT,
+        &enc_create_lookup(intruder, (3, 9)),
+        &mut [],
+    );
+    assert_eq!(
+        wrong_owner.status,
+        nt_status::NtStatus::OBJECT_NAME_COLLISION.0
+    );
+    let mut wrong_generation = enc_create_lookup(owner, (3, 9));
+    wrong_generation[24..32].copy_from_slice(&2u64.to_le_bytes());
+    let wrong_generation = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_LOOKUP_CREATE_PORT,
+        &wrong_generation,
+        &mut [],
+    );
+    assert_eq!(
+        wrong_generation.status,
+        nt_status::NtStatus::OBJECT_NAME_COLLISION.0
+    );
+    let changed_name = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&utf16("\\Other"), owner, (3, 9)),
+        &mut [],
+    );
+    assert_eq!(
+        changed_name.status,
+        nt_status::NtStatus::INVALID_PARAMETER.0
+    );
+    let different_owner = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, intruder, (3, 10)),
+        &mut [],
+    );
+    assert_eq!(
+        different_owner.status,
+        nt_status::NtStatus::OBJECT_NAME_COLLISION.0
+    );
+    let same_owner_new_token = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, owner, (3, 11)),
+        &mut [],
+    );
+    assert_eq!(
+        same_owner_new_token.status,
+        nt_status::NtStatus::OBJECT_NAME_COLLISION.0
+    );
+}
+
+#[test]
+fn checked_create_refuses_zero_token_and_does_not_recreate_closed_result() {
+    let mut core = PortCore::new();
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId {
+        process: 7,
+        thread: 11,
+    };
+    let name = utf16("\\SmApiPort");
+    let invalid = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, owner, (0, 0)),
+        &mut [],
+    );
+    assert_eq!(invalid.status, nt_status::NtStatus::INVALID_PARAMETER.0);
+    let mut truncated = enc_checked_create_port(&name, owner, (1, 2));
+    truncated.truncate(size_of::<AlpcCreatePortRequest>());
+    let invalid = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &truncated, &mut []);
+    assert_eq!(invalid.status, nt_status::NtStatus::INVALID_PARAMETER.0);
+    let mut zero_generation = enc_checked_create_port(&name, owner, (1, 2));
+    // generation sits after the 24-byte prefix and the two 64-bit IDs.
+    zero_generation[40..48].fill(0);
+    let invalid = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_CREATE_PORT,
+        &zero_generation,
+        &mut [],
+    );
+    assert_eq!(invalid.status, nt_status::NtStatus::INVALID_PARAMETER.0);
+    let request = enc_checked_create_port(&name, owner, (1, 2));
+    let first = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &request, &mut []);
+    assert_eq!(first.status, SUCCESS);
+    core.close_port_checked(first.detail0).unwrap();
+    let replay = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &request, &mut []);
+    assert_eq!(replay.status, nt_status::NtStatus::INVALID_HANDLE.0);
+    let found = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_LOOKUP_CREATE_PORT,
+        &enc_create_lookup(owner, (1, 2)),
+        &mut [],
+    );
+    assert_eq!(found.status, nt_status::NtStatus::INVALID_HANDLE.0);
+    let missing = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_LOOKUP_CREATE_PORT,
+        &enc_create_lookup(owner, (1, 3)),
+        &mut [],
+    );
+    assert_eq!(missing.status, nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.0);
+}
+
 fn enc_connect(name: &[u16], subsystem: u32, msg: &[u8]) -> Vec<u8> {
     let hdr = size_of::<AlpcConnectPortRequest>() as u32;
     let name_bytes = (name.len() * 2) as u32;

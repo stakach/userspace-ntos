@@ -203,6 +203,8 @@ pub mod opcode {
     // section's shared backing store (the ALPC big-data / WOW64 mechanism).
     pub const ALPC_OP_WRITE_SECTION_VIEW: u16 = 0x230c;
     pub const ALPC_OP_READ_SECTION_VIEW: u16 = 0x230d;
+    /// Look up the recorded result of one checked port-create invocation.
+    pub const ALPC_OP_LOOKUP_CREATE_PORT: u16 = 0x230e;
 }
 
 /// `AlpcSendReceiveRequest.flags` bits.
@@ -234,6 +236,35 @@ pub struct AlpcCreatePortRequest {
     pub name_offset: u32,
     pub name_len_bytes: u32,
     pub _reserved2: u32,
+}
+
+/// Checked create request. The legacy 24-byte prefix remains valid for existing callers.
+/// A native caller must supply its kernel-authenticated owner and a nonzero, unique token.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AlpcCreatePortCheckedRequest {
+    pub create: AlpcCreatePortRequest,
+    pub owner_process: u64,
+    pub owner_thread: u64,
+    /// Kernel-authenticated process incarnation, not a reusable PID.
+    pub owner_generation: u64,
+    pub invocation_hi: u64,
+    pub invocation_lo: u64,
+}
+
+/// Read the result of a prior checked create. Absence is inconclusive if a ring
+/// submission may still be in flight; callers must not treat it as replay authority.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AlpcLookupCreatePortRequest {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub _reserved2: u32,
+    pub owner_process: u64,
+    pub owner_thread: u64,
+    pub owner_generation: u64,
+    pub invocation_hi: u64,
+    pub invocation_lo: u64,
 }
 
 /// `ALPC_OP_CONNECT_PORT` — connect to a named ALPC port, carrying the connect
@@ -375,6 +406,8 @@ const _: () = {
     assert!(size_of::<AlpcTokenAttr>() == 24);
     // Service wire structs.
     assert!(size_of::<AlpcCreatePortRequest>() == 24);
+    assert!(size_of::<AlpcCreatePortCheckedRequest>() == 64);
+    assert!(size_of::<AlpcLookupCreatePortRequest>() == 48);
     assert!(size_of::<AlpcConnectPortRequest>() == 40);
     assert!(size_of::<AlpcAcceptConnectRequest>() == 24);
     assert!(size_of::<AlpcSendReceiveRequest>() == 40);
