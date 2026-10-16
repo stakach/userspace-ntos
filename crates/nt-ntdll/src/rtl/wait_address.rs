@@ -2,18 +2,23 @@
 //! this table owns the address comparison and FIFO waiter selection in user space.
 
 use core::ptr;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::{NtStatus, STATUS_INVALID_PARAMETER, STATUS_SUCCESS};
 
 const STATUS_ALERTED: NtStatus = 0x0000_0101;
 const BUCKETS: usize = 256;
+const QUEUED: u8 = 0;
+const ALERTING: u8 = 1;
+const ALERTED: u8 = 2;
 
 struct Waiter {
     address: usize,
     thread_id: u64,
     sequence: u64,
     next: *mut Waiter,
+    wake_state: AtomicU8,
+    native_returned: AtomicBool,
 }
 
 struct Bucket {
@@ -100,20 +105,26 @@ impl BucketGuard<'_> {
         false
     }
 
-    /// Remove the oldest waiter for an address and return its thread ID. New waiters can be
-    /// excluded by a sequence snapshot when waking all.
-    unsafe fn take(&self, address: usize, last_sequence: Option<u64>) -> Option<u64> {
+    /// Reserve the oldest eligible waiter. Its stack storage stays linked until native alert
+    /// finishes, or until its owner cleans up after a failed alert.
+    unsafe fn reserve(
+        &self,
+        address: usize,
+        first_sequence: u64,
+        last_sequence: Option<u64>,
+    ) -> Option<*mut Waiter> {
         let mut current = unsafe { *self.0.head.get() };
         while !current.is_null() {
             let selected = unsafe {
                 (*current).address == address
+                    && (*current).sequence > first_sequence
                     && last_sequence.is_none_or(|last| (*current).sequence <= last)
+                    && !(*current).native_returned.load(Ordering::Acquire)
+                    && (*current).wake_state.load(Ordering::Acquire) == QUEUED
             };
             if selected {
-                let thread_id = unsafe { (*current).thread_id };
-                // SAFETY: current was found in this locked queue.
-                unsafe { self.remove(current) };
-                return Some(thread_id);
+                unsafe { (*current).wake_state.store(ALERTING, Ordering::Release) };
+                return Some(current);
             }
             current = unsafe { (*current).next };
         }
@@ -149,7 +160,7 @@ impl AddressWaitTable {
         size: usize,
         thread_id: u64,
         timeout: *const i64,
-        native_wait: impl FnOnce(*const i64) -> NtStatus,
+        mut native_wait: impl FnMut(*const i64) -> NtStatus,
     ) -> NtStatus {
         if !matches!(size, 1 | 2 | 4 | 8)
             || address.is_null()
@@ -164,6 +175,8 @@ impl AddressWaitTable {
             thread_id,
             sequence: 0,
             next: ptr::null_mut(),
+            wake_state: AtomicU8::new(QUEUED),
+            native_returned: AtomicBool::new(false),
         };
         {
             let guard = bucket.lock();
@@ -180,14 +193,31 @@ impl AddressWaitTable {
         }
 
         let status = native_wait(timeout);
-        // A wake may already have removed the entry; address identity is never read from the
-        // entry after it leaves this scope. Cleanup handles timeout and unsupported transports.
-        {
+        // Publish native completion before competing with a wake. If alert was already reserved,
+        // keep this stack waiter alive until its native effect has a known outcome.
+        entry.native_returned.store(true, Ordering::Release);
+        let alerted = loop {
             let guard = bucket.lock();
-            // SAFETY: entry is still live on this stack, and removal is idempotent.
+            let state = entry.wake_state.load(Ordering::Acquire);
+            if state == ALERTING {
+                drop(guard);
+                core::hint::spin_loop();
+                continue;
+            }
+            // SAFETY: entry is live until this cleanup, and a reserved alert has finished.
             unsafe { guard.remove(&mut entry) };
+            break state == ALERTED;
+        };
+        if !alerted {
+            return status;
         }
         if status == STATUS_ALERTED {
+            return STATUS_SUCCESS;
+        }
+        // A timeout can win the native wait just as alert is delivered. Poll once to consume
+        // that synchronous alert before the caller may enter an unrelated thread-alert wait.
+        let zero_timeout = 0i64;
+        if native_wait(&zero_timeout) == STATUS_ALERTED {
             STATUS_SUCCESS
         } else {
             status
@@ -198,13 +228,17 @@ impl AddressWaitTable {
         if address.is_null() {
             return;
         }
-        let thread_id = {
+        let entry = {
             let guard = self.bucket(address as usize).lock();
             // SAFETY: the guard owns the queue links.
-            unsafe { guard.take(address as usize, None) }
+            unsafe { guard.reserve(address as usize, 0, None) }
         };
-        if let Some(thread_id) = thread_id {
-            let _ = alert(thread_id);
+        if let Some(entry) = entry {
+            // SAFETY: the reserved entry remains linked, and its owner waits for ALERTING to end.
+            let status = alert(unsafe { (*entry).thread_id });
+            let guard = self.bucket(address as usize).lock();
+            // SAFETY: the locked queue still retains the reserved stack entry.
+            unsafe { finish_alert(&guard, entry, status) };
         }
     }
 
@@ -218,15 +252,38 @@ impl AddressWaitTable {
             // SAFETY: the guard owns the sequence counter.
             unsafe { *bucket.sequence.get() }
         };
+        let mut last_attempted = 0;
         loop {
-            let thread_id = {
+            let entry = {
                 let guard = bucket.lock();
                 // SAFETY: the guard owns the queue links. The snapshot excludes later arrivals.
-                unsafe { guard.take(address as usize, Some(last_sequence)) }
+                unsafe { guard.reserve(address as usize, last_attempted, Some(last_sequence)) }
             };
-            let Some(thread_id) = thread_id else { break };
-            let _ = alert(thread_id);
+            let Some(entry) = entry else { break };
+            // SAFETY: the reserved entry remains linked until finish_alert.
+            last_attempted = unsafe { (*entry).sequence };
+            let status = alert(unsafe { (*entry).thread_id });
+            let guard = bucket.lock();
+            // SAFETY: the locked queue still retains the reserved stack entry.
+            unsafe { finish_alert(&guard, entry, status) };
         }
+    }
+}
+
+/// # Safety
+/// `entry` is reserved and remains linked in `guard`'s bucket until this call ends.
+unsafe fn finish_alert(guard: &BucketGuard<'_>, entry: *mut Waiter, status: NtStatus) {
+    if status == STATUS_SUCCESS {
+        // SAFETY: success commits this wake while the waiter is still live and linked.
+        unsafe { guard.remove(entry) };
+        unsafe { (*entry).wake_state.store(ALERTED, Ordering::Release) };
+    } else {
+        let returned = unsafe { (*entry).native_returned.load(Ordering::Acquire) };
+        if returned {
+            // SAFETY: a failed alert cannot wake a completed native wait.
+            unsafe { guard.remove(entry) };
+        }
+        unsafe { (*entry).wake_state.store(QUEUED, Ordering::Release) };
     }
 }
 
@@ -340,18 +397,24 @@ mod tests {
             thread_id: 11,
             sequence: 0,
             next: ptr::null_mut(),
+            wake_state: AtomicU8::new(QUEUED),
+            native_returned: AtomicBool::new(false),
         };
         let mut other_address = Waiter {
             address: address + 1,
             thread_id: 12,
             sequence: 0,
             next: ptr::null_mut(),
+            wake_state: AtomicU8::new(QUEUED),
+            native_returned: AtomicBool::new(false),
         };
         let mut second = Waiter {
             address,
             thread_id: 13,
             sequence: 0,
             next: ptr::null_mut(),
+            wake_state: AtomicU8::new(QUEUED),
+            native_returned: AtomicBool::new(false),
         };
         {
             let guard = table.bucket(address).lock();
@@ -385,12 +448,16 @@ mod tests {
             thread_id: 21,
             sequence: 0,
             next: ptr::null_mut(),
+            wake_state: AtomicU8::new(QUEUED),
+            native_returned: AtomicBool::new(false),
         };
         let mut later = Waiter {
             address,
             thread_id: 22,
             sequence: 0,
             next: ptr::null_mut(),
+            wake_state: AtomicU8::new(QUEUED),
+            native_returned: AtomicBool::new(false),
         };
         unsafe { table.bucket(address).lock().push(&mut first) };
         let mut alerted = [0u64; 2];
@@ -408,5 +475,61 @@ mod tests {
             STATUS_SUCCESS
         });
         assert_eq!(alerted, [21, 22]);
+    }
+
+    #[test]
+    fn timeout_after_selected_wake_consumes_alert_before_returning() {
+        let table = AddressWaitTable::new();
+        let value = 0u8;
+        let mut calls = 0;
+        let status = unsafe {
+            table.wait(&value, &value, 1, 88, ptr::null(), |timeout| {
+                calls += 1;
+                if calls == 1 {
+                    table.wake_one(&value, |id| {
+                        assert_eq!(id, 88);
+                        STATUS_SUCCESS
+                    });
+                    0x0000_0102 // The native wait timed out as the alert was delivered.
+                } else {
+                    assert_eq!(unsafe { *timeout }, 0);
+                    STATUS_ALERTED // The zero-time poll consumes the pending alert.
+                }
+            })
+        };
+        assert_eq!(status, STATUS_SUCCESS);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn failed_alert_keeps_waiter_available_for_next_wake() {
+        let table = AddressWaitTable::new();
+        let value = 0u8;
+        let mut attempts = 0;
+        let status = unsafe {
+            table.wait(&value, &value, 1, 89, ptr::null(), |_| {
+                table.wake_one(&value, |id| {
+                    assert_eq!(id, 89);
+                    attempts += 1;
+                    crate::STATUS_INVALID_SYSTEM_SERVICE
+                });
+                table.wake_one(&value, |id| {
+                    assert_eq!(id, 89);
+                    attempts += 1;
+                    STATUS_SUCCESS
+                });
+                STATUS_ALERTED
+            })
+        };
+        assert_eq!(attempts, 2);
+        assert_eq!(status, STATUS_SUCCESS);
+    }
+
+    #[test]
+    fn unrelated_native_alert_is_not_reported_as_address_wake() {
+        let table = AddressWaitTable::new();
+        let value = 0u8;
+        let status = unsafe { table.wait(&value, &value, 1, 90, ptr::null(), |_| STATUS_ALERTED) };
+        assert_eq!(status, STATUS_ALERTED);
     }
 }
