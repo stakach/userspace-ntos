@@ -265,8 +265,8 @@ pub unsafe extern "system" fn rtl_get_locale_file_mapping_address(
     if address.is_null() || lcid.is_null() || size.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    // The native service owns section creation and mapping. Preserve its exact status; callers
-    // index the returned table, so inventing one would make kernelbase read invalid memory.
+    // The ntdll wrapper opens and maps the installed locale file through ordinary native
+    // file/section services. Preserve its exact status; callers index the returned table.
     #[cfg(target_arch = "x86_64")]
     {
         while LOCALE_MAPPING

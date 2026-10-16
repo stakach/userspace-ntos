@@ -55,6 +55,37 @@ macro_rules! native_seh {
 }
 
 macro_rules! define_stub_arity {
+    // `generate_trap_stubs!` forwards name and SSN as opaque `literal` fragments. Match only
+    // the forwarded `ident` (which macro_rules can compare by token) so this special body is
+    // selected even after that forwarding boundary.
+    (nt_initialize_nls_files, $name:literal, $ssn:literal, 3) => {
+        #[cfg(target_arch = "x86_64")]
+        #[export_name = $name]
+        pub unsafe extern "win64" fn nt_initialize_nls_files(
+            address: u64,
+            lcid: u64,
+            size: u64,
+        ) -> u64 {
+            unsafe { crate::nls_file_mapping::initialize_native(address, lcid, size) }
+        }
+    };
+    (nt_get_nls_section_ptr, $name:literal, $ssn:literal, 5) => {
+        #[cfg(target_arch = "x86_64")]
+        #[export_name = $name]
+        pub unsafe extern "win64" fn nt_get_nls_section_ptr(
+            section_type: u64,
+            id: u64,
+            unknown: u64,
+            address: u64,
+            size: u64,
+        ) -> u64 {
+            unsafe {
+                crate::nls_file_mapping::get_section_native(
+                    section_type, id, unknown, address, size,
+                )
+            }
+        }
+    };
     ($fn:ident, $name:literal, $ssn:literal, 0) => {
         define_typed_stub!($fn, $name, $ssn, 0, ());
     };
