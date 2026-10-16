@@ -175,6 +175,8 @@ The cutover is tracked in [issue #310](https://github.com/stakach/userspace-ntos
 
 Run focused crate checks with `cargo test --workspace --locked`. Native integration and QEMU validation share generated artifacts, so run them serially. For a release refresh, update the URL, source revision, and SHA-256 values in the [media manifest](rust-micro/vendor/libernt/manifest.txt), then rerun `./run.sh --build-only` and the desktop acceptance gate. Do not edit the published release binaries.
 
+New images reserve 16 MiB for snapshots and 16 MiB for the SYSTEM registry write-ahead log. Registry mutations append durable records; `NtFlushKey` verifies its durable boundary. Set `PERSIST_IMAGE_MIB=16` to build a legacy snapshot-only image.
+
 ## Updating the kernel
 
 ```sh

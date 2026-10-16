@@ -314,6 +314,17 @@ impl FileSystem {
                 }
             }
         };
+        if let PreparedCreate::Existing { node, information, .. } = &plan {
+            if self.wal_protected_subtree(*node)
+                && (*information != FILE_OPENED || options & FILE_DELETE_ON_CLOSE != 0)
+            {
+                return CreateResult {
+                    status: STATUS_ACCESS_DENIED,
+                    handle: INVALID_HANDLE,
+                    information: 0,
+                };
+            }
+        }
         let (node_id, entry_id, information) = self.volume.apply_create(plan);
         if handle == self.handles.len() {
             self.handles.push(None);

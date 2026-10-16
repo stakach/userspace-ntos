@@ -7,9 +7,25 @@ use nt_memory_manager::SectionMountId;
 type Reserve = SnapshotReserve<AhciSnapshotDevice, SectionMountId>;
 pub(super) type Lease = SnapshotReserveLease<'static, AhciSnapshotDevice, SectionMountId>;
 static mut RESERVE: Option<Reserve> = None;
+
+struct MountedWalContinuation {
+    mount: SectionMountId,
+    token: nt_fs::RegistryWalContinuation,
+}
+
+// This is an in-process accelerator, never a boot recovery authority. Boot always scans the
+// physical WAL and proves paired snapshot headers before installing a fresh continuation.
+static mut WAL_CONTINUATION: Option<MountedWalContinuation> = None;
 pub(super) const BUSY: u32 = 0x8000_0011;
 const SNAPSHOT_SECTORS: u64 = crate::fs_loader::WRITABLE_SNAPSHOT_RESERVE_SECTORS as u64;
 const WAL_SECTORS: u64 = SNAPSHOT_SECTORS;
+
+pub(super) fn wal_bounds(lease: &Lease) -> Result<(u64, u64), u32> {
+    if lease.sector_count() < SNAPSHOT_SECTORS + WAL_SECTORS {
+        return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+    }
+    Ok((SNAPSHOT_SECTORS, WAL_SECTORS))
+}
 
 /// Boot-only publication, before the executable filesystem identity becomes visible. This slot
 /// cannot be replaced; copied Fat32 values elsewhere never grant snapshot device access.
@@ -56,6 +72,68 @@ pub(super) unsafe fn acquire() -> Result<Lease, u32> {
         return Err(nt_fs::STATUS_DEVICE_NOT_READY);
     }
     Ok(lease)
+}
+
+fn checked_mount(lease: &Lease) -> Result<SectionMountId, u32> {
+    let mount = *lease.identity();
+    if Some(mount) != unsafe { crate::fs_loader::exec_fs_mount_identity() } {
+        return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+    }
+    Ok(mount)
+}
+
+/// Publish a typed post-anchor continuation under the same physical mount lease that produced
+/// it. The nt-fs token can only be minted by a completed paired-header anchor update or
+/// completed two-slot empty baseline repair, so its private anchor is the durable header proof;
+/// this cache adds the immutable physical mount binding. Refusal returns the move-only token.
+pub(super) fn install_wal_continuation(
+    lease: &Lease,
+    token: nt_fs::RegistryWalContinuation,
+) -> Result<(), (u32, nt_fs::RegistryWalContinuation)> {
+    let mount = match checked_mount(lease) {
+        Ok(mount) => mount,
+        Err(status) => return Err((status, token)),
+    };
+    let slot = unsafe { &mut *core::ptr::addr_of_mut!(WAL_CONTINUATION) };
+    if slot.is_some() || token.anchor().incarnation == 0 {
+        return Err((nt_fs::STATUS_INVALID_DEVICE_REQUEST, token));
+    }
+    *slot = Some(MountedWalContinuation { mount, token });
+    Ok(())
+}
+
+/// Transfer the continuation only to an owner holding the exact mount lease and paired-header
+/// anchor. Absence or mismatch refuses admission without changing the cached authority.
+pub(super) fn take_wal_continuation(
+    lease: &Lease,
+    expected_anchor: nt_fs::WalSnapshotAnchor,
+) -> Result<nt_fs::RegistryWalContinuation, u32> {
+    let mount = checked_mount(lease)?;
+    let slot = unsafe { &mut *core::ptr::addr_of_mut!(WAL_CONTINUATION) };
+    let Some(cached) = slot.as_ref() else {
+        return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+    };
+    if cached.mount != mount || cached.token.anchor() != expected_anchor {
+        return Err(nt_fs::STATUS_DATA_ERROR);
+    }
+    Ok(slot.take().expect("checked continuation").token)
+}
+
+/// NtFlushKey can prove the current anchored prefix without scanning the WAL again. The caller
+/// must have read and validated the paired-header anchor while holding this lease.
+pub(super) fn peek_wal_continuation(
+    lease: &Lease,
+    expected_anchor: nt_fs::WalSnapshotAnchor,
+) -> Result<(), u32> {
+    let mount = checked_mount(lease)?;
+    let slot = unsafe { &*core::ptr::addr_of!(WAL_CONTINUATION) };
+    let Some(cached) = slot.as_ref() else {
+        return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+    };
+    if cached.mount != mount || cached.token.anchor() != expected_anchor {
+        return Err(nt_fs::STATUS_DATA_ERROR);
+    }
+    Ok(())
 }
 
 pub(super) struct AhciSnapshotDevice {

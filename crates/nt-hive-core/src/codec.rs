@@ -1,6 +1,8 @@
 //! Hive image + log codecs (spec §11-§12). Versioned, checksummed, explicit TLV (never Rust
 //! struct layout), reusing the `nt-config-store` byte primitives + CRC-32C.
 
+use alloc::collections::BTreeMap;
+use alloc::rc::Rc;
 use alloc::vec::Vec;
 
 use nt_config_store::codec::{crc32c, Reader};
@@ -61,6 +63,8 @@ pub enum HiveLogReplayError {
     UnsupportedOperation(u16),
     UnsupportedValueType(u32),
     InvalidPayload,
+    NonAdvancingSequence,
+    SequenceGap,
     OutOfMemory,
     CreateChild(crate::CreateChildError),
 }
@@ -396,10 +400,27 @@ fn put_u64_at(out: &mut [u8], v: u64) {
     out.copy_from_slice(&v.to_le_bytes());
 }
 
-fn compact_cell_id(map: &[(CellId, CellId)], raw: CellId) -> Option<CellId> {
-    map.iter()
-        .find(|(existing, _)| *existing == raw)
-        .map(|(_, mapped)| *mapped)
+fn compact_cell_id(map: &BTreeMap<CellId, CellId>, raw: CellId) -> Option<CellId> {
+    map.get(&raw).copied()
+}
+
+fn intern_decoded_value_data(
+    hive: &mut Hive,
+    index: &mut BTreeMap<(usize, u32), Vec<usize>>,
+    data: Vec<u8>,
+) -> usize {
+    let bucket = index.entry((data.len(), crc32c(&data))).or_default();
+    if let Some(existing) = bucket
+        .iter()
+        .copied()
+        .find(|&existing| hive.value_blobs[existing].as_slice() == data.as_slice())
+    {
+        return existing;
+    }
+    let blob = hive.value_blobs.len();
+    hive.value_blobs.push(Rc::new(data));
+    bucket.push(blob);
+    blob
 }
 
 /// Decode a hive image into a fresh [`Hive`], validating both CRCs + the schema (spec §11).
@@ -437,7 +458,8 @@ pub fn decode_image(bytes: &[u8]) -> Result<Hive, HiveDecodeError> {
     // Rebuild the arena with compact CellIds. Older images can contain REGF cell offsets as
     // CellIds; preserving them would inflate the restored `Vec<Option<Cell>>` into a sparse arena.
     let mut hive = Hive::empty(kind, CellId(0), generation, sequence);
-    let mut id_map: Vec<(CellId, CellId)> = Vec::new();
+    let mut id_map: BTreeMap<CellId, CellId> = BTreeMap::new();
+    let mut blob_index: BTreeMap<(usize, u32), Vec<usize>> = BTreeMap::new();
     let mut next_id = 0u64;
     map_decoded_cell_id(&mut id_map, CellId(root_cell), &mut next_id);
     let mut pr = Reader::new(payload);
@@ -489,7 +511,7 @@ pub fn decode_image(bytes: &[u8]) -> Result<Hive, HiveDecodeError> {
                     return Err(HiveDecodeError::Truncated);
                 };
                 let id = map_decoded_cell_id(&mut id_map, raw_id, &mut next_id);
-                let data_blob = hive.intern_value_data(data);
+                let data_blob = intern_decoded_value_data(&mut hive, &mut blob_index, data);
                 hive.insert_value(ValueCell {
                     id,
                     parent_key,
@@ -805,13 +827,17 @@ pub fn image_value_len_if_valid(
     Ok(0)
 }
 
-fn map_decoded_cell_id(map: &mut Vec<(CellId, CellId)>, raw: CellId, next: &mut u64) -> CellId {
+fn map_decoded_cell_id(
+    map: &mut BTreeMap<CellId, CellId>,
+    raw: CellId,
+    next: &mut u64,
+) -> CellId {
     if let Some(mapped) = compact_cell_id(map, raw) {
         return mapped;
     }
     let mapped = CellId(*next);
     *next = next.saturating_add(1);
-    map.push((raw, mapped));
+    map.insert(raw, mapped);
     mapped
 }
 
@@ -1003,48 +1029,77 @@ pub fn replay_log(hive: &mut Hive, bytes: &[u8], base: u64) -> u64 {
             if apply_log(hive, op, payload).is_err() {
                 break;
             }
+            hive.align_logged_sequence(sequence);
             last = sequence;
         }
     }
     last
 }
 
-/// Replay a persisted journal, rejecting any complete malformed record or payload.
-///
-/// An incomplete final record is the accepted torn-write recovery case and is ignored. Unlike
-/// [`replay_log`], complete bad magic, checksums, headers, operations, types, or payloads are errors.
-pub fn try_replay_log(hive: &mut Hive, bytes: &[u8], base: u64) -> Result<u64, HiveLogReplayError> {
+struct VerifiedLogRecord<'a> {
+    op: u16,
+    sequence: u64,
+    payload: &'a [u8],
+}
+
+fn next_verified_log_record<'a>(
+    bytes: &'a [u8],
+    reader: &mut Reader<'a>,
+) -> Result<Option<VerifiedLogRecord<'a>>, HiveLogReplayError> {
+    if reader.remaining() < LOG_HEADER_LEN {
+        return Ok(None);
+    }
+    let start = bytes.len() - reader.remaining();
+    let magic = reader.blob_fixed::<4>().ok_or(HiveLogReplayError::Truncated)?;
+    if magic != LOG_MAGIC {
+        return Err(HiveLogReplayError::BadMagic);
+    }
+    let header_size = reader.u16().ok_or(HiveLogReplayError::Truncated)?;
+    let op = reader.u16().ok_or(HiveLogReplayError::Truncated)?;
+    let sequence = reader.u64().ok_or(HiveLogReplayError::Truncated)?;
+    let payload_len = reader.u32().ok_or(HiveLogReplayError::Truncated)? as usize;
+    let payload_crc = reader.u32().ok_or(HiveLogReplayError::Truncated)?;
+    let record_crc = reader.u32().ok_or(HiveLogReplayError::Truncated)?;
+    if header_size as usize != LOG_HEADER_LEN {
+        return Err(HiveLogReplayError::UnsupportedHeader);
+    }
+    let header = bytes
+        .get(start..start + LOG_HEADER_LEN)
+        .ok_or(HiveLogReplayError::Truncated)?;
+    if crc32c(&header[..LOG_HEADER_LEN - 4]) != record_crc {
+        return Err(HiveLogReplayError::BadChecksum);
+    }
+    let Some(payload) = reader.take_slice(payload_len) else {
+        return Ok(None);
+    };
+    if crc32c(payload) != payload_crc {
+        return Err(HiveLogReplayError::BadChecksum);
+    }
+    Ok(Some(VerifiedLogRecord { op, sequence, payload }))
+}
+
+fn try_replay_log_with_tail_policy(
+    hive: &mut Hive,
+    bytes: &[u8],
+    base: u64,
+    allow_torn_tail: bool,
+) -> Result<u64, HiveLogReplayError> {
     let mut r = Reader::new(bytes);
     let mut last = base;
     while !r.is_empty() {
-        if r.remaining() < LOG_HEADER_LEN {
-            break;
-        }
-        let start = bytes.len() - r.remaining();
-        let magic = r.blob_fixed::<4>().ok_or(HiveLogReplayError::Truncated)?;
-        if magic != LOG_MAGIC {
-            return Err(HiveLogReplayError::BadMagic);
-        }
-        let header_size = r.u16().ok_or(HiveLogReplayError::Truncated)?;
-        let op = r.u16().ok_or(HiveLogReplayError::Truncated)?;
-        let sequence = r.u64().ok_or(HiveLogReplayError::Truncated)?;
-        let payload_len = r.u32().ok_or(HiveLogReplayError::Truncated)? as usize;
-        let payload_crc = r.u32().ok_or(HiveLogReplayError::Truncated)?;
-        let record_crc = r.u32().ok_or(HiveLogReplayError::Truncated)?;
-        if header_size as usize != LOG_HEADER_LEN {
-            return Err(HiveLogReplayError::UnsupportedHeader);
-        }
-        let header = bytes
-            .get(start..start + LOG_HEADER_LEN)
-            .ok_or(HiveLogReplayError::Truncated)?;
-        if crc32c(&header[..LOG_HEADER_LEN - 4]) != record_crc {
-            return Err(HiveLogReplayError::BadChecksum);
-        }
-        let Some(payload) = r.take_slice(payload_len) else {
-            break;
+        let Some(VerifiedLogRecord { op, sequence, payload }) =
+            next_verified_log_record(bytes, &mut r)?
+        else {
+            if allow_torn_tail { break; }
+            return Err(HiveLogReplayError::Truncated);
         };
-        if crc32c(payload) != payload_crc {
-            return Err(HiveLogReplayError::BadChecksum);
+        if !allow_torn_tail {
+            if sequence <= last {
+                return Err(HiveLogReplayError::NonAdvancingSequence);
+            }
+            if last.checked_add(1) != Some(sequence) {
+                return Err(HiveLogReplayError::SequenceGap);
+            }
         }
         // Child application validates and owns all metadata before mutation. Avoid decoding it
         // twice, but still validate skipped records so strict replay rejects malformed history.
@@ -1053,10 +1108,101 @@ pub fn try_replay_log(hive: &mut Hive, bytes: &[u8], base: u64) -> Result<u64, H
         }
         if sequence > last {
             apply_log(hive, op, payload)?;
+            hive.align_logged_sequence(sequence);
             last = sequence;
         }
     }
     Ok(last)
+}
+
+/// Replay a persisted journal, rejecting complete malformed records while accepting an incomplete
+/// final record from a torn write. WAL payloads use [`try_replay_log_complete`] instead.
+pub fn try_replay_log(hive: &mut Hive, bytes: &[u8], base: u64) -> Result<u64, HiveLogReplayError> {
+    try_replay_log_with_tail_policy(hive, bytes, base, true)
+}
+
+/// Replay an acknowledged WAL payload. Every byte must belong to a complete semantic record,
+/// and each sequence must be exactly one greater than the preceding sequence.
+pub fn try_replay_log_complete(
+    hive: &mut Hive,
+    bytes: &[u8],
+    base: u64,
+) -> Result<u64, HiveLogReplayError> {
+    if bytes.is_empty() {
+        return Err(HiveLogReplayError::InvalidPayload);
+    }
+    try_replay_log_with_tail_policy(hive, bytes, base, false)
+}
+
+/// Validate one committed WAL payload before concatenating it with a snapshot journal. This
+/// checks every record boundary, checksum, payload shape and contiguous sequence.
+pub fn complete_log_sequence_span(bytes: &[u8]) -> Result<(u64, u64), HiveLogReplayError> {
+    complete_log_sequence_span_inner(bytes, None)
+}
+
+/// Validate a committed payload against the final sequence of the previous WAL frame.
+pub fn complete_log_sequence_span_from(
+    bytes: &[u8],
+    previous_sequence: u64,
+) -> Result<(u64, u64), HiveLogReplayError> {
+    complete_log_sequence_span_inner(bytes, Some(previous_sequence))
+}
+
+/// Admit the first typed WAL append after a primary image and its existing sidecar.
+///
+/// A primary checkpoint may have reached disk before the old sidecar was truncated. Complete
+/// records already covered by that newer primary are harmless, as are complete duplicate records
+/// left by the legacy writer. Every newly advancing record must bridge the primary sequence
+/// exactly. A torn sidecar cannot become an interior tail once a durable WAL record follows it.
+pub fn validate_first_hive_wal_append(
+    primary_sequence: u64,
+    sidecar: &[u8],
+    candidate: &[u8],
+) -> Result<u64, HiveLogReplayError> {
+    let mut previous = primary_sequence;
+    let mut reader = Reader::new(sidecar);
+    while !reader.is_empty() {
+        let Some(record) = next_verified_log_record(sidecar, &mut reader)? else {
+            return Err(HiveLogReplayError::Truncated);
+        };
+        validate_log_payload(record.op, record.payload)?;
+        if record.sequence > previous {
+            if previous.checked_add(1) != Some(record.sequence) {
+                return Err(HiveLogReplayError::SequenceGap);
+            }
+            previous = record.sequence;
+        }
+    }
+    complete_log_sequence_span_from(candidate, previous).map(|(_, last)| last)
+}
+
+fn complete_log_sequence_span_inner(
+    bytes: &[u8],
+    previous_sequence: Option<u64>,
+) -> Result<(u64, u64), HiveLogReplayError> {
+    let mut reader = Reader::new(bytes);
+    let mut first = None;
+    let mut last = previous_sequence;
+    while !reader.is_empty() {
+        let Some(record) = next_verified_log_record(bytes, &mut reader)? else {
+            return Err(HiveLogReplayError::Truncated);
+        };
+        validate_log_payload(record.op, record.payload)?;
+        if let Some(previous) = last {
+            if record.sequence <= previous {
+                return Err(HiveLogReplayError::NonAdvancingSequence);
+            }
+            if previous.checked_add(1) != Some(record.sequence) {
+                return Err(HiveLogReplayError::SequenceGap);
+            }
+        }
+        first.get_or_insert(record.sequence);
+        last = Some(record.sequence);
+    }
+    match (first, last) {
+        (Some(first), Some(last)) => Ok((first, last)),
+        _ => Err(HiveLogReplayError::InvalidPayload),
+    }
 }
 
 fn validate_log_payload(op: u16, payload: &[u8]) -> Result<(), HiveLogReplayError> {

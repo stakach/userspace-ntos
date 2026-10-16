@@ -457,11 +457,13 @@ impl<C> SystemHiveMutationPreparation<C> {
         if self.phase != CmMutationPreparationPhase::Prepared || self.is_inflight() {
             return Err(STATUS_INVALID_PARAMETER);
         }
+        let storage_nonce = crate::mutation_commit::next_storage_nonce();
         let upload = self.upload.take().expect("retained preparation owner");
         self.phase = CmMutationPreparationPhase::Taken;
         Ok((
             PreparedSystemHiveMutation {
                 mount: upload.mount,
+                storage_nonce,
                 expected_generation: upload.expected_generation,
                 next_generation: upload
                     .expected_generation

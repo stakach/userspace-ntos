@@ -40470,6 +40470,7 @@ unsafe fn retain_hosted_relation_query_barrier(
         acpi_pci_scope_sources: Vec::new(),
         acpi_pci_link_candidates: Vec::new(),
         acpi_pci_catalog_update: None,
+        publication: None,
     });
 }
 
@@ -42040,6 +42041,7 @@ include!("hosted_acpi_pci_relation.rs");
 include!("hosted_acpi_pci_routes.rs");
 include!("hosted_acpi_pci_route_filters.rs");
 include!("hosted_acpi_pci_route_links.rs");
+include!("hosted_relation_publication.rs");
 
 fn hosted_relation_error_from_config(status: i32) -> HostedRelationPublishError {
     let raw_status = status as u32;
@@ -42531,250 +42533,242 @@ unsafe fn build_hosted_relation_mutations(
 }
 
 unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishError> {
-    let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
-    let mount_identity = crate::LIVE_CONFIG_MANAGER_SYSTEM_MOUNT
-        .ok_or(HostedRelationPublishError::Retry)?
-        .identity_token();
-    let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
-        .as_ref()
-        .ok_or(HostedRelationPublishError::Barrier(
-            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-        ))?;
-    let bus_object_id = query.claim.pdo_device_id;
-    let claim = query.claim;
-    if !hosted_device_relation_owner_is_current(query.relation_owner) {
-        return Err(HostedRelationPublishError::Barrier(
-            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-        ));
-    }
-    let relation_owner = hosted_acpi_pci_relation_owner_endpoint().ok_or(
-        HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
-    )?;
-    let relation_domain = query
-        .relation_domain
-        .ok_or(HostedRelationPublishError::Barrier(
-            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-        ))?;
-    if query.reported_children.len() != query.child_pdo_objects.len()
-        || query.reported_children.len() != query.child_properties.len()
-        || query
-            .child_properties
-            .iter()
-            .any(|properties| properties.acpi_namespace == HostedAcpiNamespaceState::Unqueried)
-        || (!query.acpi_pci_scope_sources.is_empty() && query.acpi_pci_catalog_update.is_none())
-        || (!query.acpi_pci_link_candidates.is_empty() && query.acpi_pci_catalog_update.is_none())
-        || query
-            .reported_children
-            .iter()
-            .zip(&query.child_pdo_objects)
-            .any(|(child, raw_pdo)| {
-                io_manager_mut().hosted_device_by_identity(relation_domain, *raw_pdo)
-                    != Some(nt_io_manager::DeviceId(child.pdo_object_id))
-                    || io_manager_mut()
-                        .device(nt_io_manager::DeviceId(child.pdo_object_id))
-                        .is_none_or(|device| device.delete_pending)
-            })
+    if (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_ref().and_then(|query| query.publication.as_ref()).is_none()
     {
-        return Err(HostedRelationPublishError::Barrier(
-            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-        ));
-    }
-
-    seed_hosted_bus_relation_baseline(
-        expected_generation,
-        bus_object_id,
-        &query.reported_children,
-    )?;
-    let prepared = hosted_bus_relations_mut()
-        .prepare_bus_relations(bus_object_id, &query.reported_children)
-        .map_err(hosted_relation_error_from_pnp)?;
-    let parent_relation = hosted_pnp_manager_mut()
-        .claim_started_parent_relation(bus_object_id, prepared.relation_identity())
-        .map_err(hosted_relation_error_from_devnode_pnp)?;
-    if parent_relation.parent() != claim.parent {
-        return Err(HostedRelationPublishError::Barrier(
-            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-        ));
-    }
-    let prepared_devnodes = prepare_hosted_relation_devnodes(
-        &query.reported_children,
-        &query.child_properties,
-        parent_relation,
-    )?;
-
-    let mut policies = Vec::new();
-    let mut existing = Vec::new();
-    policies
-        .try_reserve_exact(prepared.changes().len())
-        .map_err(|_| HostedRelationPublishError::Retry)?;
-    existing
-        .try_reserve_exact(prepared.changes().len())
-        .map_err(|_| HostedRelationPublishError::Retry)?;
-    for change in prepared.changes() {
-        let enum_path = hosted_relation_enum_path(&change.child)?;
-        policies.push(
-            if change.kind == nt_pnp_manager::BusRelationChangeKind::Removal {
-                None
-            } else {
-                resolve_hosted_relation_policy(expected_generation, &change.child)?
-            },
-        );
-        existing.push(existing_hosted_relation_values(
-            expected_generation,
-            change,
-            &enum_path,
-        )?);
-    }
-
-    if crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) != expected_generation {
-        return Err(HostedRelationPublishError::Retry);
-    }
-
-    let mut critical_starts = Vec::new();
-    critical_starts
-        .try_reserve_exact(query.reported_children.len())
-        .map_err(|_| HostedRelationPublishError::Retry)?;
-    for child in &query.reported_children {
-        if resolve_hosted_relation_policy(expected_generation, child)?
+        // Classify the lazy mount before retaining provider resources or entering CM.
+        crate::writable_fs::ensure_mounted()
+            .map_err(|status| hosted_relation_error_from_config(status as i32))?;
+        let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+        let mount_identity = crate::LIVE_CONFIG_MANAGER_SYSTEM_MOUNT
+            .ok_or(HostedRelationPublishError::Retry)?
+            .identity_token();
+        let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
             .as_ref()
-            .is_some_and(|policy| policy.service_name.is_some())
-        {
-            critical_starts.push((child.pdo_object_id, hosted_relation_instance_path(child)?));
-        }
-    }
-    hosted_critical_child_starts_mut()
-        .reserve_capacity(critical_starts.len())
-        .map_err(|_| HostedRelationPublishError::Retry)?;
-
-    let mutations = build_hosted_relation_mutations(
-        &prepared,
-        &policies,
-        &existing,
-        &query.reported_children,
-        &query.child_properties,
-    )?;
-    let mut providers = Vec::new();
-    providers
-        .try_reserve_exact(query.reported_children.len())
-        .map_err(|_| HostedRelationPublishError::Retry)?;
-    for (child, &raw_pdo) in query.reported_children.iter().zip(&query.child_pdo_objects) {
-        let registration = io_manager_mut()
-            .hosted_device_pointer_registration(relation_domain, raw_pdo)
-            .filter(|registration| registration.device_id().raw() == child.pdo_object_id)
             .ok_or(HostedRelationPublishError::Barrier(
                 nt_status::NtStatus::INVALID_DEVICE_REQUEST,
             ))?;
-        providers.push((child.pdo_object_id, registration));
-    }
-    let provider_batch = match hosted_accepted_pdo_provider_catalog().prepare_relation(
-        io_manager_mut(),
-        parent_relation,
-        &providers,
-    ) {
-        Ok(batch) => batch,
-        Err(failure) => {
-            let error = failure.error();
-            failure
-                .into_rollback()
-                .abort(io_manager_mut())
-                .unwrap_or_else(|_| panic!("accepted PDO provider preparation rollback uncertain"));
-            return Err(match error {
-                nt_pnp_manager::AcceptedPdoProviderError::InsufficientResources => {
-                    HostedRelationPublishError::Retry
-                }
-                _ => {
-                    HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
-                }
-            });
+        let bus_object_id = query.claim.pdo_device_id;
+        let claim = query.claim;
+        if !hosted_device_relation_owner_is_current(query.relation_owner) {
+            return Err(HostedRelationPublishError::Barrier(
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            ));
         }
-    };
-    if !mutations.is_empty() {
-        let client_mutations: Vec<_> = mutations
-            .iter()
-            .map(HostedRelationRegistryMutation::as_client_mutation)
-            .collect();
-        let outcome = match crate::persist_and_publish_system_hive_mutation(
+        let relation_owner = hosted_acpi_pci_relation_owner_endpoint().ok_or(
+            HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+        )?;
+        let relation_domain = query
+            .relation_domain
+            .ok_or(HostedRelationPublishError::Barrier(
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            ))?;
+        if query.reported_children.len() != query.child_pdo_objects.len()
+            || query.reported_children.len() != query.child_properties.len()
+            || query
+                .child_properties
+                .iter()
+                .any(|properties| properties.acpi_namespace == HostedAcpiNamespaceState::Unqueried)
+            || (!query.acpi_pci_scope_sources.is_empty() && query.acpi_pci_catalog_update.is_none())
+            || (!query.acpi_pci_link_candidates.is_empty() && query.acpi_pci_catalog_update.is_none())
+            || query
+                .reported_children
+                .iter()
+                .zip(&query.child_pdo_objects)
+                .any(|(child, raw_pdo)| {
+                    io_manager_mut().hosted_device_by_identity(relation_domain, *raw_pdo)
+                        != Some(nt_io_manager::DeviceId(child.pdo_object_id))
+                        || io_manager_mut()
+                            .device(nt_io_manager::DeviceId(child.pdo_object_id))
+                            .is_none_or(|device| device.delete_pending)
+                })
+        {
+            return Err(HostedRelationPublishError::Barrier(
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            ));
+        }
+
+        seed_hosted_bus_relation_baseline(
             expected_generation,
-            &client_mutations,
+            bus_object_id,
+            &query.reported_children,
+        )?;
+        let prepared = hosted_bus_relations_mut()
+            .prepare_bus_relations(bus_object_id, &query.reported_children)
+            .map_err(hosted_relation_error_from_pnp)?;
+        let parent_relation = hosted_pnp_manager_mut()
+            .claim_started_parent_relation(bus_object_id, prepared.relation_identity())
+            .map_err(hosted_relation_error_from_devnode_pnp)?;
+        if parent_relation.parent() != claim.parent {
+            return Err(HostedRelationPublishError::Barrier(
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            ));
+        }
+        let prepared_devnodes = prepare_hosted_relation_devnodes(
+            &query.reported_children,
+            &query.child_properties,
+            parent_relation,
+        )?;
+
+        let mut policies = Vec::new();
+        let mut existing = Vec::new();
+        policies
+            .try_reserve_exact(prepared.changes().len())
+            .map_err(|_| HostedRelationPublishError::Retry)?;
+        existing
+            .try_reserve_exact(prepared.changes().len())
+            .map_err(|_| HostedRelationPublishError::Retry)?;
+        for change in prepared.changes() {
+            let enum_path = hosted_relation_enum_path(&change.child)?;
+            policies.push(
+                if change.kind == nt_pnp_manager::BusRelationChangeKind::Removal {
+                    None
+                } else {
+                    resolve_hosted_relation_policy(expected_generation, &change.child)?
+                },
+            );
+            existing.push(existing_hosted_relation_values(
+                expected_generation,
+                change,
+                &enum_path,
+            )?);
+        }
+
+        if crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) != expected_generation {
+            return Err(HostedRelationPublishError::Retry);
+        }
+
+        let mut critical_starts = Vec::new();
+        critical_starts
+            .try_reserve_exact(query.reported_children.len())
+            .map_err(|_| HostedRelationPublishError::Retry)?;
+        for child in &query.reported_children {
+            if resolve_hosted_relation_policy(expected_generation, child)?
+                .as_ref()
+                .is_some_and(|policy| policy.service_name.is_some())
+            {
+                critical_starts.push((child.pdo_object_id, hosted_relation_instance_path(child)?));
+            }
+        }
+        hosted_critical_child_starts_mut()
+            .reserve_capacity(critical_starts.len())
+            .map_err(|_| HostedRelationPublishError::Retry)?;
+
+        let mutations = build_hosted_relation_mutations(
+            &prepared,
+            &policies,
+            &existing,
+            &query.reported_children,
+            &query.child_properties,
+        )?;
+        let mut providers = Vec::new();
+        providers
+            .try_reserve_exact(query.reported_children.len())
+            .map_err(|_| HostedRelationPublishError::Retry)?;
+        for (child, &raw_pdo) in query.reported_children.iter().zip(&query.child_pdo_objects) {
+            let registration = io_manager_mut()
+                .hosted_device_pointer_registration(relation_domain, raw_pdo)
+                .filter(|registration| registration.device_id().raw() == child.pdo_object_id)
+                .ok_or(HostedRelationPublishError::Barrier(
+                    nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                ))?;
+            providers.push((child.pdo_object_id, registration));
+        }
+        let provider_batch = match hosted_accepted_pdo_provider_catalog().prepare_relation(
+            io_manager_mut(),
+            parent_relation,
+            &providers,
         ) {
-            Ok(outcome) => outcome,
-            Err(status) => {
-                provider_batch
+            Ok(batch) => batch,
+            Err(failure) => {
+                let error = failure.error();
+                failure
+                    .into_rollback()
                     .abort(io_manager_mut())
-                    .unwrap_or_else(|_| panic!("accepted PDO provider rollback uncertain"));
-                return Err(hosted_relation_error_from_config(status as i32));
+                    .unwrap_or_else(|_| panic!("accepted PDO provider preparation rollback uncertain"));
+                return Err(match error {
+                    nt_pnp_manager::AcceptedPdoProviderError::InsufficientResources => {
+                        HostedRelationPublishError::Retry
+                    }
+                    _ => {
+                        HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+                    }
+                });
             }
         };
-        if outcome.wake_device_action {
-            crate::config_manager_request_device_action_wake();
+
+        let (phase, attempt) = if mutations.is_empty() {
+            (HostedRelationPublicationPhase::PostCommitRepair, None)
+        } else {
+            let client_mutations: Vec<_> = mutations.iter()
+                .map(HostedRelationRegistryMutation::as_client_mutation).collect();
+            let mount = crate::LIVE_CONFIG_MANAGER_SYSTEM_MOUNT
+                .expect("validated SYSTEM mount disappeared before relation BEGIN");
+            match reserve_relation_mutation_begin(mount, expected_generation, &client_mutations) {
+                Ok(attempt) => (HostedRelationPublicationPhase::Begin, Some(attempt)),
+                Err((status, ())) => {
+                    provider_batch.abort(io_manager_mut())
+                        .expect("unsubmitted accepted PDO provider batch");
+                    return Err(hosted_relation_error_from_config(status));
+                }
+            }
+        };
+        let children = query.reported_children.len();
+        let catalog_update = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+            .as_mut().expect("relation query during publication admission")
+            .acpi_pci_catalog_update.take();
+        let owner = HostedRelationPublication {
+            claim, relation_owner, parent_relation, mount_identity,
+            children,
+            bus_lease: None,
+            original_changes: None,
+            after_bus_lease: phase,
+            reported_children: query.reported_children.clone(),
+            child_properties: query.child_properties.clone(),
+            providers,
+            catalog_sources: query.acpi_pci_scope_sources.clone(),
+            catalog_link_candidates: query.acpi_pci_link_candidates.clone(),
+            prepared_relations: Some(prepared),
+            prepared_devnodes: Some(prepared_devnodes),
+            provider_batch: Some(provider_batch),
+            critical_starts, critical_start_index: 0,
+            catalog_update, pci_catalog_published: false,
+            invalidation_completion: None, route_reconciliation_ready: None,
+            _mutations: mutations, attempt, preparation: None, prepared: None,
+            persistence: crate::registry_mutation_work::MutationPersistence::new(),
+            receipt: None, acknowledgement: None,
+            abort_receipt: None, abort_acknowledgement: None,
+            phase: HostedRelationPublicationPhase::AcquireBusLease,
+            commit_entered: false,
+            preparation_refused: false,
+            refusal: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        };
+        let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+            .as_mut().expect("relation query before first CM exchange");
+        query.publication = Some(owner);
+    }
+    let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_mut().expect("retained relation publication");
+    let publication = query.publication.as_mut().expect("installed relation publication");
+    match advance_hosted_relation_publication(publication) {
+        HostedRelationPublicationProgress::Pending => {
+            Err(HostedRelationPublishError::Retry)
+        }
+        HostedRelationPublicationProgress::Refused(status) => {
+            Err(HostedRelationPublishError::Barrier(status))
+        }
+        HostedRelationPublicationProgress::Published => {
+            let ready = publication.route_reconciliation_ready.unwrap_or(false);
+            print_str(b"[pnp-relations] committed children/critical-starts=");
+            print_u64(publication.children as u64);
+            print_str(b"/");
+            print_u64(publication.critical_starts.len() as u64);
+            print_str(b"\n");
+            *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY) = None;
+            if ready { let _ = start_hosted_acpi_pci_route_query(); }
+            Ok(())
         }
     }
-
-    if !hosted_pnp_manager_mut().relation_parent_is_started(parent_relation) {
-        provider_batch
-            .abort(io_manager_mut())
-            .unwrap_or_else(|_| panic!("accepted PDO provider rollback uncertain"));
-        return Err(HostedRelationPublishError::Barrier(
-            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-        ));
-    }
-    hosted_pnp_manager_mut()
-        .commit_enumerated_pdo_batch(prepared_devnodes)
-        .expect("published CM relation transaction invalidated its prepared PnP devnodes");
-    hosted_bus_relations_mut()
-        .commit_bus_relations(prepared)
-        .expect("published CM relation transaction became stale before PnP commit");
-    hosted_accepted_pdo_provider_catalog()
-        .commit_relation(
-            hosted_pnp_manager_mut(),
-            hosted_bus_relations(),
-            io_manager_mut(),
-            provider_batch,
-        )
-        .unwrap_or_else(|_| panic!("committed bus relation lost its exact PDO provider batch"));
-    print_str(b"[pnp-relations] committed children/critical-starts=");
-    print_u64(query.reported_children.len() as u64);
-    print_str(b"/");
-    print_u64(critical_starts.len() as u64);
-    print_str(b"\n");
-    for (pdo, instance_id) in critical_starts {
-        hosted_critical_child_starts_mut()
-            .reserve_committed_owned(
-                hosted_pnp_manager_mut(),
-                hosted_bus_relations(),
-                mount_identity,
-                pdo,
-                instance_id,
-            )
-            .expect("committed critical child lost its pre-reserved START owner");
-    }
-    let catalog_update = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
-        .as_mut()
-        .and_then(|query| query.acpi_pci_catalog_update.take());
-    let pci_catalog_published = catalog_update.is_some();
-    if let Some(catalog_update) = catalog_update {
-        crate::hosted_pci_topology::commit_hosted_acpi_pci_relation_sources(catalog_update)
-            .expect("serialized ACPI PCI catalog preparation became stale before relation commit");
-    }
-    let invalidation_completion = hosted_device_relation_invalidations_mut()
-        .complete_terminal(claim, nt_status::NtStatus::SUCCESS)
-        .expect("published relation transaction lost its exact invalidation claim");
-    remove_hosted_device_relation_owner(claim);
-    let route_reconciliation_ready =
-        crate::hosted_pci_topology::note_hosted_pci_relation_completion(
-            relation_owner,
-            claim,
-            invalidation_completion,
-            pci_catalog_published,
-        )
-        .expect("published relation transaction lost its PCI topology dirty claim");
-    *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY) = None;
-    if route_reconciliation_ready {
-        // Consume the exact catalog/inventory generation at the transaction boundary that made it
-        // ready. The pump-tail call remains the allocation/serialization redrive path.
-        let _ = start_hosted_acpi_pci_route_query();
-    }
-    Ok(())
 }
 
 unsafe fn complete_hosted_relation_probe_without_publication(
@@ -42896,7 +42890,10 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
         else {
             return progress;
         };
-        if phase != HostedDeviceRelationQueryPhase::Barrier {
+        if phase != HostedDeviceRelationQueryPhase::Barrier
+            && (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).as_ref()
+                .is_some_and(|query| query.publication.is_none())
+        {
             let parent = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
                 .as_ref()
                 .expect("relation query disappeared during parent validation")
@@ -44280,7 +44277,8 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                         sources_staged
                             && ((query.acpi_pci_scope_sources.is_empty()
                                 && query.acpi_pci_link_candidates.is_empty())
-                                || query.acpi_pci_catalog_update.is_some())
+                                || query.acpi_pci_catalog_update.is_some()
+                                || query.publication.is_some())
                     });
                 if !ready {
                     set_hosted_relation_query_disposition(
@@ -44556,6 +44554,7 @@ unsafe fn start_hosted_device_relation_query() -> usize {
         acpi_pci_scope_sources: Vec::new(),
         acpi_pci_link_candidates: Vec::new(),
         acpi_pci_catalog_update: None,
+        publication: None,
     });
     match io_manager_mut()
         .dispatch_prepared_external_pnp(prepared)
@@ -48474,6 +48473,7 @@ struct HostedDeviceRelationQuery {
     acpi_pci_scope_sources: Vec<nt_pnp::AcpiPciScopeSource>,
     acpi_pci_link_candidates: Vec<nt_pnp::AcpiPciLinkCandidateFact>,
     acpi_pci_catalog_update: Option<nt_pnp::PreparedAcpiPciScopeCatalogUpdate>,
+    publication: Option<HostedRelationPublication>,
 }
 
 #[derive(Clone, Copy)]

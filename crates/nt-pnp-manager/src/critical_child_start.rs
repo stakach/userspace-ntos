@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 
 use crate::{
     BusRelationTable, DevnodeIdentity, ParentRelationIdentity, PnpManager,
-    StartDeviceLifecycleReceipt,
+    PreparedBusRelations, PreparedEnumeratedPdoBatch, StartDeviceLifecycleReceipt,
 };
 
 /// One mounted SYSTEM hive's canonical child, published by an accepted BusRelations generation.
@@ -94,6 +94,60 @@ impl CriticalChildStartQueue {
             .map_err(|_| CriticalChildStartError::InsufficientResources)
     }
 
+    /// Admit all critical starts against the prospective relation before any PnP publication.
+    /// The later `reserve_committed` calls may allocate copies of instance IDs, but no stale or
+    /// conflicting generation can be discovered after the PnP effect.
+    pub fn validate_prospective_reservations(
+        &self,
+        pnp: &PnpManager,
+        devnodes: &PreparedEnumeratedPdoBatch,
+        relation: &PreparedBusRelations,
+        mount_identity: u64,
+        starts: &[(u64, String)],
+    ) -> Result<(), CriticalChildStartError> {
+        if mount_identity == 0 {
+            return Err(CriticalChildStartError::InvalidMount);
+        }
+        let mut needed = 0usize;
+        for (index, (pdo, instance_id)) in starts.iter().enumerate() {
+            let (child, expected_instance, parent_relation) = devnodes
+                .prospective_child(*pdo)
+                .ok_or(CriticalChildStartError::StalePublication)?;
+            if instance_id.is_empty()
+                || instance_id != expected_instance
+                || parent_relation.relation() != relation.relation_identity()
+                || !pnp.relation_parent_is_started(parent_relation)
+                || !relation.children().iter().any(|entry| entry.pdo_object_id == *pdo)
+            {
+                return Err(CriticalChildStartError::StalePublication);
+            }
+            if starts[..index].iter().any(|(prior, _)| prior == pdo) {
+                return Err(CriticalChildStartError::ConflictingGeneration);
+            }
+            let key = CriticalChildStartKey { mount_identity, child, parent_relation };
+            if let Some(entry) = self.entries.iter().find(|entry| entry.key == key) {
+                if entry.instance_id != *instance_id {
+                    return Err(CriticalChildStartError::ConflictingGeneration);
+                }
+            } else {
+                if self.entries.iter().any(|entry| {
+                    entry.key.child == child
+                        && !matches!(entry.state, CriticalChildStartState::Retired(_))
+                }) {
+                    return Err(CriticalChildStartError::ConflictingGeneration);
+                }
+                needed = needed.checked_add(1)
+                    .ok_or(CriticalChildStartError::InsufficientResources)?;
+            }
+        }
+        if self.entries.len().checked_add(needed)
+            .is_none_or(|length| length > self.entries.capacity())
+        {
+            return Err(CriticalChildStartError::InsufficientResources);
+        }
+        Ok(())
+    }
+
     fn current_key(
         pnp: &PnpManager,
         relations: &BusRelationTable,
@@ -153,23 +207,40 @@ impl CriticalChildStartQueue {
         child_pdo: u64,
         instance_id: String,
     ) -> Result<(CriticalChildStartKey, CriticalChildStartState), CriticalChildStartError> {
-        let key = Self::current_key(pnp, relations, mount_identity, child_pdo, &instance_id)?;
+        self.try_reserve_committed_owned(
+            pnp, relations, mount_identity, child_pdo, instance_id,
+        ).map_err(|(error, _instance_id)| error)
+    }
+
+    /// A refusal returns the exact owned instance so a retained publisher can redrive it.
+    pub fn try_reserve_committed_owned(
+        &mut self,
+        pnp: &PnpManager,
+        relations: &BusRelationTable,
+        mount_identity: u64,
+        child_pdo: u64,
+        instance_id: String,
+    ) -> Result<(CriticalChildStartKey, CriticalChildStartState), (CriticalChildStartError, String)> {
+        let key = match Self::current_key(pnp, relations, mount_identity, child_pdo, &instance_id) {
+            Ok(key) => key,
+            Err(error) => return Err((error, instance_id)),
+        };
         if let Some(entry) = self.entries.iter().find(|entry| entry.key == key) {
             return if entry.instance_id == instance_id {
                 Ok((key, entry.state))
             } else {
-                Err(CriticalChildStartError::ConflictingGeneration)
+                Err((CriticalChildStartError::ConflictingGeneration, instance_id))
             };
         }
         if self.entries.iter().any(|entry| {
             entry.key.child == key.child
                 && !matches!(entry.state, CriticalChildStartState::Retired(_))
         }) {
-            return Err(CriticalChildStartError::ConflictingGeneration);
+            return Err((CriticalChildStartError::ConflictingGeneration, instance_id));
         }
-        self.entries
-            .try_reserve(1)
-            .map_err(|_| CriticalChildStartError::InsufficientResources)?;
+        if self.entries.try_reserve(1).is_err() {
+            return Err((CriticalChildStartError::InsufficientResources, instance_id));
+        }
         self.entries.push(StartEntry {
             key,
             instance_id,

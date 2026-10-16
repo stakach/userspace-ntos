@@ -19,7 +19,8 @@ impl<'ast> Visit<'ast> for Calls {
         if call.method == "write_snapshot_payload_to_sink" {
             self.payload_traversals += 1;
         }
-        if call.method == "commit_next_streaming"
+        if call.method == "commit_next_streaming_for_empty_wal_migration"
+            || call.method == "commit_next_streaming"
             || call.method == "commit_next_streaming_with_wal_manifest"
         {
             self.streaming_commits += 1;
@@ -67,8 +68,8 @@ fn memfs_snapshot_combines_captured_crc_without_a_third_payload_traversal() {
     );
     assert_eq!(calls.combinations, 1, "combine the captured finalized CRCs");
     assert_eq!(
-        calls.streaming_commits, 2,
-        "both legacy and WAL headers must use a validated streaming commit"
+        calls.streaming_commits, 3,
+        "legacy, WAL, and empty-WAL migration headers must use a validated streaming commit"
     );
     let body = &methods[0].block;
     let combination = local_initializer(body, "store_payload_crc");
@@ -91,8 +92,9 @@ fn memfs_snapshot_combines_captured_crc_without_a_third_payload_traversal() {
     let syn::Expr::Match(commits) = local_initializer(body, "generation") else {
         panic!("generation must select a streaming commit for each snapshot format");
     };
-    assert_eq!(commits.arms.len(), 2);
+    assert_eq!(commits.arms.len(), 3);
     for (arm, method) in commits.arms.iter().zip([
+        "commit_next_streaming_for_empty_wal_migration",
         "commit_next_streaming_with_wal_manifest",
         "commit_next_streaming",
     ]) {

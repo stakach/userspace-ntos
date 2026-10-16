@@ -1031,6 +1031,16 @@ struct PreparedSystemHiveCheckpoint {
     offset: usize,
 }
 
+/// The last checkpoint ACK effect, retained for an exact retry if its reply is lost.
+struct AcknowledgedSystemHiveCheckpoint {
+    token: u64,
+    mount_identity: u64,
+    mount_generation: u64,
+    hive_sequence: u64,
+    image_generation: u64,
+    value_len: usize,
+}
+
 enum RawValueTarget {
     Path(String),
     Runtime(u64),
@@ -1059,6 +1069,7 @@ pub struct CmServer {
     prepared_system_mutation: Option<PreparedSystemHiveMutation>,
     system_mutation_outcomes: mutation_commit::MutationOutcomeJournal,
     prepared_system_checkpoint: Option<PreparedSystemHiveCheckpoint>,
+    acknowledged_system_checkpoint: Option<AcknowledgedSystemHiveCheckpoint>,
     next_system_checkpoint_token: u64,
     system_key_leases: SystemKeyLeaseBank,
     system_key_opens: key_open::OpenJournal,
@@ -1118,6 +1129,7 @@ impl CmServer {
             prepared_system_mutation: None,
             system_mutation_outcomes: mutation_commit::MutationOutcomeJournal::default(),
             prepared_system_checkpoint: None,
+            acknowledged_system_checkpoint: None,
             next_system_checkpoint_token: 1,
             system_key_leases: SystemKeyLeaseBank::new(identities.clone()),
             system_key_opens: key_open::OpenJournal::new(),
@@ -2058,6 +2070,7 @@ impl CmServer {
                     current_control_set,
                     hardware_profile,
                 });
+                self.acknowledged_system_checkpoint = None;
                 self.hive_imports.swap_remove(index);
                 reply_with_info(STATUS_SUCCESS, 0, generation, req.transfer_token)
             }
@@ -2327,6 +2340,7 @@ impl CmServer {
                 let written = core::cmp::min(chunk_capacity, value.len());
                 out_buf[..written].copy_from_slice(&value[..written]);
                 self.next_system_checkpoint_token = next_token;
+                self.acknowledged_system_checkpoint = None;
                 self.prepared_system_checkpoint = Some(PreparedSystemHiveCheckpoint {
                     token,
                     mount_generation: current_generation,
@@ -2369,7 +2383,25 @@ impl CmServer {
                     return reply(STATUS_INVALID_PARAMETER, current_generation);
                 }
                 let Some(prepared) = self.prepared_system_checkpoint.take() else {
-                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                    let Some(acknowledged) = self.acknowledged_system_checkpoint.as_ref() else {
+                        return reply(STATUS_INVALID_PARAMETER, current_generation);
+                    };
+                    let mounted = self.system_hive.as_ref().unwrap();
+                    if acknowledged.token != req.transfer_token
+                        || acknowledged.mount_identity != mounted.identity
+                        || acknowledged.mount_generation != req.expected_generation
+                        || acknowledged.value_len != req.value_offset as usize
+                        || acknowledged.hive_sequence != mounted.hive.sequence
+                        || acknowledged.image_generation != mounted.hive.generation
+                    {
+                        return reply(STATUS_INVALID_PARAMETER, current_generation);
+                    }
+                    return reply_with_info(
+                        STATUS_SUCCESS,
+                        0,
+                        current_generation,
+                        acknowledged.token,
+                    );
                 };
                 if prepared.token != req.transfer_token
                     || prepared.mount_generation != req.expected_generation
@@ -2388,6 +2420,14 @@ impl CmServer {
                     self.prepared_system_checkpoint = Some(prepared);
                     return reply(STATUS_REVISION_MISMATCH, current_generation);
                 }
+                self.acknowledged_system_checkpoint = Some(AcknowledgedSystemHiveCheckpoint {
+                    token: prepared.token,
+                    mount_identity: mounted.identity,
+                    mount_generation: prepared.mount_generation,
+                    hive_sequence: prepared.hive_sequence,
+                    image_generation: prepared.image_generation,
+                    value_len: prepared.value.len(),
+                });
                 reply_with_info(STATUS_SUCCESS, 0, current_generation, req.transfer_token)
             }
             hive_checkpoint_transfer::ABORT => {
@@ -4605,6 +4645,46 @@ mod tests {
         assert_eq!(mounted.generation, 2);
         assert_eq!(mounted.hive.generation, header.image_generation);
         assert_eq!(mounted.hive.dirty_count(), 0);
+
+        // The first ACK may have taken effect while its IPC reply was lost. An
+        // exact retry must report that same outcome without applying it again.
+        let retry = server.dispatch(
+            opcode::CM_OP_CHECKPOINT_SYSTEM_HIVE,
+            &hive_checkpoint_request(
+                hive_checkpoint_transfer::ACK,
+                begin.detail1,
+                value.len() as u32,
+                0,
+                2,
+            ),
+            &mut [],
+        );
+        assert_eq!(retry, ack);
+        assert_eq!(server.system_hive.as_ref().unwrap().hive.dirty_count(), 0);
+
+        for (token, length) in [
+            (begin.detail1 + 1, value.len() as u32),
+            (begin.detail1, value.len() as u32 - 1),
+        ] {
+            let wrong = server.dispatch(
+                opcode::CM_OP_CHECKPOINT_SYSTEM_HIVE,
+                &hive_checkpoint_request(hive_checkpoint_transfer::ACK, token, length, 0, 2),
+                &mut [],
+            );
+            assert_eq!(wrong.status, STATUS_INVALID_PARAMETER);
+        }
+        let stale = server.dispatch(
+            opcode::CM_OP_CHECKPOINT_SYSTEM_HIVE,
+            &hive_checkpoint_request(
+                hive_checkpoint_transfer::ACK,
+                begin.detail1,
+                value.len() as u32,
+                0,
+                1,
+            ),
+            &mut [],
+        );
+        assert_eq!(stale.status, STATUS_REVISION_MISMATCH);
     }
 
     #[test]

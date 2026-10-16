@@ -300,6 +300,7 @@ impl<P: HiveIoProvider> HiveManager<P> {
         if !apply(hive) {
             replay_log(hive, &rec, seq - 1);
         }
+        hive.align_logged_sequence(seq);
         self.next_log_sequence += 1;
         Ok(())
     }

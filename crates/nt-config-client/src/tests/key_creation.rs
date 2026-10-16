@@ -88,7 +88,7 @@ fn assigned_child_commit_and_single_record_recovery_have_identical_security() {
             class_name: Some("test"),
             descriptor: &prepared.descriptor,
         },
-        10,
+        tx.hive().sequence + 1,
     )
     .unwrap();
     let child = tx
@@ -100,7 +100,7 @@ fn assigned_child_commit_and_single_record_recovery_have_identical_security() {
         )
         .unwrap();
     tx.commit();
-    assert_eq!(try_replay_log(&mut recovered, &record, 0), Ok(10));
+    assert_eq!(try_replay_log(&mut recovered, &record, 0), Ok(hive.sequence));
     assert_eq!(encode_image(&hive), encode_image(&recovered));
     let sd =
         security_descriptor_bytes_for_access(hive.key_security_descriptor(child).unwrap()).unwrap();

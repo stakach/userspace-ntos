@@ -134,25 +134,34 @@ fn config_manager_query_system_hive_key(
     CM.with(|cm| cm.borrow().existing.clone())
         .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.raw())
 }
-struct MutationOutcome { wake_device_action: bool }
-fn persist_and_publish_system_hive_mutation(
-    generation: u64,
-    mutations: &[nt_config_client::SystemHiveMutation<'_>],
-) -> Result<MutationOutcome, u32> {
-    assert_eq!(generation, 7);
-    CM.with(|cm| {
-        let mut state = cm.borrow_mut();
-        state.writes.extend(mutations.iter().map(|mutation| match mutation {
-            nt_config_client::SystemHiveMutation::CreateKey { path } =>
-                RecordedMutation::CreateKey { path: (*path).into() },
-            nt_config_client::SystemHiveMutation::SetValue { path, name, value_type, data } =>
-                RecordedMutation::SetValue {
-                    path: (*path).into(), name: (*name).into(),
-                    value_type: *value_type, data: data.to_vec(),
-                },
-        }));
-    });
-    Ok(MutationOutcome { wake_device_action: false })
+mod boot_registry_mutation_work {
+    use super::*;
+
+    pub enum BootRegistryStage { AcpiRoot }
+    pub struct MutationOutcome { pub generation: u64 }
+
+    pub fn publish_boot_system_mutation(
+        stage: BootRegistryStage,
+        generation: u64,
+        mutations: &[nt_config_client::SystemHiveMutation<'_>],
+    ) -> Result<MutationOutcome, u32> {
+        assert!(matches!(stage, BootRegistryStage::AcpiRoot));
+        assert_eq!(generation, 7);
+        CM.with(|cm| {
+            let mut state = cm.borrow_mut();
+            state.writes.extend(mutations.iter().map(|mutation| match mutation {
+                nt_config_client::SystemHiveMutation::CreateKey { path } =>
+                    RecordedMutation::CreateKey { path: (*path).into() },
+                nt_config_client::SystemHiveMutation::SetValue { path, name, value_type, data } =>
+                    RecordedMutation::SetValue {
+                        path: (*path).into(), name: (*name).into(),
+                        value_type: *value_type, data: data.to_vec(),
+                    },
+            }));
+        });
+        // The native caller proceeds only after this exact CM generation is acknowledged.
+        Ok(MutationOutcome { generation: generation + 1 })
+    }
 }
 "#;
 

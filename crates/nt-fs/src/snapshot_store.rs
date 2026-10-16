@@ -16,6 +16,10 @@ pub use payload_writer::PayloadSectorWriter;
 mod wal_anchor;
 pub use wal_anchor::WalSnapshotAnchorUpdate;
 
+#[path = "snapshot_epoch_rollover.rs"]
+mod epoch_rollover;
+pub use epoch_rollover::WalSnapshotEpochRollover;
+
 #[cfg(test)]
 #[path = "snapshot_store_tests.rs"]
 mod tests;
@@ -25,6 +29,8 @@ const STORE_VERSION: u16 = 1;
 const HEADER_LEN: usize = 48;
 const WAL_STORE_VERSION: u16 = 2;
 const WAL_HEADER_LEN: usize = 80;
+const WAL_RESET_VERSION: u16 = 3;
+const WAL_RESET_HEADER_LEN: usize = 84;
 
 /// Errors reported by the snapshot block store.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -132,6 +138,7 @@ struct SlotHeader {
     payload_crc: u32,
     payload_sectors: u32,
     wal: Option<WalSnapshotManifest>,
+    resetting: bool,
 }
 
 #[derive(Clone)]
@@ -139,6 +146,7 @@ struct SlotSnapshot {
     generation: u64,
     payload: Vec<u8>,
     wal: Option<WalSnapshotManifest>,
+    resetting: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -146,6 +154,7 @@ struct SlotSummary {
     slot: u32,
     generation: u64,
     wal: Option<WalSnapshotManifest>,
+    resetting: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -156,6 +165,7 @@ struct SlotReadPlan {
     payload_crc: u32,
     payload_sectors: u32,
     wal: Option<WalSnapshotManifest>,
+    resetting: bool,
 }
 
 /// V2 snapshot-header metadata. End LBA is relative to the disjoint WAL view.
@@ -216,6 +226,24 @@ fn wal_recovery_floor(
     Ok(anchor)
 }
 
+/// A torn payload may be replaced only when its still-valid v2 header cannot carry
+/// a higher recovery floor than the surviving payload. A damaged or unknown header
+/// has no such proof and remains a hard refusal.
+fn same_anchor_wal_companion(
+    selected_generation: u64,
+    selected: WalSnapshotManifest,
+    companion_generation: u64,
+    companion: WalSnapshotManifest,
+) -> Result<(), SnapshotBlockStoreError> {
+    if selected_generation == companion_generation
+        || selected.anchor() != companion.anchor()
+        || selected.base_serial < companion.base_serial
+    {
+        return Err(SnapshotBlockStoreError::Corrupt);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredWalSnapshot {
     pub snapshot: StoredSnapshot,
@@ -233,11 +261,62 @@ pub enum SnapshotReadFormat {
     },
 }
 
+/// Recovery required before the native boot reader may decode or publish a snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootSnapshotRecovery {
+    Ready,
+    InterruptedEmptyBaseline { incarnation: u64 },
+    Resetting,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoredSnapshotMetadata {
     pub generation: u64,
     pub payload_len: usize,
     pub format: SnapshotReadFormat,
+}
+
+fn verify_recovered_wal_anchor<D: SnapshotBlockDevice>(
+    selected_base_serial: u64,
+    anchor: WalSnapshotAnchor,
+    wal: &crate::RegistryWal<D>,
+) -> Result<(), SnapshotBlockStoreError> {
+    let Some((incarnation, recovered_serial, _)) = wal.verified_prefix() else {
+        return Err(SnapshotBlockStoreError::Corrupt);
+    };
+    if incarnation != anchor.incarnation
+        || recovered_serial < anchor.serial
+        || wal.verified_record_end_lba(anchor.serial) != Some(anchor.end_lba)
+        || recovered_serial < selected_base_serial
+    {
+        return Err(SnapshotBlockStoreError::Corrupt);
+    }
+    Ok(())
+}
+
+fn verified_boot_system_log_suffix<D: SnapshotBlockDevice>(
+    selected_base_serial: u64,
+    anchor: WalSnapshotAnchor,
+    snapshot_log: &[u8],
+    wal: &crate::RegistryWal<D>,
+) -> Result<Vec<u8>, SnapshotBlockStoreError> {
+    verify_recovered_wal_anchor(selected_base_serial, anchor, wal)?;
+    let base = usize::try_from(selected_base_serial).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
+    let suffix = wal.records().get(base..).ok_or(SnapshotBlockStoreError::Corrupt)?;
+    let total = suffix
+        .iter()
+        .try_fold(snapshot_log.len(), |length, record| {
+            length.checked_add(record.payload.len())
+        })
+        .ok_or(SnapshotBlockStoreError::Corrupt)?;
+    let mut log = Vec::new();
+    log.try_reserve_exact(total)
+        .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
+    log.extend_from_slice(snapshot_log);
+    for record in suffix {
+        log.extend_from_slice(&record.payload);
+    }
+    Ok(log)
 }
 
 impl StoredWalSnapshot {
@@ -247,49 +326,31 @@ impl StoredWalSnapshot {
         &self,
         wal: &crate::RegistryWal<D>,
     ) -> Result<(), SnapshotBlockStoreError> {
-        let Some((incarnation, recovered_serial, _)) = wal.verified_prefix() else {
-            return Err(SnapshotBlockStoreError::Corrupt);
-        };
-        if incarnation != self.anchor.incarnation
-            || recovered_serial < self.anchor.serial
-            || wal.verified_record_end_lba(self.anchor.serial) != Some(self.anchor.end_lba)
-            || recovered_serial < self.selected_base_serial
-        {
-            return Err(SnapshotBlockStoreError::Corrupt);
-        }
-        Ok(())
+        verify_recovered_wal_anchor(self.selected_base_serial, self.anchor, wal)
     }
 
     /// Assemble the exact SYSTEM sidecar log to replay before CM imports the boot hive.
-    /// The selected snapshot already contains records through `selected_base_serial`;
-    /// appending them again could apply a mutation twice. The anchor check also rejects
-    /// a lost committed suffix before any WAL payload is exposed to the hive decoder.
     pub fn verified_boot_system_log<D: SnapshotBlockDevice>(
         &self,
         snapshot_log: &[u8],
         wal: &crate::RegistryWal<D>,
     ) -> Result<Vec<u8>, SnapshotBlockStoreError> {
-        self.verify_recovered_wal(wal)?;
-        let base = usize::try_from(self.selected_base_serial)
-            .map_err(|_| SnapshotBlockStoreError::Corrupt)?;
-        let suffix = wal
-            .records()
-            .get(base..)
-            .ok_or(SnapshotBlockStoreError::Corrupt)?;
-        let total = suffix
-            .iter()
-            .try_fold(snapshot_log.len(), |length, record| {
-                length.checked_add(record.payload.len())
-            })
-            .ok_or(SnapshotBlockStoreError::Corrupt)?;
-        let mut log = Vec::new();
-        log.try_reserve_exact(total)
-            .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
-        log.extend_from_slice(snapshot_log);
-        for record in suffix {
-            log.extend_from_slice(&record.payload);
-        }
-        Ok(log)
+        verified_boot_system_log_suffix(self.selected_base_serial, self.anchor, snapshot_log, wal)
+    }
+}
+
+impl StoredSnapshotMetadata {
+    /// Verify the selected streamed snapshot's WAL floor and return its exact unapplied SYSTEM
+    /// journal suffix. A legacy snapshot has no WAL anchor and cannot use this path.
+    pub fn verified_boot_system_log<D: SnapshotBlockDevice>(
+        &self,
+        snapshot_log: &[u8],
+        wal: &crate::RegistryWal<D>,
+    ) -> Result<Vec<u8>, SnapshotBlockStoreError> {
+        let SnapshotReadFormat::Wal { selected_base_serial, anchor } = self.format else {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        };
+        verified_boot_system_log_suffix(selected_base_serial, anchor, snapshot_log, wal)
     }
 }
 
@@ -313,6 +374,69 @@ impl SnapshotBlockStore {
             .ok()
             .and_then(|sectors| sectors.checked_mul(sector_size))
             .ok_or(SnapshotBlockStoreError::InvalidGeometry)
+    }
+
+    /// Classify states requiring an exact-lease repair before the boot payload is decoded.
+    /// This probe performs no writes and never guesses an incarnation from a torn header.
+    pub fn boot_recovery_state<D: SnapshotBlockDevice>(
+        &self,
+        dev: &mut D,
+    ) -> Result<BootSnapshotRecovery, SnapshotBlockStoreError> {
+        let first = self.read_slot_plan(dev, 0);
+        let second = self.read_slot_plan(dev, 1);
+        for slot in [&first, &second] {
+            if let Err(error) = slot {
+                if *error != SnapshotBlockStoreError::Corrupt {
+                    return Err(*error);
+                }
+            }
+        }
+        if first.as_ref().ok().and_then(|slot| *slot).is_some_and(|slot| slot.resetting)
+            || second.as_ref().ok().and_then(|slot| *slot).is_some_and(|slot| slot.resetting)
+        {
+            return Ok(BootSnapshotRecovery::Resetting);
+        }
+        // Only a genuinely empty companion proves first-boot initialization. A torn header
+        // could hide a newer WAL floor and must not be overwritten by this repair.
+        let single = match (&first, &second) {
+            (Ok(Some(v2)), Ok(None)) | (Ok(None), Ok(Some(v2))) => Some(*v2),
+            _ => None,
+        };
+        if let Some(v2) = single {
+            if let Some(wal) = v2.wal {
+                if wal.incarnation == 0 || wal.base_serial != 0
+                    || wal.high_water_serial != 0 || wal.high_water_end_lba != 0
+                {
+                    return Err(SnapshotBlockStoreError::Corrupt);
+                }
+                self.validate_slot_payload_crc(dev, v2)?;
+                return Ok(BootSnapshotRecovery::InterruptedEmptyBaseline {
+                    incarnation: wal.incarnation,
+                });
+            }
+        }
+        let (Some(a), Some(b)) = (first.ok().flatten(), second.ok().flatten()) else {
+            // A torn companion remains the normal reader's responsibility. It will only
+            // select a surviving payload under the existing same-anchor rules.
+            return Ok(BootSnapshotRecovery::Ready);
+        };
+        let (v2, legacy) = match (a.wal, b.wal) {
+            (Some(_), None) => (a, b),
+            (None, Some(_)) => (b, a),
+            _ => return Ok(BootSnapshotRecovery::Ready),
+        };
+        let wal = v2.wal.expect("identified WAL header");
+        if v2.generation <= legacy.generation || wal.incarnation == 0
+            || wal.base_serial != 0 || wal.high_water_serial != 0
+            || wal.high_water_end_lba != 0
+        {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        self.validate_slot_payload_crc(dev, v2)?;
+        self.validate_slot_payload_crc(dev, legacy)?;
+        Ok(BootSnapshotRecovery::InterruptedEmptyBaseline {
+            incarnation: wal.incarnation,
+        })
     }
 
     pub fn read_latest<D: SnapshotBlockDevice>(
@@ -464,6 +588,9 @@ impl SnapshotBlockStore {
     ) -> Result<StoredSnapshotMetadata, SnapshotBlockStoreError> {
         let other_slot = 1 - selected.slot;
         let other_header = self.read_slot_plan(dev, other_slot)?;
+        if selected.resetting || other_header.is_some_and(|header| header.resetting) {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
         let format = match (selected.wal, other_header) {
             // A legacy payload may fall back from a companion legacy payload whose CRC is bad.
             // A damaged header remains ambiguous because its format cannot be trusted.
@@ -475,11 +602,22 @@ impl SnapshotBlockStore {
                     Some(SlotReadPlan { wal: None, .. }) => {
                         return Err(SnapshotBlockStoreError::Corrupt)
                     }
-                    Some(_) => Some(
-                        self.read_valid_slot_plan(dev, other_slot)?
-                            .and_then(|plan| plan.wal)
-                            .ok_or(SnapshotBlockStoreError::Corrupt)?,
-                    ),
+                    Some(other_plan) => {
+                        let manifest = other_plan.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
+                        match self.validate_slot_payload_crc(dev, other_plan) {
+                            Ok(()) => {}
+                            Err(SnapshotBlockStoreError::Corrupt) => {
+                                same_anchor_wal_companion(
+                                    selected.generation,
+                                    selected_manifest,
+                                    other_plan.generation,
+                                    manifest,
+                                )?;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                        Some(manifest)
+                    }
                 };
                 SnapshotReadFormat::Wal {
                     selected_base_serial: selected_manifest.base_serial,
@@ -539,6 +677,11 @@ impl SnapshotBlockStore {
         dev.flush()?;
         let a = self.read_slot(dev, 0);
         let b = self.read_slot(dev, 1);
+        if a.as_ref().ok().and_then(Option::as_ref).is_some_and(|slot| slot.resetting)
+            || b.as_ref().ok().and_then(Option::as_ref).is_some_and(|slot| slot.resetting)
+        {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
         let empty = WalSnapshotManifest {
             incarnation,
             base_serial: 0,
@@ -547,6 +690,9 @@ impl SnapshotBlockStore {
         };
         let repair = match (a, b) {
             (Ok(Some(a)), Ok(Some(b))) if a.wal.is_none() && b.wal.is_none() => return Ok(None),
+            (Ok(Some(legacy)), Ok(None) | Err(SnapshotBlockStoreError::Corrupt))
+            | (Ok(None) | Err(SnapshotBlockStoreError::Corrupt), Ok(Some(legacy)))
+                if legacy.wal.is_none() => return Ok(None),
             (Ok(Some(a)), Ok(Some(b))) if a.wal == Some(empty) && b.wal == Some(empty) => {
                 if a.generation == b.generation {
                     return Err(SnapshotBlockStoreError::Corrupt);
@@ -599,31 +745,30 @@ impl SnapshotBlockStore {
         &self,
         dev: &mut D,
     ) -> Result<Option<StoredWalSnapshot>, SnapshotBlockStoreError> {
-        let a = self.read_slot(dev, 0);
-        let b = self.read_slot(dev, 1);
-        let (a, b) = match (a, b) {
-            (Ok(a), Ok(b)) => (a, b),
-            (Ok(Some(a)), Err(SnapshotBlockStoreError::Corrupt)) => (Some(a), None),
-            (Err(SnapshotBlockStoreError::Corrupt), Ok(Some(b))) => (None, Some(b)),
-            (Err(error), _) | (_, Err(error)) => return Err(error),
+        let Some((metadata, payload)) = self.read_latest_streaming_with_metadata(dev, |reader| {
+            let mut payload = Vec::new();
+            payload
+                .try_reserve_exact(reader.remaining())
+                .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
+            payload.resize(reader.remaining(), 0);
+            reader.read_exact(&mut payload)?;
+            Ok(payload)
+        })? else {
+            return Ok(None);
         };
-        let (selected, other) = match (a, b) {
-            (None, None) => return Ok(None),
-            (Some(a), Some(b)) if b.generation > a.generation => (b, Some(a)),
-            (Some(a), Some(b)) => (a, Some(b)),
-            (Some(a), None) | (None, Some(a)) => (a, None),
+        let SnapshotReadFormat::Wal {
+            selected_base_serial,
+            anchor,
+        } = metadata.format
+        else {
+            return Err(SnapshotBlockStoreError::Corrupt);
         };
-        let selected_manifest = selected.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
-        let other_manifest = other
-            .map(|other| other.wal.ok_or(SnapshotBlockStoreError::Corrupt))
-            .transpose()?;
-        let anchor = wal_recovery_floor(selected_manifest, other_manifest)?;
         Ok(Some(StoredWalSnapshot {
             snapshot: StoredSnapshot {
-                generation: selected.generation,
-                payload: selected.payload,
+                generation: metadata.generation,
+                payload,
             },
-            selected_base_serial: selected_manifest.base_serial,
+            selected_base_serial,
             anchor,
         }))
     }
@@ -678,6 +823,147 @@ impl SnapshotBlockStore {
         )
     }
 
+    pub(crate) fn commit_next_streaming_for_empty_wal_migration<D, F>(
+        &self,
+        dev: &mut D,
+        payload_len: usize,
+        payload_crc: u32,
+        manifest: WalSnapshotManifest,
+        write_payload: F,
+    ) -> Result<u64, SnapshotBlockStoreError>
+    where
+        D: SnapshotBlockDevice,
+        F: FnOnce(&mut PayloadSectorWriter<'_, D>) -> Result<(), SnapshotBlockStoreError>,
+    {
+        if !manifest.valid() || manifest.base_serial != 0
+            || manifest.high_water_serial != 0 || manifest.high_water_end_lba != 0
+            || dev.sector_size() < WAL_HEADER_LEN
+        {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        // Admission and empty-WAL proof belong to WalSnapshotBaselineRepair. This path may
+        // recycle a torn legacy companion after a previous first-slot migration cut.
+        self.commit_next_streaming_inner(
+            dev, payload_len, payload_crc, Some(manifest), true, write_payload,
+        )
+    }
+
+    /// Admit a journal checkpoint only after both payload-valid slots name the same WAL
+    /// anchor. A mixed migration or half-advanced anchor needs recovery under this device
+    /// owner before a new journal effect can begin.
+    pub fn validate_wal_journal_manifest<D: SnapshotBlockDevice>(
+        &self,
+        dev: &mut D,
+        manifest: WalSnapshotManifest,
+    ) -> Result<(), SnapshotBlockStoreError> {
+        if !manifest.valid() {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        let first = self
+            .read_valid_slot_plan(dev, 0)?
+            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        let second = self
+            .read_valid_slot_plan(dev, 1)?
+            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        if first.generation == second.generation {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        for previous in [first, second] {
+            if previous.resetting {
+                return Err(SnapshotBlockStoreError::Corrupt);
+            }
+            let previous = previous.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
+            if previous.anchor() != manifest.anchor()
+                || previous.base_serial > manifest.base_serial
+            {
+                return Err(SnapshotBlockStoreError::Corrupt);
+            }
+        }
+        Ok(())
+    }
+
+    /// Select a journal admission manifest while validating each snapshot payload once.
+    /// Both slots must be intact before a WAL marker can advance their shared anchor.
+    pub fn current_paired_wal_journal_manifest<D: SnapshotBlockDevice>(
+        &self,
+        dev: &mut D,
+    ) -> Result<WalSnapshotManifest, SnapshotBlockStoreError> {
+        let first = self.read_valid_slot_plan(dev, 0)?
+            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        let second = self.read_valid_slot_plan(dev, 1)?
+            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        if first.resetting || second.resetting {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        let (selected, companion) = if first.generation > second.generation {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let manifest = selected.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
+        let other = companion.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
+        if !manifest.valid() || !other.valid() {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        same_anchor_wal_companion(
+            selected.generation, manifest, companion.generation, other,
+        )?;
+        Ok(manifest)
+    }
+
+    /// Select the manifest for an unrelated mounted-volume checkpoint. The new payload
+    /// has not folded any additional SYSTEM records, so it inherits the selected payload's
+    /// base serial and the exact anchor present in both valid v2 headers. One companion
+    /// payload may be torn, but a half-advanced anchor must be repaired from the WAL
+    /// before either slot can be recycled.
+    pub fn current_wal_checkpoint_manifest<D: SnapshotBlockDevice>(
+        &self,
+        dev: &mut D,
+    ) -> Result<WalSnapshotManifest, SnapshotBlockStoreError> {
+        let first = self.read_valid_slot_plan(dev, 0);
+        let second = self.read_valid_slot_plan(dev, 1);
+        let selected = match (first, second) {
+            (Ok(Some(first)), Ok(Some(second))) => {
+                if first.generation > second.generation { first } else { second }
+            }
+            (Ok(Some(first)), Err(SnapshotBlockStoreError::Corrupt)) => first,
+            (Err(SnapshotBlockStoreError::Corrupt), Ok(Some(second))) => second,
+            (Err(error), _) if error != SnapshotBlockStoreError::Corrupt => return Err(error),
+            (_, Err(error)) if error != SnapshotBlockStoreError::Corrupt => return Err(error),
+            _ => return Err(SnapshotBlockStoreError::Corrupt),
+        };
+        let companion = self
+            .read_slot_plan(dev, 1 - selected.slot)?
+            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        if selected.resetting || companion.resetting {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        let selected_manifest = selected.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
+        let companion_manifest = companion.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
+        same_anchor_wal_companion(
+            selected.generation,
+            selected_manifest,
+            companion.generation,
+            companion_manifest,
+        )?;
+        Ok(selected_manifest)
+    }
+
+    /// Check only the two headers before a legacy journal append. The writer will validate
+    /// payloads at its barrier; admission must cheaply reject a v2 or ambiguous slot without
+    /// reading an entire volume image for every current v1 mutation.
+    pub(crate) fn validate_legacy_journal_format<D: SnapshotBlockDevice>(
+        &self,
+        dev: &mut D,
+    ) -> Result<(), SnapshotBlockStoreError> {
+        for slot in 0..2 {
+            if self.read_slot_plan(dev, slot)?.is_some_and(|plan| plan.wal.is_some()) {
+                return Err(SnapshotBlockStoreError::Corrupt);
+            }
+        }
+        Ok(())
+    }
+
     fn commit_next_streaming_inner<D, F>(
         &self,
         dev: &mut D,
@@ -710,6 +996,9 @@ impl SnapshotBlockStore {
         // before deciding which slot is safe to reuse.
         dev.flush()?;
         let latest = self.latest_commit_slot(dev)?;
+        if latest.is_some_and(|slot| slot.resetting) {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
         let (target_slot, generation) = match latest {
             Some(latest) => (
                 1 - latest.slot,
@@ -731,8 +1020,36 @@ impl SnapshotBlockStore {
                     {
                         continue
                     }
+                    Err(SnapshotBlockStoreError::Corrupt) if slot == target_slot => {
+                        // The selected payload is still complete. Recycle its torn companion
+                        // only if that companion's valid v2 header names the same WAL floor;
+                        // a newer or different floor cannot be discarded by this checkpoint.
+                        let selected = latest.ok_or(SnapshotBlockStoreError::Corrupt)?;
+                        let selected_manifest =
+                            selected.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
+                        let companion = self
+                            .read_slot_plan(dev, slot)?
+                            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+                        let companion_manifest =
+                            companion.wal.ok_or(SnapshotBlockStoreError::Corrupt)?;
+                        same_anchor_wal_companion(
+                            selected.generation,
+                            selected_manifest,
+                            companion.generation,
+                            companion_manifest,
+                        )?;
+                        if current.anchor() != selected_manifest.anchor()
+                            || current.base_serial < selected_manifest.base_serial
+                        {
+                            return Err(SnapshotBlockStoreError::Corrupt);
+                        }
+                        continue;
+                    }
                     Err(error) => return Err(error),
                 };
+                if plan.is_some_and(|plan| plan.resetting) {
+                    return Err(SnapshotBlockStoreError::Corrupt);
+                }
                 if let Some(previous) = plan.and_then(|plan| plan.wal) {
                     // A newer checkpoint may fold more of the WAL into its payload, but
                     // must never make recovery depend on records an earlier checkpoint
@@ -778,6 +1095,7 @@ impl SnapshotBlockStore {
                 payload_crc,
                 payload_sectors: payload_sectors_u32,
                 wal,
+                resetting: false,
             },
         );
         dev.write_sector(slot_base, &sector)?;
@@ -860,6 +1178,7 @@ impl SnapshotBlockStore {
             generation: header.generation,
             payload,
             wal: header.wal,
+            resetting: header.resetting,
         }))
     }
 
@@ -898,6 +1217,7 @@ impl SnapshotBlockStore {
             payload_crc: header.payload_crc,
             payload_sectors: header.payload_sectors,
             wal: header.wal,
+            resetting: header.resetting,
         }))
     }
 
@@ -973,6 +1293,7 @@ impl SnapshotBlockStore {
                         slot: plan.slot,
                         generation: plan.generation,
                         wal: plan.wal,
+                        resetting: plan.resetting,
                     }))
                 }
                 Err(SnapshotBlockStoreError::Corrupt) => corrupt = true,
@@ -1073,7 +1394,9 @@ impl<D: SnapshotBlockDevice> SnapshotPayloadReader for PayloadSectorReader<'_, D
 }
 
 fn encode_header(out: &mut [u8], header: SlotHeader) {
-    let len = if header.wal.is_some() {
+    let len = if header.resetting {
+        WAL_RESET_HEADER_LEN
+    } else if header.wal.is_some() {
         WAL_HEADER_LEN
     } else {
         HEADER_LEN
@@ -1083,7 +1406,9 @@ fn encode_header(out: &mut [u8], header: SlotHeader) {
     put_u16(&mut out[8..10], len as u16);
     put_u16(
         &mut out[10..12],
-        if header.wal.is_some() {
+        if header.resetting {
+            WAL_RESET_VERSION
+        } else if header.wal.is_some() {
             WAL_STORE_VERSION
         } else {
             STORE_VERSION
@@ -1100,6 +1425,9 @@ fn encode_header(out: &mut [u8], header: SlotHeader) {
         put_u64(&mut out[52..60], wal.base_serial);
         put_u64(&mut out[60..68], wal.high_water_serial);
         put_u64(&mut out[68..76], wal.high_water_end_lba);
+    }
+    if header.resetting {
+        put_u32(&mut out[76..80], 1);
     }
     let crc = crc32c(&out[..len - 4]);
     put_u32(&mut out[len - 4..len], crc);
@@ -1120,6 +1448,9 @@ fn decode_header(bytes: &[u8]) -> Result<Option<SlotHeader>, SnapshotBlockStoreE
     let len = match (version, header_len as usize) {
         (STORE_VERSION, HEADER_LEN) => HEADER_LEN,
         (WAL_STORE_VERSION, WAL_HEADER_LEN) if bytes.len() >= WAL_HEADER_LEN => WAL_HEADER_LEN,
+        (WAL_RESET_VERSION, WAL_RESET_HEADER_LEN) if bytes.len() >= WAL_RESET_HEADER_LEN => {
+            WAL_RESET_HEADER_LEN
+        }
         _ => return Err(SnapshotBlockStoreError::Corrupt),
     };
     if bytes.len() < len {
@@ -1129,7 +1460,11 @@ fn decode_header(bytes: &[u8]) -> Result<Option<SlotHeader>, SnapshotBlockStoreE
     if crc32c(&bytes[..len - 4]) != header_crc {
         return Err(SnapshotBlockStoreError::Corrupt);
     }
-    let wal = if version == WAL_STORE_VERSION {
+    let resetting = version == WAL_RESET_VERSION;
+    if resetting && read_u32(&bytes[76..80]) != 1 {
+        return Err(SnapshotBlockStoreError::Corrupt);
+    }
+    let wal = if version == WAL_STORE_VERSION || resetting {
         let manifest = WalSnapshotManifest {
             incarnation: read_u64(&bytes[44..52]),
             base_serial: read_u64(&bytes[52..60]),
@@ -1150,6 +1485,7 @@ fn decode_header(bytes: &[u8]) -> Result<Option<SlotHeader>, SnapshotBlockStoreE
         payload_sectors: read_u32(&bytes[36..40]),
         slot: read_u32(&bytes[40..44]),
         wal,
+        resetting,
     }))
 }
 

@@ -28,6 +28,9 @@ impl<C> Journal<C> {
         let _durable = crate::allocator::enter_durable();
         let admission = (|| {
             ensure_mounted()?;
+            if !legacy_snapshot_writes_allowed() {
+                return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+            }
             let device = snapshot_storage::acquire()?;
             let path = alloc::format!("{}.LOG", CONFIG_SYSTEM_HIVE_PATH);
             let exists = writable_fs()?.try_file_len(&path)?.is_some();
