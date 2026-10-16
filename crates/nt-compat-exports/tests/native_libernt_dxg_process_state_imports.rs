@@ -2,9 +2,10 @@
 //! pointer-valued Ps data exports. The generic driver loader must preserve
 //! that distinction when it resolves the pinned PE's eager import table.
 
-use nt_pe_loader::ImportRef;
 use std::collections::BTreeSet;
-use std::path::Path;
+
+#[path = "support/libernt_driver_imports.rs"]
+mod libernt_driver_imports;
 
 const FUNCTIONS: [&str; 3] = [
     "PsGetProcessExitStatus",
@@ -88,20 +89,5 @@ fn ps_data_cell_targets_live_in_the_mapped_shared_executive_image() {
 }
 
 fn pinned_dxgkrnl_ntoskrnl_imports() -> BTreeSet<String> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let bytes = std::fs::read(
-        root.join("rust-micro/.tmp/libernt/tree/Windows/system32/drivers/dxgkrnl.sys"),
-    )
-    .expect("pinned released dxgkrnl.sys");
-    let pe = nt_pe_loader::PeFile::parse(&bytes).expect("released dxgkrnl PE");
-    pe.imports()
-        .expect("released dxgkrnl imports")
-        .into_iter()
-        .filter(|dll| dll.name.eq_ignore_ascii_case("ntoskrnl.exe"))
-        .flat_map(|dll| dll.functions)
-        .filter_map(|entry| match entry {
-            ImportRef::ByName { name, .. } => Some(name),
-            ImportRef::ByOrdinal { .. } => None,
-        })
-        .collect()
+    libernt_driver_imports::imports("dxgkrnl.sys", &["ntoskrnl.exe"])
 }

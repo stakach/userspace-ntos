@@ -2,9 +2,8 @@
 
 #[cfg(target_arch = "x86_64")]
 use nt_kernel_exec::ExRundownRef;
-use nt_pe_loader::ImportRef;
-use std::collections::BTreeSet;
-use std::path::Path;
+#[path = "support/libernt_driver_imports.rs"]
+mod libernt_driver_imports;
 
 #[cfg(target_arch = "x86_64")]
 #[path = "../../../components/ntos-executive/src/ex_rundown_exports.rs"]
@@ -25,26 +24,8 @@ const RUNDOWN_IMPORTS: [&str; 5] = [
 
 #[test]
 fn pinned_drivers_resolve_rundown_through_generic_export_registry() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let manifest = std::fs::read_to_string(root.join("rust-micro/vendor/libernt/manifest.txt"))
-        .expect("pinned LiberNT release manifest");
-    assert!(manifest.contains("source_revision=8e478a22a1e8f8a22bab17131f3184a7b4548c3d"));
-
-    let tree = root.join("rust-micro/.tmp/libernt/tree/Windows/system32/drivers");
     for driver in ["acpi.sys", "basicdisplay.sys"] {
-        let bytes = std::fs::read(tree.join(driver)).expect("staged pinned LiberNT driver");
-        let pe = nt_pe_loader::PeFile::parse(&bytes).expect("pinned LiberNT PE");
-        let imported: BTreeSet<String> = pe
-            .imports()
-            .expect("pinned LiberNT imports")
-            .into_iter()
-            .filter(|dll| dll.name.eq_ignore_ascii_case("ntoskrnl.exe"))
-            .flat_map(|dll| dll.functions)
-            .filter_map(|import| match import {
-                ImportRef::ByName { name, .. } => Some(name),
-                ImportRef::ByOrdinal { .. } => None,
-            })
-            .collect();
+        let imported = libernt_driver_imports::imports(driver, &["ntoskrnl.exe"]);
         assert!(imported.contains("ExAcquireRundownProtection"), "{driver} must exercise the pinned import frontier");
     }
 

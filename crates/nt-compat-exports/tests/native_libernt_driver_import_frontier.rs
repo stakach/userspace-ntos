@@ -1,26 +1,12 @@
 //! Released boot drivers define the generic kernel import frontier by exact PE names.
 
-use nt_pe_loader::ImportRef;
 use std::collections::BTreeSet;
-use std::path::Path;
+
+#[path = "support/libernt_driver_imports.rs"]
+mod libernt_driver_imports;
 
 fn native_imports(driver: &str) -> BTreeSet<String> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let manifest = std::fs::read_to_string(root.join("rust-micro/vendor/libernt/manifest.txt"))
-        .expect("pinned LiberNT manifest");
-    assert!(manifest.contains("source_revision=8e478a22a1e8f8a22bab17131f3184a7b4548c3d"));
-    let bytes = std::fs::read(root.join("rust-micro/.tmp/libernt/tree/Windows/system32/drivers").join(driver))
-        .expect("staged pinned driver");
-    let pe = nt_pe_loader::PeFile::parse(&bytes).expect("pinned driver PE");
-    pe.imports().expect("pinned driver imports")
-        .into_iter()
-        .filter(|dll| dll.name.eq_ignore_ascii_case("ntoskrnl.exe") || dll.name.eq_ignore_ascii_case("hal.dll"))
-        .flat_map(|dll| dll.functions)
-        .filter_map(|import| match import {
-            ImportRef::ByName { name, .. } => Some(name),
-            ImportRef::ByOrdinal { .. } => None,
-        })
-        .collect()
+    libernt_driver_imports::imports(driver, &["ntoskrnl.exe", "hal.dll"])
 }
 
 #[test]
@@ -561,4 +547,28 @@ fn pinned_acpi_pci_root_configuration_has_a_real_provider_ledger() {
         && adapter.contains("MemoryWindow")
         && adapter.contains("provider_bugcheck"),
         "VOID HAL import must publish validated PCI-root authority or terminate");
+}
+
+#[test]
+fn pinned_acpi_pci_route_query_retains_exact_callback_image() {
+    assert!(native_imports("acpi.sys").contains("HalpRegisterPciRouteQuery"));
+    let launch = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    assert!(launch.contains("reg.bind(\n        \"HalpRegisterPciRouteQuery\","));
+    let adapter = include_str!("../../../components/ntos-executive/src/hosted_driver_pci_route_query.rs");
+    assert!(adapter.contains("published_image_for_callback")
+        && adapter.contains("PciRouteCallbackLedger")
+        && adapter.contains("blocks_instance_retirement")
+        && adapter.contains("provider_bugcheck"));
+}
+
+#[test]
+fn pinned_dxg_contiguous_release_uses_exact_physical_allocation_owner() {
+    assert!(native_imports("dxgkrnl.sys").contains("MmFreeContiguousMemory"));
+    let launch = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    assert!(launch.contains("reg.bind(\n        \"MmFreeContiguousMemory\","));
+    let adapter = include_str!("../../../components/ntos-executive/src/hosted_driver_contiguous_memory.rs");
+    assert!(adapter.contains("validate_page_run")
+        && adapter.contains("hosted_component_physical_address")
+        && adapter.contains("pool_free")
+        && adapter.contains("provider_bugcheck"));
 }
