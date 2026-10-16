@@ -169,7 +169,7 @@ cd userspace-ntos
 ./run.sh --desktop      # same gate with a QEMU display window
 ```
 
-The launcher needs Rust nightly with `rust-src`, QEMU and OVMF, a C compiler, Python 3, `bsdtar`, and `7zz`. The first run downloads the pinned release; later runs use the verified cache under `rust-micro/.tmp/libernt/`. The generated image is `rust-micro/.tmp/disk.img`. Keep at least several gigabytes free for the archive, extracted tree, build output, and image. Set `BOOT_TIMEOUT_SECONDS` to a value up to 3600 to bound a boot attempt.
+The launcher needs Rust nightly with `rust-src`, QEMU and OVMF, a C compiler, `patch`, Python 3, `bsdtar`, and `7zz`. The first run downloads the pinned release; later runs use the verified cache under `rust-micro/.tmp/libernt/`. The generated image is `rust-micro/.tmp/disk.img`. Keep at least several gigabytes free for the archive, extracted tree, build output, and image. Set `BOOT_TIMEOUT_SECONDS` to a value up to 3600 to bound a boot attempt.
 
 The cutover is tracked in [issue #310](https://github.com/stakach/userspace-ntos/issues/310). The build compares every named export in the source-built ntdll with the pinned LiberNT DLL before packing; individual APIs still need native behavior validation. A crate build or image pack alone is not desktop proof: acceptance requires genuine Winlogon, Userinit, and Explorer execution, an Explorer screenshot, and the complete headless verdict. [Issue #18](https://github.com/stakach/userspace-ntos/issues/18) records the previous ReactOS desktop acceptance; it does not establish a LiberNT desktop boot.
 
