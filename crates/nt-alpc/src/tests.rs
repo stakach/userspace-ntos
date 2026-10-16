@@ -94,6 +94,110 @@ fn enc_create_lookup(owner: nt_port_core::ClientId, token: (u64, u64)) -> Vec<u8
     })
 }
 
+fn enc_owned_create_port(
+    name: &[u16],
+    owner: nt_port_core::ClientId,
+    token: (u64, u64),
+    attributes: nt_alpc_abi::AlpcPortAttributes,
+) -> Vec<u8> {
+    let mut request = enc_checked_create_port(name, owner, token);
+    let name_bytes = request.split_off(size_of::<nt_alpc_abi::AlpcCreatePortCheckedRequest>());
+    let header = (size_of::<nt_alpc_abi::AlpcCreatePortCheckedRequest>()
+        + size_of::<nt_alpc_abi::AlpcPortAttributes>()) as u16;
+    request[0..2].copy_from_slice(&header.to_le_bytes());
+    request[12..16].copy_from_slice(&(header as u32).to_le_bytes());
+    request[8..12].copy_from_slice(&(attributes.max_message_length as u32).to_le_bytes());
+    request[4..8].copy_from_slice(&attributes.flags.to_le_bytes());
+    request.extend_from_slice(bytemuck::bytes_of(&attributes));
+    request.extend_from_slice(&name_bytes);
+    request
+}
+
+#[test]
+fn owned_create_carries_smss_pool_and_security_qos_without_losing_replay_identity() {
+    let mut core = PortCore::new();
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId {
+        process: 7,
+        thread: 11,
+    };
+    let name = utf16("\\SmApiPort");
+    let attributes = nt_alpc_abi::AlpcPortAttributes {
+        max_message_length: 512,
+        max_pool_usage: 8192,
+        security_qos: nt_alpc_abi::SecurityQualityOfService {
+            length: 12,
+            impersonation_level: 1,
+            context_tracking_mode: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let request = enc_owned_create_port(&name, owner, (7, 8), attributes);
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &request, &mut []);
+    assert_eq!(created.status, SUCCESS);
+    assert_eq!(
+        core.handle_info(created.detail0)
+            .unwrap()
+            .limits
+            .max_pool_usage,
+        8192
+    );
+    assert_eq!(
+        alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &request, &mut []),
+        created
+    );
+    let mut changed = attributes;
+    changed.max_pool_usage = 4096;
+    let changed_request = enc_owned_create_port(&name, owner, (7, 8), changed);
+    assert_eq!(
+        alpc.dispatch(
+            &mut core,
+            aop::ALPC_OP_CREATE_PORT,
+            &changed_request,
+            &mut []
+        )
+        .status,
+        nt_status::NtStatus::INVALID_PARAMETER.0
+    );
+    let mut changed_qos = attributes;
+    changed_qos.security_qos.impersonation_level = 2;
+    let changed_request = enc_owned_create_port(&name, owner, (7, 8), changed_qos);
+    assert_eq!(
+        alpc.dispatch(
+            &mut core,
+            aop::ALPC_OP_CREATE_PORT,
+            &changed_request,
+            &mut []
+        )
+        .status,
+        nt_status::NtStatus::INVALID_PARAMETER.0
+    );
+}
+
+#[test]
+fn owned_create_rejects_unrepresented_limits_before_creating_a_port() {
+    let mut core = PortCore::new();
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId {
+        process: 7,
+        thread: 11,
+    };
+    let name = utf16("\\SmApiPort");
+    let attributes = nt_alpc_abi::AlpcPortAttributes {
+        max_message_length: 512,
+        max_pool_usage: u32::MAX as u64 + 1,
+        ..Default::default()
+    };
+    let request = enc_owned_create_port(&name, owner, (7, 9), attributes);
+    assert_eq!(
+        alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &request, &mut [])
+            .status,
+        nt_status::NtStatus::INVALID_PARAMETER.0
+    );
+    assert!(core.port_api(&name).is_none());
+}
+
 #[test]
 fn checked_create_reconciles_only_exact_owner_token_and_request() {
     let mut core = PortCore::new();

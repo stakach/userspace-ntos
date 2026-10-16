@@ -252,6 +252,15 @@ pub struct AlpcCreatePortCheckedRequest {
     pub invocation_lo: u64,
 }
 
+/// Native checked create with the caller's complete copied `ALPC_PORT_ATTRIBUTES`.
+/// The 64-byte checked prefix remains supported for older in-tree callers.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AlpcCreatePortOwnedRequest {
+    pub checked: AlpcCreatePortCheckedRequest,
+    pub attributes: AlpcPortAttributes,
+}
+
 /// Read the result of a prior checked create. Absence is inconclusive if a ring
 /// submission may still be in flight; callers must not treat it as replay authority.
 #[repr(C)]
@@ -407,6 +416,7 @@ const _: () = {
     // Service wire structs.
     assert!(size_of::<AlpcCreatePortRequest>() == 24);
     assert!(size_of::<AlpcCreatePortCheckedRequest>() == 64);
+    assert!(size_of::<AlpcCreatePortOwnedRequest>() == 136);
     assert!(size_of::<AlpcLookupCreatePortRequest>() == 48);
     assert!(size_of::<AlpcConnectPortRequest>() == 40);
     assert!(size_of::<AlpcAcceptConnectRequest>() == 24);

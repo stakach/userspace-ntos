@@ -52,10 +52,11 @@ use core::mem::size_of;
 use bytemuck::Pod;
 use nt_alpc_abi::{
     msg_attr_flag, opcode, send_flag, AlpcAcceptConnectRequest, AlpcConnectPortRequest,
-    AlpcContextAttr, AlpcCreatePortCheckedRequest, AlpcCreatePortRequest,
-    AlpcCreatePortSectionRequest, AlpcCreateSectionViewRequest, AlpcDataViewAttr, AlpcHandleAttr,
-    AlpcHandleRequest, AlpcLookupCreatePortRequest, AlpcMessageAttributes, AlpcReply,
-    AlpcSecurityAttr, AlpcSendReceiveRequest, AlpcTokenAttr, AlpcViewIoRequest,
+    AlpcContextAttr, AlpcCreatePortCheckedRequest, AlpcCreatePortOwnedRequest,
+    AlpcCreatePortRequest, AlpcCreatePortSectionRequest, AlpcCreateSectionViewRequest,
+    AlpcDataViewAttr, AlpcHandleAttr, AlpcHandleRequest, AlpcLookupCreatePortRequest,
+    AlpcMessageAttributes, AlpcPortAttributes, AlpcReply, AlpcSecurityAttr, AlpcSendReceiveRequest,
+    AlpcTokenAttr, AlpcViewIoRequest,
 };
 use nt_port_core::{
     ClientId, ConnectOutcome, DataView, MessageAttrs, PortApi, PortCore, PortHandleEndpoint,
@@ -185,6 +186,7 @@ struct CreatePortResult {
     owner_generation: u64,
     token: (u64, u64),
     request: AlpcCreatePortRequest,
+    attributes: Option<AlpcPortAttributes>,
     name: Vec<u16>,
     result: AlpcReply,
 }
@@ -259,7 +261,9 @@ impl AlpcServer {
 
     fn op_create_port(&mut self, core: &mut PortCore, buf: &[u8]) -> Result<AlpcReply, NtStatus> {
         let req: AlpcCreatePortRequest = read_req(buf)?;
-        if req.abi_size as usize == size_of::<AlpcCreatePortCheckedRequest>() {
+        if req.abi_size as usize == size_of::<AlpcCreatePortCheckedRequest>()
+            || req.abi_size as usize == size_of::<AlpcCreatePortOwnedRequest>()
+        {
             return self.op_create_port_checked(core, buf);
         }
         if req.abi_size as usize != size_of::<AlpcCreatePortRequest>() {
@@ -284,6 +288,44 @@ impl AlpcServer {
         buf: &[u8],
     ) -> Result<AlpcReply, NtStatus> {
         let req: AlpcCreatePortCheckedRequest = read_req(buf)?;
+        let attributes = if req.create.abi_size as usize == size_of::<AlpcCreatePortOwnedRequest>()
+        {
+            let owned: AlpcCreatePortOwnedRequest = read_req(buf)?;
+            let attrs = owned.attributes;
+            if owned.checked != req
+                || attrs.flags != req.create.port_flags
+                || attrs.max_message_length != u64::from(req.create.max_message_length)
+                || attrs.max_pool_usage > u32::MAX as u64
+                || attrs.flags != 0
+                || attrs.memory_bandwidth != 0
+                || attrs.max_section_size != 0
+                || attrs.max_view_size != 0
+                || attrs.max_total_section_size != 0
+                || attrs.dup_object_types != 0
+                || attrs.reserved != 0
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            let qos = attrs.security_qos;
+            if (qos.length != 0
+                && qos.length != size_of::<nt_alpc_abi::SecurityQualityOfService>() as u32)
+                || (qos.length == 0
+                    && (qos.impersonation_level != 0
+                        || qos.context_tracking_mode != 0
+                        || qos.effective_only != 0))
+                || qos.impersonation_level > 3
+                || qos.context_tracking_mode > 1
+                || qos.effective_only > 1
+                || qos._pad != 0
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            Some(attrs)
+        } else if req.create.abi_size as usize == size_of::<AlpcCreatePortCheckedRequest>() {
+            None
+        } else {
+            return Err(NtStatus::INVALID_PARAMETER);
+        };
         let owner = ClientId {
             process: req.owner_process,
             thread: req.owner_thread,
@@ -293,7 +335,7 @@ impl AlpcServer {
             || owner.thread == 0
             || req.owner_generation == 0
             || token == (0, 0)
-            || req.create.name_offset < size_of::<AlpcCreatePortCheckedRequest>() as u32
+            || req.create.name_offset < req.create.abi_size as u32
             || req.create._reserved != 0
             || req.create._reserved2 != 0
         {
@@ -308,7 +350,7 @@ impl AlpcServer {
             if saved.owner != owner || saved.owner_generation != req.owner_generation {
                 return Err(NtStatus::OBJECT_NAME_COLLISION);
             }
-            if saved.request != req.create || saved.name != name {
+            if saved.request != req.create || saved.attributes != attributes || saved.name != name {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
             return Ok(self.live_create_result(core, saved));
@@ -325,7 +367,7 @@ impl AlpcServer {
             PortLimits {
                 max_connection_info: MAX_CONNINFO as u32,
                 max_message: req.create.max_message_length,
-                max_pool_usage: 0,
+                max_pool_usage: attributes.map_or(0, |attrs| attrs.max_pool_usage as u32),
             },
         ) {
             Ok(handle) => reply(NtStatus::SUCCESS, 0, handle, 0),
@@ -336,6 +378,7 @@ impl AlpcServer {
             owner_generation: req.owner_generation,
             token,
             request: req.create,
+            attributes,
             name,
             result,
         });
