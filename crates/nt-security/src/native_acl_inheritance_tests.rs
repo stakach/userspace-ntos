@@ -551,7 +551,7 @@ fn empty_result_remains_concrete_empty_acl_with_parent_revision() {
 
 #[test]
 fn unsupported_types_fail_explicitly_even_when_not_inheritable() {
-    for kind in [9, 10, 11, 12, 13, 14, 15, 16, 17, 255] {
+    for kind in [9, 10, 11, 12, 13, 14, 15, 16, 255] {
         let parent = acl(4, &[vec![kind, 0, 4, 0]]);
         assert_eq!(
             inherit_native_acl(
@@ -570,6 +570,25 @@ fn unsupported_types_fail_explicitly_even_when_not_inheritable() {
             Err(STATUS_NOT_SUPPORTED)
         );
     }
+    // Type 17 is now a known mandatory-label ACE. A four-byte ACE is a
+    // malformed instance of that type, rather than an unsupported extension.
+    let malformed_label = acl(4, &[vec![17, 0, 4, 0]]);
+    assert_eq!(
+        inherit_native_acl(
+            &malformed_label,
+            &NativeAclInheritance {
+                is_container: true,
+                auto_inherit: true,
+                owner: &Sid::local_system(),
+                group: &Sid::administrators(),
+                server_owner: None,
+                server_group: None,
+                mapping: &mapping(),
+                object_type: None,
+            }
+        ),
+        Err(STATUS_INVALID_ACL)
+    );
 }
 
 #[test]

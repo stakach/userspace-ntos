@@ -88,7 +88,8 @@ pub use native_sd::{
     UNPROTECTED_SACL_SECURITY_INFORMATION,
 };
 pub use port::{
-    validate_secure_port_connect, SecurePortConnectSecurity, STATUS_SERVER_SID_MISMATCH,
+    authorize_port_connect, validate_secure_port_connect, SecurePortConnectSecurity,
+    PORT_CONNECT, PORT_GENERIC_MAPPING, STATUS_SERVER_SID_MISMATCH,
 };
 pub use section_security::{
     assign_section_security, authorize_section_open, SECTION_GENERIC_MAPPING,
