@@ -66,6 +66,9 @@ pub mod find_exported_routine;
 /// Released loader ABI entries backed by the process module table or explicit failure.
 pub mod loader_extra;
 
+/// Writable ntdll loader entry table for released WOW64 bootstrap consumers.
+pub mod loader_init_block;
+
 /// Explicit unsupported entries declared as stubs by the reference source spec.
 pub mod source_declared_stubs;
 
@@ -83,6 +86,18 @@ pub mod hash_table;
 
 /// UTF-8, system-time, and security-error compatibility entries.
 pub mod misc_rtl_exports;
+
+/// Growable unwind tables and extended x64 context operations.
+pub mod context_function_exports;
+
+/// Additional token, SID, and security helpers.
+pub mod security_sid_extra;
+
+/// Remaining registry, heap, locale, and platform export ABI entries.
+pub mod remaining_misc_exports;
+
+/// Source-checked ALPC, WNF, CFG, heap flush, and fault-label ABI entries.
+pub mod release_tail_exports;
 
 /// Query whether a process handle names the current process.
 pub mod current_process;
@@ -1371,6 +1386,18 @@ static KEEP_SYSTEM_TIME_PRECISE_EXPORTS: unsafe extern "C" fn() =
 static KEEP_TIME_EXPORTS: unsafe extern "C" fn() = time_exports::TIME_EXPORT_ANCHOR_FN;
 
 #[used]
+static KEEP_CONTEXT_FUNCTION_EXPORTS: unsafe extern "C" fn() =
+    context_function_exports::CONTEXT_FUNCTION_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_REMAINING_MISC_EXPORTS: unsafe extern "C" fn() =
+    remaining_misc_exports::REMAINING_MISC_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_RELEASE_TAIL_EXPORTS: unsafe extern "C" fn() =
+    release_tail_exports::RELEASE_TAIL_EXPORT_ANCHOR_FN;
+
+#[used]
 static KEEP_FIND_EXPORTED_ROUTINE: unsafe extern "C" fn() =
     find_exported_routine::FIND_EXPORTED_ROUTINE_ANCHOR_FN;
 
@@ -1448,6 +1475,9 @@ pub unsafe extern "C" fn LdrpInitialize(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
+        if !ntdll_base.is_null() {
+            loader_init_block::install(ntdll_base as usize);
+        }
         let peb: u64;
         unsafe {
             core::arch::asm!(
@@ -1612,16 +1642,19 @@ pub unsafe extern "system" fn DllMainCRTStartup(
     unsafe { DllMain(module, reason, reserved) }
 }
 
-/// `DllMain` — present so the linker does not pull in the CRT's `_DllMainCRTStartup`. Returns TRUE.
+/// `DllMain` — publishes the loaded ntdll base and bootstrap entries on process attach.
 ///
 /// # Safety
-/// The standard `DllMain` contract; a no-op that reports success.
+/// The standard `DllMain` contract; reports success after local data publication.
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DllMain(
-    _module: *mut c_void,
-    _reason: u32,
+    module: *mut c_void,
+    reason: u32,
     _reserved: *mut c_void,
 ) -> i32 {
+    if reason == 1 {
+        loader_init_block::install(module as usize);
+    }
     1 // TRUE
 }
 
