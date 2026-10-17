@@ -190,6 +190,47 @@ pub(crate) unsafe fn hosted_pci_topology_generations() -> Option<(u64, u64, u64)
     ))
 }
 
+/// Select the sole live display BAR enclosing the Simpleboot scanout. The PCI inventory,
+/// rather than the scanout physical number or a device name, establishes BAR identity.
+#[derive(Clone, Copy)]
+pub(crate) struct HostedGopPciBar {
+    pub(crate) inventory_generation: u64,
+    pub(crate) class: u32,
+    pub(crate) bus: u8,
+    pub(crate) device: u8,
+    pub(crate) function: u8,
+    pub(crate) bar_index: u8,
+    pub(crate) base: u64,
+    pub(crate) frames: u64,
+}
+
+pub(crate) unsafe fn unique_hosted_gop_display_bar(
+    scanout_start: u64,
+    scanout_bytes: u64,
+) -> Option<HostedGopPciBar> {
+    let authority = (*core::ptr::addr_of!(HOSTED_PCI_TOPOLOGY)).as_ref()?;
+    let end = scanout_start.checked_add(scanout_bytes)?;
+    if scanout_start == 0 || scanout_bytes == 0 { return None; }
+    let mut selected = None;
+    for device in authority.inventory.devices() {
+        if device.base_class() != nt_pnp::PCI_CLASS_DISPLAY { continue; }
+        for bar in &device.bars {
+            if bar.is_io || !bar.is_assigned() || bar.base & 0xfff != 0
+                || bar.size & 0xfff != 0 { continue; }
+            let Some(bar_end) = bar.base.checked_add(bar.size) else { continue; };
+            if scanout_start < bar.base || end > bar_end { continue; }
+            if selected.is_some() { return None; }
+            selected = Some(HostedGopPciBar {
+                inventory_generation: authority.inventory.generation(),
+                class: device.class,
+                bus: device.bus, device: device.dev, function: device.func,
+                bar_index: bar.index, base: bar.base, frames: bar.size >> 12,
+            });
+        }
+    }
+    selected
+}
+
 fn route_status(_error: nt_pnp::PciInterruptRouteError) -> nt_status::NtStatus {
     nt_status::NtStatus::INVALID_DEVICE_REQUEST
 }

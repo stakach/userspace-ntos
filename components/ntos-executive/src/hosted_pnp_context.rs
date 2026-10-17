@@ -559,6 +559,13 @@ pub(crate) unsafe fn retire_hosted_pnp_context_owner(
     retire_or_retain(owner)
 }
 
+/// A caller with its own generation row keeps the owner in that row if teardown is uncertain.
+pub(crate) unsafe fn try_retire_hosted_pnp_context_owner(
+    owner: HostedPnpContextOwner,
+) -> Result<(), HostedPnpContextOwner> {
+    owner.retire()
+}
+
 pub(crate) unsafe fn retry_hosted_pnp_context_retirements() -> usize {
     let pending_count = hosted_pnp_context_authority_mut().pending_retirements.len();
     let mut failures = Vec::new();

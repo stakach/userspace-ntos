@@ -3,6 +3,9 @@
 use super::*;
 use core::sync::atomic::AtomicBool;
 
+#[path = "hosted_gop_bar_projection.rs"]
+mod hosted_gop_bar_projection;
+
 /// Once a display driver takes postdisplay ownership, this boot-video owner never paints again.
 static DISPLAY_OWNERSHIP_LOST: AtomicBool = AtomicBool::new(false);
 
@@ -162,4 +165,40 @@ pub(crate) fn service_hosted_driver_gop_query(
         core::ptr::write_unaligned(arg as *mut LoaderParameterFramebuffer, record);
     }
     1
+}
+
+/// Project only the Simpleboot scanout backed by the unique live PCI display BAR into the
+/// authenticated Dxg provider or registered miniport VSpace. The owner persists until that
+/// hosted instance is retired.
+pub(crate) fn service_hosted_driver_gop_map(
+    channel: &crate::spawn_hosts::PumpChannel,
+    caller_badge: u64,
+    reply_cap: u64,
+    phys: u64,
+    len: u64,
+    cache: u64,
+) -> u64 {
+    unsafe { hosted_gop_bar_projection::map_scanout(
+        channel, caller_badge, reply_cap, phys, len, cache,
+    ) }
+}
+
+pub(super) unsafe fn retire_hosted_gop_projection(
+    instance_index: usize,
+    domain: HostedDomainIdentity,
+    pml4: u64,
+) -> Result<(), nt_status::NtStatus> {
+    hosted_gop_bar_projection::retire_instance(instance_index, domain, pml4)
+}
+
+pub(crate) unsafe fn legacy_vga_port_fault_grant(
+    channel: &crate::spawn_hosts::PumpChannel,
+    active_reply_cap: u64,
+    port: u16,
+    read: bool,
+    width_bits: u8,
+) -> Option<HostedIoPortFaultGrant> {
+    hosted_gop_bar_projection::legacy_vga_port_fault_grant(
+        channel, active_reply_cap, port, read, width_bits,
+    )
 }

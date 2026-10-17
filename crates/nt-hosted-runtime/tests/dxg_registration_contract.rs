@@ -9,14 +9,187 @@ use nt_hosted_runtime::{
     DxgInitializationDataError, DxgRegistrationKey, DxgSourceDriverObject, DxgDdiSignature,
     DxgPdoAliasAuthority, DxgStartInterface, DxgStartInterfaceError,
     hosted_dxg_acquire_post_display_marshal_policy,
+    dxg_scanout_dependent_admitted,
     HostedProviderArgumentMarshal,
     HostedProviderExportResultSemantics, HostedProviderExportSideEffect, HostedProviderObjectOwner,
 };
+
+#[test]
+fn child_relations_callback_uses_bounded_descriptor_array() {
+    use nt_hosted_runtime::{DxgChildRelationsLayout, DxgDdiSignature};
+    let version = 0x11007;
+    assert_eq!(DxgDdiSignature::for_offset(version, 0x40),
+        Some(DxgDdiSignature::QueryChildRelations));
+    assert_eq!(DxgDdiSignature::QueryChildRelations.argument_count(), 3);
+    assert_eq!(DxgChildRelationsLayout::new(0x38, 0x1000).unwrap().bytes(), 0x38);
+    assert_eq!(DxgChildRelationsLayout::new(0x1c, 0x1000).unwrap().bytes(), 0x1c);
+    assert!(DxgChildRelationsLayout::new(0x1b, 0x1000).is_none());
+    assert!(DxgChildRelationsLayout::new(0x39, 0x1000).is_none());
+    assert!(DxgChildRelationsLayout::new(0x38, 0x37).is_none());
+    assert!(DxgChildRelationsLayout::new(0x1c000, 0x1000).is_none());
+}
+
+#[test]
+fn query_adapter_info_uses_pinned_x64_pointer_and_size_prefix() {
+    use nt_hosted_runtime::{DxgDdiSignature, DxgQueryAdapterInfoPrefix};
+    assert_eq!(DxgDdiSignature::for_offset(0x11007, 0x88),
+        Some(DxgDdiSignature::QueryAdapterInfo));
+    assert_eq!(DxgDdiSignature::QueryAdapterInfo.argument_count(), 2);
+    let mut bytes = [0u8; 0x28];
+    bytes[0..4].copy_from_slice(&1u32.to_le_bytes());
+    bytes[0x18..0x20].copy_from_slice(&0x1000u64.to_le_bytes());
+    bytes[0x20..0x24].copy_from_slice(&0x100u32.to_le_bytes());
+    let query = DxgQueryAdapterInfoPrefix::parse(&bytes, 0x1000).unwrap();
+    assert_eq!(query.kind(), 1);
+    assert_eq!(query.output(), (0x1000, 0x100));
+    assert_eq!(query.input(), (0, 0));
+    assert!(DxgQueryAdapterInfoPrefix::parse(&bytes[..0x27], 0x1000).is_none());
+    assert!(DxgQueryAdapterInfoPrefix::parse(&bytes, 0xff).is_none());
+    bytes[0x18..0x20].fill(0);
+    assert!(DxgQueryAdapterInfoPrefix::parse(&bytes, 0x1000).is_none());
+}
+
+#[test]
+fn query_segment_nested_descriptors_are_bounded_by_pinned_version() {
+    use nt_hosted_runtime::{DxgQueryAdapterInfoPrefix, DxgSegmentQueryLayout};
+    for (kind, input_len, output_len, descriptor_len) in [
+        (2u32, 0x18u32, 0x20u32, 0x38u64),
+        (5, 0x18, 0x20, 0x48),
+        (11, 4, 0x28, 0x60),
+    ] {
+        let mut query = [0u8; 0x28];
+        query[0..4].copy_from_slice(&kind.to_le_bytes());
+        query[8..16].copy_from_slice(&0x1000u64.to_le_bytes());
+        query[0x10..0x14].copy_from_slice(&input_len.to_le_bytes());
+        query[0x18..0x20].copy_from_slice(&0x2000u64.to_le_bytes());
+        query[0x20..0x24].copy_from_slice(&output_len.to_le_bytes());
+        let prefix = DxgQueryAdapterInfoPrefix::parse(&query, 0x800).unwrap();
+        let mut output = [0u8; 0x28];
+        output[0..4].copy_from_slice(&2u32.to_le_bytes());
+        if kind == 11 {
+            output[0x20..0x28].copy_from_slice(&descriptor_len.to_le_bytes());
+        }
+        let first = DxgSegmentQueryLayout::parse(prefix, &output[..output_len as usize], 0x800).unwrap();
+        assert_eq!(first.descriptors(), (0, 0));
+        output[8..16].copy_from_slice(&0x3000u64.to_le_bytes());
+        let nested = DxgSegmentQueryLayout::parse(prefix, &output[..output_len as usize], 0x800).unwrap();
+        assert_eq!(nested.descriptors(), (0x3000, descriptor_len * 2));
+        assert!(DxgSegmentQueryLayout::parse(prefix, &output[..output_len as usize], descriptor_len * 2 - 1).is_none());
+        output[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(DxgSegmentQueryLayout::parse(prefix, &output[..output_len as usize], 0x800).is_none());
+    }
+}
+
+#[test]
+fn query_segment_rejects_unknown_kind_and_short_fixed_buffers() {
+    use nt_hosted_runtime::{DxgQueryAdapterInfoPrefix, DxgSegmentQueryLayout};
+    let mut query = [0u8; 0x28];
+    query[8..16].copy_from_slice(&0x1000u64.to_le_bytes());
+    query[0x10..0x14].copy_from_slice(&0x18u32.to_le_bytes());
+    query[0x18..0x20].copy_from_slice(&0x2000u64.to_le_bytes());
+    query[0x20..0x24].copy_from_slice(&0x20u32.to_le_bytes());
+    let output = [0u8; 0x28];
+    let unknown = DxgQueryAdapterInfoPrefix::parse(&query, 0x800).unwrap();
+    assert!(DxgSegmentQueryLayout::parse(unknown, &output, 0x800).is_none());
+    query[0..4].copy_from_slice(&5u32.to_le_bytes());
+    query[0x10..0x14].copy_from_slice(&0x17u32.to_le_bytes());
+    let short_input = DxgQueryAdapterInfoPrefix::parse(&query, 0x800).unwrap();
+    assert!(DxgSegmentQueryLayout::parse(short_input, &output, 0x800).is_none());
+    query[0x10..0x14].copy_from_slice(&0x18u32.to_le_bytes());
+    query[0x20..0x24].copy_from_slice(&0x1fu32.to_le_bytes());
+    let short_output = DxgQueryAdapterInfoPrefix::parse(&query, 0x800).unwrap();
+    assert!(DxgSegmentQueryLayout::parse(short_output, &output, 0x800).is_none());
+}
+
+#[test]
+fn query_driver_caps_accepts_pinned_fixed_prefix_and_larger_provider_output() {
+    use nt_hosted_runtime::{DxgDriverCapsLayout, DxgQueryAdapterInfoPrefix};
+    let mut query = [0u8; 0x28];
+    query[0..4].copy_from_slice(&1u32.to_le_bytes());
+    query[0x18..0x20].copy_from_slice(&0x2000u64.to_le_bytes());
+    for size in [0x250u32, 0x400] {
+        query[0x20..0x24].copy_from_slice(&size.to_le_bytes());
+        let prefix = DxgQueryAdapterInfoPrefix::parse(&query, 0x800).unwrap();
+        assert_eq!(DxgDriverCapsLayout::parse(prefix, 0x800).unwrap().output_bytes(), size as u64);
+    }
+    query[0x20..0x24].copy_from_slice(&0x24fu32.to_le_bytes());
+    let short = DxgQueryAdapterInfoPrefix::parse(&query, 0x800).unwrap();
+    assert!(DxgDriverCapsLayout::parse(short, 0x800).is_none());
+    query[0x20..0x24].copy_from_slice(&0x250u32.to_le_bytes());
+    query[8..16].copy_from_slice(&0x1000u64.to_le_bytes());
+    query[0x10..0x14].copy_from_slice(&4u32.to_le_bytes());
+    let input = DxgQueryAdapterInfoPrefix::parse(&query, 0x800).unwrap();
+    assert!(DxgDriverCapsLayout::parse(input, 0x800).is_none());
+}
+
+#[test]
+fn query_copyback_restores_only_segment_nested_pointer() {
+    use nt_hosted_runtime::dxg_query_restores_nested_pointer;
+    assert!(!dxg_query_restores_nested_pointer(1));
+    for kind in [2, 5, 11] {
+        assert!(dxg_query_restores_nested_pointer(kind));
+    }
+    assert!(!dxg_query_restores_nested_pointer(0));
+}
+
+#[test]
+fn query_fixed_and_nested_output_regions_must_not_overlap() {
+    use nt_hosted_runtime::dxg_query_output_regions_disjoint;
+    assert!(dxg_query_output_regions_disjoint(0x1000, 0x28, 0, 0));
+    assert!(dxg_query_output_regions_disjoint(0x1000, 0x28, 0x1028, 0x60));
+    assert!(!dxg_query_output_regions_disjoint(0x1000, 0x28, 0x1010, 0x60));
+    assert!(!dxg_query_output_regions_disjoint(0x1000, 0x28, 0xff0, 0x20));
+    assert!(!dxg_query_output_regions_disjoint(u64::MAX - 4, 0x28, 0, 0));
+}
+
+#[test]
+fn stop_device_rollback_requires_exact_started_context_once() {
+    use nt_hosted_runtime::dxg_stop_device_admitted;
+    assert!(dxg_stop_device_admitted(true, true, false, false, false, false,
+        0x1000, 0x1000));
+    assert!(!dxg_stop_device_admitted(true, true, true, false, false, false,
+        0x1000, 0x1000));
+    assert!(!dxg_stop_device_admitted(true, true, false, true, false, false,
+        0x1000, 0x1000));
+    assert!(!dxg_stop_device_admitted(true, true, false, false, true, false,
+        0x1000, 0x1000));
+    assert!(!dxg_stop_device_admitted(true, true, false, false, false, false,
+        0x1000, 0x2000));
+    assert!(!dxg_stop_device_admitted(true, false, false, false, false, false,
+        0x1000, 0x1000));
+}
 
 fn table(version: u32, size: usize) -> Vec<u8> {
     let mut bytes = vec![0; size];
     bytes[..4].copy_from_slice(&version.to_le_bytes());
     bytes
+}
+
+#[test]
+fn active_start_callback_may_use_scanout_while_retained_uncertainty_stays_blocked() {
+    assert!(dxg_scanout_dependent_admitted(true, true, false, true, true, false, 0x1000));
+    assert!(dxg_scanout_dependent_admitted(true, true, true, false, false, false, 0x1000));
+    assert!(!dxg_scanout_dependent_admitted(true, true, true, false, true, false, 0x1000));
+    assert!(!dxg_scanout_dependent_admitted(true, true, true, true, true, true, 0x1000));
+    assert!(!dxg_scanout_dependent_admitted(true, false, false, true, true, false, 0x1000));
+    assert!(!dxg_scanout_dependent_admitted(false, true, false, true, true, false, 0x1000));
+    assert!(!dxg_scanout_dependent_admitted(true, true, false, true, true, false, 0));
+}
+
+#[test]
+fn failed_start_cannot_reopen_scanout_after_callback_returns() {
+    assert!(!dxg_scanout_dependent_admitted(
+        true, true, false, false, false, false, 0x1000));
+}
+
+#[test]
+fn provider_worker_scanout_requires_exact_live_dxg_registration() {
+    use nt_hosted_runtime::dxg_scanout_provider_admitted;
+    assert!(dxg_scanout_provider_admitted(7, 11, 12, 13, 7, 11, 12, 13, true));
+    assert!(!dxg_scanout_provider_admitted(7, 11, 12, 13, 7, 11, 12, 13, false));
+    assert!(!dxg_scanout_provider_admitted(7, 11, 12, 13, 8, 11, 12, 13, true));
+    assert!(!dxg_scanout_provider_admitted(7, 11, 12, 13, 7, 11, 99, 13, true));
+    assert!(!dxg_scanout_provider_admitted(7, 11, 12, 13, 7, 11, 12, 14, true));
 }
 
 fn put_callback(bytes: &mut [u8], offset: usize, address: u64) {

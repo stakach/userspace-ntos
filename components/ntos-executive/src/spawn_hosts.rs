@@ -2107,7 +2107,7 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
             continue;
         }
         if label == 3 {
-            if let Some(next_ip) = pump_service_io_port_fault(ch, msg.m0, msg.m3) {
+            if let Some(next_ip) = pump_service_io_port_fault(ch, ch.reply_cap, msg.m0, msg.m3) {
                 msg = hosted_irq_reply_recv(
                     ch, ch.reply_cap, 1, [next_ip, 0, 0, 0], identity, expected_badge,
                 );
@@ -2479,7 +2479,7 @@ unsafe fn component_pump_loop(
         // in the same driver instance owns the controller port. The decoder
         // and exact hosted grant selector decide whether this GP is I/O.
         if label == 3 {
-            if let Some(next_ip) = pump_service_io_port_fault(ch, msg.m0, msg.m3) {
+            if let Some(next_ip) = pump_service_io_port_fault(ch, *reply_cap, msg.m0, msg.m3) {
                 pump_reply_recv_into!(ch, *reply_cap, msg, 1, next_ip);
                 continue;
             }
@@ -3636,12 +3636,16 @@ unsafe fn component_pump_loop(
         } else if label == crate::driver_launch::FSD_SERVICE_GOP_QUERY_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
-            let valid = if msg.mi == (crate::driver_launch::FSD_SERVICE_GOP_QUERY_LABEL << 12) {
+            let result = if msg.mi == (crate::driver_launch::FSD_SERVICE_GOP_QUERY_LABEL << 12) {
                 crate::driver_launch::service_hosted_driver_gop_query(ch, msg.badge, *reply_cap)
+            } else if msg.mi == ((crate::driver_launch::FSD_SERVICE_GOP_QUERY_LABEL << 12) | 3) {
+                crate::driver_launch::service_hosted_driver_gop_map(
+                    ch, msg.badge, *reply_cap, msg.m0, msg.m1, msg.m2,
+                )
             } else {
                 0
             };
-            pump_reply_recv4_into!(ch, *reply_cap, msg, 1, valid, 0, 0, 0);
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 1, result, 0, 0, 0);
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_DISPLAY_OWNERSHIP_LABEL
             && ch.caps.kind == ReqKind::Irp
@@ -4904,6 +4908,7 @@ unsafe fn pump_service_generic_fault(
 #[inline(never)]
 unsafe fn pump_service_io_port_fault(
     ch: &PumpChannel,
+    active_reply_cap: u64,
     fault_ip: u64,
     exception_number: u64,
 ) -> Option<u64> {
@@ -4985,7 +4990,11 @@ unsafe fn pump_service_io_port_fault(
         nt_kernel_exec::x86_io::PortIoPort::Dx => (regs[6] & 0xFFFF) as u16,
         nt_kernel_exec::x86_io::PortIoPort::Immediate(port) => port as u16,
     };
-    let grant = crate::driver_launch::hosted_io_port_fault_grant(sh, port)?;
+    let grant = crate::driver_launch::hosted_io_port_fault_grant(sh, port).or_else(|| {
+        crate::driver_launch::hosted_legacy_vga_port_fault_grant(
+            ch, active_reply_cap, port, is_in, bits,
+        )
+    })?;
     let port_cap = grant.cap;
     let port_base = grant.base;
     let port_len = grant.len;

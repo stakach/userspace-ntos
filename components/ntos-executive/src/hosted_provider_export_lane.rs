@@ -421,6 +421,30 @@ pub(super) unsafe fn executive_arg_for_shared(shared: u64) -> Option<u64> {
     }).map(|row| row.executive_shared + (ARG_OFFSET - BANK_OFFSET))
 }
 
+/// Authority for a nested provider import while its independent export worker is executing.
+/// The caller separately authenticates the pump's current Reply and badge before using this.
+pub(super) unsafe fn authority_for_channel(
+    channel: &crate::spawn_hosts::PumpChannel,
+) -> Option<(usize, HostedProviderObjectOwner, u64)> {
+    let row = (&*core::ptr::addr_of!(LANES)).iter().find(|row| {
+        row.executive_shared == channel.shared_va && row.phase == Phase::Entered
+            && channel.physical_domain == Some(row.domain)
+            && instance(row.provider).is_some_and(|inst| inst.pml4 == row.pml4)
+    })?;
+    let route = runtime::channel_route(channel).ok()??;
+    let source = runtime::physical_source(route).ok()?;
+    let worker = worker(row.provider, row.ordinal)?;
+    let enrollment = hosted_ingress_sources::enrollment(source)?;
+    if row.route != Some(route) || worker.tcb != channel.tcb
+        || enrollment.route != Some(route) || source.tcb != worker.tcb
+        || source.pml4 != row.pml4
+        || !matches!(source.kind, runtime::PhysicalSourceKind::DispatchWorker { ordinal }
+            if ordinal == row.ordinal)
+        || !row.owner.provider_matches(row.domain.domain_id.raw(), row.domain.cookie)
+    { return None; }
+    Some((row.provider, row.owner, row.publication))
+}
+
 unsafe extern "win64" fn entry(shared: u64) {
     let ready = [read_volatile((shared + 0x80) as *const u64),
         read_volatile((shared + 0x88) as *const u64),

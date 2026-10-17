@@ -566,11 +566,19 @@ fn pinned_dxg_contiguous_release_uses_exact_physical_allocation_owner() {
     assert!(native_imports("dxgkrnl.sys").contains("MmFreeContiguousMemory"));
     let launch = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
     assert!(launch.contains("reg.bind(\n        \"MmFreeContiguousMemory\","));
-    let adapter = include_str!("../../../components/ntos-executive/src/hosted_driver_contiguous_memory.rs");
-    assert!(adapter.contains("validate_page_run")
-        && adapter.contains("hosted_component_physical_address")
-        && adapter.contains("pool_free")
-        && adapter.contains("provider_bugcheck"));
+    use nt_hosted_runtime::{ContiguousRamLeaseBank, ContiguousRamLeaseSource, ContiguousRamOwner};
+    let owner = ContiguousRamOwner { instance: 7, generation: 19, domain: 23 };
+    let stale = ContiguousRamOwner { generation: 20, ..owner };
+    let mut bank = ContiguousRamLeaseBank::new();
+    let lease = bank.reserve(owner).unwrap();
+    bank.attach_resources(owner, lease.slot, 0x9000, 0xa000, 16_384).unwrap();
+    assert!(bank.confirm_clean(stale, lease.slot).is_err(),
+        "a new domain generation cannot free the pinned dxgkrnl allocation");
+    bank.confirm_clean(owner, lease.slot).unwrap();
+    let next = bank.reserve(stale).unwrap();
+    assert_eq!(next.source, ContiguousRamLeaseSource::Reuse {
+        child: 0x9000, cap_base: 0xa000, capacity_frames: 16_384,
+    });
 }
 
 #[test]

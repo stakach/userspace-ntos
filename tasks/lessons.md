@@ -697,3 +697,6 @@ diagnosis-free failure.
 
 ## Test Native Boundaries Through Their Domain Contracts
 - A source-string assertion that only repeats the intended implementation is not a useful regression. Prove filtering, generation, ownership, and selector behavior in the relevant domain or protocol tests, then verify native wiring with a build and boot.
+
+## Preserve The RED Checkpoint With A Sole Test Owner
+- When another agent is the sole build and test owner, save the reproducing regression and stop editing until that agent reports the RED result. Implementing immediately can turn the requested RED checkpoint into an unobserved test.

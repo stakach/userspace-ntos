@@ -256,6 +256,7 @@ mod hosted_driver_push_lock;
 #[path = "hosted_driver_gop.rs"]
 mod hosted_driver_gop;
 pub(crate) use hosted_driver_gop::service_hosted_driver_gop_query;
+pub(crate) use hosted_driver_gop::service_hosted_driver_gop_map;
 pub(crate) use hosted_driver_gop::service_hosted_driver_display_ownership_lost;
 #[path = "hosted_driver_device_interfaces.rs"]
 mod hosted_driver_device_interfaces;
@@ -325,6 +326,8 @@ pub(crate) mod hosted_driver_pci_route_query;
 pub(crate) const FSD_SERVICE_PCI_ROUTE_QUERY_LABEL: u64 = hosted_driver_pci_route_query::LABEL;
 #[path = "hosted_driver_contiguous_memory.rs"]
 mod hosted_driver_contiguous_memory;
+#[path = "hosted_contiguous_ram_broker.rs"]
+mod hosted_contiguous_ram_broker;
 #[path = "hosted_driver_physical_ranges.rs"]
 mod hosted_driver_physical_ranges;
 #[path = "hosted_driver_cr8_fault.rs"]
@@ -5948,6 +5951,10 @@ const HOSTED_DEVICE_OP_GET_INTERFACE_BEGIN: u64 = 28;
 const HOSTED_DEVICE_OP_GET_INTERFACE_PULL: u64 = 29;
 const HOSTED_DEVICE_OP_GET_INTERFACE_ABORT: u64 = 30;
 const HOSTED_DEVICE_OP_INVALIDATE_STATE: u64 = 31;
+const HOSTED_DEVICE_OP_CONTIGUOUS_PREPARE: u64 = 32;
+const HOSTED_DEVICE_OP_CONTIGUOUS_COMMIT: u64 = 33;
+const HOSTED_DEVICE_OP_CONTIGUOUS_FREE: u64 = 34;
+const HOSTED_DEVICE_OP_CONTIGUOUS_EXPIRE: u64 = 35;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN: u64 = 0;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF: u64 = 2;
 const HOSTED_DEVICE_ARG_DATA_OFF: u64 = FSD_ARG_BYTES;
@@ -10684,6 +10691,18 @@ extern "win64" fn s_mm_map_io_space(phys: u64, length: u64, cache: u32) -> u64 {
             length,
             true,
         ) else {
+            // A live GOP/Dxg registration may own the boot scanout through its PCI display BAR
+            // even when this component has no ordinary PnP memory grant (ROOT miniports).
+            let (words, projected, _, _, _) = call_on4_raw(
+                (FSD_SERVICE_GOP_QUERY_LABEL << 12) | 3,
+                phys, length, cache as u64, 0,
+            );
+            if words == 1 && projected != 0 {
+                write_volatile((shared + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64, phys);
+                write_volatile((shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64, length);
+                trace_hosted_mm_map_io_space(phys, length, cache, projected, b"gop-bar");
+                return projected;
+            }
             trace_hosted_mm_map_io_space(phys, length, cache, 0, b"not-assigned");
             return 0;
         };
@@ -33918,9 +33937,20 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                                 dispatch, marshal_window, provider_inst, record,
                                 dependent_inst, exec_code_va, arg0, arg1, arg2,
                                 arg3, stack0),
+                        Some(nt_hosted_runtime::DxgDdiSignature::QueryChildRelations) =>
+                            hosted_dxg_registration::service_query_child_relations_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1, arg2),
+                        Some(nt_hosted_runtime::DxgDdiSignature::StopDevice) =>
+                            hosted_dxg_registration::service_stop_device_callback(
+                                dispatch, provider_inst, record, dependent_inst,
+                                exec_code_va, arg0),
+                        Some(nt_hosted_runtime::DxgDdiSignature::QueryAdapterInfo) =>
+                            hosted_dxg_registration::service_query_adapter_info_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1),
                         // Each remaining signature needs its own pointer projection.
-                        Some(nt_hosted_runtime::DxgDdiSignature::StopDevice)
-                        | Some(nt_hosted_runtime::DxgDdiSignature::RemoveDevice)
+                        Some(nt_hosted_runtime::DxgDdiSignature::RemoveDevice)
                         | None => Err(STATUS_NOT_SUPPORTED),
                     }
                 }
@@ -55446,8 +55476,18 @@ pub(crate) fn service_hosted_device(
             | HOSTED_DEVICE_OP_GET_INTERFACE_PULL
             | HOSTED_DEVICE_OP_GET_INTERFACE_ABORT
             | HOSTED_DEVICE_OP_INVALIDATE_STATE
+            | HOSTED_DEVICE_OP_CONTIGUOUS_PREPARE
+            | HOSTED_DEVICE_OP_CONTIGUOUS_COMMIT
+            | HOSTED_DEVICE_OP_CONTIGUOUS_FREE
+            | HOSTED_DEVICE_OP_CONTIGUOUS_EXPIRE
     ) {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+    }
+    if matches!(op, HOSTED_DEVICE_OP_CONTIGUOUS_PREPARE
+        | HOSTED_DEVICE_OP_CONTIGUOUS_COMMIT | HOSTED_DEVICE_OP_CONTIGUOUS_FREE
+        | HOSTED_DEVICE_OP_CONTIGUOUS_EXPIRE) {
+        return hosted_contiguous_ram_broker::service(ch, op, pdo_object, arg2, arg3,
+            active_reply_cap, caller_badge);
     }
     if op == HOSTED_DEVICE_OP_REPORT_POWER_STATE {
         return hosted_power_broker::service_report(
@@ -57304,6 +57344,18 @@ pub(crate) unsafe fn hosted_io_port_fault_grant(
         base: resource.translated_start,
         len: resource.len,
     })
+}
+
+pub(crate) unsafe fn hosted_legacy_vga_port_fault_grant(
+    channel: &crate::spawn_hosts::PumpChannel,
+    active_reply_cap: u64,
+    port: u16,
+    read: bool,
+    width_bits: u8,
+) -> Option<HostedIoPortFaultGrant> {
+    hosted_driver_gop::legacy_vga_port_fault_grant(
+        channel, active_reply_cap, port, read, width_bits,
+    )
 }
 
 pub(crate) unsafe fn refresh_hosted_resource_state_for_shared(shared_va: u64) {
@@ -59231,6 +59283,22 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
             print_str(b"\n");
         }
     }
+    if !teardown_blocked {
+        if let (Some(domain), Some(inst)) = (retiring_domain, instance(i)) {
+            if unsafe { !hosted_driver_runtime_quiesced(i) } {
+                teardown_blocked = true;
+            } else if let Err(status) = unsafe {
+                hosted_driver_gop::retire_hosted_gop_projection(i, domain, inst.pml4)
+            } {
+                teardown_blocked = true;
+                print_str(b"[driver-launch] GOP BAR alias retirement blocked inst=");
+                print_u64(i as u64);
+                print_str(b" status=0x");
+                print_hex(status.raw() as u32);
+                print_str(b"\n");
+            }
+        }
+    }
     if unsafe { !driver_instance_thunk_slots_are_free(i) } {
         teardown_blocked = true;
         print_str(b"[driver-launch] executable thunk retirement blocked inst=");
@@ -59308,6 +59376,9 @@ fn finish_instance_physical_release(
     i: usize,
     inst: DriverInstance,
 ) -> Result<(), nt_status::NtStatus> {
+    if !unsafe { hosted_contiguous_ram_broker::retire_instance(i, inst) } {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     if !hosted_device_allocations::instance_quiesced(inst) {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }

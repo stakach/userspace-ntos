@@ -219,6 +219,8 @@ pub enum DxgDdiSignature {
     StartDevice,
     StopDevice,
     RemoveDevice,
+    QueryChildRelations,
+    QueryAdapterInfo,
 }
 
 impl DxgDdiSignature {
@@ -231,6 +233,8 @@ impl DxgDdiSignature {
             0x10 => Some(Self::StartDevice),
             0x18 => Some(Self::StopDevice),
             0x20 => Some(Self::RemoveDevice),
+            0x40 => Some(Self::QueryChildRelations),
+            0x88 => Some(Self::QueryAdapterInfo),
             _ => None,
         }
     }
@@ -239,9 +243,142 @@ impl DxgDdiSignature {
         match self {
             Self::AddDevice => 2,
             Self::StartDevice => 5,
+            Self::QueryChildRelations => 3,
+            Self::QueryAdapterInfo => 2,
             Self::StopDevice | Self::RemoveDevice => 1,
         }
     }
+}
+
+/// `DXGK_CHILD_DESCRIPTOR` is 0x1c bytes in the pinned x64 dispmprt ABI. The provider
+/// supplies the exact in/out byte count, including its trailing sentinel descriptor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgChildRelationsLayout { bytes: u64 }
+
+impl DxgChildRelationsLayout {
+    pub const fn new(bytes: u64, marshal_capacity: u64) -> Option<Self> {
+        if bytes < 0x1c || bytes > u32::MAX as u64 || bytes > marshal_capacity
+            || bytes % 0x1c != 0 { return None; }
+        Some(Self { bytes })
+    }
+
+    pub const fn bytes(self) -> u64 { self.bytes }
+}
+
+/// The pinned WDDM 2.0 x64 `DXGKARG_QUERYADAPTERINFO` common prefix. Later fields are
+/// versioned and must not be copied without an explicit policy for the observed query type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgQueryAdapterInfoPrefix {
+    kind: u32,
+    input: (u64, u32),
+    output: (u64, u32),
+}
+
+impl DxgQueryAdapterInfoPrefix {
+    pub fn parse(bytes: &[u8], marshal_capacity: u64) -> Option<Self> {
+        if bytes.len() < 0x28 { return None; }
+        let kind = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+        let input = (u64::from_le_bytes(bytes[8..16].try_into().ok()?),
+            u32::from_le_bytes(bytes[0x10..0x14].try_into().ok()?));
+        let output = (u64::from_le_bytes(bytes[0x18..0x20].try_into().ok()?),
+            u32::from_le_bytes(bytes[0x20..0x24].try_into().ok()?));
+        if (input.1 != 0 && input.0 == 0) || (output.1 != 0 && output.0 == 0)
+            || input.1 as u64 > marshal_capacity
+            || output.1 as u64 > marshal_capacity
+            || input.0.checked_add(input.1 as u64).is_none()
+            || output.0.checked_add(output.1 as u64).is_none() {
+            return None;
+        }
+        Some(Self { kind, input, output })
+    }
+
+    pub const fn kind(self) -> u32 { self.kind }
+    pub const fn input(self) -> (u64, u32) { self.input }
+    pub const fn output(self) -> (u64, u32) { self.output }
+}
+
+/// Three segment queries implemented by the pinned BasicDisplay miniport. The
+/// output header owns a second pointer to an array supplied by DxgKrnl. The
+/// published WDDM x64 layouts put count at +0 and array pointer at +8; type 11
+/// additionally supplies the descriptor stride at +0x20.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgSegmentQueryLayout {
+    descriptors: (u64, u64),
+    stride: u64,
+}
+
+/// The pinned BasicDisplay Type 1 branch writes the first 0x250 bytes of
+/// DXGK_DRIVERCAPS. DxgKrnl may supply a larger versioned output allocation;
+/// its full requested extent is retained and copied back without fabrication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgDriverCapsLayout { output_bytes: u64 }
+
+impl DxgDriverCapsLayout {
+    pub const fn parse(prefix: DxgQueryAdapterInfoPrefix,
+        marshal_capacity: u64) -> Option<Self>
+    {
+        if prefix.kind != 1 || prefix.input.0 != 0 || prefix.input.1 != 0
+            || prefix.output.1 < 0x250
+            || prefix.output.1 as u64 > marshal_capacity
+        { return None; }
+        Some(Self { output_bytes: prefix.output.1 as u64 })
+    }
+
+    pub const fn output_bytes(self) -> u64 { self.output_bytes }
+}
+
+/// Only segment-query outputs use the +8 field as an array pointer. Type 1
+/// DriverCaps stores ordinary capability data at that offset.
+pub const fn dxg_query_restores_nested_pointer(kind: u32) -> bool {
+    matches!(kind, 2 | 5 | 11)
+}
+
+/// Separate marshal regions cannot preserve aliasing between the fixed output
+/// header and its nested descriptor array. Reject such caller buffers before
+/// entering the miniport.
+pub const fn dxg_query_output_regions_disjoint(
+    output: u64, output_bytes: u64, nested: u64, nested_bytes: u64,
+) -> bool {
+    let Some(output_end) = output.checked_add(output_bytes) else { return false; };
+    if nested_bytes == 0 { return true; }
+    let Some(nested_end) = nested.checked_add(nested_bytes) else { return false; };
+    output_end <= nested || nested_end <= output
+}
+
+impl DxgSegmentQueryLayout {
+    pub fn parse(prefix: DxgQueryAdapterInfoPrefix, output: &[u8],
+        marshal_capacity: u64) -> Option<Self>
+    {
+        let (input_min, output_min, descriptor_min) = match prefix.kind {
+            2 => (0x18, 0x20, 0x38),
+            5 => (0x18, 0x20, 0x48),
+            11 => (4, 0x28, 0x60),
+            _ => return None,
+        };
+        if prefix.input.1 < input_min || prefix.output.1 < output_min
+            || output.len() < prefix.output.1 as usize
+            || prefix.output.1 as u64 > marshal_capacity
+        { return None; }
+        let count = u32::from_le_bytes(output[0..4].try_into().ok()?) as u64;
+        let address = u64::from_le_bytes(output[8..16].try_into().ok()?);
+        let stride = if prefix.kind == 11 {
+            u64::from_le_bytes(output[0x20..0x28].try_into().ok()?)
+        } else { descriptor_min };
+        // The released miniport emits one or two segments. Count is only an
+        // array capacity supplied by the caller, not authority to map memory.
+        if address == 0 { return Some(Self { descriptors: (0, 0), stride }); }
+        if count == 0 || count > 2 || stride < descriptor_min
+            || stride > marshal_capacity || address % 8 != 0
+        { return None; }
+        let bytes = count.checked_mul(stride)?;
+        if bytes > marshal_capacity || address.checked_add(bytes).is_none() {
+            return None;
+        }
+        Some(Self { descriptors: (address, bytes), stride })
+    }
+
+    pub const fn descriptors(self) -> (u64, u64) { self.descriptors }
+    pub const fn stride(self) -> u64 { self.stride }
 }
 
 pub struct DxgCallbackSlots<'data, 'bytes> {
@@ -477,4 +614,49 @@ impl DxgEntryAuthority {
             && self.source_request_generation == source_request_generation
             && self.provider_entry_va == provider_entry_va
     }
+}
+
+/// A started Dxg miniport may use its delegated scanout during the active StartDevice call.
+/// `blocked` alone is a reentry guard while that call runs, but after it returns in error it
+/// fences an uncertain native effect and must deny new access.
+pub const fn dxg_scanout_dependent_admitted(
+    callback_entered: bool,
+    start_entered: bool,
+    start_succeeded: bool,
+    start_callback_active: bool,
+    blocked: bool,
+    pointer_retired: bool,
+    interface_handle: u64,
+) -> bool {
+    callback_entered && start_entered && !pointer_retired && interface_handle != 0
+        && (start_callback_active || (start_succeeded && !blocked))
+}
+
+/// A provider worker's channel alone does not grant access to the boot scanout. Its exact
+/// publication must also be the provider side of a currently live Dxg miniport registration.
+#[allow(clippy::too_many_arguments)]
+pub const fn dxg_scanout_provider_admitted(
+    worker_instance: usize, worker_domain_id: u64, worker_domain_cookie: u64,
+    worker_publication: u64, registered_instance: usize,
+    registered_domain_id: u64, registered_domain_cookie: u64,
+    registered_publication: u64, registration_live: bool,
+) -> bool {
+    registration_live && worker_domain_id != 0 && worker_domain_cookie != 0
+        && worker_publication != 0 && worker_instance == registered_instance
+        && worker_domain_id == registered_domain_id
+        && worker_domain_cookie == registered_domain_cookie
+        && worker_publication == registered_publication
+}
+
+/// StopDevice is an irreversible miniport operation for one live adapter context. Reject
+/// retries and uncertain in-flight work before entering the dependent VSpace.
+#[allow(clippy::too_many_arguments)]
+pub const fn dxg_stop_device_admitted(
+    start_entered: bool, start_succeeded: bool, start_callback_active: bool,
+    blocked: bool, pointer_retired: bool, stop_entered: bool,
+    retained_context: u64, supplied_context: u64,
+) -> bool {
+    start_entered && start_succeeded && !start_callback_active && !blocked
+        && !pointer_retired && !stop_entered && retained_context != 0
+        && retained_context == supplied_context
 }

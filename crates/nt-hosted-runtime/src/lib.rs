@@ -11,17 +11,32 @@ mod hosted_irq_call_stack;
 mod progress_deferral;
 mod driver_load_receipt;
 mod dxg_registration;
+mod contiguous_ram;
 mod provider_export_worker;
+mod gop_bar_projection;
 
 pub use driver_load_receipt::{DriverLoadPhase, RetainedEffectState};
+pub use contiguous_ram::{ContiguousRamError, ContiguousRamLayout, ContiguousRamOwner,
+    ContiguousRamPrepareTable, ContiguousRamReceipt, ContiguousRamRequest,
+    ContiguousRamLeaseBank, ContiguousRamLease, ContiguousRamLeaseSource};
 pub use dxg_registration::{
-    DxgCallbackSlot, DxgCallbackSlots, DxgDdiSignature, DxgEntryAuthority, DxgInitializationData,
+    dxg_scanout_dependent_admitted,
+    dxg_scanout_provider_admitted,
+    dxg_stop_device_admitted,
+    DxgCallbackSlot, DxgCallbackSlots, DxgChildRelationsLayout, DxgDdiSignature,
+    DxgDriverCapsLayout,
+    dxg_query_restores_nested_pointer,
+    dxg_query_output_regions_disjoint,
+    DxgEntryAuthority, DxgInitializationData, DxgQueryAdapterInfoPrefix,
+    DxgSegmentQueryLayout,
     DxgInitializationDataError, DxgPdoAliasAuthority, DxgRegistrationKey, DxgSourceDriverObject,
     DxgStartInterface, DxgStartInterfaceCallbacks, DxgStartInterfaceError,
 };
 pub use provider_export_worker::{HostedProviderExportCompletion, HostedProviderWorkerIdentity,
     HostedWorkerBankLayout, classify_hosted_provider_export_completion,
     select_hosted_cr8_bank, select_hosted_provider_export_worker};
+pub use gop_bar_projection::{GopBarProjection, GopLegacyVgaPortAuthority,
+    GopPciBarAuthority};
 
 pub use hosted_irq_arena::{
     decode_hosted_irq_transport_message, HostedIrqArena, HostedIrqArenaConfig,
