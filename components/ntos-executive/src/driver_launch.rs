@@ -304,6 +304,8 @@ pub(crate) mod hosted_driver_process_identity;
 pub(crate) mod hosted_driver_directory_object;
 #[path = "hosted_driver_create_event.rs"]
 pub(crate) mod hosted_driver_create_event;
+#[path = "hosted_driver_event_reference.rs"]
+pub(crate) mod hosted_driver_event_reference;
 #[path = "hosted_driver_process_notify.rs"]
 pub(crate) mod hosted_driver_process_notify;
 #[path = "hosted_driver_dynamic_type.rs"]
@@ -1189,6 +1191,7 @@ pub const FSD_SERVICE_KE_STACK_ATTACH_LABEL: u64 = 0x7C3;
 pub const FSD_SERVICE_PS_IDENTITY_LABEL: u64 = hosted_driver_process_identity::LABEL;
 pub const FSD_SERVICE_DIRECTORY_OBJECT_LABEL: u64 = hosted_driver_directory_object::LABEL;
 pub const FSD_SERVICE_CREATE_EVENT_LABEL: u64 = hosted_driver_create_event::LABEL;
+pub const FSD_SERVICE_EVENT_REFERENCE_LABEL: u64 = hosted_driver_event_reference::LABEL;
 pub const FSD_SERVICE_PROCESS_NOTIFY_LABEL: u64 = hosted_driver_process_notify::LABEL;
 pub const FSD_SERVICE_DYNAMIC_TYPE_LABEL: u64 = hosted_driver_dynamic_type::LABEL;
 pub const FSD_SERVICE_DYNAMIC_OBJECT_LABEL: u64 = hosted_driver_dynamic_object::LABEL;
@@ -1233,6 +1236,7 @@ const _: () = {
         FSD_SERVICE_PS_IDENTITY_LABEL,
         FSD_SERVICE_DIRECTORY_OBJECT_LABEL,
         FSD_SERVICE_CREATE_EVENT_LABEL,
+        FSD_SERVICE_EVENT_REFERENCE_LABEL,
         FSD_SERVICE_PROCESS_NOTIFY_LABEL,
         FSD_SERVICE_DYNAMIC_TYPE_LABEL,
         FSD_SERVICE_DYNAMIC_OBJECT_LABEL,
@@ -13962,6 +13966,9 @@ extern "win64" fn s_ke_set_event(event: u64, increment: i32, wait: u8) -> i32 {
     if event == 0 {
         return 0;
     }
+    if let Some(previous) = hosted_driver_event_reference::set_if_owned(event) {
+        return previous as i32;
+    }
     let packed = (increment as u32 as u64) | ((wait as u64) << 32);
     let (_label, previous, _, _, _) = unsafe {
         call_on4(
@@ -13978,6 +13985,7 @@ extern "win64" fn s_ke_set_event(event: u64, increment: i32, wait: u8) -> i32 {
 /// `void KeClearEvent(PRKEVENT)`.
 extern "win64" fn s_ke_clear_event(event: u64) {
     if event != 0 {
+        if hosted_driver_event_reference::clear_if_owned(event).is_some() { return; }
         unsafe {
             kevent::kevent_clear(event as *mut u8);
         }
@@ -13989,6 +13997,9 @@ extern "win64" fn s_ke_reset_event(event: u64) -> i32 {
     if event == 0 {
         return 0;
     }
+    if let Some(previous) = hosted_driver_event_reference::reset_if_owned(event) {
+        return previous as i32;
+    }
     unsafe { kevent::kevent_reset(event as *mut u8) as i32 }
 }
 
@@ -13996,6 +14007,9 @@ extern "win64" fn s_ke_reset_event(event: u64) -> i32 {
 extern "win64" fn s_ke_pulse_event(event: u64, increment: i32, wait: u8) -> i32 {
     if event == 0 {
         return 0;
+    }
+    if let Some(previous) = hosted_driver_event_reference::pulse_if_owned(event) {
+        return previous as i32;
     }
     let packed = (increment as u32 as u64) | ((wait as u64) << 32);
     let (_label, previous, _, _, _) = unsafe {
@@ -14014,6 +14028,9 @@ extern "win64" fn s_ke_pulse_event(event: u64, increment: i32, wait: u8) -> i32 
 extern "win64" fn s_ke_read_state_event(event: u64) -> i32 {
     if event == 0 {
         return 0;
+    }
+    if let Some(current) = hosted_driver_event_reference::read_if_owned(event) {
+        return current as i32;
     }
     unsafe { kevent::kevent_read_state(event as *const u8) as i32 }
 }
@@ -14061,6 +14078,9 @@ unsafe fn hosted_dispatcher_ready(object: u64) -> Result<bool, i32> {
     if object == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
+    if let Some(ready) = hosted_driver_event_reference::projected_ready_for_exec(object) {
+        return ready;
+    }
     if let Some(ready) = hosted_thread_resources::wait_ready(object) {
         return Ok(ready);
     }
@@ -14091,6 +14111,9 @@ unsafe fn hosted_dispatcher_ready_for(
 }
 
 unsafe fn hosted_dispatcher_consume(object: u64) -> bool {
+    if let Some(consumed) = hosted_driver_event_reference::projected_consume_for_exec(object) {
+        return consumed;
+    }
     if hosted_thread_resources::wait_ready(object) == Some(true) {
         return true;
     }
@@ -14174,6 +14197,60 @@ unsafe fn hosted_dispatcher_wait_consume(
             return false;
         };
         hosted_dispatcher_consume_for(object, keys[ready_index as usize], thread, owner)
+    }
+}
+
+unsafe fn hosted_dispatcher_wait_ready_with_handler(
+    objects: &[u64],
+    keys: &[Option<nt_kernel_exec::hosted_kmutex::KmutexKey>],
+    thread: u64,
+    wait_all: bool,
+    handler: &ExecNtHandler,
+) -> Result<Option<u32>, i32> {
+    if objects.is_empty() || objects.len() != keys.len()
+        || objects.len() > HOSTED_DRIVER_WAIT_OBJECT_MAX as usize {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let ready = |object: u64, key| match key {
+        Some(key) => hosted_driver_kmutex::ready(object, key, thread),
+        None => hosted_driver_event_reference::projected_ready_with_handler(object, handler)
+            .unwrap_or_else(|| hosted_dispatcher_ready(object)),
+    };
+    if wait_all {
+        for (&object, &key) in objects.iter().zip(keys) {
+            if !ready(object, key)? { return Ok(None); }
+        }
+        Ok(Some(0))
+    } else {
+        for (slot, (&object, &key)) in objects.iter().zip(keys).enumerate() {
+            if ready(object, key)? { return Ok(Some(slot as u32)); }
+        }
+        Ok(None)
+    }
+}
+
+unsafe fn hosted_dispatcher_wait_consume_with_handler(
+    objects: &[u64],
+    keys: &[Option<nt_kernel_exec::hosted_kmutex::KmutexKey>],
+    thread: u64,
+    owner: u64,
+    wait_all: bool,
+    ready_index: u32,
+    handler: &mut ExecNtHandler,
+) -> bool {
+    let mut consume = |object: u64, key| match key {
+        Some(key) => hosted_driver_kmutex::acquire(object, key, thread, owner) == Ok(true),
+        None => hosted_driver_event_reference::projected_consume_with_handler(object, handler)
+            .unwrap_or_else(|| hosted_dispatcher_consume(object)),
+    };
+    if wait_all {
+        for (&object, &key) in objects.iter().zip(keys) {
+            if !consume(object, key) { return false; }
+        }
+        true
+    } else {
+        let Some(&object) = objects.get(ready_index as usize) else { return false; };
+        consume(object, keys[ready_index as usize])
     }
 }
 
@@ -14429,18 +14506,36 @@ fn park_hosted_driver_wait(
     if waiters.len() == waiters.capacity() && waiters.try_reserve(4).is_err() {
         return None;
     }
-    let sequence =
+    let token =
         crate::spawn_hosts::shared_ingress::owner::runtime::next_service_wait_token().ok()?;
+    let mut event_projection_leases = Vec::new();
+    if event_projection_leases.try_reserve(objects.len()).is_err() { return None; }
+    for &object in &objects {
+        match unsafe { hosted_driver_event_reference::retain_wait_for_exec(instance, object) } {
+            None => {}
+            Some(Ok(lease)) => event_projection_leases.push(lease),
+            Some(Err(_)) => {
+                for lease in event_projection_leases {
+                    if unsafe { hosted_driver_event_reference::release_wait(lease) }.is_err() {
+                        unsafe { crate::provider_bugcheck::report(0xc4, [instance as u64, object, 0, 9]); }
+                    }
+                }
+                return None;
+            }
+        }
+    }
+    let sequence = crate::next_dispatcher_wait_sequence();
     let shared = HostedDriverSharedWait {
         route,
         dispatch,
-        token: sequence,
+        token,
     };
     waiters.push(HostedDriverRawWaiter {
         instance,
         thread_handle,
         reply_cap: active_reply_cap,
         objects,
+        event_projection_leases,
         keys,
         owner_body,
         wait_all,
@@ -14449,6 +14544,8 @@ fn park_hosted_driver_wait(
         sequence,
         shared,
         wake_status: None,
+        delivery: nt_hosted_runtime::HostedEventWaitDelivery::new(),
+        reply_retry_at: 0,
     });
     // End the vector borrow before the collector reads the newly published deadline. The
     // original Reply remains canonical until programming and external suspension both succeed.
@@ -14486,7 +14583,12 @@ fn park_hosted_driver_wait(
                     && waiter.reply_cap == active_reply_cap
                     && waiter.thread_handle == thread_handle
             }).expect("uncommitted driver wait disappeared");
-            waiters.remove(index);
+            let waiter = waiters.remove(index);
+            for lease in waiter.event_projection_leases {
+                if hosted_driver_event_reference::release_wait(lease).is_err() {
+                    crate::provider_bugcheck::report(0xc4, [instance as u64, sequence, 0, 10]);
+                }
+            }
         }
         return None;
     }
@@ -14506,14 +14608,47 @@ unsafe fn reply_hosted_driver_waiter(mut waiter: HostedDriverRawWaiter, status: 
     let thread_handle = waiter.thread_handle;
     let sequence = waiter.sequence;
     let reply = waiter.reply_cap;
+    let reply_entered = waiter.delivery.reply_entered();
+    if !reply_entered {
+        if !waiter.delivery.select() || !waiter.delivery.enter_reply() {
+            crate::provider_bugcheck::report(0xc4, [instance as u64, sequence, reply, 12]);
+        }
+    }
     waiter.wake_status = Some(status);
+    waiter.reply_retry_at = monotonic_time_100ns().saturating_add(1_000_000);
     // Retain the consumed selection and continuation before a native Reply/query can enter.
     // Failure never puts the object selection back into the ready/timeout scan.
     hosted_driver_waiters_mut().push(waiter);
-    let result = crate::spawn_hosts::shared_ingress::owner::runtime::wake_service(
-        shared.route, shared.dispatch, reply, shared.token, status,
-    );
-    if result.is_err() { return false; }
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    let cancelled = runtime::retained_service_owner_stopped_at_broker(
+        shared.route, shared.dispatch, reply, shared.token,
+    ) && runtime::acknowledge_retained_service_cancellation(
+        shared.route, shared.dispatch, reply, shared.token,
+    ).is_ok();
+    let acknowledged = if cancelled {
+        true
+    } else if reply_entered {
+        matches!(runtime::reconcile_retained_service_reply(
+            shared.route, shared.dispatch, reply, shared.token,
+        ), Ok(true))
+    } else {
+        runtime::wake_service(
+            shared.route, shared.dispatch, reply, shared.token, status,
+        ).is_ok()
+    };
+    if !acknowledged {
+        // The selected result and original Reply remain retained. A later Event signal is
+        // optional, so program this row's absolute retry deadline before leaving this turn.
+        let timer = crate::service_sec_image::rearm_registered_delay_timer();
+        if !timer.deadline_programmed() {
+            print_str(b"[hosted-wait] retained Reply retry timer unavailable instance=");
+            print_u64(instance as u64);
+            print_str(b" owner=");
+            print_u64(u64::from(timer.owner_available()));
+            print_str(b"\n");
+        }
+        return false;
+    }
     let waiters = hosted_driver_waiters_mut();
     let index = waiters
         .iter()
@@ -14524,7 +14659,16 @@ unsafe fn reply_hosted_driver_waiter(mut waiter: HostedDriverRawWaiter, status: 
                 && row.reply_cap == reply
         })
         .expect("shared wake lost its retained waiter");
-    waiters.remove(index);
+    let mut waiter = waiters.remove(index);
+    if !(if cancelled { waiter.delivery.cancel(true) }
+        else { waiter.delivery.reconcile(true) }) {
+        crate::provider_bugcheck::report(0xc4, [instance as u64, sequence, reply, 13]);
+    }
+    for lease in waiter.event_projection_leases {
+        if hosted_driver_event_reference::release_wait(lease).is_err() {
+            crate::provider_bugcheck::report(0xc4, [instance as u64, sequence, 0, 11]);
+        }
+    }
     let _ = hosted_driver_thread_table_mut(instance).and_then(|table| table.set_ready(thread_handle).ok());
     true
 }
@@ -14577,8 +14721,13 @@ pub(crate) fn hosted_driver_wait_next_deadline(now: nt_time::TimeSnapshot) -> Op
         (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS))
             .as_ref()?
             .iter()
-            .filter(|waiter| waiter.wake_status.is_none())
-            .filter_map(|waiter| waiter.deadline.monotonic_target(now))
+            .filter_map(|waiter| {
+                if waiter.wake_status.is_some() {
+                    Some(waiter.reply_retry_at.max(now.monotonic_100ns))
+                } else {
+                    waiter.deadline.monotonic_target(now)
+                }
+            })
             .min()
     }
 }
@@ -14692,7 +14841,7 @@ unsafe fn drain_hosted_driver_dpc_snapshot() -> u64 {
 }
 
 pub(crate) unsafe fn hosted_driver_wait_wake_due(now: nt_time::TimeSnapshot) -> u64 {
-    let mut woken = 0u64;
+    let mut woken = hosted_driver_wait_redrive_selected();
     loop {
         let due_index = {
             let Some(waiters) = (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS)).as_ref() else {
@@ -14721,6 +14870,74 @@ pub(crate) unsafe fn hosted_driver_wait_wake_due(now: nt_time::TimeSnapshot) -> 
 }
 
 fn wake_hosted_driver_waiters_for_instance(instance: usize) -> u64 {
+    wake_hosted_driver_waiters_for_instance_inner(instance)
+}
+
+pub(super) unsafe fn hosted_driver_wait_oldest_event_consumer_sequence(
+    native_index: usize, handler: &ExecNtHandler,
+) -> Option<u64> {
+    let waiters = (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS)).as_ref()?;
+    let mut after = 0;
+    let mut oldest: Option<u64> = None;
+    while let Some((next, instance_index, exec_body)) =
+        hosted_driver_event_reference::exec_body_for_native_index_after(
+            native_index, handler, after)
+    {
+        after = next;
+        for waiter in waiters.iter().filter(|row| row.instance == instance_index
+            && row.wake_status.is_none()) {
+            let Ok(Some(selected)) = hosted_dispatcher_wait_ready_with_handler(
+                &waiter.objects, &waiter.keys, waiter.thread_handle,
+                waiter.wait_all, handler) else { continue; };
+            let consumes = if waiter.wait_all { waiter.objects.contains(&exec_body) }
+                else { waiter.objects.get(selected as usize) == Some(&exec_body) };
+            if consumes { oldest = Some(oldest.map_or(waiter.sequence,
+                |current| current.min(waiter.sequence))); }
+        }
+    }
+    oldest
+}
+
+pub(super) unsafe fn hosted_driver_wait_select_event_consumer(
+    native_index: usize, expected_sequence: u64, handler: &mut ExecNtHandler,
+) -> bool {
+    if hosted_driver_wait_oldest_event_consumer_sequence(native_index, handler)
+        != Some(expected_sequence) { return false; }
+    let Some(waiters) = (*core::ptr::addr_of_mut!(HOSTED_DRIVER_WAITERS)).as_mut() else {
+        return false;
+    };
+    let Some(position) = waiters.iter().position(|row| row.sequence == expected_sequence
+        && row.wake_status.is_none()) else { return false; };
+    let waiter = &mut waiters[position];
+    let Ok(Some(status)) = hosted_dispatcher_wait_ready_with_handler(&waiter.objects,
+        &waiter.keys, waiter.thread_handle, waiter.wait_all, handler) else { return false; };
+    if !hosted_dispatcher_wait_consume_with_handler(&waiter.objects, &waiter.keys,
+        waiter.thread_handle, waiter.owner_body, waiter.wait_all, status, handler)
+    { return false; }
+    // The row owns its original Reply and selected result until post-arbitration delivery.
+    waiter.wake_status = Some(status as i32);
+    true
+}
+
+pub(super) unsafe fn hosted_driver_wait_redrive_selected() -> u64 {
+    let mut delivered = 0;
+    let mut cursor = (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS))
+        .as_ref().map(Vec::len).unwrap_or(0);
+    while cursor != 0 {
+        cursor -= 1;
+        let selected = (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS))
+            .as_ref().and_then(|rows| rows.get(cursor))
+            .and_then(|row| row.wake_status);
+        let Some(status) = selected else { continue; };
+        let waiter = hosted_driver_waiters_mut().remove(cursor);
+        if reply_hosted_driver_waiter(waiter, status) {
+            delivered += 1;
+        }
+    }
+    delivered
+}
+
+fn wake_hosted_driver_waiters_for_instance_inner(instance: usize) -> u64 {
     let mut woken = 0u64;
     loop {
         let ready_index = unsafe {
@@ -14733,11 +14950,8 @@ fn wake_hosted_driver_waiters_for_instance(instance: usize) -> u64 {
                 .filter(|(_, waiter)| {
                     waiter.instance == instance
                         && waiter.wake_status.is_none()
-                        && matches!(
-                            hosted_dispatcher_wait_ready(&waiter.objects, &waiter.keys,
-                                waiter.thread_handle, waiter.wait_all),
-                            Ok(Some(_))
-                        )
+                        && matches!(hosted_dispatcher_wait_ready(&waiter.objects, &waiter.keys,
+                                waiter.thread_handle, waiter.wait_all), Ok(Some(_)))
                 })
                 .min_by_key(|(_, waiter)| waiter.sequence)
                 .map(|(index, _)| index)
@@ -14759,10 +14973,8 @@ fn wake_hosted_driver_waiters_for_instance(instance: usize) -> u64 {
                     continue;
                 }
             };
-        let consumed = unsafe {
-            hosted_dispatcher_wait_consume(&waiter.objects, &waiter.keys,
-                waiter.thread_handle, waiter.owner_body, waiter.wait_all, ready_status)
-        };
+        let consumed = unsafe { hosted_dispatcher_wait_consume(&waiter.objects, &waiter.keys,
+            waiter.thread_handle, waiter.owner_body, waiter.wait_all, ready_status) };
         if !consumed {
             record_hosted_driver_wait_wake_error(wait_is_multiple);
             unsafe {
@@ -16101,6 +16313,9 @@ extern "win64" fn s_obf_reference_object(object: u64) -> u64 {
             );
         }
         if !consumer_file_object_in_local_pool(object) {
+            if let Some(reference) = hosted_driver_event_reference::retain_if_owned(object) {
+                return reference;
+            }
             if let Some(references) = hosted_driver_process_identity::retain_process_if_known(object) {
                 return references;
             }
@@ -16124,6 +16339,9 @@ extern "win64" fn s_obf_dereference_object(object: u64) -> u64 {
             );
         }
         if !consumer_file_object_in_local_pool(object) {
+            if let Some(references) = hosted_driver_event_reference::release_if_owned(object) {
+                return references;
+            }
             if let Some(references) = hosted_driver_ps_handle_reference::release_if_owned(object) {
                 return references;
             }
@@ -16160,6 +16378,11 @@ extern "win64" fn s_ob_reference_object_by_handle(
         || object_type == nt_object_manager::object_type::thread_object_type_addr()
     {
         return hosted_driver_ps_handle_reference::ob_reference_object_by_handle(
+            handle, desired_access, object_type, access_mode, object_out, handle_information,
+        );
+    }
+    if object_type == FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_VA {
+        return hosted_driver_event_reference::reference_object_by_handle(
             handle, desired_access, object_type, access_mode, object_out, handle_information,
         );
     }
@@ -58141,6 +58364,7 @@ struct HostedDriverRawWaiter {
     thread_handle: u64,
     reply_cap: u64,
     objects: Vec<u64>,
+    event_projection_leases: Vec<hosted_driver_event_reference::EventProjectionWaitLease>,
     keys: Vec<Option<nt_kernel_exec::hosted_kmutex::KmutexKey>>,
     owner_body: u64,
     wait_all: bool,
@@ -58149,6 +58373,8 @@ struct HostedDriverRawWaiter {
     sequence: u64,
     shared: HostedDriverSharedWait,
     wake_status: Option<i32>,
+    delivery: nt_hosted_runtime::HostedEventWaitDelivery,
+    reply_retry_at: u64,
 }
 
 #[derive(Clone, Copy)]

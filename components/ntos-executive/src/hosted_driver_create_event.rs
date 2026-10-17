@@ -107,10 +107,9 @@ pub(crate) fn service(
     };
     unsafe {
         let handler = &mut *handler;
-        let Some(pi) = handler.pi_for_pid(caller.effective_process()) else {
-            return (STATUS_INVALID_HANDLE, 0);
-        };
-        if handler.pm_pid_for_pi(pi) != Some(caller.effective_process()) {
+        let pi = handler.pi_for_pid(caller.effective_process());
+        if pi.is_some_and(|pi|
+            handler.pm_pid_for_pi(pi) != Some(caller.effective_process())) {
             return (STATUS_INVALID_HANDLE, 0);
         }
         match handler.provider_create_event_with_attributes(

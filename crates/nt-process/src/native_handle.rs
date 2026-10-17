@@ -448,6 +448,43 @@ impl ProcessManager {
         })
     }
 
+    /// Inspect an Event handle through the authenticated native handle scope.
+    /// A tagged kernel handle resolves in System's table; this is a preflight
+    /// only and the host must retain the Event pointer in the same serialized
+    /// dispatch before the handle can be closed.
+    pub fn inspect_native_event_handle(
+        &self,
+        caller: NativeHandleCaller,
+        value: u64,
+        desired_access: u32,
+    ) -> Result<NativeCloseTarget, u32> {
+        let target = self.inspect_native_close_target(caller, value)?;
+        if !matches!(target.object(), HandleObject::Event(_)) {
+            return Err(STATUS_OBJECT_TYPE_MISMATCH);
+        }
+        let granted = target.information().granted_access.ok_or(STATUS_INVALID_HANDLE)?;
+        if desired_access & !granted != 0 {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        Ok(target)
+    }
+
+    /// An image-less System thread has no hosted process index. Its tagged Event handle
+    /// is created in the canonical System table and owned by the current bootstrap root.
+    pub fn authorize_initial_system_native_event_create(
+        &self,
+        caller: NativeHandleCaller,
+        attributes: u32,
+    ) -> Result<(ProcessId, u64), u32> {
+        self.validate_native_handle_caller(caller)?;
+        let system = self.initial_system_identity().ok_or(STATUS_INVALID_HANDLE)?;
+        if caller.mode() != AccessMode::KernelMode
+            || caller.effective_process() != system.process_id()
+        { return Err(STATUS_INVALID_HANDLE); }
+        if attributes != OBJ_KERNEL_HANDLE { return Err(STATUS_INVALID_PARAMETER); }
+        Ok((system.process_id(), system.thread().generation()))
+    }
+
     /// Remove exactly one visible reference from the decoded native table, irrespective of
     /// object type. Caller admission, kernel-handle scope, and protect-close are canonical here;
     /// all object-specific close effects remain owned by the native host.

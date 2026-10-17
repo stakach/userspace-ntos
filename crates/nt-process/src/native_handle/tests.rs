@@ -79,6 +79,48 @@ fn driver_created_event_and_directory_handles_close_only_in_their_exact_owner() 
     );
 }
 
+#[test]
+fn kernel_event_reference_resolves_system_table_under_exact_native_caller() {
+    let (mut pm, user, kernel, local_pid, _) = fixture();
+    let system = pm.initial_system_identity().unwrap().process_id();
+    let event = HandleObject::Event(nt_types::ObjectId(0xE2));
+    let system_handle = pm.insert_handle(system, event, 0x0010_0002).unwrap();
+    let local_handle = pm.insert_handle(local_pid,
+        HandleObject::Event(nt_types::ObjectId(0xE3)), 0x0010_0002).unwrap();
+    assert_eq!(system_handle, local_handle);
+    let tagged = KERNEL_HANDLE_TAG | u64::from(system_handle);
+    let target = pm.inspect_native_event_handle(kernel, tagged, 0x0010_0002).unwrap();
+    assert_eq!(target.table_owner(), system);
+    assert_eq!(target.object(), event);
+    assert_eq!(target.information().granted_access, Some(0x0010_0002));
+    assert_eq!(pm.inspect_native_event_handle(user, tagged, 0), Err(STATUS_INVALID_HANDLE));
+    assert_eq!(pm.inspect_native_event_handle(kernel, tagged, 0x0010_0004),
+        Err(STATUS_ACCESS_DENIED));
+    assert_eq!(pm.inspect_native_event_handle(kernel,
+        u64::from(local_handle), 0).unwrap().table_owner(), local_pid);
+    let wrong = pm.insert_handle(system, HandleObject::File(0xF1), 0x0010_0002).unwrap();
+    assert_eq!(pm.inspect_native_event_handle(kernel,
+        KERNEL_HANDLE_TAG | u64::from(wrong), 0), Err(STATUS_OBJECT_TYPE_MISMATCH));
+}
+
+#[test]
+fn initial_system_kernel_event_create_has_identity_without_hosted_process_index() {
+    let (pm, user, other_kernel, _, _) = fixture();
+    let system = pm.initial_system_identity().unwrap();
+    let system_kernel = pm.capture_native_handle_caller(
+        system.thread(), AccessMode::KernelMode).unwrap();
+    let owner = pm.authorize_initial_system_native_event_create(
+        system_kernel, OBJ_KERNEL_HANDLE).unwrap();
+    assert_eq!(owner.0, system.process_id());
+    assert_eq!(owner.1, system.thread().generation());
+    assert_eq!(pm.authorize_initial_system_native_event_create(other_kernel,
+        OBJ_KERNEL_HANDLE), Err(STATUS_INVALID_HANDLE));
+    assert_eq!(pm.authorize_initial_system_native_event_create(user,
+        OBJ_KERNEL_HANDLE), Err(STATUS_INVALID_HANDLE));
+    assert_eq!(pm.authorize_initial_system_native_event_create(system_kernel, 0),
+        Err(STATUS_INVALID_PARAMETER));
+}
+
 fn counts(pm: &ProcessManager, pid: ProcessId, tid: crate::ThreadId) -> (u32, u32) {
     (
         pm.process(pid).unwrap().kernel_pointer_references,

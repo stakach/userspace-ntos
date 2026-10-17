@@ -10686,6 +10686,19 @@ impl ExecNtHandler {
     ) -> Option<u64> {
         let pid = self.pm_pid_for_pi(pi)?;
         let generation = self.hosted_process_generation(pi)?;
+        self.mint_event_handle_for_owner(event_index, access,
+            nt_kernel_exec::EventObjectOwner::new(pid as u64, generation),
+            table_owner, kernel_handle)
+    }
+
+    fn mint_event_handle_for_owner(
+        &mut self,
+        event_index: usize,
+        access: u32,
+        event_owner: nt_kernel_exec::EventObjectOwner,
+        table_owner: nt_process::ProcessId,
+        kernel_handle: bool,
+    ) -> Option<u64> {
         let entry = self.obj_ns.get(event_index)?;
         if !entry.is_live()
             || entry.kind != OBJ_KIND_EVENT
@@ -10699,10 +10712,7 @@ impl ExecNtHandler {
         } else {
             registered = true;
             self.event_objects
-                .create(
-                    nt_kernel_exec::EventObjectOwner::new(pid as u64, generation),
-                    event_index as u64,
-                )
+                .create(event_owner, event_index as u64)
                 .ok()?
         };
         if self.event_objects.retain_handle(id).is_err() {
@@ -24272,7 +24282,7 @@ impl ExecNtHandler {
     pub(crate) fn provider_create_event_with_attributes(
         &mut self,
         caller: nt_process::native_handle::NativeHandleCaller,
-        pi: usize,
+        pi: Option<usize>,
         desired_access: u32,
         event_type: u32,
         initial_state: bool,
@@ -24283,22 +24293,31 @@ impl ExecNtHandler {
             return Err(nt_process::STATUS_INVALID_PARAMETER);
         }
         self.pm.validate_native_handle_caller(caller)?;
-        let pid = self.pm_pid_for_pi(pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        if pid != caller.effective_process() {
-            return Err(nt_process::STATUS_INVALID_HANDLE);
-        }
         let kernel = attributes & OBJ_KERNEL_HANDLE != 0;
         if kernel && caller.mode() != nt_types::AccessMode::KernelMode {
             return Err(nt_process::STATUS_INVALID_PARAMETER);
         }
-        let owner = if kernel {
-            self.pm.initial_system_identity()
-                .ok_or(nt_process::STATUS_INVALID_HANDLE)?
-                .process_id()
-        } else { pid };
+        let (event_owner, table_owner) = if let Some(pi) = pi {
+            let pid = self.pm_pid_for_pi(pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+            if pid != caller.effective_process() {
+                return Err(nt_process::STATUS_INVALID_HANDLE);
+            }
+            let generation = self.hosted_process_generation(pi)
+                .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+            let table_owner = if kernel {
+                self.pm.initial_system_identity()
+                    .ok_or(nt_process::STATUS_INVALID_HANDLE)?.process_id()
+            } else { pid };
+            (nt_kernel_exec::EventObjectOwner::new(pid as u64, generation), table_owner)
+        } else {
+            let (system, generation) = self.pm
+                .authorize_initial_system_native_event_create(caller, attributes)?;
+            (nt_kernel_exec::EventObjectOwner::new(system as u64, generation), system)
+        };
         let index = self.obj_create_anon_event(event_type == 1, initial_state)
             .ok_or(nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
-        match self.mint_event_handle_for_pi_in_table(pi, index, desired_access, owner, kernel) {
+        match self.mint_event_handle_for_owner(index, desired_access,
+            event_owner, table_owner, kernel) {
             Some(handle) => Ok(handle),
             None => {
                 self.rollback_new_event(index);
@@ -24314,7 +24333,6 @@ impl ExecNtHandler {
         desired_access: u32,
         proposed_body: u64,
     ) -> Result<(u64, nt_kernel_exec::EventObjectId, u64, u32), u32> {
-        const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
         let (id, index) = self.event_object_for_handle_in_pi(pi, handle, desired_access)?;
         let pid = self
             .pm_pid_for_pi(pi)
@@ -24323,6 +24341,72 @@ impl ExecNtHandler {
             .pm
             .handle_access(pid, handle as nt_process::Handle)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        self.retain_provider_event_pointer(id, index, proposed_body, granted_access)
+    }
+
+    /// Resolve a native driver's tagged kernel Event handle in System's
+    /// canonical table, then acquire an independent pointer reference before
+    /// ZwClose can release the handle reference.
+    pub(crate) fn provider_reference_native_event(
+        &mut self,
+        caller: nt_process::native_handle::NativeHandleCaller,
+        handle: u64,
+        desired_access: u32,
+    ) -> Result<(nt_kernel_exec::EventObjectId, u64, u32), u32> {
+        let target = self.pm.inspect_native_event_handle(caller, handle, desired_access)?;
+        let nt_process::HandleObject::Event(raw_id) = target.object() else {
+            unreachable!("typed native Event inspection returned another object");
+        };
+        let id = nt_kernel_exec::EventObjectId(raw_id);
+        let index = usize::try_from(self.event_objects.snapshot(id)
+            .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?.native_identity)
+            .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?;
+        if self.obj_ns.get(index).is_none_or(|entry|
+            !entry.is_live() || entry.kind != OBJ_KIND_EVENT)
+            || !self.events.contains(index as u64)
+        { return Err(nt_process::STATUS_INVALID_HANDLE); }
+        let granted_access = target.information().granted_access
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let (kind, signaled) = self.events.query_existing(index as u64)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        self.event_objects.retain_external_pointer(id)
+            .map_err(|_| nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
+        let metadata = u64::from(matches!(kind, EventKind::Synchronization))
+            | (u64::from(signaled) << 1);
+        Ok((id, metadata, granted_access))
+    }
+
+    pub(crate) fn provider_retain_native_event_pointer(
+        &mut self, id: nt_kernel_exec::EventObjectId,
+    ) -> Result<u32, u32> {
+        self.event_objects.retain_external_pointer(id)
+            .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?;
+        self.event_objects.snapshot(id)
+            .map(|snapshot| snapshot.pointer_leases)
+            .map_err(|_| nt_process::STATUS_INVALID_HANDLE)
+    }
+
+    pub(crate) fn provider_dereference_native_event_pointer(
+        &mut self, id: nt_kernel_exec::EventObjectId,
+    ) -> Result<u32, u32> {
+        let retired = self.event_objects.release_external_pointer(id)
+            .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?;
+        if let Some(retired) = retired {
+            self.finalize_retired_event_object(retired);
+            return Ok(0);
+        }
+        self.event_objects.snapshot(id)
+            .map(|snapshot| snapshot.pointer_leases)
+            .map_err(|_| nt_process::STATUS_INVALID_HANDLE)
+    }
+
+    fn retain_provider_event_pointer(&mut self,
+        id: nt_kernel_exec::EventObjectId,
+        index: usize,
+        proposed_body: u64,
+        granted_access: u32,
+    ) -> Result<(u64, nt_kernel_exec::EventObjectId, u64, u32), u32> {
+        const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
         let body = self
             .event_objects
             .retain_pointer_or_install(id, proposed_body)
@@ -24540,6 +24624,51 @@ impl ExecNtHandler {
         index: usize,
     ) -> Option<nt_kernel_exec::EventObjectId> {
         self.event_objects.id_for_native(index as u64)
+    }
+
+    pub(crate) fn projected_event_body_for_index(&self, index: usize) -> Option<u64> {
+        let id = self.event_id_for_index(index)?;
+        self.event_objects.provider_body(id).ok().flatten()
+    }
+
+    pub(crate) fn projected_event_ready(&self, raw_id: u64) -> Option<bool> {
+        let id = nt_kernel_exec::EventObjectId(nt_types::ObjectId(raw_id));
+        let native = self.event_objects.snapshot(id).ok()?.native_identity;
+        self.events.query_existing(native).map(|(_, state)| state)
+    }
+
+    pub(crate) fn projected_event_consume(&mut self, raw_id: u64) -> Option<bool> {
+        let id = nt_kernel_exec::EventObjectId(nt_types::ObjectId(raw_id));
+        let native = self.event_objects.snapshot(id).ok()?.native_identity;
+        self.events.query_existing(native)?;
+        Some(self.events.consume_existing(native))
+    }
+
+    pub(crate) fn projected_event_index(&self, raw_id: u64) -> Result<usize, u32> {
+        let id = nt_kernel_exec::EventObjectId(nt_types::ObjectId(raw_id));
+        let native = self.event_objects.snapshot(id)
+            .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?.native_identity;
+        let index = usize::try_from(native).map_err(|_| nt_process::STATUS_INVALID_HANDLE)?;
+        self.events.query_existing(native).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        Ok(index)
+    }
+
+    pub(crate) fn projected_event_set(&mut self, raw_id: u64) -> Result<(bool, usize), u32> {
+        let index = self.projected_event_index(raw_id)?;
+        let previous = self.events.set_existing(index as u64)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        Ok((previous, index))
+    }
+
+    pub(crate) fn projected_event_reset(&mut self, raw_id: u64) -> Result<bool, u32> {
+        let index = self.projected_event_index(raw_id)?;
+        self.events.reset_existing(index as u64).ok_or(nt_process::STATUS_INVALID_HANDLE)
+    }
+
+    pub(crate) fn projected_event_clear(&mut self, raw_id: u64) -> Result<(), u32> {
+        let index = self.projected_event_index(raw_id)?;
+        self.events.clear_existing(index as u64)
+            .then_some(()).ok_or(nt_process::STATUS_INVALID_HANDLE)
     }
 
     pub(crate) fn provider_close_event(&mut self, pi: usize, handle: u64) -> Result<(), u32> {
