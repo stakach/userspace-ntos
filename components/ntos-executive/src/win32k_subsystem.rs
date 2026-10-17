@@ -4710,6 +4710,13 @@ extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
             as u64;
     }
     if provider_pool_contains(object) {
+        unsafe {
+            let _guard = lock_section_descriptors().expect("session Section list lock unavailable");
+            if registered_section_descriptor(object) {
+                return retain_section(object as *mut u8)
+                    .unwrap_or_else(|| panic!("retired session Section pointer retained"));
+            }
+        }
         match unsafe { mm_section::reference(object, false) } {
             Ok(count) => return count,
             Err(STATUS_INVALID_HANDLE_I32) => {},
@@ -4868,6 +4875,18 @@ extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
             as u64;
     }
     if provider_pool_contains(object) {
+        unsafe {
+            let _guard = lock_section_descriptors().expect("session Section list lock unavailable");
+            if registered_section_descriptor(object) {
+                let remaining = release_section(object as *mut u8)
+                    .unwrap_or_else(|| panic!("session Section pointer reference underflow"));
+                if section_may_retire(object as *const u8) {
+                    assert!(unlink_section_descriptor(object));
+                    assert!(provider_pool_free(object), "session Section descriptor retirement failed");
+                }
+                return remaining;
+            }
+        }
         match unsafe { mm_section::reference(object, true) } {
             Ok(count) => return count,
             Err(STATUS_INVALID_HANDLE_I32) => {},
@@ -9878,73 +9897,146 @@ extern "win64" fn s_rtl_reallocate_heap(heap: u64, flags: u64, base: u64, size: 
 }
 
 use nt_kernel_exec::session_section::{
-    init_section, is_section, map_section, section_contains_addr, section_next, section_object,
-    section_size, set_section_next, unmap_section,
+    bind_section_allocation_generation, init_section, is_section, map_section, release_section,
+    retain_section, section_allocation_generation, section_contains_addr, section_may_retire,
+    section_next, section_object, section_reference_count, section_size, set_section_next,
+    unmap_section,
 };
 
 const STATUS_NO_MEMORY: i32 = 0xC000_0017u32 as i32;
 static WIN32K_SECTION_LIST_HEAD: AtomicU64 = AtomicU64::new(0);
+static WIN32K_SECTION_LIST_BUSY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
-unsafe fn register_section_descriptor(desc: u64) {
-    loop {
-        let head = WIN32K_SECTION_LIST_HEAD.load(Ordering::Relaxed);
-        set_section_next(desc as *mut u8, head);
-        if WIN32K_SECTION_LIST_HEAD
-            .compare_exchange(head, desc, Ordering::SeqCst, Ordering::Relaxed)
-            .is_ok()
-        {
-            return;
-        }
+struct SectionListGuard;
+
+impl Drop for SectionListGuard {
+    fn drop(&mut self) {
+        WIN32K_SECTION_LIST_BUSY.store(false, Ordering::Release);
     }
 }
 
-unsafe fn find_section_for_view_addr(addr: u64) -> u64 {
-    let mut cur = WIN32K_SECTION_LIST_HEAD.load(Ordering::Relaxed);
+fn lock_section_descriptors() -> Option<SectionListGuard> {
+    for _ in 0..1_000_000 {
+        if WIN32K_SECTION_LIST_BUSY
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Some(SectionListGuard);
+        }
+        core::hint::spin_loop();
+    }
+    None
+}
+
+/// Caller holds `SectionListGuard`. Membership and exact pool generation are both required;
+/// a copied magic field or recycled allocation cannot authorize an object pointer.
+unsafe fn registered_section_descriptor(desc: u64) -> bool {
+    if desc == 0 { return false; }
+    let mut cur = WIN32K_SECTION_LIST_HEAD.load(Ordering::Acquire);
     let mut scanned = 0usize;
     while cur != 0 && scanned < 4096 {
-        if is_section(cur as *const u8) {
-            if section_contains_addr(cur as *const u8, addr) {
-                return cur;
-            }
-            cur = section_next(cur as *const u8);
-        } else {
-            break;
+        if cur == desc {
+            return provider_pool_allocation_identity(cur).is_some_and(|native| {
+                native.allocation_generation != 0
+                    && is_section(cur as *const u8)
+                    && section_allocation_generation(cur as *const u8)
+                        == native.allocation_generation
+            });
         }
+        cur = section_next(cur as *const u8);
         scanned += 1;
     }
-    0
+    false
+}
+
+/// Caller holds `SectionListGuard`; the descriptor is freed only after unlinking.
+unsafe fn unlink_section_descriptor(desc: u64) -> bool {
+    let mut previous = 0u64;
+    let mut current = WIN32K_SECTION_LIST_HEAD.load(Ordering::Acquire);
+    let mut scanned = 0usize;
+    while current != 0 && scanned < 4096 {
+        let next = section_next(current as *const u8);
+        if current == desc {
+            if previous == 0 {
+                WIN32K_SECTION_LIST_HEAD.store(next, Ordering::Release);
+            } else {
+                set_section_next(previous as *mut u8, next);
+            }
+            set_section_next(desc as *mut u8, 0);
+            return true;
+        }
+        previous = current;
+        current = next;
+        scanned += 1;
+    }
+    false
+}
+
+unsafe fn register_section_descriptor(desc: u64) {
+    let _guard = lock_section_descriptors().expect("session Section list lock unavailable");
+    let identity = provider_pool_allocation_identity(desc)
+        .expect("session Section descriptor lacks exact pool allocation");
+    assert!(bind_section_allocation_generation(desc as *mut u8, identity.allocation_generation));
+    let head = WIN32K_SECTION_LIST_HEAD.load(Ordering::Relaxed);
+    set_section_next(desc as *mut u8, head);
+    WIN32K_SECTION_LIST_HEAD.store(desc, Ordering::Release);
+}
+
+/// An absent result belongs to the other Mm section broker. The registry lock covers lookup,
+/// unmap, and final unlink so the selected descriptor cannot retire between those steps.
+unsafe fn try_unmap_section_view_addr(addr: u64) -> Option<i32> {
+    if addr == 0 {
+        return Some(STATUS_INVALID_PARAMETER_I32);
+    }
+    let backing_addr = win32k_heap_client_to_server(addr).unwrap_or(addr);
+    let _guard = lock_section_descriptors().expect("session Section list lock unavailable");
+    let mut section = WIN32K_SECTION_LIST_HEAD.load(Ordering::Acquire);
+    let mut scanned = 0usize;
+    while section != 0 && scanned < 4096 {
+        if registered_section_descriptor(section)
+            && section_contains_addr(section as *const u8, backing_addr)
+        {
+            break;
+        }
+        section = section_next(section as *const u8);
+        scanned += 1;
+    }
+    if section == 0 || scanned >= 4096 {
+        return None;
+    }
+    if unmap_section(section as *mut u8, backing_addr, |base| heap_free(base)) {
+        if section_may_retire(section as *const u8) {
+            assert!(unlink_section_descriptor(section));
+            assert!(provider_pool_free(section), "unmapped session Section retirement failed");
+        }
+        Some(0)
+    } else {
+        Some(STATUS_INVALID_PARAMETER_I32)
+    }
 }
 
 unsafe fn unmap_section_view_addr(addr: u64) -> i32 {
-    if addr == 0 {
-        return STATUS_INVALID_PARAMETER_I32;
-    }
-    let backing_addr = win32k_heap_client_to_server(addr).unwrap_or(addr);
-    let section = find_section_for_view_addr(backing_addr);
-    if section == 0 {
-        print_str(b"[win32k-host] MmUnmapView: unmapped/foreign base=0x");
-        print_hex((addr >> 32) as u32);
-        print_hex(addr as u32);
-        print_str(b"\n");
-        return STATUS_INVALID_PARAMETER_I32;
-    }
-    if unmap_section(section as *mut u8, backing_addr, |base| heap_free(base)) {
-        0
-    } else {
-        STATUS_INVALID_PARAMETER_I32
-    }
+    try_unmap_section_view_addr(addr).unwrap_or(STATUS_INVALID_PARAMETER_I32)
 }
 
 /// Resolve (allocating once, from the heap arena) the coherent backing base + size for a section
 /// map. The section must be one of our [`init_section`] descriptors, so the kernel session view and
 /// every per-process view share one backing. Unknown section pointers fail instead of receiving a
 /// synthetic private mapping.
-unsafe fn section_view(section: u64, _size_hint: u64) -> (u64, u64) {
-    if section == 0 || !is_section(section as *const u8) {
-        return (0, 0);
+unsafe fn try_section_view(section: u64) -> Option<(u64, u64)> {
+    let _guard = lock_section_descriptors().expect("session Section list lock unavailable");
+    if !registered_section_descriptor(section)
+        || section_reference_count(section as *const u8) == 0
+    {
+        return None;
     }
     let sz = section_size(section as *const u8);
-    (map_section(section as *mut u8, |s| heap_alloc(s, true)), sz)
+    Some((map_section(section as *mut u8, |s| heap_alloc(s, true)), sz))
+}
+
+unsafe fn section_view(section: u64, _size_hint: u64) -> (u64, u64) {
+    try_section_view(section).unwrap_or((0, 0))
 }
 
 /// Kernel Section creation preserves FileObject authority and real file backing. Anonymous
@@ -9999,11 +10091,7 @@ extern "win64" fn s_mm_unmap_view_of_section(_process: u64, base: u64) -> i32 {
 /// `NTSTATUS MmUnmapViewInSessionSpace(PVOID MappedBase)` / `MmUnmapViewInSystemSpace`.
 extern "win64" fn s_mm_unmap_view_in_space(base: u64) -> i32 {
     unsafe {
-        if find_section_for_view_addr(base) != 0 {
-            unmap_section_view_addr(base)
-        } else {
-            mm_section::unmap(base)
-        }
+        try_unmap_section_view_addr(base).unwrap_or_else(|| mm_section::unmap(base))
     }
 }
 
@@ -10019,12 +10107,9 @@ extern "win64" fn s_mm_map_view(section: u64, base_out: *mut u64, size_io: *mut 
         } else {
             read_volatile(size_io)
         };
-        let mut descriptor = WIN32K_SECTION_LIST_HEAD.load(Ordering::Acquire);
-        while descriptor != 0 && descriptor != section {
-            descriptor = section_next(descriptor as *const u8);
-        }
-        let (base, size) = if descriptor == section && section != 0 {
-            section_view(section, hint)
+        let local_view = try_section_view(section);
+        let (base, size) = if let Some(view) = local_view {
+            view
         } else {
             match mm_section::map(section, hint) {
                 Ok(view) => view,
@@ -10040,7 +10125,7 @@ extern "win64" fn s_mm_map_view(section: u64, base_out: *mut u64, size_io: *mut 
         if !size_io.is_null() {
             write_volatile(size_io, size);
         }
-        if descriptor != 0 && size >= GDI_HANDLE_COUNT * GDI_TABLE_ENTRY_SIZE && size < 0x0020_0000 {
+        if local_view.is_some() && size >= GDI_HANDLE_COUNT * GDI_TABLE_ENTRY_SIZE && size < 0x0020_0000 {
             write_volatile((WIN32K_SHARED_VADDR + SH_GDI_TABLE_BASE) as *mut u64, base);
             write_volatile((WIN32K_SHARED_VADDR + SH_GDI_TABLE_SIZE) as *mut u64, size);
         }
