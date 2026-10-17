@@ -67,6 +67,16 @@ pub const NETWORK_WRAPPER_LOAD_ORDER_GROUP: &str = "NDIS Wrapper";
 pub const NETWORK_PNP_TRANSPORT_LOAD_ORDER_GROUP: &str = "PNP_TDI";
 pub const NETWORK_TRANSPORT_LOAD_ORDER_GROUP: &str = "TDI";
 
+/// Volatile HARDWARE parents published after mounting the live SYSTEM hive.
+/// Device-specific children such as `DeviceMap\Video` belong to their providers.
+pub const VOLATILE_HARDWARE_BOOTSTRAP_PATHS: [&str; 5] = [
+    r"\Registry\Machine\Hardware",
+    r"\Registry\Machine\Hardware\Description",
+    r"\Registry\Machine\Hardware\Description\System",
+    r"\Registry\Machine\Hardware\Description\System\CentralProcessor",
+    r"\Registry\Machine\Hardware\DeviceMap",
+];
+
 pub const SERVICE_KERNEL_DRIVER: u32 = 0x0000_0001;
 pub const SERVICE_FILE_SYSTEM_DRIVER: u32 = 0x0000_0002;
 pub const SERVICE_ADAPTER: u32 = 0x0000_0004;
@@ -2422,6 +2432,21 @@ mod tests {
             .registry()
             .open_key(r"\registry\machine\system\currentcontrolset\services")
             .is_some());
+    }
+
+    #[test]
+    fn volatile_hardware_parent_allows_driver_owned_video_child() {
+        let mut registry = Registry::new();
+        let parent = r"\Registry\Machine\Hardware\DeviceMap";
+        let child = r"\Registry\Machine\Hardware\DeviceMap\Video";
+        assert!(registry.open_key(parent).is_none());
+        for path in VOLATILE_HARDWARE_BOOTSTRAP_PATHS {
+            registry.create_key(path);
+        }
+        assert!(registry.open_key(parent).is_some());
+        assert!(registry.open_key(child).is_none(), "the display driver owns Video creation");
+        registry.create_key(child);
+        assert!(registry.open_key(child).is_some());
     }
 
     #[test]

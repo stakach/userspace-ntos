@@ -4236,14 +4236,8 @@ impl ExecNtHandler {
     pub(crate) fn provision_volatile_hardware_registry() {
         const REG_SZ: u32 = 1;
         const REG_DWORD: u32 = 4;
-        const HARDWARE_PATHS: [&str; 4] = [
-            r"\Registry\Machine\Hardware",
-            r"\Registry\Machine\Hardware\Description",
-            r"\Registry\Machine\Hardware\Description\System",
-            r"\Registry\Machine\Hardware\Description\System\CentralProcessor",
-        ];
         let mut created = 0u32;
-        for path in HARDWARE_PATHS {
+        for path in nt_config_manager::VOLATILE_HARDWARE_BOOTSTRAP_PATHS {
             match unsafe { crate::config_manager_create_key_with_options(path, true) } {
                 Ok((_key, was_created)) => created += u32::from(was_created),
                 Err(status) => {
