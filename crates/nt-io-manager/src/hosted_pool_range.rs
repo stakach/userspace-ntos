@@ -12,6 +12,49 @@ pub struct HostedPoolAllocation {
     pub capacity: u64,
 }
 
+/// A page-granular large allocation still belongs to the ordinary header chain. The preceding
+/// padding is a real, free-list eligible allocation, so range walks never skip unknown bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostedPoolBumpPlan {
+    pub padding: Option<HostedPoolAllocation>,
+    pub payload: u64,
+    pub capacity: u64,
+    pub used: u64,
+}
+
+pub fn plan_hosted_pool_bump(
+    cursor: u64,
+    requested: u64,
+    arena_bytes: u64,
+    page_align_large: bool,
+) -> Option<HostedPoolBumpPlan> {
+    if requested == 0 || cursor >= arena_bytes {
+        return None;
+    }
+    let header = cursor.checked_add(15)? & !15;
+    let ordinary_payload = header.checked_add(16)?;
+    let (padding, payload, capacity) = if page_align_large {
+        let capacity = requested.checked_add(0xfff)? & !0xfff;
+        if ordinary_payload & 0xfff == 0 {
+            (None, ordinary_payload, capacity)
+        } else {
+            let payload = ordinary_payload.checked_add(16)?.checked_add(0xfff)? & !0xfff;
+            let padding_capacity = payload.checked_sub(16)?.checked_sub(ordinary_payload)?;
+            if padding_capacity == 0 { return None; }
+            (
+                Some(HostedPoolAllocation { base: ordinary_payload, capacity: padding_capacity }),
+                payload,
+                capacity,
+            )
+        }
+    } else {
+        (None, ordinary_payload, requested)
+    };
+    let used = payload.checked_add(capacity)?;
+    if used > arena_bytes { return None; }
+    Some(HostedPoolBumpPlan { padding, payload, capacity, used })
+}
+
 /// Locate the one bump allocation containing `[target_offset, target_offset + length)`.
 ///
 /// `arena_bytes` is the immutable mapped extent. `used` is the provider-writable high-water
@@ -68,6 +111,30 @@ pub fn walk_hosted_pool_allocation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_bump_keeps_header_chain_and_grants_only_complete_pages() {
+        let plan = plan_hosted_pool_bump(0x1127, 0x300001, 0x800000, true).unwrap();
+        assert_eq!(plan.payload & 0xfff, 0);
+        assert_eq!(plan.capacity, 0x301000);
+        let padding = plan.padding.unwrap();
+        assert_eq!(padding.base + padding.capacity, plan.payload - 16);
+        let headers = [
+            ((padding.base - 16), padding.capacity),
+            ((plan.payload - 16), plan.capacity),
+        ];
+        assert_eq!(
+            walk_hosted_pool_allocation(0x800000, plan.used, 0x1127, plan.payload, 0x300001,
+                |at| headers.iter().find(|(offset, _)| *offset == at).map(|(_, size)| *size)),
+            Some(HostedPoolAllocation { base: plan.payload, capacity: plan.capacity })
+        );
+    }
+
+    #[test]
+    fn large_bump_rejects_arena_overrun_before_writing_padding() {
+        assert!(plan_hosted_pool_bump(0x1127, 0x300001, 0x300000, true).is_none());
+        assert!(plan_hosted_pool_bump(u64::MAX - 8, 0x10000, u64::MAX, true).is_none());
+    }
 
     fn find(
         headers: &[(u64, u64)],

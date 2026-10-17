@@ -218,6 +218,61 @@ pub fn security_descriptor_bytes_for_access(bytes: &[u8]) -> Result<SecurityDesc
     })
 }
 
+/// The mandatory label is separate from the ordinary access ACL. Its mask is
+/// integrity policy, not an object access mask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PortMandatoryLabel {
+    pub level: u32,
+    pub policy: u32,
+}
+
+/// Interpret a stored port descriptor for a connect check while preserving
+/// mandatory-label SACL semantics. The returned ordinary descriptor is only an
+/// access-check projection; callers retain the original self-relative bytes.
+pub(crate) fn port_descriptor_for_access(
+    bytes: &[u8],
+) -> Result<(SecurityDescriptor, Option<PortMandatoryLabel>), u32> {
+    let parsed = parse_self_relative_descriptor(bytes)?;
+    let mut label = None;
+    if let Some(sacl) = parsed.sacl {
+        let sacl = NativeAcl::validated_prefix(sacl).map_err(|error| error.status())?;
+        let mut offset = 8usize;
+        for _ in 0..read_u16(sacl, 4) {
+            let size = read_u16(sacl, offset + 2) as usize;
+            let ace = &sacl[offset..offset + size];
+            match ace[0] {
+                0x11 => {
+                    if label.is_some() || ace.len() != 20
+                        || ace[1] & !0x10 != 0
+                        || ace[8..16] != [1, 1, 0, 0, 0, 0, 0, 16]
+                    {
+                        return Err(crate::STATUS_INVALID_ACL);
+                    }
+                    let policy = read_u32(ace, 4);
+                    if policy & !7 != 0 {
+                        return Err(crate::STATUS_INVALID_ACL);
+                    }
+                    label = Some(PortMandatoryLabel { level: read_u32(ace, 16), policy });
+                }
+                2 => {
+                    // An audit ACE does not grant connect access. Validate its
+                    // supported layout before leaving audit delivery to the owner.
+                    crate::native_acl_inheritance::validate_known_native_ace(ace, sacl[0])?;
+                }
+                _ => return Err(0xc000_00bb), // STATUS_NOT_SUPPORTED
+            }
+            offset += size;
+        }
+    }
+    let descriptor = SecurityDescriptor {
+        owner: parsed.owner.map(Sid::from_native_bytes).transpose()?,
+        group: parsed.group.map(Sid::from_native_bytes).transpose()?,
+        dacl: parsed.dacl.map(|acl| convert_native_acl_bytes(acl, true)).transpose()?,
+        sacl: None,
+    };
+    Ok((descriptor, label))
+}
+
 fn capture_descriptor(
     memory: &dyn ClientMemory,
     va: u64,
@@ -534,6 +589,12 @@ fn convert_native_acl_bytes(bytes: &[u8], strict: bool) -> Result<Acl, u32> {
         }
 
         if strict {
+            // A mandatory label has meaning only in a SACL. Preserve the
+            // existing validation order for other known native ACEs so a
+            // malformed compound/object ACE reports its malformed payload.
+            if ace_type == 0x11 {
+                return Err(0xc000_00bb); // STATUS_NOT_SUPPORTED
+            }
             crate::native_acl_inheritance::validate_known_native_ace(
                 &bytes[offset..ace_end], bytes[0],
             )?;

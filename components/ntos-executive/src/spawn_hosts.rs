@@ -976,7 +976,7 @@ pub(crate) unsafe fn spawn_storage_host(
     hivebuf_start: u64,
     win32kbuf_start: u64,
     winlogonbuf_start: u64,
-) {
+) -> SpawnedComponent {
     // Granted device resources + staging buffers, in the EXACT map order of the old spawner.
     // Component heap, then device resources (cluster PT window, no dedicated PT): AHCI BAR, DMA
     // frame, shared run. Then the staging buffers, each with its own dedicated PT(s). NLS +
@@ -1079,12 +1079,11 @@ pub(crate) unsafe fn spawn_storage_host(
         };
         n += 1;
     }
-    // NLS + SYSTEM-hive buffers share one page table; the first descriptor creates it.
+    // NLS and the small hives share one page table; the first descriptor creates it.
     for (index, (start, vaddr, frames)) in [
         (nls_ansi_start, NLS_ANSI_VADDR, NLS_ANSI_FRAMES),
         (nls_oem_start, NLS_OEM_VADDR, NLS_OEM_FRAMES),
         (nls_case_start, NLS_CASE_VADDR, NLS_CASE_FRAMES),
-        (hivebuf_start, HIVEBUF_VADDR, HIVEBUF_FRAMES),
         (
             SECHIVEBUF_START.load(Ordering::Relaxed),
             SECHIVEBUF_VADDR,
@@ -1113,6 +1112,14 @@ pub(crate) unsafe fn spawn_storage_host(
         };
         n += 1;
     }
+    regions[n] = Region {
+        source: FrameSource::Alias(hivebuf_start),
+        base_va: HIVEBUF_VADDR,
+        count: HIVEBUF_FRAMES,
+        rights: Rights::Uniform(RW_NX),
+        pts: 1,
+    };
+    n += 1;
     // The SOFTWARE hive buffer (471040 B) — its own 2 MiB window + dedicated PT, mirroring the
     // executive-side mapping (it does not fit in the shared 0xA0-0xC0 input page table).
     regions[n] = Region {
@@ -1140,7 +1147,7 @@ pub(crate) unsafe fn spawn_storage_host(
         gs_base: None,
         caps: HostCaps::default(),
     };
-    let _ = spawn_component(&d);
+    spawn_component(&d)
 }
 
 // =============================================================================================
@@ -2100,7 +2107,7 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
             continue;
         }
         if label == 3 {
-            if let Some(next_ip) = pump_service_io_port_fault(ch, msg.m0, msg.m3) {
+            if let Some(next_ip) = pump_service_io_port_fault(ch, ch.reply_cap, msg.m0, msg.m3) {
                 msg = hosted_irq_reply_recv(
                     ch, ch.reply_cap, 1, [next_ip, 0, 0, 0], identity, expected_badge,
                 );
@@ -2472,9 +2479,37 @@ unsafe fn component_pump_loop(
         // in the same driver instance owns the controller port. The decoder
         // and exact hosted grant selector decide whether this GP is I/O.
         if label == 3 {
-            if let Some(next_ip) = pump_service_io_port_fault(ch, msg.m0, msg.m3) {
+            if let Some(next_ip) = pump_service_io_port_fault(ch, *reply_cap, msg.m0, msg.m3) {
                 pump_reply_recv_into!(ch, *reply_cap, msg, 1, next_ip);
                 continue;
+            }
+            match crate::driver_launch::hosted_driver_cr8_fault::service(
+                ch, *reply_cap, msg.badge, [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4],
+            ) {
+                crate::driver_launch::hosted_driver_cr8_fault::Cr8FaultOutcome::Applied => {
+                    pump_reply_recv_into!(ch, *reply_cap, msg, 0, 0);
+                    continue;
+                }
+                crate::driver_launch::hosted_driver_cr8_fault::Cr8FaultOutcome::Rejected => {
+                    outcome.wall(msg);
+                    break;
+                }
+                crate::driver_launch::hosted_driver_cr8_fault::Cr8FaultOutcome::Unrelated => {}
+            }
+            // This also covers win32k DriverEntry: it owns a root-issued kernel activation but
+            // deliberately does not enable the later checked-build assert-skip capability.
+            match crate::hosted_win32k_cr8_fault::service(
+                ch, *reply_cap, msg.badge, [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4],
+            ) {
+                crate::hosted_win32k_cr8_fault::Cr8FaultOutcome::Applied => {
+                    pump_reply_recv_into!(ch, *reply_cap, msg, 0, 0);
+                    continue;
+                }
+                crate::hosted_win32k_cr8_fault::Cr8FaultOutcome::Rejected => {
+                    outcome.wall(msg);
+                    break;
+                }
+                crate::hosted_win32k_cr8_fault::Cr8FaultOutcome::Unrelated => {}
             }
         }
         if label == crate::provider_bugcheck::BUGCHECK_LABEL {
@@ -2501,6 +2536,8 @@ unsafe fn component_pump_loop(
                 crate::driver_launch::hosted_source_completion_lane::startup_expected(ch).is_some();
             let class_starting =
                 crate::driver_launch::hosted_class_irp_lane::startup_expected(ch).is_some();
+            let provider_starting =
+                crate::driver_launch::hosted_provider_export_lane::startup_expected(ch).is_some();
             if hosted_starting
                 && !crate::driver_launch::hosted_source_completion_lane::validate_startup_ready(
                     ch,
@@ -2518,7 +2555,15 @@ unsafe fn component_pump_loop(
                 outcome.wall(msg);
                 break;
             }
-            let starting = hosted_starting || class_starting
+            if provider_starting
+                && !crate::driver_launch::hosted_provider_export_lane::validate_startup_ready(
+                    ch, [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4],
+                )
+            {
+                outcome.wall(msg);
+                break;
+            }
+            let starting = hosted_starting || class_starting || provider_starting
                 || (ch.caps.kind == ReqKind::Syscall
                     && ch.initial == InitialAction::RecvFirst
                     && crate::win32k_glue::win32k_physical_lane_for_channel(
@@ -2610,7 +2655,15 @@ unsafe fn component_pump_loop(
         } else if label == crate::win32k_subsystem::W32_LPC_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
-            let status = pump_service_lpc_request();
+            let status = if shared_pump::authenticated_badge(ch, msg.badge)
+                && crate::win32k_glue::win32k_physical_lane_for_channel(
+                    ch.tcb, ch.fault_ep, ch.reply_cap,
+                ).is_some()
+            {
+                pump_service_lpc_request()
+            } else {
+                nt_process::STATUS_INVALID_HANDLE as i32
+            };
             pump_reply_recv_into!(ch, *reply_cap, msg, REQUEST_TAG_LEN, status as u32 as u64);
             continue;
         } else if label == crate::win32k_subsystem::W32_REGISTRY_LABEL
@@ -3146,6 +3199,68 @@ unsafe fn component_pump_loop(
                 out3
             );
             continue;
+        } else if label == crate::win32k_subsystem::W32_FRAME_CHAIN_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            if !shared_pump::authenticated_badge(ch, msg.badge)
+                || msg.mi != ((crate::win32k_subsystem::W32_FRAME_CHAIN_LABEL << 12) | 1)
+                || *reply_cap != ch.reply_cap
+            {
+                outcome.wall(msg);
+                break;
+            }
+            use crate::driver_launch::hosted_exception_stack::FrameChainBrokerError;
+            match crate::driver_launch::hosted_exception_stack::capture_win32k_frame_chain(
+                ch,
+                *reply_cap,
+                msg.badge,
+                msg.m0,
+            ) {
+                Ok(count) => {
+                    pump_reply_recv_into!(ch, *reply_cap, msg, 1, u64::from(count));
+                    continue;
+                }
+                Err(FrameChainBrokerError::Refused) => {
+                    pump_reply_recv_into!(ch, *reply_cap, msg, 1, 0);
+                    continue;
+                }
+                Err(FrameChainBrokerError::UnsupportedUserSource) => {
+                    crate::print_str(b"[win32k-frame] unsupported user frame source; wall lane\n");
+                    outcome.wall(msg);
+                    break;
+                }
+                Err(FrameChainBrokerError::Uncertain) => {
+                    crate::print_str(b"[win32k-frame] uncertain result publication; wall lane\n");
+                    outcome.wall(msg);
+                    break;
+                }
+            }
+        } else if label == crate::win32k_subsystem::W32_PROCESS_QUERY_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let status = if shared_pump::authenticated_badge(ch, msg.badge) {
+                crate::service_sec_image::service_win32k_process_query_request(
+                    ch, *reply_cap, msg.badge, msg.mi,
+                    msg.m0, msg.m1, msg.m2, msg.m3,
+                )
+            } else {
+                nt_process::STATUS_INVALID_PARAMETER as i32
+            };
+            pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
+            continue;
+        } else if label == crate::win32k_subsystem::W32_ACTIVE_CONSOLE_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let status = if shared_pump::authenticated_badge(ch, msg.badge)
+                && msg.mi == ((crate::win32k_subsystem::W32_ACTIVE_CONSOLE_LABEL << 12) | 1)
+                && *reply_cap == ch.reply_cap
+            {
+                unsafe { crate::kuser_active_console::service(ch, msg.m0) }
+            } else {
+                nt_process::STATUS_INVALID_PARAMETER
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 4, status as u64, 0, 0, 0);
+            continue;
         } else if label == crate::win32k_subsystem::W32_ATOM_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
@@ -3192,6 +3307,30 @@ unsafe fn component_pump_loop(
                 0
             );
             continue;
+        } else if label == crate::win32k_subsystem::W32_MM_QUERY_PAGE_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let (status, present) = if !shared_pump::authenticated_badge(ch, msg.badge)
+                || msg.mi != ((crate::win32k_subsystem::W32_MM_QUERY_PAGE_LABEL << 12) | 1)
+            {
+                (0xc000_000du32 as i32, false)
+            } else {
+                match crate::driver_launch::win32k_address_validity::service(ch, *reply_cap, msg.m0) {
+                    Ok(present) => (0, present),
+                    Err(status) => (status, false),
+                }
+            };
+            pump_reply_recv4_into!(
+                ch,
+                *reply_cap,
+                msg,
+                2,
+                status as u32 as u64,
+                present as u64,
+                0,
+                0
+            );
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_PS_CREATE_SYSTEM_THREAD_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
@@ -3218,6 +3357,412 @@ unsafe fn component_pump_loop(
                 0,
                 0
             );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_KE_SET_PRIORITY_THREAD_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, previous) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_KE_SET_PRIORITY_THREAD_LABEL << 12) | 2)
+            {
+                crate::driver_launch::hosted_driver_thread_priority::service(
+                    ch, msg.m0, msg.m1 as u32 as i32, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 2,
+                status as u32 as u64, previous, 0, 0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_KE_STACK_ATTACH_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, marker) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_KE_STACK_ATTACH_LABEL << 12) | 3)
+            {
+                crate::driver_launch::hosted_driver_process_attach::service(
+                    ch, msg.m0, msg.m1, msg.m2, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 2,
+                status as u32 as u64, marker, 0, 0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PS_IDENTITY_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, result) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_PS_IDENTITY_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+                && msg.m2 == 0 && msg.m3 == 0
+            {
+                crate::driver_launch::hosted_driver_process_identity::service(
+                    ch, msg.m0, msg.m1, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, result, 0, 0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PCI_ROOT_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_PCI_ROOT_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+                && msg.m0 == 0 && msg.m1 == 0 && msg.m2 == 0 && msg.m3 == 0
+            {
+                crate::driver_launch::hosted_driver_pci_root::service(ch, msg.badge, *reply_cap)
+            } else {
+                STATUS_INVALID_PARAMETER_I32
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, 0, 0, 0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PCI_ROUTE_QUERY_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_PCI_ROUTE_QUERY_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+                && msg.m1 == 0 && msg.m2 == 0 && msg.m3 == 0
+            {
+                crate::driver_launch::hosted_driver_pci_route_query::service(
+                    ch, msg.m0, msg.badge, *reply_cap,
+                )
+            } else {
+                STATUS_INVALID_PARAMETER_I32
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 4, status as u32 as u64, 0, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_DIRECTORY_OBJECT_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, out1, out2, out3) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_DIRECTORY_OBJECT_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::driver_launch::hosted_driver_directory_object::service(
+                    ch, *reply_cap, msg.m0, msg.m1, msg.m2, msg.m3,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0, 0, 0)
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, out1, out2, out3
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_CREATE_EVENT_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, handle) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_CREATE_EVENT_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+                && msg.m3 == 0
+            {
+                crate::driver_launch::hosted_driver_create_event::service(
+                    ch, msg.m0, msg.m1, msg.m2, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, handle, 0, 0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_EVENT_REFERENCE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, out1, out2, out3) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_EVENT_REFERENCE_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::driver_launch::hosted_driver_event_reference::service(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0, 0, 0)
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, out1, out2, out3
+            );
+            continue;
+        } else if label == crate::driver_launch::hosted_driver_process_notify::LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_PROCESS_NOTIFY_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+                && msg.m2 == 0 && msg.m3 == 0
+            {
+                crate::driver_launch::hosted_driver_process_notify::service(
+                    ch, msg.m0, msg.m1, msg.badge, *reply_cap,
+                )
+            } else {
+                STATUS_INVALID_PARAMETER_I32
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, 0, 0, 0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_DYNAMIC_TYPE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, index) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_DYNAMIC_TYPE_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::driver_launch::hosted_driver_dynamic_type::service(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, index, 0, 0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_DYNAMIC_OBJECT_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_DYNAMIC_OBJECT_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::driver_launch::hosted_driver_dynamic_object::service(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                STATUS_INVALID_PARAMETER_I32
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, 0, 0, 0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_DYNAMIC_OBJECT_INSERT_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, handle) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_DYNAMIC_OBJECT_INSERT_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::driver_launch::hosted_driver_dynamic_object::insert_service(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, handle, 0, 0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_DYNAMIC_OBJECT_REFERENCE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, body, access, attributes) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_DYNAMIC_OBJECT_REFERENCE_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::driver_launch::hosted_driver_dynamic_object::reference_service(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0, 0, 0)
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, body, access, attributes
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_DYNAMIC_OBJECT_DEREFERENCE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, references) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_DYNAMIC_OBJECT_DEREFERENCE_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::driver_launch::hosted_driver_dynamic_delete::release_reference_service(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, references, 0, 0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PS_HANDLE_REFERENCE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, body, attributes, access) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_PS_HANDLE_REFERENCE_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::driver_launch::hosted_driver_ps_handle_reference::service(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0, 0, 0)
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, body, attributes, access
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_UUID_CREATE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, low, high) = if msg.mi == (crate::driver_launch::FSD_SERVICE_UUID_CREATE_LABEL << 12) {
+                crate::driver_launch::service_hosted_driver_uuid_create(
+                    ch, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0, 0)
+            };
+            pump_reply_recv4_into!(
+                ch,
+                *reply_cap,
+                msg,
+                3,
+                status as u32 as u64,
+                low,
+                high,
+                0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_GOP_QUERY_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let result = if msg.mi == (crate::driver_launch::FSD_SERVICE_GOP_QUERY_LABEL << 12) {
+                crate::driver_launch::service_hosted_driver_gop_query(ch, msg.badge, *reply_cap)
+            } else if msg.mi == ((crate::driver_launch::FSD_SERVICE_GOP_QUERY_LABEL << 12) | 3) {
+                crate::driver_launch::service_hosted_driver_gop_map(
+                    ch, msg.badge, *reply_cap, msg.m0, msg.m1, msg.m2,
+                )
+            } else {
+                0
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 1, result, 0, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_DISPLAY_OWNERSHIP_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = if msg.mi == ((crate::driver_launch::FSD_SERVICE_DISPLAY_OWNERSHIP_LABEL << 12) | 1) {
+                crate::driver_launch::service_hosted_driver_display_ownership_lost(
+                    ch, msg.m0, msg.badge, *reply_cap,
+                )
+            } else {
+                STATUS_INVALID_PARAMETER_I32
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 1, status as u32 as u64, 0, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PNP_NOTIFICATION_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, cookie) = if msg.mi == ((crate::driver_launch::FSD_SERVICE_PNP_NOTIFICATION_LABEL << 12) | 4) {
+                crate::driver_launch::service_hosted_driver_pnp_notification(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, cookie, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_POFX_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, value) = if msg.mi == ((crate::driver_launch::FSD_SERVICE_POFX_LABEL << 12) | 4) {
+                crate::driver_launch::service_hosted_driver_pofx(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, value, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_POWER_SETTING_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, value) = if msg.mi == ((crate::driver_launch::FSD_SERVICE_POWER_SETTING_LABEL << 12) | 4) {
+                crate::driver_launch::service_hosted_driver_power_setting(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, value, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_LUID_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, value) = if msg.mi == (crate::driver_launch::FSD_SERVICE_LUID_LABEL << 12) {
+                crate::driver_launch::service_hosted_driver_luid(ch, msg.badge, *reply_cap)
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, value, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_KMUTEX_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, value) = if msg.mi == ((crate::driver_launch::FSD_SERVICE_KMUTEX_LABEL << 12) | 2)
+                || msg.mi == ((crate::driver_launch::FSD_SERVICE_KMUTEX_LABEL << 12) | 3)
+            {
+                crate::driver_launch::service_hosted_driver_kmutex(
+                    ch, msg.m0, msg.m1, msg.m2, msg.badge, *reply_cap,
+                )
+            } else { (STATUS_INVALID_PARAMETER_I32, 0) };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, value, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PROPERTY_WRITE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = if msg.mi == ((crate::driver_launch::FSD_SERVICE_PROPERTY_WRITE_LABEL << 12) | 4) {
+                crate::driver_launch::service_hosted_driver_device_property_write(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else { STATUS_INVALID_PARAMETER_I32 };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 1, status as u32 as u64, 0, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_CREATE_DRIVER_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = if msg.mi == ((crate::driver_launch::FSD_SERVICE_CREATE_DRIVER_LABEL << 12) | 1) {
+                crate::driver_launch::service_hosted_driver_create_driver(
+                    ch, msg.m0, msg.badge, *reply_cap,
+                )
+            } else { STATUS_INVALID_PARAMETER_I32 };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 1, status as u32 as u64, 0, 0, 0);
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_PCI_CONFIG_LABEL
             && ch.caps.kind == ReqKind::Irp
@@ -3382,6 +3927,14 @@ unsafe fn component_pump_loop(
                 0
             );
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_REMOVE_DPC_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, removed) = crate::driver_launch::service_hosted_driver_remove_dpc(
+                ch, msg.m0, *reply_cap, msg.badge,
+            );
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, removed, 0, 0);
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_FLUSH_DPCS_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
@@ -3455,6 +4008,38 @@ unsafe fn component_pump_loop(
             } else {
                 crate::driver_launch::win32k_device_properties::service(
                     ch, *reply_cap, msg.m0, msg.m1, msg.m2, msg.m3, &mut bytes,
+                )
+            };
+            let words = (chunk as usize + 7) / 8;
+            for word in 0..words {
+                let mut value = [0u8; 8];
+                let start = word * 8;
+                let end = core::cmp::min(start + 8, chunk as usize);
+                value[..end - start].copy_from_slice(&bytes[start..end]);
+                core::ptr::write_volatile(
+                    (crate::IPCBUF_VADDR + 8 + (4 + word as u64) * 8) as *mut u64,
+                    u64::from_le_bytes(value),
+                );
+            }
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4 + words,
+                status as u32 as u64, total, token, chunk
+            );
+            continue;
+        } else if label == crate::win32k_subsystem::W32_DEVICE_INTERFACES_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let mut bytes = [0u8; crate::driver_launch::device_property::PROPERTY_CHUNK_BYTES];
+            let (status, total, token, chunk) = if !shared_pump::authenticated_badge(ch, msg.badge)
+                || msg.mi != ((crate::win32k_subsystem::W32_DEVICE_INTERFACES_LABEL << 12) | 5)
+            {
+                (0xc000_000du32 as i32, 0, 0, 0)
+            } else {
+                let fifth = core::ptr::read_volatile(
+                    (crate::IPCBUF_VADDR + 8 + 4 * 8) as *const u64,
+                );
+                crate::driver_launch::win32k_device_interfaces::service(
+                    ch, *reply_cap, msg.m0, msg.m1, msg.m2, msg.m3, fifth, &mut bytes,
                 )
             };
             let words = (chunk as usize + 7) / 8;
@@ -3676,6 +4261,7 @@ unsafe fn component_pump_loop(
             }
             continue;
         } else if (label == crate::driver_launch::FSD_SERVICE_QUERY_PATH_FORWARD_LABEL
+            || label == crate::driver_launch::FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_WRITE_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_READ_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_FLUSH_FORWARD_LABEL
@@ -3693,6 +4279,10 @@ unsafe fn component_pump_loop(
                 unsafe {
                     if label == crate::driver_launch::FSD_SERVICE_QUERY_PATH_FORWARD_LABEL {
                         crate::driver_launch::service_hosted_query_path_forward(
+                            ch, *reply_cap, msg.badge, msg.m0, msg.m1, msg.m2,
+                        )
+                    } else if label == crate::driver_launch::FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL {
+                        crate::driver_launch::service_hosted_internal_control_forward(
                             ch, *reply_cap, msg.badge, msg.m0, msg.m1, msg.m2,
                         )
                     } else if label == crate::driver_launch::FSD_SERVICE_WRITE_FORWARD_LABEL {
@@ -3862,6 +4452,22 @@ unsafe fn component_pump_loop(
             {
                 unsafe {
                     crate::driver_launch::service_hosted_driver_zw_load_driver(
+                        ch, msg.m0, msg.badge, *reply_cap,
+                    )
+                }
+            } else {
+                STATUS_INVALID_PARAMETER_I32
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 1, status as u32 as u64, 0, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_ZW_UNLOAD_DRIVER_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_ZW_UNLOAD_DRIVER_LABEL << 12) | 1)
+            {
+                unsafe {
+                    crate::driver_launch::service_hosted_driver_zw_unload_driver(
                         ch, msg.m0, msg.badge, *reply_cap,
                     )
                 }
@@ -4329,6 +4935,7 @@ unsafe fn pump_service_generic_fault(
 #[inline(never)]
 unsafe fn pump_service_io_port_fault(
     ch: &PumpChannel,
+    active_reply_cap: u64,
     fault_ip: u64,
     exception_number: u64,
 ) -> Option<u64> {
@@ -4410,7 +5017,11 @@ unsafe fn pump_service_io_port_fault(
         nt_kernel_exec::x86_io::PortIoPort::Dx => (regs[6] & 0xFFFF) as u16,
         nt_kernel_exec::x86_io::PortIoPort::Immediate(port) => port as u16,
     };
-    let grant = crate::driver_launch::hosted_io_port_fault_grant(sh, port)?;
+    let grant = crate::driver_launch::hosted_io_port_fault_grant(sh, port).or_else(|| {
+        crate::driver_launch::hosted_legacy_vga_port_fault_grant(
+            ch, active_reply_cap, port, is_in, bits,
+        )
+    })?;
     let port_cap = grant.cap;
     let port_base = grant.base;
     let port_len = grant.len;

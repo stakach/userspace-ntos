@@ -399,6 +399,18 @@ impl ExecNtHandler {
     }
 
     pub(super) unsafe fn nt_open_key_admitted(&mut self, args: &[u64]) -> u32 {
+        self.nt_open_key_with_options(args, false)
+    }
+
+    pub(super) unsafe fn nt_open_key_ex_admitted(&mut self, args: &[u64]) -> u32 {
+        let backup = match nt_config_manager::validate_key_open_options(nt_ulong_arg(args[3])) {
+            Ok(backup) => backup,
+            Err(status) => return status,
+        };
+        self.nt_open_key_with_options(args, backup)
+    }
+
+    unsafe fn nt_open_key_with_options(&mut self, args: &[u64], backup: bool) -> u32 {
         let _durable = allocator::enter_durable();
         let (mut state, _) = match self.capture_hosted_registry_publication(args, false) {
             Ok(state) => state,
@@ -407,7 +419,7 @@ impl ExecNtHandler {
         let result = (|| {
             let target = self.acquire_hosted_registry_target(&state)?;
             self.bind_hosted_registry_target(&mut state, target)?;
-            let granted = match self.registry_open_grant(&state, target, false) {
+            let granted = match self.registry_open_grant(&state, target, backup) {
                 Ok(granted) => granted,
                 Err(status) => return Err(status),
             };

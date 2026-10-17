@@ -136,6 +136,8 @@ unsafe fn hosted_component_pump_inner(
                     channel, words
                 ) || crate::driver_launch::hosted_class_irp_lane::validate_startup_ready(
                     channel, words
+                ) || crate::driver_launch::hosted_provider_export_lane::validate_startup_ready(
+                    channel, words
                 ),
                 "authenticate exact retained hosted worker READY"
             );

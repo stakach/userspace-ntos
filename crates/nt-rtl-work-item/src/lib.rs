@@ -195,6 +195,25 @@ pub enum PacketOwner {
     Worker,
 }
 
+/// What the native completion transport actually established about one submission.
+/// A lost reply after entry is not a failed enqueue: the packet and token must remain live.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueuePostObservation {
+    /// Rejected before the request could enter the completion service.
+    NoEffect(u32),
+    /// Exact terminal reply for this request. A failed NTSTATUS means no packet was posted.
+    Completed(u32),
+    /// Entry may have posted the packet, but there is no exact terminal reply yet.
+    Indeterminate,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum SubmissionResolution {
+    Failed { status: u32, cleanup: CleanupPlan },
+    Queued(QueuedPacket),
+    Retained(Submission),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CleanupAction {
     CloseToken(u64),
@@ -248,6 +267,29 @@ impl Submission {
 
     pub const fn packet(&self) -> WorkItemPacket {
         self.packet
+    }
+
+    /// Resolve only an observation for this submission. An uncertain post keeps the same
+    /// allocation, token, and counter ticket; it grants neither cleanup nor replay authority.
+    pub fn resolve(
+        self,
+        observation: QueuePostObservation,
+        counters: &mut PoolCounters,
+    ) -> Result<SubmissionResolution, TransitionError> {
+        match observation {
+            QueuePostObservation::Indeterminate => Ok(SubmissionResolution::Retained(self)),
+            QueuePostObservation::NoEffect(status) => Ok(SubmissionResolution::Failed {
+                status,
+                cleanup: self.queue_failed(counters)?,
+            }),
+            QueuePostObservation::Completed(status) if nt_success(status) => {
+                Ok(SubmissionResolution::Queued(self.commit_queue_success()))
+            }
+            QueuePostObservation::Completed(status) => Ok(SubmissionResolution::Failed {
+                status,
+                cleanup: self.queue_failed(counters)?,
+            }),
+        }
     }
 
     /// Commits a successful queue operation and transfers packet and accounting ownership.
@@ -1306,6 +1348,57 @@ mod tests {
             .commit_queue_success();
         assert_eq!(queued.owner(), PacketOwner::Queue);
         assert_eq!(queued.dequeue().owner(), PacketOwner::Worker);
+    }
+
+    #[test]
+    fn post_submit_uncertainty_retains_packet_token_and_accounting_until_exact_reply() {
+        let packet = WorkItemPacket::new(1, 2, WorkItemFlags::EXECUTE_DEFAULT, 0x44);
+        let mut counters = PoolCounters::default();
+        let submission = counters.reserve(0x4000, packet).unwrap();
+        let retained = match submission
+            .resolve(QueuePostObservation::Indeterminate, &mut counters)
+            .unwrap()
+        {
+            SubmissionResolution::Retained(submission) => submission,
+            other => panic!("unexpected resolution: {other:?}"),
+        };
+        assert_eq!(retained.owner(), PacketOwner::Submitter);
+        assert_eq!(retained.packet(), packet);
+        assert_eq!(counters.requests(CounterLane::Normal), 1);
+        // The same request's exact success reply transfers the original packet once.
+        let queued = match retained
+            .resolve(QueuePostObservation::Completed(STATUS_SUCCESS), &mut counters)
+            .unwrap()
+        {
+            SubmissionResolution::Queued(queued) => queued,
+            other => panic!("unexpected resolution: {other:?}"),
+        };
+        assert_eq!(queued.owner(), PacketOwner::Queue);
+    }
+
+    #[test]
+    fn exact_failed_reply_allows_one_cleanup_after_uncertainty() {
+        let packet = WorkItemPacket::new(1, 2, WorkItemFlags::EXECUTE_DEFAULT, 0x44);
+        let mut counters = PoolCounters::default();
+        let submission = counters.reserve(0x5000, packet).unwrap();
+        let retained = match submission
+            .resolve(QueuePostObservation::Indeterminate, &mut counters)
+            .unwrap()
+        {
+            SubmissionResolution::Retained(submission) => submission,
+            other => panic!("unexpected resolution: {other:?}"),
+        };
+        let failed = retained
+            .resolve(QueuePostObservation::Completed(STATUS_UNSUCCESSFUL), &mut counters)
+            .unwrap();
+        assert_eq!(
+            failed,
+            SubmissionResolution::Failed {
+                status: STATUS_UNSUCCESSFUL,
+                cleanup: CleanupPlan::submission_failure(0x5000, 0x44),
+            }
+        );
+        assert_eq!(counters, PoolCounters::default());
     }
 
     #[test]

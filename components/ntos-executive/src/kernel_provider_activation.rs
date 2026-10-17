@@ -188,6 +188,17 @@ fn authenticated_channel_caller(
     Ok(caller)
 }
 
+/// Root-owned dispatch epoch for an exact stopped kernel-originated provider fault.
+pub(crate) unsafe fn fault_dispatch_id(
+    channel: &spawn_hosts::PumpChannel,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+) -> Option<u64> {
+    let caller = authenticated_channel_caller(channel).ok()?;
+    let owner = caller.owner();
+    (owner.dispatch_id == dispatch.epoch() && owner.dispatch_id != 0)
+        .then_some(owner.dispatch_id)
+}
+
 /// Recover native registry authority only from the exact retained, currently executing job.
 pub(crate) unsafe fn registry_caller(
     channel: &spawn_hosts::PumpChannel,
@@ -389,6 +400,23 @@ pub(super) unsafe fn service_ps(
         Ok(target) => target,
         Err(status) => return (status as i32, 0, 0, 0),
     };
+    if native_thread_priority::is_priority_effect_op(op) {
+        let admitted = with_provider_process_manager(|pm| {
+            (&*core::ptr::addr_of!(ACTIVATIONS)).validate(
+                caller, pm,
+                &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
+                &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
+            )
+        });
+        if let Err(status) = admitted {
+            return (status as i32, 0, 0, 0);
+        }
+        let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+        if handler.is_null() {
+            return (0xc000_00a3u32 as i32, 0, 0, 0);
+        }
+        return native_thread_priority::dispatch(&mut *handler, op, object, value);
+    }
     match with_provider_process_manager(|pm| {
         (&*core::ptr::addr_of!(ACTIVATIONS)).validate(
             caller,
@@ -396,9 +424,14 @@ pub(super) unsafe fn service_ps(
             &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
             &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
         )?;
-        Ok(provider_ps::dispatch(pm, op, object, value, |pm, body| {
-            provider_ps_projection::grant(target, pm, body)
-        }))
+        Ok(provider_ps::dispatch(
+            pm,
+            op,
+            object,
+            value,
+            |pm, job| unsafe { crate::exec_handler::native_job_bodies::ensure(pm, job) },
+            |pm, body| provider_ps_projection::grant(target, pm, body),
+        ))
     }) {
         Ok(result) => result,
         Err(status) => (status as i32, 0, 0, 0),
@@ -430,6 +463,19 @@ pub(super) unsafe fn service_event(
             domain: owner.provider_domain,
             generation: owner.provider_generation,
         };
+        if matches!(
+            op,
+            win32k_subsystem::W32_SYNC_OP_PUBLISH
+                | win32k_subsystem::W32_SYNC_OP_RELEASE_SEMAPHORE
+                | win32k_subsystem::W32_SYNC_OP_RELEASE_MUTANT
+                | win32k_subsystem::W32_SYNC_OP_RETIRE
+                | win32k_subsystem::W32_SYNC_OP_ACK_RETIREMENT
+                | win32k_subsystem::W32_SYNC_OP_QUERY
+        ) {
+            return Ok(crate::service_sec_image::service_win32k_provider_sync_request(
+                provider, Some(owner), op, arg1, arg2, arg3,
+            ));
+        }
         if matches!(
             op,
             win32k_subsystem::W32_TIMER_OP_PUBLISH_LOCAL

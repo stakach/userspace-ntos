@@ -8,6 +8,10 @@
 #![no_std]
 
 pub mod caller_aperture;
+pub mod caller_pool_map;
+pub mod dirty_rect;
+#[cfg(test)]
+mod caller_pool_map_tests;
 pub mod caller_memory;
 mod child_ids;
 pub mod mode_evidence;
@@ -47,6 +51,7 @@ pub const IOCTL_VIDEO_QUERY_CURRENT_MODE: u32 = 0x0023_0408;
 pub const IOCTL_VIDEO_SET_CURRENT_MODE: u32 = 0x0023_040C;
 pub const IOCTL_VIDEO_MAP_VIDEO_MEMORY: u32 = 0x0023_0458;
 pub const IOCTL_VIDEO_INIT_WIN32K_CALLBACKS: u32 = 0x0023_001C;
+pub const IOCTL_VIDEO_ENUM_MONITOR_PDO: u32 = 0x0023_0018;
 pub const IOCTL_VIDEO_UNMAP_VIDEO_MEMORY: u32 = 0x0023_045C;
 
 pub const VIDEO_NUM_MODES_SIZE: usize = 8;

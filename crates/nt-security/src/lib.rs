@@ -22,6 +22,7 @@ mod object_security;
 mod object_creation_grant;
 mod directory_security;
 mod port;
+pub mod raw_rtl;
 mod section_security;
 pub mod se_exports;
 mod sid;
@@ -87,7 +88,8 @@ pub use native_sd::{
     UNPROTECTED_SACL_SECURITY_INFORMATION,
 };
 pub use port::{
-    validate_secure_port_connect, SecurePortConnectSecurity, STATUS_SERVER_SID_MISMATCH,
+    authorize_port_connect, validate_secure_port_connect, SecurePortConnectSecurity,
+    PORT_CONNECT, PORT_GENERIC_MAPPING, STATUS_SERVER_SID_MISMATCH,
 };
 pub use section_security::{
     assign_section_security, authorize_section_open, SECTION_GENERIC_MAPPING,

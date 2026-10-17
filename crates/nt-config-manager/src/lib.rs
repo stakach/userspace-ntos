@@ -19,6 +19,9 @@ mod property;
 mod registry;
 mod registry_security;
 mod filter_policy;
+mod key_open_options;
+#[cfg(test)]
+mod kernel_device_interface_tests;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -32,6 +35,7 @@ pub use registry::{
     RegistryValueType,
 };
 pub use filter_policy::{DeviceFilterPolicy, DeviceFilterPolicyError};
+pub use key_open_options::validate_key_open_options;
 pub use registry_security::{inherit_generated_key_security, validate_generated_key_security};
 
 /// The NT root-bus pseudo-devnode exposed through user-mode PnP relations.
@@ -64,6 +68,16 @@ pub const SERVICE_GROUP_ORDER_PATH: &str =
 pub const NETWORK_WRAPPER_LOAD_ORDER_GROUP: &str = "NDIS Wrapper";
 pub const NETWORK_PNP_TRANSPORT_LOAD_ORDER_GROUP: &str = "PNP_TDI";
 pub const NETWORK_TRANSPORT_LOAD_ORDER_GROUP: &str = "TDI";
+
+/// Volatile HARDWARE parents published after mounting the live SYSTEM hive.
+/// Device-specific children such as `DeviceMap\Video` belong to their providers.
+pub const VOLATILE_HARDWARE_BOOTSTRAP_PATHS: [&str; 5] = [
+    r"\Registry\Machine\Hardware",
+    r"\Registry\Machine\Hardware\Description",
+    r"\Registry\Machine\Hardware\Description\System",
+    r"\Registry\Machine\Hardware\Description\System\CentralProcessor",
+    r"\Registry\Machine\Hardware\DeviceMap",
+];
 
 pub const SERVICE_KERNEL_DRIVER: u32 = 0x0000_0001;
 pub const SERVICE_FILE_SYSTEM_DRIVER: u32 = 0x0000_0002;
@@ -818,6 +832,13 @@ pub enum InterfaceRegistrationError {
     UnknownDevnode,
     InvalidGuid,
     InvalidReference,
+}
+
+/// Validation failures before an `IoGetDeviceInterfaces` query can inspect CM state.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DeviceInterfaceQueryError {
+    UnknownDevnode,
+    InvalidGuid,
 }
 
 /// The Configuration Manager: the registry + the service/devnode/interface indices.
@@ -1977,6 +1998,36 @@ impl ConfigManager {
             .collect()
     }
 
+    /// `IoGetDeviceInterfaces`' kernel-path MULTI_SZ for one class and optional exact PDO
+    /// devnode identity. The native adapter owns GUID/PDO pointer validation and maps the PDO to
+    /// its canonical DevnodeId; this query never manufactures a device from a name or pointer.
+    /// The returned buffer contains one final NUL even when there are no matching interfaces.
+    pub fn kernel_device_interface_multi_sz(
+        &self,
+        guid: &str,
+        devnode: Option<DevnodeId>,
+        include_nonactive: bool,
+    ) -> Result<Vec<u16>, DeviceInterfaceQueryError> {
+        if guid_text_to_memory_bytes(guid).is_none() {
+            return Err(DeviceInterfaceQueryError::InvalidGuid);
+        }
+        if devnode.is_some_and(|id| !self.devnodes.iter().any(|record| record.id == id)) {
+            return Err(DeviceInterfaceQueryError::UnknownDevnode);
+        }
+        let mut result = Vec::new();
+        for interface in &self.interfaces {
+            if interface.guid.eq_ignore_ascii_case(guid)
+                && devnode.is_none_or(|id| interface.devnode == id)
+                && (include_nonactive || interface.enabled)
+            {
+                result.extend(interface.symbolic_link.encode_utf16());
+                result.push(0);
+            }
+        }
+        result.push(0);
+        Ok(result)
+    }
+
     /// Does user-mode PnP know this device instance? The CM device set includes the NT root-bus
     /// pseudo-devnode plus every indexed `Enum\<InstanceId>` devnode.
     pub fn pnp_device_exists(&self, instance_id: &str) -> bool {
@@ -2050,6 +2101,17 @@ impl ConfigManager {
         guid: &[u8; 16],
         instance_id: &str,
     ) -> Option<Vec<String>> {
+        self.pnp_interface_links_by_guid_bytes(guid, instance_id, false)
+    }
+
+    /// Configuration-service projection of `IoGetDeviceInterfaces` flags. A concrete instance
+    /// filters by its recorded devnode; the root instance addresses the complete class.
+    pub fn pnp_interface_links_by_guid_bytes(
+        &self,
+        guid: &[u8; 16],
+        instance_id: &str,
+        include_nonactive: bool,
+    ) -> Option<Vec<String>> {
         if !self.pnp_device_exists(instance_id) {
             return None;
         }
@@ -2062,7 +2124,7 @@ impl ConfigManager {
             self.interfaces
                 .iter()
                 .filter(|interface| {
-                    interface.enabled
+                    (include_nonactive || interface.enabled)
                         && guid_text_eq_memory(&interface.guid, guid)
                         && devnode_filter.is_none_or(|id| interface.devnode == id)
                 })
@@ -2372,6 +2434,21 @@ mod tests {
             .registry()
             .open_key(r"\registry\machine\system\currentcontrolset\services")
             .is_some());
+    }
+
+    #[test]
+    fn volatile_hardware_parent_allows_driver_owned_video_child() {
+        let mut registry = Registry::new();
+        let parent = r"\Registry\Machine\Hardware\DeviceMap";
+        let child = r"\Registry\Machine\Hardware\DeviceMap\Video";
+        assert!(registry.open_key(parent).is_none());
+        for path in VOLATILE_HARDWARE_BOOTSTRAP_PATHS {
+            registry.create_key(path);
+        }
+        assert!(registry.open_key(parent).is_some());
+        assert!(registry.open_key(child).is_none(), "the display driver owns Video creation");
+        registry.create_key(child);
+        assert!(registry.open_key(child).is_some());
     }
 
     #[test]
@@ -4230,6 +4307,7 @@ mod tests {
         let guid_bytes = guid_text_to_memory_bytes(guid).unwrap();
         cm.register_interface(dn1, guid, "", true).unwrap();
         let disabled = cm.register_interface(dn2, guid, "disabled", false).unwrap();
+        let disabled_link = cm.interface(disabled).unwrap().symbolic_link.clone();
         let other = cm
             .register_interface(dn2, "{9A7B0B24-6E57-4C51-AD3C-6D9F5F0E0002}", "", true)
             .unwrap();
@@ -4260,6 +4338,20 @@ mod tests {
         assert_eq!(device_links, root_links);
         assert!(cm
             .pnp_enabled_interface_links_by_guid_bytes(&guid_bytes, r"ROOT\MISSING\0000")
+            .is_none());
+        let all_links = cm
+            .pnp_interface_links_by_guid_bytes(&guid_bytes, PNP_ROOT_DEVICE_INSTANCE, true)
+            .expect("root interface query");
+        assert_eq!(all_links.len(), 2);
+        assert!(all_links.iter().any(|link| link.contains("ROOT#IFACE#0000")));
+        assert!(all_links.iter().any(|link| link.contains("ROOT#IFACE#0001")));
+        assert_eq!(
+            cm.pnp_interface_links_by_guid_bytes(&guid_bytes, r"ROOT\IFACE\0001", true)
+                .unwrap(),
+            alloc::vec![disabled_link]
+        );
+        assert!(cm
+            .pnp_interface_links_by_guid_bytes(&guid_bytes, r"ROOT\MISSING\0000", true)
             .is_none());
     }
 

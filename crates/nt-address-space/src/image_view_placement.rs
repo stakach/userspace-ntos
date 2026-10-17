@@ -24,7 +24,9 @@ pub struct ImageViewPlacement {
     pub status: u32,
 }
 
-fn zero_bits_count(raw: u64) -> Result<u32, u32> {
+/// Decode the x64 NtMapViewOfSection ZeroBits argument shared by image and data views.
+/// Values below 32 are counts; values at or above 32 are address masks.
+pub fn x64_map_view_zero_bits_count(raw: u64) -> Result<u32, u32> {
     let count = if raw >= 32 { raw.leading_zeros() }
         else if raw != 0 { raw as u32 + 32 } else { 0 };
     if count > 53 { Err(STATUS_INVALID_PARAMETER_4) } else { Ok(count) }
@@ -36,7 +38,7 @@ pub fn plan_image_view_placement(
     request: ImageViewPlacementRequest,
     mut available: impl FnMut(u64, u64) -> bool,
 ) -> Result<ImageViewPlacement, u32> {
-    let zero_bits = zero_bits_count(request.zero_bits)?;
+    let zero_bits = x64_map_view_zero_bits_count(request.zero_bits)?;
     let size = request.image_size.checked_add(PAGE_SIZE - 1)
         .map(|size| size & !(PAGE_SIZE - 1)).filter(|size| *size != 0)
         .ok_or(STATUS_CONFLICTING_ADDRESSES)?;

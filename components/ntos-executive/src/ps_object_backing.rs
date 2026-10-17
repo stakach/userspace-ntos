@@ -557,6 +557,9 @@ pub(super) unsafe fn prepare_process(
         return Err(INVALID);
     }
     let peb = pm.query_process_basic(pid, u64::MAX)?.peb_base_address;
+    let image_file_name = pm.kernel_process_export_state(pid)
+        .and_then(|state| state.eprocess_image_file_name())
+        .ok_or(INVALID)?;
     arena.prepare(
         BodyId::Process(pid),
         |address| {
@@ -564,6 +567,7 @@ pub(super) unsafe fn prepare_process(
                 body: GuestAddr(address),
                 process_id: u64::from(pid),
                 peb: GuestAddr(peb),
+                image_file_name,
             })
         },
         scratch_base,

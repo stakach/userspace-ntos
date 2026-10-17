@@ -196,6 +196,7 @@ dependencies = [
  "nt-lpc-client",
  "nt-lpc-server",
  "nt-port-core",
+ "nt-security",
  "nt-status",
 ]
 
@@ -204,6 +205,23 @@ name = "nt-alpc-abi"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+]
+
+[[package]]
+name = "nt-alpc-native-capture"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "nt-alpc-abi",
+ "nt-security",
+]
+
+[[package]]
+name = "nt-alpc-native-later"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "nt-alpc-abi",
 ]
 
 [[package]]
@@ -222,16 +240,19 @@ dependencies = [
  "nt-driver-runtime",
  "nt-exe-image",
  "nt-fs",
+ "nt-hosted-runtime",
  "nt-io-manager",
  "nt-kernel-abi",
  "nt-kernel-exec",
  "nt-memory-manager",
+ "nt-object-manager",
  "nt-pe-loader",
  "nt-printf",
  "nt-process",
  "nt-status",
  "nt-types",
  "nt-user-host",
+ "sha2",
  "syn",
 ]
 

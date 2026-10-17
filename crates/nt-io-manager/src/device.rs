@@ -61,6 +61,9 @@ pub struct DeviceRecord {
     pub object_id: ObjectId,
     pub driver_id: DriverId,
     pub name: Option<NtPath>,
+    /// Internal Object Manager name for an otherwise unnamed PnP device interface target.
+    /// This does not change the WDM DeviceObject name exposed to the driver.
+    pub(crate) interface_endpoint: Option<NtPath>,
     pub device_type: DeviceType,
     pub characteristics: DeviceCharacteristics,
     pub flags: DeviceFlags,
@@ -91,6 +94,7 @@ impl DeviceRecord {
             object_id,
             driver_id,
             name,
+            interface_endpoint: None,
             device_type,
             characteristics,
             flags,

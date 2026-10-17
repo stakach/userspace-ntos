@@ -27,11 +27,122 @@ fn fixture() -> (
     (pm, user, kernel, pid, tid)
 }
 
+#[test]
+fn driver_created_event_and_directory_handles_close_only_in_their_exact_owner() {
+    let (mut pm, _user, kernel, owner, _) = fixture();
+    let foreign = pm.create_process("foreign", None, None);
+    let foreign_thread = pm.create_thread(foreign, 0, 0, false).unwrap();
+    let foreign_caller = pm
+        .capture_native_handle_caller(
+            pm.thread_lifetime(foreign_thread).unwrap(),
+            AccessMode::KernelMode,
+        )
+        .unwrap();
+
+    let event = HandleObject::Event(nt_types::ObjectId(0xE1));
+    let event_handle = u64::from(pm.insert_handle(owner, event, 0).unwrap());
+    let mut directory = pm.reserve_native_object_directory_handle(kernel, 0).unwrap();
+    directory.bind(&mut pm, 0xD1, 1).unwrap();
+    let directory_handle = directory.publish(&mut pm).unwrap();
+    let directory_object = HandleObject::ObjectDirectory(0xD1);
+
+    for handle in [event_handle, directory_handle] {
+        assert_eq!(
+            pm.close_native_registry_key_handle(kernel, handle),
+            Err(NativeCloseError::Status(STATUS_OBJECT_TYPE_MISMATCH)),
+        );
+        assert_eq!(
+            pm.close_native_handle(foreign_caller, handle).unwrap_err(),
+            NativeCloseError::Status(STATUS_INVALID_HANDLE),
+        );
+    }
+    assert_eq!(pm.handle_object_count(event), 1);
+    assert_eq!(pm.handle_object_count(directory_object), 1);
+
+    assert_eq!(
+        pm.close_native_handle(kernel, event_handle).unwrap().into_object(),
+        event,
+    );
+    assert_eq!(
+        pm.close_native_handle(kernel, directory_handle).unwrap().into_object(),
+        directory_object,
+    );
+    assert_eq!(pm.handle_object_count(event), 0);
+    assert_eq!(pm.handle_object_count(directory_object), 0);
+    assert_eq!(
+        pm.close_native_handle(kernel, event_handle).unwrap_err(),
+        NativeCloseError::Status(STATUS_INVALID_HANDLE),
+    );
+    assert_eq!(
+        pm.close_native_handle(kernel, directory_handle).unwrap_err(),
+        NativeCloseError::Status(STATUS_INVALID_HANDLE),
+    );
+}
+
+#[test]
+fn kernel_event_reference_resolves_system_table_under_exact_native_caller() {
+    let (mut pm, user, kernel, local_pid, _) = fixture();
+    let system = pm.initial_system_identity().unwrap().process_id();
+    let event = HandleObject::Event(nt_types::ObjectId(0xE2));
+    let system_handle = pm.insert_handle(system, event, 0x0010_0002).unwrap();
+    let local_handle = pm.insert_handle(local_pid,
+        HandleObject::Event(nt_types::ObjectId(0xE3)), 0x0010_0002).unwrap();
+    assert_eq!(system_handle, local_handle);
+    let tagged = KERNEL_HANDLE_TAG | u64::from(system_handle);
+    let target = pm.inspect_native_event_handle(kernel, tagged, 0x0010_0002).unwrap();
+    assert_eq!(target.table_owner(), system);
+    assert_eq!(target.object(), event);
+    assert_eq!(target.information().granted_access, Some(0x0010_0002));
+    assert_eq!(pm.inspect_native_event_handle(user, tagged, 0), Err(STATUS_INVALID_HANDLE));
+    assert_eq!(pm.inspect_native_event_handle(kernel, tagged, 0x0010_0004),
+        Err(STATUS_ACCESS_DENIED));
+    assert_eq!(pm.inspect_native_event_handle(kernel,
+        u64::from(local_handle), 0).unwrap().table_owner(), local_pid);
+    let wrong = pm.insert_handle(system, HandleObject::File(0xF1), 0x0010_0002).unwrap();
+    assert_eq!(pm.inspect_native_event_handle(kernel,
+        KERNEL_HANDLE_TAG | u64::from(wrong), 0), Err(STATUS_OBJECT_TYPE_MISMATCH));
+}
+
+#[test]
+fn initial_system_kernel_event_create_has_identity_without_hosted_process_index() {
+    let (pm, user, other_kernel, _, _) = fixture();
+    let system = pm.initial_system_identity().unwrap();
+    let system_kernel = pm.capture_native_handle_caller(
+        system.thread(), AccessMode::KernelMode).unwrap();
+    let owner = pm.authorize_initial_system_native_event_create(
+        system_kernel, OBJ_KERNEL_HANDLE).unwrap();
+    assert_eq!(owner.0, system.process_id());
+    assert_eq!(owner.1, system.thread().generation());
+    assert_eq!(pm.authorize_initial_system_native_event_create(other_kernel,
+        OBJ_KERNEL_HANDLE), Err(STATUS_INVALID_HANDLE));
+    assert_eq!(pm.authorize_initial_system_native_event_create(user,
+        OBJ_KERNEL_HANDLE), Err(STATUS_INVALID_HANDLE));
+    assert_eq!(pm.authorize_initial_system_native_event_create(system_kernel, 0),
+        Err(STATUS_INVALID_PARAMETER));
+}
+
 fn counts(pm: &ProcessManager, pid: ProcessId, tid: crate::ThreadId) -> (u32, u32) {
     (
         pm.process(pid).unwrap().kernel_pointer_references,
         pm.thread(tid).unwrap().kernel_pointer_references,
     )
+}
+
+#[test]
+fn alpc_port_handle_cannot_escape_its_exact_service_owner_through_duplicate() {
+    let (mut pm, _user, _kernel, owner, _) = fixture();
+    let other = pm.create_process("other", None, None);
+    let object = HandleObject::AlpcPort {
+        service_handle: 0x4c50_0001,
+        kind: crate::native_alpc_port::AlpcPortKind::Created,
+        owner_generation: 7,
+        invocation_hi: 11,
+        invocation_lo: 13,
+    };
+    let handle = pm.insert_handle(owner, object, 0).unwrap();
+    assert_eq!(pm.duplicate_handle(owner, handle, other), Err(STATUS_ACCESS_DENIED));
+    assert_eq!(pm.lookup_handle(owner, handle), Some(object));
+    assert_eq!(pm.handle_count(other), 0);
 }
 
 #[test]
@@ -108,6 +219,58 @@ fn strict_native_scope_never_truncates_or_confuses_pseudo_handles() {
             kernel: true,
         })
     );
+}
+
+#[test]
+fn native_handle_attribute_change_targets_only_the_decoded_owner() {
+    let (mut pm, user, kernel, pid, _) = fixture();
+    let system = pm.initial_system_identity().unwrap().process_id();
+    let user_handle = pm
+        .insert_handle(pid, HandleObject::Opaque(0x101), 0)
+        .unwrap();
+    let system_handle = pm
+        .insert_handle(system, HandleObject::Opaque(0x202), 0)
+        .unwrap();
+    assert_eq!(user_handle, system_handle);
+
+    let user_flags = HandleFlags {
+        inherit: true,
+        protect_from_close: false,
+    };
+    let kernel_flags = HandleFlags {
+        inherit: false,
+        protect_from_close: true,
+    };
+    assert_eq!(
+        pm.set_native_handle_flags(user, u64::from(user_handle) | 1, user_flags),
+        Ok(())
+    );
+    assert_eq!(pm.handle_flags(pid, user_handle), Some(user_flags));
+    assert_eq!(
+        pm.handle_flags(system, system_handle),
+        Some(HandleFlags::default())
+    );
+
+    assert_eq!(
+        pm.set_native_handle_flags(
+            kernel,
+            KERNEL_HANDLE_TAG | u64::from(system_handle) | 2,
+            kernel_flags,
+        ),
+        Ok(())
+    );
+    assert_eq!(pm.handle_flags(system, system_handle), Some(kernel_flags));
+    assert_eq!(pm.handle_flags(pid, user_handle), Some(user_flags));
+
+    assert_eq!(
+        pm.set_native_handle_flags(user, KERNEL_HANDLE_TAG | u64::from(system_handle), user_flags),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(
+        pm.set_native_handle_flags(kernel, u64::MAX, user_flags),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(pm.handle_flags(system, system_handle), Some(kernel_flags));
 }
 
 #[test]

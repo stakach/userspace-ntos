@@ -13,9 +13,11 @@ extern crate alloc;
 
 mod byte_lock;
 mod boot_paths;
+mod bounded_read;
 mod directory;
 mod fat_directory;
 mod fat_directory_walk;
+mod fat_range_cursor;
 mod file_backing;
 mod file_mode;
 mod flush;
@@ -41,9 +43,11 @@ mod volume;
 
 pub use byte_lock::*;
 pub use boot_paths::*;
+pub use bounded_read::published_file_size;
 pub use directory::*;
 pub use fat_directory::*;
 pub use fat_directory_walk::*;
+pub use fat_range_cursor::FatRangeCursor;
 pub use file_backing::FileBacking;
 pub use file_mode::FileModeState;
 pub use flush::file_flush_access_allowed;

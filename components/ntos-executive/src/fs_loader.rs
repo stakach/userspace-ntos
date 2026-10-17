@@ -14,6 +14,9 @@ struct FatSectorCacheScratch {
 
 pub(crate) const FAT32_SCRATCH_OFFSET: u64 = 0xA00;
 const FAT32_FAT_CACHE_OFFSET: u64 = FAT32_SCRATCH_OFFSET;
+// The isolated storage host maps its image read-only and never uses this cache. The executive
+// owns one mounted FAT volume and serializes its native filesystem calls through the service loop.
+static mut EXEC_FAT_RANGE_CURSOR: nt_fs::FatRangeCursor = nt_fs::FatRangeCursor::new();
 const _: () = assert!(
     FAT32_FAT_CACHE_OFFSET + core::mem::size_of::<FatSectorCacheScratch>() as u64 <= 0x1000
 );
@@ -187,6 +190,13 @@ unsafe fn fat_cache_invalidate(fs: &Fat32) {
     cache.valid = 0;
 }
 
+unsafe fn fat_chain_cache_invalidate(fs: &Fat32) {
+    fat_cache_invalidate(fs);
+    if fs.census {
+        (&mut *core::ptr::addr_of_mut!(EXEC_FAT_RANGE_CURSOR)).invalidate();
+    }
+}
+
 /// Write one full FAT sector through the same AHCI DMA frame used by [`fat_read_sector`].
 #[allow(dead_code)]
 pub(crate) unsafe fn fat_write_sector(fs: &Fat32, sector: u32, data: &[u8]) -> u32 {
@@ -196,6 +206,8 @@ pub(crate) unsafe fn fat_write_sector(fs: &Fat32, sector: u32, data: &[u8]) -> u
     let Some(disk_lba) = nt_fs::checked_partition_lba(fs.volume_start_lba, sector) else {
         return 0xff;
     };
+    // A timed-out write may still have reached media, so invalidate before issuing it.
+    fat_chain_cache_invalidate(fs);
     let started = fs.census.then(disk_census_ticks);
     let status = ahci_write_sectors(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba, data);
     disk_census_record(
@@ -225,6 +237,7 @@ pub(crate) unsafe fn fat_write_sectors(fs: &Fat32, sector: u32, data: &[u8]) -> 
     if nt_fs::checked_partition_lba(fs.volume_start_lba, last).is_none() {
         return 0xff;
     }
+    fat_chain_cache_invalidate(fs);
     let started = fs.census.then(disk_census_ticks);
     let status = ahci_write_sectors(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba, data);
     disk_census_record(
@@ -503,13 +516,13 @@ unsafe fn system32_cache_candidate_count(fs: &Fat32, system32_cluster: u32) -> u
 }
 
 unsafe fn system32_cache_build(fs: &Fat32) -> bool {
-    let Some(reactos) = fat_find_open_metadata(fs, fs.root_cl, b"reactos") else {
+    let Some(installed_root) = fat_find_open_metadata(fs, fs.root_cl, crate::installed_layout::ROOT) else {
         return false;
     };
-    if !reactos.metadata.is_directory {
+    if !installed_root.metadata.is_directory {
         return false;
     }
-    let Some(system32) = fat_find_open_metadata(fs, reactos.first_cluster, b"system32") else {
+    let Some(system32) = fat_find_open_metadata(fs, installed_root.first_cluster, b"system32") else {
         return false;
     };
     if !system32.metadata.is_directory {
@@ -595,8 +608,8 @@ unsafe fn system32_cache_lookup_metadata(fs: &Fat32, leaf: &[u8]) -> Option<FatO
 }
 
 fn system32_leaf_from_volume_path(path: &[u8]) -> Option<&[u8]> {
-    const PREFIX: &[u8] = b"reactos\\system32\\";
-    const ALT_PREFIX: &[u8] = b"reactos/system32/";
+    const PREFIX: &[u8] = crate::installed_layout::SYSTEM32_PREFIX;
+    const ALT_PREFIX: &[u8] = crate::installed_layout::SYSTEM32_SLASH_PREFIX;
     let leaf = if path.len() > PREFIX.len() && path[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
         &path[PREFIX.len()..]
     } else if path.len() > ALT_PREFIX.len()
@@ -784,12 +797,17 @@ pub(crate) unsafe fn fat_read_file_range(
     if cluster_bytes == 0 {
         return 0;
     }
-    let mut cluster = first_cluster;
-    let mut skip_clusters = offset / cluster_bytes;
-    while skip_clusters != 0 && cluster >= 2 && cluster < 0x0FFF_FFF8 {
-        cluster = fat_next(fs, cluster);
-        skip_clusters -= 1;
-    }
+    let mut local_cursor = nt_fs::FatRangeCursor::new();
+    let cursor = if fs.census {
+        &mut *core::ptr::addr_of_mut!(EXEC_FAT_RANGE_CURSOR)
+    } else {
+        &mut local_cursor
+    };
+    let Some(mut cluster) = cursor.locate(first_cluster, size, offset / cluster_bytes, |cluster| {
+        fat_next(fs, cluster)
+    }) else {
+        return 0;
+    };
     let mut within_cluster = offset % cluster_bytes;
     let mut written = 0usize;
     while cluster >= 2 && cluster < 0x0FFF_FFF8 && written < wanted {
@@ -981,7 +999,7 @@ unsafe fn open_sys32_path(fs: &Fat32, leaf: &[u8], use_system32_cache: bool) -> 
     }
     let mut path = [0u8; 160];
     let mut n = 0usize;
-    for &c in b"reactos\\system32\\" {
+    for &c in crate::installed_layout::SYSTEM32_PREFIX {
         path[n] = c;
         n += 1;
     }
@@ -1035,7 +1053,7 @@ pub(crate) unsafe fn query_nt_path_metadata_into(
     folded: &mut [u8],
     relative: &mut [u8],
 ) -> Option<nt_fs::FileMetadata> {
-    let len = nt_fs::nt_path_to_volume_relative_into(name, b"reactos", folded, relative)?;
+    let len = nt_fs::nt_path_to_volume_relative_into(name, crate::installed_layout::ROOT, folded, relative)?;
     let fs = exec_fs()?;
     fat_open_path_metadata(&fs, &relative[..len]).map(|entry| entry.metadata)
 }

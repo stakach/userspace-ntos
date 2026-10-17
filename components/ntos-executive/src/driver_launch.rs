@@ -25,6 +25,11 @@
 mod hosted_irq_broker;
 #[path = "hosted_source_retirement.rs"]
 mod hosted_source_retirement;
+#[path = "hosted_dxg_registration.rs"]
+mod hosted_dxg_registration;
+#[path = "hosted_provider_export_lane.rs"]
+pub(crate) mod hosted_provider_export_lane;
+pub(super) use hosted_dxg_registration::bridge_dxg_registration_entry;
 
 #[path = "hosted_wmi.rs"]
 mod hosted_wmi;
@@ -78,6 +83,9 @@ mod hosted_zw_load_driver;
 #[path = "hosted_zw_enumerate_value_key.rs"]
 mod hosted_zw_enumerate_value_key;
 use hosted_zw_enumerate_value_key::HOSTED_REGISTRY_OP_ENUMERATE_VALUE;
+#[path = "hosted_zw_query_key.rs"]
+mod hosted_zw_query_key;
+use hosted_zw_query_key::HOSTED_REGISTRY_OP_QUERY_KEY;
 #[path = "hosted_device_object_pointer.rs"]
 mod hosted_device_object_pointer;
 #[path = "hosted_driver_reinitialization.rs"]
@@ -90,6 +98,14 @@ pub(crate) unsafe fn service_hosted_driver_zw_load_driver(
     reply_cap: u64,
 ) -> i32 {
     hosted_zw_load_driver::service(channel, service_name, badge, reply_cap)
+}
+pub(crate) unsafe fn service_hosted_driver_zw_unload_driver(
+    channel: &crate::spawn_hosts::PumpChannel,
+    service_name: u64,
+    badge: u64,
+    reply_cap: u64,
+) -> i32 {
+    hosted_zw_load_driver::service_unload(channel, service_name, badge, reply_cap)
 }
 #[path = "hosted_image_paging.rs"]
 mod hosted_image_paging;
@@ -123,6 +139,10 @@ pub(crate) mod device_property;
 
 #[path = "win32k_device_properties.rs"]
 pub(crate) mod win32k_device_properties;
+#[path = "win32k_device_interfaces.rs"]
+pub(crate) mod win32k_device_interfaces;
+#[path = "win32k_address_validity.rs"]
+pub(crate) mod win32k_address_validity;
 #[path = "win32k_device_consumer.rs"]
 pub(crate) mod win32k_device_consumer;
 #[path = "win32k_file_owners.rs"]
@@ -178,6 +198,8 @@ mod hosted_query_path_capture;
 mod hosted_write_capture;
 #[path = "hosted_read_capture.rs"]
 mod hosted_read_capture;
+#[path = "hosted_internal_control_capture.rs"]
+mod hosted_internal_control_capture;
 #[path = "hosted_flush_capture.rs"]
 mod hosted_flush_capture;
 #[path = "hosted_query_information_capture.rs"]
@@ -188,6 +210,8 @@ mod hosted_query_path_work;
 mod hosted_write_work;
 #[path = "hosted_read_work.rs"]
 mod hosted_read_work;
+#[path = "hosted_internal_control_work.rs"]
+mod hosted_internal_control_work;
 #[path = "hosted_source_completion_lane.rs"]
 pub(crate) mod hosted_source_completion_lane;
 #[path = "hosted_class_irp_lane.rs"]
@@ -220,6 +244,118 @@ pub(crate) mod hosted_consumer_file_objects;
 mod hosted_consumer_device_objects;
 #[path = "hosted_io_create_file_adapter.rs"]
 mod hosted_io_create_file_adapter;
+#[path = "hosted_driver_interrupt_ex.rs"]
+mod hosted_driver_interrupt_ex;
+#[path = "hosted_driver_uuid.rs"]
+mod hosted_driver_uuid;
+pub(crate) use hosted_driver_uuid::service_hosted_driver_uuid_create;
+#[path = "hosted_driver_device_enumeration.rs"]
+mod hosted_driver_device_enumeration;
+#[path = "hosted_driver_push_lock.rs"]
+mod hosted_driver_push_lock;
+#[path = "hosted_driver_gop.rs"]
+mod hosted_driver_gop;
+pub(crate) use hosted_driver_gop::service_hosted_driver_gop_query;
+pub(crate) use hosted_driver_gop::service_hosted_driver_gop_map;
+pub(crate) use hosted_driver_gop::service_hosted_driver_display_ownership_lost;
+#[path = "hosted_driver_device_interfaces.rs"]
+mod hosted_driver_device_interfaces;
+#[path = "hosted_driver_device_property_data.rs"]
+mod hosted_driver_device_property_data;
+#[path = "hosted_driver_device_property_write.rs"]
+mod hosted_driver_device_property_write;
+pub(crate) use hosted_driver_device_property_write::service as service_hosted_driver_device_property_write;
+#[path = "hosted_driver_create_driver.rs"]
+mod hosted_driver_create_driver;
+pub(crate) use hosted_driver_create_driver::service as service_hosted_driver_create_driver;
+#[path = "hosted_driver_processor_mask.rs"]
+mod hosted_driver_processor_mask;
+#[path = "hosted_driver_thermal_request.rs"]
+mod hosted_driver_thermal_request;
+#[path = "hosted_driver_process_bitness.rs"]
+mod hosted_driver_process_bitness;
+#[path = "hosted_driver_rtl_integer.rs"]
+mod hosted_driver_rtl_integer;
+#[path = "hosted_driver_queued_spin_lock.rs"]
+mod hosted_driver_queued_spin_lock;
+#[path = "hosted_driver_crt_memchr.rs"]
+mod hosted_driver_crt_memchr;
+#[path = "hosted_driver_crt_strchr.rs"]
+mod hosted_driver_crt_strchr;
+#[path = "hosted_driver_thread_priority.rs"]
+pub(crate) mod hosted_driver_thread_priority;
+#[path = "hosted_driver_worker_priority.rs"]
+mod hosted_driver_worker_priority;
+#[path = "hosted_driver_hal_idt_irql.rs"]
+mod hosted_driver_hal_idt_irql;
+#[path = "hosted_driver_process_attach.rs"]
+pub(crate) mod hosted_driver_process_attach;
+#[path = "hosted_driver_spin_lock.rs"]
+mod hosted_driver_spin_lock;
+#[path = "hosted_driver_hal_target_info.rs"]
+mod hosted_driver_hal_target_info;
+#[path = "hosted_driver_hal_cache.rs"]
+mod hosted_driver_hal_cache;
+#[path = "hosted_driver_physical_mdl.rs"]
+mod hosted_driver_physical_mdl;
+#[path = "hosted_driver_process_identity.rs"]
+pub(crate) mod hosted_driver_process_identity;
+#[path = "hosted_driver_directory_object.rs"]
+pub(crate) mod hosted_driver_directory_object;
+#[path = "hosted_driver_create_event.rs"]
+pub(crate) mod hosted_driver_create_event;
+#[path = "hosted_driver_event_reference.rs"]
+pub(crate) mod hosted_driver_event_reference;
+#[path = "hosted_driver_process_notify.rs"]
+pub(crate) mod hosted_driver_process_notify;
+#[path = "hosted_driver_dynamic_type.rs"]
+pub(crate) mod hosted_driver_dynamic_type;
+#[path = "hosted_driver_dynamic_object.rs"]
+pub(crate) mod hosted_driver_dynamic_object;
+#[path = "hosted_driver_dynamic_delete.rs"]
+pub(crate) mod hosted_driver_dynamic_delete;
+#[path = "hosted_driver_process_state.rs"]
+mod hosted_driver_process_state;
+#[path = "hosted_driver_ps_handle_reference.rs"]
+pub(crate) mod hosted_driver_ps_handle_reference;
+#[path = "hosted_driver_create_mdl.rs"]
+mod hosted_driver_create_mdl;
+#[path = "hosted_driver_pci_root.rs"]
+pub(crate) mod hosted_driver_pci_root;
+pub(crate) const FSD_SERVICE_PCI_ROOT_LABEL: u64 = hosted_driver_pci_root::LABEL;
+#[path = "hosted_driver_pci_route_query.rs"]
+pub(crate) mod hosted_driver_pci_route_query;
+pub(crate) const FSD_SERVICE_PCI_ROUTE_QUERY_LABEL: u64 = hosted_driver_pci_route_query::LABEL;
+#[path = "hosted_driver_contiguous_memory.rs"]
+mod hosted_driver_contiguous_memory;
+#[path = "hosted_contiguous_ram_broker.rs"]
+mod hosted_contiguous_ram_broker;
+#[path = "hosted_driver_physical_ranges.rs"]
+mod hosted_driver_physical_ranges;
+#[path = "hosted_driver_cr8_fault.rs"]
+pub(crate) mod hosted_driver_cr8_fault;
+#[path = "hosted_driver_crt_wide_sort.rs"]
+mod hosted_driver_crt_wide_sort;
+#[path = "hosted_driver_cache_invalidation.rs"]
+mod hosted_driver_cache_invalidation;
+#[path = "hosted_driver_pnp_notification.rs"]
+mod hosted_driver_pnp_notification;
+#[path = "hosted_driver_pofx.rs"]
+mod hosted_driver_pofx;
+#[path = "hosted_driver_power_setting.rs"]
+mod hosted_driver_power_setting;
+#[path = "hosted_driver_luid.rs"]
+mod hosted_driver_luid;
+#[path = "hosted_driver_kmutex.rs"]
+mod hosted_driver_kmutex;
+#[path = "hosted_driver_device_state.rs"]
+mod hosted_driver_device_state;
+pub(crate) use hosted_driver_pnp_notification::service as service_hosted_driver_pnp_notification;
+pub(crate) use hosted_driver_pofx::service as service_hosted_driver_pofx;
+pub(crate) use hosted_driver_power_setting::service as service_hosted_driver_power_setting;
+pub(crate) use hosted_driver_luid::service as service_hosted_driver_luid;
+pub(crate) use hosted_driver_kmutex::service as service_hosted_driver_kmutex;
+pub(crate) use hosted_driver_pnp_notification::wake_due as hosted_driver_pnp_notification_wake_due;
 #[path = "hosted_io_create_file_ingress.rs"]
 mod hosted_io_create_file_ingress;
 #[path = "hosted_io_create_file_work.rs"]
@@ -242,6 +378,8 @@ mod hosted_kernel_win32k_source_ioctl;
 mod hosted_source_terminal_packet;
 #[path = "hosted_video_caller_aperture.rs"]
 mod hosted_video_caller_aperture;
+#[path = "hosted_video_pool_map.rs"]
+mod hosted_video_pool_map;
 #[path = "hosted_video_memory_mapping.rs"]
 mod hosted_video_memory_mapping;
 #[path = "hosted_kernel_win32k_source_pnp.rs"]
@@ -334,7 +472,7 @@ use nt_dma_manager::{DmaError, DmaManager as HostedDmaManager, DmaOwner};
 use nt_hosted_runtime::{
     classify_hosted_provider_domain, encode_hosted_provider_callback_thunk,
     encode_hosted_provider_import_thunk, hosted_provider_export_marshal_policy,
-    hosted_provider_has_export_marshal_policies, hosted_provider_internal_marshal_policy,
+    hosted_provider_internal_marshal_policy,
     ndis_miniport_characteristics_layout, ndis_protocol_characteristics_layout,
     plan_hosted_driver_image, plan_hosted_provider_import_binding,
     plan_hosted_provider_import_thunk, HostedDriverImagePlanError, HostedIrqGrantIdentity,
@@ -418,7 +556,8 @@ use nt_video_miniport::{
 
 // Pure, driver-agnostic ntoskrnl byte/string primitives shared with the Subsystem (win32k) class.
 use crate::ntoskrnl_shared::{
-    s_ex_query_depth_slist, s_exp_interlocked_pop_entry_slist, s_exp_interlocked_push_entry_slist,
+    s_ex_query_depth_slist, s_exp_interlocked_flush_slist, s_exp_interlocked_pop_entry_slist, s_exp_interlocked_push_entry_slist,
+    s_initialize_slist_head,
     s_memcpy, s_memmove, s_memset, s_rtl_compare_memory, s_rtl_integer_to_unicode_string,
     s_rtl_unicode_string_to_integer, s_rtl_upcase_unicode_char, s_stricmp, s_wcschr, s_wcsicmp,
     s_wcslen, s_wcsnicmp,
@@ -509,6 +648,7 @@ const _: () = assert!(
 const FSD_DATA_MM_SYSTEM_RANGE_START_OFF: u64 = 0x200;
 const FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_OFF: u64 = 0x208;
 const FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_OFF: u64 = 0x210;
+const FSD_DATA_KD_DEBUGGER_NOT_PRESENT_OFF: u64 = 0x218;
 const FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_OFF: u64 = 0x300;
 const FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_OFF: u64 = 0x340;
 const FSD_DATA_SE_EXPORTS_CELL_OFF: u64 = 0x400;
@@ -520,6 +660,17 @@ const FSD_DATA_LOADER_BLOCK_OFF: u64 = 0x810;
 const FSD_DATA_LOADER_CONFIG_ROOT_OFF: u64 = 0x910;
 const FSD_DATA_LOADER_ACPI_NODE_OFF: u64 = 0x958;
 const FSD_DATA_LOADER_ACPI_IDENTIFIER_OFF: u64 = 0x9A0;
+// The released LiberNT acpi.sys reads KeLoaderBlock->ConfigurationRoot at +0xb0 (PE RVA 0xb560).
+const FSD_LOADER_CONFIGURATION_ROOT_OFF: u64 = 0xB0;
+// Pinned ACPI's sole HAL_PRIVATE_DISPATCH IAT use checks HalUnmaskInterrupt at +0x1f8.
+// Keep the whole version-32 table resident in the provider data frame. A null optional slot
+// advertises that this HAL operation is unavailable; ACPI itself returns STATUS_NOT_SUPPORTED.
+const FSD_DATA_HAL_PRIVATE_DISPATCH_OFF: u64 = 0xC00;
+const FSD_DATA_HAL_PRIVATE_DISPATCH_BYTES: u64 = 0x400;
+const FSD_DATA_HAL_PRIVATE_DISPATCH_VERSION: u32 = 32;
+const FSD_DATA_HAL_PRIVATE_DISPATCH_VA: u64 =
+    FSD_DATA_VADDR + FSD_DATA_HAL_PRIVATE_DISPATCH_OFF;
+const _: () = assert!(FSD_DATA_HAL_PRIVATE_DISPATCH_OFF + FSD_DATA_HAL_PRIVATE_DISPATCH_BYTES <= 0x1000);
 const FSD_DATA_LOADER_ACPI_CONFIG_OFF: u64 = 0x2000;
 const FSD_DATA_LOADER_CONFIG_CAPACITY: usize =
     nt_compat_exports::configuration::LOADER_ACPI_CONFIGURATION_FIXED_BYTES
@@ -536,6 +687,8 @@ const FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_OFF;
 const FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_OFF;
+const FSD_DATA_KD_DEBUGGER_NOT_PRESENT_VA: u64 =
+    FSD_DATA_VADDR + FSD_DATA_KD_DEBUGGER_NOT_PRESENT_OFF;
 const FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_OFF;
 const FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_VA: u64 =
@@ -902,6 +1055,7 @@ const HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT: u8 = 1;
 const HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL: u8 = 2;
 const HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT_TIMER: u8 = 3;
 const HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM: u8 = 4;
+const HOSTED_PROVIDER_CALLBACK_KIND_DXG: u8 = 5;
 const NDIS_MINIPORT_TIMER_DPC_OFFSET_X64: u64 = 0x40;
 const NDIS_MINIPORT_TIMER_FUNCTION_CALLBACK_OFFSET_X64: u64 = 0x80;
 const NDIS_WORK_ITEM_CONTEXT_OFFSET_X64: u64 = 0x00;
@@ -1025,6 +1179,32 @@ pub const FSD_SERVICE_LOWER_PNP_FORWARD_LABEL: u64 = 0x7A6;
 pub const FSD_SERVICE_CONNECT_FORWARD_LABEL: u64 = 0x7A7;
 pub const FSD_SERVICE_HOOK_FORWARD_LABEL: u64 = 0x7A8;
 pub const FSD_SERVICE_LOWER_FILE_FORWARD_LABEL: u64 = 0x7A9;
+pub const FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL: u64 = 0x7AA;
+pub const FSD_SERVICE_REMOVE_DPC_LABEL: u64 = 0x7BA;
+pub const FSD_SERVICE_ZW_UNLOAD_DRIVER_LABEL: u64 = 0x7BB;
+pub const FSD_SERVICE_UUID_CREATE_LABEL: u64 = 0x7BC;
+pub const FSD_SERVICE_GOP_QUERY_LABEL: u64 = 0x7BD;
+pub const FSD_SERVICE_DISPLAY_OWNERSHIP_LABEL: u64 = 0x7BE;
+pub const FSD_SERVICE_PNP_NOTIFICATION_LABEL: u64 = 0x7BF;
+pub const FSD_SERVICE_PROPERTY_WRITE_LABEL: u64 = 0x7C0;
+pub const FSD_SERVICE_CREATE_DRIVER_LABEL: u64 = 0x7C1;
+pub const FSD_SERVICE_KE_SET_PRIORITY_THREAD_LABEL: u64 = 0x7C2;
+pub const FSD_SERVICE_KE_STACK_ATTACH_LABEL: u64 = 0x7C3;
+pub const FSD_SERVICE_PS_IDENTITY_LABEL: u64 = hosted_driver_process_identity::LABEL;
+pub const FSD_SERVICE_DIRECTORY_OBJECT_LABEL: u64 = hosted_driver_directory_object::LABEL;
+pub const FSD_SERVICE_CREATE_EVENT_LABEL: u64 = hosted_driver_create_event::LABEL;
+pub const FSD_SERVICE_EVENT_REFERENCE_LABEL: u64 = hosted_driver_event_reference::LABEL;
+pub const FSD_SERVICE_PROCESS_NOTIFY_LABEL: u64 = hosted_driver_process_notify::LABEL;
+pub const FSD_SERVICE_DYNAMIC_TYPE_LABEL: u64 = hosted_driver_dynamic_type::LABEL;
+pub const FSD_SERVICE_DYNAMIC_OBJECT_LABEL: u64 = hosted_driver_dynamic_object::LABEL;
+pub const FSD_SERVICE_DYNAMIC_OBJECT_INSERT_LABEL: u64 = hosted_driver_dynamic_object::INSERT_LABEL;
+pub const FSD_SERVICE_DYNAMIC_OBJECT_REFERENCE_LABEL: u64 = hosted_driver_dynamic_object::REFERENCE_LABEL;
+pub const FSD_SERVICE_DYNAMIC_OBJECT_DEREFERENCE_LABEL: u64 = hosted_driver_dynamic_delete::DEREFERENCE_LABEL;
+pub const FSD_SERVICE_PS_HANDLE_REFERENCE_LABEL: u64 = hosted_driver_ps_handle_reference::LABEL;
+pub const FSD_SERVICE_POFX_LABEL: u64 = hosted_driver_pofx::LABEL;
+pub const FSD_SERVICE_POWER_SETTING_LABEL: u64 = hosted_driver_power_setting::LABEL;
+pub const FSD_SERVICE_LUID_LABEL: u64 = hosted_driver_luid::LABEL;
+pub const FSD_SERVICE_KMUTEX_LABEL: u64 = hosted_driver_kmutex::LABEL;
 const _: () = {
     let labels = [
         FSD_SERVICE_SOURCE_IRP_LABEL,
@@ -1044,6 +1224,34 @@ const _: () = {
         FSD_SERVICE_CONNECT_FORWARD_LABEL,
         FSD_SERVICE_HOOK_FORWARD_LABEL,
         FSD_SERVICE_LOWER_FILE_FORWARD_LABEL,
+        FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL,
+        FSD_SERVICE_REMOVE_DPC_LABEL,
+        FSD_SERVICE_ZW_UNLOAD_DRIVER_LABEL,
+        FSD_SERVICE_UUID_CREATE_LABEL,
+        FSD_SERVICE_GOP_QUERY_LABEL,
+        FSD_SERVICE_DISPLAY_OWNERSHIP_LABEL,
+        FSD_SERVICE_PNP_NOTIFICATION_LABEL,
+        FSD_SERVICE_PROPERTY_WRITE_LABEL,
+        FSD_SERVICE_CREATE_DRIVER_LABEL,
+        FSD_SERVICE_KE_SET_PRIORITY_THREAD_LABEL,
+        FSD_SERVICE_KE_STACK_ATTACH_LABEL,
+        FSD_SERVICE_PS_IDENTITY_LABEL,
+        FSD_SERVICE_DIRECTORY_OBJECT_LABEL,
+        FSD_SERVICE_CREATE_EVENT_LABEL,
+        FSD_SERVICE_EVENT_REFERENCE_LABEL,
+        FSD_SERVICE_PROCESS_NOTIFY_LABEL,
+        FSD_SERVICE_DYNAMIC_TYPE_LABEL,
+        FSD_SERVICE_DYNAMIC_OBJECT_LABEL,
+        FSD_SERVICE_DYNAMIC_OBJECT_INSERT_LABEL,
+        FSD_SERVICE_DYNAMIC_OBJECT_REFERENCE_LABEL,
+        FSD_SERVICE_DYNAMIC_OBJECT_DEREFERENCE_LABEL,
+        FSD_SERVICE_PS_HANDLE_REFERENCE_LABEL,
+        FSD_SERVICE_POFX_LABEL,
+        FSD_SERVICE_POWER_SETTING_LABEL,
+        FSD_SERVICE_LUID_LABEL,
+        FSD_SERVICE_KMUTEX_LABEL,
+        FSD_SERVICE_PCI_ROOT_LABEL,
+        FSD_SERVICE_PCI_ROUTE_QUERY_LABEL,
     ];
     let mut i = 0;
     while i < labels.len() {
@@ -1071,6 +1279,7 @@ pub const FSD_DISPATCH_VIDEO_RELATION_ACK: u64 = u64::MAX - 0x77E;
 pub const FSD_DISPATCH_CREATE_PDO_PROJECTION: u64 = u64::MAX - 0x77F;
 pub const FSD_DISPATCH_DRAIN_FILE_RETIREMENTS: u64 = u64::MAX - 0x781;
 pub const FSD_DISPATCH_DRIVER_REINIT: u64 = u64::MAX - 0x782;
+pub const FSD_DISPATCH_PNP_NOTIFICATION: u64 = u64::MAX - 0x786;
 pub const FSD_DISPATCH_CLASS_LOWER_ALIAS: u64 = u64::MAX - 0x783;
 pub const FSD_DISPATCH_REVERSE_CLASS_ALIAS: u64 = u64::MAX - 0x784;
 
@@ -1124,6 +1333,7 @@ const IRP_MJ_INTERNAL_DEVICE_CONTROL: u64 = major::IRP_MJ_INTERNAL_DEVICE_CONTRO
 const IRP_MJ_PNP: u64 = major::IRP_MJ_PNP as u64;
 const IRP_MN_START_DEVICE: u64 = 0x00;
 const IRP_MN_QUERY_DEVICE_RELATIONS: u64 = nt_pnp_abi::IRP_MN_QUERY_DEVICE_RELATIONS as u64;
+const IRP_MN_QUERY_PNP_DEVICE_STATE: u64 = nt_pnp_abi::IRP_MN_QUERY_PNP_DEVICE_STATE as u64;
 const IRP_MN_QUERY_ID: u64 = nt_pnp_abi::IRP_MN_QUERY_ID as u64;
 const IRP_MN_QUERY_RESOURCES: u64 = nt_pnp_abi::IRP_MN_QUERY_RESOURCES as u64;
 const IRP_MN_QUERY_RESOURCE_REQUIREMENTS: u64 =
@@ -1660,7 +1870,8 @@ unsafe fn pool_pull_request_bytes(
     dst: u64,
     len: u64,
 ) -> bool {
-    let arg = hosted_class_irp_lane::current_component_arg().unwrap_or(FSD_ARG_VADDR);
+    let arg = hosted_provider_export_lane::current_component_arg()
+        .or_else(hosted_class_irp_lane::current_component_arg).unwrap_or(FSD_ARG_VADDR);
     let mut offset = 0u64;
     while offset < len {
         let chunk = (len - offset).min(FSD_ARG_BYTES);
@@ -1687,7 +1898,8 @@ unsafe fn pool_push_request_bytes(
     destination_offset: u64,
     len: u64,
 ) -> bool {
-    let arg = hosted_class_irp_lane::current_component_arg().unwrap_or(FSD_ARG_VADDR);
+    let arg = hosted_provider_export_lane::current_component_arg()
+        .or_else(hosted_class_irp_lane::current_component_arg).unwrap_or(FSD_ARG_VADDR);
     let mut copied = 0u64;
     while copied < len {
         let chunk = (len - copied).min(FSD_ARG_BYTES);
@@ -2874,62 +3086,12 @@ pub(crate) unsafe fn pool_alloc(size: u64) -> u64 {
         print_u64(size);
         print_str(b"\n");
     }
-    // first-fit the free list
-    let head_slot = (FSD_POOL_VADDR + 8) as *mut u64;
-    let mut prev = head_slot;
-    let mut cur = read_volatile(head_slot);
-    let mut steps = 0u64;
-    while cur != 0 {
-        if steps >= POOL_FREE_LIST_MAX {
-            if FSD_POOL_LIST_CYCLES.fetch_add(1, Ordering::Relaxed) == 0 {
-                print_str(b"[fsd-host] POOL FREE-LIST CYCLE -> bump path\n");
-            }
-            break;
-        }
-        steps += 1;
-        let Some(cap) = component_pool_allocation_capacity(cur) else {
-            break;
-        };
-        if cap >= size {
-            let Some(generation) = next_component_pool_generation(FSD_POOL_VADDR) else {
-                return 0;
-            };
-            let next = read_volatile((cur - 8) as *const u64);
-            write_volatile(prev, next);
-            write_volatile((cur - 8) as *mut u64, generation);
-            return cur;
-        }
-        prev = (cur - 8) as *mut u64;
-        cur = read_volatile((cur - 8) as *const u64);
-    }
-    // bump
-    let mut off = hosted_pool_used(FSD_POOL_VADDR);
-    if off < POOL_DATA_OFF {
-        off = POOL_DATA_OFF;
-    }
-    if off > FSD_POOL_FRAMES * 0x1000 {
-        return 0;
-    }
-    // 16-byte header + 16-align the returned block
-    let Some(hdr) = FSD_POOL_VADDR.checked_add(off).and_then(|at| at.checked_add(15))
-        .map(|at| at & !15)
-    else {
-        return 0;
-    };
-    let Some(block) = hdr.checked_add(16) else { return 0; };
-    let cap = FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000;
-    if size == 0 || block.checked_add(size).is_none_or(|end| end > cap) {
+    let Some(block) = hosted_pool_alloc_locked(FSD_POOL_VADDR, size) else {
         print_str(b"[fsd-host] POOL EXHAUSTED size=0x");
         print_hex(size as u32);
         print_str(b"\n");
         return 0;
-    }
-    let Some(generation) = next_component_pool_generation(FSD_POOL_VADDR) else {
-        return 0;
     };
-    write_volatile((block - 16) as *mut u64, size); // capacity header
-    write_volatile((block - 8) as *mut u64, generation);
-    hosted_pool_publish_used(FSD_POOL_VADDR, (block + size) - FSD_POOL_VADDR);
     block
 }
 
@@ -4045,12 +4207,18 @@ unsafe fn hosted_instance_pool_alloc(inst: DriverInstance, size: u64) -> Option<
         return None;
     }
     let _guard = hosted_instance_pool_lock(inst.exec_pool_va)?;
-    let pool_bytes = FSD_POOL_FRAMES.checked_mul(0x1000)?;
-    let exec_pool_end = inst.exec_pool_va.checked_add(pool_bytes)?;
-    let component_pool_end = component_pool_end();
-    let head_slot_exec = inst.exec_pool_va.checked_add(8)?;
-    let mut prev_next_slot_exec = head_slot_exec;
-    let mut cur = read_volatile(head_slot_exec as *const u64);
+    hosted_pool_alloc_locked(inst.exec_pool_va, size)
+}
+
+/// Both address-space views use the same header chain and alignment rule. Large allocations
+/// reserve complete payload pages; the padding before their header remains a real free block.
+unsafe fn hosted_pool_alloc_locked(pool_view_base: u64, size: u64) -> Option<u64> {
+    if pool_view_base == 0 || size == 0 { return None; }
+    const PAGE_ALIGNED_MIN: u64 = 0x10000;
+    let large = size >= PAGE_ALIGNED_MIN;
+    let head_slot = pool_view_base.checked_add(8)?;
+    let mut prev_next_slot = head_slot;
+    let mut cur = read_volatile(head_slot as *const u64);
     let mut steps = 0u64;
     while cur != 0 {
         if steps >= POOL_FREE_LIST_MAX {
@@ -4058,43 +4226,39 @@ unsafe fn hosted_instance_pool_alloc(inst: DriverInstance, size: u64) -> Option<
             break;
         }
         steps += 1;
-        let Some((cur_exec, cap)) = hosted_pool_allocation_exec_range(inst.exec_pool_va, cur)
+        let Some((cur_view, cap)) = hosted_pool_allocation_exec_range(pool_view_base, cur)
         else {
             break;
         };
-        if cur_exec < inst.exec_pool_va + 16 || cur_exec >= exec_pool_end {
-            break;
-        }
-        let next = read_volatile((cur_exec - 8) as *const u64);
-        if cap >= size {
-            let generation = next_component_pool_generation(inst.exec_pool_va)?;
-            write_volatile(prev_next_slot_exec as *mut u64, next);
-            write_volatile((cur_exec - 8) as *mut u64, generation);
+        let next = read_volatile((cur_view - 8) as *const u64);
+        if cap >= size && (!large || (cur & 0xfff == 0 && cap & 0xfff == 0)) {
+            let generation = next_component_pool_generation(pool_view_base)?;
+            write_volatile(prev_next_slot as *mut u64, next);
+            write_volatile((cur_view - 8) as *mut u64, generation);
             return Some(cur);
         }
-        prev_next_slot_exec = cur_exec - 8;
+        prev_next_slot = cur_view - 8;
         cur = next;
     }
-
-    let mut off = hosted_pool_used(inst.exec_pool_va);
+    let mut off = hosted_pool_used(pool_view_base);
     if off < POOL_DATA_OFF {
         off = POOL_DATA_OFF;
     }
-    let hdr = FSD_POOL_VADDR.checked_add(off)?.checked_add(15)? & !15;
-    let block = hdr.checked_add(16)?;
-    let end = block.checked_add(size)?;
-    if end > component_pool_end {
-        return None;
+    let plan = nt_io_manager::hosted_pool_range::plan_hosted_pool_bump(
+        off, size, FSD_POOL_FRAMES * 0x1000, large,
+    )?;
+    let generation = next_component_pool_generation(pool_view_base)?;
+    if let Some(padding) = plan.padding {
+        let pad_view = pool_view_base.checked_add(padding.base)?;
+        write_volatile((pad_view - 16) as *mut u64, padding.capacity);
+        write_volatile((pad_view - 8) as *mut u64, read_volatile(head_slot as *const u64));
+        write_volatile(head_slot as *mut u64, FSD_POOL_VADDR + padding.base);
     }
-    let block_exec = inst.exec_pool_va.checked_add(block - FSD_POOL_VADDR)?;
-    if block_exec < inst.exec_pool_va + 16 || block_exec >= exec_pool_end {
-        return None;
-    }
-    let generation = next_component_pool_generation(inst.exec_pool_va)?;
-    write_volatile((block_exec - 16) as *mut u64, size);
-    write_volatile((block_exec - 8) as *mut u64, generation);
-    hosted_pool_publish_used(inst.exec_pool_va, end - FSD_POOL_VADDR);
-    Some(block)
+    let block_view = pool_view_base.checked_add(plan.payload)?;
+    write_volatile((block_view - 16) as *mut u64, plan.capacity);
+    write_volatile((block_view - 8) as *mut u64, generation);
+    hosted_pool_publish_used(pool_view_base, plan.used);
+    Some(FSD_POOL_VADDR + plan.payload)
 }
 
 unsafe fn hosted_instance_pool_free_unlocked(inst: DriverInstance, p: u64) -> bool {
@@ -4213,6 +4377,81 @@ unsafe fn hosted_instance_pool_allocation_exec_if_live(
         return None;
     }
     hosted_pool_allocation_exec_va(inst.exec_pool_va, component_va, bytes)
+}
+
+/// Successful VideoPort monitor enumeration transfers this exact FSD allocation to the caller.
+/// The pin excludes generic driver frees while the caller's win32k projection remains live.
+pub(crate) struct HostedVideoMonitorArray {
+    pin: hosted_device_allocations::TemporaryPoolPin,
+    identity: nt_io_manager::video_monitor_array_projection::MonitorArrayAllocation,
+    bytes: Vec<u8>,
+}
+
+impl HostedVideoMonitorArray {
+    pub(crate) fn identity(&self) -> nt_io_manager::video_monitor_array_projection::MonitorArrayAllocation {
+        self.identity
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] { &self.bytes }
+
+    pub(crate) unsafe fn retire_transferred(
+        &mut self,
+        ownership: &nt_io_manager::video_monitor_array_projection::MonitorArrayProjection,
+    ) -> bool {
+        hosted_device_allocations::retire_transferred_monitor_array(&mut self.pin, ownership)
+            .is_ok()
+    }
+
+    pub(crate) unsafe fn retire_unpublished_after_sealed_stop(&mut self) -> bool {
+        hosted_device_allocations::retire_unpublished_transferred_monitor_array(
+            &mut self.pin, self.identity,
+        ).is_ok()
+    }
+
+    pub(crate) fn quarantine(&self) {
+        let _ = hosted_device_allocations::retain_temporary_pool_pin_uncertain(&self.pin);
+    }
+}
+
+pub(crate) unsafe fn capture_hosted_video_monitor_array(
+    device_id: u64,
+    completion_driver_id: u64,
+    pointer: u64,
+) -> Result<HostedVideoMonitorArray, u32> {
+    use nt_io_manager::video_monitor_array_projection::MonitorArrayAllocation;
+    if pointer == 0 { return Err(STATUS_INVALID_PARAMETER as u32); }
+    let (_, inst, _) = hosted_dispatch_instance_for_device_id(device_id)?;
+    if !inst.ready || inst.driver_id != completion_driver_id {
+        return Err(STATUS_INVALID_DEVICE_REQUEST as u32);
+    }
+    let domain = instance_domain_identity(inst).ok_or(STATUS_INVALID_DEVICE_REQUEST as u32)?;
+    let pin = hosted_device_allocations::pin_temporary_pool_range(inst, pointer, 1)
+        .map_err(|status| status.raw() as u32)?;
+    let allocation = pin.allocation();
+    let identity = match MonitorArrayAllocation::new(domain, allocation) {
+        Ok(identity) => identity,
+        Err(_) => {
+            let _ = hosted_device_allocations::retain_temporary_pool_pin_uncertain(&pin);
+            return Err(STATUS_INVALID_PARAMETER as u32);
+        }
+    };
+    if allocation.component_address != pointer || allocation.capacity < 24
+        || allocation.capacity > 0x10_0000
+    {
+        let _ = hosted_device_allocations::retain_temporary_pool_pin_uncertain(&pin);
+        return Err(STATUS_INVALID_PARAMETER as u32);
+    }
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(allocation.capacity as usize).is_err() {
+        let _ = hosted_device_allocations::retain_temporary_pool_pin_uncertain(&pin);
+        return Err(STATUS_INSUFFICIENT_RESOURCES as u32);
+    }
+    bytes.resize(allocation.capacity as usize, 0);
+    if let Err(status) = hosted_device_allocations::copy_temporary_pool_pin(&pin, 0, &mut bytes) {
+        let _ = hosted_device_allocations::retain_temporary_pool_pin_uncertain(&pin);
+        return Err(status.raw() as u32);
+    }
+    Ok(HostedVideoMonitorArray { pin, identity, bytes })
 }
 
 unsafe fn print_active_irp_graph_for_deadman(inst: &DriverInstance) {
@@ -4794,7 +5033,8 @@ extern "win64" fn s_ke_bug_check_ex(code: u64, p1: u64, p2: u64, p3: u64, p4: u6
             print_u64(p1 & 0xFFFF);
             print_str(b")");
         }
-        let jb = hosted_class_irp_lane::current_jump_buffer()
+        let jb = hosted_provider_export_lane::current_jump_buffer()
+            .or_else(hosted_class_irp_lane::current_jump_buffer)
             .unwrap_or(core::ptr::addr_of_mut!(BUGCHECK_JB) as *mut u64);
         if read_volatile(jb.add(1)) != 0 {
             print_str(b" -> dispatch UNWOUND\n");
@@ -4816,10 +5056,6 @@ extern "win64" fn s_zero() -> u64 {
 }
 
 extern "win64" fn s_void() {}
-
-extern "win64" fn s_ke_release_mutex(_mutex: u64, _wait: u8) -> i32 {
-    1
-}
 
 unsafe fn hosted_irq_timer_service(
     kind: nt_hosted_runtime::HostedIrqServiceKind,
@@ -4923,7 +5159,7 @@ extern "win64" fn s_ke_set_timer_ex(timer: u64, due_time: u64, period: i32, dpc:
 }
 
 #[inline]
-fn read_ordered_tsc() -> u64 {
+pub(crate) fn read_ordered_tsc() -> u64 {
     let low: u32;
     let high: u32;
     unsafe {
@@ -5078,9 +5314,10 @@ unsafe fn initialize_hosted_loader_block(exec_data_va: u64) {
     core::ptr::write_bytes(acpi as *mut u8, 0, 0x48);
     core::ptr::write_bytes(config as *mut u8, 0, FSD_DATA_LOADER_CONFIG_CAPACITY);
 
-    // NT 5.2 LOADER_PARAMETER_BLOCK: initialize the three list heads and publish the real ARC
-    // configuration root at offset 0x60.
-    for list_off in [0u64, 0x10, 0x20] {
+    // Pinned LiberNT Win10 loader block: version header, six list heads, and ARC root at +0xb0.
+    write_unaligned(block as *mut u32, 10);
+    write_unaligned((block + 0x08) as *mut u32, 0x100);
+    for list_off in [0x10u64, 0x20, 0x30, 0x40, 0x50, 0x60] {
         write_unaligned(
             (block + list_off) as *mut u64,
             FSD_DATA_LOADER_BLOCK_VA + list_off,
@@ -5090,7 +5327,10 @@ unsafe fn initialize_hosted_loader_block(exec_data_va: u64) {
             FSD_DATA_LOADER_BLOCK_VA + list_off,
         );
     }
-    write_unaligned((block + 0x60) as *mut u64, FSD_DATA_LOADER_CONFIG_ROOT_VA);
+    write_unaligned(
+        (block + FSD_LOADER_CONFIGURATION_ROOT_OFF) as *mut u64,
+        FSD_DATA_LOADER_CONFIG_ROOT_VA,
+    );
 
     // CONFIGURATION_COMPONENT_DATA root: SystemClass / MaximumType, with the firmware ACPI node as
     // its child. CONFIGURATION_COMPONENT_DATA is 0x48 bytes on NT amd64.
@@ -5101,8 +5341,14 @@ unsafe fn initialize_hosted_loader_block(exec_data_va: u64) {
 
     // Firmware child: AdapterClass / MultiFunctionAdapter, matching the FreeLdr ACPI BIOS node.
     write_unaligned((acpi + 0x00) as *mut u64, FSD_DATA_LOADER_CONFIG_ROOT_VA);
-    write_unaligned((acpi + 0x18) as *mut u32, 3); // AdapterClass
-    write_unaligned((acpi + 0x1C) as *mut u32, 12); // MultiFunctionAdapter
+    write_unaligned(
+        (acpi + 0x18) as *mut u32,
+        nt_compat_exports::configuration::ARC_ADAPTER_CLASS,
+    );
+    write_unaligned(
+        (acpi + 0x1C) as *mut u32,
+        nt_compat_exports::configuration::ARC_MULTIFUNCTION_ADAPTER,
+    );
     write_unaligned((acpi + 0x2C) as *mut u32, u32::MAX); // AffinityMask
     write_unaligned((acpi + 0x34) as *mut u32, 10);
     write_unaligned(
@@ -5129,6 +5375,13 @@ unsafe fn initialize_hosted_loader_block(exec_data_va: u64) {
 }
 
 unsafe fn initialize_hosted_driver_data_exports(exec_data_va: u64) {
+    let hal_private = exec_data_va + FSD_DATA_HAL_PRIVATE_DISPATCH_OFF;
+    core::ptr::write_bytes(
+        hal_private as *mut u8,
+        0,
+        FSD_DATA_HAL_PRIVATE_DISPATCH_BYTES as usize,
+    );
+    write_unaligned(hal_private as *mut u32, FSD_DATA_HAL_PRIVATE_DISPATCH_VERSION);
     core::ptr::write(
         (exec_data_va + FSD_DATA_HELD_PNP_COMPLETIONS_OFF) as *mut HostedHeldPnpCompletions,
         HostedHeldPnpCompletions::new(),
@@ -5154,6 +5407,12 @@ unsafe fn initialize_hosted_driver_data_exports(exec_data_va: u64) {
     );
     write_volatile(ex_event_object_type_body as *mut u64, 0x4556_454e_5459_5045); // "EVENTYPE"
 
+    let kd_debugger_not_present = exec_data_va + FSD_DATA_KD_DEBUGGER_NOT_PRESENT_OFF;
+    write_volatile(
+        kd_debugger_not_present as *mut u8,
+        u8::from(!hosted_kd_debug::kernel_debugger_connected()),
+    );
+
     let se_exports_cell = exec_data_va + FSD_DATA_SE_EXPORTS_CELL_OFF;
     let se_exports_struct = exec_data_va + FSD_DATA_SE_EXPORTS_STRUCT_OFF;
     let se_sid_pool = exec_data_va + FSD_DATA_SE_SID_POOL_OFF;
@@ -5178,9 +5437,14 @@ unsafe fn initialize_hosted_driver_data_exports(exec_data_va: u64) {
 
 fn fsd_data_export_addr(name: &str) -> Option<u64> {
     Some(match name {
+        "HalPrivateDispatchTable" => FSD_DATA_HAL_PRIVATE_DISPATCH_VA,
         "MmSystemRangeStart" => FSD_DATA_MM_SYSTEM_RANGE_START_VA,
+        "KdDebuggerNotPresent" => FSD_DATA_KD_DEBUGGER_NOT_PRESENT_VA,
         "IoFileObjectType" => FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_VA,
         "ExEventObjectType" => FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_VA,
+        "PsInitialSystemProcess" => hosted_driver_process_state::INITIAL_SYSTEM_PROCESS_CELL_VA,
+        "PsProcessType" => hosted_driver_process_state::PROCESS_TYPE_CELL_VA,
+        "PsThreadType" => hosted_driver_process_state::THREAD_TYPE_CELL_VA,
         "SeExports" => FSD_DATA_SE_EXPORTS_CELL_VA,
         "KeLoaderBlock" => FSD_DATA_KE_LOADER_BLOCK_CELL_VA,
         _ => return None,
@@ -5591,6 +5855,18 @@ extern "win64" fn s_swprintf_body(dst: u64, fmt: u64, a0: u64, a1: u64, caller_r
     unsafe { format_wide_driver(dst, usize::MAX, fmt, &mut args) }
 }
 
+#[no_mangle]
+extern "win64" fn s_snwprintf_body(
+    dst: u64,
+    count: usize,
+    fmt: u64,
+    a0: u64,
+    caller_rsp: u64,
+) -> i32 {
+    let mut args = Win64PrintfArguments::new([a0, 0, 0], 1, caller_rsp);
+    unsafe { format_wide_driver(dst, count, fmt, &mut args) }
+}
+
 core::arch::global_asm!(
     ".text",
     ".globl hosted_sprintf_gate",
@@ -5617,12 +5893,21 @@ core::arch::global_asm!(
     "call s_swprintf_body",
     "add rsp, 0x38",
     "ret",
+    ".globl hosted_snwprintf_gate",
+    "hosted_snwprintf_gate:",
+    "mov r11, rsp",
+    "sub rsp, 0x38",
+    "mov [rsp + 0x20], r11",
+    "call s_snwprintf_body",
+    "add rsp, 0x38",
+    "ret",
 );
 
 extern "win64" {
     fn hosted_sprintf_gate();
     fn hosted_snprintf_gate();
     fn hosted_swprintf_gate();
+    fn hosted_snwprintf_gate();
 }
 
 extern "win64" fn s_vsnwprintf(dst: u64, count: usize, fmt: u64, va_list: u64) -> i32 {
@@ -5695,6 +5980,17 @@ const HOSTED_DEVICE_OP_START_PACKET_CALLBACK_RETURNED: u64 = 24;
 const HOSTED_DEVICE_OP_START_NEXT_PACKET: u64 = 25;
 const HOSTED_DEVICE_OP_START_NEXT_PACKET_CALLBACK_RETURNED: u64 = 26;
 const HOSTED_DEVICE_OP_REGISTER_DRIVER_REINIT: u64 = 27;
+const HOSTED_DEVICE_OP_GET_INTERFACE_BEGIN: u64 = 28;
+const HOSTED_DEVICE_OP_GET_INTERFACE_PULL: u64 = 29;
+const HOSTED_DEVICE_OP_GET_INTERFACE_ABORT: u64 = 30;
+const HOSTED_DEVICE_OP_INVALIDATE_STATE: u64 = 31;
+const HOSTED_DEVICE_OP_CONTIGUOUS_PREPARE: u64 = 32;
+const HOSTED_DEVICE_OP_CONTIGUOUS_COMMIT: u64 = 33;
+const HOSTED_DEVICE_OP_CONTIGUOUS_FREE: u64 = 34;
+const HOSTED_DEVICE_OP_CONTIGUOUS_EXPIRE: u64 = 35;
+const HOSTED_DEVICE_OP_CONTIGUOUS_PHYSICAL: u64 = 36;
+const HOSTED_DEVICE_OP_CONTIGUOUS_MAP: u64 = 37;
+const HOSTED_DEVICE_OP_CONTIGUOUS_UNMAP: u64 = 38;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN: u64 = 0;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF: u64 = 2;
 const HOSTED_DEVICE_ARG_DATA_OFF: u64 = FSD_ARG_BYTES;
@@ -6883,6 +7179,9 @@ extern "win64" fn s_ex_free_pool_tag(p: u64, _tag: u64) {
 extern "win64" fn s_ex_free_pool(p: u64) {
     if p == 0 {
         return;
+    }
+    if unsafe { hosted_driver_contiguous_memory::owns_allocation(p) } {
+        unsafe { crate::provider_bugcheck::report(0xc4, [0x434f_4e54, p, 3, 0]); }
     }
     let status = unsafe { hosted_source_retirement::retire(3, p) };
     if status != STATUS_SUCCESS && status as u32 != STATUS_PENDING {
@@ -9073,6 +9372,62 @@ extern "win64" fn s_io_csq_remove_next_irp(csq: u64, peek_context: u64) -> u64 {
     }
 }
 
+/// Call the retained file-less internal-control owner after a missing local dispatch target.
+/// The executive validates that the Device is an exact foreign projection before entry.
+unsafe fn forward_hosted_internal_control(
+    device: u64,
+    irp: u64,
+    next: u64,
+    current_location_after_forward: u8,
+) -> i32 {
+    let (reply_label, status, accepted, _, _) = call_on4(
+        (FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL << 12) | 4,
+        1,
+        device,
+        irp,
+        0,
+    );
+    if reply_label != 0 || accepted > 1 {
+        crate::provider_bugcheck::report(
+            0xc4,
+            [FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL, 1, irp, reply_label],
+        );
+    }
+    if accepted == 0 {
+        return status as u32 as i32;
+    }
+    write_unaligned(
+        (irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
+        current_location_after_forward,
+    );
+    write_unaligned((irp + 0xb8) as *mut u64, next);
+    write_unaligned(
+        (next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64,
+        device,
+    );
+    let completion = complete_hosted_irp_with_owner(irp);
+    if completion.outcome == HostedIrpUnwindOutcome::MoreProcessingRequired {
+        crate::provider_bugcheck::report(
+            0xc4,
+            [FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL, 3, irp, status],
+        );
+    }
+    let (ack_label, ack_status, _, _, _) = call_on4(
+        (FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL << 12) | 4,
+        2,
+        irp,
+        0,
+        0,
+    );
+    if ack_label != 0 || ack_status as u32 as i32 != STATUS_SUCCESS {
+        crate::provider_bugcheck::report(
+            0xc4,
+            [FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL, 2, irp, ack_status],
+        );
+    }
+    status as u32 as i32
+}
+
 /// `NTSTATUS IofCallDriver(PDEVICE_OBJECT, PIRP)`.
 extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
     unsafe {
@@ -9104,6 +9459,24 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                     as *const u64,
             );
             if handler == 0 {
+                if major == major::IRP_MJ_INTERNAL_DEVICE_CONTROL as u64 {
+                    let control = read_unaligned(next as *const nt_kernel_abi::IoStackLocation)
+                        .device_io_control()
+                        .io_control_code;
+                    let keyboard_hook = nt_io_abi::ioctl::ctl_code(
+                        0x0b, 0x0ff0, nt_io_abi::ioctl::METHOD_NEITHER, 0,
+                    );
+                    let mouse_hook = nt_io_abi::ioctl::ctl_code(
+                        0x0f, 0x0ff0, nt_io_abi::ioctl::METHOD_NEITHER, 0,
+                    );
+                    if control != nt_io_manager::retained_connect_forward::ConnectControl::Keyboard.code()
+                        && control != nt_io_manager::retained_connect_forward::ConnectControl::Mouse.code()
+                        && control != keyboard_hook
+                        && control != mouse_hook
+                    {
+                        return forward_hosted_internal_control(device, irp, next, current_location_after_forward);
+                    }
+                }
                 if major == IRP_MJ_DEVICE_CONTROL
                     || major == major::IRP_MJ_WRITE as u64
                     || major == major::IRP_MJ_READ as u64
@@ -9313,6 +9686,8 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                 }
                 return status as u32 as i32;
             }
+
+            return forward_hosted_internal_control(device, irp, next, current_location_after_forward);
         }
         if matches!(major as u8,
             major::IRP_MJ_CREATE | major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE)
@@ -10182,25 +10557,6 @@ extern "win64" fn s_mm_unmap_locked_pages(_base: u64, mdl: u64) {
     }
 }
 
-/// `PVOID MmAllocateContiguousMemorySpecifyCache(...)`.
-extern "win64" fn s_mm_allocate_contiguous_memory_specify_cache(
-    number_of_bytes: u64,
-    _lowest: u64,
-    _highest: u64,
-    _boundary: u64,
-    _cache_type: u32,
-) -> u64 {
-    unsafe { pool_alloc(number_of_bytes) }
-}
-
-extern "win64" fn s_mm_free_contiguous_memory_specify_cache(
-    base: u64,
-    _number_of_bytes: u64,
-    _cache_type: u32,
-) {
-    s_ex_free_pool(base);
-}
-
 extern "win64" fn s_mm_allocate_non_cached_memory(number_of_bytes: u64) -> u64 {
     unsafe { pool_alloc(number_of_bytes) }
 }
@@ -10332,10 +10688,10 @@ unsafe fn hosted_component_physical_address(virtual_address: u64) -> Option<u64>
             .translated_start
             .checked_add(virtual_address.checked_sub(resource.va)?);
     }
-    nt_compat_exports::memory::physical_address(
-        hosted_component_physical_mappings()?,
-        virtual_address,
-    )
+    hosted_component_physical_mappings()
+        .and_then(|mappings| nt_compat_exports::memory::physical_address(
+            mappings, virtual_address))
+        .or_else(|| hosted_driver_contiguous_memory::physical_address(virtual_address))
 }
 
 unsafe fn hosted_component_virtual_address(physical_address: u64, length: u64) -> Option<u64> {
@@ -10357,17 +10713,37 @@ extern "win64" fn s_mm_get_physical_address(virtual_address: u64) -> u64 {
 /// grant fail with NULL; there is no success fallback.
 extern "win64" fn s_mm_map_io_space(phys: u64, length: u64, cache: u32) -> u64 {
     unsafe {
+        let shared = hosted_provider_export_lane::current_component_bank()
+            .or_else(hosted_class_irp_lane::current_component_bank)
+            .unwrap_or(FSD_SHARED_VADDR);
         if let Some(existing) = hosted_component_virtual_address(phys, length) {
             trace_hosted_mm_map_io_space(phys, length, cache, existing, b"component-map");
             return existing;
         }
         let Some(resource) = find_shared_address_resource_by_range(
-            FSD_SHARED_VADDR,
+            shared,
             SH_RESOURCE_ADDRESS_KIND_MEMORY,
             phys,
             length,
             true,
         ) else {
+            if let Some(projected) = hosted_driver_contiguous_memory::map_physical(
+                phys, length, cache) {
+                trace_hosted_mm_map_io_space(phys, length, cache, projected, b"contiguous-owned");
+                return projected;
+            }
+            // A live GOP/Dxg registration may own the boot scanout through its PCI display BAR
+            // even when this component has no ordinary PnP memory grant (ROOT miniports).
+            let (words, projected, _, _, _) = call_on4_raw(
+                (FSD_SERVICE_GOP_QUERY_LABEL << 12) | 3,
+                phys, length, cache as u64, 0,
+            );
+            if words == 1 && projected != 0 {
+                write_volatile((shared + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64, phys);
+                write_volatile((shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64, length);
+                trace_hosted_mm_map_io_space(phys, length, cache, projected, b"gop-bar");
+                return projected;
+            }
             trace_hosted_mm_map_io_space(phys, length, cache, 0, b"not-assigned");
             return 0;
         };
@@ -10377,11 +10753,11 @@ extern "win64" fn s_mm_map_io_space(phys: u64, length: u64, cache: u32) -> u64 {
         }
         let offset = phys - resource.translated_start;
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64,
+            (shared + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64,
             phys,
         );
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64,
+            (shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64,
             length,
         );
         let result = resource.va + offset;
@@ -10394,13 +10770,17 @@ extern "win64" fn s_mm_map_io_space(phys: u64, length: u64, cache: u32) -> u64 {
 /// owned by the executive grant and is torn down with the component.
 extern "win64" fn s_mm_unmap_io_space(base: u64, _length: u64) {
     unsafe {
-        if find_shared_address_resource_by_va(FSD_SHARED_VADDR, base, 1).is_some() {
+        if hosted_driver_contiguous_memory::unmap_physical(base, _length) { return; }
+        let shared = hosted_provider_export_lane::current_component_bank()
+            .or_else(hosted_class_irp_lane::current_component_bank)
+            .unwrap_or(FSD_SHARED_VADDR);
+        if find_shared_address_resource_by_va(shared, base, 1).is_some() {
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64,
+                (shared + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64,
                 0,
             );
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64,
+                (shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64,
                 0,
             );
         }
@@ -12960,15 +13340,6 @@ extern "win64" fn s_init_small_struct(p: u64) -> i32 {
     0
 }
 
-/// `void KeInitializeSpinLock(PKSPIN_LOCK)` — a KSPIN_LOCK is pointer-sized storage.
-extern "win64" fn s_ke_initialize_spin_lock(lock: u64) {
-    unsafe {
-        if lock != 0 {
-            write_unaligned(lock as *mut u64, 0);
-        }
-    }
-}
-
 #[inline]
 unsafe fn hosted_current_irql() -> u8 {
     if let Some((arena, identity, _, _, _)) = hosted_irq_lane_context() {
@@ -13613,48 +13984,6 @@ extern "win64" fn s_ke_get_current_irql() -> u8 {
     unsafe { hosted_current_irql() }
 }
 
-/// `KIRQL KeAcquireSpinLockRaiseToDpc(PKSPIN_LOCK)`.
-///
-/// The hosted NT ABI exposes one logical processor (`KeNumberProcessors == 1`). NT UP spinlocks
-/// therefore provide exclusion by raising IRQL; no inter-processor lock word is acquired. This is
-/// also what permits a protocol receive indication to synchronously re-enter NDIS send code while
-/// the outer indication is at `DISPATCH_LEVEL`.
-extern "win64" fn s_ke_acquire_spin_lock_raise_to_dpc(lock: u64) -> u8 {
-    unsafe {
-        if lock == 0 {
-            return hosted_current_irql();
-        }
-        let old_irql = hosted_raise_irql(DISPATCH_LEVEL);
-        compiler_fence(Ordering::SeqCst);
-        old_irql
-    }
-}
-
-/// `void KeReleaseSpinLock(PKSPIN_LOCK, KIRQL)`.
-extern "win64" fn s_ke_release_spin_lock(lock: u64, old_irql: u8) {
-    unsafe {
-        if lock == 0 {
-            return;
-        }
-        compiler_fence(Ordering::SeqCst);
-        hosted_lower_irql(old_irql);
-    }
-}
-
-/// `VOID KeAcquireSpinLockAtDpcLevel(PKSPIN_LOCK)` -- barrier-only on the hosted UP ABI.
-extern "win64" fn s_ke_acquire_spin_lock_at_dpc_level(lock: u64) {
-    if lock != 0 {
-        compiler_fence(Ordering::SeqCst);
-    }
-}
-
-/// `VOID KeReleaseSpinLockFromDpcLevel(PKSPIN_LOCK)` -- barrier-only on the hosted UP ABI.
-extern "win64" fn s_ke_release_spin_lock_from_dpc_level(lock: u64) {
-    if lock != 0 {
-        compiler_fence(Ordering::SeqCst);
-    }
-}
-
 /// `void KeInitializeEvent(PRKEVENT, EVENT_TYPE, BOOLEAN)`.
 extern "win64" fn s_ke_initialize_event(event: u64, event_type: u32, state: u8) {
     if event == 0 {
@@ -13675,6 +14004,9 @@ extern "win64" fn s_ke_set_event(event: u64, increment: i32, wait: u8) -> i32 {
     if event == 0 {
         return 0;
     }
+    if let Some(previous) = hosted_driver_event_reference::set_if_owned(event) {
+        return previous as i32;
+    }
     let packed = (increment as u32 as u64) | ((wait as u64) << 32);
     let (_label, previous, _, _, _) = unsafe {
         call_on4(
@@ -13691,6 +14023,7 @@ extern "win64" fn s_ke_set_event(event: u64, increment: i32, wait: u8) -> i32 {
 /// `void KeClearEvent(PRKEVENT)`.
 extern "win64" fn s_ke_clear_event(event: u64) {
     if event != 0 {
+        if hosted_driver_event_reference::clear_if_owned(event).is_some() { return; }
         unsafe {
             kevent::kevent_clear(event as *mut u8);
         }
@@ -13702,6 +14035,9 @@ extern "win64" fn s_ke_reset_event(event: u64) -> i32 {
     if event == 0 {
         return 0;
     }
+    if let Some(previous) = hosted_driver_event_reference::reset_if_owned(event) {
+        return previous as i32;
+    }
     unsafe { kevent::kevent_reset(event as *mut u8) as i32 }
 }
 
@@ -13709,6 +14045,9 @@ extern "win64" fn s_ke_reset_event(event: u64) -> i32 {
 extern "win64" fn s_ke_pulse_event(event: u64, increment: i32, wait: u8) -> i32 {
     if event == 0 {
         return 0;
+    }
+    if let Some(previous) = hosted_driver_event_reference::pulse_if_owned(event) {
+        return previous as i32;
     }
     let packed = (increment as u32 as u64) | ((wait as u64) << 32);
     let (_label, previous, _, _, _) = unsafe {
@@ -13727,6 +14066,9 @@ extern "win64" fn s_ke_pulse_event(event: u64, increment: i32, wait: u8) -> i32 
 extern "win64" fn s_ke_read_state_event(event: u64) -> i32 {
     if event == 0 {
         return 0;
+    }
+    if let Some(current) = hosted_driver_event_reference::read_if_owned(event) {
+        return current as i32;
     }
     unsafe { kevent::kevent_read_state(event as *const u8) as i32 }
 }
@@ -13774,6 +14116,12 @@ unsafe fn hosted_dispatcher_ready(object: u64) -> Result<bool, i32> {
     if object == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
+    if let Some(ready) = hosted_driver_event_reference::projected_ready_for_exec(object) {
+        return ready;
+    }
+    if let Some(ready) = hosted_thread_resources::wait_ready(object) {
+        return Ok(ready);
+    }
     let object_type = read_unaligned(object as *const u8);
     if object_type == kevent::EVENT_NOTIFICATION_OBJECT
         || object_type == kevent::EVENT_SYNCHRONIZATION_OBJECT
@@ -13789,7 +14137,24 @@ unsafe fn hosted_dispatcher_ready(object: u64) -> Result<bool, i32> {
     Err(STATUS_INVALID_PARAMETER)
 }
 
+unsafe fn hosted_dispatcher_ready_for(
+    object: u64,
+    key: Option<nt_kernel_exec::hosted_kmutex::KmutexKey>,
+    thread: u64,
+) -> Result<bool, i32> {
+    match key {
+        Some(key) => hosted_driver_kmutex::ready(object, key, thread),
+        None => hosted_dispatcher_ready(object),
+    }
+}
+
 unsafe fn hosted_dispatcher_consume(object: u64) -> bool {
+    if let Some(consumed) = hosted_driver_event_reference::projected_consume_for_exec(object) {
+        return consumed;
+    }
+    if hosted_thread_resources::wait_ready(object) == Some(true) {
+        return true;
+    }
     let object_type = read_unaligned(object as *const u8);
     if object_type == kevent::EVENT_NOTIFICATION_OBJECT {
         return true;
@@ -13811,23 +14176,38 @@ unsafe fn hosted_dispatcher_consume(object: u64) -> bool {
     false
 }
 
+unsafe fn hosted_dispatcher_consume_for(
+    object: u64,
+    key: Option<nt_kernel_exec::hosted_kmutex::KmutexKey>,
+    thread: u64,
+    owner: u64,
+) -> bool {
+    match key {
+        Some(key) => hosted_driver_kmutex::acquire(object, key, thread, owner) == Ok(true),
+        None => hosted_dispatcher_consume(object),
+    }
+}
+
 unsafe fn hosted_dispatcher_wait_ready(
     objects: &[u64],
+    keys: &[Option<nt_kernel_exec::hosted_kmutex::KmutexKey>],
+    thread: u64,
     wait_all: bool,
 ) -> Result<Option<u32>, i32> {
-    if objects.is_empty() || objects.len() > HOSTED_DRIVER_WAIT_OBJECT_MAX as usize {
+    if objects.is_empty() || objects.len() != keys.len()
+        || objects.len() > HOSTED_DRIVER_WAIT_OBJECT_MAX as usize {
         return Err(STATUS_INVALID_PARAMETER);
     }
     if wait_all {
-        for &object in objects {
-            if !hosted_dispatcher_ready(object)? {
+        for (&object, &key) in objects.iter().zip(keys) {
+            if !hosted_dispatcher_ready_for(object, key, thread)? {
                 return Ok(None);
             }
         }
         Ok(Some(0))
     } else {
-        for (index, &object) in objects.iter().enumerate() {
-            if hosted_dispatcher_ready(object)? {
+        for (index, (&object, &key)) in objects.iter().zip(keys).enumerate() {
+            if hosted_dispatcher_ready_for(object, key, thread)? {
                 return Ok(Some(index as u32));
             }
         }
@@ -13837,12 +14217,15 @@ unsafe fn hosted_dispatcher_wait_ready(
 
 unsafe fn hosted_dispatcher_wait_consume(
     objects: &[u64],
+    keys: &[Option<nt_kernel_exec::hosted_kmutex::KmutexKey>],
+    thread: u64,
+    owner: u64,
     wait_all: bool,
     ready_index: u32,
 ) -> bool {
     if wait_all {
-        for &object in objects {
-            if !hosted_dispatcher_consume(object) {
+        for (&object, &key) in objects.iter().zip(keys) {
+            if !hosted_dispatcher_consume_for(object, key, thread, owner) {
                 return false;
             }
         }
@@ -13851,7 +14234,61 @@ unsafe fn hosted_dispatcher_wait_consume(
         let Some(&object) = objects.get(ready_index as usize) else {
             return false;
         };
-        hosted_dispatcher_consume(object)
+        hosted_dispatcher_consume_for(object, keys[ready_index as usize], thread, owner)
+    }
+}
+
+unsafe fn hosted_dispatcher_wait_ready_with_handler(
+    objects: &[u64],
+    keys: &[Option<nt_kernel_exec::hosted_kmutex::KmutexKey>],
+    thread: u64,
+    wait_all: bool,
+    handler: &ExecNtHandler,
+) -> Result<Option<u32>, i32> {
+    if objects.is_empty() || objects.len() != keys.len()
+        || objects.len() > HOSTED_DRIVER_WAIT_OBJECT_MAX as usize {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let ready = |object: u64, key| match key {
+        Some(key) => hosted_driver_kmutex::ready(object, key, thread),
+        None => hosted_driver_event_reference::projected_ready_with_handler(object, handler)
+            .unwrap_or_else(|| hosted_dispatcher_ready(object)),
+    };
+    if wait_all {
+        for (&object, &key) in objects.iter().zip(keys) {
+            if !ready(object, key)? { return Ok(None); }
+        }
+        Ok(Some(0))
+    } else {
+        for (slot, (&object, &key)) in objects.iter().zip(keys).enumerate() {
+            if ready(object, key)? { return Ok(Some(slot as u32)); }
+        }
+        Ok(None)
+    }
+}
+
+unsafe fn hosted_dispatcher_wait_consume_with_handler(
+    objects: &[u64],
+    keys: &[Option<nt_kernel_exec::hosted_kmutex::KmutexKey>],
+    thread: u64,
+    owner: u64,
+    wait_all: bool,
+    ready_index: u32,
+    handler: &mut ExecNtHandler,
+) -> bool {
+    let mut consume = |object: u64, key| match key {
+        Some(key) => hosted_driver_kmutex::acquire(object, key, thread, owner) == Ok(true),
+        None => hosted_driver_event_reference::projected_consume_with_handler(object, handler)
+            .unwrap_or_else(|| hosted_dispatcher_consume(object)),
+    };
+    if wait_all {
+        for (&object, &key) in objects.iter().zip(keys) {
+            if !consume(object, key) { return false; }
+        }
+        true
+    } else {
+        let Some(&object) = objects.get(ready_index as usize) else { return false; };
+        consume(object, keys[ready_index as usize])
     }
 }
 
@@ -14018,6 +14455,7 @@ fn hosted_driver_wait_object_exec_va(
     component_object: u64,
 ) -> Option<u64> {
     component_to_exec_va_for_instance(instance, inst, component_object, 0x20)
+        .or_else(|| unsafe { hosted_thread_resources::wait_body(instance, component_object).map(|body| body.0) })
         .or_else(|| {
             runtime.and_then(|rt| hosted_worker_component_to_exec_va(rt, component_object, 0x20))
         })
@@ -14078,11 +14516,14 @@ fn park_hosted_driver_wait(
     route: nt_component_suspension::peer_registry::PeerRoute,
     active_reply_cap: u64,
     objects: Vec<u64>,
+    keys: Vec<Option<nt_kernel_exec::hosted_kmutex::KmutexKey>>,
+    owner_body: u64,
     wait_all: bool,
     api_multiple: bool,
     deadline: nt_kernel_exec::Deadline,
 ) -> Option<HostedDriverWaitServiceResult> {
-    if objects.is_empty() || objects.len() > HOSTED_DRIVER_WAIT_OBJECT_MAX as usize {
+    if objects.is_empty() || objects.len() != keys.len()
+        || objects.len() > HOSTED_DRIVER_WAIT_OBJECT_MAX as usize {
         return None;
     }
     if deadline != nt_kernel_exec::Deadline::Infinite
@@ -14103,24 +14544,46 @@ fn park_hosted_driver_wait(
     if waiters.len() == waiters.capacity() && waiters.try_reserve(4).is_err() {
         return None;
     }
-    let sequence =
+    let token =
         crate::spawn_hosts::shared_ingress::owner::runtime::next_service_wait_token().ok()?;
+    let mut event_projection_leases = Vec::new();
+    if event_projection_leases.try_reserve(objects.len()).is_err() { return None; }
+    for &object in &objects {
+        match unsafe { hosted_driver_event_reference::retain_wait_for_exec(instance, object) } {
+            None => {}
+            Some(Ok(lease)) => event_projection_leases.push(lease),
+            Some(Err(_)) => {
+                for lease in event_projection_leases {
+                    if unsafe { hosted_driver_event_reference::release_wait(lease) }.is_err() {
+                        unsafe { crate::provider_bugcheck::report(0xc4, [instance as u64, object, 0, 9]); }
+                    }
+                }
+                return None;
+            }
+        }
+    }
+    let sequence = crate::next_dispatcher_wait_sequence();
     let shared = HostedDriverSharedWait {
         route,
         dispatch,
-        token: sequence,
+        token,
     };
     waiters.push(HostedDriverRawWaiter {
         instance,
         thread_handle,
         reply_cap: active_reply_cap,
         objects,
+        event_projection_leases,
+        keys,
+        owner_body,
         wait_all,
         api_multiple,
         deadline,
         sequence,
         shared,
         wake_status: None,
+        delivery: nt_hosted_runtime::HostedEventWaitDelivery::new(),
+        reply_retry_at: 0,
     });
     // End the vector borrow before the collector reads the newly published deadline. The
     // original Reply remains canonical until programming and external suspension both succeed.
@@ -14158,7 +14621,12 @@ fn park_hosted_driver_wait(
                     && waiter.reply_cap == active_reply_cap
                     && waiter.thread_handle == thread_handle
             }).expect("uncommitted driver wait disappeared");
-            waiters.remove(index);
+            let waiter = waiters.remove(index);
+            for lease in waiter.event_projection_leases {
+                if hosted_driver_event_reference::release_wait(lease).is_err() {
+                    crate::provider_bugcheck::report(0xc4, [instance as u64, sequence, 0, 10]);
+                }
+            }
         }
         return None;
     }
@@ -14178,14 +14646,47 @@ unsafe fn reply_hosted_driver_waiter(mut waiter: HostedDriverRawWaiter, status: 
     let thread_handle = waiter.thread_handle;
     let sequence = waiter.sequence;
     let reply = waiter.reply_cap;
+    let reply_entered = waiter.delivery.reply_entered();
+    if !reply_entered {
+        if !waiter.delivery.select() || !waiter.delivery.enter_reply() {
+            crate::provider_bugcheck::report(0xc4, [instance as u64, sequence, reply, 12]);
+        }
+    }
     waiter.wake_status = Some(status);
+    waiter.reply_retry_at = monotonic_time_100ns().saturating_add(1_000_000);
     // Retain the consumed selection and continuation before a native Reply/query can enter.
     // Failure never puts the object selection back into the ready/timeout scan.
     hosted_driver_waiters_mut().push(waiter);
-    let result = crate::spawn_hosts::shared_ingress::owner::runtime::wake_service(
-        shared.route, shared.dispatch, reply, shared.token, status,
-    );
-    if result.is_err() { return false; }
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    let cancelled = runtime::retained_service_owner_stopped_at_broker(
+        shared.route, shared.dispatch, reply, shared.token,
+    ) && runtime::acknowledge_retained_service_cancellation(
+        shared.route, shared.dispatch, reply, shared.token,
+    ).is_ok();
+    let acknowledged = if cancelled {
+        true
+    } else if reply_entered {
+        matches!(runtime::reconcile_retained_service_reply(
+            shared.route, shared.dispatch, reply, shared.token,
+        ), Ok(true))
+    } else {
+        runtime::wake_service(
+            shared.route, shared.dispatch, reply, shared.token, status,
+        ).is_ok()
+    };
+    if !acknowledged {
+        // The selected result and original Reply remain retained. A later Event signal is
+        // optional, so program this row's absolute retry deadline before leaving this turn.
+        let timer = crate::service_sec_image::rearm_registered_delay_timer();
+        if !timer.deadline_programmed() {
+            print_str(b"[hosted-wait] retained Reply retry timer unavailable instance=");
+            print_u64(instance as u64);
+            print_str(b" owner=");
+            print_u64(u64::from(timer.owner_available()));
+            print_str(b"\n");
+        }
+        return false;
+    }
     let waiters = hosted_driver_waiters_mut();
     let index = waiters
         .iter()
@@ -14196,7 +14697,16 @@ unsafe fn reply_hosted_driver_waiter(mut waiter: HostedDriverRawWaiter, status: 
                 && row.reply_cap == reply
         })
         .expect("shared wake lost its retained waiter");
-    waiters.remove(index);
+    let mut waiter = waiters.remove(index);
+    if !(if cancelled { waiter.delivery.cancel(true) }
+        else { waiter.delivery.reconcile(true) }) {
+        crate::provider_bugcheck::report(0xc4, [instance as u64, sequence, reply, 13]);
+    }
+    for lease in waiter.event_projection_leases {
+        if hosted_driver_event_reference::release_wait(lease).is_err() {
+            crate::provider_bugcheck::report(0xc4, [instance as u64, sequence, 0, 11]);
+        }
+    }
     let _ = hosted_driver_thread_table_mut(instance).and_then(|table| table.set_ready(thread_handle).ok());
     true
 }
@@ -14249,8 +14759,13 @@ pub(crate) fn hosted_driver_wait_next_deadline(now: nt_time::TimeSnapshot) -> Op
         (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS))
             .as_ref()?
             .iter()
-            .filter(|waiter| waiter.wake_status.is_none())
-            .filter_map(|waiter| waiter.deadline.monotonic_target(now))
+            .filter_map(|waiter| {
+                if waiter.wake_status.is_some() {
+                    Some(waiter.reply_retry_at.max(now.monotonic_100ns))
+                } else {
+                    waiter.deadline.monotonic_target(now)
+                }
+            })
             .min()
     }
 }
@@ -14364,7 +14879,7 @@ unsafe fn drain_hosted_driver_dpc_snapshot() -> u64 {
 }
 
 pub(crate) unsafe fn hosted_driver_wait_wake_due(now: nt_time::TimeSnapshot) -> u64 {
-    let mut woken = 0u64;
+    let mut woken = hosted_driver_wait_redrive_selected();
     loop {
         let due_index = {
             let Some(waiters) = (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS)).as_ref() else {
@@ -14393,6 +14908,74 @@ pub(crate) unsafe fn hosted_driver_wait_wake_due(now: nt_time::TimeSnapshot) -> 
 }
 
 fn wake_hosted_driver_waiters_for_instance(instance: usize) -> u64 {
+    wake_hosted_driver_waiters_for_instance_inner(instance)
+}
+
+pub(super) unsafe fn hosted_driver_wait_oldest_event_consumer_sequence(
+    native_index: usize, handler: &ExecNtHandler,
+) -> Option<u64> {
+    let waiters = (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS)).as_ref()?;
+    let mut after = 0;
+    let mut oldest: Option<u64> = None;
+    while let Some((next, instance_index, exec_body)) =
+        hosted_driver_event_reference::exec_body_for_native_index_after(
+            native_index, handler, after)
+    {
+        after = next;
+        for waiter in waiters.iter().filter(|row| row.instance == instance_index
+            && row.wake_status.is_none()) {
+            let Ok(Some(selected)) = hosted_dispatcher_wait_ready_with_handler(
+                &waiter.objects, &waiter.keys, waiter.thread_handle,
+                waiter.wait_all, handler) else { continue; };
+            let consumes = if waiter.wait_all { waiter.objects.contains(&exec_body) }
+                else { waiter.objects.get(selected as usize) == Some(&exec_body) };
+            if consumes { oldest = Some(oldest.map_or(waiter.sequence,
+                |current| current.min(waiter.sequence))); }
+        }
+    }
+    oldest
+}
+
+pub(super) unsafe fn hosted_driver_wait_select_event_consumer(
+    native_index: usize, expected_sequence: u64, handler: &mut ExecNtHandler,
+) -> bool {
+    if hosted_driver_wait_oldest_event_consumer_sequence(native_index, handler)
+        != Some(expected_sequence) { return false; }
+    let Some(waiters) = (*core::ptr::addr_of_mut!(HOSTED_DRIVER_WAITERS)).as_mut() else {
+        return false;
+    };
+    let Some(position) = waiters.iter().position(|row| row.sequence == expected_sequence
+        && row.wake_status.is_none()) else { return false; };
+    let waiter = &mut waiters[position];
+    let Ok(Some(status)) = hosted_dispatcher_wait_ready_with_handler(&waiter.objects,
+        &waiter.keys, waiter.thread_handle, waiter.wait_all, handler) else { return false; };
+    if !hosted_dispatcher_wait_consume_with_handler(&waiter.objects, &waiter.keys,
+        waiter.thread_handle, waiter.owner_body, waiter.wait_all, status, handler)
+    { return false; }
+    // The row owns its original Reply and selected result until post-arbitration delivery.
+    waiter.wake_status = Some(status as i32);
+    true
+}
+
+pub(super) unsafe fn hosted_driver_wait_redrive_selected() -> u64 {
+    let mut delivered = 0;
+    let mut cursor = (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS))
+        .as_ref().map(Vec::len).unwrap_or(0);
+    while cursor != 0 {
+        cursor -= 1;
+        let selected = (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS))
+            .as_ref().and_then(|rows| rows.get(cursor))
+            .and_then(|row| row.wake_status);
+        let Some(status) = selected else { continue; };
+        let waiter = hosted_driver_waiters_mut().remove(cursor);
+        if reply_hosted_driver_waiter(waiter, status) {
+            delivered += 1;
+        }
+    }
+    delivered
+}
+
+fn wake_hosted_driver_waiters_for_instance_inner(instance: usize) -> u64 {
     let mut woken = 0u64;
     loop {
         let ready_index = unsafe {
@@ -14405,10 +14988,8 @@ fn wake_hosted_driver_waiters_for_instance(instance: usize) -> u64 {
                 .filter(|(_, waiter)| {
                     waiter.instance == instance
                         && waiter.wake_status.is_none()
-                        && matches!(
-                            hosted_dispatcher_wait_ready(&waiter.objects, waiter.wait_all),
-                            Ok(Some(_))
-                        )
+                        && matches!(hosted_dispatcher_wait_ready(&waiter.objects, &waiter.keys,
+                                waiter.thread_handle, waiter.wait_all), Ok(Some(_)))
                 })
                 .min_by_key(|(_, waiter)| waiter.sequence)
                 .map(|(index, _)| index)
@@ -14419,7 +15000,8 @@ fn wake_hosted_driver_waiters_for_instance(instance: usize) -> u64 {
         let waiter = unsafe { hosted_driver_waiters_mut().remove(index) };
         let wait_is_multiple = waiter.api_multiple;
         let ready_status =
-            match unsafe { hosted_dispatcher_wait_ready(&waiter.objects, waiter.wait_all) } {
+            match unsafe { hosted_dispatcher_wait_ready(&waiter.objects, &waiter.keys,
+                waiter.thread_handle, waiter.wait_all) } {
                 Ok(Some(status)) => status,
                 _ => {
                     record_hosted_driver_wait_wake_error(wait_is_multiple);
@@ -14429,9 +15011,8 @@ fn wake_hosted_driver_waiters_for_instance(instance: usize) -> u64 {
                     continue;
                 }
             };
-        let consumed = unsafe {
-            hosted_dispatcher_wait_consume(&waiter.objects, waiter.wait_all, ready_status)
-        };
+        let consumed = unsafe { hosted_dispatcher_wait_consume(&waiter.objects, &waiter.keys,
+            waiter.thread_handle, waiter.owner_body, waiter.wait_all, ready_status) };
         if !consumed {
             record_hosted_driver_wait_wake_error(wait_is_multiple);
             unsafe {
@@ -14635,8 +15216,42 @@ extern "win64" fn s_ke_insert_queue_dpc(dpc: u64, arg1: u64, arg2: u64) -> u8 {
     }
 }
 
+/// `BOOLEAN KeRemoveQueueDpc(PRKDPC)` removes only a still queued KDPC. Root owns the
+/// generation-fenced queue; component memory is a projection, never the scheduling authority.
+extern "win64" fn s_ke_remove_queue_dpc(dpc: u64) -> u8 {
+    if dpc == 0 {
+        return 0;
+    }
+    unsafe {
+        if let Some((_, identity, _, _, grant)) = hosted_irq_lane_context() {
+            let removed = hosted_irq_lane_service(nt_hosted_runtime::HostedIrqServiceCommand {
+                kind: nt_hosted_runtime::HostedIrqServiceKind::RemoveDpc,
+                service_id: dpc,
+                target_domain_id: identity.domain_id,
+                target_domain_cookie: identity.domain_cookie,
+                authority_cookie: 0,
+                grant,
+                argument_count: 0,
+                arguments: [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP],
+            });
+            if removed.faulted || removed.status != STATUS_SUCCESS
+                || removed.value_count != 1 || removed.values[0] > 1
+            {
+                hosted_irq_lane_protocol_fault(dpc);
+            }
+            return removed.values[0] as u8;
+        }
+        let (_, status, removed, _, _) =
+            call_on4((FSD_SERVICE_REMOVE_DPC_LABEL << 12) | 1, dpc, 0, 0, 0);
+        if status as u32 as i32 != STATUS_SUCCESS || removed > 1 {
+            return 0;
+        }
+        removed as u8
+    }
+}
+
 /// `ULONG KeQueryTimeIncrement()`.
-extern "win64" fn s_ke_query_time_increment() -> u32 {
+pub(crate) extern "win64" fn s_ke_query_time_increment() -> u32 {
     156_250
 }
 
@@ -15736,6 +16351,12 @@ extern "win64" fn s_obf_reference_object(object: u64) -> u64 {
             );
         }
         if !consumer_file_object_in_local_pool(object) {
+            if let Some(reference) = hosted_driver_event_reference::retain_if_owned(object) {
+                return reference;
+            }
+            if let Some(references) = hosted_driver_process_identity::retain_process_if_known(object) {
+                return references;
+            }
             return object;
         }
         let (info, status, reference, _, _) =
@@ -15756,6 +16377,18 @@ extern "win64" fn s_obf_dereference_object(object: u64) -> u64 {
             );
         }
         if !consumer_file_object_in_local_pool(object) {
+            if let Some(references) = hosted_driver_event_reference::release_if_owned(object) {
+                return references;
+            }
+            if let Some(references) = hosted_driver_ps_handle_reference::release_if_owned(object) {
+                return references;
+            }
+            if let Some(references) = hosted_driver_process_identity::release_process_if_owned(object) {
+                return references;
+            }
+            if let Some(references) = hosted_driver_dynamic_object::dereference_if_dynamic(object) {
+                return references;
+            }
             return 0;
         }
         let (info, status, _, _, _) =
@@ -15779,8 +16412,25 @@ extern "win64" fn s_ob_reference_object_by_handle(
     if handle == 0 || object_out == 0 || access_mode > 1 {
         return STATUS_INVALID_HANDLE;
     }
-    if object_type != 0 && object_type != FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_VA {
-        return nt_process::native_handle::STATUS_OBJECT_TYPE_MISMATCH as i32;
+    if object_type == nt_object_manager::object_type::process_object_type_addr()
+        || object_type == nt_object_manager::object_type::thread_object_type_addr()
+    {
+        return hosted_driver_ps_handle_reference::ob_reference_object_by_handle(
+            handle, desired_access, object_type, access_mode, object_out, handle_information,
+        );
+    }
+    if object_type == FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_VA {
+        return hosted_driver_event_reference::reference_object_by_handle(
+            handle, desired_access, object_type, access_mode, object_out, handle_information,
+        );
+    }
+    if object_type != FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_VA {
+        let dynamic = hosted_driver_dynamic_object::reference_object_by_handle(
+            handle, desired_access, object_type, access_mode, object_out, handle_information,
+        );
+        if object_type != 0 || dynamic != STATUS_INVALID_HANDLE {
+            return dynamic;
+        }
     }
     unsafe {
         let (info, status, object, granted_access, attributes) = call_on4_raw(
@@ -16801,6 +17451,13 @@ pub(crate) fn bind_debug_exports(reg: &mut DriverExportRegistry) {
     reg.bind(
         "DbgPrintEx",
         hosted_dbg_print_ex_gate as *const () as usize as u64,
+    );
+}
+
+pub(crate) fn bind_kd_debug_export(reg: &mut DriverExportRegistry) {
+    reg.bind(
+        "KdSystemDebugControl",
+        hosted_kd_debug::s_kd_system_debug_control as *const () as usize as u64,
     );
 }
 
@@ -18089,16 +18746,18 @@ static mut FSD_EXPORTS_READY: bool = false;
 
 const HOSTED_DEP_PROVIDER_MAX: usize = 64;
 const HOSTED_DEP_PATH_MAX: usize = 96;
-const HOSTED_DRIVER_DEP_PATH_PREFIX: &[u8] = b"reactos\\system32\\drivers\\";
+const HOSTED_DRIVER_DEP_PATH_PREFIX: &[u8] = crate::installed_layout::DRIVERS_PREFIX;
 const MAX_RAW_IMPORT_DESCRIPTORS: u32 = 256;
 const MAX_LOADED_EXPORT_NAMES: u32 = 1024;
-const HOSTED_EXECUTABLE_THUNK_FRAMES: u64 = 1;
+const HOSTED_EXECUTABLE_THUNK_FRAMES: u64 = 2;
 const HOSTED_EXECUTABLE_THUNK_TABLE_LEN: u64 = HOSTED_EXECUTABLE_THUNK_FRAMES * 0x1000;
 const HOSTED_EXECUTABLE_THUNK_SLOT_COUNT: usize =
     (HOSTED_EXECUTABLE_THUNK_TABLE_LEN / HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN) as usize;
 const HOSTED_THUNK_PURPOSE_PROVIDER_IMPORT: u8 = 1;
 const HOSTED_THUNK_PURPOSE_PROVIDER_INTERNAL_IMPORT: u8 = 2;
 const HOSTED_THUNK_PURPOSE_PROVIDER_CALLBACK: u8 = 3;
+const HOSTED_THUNK_PURPOSE_DXG_REGISTRATION: u8 = 4;
+const HOSTED_THUNK_PURPOSE_DXG_INTERFACE: u8 = 5;
 
 #[derive(Clone, Copy)]
 struct LoadedDependencyImage {
@@ -18792,6 +19451,7 @@ struct HostedExecutableThunkAddress {
 
 const HOSTED_PROVIDER_CALLBACK_PARENT_KIND_MINIPORT: u8 = 1;
 const HOSTED_PROVIDER_CALLBACK_PARENT_KIND_PROTOCOL: u8 = 2;
+const HOSTED_PROVIDER_CALLBACK_PARENT_KIND_DXG: u8 = 3;
 
 struct HostedProviderCallbackParent {
     present: bool,
@@ -18801,7 +19461,7 @@ struct HostedProviderCallbackParent {
     dependent_instance: usize,
     kind: u8,
     provider_handle: u64,
-    bindings: [Option<HostedExecutableThunkBinding>; NDIS_MINIPORT_CHARACTERISTICS_CALLBACK_CAP],
+    bindings: Vec<Option<HostedExecutableThunkBinding>>,
     binding_count: usize,
 }
 
@@ -18815,7 +19475,7 @@ impl HostedProviderCallbackParent {
             dependent_instance: 0,
             kind: 0,
             provider_handle: 0,
-            bindings: [None; NDIS_MINIPORT_CHARACTERISTICS_CALLBACK_CAP],
+            bindings: Vec::new(),
             binding_count: 0,
         }
     }
@@ -18975,6 +19635,7 @@ struct HostedProviderCallbackRecord {
     target: u64,
     callback_offset: u64,
     callback_kind: u8,
+    callback_version: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -19545,11 +20206,10 @@ unsafe fn register_hosted_provider_singleton(
         print_str(b"\n");
         return false;
     };
-    let export_call_gate = if hosted_provider_has_export_marshal_policies(provider.as_str()) {
-        hosted_provider_export_gate_va()
-    } else {
-        0
-    };
+    // A live provider may obtain a typed internal-call policy only after a
+    // resolver IRP completes. The gate itself still rejects every RVA without
+    // a named-export or generation-bound internal policy.
+    let export_call_gate = hosted_provider_export_gate_va();
     if singletons.try_reserve(1).is_err() {
         HOSTED_PROVIDER_SINGLETON_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
         return false;
@@ -19851,6 +20511,7 @@ fn print_hosted_provider_callback_kind_name(kind: u8) {
         HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL => print_str(b"protocol"),
         HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT_TIMER => print_str(b"miniport-timer"),
         HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM => print_str(b"ndis-work-item"),
+        HOSTED_PROVIDER_CALLBACK_KIND_DXG => print_str(b"dxg"),
         _ => print_str(b"unknown"),
     }
 }
@@ -20453,6 +21114,7 @@ unsafe fn register_hosted_provider_callback_record(
     target: u64,
     callback_offset: u64,
     callback_kind: u8,
+    callback_version: u32,
     thunk_token: HostedThunkSlotToken,
     thunk_key: HostedThunkSlotKey,
 ) -> Option<(usize, HostedProviderCallbackRecord)> {
@@ -20494,6 +21156,7 @@ unsafe fn register_hosted_provider_callback_record(
         target,
         callback_offset,
         callback_kind,
+        callback_version,
     };
     if index == records.len() {
         records.push(record);
@@ -20585,6 +21248,7 @@ unsafe fn reserve_hosted_provider_callback_parent(
         kind,
         HOSTED_PROVIDER_CALLBACK_PARENT_KIND_MINIPORT
             | HOSTED_PROVIDER_CALLBACK_PARENT_KIND_PROTOCOL
+            | HOSTED_PROVIDER_CALLBACK_PARENT_KIND_DXG
     ) {
         return Err(STATUS_INVALID_PARAMETER);
     }
@@ -20607,7 +21271,7 @@ unsafe fn reserve_hosted_provider_callback_parent(
         dependent_instance,
         kind,
         provider_handle: 0,
-        bindings: [None; NDIS_MINIPORT_CHARACTERISTICS_CALLBACK_CAP],
+        bindings: Vec::new(),
         binding_count: 0,
     };
     if index == parents.len() {
@@ -20628,11 +21292,13 @@ unsafe fn retain_hosted_provider_callback_parent_binding(
     if !parent.present
         || parent.construction_state != HostedProviderConstructionState::Constructing
         || binding.instance_index != parent.provider_instance
-        || parent.binding_count >= parent.bindings.len()
     {
         return false;
     }
-    parent.bindings[parent.binding_count] = Some(binding);
+    if parent.bindings.try_reserve(1).is_err() {
+        return false;
+    }
+    parent.bindings.push(Some(binding));
     parent.binding_count += 1;
     true
 }
@@ -20784,9 +21450,16 @@ unsafe fn clear_hosted_provider_callback_parents_for_instance(
             parent.construction_state,
             HostedProviderConstructionState::Constructing
                 | HostedProviderConstructionState::RollingBack
-        ) {
+        ) && !(parent.kind == HOSTED_PROVIDER_CALLBACK_PARENT_KIND_DXG
+            && parent.construction_state == HostedProviderConstructionState::Published) {
             failures += 1;
             continue;
+        }
+        // The dependency was marked retiring and drained by clear_instance before
+        // reaching this point. No new reverse callback can acquire its dispatch lease.
+        if parent.construction_state == HostedProviderConstructionState::Published {
+            hosted_provider_callback_parents_mut()[index].construction_state =
+                HostedProviderConstructionState::RollingBack;
         }
         rollback_hosted_provider_callback_parent(index);
         if hosted_provider_callback_parents()
@@ -21502,6 +22175,14 @@ unsafe fn complete_hosted_provider_miniport_registration(
     else {
         return Err(STATUS_DEVICE_NOT_READY);
     };
+    complete_hosted_provider_driver_registration(route_index, route)
+}
+
+unsafe fn complete_hosted_provider_driver_registration(
+    route_index: usize,
+    route: HostedProviderDispatchRoute,
+) -> Result<(), i32> {
+    let provider_instance = route.provider_instance;
     let Some(provider_inst) = instance(provider_instance) else {
         return Err(STATUS_DEVICE_NOT_READY);
     };
@@ -27444,7 +28125,8 @@ unsafe fn provider_marshal_emit_callback_thunk(
 ) -> Result<HostedExecutableThunkAddress, i32> {
     let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
         .ok_or(STATUS_DEVICE_NOT_READY)?;
-    let discriminator = callback_offset ^ ((callback_kind as u64) << 56);
+    let discriminator = hosted_provider_callback_discriminator(
+        callback_offset, callback_kind, 0).ok_or(STATUS_INVALID_PARAMETER)?;
     let key = HostedThunkSlotKey::new(
         owner,
         HOSTED_THUNK_PURPOSE_PROVIDER_CALLBACK,
@@ -27453,6 +28135,52 @@ unsafe fn provider_marshal_emit_callback_thunk(
     )
     .ok_or(STATUS_INVALID_PARAMETER)?;
     let reservation = reserve_instance_executable_thunk(provider_instance, key)?;
+    provider_marshal_emit_callback_thunk_reserved(
+        provider_instance,
+        dependent_instance,
+        target,
+        callback_offset,
+        callback_kind,
+        0,
+        reservation,
+    )
+}
+
+fn hosted_provider_callback_discriminator(
+    callback_offset: u64,
+    callback_kind: u8,
+    callback_version: u32,
+) -> Option<u64> {
+    if callback_offset > u32::MAX as u64 || callback_version > 0x00ff_ffff {
+        return None;
+    }
+    Some(callback_offset | ((callback_version as u64) << 32)
+        | ((callback_kind as u64) << 56))
+}
+
+unsafe fn provider_marshal_emit_callback_thunk_reserved(
+    provider_instance: usize,
+    dependent_instance: usize,
+    target: u64,
+    callback_offset: u64,
+    callback_kind: u8,
+    callback_version: u32,
+    reservation: HostedExecutableThunkReservation,
+) -> Result<HostedExecutableThunkAddress, i32> {
+    let key = reservation.key;
+    let Some(discriminator) = hosted_provider_callback_discriminator(
+        callback_offset, callback_kind, callback_version) else {
+        abort_instance_executable_thunk(provider_instance, reservation);
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    if key.target != target
+        || key.discriminator != discriminator
+        || key.purpose != HOSTED_THUNK_PURPOSE_PROVIDER_CALLBACK
+        || hosted_provider_object_owner_for_pair(provider_instance, dependent_instance) != Some(key.owner)
+    {
+        abort_instance_executable_thunk(provider_instance, reservation);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
     if reservation.existing {
         let Some(record) = hosted_provider_callback_record_for_thunk(reservation.token, key) else {
             abort_instance_executable_thunk(provider_instance, reservation);
@@ -27461,6 +28189,7 @@ unsafe fn provider_marshal_emit_callback_thunk(
         return if record.target == target
             && record.callback_offset == callback_offset
             && record.callback_kind == callback_kind
+            && record.callback_version == callback_version
             && hosted_provider_callback_record(record.callback_cookie).is_some()
         {
             Ok(reservation.address(provider_instance))
@@ -27475,6 +28204,7 @@ unsafe fn provider_marshal_emit_callback_thunk(
         target,
         callback_offset,
         callback_kind,
+        callback_version,
         reservation.token,
         key,
     ) else {
@@ -29042,7 +29772,9 @@ unsafe fn prepare_provider_export_marshal(
                 provider_handle
             }
             HostedProviderArgumentMarshal::CallerInDriverObject => {
-                if policy.side_effect == HostedProviderExportSideEffect::NdisInitializeWrapper {
+                if matches!(policy.side_effect,
+                    HostedProviderExportSideEffect::NdisInitializeWrapper
+                        | HostedProviderExportSideEffect::DxgRegistration) {
                     provider_marshal_driver_object_shadow(
                         &mut state,
                         provider_instance,
@@ -29129,6 +29861,16 @@ unsafe fn prepare_provider_export_marshal(
             HostedProviderArgumentMarshal::CallerInUnicodeString => {
                 provider_marshal_unicode_string(
                     &mut state,
+                    dependent_index,
+                    dependent_inst,
+                    marshal_window,
+                    arg,
+                )?
+            }
+            HostedProviderArgumentMarshal::CallerInDxgInitializationData => {
+                hosted_dxg_registration::marshal_initialization_data(
+                    &mut state,
+                    provider_instance,
                     dependent_index,
                     dependent_inst,
                     marshal_window,
@@ -29344,6 +30086,16 @@ unsafe fn prepare_provider_export_marshal(
                     marshal_window,
                     arg,
                     provider_marshal_u32_arg(policy, args, length_index)?,
+                )?
+            }
+            HostedProviderArgumentMarshal::CallerOutFixed { bytes } => {
+                provider_marshal_output_cell(
+                    &mut state,
+                    dependent_index,
+                    dependent_inst,
+                    marshal_window,
+                    arg,
+                    u64::from(bytes),
                 )?
             }
             HostedProviderArgumentMarshal::CallerInMiniportCharacteristics { length_arg } => {
@@ -29690,6 +30442,11 @@ unsafe fn complete_provider_export_marshal(
     }
     if state.callback_parent_construction_index != usize::MAX {
         let (registration_succeeded, provider_handle) = match policy.side_effect {
+            HostedProviderExportSideEffect::DxgRegistration => {
+                let handle = hosted_provider_dispatch_route(state.ndis_route_index)
+                    .map_or(0, |route| route.provider_driver_object);
+                (success && handle != 0, handle)
+            }
             HostedProviderExportSideEffect::NdisMiniportRegistration => (
                 success && state.callback_parent_input_provider_handle != 0,
                 state.callback_parent_input_provider_handle,
@@ -29819,7 +30576,20 @@ unsafe fn complete_provider_export_side_effects(
     result: u64,
 ) -> Result<(), i32> {
     match policy.side_effect {
-        HostedProviderExportSideEffect::None => Ok(()),
+        HostedProviderExportSideEffect::None
+        | HostedProviderExportSideEffect::DxgInterfaceCallback => Ok(()),
+        HostedProviderExportSideEffect::DxgRegistration => {
+            if result != STATUS_SUCCESS as u64 { return Ok(()); }
+            let route = hosted_provider_dispatch_route(state.ndis_route_index)
+                .ok_or(STATUS_DEVICE_NOT_READY)?;
+            if route.provider_instance != provider_instance
+                || route.dependent_instance != dependent_instance
+                || route.provider_driver_object != args[0]
+            {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            complete_hosted_provider_driver_registration(state.ndis_route_index, route)
+        }
         HostedProviderExportSideEffect::NdisInitializeWrapper => {
             if state.ndis_route_index == usize::MAX {
                 return Err(STATUS_INVALID_PARAMETER);
@@ -30495,7 +31265,14 @@ unsafe fn service_hosted_provider_export_explicit(
 ) -> u64 {
     let caller = match crate::provider_registry_caller::resolve(dependent_channel) {
         Ok(caller) => caller,
-        Err(status) => return hosted_provider_export_failure(status as i32),
+        Err(status) => {
+            print_str(b"[provider-export] reject stage=caller status=0x");
+            print_hex(status as u32);
+            print_str(b" rva=0x");
+            print_hex(provider_export_rva as u32);
+            print_str(b"\n");
+            return hosted_provider_export_failure(status as i32);
+        }
     };
     service_hosted_provider_export_with_dispatch(
         dependent_channel,
@@ -30504,16 +31281,15 @@ unsafe fn service_hosted_provider_export_explicit(
         caller_rsp,
         args,
         HostedProviderMarshalWindowSource::LEGACY_SHARED_BANK,
-        |singleton, provider_inst, exec_code_va, marshalled_args, caller_rsp| {
-            dispatch_hosted_provider_export_legacy(
-                caller,
-                singleton,
-                provider_inst,
-                exec_code_va,
-                provider_export_rva,
-                marshalled_args,
-                caller_rsp,
-            )
+        |singleton, provider_inst, exec_code_va, marshalled_args, caller_rsp, reentrant| {
+            if let Some(selection) = reentrant {
+                hosted_provider_export_lane::dispatch(
+                    selection, provider_export_rva, marshalled_args, caller_rsp, caller)
+            } else {
+                dispatch_hosted_provider_export_legacy(
+                    caller, singleton, provider_inst, exec_code_va, provider_export_rva,
+                    marshalled_args, caller_rsp)
+            }
         },
     )
 }
@@ -30589,12 +31365,14 @@ unsafe fn dispatch_hosted_provider_export_legacy(
         },
     };
     let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
-    if pr.completed {
+    let completion = nt_hosted_runtime::classify_hosted_provider_export_completion(
+        pr.completed, pr.status);
+    if completion == nt_hosted_runtime::HostedProviderExportCompletion::Reusable {
         return Ok(read_volatile((provider_shared + SH_REQ_INFO) as *const u64));
     }
     let trace = HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
     if trace < HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_CAP {
-        print_str(b"[provider-export] incomplete provider=");
+        print_str(b"[provider-export] retained provider=");
         print_str(singleton.provider.as_bytes());
         print_str(b" cookie=");
         print_u64(singleton.provider_publication_cookie);
@@ -30617,7 +31395,10 @@ unsafe fn dispatch_hosted_provider_export_legacy(
         print_str(b"\n");
     }
     register_instance_ready(singleton.instance, false);
-    Err(STATUS_UNSUCCESSFUL)
+    match completion {
+        nt_hosted_runtime::HostedProviderExportCompletion::Retain(status) => Err(status),
+        nt_hosted_runtime::HostedProviderExportCompletion::Reusable => unreachable!(),
+    }
 }
 
 unsafe fn service_hosted_provider_export_with_dispatch<F>(
@@ -30626,7 +31407,7 @@ unsafe fn service_hosted_provider_export_with_dispatch<F>(
     provider_publication_cookie: u64,
     caller_rsp: u64,
     mut args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
-    marshal_window_source: HostedProviderMarshalWindowSource,
+    mut marshal_window_source: HostedProviderMarshalWindowSource,
     dispatch: F,
 ) -> u64
 where
@@ -30636,6 +31417,7 @@ where
         u64,
         &[u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
         u64,
+        Option<hosted_provider_export_lane::Selection>,
     ) -> Result<u64, i32>,
 {
     HOSTED_PROVIDER_EXPORT_REQUESTS.fetch_add(1, Ordering::Relaxed);
@@ -30645,13 +31427,18 @@ where
         return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
     };
     let descriptor = hosted_provider_domain_descriptor(singleton);
-    let Some(policy) = loaded_pe_export_rva_marshal_policy(
-        singleton.provider.as_str(),
-        singleton.exec_va,
-        singleton.image_len,
-        provider_export_rva,
-    )
-    .or_else(|| hosted_provider_internal_rva_marshal_policy(singleton, provider_export_rva)) else {
+    let internal_policy = hosted_provider_internal_rva_marshal_policy(singleton,
+        provider_export_rva);
+    let policy = if hosted_dxg_registration::is_interface_callback_rva(
+        provider_publication_cookie, provider_export_rva)
+    {
+        internal_policy
+    } else {
+        loaded_pe_export_rva_marshal_policy(singleton.provider.as_str(),
+            singleton.exec_va, singleton.image_len, provider_export_rva)
+            .or(internal_policy)
+    };
+    let Some(policy) = policy else {
         return hosted_provider_export_failure(STATUS_NOT_SUPPORTED);
     };
     let packet_array_export = provider_policy_uses_packet_array(policy);
@@ -30688,6 +31475,33 @@ where
     if dependent_index == singleton.instance {
         return hosted_provider_export_failure(STATUS_INVALID_PARAMETER);
     }
+    if policy.side_effect == HostedProviderExportSideEffect::DxgRegistration
+        && !hosted_dxg_registration::validate_call(
+            singleton.instance,
+            dependent_index,
+            provider_publication_cookie,
+            provider_export_rva,
+            &args,
+        )
+    {
+        return hosted_provider_export_failure(STATUS_INVALID_PARAMETER);
+    }
+    if policy.side_effect == HostedProviderExportSideEffect::DxgInterfaceCallback
+        && !hosted_dxg_registration::validate_interface_call(
+            singleton.instance,
+            dependent_index,
+            provider_publication_cookie,
+            provider_export_rva,
+            &args,
+        )
+    {
+        print_str(b"[provider-export] reject stage=dxg-interface-authority rva=0x");
+        print_hex(provider_export_rva as u32);
+        print_str(b" cookie=");
+        print_u64(provider_publication_cookie);
+        print_str(b"\n");
+        return hosted_provider_export_failure(STATUS_INVALID_PARAMETER);
+    }
     let Some(provider_inst) = instance(singleton.instance) else {
         return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
     };
@@ -30698,9 +31512,6 @@ where
     {
         return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
     }
-    let Some(marshal_window) = marshal_window_source.resolve(provider_inst.exec_shared_va) else {
-        return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
-    };
     if let Err(status) = ensure_hosted_provider_domain_dependency(
         singleton.instance,
         singleton.provider_publication_cookie,
@@ -30722,13 +31533,44 @@ where
     ) else {
         return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
     };
+    let reentrant = if policy.side_effect == HostedProviderExportSideEffect::DxgInterfaceCallback {
+        let Some(owner) = hosted_provider_object_owner_for_pair(singleton.instance, dependent_index)
+        else {
+            print_str(b"[provider-export] reject stage=dxg-worker-owner\n");
+            return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
+        };
+        if let Err(status) = hosted_provider_export_lane::prepare(
+            singleton.instance, dependent_index, owner, provider_publication_cookie) {
+            print_str(b"[provider-export] reject stage=dxg-worker-prepare status=0x");
+            print_hex(status.raw() as u32);
+            print_str(b"\n");
+            return hosted_provider_export_failure(status.raw() as i32);
+        }
+        let Some(selection) = hosted_provider_export_lane::select(
+            singleton.instance, owner, provider_publication_cookie)
+        else {
+            print_str(b"[provider-export] reject stage=dxg-worker-select\n");
+            return hosted_provider_export_failure(nt_status::NtStatus::DEVICE_BUSY.raw() as i32);
+        };
+        let Some(window) = HostedProviderMarshalWindow::new(
+            selection.component_shared.checked_add(SH_PROVIDER_EXPORT_MARSHAL_BASE)
+                .unwrap_or(0),
+            selection.executive_shared.checked_add(SH_PROVIDER_EXPORT_MARSHAL_BASE)
+                .unwrap_or(0),
+            SH_PROVIDER_EXPORT_MARSHAL_BYTES,
+        ) else { return hosted_provider_export_failure(STATUS_INVALID_PARAMETER); };
+        marshal_window_source.target_exact = Some(window);
+        Some(selection)
+    } else { None };
+    let provider_shared = reentrant.map_or(provider_inst.exec_shared_va, |row| row.executive_shared);
+    let Some(marshal_window) = marshal_window_source.resolve(provider_shared) else {
+        return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
+    };
     let Some(exec_code_va) =
         ExecVaWindow::try_for_instance(singleton.instance).map(|win| win.code_va)
     else {
         return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
     };
-    let provider_shared = provider_inst.exec_shared_va;
-
     let original_args = args;
     trace_hosted_provider_export_frame(
         b"enter",
@@ -30803,7 +31645,8 @@ where
     } else {
         provider_inst.image_frames
     };
-    let mut result = match dispatch(singleton, provider_inst, exec_code_va, &args, caller_rsp) {
+    let mut result = match dispatch(singleton, provider_inst, exec_code_va, &args, caller_rsp,
+        reentrant) {
         Ok(result) => result,
         Err(status) => {
             trace_hosted_provider_export_rejection(
@@ -30831,7 +31674,9 @@ where
         print_str(b" status=0x");
         print_hex(status as u32);
         print_str(b"\n");
-        if policy.side_effect == HostedProviderExportSideEffect::NdisMiniportRegistration
+        if matches!(policy.side_effect,
+            HostedProviderExportSideEffect::NdisMiniportRegistration
+                | HostedProviderExportSideEffect::DxgRegistration)
             && result == STATUS_SUCCESS as u64
         {
             result = status as u32 as u64;
@@ -32855,7 +33700,7 @@ unsafe fn hosted_provider_callback_device_binding(
                 )
             }
         }
-        HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL => inherited,
+        HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL | HOSTED_PROVIDER_CALLBACK_KIND_DXG => inherited,
         _ => return Err(STATUS_INVALID_PARAMETER),
     };
     if inherited.is_some_and(|binding| {
@@ -32967,7 +33812,8 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
         || (record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT
             && record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL
             && record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT_TIMER
-            && record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM)
+            && record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM
+            && record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_DXG)
         || dependent_inst.fault_ep == 0
         || dependent_inst.pml4 == 0
         || dependent_inst.reply_cap == 0
@@ -33346,6 +34192,76 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     exec_code_va,
                     arg0,
                 ),
+                HOSTED_PROVIDER_CALLBACK_KIND_DXG => {
+                    match nt_hosted_runtime::DxgDdiSignature::for_offset(
+                        record.callback_version, record.callback_offset as usize,
+                    ) {
+                        Some(nt_hosted_runtime::DxgDdiSignature::AddDevice) =>
+                            hosted_dxg_registration::service_add_device_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1),
+                        Some(nt_hosted_runtime::DxgDdiSignature::StartDevice) =>
+                            hosted_dxg_registration::service_start_device_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1, arg2,
+                                arg3, stack0),
+                        Some(nt_hosted_runtime::DxgDdiSignature::QueryChildRelations) =>
+                            hosted_dxg_registration::service_query_child_relations_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1, arg2),
+                        Some(nt_hosted_runtime::DxgDdiSignature::StopDevice) =>
+                            hosted_dxg_registration::service_stop_device_callback(
+                                dispatch, provider_inst, record, dependent_inst,
+                                exec_code_va, arg0),
+                        Some(nt_hosted_runtime::DxgDdiSignature::QueryAdapterInfo) =>
+                            hosted_dxg_registration::service_query_adapter_info_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1),
+                        Some(nt_hosted_runtime::DxgDdiSignature::GetStandardAllocationDriverData) =>
+                            hosted_dxg_registration::service_standard_allocation_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1),
+                        Some(nt_hosted_runtime::DxgDdiSignature::CreateAllocation) =>
+                            hosted_dxg_registration::service_create_allocation_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1),
+                        Some(nt_hosted_runtime::DxgDdiSignature::DestroyAllocation) =>
+                            hosted_dxg_registration::service_destroy_allocation_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1),
+                        Some(nt_hosted_runtime::DxgDdiSignature::CreateDevice) =>
+                            hosted_dxg_registration::service_create_device_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1),
+                        Some(nt_hosted_runtime::DxgDdiSignature::DestroyDevice) =>
+                            hosted_dxg_registration::service_destroy_device_callback(
+                                dispatch, provider_inst, record, dependent_inst,
+                                exec_code_va, arg0),
+                        Some(nt_hosted_runtime::DxgDdiSignature::CreateContext) =>
+                            hosted_dxg_registration::service_create_context_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1),
+                        Some(nt_hosted_runtime::DxgDdiSignature::DestroyContext) =>
+                            hosted_dxg_registration::service_destroy_context_callback(
+                                dispatch, provider_inst, record, dependent_inst,
+                                exec_code_va, arg0),
+                        Some(nt_hosted_runtime::DxgDdiSignature::GetNodeMetadata) =>
+                            hosted_dxg_registration::service_get_node_metadata_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1, arg2),
+                        Some(nt_hosted_runtime::DxgDdiSignature::CreateProcess) =>
+                            hosted_dxg_registration::service_create_process_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1),
+                        Some(nt_hosted_runtime::DxgDdiSignature::DestroyProcess) =>
+                            hosted_dxg_registration::service_destroy_process_callback(
+                                dispatch, provider_inst, record, dependent_inst,
+                                exec_code_va, arg0, arg1),
+                        // Each remaining signature needs its own pointer projection.
+                        Some(nt_hosted_runtime::DxgDdiSignature::RemoveDevice)
+                        | None => Err(STATUS_NOT_SUPPORTED),
+                    }
+                }
                 _ => Err(STATUS_NOT_SUPPORTED),
             }
         }
@@ -33457,10 +34373,9 @@ fn register_fsd_trampolines() -> bool {
         "DbgBreakPointWithStatus",
         crate::debug_traps::DbgBreakPointWithStatus as *const () as usize as u64,
     );
-    reg.bind(
-        "KdSystemDebugControl",
-        hosted_kd_debug::s_kd_system_debug_control as *const () as usize as u64,
-    );
+    bind_kd_debug_export(reg);
+    reg.bind("RtlAssert", crate::hosted_driver_assertion::rtl_assert as usize as u64);
+    crate::ex_rundown_exports::bind_ex_rundown_exports(reg);
     // pool (ExAllocatePool* → the FSD arena)
     reg.bind(
         "ExAllocatePoolWithTag",
@@ -33521,6 +34436,10 @@ fn register_fsd_trampolines() -> bool {
         s_rtl_unicode_string_to_integer as *const () as usize as u64,
     );
     reg.bind(
+        "RtlCharToInteger",
+        hosted_driver_rtl_integer::char_to_integer as *const () as usize as u64,
+    );
+    reg.bind(
         "RtlAnsiStringToUnicodeString",
         s_rtl_ansi_string_to_unicode_string as *const () as usize as u64,
     );
@@ -33570,6 +34489,10 @@ fn register_fsd_trampolines() -> bool {
         s_io_create_device as *const () as usize as u64,
     );
     reg.bind(
+        "IoEnumerateDeviceObjectList",
+        hosted_driver_device_enumeration::s_io_enumerate_device_object_list as *const () as usize as u64,
+    );
+    reg.bind(
         "IoCheckShareAccess",
         driver_share_access::check as *const () as usize as u64,
     );
@@ -33606,6 +34529,46 @@ fn register_fsd_trampolines() -> bool {
         s_io_get_device_property as *const () as usize as u64,
     );
     reg.bind(
+        "IoGetDevicePropertyData",
+        hosted_driver_device_property_data::s_io_get_device_property_data as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoSetDevicePropertyData",
+        hosted_driver_device_property_write::set as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoCreateDriver",
+        hosted_driver_create_driver::create as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeQueryActiveProcessors",
+        hosted_driver_processor_mask::query_active_processors as *const () as usize as u64,
+    );
+    reg.bind(
+        "PoCreateThermalRequest",
+        hosted_driver_thermal_request::create as *const () as usize as u64,
+    );
+    reg.bind(
+        "PoGetThermalRequestSupport",
+        hosted_driver_thermal_request::support as *const () as usize as u64,
+    );
+    reg.bind(
+        "PoSetThermalPassiveCooling",
+        hosted_driver_thermal_request::set_passive as *const () as usize as u64,
+    );
+    reg.bind(
+        "PoSetThermalActiveCooling",
+        hosted_driver_thermal_request::set_active as *const () as usize as u64,
+    );
+    reg.bind(
+        "PoDeleteThermalRequest",
+        hosted_driver_thermal_request::delete as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoIs32bitProcess",
+        hosted_driver_process_bitness::io_is_32bit_process as *const () as usize as u64,
+    );
+    reg.bind(
         "IoWMIOpenBlock",
         hosted_wmi::open_block as *const () as usize as u64,
     );
@@ -33618,8 +34581,28 @@ fn register_fsd_trampolines() -> bool {
         s_io_invalidate_device_relations as *const () as usize as u64,
     );
     reg.bind(
+        "IoInvalidateDeviceState",
+        hosted_driver_device_state::invalidate as *const () as usize as u64,
+    );
+    reg.bind(
         "IoRegisterDeviceInterface",
         s_io_register_device_interface as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoRegisterPlugPlayNotification",
+        hosted_driver_pnp_notification::register as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoUnregisterPlugPlayNotification",
+        hosted_driver_pnp_notification::unregister as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoUnregisterPlugPlayNotificationEx",
+        hosted_driver_pnp_notification::unregister_ex as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoGetDeviceInterfaces",
+        hosted_driver_device_interfaces::s_io_get_device_interfaces as *const () as usize as u64,
     );
     reg.bind(
         "IoSetDeviceInterfaceState",
@@ -33759,6 +34742,20 @@ fn register_fsd_trampolines() -> bool {
         "PoSetPowerState",
         s_po_set_power_state as *const () as usize as u64,
     );
+    reg.bind("PoFxRegisterDevice", hosted_driver_pofx::register_device as *const () as usize as u64);
+    reg.bind("PoFxUnregisterDevice", hosted_driver_pofx::unregister_device as *const () as usize as u64);
+    reg.bind("PoFxActivateComponent", hosted_driver_pofx::activate as *const () as usize as u64);
+    reg.bind("PoFxIdleComponent", hosted_driver_pofx::idle as *const () as usize as u64);
+    reg.bind("PoFxSetComponentLatency", hosted_driver_pofx::set_latency as *const () as usize as u64);
+    reg.bind("PoFxSetComponentResidency", hosted_driver_pofx::set_residency as *const () as usize as u64);
+    reg.bind("PoFxCompleteIdleCondition", hosted_driver_pofx::complete_idle_condition as *const () as usize as u64);
+    reg.bind("PoFxCompleteIdleState", hosted_driver_pofx::complete_idle_state as *const () as usize as u64);
+    reg.bind("PoFxCompleteDevicePowerNotRequired", hosted_driver_pofx::complete_device_power_not_required as *const () as usize as u64);
+    reg.bind("PoFxReportDevicePoweredOn", hosted_driver_pofx::report_device_powered_on as *const () as usize as u64);
+    reg.bind("PoFxPowerControl", hosted_driver_pofx::power_control as *const () as usize as u64);
+    reg.bind("PoRegisterPowerSettingCallback", hosted_driver_power_setting::register as *const () as usize as u64);
+    reg.bind("PoUnregisterPowerSettingCallback", hosted_driver_power_setting::unregister as *const () as usize as u64);
+    reg.bind("ZwAllocateLocallyUniqueId", hosted_driver_luid::allocate as *const () as usize as u64);
     reg.bind(
         "IoGetDmaAdapter",
         s_io_get_dma_adapter as *const () as usize as u64,
@@ -33821,12 +34818,28 @@ fn register_fsd_trampolines() -> bool {
         s_mm_map_locked_pages_specify_cache as *const () as usize as u64,
     );
     reg.bind(
+        "MmAllocatePagesForMdlEx",
+        hosted_driver_physical_mdl::mm_allocate_pages_for_mdl_ex as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmCreateMdl",
+        hosted_driver_create_mdl::mm_create_mdl as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmFreePagesFromMdl",
+        hosted_driver_physical_mdl::mm_free_pages_from_mdl as *const () as usize as u64,
+    );
+    reg.bind(
         "MmAllocateContiguousMemorySpecifyCache",
-        s_mm_allocate_contiguous_memory_specify_cache as *const () as usize as u64,
+        hosted_driver_contiguous_memory::mm_allocate_contiguous_memory_specify_cache as *const () as usize as u64,
     );
     reg.bind(
         "MmFreeContiguousMemorySpecifyCache",
-        s_mm_free_contiguous_memory_specify_cache as *const () as usize as u64,
+        hosted_driver_contiguous_memory::mm_free_contiguous_memory_specify_cache as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmFreeContiguousMemory",
+        hosted_driver_contiguous_memory::mm_free_contiguous_memory as *const () as usize as u64,
     );
     reg.bind(
         "MmAllocateNonCachedMemory",
@@ -33843,6 +34856,10 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "MmGetPhysicalAddress",
         s_mm_get_physical_address as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmGetPhysicalMemoryRanges",
+        hosted_driver_physical_ranges::mm_get_physical_memory_ranges as *const () as usize as u64,
     );
     reg.bind(
         "MmUnmapIoSpace",
@@ -33893,8 +34910,60 @@ fn register_fsd_trampolines() -> bool {
         s_io_connect_interrupt as *const () as usize as u64,
     );
     reg.bind(
+        "IoConnectInterruptEx",
+        hosted_driver_interrupt_ex::s_io_connect_interrupt_ex as *const () as usize as u64,
+    );
+    reg.bind(
         "IoDisconnectInterrupt",
         s_io_disconnect_interrupt as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoDisconnectInterruptEx",
+        hosted_driver_interrupt_ex::s_io_disconnect_interrupt_ex as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExGetPreviousMode",
+        hosted_io_create_file_adapter::s_ex_get_previous_mode as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExUuidCreate",
+        hosted_driver_uuid::s_ex_uuid_create as *const () as usize as u64,
+    );
+    reg.bind(
+        "InbvGetGopFrameBufferInfo",
+        hosted_driver_gop::s_inbv_get_gop_frame_buffer_info as *const () as usize as u64,
+    );
+    reg.bind(
+        "InbvHasValidGopFrameBuffer",
+        hosted_driver_gop::s_inbv_has_valid_gop_frame_buffer as *const () as usize as u64,
+    );
+    reg.bind(
+        "InbvNotifyDisplayOwnershipLost",
+        hosted_driver_gop::s_inbv_notify_display_ownership_lost as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExfAcquirePushLockExclusive",
+        hosted_driver_push_lock::acquire_exclusive as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExfAcquirePushLockShared",
+        hosted_driver_push_lock::acquire_shared as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExfReleasePushLockExclusive",
+        hosted_driver_push_lock::release_exclusive as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExfReleasePushLockShared",
+        hosted_driver_push_lock::release_shared as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExfReleasePushLock",
+        hosted_driver_push_lock::release_generic as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExfTryToWakePushLock",
+        hosted_driver_push_lock::try_to_wake as *const () as usize as u64,
     );
     reg.bind(
         "IoCreateSymbolicLink",
@@ -34025,6 +35094,31 @@ fn register_fsd_trampolines() -> bool {
     // CRT / Rtl mem intrinsics (REAL — silent corruption otherwise)
     reg.bind("memcpy", s_memcpy as *const () as usize as u64);
     reg.bind("memmove", s_memmove as *const () as usize as u64);
+    reg.bind("memchr", hosted_driver_crt_memchr::memchr as *const () as usize as u64);
+    reg.bind("strchr", hosted_driver_crt_strchr::strchr as *const () as usize as u64);
+    reg.bind("qsort", hosted_driver_crt_wide_sort::qsort as *const () as usize as u64);
+    reg.bind("wcscmp", hosted_driver_crt_wide_sort::wcscmp as *const () as usize as u64);
+    reg.bind("wcsrchr", hosted_driver_crt_wide_sort::wcsrchr as *const () as usize as u64);
+    reg.bind(
+        "HalConvertDeviceIdtToIrql",
+        hosted_driver_hal_idt_irql::hal_convert_device_idt_to_irql as *const () as usize as u64,
+    );
+    reg.bind(
+        "HalGetInterruptTargetInformation",
+        hosted_driver_hal_target_info::hal_get_interrupt_target_information as *const () as usize as u64,
+    );
+    reg.bind(
+        "HalGetMemoryCachingRequirements",
+        hosted_driver_hal_cache::hal_get_memory_caching_requirements as *const () as usize as u64,
+    );
+    reg.bind(
+        "HalpConfigurePciRootBridge",
+        hosted_driver_pci_root::halp_configure_pci_root_bridge as *const () as usize as u64,
+    );
+    reg.bind(
+        "HalpRegisterPciRouteQuery",
+        hosted_driver_pci_route_query::halp_register_pci_route_query as *const () as usize as u64,
+    );
     reg.bind("RtlCopyMemory", s_memcpy as *const () as usize as u64);
     reg.bind("RtlMoveMemory", s_memmove as *const () as usize as u64);
     reg.bind("memset", s_memset as *const () as usize as u64);
@@ -34051,6 +35145,8 @@ fn register_fsd_trampolines() -> bool {
         "swprintf",
         hosted_swprintf_gate as *const () as usize as u64,
     );
+    reg.bind("_swprintf", hosted_swprintf_gate as *const () as usize as u64);
+    reg.bind("_snwprintf", hosted_snwprintf_gate as *const () as usize as u64);
     reg.bind("_vsnwprintf", s_vsnwprintf as *const () as usize as u64);
     reg.bind("wcslen", s_wcslen as *const () as usize as u64);
     reg.bind("wcsstr", s_wcsstr as *const () as usize as u64);
@@ -34113,8 +35209,20 @@ fn register_fsd_trampolines() -> bool {
     );
     reg.bind("ZwClose", s_zw_close as *const () as usize as u64);
     reg.bind(
+        "ZwCreateDirectoryObject",
+        hosted_driver_directory_object::zw_create_directory_object as *const () as usize as u64,
+    );
+    reg.bind(
+        "ZwCreateEvent",
+        hosted_driver_create_event::zw_create_event as *const () as usize as u64,
+    );
+    reg.bind(
         "ZwLoadDriver",
         hosted_zw_load_driver::s_zw_load_driver as *const () as usize as u64,
+    );
+    reg.bind(
+        "ZwUnloadDriver",
+        hosted_zw_load_driver::s_zw_unload_driver as *const () as usize as u64,
     );
     reg.bind(
         "NtClose",
@@ -34134,6 +35242,7 @@ fn register_fsd_trampolines() -> bool {
         "ZwQueryValueKey",
         s_zw_query_value_key as *const () as usize as u64,
     );
+    reg.bind("ZwQueryKey", hosted_zw_query_key::s_zw_query_key as *const () as usize as u64);
     reg.bind(
         "ZwSetValueKey",
         s_zw_set_value_key as *const () as usize as u64,
@@ -34203,6 +35312,14 @@ fn register_fsd_trampolines() -> bool {
         s_exp_interlocked_pop_entry_slist as *const () as usize as u64,
     );
     reg.bind(
+        "ExpInterlockedFlushSList",
+        s_exp_interlocked_flush_slist as *const () as usize as u64,
+    );
+    reg.bind(
+        "InitializeSListHead",
+        s_initialize_slist_head as *const () as usize as u64,
+    );
+    reg.bind(
         "ExQueueWorkItem",
         s_ex_queue_work_item as *const () as usize as u64,
     );
@@ -34213,23 +35330,39 @@ fn register_fsd_trampolines() -> bool {
     );
     reg.bind(
         "KeInitializeSpinLock",
-        s_ke_initialize_spin_lock as *const () as usize as u64,
+        hosted_driver_spin_lock::initialize as *const () as usize as u64,
     );
     reg.bind(
         "KeAcquireSpinLockRaiseToDpc",
-        s_ke_acquire_spin_lock_raise_to_dpc as *const () as usize as u64,
+        hosted_driver_spin_lock::acquire_raise_to_dpc as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeAcquireInStackQueuedSpinLock",
+        hosted_driver_queued_spin_lock::acquire as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeInvalidateRangeAllCaches",
+        hosted_driver_cache_invalidation::invalidate as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeReleaseInStackQueuedSpinLock",
+        hosted_driver_queued_spin_lock::release as *const () as usize as u64,
     );
     reg.bind(
         "KeAcquireSpinLockAtDpcLevel",
-        s_ke_acquire_spin_lock_at_dpc_level as *const () as usize as u64,
+        hosted_driver_spin_lock::acquire_at_dpc as *const () as usize as u64,
     );
     reg.bind(
         "KeReleaseSpinLock",
-        s_ke_release_spin_lock as *const () as usize as u64,
+        hosted_driver_spin_lock::release_restore_irql as *const () as usize as u64,
     );
     reg.bind(
         "KeReleaseSpinLockFromDpcLevel",
-        s_ke_release_spin_lock_from_dpc_level as *const () as usize as u64,
+        hosted_driver_spin_lock::release_from_dpc as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeTryToAcquireSpinLockAtDpcLevel",
+        hosted_driver_spin_lock::try_acquire_at_dpc as *const () as usize as u64,
     );
     reg.bind(
         "KeGetCurrentIrql",
@@ -34244,6 +35377,18 @@ fn register_fsd_trampolines() -> bool {
         s_ke_initialize_event as *const () as usize as u64,
     );
     reg.bind("KeSetEvent", s_ke_set_event as *const () as usize as u64);
+    reg.bind(
+        "KeSetPriorityThread",
+        hosted_driver_thread_priority::ke_set_priority_thread as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeStackAttachProcess",
+        hosted_driver_process_attach::ke_stack_attach_process as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeUnstackDetachProcess",
+        hosted_driver_process_attach::ke_unstack_detach_process as *const () as usize as u64,
+    );
     reg.bind(
         "KeResetEvent",
         s_ke_reset_event as *const () as usize as u64,
@@ -34310,6 +35455,10 @@ fn register_fsd_trampolines() -> bool {
         s_ke_insert_queue_dpc as *const () as usize as u64,
     );
     reg.bind(
+        "KeRemoveQueueDpc",
+        s_ke_remove_queue_dpc as *const () as usize as u64,
+    );
+    reg.bind(
         "KeFlushQueuedDpcs",
         s_ke_flush_queued_dpcs as *const () as usize as u64,
     );
@@ -34361,14 +35510,10 @@ fn register_fsd_trampolines() -> bool {
         "ExTryToAcquireFastMutex",
         s_ex_try_to_acquire_fast_mutex as *const () as usize as u64,
     );
-    reg.bind(
-        "KeInitializeMutex",
-        s_init_small_struct as *const () as usize as u64,
-    );
-    reg.bind(
-        "KeReleaseMutex",
-        s_ke_release_mutex as *const () as usize as u64,
-    );
+    reg.bind("KeInitializeMutex",
+        hosted_driver_kmutex::initialize as *const () as usize as u64);
+    reg.bind("KeReleaseMutex",
+        hosted_driver_kmutex::release as *const () as usize as u64);
     reg.bind(
         "KeInitializeSemaphore",
         s_ke_initialize_semaphore as *const () as usize as u64,
@@ -34519,6 +35664,46 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "PsGetCurrentProcessId",
         s_ps_get_current_process_id as *const () as usize as u64,
+    );
+    reg.bind(
+        "PsGetProcessId",
+        hosted_driver_process_identity::ps_get_process_id as *const () as usize as u64,
+    );
+    reg.bind(
+        "PsLookupProcessByProcessId",
+        hosted_driver_process_identity::ps_lookup_process_by_process_id as *const () as usize as u64,
+    );
+    reg.bind(
+        "PsGetProcessExitStatus",
+        hosted_driver_process_state::ps_get_process_exit_status as *const () as usize as u64,
+    );
+    reg.bind(
+        "PsGetProcessSessionId",
+        hosted_driver_process_state::ps_get_process_session_id as *const () as usize as u64,
+    );
+    reg.bind(
+        "PsIsSystemProcess",
+        hosted_driver_process_state::ps_is_system_process as *const () as usize as u64,
+    );
+    reg.bind(
+        "PsIsThreadTerminating",
+        hosted_driver_process_state::ps_is_thread_terminating as *const () as usize as u64,
+    );
+    reg.bind(
+        "PsSetCreateProcessNotifyRoutineEx",
+        hosted_driver_process_notify::ps_set_create_process_notify_routine_ex as *const () as usize as u64,
+    );
+    reg.bind(
+        "ObCreateObjectType",
+        hosted_driver_dynamic_type::ob_create_object_type as *const () as usize as u64,
+    );
+    reg.bind(
+        "ObCreateObject",
+        hosted_driver_dynamic_object::ob_create_object as *const () as usize as u64,
+    );
+    reg.bind(
+        "ObInsertObject",
+        hosted_driver_dynamic_object::ob_insert_object as *const () as usize as u64,
     );
     reg.bind(
         "PsGetCurrentThreadId",
@@ -34908,6 +36093,7 @@ unsafe extern "win64" fn fsd_invalid_device_request(_devobj: u64, irp: u64) -> i
             STATUS_INVALID_DEVICE_REQUEST_I32,
         );
         write_unaligned((irp + 0x38) as *mut u64, 0);
+        s_io_complete_request(irp, 0);
     }
     STATUS_INVALID_DEVICE_REQUEST_I32
 }
@@ -35032,32 +36218,36 @@ unsafe fn component_dispatch_video_win32k_callbacks(
 }
 
 unsafe fn component_dispatch_provider_export() -> (i32, u64) {
-    let export_rva = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
+    component_dispatch_provider_export_with_bank(
+        FSD_SHARED_VADDR, core::ptr::addr_of_mut!(BUGCHECK_JB) as *mut u64)
+}
+
+unsafe fn component_dispatch_provider_export_with_bank(shared: u64, jb: *mut u64) -> (i32, u64) {
+    let export_rva = read_volatile((shared + SH_REQ_MINOR) as *const u64);
     let export = match FSD_CODE_VA.checked_add(export_rva) {
         Some(export) => export,
         None => return (STATUS_INVALID_PARAMETER, 0),
     };
-    let arg0 = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
-    let arg1 = read_volatile((FSD_SHARED_VADDR + SH_REQ_INLEN) as *const u64);
-    let arg2 = read_volatile((FSD_SHARED_VADDR + SH_REQ_OUTLEN) as *const u64);
-    let arg3 = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
-    let jb = &mut *core::ptr::addr_of_mut!(BUGCHECK_JB);
-    jb[0] = 0;
-    jb[1] = 0;
-    jb[2] = 0;
+    let arg0 = read_volatile((shared + SH_REQ_FSCTL) as *const u64);
+    let arg1 = read_volatile((shared + SH_REQ_INLEN) as *const u64);
+    let arg2 = read_volatile((shared + SH_REQ_OUTLEN) as *const u64);
+    let arg3 = read_volatile((shared + SH_REQ_FILEID) as *const u64);
+    write_volatile(jb, 0);
+    write_volatile(jb.add(1), 0);
+    write_volatile(jb.add(2), 0);
     let mut args = [0u64; 12];
     args[..4].copy_from_slice(&[arg0, arg1, arg2, arg3]);
     for index in 0..8 {
         args[index + 4] = read_volatile(
-            (FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_STACK_BASE + (index as u64) * 8) as *const u64,
+            (shared + SH_PROVIDER_EXPORT_STACK_BASE + (index as u64) * 8) as *const u64,
         );
     }
-    let boundary = read_volatile((FSD_SHARED_VADDR + SH_SEH_FOREIGN_CALL16_VA) as *const u64);
-    assert_ne!(boundary, 0, "hosted provider export lacks its admitted PE boundary");
-    let result = fsd_guarded_call_vector(export, args.as_ptr(), 12, jb.as_mut_ptr(), boundary);
-    let bugchecked = jb[2] != 0;
-    jb[1] = 0;
-    jb[2] = 0;
+    let boundary = read_volatile((shared + SH_SEH_FOREIGN_CALL16_VA) as *const u64);
+    if boundary == 0 { return (STATUS_INVALID_DEVICE_REQUEST, 0); }
+    let result = fsd_guarded_call_vector(export, args.as_ptr(), 12, jb, boundary);
+    let bugchecked = read_volatile(jb.add(2)) != 0;
+    write_volatile(jb.add(1), 0);
+    write_volatile(jb.add(2), 0);
     if bugchecked {
         return (STATUS_UNSUCCESSFUL, 0);
     }
@@ -35219,6 +36409,9 @@ unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64
     }
     if major == FSD_DISPATCH_DRIVER_REINIT {
         return hosted_driver_reinitialization::component_dispatch();
+    }
+    if major == FSD_DISPATCH_PNP_NOTIFICATION {
+        return hosted_driver_pnp_notification::component_dispatch();
     }
     let request_drv = match read_volatile((FSD_SHARED_VADDR + SH_DRVOBJ) as *const u64) {
         0 => req.drv,
@@ -36705,6 +37898,7 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 minor,
                 IRP_MN_QUERY_RESOURCES
                     | IRP_MN_QUERY_RESOURCE_REQUIREMENTS
+                    | IRP_MN_QUERY_PNP_DEVICE_STATE
                     | IRP_MN_QUERY_BUS_INFORMATION
             ) =>
         {
@@ -37023,7 +38217,8 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     if trace_active_write {
         trace_active_write_call_site(b"before-call", active_seq, file_id, handler, irp);
     }
-    let jb = hosted_class_irp_lane::current_jump_buffer()
+    let jb = hosted_provider_export_lane::current_jump_buffer()
+        .or_else(hosted_class_irp_lane::current_jump_buffer)
         .unwrap_or(core::ptr::addr_of_mut!(BUGCHECK_JB) as *mut u64);
     write_volatile(jb, 0);
     write_volatile(jb.add(1), 0);
@@ -37834,7 +39029,7 @@ fn frames_for_image_len(len: u64) -> Option<u64> {
     Some(align_up_4k(len)? / 0x1000)
 }
 
-const HOSTED_AUXILIARY_PE_PATH: &[u8] = b"reactos\\system32\\nt-seh-linkage.dll";
+const HOSTED_AUXILIARY_PE_PATH: &[u8] = crate::installed_layout::SEH_LINKAGE;
 
 fn hosted_auxiliary_pe(source: &[u8]) -> Option<nt_pe_loader::PeFile<'_>> {
     let pe = nt_pe_loader::PeFile::parse(source).ok()?;
@@ -38353,68 +39548,9 @@ unsafe fn load_pe_into(
         }
     }
 
-    // CR8 transform (documented; the win32k `KeGetCurrentIrql`-cr8 precedent): a kernel driver reads
-    // the current IRQL as `mov %cr8, %reg` — a privileged instruction that #GPs in the component's
-    // usermode context. ReactOS x64 helpers use `44 0f 20 c0; c3` (`mov %cr8,%rax; ret`); expand that
-    // helper in place to `movzx eax, byte ptr [rip+SH_HOSTED_CURRENT_IRQL]; ret`, so DPC delivery can
-    // report DISPATCH_LEVEL while ordinary dispatch remains PASSIVE_LEVEL. Short inline reads that do
-    // not have a helper-sized padding budget are still neutralized to PASSIVE_LEVEL. CR8 writes are
-    // nopped; hosted IRQL transitions are owned by the ntoskrnl import trampolines and DPC pump.
-    {
-        let scan = (size_of_image as u64).min(cap);
-        let mut p = 0u64;
-        while p + 4 <= scan {
-            let b0 = read_unaligned((dst_va + p) as *const u8);
-            let b1 = read_unaligned((dst_va + p + 1) as *const u8);
-            let b2 = read_unaligned((dst_va + p + 2) as *const u8);
-            // REX prefix (0x40..0x4f), then 0F 20 (mov %cr,%reg): if the ModRM names cr8 (reg field
-            // == 0, with REX.R providing the high bit → cr8), rewrite to xor eax,eax; nop; nop.
-            if (b0 & 0xF0) == 0x40 && b1 == 0x0F && b2 == 0x20 {
-                let modrm = read_unaligned((dst_va + p + 3) as *const u8);
-                // ModRM = 11 000 rrr (reg field 000 = crN, rm = dest GPR). REX.R (b0 & 4) selects cr8.
-                if (modrm & 0xC0) == 0xC0 && (modrm & 0x38) == 0x00 {
-                    if (b0 & 0x04) != 0
-                        && modrm == 0xC0
-                        && p + 8 <= scan
-                        && read_unaligned((dst_va + p + 4) as *const u8) == 0xC3
-                    {
-                        let target = FSD_SHARED_VADDR + SH_HOSTED_CURRENT_IRQL;
-                        let next_rip = run_va + p + 7;
-                        let disp = target as i64 - next_rip as i64;
-                        if disp >= i32::MIN as i64 && disp <= i32::MAX as i64 {
-                            let d = disp as u32;
-                            write_unaligned((dst_va + p) as *mut u8, 0x0F); // movzx eax, byte ptr [rip+disp32]
-                            write_unaligned((dst_va + p + 1) as *mut u8, 0xB6);
-                            write_unaligned((dst_va + p + 2) as *mut u8, 0x05);
-                            write_unaligned((dst_va + p + 3) as *mut u8, d as u8);
-                            write_unaligned((dst_va + p + 4) as *mut u8, (d >> 8) as u8);
-                            write_unaligned((dst_va + p + 5) as *mut u8, (d >> 16) as u8);
-                            write_unaligned((dst_va + p + 6) as *mut u8, (d >> 24) as u8);
-                            write_unaligned((dst_va + p + 7) as *mut u8, 0xC3); // ret
-                            p += 8;
-                            continue;
-                        }
-                    }
-                    write_unaligned((dst_va + p) as *mut u8, 0x31); // xor
-                    write_unaligned((dst_va + p + 1) as *mut u8, 0xC0); // eax,eax
-                    write_unaligned((dst_va + p + 2) as *mut u8, 0xB0); // mov al,
-                    write_unaligned((dst_va + p + 3) as *mut u8, PASSIVE_LEVEL);
-                    p += 4;
-                    continue;
-                }
-            }
-            // 0F 22 (mov %reg,%cr): a KeRaise/LowerIrql write to cr8 → neutralize to nops (3 bytes;
-            // an optional REX makes it 4). Rewrite the 0F 22 ModRM triple to nops.
-            if b0 == 0x0F && b1 == 0x22 {
-                write_unaligned((dst_va + p) as *mut u8, 0x90);
-                write_unaligned((dst_va + p + 1) as *mut u8, 0x90);
-                write_unaligned((dst_va + p + 2) as *mut u8, 0x90);
-                p += 3;
-                continue;
-            }
-            p += 1;
-        }
-    }
+    // Inline CR8 reads and writes stay in the immutable driver image. Their #GP
+    // is decoded at the authenticated fault boundary, where the stopped lane's
+    // source-owned IRQL is projected and the original Reply is retained.
 
     // Seed a valid /GS cookie when the image declares one through the PE load-config directory.
     // MSVC's GsDriverEntry wrapper fastfails with int 0x29 if this is left at the CRT default.
@@ -38951,6 +40087,8 @@ unsafe fn load_driver_reserved(
             .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     }
     initialize_hosted_driver_data_exports(win.data_va);
+    hosted_driver_process_state::initialize_data_cells(win.data_va)
+        .map_err(|status| nt_status::NtStatus(status as i32))?;
 
     // 3. Parse + copy + relocate + IAT-patch (HEAP-FREE, records W^X rights). Load bytes into the
     //    per-instance executive window (code_va) but relocate for the component execution VA (run_va).
@@ -39231,6 +40369,20 @@ unsafe fn load_driver_reserved(
             print_str(b"[driver-launch] primary route enrollment failed\n");
             nt_status::NtStatus::UNSUCCESSFUL
         })?;
+    unsafe {
+        hosted_driver_process_notify::publish_image(instance, primary_run_va, u64::from(image_len))
+            .map_err(|status| nt_status::NtStatus(status as i32))?;
+        if let Some(images) = (&*core::ptr::addr_of!(HOSTED_DEP_IMAGES)).as_ref() {
+            for image in images.iter().filter(|image| image.present) {
+                hosted_driver_process_notify::publish_image(
+                    instance,
+                    image.run_va,
+                    u64::from(image.image_len),
+                )
+                .map_err(|status| nt_status::NtStatus(status as i32))?;
+            }
+        }
+    }
     if !hosted_pretransport_retirement::transport_registered(instance) {
         panic!("hosted driver pre-transport ownership handoff failed");
     }
@@ -39398,7 +40550,7 @@ unsafe fn load_driver_reserved(
             instance,
             image_len,
         );
-        if planned_images.primary_offset == 0 && planned_images.dependencies.is_empty() {
+        if planned_images.primary_offset == 0 {
             let Some(singleton_image_frames) = frames_for_image_len(image_len as u64) else {
                 return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
             };
@@ -39941,6 +41093,22 @@ impl ObjectManagerPort for ExecutiveObjectManagerPort {
             }
             None => Ok(ObjectId::NULL),
         }
+    }
+
+    fn publish_device_endpoint(
+        &mut self,
+        object: ObjectId,
+        endpoint: &NtPath,
+        owner_local_id: u64,
+    ) -> Result<ObjectId, nt_status::NtStatus> {
+        // Native unnamed PDOs have no Object Manager object until an interface exposes one.
+        // An already published object needs an exact alias operation; never create a second.
+        if object != ObjectId::NULL {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        let path = Self::ascii_path(endpoint)?;
+        unsafe { crate::object_manager_create_device_path(
+            &path, IO_MANAGER_COMPONENT_ID, owner_local_id).map(ObjectId) }
     }
 
     fn delete_device_object(
@@ -44867,6 +46035,7 @@ pub(crate) fn pump_hosted_io_completions() -> usize {
         .saturating_add(unsafe { drain_hosted_device_retirements() })
         .saturating_add(unsafe { hosted_add_device_rollback::drain() })
         .saturating_add(unsafe { drain_hosted_pnp_completions() })
+        .saturating_add(unsafe { hosted_driver_device_state::drain() })
         .saturating_add(unsafe { drain_hosted_filter_requirements_transactions() })
         .saturating_add(unsafe { drain_hosted_device_relation_query() })
         .saturating_add(unsafe { drain_hosted_acpi_pci_route_query() })
@@ -46888,7 +48057,7 @@ pub(crate) fn probe_kernel_volume_file(device_path: &str) -> bool {
         return false;
     };
     let client = ClientId(IO_MANAGER_COMPONENT_ID);
-    let name = nt_types::UnicodeString::from_str("reactos\\Fonts\\arial.ttf");
+    let name = nt_types::UnicodeString::from_str(crate::installed_layout::ARIAL_STR);
     let Ok(file) = io_manager_mut().allocate_external_file(
         client,
         device,
@@ -47132,34 +48301,22 @@ unsafe fn shared_path_ascii_at<const N: usize>(
 }
 
 fn hosted_device_interface_target(pdo_device_id: u64) -> Result<NtPath, nt_status::NtStatus> {
-    let mut current =
-        io_manager_mut().top_of_device_stack(nt_io_manager::DeviceId(pdo_device_id))?;
-    let limit = io_manager_mut().device_count().saturating_add(1);
-    let mut depth = 0usize;
-    while depth < limit {
-        let (name, lower, delete_pending) = {
-            let device = io_manager_mut()
-                .device(current)
-                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-            (
-                device.name.clone(),
-                device.attached_to,
-                device.delete_pending,
-            )
-        };
-        if delete_pending {
-            return Err(nt_status::NtStatus::DELETE_PENDING);
-        }
-        if let Some(name) = name {
-            return Ok(name);
-        }
-        let Some(next) = lower else {
-            return Err(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND);
-        };
-        current = next;
-        depth += 1;
+    let pdo = nt_io_manager::DeviceId(pdo_device_id);
+    let device = io_manager_mut()
+        .device(pdo)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if device.delete_pending {
+        return Err(nt_status::NtStatus::DELETE_PENDING);
     }
-    Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+    if let Some(name) = &device.name {
+        return Ok(name.clone());
+    }
+    // The caller has already authenticated the live PDO and its PnP devnode. Interface links
+    // name that PDO, even when its WDM DeviceObject has no name. DeviceId includes generation.
+    let endpoint = alloc::format!(r"\Device\PnpInterface{:016X}", pdo_device_id);
+    let endpoint = parse_nt_path(&endpoint).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    io_manager_mut().publish_device_interface_endpoint(pdo, &endpoint)?;
+    Ok(endpoint)
 }
 
 unsafe fn set_hosted_device_interface_state(
@@ -47201,6 +48358,11 @@ unsafe fn set_hosted_device_interface_state(
     {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
+    hosted_driver_pnp_notification::set_hosted_device_interface_state(
+        registration.class_guid,
+        registration.symbolic_link,
+        enable,
+    )?;
     slot.enabled = enable;
     Ok(())
 }
@@ -54565,6 +55727,28 @@ pub(crate) unsafe fn win32k_pdo_driver_key_property_snapshot(
     Ok(value)
 }
 
+/// Copy the instance path only while this projected PDO still owns the same PnP incarnation.
+pub(crate) unsafe fn win32k_pdo_instance_path(
+    device: nt_io_manager::DeviceId,
+    expected: nt_pnp_manager::DevnodeIdentity,
+) -> Result<String, i32> {
+    let pnp = hosted_pnp_manager_mut();
+    if pnp.devnode_identity_for_pdo(device.raw()) != Some(expected) {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    let source = pnp
+        .instance_id(expected.devnode_id())
+        .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+    let mut path = String::new();
+    path.try_reserve_exact(source.len())
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    path.push_str(source);
+    if pnp.devnode_identity_for_pdo(device.raw()) != Some(expected) {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    Ok(path)
+}
+
 pub(crate) fn service_hosted_device(
     ch: &crate::spawn_hosts::PumpChannel,
     op: u64,
@@ -54604,8 +55788,28 @@ pub(crate) fn service_hosted_device(
             | HOSTED_DEVICE_OP_START_NEXT_PACKET
             | HOSTED_DEVICE_OP_START_NEXT_PACKET_CALLBACK_RETURNED
             | HOSTED_DEVICE_OP_REGISTER_DRIVER_REINIT
+            | HOSTED_DEVICE_OP_GET_INTERFACE_BEGIN
+            | HOSTED_DEVICE_OP_GET_INTERFACE_PULL
+            | HOSTED_DEVICE_OP_GET_INTERFACE_ABORT
+            | HOSTED_DEVICE_OP_INVALIDATE_STATE
+            | HOSTED_DEVICE_OP_CONTIGUOUS_PREPARE
+            | HOSTED_DEVICE_OP_CONTIGUOUS_COMMIT
+            | HOSTED_DEVICE_OP_CONTIGUOUS_FREE
+            | HOSTED_DEVICE_OP_CONTIGUOUS_EXPIRE
+            | HOSTED_DEVICE_OP_CONTIGUOUS_PHYSICAL
+            | HOSTED_DEVICE_OP_CONTIGUOUS_MAP
+            | HOSTED_DEVICE_OP_CONTIGUOUS_UNMAP
     ) {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+    }
+    if matches!(op, HOSTED_DEVICE_OP_CONTIGUOUS_PREPARE
+        | HOSTED_DEVICE_OP_CONTIGUOUS_COMMIT | HOSTED_DEVICE_OP_CONTIGUOUS_FREE
+        | HOSTED_DEVICE_OP_CONTIGUOUS_EXPIRE
+        | HOSTED_DEVICE_OP_CONTIGUOUS_PHYSICAL
+        | HOSTED_DEVICE_OP_CONTIGUOUS_MAP
+        | HOSTED_DEVICE_OP_CONTIGUOUS_UNMAP) {
+        return hosted_contiguous_ram_broker::service(ch, op, pdo_object, arg2, arg3,
+            active_reply_cap, caller_badge);
     }
     if op == HOSTED_DEVICE_OP_REPORT_POWER_STATE {
         return hosted_power_broker::service_report(
@@ -54615,6 +55819,15 @@ pub(crate) fn service_hosted_device(
             arg3,
             active_reply_cap,
             caller_badge,
+        );
+    }
+    if matches!(op,
+        HOSTED_DEVICE_OP_GET_INTERFACE_BEGIN
+            | HOSTED_DEVICE_OP_GET_INTERFACE_PULL
+            | HOSTED_DEVICE_OP_GET_INTERFACE_ABORT
+    ) {
+        return hosted_driver_device_interfaces::service(
+            ch, op, pdo_object, arg2, arg3, caller_badge, active_reply_cap,
         );
     }
     if op == HOSTED_DEVICE_OP_REGISTER_DRIVER_REINIT {
@@ -54630,6 +55843,12 @@ pub(crate) fn service_hosted_device(
             0,
             0,
         );
+    }
+    if op == HOSTED_DEVICE_OP_INVALIDATE_STATE {
+        if arg2 != 0 || arg3 != 0 {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
+        return (hosted_driver_device_state::enqueue(ch, pdo_object, active_reply_cap), 0, 0, 0);
     }
     if matches!(
         op,
@@ -56449,6 +57668,18 @@ pub(crate) unsafe fn hosted_io_port_fault_grant(
     })
 }
 
+pub(crate) unsafe fn hosted_legacy_vga_port_fault_grant(
+    channel: &crate::spawn_hosts::PumpChannel,
+    active_reply_cap: u64,
+    port: u16,
+    read: bool,
+    width_bits: u8,
+) -> Option<HostedIoPortFaultGrant> {
+    hosted_driver_gop::legacy_vga_port_fault_grant(
+        channel, active_reply_cap, port, read, width_bits,
+    )
+}
+
 pub(crate) unsafe fn refresh_hosted_resource_state_for_shared(shared_va: u64) {
     let pdo_object = read_volatile((shared_va + SH_RESOURCE_PDO_OBJECT) as *const u64);
     let interrupt_id = read_volatile((shared_va + SH_RESOURCE_INTERRUPT_ID) as *const u64);
@@ -57165,6 +58396,7 @@ struct HostedDriverThreadRuntime {
 #[derive(Clone, Copy)]
 struct HostedWorkerSharedBankSpec {
     offset: u64,
+    frames: u64,
     arg_offset: Option<u64>,
 }
 
@@ -57196,12 +58428,17 @@ struct HostedDriverRawWaiter {
     thread_handle: u64,
     reply_cap: u64,
     objects: Vec<u64>,
+    event_projection_leases: Vec<hosted_driver_event_reference::EventProjectionWaitLease>,
+    keys: Vec<Option<nt_kernel_exec::hosted_kmutex::KmutexKey>>,
+    owner_body: u64,
     wait_all: bool,
     api_multiple: bool,
     deadline: nt_kernel_exec::Deadline,
     sequence: u64,
     shared: HostedDriverSharedWait,
     wake_status: Option<i32>,
+    delivery: nt_hosted_runtime::HostedEventWaitDelivery,
+    reply_retry_at: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -57385,7 +58622,8 @@ fn hosted_driver_caller(
         }
         PhysicalSourceKind::DispatchWorker { ordinal } => {
             let runtime = unsafe { hosted_source_completion_lane::worker(instance, ordinal)
-                .or_else(|| hosted_class_irp_lane::worker(instance, ordinal))? };
+                .or_else(|| hosted_class_irp_lane::worker(instance, ordinal))
+                .or_else(|| hosted_provider_export_lane::worker(instance, ordinal))? };
             if runtime.domain != domain || runtime.tcb != source.tcb
                 || runtime.pml4 != source.pml4 || runtime.ingress_route != Some(route)
             { return None; }
@@ -57437,7 +58675,8 @@ fn clear_hosted_driver_threads_for_instance(instance: usize) {
                 .and_then(|rows| rows.get(index)).copied();
             let Some(runtime) = runtime.filter(|runtime| runtime.instance == instance) else { continue; };
             if !hosted_source_completion_lane::begin_worker_retirement(instance, runtime.handle)
-                || !hosted_class_irp_lane::begin_worker_retirement(instance, runtime.handle) {
+                || !hosted_class_irp_lane::begin_worker_retirement(instance, runtime.handle)
+                || !hosted_provider_export_lane::begin_worker_retirement(instance, runtime.handle) {
                 continue;
             }
             let _ = hosted_driver_thread_table_mut(instance).and_then(|table| {
@@ -57448,6 +58687,7 @@ fn clear_hosted_driver_threads_for_instance(instance: usize) {
             if hosted_thread_resources::retire_thread(instance, runtime.handle) {
                 hosted_source_completion_lane::finish_worker_retirement(instance, runtime.handle);
                 hosted_class_irp_lane::finish_worker_retirement(instance, runtime.handle);
+                hosted_provider_export_lane::finish_worker_retirement(instance, runtime.handle);
             }
         }
     }
@@ -57562,12 +58802,19 @@ unsafe fn hosted_driver_device_lifetime_quiesced(
     let property_transfers_quiesced = (*core::ptr::addr_of!(HOSTED_DEVICE_PROPERTY_TRANSFERS))
         .as_ref()
         .is_none_or(|transfers| !transfers.domain_busy(domain));
+    let interface_queries_quiesced =
+        hosted_driver_device_interfaces::transfers_quiesced(domain);
     bindings_quiesced
         && hosted_add_device_rollback::lifetime_quiesced(instance, driver_id, domain)
         && retirements_quiesced
         && interfaces_quiesced
         && resource_maps_quiesced
         && property_transfers_quiesced
+        && interface_queries_quiesced
+        && unsafe { hosted_driver_device_state::retire_domain(domain) }
+        && hosted_driver_pnp_notification::quiesced(domain)
+        && hosted_driver_pofx::quiesced(domain)
+        && hosted_driver_kmutex::quiesced(domain)
 }
 
 fn hosted_driver_thread_error_status(error: HostedDriverThreadError) -> i32 {
@@ -57995,6 +59242,50 @@ unsafe fn reserve_instance_executable_thunk(
     })
 }
 
+/// Reserve a callback table as one unpublished unit. A short table never
+/// exposes a partially projected DDI table to the provider.
+unsafe fn reserve_instance_executable_thunk_batch(
+    instance_index: usize,
+    keys: &[HostedThunkSlotKey],
+) -> Result<Vec<HostedExecutableThunkReservation>, i32> {
+    let Some(inst) = instance(instance_index) else {
+        return Err(STATUS_DEVICE_NOT_READY);
+    };
+    if !inst.used || inst.exec_thunk_va == 0 || inst.run_thunk_va == 0 || inst.thunk_len == 0 {
+        return Err(STATUS_DEVICE_NOT_READY);
+    }
+    let dynamic_slots = inst.thunk_len
+        .checked_div(HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN)
+        .and_then(|slots| slots.checked_sub(inst.thunk_next))
+        .ok_or(STATUS_INVALID_PARAMETER)?
+        .min(HOSTED_EXECUTABLE_THUNK_SLOT_COUNT as u64) as usize;
+    inst.exec_thunk_va.checked_add(inst.thunk_len).ok_or(STATUS_INVALID_PARAMETER)?;
+    inst.run_thunk_va.checked_add(inst.thunk_len).ok_or(STATUS_INVALID_PARAMETER)?;
+    let mut acquired = Vec::new();
+    acquired.try_reserve_exact(keys.len()).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    acquired.resize(keys.len(), None);
+    let mut reservations = Vec::new();
+    reservations.try_reserve_exact(keys.len()).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    ensure_driver_instance_thunk_slots(instance_index)
+        .reserve_batch_with_limit(keys, &mut acquired, dynamic_slots)
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    for (key, item) in keys.iter().copied().zip(acquired.into_iter()) {
+        let (token, existing) = match item.expect("complete thunk batch") {
+            HostedThunkReservation::Existing(token) => (token, true),
+            HostedThunkReservation::Reserved(token) => (token, false),
+        };
+        let thunk_index = inst.thunk_next + token.index as u64;
+        let thunk_offset = thunk_index * HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN;
+        reservations.push(HostedExecutableThunkReservation {
+            token, key,
+            exec_va: inst.exec_thunk_va + thunk_offset,
+            run_va: inst.run_thunk_va + thunk_offset,
+            thunk_index, existing,
+        });
+    }
+    Ok(reservations)
+}
+
 unsafe fn commit_instance_executable_thunk(
     instance_index: usize,
     reservation: HostedExecutableThunkReservation,
@@ -58070,6 +59361,11 @@ pub(crate) struct HostedVideoRouteInfo {
 }
 
 fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
+    if unsafe { instance(i).is_some_and(|inst| hosted_driver_pci_route_query::blocks_instance_retirement(inst))
+        || hosted_driver_process_notify::blocks_instance_retirement(i)
+        || hosted_driver_dynamic_type::blocks_instance_retirement(i) } {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     if let Some(inst) = instance(i) {
         if instance_domain_identity(inst).is_some_and(|domain| unsafe {
             hosted_video_caller_aperture::blocks_domain_retirement(
@@ -58188,6 +59484,10 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
     if let Some(domain) = retiring_domain {
         unsafe {
             hosted_device_property_transfers_mut().remove_domain(domain);
+            hosted_driver_device_interfaces::retire_domain(domain);
+            hosted_driver_pnp_notification::retire_domain(domain);
+            hosted_driver_pofx::retire_domain(domain);
+            hosted_driver_kmutex::retire_domain(domain);
         }
     }
     if let Some(domain) = retiring_domain {
@@ -58242,6 +59542,8 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
             let mut dependency_failures = 0u64;
             let mut singleton_failures = 0u64;
             shadow_failures += clear_hosted_provider_callback_parents_for_instance(i, domain);
+            shadow_failures += hosted_dxg_registration::retire_pdo_aliases_for_instance(i, domain);
+            shadow_failures += hosted_dxg_registration::retire_for_instance(i, domain);
             shadow_failures += clear_hosted_provider_pointer_allocations_for_instance(i, domain);
             shadow_failures += clear_hosted_provider_ndis_shadows_for_instance(i, domain);
             shadow_failures +=
@@ -58304,6 +59606,22 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
             print_str(b" failures=");
             print_u64(irq_lane_failures);
             print_str(b"\n");
+        }
+    }
+    if !teardown_blocked {
+        if let (Some(domain), Some(inst)) = (retiring_domain, instance(i)) {
+            if unsafe { !hosted_driver_runtime_quiesced(i) } {
+                teardown_blocked = true;
+            } else if let Err(status) = unsafe {
+                hosted_driver_gop::retire_hosted_gop_projection(i, domain, inst.pml4)
+            } {
+                teardown_blocked = true;
+                print_str(b"[driver-launch] GOP BAR alias retirement blocked inst=");
+                print_u64(i as u64);
+                print_str(b" status=0x");
+                print_hex(status.raw() as u32);
+                print_str(b"\n");
+            }
         }
     }
     if unsafe { !driver_instance_thunk_slots_are_free(i) } {
@@ -58383,6 +59701,9 @@ fn finish_instance_physical_release(
     i: usize,
     inst: DriverInstance,
 ) -> Result<(), nt_status::NtStatus> {
+    if !unsafe { hosted_contiguous_ram_broker::retire_instance(i, inst) } {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     if !hosted_device_allocations::instance_quiesced(inst) {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
@@ -58406,6 +59727,10 @@ fn finish_instance_physical_release(
             return Err(status);
         }
         hosted_exception_images::retire(i, domain);
+    }
+    unsafe {
+        hosted_driver_process_notify::retire_instance_images(i)
+            .map_err(|status| nt_status::NtStatus(status as i32))?;
     }
     let t = unsafe { driver_instances_mut() };
     if i < t.len() {
@@ -58594,7 +59919,8 @@ fn instance_for_pump_channel(
 ) -> Option<(usize, DriverInstance)> {
     let (instance, inst) = instance_by_shared_va(ch.shared_va)
         .or_else(|| unsafe { hosted_source_completion_lane::instance_for_shared(ch.shared_va) })
-        .or_else(|| unsafe { hosted_class_irp_lane::instance_for_shared(ch.shared_va) })?;
+        .or_else(|| unsafe { hosted_class_irp_lane::instance_for_shared(ch.shared_va) })
+        .or_else(|| unsafe { hosted_provider_export_lane::instance_for_shared(ch.shared_va) })?;
     let captured = nt_io_manager::HostedTransportIdentity {
         domain: ch.physical_domain?,
         endpoint: ch.fault_ep,
@@ -58611,7 +59937,9 @@ fn instance_for_pump_channel(
         hosted_source_completion_lane::matches_channel(instance, inst, ch)
     };
     let class_lane = unsafe { hosted_class_irp_lane::matches_channel(instance, inst, ch) };
-    if (!captured.matches_live(live) && !completion_lane && !class_lane) || active_reply_cap == 0 {
+    let provider_lane = unsafe { hosted_provider_export_lane::matches_channel(instance, inst, ch) };
+    if (!captured.matches_live(live) && !completion_lane && !class_lane && !provider_lane)
+        || active_reply_cap == 0 {
         return None;
     }
     let route =
@@ -60076,7 +61404,8 @@ fn service_hosted_irp_bank_pull(
     let Some((_instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
         return STATUS_INVALID_PARAMETER;
     };
-    let arg = unsafe { hosted_class_irp_lane::executive_arg_for_shared(ch.shared_va) }
+    let arg = unsafe { hosted_provider_export_lane::executive_arg_for_shared(ch.shared_va) }
+        .or_else(|| unsafe { hosted_class_irp_lane::executive_arg_for_shared(ch.shared_va) })
         .unwrap_or(inst.exec_arg_va);
     if arg == 0 {
         return STATUS_INVALID_PARAMETER;
@@ -60135,7 +61464,8 @@ pub(crate) fn service_hosted_irp_output_push(
     let Some((_instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
         return STATUS_INVALID_PARAMETER;
     };
-    let arg = unsafe { hosted_class_irp_lane::executive_arg_for_shared(ch.shared_va) }
+    let arg = unsafe { hosted_provider_export_lane::executive_arg_for_shared(ch.shared_va) }
+        .or_else(|| unsafe { hosted_class_irp_lane::executive_arg_for_shared(ch.shared_va) })
         .unwrap_or(inst.exec_arg_va);
     if arg == 0 {
         return STATUS_INVALID_PARAMETER;
@@ -60644,6 +61974,27 @@ pub(crate) unsafe fn service_hosted_query_path_forward(
     }
 }
 
+pub(crate) unsafe fn service_hosted_internal_control_forward(
+    ch: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    operation: u64,
+    address: u64,
+    irp: u64,
+) -> Option<(i32, bool)> {
+    match operation {
+        1 => hosted_internal_control_work::submit(ch, irp, address, badge, reply_cap)
+            .map(|status| (status, false)),
+        2 if irp == 0 => hosted_internal_control_work::acknowledge(ch, reply_cap, badge, address)
+            .map(|status| (status, false)),
+        _ => Some((STATUS_INVALID_PARAMETER, false)),
+    }
+}
+
+pub(crate) unsafe fn redrive_hosted_internal_control_forward(handler: *mut ExecNtHandler) {
+    hosted_internal_control_work::redrive(handler);
+}
+
 pub(crate) unsafe fn redrive_hosted_query_path_forward(handler: *mut ExecNtHandler) {
     hosted_query_path_work::redrive(handler);
     hosted_create_subject_registration::redrive_terminal();
@@ -60934,6 +62285,14 @@ pub(crate) unsafe fn nested_hosted_query_path_ready() -> bool {
     hosted_query_path_work::nested_work_ready()
 }
 
+pub(crate) unsafe fn nested_hosted_internal_control_ready() -> bool {
+    hosted_internal_control_work::nested_work_ready()
+}
+
+pub(crate) unsafe fn redrive_nested_hosted_internal_control(handler: *mut ExecNtHandler) -> bool {
+    hosted_internal_control_work::redrive_nested_ready(handler)
+}
+
 pub(crate) unsafe fn redrive_nested_hosted_query_path(handler: *mut ExecNtHandler) -> bool {
     hosted_query_path_work::redrive_nested_ready(handler)
 }
@@ -61064,7 +62423,24 @@ fn service_hosted_driver_registry_sync(
                 )
             }
             HOSTED_REGISTRY_OP_CLOSE => {
-                finish_driver_registry_close(ch, close_driver_registry_handle(caller, a1))
+                let registry_close = close_driver_registry_handle(caller, a1);
+                if matches!(
+                    &registry_close,
+                    Err(nt_process::native_handle::NativePsCloseError::Status(
+                        nt_process::native_handle::STATUS_OBJECT_TYPE_MISMATCH
+                    ))
+                ) {
+                    let handler = match crate::service_sec_image::registry_live_handler_pointer() {
+                        Ok(handler) => handler,
+                        Err(status) => return (status as i32, 0, 0),
+                    };
+                    return match (&mut *handler).close_native_table_handle(caller, a1) {
+                        Ok(true) => (STATUS_SUCCESS, 0, 0),
+                        Ok(false) => (STATUS_INVALID_HANDLE, 0, 0),
+                        Err(status) => (status as i32, 0, 0),
+                    };
+                }
+                finish_driver_registry_close(ch, registry_close)
             }
             HOSTED_REGISTRY_OP_ENUMERATE_KEY => {
                 let Ok(slot) = driver_registry_handle_slot(caller, a1, 8) else {
@@ -61126,6 +62502,9 @@ fn service_hosted_driver_registry_sync(
             }
             HOSTED_REGISTRY_OP_ENUMERATE_VALUE => {
                 hosted_zw_enumerate_value_key::service(caller, arg, a1, a2, a3)
+            }
+            HOSTED_REGISTRY_OP_QUERY_KEY => {
+                hosted_zw_query_key::service(caller, arg, a1, a2)
             }
             HOSTED_REGISTRY_OP_QUERY_HANDLE_VALUE => {
                 let Ok(slot) = driver_registry_handle_slot(caller, a1, 1) else {
@@ -61330,13 +62709,10 @@ unsafe fn spawn_hosted_driver_worker_thread_with_shared_bank(
     let kpcr_exec_va = exec_base.checked_add(FSD_WORKER_KPCR_OFFSET)?;
     let shared_bank = match shared_bank_spec {
         Some(spec) => {
-            if spec.offset & 0xfff != 0
-                || spec.offset < FSD_WORKER_KPCR_OFFSET.checked_add(0x1000)?
-                || spec.offset.checked_add(0x1000)? > FSD_WORKER_STRIDE
-                || spec.arg_offset.is_some_and(|arg| arg & 0xfff != 0
-                    || arg < spec.offset + 0x1000
-                    || arg.checked_add(FSD_ARG_FRAMES * 0x1000)
-                        .is_none_or(|end| end > FSD_WORKER_STRIDE))
+            if spec.offset < FSD_WORKER_KPCR_OFFSET.checked_add(0x1000)?
+                || nt_hosted_runtime::HostedWorkerBankLayout::new(
+                    spec.offset, spec.frames, spec.arg_offset, FSD_ARG_FRAMES,
+                    FSD_WORKER_STRIDE).is_none()
             {
                 return None;
             }
@@ -61349,8 +62725,11 @@ unsafe fn spawn_hosted_driver_worker_thread_with_shared_bank(
         }
         None => None,
     };
-    let additional_resources = (if shared_bank.is_some() { 2 } else { 0 })
-        + (if shared_bank.is_some_and(|bank| bank.arg_component.is_some()) { 16 } else { 0 });
+    let additional_resources = shared_bank_spec.map_or(Some(0usize), |spec|
+        usize::try_from(spec.frames).ok()?.checked_mul(4))?
+        .checked_add(if shared_bank.is_some_and(|bank| bank.arg_component.is_some()) {
+            (FSD_ARG_FRAMES as usize) * 4
+        } else { 0 })?;
 
     let domain = instance_domain_identity(inst)?;
     let Some(construction) =
@@ -61416,23 +62795,23 @@ unsafe fn spawn_hosted_driver_worker_thread_with_shared_bank(
     }
 
     if let Some(bank) = shared_bank {
-        let frame = alloc_frame();
-        hosted_thread_resources::root(construction, frame);
-        let executive_frame = copy_cap(frame);
-        hosted_thread_resources::root(construction, executive_frame);
-        hosted_thread_resources::mapping(construction, frame);
-        if page_map_r(frame, bank.component, RW_NX, inst.pml4) != 0 { return None; }
-        hosted_thread_resources::mapping(construction, executive_frame);
-        if page_map_r(
-            executive_frame,
-            bank.executive,
-            RW_NX,
-            CAP_INIT_THREAD_VSPACE,
-        ) != 0
-        {
-            return None;
+        let frames = shared_bank_spec.expect("mapped bank retains its checked specification").frames;
+        for page in 0..frames {
+            let frame = alloc_frame();
+            hosted_thread_resources::root(construction, frame);
+            let executive_frame = copy_cap(frame);
+            hosted_thread_resources::root(construction, executive_frame);
+            hosted_thread_resources::mapping(construction, frame);
+            if page_map_r(frame, bank.component + page * 0x1000, RW_NX, inst.pml4) != 0 {
+                return None;
+            }
+            hosted_thread_resources::mapping(construction, executive_frame);
+            if page_map_r(executive_frame, bank.executive + page * 0x1000,
+                RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+                return None;
+            }
+            core::ptr::write_bytes((bank.executive + page * 0x1000) as *mut u8, 0, 0x1000);
         }
-        core::ptr::write_bytes(bank.executive as *mut u8, 0, 0x1000);
         if let (Some(component_arg), Some(executive_arg)) =
             (bank.arg_component, bank.arg_executive) {
             for page in 0..FSD_ARG_FRAMES {
@@ -61588,10 +62967,23 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
         }
         return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
     };
+    let key = instance_domain_identity(inst)
+        .and_then(|domain| hosted_driver_kmutex::key_for(domain, exec_object));
+    if unsafe { read_unaligned(exec_object as *const u8) } == 2 && key.is_none() {
+        return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
+    }
+    let owner_body = if key.is_some() {
+        match hosted_driver_kmutex::owner_body(ch, inst) {
+            Some(owner) => owner,
+            None => return HostedDriverWaitServiceResult::Reply(STATUS_ACCESS_DENIED),
+        }
+    } else { 0 };
     unsafe {
-        match hosted_dispatcher_ready(exec_object) {
+        match hosted_dispatcher_ready_for(exec_object, key, thread_handle) {
             Ok(true) => {
-                hosted_dispatcher_consume(exec_object);
+                if !hosted_dispatcher_consume_for(exec_object, key, thread_handle, owner_body) {
+                    return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
+                }
                 HOSTED_DRIVER_WAIT_SINGLE_READY.fetch_add(1, Ordering::Relaxed);
                 HostedDriverWaitServiceResult::Reply(STATUS_SUCCESS)
             }
@@ -61615,12 +63007,19 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
                     return HostedDriverWaitServiceResult::Reply(STATUS_INSUFFICIENT_RESOURCES);
                 }
                 objects.push(exec_object);
+                let mut keys = Vec::new();
+                if keys.try_reserve_exact(1).is_err() {
+                    return HostedDriverWaitServiceResult::Reply(STATUS_INSUFFICIENT_RESOURCES);
+                }
+                keys.push(key);
                 let Some(parked) = park_hosted_driver_wait(
                     instance,
                     thread_handle,
                     caller.route,
                     active_reply_cap,
                     objects,
+                    keys,
+                    owner_body,
                     false,
                     false,
                     deadline,
@@ -61726,6 +63125,10 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
         HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS.fetch_add(1, Ordering::Relaxed);
         return HostedDriverWaitServiceResult::Reply(STATUS_INSUFFICIENT_RESOURCES);
     }
+    let mut keys = Vec::new();
+    if keys.try_reserve_exact(count as usize).is_err() {
+        return HostedDriverWaitServiceResult::Reply(STATUS_INSUFFICIENT_RESOURCES);
+    }
     let mut index = 0u32;
     while index < count {
         let component_object =
@@ -61750,9 +63153,21 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
             }
             return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
         };
+        let key = instance_domain_identity(inst)
+            .and_then(|domain| hosted_driver_kmutex::key_for(domain, exec_object));
+        if unsafe { read_unaligned(exec_object as *const u8) } == 2 && key.is_none() {
+            return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
+        }
         objects.push(exec_object);
+        keys.push(key);
         index += 1;
     }
+    let owner_body = if keys.iter().any(Option::is_some) {
+        match hosted_driver_kmutex::owner_body(ch, inst) {
+            Some(owner) => owner,
+            None => return HostedDriverWaitServiceResult::Reply(STATUS_ACCESS_DENIED),
+        }
+    } else { 0 };
 
     let wait_all = wait_type == 0;
     if wait_all && hosted_driver_wait_all_has_duplicate(&objects) {
@@ -61761,9 +63176,10 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
     }
 
     unsafe {
-        match hosted_dispatcher_wait_ready(&objects, wait_all) {
+        match hosted_dispatcher_wait_ready(&objects, &keys, thread_handle, wait_all) {
             Ok(Some(status)) => {
-                if !hosted_dispatcher_wait_consume(&objects, wait_all, status) {
+                if !hosted_dispatcher_wait_consume(&objects, &keys,
+                    thread_handle, owner_body, wait_all, status) {
                     HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS.fetch_add(1, Ordering::Relaxed);
                     return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
                 }
@@ -61790,6 +63206,8 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
                     caller.route,
                     active_reply_cap,
                     objects,
+                    keys,
+                    owner_body,
                     wait_all,
                     true,
                     deadline,
@@ -62045,6 +63463,67 @@ unsafe fn queue_hosted_driver_dpc(
     Ok(queued)
 }
 
+/// Remove the exact root queue entry before clearing its provider-visible KDPC projection.
+/// The descriptor address is translated only through this instance's retained mappings.
+pub(crate) unsafe fn remove_hosted_driver_dpc(
+    instance_index: usize,
+    owner: Option<HostedDpcOwner>,
+    dpc: u64,
+) -> Result<bool, nt_status::NtStatus> {
+    let inst = instance(instance_index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    let domain = instance_domain_identity(inst).ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let exec_dpc = hosted_driver_component_object_exec_va(instance_index, inst, dpc, KDPC_SIZE)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let projected = read_unaligned((exec_dpc + KDPC_QUEUED_OFFSET) as *const u8) != 0;
+    let Some(owner) = owner else {
+        return if projected { Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST) } else { Ok(false) };
+    };
+    if owner.domain_id != domain.domain_id.raw()
+        || owner.domain_cookie != domain.cookie
+        || hosted_irq_lane_generation(instance_index, domain) != Some(owner.lane_generation)
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let table = hosted_dpcs_mut();
+    let snapshot = table.snapshot_registered(owner, dpc).map_err(hosted_dpc_status)?;
+    let queued = snapshot.is_some_and(|snapshot| snapshot.queued);
+    if queued != projected {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    if !queued {
+        return Ok(false);
+    }
+    let removed = table.remove_registered(owner, dpc).map_err(hosted_dpc_status)?;
+    if !removed {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    write_unaligned((exec_dpc + KDPC_QUEUED_OFFSET) as *mut u8, 0);
+    Ok(true)
+}
+
+pub(crate) fn service_hosted_driver_remove_dpc(
+    ch: &crate::spawn_hosts::PumpChannel,
+    dpc: u64,
+    active_reply_cap: u64,
+    caller_badge: u64,
+) -> (i32, u64) {
+    let Some((instance_index, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        return (STATUS_INVALID_PARAMETER, 0);
+    };
+    if hosted_driver_caller(instance_index, inst, caller_badge).is_none() {
+        return (STATUS_INVALID_PARAMETER, 0);
+    }
+    let owner = unsafe {
+        instance_domain_identity(inst)
+            .and_then(|domain| hosted_irq_lane_generation(instance_index, domain)
+                .and_then(|generation| HostedDpcOwner::new(domain.domain_id.raw(), domain.cookie, generation)))
+    };
+    match unsafe { remove_hosted_driver_dpc(instance_index, owner, dpc) } {
+        Ok(removed) => (STATUS_SUCCESS, removed as u64),
+        Err(status) => (status.raw(), 0),
+    }
+}
+
 pub(crate) fn service_hosted_driver_queue_dpc(
     ch: &crate::spawn_hosts::PumpChannel,
     dpc: u64,
@@ -62244,6 +63723,19 @@ pub(crate) fn service_hosted_driver_ke_release_semaphore(
     previous
 }
 
+/// A worker can exit while its creating PsCreateSystemThread reply is still
+/// pending. Once that reply's handle has been delivered or withdrawn, retry
+/// retirement from the exact table exit receipt and wake ETHREAD waiters.
+unsafe fn retry_exited_hosted_system_thread_after_publication(instance: usize, handle: u64) {
+    let exited = (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_TABLES)).as_ref()
+        .and_then(|tables| tables.get(instance))
+        .and_then(|table| table.get(handle))
+        .is_some_and(|thread| thread.exit_status.is_some());
+    if exited && hosted_thread_resources::retire_thread(instance, handle) {
+        let _ = wake_hosted_driver_waiters_for_instance(instance);
+    }
+}
+
 pub(crate) fn service_hosted_driver_ps_create_system_thread(
     ch: &crate::spawn_hosts::PumpChannel,
     start_routine: u64,
@@ -62263,6 +63755,13 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
         HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
         return (STATUS_INVALID_HANDLE, 0);
     }
+    let creator = match unsafe { crate::provider_registry_caller::resolve(ch) } {
+        Ok(caller) => caller,
+        Err(status) => {
+            HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return (status as i32, 0);
+        }
+    };
     let Some(domain) = instance_domain_identity(inst) else {
         HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
         return (STATUS_INVALID_HANDLE, 0);
@@ -62369,11 +63868,37 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
             sched_context: spawn.sched_context,
         });
     }
+    let runtime = unsafe {
+        *hosted_driver_thread_runtimes_mut().last()
+            .expect("newly retained system thread runtime")
+    };
+    let public_handle = match unsafe { hosted_thread_resources::publish_object(runtime, creator) } {
+        Ok(handle) => handle,
+        Err(status) => {
+            unsafe {
+                if hosted_thread_resources::retire(spawn.construction, false) {
+                    hosted_driver_thread_runtimes_mut().pop();
+                    if let Some(table) = hosted_driver_thread_table_mut(instance) {
+                        let _ = table.remove(handle);
+                    }
+                }
+            }
+            HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return (status as i32, 0);
+        }
+    };
     unsafe { hosted_thread_resources::enter_shared(spawn.construction, spawn.reply_cap); }
     let route = match unsafe { hosted_ingress_sources::enroll_system_thread(instance, handle, spawn.reply_cap) } {
         Ok(route) => route,
         Err(_) => {
             // Partial aliases, Reply and physical worker stay with their retained owners.
+            if let Err(status) = unsafe {
+                hosted_thread_resources::withdraw_unreturned_public_handle(runtime, creator, public_handle)
+            } {
+                print_str(b"[driver-thread] retained undelivered handle after enrollment failure status=0x");
+                print_hex(status);
+                print_str(b"\n");
+            }
             HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
             HOSTED_DRIVER_SYSTEM_THREAD_SPAWN_FAILURES.fetch_add(1, Ordering::Relaxed);
             return (STATUS_INSUFFICIENT_RESOURCES, 0);
@@ -62388,10 +63913,31 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
         route, spawn.cnode, spawn.sched_context,
     ) }.is_err() {
         // Resume may have entered. No replay, deletion or Reply reuse is permitted here.
+        if let Err(status) = unsafe {
+            hosted_thread_resources::withdraw_unreturned_public_handle(runtime, creator, public_handle)
+        } {
+            print_str(b"[driver-thread] retained undelivered handle after uncertain start status=0x");
+            print_hex(status);
+            print_str(b"\n");
+        } else {
+            unsafe { retry_exited_hosted_system_thread_after_publication(instance, handle); }
+        }
         HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
         HOSTED_DRIVER_SYSTEM_THREAD_SPAWN_FAILURES.fetch_add(1, Ordering::Relaxed);
         return (STATUS_INSUFFICIENT_RESOURCES, 0);
     }
+    if !unsafe { hosted_thread_resources::deliver_public_handle(runtime, public_handle) } {
+        if let Err(status) = unsafe {
+            hosted_thread_resources::withdraw_unreturned_public_handle(runtime, creator, public_handle)
+        } {
+            print_str(b"[driver-thread] retained undelivered handle after publication mismatch status=0x");
+            print_hex(status);
+            print_str(b"\n");
+        }
+        HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        return (STATUS_INVALID_HANDLE, 0);
+    }
+    unsafe { retry_exited_hosted_system_thread_after_publication(instance, handle); }
     HOSTED_DRIVER_SYSTEM_THREAD_SPAWNS.fetch_add(1, Ordering::Relaxed);
     if request <= 8 {
         print_str(b"[driver-thread] PsCreateSystemThread request inst=");
@@ -62415,7 +63961,7 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
         print_u64(route.badge());
         print_str(b"\n");
     }
-    (STATUS_SUCCESS, handle)
+    (STATUS_SUCCESS, public_handle)
 }
 
 pub(crate) fn service_hosted_source_irp_lifetime(
@@ -62465,19 +64011,25 @@ pub(crate) fn service_hosted_driver_ps_get_current_thread_id(
         };
     }
     let result = unsafe { crate::provider_registry_caller::resolve(ch).and_then(|caller| {
-        if matches!(selector, 1 | 2 | 5) {
+        if matches!(selector, 1 | 2 | 5 | 6) {
             crate::service_sec_image::with_provider_process_manager(|pm| {
                 pm.validate_native_handle_caller(caller)?;
                 let thread = caller.original_thread();
-                    Ok((
-                        u64::from(thread.process_id()),
-                        u64::from(thread.thread_id()),
-                        0,
-                        0,
-                        pm.thread(thread.thread_id())
+                let process = if selector == 6 {
+                    u64::from(pm.process_wow64_pointer(thread.process_id())? != 0)
+                } else { 0 };
+                let teb = if selector == 5 {
+                    pm.thread(thread.thread_id())
                             .ok_or(nt_process::STATUS_INVALID_HANDLE)?
-                            .teb_base,
-                    ))
+                            .teb_base
+                } else { 0 };
+                Ok((
+                    u64::from(thread.process_id()),
+                    u64::from(thread.thread_id()),
+                    process,
+                    0,
+                    teb,
+                ))
             })
         } else { driver_ps_context::project(inst, caller) }
     }) };
@@ -62485,7 +64037,8 @@ pub(crate) fn service_hosted_driver_ps_get_current_thread_id(
         Ok((pid, tid, process, thread, teb)) => match selector {
             1 => (STATUS_SUCCESS, tid), 2 => (STATUS_SUCCESS, pid),
             3 => (STATUS_SUCCESS, thread), 4 => (STATUS_SUCCESS, process),
-            5 => (STATUS_SUCCESS, teb), _ => (STATUS_INVALID_PARAMETER, 0),
+            5 => (STATUS_SUCCESS, teb), 6 => (STATUS_SUCCESS, process),
+            _ => (STATUS_INVALID_PARAMETER, 0),
         },
         Err(status) => (status as i32, 0),
     }
@@ -62539,7 +64092,9 @@ pub(crate) fn service_hosted_driver_ps_terminate_system_thread(
     unsafe {
         // Stop/retirement owns the nonreturning Call and every installed alias. Even a failed
         // stop remains retained; neither this service nor its pump deletes the active Reply.
-        let _ = hosted_thread_resources::retire_thread(instance, runtime.handle);
+        if hosted_thread_resources::retire_thread(instance, runtime.handle) {
+            let _ = wake_hosted_driver_waiters_for_instance(instance);
+        }
     }
     HOSTED_DRIVER_SYSTEM_THREAD_TERMINATIONS.fetch_add(1, Ordering::Relaxed);
     if request <= 16 {

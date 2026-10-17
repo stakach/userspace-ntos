@@ -45,6 +45,93 @@ pub mod exports;
 /// See [`security_exports`].
 pub mod security_exports;
 
+/// Private-namespace boundary descriptor construction and SID ownership.
+pub mod boundary;
+
+/// Process-local USER client procedure tables registered by the released user32.dll.
+pub mod user_pfn;
+
+/// Native performance counter wrappers used by the released kernel32.dll.
+pub mod performance;
+
+/// The released kernel32's precise NT system-time query.
+pub mod system_time_precise;
+
+/// Shared-data interrupt clock and native dynamic time-zone query.
+pub mod time_exports;
+
+/// Named PE export lookup used by the released WOW64 support libraries.
+pub mod find_exported_routine;
+
+/// Released loader ABI entries backed by the process module table or explicit failure.
+pub mod loader_extra;
+
+/// Writable ntdll loader entry table for released WOW64 bootstrap consumers.
+pub mod loader_init_block;
+
+/// Explicit unsupported entries declared as stubs by the reference source spec.
+pub mod source_declared_stubs;
+
+/// Bounds-checked CRT string helpers exported by the released DLL.
+pub mod safe_strings;
+
+/// No-CRT floating-point, formatting, scanning, and nonlocal state exports.
+pub mod crt_math;
+pub mod crt_printf_safe;
+pub mod crt_scan;
+pub mod crt_state;
+
+/// Intrusive dynamic hash-table ABI with process-heap-owned buckets.
+pub mod hash_table;
+
+/// UTF-8, system-time, and security-error compatibility entries.
+pub mod misc_rtl_exports;
+
+/// Growable unwind tables and extended x64 context operations.
+pub mod context_function_exports;
+
+/// Additional token, SID, and security helpers.
+pub mod security_sid_extra;
+
+/// Remaining registry, heap, locale, and platform export ABI entries.
+pub mod remaining_misc_exports;
+
+/// Source-checked ALPC, WNF, CFG, heap flush, and fault-label ABI entries.
+pub mod release_tail_exports;
+
+/// Query whether a process handle names the current process.
+pub mod current_process;
+
+/// Native architecture queries and WOW64 cross-process work-list ABI.
+pub mod wow64;
+
+/// The x64 ntdll thread entry used by the released kernel32.dll.
+pub mod user_thread_start;
+
+/// Extended processor-state feature query from the mapped NT shared-data page.
+pub mod extended_features;
+
+/// Process MUI overrides and the native NLS locale-file mapping used by kernelbase.
+pub mod locale_exports;
+
+/// UTF-16 normalization and IDN ABI entries used by the released kernelbase.
+pub mod unicode_normalization;
+
+/// Process-local address waits backed by native thread-alert syscalls.
+pub mod wait_address;
+
+/// Work callback ownership and cancellation state, separately host-testable.
+mod threadpool_state;
+
+/// Object threadpool work exports on the existing native completion-port worker.
+pub mod threadpool;
+
+/// Fail-closed Tp ABI entries awaiting native timer, wait, IO, ALPC, and pool ownership.
+pub mod threadpool_unavailable;
+
+/// Windows x64 extended-context ABI over the currently supported legacy context.
+pub mod extended_context;
+
 /// Step 4.B — the on-target IN-PROCESS loader drive (real heap + import snap). See [`on_target`].
 #[cfg(target_arch = "x86_64")]
 pub mod on_target;
@@ -1275,6 +1362,72 @@ static KEEP_EXPORTS: unsafe extern "C" fn() = exports::EXPORT_ANCHOR_FN;
 #[used]
 static KEEP_SECURITY_EXPORTS: unsafe extern "C" fn() = security_exports::SECURITY_EXPORT_ANCHOR_FN;
 
+#[used]
+static KEEP_BOUNDARY_EXPORTS: unsafe extern "C" fn() = boundary::BOUNDARY_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_USER_PFN_EXPORTS: unsafe extern "C" fn() = user_pfn::USER_PFN_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_PERFORMANCE_EXPORTS: unsafe extern "C" fn() = performance::PERFORMANCE_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_WAIT_ADDRESS_EXPORTS: unsafe extern "C" fn() = wait_address::WAIT_ADDRESS_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_UNICODE_NORMALIZATION_EXPORTS: unsafe extern "C" fn() =
+    unicode_normalization::UNICODE_NORMALIZATION_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_SYSTEM_TIME_PRECISE_EXPORTS: unsafe extern "C" fn() =
+    system_time_precise::SYSTEM_TIME_PRECISE_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_TIME_EXPORTS: unsafe extern "C" fn() = time_exports::TIME_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_CONTEXT_FUNCTION_EXPORTS: unsafe extern "C" fn() =
+    context_function_exports::CONTEXT_FUNCTION_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_REMAINING_MISC_EXPORTS: unsafe extern "C" fn() =
+    remaining_misc_exports::REMAINING_MISC_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_RELEASE_TAIL_EXPORTS: unsafe extern "C" fn() =
+    release_tail_exports::RELEASE_TAIL_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_FIND_EXPORTED_ROUTINE: unsafe extern "C" fn() =
+    find_exported_routine::FIND_EXPORTED_ROUTINE_ANCHOR_FN;
+
+#[used]
+static KEEP_LOADER_EXTRA_EXPORTS: unsafe extern "C" fn() =
+    loader_extra::LOADER_EXTRA_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_SOURCE_DECLARED_STUBS: unsafe extern "C" fn() =
+    source_declared_stubs::SOURCE_STUB_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_SAFE_STRINGS: unsafe extern "C" fn() = safe_strings::SAFE_STRINGS_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_CURRENT_PROCESS: unsafe extern "C" fn() =
+    current_process::CURRENT_PROCESS_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_USER_THREAD_START_EXPORTS: unsafe extern "C" fn() =
+    user_thread_start::USER_THREAD_START_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_EXTENDED_FEATURES_EXPORTS: unsafe extern "C" fn() =
+    extended_features::EXTENDED_FEATURES_EXPORT_ANCHOR_FN;
+
+#[used]
+static KEEP_EXTENDED_CONTEXT_EXPORTS: unsafe extern "C" fn() =
+    extended_context::EXTENDED_CONTEXT_EXPORT_ANCHOR_FN;
+
 /// Anchor private on-target entrypoints that are still discovered dynamically from ntdll exports.
 #[used]
 static KEEP_ON_TARGET_EXPORTS: unsafe extern "C" fn() = on_target::ON_TARGET_EXPORT_ANCHOR_FN;
@@ -1322,6 +1475,9 @@ pub unsafe extern "C" fn LdrpInitialize(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
+        if !ntdll_base.is_null() {
+            loader_init_block::install(ntdll_base as usize);
+        }
         let peb: u64;
         unsafe {
             core::arch::asm!(
@@ -1486,16 +1642,19 @@ pub unsafe extern "system" fn DllMainCRTStartup(
     unsafe { DllMain(module, reason, reserved) }
 }
 
-/// `DllMain` — present so the linker does not pull in the CRT's `_DllMainCRTStartup`. Returns TRUE.
+/// `DllMain` — publishes the loaded ntdll base and bootstrap entries on process attach.
 ///
 /// # Safety
-/// The standard `DllMain` contract; a no-op that reports success.
+/// The standard `DllMain` contract; reports success after local data publication.
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DllMain(
-    _module: *mut c_void,
-    _reason: u32,
+    module: *mut c_void,
+    reason: u32,
     _reserved: *mut c_void,
 ) -> i32 {
+    if reason == 1 {
+        loader_init_block::install(module as usize);
+    }
     1 // TRUE
 }
 

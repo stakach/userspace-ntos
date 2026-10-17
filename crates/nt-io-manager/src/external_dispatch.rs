@@ -938,6 +938,40 @@ impl<P> IoManager<P> {
         Ok(file.driver_context)
     }
 
+    /// Ask the exact live provider whether a captured File can be paged from immutable bytes.
+    /// The answer is tied to canonical File and device generations plus the CREATE-returned
+    /// context; a filter/changed stack or an unrecognised provider yields no attestation.
+    pub fn immutable_file_extent(
+        &self,
+        client: ClientId,
+        file_id: FileId,
+        device_id: DeviceId,
+        file_context: u64,
+    ) -> Result<Option<u64>, NtStatus> {
+        let file = self.file(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
+        if file.client_id != client
+            || file.device_id != device_id
+            || file.driver_context != Some(file_context)
+            || !file.state.is_open()
+        {
+            return Err(NtStatus::INVALID_HANDLE);
+        }
+        if self.top_of_device_stack(device_id)? != device_id {
+            return Ok(None);
+        }
+        let device = self.device(device_id).ok_or(NtStatus::INVALID_HANDLE)?;
+        let driver = self.driver(device.driver_id).ok_or(NtStatus::INVALID_HANDLE)?;
+        let Some(backend) = driver
+            .dispatch
+            .get(nt_io_abi::major::IRP_MJ_READ)
+            .kernel_id()
+            .and_then(|id| self.backends.get(id.0 as usize))
+        else {
+            return Ok(None);
+        };
+        Ok(backend.immutable_file_extent(file_id, file_context))
+    }
+
     /// Build one IRP for `device_id`, route it through the owning driver's
     /// dispatch table, and return either its synchronous result or the canonical
     /// id retained for asynchronous completion.

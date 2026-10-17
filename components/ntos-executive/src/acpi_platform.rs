@@ -167,6 +167,7 @@ pub(crate) const ACPI_ROOT_HARDWARE_ID: &str = r"ACPI_HAL\PNP0C08";
 pub(crate) const ACPI_ROOT_COMPATIBLE_ID: &str = r"*PNP0C08";
 const ACPI_ROOT_ENUM_PATH: &str =
     r"\Registry\Machine\System\CurrentControlSet\Enum\ACPI_HAL\PNP0C08\0";
+const DRIVER_DATABASE_PATH: &str = r"\Registry\Machine\System\DriverDatabase";
 
 #[derive(Clone, Copy)]
 struct ClaimedDeviceRegion {
@@ -906,25 +907,185 @@ fn encode_registry_multi_sz(values: &[&str]) -> Result<Vec<u8>, nt_status::NtSta
     Ok(encoded)
 }
 
+struct AcpiRootRegistryPolicy {
+    mount_generation: u64,
+    class_guid: alloc::string::String,
+    service_name: alloc::string::String,
+}
+
+fn registry_string_value(
+    snapshot: &nt_config_client::HiveKeySnapshot,
+    name: &str,
+) -> Result<alloc::string::String, nt_status::NtStatus> {
+    let value = snapshot
+        .values
+        .iter()
+        .find(|value| value.name.eq_ignore_ascii_case(name))
+        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    if value.value_type != nt_config_manager::RegistryValueType::Sz as u32
+        || value.data.len() < 4
+        || value.data.len() % 2 != 0
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let mut units = Vec::new();
+    units
+        .try_reserve_exact(value.data.len() / 2)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    for pair in value.data.chunks_exact(2) {
+        units.push(u16::from_le_bytes([pair[0], pair[1]]));
+    }
+    if units.pop() != Some(0) || units.contains(&0) {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let text = alloc::string::String::from_utf16(&units)
+        .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+    if text.is_empty() {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    Ok(text)
+}
+
+fn driver_package_class_guid(
+    snapshot: &nt_config_client::HiveKeySnapshot,
+) -> Result<alloc::string::String, nt_status::NtStatus> {
+    let version = snapshot
+        .values
+        .iter()
+        .find(|value| value.name.eq_ignore_ascii_case("Version"))
+        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    // DriverDatabase\DriverPackages\<package>\Version stores the setup-class GUID in
+    // little-endian GUID layout after its eight-byte header.
+    if version.value_type != nt_config_manager::RegistryValueType::Binary as u32
+        || version.data.len() < 24
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let guid = &version.data[8..24];
+    Ok(alloc::format!(
+        "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+        u32::from_le_bytes(guid[0..4].try_into().unwrap()),
+        u16::from_le_bytes(guid[4..6].try_into().unwrap()),
+        u16::from_le_bytes(guid[6..8].try_into().unwrap()),
+        guid[8],
+        guid[9],
+        guid[10],
+        guid[11],
+        guid[12],
+        guid[13],
+        guid[14],
+        guid[15]
+    ))
+}
+
+/// Modern SYSTEM hives publish install policy in DriverDatabase rather than the older
+/// CriticalDeviceDatabase. Follow the exact device-ID -> INF -> package descriptor ->
+/// configuration chain, and reject ambiguous package matches instead of guessing a service.
+unsafe fn acpi_root_driver_database_policy(
+    expected_generation: u64,
+) -> Result<AcpiRootRegistryPolicy, nt_status::NtStatus> {
+    let device_path = alloc::format!(
+        r"{}\DeviceIds\{}",
+        DRIVER_DATABASE_PATH,
+        ACPI_ROOT_COMPATIBLE_ID
+    );
+    let device = config_manager_query_system_hive_key(&device_path).map_err(nt_status::NtStatus)?;
+    let packages_path = alloc::format!(r"{}\DriverPackages", DRIVER_DATABASE_PATH);
+    let packages =
+        config_manager_query_system_hive_key(&packages_path).map_err(nt_status::NtStatus)?;
+    if device.mount_generation != expected_generation
+        || packages.mount_generation != expected_generation
+    {
+        return Err(nt_status::NtStatus(0xC000_0059u32 as i32));
+    }
+    let mut selected = None;
+    for inf in &device.values {
+        if inf.value_type != nt_config_manager::RegistryValueType::Binary as u32
+            || inf.data.is_empty()
+            || inf.name.is_empty()
+        {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        for package in &packages.subkeys {
+            let name = package.name.as_str();
+            if !name
+                .get(..inf.name.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&inf.name))
+                || name.as_bytes().get(inf.name.len()) != Some(&b'_')
+            {
+                continue;
+            }
+            let package_path = alloc::format!(r"{}\{}", packages_path, name);
+            let descriptor_path =
+                alloc::format!(r"{}\Descriptors\{}", package_path, ACPI_ROOT_COMPATIBLE_ID);
+            let descriptor = match config_manager_query_system_hive_key(&descriptor_path) {
+                Ok(snapshot) => snapshot,
+                Err(status)
+                    if status as u32 == nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.raw() as u32 =>
+                {
+                    continue
+                }
+                Err(status) => return Err(nt_status::NtStatus(status)),
+            };
+            if descriptor.mount_generation != expected_generation {
+                return Err(nt_status::NtStatus(0xC000_0059u32 as i32));
+            }
+            let configuration = registry_string_value(&descriptor, "Configuration")?;
+            let config_path = alloc::format!(r"{}\Configurations\{}", package_path, configuration);
+            let config =
+                config_manager_query_system_hive_key(&config_path).map_err(nt_status::NtStatus)?;
+            let package =
+                config_manager_query_system_hive_key(&package_path).map_err(nt_status::NtStatus)?;
+            if config.mount_generation != expected_generation
+                || package.mount_generation != expected_generation
+            {
+                return Err(nt_status::NtStatus(0xC000_0059u32 as i32));
+            }
+            let policy = AcpiRootRegistryPolicy {
+                mount_generation: expected_generation,
+                class_guid: driver_package_class_guid(&package)?,
+                service_name: registry_string_value(&config, "Service")?,
+            };
+            if selected.replace(policy).is_some() {
+                return Err(nt_status::NtStatus::INVALID_PARAMETER);
+            }
+        }
+    }
+    selected.ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)
+}
+
+unsafe fn acpi_root_registry_policy(
+    expected_generation: u64,
+) -> Result<AcpiRootRegistryPolicy, nt_status::NtStatus> {
+    if let Some(binding) = config_manager_query_critical_device_binding(ACPI_ROOT_COMPATIBLE_ID)
+        .map_err(nt_status::NtStatus)?
+    {
+        let service_name = binding
+            .service_name
+            .filter(|service| !service.is_empty())
+            .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+        if binding.class_guid.is_empty() {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        return Ok(AcpiRootRegistryPolicy {
+            mount_generation: binding.mount_generation,
+            class_guid: binding.class_guid,
+            service_name,
+        });
+    }
+    acpi_root_driver_database_policy(expected_generation)
+}
+
 /// Publish the firmware-discovered ACPI root identity through normal CriticalDeviceDatabase
 /// policy before the boot-driver launch snapshot is taken. No service name is embedded here.
 pub(crate) unsafe fn publish_acpi_root_devnode_from_registry_policy(
 ) -> Result<(), nt_status::NtStatus> {
     let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
-    let policy = config_manager_query_critical_device_binding(ACPI_ROOT_COMPATIBLE_ID)
-        .map_err(nt_status::NtStatus)?
-        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    let policy = acpi_root_registry_policy(expected_generation)?;
     if policy.mount_generation != expected_generation {
         return Err(nt_status::NtStatus(0xC000_0059u32 as i32));
     }
-    let service = policy
-        .service_name
-        .as_deref()
-        .filter(|service| !service.is_empty())
-        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
-    if policy.class_guid.is_empty() {
-        return Err(nt_status::NtStatus::INVALID_PARAMETER);
-    }
+    let service = policy.service_name.as_str();
     let existing = match config_manager_query_system_hive_key(ACPI_ROOT_ENUM_PATH) {
         Ok(snapshot) => Some(snapshot),
         Err(status) if status as u32 == nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.raw() as u32 => {
@@ -932,7 +1093,10 @@ pub(crate) unsafe fn publish_acpi_root_devnode_from_registry_policy(
         }
         Err(status) => return Err(nt_status::NtStatus(status)),
     };
-    if existing.as_ref().is_some_and(|snapshot| snapshot.mount_generation != expected_generation) {
+    if existing
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.mount_generation != expected_generation)
+    {
         return Err(nt_status::NtStatus(0xC000_0059u32 as i32));
     }
     let hardware = encode_registry_multi_sz(&[ACPI_ROOT_HARDWARE_ID])?;
@@ -1028,7 +1192,10 @@ pub(crate) unsafe fn publish_acpi_root_devnode_from_registry_policy(
         &mutations,
     )
     .map_err(|status| nt_status::NtStatus(status as i32))?;
-    assert_eq!(outcome.generation, expected_generation + 1,
-        "ACPI root CM ACK returned the wrong generation");
+    assert_eq!(
+        outcome.generation,
+        expected_generation + 1,
+        "ACPI root CM ACK returned the wrong generation"
+    );
     Ok(())
 }

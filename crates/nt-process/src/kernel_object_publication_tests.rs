@@ -26,6 +26,20 @@ fn distinct_processes_cannot_publish_the_same_body() {
 }
 
 #[test]
+fn process_session_query_requires_the_exact_published_eprocess() {
+    let (mut pm, [first, second], _) = objects();
+    pm.set_process_session_id(first, 1).unwrap();
+    pm.set_process_session_id(second, 2).unwrap();
+    assert!(pm.kernel_process_state(0x1000).is_none());
+    assert!(pm.publish_process_kernel_object(first, 0x1000));
+    assert!(pm.publish_process_kernel_object(second, 0x2000));
+    assert_eq!(pm.kernel_process_state(0x1000).unwrap().session_id, 1);
+    assert_eq!(pm.kernel_process_state(0x2000).unwrap().session_id, 2);
+    assert!(pm.kernel_process_state(first as u64).is_none());
+    assert!(pm.kernel_process_state(0x1001).is_none());
+}
+
+#[test]
 fn distinct_threads_cannot_publish_the_same_body() {
     let (mut pm, _, [first, second]) = objects();
     assert!(pm.publish_thread_kernel_object(first, 0x1000));
@@ -221,4 +235,67 @@ fn pair_cannot_republish_withdrawn_objects_or_reuse_their_reserved_bodies() {
     }
     pm.finish_process_object_retirement(retirement).unwrap();
     assert!(pm.publish_kernel_object_pair(next, 0x1000, 0x2000));
+}
+
+#[test]
+fn job_body_shares_process_and_thread_pointer_namespace() {
+    let (mut pm, [first, second], [first_tid, second_tid]) = objects();
+    let job = pm.create_job(0).unwrap();
+    assert!(pm.publish_process_kernel_object(first, 0x1000));
+    assert!(pm.publish_thread_kernel_object(first_tid, 0x2000));
+    assert!(!pm.publish_job_kernel_object(job, 0x1000));
+    assert!(!pm.publish_job_kernel_object(job, 0x2000));
+    assert_eq!(pm.job_kernel_object(job), None);
+
+    assert!(pm.publish_job_kernel_object(job, 0x3000));
+    assert_eq!(pm.job_kernel_object(job), Some(0x3000));
+    assert_eq!(pm.job_for_kernel_object(0x3000), Some(job));
+    assert!(!pm.publish_process_kernel_object(second, 0x3000));
+    assert!(!pm.publish_thread_kernel_object(second_tid, 0x3000));
+    assert_eq!(pm.process_kernel_object(second), None);
+    assert_eq!(pm.thread_kernel_object(second_tid), None);
+
+    let lifetime = pm.thread_lifetime(second_tid).unwrap();
+    assert!(!pm.publish_kernel_object_pair(lifetime, 0x3000, 0x4000));
+    assert!(!pm.publish_kernel_object_pair(lifetime, 0x4000, 0x3000));
+    assert_eq!(pm.process_kernel_object(second), None);
+    assert_eq!(pm.thread_kernel_object(second_tid), None);
+}
+
+#[test]
+fn pending_job_destruction_reserves_its_body_until_owner_takes_it() {
+    let (mut pm, [pid, _], [tid, _]) = objects();
+    let first = pm.create_job(0).unwrap();
+    let second = pm.create_job(0).unwrap();
+    assert!(pm.publish_job_kernel_object(first, 0x3000));
+    assert!(pm.discard_unreferenced_job(first));
+    assert_eq!(pm.job_for_kernel_object(0x3000), None);
+    assert!(!pm.publish_job_kernel_object(second, 0x3000));
+    assert!(!pm.publish_process_kernel_object(pid, 0x3000));
+    assert!(!pm.publish_thread_kernel_object(tid, 0x3000));
+    assert_eq!(pm.take_job_destruction().unwrap().kernel_job_object, Some(0x3000));
+}
+
+#[test]
+fn job_ui_restrictions_follow_only_the_exact_live_kernel_body() {
+    let mut pm = ProcessManager::new();
+    let job = pm.create_job(0).unwrap();
+    let body = 0x3000;
+    assert_eq!(pm.job_for_kernel_object(body), None);
+    assert!(pm.publish_job_kernel_object(job, body));
+
+    let restrictions_for_body = |manager: &ProcessManager, candidate| {
+        manager
+            .job_for_kernel_object(candidate)
+            .and_then(|id| manager.job_ui_restrictions(id).ok())
+    };
+    assert_eq!(restrictions_for_body(&pm, body), Some(0));
+    assert_eq!(restrictions_for_body(&pm, body + 8), None);
+    pm.set_job_ui_restrictions(job, 0x21).unwrap();
+    assert_eq!(restrictions_for_body(&pm, body), Some(0x21));
+    assert_eq!(restrictions_for_body(&pm, body + 8), None);
+
+    assert!(pm.discard_unreferenced_job(job));
+    assert_eq!(restrictions_for_body(&pm, body), None);
+    assert_eq!(pm.take_job_destruction().unwrap().kernel_job_object, Some(body));
 }

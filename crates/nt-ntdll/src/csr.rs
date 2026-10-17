@@ -1,11 +1,11 @@
 //! `Csr*` — the CSR (Client/Server Runtime) client stubs (8 imported exports).
 //!
-//! The Win32 subsystem (csrss) is reached from a client process over an **LPC port** (`\Windows\
-//! ApiPort`). The `Csr*` client exports build a **`CSR_API_MESSAGE`** — a `PORT_MESSAGE` header + a
+//! The Win32 subsystem (csrss) is reached through `\Windows\ApiPort`. LiberNT connects with
+//! ALPC and a framed [`CsrAlpcConnectFrame`]. The `Csr*` client exports build a **`CSR_API_MESSAGE`** — a `PORT_MESSAGE` header + a
 //! CSR-specific body (API number + argument union) — optionally carrying a **capture buffer** for
 //! the pointer arguments (CSR can't dereference client pointers directly, so variable-length args
 //! are copied into a self-describing buffer whose internal pointers are relocated to server
-//! address space on receipt), and then issue `NtRequestWaitReplyPort` on the CSR port.
+//! address space on receipt), and then issue `NtAlpcSendWaitReceivePort` on the CSR port.
 //!
 //! This module implements the **message construction + capture-buffer marshalling** (host-tested)
 //! and models the connection handshake. The actual port send is the **LPC seam** over
@@ -16,6 +16,7 @@
 use alloc::vec::Vec;
 
 use nt_port_core::PortApi;
+use nt_alpc_abi::PortMessage;
 
 use crate::NtStatus;
 use crate::STATUS_INVALID_PARAMETER;
@@ -58,6 +59,72 @@ const MAXSHORT: usize = 0x7fff;
 /// The x64 `PORT_MESSAGE` header size (bytes) — the frame every LPC/CSR message carries. Shared by
 /// LPC and ALPC (`nt-port-core` docs).
 pub const PORT_MESSAGE_HEADER_LEN: usize = 0x28;
+
+/// Native ALPC CSR request parameters derived from the framed message header.
+pub struct CsrAlpcSyncCall {
+    pub flags: u32,
+    pub buffer_length: usize,
+}
+
+impl CsrAlpcSyncCall {
+    pub fn from_total_length(total_length: u16) -> Option<Self> {
+        (usize::from(total_length) >= PORT_MESSAGE_HEADER_LEN).then_some(Self {
+            flags: nt_alpc_abi::send_flag::SYNC_REQUEST,
+            buffer_length: usize::from(total_length),
+        })
+    }
+}
+
+/// LiberNT's x64 CSR connection payload returned by CSRSS during ALPC acceptance.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CsrApiConnectInfo {
+    pub object_directory: u64,
+    pub shared_section_base: u64,
+    pub shared_static_server_data: u64,
+    pub shared_section_heap: u64,
+    pub debug_flags: u32,
+    pub size_of_peb_data: u32,
+    pub size_of_teb_data: u32,
+    pub number_of_server_dll_names: u32,
+    pub server_process_id: u64,
+    pub port_view_base: u64,
+    pub port_view_remote_base: u64,
+}
+
+/// The `PORT_MESSAGE` and CSR payload occupy one writable ALPC connect buffer.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CsrAlpcConnectFrame {
+    pub header: PortMessage,
+    pub info: CsrApiConnectInfo,
+}
+
+impl CsrAlpcConnectFrame {
+    pub fn new() -> Self {
+        let mut frame = Self::default();
+        frame.header.data_length = core::mem::size_of::<CsrApiConnectInfo>() as u16;
+        frame.header.total_length = core::mem::size_of::<Self>() as u16;
+        frame
+    }
+}
+
+/// Geometry of LiberNT's caller-owned heap in the accepted CSR port view.
+pub struct CsrPortHeapLayout {
+    pub base: u64,
+    pub reserve: usize,
+    pub commit: usize,
+}
+
+impl CsrPortHeapLayout {
+    pub fn from_accepted_view(info: &CsrApiConnectInfo) -> Option<Self> {
+        (info.port_view_base != 0).then_some(Self {
+            base: info.port_view_base,
+            reserve: 0x1_0000,
+            commit: 0x1000,
+        })
+    }
+}
 
 #[inline]
 fn align_up4(n: usize) -> Option<usize> {
@@ -478,7 +545,7 @@ pub unsafe fn init_raw_api_message(
     Ok(())
 }
 
-/// Convert a client capture buffer into the server view before `NtRequestWaitReplyPort`.
+/// Convert a client capture buffer into the server view before the CSR ALPC request.
 ///
 /// # Safety
 /// `api_message` and `capture_buffer` must point at writable raw CSR objects in the current process.
@@ -775,6 +842,37 @@ mod tests {
     extern crate std;
     use super::*;
     use std::vec;
+
+    #[test]
+    fn libernt_csr_alpc_connect_frame_has_complete_port_view_contract() {
+        let frame = CsrAlpcConnectFrame::new();
+        assert_eq!(core::mem::size_of::<CsrApiConnectInfo>(), 0x48);
+        assert_eq!(core::mem::size_of::<CsrAlpcConnectFrame>(), 0x70);
+        assert_eq!(frame.header.data_length, 0x48);
+        assert_eq!(frame.header.total_length, 0x70);
+        assert_eq!(frame.info.port_view_base, 0);
+        assert_eq!(frame.info.port_view_remote_base, 0);
+    }
+
+    #[test]
+    fn libernt_csr_api_call_uses_sync_alpc_with_in_place_reply_length() {
+        let call = CsrAlpcSyncCall::from_total_length(0x90).unwrap();
+        assert_eq!(call.flags, nt_alpc_abi::send_flag::SYNC_REQUEST);
+        assert_eq!(call.buffer_length, 0x90);
+        assert!(CsrAlpcSyncCall::from_total_length(0x27).is_none());
+    }
+
+    #[test]
+    fn libernt_csr_capture_heap_uses_accepted_shared_port_view() {
+        let mut info = CsrApiConnectInfo::default();
+        info.port_view_base = 0x1000_4000;
+        let layout = CsrPortHeapLayout::from_accepted_view(&info).unwrap();
+        assert_eq!(layout.base, info.port_view_base);
+        assert_eq!(layout.reserve, 0x1_0000);
+        assert_eq!(layout.commit, 0x1000);
+        info.port_view_base = 0;
+        assert!(CsrPortHeapLayout::from_accepted_view(&info).is_none());
+    }
 
     #[test]
     fn api_number_encoding() {

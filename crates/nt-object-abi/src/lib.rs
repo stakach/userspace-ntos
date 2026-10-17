@@ -44,6 +44,10 @@ pub mod opcode {
     pub const OB_OP_REFERENCE_FILE_HANDLE: u16 = 0x2026;
     pub const OB_OP_CREATE_DIRECTORY_HANDLE: u16 = 0x2027;
     pub const OB_OP_OPEN_DIRECTORY_HANDLE: u16 = 0x2028;
+    /// Kernel session creation publishes its numbered parent and Windows directory together.
+    pub const OB_OP_CREATE_SESSION_NAMESPACE: u16 = 0x2029;
+    /// Retire only the exact empty pair owned by that session generation.
+    pub const OB_OP_RETIRE_SESSION_NAMESPACE_EXACT: u16 = 0x202a;
 
     pub const OB_OP_LOOKUP_PATH: u16 = 0x2030;
     pub const OB_OP_QUERY_OBJECT: u16 = 0x2031;
@@ -146,6 +150,28 @@ pub struct ObQueryDirectoryRequest {
 
 const _: [(); 24] = [(); core::mem::size_of::<ObDirectoryHandleRequest>()];
 const _: [(); 32] = [(); core::mem::size_of::<ObQueryDirectoryRequest>()];
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ObCreateSessionNamespaceRequest {
+    pub abi_size: u16,
+    pub reserved: u16,
+    pub session_id: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ObRetireSessionNamespaceRequest {
+    pub abi_size: u16,
+    pub reserved: u16,
+    pub session_id: u32,
+    pub session_object_id: u64,
+    pub windows_object_id: u64,
+    pub base_named_objects_id: u64,
+}
+
+const _: [(); 8] = [(); core::mem::size_of::<ObCreateSessionNamespaceRequest>()];
+const _: [(); 32] = [(); core::mem::size_of::<ObRetireSessionNamespaceRequest>()];
 
 /// `OB_OP_CREATE_SYMBOLIC_LINK` payload — link path + target path both in-buffer.
 #[repr(C)]

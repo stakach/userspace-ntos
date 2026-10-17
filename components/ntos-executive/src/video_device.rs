@@ -19,7 +19,6 @@ use nt_video_miniport::{VIDEO_DEVICE_MAP_KEY, VIDEO_DEVICE_MAP_MAX_OBJECT_VALUE}
 
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_NO_MEMORY: i32 = 0xC000_0017u32 as i32;
-const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
 const REG_SZ: u32 = 1;
 const REG_DWORD: u32 = 4;
 
@@ -593,26 +592,6 @@ unsafe fn teardown_video_io_route() -> bool {
     true
 }
 
-fn wstr_eq_ascii(name: &[u16], pat: &[u8]) -> bool {
-    if name.len() != pat.len() {
-        return false;
-    }
-    let low = |c: u16| -> u16 {
-        if (b'A' as u16..=b'Z' as u16).contains(&c) {
-            c + 32
-        } else {
-            c
-        }
-    };
-    for (c, expected) in name.iter().zip(pat) {
-        let c = low(*c);
-        if c != low(*expected as u16) {
-            return false;
-        }
-    }
-    true
-}
-
 fn utf16le_nul_from_ascii(bytes: &[u8]) -> Option<Vec<u8>> {
     let need = bytes.len().checked_mul(2)?.checked_add(2)?;
     let mut data = Vec::new();
@@ -663,32 +642,6 @@ unsafe fn publish_video_device_map(metadata: VideoRegistrationMetadata) -> bool 
         .is_ok()
 }
 
-/// Resolve and retain the video File entirely in the executive's owning VSpace.
-pub(crate) unsafe fn video_get_device_object_pointer(
-    name: &[u16],
-    desired_access: u32,
-) -> Result<(u64, u64), i32> {
-    if !projected_video_route_ready() || name.is_empty() {
-        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
-    }
-    let state = video_state_snapshot();
-    let Some(metadata) = state.metadata else {
-        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
-    };
-    if !wstr_eq_ascii(name, metadata.device_path()) {
-        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
-    }
-    let objects = state.objects;
-    if !objects.ready() {
-        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
-    }
-    retain_video_file_projection(
-        state.route.file_projection,
-        nt_types::AccessMask::from_bits_retain(desired_access),
-    )?;
-    Ok((state.route.file_projection, objects.device))
-}
-
 /// Resolve the current attachment top through the File's exact consumer projection.
 pub(crate) unsafe fn video_related_device_object(
     domain: nt_io_manager::HostedDomainIdentity,
@@ -707,28 +660,6 @@ pub(crate) unsafe fn video_related_device_object(
 pub(crate) unsafe fn video_file_projection_contains(object: u64) -> bool {
     let state = video_state_snapshot();
     state.ready && object != 0 && object == state.route.file_projection
-}
-
-pub(crate) unsafe fn retain_video_file_projection(
-    object: u64,
-    desired_access: nt_types::AccessMask,
-) -> Result<u64, i32> {
-    let _operation = PublicationGuard::enter().ok_or(NtStatus::DEVICE_BUSY.raw())?;
-    if !projected_video_route_ready() || !video_file_projection_contains(object) {
-        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
-    }
-    let state = video_state_snapshot();
-    let (file, device, object_id) =
-        crate::driver_launch::lookup_io_handle_file(state.route.file_handle, desired_access)
-            .map_err(|status| status.raw())?;
-    if file != state.route.file_id
-        || device != state.route.device_id
-        || object_id != state.route.file_object_id
-    {
-        return Err(STATUS_INVALID_PARAMETER);
-    }
-    video_projection_owners::reference_by_handle(state.route.owner_id, object)
-        .map_err(|status| status.raw())
 }
 
 pub(crate) unsafe fn reference_video_file_pointer(

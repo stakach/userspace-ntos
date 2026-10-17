@@ -102,6 +102,9 @@ pub(crate) unsafe fn w32_attach_mapped(page: u64) -> bool {
 }
 
 unsafe fn admit(pi: u64, page: u64) -> Result<(), u32> {
+    if crate::win32k_subsystem::is_reserved_cursor_alias_page(page) {
+        return Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES);
+    }
     if attached_pi() != pi || page & 0xfff != 0 {
         return Err(nt_fs::STATUS_INVALID_HANDLE);
     }

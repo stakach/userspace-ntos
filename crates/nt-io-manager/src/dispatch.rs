@@ -207,6 +207,13 @@ pub enum PnpBackendDispatch {
 /// A driver dispatch backend (spec §15.1). Pluggable: the mock backend for
 /// tests/bring-up, or a SURT driver-peer backend for an isolated Driver Host.
 pub trait DriverDispatchBackend {
+    /// Attest that the exact live File context reads immutable bytes of this extent for its
+    /// remaining lifetime. Unknown or mutable providers return None. The I/O Manager validates
+    /// canonical File/device/context identity before consulting this provider-owned claim.
+    fn immutable_file_extent(&self, _file_id: FileId, _file_context: u64) -> Option<u64> {
+        None
+    }
+
     /// Dispatch one IRP projection. Returns how it was handled.
     fn dispatch_irp(
         &mut self,

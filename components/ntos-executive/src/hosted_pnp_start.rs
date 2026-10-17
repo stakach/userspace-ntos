@@ -447,8 +447,10 @@ impl OwnedHostedPnpStartBatch {
         progress: HostedPnpDevnodeProgress,
     ) -> Option<OwnedHostedPnpStartProgress> {
         match progress {
-            HostedPnpDevnodeProgress::BusRelationPending => {
-                self.pending_bus_relation_devnode = Some(devnode_index);
+            HostedPnpDevnodeProgress::BusRelationPending { require_accepted_bus_pdo } => {
+                if require_accepted_bus_pdo {
+                    self.pending_bus_relation_devnode = Some(devnode_index);
+                }
                 return Some(OwnedHostedPnpStartProgress::AwaitingCompletion);
             }
             HostedPnpDevnodeProgress::ResourceAdmissionPending => {
@@ -562,7 +564,7 @@ impl OwnedHostedPnpStartBatch {
                     },
                 ))
             }
-            HostedPnpDevnodeProgress::BusRelationPending
+            HostedPnpDevnodeProgress::BusRelationPending { .. }
             | HostedPnpDevnodeProgress::FilterAdmissionPending { .. }
             | HostedPnpDevnodeProgress::FilterPending { .. }
             | HostedPnpDevnodeProgress::FilterOwnershipLost { .. }
@@ -1730,7 +1732,7 @@ where
 }
 
 enum HostedPnpDevnodeProgress {
-    BusRelationPending,
+    BusRelationPending { require_accepted_bus_pdo: bool },
     ResourceAdmissionPending,
     FilterAdmissionPending {
         device_id: u64,
@@ -1870,7 +1872,7 @@ where
     let relation_pending = bus_pdo.is_none() && driver_launch::hosted_bus_relation_pending();
 
     if bus_pdo.is_none() && relation_pending {
-        return HostedPnpDevnodeProgress::BusRelationPending;
+        return HostedPnpDevnodeProgress::BusRelationPending { require_accepted_bus_pdo };
     }
     let prepared = match prepare_current_hosted_devnode(
         bus_pdo,

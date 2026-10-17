@@ -114,7 +114,7 @@ impl ImageSourcePageIo<SourceKey> for SourceIo<'_> {
                     wrote = true;
                     let page = core::slice::from_raw_parts_mut(address as *mut u8, 4096);
                     plan.read_into_page(page, |offset, output| {
-                        source.read_exact(self.handler, offset, output)?;
+                        source.read_exact(self.handler, key.area, offset, output)?;
                         Ok::<usize, u32>(output.len())
                     })
                     .map_err(|error| match error {

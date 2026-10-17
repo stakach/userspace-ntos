@@ -51,15 +51,21 @@ use core::mem::size_of;
 
 use bytemuck::Pod;
 use nt_alpc_abi::{
-    msg_attr_flag, opcode, send_flag, AlpcAcceptConnectRequest, AlpcConnectPortRequest,
-    AlpcContextAttr, AlpcCreatePortRequest, AlpcCreatePortSectionRequest,
-    AlpcCreateSectionViewRequest, AlpcDataViewAttr, AlpcHandleAttr, AlpcHandleRequest,
-    AlpcMessageAttributes, AlpcReply, AlpcSecurityAttr, AlpcSendReceiveRequest, AlpcTokenAttr,
-    AlpcViewIoRequest,
+    connect_flag, msg_attr_flag, opcode, port_flag, send_flag, AlpcAcceptConnectCheckedRequest,
+    AlpcAcceptConnectRequest, AlpcAcknowledgeSendReceiveRequest,
+    AlpcCheckedInvocation, AlpcConnectPortAuthorizedRequest,
+    AlpcConnectPortCheckedRequest, AlpcConnectPortRequest,
+    AlpcContextAttr, AlpcCreatePortCheckedRequest, AlpcCreatePortOwnedRequest,
+    AlpcCreatePortSecuredRequest,
+    AlpcCloseCreatedPortRequest, AlpcCreatePortRequest, AlpcCreatePortSectionRequest,
+    AlpcCreateSectionViewRequest,
+    AlpcDataViewAttr, AlpcHandleAttr, AlpcHandleRequest, AlpcLookupCreatePortRequest,
+    AlpcMessageAttributes, AlpcPortAttributes, AlpcReply, AlpcSecurityAttr, AlpcSendReceiveRequest,
+    AlpcSendReceiveCheckedRequest, AlpcTokenAttr, AlpcViewIoRequest, PortMessage,
 };
 use nt_port_core::{
-    ConnectOutcome, DataView, MessageAttrs, PortApi, PortCore, PortHandleEndpoint, PortLimits,
-    QueuedMessage, ReceiveOutcome, MAX_CONNINFO,
+    ClientId, ConnState, ConnectOutcome, ConnectionSecurity, DataView, MessageAttrs, PortApi, PortCore, PortHandleEndpoint,
+    MessageIdentity, PortAdmission, PortLimits, QueuedMessage, ReceiveOutcome, MAX_CONNINFO,
 };
 use nt_status::NtStatus;
 
@@ -67,12 +73,53 @@ use nt_status::NtStatus;
 /// core's `"LP"` port-handle range).
 const ALPC_SECTION_BASE: u64 = 0x0000_4153_0000_0001;
 
+fn port_admission(flags: u32) -> Result<PortAdmission, NtStatus> {
+    const SUPPORTED: u32 = port_flag::LPC_MODE | port_flag::ALLOW_LPC_REQUESTS
+        | port_flag::ALLOW_IMPERSONATION;
+    if flags & !SUPPORTED != 0 { return Err(NtStatus::INVALID_PARAMETER); }
+    Ok(PortAdmission {
+        allow_lpc_requests: flags & (port_flag::LPC_MODE | port_flag::ALLOW_LPC_REQUESTS) != 0,
+        allow_impersonation: flags & port_flag::ALLOW_IMPERSONATION != 0,
+    })
+}
+
+fn connect_port_options(attributes: AlpcPortAttributes, has_attributes: u32)
+    -> Result<(ConnectionSecurity, Option<u32>), NtStatus>
+{
+    if has_attributes > 1 || (has_attributes == 0 && attributes != AlpcPortAttributes::default()) {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+    if has_attributes == 0 { return Ok((ConnectionSecurity::default(), None)); }
+    if attributes.flags != 0 || attributes.max_message_length > u16::MAX as u64
+        || attributes.memory_bandwidth != 0 || attributes.max_pool_usage != 0
+        || attributes.max_section_size != 0 || attributes.max_view_size != 0
+        || attributes.max_total_section_size != 0 || attributes.dup_object_types != 0
+        || attributes.reserved != 0
+    { return Err(NtStatus::INVALID_PARAMETER); }
+    let qos = attributes.security_qos;
+    if (qos.length != 0 && qos.length != size_of::<nt_alpc_abi::SecurityQualityOfService>() as u32)
+        || (qos.length == 0 && (qos.impersonation_level != 0
+            || qos.context_tracking_mode != 0 || qos.effective_only != 0))
+        || qos.impersonation_level > 3 || qos.context_tracking_mode > 1
+        || qos.effective_only > 1 || qos._pad != 0
+    { return Err(NtStatus::INVALID_PARAMETER); }
+    Ok((ConnectionSecurity {
+        impersonation_level: qos.impersonation_level,
+        dynamic_tracking: qos.context_tracking_mode != 0,
+        effective_only: qos.effective_only != 0,
+    }, (attributes.max_message_length != 0)
+        .then_some(attributes.max_message_length as u32)))
+}
+
 /// Upper bound on a port section's backing store, so a malformed/hostile
 /// `SectionSize` can't grow the broker's memory without bound. 8 MiB comfortably
 /// covers the WOW64 large-transfer path (real ALPC caps a section at
 /// `MaximumViewSize`, typically well under this).
 const MAX_SECTION_SIZE: u64 = 8 * 1024 * 1024;
 const SECTION_PAGE_SIZE: usize = 4096;
+const MAX_CHECKED_SEND_RECEIVE: usize = 256;
+const MAX_CHECKED_CREATE_RESULTS: usize = 128;
+const RECENT_SETTLED_CREATE_RESULTS: usize = 32;
 
 struct SparseSectionBacking {
     len: usize,
@@ -178,10 +225,86 @@ struct SectionView {
     size: u64,
 }
 
+/// A completed checked invocation stays recorded after handle close. In particular,
+/// closing a result must not turn a delayed duplicate SQE into a second create.
+struct CreatePortResult {
+    owner: ClientId,
+    owner_generation: u64,
+    token: (u64, u64),
+    request: AlpcCreatePortRequest,
+    attributes: Option<AlpcPortAttributes>,
+    security_descriptor: Option<Vec<u8>>,
+    name: Vec<u16>,
+    result: AlpcReply,
+    closed: bool,
+}
+
+/// A native invocation's receive continuation. A pending receive may be polled
+/// again, but its send half must never be repeated after the first attempt.
+struct CheckedSendReceive {
+    owner: ClientId,
+    owner_generation: u64,
+    token: (u64, u64),
+    op: u16,
+    request: Vec<u8>,
+    output: Vec<u8>,
+    terminal: Option<AlpcReply>,
+}
+
+struct CheckedConnect {
+    owner: ClientId,
+    owner_generation: u64,
+    token: (u64, u64),
+    request: Vec<u8>,
+    result: AlpcReply,
+    response: Vec<u8>,
+    closed: bool,
+    acknowledged: bool,
+}
+
+struct CheckedAccept {
+    owner: ClientId,
+    owner_generation: u64,
+    token: (u64, u64),
+    request: Vec<u8>,
+    result: AlpcReply,
+    closed: bool,
+    acknowledged: bool,
+}
+
+/// Compact authority retained after a checked receive's large output is ACKed.
+struct ConnectionReceipt {
+    owner: ClientId,
+    owner_generation: u64,
+    listen_port: u64,
+    connection_id: u64,
+}
+
+fn checked_identity(invocation: AlpcCheckedInvocation)
+    -> Result<(ClientId, u64, (u64, u64)), NtStatus>
+{
+    let owner = ClientId { process: invocation.owner_process,
+        thread: invocation.owner_thread };
+    let token = (invocation.invocation_hi, invocation.invocation_lo);
+    if owner.process == 0 || owner.thread == 0 || invocation.owner_generation == 0
+        || token == (0, 0)
+    { return Err(NtStatus::INVALID_PARAMETER); }
+    Ok((owner, invocation.owner_generation, token))
+}
+
 /// The ALPC service: the `NtAlpc*` ABI adapter. It borrows a shared
 /// [`PortCore`]; it owns only ALPC-specific state (port sections + views).
 #[derive(Default)]
 pub struct AlpcServer {
+    create_results: Vec<CreatePortResult>,
+    retired_create_sequence: u64,
+    send_receive_results: Vec<CheckedSendReceive>,
+    retired_send_receive_sequence: u64,
+    connect_results: Vec<CheckedConnect>,
+    retired_connect_sequence: u64,
+    accept_results: Vec<CheckedAccept>,
+    retired_accept_sequence: u64,
+    connection_receipts: Vec<ConnectionReceipt>,
     sections: Vec<PortSection>,
     views: Vec<SectionView>,
     next_section: u64,
@@ -189,9 +312,36 @@ pub struct AlpcServer {
 }
 
 impl AlpcServer {
+    /// Keep only a small recent reconciliation window. The retired sequence
+    /// rejects any pruned invocation before another core create effect.
+    fn retire_settled_create_results(&mut self) {
+        loop {
+            let settled = self.create_results.iter().filter(|saved|
+                saved.closed || saved.result.status != NtStatus::SUCCESS.0).count();
+            if settled < RECENT_SETTLED_CREATE_RESULTS
+                && self.create_results.len() < MAX_CHECKED_CREATE_RESULTS { break; }
+            let Some((index, _)) = self.create_results.iter().enumerate()
+                .filter(|(_, saved)| saved.closed
+                    || saved.result.status != NtStatus::SUCCESS.0)
+                .min_by_key(|(_, saved)| saved.token.1)
+            else { break };
+            let removed = self.create_results.swap_remove(index);
+            self.retired_create_sequence = self.retired_create_sequence.max(removed.token.1);
+        }
+    }
+
     /// A new ALPC adapter with no sections/views.
     pub fn new() -> Self {
         Self {
+            create_results: Vec::new(),
+            retired_create_sequence: 0,
+            send_receive_results: Vec::new(),
+            retired_send_receive_sequence: 0,
+            connect_results: Vec::new(),
+            retired_connect_sequence: 0,
+            accept_results: Vec::new(),
+            retired_accept_sequence: 0,
+            connection_receipts: Vec::new(),
             sections: Vec::new(),
             views: Vec::new(),
             next_section: ALPC_SECTION_BASE,
@@ -224,7 +374,13 @@ impl AlpcServer {
         match op {
             opcode::ALPC_OP_PING => Ok(ok()),
             opcode::ALPC_OP_CREATE_PORT => self.op_create_port(core, in_buf),
-            opcode::ALPC_OP_CONNECT_PORT => self.op_connect_port(core, in_buf),
+            opcode::ALPC_OP_LOOKUP_CREATE_PORT => self.op_lookup_create_port(core, in_buf),
+            opcode::ALPC_OP_CLOSE_CREATED_PORT => self.op_close_created_port(core, in_buf),
+            opcode::ALPC_OP_ACK_SEND_RECEIVE => self.op_ack_send_receive(in_buf),
+            opcode::ALPC_OP_CLOSE_LATER_PORT => self.op_close_later_port(core, in_buf),
+            opcode::ALPC_OP_ACK_CONNECT_PORT => self.op_ack_later(in_buf, false),
+            opcode::ALPC_OP_ACK_ACCEPT_CONNECT => self.op_ack_later(in_buf, true),
+            opcode::ALPC_OP_CONNECT_PORT => self.op_connect_port(core, in_buf, out_buf),
             opcode::ALPC_OP_ACCEPT_CONNECT => self.op_accept_connect(core, in_buf),
             opcode::ALPC_OP_SEND_RECEIVE | opcode::ALPC_OP_RECEIVE => {
                 self.op_send_receive(core, op, in_buf, out_buf)
@@ -245,8 +401,18 @@ impl AlpcServer {
 
     fn op_create_port(&mut self, core: &mut PortCore, buf: &[u8]) -> Result<AlpcReply, NtStatus> {
         let req: AlpcCreatePortRequest = read_req(buf)?;
+        if req.abi_size as usize == size_of::<AlpcCreatePortCheckedRequest>()
+            || req.abi_size as usize == size_of::<AlpcCreatePortOwnedRequest>()
+            || req.abi_size as usize == size_of::<AlpcCreatePortSecuredRequest>()
+        {
+            return self.op_create_port_checked(core, buf);
+        }
+        if req.abi_size as usize != size_of::<AlpcCreatePortRequest>() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         let name = read_name(buf, req.name_offset, req.name_len_bytes)?;
-        let handle = core.create_port_with_limits(
+        let admission = port_admission(req.port_flags)?;
+        let handle = core.create_port_with_limits_admission(
             &name,
             PortApi::Alpc,
             PortLimits {
@@ -254,12 +420,329 @@ impl AlpcServer {
                 max_message: req.max_message_length,
                 max_pool_usage: 0,
             },
+            admission,
         )?;
         Ok(reply(NtStatus::SUCCESS, 0, handle, 0))
     }
 
-    fn op_connect_port(&mut self, core: &mut PortCore, buf: &[u8]) -> Result<AlpcReply, NtStatus> {
+    fn op_create_port_checked(
+        &mut self,
+        core: &mut PortCore,
+        buf: &[u8],
+    ) -> Result<AlpcReply, NtStatus> {
+        let req: AlpcCreatePortCheckedRequest = read_req(buf)?;
+        let attributes = if req.create.abi_size as usize == size_of::<AlpcCreatePortOwnedRequest>()
+            || req.create.abi_size as usize == size_of::<AlpcCreatePortSecuredRequest>()
+        {
+            let owned: AlpcCreatePortOwnedRequest = read_req(buf)?;
+            let attrs = owned.attributes;
+            if owned.checked != req
+                || attrs.flags != req.create.port_flags
+                || attrs.max_message_length != u64::from(req.create.max_message_length)
+                || attrs.max_pool_usage > u32::MAX as u64
+                || port_admission(attrs.flags).is_err()
+                || attrs.memory_bandwidth != 0
+                || attrs.max_section_size != 0
+                || attrs.max_view_size != 0
+                || attrs.max_total_section_size != 0
+                || attrs.dup_object_types != 0
+                || attrs.reserved != 0
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            let qos = attrs.security_qos;
+            if (qos.length != 0
+                && qos.length != size_of::<nt_alpc_abi::SecurityQualityOfService>() as u32)
+                || (qos.length == 0
+                    && (qos.impersonation_level != 0
+                        || qos.context_tracking_mode != 0
+                        || qos.effective_only != 0))
+                || qos.impersonation_level > 3
+                || qos.context_tracking_mode > 1
+                || qos.effective_only > 1
+                || qos._pad != 0
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            Some(attrs)
+        } else if req.create.abi_size as usize == size_of::<AlpcCreatePortCheckedRequest>() {
+            None
+        } else {
+            return Err(NtStatus::INVALID_PARAMETER);
+        };
+        let security_descriptor = if req.create.abi_size as usize
+            == size_of::<AlpcCreatePortSecuredRequest>()
+        {
+            let secured: AlpcCreatePortSecuredRequest = read_req(buf)?;
+            if secured.owned.checked != req
+                || secured.security_len_bytes == 0
+                || secured.security_offset as usize
+                    != size_of::<AlpcCreatePortSecuredRequest>()
+                        + req.create.name_len_bytes as usize
+            { return Err(NtStatus::INVALID_PARAMETER); }
+            let bytes = read_blob(buf, secured.security_offset, secured.security_len_bytes)?;
+            if secured.security_offset as usize + bytes.len() != buf.len() {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            nt_security::validate_security_descriptor_bytes(bytes)
+                .map_err(|status| NtStatus(status as i32))?;
+            let mut owned = Vec::new();
+            owned.try_reserve_exact(bytes.len())
+                .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+            owned.extend_from_slice(bytes);
+            Some(owned)
+        } else { None };
+        let owner = ClientId {
+            process: req.owner_process,
+            thread: req.owner_thread,
+        };
+        let token = (req.invocation_hi, req.invocation_lo);
+        if owner.process == 0
+            || owner.thread == 0
+            || req.owner_generation == 0
+            || token == (0, 0)
+            || req.create.name_offset < req.create.abi_size as u32
+            || req.create._reserved != 0
+            || req.create._reserved2 != 0
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let name = read_name(buf, req.create.name_offset, req.create.name_len_bytes)?;
+        if let Some(saved) = self
+            .create_results
+            .iter()
+            .find(|saved| saved.token == token)
+        {
+            if saved.owner != owner || saved.owner_generation != req.owner_generation {
+                return Err(NtStatus::OBJECT_NAME_COLLISION);
+            }
+            if saved.closed { return Err(NtStatus::INVALID_PORT_HANDLE); }
+            if saved.request != req.create || saved.attributes != attributes
+                || saved.security_descriptor != security_descriptor || saved.name != name {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            return Ok(self.live_create_result(core, saved));
+        }
+        self.retire_settled_create_results();
+        if token.1 <= self.retired_create_sequence {
+            return Err(NtStatus::OBJECT_NAME_COLLISION);
+        }
+        if self.create_results.len() >= MAX_CHECKED_CREATE_RESULTS {
+            return Err(NtStatus::INSUFFICIENT_RESOURCES);
+        }
+        // Reserve the replay record before the core may publish a port. An allocation
+        // failure must leave the operation at known zero effect.
+        self.create_results
+            .try_reserve(1)
+            .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+        let admission = port_admission(req.create.port_flags)?;
+        let result = match core.create_port_with_owner_and_limits_checked_admission(
+            &name,
+            PortApi::Alpc,
+            owner,
+            PortLimits {
+                max_connection_info: MAX_CONNINFO as u32,
+                max_message: req.create.max_message_length,
+                max_pool_usage: attributes.map_or(0, |attrs| attrs.max_pool_usage as u32),
+            },
+            admission,
+        ) {
+            Ok(handle) => reply(NtStatus::SUCCESS, 0, handle, 0),
+            Err(status) => reply(status, 0, 0, 0),
+        };
+        self.create_results.push(CreatePortResult {
+            owner,
+            owner_generation: req.owner_generation,
+            token,
+            request: req.create,
+            attributes,
+            security_descriptor,
+            name,
+            result,
+            closed: false,
+        });
+        Ok(result)
+    }
+
+    fn op_close_created_port(
+        &mut self,
+        core: &mut PortCore,
+        buf: &[u8],
+    ) -> Result<AlpcReply, NtStatus> {
+        let req: AlpcCloseCreatedPortRequest = read_req(buf)?;
+        if req.abi_size as usize != size_of::<AlpcCloseCreatedPortRequest>()
+            || req._reserved != 0 || req._reserved2 != 0 || req.handle == 0
+            || req.owner_process == 0 || req.owner_thread == 0 || req.owner_generation == 0
+            || (req.invocation_hi, req.invocation_lo) == (0, 0)
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let saved = self.create_results.iter_mut().find(|saved| {
+            saved.token == (req.invocation_hi, req.invocation_lo)
+        }).ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
+        if saved.owner.process != req.owner_process
+            || saved.owner_generation != req.owner_generation
+            || saved.result.status != NtStatus::SUCCESS.0
+            || saved.result.detail0 != req.handle
+        {
+            return Err(NtStatus::OBJECT_NAME_COLLISION);
+        }
+        if saved.closed {
+            return Ok(ok());
+        }
+        let info = core.handle_info(req.handle).ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+        if info.endpoint != PortHandleEndpoint::ListenPort
+            || info.api != PortApi::Alpc || info.server_id != saved.owner
+        {
+            return Err(NtStatus::INVALID_PORT_HANDLE);
+        }
+        core.close_port_checked(req.handle)?;
+        saved.closed = true;
+        saved.request = AlpcCreatePortRequest::default();
+        saved.attributes = None;
+        saved.security_descriptor = None;
+        saved.name = Vec::new();
+        Ok(ok())
+    }
+
+    fn op_close_later_port(&mut self, core: &mut PortCore,
+        buf: &[u8]) -> Result<AlpcReply, NtStatus> {
+        let req: AlpcCloseCreatedPortRequest = read_req(buf)?;
+        if req.abi_size as usize != size_of::<AlpcCloseCreatedPortRequest>()
+            || req._reserved != 0 || req._reserved2 != 0 || req.handle == 0
+            || req.owner_process == 0 || req.owner_thread == 0 || req.owner_generation == 0
+            || (req.invocation_hi, req.invocation_lo) == (0, 0)
+        { return Err(NtStatus::INVALID_PARAMETER); }
+        let token = (req.invocation_hi, req.invocation_lo);
+        let owner = ClientId { process: req.owner_process, thread: req.owner_thread };
+        let (endpoint, saved_owner, saved_generation, saved_handle, closed) =
+            if let Some(saved) = self.connect_results.iter().find(|saved| saved.token == token) {
+                (PortHandleEndpoint::ClientCommPort, saved.owner, saved.owner_generation,
+                    saved.result.detail0, saved.closed)
+            } else if let Some(saved) = self.accept_results.iter().find(|saved| saved.token == token) {
+                (PortHandleEndpoint::ServerCommPort, saved.owner, saved.owner_generation,
+                    saved.result.detail0, saved.closed)
+            } else { return Err(NtStatus::OBJECT_NAME_NOT_FOUND); };
+        if saved_owner.process != owner.process || saved_generation != req.owner_generation
+            || saved_handle != req.handle
+        { return Err(NtStatus::OBJECT_NAME_COLLISION); }
+        if closed { return Ok(ok()); }
+        let info = core.handle_info(req.handle).ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+        if info.endpoint != endpoint || info.api != PortApi::Alpc
+            || match endpoint {
+                PortHandleEndpoint::ClientCommPort => info.client_id
+                    .is_none_or(|client| client.process != owner.process),
+                PortHandleEndpoint::ServerCommPort => info.server_id.process != owner.process,
+                PortHandleEndpoint::ListenPort => true,
+            }
+        { return Err(NtStatus::INVALID_PORT_HANDLE); }
+        core.close_port_checked(req.handle)?;
+        if endpoint == PortHandleEndpoint::ClientCommPort {
+            self.connect_results.iter_mut().find(|saved| saved.token == token).unwrap().closed = true;
+        } else {
+            self.accept_results.iter_mut().find(|saved| saved.token == token).unwrap().closed = true;
+        }
+        Ok(ok())
+    }
+
+    fn op_ack_later(&mut self, buf: &[u8], accept: bool) -> Result<AlpcReply, NtStatus> {
+        let ack: AlpcAcknowledgeSendReceiveRequest = read_req(buf)?;
+        let (owner, generation, token) = checked_identity(ack.invocation)?;
+        if ack.abi_size as usize != size_of::<AlpcAcknowledgeSendReceiveRequest>()
+            || ack._reserved != 0 || ack._reserved2 != 0
+        { return Err(NtStatus::INVALID_PARAMETER); }
+        if accept {
+            let index = self.accept_results.iter().position(|saved| saved.token == token)
+                .ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
+            let saved = &self.accept_results[index];
+            if saved.owner != owner || saved.owner_generation != generation {
+                return Err(NtStatus::OBJECT_NAME_COLLISION);
+            }
+            let saved = &mut self.accept_results[index];
+            if saved.result.status == NtStatus::SUCCESS.0 && saved.result.detail0 != 0
+                && !saved.closed {
+                saved.acknowledged = true;
+                saved.request = Vec::new();
+            } else { self.accept_results.swap_remove(index); }
+            self.retired_accept_sequence = self.retired_accept_sequence.max(token.1);
+        } else {
+            let index = self.connect_results.iter().position(|saved| saved.token == token)
+                .ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
+            let saved = &self.connect_results[index];
+            if saved.owner != owner || saved.owner_generation != generation {
+                return Err(NtStatus::OBJECT_NAME_COLLISION);
+            }
+            if saved.result.status == NtStatus::PENDING.0 {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            let saved = &mut self.connect_results[index];
+            if saved.result.status == NtStatus::SUCCESS.0 && saved.result.detail0 != 0
+                && !saved.closed {
+                saved.acknowledged = true;
+                saved.request = Vec::new();
+                saved.response = Vec::new();
+            } else { self.connect_results.swap_remove(index); }
+            self.retired_connect_sequence = self.retired_connect_sequence.max(token.1);
+        }
+        Ok(ok())
+    }
+
+    fn op_lookup_create_port(&self, core: &PortCore, buf: &[u8]) -> Result<AlpcReply, NtStatus> {
+        let req: AlpcLookupCreatePortRequest = read_req(buf)?;
+        if req.abi_size as usize != size_of::<AlpcLookupCreatePortRequest>()
+            || req._reserved != 0
+            || req._reserved2 != 0
+            || req.owner_process == 0
+            || req.owner_thread == 0
+            || req.owner_generation == 0
+            || (req.invocation_hi, req.invocation_lo) == (0, 0)
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let Some(saved) = self
+            .create_results
+            .iter()
+            .find(|saved| saved.token == (req.invocation_hi, req.invocation_lo))
+        else {
+            return Err(if (req.invocation_hi, req.invocation_lo) != (0, 0)
+                && req.invocation_lo <= self.retired_create_sequence {
+                NtStatus::INVALID_PORT_HANDLE
+            } else { NtStatus::OBJECT_NAME_NOT_FOUND });
+        };
+        if saved.owner
+            != (ClientId {
+                process: req.owner_process,
+                thread: req.owner_thread,
+            })
+            || saved.owner_generation != req.owner_generation
+        {
+            return Err(NtStatus::OBJECT_NAME_COLLISION);
+        }
+        Ok(self.live_create_result(core, saved))
+    }
+
+    fn live_create_result(&self, core: &PortCore, saved: &CreatePortResult) -> AlpcReply {
+        if saved.closed {
+            return reply(NtStatus::INVALID_PORT_HANDLE, 0, 0, 0);
+        }
+        if saved.result.status == NtStatus::SUCCESS.0
+            && core.handle_info(saved.result.detail0).is_none()
+        {
+            return reply(NtStatus::INVALID_HANDLE, 0, 0, 0);
+        }
+        saved.result
+    }
+
+    fn op_connect_port(&mut self, core: &mut PortCore, buf: &[u8],
+        out_buf: &mut [u8]) -> Result<AlpcReply, NtStatus> {
         let req: AlpcConnectPortRequest = read_req(buf)?;
+        if req.abi_size as usize == size_of::<AlpcConnectPortCheckedRequest>()
+            || req.abi_size as usize == size_of::<AlpcConnectPortAuthorizedRequest>() {
+            return self.op_connect_port_checked(core, buf, out_buf);
+        }
+        if req.abi_size as usize != size_of::<AlpcConnectPortRequest>() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         let name = read_name(buf, req.name_offset, req.name_len_bytes)?;
         // The ALPC connect PORT_MESSAGE payload IS the connection-info blob (the
         // bridge passthrough); an LPC host will read these bytes as its blob.
@@ -275,6 +758,102 @@ impl AlpcServer {
         }
     }
 
+    fn op_connect_port_checked(&mut self, core: &mut PortCore,
+        buf: &[u8], out_buf: &mut [u8]) -> Result<AlpcReply, NtStatus> {
+        let checked: AlpcConnectPortCheckedRequest = read_req(buf)?;
+        let req = checked.connect;
+        let authorized = if req.abi_size as usize
+            == size_of::<AlpcConnectPortAuthorizedRequest>() {
+            let authorization: AlpcConnectPortAuthorizedRequest = read_req(buf)?;
+            if authorization.checked != checked || authorization._reserved != 0
+                || authorization.access_granted != 1
+                || authorization.target_listen_handle == 0
+            { return Err(NtStatus::INVALID_PARAMETER); }
+            Some(authorization.target_listen_handle)
+        } else { None };
+        let (owner, generation, token) = checked_identity(checked.invocation)?;
+        if req._reserved != 0 || checked._reserved != 0
+            || req.valid_attributes != 0 || req.attr_len_bytes != 0
+            || req.connect_flags & !connect_flag::SYNC_CONNECTION != 0
+        { return Err(NtStatus::INVALID_PARAMETER); }
+        let (connection_security, client_max_message) =
+            connect_port_options(checked.port_attributes, checked.has_port_attributes)?;
+        if let Some(saved) = self.connect_results.iter_mut().find(|saved| saved.token == token) {
+            if saved.owner != owner || saved.owner_generation != generation {
+                return Err(NtStatus::OBJECT_NAME_COLLISION);
+            }
+            if saved.acknowledged { return Err(NtStatus::OBJECT_NAME_COLLISION); }
+            if saved.request != buf { return Err(NtStatus::INVALID_PARAMETER); }
+            if saved.closed { return Err(NtStatus::INVALID_PORT_HANDLE); }
+            if saved.result.status == NtStatus::PENDING.0 {
+                let connection_id = saved.result.detail1;
+                if let Some(client_handle) = core.completed_client_handle(connection_id) {
+                    let response = core.connection_response_info(connection_id)
+                        .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+                    if response.len() > out_buf.len() { return Err(NtStatus::BUFFER_TOO_SMALL); }
+                    saved.response.try_reserve_exact(response.len())
+                        .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+                    saved.response.extend_from_slice(response);
+                    saved.result = reply(NtStatus::SUCCESS, response.len() as u32,
+                        client_handle, connection_id);
+                } else if core.connection_state(connection_id) == Some(ConnState::Refused) {
+                    saved.result = reply(NtStatus::PORT_CONNECTION_REFUSED, 0, 0, connection_id);
+                }
+            }
+            if saved.response.len() > out_buf.len() { return Err(NtStatus::BUFFER_TOO_SMALL); }
+            out_buf[..saved.response.len()].copy_from_slice(&saved.response);
+            return Ok(saved.result);
+        }
+        if token.1 <= self.retired_connect_sequence {
+            return Err(NtStatus::OBJECT_NAME_COLLISION);
+        }
+        let name = read_name(buf, req.name_offset, req.name_len_bytes)?;
+        let framed = read_blob(buf, req.message_offset, req.message_len_bytes)?;
+        let payload = if framed.is_empty() { &[][..] } else {
+            if framed.len() < size_of::<PortMessage>() { return Err(NtStatus::INVALID_PARAMETER); }
+            let header: PortMessage = bytemuck::pod_read_unaligned(&framed[..size_of::<PortMessage>()]);
+            if header.total_length as usize != framed.len()
+                || header.data_length as usize != framed.len() - size_of::<PortMessage>()
+            { return Err(NtStatus::INVALID_PARAMETER); }
+            &framed[size_of::<PortMessage>()..]
+        };
+        // A checked caller identity alone is not an access decision. Keep a
+        // protected port closed to this route until the executive submits a
+        // token-derived grant bound to the exact current listen object.
+        let live_handle = core.named_listen_port_handle(&name);
+        if let Some(target) = authorized {
+            if live_handle != Some(target) { return Err(NtStatus::INVALID_PORT_HANDLE); }
+        }
+        if let Some(live_handle) = live_handle {
+            if authorized.is_none() && self.create_results.iter().any(|created| {
+                !created.closed && created.result.status == NtStatus::SUCCESS.0
+                    && created.result.detail0 == live_handle
+                    && created.security_descriptor.is_some()
+            }) {
+                return Err(NtStatus::ACCESS_DENIED);
+            }
+        }
+        self.connect_results.retain(|saved| !saved.acknowledged || !saved.closed);
+        if self.connect_results.len() >= MAX_CHECKED_SEND_RECEIVE {
+            return Err(NtStatus::INSUFFICIENT_RESOURCES);
+        }
+        self.connect_results.try_reserve(1).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+        let mut request = Vec::new();
+        request.try_reserve_exact(buf.len()).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+        request.extend_from_slice(buf);
+        let result = match core.connect_with_client_id_and_security_limit(&name, PortApi::Alpc,
+            req.subsystem_type, payload, owner, connection_security, client_max_message)? {
+            ConnectOutcome::Completed { client_handle, connection_id } =>
+                reply(NtStatus::SUCCESS, 0, client_handle, connection_id),
+            ConnectOutcome::Pending { connection_id } =>
+                reply(NtStatus::PENDING, 0, 0, connection_id),
+        };
+        self.connect_results.push(CheckedConnect { owner, owner_generation: generation,
+            token, request, result, response: Vec::new(), closed: false,
+            acknowledged: false });
+        Ok(result)
+    }
+
     /// ALPC accept folds complete: on accept the connection is driven all the way
     /// to Connected in one call. `detail0` = server comm-port handle, `detail1` =
     /// client comm-port handle (to unblock the connector).
@@ -284,6 +863,12 @@ impl AlpcServer {
         buf: &[u8],
     ) -> Result<AlpcReply, NtStatus> {
         let req: AlpcAcceptConnectRequest = read_req(buf)?;
+        if req.abi_size as usize == size_of::<AlpcAcceptConnectCheckedRequest>() {
+            return self.op_accept_connect_checked(core, buf);
+        }
+        if req.abi_size as usize != size_of::<AlpcAcceptConnectRequest>() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         let accept = req.accept != 0;
         let sh = core.accept(req.connection_id, accept, req.port_context)?;
         if !accept {
@@ -291,6 +876,92 @@ impl AlpcServer {
         }
         let (client_handle, _) = core.complete(req.connection_id)?;
         Ok(reply(NtStatus::SUCCESS, 0, sh, client_handle))
+    }
+
+    fn op_accept_connect_checked(&mut self, core: &mut PortCore,
+        buf: &[u8]) -> Result<AlpcReply, NtStatus> {
+        let checked: AlpcAcceptConnectCheckedRequest = read_req(buf)?;
+        let req = checked.accept;
+        let (owner, generation, token) = checked_identity(checked.invocation)?;
+        if req._reserved != 0 || req.accept > 1 || req.connection_id == 0
+            || checked.listen_port == 0
+        { return Err(NtStatus::INVALID_PARAMETER); }
+        if let Some(saved) = self.accept_results.iter().find(|saved| saved.token == token) {
+            if saved.owner != owner || saved.owner_generation != generation {
+                return Err(NtStatus::OBJECT_NAME_COLLISION);
+            }
+            if saved.acknowledged { return Err(NtStatus::OBJECT_NAME_COLLISION); }
+            if saved.request != buf { return Err(NtStatus::INVALID_PARAMETER); }
+            if saved.closed { return Err(NtStatus::INVALID_PORT_HANDLE); }
+            return Ok(saved.result);
+        }
+        if token.1 <= self.retired_accept_sequence {
+            return Err(NtStatus::OBJECT_NAME_COLLISION);
+        }
+        let info = core.handle_info(checked.listen_port).ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+        if info.endpoint != PortHandleEndpoint::ListenPort || info.api != PortApi::Alpc {
+            return Err(NtStatus::INVALID_PORT_HANDLE);
+        }
+        if info.server_id.process != owner.process { return Err(NtStatus::ACCESS_DENIED); }
+        let receipt = self.connection_receipts.iter().position(|receipt|
+            receipt.listen_port == checked.listen_port
+                && receipt.connection_id == req.connection_id
+                && receipt.owner.process == owner.process
+                && receipt.owner_generation == generation)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        let message = read_blob(buf, checked.message_offset, checked.message_len_bytes)?;
+        let response = if message.is_empty() { &[][..] } else {
+            if checked.message_offset as usize != size_of::<AlpcAcceptConnectCheckedRequest>()
+                || message.len() < size_of::<PortMessage>()
+            { return Err(NtStatus::INVALID_PARAMETER); }
+            let header: PortMessage = bytemuck::pod_read_unaligned(&message[..size_of::<PortMessage>()]);
+            if header.total_length as usize != message.len()
+                || header.data_length as usize != message.len() - size_of::<PortMessage>()
+                || header.msg_type != nt_alpc_abi::msg_type::CONNECTION_REQUEST
+                || u64::from(header.message_id) != req.connection_id
+                || core.connection_client_id(req.connection_id)
+                    != Some(ClientId { process: header.client_process, thread: header.client_thread })
+            { return Err(NtStatus::INVALID_PARAMETER); }
+            &message[size_of::<PortMessage>()..]
+        };
+        self.accept_results.retain(|saved| !saved.acknowledged || !saved.closed);
+        if self.accept_results.len() >= MAX_CHECKED_SEND_RECEIVE {
+            return Err(NtStatus::INSUFFICIENT_RESOURCES);
+        }
+        self.accept_results.try_reserve(1).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+        let mut request = Vec::new();
+        request.try_reserve_exact(buf.len()).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+        request.extend_from_slice(buf);
+        let mut copied_response = Vec::new();
+        copied_response.try_reserve_exact(response.len()).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+        copied_response.extend_from_slice(response);
+        let accepted = req.accept != 0;
+        let server_handle = if message.is_empty() {
+            core.accept(req.connection_id, accepted, req.port_context)?
+        } else {
+            core.accept_with_connection_info(req.connection_id, accepted,
+                req.port_context, response)?
+        };
+        let result = if accepted {
+            let (client_handle, _) = core.complete(req.connection_id)?;
+            reply(NtStatus::SUCCESS, 0, server_handle, client_handle)
+        } else {
+            reply(NtStatus::SUCCESS, 0, 0, req.connection_id)
+        };
+        self.connection_receipts.swap_remove(receipt);
+        if let Some(connect) = self.connect_results.iter_mut().find(|saved|
+            saved.result.detail1 == req.connection_id
+                && saved.result.status == NtStatus::PENDING.0)
+        {
+            connect.result = if accepted {
+                reply(NtStatus::SUCCESS, copied_response.len() as u32,
+                    result.detail1, req.connection_id)
+            } else { reply(NtStatus::PORT_CONNECTION_REFUSED, 0, 0, req.connection_id) };
+            if accepted { connect.response = copied_response; }
+        }
+        self.accept_results.push(CheckedAccept { owner, owner_generation: generation,
+            token, request, result, closed: false, acknowledged: false });
+        Ok(result)
     }
 
     /// Send an outgoing `PORT_MESSAGE` (if present) with its ALPC attributes, then
@@ -307,32 +978,367 @@ impl AlpcServer {
         out_buf: &mut [u8],
     ) -> Result<AlpcReply, NtStatus> {
         let req: AlpcSendReceiveRequest = read_req(buf)?;
+        if req.abi_size as usize == size_of::<AlpcSendReceiveCheckedRequest>() {
+            return self.op_send_receive_checked(core, op, buf, out_buf);
+        }
+        if req.abi_size as usize != size_of::<AlpcSendReceiveRequest>() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        if req.flags & send_flag::SYNC_REQUEST != 0 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+
+        Self::perform_send_receive(core, op, req, buf, out_buf, true, false, None)
+    }
+
+    fn op_send_receive_checked(
+        &mut self,
+        core: &mut PortCore,
+        op: u16,
+        buf: &[u8],
+        out_buf: &mut [u8],
+    ) -> Result<AlpcReply, NtStatus> {
+        let checked: AlpcSendReceiveCheckedRequest = read_req(buf)?;
+        let invocation = checked.invocation;
+        let owner = ClientId {
+            process: invocation.owner_process,
+            thread: invocation.owner_thread,
+        };
+        let token = (invocation.invocation_hi, invocation.invocation_lo);
+        if owner.process == 0 || owner.thread == 0 || invocation.owner_generation == 0
+            || token == (0, 0) || checked.send_receive._reserved != 0
+            || checked.send_receive._reserved2 != 0
+            || checked.send_receive.flags
+                & !(send_flag::RECV_ATTRIBUTES | send_flag::REPLY_MESSAGE
+                    | send_flag::SYNC_REQUEST) != 0
+            || (checked.send_receive.flags & send_flag::REPLY_MESSAGE != 0
+                && checked.send_receive.message_len_bytes == 0)
+            || (checked.send_receive.flags & send_flag::SYNC_REQUEST != 0
+                && (checked.send_receive.flags & send_flag::REPLY_MESSAGE != 0
+                    || checked.send_receive.message_len_bytes == 0
+                    || op != opcode::ALPC_OP_SEND_RECEIVE))
+            || (checked.send_receive.flags & send_flag::RECV_ATTRIBUTES != 0
+                && (checked.send_receive.valid_attributes != msg_attr_flag::CONTEXT
+                    || checked.send_receive.attr_len_bytes != 0))
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let sync_identity = if checked.send_receive.flags & send_flag::SYNC_REQUEST != 0 {
+            Some(MessageIdentity { client: owner,
+                message_id: u32::try_from(token.1).ok().filter(|id| *id != 0)
+                    .ok_or(NtStatus::INVALID_PARAMETER)? })
+        } else { None };
+        let receipt_listen_port = if checked.send_receive.flags & send_flag::REPLY_MESSAGE != 0 {
+            core.connection_listen_handle_for_server_reply(checked.send_receive.port_handle)
+        } else {
+            core.handle_info(checked.send_receive.port_handle)
+                .filter(|info| info.endpoint == PortHandleEndpoint::ListenPort)
+                .map(|_| checked.send_receive.port_handle)
+        };
+        if let Some(saved) = self.send_receive_results.iter_mut().find(|saved| saved.token == token) {
+            if saved.owner != owner || saved.owner_generation != invocation.owner_generation {
+                return Err(NtStatus::OBJECT_NAME_COLLISION);
+            }
+            if saved.op != op || saved.request != buf || saved.output.len() != out_buf.len() {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            if let Some(result) = saved.terminal {
+                out_buf.copy_from_slice(&saved.output);
+                return Ok(result);
+            }
+            if receipt_listen_port.is_some() {
+                if self.connection_receipts.len() >= MAX_CHECKED_SEND_RECEIVE {
+                    return Err(NtStatus::INSUFFICIENT_RESOURCES);
+                }
+                self.connection_receipts.try_reserve(1)
+                    .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+            }
+            // The request was reserved before its first effect. Redrive only
+            // the receive half, including when the first send is uncertain.
+            let result = Self::perform_send_receive(
+                core, op, checked.send_receive, buf, &mut saved.output, false, true,
+                sync_identity,
+            );
+            let result = match result {
+                Ok(reply) => reply,
+                Err(status) => reply(status, 0, 0, 0),
+            };
+            if result.status != NtStatus::PENDING.0 {
+                saved.terminal = Some(result);
+            }
+            if result.status == NtStatus::SUCCESS.0
+                && result.detail1 == u64::from(nt_alpc_abi::msg_type::CONNECTION_REQUEST)
+            {
+                self.connection_receipts.push(ConnectionReceipt { owner,
+                    owner_generation: invocation.owner_generation,
+                    listen_port: receipt_listen_port.ok_or(NtStatus::INVALID_PORT_HANDLE)?,
+                    connection_id: result.detail0 });
+            }
+            out_buf.copy_from_slice(&saved.output);
+            return Ok(result);
+        }
+        if token.1 <= self.retired_send_receive_sequence {
+            return Err(NtStatus::OBJECT_NAME_COLLISION);
+        }
+        let info = core.handle_info(checked.send_receive.port_handle)
+            .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+        let port_owner = match info.endpoint {
+            PortHandleEndpoint::ListenPort | PortHandleEndpoint::ServerCommPort => info.server_id.process,
+            PortHandleEndpoint::ClientCommPort => info.client_id.ok_or(NtStatus::INVALID_PORT_HANDLE)?.process,
+        };
+        if info.api != PortApi::Alpc || owner.process != port_owner {
+            return Err(NtStatus::ACCESS_DENIED);
+        }
+        if receipt_listen_port.is_some() {
+            if self.connection_receipts.len() >= MAX_CHECKED_SEND_RECEIVE {
+                return Err(NtStatus::INSUFFICIENT_RESOURCES);
+            }
+            self.connection_receipts.try_reserve(1)
+                .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+        }
+        // Reserve the exact request and output capacity before sending or
+        // consuming a queued message. A failed allocation has zero effect.
+        if self.send_receive_results.len() >= MAX_CHECKED_SEND_RECEIVE {
+            return Err(NtStatus::INSUFFICIENT_RESOURCES);
+        }
+        self.send_receive_results.try_reserve(1).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+        let mut request = Vec::new();
+        request.try_reserve_exact(buf.len()).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+        request.extend_from_slice(buf);
+        let mut output = Vec::new();
+        output.try_reserve_exact(out_buf.len()).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+        output.resize(out_buf.len(), 0);
+        self.send_receive_results.push(CheckedSendReceive {
+            owner,
+            owner_generation: invocation.owner_generation,
+            token,
+            op,
+            request,
+            output,
+            terminal: None,
+        });
+        let saved = self.send_receive_results.last_mut().ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+        let result = Self::perform_send_receive(
+            core, op, checked.send_receive, buf, &mut saved.output, true, true,
+            sync_identity,
+        );
+        let result = match result {
+            Ok(reply) => reply,
+            Err(status) => reply(status, 0, 0, 0),
+        };
+        if result.status != NtStatus::PENDING.0 {
+            saved.terminal = Some(result);
+        }
+        if result.status == NtStatus::SUCCESS.0
+            && result.detail1 == u64::from(nt_alpc_abi::msg_type::CONNECTION_REQUEST)
+        {
+            self.connection_receipts.push(ConnectionReceipt { owner,
+                owner_generation: invocation.owner_generation,
+                listen_port: receipt_listen_port.ok_or(NtStatus::INVALID_PORT_HANDLE)?,
+                connection_id: result.detail0 });
+        }
+        out_buf.copy_from_slice(&saved.output);
+        Ok(result)
+    }
+
+    fn op_ack_send_receive(&mut self, buf: &[u8]) -> Result<AlpcReply, NtStatus> {
+        let ack: AlpcAcknowledgeSendReceiveRequest = read_req(buf)?;
+        let invocation = ack.invocation;
+        let token = (invocation.invocation_hi, invocation.invocation_lo);
+        if ack.abi_size as usize != size_of::<AlpcAcknowledgeSendReceiveRequest>()
+            || ack._reserved != 0 || ack._reserved2 != 0
+            || invocation.owner_process == 0 || invocation.owner_thread == 0
+            || invocation.owner_generation == 0 || token == (0, 0)
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let index = self.send_receive_results.iter().position(|saved| saved.token == token)
+            .ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
+        let saved = &self.send_receive_results[index];
+        if saved.owner != (ClientId { process: invocation.owner_process,
+            thread: invocation.owner_thread })
+            || saved.owner_generation != invocation.owner_generation
+        {
+            return Err(NtStatus::OBJECT_NAME_COLLISION);
+        }
+        if saved.terminal.is_none() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        self.send_receive_results.swap_remove(index);
+        self.retired_send_receive_sequence = self.retired_send_receive_sequence.max(token.1);
+        Ok(ok())
+    }
+
+    fn perform_send_receive(
+        core: &mut PortCore,
+        op: u16,
+        req: AlpcSendReceiveRequest,
+        buf: &[u8],
+        out_buf: &mut [u8],
+        send_allowed: bool,
+        native_checked: bool,
+        sync_identity: Option<MessageIdentity>,
+    ) -> Result<AlpcReply, NtStatus> {
 
         // Send half (skipped for a pure receive op or a zero-length send).
-        if op == opcode::ALPC_OP_SEND_RECEIVE && req.message_len_bytes != 0 {
+        if send_allowed && op == opcode::ALPC_OP_SEND_RECEIVE && req.message_len_bytes != 0 {
             let msg = read_blob(buf, req.message_offset, req.message_len_bytes)?;
             let attr_blob = read_blob(buf, req.attr_offset, req.attr_len_bytes)?;
             let attrs = parse_attrs(req.valid_attributes, attr_blob);
-            core.send_message(req.port_handle, msg, attrs)?;
+            if req.flags & send_flag::REPLY_MESSAGE != 0 {
+                let header: PortMessage = read_at(msg, 0).ok_or(NtStatus::INVALID_PARAMETER)?;
+                if usize::from(header.total_length) != msg.len()
+                    || usize::from(header.data_length) + size_of::<PortMessage>() != msg.len()
+                { return Err(NtStatus::INVALID_PARAMETER); }
+                let mut reply = Vec::new();
+                reply.try_reserve_exact(msg.len())
+                    .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+                reply.extend_from_slice(msg);
+                reply[4..6].copy_from_slice(&nt_alpc_abi::msg_type::REPLY.to_le_bytes());
+                core.send_reply_message(req.port_handle, &reply, attrs,
+                    nt_port_core::MessageIdentity {
+                        client: ClientId {
+                            process: header.client_process,
+                            thread: header.client_thread,
+                        },
+                        message_id: header.message_id,
+                    })?;
+            } else if let Some(identity) = sync_identity {
+                let header: PortMessage = read_at(msg, 0).ok_or(NtStatus::INVALID_PARAMETER)?;
+                if usize::from(header.total_length) != msg.len()
+                    || usize::from(header.data_length) + size_of::<PortMessage>() != msg.len()
+                { return Err(NtStatus::INVALID_PARAMETER); }
+                let mut request = Vec::new();
+                request.try_reserve_exact(msg.len())
+                    .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+                request.extend_from_slice(msg);
+                // ALPC supplies the request type to the server. User-mode CSR
+                // initializes this header field to zero before the syscall.
+                request[4..6].copy_from_slice(&nt_alpc_abi::msg_type::REQUEST.to_le_bytes());
+                request[8..16].copy_from_slice(&identity.client.process.to_le_bytes());
+                request[16..24].copy_from_slice(&identity.client.thread.to_le_bytes());
+                request[24..28].copy_from_slice(&identity.message_id.to_le_bytes());
+                core.send_request_message(req.port_handle, &request, attrs, identity)?;
+            } else {
+                core.send_message(req.port_handle, msg, attrs)?;
+            }
+        }
+
+        if let Some(identity) = sync_identity {
+            let Some(QueuedMessage { bytes, attrs, .. }) =
+                core.receive_reply_message(req.port_handle, identity)?
+            else { return Ok(reply(NtStatus::PENDING, 0, 0, 0)); };
+            let present = project_valid_attributes(&attrs);
+            let prefix = if req.flags & send_flag::RECV_ATTRIBUTES != 0 {
+                let (valid, blob) = serialize_attrs(req.valid_attributes, &attrs);
+                if blob.len().checked_add(bytes.len()).is_none_or(|len| len > out_buf.len()) {
+                    return Err(NtStatus::BUFFER_TOO_SMALL);
+                }
+                out_buf[..blob.len()].copy_from_slice(&blob);
+                (blob.len(), valid)
+            } else { (0, present) };
+            let total = prefix.0.checked_add(bytes.len()).ok_or(NtStatus::BUFFER_TOO_SMALL)?;
+            if total > out_buf.len() { return Err(NtStatus::BUFFER_TOO_SMALL); }
+            out_buf[prefix.0..total].copy_from_slice(&bytes);
+            return Ok(reply(NtStatus::SUCCESS, total as u32,
+                u64::from(prefix.1), u64::from(read_msg_type(&bytes))));
+        }
+
+        let reply_wait = req.flags & send_flag::REPLY_MESSAGE != 0;
+        if native_checked {
+            if let Some((connection_id, payload_len)) =
+                if reply_wait {
+                    core.peek_pending_connection_after_server_reply(req.port_handle)
+                } else {
+                    core.peek_pending_connection(req.port_handle)
+                }
+            {
+                let total = size_of::<PortMessage>().checked_add(payload_len)
+                    .ok_or(NtStatus::INVALID_PARAMETER)?;
+                if u32::try_from(connection_id).is_err() {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
+                let attribute_reserve = if req.flags & send_flag::RECV_ATTRIBUTES != 0 {
+                    8 + size_of::<AlpcContextAttr>()
+                } else { 0 };
+                if total > out_buf.len().saturating_sub(attribute_reserve)
+                    || total > u16::MAX as usize {
+                    return Err(NtStatus::BUFFER_TOO_SMALL);
+                }
+            }
         }
 
         // Receive half. NtAlpcSendWaitReceivePort receives BOTH a pending
         // connection request (on a listen port) AND a data message (on a comm
         // port); try the connection request first, then the data queue.
-        let conn_try = core.receive(req.port_handle);
+        let conn_try = if reply_wait {
+            core.receive_after_server_reply(req.port_handle)
+        } else {
+            core.receive(req.port_handle)
+        };
         if let Ok(ReceiveOutcome::ConnectionRequest {
             connection_id,
             msg_type,
         }) = conn_try
         {
+            if native_checked {
+                let payload = core.connection_info(connection_id)
+                    .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+                let client = core.connection_client_id(connection_id)
+                    .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+                let total = size_of::<PortMessage>() + payload.len();
+                let header = PortMessage {
+                    data_length: payload.len() as u16,
+                    total_length: total as u16,
+                    msg_type,
+                    client_process: client.process,
+                    client_thread: client.thread,
+                    message_id: connection_id as u32,
+                    ..Default::default()
+                };
+                let prefix = if req.flags & send_flag::RECV_ATTRIBUTES != 0 {
+                    out_buf[..8].copy_from_slice(bytemuck::bytes_of(&AlpcMessageAttributes {
+                        allocated_attributes: req.valid_attributes,
+                        valid_attributes: 0,
+                    }));
+                    8
+                } else { 0 };
+                out_buf[prefix..prefix + size_of::<PortMessage>()]
+                    .copy_from_slice(bytemuck::bytes_of(&header));
+                out_buf[prefix + size_of::<PortMessage>()..prefix + total].copy_from_slice(payload);
+                return Ok(reply(NtStatus::SUCCESS, (prefix + total) as u32,
+                    connection_id, msg_type as u64));
+            }
             // detail0 = connection id (feed to accept), detail1 = CONNECTION_REQUEST.
             return Ok(reply(NtStatus::SUCCESS, 0, connection_id, msg_type as u64));
         }
         // A valid listen port with nothing pending must park, not error.
         let is_listen_port = conn_try.is_ok();
+        let checked_message_capacity = if req.flags & send_flag::RECV_ATTRIBUTES != 0 {
+            out_buf.len().saturating_sub(8 + size_of::<AlpcContextAttr>())
+        } else { out_buf.len() };
+        if native_checked && core.peek_receive_message_len(req.port_handle)
+            .is_some_and(|len| len > checked_message_capacity)
+        {
+            return Err(NtStatus::BUFFER_TOO_SMALL);
+        }
+        let server_receive = core.handle_info(req.port_handle).is_some_and(|info|
+            matches!(info.endpoint,
+                PortHandleEndpoint::ListenPort | PortHandleEndpoint::ServerCommPort));
         match core.receive_message(req.port_handle) {
-            Ok(Some(QueuedMessage { bytes, attrs, .. })) => {
+            Ok(Some(QueuedMessage { bytes, mut attrs, provenance, port_context,
+                request_identity })) => {
                 let msg_type = read_msg_type(&bytes);
+                // A checked ALPC request carries the accepted connection's
+                // PortContext. Ordinary messages retain their sender attributes,
+                // including LPC bridge degradation and ALPC message context.
+                if native_checked && server_receive && provenance.connection_id != 0
+                    && request_identity.is_some()
+                    && core.connection_apis(provenance.connection_id)
+                        .is_some_and(|(client, _)| client == PortApi::Alpc)
+                {
+                    attrs.context = Some(port_context);
+                }
                 // Project the neutral attrs into the ALPC valid-attributes view.
                 // Non-bridging attrs from an ALPC peer are surfaced; an LPC peer
                 // carried none, so valid == 0 (the LPC → ALPC degradation).

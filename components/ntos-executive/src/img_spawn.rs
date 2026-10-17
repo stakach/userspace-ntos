@@ -641,7 +641,7 @@ pub(crate) unsafe fn initialize_kuser_snapshot(scratch_va: u64, system_root: &[u
     let time = nt_time_snapshot_at(interrupt_time);
     let processor = exec_handler::native_processor_information();
     let page = unsafe { &mut *(scratch_va as *mut [u8; nt_ntdll_layout::kuser::PAGE_SIZE]) };
-    nt_ntdll_layout::kuser::initialize_page(
+    nt_ntdll_layout::kuser::initialize_page_with_active_console(
         page,
         nt_ntdll_layout::kuser::StaticInformation {
             nt_product_type: 1,
@@ -659,6 +659,7 @@ pub(crate) unsafe fn initialize_kuser_snapshot(scratch_va: u64, system_root: &[u
         interrupt_time,
         time.system_time_100ns,
         system_root,
+        kuser_active_console::current(),
     );
     nt_ntdll_layout::kuser::update_time_zone(
         page,

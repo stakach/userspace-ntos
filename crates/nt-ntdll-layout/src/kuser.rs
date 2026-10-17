@@ -26,10 +26,15 @@ pub const PRODUCT_TYPE_IS_VALID: usize = 0x268;
 pub const NT_MAJOR_VERSION: usize = 0x26c;
 pub const NT_MINOR_VERSION: usize = 0x270;
 pub const PROCESSOR_FEATURES: usize = 0x274;
+/// Session ID of the active physical console, shared with every process.
+/// The pinned LiberNT kernel's `RtlSetActiveConsoleId` writes this field.
+pub const ACTIVE_CONSOLE_ID: usize = 0x2d8;
 pub const NUMBER_OF_PHYSICAL_PAGES: usize = 0x2e8;
 pub const TICK_COUNT: usize = 0x320;
 pub const COOKIE: usize = 0x330;
 pub const ACTIVE_PROCESSOR_COUNT: usize = 0x3c0;
+/// NT 10 x64 `KUSER_SHARED_DATA.XState.EnabledFeatures` in the pinned LiberNT ABI.
+pub const XSTATE_ENABLED_FEATURES: usize = 0x3d8;
 
 pub const PROCESSOR_FEATURE_COUNT: usize = 64;
 pub const TICK_COUNT_MULTIPLIER_ONE_MS: u32 = 1 << 24;
@@ -104,6 +109,47 @@ pub fn initialize_page(
     );
 }
 
+/// Construct a new process snapshot with the currently published console ID.
+pub fn initialize_page_with_active_console(
+    page: &mut [u8; PAGE_SIZE],
+    information: StaticInformation,
+    interrupt_time_100ns: u64,
+    system_time_100ns: u64,
+    system_root: &[u8],
+    active_console_id: u32,
+) {
+    initialize_page(page, information, interrupt_time_100ns, system_time_100ns, system_root);
+    write_active_console_id(page, active_console_id);
+}
+
+/// Read the active console session from one complete shared-data page snapshot.
+pub fn read_active_console_id(page: &[u8; PAGE_SIZE]) -> u32 {
+    u32::from_le_bytes(
+        page[ACTIVE_CONSOLE_ID..ACTIVE_CONSOLE_ID + 4]
+            .try_into()
+            .expect("the active-console field fits in a KUSER page"),
+    )
+}
+
+/// Publish the active console session into one complete shared-data page snapshot.
+///
+/// A native publisher must atomically update every live process alias and the
+/// kernel alias under its own ownership protocol. This byte-slice operation is
+/// for constructing or updating an exclusively owned snapshot.
+pub fn write_active_console_id(page: &mut [u8; PAGE_SIZE], session_id: u32) {
+    page[ACTIVE_CONSOLE_ID..ACTIVE_CONSOLE_ID + 4]
+        .copy_from_slice(&session_id.to_le_bytes());
+}
+
+/// Publish the console ID to an already mapped KUSER page with one aligned store.
+///
+/// # Safety
+/// `page` must be a writable, 4-byte-aligned KUSER page owned by the caller.
+pub unsafe fn publish_active_console_id(page: *mut u8, session_id: u32) {
+    debug_assert_eq!(page as usize & 3, 0);
+    unsafe { core::ptr::write_volatile(page.add(ACTIVE_CONSOLE_ID) as *mut u32, session_id) };
+}
+
 /// Publish the effective timezone fields consumed directly through `KUSER_SHARED_DATA`.
 pub fn update_time_zone(page: &mut [u8; PAGE_SIZE], bias_100ns: i64, time_zone_id: u32) {
     put_ksystem_time(page, TIME_ZONE_BIAS, bias_100ns as u64);
@@ -156,6 +202,16 @@ pub unsafe fn read_tick_count(page: *const u8) -> u32 {
     let multiplier =
         unsafe { core::ptr::read_volatile(page.add(TICK_COUNT_MULTIPLIER) as *const u32) };
     tick_count_to_milliseconds(ticks, multiplier)
+}
+
+/// Return the enabled XState bits requested by the caller. The host publishes zero
+/// until it supplies an OS-backed extended-state save/restore contract.
+///
+/// # Safety
+/// `page` identifies a readable native `KUSER_SHARED_DATA` page.
+pub unsafe fn read_enabled_extended_features(page: *const u8, mask: u64) -> u64 {
+    let enabled = unsafe { core::ptr::read_volatile(page.add(XSTATE_ENABLED_FEATURES) as *const u64) };
+    enabled & mask
 }
 
 /// Publish the dynamic clocks consumed directly through `KUSER_SHARED_DATA`.
@@ -305,6 +361,18 @@ mod tests {
         const PF_XSAVE_ENABLED: usize = 17;
         let features = processor_features(u32::MAX);
         assert_eq!(features[PF_XSAVE_ENABLED], 0);
+    }
+
+    #[test]
+    fn enabled_extended_features_reads_the_pinned_nt10_field_and_masks_it() {
+        #[repr(align(8))]
+        struct AlignedPage([u8; PAGE_SIZE]);
+
+        let mut page = AlignedPage([0u8; PAGE_SIZE]);
+        assert_eq!(unsafe { read_enabled_extended_features(page.0.as_ptr(), !0) }, 0);
+        page.0[XSTATE_ENABLED_FEATURES..XSTATE_ENABLED_FEATURES + 8]
+            .copy_from_slice(&0b1011u64.to_le_bytes());
+        assert_eq!(unsafe { read_enabled_extended_features(page.0.as_ptr(), 0b0110) }, 0b0010);
     }
 
     #[test]

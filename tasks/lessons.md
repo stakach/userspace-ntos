@@ -1,5 +1,15 @@
 # Lessons
 
+## Keep The Kernel-Facing DLL When Changing Userspace Media
+- An installed distribution supplies the user-mode image and drivers, but this project's
+  source-built `ntdll.dll` is the interface to its NT kernel personality. Stage our DLL
+  in the generated image and leave the release archive and its `acpi.sys` untouched.
+- Compare the built DLL's named exports and ordinals with the distribution DLL before
+  booting. Gate on missing names; report ordinal differences separately when the pinned
+  installed binaries import by name. Scan the whole installed PE tree for ntdll ordinal
+  imports before accepting different ordinals; the pinned LiberNT tree has none. Generate
+  import fixups against the DLL actually staged, and fail on gaps.
+
 ## Stage The Whole Public Export Chain
 - Before committing a tested crate change, inspect `git diff --cached` for every module
   re-export between the new type and the crate root. Local tests can pass from uncommitted
@@ -657,6 +667,9 @@ diagnosis-free failure.
 ## Fix Upstream Source Instead Of Patching Vendor Binaries
 - When a pinned ReactOS binary has a source-level defect, prepare an upstream source pull request
   with the native reproduction and reference accounting. Do not alter the binary locally.
+- Treat load-time instruction rewrites as binary modification too. When hosted code executes a
+  privileged instruction, implement an exact fault/continuation contract in source instead of
+  assuming a fixed image RVA or patchable instruction length in a new release.
 - Keep strict acceptance failed until an official fixed build is integrated and the native fixture
   passes. Track the upstream dependency separately from already-proven desktop acceptance.
 
@@ -676,3 +689,14 @@ diagnosis-free failure.
 ## Verify Live Input Before Requesting Desktop Interaction
 - A visible Winlogon frame does not prove that keyboard input reaches i8042 and kbdclass. Send a bounded QMP key event and verify the IRQ and class callback before asking a person to type credentials.
 - When replaying a shorter accepted persistence tail into a larger reserve, clear the entire reserve first. Stale bytes in the unused half can change recovery and invalidate the boot comparison.
+
+## Keep The Kernel Interface In Our Ntdll
+- For a replacement userspace release, stage this project's source-built `ntdll.dll` as the kernel interface and retain the release's unrelated drivers, including `acpi.sys`.
+- Compare exported names against the pinned release `ntdll.dll` and check installed PE imports before boot. Export coverage is an admission gate; live calls and desktop behavior need separate proof.
+- Treat named export coverage as the DLL compatibility requirement when the installed binaries import by name. Audit ordinal imports separately; differing export ordinal numbers alone do not require replacing the source-built kernel interface.
+
+## Test Native Boundaries Through Their Domain Contracts
+- A source-string assertion that only repeats the intended implementation is not a useful regression. Prove filtering, generation, ownership, and selector behavior in the relevant domain or protocol tests, then verify native wiring with a build and boot.
+
+## Preserve The RED Checkpoint With A Sole Test Owner
+- When another agent is the sole build and test owner, save the reproducing regression and stop editing until that agent reports the RED result. Implementing immediately can turn the requested RED checkpoint into an unobserved test.

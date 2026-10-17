@@ -31,6 +31,13 @@ mod allocator;
 mod component_heap;
 mod debug_traps;
 mod alpc_selftest;
+mod native_alpc_create;
+mod native_alpc_create_work;
+mod native_alpc_close_work;
+mod native_alpc_port_security;
+mod native_alpc_connect_accept_work;
+mod native_alpc_send_receive_work;
+mod kuser_active_console;
 mod termination_port_notifications;
 use termination_port_notifications::notify_thread_termination_ports;
 pub(crate) use acpi_platform::*;
@@ -49,6 +56,8 @@ mod provider_registry_caller;
 mod provider_directory_broker;
 mod provider_section_broker;
 mod provider_service_ingress;
+mod process_information_bridge;
+mod process_information_capture;
 mod provider_section_cleanup;
 mod provider_section_receipts;
 mod registry_query_diagnostics;
@@ -67,11 +76,16 @@ mod hosted_stack_growth;
 mod local_section_file;
 mod native_image_source_io;
 mod storage_host;
+mod boot_probe_thread_retirement;
 mod bootstrap_image;
 mod system_modules;
 mod video_device;
 mod win32k_pe;
+mod ex_rundown_exports;
+mod win32k_frame_capture;
 mod win32k_seh_image;
+mod win32k_cr8_publication;
+mod hosted_win32k_cr8_fault;
 mod win32k_session_runtime;
 mod win32k_subsystem;
 pub(crate) use service_sec_image::*;
@@ -88,6 +102,7 @@ mod thread_context;
 mod thread_suspend;
 mod boot_registry_mutation_work;
 mod object_wait;
+mod thread_alert;
 use object_wait::*;
 mod object_wait_apc;
 mod object_wait_reply;
@@ -115,6 +130,7 @@ mod section_metadata_work;
 mod section_pagein_work;
 pub(crate) use fs_loader::*;
 mod hosted_bootstrap;
+mod installed_layout;
 pub(crate) use hosted_bootstrap::*;
 mod hosted_loaded_images;
 pub(crate) use hosted_loaded_images::*;
@@ -134,6 +150,7 @@ mod provider_dispatcher_backend;
 mod provider_file_wait;
 mod ps_object_retirement;
 mod provider_ps;
+mod native_thread_priority;
 mod provider_ps_projection;
 mod sec_image_diagnostic;
 mod fault_stack_diagnostics;
@@ -171,6 +188,7 @@ mod win32k_glue;
 pub(crate) use win32k_glue::*;
 pub(crate) use win32k_session_runtime::*;
 mod driver_launch;
+mod hosted_driver_assertion;
 pub(crate) use driver_launch::*;
 
 use core::panic::PanicInfo;
@@ -969,6 +987,8 @@ pub const SSN_NT_SET_INFO_THREAD: u64 = 238;
 pub const SSN_NT_SET_INFO_PROCESS: u64 = 237;
 /// ntdll's NtTestAlert SSN (LdrpInitialize drains pending APCs before the image entry).
 pub const SSN_NT_TEST_ALERT: u64 = 268;
+pub const SSN_NT_ALERT_THREAD_BY_THREAD_ID: u64 = 0x406;
+pub const SSN_NT_WAIT_FOR_ALERT_BY_THREAD_ID: u64 = 0x4ad;
 /// ntdll's NtQueueApcThread SSN (RTL work items queue user APCs to alertable worker threads).
 pub const SSN_NT_QUEUE_APC_THREAD: u64 = 188;
 /// NtInitializeRegistry — smss tells the Config Manager that boot registry initialization has
@@ -1095,7 +1115,10 @@ pub const SSN_NT_DELETE_VALUE_KEY: u64 = 68;
 /// Security-token SSNs. The Ex opens differ only by their handle-attribute argument.
 pub const SSN_NT_ACCESS_CHECK: u64 = 1;
 pub const SSN_NT_ACCESS_CHECK_BY_TYPE: u64 = 3;
+pub const SSN_NT_ACCESS_CHECK_BY_TYPE_AND_AUDIT_ALARM: u64 = 4;
 pub const SSN_NT_ACCESS_CHECK_BY_TYPE_RESULT_LIST: u64 = 5;
+pub const SSN_NT_ACCESS_CHECK_BY_TYPE_RESULT_LIST_AND_AUDIT_ALARM: u64 = 6;
+pub const SSN_NT_ACCESS_CHECK_BY_TYPE_RESULT_LIST_AND_AUDIT_ALARM_BY_HANDLE: u64 = 7;
 pub const SSN_NT_DUPLICATE_TOKEN: u64 = 72;
 pub const SSN_NT_FILTER_TOKEN: u64 = 79;
 /// NtCreateToken — lsasrv's `LsapLogonUser` mints the interactive logon token here
@@ -1288,7 +1311,8 @@ pub const WINSRV_SRVBUF_OFFSET: u64 = 0x10000; // 64 KiB in — clear of basesrv
 /// SRVBUF), dual-mapped host<->exec like SRVBUF. Size reported at STORAGE_SHARED+0x94; the executive
 /// parses it PE32+ and spawns it as the 3rd hosted process when smss's RtlCreateUserProcess creates it.
 pub const WINLOGONBUF_VADDR: u64 = 0x0000_0100_1420_0000; // own PT, past SRVBUF (0x1400)
-pub const WINLOGONBUF_FRAMES: u64 = 64; // 256 KiB — holds the 229888 B winlogon.exe
+pub const WINLOGONBUF_FRAMES: u64 = 80; // holds the installed 274432 B winlogon.exe
+const _: () = assert!(WINLOGONBUF_FRAMES * 0x1000 >= 274_432);
 /// The Win32 client stack (kernel32 ~2.66 MiB + user32 ~1.12 MiB + gdi32 ~326 KiB) that winsrv.dll
 /// statically imports. These are too large for the SRVBUF, so they get their own fresh 6 MiB region
 /// (3 PTs), dual-mapped host<->exec like SRVBUF. Sizes reported at STORAGE_SHARED +0x4c/+0x50/+0x54.
@@ -1309,11 +1333,10 @@ pub const NTDLL_VISTA_WIN32BUF_OFFSET: u64 = 0x670000; // ntdll_vista ~56 KiB (e
                                                        // winlogon.exe's two extra static imports (the rest of its Win32 stack is shared with csrss above).
 pub const USERENV_WIN32BUF_OFFSET: u64 = 0x680000; // userenv ~166 KiB (file 0x297C0)
 pub const MPR_WIN32BUF_OFFSET: u64 = 0x6C0000; // mpr ~107 KiB (ends ~0x6DAC00)
-/// Raw win32k.sys staging buffer (2,208,192 B). Its own 2 MiB-aligned window past WIN32BUF, with
-/// 2 page tables (544 frames = 0x220000 spans two 2 MiB PTs). The storage host reads win32k.sys
-/// off disk into here; the executive parses+loads it into the win32k-service component.
+/// Raw win32k.sys staging buffer for the pinned 2,088,960-byte LiberNT file. Its virtual PE
+/// image is larger and receives a separate frame run at WIN32K_CODE_VA.
 pub const WIN32KBUF_VADDR: u64 = 0x0000_0100_0600_0000;
-pub const WIN32KBUF_FRAMES: u64 = 544; // 0x220 — matches win32k.sys size_of_image
+pub const WIN32KBUF_FRAMES: u64 = 544; // 0x220 — covers the released raw file
 /// Fault-endpoint badge for the second hosted process (csrss). smss's fault cap is an unbadged
 /// copy (badge 0); csrss's is minted at this badge so the single service loop can tell them apart.
 pub const CSRSS_BADGE: u64 = 2;
@@ -1992,8 +2015,10 @@ pub const NLS_CASE_FRAMES: u64 = 4;
 /// The installed ReactOS SYSTEM registry hive (::ROSSYS.HIV, ~204 KiB regf), read off the disk by
 /// the isolated storage host into these shared frames. Boot composition imports it once and hands
 /// the resulting image to isolated CM; it is not a runtime executive registry view.
-pub const HIVEBUF_VADDR: u64 = 0x0000_0100_10B5_0000;
-pub const HIVEBUF_FRAMES: u64 = 64; // 256 KiB
+pub const HIVEBUF_VADDR: u64 = 0x0000_0100_10C0_0000;
+pub const HIVEBUF_FRAMES: u64 = 288; // installed SYSTEM hive is 1122304 B
+const _: () = assert!(HIVEBUF_FRAMES * 0x1000 >= 1_122_304);
+const _: () = assert!(HIVEBUF_FRAMES * 0x1000 <= 0x20_0000);
 /// The real ReactOS **SECURITY** hive (`\reactos\system32\config\security`, 8 KiB regf) — the LSA
 /// policy database's on-disk backing store. Read BY PATH off the image by the isolated storage
 /// host, exactly like the SYSTEM hive, and mounted read-only at `\Registry\Machine\SECURITY`.
@@ -2024,8 +2049,8 @@ const _: () = assert!(DEFHIVEBUF_VADDR + DEFHIVEBUF_FRAMES * 0x1000 <= 0x0000_01
 /// leftover of the shared 0xA0-0xC0 input page table: it gets its OWN 2 MiB window + dedicated PT
 /// below the process-mirror region (0x1200_0000).
 pub const SWHIVEBUF_VADDR: u64 = 0x0000_0100_10E0_0000;
-pub const SWHIVEBUF_FRAMES: u64 = 128; // 512 KiB (the staged hive is 471040 B = 115 pages)
-const _: () = assert!(SWHIVEBUF_FRAMES * 0x1000 >= 471_040);
+pub const SWHIVEBUF_FRAMES: u64 = 480; // installed SOFTWARE hive is 1961984 B
+const _: () = assert!(SWHIVEBUF_FRAMES * 0x1000 >= 1_961_984);
 const _: () = assert!(SWHIVEBUF_VADDR & 0x1F_FFFF == 0); // 2 MiB aligned -> exactly one PT window
 const _: () = assert!(SWHIVEBUF_FRAMES * 0x1000 <= 0x20_0000);
 /// The same NLS frames shared into smss (own PT at the 0xE0_0000 2 MiB region). The PEB's
@@ -2924,7 +2949,6 @@ unsafe fn watchdog_report(messages: u64) {
         print_str(b" entered-at-ms=");
         print_u64(W32_PREV_T.load(Ordering::Relaxed) / 10_000);
         print_str(b"\n");
-        win32k_subsystem::trace_win32k_request_context();
         win32k_glue::win32k_dispatch_backtrace();
     }
     let now = nt_time_snapshot();
@@ -3054,6 +3078,7 @@ const DELAY_TIMER_SOURCE_HOSTED_DPC: u64 = 19;
 const DELAY_TIMER_SOURCE_REGISTRY_MUTATION: u64 = 20;
 const DELAY_TIMER_SOURCE_SECTION_METADATA: u64 = 21;
 const DELAY_TIMER_SOURCE_SYSTEM_WAL_FOLD: u64 = 22;
+const DELAY_TIMER_SOURCE_THREAD_ALERT: u64 = 23;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -4254,7 +4279,7 @@ unsafe fn writable_overlay_spec(passed: &mut u64, report: &DesktopAcceptanceRepo
     let attr_queries = OVERLAY_ATTR_QUERIES.load(Ordering::Relaxed);
     let restored = snapshot_restore_seen();
     let restored_profile_source =
-        restored && PROFILE_SOURCE_DIRS.load(Ordering::Relaxed) >= 45 && copied_profile_probe_ok();
+        restored && PROFILE_SOURCE_DIRS.load(Ordering::Relaxed) >= 2 && copied_profile_probe_ok();
     print_str(b"[writable-fs] mounted=");
     print_u64(writable_fs_mounted() as u64);
     print_str(b" restored=");
@@ -5350,22 +5375,8 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
     );
 }
 
-/// ═══ `CopyDirectory` REALLY RAN — the profile tree was COPIED, not just created ═════════════════
-///
-/// `userenv!CreateUserProfileExW` seeds a new profile by calling
-/// `CopyDirectory(C:\Profiles\<user>, C:\Profiles\Default User)` (`profile.c:1000`), which
-/// `FindFirstFileW`s the source, `CreateDirectoryExW`s every subdirectory and `CopyFileW`s every
-/// file, recursing. Before this batch it returned at its FIRST `CreateDirectoryExW` with
-/// `Error: 87`, because `NtQueryInformationFile` served exactly ONE information class.
-///
-/// The proof here is by CONTENT and by STRUCTURE, never by non-failure:
-///   * the DESTINATION copy of a real ISO file reads back off the LIVE writable volume with the
-///     source's exact 9 bytes — `CopyFileW` genuinely read the `Default User` original and wrote
-///     those bytes into `C:\Profiles\<user>\My Documents\livecd_start.cmd`;
-///   * the destination subdirectories BELOW `C:\Profiles\<user>` can only come from
-///     `CopyDirectory`'s recursion (winlogon itself creates only the root and the per-user
-///     directory, which the sibling spec already accounts for);
-///   * and it happened off the REAL interactive logon, under the SID `NtCreateToken` minted.
+/// The installed `Users\Default` source has directories but no regular files. A real
+/// AppData directory under the logged-on user's profile proves that `CopyDirectory` ran.
 unsafe fn winlogon_profile_copied_spec(passed: &mut u64) {
     use crate::writable_fs::*;
     let dirs = PROFILE_COPY_DIRS.load(Ordering::Relaxed);
@@ -5375,14 +5386,14 @@ unsafe fn winlogon_profile_copied_spec(passed: &mut u64) {
     let user_dir_exists = directory_exists_at(COPIED_PROFILE_DIR);
     let copied_ntuser = hive_image_len_at(COPIED_PROFILE_NTUSER_DAT) as u64;
     let copied_this_boot =
-        dirs >= 15 && files >= 1 && PROFILE_USER_DIR_CREATED.load(Ordering::Relaxed) >= 1;
+        dirs >= 1 && PROFILE_USER_DIR_CREATED.load(Ordering::Relaxed) >= 1;
     let copied_from_restored_volume =
         restored && user_dir_exists && content_ok && copied_ntuser > 0;
     print_str(b"[wl-profile-copy] CopyDirectory: subdirectories created=");
     print_u64(dirs);
     print_str(b" files copied=");
     print_u64(files);
-    print_str(b" destination-content-matches-source=");
+    print_str(b" destination-AppData-dir=");
     print_u64(content_ok as u64);
     print_str(b" restored-dir=");
     print_u64(user_dir_exists as u64);
@@ -5503,46 +5514,22 @@ fn synchronous_file_retry_spec(passed: &mut u64) {
         passed);
 }
 
-/// ═══ THE PROFILE SOURCE — the ISO's OWN `Profiles/` TREE, WHICH OUR STAGING WAS DROPPING ══════
-///
-/// `CreateUserProfileExW` seeds a new profile by COPYING `C:\Profiles\Default User`
-/// (`profile.c:1000` → `CopyDirectory` → `FindFirstFileW`), and that copy failed at
-/// `profile.c:1002  Error: 3` (ERROR_PATH_NOT_FOUND) because the disk image had no profile tree.
-///
-/// **The tree was never missing from the media — it was missing from our STAGING.** The ReactOS
-/// LiveCD ISO carries a real 76-entry `Profiles/` tree (`Default User/…`, `All Users/…`) as a
-/// TOP-LEVEL sibling of `reactos/`, and every extraction in `fetch_reactos.sh` was scoped to
-/// `reactos`, so it never reached the image. It is now extracted and laid down at `::Profiles` —
-/// exactly where `%SystemDrive%\Profiles` (the real SOFTWARE hive's `ProfileList\ProfilesDirectory`)
-/// resolves — and the executive MATERIALISES it onto the writable volume at mount, by walking it
-/// off the read-only FAT volume with the same reader every hosted binary is loaded with.
-///
-/// The proof is by CONTENT and by ENUMERATION, off the LIVE volume: the tree's real directory and
-/// file counts, `Default User`'s real child list through the same record encoder `FindFirstFileW`
-/// reaches, and a REAL staged file's bytes (`Default User\My Documents\livecd_start.cmd` is the
-/// ISO's 9-byte `@start %1`). Nothing here is synthesised — every byte came off the image.
-/// Read the STAGED `\Profiles` tree straight off the read-only FAT volume, BY PATH — independent of
-/// the writable overlay. Returns (is `Default User` a real directory?, does a real file inside it
-/// hold the ISO's exact bytes?). This is what proves the staging gap is closed on the IMAGE.
+/// Check the installed `Users\Default` source directly on the read-only image.
+/// The writable layer copies that tree before winlogon creates a user profile.
 unsafe fn staged_profiles_by_path() -> (bool, bool) {
     let Some(fat) = crate::fs_loader::exec_fs() else {
         return (false, false);
     };
-    let is_dir = crate::fs_loader::fat_open_path_entry(&fat, b"Profiles\\Default User")
-        .is_some_and(|(_, _, attr)| attr & 0x10 != 0);
-    let mut probe_ok = false;
-    if let Some((cluster, size, attr)) = crate::fs_loader::fat_open_path_entry(
+    let is_dir = crate::fs_loader::fat_open_path_entry(
         &fat,
-        b"Profiles\\Default User\\My Documents\\livecd_start.cmd",
-    ) {
-        if attr & 0x10 == 0 && size == 9 {
-            let mut bytes = [0u8; 9];
-            if crate::fs_loader::fat_read_file(&fat, cluster, size, bytes.as_mut_ptr() as u64) == 9
-            {
-                probe_ok = &bytes == b"@start %1";
-            }
-        }
-    }
+        crate::installed_layout::PROFILE_DEFAULT_SOURCE,
+    )
+        .is_some_and(|(_, _, attr)| attr & 0x10 != 0);
+    let probe_ok = crate::fs_loader::fat_open_path_entry(
+        &fat,
+        crate::installed_layout::PROFILE_DEFAULT_APPDATA_SOURCE,
+    )
+    .is_some_and(|(_, _, attr)| attr & 0x10 != 0);
     (is_dir, probe_ok)
 }
 
@@ -5556,9 +5543,9 @@ unsafe fn default_user_profile_spec(passed: &mut u64) {
     // The one file this executive deliberately adds to the ISO's own `Default User` tree.
     let provisioned_ntuser = (NTUSER_DAT_PROVISIONED.load(Ordering::Relaxed) != 0) as u64;
     let (staged_default_user_dir, staged_probe_ok) = staged_profiles_by_path();
-    print_str(b"[profile-source] on-image \\Profiles: `Default User` dir=");
+    print_str(b"[profile-source] on-image \\Users: `Default` dir=");
     print_u64(staged_default_user_dir as u64);
-    print_str(b" probe-file-bytes-match=");
+    print_str(b" AppData-dir=");
     print_u64(staged_probe_ok as u64);
     print_str(b" | materialised: dirs=");
     print_u64(dirs);
@@ -5566,9 +5553,9 @@ unsafe fn default_user_profile_spec(passed: &mut u64) {
     print_u64(files);
     print_str(b" bytes=");
     print_u64(bytes);
-    print_str(b" `Default User` entries=");
+    print_str(b" `Default` entries=");
     print_u64(entries);
-    print_str(b" probe-content-ok=");
+    print_str(b" AppData-provisioned=");
     print_u64(probe);
     print_str(b" ntuser.dat=");
     print_u64(crate::writable_fs::NTUSER_DAT_PROVISIONED.load(Ordering::Relaxed));
@@ -5576,24 +5563,14 @@ unsafe fn default_user_profile_spec(passed: &mut u64) {
     print_str(b"\n");
     check(
         b"exec_default_user_profile_staged",
-        // The ISO's real tree is really ON THE IMAGE, resolvable BY PATH through the ordinary
-        // read-only FAT reader: `\Profiles\Default User` is a directory, and a REAL file inside it
-        // (`My Documents\livecd_start.cmd`) reads back with the ISO's exact 9 bytes.
+        // The source directory and its AppData child must exist on the installed image.
         staged_default_user_dir && staged_probe_ok
-            // When the runtime materialisation is ON, the whole tree really came across too — all
-            // 45 directories and all 31 files (5307 bytes of genuine `.lnk`/`.cmd` content),
-            // `Default User` enumerating `.`, `..` and its 15 real children through the same `Zw*`
-            // record encoder `FindFirstFileW` reaches, and the same file readable off the volume.
-            //
-            // ★ Plus EXACTLY ONE deliberate addition when `PROVISION_NTUSER_DAT` is on: the
-            // `ntuser.dat` the LiveCD's skipped setup step would have left in this profile (see
-            // `writable_fs::PROVISION_NTUSER_DAT`). The counts stay EXACT — they are the ISO tree's
-            // own numbers plus that one file — so a staging regression still turns this spec red.
+            // The writable source must include both installed profile roots and Public files.
             && (!crate::writable_fs::PROVISION_DEFAULT_USER_PROFILE
-                || (dirs >= 45
-                    && files >= 31 + provisioned_ntuser
-                    && bytes >= 5307 + crate::writable_fs::NTUSER_DAT_PROVISIONED.load(Ordering::Relaxed)
-                    && entries == 17 + provisioned_ntuser
+                || (dirs >= 2
+                    && files >= 1 + provisioned_ntuser
+                    && bytes >= crate::writable_fs::NTUSER_DAT_PROVISIONED.load(Ordering::Relaxed)
+                    && entries >= 3 + provisioned_ntuser
                     && probe == 1)),
         passed,
     );
@@ -5691,7 +5668,7 @@ unsafe fn software_hive_mount_spec(passed: &mut u64) {
                     val_type = ty as u64;
                     val_len = data.len() as u64;
                     // REG_EXPAND_SZ `%SystemDrive%\Profiles` + NUL, UTF-16LE = 46 bytes.
-                    const EXPECT: &[u8] = b"%SystemDrive%\\Profiles";
+                    const EXPECT: &[u8] = crate::installed_layout::PROFILE_DIRECTORY_VALUE;
                     val_ok = ty == 2
                         && data.len() == (EXPECT.len() + 1) * 2
                         && data
@@ -5779,7 +5756,7 @@ unsafe fn winlogon_profile_directory_spec(passed: &mut u64) {
     let profile_path_proven = profile_image_path_sets != 0 || profile_image_path_readbacks != 0;
     let copied_this_boot = crate::writable_fs::PROFILE_USER_DIR_CREATED.load(Ordering::Relaxed)
         != 0
-        && crate::writable_fs::PROFILE_COPY_FILES.load(Ordering::Relaxed) != 0;
+        && crate::writable_fs::PROFILE_COPY_DIRS.load(Ordering::Relaxed) != 0;
     let copied_from_restored_volume = crate::writable_fs::snapshot_restore_seen()
         && crate::writable_fs::directory_exists_at(crate::writable_fs::COPIED_PROFILE_DIR)
         && crate::writable_fs::copied_profile_probe_ok()
@@ -7212,6 +7189,7 @@ pub(crate) fn census_tick_static(now: u64) {
     CENSUS_LAST_DUMP.store(now, Ordering::Relaxed);
     let n = CENSUS_PERIODIC_DUMPS.fetch_add(1, Ordering::Relaxed);
     print_periodic_census_heartbeat(n, now);
+    service_sec_image::trace_csrss_post_resume_census(n);
     print_native_ssn_time();
     print_add_device_rollback_census(b"periodic", false);
     print_hosted_file_owner_census(b"periodic", false);
@@ -12062,6 +12040,34 @@ unsafe fn alloc_frame() -> u64 {
     panic!("frame allocation failed");
 }
 
+/// Reserve a durable, consecutive cap run before retyping any frame. A sequence of scalar
+/// `alloc_frame()` calls may draw from the recycled-slot stack and cannot be indexed as base+i.
+unsafe fn alloc_frame_run(count: u64) -> u64 {
+    assert!(count > 0, "empty frame run");
+    let base = try_alloc_slot_run(count).expect("contiguous root frame cap run unavailable");
+    root_slot_pin_run(base, count);
+    for index in 0..count {
+        let error = untyped_retype_r(
+            CAP_INIT_UNTYPED,
+            OBJ_X86_4K_PAGE,
+            PAGING_BITS,
+            1,
+            base + index,
+        );
+        if error != 0 {
+            print_str(b"[frame-run] retype failed index=");
+            print_u64(index);
+            print_str(b" count=");
+            print_u64(count);
+            print_str(b" error=");
+            print_u64(error);
+            print_str(b"\n");
+            panic!("contiguous root frame retype failed");
+        }
+    }
+    base
+}
+
 unsafe fn vm_frame_acquire(scratch_base: u64) -> Result<u64, u32> {
     frame_acquisition::acquire(scratch_base)
 }
@@ -14848,11 +14854,92 @@ struct OwnedSurtCompletion {
     cqe: SurtCqe,
     payload: Vec<u8>,
 }
+
+/// A checked call distinguishes failure before submission from a reply that
+/// remains owned after submission. An indeterminate result is never an NTSTATUS.
+enum RingCallOutcome {
+    NoEffect(i32),
+    Completed(i32, u32, u64, u64, u64),
+    Indeterminate { request_id: u64 },
+}
 static SURT_CLIENT_TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 static SURT_CLIENT_WAIT_WAKES: AtomicU64 = AtomicU64::new(0);
 const SURT_STATUS_INVALID_BUFFER_SIZE: i32 = 0xC000_0206u32 as i32;
 
 impl RingChannel<'_> {
+    /// Submit through the existing synchronous transport while exposing its
+    /// exact completion identity. The caller must retain its Reply and input
+    /// request when this returns `Indeterminate`.
+    fn raw_owned(
+        &mut self,
+        opcode: u16,
+        in_buf: &[u8],
+        out_buf: &mut [u8],
+    ) -> RingCallOutcome {
+        if in_buf.len() > REP_DATA_LEN {
+            return RingCallOutcome::NoEffect(SURT_STATUS_INVALID_BUFFER_SIZE);
+        }
+        if self.completion_inbox.active_request().is_some() {
+            return RingCallOutcome::NoEffect(nt_status::NtStatus::DEVICE_BUSY.raw());
+        }
+        let request_id = self.next_id;
+        let (status, flags, information, detail0, detail1) =
+            self.raw(opcode, in_buf, out_buf);
+        if self.completion_inbox.active_request() == Some(request_id) {
+            RingCallOutcome::Indeterminate { request_id }
+        } else {
+            RingCallOutcome::Completed(status, flags, information, detail0, detail1)
+        }
+    }
+
+    /// Retire only the exact in-flight request. A missing or unusable CQE keeps
+    /// the shared frames and the caller's retained Reply owned by the request.
+    fn poll_owned(
+        &mut self,
+        request_id: u64,
+        out_buf: &mut [u8],
+    ) -> Option<(i32, u32, u64, u64, u64)> {
+        assert_eq!(self.completion_inbox.active_request(), Some(request_id));
+        let completion = if let Some(owned) = self.completion_inbox.take(request_id) {
+            Some(owned)
+        } else {
+            match self.cq.try_pop() {
+                Ok(Some(mut cqe)) => {
+                    let mut payload = Vec::new();
+                    let n = (cqe.information as usize).min(REP_DATA_LEN);
+                    if payload.try_reserve_exact(n).is_err() {
+                        // The CQE itself is exact and terminal. Preserve its
+                        // identity and detail words, but never expose success
+                        // without the payload that the service returned.
+                        cqe.status = nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw();
+                        cqe.information = 0;
+                    } else {
+                        payload.resize(n, 0);
+                        unsafe {
+                            let src = self.rep_vaddr as *const u8;
+                            for (index, slot) in payload.iter_mut().enumerate() {
+                                *slot = core::ptr::read_volatile(src.add(index));
+                            }
+                        }
+                    }
+                    self.completion_inbox.accept(
+                        request_id,
+                        cqe.request_id,
+                        OwnedSurtCompletion { cqe, payload },
+                    )
+                }
+                Ok(None) | Err(_) => None,
+            }
+        }?;
+        let cqe = completion.cqe;
+        let n = (cqe.information as usize)
+            .min(out_buf.len())
+            .min(completion.payload.len());
+        out_buf[..n].copy_from_slice(&completion.payload[..n]);
+        self.completion_inbox.finish(request_id);
+        Some((cqe.status, cqe.flags, cqe.information, cqe.detail0, cqe.detail1))
+    }
+
     /// One synchronous request/reply: stage `in_buf` in the request frame, push the
     /// SQE, wait for the matching completion, copy the reply payload out. Returns
     /// `(status, flags, information, detail0, detail1)`.
@@ -15048,6 +15135,25 @@ pub(crate) unsafe fn object_manager_lookup_path(path: &str) -> Result<u64, nt_st
     client.lookup(path, true).map(|id| id.0)
 }
 
+pub(crate) unsafe fn object_manager_create_session_namespace(
+    session_id: u32,
+) -> Result<nt_object_client::SessionNamespace, nt_status::NtStatus> {
+    let client = OBJECT_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    client.create_session_namespace(session_id)
+}
+
+pub(crate) unsafe fn object_manager_retire_session_namespace_exact(
+    session_id: u32,
+    owned: nt_object_client::SessionNamespace,
+) -> Result<(), nt_status::NtStatus> {
+    let client = OBJECT_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    client.retire_session_namespace_exact(session_id, owned)
+}
+
 pub(crate) unsafe fn object_manager_create_symbolic_link_path(
     link: &str,
     target: &str,
@@ -15066,6 +15172,21 @@ pub(crate) unsafe fn object_manager_create_symbolic_link_path_with_permanence(
     client
         .create_symbolic_link(link, target, permanent)
         .map(|id| id.0)
+}
+
+pub(crate) unsafe fn object_manager_create_or_open_symbolic_link_path(
+    link: &str,
+    target: &str,
+    permanent: bool,
+    open_if: bool,
+    case_insensitive: bool,
+) -> Result<(u64, bool), nt_status::NtStatus> {
+    let client = OBJECT_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    client
+        .create_or_open_symbolic_link(link, target, permanent, open_if, case_insensitive)
+        .map(|(id, existing)| (id.0, existing))
 }
 
 pub(crate) unsafe fn object_manager_delete_symbolic_link_path(
@@ -15306,6 +15427,17 @@ pub(crate) unsafe fn config_manager_query_device_property(
             required_len: 0,
         })?;
     client.query_device_property(instance, property, out)
+}
+
+pub(crate) unsafe fn config_manager_set_device_devprop(
+    instance: &str,
+    fmtid: [u8; 16],
+    pid: u32,
+    property_type: u32,
+    data: &[u8],
+) -> Result<(), i32> {
+    let client = CONFIG_CLIENT_PTR.as_mut().ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    client.set_device_devprop(instance, fmtid, pid, property_type, data)
 }
 
 pub(crate) unsafe fn config_manager_query_active_driver_service_by_registry_path(
@@ -16882,6 +17014,7 @@ unsafe fn delay_timer_drain_due_work(
         + subdrain!(2, keyed_wait_wake_due(handler, now))
         + subdrain!(3, keyed_release_wait_wake_due(handler, now))
         + subdrain!(4, io_completion_wake_due(handler, now))
+        + thread_alert::redrive(handler)
         + subdrain!(5, user_timer_wake_due(handler, now))
         + timer_hosted_driver_wake_due(now)
         + subdrain!(9, handler.job_time_sample_due(now_100ns))
@@ -16903,6 +17036,7 @@ unsafe fn delay_timer_drain_due_work(
         + timer_retry_wake_due(now_100ns)
         + service_sec_image::component_resume::wake_due(&handler.pm, now_100ns)
         + driver_launch::hosted_dpc_wake_due(now_100ns)
+        + driver_launch::hosted_driver_pnp_notification_wake_due()
         + watchdog_tick
 }
 
@@ -18089,6 +18223,7 @@ unsafe fn terminate_hosted_thread_mechanism(
         return false;
     }
     delay_cancel_thread(delay_queue, handler, tid);
+    if !thread_alert::cancel_thread(handler, tid) { return false; }
     io_completion_cancel_thread(handler, tid);
     let _ = handler.user_timer_cancel_thread(tid);
     delay_timer_rearm(delay_queue, handler);
@@ -19315,19 +19450,19 @@ fn normalize_registry_ascii_path(path: &[u8]) -> Option<Vec<u8>> {
 
     let mut out = Vec::new();
     if let Some(rest) = s.strip_prefix(b"%systemroot%\\") {
-        let prefix = b"reactos\\";
+        let prefix = crate::installed_layout::ROOT_PREFIX;
         out.try_reserve_exact(prefix.len().checked_add(rest.len())?)
             .ok()?;
         out.extend_from_slice(prefix);
         out.extend_from_slice(rest);
     } else if let Some(rest) = s.strip_prefix(b"systemroot\\") {
-        let prefix = b"reactos\\";
+        let prefix = crate::installed_layout::ROOT_PREFIX;
         out.try_reserve_exact(prefix.len().checked_add(rest.len())?)
             .ok()?;
         out.extend_from_slice(prefix);
         out.extend_from_slice(rest);
     } else if s.starts_with(b"system32\\") {
-        let prefix = b"reactos\\";
+        let prefix = crate::installed_layout::ROOT_PREFIX;
         out.try_reserve_exact(prefix.len().checked_add(s.len())?)
             .ok()?;
         out.extend_from_slice(prefix);
@@ -22916,6 +23051,8 @@ struct ExecNtHandler {
     /// pointers, native/GUI waits, and queued provider signals hold independent leases here; the
     /// `EventStore` namespace index remains the canonical dispatcher identity.
     event_objects: nt_kernel_exec::EventObjectRegistry,
+    /// Explicit native descriptors retained with exact named Event body identities.
+    named_event_security: Vec<(u64, Vec<u8>)>,
     /// Canonical dispatcher state for provider-owned kernel Timers. Component addresses never
     /// enter this table; provider-local identities resolve to generation-fenced Timer IDs.
     provider_timers: Option<nt_provider_wait::ProviderTimerTable>,
@@ -23063,6 +23200,8 @@ struct ExecNtHandler {
     delay_requested: bool,
     delay_interval_100ns: i64,
     delay_alertable: bool,
+    /// Owned NtWaitForAlertByThreadId admission; the loop binds its live Reply after dispatch.
+    thread_alert_wait: Option<nt_delay_execution::Deadline>,
     /// Blocking completion remove side signal. `-1` means no park request; nonnegative is the
     /// retained completion-port id to publish at the reply-cap park site.
     io_completion_park_port: i64,
@@ -23188,6 +23327,9 @@ struct ExecNtHandler {
     /// resolve TID -> TCB; the old TCB atomics are synchronized mirrors for global glue that has not
     /// been threaded through `ExecNtHandler` yet.
     thread_runtime: HostedThreadRuntimes,
+    /// Native TCB priority effects and their PM plan remain owned until exact acknowledgment.
+    priority_transition_owner: Option<native_thread_priority::NativePriorityOwner>,
+    native_alpc_secured_ports: native_alpc_port_security::SecuredPortRegistry,
     desktop_observations: DesktopObservations,
     /// Session-scoped win32k state observed from provider-owned objects and reused only through
     /// explicit session/runtime lookup.
@@ -23262,35 +23404,38 @@ impl DriverStartBootstrap {
     }
 }
 
-unsafe fn launch_boot_driver_service(
-    fs: &Fat32,
+struct PreparedBootDriverStart {
+    owned: DriverServiceLaunchSpec,
+    reservation: nt_driver_start::PendingOperationReservation,
+    predecessors: alloc::vec::Vec<nt_driver_start::PendingOperationReservation>,
+    dependent_devnodes: alloc::vec::Vec<usize>,
+}
+
+/// Reserve the exact START continuation before DriverEntry can have native effects. This
+/// function borrows the table only during preparation, so a live handler can serve nested
+/// provider calls while DriverEntry and AddDevice execute.
+fn prepare_boot_driver_start(
     spec: &InlineDriverLaunchSpec,
     plan: &InlineDriverLaunchPlan,
-    options: HostedPnpStartOptions,
-    driver_starts: &mut DriverStartBootstrap,
-) -> Option<(driver_launch::DriverComponent, HostedPnpStartReport)> {
-    let target = BootDriverStartReportTarget {
-        trace: options.trace,
-        pci: inline_launch_spec_has_pci_devnode(plan.devnodes_for(spec)),
-    };
-    let prepared_start =
-        if spec.class == driver_launch::DriverClass::Device && spec.devnode_count != 0 {
+    pending: &mut nt_driver_start::PendingOperationTable<PendingDriverStart>,
+) -> Result<Option<PreparedBootDriverStart>, ()> {
+    let prepared_start = if spec.class == driver_launch::DriverClass::Device && spec.devnode_count != 0 {
             let owned = match owned_driver_launch_spec_from_inline(spec, plan) {
                 Some(owned) => owned,
                 None => {
                     print_str(b"[driver-launch] boot START ownership allocation failed service=");
                     print_str(spec.service_name.as_bytes());
                     print_str(b"\n");
-                    return None;
+                    return Err(());
                 }
             };
-            let reservation = match driver_starts.pending.reserve() {
+            let reservation = match pending.reserve() {
                 Ok(reservation) => reservation,
                 Err(_) => {
                     print_str(b"[driver-launch] boot START continuation reserve failed service=");
                     print_str(spec.service_name.as_bytes());
                     print_str(b"\n");
-                    return None;
+                    return Err(());
                 }
             };
             let mut predecessors = alloc::vec::Vec::new();
@@ -23302,36 +23447,112 @@ unsafe fn launch_boot_driver_service(
                 let mut dependent = false;
                 // Every occupied Boot row predates this unpublished reservation. Physical slot
                 // indices are not launch order because the table reuses empty slots.
-                for earlier_slot in 0..driver_starts.pending.slot_count() {
-                    let Some(pending) = driver_starts.pending.get(earlier_slot) else {
+                for earlier_slot in 0..pending.slot_count() {
+                    let Some(earlier) = pending.get(earlier_slot) else {
                         continue;
                     };
-                    if matches!(&pending.owner, PendingDriverStartOwner::Boot { .. })
-                        && pending.batch.service_name().eq_ignore_ascii_case(enumerator)
+                    if matches!(&earlier.owner, PendingDriverStartOwner::Boot { .. })
+                        && earlier.batch.service_name().eq_ignore_ascii_case(enumerator)
                     {
                         dependent = true;
-                        if predecessors.contains(&pending.reservation) {
+                        if predecessors.contains(&earlier.reservation) {
                             continue;
                         }
                         if predecessors.try_reserve(1).is_err() {
-                            driver_starts.pending.cancel(reservation).expect("boot START reservation disappeared");
-                            return None;
+                            pending.cancel(reservation).expect("boot START reservation disappeared");
+                            return Err(());
                         }
-                        predecessors.push(pending.reservation);
+                        predecessors.push(earlier.reservation);
                     }
                 }
                 if dependent {
                     if dependent_devnodes.try_reserve(1).is_err() {
-                        driver_starts.pending.cancel(reservation).expect("boot START reservation disappeared");
-                        return None;
+                        pending.cancel(reservation).expect("boot START reservation disappeared");
+                        return Err(());
                     }
                     dependent_devnodes.push(index);
                 }
             }
-            Some((owned, reservation, predecessors, dependent_devnodes))
+            Some(PreparedBootDriverStart { owned, reservation, predecessors, dependent_devnodes })
         } else {
             None
         };
+    Ok(prepared_start)
+}
+
+struct DrivenBootDriverStart {
+    batch: OwnedHostedPnpStartBatch,
+    reservation: nt_driver_start::PendingOperationReservation,
+    predecessors: alloc::vec::Vec<nt_driver_start::PendingOperationReservation>,
+    progress: OwnedHostedPnpStartProgress,
+}
+
+/// Drive callbacks with no mutable borrow of the pending table. The pre-reserved continuation
+/// remains owned by the caller until `publish_boot_driver_start` consumes this result.
+unsafe fn drive_boot_driver_start(
+    dc: &driver_launch::DriverComponent,
+    prepared: PreparedBootDriverStart,
+    options: HostedPnpStartOptions,
+) -> DrivenBootDriverStart {
+    let PreparedBootDriverStart { owned, reservation, predecessors, dependent_devnodes } = prepared;
+    let mut batch = OwnedHostedPnpStartBatch::new(dc, owned, options);
+    batch.require_bootstrap_bus_pdos(dependent_devnodes);
+    let progress = if predecessors.is_empty() {
+        batch.drive()
+    } else {
+        OwnedHostedPnpStartProgress::AwaitingCompletion
+    };
+    DrivenBootDriverStart { batch, reservation, predecessors, progress }
+}
+
+/// Publish the generation-exact result under its pre-reserved slot. An uncertain START retains
+/// its batch and ownership barrier rather than replaying the native callback.
+fn publish_boot_driver_start(
+    driven: DrivenBootDriverStart,
+    target: BootDriverStartReportTarget,
+    pending: &mut nt_driver_start::PendingOperationTable<PendingDriverStart>,
+    reports: &mut BootDriverStartReports,
+) -> HostedPnpStartReport {
+    let DrivenBootDriverStart { batch, reservation, predecessors, progress } = driven;
+    let report = match progress {
+        OwnedHostedPnpStartProgress::Complete(_) => {
+            pending.cancel(reservation).expect("synchronous boot START lost its continuation reservation");
+            reports.merge(target, batch.report());
+            batch.report()
+        }
+        OwnedHostedPnpStartProgress::AwaitingCompletion => {
+            let report = batch.report();
+            pending.publish(reservation, PendingDriverStart {
+                batch, reservation, bootstrap_predecessors: predecessors,
+                owner: PendingDriverStartOwner::Boot { target, report_published: false },
+            }).expect("pending boot START rejected its pre-reserved owner");
+            report
+        }
+        OwnedHostedPnpStartProgress::OwnershipLost(_) => {
+            let report = batch.report();
+            reports.merge(target, batch.report());
+            pending.publish(reservation, PendingDriverStart {
+                batch, reservation, bootstrap_predecessors: predecessors,
+                owner: PendingDriverStartOwner::Boot { target, report_published: true },
+            }).expect("indeterminate boot START rejected its barrier owner");
+            report
+        }
+    };
+    report
+}
+
+unsafe fn launch_boot_driver_service(
+    fs: &Fat32,
+    spec: &InlineDriverLaunchSpec,
+    plan: &InlineDriverLaunchPlan,
+    options: HostedPnpStartOptions,
+    driver_starts: &mut DriverStartBootstrap,
+) -> Option<(driver_launch::DriverComponent, HostedPnpStartReport)> {
+    let target = BootDriverStartReportTarget {
+        trace: options.trace,
+        pci: inline_launch_spec_has_pci_devnode(plan.devnodes_for(spec)),
+    };
+    let prepared_start = prepare_boot_driver_start(spec, plan, &mut driver_starts.pending).ok()?;
     let Ok(dc) = load_driver(
         fs,
         spec.image_path.as_bytes(),
@@ -23339,74 +23560,89 @@ unsafe fn launch_boot_driver_service(
         spec.driver_object_path.as_str(),
         initial_system_driver_caller(),
     ) else {
-        if let Some((_, reservation, _, _)) = prepared_start {
+        if let Some(prepared) = prepared_start {
             driver_starts
                 .pending
-                .cancel(reservation)
+                .cancel(prepared.reservation)
                 .expect("failed boot driver load lost its START reservation");
         }
         return None;
     };
-    let Some((owned, reservation, predecessors, dependent_devnodes)) = prepared_start else {
+    let Some(prepared) = prepared_start else {
         return Some((dc, HostedPnpStartReport::default()));
     };
-    let mut batch = OwnedHostedPnpStartBatch::new(&dc, owned, options);
-    batch.require_bootstrap_bus_pdos(dependent_devnodes);
-    let progress = if predecessors.is_empty() {
-        batch.drive()
-    } else {
-        OwnedHostedPnpStartProgress::AwaitingCompletion
-    };
-    let report = match progress {
-        OwnedHostedPnpStartProgress::Complete(_) => {
-            driver_starts
-                .pending
-                .cancel(reservation)
-                .expect("synchronous boot START lost its continuation reservation");
-            driver_starts.reports.merge(target, batch.report());
-            batch.report()
-        }
-        OwnedHostedPnpStartProgress::AwaitingCompletion => {
-            let report = batch.report();
-            driver_starts
-                .pending
-                .publish(
-                    reservation,
-                    PendingDriverStart {
-                        batch,
-                        reservation,
-                        bootstrap_predecessors: predecessors,
-                        owner: PendingDriverStartOwner::Boot {
-                            target,
-                            report_published: false,
-                        },
-                    },
-                )
-                .expect("pending boot START rejected its pre-reserved owner");
-            report
-        }
-        OwnedHostedPnpStartProgress::OwnershipLost(_) => {
-            let report = batch.report();
-            driver_starts.reports.merge(target, batch.report());
-            driver_starts
-                .pending
-                .publish(
-                    reservation,
-                    PendingDriverStart {
-                        batch,
-                        reservation,
-                        bootstrap_predecessors: predecessors,
-                        owner: PendingDriverStartOwner::Boot {
-                            target,
-                            report_published: true,
-                        },
-                    },
-                )
-                .expect("indeterminate boot START rejected its barrier owner");
-            report
-        }
-    };
+    let driven = drive_boot_driver_start(&dc, prepared, options);
+    let report = publish_boot_driver_start(driven, target,
+        &mut driver_starts.pending, &mut driver_starts.reports);
     Some((dc, report))
+}
+
+/// Registry-selected PnP DriverEntry may open another provider device (as BasicDisplay opens
+/// DxgKrnl). Run both Start classes after the live File handler is registered, preserving their
+/// plan order and the exact resource windows that bootstrap published for each devnode.
+unsafe fn launch_live_pnp_plans(
+    handler: *mut ExecNtHandler,
+    plans: &[&InlineDriverLaunchPlan],
+) {
+    if plans.iter().all(|plan| plan.as_slice().is_empty()) { return; }
+    let Some(fs) = exec_fs() else {
+        print_str(b"[driver-launch] live PnP launch has no filesystem\n");
+        return;
+    };
+    for &plan in plans {
+        for spec in plan.as_slice() {
+            print_str(b"[driver-launch] launching live PnP service ");
+            print_str(spec.service_name.as_bytes());
+            print_str(b" path=");
+            print_str(spec.image_path.as_bytes());
+            print_str(b" devnodes=");
+            print_u64(spec.devnode_count as u64);
+            print_str(b"\n");
+            let options = HostedPnpStartOptions::config_pnp();
+            let target = BootDriverStartReportTarget {
+                trace: options.trace,
+                pci: inline_launch_spec_has_pci_devnode(plan.devnodes_for(spec)),
+            };
+            let prepared = match prepare_boot_driver_start(
+                spec, plan, &mut (*handler).pending_driver_starts,
+            ) {
+                Ok(prepared) => prepared,
+                Err(()) => continue,
+            };
+            // No handler field borrow crosses DriverEntry. Nested CREATE uses this live handler.
+            let loaded = load_driver(
+                &fs,
+                spec.image_path.as_bytes(),
+                spec.class,
+                spec.driver_object_path.as_str(),
+                initial_system_driver_caller(),
+            );
+            let Ok(dc) = loaded else {
+                if let Some(prepared) = prepared {
+                    (*handler).pending_driver_starts.cancel(prepared.reservation)
+                        .expect("failed live PnP driver load lost START reservation");
+                }
+                print_str(b"[driver-launch] live PnP load failed service=");
+                print_str(spec.service_name.as_bytes());
+                print_str(b"\n");
+                continue;
+            };
+            let Some(prepared) = prepared else { continue; };
+            let driven = drive_boot_driver_start(&dc, prepared, options);
+            let report = publish_boot_driver_start(
+                driven, target,
+                &mut (*handler).pending_driver_starts,
+                &mut (*handler).boot_driver_start_reports,
+            );
+            print_str(b"[driver-launch] live PnP START attempted/terminal/pending=");
+            print_u64(report.attempted);
+            print_str(b"/");
+            print_u64(report.terminal);
+            print_str(b"/");
+            print_u64(report.pending);
+            print_str(b"\n");
+        }
+    }
 }
 
 fn report_deferred_generic_hardware_checks(
@@ -24621,68 +24857,6 @@ struct LpcStaticSecurityContext {
     level: nt_security::SecurityImpersonationLevel,
 }
 
-// ===================== ALPC last-mile item (a): register the NtAlpc* SSNs =========================
-// SSNs EXTRACTED (not hardcoded — the rootserver-constant-drift trap) from references/ntdll.dll (a
-// real Windows x64 ntdll, the Win7-pivot target; ReactOS ros-ntdll.dll, which the LIVE smss/csrss/
-// winlogon run, exports NO NtAlpc* at all — ALPC is Vista+ and ReactOS has only kernel-less stubs).
-//   NtAlpcAcceptConnectPort=111 NtAlpcConnectPort=113 NtAlpcCreatePort=114 NtAlpcCreatePortSection=115
-//   NtAlpcCreateSectionView=117 NtAlpcDisconnectPort=123 NtAlpcSendWaitReceivePort=130
-// ★ CONSTANT-DRIFT / COLLISION FINDING (load-bearing): the Win7 ALPC SSN block (111..131) OVERLAPS
-// the live ReactOS SSN space — e.g. Win7 NtAlpcConnectPort=113 == the live ReactOS NtMapViewOfSection
-// =113 (registered in build_nt_table). So the ALPC route MUST NOT be merged into build_nt_table nor
-// fired on a raw m0 for the 3 live ReactOS processes (that would HIJACK live NtMapViewOfSection etc.).
-// It is a DEDICATED recognizer, gated by ALPC-PROCESS IDENTITY (`ALPC_HOST_PRESENT`, never set at
-// boot — no ALPC binary yet), so it is DORMANT (byte-identical boot) yet genuinely wired into the
-// fault dispatcher. The recognizer + the SSN→adapter routing are proven by counted specs
-// (exec_alpc_ssn_registered / exec_alpc_ssn_routes_to_adapter); a live hosted caller arrives with a
-// real ALPC binary running the Win7 ntdll (whose ntdll then defines the authoritative SSNs).
-pub const SSN_NT_ALPC_ACCEPT_CONNECT_PORT: u64 = 111;
-pub const SSN_NT_ALPC_CONNECT_PORT: u64 = 113;
-pub const SSN_NT_ALPC_CREATE_PORT: u64 = 114;
-pub const SSN_NT_ALPC_CREATE_PORT_SECTION: u64 = 115;
-pub const SSN_NT_ALPC_CREATE_SECTION_VIEW: u64 = 117;
-pub const SSN_NT_ALPC_DISCONNECT_PORT: u64 = 123;
-pub const SSN_NT_ALPC_SEND_WAIT_RECEIVE_PORT: u64 = 130;
-
-/// Set true ONLY when a real ALPC binary (running the Win7 ntdll) is hosted. Never set at boot, so
-/// `try_route_alpc_ssn` is dormant — the Win7 ALPC SSNs can never hijack the live ReactOS SSN space.
-static ALPC_HOST_PRESENT: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Recognizer: map a Win7 `NtAlpc*` SSN to its unified port-service ALPC wire opcode (0x2300 block).
-/// This IS the registration of the NtAlpc* SSNs in the executive's dispatch logic.
-pub fn alpc_ssn_to_opcode(ssn: u64) -> Option<u16> {
-    use nt_alpc_abi::opcode as aop;
-    Some(match ssn {
-        SSN_NT_ALPC_CREATE_PORT => aop::ALPC_OP_CREATE_PORT,
-        SSN_NT_ALPC_CONNECT_PORT => aop::ALPC_OP_CONNECT_PORT,
-        SSN_NT_ALPC_ACCEPT_CONNECT_PORT => aop::ALPC_OP_ACCEPT_CONNECT,
-        SSN_NT_ALPC_SEND_WAIT_RECEIVE_PORT => aop::ALPC_OP_SEND_RECEIVE,
-        SSN_NT_ALPC_DISCONNECT_PORT => aop::ALPC_OP_DISCONNECT_PORT,
-        SSN_NT_ALPC_CREATE_PORT_SECTION => aop::ALPC_OP_CREATE_PORT_SECTION,
-        SSN_NT_ALPC_CREATE_SECTION_VIEW => aop::ALPC_OP_CREATE_SECTION_VIEW,
-        _ => return None,
-    })
-}
-
-/// Fault-dispatcher hook: if a hosted ALPC process (running the Win7 ntdll) issued an `NtAlpc*`
-/// syscall, translate its SSN → the ALPC adapter opcode and route it to the unified port service
-/// over the shared ring (`LPC_CLIENT`), returning the NTSTATUS. DORMANT unless `ALPC_HOST_PRESENT`
-/// (never set at boot) — so it can NEVER fire for the 3 live ReactOS processes whose SSN space
-/// collides with the Win7 ALPC SSNs. The per-binary marshalling of the native ALPC arg blocks
-/// (PORT_MESSAGE + ALPC_MESSAGE_ATTRIBUTES from the fault register/stack image) is the shim that
-/// lands with a real ALPC binary; the recognizer + adapter routing here are proven by counted specs.
-unsafe fn try_route_alpc_ssn(ssn: u64, req: &[u8], out: &mut [u8]) -> Option<u64> {
-    if !ALPC_HOST_PRESENT.load(Ordering::Relaxed) {
-        return None;
-    }
-    let op = alpc_ssn_to_opcode(ssn)?;
-    #[allow(static_mut_refs)]
-    let lpc = LPC_CLIENT.as_mut()?;
-    let (status, _f, _i, _d0, _d1) = lpc.backend_mut().0.raw(op, req, out);
-    Some(status as u64)
-}
-
 /// Build the service table mapping smss's ntdll SSNs -> NativeService, for ONLY the services the
 /// real handler implements. `table.lookup(ssn).is_some()` is the routing switch: present -> real
 /// dispatcher, absent -> broker fallback. Grows as each syscall family is implemented for real.
@@ -24700,6 +24874,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtClose, SSN_NT_CLOSE as u32),
             (NativeService::NtDuplicateObject, 71),
             (NativeService::NtOpenKey, SSN_NT_OPEN_KEY as u32),
+            (NativeService::NtOpenKeyEx, 0x457),
             (NativeService::NtCreateKey, SSN_NT_CREATE_KEY as u32),
             (
                 NativeService::NtEnumerateValueKey,
@@ -24915,8 +25090,20 @@ fn build_nt_table() -> NativeServiceTable {
                 SSN_NT_ACCESS_CHECK_BY_TYPE as u32,
             ),
             (
+                NativeService::NtAccessCheckByTypeAndAuditAlarm,
+                SSN_NT_ACCESS_CHECK_BY_TYPE_AND_AUDIT_ALARM as u32,
+            ),
+            (
                 NativeService::NtAccessCheckByTypeResultList,
                 SSN_NT_ACCESS_CHECK_BY_TYPE_RESULT_LIST as u32,
+            ),
+            (
+                NativeService::NtAccessCheckByTypeResultListAndAuditAlarm,
+                SSN_NT_ACCESS_CHECK_BY_TYPE_RESULT_LIST_AND_AUDIT_ALARM as u32,
+            ),
+            (
+                NativeService::NtAccessCheckByTypeResultListAndAuditAlarmByHandle,
+                SSN_NT_ACCESS_CHECK_BY_TYPE_RESULT_LIST_AND_AUDIT_ALARM_BY_HANDLE as u32,
             ),
             (
                 NativeService::NtMakeTemporaryObject,
@@ -24944,6 +25131,8 @@ fn build_nt_table() -> NativeServiceTable {
                 SSN_NT_SET_INFO_PROCESS as u32,
             ),
             (NativeService::NtTestAlert, SSN_NT_TEST_ALERT as u32),
+            (NativeService::NtAlertThreadByThreadId, SSN_NT_ALERT_THREAD_BY_THREAD_ID as u32),
+            (NativeService::NtWaitForAlertByThreadId, SSN_NT_WAIT_FOR_ALERT_BY_THREAD_ID as u32),
             (
                 NativeService::NtQueueApcThread,
                 SSN_NT_QUEUE_APC_THREAD as u32,
@@ -25396,17 +25585,27 @@ unsafe fn spawn_user_thread(
 
 /// Create a NEW thread in an EXISTING VSpace `pml4` (NtCreateThreadEx): a fresh stack + IPC
 /// buffer + CNode (fault ep) at bumped user vaddrs, starting at `entry`. The thread shares the
-/// caller's address space (so it sees the caller's mappings). Returns the TCB cap.
-unsafe fn spawn_thread_in(pml4: u64, entry: u64) -> u64 {
-    let Some(stack_base) = user_alloc_bump(0x4000) else {
-        return 0;
-    };
+/// caller's address space (so it sees the caller's mappings). This boot proof retains every
+/// private cap until its exact TCB is suspended and retired.
+struct SyntheticSecondSpawn {
+    tcb: u64,
+    cnode: u64,
+    raw_cnode: u64,
+    sched_context: u64,
+    ipc_buffer: u64,
+    fault_endpoint: u64,
+    stack_frames: [u64; 4],
+}
+
+unsafe fn spawn_thread_in(pml4: u64, entry: u64) -> SyntheticSecondSpawn {
+    let stack_base = user_alloc_bump(0x4000).expect("synthetic second stack VA unavailable");
+    let mut stack_frames = [0u64; 4];
     for i in 0..4u64 {
-        let _ = page_map(alloc_frame(), stack_base + i * 0x1000, RW_NX, pml4);
+        let frame = alloc_frame();
+        stack_frames[i as usize] = frame;
+        let _ = page_map(frame, stack_base + i * 0x1000, RW_NX, pml4);
     }
-    let Some(ipcbuf_va) = user_alloc_bump(0x1000) else {
-        return 0;
-    };
+    let ipcbuf_va = user_alloc_bump(0x1000).expect("synthetic second IPC VA unavailable");
     let ipcbuf = alloc_frame();
     let _ = page_map(ipcbuf, ipcbuf_va, RW_NX, pml4);
     let fault_ep = make_object(OBJ_ENDPOINT);
@@ -25427,7 +25626,7 @@ unsafe fn spawn_thread_in(pml4: u64, entry: u64) -> u64 {
         cnode,
         LBL_CNODE_COPY << 12,
         CT_FAULT,
-        copy_cap(fault_ep),
+        fault_ep,
         0,
     );
     let tcb = alloc_slot();
@@ -25443,16 +25642,13 @@ unsafe fn spawn_thread_in(pml4: u64, entry: u64) -> u64 {
     );
     let _ = tcb_write_registers(tcb, entry, stack_base + 0x4000 - 16, 0);
     let _ = tcb_set_priority(tcb, 100);
-    if let Err(e_sc) = attach_sched_context(tcb) {
-        print_str(b"[thread-life] legacy SC attach failed tcb=0x");
-        print_hex(tcb as u32);
-        print_str(b" error=");
-        print_u64(e_sc);
-        print_str(b"\n");
-        park();
+    let sched_context = attach_sched_context(tcb)
+        .expect("synthetic second SC attach failed");
+    assert_eq!(tcb_resume_r(tcb), 0, "synthetic second TCB resume failed");
+    SyntheticSecondSpawn {
+        tcb, cnode, raw_cnode: raw, sched_context, ipc_buffer: ipcbuf,
+        fault_endpoint: fault_ep, stack_frames,
     }
-    let _ = tcb_resume(tcb);
-    tcb
 }
 
 /// Parameters describing a hosted second thread for [`spawn_hosted_thread`]. All VAs in the
@@ -25467,14 +25663,6 @@ struct HostedUserThreadContext<'a> {
     initial_teb: nt_thread_start::InitialTeb64,
     stack_origin: ThreadStackOrigin,
 }
-
-/// Initial seL4 priority for every hosted Windows user thread.
-///
-/// NT priority changes belong to the thread scheduler interface, not to spawn-site boot ordering.
-/// Keeping process mains, RPC listeners, and thread-pool workers in the same initial class also
-/// preserves round-robin progress when a busy GUI/RPC worker repeatedly blocks and wakes on the
-/// executive endpoint.
-const HOSTED_USER_THREAD_PRIORITY: u8 = 100;
 
 struct HostedThread<'a> {
     /// The target process's VSpace (PML4) cap — the thread runs here, sharing the main thread's
@@ -25510,9 +25698,6 @@ struct HostedThread<'a> {
     /// The `ClientId` written into the TEB (`0,0` leaves the TEB's zero-fill).
     cid_proc: u64,
     cid_thread: u64,
-    /// Initial scheduling priority. Hosted Windows threads begin in the same base class; real NT
-    /// priority changes are applied through the scheduler API after creation.
-    prio: u8,
     /// NATIVE seL4-Call transport (ntdll_plan Step 6.A / BATCH 6). When set, this thread runs on
     /// OUR ntdll's native transport: its explicit `Call(CT_FAULT, label=0x4E54)` dispatches natively
     /// with MR0=SSN even though the thread also has rust-micro's hosted-syscalls flag. Raw ReactOS DLL
@@ -25613,6 +25798,15 @@ unsafe fn spawn_hosted_thread(
     ) else {
         return Err(HostedThreadSpawnFailure::Unstarted);
     };
+    if binding.process.pid != u32::try_from(t.cid_proc).unwrap_or(0)
+        || handler.capture_process_identity(binding.pi) != Some(binding.process)
+    {
+        return Err(HostedThreadSpawnFailure::Unstarted);
+    }
+    let initial_priority = match native_thread_priority::initial_priority(&handler.pm, t.cid_thread) {
+        Ok(priority) => priority,
+        Err(_) => return Err(HostedThreadSpawnFailure::Unstarted),
+    };
     if !hosted_thread_client_frame_keys_available(t, layout) {
         return Err(HostedThreadSpawnFailure::Unstarted);
     }
@@ -25623,7 +25817,7 @@ unsafe fn spawn_hosted_thread(
         Ok(prepared) => prepared,
         Err(_) => return Err(HostedThreadSpawnFailure::Unstarted),
     };
-    let mut spawned = spawn_hosted_thread_mechanism(t, resources, binding)?;
+    let mut spawned = spawn_hosted_thread_mechanism(t, resources, binding, initial_priority)?;
     spawned.attach_commitment(prepared);
     Ok(spawned)
 }
@@ -25632,6 +25826,7 @@ unsafe fn spawn_hosted_thread_mechanism(
     t: &HostedThread,
     mut resources: HostedThreadResources,
     binding: nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
+    initial_priority: u8,
 ) -> HostedThreadSpawnResult {
     use nt_user_host::thread_construction::{MemoryConstructionProgress, Role, ThreadConstructionInventory};
     let mut construction = ThreadConstructionInventory::empty();
@@ -26064,14 +26259,7 @@ unsafe fn spawn_hosted_thread_mechanism(
     if e_gs != 0 {
         return failed!(b"tcb-set-gs", ThreadConstructionError::Native(e_gs), t.teb_va);
     }
-    let e_priority = tcb_set_priority_r(
-        tcb,
-        if t.prio != 0 {
-            t.prio as u64
-        } else {
-            HOSTED_USER_THREAD_PRIORITY as u64
-        },
-    );
+    let e_priority = tcb_set_priority_r(tcb, u64::from(initial_priority));
     if e_priority != 0 { return failed!(b"tcb-set-priority", ThreadConstructionError::Native(e_priority), tcb); }
     if t.diag {
         print_str(b"[spawn-diag] tcb=0x");
@@ -26262,7 +26450,8 @@ pub(crate) static LSA_LOGON_CLIENT_READS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LSA_API_MASK: AtomicU64 = AtomicU64::new(0);
 /// `ExpLuid` — the kernel's global locally-unique-id counter (`ntoskrnl/ex/uuid.c:43`), seeded at
 /// `0x3e9` with `ExpLuidIncrement = 1`. `NtAllocateLocallyUniqueId` post-increments it.
-pub(crate) static EXP_LUID: AtomicU64 = AtomicU64::new(0x3e9);
+pub(crate) static EXP_LUID: nt_kernel_exec::luid::LocalLuidAllocator =
+    nt_kernel_exec::luid::LocalLuidAllocator::new(0x3e9);
 /// The `*LsaHandle` winlogon's `LsaRegisterLogonProcess` ended up holding (0 = none).
 pub(crate) static WINLOGON_LSA_PORT_HANDLE: AtomicU64 = AtomicU64::new(0);
 /// Set when winlogon's blocked `NtConnectPort(\LsaAuthenticationPort)` was woken with SUCCESS.
@@ -26757,6 +26946,8 @@ static FB_WIDTH: AtomicU64 = AtomicU64::new(0);
 static FB_HEIGHT: AtomicU64 = AtomicU64::new(0);
 static FB_SCANLINE: AtomicU64 = AtomicU64::new(0);
 static FB_SIZE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Validated Simpleboot RGB mask layout of the captured boot scanout.
+static FB_TYPE: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Latest validated `IOCTL_VIDEO_QUERY_CURRENT_MODE` reply. The zero size denotes that the display
 /// stack has not published a current mode yet, in which case the boot GOP geometry remains active.
 static ACTIVE_FB_WIDTH: AtomicU64 = AtomicU64::new(0);
@@ -26845,14 +27036,15 @@ fn active_framebuffer_geometry() -> Option<(u64, u64, u64, u64)> {
 /// Run the native-syscall service loop for the isolated user thread, routing each
 /// Ob syscall to the isolated Object Manager service via `client`, backing
 /// NtAllocateVirtualMemory with real frames mapped into `user_pml4`, and demand-paging
-/// file-backed section views (backed by `file_frame`) on VMFault. Returns `(serviced, verdict)`.
+/// file-backed section views (backed by `file_frame`) on VMFault. Returns the exact synthetic
+/// second thread owner with its verdict so the caller can retire it after checking the marker.
 unsafe fn service_user_syscalls<B, CB>(
     user_fault_ep: u64,
     client: &mut ObjectClient<B>,
     cm: &mut ConfigClient<CB>,
     user_pml4: u64,
     file_frame: u64,
-) -> (u64, u64)
+) -> (u64, u64, Option<SyntheticSecondSpawn>)
 where
     B: nt_object_client::Backend,
     CB: nt_config_client::Backend,
@@ -26896,6 +27088,7 @@ where
     let mut view_count = 0usize;
     let mut serviced = 0u64;
     let mut verdict = 0u64;
+    let mut second_spawn = None;
     let (_z, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(user_fault_ep);
     loop {
         // A VMFault (page fault, label 6) from the user thread: demand-page the faulting page
@@ -27040,8 +27233,10 @@ where
                 // Create a new thread in the CALLER's VSpace at start routine `arg1` (the way
                 // RtlCreateUserProcess/smss launch a process's main thread). Returns a handle.
                 NativeService::NtCreateThreadEx => {
-                    let _tcb = spawn_thread_in(user_pml4, arg1);
-                    1 // handle
+                    if second_spawn.is_some() { 0 } else {
+                        second_spawn = Some(spawn_thread_in(user_pml4, arg1));
+                        1 // this synthetic handle is never exported
+                    }
                 }
                 _ => 0,
             }
@@ -27113,7 +27308,7 @@ where
         m2 = nm2;
         m3 = nm3;
     }
-    (serviced, verdict)
+    (serviced, verdict, second_spawn)
 }
 
 /// Service the blocking-wait demo: two threads (waiter + signaler) fault here, dispatched by
@@ -28181,7 +28376,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_str(b"\n");
     }
     let user_pml4 = spawn_user_thread(user_entry, user_fault_ep_c, copy_cap(sysarg), 100, 0);
-    let (serviced, verdict) =
+    let (serviced, verdict, second_spawn) =
         service_user_syscalls(user_fault_ep, &mut *c, &mut *cm, user_pml4, ff);
     check(
         b"exec_syscall_frontend_serviced",
@@ -28324,6 +28519,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_str(b"\n");
     check(b"exec_nt_create_thread", th != 0, &mut passed);
     check(b"exec_nt_second_thread_ran", t2 == 0x7EAD2, &mut passed);
+    boot_probe_thread_retirement::retire_synthetic_second(
+        second_spawn.expect("synthetic second thread was not created"),
+    );
 
     // --- P3 demand paging: the user thread mapped a file-backed section view (VA reserved, page
     // NOT mapped) and read it; the read #PF'd, the executive faulted the page in from the
@@ -28441,7 +28639,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let pe_fault_c = copy_cap(pe_fault);
             let pe_sysarg = alloc_frame();
             let pe_pml4 = spawn_pe_thread(&mapped, pe_fault_c, pe_sysarg);
-            let (srv, verdict) = service_user_syscalls(pe_fault, &mut *c, &mut *cm, pe_pml4, 0);
+            let (srv, verdict, _) = service_user_syscalls(pe_fault, &mut *c, &mut *cm, pe_pml4, 0);
             pe_serviced = srv;
             pe_verdict = verdict;
         }
@@ -28540,6 +28738,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             0,
             0,
             0,
+            100, // isolated SEC_IMAGE diagnostic has no canonical PM thread
         );
         if ensure_executive_paging(BOOT_SEC_IMAGE_SCRATCH_BASE) {
             let (v, f) = sec_image_diagnostic::run(
@@ -28717,6 +28916,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     FB_HEIGHT.store(fb_h, Ordering::Relaxed);
                     FB_SCANLINE.store(fb_scan, Ordering::Relaxed);
                     FB_SIZE_BYTES.store(fb_size, Ordering::Relaxed);
+                    FB_TYPE.store(fb_type as u64, Ordering::Relaxed);
                     FB_BAR_FRAME_COUNT.store(run.pages, Ordering::Release);
                 }
             }
@@ -28934,10 +29134,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             check(b"exec_ahci_dma_frame_io_mapped", map_err == 0, &mut passed);
             // Shared storage run: page 0 carries AHCI IOVA + verdict/size metadata + imports.bin;
             // the remaining pages carry the generated SYSTEM.DAT hive.
-            let shared_start = alloc_frame();
-            for _ in 1..STORAGE_SHARED_FRAMES {
-                let _ = alloc_frame();
-            }
+            let shared_start = alloc_frame_run(STORAGE_SHARED_FRAMES);
             for i in 0..STORAGE_SHARED_FRAMES {
                 let _ = page_map(
                     copy_cap(shared_start + i),
@@ -28990,10 +29187,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 EXPLORER_STACK_MIRROR_VA,
                 CAP_INIT_THREAD_VSPACE,
             );
-            let fb_start = alloc_frame();
-            for _ in 1..FILEBUF_FRAMES {
-                let _ = alloc_frame();
-            }
+            let fb_start = alloc_frame_run(FILEBUF_FRAMES);
             for i in 0..FILEBUF_FRAMES {
                 let _ = page_map(
                     copy_cap(fb_start + i),
@@ -29027,10 +29221,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 SRVBUF_VADDR,
                 CAP_INIT_THREAD_VSPACE,
             );
-            let srvbuf_start = alloc_frame();
-            for _ in 1..SRVBUF_FRAMES {
-                let _ = alloc_frame();
-            }
+            let srvbuf_start = alloc_frame_run(SRVBUF_FRAMES);
             for i in 0..SRVBUF_FRAMES {
                 let _ = page_map(
                     copy_cap(srvbuf_start + i),
@@ -29051,10 +29242,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     CAP_INIT_THREAD_VSPACE,
                 );
             }
-            let win32buf_start = alloc_frame();
-            for _ in 1..WIN32BUF_FRAMES {
-                let _ = alloc_frame();
-            }
+            let win32buf_start = alloc_frame_run(WIN32BUF_FRAMES);
             for i in 0..WIN32BUF_FRAMES {
                 let _ = page_map(
                     copy_cap(win32buf_start + i),
@@ -29075,10 +29263,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     CAP_INIT_THREAD_VSPACE,
                 );
             }
-            let win32kbuf_start = alloc_frame();
-            for _ in 1..WIN32KBUF_FRAMES {
-                let _ = alloc_frame();
-            }
+            let win32kbuf_start = alloc_frame_run(WIN32KBUF_FRAMES);
             for i in 0..WIN32KBUF_FRAMES {
                 let _ = page_map(
                     copy_cap(win32kbuf_start + i),
@@ -29098,10 +29283,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 WINLOGONBUF_VADDR,
                 CAP_INIT_THREAD_VSPACE,
             );
-            let winlogonbuf_start = alloc_frame();
-            for _ in 1..WINLOGONBUF_FRAMES {
-                let _ = alloc_frame();
-            }
+            let winlogonbuf_start = alloc_frame_run(WINLOGONBUF_FRAMES);
             for i in 0..WINLOGONBUF_FRAMES {
                 let _ = page_map(
                     copy_cap(winlogonbuf_start + i),
@@ -29120,10 +29302,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
                 let _ =
                     paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, vaddr, CAP_INIT_THREAD_VSPACE);
-                let start = alloc_frame();
-                for _ in 1..frames {
-                    let _ = alloc_frame();
-                }
+                let start = alloc_frame_run(frames);
                 for i in 0..frames {
                     let _ = page_map(
                         copy_cap(start + i),
@@ -29146,10 +29325,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             .into_iter()
             .enumerate()
             {
-                let start = alloc_frame();
-                for _ in 1..frames {
-                    let _ = alloc_frame();
-                }
+                let start = alloc_frame_run(frames);
                 for i in 0..frames {
                     let _ = page_map(
                         copy_cap(start + i),
@@ -29163,12 +29339,22 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             NLS_ANSI_START.store(nls_starts[0], Ordering::Relaxed);
             NLS_OEM_START.store(nls_starts[1], Ordering::Relaxed);
             NLS_CASE_START.store(nls_starts[2], Ordering::Relaxed);
-            // The real SYSTEM hive buffer (64 frames, shares the 0xA0-0xC0 PT), mapped in the
-            // executive; the same frames are granted to the storage host in spawn_storage_host.
-            let hivebuf_start = alloc_frame();
-            for _ in 1..HIVEBUF_FRAMES {
-                let _ = alloc_frame();
-            }
+            // The installed SYSTEM hive needs a dedicated 2 MiB page-table window.
+            let hivebuf_pt = alloc_slot();
+            let _ = untyped_retype(
+                CAP_INIT_UNTYPED,
+                OBJ_X86_PAGE_TABLE,
+                PAGING_BITS,
+                1,
+                hivebuf_pt,
+            );
+            let _ = paging_struct_map(
+                hivebuf_pt,
+                LBL_X86_PAGE_TABLE_MAP,
+                HIVEBUF_VADDR,
+                CAP_INIT_THREAD_VSPACE,
+            );
+            let hivebuf_start = alloc_frame_run(HIVEBUF_FRAMES);
             for i in 0..HIVEBUF_FRAMES {
                 let _ = page_map(
                     copy_cap(hivebuf_start + i),
@@ -29178,16 +29364,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 );
             }
             HIVEBUF_START.store(hivebuf_start, Ordering::Relaxed);
-            // The real SECURITY + SAM hive buffers (8 frames each, same 0xA0-0xC0 PT as HIVEBUF).
+            // SECURITY, SAM, and DEFAULT remain in the shared 0xA0-0xC0 input window.
             for (frames, vaddr, slot) in [
                 (SECHIVEBUF_FRAMES, SECHIVEBUF_VADDR, &SECHIVEBUF_START),
                 (SAMHIVEBUF_FRAMES, SAMHIVEBUF_VADDR, &SAMHIVEBUF_START),
                 (DEFHIVEBUF_FRAMES, DEFHIVEBUF_VADDR, &DEFHIVEBUF_START),
             ] {
-                let start = alloc_frame();
-                for _ in 1..frames {
-                    let _ = alloc_frame();
-                }
+                let start = alloc_frame_run(frames);
                 for i in 0..frames {
                     let _ = page_map(
                         copy_cap(start + i),
@@ -29209,10 +29392,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     SWHIVEBUF_VADDR,
                     CAP_INIT_THREAD_VSPACE,
                 );
-                let start = alloc_frame();
-                for _ in 1..SWHIVEBUF_FRAMES {
-                    let _ = alloc_frame();
-                }
+                let start = alloc_frame_run(SWHIVEBUF_FRAMES);
                 for i in 0..SWHIVEBUF_FRAMES {
                     let _ = page_map(
                         copy_cap(start + i),
@@ -29236,7 +29416,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 ISR_DONE_BADGE,
             );
             let sfault = make_object(OBJ_ENDPOINT);
-            spawn_storage_host(
+            let storage_component = spawn_storage_host(
                 storage_host::storage_host_entry,
                 sresult_badged,
                 sfault,
@@ -29254,7 +29434,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 win32kbuf_start,
                 winlogonbuf_start,
             );
-            let _ = sfault;
             let (_z, _b, _s, _m) = ep_recv(sresult);
             let verdict = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 8) as *const u32);
             // Capture the NLS table sizes the host reported.
@@ -29334,8 +29513,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 (verdict & 0x200) != 0,
                 &mut passed,
             );
+            boot_probe_thread_retirement::retire_storage_host(
+                storage_component, sresult_badged, sresult, sfault,
+            );
 
-            // --- P7-A: EXECUTIVE-SIDE FS-BY-PATH — the storage host has now PARKED, so the executive
+            // --- P7-A: EXECUTIVE-SIDE FS-BY-PATH — the one-shot storage host has retired, so the executive
             // drives the same (idle) AHCI HBA itself to resolve ANY \reactos path on demand. It
             // already owns the AHCI BAR (mapped at AHCI_VADDR) + the DMA frame cap + the VT-d IO
             // mapping (AHCI_IOVA); it only needs a CPU-side mapping of that DMA frame. Map it at
@@ -29348,7 +29530,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let mut generic_loader_ok = false;
             if let Some(fs) = fat32_mount(AHCI_VADDR, AHCI_DMA_VADDR, AHCI_IOVA)
                 .and_then(|fs| publish_exec_fs(fs).ok().map(|()| fs)) {
-                if let Some((va, sz)) = load_file_to_pool(&fs, b"reactos\\system32\\version.dll") {
+                if let Some((va, sz)) = load_file_to_pool(&fs, crate::installed_layout::VERSION_DLL) {
                     let bytes = core::slice::from_raw_parts(va as *const u8, sz as usize);
                     let mz = sz >= 2 && bytes[0] == b'M' && bytes[1] == b'Z';
                     let parsed = nt_pe_loader::PeFile::parse(bytes).is_ok();
@@ -29535,7 +29717,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let ld_sysarg = alloc_frame();
             let faults_before = DEMAND_FAULTS.load(Ordering::Relaxed);
             let ld_pml4 = spawn_user_thread(loader_entry, ld_fault_c, copy_cap(ld_sysarg), 100, 0);
-            let (_srv, verdict) = service_user_syscalls(ld_fault, &mut *c, &mut *cm, ld_pml4, ldff);
+            let (_srv, verdict, _) = service_user_syscalls(ld_fault, &mut *c, &mut *cm, ld_pml4, ldff);
             ld_magic = verdict;
             ld_faults = DEMAND_FAULTS.load(Ordering::Relaxed) - faults_before;
         }
@@ -30561,7 +30743,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             &mut passed,
         );
         if win32k_size > 0 && win32kbuf_start != 0 {
-            // Executive-side PTs + frames: CODE (544 frames, 2 PTs, mapped RW to load into),
+            // Executive-side PTs + frames: CODE (645 frames, 2 PTs, mapped RW to load into),
             // POOL, DATA, and the shared handoff page. DATA + SHARED are mapped in the executive
             // (load_into writes the cells + the entry rva); POOL is also mapped because the
             // executive-side win32k bridge allocates provider-owned object bodies there.
@@ -30575,10 +30757,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     CAP_INIT_THREAD_VSPACE,
                 );
             }
-            let code_base = alloc_frame();
-            for _ in 1..win32k_subsystem::WIN32K_IMAGE_FRAMES {
-                let _ = alloc_frame();
-            }
+            let code_base = alloc_frame_run(win32k_subsystem::WIN32K_IMAGE_FRAMES);
             for i in 0..win32k_subsystem::WIN32K_IMAGE_FRAMES {
                 let _ = page_map(
                     copy_cap(code_base + i),
@@ -30592,10 +30771,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             )
                 .expect("win32k exception linkage PE missing or invalid");
             let seh_frames = seh_image.frame_count();
-            let seh_base = alloc_frame();
-            for _ in 1..seh_frames {
-                let _ = alloc_frame();
-            }
+            let seh_base = alloc_frame_run(seh_frames);
             for frame in 0..seh_frames {
                 let _ = page_map(
                     copy_cap(seh_base + frame),
@@ -30606,10 +30782,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             }
             seh_image.install().expect("win32k exception linkage installation failed");
             seh_image.publish_imports().expect("win32k exception linkage import publication failed");
-            let pool_base = alloc_frame();
-            for _ in 1..win32k_subsystem::WIN32K_POOL_FRAMES {
-                let _ = alloc_frame();
-            }
+            let pool_base = alloc_frame_run(win32k_subsystem::WIN32K_POOL_FRAMES);
             WIN32K_POOL_FRAME_BASE.store(pool_base, Ordering::Relaxed);
             for page_table in 0..(win32k_subsystem::WIN32K_POOL_FRAMES + 511) / 512 {
                 let pt = alloc_slot();
@@ -30633,41 +30806,23 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_str(b"[win32k-svc] provider pool initialization failed\n");
                 park();
             }
-            let data_base = alloc_frame();
-            for _ in 1..win32k_subsystem::WIN32K_DATA_FRAMES {
-                let _ = alloc_frame();
-            }
+            let data_base = alloc_frame_run(win32k_subsystem::WIN32K_DATA_FRAMES);
             let shared = alloc_frame();
             // A provider wait can outlive and nest with the ordinary syscall/callback frames.
             let provider_wait_frame = alloc_frame();
             // The cross-AS arg-marshal frame(s) — mapped in both the executive and the component.
-            let arg_base = alloc_frame();
-            for _ in 1..win32k_subsystem::WIN32K_ARG_FRAMES {
-                let _ = alloc_frame();
-            }
+            let arg_base = alloc_frame_run(win32k_subsystem::WIN32K_ARG_FRAMES);
             // Pointer-free kernel LPC staging. The executive owns the isolated LPC broker caps;
             // win32k reaches them only through its component-pump service boundary.
-            let lpc_request_base = alloc_frame();
-            for _ in 1..win32k_subsystem::WIN32K_LPC_FRAMES {
-                let _ = alloc_frame();
-            }
+            let lpc_request_base = alloc_frame_run(win32k_subsystem::WIN32K_LPC_FRAMES);
             // Pointer-free staging for native global-atom services redirected to win32k's
             // job-private atom namespace.
-            let job_atom_base = alloc_frame();
-            for _ in 1..win32k_subsystem::WIN32K_JOB_ATOM_FRAMES {
-                let _ = alloc_frame();
-            }
+            let job_atom_base = alloc_frame_run(win32k_subsystem::WIN32K_JOB_ATOM_FRAMES);
             // Pointer-free registry staging. CM channels and leased-key state remain in the
             // executive while win32k carries only bounded bytes and opaque handles.
-            let registry_request_base = alloc_frame();
-            for _ in 1..win32k_subsystem::WIN32K_REGISTRY_FRAMES {
-                let _ = alloc_frame();
-            }
+            let registry_request_base = alloc_frame_run(win32k_subsystem::WIN32K_REGISTRY_FRAMES);
             // Bulk provider argument staging for large GDI client buffers.
-            let bulk_arg_base = alloc_frame();
-            for _ in 1..win32k_subsystem::WIN32K_BULK_ARG_FRAMES {
-                let _ = alloc_frame();
-            }
+            let bulk_arg_base = alloc_frame_run(win32k_subsystem::WIN32K_BULK_ARG_FRAMES);
             // KUSER_SHARED_DATA for win32k's kernel-mode high canonical mapping. It is initialized
             // through an executive scratch alias below, then mapped into the component after its
             // high-VA paging chain exists.
@@ -30676,10 +30831,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // RO-map it into GUI clients. Phase 2A also maps the same frames RW into the executive at
             // their server VAs: callback policy must resolve HWND through gSharedInfo's handle table
             // without dereferencing an unmapped raw component address.
-            let heap_base = alloc_frame();
-            for _ in 1..win32k_subsystem::WIN32K_HEAP_FRAMES {
-                let _ = alloc_frame();
-            }
+            let heap_base = alloc_frame_run(win32k_subsystem::WIN32K_HEAP_FRAMES);
             WIN32K_HEAP_FRAME_BASE.store(heap_base, Ordering::Relaxed);
             for page_table in 0..(win32k_subsystem::WIN32K_HEAP_FRAMES + 511) / 512 {
                 let pt = alloc_slot();
@@ -30829,7 +30981,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 match win32k_subsystem::load_into(WIN32KBUF_VADDR, win32k_size, nls_sizes) {
                     Some(entry_rva) => {
                         let _ = register_system_module(
-                            b"reactos\\system32\\win32k.sys",
+                            crate::installed_layout::WIN32K,
                             win32k_subsystem::WIN32K_CODE_VA,
                             win32k_image_size,
                         );
@@ -31105,7 +31257,25 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     gs_base: Some(win32k_subsystem::WIN32K_KPCR_VA),
                     caps: HostCaps::default(),
                 };
-                let sc = spawn_component_suspended(&d);
+                let mut sc = spawn_component_suspended(&d);
+                // Cursor capture buffers are provider-owned kernel-class pointers. Map a small
+                // separately accounted pool above MmUserProbeAddress, but below the reserved
+                // final canonical page; the ordinary shared provider pool remains unchanged.
+                if !win32k_glue::ensure_w32_client_paging(
+                    win32k_subsystem::WIN32K_CURSOR_ALIAS_VADDR,
+                    sc.pml4,
+                ) {
+                    panic!("win32k cursor alias paging setup failed");
+                }
+                let cursor_alias_frames = alloc_frame_run(win32k_subsystem::WIN32K_CURSOR_ALIAS_FRAMES);
+                for index in 0..win32k_subsystem::WIN32K_CURSOR_ALIAS_FRAMES {
+                    let frame = cursor_alias_frames + index;
+                    let address = win32k_subsystem::WIN32K_CURSOR_ALIAS_VADDR + index * 0x1000;
+                    if page_map_r(frame, address, RW_NX, sc.pml4) != 0 {
+                        panic!("win32k cursor alias frame mapping failed");
+                    }
+                    spawn_hosts::component_map_cap_bank_store(&mut sc.map_cap_bank, frame);
+                }
                 if !win32k_glue::ensure_w32_client_paging(
                     win32k_subsystem::WIN32K_KUSER_SHARED_DATA_VA,
                     sc.pml4,
@@ -31471,272 +31641,26 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     #[cfg(feature = "mup-provider-kernel-only")]
     print_str(b"[mup-provider-gate] kernel-only native service loop; win32k admission deferred\n");
 
-    // --- B3: start registry-selected PnP drivers against their discovered devnodes and
-    // generation-owned resources.
+    // Registry-selected PnP plans, PCI grants, and resource windows are already captured.
+    // DriverEntry runs after the live File handler exists, because a driver can synchronously
+    // open another provider's device during initialization. Both Start classes use that phase.
     let mut generic_hw_registry_selected = false;
-    let mut generic_hw_io_out32 = false;
-    let mut generic_hw_video_route_published = false;
     let mut generic_hw_selected = 0u64;
-    let mut generic_hw_attempted = 0u64;
-    let mut generic_hw_terminal = 0u64;
-    let mut generic_hw_add_device_count = 0u64;
-    let mut generic_hw_started = 0u64;
-    let mut generic_hw_failed = 0u64;
-    let mut generic_hw_pending = 0u64;
-    let mut generic_hw_pending_observed = 0u64;
-    let mut generic_hw_indeterminate = 0u64;
-    let mut generic_hw_video_route_attempted = 0u64;
-    let mut generic_hw_video_route_published_count = 0u64;
-    let mut generic_hw_first_error = 0u32;
-    let mut generic_hw_first_indeterminate = 0u32;
     let mut generic_pci_registry_selected = false;
-    let mut generic_pci_provider_domain_bound = false;
     let mut generic_pci_selected = 0u64;
-    let mut generic_pci_attempted = 0u64;
-    let mut generic_pci_provider_export_requests = 0u64;
-    let mut generic_pci_provider_export_completions = 0u64;
-    let mut generic_pci_provider_export_rejections = 0u64;
-    let mut generic_pci_add_device_count = 0u64;
-    let mut generic_pci_started = 0u64;
-    let mut generic_pci_resource_accessed = false;
-    let mut generic_pci_first_error = 0u32;
-    // A present devnode demand-loads its registry-selected function driver when no Driver object is
-    // loaded yet. This is the kernel PnP IopLoadDriver path, independent of a user NtLoadDriver
-    // request; Start=3 remains loadable here and only a disabled service is excluded by selection.
-    let config_pnp_launch_plans = [config_pnp_plan, config_demand_pnp_plan];
-    if config_pnp_launch_plans
-        .iter()
-        .any(|plan| !plan.as_slice().is_empty())
-    {
-        if let Some(fs) = exec_fs() {
-            for config_plan in config_pnp_launch_plans {
-                for config_spec in config_plan.as_slice() {
-                    let config_devnodes = config_plan.devnodes_for(config_spec);
-                    let spec_has_pci_devnode = inline_launch_spec_has_pci_devnode(config_devnodes);
-                    let spec_devnodes = config_spec.devnode_count as u64;
-                    generic_hw_selected += spec_devnodes;
-                    generic_hw_registry_selected |= config_spec.devnode_count != 0;
-                    generic_pci_registry_selected |= spec_has_pci_devnode;
-                    if spec_has_pci_devnode {
-                        generic_pci_selected += spec_devnodes;
-                    }
-                    print_str(b"[driver-launch] launching PnP service ");
-                    print_str(config_spec.service_name.as_bytes());
-                    print_str(b" from config hive path=");
-                    print_str(config_spec.image_path.as_bytes());
-                    print_str(b" object=");
-                    print_str(config_spec.driver_object_path.as_bytes());
-                    print_str(b" devnodes=");
-                    print_u64(config_spec.devnode_count as u64);
-                    print_str(b"\n");
-
-                    let provider_before = driver_launch::hosted_provider_sharing_evidence();
-                    if let Some((_dc, start_report)) = launch_boot_driver_service(
-                        &fs,
-                        config_spec,
-                        config_plan,
-                        HostedPnpStartOptions::config_pnp(),
-                        &mut driver_start_bootstrap,
-                    ) {
-                        let provider_after = driver_launch::hosted_provider_sharing_evidence();
-                        generic_hw_attempted += start_report.attempted;
-                        generic_hw_terminal += start_report.terminal;
-                        generic_hw_add_device_count += start_report.add_device_count;
-                        generic_hw_started += start_report.started;
-                        generic_hw_failed += start_report.failed;
-                        generic_hw_pending += start_report.pending;
-                        generic_hw_pending_observed += start_report.pending_observed;
-                        generic_hw_indeterminate += start_report.indeterminate;
-                        if generic_hw_first_error == 0 && start_report.first_error != 0 {
-                            generic_hw_first_error = start_report.first_error;
-                        }
-                        if generic_hw_first_indeterminate == 0
-                            && start_report.first_indeterminate != 0
-                        {
-                            generic_hw_first_indeterminate = start_report.first_indeterminate;
-                        }
-                        if spec_has_pci_devnode {
-                            generic_pci_attempted += start_report.attempted;
-                            generic_pci_add_device_count += start_report.add_device_count;
-                            generic_pci_started += start_report.started;
-                            generic_pci_provider_domain_bound |=
-                                provider_after.provider_domain_bindings != 0;
-                            generic_pci_provider_export_requests =
-                                generic_pci_provider_export_requests.saturating_add(
-                                    provider_after
-                                        .provider_export_requests
-                                        .saturating_sub(provider_before.provider_export_requests),
-                                );
-                            generic_pci_provider_export_completions =
-                                generic_pci_provider_export_completions.saturating_add(
-                                    provider_after.provider_export_completions.saturating_sub(
-                                        provider_before.provider_export_completions,
-                                    ),
-                                );
-                            generic_pci_provider_export_rejections =
-                                generic_pci_provider_export_rejections.saturating_add(
-                                    provider_after
-                                        .provider_export_rejections
-                                        .saturating_sub(provider_before.provider_export_rejections),
-                                );
-                            generic_pci_resource_accessed |= start_report.mmio_mapped
-                                || start_report.io_port_out32
-                                || start_report.interrupt_delivered
-                                || start_report.dma_common;
-                            if generic_pci_first_error == 0 && start_report.first_error != 0 {
-                                generic_pci_first_error = start_report.first_error;
-                            }
-                        }
-                        generic_hw_io_out32 |= start_report.io_port_out32;
-                        generic_hw_video_route_published |= start_report.video_route_published;
-                        generic_hw_video_route_attempted +=
-                            start_report.video_route_attempted_count;
-                        generic_hw_video_route_published_count +=
-                            start_report.video_route_published_count;
-                    } else {
-                        print_str(
-                            b"[driver-launch] registry-selected PnP driver launch returned None service=",
-                        );
-                        print_str(config_spec.service_name.as_bytes());
-                        print_str(b" (not staged / load failed)\n");
-                    }
-                }
+    for plan in [config_pnp_plan, config_demand_pnp_plan] {
+        for spec in plan.as_slice() {
+            let devnodes = spec.devnode_count as u64;
+            generic_hw_selected += devnodes;
+            generic_hw_registry_selected |= spec.devnode_count != 0;
+            if inline_launch_spec_has_pci_devnode(plan.devnodes_for(spec)) {
+                generic_pci_registry_selected = true;
+                generic_pci_selected += devnodes;
             }
-        } else {
-            print_str(b"[driver-launch] registry-selected PnP launch has no filesystem\n");
         }
-    } else {
-        print_str(b"[driver-launch] config hive has no installed PnP driver binding\n");
     }
-    let generic_hw_gates_deferred = generic_hw_pending != 0
-        || generic_hw_indeterminate != 0
-        || !driver_start_bootstrap.pending.is_empty();
-    if !generic_hw_gates_deferred && generic_hw_selected != 0 {
-        print_str(b"[driver-launch] config PnP hardware summary selected=");
-        print_u64(generic_hw_selected);
-        print_str(b" attempted=");
-        print_u64(generic_hw_attempted);
-        print_str(b" add=");
-        print_u64(generic_hw_add_device_count);
-        print_str(b" started=");
-        print_u64(generic_hw_started);
-        print_str(b" terminal/failed/pending/pending-observed/indeterminate=");
-        print_u64(generic_hw_terminal);
-        print_str(b"/");
-        print_u64(generic_hw_failed);
-        print_str(b"/");
-        print_u64(generic_hw_pending);
-        print_str(b"/");
-        print_u64(generic_hw_pending_observed);
-        print_str(b"/");
-        print_u64(generic_hw_indeterminate);
-        print_str(b" first_error=0x");
-        print_hex(generic_hw_first_error);
-        print_str(b" first_indeterminate=0x");
-        print_hex(generic_hw_first_indeterminate);
-        print_str(b" pci_selected=");
-        print_u64(generic_pci_selected);
-        print_str(b" pci_attempted=");
-        print_u64(generic_pci_attempted);
-        print_str(b" pci_provider_domain=");
-        print_u64(generic_pci_provider_domain_bound as u64);
-        print_str(b" pci_provider_exports=");
-        print_u64(generic_pci_provider_export_completions);
-        print_str(b"/");
-        print_u64(generic_pci_provider_export_requests);
-        print_str(b" pci_provider_rejections=");
-        print_u64(generic_pci_provider_export_rejections);
-        print_str(b" pci_add=");
-        print_u64(generic_pci_add_device_count);
-        print_str(b" pci_started=");
-        print_u64(generic_pci_started);
-        print_str(b" pci_resource_accessed=");
-        print_u64(generic_pci_resource_accessed as u64);
-        print_str(b" pci_first_error=0x");
-        print_hex(generic_pci_first_error);
-        print_str(b" io_out32=");
-        print_u64(generic_hw_io_out32 as u64);
-        print_str(b" video_route=");
-        print_u64(generic_hw_video_route_published as u64);
-        print_str(b" video_route_attempted=");
-        print_u64(generic_hw_video_route_attempted);
-        print_str(b" video_route_published=");
-        print_u64(generic_hw_video_route_published_count);
-        print_str(b"\n");
-    }
-    let provider_sharing = driver_launch::hosted_provider_sharing_evidence();
-    if !generic_hw_gates_deferred
-        && (provider_sharing.primary_services != 0
-            || provider_sharing.private_dependencies != 0
-            || provider_sharing.singleton_providers != 0
-            || provider_sharing.provider_domain_bindings != 0)
-    {
-        print_str(b"[driver-launch] hosted provider sharing primary=");
-        print_u64(provider_sharing.primary_services);
-        print_str(b" primary-bytes=");
-        print_u64(provider_sharing.primary_service_image_bytes);
-        print_str(b" private-deps=");
-        print_u64(provider_sharing.private_dependencies);
-        print_str(b" private-bytes=");
-        print_u64(provider_sharing.private_dependency_image_bytes);
-        print_str(b" private-deps-with-primary=");
-        print_u64(provider_sharing.private_dependencies_with_primary_provider);
-        print_str(b" first-private-primary-inst=");
-        print_u64(provider_sharing.first_private_dependency_with_primary_instance);
-        print_str(b" duplicate-private-deps=");
-        print_u64(provider_sharing.duplicate_private_dependencies);
-        print_str(b" unique-primary-provider-matches=");
-        print_u64(provider_sharing.unique_primary_provider_matches);
-        print_str(b" overflow=");
-        print_u64(provider_sharing.overflowed_load_records);
-        print_str(b" singletons=");
-        print_u64(provider_sharing.singleton_providers);
-        print_str(b" provider-domains=");
-        print_u64(provider_sharing.provider_domain_bindings);
-        print_str(b" exports=");
-        print_u64(provider_sharing.provider_export_completions);
-        print_str(b"/");
-        print_u64(provider_sharing.provider_export_requests);
-        print_str(b" export-rejections=");
-        print_u64(provider_sharing.provider_export_rejections);
-        print_str(b" callbacks=");
-        print_u64(provider_sharing.provider_callback_completions);
-        print_str(b"/");
-        print_u64(provider_sharing.provider_callback_requests);
-        print_str(b" packet-array=");
-        print_u64(provider_sharing.provider_packet_array_export_completions);
-        print_str(b"/");
-        print_u64(provider_sharing.provider_packet_array_export_requests);
-        print_str(b" packet-array-rx=");
-        print_u64(provider_sharing.provider_packet_array_protocol_receive_completions);
-        print_str(b"/");
-        print_u64(provider_sharing.provider_packet_array_protocol_receive_requests);
-        print_str(b" packet-array-rx-packet=");
-        print_u64(provider_sharing.provider_packet_array_protocol_receive_packet_completions);
-        print_str(b"/");
-        print_u64(provider_sharing.provider_packet_array_protocol_receive_packet_requests);
-        print_str(b" rx=");
-        print_u64(provider_sharing.provider_protocol_receive_completions);
-        print_str(b"/");
-        print_u64(provider_sharing.provider_protocol_receive_requests);
-        print_str(b" rx-complete=");
-        print_u64(provider_sharing.provider_protocol_receive_complete_completions);
-        print_str(b"/");
-        print_u64(provider_sharing.provider_protocol_receive_complete_requests);
-        print_str(b" rx-packet=");
-        print_u64(provider_sharing.provider_protocol_receive_packet_completions);
-        print_str(b"/");
-        print_u64(provider_sharing.provider_protocol_receive_packet_requests);
-        print_str(b" singleton-overflows=");
-        print_u64(provider_sharing.singleton_overflows);
-        print_str(b" singleton-conflicts=");
-        print_u64(provider_sharing.singleton_conflicts);
-        print_str(b"\n");
-    }
-    // --- P3 ReactOS-binary pipeline: the storage host read a REAL, redistributable (GPL)
-    // ReactOS x64 smss.exe off the disk into the file buffer. Parse it through the REAL
-    // PE-load path (nt-pe-loader) and validate our SEC_IMAGE page-fill against it — a genuine
-    // Windows-family binary flowing through the machinery we built.
+    // The storage host read the installed SMSS image into the file buffer. Validate its PE
+    // shape and SEC_IMAGE page-fill without pinning a particular release's section count or RVA.
     let smss_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x20) as *const u32);
     if found_storage && smss_size > 0 {
         let smss = core::slice::from_raw_parts(FILEBUF_VADDR as *const u8, smss_size as usize);
@@ -31770,7 +31694,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 }
                 // SEC_IMAGE fill validation: fill the .text page (RVA 0x1000) via our RVA->file
                 // translation and compare to the file's .text raw bytes. Match => our loader
-                // maps a real 6-section x64 binary correctly.
+                // maps the installed x64 binary correctly.
                 let (scratch_frame, scratch_frame_error) = alloc_frame_r();
                 let (scratch, scratch_map) = if scratch_frame_error == 0 {
                     map_boot_proof_alias(scratch_frame)
@@ -31800,7 +31724,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         }
                     }
                 }
-                print_str(b"[ntos-exec] REAL ReactOS smss.exe loaded: PE32+ x64, sections=");
+                print_str(b"[ntos-exec] installed smss.exe loaded: PE32+ x64, sections=");
                 print_u64(nsec as u64);
                 print_str(b" entry=0x");
                 print_hex(entry);
@@ -31811,7 +31735,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_str(b"\n");
                 check(
                     b"exec_reactos_smss_parsed",
-                    nsec == 6 && entry == 0x12ee0,
+                    nsec != 0 && entry != 0 && entry < pe.size_of_image(),
                     &mut passed,
                 );
                 check(
@@ -31828,11 +31752,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let imports_size =
                     core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x24) as *const u32);
                 let mut resolved = 0u32;
+                let mut expected = 0u32;
                 if imports_size >= 4 {
                     let count = core::ptr::read_volatile(
                         (STORAGE_SHARED_VADDR + STORAGE_IMPORTS_IMAGE_OFFSET) as *const u32,
                     );
-                    for i in 0..count as u64 {
+                    if count > 0 && count <= (imports_size - 4) / 8 {
+                        expected = count;
+                    }
+                    for i in 0..expected as u64 {
                         let ent = STORAGE_SHARED_VADDR + STORAGE_IMPORTS_IMAGE_OFFSET + 4 + i * 8;
                         let off = core::ptr::read_volatile(ent as *const u32) as u64;
                         let rva = core::ptr::read_volatile((ent + 4) as *const u32) as u64;
@@ -31852,7 +31780,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_str(b"\n");
                 check(
                     b"exec_reactos_imports_resolved",
-                    resolved == 103,
+                    expected != 0 && resolved == expected,
                     &mut passed,
                 );
 
@@ -31862,7 +31790,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // IAT -> NTDLL_BASE+0x48f00 -> ntdll's .text page faults in and REAL NTDLL CODE
                 // EXECUTES. It runs until it derefs the (null) process params -> a safe stop.
                 let ntdll_source =
-                    bootstrap_image::load_installed(b"reactos\\system32\\ntdll.dll");
+                    bootstrap_image::load_installed(crate::installed_layout::NTDLL);
                 check(
                     b"exec_ntdll_loaded_from_fs_by_path",
                     ntdll_source.is_some(),
@@ -31925,6 +31853,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         .expect("session manager requires a valid fault endpoint capability");
                     let smss_client_id = ps_bootstrap::hosted_main_client_id(smss_image.pi)
                         .expect("SMSS must own its canonical ClientId before spawn");
+                    let smss_priority = ps_bootstrap::with_process_manager(|pm| {
+                        native_thread_priority::initial_priority(pm, u64::from(smss_client_id.unique_thread))
+                    }).expect("SMSS TCB priority must match its canonical PM thread");
                     let spawn = spawn_hosted_sec_image_for_image(
                         smss_image,
                         nt_memory_manager::MemoryLifetime::Process(
@@ -31945,6 +31876,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         smss_ldrp_rva,
                         u64::from(smss_client_id.unique_process),
                         u64::from(smss_client_id.unique_thread),
+                        smss_priority,
                     );
                     print_str(b"[diag-smss] spawn returned pml4=0x");
                     print_hex((spawn.pml4 >> 32) as u32);
@@ -31982,6 +31914,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         SCRATCH_BASE,
                         (NTDLL_BASE, smss_ntdll_pe),
                         driver_start_bootstrap,
+                        config_pnp_plan,
+                        config_demand_pnp_plan,
                     );
                     desktop_acceptance = desktop_report;
                     // The service has returned its exclusive borrow. Final observations read only
@@ -32950,7 +32884,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 }
             }
             Err(_) => {
-                print_str(b"[ntos-exec] ReactOS smss.exe PARSE FAILED\n");
+                print_str(b"[ntos-exec] installed smss.exe PARSE FAILED\n");
                 check(b"exec_reactos_smss_parsed", false, &mut passed);
                 check(b"exec_reactos_smss_imports_ntdll", false, &mut passed);
                 check(b"exec_reactos_sec_image_fill", false, &mut passed);

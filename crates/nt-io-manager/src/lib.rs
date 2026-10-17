@@ -73,6 +73,7 @@ mod hosted_safe_attach;
 mod hosted_bus_pdo_publication;
 mod hosted_file_system_registry;
 pub mod hosted_pool_range;
+pub mod video_monitor_array_projection;
 pub mod hosted_kernel_read_delivery;
 pub mod inline_file_retirement;
 mod irp;
@@ -88,6 +89,7 @@ pub mod redir_query_path;
 pub mod retained_query_path_forward;
 pub mod retained_write_forward;
 pub mod retained_read_forward;
+pub mod internal_device_control_forward;
 pub mod retained_query_information_forward;
 pub mod retained_flush_forward;
 pub mod retained_connect_forward;
@@ -5027,6 +5029,10 @@ mod tests {
     }
 
     impl DriverDispatchBackend for KernelFileRouteBackend {
+        fn immutable_file_extent(&self, _file_id: FileId, file_context: u64) -> Option<u64> {
+            (file_context == 0xfeed).then_some(4)
+        }
+
         fn dispatch_irp(
             &mut self,
             ctx: DispatchContext<'_>,
@@ -5177,6 +5183,15 @@ mod tests {
         ));
         assert_eq!(om.file(file).unwrap().state, FileState::Open);
         assert_eq!(om.external_file_context(client, file), Ok(Some(0xfeed)));
+        assert_eq!(om.immutable_file_extent(client, file, device, 0xfeed), Ok(Some(4)));
+        assert_eq!(
+            om.immutable_file_extent(client, file, device, 0xbeef),
+            Err(NtStatus::INVALID_HANDLE)
+        );
+        assert_eq!(
+            om.immutable_file_extent(client, file, DeviceId::NULL, 0xfeed),
+            Err(NtStatus::INVALID_HANDLE)
+        );
 
         let mut metadata = [0; 4];
         assert!(matches!(

@@ -8,7 +8,7 @@ use nt_types::UnicodeString;
 
 pub(crate) unsafe fn run(device_id: u64) -> bool {
     let caller = crate::initial_system_driver_caller();
-    let name = UnicodeString::from_str("reactos\\Fonts\\arial.ttf");
+    let name = UnicodeString::from_str(crate::installed_layout::ARIAL_STR);
     let file = match crate::driver_launch::allocate_hosted_file(
         device_id,
         nt_types::AccessMask::GENERIC_READ.bits(),
@@ -93,7 +93,7 @@ pub(crate) unsafe fn run(device_id: u64) -> bool {
 
 pub(crate) unsafe fn run_directory(device_id: u64) -> bool {
     let caller = crate::initial_system_driver_caller();
-    let name = UnicodeString::from_str("reactos\\Fonts");
+    let name = UnicodeString::from_str(crate::installed_layout::FONTS_STR);
     let access = nt_types::AccessMask::GENERIC_READ;
     let share = nt_io_manager::ShareAccess::READ;
     let options = nt_io_manager::CreateOptions::DIRECTORY_FILE;
@@ -317,7 +317,7 @@ pub(crate) unsafe fn run_overlay(device_id: u64) -> bool {
 }
 
 pub(crate) unsafe fn run_copy_up(device_id: u64) -> bool {
-    let relative = b"reactos\\system32\\version.dll";
+    let relative = crate::installed_layout::VERSION_DLL;
     if !matches!(
         crate::writable_fs::query_metadata_relative(relative),
         Ok(None)
@@ -325,7 +325,7 @@ pub(crate) unsafe fn run_copy_up(device_id: u64) -> bool {
         return false;
     }
     let caller = crate::initial_system_driver_caller();
-    let name = UnicodeString::from_str("reactos\\system32\\version.dll");
+    let name = UnicodeString::from_str(crate::installed_layout::VERSION_DLL_STR);
     let access = nt_types::AccessMask::GENERIC_READ
         | nt_types::AccessMask::GENERIC_WRITE
         | nt_types::AccessMask::DELETE;

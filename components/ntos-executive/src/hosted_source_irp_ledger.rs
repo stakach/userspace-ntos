@@ -69,7 +69,7 @@ fn auxiliary() -> &'static mut SourceIrpAuxiliaryLedger {
     unsafe { &mut *core::ptr::addr_of_mut!(AUXILIARY) }
 }
 
-unsafe fn pool_range_identity_unlocked(
+pub(super) unsafe fn pool_range_identity_unlocked(
     inst: DriverInstance,
     component_address: u64,
     bytes: u64,
@@ -106,7 +106,7 @@ unsafe fn pool_range_identity_unlocked(
     })
 }
 
-unsafe fn exact_pool_identity_unlocked(
+pub(super) unsafe fn exact_pool_identity_unlocked(
     inst: DriverInstance,
     component_address: u64,
     bytes: u64,
@@ -694,6 +694,12 @@ pub(super) fn retire_allocation(
     {
         return (STATUS_INVALID_HANDLE, 0, 0);
     }
+    if op == 3 && unsafe {
+        hosted_driver_dynamic_type::owns_type_allocation(instance_index, component_address)
+            || hosted_driver_dynamic_type::owns_object_allocation(instance_index, component_address)
+    } {
+        return (nt_status::NtStatus::DELETE_PENDING.raw(), 0, 0);
+    }
     let _guard = lock();
     let _projection_guard = match hosted_device_allocations::generic_free_admission(inst, component_address) {
         Ok(guard) => guard,
@@ -714,6 +720,13 @@ pub(super) fn retire_allocation(
     {
         return (nt_status::NtStatus::PENDING.raw(), 0, 0);
     }
+    let mutex_pool = if op == 3 {
+        unsafe { exact_pool_identity_unlocked(inst, component_address, 1) }
+            .map(|identity| (identity.component_address, identity.pool_generation))
+    } else { None };
+    if mutex_pool.is_some_and(|pool| !hosted_driver_kmutex::pool_free_admission(domain, pool)) {
+        return (nt_status::NtStatus::DELETE_PENDING.raw(), 0, 0);
+    }
     let owner = match ledger().pool_free_admission(instance_index, domain, component_address) {
         Ok(SourcePoolFreeAdmission::Unregistered) => {
             return if op == 3
@@ -721,6 +734,7 @@ pub(super) fn retire_allocation(
                     == Some(false)
                 && unsafe { hosted_instance_pool_free_unlocked(inst, component_address) }
             {
+                if let Some(pool) = mutex_pool { hosted_driver_kmutex::pool_freed(domain, pool); }
                 (STATUS_SUCCESS, 0, 0)
             } else {
                 (STATUS_INVALID_HANDLE, 0, 0)
@@ -741,6 +755,7 @@ pub(super) fn retire_allocation(
             if !unsafe { hosted_instance_pool_free_unlocked(inst, component_address) } {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             }
+            if let Some(pool) = mutex_pool { hosted_driver_kmutex::pool_freed(domain, pool); }
             if ledger().retire(ticket, owner).is_err() {
                 unsafe {
                     crate::provider_bugcheck::report(
@@ -891,6 +906,36 @@ pub(super) fn service(
             let Some(domain) = instance_domain_identity(inst) else {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             };
+            if op == 3 {
+                if let Some(status) = unsafe {
+                    hosted_dxg_registration::defer_allocation_cookie_free(
+                        ch, instance_index, inst, domain, component_address,
+                        caller_badge, active_reply_cap)
+                } {
+                    return (status, 0, 0);
+                }
+                if let Some(status) = unsafe {
+                    hosted_dxg_registration::defer_context_cookie_free(
+                        ch, instance_index, inst, domain, component_address,
+                        caller_badge, active_reply_cap)
+                } {
+                    return (status, 0, 0);
+                }
+                if let Some(status) = unsafe {
+                    hosted_dxg_registration::defer_device_cookie_free(
+                        ch, instance_index, inst, domain, component_address,
+                        caller_badge, active_reply_cap)
+                } {
+                    return (status, 0, 0);
+                }
+                if let Some(status) = unsafe {
+                    hosted_dxg_registration::defer_process_cookie_free(
+                        ch, instance_index, inst, domain, component_address,
+                        caller_badge, active_reply_cap)
+                } {
+                    return (status, 0, 0);
+                }
+            }
             retire_allocation(instance_index, inst, domain, op, component_address)
         }
         6 => {

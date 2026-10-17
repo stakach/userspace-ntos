@@ -51,6 +51,9 @@ mod hosted_gui_client_info;
 #[path = "provider_file_objects.rs"]
 mod provider_file_objects;
 pub(crate) use provider_file_objects::service_win32k_file_object_request;
+#[path = "process_information_native.rs"]
+mod process_information_native;
+pub(crate) use process_information_native::service_win32k_process_query_request;
 
 pub(crate) static FILE_IO_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
 static FILE_IO_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -58,6 +61,37 @@ static PIPE_TRANSCEIVE_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
 static mut FILE_IO_COPY_WORK: [u8; 4096] = [0; 4096];
 static CALLBACK_MESSAGE_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_MESSAGE_TRACE: AtomicU64 = AtomicU64::new(0);
+static CSRSS_RESUME_REPLIES: AtomicU64 = AtomicU64::new(0);
+static CSRSS_POST_RESUME_TCB: AtomicU64 = AtomicU64::new(0);
+
+/// Bounded boot diagnostic: sample the CSRSS main thread after its SB worker resume reply.
+pub(crate) fn trace_csrss_post_resume_census(census: u64) {
+    if census > 5 {
+        return;
+    }
+    let tcb = CSRSS_POST_RESUME_TCB.load(Ordering::Relaxed);
+    if tcb == 0 {
+        return;
+    }
+    let mut regs = [0u64; 20];
+    let valid = unsafe { crate::win32k_glue::tcb_read_regs20_checked(tcb, &mut regs) };
+    print_str(b"[csrss-post-resume] census=");
+    print_u64(census);
+    print_str(b" tcb=0x");
+    print_hex_u64(tcb);
+    print_str(b" registers-valid=");
+    print_u64(valid as u64);
+    if valid {
+        print_str(b" rip=0x");
+        print_hex_u64(regs[0]);
+        print_str(b" rsp=0x");
+        print_hex_u64(regs[1]);
+        print_str(b" rax=0x");
+        print_hex_u64(regs[3]);
+    }
+    print_str(b"\n");
+    unsafe { crate::win32k_glue::trace_hosted_tcb_debug_state(b"csrss-post-resume", tcb, 0) };
+}
 
 pub(crate) fn synchronous_file_retry_stats() -> (nt_io_manager::SynchronousFileRetryStats, u64, u64, u64) {
     let stats = unsafe { (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).retry_stats() };
@@ -1284,6 +1318,9 @@ unsafe fn lpc_wait_begin_after_stack_admission(
                 // syscall. Publish the same progress signal so the common drain wakes a parked LPC
                 // server receiver before the executive blocks again.
                 nt_handler.lpc_endpoint_progress = true;
+                let alpc_reply_committed =
+                    crate::native_alpc_send_receive_work::redrive_after_lpc_publish(nt_handler);
+                nt_handler.lpc_reply_published |= alpc_reply_committed;
                 return true;
             }
             if let Some(client) = lpc_client() {
@@ -3046,6 +3083,10 @@ fn maybe_fold_system_wal() -> Result<(), u32> {
 fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
     nt_handler.sweep_directory_security_bodies();
     nt_handler.sweep_data_section_security();
+    // A hosted import can consume its last object reference while its primary Call still owns
+    // the Reply. The dynamic delete drain waits for that primary's exact ready receipt, then
+    // invokes DeleteProcedure on a separate PASSIVE worker.
+    unsafe { driver_launch::hosted_driver_dynamic_delete::drain(); }
     // A completed physical fold can be waiting only for its exact CM ACK. It still owns the
     // reserve, so redrive that receipt before any ordinary snapshot tries to acquire it.
     if crate::writable_fs::system_wal_fold_ack_pending() {
@@ -4092,6 +4133,37 @@ pub(crate) unsafe fn rearm_registered_active_delay_timer() {
     }
 }
 
+/// Resolve the active process handle table for a win32k Event handle operation.
+/// KeStackAttachProcess changes this table without changing the original IPC caller.
+fn resolve_win32k_event_handle_pi(
+    handler: &ExecNtHandler,
+    channel: &spawn_hosts::PumpChannel,
+    original_pi: usize,
+) -> Result<usize, u32> {
+    let invalid = nt_process::STATUS_INVALID_HANDLE;
+    let logical = channel.logical_caller.ok_or(invalid)?;
+    if !handler.validate_provider_logical_caller(logical)
+        || logical.pi() != original_pi
+        || logical.pi() as u64 != channel.client_pi
+        || logical.process().generation !=
+            nt_user_host::process_identity::ProcessGeneration::Hosted(channel.client_generation)
+    {
+        return Err(invalid);
+    }
+    let active = unsafe { crate::win32k_glue::current_query_process(logical, channel.pml4) }
+        .ok_or(invalid)?;
+    if handler.pm_pid_for_pi(active.pi) != Some(active.process.pid)
+        || handler.hosted_process_generation(active.pi)
+            != match active.process.generation {
+                nt_user_host::process_identity::ProcessGeneration::Hosted(generation) => Some(generation),
+                _ => None,
+            }
+    {
+        return Err(invalid);
+    }
+    Ok(active.pi)
+}
+
 /// Route kernel Event requests through their retained activation; hosted requests use the live handler.
 /// The nested component pump is serialized with native dispatch, so no second handler pointer or
 /// lock domain is introduced. GUI redrive remains deferred until the outer dispatch can resume.
@@ -4107,6 +4179,10 @@ pub(crate) unsafe fn service_win32k_event_request(
 ) -> (i32, u64, u64, u64) {
     const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
     const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
+    if op == crate::win32k_subsystem::W32_EVENT_OP_CREATE_NAMED {
+        return service_win32k_named_event_request(channel, reply_cap, badge, message_info,
+            arg1, arg2, arg3);
+    }
     if channel.kernel_caller.is_some() {
         return kernel_provider_activation::service_event(
             channel,
@@ -4130,6 +4206,13 @@ pub(crate) unsafe fn service_win32k_event_request(
     let handler = &mut *handler_ptr;
     let provider_scoped = matches!(
         op,
+        crate::win32k_subsystem::W32_SYNC_OP_PUBLISH
+            | crate::win32k_subsystem::W32_SYNC_OP_RELEASE_SEMAPHORE
+            | crate::win32k_subsystem::W32_SYNC_OP_RELEASE_MUTANT
+            | crate::win32k_subsystem::W32_SYNC_OP_RETIRE
+            | crate::win32k_subsystem::W32_SYNC_OP_ACK_RETIREMENT
+            | crate::win32k_subsystem::W32_SYNC_OP_QUERY
+            |
         crate::win32k_subsystem::W32_EVENT_OP_PUBLISH_LOCAL
             | crate::win32k_subsystem::W32_EVENT_OP_RETIRE_LOCAL
             | crate::win32k_subsystem::W32_EVENT_OP_ACK_LOCAL_RETIREMENT
@@ -4160,12 +4243,51 @@ pub(crate) unsafe fn service_win32k_event_request(
         pi
     };
     match op {
+        crate::win32k_subsystem::W32_SYNC_OP_PUBLISH
+        | crate::win32k_subsystem::W32_SYNC_OP_RELEASE_SEMAPHORE
+        | crate::win32k_subsystem::W32_SYNC_OP_RELEASE_MUTANT
+        | crate::win32k_subsystem::W32_SYNC_OP_RETIRE
+        | crate::win32k_subsystem::W32_SYNC_OP_ACK_RETIREMENT
+        | crate::win32k_subsystem::W32_SYNC_OP_QUERY => {
+            let Some(provider) = crate::current_win32k_provider_domain() else {
+                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+            };
+            let owner = if op == crate::win32k_subsystem::W32_SYNC_OP_RELEASE_MUTANT {
+                let Some(caller) = channel.logical_caller else {
+                    return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+                };
+                if !handler.validate_provider_logical_caller(caller)
+                    || caller.pi() as u64 != channel.client_pi
+                    || caller.process().generation !=
+                        nt_user_host::process_identity::ProcessGeneration::Hosted(channel.client_generation)
+                {
+                    return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+                }
+                Some(nt_provider_wait::ProviderWaitOwner {
+                    provider_domain: provider.domain,
+                    provider_generation: provider.generation,
+                    dispatch_id: 1,
+                    caller: nt_component_suspension::SuspensionCaller::Hosted(
+                        nt_component_suspension::SuspensionHostedClient {
+                            client_pi: caller.pi() as u32,
+                            client_generation: channel.client_generation,
+                            client_tid: u64::from(caller.thread().thread_id()),
+                            client_badge: caller.badge(),
+                        },
+                    ),
+                })
+            } else {
+                None
+            };
+            service_win32k_provider_sync_request(provider, owner, op, arg1, arg2, arg3)
+        }
         crate::win32k_subsystem::W32_EVENT_OP_CREATE => handler
             .provider_create_event(pi, arg1 as u32, arg2 as u32, arg3 != 0)
             .map(|handle| (0, handle, 0, 0))
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
-        crate::win32k_subsystem::W32_EVENT_OP_REFERENCE => handler
-            .provider_reference_event(pi, arg1, arg3 as u32, arg2)
+        crate::win32k_subsystem::W32_EVENT_OP_REFERENCE =>
+            resolve_win32k_event_handle_pi(handler, channel, pi)
+            .and_then(|active_pi| handler.provider_reference_event(active_pi, arg1, arg3 as u32, arg2))
             .map(|(body, id, metadata, granted_access)| {
                 (
                     0,
@@ -4175,8 +4297,9 @@ pub(crate) unsafe fn service_win32k_event_request(
                 )
             })
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
-        crate::win32k_subsystem::W32_EVENT_OP_CLOSE => handler
-            .provider_close_event(pi, arg1)
+        crate::win32k_subsystem::W32_EVENT_OP_CLOSE =>
+            resolve_win32k_event_handle_pi(handler, channel, pi)
+            .and_then(|active_pi| handler.provider_close_event(active_pi, arg1))
             .map(|()| (0, 0, 0, 0))
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
         crate::win32k_subsystem::W32_EVENT_OP_DEREFERENCE => handler
@@ -4340,6 +4463,139 @@ pub(crate) unsafe fn service_win32k_event_request(
             service_win32k_provider_timer_request(provider, op, arg1, arg2, arg3)
         }
         _ => (STATUS_INVALID_PARAMETER, 0, 0, 0),
+    }
+}
+
+/// Capture the inline named-Event frame under the exact physical provider job before any
+/// namespace or handle effect. The attached process is the target handle table.
+unsafe fn service_win32k_named_event_request(
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    mi: u64,
+    name_len: u64,
+    sd_len: u64,
+    reserved: u64,
+) -> (i32, u64, u64, u64) {
+    let invalid = nt_process::STATUS_INVALID_HANDLE;
+    if reserved != 0 || channel.kernel_caller.is_some() {
+        return (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0);
+    }
+    let (route, dispatch, caller) = match authenticate_win32k_service_request(
+        channel, reply_cap, badge, mi,
+        (crate::win32k_subsystem::W32_EVENT_LABEL << 12) | 4,
+    ) {
+        Ok(owner) => owner,
+        Err(status) => return (status as i32, 0, 0, 0),
+    };
+    let Some(logical) = channel.logical_caller else { return (invalid as i32, 0, 0, 0) };
+    let Some(target) = crate::win32k_glue::current_query_process(logical, channel.pml4)
+    else { return (invalid as i32, 0, 0, 0) };
+    let capture = match crate::win32k_subsystem::named_event::read_owned(
+        (route, dispatch, caller), name_len, sd_len,
+    ) {
+        Ok(capture) => capture,
+        Err(status) => return (status as i32, 0, 0, 0),
+    };
+    let handler = match registry_live_handler() {
+        Ok(handler) => handler,
+        Err(status) => return (status as i32, 0, 0, 0),
+    };
+    if handler.pm_pid_for_pi(target.pi) != Some(target.process.pid)
+        || handler.hosted_process_generation(target.pi)
+            != match target.process.generation {
+                nt_user_host::process_identity::ProcessGeneration::Hosted(generation) => Some(generation),
+                _ => None,
+            }
+    {
+        return (invalid as i32, 0, 0, 0);
+    }
+    handler.provider_create_named_event(target.pi, caller, &capture)
+        .map(|(status, handle)| (status as i32, handle, 0, 0))
+        .unwrap_or_else(|status| (status as i32, 0, 0, 0))
+}
+
+/// Authenticate at the entry adapter, then mutate one exact root-owned sync identity.
+/// Release triggers the existing canonical waiter selector after the mutation is visible.
+pub(crate) unsafe fn service_win32k_provider_sync_request(
+    provider: nt_provider_wait::ProviderDomainIdentity,
+    owner: Option<nt_provider_wait::ProviderWaitOwner>,
+    op: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+) -> (i32, u64, u64, u64) {
+    use crate::win32k_subsystem::*;
+    const INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
+    let result: Result<(u64, u64, u64), u32> = match op {
+        W32_SYNC_OP_PUBLISH => {
+            let kind = match arg2 >> 32 {
+                1 => nt_provider_wait::ProviderSyncKind::Semaphore {
+                    initial_count: arg2 as u32 as i32,
+                    limit: arg3 as u32 as i32,
+                },
+                2 if arg2 as u32 == 0 && arg3 == 0 => nt_provider_wait::ProviderSyncKind::Mutant,
+                _ => return (INVALID_PARAMETER, 0, 0, 0),
+            };
+            crate::provider_dispatcher_backend::publish_sync(provider, arg1, kind)
+                .map(|canonical| (canonical.object_id, canonical.object_generation, 0))
+        }
+        W32_SYNC_OP_RELEASE_SEMAPHORE if arg3 == 0 =>
+            crate::provider_dispatcher_backend::release_sync_semaphore(provider, arg1, arg2 as u32 as i32)
+                .map(|previous| (previous as u32 as u64, 0, 0)),
+        W32_SYNC_OP_RELEASE_MUTANT if arg2 == 0 && arg3 == 0 =>
+            owner.ok_or(INVALID_PARAMETER as u32).and_then(|owner|
+                crate::provider_dispatcher_backend::release_sync_mutant(provider, arg1, owner))
+                .map(|previous| (previous as u32 as u64, 0, 0)),
+        W32_SYNC_OP_RETIRE if arg2 == 0 && arg3 == 0 =>
+            crate::provider_dispatcher_backend::begin_retire_sync(provider, arg1)
+                .map(|retirement| (retirement.canonical.object_id,
+                    retirement.canonical.object_generation,
+                    retirement.canonical.object_type as u64)),
+        W32_SYNC_OP_ACK_RETIREMENT => {
+            let kind = match arg3 >> 32 {
+                2 => nt_provider_wait::ProviderWaitObjectType::Semaphore,
+                7 => nt_provider_wait::ProviderWaitObjectType::Mutant,
+                _ => return (INVALID_PARAMETER, 0, 0, 0),
+            };
+            let canonical = nt_provider_wait::ProviderWaitObject::new(kind, arg2, arg3 as u32 as u64);
+            crate::provider_dispatcher_backend::ack_retire_sync(provider, arg1, canonical)
+                .map(|()| (0, 0, 0))
+        }
+        W32_SYNC_OP_QUERY => {
+            let kind = match arg3 >> 32 {
+                2 => nt_provider_wait::ProviderWaitObjectType::Semaphore,
+                7 => nt_provider_wait::ProviderWaitObjectType::Mutant,
+                _ => return (INVALID_PARAMETER, 0, 0, 0),
+            };
+            let canonical = nt_provider_wait::ProviderWaitObject::new(kind, arg2, arg3 as u32 as u64);
+            crate::provider_dispatcher_backend::snapshot_sync(provider, arg1, canonical)
+                .and_then(|snapshot| match snapshot.mutant_owner {
+                    None => Ok((snapshot.signal_state as u32 as u64, 0, 0)),
+                    Some(nt_component_suspension::SuspensionCaller::Hosted(client)) =>
+                        Ok((snapshot.signal_state as u32 as u64, client.client_tid, client.client_generation)),
+                    Some(nt_component_suspension::SuspensionCaller::Kernel { .. }) =>
+                        Err(INVALID_PARAMETER as u32),
+                })
+        }
+        _ => Err(INVALID_PARAMETER as u32),
+    };
+    match result {
+        Ok((out1, out2, out3)) => {
+            if matches!(op, W32_SYNC_OP_RELEASE_SEMAPHORE | W32_SYNC_OP_RELEASE_MUTANT) {
+                let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+                if let Some(handler) = handler.as_mut() {
+                    let mut objects = handler.dispatcher_objects(None);
+                    let _ = provider_wait_select_ready(&mut objects);
+                } else {
+                    let _ = dispatcher_bootstrap::with_provider_objects(|mut objects| {
+                        provider_wait_select_ready(&mut objects)
+                    });
+                }
+            }
+            (0, out1, out2, out3)
+        }
+        Err(status) => (status as i32, 0, 0, 0),
     }
 }
 
@@ -5105,6 +5361,38 @@ pub(crate) unsafe fn service_win32k_ps_request(
     if logical_caller.is_some() && channel.kernel_caller.is_some() {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
     }
+    if matches!(
+        op,
+        win32k_subsystem::W32_PS_OP_SET_OBJECT_HANDLE_FLAGS
+            | win32k_subsystem::W32_PS_OP_QUERY_OBJECT_HANDLE_FLAGS
+    ) {
+        if (op == win32k_subsystem::W32_PS_OP_SET_OBJECT_HANDLE_FLAGS
+            && value > u16::MAX as u64)
+            || (op == win32k_subsystem::W32_PS_OP_QUERY_OBJECT_HANDLE_FLAGS && value != 0)
+        {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
+        if let Err(status) = provider_ps_projection::authenticated_target(channel) {
+            return (status as i32, 0, 0, 0);
+        }
+        let caller = match provider_registry_caller::resolve(channel) {
+            Ok(caller) => caller,
+            Err(status) => return (status as i32, 0, 0, 0),
+        };
+        if op == win32k_subsystem::W32_PS_OP_QUERY_OBJECT_HANDLE_FLAGS {
+            return match with_provider_process_manager(|pm| {
+                pm.query_native_object_handle_flag_information(caller, object)
+            }) {
+                Ok(encoded) => (0, u16::from_le_bytes(encoded) as u64, 0, 0),
+                Err(status) => (status as i32, 0, 0, 0),
+            };
+        }
+        let encoded = (value as u16).to_le_bytes();
+        let result = with_provider_process_manager(|pm| {
+            pm.set_native_object_handle_flag_information(caller, object, &encoded)
+        });
+        return (result.err().unwrap_or(0) as i32, 0, 0, 0);
+    }
     if let Some(caller) = channel.kernel_caller {
         return kernel_provider_activation::service_ps(channel, caller, op, object, value);
     }
@@ -5131,9 +5419,36 @@ pub(crate) unsafe fn service_win32k_ps_request(
     {
         return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
     }
-    provider_ps::dispatch(&mut handler.pm, op, object, value, |pm, body| {
-        provider_ps_projection::grant(target, pm, body)
-    })
+    if native_thread_priority::is_priority_effect_op(op) {
+        return native_thread_priority::dispatch(handler, op, object, value);
+    }
+    provider_ps::dispatch(
+        &mut handler.pm,
+        op,
+        object,
+        value,
+        |pm, job| unsafe { crate::exec_handler::native_job_bodies::ensure(pm, job) },
+        |pm, body| provider_ps_projection::grant(target, pm, body),
+    )
+}
+
+/// Execute a hosted driver's checked thread-priority request against the same retained
+/// PM/native TCB owner as win32k. The caller was authenticated by the driver ingress service.
+pub(crate) unsafe fn service_hosted_driver_thread_priority(
+    thread: u64,
+    priority: i32,
+) -> (i32, u64) {
+    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    if handler.is_null() {
+        return (0xC000_00A3u32 as i32, 0);
+    }
+    let (status, previous, _, _) = native_thread_priority::dispatch(
+        &mut *handler,
+        win32k_subsystem::W32_PS_OP_SET_THREAD_PRIORITY,
+        thread,
+        priority as u32 as u64,
+    );
+    (status, previous)
 }
 
 /// Serialized memory-only ownership operation, across the bootstrap-to-live Ps store transfer.
@@ -5340,6 +5655,8 @@ pub(crate) unsafe fn redrive_nested_hosted_file_work() -> bool {
         && crate::driver_launch::redrive_nested_hosted_driver_create(handler);
     let query = crate::driver_launch::nested_hosted_query_path_ready()
         && crate::driver_launch::redrive_nested_hosted_query_path(handler);
+    let internal_control = crate::driver_launch::nested_hosted_internal_control_ready()
+        && crate::driver_launch::redrive_nested_hosted_internal_control(handler);
     let write = crate::driver_launch::nested_hosted_write_ready()
         && crate::driver_launch::redrive_nested_hosted_write(handler);
     let read = crate::driver_launch::nested_hosted_read_ready()
@@ -5366,7 +5683,7 @@ pub(crate) unsafe fn redrive_nested_hosted_file_work() -> bool {
     let section = crate::provider_section_broker::nested_work_ready()
         && crate::provider_section_broker::redrive_nested_ready(handler);
     crate::provider_mm_section_objects::redrive(handler);
-    create || query || write || read || flush || query_information || lower_pnp || lower_file || input || kernel_file_query || win32k_async_read || lifecycle || close || source || section
+    create || query || internal_control || write || read || flush || query_information || lower_pnp || lower_file || input || kernel_file_query || win32k_async_read || lifecycle || close || source || section
 }
 
 pub(crate) unsafe fn watchdog_defer_if_hosted_work_can_run(site: &[u8]) -> bool {
@@ -6618,6 +6935,7 @@ unsafe fn spawn_requested_hosted_exe(
     let creator_pid = nt_handler
         .pm_pid_for_pi(request.creator_pi)
         .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let initial_priority = native_thread_priority::initial_priority(&nt_handler.pm, u64::from(child_tid))?;
     let child_spawn = spawn_hosted_sec_image_for_image(
         spec.image,
         nt_memory_manager::MemoryLifetime::Process(
@@ -6633,6 +6951,7 @@ unsafe fn spawn_requested_hosted_exe(
         0,
         child_pid as u64,
         child_tid as u64,
+        initial_priority,
     );
     procs[pi].pid = child_pid as u64;
     procs[pi].pml4 = child_spawn.pml4;
@@ -8393,6 +8712,8 @@ pub(crate) unsafe fn service_sec_image(
     scratch_base: u64,
     ntdll: (u64, &nt_pe_loader::PeFile),
     driver_starts: DriverStartBootstrap,
+    boot_system_pnp_plan: &InlineDriverLaunchPlan,
+    demand_pnp_plan: &InlineDriverLaunchPlan,
 ) -> (
     u64,
     u64,
@@ -8502,14 +8823,29 @@ pub(crate) unsafe fn service_sec_image(
         );
     }
     print_str(b"[sec-init] bootstrap-image-load end\n");
+    // Seeded Ps objects precede image loading. Admit each exact process only after its attached
+    // executable has passed PE parsing; win32k Ps WOW64 queries must never infer x64 from a name.
+    for pi in 0..HOSTED_PROCESS_MANAGER_SEED_COUNT {
+        let image = exe_image_catalog
+            .get_by_pi(pi)
+            .expect("seeded Ps process retains its hosted image identity");
+        let (validated_pe, _) = unsafe { hosted_loaded_images.pe_and_pool_for_image(image) }
+            .expect("seeded Ps process needs its exact parsed executable");
+        let cid = ps_bootstrap::hosted_main_client_id(pi)
+            .expect("seeded Ps process retains its exact main client ID");
+        unsafe { ps_bootstrap::with_process_manager(|pm| {
+            pm.admit_validated_process_image(cid.unique_process, validated_pe)
+        }) }
+        .expect("seeded Ps process architecture admission failed");
+    }
     // Retain the existing bootstrap DLL registry and its parsed pool-backed images for legacy
     // bootstrap consumers. Ordinary File opens do not populate this store: canonical SEC_IMAGE
     // admission captures the opened File, and image residency reads that retained source.
     const DLL_PINS: [(&[u8], &[u8]); DLL_PIN_COUNT] = [
-        (b"csrsrv", b"reactos\\system32\\csrsrv.dll"),
-        (b"kernel32_vista", b"reactos\\system32\\kernel32_vista.dll"),
-        (b"advapi32_vista", b"reactos\\system32\\advapi32_vista.dll"),
-        (b"ntdll_vista", b"reactos\\system32\\ntdll_vista.dll"),
+        (b"csrsrv", crate::installed_layout::CSRSRV),
+        (b"kernel32_vista", crate::installed_layout::KERNEL32_VISTA),
+        (b"advapi32_vista", crate::installed_layout::ADVAPI32_VISTA),
+        (b"ntdll_vista", crate::installed_layout::NTDLL_VISTA),
     ];
     // Bootstrap parsed-PE storage lives for the whole service loop.
     let dll_pe_store = reset_service_dll_pe_store_work();
@@ -8578,6 +8914,10 @@ pub(crate) unsafe fn service_sec_image(
         );
     }
     KUSER_CLOCK_INIT_OK.store(true, Ordering::Release);
+    launch_live_pnp_plans(
+        nt_handler as *mut ExecNtHandler,
+        &[boot_system_pnp_plan, demand_pnp_plan],
+    );
     // Per-hosted-process state, indexed by fault badge (0 = smss, 1 = csrss). The SINGLE service
     // loop multiplexes both: each thread faults through a fault-EP cap minted with its badge, so the
     // recv badge selects whose VSpace / image / scratch / fault-bookkeeping to use. Slot 1 (csrss)
@@ -9104,8 +9444,14 @@ pub(crate) unsafe fn service_sec_image(
         // CM retries run only between hosted events, never inside a timer callback or nested pump.
         crate::cm_key_ownership::retry_cleanup(monotonic_time_100ns());
         crate::cm_snapshot_ownership::retry_cleanup(monotonic_time_100ns());
+        let alpc_reply_committed;
         {
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
+            crate::native_alpc_create_work::redrive(&mut nt_handler);
+            crate::native_alpc_close_work::redrive(&mut nt_handler);
+            crate::native_alpc_connect_accept_work::redrive(&mut nt_handler);
+            alpc_reply_committed =
+                crate::native_alpc_send_receive_work::redrive(&mut nt_handler);
             crate::registry_mutation_work::redrive(&mut nt_handler, delay_queue);
             crate::section_metadata_work::redrive(&mut nt_handler, delay_queue);
             crate::section_pagein_work::redrive(&mut nt_handler);
@@ -9113,6 +9459,7 @@ pub(crate) unsafe fn service_sec_image(
             crate::provider_mm_section_objects::redrive(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_driver_io_create_file(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_query_path_forward(nt_handler as *mut _);
+            crate::driver_launch::redrive_hosted_internal_control_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_write_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_read_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_flush_forward(nt_handler as *mut _);
@@ -9134,6 +9481,9 @@ pub(crate) unsafe fn service_sec_image(
             crate::object_wait_reply::redrive(&mut nt_handler);
             crate::object_wait_reply::redrive_terminated_runtimes(&mut nt_handler, delay_queue);
             inline_file_retirement::redrive(&mut nt_handler);
+        }
+        if alpc_reply_committed.is_some() {
+            let _ = lpc_component_reply_commit_drain(&mut nt_handler);
         }
         if crate::writable_fs::registry_journal::owns_volume()
             && badge != DELAY_TIMER_BADGE
@@ -9258,6 +9608,8 @@ pub(crate) unsafe fn service_sec_image(
                     Ordering::Relaxed,
                 );
                 census_tick_static(now);
+                if CENSUS_LAST_DUMP.load(Ordering::Relaxed) == now {
+                }
             }
             if ep != last_progress_epoch {
                 last_progress_epoch = ep;
@@ -12101,6 +12453,7 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_keyed_release_wait_key: u64 = u64::MAX;
             let mut park_keyed_release_wait_deadline = nt_delay_execution::Deadline::Infinite;
             let mut park_delay_deadline: Option<nt_delay_execution::Deadline> = None;
+            let mut park_thread_alert_deadline: Option<nt_delay_execution::Deadline> = None;
             let mut park_io_completion_port: i64 = -1;
             let mut park_io_completion_key_out: u64 = 0;
             let mut park_io_completion_apc_out: u64 = 0;
@@ -12173,18 +12526,24 @@ pub(crate) unsafe fn service_sec_image(
             // dispatcher -> real handler; otherwise fall through to the broker match. The x64 native
             // ABI passes args in r10(=rcx),rdx,r8,r9 then the stack; here we forward the register
             // args (sized to the service's max) — pointer/stack args come with the copyin layer.
-            if let Some(entry) = nt_dispatcher.table().lookup(m0 as u32) {
+            let table_entry = nt_dispatcher.table().lookup(m0 as u32);
+            if let Some(route) = nt_syscall_abi::NativeIngressRoute::select(
+                m0, native_call_transport, table_entry.is_some()) {
                 let origin = SyscallOrigin::new(1, 1, ProcessorMode::UserMode);
                 // x64 native syscall args: arg1=R10 (the stub's `mov r10,rcx`; RCX itself is the
                 // syscall return address), arg2=RDX, arg3=R8, arg4=R9, then arg5+ on the caller's
                 // stack at [rsp+0x28], [rsp+0x30], … RDX rides in m3; R8/R9/R10 + the stack come
                 // from the IPC buffer / stack mirror.
-                let mut argv = [0u64; 16];
+                let mut argv = [0u64; nt_syscall_abi::MAX_STUB_ARGS as usize];
                 argv[0] = get_recv_mr(9); // R10
                 argv[1] = m3; // RDX
                 argv[2] = get_recv_mr(7); // R8
                 argv[3] = get_recv_mr(8); // R9
-                let n = (entry.max_args as usize).min(16);
+                let n = match route {
+                    nt_syscall_abi::NativeIngressRoute::Alpc(service) => service.argument_count(),
+                    nt_syscall_abi::NativeIngressRoute::Table => table_entry
+                        .expect("table route lost registered service").max_args as usize,
+                }.min(argv.len());
                 let mut stack_args_valid = true;
                 let retained_arguments = nt_handler.active_synchronous_file_retry.as_ref()
                     .and_then(|ingress| ingress.waiter().transfer_parameters)
@@ -12255,6 +12614,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.delay_requested = false;
                 nt_handler.delay_interval_100ns = 0;
                 nt_handler.delay_alertable = false;
+                nt_handler.thread_alert_wait = None;
                 nt_handler.io_completion_park_port = -1;
                 nt_handler.io_completion_key_out = 0;
                 nt_handler.io_completion_apc_out = 0;
@@ -12304,12 +12664,6 @@ pub(crate) unsafe fn service_sec_image(
                     panic!("previous syscall leaked an LPC request continuation reservation");
                 }
                 let _ = lpc_connect_completion_drain(&mut nt_handler);
-                // ALPC last-mile item (a): NtAlpc* SSNs are registered in the dispatcher via this
-                // recognizer. DORMANT — `ALPC_HOST_PRESENT` is never set at boot (no ALPC binary
-                // yet), and the Win7 ALPC SSNs collide with the live ReactOS SSN space, so it can
-                // never fire for the 3 live ReactOS processes → byte-identical boot. When active it
-                // routes a real ALPC process's NtAlpc* syscall to the unified port-service ALPC
-                // adapter (skipping the native ReactOS dispatch).
                 if !stack_args_valid {
                     if m0 as u32 == SSN_NT_QUERY_KEY as u32 {
                         let arguments = [argv[0], argv[1], argv[2], argv[3], argv[4]];
@@ -12322,9 +12676,193 @@ pub(crate) unsafe fn service_sec_image(
                     .is_some_and(|ingress| !ingress.matches_handle(argv[0]))
                 {
                     result = nt_fs::STATUS_INVALID_PARAMETER as u64;
-                } else if let Some(st) = try_route_alpc_ssn(m0, &[], &mut [0u8; 8]) {
-                    result = st;
+                } else if nt_syscall_abi::NativeAlpcService::from_call(m0, native_call_transport)
+                    == Some(nt_syscall_abi::NativeAlpcService::CreatePort)
+                {
                     handled = true;
+                    static ALPC_CREATE_INGRESS_TRACE: AtomicU64 = AtomicU64::new(0);
+                    if ALPC_CREATE_INGRESS_TRACE.fetch_add(1, Ordering::Relaxed) < 8 {
+                        print_str(b"[native-alpc-create-ingress] badge=");
+                        print_u64(badge);
+                        print_str(b" output=0x");
+                        print_hex_u64(argv[0]);
+                        print_str(b" object_attributes=0x");
+                        print_hex_u64(argv[1]);
+                        print_str(b" port_attributes=0x");
+                        print_hex_u64(argv[2]);
+                        print_str(b"\n");
+                    }
+                    match crate::native_alpc_create_work::begin(&mut nt_handler,
+                        [argv[0], argv[1], argv[2]]) {
+                        Err(status) => result = status as u64,
+                        Ok(()) => {
+                            thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
+                            {
+                                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                                crate::native_alpc_create_work::redrive(&mut nt_handler);
+                            }
+                            let _ = finalize_service_loop_state(&mut nt_handler);
+                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
+                    }
+                } else if nt_syscall_abi::NativeAlpcService::from_call(m0, native_call_transport)
+                    == Some(nt_syscall_abi::NativeAlpcService::ConnectPort)
+                {
+                    handled = true;
+                    print_str(b"[native-alpc-connect-ingress] badge=");
+                    print_u64(badge);
+                    print_str(b" tcb=0x");
+                    print_hex_u64(event_runtime.tcb);
+                    print_str(b" flags=0x");
+                    print_hex_u64(argv[4]);
+                    print_str(b"\n");
+                    match crate::native_alpc_connect_accept_work::begin_connect(&mut nt_handler,
+                        [argv[0], argv[1], argv[2], argv[3], argv[4], argv[5], argv[6],
+                            argv[7], argv[8], argv[9], argv[10]]) {
+                        Err(status) => {
+                            print_str(b"[native-alpc-connect-begin] rejected status=0x");
+                            print_hex_u64(status as u64);
+                            print_str(b"\n");
+                            result = status as u64;
+                        }
+                        Ok(()) => {
+                            print_str(b"[native-alpc-connect-begin] retained\n");
+                            thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
+                            {
+                                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                                crate::native_alpc_connect_accept_work::redrive(&mut nt_handler);
+                            }
+                            print_str(b"[native-alpc-connect-begin] redrove\n");
+                            let _ = finalize_service_loop_state(&mut nt_handler);
+                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
+                    }
+                } else if nt_syscall_abi::NativeAlpcService::from_call(m0, native_call_transport)
+                    == Some(nt_syscall_abi::NativeAlpcService::AcceptConnectPort)
+                {
+                    handled = true;
+                    match crate::native_alpc_connect_accept_work::begin_accept(&mut nt_handler,
+                        [argv[0], argv[1], argv[2], argv[3], argv[4], argv[5], argv[6],
+                            argv[7], argv[8]]) {
+                        Err(status) => result = status as u64,
+                        Ok(()) => {
+                            thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
+                            {
+                                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                                crate::native_alpc_connect_accept_work::redrive(&mut nt_handler);
+                            }
+                            let _ = finalize_service_loop_state(&mut nt_handler);
+                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
+                    }
+                } else if nt_syscall_abi::NativeAlpcService::from_call(m0, native_call_transport)
+                    == Some(nt_syscall_abi::NativeAlpcService::SendWaitReceivePort)
+                {
+                    handled = true;
+                    let ingress = crate::native_alpc_send_receive_work::begin(&mut nt_handler,
+                        [argv[0], argv[1], argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]]);
+                    static ALPC_SEND_INGRESS_TRACE: AtomicU64 = AtomicU64::new(0);
+                    let trace = ALPC_SEND_INGRESS_TRACE.fetch_add(1, Ordering::Relaxed);
+                    if trace < 16 {
+                        let mut return_bytes = [0u8; 8];
+                        let return_readable = nt_handler.xas_read(sp, &mut return_bytes);
+                        print_str(b"[native-alpc-send-ingress] #");
+                        print_u64(trace);
+                        print_str(b" badge=");
+                        print_u64(badge);
+                        print_str(b" port=0x");
+                        print_hex_u64(argv[0]);
+                        print_str(b" raw-mr2=0x");
+                        print_hex_u64(native_ingress_request
+                            .and_then(|request| request.word(2)).unwrap_or(0));
+                        print_str(b" caller=0x");
+                        print_hex_u64(if return_readable { u64::from_le_bytes(return_bytes) }
+                            else { 0 });
+                        print_str(b" flags=0x");
+                        print_hex_u64(argv[1]);
+                        print_str(b" send=0x");
+                        print_hex_u64(argv[2]);
+                        print_str(b" receive=0x");
+                        print_hex_u64(argv[4]);
+                        print_str(b" size=0x");
+                        print_hex_u64(argv[5]);
+                        print_str(b" timeout=0x");
+                        print_hex_u64(argv[7]);
+                        print_str(b" status=0x");
+                        print_hex_u64(ingress.as_ref().err().copied().unwrap_or(0x103) as u64);
+                        print_str(b"\n");
+                    }
+                    match ingress {
+                        Err(status) => result = status as u64,
+                        Ok(()) => {
+                            thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
+                            let alpc_reply_committed = {
+                                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                                crate::native_alpc_send_receive_work::redrive(&mut nt_handler)
+                            };
+                            if alpc_reply_committed.is_some() {
+                                let _ = lpc_component_reply_commit_drain(&mut nt_handler);
+                            }
+                            let _ = finalize_service_loop_state(&mut nt_handler);
+                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
+                    }
+                } else if native_call_transport && m0 as u32 == SSN_NT_CLOSE as u32
+                    && crate::native_alpc_close_work::recognizes(&nt_handler, argv[0])
+                {
+                    handled = true;
+                    match crate::native_alpc_close_work::begin(&mut nt_handler, argv[0]) {
+                        Err(status) => result = status as u64,
+                        Ok(()) => {
+                            thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
+                            {
+                                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                                crate::native_alpc_close_work::redrive(&mut nt_handler);
+                            }
+                            let _ = finalize_service_loop_state(&mut nt_handler);
+                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
+                    }
                 } else {
                     crate::probe_reset();
                     let dispatch_started = crate::disk_census_ticks();
@@ -12820,6 +13358,8 @@ pub(crate) unsafe fn service_sec_image(
                         park_delay_deadline = Some(deadline);
                     }
                 }
+                park_thread_alert_deadline = nt_handler.thread_alert_wait.take();
+                thread_alert::redrive(&mut nt_handler);
                 if nt_handler.io_completion_park_port >= 0 {
                     park_io_completion_port = nt_handler.io_completion_park_port;
                     park_io_completion_key_out = nt_handler.io_completion_key_out;
@@ -17872,6 +18412,27 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b"[delay] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n");
                 result = 0xC000_009A;
             }
+            if let Some(deadline) = park_thread_alert_deadline {
+                let timed = deadline != nt_delay_execution::Deadline::Infinite;
+                if timed && !delay_timer_init() {
+                    result = nt_fs::STATUS_INSUFFICIENT_RESOURCES as u64;
+                } else if thread_alert::park(&mut nt_handler, deadline, reply_main) {
+                    delay_timer_rearm_after_park(delay_queue, &mut nt_handler, timed);
+                    thread_alert::redrive(&mut nt_handler);
+                    let _ = finalize_service_loop_state(&mut nt_handler);
+                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let received = component_recv!(fault_ep, new_reply);
+                    badge = received.0;
+                    mi = received.1;
+                    m0 = received.2;
+                    m1 = received.3;
+                    m2 = received.4;
+                    m3 = received.5;
+                    continue;
+                } else {
+                    result = nt_fs::STATUS_INSUFFICIENT_RESOURCES as u64;
+                }
+            }
             // Keyed-event release park (`NtReleaseKeyedEvent`): if no wait side is already parked,
             // the release side waits for a future `NtWaitForKeyedEvent` on the same key.
             if park_keyed_release_wait_key != u64::MAX && reply_main != 0 {
@@ -18355,6 +18916,21 @@ pub(crate) unsafe fn service_sec_image(
             // restart without IPC register fanout. NtContinue already bypassed this tail.
             let len = 1;
             let r0 = result;
+            let trace_csrss_resume_reply = native_call_transport && badge == 29 && m0 == 214;
+            if trace_csrss_resume_reply {
+                if CSRSS_RESUME_REPLIES.fetch_add(1, Ordering::Relaxed) == 1 {
+                    CSRSS_POST_RESUME_TCB.store(event_runtime.tcb, Ordering::Relaxed);
+                }
+                print_str(b"[csrss-resume-reply] handoff badge=");
+                print_u64(badge);
+                print_str(b" tcb=0x");
+                print_hex_u64(event_runtime.tcb);
+                print_str(b" reply=0x");
+                print_hex_u64(reply_main);
+                print_str(b" status=0x");
+                print_hex_u64(r0);
+                print_str(b"\n");
+            }
             let ((nb, nmi, nm0, nm1, nm2, nm3), native_reply_delivered) = if redirected_user_control {
                 let restarted = win32k_glue::restart_staged_user_callback_context(
                     win32k_glue::StagedUserCallbackContext::installed(event_runtime.tcb),
@@ -18389,6 +18965,17 @@ pub(crate) unsafe fn service_sec_image(
                     (received, delivered)
                 }
             };
+            if trace_csrss_resume_reply {
+                print_str(b"[csrss-resume-reply] received badge=");
+                print_u64(nb);
+                print_str(b" delivered=");
+                print_u64(native_reply_delivered as u64);
+                print_str(b" label=0x");
+                print_hex_u64(nmi);
+                print_str(b" m0=0x");
+                print_hex_u64(nm0);
+                print_str(b"\n");
+            }
             if let Some(status) = native_load_reply_status {
                 // The checked reply path consumed the bound Reply object before returning. The
                 // combined path reserves one impossible receive badge to report a send-half failure
@@ -21620,7 +22207,12 @@ pub(crate) unsafe fn service_sec_image(
         // handler produced — differing only in the two transport switches a target with no ntdll
         // mapped requires (direct entry instead of `LdrInitializeThunk`, hosted-syscalls instead of
         // the native Call) and a private endpoint, so the post-loop test can service it itself.
-        {
+        if nt_handler.pm.has_process_exit_notify_registrations() {
+            // This synthetic target has no ordinary provider create lifecycle. Do not inject its
+            // exit into live providers from a post-loop diagnostic.
+            print_str(b"[ntos-exec] dbgk remote-breakin selftest skipped: provider exit callbacks live\n");
+            DBGK_BREAKIN_SELFTEST.store(0, Ordering::Relaxed);
+        } else {
             use nt_process::dbgk;
             const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
             const PROCESS_CREATE_THREAD: u32 = 0x0002;
@@ -22440,6 +23032,7 @@ pub(crate) unsafe fn service_sec_image(
                 "debugger fixture detaches before retiring target Ps bodies");
             nt_handler.pm.terminate_process(target, nt_process::STATUS_SUCCESS)
                 .expect("debugger fixture terminates its throwaway target");
+            crate::process_terminal_receipt::drain_hosted_process_exit_notifications(&mut nt_handler);
             let retirement = nt_handler.pm.withdraw_process_object_if_unreferenced(target)
                 .expect("debugger fixture releases every target object reference");
             let backing = ps_object_backing::retire_withdrawn(
@@ -23724,6 +24317,12 @@ unsafe fn spawn_requested_tp_worker(
     print_u64(badge);
     print_str(b" tid=");
     print_u64(tid);
+    if pi == 0 {
+        print_str(b" start_rcx=0x");
+        print_hex_u64(start.rcx);
+        print_str(b" start_rdx=0x");
+        print_hex_u64(start.rdx);
+    }
     print_str(b" tcb=0x");
     print_hex(tcb as u32);
     if let Some(kind) = role.rpc_worker_kind() {

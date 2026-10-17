@@ -5,6 +5,7 @@ fn process() -> ProcessInitialization {
         body: GuestAddr(0x10_0000),
         process_id: 4,
         peb: GuestAddr::NULL,
+        image_file_name: [0; 16],
     }
 }
 
@@ -256,6 +257,16 @@ fn system_process_has_real_identity_and_no_synthetic_user_storage() {
     assert_eq!(u64_at(&bytes, EPROCESS_PEB), 0);
     assert_eq!(u64_at(&bytes, EPROCESS_WIN32_PROCESS), 0);
     assert!(bytes[0x800..0xc00].iter().all(|byte| *byte == 0));
+}
+
+#[test]
+fn process_image_file_name_is_stable_inside_its_exact_eprocess_body() {
+    let mut init = process();
+    init.image_file_name[..13].copy_from_slice(b"Explorer.EXE\0");
+    let mut bytes = [0xa5; EPROCESS_BODY_BYTES + 8];
+    initialize_process(&mut bytes, init).unwrap();
+    assert_eq!(&bytes[0x260..0x270], &init.image_file_name);
+    assert_eq!(&bytes[EPROCESS_BODY_BYTES..], [0xa5; 8]);
 }
 
 #[test]

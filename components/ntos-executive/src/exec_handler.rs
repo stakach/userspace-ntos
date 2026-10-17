@@ -9,6 +9,9 @@ use crate::provider_local_event::trace as trace_provider_local_event;
 use nt_io_abi::major;
 use nt_io_manager::{LocalFileObject, PendingFileRoute};
 
+#[path = "native_job_bodies.rs"]
+pub(crate) mod native_job_bodies;
+
 struct RetainedV1SystemCheckpointAck {
     prepared: nt_config_client::PreparedSystemHiveCheckpoint,
     image_len: usize,
@@ -45,6 +48,8 @@ mod named_sections;
 
 #[path = "exec_named_directories.rs"]
 mod named_directories;
+#[path = "exec_named_events.rs"]
+mod named_events;
 
 #[path = "file_image_section.rs"]
 pub(crate) mod file_image_section;
@@ -112,6 +117,9 @@ mod directory_query;
 pub(crate) mod directory_object;
 #[path = "exec_directory_security.rs"]
 pub(crate) mod directory_security;
+
+#[path = "exec_session_namespace.rs"]
+mod session_namespace;
 
 #[path = "exec_namespace_security.rs"]
 mod namespace_security;
@@ -1044,7 +1052,7 @@ static NT_WAIT_FOR_DEBUG_EVENT_SERVICE_ENTRY: ExecServiceHandler =
 #[used]
 static NT_QUERY_ATTRIBUTES_FILE_SERVICE_ENTRY: ExecServiceHandler =
     exec_nt_query_attributes_file_service_entry;
-const SETUP_UNATTEND_PATH: &[u8] = b"reactos\\unattend.inf";
+const SETUP_UNATTEND_PATH: &[u8] = crate::installed_layout::UNATTEND;
 const SYSTEM_NLS_LANGUAGE_PATH: &str =
     r"\Registry\Machine\System\CurrentControlSet\Control\Nls\Language";
 const NT_DEFAULT_LOCALE_ID: u32 = 0x0409;
@@ -1242,6 +1250,12 @@ fn trace_handle_object_for(nt: &ExecNtHandler, handle: u64) {
         Some(nt_process::HandleObject::DiskFile { .. }) => print_str(b"disk-file"),
         Some(nt_process::HandleObject::Directory { .. }) => print_str(b"directory"),
         Some(nt_process::HandleObject::ObjectDirectory(_)) => print_str(b"object-directory"),
+        Some(nt_process::HandleObject::DynamicObject { body, generation }) => {
+            print_str(b"dynamic-object body=0x");
+            print_hex_u64(body);
+            print_str(b" generation=0x");
+            print_hex_u64(generation);
+        }
         Some(nt_process::HandleObject::IoCompletion(_)) => print_str(b"io-completion"),
         Some(nt_process::HandleObject::RegistryKey(_)) => print_str(b"registry-key"),
         Some(nt_process::HandleObject::Process(_)) => print_str(b"process"),
@@ -1251,6 +1265,10 @@ fn trace_handle_object_for(nt: &ExecNtHandler, handle: u64) {
         Some(nt_process::HandleObject::TokenObject(_)) => print_str(b"token-object"),
         Some(nt_process::HandleObject::DebugObject(_)) => print_str(b"debug-object"),
         Some(nt_process::HandleObject::Job(_)) => print_str(b"job"),
+        Some(nt_process::HandleObject::AlpcPort { service_handle, .. }) => {
+            print_str(b"alpc-port service=0x");
+            print_hex_u64(service_handle);
+        }
         None => print_str(b"missing"),
     }
 }
@@ -2545,7 +2563,7 @@ fn dynamic_hosted_nt_image_path(
     out: &mut [u8; nt_exe_image::MAX_NT_IMAGE_PATH],
 ) -> Option<(usize, nt_exe_image::HostedImageRoot)> {
     let (prefix, root) = if volume_relative
-        .strip_prefix(br"reactos\system32\")
+        .strip_prefix(crate::installed_layout::SYSTEM32_PREFIX)
         .is_some_and(|suffix| suffix.eq_ignore_ascii_case(leaf))
     {
         (
@@ -2553,7 +2571,7 @@ fn dynamic_hosted_nt_image_path(
             nt_exe_image::HostedImageRoot::System32,
         )
     } else if volume_relative
-        .strip_prefix(br"reactos\")
+        .strip_prefix(crate::installed_layout::ROOT_PREFIX)
         .is_some_and(|suffix| suffix.eq_ignore_ascii_case(leaf))
     {
         (
@@ -2614,7 +2632,7 @@ unsafe fn admit_dynamic_hosted_exe(
         return None;
     }
     let role = role?;
-    let volume_relative = nt_fs::nt_path_to_volume_relative(name16, b"reactos")?;
+    let volume_relative = nt_fs::nt_path_to_volume_relative(name16, crate::installed_layout::ROOT)?;
     let leaf = nt_exe_image::canonical_exe_leaf(&volume_relative)?;
     if !folded_name
         .windows(leaf.len())
@@ -3135,6 +3153,10 @@ pub(super) fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
     ] {
         ObjEntry::push_dir(&mut v, d, 0, true).expect("initial object directory");
     }
+    let windows = ObjEntry::push_dir(&mut v, b"windows", 0, true)
+        .expect("initial Windows directory");
+    ObjEntry::push_dir(&mut v, b"windowstations", windows, true)
+        .expect("initial WindowStations directory");
     ObjEntry::push_symlink(&mut v, b"dosdevices", 0, b"\\??", true)
         .expect("initial DosDevices alias");
     v
@@ -3920,6 +3942,7 @@ impl ExecNtHandler {
         write_field!(native_image_views, Vec::new());
         write_field!(events, events);
         write_field!(event_objects, event_objects);
+        write_field!(named_event_security, Vec::new());
         write_field!(provider_timers, provider_timers);
         write_field!(user_timers, nt_user_timer::TimerTable::with_capacity(32));
         write_field!(user_timer_rearm_requested, false);
@@ -3985,6 +4008,7 @@ impl ExecNtHandler {
         write_field!(delay_requested, false);
         write_field!(delay_interval_100ns, 0);
         write_field!(delay_alertable, false);
+        write_field!(thread_alert_wait, None);
         write_field!(io_completion_park_port, -1);
         write_field!(io_completion_key_out, 0);
         write_field!(io_completion_apc_out, 0);
@@ -4051,6 +4075,9 @@ impl ExecNtHandler {
         write_field!(pool_used, zeroed_process_slot_u64_vec());
         write_field!(tp_worker_window_used, zeroed_process_slot_u64_vec());
         write_field!(thread_runtime, HostedThreadRuntimes::reset());
+        write_field!(priority_transition_owner, None);
+        write_field!(native_alpc_secured_ports,
+            native_alpc_port_security::SecuredPortRegistry::new());
         write_field!(desktop_observations, DesktopObservations::new());
         write_field!(win32k_session, Win32kSessionRuntime::reset());
         write_field!(token_store, token_store);
@@ -4216,14 +4243,8 @@ impl ExecNtHandler {
     pub(crate) fn provision_volatile_hardware_registry() {
         const REG_SZ: u32 = 1;
         const REG_DWORD: u32 = 4;
-        const HARDWARE_PATHS: [&str; 4] = [
-            r"\Registry\Machine\Hardware",
-            r"\Registry\Machine\Hardware\Description",
-            r"\Registry\Machine\Hardware\Description\System",
-            r"\Registry\Machine\Hardware\Description\System\CentralProcessor",
-        ];
         let mut created = 0u32;
-        for path in HARDWARE_PATHS {
+        for path in nt_config_manager::VOLATILE_HARDWARE_BOOTSTRAP_PATHS {
             match unsafe { crate::config_manager_create_key_with_options(path, true) } {
                 Ok((_key, was_created)) => created += u32::from(was_created),
                 Err(status) => {
@@ -4630,7 +4651,7 @@ impl ExecNtHandler {
             let stats = nt_hive_core::seed_reactos_user_profile_shell_folders_into_target(
                 &mut target,
                 r"\Registry\User\.Default",
-                r"C:\Profiles\Default User",
+                crate::installed_layout::DOS_DEFAULT_PROFILE,
                 "%USERPROFILE%",
             );
             (stats, target.changed(), target.failed, target.last_status)
@@ -8912,6 +8933,7 @@ impl ExecNtHandler {
         self.sample_hosted_process_scheduler_times(pid);
         match self.pm.terminate_process_at(pid, exit_status, exit_time) {
             Ok(()) => {
+                crate::process_terminal_receipt::drain_hosted_process_exit_notifications(self);
                 self.release_process_handles(pid, reserved_files);
                 self.refresh_job_time_sampling();
                 self.post_action = ExecPostAction::TerminateProcess {
@@ -9630,6 +9652,9 @@ impl ExecNtHandler {
     ) -> Result<usize, u32> {
         let child_pi = image.pi;
         let name = image.process_name;
+        let ctx = self.loop_ctx.ok_or(nt_process::STATUS_INVALID_IMAGE_FORMAT)?;
+        let (validated_pe, _) = unsafe { (&*ctx.hosted_loaded_images).pe_and_pool_for_image(image) }
+            .ok_or(nt_process::STATUS_INVALID_IMAGE_FORMAT)?;
         let selected_job = self
             .pm
             .select_child_job(Some(parent), flags, job_member_level)?;
@@ -9696,6 +9721,11 @@ impl ExecNtHandler {
                 return Err(status);
             }
         };
+        if let Err(status) = self.pm.admit_validated_process_image(pid, validated_pe) {
+            let _ = self.token_store.release(token);
+            self.rollback_hosted_process_creation(child_pi, pid);
+            return Err(status);
+        }
         self.drain_job_notifications();
         for inherited in inherited_handles {
             if let Err(status) = self.retain_external_handle_reference(inherited.object) {
@@ -10095,13 +10125,13 @@ impl ExecNtHandler {
     }
 
     fn readonly_volume_metadata(name16: &[u16]) -> Option<crate::fs_loader::FatOpenMetadata> {
-        nt_fs::nt_path_to_volume_relative(name16, b"reactos").and_then(|path| unsafe {
+        nt_fs::nt_path_to_volume_relative(name16, crate::installed_layout::ROOT).and_then(|path| unsafe {
             exec_fs().and_then(|fs| crate::fs_loader::fat_open_path_metadata(&fs, &path))
         })
     }
 
     fn readonly_volume_entry(name16: &[u16]) -> Option<(u32, u32, u8)> {
-        let path = nt_fs::nt_path_to_volume_relative(name16, b"reactos")?;
+        let path = nt_fs::nt_path_to_volume_relative(name16, crate::installed_layout::ROOT)?;
         unsafe {
             let fs = exec_fs()?;
             if path.is_empty() {
@@ -10142,7 +10172,7 @@ impl ExecNtHandler {
     }
 
     fn readonly_disk_open_miss_status(name16: &[u16]) -> Option<u32> {
-        let path = nt_fs::nt_path_to_volume_relative(name16, b"reactos")?;
+        let path = nt_fs::nt_path_to_volume_relative(name16, crate::installed_layout::ROOT)?;
         let fs = unsafe { exec_fs() }?;
         if path.is_empty() {
             return Some(nt_fs::STATUS_NOT_A_DIRECTORY);
@@ -10643,8 +10673,33 @@ impl ExecNtHandler {
         event_index: usize,
         access: u32,
     ) -> Option<u64> {
+        let owner = self.pm_pid_for_pi(pi)?;
+        self.mint_event_handle_for_pi_in_table(pi, event_index, access, owner, false)
+    }
+
+    fn mint_event_handle_for_pi_in_table(
+        &mut self,
+        pi: usize,
+        event_index: usize,
+        access: u32,
+        table_owner: nt_process::ProcessId,
+        kernel_handle: bool,
+    ) -> Option<u64> {
         let pid = self.pm_pid_for_pi(pi)?;
         let generation = self.hosted_process_generation(pi)?;
+        self.mint_event_handle_for_owner(event_index, access,
+            nt_kernel_exec::EventObjectOwner::new(pid as u64, generation),
+            table_owner, kernel_handle)
+    }
+
+    fn mint_event_handle_for_owner(
+        &mut self,
+        event_index: usize,
+        access: u32,
+        event_owner: nt_kernel_exec::EventObjectOwner,
+        table_owner: nt_process::ProcessId,
+        kernel_handle: bool,
+    ) -> Option<u64> {
         let entry = self.obj_ns.get(event_index)?;
         if !entry.is_live()
             || entry.kind != OBJ_KIND_EVENT
@@ -10658,10 +10713,7 @@ impl ExecNtHandler {
         } else {
             registered = true;
             self.event_objects
-                .create(
-                    nt_kernel_exec::EventObjectOwner::new(pid as u64, generation),
-                    event_index as u64,
-                )
+                .create(event_owner, event_index as u64)
                 .ok()?
         };
         if self.event_objects.retain_handle(id).is_err() {
@@ -10671,8 +10723,10 @@ impl ExecNtHandler {
             return None;
         }
         let object = nt_process::HandleObject::Event(id.0);
-        match self.insert_process_handle(pid, object, nt_kernel_exec::map_event_access(access)) {
-            Ok(handle) => Some(handle as u64),
+        match self.insert_process_handle(table_owner, object, nt_kernel_exec::map_event_access(access)) {
+            Ok(handle) => Some(u64::from(handle) | if kernel_handle {
+                nt_process::native_handle::KERNEL_HANDLE_TAG
+            } else { 0 }),
             Err(_) => {
                 let _ = self.event_objects.release_handle(id);
                 if registered {
@@ -11171,6 +11225,7 @@ impl ExecNtHandler {
                     nt_process::dbgk::DBG_TERMINATE_THREAD,
                     nt_system_time_100ns() as i64,
                 );
+                crate::process_terminal_receipt::drain_hosted_process_exit_notifications(self);
                 self.refresh_job_time_sampling();
                 DBGK_TERMINATES_ENFORCED.fetch_add(1, Ordering::Relaxed);
             }
@@ -11182,6 +11237,7 @@ impl ExecNtHandler {
                     nt_process::dbgk::DBG_TERMINATE_PROCESS,
                     nt_system_time_100ns() as i64,
                 );
+                crate::process_terminal_receipt::drain_hosted_process_exit_notifications(self);
                 self.refresh_job_time_sampling();
                 DBGK_TERMINATES_ENFORCED.fetch_add(1, Ordering::Relaxed);
                 if block.is_blocked() {
@@ -14308,6 +14364,7 @@ impl ExecNtHandler {
                     self.pm.exit_thread_at(tid, nt_process::STATUS_UNSUCCESSFUL,
                         crate::monotonic_time_100ns() as i64)
                         .expect("failed first resume exits the exact new activation");
+                    crate::process_terminal_receipt::drain_hosted_process_exit_notifications(self);
                     Some(nt_process::STATUS_UNSUCCESSFUL)
                 } else {
                     None
@@ -14725,6 +14782,12 @@ impl ExecNtHandler {
         print_str(b" entry=0x");
         print_hex((start.rip >> 32) as u32);
         print_hex(start.rip as u32);
+        if self.pi == 0 {
+            print_str(b" captured_rcx=0x");
+            print_hex_u64(start.rcx);
+            print_str(b" captured_rdx=0x");
+            print_hex_u64(start.rdx);
+        }
         print_str(b" suspended=");
         print_u64(create_suspended as u64);
         if let Some(kind) = hosted_role.rpc_worker_kind() {
@@ -15575,14 +15638,14 @@ impl ExecNtHandler {
             .unwrap_or(true);
         let prefix = if win32_path {
             if system32 {
-                b"C:\\ReactOS\\System32\\" as &[u8]
+                crate::installed_layout::DOS_SYSTEM32_PREFIX
             } else {
-                b"C:\\ReactOS\\"
+                crate::installed_layout::DOS_ROOT_PREFIX
             }
         } else if system32 {
-            b"\\Device\\Harddisk0\\Partition1\\reactos\\system32\\" as &[u8]
+            crate::installed_layout::DEVICE_SYSTEM32_PREFIX
         } else {
-            b"\\Device\\Harddisk0\\Partition1\\reactos\\" as &[u8]
+            crate::installed_layout::DEVICE_ROOT_PREFIX
         };
         let mut n = 0usize;
         for &byte in prefix.iter().chain(process.image_file_name.as_bytes()) {
@@ -15826,12 +15889,12 @@ impl ExecNtHandler {
                 0x04
             }
             26 => {
-                let _pid = self.pm.resolve_process_handle(
+                let pid = self.pm.resolve_process_handle(
                     caller_pid,
                     handle,
                     nt_process::PROCESS_QUERY_INFORMATION,
                 )?;
-                put_u64(&mut output, 0, 0);
+                put_u64(&mut output, 0, self.pm.process_wow64_pointer(pid)?);
                 0x08
             }
             28 => {
@@ -16062,7 +16125,7 @@ impl ExecNtHandler {
             )
     }
 
-    fn pi_for_pid(&self, pid: nt_process::ProcessId) -> Option<usize> {
+    pub(crate) fn pi_for_pid(&self, pid: nt_process::ProcessId) -> Option<usize> {
         self.process_mechanisms
             .pi_for_pid(pid)
             .or_else(|| self.temporary_pi_for_pid(pid))
@@ -16730,11 +16793,13 @@ impl ExecNtHandler {
                 nt_process::HandleObject::IoCompletion(_) => b"IoCompletion",
                 nt_process::HandleObject::RegistryKey(_) => b"Key",
                 nt_process::HandleObject::ObjectDirectory(_) => b"Directory",
+                nt_process::HandleObject::DynamicObject { .. } => b"Object",
                 nt_process::HandleObject::Token(_) | nt_process::HandleObject::TokenObject(_) => {
                     b"Token"
                 }
                 nt_process::HandleObject::DebugObject(_) => b"DebugObject",
                 nt_process::HandleObject::Job(_) => b"Job",
+                nt_process::HandleObject::AlpcPort { .. } => b"ALPC Port",
                 nt_process::HandleObject::Opaque(tag)
                     if tag & SEMAPHORE_HANDLE_TAG_MASK == SEMAPHORE_HANDLE_TAG =>
                 {
@@ -20001,6 +20066,7 @@ impl ExecNtHandler {
         &mut self,
         args: &[u64],
         memory: SyscallUserMemory,
+        previous_mode: nt_syscall::ProcessorMode,
     ) -> u32 {
         let information_class = nt_ulong_arg(args[1]);
         let information_length = nt_ulong_arg(args[3]) as usize;
@@ -20063,6 +20129,20 @@ impl ExecNtHandler {
                     return STATUS_PRIVILEGE_NOT_HELD;
                 }
                 let port_handle = u64::from_le_bytes(value);
+                let generation = match self.hosted_process_generation(self.pi) {
+                    Some(generation) => generation,
+                    None => return STATUS_INVALID_HANDLE,
+                };
+                let handle_caller = match self.native_handle_caller(previous_mode) {
+                    Ok(caller) => caller,
+                    Err(status) => return status,
+                };
+                let port_handle = match self.pm.resolve_native_user_port_service_handle(
+                    handle_caller, port_handle, generation,
+                ) {
+                    Ok(service_handle) => service_handle,
+                    Err(status) => return status,
+                };
                 let retained = match lpc_client() {
                     Some(client) => {
                         let metadata = match client.query_handle(port_handle) {
@@ -20386,6 +20466,10 @@ impl ExecNtHandler {
             nt_process::HandleObject::RegistryKey(target) => {
                 self.release_registry_key_target(target);
             }
+            nt_process::HandleObject::DynamicObject { body, generation } => {
+                unsafe { driver_launch::hosted_driver_dynamic_delete::close_removed_object(body, generation) }
+                    .expect("removed dynamic object retains its exact ledger lease");
+            }
             _ => {}
         }
     }
@@ -20455,6 +20539,11 @@ impl ExecNtHandler {
             Err(nt_process::STATUS_INVALID_HANDLE) => return Ok(false),
             Err(status) => return Err(status),
         };
+        // A service-owned ALPC port stays in the table until an exact checked
+        // close completes. Generic NtClose cannot silently discard this owner.
+        if matches!(target.object(), nt_process::HandleObject::AlpcPort { .. }) {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
         let cleanup_file = match target.object() {
             nt_process::HandleObject::File(file_id)
             | nt_process::HandleObject::RoutedFile { file_id, .. } => self
@@ -20530,7 +20619,14 @@ impl ExecNtHandler {
                 closed.handle(),
             );
         }
-        self.release_handle_object(closed.into_object());
+        let dynamic_closed = if let nt_process::HandleObject::DynamicObject { body, generation } = closed.object() {
+            unsafe { driver_launch::hosted_driver_dynamic_delete::close_native_handle(
+                &self.pm, closed.table_owner(), closed.handle(), body, generation,
+            ) }.expect("canonical dynamic close retains exact ledger handle owner");
+            true
+        } else { false };
+        let object = closed.into_object();
+        if !dynamic_closed { self.release_handle_object(object); }
         if lifecycle_executor.is_some() {
             driver_launch::pump_hosted_file_lifecycle();
         }
@@ -22766,7 +22862,7 @@ impl ExecNtHandler {
         Ok(i64::from_le_bytes(bytes))
     }
 
-    fn wait_timeout_interval(&self, timeout_ptr: u64) -> Result<Option<i64>, u32> {
+    pub(crate) fn wait_timeout_interval(&self, timeout_ptr: u64) -> Result<Option<i64>, u32> {
         if timeout_ptr == 0 {
             return Ok(None);
         }
@@ -24064,6 +24160,11 @@ impl ExecNtHandler {
         &mut self,
         retired: nt_kernel_exec::RetiredEventObject,
     ) {
+        if let Ok(index) = usize::try_from(retired.native_identity) {
+            if let Some(entry) = self.obj_ns.get(index) {
+                self.named_event_security.retain(|(identity, _)| *identity != entry.identity);
+            }
+        }
         crate::provider_dispatcher_backend::finalize_retired_event(
             &mut self.obj_ns,
             &mut self.events,
@@ -24199,6 +24300,53 @@ impl ExecNtHandler {
         }
     }
 
+    pub(crate) fn provider_create_event_with_attributes(
+        &mut self,
+        caller: nt_process::native_handle::NativeHandleCaller,
+        pi: Option<usize>,
+        desired_access: u32,
+        event_type: u32,
+        initial_state: bool,
+        attributes: u32,
+    ) -> Result<u64, u32> {
+        use nt_process::native_handle::OBJ_KERNEL_HANDLE;
+        if attributes & !OBJ_KERNEL_HANDLE != 0 || event_type > 1 {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
+        self.pm.validate_native_handle_caller(caller)?;
+        let kernel = attributes & OBJ_KERNEL_HANDLE != 0;
+        if kernel && caller.mode() != nt_types::AccessMode::KernelMode {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
+        let (event_owner, table_owner) = if let Some(pi) = pi {
+            let pid = self.pm_pid_for_pi(pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+            if pid != caller.effective_process() {
+                return Err(nt_process::STATUS_INVALID_HANDLE);
+            }
+            let generation = self.hosted_process_generation(pi)
+                .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+            let table_owner = if kernel {
+                self.pm.initial_system_identity()
+                    .ok_or(nt_process::STATUS_INVALID_HANDLE)?.process_id()
+            } else { pid };
+            (nt_kernel_exec::EventObjectOwner::new(pid as u64, generation), table_owner)
+        } else {
+            let (system, generation) = self.pm
+                .authorize_initial_system_native_event_create(caller, attributes)?;
+            (nt_kernel_exec::EventObjectOwner::new(system as u64, generation), system)
+        };
+        let index = self.obj_create_anon_event(event_type == 1, initial_state)
+            .ok_or(nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
+        match self.mint_event_handle_for_owner(index, desired_access,
+            event_owner, table_owner, kernel) {
+            Some(handle) => Ok(handle),
+            None => {
+                self.rollback_new_event(index);
+                Err(nt_process::STATUS_INSUFFICIENT_RESOURCES)
+            }
+        }
+    }
+
     pub(crate) fn provider_reference_event(
         &mut self,
         pi: usize,
@@ -24206,7 +24354,6 @@ impl ExecNtHandler {
         desired_access: u32,
         proposed_body: u64,
     ) -> Result<(u64, nt_kernel_exec::EventObjectId, u64, u32), u32> {
-        const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
         let (id, index) = self.event_object_for_handle_in_pi(pi, handle, desired_access)?;
         let pid = self
             .pm_pid_for_pi(pi)
@@ -24215,6 +24362,72 @@ impl ExecNtHandler {
             .pm
             .handle_access(pid, handle as nt_process::Handle)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        self.retain_provider_event_pointer(id, index, proposed_body, granted_access)
+    }
+
+    /// Resolve a native driver's tagged kernel Event handle in System's
+    /// canonical table, then acquire an independent pointer reference before
+    /// ZwClose can release the handle reference.
+    pub(crate) fn provider_reference_native_event(
+        &mut self,
+        caller: nt_process::native_handle::NativeHandleCaller,
+        handle: u64,
+        desired_access: u32,
+    ) -> Result<(nt_kernel_exec::EventObjectId, u64, u32), u32> {
+        let target = self.pm.inspect_native_event_handle(caller, handle, desired_access)?;
+        let nt_process::HandleObject::Event(raw_id) = target.object() else {
+            unreachable!("typed native Event inspection returned another object");
+        };
+        let id = nt_kernel_exec::EventObjectId(raw_id);
+        let index = usize::try_from(self.event_objects.snapshot(id)
+            .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?.native_identity)
+            .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?;
+        if self.obj_ns.get(index).is_none_or(|entry|
+            !entry.is_live() || entry.kind != OBJ_KIND_EVENT)
+            || !self.events.contains(index as u64)
+        { return Err(nt_process::STATUS_INVALID_HANDLE); }
+        let granted_access = target.information().granted_access
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let (kind, signaled) = self.events.query_existing(index as u64)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        self.event_objects.retain_external_pointer(id)
+            .map_err(|_| nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
+        let metadata = u64::from(matches!(kind, EventKind::Synchronization))
+            | (u64::from(signaled) << 1);
+        Ok((id, metadata, granted_access))
+    }
+
+    pub(crate) fn provider_retain_native_event_pointer(
+        &mut self, id: nt_kernel_exec::EventObjectId,
+    ) -> Result<u32, u32> {
+        self.event_objects.retain_external_pointer(id)
+            .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?;
+        self.event_objects.snapshot(id)
+            .map(|snapshot| snapshot.pointer_leases)
+            .map_err(|_| nt_process::STATUS_INVALID_HANDLE)
+    }
+
+    pub(crate) fn provider_dereference_native_event_pointer(
+        &mut self, id: nt_kernel_exec::EventObjectId,
+    ) -> Result<u32, u32> {
+        let retired = self.event_objects.release_external_pointer(id)
+            .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?;
+        if let Some(retired) = retired {
+            self.finalize_retired_event_object(retired);
+            return Ok(0);
+        }
+        self.event_objects.snapshot(id)
+            .map(|snapshot| snapshot.pointer_leases)
+            .map_err(|_| nt_process::STATUS_INVALID_HANDLE)
+    }
+
+    fn retain_provider_event_pointer(&mut self,
+        id: nt_kernel_exec::EventObjectId,
+        index: usize,
+        proposed_body: u64,
+        granted_access: u32,
+    ) -> Result<(u64, nt_kernel_exec::EventObjectId, u64, u32), u32> {
+        const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
         let body = self
             .event_objects
             .retain_pointer_or_install(id, proposed_body)
@@ -24432,6 +24645,51 @@ impl ExecNtHandler {
         index: usize,
     ) -> Option<nt_kernel_exec::EventObjectId> {
         self.event_objects.id_for_native(index as u64)
+    }
+
+    pub(crate) fn projected_event_body_for_index(&self, index: usize) -> Option<u64> {
+        let id = self.event_id_for_index(index)?;
+        self.event_objects.provider_body(id).ok().flatten()
+    }
+
+    pub(crate) fn projected_event_ready(&self, raw_id: u64) -> Option<bool> {
+        let id = nt_kernel_exec::EventObjectId(nt_types::ObjectId(raw_id));
+        let native = self.event_objects.snapshot(id).ok()?.native_identity;
+        self.events.query_existing(native).map(|(_, state)| state)
+    }
+
+    pub(crate) fn projected_event_consume(&mut self, raw_id: u64) -> Option<bool> {
+        let id = nt_kernel_exec::EventObjectId(nt_types::ObjectId(raw_id));
+        let native = self.event_objects.snapshot(id).ok()?.native_identity;
+        self.events.query_existing(native)?;
+        Some(self.events.consume_existing(native))
+    }
+
+    pub(crate) fn projected_event_index(&self, raw_id: u64) -> Result<usize, u32> {
+        let id = nt_kernel_exec::EventObjectId(nt_types::ObjectId(raw_id));
+        let native = self.event_objects.snapshot(id)
+            .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?.native_identity;
+        let index = usize::try_from(native).map_err(|_| nt_process::STATUS_INVALID_HANDLE)?;
+        self.events.query_existing(native).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        Ok(index)
+    }
+
+    pub(crate) fn projected_event_set(&mut self, raw_id: u64) -> Result<(bool, usize), u32> {
+        let index = self.projected_event_index(raw_id)?;
+        let previous = self.events.set_existing(index as u64)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        Ok((previous, index))
+    }
+
+    pub(crate) fn projected_event_reset(&mut self, raw_id: u64) -> Result<bool, u32> {
+        let index = self.projected_event_index(raw_id)?;
+        self.events.reset_existing(index as u64).ok_or(nt_process::STATUS_INVALID_HANDLE)
+    }
+
+    pub(crate) fn projected_event_clear(&mut self, raw_id: u64) -> Result<(), u32> {
+        let index = self.projected_event_index(raw_id)?;
+        self.events.clear_existing(index as u64)
+            .then_some(()).ok_or(nt_process::STATUS_INVALID_HANDLE)
     }
 
     pub(crate) fn provider_close_event(&mut self, pi: usize, handle: u64) -> Result<(), u32> {
@@ -24888,6 +25146,7 @@ impl ExecNtHandler {
     }
 
     fn drain_job_destructions(&mut self) {
+        unsafe { native_job_bodies::redrive(); }
         while let Some(destruction) = self.pm.take_job_destruction() {
             let provider_flags = self.job_token_policies.flags(destruction.id);
             let security_ready = self
@@ -24906,6 +25165,16 @@ impl ExecNtHandler {
                 print_hex(destruction.security_limits);
                 print_str(b"/0x");
                 print_hex(provider_flags);
+                print_str(b" status=0x");
+                print_hex(status);
+                print_str(b"\n");
+                let restored = self.pm.restore_job_destruction(destruction);
+                debug_assert!(restored);
+                break;
+            }
+            if let Err(status) = unsafe { native_job_bodies::prepare_retirement(destruction) } {
+                print_str(b"[ps-job] PEJOB retirement preflight failed id=");
+                print_u64(destruction.id as u64);
                 print_str(b" status=0x");
                 print_hex(status);
                 print_str(b"\n");
@@ -24944,6 +25213,7 @@ impl ExecNtHandler {
                 let _ = self.io_completion_ports.release(association.port_id);
             }
             self.unlink_job_namespace(destruction.id);
+            unsafe { native_job_bodies::commit_retirement(destruction); }
         }
     }
 
@@ -25128,6 +25398,7 @@ impl ExecNtHandler {
             self.cancel_rundown_hosted_files(&reserved_files);
             return Err(status);
         }
+        crate::process_terminal_receipt::drain_hosted_process_exit_notifications(self);
         self.release_process_handles(pid, reserved_files);
         if let Some(process_index) = process_index {
             if !self.pending_job_terminations.contains(&process_index) {
@@ -29515,15 +29786,11 @@ impl ExecNtHandler {
             .map(|value| value & !0xfff)
             .filter(|&value| value != 0)
             .ok_or(STATUS_INVALID_VIEW_SIZE)?;
-        if zero_bits > 53 {
-            return Err(nt_address_space::STATUS_INVALID_PARAMETER_3);
-        }
-        let placement_limit = if base_in == 0 && zero_bits != 0 {
-            let highest = u64::MAX >> zero_bits;
-            if highest > HIGHEST_VAD_ADDRESS {
-                return Err(nt_address_space::STATUS_INVALID_PARAMETER_3);
-            }
-            PRIVATE_VM_LIMIT.min(highest + 1)
+        let zero_bits_count = nt_address_space::image_view_placement::x64_map_view_zero_bits_count(
+            zero_bits,
+        )?;
+        let placement_limit = if base_in == 0 && zero_bits_count != 0 {
+            PRIVATE_VM_LIMIT.min((u64::MAX >> zero_bits_count).saturating_add(1))
         } else {
             PRIVATE_VM_LIMIT
         };
@@ -29533,7 +29800,7 @@ impl ExecNtHandler {
             win32_protect
         };
         nt_address_space::validate_allocate_parameters(
-            zero_bits,
+            u64::from(zero_bits_count),
             nt_address_space::MEM_RESERVE
                 | nt_address_space::MEM_COMMIT
                 | (allocation_type & nt_address_space::MEM_TOP_DOWN),
@@ -30554,7 +30821,7 @@ impl ExecNtHandler {
             };
             let mut path = [0u8; 96];
             let mut n = 0usize;
-            for &c in b"reactos\\" {
+            for &c in crate::installed_layout::ROOT_PREFIX {
                 path[n] = c;
                 n += 1;
             }
@@ -31775,7 +32042,9 @@ impl ExecNtHandler {
                 if args[0] == 0 {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                let luid = EXP_LUID.fetch_add(1, Ordering::Relaxed);
+                let Some(luid) = EXP_LUID.allocate() else {
+                    return 0xC000_0095; // STATUS_INTEGER_OVERFLOW: never reissue a LUID.
+                };
                 if unsafe { !self.xas_write_u64(args[0], luid) } {
                     self.queue_write(args[0], luid);
                 }
@@ -32186,6 +32455,7 @@ impl ExecNtHandler {
                 status
             },
             NativeService::NtOpenKey => unsafe { self.nt_open_key_admitted(args) },
+            NativeService::NtOpenKeyEx => unsafe { self.nt_open_key_ex_admitted(args) },
             NativeService::NtCreateKey => unsafe { self.nt_create_key_admitted(args) },
             // NtSetValueKey captured args: KeyHandle=args[0], *ValueName=args[1],
             // TitleIndex=args[2], Type=args[3], Data=args[4], DataSize=args[5]. CM leases own
@@ -33172,7 +33442,7 @@ impl ExecNtHandler {
                                         .as_deref()
                                         .is_some_and(is_profile_list_sid_key_canon)
                                 {
-                                    const EXPECTED: &[u8] = b"%SystemDrive%\\Profiles\\Administrator";
+                                    const EXPECTED: &[u8] = crate::installed_layout::ADMIN_PROFILE_VALUE;
                                     let exact = ty == 2
                                         && data.len() == (EXPECTED.len() + 1) * 2
                                         && data
@@ -33426,13 +33696,27 @@ impl ExecNtHandler {
                 if crate::hard_error::is_ready() {
                     return STATUS_UNSUCCESSFUL;
                 }
-                let Some(owner_process) = self.pm_pid_for_pi(self.pi).map(|pid| pid as u64) else {
+                let Some(owner_pid) = self.pm_pid_for_pi(self.pi) else {
                     return STATUS_INVALID_HANDLE;
+                };
+                let owner_process = owner_pid as u64;
+                let Some(generation) = self.hosted_process_generation(self.pi) else {
+                    return STATUS_INVALID_HANDLE;
+                };
+                let caller = match self.native_handle_caller(ctx.previous_mode) {
+                    Ok(caller) => caller,
+                    Err(status) => return status,
+                };
+                let service_handle = match self.pm.resolve_native_user_port_service_handle(
+                    caller, args[0], generation,
+                ) {
+                    Ok(service_handle) => service_handle,
+                    Err(status) => return status,
                 };
                 let Some(lpc) = lpc_client() else {
                     return STATUS_UNSUCCESSFUL;
                 };
-                let metadata = match lpc.query_handle(args[0]) {
+                let metadata = match lpc.query_handle(service_handle) {
                     Ok(metadata) => metadata,
                     Err(status) => return status.raw() as u32,
                 };
@@ -33441,9 +33725,9 @@ impl ExecNtHandler {
                 {
                     return nt_status::NtStatus::INVALID_PORT_HANDLE.raw() as u32;
                 }
-                match crate::hard_error::register(args[0], owner_process) {
+                match crate::hard_error::register(service_handle, owner_process) {
                     Ok(()) => {
-                        print_str(b"[hard-error] registered default LPC port owner=");
+                        print_str(b"[hard-error] registered default shared port owner=");
                         print_u64(owner_process);
                         print_str(b" handle=0x");
                         print_hex_u64(args[0]);
@@ -33631,6 +33915,16 @@ impl ExecNtHandler {
             NativeService::NtCreatePort => unsafe {
                 const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
                 const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+                static SMSS_CREATE_PORT_TRACE: AtomicU64 = AtomicU64::new(0);
+                let smss_trace = self.pi == 0
+                    && SMSS_CREATE_PORT_TRACE.fetch_add(1, Ordering::Relaxed) < 8;
+                if smss_trace {
+                    print_str(b"[smss-create-port] output=0x");
+                    print_hex_u64(args[0]);
+                    print_str(b" object_attributes=0x");
+                    print_hex_u64(args[1]);
+                    print_str(b"\n");
+                }
                 // Robust .rdata-capable name read (csrss's \Windows\ApiPort name is in csrsrv .rdata,
                 // unreachable by the mirror-only smss_read_objattr_name) so the port registers under
                 // its real name → winlogon's NtSecureConnectPort matches it → the authentic CSR accept.
@@ -33720,6 +34014,13 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 }
                 self.queue_write(args[0], handle);
+                if smss_trace {
+                    print_str(b"[smss-create-port] queued handle=0x");
+                    print_hex_u64(handle);
+                    print_str(b" output=0x");
+                    print_hex_u64(args[0]);
+                    print_str(b"\n");
+                }
                 // Record the authentication port identity for the acceptance proof. lsass' lsasrv
                 // `StartAuthenticationPort`
                 // (`references/reactos/dll/win32/lsasrv/authport.c:364`) creates `\LsaAuthenticationPort`
@@ -35496,6 +35797,12 @@ impl ExecNtHandler {
             NativeService::NtAccessCheckByTypeResultList => unsafe {
                 self.nt_access_check_by_type(ctx, args, true)
             },
+            // The audit variants require the audited object/client-token policy and audit
+            // record side effect. Keep the exact ABI and reject the operation until that
+            // policy is implemented; an ordinary access check would falsely report success.
+            NativeService::NtAccessCheckByTypeAndAuditAlarm
+            | NativeService::NtAccessCheckByTypeResultListAndAuditAlarm
+            | NativeService::NtAccessCheckByTypeResultListAndAuditAlarmByHandle => 0xC000_0002,
             NativeService::NtPrivilegeCheck => unsafe { self.nt_privilege_check(ctx, args) },
             NativeService::NtImpersonateAnonymousToken => unsafe {
                 self.nt_impersonate_anonymous_token(args[0])
@@ -35606,6 +35913,7 @@ impl ExecNtHandler {
                 self.nt_set_information_process_with_user_memory(
                     args,
                     SyscallUserMemory::CurrentProcess,
+                    ctx.previous_mode,
                 )
             },
             NativeService::NtSetInformationThread => unsafe {
@@ -35724,15 +36032,27 @@ impl ExecNtHandler {
                             SYSTEM_SESSION_NEXT_ID.store(u32::MAX, Ordering::Relaxed);
                             return STATUS_INSUFFICIENT_RESOURCES;
                         }
-                        if !self.xas_try_write_buf(buffer, &session_id.to_le_bytes()) {
-                            return STATUS_ACCESS_VIOLATION;
+                        if let Err(status) = self.pm.create_process_session(pid, session_id) {
+                            return status;
                         }
-                        if let Err(status) = self.pm.set_process_session_id(pid, session_id) {
+                        if let Err(status) = self.publish_session_namespace(session_id, ctx.previous_mode) {
+                            self.pm.delete_process_session(pid, session_id)
+                                .expect("new session has one exact leader before publication");
                             return status;
                         }
                         if session_id < u64::BITS {
                             SYSTEM_SESSION_ACTIVE_MASK
                                 .fetch_or(1u64 << session_id, Ordering::Relaxed);
+                        }
+                        if !self.xas_try_write_buf(buffer, &session_id.to_le_bytes()) {
+                            self.retire_session_namespace_if_empty(session_id);
+                            self.pm.delete_process_session(pid, session_id)
+                                .expect("failed session copyout retains exact leader");
+                            if session_id < u64::BITS {
+                                SYSTEM_SESSION_ACTIVE_MASK
+                                    .fetch_and(!(1u64 << session_id), Ordering::Relaxed);
+                            }
+                            return STATUS_ACCESS_VIOLATION;
                         }
                         0
                     }
@@ -35745,27 +36065,18 @@ impl ExecNtHandler {
                             return STATUS_ACCESS_VIOLATION;
                         }
                         let session_id = u32::from_le_bytes(encoded);
-                        let was_active = if session_id < u64::BITS {
-                            let bit = 1u64 << session_id;
-                            SYSTEM_SESSION_ACTIVE_MASK.fetch_and(!bit, Ordering::Relaxed) & bit != 0
-                        } else {
-                            false
-                        };
                         let Some(pid) = self.pm_pid_for_pi(self.pi) else {
                             return STATUS_INVALID_HANDLE;
                         };
-                        let current_session = self
-                            .pm
-                            .process(pid)
-                            .map(|process| process.session_id)
-                            .unwrap_or(0);
-                        if current_session != session_id && !was_active {
-                            return STATUS_INVALID_PARAMETER;
+                        if let Err(status) = self.pm.delete_process_session(pid, session_id) {
+                            return status;
                         }
-                        match self.pm.set_process_session_id(pid, 0) {
-                            Ok(()) => 0,
-                            Err(status) => status,
+                        self.retire_session_namespace_if_empty(session_id);
+                        if session_id < u64::BITS {
+                            SYSTEM_SESSION_ACTIVE_MASK
+                                .fetch_and(!(1u64 << session_id), Ordering::Relaxed);
                         }
+                        0
                     }
                 }
             },
@@ -35889,6 +36200,12 @@ impl ExecNtHandler {
             NativeService::NtTestAlert => match unsafe { self.try_deliver_current_user_apc(0) } {
                 Ok(_) => 0,
                 Err(status) => status,
+            },
+            NativeService::NtAlertThreadByThreadId => unsafe {
+                crate::thread_alert::alert(self, args[0])
+            },
+            NativeService::NtWaitForAlertByThreadId => unsafe {
+                crate::thread_alert::begin_wait(self, args[1])
             },
             NativeService::NtQuerySecurityObject => unsafe {
                 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
@@ -36850,77 +37167,102 @@ impl ExecNtHandler {
                 let Some(target) = core::str::from_utf8(&tbuf[..tl]).ok() else {
                     return nt_fs::STATUS_OBJECT_NAME_INVALID;
                 };
-                match self.obj_resolve_open_link(path, root_idx) {
-                    Some(index) if self.obj_ns[index].kind == OBJ_KIND_SYMBOLIC_LINK => {
-                        let Some(handle) = self.mint_object_namespace_handle(index, desired_access)
-                        else {
-                            return 0xC000_009A;
-                        };
-                        if !self.xas_write_u64(out, handle) {
-                            if let Some(pid) = self.pm_pid_for_pi(self.pi) {
-                                let _ = self.close_process_handle(pid, handle);
-                            }
-                            return 0xC000_0005;
-                        }
-                        0
+                let local = self.obj_resolve_open_link(path, root_idx);
+                if let Some(index) = local {
+                    if self.obj_ns[index].kind != OBJ_KIND_SYMBOLIC_LINK {
+                        return 0xC000_0024;
                     }
-                    Some(_) => 0xC000_0024,
+                    if self.obj_ns[index].target() != &tbuf[..tl] {
+                        return 0xC000_0035;
+                    }
+                }
+                let open_if = captured.attributes & 0x80 != 0;
+                let case_insensitive = captured.attributes & 0x40 != 0;
+                let (canonical_id, opened_existing) =
+                    match crate::object_manager_create_or_open_symbolic_link_path(
+                        absolute_link,
+                        target,
+                        permanent,
+                        open_if,
+                        case_insensitive,
+                    ) {
+                        Ok(result) => result,
+                        Err(status) => return status.raw() as u32,
+                    };
+                let prior_payload = local.map(|index| self.obj_ns[index].payload);
+                let index = match local {
+                    Some(index) => {
+                        if self.obj_ns[index].payload != 0
+                            && self.obj_ns[index].payload != canonical_id
+                        {
+                            if !opened_existing {
+                                let _ = crate::object_manager_delete_symbolic_link_exact(
+                                    absolute_link,
+                                    canonical_id,
+                                );
+                            }
+                            return 0xC000_0008;
+                        }
+                        index
+                    }
                     None => match self.obj_create(
                         path,
                         root_idx,
                         OBJ_KIND_SYMBOLIC_LINK,
                         &tbuf[..tl],
-                        permanent,
+                        permanent || opened_existing,
                     ) {
-                        Some(index) => {
-                            let mirror_id = match crate::object_manager_create_symbolic_link_path_with_permanence(
-                                absolute_link,
-                                target,
-                                permanent,
-                            ) {
-                                Ok(id) => id,
-                                Err(status) => {
-                                    self.rollback_new_namespace_object(index);
-                                    return status.raw() as u32;
-                                }
-                            };
-                            self.obj_ns[index].payload = mirror_id;
-                            let Some(handle) =
-                                self.mint_object_namespace_handle(index, desired_access)
-                            else {
-                                if crate::object_manager_delete_symbolic_link_exact(
+                        Some(index) => index,
+                        None => {
+                            if !opened_existing {
+                                let _ = crate::object_manager_delete_symbolic_link_exact(
                                     absolute_link,
-                                    mirror_id,
-                                )
-                                .is_ok()
-                                {
-                                    self.rollback_new_namespace_object(index);
-                                }
-                                return 0xC000_009A;
-                            };
-                            if !self.xas_write_u64(out, handle) {
-                                // Retain the mirror name if canonical deletion cannot be confirmed.
-                                let deleted = crate::object_manager_delete_symbolic_link_exact(
-                                    absolute_link,
-                                    mirror_id,
-                                )
-                                .is_ok();
-                                if deleted {
-                                    self.obj_ns[index].payload = 0;
-                                }
-                                let closed = self
-                                    .pm_pid_for_pi(self.pi)
-                                    .is_some_and(|pid| self.close_process_handle(pid, handle));
-                                if deleted && closed {
-                                    self.rollback_new_namespace_object(index);
-                                }
-                                return 0xC000_0005;
+                                    canonical_id,
+                                );
                             }
-                            0
+                            return 0xC000_003A;
                         }
-                        None => 0xC000_003A,
                     },
+                };
+                self.obj_ns[index].payload = canonical_id;
+                let Some(handle) = self.mint_object_namespace_handle(index, desired_access) else {
+                    if !opened_existing {
+                        if crate::object_manager_delete_symbolic_link_exact(
+                            absolute_link,
+                            canonical_id,
+                        )
+                        .is_ok()
+                        {
+                            if let Some(payload) = prior_payload {
+                                self.obj_ns[index].payload = payload;
+                            } else {
+                                self.rollback_new_namespace_object(index);
+                            }
+                        }
+                    }
+                    return 0xC000_009A;
+                };
+                if !self.xas_write_u64(out, handle) {
+                    let closed = self
+                        .pm_pid_for_pi(self.pi)
+                        .is_some_and(|pid| self.close_process_handle(pid, handle));
+                    if !opened_existing && closed {
+                        let deleted = crate::object_manager_delete_symbolic_link_exact(
+                            absolute_link,
+                            canonical_id,
+                        )
+                        .is_ok();
+                        if deleted {
+                            if let Some(payload) = prior_payload {
+                                self.obj_ns[index].payload = payload;
+                            } else {
+                                self.rollback_new_namespace_object(index);
+                            }
+                        }
+                    }
+                    return 0xC000_0005;
                 }
+                if opened_existing { 0x4000_0000 } else { 0 }
             },
             // NtOpenSymbolicLinkObject(*Handle[R10]=args[0], DesiredAccess, *OA[R8]=args[2]).
             // Resolve; hand back a handle only for an actual symbolic link (a dir match is a miss).
@@ -40710,6 +41052,7 @@ impl ExecNtHandler {
                         self.cancel_rundown_hosted_files(&reserved_files);
                         return status;
                     }
+                    crate::process_terminal_receipt::drain_hosted_process_exit_notifications(self);
                     if !was_terminated {
                         crate::process_terminal_receipt::note_native_process_terminal(self, pid, process_index);
                     }
@@ -40796,6 +41139,7 @@ impl ExecNtHandler {
                     self.cancel_rundown_hosted_files(&reserved_files);
                     return status;
                 }
+                crate::process_terminal_receipt::drain_hosted_process_exit_notifications(self);
                 let abandoned_mutants = unsafe { self.abandon_mutants_for_thread(target as u64) };
                 if abandoned_mutants != 0 {
                     print_str(b"[thread-term] abandoned mutants tid=");

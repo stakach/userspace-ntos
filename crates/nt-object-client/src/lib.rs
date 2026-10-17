@@ -27,6 +27,7 @@ use nt_object_abi::{
     ObDereferenceObjectRequest, ObLookupPathRequest, ObOpenObjectRequest, ObQueryObjectInfo,
     ObReferenceFileHandleRequest,
     ObReferenceHandleRequest, ObReply, ObDirectoryHandleRequest, ObQueryDirectoryRequest,
+    ObCreateSessionNamespaceRequest, ObRetireSessionNamespaceRequest,
 };
 use nt_status::NtStatus;
 use nt_types::{AccessMask, HandleValue, ObjAttrFlags, ObjectId, ObjectTypeId, UnicodeString};
@@ -73,7 +74,50 @@ pub struct DirectoryQueryResult {
     pub written: u32,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SessionNamespace {
+    pub session: ObjectId,
+    pub windows: ObjectId,
+    pub base_named_objects: ObjectId,
+}
+
 impl<B: Backend> ObjectClient<B> {
+    pub fn create_session_namespace(&mut self, session_id: u32) -> Result<SessionNamespace, NtStatus> {
+        let req = ObCreateSessionNamespaceRequest {
+            abi_size: size_of::<ObCreateSessionNamespaceRequest>() as u16,
+            reserved: 0,
+            session_id,
+        };
+        let mut bno = [0u8; 8];
+        let reply = self.backend.call(opcode::OB_OP_CREATE_SESSION_NAMESPACE,
+            bytemuck::bytes_of(&req), &mut bno);
+        NtStatus(reply.status).to_result()?;
+        let bno = u64::from_le_bytes(bno);
+        if reply.detail0 == 0 || reply.detail1 == 0 || reply.information != 8 || bno == 0 {
+            return Err(NtStatus::INVALID_HANDLE);
+        }
+        Ok(SessionNamespace { session: ObjectId(reply.detail0), windows: ObjectId(reply.detail1),
+            base_named_objects: ObjectId(bno) })
+    }
+
+    pub fn retire_session_namespace_exact(
+        &mut self,
+        session_id: u32,
+        owned: SessionNamespace,
+    ) -> Result<(), NtStatus> {
+        let req = ObRetireSessionNamespaceRequest {
+            abi_size: size_of::<ObRetireSessionNamespaceRequest>() as u16,
+            reserved: 0,
+            session_id,
+            session_object_id: owned.session.0,
+            windows_object_id: owned.windows.0,
+            base_named_objects_id: owned.base_named_objects.0,
+        };
+        let reply = self.backend.call(opcode::OB_OP_RETIRE_SESSION_NAMESPACE_EXACT,
+            bytemuck::bytes_of(&req), &mut []);
+        NtStatus(reply.status).to_result()
+    }
+
     pub fn create_directory_handle(&mut self, root: Option<HandleValue>, name: &UnicodeString,
         access: AccessMask, attributes: ObjAttrFlags) -> Result<DirectoryHandleResult, NtStatus>
     {
@@ -511,6 +555,49 @@ impl<B: Backend> ObjectClient<B> {
             .call(opcode::OB_OP_CREATE_SYMBOLIC_LINK, &buf, &mut []);
         NtStatus(r.status).to_result()?;
         Ok(ObjectId(r.detail0))
+    }
+
+    /// Atomically create a link or open the same canonical link under OBJ_OPENIF.
+    /// The returned identity belongs to the link itself, rather than its target.
+    pub fn create_or_open_symbolic_link(
+        &mut self,
+        link: &str,
+        target: &str,
+        permanent: bool,
+        open_if: bool,
+        case_insensitive: bool,
+    ) -> Result<(ObjectId, bool), NtStatus> {
+        let l = utf16(link);
+        let t = utf16(target);
+        let hdr = size_of::<ObCreateSymbolicLinkRequest>();
+        let mut attributes = perm_flag(permanent);
+        if open_if {
+            attributes |= ObjAttrFlags::OPEN_IF.bits() as u16;
+        }
+        if case_insensitive {
+            attributes |= ObjAttrFlags::CASE_INSENSITIVE.bits() as u16;
+        }
+        let req = ObCreateSymbolicLinkRequest {
+            abi_size: hdr as u16,
+            obj_attributes: attributes,
+            desired_access: 0,
+            link_offset: hdr as u32,
+            link_len_bytes: byte_len(&l),
+            target_offset: (hdr + l.len() * 2) as u32,
+            target_len_bytes: byte_len(&t),
+        };
+        let mut buf = bytemuck::bytes_of(&req).to_vec();
+        push_units(&mut buf, &l);
+        push_units(&mut buf, &t);
+        let response = self
+            .backend
+            .call(opcode::OB_OP_CREATE_SYMBOLIC_LINK, &buf, &mut []);
+        let status = NtStatus(response.status);
+        status.to_result()?;
+        if response.detail0 == 0 || !matches!(status, NtStatus::SUCCESS | NtStatus::OBJECT_NAME_EXISTS) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok((ObjectId(response.detail0), status == NtStatus::OBJECT_NAME_EXISTS))
     }
 
     fn create_io_object(

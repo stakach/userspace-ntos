@@ -21,17 +21,26 @@ pub struct WdmDeviceObjectAllocationLayout {
 
 impl WdmDeviceObjectAllocationLayout {
     pub const fn plan(driver_size: u32) -> Result<Self, WdmLayoutError> {
-        // Keep the supported logical Size representable, independently of allocation padding.
-        if driver_size > u16::MAX as u32 - WDM_X64_DEVICE_OBJECT_SIZE as u32 {
-            return Err(WdmLayoutError::InvalidField);
-        }
-        let logical = WDM_X64_DEVICE_OBJECT_SIZE + driver_size as usize;
-        let kernel_offset = (logical + 15) & !15;
+        // IoCreateDevice allocates the full ULONG extension but stores its Size
+        // in a USHORT field. Keep allocation and extension offsets independent
+        // of that truncating field, as ReactOS does.
+        let logical = match WDM_X64_DEVICE_OBJECT_SIZE.checked_add(driver_size as usize) {
+            Some(size) => size,
+            None => return Err(WdmLayoutError::InvalidField),
+        };
+        let kernel_offset = match logical.checked_add(15) {
+            Some(size) => size & !15,
+            None => return Err(WdmLayoutError::InvalidField),
+        };
+        let allocation_size = match kernel_offset.checked_add(WDM_X64_DEVICE_OBJECT_EXTENSION_SIZE) {
+            Some(size) => size,
+            None => return Err(WdmLayoutError::InvalidField),
+        };
         Ok(Self {
             driver_size,
             size_field: logical as u16,
             kernel_offset,
-            allocation_size: kernel_offset + WDM_X64_DEVICE_OBJECT_EXTENSION_SIZE,
+            allocation_size,
         })
     }
     pub const fn allocation_size(self) -> usize {
