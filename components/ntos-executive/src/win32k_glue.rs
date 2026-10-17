@@ -91,6 +91,7 @@ struct Win32kPhysicalLane {
     stack_base: u64,
     stack_frames: u64,
     ipc_buffer_va: u64,
+    kpcr_frame: Option<u64>,
     stack_publication: Option<nt_provider_wait::ProviderStackReadyReceipt>,
     stack_alias: Win32kStackAlias,
     // Allocation receipt only; canonical state owns live transport and mechanism retirement.
@@ -186,6 +187,7 @@ pub(crate) unsafe fn register_primary_win32k_physical_lane(
         stack_base: win32k_subsystem::WIN32K_STACK_VADDR,
         stack_frames: 32,
         ipc_buffer_va: crate::IPCBUF_VADDR,
+        kpcr_frame: None,
         worker: None,
         stack_publication: None,
         stack_alias: Win32kStackAlias::Unmapped,
@@ -446,6 +448,10 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
     else {
         return false;
     };
+    let Some(kpcr_va) = win32k_subsystem::WIN32K_PHYSICAL_KPCR_LAYOUT.address(worker_index + 1)
+    else {
+        return false;
+    };
     use crate::spawn_hosts::shared_ingress::owner::runtime;
     let Some(provider) = crate::current_win32k_provider_domain() else {
         return false;
@@ -462,7 +468,7 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
             stack_frames: win32k_subsystem::WIN32K_LANE_STACK_FRAMES,
             ipc_buffer_va,
             prio: 100,
-            gs_base: Some(win32k_subsystem::WIN32K_KPCR_VA),
+            gs_base: Some(kpcr_va),
             ensure_paging: ensure_w32_client_paging,
         },
         shared_endpoint,
@@ -498,6 +504,8 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
     let tcb = worker.tcb;
     let endpoint = worker.endpoint;
     let reply_cap = worker.reply_cap;
+    // Retain the new page in the physical row before any paging or map effect can fail.
+    let kpcr_frame = alloc_frame();
     // Retain every allocated arena and capability before any worker can run or fail startup.
     let physical_index = {
         let lanes = win32k_physical_lanes_mut();
@@ -511,12 +519,21 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
             stack_base,
             stack_frames: win32k_subsystem::WIN32K_LANE_STACK_FRAMES,
             ipc_buffer_va,
+            kpcr_frame: Some(kpcr_frame),
             worker: Some(worker),
             stack_publication: None,
             stack_alias: Win32kStackAlias::Unmapped,
         });
         index
     };
+    // The worker is still suspended. Map its own KPCR before it can execute native win32k code;
+    // each physical lane's GS resolves to a distinct current-thread projection.
+    if !ensure_w32_client_paging(kpcr_va, pml4)
+        || page_map_r(kpcr_frame, kpcr_va, RW_NX, pml4) != 0
+    {
+        retain_failed_shared_win32k_lane(tcb, None, b"kpcr-map");
+        return false;
+    }
     let cnode = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
         .as_ref().unwrap()[physical_index].worker.as_ref().unwrap().cnode;
     let source = runtime::PhysicalSource {
@@ -4063,18 +4080,6 @@ unsafe fn resume_suspended_user_callback_component(
         (sh + win32k_subsystem::SH_REQ_PROCESS_ROLE) as *mut u64,
         callback_process_role_code(client.process_role) as u64,
     );
-    if !win32k_subsystem::restore_current_context_for_user_callback_resume(
-        client.pi,
-        client.pid,
-        client.tid,
-        client.teb,
-        client.eprocess,
-        client.ethread,
-    ) {
-        return crate::spawn_hosts::PumpResult::refused(
-            0xC000_000Du32 as i32, channel.reply_cap,
-        );
-    }
     if !crate::service_sec_image::resume_external_component_execution_lane(lane, callback_token) {
         return crate::spawn_hosts::PumpResult::refused(
             0xC000_000Du32 as i32, 0,
@@ -4205,17 +4210,6 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
     ] {
         core::ptr::write_volatile((sh + offset) as *mut u64, value);
     }
-    if !win32k_subsystem::restore_current_context_for_user_callback_resume(
-        client.pi,
-        client.pid,
-        client.tid,
-        client.teb,
-        client.eprocess,
-        client.ethread,
-    ) {
-        return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
-    }
-
     let previous_dispatch = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
@@ -4444,16 +4438,6 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
         ),
     ] {
         core::ptr::write_volatile((sh + offset) as *mut u64, value);
-    }
-    if !win32k_subsystem::restore_current_context_for_user_callback_resume(
-        client.pi,
-        client.pid,
-        client.tid,
-        client.teb,
-        client.eprocess,
-        client.ethread,
-    ) {
-        return LpcWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
     }
     let previous_dispatch = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
     core::ptr::write(
@@ -7282,7 +7266,6 @@ pub(crate) unsafe fn win32k_dispatch_backtrace() {
     print_hex(registers[nt_user_callback::USER_CONTEXT_R15] as u32);
     print_str(b"\n");
     trace_win32k_tcb_debug_state();
-    win32k_subsystem::trace_win32k_wall_context();
     // RAW stack window from fault rsp: each qword annotated with its win32k RVA if it lands in the
     // image (a return address). Keep the scan bounded; this path only runs after the component has
     // already walled, and the first few caller RVAs are the useful signal.

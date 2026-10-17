@@ -152,6 +152,8 @@ pub const WIN32K_LANE_ARENA_VADDR: u64 = 0x0000_0100_0D20_0000;
 pub const WIN32K_LANE_STRIDE: u64 = 0x0004_0000;
 pub const WIN32K_LANE_STACK_FRAMES: u64 = 32;
 pub const WIN32K_LANE_IPCBUF_OFFSET: u64 = 0x0002_0000;
+/// Dedicated KPCR page outside each worker's stack and IPC buffer.
+pub const WIN32K_LANE_KPCR_OFFSET: u64 = 0x0002_1000;
 pub const WIN32K_LANE_CAPACITY: usize = 48;
 const _: () = assert!(
     WIN32K_LANE_ARENA_VADDR + WIN32K_LANE_CAPACITY as u64 * WIN32K_LANE_STRIDE
@@ -159,6 +161,17 @@ const _: () = assert!(
 );
 const _: () = assert!(WIN32K_LANE_STACK_FRAMES * 0x1000 <= WIN32K_LANE_IPCBUF_OFFSET);
 const _: () = assert!(WIN32K_LANE_IPCBUF_OFFSET + 0x1000 <= WIN32K_LANE_STRIDE);
+const _: () = assert!(WIN32K_LANE_KPCR_OFFSET >= WIN32K_LANE_IPCBUF_OFFSET + 0x1000);
+const _: () = assert!(WIN32K_LANE_KPCR_OFFSET + 0x1000 <= WIN32K_LANE_STRIDE);
+
+pub const WIN32K_PHYSICAL_KPCR_LAYOUT: nt_kernel_exec::win32k_lane_context::PhysicalKpcrLayout =
+    nt_kernel_exec::win32k_lane_context::PhysicalKpcrLayout {
+        primary: WIN32K_KPCR_VA,
+        worker_arena: WIN32K_LANE_ARENA_VADDR,
+        worker_stride: WIN32K_LANE_STRIDE,
+        worker_offset: WIN32K_LANE_KPCR_OFFSET,
+        worker_capacity: WIN32K_LANE_CAPACITY,
+    };
 /// The 2 MiB PT window (0x0700_0000..0x0720_0000) that holds the DATA/SHARED/SENTINEL/ARG frames
 /// (the pool used to share it; now the pool has its own window above). Both the executive-load view
 /// and the host-run view map a page table here for those frames.
@@ -208,8 +221,15 @@ struct Win32kNlsState {
 }
 /// Current-process win32 state (page 4): compatibility cells mirroring the selected runtime
 /// context + a copy of win32k's callout table (recorded by PsEstablishWin32Callouts).
-const SLOT_W32PROCESS: u64 = WIN32K_DATA_VADDR + 0x4000; // Ps{Set,Get}ProcessWin32Process slot
-const SLOT_W32THREAD: u64 = WIN32K_DATA_VADDR + 0x4008; // Ps{Set,Get}ThreadWin32Thread slot
+// The Ps{Set,Get}{Process,Thread}Win32* compatibility cells live with their physical lane's
+// current identity. A callout on another lane must not replace a suspended callout's result.
+fn current_w32process_slot() -> u64 {
+    current_lane_ids().w32process.as_ptr() as u64
+}
+
+fn current_w32thread_slot() -> u64 {
+    current_lane_ids().w32thread.as_ptr() as u64
+}
 const WIN32_CALLOUTS: u64 = WIN32K_DATA_VADDR + 0x4100; // recorded WIN32_CALLOUTS_FG table (copy)
 /// A synthetic process handle NtUserProcessConnect's ObReferenceObjectByHandle resolves.
 pub const FAKE_PROCESS_HANDLE: u64 = 0x0000_0000_5A5A_0100;
@@ -1576,6 +1596,8 @@ const LPC_SERVICE_RETAIN_PORT: u32 = 2;
 const LPC_SERVICE_RELEASE_PORT: u32 = 3;
 const LPC_SERVICE_RETAINED_REQUEST_PORT: u32 = 4;
 const LPC_SERVICE_MESSAGE_CAP: usize = nt_lpc_abi::PORT_MESSAGE_MAX_LEN;
+const PORT_MESSAGE_CLIENT_PROCESS_OFFSET: usize = 8;
+const PORT_MESSAGE_CLIENT_THREAD_OFFSET: usize = 16;
 const _: () = assert!(LPC_SERVICE_MESSAGE as usize + LPC_SERVICE_MESSAGE_CAP <= WIN32K_LPC_BYTES);
 
 // --- pool allocator (host-side; the trampolines run in the component) ------------------------
@@ -3497,14 +3519,14 @@ extern "win64" fn s_ps_get_process_id(process: u64) -> u64 {
 
 /// `HANDLE PsGetCurrentThreadId()` — the routed client's current TID.
 extern "win64" fn s_ps_get_current_thread_id() -> u64 {
-    WIN32K_CURRENT_THREAD_ID.load(Ordering::Relaxed)
+    current_lane_ids().thread_id.load(Ordering::Relaxed)
 }
 
 /// `BOOLEAN KeIsAttachedProcess()` reads the selected KTHREAD's APC environment.
 extern "win64" fn s_ke_is_attached_process() -> u8 {
     unsafe {
         let ethread = current_ethread();
-        let tid = WIN32K_CURRENT_THREAD_ID.load(Ordering::Relaxed);
+        let tid = current_lane_ids().thread_id.load(Ordering::Relaxed);
         let selected = thread_context_index_for_ethread(ethread)
             .is_some_and(|index| {
                 thread_ctx_tid(index) == tid
@@ -4156,7 +4178,7 @@ extern "win64" fn s_set_win32process(process: u64, w32process: u64, old: u64) ->
         if let Some(index) = context_index {
             set_process_ctx_w32process(index, w32process);
             if index == current_process_context_index().unwrap_or(usize::MAX) {
-                write_volatile(SLOT_W32PROCESS as *mut u64, w32process);
+                write_volatile(current_w32process_slot() as *mut u64, w32process);
             }
             if let Some(thread_index) = current_thread_context_index() {
                 publish_selected_context(index, thread_index);
@@ -4170,7 +4192,7 @@ extern "win64" fn s_set_win32process(process: u64, w32process: u64, old: u64) ->
 /// at [`KTHREAD_WIN32THREAD_OFF`]) and returns the previous value; a NULL `Win32Thread` is the RESET
 /// form, which only takes effect when the current value matches `OldWin32Thread`.
 ///
-/// The compatibility cell ([`SLOT_W32THREAD`]) is kept in lockstep for current-thread imports, but the
+/// The lane-local compatibility cell is kept in lockstep for current-thread imports, but the
 /// *thread-object* store is the load-bearing half: win32k inlines
 /// `PsGetCurrentThread()->Tcb.Win32Thread` and never goes through the export.
 extern "win64" fn s_set_win32thread(thread: u64, w32thread: u64, old: u64) -> u64 {
@@ -4192,7 +4214,7 @@ extern "win64" fn s_set_win32thread(thread: u64, w32thread: u64, old: u64) -> u6
                 }
             }
             if thread == current_ethread() {
-                write_volatile(SLOT_W32THREAD as *mut u64, w32thread);
+                write_volatile(current_w32thread_slot() as *mut u64, w32thread);
             }
         }
         previous
@@ -8084,12 +8106,12 @@ extern "win64" fn s_lpc_request_port(port_object: u64, message: *const u8) -> i3
     };
     frame[4..6].copy_from_slice(&message_type.to_le_bytes());
     frame[8..16].copy_from_slice(
-        &WIN32K_CURRENT_PROCESS_ID
+        &current_lane_ids().process_id
             .load(Ordering::Relaxed)
             .to_le_bytes(),
     );
     frame[16..24].copy_from_slice(
-        &WIN32K_CURRENT_THREAD_ID
+        &current_lane_ids().thread_id
             .load(Ordering::Relaxed)
             .to_le_bytes(),
     );
@@ -8176,9 +8198,19 @@ pub(crate) unsafe fn service_lpc_request() -> i32 {
             let bytes =
                 core::slice::from_raw_parts((sh + LPC_SERVICE_MESSAGE) as *const u8, message_len);
             let header = bytes.get(..4).and_then(|header| header.try_into().ok());
+            let process = bytes
+                .get(PORT_MESSAGE_CLIENT_PROCESS_OFFSET..PORT_MESSAGE_CLIENT_PROCESS_OFFSET + 8)
+                .and_then(|value| value.try_into().ok())
+                .map(u64::from_le_bytes);
+            let thread = bytes
+                .get(PORT_MESSAGE_CLIENT_THREAD_OFFSET..PORT_MESSAGE_CLIENT_THREAD_OFFSET + 8)
+                .and_then(|value| value.try_into().ok())
+                .map(u64::from_le_bytes);
             let valid = header
                 .and_then(nt_lpc_abi::port_message_total_length)
-                .is_some_and(|total| total == message_len);
+                .is_some_and(|total| total == message_len)
+                && process.is_some_and(|value| value != 0)
+                && thread.is_some_and(|value| value != 0);
             if !valid {
                 STATUS_INVALID_PARAMETER_I32
             } else {
@@ -8187,8 +8219,8 @@ pub(crate) unsafe fn service_lpc_request() -> i32 {
                         Ok(identity) => match lpc.retained_request_port(
                             port_handle,
                             bytes,
-                            WIN32K_CURRENT_PROCESS_ID.load(Ordering::Relaxed),
-                            WIN32K_CURRENT_THREAD_ID.load(Ordering::Relaxed),
+                            process.unwrap(),
+                            thread.unwrap(),
                         ) {
                             Ok(()) => {
                                 if lpc_name_is(&identity.name, b"\\windows\\apiport") {
@@ -8303,11 +8335,11 @@ fn lpc_request_wait_reply_retained(
         write_volatile((sh + LPC_WAIT_RESULT_GENERATION) as *mut u64, 0);
         write_volatile(
             (sh + LPC_WAIT_CLIENT_PROCESS) as *mut u64,
-            WIN32K_CURRENT_PROCESS_ID.load(Ordering::Relaxed),
+            current_lane_ids().process_id.load(Ordering::Relaxed),
         );
         write_volatile(
             (sh + LPC_WAIT_CLIENT_THREAD) as *mut u64,
-            WIN32K_CURRENT_THREAD_ID.load(Ordering::Relaxed),
+            current_lane_ids().thread_id.load(Ordering::Relaxed),
         );
         write_volatile((sh + LPC_WAIT_MESSAGE_ID) as *mut u32, 0);
         core::ptr::copy_nonoverlapping(
@@ -10343,9 +10375,17 @@ extern "win64" fn s_rtl_destroy_atom_table(table: u64) -> i32 {
     rtl_atom::status::SUCCESS as i32
 }
 
-static WIN32K_CURRENT_PROCESS_ID: AtomicU64 = AtomicU64::new(0);
-static WIN32K_CURRENT_THREAD_ID: AtomicU64 = AtomicU64::new(0);
-static WIN32K_CURRENT_CLIENT_PI: AtomicU64 = AtomicU64::new(MAX_PI as u64);
+use nt_kernel_exec::win32k_lane_context::LaneCurrentIds;
+
+static WIN32K_LANE_CURRENT_IDS: [LaneCurrentIds; WIN32K_LANE_CAPACITY + 1] =
+    [const { LaneCurrentIds::new(MAX_PI as u64) }; WIN32K_LANE_CAPACITY + 1];
+
+fn current_lane_ids() -> &'static LaneCurrentIds {
+    let kpcr = current_kpcr_va();
+    let ordinal = WIN32K_PHYSICAL_KPCR_LAYOUT.ordinal(kpcr)
+        .expect("current physical win32k KPCR must be registered");
+    &WIN32K_LANE_CURRENT_IDS[ordinal]
+}
 const WIN32K_PROCESS_CTX_INITIAL_CAP: u64 = 8;
 const WIN32K_THREAD_CTX_INITIAL_CAP: u64 = 64;
 #[derive(Clone, Copy)]
@@ -10401,7 +10441,6 @@ static WIN32K_CLIENT_THREAD_CALLOUTS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_CONTEXT_TRACES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CALLBACK_RESUME_CONTEXT_RESTORES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CALLBACK_RESUME_CONTEXT_FAILURES: AtomicU64 = AtomicU64::new(0);
-static WIN32K_WALL_CONTEXT_TRACES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_TOKEN_CONTEXT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_PRIMARY_TOKEN_REFERENCE_FAILURES: AtomicU64 = AtomicU64::new(0);
 const WIN32K_SERVICE_WINSTA_INITIAL_CAP: u64 = 4;
@@ -10415,7 +10454,7 @@ static WIN32K_TICK_COUNT: AtomicU64 = AtomicU64::new(1);
 
 /// Current process identity for the explicitly selected initialization or hosted caller.
 extern "win64" fn s_current_process_id() -> u64 {
-    WIN32K_CURRENT_PROCESS_ID.load(Ordering::Relaxed)
+    current_lane_ids().process_id.load(Ordering::Relaxed)
 }
 
 /// Thread ownership does not change when its APC environment attaches to another process.
@@ -10439,7 +10478,7 @@ unsafe fn zero_region(base: u64, size: u64) {
 }
 
 unsafe fn current_client_index() -> usize {
-    let pi = WIN32K_CURRENT_CLIENT_PI.load(Ordering::Relaxed) as usize;
+    let pi = current_lane_ids().client_pi.load(Ordering::Relaxed) as usize;
     assert!(pi < MAX_PI, "a hosted client is required for this win32k operation");
     pi
 }
@@ -10845,19 +10884,19 @@ unsafe fn finalize_thread_ctx_record(index: usize) -> bool {
         Some(retirement)
     };
 
-    if read_volatile((WIN32K_KPCR_VA + 0x30) as *const u64) == record.callout_teb
-        || read_volatile((WIN32K_KPCR_VA + 0x30) as *const u64) == record.teb
+    if read_volatile((current_kpcr_va() + 0x30) as *const u64) == record.callout_teb
+        || read_volatile((current_kpcr_va() + 0x30) as *const u64) == record.teb
     {
-        write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, WIN32K_KPCR_VA);
+        write_volatile((current_kpcr_va() + 0x30) as *mut u64, current_kpcr_va());
     }
-    if read_volatile((WIN32K_KPCR_VA + 0x188) as *const u64) == record.ethread {
-        write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, 0);
+    if read_volatile((current_kpcr_va() + 0x188) as *const u64) == record.ethread {
+        write_volatile((current_kpcr_va() + 0x188) as *mut u64, 0);
     }
-    if WIN32K_CURRENT_CLIENT_PI.load(Ordering::Relaxed) == record.pi
-        && WIN32K_CURRENT_THREAD_ID.load(Ordering::Relaxed) == record.tid
+    if current_lane_ids().client_pi.load(Ordering::Relaxed) == record.pi
+        && current_lane_ids().thread_id.load(Ordering::Relaxed) == record.tid
     {
-        WIN32K_CURRENT_THREAD_ID.store(0, Ordering::Relaxed);
-        write_volatile(SLOT_W32THREAD as *mut u64, 0);
+        current_lane_ids().thread_id.store(0, Ordering::Relaxed);
+        write_volatile(current_w32thread_slot() as *mut u64, 0);
     }
     let shared = WIN32K_SHARED_VADDR;
     if read_volatile((shared + SH_CTX_ETHREAD) as *const u64) == record.ethread {
@@ -10933,17 +10972,17 @@ unsafe fn finalize_process_ctx_record(index: usize) -> bool {
         Some(retirement)
     };
 
-    if read_volatile((WIN32K_KPCR_VA + 0x60) as *const u64) == record.eprocess {
-        write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, 0);
+    if read_volatile((current_kpcr_va() + 0x60) as *const u64) == record.eprocess {
+        write_volatile((current_kpcr_va() + 0x60) as *mut u64, 0);
     }
-    if WIN32K_CURRENT_CLIENT_PI.load(Ordering::Relaxed) == record.pi
-        && WIN32K_CURRENT_PROCESS_ID.load(Ordering::Relaxed) == record.pid
+    if current_lane_ids().client_pi.load(Ordering::Relaxed) == record.pi
+        && current_lane_ids().process_id.load(Ordering::Relaxed) == record.pid
     {
-        WIN32K_CURRENT_CLIENT_PI.store(MAX_PI as u64, Ordering::Relaxed);
-        WIN32K_CURRENT_PROCESS_ID.store(0, Ordering::Relaxed);
-        WIN32K_CURRENT_THREAD_ID.store(0, Ordering::Relaxed);
-        write_volatile(SLOT_W32PROCESS as *mut u64, 0);
-        write_volatile(SLOT_W32THREAD as *mut u64, 0);
+        current_lane_ids().client_pi.store(MAX_PI as u64, Ordering::Relaxed);
+        current_lane_ids().process_id.store(0, Ordering::Relaxed);
+        current_lane_ids().thread_id.store(0, Ordering::Relaxed);
+        write_volatile(current_w32process_slot() as *mut u64, 0);
+        write_volatile(current_w32thread_slot() as *mut u64, 0);
     }
     let shared = WIN32K_SHARED_VADDR;
     if read_volatile((shared + SH_CTX_EPROCESS) as *const u64) == record.eprocess {
@@ -11078,7 +11117,7 @@ unsafe fn process_context_index_for_eprocess(process: u64) -> Option<usize> {
 }
 
 unsafe fn current_process_context_index() -> Option<usize> {
-    process_context_index_for_pid(WIN32K_CURRENT_PROCESS_ID.load(Ordering::Relaxed))
+    process_context_index_for_pid(current_lane_ids().process_id.load(Ordering::Relaxed))
 }
 
 unsafe fn thread_context_index_for_tid(tid: u64) -> Option<usize> {
@@ -11118,15 +11157,28 @@ unsafe fn thread_context_index_for_w32thread(thread: u64) -> Option<usize> {
 }
 
 unsafe fn current_thread_context_index() -> Option<usize> {
-    thread_context_index_for_tid(WIN32K_CURRENT_THREAD_ID.load(Ordering::Relaxed))
+    thread_context_index_for_tid(current_lane_ids().thread_id.load(Ordering::Relaxed))
 }
 
 unsafe fn current_eprocess() -> u64 {
-    read_volatile((WIN32K_KPCR_VA + 0x60) as *const u64)
+    read_volatile((current_kpcr_va() + 0x60) as *const u64)
 }
 
 unsafe fn current_ethread() -> u64 {
-    read_volatile((WIN32K_KPCR_VA + 0x188) as *const u64)
+    read_volatile((current_kpcr_va() + 0x188) as *const u64)
+}
+
+/// `KPCR.Self` is selected by this physical lane's GS base. The primary lane and every worker
+/// initialize this field before entering native win32k; reading it avoids a shared current-thread
+/// cell when two provider lanes execute in the same VSpace.
+#[inline]
+fn current_kpcr_va() -> u64 {
+    let base: u64;
+    unsafe {
+        core::arch::asm!("mov {}, gs:[0x18]", out(reg) base, options(nostack, preserves_flags));
+    }
+    assert!(WIN32K_PHYSICAL_KPCR_LAYOUT.ordinal(base).is_some());
+    base
 }
 
 unsafe fn current_w32process() -> u64 {
@@ -11563,277 +11615,6 @@ unsafe fn resolve_window_handle(hwnd: u64) -> u64 {
         .map_or(0, |entry| entry.object)
 }
 
-unsafe fn trace_getdc_window_context(hwnd: u64) {
-    let pwnd = resolve_window_handle(hwnd);
-    print_str(b"[w32req-getdc] hwnd=0x");
-    print_hex(hwnd as u32);
-    print_str(b" pwnd=0x");
-    print_win32k_hex64(pwnd);
-    if pwnd == 0 {
-        print_str(b"\n");
-        return;
-    }
-    let pti = read_volatile((pwnd + WND_HEAD_PTI_OFF) as *const u64);
-    let parent = read_volatile((pwnd + WND_SPWND_PARENT_OFF) as *const u64);
-    let child = read_volatile((pwnd + WND_SPWND_CHILD_OFF) as *const u64);
-    let next = read_volatile((pwnd + WND_SPWND_NEXT_OFF) as *const u64);
-    let prev = read_volatile((pwnd + WND_SPWND_PREV_OFF) as *const u64);
-    let style = read_volatile((pwnd + WND_STYLE_OFF) as *const u32);
-    let exstyle = read_volatile((pwnd + WND_EXSTYLE_OFF) as *const u32);
-    let pcls = read_volatile((pwnd + WND_PCLS_OFF) as *const u64);
-    let class_style = if pcls == 0 {
-        0
-    } else {
-        read_volatile((pcls + CLS_STYLE_OFF) as *const u32)
-    };
-    let class_dce = read_u64_field_if_present(pcls, CLS_PDCE_OFF);
-    print_str(b" pti=0x");
-    print_win32k_hex64(pti);
-    print_str(b" parent=0x");
-    print_win32k_hex64(parent);
-    print_str(b" child=0x");
-    print_win32k_hex64(child);
-    print_str(b" next=0x");
-    print_win32k_hex64(next);
-    print_str(b" prev=0x");
-    print_win32k_hex64(prev);
-    print_str(b" style=0x");
-    print_hex(style);
-    print_str(b" ex=0x");
-    print_hex(exstyle);
-    print_str(b" pcls=0x");
-    print_win32k_hex64(pcls);
-    print_str(b" cls-style=0x");
-    print_hex(class_style);
-    print_str(b" cls-dce=0x");
-    print_win32k_hex64(class_dce);
-    print_str(b"\n");
-}
-
-unsafe fn trace_oneparam_thread_context(param: u64, routine: u64) {
-    let pti = current_w32thread();
-    print_str(b"[w32req-oneparam] routine=0x");
-    print_hex(routine as u32);
-    print_str(b" param=0x");
-    print_win32k_hex64(param);
-    print_str(b" pti=0x");
-    print_win32k_hex64(pti);
-    if pti == 0 {
-        print_str(b"\n");
-        return;
-    }
-
-    let ppi = read_u64_field_if_present(pti, THREADINFO_PPI_OFF);
-    let mq = read_u64_field_if_present(pti, THREADINFO_MESSAGE_QUEUE_OFF);
-    let kl = read_u64_field_if_present(pti, THREADINFO_KEYBOARD_LAYOUT_OFF);
-    let pcti = read_u64_field_if_present(pti, 0x70);
-    let rpdesk = read_u64_field_if_present(pti, THREADINFO_RPDESK_OFF);
-    let pdeskinfo = read_u64_field_if_present(pti, THREADINFO_PDESKINFO_OFF);
-    let pci = read_u64_field_if_present(pti, THREADINFO_PCLIENTINFO_OFF);
-    let hkl = read_u64_field_if_present(kl, KL_HKL_OFF);
-    let pci_hkl = read_u64_field_if_present(pci, CLIENTINFO_HKL_OFF);
-    let pci_codepage = if pci == 0 {
-        0
-    } else {
-        read_volatile((pci + CLIENTINFO_CODEPAGE_OFF) as *const u16) as u64
-    };
-
-    print_str(b" ppi=0x");
-    print_win32k_hex64(ppi);
-    print_str(b" mq=0x");
-    print_win32k_hex64(mq);
-    print_str(b" kl=0x");
-    print_win32k_hex64(kl);
-    print_str(b" hkl=0x");
-    print_win32k_hex64(hkl);
-    print_str(b" pcti=0x");
-    print_win32k_hex64(pcti);
-    print_str(b" rpdesk=0x");
-    print_win32k_hex64(rpdesk);
-    print_str(b" pdeskinfo=0x");
-    print_win32k_hex64(pdeskinfo);
-    print_str(b" pci=0x");
-    print_win32k_hex64(pci);
-    print_str(b" pci-hkl=0x");
-    print_win32k_hex64(pci_hkl);
-    print_str(b" cp=");
-    print_u64(pci_codepage);
-    if routine == ONEPARAM_ROUTINE_GETKEYBOARDLAYOUT && param == 0 {
-        print_str(b" current-thread-hkl");
-    }
-    print_str(b"\n");
-}
-
-pub(crate) unsafe fn trace_win32k_request_context() {
-    let sh = WIN32K_SHARED_VADDR;
-    let ssn = read_volatile((sh + SH_REQ_SSN) as *const u64);
-    let a0 = read_volatile((sh + SH_REQ_A0) as *const u64);
-    let a1 = read_volatile((sh + SH_REQ_A1) as *const u64);
-    let a2 = read_volatile((sh + SH_REQ_A2) as *const u64);
-    let a3 = read_volatile((sh + SH_REQ_A3) as *const u64);
-    let pi = read_volatile((sh + SH_REQ_CLIENT_PI) as *const u64);
-    let tid = read_volatile((sh + SH_REQ_THREAD_ID) as *const u64);
-    let nested = read_volatile((sh + SH_REQ_NESTED_CALLBACK) as *const u64);
-    let caller_sp = read_volatile((sh + SH_REQ_CALLER_SP) as *const u64);
-    let nargs = read_volatile((sh + SH_REQ_NARGS) as *const u64);
-    let ppi = current_w32process();
-    let ppi_flags = read_u64_field_if_present(ppi, W32PROCESS_FLAGS_OFF) as u32;
-    let handler = if ssn >= WIN32K_SERVICE_BASE {
-        let base = read_volatile((sh + SH_SSDT_BASE) as *const u64);
-        let count = read_volatile((sh + SH_SSDT_COUNT) as *const u32) as u64;
-        let idx = ssn - WIN32K_SERVICE_BASE;
-        if base != 0 && (count == 0 || idx < count) {
-            read_volatile((base + idx * 8) as *const u64)
-        } else {
-            0
-        }
-    } else {
-        0
-    };
-    let provider_argc = registered_win32k_provider_argc(ssn).unwrap_or(u64::MAX);
-    print_str(b"[w32req] ssn=0x");
-    print_hex(ssn as u32);
-    print_str(b" pi=");
-    print_u64(pi);
-    print_str(b" tid=");
-    print_u64(tid);
-    print_str(b" nested=");
-    print_u64(nested);
-    print_str(b" a0=0x");
-    print_win32k_hex64(a0);
-    print_str(b" a1=0x");
-    print_win32k_hex64(a1);
-    print_str(b" a2=0x");
-    print_win32k_hex64(a2);
-    print_str(b" a3=0x");
-    print_win32k_hex64(a3);
-    print_str(b" caller-sp=0x");
-    print_win32k_hex64(caller_sp);
-    print_str(b" nargs=");
-    print_u64(nargs);
-    print_str(b" provider-argc=");
-    if provider_argc == u64::MAX {
-        print_str(b"?");
-    } else {
-        print_u64(provider_argc);
-    }
-    print_str(b" handler-rva=0x");
-    if handler >= WIN32K_CODE_VA {
-        print_hex(handler.wrapping_sub(WIN32K_CODE_VA) as u32);
-    } else {
-        print_hex(0);
-    }
-    print_str(b" ppi-flags=0x");
-    print_hex(ppi_flags);
-    print_str(if ppi_flags & W32PF_CREATEDWINORDC != 0 {
-        b" created-dc=1"
-    } else {
-        b" created-dc=0"
-    });
-    print_str(b"\n");
-    if ssn == SSN_NT_USER_GET_DC {
-        trace_getdc_window_context(a0);
-    } else if ssn == SSN_NT_USER_CALL_ONE_PARAM {
-        trace_oneparam_thread_context(a0, a1);
-    }
-}
-
-/// Wall-only context diagnostic for ReactOS win32k failures that depend on the current-thread object.
-/// `UserRefObjectCo` / `UserDerefObjectCo` use `PsGetCurrentThreadWin32Thread()->ReferencesList`;
-/// when that list is unexpectedly empty, the important state is which ETHREAD/THREADINFO win32k saw
-/// at the exact fault, not whichever client request the executive handles next.
-pub(crate) unsafe fn trace_win32k_wall_context() {
-    let n = WIN32K_WALL_CONTEXT_TRACES.fetch_add(1, Ordering::Relaxed);
-    if n >= 8 {
-        return;
-    }
-    let pi = WIN32K_CURRENT_CLIENT_PI.load(Ordering::Relaxed);
-    let pid = WIN32K_CURRENT_PROCESS_ID.load(Ordering::Relaxed);
-    let tid = WIN32K_CURRENT_THREAD_ID.load(Ordering::Relaxed);
-    let eprocess = current_eprocess();
-    let ethread = current_ethread();
-    let w32process = current_w32process();
-    let w32thread = current_w32thread();
-    let slot_process = read_volatile(SLOT_W32PROCESS as *const u64);
-    let slot_thread = read_volatile(SLOT_W32THREAD as *const u64);
-    let kpcr_teb = read_volatile((WIN32K_KPCR_VA + 0x30) as *const u64);
-    let kpcr_process = read_volatile((WIN32K_KPCR_VA + 0x60) as *const u64);
-    let kpcr_thread = read_volatile((WIN32K_KPCR_VA + 0x188) as *const u64);
-    let kthread_w32thread = read_u64_field_if_present(ethread, KTHREAD_WIN32THREAD_OFF);
-    let refs = read_u64_field_if_present(w32thread, 0x2f8);
-    let locks = if w32thread == 0 {
-        0
-    } else {
-        read_volatile((w32thread + 0x344) as *const u32) as u64
-    };
-    print_str(b"[w32ctx-wall] #");
-    print_u64(n);
-    print_str(b" current pi=");
-    print_u64(pi);
-    print_str(b" pid=");
-    print_u64(pid);
-    print_str(b" tid=");
-    print_u64(tid);
-    print_str(b" eprocess=0x");
-    print_win32k_hex64(eprocess);
-    print_str(b" ethread=0x");
-    print_win32k_hex64(ethread);
-    print_str(b" ppi=0x");
-    print_win32k_hex64(w32process);
-    print_str(b" pti=0x");
-    print_win32k_hex64(w32thread);
-    print_str(b"\n");
-    print_str(b"[w32ctx-wall] slots ppi=0x");
-    print_win32k_hex64(slot_process);
-    print_str(b" pti=0x");
-    print_win32k_hex64(slot_thread);
-    print_str(b" kpcr-teb=0x");
-    print_win32k_hex64(kpcr_teb);
-    print_str(b" kpcr-process=0x");
-    print_win32k_hex64(kpcr_process);
-    print_str(b" kpcr-thread=0x");
-    print_win32k_hex64(kpcr_thread);
-    print_str(b" kth-pti=0x");
-    print_win32k_hex64(kthread_w32thread);
-    print_str(b" refs=0x");
-    print_win32k_hex64(refs);
-    print_str(b" locks=");
-    print_u64(locks);
-    print_str(b"\n");
-
-    let mut printed = 0usize;
-    for index in 0..thread_ctx_len() {
-        let row_tid = thread_ctx_tid(index);
-        if row_tid == 0 || thread_ctx_pi(index) != pi {
-            continue;
-        }
-        let row_pid = thread_ctx_pid(index);
-        let row_ethread = thread_ctx_ethread(index);
-        let row_w32thread = thread_ctx_w32thread(index);
-        let row_refs = read_u64_field_if_present(row_w32thread, 0x2f8);
-        let row_kthread_w32thread = read_u64_field_if_present(row_ethread, KTHREAD_WIN32THREAD_OFF);
-        print_str(b"[w32ctx-wall] table idx=");
-        print_u64(index as u64);
-        print_str(b" pid=");
-        print_u64(row_pid);
-        print_str(b" tid=");
-        print_u64(row_tid);
-        print_str(b" ethread=0x");
-        print_win32k_hex64(row_ethread);
-        print_str(b" pti=0x");
-        print_win32k_hex64(row_w32thread);
-        print_str(b" kth-pti=0x");
-        print_win32k_hex64(row_kthread_w32thread);
-        print_str(b" refs=0x");
-        print_win32k_hex64(row_refs);
-        print_str(b"\n");
-        printed += 1;
-        if printed >= 12 {
-            break;
-        }
-    }
-}
-
 unsafe fn eprocess_for_pid(process_id: u64) -> u64 {
     if process_id == 0 {
         return current_eprocess();
@@ -12013,26 +11794,6 @@ unsafe fn restore_user_callback_execution_context(
     )
 }
 
-pub(crate) unsafe fn restore_current_context_for_user_callback_resume(
-    pi: u32,
-    pid: u64,
-    tid: u64,
-    client_teb: u64,
-    supplied_eprocess: u64,
-    supplied_ethread: u64,
-) -> bool {
-    restore_current_context_for_user_callback_resume_inner(
-        pi,
-        pid,
-        tid,
-        client_teb,
-        supplied_eprocess,
-        supplied_ethread,
-        true,
-        true,
-    )
-}
-
 unsafe fn restore_current_context_for_user_callback_resume_inner(
     pi: u32,
     pid: u64,
@@ -12140,21 +11901,21 @@ unsafe fn restore_current_context_for_user_callback_resume_inner(
         return false;
     }
 
-    WIN32K_CURRENT_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
-    WIN32K_CURRENT_PROCESS_ID.store(pid, Ordering::Relaxed);
-    WIN32K_CURRENT_THREAD_ID.store(tid, Ordering::Relaxed);
+    current_lane_ids().client_pi.store(pi as u64, Ordering::Relaxed);
+    current_lane_ids().process_id.store(pid, Ordering::Relaxed);
+    current_lane_ids().thread_id.store(tid, Ordering::Relaxed);
     prepare_ethread_for_win32k_callout(thread_index, teb);
-    write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, teb);
+    write_volatile((current_kpcr_va() + 0x30) as *mut u64, teb);
     write_volatile(
-        (WIN32K_KPCR_VA + 0x60) as *mut u64,
+        (current_kpcr_va() + 0x60) as *mut u64,
         process_attach::selected_process(ethread, eprocess),
     );
-    write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, ethread);
+    write_volatile((current_kpcr_va() + 0x188) as *mut u64, ethread);
     write_volatile(
-        SLOT_W32PROCESS as *mut u64,
+        current_w32process_slot() as *mut u64,
         process_attach::selected_win32process(ethread, eprocess, w32process),
     );
-    write_volatile(SLOT_W32THREAD as *mut u64, w32thread);
+    write_volatile(current_w32thread_slot() as *mut u64, w32thread);
     write_volatile((ethread + KTHREAD_WIN32THREAD_OFF) as *mut u64, w32thread);
     write_volatile(w32thread as *mut u64, ethread);
     sync_threadinfo_process(w32thread);
@@ -12330,16 +12091,16 @@ unsafe fn select_win32k_client_context(
         ensure_thread_context(pi, pid, tid, generation, client_teb, supplied_ethread)?;
     let eprocess = process_ctx_eprocess(process_index);
     let ethread = thread_ctx_ethread(thread_index);
-    WIN32K_CURRENT_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
-    WIN32K_CURRENT_PROCESS_ID.store(pid, Ordering::Relaxed);
-    WIN32K_CURRENT_THREAD_ID.store(tid, Ordering::Relaxed);
+    current_lane_ids().client_pi.store(pi as u64, Ordering::Relaxed);
+    current_lane_ids().process_id.store(pid, Ordering::Relaxed);
+    current_lane_ids().thread_id.store(tid, Ordering::Relaxed);
     write_volatile(
-        (WIN32K_KPCR_VA + 0x60) as *mut u64,
+        (current_kpcr_va() + 0x60) as *mut u64,
         process_attach::selected_process(ethread, eprocess),
     );
-    write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, ethread);
+    write_volatile((current_kpcr_va() + 0x188) as *mut u64, ethread);
     write_volatile(
-        SLOT_W32PROCESS as *mut u64,
+        current_w32process_slot() as *mut u64,
         process_attach::selected_win32process(
             ethread,
             eprocess,
@@ -12347,7 +12108,7 @@ unsafe fn select_win32k_client_context(
         ),
     );
     write_volatile(
-        SLOT_W32THREAD as *mut u64,
+        current_w32thread_slot() as *mut u64,
         thread_ctx_w32thread(thread_index),
     );
     publish_selected_context(process_index, thread_index);
@@ -12376,14 +12137,14 @@ unsafe fn ensure_win32k_process_attached(process_index: usize) -> bool {
                 (WIN32K_SHARED_VADDR + SH_VERDICT) as *mut u32,
                 verdict | V_CALLOUT_RETURNED,
             );
-            let slot_value = read_volatile(SLOT_W32PROCESS as *const u64);
+            let slot_value = read_volatile(current_w32process_slot() as *const u64);
             if slot_value != 0 {
                 set_process_ctx_w32process(process_index, slot_value);
             } else if process != 0 {
                 let field = read_volatile((process + EPROCESS_WIN32PROCESS_OFF) as *const u64);
                 if field != 0 {
                     set_process_ctx_w32process(process_index, field);
-                    write_volatile(SLOT_W32PROCESS as *mut u64, field);
+                    write_volatile(current_w32process_slot() as *mut u64, field);
                 }
             }
             if let Some(thread_index) = current_thread_context_index() {
@@ -12415,7 +12176,7 @@ unsafe fn ensure_win32k_process_attached(process_index: usize) -> bool {
         return false;
     }
     write_volatile(
-        SLOT_W32PROCESS as *mut u64,
+        current_w32process_slot() as *mut u64,
         process_ctx_w32process(process_index),
     );
     link_processinfo_to_eprocess(process_index);
@@ -12477,8 +12238,8 @@ unsafe fn ensure_win32k_threadinfo(thread_index: usize, client_teb: u64) -> bool
             return false;
         };
         prepare_ethread_for_win32k_callout(thread_index, teb);
-        write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, teb);
-        write_volatile(SLOT_W32THREAD as *mut u64, 0);
+        write_volatile((current_kpcr_va() + 0x30) as *mut u64, teb);
+        write_volatile(current_w32thread_slot() as *mut u64, 0);
 
         let callout = read_volatile((WIN32_CALLOUTS + 8) as *const u64);
         if callout != 0 {
@@ -12487,14 +12248,14 @@ unsafe fn ensure_win32k_threadinfo(thread_index: usize, client_teb: u64) -> bool
                 callout,
                 &[ethread, PS_W32_THREAD_CALLOUT_INITIALIZE],
             ) as i32;
-            let slot_value = read_volatile(SLOT_W32THREAD as *const u64);
+            let slot_value = read_volatile(current_w32thread_slot() as *const u64);
             if slot_value != 0 {
                 set_thread_ctx_w32thread(thread_index, slot_value);
             } else {
                 let field = read_volatile((ethread + KTHREAD_WIN32THREAD_OFF) as *const u64);
                 if field != 0 {
                     set_thread_ctx_w32thread(thread_index, field);
-                    write_volatile(SLOT_W32THREAD as *mut u64, field);
+                    write_volatile(current_w32thread_slot() as *mut u64, field);
                 }
             }
             if let Some(process_index) = current_process_context_index() {
@@ -12529,7 +12290,7 @@ unsafe fn ensure_win32k_threadinfo(thread_index: usize, client_teb: u64) -> bool
         return false;
     }
     let thread = thread_ctx_w32thread(thread_index);
-    write_volatile(SLOT_W32THREAD as *mut u64, thread);
+    write_volatile(current_w32thread_slot() as *mut u64, thread);
     init_threadinfo_placeholder(thread);
     let ethread = thread_ctx_ethread(thread_index);
     if ethread != 0 {
@@ -16579,6 +16340,7 @@ pub(crate) unsafe fn pool_alloc_export(size: u64) -> u64 {
 #[no_mangle]
 #[link_section = ".text.win32k_subsystem_entry"]
 pub unsafe extern "C" fn win32k_subsystem_entry(heap_frames: u64) -> ! {
+    write_volatile((WIN32K_KPCR_VA + 0x18) as *mut u64, WIN32K_KPCR_VA);
     if !unsafe { allocator::initialize_reserved_heap(heap_frames) } {
         park();
     }
@@ -16664,6 +16426,10 @@ pub unsafe extern "C" fn win32k_subsystem_entry(heap_frames: u64) -> ! {
 #[no_mangle]
 #[link_section = ".text.win32k_dispatch_lane_entry"]
 pub unsafe extern "C" fn win32k_dispatch_lane_entry(lane_ordinal: u64) -> ! {
+    let Some(kpcr_va) = WIN32K_PHYSICAL_KPCR_LAYOUT.address(lane_ordinal as usize) else {
+        park();
+    };
+    write_volatile((kpcr_va + 0x18) as *mut u64, kpcr_va);
     let drv = WIN32K_DRIVER_OBJECT.load(Ordering::Acquire);
     if drv == 0 {
         print_str(b"[win32k-host] ERROR: secondary lane started before DriverEntry completed\n");
@@ -16822,31 +16588,31 @@ unsafe fn select_existing_ps_provider_context(
     };
 
     // Publish the entire selection only after validating every requested thread field.
-    WIN32K_CURRENT_CLIENT_PI.store(pi, Ordering::Relaxed);
-    WIN32K_CURRENT_PROCESS_ID.store(pid, Ordering::Relaxed);
-    WIN32K_CURRENT_THREAD_ID.store(tid, Ordering::Relaxed);
+    current_lane_ids().client_pi.store(pi, Ordering::Relaxed);
+    current_lane_ids().process_id.store(pid, Ordering::Relaxed);
+    current_lane_ids().thread_id.store(tid, Ordering::Relaxed);
     write_volatile(
-        (WIN32K_KPCR_VA + 0x60) as *mut u64,
+        (current_kpcr_va() + 0x60) as *mut u64,
         process_attach::selected_process(supplied_ethread, supplied_eprocess),
     );
     write_volatile(
-        SLOT_W32PROCESS as *mut u64,
+        current_w32process_slot() as *mut u64,
         process_attach::selected_win32process(
             supplied_ethread,
             supplied_eprocess,
             process_ctx_w32process(process_index),
         ),
     );
-    write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, selected_teb);
-    write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, supplied_ethread);
+    write_volatile((current_kpcr_va() + 0x30) as *mut u64, selected_teb);
+    write_volatile((current_kpcr_va() + 0x188) as *mut u64, supplied_ethread);
     if let Some(thread_index) = thread_index {
         write_volatile(
-            SLOT_W32THREAD as *mut u64,
+            current_w32thread_slot() as *mut u64,
             thread_ctx_w32thread(thread_index),
         );
         publish_selected_context(process_index, thread_index);
     } else {
-        write_volatile(SLOT_W32THREAD as *mut u64, 0);
+        write_volatile(current_w32thread_slot() as *mut u64, 0);
         write_volatile((sh + SH_CTX_PROCESS_ID) as *mut u64, pid);
         write_volatile((sh + SH_CTX_THREAD_ID) as *mut u64, tid);
         write_volatile((sh + SH_CTX_EPROCESS) as *mut u64, supplied_eprocess);
@@ -16958,7 +16724,7 @@ unsafe fn dispatch_ps_provider_command(command: u64, expected: u64, flags: u64) 
             }
             if thread_ctx_w32thread(thread_index) != 0
                 || read_volatile((ethread + KTHREAD_WIN32THREAD_OFF) as *const u64) != 0
-                || read_volatile(SLOT_W32THREAD as *const u64) != 0
+                || read_volatile(current_w32thread_slot() as *const u64) != 0
             {
                 return STATUS_UNSUCCESSFUL;
             }
@@ -16990,7 +16756,7 @@ unsafe fn dispatch_ps_provider_command(command: u64, expected: u64, flags: u64) 
             }
             if process_ctx_w32process(process_index) != 0
                 || read_volatile((eprocess + EPROCESS_WIN32PROCESS_OFF) as *const u64) != 0
-                || read_volatile(SLOT_W32PROCESS as *const u64) != 0
+                || read_volatile(current_w32process_slot() as *const u64) != 0
             {
                 return STATUS_UNSUCCESSFUL;
             }
@@ -17223,9 +16989,9 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     let teb_context = if ssn == SSN_GDI_BATCH_FLUSH_CALLOUT || ssn == 0x122f || ssn == 0x122d {
         client_teb
     } else {
-        WIN32K_KPCR_VA
+        current_kpcr_va()
     };
-    write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, teb_context);
+    write_volatile((current_kpcr_va() + 0x30) as *mut u64, teb_context);
     let t = current_w32thread();
     sync_threadinfo_process(t);
     // ★ Publish the dispatch THREADINFO into the CURRENT-THREAD OBJECT (`Thread->Tcb.Win32Thread`).
@@ -17261,9 +17027,9 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
                 let _kernel_mode = thread_execution::PreviousModeScope::enter(
                     nt_kernel_abi::ps_reactos_x64::ThreadPreviousMode::KernelMode,
                 );
-                write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, client_teb);
+                write_volatile((current_kpcr_va() + 0x30) as *mut u64, client_teb);
                 let status = dispatch_gdi_batch_flush_callout(client_pi, client_teb);
-                write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, teb_context);
+                write_volatile((current_kpcr_va() + 0x30) as *mut u64, teb_context);
                 status
             };
             if status != 0 {
@@ -18120,7 +17886,7 @@ unsafe fn observe_gdi_handle_return(ssn: u64, handle: u64) {
     let user_data = read_volatile((entry + GDI_ENTRY_USER_DATA_OFF) as *const u64);
     let handle_type = (handle as u32) & GDI_HANDLE_TYPE_MASK;
     let gdi32_entry_type = entry_type.wrapping_shl(GDI_ENTRY_UPPER_SHIFT) & GDI_HANDLE_TYPE_MASK;
-    let current_pid = WIN32K_CURRENT_PROCESS_ID.load(Ordering::Relaxed) as u32;
+    let current_pid = current_lane_ids().process_id.load(Ordering::Relaxed) as u32;
     let owner_pid = entry_pid & !1;
     let type_ok = handle_type == expected_type
         && gdi32_entry_type == expected_type
@@ -18301,14 +18067,14 @@ unsafe fn select_initial_system_context() -> bool {
     if pid == 0 || tid == 0 || system.process_body == 0 || system.thread_body == 0 {
         return false;
     }
-    WIN32K_CURRENT_CLIENT_PI.store(MAX_PI as u64, Ordering::Relaxed);
-    WIN32K_CURRENT_PROCESS_ID.store(pid, Ordering::Relaxed);
-    WIN32K_CURRENT_THREAD_ID.store(tid, Ordering::Relaxed);
-    write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, WIN32K_KPCR_VA);
-    write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, system.process_body);
-    write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, system.thread_body);
-    write_volatile(SLOT_W32PROCESS as *mut u64, 0);
-    write_volatile(SLOT_W32THREAD as *mut u64, 0);
+    current_lane_ids().client_pi.store(MAX_PI as u64, Ordering::Relaxed);
+    current_lane_ids().process_id.store(pid, Ordering::Relaxed);
+    current_lane_ids().thread_id.store(tid, Ordering::Relaxed);
+    write_volatile((current_kpcr_va() + 0x30) as *mut u64, current_kpcr_va());
+    write_volatile((current_kpcr_va() + 0x60) as *mut u64, system.process_body);
+    write_volatile((current_kpcr_va() + 0x188) as *mut u64, system.thread_body);
+    write_volatile(current_w32process_slot() as *mut u64, 0);
+    write_volatile(current_w32thread_slot() as *mut u64, 0);
     for offset in [
         SH_CTX_PROCESS_ID, SH_CTX_THREAD_ID, SH_CTX_EPROCESS, SH_CTX_ETHREAD,
         SH_CTX_W32PROCESS, SH_CTX_W32THREAD,
@@ -18423,7 +18189,7 @@ unsafe fn sync_threadinfo_process(w32thread: u64) {
     if w32thread == 0 {
         return;
     }
-    let ppi = read_volatile(SLOT_W32PROCESS as *const u64);
+    let ppi = read_volatile(current_w32process_slot() as *const u64);
     if ppi == 0 {
         return;
     }

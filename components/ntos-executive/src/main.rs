@@ -2949,7 +2949,6 @@ unsafe fn watchdog_report(messages: u64) {
         print_str(b" entered-at-ms=");
         print_u64(W32_PREV_T.load(Ordering::Relaxed) / 10_000);
         print_str(b"\n");
-        win32k_subsystem::trace_win32k_request_context();
         win32k_glue::win32k_dispatch_backtrace();
     }
     let now = nt_time_snapshot();

@@ -61,6 +61,7 @@ pub mod user_class;
 pub mod user_cursor;
 pub mod user_string;
 pub mod uuid_v1;
+pub mod win32k_lane_context;
 mod work_item;
 pub mod x86_io;
 pub mod x86_cr8;

@@ -97,9 +97,12 @@ impl ProviderWaitContext {
             Self::Hosted(context) => restore_user_callback_request_context(context),
             Self::Kernel { activation, owner } => {
                 // Nested dispatch guards retire their own activation before returning here.
-                // Validate the original stack-local owner; never republish a shared descriptor.
-                active_provider_stack_event_activation() == Some(activation)
-                    && current_provider_wait_owner() == Some(owner)
+                // Validate the original stack-local owner before restoring this lane's
+                // kernel caller; never republish a shared descriptor.
+                let activation_is_current =
+                    active_provider_stack_event_activation() == Some(activation);
+                let owner_is_current = current_provider_wait_owner() == Some(owner);
+                activation_is_current && owner_is_current && select_initial_system_context()
             }
         }
     }

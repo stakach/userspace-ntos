@@ -78,9 +78,9 @@ unsafe fn publish_process(thread: u64, current: u64, index: u8) {
         (thread + nt_kernel_abi::ps_reactos_x64::KTHREAD_APC_STATE_INDEX as u64) as *mut u8,
         index,
     );
-    write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, current);
+    write_volatile((current_kpcr_va() + 0x60) as *mut u64, current);
     write_volatile(
-        SLOT_W32PROCESS as *mut u64,
+        current_w32process_slot() as *mut u64,
         read_volatile((current + EPROCESS_WIN32PROCESS_OFF) as *const u64),
     );
 }
