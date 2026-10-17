@@ -426,3 +426,54 @@ fn checked_wire_rejects_unbound_owner_and_token_before_submission() {
     wrong.tcb = 0;
     assert_eq!(captured.checked_wire(wrong, (7,9)), Err(STATUS_INVALID_PARAMETER));
 }
+
+#[test]
+fn terminal_redrive_precedes_pending_listeners_after_ordered_admission() {
+    use crate::redrive_selection::{select_redrive_owner, RedriveOwner, RedrivePhase};
+    let mut owners = [
+        RedriveOwner { phase: RedrivePhase::Ready, submitted_once: true, token_sequence: 1 },
+        RedriveOwner { phase: RedrivePhase::AckReady, submitted_once: true, token_sequence: 2 },
+        RedriveOwner { phase: RedrivePhase::Ready, submitted_once: false, token_sequence: 3 },
+        RedriveOwner { phase: RedrivePhase::Ready, submitted_once: false, token_sequence: 4 },
+        RedriveOwner { phase: RedrivePhase::Submitted(88), submitted_once: true, token_sequence: 5 },
+    ];
+    let select = |active, cursor, entries: &[RedriveOwner]| {
+        select_redrive_owner(entries.len(), active, cursor, |index| entries[index])
+    };
+    assert_eq!(select(Some(88), 0, &owners), Some(4),
+        "the active ring request owns the next service step");
+    assert_eq!(select(None, 0, &owners), Some(2),
+        "new tokens must be admitted in order before a later terminal ACK");
+    owners[2].submitted_once = true;
+    assert_eq!(select(None, 0, &owners), Some(3));
+    owners[3].submitted_once = true;
+    assert_eq!(select(None, 0, &owners), Some(1),
+        "a completed owner must ACK before idle listeners can consume the finite drain");
+    owners[1].phase = RedrivePhase::ReplyReady;
+    assert_eq!(select(None, 0, &owners), Some(1),
+        "an ACKed owner must deliver its retained Reply before pending listeners");
+}
+
+#[test]
+fn checked_reply_and_receive_inspects_retained_component_reply_once_after_exact_service() {
+    use crate::reply_commit::ReplyCommitGate;
+
+    let mut rejected = ReplyCommitGate::new(nt_alpc_abi::send_flag::REPLY_MESSAGE, (12, 44));
+    assert_eq!(rejected.service_exact(STATUS_INVALID_PARAMETER as i32), None,
+        "a rejected send cannot wake a retained LPC requester");
+    let mut reply = ReplyCommitGate::new(nt_alpc_abi::send_flag::REPLY_MESSAGE, (12, 45));
+    assert_eq!(reply.service_exact(0x103), Some((12, 45)),
+        "PENDING means the ALPC reply send committed before its receive half parked");
+    assert_eq!(reply.service_exact(0x103), None,
+        "checked redrive must not inspect or release the retained reply twice");
+
+    let mut completed = ReplyCommitGate::new(nt_alpc_abi::send_flag::REPLY_MESSAGE, (12, 46));
+    assert_eq!(completed.service_exact(0), None,
+        "a terminal service record needs its exact ACK before notifying the requester");
+    assert_eq!(completed.ack_exact(0), Some((12, 46)));
+    assert_eq!(completed.ack_exact(0), None);
+
+    let mut receive_only = ReplyCommitGate::new(0, (12, 47));
+    assert_eq!(receive_only.service_exact(0x103), None,
+        "a receive-only listener has not published a reply");
+}

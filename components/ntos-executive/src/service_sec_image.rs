@@ -1318,6 +1318,9 @@ unsafe fn lpc_wait_begin_after_stack_admission(
                 // syscall. Publish the same progress signal so the common drain wakes a parked LPC
                 // server receiver before the executive blocks again.
                 nt_handler.lpc_endpoint_progress = true;
+                let alpc_reply_committed =
+                    crate::native_alpc_send_receive_work::redrive_after_lpc_publish(nt_handler);
+                nt_handler.lpc_reply_published |= alpc_reply_committed;
                 return true;
             }
             if let Some(client) = lpc_client() {
@@ -9441,12 +9444,14 @@ pub(crate) unsafe fn service_sec_image(
         // CM retries run only between hosted events, never inside a timer callback or nested pump.
         crate::cm_key_ownership::retry_cleanup(monotonic_time_100ns());
         crate::cm_snapshot_ownership::retry_cleanup(monotonic_time_100ns());
+        let alpc_reply_committed;
         {
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             crate::native_alpc_create_work::redrive(&mut nt_handler);
             crate::native_alpc_close_work::redrive(&mut nt_handler);
             crate::native_alpc_connect_accept_work::redrive(&mut nt_handler);
-            crate::native_alpc_send_receive_work::redrive(&mut nt_handler);
+            alpc_reply_committed =
+                crate::native_alpc_send_receive_work::redrive(&mut nt_handler);
             crate::registry_mutation_work::redrive(&mut nt_handler, delay_queue);
             crate::section_metadata_work::redrive(&mut nt_handler, delay_queue);
             crate::section_pagein_work::redrive(&mut nt_handler);
@@ -9476,6 +9481,9 @@ pub(crate) unsafe fn service_sec_image(
             crate::object_wait_reply::redrive(&mut nt_handler);
             crate::object_wait_reply::redrive_terminated_runtimes(&mut nt_handler, delay_queue);
             inline_file_retirement::redrive(&mut nt_handler);
+        }
+        if alpc_reply_committed.is_some() {
+            let _ = lpc_component_reply_commit_drain(&mut nt_handler);
         }
         if crate::writable_fs::registry_journal::owns_volume()
             && badge != DELAY_TIMER_BADGE
@@ -12812,9 +12820,12 @@ pub(crate) unsafe fn service_sec_image(
                         Err(status) => result = status as u64,
                         Ok(()) => {
                             thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
-                            {
+                            let alpc_reply_committed = {
                                 let _message = crate::ipc_message::SavedMessageBuffer::capture();
-                                crate::native_alpc_send_receive_work::redrive(&mut nt_handler);
+                                crate::native_alpc_send_receive_work::redrive(&mut nt_handler)
+                            };
+                            if alpc_reply_committed.is_some() {
+                                let _ = lpc_component_reply_commit_drain(&mut nt_handler);
                             }
                             let _ = finalize_service_loop_state(&mut nt_handler);
                             let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);

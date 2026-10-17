@@ -6,6 +6,8 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use nt_alpc_native_later::{NativeCaller, ReceiveTarget, RetainedLater, TerminalLater};
+use nt_alpc_native_later::redrive_selection::{select_redrive_owner, RedriveOwner, RedrivePhase};
+use nt_alpc_native_later::reply_commit::ReplyCommitGate;
 
 use crate::root_reply_park::RootReplyPark;
 use crate::*;
@@ -45,6 +47,7 @@ struct OwnedReceive {
     reply_status: i32,
     copyout_done: bool,
     submitted_once: bool,
+    reply_commit: ReplyCommitGate,
 }
 
 impl OwnedReceive {
@@ -149,6 +152,7 @@ pub(crate) unsafe fn begin(handler: &mut ExecNtHandler, args: [u64; 8]) -> Resul
     let sequence = NEXT_INVOCATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
         |next| next.checked_add(1)).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
     let token = (generation, sequence);
+    let reply_commit = ReplyCommitGate::new(captured.flags, token);
     let (request, target) = captured.into_checked_wire_and_receive(caller, token)?;
     if request.len() > REP_DATA_LEN { return Err(STATUS_NOT_SUPPORTED); }
     let owners = &mut *core::ptr::addr_of_mut!(OWNERS);
@@ -175,7 +179,7 @@ pub(crate) unsafe fn begin(handler: &mut ExecNtHandler, args: [u64; 8]) -> Resul
     };
     owners.push(OwnedReceive { pi, target, retained, output, ack,
         flight: Flight::Ready, reply_status: 0, copyout_done: false,
-        submitted_once: false });
+        submitted_once: false, reply_commit });
     park.commit();
     Ok(())
 }
@@ -191,20 +195,20 @@ enum RingStep {
 }
 
 fn selected_owner(owners: &[OwnedReceive], active: Option<u64>, cursor: usize) -> Option<usize> {
-    if let Some(request_id) = active {
-        return owners.iter().position(|owner| matches!(owner.flight,
-            Flight::Submitted(id) | Flight::AckSubmitted(id) if id == request_id));
-    }
-    if owners.is_empty() { return None; }
-    // A later terminal ACK advances the service's retired-token watermark.
-    // Admit newly issued tokens in sequence before allowing such an ACK.
-    if let Some((index, _)) = owners.iter().enumerate()
-        .filter(|(_, owner)| !owner.submitted_once && matches!(owner.flight, Flight::Ready))
-        .min_by_key(|(_, owner)| owner.retained.token().1)
-    { return Some(index); }
-    (0..owners.len()).map(|offset| (cursor + offset) % owners.len())
-        .find(|index| !matches!(owners[*index].flight,
-            Flight::InvalidTerminal))
+    select_redrive_owner(owners.len(), active, cursor, |index| {
+        let owner = &owners[index];
+        let phase = match owner.flight {
+            Flight::Ready => RedrivePhase::Ready,
+            Flight::Submitted(id) => RedrivePhase::Submitted(id),
+            Flight::AckReady => RedrivePhase::AckReady,
+            Flight::AckSubmitted(id) => RedrivePhase::AckSubmitted(id),
+            Flight::ReplyReady => RedrivePhase::ReplyReady,
+            Flight::ReplyIndeterminate => RedrivePhase::ReplyIndeterminate,
+            Flight::InvalidTerminal => RedrivePhase::InvalidTerminal,
+        };
+        RedriveOwner { phase, submitted_once: owner.submitted_once,
+            token_sequence: owner.retained.token().1 }
+    })
 }
 
 unsafe fn retire(owner: OwnedReceive, handler: &mut ExecNtHandler) {
@@ -218,15 +222,15 @@ unsafe fn retire(owner: OwnedReceive, handler: &mut ExecNtHandler) {
 
 /// Advance one exact CQE or SQE per service-loop pass. The service terminal
 /// record is ACKed before user memory copyout or the one physical Reply attempt.
-pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
+pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) -> Option<(u64, u64)> {
     let owners = &mut *core::ptr::addr_of_mut!(OWNERS);
-    if owners.is_empty() { return; }
+    if owners.is_empty() { return None; }
     let active = match lpc_client() {
         Some(client) => client.backend_mut().0.completion_inbox.active_request(),
-        None => return,
+        None => return None,
     };
     let cursor = *core::ptr::addr_of!(NEXT_OWNER);
-    let Some(index) = selected_owner(owners, active, cursor) else { return };
+    let Some(index) = selected_owner(owners, active, cursor) else { return None };
     *core::ptr::addr_of_mut!(NEXT_OWNER) = cursor.wrapping_add(1);
     let mut owner = owners.swap_remove(index);
     if matches!(owner.flight, Flight::ReplyIndeterminate) {
@@ -234,10 +238,11 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
         if spawn_hosts::shared_ingress::owner::runtime::owns_hosted_reply(cap)
             && matches!(spawn_hosts::shared_ingress::owner::runtime::finish_acknowledged_hosted_reply(cap), Ok(true))
         { retire(owner, handler); } else { owners.push(owner); }
-        return;
+        return None;
     }
+    let mut reply_committed = None;
     let step = {
-        let Some(client) = lpc_client() else { owners.push(owner); return };
+        let Some(client) = lpc_client() else { owners.push(owner); return None };
         let channel = &mut client.backend_mut().0;
         match owner.flight {
             Flight::Ready => {
@@ -295,6 +300,7 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
             let caller = owner.caller();
             if status == STATUS_PENDING {
                 owner.flight = if owner.retained.continue_pending(request_id, caller).is_ok() {
+                    reply_committed = owner.reply_commit.service_exact(status);
                     Flight::Ready
                 } else { Flight::InvalidTerminal };
             } else if let Ok(info) = u32::try_from(info) {
@@ -305,13 +311,17 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
                     output.truncate(info as usize);
                     owner.flight = if owner.retained.complete(request_id, caller,
                         TerminalLater::service(status, info, detail0, detail1, output)).is_ok()
-                    { Flight::AckReady } else { Flight::InvalidTerminal };
+                    {
+                        reply_committed = owner.reply_commit.service_exact(status);
+                        Flight::AckReady
+                    } else { Flight::InvalidTerminal };
                     owner.reply_status = status;
                 }
             } else { owner.flight = Flight::InvalidTerminal; }
         }
         RingStep::Uncertain(request_id) => owner.flight = Flight::Submitted(request_id),
         RingStep::AckExact(status) => {
+            reply_committed = owner.reply_commit.ack_exact(status);
             owner.flight = if status == 0 { Flight::ReplyReady } else { Flight::InvalidTerminal };
         }
         RingStep::AckUncertain(request_id) => owner.flight = Flight::AckSubmitted(request_id),
@@ -326,10 +336,24 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
                 if reply_parked_syscall(cap, owner.reply_status as u64)
                     || (spawn_hosts::shared_ingress::owner::runtime::owns_hosted_reply(cap)
                         && matches!(spawn_hosts::shared_ingress::owner::runtime::finish_acknowledged_hosted_reply(cap), Ok(true)))
-                { retire(owner, handler); return; }
+                { retire(owner, handler); return reply_committed; }
                 owner.flight = Flight::ReplyIndeterminate;
             }
         }
     }
     owners.push(owner);
+    reply_committed
+}
+
+/// A retained kernel LPC request can publish into the same PortCore inbox as a parked native
+/// ALPC listener. Visit each owned receive through its existing exact ring/ACK state machine
+/// before the executive blocks on a fresh ingress. Two passes allow a ready receive and its
+/// terminal ACK to complete without waiting for an unrelated syscall or timer tick.
+pub(crate) unsafe fn redrive_after_lpc_publish(handler: &mut ExecNtHandler) -> bool {
+    let count = (&*core::ptr::addr_of!(OWNERS)).len().min(MAX_OWNERS);
+    let mut reply_committed = false;
+    for _ in 0..count.saturating_mul(2) {
+        reply_committed |= redrive(handler).is_some();
+    }
+    reply_committed
 }

@@ -7,6 +7,9 @@
 #![no_std]
 extern crate alloc;
 
+pub mod redrive_selection;
+pub mod reply_commit;
+
 use alloc::vec::Vec;
 use core::mem::size_of;
 use nt_alpc_abi::{

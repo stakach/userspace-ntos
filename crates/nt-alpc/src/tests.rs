@@ -2083,6 +2083,45 @@ fn bridge_lpc_client_to_alpc_host() {
     );
 }
 
+#[test]
+fn retained_kernel_lpc_request_wakes_pending_checked_alpc_listener() {
+    let mut lpc = Server::new();
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId { process: 60, thread: 84 };
+    let requester = nt_port_core::ClientId { process: 76, thread: 80 };
+    let name = utf16("\\Windows\\ApiPort");
+    let created = alpc.dispatch(lpc.core_mut(), aop::ALPC_OP_CREATE_PORT,
+        &enc_owned_create_port(&name, owner, (9, 1), nt_alpc_abi::AlpcPortAttributes {
+            flags: port_flag::ALLOW_LPC_REQUESTS | port_flag::ALLOW_IMPERSONATION,
+            max_message_length: 512,
+            ..Default::default()
+        }), &mut []);
+    assert_eq!(created.status, SUCCESS);
+    let listen = created.detail0;
+    let receive = enc_checked_receive(listen, owner, (9, 2));
+    let mut output = [0u8; 512];
+    assert_eq!(alpc.dispatch(lpc.core_mut(), aop::ALPC_OP_SEND_RECEIVE,
+        &receive, &mut output).status, nt_status::NtStatus::PENDING.0);
+
+    let request = port_message(0, b"create-system-thread");
+    let message_id = {
+        let mut client = LpcClient::new(LpcDirect { server: &mut lpc, out: [0; 512] });
+        let retained = client.retain_port_object(listen).unwrap();
+        let pending = client.begin_retained_request_wait_reply(retained, &request,
+            requester.process, requester.thread).unwrap();
+        assert!(matches!(pending, nt_lpc_client::BeginRequestWaitReply::Pending { .. }));
+        pending.message_id()
+    };
+    let delivered = alpc.dispatch(lpc.core_mut(), aop::ALPC_OP_SEND_RECEIVE,
+        &receive, &mut output);
+    assert_eq!(delivered.status, SUCCESS,
+        "the checked ALPC listener must consume the kernel-retained LPC request");
+    assert_eq!(delivered.detail1, u64::from(msg_type::REQUEST));
+    let body = &output[..delivered.information as usize];
+    assert_eq!(&body[40..], b"create-system-thread");
+    assert_eq!(u32::from_le_bytes(body[24..28].try_into().unwrap()), message_id);
+}
+
 /// Direction 2: an ALPC client connects to a classic-LPC host, over one shared
 /// core, with a message each way.
 #[test]
