@@ -34,6 +34,10 @@ fn switch_desktop_dispatch_uses_threadinfo_teb_without_changing_name_capture() {
     assert_eq!(purpose_for_win32k_syscall(0x122d, 0), DispatchTebPurpose::UserObjectName,
         "desktop object names still need the client TEB");
     assert_eq!(purpose_for_win32k_syscall(0x1002, 0x22), DispatchTebPurpose::ThreadInfo);
-    assert_eq!(purpose_for_win32k_syscall(0x1002, 0x21), DispatchTebPurpose::Compatibility,
-        "only the proven system-thread routine selects the callout TEB");
+    let cursor_create_purpose = purpose_for_win32k_syscall(0x1002, 0x21);
+    assert_eq!(cursor_create_purpose, DispatchTebPurpose::ThreadInfo,
+        "LiberNT CreateEmptyCurObject calls GetW32ThreadInfo, which asserts the TEB client-info link");
+    assert_eq!(select_dispatch_teb(cursor_create_purpose, candidates), Ok(candidates.callout_teb));
+    assert_eq!(purpose_for_win32k_syscall(0x1002, 0x23), DispatchTebPurpose::Compatibility,
+        "unproven one-parameter routines retain their prior TEB selection");
 }

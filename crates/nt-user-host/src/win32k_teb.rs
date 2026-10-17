@@ -32,7 +32,9 @@ pub enum DispatchTebError {
 /// desktop creation instead captures a user `OBJECT_ATTRIBUTES` name from the client TEB.
 pub fn purpose_for_win32k_syscall(ssn: u64, arg1: u64) -> DispatchTebPurpose {
     match ssn {
-        0x1002 if arg1 == 0x22 => DispatchTebPurpose::ThreadInfo,
+        // CreateEmptyCurObject (0x21) calls GetW32ThreadInfo, whose debug hook verifies that
+        // NtCurrentTeb()->Win32ClientInfo is the THREADINFO's published pClientInfo.
+        0x1002 if matches!(arg1, 0x21 | 0x22) => DispatchTebPurpose::ThreadInfo,
         0x1288 => DispatchTebPurpose::ThreadInfo,
         0x1ffd | 0x122f | 0x122d => DispatchTebPurpose::UserObjectName,
         _ => DispatchTebPurpose::Compatibility,
