@@ -51,7 +51,7 @@ use core::mem::size_of;
 
 use bytemuck::Pod;
 use nt_alpc_abi::{
-    msg_attr_flag, opcode, send_flag, AlpcAcceptConnectCheckedRequest,
+    msg_attr_flag, opcode, port_flag, send_flag, AlpcAcceptConnectCheckedRequest,
     AlpcAcceptConnectRequest, AlpcAcknowledgeSendReceiveRequest,
     AlpcCheckedInvocation, AlpcConnectPortAuthorizedRequest,
     AlpcConnectPortCheckedRequest, AlpcConnectPortRequest,
@@ -65,13 +65,23 @@ use nt_alpc_abi::{
 };
 use nt_port_core::{
     ClientId, ConnectOutcome, DataView, MessageAttrs, PortApi, PortCore, PortHandleEndpoint,
-    PortLimits, QueuedMessage, ReceiveOutcome, MAX_CONNINFO,
+    PortAdmission, PortLimits, QueuedMessage, ReceiveOutcome, MAX_CONNINFO,
 };
 use nt_status::NtStatus;
 
 /// Base for allocated ALPC section handles (ASCII `"AS"` — distinct from the
 /// core's `"LP"` port-handle range).
 const ALPC_SECTION_BASE: u64 = 0x0000_4153_0000_0001;
+
+fn port_admission(flags: u32) -> Result<PortAdmission, NtStatus> {
+    const SUPPORTED: u32 = port_flag::LPC_MODE | port_flag::ALLOW_LPC_REQUESTS
+        | port_flag::ALLOW_IMPERSONATION;
+    if flags & !SUPPORTED != 0 { return Err(NtStatus::INVALID_PARAMETER); }
+    Ok(PortAdmission {
+        allow_lpc_requests: flags & (port_flag::LPC_MODE | port_flag::ALLOW_LPC_REQUESTS) != 0,
+        allow_impersonation: flags & port_flag::ALLOW_IMPERSONATION != 0,
+    })
+}
 
 /// Upper bound on a port section's backing store, so a malformed/hostile
 /// `SectionSize` can't grow the broker's memory without bound. 8 MiB comfortably
@@ -373,7 +383,8 @@ impl AlpcServer {
             return Err(NtStatus::INVALID_PARAMETER);
         }
         let name = read_name(buf, req.name_offset, req.name_len_bytes)?;
-        let handle = core.create_port_with_limits(
+        let admission = port_admission(req.port_flags)?;
+        let handle = core.create_port_with_limits_admission(
             &name,
             PortApi::Alpc,
             PortLimits {
@@ -381,6 +392,7 @@ impl AlpcServer {
                 max_message: req.max_message_length,
                 max_pool_usage: 0,
             },
+            admission,
         )?;
         Ok(reply(NtStatus::SUCCESS, 0, handle, 0))
     }
@@ -400,7 +412,7 @@ impl AlpcServer {
                 || attrs.flags != req.create.port_flags
                 || attrs.max_message_length != u64::from(req.create.max_message_length)
                 || attrs.max_pool_usage > u32::MAX as u64
-                || attrs.flags != 0
+                || port_admission(attrs.flags).is_err()
                 || attrs.memory_bandwidth != 0
                 || attrs.max_section_size != 0
                 || attrs.max_view_size != 0
@@ -495,7 +507,8 @@ impl AlpcServer {
         self.create_results
             .try_reserve(1)
             .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
-        let result = match core.create_port_with_owner_and_limits_checked(
+        let admission = port_admission(req.create.port_flags)?;
+        let result = match core.create_port_with_owner_and_limits_checked_admission(
             &name,
             PortApi::Alpc,
             owner,
@@ -504,6 +517,7 @@ impl AlpcServer {
                 max_message: req.create.max_message_length,
                 max_pool_usage: attributes.map_or(0, |attrs| attrs.max_pool_usage as u32),
             },
+            admission,
         ) {
             Ok(handle) => reply(NtStatus::SUCCESS, 0, handle, 0),
             Err(status) => reply(status, 0, 0, 0),

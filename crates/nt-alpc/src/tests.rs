@@ -691,6 +691,46 @@ fn owned_create_carries_smss_pool_and_security_qos_without_losing_replay_identit
 }
 
 #[test]
+fn checked_csrss_port_flags_allow_lpc_clients_only_when_requested() {
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId { process: 7, thread: 11 };
+    let client = nt_port_core::ClientId { process: 8, thread: 12 };
+    let flags = port_flag::ALLOW_LPC_REQUESTS | port_flag::ALLOW_IMPERSONATION;
+    let name = utf16("\\Windows\\ApiPort");
+    let attributes = nt_alpc_abi::AlpcPortAttributes {
+        flags,
+        max_message_length: 512,
+        max_pool_usage: 16 * 4096,
+        security_qos: nt_alpc_abi::SecurityQualityOfService {
+            length: 12,
+            impersonation_level: 2,
+            context_tracking_mode: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_owned_create_port(&name, owner, (7, 80), attributes), &mut []);
+    assert_eq!(created.status, SUCCESS);
+    assert!(matches!(core.connect_with_client_id(&name, PortApi::Lpc, 0,
+        b"csr-client", client), Ok(nt_port_core::ConnectOutcome::Pending { .. })));
+
+    let restricted_name = utf16("\\Windows\\AlpcOnly");
+    let restricted = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_owned_create_port(&restricted_name, owner, (7, 81),
+            nt_alpc_abi::AlpcPortAttributes {
+                flags: port_flag::ALLOW_IMPERSONATION,
+                max_message_length: 512,
+                ..Default::default()
+            }), &mut []);
+    assert_eq!(restricted.status, SUCCESS);
+    assert!(core.connect_with_client_id(&restricted_name, PortApi::Lpc, 0,
+        b"csr-client", client).is_err());
+}
+
+#[test]
 fn owned_create_rejects_unrepresented_limits_before_creating_a_port() {
     let mut core = PortCore::new();
     let mut alpc = AlpcServer::new();

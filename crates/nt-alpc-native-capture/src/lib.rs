@@ -72,7 +72,11 @@ impl CapturedCreatePort {
             return Err(STATUS_OBJECT_NAME_INVALID);
         }
         let attributes: AlpcPortAttributes = bytemuck::pod_read_unaligned(&self.attributes);
-        if attributes.flags != 0 || attributes.max_message_length > u32::MAX as u64
+        let supported_flags = nt_alpc_abi::port_flag::LPC_MODE
+            | nt_alpc_abi::port_flag::ALLOW_LPC_REQUESTS
+            | nt_alpc_abi::port_flag::ALLOW_IMPERSONATION;
+        if attributes.flags & !supported_flags != 0
+            || attributes.max_message_length > u32::MAX as u64
             || attributes.max_pool_usage > u32::MAX as u64
             || attributes.memory_bandwidth != 0 || attributes.max_section_size != 0
             || attributes.max_view_size != 0 || attributes.max_total_section_size != 0
@@ -295,6 +299,25 @@ mod tests {
         assert_eq!(request.attributes.max_message_length, 328);
         assert_eq!(request.attributes.max_pool_usage, 8192);
         assert_eq!(&wire[size..], &memory[160..180]);
+    }
+
+    #[test]
+    fn csrss_create_carries_lpc_and_impersonation_flags() {
+        let mut memory = image();
+        let flags = nt_alpc_abi::port_flag::ALLOW_LPC_REQUESTS
+            | nt_alpc_abi::port_flag::ALLOW_IMPERSONATION;
+        memory[256..260].copy_from_slice(&flags.to_le_bytes());
+        let captured = capture([16, 64, 256], |address, out| {
+            let start = address as usize;
+            out.copy_from_slice(&memory[start..start + out.len()]);
+            true
+        }, |_, _| true).unwrap();
+        let owner = CreateOwner { process_id: 41, thread_id: 51, process_generation: 61 };
+        let wire = captured.checked_wire(owner, (71, 81)).unwrap();
+        let request: AlpcCreatePortOwnedRequest = bytemuck::pod_read_unaligned(
+            &wire[..core::mem::size_of::<AlpcCreatePortOwnedRequest>()]);
+        assert_eq!(request.checked.create.port_flags, flags);
+        assert_eq!(request.attributes.flags, flags);
     }
 
     #[test]

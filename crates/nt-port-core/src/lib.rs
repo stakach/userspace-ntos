@@ -117,6 +117,20 @@ pub struct PortLimits {
     pub max_pool_usage: u32,
 }
 
+/// Admission permissions fixed by a listening port at creation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PortAdmission {
+    pub allow_lpc_requests: bool,
+    pub allow_impersonation: bool,
+}
+
+impl Default for PortAdmission {
+    fn default() -> Self {
+        // Legacy LPC callers have always accepted both forms of traffic.
+        Self { allow_lpc_requests: true, allow_impersonation: true }
+    }
+}
+
 impl Default for PortLimits {
     fn default() -> Self {
         Self {
@@ -329,6 +343,7 @@ struct Port {
     api: PortApi,
     owner: ClientId,
     limits: PortLimits,
+    admission: PortAdmission,
     pool_account: usize,
     /// Connection ids awaiting a receiver (Manual-policy FIFO).
     pending: Vec<u64>,
@@ -654,6 +669,18 @@ impl PortCore {
         self.create_port_with_owner_and_limits(name, api, ClientId::default(), limits)
     }
 
+    /// Create an adapter-owned port with explicit admission permissions.
+    pub fn create_port_with_limits_admission(
+        &mut self,
+        name: &[u16],
+        api: PortApi,
+        limits: PortLimits,
+        admission: PortAdmission,
+    ) -> Result<u64, NtStatus> {
+        self.create_port_with_owner_and_limits_policy(
+            name, api, ClientId::default(), limits, admission, false)
+    }
+
     /// Create a port while preserving both its kernel-supplied owner and native limits.
     pub fn create_port_with_owner_and_limits(
         &mut self,
@@ -662,7 +689,8 @@ impl PortCore {
         owner: ClientId,
         limits: PortLimits,
     ) -> Result<u64, NtStatus> {
-        self.create_port_with_owner_and_limits_policy(name, api, owner, limits, false)
+        self.create_port_with_owner_and_limits_policy(
+            name, api, owner, limits, PortAdmission::default(), false)
     }
 
     /// Create a port with a unique name, preserving the caller's owner identity.
@@ -675,7 +703,21 @@ impl PortCore {
         owner: ClientId,
         limits: PortLimits,
     ) -> Result<u64, NtStatus> {
-        self.create_port_with_owner_and_limits_policy(name, api, owner, limits, true)
+        self.create_port_with_owner_and_limits_policy(
+            name, api, owner, limits, PortAdmission::default(), true)
+    }
+
+    /// Create a checked native ALPC port with its captured admission policy.
+    pub fn create_port_with_owner_and_limits_checked_admission(
+        &mut self,
+        name: &[u16],
+        api: PortApi,
+        owner: ClientId,
+        limits: PortLimits,
+        admission: PortAdmission,
+    ) -> Result<u64, NtStatus> {
+        self.create_port_with_owner_and_limits_policy(
+            name, api, owner, limits, admission, true)
     }
 
     fn create_port_with_owner_and_limits_policy(
@@ -684,6 +726,7 @@ impl PortCore {
         api: PortApi,
         owner: ClientId,
         limits: PortLimits,
+        admission: PortAdmission,
         refuse_existing_name: bool,
     ) -> Result<u64, NtStatus> {
         if limits.max_connection_info as usize > MAX_CONNINFO
@@ -722,6 +765,7 @@ impl PortCore {
             api,
             owner,
             limits,
+            admission,
             pool_account,
             pending: Vec::new(),
             datagrams: Vec::new(),
@@ -784,6 +828,11 @@ impl PortCore {
             .iter()
             .position(|p| p.user_open && p.named && p.name == name)
             .ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
+        if client_api == PortApi::Lpc && self.ports[port_idx].api == PortApi::Alpc
+            && !self.ports[port_idx].admission.allow_lpc_requests
+        {
+            return Err(NtStatus::ACCESS_DENIED);
+        }
         let server_api = self.ports[port_idx].api;
         let server_id = self.ports[port_idx].owner;
         let limits = self.ports[port_idx].limits;
