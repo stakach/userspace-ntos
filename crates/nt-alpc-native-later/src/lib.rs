@@ -59,6 +59,8 @@ pub struct CapturedConnectPort {
     pub name: Vec<u16>,
     pub connect_flags: u32,
     pub port_attributes: Option<[u8; 72]>,
+    /// Caller-required server SID, copied before resolving the exact listen object.
+    pub server_sid: Option<Vec<u8>>,
     pub message: Option<Vec<u8>>,
     /// Original writable message, its capacity, and the size field. The
     /// message bytes above are copied input and never reread after submission.
@@ -323,7 +325,7 @@ pub fn capture_connect_port(
     // part of the caller's value and may retain unrelated stack data.
     let flags = flags as u32;
     if output == 0 || !probe_output(output, 8) { return Err(STATUS_ACCESS_VIOLATION); }
-    if object_attributes != 0 || server_sid != 0 || receive_attrs != 0 {
+    if object_attributes != 0 || receive_attrs != 0 {
         return Err(STATUS_NOT_SUPPORTED);
     }
     if flags & !nt_alpc_abi::connect_flag::SYNC_CONNECTION != 0
@@ -345,6 +347,13 @@ pub fn capture_connect_port(
         if !read(attributes, &mut copied) { return Err(STATUS_ACCESS_VIOLATION); }
         Some(copied)
     };
+    let server_sid = if server_sid == 0 { None } else {
+        let mut header = [0u8; 8];
+        if !read(server_sid, &mut header) { return Err(STATUS_ACCESS_VIOLATION); }
+        if header[0] != 1 || header[1] > 15 { return Err(0xC000_0078); }
+        let length = 8 + usize::from(header[1]) * 4;
+        Some(copy_bounded(server_sid, length, 68, &mut read)?)
+    };
     let (message, message_target) = if message_pointer == 0 { (None, None) } else {
         let mut size = [0u8; 8];
         if !read(message_size, &mut size) { return Err(STATUS_ACCESS_VIOLATION); }
@@ -358,7 +367,7 @@ pub fn capture_connect_port(
     };
     let send_attributes = if send_attrs == 0 { None } else { Some(copy_attributes(send_attrs, &mut read)?) };
     Ok(CapturedConnectPort { output, name, connect_flags: flags,
-        port_attributes, message, message_target, send_attributes,
+        port_attributes, server_sid, message, message_target, send_attributes,
         timeout: copy_timeout(timeout, &mut read)? })
 }
 
@@ -372,6 +381,10 @@ pub fn capture_accept_connect(
     mut probe_output: impl FnMut(u64, usize) -> bool,
 ) -> Result<CapturedAcceptConnect, u32> {
     let [output, listen_port, flags, object_attrs, port_attrs, context, message, message_attrs, accept] = args;
+    // The native Windows ABI leaves the unused upper bits of ULONG and
+    // BOOLEAN argument slots unspecified.
+    let flags = flags as u32;
+    let accept = accept as u8;
     if output == 0 || !probe_output(output, 8) { return Err(STATUS_ACCESS_VIOLATION); }
     if listen_port == 0 || message == 0 || accept > 1 || flags != 0 { return Err(STATUS_INVALID_PARAMETER); }
     if object_attrs != 0 || port_attrs != 0 || message_attrs != 0 { return Err(STATUS_NOT_SUPPORTED); }

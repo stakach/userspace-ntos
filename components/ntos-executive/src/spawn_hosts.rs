@@ -2655,7 +2655,15 @@ unsafe fn component_pump_loop(
         } else if label == crate::win32k_subsystem::W32_LPC_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
-            let status = pump_service_lpc_request();
+            let status = if shared_pump::authenticated_badge(ch, msg.badge)
+                && crate::win32k_glue::win32k_physical_lane_for_channel(
+                    ch.tcb, ch.fault_ep, ch.reply_cap,
+                ).is_some()
+            {
+                pump_service_lpc_request()
+            } else {
+                nt_process::STATUS_INVALID_HANDLE as i32
+            };
             pump_reply_recv_into!(ch, *reply_cap, msg, REQUEST_TAG_LEN, status as u32 as u64);
             continue;
         } else if label == crate::win32k_subsystem::W32_REGISTRY_LABEL

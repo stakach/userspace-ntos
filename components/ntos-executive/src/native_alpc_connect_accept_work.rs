@@ -250,6 +250,20 @@ pub(crate) unsafe fn begin_connect(handler: &mut ExecNtHandler,
         |address, len| (*handler_ptr).probe_user_output(address, len))?;
     if captured.timeout.is_some() || captured.send_attributes.is_some()
     { return Err(STATUS_NOT_SUPPORTED); }
+    // A required server SID is an authorization condition on the exact
+    // published listen object. Check its owner's primary token before any
+    // connect is submitted, then bind admission to its service handle below.
+    if let Some(server_sid) = captured.server_sid.as_deref() {
+        let required = nt_security::Sid::from_native_bytes(server_sid)?;
+        let port = handler.native_alpc_secured_ports.find(&captured.name)
+            .ok_or(nt_security::STATUS_SERVER_SID_MISMATCH)?;
+        let token = handler.pm.process_primary_token(port.owner_process)
+            .and_then(|id| handler.token_store.get(id))
+            .ok_or(nt_security::STATUS_SERVER_SID_MISMATCH)?;
+        if token.user != required {
+            return Err(nt_security::STATUS_SERVER_SID_MISMATCH);
+        }
+    }
     let authorized_listen = if let Some(port) = handler.native_alpc_secured_ports.find(&captured.name) {
         let process = u32::try_from(caller.process).map_err(|_| STATUS_INVALID_HANDLE)?;
         let thread = u32::try_from(caller.thread).map_err(|_| STATUS_INVALID_HANDLE)?;

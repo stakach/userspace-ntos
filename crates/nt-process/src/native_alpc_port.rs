@@ -149,6 +149,16 @@ impl ProcessManager {
         }
     }
 
+    /// Resolve a win32k Port reference using the physical hosted thread's
+    /// process identity before translating a process-local ALPC handle.
+    pub fn resolve_win32k_user_port_service_handle(&self, process: ProcessId,
+        thread: crate::ThreadId, value: u64, owner_generation: u64) -> Result<u64, u32> {
+        let lifetime = self.thread_lifetime(thread).ok_or(STATUS_INVALID_HANDLE)?;
+        if lifetime.process_id() != process { return Err(STATUS_INVALID_HANDLE); }
+        let caller = self.capture_native_handle_caller(lifetime, AccessMode::UserMode)?;
+        self.resolve_native_user_port_service_handle(caller, value, owner_generation)
+    }
+
     /// Hide the exact table entry until a checked service close is known.
     pub fn begin_native_alpc_port_close(&mut self, caller: NativeHandleCaller,
         value: u64, owner_generation: u64) -> Result<NativeAlpcPortClose, NativeCloseError> {
@@ -396,6 +406,21 @@ mod tests {
             Err(STATUS_INVALID_HANDLE), "typed table objects cannot alias an LPC broker handle");
         assert_eq!(pm.resolve_native_user_port_service_handle(caller, 0x4c50_0002, 7),
             Ok(0x4c50_0002), "an unoccupied value remains eligible for broker validation");
+    }
+
+    #[test]
+    fn win32k_csr_port_reference_resolves_only_the_physical_owner_and_generation() {
+        let (mut pm, caller, pid) = fixture();
+        let mut publication = pm.reserve_native_alpc_port_handle(caller, 7, (11, 13)).unwrap();
+        publication.bind(&mut pm, 0x4c50_0001).unwrap();
+        let value = publication.publish(&mut pm).unwrap();
+        let tid = caller.original_thread().thread_id();
+        assert_eq!(pm.resolve_win32k_user_port_service_handle(pid, tid, value, 7),
+            Ok(0x4c50_0001));
+        assert_eq!(pm.resolve_win32k_user_port_service_handle(pid, tid, value, 8),
+            Err(STATUS_INVALID_HANDLE));
+        assert_eq!(pm.resolve_win32k_user_port_service_handle(pid + 1, tid, value, 7),
+            Err(STATUS_INVALID_HANDLE));
     }
 
     #[test]

@@ -1602,6 +1602,8 @@ pub(crate) const LPC_WAIT_RESULT_GENERATION: u64 = 0x28;
 pub(crate) const LPC_WAIT_CLIENT_PROCESS: u64 = 0x30;
 pub(crate) const LPC_WAIT_CLIENT_THREAD: u64 = 0x38;
 pub(crate) const LPC_WAIT_MESSAGE_ID: u64 = 0x40;
+const LPC_SERVICE_CLIENT_PI: u64 = 0x48;
+const LPC_SERVICE_CLIENT_GENERATION: u64 = 0x50;
 pub(crate) const LPC_SERVICE_MESSAGE: u64 = 0x100;
 const LPC_SERVICE_QUERY_HANDLE: u32 = 1;
 const LPC_SERVICE_RETAIN_PORT: u32 = 2;
@@ -8172,6 +8174,18 @@ unsafe fn request_lpc_service(operation: u32, port_handle: u64, message: &[u8]) 
     write_volatile((sh + LPC_SERVICE_OPERATION) as *mut u32, operation);
     write_volatile((sh + LPC_SERVICE_STATUS) as *mut i32, 0xC000_0001u32 as i32);
     write_volatile((sh + LPC_SERVICE_RESULT) as *mut u64, 0);
+    let ids = current_lane_ids();
+    let pi = ids.client_pi.load(Ordering::Relaxed);
+    let pid = ids.process_id.load(Ordering::Relaxed);
+    let tid = ids.thread_id.load(Ordering::Relaxed);
+    let generation = current_process_context_index()
+        .filter(|&index| process_ctx_pi(index) == pi && process_ctx_pid(index) == pid)
+        .map(|index| process_ctx_generation(index))
+        .unwrap_or(0);
+    write_volatile((sh + LPC_WAIT_CLIENT_PROCESS) as *mut u64, pid);
+    write_volatile((sh + LPC_WAIT_CLIENT_THREAD) as *mut u64, tid);
+    write_volatile((sh + LPC_SERVICE_CLIENT_PI) as *mut u64, pi);
+    write_volatile((sh + LPC_SERVICE_CLIENT_GENERATION) as *mut u64, generation);
     write_volatile(
         (sh + LPC_SERVICE_MESSAGE_LEN) as *mut u32,
         message.len() as u32,
@@ -8184,6 +8198,31 @@ unsafe fn request_lpc_service(operation: u32, port_handle: u64, message: &[u8]) 
         read_volatile((sh + LPC_SERVICE_STATUS) as *const i32),
         read_volatile((sh + LPC_SERVICE_RESULT) as *const u64),
     )
+}
+
+/// The component sends a process-local handle. Resolve it through the live
+/// process table before the broker sees it; a numeric collision with another
+/// object type must not be interpreted as a raw LPC service handle.
+unsafe fn resolve_win32k_user_port_service_handle(sh: u64, value: u64) -> Result<u64, u32> {
+    let invalid = nt_process::STATUS_INVALID_HANDLE;
+    let pi = read_volatile((sh + LPC_SERVICE_CLIENT_PI) as *const u64);
+    let pid = read_volatile((sh + LPC_WAIT_CLIENT_PROCESS) as *const u64);
+    let tid = read_volatile((sh + LPC_WAIT_CLIENT_THREAD) as *const u64);
+    let generation = read_volatile((sh + LPC_SERVICE_CLIENT_GENERATION) as *const u64);
+    let pi = checked_client_index(pi).ok_or(invalid)?;
+    let pid = u32::try_from(pid).map_err(|_| invalid)?;
+    let tid = u32::try_from(tid).map_err(|_| invalid)?;
+    if pid == 0 || tid == 0 || generation == 0 {
+        return Err(invalid);
+    }
+    let handler = crate::service_sec_image::registry_live_handler_pointer().map_err(|_| invalid)?;
+    let handler = &*handler;
+    if handler.pm_pid_for_pi(pi) != Some(pid)
+        || handler.hosted_process_generation(pi) != Some(generation)
+    {
+        return Err(invalid);
+    }
+    handler.pm.resolve_win32k_user_port_service_handle(pid, tid, value, generation)
 }
 
 /// Execute a bounded request against the isolated LPC broker from the executive component pump.
@@ -8205,15 +8244,20 @@ pub(crate) unsafe fn service_lpc_request() -> i32 {
                 .unwrap_or_else(|s| s.raw()),
             None => 0xC000_0001u32 as i32,
         },
-        LPC_SERVICE_RETAIN_PORT if message_len == 0 => match lpc_client() {
-            Some(lpc) => match lpc.retain_port_object(port_handle) {
-                Ok(endpoint) => {
-                    result = endpoint;
-                    0
-                }
-                Err(status) => status.raw(),
-            },
-            None => 0xC000_0001u32 as i32,
+        LPC_SERVICE_RETAIN_PORT if message_len == 0 => {
+            match resolve_win32k_user_port_service_handle(sh, port_handle) {
+                Ok(service_handle) => match lpc_client() {
+                    Some(lpc) => match lpc.retain_port_object(service_handle) {
+                        Ok(endpoint) => {
+                            result = endpoint;
+                            0
+                        }
+                        Err(status) => status.raw(),
+                    },
+                    None => 0xC000_0001u32 as i32,
+                },
+                Err(status) => status as i32,
+            }
         },
         LPC_SERVICE_RELEASE_PORT if message_len == 0 => match lpc_client() {
             Some(lpc) => lpc

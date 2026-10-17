@@ -1192,6 +1192,9 @@ impl AlpcServer {
                 request.try_reserve_exact(msg.len())
                     .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
                 request.extend_from_slice(msg);
+                // ALPC supplies the request type to the server. User-mode CSR
+                // initializes this header field to zero before the syscall.
+                request[4..6].copy_from_slice(&nt_alpc_abi::msg_type::REQUEST.to_le_bytes());
                 request[8..16].copy_from_slice(&identity.client.process.to_le_bytes());
                 request[16..24].copy_from_slice(&identity.client.thread.to_le_bytes());
                 request[24..28].copy_from_slice(&identity.message_id.to_le_bytes());

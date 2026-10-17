@@ -733,7 +733,9 @@ fn checked_sync_request_waits_for_its_exact_reply_without_replaying_send() {
     assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
         &listener, &mut listener_output).status, nt_status::NtStatus::PENDING.0);
 
-    let request = port_message(msg_type::REQUEST, b"exec");
+    // Native CSR initializes Type to zero; the ALPC kernel marks a synchronous
+    // client send as LPC_REQUEST before the server's receive loop sees it.
+    let request = port_message(0, b"exec");
     let mut wire = enc_checked_receive(client_port, client, (3, 91));
     let mut checked: nt_alpc_abi::AlpcSendReceiveCheckedRequest =
         bytemuck::pod_read_unaligned(&wire);
@@ -758,6 +760,7 @@ fn checked_sync_request_waits_for_its_exact_reply_without_replaying_send() {
     assert_eq!(context.port_context, 0xCAFE_BABE);
     let delivered = &listener_output[40..listener_result.information as usize];
     let header: PortMessage = bytemuck::pod_read_unaligned(&delivered[..40]);
+    assert_eq!(header.msg_type, msg_type::REQUEST);
     let identity = MessageIdentity { client, message_id: header.message_id };
     assert_eq!(header.client_process, client.process);
     assert_eq!(header.client_thread, client.thread);

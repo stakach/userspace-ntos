@@ -8,6 +8,7 @@ const MAX_SECURED_PORTS: usize = 64;
 
 pub(crate) struct SecuredPort {
     pub(crate) listen_handle: u64,
+    pub(crate) owner_process: u32,
     pub(crate) descriptor: Vec<u8>,
     name: Vec<u16>,
 }
@@ -29,19 +30,19 @@ impl SecuredPortRegistry {
     pub(crate) fn new() -> Self { Self { ports: Vec::new() } }
 
     pub(crate) fn register(&mut self, name: Vec<u16>, descriptor: Vec<u8>,
-        listen_handle: u64) -> Result<(), u32> {
-        if listen_handle == 0 || descriptor.is_empty() {
+        listen_handle: u64, owner_process: u32) -> Result<(), u32> {
+        if listen_handle == 0 || owner_process == 0 || descriptor.is_empty() {
             return Err(0xC000_000D);
         }
         if let Some(old) = self.ports.iter_mut().find(|port| same_name(&port.name, &name)) {
-            *old = SecuredPort { name, descriptor, listen_handle };
+            *old = SecuredPort { name, descriptor, listen_handle, owner_process };
             return Ok(());
         }
         if self.ports.len() == MAX_SECURED_PORTS {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
         self.ports.try_reserve(1).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-        self.ports.push(SecuredPort { name, descriptor, listen_handle });
+        self.ports.push(SecuredPort { name, descriptor, listen_handle, owner_process });
         Ok(())
     }
 
@@ -61,11 +62,12 @@ mod tests {
     #[test]
     fn name_replacement_rebinds_exact_handle_and_retire_is_identity_checked() {
         let mut ports = SecuredPortRegistry::new();
-        ports.register("\\SmApiPort".encode_utf16().collect(), alloc::vec![1], 10).unwrap();
-        ports.register("\\SMAPIPORT".encode_utf16().collect(), alloc::vec![2], 11).unwrap();
+        ports.register("\\SmApiPort".encode_utf16().collect(), alloc::vec![1], 10, 20).unwrap();
+        ports.register("\\SMAPIPORT".encode_utf16().collect(), alloc::vec![2], 11, 21).unwrap();
         ports.retire(10);
         let bound = ports.find(&"\\smapiport".encode_utf16().collect::<Vec<_>>()).unwrap();
         assert_eq!(bound.listen_handle, 11);
+        assert_eq!(bound.owner_process, 21);
         assert_eq!(bound.descriptor, alloc::vec![2]);
     }
 }

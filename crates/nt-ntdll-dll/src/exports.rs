@@ -28764,9 +28764,9 @@ pub unsafe extern "system" fn csr_get_process_id() -> *mut c_void {
 
 /// `CsrClientConnectToServer(PCWSTR ObjectDirectory, ULONG ServerId, PVOID ConnectionInfo,
 /// PULONG ConnectionInfoSize, PBOOLEAN ServerToServerCall) -> NTSTATUS`. Port of ReactOS
-/// `CsrpConnectToServer` (`subsystems/csr/csrlib/connect.c`): on target it issues the 9-arg
-/// `NtSecureConnectPort(\Windows\ApiPort)` (serviced by the generic LPC dispatcher) and
-/// copies the returned CSR section data into the PEB (`ReadOnlyStaticServerData` etc.), so kernel32's
+/// `CsrpConnectToServer` (`subsystems/csr/csrlib/connect.c`): on target it issues
+/// `NtAlpcConnectPort(\Windows\ApiPort)` with LiberNT's framed connect info and
+/// copies the accepted CSR section data into the PEB (`ReadOnlyStaticServerData` etc.), so kernel32's
 /// `DllMain` proceeds past `InitCommandLines()`. On the host (no syscalls) returns
 /// STATUS_NOT_IMPLEMENTED — never a fabricated connection.
 ///
@@ -28782,7 +28782,7 @@ pub unsafe extern "system" fn csr_client_connect_to_server(
 ) -> NtStatus {
     #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: on-target hosted-process; issues NtSecureConnectPort + fills the PEB CSR fields.
+        // SAFETY: on-target hosted-process; issues NtAlpcConnectPort + fills the PEB CSR fields.
         unsafe {
             crate::on_target::csr_client_connect_to_server(
                 object_directory,
@@ -28810,8 +28810,9 @@ pub unsafe extern "system" fn csr_client_connect_to_server(
 /// ApiNumber, ULONG RequestLength) -> NTSTATUS`.
 ///
 /// This is the real ntdll client-side half: fill the PORT_MESSAGE/CSR headers, translate an optional
-/// capture buffer to the CSR server view, issue `NtRequestWaitReplyPort(CsrApiPort, &Header,
-/// &Header)`, then translate captured pointers back and return `ApiMessage->Status`.
+/// capture buffer to the CSR server view, issue a synchronous
+/// `NtAlpcSendWaitReceivePort` with an in-place reply, then translate captured pointers back and
+/// return `ApiMessage->Status`.
 ///
 /// # Safety
 /// `request` a valid `CSR_API_MESSAGE*`; `capture` null or a valid capture buffer.
@@ -28848,8 +28849,8 @@ pub unsafe extern "system" fn csr_client_call_server(
             }
         }
 
-        // SAFETY: request is both the LPC request and reply buffer.
-        let transport_status = unsafe { crate::on_target::csr_request_wait_reply(request as u64) };
+        // SAFETY: request is both the ALPC request and reply buffer.
+        let transport_status = unsafe { crate::on_target::csr_alpc_sync_call(request as u64) };
 
         if !capture.is_null() {
             // SAFETY: restores the same raw capture buffer converted above.
@@ -28889,7 +28890,7 @@ pub unsafe extern "system" fn csr_client_call_server(
 }
 
 /// `CsrAllocateCaptureBuffer(ULONG ArgumentCount, ULONG BufferSize) -> PCSR_CAPTURE_BUFFER`.
-/// Allocates the real ReactOS CSR_CAPTURE_BUFFER layout from the process heap.
+/// Allocates the CSR_CAPTURE_BUFFER in the accepted shared CSR port view.
 ///
 /// # Safety
 /// Reads no memory.
@@ -28904,16 +28905,16 @@ pub unsafe extern "system" fn csr_allocate_capture_buffer(
     };
     #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: process heap allocation; zero-initialize the public buffer layout.
-        let p = unsafe { crate::process_heap_alloc(size) };
+        let heap = unsafe { crate::on_target::csr_port_heap() };
+        if heap == 0 { return core::ptr::null_mut(); }
+        let p = unsafe { rtl_allocate_heap(heap as *mut c_void, 0x8, size) };
         if p.is_null() {
             return core::ptr::null_mut();
         }
         unsafe {
-            core::ptr::write_bytes(p, 0, size);
-            nt_ntdll::csr::init_raw_capture_buffer(p, size, argument_count);
+            nt_ntdll::csr::init_raw_capture_buffer(p as *mut u8, size, argument_count);
         }
-        p as *mut c_void
+        p
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -28931,9 +28932,9 @@ pub unsafe extern "system" fn csr_free_capture_buffer(capture_buffer: *mut c_voi
         return;
     }
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: buffer was allocated from the process heap by CsrAllocateCaptureBuffer.
     unsafe {
-        crate::process_heap_free(capture_buffer as *mut u8);
+        let heap = crate::on_target::csr_port_heap();
+        if heap != 0 { let _ = rtl_free_heap(heap as *mut c_void, 0, capture_buffer); }
     }
 }
 
@@ -29021,17 +29022,17 @@ pub unsafe extern "system" fn csr_capture_message_multi_unicode_strings_in_place
         };
         #[cfg(target_arch = "x86_64")]
         {
-            // SAFETY: process heap allocation; zero-initialize before CSR header setup.
-            let allocated = unsafe { crate::process_heap_alloc(total_size) };
+            let heap = unsafe { crate::on_target::csr_port_heap() };
+            if heap == 0 { return STATUS_NO_MEMORY; }
+            let allocated = unsafe { rtl_allocate_heap(heap as *mut c_void, 0x8, total_size) };
             if allocated.is_null() {
                 return STATUS_NO_MEMORY;
             }
             unsafe {
-                core::ptr::write_bytes(allocated, 0, total_size);
-                nt_ntdll::csr::init_raw_capture_buffer(allocated, total_size, strings_count);
-                *capture_buffer = allocated as *mut c_void;
+                nt_ntdll::csr::init_raw_capture_buffer(allocated as *mut u8, total_size, strings_count);
+                *capture_buffer = allocated;
             }
-            capture = allocated;
+            capture = allocated as *mut u8;
         }
         #[cfg(not(target_arch = "x86_64"))]
         {

@@ -119,7 +119,7 @@ fn smss_sync_request_owns_send_bytes_before_reusing_receive_buffer() {
 }
 
 #[test]
-fn connect_capture_owns_name_and_rejects_unmodeled_security_inputs() {
+fn connect_capture_owns_name_and_rejects_invalid_server_sid() {
     let mut image = [0u8; 512];
     image[64..66].copy_from_slice(&20u16.to_le_bytes());
     image[66..68].copy_from_slice(&22u16.to_le_bytes());
@@ -137,7 +137,7 @@ fn connect_capture_owns_name_and_rejects_unmodeled_security_inputs() {
     assert_eq!(head.access_granted, 1);
     assert_eq!(head.checked.connect.name_offset as usize,
         core::mem::size_of::<nt_alpc_abi::AlpcConnectPortAuthorizedRequest>());
-    assert_eq!(capture_connect_port([16,64,0,0,0,256,0,0,0,0,0], |p,b| read_image(&image,p,b), |_,_| true), Err(STATUS_NOT_SUPPORTED));
+    assert_eq!(capture_connect_port([16,64,0,0,0,256,0,0,0,0,0], |p,b| read_image(&image,p,b), |_,_| true), Err(0xC000_0078));
 }
 
 #[test]
@@ -157,6 +157,24 @@ fn smss_sync_connect_uses_32_bit_flags_from_native_argument_slot() {
 }
 
 #[test]
+fn libernt_csr_connect_retains_local_system_server_sid() {
+    let mut image = [0u8; 512];
+    image[64..66].copy_from_slice(&32u16.to_le_bytes());
+    image[66..68].copy_from_slice(&34u16.to_le_bytes());
+    image[72..80].copy_from_slice(&128u64.to_le_bytes());
+    for (index, unit) in "\\Windows\\ApiPort".encode_utf16().enumerate() {
+        image[128 + 2 * index..130 + 2 * index].copy_from_slice(&unit.to_le_bytes());
+    }
+    let sid = [1u8, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+    image[256..268].copy_from_slice(&sid);
+    let captured = capture_connect_port(
+        [16, 64, 0, 0, 0x0002_0000, 256, 0, 0, 0, 0, 0],
+        |address, out| read_image(&image, address, out), |_, _| true,
+    ).expect("LiberNT supplies an owned LocalSystem server SID");
+    assert_eq!(captured.server_sid.as_deref(), Some(sid.as_slice()));
+}
+
+#[test]
 fn smss_main_thread_badge_zero_keeps_exact_connect_and_reply_identity() {
     let mut main = caller();
     main.badge = 0;
@@ -165,6 +183,7 @@ fn smss_main_thread_badge_zero_keeps_exact_connect_and_reply_identity() {
         name: "\\SmApiPort".encode_utf16().collect(),
         connect_flags: nt_alpc_abi::connect_flag::SYNC_CONNECTION,
         port_attributes: None,
+        server_sid: None,
         message: None,
         message_target: None,
         send_attributes: None,
@@ -199,6 +218,30 @@ fn accept_capture_requires_connection_request_and_owned_output() {
     assert_eq!(capture_accept_connect([16,77,0,0,0,0,64,0,1], 60, |p,b| read_image(&image,p,b), |_,_| true), Err(STATUS_INVALID_PARAMETER));
     image[68..70].copy_from_slice(&1u16.to_le_bytes());
     assert_eq!(capture_accept_connect([16,77,0,0,0,0,64,0,1], 59, |p,b| read_image(&image,p,b), |_,_| true), Err(STATUS_INVALID_PARAMETER));
+}
+
+#[test]
+fn libernt_csr_accept_uses_native_ulong_and_boolean_widths() {
+    let mut image = [0u8; 256];
+    image[64..66].copy_from_slice(&72u16.to_le_bytes());
+    image[66..68].copy_from_slice(&112u16.to_le_bytes());
+    image[68..70].copy_from_slice(&10u16.to_le_bytes());
+    image[88..92].copy_from_slice(&59u32.to_le_bytes());
+    let captured = capture_accept_connect(
+        [16, 77, 0xfeed_face_0000_0000, 0, 0, 42, 64, 0, 0xfeed_face_0000_0001],
+        59, |address, out| read_image(&image, address, out), |address, len| address == 16 && len == 8,
+    ).expect("Windows ABI accepts only the ULONG flags and BOOLEAN low byte");
+    assert!(captured.accept);
+    assert_eq!(captured.connection_id, 59);
+    assert_eq!(captured.port_context, 42);
+    assert_eq!(capture_accept_connect(
+        [16, 77, 0xfeed_face_0000_0001, 0, 0, 42, 64, 0, 1],
+        59, |address, out| read_image(&image, address, out), |_, _| true,
+    ), Err(STATUS_INVALID_PARAMETER));
+    assert_eq!(capture_accept_connect(
+        [16, 77, 0, 0, 0, 42, 64, 0, 0xfeed_face_0000_0002],
+        59, |address, out| read_image(&image, address, out), |_, _| true,
+    ), Err(STATUS_INVALID_PARAMETER));
 }
 
 #[test]
@@ -349,7 +392,7 @@ fn checked_connect_and_accept_wires_bind_owner_and_connection() {
     let connect = CapturedConnectPort {
         output: 16, name: "\\SmApiPort".encode_utf16().collect(),
         connect_flags: 0,
-        port_attributes: None, message: None, message_target: None,
+        port_attributes: None, server_sid: None, message: None, message_target: None,
         send_attributes: None, timeout: None,
     };
     let wire = connect.checked_wire(caller(), (7,9)).unwrap();

@@ -101,6 +101,7 @@ impl PendingCreatePort {
                 .map(|result| result.handle).ok_or(STATUS_INVALID_HANDLE)?;
             if let Err(error) = handler.native_alpc_secured_ports.register(
                 core::mem::take(&mut self.name), descriptor, service_handle,
+                u32::try_from(self.process_id).map_err(|_| STATUS_INVALID_HANDLE)?,
             ) {
                 self.abort_bound(&mut handler.pm)?;
                 return Err(error);
