@@ -13,6 +13,7 @@ const FIRST_CALLBACK_OFFSET: usize = 8;
 const CALLBACK_POINTER_SIZE: usize = 8;
 const WDDM_20_FULL_PREFIX: usize = 0x340;
 const WDDM_32_FULL_PREFIX: usize = 0x608;
+const WDDM_32_START_INTERFACE_SIZE: usize = 0x240;
 // Pinned sdk/include/ddk/dispmprt.h marks each of these PVOID cells
 // "reserved, set to zero". They are not callable DDI entries.
 const RESERVED_OFFSETS: [usize; 11] = [
@@ -123,6 +124,90 @@ impl<'a> DxgInitializationData<'a> {
 pub struct DxgCallbackSlot {
     pub offset: usize,
     pub target: u64,
+}
+
+/// The x64 DXGKRNL_INTERFACE published by pinned LiberNT for a 0x11007
+/// miniport. The provider retains this table after DxgkDdiStartDevice, so
+/// native callers must replace every cross-domain function pointer they expose.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgStartInterface<'a> {
+    bytes: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DxgStartInterfaceError {
+    Truncated,
+    UnknownVersion,
+    BadSize,
+    MissingRequired,
+}
+
+impl<'a> DxgStartInterface<'a> {
+    pub const fn required_size(version: u32) -> Option<usize> {
+        match version {
+            0x11007 => Some(WDDM_32_START_INTERFACE_SIZE),
+            _ => None,
+        }
+    }
+
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, DxgStartInterfaceError> {
+        let header = bytes.get(..16).ok_or(DxgStartInterfaceError::Truncated)?;
+        let size = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+        let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        let required = Self::required_size(version)
+            .ok_or(DxgStartInterfaceError::UnknownVersion)?;
+        if size != required {
+            return Err(DxgStartInterfaceError::BadSize);
+        }
+        if bytes.len() < required {
+            return Err(DxgStartInterfaceError::Truncated);
+        }
+        let data = Self { bytes: &bytes[..required] };
+        if data.device_handle() == 0
+            || [0x80, 0x88, 0xd8].iter().any(|offset| {
+                data.callback_at(*offset).is_none_or(|target| target == 0)
+            })
+        {
+            return Err(DxgStartInterfaceError::MissingRequired);
+        }
+        Ok(data)
+    }
+
+    pub const fn size(&self) -> usize { WDDM_32_START_INTERFACE_SIZE }
+    pub fn version(&self) -> u32 {
+        u32::from_le_bytes(self.bytes[4..8].try_into().unwrap())
+    }
+    pub fn device_handle(&self) -> u64 {
+        u64::from_le_bytes(self.bytes[8..16].try_into().unwrap())
+    }
+    pub fn callback_at(&self, offset: usize) -> Option<u64> {
+        if offset < 0x10 || offset % 8 != 0 || offset >= self.size() {
+            return None;
+        }
+        Some(u64::from_le_bytes(self.bytes[offset..offset + 8].try_into().ok()?))
+    }
+    pub fn callbacks(&self) -> DxgStartInterfaceCallbacks<'_, 'a> {
+        DxgStartInterfaceCallbacks { interface: self, next_offset: 0x10 }
+    }
+}
+
+pub struct DxgStartInterfaceCallbacks<'data, 'bytes> {
+    interface: &'data DxgStartInterface<'bytes>,
+    next_offset: usize,
+}
+
+impl Iterator for DxgStartInterfaceCallbacks<'_, '_> {
+    type Item = DxgCallbackSlot;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.next_offset < self.interface.size() {
+            let offset = self.next_offset;
+            self.next_offset += 8;
+            let target = self.interface.callback_at(offset)?;
+            if target != 0 { return Some(DxgCallbackSlot { offset, target }); }
+        }
+        None
+    }
 }
 
 /// The lifecycle DDI prefix shared by DRIVER_INITIALIZATION_DATA and

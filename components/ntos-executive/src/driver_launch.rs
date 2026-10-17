@@ -27,6 +27,8 @@ mod hosted_irq_broker;
 mod hosted_source_retirement;
 #[path = "hosted_dxg_registration.rs"]
 mod hosted_dxg_registration;
+#[path = "hosted_provider_export_lane.rs"]
+pub(crate) mod hosted_provider_export_lane;
 pub(super) use hosted_dxg_registration::bridge_dxg_registration_entry;
 
 #[path = "hosted_wmi.rs"]
@@ -1859,7 +1861,8 @@ unsafe fn pool_pull_request_bytes(
     dst: u64,
     len: u64,
 ) -> bool {
-    let arg = hosted_class_irp_lane::current_component_arg().unwrap_or(FSD_ARG_VADDR);
+    let arg = hosted_provider_export_lane::current_component_arg()
+        .or_else(hosted_class_irp_lane::current_component_arg).unwrap_or(FSD_ARG_VADDR);
     let mut offset = 0u64;
     while offset < len {
         let chunk = (len - offset).min(FSD_ARG_BYTES);
@@ -1886,7 +1889,8 @@ unsafe fn pool_push_request_bytes(
     destination_offset: u64,
     len: u64,
 ) -> bool {
-    let arg = hosted_class_irp_lane::current_component_arg().unwrap_or(FSD_ARG_VADDR);
+    let arg = hosted_provider_export_lane::current_component_arg()
+        .or_else(hosted_class_irp_lane::current_component_arg).unwrap_or(FSD_ARG_VADDR);
     let mut copied = 0u64;
     while copied < len {
         let chunk = (len - copied).min(FSD_ARG_BYTES);
@@ -4993,7 +4997,8 @@ extern "win64" fn s_ke_bug_check_ex(code: u64, p1: u64, p2: u64, p3: u64, p4: u6
             print_u64(p1 & 0xFFFF);
             print_str(b")");
         }
-        let jb = hosted_class_irp_lane::current_jump_buffer()
+        let jb = hosted_provider_export_lane::current_jump_buffer()
+            .or_else(hosted_class_irp_lane::current_jump_buffer)
             .unwrap_or(core::ptr::addr_of_mut!(BUGCHECK_JB) as *mut u64);
         if read_volatile(jb.add(1)) != 0 {
             print_str(b" -> dispatch UNWOUND\n");
@@ -10665,12 +10670,15 @@ extern "win64" fn s_mm_get_physical_address(virtual_address: u64) -> u64 {
 /// grant fail with NULL; there is no success fallback.
 extern "win64" fn s_mm_map_io_space(phys: u64, length: u64, cache: u32) -> u64 {
     unsafe {
+        let shared = hosted_provider_export_lane::current_component_bank()
+            .or_else(hosted_class_irp_lane::current_component_bank)
+            .unwrap_or(FSD_SHARED_VADDR);
         if let Some(existing) = hosted_component_virtual_address(phys, length) {
             trace_hosted_mm_map_io_space(phys, length, cache, existing, b"component-map");
             return existing;
         }
         let Some(resource) = find_shared_address_resource_by_range(
-            FSD_SHARED_VADDR,
+            shared,
             SH_RESOURCE_ADDRESS_KIND_MEMORY,
             phys,
             length,
@@ -10685,11 +10693,11 @@ extern "win64" fn s_mm_map_io_space(phys: u64, length: u64, cache: u32) -> u64 {
         }
         let offset = phys - resource.translated_start;
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64,
+            (shared + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64,
             phys,
         );
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64,
+            (shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64,
             length,
         );
         let result = resource.va + offset;
@@ -10702,13 +10710,16 @@ extern "win64" fn s_mm_map_io_space(phys: u64, length: u64, cache: u32) -> u64 {
 /// owned by the executive grant and is torn down with the component.
 extern "win64" fn s_mm_unmap_io_space(base: u64, _length: u64) {
     unsafe {
-        if find_shared_address_resource_by_va(FSD_SHARED_VADDR, base, 1).is_some() {
+        let shared = hosted_provider_export_lane::current_component_bank()
+            .or_else(hosted_class_irp_lane::current_component_bank)
+            .unwrap_or(FSD_SHARED_VADDR);
+        if find_shared_address_resource_by_va(shared, base, 1).is_some() {
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64,
+                (shared + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64,
                 0,
             );
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64,
+                (shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64,
                 0,
             );
         }
@@ -18459,6 +18470,7 @@ const HOSTED_THUNK_PURPOSE_PROVIDER_IMPORT: u8 = 1;
 const HOSTED_THUNK_PURPOSE_PROVIDER_INTERNAL_IMPORT: u8 = 2;
 const HOSTED_THUNK_PURPOSE_PROVIDER_CALLBACK: u8 = 3;
 const HOSTED_THUNK_PURPOSE_DXG_REGISTRATION: u8 = 4;
+const HOSTED_THUNK_PURPOSE_DXG_INTERFACE: u8 = 5;
 
 #[derive(Clone, Copy)]
 struct LoadedDependencyImage {
@@ -29789,6 +29801,16 @@ unsafe fn prepare_provider_export_marshal(
                     provider_marshal_u32_arg(policy, args, length_index)?,
                 )?
             }
+            HostedProviderArgumentMarshal::CallerOutFixed { bytes } => {
+                provider_marshal_output_cell(
+                    &mut state,
+                    dependent_index,
+                    dependent_inst,
+                    marshal_window,
+                    arg,
+                    u64::from(bytes),
+                )?
+            }
             HostedProviderArgumentMarshal::CallerInMiniportCharacteristics { length_arg } => {
                 let length_index = length_arg as usize;
                 provider_marshal_miniport_characteristics(
@@ -30267,7 +30289,8 @@ unsafe fn complete_provider_export_side_effects(
     result: u64,
 ) -> Result<(), i32> {
     match policy.side_effect {
-        HostedProviderExportSideEffect::None => Ok(()),
+        HostedProviderExportSideEffect::None
+        | HostedProviderExportSideEffect::DxgInterfaceCallback => Ok(()),
         HostedProviderExportSideEffect::DxgRegistration => {
             if result != STATUS_SUCCESS as u64 { return Ok(()); }
             let route = hosted_provider_dispatch_route(state.ndis_route_index)
@@ -30955,7 +30978,14 @@ unsafe fn service_hosted_provider_export_explicit(
 ) -> u64 {
     let caller = match crate::provider_registry_caller::resolve(dependent_channel) {
         Ok(caller) => caller,
-        Err(status) => return hosted_provider_export_failure(status as i32),
+        Err(status) => {
+            print_str(b"[provider-export] reject stage=caller status=0x");
+            print_hex(status as u32);
+            print_str(b" rva=0x");
+            print_hex(provider_export_rva as u32);
+            print_str(b"\n");
+            return hosted_provider_export_failure(status as i32);
+        }
     };
     service_hosted_provider_export_with_dispatch(
         dependent_channel,
@@ -30964,16 +30994,15 @@ unsafe fn service_hosted_provider_export_explicit(
         caller_rsp,
         args,
         HostedProviderMarshalWindowSource::LEGACY_SHARED_BANK,
-        |singleton, provider_inst, exec_code_va, marshalled_args, caller_rsp| {
-            dispatch_hosted_provider_export_legacy(
-                caller,
-                singleton,
-                provider_inst,
-                exec_code_va,
-                provider_export_rva,
-                marshalled_args,
-                caller_rsp,
-            )
+        |singleton, provider_inst, exec_code_va, marshalled_args, caller_rsp, reentrant| {
+            if let Some(selection) = reentrant {
+                hosted_provider_export_lane::dispatch(
+                    selection, provider_export_rva, marshalled_args, caller_rsp, caller)
+            } else {
+                dispatch_hosted_provider_export_legacy(
+                    caller, singleton, provider_inst, exec_code_va, provider_export_rva,
+                    marshalled_args, caller_rsp)
+            }
         },
     )
 }
@@ -31049,12 +31078,14 @@ unsafe fn dispatch_hosted_provider_export_legacy(
         },
     };
     let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
-    if pr.completed {
+    let completion = nt_hosted_runtime::classify_hosted_provider_export_completion(
+        pr.completed, pr.status);
+    if completion == nt_hosted_runtime::HostedProviderExportCompletion::Reusable {
         return Ok(read_volatile((provider_shared + SH_REQ_INFO) as *const u64));
     }
     let trace = HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
     if trace < HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_CAP {
-        print_str(b"[provider-export] incomplete provider=");
+        print_str(b"[provider-export] retained provider=");
         print_str(singleton.provider.as_bytes());
         print_str(b" cookie=");
         print_u64(singleton.provider_publication_cookie);
@@ -31077,7 +31108,10 @@ unsafe fn dispatch_hosted_provider_export_legacy(
         print_str(b"\n");
     }
     register_instance_ready(singleton.instance, false);
-    Err(STATUS_UNSUCCESSFUL)
+    match completion {
+        nt_hosted_runtime::HostedProviderExportCompletion::Retain(status) => Err(status),
+        nt_hosted_runtime::HostedProviderExportCompletion::Reusable => unreachable!(),
+    }
 }
 
 unsafe fn service_hosted_provider_export_with_dispatch<F>(
@@ -31086,7 +31120,7 @@ unsafe fn service_hosted_provider_export_with_dispatch<F>(
     provider_publication_cookie: u64,
     caller_rsp: u64,
     mut args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
-    marshal_window_source: HostedProviderMarshalWindowSource,
+    mut marshal_window_source: HostedProviderMarshalWindowSource,
     dispatch: F,
 ) -> u64
 where
@@ -31096,6 +31130,7 @@ where
         u64,
         &[u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
         u64,
+        Option<hosted_provider_export_lane::Selection>,
     ) -> Result<u64, i32>,
 {
     HOSTED_PROVIDER_EXPORT_REQUESTS.fetch_add(1, Ordering::Relaxed);
@@ -31105,13 +31140,18 @@ where
         return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
     };
     let descriptor = hosted_provider_domain_descriptor(singleton);
-    let Some(policy) = loaded_pe_export_rva_marshal_policy(
-        singleton.provider.as_str(),
-        singleton.exec_va,
-        singleton.image_len,
-        provider_export_rva,
-    )
-    .or_else(|| hosted_provider_internal_rva_marshal_policy(singleton, provider_export_rva)) else {
+    let internal_policy = hosted_provider_internal_rva_marshal_policy(singleton,
+        provider_export_rva);
+    let policy = if hosted_dxg_registration::is_interface_callback_rva(
+        provider_publication_cookie, provider_export_rva)
+    {
+        internal_policy
+    } else {
+        loaded_pe_export_rva_marshal_policy(singleton.provider.as_str(),
+            singleton.exec_va, singleton.image_len, provider_export_rva)
+            .or(internal_policy)
+    };
+    let Some(policy) = policy else {
         return hosted_provider_export_failure(STATUS_NOT_SUPPORTED);
     };
     let packet_array_export = provider_policy_uses_packet_array(policy);
@@ -31159,6 +31199,22 @@ where
     {
         return hosted_provider_export_failure(STATUS_INVALID_PARAMETER);
     }
+    if policy.side_effect == HostedProviderExportSideEffect::DxgInterfaceCallback
+        && !hosted_dxg_registration::validate_interface_call(
+            singleton.instance,
+            dependent_index,
+            provider_publication_cookie,
+            provider_export_rva,
+            &args,
+        )
+    {
+        print_str(b"[provider-export] reject stage=dxg-interface-authority rva=0x");
+        print_hex(provider_export_rva as u32);
+        print_str(b" cookie=");
+        print_u64(provider_publication_cookie);
+        print_str(b"\n");
+        return hosted_provider_export_failure(STATUS_INVALID_PARAMETER);
+    }
     let Some(provider_inst) = instance(singleton.instance) else {
         return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
     };
@@ -31169,9 +31225,6 @@ where
     {
         return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
     }
-    let Some(marshal_window) = marshal_window_source.resolve(provider_inst.exec_shared_va) else {
-        return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
-    };
     if let Err(status) = ensure_hosted_provider_domain_dependency(
         singleton.instance,
         singleton.provider_publication_cookie,
@@ -31193,13 +31246,44 @@ where
     ) else {
         return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
     };
+    let reentrant = if policy.side_effect == HostedProviderExportSideEffect::DxgInterfaceCallback {
+        let Some(owner) = hosted_provider_object_owner_for_pair(singleton.instance, dependent_index)
+        else {
+            print_str(b"[provider-export] reject stage=dxg-worker-owner\n");
+            return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
+        };
+        if let Err(status) = hosted_provider_export_lane::prepare(
+            singleton.instance, dependent_index, owner, provider_publication_cookie) {
+            print_str(b"[provider-export] reject stage=dxg-worker-prepare status=0x");
+            print_hex(status.raw() as u32);
+            print_str(b"\n");
+            return hosted_provider_export_failure(status.raw() as i32);
+        }
+        let Some(selection) = hosted_provider_export_lane::select(
+            singleton.instance, owner, provider_publication_cookie)
+        else {
+            print_str(b"[provider-export] reject stage=dxg-worker-select\n");
+            return hosted_provider_export_failure(nt_status::NtStatus::DEVICE_BUSY.raw() as i32);
+        };
+        let Some(window) = HostedProviderMarshalWindow::new(
+            selection.component_shared.checked_add(SH_PROVIDER_EXPORT_MARSHAL_BASE)
+                .unwrap_or(0),
+            selection.executive_shared.checked_add(SH_PROVIDER_EXPORT_MARSHAL_BASE)
+                .unwrap_or(0),
+            SH_PROVIDER_EXPORT_MARSHAL_BYTES,
+        ) else { return hosted_provider_export_failure(STATUS_INVALID_PARAMETER); };
+        marshal_window_source.target_exact = Some(window);
+        Some(selection)
+    } else { None };
+    let provider_shared = reentrant.map_or(provider_inst.exec_shared_va, |row| row.executive_shared);
+    let Some(marshal_window) = marshal_window_source.resolve(provider_shared) else {
+        return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
+    };
     let Some(exec_code_va) =
         ExecVaWindow::try_for_instance(singleton.instance).map(|win| win.code_va)
     else {
         return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
     };
-    let provider_shared = provider_inst.exec_shared_va;
-
     let original_args = args;
     trace_hosted_provider_export_frame(
         b"enter",
@@ -31274,7 +31358,8 @@ where
     } else {
         provider_inst.image_frames
     };
-    let mut result = match dispatch(singleton, provider_inst, exec_code_va, &args, caller_rsp) {
+    let mut result = match dispatch(singleton, provider_inst, exec_code_va, &args, caller_rsp,
+        reentrant) {
         Ok(result) => result,
         Err(status) => {
             trace_hosted_provider_export_rejection(
@@ -33828,10 +33913,13 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                             hosted_dxg_registration::service_add_device_callback(
                                 dispatch, marshal_window, provider_inst, record,
                                 dependent_inst, exec_code_va, arg0, arg1),
-                        // Each remaining signature needs its own pointer projection
-                        // and copyout before it can be invoked across VSpaces.
-                        Some(nt_hosted_runtime::DxgDdiSignature::StartDevice)
-                        | Some(nt_hosted_runtime::DxgDdiSignature::StopDevice)
+                        Some(nt_hosted_runtime::DxgDdiSignature::StartDevice) =>
+                            hosted_dxg_registration::service_start_device_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1, arg2,
+                                arg3, stack0),
+                        // Each remaining signature needs its own pointer projection.
+                        Some(nt_hosted_runtime::DxgDdiSignature::StopDevice)
                         | Some(nt_hosted_runtime::DxgDdiSignature::RemoveDevice)
                         | None => Err(STATUS_NOT_SUPPORTED),
                     }
@@ -35788,32 +35876,36 @@ unsafe fn component_dispatch_video_win32k_callbacks(
 }
 
 unsafe fn component_dispatch_provider_export() -> (i32, u64) {
-    let export_rva = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
+    component_dispatch_provider_export_with_bank(
+        FSD_SHARED_VADDR, core::ptr::addr_of_mut!(BUGCHECK_JB) as *mut u64)
+}
+
+unsafe fn component_dispatch_provider_export_with_bank(shared: u64, jb: *mut u64) -> (i32, u64) {
+    let export_rva = read_volatile((shared + SH_REQ_MINOR) as *const u64);
     let export = match FSD_CODE_VA.checked_add(export_rva) {
         Some(export) => export,
         None => return (STATUS_INVALID_PARAMETER, 0),
     };
-    let arg0 = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
-    let arg1 = read_volatile((FSD_SHARED_VADDR + SH_REQ_INLEN) as *const u64);
-    let arg2 = read_volatile((FSD_SHARED_VADDR + SH_REQ_OUTLEN) as *const u64);
-    let arg3 = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
-    let jb = &mut *core::ptr::addr_of_mut!(BUGCHECK_JB);
-    jb[0] = 0;
-    jb[1] = 0;
-    jb[2] = 0;
+    let arg0 = read_volatile((shared + SH_REQ_FSCTL) as *const u64);
+    let arg1 = read_volatile((shared + SH_REQ_INLEN) as *const u64);
+    let arg2 = read_volatile((shared + SH_REQ_OUTLEN) as *const u64);
+    let arg3 = read_volatile((shared + SH_REQ_FILEID) as *const u64);
+    write_volatile(jb, 0);
+    write_volatile(jb.add(1), 0);
+    write_volatile(jb.add(2), 0);
     let mut args = [0u64; 12];
     args[..4].copy_from_slice(&[arg0, arg1, arg2, arg3]);
     for index in 0..8 {
         args[index + 4] = read_volatile(
-            (FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_STACK_BASE + (index as u64) * 8) as *const u64,
+            (shared + SH_PROVIDER_EXPORT_STACK_BASE + (index as u64) * 8) as *const u64,
         );
     }
-    let boundary = read_volatile((FSD_SHARED_VADDR + SH_SEH_FOREIGN_CALL16_VA) as *const u64);
-    assert_ne!(boundary, 0, "hosted provider export lacks its admitted PE boundary");
-    let result = fsd_guarded_call_vector(export, args.as_ptr(), 12, jb.as_mut_ptr(), boundary);
-    let bugchecked = jb[2] != 0;
-    jb[1] = 0;
-    jb[2] = 0;
+    let boundary = read_volatile((shared + SH_SEH_FOREIGN_CALL16_VA) as *const u64);
+    if boundary == 0 { return (STATUS_INVALID_DEVICE_REQUEST, 0); }
+    let result = fsd_guarded_call_vector(export, args.as_ptr(), 12, jb, boundary);
+    let bugchecked = read_volatile(jb.add(2)) != 0;
+    write_volatile(jb.add(1), 0);
+    write_volatile(jb.add(2), 0);
     if bugchecked {
         return (STATUS_UNSUCCESSFUL, 0);
     }
@@ -37783,7 +37875,8 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     if trace_active_write {
         trace_active_write_call_site(b"before-call", active_seq, file_id, handler, irp);
     }
-    let jb = hosted_class_irp_lane::current_jump_buffer()
+    let jb = hosted_provider_export_lane::current_jump_buffer()
+        .or_else(hosted_class_irp_lane::current_jump_buffer)
         .unwrap_or(core::ptr::addr_of_mut!(BUGCHECK_JB) as *mut u64);
     write_volatile(jb, 0);
     write_volatile(jb.add(1), 0);
@@ -57929,6 +58022,7 @@ struct HostedDriverThreadRuntime {
 #[derive(Clone, Copy)]
 struct HostedWorkerSharedBankSpec {
     offset: u64,
+    frames: u64,
     arg_offset: Option<u64>,
 }
 
@@ -58151,7 +58245,8 @@ fn hosted_driver_caller(
         }
         PhysicalSourceKind::DispatchWorker { ordinal } => {
             let runtime = unsafe { hosted_source_completion_lane::worker(instance, ordinal)
-                .or_else(|| hosted_class_irp_lane::worker(instance, ordinal))? };
+                .or_else(|| hosted_class_irp_lane::worker(instance, ordinal))
+                .or_else(|| hosted_provider_export_lane::worker(instance, ordinal))? };
             if runtime.domain != domain || runtime.tcb != source.tcb
                 || runtime.pml4 != source.pml4 || runtime.ingress_route != Some(route)
             { return None; }
@@ -58203,7 +58298,8 @@ fn clear_hosted_driver_threads_for_instance(instance: usize) {
                 .and_then(|rows| rows.get(index)).copied();
             let Some(runtime) = runtime.filter(|runtime| runtime.instance == instance) else { continue; };
             if !hosted_source_completion_lane::begin_worker_retirement(instance, runtime.handle)
-                || !hosted_class_irp_lane::begin_worker_retirement(instance, runtime.handle) {
+                || !hosted_class_irp_lane::begin_worker_retirement(instance, runtime.handle)
+                || !hosted_provider_export_lane::begin_worker_retirement(instance, runtime.handle) {
                 continue;
             }
             let _ = hosted_driver_thread_table_mut(instance).and_then(|table| {
@@ -58214,6 +58310,7 @@ fn clear_hosted_driver_threads_for_instance(instance: usize) {
             if hosted_thread_resources::retire_thread(instance, runtime.handle) {
                 hosted_source_completion_lane::finish_worker_retirement(instance, runtime.handle);
                 hosted_class_irp_lane::finish_worker_retirement(instance, runtime.handle);
+                hosted_provider_export_lane::finish_worker_retirement(instance, runtime.handle);
             }
         }
     }
@@ -59426,7 +59523,8 @@ fn instance_for_pump_channel(
 ) -> Option<(usize, DriverInstance)> {
     let (instance, inst) = instance_by_shared_va(ch.shared_va)
         .or_else(|| unsafe { hosted_source_completion_lane::instance_for_shared(ch.shared_va) })
-        .or_else(|| unsafe { hosted_class_irp_lane::instance_for_shared(ch.shared_va) })?;
+        .or_else(|| unsafe { hosted_class_irp_lane::instance_for_shared(ch.shared_va) })
+        .or_else(|| unsafe { hosted_provider_export_lane::instance_for_shared(ch.shared_va) })?;
     let captured = nt_io_manager::HostedTransportIdentity {
         domain: ch.physical_domain?,
         endpoint: ch.fault_ep,
@@ -59443,7 +59541,9 @@ fn instance_for_pump_channel(
         hosted_source_completion_lane::matches_channel(instance, inst, ch)
     };
     let class_lane = unsafe { hosted_class_irp_lane::matches_channel(instance, inst, ch) };
-    if (!captured.matches_live(live) && !completion_lane && !class_lane) || active_reply_cap == 0 {
+    let provider_lane = unsafe { hosted_provider_export_lane::matches_channel(instance, inst, ch) };
+    if (!captured.matches_live(live) && !completion_lane && !class_lane && !provider_lane)
+        || active_reply_cap == 0 {
         return None;
     }
     let route =
@@ -60908,7 +61008,8 @@ fn service_hosted_irp_bank_pull(
     let Some((_instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
         return STATUS_INVALID_PARAMETER;
     };
-    let arg = unsafe { hosted_class_irp_lane::executive_arg_for_shared(ch.shared_va) }
+    let arg = unsafe { hosted_provider_export_lane::executive_arg_for_shared(ch.shared_va) }
+        .or_else(|| unsafe { hosted_class_irp_lane::executive_arg_for_shared(ch.shared_va) })
         .unwrap_or(inst.exec_arg_va);
     if arg == 0 {
         return STATUS_INVALID_PARAMETER;
@@ -60967,7 +61068,8 @@ pub(crate) fn service_hosted_irp_output_push(
     let Some((_instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
         return STATUS_INVALID_PARAMETER;
     };
-    let arg = unsafe { hosted_class_irp_lane::executive_arg_for_shared(ch.shared_va) }
+    let arg = unsafe { hosted_provider_export_lane::executive_arg_for_shared(ch.shared_va) }
+        .or_else(|| unsafe { hosted_class_irp_lane::executive_arg_for_shared(ch.shared_va) })
         .unwrap_or(inst.exec_arg_va);
     if arg == 0 {
         return STATUS_INVALID_PARAMETER;
@@ -62211,13 +62313,10 @@ unsafe fn spawn_hosted_driver_worker_thread_with_shared_bank(
     let kpcr_exec_va = exec_base.checked_add(FSD_WORKER_KPCR_OFFSET)?;
     let shared_bank = match shared_bank_spec {
         Some(spec) => {
-            if spec.offset & 0xfff != 0
-                || spec.offset < FSD_WORKER_KPCR_OFFSET.checked_add(0x1000)?
-                || spec.offset.checked_add(0x1000)? > FSD_WORKER_STRIDE
-                || spec.arg_offset.is_some_and(|arg| arg & 0xfff != 0
-                    || arg < spec.offset + 0x1000
-                    || arg.checked_add(FSD_ARG_FRAMES * 0x1000)
-                        .is_none_or(|end| end > FSD_WORKER_STRIDE))
+            if spec.offset < FSD_WORKER_KPCR_OFFSET.checked_add(0x1000)?
+                || nt_hosted_runtime::HostedWorkerBankLayout::new(
+                    spec.offset, spec.frames, spec.arg_offset, FSD_ARG_FRAMES,
+                    FSD_WORKER_STRIDE).is_none()
             {
                 return None;
             }
@@ -62230,8 +62329,11 @@ unsafe fn spawn_hosted_driver_worker_thread_with_shared_bank(
         }
         None => None,
     };
-    let additional_resources = (if shared_bank.is_some() { 2 } else { 0 })
-        + (if shared_bank.is_some_and(|bank| bank.arg_component.is_some()) { 16 } else { 0 });
+    let additional_resources = shared_bank_spec.map_or(Some(0usize), |spec|
+        usize::try_from(spec.frames).ok()?.checked_mul(4))?
+        .checked_add(if shared_bank.is_some_and(|bank| bank.arg_component.is_some()) {
+            (FSD_ARG_FRAMES as usize) * 4
+        } else { 0 })?;
 
     let domain = instance_domain_identity(inst)?;
     let Some(construction) =
@@ -62297,23 +62399,23 @@ unsafe fn spawn_hosted_driver_worker_thread_with_shared_bank(
     }
 
     if let Some(bank) = shared_bank {
-        let frame = alloc_frame();
-        hosted_thread_resources::root(construction, frame);
-        let executive_frame = copy_cap(frame);
-        hosted_thread_resources::root(construction, executive_frame);
-        hosted_thread_resources::mapping(construction, frame);
-        if page_map_r(frame, bank.component, RW_NX, inst.pml4) != 0 { return None; }
-        hosted_thread_resources::mapping(construction, executive_frame);
-        if page_map_r(
-            executive_frame,
-            bank.executive,
-            RW_NX,
-            CAP_INIT_THREAD_VSPACE,
-        ) != 0
-        {
-            return None;
+        let frames = shared_bank_spec.expect("mapped bank retains its checked specification").frames;
+        for page in 0..frames {
+            let frame = alloc_frame();
+            hosted_thread_resources::root(construction, frame);
+            let executive_frame = copy_cap(frame);
+            hosted_thread_resources::root(construction, executive_frame);
+            hosted_thread_resources::mapping(construction, frame);
+            if page_map_r(frame, bank.component + page * 0x1000, RW_NX, inst.pml4) != 0 {
+                return None;
+            }
+            hosted_thread_resources::mapping(construction, executive_frame);
+            if page_map_r(executive_frame, bank.executive + page * 0x1000,
+                RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+                return None;
+            }
+            core::ptr::write_bytes((bank.executive + page * 0x1000) as *mut u8, 0, 0x1000);
         }
-        core::ptr::write_bytes(bank.executive as *mut u8, 0, 0x1000);
         if let (Some(component_arg), Some(executive_arg)) =
             (bank.arg_component, bank.arg_executive) {
             for page in 0..FSD_ARG_FRAMES {

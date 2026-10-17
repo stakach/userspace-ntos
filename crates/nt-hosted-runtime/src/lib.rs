@@ -11,12 +11,17 @@ mod hosted_irq_call_stack;
 mod progress_deferral;
 mod driver_load_receipt;
 mod dxg_registration;
+mod provider_export_worker;
 
 pub use driver_load_receipt::{DriverLoadPhase, RetainedEffectState};
 pub use dxg_registration::{
     DxgCallbackSlot, DxgCallbackSlots, DxgDdiSignature, DxgEntryAuthority, DxgInitializationData,
     DxgInitializationDataError, DxgPdoAliasAuthority, DxgRegistrationKey, DxgSourceDriverObject,
+    DxgStartInterface, DxgStartInterfaceCallbacks, DxgStartInterfaceError,
 };
+pub use provider_export_worker::{HostedProviderExportCompletion, HostedProviderWorkerIdentity,
+    HostedWorkerBankLayout, classify_hosted_provider_export_completion,
+    select_hosted_cr8_bank, select_hosted_provider_export_worker};
 
 pub use hosted_irq_arena::{
     decode_hosted_irq_transport_message, HostedIrqArena, HostedIrqArenaConfig,
@@ -890,6 +895,9 @@ pub enum HostedProviderArgumentMarshal {
     CallerOutBuffer {
         length_arg: u8,
     },
+    CallerOutFixed {
+        bytes: u16,
+    },
     CallerInMiniportCharacteristics {
         length_arg: u8,
     },
@@ -960,6 +968,7 @@ pub enum HostedProviderArgumentMarshal {
 pub enum HostedProviderExportSideEffect {
     None,
     DxgRegistration,
+    DxgInterfaceCallback,
     NdisInitializeWrapper,
     NdisTerminateWrapper,
     NdisMiniportRegistration,
@@ -1156,6 +1165,17 @@ pub fn hosted_dxg_registration_marshal_policy() -> HostedProviderExportMarshalPo
         HostedProviderExportSideEffect::DxgRegistration,
     )
     .expect("three Dxg registration arguments fit the provider call frame")
+}
+
+/// The pinned DXGK_INTERFACE AcquirePostDisplayOwnership callback accepts a
+/// device handle and writes one DXGK_DISPLAY_INFORMATION (32 bytes).
+pub fn hosted_dxg_acquire_post_display_marshal_policy() -> HostedProviderExportMarshalPolicy {
+    use HostedProviderArgumentMarshal::*;
+    export_policy_with_side_effect(
+        &[Scalar, CallerOutFixed { bytes: 32 }],
+        HostedProviderExportSideEffect::DxgInterfaceCallback,
+    )
+    .expect("two Dxg interface callback arguments fit the provider call frame")
 }
 
 fn export_policy_with_effect_and_result(

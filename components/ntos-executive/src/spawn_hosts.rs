@@ -2536,6 +2536,8 @@ unsafe fn component_pump_loop(
                 crate::driver_launch::hosted_source_completion_lane::startup_expected(ch).is_some();
             let class_starting =
                 crate::driver_launch::hosted_class_irp_lane::startup_expected(ch).is_some();
+            let provider_starting =
+                crate::driver_launch::hosted_provider_export_lane::startup_expected(ch).is_some();
             if hosted_starting
                 && !crate::driver_launch::hosted_source_completion_lane::validate_startup_ready(
                     ch,
@@ -2553,7 +2555,15 @@ unsafe fn component_pump_loop(
                 outcome.wall(msg);
                 break;
             }
-            let starting = hosted_starting || class_starting
+            if provider_starting
+                && !crate::driver_launch::hosted_provider_export_lane::validate_startup_ready(
+                    ch, [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4],
+                )
+            {
+                outcome.wall(msg);
+                break;
+            }
+            let starting = hosted_starting || class_starting || provider_starting
                 || (ch.caps.kind == ReqKind::Syscall
                     && ch.initial == InitialAction::RecvFirst
                     && crate::win32k_glue::win32k_physical_lane_for_channel(

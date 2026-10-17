@@ -154,7 +154,8 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
     (&mut *core::ptr::addr_of_mut!(LANES))[index].handle = handle;
     let spawn = spawn_hosted_driver_worker_thread_with_shared_bank(
         instance_index, inst, handle, slot, entry as *const () as u64, shared,
-        Some(HostedWorkerSharedBankSpec { offset: BANK_OFFSET, arg_offset: Some(ARG_OFFSET) }),
+        Some(HostedWorkerSharedBankSpec { offset: BANK_OFFSET, frames: 1,
+            arg_offset: Some(ARG_OFFSET) }),
     ).ok_or(STATUS_INSUFFICIENT_RESOURCES as u32)?;
     let bank = spawn.shared_bank.ok_or(STATUS_INVALID_HANDLE as u32)?;
     if bank.component != shared || bank.arg_component

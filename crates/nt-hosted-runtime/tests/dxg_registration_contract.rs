@@ -7,7 +7,8 @@
 use nt_hosted_runtime::{
     hosted_dxg_registration_marshal_policy, DxgEntryAuthority, DxgInitializationData,
     DxgInitializationDataError, DxgRegistrationKey, DxgSourceDriverObject, DxgDdiSignature,
-    DxgPdoAliasAuthority,
+    DxgPdoAliasAuthority, DxgStartInterface, DxgStartInterfaceError,
+    hosted_dxg_acquire_post_display_marshal_policy,
     HostedProviderArgumentMarshal,
     HostedProviderExportResultSemantics, HostedProviderExportSideEffect, HostedProviderObjectOwner,
 };
@@ -246,4 +247,44 @@ fn reverse_add_device_alias_binds_both_pdo_generations_and_canonical_device() {
         33, 44, 0x1000, 55, 0x2000, 66));
     assert!(DxgPdoAliasAuthority::new(owner, 33, 44, 0x1000, 55, 0x2000, 0).is_none());
     assert!(DxgPdoAliasAuthority::new(owner, 33, 44, 0x1000, 0, 0x2000, 66).is_none());
+}
+
+#[test]
+fn pinned_wddm_32_start_interface_is_bounded_and_requires_first_callbacks() {
+    let mut interface = vec![0u8; 0x240];
+    interface[0..4].copy_from_slice(&0x240u32.to_le_bytes());
+    interface[4..8].copy_from_slice(&0x11007u32.to_le_bytes());
+    put_callback(&mut interface, 0x8, 0x1000); // provider-owned DeviceHandle
+    put_callback(&mut interface, 0x80, 0x2080); // NotifyInterrupt
+    put_callback(&mut interface, 0x88, 0x2088); // NotifyDpc
+    put_callback(&mut interface, 0xd8, 0x20d8); // AcquirePostDisplayOwnership
+    let parsed = DxgStartInterface::parse(&interface).unwrap();
+    assert_eq!(parsed.size(), 0x240);
+    assert_eq!(parsed.version(), 0x11007);
+    assert_eq!(parsed.device_handle(), 0x1000);
+    assert_eq!(parsed.callback_at(0xd8), Some(0x20d8));
+    assert_eq!(parsed.callback_at(0x240), None);
+    assert_eq!(parsed.callbacks().count(), 3);
+
+    let mut bad = interface.clone();
+    put_callback(&mut bad, 0xd8, 0);
+    assert_eq!(DxgStartInterface::parse(&bad), Err(DxgStartInterfaceError::MissingRequired));
+    let mut bad = interface.clone();
+    bad[4..8].copy_from_slice(&0x11008u32.to_le_bytes());
+    assert_eq!(DxgStartInterface::parse(&bad), Err(DxgStartInterfaceError::UnknownVersion));
+    let mut bad = interface.clone();
+    bad[0..4].copy_from_slice(&0x238u32.to_le_bytes());
+    assert_eq!(DxgStartInterface::parse(&bad), Err(DxgStartInterfaceError::BadSize));
+    assert_eq!(DxgStartInterface::parse(&interface[..0x23f]),
+        Err(DxgStartInterfaceError::Truncated));
+}
+
+#[test]
+fn acquire_post_display_has_exact_two_argument_output_policy() {
+    let policy = hosted_dxg_acquire_post_display_marshal_policy();
+    assert_eq!(policy.argument_count, 2);
+    assert_eq!(policy.args[0], HostedProviderArgumentMarshal::Scalar);
+    assert_eq!(policy.args[1], HostedProviderArgumentMarshal::CallerOutFixed { bytes: 32 });
+    assert_eq!(policy.side_effect, HostedProviderExportSideEffect::DxgInterfaceCallback);
+    assert_eq!(policy.result_semantics, HostedProviderExportResultSemantics::NtStatus);
 }

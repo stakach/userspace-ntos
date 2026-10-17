@@ -943,6 +943,21 @@ pub(super) unsafe fn capture_allocation(
     allocation(inst, address)
 }
 
+/// Resolve an interior output cell to its exact physical pool allocation.
+/// The caller retains the returned generation across a parked callback and
+/// rechecks it before copyout; owned Device projections remain free excluded
+/// by their registration, while other allocations need a temporary pin.
+pub(super) unsafe fn capture_range_allocation(
+    inst: DriverInstance,
+    address: u64,
+    bytes: u64,
+) -> Result<SourcePoolAllocationIdentity, nt_status::NtStatus> {
+    validate_arena(inst)?;
+    let _pool =
+        hosted_instance_pool_lock(inst.exec_pool_va).ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    allocation_containing(inst, address, bytes)
+}
+
 /// Free one row-owned graph member only when its original physical allocation is still live.
 /// The caller clears its ownership bit only after this exact free acknowledges success.
 pub(super) unsafe fn free_captured_allocation(

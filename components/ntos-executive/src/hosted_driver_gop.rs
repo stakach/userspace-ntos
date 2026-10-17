@@ -51,7 +51,10 @@ pub(super) extern "win64" fn s_inbv_get_gop_frame_buffer_info(output: u64) -> u8
         return 0;
     }
     unsafe {
-        copy_bytes_unchecked(output, FSD_ARG_VADDR, GOP_ARG_BYTES);
+        let arg = hosted_provider_export_lane::current_component_arg()
+            .or_else(hosted_class_irp_lane::current_component_arg)
+            .unwrap_or(FSD_ARG_VADDR);
+        copy_bytes_unchecked(output, arg, GOP_ARG_BYTES);
     }
     1
 }
@@ -115,9 +118,13 @@ pub(crate) fn service_hosted_driver_gop_query(
     let Some((instance, inst)) = instance_for_pump_channel(channel, reply_cap) else {
         return 0;
     };
-    if hosted_driver_caller(instance, inst, caller_badge).is_none() || inst.exec_arg_va == 0 {
+    if hosted_driver_caller(instance, inst, caller_badge).is_none() {
         return 0;
     }
+    let arg = unsafe { hosted_provider_export_lane::executive_arg_for_shared(channel.shared_va) }
+        .or_else(|| unsafe { hosted_class_irp_lane::executive_arg_for_shared(channel.shared_va) })
+        .unwrap_or(inst.exec_arg_va);
+    if arg == 0 { return 0; }
     let bar = crate::FB_BAR_PADDR.load(Ordering::Acquire);
     let pages = crate::FB_BAR_FRAME_COUNT.load(Ordering::Acquire);
     let offset = crate::FB_SCANOUT_BAR_OFFSET.load(Ordering::Acquire);
@@ -152,7 +159,7 @@ pub(crate) fn service_hosted_driver_gop_query(
         Dpi: 96, // LiberNT LOADER_PARAMETER_FRAMEBUFFER_DPI_DEFAULT.
     };
     unsafe {
-        core::ptr::write_unaligned(inst.exec_arg_va as *mut LoaderParameterFramebuffer, record);
+        core::ptr::write_unaligned(arg as *mut LoaderParameterFramebuffer, record);
     }
     1
 }

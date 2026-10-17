@@ -653,7 +653,11 @@ impl HostedIrqRootSession {
             0,
             command.arguments,
             marshal_window_source,
-            |singleton, _provider_inst, _exec_code_va, arguments, _caller_rsp| {
+            |singleton, _provider_inst, _exec_code_va, arguments, _caller_rsp, reentrant| {
+                if reentrant.is_some() {
+                    dispatch_error = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                    return Err(STATUS_INVALID_DEVICE_REQUEST);
+                }
                 if singleton.instance != dependency.provider_instance
                     || singleton.owner_domain != dependency.provider_domain
                     || command.service_id >= singleton.image_len as u64

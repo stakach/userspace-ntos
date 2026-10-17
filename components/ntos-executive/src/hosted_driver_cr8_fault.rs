@@ -1,4 +1,4 @@
-//! Authenticated inline CR8 access from a stopped hosted driver primary lane.
+//! Authenticated inline CR8 access from a stopped hosted driver primary or provider-export lane.
 
 use super::*;
 use nt_kernel_exec::x86_cr8::{
@@ -9,8 +9,8 @@ pub(crate) enum Cr8FaultOutcome { Unrelated, Applied, Rejected }
 
 /// The executive mirror of the component's IRQL byte is selected through the
 /// admitted physical instance. A component-supplied address is never authority.
-unsafe fn hosted_current_irql(inst: DriverInstance) -> Option<(u64, u8)> {
-    let address = inst.exec_shared_va.checked_add(SH_HOSTED_CURRENT_IRQL)?;
+unsafe fn hosted_current_irql(shared: u64) -> Option<(u64, u8)> {
+    let address = shared.checked_add(SH_HOSTED_CURRENT_IRQL)?;
     let value = read_volatile(address as *const u8);
     (value <= 15).then_some((address, value))
 }
@@ -39,10 +39,18 @@ pub(crate) unsafe fn service(
     let Some(caller) = hosted_driver_caller(index, inst, badge) else {
         return Cr8FaultOutcome::Rejected;
     };
-    // The primary's shared IRQL byte is exact. Worker/IRQ lanes use distinct
-    // scheduling authority and must not alias that primary state.
-    if caller.runtime.is_some() || channel.tcb != inst.tcb
-        || channel.ingress_route != Some(caller.route)
+    // A provider-export worker has its own IRQL byte in its exact retained bank. Other worker
+    // and IRQ lanes cannot borrow either that byte or the primary's dispatch authority.
+    let provider_worker = unsafe {
+        hosted_provider_export_lane::matches_channel(index, inst, channel)
+    };
+    let primary = caller.runtime.is_none() && channel.tcb == inst.tcb
+        && channel.shared_va == inst.exec_shared_va;
+    let Some(shared) = nt_hosted_runtime::select_hosted_cr8_bank(
+        inst.exec_shared_va, channel.shared_va, primary, provider_worker) else {
+        return Cr8FaultOutcome::Rejected;
+    };
+    if channel.ingress_route != Some(caller.route)
     { return Cr8FaultOutcome::Rejected; }
     // Per-IRP pumps deliberately set code_va/image_frames to zero to disable
     // demand-fault wall checks. Resolve code only after physical source
@@ -81,7 +89,7 @@ pub(crate) unsafe fn service(
     if read.is_none() && write.is_none() {
         return Cr8FaultOutcome::Unrelated;
     }
-    let Some((irql_address, current_irql)) = hosted_current_irql(inst) else {
+    let Some((irql_address, current_irql)) = hosted_current_irql(shared) else {
         return Cr8FaultOutcome::Rejected;
     };
     let Ok(snapshot) = crate::thread_context::LegacyThreadContext::read(channel.tcb) else {
@@ -105,7 +113,13 @@ pub(crate) unsafe fn service(
     };
     if crate::driver_launch::hosted_exception_stack::fault_source_identity(
         channel, active_reply_cap, badge,
-    ) != source || hosted_current_irql(inst) != Some((irql_address, current_irql))
+    ) != source || hosted_current_irql(shared) != Some((irql_address, current_irql))
+        || nt_hosted_runtime::select_hosted_cr8_bank(
+            inst.exec_shared_va, channel.shared_va,
+            caller.runtime.is_none() && channel.tcb == inst.tcb
+                && channel.shared_va == inst.exec_shared_va,
+            hosted_provider_export_lane::matches_channel(index, inst, channel),
+        ) != Some(shared)
         || hosted_driver_process_notify::published_image_for_callback(index, inst, words[0])
             != Some(image)
     { return Cr8FaultOutcome::Rejected; }

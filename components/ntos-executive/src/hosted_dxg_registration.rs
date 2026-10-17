@@ -6,9 +6,10 @@
 
 use super::*;
 use nt_hosted_runtime::{
-    DxgEntryAuthority, DxgInitializationData, DxgPdoAliasAuthority,
+    DxgEntryAuthority, DxgInitializationData, DxgPdoAliasAuthority, DxgStartInterface,
     DxgRegistrationKey, DxgSourceDriverObject,
     encode_hosted_dxg_registration_thunk,
+    hosted_dxg_acquire_post_display_marshal_policy,
     hosted_dxg_registration_marshal_policy,
 };
 use nt_io_manager::{HostedDevicePointerRegistration,
@@ -45,10 +46,122 @@ struct DxgPdoAlias {
     alias_allocation: Option<nt_io_manager::source_irp_auxiliary::SourcePoolAllocationIdentity>,
     authority: Option<DxgPdoAliasAuthority>,
     context: u64,
+    context_allocation: Option<nt_io_manager::source_irp_auxiliary::SourcePoolAllocationIdentity>,
+    provider_fdo_allocation: nt_io_manager::source_irp_auxiliary::SourcePoolAllocationIdentity,
+    provider_fdo: HostedDevicePointerRegistration,
+    start_sources_output: Option<StartOutputGuard>,
+    start_children_output: Option<StartOutputGuard>,
+    provider_domain: HostedDomainIdentity,
+    provider_publication_cookie: u64,
+    interface_handle: u64,
+    interface_callbacks: Vec<DxgInterfaceCallback>,
+    start_entered: bool,
     callback_entered: bool,
     pointer_retired: bool,
     blocked: bool,
 }
+
+#[derive(Clone, Copy)]
+struct DxgInterfaceCallback {
+    cookie: u32,
+    offset: usize,
+    provider_rva: u64,
+    binding: HostedExecutableThunkBinding,
+}
+
+/// A provider output cell is either inside the exact published FDO or in a
+/// separate pool allocation pinned for this callback. Interior pointers are
+/// resolved to their physical allocation before the miniport is entered.
+struct StartOutputGuard {
+    address: u64,
+    allocation: nt_io_manager::source_irp_auxiliary::SourcePoolAllocationIdentity,
+    owned_fdo: Option<HostedDevicePointerRegistration>,
+    pin: Option<hosted_device_allocations::TemporaryPoolPin>,
+}
+
+impl StartOutputGuard {
+    unsafe fn capture(inst: DriverInstance, domain: HostedDomainIdentity,
+        address: u64,
+        fdo_allocation: nt_io_manager::source_irp_auxiliary::SourcePoolAllocationIdentity,
+        fdo: HostedDevicePointerRegistration) -> Result<Self, i32>
+    {
+        let allocation = hosted_device_allocations::capture_range_allocation(inst, address, 4)
+            .map_err(|status| status.raw())?;
+        let owned_fdo = if allocation == fdo_allocation
+            && io_manager_mut().hosted_device_pointer_registration(domain, fdo.address())
+                == Some(fdo)
+        {
+            Some(fdo)
+        } else {
+            None
+        };
+        let pin = if owned_fdo.is_none() {
+            let pin = hosted_device_allocations::pin_temporary_pool_range(inst, address, 4)
+                .map_err(|status| status.raw())?;
+            if pin.allocation() != allocation {
+                let mut pin = pin;
+                let _ = hosted_device_allocations::release_temporary_pool_pin(&mut pin);
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            Some(pin)
+        } else {
+            None
+        };
+        Ok(Self { address, allocation, owned_fdo, pin })
+    }
+
+    unsafe fn live(&self, inst: DriverInstance, domain: HostedDomainIdentity) -> bool {
+        hosted_device_allocations::capture_range_allocation(inst, self.address, 4).ok()
+            == Some(self.allocation)
+            && self.owned_fdo.is_none_or(|fdo| {
+                io_manager_mut().hosted_device_pointer_registration(domain, fdo.address())
+                    == Some(fdo)
+            })
+            && self.pin.as_ref().is_none_or(|pin| {
+                !hosted_device_allocations::temporary_pool_pin_uncertain(pin)
+                    && pin.allocation() == self.allocation
+            })
+    }
+
+    unsafe fn write(&self, instance_index: usize, inst: DriverInstance,
+        domain: HostedDomainIdentity,
+        value: u32) -> Result<(), i32>
+    {
+        if !self.live(inst, domain) { return Err(STATUS_INVALID_PARAMETER); }
+        if let Some(pin) = self.pin.as_ref() {
+            let offset = self.address - self.allocation.component_address;
+            hosted_device_allocations::write_temporary_pool_pin(pin, offset,
+                &value.to_le_bytes()).map_err(|status| status.raw())
+        } else {
+            let exec = component_to_exec_va_for_instance(
+                instance_index, inst, self.address, 4).ok_or(STATUS_INVALID_PARAMETER)?;
+            write_unaligned(exec as *mut u32, value);
+            Ok(())
+        }
+    }
+
+    fn retain_uncertain(&self) {
+        if let Some(pin) = self.pin.as_ref() {
+            hosted_device_allocations::retain_temporary_pool_pin_uncertain(pin);
+        }
+    }
+
+    unsafe fn release(&mut self) -> Result<(), i32> {
+        if let Some(pin) = self.pin.as_mut() {
+            hosted_device_allocations::release_temporary_pool_pin(pin)
+                .map_err(|status| status.raw())?;
+            self.pin = None;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StartOutputGuard {
+    fn drop(&mut self) {
+        unsafe { let _ = self.release(); }
+    }
+}
+
 
 static mut PDO_ALIASES: Vec<DxgPdoAlias> = Vec::new();
 
@@ -310,6 +423,66 @@ pub(super) unsafe fn validate_call(
             .is_some_and(|slots| slots.is_live(record.binding.token, record.binding.key))
 }
 
+pub(super) unsafe fn is_interface_callback_rva(
+    provider_publication_cookie: u64,
+    provider_rva: u64,
+) -> bool {
+    (&*core::ptr::addr_of!(PDO_ALIASES)).iter().any(|alias| {
+        alias.provider_publication_cookie == provider_publication_cookie
+            && alias.interface_callbacks.iter().any(|callback| {
+                callback.provider_rva == provider_rva
+            })
+    })
+}
+
+/// The hidden fourth Win64 register is a generation cookie placed by our
+/// thunk. A valid handle alone cannot authorize a callback for another alias
+/// or a recycled provider publication.
+pub(super) unsafe fn validate_interface_call(
+    provider_instance: usize,
+    dependent_instance: usize,
+    provider_publication_cookie: u64,
+    provider_rva: u64,
+    args: &[u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+) -> bool {
+    let Some(provider) = instance(provider_instance) else { return false; };
+    let Some(dependent) = instance(dependent_instance) else { return false; };
+    let Some(provider_domain) = instance_domain_identity(provider) else { return false; };
+    let Some(dependent_domain) = instance_domain_identity(dependent) else { return false; };
+    let Some(owner) = hosted_provider_object_owner_for_pair(provider_instance,
+        dependent_instance) else { return false; };
+    (&*core::ptr::addr_of!(PDO_ALIASES)).iter().any(|alias| {
+        let Some(callback) = alias.interface_callbacks.iter().find(|callback| {
+            callback.cookie as u64 == args[3]
+                && callback.offset == 0xd8
+                && callback.provider_rva == provider_rva
+        }) else { return false; };
+        let Some(dependent_pdo) = alias.dependent_alias else { return false; };
+        let Some(authority) = alias.authority else { return false; };
+        alias.provider_instance == provider_instance
+            && alias.dependent_instance == dependent_instance
+            && alias.provider_domain == provider_domain
+            && alias.dependent_domain == dependent_domain
+            && alias.provider_publication_cookie == provider_publication_cookie
+            && alias.start_entered && !alias.pointer_retired
+            && alias.interface_handle != 0 && alias.interface_handle == args[0]
+            && alias.context != 0
+            && hosted_device_allocations::capture_allocation(dependent,
+                alias.context).ok() == alias.context_allocation
+            && io_manager_mut().hosted_device_pointer_registration(
+                provider_domain, alias.provider_pdo.address()) == Some(alias.provider_pdo)
+            && io_manager_mut().hosted_device_pointer_registration(
+                dependent_domain, dependent_pdo.address()) == Some(dependent_pdo)
+            && authority.matches(owner, provider_publication_cookie,
+                alias.provider_pdo.device_id().raw(), alias.provider_pdo.address(),
+                alias.provider_pdo.generation(), dependent_pdo.address(),
+                dependent_pdo.generation())
+            && driver_instance_thunk_slots().and_then(|rows| rows.get(dependent_instance))
+                .is_some_and(|slots| slots.is_live(callback.binding.token,
+                    callback.binding.key))
+    })
+}
+
 /// DxgKrnl supplies its PDO and an out cell in the provider VSpace. The
 /// miniport receives a separate PDO projection of the same canonical Device.
 /// The alias owner is recorded before entering either component and retained
@@ -327,7 +500,7 @@ pub(super) unsafe fn service_add_device_callback(
     let provider_pdo = hosted_add_device_rollback::active_pdo_registration(
         record.provider_instance, record.provider_domain, provider_pdo_address)
         .ok_or(STATUS_INVALID_PARAMETER)?;
-    let (_, output_allocation) = hosted_add_device_rollback::active_created_output(
+    let (_, output_allocation, provider_fdo) = hosted_add_device_rollback::active_created_output(
         record.provider_instance, record.provider_domain, provider_pdo,
         provider_context_out).ok_or(STATUS_INVALID_PARAMETER)?;
     let owner = hosted_provider_object_owner_for_pair(
@@ -360,6 +533,16 @@ pub(super) unsafe fn service_add_device_callback(
             alias_allocation: None,
             authority: None,
             context: 0,
+            context_allocation: None,
+            provider_fdo_allocation: output_allocation,
+            provider_fdo,
+            start_sources_output: None,
+            start_children_output: None,
+            provider_domain: record.provider_domain,
+            provider_publication_cookie: record.provider_publication_cookie,
+            interface_handle: 0,
+            interface_callbacks: Vec::new(),
+            start_entered: false,
             callback_entered: false,
             pointer_retired: false,
             blocked: true,
@@ -419,10 +602,252 @@ pub(super) unsafe fn service_add_device_callback(
             return Err(STATUS_INVALID_PARAMETER);
         }
         let context = read_unaligned(marshal_window.exec_base as *const u64);
+        let context_allocation = if context != 0 {
+            Some(hosted_device_allocations::capture_allocation(dependent_inst, context)
+                .map_err(|status| status.raw())?)
+        } else {
+            None
+        };
         write_unaligned(current_provider.0 as *mut u64, context);
         pdo_aliases_mut()[alias_index].context = context;
+        pdo_aliases_mut()[alias_index].context_allocation = context_allocation;
         pdo_aliases_mut()[alias_index].blocked = false;
     }
+    Ok(result)
+}
+
+/// DxgKrnl's StartDevice frame is provider-owned. A miniport receives copied
+/// value data, private output cells, and an interface whose nonzero callbacks
+/// are generation-bound import thunks into the live provider image.
+pub(super) unsafe fn service_start_device_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    marshal_window: HostedProviderMarshalWindow,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    provider_context: u64,
+    provider_start_info: u64,
+    provider_interface: u64,
+    provider_sources_out: u64,
+    provider_children_out: u64,
+) -> Result<u64, i32> {
+    // ULONG + GUID + LUID, with 4-byte Windows ABI alignment.
+    const START_INFO_LEN: u64 = 0x1c;
+    const INTERFACE_LEN: u64 = 0x240;
+    const INTERFACE_OFFSET: u64 = 0x20;
+    const SOURCES_OFFSET: u64 = INTERFACE_OFFSET + INTERFACE_LEN;
+    const CHILDREN_OFFSET: u64 = SOURCES_OFFSET + 8;
+    print_str(b"[dxg-start] context=0x");
+    print_hex64(provider_context);
+    print_str(b" interface=0x");
+    print_hex64(provider_interface);
+    print_str(b" sources=0x");
+    print_hex64(provider_sources_out);
+    print_str(b" children=0x");
+    print_hex64(provider_children_out);
+    print_str(b"\n");
+    provider_callback_marshal_window(marshal_window, CHILDREN_OFFSET + 8, 0)
+        .map_err(|status| reject(b"start-window", status))?;
+    let owner = hosted_provider_object_owner_for_pair(
+        record.provider_instance, record.dependent_instance)
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
+    let alias_index = pdo_aliases_mut().iter().position(|alias| {
+        alias.provider_instance == record.provider_instance
+            && alias.dependent_instance == record.dependent_instance
+            && alias.provider_domain == record.provider_domain
+            && alias.dependent_domain == record.dependent_domain
+            && alias.provider_publication_cookie == record.provider_publication_cookie
+            && alias.context != 0 && alias.context == provider_context
+            && alias.context_allocation.is_some()
+            && alias.authority.is_some()
+            && !alias.blocked && !alias.start_entered
+    }).ok_or_else(|| reject(b"start-alias", STATUS_INVALID_PARAMETER))?;
+    let alias = &pdo_aliases_mut()[alias_index];
+    let dependent_pdo = alias.dependent_alias
+        .ok_or_else(|| reject(b"start-dependent-pdo", STATUS_INVALID_PARAMETER))?;
+    let authority = alias.authority
+        .ok_or_else(|| reject(b"start-authority", STATUS_INVALID_PARAMETER))?;
+    if instance_domain_identity(provider_inst) != Some(record.provider_domain)
+        || instance_domain_identity(dependent_inst) != Some(record.dependent_domain)
+        || hosted_device_allocations::capture_allocation(dependent_inst, provider_context)
+            .ok() != alias.context_allocation
+        || io_manager_mut().hosted_device_pointer_registration(
+            record.provider_domain, alias.provider_pdo.address()) != Some(alias.provider_pdo)
+        || io_manager_mut().hosted_device_pointer_registration(
+            record.dependent_domain, dependent_pdo.address()) != Some(dependent_pdo)
+        || hosted_device_allocations::capture_allocation(dependent_inst,
+            dependent_pdo.address()).ok() != alias.alias_allocation
+        || !authority.matches(owner, record.provider_publication_cookie,
+            alias.provider_pdo.device_id().raw(), alias.provider_pdo.address(),
+            alias.provider_pdo.generation(), dependent_pdo.address(),
+            dependent_pdo.generation())
+    {
+        print_str(b"[dxg-start] context-allocation=");
+        print_u64((hosted_device_allocations::capture_allocation(dependent_inst,
+            provider_context).ok() == alias.context_allocation) as u64);
+        print_str(b"\n");
+        return Err(reject(b"start-alias-identity", STATUS_INVALID_PARAMETER));
+    }
+    let start_info_exec = component_to_exec_va_for_instance(
+        record.provider_instance, provider_inst, provider_start_info, START_INFO_LEN)
+        .ok_or_else(|| reject(b"start-info-range", STATUS_INVALID_PARAMETER))?;
+    let interface_exec = component_to_exec_va_for_instance(
+        record.provider_instance, provider_inst, provider_interface, INTERFACE_LEN)
+        .ok_or_else(|| reject(b"start-interface-range", STATUS_INVALID_PARAMETER))?;
+    let interface_bytes = core::slice::from_raw_parts(interface_exec as *const u8,
+        INTERFACE_LEN as usize);
+    let table = DxgStartInterface::parse(interface_bytes)
+        .map_err(|_| reject(b"start-interface-abi", STATUS_INVALID_PARAMETER))?;
+    let singleton = hosted_provider_singletons().and_then(|rows| rows.iter().copied().find(|row| {
+        row.present && row.instance == record.provider_instance
+            && row.owner_domain == record.provider_domain
+            && row.provider_publication_cookie == record.provider_publication_cookie
+    })).ok_or(STATUS_DEVICE_NOT_READY)?;
+    let source_output = StartOutputGuard::capture(provider_inst, record.provider_domain,
+        provider_sources_out, alias.provider_fdo_allocation, alias.provider_fdo)
+        .map_err(|status| reject(b"start-sources-owner", status))?;
+    let child_output = StartOutputGuard::capture(provider_inst, record.provider_domain,
+        provider_children_out, alias.provider_fdo_allocation, alias.provider_fdo)
+        .map_err(|status| reject(b"start-children-owner", status))?;
+
+    let count = table.callbacks().count();
+    let mut callbacks = Vec::new();
+    callbacks.try_reserve_exact(count).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    let mut keys = Vec::new();
+    keys.try_reserve_exact(count).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    for slot in table.callbacks() {
+        let rva = slot.target.checked_sub(singleton.run_va)
+            .ok_or_else(|| reject(b"start-callback-base", STATUS_INVALID_PARAMETER))?;
+        executable_extent(singleton, rva)
+            .ok_or_else(|| reject(b"start-callback-executable", STATUS_INVALID_PARAMETER))?;
+        let cookie = NEXT_AUTHORITY_COOKIE.fetch_add(1, Ordering::Relaxed);
+        if cookie == 0 || cookie > u32::MAX as u64 {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        let key = HostedThunkSlotKey::new(owner, HOSTED_THUNK_PURPOSE_DXG_INTERFACE,
+            slot.target, cookie).ok_or(STATUS_INVALID_PARAMETER)?;
+        callbacks.push((slot, rva, cookie as u32));
+        keys.push(key);
+    }
+    let reservations = reserve_instance_executable_thunk_batch(record.dependent_instance,
+        &keys)?;
+    let descriptor = hosted_provider_domain_descriptor(singleton);
+    copy_bytes(marshal_window.exec_base, start_info_exec, START_INFO_LEN);
+    copy_bytes(marshal_window.exec_base + INTERFACE_OFFSET, interface_exec, INTERFACE_LEN);
+    write_unaligned((marshal_window.exec_base + SOURCES_OFFSET) as *mut u32, 0);
+    write_unaligned((marshal_window.exec_base + CHILDREN_OFFSET) as *mut u32, 0);
+
+    // All reservations exist before a thunk can be exposed to the miniport.
+    // The owner retains every committed binding until dependency quiescence.
+    pdo_aliases_mut()[alias_index].blocked = true;
+    pdo_aliases_mut()[alias_index].interface_handle = table.device_handle();
+    let construction = (|| -> Result<(), i32> {
+        pdo_aliases_mut()[alias_index].interface_callbacks.try_reserve_exact(count)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        for (index, reservation) in reservations.iter().copied().enumerate() {
+            let (slot, rva, cookie) = callbacks[index];
+            let thunk = match plan_hosted_provider_import_binding(Some(descriptor), rva) {
+                Ok(HostedProviderImportBinding::ProviderDomainCall(plan)) =>
+                    plan_hosted_provider_import_thunk(dependent_inst.run_thunk_va,
+                        dependent_inst.thunk_len, reservation.thunk_index, plan)
+                        .map_err(|_| STATUS_INVALID_PARAMETER)?,
+                _ => return Err(STATUS_DEVICE_NOT_READY),
+            };
+            let encoded = core::slice::from_raw_parts_mut(reservation.exec_va as *mut u8,
+                HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN as usize);
+            encode_hosted_dxg_registration_thunk(thunk, cookie, encoded)
+                .map_err(|_| STATUS_INVALID_PARAMETER)?;
+            if reservation.existing
+                || !commit_instance_executable_thunk(record.dependent_instance, reservation)
+            {
+                return Err(STATUS_DEVICE_NOT_READY);
+            }
+            pdo_aliases_mut()[alias_index].interface_callbacks.push(DxgInterfaceCallback {
+                cookie, offset: slot.offset, provider_rva: rva,
+                binding: reservation.address(record.dependent_instance).binding,
+            });
+            write_unaligned((marshal_window.exec_base + INTERFACE_OFFSET + slot.offset as u64)
+                as *mut u64, reservation.run_va);
+        }
+        let acquire = callbacks.iter().find(|(slot, _, _)| slot.offset == 0xd8)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        if !register_hosted_provider_internal_marshal_policy(record.provider_domain,
+            record.provider_publication_cookie, acquire.1,
+            hosted_dxg_acquire_post_display_marshal_policy())
+        {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        Ok(())
+    })();
+    if let Err(status) = construction {
+        let committed = pdo_aliases_mut()[alias_index].interface_callbacks.len();
+        for reservation in reservations.iter().copied().skip(committed) {
+            abort_instance_executable_thunk(record.dependent_instance, reservation);
+        }
+        let mut all_released = true;
+        for callback in &pdo_aliases_mut()[alias_index].interface_callbacks {
+            all_released &= release_instance_executable_thunk_binding(callback.binding, true);
+        }
+        if all_released {
+            pdo_aliases_mut()[alias_index].interface_callbacks.clear();
+            pdo_aliases_mut()[alias_index].interface_handle = 0;
+            pdo_aliases_mut()[alias_index].blocked = false;
+        }
+        return Err(status);
+    }
+    pdo_aliases_mut()[alias_index].start_sources_output = Some(source_output);
+    pdo_aliases_mut()[alias_index].start_children_output = Some(child_output);
+    pdo_aliases_mut()[alias_index].start_entered = true;
+    let result = match dispatch_dependent_provider_callback(
+        dispatch, record, dependent_inst, exec_code_va,
+        [provider_context, marshal_window.component_base,
+            marshal_window.component_base + INTERFACE_OFFSET,
+            marshal_window.component_base + SOURCES_OFFSET],
+        [marshal_window.component_base + CHILDREN_OFFSET, 0, 0, 0, 0, 0, 0, 0],
+    ) {
+        Ok(result) => result,
+        Err(status) => {
+            pdo_aliases_mut()[alias_index].start_sources_output.as_ref()
+                .unwrap().retain_uncertain();
+            pdo_aliases_mut()[alias_index].start_children_output.as_ref()
+                .unwrap().retain_uncertain();
+            return Err(status);
+        }
+    };
+    if (result as u32 as i32) >= 0 {
+        let source_count = read_unaligned(
+            (marshal_window.exec_base + SOURCES_OFFSET) as *const u32);
+        let child_count = read_unaligned(
+            (marshal_window.exec_base + CHILDREN_OFFSET) as *const u32);
+        let source_written = pdo_aliases_mut()[alias_index].start_sources_output
+            .as_ref().unwrap().write(record.provider_instance, provider_inst,
+                record.provider_domain, source_count);
+        let child_written = if source_written.is_ok() {
+            pdo_aliases_mut()[alias_index].start_children_output.as_ref().unwrap()
+                .write(record.provider_instance, provider_inst,
+                    record.provider_domain, child_count)
+        } else {
+            source_written
+        };
+        if let Err(status) = child_written {
+            pdo_aliases_mut()[alias_index].start_sources_output.as_ref()
+                .unwrap().retain_uncertain();
+            pdo_aliases_mut()[alias_index].start_children_output.as_ref()
+                .unwrap().retain_uncertain();
+            return Err(status);
+        }
+    }
+    let release_sources = pdo_aliases_mut()[alias_index].start_sources_output
+        .as_mut().unwrap().release();
+    let release_children = pdo_aliases_mut()[alias_index].start_children_output
+        .as_mut().unwrap().release();
+    if release_sources.is_err() || release_children.is_err() {
+        return Err(STATUS_DEVICE_NOT_READY);
+    }
+    pdo_aliases_mut()[alias_index].start_sources_output = None;
+    pdo_aliases_mut()[alias_index].start_children_output = None;
+    pdo_aliases_mut()[alias_index].blocked = false;
     Ok(result)
 }
 
@@ -466,6 +891,20 @@ pub(super) unsafe fn retire_pdo_aliases_for_instance(
         if hosted_device_allocations::capture_allocation(inst, alias.address()).ok()
             != allocation
         {
+            pdo_aliases_mut()[index].blocked = true;
+            failures += 1;
+            index += 1;
+            continue;
+        }
+        let mut callback_release_failed = false;
+        while let Some(callback) = pdo_aliases_mut()[index].interface_callbacks.last().copied() {
+            if !release_instance_executable_thunk_binding(callback.binding, true) {
+                callback_release_failed = true;
+                break;
+            }
+            pdo_aliases_mut()[index].interface_callbacks.pop();
+        }
+        if callback_release_failed {
             pdo_aliases_mut()[index].blocked = true;
             failures += 1;
             index += 1;

@@ -250,7 +250,8 @@ pub(super) unsafe fn active_created_output(
     domain: HostedDomainIdentity,
     pdo: nt_io_manager::HostedDevicePointerRegistration,
     address: u64,
-) -> Option<(u64, nt_io_manager::source_irp_auxiliary::SourcePoolAllocationIdentity)> {
+) -> Option<(u64, nt_io_manager::source_irp_auxiliary::SourcePoolAllocationIdentity,
+    nt_io_manager::HostedDevicePointerRegistration)> {
     if active_pdo_registration(provider_instance, domain, pdo.address()) != Some(pdo) {
         return None;
     }
@@ -276,7 +277,7 @@ pub(super) unsafe fn active_created_output(
             continue;
         }
         let exec = component_pool_to_exec_va(inst.exec_pool_va, address, 8)?;
-        return Some((exec, allocation));
+        return Some((exec, allocation, registration));
     }
     None
 }
