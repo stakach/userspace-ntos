@@ -113,7 +113,7 @@ impl Server {
             opcode::OB_OP_CREATE_DIRECTORY => self.op_create_directory(in_buf),
             opcode::OB_OP_CREATE_DIRECTORY_HANDLE => self.op_directory_handle(client, in_buf, true),
             opcode::OB_OP_OPEN_DIRECTORY_HANDLE => self.op_directory_handle(client, in_buf, false),
-            opcode::OB_OP_CREATE_SESSION_NAMESPACE => self.op_create_session_namespace(client, in_buf),
+            opcode::OB_OP_CREATE_SESSION_NAMESPACE => self.op_create_session_namespace(client, in_buf, out_buf),
             opcode::OB_OP_RETIRE_SESSION_NAMESPACE_EXACT => self.op_retire_session_namespace(client, in_buf),
             opcode::OB_OP_QUERY_DIRECTORY => self.op_query_directory(client, in_buf, out_buf),
             opcode::OB_OP_CREATE_SYMBOLIC_LINK => self.op_create_symlink(in_buf),
@@ -301,6 +301,7 @@ impl Server {
         &mut self,
         client: ClientId,
         buf: &[u8],
+        out_buf: &mut [u8],
     ) -> Result<ObReply, NtStatus> {
         if self.om.client_mode(client)? != AccessMode::KernelMode {
             return Err(NtStatus::ACCESS_DENIED);
@@ -308,8 +309,10 @@ impl Server {
         let req: ObCreateSessionNamespaceRequest = read_req(buf)?;
         check_size::<ObCreateSessionNamespaceRequest>(req.abi_size)?;
         if req.reserved != 0 { return Err(NtStatus::INVALID_PARAMETER); }
-        let (session, windows) = self.om.create_session_namespace(req.session_id)?;
-        Ok(reply(NtStatus::SUCCESS, 0, session.0, windows.0))
+        let dst = out_buf.get_mut(..8).ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+        let (session, windows, bno) = self.om.create_session_namespace(req.session_id)?;
+        dst.copy_from_slice(&bno.0.to_le_bytes());
+        Ok(reply(NtStatus::SUCCESS, 8, session.0, windows.0))
     }
 
     fn op_retire_session_namespace(
@@ -322,11 +325,13 @@ impl Server {
         }
         let req: ObRetireSessionNamespaceRequest = read_req(buf)?;
         check_size::<ObRetireSessionNamespaceRequest>(req.abi_size)?;
-        if req.reserved != 0 || req.session_object_id == 0 || req.windows_object_id == 0 {
+        if req.reserved != 0 || req.session_object_id == 0 || req.windows_object_id == 0
+            || req.base_named_objects_id == 0 {
             return Err(NtStatus::INVALID_PARAMETER);
         }
         self.om.retire_session_namespace_exact(
             req.session_id, ObjectId(req.session_object_id), ObjectId(req.windows_object_id),
+            ObjectId(req.base_named_objects_id),
         )?;
         Ok(ok())
     }

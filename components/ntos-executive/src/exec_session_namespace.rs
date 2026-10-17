@@ -46,12 +46,16 @@ impl ExecNtHandler {
                 subject.mode(),
                 &mut audit,
             )?;
-            Ok::<_, u32>((session, windows))
+            let mut audit = nt_security::SecurityAssignmentAudit::default();
+            let bno = nt_security::assign_directory_security(
+                &tokens, None, Some(&session), subject.mode(), &mut audit,
+            )?;
+            Ok::<_, u32>((session, windows, bno))
         })();
         subject.release(&mut self.token_store)?;
-        let (session_descriptor, windows_descriptor) = descriptors?;
-        self.obj_ns.try_reserve(2).map_err(|_| 0xC000_009Au32)?;
-        self.directory_security.try_reserve(2).map_err(|_| 0xC000_009Au32)?;
+        let (session_descriptor, windows_descriptor, bno_descriptor) = descriptors?;
+        self.obj_ns.try_reserve(3).map_err(|_| 0xC000_009Au32)?;
+        self.directory_security.try_reserve(3).map_err(|_| 0xC000_009Au32)?;
 
         // The canonical server owns the paths; the executive mirror carries its exact IDs.
         // All fallible allocations and security assignments precede this native effect.
@@ -63,6 +67,9 @@ impl ExecNtHandler {
         let windows = ObjEntry::push_dir(&mut self.obj_ns, b"windows", session, true)
             .expect("preflighted Windows child capacity and identity");
         self.obj_ns[windows].payload = canonical.windows.0;
+        let bno = ObjEntry::push_dir(&mut self.obj_ns, b"basenamedobjects", session, true)
+            .expect("preflighted BaseNamedObjects child capacity and identity");
+        self.obj_ns[bno].payload = canonical.base_named_objects.0;
         self.directory_security.push(directory_security::DirectorySecurityRecord {
             identity: self.obj_ns[session].identity,
             descriptor: session_descriptor,
@@ -73,10 +80,15 @@ impl ExecNtHandler {
             descriptor: windows_descriptor,
             references: 0,
         });
+        self.directory_security.push(directory_security::DirectorySecurityRecord {
+            identity: self.obj_ns[bno].identity,
+            descriptor: bno_descriptor,
+            references: 0,
+        });
         Ok(())
     }
 
-    /// Retire only a proven empty pair. A live child, handle, or failed canonical retirement
+    /// Retire only a proven empty namespace. A live child, handle, or failed canonical retirement
     /// leaves the namespace intact; monotonically allocated session IDs are never reused.
     pub(super) fn retire_session_namespace_if_empty(&mut self, session_id: u32) {
         if nt_object_manager::session_namespace_ownership(session_id)
@@ -88,16 +100,23 @@ impl ExecNtHandler {
         let name = alloc::format!("{session_id}");
         let Some(session) = self.obj_child(parent, name.as_bytes()) else { return };
         let Some(windows) = self.obj_child(session, b"windows") else { return };
+        let Some(bno) = self.obj_child(session, b"basenamedobjects") else { return };
         let session_entry = self.obj_ns[session];
         let windows_entry = self.obj_ns[windows];
+        let bno_entry = self.obj_ns[bno];
         if session_entry.kind != OBJ_KIND_DIRECTORY || windows_entry.kind != OBJ_KIND_DIRECTORY
-            || session_entry.payload == 0 || windows_entry.payload == 0
+            || bno_entry.kind != OBJ_KIND_DIRECTORY
+            || session_entry.payload == 0 || windows_entry.payload == 0 || bno_entry.payload == 0
             || self.obj_ns.iter().any(|entry| entry.is_live()
-                && (entry.parent == windows || (entry.parent == session && entry.identity != windows_entry.identity)))
+                && (entry.parent == windows || entry.parent == bno
+                    || (entry.parent == session && entry.identity != windows_entry.identity
+                        && entry.identity != bno_entry.identity)))
             || self.pm.handle_object_count(nt_process::HandleObject::ObjectDirectory(session_entry.identity)) != 0
             || self.pm.handle_object_count(nt_process::HandleObject::ObjectDirectory(windows_entry.identity)) != 0
+            || self.pm.handle_object_count(nt_process::HandleObject::ObjectDirectory(bno_entry.identity)) != 0
             || self.directory_security.iter().any(|record|
-                (record.identity == session_entry.identity || record.identity == windows_entry.identity)
+                (record.identity == session_entry.identity || record.identity == windows_entry.identity
+                    || record.identity == bno_entry.identity)
                     && record.references != 0)
         {
             return;
@@ -105,16 +124,19 @@ impl ExecNtHandler {
         let canonical = nt_object_client::SessionNamespace {
             session: nt_types::ObjectId(session_entry.payload),
             windows: nt_types::ObjectId(windows_entry.payload),
+            base_named_objects: nt_types::ObjectId(bno_entry.payload),
         };
         if unsafe { crate::object_manager_retire_session_namespace_exact(session_id, canonical) }
             .is_err()
         {
             return;
         }
+        self.obj_ns[bno].unlink();
         self.obj_ns[windows].unlink();
         self.obj_ns[session].unlink();
         self.directory_security.retain(|record| {
             record.identity != session_entry.identity && record.identity != windows_entry.identity
+                && record.identity != bno_entry.identity
         });
     }
 }

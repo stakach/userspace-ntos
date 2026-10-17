@@ -135,11 +135,13 @@ fn created_session_owns_exact_numbered_windows_namespace_until_retired() {
     let owned = c.create_session_namespace(37).unwrap();
     assert_eq!(c.lookup("\\Sessions\\37", true).unwrap(), owned.session);
     assert_eq!(c.lookup("\\Sessions\\37\\Windows", true).unwrap(), owned.windows);
+    assert_eq!(c.lookup("\\Sessions\\37\\BaseNamedObjects", true).unwrap(), owned.base_named_objects);
     assert_eq!(c.create_session_namespace(37), Err(NtStatus::OBJECT_NAME_COLLISION));
     assert_eq!(c.lookup("\\Sessions\\38", true), Err(NtStatus::OBJECT_NAME_NOT_FOUND));
     let stale = nt_object_client::SessionNamespace {
         session: nt_types::ObjectId(owned.session.0 + 1),
         windows: owned.windows,
+        base_named_objects: owned.base_named_objects,
     };
     assert_eq!(c.retire_session_namespace_exact(37, stale), Err(NtStatus::INVALID_HANDLE));
     assert_eq!(c.lookup("\\Sessions\\37\\Windows", true).unwrap(), owned.windows);

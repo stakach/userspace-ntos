@@ -167,10 +167,11 @@ pub struct ObRetireSessionNamespaceRequest {
     pub session_id: u32,
     pub session_object_id: u64,
     pub windows_object_id: u64,
+    pub base_named_objects_id: u64,
 }
 
 const _: [(); 8] = [(); core::mem::size_of::<ObCreateSessionNamespaceRequest>()];
-const _: [(); 24] = [(); core::mem::size_of::<ObRetireSessionNamespaceRequest>()];
+const _: [(); 32] = [(); core::mem::size_of::<ObRetireSessionNamespaceRequest>()];
 
 /// `OB_OP_CREATE_SYMBOLIC_LINK` payload — link path + target path both in-buffer.
 #[repr(C)]

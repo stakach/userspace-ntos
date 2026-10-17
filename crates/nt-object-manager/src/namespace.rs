@@ -72,12 +72,12 @@ pub const fn session_namespace_ownership(session_id: u32) -> SessionNamespaceOwn
 }
 
 impl ObjectManager {
-    /// Publish the two numbered Object Manager parents required by a new GUI session.
-    /// The Windows child is committed before either identity is returned.
+    /// Publish the numbered Object Manager parents required by a new GUI session.
+    /// Both children are committed before any identity is returned.
     pub fn create_session_namespace(
         &mut self,
         session_id: u32,
-    ) -> Result<(ObjectId, ObjectId), NtStatus> {
+    ) -> Result<(ObjectId, ObjectId, ObjectId), NtStatus> {
         let sessions = self.lookup_path(
             &NtPath::parse_str("\\Sessions")?, CaseSensitivity::CaseInsensitive,
         )?;
@@ -92,7 +92,18 @@ impl ObjectManager {
                 return Err(status);
             }
         };
-        Ok((session.id(), windows.id()))
+        let bno_name = UnicodeString::from_str("BaseNamedObjects");
+        let bno = match self.create_directory(&session, &bno_name, true) {
+            Ok(bno) => bno,
+            Err(status) => {
+                self.remove_named_object(&session, &windows_name, CaseSensitivity::CaseInsensitive)
+                    .expect("new Windows child has no external references");
+                self.remove_named_object(&sessions, &name, CaseSensitivity::CaseInsensitive)
+                    .expect("new session has no published child after rollback");
+                return Err(status);
+            }
+        };
+        Ok((session.id(), windows.id(), bno.id()))
     }
 
     /// Unlink only the empty numbered namespace whose exact identities were returned at create.
@@ -102,6 +113,7 @@ impl ObjectManager {
         session_id: u32,
         session_id_exact: ObjectId,
         windows_id_exact: ObjectId,
+        bno_id_exact: ObjectId,
     ) -> Result<(), NtStatus> {
         let sessions = self.lookup_path(
             &NtPath::parse_str("\\Sessions")?, CaseSensitivity::CaseInsensitive,
@@ -118,16 +130,26 @@ impl ObjectManager {
             _ => None,
         }).ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
         if windows.id() != windows_id_exact { return Err(NtStatus::INVALID_HANDLE); }
-        if windows.handle_count() != 0 || session.handle_count() != 0 {
+        let bno_name = UnicodeString::from_str("BaseNamedObjects");
+        let bno = session.with_body(|body| match body {
+            ObjectBody::Directory(directory) => directory.lookup(&bno_name, CaseSensitivity::CaseInsensitive),
+            _ => None,
+        }).ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
+        if bno.id() != bno_id_exact { return Err(NtStatus::INVALID_HANDLE); }
+        if windows.handle_count() != 0 || bno.handle_count() != 0 || session.handle_count() != 0 {
             return Err(NtStatus::DEVICE_BUSY);
         }
         if windows.with_body(|body| !matches!(body, ObjectBody::Directory(directory) if directory.children().next().is_none())) {
             return Err(NtStatus::DIRECTORY_NOT_EMPTY);
         }
-        if session.with_body(|body| !matches!(body, ObjectBody::Directory(directory)
-            if directory.children().count() == 1)) {
+        if bno.with_body(|body| !matches!(body, ObjectBody::Directory(directory) if directory.children().next().is_none())) {
             return Err(NtStatus::DIRECTORY_NOT_EMPTY);
         }
+        if session.with_body(|body| !matches!(body, ObjectBody::Directory(directory)
+            if directory.children().count() == 2)) {
+            return Err(NtStatus::DIRECTORY_NOT_EMPTY);
+        }
+        self.remove_named_object(&session, &bno_name, CaseSensitivity::CaseInsensitive)?;
         self.remove_named_object(&session, &windows_name, CaseSensitivity::CaseInsensitive)?;
         self.remove_named_object(&sessions, &name, CaseSensitivity::CaseInsensitive)
     }

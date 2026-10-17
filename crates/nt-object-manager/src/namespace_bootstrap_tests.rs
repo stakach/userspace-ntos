@@ -27,9 +27,11 @@ fn smss_reserves_bootstrap_session_zero_before_numbered_sessions() {
     assert_eq!(manager.lookup_path(&path("\\Sessions\\0"), CI).unwrap().id(), session_zero);
     assert_eq!(manager.lookup_link(&path("\\Sessions\\0\\BaseNamedObjects"), CI).unwrap().id(), bno);
     assert_eq!(session_namespace_ownership(1), SessionNamespaceOwnership::Numbered);
-    let (session_one, windows_one) = manager.create_session_namespace(1).unwrap();
+    let (session_one, windows_one, bno_one) = manager.create_session_namespace(1).unwrap();
     assert_eq!(manager.lookup_path(&path("\\Sessions\\1"), CI).unwrap().id(), session_one);
     assert_eq!(manager.lookup_path(&path("\\Sessions\\1\\Windows"), CI).unwrap().id(), windows_one);
+    assert_eq!(manager.lookup_path(&path("\\Sessions\\1\\BaseNamedObjects"), CI).unwrap().id(), bno_one,
+        "new GUI session needs the named-object parent before win32k creates its desktop-switch event");
     assert_eq!(manager.lookup_path(&path("\\Sessions\\0"), CI).unwrap().id(), session_zero);
 }
 

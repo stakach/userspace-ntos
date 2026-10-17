@@ -78,6 +78,7 @@ pub struct DirectoryQueryResult {
 pub struct SessionNamespace {
     pub session: ObjectId,
     pub windows: ObjectId,
+    pub base_named_objects: ObjectId,
 }
 
 impl<B: Backend> ObjectClient<B> {
@@ -87,13 +88,16 @@ impl<B: Backend> ObjectClient<B> {
             reserved: 0,
             session_id,
         };
+        let mut bno = [0u8; 8];
         let reply = self.backend.call(opcode::OB_OP_CREATE_SESSION_NAMESPACE,
-            bytemuck::bytes_of(&req), &mut []);
+            bytemuck::bytes_of(&req), &mut bno);
         NtStatus(reply.status).to_result()?;
-        if reply.detail0 == 0 || reply.detail1 == 0 {
+        let bno = u64::from_le_bytes(bno);
+        if reply.detail0 == 0 || reply.detail1 == 0 || reply.information != 8 || bno == 0 {
             return Err(NtStatus::INVALID_HANDLE);
         }
-        Ok(SessionNamespace { session: ObjectId(reply.detail0), windows: ObjectId(reply.detail1) })
+        Ok(SessionNamespace { session: ObjectId(reply.detail0), windows: ObjectId(reply.detail1),
+            base_named_objects: ObjectId(bno) })
     }
 
     pub fn retire_session_namespace_exact(
@@ -107,6 +111,7 @@ impl<B: Backend> ObjectClient<B> {
             session_id,
             session_object_id: owned.session.0,
             windows_object_id: owned.windows.0,
+            base_named_objects_id: owned.base_named_objects.0,
         };
         let reply = self.backend.call(opcode::OB_OP_RETIRE_SESSION_NAMESPACE_EXACT,
             bytemuck::bytes_of(&req), &mut []);
