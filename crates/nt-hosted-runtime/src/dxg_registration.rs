@@ -221,6 +221,7 @@ pub enum DxgDdiSignature {
     RemoveDevice,
     QueryChildRelations,
     QueryAdapterInfo,
+    GetNodeMetadata,
     CreateProcess,
     DestroyProcess,
 }
@@ -237,6 +238,7 @@ impl DxgDdiSignature {
             0x20 => Some(Self::RemoveDevice),
             0x40 => Some(Self::QueryChildRelations),
             0x88 => Some(Self::QueryAdapterInfo),
+            0x298 => Some(Self::GetNodeMetadata),
             0x300 => Some(Self::CreateProcess),
             0x308 => Some(Self::DestroyProcess),
             _ => None,
@@ -248,10 +250,48 @@ impl DxgDdiSignature {
             Self::AddDevice => 2,
             Self::StartDevice => 5,
             Self::QueryChildRelations => 3,
+            Self::GetNodeMetadata => 3,
             Self::QueryAdapterInfo => 2,
             Self::CreateProcess | Self::DestroyProcess => 2,
             Self::StopDevice | Self::RemoveDevice => 1,
         }
+    }
+}
+
+/// LiberNT WDDM 2.0 x64 DXGKARG_GETNODEMETADATA is the 0x4A-byte
+/// DXGK_NODEMETADATA record. It contains no nested pointer fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgNodeMetadataLayout {
+    ordinal: u32,
+    output_address: u64,
+}
+
+impl DxgNodeMetadataLayout {
+    pub const fn new(version: u32, ordinal: u64,
+        output_address: u64, marshal_capacity: u64) -> Option<Self>
+    {
+        if DxgInitializationData::required_prefix_len(version).is_none()
+            || ordinal > u32::MAX as u64 || output_address == 0
+            || output_address.checked_add(0x4a).is_none()
+            || marshal_capacity < 0x4a
+        { return None; }
+        Some(Self { ordinal: ordinal as u32, output_address })
+    }
+
+    pub const fn node_ordinal(self) -> u32 { self.ordinal }
+    pub const fn output_address(self) -> u64 { self.output_address }
+    pub const fn bytes(self) -> u64 { 0x4a }
+
+    pub fn initialize_output(self, output: &mut [u8]) -> bool {
+        if output.len() < 0x4a { return false; }
+        output[..0x4a].fill(0);
+        true
+    }
+
+    pub fn copyback(self, output: &mut [u8], returned: &[u8]) -> bool {
+        if output.len() < 0x4a || returned.len() != 0x4a { return false; }
+        output[..0x4a].copy_from_slice(returned);
+        true
     }
 }
 

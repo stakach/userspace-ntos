@@ -23,6 +23,8 @@ static NEXT_AUTHORITY_COOKIE: AtomicU64 = AtomicU64::new(1);
 
 #[path = "hosted_dxg_registration/process.rs"]
 mod process;
+#[path = "hosted_dxg_registration/node_metadata.rs"]
+mod node_metadata;
 
 #[derive(Clone, Copy)]
 struct DxgResolution {
@@ -59,6 +61,7 @@ struct DxgPdoAlias {
     child_relations_output: Option<StartOutputGuard>,
     query_output: Option<DxgQueryOutputGuard>,
     query_nested: Option<DxgQueryOutputGuard>,
+    node_metadata_output: Option<DxgQueryOutputGuard>,
     processes: Vec<process::DxgProcessAlias>,
     null_process_credits: Option<nt_hosted_runtime::DxgNullProcessCredits>,
     provider_domain: HostedDomainIdentity,
@@ -745,6 +748,7 @@ pub(super) unsafe fn service_add_device_callback(
             child_relations_output: None,
             query_output: None,
             query_nested: None,
+            node_metadata_output: None,
             processes: Vec::new(),
             null_process_credits: None,
             provider_domain: record.provider_domain,
@@ -1154,6 +1158,22 @@ pub(super) unsafe fn service_create_process_callback(
 ) -> Result<u64, i32> {
     process::create(dispatch, marshal_window, provider_inst, record,
         dependent_inst, exec_code_va, provider_context, provider_request)
+}
+
+pub(super) unsafe fn service_get_node_metadata_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    marshal_window: HostedProviderMarshalWindow,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    provider_context: u64,
+    node_ordinal: u64,
+    provider_output: u64,
+) -> Result<u64, i32> {
+    node_metadata::query(dispatch, marshal_window, provider_inst, record,
+        dependent_inst, exec_code_va, provider_context,
+        node_ordinal, provider_output)
 }
 
 pub(super) unsafe fn service_destroy_process_callback(
