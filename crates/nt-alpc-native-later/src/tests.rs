@@ -124,6 +124,50 @@ fn connect_capture_owns_name_and_rejects_unmodeled_security_inputs() {
 }
 
 #[test]
+fn smss_sync_connect_uses_32_bit_flags_from_native_argument_slot() {
+    let mut image = [0u8; 512];
+    image[64..66].copy_from_slice(&20u16.to_le_bytes());
+    image[66..68].copy_from_slice(&22u16.to_le_bytes());
+    image[72..80].copy_from_slice(&128u64.to_le_bytes());
+    for (i, unit) in "\\SmApiPort".encode_utf16().enumerate() {
+        image[128 + 2*i..130 + 2*i].copy_from_slice(&unit.to_le_bytes());
+    }
+    let captured = capture_connect_port(
+        [16, 64, 0, 0, 0x0000_0100_0002_0000, 0, 0, 0, 0, 0, 0],
+        |p, b| read_image(&image, p, b), |p, n| p == 16 && n == 8,
+    ).expect("native ULONG flags use only their low 32 bits");
+    assert_eq!(captured.connect_flags, nt_alpc_abi::connect_flag::SYNC_CONNECTION);
+}
+
+#[test]
+fn smss_main_thread_badge_zero_keeps_exact_connect_and_reply_identity() {
+    let mut main = caller();
+    main.badge = 0;
+    let captured = CapturedConnectPort {
+        output: 16,
+        name: "\\SmApiPort".encode_utf16().collect(),
+        connect_flags: nt_alpc_abi::connect_flag::SYNC_CONNECTION,
+        port_attributes: None,
+        message: None,
+        message_target: None,
+        send_attributes: None,
+        timeout: None,
+    };
+    let wire = captured.checked_wire(main, (7, 13))
+        .expect("badge zero is a valid physical SMSS thread badge");
+    let retained = RetainedLater::new(main, (7, 13), 31, wire)
+        .expect("reply ownership includes exact TCB, not a nonzero badge assumption");
+    assert_eq!(retained.caller(), main);
+    assert_eq!(retained.reply_cap(), 31);
+
+    let mut missing_tcb = main;
+    missing_tcb.tcb = 0;
+    assert_eq!(captured.checked_wire(missing_tcb, (7, 14)), Err(STATUS_INVALID_PARAMETER));
+    assert!(matches!(RetainedLater::new(missing_tcb, (7, 14), 32, vec![1]),
+        Err(RetainedError::InvalidIdentity)));
+}
+
+#[test]
 fn accept_capture_requires_connection_request_and_owned_output() {
     let mut image = [0u8; 512];
     image[64..66].copy_from_slice(&0u16.to_le_bytes());

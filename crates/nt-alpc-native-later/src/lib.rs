@@ -80,7 +80,7 @@ pub struct CapturedAcceptConnect {
 
 fn invocation(caller: NativeCaller, token: (u64, u64)) -> Result<AlpcCheckedInvocation, u32> {
     if caller.process == 0 || caller.thread == 0 || caller.generation == 0
-        || caller.badge == 0 || caller.tcb == 0 || token == (0, 0)
+        || caller.tcb == 0 || token == (0, 0)
     { return Err(STATUS_INVALID_PARAMETER); }
     Ok(AlpcCheckedInvocation {
         owner_process: caller.process,
@@ -315,11 +315,14 @@ pub fn capture_connect_port(
 ) -> Result<CapturedConnectPort, u32> {
     let [output, name_pointer, object_attributes, attributes, flags, server_sid,
         message_pointer, message_size, send_attrs, receive_attrs, timeout] = args;
+    // Flags is a native ULONG. The high half of its x64 argument slot is not
+    // part of the caller's value and may retain unrelated stack data.
+    let flags = flags as u32;
     if output == 0 || !probe_output(output, 8) { return Err(STATUS_ACCESS_VIOLATION); }
     if object_attributes != 0 || server_sid != 0 || receive_attrs != 0 {
         return Err(STATUS_NOT_SUPPORTED);
     }
-    if flags & !u64::from(nt_alpc_abi::connect_flag::SYNC_CONNECTION) != 0
+    if flags & !nt_alpc_abi::connect_flag::SYNC_CONNECTION != 0
         || name_pointer == 0 || (message_pointer == 0) != (message_size == 0)
         || (message_pointer == 0 && send_attrs != 0)
     { return Err(STATUS_INVALID_PARAMETER); }
@@ -350,7 +353,7 @@ pub fn capture_connect_port(
         (Some(copied), Some((message_pointer, capacity, message_size)))
     };
     let send_attributes = if send_attrs == 0 { None } else { Some(copy_attributes(send_attrs, &mut read)?) };
-    Ok(CapturedConnectPort { output, name, connect_flags: flags as u32,
+    Ok(CapturedConnectPort { output, name, connect_flags: flags,
         port_attributes, message, message_target, send_attributes,
         timeout: copy_timeout(timeout, &mut read)? })
 }
@@ -431,7 +434,7 @@ impl RetainedLater {
         -> Result<Self, RetainedError>
     {
         if caller.process == 0 || caller.thread == 0 || caller.generation == 0
-            || caller.badge == 0 || caller.tcb == 0 || token == (0, 0)
+            || caller.tcb == 0 || token == (0, 0)
             || reply_cap == 0 || request.is_empty()
         { return Err(RetainedError::InvalidIdentity); }
         Ok(Self { caller, token, reply_cap, request, phase: Phase::Prepared,
