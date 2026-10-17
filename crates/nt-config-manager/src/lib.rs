@@ -19,6 +19,7 @@ mod property;
 mod registry;
 mod registry_security;
 mod filter_policy;
+mod key_open_options;
 #[cfg(test)]
 mod kernel_device_interface_tests;
 
@@ -34,6 +35,7 @@ pub use registry::{
     RegistryValueType,
 };
 pub use filter_policy::{DeviceFilterPolicy, DeviceFilterPolicyError};
+pub use key_open_options::validate_key_open_options;
 pub use registry_security::{inherit_generated_key_security, validate_generated_key_security};
 
 /// The NT root-bus pseudo-devnode exposed through user-mode PnP relations.

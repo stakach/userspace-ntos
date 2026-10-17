@@ -101,6 +101,18 @@ fn service_table_numbering() {
 }
 
 #[test]
+fn extended_key_open_routes_the_released_kernelbase_syscall() {
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtOpenKeyEx, 0x457)],
+    );
+    assert_eq!(nt_syscall_abi::ssn_of("NtOpenKeyEx"), Some(0x457));
+    assert_eq!(NativeService::NtOpenKeyEx.arg_count(), (4, 4));
+    assert_eq!(table.lookup(0x457).unwrap().service, NativeService::NtOpenKeyEx);
+    assert_eq!(table.number_of(NativeService::NtOpenKeyEx), Some(0x457));
+}
+
+#[test]
 fn create_named_pipe_keeps_native_fourteen_argument_contract() {
     let expected = nt_syscall_abi::argc_of("NtCreateNamedPipeFile");
     assert_eq!(expected, 14);

@@ -32455,6 +32455,7 @@ impl ExecNtHandler {
                 status
             },
             NativeService::NtOpenKey => unsafe { self.nt_open_key_admitted(args) },
+            NativeService::NtOpenKeyEx => unsafe { self.nt_open_key_ex_admitted(args) },
             NativeService::NtCreateKey => unsafe { self.nt_create_key_admitted(args) },
             // NtSetValueKey captured args: KeyHandle=args[0], *ValueName=args[1],
             // TitleIndex=args[2], Type=args[3], Data=args[4], DataSize=args[5]. CM leases own

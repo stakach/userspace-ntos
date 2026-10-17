@@ -24874,6 +24874,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtClose, SSN_NT_CLOSE as u32),
             (NativeService::NtDuplicateObject, 71),
             (NativeService::NtOpenKey, SSN_NT_OPEN_KEY as u32),
+            (NativeService::NtOpenKeyEx, 0x457),
             (NativeService::NtCreateKey, SSN_NT_CREATE_KEY as u32),
             (
                 NativeService::NtEnumerateValueKey,

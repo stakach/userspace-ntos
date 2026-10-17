@@ -91,6 +91,7 @@ pub enum NativeService {
     NtSetIoCompletion,
     // Registry (§16.3)
     NtOpenKey,
+    NtOpenKeyEx,
     NtCreateKey,
     NtQueryValueKey,
     NtSetValueKey,
@@ -351,6 +352,7 @@ impl NativeService {
             NtRemoveIoCompletion => "NtRemoveIoCompletion",
             NtSetIoCompletion => "NtSetIoCompletion",
             NtOpenKey => "NtOpenKey",
+            NtOpenKeyEx => "NtOpenKeyEx",
             NtCreateKey => "NtCreateKey",
             NtQueryValueKey => "NtQueryValueKey",
             NtSetValueKey => "NtSetValueKey",
@@ -555,6 +557,7 @@ impl NativeService {
         NativeService::NtRemoveIoCompletion,
         NativeService::NtSetIoCompletion,
         NativeService::NtOpenKey,
+        NativeService::NtOpenKeyEx,
         NativeService::NtCreateKey,
         NativeService::NtQueryValueKey,
         NativeService::NtSetValueKey,
