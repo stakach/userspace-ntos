@@ -38,6 +38,9 @@ pub fn purpose_for_win32k_syscall(ssn: u64, arg1: u64) -> DispatchTebPurpose {
         // SetCursorIconData enters GetW32ThreadInfo, which checks the current TEB's inline
         // Win32ClientInfo against THREADINFO.pClientInfo after captured user input is staged.
         0x10a8 => DispatchTebPurpose::ThreadInfo,
+        // LoadKeyboardLayoutEx activates the new layout through GetW32ThreadInfo after its
+        // optional charset and IMM callbacks have returned.
+        0x125c => DispatchTebPurpose::ThreadInfo,
         0x1288 => DispatchTebPurpose::ThreadInfo,
         0x1ffd | 0x122f | 0x122d => DispatchTebPurpose::UserObjectName,
         _ => DispatchTebPurpose::Compatibility,

@@ -57,3 +57,19 @@ fn cursor_icon_data_dispatch_preserves_threadinfo_client_info_identity() {
     let foreign = DispatchTebCandidates { thread_client_info: 0x2000_0800, ..candidates };
     assert_eq!(select_dispatch_teb(purpose, foreign), Err(DispatchTebError::ClientInfoMismatch));
 }
+
+#[test]
+fn keyboard_layout_activation_uses_threadinfo_client_info_identity() {
+    let candidates = DispatchTebCandidates {
+        callout_teb: 0x1000_0000,
+        client_teb: 0x2000_0000,
+        compatibility_teb: 0x3000_0000,
+        thread_client_info: 0x1000_0800,
+    };
+    let purpose = purpose_for_win32k_syscall(0x125c, 0);
+    assert_eq!(purpose, DispatchTebPurpose::ThreadInfo,
+        "LiberNT keyboard layout activation calls GetW32ThreadInfo after optional user callbacks");
+    assert_eq!(select_dispatch_teb(purpose, candidates), Ok(candidates.callout_teb));
+    let foreign = DispatchTebCandidates { thread_client_info: 0x2000_0800, ..candidates };
+    assert_eq!(select_dispatch_teb(purpose, foreign), Err(DispatchTebError::ClientInfoMismatch));
+}
