@@ -221,6 +221,8 @@ pub enum DxgDdiSignature {
     RemoveDevice,
     QueryChildRelations,
     QueryAdapterInfo,
+    CreateDevice,
+    DestroyDevice,
     GetNodeMetadata,
     CreateProcess,
     DestroyProcess,
@@ -238,6 +240,8 @@ impl DxgDdiSignature {
             0x20 => Some(Self::RemoveDevice),
             0x40 => Some(Self::QueryChildRelations),
             0x88 => Some(Self::QueryAdapterInfo),
+            0x90 => Some(Self::CreateDevice),
+            0x190 => Some(Self::DestroyDevice),
             0x298 => Some(Self::GetNodeMetadata),
             0x300 => Some(Self::CreateProcess),
             0x308 => Some(Self::DestroyProcess),
@@ -252,9 +256,40 @@ impl DxgDdiSignature {
             Self::QueryChildRelations => 3,
             Self::GetNodeMetadata => 3,
             Self::QueryAdapterInfo => 2,
+            Self::CreateDevice => 2,
+            Self::DestroyDevice => 1,
             Self::CreateProcess | Self::DestroyProcess => 2,
             Self::StopDevice | Self::RemoveDevice => 1,
         }
+    }
+}
+
+/// Pinned LiberNT x64 DXGKARG_CREATEDEVICE for the system-device path.
+/// The miniport writes only the first eight-byte `hDevice` output. All other
+/// fields are inputs and must retain their original bytes on copyback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgCreateDeviceLayout {
+    kmd_process: u64,
+}
+
+impl DxgCreateDeviceLayout {
+    pub fn parse(version: u32, bytes: &[u8], marshal_capacity: u64) -> Option<Self> {
+        if DxgInitializationData::required_prefix_len(version).is_none()
+            || bytes.len() < 0x20 || marshal_capacity < 0x20
+            || bytes[..8] != [0; 8]
+            || u32::from_le_bytes(bytes[8..12].try_into().ok()?) != 1
+            || bytes[12..0x18] != [0; 12]
+        { return None; }
+        Some(Self { kmd_process: u64::from_le_bytes(bytes[0x18..0x20].try_into().ok()?) })
+    }
+
+    pub const fn bytes(self) -> u64 { 0x20 }
+    pub const fn kmd_process(self) -> u64 { self.kmd_process }
+
+    pub fn copyback_device(self, output: &mut [u8], kmd_device: u64) -> bool {
+        if output.len() < 0x20 || kmd_device == 0 { return false; }
+        output[..8].copy_from_slice(&kmd_device.to_le_bytes());
+        true
     }
 }
 
@@ -572,6 +607,47 @@ pub struct DxgProcessAliasKey {
     kmd_generation: u64,
 }
 
+/// A device cookie belongs to one started adapter and one exact KMD process
+/// allocation. The zero process/generation pair is the system-device case.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgDeviceAliasKey {
+    adapter: DxgPdoAliasAuthority,
+    adapter_context: u64,
+    adapter_generation: u64,
+    kmd_process: u64,
+    process_generation: u64,
+    kmd_device: u64,
+    device_generation: u64,
+}
+
+impl DxgDeviceAliasKey {
+    pub const fn new(adapter: DxgPdoAliasAuthority,
+        adapter_context: u64, adapter_generation: u64,
+        kmd_process: u64, process_generation: u64,
+        kmd_device: u64, device_generation: u64) -> Option<Self>
+    {
+        if adapter_context == 0 || adapter_generation == 0
+            || (kmd_process == 0) != (process_generation == 0)
+            || kmd_device == 0 || device_generation == 0
+        { return None; }
+        Some(Self { adapter, adapter_context, adapter_generation,
+            kmd_process, process_generation, kmd_device, device_generation })
+    }
+
+    pub fn matches_destroy(self, adapter: DxgPdoAliasAuthority,
+        kmd_device: u64, device_generation: u64) -> bool
+    {
+        self.adapter == adapter && self.kmd_device == kmd_device
+            && self.device_generation == device_generation
+    }
+
+    pub const fn kmd_process(self) -> u64 { self.kmd_process }
+    pub const fn process_generation(self) -> u64 { self.process_generation }
+    pub const fn cookie_address_conflicts(self, other: Self) -> bool {
+        self.kmd_device == other.kmd_device
+    }
+}
+
 impl DxgProcessAliasKey {
     pub const fn new(adapter: DxgPdoAliasAuthority,
         adapter_context: u64, adapter_generation: u64,
@@ -598,6 +674,7 @@ impl DxgProcessAliasKey {
 
     pub const fn dxg_process(self) -> u64 { self.dxg_process }
     pub const fn dxg_generation(self) -> u64 { self.dxg_generation }
+    pub const fn kmd_process(self) -> u64 { self.kmd_process }
     pub const fn cookie_address_conflicts(self, other: Self) -> bool {
         self.kmd_process != 0 && self.kmd_process == other.kmd_process
     }
@@ -675,6 +752,56 @@ impl DxgProcessCookieRetirement {
 
     /// The miniport retained its own allocation and issued no in-callback
     /// free. Its completed Destroy ends root's temporary pin authority.
+    pub fn release_without_free(&mut self,
+        callback_completed: bool, reply_acknowledged: bool) -> bool
+    {
+        if self.free_requested || self.callback_interval_open || self.completed
+            || !callback_completed || !reply_acknowledged
+        { return false; }
+        self.completed = true;
+        true
+    }
+}
+
+/// A DestroyDevice free is escrowed under the exact device-cookie generation
+/// and dependent callback route until its callback and Reply both finish.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgDeviceCookieRetirement {
+    key: DxgDeviceAliasKey,
+    route: DxgProcessFreeRoute,
+    free_requested: bool,
+    callback_interval_open: bool,
+    completed: bool,
+}
+
+impl DxgDeviceCookieRetirement {
+    pub const fn new(key: DxgDeviceAliasKey, route: DxgProcessFreeRoute) -> Option<Self> {
+        Some(Self { key, route, free_requested: false,
+            callback_interval_open: true, completed: false })
+    }
+
+    pub fn request_free(&mut self, key: DxgDeviceAliasKey, route: DxgProcessFreeRoute,
+        address: u64, generation: u64) -> bool
+    {
+        if self.free_requested || !self.callback_interval_open || self.completed
+            || self.key != key || self.route != route
+            || address != self.key.kmd_device || generation != self.key.device_generation
+        { return false; }
+        self.free_requested = true;
+        true
+    }
+
+    pub const fn free_requested(self) -> bool { self.free_requested }
+    pub fn close_callback_interval(&mut self) { self.callback_interval_open = false; }
+
+    pub fn complete(&mut self, callback_completed: bool, reply_acknowledged: bool) -> bool {
+        if !self.free_requested || self.callback_interval_open || self.completed
+            || !callback_completed || !reply_acknowledged
+        { return false; }
+        self.completed = true;
+        true
+    }
+
     pub fn release_without_free(&mut self,
         callback_completed: bool, reply_acknowledged: bool) -> bool
     {

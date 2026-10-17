@@ -18,12 +18,23 @@ pub(super) struct DxgProcessAlias {
     destroy_entered: bool,
 }
 
-fn free_route_identity(domain: HostedDomainIdentity,
+pub(super) fn free_route_identity(domain: HostedDomainIdentity,
     route: nt_component_suspension::peer_registry::PeerRoute) -> Option<DxgProcessFreeRoute>
 {
     DxgProcessFreeRoute::new(domain.domain_id.raw(), domain.cookie,
         route.endpoint(), route.badge(), route.identity().domain_generation,
         route.identity().executor)
+}
+
+impl DxgProcessAlias {
+    pub(super) unsafe fn live_kmd_cookie(&self, inst: DriverInstance,
+        domain: HostedDomainIdentity, cookie: u64) -> Option<u64>
+    {
+        if self.destroy_entered || self.key?.kmd_process() != cookie { return None; }
+        let guard = self.kmd_guard.as_ref()?;
+        if !guard.live(inst, domain) { return None; }
+        Some(guard.allocation.pool_generation)
+    }
 }
 
 pub(super) unsafe fn create(
@@ -221,6 +232,9 @@ pub(super) unsafe fn destroy(
             dependent_pdo.generation())
     { return Err(STATUS_INVALID_PARAMETER); }
     let context_generation = alias.context_allocation.unwrap().pool_generation;
+    if alias.devices.iter().any(|device| device.linked_process(kmd_process)) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
+    }
     let route = hosted_ingress_sources::primary_route(record.dependent_instance)
         .ok_or(STATUS_DEVICE_NOT_READY)?;
     if route.identity().executor != dependent_inst.tcb

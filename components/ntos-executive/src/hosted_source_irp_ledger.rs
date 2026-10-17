@@ -908,6 +908,13 @@ pub(super) fn service(
             };
             if op == 3 {
                 if let Some(status) = unsafe {
+                    hosted_dxg_registration::defer_device_cookie_free(
+                        ch, instance_index, inst, domain, component_address,
+                        caller_badge, active_reply_cap)
+                } {
+                    return (status, 0, 0);
+                }
+                if let Some(status) = unsafe {
                     hosted_dxg_registration::defer_process_cookie_free(
                         ch, instance_index, inst, domain, component_address,
                         caller_badge, active_reply_cap)

@@ -25,6 +25,8 @@ static NEXT_AUTHORITY_COOKIE: AtomicU64 = AtomicU64::new(1);
 mod process;
 #[path = "hosted_dxg_registration/node_metadata.rs"]
 mod node_metadata;
+#[path = "hosted_dxg_registration/device.rs"]
+mod device;
 
 #[derive(Clone, Copy)]
 struct DxgResolution {
@@ -63,6 +65,7 @@ struct DxgPdoAlias {
     query_nested: Option<DxgQueryOutputGuard>,
     node_metadata_output: Option<DxgQueryOutputGuard>,
     processes: Vec<process::DxgProcessAlias>,
+    devices: Vec<device::DxgDeviceAlias>,
     null_process_credits: Option<nt_hosted_runtime::DxgNullProcessCredits>,
     provider_domain: HostedDomainIdentity,
     provider_publication_cookie: u64,
@@ -750,6 +753,7 @@ pub(super) unsafe fn service_add_device_callback(
             query_nested: None,
             node_metadata_output: None,
             processes: Vec::new(),
+            devices: Vec::new(),
             null_process_credits: None,
             provider_domain: record.provider_domain,
             provider_publication_cookie: record.provider_publication_cookie,
@@ -936,6 +940,7 @@ pub(super) unsafe fn service_stop_device_callback(
             && alias.dependent_domain == record.dependent_domain
             && alias.provider_publication_cookie == record.provider_publication_cookie
             && alias.processes.is_empty()
+            && alias.devices.is_empty()
             && alias.null_process_credits.is_none_or(|credits| credits.count() == 0)
             && nt_hosted_runtime::dxg_stop_device_admitted(
                 alias.start_entered, alias.start_succeeded, alias.start_callback_active,
@@ -1187,6 +1192,45 @@ pub(super) unsafe fn service_destroy_process_callback(
 ) -> Result<u64, i32> {
     process::destroy(dispatch, provider_inst, record, dependent_inst,
         exec_code_va, provider_context, kmd_process)
+}
+
+pub(super) unsafe fn service_create_device_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    marshal_window: HostedProviderMarshalWindow,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    provider_context: u64,
+    provider_request: u64,
+) -> Result<u64, i32> {
+    device::create(dispatch, marshal_window, provider_inst, record,
+        dependent_inst, exec_code_va, provider_context, provider_request)
+}
+
+pub(super) unsafe fn service_destroy_device_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    kmd_device: u64,
+) -> Result<u64, i32> {
+    device::destroy(dispatch, provider_inst, record,
+        dependent_inst, exec_code_va, kmd_device)
+}
+
+pub(super) unsafe fn defer_device_cookie_free(
+    channel: &crate::spawn_hosts::PumpChannel,
+    instance_index: usize,
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    address: u64,
+    caller_badge: u64,
+    active_reply_cap: u64,
+) -> Option<i32> {
+    device::defer_cookie_free(channel, instance_index, inst, domain,
+        address, caller_badge, active_reply_cap)
 }
 
 pub(super) unsafe fn defer_process_cookie_free(
@@ -1487,6 +1531,7 @@ pub(super) unsafe fn retire_pdo_aliases_for_instance(
             continue;
         }
         if !pdo_aliases_mut()[index].processes.is_empty()
+            || !pdo_aliases_mut()[index].devices.is_empty()
             || pdo_aliases_mut()[index].null_process_credits
                 .is_some_and(|credits| credits.count() != 0)
         {
