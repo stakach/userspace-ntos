@@ -7,6 +7,7 @@
 use nt_hosted_runtime::{
     hosted_dxg_registration_marshal_policy, DxgEntryAuthority, DxgInitializationData,
     DxgInitializationDataError, DxgRegistrationKey, DxgSourceDriverObject, DxgDdiSignature,
+    DxgPdoAliasAuthority,
     HostedProviderArgumentMarshal,
     HostedProviderExportResultSemantics, HostedProviderExportSideEffect, HostedProviderObjectOwner,
 };
@@ -230,4 +231,19 @@ fn pinned_libernt_lifecycle_callbacks_have_explicit_x64_signatures() {
     assert_eq!(DxgDdiSignature::StartDevice.argument_count(), 5);
     assert_eq!(DxgDdiSignature::StopDevice.argument_count(), 1);
     assert_eq!(DxgDdiSignature::RemoveDevice.argument_count(), 1);
+}
+
+#[test]
+fn reverse_add_device_alias_binds_both_pdo_generations_and_canonical_device() {
+    let owner = HostedProviderObjectOwner::new(1, 11, 2, 22).unwrap();
+    let alias = DxgPdoAliasAuthority::new(owner, 33, 44,
+        0x1000, 55, 0x2000, 66).unwrap();
+    assert!(alias.matches(owner, 33, 44, 0x1000, 55, 0x2000, 66));
+    assert!(!alias.matches(owner, 33, 45, 0x1000, 55, 0x2000, 66));
+    assert!(!alias.matches(owner, 33, 44, 0x1000, 56, 0x2000, 66));
+    assert!(!alias.matches(owner, 33, 44, 0x1000, 55, 0x2000, 67));
+    assert!(!alias.matches(HostedProviderObjectOwner::new(1, 12, 2, 22).unwrap(),
+        33, 44, 0x1000, 55, 0x2000, 66));
+    assert!(DxgPdoAliasAuthority::new(owner, 33, 44, 0x1000, 55, 0x2000, 0).is_none());
+    assert!(DxgPdoAliasAuthority::new(owner, 33, 44, 0x1000, 0, 0x2000, 66).is_none());
 }

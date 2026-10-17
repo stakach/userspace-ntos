@@ -6,7 +6,8 @@
 
 use super::*;
 use nt_hosted_runtime::{
-    DxgEntryAuthority, DxgInitializationData, DxgRegistrationKey, DxgSourceDriverObject,
+    DxgEntryAuthority, DxgInitializationData, DxgPdoAliasAuthority,
+    DxgRegistrationKey, DxgSourceDriverObject,
     encode_hosted_dxg_registration_thunk,
     hosted_dxg_registration_marshal_policy,
 };
@@ -34,6 +35,26 @@ struct DxgResolution {
 }
 
 static mut RESOLUTIONS: Vec<DxgResolution> = Vec::new();
+
+struct DxgPdoAlias {
+    provider_instance: usize,
+    dependent_instance: usize,
+    provider_pdo: HostedDevicePointerRegistration,
+    dependent_domain: HostedDomainIdentity,
+    dependent_alias: Option<HostedDevicePointerRegistration>,
+    alias_allocation: Option<nt_io_manager::source_irp_auxiliary::SourcePoolAllocationIdentity>,
+    authority: Option<DxgPdoAliasAuthority>,
+    context: u64,
+    callback_entered: bool,
+    pointer_retired: bool,
+    blocked: bool,
+}
+
+static mut PDO_ALIASES: Vec<DxgPdoAlias> = Vec::new();
+
+unsafe fn pdo_aliases_mut() -> &'static mut Vec<DxgPdoAlias> {
+    &mut *core::ptr::addr_of_mut!(PDO_ALIASES)
+}
 
 fn reject(stage: &[u8], status: i32) -> i32 {
     print_str(b"[dxg-bridge] reject stage=");
@@ -287,6 +308,192 @@ pub(super) unsafe fn validate_call(
             provider_entry_va)
         && driver_instance_thunk_slots().and_then(|rows| rows.get(dependent_instance))
             .is_some_and(|slots| slots.is_live(record.binding.token, record.binding.key))
+}
+
+/// DxgKrnl supplies its PDO and an out cell in the provider VSpace. The
+/// miniport receives a separate PDO projection of the same canonical Device.
+/// The alias owner is recorded before entering either component and retained
+/// on every uncertain result.
+pub(super) unsafe fn service_add_device_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    marshal_window: HostedProviderMarshalWindow,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    provider_pdo_address: u64,
+    provider_context_out: u64,
+) -> Result<u64, i32> {
+    let provider_pdo = hosted_add_device_rollback::active_pdo_registration(
+        record.provider_instance, record.provider_domain, provider_pdo_address)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let (_, output_allocation) = hosted_add_device_rollback::active_created_output(
+        record.provider_instance, record.provider_domain, provider_pdo,
+        provider_context_out).ok_or(STATUS_INVALID_PARAMETER)?;
+    let owner = hosted_provider_object_owner_for_pair(
+        record.provider_instance, record.dependent_instance)
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
+    if instance_domain_identity(provider_inst) != Some(record.provider_domain)
+        || instance_domain_identity(dependent_inst) != Some(record.dependent_domain)
+        || provider_pdo.device_id().raw() == 0
+        || provider_callback_marshal_window(marshal_window, 8, 0).is_err()
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let alias_index = {
+        let aliases = pdo_aliases_mut();
+        if aliases.iter().any(|alias| {
+            alias.provider_instance == record.provider_instance
+                && alias.dependent_instance == record.dependent_instance
+                && alias.provider_pdo == provider_pdo
+        }) {
+            return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
+        }
+        aliases.try_reserve(1).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        let index = aliases.len();
+        aliases.push(DxgPdoAlias {
+            provider_instance: record.provider_instance,
+            dependent_instance: record.dependent_instance,
+            provider_pdo,
+            dependent_domain: record.dependent_domain,
+            dependent_alias: None,
+            alias_allocation: None,
+            authority: None,
+            context: 0,
+            callback_entered: false,
+            pointer_retired: false,
+            blocked: true,
+        });
+        index
+    };
+    let dependent_pdo = create_hosted_pdo_projection(
+        record.dependent_instance, crate::initial_system_driver_caller())
+        .map_err(|status| status.raw())?;
+    let alias_allocation = hosted_device_allocations::capture_allocation(
+        dependent_inst, dependent_pdo).map_err(|status| status.raw())?;
+    pdo_aliases_mut()[alias_index].alias_allocation = Some(alias_allocation);
+    let dependent_alias = match register_unlinked_hosted_device_projection(
+        dependent_inst, record.dependent_domain, dependent_pdo, provider_pdo.device_id()) {
+        Ok(registration) => registration,
+        Err(error) => {
+            pdo_aliases_mut()[alias_index].dependent_alias = error.accepted_registration();
+            return Err(error.status.raw());
+        }
+    };
+    pdo_aliases_mut()[alias_index].dependent_alias = Some(dependent_alias);
+    let authority = DxgPdoAliasAuthority::new(
+        owner, record.provider_publication_cookie, provider_pdo.device_id().raw(),
+        provider_pdo.address(), provider_pdo.generation(),
+        dependent_alias.address(), dependent_alias.generation())
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    pdo_aliases_mut()[alias_index].authority = Some(authority);
+    if hosted_device_allocations::capture_allocation(dependent_inst, dependent_pdo)
+        .ok() != Some(alias_allocation)
+        || io_manager_mut().hosted_device_pointer_registration(
+            record.dependent_domain, dependent_pdo) != Some(dependent_alias)
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    write_unaligned(marshal_window.exec_base as *mut u64, 0);
+    pdo_aliases_mut()[alias_index].callback_entered = true;
+    let result = dispatch_dependent_provider_callback(
+        dispatch, record, dependent_inst, exec_code_va,
+        [dependent_pdo, marshal_window.component_base, 0, 0],
+        [0; PROVIDER_CALLBACK_STACK_QWORDS],
+    )?;
+    let status = result as u32 as i32;
+    if status >= 0 {
+        let current_provider = hosted_add_device_rollback::active_created_output(
+            record.provider_instance, record.provider_domain, provider_pdo,
+            provider_context_out).ok_or(STATUS_INVALID_PARAMETER)?;
+        if current_provider.1 != output_allocation
+            || hosted_device_allocations::capture_allocation(
+                dependent_inst, dependent_pdo).ok() != Some(alias_allocation)
+            || io_manager_mut().hosted_device_pointer_registration(
+                record.dependent_domain, dependent_pdo) != Some(dependent_alias)
+            || !authority.matches(owner, record.provider_publication_cookie,
+                provider_pdo.device_id().raw(), provider_pdo.address(),
+                provider_pdo.generation(), dependent_alias.address(),
+                dependent_alias.generation())
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let context = read_unaligned(marshal_window.exec_base as *const u64);
+        write_unaligned(current_provider.0 as *mut u64, context);
+        pdo_aliases_mut()[alias_index].context = context;
+        pdo_aliases_mut()[alias_index].blocked = false;
+    }
+    Ok(result)
+}
+
+/// After clear_instance drains the dependency, remove only fully published
+/// aliases whose exact registration and physical allocation still match.
+/// A lost callback result keeps its owner and prevents domain reuse.
+pub(super) unsafe fn retire_pdo_aliases_for_instance(
+    instance_index: usize,
+    domain: HostedDomainIdentity,
+) -> u64 {
+    let mut failures = 0u64;
+    let mut index = 0usize;
+    while index < pdo_aliases_mut().len() {
+        let row = &pdo_aliases_mut()[index];
+        if row.provider_instance != instance_index
+            && row.dependent_instance != instance_index
+        {
+            index += 1;
+            continue;
+        }
+        let dependent = row.dependent_instance;
+        let alias = row.dependent_alias;
+        let allocation = row.alias_allocation;
+        let domain_matches = row.dependent_instance == instance_index
+            && row.dependent_domain == domain;
+        if !domain_matches || row.blocked || !row.callback_entered {
+            failures += 1;
+            index += 1;
+            continue;
+        }
+        let Some(alias) = alias else {
+            failures += 1;
+            index += 1;
+            continue;
+        };
+        let Some(inst) = instance(dependent) else {
+            failures += 1;
+            index += 1;
+            continue;
+        };
+        if hosted_device_allocations::capture_allocation(inst, alias.address()).ok()
+            != allocation
+        {
+            pdo_aliases_mut()[index].blocked = true;
+            failures += 1;
+            index += 1;
+            continue;
+        }
+        if !pdo_aliases_mut()[index].pointer_retired {
+            if io_manager_mut().hosted_device_pointer_registration(domain, alias.address())
+                != Some(alias)
+                || io_manager_mut().retire_hosted_device_pointer(alias).is_err()
+            {
+                pdo_aliases_mut()[index].blocked = true;
+                failures += 1;
+                index += 1;
+                continue;
+            }
+            pdo_aliases_mut()[index].pointer_retired = true;
+        }
+        if retire_hosted_device_projection(inst, alias.address(),
+            CanonicalRetirement::Retired { registration: alias }, None).is_err()
+        {
+            pdo_aliases_mut()[index].blocked = true;
+            failures += 1;
+            index += 1;
+            continue;
+        }
+        pdo_aliases_mut().swap_remove(index);
+    }
+    failures
 }
 
 pub(super) unsafe fn marshal_initialization_data(

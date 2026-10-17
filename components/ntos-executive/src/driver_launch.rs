@@ -33824,10 +33824,13 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     match nt_hosted_runtime::DxgDdiSignature::for_offset(
                         record.callback_version, record.callback_offset as usize,
                     ) {
-                        // Each lifecycle signature needs its own pointer projection
+                        Some(nt_hosted_runtime::DxgDdiSignature::AddDevice) =>
+                            hosted_dxg_registration::service_add_device_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1),
+                        // Each remaining signature needs its own pointer projection
                         // and copyout before it can be invoked across VSpaces.
-                        Some(nt_hosted_runtime::DxgDdiSignature::AddDevice)
-                        | Some(nt_hosted_runtime::DxgDdiSignature::StartDevice)
+                        Some(nt_hosted_runtime::DxgDdiSignature::StartDevice)
                         | Some(nt_hosted_runtime::DxgDdiSignature::StopDevice)
                         | Some(nt_hosted_runtime::DxgDdiSignature::RemoveDevice)
                         | None => Err(STATUS_NOT_SUPPORTED),
@@ -59065,6 +59068,7 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
             let mut dependency_failures = 0u64;
             let mut singleton_failures = 0u64;
             shadow_failures += clear_hosted_provider_callback_parents_for_instance(i, domain);
+            shadow_failures += hosted_dxg_registration::retire_pdo_aliases_for_instance(i, domain);
             shadow_failures += hosted_dxg_registration::retire_for_instance(i, domain);
             shadow_failures += clear_hosted_provider_pointer_allocations_for_instance(i, domain);
             shadow_failures += clear_hosted_provider_ndis_shadows_for_instance(i, domain);

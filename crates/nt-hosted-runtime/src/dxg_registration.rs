@@ -192,6 +192,60 @@ pub struct DxgRegistrationKey {
     dependent_driver_generation: u64,
 }
 
+/// Exact cross-domain alias for the PDO passed to DxgkDdiAddDevice. Both
+/// native addresses can be recycled, so each observed registration generation
+/// is part of the authority alongside the provider publication and device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgPdoAliasAuthority {
+    owner: HostedProviderObjectOwner,
+    provider_publication_cookie: u64,
+    canonical_device_id: u64,
+    provider_pdo_address: u64,
+    provider_pdo_generation: u64,
+    dependent_alias_address: u64,
+    dependent_alias_generation: u64,
+}
+
+impl DxgPdoAliasAuthority {
+    pub const fn new(
+        owner: HostedProviderObjectOwner,
+        provider_publication_cookie: u64,
+        canonical_device_id: u64,
+        provider_pdo_address: u64,
+        provider_pdo_generation: u64,
+        dependent_alias_address: u64,
+        dependent_alias_generation: u64,
+    ) -> Option<Self> {
+        if owner.provider_domain_id == 0 || owner.provider_domain_cookie == 0
+            || owner.dependent_domain_id == 0 || owner.dependent_domain_cookie == 0
+            || provider_publication_cookie == 0 || canonical_device_id == 0
+            || provider_pdo_address == 0 || provider_pdo_generation == 0
+            || dependent_alias_address == 0 || dependent_alias_generation == 0
+        {
+            return None;
+        }
+        Some(Self { owner, provider_publication_cookie, canonical_device_id,
+            provider_pdo_address, provider_pdo_generation,
+            dependent_alias_address, dependent_alias_generation })
+    }
+
+    pub const fn matches(
+        self, owner: HostedProviderObjectOwner,
+        provider_publication_cookie: u64, canonical_device_id: u64,
+        provider_pdo_address: u64, provider_pdo_generation: u64,
+        dependent_alias_address: u64, dependent_alias_generation: u64,
+    ) -> bool {
+        self.owner.pair_matches(owner.provider_domain_id, owner.provider_domain_cookie,
+            owner.dependent_domain_id, owner.dependent_domain_cookie)
+            && self.provider_publication_cookie == provider_publication_cookie
+            && self.canonical_device_id == canonical_device_id
+            && self.provider_pdo_address == provider_pdo_address
+            && self.provider_pdo_generation == provider_pdo_generation
+            && self.dependent_alias_address == dependent_alias_address
+            && self.dependent_alias_generation == dependent_alias_generation
+    }
+}
+
 /// The source DriverObject is published in the component preamble before
 /// DriverEntry, while the executive's post-entry snapshot is still zero.
 /// Pool generation binds its address against reuse within that domain.

@@ -15,7 +15,7 @@ mod dxg_registration;
 pub use driver_load_receipt::{DriverLoadPhase, RetainedEffectState};
 pub use dxg_registration::{
     DxgCallbackSlot, DxgCallbackSlots, DxgDdiSignature, DxgEntryAuthority, DxgInitializationData,
-    DxgInitializationDataError, DxgRegistrationKey, DxgSourceDriverObject,
+    DxgInitializationDataError, DxgPdoAliasAuthority, DxgRegistrationKey, DxgSourceDriverObject,
 };
 
 pub use hosted_irq_arena::{
