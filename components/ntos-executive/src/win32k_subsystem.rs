@@ -1182,10 +1182,10 @@ const PROCESSINFO_PRPWINSTA_OFF: u64 = 0x220;
 const PROCESSINFO_HWINSTA_OFF: u64 = 0x228;
 /// `PROCESSINFO.pW32Job`, immediately after `dwLpkEntryPoints` in the NT5/ReactOS layout.
 const PROCESSINFO_PW32JOB_OFF: u64 = 0x260;
-/// ReactOS 0.4.17 `gAtomTable` pointer cell. `NtUserRegisterWindowMessage`'s call to `IntAddAtom`
-/// loads this cell at image VA 0x21bfd8 (RVA 0x20bfd8); the job namespace wrapper substitutes only
-/// for the two global-atom user services and restores it before returning.
-const G_ATOM_TABLE_RVA: u64 = 0x20_BFD8;
+/// Pinned LiberNT `gAtomTable` cell. `IntAddAtom` loads it through the relocation slot at
+/// RVA 0x174390 before calling `RtlAddAtomToAtomTable`. The job namespace wrapper substitutes
+/// only for the two global-atom user services and restores it before returning.
+const G_ATOM_TABLE_RVA: u64 = 0x23c2a8;
 static WIN32K_SESSION_ATOM_TABLE: AtomicU64 = AtomicU64::new(0);
 /// PROCESSINFO->HeapMappings (`win32.h`). The first embedded entry is the global USER heap; its
 /// `Next` chain holds per-desktop heap mappings for DesktopHeapGetUserDelta/DesktopHeapAddressToUser.
@@ -1315,38 +1315,33 @@ static WIN32K_DEFAULT_KEYBOARD_LAYOUT: AtomicU64 = AtomicU64::new(0);
 static WIN32K_KEYBOARD_LAYOUT_OBSERVES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_KEYBOARD_LAYOUT_BINDINGS: AtomicU64 = AtomicU64::new(0);
 
-/// win32k `gpdeskInputDesktop` RVA, read to observe genuine NtUserSwitchDesktop results.
-pub const GPDESK_INPUT_DESKTOP_RVA: u64 = 0x20b528;
+/// Pinned LiberNT `gpdeskInputDesktop`, stored by `NtUserSwitchDesktop` at VMA 0x63aef.
+pub const GPDESK_INPUT_DESKTOP_RVA: u64 = 0x23ae70;
 
-/// win32k `.data` global `gspklBaseLayout` (`kbdlayout.c:22`) RVA. Derived from this build's
-/// disassembly:
-///   * VMA 0x9ff20 is `W32kGetDefaultKeyLayout`: it reads 0x21bf40, tests `KL.dwKL_Flags` (+0x20)
-///     for `KL_UNLOAD`, then follows `pklPrev` (+0x18) until it returns to the same global.
-///   * win32k.sys ImageBase is 0x10000, so VMA 0x21bf40 maps to RVA 0x20bf40.
-pub const GSPKL_BASE_LAYOUT_RVA: u64 = 0x20bf40;
+/// Pinned LiberNT `gspklBaseLayout` (`kbdlayout.c:22`), loaded through the relocation slot at
+/// RVA 0x17c010 by the native IME keyboard-layout traversal.
+pub const GSPKL_BASE_LAYOUT_RVA: u64 = 0x23b9f8;
 
-/// win32k `.data` global `NrGuiAppsRunning` (guicheck.c:17) RVA — the lazy-graphics-init gate counter.
-/// `co_AddGuiApp` triggers `co_IntInitializeDesktopGraphics` only on the 0→1 transition. We READ it to
-/// diagnose whether winlogon's SwitchGDI DC-op fires the lazy InitVideo (paint) or is short-circuited.
-pub const NR_GUI_APPS_RUNNING_RVA: u64 = 0x20be88;
-/// `gpmdev`, the active MDEV pointer populated by `PDEVOBJ_lChangeDisplaySettings`.
-pub const GPMDEV_RVA: u64 = 0x20b490;
-/// `PDEVOBJ_lChangeDisplaySettings` — creates the real display PDEV and its initial driver surface.
-pub const PDEVOBJ_L_CHANGE_DISPLAY_SETTINGS_RVA: u64 = 0x2e100;
+/// Pinned LiberNT `NrGuiAppsRunning` (guicheck.c:17), the lazy graphics gate. `co_AddGuiApp`
+/// updates this cell at VMA 0x6d289 and initializes graphics on the 0-to-1 transition.
+pub const NR_GUI_APPS_RUNNING_RVA: u64 = 0x23b8a0;
+/// Pinned LiberNT `gpmdev`, the active MDEV pointer. Its address is loaded from the relocation
+/// slot at RVA 0x16ae58 by `co_IntInitializeDesktopGraphics` before the native PDEV call.
+pub const GPMDEV_RVA: u64 = 0x1b7168;
+/// Pinned LiberNT `PDEVOBJ_lChangeDisplaySettings` entry, called by
+/// `co_IntInitializeDesktopGraphics` at RVA 0xba8cb to create the real display PDEV.
+pub const PDEVOBJ_L_CHANGE_DISPLAY_SETTINGS_RVA: u64 = 0x1b790;
 
 /// SSN NtUserSwitchDesktop — SSDT idx 0x288 (== `WIN32K_SERVICE_BASE + 0x288`).
 pub const SSN_NT_USER_SWITCH_DESKTOP: u64 = 0x1288;
 /// SSN NtUserSetProcessWindowStation — win32k's real PROCESSINFO/EPROCESS station association.
 pub const SSN_NT_USER_SET_PROCESS_WINDOW_STATION: u64 = 0x10ac;
 
-/// win32k `.data` global `InputWindowStation` (winsta.c:21) RVA — the interactive window station.
-/// `NtUserSwitchDesktop` requires `pdesk->rpwinstaParent == InputWindowStation` (desktop.c:3015) or it
-/// returns FALSE. Derived from the disasm at NtUserSwitchDesktop RVA 0x6c44e `mov rcx,[rip+0x19fc13]`
-/// (0x6c455 + 0x19fc13). We set it to our created WINDOWSTATION body before the switch.
-pub const INPUT_WINDOW_STATION_RVA: u64 = 0x20c068;
-/// DESKTOP.rpwinstaParent offset (confirmed by the NtUserSwitchDesktop disasm: RVA 0x6c3b1
-/// `mov rax,[rax+0x20]` = pdesk->rpwinstaParent, then [+0x20]=WINSTATION.Flags for the WSS_LOCKED
-/// check; and RVA 0x6c281 `mov rcx,[pdesk+0x20]; cmp sessionId,[rcx]` = winsta->dwSessionId@0).
+/// Pinned LiberNT `InputWindowStation` (winsta.c:21), loaded through the relocation slot at
+/// RVA 0x16f340 by `NtUserSwitchDesktop` to compare the target desktop's parent.
+pub const INPUT_WINDOW_STATION_RVA: u64 = 0x23cab8;
+/// DESKTOP.rpwinstaParent offset, confirmed by pinned `NtUserSwitchDesktop` at VMA 0x639ec
+/// (`mov rax,[rcx+0x20]`) before comparison with `InputWindowStation`.
 pub const DESKTOP_RPWINSTA_PARENT_OFF: u64 = 0x20;
 
 pub const DESKTOP_HSECTION_OFF: u64 = 0x78;
