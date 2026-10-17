@@ -1220,6 +1220,45 @@ pub(super) unsafe fn service_destroy_device_callback(
         dependent_inst, exec_code_va, kmd_device)
 }
 
+pub(super) unsafe fn service_create_context_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    marshal_window: HostedProviderMarshalWindow,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    kmd_device: u64,
+    provider_request: u64,
+) -> Result<u64, i32> {
+    device::context::create(dispatch, marshal_window, provider_inst,
+        record, dependent_inst, exec_code_va, kmd_device, provider_request)
+}
+
+pub(super) unsafe fn service_destroy_context_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    kmd_context: u64,
+) -> Result<u64, i32> {
+    device::context::destroy(dispatch, provider_inst, record,
+        dependent_inst, exec_code_va, kmd_context)
+}
+
+pub(super) unsafe fn defer_context_cookie_free(
+    channel: &crate::spawn_hosts::PumpChannel,
+    instance_index: usize,
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    address: u64,
+    caller_badge: u64,
+    active_reply_cap: u64,
+) -> Option<i32> {
+    device::context::defer_cookie_free(channel, instance_index, inst, domain,
+        address, caller_badge, active_reply_cap)
+}
+
 pub(super) unsafe fn defer_device_cookie_free(
     channel: &crate::spawn_hosts::PumpChannel,
     instance_index: usize,

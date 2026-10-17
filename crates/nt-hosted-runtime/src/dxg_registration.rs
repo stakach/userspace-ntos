@@ -223,6 +223,8 @@ pub enum DxgDdiSignature {
     QueryAdapterInfo,
     CreateDevice,
     DestroyDevice,
+    CreateContext,
+    DestroyContext,
     GetNodeMetadata,
     CreateProcess,
     DestroyProcess,
@@ -242,6 +244,8 @@ impl DxgDdiSignature {
             0x88 => Some(Self::QueryAdapterInfo),
             0x90 => Some(Self::CreateDevice),
             0x190 => Some(Self::DestroyDevice),
+            0x1d0 => Some(Self::CreateContext),
+            0x1d8 => Some(Self::DestroyContext),
             0x298 => Some(Self::GetNodeMetadata),
             0x300 => Some(Self::CreateProcess),
             0x308 => Some(Self::DestroyProcess),
@@ -256,11 +260,44 @@ impl DxgDdiSignature {
             Self::QueryChildRelations => 3,
             Self::GetNodeMetadata => 3,
             Self::QueryAdapterInfo => 2,
-            Self::CreateDevice => 2,
-            Self::DestroyDevice => 1,
+            Self::CreateDevice | Self::CreateContext => 2,
+            Self::DestroyDevice | Self::DestroyContext => 1,
             Self::CreateProcess | Self::DestroyProcess => 2,
             Self::StopDevice | Self::RemoveDevice => 1,
         }
+    }
+}
+
+/// Pinned x64 WDDM system-context request. A private-data pointer requires
+/// its own nested marshal contract and is rejected here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgCreateContextLayout {
+    runtime_context: u64,
+}
+
+impl DxgCreateContextLayout {
+    pub fn parse(version: u32, bytes: &[u8], marshal_capacity: u64) -> Option<Self> {
+        if DxgInitializationData::required_prefix_len(version).is_none()
+            || bytes.len() < 0x48 || marshal_capacity < 0x48
+            || u64::from_le_bytes(bytes[..8].try_into().ok()?) != 0
+            || u32::from_le_bytes(bytes[0x0c..0x10].try_into().ok()?) == 0
+            || u32::from_le_bytes(bytes[0x10..0x14].try_into().ok()?) != 1
+            || bytes[0x14..0x18] != [0; 4]
+            || bytes[0x18..0x24] != [0; 12]
+        { return None; }
+        Some(Self { runtime_context: 0 })
+    }
+
+    pub const fn bytes(self) -> u64 { 0x48 }
+    pub const fn runtime_context(self) -> u64 { self.runtime_context }
+
+    pub fn copyback(self, output: &mut [u8], returned: &[u8]) -> bool {
+        if output.len() < 0x48 || returned.len() < 0x48
+            || returned[..8] == [0; 8]
+        { return false; }
+        output[..8].copy_from_slice(&returned[..8]);
+        output[0x24..0x44].copy_from_slice(&returned[0x24..0x44]);
+        true
     }
 }
 
@@ -648,6 +685,41 @@ impl DxgDeviceAliasKey {
     }
 }
 
+/// One miniport context cookie belongs to an exact device allocation and,
+/// when present, an exact runtime context allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgContextAliasKey {
+    device: DxgDeviceAliasKey,
+    runtime_context: u64,
+    runtime_generation: u64,
+    kmd_context: u64,
+    context_generation: u64,
+}
+
+impl DxgContextAliasKey {
+    pub const fn new(device: DxgDeviceAliasKey,
+        runtime_context: u64, runtime_generation: u64,
+        kmd_context: u64, context_generation: u64) -> Option<Self>
+    {
+        if (runtime_context == 0) != (runtime_generation == 0)
+            || kmd_context == 0 || context_generation == 0
+        { return None; }
+        Some(Self { device, runtime_context, runtime_generation,
+            kmd_context, context_generation })
+    }
+
+    pub fn matches_destroy(self, device: DxgDeviceAliasKey,
+        kmd_context: u64, context_generation: u64) -> bool
+    {
+        self.device == device && self.kmd_context == kmd_context
+            && self.context_generation == context_generation
+    }
+
+    pub const fn cookie_address_conflicts(self, other: Self) -> bool {
+        self.kmd_context == other.kmd_context
+    }
+}
+
 impl DxgProcessAliasKey {
     pub const fn new(adapter: DxgPdoAliasAuthority,
         adapter_context: u64, adapter_generation: u64,
@@ -786,6 +858,56 @@ impl DxgDeviceCookieRetirement {
         if self.free_requested || !self.callback_interval_open || self.completed
             || self.key != key || self.route != route
             || address != self.key.kmd_device || generation != self.key.device_generation
+        { return false; }
+        self.free_requested = true;
+        true
+    }
+
+    pub const fn free_requested(self) -> bool { self.free_requested }
+    pub fn close_callback_interval(&mut self) { self.callback_interval_open = false; }
+
+    pub fn complete(&mut self, callback_completed: bool, reply_acknowledged: bool) -> bool {
+        if !self.free_requested || self.callback_interval_open || self.completed
+            || !callback_completed || !reply_acknowledged
+        { return false; }
+        self.completed = true;
+        true
+    }
+
+    pub fn release_without_free(&mut self,
+        callback_completed: bool, reply_acknowledged: bool) -> bool
+    {
+        if self.free_requested || self.callback_interval_open || self.completed
+            || !callback_completed || !reply_acknowledged
+        { return false; }
+        self.completed = true;
+        true
+    }
+}
+
+/// A DestroyContext free remains pinned until the exact callback and Reply
+/// complete. No other worker can retire the cookie during that interval.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgContextCookieRetirement {
+    key: DxgContextAliasKey,
+    route: DxgProcessFreeRoute,
+    free_requested: bool,
+    callback_interval_open: bool,
+    completed: bool,
+}
+
+impl DxgContextCookieRetirement {
+    pub const fn new(key: DxgContextAliasKey, route: DxgProcessFreeRoute) -> Option<Self> {
+        Some(Self { key, route, free_requested: false,
+            callback_interval_open: true, completed: false })
+    }
+
+    pub fn request_free(&mut self, key: DxgContextAliasKey, route: DxgProcessFreeRoute,
+        address: u64, generation: u64) -> bool
+    {
+        if self.free_requested || !self.callback_interval_open || self.completed
+            || self.key != key || self.route != route
+            || address != self.key.kmd_context || generation != self.key.context_generation
         { return false; }
         self.free_requested = true;
         true

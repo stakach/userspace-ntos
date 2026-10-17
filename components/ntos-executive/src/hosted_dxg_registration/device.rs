@@ -4,6 +4,9 @@ use super::*;
 use nt_hosted_runtime::{DxgCreateDeviceLayout, DxgDeviceAliasKey,
     DxgDeviceCookieRetirement};
 
+#[path = "device/context.rs"]
+pub(super) mod context;
+
 pub(super) struct DxgDeviceAlias {
     request_guard: Option<DxgQueryOutputGuard>,
     kmd_guard: Option<StartOutputGuard>,
@@ -11,6 +14,7 @@ pub(super) struct DxgDeviceAlias {
     free_route: Option<nt_component_suspension::peer_registry::PeerRoute>,
     retirement: Option<DxgDeviceCookieRetirement>,
     destroy_entered: bool,
+    contexts: Vec<context::DxgContextAlias>,
 }
 
 impl DxgDeviceAlias {
@@ -98,6 +102,7 @@ pub(super) unsafe fn create(
     pdo_aliases_mut()[alias_index].devices.push(DxgDeviceAlias {
         request_guard: Some(request_guard), kmd_guard: None, key: None,
         free_route: None, retirement: None, destroy_entered: false,
+        contexts: Vec::new(),
     });
     pdo_aliases_mut()[alias_index].blocked = true;
     let device_index = pdo_aliases_mut()[alias_index].devices.len() - 1;
@@ -179,7 +184,7 @@ pub(super) unsafe fn destroy(
             { continue; }
             let Some(authority) = alias.authority else { continue; };
             for (device_index, device) in alias.devices.iter().enumerate() {
-                if device.destroy_entered { continue; }
+                if device.destroy_entered || !device.contexts.is_empty() { continue; }
                 let Some(guard) = device.kmd_guard.as_ref() else { continue; };
                 if device.key.is_some_and(|key| key.matches_destroy(authority,
                     kmd_device, guard.allocation.pool_generation)) {

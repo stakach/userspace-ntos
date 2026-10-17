@@ -33964,6 +33964,14 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                             hosted_dxg_registration::service_destroy_device_callback(
                                 dispatch, provider_inst, record, dependent_inst,
                                 exec_code_va, arg0),
+                        Some(nt_hosted_runtime::DxgDdiSignature::CreateContext) =>
+                            hosted_dxg_registration::service_create_context_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1),
+                        Some(nt_hosted_runtime::DxgDdiSignature::DestroyContext) =>
+                            hosted_dxg_registration::service_destroy_context_callback(
+                                dispatch, provider_inst, record, dependent_inst,
+                                exec_code_va, arg0),
                         Some(nt_hosted_runtime::DxgDdiSignature::GetNodeMetadata) =>
                             hosted_dxg_registration::service_get_node_metadata_callback(
                                 dispatch, marshal_window, provider_inst, record,
