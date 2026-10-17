@@ -127,11 +127,27 @@ pub(super) fn prepare_boot_directory_security(
                 )
             } else if entry.name() == b"security" {
                 nt_security::assign_security_directory_security(&subject, &mut audit)
-            } else if matches!(entry.name(), b"objecttypes" | b"driver" | b"filesystem") {
+            } else if matches!(entry.name(), b"objecttypes" | b"driver" | b"filesystem" | b"windows") {
                 nt_security::assign_directory_security(
                     &subject,
                     None,
                     None,
+                    nt_security::ProcessorMode::KernelMode,
+                    &mut audit,
+                )
+            } else if entry.name() == b"windowstations" {
+                let parent = namespace.get(entry.parent).ok_or(0xC000_0008u32)?;
+                if parent.name() != b"windows" || parent.parent != 0 {
+                    return Err(0xC000_0008);
+                }
+                let inherited = records
+                    .iter()
+                    .find(|record: &&DirectorySecurityRecord| record.identity == parent.identity)
+                    .ok_or(0xC000_0008u32)?;
+                nt_security::assign_directory_security(
+                    &subject,
+                    None,
+                    Some(&inherited.descriptor),
                     nt_security::ProcessorMode::KernelMode,
                     &mut audit,
                 )

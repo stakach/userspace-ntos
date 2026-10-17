@@ -3151,6 +3151,10 @@ pub(super) fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
     ] {
         ObjEntry::push_dir(&mut v, d, 0, true).expect("initial object directory");
     }
+    let windows = ObjEntry::push_dir(&mut v, b"windows", 0, true)
+        .expect("initial Windows directory");
+    ObjEntry::push_dir(&mut v, b"windowstations", windows, true)
+        .expect("initial WindowStations directory");
     ObjEntry::push_symlink(&mut v, b"dosdevices", 0, b"\\??", true)
         .expect("initial DosDevices alias");
     v
