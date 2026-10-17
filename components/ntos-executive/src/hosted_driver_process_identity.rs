@@ -14,6 +14,7 @@ const RETAIN: u64 = 4;
 pub(super) const QUERY_PROCESS_EXIT_STATUS: u64 = 5;
 pub(super) const QUERY_IS_SYSTEM_PROCESS: u64 = 6;
 pub(super) const QUERY_IS_THREAD_TERMINATING: u64 = 7;
+pub(super) const QUERY_PROCESS_SESSION_ID: u64 = 8;
 const STATUS_UNSUPPORTED_OBJECT: i32 = STATUS_NOT_SUPPORTED;
 
 #[derive(Clone, Copy)]
@@ -255,6 +256,15 @@ pub(crate) fn service(
                     .ok_or(nt_process::STATUS_INVALID_HANDLE)
             }) {
                 Ok(terminating) => (STATUS_SUCCESS, terminating),
+                Err(status) => (status as i32, 0),
+            },
+            QUERY_PROCESS_SESSION_ID => match crate::service_sec_image::with_provider_process_manager(|pm| {
+                pm.validate_native_handle_caller(caller)?;
+                pm.kernel_process_state(value)
+                    .map(|state| u64::from(state.session_id))
+                    .ok_or(nt_process::STATUS_INVALID_HANDLE)
+            }) {
+                Ok(session_id) => (STATUS_SUCCESS, session_id),
                 Err(status) => (status as i32, 0),
             },
             _ => (STATUS_INVALID_PARAMETER, 0),

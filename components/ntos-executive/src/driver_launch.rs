@@ -35678,6 +35678,10 @@ fn register_fsd_trampolines() -> bool {
         hosted_driver_process_state::ps_get_process_exit_status as *const () as usize as u64,
     );
     reg.bind(
+        "PsGetProcessSessionId",
+        hosted_driver_process_state::ps_get_process_session_id as *const () as usize as u64,
+    );
+    reg.bind(
         "PsIsSystemProcess",
         hosted_driver_process_state::ps_is_system_process as *const () as usize as u64,
     );

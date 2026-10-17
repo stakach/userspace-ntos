@@ -26,6 +26,20 @@ fn distinct_processes_cannot_publish_the_same_body() {
 }
 
 #[test]
+fn process_session_query_requires_the_exact_published_eprocess() {
+    let (mut pm, [first, second], _) = objects();
+    pm.set_process_session_id(first, 1).unwrap();
+    pm.set_process_session_id(second, 2).unwrap();
+    assert!(pm.kernel_process_state(0x1000).is_none());
+    assert!(pm.publish_process_kernel_object(first, 0x1000));
+    assert!(pm.publish_process_kernel_object(second, 0x2000));
+    assert_eq!(pm.kernel_process_state(0x1000).unwrap().session_id, 1);
+    assert_eq!(pm.kernel_process_state(0x2000).unwrap().session_id, 2);
+    assert!(pm.kernel_process_state(first as u64).is_none());
+    assert!(pm.kernel_process_state(0x1001).is_none());
+}
+
+#[test]
 fn distinct_threads_cannot_publish_the_same_body() {
     let (mut pm, _, [first, second]) = objects();
     assert!(pm.publish_thread_kernel_object(first, 0x1000));

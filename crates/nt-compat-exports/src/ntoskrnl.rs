@@ -22,6 +22,7 @@ pub const NTOSKRNL: &[ExportDescriptor] = &[
     e("memmove", Implemented, "overlap-safe native byte copy returns the destination"),
     e("memset", Implemented, "native byte fill returns the destination"),
     e("PsGetCurrentThreadProcessId", Implemented, "reads the selected canonical ETHREAD Cid.UniqueProcess, independent of APC process attachment"),
+    e("PsGetProcessSessionId", Implemented, "reads the exact published EPROCESS session through the authenticated hosted-driver Ps broker"),
     // --- device / symlink / IRP (implemented by the runtime, M6–M7) ---
     e("IoCreateDevice", Implemented, ""),
     e("IoDeleteDevice", Implemented, ""),

@@ -54,6 +54,19 @@ pub(super) extern "win64" fn ps_get_process_exit_status(process: u64) -> i32 {
     ) as u32 as i32
 }
 
+/// `ULONG PsGetProcessSessionId(PEPROCESS)` reads the exact published process
+/// body's session, including an attached process in a numbered GUI session.
+pub(super) extern "win64" fn ps_get_process_session_id(process: u64) -> u32 {
+    let value = hosted_driver_process_identity::query_state(
+        hosted_driver_process_identity::QUERY_PROCESS_SESSION_ID,
+        process,
+    );
+    match u32::try_from(value) {
+        Ok(session_id) => session_id,
+        Err(_) => unsafe { crate::provider_bugcheck::report(0xc4, [0x7C4, 8, process, value]) },
+    }
+}
+
 /// `BOOLEAN PsIsSystemProcess(PEPROCESS)` compares the canonical designated
 /// initial System process, regardless of PID, image name, or token subject.
 pub(super) extern "win64" fn ps_is_system_process(process: u64) -> u8 {
