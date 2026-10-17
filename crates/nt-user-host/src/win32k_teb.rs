@@ -35,6 +35,9 @@ pub fn purpose_for_win32k_syscall(ssn: u64, arg1: u64) -> DispatchTebPurpose {
         // CreateEmptyCurObject (0x21) calls GetW32ThreadInfo, whose debug hook verifies that
         // NtCurrentTeb()->Win32ClientInfo is the THREADINFO's published pClientInfo.
         0x1002 if matches!(arg1, 0x21 | 0x22) => DispatchTebPurpose::ThreadInfo,
+        // SetCursorIconData enters GetW32ThreadInfo, which checks the current TEB's inline
+        // Win32ClientInfo against THREADINFO.pClientInfo after captured user input is staged.
+        0x10a8 => DispatchTebPurpose::ThreadInfo,
         0x1288 => DispatchTebPurpose::ThreadInfo,
         0x1ffd | 0x122f | 0x122d => DispatchTebPurpose::UserObjectName,
         _ => DispatchTebPurpose::Compatibility,

@@ -42,6 +42,7 @@ pub mod luid;
 mod mutant;
 pub mod np_prefix;
 pub mod provider_pool;
+pub mod provider_kernel_alias;
 pub mod process_attach;
 pub mod push_lock;
 pub mod provider_bugcheck;

@@ -31256,7 +31256,25 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     gs_base: Some(win32k_subsystem::WIN32K_KPCR_VA),
                     caps: HostCaps::default(),
                 };
-                let sc = spawn_component_suspended(&d);
+                let mut sc = spawn_component_suspended(&d);
+                // Cursor capture buffers are provider-owned kernel-class pointers. Map a small
+                // separately accounted pool above MmUserProbeAddress, but below the reserved
+                // final canonical page; the ordinary shared provider pool remains unchanged.
+                if !win32k_glue::ensure_w32_client_paging(
+                    win32k_subsystem::WIN32K_CURSOR_ALIAS_VADDR,
+                    sc.pml4,
+                ) {
+                    panic!("win32k cursor alias paging setup failed");
+                }
+                let cursor_alias_frames = alloc_frame_run(win32k_subsystem::WIN32K_CURSOR_ALIAS_FRAMES);
+                for index in 0..win32k_subsystem::WIN32K_CURSOR_ALIAS_FRAMES {
+                    let frame = cursor_alias_frames + index;
+                    let address = win32k_subsystem::WIN32K_CURSOR_ALIAS_VADDR + index * 0x1000;
+                    if page_map_r(frame, address, RW_NX, sc.pml4) != 0 {
+                        panic!("win32k cursor alias frame mapping failed");
+                    }
+                    spawn_hosts::component_map_cap_bank_store(&mut sc.map_cap_bank, frame);
+                }
                 if !win32k_glue::ensure_w32_client_paging(
                     win32k_subsystem::WIN32K_KUSER_SHARED_DATA_VA,
                     sc.pml4,

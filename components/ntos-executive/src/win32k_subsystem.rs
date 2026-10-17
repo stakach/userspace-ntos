@@ -142,6 +142,12 @@ const WIN32K_IMAGE_BYTES: u64 = WIN32K_IMAGE_FRAMES * 0x1000;
 /// head at +8, data at +0x1000. Its own 0x0A00_0000 window spans four 2 MiB page tables.
 pub const WIN32K_POOL_VADDR: u64 = 0x0000_0100_0A00_0000;
 pub const WIN32K_POOL_FRAMES: u64 = 2048; // 8 MiB, pre-mapped
+/// Dedicated provider-owned cursor capture pool. Its payload lies above the imported
+/// MmUserProbeAddress without changing the user probe contract for client buffers.
+pub const WIN32K_CURSOR_ALIAS_VADDR: u64 = 0x0000_7fff_ffff_1000;
+pub const WIN32K_CURSOR_ALIAS_FRAMES: u64 = 14;
+const WIN32K_CURSOR_ALIAS_BYTES: u64 = WIN32K_CURSOR_ALIAS_FRAMES * 0x1000;
+const WIN32K_CURSOR_POOL_TAG: u32 = u32::from_be_bytes(*b"ucsU");
 /// The win32k COMPONENT's own stack (32 frames = 128 KiB, own 2 MiB PT). Deliberately NOT at the
 /// hosted-process `STACK_BASE` (0x100_105C_0000): win32k must be able to dereference a GUI client's
 /// stack-built pointers (e.g. winlogon's NtUserCreateWindowStation OBJECT_ATTRIBUTES) at their
@@ -1624,6 +1630,78 @@ const _: () = assert!(LPC_SERVICE_MESSAGE as usize + LPC_SERVICE_MESSAGE_CAP <= 
 pub type ProviderPoolCensus = shared_pool::PoolCensus;
 
 struct ProviderPoolMemory;
+
+struct CursorAliasMemory;
+
+impl shared_pool::PoolMemory for CursorAliasMemory {
+    fn len(&self) -> u64 { WIN32K_CURSOR_ALIAS_BYTES }
+
+    fn read_u64(&self, offset: u64) -> Option<u64> {
+        if offset.checked_add(8)? > self.len() || offset & 7 != 0 { return None; }
+        Some(unsafe { read_volatile((WIN32K_CURSOR_ALIAS_VADDR + offset) as *const u64) })
+    }
+
+    fn write_u64(&mut self, offset: u64, value: u64) -> bool {
+        if offset.checked_add(8).is_none_or(|end| end > self.len()) || offset & 7 != 0 { return false; }
+        unsafe { write_volatile((WIN32K_CURSOR_ALIAS_VADDR + offset) as *mut u64, value) };
+        true
+    }
+
+    fn zero(&mut self, offset: u64, len: u64) -> bool {
+        if offset.checked_add(len).is_none_or(|end| end > self.len()) { return false; }
+        unsafe { core::ptr::write_bytes((WIN32K_CURSOR_ALIAS_VADDR + offset) as *mut u8, 0, len as usize) };
+        true
+    }
+}
+
+fn cursor_alias_window() -> nt_kernel_exec::provider_kernel_alias::KernelAliasWindow {
+    nt_kernel_exec::provider_kernel_alias::KernelAliasWindow::new(
+        WIN32K_CURSOR_ALIAS_VADDR,
+        WIN32K_CURSOR_ALIAS_BYTES,
+        nt_compat_exports::memory::MM_USER_PROBE_ADDRESS,
+    ).expect("cursor alias VA must be kernel-classified and canonical")
+}
+
+pub(crate) fn is_reserved_cursor_alias_page(page: u64) -> bool {
+    cursor_alias_window().contains_page(page)
+}
+
+struct CursorAliasLockGuard;
+
+impl Drop for CursorAliasLockGuard {
+    fn drop(&mut self) {
+        unsafe { (&*((WIN32K_CURSOR_ALIAS_VADDR + shared_pool::LOCK_OFFSET) as *const AtomicU64))
+            .store(0, Ordering::Release) }
+    }
+}
+
+unsafe fn cursor_alias_lock() -> Option<CursorAliasLockGuard> {
+    let magic = &*((WIN32K_CURSOR_ALIAS_VADDR + shared_pool::MAGIC_OFFSET) as *const AtomicU64);
+    if magic.load(Ordering::Acquire) != shared_pool::MAGIC { return None; }
+    let lock = &*((WIN32K_CURSOR_ALIAS_VADDR + shared_pool::LOCK_OFFSET) as *const AtomicU64);
+    while lock.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        crate::yield_now();
+    }
+    Some(CursorAliasLockGuard)
+}
+
+unsafe fn cursor_alias_alloc(size: u64) -> u64 {
+    let Some(_guard) = cursor_alias_lock() else { return 0; };
+    cursor_alias_window().allocate(&mut CursorAliasMemory, size).map_or(0, |allocation| allocation.address)
+}
+
+unsafe fn cursor_alias_free(address: u64) -> bool {
+    let Some(_guard) = cursor_alias_lock() else { return false; };
+    cursor_alias_window().free(&mut CursorAliasMemory, address).is_ok()
+}
+
+unsafe fn initialize_cursor_alias_pool() -> bool {
+    let magic = &*((WIN32K_CURSOR_ALIAS_VADDR + shared_pool::MAGIC_OFFSET) as *const AtomicU64);
+    if magic.load(Ordering::Relaxed) != 0 { return false; }
+    if cursor_alias_window().initialize(&mut CursorAliasMemory).is_err() { return false; }
+    magic.store(shared_pool::MAGIC, Ordering::Release);
+    true
+}
 
 impl shared_pool::PoolMemory for ProviderPoolMemory {
     fn len(&self) -> u64 {
@@ -10010,7 +10088,9 @@ extern "win64" fn s_mm_map_view_of_section(
 /// tagged allocations (unbounded) go to a separate arena so they can't starve the main pool.
 extern "win64" fn s_ex_alloc_pool_with_tag(_pool: u64, size: u64, tag: u64) -> u64 {
     unsafe {
-        if (tag as u32) as u64 == FTYP_TAG {
+        if tag as u32 == WIN32K_CURSOR_POOL_TAG {
+            cursor_alias_alloc(size)
+        } else if (tag as u32) as u64 == FTYP_TAG {
             reclaiming_pool_alloc(size)
         } else {
             provider_pool_alloc(size, false)
@@ -10116,6 +10196,11 @@ unsafe fn release_monitor_array_projection(p: u64) -> Option<bool> {
 
 extern "win64" fn s_ex_free_pool_with_tag(p: u64, _tag: u64) {
     unsafe {
+        if (WIN32K_CURSOR_ALIAS_VADDR..WIN32K_CURSOR_ALIAS_VADDR + WIN32K_CURSOR_ALIAS_BYTES).contains(&p) {
+            if cursor_alias_free(p) { return; }
+            print_str(b"[win32k-host] invalid cursor alias pool free\n");
+            park();
+        }
         let in_provider_pool = provider_pool_contains(p);
         if in_provider_pool && source_irp::is_source_irp(p) {
             print_str(b"[win32k-host] source IRP requires exact retirement, not ExFreePool\n");
@@ -16453,6 +16538,10 @@ pub unsafe extern "C" fn win32k_subsystem_entry(heap_frames: u64) -> ! {
     }
     if !provider_pool_ready() {
         print_str(b"[win32k-host] ERROR: provider pool metadata is not initialized\n");
+        park();
+    }
+    if !initialize_cursor_alias_pool() {
+        print_str(b"[win32k-host] ERROR: cursor alias pool initialization failed\n");
         park();
     }
     if registered_provider_wait_domain().is_none() {

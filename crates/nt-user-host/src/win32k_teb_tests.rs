@@ -41,3 +41,19 @@ fn switch_desktop_dispatch_uses_threadinfo_teb_without_changing_name_capture() {
     assert_eq!(purpose_for_win32k_syscall(0x1002, 0x23), DispatchTebPurpose::Compatibility,
         "unproven one-parameter routines retain their prior TEB selection");
 }
+
+#[test]
+fn cursor_icon_data_dispatch_preserves_threadinfo_client_info_identity() {
+    let candidates = DispatchTebCandidates {
+        callout_teb: 0x1000_0000,
+        client_teb: 0x2000_0000,
+        compatibility_teb: 0x3000_0000,
+        thread_client_info: 0x1000_0800,
+    };
+    let purpose = purpose_for_win32k_syscall(0x10a8, 0);
+    assert_eq!(purpose, DispatchTebPurpose::ThreadInfo,
+        "LiberNT cursoricon data accesses GetW32ThreadInfo and checks pti->pClientInfo");
+    assert_eq!(select_dispatch_teb(purpose, candidates), Ok(candidates.callout_teb));
+    let foreign = DispatchTebCandidates { thread_client_info: 0x2000_0800, ..candidates };
+    assert_eq!(select_dispatch_teb(purpose, foreign), Err(DispatchTebError::ClientInfoMismatch));
+}
