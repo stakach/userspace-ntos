@@ -88,6 +88,7 @@ pub mod redir_query_path;
 pub mod retained_query_path_forward;
 pub mod retained_write_forward;
 pub mod retained_read_forward;
+pub mod internal_device_control_forward;
 pub mod retained_query_information_forward;
 pub mod retained_flush_forward;
 pub mod retained_connect_forward;

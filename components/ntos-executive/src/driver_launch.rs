@@ -193,6 +193,8 @@ mod hosted_query_path_capture;
 mod hosted_write_capture;
 #[path = "hosted_read_capture.rs"]
 mod hosted_read_capture;
+#[path = "hosted_internal_control_capture.rs"]
+mod hosted_internal_control_capture;
 #[path = "hosted_flush_capture.rs"]
 mod hosted_flush_capture;
 #[path = "hosted_query_information_capture.rs"]
@@ -203,6 +205,8 @@ mod hosted_query_path_work;
 mod hosted_write_work;
 #[path = "hosted_read_work.rs"]
 mod hosted_read_work;
+#[path = "hosted_internal_control_work.rs"]
+mod hosted_internal_control_work;
 #[path = "hosted_source_completion_lane.rs"]
 pub(crate) mod hosted_source_completion_lane;
 #[path = "hosted_class_irp_lane.rs"]
@@ -1162,6 +1166,7 @@ pub const FSD_SERVICE_LOWER_PNP_FORWARD_LABEL: u64 = 0x7A6;
 pub const FSD_SERVICE_CONNECT_FORWARD_LABEL: u64 = 0x7A7;
 pub const FSD_SERVICE_HOOK_FORWARD_LABEL: u64 = 0x7A8;
 pub const FSD_SERVICE_LOWER_FILE_FORWARD_LABEL: u64 = 0x7A9;
+pub const FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL: u64 = 0x7AA;
 pub const FSD_SERVICE_REMOVE_DPC_LABEL: u64 = 0x7BA;
 pub const FSD_SERVICE_ZW_UNLOAD_DRIVER_LABEL: u64 = 0x7BB;
 pub const FSD_SERVICE_UUID_CREATE_LABEL: u64 = 0x7BC;
@@ -1205,6 +1210,7 @@ const _: () = {
         FSD_SERVICE_CONNECT_FORWARD_LABEL,
         FSD_SERVICE_HOOK_FORWARD_LABEL,
         FSD_SERVICE_LOWER_FILE_FORWARD_LABEL,
+        FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL,
         FSD_SERVICE_REMOVE_DPC_LABEL,
         FSD_SERVICE_ZW_UNLOAD_DRIVER_LABEL,
         FSD_SERVICE_UUID_CREATE_LABEL,
@@ -9314,6 +9320,62 @@ extern "win64" fn s_io_csq_remove_next_irp(csq: u64, peek_context: u64) -> u64 {
     }
 }
 
+/// Call the retained file-less internal-control owner after a missing local dispatch target.
+/// The executive validates that the Device is an exact foreign projection before entry.
+unsafe fn forward_hosted_internal_control(
+    device: u64,
+    irp: u64,
+    next: u64,
+    current_location_after_forward: u8,
+) -> i32 {
+    let (reply_label, status, accepted, _, _) = call_on4(
+        (FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL << 12) | 4,
+        1,
+        device,
+        irp,
+        0,
+    );
+    if reply_label != 0 || accepted > 1 {
+        crate::provider_bugcheck::report(
+            0xc4,
+            [FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL, 1, irp, reply_label],
+        );
+    }
+    if accepted == 0 {
+        return status as u32 as i32;
+    }
+    write_unaligned(
+        (irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
+        current_location_after_forward,
+    );
+    write_unaligned((irp + 0xb8) as *mut u64, next);
+    write_unaligned(
+        (next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64,
+        device,
+    );
+    let completion = complete_hosted_irp_with_owner(irp);
+    if completion.outcome == HostedIrpUnwindOutcome::MoreProcessingRequired {
+        crate::provider_bugcheck::report(
+            0xc4,
+            [FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL, 3, irp, status],
+        );
+    }
+    let (ack_label, ack_status, _, _, _) = call_on4(
+        (FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL << 12) | 4,
+        2,
+        irp,
+        0,
+        0,
+    );
+    if ack_label != 0 || ack_status as u32 as i32 != STATUS_SUCCESS {
+        crate::provider_bugcheck::report(
+            0xc4,
+            [FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL, 2, irp, ack_status],
+        );
+    }
+    status as u32 as i32
+}
+
 /// `NTSTATUS IofCallDriver(PDEVICE_OBJECT, PIRP)`.
 extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
     unsafe {
@@ -9345,6 +9407,24 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                     as *const u64,
             );
             if handler == 0 {
+                if major == major::IRP_MJ_INTERNAL_DEVICE_CONTROL as u64 {
+                    let control = read_unaligned(next as *const nt_kernel_abi::IoStackLocation)
+                        .device_io_control()
+                        .io_control_code;
+                    let keyboard_hook = nt_io_abi::ioctl::ctl_code(
+                        0x0b, 0x0ff0, nt_io_abi::ioctl::METHOD_NEITHER, 0,
+                    );
+                    let mouse_hook = nt_io_abi::ioctl::ctl_code(
+                        0x0f, 0x0ff0, nt_io_abi::ioctl::METHOD_NEITHER, 0,
+                    );
+                    if control != nt_io_manager::retained_connect_forward::ConnectControl::Keyboard.code()
+                        && control != nt_io_manager::retained_connect_forward::ConnectControl::Mouse.code()
+                        && control != keyboard_hook
+                        && control != mouse_hook
+                    {
+                        return forward_hosted_internal_control(device, irp, next, current_location_after_forward);
+                    }
+                }
                 if major == IRP_MJ_DEVICE_CONTROL
                     || major == major::IRP_MJ_WRITE as u64
                     || major == major::IRP_MJ_READ as u64
@@ -9554,6 +9634,8 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                 }
                 return status as u32 as i32;
             }
+
+            return forward_hosted_internal_control(device, irp, next, current_location_after_forward);
         }
         if matches!(major as u8,
             major::IRP_MJ_CREATE | major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE)
@@ -61213,6 +61295,27 @@ pub(crate) unsafe fn service_hosted_query_path_forward(
     }
 }
 
+pub(crate) unsafe fn service_hosted_internal_control_forward(
+    ch: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    operation: u64,
+    address: u64,
+    irp: u64,
+) -> Option<(i32, bool)> {
+    match operation {
+        1 => hosted_internal_control_work::submit(ch, irp, address, badge, reply_cap)
+            .map(|status| (status, false)),
+        2 if irp == 0 => hosted_internal_control_work::acknowledge(ch, reply_cap, badge, address)
+            .map(|status| (status, false)),
+        _ => Some((STATUS_INVALID_PARAMETER, false)),
+    }
+}
+
+pub(crate) unsafe fn redrive_hosted_internal_control_forward(handler: *mut ExecNtHandler) {
+    hosted_internal_control_work::redrive(handler);
+}
+
 pub(crate) unsafe fn redrive_hosted_query_path_forward(handler: *mut ExecNtHandler) {
     hosted_query_path_work::redrive(handler);
     hosted_create_subject_registration::redrive_terminal();
@@ -61501,6 +61604,14 @@ pub(crate) unsafe fn redrive_nested_hosted_write(handler: *mut ExecNtHandler) ->
 
 pub(crate) unsafe fn nested_hosted_query_path_ready() -> bool {
     hosted_query_path_work::nested_work_ready()
+}
+
+pub(crate) unsafe fn nested_hosted_internal_control_ready() -> bool {
+    hosted_internal_control_work::nested_work_ready()
+}
+
+pub(crate) unsafe fn redrive_nested_hosted_internal_control(handler: *mut ExecNtHandler) -> bool {
+    hosted_internal_control_work::redrive_nested_ready(handler)
 }
 
 pub(crate) unsafe fn redrive_nested_hosted_query_path(handler: *mut ExecNtHandler) -> bool {
