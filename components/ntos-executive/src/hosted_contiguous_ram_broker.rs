@@ -1,7 +1,8 @@
 //! Executive-owned contiguous RAM for isolated kernel drivers.
 //!
-//! The component's 8 MiB pool is unrelated to physical DMA RAM. This broker carves a 64 MiB
-//! child Untyped and maps a verified 4 KiB frame run into a separate component VA aperture.
+//! The component's 8 MiB pool is unrelated to physical DMA RAM. This broker carves the smallest
+//! power-of-two child Untyped and maps a verified 4 KiB frame run into a separate component VA
+//! aperture.
 //! Every cap, map and domain generation remains owned until a confirmed free or retirement.
 
 use super::*;
@@ -10,10 +11,9 @@ use nt_hosted_runtime::{ContiguousRamLayout, ContiguousRamOwner, ContiguousRamPr
     ContiguousRamLeaseSource};
 
 const PAGE: u64 = 4096;
-const CHILD_BITS: u32 = 26;
-const CHILD_BYTES: u64 = 1 << CHILD_BITS;
+const MAX_CHILD_BYTES: u64 = 64 << 20;
 const APERTURE_BASE: u64 = 0x0000_0103_0000_0000;
-const APERTURE_STRIDE: u64 = CHILD_BYTES;
+const APERTURE_STRIDE: u64 = MAX_CHILD_BYTES;
 const APERTURE_SLOTS: u64 = 8;
 const STATUS_INVALID_PARAMETER: i32 = 0xc000_000du32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xc000_0022u32 as i32;
@@ -67,9 +67,10 @@ fn owner(instance: usize, inst: DriverInstance) -> Option<ContiguousRamOwner> {
 
 fn next_aperture(owner: ContiguousRamOwner, ledger: &[Allocation], length: u64)
     -> Option<ContiguousRamLayout> {
+    let child_bytes = ContiguousRamLayout::minimum_child_bytes(length)?;
     for slot in 0..APERTURE_SLOTS {
         let base = APERTURE_BASE.checked_add(slot.checked_mul(APERTURE_STRIDE)?)?;
-        let plan = ContiguousRamLayout::for_request(length, base, CHILD_BYTES)?;
+        let plan = ContiguousRamLayout::for_request(length, base, child_bytes)?;
         if !ledger.iter().any(|row| !row.available && row.owner == owner && row.address == base) {
             return Some(plan);
         }
@@ -129,7 +130,8 @@ unsafe fn allocate(owner: ContiguousRamOwner, inst: DriverInstance,
     let ledger = &mut *core::ptr::addr_of_mut!(ALLOCATIONS);
     let plan = next_aperture(owner, ledger, request.length)?;
     if request.low > request.high { return None; }
-    let lease = (&mut *core::ptr::addr_of_mut!(LEASES)).reserve(owner).ok()?;
+    let lease = (&mut *core::ptr::addr_of_mut!(LEASES))
+        .reserve(owner, plan.child_bytes() / PAGE).ok()?;
     if lease.slot >= ledger.len() && ledger.try_reserve(1).is_err() {
         let _ = (&mut *core::ptr::addr_of_mut!(LEASES)).confirm_clean(owner, lease.slot);
         return None;
@@ -168,20 +170,21 @@ unsafe fn allocate_into(row: &mut Allocation, inst: DriverInstance, plan: Contig
     let owner = row.owner;
     print_str(b"[contiguous-broker] reserved aperture=0x");
     print_hex64(plan.base()); print_str(b" frames="); print_u64(plan.frames());
+    print_str(b" child_bytes="); print_u64(plan.child_bytes());
     print_str(b"\n");
     match source {
         ContiguousRamLeaseSource::Fresh => {
             let child = try_alloc_slot()?;
             row.child = child;
-            let caps = try_alloc_slot_run(CHILD_BYTES / PAGE)?;
+            let caps = try_alloc_slot_run(plan.child_bytes() / PAGE)?;
             row.cap_base = caps;
-            row.capacity_frames = CHILD_BYTES / PAGE;
+            row.capacity_frames = plan.child_bytes() / PAGE;
             if (&mut *core::ptr::addr_of_mut!(LEASES)).attach_frame_slots(owner, row.slot,
                 caps, row.capacity_frames).is_err() {
                 panic!("contiguous RAM slot run lost its pre-effect owner");
             }
             if crate::untyped_retype_from_r(CAP_INIT_UNTYPED, OBJ_UNTYPED,
-                CHILD_BITS, 1, child) != 0 {
+                plan.child_bytes().trailing_zeros(), 1, child) != 0 {
                 print_str(b"[contiguous-broker] child retype failed\n");
                 return None;
             }
@@ -195,14 +198,15 @@ unsafe fn allocate_into(row: &mut Allocation, inst: DriverInstance, plan: Contig
         }
         ContiguousRamLeaseSource::SlotsOnly { cap_base, capacity_frames } => {
             if row.child_ready || row.child != 0 || row.cap_base != cap_base
-                || row.capacity_frames != capacity_frames || row.frames > capacity_frames {
+                || row.capacity_frames != capacity_frames
+                || capacity_frames != plan.child_bytes() / PAGE {
                 row.quarantined = true;
                 return None;
             }
             let child = try_alloc_slot()?;
             row.child = child;
             if crate::untyped_retype_from_r(CAP_INIT_UNTYPED, OBJ_UNTYPED,
-                CHILD_BITS, 1, child) != 0 {
+                plan.child_bytes().trailing_zeros(), 1, child) != 0 {
                 print_str(b"[contiguous-broker] child retype failed with retained slots\n");
                 return None;
             }
@@ -216,7 +220,8 @@ unsafe fn allocate_into(row: &mut Allocation, inst: DriverInstance, plan: Contig
         }
         ContiguousRamLeaseSource::Reuse { child, cap_base, capacity_frames } => {
             if !row.child_ready || row.child != child || row.cap_base != cap_base
-                || row.capacity_frames != capacity_frames || row.frames > capacity_frames {
+                || row.capacity_frames != capacity_frames
+                || capacity_frames != plan.child_bytes() / PAGE {
                 row.quarantined = true;
                 return None;
             }

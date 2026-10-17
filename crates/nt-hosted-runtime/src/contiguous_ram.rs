@@ -6,28 +6,37 @@
 
 const PAGE: u64 = 4096;
 const RETYPE_FAN_OUT: u64 = 256;
-const MIN_CHILD_BYTES: u64 = 64 << 20;
+const MAX_CHILD_BYTES: u64 = 64 << 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContiguousRamLayout {
     base: u64,
     frames: u64,
+    child_bytes: u64,
 }
 
 impl ContiguousRamLayout {
+    /// Smallest independently owned Untyped capable of holding the rounded frame run.
+    pub fn minimum_child_bytes(bytes: u64) -> Option<u64> {
+        let rounded = bytes.checked_add(PAGE - 1)? & !(PAGE - 1);
+        if rounded == 0 || rounded > MAX_CHILD_BYTES { return None; }
+        Some(rounded.checked_next_power_of_two()?.max(PAGE))
+    }
+
     /// `child_bytes` is an independently retained child Untyped, not component pool capacity.
     pub fn for_request(bytes: u64, base: u64, child_bytes: u64) -> Option<Self> {
-        if bytes == 0 || base & (PAGE - 1) != 0 || child_bytes < MIN_CHILD_BYTES
-            || !child_bytes.is_power_of_two()
+        if base & (PAGE - 1) != 0 || child_bytes < PAGE || child_bytes > MAX_CHILD_BYTES
+            || !child_bytes.is_power_of_two() || child_bytes < Self::minimum_child_bytes(bytes)?
         { return None; }
         let frames = bytes.checked_add(PAGE - 1)? / PAGE;
         let rounded = frames.checked_mul(PAGE)?;
         if rounded > child_bytes || base.checked_add(rounded).is_none() { return None; }
-        Some(Self { base, frames })
+        Some(Self { base, frames, child_bytes })
     }
 
     pub const fn base(self) -> u64 { self.base }
     pub const fn frames(self) -> u64 { self.frames }
+    pub const fn child_bytes(self) -> u64 { self.child_bytes }
     pub fn end(self) -> u64 { self.base + self.frames * PAGE }
     pub fn batch_count(self) -> u64 { self.frames.div_ceil(RETYPE_FAN_OUT) }
     pub fn batch(self, index: u64) -> Option<(u64, u32)> {
@@ -149,8 +158,9 @@ impl ContiguousRamPrepareTable {
 }
 
 /// Resource identity supplied by the executive after a fresh reservation, or retained from a
-/// confirmed clean prior allocation. The 64 MiB child and its empty CSpace slots are reusable;
-/// mapped pages or an uncertain native effect are never handed to another generation.
+/// confirmed clean prior allocation. A child and its empty CSpace slots are reusable only at
+/// their exact frame capacity. Mapped pages or an uncertain native effect are never handed to
+/// another generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContiguousRamLeaseSource {
     Fresh,
@@ -167,7 +177,8 @@ pub struct ContiguousRamLease {
 #[derive(Clone, Copy)]
 enum LeaseState {
     Empty,
-    Active { owner: ContiguousRamOwner, source: ContiguousRamLeaseSource },
+    Active { owner: ContiguousRamOwner, source: ContiguousRamLeaseSource,
+        requested_frames: u64 },
     Available { child: u64, cap_base: u64, capacity_frames: u64 },
     Quarantined,
 }
@@ -184,15 +195,19 @@ impl Default for ContiguousRamLeaseBank {
 impl ContiguousRamLeaseBank {
     pub const fn new() -> Self { Self { slots: [LeaseState::Empty; 8] } }
 
-    pub fn reserve(&mut self, owner: ContiguousRamOwner) -> Result<ContiguousRamLease, ContiguousRamError> {
+    pub fn reserve(&mut self, owner: ContiguousRamOwner, capacity_frames: u64)
+        -> Result<ContiguousRamLease, ContiguousRamError> {
         if owner.generation == 0 || owner.domain == 0 { return Err(ContiguousRamError::WrongOwner); }
+        if capacity_frames == 0 || capacity_frames > MAX_CHILD_BYTES / PAGE
+            || !capacity_frames.is_power_of_two() { return Err(ContiguousRamError::Unproved); }
         // Consume reusable resources before carving another child from the boot Untyped.
-        let index = self.slots.iter().position(|state| matches!(state, LeaseState::Available { child, cap_base, .. }
-            if *child != 0 && *cap_base != 0))
+        let index = self.slots.iter().position(|state| matches!(state,
+            LeaseState::Available { child, cap_base, capacity_frames: available }
+                if *child != 0 && *cap_base != 0 && *available == capacity_frames))
             .or_else(|| self.slots.iter().position(|state| matches!(state,
-                LeaseState::Available { child: 0, cap_base, .. } if *cap_base != 0)))
-            .or_else(|| self.slots.iter().position(|state| matches!(state, LeaseState::Empty
-                | LeaseState::Available { .. })))
+                LeaseState::Available { child: 0, cap_base, capacity_frames: available }
+                    if *cap_base != 0 && *available == capacity_frames)))
+            .or_else(|| self.slots.iter().position(|state| matches!(state, LeaseState::Empty)))
             .ok_or(ContiguousRamError::NoCapacity)?;
         let source = match self.slots[index] {
             LeaseState::Available { child, cap_base, capacity_frames }
@@ -202,22 +217,25 @@ impl ContiguousRamLeaseBank {
                 ContiguousRamLeaseSource::SlotsOnly { cap_base, capacity_frames },
             _ => ContiguousRamLeaseSource::Fresh,
         };
-        self.slots[index] = LeaseState::Active { owner, source };
+        self.slots[index] = LeaseState::Active { owner, source,
+            requested_frames: capacity_frames };
         Ok(ContiguousRamLease { slot: index, source })
     }
 
     pub fn attach_resources(&mut self, owner: ContiguousRamOwner, slot: usize,
         child: u64, cap_base: u64, capacity_frames: u64) -> Result<(), ContiguousRamError> {
         if child == 0 || cap_base == 0 || capacity_frames == 0
-            || capacity_frames > MIN_CHILD_BYTES / PAGE {
+            || capacity_frames > MAX_CHILD_BYTES / PAGE || !capacity_frames.is_power_of_two() {
             return Err(ContiguousRamError::Unproved);
         }
         match self.slots.get(slot).copied() {
-            Some(LeaseState::Active { owner: exact, source }) if exact == owner
+            Some(LeaseState::Active { owner: exact, source, requested_frames }) if exact == owner
+                && requested_frames == capacity_frames
                 && (source == ContiguousRamLeaseSource::Fresh || source
                     == ContiguousRamLeaseSource::SlotsOnly { cap_base, capacity_frames }) => {
                 self.slots[slot] = LeaseState::Active { owner,
-                    source: ContiguousRamLeaseSource::Reuse { child, cap_base, capacity_frames } };
+                    source: ContiguousRamLeaseSource::Reuse { child, cap_base, capacity_frames },
+                    requested_frames };
                 Ok(())
             }
             _ => Err(ContiguousRamError::WrongOwner),
@@ -228,14 +246,17 @@ impl ContiguousRamLeaseBank {
     /// confirmed no-effect label. Future attempts reuse these exact empty slots.
     pub fn attach_frame_slots(&mut self, owner: ContiguousRamOwner, slot: usize,
         cap_base: u64, capacity_frames: u64) -> Result<(), ContiguousRamError> {
-        if cap_base == 0 || capacity_frames == 0 || capacity_frames > MIN_CHILD_BYTES / PAGE {
+        if cap_base == 0 || capacity_frames == 0 || capacity_frames > MAX_CHILD_BYTES / PAGE
+            || !capacity_frames.is_power_of_two() {
             return Err(ContiguousRamError::Unproved);
         }
         match self.slots.get(slot).copied() {
-            Some(LeaseState::Active { owner: exact, source: ContiguousRamLeaseSource::Fresh })
-                if exact == owner => {
+            Some(LeaseState::Active { owner: exact,
+                source: ContiguousRamLeaseSource::Fresh, requested_frames })
+                if exact == owner && requested_frames == capacity_frames => {
                 self.slots[slot] = LeaseState::Active { owner,
-                    source: ContiguousRamLeaseSource::SlotsOnly { cap_base, capacity_frames } };
+                    source: ContiguousRamLeaseSource::SlotsOnly { cap_base, capacity_frames },
+                    requested_frames };
                 Ok(())
             }
             _ => Err(ContiguousRamError::WrongOwner),
@@ -245,7 +266,7 @@ impl ContiguousRamLeaseBank {
     pub fn confirm_clean(&mut self, owner: ContiguousRamOwner, slot: usize)
         -> Result<(), ContiguousRamError> {
         match self.slots.get(slot).copied() {
-            Some(LeaseState::Active { owner: exact, source }) if exact == owner => {
+            Some(LeaseState::Active { owner: exact, source, .. }) if exact == owner => {
                 self.slots[slot] = match source {
                     ContiguousRamLeaseSource::Reuse { child, cap_base, capacity_frames } =>
                         LeaseState::Available { child, cap_base, capacity_frames },
