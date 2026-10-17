@@ -822,6 +822,25 @@ impl PortCore {
         client_id: ClientId,
         security: ConnectionSecurity,
     ) -> Result<ConnectOutcome, NtStatus> {
+        self.connect_with_client_id_and_security_limit(name, client_api, subsystem_type,
+            conn_info, client_id, security, None)
+    }
+
+    /// Connect with captured client QoS and an optional client message ceiling.
+    /// The effective connection limit is the tighter of the two endpoint limits.
+    pub fn connect_with_client_id_and_security_limit(
+        &mut self,
+        name: &[u16],
+        client_api: PortApi,
+        subsystem_type: u32,
+        conn_info: &[u8],
+        client_id: ClientId,
+        security: ConnectionSecurity,
+        client_max_message: Option<u32>,
+    ) -> Result<ConnectOutcome, NtStatus> {
+        if client_max_message.is_some_and(|limit| limit == 0 || limit > u16::MAX as u32) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         let name = fold_name(name);
         let port_idx = self
             .ports
@@ -835,7 +854,10 @@ impl PortCore {
         }
         let server_api = self.ports[port_idx].api;
         let server_id = self.ports[port_idx].owner;
-        let limits = self.ports[port_idx].limits;
+        let mut limits = self.ports[port_idx].limits;
+        if let Some(client_limit) = client_max_message {
+            limits.max_message = limits.max_message.min(client_limit);
+        }
         let pool_account = self.ports[port_idx].pool_account;
         let port_object_id = self.ports[port_idx].object_id;
 

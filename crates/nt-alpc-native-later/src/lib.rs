@@ -57,6 +57,7 @@ pub struct CapturedSendWaitReceive {
 pub struct CapturedConnectPort {
     pub output: u64,
     pub name: Vec<u16>,
+    pub connect_flags: u32,
     pub port_attributes: Option<[u8; 72]>,
     pub message: Option<Vec<u8>>,
     /// Original writable message, its capacity, and the size field. The
@@ -164,6 +165,7 @@ impl CapturedConnectPort {
         let header = AlpcConnectPortCheckedRequest {
             connect: AlpcConnectPortRequest {
                 abi_size: u16::try_from(base).map_err(|_| STATUS_INVALID_PARAMETER)?,
+                connect_flags: self.connect_flags,
                 name_offset: u32_len(base)?,
                 name_len_bytes: u32_len(name.len())?,
                 message_offset: if message.is_empty() { 0 } else { u32_len(message_offset)? },
@@ -306,7 +308,8 @@ pub fn capture_connect_port(
     if object_attributes != 0 || server_sid != 0 || receive_attrs != 0 {
         return Err(STATUS_NOT_SUPPORTED);
     }
-    if flags != 0 || name_pointer == 0 || (message_pointer == 0) != (message_size == 0)
+    if flags & !u64::from(nt_alpc_abi::connect_flag::SYNC_CONNECTION) != 0
+        || name_pointer == 0 || (message_pointer == 0) != (message_size == 0)
         || (message_pointer == 0 && send_attrs != 0)
     { return Err(STATUS_INVALID_PARAMETER); }
     let mut unicode = [0u8; 16];
@@ -336,7 +339,8 @@ pub fn capture_connect_port(
         (Some(copied), Some((message_pointer, capacity, message_size)))
     };
     let send_attributes = if send_attrs == 0 { None } else { Some(copy_attributes(send_attrs, &mut read)?) };
-    Ok(CapturedConnectPort { output, name, port_attributes, message, message_target, send_attributes,
+    Ok(CapturedConnectPort { output, name, connect_flags: flags as u32,
+        port_attributes, message, message_target, send_attributes,
         timeout: copy_timeout(timeout, &mut read)? })
 }
 

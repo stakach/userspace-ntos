@@ -249,7 +249,6 @@ pub(crate) unsafe fn begin_connect(handler: &mut ExecNtHandler,
         |address, out| (*handler_ptr).xas_read(address, out),
         |address, len| (*handler_ptr).probe_user_output(address, len))?;
     if captured.timeout.is_some() || captured.send_attributes.is_some()
-        || captured.port_attributes.is_some()
     { return Err(STATUS_NOT_SUPPORTED); }
     let authorized_listen = if let Some(port) = handler.native_alpc_secured_ports.find(&captured.name) {
         let process = u32::try_from(caller.process).map_err(|_| STATUS_INVALID_HANDLE)?;

@@ -166,6 +166,11 @@ pub mod port_flag {
     pub const ALLOW_DUP_OBJECT: u32 = 0x8_0000;
 }
 
+/// `NtAlpcConnectPort` flags supported by the owned native adapter.
+pub mod connect_flag {
+    pub const SYNC_CONNECTION: u32 = 0x0002_0000;
+}
+
 /// `PORT_MESSAGE.Type` values (shared with LPC).
 pub mod msg_type {
     pub const REQUEST: u16 = 1;

@@ -267,6 +267,57 @@ fn checked_connect_copies_only_native_port_message_payload_and_never_reconnects_
 }
 
 #[test]
+fn libernt_sync_connect_preserves_qos_through_pending_accept_and_exact_replay() {
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let server = nt_port_core::ClientId { process: 7, thread: 11 };
+    let client = nt_port_core::ClientId { process: 8, thread: 12 };
+    let name = utf16("\\SmApiPort");
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, server, (3, 85)), &mut []);
+    assert_eq!(created.status, SUCCESS);
+    let mut wire = enc_checked_connect(&name, client, (3, 86),
+        &port_message(msg_type::CONNECTION_REQUEST, b"SB!!"));
+    let mut header: nt_alpc_abi::AlpcConnectPortCheckedRequest =
+        bytemuck::pod_read_unaligned(&wire[..size_of::<nt_alpc_abi::AlpcConnectPortCheckedRequest>()]);
+    header.connect.connect_flags = 0x0002_0000;
+    header.has_port_attributes = 1;
+    header.port_attributes = nt_alpc_abi::AlpcPortAttributes {
+        max_message_length: 512,
+        security_qos: nt_alpc_abi::SecurityQualityOfService {
+            length: 12, impersonation_level: 1, context_tracking_mode: 1,
+            effective_only: 1, ..Default::default()
+        },
+        ..Default::default()
+    };
+    wire[..size_of::<nt_alpc_abi::AlpcConnectPortCheckedRequest>()]
+        .copy_from_slice(bytemuck::bytes_of(&header));
+    let pending = alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &wire, &mut []);
+    assert_eq!(pending.status, nt_status::NtStatus::PENDING.0);
+    assert_eq!(core.connection_security(pending.detail1), Some(nt_port_core::ConnectionSecurity {
+        impersonation_level: 1, dynamic_tracking: true, effective_only: true,
+    }));
+    assert_eq!(core.connection_limits(pending.detail1).unwrap().max_message, 512);
+    let mut altered = wire.clone();
+    let mut altered_header = header;
+    altered_header.port_attributes.security_qos.impersonation_level = 2;
+    altered[..size_of::<nt_alpc_abi::AlpcConnectPortCheckedRequest>()]
+        .copy_from_slice(bytemuck::bytes_of(&altered_header));
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &altered, &mut []).status,
+        nt_status::NtStatus::INVALID_PARAMETER.0);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &wire, &mut []), pending);
+    let mut received = [0u8; 128];
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &enc_checked_receive(created.detail0, server, (3, 87)), &mut received).status, SUCCESS);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_ACCEPT_CONNECT,
+        &enc_checked_accept(created.detail0, pending.detail1, server, (3, 88)),
+        &mut []).status, SUCCESS);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &wire, &mut []).status,
+        SUCCESS);
+}
+
+#[test]
 fn checked_accept_requires_a_matching_owned_receive_receipt_even_after_ack() {
     let mut core = PortCore::new();
     core.set_accept_policy(AcceptPolicy::Manual);

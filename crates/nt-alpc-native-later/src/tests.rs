@@ -147,6 +147,48 @@ fn connect_capture_retains_response_addresses_for_exact_copyout() {
 }
 
 #[test]
+fn libernt_sm_connect_captures_sync_flag_message_and_qos_before_effect() {
+    let mut image = [0u8; 512];
+    image[64..66].copy_from_slice(&20u16.to_le_bytes());
+    image[66..68].copy_from_slice(&22u16.to_le_bytes());
+    image[72..80].copy_from_slice(&128u64.to_le_bytes());
+    for (index, unit) in "\\SmApiPort".encode_utf16().enumerate() {
+        image[128 + 2 * index..130 + 2 * index].copy_from_slice(&unit.to_le_bytes());
+    }
+    let attributes = AlpcPortAttributes {
+        max_message_length: 512,
+        security_qos: nt_alpc_abi::SecurityQualityOfService {
+            length: 12, impersonation_level: 1, context_tracking_mode: 1,
+            effective_only: 1, ..Default::default()
+        },
+        ..Default::default()
+    };
+    image[160..232].copy_from_slice(bytemuck::bytes_of(&attributes));
+    image[240..242].copy_from_slice(&4u16.to_le_bytes());
+    image[242..244].copy_from_slice(&44u16.to_le_bytes());
+    image[280..284].copy_from_slice(b"SB!!");
+    image[400..408].copy_from_slice(&128u64.to_le_bytes());
+    let captured = capture_connect_port(
+        [16, 64, 0, 160, 0x0002_0000, 0, 240, 400, 0, 0, 0],
+        |address, out| read_image(&image, address, out), |_, _| true,
+    ).expect("LiberNT SmConnectToSm sync connection is a supported owned input");
+    let mut expected_attributes = [0u8; 72];
+    expected_attributes.copy_from_slice(bytemuck::bytes_of(&attributes));
+    assert_eq!(captured.port_attributes, Some(expected_attributes));
+    assert_eq!(captured.message.as_deref(), Some(&image[240..284]));
+    let wire = captured.checked_wire(caller(), (7, 11)).unwrap();
+    let header: nt_alpc_abi::AlpcConnectPortCheckedRequest =
+        bytemuck::pod_read_unaligned(&wire[..core::mem::size_of::<nt_alpc_abi::AlpcConnectPortCheckedRequest>()]);
+    assert_eq!(header.connect.connect_flags, 0x0002_0000);
+    assert_eq!(header.has_port_attributes, 1);
+    assert_eq!(header.port_attributes, attributes);
+    assert_eq!(capture_connect_port(
+        [16, 64, 0, 160, 0x0004_0000, 0, 240, 400, 0, 0, 0],
+        |address, out| read_image(&image, address, out), |_, _| true,
+    ), Err(STATUS_INVALID_PARAMETER));
+}
+
+#[test]
 fn uncertain_submission_retains_exact_reply_request_and_physical_caller() {
     let mut pending = RetainedLater::new(caller(), (7,9), 31, vec![1,2,3]).unwrap();
     pending.begin(41).unwrap();
@@ -229,6 +271,7 @@ fn checked_connect_and_accept_wires_bind_owner_and_connection() {
     use nt_alpc_abi::{AlpcAcceptConnectCheckedRequest, AlpcConnectPortCheckedRequest};
     let connect = CapturedConnectPort {
         output: 16, name: "\\SmApiPort".encode_utf16().collect(),
+        connect_flags: 0,
         port_attributes: None, message: None, message_target: None,
         send_attributes: None, timeout: None,
     };

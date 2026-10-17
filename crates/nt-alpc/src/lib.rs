@@ -51,7 +51,7 @@ use core::mem::size_of;
 
 use bytemuck::Pod;
 use nt_alpc_abi::{
-    msg_attr_flag, opcode, port_flag, send_flag, AlpcAcceptConnectCheckedRequest,
+    connect_flag, msg_attr_flag, opcode, port_flag, send_flag, AlpcAcceptConnectCheckedRequest,
     AlpcAcceptConnectRequest, AlpcAcknowledgeSendReceiveRequest,
     AlpcCheckedInvocation, AlpcConnectPortAuthorizedRequest,
     AlpcConnectPortCheckedRequest, AlpcConnectPortRequest,
@@ -64,7 +64,7 @@ use nt_alpc_abi::{
     AlpcSendReceiveCheckedRequest, AlpcTokenAttr, AlpcViewIoRequest, PortMessage,
 };
 use nt_port_core::{
-    ClientId, ConnectOutcome, DataView, MessageAttrs, PortApi, PortCore, PortHandleEndpoint,
+    ClientId, ConnectOutcome, ConnectionSecurity, DataView, MessageAttrs, PortApi, PortCore, PortHandleEndpoint,
     PortAdmission, PortLimits, QueuedMessage, ReceiveOutcome, MAX_CONNINFO,
 };
 use nt_status::NtStatus;
@@ -81,6 +81,34 @@ fn port_admission(flags: u32) -> Result<PortAdmission, NtStatus> {
         allow_lpc_requests: flags & (port_flag::LPC_MODE | port_flag::ALLOW_LPC_REQUESTS) != 0,
         allow_impersonation: flags & port_flag::ALLOW_IMPERSONATION != 0,
     })
+}
+
+fn connect_port_options(attributes: AlpcPortAttributes, has_attributes: u32)
+    -> Result<(ConnectionSecurity, Option<u32>), NtStatus>
+{
+    if has_attributes > 1 || (has_attributes == 0 && attributes != AlpcPortAttributes::default()) {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+    if has_attributes == 0 { return Ok((ConnectionSecurity::default(), None)); }
+    if attributes.flags != 0 || attributes.max_message_length > u16::MAX as u64
+        || attributes.memory_bandwidth != 0 || attributes.max_pool_usage != 0
+        || attributes.max_section_size != 0 || attributes.max_view_size != 0
+        || attributes.max_total_section_size != 0 || attributes.dup_object_types != 0
+        || attributes.reserved != 0
+    { return Err(NtStatus::INVALID_PARAMETER); }
+    let qos = attributes.security_qos;
+    if (qos.length != 0 && qos.length != size_of::<nt_alpc_abi::SecurityQualityOfService>() as u32)
+        || (qos.length == 0 && (qos.impersonation_level != 0
+            || qos.context_tracking_mode != 0 || qos.effective_only != 0))
+        || qos.impersonation_level > 3 || qos.context_tracking_mode > 1
+        || qos.effective_only > 1 || qos._pad != 0
+    { return Err(NtStatus::INVALID_PARAMETER); }
+    Ok((ConnectionSecurity {
+        impersonation_level: qos.impersonation_level,
+        dynamic_tracking: qos.context_tracking_mode != 0,
+        effective_only: qos.effective_only != 0,
+    }, (attributes.max_message_length != 0)
+        .then_some(attributes.max_message_length as u32)))
 }
 
 /// Upper bound on a port section's backing store, so a malformed/hostile
@@ -745,10 +773,11 @@ impl AlpcServer {
         } else { None };
         let (owner, generation, token) = checked_identity(checked.invocation)?;
         if req._reserved != 0 || checked._reserved != 0
-            || checked.has_port_attributes != 0 || checked.port_attributes != AlpcPortAttributes::default()
             || req.valid_attributes != 0 || req.attr_len_bytes != 0
-            || req.connect_flags != 0
+            || req.connect_flags & !connect_flag::SYNC_CONNECTION != 0
         { return Err(NtStatus::INVALID_PARAMETER); }
+        let (connection_security, client_max_message) =
+            connect_port_options(checked.port_attributes, checked.has_port_attributes)?;
         if let Some(saved) = self.connect_results.iter().find(|saved| saved.token == token) {
             if saved.owner != owner || saved.owner_generation != generation {
                 return Err(NtStatus::OBJECT_NAME_COLLISION);
@@ -797,8 +826,8 @@ impl AlpcServer {
         let mut request = Vec::new();
         request.try_reserve_exact(buf.len()).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
         request.extend_from_slice(buf);
-        let result = match core.connect_with_client_id(&name, PortApi::Alpc,
-            req.subsystem_type, payload, owner)? {
+        let result = match core.connect_with_client_id_and_security_limit(&name, PortApi::Alpc,
+            req.subsystem_type, payload, owner, connection_security, client_max_message)? {
             ConnectOutcome::Completed { client_handle, connection_id } =>
                 reply(NtStatus::SUCCESS, 0, client_handle, connection_id),
             ConnectOutcome::Pending { connection_id } =>
