@@ -648,7 +648,7 @@ impl ExecNtHandler {
         Ok(Some(CapturedLpcRemoteView { pointer, native }))
     }
 
-    pub(super) fn stage_lpc_connection_views(
+    pub(crate) fn stage_lpc_connection_views(
         &mut self,
         connection_id: u64,
         connector_pi: usize,

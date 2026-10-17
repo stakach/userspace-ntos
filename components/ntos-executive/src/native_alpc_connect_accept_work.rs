@@ -36,6 +36,10 @@ enum Kind {
 enum Flight {
     Ready,
     Submitted(u64),
+    KernelAcceptReady,
+    KernelAcceptSubmitted(u64),
+    ReverseConnectReady,
+    ReverseConnectSubmitted(u64),
     TerminalReady,
     CloseReady,
     CloseSubmitted(u64),
@@ -57,6 +61,12 @@ struct OwnedLater {
     flight: Flight,
     reply_status: i32,
     submitted_once: bool,
+    kernel_listen: Option<u64>,
+    kernel_connection_id: Option<u64>,
+    kernel_client_handle: Option<u64>,
+    kernel_cached: bool,
+    reverse_request: Option<Vec<u8>>,
+    reverse_failure: Option<i32>,
 }
 
 impl OwnedLater {
@@ -121,9 +131,21 @@ impl OwnedLater {
             return;
         }
         let handle = result.detail0;
+        if self.kernel_client_handle.is_some_and(|expected| expected != handle) {
+            self.flight = Flight::InvalidTerminal;
+            return;
+        }
         let needs_port = !matches!(&self.kind, Kind::Accept(CapturedAcceptConnect { accept: false, .. }));
         if needs_port && handle == 0 {
             self.flight = Flight::InvalidTerminal;
+            return;
+        }
+        if let Some(status) = self.reverse_failure {
+            self.reply_status = status;
+            self.flight = if self.abort_publication(handler) {
+                self.close = Some(self.close_request(handle));
+                Flight::CloseReady
+            } else { Flight::InvalidTerminal };
             return;
         }
         if let Some(publication) = self.publication.as_mut() {
@@ -134,6 +156,21 @@ impl OwnedLater {
                 } else { Flight::InvalidTerminal };
                 return;
             }
+        }
+        if let (Some(connection_id), Kind::Connect(captured)) =
+            (self.kernel_connection_id, &self.kind)
+        {
+            if !handler.cache_lpc_connection_for_pi(connection_id, handle, self.pi,
+                &captured.name)
+            {
+                self.reply_status = STATUS_INVALID_HANDLE as i32;
+                self.flight = if self.abort_publication(handler) {
+                    self.close = Some(self.close_request(handle));
+                    Flight::CloseReady
+                } else { Flight::InvalidTerminal };
+                return;
+            }
+            self.kernel_cached = true;
         }
         let copied = match &self.kind {
             Kind::Connect(captured) => {
@@ -168,6 +205,10 @@ impl OwnedLater {
             || self.publication.as_mut().is_some_and(|publication|
                 publication.publish(&mut handler.pm).is_err())
         {
+            if self.kernel_cached {
+                handler.discard_lpc_connection_for_pi(handle, self.pi);
+                self.kernel_cached = false;
+            }
             self.reply_status = STATUS_ACCESS_VIOLATION as i32;
             self.flight = if self.abort_publication(handler) {
                 if self.close.is_some() { Flight::CloseReady } else { Flight::AckReady }
@@ -194,7 +235,7 @@ unsafe fn caller(handler: &ExecNtHandler) -> Result<NativeCaller, u32> {
 }
 
 unsafe fn begin_owned(handler: &mut ExecNtHandler, caller: NativeCaller,
-    kind: Kind, authorized_listen: Option<u64>) -> Result<(), u32> {
+    kind: Kind, authorized_listen: Option<u64>, kernel_listen: Option<u64>) -> Result<(), u32> {
     let pi = handler.pi;
     let owners = &mut *core::ptr::addr_of_mut!(OWNERS);
     if owners.len() >= MAX_OWNERS || owners.iter().any(|owner| owner.caller().badge == caller.badge) {
@@ -211,6 +252,23 @@ unsafe fn begin_owned(handler: &mut ExecNtHandler, caller: NativeCaller,
         },
         Kind::Accept(captured) => captured.checked_wire(caller, token)?,
     };
+    let reverse_request = if kernel_listen.is_some() {
+        let name: Vec<u16> = "\\SeLsaCommandPort".encode_utf16().collect();
+        let header_len = core::mem::size_of::<nt_lpc_abi::LpcKernelConnectNamedRequest>();
+        let reverse = nt_lpc_abi::LpcKernelConnectNamedRequest {
+            abi_size: header_len as u16,
+            name_offset: header_len as u32,
+            name_len_bytes: (name.len() * 2) as u32,
+            server_process: caller.process,
+            ..Default::default()
+        };
+        let mut wire = Vec::new();
+        wire.try_reserve_exact(header_len + name.len() * 2)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        wire.extend_from_slice(bytemuck::bytes_of(&reverse));
+        for unit in name { wire.extend_from_slice(&unit.to_le_bytes()); }
+        Some(wire)
+    } else { None };
     if request.len() > REP_DATA_LEN { return Err(STATUS_NOT_SUPPORTED); }
     let mut output = Vec::new();
     output.try_reserve_exact(REP_DATA_LEN).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
@@ -235,7 +293,9 @@ unsafe fn begin_owned(handler: &mut ExecNtHandler, caller: NativeCaller,
         }, ..Default::default()
     };
     owners.push(OwnedLater { pi, kind, retained, publication, output, ack, close: None,
-        flight: Flight::Ready, reply_status: 0, submitted_once: false });
+        flight: Flight::Ready, reply_status: 0, submitted_once: false,
+        kernel_listen, kernel_connection_id: None, kernel_client_handle: None,
+        kernel_cached: false, reverse_request, reverse_failure: None });
     park.commit();
     Ok(())
 }
@@ -284,7 +344,11 @@ pub(crate) unsafe fn begin_connect(handler: &mut ExecNtHandler,
         if !decision.granted() { return Err(decision.status); }
         Some(listen)
     } else { None };
-    begin_owned(handler, caller, Kind::Connect(captured), authorized_listen)
+    let registered = SRM_COMMAND_PORT_OBJECT_HANDLE.load(Ordering::Relaxed);
+    let kernel_listen = (registered != 0
+        && handler.lpc_port_handle_for_name16(&captured.name) == Some(registered))
+        .then_some(registered);
+    begin_owned(handler, caller, Kind::Connect(captured), authorized_listen, kernel_listen)
 }
 
 pub(crate) unsafe fn begin_accept(handler: &mut ExecNtHandler,
@@ -304,7 +368,7 @@ pub(crate) unsafe fn begin_accept(handler: &mut ExecNtHandler,
         captured.listen_port, caller.generation)?;
     if u64::from(listen.owner_process) != caller.process { return Err(STATUS_INVALID_HANDLE); }
     captured.listen_port = listen.service_handle;
-    begin_owned(handler, caller, Kind::Accept(captured), None)
+    begin_owned(handler, caller, Kind::Accept(captured), None, None)
 }
 
 enum Step {
@@ -312,6 +376,12 @@ enum Step {
     NoEffect(u64, i32),
     Exact(u64, i32, u64, u64, u64),
     Uncertain(u64),
+    KernelAcceptNoEffect(i32),
+    KernelAcceptExact(i32, u64, u64),
+    KernelAcceptUncertain(u64),
+    ReverseConnectNoEffect(i32),
+    ReverseConnectExact(i32, u64, u64),
+    ReverseConnectUncertain(u64),
     CloseNoEffect,
     CloseExact(i32),
     CloseUncertain(u64),
@@ -323,7 +393,9 @@ enum Step {
 fn selected(owners: &[OwnedLater], active: Option<u64>, cursor: usize) -> Option<usize> {
     if let Some(id) = active {
         return owners.iter().position(|owner| matches!(owner.flight,
-            Flight::Submitted(request) | Flight::CloseSubmitted(request)
+            Flight::Submitted(request) | Flight::KernelAcceptSubmitted(request)
+                | Flight::ReverseConnectSubmitted(request)
+                | Flight::CloseSubmitted(request)
                 | Flight::AckSubmitted(request) if request == id));
     }
     if let Some((index, _)) = owners.iter().enumerate()
@@ -370,7 +442,9 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
         let Some(client) = lpc_client() else { owners.push(owner); return };
         let channel = &mut client.backend_mut().0;
         if channel.completion_inbox.active_request().is_some()
-            && matches!(owner.flight, Flight::Ready | Flight::CloseReady | Flight::AckReady)
+            && matches!(owner.flight, Flight::Ready | Flight::KernelAcceptReady
+                | Flight::ReverseConnectReady
+                | Flight::CloseReady | Flight::AckReady)
         { owners.push(owner); return; }
         match owner.flight {
             Flight::Ready => {
@@ -393,6 +467,59 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
             }
             Flight::Submitted(id) => match channel.poll_owned(id, &mut owner.output) {
                 Some((status, _, info, d0, d1)) => Step::Exact(id, status, info, d0, d1),
+                None => Step::Idle,
+            },
+            Flight::KernelAcceptReady => {
+                let Some(listen_port) = owner.kernel_listen else {
+                    owner.flight = Flight::InvalidTerminal; owners.push(owner); return;
+                };
+                let Some(connection_id) = owner.kernel_connection_id else {
+                    owner.flight = Flight::InvalidTerminal; owners.push(owner); return;
+                };
+                let caller = owner.caller();
+                let request = nt_lpc_abi::LpcKernelAcceptConnectRequest {
+                    abi_size: core::mem::size_of::<nt_lpc_abi::LpcKernelAcceptConnectRequest>() as u16,
+                    listen_port, connection_id, client_process: caller.process,
+                    client_thread: caller.thread, ..Default::default()
+                };
+                let id = channel.next_id;
+                match channel.raw_owned(nt_lpc_abi::opcode::LPC_OP_KERNEL_ACCEPT_CONNECT,
+                    bytemuck::bytes_of(&request), &mut []) {
+                    RingCallOutcome::NoEffect(status) => Step::KernelAcceptNoEffect(status),
+                    RingCallOutcome::Completed(status, _, _, d0, d1) =>
+                        Step::KernelAcceptExact(status, d0, d1),
+                    RingCallOutcome::Indeterminate { request_id } => {
+                        assert_eq!(request_id, id); Step::KernelAcceptUncertain(id)
+                    }
+                }
+            }
+            Flight::KernelAcceptSubmitted(id) => match channel.poll_owned(id, &mut []) {
+                Some((status, _, _, d0, d1)) => Step::KernelAcceptExact(status, d0, d1),
+                None => Step::Idle,
+            },
+            Flight::ReverseConnectReady => {
+                if !owner.exact_caller_live(handler) {
+                    owner.reverse_failure = Some(STATUS_INVALID_HANDLE as i32);
+                    owner.flight = Flight::Ready;
+                    owners.push(owner);
+                    return;
+                }
+                let Some(request) = owner.reverse_request.as_deref() else {
+                    owner.flight = Flight::InvalidTerminal; owners.push(owner); return;
+                };
+                let id = channel.next_id;
+                match channel.raw_owned(nt_lpc_abi::opcode::LPC_OP_KERNEL_CONNECT_NAMED,
+                    request, &mut []) {
+                    RingCallOutcome::NoEffect(status) => Step::ReverseConnectNoEffect(status),
+                    RingCallOutcome::Completed(status, _, _, d0, d1) =>
+                        Step::ReverseConnectExact(status, d0, d1),
+                    RingCallOutcome::Indeterminate { request_id } => {
+                        assert_eq!(request_id, id); Step::ReverseConnectUncertain(id)
+                    }
+                }
+            }
+            Flight::ReverseConnectSubmitted(id) => match channel.poll_owned(id, &mut []) {
+                Some((status, _, _, d0, d1)) => Step::ReverseConnectExact(status, d0, d1),
                 None => Step::Idle,
             },
             Flight::CloseReady => {
@@ -442,7 +569,14 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
             let caller = owner.caller();
             if status == STATUS_PENDING && matches!(&owner.kind, Kind::Connect(_)) {
                 owner.flight = if owner.retained.continue_pending(id, caller).is_ok() {
-                    Flight::Ready
+                    if owner.kernel_listen.is_some() {
+                        if d1 == 0 || owner.kernel_connection_id.is_some_and(|seen| seen != d1) {
+                            Flight::InvalidTerminal
+                        } else {
+                            owner.kernel_connection_id = Some(d1);
+                            Flight::KernelAcceptReady
+                        }
+                    } else { Flight::Ready }
                 } else { Flight::InvalidTerminal };
             } else if let Ok(info) = u32::try_from(info) {
                 if info as usize > owner.output.len() { owner.flight = Flight::InvalidTerminal; }
@@ -456,6 +590,37 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
             } else { owner.flight = Flight::InvalidTerminal; }
         }
         Step::Uncertain(id) => owner.flight = Flight::Submitted(id),
+        Step::KernelAcceptNoEffect(_) => owner.flight = Flight::KernelAcceptReady,
+        Step::KernelAcceptExact(status, client_handle, server_handle) => {
+            owner.flight = if status == STATUS_PENDING {
+                Flight::KernelAcceptReady
+            } else if status == 0 && client_handle != 0 && server_handle != 0 {
+                owner.kernel_client_handle = Some(client_handle);
+                Flight::ReverseConnectReady
+            } else {
+                Flight::InvalidTerminal
+            };
+        }
+        Step::KernelAcceptUncertain(id) => owner.flight = Flight::KernelAcceptSubmitted(id),
+        Step::ReverseConnectNoEffect(status) => {
+            owner.reverse_failure = Some(status);
+            owner.flight = Flight::Ready;
+        }
+        Step::ReverseConnectExact(status, handle, connection_id) => {
+            owner.flight = if status == STATUS_PENDING && handle == 0 && connection_id != 0
+                && handler.stage_lpc_connection_views(connection_id, 0, 0,
+                    SyscallUserMemory::CurrentProcess, None, None).is_ok()
+            {
+                LSASS_SRM_CONNECTED.store(1, Ordering::Relaxed);
+                Flight::Ready
+            } else if status != 0 && status != STATUS_PENDING && handle == 0
+                && connection_id == 0
+            {
+                owner.reverse_failure = Some(status);
+                Flight::Ready
+            } else { Flight::InvalidTerminal };
+        }
+        Step::ReverseConnectUncertain(id) => owner.flight = Flight::ReverseConnectSubmitted(id),
         Step::CloseExact(status) => {
             owner.flight = if status == 0 { Flight::AckReady } else { Flight::InvalidTerminal };
         }

@@ -76,6 +76,9 @@ pub mod opcode {
     pub const LPC_OP_RELEASE_PORT_OBJECT_WITH_LIFETIME: u16 = 0x2218;
     pub const LPC_OP_CLOSE_PROCESS_PORTS: u16 = 0x2219;
     pub const LPC_OP_RETAINED_REQUEST_PORT_OUTCOME: u16 = 0x221a;
+    /// Executive-owned listener accepts one exact queued client as one broker effect.
+    pub const LPC_OP_KERNEL_ACCEPT_CONNECT: u16 = 0x221b;
+    pub const LPC_OP_KERNEL_CONNECT_NAMED: u16 = 0x221c;
 }
 
 /// True if `op` is an LPC opcode.
@@ -412,6 +415,32 @@ pub struct LpcCreatePortRequest {
     pub server_thread: u64,
 }
 
+/// Atomic kernel-listener receive, accept, and complete. The caller holds the
+/// original client connect Reply while the broker commits this exact effect.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LpcKernelAcceptConnectRequest {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub _reserved2: u32,
+    pub listen_port: u64,
+    pub connection_id: u64,
+    pub client_process: u64,
+    pub client_thread: u64,
+}
+
+/// Kernel-owned reverse connection, resolving the live listen object atomically.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LpcKernelConnectNamedRequest {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub name_offset: u32,
+    pub name_len_bytes: u32,
+    pub _reserved2: u32,
+    pub server_process: u64,
+}
+
 /// `LPC_OP_CONNECT_PORT` — connect to a named port; carries the connection-info blob.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -723,6 +752,7 @@ pub struct LpcReply {
 const _: () = {
     use core::mem::{align_of, size_of};
     assert!(size_of::<LpcCreatePortRequest>() == 40);
+    assert!(size_of::<LpcKernelAcceptConnectRequest>() == 40);
     assert!(size_of::<LpcConnectPortRequest>() == 48);
     assert!(size_of::<LpcConnectionRequestMetadata>() == 32);
     assert!(size_of::<LpcDataMessageMetadata>() == 40);

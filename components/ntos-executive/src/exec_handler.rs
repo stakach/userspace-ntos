@@ -28706,7 +28706,7 @@ impl ExecNtHandler {
         true
     }
 
-    fn discard_lpc_connection_for_pi(&mut self, client_handle: u64, connector_pi: usize) {
+    pub(crate) fn discard_lpc_connection_for_pi(&mut self, client_handle: u64, connector_pi: usize) {
         if let Some(index) = self.lpc_connections.iter().position(|connection| {
             connection.client_handle == client_handle
                 && connection.connector_pi as usize == connector_pi
