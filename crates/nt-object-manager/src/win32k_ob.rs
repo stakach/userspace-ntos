@@ -311,6 +311,8 @@ pub fn object_type_matches(kind: ObKind, expected_type_ptr: u64) -> bool {
 
 /// DESKTOP body field offsets (`references/reactos/win32ss/user/ntuser/desktop.h` `struct _DESKTOP`).
 pub mod desktop {
+    /// `DESKTOP.dwSessionId`; the parent `WINSTATION_OBJECT.dwSessionId` is also its first field.
+    pub const SESSION_ID: usize = 0;
     /// `PDESKTOPINFO pDeskInfo` — the desktop-info block hung off the DESKTOP body.
     pub const P_DESK_INFO: usize = 0x08;
     /// `LIST_ENTRY PtiList` — the desktop's thread-info list head (desktop.h). Offset from the
@@ -1198,6 +1200,29 @@ pub unsafe fn init_desktop_body(desktop_body: *mut u8, desktop_info: u64) {
     }
 }
 
+/// Bind a newly allocated desktop to its creator's session only when its exact parent station
+/// belongs to that same session. The native desktop parse callback makes this assignment before
+/// publishing the object; our hosted parse adapter must do likewise.
+///
+/// # Safety
+/// Both pointers must refer to live, readable bodies of the indicated types. `desktop_body`
+/// must be writable and must not yet be published.
+pub unsafe fn bind_desktop_session(
+    desktop_body: *mut u8,
+    parent_station_body: *const u8,
+    current_session_id: u32,
+) -> bool {
+    if desktop_body.is_null() || parent_station_body.is_null() {
+        return false;
+    }
+    let parent_session_id = core::ptr::read_unaligned(parent_station_body as *const u32);
+    if parent_session_id != current_session_id {
+        return false;
+    }
+    core::ptr::write_unaligned(desktop_body.add(desktop::SESSION_ID) as *mut u32, current_session_id);
+    true
+}
+
 /// Insert a THREADINFO into a DESKTOP's `PtiList`, matching `InsertTailList` in
 /// `IntSetThreadDesktop`. Returns `false` when the desktop list head was not initialized or the
 /// thread entry is already linked elsewhere.
@@ -1930,6 +1955,24 @@ mod tests {
             let p =
                 core::ptr::read_unaligned(body.as_ptr().add(desktop::P_DESK_INFO) as *const u64);
             assert_eq!(p, 0xDEC0_0000);
+        }
+    }
+
+    #[test]
+    fn desktop_session_uses_current_process_only_for_its_exact_parent_station() {
+        let mut desktop = [0u8; DESKTOP_BODY_SIZE as usize];
+        let mut station = [0u8; 0x100];
+        station[..4].copy_from_slice(&1u32.to_le_bytes());
+        unsafe {
+            assert!(!bind_desktop_session(
+                desktop.as_mut_ptr(), station.as_ptr(), 0,
+            ));
+            assert_eq!(u32::from_le_bytes(desktop[..4].try_into().unwrap()), 0,
+                "a foreign session must not publish or mutate the desktop");
+            assert!(bind_desktop_session(
+                desktop.as_mut_ptr(), station.as_ptr(), 1,
+            ));
+            assert_eq!(u32::from_le_bytes(desktop[..4].try_into().unwrap()), 1);
         }
     }
 

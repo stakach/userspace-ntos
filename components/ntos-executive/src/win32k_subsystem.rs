@@ -4457,7 +4457,7 @@ extern "win64" fn s_establish_win32_callouts(callout_data: u64) -> i32 {
 // semantics (handle minting, the registry, the create→insert latch, the single-instance
 // window-station cache) live in the crate.
 use nt_object_manager::win32k_ob::{
-    init_desktop_body, ObHandleTable, ObKind,
+    bind_desktop_session, init_desktop_body, ObHandleTable, ObKind,
     PendingObjectRelease, DESKTOP_BODY_SIZE,
 };
 
@@ -7617,6 +7617,14 @@ fn ob_open_object_by_name_existing(
                 let body = alloc_desktop_body();
                 if body == 0 {
                     return STATUS_INSUFFICIENT_RESOURCES_I32;
+                }
+                if !bind_desktop_session(
+                    body as *mut u8,
+                    winsta_body as *const u8,
+                    s_ps_get_current_process_session_id(),
+                ) {
+                    assert!(provider_pool_free(body), "foreign-session desktop body leaked");
+                    return 0xC000_0022u32 as i32; // STATUS_ACCESS_DENIED
                 }
                 write_volatile(
                     (body + DESKTOP_RPWINSTA_PARENT_OFF) as *mut u64,
@@ -17081,17 +17089,7 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         print_hex(pti as u32);
         print_str(b"\n");
     }
-    // The thread callout binds THREADINFO.pClientInfo to its TEB's inline
-    // Win32ClientInfo. The system-thread entry checks that exact pointer.
-    // User-object name capture still needs the routed caller's guest TEB;
-    // other early entry points retain their established compatibility view.
-    let teb_purpose = if ssn == SSN_NT_USER_CALL_ONE_PARAM && a1 == 0x22 {
-        nt_user_host::win32k_teb::DispatchTebPurpose::ThreadInfo
-    } else if ssn == SSN_GDI_BATCH_FLUSH_CALLOUT || ssn == 0x122f || ssn == 0x122d {
-        nt_user_host::win32k_teb::DispatchTebPurpose::UserObjectName
-    } else {
-        nt_user_host::win32k_teb::DispatchTebPurpose::Compatibility
-    };
+    let teb_purpose = nt_user_host::win32k_teb::purpose_for_win32k_syscall(ssn, a1);
     let callout_teb = thread_ctx_callout_teb(thread_index);
     let thread_client_info = read_volatile(
         (current_w32thread() + THREADINFO_PCLIENTINFO_OFF) as *const u64,
