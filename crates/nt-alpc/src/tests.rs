@@ -2122,6 +2122,69 @@ fn retained_kernel_lpc_request_wakes_pending_checked_alpc_listener() {
     assert_eq!(u32::from_le_bytes(body[24..28].try_into().unwrap()), message_id);
 }
 
+#[test]
+fn second_kernel_lpc_request_reaches_accepted_alpc_worker_after_first_reply() {
+    use nt_port_core::{ClientId, ConnectOutcome, MessageAttrs, MessageIdentity};
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let server = ClientId { process: 60, thread: 84 };
+    let requester = ClientId { process: 76, thread: 80 };
+    let name = utf16("\\Windows\\ApiPortSecond");
+    let listen = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_owned_create_port(&name, server, (9, 30), nt_alpc_abi::AlpcPortAttributes {
+            flags: port_flag::ALLOW_LPC_REQUESTS | port_flag::ALLOW_IMPERSONATION,
+            max_message_length: 512,
+            ..Default::default()
+        }), &mut []).detail0;
+    let ConnectOutcome::Pending { connection_id } = core.connect_with_client_id(
+        &name, PortApi::Alpc, 0, b"", requester).unwrap()
+    else { panic!("ALPC connection must wait for server acceptance"); };
+    core.receive(listen).unwrap();
+    let server_comm = core.accept(connection_id, true, 0).unwrap();
+    core.complete(connection_id).unwrap();
+    let kernel = core.retain_connection_port(listen).unwrap();
+
+    let first_identity = MessageIdentity { client: requester, message_id: 2 };
+    let mut first = port_message(msg_type::REQUEST, b"desktop-thread");
+    first[8..16].copy_from_slice(&requester.process.to_le_bytes());
+    first[16..24].copy_from_slice(&requester.thread.to_le_bytes());
+    first[24..28].copy_from_slice(&first_identity.message_id.to_le_bytes());
+    core.send_kernel_request_message(kernel, &first, MessageAttrs::default(), first_identity)
+        .unwrap();
+    let mut output = [0u8; 512];
+    let listen_receive = enc_checked_receive(listen, server, (9, 31));
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &listen_receive, &mut output).status, SUCCESS);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_ACK_SEND_RECEIVE,
+        &enc_ack_receive(server, (9, 31)), &mut []).status, SUCCESS);
+    let mut response = port_message(msg_type::REPLY, b"OK");
+    response[8..16].copy_from_slice(&requester.process.to_le_bytes());
+    response[16..24].copy_from_slice(&requester.thread.to_le_bytes());
+    response[24..28].copy_from_slice(&first_identity.message_id.to_le_bytes());
+    core.send_reply_message(server_comm, &response, MessageAttrs::default(), first_identity)
+        .unwrap();
+    assert!(core.receive_reply_message(kernel, first_identity).unwrap().is_some());
+
+    let comm_receive = enc_checked_receive(server_comm, server, (9, 32));
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &comm_receive, &mut output).status, nt_status::NtStatus::PENDING.0);
+    let second_identity = MessageIdentity { client: requester, message_id: 3 };
+    let mut second = port_message(msg_type::REQUEST, b"input-thread");
+    second[8..16].copy_from_slice(&requester.process.to_le_bytes());
+    second[16..24].copy_from_slice(&requester.thread.to_le_bytes());
+    second[24..28].copy_from_slice(&second_identity.message_id.to_le_bytes());
+    core.send_kernel_request_message(kernel, &second, MessageAttrs::default(), second_identity)
+        .unwrap();
+    let delivered = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &comm_receive, &mut output);
+    assert_eq!(delivered.status, SUCCESS,
+        "the accepted ALPC worker must receive a later retained kernel request");
+    assert_eq!(&output[..delivered.information as usize], &second);
+    assert_eq!(core.receive_message(listen).unwrap(), None,
+        "the same request cannot also be delivered on the connection port");
+}
+
 /// Direction 2: an ALPC client connects to a classic-LPC host, over one shared
 /// core, with a message each way.
 #[test]

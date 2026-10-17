@@ -358,6 +358,9 @@ struct Port {
 struct KernelPortEndpoint {
     handle: u64,
     port_object_id: u64,
+    /// Accepted ALPC connection that answered this endpoint's first delivered request.
+    /// The exact connection owns later receive routing; the endpoint still owns requests/replies.
+    accepted_alpc_connection: Option<u64>,
     server_inbox: Vec<StoredMessage>,
     client_inbox: Vec<StoredMessage>,
     delivered_requests: Vec<DeliveredRequest>,
@@ -1114,6 +1117,7 @@ impl PortCore {
         self.kernel_endpoints.push(KernelPortEndpoint {
             handle,
             port_object_id,
+            accepted_alpc_connection: None,
             server_inbox: Vec::new(),
             client_inbox: Vec::new(),
             delivered_requests: Vec::new(),
@@ -1435,6 +1439,17 @@ impl PortCore {
             .iter()
             .position(|endpoint| endpoint.handle == endpoint_handle)
         {
+            if let Some(connection_id) = self.kernel_endpoints[endpoint_index]
+                .accepted_alpc_connection
+            {
+                if !self.connections.iter().any(|connection| connection.id == connection_id
+                    && connection.state == ConnState::Connected && connection.server_open
+                    && connection.client_live()
+                    && connection.port_object_id == self.kernel_endpoints[endpoint_index].port_object_id)
+                {
+                    return Err(NtStatus::PORT_DISCONNECTED);
+                }
+            }
             let port = self
                 .ports
                 .iter()
@@ -1910,6 +1925,11 @@ impl PortCore {
                             .any(|request| request.identity == identity)
                 })
                 .ok_or(NtStatus::REPLY_MESSAGE_MISMATCH)?;
+            if self.kernel_endpoints[endpoint_index].accepted_alpc_connection
+                .is_some_and(|accepted| accepted != connection.id)
+            {
+                return Err(NtStatus::REPLY_MESSAGE_MISMATCH);
+            }
             if bytes.len() > related_port.limits.max_message as usize {
                 return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
             }
@@ -1922,6 +1942,8 @@ impl PortCore {
                 [delivered_index]
                 .pool_charge;
             let account = related_port.pool_account;
+            let accepted_alpc_connection =
+                (connection.server_api == PortApi::Alpc).then_some(connection.id);
             let stored = self.allocate_stored_message(
                 account,
                 old_charge,
@@ -1940,6 +1962,9 @@ impl PortCore {
             self.kernel_endpoints[endpoint_index]
                 .client_inbox
                 .push(stored);
+            if let Some(connection_id) = accepted_alpc_connection {
+                self.kernel_endpoints[endpoint_index].accepted_alpc_connection = Some(connection_id);
+            }
             return Ok(());
         }
 
@@ -2114,7 +2139,12 @@ impl PortCore {
             handle != 0 && connection.server_open && connection.server_handle == handle
                 && connection.server_api == PortApi::Alpc)
         {
-            return connection.server_inbox.first().map(|stored| stored.message.bytes.len());
+            return connection.server_inbox.first().map(|stored| stored.message.bytes.len())
+                .or_else(|| self.kernel_endpoints.iter()
+                    .find(|endpoint| endpoint.accepted_alpc_connection == Some(connection.id)
+                        && !endpoint.server_inbox.is_empty())
+                    .and_then(|endpoint| endpoint.server_inbox.first())
+                    .map(|stored| stored.message.bytes.len()));
         }
         let port = self.ports.iter().find(|port| port.user_open && port.handle == handle)
             .or_else(|| self.connection_port_index_for_server_handle(handle)
@@ -2122,6 +2152,7 @@ impl PortCore {
         port.datagrams.first().map(|stored| stored.message.bytes.len())
             .or_else(|| self.kernel_endpoints.iter()
                 .find(|endpoint| endpoint.port_object_id == port.object_id
+                    && endpoint.accepted_alpc_connection.is_none()
                     && !endpoint.server_inbox.is_empty())
                 .and_then(|endpoint| endpoint.server_inbox.first())
                 .map(|stored| stored.message.bytes.len()))
@@ -2162,6 +2193,13 @@ impl PortCore {
             if !self.connections[connection_index].server_inbox.is_empty() {
                 return Ok(self.dequeue_server_message(connection_index));
             }
+            let connection_id = self.connections[connection_index].id;
+            if let Some(endpoint_index) = self.kernel_endpoints.iter().position(|endpoint| {
+                endpoint.accepted_alpc_connection == Some(connection_id)
+                    && !endpoint.server_inbox.is_empty()
+            }) {
+                return Ok(self.dequeue_kernel_server_message(endpoint_index));
+            }
             let connection = &self.connections[connection_index];
             return if connection.state == ConnState::Connected && connection.client_live() {
                 Ok(None)
@@ -2187,7 +2225,9 @@ impl PortCore {
                 return Ok(Some(stored.message));
             }
             if let Some(endpoint_index) = self.kernel_endpoints.iter().position(|endpoint| {
-                endpoint.port_object_id == port_object_id && !endpoint.server_inbox.is_empty()
+                endpoint.port_object_id == port_object_id
+                    && endpoint.accepted_alpc_connection.is_none()
+                    && !endpoint.server_inbox.is_empty()
             }) {
                 return Ok(self.dequeue_kernel_server_message(endpoint_index));
             }
@@ -3359,6 +3399,79 @@ mod tests {
         core.close_port(server);
         core.close_port(listen);
         assert_eq!(core.port_count(), 0);
+    }
+
+    #[test]
+    fn retained_alpc_request_stays_with_the_accepted_connection_that_replied() {
+        let mut core = PortCore::new();
+        core.set_accept_policy(AcceptPolicy::Manual);
+        let name = utf16("\\Windows\\ApiPortAlpcOwners");
+        let listen = core.create_port(&name, PortApi::Alpc);
+        let first_client = ClientId { process: 76, thread: 80 };
+        let other_client = ClientId { process: 77, thread: 81 };
+        let mut servers = Vec::new();
+        for client in [first_client, other_client] {
+            let ConnectOutcome::Pending { connection_id } = core
+                .connect_with_client_id(&name, PortApi::Alpc, 0, &[], client)
+                .unwrap()
+            else { panic!("manual ALPC connection must pend") };
+            core.receive(listen).unwrap();
+            servers.push(core.accept(connection_id, true, 0).unwrap());
+            core.complete(connection_id).unwrap();
+        }
+        let kernel = core.retain_connection_port(listen).unwrap();
+        let first = MessageIdentity { client: first_client, message_id: 2 };
+        core.send_kernel_request_message(kernel, b"first", MessageAttrs::default(), first)
+            .unwrap();
+        assert_eq!(core.receive_message(listen).unwrap().unwrap().bytes, b"first");
+        assert_eq!(core.send_reply_message(servers[1], b"wrong", MessageAttrs::default(), first),
+            Err(NtStatus::REPLY_MESSAGE_MISMATCH));
+        core.send_reply_message(servers[0], b"first-reply", MessageAttrs::default(), first)
+            .unwrap();
+        assert_eq!(core.receive_reply_message(kernel, first).unwrap().unwrap().bytes,
+            b"first-reply");
+
+        let second = MessageIdentity { client: first_client, message_id: 3 };
+        core.send_kernel_request_message(kernel, b"second", MessageAttrs::default(), second)
+            .unwrap();
+        assert!(core.receive_message(servers[1]).unwrap().is_none());
+        assert!(core.receive_message(listen).unwrap().is_none());
+        assert_eq!(core.receive_message(servers[0]).unwrap().unwrap().bytes, b"second");
+        assert_eq!(core.send_reply_message(servers[1], b"wrong", MessageAttrs::default(), second),
+            Err(NtStatus::REPLY_MESSAGE_MISMATCH));
+        core.send_reply_message(servers[0], b"second-reply", MessageAttrs::default(), second)
+            .unwrap();
+        assert_eq!(core.receive_reply_message(kernel, second).unwrap().unwrap().bytes,
+            b"second-reply");
+    }
+
+    #[test]
+    fn closed_bound_alpc_connection_cannot_reassign_retained_kernel_requests() {
+        let mut core = PortCore::new();
+        core.set_accept_policy(AcceptPolicy::Manual);
+        let name = utf16("\\Windows\\ApiPortAlpcClosed");
+        let listen = core.create_port(&name, PortApi::Alpc);
+        let client = ClientId { process: 76, thread: 80 };
+        let ConnectOutcome::Pending { connection_id } = core
+            .connect_with_client_id(&name, PortApi::Alpc, 0, &[], client)
+            .unwrap()
+        else { panic!("manual ALPC connection must pend") };
+        core.receive(listen).unwrap();
+        let server = core.accept(connection_id, true, 0).unwrap();
+        core.complete(connection_id).unwrap();
+        let kernel = core.retain_connection_port(listen).unwrap();
+        let first = MessageIdentity { client, message_id: 2 };
+        core.send_kernel_request_message(kernel, b"first", MessageAttrs::default(), first)
+            .unwrap();
+        assert_eq!(core.receive_message(listen).unwrap().unwrap().bytes, b"first");
+        core.send_reply_message(server, b"reply", MessageAttrs::default(), first).unwrap();
+        assert!(core.receive_reply_message(kernel, first).unwrap().is_some());
+
+        core.close_port(server);
+        let later = MessageIdentity { client, message_id: 3 };
+        assert_eq!(core.send_kernel_request_message(kernel, b"later", MessageAttrs::default(), later),
+            Err(NtStatus::PORT_DISCONNECTED));
+        assert!(core.receive_message(listen).unwrap().is_none());
     }
 
     #[test]
