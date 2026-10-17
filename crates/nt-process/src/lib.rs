@@ -282,7 +282,7 @@ impl ThreadLifetime {
     }
 }
 
-/// Broker-owned reference to one exact LPC port object. This is deliberately distinct from a
+/// Broker-owned reference to one exact port object. This is deliberately distinct from a
 /// process-local user handle: it remains valid after that handle table entry is closed and must be
 /// returned to the broker during process teardown.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

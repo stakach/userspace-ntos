@@ -131,6 +131,24 @@ impl ProcessManager {
         Ok(identity.service_handle)
     }
 
+    /// Resolve a process-local native ALPC listen handle before a port-service
+    /// operation. Classic LPC broker handles have no Process Manager table entry
+    /// and remain raw for the broker to validate. An occupied entry of any
+    /// other type must never alias a raw broker handle with the same number.
+    pub fn resolve_native_user_port_service_handle(&self, caller: NativeHandleCaller,
+        value: u64, owner_generation: u64) -> Result<u64, u32> {
+        self.validate_native_handle_caller(caller)?;
+        if value == 0 { return Err(STATUS_INVALID_HANDLE); }
+        let occupied = u32::try_from(value).ok()
+            .and_then(|handle| self.lookup_handle(caller.effective_process(), handle));
+        match occupied {
+            Some(HandleObject::AlpcPort { .. }) =>
+                self.resolve_native_alpc_listen_service_handle(caller, value, owner_generation),
+            Some(_) => Err(STATUS_INVALID_HANDLE),
+            None => Ok(value),
+        }
+    }
+
     /// Hide the exact table entry until a checked service close is known.
     pub fn begin_native_alpc_port_close(&mut self, caller: NativeHandleCaller,
         value: u64, owner_generation: u64) -> Result<NativeAlpcPortClose, NativeCloseError> {
@@ -360,6 +378,24 @@ mod tests {
         let later_value = later.publish(&mut pm).unwrap();
         assert_eq!(pm.resolve_native_alpc_listen_service_handle(caller, later_value, 7),
             Err(STATUS_INVALID_HANDLE));
+    }
+
+    #[test]
+    fn exception_port_selection_translates_exact_native_alpc_or_unoccupied_lpc_value() {
+        let (mut pm, caller, pid) = fixture();
+        let mut created = pm.reserve_native_alpc_port_handle(caller, 7, (11, 13)).unwrap();
+        created.bind(&mut pm, 0x4c50_0001).unwrap();
+        let created_value = created.publish(&mut pm).unwrap();
+        assert_eq!(pm.resolve_native_user_port_service_handle(caller, created_value, 7),
+            Ok(0x4c50_0001));
+        assert_eq!(pm.resolve_native_user_port_service_handle(caller, created_value, 8),
+            Err(STATUS_INVALID_HANDLE));
+
+        let other = pm.insert_handle(pid, HandleObject::Opaque(0xABCD), 0).unwrap();
+        assert_eq!(pm.resolve_native_user_port_service_handle(caller, other as u64, 7),
+            Err(STATUS_INVALID_HANDLE), "typed table objects cannot alias an LPC broker handle");
+        assert_eq!(pm.resolve_native_user_port_service_handle(caller, 0x4c50_0002, 7),
+            Ok(0x4c50_0002), "an unoccupied value remains eligible for broker validation");
     }
 
     #[test]

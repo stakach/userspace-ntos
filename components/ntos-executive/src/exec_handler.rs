@@ -20059,6 +20059,7 @@ impl ExecNtHandler {
         &mut self,
         args: &[u64],
         memory: SyscallUserMemory,
+        previous_mode: nt_syscall::ProcessorMode,
     ) -> u32 {
         let information_class = nt_ulong_arg(args[1]);
         let information_length = nt_ulong_arg(args[3]) as usize;
@@ -20121,6 +20122,20 @@ impl ExecNtHandler {
                     return STATUS_PRIVILEGE_NOT_HELD;
                 }
                 let port_handle = u64::from_le_bytes(value);
+                let generation = match self.hosted_process_generation(self.pi) {
+                    Some(generation) => generation,
+                    None => return STATUS_INVALID_HANDLE,
+                };
+                let handle_caller = match self.native_handle_caller(previous_mode) {
+                    Ok(caller) => caller,
+                    Err(status) => return status,
+                };
+                let port_handle = match self.pm.resolve_native_user_port_service_handle(
+                    handle_caller, port_handle, generation,
+                ) {
+                    Ok(service_handle) => service_handle,
+                    Err(status) => return status,
+                };
                 let retained = match lpc_client() {
                     Some(client) => {
                         let metadata = match client.query_handle(port_handle) {
@@ -33672,26 +33687,18 @@ impl ExecNtHandler {
                     return STATUS_INVALID_HANDLE;
                 };
                 let owner_process = owner_pid as u64;
-                let table_object = u32::try_from(args[0]).ok()
-                    .and_then(|value| self.pm.lookup_handle(owner_pid, value));
-                let service_handle = if matches!(table_object,
-                    Some(nt_process::HandleObject::AlpcPort { .. })) {
-                    let Some(generation) = self.hosted_process_generation(self.pi) else {
-                        return STATUS_INVALID_HANDLE;
-                    };
-                    let caller = match self.native_handle_caller(ctx.previous_mode) {
-                        Ok(caller) => caller,
-                        Err(status) => return status,
-                    };
-                    match self.pm.resolve_native_alpc_listen_service_handle(
-                        caller, args[0], generation,
-                    ) {
-                        Ok(service_handle) => service_handle,
-                        Err(status) => return status,
-                    }
-                } else {
-                    if table_object.is_some() { return STATUS_INVALID_HANDLE; }
-                    args[0]
+                let Some(generation) = self.hosted_process_generation(self.pi) else {
+                    return STATUS_INVALID_HANDLE;
+                };
+                let caller = match self.native_handle_caller(ctx.previous_mode) {
+                    Ok(caller) => caller,
+                    Err(status) => return status,
+                };
+                let service_handle = match self.pm.resolve_native_user_port_service_handle(
+                    caller, args[0], generation,
+                ) {
+                    Ok(service_handle) => service_handle,
+                    Err(status) => return status,
                 };
                 let Some(lpc) = lpc_client() else {
                     return STATUS_UNSUCCESSFUL;
@@ -35893,6 +35900,7 @@ impl ExecNtHandler {
                 self.nt_set_information_process_with_user_memory(
                     args,
                     SyscallUserMemory::CurrentProcess,
+                    ctx.previous_mode,
                 )
             },
             NativeService::NtSetInformationThread => unsafe {
