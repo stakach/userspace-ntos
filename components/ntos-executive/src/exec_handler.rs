@@ -48,6 +48,8 @@ mod named_sections;
 
 #[path = "exec_named_directories.rs"]
 mod named_directories;
+#[path = "exec_named_events.rs"]
+mod named_events;
 
 #[path = "file_image_section.rs"]
 pub(crate) mod file_image_section;
@@ -3940,6 +3942,7 @@ impl ExecNtHandler {
         write_field!(native_image_views, Vec::new());
         write_field!(events, events);
         write_field!(event_objects, event_objects);
+        write_field!(named_event_security, Vec::new());
         write_field!(provider_timers, provider_timers);
         write_field!(user_timers, nt_user_timer::TimerTable::with_capacity(32));
         write_field!(user_timer_rearm_requested, false);
@@ -24157,6 +24160,11 @@ impl ExecNtHandler {
         &mut self,
         retired: nt_kernel_exec::RetiredEventObject,
     ) {
+        if let Ok(index) = usize::try_from(retired.native_identity) {
+            if let Some(entry) = self.obj_ns.get(index) {
+                self.named_event_security.retain(|(identity, _)| *identity != entry.identity);
+            }
+        }
         crate::provider_dispatcher_backend::finalize_retired_event(
             &mut self.obj_ns,
             &mut self.events,

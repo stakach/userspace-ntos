@@ -4130,6 +4130,37 @@ pub(crate) unsafe fn rearm_registered_active_delay_timer() {
     }
 }
 
+/// Resolve the active process handle table for a win32k Event handle operation.
+/// KeStackAttachProcess changes this table without changing the original IPC caller.
+fn resolve_win32k_event_handle_pi(
+    handler: &ExecNtHandler,
+    channel: &spawn_hosts::PumpChannel,
+    original_pi: usize,
+) -> Result<usize, u32> {
+    let invalid = nt_process::STATUS_INVALID_HANDLE;
+    let logical = channel.logical_caller.ok_or(invalid)?;
+    if !handler.validate_provider_logical_caller(logical)
+        || logical.pi() != original_pi
+        || logical.pi() as u64 != channel.client_pi
+        || logical.process().generation !=
+            nt_user_host::process_identity::ProcessGeneration::Hosted(channel.client_generation)
+    {
+        return Err(invalid);
+    }
+    let active = unsafe { crate::win32k_glue::current_query_process(logical, channel.pml4) }
+        .ok_or(invalid)?;
+    if handler.pm_pid_for_pi(active.pi) != Some(active.process.pid)
+        || handler.hosted_process_generation(active.pi)
+            != match active.process.generation {
+                nt_user_host::process_identity::ProcessGeneration::Hosted(generation) => Some(generation),
+                _ => None,
+            }
+    {
+        return Err(invalid);
+    }
+    Ok(active.pi)
+}
+
 /// Route kernel Event requests through their retained activation; hosted requests use the live handler.
 /// The nested component pump is serialized with native dispatch, so no second handler pointer or
 /// lock domain is introduced. GUI redrive remains deferred until the outer dispatch can resume.
@@ -4145,6 +4176,10 @@ pub(crate) unsafe fn service_win32k_event_request(
 ) -> (i32, u64, u64, u64) {
     const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
     const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
+    if op == crate::win32k_subsystem::W32_EVENT_OP_CREATE_NAMED {
+        return service_win32k_named_event_request(channel, reply_cap, badge, message_info,
+            arg1, arg2, arg3);
+    }
     if channel.kernel_caller.is_some() {
         return kernel_provider_activation::service_event(
             channel,
@@ -4247,8 +4282,9 @@ pub(crate) unsafe fn service_win32k_event_request(
             .provider_create_event(pi, arg1 as u32, arg2 as u32, arg3 != 0)
             .map(|handle| (0, handle, 0, 0))
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
-        crate::win32k_subsystem::W32_EVENT_OP_REFERENCE => handler
-            .provider_reference_event(pi, arg1, arg3 as u32, arg2)
+        crate::win32k_subsystem::W32_EVENT_OP_REFERENCE =>
+            resolve_win32k_event_handle_pi(handler, channel, pi)
+            .and_then(|active_pi| handler.provider_reference_event(active_pi, arg1, arg3 as u32, arg2))
             .map(|(body, id, metadata, granted_access)| {
                 (
                     0,
@@ -4258,8 +4294,9 @@ pub(crate) unsafe fn service_win32k_event_request(
                 )
             })
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
-        crate::win32k_subsystem::W32_EVENT_OP_CLOSE => handler
-            .provider_close_event(pi, arg1)
+        crate::win32k_subsystem::W32_EVENT_OP_CLOSE =>
+            resolve_win32k_event_handle_pi(handler, channel, pi)
+            .and_then(|active_pi| handler.provider_close_event(active_pi, arg1))
             .map(|()| (0, 0, 0, 0))
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
         crate::win32k_subsystem::W32_EVENT_OP_DEREFERENCE => handler
@@ -4424,6 +4461,55 @@ pub(crate) unsafe fn service_win32k_event_request(
         }
         _ => (STATUS_INVALID_PARAMETER, 0, 0, 0),
     }
+}
+
+/// Capture the inline named-Event frame under the exact physical provider job before any
+/// namespace or handle effect. The attached process is the target handle table.
+unsafe fn service_win32k_named_event_request(
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    mi: u64,
+    name_len: u64,
+    sd_len: u64,
+    reserved: u64,
+) -> (i32, u64, u64, u64) {
+    let invalid = nt_process::STATUS_INVALID_HANDLE;
+    if reserved != 0 || channel.kernel_caller.is_some() {
+        return (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0);
+    }
+    let (route, dispatch, caller) = match authenticate_win32k_service_request(
+        channel, reply_cap, badge, mi,
+        (crate::win32k_subsystem::W32_EVENT_LABEL << 12) | 4,
+    ) {
+        Ok(owner) => owner,
+        Err(status) => return (status as i32, 0, 0, 0),
+    };
+    let Some(logical) = channel.logical_caller else { return (invalid as i32, 0, 0, 0) };
+    let Some(target) = crate::win32k_glue::current_query_process(logical, channel.pml4)
+    else { return (invalid as i32, 0, 0, 0) };
+    let capture = match crate::win32k_subsystem::named_event::read_owned(
+        (route, dispatch, caller), name_len, sd_len,
+    ) {
+        Ok(capture) => capture,
+        Err(status) => return (status as i32, 0, 0, 0),
+    };
+    let handler = match registry_live_handler() {
+        Ok(handler) => handler,
+        Err(status) => return (status as i32, 0, 0, 0),
+    };
+    if handler.pm_pid_for_pi(target.pi) != Some(target.process.pid)
+        || handler.hosted_process_generation(target.pi)
+            != match target.process.generation {
+                nt_user_host::process_identity::ProcessGeneration::Hosted(generation) => Some(generation),
+                _ => None,
+            }
+    {
+        return (invalid as i32, 0, 0, 0);
+    }
+    handler.provider_create_named_event(target.pi, caller, &capture)
+        .map(|(status, handle)| (status as i32, handle, 0, 0))
+        .unwrap_or_else(|status| (status as i32, 0, 0, 0))
 }
 
 /// Authenticate at the entry adapter, then mutate one exact root-owned sync identity.

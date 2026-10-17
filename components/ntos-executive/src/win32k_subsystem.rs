@@ -1523,6 +1523,7 @@ pub const W32_KERNEL_ACTIVATION_LABEL: u64 = 0x78E;
 pub const W32_MM_SECURE_OP_SECURE: u64 = 1;
 pub const W32_MM_SECURE_OP_UNSECURE: u64 = 2;
 pub const W32_EVENT_OP_CREATE: u64 = 1;
+pub const W32_EVENT_OP_CREATE_NAMED: u64 = 40;
 pub const W32_EVENT_OP_REFERENCE: u64 = 2;
 pub const W32_EVENT_OP_CLOSE: u64 = 3;
 pub const W32_EVENT_OP_DEREFERENCE: u64 = 4;
@@ -4465,6 +4466,7 @@ static mut OBJ_TABLE: ObHandleTable = ObHandleTable::new();
 
 pub(crate) mod object_security;
 pub(crate) mod directory_object;
+pub(crate) mod named_event;
 mod file_close;
 mod file_open;
 mod section_create;
@@ -4836,7 +4838,8 @@ extern "win64" fn s_zw_create_event(
         return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
     }
     if object_attributes != 0 {
-        return 0xC000_00BBu32 as i32; // STATUS_NOT_SUPPORTED until named provider creates are brokered.
+        return named_event::create_named_event(handle_out, desired_access as u32,
+            object_attributes, event_type as u32, initial_state != 0);
     }
     unsafe {
         write_unaligned(handle_out, 0);

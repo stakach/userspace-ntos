@@ -23051,6 +23051,8 @@ struct ExecNtHandler {
     /// pointers, native/GUI waits, and queued provider signals hold independent leases here; the
     /// `EventStore` namespace index remains the canonical dispatcher identity.
     event_objects: nt_kernel_exec::EventObjectRegistry,
+    /// Explicit native descriptors retained with exact named Event body identities.
+    named_event_security: Vec<(u64, Vec<u8>)>,
     /// Canonical dispatcher state for provider-owned kernel Timers. Component addresses never
     /// enter this table; provider-local identities resolve to generation-fenced Timer IDs.
     provider_timers: Option<nt_provider_wait::ProviderTimerTable>,
