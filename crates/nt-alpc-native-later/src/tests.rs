@@ -67,6 +67,22 @@ fn smss_receive_context_attribute_is_bounded_and_retained_before_effect() {
 }
 
 #[test]
+fn owned_smss_receive_wire_preserves_context_attributes_after_target_transfer() {
+    let mut image = [0u8; 512];
+    image[32..40].copy_from_slice(&328u64.to_le_bytes());
+    image[400..404].copy_from_slice(&CONTEXT_ATTR.to_le_bytes());
+    let captured = capture_send_wait_receive([77, 0, 0, 0, 64, 32, 400, 0],
+        |p, b| read_image(&image, p, b), |_, _| true).unwrap();
+    let (wire, target) = captured.into_checked_wire_and_receive(caller(), (7, 12)).unwrap();
+    let header: nt_alpc_abi::AlpcSendReceiveCheckedRequest = bytemuck::pod_read_unaligned(
+        &wire[..core::mem::size_of::<nt_alpc_abi::AlpcSendReceiveCheckedRequest>()]);
+    assert_eq!(target.capacity, 328);
+    assert_eq!(target.attributes, Some((400, CONTEXT_ATTR)));
+    assert_eq!(header.send_receive.flags, nt_alpc_abi::send_flag::RECV_ATTRIBUTES);
+    assert_eq!(header.send_receive.valid_attributes, CONTEXT_ATTR);
+}
+
+#[test]
 fn smss_reply_and_receive_captures_the_reply_with_context_output() {
     let mut image = [0u8; 512];
     image[32..40].copy_from_slice(&128u64.to_le_bytes());

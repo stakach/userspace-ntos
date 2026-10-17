@@ -104,6 +104,17 @@ fn checked_bytes<T: bytemuck::Pod>(header: &T, blobs: &[&[u8]]) -> Result<Vec<u8
 fn u32_len(len: usize) -> Result<u32, u32> { u32::try_from(len).map_err(|_| STATUS_INVALID_PARAMETER) }
 
 impl CapturedSendWaitReceive {
+    /// Build the checked request while receive metadata is still owned, then
+    /// transfer the native output target. The wire's attribute flag and mask
+    /// must describe the same target that will receive the service output.
+    pub fn into_checked_wire_and_receive(self, caller: NativeCaller, token: (u64, u64))
+        -> Result<(Vec<u8>, ReceiveTarget), u32>
+    {
+        let wire = self.checked_wire(caller, token)?;
+        let target = self.receive.ok_or(STATUS_INVALID_PARAMETER)?;
+        Ok((wire, target))
+    }
+
     /// Copy-ready service request. Submission still requires retained Reply and
     /// service-side token reservation before its first possible effect.
     pub fn checked_wire(&self, caller: NativeCaller, token: (u64, u64)) -> Result<Vec<u8>, u32> {

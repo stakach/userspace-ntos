@@ -355,6 +355,53 @@ fn checked_accept_requires_a_matching_owned_receive_receipt_even_after_ack() {
 }
 
 #[test]
+fn pending_smss_listeners_receive_later_sync_connect_once_and_complete_it() {
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let name = utf16("\\SmApiPort");
+    let smss = nt_port_core::ClientId { process: 4, thread: 24 };
+    let first_worker = nt_port_core::ClientId { process: 4, thread: 44 };
+    let second_worker = nt_port_core::ClientId { process: 4, thread: 48 };
+    let csrss = nt_port_core::ClientId { process: 56, thread: 60 };
+    let listen = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, smss, (3, 100)), &mut []).detail0;
+    let first_receive = enc_checked_receive(listen, first_worker, (3, 101));
+    let second_receive = enc_checked_receive(listen, second_worker, (3, 102));
+    let mut first_output = [0u8; 512];
+    let mut second_output = [0u8; 512];
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &first_receive, &mut first_output).status, nt_status::NtStatus::PENDING.0);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &second_receive, &mut second_output).status, nt_status::NtStatus::PENDING.0);
+
+    let mut connect = enc_checked_connect(&name, csrss, (3, 103),
+        &port_message(msg_type::CONNECTION_REQUEST, b"SB!!"));
+    let mut header: nt_alpc_abi::AlpcConnectPortCheckedRequest =
+        bytemuck::pod_read_unaligned(&connect[..size_of::<nt_alpc_abi::AlpcConnectPortCheckedRequest>()]);
+    header.connect.connect_flags = nt_alpc_abi::connect_flag::SYNC_CONNECTION;
+    connect[..size_of::<nt_alpc_abi::AlpcConnectPortCheckedRequest>()]
+        .copy_from_slice(bytemuck::bytes_of(&header));
+    let pending = alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &connect, &mut []);
+    assert_eq!(pending.status, nt_status::NtStatus::PENDING.0);
+
+    let delivered = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &first_receive, &mut first_output);
+    assert_eq!(delivered.status, SUCCESS);
+    assert_eq!(delivered.detail0, pending.detail1);
+    assert_eq!(delivered.detail1, u64::from(msg_type::CONNECTION_REQUEST));
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &second_receive, &mut second_output).status, nt_status::NtStatus::PENDING.0);
+
+    let accepted = alpc.dispatch(&mut core, aop::ALPC_OP_ACCEPT_CONNECT,
+        &enc_checked_accept(listen, pending.detail1, first_worker, (3, 104)), &mut []);
+    assert_eq!(accepted.status, SUCCESS);
+    let completed = alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &connect, &mut []);
+    assert_eq!(completed.status, SUCCESS);
+    assert_eq!(completed.detail0, accepted.detail1);
+}
+
+#[test]
 fn checked_accept_commits_copied_response_and_connect_poll_returns_exact_bytes() {
     let mut core = PortCore::new();
     core.set_accept_policy(AcceptPolicy::Manual);

@@ -33668,13 +33668,35 @@ impl ExecNtHandler {
                 if crate::hard_error::is_ready() {
                     return STATUS_UNSUCCESSFUL;
                 }
-                let Some(owner_process) = self.pm_pid_for_pi(self.pi).map(|pid| pid as u64) else {
+                let Some(owner_pid) = self.pm_pid_for_pi(self.pi) else {
                     return STATUS_INVALID_HANDLE;
+                };
+                let owner_process = owner_pid as u64;
+                let table_object = u32::try_from(args[0]).ok()
+                    .and_then(|value| self.pm.lookup_handle(owner_pid, value));
+                let service_handle = if matches!(table_object,
+                    Some(nt_process::HandleObject::AlpcPort { .. })) {
+                    let Some(generation) = self.hosted_process_generation(self.pi) else {
+                        return STATUS_INVALID_HANDLE;
+                    };
+                    let caller = match self.native_handle_caller(ctx.previous_mode) {
+                        Ok(caller) => caller,
+                        Err(status) => return status,
+                    };
+                    match self.pm.resolve_native_alpc_listen_service_handle(
+                        caller, args[0], generation,
+                    ) {
+                        Ok(service_handle) => service_handle,
+                        Err(status) => return status,
+                    }
+                } else {
+                    if table_object.is_some() { return STATUS_INVALID_HANDLE; }
+                    args[0]
                 };
                 let Some(lpc) = lpc_client() else {
                     return STATUS_UNSUCCESSFUL;
                 };
-                let metadata = match lpc.query_handle(args[0]) {
+                let metadata = match lpc.query_handle(service_handle) {
                     Ok(metadata) => metadata,
                     Err(status) => return status.raw() as u32,
                 };
@@ -33683,9 +33705,9 @@ impl ExecNtHandler {
                 {
                     return nt_status::NtStatus::INVALID_PORT_HANDLE.raw() as u32;
                 }
-                match crate::hard_error::register(args[0], owner_process) {
+                match crate::hard_error::register(service_handle, owner_process) {
                     Ok(()) => {
-                        print_str(b"[hard-error] registered default LPC port owner=");
+                        print_str(b"[hard-error] registered default shared port owner=");
                         print_u64(owner_process);
                         print_str(b" handle=0x");
                         print_hex_u64(args[0]);

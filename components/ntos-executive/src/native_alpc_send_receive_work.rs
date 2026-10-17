@@ -140,8 +140,8 @@ pub(crate) unsafe fn begin(handler: &mut ExecNtHandler, args: [u64; 8]) -> Resul
     if captured.timeout.is_some() || captured.receive.is_none() {
         return Err(STATUS_NOT_SUPPORTED);
     }
-    let target = captured.receive.take().ok_or(STATUS_NOT_SUPPORTED)?;
-    if target.capacity > REP_DATA_LEN { return Err(STATUS_NOT_SUPPORTED); }
+    let target_capacity = captured.receive.as_ref().ok_or(STATUS_NOT_SUPPORTED)?.capacity;
+    if target_capacity > REP_DATA_LEN { return Err(STATUS_NOT_SUPPORTED); }
     let handle_caller = handler.native_handle_caller(nt_syscall::ProcessorMode::UserMode)?;
     let port = handler.pm.lookup_native_alpc_port(handle_caller, captured.port, generation)?;
     if u64::from(port.owner_process) != process { return Err(STATUS_INVALID_HANDLE); }
@@ -149,7 +149,7 @@ pub(crate) unsafe fn begin(handler: &mut ExecNtHandler, args: [u64; 8]) -> Resul
     let sequence = NEXT_INVOCATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
         |next| next.checked_add(1)).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
     let token = (generation, sequence);
-    let request = captured.checked_wire(caller, token)?;
+    let (request, target) = captured.into_checked_wire_and_receive(caller, token)?;
     if request.len() > REP_DATA_LEN { return Err(STATUS_NOT_SUPPORTED); }
     let owners = &mut *core::ptr::addr_of_mut!(OWNERS);
     if owners.len() >= MAX_OWNERS

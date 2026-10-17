@@ -122,6 +122,15 @@ impl ProcessManager {
             owner_generation, invocation_hi, invocation_lo })
     }
 
+    /// Translate a published native listen-port handle to its exact broker
+    /// identity for a kernel facility that retains the connection port.
+    pub fn resolve_native_alpc_listen_service_handle(&self, caller: NativeHandleCaller,
+        value: u64, owner_generation: u64) -> Result<u64, u32> {
+        let identity = self.lookup_native_alpc_port(caller, value, owner_generation)?;
+        if identity.kind != AlpcPortKind::Created { return Err(STATUS_INVALID_HANDLE); }
+        Ok(identity.service_handle)
+    }
+
     /// Hide the exact table entry until a checked service close is known.
     pub fn begin_native_alpc_port_close(&mut self, caller: NativeHandleCaller,
         value: u64, owner_generation: u64) -> Result<NativeAlpcPortClose, NativeCloseError> {
@@ -330,6 +339,27 @@ mod tests {
         assert_eq!(pm.lookup_native_alpc_port(caller, value, 8), Err(STATUS_INVALID_HANDLE));
         assert_eq!(pm.lookup_native_alpc_port(caller, value, 7), Ok(identity));
         assert_eq!(pm.lookup_handle(pid, value as u32), Some(identity.object()));
+    }
+
+    #[test]
+    fn hard_error_registration_resolves_only_a_live_created_alpc_port() {
+        let (mut pm, caller, _) = fixture();
+        let mut created = pm.reserve_native_alpc_port_handle(caller, 7, (11, 13)).unwrap();
+        created.bind(&mut pm, 0x4c50_0001).unwrap();
+        let created_value = created.value();
+        assert_eq!(pm.resolve_native_alpc_listen_service_handle(caller, created_value, 7),
+            Err(STATUS_INVALID_HANDLE));
+        created.publish(&mut pm).unwrap();
+        assert_eq!(pm.resolve_native_alpc_listen_service_handle(caller, created_value, 7),
+            Ok(0x4c50_0001));
+        assert_eq!(pm.resolve_native_alpc_listen_service_handle(caller, created_value, 8),
+            Err(STATUS_INVALID_HANDLE));
+
+        let mut later = pm.reserve_native_alpc_later_port_handle(caller, 7, (17, 19)).unwrap();
+        later.bind(&mut pm, 0x4c50_0002).unwrap();
+        let later_value = later.publish(&mut pm).unwrap();
+        assert_eq!(pm.resolve_native_alpc_listen_service_handle(caller, later_value, 7),
+            Err(STATUS_INVALID_HANDLE));
     }
 
     #[test]
