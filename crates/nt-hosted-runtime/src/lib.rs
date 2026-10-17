@@ -10,8 +10,13 @@ mod hosted_irq_arena;
 mod hosted_irq_call_stack;
 mod progress_deferral;
 mod driver_load_receipt;
+mod dxg_registration;
 
 pub use driver_load_receipt::{DriverLoadPhase, RetainedEffectState};
+pub use dxg_registration::{
+    DxgCallbackSlot, DxgCallbackSlots, DxgInitializationData, DxgInitializationDataError,
+    DxgRegistrationKey,
+};
 
 pub use hosted_irq_arena::{
     decode_hosted_irq_transport_message, HostedIrqArena, HostedIrqArenaConfig,
