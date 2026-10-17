@@ -252,6 +252,7 @@ dependencies = [
  "nt-status",
  "nt-types",
  "nt-user-host",
+ "sha2",
  "syn",
 ]
 

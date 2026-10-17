@@ -2471,14 +2471,12 @@ static WIN32K_USERVM_RUN_SLOTS: [AtomicU64; USERVM_SLOT_COUNT] =
 /// Own 2 MiB PT window at 0x06E0 (free in both VSpaces: after the win32k image window, before AUX_PT 0x0700).
 pub const FONTBUF_VADDR: u64 = 0x0000_0100_06E0_0000;
 pub const FONTBUF_FRAMES: u64 = 64; // 256 KiB (arial.ttf = 180,144 B)
-/// `IntGdiAddFontMemResource(PVOID Buffer, DWORD dwSize, PDWORD pNumAdded)` — win32k RVA. Found via
-/// NtGdiAddFontMemResourceEx (SSDT idx 0x116 / RVA 0x124020): the SECOND internal call is
-/// IntGdiAddFontMemResource (the first, 0x1cbd80, is the inlined memcpy for RtlCopyMemory). Verified
-/// by disasm: ExAllocatePoolWithTag(PagedPool, dwSize, 'ETNF') → memcpy → SharedMem_Create →
-/// Characteristics=0x30 (FR_PRIVATE|FR_NOT_ENUM) → IntGdiLoadFontByIndexFromMemory. Adds the font
-/// FR_PRIVATE to the current process's private list, which TextIntRealizeFont searches (alongside
-/// g_FontListHead) to find the system font.
-pub const INT_GDI_ADD_FONT_MEM_RESOURCE_RVA: u64 = 0x12c840;
+/// Pinned LiberNT win32k.sys `IntGdiAddFontMemResource(Buffer, dwSize, pNumAdded)` RVA.
+/// Release source revision 8e478a22 and the image's `.symz` identify RVA 0xEBD10; the
+/// `NtGdiAddFontMemResourceEx` call at RVA 0xE6E35 also targets it. The previous ReactOS
+/// RVA 0x12C840 landed inside LiberNT's EngCopyBits. The callable entry allocates and copies
+/// the font, sets FR_PRIVATE | FR_NOT_ENUM, and links the result to the current process.
+pub const INT_GDI_ADD_FONT_MEM_RESOURCE_RVA: u64 = 0x0e_bd10;
 
 fn uservm_mask(slot: usize, slots: usize) -> Option<u64> {
     if slots == 0 || slot < USERVM_FIRST_SLOT || slot + slots > USERVM_SLOT_COUNT {

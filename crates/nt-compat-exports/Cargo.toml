@@ -11,6 +11,7 @@ authors.workspace = true
 undocumented_unsafe_blocks = "deny"
 
 [dev-dependencies]
+sha2 = "0.10"
 nt-ahci = { path = "../nt-ahci" }
 nt-fs = { path = "../nt-fs" }
 nt-printf = { path = "../nt-printf" }
