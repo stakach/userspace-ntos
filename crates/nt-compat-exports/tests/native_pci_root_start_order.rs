@@ -46,3 +46,29 @@ fn deferred_bus_child_never_falls_through_after_relation_terminal() {
     assert!(prepare.contains("NtStatus::INVALID_DEVICE_REQUEST"));
     assert!(start.contains("driver_launch::hosted_bus_relation_pending()"));
 }
+
+#[test]
+fn unrelated_pending_relation_does_not_turn_a_root_devnode_into_a_bus_child() {
+    let start = include_str!("../../../components/ntos-executive/src/hosted_pnp_start.rs");
+    let pending = start
+        .split("HostedPnpDevnodeProgress::BusRelationPending { require_accepted_bus_pdo } => {")
+        .nth(1)
+        .expect("missing pending relation handling");
+    let pending = &pending[..pending.find("return Some(").unwrap()];
+    assert!(
+        pending.contains("if require_accepted_bus_pdo"),
+        "a global relation wait must retain a PDO requirement only for an actual bus child"
+    );
+
+    let start_one = start
+        .split("unsafe fn start_one_devnode<")
+        .nth(1)
+        .expect("missing hosted devnode START")
+        .split("let prepared = match prepare_current_hosted_devnode(")
+        .next()
+        .unwrap();
+    assert!(
+        start_one.contains("BusRelationPending { require_accepted_bus_pdo }"),
+        "the deferred owner must carry its preexisting bus dependency through the wait"
+    );
+}
