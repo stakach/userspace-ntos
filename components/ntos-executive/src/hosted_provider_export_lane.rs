@@ -316,11 +316,11 @@ pub(super) unsafe fn select(provider: usize, owner: HostedProviderObjectOwner,
         return None;
     };
     let primary = nt_hosted_runtime::HostedProviderWorkerIdentity::new(
-        instance(provider)?.tcb, instance(provider)?.reply_cap,
+        instance(provider)?.tcb, instance(provider)?.cnode, instance(provider)?.reply_cap,
         instance(provider)?.exec_shared_va, primary_route.endpoint(), primary_route.badge(),
         primary_route.identity().lane.generation)?;
     let candidate = nt_hosted_runtime::HostedProviderWorkerIdentity::new(
-        worker.tcb, worker.reply_cap, row.executive_shared, route.endpoint(), route.badge(),
+        worker.tcb, worker.cnode, worker.reply_cap, row.executive_shared, route.endpoint(), route.badge(),
         route.identity().lane.generation)?;
     if nt_hosted_runtime::select_hosted_provider_export_worker(
         owner, publication, row.owner, row.publication, primary, candidate, true).is_none() {

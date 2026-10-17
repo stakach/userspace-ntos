@@ -11,8 +11,8 @@ fn owner() -> HostedProviderObjectOwner {
 #[test]
 fn reentrant_export_requires_separate_physical_worker_and_exact_publication() {
     // Distinct routes on one shared ingress endpoint can each have generation 1.
-    let primary = HostedProviderWorkerIdentity::new(100, 101, 102, 400, 103, 1).unwrap();
-    let worker = HostedProviderWorkerIdentity::new(200, 201, 202, 400, 203, 1).unwrap();
+    let primary = HostedProviderWorkerIdentity::new(100, 10, 101, 102, 400, 103, 1).unwrap();
+    let worker = HostedProviderWorkerIdentity::new(200, 20, 201, 202, 400, 203, 1).unwrap();
     let selected = select_hosted_provider_export_worker(
         owner(), 301, owner(), 301, primary, worker, true).unwrap();
     assert_eq!(selected, worker);
@@ -28,26 +28,45 @@ fn reentrant_export_requires_separate_physical_worker_and_exact_publication() {
         owner(), 301, owner(), 301, primary, primary, true).is_none());
     assert!(select_hosted_provider_export_worker(
         owner(), 301, owner(), 301, primary,
-        HostedProviderWorkerIdentity::new(200, 201, 102, 400, 203, 1).unwrap(), true).is_none());
+        HostedProviderWorkerIdentity::new(200, 20, 201, 102, 400, 203, 1).unwrap(), true).is_none());
     assert!(select_hosted_provider_export_worker(
         owner(), 301, owner(), 301, primary,
-        HostedProviderWorkerIdentity::new(200, 101, 202, 400, 203, 1).unwrap(), true).is_none());
+        HostedProviderWorkerIdentity::new(200, 10, 101, 202, 400, 203, 1).unwrap(), true).is_none());
     assert!(select_hosted_provider_export_worker(
         owner(), 301, owner(), 301, primary,
-        HostedProviderWorkerIdentity::new(100, 201, 202, 400, 203, 1).unwrap(), true).is_none());
+        HostedProviderWorkerIdentity::new(100, 20, 201, 202, 400, 203, 1).unwrap(), true).is_none());
     assert!(select_hosted_provider_export_worker(
         owner(), 301, owner(), 301, primary,
-        HostedProviderWorkerIdentity::new(200, 201, 202, 400, 103, 1).unwrap(), true).is_none());
+        HostedProviderWorkerIdentity::new(200, 20, 201, 202, 400, 103, 1).unwrap(), true).is_none());
+}
+
+#[test]
+fn local_reply_slot_may_match_across_distinct_owned_cnodes() {
+    let primary = HostedProviderWorkerIdentity::new(100, 10, 101, 102, 400, 103, 1).unwrap();
+    let worker = HostedProviderWorkerIdentity::new(200, 20, 101, 202, 400, 203, 1).unwrap();
+    assert_eq!(
+        select_hosted_provider_export_worker(owner(), 301, owner(), 301, primary, worker, true),
+        Some(worker)
+    );
+    let aliased = HostedProviderWorkerIdentity::new(200, 10, 101, 202, 400, 203, 1).unwrap();
+    assert!(select_hosted_provider_export_worker(
+        owner(), 301, owner(), 301, primary, aliased, true).is_none());
+    let separate_slot = HostedProviderWorkerIdentity::new(200, 10, 201, 202, 400, 203, 1).unwrap();
+    assert_eq!(
+        select_hosted_provider_export_worker(owner(), 301, owner(), 301, primary, separate_slot, true),
+        Some(separate_slot)
+    );
 }
 
 #[test]
 fn incomplete_physical_worker_cannot_be_selected() {
-    assert!(HostedProviderWorkerIdentity::new(0, 201, 202, 400, 203, 1).is_none());
-    assert!(HostedProviderWorkerIdentity::new(200, 0, 202, 400, 203, 1).is_none());
-    assert!(HostedProviderWorkerIdentity::new(200, 201, 0, 400, 203, 1).is_none());
-    assert!(HostedProviderWorkerIdentity::new(200, 201, 202, 0, 203, 1).is_none());
-    assert!(HostedProviderWorkerIdentity::new(200, 201, 202, 400, 0, 1).is_none());
-    assert!(HostedProviderWorkerIdentity::new(200, 201, 202, 400, 203, 0).is_none());
+    assert!(HostedProviderWorkerIdentity::new(0, 20, 201, 202, 400, 203, 1).is_none());
+    assert!(HostedProviderWorkerIdentity::new(200, 0, 201, 202, 400, 203, 1).is_none());
+    assert!(HostedProviderWorkerIdentity::new(200, 20, 0, 202, 400, 203, 1).is_none());
+    assert!(HostedProviderWorkerIdentity::new(200, 20, 201, 0, 400, 203, 1).is_none());
+    assert!(HostedProviderWorkerIdentity::new(200, 20, 201, 202, 0, 203, 1).is_none());
+    assert!(HostedProviderWorkerIdentity::new(200, 20, 201, 202, 400, 0, 1).is_none());
+    assert!(HostedProviderWorkerIdentity::new(200, 20, 201, 202, 400, 203, 0).is_none());
 }
 
 #[test]

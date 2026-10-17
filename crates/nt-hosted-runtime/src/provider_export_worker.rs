@@ -69,11 +69,12 @@ impl HostedWorkerBankLayout {
     pub const fn arg_end(self) -> Option<u64> { self.arg_end }
 }
 
-/// Physical channel identity of a hosted provider worker. All four resources must belong to the
-/// same live worker publication; a reusable driver slot is insufficient authority.
+/// Physical channel identity of a hosted provider worker. A Reply cap slot is local to its
+/// CNode; all resources must belong to the same live worker publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostedProviderWorkerIdentity {
     pub tcb: u64,
+    pub reply_cnode: u64,
     pub reply: u64,
     pub shared_bank: u64,
     pub route_endpoint: u64,
@@ -84,17 +85,18 @@ pub struct HostedProviderWorkerIdentity {
 impl HostedProviderWorkerIdentity {
     pub const fn new(
         tcb: u64,
+        reply_cnode: u64,
         reply: u64,
         shared_bank: u64,
         route_endpoint: u64,
         route_badge: u64,
         route_generation: u64,
     ) -> Option<Self> {
-        if tcb == 0 || reply == 0 || shared_bank == 0 || route_endpoint == 0
+        if tcb == 0 || reply_cnode == 0 || reply == 0 || shared_bank == 0 || route_endpoint == 0
             || route_badge == 0 || route_generation == 0 {
             return None;
         }
-        Some(Self { tcb, reply, shared_bank, route_endpoint, route_badge, route_generation })
+        Some(Self { tcb, reply_cnode, reply, shared_bank, route_endpoint, route_badge, route_generation })
     }
 }
 
@@ -119,7 +121,7 @@ pub const fn select_hosted_provider_export_worker(
         )
         || expected_publication != live_publication
         || primary.tcb == worker.tcb
-        || primary.reply == worker.reply
+        || (primary.reply_cnode == worker.reply_cnode && primary.reply == worker.reply)
         || primary.shared_bank == worker.shared_bank
         // A generation belongs to one lane and may equal another lane's generation. The
         // ingress registry issues unique badges for route publications on its endpoint.
