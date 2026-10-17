@@ -32,6 +32,8 @@
 use alloc::vec::Vec;
 #[path = "win32k_irql.rs"]
 mod irql;
+#[path = "win32k_local_sync.rs"]
+mod local_sync;
 #[path = "win32k_provider_wait_context.rs"]
 mod provider_wait_context;
 #[path = "win32k_source_irp.rs"]
@@ -759,6 +761,9 @@ unsafe fn initialize_provider_local_event_tracking() -> bool {
     }
     *core::ptr::addr_of_mut!(WIN32K_LOCAL_EVENTS) = Some(events);
     *core::ptr::addr_of_mut!(WIN32K_LOCAL_TIMERS) = Some(timers);
+    if !local_sync::initialize_under_metadata(provider) {
+        return false;
+    }
     *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS) = Some(stack_activations);
     (&mut *core::ptr::addr_of_mut!(WIN32K_HOSTED_WAIT_HEADERS)).clear();
     *core::ptr::addr_of_mut!(WIN32K_DRIVER_STACK_EVENT_ACTIVATION) = None;
@@ -923,6 +928,7 @@ unsafe fn begin_provider_allocation_retirement_locked(
         || catalog.validate_retirement(allocation.identity) != Ok(allocation)
         || !validate_provider_allocation_event_retirement(allocation)
         || !validate_provider_allocation_timer_retirement(allocation)
+        || !local_sync::validate_backing_retirement(provider_allocation_event_backing(allocation))
     {
         return None;
     }
@@ -941,6 +947,7 @@ unsafe fn provider_allocation_has_local_wait_objects(
     let backing = provider_allocation_event_backing(allocation);
     provider_local_events().is_none_or(|events| events.backing_event_count(backing) != 0)
         || provider_local_timers().is_none_or(|timers| timers.backing_timer_count(backing) != 0)
+        || local_sync::backing_count(backing) != 0
 }
 
 unsafe fn validate_provider_allocation_event_retirement(
@@ -1538,6 +1545,12 @@ pub const W32_TIMER_OP_ACK_LOCAL_RETIREMENT: u64 = 23;
 pub const W32_TIMER_OP_SET_LOCAL: u64 = 24;
 pub const W32_TIMER_OP_CANCEL_LOCAL: u64 = 25;
 pub const W32_TIMER_OP_READ_LOCAL: u64 = 26;
+pub const W32_SYNC_OP_PUBLISH: u64 = 31;
+pub const W32_SYNC_OP_RELEASE_SEMAPHORE: u64 = 32;
+pub const W32_SYNC_OP_RELEASE_MUTANT: u64 = 33;
+pub const W32_SYNC_OP_RETIRE: u64 = 34;
+pub const W32_SYNC_OP_ACK_RETIREMENT: u64 = 35;
+pub const W32_SYNC_OP_QUERY: u64 = 36;
 
 static mut WIN32K_EVENT_PROJECTIONS: nt_kernel_exec::ProviderEventProjectionCatalog =
     nt_kernel_exec::ProviderEventProjectionCatalog::new();
@@ -2082,6 +2095,7 @@ unsafe fn reserve_provider_pool_owned(objects: &[(u64, u64)]) -> Option<Provider
         let allocation = catalog.active_exact_capacity(arena, pointer, capacity).ok()?;
         if !validate_provider_allocation_event_retirement(allocation)
             || !validate_provider_allocation_timer_retirement(allocation)
+            || !local_sync::validate_backing_retirement(provider_allocation_event_backing(allocation))
         {
             return None;
         }
@@ -2119,6 +2133,10 @@ unsafe fn release_reserved_provider_pool(
         }
         if !retire_provider_allocation_timers(allocation) {
             print_str(b"[win32k-host] fatal provider-pool Timer retirement commit failure\n");
+            park();
+        }
+        if !local_sync::retire_backing(provider_allocation_event_backing(allocation)) {
+            print_str(b"[win32k-host] fatal provider-pool sync retirement commit failure\n");
             park();
         }
     }
@@ -2427,6 +2445,7 @@ unsafe fn reclaiming_pool_free(p: u64) -> bool {
     };
     if !retire_provider_allocation_events(allocation)
         || !retire_provider_allocation_timers(allocation)
+        || !local_sync::retire_backing(provider_allocation_event_backing(allocation))
     {
         return false;
     }
@@ -5014,6 +5033,9 @@ unsafe fn finish_provider_stack_event_activation(
     if !retire_provider_local_timers_for_backing(activation.backing()) {
         return false;
     }
+    if !local_sync::retire_backing(activation.backing()) {
+        return false;
+    }
     let _metadata = ProviderMetadataGuard::acquire();
     let (finished, parent) = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
         .as_mut()
@@ -5919,6 +5941,7 @@ enum ProviderWaitLease {
     Timer(nt_provider_wait::ProviderLocalTimerOperationLease),
     ProjectedEvent(nt_kernel_exec::ProviderEventProjectionWaitLease),
     File(u64),
+    Sync(nt_provider_wait::ProviderLocalSyncLease),
 }
 
 struct ProviderWaitAdmission {
@@ -6000,6 +6023,7 @@ impl ProviderWaitAdmission {
                             .is_ok()
                     }
                     Some(ProviderWaitLease::File(_)) => continue,
+                    Some(ProviderWaitLease::Sync(lease)) => local_sync::release_wait_under_metadata(lease),
                 };
                 if !released {
                     return false;
@@ -6107,6 +6131,9 @@ unsafe fn provider_wait_object_for_dispatcher(
                 return Ok((lease.canonical, Some(ProviderWaitLease::Timer(lease))));
             }
         }
+    }
+    if let Some((canonical, lease)) = local_sync::wait_object(object_body) {
+        return Ok((canonical, Some(ProviderWaitLease::Sync(lease))));
     }
     if !provider_pool_contains(object_body) {
         return Err(ProviderWaitResolutionFailure { kind: b"outside-provider-pool", status: STATUS_INVALID_HANDLE_I32 });
@@ -6255,6 +6282,15 @@ unsafe fn provider_wait_rendezvous(
                 };
                 if !wait_context.restore() {
                     park();
+                }
+                if status >= 0 && status < admission.count as i32 {
+                    for index in 0..admission.count {
+                        if let Some(ProviderWaitLease::Sync(lease)) = admission.leases[index] {
+                            if !local_sync::refresh_wait_header(bodies[index], lease) {
+                                park();
+                            }
+                        }
+                    }
                 }
                 if !admission.release() {
                     park();
@@ -8830,6 +8866,7 @@ unsafe fn heap_free_in_reserved(
 ) -> bool {
     if !retire_provider_allocation_events(allocation)
         || !retire_provider_allocation_timers(allocation)
+        || !local_sync::retire_backing(provider_allocation_event_backing(allocation))
     {
         return false;
     }
@@ -15148,6 +15185,10 @@ fn register_trampolines() -> bool {
     reg.bind("ZwCreateEvent", s_zw_create_event as usize as u64);
     reg.bind("NtCreateEvent", s_zw_create_event as usize as u64);
     reg.bind("KeInitializeEvent", s_ke_initialize_event as usize as u64);
+    reg.bind("KeInitializeMutex", local_sync::ke_initialize_mutant as usize as u64);
+    reg.bind("KeReleaseMutex", local_sync::ke_release_mutant as usize as u64);
+    reg.bind("KeInitializeSemaphore", local_sync::ke_initialize_semaphore as usize as u64);
+    reg.bind("KeReleaseSemaphore", local_sync::ke_release_semaphore as usize as u64);
     reg.bind("KeGetCurrentIrql", irql::get_current as *const () as u64);
     reg.bind("KfRaiseIrql", irql::raise as *const () as u64);
     reg.bind("KeLowerIrql", irql::lower as *const () as u64);

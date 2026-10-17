@@ -7189,6 +7189,7 @@ pub(crate) fn census_tick_static(now: u64) {
     CENSUS_LAST_DUMP.store(now, Ordering::Relaxed);
     let n = CENSUS_PERIODIC_DUMPS.fetch_add(1, Ordering::Relaxed);
     print_periodic_census_heartbeat(n, now);
+    service_sec_image::trace_csrss_post_resume_census(n);
     print_native_ssn_time();
     print_add_device_rollback_census(b"periodic", false);
     print_hosted_file_owner_census(b"periodic", false);

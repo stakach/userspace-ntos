@@ -465,6 +465,19 @@ pub(super) unsafe fn service_event(
         };
         if matches!(
             op,
+            win32k_subsystem::W32_SYNC_OP_PUBLISH
+                | win32k_subsystem::W32_SYNC_OP_RELEASE_SEMAPHORE
+                | win32k_subsystem::W32_SYNC_OP_RELEASE_MUTANT
+                | win32k_subsystem::W32_SYNC_OP_RETIRE
+                | win32k_subsystem::W32_SYNC_OP_ACK_RETIREMENT
+                | win32k_subsystem::W32_SYNC_OP_QUERY
+        ) {
+            return Ok(crate::service_sec_image::service_win32k_provider_sync_request(
+                provider, Some(owner), op, arg1, arg2, arg3,
+            ));
+        }
+        if matches!(
+            op,
             win32k_subsystem::W32_TIMER_OP_PUBLISH_LOCAL
                 | win32k_subsystem::W32_TIMER_OP_RETIRE_LOCAL
                 | win32k_subsystem::W32_TIMER_OP_ACK_LOCAL_RETIREMENT

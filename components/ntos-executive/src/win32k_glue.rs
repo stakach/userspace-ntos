@@ -5982,7 +5982,7 @@ pub(crate) use process_attach_root::current_query_process;
 
 /// Checked system-image loading owns its mappings and opaque module allocation independently.
 #[path = "win32k_image_loader.rs"]
-mod image_loader;
+pub(crate) mod image_loader;
 #[cfg(feature = "source-irp-integration")]
 #[path = "source_irp_integration.rs"]
 pub(crate) mod source_irp_integration;

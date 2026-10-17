@@ -19,6 +19,7 @@ const STATUS_INVALID_PARAMETER: i32 = 0xc000_000du32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xc000_0022u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: i32 = 0xc000_009au32 as i32;
 const STATUS_NOT_FOUND: i32 = 0xc000_0034u32 as i32;
+const STATUS_DEVICE_BUSY: i32 = nt_status::NtStatus::DEVICE_BUSY.raw();
 const STATUS_SUCCESS: i32 = 0;
 
 const _: () = assert!(APERTURE_BASE >= FSD_WORKER_EXEC_ALIAS_BASE + 0x8000_0000);
@@ -57,6 +58,20 @@ struct Projection {
     length: u64,
     owner: Option<crate::hosted_pnp_context::HostedPnpContextOwner>,
     phase: ProjectionPhase,
+    video_pins: u64,
+}
+
+/// A retained reference to the exact source frame run behind a dependent provider's
+/// CPU-visible video segment. The numeric component VA is never sufficient authority.
+pub(super) struct VideoProjectionPin {
+    projection_index: usize,
+    consumer: ContiguousRamOwner,
+    source_child: u64,
+    pub(super) provider_page_base: u64,
+    pub(super) pages: u64,
+    pub(super) frame_slot_base: u64,
+    pub(super) generation: u64,
+    held: bool,
 }
 
 static BROKER_LOCK: AtomicU64 = AtomicU64::new(0);
@@ -352,6 +367,62 @@ unsafe fn physical_address(requester: ContiguousRamOwner, address: u64) -> Optio
     })
 }
 
+/// Pin a video provider's exact, generation-owned CPU projection and its source
+/// frames. The caller must release this only after revoking every copied alias.
+pub(super) unsafe fn pin_video_projection(
+    instance: usize, inst: DriverInstance, address: u64, length: u64,
+) -> Option<VideoProjectionPin> {
+    let consumer = owner(instance, inst)?;
+    if length == 0 || inst.pml4 == 0 { return None; }
+    let _guard = lock();
+    let rows = &mut *core::ptr::addr_of_mut!(PROJECTIONS);
+    let mut match_index = None;
+    for (index, row) in rows.iter().enumerate() {
+        if row.phase != ProjectionPhase::Ready || row.consumer != consumer
+            || row.consumer_pml4 != inst.pml4
+            || row.mapping.physical_range(consumer, address, length).is_none()
+        { continue; }
+        if match_index.replace(index).is_some() { return None; }
+    }
+    let index = match_index?;
+    let row = &mut rows[index];
+    let physical = row.mapping.physical_range(consumer, address, length)?;
+    let provider_page_base = address & !(PAGE - 1);
+    let offset = address & (PAGE - 1);
+    let pages = offset.checked_add(length)?.checked_add(PAGE - 1)? / PAGE;
+    let first_physical_page = physical & !(PAGE - 1);
+    let last_physical = first_physical_page.checked_add(pages.checked_mul(PAGE)?)?;
+    let source = (&*core::ptr::addr_of!(ALLOCATIONS)).iter().find(|source| {
+        source.slot == row.source_slot && source.child == row.source_child
+            && source.owner == row.mapping.producer() && published_mapping(source).is_some()
+    })?;
+    let first_frame = first_physical_page.checked_sub(source.physical_start)? / PAGE;
+    if first_frame.checked_add(pages)? > source.frames
+        || last_physical > source.physical_start.checked_add(source.length)?
+    { return None; }
+    let frame_slot_base = source.cap_base.checked_add(first_frame)?;
+    frame_slot_base.checked_add(pages)?;
+    row.video_pins = row.video_pins.checked_add(1)?;
+    Some(VideoProjectionPin {
+        projection_index: index, consumer, source_child: source.child,
+        provider_page_base, pages, frame_slot_base,
+        generation: source.child, held: true,
+    })
+}
+
+pub(super) unsafe fn release_video_projection_pin(pin: &mut VideoProjectionPin) -> bool {
+    if !pin.held { return false; }
+    let _guard = lock();
+    let Some(row) = (&mut *core::ptr::addr_of_mut!(PROJECTIONS)).get_mut(pin.projection_index)
+    else { return false; };
+    if row.phase != ProjectionPhase::Ready || row.consumer != pin.consumer
+        || row.source_child != pin.source_child || row.video_pins == 0
+    { return false; }
+    row.video_pins -= 1;
+    pin.held = false;
+    true
+}
+
 /// A registered Dxg provider may map a physical segment published by its exact live miniport.
 /// Source frame caps are copied into the provider VSpace and retained independently of the source.
 unsafe fn map_physical(consumer: ContiguousRamOwner, inst: DriverInstance,
@@ -407,7 +478,7 @@ unsafe fn map_physical(consumer: ContiguousRamOwner, inst: DriverInstance,
     };
     rows.push(Projection { source_slot, source_child, mapping, consumer,
         consumer_pml4: inst.pml4, address, length, owner: Some(caps_owner),
-        phase: ProjectionPhase::Mapping });
+        phase: ProjectionPhase::Mapping, video_pins: 0 });
     let index = rows.len() - 1;
     let domain = HostedDomainIdentity {
         domain_id: nt_io_manager::HostedDomainId(consumer.domain),
@@ -442,6 +513,7 @@ unsafe fn map_physical(consumer: ContiguousRamOwner, inst: DriverInstance,
 }
 
 unsafe fn retire_projection(row: &mut Projection) -> bool {
+    if row.video_pins != 0 { return false; }
     let Some(caps_owner) = row.owner.take() else { return false; };
     match crate::hosted_pnp_context::try_retire_hosted_pnp_context_owner(caps_owner) {
         Ok(()) => {
@@ -462,6 +534,7 @@ unsafe fn unmap_physical(consumer: ContiguousRamOwner, address: u64, length: u64
     let Some(row) = rows.iter_mut().find(|row| row.consumer == consumer
         && row.phase == ProjectionPhase::Ready && row.address == address
         && row.length == length && cache == 0) else { return STATUS_NOT_FOUND; };
+    if row.video_pins != 0 { return STATUS_DEVICE_BUSY; }
     let mut mapping = row.mapping;
     if mapping.retire_exact(consumer, address, length).is_err() {
         return STATUS_NOT_FOUND;
@@ -517,6 +590,10 @@ unsafe fn free(owner: ContiguousRamOwner, address: u64, length: u64, cache: u64)
         || cache != u64::MAX && cache != row.cache as u64 {
         return STATUS_INVALID_PARAMETER;
     }
+    if (&*core::ptr::addr_of!(PROJECTIONS)).iter().any(|projection| {
+        projection.source_slot == row.slot && projection.source_child == row.child
+            && projection.mapping.producer() == row.owner && projection.video_pins != 0
+    }) { return STATUS_DEVICE_BUSY; }
     if !retire_projections_for_source(row) {
         row.quarantined = true;
         let _ = (&mut *core::ptr::addr_of_mut!(LEASES)).quarantine(owner, row.slot);

@@ -208,6 +208,7 @@ struct Work {
     origin_armed: bool,
     terminal: Option<(u32, u64)>,
     output_captured: bool,
+    pool_map_handled: bool,
     monitor_source: Option<crate::driver_launch::HostedVideoMonitorArray>,
     monitor_projected: Option<crate::win32k_subsystem::RootProviderPoolAllocation>,
     terminal_claimed: bool,
@@ -441,6 +442,7 @@ pub(crate) unsafe fn submit(
         irp: None, entered: false, packet_prepared: false,
         reply_entered: false, reply_acked: false,
         pending: false, origin_armed: false, terminal: None, output_captured: false,
+        pool_map_handled: false,
         monitor_source: None, monitor_projected: None,
         terminal_claimed: false, terminal_published: false,
         terminal_packet: None, terminal_acknowledged: false, origin_committed: false, discarding: false,
@@ -730,6 +732,7 @@ impl Work {
     }
 
     unsafe fn capture_output(&mut self) -> bool {
+        if self.indeterminate { return false; }
         if self.output_captured {
             return true;
         }
@@ -746,6 +749,22 @@ impl Work {
             }
         }
         if !self.project_monitor_array(length) { return false; }
+        if self.pool_map_handled && status == 0
+            && self.code == nt_video_miniport::IOCTL_VIDEO_MAP_VIDEO_MEMORY
+            && !super::hosted_video_pool_map::publish_map(
+                self.route, &self.target, information, &mut self.output[..length],
+            )
+        {
+            self.indeterminate = true;
+            return false;
+        }
+        if self.pool_map_handled
+            && self.code == nt_video_miniport::IOCTL_VIDEO_UNMAP_VIDEO_MEMORY
+            && !super::hosted_video_pool_map::complete_unmap(self.token, status)
+        {
+            self.indeterminate = true;
+            return false;
+        }
         let (status, information) = self.terminal.expect("projected source IOCTL terminal");
         let length = wire::completion_output_len(
             self.code, status, information, self.output_capacity,
@@ -1028,13 +1047,27 @@ impl Work {
                 return false;
             }
             let aperture = if self.internal { Ok(()) } else {
-                super::hosted_video_caller_aperture::prepare(
+                match super::hosted_video_pool_map::prepare(
                     self.route, self.dispatch, self.reply, self.token, &self.target,
-                    self.code, &self.input, self.output_capacity,
-                )
+                    self.code, &mut self.input, self.output_capacity,
+                ) {
+                    Ok(true) => { self.pool_map_handled = true; Ok(()) }
+                    Ok(false) => super::hosted_video_caller_aperture::prepare(
+                        self.route, self.dispatch, self.reply, self.token, &self.target,
+                        self.code, &self.input, self.output_capacity,
+                    ),
+                    Err(status) => Err(status),
+                }
             };
             self.entered = true;
             let result = if let Err(status) = aperture {
+                if self.code == nt_video_miniport::IOCTL_VIDEO_MAP_VIDEO_MEMORY {
+                    print_str(b"[win32k-video-map] aperture rejected status=");
+                    print_hex_u64(status.raw() as u32 as u64);
+                    print_str(b" device-id=");
+                    print_u64(self.target.device_id().raw());
+                    print_str(b"\n");
+                }
                 Err(status)
             } else if self.internal {
                 io_manager_mut().internal_device_control_exact_device(

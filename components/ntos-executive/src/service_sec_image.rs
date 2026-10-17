@@ -61,6 +61,37 @@ static PIPE_TRANSCEIVE_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
 static mut FILE_IO_COPY_WORK: [u8; 4096] = [0; 4096];
 static CALLBACK_MESSAGE_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_MESSAGE_TRACE: AtomicU64 = AtomicU64::new(0);
+static CSRSS_RESUME_REPLIES: AtomicU64 = AtomicU64::new(0);
+static CSRSS_POST_RESUME_TCB: AtomicU64 = AtomicU64::new(0);
+
+/// Bounded boot diagnostic: sample the CSRSS main thread after its SB worker resume reply.
+pub(crate) fn trace_csrss_post_resume_census(census: u64) {
+    if census > 5 {
+        return;
+    }
+    let tcb = CSRSS_POST_RESUME_TCB.load(Ordering::Relaxed);
+    if tcb == 0 {
+        return;
+    }
+    let mut regs = [0u64; 20];
+    let valid = unsafe { crate::win32k_glue::tcb_read_regs20_checked(tcb, &mut regs) };
+    print_str(b"[csrss-post-resume] census=");
+    print_u64(census);
+    print_str(b" tcb=0x");
+    print_hex_u64(tcb);
+    print_str(b" registers-valid=");
+    print_u64(valid as u64);
+    if valid {
+        print_str(b" rip=0x");
+        print_hex_u64(regs[0]);
+        print_str(b" rsp=0x");
+        print_hex_u64(regs[1]);
+        print_str(b" rax=0x");
+        print_hex_u64(regs[3]);
+    }
+    print_str(b"\n");
+    unsafe { crate::win32k_glue::trace_hosted_tcb_debug_state(b"csrss-post-resume", tcb, 0) };
+}
 
 pub(crate) fn synchronous_file_retry_stats() -> (nt_io_manager::SynchronousFileRetryStats, u64, u64, u64) {
     let stats = unsafe { (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).retry_stats() };
@@ -4137,6 +4168,13 @@ pub(crate) unsafe fn service_win32k_event_request(
     let handler = &mut *handler_ptr;
     let provider_scoped = matches!(
         op,
+        crate::win32k_subsystem::W32_SYNC_OP_PUBLISH
+            | crate::win32k_subsystem::W32_SYNC_OP_RELEASE_SEMAPHORE
+            | crate::win32k_subsystem::W32_SYNC_OP_RELEASE_MUTANT
+            | crate::win32k_subsystem::W32_SYNC_OP_RETIRE
+            | crate::win32k_subsystem::W32_SYNC_OP_ACK_RETIREMENT
+            | crate::win32k_subsystem::W32_SYNC_OP_QUERY
+            |
         crate::win32k_subsystem::W32_EVENT_OP_PUBLISH_LOCAL
             | crate::win32k_subsystem::W32_EVENT_OP_RETIRE_LOCAL
             | crate::win32k_subsystem::W32_EVENT_OP_ACK_LOCAL_RETIREMENT
@@ -4167,6 +4205,44 @@ pub(crate) unsafe fn service_win32k_event_request(
         pi
     };
     match op {
+        crate::win32k_subsystem::W32_SYNC_OP_PUBLISH
+        | crate::win32k_subsystem::W32_SYNC_OP_RELEASE_SEMAPHORE
+        | crate::win32k_subsystem::W32_SYNC_OP_RELEASE_MUTANT
+        | crate::win32k_subsystem::W32_SYNC_OP_RETIRE
+        | crate::win32k_subsystem::W32_SYNC_OP_ACK_RETIREMENT
+        | crate::win32k_subsystem::W32_SYNC_OP_QUERY => {
+            let Some(provider) = crate::current_win32k_provider_domain() else {
+                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+            };
+            let owner = if op == crate::win32k_subsystem::W32_SYNC_OP_RELEASE_MUTANT {
+                let Some(caller) = channel.logical_caller else {
+                    return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+                };
+                if !handler.validate_provider_logical_caller(caller)
+                    || caller.pi() as u64 != channel.client_pi
+                    || caller.process().generation !=
+                        nt_user_host::process_identity::ProcessGeneration::Hosted(channel.client_generation)
+                {
+                    return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+                }
+                Some(nt_provider_wait::ProviderWaitOwner {
+                    provider_domain: provider.domain,
+                    provider_generation: provider.generation,
+                    dispatch_id: 1,
+                    caller: nt_component_suspension::SuspensionCaller::Hosted(
+                        nt_component_suspension::SuspensionHostedClient {
+                            client_pi: caller.pi() as u32,
+                            client_generation: channel.client_generation,
+                            client_tid: u64::from(caller.thread().thread_id()),
+                            client_badge: caller.badge(),
+                        },
+                    ),
+                })
+            } else {
+                None
+            };
+            service_win32k_provider_sync_request(provider, owner, op, arg1, arg2, arg3)
+        }
         crate::win32k_subsystem::W32_EVENT_OP_CREATE => handler
             .provider_create_event(pi, arg1 as u32, arg2 as u32, arg3 != 0)
             .map(|handle| (0, handle, 0, 0))
@@ -4347,6 +4423,90 @@ pub(crate) unsafe fn service_win32k_event_request(
             service_win32k_provider_timer_request(provider, op, arg1, arg2, arg3)
         }
         _ => (STATUS_INVALID_PARAMETER, 0, 0, 0),
+    }
+}
+
+/// Authenticate at the entry adapter, then mutate one exact root-owned sync identity.
+/// Release triggers the existing canonical waiter selector after the mutation is visible.
+pub(crate) unsafe fn service_win32k_provider_sync_request(
+    provider: nt_provider_wait::ProviderDomainIdentity,
+    owner: Option<nt_provider_wait::ProviderWaitOwner>,
+    op: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+) -> (i32, u64, u64, u64) {
+    use crate::win32k_subsystem::*;
+    const INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
+    let result: Result<(u64, u64, u64), u32> = match op {
+        W32_SYNC_OP_PUBLISH => {
+            let kind = match arg2 >> 32 {
+                1 => nt_provider_wait::ProviderSyncKind::Semaphore {
+                    initial_count: arg2 as u32 as i32,
+                    limit: arg3 as u32 as i32,
+                },
+                2 if arg2 as u32 == 0 && arg3 == 0 => nt_provider_wait::ProviderSyncKind::Mutant,
+                _ => return (INVALID_PARAMETER, 0, 0, 0),
+            };
+            crate::provider_dispatcher_backend::publish_sync(provider, arg1, kind)
+                .map(|canonical| (canonical.object_id, canonical.object_generation, 0))
+        }
+        W32_SYNC_OP_RELEASE_SEMAPHORE if arg3 == 0 =>
+            crate::provider_dispatcher_backend::release_sync_semaphore(provider, arg1, arg2 as u32 as i32)
+                .map(|previous| (previous as u32 as u64, 0, 0)),
+        W32_SYNC_OP_RELEASE_MUTANT if arg2 == 0 && arg3 == 0 =>
+            owner.ok_or(INVALID_PARAMETER as u32).and_then(|owner|
+                crate::provider_dispatcher_backend::release_sync_mutant(provider, arg1, owner))
+                .map(|previous| (previous as u32 as u64, 0, 0)),
+        W32_SYNC_OP_RETIRE if arg2 == 0 && arg3 == 0 =>
+            crate::provider_dispatcher_backend::begin_retire_sync(provider, arg1)
+                .map(|retirement| (retirement.canonical.object_id,
+                    retirement.canonical.object_generation,
+                    retirement.canonical.object_type as u64)),
+        W32_SYNC_OP_ACK_RETIREMENT => {
+            let kind = match arg3 >> 32 {
+                2 => nt_provider_wait::ProviderWaitObjectType::Semaphore,
+                7 => nt_provider_wait::ProviderWaitObjectType::Mutant,
+                _ => return (INVALID_PARAMETER, 0, 0, 0),
+            };
+            let canonical = nt_provider_wait::ProviderWaitObject::new(kind, arg2, arg3 as u32 as u64);
+            crate::provider_dispatcher_backend::ack_retire_sync(provider, arg1, canonical)
+                .map(|()| (0, 0, 0))
+        }
+        W32_SYNC_OP_QUERY => {
+            let kind = match arg3 >> 32 {
+                2 => nt_provider_wait::ProviderWaitObjectType::Semaphore,
+                7 => nt_provider_wait::ProviderWaitObjectType::Mutant,
+                _ => return (INVALID_PARAMETER, 0, 0, 0),
+            };
+            let canonical = nt_provider_wait::ProviderWaitObject::new(kind, arg2, arg3 as u32 as u64);
+            crate::provider_dispatcher_backend::snapshot_sync(provider, arg1, canonical)
+                .and_then(|snapshot| match snapshot.mutant_owner {
+                    None => Ok((snapshot.signal_state as u32 as u64, 0, 0)),
+                    Some(nt_component_suspension::SuspensionCaller::Hosted(client)) =>
+                        Ok((snapshot.signal_state as u32 as u64, client.client_tid, client.client_generation)),
+                    Some(nt_component_suspension::SuspensionCaller::Kernel { .. }) =>
+                        Err(INVALID_PARAMETER as u32),
+                })
+        }
+        _ => Err(INVALID_PARAMETER as u32),
+    };
+    match result {
+        Ok((out1, out2, out3)) => {
+            if matches!(op, W32_SYNC_OP_RELEASE_SEMAPHORE | W32_SYNC_OP_RELEASE_MUTANT) {
+                let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+                if let Some(handler) = handler.as_mut() {
+                    let mut objects = handler.dispatcher_objects(None);
+                    let _ = provider_wait_select_ready(&mut objects);
+                } else {
+                    let _ = dispatcher_bootstrap::with_provider_objects(|mut objects| {
+                        provider_wait_select_ready(&mut objects)
+                    });
+                }
+            }
+            (0, out1, out2, out3)
+        }
+        Err(status) => (status as i32, 0, 0, 0),
     }
 }
 
@@ -12463,16 +12623,30 @@ pub(crate) unsafe fn service_sec_image(
                     == Some(nt_syscall_abi::NativeAlpcService::ConnectPort)
                 {
                     handled = true;
+                    print_str(b"[native-alpc-connect-ingress] badge=");
+                    print_u64(badge);
+                    print_str(b" tcb=0x");
+                    print_hex_u64(event_runtime.tcb);
+                    print_str(b" flags=0x");
+                    print_hex_u64(argv[4]);
+                    print_str(b"\n");
                     match crate::native_alpc_connect_accept_work::begin_connect(&mut nt_handler,
                         [argv[0], argv[1], argv[2], argv[3], argv[4], argv[5], argv[6],
                             argv[7], argv[8], argv[9], argv[10]]) {
-                        Err(status) => result = status as u64,
+                        Err(status) => {
+                            print_str(b"[native-alpc-connect-begin] rejected status=0x");
+                            print_hex_u64(status as u64);
+                            print_str(b"\n");
+                            result = status as u64;
+                        }
                         Ok(()) => {
+                            print_str(b"[native-alpc-connect-begin] retained\n");
                             thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
                             {
                                 let _message = crate::ipc_message::SavedMessageBuffer::capture();
                                 crate::native_alpc_connect_accept_work::redrive(&mut nt_handler);
                             }
+                            print_str(b"[native-alpc-connect-begin] redrove\n");
                             let _ = finalize_service_loop_state(&mut nt_handler);
                             let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                             let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
@@ -18645,6 +18819,21 @@ pub(crate) unsafe fn service_sec_image(
             // restart without IPC register fanout. NtContinue already bypassed this tail.
             let len = 1;
             let r0 = result;
+            let trace_csrss_resume_reply = native_call_transport && badge == 29 && m0 == 214;
+            if trace_csrss_resume_reply {
+                if CSRSS_RESUME_REPLIES.fetch_add(1, Ordering::Relaxed) == 1 {
+                    CSRSS_POST_RESUME_TCB.store(event_runtime.tcb, Ordering::Relaxed);
+                }
+                print_str(b"[csrss-resume-reply] handoff badge=");
+                print_u64(badge);
+                print_str(b" tcb=0x");
+                print_hex_u64(event_runtime.tcb);
+                print_str(b" reply=0x");
+                print_hex_u64(reply_main);
+                print_str(b" status=0x");
+                print_hex_u64(r0);
+                print_str(b"\n");
+            }
             let ((nb, nmi, nm0, nm1, nm2, nm3), native_reply_delivered) = if redirected_user_control {
                 let restarted = win32k_glue::restart_staged_user_callback_context(
                     win32k_glue::StagedUserCallbackContext::installed(event_runtime.tcb),
@@ -18679,6 +18868,17 @@ pub(crate) unsafe fn service_sec_image(
                     (received, delivered)
                 }
             };
+            if trace_csrss_resume_reply {
+                print_str(b"[csrss-resume-reply] received badge=");
+                print_u64(nb);
+                print_str(b" delivered=");
+                print_u64(native_reply_delivered as u64);
+                print_str(b" label=0x");
+                print_hex_u64(nmi);
+                print_str(b" m0=0x");
+                print_hex_u64(nm0);
+                print_str(b"\n");
+            }
             if let Some(status) = native_load_reply_status {
                 // The checked reply path consumed the bound Reply object before returning. The
                 // combined path reserves one impossible receive badge to report a send-half failure

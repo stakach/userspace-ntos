@@ -378,6 +378,8 @@ mod hosted_kernel_win32k_source_ioctl;
 mod hosted_source_terminal_packet;
 #[path = "hosted_video_caller_aperture.rs"]
 mod hosted_video_caller_aperture;
+#[path = "hosted_video_pool_map.rs"]
+mod hosted_video_pool_map;
 #[path = "hosted_video_memory_mapping.rs"]
 mod hosted_video_memory_mapping;
 #[path = "hosted_kernel_win32k_source_pnp.rs"]
@@ -3084,62 +3086,12 @@ pub(crate) unsafe fn pool_alloc(size: u64) -> u64 {
         print_u64(size);
         print_str(b"\n");
     }
-    // first-fit the free list
-    let head_slot = (FSD_POOL_VADDR + 8) as *mut u64;
-    let mut prev = head_slot;
-    let mut cur = read_volatile(head_slot);
-    let mut steps = 0u64;
-    while cur != 0 {
-        if steps >= POOL_FREE_LIST_MAX {
-            if FSD_POOL_LIST_CYCLES.fetch_add(1, Ordering::Relaxed) == 0 {
-                print_str(b"[fsd-host] POOL FREE-LIST CYCLE -> bump path\n");
-            }
-            break;
-        }
-        steps += 1;
-        let Some(cap) = component_pool_allocation_capacity(cur) else {
-            break;
-        };
-        if cap >= size {
-            let Some(generation) = next_component_pool_generation(FSD_POOL_VADDR) else {
-                return 0;
-            };
-            let next = read_volatile((cur - 8) as *const u64);
-            write_volatile(prev, next);
-            write_volatile((cur - 8) as *mut u64, generation);
-            return cur;
-        }
-        prev = (cur - 8) as *mut u64;
-        cur = read_volatile((cur - 8) as *const u64);
-    }
-    // bump
-    let mut off = hosted_pool_used(FSD_POOL_VADDR);
-    if off < POOL_DATA_OFF {
-        off = POOL_DATA_OFF;
-    }
-    if off > FSD_POOL_FRAMES * 0x1000 {
-        return 0;
-    }
-    // 16-byte header + 16-align the returned block
-    let Some(hdr) = FSD_POOL_VADDR.checked_add(off).and_then(|at| at.checked_add(15))
-        .map(|at| at & !15)
-    else {
-        return 0;
-    };
-    let Some(block) = hdr.checked_add(16) else { return 0; };
-    let cap = FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000;
-    if size == 0 || block.checked_add(size).is_none_or(|end| end > cap) {
+    let Some(block) = hosted_pool_alloc_locked(FSD_POOL_VADDR, size) else {
         print_str(b"[fsd-host] POOL EXHAUSTED size=0x");
         print_hex(size as u32);
         print_str(b"\n");
         return 0;
-    }
-    let Some(generation) = next_component_pool_generation(FSD_POOL_VADDR) else {
-        return 0;
     };
-    write_volatile((block - 16) as *mut u64, size); // capacity header
-    write_volatile((block - 8) as *mut u64, generation);
-    hosted_pool_publish_used(FSD_POOL_VADDR, (block + size) - FSD_POOL_VADDR);
     block
 }
 
@@ -4255,12 +4207,18 @@ unsafe fn hosted_instance_pool_alloc(inst: DriverInstance, size: u64) -> Option<
         return None;
     }
     let _guard = hosted_instance_pool_lock(inst.exec_pool_va)?;
-    let pool_bytes = FSD_POOL_FRAMES.checked_mul(0x1000)?;
-    let exec_pool_end = inst.exec_pool_va.checked_add(pool_bytes)?;
-    let component_pool_end = component_pool_end();
-    let head_slot_exec = inst.exec_pool_va.checked_add(8)?;
-    let mut prev_next_slot_exec = head_slot_exec;
-    let mut cur = read_volatile(head_slot_exec as *const u64);
+    hosted_pool_alloc_locked(inst.exec_pool_va, size)
+}
+
+/// Both address-space views use the same header chain and alignment rule. Large allocations
+/// reserve complete payload pages; the padding before their header remains a real free block.
+unsafe fn hosted_pool_alloc_locked(pool_view_base: u64, size: u64) -> Option<u64> {
+    if pool_view_base == 0 || size == 0 { return None; }
+    const PAGE_ALIGNED_MIN: u64 = 0x10000;
+    let large = size >= PAGE_ALIGNED_MIN;
+    let head_slot = pool_view_base.checked_add(8)?;
+    let mut prev_next_slot = head_slot;
+    let mut cur = read_volatile(head_slot as *const u64);
     let mut steps = 0u64;
     while cur != 0 {
         if steps >= POOL_FREE_LIST_MAX {
@@ -4268,43 +4226,39 @@ unsafe fn hosted_instance_pool_alloc(inst: DriverInstance, size: u64) -> Option<
             break;
         }
         steps += 1;
-        let Some((cur_exec, cap)) = hosted_pool_allocation_exec_range(inst.exec_pool_va, cur)
+        let Some((cur_view, cap)) = hosted_pool_allocation_exec_range(pool_view_base, cur)
         else {
             break;
         };
-        if cur_exec < inst.exec_pool_va + 16 || cur_exec >= exec_pool_end {
-            break;
-        }
-        let next = read_volatile((cur_exec - 8) as *const u64);
-        if cap >= size {
-            let generation = next_component_pool_generation(inst.exec_pool_va)?;
-            write_volatile(prev_next_slot_exec as *mut u64, next);
-            write_volatile((cur_exec - 8) as *mut u64, generation);
+        let next = read_volatile((cur_view - 8) as *const u64);
+        if cap >= size && (!large || (cur & 0xfff == 0 && cap & 0xfff == 0)) {
+            let generation = next_component_pool_generation(pool_view_base)?;
+            write_volatile(prev_next_slot as *mut u64, next);
+            write_volatile((cur_view - 8) as *mut u64, generation);
             return Some(cur);
         }
-        prev_next_slot_exec = cur_exec - 8;
+        prev_next_slot = cur_view - 8;
         cur = next;
     }
-
-    let mut off = hosted_pool_used(inst.exec_pool_va);
+    let mut off = hosted_pool_used(pool_view_base);
     if off < POOL_DATA_OFF {
         off = POOL_DATA_OFF;
     }
-    let hdr = FSD_POOL_VADDR.checked_add(off)?.checked_add(15)? & !15;
-    let block = hdr.checked_add(16)?;
-    let end = block.checked_add(size)?;
-    if end > component_pool_end {
-        return None;
+    let plan = nt_io_manager::hosted_pool_range::plan_hosted_pool_bump(
+        off, size, FSD_POOL_FRAMES * 0x1000, large,
+    )?;
+    let generation = next_component_pool_generation(pool_view_base)?;
+    if let Some(padding) = plan.padding {
+        let pad_view = pool_view_base.checked_add(padding.base)?;
+        write_volatile((pad_view - 16) as *mut u64, padding.capacity);
+        write_volatile((pad_view - 8) as *mut u64, read_volatile(head_slot as *const u64));
+        write_volatile(head_slot as *mut u64, FSD_POOL_VADDR + padding.base);
     }
-    let block_exec = inst.exec_pool_va.checked_add(block - FSD_POOL_VADDR)?;
-    if block_exec < inst.exec_pool_va + 16 || block_exec >= exec_pool_end {
-        return None;
-    }
-    let generation = next_component_pool_generation(inst.exec_pool_va)?;
-    write_volatile((block_exec - 16) as *mut u64, size);
-    write_volatile((block_exec - 8) as *mut u64, generation);
-    hosted_pool_publish_used(inst.exec_pool_va, end - FSD_POOL_VADDR);
-    Some(block)
+    let block_view = pool_view_base.checked_add(plan.payload)?;
+    write_volatile((block_view - 16) as *mut u64, plan.capacity);
+    write_volatile((block_view - 8) as *mut u64, generation);
+    hosted_pool_publish_used(pool_view_base, plan.used);
+    Some(FSD_POOL_VADDR + plan.payload)
 }
 
 unsafe fn hosted_instance_pool_free_unlocked(inst: DriverInstance, p: u64) -> bool {

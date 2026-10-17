@@ -8,6 +8,10 @@
 #![no_std]
 
 pub mod caller_aperture;
+pub mod caller_pool_map;
+pub mod dirty_rect;
+#[cfg(test)]
+mod caller_pool_map_tests;
 pub mod caller_memory;
 mod child_ids;
 pub mod mode_evidence;

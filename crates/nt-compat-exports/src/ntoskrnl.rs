@@ -79,6 +79,12 @@ pub const NTOSKRNL: &[ExportDescriptor] = &[
         Partial,
         "component/level filter ignored; same format limits as DbgPrint",
     ),
+    // --- dispatcher synchronization ---
+    e("KeInitializeMutex", Partial, "caller-owned KMUTEX header with generation-bound provider ownership"),
+    e("KeReleaseMutex", Partial, "owner-checked recursive KMUTEX release and dispatcher wake"),
+    e("KeInitializeSemaphore", Partial, "caller-owned KSEMAPHORE header with bounded count"),
+    e("KeReleaseSemaphore", Partial, "bounded count update and dispatcher wake"),
+    e("RtlAssert", Implemented, "captures native assertion fields and terminates the provider"),
     // --- events (partial: local state, no real wait/wakeup) ---
     e(
         "KeInitializeEvent",

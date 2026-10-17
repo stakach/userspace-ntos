@@ -129,6 +129,16 @@ impl ContiguousRamProjectedMapping {
         (offset.checked_add(length)? <= self.length).then(|| self.virtual_start + offset)
     }
 
+    /// Resolve an interior CPU-visible span only through this live consumer's projection.
+    /// A numeric VA in the resource aperture does not by itself establish ownership.
+    pub fn physical_range(self, consumer: ContiguousRamOwner, address: u64,
+        length: u64) -> Option<u64> {
+        if !self.live || consumer != self.consumer || length == 0 { return None; }
+        let offset = address.checked_sub(self.virtual_start)?;
+        if offset.checked_add(length)? > self.length { return None; }
+        self.physical_start.checked_add(offset)
+    }
+
     pub fn retire(&mut self, consumer: ContiguousRamOwner) -> Result<(), ContiguousRamError> {
         if consumer != self.consumer { return Err(ContiguousRamError::WrongOwner); }
         self.live = false;
@@ -508,5 +518,32 @@ impl ContiguousRamReceipt {
     pub fn can_release(&self, owner: ContiguousRamOwner) -> bool {
         self.owner == owner && !self.uncertain && !self.map_in_flight && self.next_map == 0
             && !self.published
+    }
+}
+
+#[cfg(test)]
+mod projected_video_range_tests {
+    use super::*;
+
+    #[test]
+    fn projected_shadow_range_requires_exact_live_consumer_and_extent() {
+        let producer = ContiguousRamOwner { instance: 6, generation: 17, domain: 61 };
+        let consumer = ContiguousRamOwner { instance: 7, generation: 19, domain: 71 };
+        let source = ContiguousRamPublishedMapping::new(
+            producer, 0x0000_0103_0000_0000, 0x8000_0000, 36 << 20, 0,
+        ).unwrap();
+        let mut projection = ContiguousRamProjectedMapping::new(
+            source, producer, consumer, 0x0000_0100_1780_0000,
+            0x8000_0000, 36 << 20, 0,
+        ).unwrap();
+        let shadow = 0x0000_0100_17b0_0000;
+        assert_eq!(projection.physical_range(consumer, shadow, 3 << 20), Some(0x8030_0000));
+        assert_eq!(projection.physical_range(consumer, shadow, 34 << 20), None);
+        assert_eq!(projection.physical_range(consumer, shadow - 1, 1), Some(0x802f_ffff));
+        assert_eq!(projection.physical_range(consumer, shadow, 0), None);
+        let stale = ContiguousRamOwner { generation: 20, ..consumer };
+        assert_eq!(projection.physical_range(stale, shadow, 3 << 20), None);
+        projection.retire(consumer).unwrap();
+        assert_eq!(projection.physical_range(consumer, shadow, 3 << 20), None);
     }
 }
