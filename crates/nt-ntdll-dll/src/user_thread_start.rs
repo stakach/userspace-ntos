@@ -108,29 +108,52 @@ unsafe fn resolve_kernel32_thunk() -> Result<Option<ThreadInitThunk>, u32> {
     Ok(Some(unsafe { core::mem::transmute(address) }))
 }
 
-/// `RtlUserThreadStart(PVOID StartAddress, PVOID Parameter)` on x64.
+/// NT5/ReactOS `BaseInitializeContext` starts a fresh x64 thread at `StackBase`, which is
+/// 16-byte aligned and has no return address. Rust's Windows ABI expects an entry RSP of 8 mod
+/// 16. Supply that initial return slot without changing the caller's captured CONTEXT or its
+/// RCX/RDX startup arguments. An ordinary call already has the correct entry alignment.
 ///
 /// # Safety
-/// Invoked by the loader with a valid thread start address and parameter.
+/// Entered with a writable user stack and valid thread startup arguments.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
 #[export_name = "RtlUserThreadStart"]
 pub unsafe extern "system" fn rtl_user_thread_start(
+    _start_address: *mut c_void,
+    _parameter: *mut c_void,
+) {
+    core::arch::naked_asm!(
+        "test rsp, 8",
+        "jnz 2f",
+        "sub rsp, 8",
+        "mov qword ptr [rsp], 0",
+        "2:",
+        "jmp {body}",
+        body = sym rtl_user_thread_start_body,
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+unsafe extern "system" fn rtl_user_thread_start_body(
     start_address: *mut c_void,
     parameter: *mut c_void,
 ) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        // SAFETY: the loader established its module table before entering a user thread.
-        let status = match unsafe { resolve_kernel32_thunk() } {
-            Ok(thunk) => unsafe { invoke_start(start_address, parameter, thunk) },
-            Err(status) => status,
-        };
-        // SAFETY: the released thread gateway always exits through RtlExitUserThread.
-        unsafe { crate::exports::rtl_exit_user_thread(status) };
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = (start_address, parameter);
-    }
+    // SAFETY: the loader established its module table before entering a user thread.
+    let status = match unsafe { resolve_kernel32_thunk() } {
+        Ok(thunk) => unsafe { invoke_start(start_address, parameter, thunk) },
+        Err(status) => status,
+    };
+    // SAFETY: the released thread gateway always exits through RtlExitUserThread.
+    unsafe { crate::exports::rtl_exit_user_thread(status) };
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[export_name = "RtlUserThreadStart"]
+pub unsafe extern "system" fn rtl_user_thread_start(
+    _start_address: *mut c_void,
+    _parameter: *mut c_void,
+) {
 }
 
 #[used]
@@ -184,4 +207,5 @@ mod tests {
         assert_eq!(THUNK_CALLS.load(Ordering::SeqCst), 1);
         assert_eq!(START_CALLS.load(Ordering::SeqCst), 1);
     }
+
 }
