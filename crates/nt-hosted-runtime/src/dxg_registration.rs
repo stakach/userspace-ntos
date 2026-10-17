@@ -221,6 +221,9 @@ pub enum DxgDdiSignature {
     RemoveDevice,
     QueryChildRelations,
     QueryAdapterInfo,
+    GetStandardAllocationDriverData,
+    CreateAllocation,
+    DestroyAllocation,
     CreateDevice,
     DestroyDevice,
     CreateContext,
@@ -243,6 +246,9 @@ impl DxgDdiSignature {
             0x40 => Some(Self::QueryChildRelations),
             0x88 => Some(Self::QueryAdapterInfo),
             0x90 => Some(Self::CreateDevice),
+            0x98 => Some(Self::CreateAllocation),
+            0xa0 => Some(Self::DestroyAllocation),
+            0xb0 => Some(Self::GetStandardAllocationDriverData),
             0x190 => Some(Self::DestroyDevice),
             0x1d0 => Some(Self::CreateContext),
             0x1d8 => Some(Self::DestroyContext),
@@ -260,12 +266,124 @@ impl DxgDdiSignature {
             Self::QueryChildRelations => 3,
             Self::GetNodeMetadata => 3,
             Self::QueryAdapterInfo => 2,
-            Self::CreateDevice | Self::CreateContext => 2,
+            Self::CreateDevice | Self::CreateContext | Self::CreateAllocation
+            | Self::DestroyAllocation
+            | Self::GetStandardAllocationDriverData => 2,
             Self::DestroyDevice | Self::DestroyContext => 1,
             Self::CreateProcess | Self::DestroyProcess => 2,
             Self::StopDevice | Self::RemoveDevice => 1,
         }
     }
+}
+
+/// Pinned LiberNT x64 DXGKARG_CREATEALLOCATION and one DXGK_ALLOCATIONINFO.
+/// This is the first shared-primary allocation path; multiple allocations or
+/// an existing resource require distinct cookie ownership before admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgCreateAllocationLayout {
+    info: u64,
+    private: (u64, u32),
+    allocation_private: (u64, u32),
+    private_offset: u64,
+    allocation_private_offset: u64,
+    marshal_bytes: u64,
+}
+
+impl DxgCreateAllocationLayout {
+    const REQUEST_BYTES: u64 = 0x28;
+    const INFO_BYTES: u64 = 0x58;
+    const PRIVATE_MAX: u32 = 0x1_0000;
+
+    pub fn parse(version: u32, request_address: u64, request: &[u8],
+        info: &[u8], marshal_capacity: u64) -> Option<Self>
+    {
+        if DxgInitializationData::required_prefix_len(version).is_none()
+            || request.len() < Self::REQUEST_BYTES as usize
+            || info.len() < Self::INFO_BYTES as usize
+            || request_address == 0
+            || u32::from_le_bytes(request[12..16].try_into().ok()?) != 1
+            || u32::from_le_bytes(request[32..36].try_into().ok()?) != 1
+            || u64::from_le_bytes(request[24..32].try_into().ok()?) != 0
+            || u64::from_le_bytes(info[0x38..0x40].try_into().ok()?) != 0
+            || u64::from_le_bytes(info[0x48..0x50].try_into().ok()?) != 0
+        { return None; }
+        let info_address = u64::from_le_bytes(request[16..24].try_into().ok()?);
+        let private = (u64::from_le_bytes(request[..8].try_into().ok()?),
+            u32::from_le_bytes(request[8..12].try_into().ok()?));
+        let allocation_private = (u64::from_le_bytes(info[..8].try_into().ok()?),
+            u32::from_le_bytes(info[8..12].try_into().ok()?));
+        if info_address == 0
+            || [(private.0, private.1), (allocation_private.0, allocation_private.1)]
+                .iter().any(|(address, bytes)| (*address == 0) != (*bytes == 0)
+                    || *bytes > Self::PRIVATE_MAX)
+        { return None; }
+        let regions = [
+            (request_address, Self::REQUEST_BYTES),
+            (info_address, Self::INFO_BYTES),
+            (private.0, private.1 as u64),
+            (allocation_private.0, allocation_private.1 as u64),
+        ];
+        for (index, (address, bytes)) in regions.iter().copied().enumerate() {
+            if address.checked_add(bytes).is_none() { return None; }
+            for (other, other_bytes) in regions[..index].iter().copied() {
+                if !dxg_query_output_regions_disjoint(address, bytes, other, other_bytes) {
+                    return None;
+                }
+            }
+        }
+        let private_offset = (Self::REQUEST_BYTES + Self::INFO_BYTES + 7) & !7;
+        let allocation_private_offset = private_offset
+            .checked_add(private.1 as u64)?.checked_add(7)? & !7;
+        let marshal_bytes = allocation_private_offset
+            .checked_add(allocation_private.1 as u64)?;
+        if marshal_bytes > marshal_capacity { return None; }
+        Some(Self { info: info_address, private, allocation_private,
+            private_offset, allocation_private_offset, marshal_bytes })
+    }
+
+    pub const fn request_bytes(self) -> u64 { Self::REQUEST_BYTES }
+    pub const fn info_bytes(self) -> u64 { Self::INFO_BYTES }
+    pub const fn info_offset(self) -> u64 { Self::REQUEST_BYTES }
+    pub const fn info_address(self) -> u64 { self.info }
+    pub const fn private_driver_data(self) -> (u64, u32) { self.allocation_private }
+    pub const fn allocation_count(self) -> u32 { 1 }
+    pub const fn request_private(self) -> (u64, u32) { self.private }
+    pub const fn private_offset(self) -> u64 { self.private_offset }
+    pub const fn allocation_private_offset(self) -> u64 { self.allocation_private_offset }
+    pub const fn marshal_bytes(self) -> u64 { self.marshal_bytes }
+}
+
+/// Pinned x64 DXGKARG_DESTROYALLOCATION with one immutable KMD cookie list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgDestroyAllocationLayout {
+    list: u64,
+    cookie: u64,
+}
+
+impl DxgDestroyAllocationLayout {
+    pub fn parse(version: u32, request_address: u64,
+        request: &[u8], cookie: u64, marshal_capacity: u64) -> Option<Self>
+    {
+        if DxgInitializationData::required_prefix_len(version).is_none()
+            || request.len() < 0x20 || marshal_capacity < 0x28
+            || request_address == 0 || cookie == 0
+            || u32::from_le_bytes(request[..4].try_into().ok()?) != 1
+            || u64::from_le_bytes(request[16..24].try_into().ok()?) != 0
+            || u32::from_le_bytes(request[24..28].try_into().ok()?) != 1
+        { return None; }
+        let list = u64::from_le_bytes(request[8..16].try_into().ok()?);
+        if list == 0 || !dxg_query_output_regions_disjoint(
+            request_address, 0x20, list, 8) {
+            return None;
+        }
+        Some(Self { list, cookie })
+    }
+
+    pub const fn request_bytes(self) -> u64 { 0x20 }
+    pub const fn list_bytes(self) -> u64 { 8 }
+    pub const fn list_address(self) -> u64 { self.list }
+    pub const fn cookie(self) -> u64 { self.cookie }
+    pub const fn marshal_bytes(self) -> u64 { 0x28 }
 }
 
 /// Pinned x64 WDDM system-context request. A private-data pointer requires
@@ -326,6 +444,100 @@ impl DxgCreateDeviceLayout {
     pub fn copyback_device(self, output: &mut [u8], kmd_device: u64) -> bool {
         if output.len() < 0x20 || kmd_device == 0 { return false; }
         output[..8].copy_from_slice(&kmd_device.to_le_bytes());
+        true
+    }
+}
+
+/// Pinned LiberNT x64 DXGKARG_GETSTANDARDALLOCATIONDRIVERDATA. The first
+/// call reports private-data sizes; the second supplies bounded buffers.
+/// Only the shared-primary and shadow surfaces used by adapter startup are
+/// admitted. All caller buffers must be distinct before separate projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgStandardAllocationLayout {
+    kind: u32,
+    surface: u64,
+    surface_bytes: u64,
+    allocation: (u64, u32),
+    resource: (u64, u32),
+    allocation_offset: u64,
+    resource_offset: u64,
+    marshal_bytes: u64,
+}
+
+impl DxgStandardAllocationLayout {
+    const REQUEST_BYTES: u64 = 0x30;
+    const PRIVATE_MAX: u32 = 0x1_0000;
+
+    pub fn parse(version: u32, request: &[u8], marshal_capacity: u64) -> Option<Self> {
+        if DxgInitializationData::required_prefix_len(version).is_none()
+            || request.len() < Self::REQUEST_BYTES as usize
+            || request[4..8] != [0; 4]
+            || request[0x1c..0x20] != [0; 4]
+        { return None; }
+        let kind = u32::from_le_bytes(request[..4].try_into().ok()?);
+        let surface_bytes = match kind { 1 => 0x18, 2 => 0x10, _ => return None };
+        let surface = u64::from_le_bytes(request[8..16].try_into().ok()?);
+        let allocation = (
+            u64::from_le_bytes(request[0x10..0x18].try_into().ok()?),
+            u32::from_le_bytes(request[0x18..0x1c].try_into().ok()?),
+        );
+        let resource = (
+            u64::from_le_bytes(request[0x20..0x28].try_into().ok()?),
+            u32::from_le_bytes(request[0x28..0x2c].try_into().ok()?),
+        );
+        if surface == 0 || surface.checked_add(surface_bytes).is_none()
+            || [allocation, resource].iter().any(|(address, bytes)|
+                (*address == 0) != (*bytes == 0) || *bytes > Self::PRIVATE_MAX
+                    || address.checked_add(*bytes as u64).is_none())
+            || !Self::disjoint(surface, surface_bytes, allocation.0, allocation.1 as u64)
+            || !Self::disjoint(surface, surface_bytes, resource.0, resource.1 as u64)
+            || !Self::disjoint(allocation.0, allocation.1 as u64,
+                resource.0, resource.1 as u64)
+        { return None; }
+        let surface_end = Self::REQUEST_BYTES.checked_add(surface_bytes)?;
+        let allocation_offset = surface_end.checked_add(7)? & !7;
+        let resource_offset = allocation_offset.checked_add(allocation.1 as u64)?
+            .checked_add(7)? & !7;
+        let marshal_bytes = resource_offset.checked_add(resource.1 as u64)?;
+        if marshal_bytes > marshal_capacity { return None; }
+        Some(Self { kind, surface, surface_bytes, allocation, resource,
+            allocation_offset, resource_offset, marshal_bytes })
+    }
+
+    const fn disjoint(a: u64, a_bytes: u64, b: u64, b_bytes: u64) -> bool {
+        if a_bytes == 0 || b_bytes == 0 { return true; }
+        let Some(a_end) = a.checked_add(a_bytes) else { return false; };
+        let Some(b_end) = b.checked_add(b_bytes) else { return false; };
+        a_end <= b || b_end <= a
+    }
+
+    pub const fn kind(self) -> u32 { self.kind }
+    pub const fn surface_address(self) -> u64 { self.surface }
+    pub const fn surface_bytes(self) -> u64 { self.surface_bytes }
+    pub const fn allocation_private(self) -> (u64, u32) { self.allocation }
+    pub const fn resource_private(self) -> (u64, u32) { self.resource }
+    pub const fn request_bytes(self) -> u64 { Self::REQUEST_BYTES }
+    pub const fn surface_offset(self) -> u64 { Self::REQUEST_BYTES }
+    pub const fn allocation_offset(self) -> u64 { self.allocation_offset }
+    pub const fn resource_offset(self) -> u64 { self.resource_offset }
+    pub const fn marshal_bytes(self) -> u64 { self.marshal_bytes }
+
+    /// Preserve all pointers and inputs; only the two required-size fields
+    /// may flow back to the provider after the miniport returns.
+    pub fn copyback_sizes(self, provider: &mut [u8], returned: &[u8]) -> bool {
+        if provider.len() < Self::REQUEST_BYTES as usize
+            || returned.len() < Self::REQUEST_BYTES as usize
+            || provider[..0x18] != returned[..0x18]
+            || provider[0x1c..0x28] != returned[0x1c..0x28]
+            || provider[0x2c..0x30] != returned[0x2c..0x30]
+        { return false; }
+        let allocation_size = u32::from_le_bytes(returned[0x18..0x1c].try_into().unwrap());
+        let resource_size = u32::from_le_bytes(returned[0x28..0x2c].try_into().unwrap());
+        if allocation_size > Self::PRIVATE_MAX || resource_size > Self::PRIVATE_MAX {
+            return false;
+        }
+        provider[0x18..0x1c].copy_from_slice(&returned[0x18..0x1c]);
+        provider[0x28..0x2c].copy_from_slice(&returned[0x28..0x2c]);
         true
     }
 }
@@ -657,6 +869,41 @@ pub struct DxgDeviceAliasKey {
     device_generation: u64,
 }
 
+/// A real miniport allocation cookie belongs to one started adapter context
+/// and one exact dependent pool allocation generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgAllocationAliasKey {
+    adapter: DxgPdoAliasAuthority,
+    adapter_context: u64,
+    adapter_generation: u64,
+    kmd_allocation: u64,
+    allocation_generation: u64,
+}
+
+impl DxgAllocationAliasKey {
+    pub const fn new(adapter: DxgPdoAliasAuthority,
+        adapter_context: u64, adapter_generation: u64,
+        kmd_allocation: u64, allocation_generation: u64) -> Option<Self>
+    {
+        if adapter_context == 0 || adapter_generation == 0
+            || kmd_allocation == 0 || allocation_generation == 0
+        { return None; }
+        Some(Self { adapter, adapter_context, adapter_generation,
+            kmd_allocation, allocation_generation })
+    }
+
+    pub fn matches_destroy(self, adapter: DxgPdoAliasAuthority,
+        kmd_allocation: u64, allocation_generation: u64) -> bool
+    {
+        self.adapter == adapter && self.kmd_allocation == kmd_allocation
+            && self.allocation_generation == allocation_generation
+    }
+
+    pub const fn cookie_address_conflicts(self, other: Self) -> bool {
+        self.kmd_allocation == other.kmd_allocation
+    }
+}
+
 impl DxgDeviceAliasKey {
     pub const fn new(adapter: DxgPdoAliasAuthority,
         adapter_context: u64, adapter_generation: u64,
@@ -858,6 +1105,92 @@ impl DxgDeviceCookieRetirement {
         if self.free_requested || !self.callback_interval_open || self.completed
             || self.key != key || self.route != route
             || address != self.key.kmd_device || generation != self.key.device_generation
+        { return false; }
+        self.free_requested = true;
+        true
+    }
+
+    pub const fn free_requested(self) -> bool { self.free_requested }
+    pub fn close_callback_interval(&mut self) { self.callback_interval_open = false; }
+
+    pub fn complete(&mut self, callback_completed: bool, reply_acknowledged: bool) -> bool {
+        if !self.free_requested || self.callback_interval_open || self.completed
+            || !callback_completed || !reply_acknowledged
+        { return false; }
+        self.completed = true;
+        true
+    }
+
+    pub fn release_without_free(&mut self,
+        callback_completed: bool, reply_acknowledged: bool) -> bool
+    {
+        if self.free_requested || self.callback_interval_open || self.completed
+            || !callback_completed || !reply_acknowledged
+        { return false; }
+        self.completed = true;
+        true
+    }
+}
+
+/// A DestroyAllocation free is escrowed under its exact callback route until
+/// the miniport's callback and retained Reply both finish.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgAllocationCookieRetirement {
+    key: DxgAllocationAliasKey,
+    route: DxgProcessFreeRoute,
+    free_requested: bool,
+    callback_interval_open: bool,
+    completed: bool,
+}
+
+/// Terminal callback evidence determines whether a provisional allocation
+/// owner can be released, retried, published, or permanently fenced.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DxgAllocationCallbackDisposition {
+    ReleaseProvisional,
+    RetryWithCookie,
+    Publish,
+    RetireCookie,
+    Retain,
+}
+
+impl DxgAllocationCallbackDisposition {
+    pub const fn create(terminal_ack: bool, status: i32, returned_cookie: u64) -> Self {
+        if !terminal_ack { return Self::Retain; }
+        if status < 0 {
+            if returned_cookie == 0 { Self::ReleaseProvisional } else { Self::Retain }
+        } else if returned_cookie != 0 {
+            Self::Publish
+        } else {
+            Self::Retain
+        }
+    }
+
+    pub const fn destroy(terminal_ack: bool, status: i32, free_requested: bool) -> Self {
+        if !terminal_ack { return Self::Retain; }
+        if status < 0 {
+            if free_requested { Self::Retain } else { Self::RetryWithCookie }
+        } else if free_requested {
+            Self::RetireCookie
+        } else {
+            Self::Retain
+        }
+    }
+}
+
+impl DxgAllocationCookieRetirement {
+    pub const fn new(key: DxgAllocationAliasKey, route: DxgProcessFreeRoute) -> Option<Self> {
+        Some(Self { key, route, free_requested: false,
+            callback_interval_open: true, completed: false })
+    }
+
+    pub fn request_free(&mut self, key: DxgAllocationAliasKey,
+        route: DxgProcessFreeRoute, address: u64, generation: u64) -> bool
+    {
+        if self.free_requested || !self.callback_interval_open || self.completed
+            || self.key != key || self.route != route
+            || address != self.key.kmd_allocation
+            || generation != self.key.allocation_generation
         { return false; }
         self.free_requested = true;
         true

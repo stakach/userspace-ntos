@@ -27,6 +27,10 @@ mod process;
 mod node_metadata;
 #[path = "hosted_dxg_registration/device.rs"]
 mod device;
+#[path = "hosted_dxg_registration/standard_allocation.rs"]
+mod standard_allocation;
+#[path = "hosted_dxg_registration/allocation.rs"]
+mod allocation;
 
 #[derive(Clone, Copy)]
 struct DxgResolution {
@@ -63,6 +67,8 @@ struct DxgPdoAlias {
     child_relations_output: Option<StartOutputGuard>,
     query_output: Option<DxgQueryOutputGuard>,
     query_nested: Option<DxgQueryOutputGuard>,
+    standard_allocation: Option<standard_allocation::StandardAllocationInFlight>,
+    allocations: Vec<allocation::DxgAllocationAlias>,
     node_metadata_output: Option<DxgQueryOutputGuard>,
     processes: Vec<process::DxgProcessAlias>,
     devices: Vec<device::DxgDeviceAlias>,
@@ -751,6 +757,8 @@ pub(super) unsafe fn service_add_device_callback(
             child_relations_output: None,
             query_output: None,
             query_nested: None,
+            standard_allocation: None,
+            allocations: Vec::new(),
             node_metadata_output: None,
             processes: Vec::new(),
             devices: Vec::new(),
@@ -941,6 +949,7 @@ pub(super) unsafe fn service_stop_device_callback(
             && alias.provider_publication_cookie == record.provider_publication_cookie
             && alias.processes.is_empty()
             && alias.devices.is_empty()
+            && alias.allocations.is_empty()
             && alias.null_process_credits.is_none_or(|credits| credits.count() == 0)
             && nt_hosted_runtime::dxg_stop_device_admitted(
                 alias.start_entered, alias.start_succeeded, alias.start_callback_active,
@@ -1151,6 +1160,48 @@ pub(super) unsafe fn service_query_adapter_info_callback(
     Ok(result)
 }
 
+pub(super) unsafe fn service_standard_allocation_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    marshal_window: HostedProviderMarshalWindow,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    provider_context: u64,
+    provider_request: u64,
+) -> Result<u64, i32> {
+    standard_allocation::query(dispatch, marshal_window, provider_inst, record,
+        dependent_inst, exec_code_va, provider_context, provider_request)
+}
+
+pub(super) unsafe fn service_create_allocation_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    marshal_window: HostedProviderMarshalWindow,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    provider_context: u64,
+    provider_request: u64,
+) -> Result<u64, i32> {
+    allocation::create(dispatch, marshal_window, provider_inst, record,
+        dependent_inst, exec_code_va, provider_context, provider_request)
+}
+
+pub(super) unsafe fn service_destroy_allocation_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    marshal_window: HostedProviderMarshalWindow,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    provider_context: u64,
+    provider_request: u64,
+) -> Result<u64, i32> {
+    allocation::destroy(dispatch, marshal_window, provider_inst, record,
+        dependent_inst, exec_code_va, provider_context, provider_request)
+}
+
 pub(super) unsafe fn service_create_process_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     marshal_window: HostedProviderMarshalWindow,
@@ -1256,6 +1307,19 @@ pub(super) unsafe fn defer_context_cookie_free(
     active_reply_cap: u64,
 ) -> Option<i32> {
     device::context::defer_cookie_free(channel, instance_index, inst, domain,
+        address, caller_badge, active_reply_cap)
+}
+
+pub(super) unsafe fn defer_allocation_cookie_free(
+    channel: &crate::spawn_hosts::PumpChannel,
+    instance_index: usize,
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    address: u64,
+    caller_badge: u64,
+    active_reply_cap: u64,
+) -> Option<i32> {
+    allocation::defer_cookie_free(channel, instance_index, inst, domain,
         address, caller_badge, active_reply_cap)
 }
 
@@ -1569,8 +1633,10 @@ pub(super) unsafe fn retire_pdo_aliases_for_instance(
             index += 1;
             continue;
         }
-        if !pdo_aliases_mut()[index].processes.is_empty()
+        if pdo_aliases_mut()[index].standard_allocation.is_some()
+            || !pdo_aliases_mut()[index].processes.is_empty()
             || !pdo_aliases_mut()[index].devices.is_empty()
+            || !pdo_aliases_mut()[index].allocations.is_empty()
             || pdo_aliases_mut()[index].null_process_credits
                 .is_some_and(|credits| credits.count() != 0)
         {
