@@ -14,6 +14,7 @@ mod dxg_registration;
 mod contiguous_ram;
 mod provider_export_worker;
 mod gop_bar_projection;
+mod hosted_driver_thread_object;
 
 pub use driver_load_receipt::{DriverLoadPhase, RetainedEffectState};
 pub use contiguous_ram::{ContiguousRamError, ContiguousRamLayout, ContiguousRamOwner,
@@ -37,6 +38,8 @@ pub use provider_export_worker::{HostedProviderExportCompletion, HostedProviderW
     select_hosted_cr8_bank, select_hosted_provider_export_worker};
 pub use gop_bar_projection::{GopBarProjection, GopLegacyVgaPortAuthority,
     GopPciBarAuthority};
+pub use hosted_driver_thread_object::{HostedDriverThreadObjectKey,
+    HostedDriverThreadObjectRecord};
 
 pub use hosted_irq_arena::{
     decode_hosted_irq_transport_message, HostedIrqArena, HostedIrqArenaConfig,

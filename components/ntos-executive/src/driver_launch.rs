@@ -14061,6 +14061,9 @@ unsafe fn hosted_dispatcher_ready(object: u64) -> Result<bool, i32> {
     if object == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
+    if let Some(ready) = hosted_thread_resources::wait_ready(object) {
+        return Ok(ready);
+    }
     let object_type = read_unaligned(object as *const u8);
     if object_type == kevent::EVENT_NOTIFICATION_OBJECT
         || object_type == kevent::EVENT_SYNCHRONIZATION_OBJECT
@@ -14088,6 +14091,9 @@ unsafe fn hosted_dispatcher_ready_for(
 }
 
 unsafe fn hosted_dispatcher_consume(object: u64) -> bool {
+    if hosted_thread_resources::wait_ready(object) == Some(true) {
+        return true;
+    }
     let object_type = read_unaligned(object as *const u8);
     if object_type == kevent::EVENT_NOTIFICATION_OBJECT {
         return true;
@@ -14334,6 +14340,7 @@ fn hosted_driver_wait_object_exec_va(
     component_object: u64,
 ) -> Option<u64> {
     component_to_exec_va_for_instance(instance, inst, component_object, 0x20)
+        .or_else(|| unsafe { hosted_thread_resources::wait_body(instance, component_object).map(|body| body.0) })
         .or_else(|| {
             runtime.and_then(|rt| hosted_worker_component_to_exec_va(rt, component_object, 0x20))
         })
@@ -63398,6 +63405,19 @@ pub(crate) fn service_hosted_driver_ke_release_semaphore(
     previous
 }
 
+/// A worker can exit while its creating PsCreateSystemThread reply is still
+/// pending. Once that reply's handle has been delivered or withdrawn, retry
+/// retirement from the exact table exit receipt and wake ETHREAD waiters.
+unsafe fn retry_exited_hosted_system_thread_after_publication(instance: usize, handle: u64) {
+    let exited = (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_TABLES)).as_ref()
+        .and_then(|tables| tables.get(instance))
+        .and_then(|table| table.get(handle))
+        .is_some_and(|thread| thread.exit_status.is_some());
+    if exited && hosted_thread_resources::retire_thread(instance, handle) {
+        let _ = wake_hosted_driver_waiters_for_instance(instance);
+    }
+}
+
 pub(crate) fn service_hosted_driver_ps_create_system_thread(
     ch: &crate::spawn_hosts::PumpChannel,
     start_routine: u64,
@@ -63417,6 +63437,13 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
         HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
         return (STATUS_INVALID_HANDLE, 0);
     }
+    let creator = match unsafe { crate::provider_registry_caller::resolve(ch) } {
+        Ok(caller) => caller,
+        Err(status) => {
+            HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return (status as i32, 0);
+        }
+    };
     let Some(domain) = instance_domain_identity(inst) else {
         HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
         return (STATUS_INVALID_HANDLE, 0);
@@ -63523,11 +63550,37 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
             sched_context: spawn.sched_context,
         });
     }
+    let runtime = unsafe {
+        *hosted_driver_thread_runtimes_mut().last()
+            .expect("newly retained system thread runtime")
+    };
+    let public_handle = match unsafe { hosted_thread_resources::publish_object(runtime, creator) } {
+        Ok(handle) => handle,
+        Err(status) => {
+            unsafe {
+                if hosted_thread_resources::retire(spawn.construction, false) {
+                    hosted_driver_thread_runtimes_mut().pop();
+                    if let Some(table) = hosted_driver_thread_table_mut(instance) {
+                        let _ = table.remove(handle);
+                    }
+                }
+            }
+            HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return (status as i32, 0);
+        }
+    };
     unsafe { hosted_thread_resources::enter_shared(spawn.construction, spawn.reply_cap); }
     let route = match unsafe { hosted_ingress_sources::enroll_system_thread(instance, handle, spawn.reply_cap) } {
         Ok(route) => route,
         Err(_) => {
             // Partial aliases, Reply and physical worker stay with their retained owners.
+            if let Err(status) = unsafe {
+                hosted_thread_resources::withdraw_unreturned_public_handle(runtime, creator, public_handle)
+            } {
+                print_str(b"[driver-thread] retained undelivered handle after enrollment failure status=0x");
+                print_hex(status);
+                print_str(b"\n");
+            }
             HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
             HOSTED_DRIVER_SYSTEM_THREAD_SPAWN_FAILURES.fetch_add(1, Ordering::Relaxed);
             return (STATUS_INSUFFICIENT_RESOURCES, 0);
@@ -63542,10 +63595,31 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
         route, spawn.cnode, spawn.sched_context,
     ) }.is_err() {
         // Resume may have entered. No replay, deletion or Reply reuse is permitted here.
+        if let Err(status) = unsafe {
+            hosted_thread_resources::withdraw_unreturned_public_handle(runtime, creator, public_handle)
+        } {
+            print_str(b"[driver-thread] retained undelivered handle after uncertain start status=0x");
+            print_hex(status);
+            print_str(b"\n");
+        } else {
+            unsafe { retry_exited_hosted_system_thread_after_publication(instance, handle); }
+        }
         HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
         HOSTED_DRIVER_SYSTEM_THREAD_SPAWN_FAILURES.fetch_add(1, Ordering::Relaxed);
         return (STATUS_INSUFFICIENT_RESOURCES, 0);
     }
+    if !unsafe { hosted_thread_resources::deliver_public_handle(runtime, public_handle) } {
+        if let Err(status) = unsafe {
+            hosted_thread_resources::withdraw_unreturned_public_handle(runtime, creator, public_handle)
+        } {
+            print_str(b"[driver-thread] retained undelivered handle after publication mismatch status=0x");
+            print_hex(status);
+            print_str(b"\n");
+        }
+        HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        return (STATUS_INVALID_HANDLE, 0);
+    }
+    unsafe { retry_exited_hosted_system_thread_after_publication(instance, handle); }
     HOSTED_DRIVER_SYSTEM_THREAD_SPAWNS.fetch_add(1, Ordering::Relaxed);
     if request <= 8 {
         print_str(b"[driver-thread] PsCreateSystemThread request inst=");
@@ -63569,7 +63643,7 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
         print_u64(route.badge());
         print_str(b"\n");
     }
-    (STATUS_SUCCESS, handle)
+    (STATUS_SUCCESS, public_handle)
 }
 
 pub(crate) fn service_hosted_source_irp_lifetime(
@@ -63700,7 +63774,9 @@ pub(crate) fn service_hosted_driver_ps_terminate_system_thread(
     unsafe {
         // Stop/retirement owns the nonreturning Call and every installed alias. Even a failed
         // stop remains retained; neither this service nor its pump deletes the active Reply.
-        let _ = hosted_thread_resources::retire_thread(instance, runtime.handle);
+        if hosted_thread_resources::retire_thread(instance, runtime.handle) {
+            let _ = wake_hosted_driver_waiters_for_instance(instance);
+        }
     }
     HOSTED_DRIVER_SYSTEM_THREAD_TERMINATIONS.fetch_add(1, Ordering::Relaxed);
     if request <= 16 {
