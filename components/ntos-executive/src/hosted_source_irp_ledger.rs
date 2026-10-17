@@ -906,6 +906,15 @@ pub(super) fn service(
             let Some(domain) = instance_domain_identity(inst) else {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             };
+            if op == 3 {
+                if let Some(status) = unsafe {
+                    hosted_dxg_registration::defer_process_cookie_free(
+                        ch, instance_index, inst, domain, component_address,
+                        caller_badge, active_reply_cap)
+                } {
+                    return (status, 0, 0);
+                }
+            }
             retire_allocation(instance_index, inst, domain, op, component_address)
         }
         6 => {

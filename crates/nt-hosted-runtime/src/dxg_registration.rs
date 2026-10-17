@@ -221,6 +221,8 @@ pub enum DxgDdiSignature {
     RemoveDevice,
     QueryChildRelations,
     QueryAdapterInfo,
+    CreateProcess,
+    DestroyProcess,
 }
 
 impl DxgDdiSignature {
@@ -235,6 +237,8 @@ impl DxgDdiSignature {
             0x20 => Some(Self::RemoveDevice),
             0x40 => Some(Self::QueryChildRelations),
             0x88 => Some(Self::QueryAdapterInfo),
+            0x300 => Some(Self::CreateProcess),
+            0x308 => Some(Self::DestroyProcess),
             _ => None,
         }
     }
@@ -245,6 +249,7 @@ impl DxgDdiSignature {
             Self::StartDevice => 5,
             Self::QueryChildRelations => 3,
             Self::QueryAdapterInfo => 2,
+            Self::CreateProcess | Self::DestroyProcess => 2,
             Self::StopDevice | Self::RemoveDevice => 1,
         }
     }
@@ -263,6 +268,51 @@ impl DxgChildRelationsLayout {
     }
 
     pub const fn bytes(self) -> u64 { self.bytes }
+}
+
+/// Pinned LiberNT x64 DXGKARG_CREATEPROCESS. WDDM 2.0 has a 0x20-byte
+/// prefix; the published 0x11007 table uses the 0x38-byte WDDM 2.4+ form.
+/// Nested PASID and process-name buffers need separate authority and are not
+/// admitted by this minimal callback projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgCreateProcessLayout {
+    bytes: usize,
+    dxg_process: u64,
+    flags: u32,
+}
+
+impl DxgCreateProcessLayout {
+    pub fn parse(version: u32, request: &[u8], marshal_capacity: u64) -> Option<Self> {
+        let bytes = match version {
+            0x5022 | 0x5023 => 0x20,
+            0x11007 => 0x38,
+            _ => return None,
+        };
+        if request.len() < bytes || marshal_capacity < bytes as u64 { return None; }
+        let dxg_process = u64::from_le_bytes(request[0..8].try_into().ok()?);
+        let kmd_process = u64::from_le_bytes(request[8..16].try_into().ok()?);
+        let flags = u32::from_le_bytes(request[0x10..0x14].try_into().ok()?);
+        let pasid_count = u32::from_le_bytes(request[0x14..0x18].try_into().ok()?);
+        let pasid = u64::from_le_bytes(request[0x18..0x20].try_into().ok()?);
+        if dxg_process == 0 || kmd_process != 0 || flags & !1 != 0
+            || pasid_count != 0 || pasid != 0
+        { return None; }
+        if bytes == 0x38 && request[0x20..0x38].iter().any(|&byte| byte != 0) {
+            return None;
+        }
+        Some(Self { bytes, dxg_process, flags })
+    }
+
+    pub const fn bytes(self) -> usize { self.bytes }
+    pub const fn dxg_process(self) -> u64 { self.dxg_process }
+    pub const fn flags(self) -> u32 { self.flags }
+
+    /// Only hKmdProcess at +8 is an output of the pinned miniport callback.
+    pub fn copyback_kmd_process(self, request: &mut [u8], kmd_process: u64) -> bool {
+        if request.len() < self.bytes { return false; }
+        request[8..16].copy_from_slice(&kmd_process.to_le_bytes());
+        true
+    }
 }
 
 /// The pinned WDDM 2.0 x64 `DXGKARG_QUERYADAPTERINFO` common prefix. Later fields are
@@ -465,6 +515,193 @@ impl DxgPdoAliasAuthority {
             && self.provider_pdo_generation == provider_pdo_generation
             && self.dependent_alias_address == dependent_alias_address
             && self.dependent_alias_generation == dependent_alias_generation
+    }
+}
+
+/// One real miniport process cookie returned across the Dxg provider boundary.
+/// Address reuse is safe only when both process allocations and the started
+/// adapter context still match their publication generations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgProcessAliasKey {
+    adapter: DxgPdoAliasAuthority,
+    adapter_context: u64,
+    adapter_generation: u64,
+    dxg_process: u64,
+    dxg_generation: u64,
+    kmd_process: u64,
+    kmd_generation: u64,
+}
+
+impl DxgProcessAliasKey {
+    pub const fn new(adapter: DxgPdoAliasAuthority,
+        adapter_context: u64, adapter_generation: u64,
+        dxg_process: u64, dxg_generation: u64,
+        kmd_process: u64, kmd_generation: u64) -> Option<Self>
+    {
+        if adapter_context == 0 || adapter_generation == 0
+            || dxg_process == 0 || dxg_generation == 0
+            || (kmd_process == 0) != (kmd_generation == 0)
+        { return None; }
+        Some(Self { adapter, adapter_context, adapter_generation,
+            dxg_process, dxg_generation, kmd_process, kmd_generation })
+    }
+
+    pub fn matches_destroy(self, adapter: DxgPdoAliasAuthority,
+        adapter_context: u64, adapter_generation: u64,
+        kmd_process: u64, kmd_generation: u64) -> bool
+    {
+        self.adapter == adapter && self.adapter_context == adapter_context
+            && self.adapter_generation == adapter_generation
+            && self.kmd_process == kmd_process
+            && self.kmd_generation == kmd_generation
+    }
+
+    pub const fn dxg_process(self) -> u64 { self.dxg_process }
+    pub const fn dxg_generation(self) -> u64 { self.dxg_generation }
+    pub const fn cookie_address_conflicts(self, other: Self) -> bool {
+        self.kmd_process != 0 && self.kmd_process == other.kmd_process
+    }
+}
+
+/// The physical dependent callback route which may request the process
+/// cookie's terminal free. Native code additionally compares the whole live
+/// PeerRoute and current Reply before projecting this identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgProcessFreeRoute {
+    domain_id: u64,
+    domain_cookie: u64,
+    endpoint: u64,
+    badge: u64,
+    domain_generation: u64,
+    tcb: u64,
+}
+
+impl DxgProcessFreeRoute {
+    pub const fn new(domain_id: u64, domain_cookie: u64, endpoint: u64,
+        badge: u64, domain_generation: u64, tcb: u64) -> Option<Self>
+    {
+        if domain_id == 0 || domain_cookie == 0 || endpoint == 0
+            || badge == 0 || domain_generation == 0 || tcb == 0
+        { return None; }
+        Some(Self { domain_id, domain_cookie, endpoint, badge,
+            domain_generation, tcb })
+    }
+}
+
+/// A miniport can free its cookie inside DestroyProcess. Root records that
+/// request but completes the physical pool free only after the callback and
+/// its Reply have both completed, retaining the allocation pin meanwhile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgProcessCookieRetirement {
+    key: DxgProcessAliasKey,
+    route: DxgProcessFreeRoute,
+    free_requested: bool,
+    callback_interval_open: bool,
+    completed: bool,
+}
+
+impl DxgProcessCookieRetirement {
+    pub const fn new(key: DxgProcessAliasKey, route: DxgProcessFreeRoute) -> Option<Self> {
+        if key.kmd_process == 0 { return None; }
+        Some(Self { key, route, free_requested: false,
+            callback_interval_open: true, completed: false })
+    }
+
+    pub fn request_free(&mut self, key: DxgProcessAliasKey, route: DxgProcessFreeRoute,
+        address: u64, generation: u64) -> bool
+    {
+        if self.free_requested || !self.callback_interval_open || self.completed
+            || self.key != key || self.route != route
+            || address != self.key.kmd_process || generation != self.key.kmd_generation
+        { return false; }
+        self.free_requested = true;
+        true
+    }
+
+    pub const fn free_requested(self) -> bool { self.free_requested }
+
+    pub fn close_callback_interval(&mut self) {
+        self.callback_interval_open = false;
+    }
+
+    pub fn complete(&mut self, callback_completed: bool, reply_acknowledged: bool) -> bool {
+        if !self.free_requested || self.callback_interval_open || self.completed
+            || !callback_completed || !reply_acknowledged {
+            return false;
+        }
+        self.completed = true;
+        true
+    }
+
+    /// The miniport retained its own allocation and issued no in-callback
+    /// free. Its completed Destroy ends root's temporary pin authority.
+    pub fn release_without_free(&mut self,
+        callback_completed: bool, reply_acknowledged: bool) -> bool
+    {
+        if self.free_requested || self.callback_interval_open || self.completed
+            || !callback_completed || !reply_acknowledged
+        { return false; }
+        self.completed = true;
+        true
+    }
+}
+
+/// Successful NULL process handles have no per-process miniport identity.
+/// One Destroy(NULL) consumes one adapter-scoped credit after a real callback
+/// completes; a failed or uncertain callback keeps the credit fenced.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgNullProcessCredits {
+    adapter: DxgPdoAliasAuthority,
+    context: u64,
+    generation: u64,
+    count: u64,
+    destroy_entered: bool,
+}
+
+impl DxgNullProcessCredits {
+    pub const fn new(adapter: DxgPdoAliasAuthority,
+        context: u64, generation: u64) -> Option<Self>
+    {
+        if context == 0 || generation == 0 { return None; }
+        Some(Self { adapter, context, generation, count: 0,
+            destroy_entered: false })
+    }
+
+    pub const fn count(self) -> u64 { self.count }
+
+    pub fn record_create(&mut self, adapter: DxgPdoAliasAuthority,
+        context: u64, generation: u64,
+        callback_completed: bool, reply_acknowledged: bool) -> bool
+    {
+        if self.adapter != adapter || self.context != context
+            || self.generation != generation || self.destroy_entered
+            || !callback_completed || !reply_acknowledged
+        { return false; }
+        let Some(next) = self.count.checked_add(1) else { return false; };
+        self.count = next;
+        true
+    }
+
+    pub fn begin_destroy(&mut self, adapter: DxgPdoAliasAuthority,
+        context: u64, generation: u64) -> bool
+    {
+        if self.adapter != adapter || self.context != context
+            || self.generation != generation || self.destroy_entered
+            || self.count == 0
+        { return false; }
+        self.destroy_entered = true;
+        true
+    }
+
+    pub fn finish_destroy(&mut self,
+        callback_succeeded: bool, reply_acknowledged: bool) -> bool
+    {
+        if !self.destroy_entered || !callback_succeeded || !reply_acknowledged {
+            return false;
+        }
+        self.count -= 1;
+        self.destroy_entered = false;
+        true
     }
 }
 

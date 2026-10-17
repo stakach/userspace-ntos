@@ -33956,6 +33956,14 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                             hosted_dxg_registration::service_query_adapter_info_callback(
                                 dispatch, marshal_window, provider_inst, record,
                                 dependent_inst, exec_code_va, arg0, arg1),
+                        Some(nt_hosted_runtime::DxgDdiSignature::CreateProcess) =>
+                            hosted_dxg_registration::service_create_process_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1),
+                        Some(nt_hosted_runtime::DxgDdiSignature::DestroyProcess) =>
+                            hosted_dxg_registration::service_destroy_process_callback(
+                                dispatch, provider_inst, record, dependent_inst,
+                                exec_code_va, arg0, arg1),
                         // Each remaining signature needs its own pointer projection.
                         Some(nt_hosted_runtime::DxgDdiSignature::RemoveDevice)
                         | None => Err(STATUS_NOT_SUPPORTED),

@@ -21,6 +21,9 @@ const DXG_REGISTRATION_IOCTL: u32 = 0x230047;
 const PE_EXECUTE: u32 = 0x2000_0000;
 static NEXT_AUTHORITY_COOKIE: AtomicU64 = AtomicU64::new(1);
 
+#[path = "hosted_dxg_registration/process.rs"]
+mod process;
+
 #[derive(Clone, Copy)]
 struct DxgResolution {
     cookie: u32,
@@ -56,6 +59,8 @@ struct DxgPdoAlias {
     child_relations_output: Option<StartOutputGuard>,
     query_output: Option<DxgQueryOutputGuard>,
     query_nested: Option<DxgQueryOutputGuard>,
+    processes: Vec<process::DxgProcessAlias>,
+    null_process_credits: Option<nt_hosted_runtime::DxgNullProcessCredits>,
     provider_domain: HostedDomainIdentity,
     provider_publication_cookie: u64,
     interface_handle: u64,
@@ -172,6 +177,16 @@ impl StartOutputGuard {
         }
         Ok(())
     }
+
+    /// Complete a miniport-requested cookie free after its Destroy callback
+    /// and retained Reply have both finished. The pin prevents interim reuse.
+    unsafe fn complete_deferred_free(&mut self) -> Result<(), i32> {
+        let pin = self.pin.as_mut().ok_or(STATUS_INVALID_PARAMETER)?;
+        hosted_device_allocations::retire_owned_temporary_pool_allocation(pin)
+            .map_err(|status| status.raw())?;
+        self.pin = None;
+        Ok(())
+    }
 }
 
 impl Drop for StartOutputGuard {
@@ -221,6 +236,16 @@ impl DxgQueryOutputGuard {
                 Ok(())
             }
             Self::Pool(guard) => guard.write_bytes(instance_index, inst, domain, bytes),
+        }
+    }
+
+    unsafe fn live(&self, inst: DriverInstance, domain: HostedDomainIdentity) -> bool {
+        match self {
+            Self::Stack { address, bytes, domain: held } => *held == domain
+                && instance_domain_identity(inst) == Some(domain)
+                && translate_component_range(*address, *bytes, FSD_STACK_VADDR,
+                    FSD_STACK_BYTES, inst.exec_stack_va).is_some(),
+            Self::Pool(guard) => guard.live(inst, domain),
         }
     }
 
@@ -720,6 +745,8 @@ pub(super) unsafe fn service_add_device_callback(
             child_relations_output: None,
             query_output: None,
             query_nested: None,
+            processes: Vec::new(),
+            null_process_credits: None,
             provider_domain: record.provider_domain,
             provider_publication_cookie: record.provider_publication_cookie,
             interface_handle: 0,
@@ -904,6 +931,8 @@ pub(super) unsafe fn service_stop_device_callback(
             && alias.provider_domain == record.provider_domain
             && alias.dependent_domain == record.dependent_domain
             && alias.provider_publication_cookie == record.provider_publication_cookie
+            && alias.processes.is_empty()
+            && alias.null_process_credits.is_none_or(|credits| credits.count() == 0)
             && nt_hosted_runtime::dxg_stop_device_admitted(
                 alias.start_entered, alias.start_succeeded, alias.start_callback_active,
                 alias.blocked, alias.pointer_retired, alias.stop_entered,
@@ -1111,6 +1140,46 @@ pub(super) unsafe fn service_query_adapter_info_callback(
     pdo_aliases_mut()[alias_index].query_output = None;
     pdo_aliases_mut()[alias_index].blocked = false;
     Ok(result)
+}
+
+pub(super) unsafe fn service_create_process_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    marshal_window: HostedProviderMarshalWindow,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    provider_context: u64,
+    provider_request: u64,
+) -> Result<u64, i32> {
+    process::create(dispatch, marshal_window, provider_inst, record,
+        dependent_inst, exec_code_va, provider_context, provider_request)
+}
+
+pub(super) unsafe fn service_destroy_process_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    provider_context: u64,
+    kmd_process: u64,
+) -> Result<u64, i32> {
+    process::destroy(dispatch, provider_inst, record, dependent_inst,
+        exec_code_va, provider_context, kmd_process)
+}
+
+pub(super) unsafe fn defer_process_cookie_free(
+    channel: &crate::spawn_hosts::PumpChannel,
+    instance_index: usize,
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    address: u64,
+    caller_badge: u64,
+    active_reply_cap: u64,
+) -> Option<i32> {
+    process::defer_cookie_free(channel, instance_index, inst, domain,
+        address, caller_badge, active_reply_cap)
 }
 
 /// DxgKrnl's StartDevice frame is provider-owned. A miniport receives copied
@@ -1391,6 +1460,15 @@ pub(super) unsafe fn retire_pdo_aliases_for_instance(
         };
         if hosted_device_allocations::capture_allocation(inst, alias.address()).ok()
             != allocation
+        {
+            pdo_aliases_mut()[index].blocked = true;
+            failures += 1;
+            index += 1;
+            continue;
+        }
+        if !pdo_aliases_mut()[index].processes.is_empty()
+            || pdo_aliases_mut()[index].null_process_credits
+                .is_some_and(|credits| credits.count() != 0)
         {
             pdo_aliases_mut()[index].blocked = true;
             failures += 1;
