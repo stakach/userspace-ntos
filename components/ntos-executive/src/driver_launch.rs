@@ -25,6 +25,9 @@
 mod hosted_irq_broker;
 #[path = "hosted_source_retirement.rs"]
 mod hosted_source_retirement;
+#[path = "hosted_dxg_registration.rs"]
+mod hosted_dxg_registration;
+pub(super) use hosted_dxg_registration::bridge_dxg_registration_entry;
 
 #[path = "hosted_wmi.rs"]
 mod hosted_wmi;
@@ -460,7 +463,7 @@ use nt_dma_manager::{DmaError, DmaManager as HostedDmaManager, DmaOwner};
 use nt_hosted_runtime::{
     classify_hosted_provider_domain, encode_hosted_provider_callback_thunk,
     encode_hosted_provider_import_thunk, hosted_provider_export_marshal_policy,
-    hosted_provider_has_export_marshal_policies, hosted_provider_internal_marshal_policy,
+    hosted_provider_internal_marshal_policy,
     ndis_miniport_characteristics_layout, ndis_protocol_characteristics_layout,
     plan_hosted_driver_image, plan_hosted_provider_import_binding,
     plan_hosted_provider_import_thunk, HostedDriverImagePlanError, HostedIrqGrantIdentity,
@@ -1043,6 +1046,7 @@ const HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT: u8 = 1;
 const HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL: u8 = 2;
 const HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT_TIMER: u8 = 3;
 const HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM: u8 = 4;
+const HOSTED_PROVIDER_CALLBACK_KIND_DXG: u8 = 5;
 const NDIS_MINIPORT_TIMER_DPC_OFFSET_X64: u64 = 0x40;
 const NDIS_MINIPORT_TIMER_FUNCTION_CALLBACK_OFFSET_X64: u64 = 0x80;
 const NDIS_WORK_ITEM_CONTEXT_OFFSET_X64: u64 = 0x00;
@@ -18447,13 +18451,14 @@ const HOSTED_DEP_PATH_MAX: usize = 96;
 const HOSTED_DRIVER_DEP_PATH_PREFIX: &[u8] = crate::installed_layout::DRIVERS_PREFIX;
 const MAX_RAW_IMPORT_DESCRIPTORS: u32 = 256;
 const MAX_LOADED_EXPORT_NAMES: u32 = 1024;
-const HOSTED_EXECUTABLE_THUNK_FRAMES: u64 = 1;
+const HOSTED_EXECUTABLE_THUNK_FRAMES: u64 = 2;
 const HOSTED_EXECUTABLE_THUNK_TABLE_LEN: u64 = HOSTED_EXECUTABLE_THUNK_FRAMES * 0x1000;
 const HOSTED_EXECUTABLE_THUNK_SLOT_COUNT: usize =
     (HOSTED_EXECUTABLE_THUNK_TABLE_LEN / HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN) as usize;
 const HOSTED_THUNK_PURPOSE_PROVIDER_IMPORT: u8 = 1;
 const HOSTED_THUNK_PURPOSE_PROVIDER_INTERNAL_IMPORT: u8 = 2;
 const HOSTED_THUNK_PURPOSE_PROVIDER_CALLBACK: u8 = 3;
+const HOSTED_THUNK_PURPOSE_DXG_REGISTRATION: u8 = 4;
 
 #[derive(Clone, Copy)]
 struct LoadedDependencyImage {
@@ -19147,6 +19152,7 @@ struct HostedExecutableThunkAddress {
 
 const HOSTED_PROVIDER_CALLBACK_PARENT_KIND_MINIPORT: u8 = 1;
 const HOSTED_PROVIDER_CALLBACK_PARENT_KIND_PROTOCOL: u8 = 2;
+const HOSTED_PROVIDER_CALLBACK_PARENT_KIND_DXG: u8 = 3;
 
 struct HostedProviderCallbackParent {
     present: bool,
@@ -19156,7 +19162,7 @@ struct HostedProviderCallbackParent {
     dependent_instance: usize,
     kind: u8,
     provider_handle: u64,
-    bindings: [Option<HostedExecutableThunkBinding>; NDIS_MINIPORT_CHARACTERISTICS_CALLBACK_CAP],
+    bindings: Vec<Option<HostedExecutableThunkBinding>>,
     binding_count: usize,
 }
 
@@ -19170,7 +19176,7 @@ impl HostedProviderCallbackParent {
             dependent_instance: 0,
             kind: 0,
             provider_handle: 0,
-            bindings: [None; NDIS_MINIPORT_CHARACTERISTICS_CALLBACK_CAP],
+            bindings: Vec::new(),
             binding_count: 0,
         }
     }
@@ -19330,6 +19336,7 @@ struct HostedProviderCallbackRecord {
     target: u64,
     callback_offset: u64,
     callback_kind: u8,
+    callback_version: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -19900,11 +19907,10 @@ unsafe fn register_hosted_provider_singleton(
         print_str(b"\n");
         return false;
     };
-    let export_call_gate = if hosted_provider_has_export_marshal_policies(provider.as_str()) {
-        hosted_provider_export_gate_va()
-    } else {
-        0
-    };
+    // A live provider may obtain a typed internal-call policy only after a
+    // resolver IRP completes. The gate itself still rejects every RVA without
+    // a named-export or generation-bound internal policy.
+    let export_call_gate = hosted_provider_export_gate_va();
     if singletons.try_reserve(1).is_err() {
         HOSTED_PROVIDER_SINGLETON_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
         return false;
@@ -20206,6 +20212,7 @@ fn print_hosted_provider_callback_kind_name(kind: u8) {
         HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL => print_str(b"protocol"),
         HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT_TIMER => print_str(b"miniport-timer"),
         HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM => print_str(b"ndis-work-item"),
+        HOSTED_PROVIDER_CALLBACK_KIND_DXG => print_str(b"dxg"),
         _ => print_str(b"unknown"),
     }
 }
@@ -20808,6 +20815,7 @@ unsafe fn register_hosted_provider_callback_record(
     target: u64,
     callback_offset: u64,
     callback_kind: u8,
+    callback_version: u32,
     thunk_token: HostedThunkSlotToken,
     thunk_key: HostedThunkSlotKey,
 ) -> Option<(usize, HostedProviderCallbackRecord)> {
@@ -20849,6 +20857,7 @@ unsafe fn register_hosted_provider_callback_record(
         target,
         callback_offset,
         callback_kind,
+        callback_version,
     };
     if index == records.len() {
         records.push(record);
@@ -20940,6 +20949,7 @@ unsafe fn reserve_hosted_provider_callback_parent(
         kind,
         HOSTED_PROVIDER_CALLBACK_PARENT_KIND_MINIPORT
             | HOSTED_PROVIDER_CALLBACK_PARENT_KIND_PROTOCOL
+            | HOSTED_PROVIDER_CALLBACK_PARENT_KIND_DXG
     ) {
         return Err(STATUS_INVALID_PARAMETER);
     }
@@ -20962,7 +20972,7 @@ unsafe fn reserve_hosted_provider_callback_parent(
         dependent_instance,
         kind,
         provider_handle: 0,
-        bindings: [None; NDIS_MINIPORT_CHARACTERISTICS_CALLBACK_CAP],
+        bindings: Vec::new(),
         binding_count: 0,
     };
     if index == parents.len() {
@@ -20983,11 +20993,13 @@ unsafe fn retain_hosted_provider_callback_parent_binding(
     if !parent.present
         || parent.construction_state != HostedProviderConstructionState::Constructing
         || binding.instance_index != parent.provider_instance
-        || parent.binding_count >= parent.bindings.len()
     {
         return false;
     }
-    parent.bindings[parent.binding_count] = Some(binding);
+    if parent.bindings.try_reserve(1).is_err() {
+        return false;
+    }
+    parent.bindings.push(Some(binding));
     parent.binding_count += 1;
     true
 }
@@ -21139,9 +21151,16 @@ unsafe fn clear_hosted_provider_callback_parents_for_instance(
             parent.construction_state,
             HostedProviderConstructionState::Constructing
                 | HostedProviderConstructionState::RollingBack
-        ) {
+        ) && !(parent.kind == HOSTED_PROVIDER_CALLBACK_PARENT_KIND_DXG
+            && parent.construction_state == HostedProviderConstructionState::Published) {
             failures += 1;
             continue;
+        }
+        // The dependency was marked retiring and drained by clear_instance before
+        // reaching this point. No new reverse callback can acquire its dispatch lease.
+        if parent.construction_state == HostedProviderConstructionState::Published {
+            hosted_provider_callback_parents_mut()[index].construction_state =
+                HostedProviderConstructionState::RollingBack;
         }
         rollback_hosted_provider_callback_parent(index);
         if hosted_provider_callback_parents()
@@ -21857,6 +21876,14 @@ unsafe fn complete_hosted_provider_miniport_registration(
     else {
         return Err(STATUS_DEVICE_NOT_READY);
     };
+    complete_hosted_provider_driver_registration(route_index, route)
+}
+
+unsafe fn complete_hosted_provider_driver_registration(
+    route_index: usize,
+    route: HostedProviderDispatchRoute,
+) -> Result<(), i32> {
+    let provider_instance = route.provider_instance;
     let Some(provider_inst) = instance(provider_instance) else {
         return Err(STATUS_DEVICE_NOT_READY);
     };
@@ -27799,7 +27826,8 @@ unsafe fn provider_marshal_emit_callback_thunk(
 ) -> Result<HostedExecutableThunkAddress, i32> {
     let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
         .ok_or(STATUS_DEVICE_NOT_READY)?;
-    let discriminator = callback_offset ^ ((callback_kind as u64) << 56);
+    let discriminator = hosted_provider_callback_discriminator(
+        callback_offset, callback_kind, 0).ok_or(STATUS_INVALID_PARAMETER)?;
     let key = HostedThunkSlotKey::new(
         owner,
         HOSTED_THUNK_PURPOSE_PROVIDER_CALLBACK,
@@ -27808,6 +27836,52 @@ unsafe fn provider_marshal_emit_callback_thunk(
     )
     .ok_or(STATUS_INVALID_PARAMETER)?;
     let reservation = reserve_instance_executable_thunk(provider_instance, key)?;
+    provider_marshal_emit_callback_thunk_reserved(
+        provider_instance,
+        dependent_instance,
+        target,
+        callback_offset,
+        callback_kind,
+        0,
+        reservation,
+    )
+}
+
+fn hosted_provider_callback_discriminator(
+    callback_offset: u64,
+    callback_kind: u8,
+    callback_version: u32,
+) -> Option<u64> {
+    if callback_offset > u32::MAX as u64 || callback_version > 0x00ff_ffff {
+        return None;
+    }
+    Some(callback_offset | ((callback_version as u64) << 32)
+        | ((callback_kind as u64) << 56))
+}
+
+unsafe fn provider_marshal_emit_callback_thunk_reserved(
+    provider_instance: usize,
+    dependent_instance: usize,
+    target: u64,
+    callback_offset: u64,
+    callback_kind: u8,
+    callback_version: u32,
+    reservation: HostedExecutableThunkReservation,
+) -> Result<HostedExecutableThunkAddress, i32> {
+    let key = reservation.key;
+    let Some(discriminator) = hosted_provider_callback_discriminator(
+        callback_offset, callback_kind, callback_version) else {
+        abort_instance_executable_thunk(provider_instance, reservation);
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    if key.target != target
+        || key.discriminator != discriminator
+        || key.purpose != HOSTED_THUNK_PURPOSE_PROVIDER_CALLBACK
+        || hosted_provider_object_owner_for_pair(provider_instance, dependent_instance) != Some(key.owner)
+    {
+        abort_instance_executable_thunk(provider_instance, reservation);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
     if reservation.existing {
         let Some(record) = hosted_provider_callback_record_for_thunk(reservation.token, key) else {
             abort_instance_executable_thunk(provider_instance, reservation);
@@ -27816,6 +27890,7 @@ unsafe fn provider_marshal_emit_callback_thunk(
         return if record.target == target
             && record.callback_offset == callback_offset
             && record.callback_kind == callback_kind
+            && record.callback_version == callback_version
             && hosted_provider_callback_record(record.callback_cookie).is_some()
         {
             Ok(reservation.address(provider_instance))
@@ -27830,6 +27905,7 @@ unsafe fn provider_marshal_emit_callback_thunk(
         target,
         callback_offset,
         callback_kind,
+        callback_version,
         reservation.token,
         key,
     ) else {
@@ -29397,7 +29473,9 @@ unsafe fn prepare_provider_export_marshal(
                 provider_handle
             }
             HostedProviderArgumentMarshal::CallerInDriverObject => {
-                if policy.side_effect == HostedProviderExportSideEffect::NdisInitializeWrapper {
+                if matches!(policy.side_effect,
+                    HostedProviderExportSideEffect::NdisInitializeWrapper
+                        | HostedProviderExportSideEffect::DxgRegistration) {
                     provider_marshal_driver_object_shadow(
                         &mut state,
                         provider_instance,
@@ -29484,6 +29562,16 @@ unsafe fn prepare_provider_export_marshal(
             HostedProviderArgumentMarshal::CallerInUnicodeString => {
                 provider_marshal_unicode_string(
                     &mut state,
+                    dependent_index,
+                    dependent_inst,
+                    marshal_window,
+                    arg,
+                )?
+            }
+            HostedProviderArgumentMarshal::CallerInDxgInitializationData => {
+                hosted_dxg_registration::marshal_initialization_data(
+                    &mut state,
+                    provider_instance,
                     dependent_index,
                     dependent_inst,
                     marshal_window,
@@ -30045,6 +30133,11 @@ unsafe fn complete_provider_export_marshal(
     }
     if state.callback_parent_construction_index != usize::MAX {
         let (registration_succeeded, provider_handle) = match policy.side_effect {
+            HostedProviderExportSideEffect::DxgRegistration => {
+                let handle = hosted_provider_dispatch_route(state.ndis_route_index)
+                    .map_or(0, |route| route.provider_driver_object);
+                (success && handle != 0, handle)
+            }
             HostedProviderExportSideEffect::NdisMiniportRegistration => (
                 success && state.callback_parent_input_provider_handle != 0,
                 state.callback_parent_input_provider_handle,
@@ -30175,6 +30268,18 @@ unsafe fn complete_provider_export_side_effects(
 ) -> Result<(), i32> {
     match policy.side_effect {
         HostedProviderExportSideEffect::None => Ok(()),
+        HostedProviderExportSideEffect::DxgRegistration => {
+            if result != STATUS_SUCCESS as u64 { return Ok(()); }
+            let route = hosted_provider_dispatch_route(state.ndis_route_index)
+                .ok_or(STATUS_DEVICE_NOT_READY)?;
+            if route.provider_instance != provider_instance
+                || route.dependent_instance != dependent_instance
+                || route.provider_driver_object != args[0]
+            {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            complete_hosted_provider_driver_registration(state.ndis_route_index, route)
+        }
         HostedProviderExportSideEffect::NdisInitializeWrapper => {
             if state.ndis_route_index == usize::MAX {
                 return Err(STATUS_INVALID_PARAMETER);
@@ -31043,6 +31148,17 @@ where
     if dependent_index == singleton.instance {
         return hosted_provider_export_failure(STATUS_INVALID_PARAMETER);
     }
+    if policy.side_effect == HostedProviderExportSideEffect::DxgRegistration
+        && !hosted_dxg_registration::validate_call(
+            singleton.instance,
+            dependent_index,
+            provider_publication_cookie,
+            provider_export_rva,
+            &args,
+        )
+    {
+        return hosted_provider_export_failure(STATUS_INVALID_PARAMETER);
+    }
     let Some(provider_inst) = instance(singleton.instance) else {
         return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
     };
@@ -31186,7 +31302,9 @@ where
         print_str(b" status=0x");
         print_hex(status as u32);
         print_str(b"\n");
-        if policy.side_effect == HostedProviderExportSideEffect::NdisMiniportRegistration
+        if matches!(policy.side_effect,
+            HostedProviderExportSideEffect::NdisMiniportRegistration
+                | HostedProviderExportSideEffect::DxgRegistration)
             && result == STATUS_SUCCESS as u64
         {
             result = status as u32 as u64;
@@ -33210,7 +33328,7 @@ unsafe fn hosted_provider_callback_device_binding(
                 )
             }
         }
-        HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL => inherited,
+        HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL | HOSTED_PROVIDER_CALLBACK_KIND_DXG => inherited,
         _ => return Err(STATUS_INVALID_PARAMETER),
     };
     if inherited.is_some_and(|binding| {
@@ -33322,7 +33440,8 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
         || (record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT
             && record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL
             && record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT_TIMER
-            && record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM)
+            && record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM
+            && record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_DXG)
         || dependent_inst.fault_ep == 0
         || dependent_inst.pml4 == 0
         || dependent_inst.reply_cap == 0
@@ -33701,6 +33820,19 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     exec_code_va,
                     arg0,
                 ),
+                HOSTED_PROVIDER_CALLBACK_KIND_DXG => {
+                    match nt_hosted_runtime::DxgDdiSignature::for_offset(
+                        record.callback_version, record.callback_offset as usize,
+                    ) {
+                        // Each lifecycle signature needs its own pointer projection
+                        // and copyout before it can be invoked across VSpaces.
+                        Some(nt_hosted_runtime::DxgDdiSignature::AddDevice)
+                        | Some(nt_hosted_runtime::DxgDdiSignature::StartDevice)
+                        | Some(nt_hosted_runtime::DxgDdiSignature::StopDevice)
+                        | Some(nt_hosted_runtime::DxgDdiSignature::RemoveDevice)
+                        | None => Err(STATUS_NOT_SUPPORTED),
+                    }
+                }
                 _ => Err(STATUS_NOT_SUPPORTED),
             }
         }
@@ -39980,7 +40112,7 @@ unsafe fn load_driver_reserved(
             instance,
             image_len,
         );
-        if planned_images.primary_offset == 0 && planned_images.dependencies.is_empty() {
+        if planned_images.primary_offset == 0 {
             let Some(singleton_image_frames) = frames_for_image_len(image_len as u64) else {
                 return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
             };
@@ -58633,6 +58765,50 @@ unsafe fn reserve_instance_executable_thunk(
     })
 }
 
+/// Reserve a callback table as one unpublished unit. A short table never
+/// exposes a partially projected DDI table to the provider.
+unsafe fn reserve_instance_executable_thunk_batch(
+    instance_index: usize,
+    keys: &[HostedThunkSlotKey],
+) -> Result<Vec<HostedExecutableThunkReservation>, i32> {
+    let Some(inst) = instance(instance_index) else {
+        return Err(STATUS_DEVICE_NOT_READY);
+    };
+    if !inst.used || inst.exec_thunk_va == 0 || inst.run_thunk_va == 0 || inst.thunk_len == 0 {
+        return Err(STATUS_DEVICE_NOT_READY);
+    }
+    let dynamic_slots = inst.thunk_len
+        .checked_div(HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN)
+        .and_then(|slots| slots.checked_sub(inst.thunk_next))
+        .ok_or(STATUS_INVALID_PARAMETER)?
+        .min(HOSTED_EXECUTABLE_THUNK_SLOT_COUNT as u64) as usize;
+    inst.exec_thunk_va.checked_add(inst.thunk_len).ok_or(STATUS_INVALID_PARAMETER)?;
+    inst.run_thunk_va.checked_add(inst.thunk_len).ok_or(STATUS_INVALID_PARAMETER)?;
+    let mut acquired = Vec::new();
+    acquired.try_reserve_exact(keys.len()).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    acquired.resize(keys.len(), None);
+    let mut reservations = Vec::new();
+    reservations.try_reserve_exact(keys.len()).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    ensure_driver_instance_thunk_slots(instance_index)
+        .reserve_batch_with_limit(keys, &mut acquired, dynamic_slots)
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    for (key, item) in keys.iter().copied().zip(acquired.into_iter()) {
+        let (token, existing) = match item.expect("complete thunk batch") {
+            HostedThunkReservation::Existing(token) => (token, true),
+            HostedThunkReservation::Reserved(token) => (token, false),
+        };
+        let thunk_index = inst.thunk_next + token.index as u64;
+        let thunk_offset = thunk_index * HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN;
+        reservations.push(HostedExecutableThunkReservation {
+            token, key,
+            exec_va: inst.exec_thunk_va + thunk_offset,
+            run_va: inst.run_thunk_va + thunk_offset,
+            thunk_index, existing,
+        });
+    }
+    Ok(reservations)
+}
+
 unsafe fn commit_instance_executable_thunk(
     instance_index: usize,
     reservation: HostedExecutableThunkReservation,
@@ -58889,6 +59065,7 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
             let mut dependency_failures = 0u64;
             let mut singleton_failures = 0u64;
             shadow_failures += clear_hosted_provider_callback_parents_for_instance(i, domain);
+            shadow_failures += hosted_dxg_registration::retire_for_instance(i, domain);
             shadow_failures += clear_hosted_provider_pointer_allocations_for_instance(i, domain);
             shadow_failures += clear_hosted_provider_ndis_shadows_for_instance(i, domain);
             shadow_failures +=

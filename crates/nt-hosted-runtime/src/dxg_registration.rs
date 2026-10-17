@@ -39,20 +39,21 @@ pub struct DxgInitializationData<'a> {
 }
 
 impl<'a> DxgInitializationData<'a> {
+    pub const fn required_prefix_len(version: u32) -> Option<usize> {
+        match version {
+            0x5022 | 0x5023 => Some(WDDM_20_FULL_PREFIX),
+            0x11007 => Some(WDDM_32_FULL_PREFIX),
+            _ => None,
+        }
+    }
+
     pub fn parse(bytes: &'a [u8]) -> Result<Self, DxgInitializationDataError> {
         let version_bytes = bytes
             .get(VERSION_OFFSET..VERSION_OFFSET + 4)
             .ok_or(DxgInitializationDataError::Truncated)?;
         let version = u32::from_le_bytes(version_bytes.try_into().unwrap());
-        let prefix_len = match version {
-            // Both selectors are listed by pinned LiberNT's displib.c and
-            // classify as WDDM 2.0 in its caps_core interface contract.
-            0x5022 | 0x5023 => WDDM_20_FULL_PREFIX,
-            // Released BasicDisplay.sys sets this exact pinned LiberNT
-            // WDDM 3.2 selector and initializes a 0x608-byte table.
-            0x11007 => WDDM_32_FULL_PREFIX,
-            _ => return Err(DxgInitializationDataError::UnknownVersion),
-        };
+        let prefix_len = Self::required_prefix_len(version)
+            .ok_or(DxgInitializationDataError::UnknownVersion)?;
         if bytes.len() < prefix_len {
             return Err(DxgInitializationDataError::Truncated);
         }
@@ -124,6 +125,40 @@ pub struct DxgCallbackSlot {
     pub target: u64,
 }
 
+/// The lifecycle DDI prefix shared by DRIVER_INITIALIZATION_DATA and
+/// KMDDOD_INITIALIZATION_DATA in pinned LiberNT adapter.c. Every other slot
+/// needs its own marshal policy before it can cross a VSpace boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DxgDdiSignature {
+    AddDevice,
+    StartDevice,
+    StopDevice,
+    RemoveDevice,
+}
+
+impl DxgDdiSignature {
+    pub const fn for_offset(version: u32, offset: usize) -> Option<Self> {
+        if DxgInitializationData::required_prefix_len(version).is_none() {
+            return None;
+        }
+        match offset {
+            0x8 => Some(Self::AddDevice),
+            0x10 => Some(Self::StartDevice),
+            0x18 => Some(Self::StopDevice),
+            0x20 => Some(Self::RemoveDevice),
+            _ => None,
+        }
+    }
+
+    pub const fn argument_count(self) -> usize {
+        match self {
+            Self::AddDevice => 2,
+            Self::StartDevice => 5,
+            Self::StopDevice | Self::RemoveDevice => 1,
+        }
+    }
+}
+
 pub struct DxgCallbackSlots<'data, 'bytes> {
     data: &'data DxgInitializationData<'bytes>,
     next_offset: usize,
@@ -155,6 +190,52 @@ pub struct DxgRegistrationKey {
     provider_publication_cookie: u64,
     dependent_driver_object: u64,
     dependent_driver_generation: u64,
+}
+
+/// The source DriverObject is published in the component preamble before
+/// DriverEntry, while the executive's post-entry snapshot is still zero.
+/// Pool generation binds its address against reuse within that domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgSourceDriverObject {
+    address: u64,
+    pool_generation: u64,
+    canonical_driver_id: u64,
+}
+
+impl DxgSourceDriverObject {
+    pub const fn admit(
+        post_entry_snapshot: u64,
+        shared_bootstrap_address: u64,
+        pool_generation: u64,
+        canonical_driver_id: u64,
+    ) -> Option<Self> {
+        if shared_bootstrap_address == 0 || pool_generation == 0 || canonical_driver_id == 0
+            || post_entry_snapshot != 0 && post_entry_snapshot != shared_bootstrap_address
+        {
+            return None;
+        }
+        Some(Self {
+            address: shared_bootstrap_address,
+            pool_generation,
+            canonical_driver_id,
+        })
+    }
+
+    pub const fn address(self) -> u64 { self.address }
+    pub const fn generation(self) -> u64 { self.pool_generation }
+
+    pub const fn matches(
+        self,
+        post_entry_snapshot: u64,
+        shared_bootstrap_address: u64,
+        pool_generation: u64,
+        canonical_driver_id: u64,
+    ) -> bool {
+        (post_entry_snapshot == 0 || post_entry_snapshot == self.address)
+            && shared_bootstrap_address == self.address
+            && pool_generation == self.pool_generation
+            && canonical_driver_id == self.canonical_driver_id
+    }
 }
 
 impl DxgRegistrationKey {
@@ -197,5 +278,64 @@ impl DxgRegistrationKey {
         ) && self.provider_publication_cookie == provider_publication_cookie
             && self.dependent_driver_object == dependent_driver_object
             && self.dependent_driver_generation == dependent_driver_generation
+    }
+}
+
+/// Authority retained from the exact resolver IRP until a caller-side thunk
+/// replaces its provider-space code pointer. The native adapter must supply
+/// an executable PE section, not the enclosing image allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgEntryAuthority {
+    registration: DxgRegistrationKey,
+    target_device_id: u64,
+    target_generation: u64,
+    source_request_generation: u64,
+    provider_entry_va: u64,
+}
+
+impl DxgEntryAuthority {
+    pub fn new(
+        registration: DxgRegistrationKey,
+        target_device_id: u64,
+        target_generation: u64,
+        source_request_generation: u64,
+        provider_entry_va: u64,
+        executable_start: u64,
+        executable_len: u64,
+    ) -> Option<Self> {
+        if target_device_id == 0
+            || target_generation == 0
+            || source_request_generation == 0
+            || executable_start == 0
+            || executable_len == 0
+        {
+            return None;
+        }
+        let executable_end = executable_start.checked_add(executable_len)?;
+        if provider_entry_va < executable_start || provider_entry_va >= executable_end {
+            return None;
+        }
+        Some(Self {
+            registration,
+            target_device_id,
+            target_generation,
+            source_request_generation,
+            provider_entry_va,
+        })
+    }
+
+    pub fn matches(
+        self,
+        registration: DxgRegistrationKey,
+        target_device_id: u64,
+        target_generation: u64,
+        source_request_generation: u64,
+        provider_entry_va: u64,
+    ) -> bool {
+        self.registration == registration
+            && self.target_device_id == target_device_id
+            && self.target_generation == target_generation
+            && self.source_request_generation == source_request_generation
+            && self.provider_entry_va == provider_entry_va
     }
 }

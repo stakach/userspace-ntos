@@ -5,8 +5,10 @@
 //! entry with the caller's driver object, registry path, and callback table.
 
 use nt_hosted_runtime::{
-    DxgInitializationData, DxgInitializationDataError, DxgRegistrationKey,
-    HostedProviderObjectOwner,
+    hosted_dxg_registration_marshal_policy, DxgEntryAuthority, DxgInitializationData,
+    DxgInitializationDataError, DxgRegistrationKey, DxgSourceDriverObject, DxgDdiSignature,
+    HostedProviderArgumentMarshal,
+    HostedProviderExportResultSemantics, HostedProviderExportSideEffect, HostedProviderObjectOwner,
 };
 
 fn table(version: u32, size: usize) -> Vec<u8> {
@@ -167,4 +169,65 @@ fn registration_key_rejects_manually_constructed_invalid_domain_authority() {
     ] {
         assert!(DxgRegistrationKey::new(invalid, 33, 0x1000, 44).is_none());
     }
+}
+
+#[test]
+fn resolved_entry_requires_executable_provider_extent_and_exact_source_identity() {
+    let owner = HostedProviderObjectOwner::new(1, 11, 2, 22).unwrap();
+    let key = DxgRegistrationKey::new(owner, 33, 0x1000, 44).unwrap();
+    let entry = DxgEntryAuthority::new(key, 55, 66, 77, 0x8120, 0x8000, 0x300).unwrap();
+    assert!(entry.matches(key, 55, 66, 77, 0x8120));
+    assert!(!entry.matches(key, 56, 66, 77, 0x8120));
+    assert!(!entry.matches(key, 55, 67, 77, 0x8120));
+    assert!(!entry.matches(key, 55, 66, 78, 0x8120));
+    assert!(!entry.matches(key, 55, 66, 77, 0x8130));
+    let stale_owner = HostedProviderObjectOwner::new(1, 12, 2, 22).unwrap();
+    let stale_key = DxgRegistrationKey::new(stale_owner, 33, 0x1000, 44).unwrap();
+    assert!(!entry.matches(stale_key, 55, 66, 77, 0x8120));
+    assert!(DxgEntryAuthority::new(key, 55, 66, 77, 0x7fff, 0x8000, 0x300).is_none());
+    assert!(DxgEntryAuthority::new(key, 55, 66, 77, 0x8300, 0x8000, 0x300).is_none());
+    assert!(DxgEntryAuthority::new(key, 55, 66, 77, 0x8120, u64::MAX - 1, 4).is_none());
+    assert!(DxgEntryAuthority::new(key, 0, 66, 77, 0x8120, 0x8000, 0x300).is_none());
+    assert!(DxgEntryAuthority::new(key, 55, 0, 77, 0x8120, 0x8000, 0x300).is_none());
+    assert!(DxgEntryAuthority::new(key, 55, 66, 0, 0x8120, 0x8000, 0x300).is_none());
+}
+
+#[test]
+fn dxg_registration_policy_marshals_all_three_pointer_arguments() {
+    let policy = hosted_dxg_registration_marshal_policy();
+    assert_eq!(policy.argument_count, 3);
+    assert_eq!(policy.args[0], HostedProviderArgumentMarshal::CallerInDriverObject);
+    assert_eq!(policy.args[1], HostedProviderArgumentMarshal::CallerInUnicodeString);
+    assert_eq!(policy.args[2], HostedProviderArgumentMarshal::CallerInDxgInitializationData);
+    assert_eq!(policy.side_effect, HostedProviderExportSideEffect::DxgRegistration);
+    assert_eq!(policy.result_semantics, HostedProviderExportResultSemantics::NtStatus);
+}
+
+#[test]
+fn driver_entry_bootstrap_object_uses_exact_live_pool_generation() {
+    let bootstrap = DxgSourceDriverObject::admit(0, 0x1000, 91, 27).unwrap();
+    assert!(bootstrap.matches(0, 0x1000, 91, 27));
+    assert!(!bootstrap.matches(0, 0x1000, 92, 27));
+    assert!(!bootstrap.matches(0, 0x2000, 91, 27));
+    assert!(!bootstrap.matches(0, 0x1000, 91, 28));
+    assert!(DxgSourceDriverObject::admit(0x2000, 0x1000, 91, 27).is_none());
+    assert!(DxgSourceDriverObject::admit(0, 0, 91, 27).is_none());
+    assert!(DxgSourceDriverObject::admit(0, 0x1000, 0, 27).is_none());
+    assert!(DxgSourceDriverObject::admit(0, 0x1000, 91, 0).is_none());
+}
+
+#[test]
+fn pinned_libernt_lifecycle_callbacks_have_explicit_x64_signatures() {
+    for version in [0x5022, 0x5023, 0x11007] {
+        assert_eq!(DxgDdiSignature::for_offset(version, 0x8), Some(DxgDdiSignature::AddDevice));
+        assert_eq!(DxgDdiSignature::for_offset(version, 0x10), Some(DxgDdiSignature::StartDevice));
+        assert_eq!(DxgDdiSignature::for_offset(version, 0x18), Some(DxgDdiSignature::StopDevice));
+        assert_eq!(DxgDdiSignature::for_offset(version, 0x20), Some(DxgDdiSignature::RemoveDevice));
+        assert_eq!(DxgDdiSignature::for_offset(version, 0x28), None);
+    }
+    assert_eq!(DxgDdiSignature::for_offset(0x11008, 0x8), None);
+    assert_eq!(DxgDdiSignature::AddDevice.argument_count(), 2);
+    assert_eq!(DxgDdiSignature::StartDevice.argument_count(), 5);
+    assert_eq!(DxgDdiSignature::StopDevice.argument_count(), 1);
+    assert_eq!(DxgDdiSignature::RemoveDevice.argument_count(), 1);
 }

@@ -57,6 +57,13 @@ impl CapturedSourceInternalControl {
         self.target.as_ref().expect("target retained").device_id()
     }
 
+    pub(super) fn target_registration(
+        &self,
+    ) -> Result<nt_io_manager::HostedDevicePointerRegistration, CaptureError> {
+        self.validate_source()?;
+        Ok(self.target.as_ref().ok_or(CaptureError::InvalidTarget)?.registration())
+    }
+
     pub(super) fn request(&self) -> InternalControlCapture {
         self.request
     }
@@ -152,6 +159,34 @@ impl CapturedSourceInternalControl {
         }
         hosted_worker_component_to_exec_va(runtime, self.output_address, 8)
             .ok_or(CaptureError::InvalidOutput)?;
+        Ok(())
+    }
+
+    /// Publish only a bridge-created callable VA into the original driver's output buffer.
+    /// Pool writes stay under the source pool lock; stack writes recheck the exact caller TCB.
+    pub(super) unsafe fn write_typed_output(&self, caller_thunk_va: u64) -> Result<(), CaptureError> {
+        if caller_thunk_va == 0 { return Err(CaptureError::InvalidOutput); }
+        self.validate_output()?;
+        let inst = instance(self.instance_index).ok_or(CaptureError::InvalidSourceIrp)?;
+        let value = caller_thunk_va.to_le_bytes();
+        let memory = SourcePoolMemory::new(inst).ok_or(CaptureError::InvalidSourceIrp)?;
+        if memory.contains(self.output_address, value.len()) {
+            return memory.write(self.output_address, &value)
+                .then_some(())
+                .ok_or(CaptureError::InvalidOutput);
+        }
+        drop(memory);
+        let output_exec = if self.caller_tcb == inst.tcb {
+            component_to_exec_va_for_instance(self.instance_index, inst, self.output_address, 8)
+        } else {
+            hosted_driver_runtime_for_worker_component_range(
+                self.instance_index, self.output_address, 8,
+            )
+            .filter(|runtime| runtime.tcb == self.caller_tcb && runtime.domain == self.allocation.domain)
+            .and_then(|runtime| hosted_worker_component_to_exec_va(runtime, self.output_address, 8))
+        }
+        .ok_or(CaptureError::InvalidOutput)?;
+        core::ptr::copy_nonoverlapping(value.as_ptr(), output_exec as *mut u8, value.len());
         Ok(())
     }
 

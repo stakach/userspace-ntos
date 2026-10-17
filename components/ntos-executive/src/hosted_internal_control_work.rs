@@ -2,7 +2,7 @@
 //!
 //! The canonical Device IRP may finish later than the source Call. Both the source IRP pin and
 //! physical Reply are retained until the provider terminal and source-local IoCompleteRequest.
-//! Opaque eight-byte output is never copied back: a callable pointer needs a typed bridge.
+//! Provider output is copied back only after an exact, typed bridge produces a caller thunk.
 
 use super::*;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
@@ -23,7 +23,9 @@ const INSUFFICIENT_RESOURCES: i32 = nt_status::NtStatus::INSUFFICIENT_RESOURCES.
 
 struct Work {
     source: hosted_internal_control_capture::CapturedSourceInternalControl,
+    source_index: usize,
     source_instance: DriverInstance,
+    provider_index: usize,
     provider_instance: DriverInstance,
     caller: NativeHandleCaller,
     actor: NativeThreadProcessReference,
@@ -35,6 +37,7 @@ struct Work {
     canonical_irp: Option<IrpId>,
     entered_provider: bool,
     terminal_status: Option<i32>,
+    caller_thunk_va: Option<u64>,
     source_published: bool,
     source_released: bool,
     reply_entered: bool,
@@ -182,7 +185,9 @@ pub(super) unsafe fn submit(
     let work = Work {
         progress: InternalControlProgress::new(source.request()),
         source,
+        source_index,
         source_instance,
+        provider_index,
         provider_instance,
         caller,
         actor,
@@ -193,6 +198,7 @@ pub(super) unsafe fn submit(
         canonical_irp: None,
         entered_provider: false,
         terminal_status: None,
+        caller_thunk_va: None,
         source_published: false,
         source_released: false,
         reply_entered: false,
@@ -312,7 +318,7 @@ impl Work {
         }
     }
 
-    fn observe_terminal(&mut self, status: i32, information: u64, opaque: [u8; 8]) {
+    unsafe fn observe_terminal(&mut self, status: i32, information: u64, opaque: [u8; 8]) {
         // A completed provider IRP cannot report STATUS_PENDING as its terminal status.
         // Completing the source with it would violate IoCompleteRequest's contract.
         if status as u32 == nt_status::NtStatus::PENDING.raw() as u32 {
@@ -322,11 +328,47 @@ impl Work {
         let observed = self.progress.observe(InternalControlOutcome::Terminal {
             status, information, output: opaque,
         });
-        self.terminal_status = Some(match observed {
-            Ok(Some(_)) if status >= 0 => NOT_SUPPORTED,
-            Ok(Some(_)) => status,
-            _ => INVALID_DEVICE_REQUEST,
-        });
+        let Ok(Some(_)) = observed else {
+            self.terminal_status = Some(INVALID_DEVICE_REQUEST);
+            return;
+        };
+        if status < 0 {
+            self.terminal_status = Some(status);
+            return;
+        }
+        if information == 8 {
+            if self.source.validate_output().is_err() {
+                self.terminal_status = Some(INVALID_DEVICE_REQUEST);
+                return;
+            }
+            let target = match self.source.target_registration() {
+                Ok(target) => target,
+                Err(_) => {
+                    self.terminal_status = Some(INVALID_DEVICE_REQUEST);
+                    return;
+                }
+            };
+            let provider_entry_va = u64::from_le_bytes(opaque);
+            match bridge_dxg_registration_entry(
+                self.source_index,
+                self.provider_index,
+                self.source.source_identity(),
+                target,
+                self.source.request().code(),
+                provider_entry_va,
+            ) {
+                Ok(caller_thunk_va) if caller_thunk_va != 0 => {
+                    self.caller_thunk_va = Some(caller_thunk_va);
+                    self.terminal_status = Some(status);
+                }
+                Ok(_) => self.terminal_status = Some(INVALID_DEVICE_REQUEST),
+                Err(status) => {
+                    self.terminal_status = Some(if status < 0 { status } else { INVALID_DEVICE_REQUEST });
+                }
+            }
+        } else {
+            self.terminal_status = Some(NOT_SUPPORTED);
+        }
     }
 
     unsafe fn poll_provider(&mut self) {
@@ -355,16 +397,24 @@ impl Work {
         self.observe_terminal(completion.status as i32, completion.information, opaque);
     }
 
-    unsafe fn publish_source_failure(&mut self) -> bool {
+    unsafe fn publish_source_terminal(&mut self) -> bool {
         if self.source.validate_output().is_err() {
             return false;
         }
         let Ok(irp) = self.source.source_irp_exec() else { return false; };
         let status = self.terminal_status.expect("internal control terminal status");
-        // No raw provider pointer is copied to the source output. The source's IOSB/event and
-        // completion routine still run with an honest error and zero information.
+        let information = if let Some(caller_thunk_va) = self.caller_thunk_va {
+            if status < 0
+                || self.source.write_typed_output(caller_thunk_va).is_err()
+            {
+                return false;
+            }
+            8
+        } else {
+            0
+        };
         write_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut i32, status);
-        write_unaligned((irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *mut u64, 0);
+        write_unaligned((irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *mut u64, information);
         self.source.arm_callback_free().is_ok()
     }
 
@@ -443,7 +493,7 @@ impl Work {
         }
         let Some(status) = self.terminal_status else { return false; };
         if self.entered_provider {
-            if !self.publish_source_failure() { return false; }
+            if !self.publish_source_terminal() { return false; }
             self.source_published = true;
         }
         self.reply_entered = true;

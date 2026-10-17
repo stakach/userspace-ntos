@@ -14,8 +14,8 @@ mod dxg_registration;
 
 pub use driver_load_receipt::{DriverLoadPhase, RetainedEffectState};
 pub use dxg_registration::{
-    DxgCallbackSlot, DxgCallbackSlots, DxgInitializationData, DxgInitializationDataError,
-    DxgRegistrationKey,
+    DxgCallbackSlot, DxgCallbackSlots, DxgDdiSignature, DxgEntryAuthority, DxgInitializationData,
+    DxgInitializationDataError, DxgRegistrationKey, DxgSourceDriverObject,
 };
 
 pub use hosted_irq_arena::{
@@ -38,6 +38,7 @@ pub use progress_deferral::ProgressDeferralBudget;
 pub const PAGE_SIZE: u64 = 0x1000;
 pub const PAGE_TABLE_SPAN: u64 = 0x20_0000;
 pub const HOSTED_PROVIDER_IMPORT_THUNK_LEN: usize = 55;
+pub const HOSTED_DXG_REGISTRATION_THUNK_LEN: usize = HOSTED_PROVIDER_IMPORT_THUNK_LEN + 6;
 pub const HOSTED_PROVIDER_CALLBACK_THUNK_LEN: usize = 55;
 pub const HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN: u64 = 64;
 pub const HOSTED_PROVIDER_EXPORT_ARG_CAP: usize = 12;
@@ -516,6 +517,39 @@ impl<const N: usize> HostedThunkSlotRegistry<N> {
         }))
     }
 
+    /// Acquire every slot before publishing any thunk. A failed acquisition
+    /// leaves no new reservation or additional lease behind.
+    pub fn reserve_batch_with_limit(
+        &mut self,
+        keys: &[HostedThunkSlotKey],
+        output: &mut [Option<HostedThunkReservation>],
+        limit: usize,
+    ) -> Result<(), HostedThunkSlotError> {
+        if keys.len() != output.len() {
+            return Err(HostedThunkSlotError::InvalidToken);
+        }
+        output.fill(None);
+        for index in 0..keys.len() {
+            match self.reserve_with_limit(keys[index], limit) {
+                Ok(reservation) => output[index] = Some(reservation),
+                Err(error) => {
+                    for previous in (0..index).rev() {
+                        match output[previous].take().expect("reserved prefix") {
+                            HostedThunkReservation::Existing(token) => {
+                                let _ = self.release(token, keys[previous]);
+                            }
+                            HostedThunkReservation::Reserved(token) => {
+                                let _ = self.abort(token, keys[previous]);
+                            }
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn available_with_limit(&self, limit: usize) -> usize {
         self.slots[..limit.min(N)]
             .iter()
@@ -836,6 +870,7 @@ pub enum HostedProviderArgumentMarshal {
     ProviderHandle,
     CallerContext,
     CallerInDriverObject,
+    CallerInDxgInitializationData,
     CallerInUnicodeString,
     CallerInAnsiString,
     CallerOutUnicodeStringFromSource {
@@ -924,6 +959,7 @@ pub enum HostedProviderArgumentMarshal {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostedProviderExportSideEffect {
     None,
+    DxgRegistration,
     NdisInitializeWrapper,
     NdisTerminateWrapper,
     NdisMiniportRegistration,
@@ -1109,6 +1145,17 @@ fn export_policy_with_side_effect(
         side_effect,
         HostedProviderExportResultSemantics::NtStatus,
     )
+}
+
+/// The three x64 pointers passed by displib to the resolved DxgkInitialize
+/// entry. The callback table has a version-selected readable prefix.
+pub fn hosted_dxg_registration_marshal_policy() -> HostedProviderExportMarshalPolicy {
+    use HostedProviderArgumentMarshal::*;
+    export_policy_with_side_effect(
+        &[CallerInDriverObject, CallerInUnicodeString, CallerInDxgInitializationData],
+        HostedProviderExportSideEffect::DxgRegistration,
+    )
+    .expect("three Dxg registration arguments fit the provider call frame")
 }
 
 fn export_policy_with_effect_and_result(
@@ -1629,6 +1676,32 @@ pub fn encode_hosted_provider_import_thunk(
     out[31..39].copy_from_slice(&thunk.provider_domain_id.to_le_bytes());
     out[39..47].copy_from_slice(&thunk.provider_domain_cookie.to_le_bytes());
     out[47..55].copy_from_slice(&thunk.export_call_gate.to_le_bytes());
+    Ok(())
+}
+
+/// DxgkInitialize has three Win64 arguments. The fourth register carries a
+/// construction cookie to distinguish identical provider RVAs resolved by
+/// different source IRP and DeviceObject generations.
+pub fn encode_hosted_dxg_registration_thunk(
+    thunk: HostedProviderImportThunkPlan,
+    authority_cookie: u32,
+    out: &mut [u8],
+) -> Result<(), HostedProviderImportThunkError> {
+    if authority_cookie == 0 {
+        return Err(HostedProviderImportThunkError::InvalidAuthority);
+    }
+    if out.len() < HOSTED_DXG_REGISTRATION_THUNK_LEN {
+        return Err(HostedProviderImportThunkError::OutputTooSmall);
+    }
+    // Prepending six bytes shifts the RIP-relative LEA and its inline data by
+    // the same amount, preserving the original four-byte displacement.
+    let mut encoded = [0xcc; HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN as usize];
+    encode_hosted_provider_import_thunk(thunk, &mut encoded)?;
+    out[..HOSTED_DXG_REGISTRATION_THUNK_LEN].fill(0xcc);
+    out[..6].copy_from_slice(&[0x41, 0xb9, 0, 0, 0, 0]); // mov r9d, cookie
+    out[2..6].copy_from_slice(&authority_cookie.to_le_bytes());
+    out[6..HOSTED_DXG_REGISTRATION_THUNK_LEN]
+        .copy_from_slice(&encoded[..HOSTED_PROVIDER_IMPORT_THUNK_LEN]);
     Ok(())
 }
 
@@ -3337,6 +3410,29 @@ mod tests {
     }
 
     #[test]
+    fn dxg_entry_thunk_carries_exact_resolution_cookie_without_overrunning_slot() {
+        let call = HostedProviderExportCallPlan {
+            provider_domain_id: 7,
+            provider_domain_cookie: 11,
+            provider_publication_cookie: 13,
+            provider_export_rva: 0x1234,
+            provider_export_offset: 0x1234,
+            export_call_gate: 0x5678,
+        };
+        let plan = plan_hosted_provider_import_thunk(0x8000, 64, 0, call).unwrap();
+        let mut slot = [0xcc; HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN as usize];
+        encode_hosted_dxg_registration_thunk(plan, 0x1020_3040, &mut slot).unwrap();
+        assert_eq!(&slot[..6], &[0x41, 0xb9, 0x40, 0x30, 0x20, 0x10]);
+        assert_eq!(&slot[8..16], &0x1234u64.to_le_bytes());
+        assert_eq!(&slot[18..26], &13u64.to_le_bytes());
+        assert!(slot[HOSTED_DXG_REGISTRATION_THUNK_LEN..].iter().all(|byte| *byte == 0xcc));
+        assert_eq!(
+            encode_hosted_dxg_registration_thunk(plan, 0, &mut slot),
+            Err(HostedProviderImportThunkError::InvalidAuthority)
+        );
+    }
+
+    #[test]
     fn thunk_slot_reservation_is_private_and_abort_changes_generation() {
         let mut registry = HostedThunkSlotRegistry::<1>::new();
         let key = thunk_slot_key(0x1000);
@@ -3469,6 +3565,53 @@ mod tests {
         );
         registry.abort(token, key).unwrap();
         assert_eq!(registry.slots()[0].state, HostedThunkSlotState::Free);
+    }
+
+    #[test]
+    fn thunk_slot_batch_reserves_all_callbacks_or_none_at_frame_capacity() {
+        let mut registry = HostedThunkSlotRegistry::<64>::new();
+        let keys = core::array::from_fn::<_, 61, _>(|i| thunk_slot_key(0x7000 + i as u64));
+        let mut reservations = [None; 61];
+        assert_eq!(
+            registry.reserve_batch_with_limit(&keys, &mut reservations, 60),
+            Err(HostedThunkSlotError::Full)
+        );
+        assert!(reservations.iter().all(Option::is_none));
+        assert_eq!(registry.available_with_limit(60), 60);
+        assert!(registry.slots().iter().all(|slot| slot.key.is_none()));
+
+        let mut fitting = [None; 60];
+        registry
+            .reserve_batch_with_limit(&keys[..60], &mut fitting, 60)
+            .unwrap();
+        assert!(fitting.iter().all(|slot| matches!(slot, Some(HostedThunkReservation::Reserved(_)))));
+        assert_eq!(registry.available_with_limit(60), 0);
+    }
+
+    #[test]
+    fn thunk_slot_batch_failure_releases_existing_lease_and_new_reservations() {
+        let mut registry = HostedThunkSlotRegistry::<3>::new();
+        let existing_key = thunk_slot_key(0x8000);
+        let HostedThunkReservation::Reserved(existing) = registry.reserve(existing_key).unwrap()
+        else {
+            panic!("first reservation unexpectedly reused a live thunk");
+        };
+        registry.commit(existing, existing_key).unwrap();
+        let busy_key = thunk_slot_key(0x8002);
+        let HostedThunkReservation::Reserved(busy) = registry.reserve(busy_key).unwrap() else {
+            panic!("expected a private reservation");
+        };
+        let keys = [existing_key, thunk_slot_key(0x8001), busy_key];
+        let mut reservations = [None; 3];
+        assert_eq!(
+            registry.reserve_batch_with_limit(&keys, &mut reservations, 3),
+            Err(HostedThunkSlotError::Busy)
+        );
+        assert_eq!(reservations, [None; 3]);
+        assert_eq!(registry.slots()[existing.index as usize].leases, 1);
+        assert_eq!(registry.available_with_limit(3), 1);
+        assert!(registry.is_live(existing, existing_key));
+        assert_eq!(registry.slots()[busy.index as usize].state, HostedThunkSlotState::Reserved);
     }
 
     #[test]
