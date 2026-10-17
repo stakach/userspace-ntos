@@ -51,6 +51,7 @@ mod open_with_details_tests {
     use super::*;
     use crate::dispatch::{DispatchContext, DriverCompletion, IrpProjection};
     use crate::{MockDriverBackend, MockObjectPort};
+    use std::format;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::rc::Rc;
@@ -541,6 +542,79 @@ mod open_with_details_tests {
     }
 
     #[test]
+    fn unnamed_pdo_interface_endpoint_preserves_device_identity_and_retires() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let client = io.register_client();
+        let driver = io.create_driver(&path(r"\Driver\InterfacePdo"),
+            Box::new(MockDriverBackend::new())).unwrap();
+        let pdo = io.create_device(driver, None, DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(), DeviceFlags::empty(), 0).unwrap();
+        assert!(io.device(pdo).unwrap().name.is_none());
+        let endpoint = path(&format!(r"\Device\PnpInterface{:x}", pdo.raw()));
+        let object = io.publish_device_interface_endpoint(pdo, &endpoint).unwrap();
+        assert_ne!(object, ObjectId::NULL);
+        assert_eq!(io.publish_device_interface_endpoint(pdo, &endpoint), Ok(object));
+        assert_eq!(io.publish_device_interface_endpoint(pdo,
+            &path(r"\Device\WrongEndpoint")), Err(NtStatus::OBJECT_NAME_COLLISION));
+        assert!(io.device(pdo).unwrap().name.is_none());
+        let link = path(r"\??\InterfacePdo");
+        io.create_symbolic_link(&link, &endpoint).unwrap();
+        assert_eq!(io.port_mut().open_device_object(&link), Ok(object));
+        let (handle, _file, opened, file_object) = io.open_with_details(client, &link,
+            AccessMask::GENERIC_READ, ShareAccess::READ,
+            CreateOptions::NON_DIRECTORY_FILE, 1).unwrap();
+        assert_eq!(opened, pdo);
+        assert_ne!(file_object, object);
+        io.close(client, handle).unwrap();
+        io.delete_symbolic_link(&link).unwrap();
+        io.destroy_device(pdo).unwrap();
+        assert_eq!(io.port_mut().open_device_object(&endpoint),
+            Err(NtStatus::OBJECT_NAME_NOT_FOUND));
+    }
+
+    #[test]
+    fn failed_interface_endpoint_retirement_keeps_device_for_exact_retry() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let driver = io.create_driver(&path(r"\Driver\RetirementPdo"),
+            Box::new(MockDriverBackend::new())).unwrap();
+        let pdo = io.create_device(driver, None, DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(), DeviceFlags::empty(), 0).unwrap();
+        let endpoint = path(r"\Device\RetirementPdoEndpoint");
+        let object = io.publish_device_interface_endpoint(pdo, &endpoint).unwrap();
+        io.port_mut().fail_next_device_delete();
+        assert_eq!(io.destroy_device(pdo).err(), Some(NtStatus::UNSUCCESSFUL));
+        assert_eq!(io.device(pdo).map(|record| record.object_id), Some(object));
+        assert_eq!(io.port_mut().open_device_object(&endpoint), Ok(object));
+        io.destroy_device(pdo).unwrap();
+        assert_eq!(io.port_mut().open_device_object(&endpoint),
+            Err(NtStatus::OBJECT_NAME_NOT_FOUND));
+    }
+
+    #[cfg(feature = "object-manager")]
+    #[test]
+    fn library_port_unnamed_pdo_publishes_and_retires_endpoint() {
+        use crate::ObjectManagerLibraryPort;
+        use nt_object_manager::ComponentId;
+
+        let mut io = IoManager::new(ObjectManagerLibraryPort::new(ComponentId(0x10)).unwrap());
+        let driver = io.create_driver(&path(r"\Driver\LibraryPdo"),
+            Box::new(MockDriverBackend::new())).unwrap();
+        let unpublished = io.create_device(driver, None, DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(), DeviceFlags::empty(), 0).unwrap();
+        assert_eq!(io.device(unpublished).unwrap().object_id, ObjectId::NULL);
+        io.destroy_device(unpublished).unwrap();
+        let pdo = io.create_device(driver, None, DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(), DeviceFlags::empty(), 0).unwrap();
+        let endpoint = path(r"\Device\LibraryPdoEndpoint");
+        let object = io.publish_device_interface_endpoint(pdo, &endpoint).unwrap();
+        assert_ne!(object, ObjectId::NULL);
+        assert_eq!(io.port_mut().open_device_object(&endpoint), Ok(object));
+        io.destroy_device(pdo).unwrap();
+        assert_eq!(io.port_mut().open_device_object(&endpoint),
+            Err(NtStatus::OBJECT_NAME_NOT_FOUND));
+    }
+
+    #[test]
     fn failed_identity_lookup_closes_the_transient_handle() {
         let mut io = IoManager::new(MockObjectPort::new());
         let client = io.register_client();
@@ -785,15 +859,45 @@ impl<P: ObjectManagerPort> IoManager<P> {
         }
     }
 
+    /// Give an unnamed PnP device an internal Object Manager endpoint for device-interface
+    /// symbolic links. Its WDM name remains absent; the endpoint resolves to this exact DeviceId.
+    pub fn publish_device_interface_endpoint(
+        &mut self,
+        device: DeviceId,
+        endpoint: &NtPath,
+    ) -> Result<ObjectId, NtStatus> {
+        let record = self.device(device).ok_or(NtStatus::INVALID_PARAMETER)?;
+        if record.delete_pending { return Err(NtStatus::DELETE_PENDING); }
+        if record.name.is_some() { return Err(NtStatus::INVALID_PARAMETER); }
+        if let Some(published) = &record.interface_endpoint {
+            return if published == endpoint { Ok(record.object_id) }
+                else { Err(NtStatus::OBJECT_NAME_COLLISION) };
+        }
+        let object = self.port.publish_device_endpoint(record.object_id, endpoint, device.raw())?;
+        let record = self.device_mut(device).expect("validated device remains live");
+        record.object_id = object;
+        record.interface_endpoint = Some(endpoint.clone());
+        Ok(object)
+    }
+
     /// Destroy a device through the I/O Manager and Object Manager. If open files or upper
     /// attachments still reference it, the record is left live and marked delete-pending.
     pub fn destroy_device(&mut self, device: DeviceId) -> Result<DeviceRecord, NtStatus> {
-        let record = self.delete_device(device)?;
-        if record.object_id != ObjectId::NULL {
-            self.port
-                .delete_device_object(record.object_id, record.name.as_ref())?;
+        if let Err(status) = self.can_delete_device(device) {
+            if status == NtStatus::DELETE_PENDING {
+                self.device_mut(device).expect("validated device remains live").delete_pending = true;
+            }
+            return Err(status);
         }
-        Ok(record)
+        let (object_id, object_path) = {
+            let record = self.device(device).expect("preflight validated device");
+            (record.object_id, record.name.clone().or(record.interface_endpoint.clone()))
+        };
+        if object_id != ObjectId::NULL {
+            self.port
+                .delete_device_object(object_id, object_path.as_ref())?;
+        }
+        self.delete_device(device)
     }
 
     /// Mark a driver unload requested and mark its devices delete-pending.

@@ -41041,6 +41041,22 @@ impl ObjectManagerPort for ExecutiveObjectManagerPort {
         }
     }
 
+    fn publish_device_endpoint(
+        &mut self,
+        object: ObjectId,
+        endpoint: &NtPath,
+        owner_local_id: u64,
+    ) -> Result<ObjectId, nt_status::NtStatus> {
+        // Native unnamed PDOs have no Object Manager object until an interface exposes one.
+        // An already published object needs an exact alias operation; never create a second.
+        if object != ObjectId::NULL {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        let path = Self::ascii_path(endpoint)?;
+        unsafe { crate::object_manager_create_device_path(
+            &path, IO_MANAGER_COMPONENT_ID, owner_local_id).map(ObjectId) }
+    }
+
     fn delete_device_object(
         &mut self,
         _object: ObjectId,
@@ -48231,34 +48247,22 @@ unsafe fn shared_path_ascii_at<const N: usize>(
 }
 
 fn hosted_device_interface_target(pdo_device_id: u64) -> Result<NtPath, nt_status::NtStatus> {
-    let mut current =
-        io_manager_mut().top_of_device_stack(nt_io_manager::DeviceId(pdo_device_id))?;
-    let limit = io_manager_mut().device_count().saturating_add(1);
-    let mut depth = 0usize;
-    while depth < limit {
-        let (name, lower, delete_pending) = {
-            let device = io_manager_mut()
-                .device(current)
-                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-            (
-                device.name.clone(),
-                device.attached_to,
-                device.delete_pending,
-            )
-        };
-        if delete_pending {
-            return Err(nt_status::NtStatus::DELETE_PENDING);
-        }
-        if let Some(name) = name {
-            return Ok(name);
-        }
-        let Some(next) = lower else {
-            return Err(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND);
-        };
-        current = next;
-        depth += 1;
+    let pdo = nt_io_manager::DeviceId(pdo_device_id);
+    let device = io_manager_mut()
+        .device(pdo)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if device.delete_pending {
+        return Err(nt_status::NtStatus::DELETE_PENDING);
     }
-    Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+    if let Some(name) = &device.name {
+        return Ok(name.clone());
+    }
+    // The caller has already authenticated the live PDO and its PnP devnode. Interface links
+    // name that PDO, even when its WDM DeviceObject has no name. DeviceId includes generation.
+    let endpoint = alloc::format!(r"\Device\PnpInterface{:016X}", pdo_device_id);
+    let endpoint = parse_nt_path(&endpoint).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    io_manager_mut().publish_device_interface_endpoint(pdo, &endpoint)?;
+    Ok(endpoint)
 }
 
 unsafe fn set_hosted_device_interface_state(
