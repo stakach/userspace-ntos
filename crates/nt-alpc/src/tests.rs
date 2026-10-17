@@ -707,6 +707,78 @@ fn checked_smss_reply_and_receive_routes_exact_delivered_request_once() {
     assert_eq!(core.receive_reply_message(kernel, identity).unwrap(), None);
 }
 
+#[test]
+fn checked_sync_request_waits_for_its_exact_reply_without_replaying_send() {
+    use nt_port_core::{ClientId, ConnectOutcome, MessageAttrs, MessageIdentity};
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let server = ClientId { process: 7, thread: 11 };
+    let client = ClientId { process: 8, thread: 12 };
+    let name = utf16("\\SmSync");
+    let listen = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, server, (3, 90)), &mut []).detail0;
+    let ConnectOutcome::Pending { connection_id } = core.connect_with_client_id(
+        &name, PortApi::Alpc, 0, b"", client).unwrap() else { panic!("pending connect"); };
+    core.receive(listen).unwrap();
+    let server_port = core.accept(connection_id, true, 0xCAFE_BABE).unwrap();
+    let client_port = core.complete(connection_id).unwrap().0;
+    let mut listener = enc_checked_receive(listen, server, (3, 92));
+    let mut listener_header: nt_alpc_abi::AlpcSendReceiveCheckedRequest =
+        bytemuck::pod_read_unaligned(&listener);
+    listener_header.send_receive.flags = nt_alpc_abi::send_flag::RECV_ATTRIBUTES;
+    listener_header.send_receive.valid_attributes = msg_attr_flag::CONTEXT;
+    listener.copy_from_slice(bytemuck::bytes_of(&listener_header));
+    let mut listener_output = [0u8; 128];
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &listener, &mut listener_output).status, nt_status::NtStatus::PENDING.0);
+
+    let request = port_message(msg_type::REQUEST, b"exec");
+    let mut wire = enc_checked_receive(client_port, client, (3, 91));
+    let mut checked: nt_alpc_abi::AlpcSendReceiveCheckedRequest =
+        bytemuck::pod_read_unaligned(&wire);
+    checked.send_receive.flags = 0x0002_0000; // ALPC_MSGFLG_SYNC_REQUEST
+    checked.send_receive.message_offset = wire.len() as u32;
+    checked.send_receive.message_len_bytes = request.len() as u32;
+    checked.send_receive.valid_attributes = msg_attr_flag::CONTEXT;
+    checked.send_receive.attr_offset = (wire.len() + request.len()) as u32;
+    checked.send_receive.attr_len_bytes = size_of::<AlpcContextAttr>() as u32;
+    wire.copy_from_slice(bytemuck::bytes_of(&checked));
+    wire.extend_from_slice(&request);
+    wire.extend_from_slice(&enc_attrs_context(0xBAD_CAFE));
+    let mut output = [0u8; 128];
+    let pending = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &wire, &mut output);
+    assert_eq!(pending.status, nt_status::NtStatus::PENDING.0);
+    let listener_result = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &listener, &mut listener_output);
+    assert_eq!(listener_result.status, SUCCESS);
+    assert_eq!(u32::from_le_bytes(listener_output[4..8].try_into().unwrap()),
+        msg_attr_flag::CONTEXT, "accepted PortContext must be valid on a received request");
+    let context: AlpcContextAttr = bytemuck::pod_read_unaligned(&listener_output[8..40]);
+    assert_eq!(context.port_context, 0xCAFE_BABE);
+    let delivered = &listener_output[40..listener_result.information as usize];
+    let header: PortMessage = bytemuck::pod_read_unaligned(&delivered[..40]);
+    let identity = MessageIdentity { client, message_id: header.message_id };
+    assert_eq!(header.client_process, client.process);
+    assert_eq!(header.client_thread, client.thread);
+    assert_ne!(identity.message_id, 0);
+    assert_eq!(&delivered[40..], b"exec");
+
+    core.send_message(server_port, b"unrelated", MessageAttrs::default()).unwrap();
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &wire, &mut output).status,
+        nt_status::NtStatus::PENDING.0, "an unrelated datagram is not the reply");
+    let mut response = port_message(msg_type::REPLY, b"OK");
+    response[8..16].copy_from_slice(&client.process.to_le_bytes());
+    response[16..24].copy_from_slice(&client.thread.to_le_bytes());
+    response[24..28].copy_from_slice(&identity.message_id.to_le_bytes());
+    core.send_reply_message(server_port, &response, MessageAttrs::default(), identity).unwrap();
+    let completed = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &wire, &mut output);
+    assert_eq!(completed.status, SUCCESS);
+    assert_eq!(&output[..completed.information as usize], &response);
+    assert_eq!(core.receive_message(client_port).unwrap().unwrap().bytes, b"unrelated");
+    assert_eq!(core.receive_message(server_port).unwrap(), None, "redrive did not resend");
+}
+
 fn enc_owned_create_port(
     name: &[u16],
     owner: nt_port_core::ClientId,

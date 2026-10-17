@@ -102,6 +102,23 @@ fn smss_reply_and_receive_captures_the_reply_with_context_output() {
 }
 
 #[test]
+fn smss_sync_request_owns_send_bytes_before_reusing_receive_buffer() {
+    let mut image = [0u8; 512];
+    image[32..40].copy_from_slice(&128u64.to_le_bytes());
+    image[128..130].copy_from_slice(&4u16.to_le_bytes());
+    image[130..132].copy_from_slice(&44u16.to_le_bytes());
+    image[168..172].copy_from_slice(b"exec");
+    let captured = capture_send_wait_receive(
+        [77, 0x0002_0000, 128, 0, 128, 32, 0, 0],
+        |p, b| read_image(&image, p, b), |_, _| true,
+    ).expect("ALPC_MSGFLG_SYNC_REQUEST permits an in-place send and reply buffer");
+    assert_eq!(captured.flags, 0x0002_0000);
+    assert_eq!(captured.send_message.as_deref(), Some(&image[128..172]));
+    assert_eq!(captured.receive.as_ref().unwrap().message, 128);
+    assert_eq!(captured.receive.as_ref().unwrap().capacity, 128);
+}
+
+#[test]
 fn connect_capture_owns_name_and_rejects_unmodeled_security_inputs() {
     let mut image = [0u8; 512];
     image[64..66].copy_from_slice(&20u16.to_le_bytes());

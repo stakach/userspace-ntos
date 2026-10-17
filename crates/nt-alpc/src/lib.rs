@@ -65,7 +65,7 @@ use nt_alpc_abi::{
 };
 use nt_port_core::{
     ClientId, ConnectOutcome, ConnectionSecurity, DataView, MessageAttrs, PortApi, PortCore, PortHandleEndpoint,
-    PortAdmission, PortLimits, QueuedMessage, ReceiveOutcome, MAX_CONNINFO,
+    MessageIdentity, PortAdmission, PortLimits, QueuedMessage, ReceiveOutcome, MAX_CONNINFO,
 };
 use nt_status::NtStatus;
 
@@ -969,8 +969,11 @@ impl AlpcServer {
         if req.abi_size as usize != size_of::<AlpcSendReceiveRequest>() {
             return Err(NtStatus::INVALID_PARAMETER);
         }
+        if req.flags & send_flag::SYNC_REQUEST != 0 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
 
-        Self::perform_send_receive(core, op, req, buf, out_buf, true, false)
+        Self::perform_send_receive(core, op, req, buf, out_buf, true, false, None)
     }
 
     fn op_send_receive_checked(
@@ -991,15 +994,25 @@ impl AlpcServer {
             || token == (0, 0) || checked.send_receive._reserved != 0
             || checked.send_receive._reserved2 != 0
             || checked.send_receive.flags
-                & !(send_flag::RECV_ATTRIBUTES | send_flag::REPLY_MESSAGE) != 0
+                & !(send_flag::RECV_ATTRIBUTES | send_flag::REPLY_MESSAGE
+                    | send_flag::SYNC_REQUEST) != 0
             || (checked.send_receive.flags & send_flag::REPLY_MESSAGE != 0
                 && checked.send_receive.message_len_bytes == 0)
+            || (checked.send_receive.flags & send_flag::SYNC_REQUEST != 0
+                && (checked.send_receive.flags & send_flag::REPLY_MESSAGE != 0
+                    || checked.send_receive.message_len_bytes == 0
+                    || op != opcode::ALPC_OP_SEND_RECEIVE))
             || (checked.send_receive.flags & send_flag::RECV_ATTRIBUTES != 0
                 && (checked.send_receive.valid_attributes != msg_attr_flag::CONTEXT
                     || checked.send_receive.attr_len_bytes != 0))
         {
             return Err(NtStatus::INVALID_PARAMETER);
         }
+        let sync_identity = if checked.send_receive.flags & send_flag::SYNC_REQUEST != 0 {
+            Some(MessageIdentity { client: owner,
+                message_id: u32::try_from(token.1).ok().filter(|id| *id != 0)
+                    .ok_or(NtStatus::INVALID_PARAMETER)? })
+        } else { None };
         if let Some(saved) = self.send_receive_results.iter_mut().find(|saved| saved.token == token) {
             if saved.owner != owner || saved.owner_generation != invocation.owner_generation {
                 return Err(NtStatus::OBJECT_NAME_COLLISION);
@@ -1024,6 +1037,7 @@ impl AlpcServer {
             // the receive half, including when the first send is uncertain.
             let result = Self::perform_send_receive(
                 core, op, checked.send_receive, buf, &mut saved.output, false, true,
+                sync_identity,
             );
             let result = match result {
                 Ok(reply) => reply,
@@ -1086,6 +1100,7 @@ impl AlpcServer {
         let saved = self.send_receive_results.last_mut().ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
         let result = Self::perform_send_receive(
             core, op, checked.send_receive, buf, &mut saved.output, true, true,
+            sync_identity,
         );
         let result = match result {
             Ok(reply) => reply,
@@ -1142,6 +1157,7 @@ impl AlpcServer {
         out_buf: &mut [u8],
         send_allowed: bool,
         native_checked: bool,
+        sync_identity: Option<MessageIdentity>,
     ) -> Result<AlpcReply, NtStatus> {
 
         // Send half (skipped for a pure receive op or a zero-length send).
@@ -1167,9 +1183,42 @@ impl AlpcServer {
                         },
                         message_id: header.message_id,
                     })?;
+            } else if let Some(identity) = sync_identity {
+                let header: PortMessage = read_at(msg, 0).ok_or(NtStatus::INVALID_PARAMETER)?;
+                if usize::from(header.total_length) != msg.len()
+                    || usize::from(header.data_length) + size_of::<PortMessage>() != msg.len()
+                { return Err(NtStatus::INVALID_PARAMETER); }
+                let mut request = Vec::new();
+                request.try_reserve_exact(msg.len())
+                    .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+                request.extend_from_slice(msg);
+                request[8..16].copy_from_slice(&identity.client.process.to_le_bytes());
+                request[16..24].copy_from_slice(&identity.client.thread.to_le_bytes());
+                request[24..28].copy_from_slice(&identity.message_id.to_le_bytes());
+                core.send_request_message(req.port_handle, &request, attrs, identity)?;
             } else {
                 core.send_message(req.port_handle, msg, attrs)?;
             }
+        }
+
+        if let Some(identity) = sync_identity {
+            let Some(QueuedMessage { bytes, attrs, .. }) =
+                core.receive_reply_message(req.port_handle, identity)?
+            else { return Ok(reply(NtStatus::PENDING, 0, 0, 0)); };
+            let present = project_valid_attributes(&attrs);
+            let prefix = if req.flags & send_flag::RECV_ATTRIBUTES != 0 {
+                let (valid, blob) = serialize_attrs(req.valid_attributes, &attrs);
+                if blob.len().checked_add(bytes.len()).is_none_or(|len| len > out_buf.len()) {
+                    return Err(NtStatus::BUFFER_TOO_SMALL);
+                }
+                out_buf[..blob.len()].copy_from_slice(&blob);
+                (blob.len(), valid)
+            } else { (0, present) };
+            let total = prefix.0.checked_add(bytes.len()).ok_or(NtStatus::BUFFER_TOO_SMALL)?;
+            if total > out_buf.len() { return Err(NtStatus::BUFFER_TOO_SMALL); }
+            out_buf[prefix.0..total].copy_from_slice(&bytes);
+            return Ok(reply(NtStatus::SUCCESS, total as u32,
+                u64::from(prefix.1), u64::from(read_msg_type(&bytes))));
         }
 
         if native_checked {
@@ -1241,9 +1290,23 @@ impl AlpcServer {
         {
             return Err(NtStatus::BUFFER_TOO_SMALL);
         }
+        let server_receive = core.handle_info(req.port_handle).is_some_and(|info|
+            matches!(info.endpoint,
+                PortHandleEndpoint::ListenPort | PortHandleEndpoint::ServerCommPort));
         match core.receive_message(req.port_handle) {
-            Ok(Some(QueuedMessage { bytes, attrs, .. })) => {
+            Ok(Some(QueuedMessage { bytes, mut attrs, provenance, port_context,
+                request_identity })) => {
                 let msg_type = read_msg_type(&bytes);
+                // A checked ALPC request carries the accepted connection's
+                // PortContext. Ordinary messages retain their sender attributes,
+                // including LPC bridge degradation and ALPC message context.
+                if native_checked && server_receive && provenance.connection_id != 0
+                    && request_identity.is_some()
+                    && core.connection_apis(provenance.connection_id)
+                        .is_some_and(|(client, _)| client == PortApi::Alpc)
+                {
+                    attrs.context = Some(port_context);
+                }
                 // Project the neutral attrs into the ALPC valid-attributes view.
                 // Non-bridging attrs from an ALPC peer are surfaced; an LPC peer
                 // carried none, so valid == 0 (the LPC → ALPC degradation).

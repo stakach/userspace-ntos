@@ -228,6 +228,9 @@ pub mod send_flag {
     /// Native `ALPC_MSGFLG_REPLY_MESSAGE`: the send half replies to the exact
     /// previously delivered request selected by the PORT_MESSAGE identity.
     pub const REPLY_MESSAGE: u32 = 0x0001_0000;
+    /// Native `ALPC_MSGFLG_SYNC_REQUEST`: send one request and wait for only
+    /// its matching reply on the same communication endpoint.
+    pub const SYNC_REQUEST: u32 = 0x0002_0000;
     /// On a receive, serialize the received `ALPC_MESSAGE_ATTRIBUTES` (the 8-byte
     /// header + the per-attribute structs, in the fixed SECURITY,VIEW,CONTEXT,
     /// HANDLE,TOKEN order) into the FRONT of the reply frame, before the message
