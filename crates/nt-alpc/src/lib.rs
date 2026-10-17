@@ -64,7 +64,7 @@ use nt_alpc_abi::{
     AlpcSendReceiveCheckedRequest, AlpcTokenAttr, AlpcViewIoRequest, PortMessage,
 };
 use nt_port_core::{
-    ClientId, ConnectOutcome, ConnectionSecurity, DataView, MessageAttrs, PortApi, PortCore, PortHandleEndpoint,
+    ClientId, ConnState, ConnectOutcome, ConnectionSecurity, DataView, MessageAttrs, PortApi, PortCore, PortHandleEndpoint,
     MessageIdentity, PortAdmission, PortLimits, QueuedMessage, ReceiveOutcome, MAX_CONNINFO,
 };
 use nt_status::NtStatus;
@@ -778,13 +778,28 @@ impl AlpcServer {
         { return Err(NtStatus::INVALID_PARAMETER); }
         let (connection_security, client_max_message) =
             connect_port_options(checked.port_attributes, checked.has_port_attributes)?;
-        if let Some(saved) = self.connect_results.iter().find(|saved| saved.token == token) {
+        if let Some(saved) = self.connect_results.iter_mut().find(|saved| saved.token == token) {
             if saved.owner != owner || saved.owner_generation != generation {
                 return Err(NtStatus::OBJECT_NAME_COLLISION);
             }
             if saved.acknowledged { return Err(NtStatus::OBJECT_NAME_COLLISION); }
             if saved.request != buf { return Err(NtStatus::INVALID_PARAMETER); }
             if saved.closed { return Err(NtStatus::INVALID_PORT_HANDLE); }
+            if saved.result.status == NtStatus::PENDING.0 {
+                let connection_id = saved.result.detail1;
+                if let Some(client_handle) = core.completed_client_handle(connection_id) {
+                    let response = core.connection_response_info(connection_id)
+                        .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+                    if response.len() > out_buf.len() { return Err(NtStatus::BUFFER_TOO_SMALL); }
+                    saved.response.try_reserve_exact(response.len())
+                        .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+                    saved.response.extend_from_slice(response);
+                    saved.result = reply(NtStatus::SUCCESS, response.len() as u32,
+                        client_handle, connection_id);
+                } else if core.connection_state(connection_id) == Some(ConnState::Refused) {
+                    saved.result = reply(NtStatus::PORT_CONNECTION_REFUSED, 0, 0, connection_id);
+                }
+            }
             if saved.response.len() > out_buf.len() { return Err(NtStatus::BUFFER_TOO_SMALL); }
             out_buf[..saved.response.len()].copy_from_slice(&saved.response);
             return Ok(saved.result);

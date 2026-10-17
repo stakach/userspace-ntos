@@ -517,6 +517,13 @@ impl PortCore {
         self.conn(id).map(|c| c.response_info.as_slice())
     }
 
+    /// A completed client endpoint can be observed by another API adapter
+    /// without repeating the original connect effect.
+    pub fn completed_client_handle(&self, id: u64) -> Option<u64> {
+        self.conn(id).filter(|c| c.state == ConnState::Connected && c.client_open)
+            .map(|c| c.client_handle)
+    }
+
     /// Read the exact response before the completion transition can publish a client handle.
     pub fn completion_response_info(&self, id_or_server_handle: u64) -> Option<&[u8]> {
         self.connections

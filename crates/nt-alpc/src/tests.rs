@@ -764,6 +764,35 @@ fn reply_wait_on_server_comm_port_receives_next_connection_request() {
 }
 
 #[test]
+fn checked_alpc_connect_observes_lpc_server_completion_without_reconnect() {
+    use nt_port_core::ClientId;
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let name = utf16("\\KernelOwnedPort");
+    let listen = core.create_port_with_owner(&name, PortApi::Lpc, ClientId::default());
+    let client = ClientId { process: 8, thread: 12 };
+    let wire = enc_checked_connect(&name, client, (3, 201),
+        &port_message(msg_type::CONNECTION_REQUEST, b"input"));
+    let mut output = [0u8; 64];
+    let pending = alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &wire, &mut output);
+    assert_eq!(pending.status, nt_status::NtStatus::PENDING.0);
+    let connection_id = pending.detail1;
+    assert!(matches!(core.receive(listen).unwrap(),
+        ReceiveOutcome::ConnectionRequest { connection_id: id, .. } if id == connection_id));
+    assert_eq!(core.connection_info(connection_id), Some(&b"input"[..]));
+    let server_comm = core.accept_with_connection_info(connection_id, true, 0, b"out").unwrap();
+    let (client_comm, completed_id) = core.complete(server_comm).unwrap();
+    assert_eq!(completed_id, connection_id);
+    let completed = alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &wire, &mut output);
+    assert_eq!(completed.status, SUCCESS);
+    assert_eq!(completed.detail0, client_comm);
+    assert_eq!(completed.detail1, connection_id);
+    assert_eq!(&output[..completed.information as usize], b"out");
+    assert_eq!(core.connection_state(connection_id), Some(ConnState::Connected));
+}
+
+#[test]
 fn checked_sync_request_waits_for_its_exact_reply_without_replaying_send() {
     use nt_port_core::{ClientId, ConnectOutcome, MessageAttrs, MessageIdentity};
     let mut core = PortCore::new();
