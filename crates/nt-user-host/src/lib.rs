@@ -36,6 +36,9 @@ pub mod provider_file_close;
 pub mod native_call_owner;
 pub mod gui_exit;
 pub mod gui_client_info_snapshot;
+pub mod win32k_teb;
+#[cfg(test)]
+mod win32k_teb_tests;
 pub mod provider_kernel_activation;
 pub mod provider_kernel_pump;
 pub mod provider_kernel_wait;

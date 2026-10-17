@@ -17081,14 +17081,32 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         print_hex(pti as u32);
         print_str(b"\n");
     }
-    // The established compatibility context remains load-bearing for win32k's early initialization.
-    // Switch to the routed client's real TEB only where ReactOS may call kernel-mode NtCurrentTeb()
-    // while capturing a user window-station/desktop name. The client attach path identity-maps the
-    // registered TEB pages, so this remains the caller's live StaticUnicodeString/CLIENTINFO view.
-    let teb_context = if ssn == SSN_GDI_BATCH_FLUSH_CALLOUT || ssn == 0x122f || ssn == 0x122d {
-        client_teb
+    // The thread callout binds THREADINFO.pClientInfo to its TEB's inline
+    // Win32ClientInfo. The system-thread entry checks that exact pointer.
+    // User-object name capture still needs the routed caller's guest TEB;
+    // other early entry points retain their established compatibility view.
+    let teb_purpose = if ssn == SSN_NT_USER_CALL_ONE_PARAM && a1 == 0x22 {
+        nt_user_host::win32k_teb::DispatchTebPurpose::ThreadInfo
+    } else if ssn == SSN_GDI_BATCH_FLUSH_CALLOUT || ssn == 0x122f || ssn == 0x122d {
+        nt_user_host::win32k_teb::DispatchTebPurpose::UserObjectName
     } else {
-        current_kpcr_va()
+        nt_user_host::win32k_teb::DispatchTebPurpose::Compatibility
+    };
+    let callout_teb = thread_ctx_callout_teb(thread_index);
+    let thread_client_info = read_volatile(
+        (current_w32thread() + THREADINFO_PCLIENTINFO_OFF) as *const u64,
+    );
+    let teb_context = match nt_user_host::win32k_teb::select_dispatch_teb(
+        teb_purpose,
+        nt_user_host::win32k_teb::DispatchTebCandidates {
+            callout_teb,
+            client_teb,
+            compatibility_teb: current_kpcr_va(),
+            thread_client_info,
+        },
+    ) {
+        Ok(teb) => teb,
+        Err(_) => return (0xC000_000Bu32 as i32, 0xC000_000B),
     };
     write_volatile((current_kpcr_va() + 0x30) as *mut u64, teb_context);
     let t = current_w32thread();
