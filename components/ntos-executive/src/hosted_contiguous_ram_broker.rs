@@ -8,7 +8,7 @@
 use super::*;
 use nt_hosted_runtime::{ContiguousRamLayout, ContiguousRamOwner, ContiguousRamPrepareTable,
     ContiguousRamReceipt, ContiguousRamRequest, ContiguousRamLeaseBank,
-    ContiguousRamLeaseSource};
+    ContiguousRamLeaseSource, ContiguousRamPublishedMapping, ContiguousRamProjectedMapping};
 
 const PAGE: u64 = 4096;
 const MAX_CHILD_BYTES: u64 = 64 << 20;
@@ -29,6 +29,7 @@ struct Allocation {
     slot: usize,
     owner: ContiguousRamOwner,
     address: u64,
+    physical_start: u64,
     length: u64,
     cache: u32,
     child: u64,
@@ -43,10 +44,26 @@ struct Allocation {
     available: bool,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProjectionPhase { Mapping, Ready, Uncertain, Retired }
+
+struct Projection {
+    source_slot: usize,
+    source_child: u64,
+    mapping: ContiguousRamProjectedMapping,
+    consumer: ContiguousRamOwner,
+    consumer_pml4: u64,
+    address: u64,
+    length: u64,
+    owner: Option<crate::hosted_pnp_context::HostedPnpContextOwner>,
+    phase: ProjectionPhase,
+}
+
 static BROKER_LOCK: AtomicU64 = AtomicU64::new(0);
 static mut PREPARED: ContiguousRamPrepareTable = ContiguousRamPrepareTable::new();
 static mut LEASES: ContiguousRamLeaseBank = ContiguousRamLeaseBank::new();
 static mut ALLOCATIONS: Vec<Allocation> = Vec::new();
+static mut PROJECTIONS: Vec<Projection> = Vec::new();
 
 struct BrokerGuard;
 impl Drop for BrokerGuard {
@@ -119,6 +136,21 @@ pub(super) fn service(ch: &crate::spawn_hosts::PumpChannel, op: u64, a1: u64, a2
             HOSTED_DEVICE_OP_CONTIGUOUS_FREE => {
                 (free(owner, a1, a2, a3), 0, 0, 0)
             }
+            HOSTED_DEVICE_OP_CONTIGUOUS_PHYSICAL if a2 == 0 && a3 == 0 => {
+                match physical_address(owner, a1) {
+                    Some(physical) => (STATUS_SUCCESS, physical, 0, 0),
+                    None => (STATUS_NOT_FOUND, 0, 0, 0),
+                }
+            }
+            HOSTED_DEVICE_OP_CONTIGUOUS_MAP if a3 == a3 as u32 as u64 => {
+                match map_physical(owner, inst, a1, a2, a3 as u32) {
+                    Some(address) => (STATUS_SUCCESS, address, 0, 0),
+                    None => (STATUS_NOT_FOUND, 0, 0, 0),
+                }
+            }
+            HOSTED_DEVICE_OP_CONTIGUOUS_UNMAP => {
+                (unmap_physical(owner, a1, a2, a3), 0, 0, 0)
+            }
             _ => (STATUS_INVALID_PARAMETER, 0, 0, 0),
         }
     }
@@ -138,6 +170,7 @@ unsafe fn allocate(owner: ContiguousRamOwner, inst: DriverInstance,
     }
     if lease.slot == ledger.len() {
         ledger.push(Allocation { slot: lease.slot, owner, address: plan.base(),
+            physical_start: 0,
             length: request.length, cache: request.cache, child: 0, cap_base: 0,
             capacity_frames: 0, child_ready: false, frames: plan.frames(), retyped: 0,
             mapped: 0, quarantined: false, published: false, available: false });
@@ -145,6 +178,7 @@ unsafe fn allocate(owner: ContiguousRamOwner, inst: DriverInstance,
     let row = &mut ledger[lease.slot];
     row.owner = owner;
     row.address = plan.base();
+    row.physical_start = 0;
     row.length = request.length;
     row.cache = request.cache;
     row.frames = plan.frames();
@@ -296,11 +330,156 @@ unsafe fn allocate_into(row: &mut Allocation, inst: DriverInstance, plan: Contig
         row.mapped += 1;
     }
     let address = receipt.publish(owner, request.low, request.high, request.boundary).ok()?;
+    row.physical_start = first;
     row.published = true;
     print_str(b"[contiguous-broker] published address=0x");
     print_hex64(address); print_str(b" bytes="); print_u64(request.length);
     print_str(b"\n");
     Some(address)
+}
+
+unsafe fn published_mapping(row: &Allocation) -> Option<ContiguousRamPublishedMapping> {
+    if row.available || row.quarantined || !row.published || !row.child_ready {
+        return None;
+    }
+    ContiguousRamPublishedMapping::new(row.owner, row.address, row.physical_start,
+        row.length, row.cache)
+}
+
+unsafe fn physical_address(requester: ContiguousRamOwner, address: u64) -> Option<u64> {
+    (&*core::ptr::addr_of!(ALLOCATIONS)).iter().find_map(|row| {
+        published_mapping(row)?.physical_address(requester, address)
+    })
+}
+
+/// A registered Dxg provider may map a physical segment published by its exact live miniport.
+/// Source frame caps are copied into the provider VSpace and retained independently of the source.
+unsafe fn map_physical(consumer: ContiguousRamOwner, inst: DriverInstance,
+    physical: u64, length: u64, cache: u32) -> Option<u64> {
+    if length == 0 || inst.pml4 == 0 { return None; }
+    let ledger = &*core::ptr::addr_of!(ALLOCATIONS);
+    let mut selected = None;
+    for source in ledger.iter() {
+        let Some(mapping) = published_mapping(source) else { continue; };
+        if !mapping.contains_physical(source.owner, physical, length, cache) { continue; }
+        if source.owner == consumer {
+            return mapping.virtual_address(consumer, physical, length, cache);
+        }
+        let Some(source_inst) = instance(source.owner.instance) else { continue; };
+        if owner(source.owner.instance, source_inst) != Some(source.owner) { continue; }
+        let Some((provider_instance, _publication)) =
+            hosted_dxg_registration::contiguous_dependent_authority(
+                source.owner.instance, HostedDomainIdentity {
+                    domain_id: nt_io_manager::HostedDomainId(source.owner.domain),
+                    cookie: source.owner.generation,
+                }) else { continue; };
+        if provider_instance != consumer.instance { continue; }
+        if selected.is_some() { return None; }
+        selected = Some((source.slot, source.child, source.cap_base,
+            source.physical_start, source.owner, mapping));
+    }
+    let (source_slot, source_child, cap_base, physical_start, producer, source_mapping) = selected?;
+    let rows = &mut *core::ptr::addr_of_mut!(PROJECTIONS);
+    for row in rows.iter() {
+        if row.source_slot != source_slot || row.source_child != source_child
+            || row.consumer != consumer || row.consumer_pml4 != inst.pml4
+            || row.phase == ProjectionPhase::Retired { continue; }
+        // Every successful MAP gets its own cap/VA owner and exact UNMAP. An uncertain prior
+        // projection fences another mapping of the same physical source into this consumer.
+        if row.phase != ProjectionPhase::Ready { return None; }
+    }
+
+    let offset = physical & (PAGE - 1);
+    let aligned = physical - offset;
+    let bytes = length.checked_add(offset)?.checked_add(PAGE - 1)? & !(PAGE - 1);
+    let pages = usize::try_from(bytes / PAGE).ok()?;
+    if rows.try_reserve(1).is_err() { return None; }
+    let mut caps_owner = crate::hosted_pnp_context::HostedPnpContextOwner::new();
+    if !caps_owner.reserve_alias_caps(pages) { return None; }
+    let base = crate::hosted_pnp_context::reserve_hosted_pnp_component_span(
+        &mut caps_owner, bytes)?;
+    let address = base.checked_add(offset);
+    let mapping = address.and_then(|address| ContiguousRamProjectedMapping::new(
+        source_mapping, producer, consumer, address, physical, length, cache));
+    let (Some(address), Some(mapping)) = (address, mapping) else {
+        let _ = crate::hosted_pnp_context::retire_hosted_pnp_context_owner(caps_owner);
+        return None;
+    };
+    rows.push(Projection { source_slot, source_child, mapping, consumer,
+        consumer_pml4: inst.pml4, address, length, owner: Some(caps_owner),
+        phase: ProjectionPhase::Mapping });
+    let index = rows.len() - 1;
+    let domain = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId(consumer.domain),
+        cookie: consumer.generation,
+    };
+    let mapped = (|| -> Option<()> {
+        for page in 0..pages as u64 {
+            let expected_phys = aligned.checked_add(page.checked_mul(PAGE)?)?;
+            let frame = expected_phys.checked_sub(physical_start)? / PAGE;
+            let source_cap = cap_base.checked_add(frame)?;
+            if hosted_resource_mapping::checked_frame_address(source_cap).ok()? != expected_phys {
+                return None;
+            }
+            let va = base.checked_add(page * PAGE)?;
+            if !ensure_paging(va, inst.pml4, domain) { return None; }
+            let (cap, copied) = copy_cap_r(source_cap);
+            if cap == 0 || copied != 0 {
+                if cap != 0 { rows[index].owner.as_mut()?.adopt_alias_cap(cap, false); }
+                return None;
+            }
+            rows[index].owner.as_mut()?.adopt_alias_cap(cap, true);
+            if page_map_r(cap, va, RW_NX, inst.pml4) != 0 { return None; }
+        }
+        Some(())
+    })();
+    if mapped.is_none() {
+        rows[index].phase = ProjectionPhase::Uncertain;
+        return None;
+    }
+    rows[index].phase = ProjectionPhase::Ready;
+    Some(address)
+}
+
+unsafe fn retire_projection(row: &mut Projection) -> bool {
+    let Some(caps_owner) = row.owner.take() else { return false; };
+    match crate::hosted_pnp_context::try_retire_hosted_pnp_context_owner(caps_owner) {
+        Ok(()) => {
+            row.phase = ProjectionPhase::Retired;
+            true
+        }
+        Err(caps_owner) => {
+            row.owner = Some(caps_owner);
+            row.phase = ProjectionPhase::Uncertain;
+            false
+        }
+    }
+}
+
+unsafe fn unmap_physical(consumer: ContiguousRamOwner, address: u64, length: u64,
+    cache: u64) -> i32 {
+    let rows = &mut *core::ptr::addr_of_mut!(PROJECTIONS);
+    let Some(row) = rows.iter_mut().find(|row| row.consumer == consumer
+        && row.phase == ProjectionPhase::Ready && row.address == address
+        && row.length == length && cache == 0) else { return STATUS_NOT_FOUND; };
+    let mut mapping = row.mapping;
+    if mapping.retire_exact(consumer, address, length).is_err() {
+        return STATUS_NOT_FOUND;
+    }
+    if retire_projection(row) {
+        row.mapping = mapping;
+        STATUS_SUCCESS
+    } else { STATUS_INSUFFICIENT_RESOURCES }
+}
+
+unsafe fn retire_projections_for_source(source: &Allocation) -> bool {
+    let rows = &mut *core::ptr::addr_of_mut!(PROJECTIONS);
+    for row in rows.iter_mut().filter(|row| row.source_slot == source.slot
+        && row.source_child == source.child && row.mapping.producer() == source.owner
+        && row.phase != ProjectionPhase::Retired) {
+        if !retire_projection(row) { return false; }
+    }
+    true
 }
 
 /// Only definite native effects are rolled back. Failed retypes are confirmed no-effect;
@@ -338,6 +517,11 @@ unsafe fn free(owner: ContiguousRamOwner, address: u64, length: u64, cache: u64)
         || cache != u64::MAX && cache != row.cache as u64 {
         return STATUS_INVALID_PARAMETER;
     }
+    if !retire_projections_for_source(row) {
+        row.quarantined = true;
+        let _ = (&mut *core::ptr::addr_of_mut!(LEASES)).quarantine(owner, row.slot);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
     row.published = false;
     if !cleanup_known_effects(row) {
         let _ = (&mut *core::ptr::addr_of_mut!(LEASES)).quarantine(owner, row.slot);
@@ -356,8 +540,13 @@ pub(super) unsafe fn retire_instance(instance: usize, inst: DriverInstance) -> b
     let Some(owner) = owner(instance, inst) else { return false; };
     let _guard = lock();
     (&mut *core::ptr::addr_of_mut!(PREPARED)).retire_owner(owner);
+    for row in (&mut *core::ptr::addr_of_mut!(PROJECTIONS)).iter_mut()
+        .filter(|row| row.consumer == owner && row.phase != ProjectionPhase::Retired) {
+        if !retire_projection(row) { return false; }
+    }
     let ledger = &mut *core::ptr::addr_of_mut!(ALLOCATIONS);
     for row in ledger.iter_mut().filter(|row| row.owner == owner && !row.available) {
+        if !retire_projections_for_source(row) { return false; }
         if row.quarantined || !cleanup_known_effects(row) { return false; }
         if (&mut *core::ptr::addr_of_mut!(LEASES)).confirm_clean(owner, row.slot).is_err() {
             row.quarantined = true;

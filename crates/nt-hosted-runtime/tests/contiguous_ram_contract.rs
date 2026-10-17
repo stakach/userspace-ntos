@@ -1,5 +1,6 @@
 use nt_hosted_runtime::{ContiguousRamLayout, ContiguousRamOwner, ContiguousRamReceipt,
-    ContiguousRamPrepareTable, ContiguousRamLeaseBank, ContiguousRamLeaseSource};
+    ContiguousRamPrepareTable, ContiguousRamLeaseBank, ContiguousRamLeaseSource,
+    ContiguousRamPublishedMapping, ContiguousRamProjectedMapping};
 
 const PAGE: u64 = 4096;
 
@@ -170,4 +171,52 @@ fn clean_children_are_reused_only_at_their_exact_capacity() {
     assert_eq!(reused_large.source, ContiguousRamLeaseSource::Reuse {
         child: 0x9000, cap_base: 0xa000, capacity_frames: 16_384,
     });
+}
+
+#[test]
+fn published_contiguous_ram_round_trips_only_for_its_exact_owner_and_extent() {
+    let producer = ContiguousRamOwner { instance: 6, generation: 19, domain: 23 };
+    let consumer = ContiguousRamOwner { instance: 7, generation: 31, domain: 24 };
+    let stale_consumer = ContiguousRamOwner { generation: 32, ..consumer };
+    let source_va = 0x103_0000_0000;
+    let consumer_va = 0x104_0000_0000;
+    let pa = 0x2000_0000;
+    let bytes = 36 << 20;
+    let mapping = ContiguousRamPublishedMapping::new(producer, source_va, pa, bytes, 1).unwrap();
+    assert_eq!(mapping.physical_address(producer, source_va), Some(pa));
+    assert_eq!(mapping.physical_address(producer, source_va + bytes - 1), Some(pa + bytes - 1));
+    assert_eq!(mapping.virtual_address(producer, pa, bytes, 1), Some(source_va));
+    assert_eq!(mapping.virtual_address(consumer, pa, bytes, 1), None);
+    assert_eq!(mapping.physical_address(consumer, source_va), None);
+    assert_eq!(mapping.physical_address(producer, source_va + bytes), None);
+    let mut projection = ContiguousRamProjectedMapping::new(mapping, producer, consumer,
+        consumer_va, pa, bytes, 1).unwrap();
+    assert_eq!(projection.virtual_address(consumer, pa, bytes, 1), Some(consumer_va));
+    assert_eq!(projection.virtual_address(consumer, pa + PAGE, PAGE, 1),
+        Some(consumer_va + PAGE));
+    assert_eq!(projection.virtual_address(stale_consumer, pa, bytes, 1), None);
+    assert_eq!(projection.virtual_address(producer, pa, bytes, 1), None);
+    assert_eq!(projection.virtual_address(consumer, pa, bytes, 2), None);
+    assert_eq!(projection.virtual_address(consumer, pa, bytes + PAGE, 1), None);
+    let second_va = consumer_va + (64 << 20);
+    let second = ContiguousRamProjectedMapping::new(mapping, producer, consumer,
+        second_va, pa, bytes, 1).unwrap();
+    assert!(projection.retire_exact(consumer, consumer_va + PAGE, PAGE).is_err());
+    assert!(projection.retire_exact(stale_consumer, consumer_va, bytes).is_err());
+    projection.retire_exact(consumer, consumer_va, bytes).unwrap();
+    assert_eq!(projection.virtual_address(consumer, pa, bytes, 1), None);
+    assert_eq!(second.virtual_address(consumer, pa, bytes, 1), Some(second_va));
+}
+
+#[test]
+fn blocked_dxg_alias_grants_ram_projection_only_during_create_callback_interval() {
+    use nt_hosted_runtime::dxg_contiguous_dependent_admitted;
+    assert!(dxg_contiguous_dependent_admitted(true, true, true, false, true,
+        false, true, 0x100));
+    assert!(!dxg_contiguous_dependent_admitted(true, true, true, false, true,
+        false, false, 0x100));
+    assert!(!dxg_contiguous_dependent_admitted(true, true, true, true, false,
+        false, true, 0x100));
+    assert!(!dxg_contiguous_dependent_admitted(true, true, true, false, false,
+        true, true, 0x100));
 }

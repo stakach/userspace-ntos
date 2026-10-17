@@ -5,6 +5,7 @@ use super::*;
 #[derive(Clone, Copy)]
 struct Allocation { address: u64, length: u64, cache: u32 }
 static mut ALLOCATIONS: Vec<Allocation> = Vec::new();
+const STATUS_NOT_FOUND: i32 = 0xc000_0034u32 as i32;
 
 unsafe fn call(op: u64, a1: u64, a2: u64, a3: u64) -> (i32, u64, u64, u64) {
     let (info, status, v1, v2, v3) = call_on4_raw(
@@ -89,4 +90,32 @@ pub(super) extern "win64" fn mm_free_contiguous_memory_specify_cache(
 pub(super) unsafe fn owns_allocation(address: u64) -> bool {
     let _guard = component_device_reply_lock();
     (&*core::ptr::addr_of!(ALLOCATIONS)).iter().any(|row| row.address == address)
+}
+
+/// Ask the executive to translate only a live physical run owned by this exact hosted domain.
+pub(super) unsafe fn physical_address(address: u64) -> Option<u64> {
+    let _guard = component_device_reply_lock();
+    let (status, physical, _, _) = call(HOSTED_DEVICE_OP_CONTIGUOUS_PHYSICAL,
+        address, 0, 0);
+    (status == STATUS_SUCCESS).then_some(physical)
+}
+
+/// A provider receives a separately mapped alias of its registered dependent's physical RAM.
+pub(super) unsafe fn map_physical(physical: u64, length: u64, cache: u32) -> Option<u64> {
+    if length == 0 { return None; }
+    let _guard = component_device_reply_lock();
+    let (status, address, _, _) = call(HOSTED_DEVICE_OP_CONTIGUOUS_MAP,
+        physical, length, cache as u64);
+    (status == STATUS_SUCCESS && address != 0).then_some(address)
+}
+
+pub(super) unsafe fn unmap_physical(address: u64, length: u64) -> bool {
+    let _guard = component_device_reply_lock();
+    let (status, _, _, _) = call(HOSTED_DEVICE_OP_CONTIGUOUS_UNMAP, address, length, 0);
+    match status {
+        STATUS_SUCCESS => true,
+        STATUS_NOT_FOUND => false,
+        _ => crate::provider_bugcheck::report(0xc4,
+            [0x434f_4e54, address, 5, status as u32 as u64]),
+    }
 }

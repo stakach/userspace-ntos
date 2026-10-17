@@ -598,6 +598,35 @@ pub(super) unsafe fn scanout_dependent_authority(
     dependent_instance: usize,
     dependent_domain: HostedDomainIdentity,
 ) -> Option<(usize, u64)> {
+    registered_dependent_authority(dependent_instance, dependent_domain, |alias| {
+        nt_hosted_runtime::dxg_scanout_dependent_admitted(
+            alias.callback_entered, alias.start_entered, alias.start_succeeded,
+            alias.start_callback_active, alias.blocked,
+            alias.pointer_retired, alias.interface_handle)
+    })
+}
+
+/// A started miniport's owned framebuffer may be projected into its registered Dxg provider.
+/// CreateAllocation briefly blocks the alias while its callback owns the request, so that exact
+/// in-flight callback is admitted without opening the stopped or uncertain registration.
+pub(super) unsafe fn contiguous_dependent_authority(
+    dependent_instance: usize,
+    dependent_domain: HostedDomainIdentity,
+) -> Option<(usize, u64)> {
+    registered_dependent_authority(dependent_instance, dependent_domain, |alias| {
+        nt_hosted_runtime::dxg_contiguous_dependent_admitted(
+            alias.callback_entered, alias.start_entered, alias.start_succeeded,
+            alias.stop_entered, alias.blocked, alias.pointer_retired,
+            alias.allocations.iter().any(|row| row.create_in_flight()),
+            alias.interface_handle)
+    })
+}
+
+unsafe fn registered_dependent_authority(
+    dependent_instance: usize,
+    dependent_domain: HostedDomainIdentity,
+    admit: impl Fn(&DxgPdoAlias) -> bool,
+) -> Option<(usize, u64)> {
     let dependent = instance(dependent_instance)?;
     if instance_domain_identity(dependent) != Some(dependent_domain) { return None; }
     let mut selected = None;
@@ -620,10 +649,7 @@ pub(super) unsafe fn scanout_dependent_authority(
         }
         if alias.dependent_instance != dependent_instance
             || alias.dependent_domain != dependent_domain
-            || !nt_hosted_runtime::dxg_scanout_dependent_admitted(
-                alias.callback_entered, alias.start_entered, alias.start_succeeded,
-                alias.start_callback_active, alias.blocked,
-                alias.pointer_retired, alias.interface_handle)
+            || !admit(alias)
         { continue; }
         let Some(provider) = instance(alias.provider_instance) else {
             print_str(b"[gop-dxg] reject provider-instance\n"); continue;

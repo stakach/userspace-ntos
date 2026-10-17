@@ -52,6 +52,103 @@ impl ContiguousRamLayout {
     }
 }
 
+/// A proved, published physical run in one provider VSpace. The executive constructs this only
+/// after frame identity and mapping publication; numeric addresses alone cannot grant access.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContiguousRamPublishedMapping {
+    owner: ContiguousRamOwner,
+    virtual_start: u64,
+    physical_start: u64,
+    length: u64,
+    cache: u32,
+}
+
+impl ContiguousRamPublishedMapping {
+    pub fn new(owner: ContiguousRamOwner, virtual_start: u64, physical_start: u64,
+        length: u64, cache: u32) -> Option<Self> {
+        if owner.generation == 0 || owner.domain == 0 || length == 0
+            || virtual_start & (PAGE - 1) != 0 || physical_start & (PAGE - 1) != 0
+            || virtual_start.checked_add(length).is_none()
+            || physical_start.checked_add(length).is_none() { return None; }
+        Some(Self { owner, virtual_start, physical_start, length, cache })
+    }
+
+    pub fn physical_address(self, owner: ContiguousRamOwner, address: u64) -> Option<u64> {
+        if owner != self.owner { return None; }
+        let offset = address.checked_sub(self.virtual_start)?;
+        (offset < self.length).then(|| self.physical_start + offset)
+    }
+
+    pub fn contains_physical(self, owner: ContiguousRamOwner, physical: u64,
+        length: u64, cache: u32) -> bool {
+        owner == self.owner && cache == self.cache && length != 0
+            && physical.checked_sub(self.physical_start)
+                .and_then(|offset| offset.checked_add(length))
+                .is_some_and(|end| end <= self.length)
+    }
+
+    pub fn virtual_address(self, owner: ContiguousRamOwner, physical: u64,
+        length: u64, cache: u32) -> Option<u64> {
+        if !self.contains_physical(owner, physical, length, cache) { return None; }
+        Some(self.virtual_start + (physical - self.physical_start))
+    }
+}
+
+/// A separate page-table projection of a provider's owned frames into a registered consumer.
+/// Native code retains every copied frame cap until this projection has been torn down.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContiguousRamProjectedMapping {
+    producer: ContiguousRamOwner,
+    consumer: ContiguousRamOwner,
+    virtual_start: u64,
+    physical_start: u64,
+    length: u64,
+    cache: u32,
+    live: bool,
+}
+
+impl ContiguousRamProjectedMapping {
+    pub fn new(source: ContiguousRamPublishedMapping, producer: ContiguousRamOwner,
+        consumer: ContiguousRamOwner, virtual_start: u64, physical_start: u64,
+        length: u64, cache: u32) -> Option<Self> {
+        if producer == consumer || consumer.generation == 0 || consumer.domain == 0
+            || (virtual_start & (PAGE - 1)) != (physical_start & (PAGE - 1))
+            || virtual_start.checked_add(length).is_none()
+            || !source.contains_physical(producer, physical_start, length, cache) {
+            return None;
+        }
+        Some(Self { producer, consumer, virtual_start, physical_start, length, cache, live: true })
+    }
+
+    pub fn virtual_address(self, consumer: ContiguousRamOwner, physical: u64,
+        length: u64, cache: u32) -> Option<u64> {
+        if !self.live || consumer != self.consumer || cache != self.cache || length == 0 {
+            return None;
+        }
+        let offset = physical.checked_sub(self.physical_start)?;
+        (offset.checked_add(length)? <= self.length).then(|| self.virtual_start + offset)
+    }
+
+    pub fn retire(&mut self, consumer: ContiguousRamOwner) -> Result<(), ContiguousRamError> {
+        if consumer != self.consumer { return Err(ContiguousRamError::WrongOwner); }
+        self.live = false;
+        Ok(())
+    }
+
+    /// A caller's MmUnmapIoSpace releases only the exact projection returned for that MAP.
+    pub fn retire_exact(&mut self, consumer: ContiguousRamOwner, virtual_start: u64,
+        length: u64) -> Result<(), ContiguousRamError> {
+        if consumer != self.consumer { return Err(ContiguousRamError::WrongOwner); }
+        if !self.live || virtual_start != self.virtual_start || length != self.length {
+            return Err(ContiguousRamError::Unproved);
+        }
+        self.live = false;
+        Ok(())
+    }
+
+    pub fn producer(self) -> ContiguousRamOwner { self.producer }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContiguousRamOwner {
     pub instance: usize,

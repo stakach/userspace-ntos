@@ -17,9 +17,14 @@ pub(super) struct DxgAllocationAlias {
     free_route: Option<nt_component_suspension::peer_registry::PeerRoute>,
     retirement: Option<DxgAllocationCookieRetirement>,
     destroy_entered: bool,
+    create_callback_active: bool,
 }
 
 impl DxgAllocationAlias {
+    pub(super) fn create_in_flight(&self) -> bool {
+        self.create_callback_active
+    }
+
     fn retain_uncertain(&self) {
         if let Some(guard) = &self.request { guard.retain_uncertain(); }
         if let Some(guard) = &self.info { guard.retain_uncertain(); }
@@ -158,13 +163,17 @@ pub(super) unsafe fn create(
         request_private, allocation_private, cookie: None, key: None,
         destroy_request: None, destroy_list: None,
         free_route: None, retirement: None, destroy_entered: false,
+        create_callback_active: false,
     });
     pdo_aliases_mut()[alias_index].blocked = true;
     let allocation_index = pdo_aliases_mut()[alias_index].allocations.len() - 1;
-    let result = match dispatch_dependent_provider_callback(dispatch, record,
+    pdo_aliases_mut()[alias_index].allocations[allocation_index].create_callback_active = true;
+    let dispatch_result = dispatch_dependent_provider_callback(dispatch, record,
         dependent_inst, exec_code_va,
         [provider_context, marshal_window.component_base, 0, 0],
-        [0; PROVIDER_CALLBACK_STACK_QWORDS]) {
+        [0; PROVIDER_CALLBACK_STACK_QWORDS]);
+    pdo_aliases_mut()[alias_index].allocations[allocation_index].create_callback_active = false;
+    let result = match dispatch_result {
         Ok(result) => result,
         Err(status) => {
             pdo_aliases_mut()[alias_index].allocations[allocation_index].retain_uncertain();

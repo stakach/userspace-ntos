@@ -1491,6 +1491,19 @@ pub const fn dxg_scanout_dependent_admitted(
         && (start_callback_active || (start_succeeded && !blocked))
 }
 
+/// A blocked registration may expose its dependent's owned RAM only while CreateAllocation is
+/// actively executing. Retained callback guards after an uncertain return confer no authority.
+#[allow(clippy::too_many_arguments)]
+pub const fn dxg_contiguous_dependent_admitted(
+    callback_entered: bool, start_entered: bool, start_succeeded: bool,
+    stop_entered: bool, blocked: bool, pointer_retired: bool,
+    create_callback_active: bool, interface_handle: u64,
+) -> bool {
+    callback_entered && start_entered && start_succeeded && !stop_entered
+        && !pointer_retired && interface_handle != 0
+        && (!blocked || create_callback_active)
+}
+
 /// A provider worker's channel alone does not grant access to the boot scanout. Its exact
 /// publication must also be the provider side of a currently live Dxg miniport registration.
 #[allow(clippy::too_many_arguments)]

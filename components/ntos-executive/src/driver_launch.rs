@@ -5959,6 +5959,9 @@ const HOSTED_DEVICE_OP_CONTIGUOUS_PREPARE: u64 = 32;
 const HOSTED_DEVICE_OP_CONTIGUOUS_COMMIT: u64 = 33;
 const HOSTED_DEVICE_OP_CONTIGUOUS_FREE: u64 = 34;
 const HOSTED_DEVICE_OP_CONTIGUOUS_EXPIRE: u64 = 35;
+const HOSTED_DEVICE_OP_CONTIGUOUS_PHYSICAL: u64 = 36;
+const HOSTED_DEVICE_OP_CONTIGUOUS_MAP: u64 = 37;
+const HOSTED_DEVICE_OP_CONTIGUOUS_UNMAP: u64 = 38;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN: u64 = 0;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF: u64 = 2;
 const HOSTED_DEVICE_ARG_DATA_OFF: u64 = FSD_ARG_BYTES;
@@ -10656,10 +10659,10 @@ unsafe fn hosted_component_physical_address(virtual_address: u64) -> Option<u64>
             .translated_start
             .checked_add(virtual_address.checked_sub(resource.va)?);
     }
-    nt_compat_exports::memory::physical_address(
-        hosted_component_physical_mappings()?,
-        virtual_address,
-    )
+    hosted_component_physical_mappings()
+        .and_then(|mappings| nt_compat_exports::memory::physical_address(
+            mappings, virtual_address))
+        .or_else(|| hosted_driver_contiguous_memory::physical_address(virtual_address))
 }
 
 unsafe fn hosted_component_virtual_address(physical_address: u64, length: u64) -> Option<u64> {
@@ -10695,6 +10698,11 @@ extern "win64" fn s_mm_map_io_space(phys: u64, length: u64, cache: u32) -> u64 {
             length,
             true,
         ) else {
+            if let Some(projected) = hosted_driver_contiguous_memory::map_physical(
+                phys, length, cache) {
+                trace_hosted_mm_map_io_space(phys, length, cache, projected, b"contiguous-owned");
+                return projected;
+            }
             // A live GOP/Dxg registration may own the boot scanout through its PCI display BAR
             // even when this component has no ordinary PnP memory grant (ROOT miniports).
             let (words, projected, _, _, _) = call_on4_raw(
@@ -10733,6 +10741,7 @@ extern "win64" fn s_mm_map_io_space(phys: u64, length: u64, cache: u32) -> u64 {
 /// owned by the executive grant and is torn down with the component.
 extern "win64" fn s_mm_unmap_io_space(base: u64, _length: u64) {
     unsafe {
+        if hosted_driver_contiguous_memory::unmap_physical(base, _length) { return; }
         let shared = hosted_provider_export_lane::current_component_bank()
             .or_else(hosted_class_irp_lane::current_component_bank)
             .unwrap_or(FSD_SHARED_VADDR);
@@ -55754,12 +55763,18 @@ pub(crate) fn service_hosted_device(
             | HOSTED_DEVICE_OP_CONTIGUOUS_COMMIT
             | HOSTED_DEVICE_OP_CONTIGUOUS_FREE
             | HOSTED_DEVICE_OP_CONTIGUOUS_EXPIRE
+            | HOSTED_DEVICE_OP_CONTIGUOUS_PHYSICAL
+            | HOSTED_DEVICE_OP_CONTIGUOUS_MAP
+            | HOSTED_DEVICE_OP_CONTIGUOUS_UNMAP
     ) {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
     }
     if matches!(op, HOSTED_DEVICE_OP_CONTIGUOUS_PREPARE
         | HOSTED_DEVICE_OP_CONTIGUOUS_COMMIT | HOSTED_DEVICE_OP_CONTIGUOUS_FREE
-        | HOSTED_DEVICE_OP_CONTIGUOUS_EXPIRE) {
+        | HOSTED_DEVICE_OP_CONTIGUOUS_EXPIRE
+        | HOSTED_DEVICE_OP_CONTIGUOUS_PHYSICAL
+        | HOSTED_DEVICE_OP_CONTIGUOUS_MAP
+        | HOSTED_DEVICE_OP_CONTIGUOUS_UNMAP) {
         return hosted_contiguous_ram_broker::service(ch, op, pdo_object, arg2, arg3,
             active_reply_cap, caller_badge);
     }

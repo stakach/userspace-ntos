@@ -20,8 +20,10 @@ mod hosted_event_projection;
 pub use driver_load_receipt::{DriverLoadPhase, RetainedEffectState};
 pub use contiguous_ram::{ContiguousRamError, ContiguousRamLayout, ContiguousRamOwner,
     ContiguousRamPrepareTable, ContiguousRamReceipt, ContiguousRamRequest,
-    ContiguousRamLeaseBank, ContiguousRamLease, ContiguousRamLeaseSource};
+    ContiguousRamLeaseBank, ContiguousRamLease, ContiguousRamLeaseSource,
+    ContiguousRamPublishedMapping, ContiguousRamProjectedMapping};
 pub use dxg_registration::{
+    dxg_contiguous_dependent_admitted,
     dxg_scanout_dependent_admitted,
     dxg_scanout_provider_admitted,
     dxg_stop_device_admitted,
