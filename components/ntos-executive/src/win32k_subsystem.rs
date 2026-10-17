@@ -1194,9 +1194,8 @@ const PROCESSINFO_PW32JOB_OFF: u64 = 0x260;
 /// only for the two global-atom user services and restores it before returning.
 const G_ATOM_TABLE_RVA: u64 = 0x23c2a8;
 static WIN32K_SESSION_ATOM_TABLE: AtomicU64 = AtomicU64::new(0);
-/// PROCESSINFO->HeapMappings (`win32.h`). The first embedded entry is the global USER heap; its
-/// `Next` chain holds per-desktop heap mappings for DesktopHeapGetUserDelta/DesktopHeapAddressToUser.
-const PROCESSINFO_HEAP_MAPPINGS_OFF: u64 = 0x340;
+/// The first embedded PROCESSINFO heap entry is the global USER heap. The address of its `Next`
+/// chain comes from the pinned LiberNT win32k layout contract in `nt-user-host`.
 const W32PROCESS_PEPROCESS_OFF: u64 = 0x00;
 const W32PROCESS_FLAGS_OFF: u64 = 0x0C;
 const W32PROCESS_W32PID_OFF: u64 = 0x40;
@@ -9223,7 +9222,7 @@ unsafe fn ensure_process_desktop_heap_mapping(ppi: u64, desk_body: u64) -> Optio
         return None;
     }
     let (kernel_base, user_base, limit) = desktop_heap_client_mapping(desk_body)?;
-    let head = ppi + PROCESSINFO_HEAP_MAPPINGS_OFF;
+    let head = nt_user_host::win32k_process_heap::heap_mappings_head(ppi)?;
     let mut prev_next = head + W32HEAP_MAPPING_NEXT_OFF;
     let mut mapping = read_volatile(prev_next as *const u64);
     let mut scanned = 0usize;
@@ -9358,9 +9357,10 @@ unsafe fn prepared_process_desktop_mapping(
     if ppi == 0 {
         return false;
     }
-    let mut mapping = read_volatile(
-        (ppi + PROCESSINFO_HEAP_MAPPINGS_OFF + W32HEAP_MAPPING_NEXT_OFF) as *const u64,
-    );
+    let Some(head) = nt_user_host::win32k_process_heap::heap_mappings_head(ppi) else {
+        return false;
+    };
+    let mut mapping = read_volatile((head + W32HEAP_MAPPING_NEXT_OFF) as *const u64);
     let mut scanned = 0usize;
     while mapping != 0 && scanned < 64 {
         if read_volatile((mapping + W32HEAP_MAPPING_KERNEL_OFF) as *const u64) == kernel_base {
