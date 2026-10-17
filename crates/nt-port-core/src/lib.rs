@@ -936,6 +936,23 @@ impl PortCore {
             .position(|port| port.user_open && port.handle == port_handle)
             .or_else(|| self.connection_port_index_for_server_handle(port_handle))
             .ok_or(NtStatus::INVALID_HANDLE)?;
+        self.receive_from_port_index(port_index)
+    }
+
+    /// A server reply-and-wait may use its accepted communication handle while
+    /// waiting for the next connection on the parent listen port. Ordinary
+    /// receives on an ALPC communication handle remain connection-local.
+    pub fn receive_after_server_reply(
+        &mut self,
+        port_handle: u64,
+    ) -> Result<ReceiveOutcome, NtStatus> {
+        if let Some(index) = self.parent_port_index_for_server_handle(port_handle) {
+            return self.receive_from_port_index(index);
+        }
+        self.receive(port_handle)
+    }
+
+    fn receive_from_port_index(&mut self, port_index: usize) -> Result<ReceiveOutcome, NtStatus> {
         let port = &mut self.ports[port_index];
         if port.pending.is_empty() {
             return Ok(ReceiveOutcome::WouldBlock);
@@ -959,6 +976,28 @@ impl PortCore {
         let connection_id = *port.pending.first()?;
         let connection = self.connections.iter().find(|connection| connection.id == connection_id)?;
         Some((connection_id, connection.conn_info.len()))
+    }
+
+    /// Capacity probe matching `receive_after_server_reply`.
+    pub fn peek_pending_connection_after_server_reply(
+        &self,
+        port_handle: u64,
+    ) -> Option<(u64, usize)> {
+        let port = self.parent_port_index_for_server_handle(port_handle)
+            .and_then(|index| self.ports.get(index))
+            .or_else(|| self.ports.iter().find(|port| port.user_open && port.handle == port_handle))?;
+        let connection_id = *port.pending.first()?;
+        let connection = self.connections.iter().find(|connection| connection.id == connection_id)?;
+        Some((connection_id, connection.conn_info.len()))
+    }
+
+    /// The parent listen handle owns the connection receipt even when a
+    /// reply-and-wait delivered the request through a server comm handle.
+    pub fn connection_listen_handle_for_server_reply(&self, handle: u64) -> Option<u64> {
+        let port = self.parent_port_index_for_server_handle(handle)
+            .and_then(|index| self.ports.get(index))
+            .or_else(|| self.ports.iter().find(|port| port.user_open && port.handle == handle))?;
+        port.user_open.then_some(port.handle)
     }
 
     /// Accept (or refuse) a pending connection. On accept, returns the server
@@ -2286,13 +2325,22 @@ impl PortCore {
     }
 
     /// Classic LPC server communication ports reply to one client but receive from their associated
-    /// named connection port. ALPC server handles are exact endpoints and never use this alias.
+    /// named connection port. ALPC server handles use that association only for reply-and-wait.
     fn connection_port_index_for_server_handle(&self, handle: u64) -> Option<usize> {
         let connection = self.connections.iter().find(|connection| {
             handle != 0
                 && connection.server_open
                 && connection.server_handle == handle
                 && connection.server_api == PortApi::Lpc
+        })?;
+        self.parent_port_index_for_server_handle(connection.server_handle)
+    }
+
+    fn parent_port_index_for_server_handle(&self, handle: u64) -> Option<usize> {
+        let connection = self.connections.iter().find(|connection| {
+            handle != 0
+                && connection.server_open
+                && connection.server_handle == handle
         })?;
         self.ports
             .iter()

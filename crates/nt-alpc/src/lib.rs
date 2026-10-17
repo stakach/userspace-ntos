@@ -1013,6 +1013,13 @@ impl AlpcServer {
                 message_id: u32::try_from(token.1).ok().filter(|id| *id != 0)
                     .ok_or(NtStatus::INVALID_PARAMETER)? })
         } else { None };
+        let receipt_listen_port = if checked.send_receive.flags & send_flag::REPLY_MESSAGE != 0 {
+            core.connection_listen_handle_for_server_reply(checked.send_receive.port_handle)
+        } else {
+            core.handle_info(checked.send_receive.port_handle)
+                .filter(|info| info.endpoint == PortHandleEndpoint::ListenPort)
+                .map(|_| checked.send_receive.port_handle)
+        };
         if let Some(saved) = self.send_receive_results.iter_mut().find(|saved| saved.token == token) {
             if saved.owner != owner || saved.owner_generation != invocation.owner_generation {
                 return Err(NtStatus::OBJECT_NAME_COLLISION);
@@ -1024,9 +1031,7 @@ impl AlpcServer {
                 out_buf.copy_from_slice(&saved.output);
                 return Ok(result);
             }
-            if core.handle_info(checked.send_receive.port_handle)
-                .is_some_and(|info| info.endpoint == PortHandleEndpoint::ListenPort)
-            {
+            if receipt_listen_port.is_some() {
                 if self.connection_receipts.len() >= MAX_CHECKED_SEND_RECEIVE {
                     return Err(NtStatus::INSUFFICIENT_RESOURCES);
                 }
@@ -1051,7 +1056,7 @@ impl AlpcServer {
             {
                 self.connection_receipts.push(ConnectionReceipt { owner,
                     owner_generation: invocation.owner_generation,
-                    listen_port: checked.send_receive.port_handle,
+                    listen_port: receipt_listen_port.ok_or(NtStatus::INVALID_PORT_HANDLE)?,
                     connection_id: result.detail0 });
             }
             out_buf.copy_from_slice(&saved.output);
@@ -1069,7 +1074,7 @@ impl AlpcServer {
         if info.api != PortApi::Alpc || owner.process != port_owner {
             return Err(NtStatus::ACCESS_DENIED);
         }
-        if info.endpoint == PortHandleEndpoint::ListenPort {
+        if receipt_listen_port.is_some() {
             if self.connection_receipts.len() >= MAX_CHECKED_SEND_RECEIVE {
                 return Err(NtStatus::INSUFFICIENT_RESOURCES);
             }
@@ -1114,7 +1119,7 @@ impl AlpcServer {
         {
             self.connection_receipts.push(ConnectionReceipt { owner,
                 owner_generation: invocation.owner_generation,
-                listen_port: checked.send_receive.port_handle,
+                listen_port: receipt_listen_port.ok_or(NtStatus::INVALID_PORT_HANDLE)?,
                 connection_id: result.detail0 });
         }
         out_buf.copy_from_slice(&saved.output);
@@ -1224,9 +1229,14 @@ impl AlpcServer {
                 u64::from(prefix.1), u64::from(read_msg_type(&bytes))));
         }
 
+        let reply_wait = req.flags & send_flag::REPLY_MESSAGE != 0;
         if native_checked {
             if let Some((connection_id, payload_len)) =
-                core.peek_pending_connection(req.port_handle)
+                if reply_wait {
+                    core.peek_pending_connection_after_server_reply(req.port_handle)
+                } else {
+                    core.peek_pending_connection(req.port_handle)
+                }
             {
                 let total = size_of::<PortMessage>().checked_add(payload_len)
                     .ok_or(NtStatus::INVALID_PARAMETER)?;
@@ -1246,7 +1256,11 @@ impl AlpcServer {
         // Receive half. NtAlpcSendWaitReceivePort receives BOTH a pending
         // connection request (on a listen port) AND a data message (on a comm
         // port); try the connection request first, then the data queue.
-        let conn_try = core.receive(req.port_handle);
+        let conn_try = if reply_wait {
+            core.receive_after_server_reply(req.port_handle)
+        } else {
+            core.receive(req.port_handle)
+        };
         if let Ok(ReceiveOutcome::ConnectionRequest {
             connection_id,
             msg_type,

@@ -708,6 +708,62 @@ fn checked_smss_reply_and_receive_routes_exact_delivered_request_once() {
 }
 
 #[test]
+fn reply_wait_on_server_comm_port_receives_next_connection_request() {
+    use nt_port_core::{ClientId, ConnectOutcome, MessageAttrs, MessageIdentity};
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let name = utf16("\\ApiPortReplyWait");
+    let server = ClientId { process: 7, thread: 11 };
+    let listen = core.create_port_with_owner(&name, PortApi::Alpc, server);
+    let first_client = ClientId { process: 8, thread: 12 };
+    let ConnectOutcome::Pending { connection_id: first_id } = core
+        .connect_with_client_id(&name, PortApi::Alpc, 0, b"first", first_client)
+        .unwrap() else { panic!("first connect must pend"); };
+    core.receive(listen).unwrap();
+    let server_comm = core.accept(first_id, true, 0).unwrap();
+    let client_comm = core.complete(first_id).unwrap().0;
+    let identity = MessageIdentity { client: first_client, message_id: 91 };
+    let mut request = port_message(msg_type::REQUEST, b"ping");
+    request[8..16].copy_from_slice(&first_client.process.to_le_bytes());
+    request[16..24].copy_from_slice(&first_client.thread.to_le_bytes());
+    request[24..28].copy_from_slice(&identity.message_id.to_le_bytes());
+    core.send_request_message(client_comm, &request, MessageAttrs::default(), identity)
+        .unwrap();
+    assert_eq!(core.receive_message(server_comm).unwrap().unwrap().bytes, request);
+
+    let second_client = ClientId { process: 9, thread: 13 };
+    let ConnectOutcome::Pending { connection_id: second_id } = core
+        .connect_with_client_id(&name, PortApi::Alpc, 0, b"second", second_client)
+        .unwrap() else { panic!("second connect must pend"); };
+    let mut reply_message = port_message(msg_type::REPLY, b"pong");
+    reply_message[8..16].copy_from_slice(&first_client.process.to_le_bytes());
+    reply_message[16..24].copy_from_slice(&first_client.thread.to_le_bytes());
+    reply_message[24..28].copy_from_slice(&identity.message_id.to_le_bytes());
+    let mut wire = enc_checked_receive(server_comm, server, (3, 101));
+    let mut header: nt_alpc_abi::AlpcSendReceiveCheckedRequest =
+        bytemuck::pod_read_unaligned(&wire);
+    header.send_receive.flags = nt_alpc_abi::send_flag::REPLY_MESSAGE;
+    header.send_receive.message_offset = wire.len() as u32;
+    header.send_receive.message_len_bytes = reply_message.len() as u32;
+    wire.copy_from_slice(bytemuck::bytes_of(&header));
+    wire.extend_from_slice(&reply_message);
+    let mut output = [0u8; 128];
+    let result = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &wire, &mut output);
+    assert_eq!(result.status, SUCCESS);
+    assert_eq!(result.detail0, second_id);
+    let connection: PortMessage = bytemuck::pod_read_unaligned(&output[..size_of::<PortMessage>()]);
+    assert_eq!(connection.msg_type, msg_type::CONNECTION_REQUEST);
+    assert_eq!(&output[size_of::<PortMessage>()..result.information as usize], b"second");
+    assert_eq!(core.receive_reply_message(client_comm, identity).unwrap().unwrap().bytes,
+        reply_message);
+    let accepted = alpc.dispatch(&mut core, aop::ALPC_OP_ACCEPT_CONNECT,
+        &enc_checked_accept(listen, second_id, server, (3, 102)), &mut []);
+    assert_eq!(accepted.status, SUCCESS,
+        "the receive receipt must name the parent listen port for checked accept");
+}
+
+#[test]
 fn checked_sync_request_waits_for_its_exact_reply_without_replaying_send() {
     use nt_port_core::{ClientId, ConnectOutcome, MessageAttrs, MessageIdentity};
     let mut core = PortCore::new();
