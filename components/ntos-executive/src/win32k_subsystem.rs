@@ -1302,6 +1302,10 @@ const CLIENTINFO_PCLIENTTHREADINFO_OFF: u64 = 0x60;
 const THREADINFO_HEVENT_QUEUE_CLIENT_OFF: u64 = 0x138;
 /// THREADINFO->PtiLink offset, membership in DESKTOP.PtiList.
 const THREADINFO_PTI_LINK_OFF: u64 = 0x148;
+/// Pinned LiberNT `MsqCleanupThreadMsgs` addresses `PostedMessagesListHead` at THREADINFO+0x190.
+/// This is distinct from the preceding +0x188 field; seeding a head there makes an empty
+/// +0x190 list appear to contain the +0x188 field and trips `RemoveEntryList` fail-fast.
+const THREADINFO_POSTED_MESSAGES_OFF: u64 = 0x190;
 /// KL layout and CLIENTINFO.{hKL,CodePage}. ReactOS' `tagKL` starts with `HEAD` (16 bytes on x64),
 /// then the pklNext/pklPrev ring, flags, hkl, spkf, font sigs/base charset, and CodePage.
 const KL_PKL_PREV_OFF: u64 = 0x18;
@@ -18151,11 +18155,11 @@ unsafe fn init_threadinfo_placeholder(w32thread: u64) {
     //   +0x2d8 WindowListHead         (IntCreateWindow window.c:2142)
     //   +0x2e8 W32CallbackListHead    (IntCbAllocateMemory callback.c)
     //   +0x148 PtiLink                (IntSetThreadDesktop desktop.c:3463/3471)
-    //   +0x188 PostedMessagesListHead — `InsertTailList(&pti->PostedMessagesListHead,…)` MsqPostMessage
+    //   +0x190 PostedMessagesListHead — `InsertTailList(&pti->PostedMessagesListHead,…)` MsqPostMessage
     //          (msgqueue.c:1369). NtUserPostMessage(SAS window, WLX_WM_SAS) posts here; a NULL (zeroed)
     //          list head → InsertTailList derefs head->Blink (offset +8) → null-deref at cr2=0x8.
-    //          Offset computed from the SentMessagesListHead@0xB0 anchor per win32.h THREADINFO layout.
-    for off in [0xB0u64, THREADINFO_PTI_LINK_OFF, 0x188, 0x2d8, 0x2e8] {
+    //          Offset confirmed by pinned LiberNT `MsqCleanupThreadMsgs` list-head LEA.
+    for off in [0xB0u64, THREADINFO_PTI_LINK_OFF, THREADINFO_POSTED_MESSAGES_OFF, 0x2d8, 0x2e8] {
         let head = w32thread + off;
         ensure_list_head_initialized(head);
     }
