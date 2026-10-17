@@ -22110,7 +22110,12 @@ pub(crate) unsafe fn service_sec_image(
         // handler produced — differing only in the two transport switches a target with no ntdll
         // mapped requires (direct entry instead of `LdrInitializeThunk`, hosted-syscalls instead of
         // the native Call) and a private endpoint, so the post-loop test can service it itself.
-        {
+        if nt_handler.pm.has_process_exit_notify_registrations() {
+            // This synthetic target has no ordinary provider create lifecycle. Do not inject its
+            // exit into live providers from a post-loop diagnostic.
+            print_str(b"[ntos-exec] dbgk remote-breakin selftest skipped: provider exit callbacks live\n");
+            DBGK_BREAKIN_SELFTEST.store(0, Ordering::Relaxed);
+        } else {
             use nt_process::dbgk;
             const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
             const PROCESS_CREATE_THREAD: u32 = 0x0002;
@@ -22930,6 +22935,7 @@ pub(crate) unsafe fn service_sec_image(
                 "debugger fixture detaches before retiring target Ps bodies");
             nt_handler.pm.terminate_process(target, nt_process::STATUS_SUCCESS)
                 .expect("debugger fixture terminates its throwaway target");
+            crate::process_terminal_receipt::drain_hosted_process_exit_notifications(&mut nt_handler);
             let retirement = nt_handler.pm.withdraw_process_object_if_unreferenced(target)
                 .expect("debugger fixture releases every target object reference");
             let backing = ps_object_backing::retire_withdrawn(

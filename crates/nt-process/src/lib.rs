@@ -1270,6 +1270,11 @@ impl ProcessManager {
         }
     }
 
+    /// Whether any provider process-exit callback is currently registered.
+    pub fn has_process_exit_notify_registrations(&self) -> bool {
+        self.process_exit_notify.has_registrations()
+    }
+
     /// Admit a process-exit callback after the host proves `callback` belongs to the exact loaded
     /// provider image instance. Registration keeps that image instance live until removal.
     pub fn register_process_exit_notify(
