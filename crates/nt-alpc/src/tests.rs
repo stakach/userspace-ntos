@@ -553,6 +553,62 @@ fn checked_connection_receive_with_context_output_keeps_message_and_empty_valid_
     assert_eq!(&output[48..53], b"hello");
 }
 
+#[test]
+fn checked_smss_reply_and_receive_routes_exact_delivered_request_once() {
+    use nt_port_core::{ClientId, MessageAttrs, MessageIdentity};
+    let mut core = PortCore::new();
+    let mut alpc = AlpcServer::new();
+    let server = ClientId { process: 7, thread: 11 };
+    let identity = MessageIdentity {
+        client: ClientId { process: 8, thread: 12 }, message_id: 91,
+    };
+    let name = utf16("\\SmApiPortReply");
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, server, (3, 80)), &mut []);
+    assert_eq!(created.status, SUCCESS);
+    let listen = created.detail0;
+    let kernel = core.retain_connection_port(listen).unwrap();
+    let mut request = port_message(msg_type::REQUEST, b"hi");
+    request[8..16].copy_from_slice(&identity.client.process.to_le_bytes());
+    request[16..24].copy_from_slice(&identity.client.thread.to_le_bytes());
+    request[24..28].copy_from_slice(&identity.message_id.to_le_bytes());
+    core.send_kernel_request_message(kernel, &request, MessageAttrs::default(), identity).unwrap();
+    let mut received = [0u8; 128];
+    let first = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &enc_checked_receive(listen, server, (3, 81)), &mut received);
+    assert_eq!(first.status, SUCCESS);
+    assert_eq!(&received[..request.len()], &request);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_ACK_SEND_RECEIVE,
+        &enc_ack_receive(server, (3, 81)), &mut []).status, SUCCESS);
+
+    // SMSS keeps the received header and uses ALPC_MSGFLG_REPLY_MESSAGE.
+    let mut response = port_message(msg_type::REQUEST, b"OK");
+    response[8..16].copy_from_slice(&identity.client.process.to_le_bytes());
+    response[16..24].copy_from_slice(&identity.client.thread.to_le_bytes());
+    response[24..28].copy_from_slice(&identity.message_id.to_le_bytes());
+    let mut wire = enc_checked_receive(listen, server, (3, 82));
+    let mut header: nt_alpc_abi::AlpcSendReceiveCheckedRequest =
+        bytemuck::pod_read_unaligned(&wire);
+    header.send_receive.flags = nt_alpc_abi::send_flag::RECV_ATTRIBUTES
+        | nt_alpc_abi::send_flag::REPLY_MESSAGE;
+    header.send_receive.valid_attributes = msg_attr_flag::CONTEXT;
+    header.send_receive.message_offset = wire.len() as u32;
+    header.send_receive.message_len_bytes = response.len() as u32;
+    wire.copy_from_slice(bytemuck::bytes_of(&header));
+    wire.extend_from_slice(&response);
+    let mut output = [0u8; 128];
+    let pending = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &wire, &mut output);
+    assert_eq!(pending.status, nt_status::NtStatus::PENDING.0);
+    let delivered = core.receive_reply_message(kernel, identity).unwrap().unwrap().bytes;
+    assert_eq!(&delivered[8..], &response[8..], "identity and payload survive reply routing");
+    assert_eq!(u16::from_le_bytes(delivered[4..6].try_into().unwrap()), msg_type::REPLY,
+        "ALPC reply delivery must normalize the reused SMSS request header");
+    // A pending poll of the same token must not replay the already sent reply.
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &wire, &mut output).status,
+        nt_status::NtStatus::PENDING.0);
+    assert_eq!(core.receive_reply_message(kernel, identity).unwrap(), None);
+}
+
 fn enc_owned_create_port(
     name: &[u16],
     owner: nt_port_core::ClientId,

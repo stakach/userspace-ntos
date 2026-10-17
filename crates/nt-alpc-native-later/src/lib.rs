@@ -262,7 +262,8 @@ pub fn capture_send_wait_receive(
     mut probe_output: impl FnMut(u64, usize) -> bool,
 ) -> Result<CapturedSendWaitReceive, u32> {
     let [port, flags, send, send_attrs, receive, receive_size, receive_attrs, timeout] = args;
-    if port == 0 || flags != 0 || (send == 0 && send_attrs != 0)
+    if port == 0 || flags & !u64::from(nt_alpc_abi::send_flag::REPLY_MESSAGE) != 0
+        || (flags != 0 && send == 0) || (send == 0 && send_attrs != 0)
         || (receive == 0) != (receive_size == 0)
         || (receive == 0 && receive_attrs != 0)
     { return Err(STATUS_INVALID_PARAMETER); }

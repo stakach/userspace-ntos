@@ -947,11 +947,13 @@ impl AlpcServer {
         if owner.process == 0 || owner.thread == 0 || invocation.owner_generation == 0
             || token == (0, 0) || checked.send_receive._reserved != 0
             || checked.send_receive._reserved2 != 0
-            || checked.send_receive.flags & !send_flag::RECV_ATTRIBUTES != 0
+            || checked.send_receive.flags
+                & !(send_flag::RECV_ATTRIBUTES | send_flag::REPLY_MESSAGE) != 0
+            || (checked.send_receive.flags & send_flag::REPLY_MESSAGE != 0
+                && checked.send_receive.message_len_bytes == 0)
             || (checked.send_receive.flags & send_flag::RECV_ATTRIBUTES != 0
                 && (checked.send_receive.valid_attributes != msg_attr_flag::CONTEXT
-                    || checked.send_receive.attr_len_bytes != 0
-                    || checked.send_receive.message_len_bytes != 0))
+                    || checked.send_receive.attr_len_bytes != 0))
         {
             return Err(NtStatus::INVALID_PARAMETER);
         }
@@ -1104,7 +1106,27 @@ impl AlpcServer {
             let msg = read_blob(buf, req.message_offset, req.message_len_bytes)?;
             let attr_blob = read_blob(buf, req.attr_offset, req.attr_len_bytes)?;
             let attrs = parse_attrs(req.valid_attributes, attr_blob);
-            core.send_message(req.port_handle, msg, attrs)?;
+            if req.flags & send_flag::REPLY_MESSAGE != 0 {
+                let header: PortMessage = read_at(msg, 0).ok_or(NtStatus::INVALID_PARAMETER)?;
+                if usize::from(header.total_length) != msg.len()
+                    || usize::from(header.data_length) + size_of::<PortMessage>() != msg.len()
+                { return Err(NtStatus::INVALID_PARAMETER); }
+                let mut reply = Vec::new();
+                reply.try_reserve_exact(msg.len())
+                    .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+                reply.extend_from_slice(msg);
+                reply[4..6].copy_from_slice(&nt_alpc_abi::msg_type::REPLY.to_le_bytes());
+                core.send_reply_message(req.port_handle, &reply, attrs,
+                    nt_port_core::MessageIdentity {
+                        client: ClientId {
+                            process: header.client_process,
+                            thread: header.client_thread,
+                        },
+                        message_id: header.message_id,
+                    })?;
+            } else {
+                core.send_message(req.port_handle, msg, attrs)?;
+            }
         }
 
         if native_checked {

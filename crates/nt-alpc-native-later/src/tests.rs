@@ -67,6 +67,25 @@ fn smss_receive_context_attribute_is_bounded_and_retained_before_effect() {
 }
 
 #[test]
+fn smss_reply_and_receive_captures_the_reply_with_context_output() {
+    let mut image = [0u8; 512];
+    image[32..40].copy_from_slice(&128u64.to_le_bytes());
+    image[64..66].copy_from_slice(&2u16.to_le_bytes());
+    image[66..68].copy_from_slice(&42u16.to_le_bytes());
+    // SMSS reuses the request header; the flag, not the header type, marks a reply.
+    image[68..70].copy_from_slice(&nt_alpc_abi::msg_type::REQUEST.to_le_bytes());
+    image[104..106].copy_from_slice(b"OK");
+    image[256..260].copy_from_slice(&CONTEXT_ATTR.to_le_bytes());
+    let captured = capture_send_wait_receive(
+        [77, u64::from(nt_alpc_abi::send_flag::REPLY_MESSAGE), 64, 0, 128, 32, 256, 0],
+        |p, b| read_image(&image, p, b), |_, _| true,
+    ).expect("SMSS sends its previous reply while receiving the next request");
+    assert_eq!(captured.flags, nt_alpc_abi::send_flag::REPLY_MESSAGE);
+    assert_eq!(captured.send_message.as_deref(), Some(&image[64..106]));
+    assert_eq!(captured.receive.unwrap().attributes, Some((256, CONTEXT_ATTR)));
+}
+
+#[test]
 fn connect_capture_owns_name_and_rejects_unmodeled_security_inputs() {
     let mut image = [0u8; 512];
     image[64..66].copy_from_slice(&20u16.to_le_bytes());
