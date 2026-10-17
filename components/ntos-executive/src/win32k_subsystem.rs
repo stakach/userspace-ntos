@@ -10016,11 +10016,25 @@ extern "win64" fn s_ke_add_system_service_table(
 
 /// `VOID ExFreePoolWithTag(PVOID, ULONG)`. Resolve the allocation by exact arena membership and
 /// live-header validation. Foreign and duplicate frees remain visible instead of being accepted.
+pub(crate) const VIDEO_MONITOR_ARRAY_PROJECTION_BYTES: usize = 48;
+pub(crate) const VIDEO_MONITOR_ARRAY_PROJECTION_MAGIC: u64 = 0x564d_4f4e_4152_5231;
+
+/// The root pins this typed array until it observes the dependent's exact free. The final word is
+/// a one-way release witness; only root retires either physical allocation after terminal ACK.
+unsafe fn release_monitor_array_projection(p: u64) -> Option<bool> {
+    source_irp_call::claim_monitor_array_projection_free(p)
+}
+
 extern "win64" fn s_ex_free_pool_with_tag(p: u64, _tag: u64) {
     unsafe {
         let in_provider_pool = provider_pool_contains(p);
         if in_provider_pool && source_irp::is_source_irp(p) {
             print_str(b"[win32k-host] source IRP requires exact retirement, not ExFreePool\n");
+            park();
+        }
+        if let Some(released) = release_monitor_array_projection(p) {
+            if released { return; }
+            print_str(b"[win32k-host] duplicate monitor array projection free\n");
             park();
         }
         let in_ftyp_pool = p >= WIN32K_FTYP_VADDR + POOL_DATA_OFF + FTYP_HDR_SIZE

@@ -463,6 +463,38 @@ pub(super) unsafe fn retire_owned_temporary_pool_allocation(
     Ok(())
 }
 
+/// VideoPort transfers ownership of its monitor array to the successful IOCTL caller. The
+/// win32k bridge is that caller's proxy: its typed lease proves the exact provider generation,
+/// dependent free, and completion barrier before this physical free may be attempted.
+pub(super) unsafe fn retire_transferred_monitor_array(
+    pin: &mut TemporaryPoolPin,
+    ownership: &nt_io_manager::video_monitor_array_projection::MonitorArrayProjection,
+) -> Result<(), nt_status::NtStatus> {
+    use nt_io_manager::video_monitor_array_projection::MonitorArrayAllocation;
+    let source = MonitorArrayAllocation::new(pin.domain, pin.allocation)
+        .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+    if ownership.source() != source || !ownership.provider_retirement_ready() {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    retire_owned_temporary_pool_allocation(pin)
+}
+
+/// A sealed, acknowledged source IOCTL may stop after capture but before any dependent pointer
+/// projection exists. Its successful VideoPort result still transferred ownership to the caller;
+/// the retained exact pin is the authority to retire that unpublished allocation once.
+pub(super) unsafe fn retire_unpublished_transferred_monitor_array(
+    pin: &mut TemporaryPoolPin,
+    source: nt_io_manager::video_monitor_array_projection::MonitorArrayAllocation,
+) -> Result<(), nt_status::NtStatus> {
+    use nt_io_manager::video_monitor_array_projection::MonitorArrayAllocation;
+    if MonitorArrayAllocation::new(pin.domain, pin.allocation)
+        .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)? != source
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    retire_owned_temporary_pool_allocation(pin)
+}
+
 /// The returned lock spans the subsequent generic free, preventing publication in between.
 pub(super) fn generic_free_admission(
     inst: DriverInstance,

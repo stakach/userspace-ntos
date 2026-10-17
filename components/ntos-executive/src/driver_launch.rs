@@ -4425,6 +4425,81 @@ unsafe fn hosted_instance_pool_allocation_exec_if_live(
     hosted_pool_allocation_exec_va(inst.exec_pool_va, component_va, bytes)
 }
 
+/// Successful VideoPort monitor enumeration transfers this exact FSD allocation to the caller.
+/// The pin excludes generic driver frees while the caller's win32k projection remains live.
+pub(crate) struct HostedVideoMonitorArray {
+    pin: hosted_device_allocations::TemporaryPoolPin,
+    identity: nt_io_manager::video_monitor_array_projection::MonitorArrayAllocation,
+    bytes: Vec<u8>,
+}
+
+impl HostedVideoMonitorArray {
+    pub(crate) fn identity(&self) -> nt_io_manager::video_monitor_array_projection::MonitorArrayAllocation {
+        self.identity
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] { &self.bytes }
+
+    pub(crate) unsafe fn retire_transferred(
+        &mut self,
+        ownership: &nt_io_manager::video_monitor_array_projection::MonitorArrayProjection,
+    ) -> bool {
+        hosted_device_allocations::retire_transferred_monitor_array(&mut self.pin, ownership)
+            .is_ok()
+    }
+
+    pub(crate) unsafe fn retire_unpublished_after_sealed_stop(&mut self) -> bool {
+        hosted_device_allocations::retire_unpublished_transferred_monitor_array(
+            &mut self.pin, self.identity,
+        ).is_ok()
+    }
+
+    pub(crate) fn quarantine(&self) {
+        let _ = hosted_device_allocations::retain_temporary_pool_pin_uncertain(&self.pin);
+    }
+}
+
+pub(crate) unsafe fn capture_hosted_video_monitor_array(
+    device_id: u64,
+    completion_driver_id: u64,
+    pointer: u64,
+) -> Result<HostedVideoMonitorArray, u32> {
+    use nt_io_manager::video_monitor_array_projection::MonitorArrayAllocation;
+    if pointer == 0 { return Err(STATUS_INVALID_PARAMETER as u32); }
+    let (_, inst, _) = hosted_dispatch_instance_for_device_id(device_id)?;
+    if !inst.ready || inst.driver_id != completion_driver_id {
+        return Err(STATUS_INVALID_DEVICE_REQUEST as u32);
+    }
+    let domain = instance_domain_identity(inst).ok_or(STATUS_INVALID_DEVICE_REQUEST as u32)?;
+    let pin = hosted_device_allocations::pin_temporary_pool_range(inst, pointer, 1)
+        .map_err(|status| status.raw() as u32)?;
+    let allocation = pin.allocation();
+    let identity = match MonitorArrayAllocation::new(domain, allocation) {
+        Ok(identity) => identity,
+        Err(_) => {
+            let _ = hosted_device_allocations::retain_temporary_pool_pin_uncertain(&pin);
+            return Err(STATUS_INVALID_PARAMETER as u32);
+        }
+    };
+    if allocation.component_address != pointer || allocation.capacity < 24
+        || allocation.capacity > 0x10_0000
+    {
+        let _ = hosted_device_allocations::retain_temporary_pool_pin_uncertain(&pin);
+        return Err(STATUS_INVALID_PARAMETER as u32);
+    }
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(allocation.capacity as usize).is_err() {
+        let _ = hosted_device_allocations::retain_temporary_pool_pin_uncertain(&pin);
+        return Err(STATUS_INSUFFICIENT_RESOURCES as u32);
+    }
+    bytes.resize(allocation.capacity as usize, 0);
+    if let Err(status) = hosted_device_allocations::copy_temporary_pool_pin(&pin, 0, &mut bytes) {
+        let _ = hosted_device_allocations::retain_temporary_pool_pin_uncertain(&pin);
+        return Err(status.raw() as u32);
+    }
+    Ok(HostedVideoMonitorArray { pin, identity, bytes })
+}
+
 unsafe fn print_active_irp_graph_for_deadman(inst: &DriverInstance) {
     let sh = inst.exec_shared_va;
     let irp_c = read_volatile((sh + SH_ACTIVE_IRP) as *const u64);
