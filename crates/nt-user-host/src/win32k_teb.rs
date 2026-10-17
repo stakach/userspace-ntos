@@ -27,6 +27,18 @@ pub enum DispatchTebError {
     ClientInfoMismatch,
 }
 
+/// Select the TEB view for entry points whose native call chain is established. A desktop switch
+/// reaches window-position code that checks `THREADINFO.pClientInfo` against `NtCurrentTeb()`;
+/// desktop creation instead captures a user `OBJECT_ATTRIBUTES` name from the client TEB.
+pub fn purpose_for_win32k_syscall(ssn: u64, arg1: u64) -> DispatchTebPurpose {
+    match ssn {
+        0x1002 if arg1 == 0x22 => DispatchTebPurpose::ThreadInfo,
+        0x1288 => DispatchTebPurpose::ThreadInfo,
+        0x1ffd | 0x122f | 0x122d => DispatchTebPurpose::UserObjectName,
+        _ => DispatchTebPurpose::Compatibility,
+    }
+}
+
 pub fn select_dispatch_teb(
     purpose: DispatchTebPurpose,
     candidates: DispatchTebCandidates,

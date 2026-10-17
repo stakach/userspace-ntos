@@ -1,4 +1,4 @@
-use crate::win32k_teb::{select_dispatch_teb, DispatchTebCandidates, DispatchTebPurpose,
+use crate::win32k_teb::{purpose_for_win32k_syscall, select_dispatch_teb, DispatchTebCandidates, DispatchTebPurpose,
     DispatchTebError};
 
 #[test]
@@ -18,4 +18,22 @@ fn system_thread_dispatch_uses_teb_that_owns_threadinfo_client_info() {
     assert_eq!(select_dispatch_teb(DispatchTebPurpose::ThreadInfo, stale),
         Err(DispatchTebError::ClientInfoMismatch),
         "a CSRSS system thread may not assert through an unrelated TEB");
+}
+
+#[test]
+fn switch_desktop_dispatch_uses_threadinfo_teb_without_changing_name_capture() {
+    let candidates = DispatchTebCandidates {
+        callout_teb: 0x1000_0000,
+        client_teb: 0x2000_0000,
+        compatibility_teb: 0x3000_0000,
+        thread_client_info: 0x1000_0800,
+    };
+    let switch_purpose = purpose_for_win32k_syscall(0x1288, 0);
+    assert_eq!(switch_purpose, DispatchTebPurpose::ThreadInfo);
+    assert_eq!(select_dispatch_teb(switch_purpose, candidates), Ok(candidates.callout_teb));
+    assert_eq!(purpose_for_win32k_syscall(0x122d, 0), DispatchTebPurpose::UserObjectName,
+        "desktop object names still need the client TEB");
+    assert_eq!(purpose_for_win32k_syscall(0x1002, 0x22), DispatchTebPurpose::ThreadInfo);
+    assert_eq!(purpose_for_win32k_syscall(0x1002, 0x21), DispatchTebPurpose::Compatibility,
+        "only the proven system-thread routine selects the callout TEB");
 }
