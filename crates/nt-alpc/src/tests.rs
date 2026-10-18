@@ -764,6 +764,59 @@ fn reply_wait_on_server_comm_port_receives_next_connection_request() {
 }
 
 #[test]
+fn reply_wait_on_server_comm_port_receives_another_clients_request() {
+    use nt_port_core::{ClientId, ConnectOutcome, MessageAttrs, MessageIdentity};
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let name = utf16("\\ApiPortCrossClient");
+    let server = ClientId { process: 7, thread: 11 };
+    let listen = core.create_port_with_owner(&name, PortApi::Alpc, server);
+    let mut comm = [(0, 0); 2];
+    let clients = [ClientId { process: 8, thread: 12 }, ClientId { process: 9, thread: 13 }];
+    for (index, client) in clients.into_iter().enumerate() {
+        let ConnectOutcome::Pending { connection_id } = core
+            .connect_with_client_id(&name, PortApi::Alpc, 0, b"connect", client).unwrap()
+        else { panic!("connection must pend"); };
+        core.receive(listen).unwrap();
+        comm[index] = (core.accept(connection_id, true, 0).unwrap(),
+            core.complete(connection_id).unwrap().0);
+    }
+    let first = MessageIdentity { client: clients[0], message_id: 91 };
+    let mut first_request = port_message(msg_type::REQUEST, b"first");
+    first_request[8..16].copy_from_slice(&first.client.process.to_le_bytes());
+    first_request[16..24].copy_from_slice(&first.client.thread.to_le_bytes());
+    first_request[24..28].copy_from_slice(&first.message_id.to_le_bytes());
+    core.send_request_message(comm[0].1, &first_request, MessageAttrs::default(), first).unwrap();
+    assert_eq!(core.receive_message(comm[0].0).unwrap().unwrap().bytes, first_request);
+
+    let second = MessageIdentity { client: clients[1], message_id: 92 };
+    let mut second_request = port_message(msg_type::REQUEST, b"second");
+    second_request[8..16].copy_from_slice(&second.client.process.to_le_bytes());
+    second_request[16..24].copy_from_slice(&second.client.thread.to_le_bytes());
+    second_request[24..28].copy_from_slice(&second.message_id.to_le_bytes());
+    core.send_request_message(comm[1].1, &second_request, MessageAttrs::default(), second).unwrap();
+
+    let mut reply = port_message(msg_type::REPLY, b"ack");
+    reply[8..16].copy_from_slice(&first.client.process.to_le_bytes());
+    reply[16..24].copy_from_slice(&first.client.thread.to_le_bytes());
+    reply[24..28].copy_from_slice(&first.message_id.to_le_bytes());
+    let mut wire = enc_checked_receive(comm[0].0, server, (3, 103));
+    let mut header: nt_alpc_abi::AlpcSendReceiveCheckedRequest = bytemuck::pod_read_unaligned(&wire);
+    header.send_receive.flags = nt_alpc_abi::send_flag::REPLY_MESSAGE;
+    header.send_receive.message_offset = wire.len() as u32;
+    header.send_receive.message_len_bytes = reply.len() as u32;
+    wire.copy_from_slice(bytemuck::bytes_of(&header));
+    wire.extend_from_slice(&reply);
+    let mut output = [0u8; 128];
+    let result = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &wire, &mut output);
+    assert_eq!(result.status, SUCCESS, "reply-and-wait must receive from the parent listen port");
+    assert_eq!(&output[..result.information as usize], &second_request);
+    assert_eq!(core.receive_reply_message(comm[0].1, first).unwrap().unwrap().bytes, reply);
+    assert_eq!(core.receive_reply_message(comm[1].1, second).unwrap(), None);
+}
+
+#[test]
 fn checked_alpc_connect_observes_lpc_server_completion_without_reconnect() {
     use nt_port_core::ClientId;
     let mut core = PortCore::new();

@@ -1314,10 +1314,24 @@ impl AlpcServer {
         }
         // A valid listen port with nothing pending must park, not error.
         let is_listen_port = conn_try.is_ok();
+        // Reply-and-wait answers on the previous client's communication handle, then receives
+        // the next request from the parent connection port. The next request can belong to a
+        // different accepted client, so the receive half cannot stay connection-local.
+        let parent_receive_port = if reply_wait {
+            core.connection_listen_handle_for_server_reply(req.port_handle)
+                .unwrap_or(req.port_handle)
+        } else {
+            req.port_handle
+        };
         let checked_message_capacity = if req.flags & send_flag::RECV_ATTRIBUTES != 0 {
             out_buf.len().saturating_sub(8 + size_of::<AlpcContextAttr>())
         } else { out_buf.len() };
-        if native_checked && core.peek_receive_message_len(req.port_handle)
+        let local_message_len = core.peek_receive_message_len(req.port_handle);
+        let pending_message_len = local_message_len.or_else(|| {
+            (parent_receive_port != req.port_handle)
+                .then(|| core.peek_receive_message_len(parent_receive_port)).flatten()
+        });
+        if native_checked && pending_message_len
             .is_some_and(|len| len > checked_message_capacity)
         {
             return Err(NtStatus::BUFFER_TOO_SMALL);
@@ -1325,7 +1339,11 @@ impl AlpcServer {
         let server_receive = core.handle_info(req.port_handle).is_some_and(|info|
             matches!(info.endpoint,
                 PortHandleEndpoint::ListenPort | PortHandleEndpoint::ServerCommPort));
-        match core.receive_message(req.port_handle) {
+        let received = core.receive_message(req.port_handle);
+        let received = if matches!(&received, Ok(None)) && parent_receive_port != req.port_handle {
+            core.receive_message(parent_receive_port)
+        } else { received };
+        match received {
             Ok(Some(QueuedMessage { bytes, mut attrs, provenance, port_context,
                 request_identity })) => {
                 let msg_type = read_msg_type(&bytes);
