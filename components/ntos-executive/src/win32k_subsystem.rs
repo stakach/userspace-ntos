@@ -17263,7 +17263,7 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         print_hex(pti as u32);
         print_str(b"\n");
     }
-    let teb_purpose = nt_user_host::win32k_teb::purpose_for_win32k_syscall(ssn, a1);
+    let teb_purpose = nt_user_host::win32k_teb::purpose_for_win32k_syscall(ssn);
     let callout_teb = thread_ctx_callout_teb(thread_index);
     let thread_client_info = read_volatile(
         (current_w32thread() + THREADINFO_PCLIENTINFO_OFF) as *const u64,
@@ -17273,7 +17273,6 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         nt_user_host::win32k_teb::DispatchTebCandidates {
             callout_teb,
             client_teb,
-            compatibility_teb: current_kpcr_va(),
             thread_client_info,
         },
     ) {

@@ -14,7 +14,8 @@ unsafe fn read_image_byte(address: u64) -> Option<u8> {
         return None;
     }
     let rights = *code_rights().get((offset / 0x1000) as usize)?;
-    if rights != RW_NX && rights != 2 {
+    // Assertion and source-file literals reside in the provider image's read-only .rdata.
+    if rights != RO_NX && rights != RW_NX && rights != 2 {
         return None;
     }
     Some(read_volatile(address as *const u8))
@@ -56,6 +57,11 @@ pub(super) extern "win64" fn rtl_assert(
     message: u64,
 ) -> ! {
     unsafe {
+        print_str(b"[win32k-assert] request-kind=0x");
+        print_hex_u64(read_volatile((WIN32K_SHARED_VADDR + SH_REQ_KIND) as *const u64));
+        print_str(b" ssn=0x");
+        print_hex_u64(read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SSN) as *const u64));
+        print_str(b"\n");
         let assertion_bytes = read_assertion_field(assertion);
         let file_bytes = read_assertion_field(file);
         let message_bytes = (message != 0).then(|| read_assertion_field(message));
