@@ -214,6 +214,8 @@ static mut SERVICE_EXE_IMAGE_CATALOG_WORK: nt_exe_image::OwnedHostedImageCatalog
 static mut SERVICE_HOSTED_LOADED_IMAGES_WORK: HostedLoadedImageTable =
     HostedLoadedImageTable::new();
 static mut SERVICE_GENERIC_SECTIONS_WORK: GenericSectionTable = GenericSectionTable::new();
+static SERVICE_GENERIC_SECTIONS_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static BOOTSTRAP_SECTION_OWNER_ACTIVE: AtomicBool = AtomicBool::new(false);
 static mut SERVICE_DELAY_QUEUE_WORK: Option<nt_delay_execution::Queue> = None;
 static SERVICE_DELAY_DRAIN_HANDLER: AtomicU64 = AtomicU64::new(0);
 static SERVICE_DELAY_DRAIN_QUEUE: AtomicU64 = AtomicU64::new(0);
@@ -2973,11 +2975,52 @@ unsafe fn reset_service_hosted_loaded_images_work() -> &'static mut HostedLoaded
 
 #[inline(never)]
 unsafe fn reset_service_generic_sections_work() -> *mut GenericSectionTable {
+    if SERVICE_GENERIC_SECTIONS_INITIALIZED.load(Ordering::Acquire) {
+        // DriverEntry already populated this very table with canonical kernel Sections.
+        // Preserve their identities and frames through the Ps/service handoff.
+        return core::ptr::addr_of_mut!(SERVICE_GENERIC_SECTIONS_WORK);
+    }
+    SERVICE_GENERIC_SECTIONS_INITIALIZED.store(false, Ordering::Release);
     let slot = core::ptr::addr_of_mut!(SERVICE_GENERIC_SECTIONS_WORK);
     if !(*slot).reset() {
         panic!("generic section table allocation failed");
     }
+    SERVICE_GENERIC_SECTIONS_INITIALIZED.store(true, Ordering::Release);
     slot
+}
+
+pub(crate) unsafe fn initialize_bootstrap_generic_sections_work() {
+    let _durable = allocator::enter_durable();
+    assert!(!SERVICE_GENERIC_SECTIONS_INITIALIZED.load(Ordering::Acquire));
+    let _ = reset_service_generic_sections_work();
+    BOOTSTRAP_SECTION_OWNER_ACTIVE.store(true, Ordering::Release);
+}
+
+/// DriverEntry's authenticated kernel Section lane uses the same table later adopted by the
+/// service loop, but has no ExecNtHandler or process paging context.
+pub(crate) fn bootstrap_section_table() -> Result<*mut GenericSectionTable, u32> {
+    if !BOOTSTRAP_SECTION_OWNER_ACTIVE.load(Ordering::Acquire)
+        || SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) != 0
+        || !SERVICE_GENERIC_SECTIONS_INITIALIZED.load(Ordering::Acquire)
+    { return Err(0xc000_00a3); }
+    Ok(core::ptr::addr_of_mut!(SERVICE_GENERIC_SECTIONS_WORK))
+}
+
+/// The initialized canonical Section table is owned by the registered service handler even
+/// while DriverEntry runs outside a per-process loop context. A stale handler or an unrelated
+/// loop context cannot borrow it.
+pub(crate) unsafe fn registered_section_table_for_handler(
+    handler: *const ExecNtHandler,
+) -> Result<*mut GenericSectionTable, u32> {
+    let live = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire);
+    if handler.is_null() || live == 0 || live != handler as u64
+        || !SERVICE_GENERIC_SECTIONS_INITIALIZED.load(Ordering::Acquire)
+    { return Err(0xc000_00a3); }
+    let table = core::ptr::addr_of_mut!(SERVICE_GENERIC_SECTIONS_WORK);
+    if (*handler).loop_ctx.is_some_and(|ctx| ctx.generic_sections != table) {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    Ok(table)
 }
 
 pub(crate) fn service_generic_section_stats() -> GenericSectionTableStats {
@@ -4029,6 +4072,7 @@ unsafe fn register_service_delay_drain_context(
     handler: &mut ExecNtHandler,
     queue: &mut nt_delay_execution::Queue,
 ) {
+    BOOTSTRAP_SECTION_OWNER_ACTIVE.store(false, Ordering::Release);
     SERVICE_DELAY_DRAIN_HANDLER.store(handler as *mut ExecNtHandler as u64, Ordering::Release);
     SERVICE_DELAY_DRAIN_QUEUE.store(
         queue as *mut nt_delay_execution::Queue as u64,
@@ -4783,7 +4827,7 @@ pub(crate) unsafe fn service_win32k_section_create_request(
 ) -> crate::provider_section_broker::SubmitResult {
     use crate::provider_section_broker::SubmitResult;
     use nt_io_manager::win32k_mm_section_wire as mm_wire;
-    if matches!(op, mm_wire::OP_DEREFERENCE | mm_wire::OP_UNMAP) {
+    if matches!(op, mm_wire::OP_DEREFERENCE | mm_wire::OP_UNMAP | mm_wire::OP_UNMAP_CLIENT) {
         return crate::provider_section_cleanup::service_win32k_section_cleanup_request(
             channel, reply_cap, badge, mi, op, first, second, third,
         );
@@ -4806,12 +4850,46 @@ pub(crate) unsafe fn service_win32k_section_create_request(
         }
     };
     let handler = match registry_live_handler() {
-        Ok(handler) if handler.loop_ctx.is_some() => handler,
-        _ => return SubmitResult::Ready((0xC000_00A3u32 as i32, 0, 0, 0)),
+        Ok(handler) if registered_section_table_for_handler(handler).is_ok() => handler,
+        Ok(_) => return SubmitResult::Ready((0xC000_00A3u32 as i32, 0, 0, 0)),
+        Err(_) => {
+            if bootstrap_section_table().is_err() || op == mm_wire::OP_MAP_CLIENT
+                || !crate::provider_section_broker::bootstrap_caller_admitted(caller)
+            {
+                return SubmitResult::Ready((0xC000_00A3u32 as i32, 0, 0, 0));
+            }
+            let physical = match crate::provider_service_ingress::physical_win32k_provider(
+                channel, route, dispatch,
+            ) {
+                Ok(physical) => physical,
+                Err(status) => return SubmitResult::Ready((status as i32, 0, 0, 0)),
+            };
+            if matches!(op, mm_wire::OP_REFERENCE | mm_wire::OP_MAP) {
+                if third != 0 || (op == mm_wire::OP_REFERENCE && second != 0) {
+                    return SubmitResult::Ready((nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0));
+                }
+                let result = match op {
+                    mm_wire::OP_REFERENCE => crate::provider_mm_section_objects::reference(
+                        core::ptr::null_mut(), first, physical).map(|count| (count, 0)),
+                    mm_wire::OP_MAP => crate::provider_mm_section_objects::map(
+                        core::ptr::null_mut(), first, physical, second, caller),
+                    _ => unreachable!(),
+                };
+                return SubmitResult::Ready(match result {
+                    Ok((first, second)) => (0, first, second, 0),
+                    Err(status) => (status as i32, 0, 0, 0),
+                });
+            }
+            return crate::provider_section_broker::submit_bootstrap(
+                route, dispatch, caller, physical, op, first, second, third,
+            );
+        }
     };
-    if matches!(op, mm_wire::OP_REFERENCE | mm_wire::OP_MAP)
+    if matches!(op, mm_wire::OP_REFERENCE | mm_wire::OP_MAP | mm_wire::OP_MAP_CLIENT)
     {
-        if third != 0 || (op != mm_wire::OP_MAP && second != 0) {
+        if (op != mm_wire::OP_MAP_CLIENT && third != 0)
+            || (op == mm_wire::OP_REFERENCE && second != 0)
+        {
             return SubmitResult::Ready((nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0));
         }
         let physical = match spawn_hosts::shared_ingress::owner::runtime::physical_source(route) {
@@ -4828,6 +4906,8 @@ pub(crate) unsafe fn service_win32k_section_create_request(
             mm_wire::OP_REFERENCE => crate::provider_mm_section_objects::reference(handler, first, physical)
                 .map(|count| (count, 0)),
             mm_wire::OP_MAP => crate::provider_mm_section_objects::map(handler, first, physical, second, caller),
+            mm_wire::OP_MAP_CLIENT => crate::provider_mm_section_objects::map_client(
+                handler, first, physical, second, third >> 8, (third & 0xff) as u32),
             _ => unreachable!(),
         };
         return SubmitResult::Ready(match result {
@@ -6068,6 +6148,33 @@ unsafe fn sync_win32k_context_to_process_manager(
         }
     }
     true
+}
+
+/// Consume the exact provider process-create publication before the initial loader can run.
+/// The PM mirror then owns W32PROCESS and will issue the real process-exit callout before
+/// provider object finalization. A missing or mismatched publication is an indeterminate
+/// post-callout state; callers must retain the process and never invoke create again.
+pub(crate) unsafe fn import_early_win32k_process_context(
+    nt_handler: &mut ExecNtHandler,
+    pi: usize,
+    process: nt_types::ProcessIdentity,
+    tid: u64,
+) -> Option<u64> {
+    if nt_handler.capture_process_identity(pi) != Some(process) { return None; }
+    let pid = process.pid;
+    let tid32 = nt_process::ThreadId::try_from(tid).ok()?;
+    let published = win32k_glue::published_win32k_context();
+    if published.pid != u64::from(pid) || published.tid != tid
+        || published.eprocess == 0 || published.ethread == 0
+        || published.eprocess != nt_handler.pm.process_kernel_object(pid).unwrap_or(0)
+        || published.ethread != nt_handler.pm.thread_kernel_object(tid32).unwrap_or(0)
+        || published.w32process == 0 || published.w32thread != 0
+    { return None; }
+    if !sync_win32k_context_to_process_manager(nt_handler, pi, u64::from(pid), tid)
+        || nt_handler.capture_process_identity(pi) != Some(process)
+        || nt_handler.pm.process_win32(pid) != Some(published.w32process)
+    { return None; }
+    Some(published.w32process)
 }
 
 unsafe fn dispatch_win32k_for_client(
@@ -17883,9 +17990,9 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(st as u32);
                     print_str(b"\n");
                 }
-                // ★ CLIENT-GDI HANDLE-TABLE ALIAS. GUI clients whose PEB+0xf8 was seeded before
-                // gdi32's GdiProcessSetup must have the live win32k USER heap prefix and user-attribute
-                // area projected before client-side GdiValidateHandle runs. Winlogon needs this for the
+                // ★ CLIENT-GDI HANDLE-TABLE ALIAS. The early win32k process-create callout maps
+                // the canonical Section and writes PEB+0xf8 before gdi32's GdiProcessSetup. The
+                // user-attribute area also precedes client-side GdiValidateHandle. Winlogon needs this for the
                 // msgina dialog DC/font setup; later interactive shell clients use the same cataloged
                 // role path instead of fixed pi checks.
                 if uses_client_gdi {

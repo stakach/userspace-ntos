@@ -29736,6 +29736,78 @@ impl ExecNtHandler {
         )
     }
 
+    /// Reserve a genuine process VAD before projecting a win32k kernel Section into that
+    /// process. The caller retains the exact process and Section alias owner across native
+    /// capability effects; uncertain effects leave this VAD owned until cleanup can prove them
+    /// retired.
+    pub(crate) unsafe fn reserve_provider_section_client_view(
+        &mut self,
+        eprocess: u64,
+        bytes: u64,
+        protection: u32,
+    ) -> Result<(usize, nt_types::ProcessIdentity, u64, u64, u64), u32> {
+        let pid = self.pm.pid_for_kernel_process_object(eprocess)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let pi = self.pi_for_pid(pid).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let process = self.capture_process_identity(pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let pml4 = *self.process_vspaces.get(pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let generation = match process.generation {
+            nt_types::ProcessGeneration::Hosted(value)
+            | nt_types::ProcessGeneration::Temporary(value) => value,
+        };
+        if pml4 == 0 || self.process_vspace_caps.get(pi).flatten()
+            .is_none_or(|owner| owner.pml4 != pml4 || owner.generation != generation)
+        {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        if bytes == 0 {
+            return Err(nt_address_space::STATUS_INVALID_PARAMETER);
+        }
+        let rounded = bytes.checked_add(0xfff)
+            .ok_or(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)? & !0xfff;
+        let map = process_vm_region_map_mut(pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
+        let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
+        *before = *map;
+        let plan = allocate_vad_avoiding_fixed_authorities(
+            before, after, VmVadKind::Mapped, pi, None, rounded,
+            nt_address_space::MEM_RESERVE | nt_address_space::MEM_COMMIT,
+            protection, PRIVATE_VM_LIMIT,
+        )?;
+        hosted_thread_memory_access(pi as u64, plan.base, plan.size)?;
+        if !process_committed_mapping_register(pi as u64,
+            nt_address_space::VmCommittedRange::mapped(
+                plan.base, plan.size, protection))
+        {
+            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        *map = *after;
+        Ok((pi, process, pml4, plan.base, plan.size))
+    }
+
+    pub(crate) unsafe fn retire_provider_section_client_view(
+        &mut self,
+        pi: usize,
+        process: nt_types::ProcessIdentity,
+        base: u64,
+        size: u64,
+    ) -> Result<(), u32> {
+        if self.capture_process_identity(pi) != Some(process) {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        let map = process_vm_region_map_mut(pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let mut after = *map;
+        let released = after.unmap_mapped(base)?;
+        if released.base != base || released.size != size {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        if !process_committed_mapping_unregister_allocation(pi as u64, base) {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        *map = after;
+        Ok(())
+    }
+
     unsafe fn map_generic_section_view_internal(
         &mut self,
         section_index: usize,

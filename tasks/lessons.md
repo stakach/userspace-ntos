@@ -700,3 +700,7 @@ diagnosis-free failure.
 
 ## Preserve The RED Checkpoint With A Sole Test Owner
 - When another agent is the sole build and test owner, save the reproducing regression and stop editing until that agent reports the RED result. Implementing immediately can turn the requested RED checkpoint into an unobserved test.
+
+## Complete Native Contracts Before Closing The Issue
+- Treat a successful callback entry or a boot that advances one frontier as a checkpoint. Close the issue only after its live acceptance criteria, reboot evidence, exact-head CI, and final review pass.
+- When projecting a native interface, validate every supported argument and preserve each handle, alias, and uncertain effect through exact retirement. Fence unsupported operations explicitly; a convenient success result creates hidden debt.

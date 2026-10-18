@@ -638,6 +638,7 @@ pub const WIN32K_REQUEST_USER_ORIGIN: u64 = 1 << 63;
 pub const PS_WIN32_PROVIDER_THREAD_EXIT: u64 = 1;
 pub const PS_WIN32_PROVIDER_PROCESS_EXIT: u64 = 2;
 pub const PS_WIN32_PROVIDER_FINALIZE_PROCESS_OBJECTS: u64 = 3;
+pub const PS_WIN32_PROVIDER_PROCESS_CREATE: u64 = 4;
 pub const PS_WIN32_PROVIDER_RETAIN_THREAD_CONTEXT: u64 = 1;
 const _: () = assert!(SH_SAS_AHELIST > SH_REQ_NARGS);
 /// Phase 2A callback rendezvous frame. The fixed, pointer-free ABI occupies the otherwise-unused
@@ -10072,8 +10073,9 @@ unsafe fn section_view(section: u64, _size_hint: u64) -> (u64, u64) {
     try_section_view(section).unwrap_or((0, 0))
 }
 
-/// Kernel Section creation preserves FileObject authority and real file backing. Anonymous
-/// session heaps retain their coherent server/client aliases in the shared USER heap arena.
+/// Kernel Section creation preserves FileObject authority and real file backing. Committed
+/// anonymous Sections use canonical Mm backing; reserved USER/desktop heaps keep their coherent
+/// server/client aliases in the shared USER heap arena.
 extern "win64" fn s_mm_create_section(
     section_out: *mut u64,
     access: u32,
@@ -10088,7 +10090,9 @@ extern "win64" fn s_mm_create_section(
         if section_out.is_null() { return STATUS_ACCESS_VIOLATION_I32; }
         // Mm's legacy internal flag is consumed before the Section creation policy.
         let allocation_attributes = allocation_attributes & !1;
-        if file_handle != 0 || file_object != 0 {
+        if file_handle != 0 || file_object != 0
+            || allocation_attributes & nt_memory_manager::SECTION_ATTR_SEC_COMMIT != 0
+        {
             return mm_section::create(section_out, access, obj_attr, max_size as u64,
                 protection, allocation_attributes, file_handle, file_object);
         }
@@ -10113,12 +10117,13 @@ extern "win64" fn s_mm_create_section(
     0
 }
 
-/// `NTSTATUS MmUnmapViewOfSection(PEPROCESS Process, PVOID BaseAddress)`. The host maps session
-/// sections at the same VA for kernel and client views, so unmap is logical: validate the base
-/// belongs to a live section view, drop that view's reference, and release the backing when it was
-/// the final view.
-extern "win64" fn s_mm_unmap_view_of_section(_process: u64, base: u64) -> i32 {
-    unsafe { unmap_section_view_addr(base) }
+/// `NTSTATUS MmUnmapViewOfSection(PEPROCESS Process, PVOID BaseAddress)`. Reserved USER/desktop
+/// heaps use logical aliases; committed Sections retire an exact process view and its page caps.
+extern "win64" fn s_mm_unmap_view_of_section(process: u64, base: u64) -> i32 {
+    unsafe {
+        try_unmap_section_view_addr(base)
+            .unwrap_or_else(|| mm_section::unmap_client(process, base))
+    }
 }
 
 /// `NTSTATUS MmUnmapViewInSessionSpace(PVOID MappedBase)` / `MmUnmapViewInSystemSpace`.
@@ -10158,10 +10163,6 @@ extern "win64" fn s_mm_map_view(section: u64, base_out: *mut u64, size_io: *mut 
         if !size_io.is_null() {
             write_volatile(size_io, size);
         }
-        if local_view.is_some() && size >= GDI_HANDLE_COUNT * GDI_TABLE_ENTRY_SIZE && size < 0x0020_0000 {
-            write_volatile((WIN32K_SHARED_VADDR + SH_GDI_TABLE_BASE) as *mut u64, base);
-            write_volatile((WIN32K_SHARED_VADDR + SH_GDI_TABLE_SIZE) as *mut u64, size);
-        }
     }
     0
 }
@@ -10169,17 +10170,19 @@ extern "win64" fn s_mm_map_view(section: u64, base_out: *mut u64, size_io: *mut 
 /// `NTSTATUS MmMapViewOfSection(PVOID Section, PEPROCESS Process, PVOID *BaseAddress, ULONG_PTR
 /// ZeroBits, SIZE_T CommitSize, PLARGE_INTEGER SectionOffset, PSIZE_T ViewSize, SECTION_INHERIT,
 /// ULONG AllocationType, ULONG Win32Protect)` — `MapGlobalUserHeap` and `IntMapDesktopView` project
-/// USER/desktop heap sections into GUI client processes. The backing remains the coherent win32k heap
-/// region, but the returned view base is the logical client alias inside `CSRSS_W32_SHARED_VA` so
-/// ReactOS' W32PROCESS heap mappings publish the same server→client delta that user32 will use.
+/// USER/desktop heap sections into GUI client processes. Those heaps retain their shared-arena
+/// delta; committed Sections return the exact process VAD containing canonical backing pages.
 extern "win64" fn s_mm_map_view_of_section(
     section: u64,
-    _process: u64,
+    process: u64,
     base_out: *mut u64,
-    _zero_bits: u64,
-    _commit: u64,
-    _offset: u64,
+    zero_bits: u64,
+    commit: u64,
+    offset: *const i64,
     size_io: *mut u64,
+    inherit: u32,
+    allocation_type: u32,
+    protection: u32,
 ) -> i32 {
     unsafe {
         let hint = if size_io.is_null() {
@@ -10187,11 +10190,30 @@ extern "win64" fn s_mm_map_view_of_section(
         } else {
             read_volatile(size_io)
         };
-        let (base, size) = section_view(section, hint);
+        // A client projection currently owns one complete canonical Section view. Reject
+        // unsupported placement/partial semantics before any provider page-map effect.
+        if base_out.is_null() || zero_bits != 0 || (!offset.is_null() && read_volatile(offset) != 0)
+            || (commit != 0 && commit != hint) || inherit != 2
+            || (protection != 0x02 && protection != 0x04)
+            || (allocation_type != 0 && allocation_type != 0x0040_0000)
+        {
+            return STATUS_INVALID_PARAMETER_I32;
+        }
+        if read_volatile(base_out) != 0 { return STATUS_INVALID_PARAMETER_I32; }
+        let (base, size, local_heap_view) = if let Some((base, size)) = try_section_view(section) {
+            (base, size, true)
+        } else {
+            match mm_section::map_client(section, process, hint, protection) {
+                Ok((base, size)) => (base, size, false),
+                Err(status) => return status,
+            }
+        };
         if base == 0 {
             return STATUS_NO_MEMORY;
         }
-        let view_base = win32k_heap_server_to_client(base).unwrap_or(base);
+        let view_base = if local_heap_view {
+            win32k_heap_server_to_client(base).unwrap_or(base)
+        } else { base };
         if !base_out.is_null() {
             write_volatile(base_out, view_base);
         }
@@ -16996,11 +17018,53 @@ unsafe fn select_existing_ps_provider_context(
     Ok((process_index, thread_index))
 }
 
+/// Select a newly published Ps pair for both early process creation and ordinary GUI dispatch.
+/// The root has granted the exact process/thread bodies before this request enters the provider.
+unsafe fn select_request_client_context() -> Option<(usize, usize, u64, u64, u64, u64, u64)> {
+    let sh = WIN32K_SHARED_VADDR;
+    let process_id = read_volatile((sh + SH_REQ_PROCESS_ID) as *const u64);
+    let client_pi = read_volatile((sh + SH_REQ_CLIENT_PI) as *const u64);
+    let client_teb = read_volatile((sh + SH_REQ_CLIENT_TEB) as *const u64);
+    let thread_id = read_volatile((sh + SH_REQ_THREAD_ID) as *const u64);
+    let generation = read_volatile((sh + SH_REQ_GENERATION) as *const u64);
+    let supplied_eprocess = read_volatile((sh + SH_REQ_EPROCESS) as *const u64);
+    let supplied_ethread = read_volatile((sh + SH_REQ_ETHREAD) as *const u64);
+    let token_authentication_id = read_volatile((sh + SH_REQ_TOKEN_AUTH) as *const u64);
+    let token_user_sid_len = read_volatile((sh + SH_REQ_TOKEN_USER_SID_LEN) as *const u64) as usize;
+    let token_user_sid_ptr = read_volatile((sh + SH_REQ_TOKEN_USER_SID_PTR) as *const u64);
+    let mut token_user_sid = [0u8; WIN32K_TOKEN_USER_SID_MAX];
+    if token_user_sid_ptr != 0 && token_user_sid_len <= WIN32K_TOKEN_USER_SID_MAX {
+        for (index, byte) in token_user_sid.iter_mut().enumerate() {
+            *byte = read_volatile((token_user_sid_ptr + index as u64) as *const u8);
+        }
+    }
+    let (process_index, thread_index) = select_win32k_client_context(
+        client_pi, process_id, thread_id, generation, client_teb, supplied_eprocess,
+        supplied_ethread, token_authentication_id, &token_user_sid, token_user_sid_len,
+    )?;
+    Some((process_index, thread_index, client_pi, client_teb,
+        process_id, thread_id, generation))
+}
+
 unsafe fn dispatch_ps_provider_command(command: u64, expected: u64, flags: u64) -> u64 {
     const STATUS_SUCCESS: u64 = 0;
     const STATUS_UNSUCCESSFUL: u64 = 0xC000_0001u32 as u64;
     const STATUS_INVALID_PARAMETER: u64 = 0xC000_000Du32 as u64;
     const STATUS_DEVICE_NOT_READY: u64 = 0xC000_00A3u32 as u64;
+    if command == PS_WIN32_PROVIDER_PROCESS_CREATE {
+        if expected != 0 || flags != 0 { return STATUS_INVALID_PARAMETER; }
+        let Some((process_index, _, _, _, _, _, _)) = select_request_client_context() else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let _previous_mode = thread_execution::PreviousModeScope::enter(
+            nt_kernel_abi::ps_reactos_x64::ThreadPreviousMode::KernelMode,
+        );
+        return if ensure_win32k_process_attached(process_index) {
+            STATUS_SUCCESS
+        } else {
+            STATUS_UNSUCCESSFUL
+        };
+    }
     if command == PS_WIN32_PROVIDER_FINALIZE_PROCESS_OBJECTS {
         if expected != 0 || flags != 0 {
             return STATUS_INVALID_PARAMETER;
@@ -17291,39 +17355,9 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
             u64::MAX,
         );
     }
-    let process_id = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_PROCESS_ID) as *const u64);
-    let client_pi = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_PI) as *const u64);
-    let client_teb = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_TEB) as *const u64);
-    let thread_id = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_THREAD_ID) as *const u64);
-    let generation = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_GENERATION) as *const u64);
-    let supplied_eprocess = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_EPROCESS) as *const u64);
-    let supplied_ethread = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_ETHREAD) as *const u64);
-    let token_authentication_id =
-        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_TOKEN_AUTH) as *const u64);
-    let token_user_sid_len =
-        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_TOKEN_USER_SID_LEN) as *const u64) as usize;
-    let token_user_sid_ptr =
-        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_TOKEN_USER_SID_PTR) as *const u64);
-    let mut token_user_sid = [0u8; WIN32K_TOKEN_USER_SID_MAX];
-    if token_user_sid_ptr != 0 && token_user_sid_len <= WIN32K_TOKEN_USER_SID_MAX {
-        let mut sid_i = 0usize;
-        while sid_i < WIN32K_TOKEN_USER_SID_MAX {
-            token_user_sid[sid_i] = read_volatile((token_user_sid_ptr + sid_i as u64) as *const u8);
-            sid_i += 1;
-        }
-    }
-    let Some((process_index, thread_index)) = select_win32k_client_context(
-        client_pi,
-        process_id,
-        thread_id,
-        generation,
-        client_teb,
-        supplied_eprocess,
-        supplied_ethread,
-        token_authentication_id,
-        &token_user_sid,
-        token_user_sid_len,
-    ) else {
+    let Some((process_index, thread_index, client_pi, client_teb,
+        process_id, thread_id, generation)) =
+        select_request_client_context() else {
         return (0xC000_009Au32 as i32, 0xC000_009Au32 as u64);
     };
     let mode = if user_origin && registered_win32k_provider_argc(ssn).is_some() {

@@ -17,6 +17,9 @@ pub(crate) struct HostedThreadRuntimeOwner {
     pub(crate) initial_creation: core::cell::RefCell<
         Option<crate::exec_handler::initial_thread_creation::PendingInitialThreadCreation>,
     >,
+    pub(crate) process_create_callout: core::cell::RefCell<
+        Option<nt_user_host::process_create_callout::ProcessCreateCalloutOwner>,
+    >,
     fresh_creation: core::cell::RefCell<Option<nt_process::FreshHostedThreadPreparation>>,
     memory_coverage: nt_user_host::thread_construction::MemoryConstructionCoverage<TP_WORKER_STACK_FRAME_COUNT>,
     registered_memory: Option<nt_user_host::thread_construction::RegisteredThreadMemory>,
@@ -35,6 +38,7 @@ impl HostedThreadRuntimeOwner {
             suspension: crate::thread_suspend::HostedThreadSuspend::new(),
             priority_transition_pending: core::cell::Cell::new(false),
             initial_creation: core::cell::RefCell::new(None),
+            process_create_callout: core::cell::RefCell::new(None),
             fresh_creation: core::cell::RefCell::new(None),
             memory_coverage: nt_user_host::thread_construction::MemoryConstructionCoverage::empty(),
             registered_memory: None,
@@ -51,6 +55,9 @@ impl HostedThreadRuntimeOwner {
         self.suspension.is_empty()
             && !self.priority_transition_pending.get()
             && self.initial_creation.try_borrow().is_ok_and(|owner| owner.is_none())
+            && self.process_create_callout.try_borrow().is_ok_and(|owner| {
+                owner.as_ref().is_none_or(nt_user_host::process_create_callout::ProcessCreateCalloutOwner::may_retire)
+            })
             && self.fresh_creation.try_borrow().is_ok_and(|owner| owner.is_none())
             && self.memory_coverage.is_empty()
             && !self.registry_preparation.is_prepared() && self.alias_preparation.get().is_none()
@@ -1387,7 +1394,11 @@ pub(crate) fn check_user_stack_retirement_access(
 
 impl RuntimeTcbProjection for HostedThreadRuntimeOwner {
     fn clear_retired_tcb_projection(&mut self, expected_cap: u64) -> Result<(), u32> {
-        if self.initial_creation.try_borrow().map_or(true, |owner| owner.is_some()) {
+        if self.initial_creation.try_borrow().map_or(true, |owner| owner.is_some())
+            || self.process_create_callout.try_borrow().map_or(true, |owner| {
+                owner.as_ref().is_some_and(|owner| !owner.may_retire())
+            })
+        {
             return Err(nt_process::STATUS_DEVICE_BUSY);
         }
         if expected_cap <= 1 || (self.runtime.tcb != expected_cap && self.runtime.tcb != 1) {

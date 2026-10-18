@@ -19,6 +19,103 @@ unsafe fn runtime(handler: &ExecNtHandler, binding: Binding) -> Option<&HostedTh
         .find(|owner| owner.binding() == binding)
 }
 
+/// Complete the genuine win32k process-create callback while the initial TCB is still dormant.
+/// The published main runtime is an exact Ps target at this boundary, and has not yet entered
+/// initial-thread control (which correctly closes ordinary logical-caller admission).
+unsafe fn create_win32_process_before_loader(
+    handler: &mut ExecNtHandler,
+    binding: Binding,
+) -> Result<(), u32> {
+    use nt_user_host::process_create_callout::{
+        CalloutResult, ProcessCreateCalloutOwner, ProcessCreateCalloutPhase,
+    };
+    let Some(role) = handler.hosted_process_role(binding.pi) else {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    };
+    if !role.uses_win32_client_gdi() { return Ok(()); }
+    if crate::win32k_subsystem::registered_win32k_callouts().is_none() {
+        return Err(0xC000_00A3); // STATUS_DEVICE_NOT_READY
+    }
+    let process = handler.capture_process_identity(binding.pi)
+        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    if process != binding.process { return Err(nt_process::STATUS_INVALID_HANDLE); }
+    let client = crate::win32k_lifecycle_client(binding.tid, handler)
+        .ok_or(nt_process::STATUS_DEVICE_BUSY)?;
+    {
+        let owner = runtime(handler, binding).ok_or(nt_process::STATUS_DEVICE_BUSY)?;
+        let mut slot = owner.process_create_callout.try_borrow_mut()
+            .map_err(|_| nt_process::STATUS_DEVICE_BUSY)?;
+        if slot.is_none() {
+            *slot = Some(ProcessCreateCalloutOwner::new(binding.pi, process)
+                .ok_or(nt_process::STATUS_INVALID_HANDLE)?);
+        }
+        let callout = slot.as_mut().unwrap();
+        if callout.ready(binding.pi, process) { return Ok(()); }
+        callout.begin(binding.pi, process)
+            .map_err(|_| nt_process::STATUS_DEVICE_BUSY)?;
+    }
+    let outcome = crate::win32k_glue::win32k_create_process_before_loader(client);
+    {
+        let owner = runtime(handler, binding).ok_or(nt_process::STATUS_DEVICE_BUSY)?;
+        let mut slot = owner.process_create_callout.try_borrow_mut()
+            .map_err(|_| nt_process::STATUS_DEVICE_BUSY)?;
+        let callout = slot.as_mut().ok_or(nt_process::STATUS_DEVICE_BUSY)?;
+        let result = match outcome {
+            crate::win32k_glue::Win32kProcessCreateResult::NotEntered(status) =>
+                CalloutResult::NotEntered(status),
+            crate::win32k_glue::Win32kProcessCreateResult::Returned(status) =>
+                CalloutResult::Returned(status),
+            crate::win32k_glue::Win32kProcessCreateResult::Indeterminate(status) =>
+                CalloutResult::Indeterminate(status),
+        };
+        callout.record(result).map_err(|_| nt_process::STATUS_DEVICE_BUSY)?;
+        if callout.phase() != ProcessCreateCalloutPhase::Returned {
+            return Err(match outcome {
+                crate::win32k_glue::Win32kProcessCreateResult::NotEntered(status)
+                | crate::win32k_glue::Win32kProcessCreateResult::Returned(status)
+                | crate::win32k_glue::Win32kProcessCreateResult::Indeterminate(status) => {
+                    if status == 0 { nt_process::STATUS_DEVICE_BUSY } else { status }
+                }
+            });
+        }
+    }
+    let imported = crate::service_sec_image::import_early_win32k_process_context(
+        handler, binding.pi, process, binding.tid,
+    );
+    {
+        let owner = runtime(handler, binding).ok_or(nt_process::STATUS_DEVICE_BUSY)?;
+        let mut slot = owner.process_create_callout.try_borrow_mut()
+            .map_err(|_| nt_process::STATUS_DEVICE_BUSY)?;
+        let callout = slot.as_mut().ok_or(nt_process::STATUS_DEVICE_BUSY)?;
+        match imported {
+            Some(w32process) => callout.confirm_process_import(binding.pi, process, w32process)
+                .map_err(|_| nt_process::STATUS_DEVICE_BUSY)?,
+            None => {
+                callout.fail_projection(nt_process::STATUS_UNSUCCESSFUL)
+                    .map_err(|_| nt_process::STATUS_DEVICE_BUSY)?;
+                return Err(nt_process::STATUS_UNSUCCESSFUL);
+            }
+        }
+    }
+    let pml4 = handler.process_vspaces.get(binding.pi).copied().unwrap_or(0);
+    let projected = pml4 != 0
+        && crate::win32k_glue::map_gdi_shared_handle_table_into_client(
+            handler, pml4, binding.pi,
+        ) != 0;
+    let owner = runtime(handler, binding).ok_or(nt_process::STATUS_DEVICE_BUSY)?;
+    let mut slot = owner.process_create_callout.try_borrow_mut()
+        .map_err(|_| nt_process::STATUS_DEVICE_BUSY)?;
+    let callout = slot.as_mut().ok_or(nt_process::STATUS_DEVICE_BUSY)?;
+    if !projected {
+        callout.fail_projection(nt_process::STATUS_UNSUCCESSFUL)
+            .map_err(|_| nt_process::STATUS_DEVICE_BUSY)?;
+        return Err(nt_process::STATUS_UNSUCCESSFUL);
+    }
+    callout.confirm_projection(binding.pi, process)
+        .map_err(|_| nt_process::STATUS_DEVICE_BUSY)?;
+    Ok(())
+}
+
 /// No native entry occurred, or the suspension owner proved definitive no-effects rejection.
 /// Any failed local cleanup retains the plan and the remaining handle ownership in the runtime.
 unsafe fn cancel_creation(handler: &mut ExecNtHandler, binding: Binding, status: u32) -> u32 {
@@ -78,6 +175,9 @@ impl ExecNtHandler {
         };
         if binding.pi != pi || binding.process != process || binding.tcb != main_tcb {
             return nt_process::STATUS_INVALID_PARAMETER;
+        }
+        if let Err(status) = create_win32_process_before_loader(self, binding) {
+            return status;
         }
         let plan = match self.pm.prepare_initial_thread_creation(process.pid) {
             Ok(Some(plan)) => plan,
@@ -181,6 +281,11 @@ impl ExecNtHandler {
                 return nt_process::STATUS_DEVICE_BUSY;
             }
         };
+        if let Err(status) = create_win32_process_before_loader(self, binding) {
+            self.pm.cancel_initial_thread_creation(&plan)
+                .expect("unentered initial creation retains its exact canonical reservation");
+            return status;
+        }
         {
             let runtime = runtime(self, binding).expect("validated initial runtime");
             let mut slot = runtime.initial_creation.borrow_mut();

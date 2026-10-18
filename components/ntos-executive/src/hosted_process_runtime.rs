@@ -409,7 +409,6 @@ pub(crate) unsafe fn spawn_hosted_sec_image_for_image(
         client_thread_id,
         image.nt_image_path,
         image.command_line,
-        image.role.uses_win32_client_gdi(),
         start_immediately,
         ldrpinit_rva,
     )

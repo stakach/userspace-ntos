@@ -940,7 +940,6 @@ pub(crate) unsafe fn spawn_sec_image(
     client_thread_id: u64,
     image_path: &[u8],
     cmd_line: &[u8],
-    seed_gdi_shared_handle_table: bool,
     start_immediately: bool,
     // ntdll_plan.md Step 4.A: the RVA of ntdll's `LdrpInitialize` the trampoline calls. The REAL
     // ReactOS ntdll's is 0x8e70 (its build-fixed RVA); OUR Rust ntdll's is DIFFERENT + not stable
@@ -1327,31 +1326,8 @@ pub(crate) unsafe fn spawn_sec_image(
         core::ptr::write_volatile((scr + 0x1000 + 0x11c) as *mut u32, 1);
         core::ptr::write_volatile((scr + 0x1000 + 0x120) as *mut u16, 7601);
         core::ptr::write_volatile((scr + 0x1000 + 0x124) as *mut u32, 2);
-        // ★ DIALOG BATCH 3 — PEB->GdiSharedHandleTable (x64 PEB+0xf8). Client-side gdi32's
-        // GdiProcessSetup (gdi32 RVA 0x1100, run once from GdiDllInitialize/DllMain at process init)
-        // copies PEB+0xf8 into its cached global (gdi32 RVA 0x4e188); every later GDI-handle validity
-        // check indexes `GdiSharedHandleTable[handle & 0xffff]`. If PEB+0xf8 is NULL when GdiProcessSetup
-        // runs (as it was), gdi32 caches NULL → NULL-deref at RVA 0x535a on the logon dialog's DC/font
-        // setup. Seed it HERE (before the loader runs any DllMain) so GdiProcessSetup caches the real
-        // table base on its only run. The table is allocated inside win32k's USER heap, so the PEB
-        // value must be the USER-heap client alias of that server allocation; the committed heap
-        // prefix is projected when the process enters the Win32 client runtime.
-        if seed_gdi_shared_handle_table {
-            let gdi_server_base = core::ptr::read_volatile(
-                (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_GDI_TABLE_BASE)
-                    as *const u64,
-            );
-            if let Some(gdi_client_base) =
-                win32k_subsystem::win32k_heap_server_to_client(gdi_server_base)
-            {
-                core::ptr::write_volatile((scr + 0x1000 + 0xf8) as *mut u64, gdi_client_base);
-            } else {
-                print_str(b"[spawn-env] GDI shared handle table seed unavailable server=0x");
-                print_hex((gdi_server_base >> 32) as u32);
-                print_hex(gdi_server_base as u32);
-                print_str(b"\n");
-            }
-        }
+        // The genuine win32k process-create callout maps its canonical GDI Section into this
+        // suspended process and writes PEB->GdiSharedHandleTable before its loader runs.
         let peb_client = checked_spawn_copy_cap(peb, b"peb-target");
         let _ = checked_spawn_page_map(peb_client, SMSS_PEB_VA, RW_NX, pml4, b"peb-target");
         // Cross-process process creation finishes by writing Peb->ProcessParameters through

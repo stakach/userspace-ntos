@@ -32,6 +32,7 @@ pub mod process_observation;
 pub mod desktop_launch;
 pub mod provider_alias_bank;
 pub mod provider_finalization;
+pub mod process_create_callout;
 pub mod provider_file_close;
 pub mod native_call_owner;
 pub mod gui_exit;

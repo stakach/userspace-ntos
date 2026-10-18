@@ -5615,6 +5615,26 @@ pub(crate) fn win32k_client_cap_bank_is_empty(pi: usize) -> bool {
     client_cap_bank::is_empty(pi)
 }
 
+pub(crate) unsafe fn map_provider_section_client_page(
+    request: nt_user_host::provider_alias_bank::ProviderAliasRequest,
+) -> Result<nt_user_host::provider_alias_bank::ProviderAliasHandle,
+    nt_user_host::provider_alias_bank::BankError> {
+    client_cap_bank::map_with_handle(request)
+}
+
+pub(crate) fn provider_section_client_page_handle(
+    request: nt_user_host::provider_alias_bank::ProviderAliasRequest,
+) -> Option<nt_user_host::provider_alias_bank::ProviderAliasHandle> {
+    client_cap_bank::handle_for_exact_request(request)
+}
+
+pub(crate) unsafe fn unmap_provider_section_client_page(
+    request: nt_user_host::provider_alias_bank::ProviderAliasRequest,
+    handle: nt_user_host::provider_alias_bank::ProviderAliasHandle,
+) -> Result<(), nt_user_host::provider_alias_bank::BankError> {
+    client_cap_bank::release_page_exact(request, handle)
+}
+
 pub(crate) fn provider_alias_owns_root_cap(cap: u64) -> bool {
     client_cap_bank::owns_root_cap(cap)
 }
@@ -5722,50 +5742,43 @@ pub(crate) unsafe fn map_win32k_pool_into_client(
     Some(delta)
 }
 
-/// Publish the GDI shared handle table pointer for GUI client `pi`.
-///
-/// ReactOS win32k returns a user-mode pointer from `GDI_MapHandleTable`, then gdi32 caches
-/// `PEB->GdiSharedHandleTable` during process setup. Our table is allocated inside win32k's USER heap,
-/// so the correct client pointer is the USER-heap alias of that allocation. The committed USER heap
-/// prefix mapping installed here covers the table pages; a second table window would retain duplicate
-/// frame caps for every GUI process.
+/// Resolve the real `GDI_MapHandleTable` result from the target PEB and verify that it names a
+/// generation-exact canonical Section alias. The Section broker owns its page caps and lifetime;
+/// this bridge only publishes its coherent server base for GDI handle validation.
 pub(crate) unsafe fn map_gdi_shared_handle_table_into_client(
     handler: &mut ExecNtHandler,
     pml4: u64,
     pi: usize,
 ) -> u64 {
-    let server_base = core::ptr::read_volatile(
-        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_GDI_TABLE_BASE) as *const u64,
+    if handler.process_vspaces.get(pi).copied() != Some(pml4) || pml4 == 0 {
+        return 0;
+    }
+    let Some(pid) = handler.pm_pid_for_pi(pi) else { return 0; };
+    let Ok(process) = handler.pm.query_process_basic(pid, u64::MAX) else { return 0; };
+    let Some(field) = process.peb_base_address.checked_add(0xf8) else { return 0; };
+    let mut bytes = [0u8; 8];
+    if handler.process_memory_read_status(pi, field, &mut bytes).is_err() {
+        return 0;
+    }
+    let client_base = u64::from_le_bytes(bytes);
+    let Some((server_base, size)) =
+        crate::provider_mm_section_objects::server_view_for_client_alias(handler, pi, client_base)
+    else { return 0; };
+    if size < win32k_subsystem::GDI_HANDLE_COUNT * win32k_subsystem::GDI_TABLE_ENTRY_SIZE {
+        return 0;
+    }
+    core::ptr::write_volatile(
+        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_GDI_TABLE_BASE) as *mut u64,
+        server_base,
     );
-    let size = core::ptr::read_volatile(
-        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_GDI_TABLE_SIZE) as *const u64,
+    core::ptr::write_volatile(
+        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_GDI_TABLE_SIZE) as *mut u64,
+        size,
     );
-    let heap_frames = WIN32K_HEAP_FRAME_BASE.load(Ordering::Relaxed);
-    if server_base < win32k_subsystem::WIN32K_HEAP_VADDR
-        || size < win32k_subsystem::GDI_HANDLE_COUNT * win32k_subsystem::GDI_TABLE_ENTRY_SIZE
-        || size > win32k_subsystem::GDI_SHARED_TABLE_MAX_BYTES
-        || heap_frames == 0
-    {
-        return 0;
-    }
-    let server_page = server_base & !0xfff;
-    let intra_page = server_base - server_page;
-    let source_offset = (server_page - win32k_subsystem::WIN32K_HEAP_VADDR) / 0x1000;
-    let Some(client_base) = win32k_subsystem::win32k_heap_server_to_client(server_base) else {
-        return 0;
-    };
-    let frames = (intra_page + size + 0xfff) / 0x1000;
-    if source_offset + frames > win32k_subsystem::WIN32K_HEAP_FRAMES {
-        return 0;
-    }
-    if map_win32k_user_heap_into_client(handler, pml4, pi).is_none() {
-        return 0;
-    }
-    GDI_SHARED_TABLE_FRAME_BASE.store(heap_frames + source_offset, Ordering::Relaxed);
     if pi < 64
         && GDI_SHARED_TABLE_MAPPED.fetch_or(1u64 << pi, Ordering::Relaxed) & (1u64 << pi) == 0
     {
-        print_str(b"[win32k-svc] GDI handle table uses USER heap alias in pi 0x");
+        print_str(b"[win32k-svc] GDI handle table uses canonical Section alias in pi 0x");
         print_hex(pi as u32);
         print_str(b" bytes=0x");
         print_hex(size as u32);
@@ -6435,6 +6448,34 @@ pub(crate) unsafe fn win32k_dispatch_ps_provider_command(
         win32k_subsystem::WIN32K_REQUEST_PS_PROVIDER,
         true,
     )
+}
+
+/// Process creation enters the real registered win32k callout before the initial user thread
+/// starts. A missing completion after physical entry retains the caller's initial-thread owner;
+/// it cannot safely issue the callout again against possibly published W32PROCESS/Section views.
+pub(crate) unsafe fn win32k_create_process_before_loader(
+    client: Win32kClientContext,
+) -> Win32kProcessCreateResult {
+    let command = win32k_subsystem::PS_WIN32_PROVIDER_PROCESS_CREATE;
+    let mut entered = false;
+    let (status, completed) = win32k_dispatch_wide_observed(
+        0, command, 0, 0, 0, 0, &[], [command, 0, 0, 0], None, None,
+        client, win32k_subsystem::WIN32K_REQUEST_PS_PROVIDER, true, Some(&mut entered),
+    );
+    if completed {
+        Win32kProcessCreateResult::Returned(status as u32)
+    } else if entered {
+        Win32kProcessCreateResult::Indeterminate(status as u32)
+    } else {
+        Win32kProcessCreateResult::NotEntered(status as u32)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Win32kProcessCreateResult {
+    NotEntered(u32),
+    Returned(u32),
+    Indeterminate(u32),
 }
 
 pub(crate) use nt_user_host::provider_finalization::ProviderFinalizationResult as PsProviderFinalization;
