@@ -77,10 +77,12 @@ unsafe fn classify_hosted_acpi_pci_namespace_filter_result(
     information: u64,
     payload: &[u8],
 ) -> HostedAcpiPciNamespaceDisposition {
-    if status.raw() as u32 == STATUS_BUFFER_OVERFLOW {
+    if matches!(status.raw() as u32, STATUS_BUFFER_OVERFLOW | 0xc000_0023) {
         return match (information == 0)
             .then(|| {
-                nt_acpi::namespace_children_overflow_retry_len(
+                nt_acpi::namespace_children_probe_retry_len(
+                    status.raw() as u32,
+                    information,
                     payload,
                     output_len,
                     HOSTED_ACPI_NAMESPACE_MAX_BYTES,
