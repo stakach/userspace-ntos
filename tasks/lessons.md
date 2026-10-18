@@ -704,3 +704,20 @@ diagnosis-free failure.
 ## Complete Native Contracts Before Closing The Issue
 - Treat a successful callback entry or a boot that advances one frontier as a checkpoint. Close the issue only after its live acceptance criteria, reboot evidence, exact-head CI, and final review pass.
 - When projecting a native interface, validate every supported argument and preserve each handle, alias, and uncertain effect through exact retirement. Fence unsupported operations explicitly; a convenient success result creates hidden debt.
+
+## Restore Suspended Native Lane Metadata As One Owned Context
+- When a native lane's Ps thread is correct but a shared callback or request header names another dispatch, trace the suspension and resume owner before changing callback policy. Keep the cross-process guard.
+- Retain and restore the exact per-dispatch shared metadata at each yield boundary. A failed native hypothesis must be reverted before changing the next path; focused tests alone do not establish live ownership.
+
+## Validate Initialization Callbacks Without Inventing Published Objects
+- Win32k callouts may suspend before their Win32 objects are published. Retain the exact active callout phase, stack activation, generation, and Ps object pair across a permitted callback or wait; an ordinary dispatch still requires both published Win32 objects.
+- A callout may publish its object before returning. Revalidate the current real publication at each resume instead of assuming every callback in that phase sees zero. Treat later root ingress failures as separate ownership failures until the typed receive error is known.
+
+## Separate Initial Thread Targets From Their Creating Callers
+- An initial-thread Ps callout executes for the dormant target, while `NtCreateThread` holds the creating caller's Reply. Capture the target's authenticated provider context before publishing the creation guard, then retain both identities across a provider wait and finish creation only after exact completion.
+- A callback redirect cannot transfer the creating caller's Reply into the target TCB. Require an explicit dual-identity contract before supporting that path; fail closed rather than treating a callback yield as an ordinary wait.
+- A bounded boot that advances to the next process is still a checkpoint. Identify the specific wait object, selection and resume eligibility before changing wake behavior, and keep genuine Explorer and reboot evidence as closure gates.
+
+## Commit Verified Increments During Long Native Bring-Up
+- When the user asks for commits as work proceeds, isolate each proven contract and commit it after its focused tests and native integration evidence, before exploring the next boot frontier.
+- Review staged paths and diff before every commit. Keep diagnostic traces and unrelated edits out; push a changed submodule commit before recording its pointer in the parent.

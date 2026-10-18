@@ -135,7 +135,6 @@ pub enum BusQueryIdCopyError {
     IdTooLong,
     InvalidCharacter,
     InvalidSeparators,
-    DuplicateId,
     InsufficientResources,
 }
 
@@ -231,12 +230,6 @@ fn copy_query_id_multi_sz(bytes: &[u8]) -> Result<BusQueryIdValue, BusQueryIdCop
             return Ok(BusQueryIdValue::Multi(values));
         }
         let (value, _separators, next) = copy_query_id_entry(bytes, cursor)?;
-        if values
-            .iter()
-            .any(|existing: &String| existing.eq_ignore_ascii_case(&value))
-        {
-            return Err(BusQueryIdCopyError::DuplicateId);
-        }
         values
             .try_reserve(1)
             .map_err(|_| BusQueryIdCopyError::InsufficientResources)?;
@@ -1532,7 +1525,27 @@ mod tests {
     }
 
     #[test]
-    fn native_query_id_rejects_malformed_and_duplicate_values() {
+    fn native_query_id_preserves_duplicate_hardware_ids_in_bus_order() {
+        let duplicate: Vec<u16> = r"ACPI\VEN_ACPI&DEV_0007"
+            .encode_utf16()
+            .chain([0])
+            .chain(r"acpi\ven_acpi&dev_0007".encode_utf16())
+            .chain([0, 0])
+            .collect();
+        assert_eq!(
+            copy_bus_query_id_x64(
+                &native_query_id(&duplicate, 0),
+                nt_pnp_abi::BUS_QUERY_HARDWARE_IDS
+            ),
+            Ok(BusQueryIdValue::Multi(vec![
+                r"ACPI\VEN_ACPI&DEV_0007".into(),
+                r"acpi\ven_acpi&dev_0007".into(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn native_query_id_rejects_malformed_values() {
         assert_eq!(
             copy_bus_query_id_x64(&native_query_id(&[0], 0), nt_pnp_abi::BUS_QUERY_DEVICE_ID),
             Err(BusQueryIdCopyError::EmptyId)
@@ -1550,19 +1563,6 @@ mod tests {
                 nt_pnp_abi::BUS_QUERY_INSTANCE_ID
             ),
             Err(BusQueryIdCopyError::InvalidCharacter)
-        );
-        let duplicate: Vec<u16> = r"PCI\VEN_1234"
-            .encode_utf16()
-            .chain([0])
-            .chain(r"pci\ven_1234".encode_utf16())
-            .chain([0, 0])
-            .collect();
-        assert_eq!(
-            copy_bus_query_id_x64(
-                &native_query_id(&duplicate, 0),
-                nt_pnp_abi::BUS_QUERY_HARDWARE_IDS
-            ),
-            Err(BusQueryIdCopyError::DuplicateId)
         );
         let unterminated = native_query_id(&query_units(r"PCI\VEN_1234")[..12], 0);
         assert_eq!(

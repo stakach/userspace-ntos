@@ -37,12 +37,30 @@ pub struct AcpiNamespacePath(String);
 
 impl AcpiNamespacePath {
     pub fn parse(path: &str) -> Result<Self, AcpiNamespaceError> {
-        validate_absolute_path(path.as_bytes())?;
+        if path == "\\" {
+            return Ok(Self(String::from("\\")));
+        }
+        let relative = path.strip_prefix('\\').ok_or(AcpiNamespaceError::InvalidPath)?;
+        validate_relative_path_segments(relative.as_bytes(), true)
+            .map_err(|_| AcpiNamespaceError::InvalidPath)?;
+        let segments = relative.split('.').count();
+        let capacity = segments
+            .checked_mul(5)
+            .ok_or(AcpiNamespaceError::LimitExceeded)?;
         let mut owned = String::new();
         owned
-            .try_reserve_exact(path.len())
+            .try_reserve_exact(capacity)
             .map_err(|_| AcpiNamespaceError::Allocation)?;
-        owned.push_str(path);
+        owned.push('\\');
+        for (index, segment) in relative.split('.').enumerate() {
+            if index != 0 {
+                owned.push('.');
+            }
+            owned.push_str(segment);
+            for _ in segment.len()..4 {
+                owned.push('_');
+            }
+        }
         Ok(Self(owned))
     }
 
@@ -187,6 +205,28 @@ pub fn namespace_children_overflow_retry_len(
     (current < maximum)
         .then_some(maximum)
         .ok_or(AcpiNamespaceError::InvalidRequiredLength)
+}
+
+/// Select one bounded retry for an undersized namespace probe. Released ACPI providers may
+/// return either overflow with a required-length header or buffer-too-small with the original
+/// METHOD_BUFFERED input still in the output. Neither status authorizes an unbounded retry.
+pub fn namespace_children_probe_retry_len(
+    status: u32,
+    information: u64,
+    header: &[u8],
+    current: usize,
+    maximum: usize,
+) -> Result<usize, AcpiNamespaceError> {
+    if !matches!(status, 0x8000_0005 | 0xc000_0023) || information != 0 {
+        return Err(AcpiNamespaceError::InvalidOutput);
+    }
+    namespace_children_overflow_retry_len(header, current, maximum)
+}
+
+/// An ACPI PDO without a namespace handle cannot enumerate children. The provider may report
+/// either an unsupported control or a missing root; both mean absence only with no output.
+pub fn namespace_children_absent(status: u32, information: u64) -> bool {
+    matches!(status, 0xc000_0010 | 0xc000_0034) && information == 0
 }
 
 /// Decode one exact successful `IOCTL_ACPI_ENUM_CHILDREN` result. The provider returns the queried
@@ -377,11 +417,19 @@ pub(crate) fn validate_absolute_path(path: &[u8]) -> Result<(), AcpiNamespaceErr
 }
 
 fn validate_relative_path(path: &[u8]) -> Result<(), AcpiNamespaceError> {
+    validate_relative_path_segments(path, false)
+}
+
+fn validate_relative_path_segments(
+    path: &[u8],
+    allow_trimmed: bool,
+) -> Result<(), AcpiNamespaceError> {
     if path.is_empty() {
         return Err(AcpiNamespaceError::InvalidReference);
     }
     for segment in path.split(|byte| *byte == b'.') {
-        if segment.len() != 4
+        if (!allow_trimmed && segment.len() != 4)
+            || (allow_trimmed && !(1..=4).contains(&segment.len()))
             || !matches!(segment[0], b'A'..=b'Z' | b'_')
             || !segment[1..]
                 .iter()
@@ -495,6 +543,14 @@ mod tests {
     }
 
     #[test]
+    fn namespace_output_restores_trimmed_name_seg_underscores() {
+        let payload = output(&[(1, "\\_SB.PCI0"), (0, "\\_SB.PCI0.SEJ")]);
+        let decoded = parse_namespace_children(&payload, 8).unwrap();
+        assert_eq!(decoded.self_path().as_str(), "\\_SB_.PCI0");
+        assert_eq!(decoded.children()[1].path.as_str(), "\\_SB_.PCI0.SEJ_");
+    }
+
+    #[test]
     fn filtered_paths_are_exact_canonical_and_unique_without_self_assumption() {
         let bytes = output(&[(0, "\\_SB_.PCI0._PRT"), (0, "\\_SB_.PCI0.BRG0._PRT")]);
         let matches = parse_namespace_matches(&bytes, 2).unwrap();
@@ -544,6 +600,27 @@ mod tests {
             namespace_children_overflow_retry_len(&required_header, 8, 4096),
             Ok(1234)
         );
+    }
+
+    #[test]
+    fn undersized_acpi_namespace_probe_gets_one_bounded_retry() {
+        let input_header = immediate_namespace_children_input();
+        assert_eq!(
+            namespace_children_probe_retry_len(0xc000_0023, 0, &input_header[..8], 8, 4096),
+            Ok(4096)
+        );
+        assert_eq!(
+            namespace_children_probe_retry_len(0xc000_0023, 0, &input_header[..8], 4096, 4096),
+            Err(AcpiNamespaceError::InvalidRequiredLength)
+        );
+    }
+
+    #[test]
+    fn namespace_absence_requires_exact_status_and_no_output() {
+        assert!(namespace_children_absent(0xc000_0034, 0));
+        assert!(namespace_children_absent(0xc000_0010, 0));
+        assert!(!namespace_children_absent(0xc000_0034, 8));
+        assert!(!namespace_children_absent(0, 0));
     }
 
     #[test]

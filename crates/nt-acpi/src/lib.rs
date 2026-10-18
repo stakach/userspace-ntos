@@ -29,7 +29,9 @@ pub use madt::{
 };
 pub use namespace::{
     immediate_namespace_children_input, multilevel_namespace_filter_input,
-    namespace_children_overflow_retry_len, namespace_children_required_len,
+    namespace_children_absent, namespace_children_overflow_retry_len,
+    namespace_children_probe_retry_len,
+    namespace_children_required_len,
     parse_namespace_children, parse_namespace_matches, resolve_namespace_reference,
     AcpiNamespaceChild, AcpiNamespaceChildren, AcpiNamespaceError, AcpiNamespaceMatches,
     AcpiNamespacePath, ACPI_ENUM_CHILDREN_FILTER_INPUT_LEN, ACPI_ENUM_CHILDREN_INPUT_LEN,
