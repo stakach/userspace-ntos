@@ -1445,6 +1445,8 @@ pub const W32_PS_OP_QUERY_PROCESS_PRIORITY_CLASS: u64 = 19;
 pub const W32_PS_OP_SET_PROCESS_PRIORITY_CLASS: u64 = 20;
 pub const W32_PS_OP_QUERY_PROCESS_SESSION_ID_EX: u64 = 21;
 pub const W32_PS_OP_SET_PROCESS_PRIORITY_BY_CLASS: u64 = 22;
+pub const W32_PS_OP_WAIT_THREAD_IDENTITY: u64 = 23;
+pub const W32_PS_OP_RELEASE_THREAD_WAIT: u64 = 24;
 /// Bounded global-atom requests. The executive owns the one native atom table; win32k stages only
 /// explicit-length UTF-16 input and receives the resulting 16-bit atom.
 pub const W32_ATOM_LABEL: u64 = 0x77E;
@@ -6046,6 +6048,7 @@ enum ProviderWaitLease {
     Timer(nt_provider_wait::ProviderLocalTimerOperationLease),
     ProjectedEvent(nt_kernel_exec::ProviderEventProjectionWaitLease),
     File(u64),
+    Thread(u64),
     Sync(nt_provider_wait::ProviderLocalSyncLease),
 }
 
@@ -6127,7 +6130,7 @@ impl ProviderWaitAdmission {
                             .release_wait(lease)
                             .is_ok()
                     }
-                    Some(ProviderWaitLease::File(_)) => continue,
+                    Some(ProviderWaitLease::File(_) | ProviderWaitLease::Thread(_)) => continue,
                     Some(ProviderWaitLease::Sync(lease)) => local_sync::release_wait_under_metadata(lease),
                 };
                 if !released {
@@ -6149,6 +6152,12 @@ impl ProviderWaitAdmission {
             if status != 0 {
                 return false;
             }
+            self.leases[index] = None;
+        }
+        for index in 0..self.count {
+            let Some(ProviderWaitLease::Thread(token)) = self.leases[index] else { continue };
+            let (status, _, _, _) = win32k_ps_broker_call(W32_PS_OP_RELEASE_THREAD_WAIT, token, 0);
+            if status != 0 { return false; }
             self.leases[index] = None;
         }
         !projected_released
@@ -6239,6 +6248,27 @@ unsafe fn provider_wait_object_for_dispatcher(
     }
     if let Some((canonical, lease)) = local_sync::wait_object(object_body) {
         return Ok((canonical, Some(ProviderWaitLease::Sync(lease))));
+    }
+    if (crate::ps_object_paging::PS_OBJECT_ARENA_BASE..crate::ps_object_paging::PS_OBJECT_ARENA_LIMIT).contains(&object_body) {
+        let (status, tid, generation, token) = win32k_ps_broker_call(
+            W32_PS_OP_WAIT_THREAD_IDENTITY, object_body, 0,
+        );
+        if status != 0 {
+            if token != 0 { park(); }
+            return Err(ProviderWaitResolutionFailure { kind: b"ps-thread", status });
+        }
+        if tid == 0 || generation == 0 || token == 0 { park(); }
+        let canonical = nt_provider_wait::ProviderWaitObject::new(
+            nt_provider_wait::ProviderWaitObjectType::Thread, tid, generation,
+        );
+        print_str(b"[win32k-ps-thread-wait] body=");
+        print_win32k_hex64(object_body);
+        print_str(b" tid=");
+        print_u64(tid);
+        print_str(b" generation=");
+        print_u64(generation);
+        print_str(b"\n");
+        return Ok((canonical, Some(ProviderWaitLease::Thread(token))));
     }
     if !provider_pool_contains(object_body) {
         return Err(ProviderWaitResolutionFailure { kind: b"outside-provider-pool", status: STATUS_INVALID_HANDLE_I32 });

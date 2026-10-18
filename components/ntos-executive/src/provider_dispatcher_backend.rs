@@ -107,6 +107,7 @@ pub(crate) unsafe fn ack_retire_sync(
 pub(crate) struct NativeEventBacking<'a> {
     pub objects: &'a mut [ObjEntry],
     pub file_completion: Option<&'a mut ExecFileCompletion>,
+    pub pm: Option<&'a mut nt_process::ProcessManager>,
 }
 
 impl ProviderEventBacking for NativeEventBacking<'_> {
@@ -152,6 +153,30 @@ impl ProviderEventBacking for NativeEventBacking<'_> {
             lease,
             self.file_completion.as_deref_mut().expect("File wait has no completion owner"),
         );
+    }
+
+    fn acquire_thread_wait(&mut self, owner: nt_provider_wait::ProviderWaitOwner, object: nt_provider_wait::ProviderWaitObject) -> Result<u64, u32> {
+        if !crate::provider_ps_wait::has_canonical(owner, object) { return Err(0xC000_000Du32); }
+        let pm = self.pm.as_deref_mut().ok_or(0xC000_000Du32)?;
+        let tid = u32::try_from(object.object_id).map_err(|_| 0xC000_000Du32)?;
+        let lifetime = pm.thread_lifetime(tid).ok_or(0xC000_000Du32)?;
+        if object.object_generation == 0 || lifetime.generation() != object.object_generation {
+            return Err(0xC000_000D);
+        }
+        pm.retain_thread_wait_reference(tid)?;
+        Ok(object.object_id)
+    }
+
+    fn thread_wait_is_ready(&self, lease: u64) -> bool {
+        let pm = self.pm.as_deref().expect("Thread wait has no Process Manager");
+        let tid = u32::try_from(lease).expect("Thread wait lease lost its TID");
+        pm.is_thread_signaled(tid)
+    }
+
+    fn release_thread_wait(&mut self, lease: u64) {
+        let pm = self.pm.as_deref_mut().expect("Thread wait has no Process Manager");
+        let tid = u32::try_from(lease).expect("Thread wait lease lost its TID");
+        pm.release_thread_wait_reference(tid).expect("Thread wait lost its exact reference");
     }
 
     fn acquire_sync_wait(
@@ -230,6 +255,7 @@ impl ExecNtHandler {
             backing: NativeEventBacking {
                 objects: &mut self.obj_ns,
                 file_completion: Some(&mut self.file_completion),
+                pm: Some(&mut self.pm),
             },
             access,
         }
@@ -272,6 +298,9 @@ impl nt_provider_wait::ProviderDispatcherWaitBackend for ExecNtHandler {
     fn dispatcher_is_ready(&self, lease: Self::Lease) -> bool {
         if let ProviderDispatcherLease::File(token) = lease {
             return crate::provider_file_wait::is_ready(token, &self.file_completion);
+        }
+        if let ProviderDispatcherLease::Thread(tid) = lease {
+            return self.pm.is_thread_signaled(u32::try_from(tid).expect("Thread wait lost TID"));
         }
         if let ProviderDispatcherLease::Sync(lease) = lease {
             return unsafe { sync_catalog_for_lease(lease).is_ready(lease) }

@@ -193,6 +193,7 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
                         | ProviderWaitObjectType::Semaphore
                         | ProviderWaitObjectType::Timer
                         | ProviderWaitObjectType::File
+                        | ProviderWaitObjectType::Thread
                         | ProviderWaitObjectType::Mutant
                 )
             )

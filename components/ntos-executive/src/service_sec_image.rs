@@ -5422,6 +5422,20 @@ pub(crate) unsafe fn service_win32k_ps_request(
     if native_thread_priority::is_priority_effect_op(op) {
         return native_thread_priority::dispatch(handler, op, object, value);
     }
+    if op == win32k_subsystem::W32_PS_OP_WAIT_THREAD_IDENTITY {
+        if value != 0 { return (STATUS_INVALID_PARAMETER, 0, 0, 0); }
+        return match provider_ps_wait::acquire(&mut handler.pm, target, object, client_pi, client_generation) {
+            Ok((tid, generation, token)) => (0, tid, generation, token),
+            Err(status) => (status as i32, 0, 0, 0),
+        };
+    }
+    if op == win32k_subsystem::W32_PS_OP_RELEASE_THREAD_WAIT {
+        if value != 0 { return (STATUS_INVALID_PARAMETER, 0, 0, 0); }
+        return match provider_ps_wait::release(&mut handler.pm, target, object) {
+            Ok(()) => (0, 0, 0, 0),
+            Err(status) => (status as i32, 0, 0, 0),
+        };
+    }
     provider_ps::dispatch(
         &mut handler.pm,
         op,

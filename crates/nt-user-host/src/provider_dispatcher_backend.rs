@@ -16,6 +16,7 @@ pub enum ProviderDispatcherLease {
     Event(EventLeaseId),
     Timer(ProviderTimerLeaseId),
     File(u64),
+    Thread(u64),
     Sync(nt_provider_wait::ProviderLocalSyncLease),
 }
 
@@ -69,6 +70,15 @@ pub trait ProviderEventBacking {
     }
     fn release_file_wait(&mut self, _lease: u64) {
         panic!("File wait lease has no backing");
+    }
+    fn acquire_thread_wait(&mut self, _owner: ProviderWaitOwner, _object: ProviderWaitObject) -> Result<u64, u32> {
+        Err(INVALID_PARAMETER)
+    }
+    fn thread_wait_is_ready(&self, _lease: u64) -> bool {
+        panic!("Thread wait lease has no backing");
+    }
+    fn release_thread_wait(&mut self, _lease: u64) {
+        panic!("Thread wait lease has no backing");
     }
     fn acquire_sync_wait(
         &mut self,
@@ -179,6 +189,7 @@ pub fn dispatcher_lease_is_ready(
             .is_ready(lease)
             .expect("provider Timer wait lost its canonical lease"),
         ProviderDispatcherLease::File(_) => false,
+        ProviderDispatcherLease::Thread(_) => false,
         ProviderDispatcherLease::Sync(_) => panic!("Sync readiness needs its canonical backing"),
     }
 }
@@ -244,6 +255,9 @@ impl<B: ProviderEventBacking> ProviderDispatcherWaitBackend for ProviderDispatch
                 self.backing
                     .acquire_file_wait(owner, object, access.process)?,
             ),
+            Some(ProviderWaitObjectType::Thread) => ProviderDispatcherLease::Thread(
+                self.backing.acquire_thread_wait(owner, object)?,
+            ),
             Some(ProviderWaitObjectType::Semaphore | ProviderWaitObjectType::Mutant) => {
                 ProviderDispatcherLease::Sync(self.backing.acquire_sync_wait(owner, object)?)
             }
@@ -256,6 +270,9 @@ impl<B: ProviderEventBacking> ProviderDispatcherWaitBackend for ProviderDispatch
     fn dispatcher_is_ready(&self, lease: Self::Lease) -> bool {
         if let ProviderDispatcherLease::File(lease) = lease {
             return self.backing.file_wait_is_ready(lease);
+        }
+        if let ProviderDispatcherLease::Thread(lease) = lease {
+            return self.backing.thread_wait_is_ready(lease);
         }
         if let ProviderDispatcherLease::Sync(lease) = lease {
             return self.backing.sync_wait_is_ready(lease);
@@ -282,6 +299,7 @@ impl<B: ProviderEventBacking> ProviderDispatcherWaitBackend for ProviderDispatch
                 .consume_ready(lease)
                 .expect("provider Timer wait selected an unsignalled object"),
             ProviderDispatcherLease::File(_) => {}
+            ProviderDispatcherLease::Thread(_) => {}
             ProviderDispatcherLease::Sync(lease) => self.backing.consume_sync_wait(lease),
         }
     }
@@ -305,6 +323,7 @@ impl<B: ProviderEventBacking> ProviderDispatcherWaitBackend for ProviderDispatch
                     .expect("provider Timer wait lost its exact lease during release");
             }
             ProviderDispatcherLease::File(lease) => self.backing.release_file_wait(lease),
+            ProviderDispatcherLease::Thread(lease) => self.backing.release_thread_wait(lease),
             ProviderDispatcherLease::Sync(lease) => self.backing.release_sync_wait(lease),
         }
         self.backing.lease_released();
