@@ -12,6 +12,8 @@ use nt_hosted_runtime::{
     DxgRegistrationKey, DxgSourceDriverObject,
     encode_hosted_dxg_registration_thunk,
     hosted_dxg_acquire_post_display_marshal_policy,
+    hosted_dxg_query_vidpn_interface_marshal_policy,
+    hosted_dxg_vidpn_method_marshal_policy,
     hosted_dxg_registration_marshal_policy,
 };
 use nt_io_manager::{HostedDevicePointerRegistration,
@@ -31,6 +33,10 @@ mod device;
 mod standard_allocation;
 #[path = "hosted_dxg_registration/allocation.rs"]
 mod allocation;
+#[path = "hosted_dxg_registration/recommendation.rs"]
+pub(super) mod recommendation;
+#[path = "hosted_dxg_registration/vidpn.rs"]
+pub(super) mod vidpn;
 
 #[derive(Clone, Copy)]
 struct DxgResolution {
@@ -70,6 +76,8 @@ struct DxgPdoAlias {
     standard_allocation: Option<standard_allocation::StandardAllocationInFlight>,
     allocations: Vec<allocation::DxgAllocationAlias>,
     node_metadata_output: Option<DxgQueryOutputGuard>,
+    recommendation: Option<recommendation::RecommendationInFlight>,
+    vidpn: Option<vidpn::VidPnInFlight>,
     processes: Vec<process::DxgProcessAlias>,
     devices: Vec<device::DxgDeviceAlias>,
     null_process_credits: Option<nt_hosted_runtime::DxgNullProcessCredits>,
@@ -536,7 +544,8 @@ pub(super) unsafe fn is_interface_callback_rva(
     provider_publication_cookie: u64,
     provider_rva: u64,
 ) -> bool {
-    (&*core::ptr::addr_of!(PDO_ALIASES)).iter().any(|alias| {
+    vidpn::is_method_rva(provider_publication_cookie, provider_rva)
+        || (&*core::ptr::addr_of!(PDO_ALIASES)).iter().any(|alias| {
         alias.provider_publication_cookie == provider_publication_cookie
             && alias.interface_callbacks.iter().any(|callback| {
                 callback.provider_rva == provider_rva
@@ -563,7 +572,7 @@ pub(super) unsafe fn validate_interface_call(
     (&*core::ptr::addr_of!(PDO_ALIASES)).iter().any(|alias| {
         let Some(callback) = alias.interface_callbacks.iter().find(|callback| {
             callback.cookie as u64 == args[3]
-                && callback.offset == 0xd8
+                && (callback.offset == 0xd8 || callback.offset == 0x90)
                 && callback.provider_rva == provider_rva
         }) else { return false; };
         let Some(dependent_pdo) = alias.dependent_alias else { return false; };
@@ -574,7 +583,15 @@ pub(super) unsafe fn validate_interface_call(
             && alias.dependent_domain == dependent_domain
             && alias.provider_publication_cookie == provider_publication_cookie
             && alias.start_entered && !alias.pointer_retired
-            && alias.interface_handle != 0 && alias.interface_handle == args[0]
+            && alias.interface_handle != 0
+            && (if callback.offset == 0xd8 {
+                alias.interface_handle == args[0]
+            } else {
+                args[1] == 1 && alias.blocked
+                    && alias.vidpn.as_ref().is_some_and(|held| {
+                        held.handle() != 0 && held.handle() == args[0]
+                    })
+            })
             && alias.context != 0
             && hosted_device_allocations::capture_allocation(dependent,
                 alias.context).ok() == alias.context_allocation
@@ -786,6 +803,8 @@ pub(super) unsafe fn service_add_device_callback(
             standard_allocation: None,
             allocations: Vec::new(),
             node_metadata_output: None,
+            recommendation: None,
+            vidpn: None,
             processes: Vec::new(),
             devices: Vec::new(),
             null_process_credits: None,
@@ -1537,6 +1556,14 @@ pub(super) unsafe fn service_start_device_callback(
         {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
+        let query_vidpn = callbacks.iter().find(|(slot, _, _)| slot.offset == 0x90)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        if !register_hosted_provider_internal_marshal_policy(record.provider_domain,
+            record.provider_publication_cookie, query_vidpn.1,
+            hosted_dxg_query_vidpn_interface_marshal_policy())
+        {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
         Ok(())
     })();
     if let Err(status) = construction {
@@ -1634,9 +1661,29 @@ pub(super) unsafe fn retire_pdo_aliases_for_instance(
         let dependent = row.dependent_instance;
         let alias = row.dependent_alias;
         let allocation = row.alias_allocation;
+        let callback_entered = row.callback_entered;
         let domain_matches = row.dependent_instance == instance_index
             && row.dependent_domain == domain;
-        if !domain_matches || row.blocked || !row.callback_entered {
+        if domain_matches && row.blocked
+            && row.recommendation.as_ref().is_some_and(|held| held.may_settle())
+        {
+            // The callback and its negative, read-only result were already
+            // acknowledged. Retry only exact receipt release after an earlier
+            // release failure, never the native DDI.
+            if pdo_aliases_mut()[index].recommendation.as_mut().unwrap().release().is_ok() {
+                pdo_aliases_mut()[index].recommendation = None;
+                pdo_aliases_mut()[index].blocked = false;
+            }
+        }
+        if domain_matches && pdo_aliases_mut()[index].blocked
+            && pdo_aliases_mut()[index].vidpn.as_ref().is_some_and(|held| held.may_settle())
+        {
+            if pdo_aliases_mut()[index].vidpn.as_mut().unwrap().release().is_ok() {
+                pdo_aliases_mut()[index].vidpn = None;
+                pdo_aliases_mut()[index].blocked = false;
+            }
+        }
+        if !domain_matches || pdo_aliases_mut()[index].blocked || !callback_entered {
             failures += 1;
             index += 1;
             continue;
@@ -1660,6 +1707,7 @@ pub(super) unsafe fn retire_pdo_aliases_for_instance(
             continue;
         }
         if pdo_aliases_mut()[index].standard_allocation.is_some()
+            || pdo_aliases_mut()[index].recommendation.is_some()
             || !pdo_aliases_mut()[index].processes.is_empty()
             || !pdo_aliases_mut()[index].devices.is_empty()
             || !pdo_aliases_mut()[index].allocations.is_empty()

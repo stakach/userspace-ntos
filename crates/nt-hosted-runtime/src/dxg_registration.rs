@@ -164,7 +164,7 @@ impl<'a> DxgStartInterface<'a> {
         }
         let data = Self { bytes: &bytes[..required] };
         if data.device_handle() == 0
-            || [0x80, 0x88, 0xd8].iter().any(|offset| {
+            || [0x80, 0x88, 0x90, 0xd8].iter().any(|offset| {
                 data.callback_at(*offset).is_none_or(|target| target == 0)
             })
         {
@@ -231,6 +231,12 @@ pub enum DxgDdiSignature {
     GetNodeMetadata,
     CreateProcess,
     DestroyProcess,
+    IsSupportedVidPn,
+    SetTimingsFromVidPn,
+    SetVidPnSourceVisibility,
+    RecommendFunctionalVidPn,
+    EnumVidPnCofuncModality,
+    RecommendVidPnTopology,
 }
 
 impl DxgDdiSignature {
@@ -249,6 +255,12 @@ impl DxgDdiSignature {
             0x98 => Some(Self::CreateAllocation),
             0xa0 => Some(Self::DestroyAllocation),
             0xb0 => Some(Self::GetStandardAllocationDriverData),
+            0x128 => Some(Self::IsSupportedVidPn),
+            0x3b8 if version == 0x11007 => Some(Self::SetTimingsFromVidPn),
+            0x130 => Some(Self::RecommendFunctionalVidPn),
+            0x138 => Some(Self::EnumVidPnCofuncModality),
+            0x148 => Some(Self::SetVidPnSourceVisibility),
+            0x168 => Some(Self::RecommendVidPnTopology),
             0x190 => Some(Self::DestroyDevice),
             0x1d0 => Some(Self::CreateContext),
             0x1d8 => Some(Self::DestroyContext),
@@ -271,9 +283,361 @@ impl DxgDdiSignature {
             | Self::GetStandardAllocationDriverData => 2,
             Self::DestroyDevice | Self::DestroyContext => 1,
             Self::CreateProcess | Self::DestroyProcess => 2,
+            Self::IsSupportedVidPn | Self::SetTimingsFromVidPn
+            | Self::SetVidPnSourceVisibility
+            | Self::RecommendFunctionalVidPn
+            | Self::EnumVidPnCofuncModality
+            | Self::RecommendVidPnTopology => 2,
             Self::StopDevice | Self::RemoveDevice => 1,
         }
     }
+}
+
+/// Pinned LiberNT's x64 DXGKARG_ISSUPPORTEDVIDPN. The BOOLEAN at byte 8 is
+/// the only output field; the final seven bytes are C padding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgIsSupportedVidPnRequest {
+    vidpn: u64,
+}
+
+impl DxgIsSupportedVidPnRequest {
+    pub const BYTES: usize = 16;
+
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        let raw = bytes.get(..Self::BYTES)?;
+        Some(Self { vidpn: u64::from_le_bytes(raw[..8].try_into().ok()?) })
+    }
+
+    pub const fn vidpn(self) -> u64 { self.vidpn }
+
+    pub fn supported(bytes: &[u8]) -> Option<bool> {
+        match *bytes.get(8)? { 0 => Some(false), 1 => Some(true), _ => None }
+    }
+}
+
+/// Pinned LiberNT's const x64 DXGKARG_SETVIDPNSOURCEVISIBILITY.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgSourceVisibilityRequest {
+    source_id: u32,
+    visible: bool,
+}
+
+impl DxgSourceVisibilityRequest {
+    pub const BYTES: usize = 8;
+
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        let raw = bytes.get(..Self::BYTES)?;
+        let visible = raw[4] != 0;
+        Some(Self { source_id: u32::from_le_bytes(raw[..4].try_into().ok()?),
+            visible })
+    }
+
+    pub const fn source_id(self) -> u32 { self.source_id }
+    pub const fn visible(self) -> bool { self.visible }
+}
+
+/// Pinned LiberNT's x64 WDDM 2.2+ DXGKARG_SETTIMINGSFROMVIDPN.
+/// Both nested pointers belong to the caller and require separate projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgSetTimingsRequest {
+    vidpn: u64,
+    set_flags: u32,
+    results: u64,
+    path_count: usize,
+    paths: u64,
+}
+
+impl DxgSetTimingsRequest {
+    pub const BYTES: usize = 0x28;
+    pub const PATH_BYTES: usize = 0x38;
+    pub const MAX_PATHS: usize = 32;
+
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        let raw = bytes.get(..Self::BYTES)?;
+        let qword = |at: usize| -> Option<u64> {
+            Some(u64::from_le_bytes(raw.get(at..at + 8)?.try_into().ok()?))
+        };
+        let dword = |at: usize| -> Option<u32> {
+            Some(u32::from_le_bytes(raw.get(at..at + 4)?.try_into().ok()?))
+        };
+        let path_count = dword(24)? as usize;
+        let paths = qword(32)?;
+        if path_count > Self::MAX_PATHS || qword(16)? == 0
+            || (path_count != 0 && paths == 0)
+        { return None; }
+        Some(Self { vidpn: qword(0)?, set_flags: dword(8)?,
+            results: qword(16)?, path_count, paths })
+    }
+
+    pub const fn vidpn(self) -> u64 { self.vidpn }
+    pub const fn set_flags(self) -> u32 { self.set_flags }
+    pub const fn results(self) -> u64 { self.results }
+    pub const fn path_count(self) -> usize { self.path_count }
+    pub const fn paths(self) -> u64 { self.paths }
+    pub const fn path_bytes(self) -> usize { self.path_count * Self::PATH_BYTES }
+
+    /// Apply only DXGK_SET_TIMING_PATH_INFO output fields. The target, color,
+    /// wire format, and InputFlags remain the provider's original input.
+    pub fn merge_path_outputs(self, original: &mut [u8], returned: &[u8]) -> Option<()> {
+        let bytes = self.path_bytes();
+        if original.len() != bytes || returned.len() != bytes { return None; }
+        for index in 0..self.path_count {
+            let at = index * Self::PATH_BYTES;
+            if original[at..at + 16] != returned[at..at + 16] { return None; }
+            original[at + 16..at + 20]
+                .copy_from_slice(&returned[at + 16..at + 20]);
+            original[at + 24..at + 52]
+                .copy_from_slice(&returned[at + 24..at + 52]);
+        }
+        Some(())
+    }
+}
+
+/// Pinned LiberNT's x64 DXGKARG_ENUMVIDPNCOFUNCMODALITY. The handle is
+/// provider-owned and opaque; the pivot fields are scalar IDs, not pointers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgEnumVidPnRequest {
+    vidpn: u64,
+    pivot_type: u32,
+    source_id: u32,
+    target_id: u32,
+}
+
+impl DxgEnumVidPnRequest {
+    pub const BYTES: usize = 24;
+
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        let raw = bytes.get(..Self::BYTES)?;
+        let vidpn = u64::from_le_bytes(raw[0..8].try_into().ok()?);
+        if vidpn == 0 { return None; }
+        Some(Self {
+            vidpn,
+            pivot_type: u32::from_le_bytes(raw[8..12].try_into().ok()?),
+            source_id: u32::from_le_bytes(raw[12..16].try_into().ok()?),
+            target_id: u32::from_le_bytes(raw[16..20].try_into().ok()?),
+        })
+    }
+
+    pub const fn vidpn(self) -> u64 { self.vidpn }
+    pub const fn pivot_type(self) -> u32 { self.pivot_type }
+    pub const fn source_id(self) -> u32 { self.source_id }
+    pub const fn target_id(self) -> u32 { self.target_id }
+}
+
+/// The released DXGK_VIDPN_INTERFACE V1 and its nested x64 tables. Only the
+/// top table carries a version word; every slot is a provider function address
+/// that must be rebound into the dependent VSpace before publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DxgVidPnTableKind {
+    VidPn,
+    Topology,
+    SourceModeSet,
+    TargetModeSet,
+}
+
+/// One nested VidPN method candidate. A shared provider function RVA is not
+/// sufficient to identify the in-flight VidPN or mode-set it acts on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgVidPnMethodRouteKey {
+    provider_rva: u64,
+    owner_handle: u64,
+    owner_generation: u64,
+}
+
+impl DxgVidPnMethodRouteKey {
+    pub const fn new(provider_rva: u64, owner_handle: u64,
+        owner_generation: u64) -> Self
+    {
+        Self { provider_rva, owner_handle, owner_generation }
+    }
+
+    pub fn select_unique(candidates: &[Self], provider_rva: u64,
+        owner_handle: u64, owner_generation: u64) -> Option<usize>
+    {
+        Self::select_unique_route(candidates.iter().copied().enumerate(),
+            provider_rva, owner_handle, owner_generation)
+    }
+
+    pub fn select_unique_route<T: Copy>(
+        candidates: impl IntoIterator<Item = (T, Self)>,
+        provider_rva: u64,
+        owner_handle: u64,
+        owner_generation: u64,
+    ) -> Option<T> {
+        let expected = Self::new(provider_rva, owner_handle, owner_generation);
+        let mut selected = None;
+        for (route, key) in candidates {
+            if key != expected { continue; }
+            if selected.is_some() { return None; }
+            selected = Some(route);
+        }
+        selected
+    }
+}
+
+impl DxgVidPnTableKind {
+    pub const fn object_bytes(self) -> usize {
+        match self {
+            Self::VidPn | Self::Topology => 0,
+            Self::SourceModeSet => 40,
+            Self::TargetModeSet => 80,
+        }
+    }
+
+    pub const fn slot_count(self) -> usize {
+        match self {
+            Self::VidPn => 10,
+            Self::Topology => 12,
+            Self::SourceModeSet | Self::TargetModeSet => 8,
+        }
+    }
+
+    pub const fn bytes(self) -> usize {
+        self.slot_count() * 8 + if matches!(self, Self::VidPn) { 8 } else { 0 }
+    }
+
+    pub const fn slot_offset(self, index: usize) -> Option<usize> {
+        if index >= self.slot_count() { return None; }
+        Some(index * 8 + if matches!(self, Self::VidPn) { 8 } else { 0 })
+    }
+
+    pub const fn argument_count(self, index: usize) -> Option<u8> {
+        if index >= self.slot_count() { return None; }
+        Some(match self {
+            Self::VidPn => [3, 4, 2, 4, 3, 4, 4, 2, 4, 3][index],
+            Self::Topology => [2, 3, 4, 3, 4, 2, 3, 2, 2, 2, 2, 3][index],
+            Self::SourceModeSet | Self::TargetModeSet =>
+                [2, 2, 3, 2, 2, 2, 2, 2][index],
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgVidPnInterfaceLayout<'a> {
+    kind: DxgVidPnTableKind,
+    bytes: &'a [u8],
+}
+
+/// WDDM 3.2 present-path copy admitted by the released BasicDisplay path.
+/// A nonempty gamma ramp includes a nested provider pointer and requires its
+/// own projection before the path can be exposed to another VSpace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgVidPnPathLayout;
+
+impl DxgVidPnPathLayout {
+    pub const BYTES: usize = 360;
+    pub fn has_no_nested_data(bytes: &[u8]) -> bool {
+        let Some(path) = bytes.get(..Self::BYTES) else { return false; };
+        path[344..360].iter().all(|byte| *byte == 0)
+    }
+}
+
+impl<'a> DxgVidPnInterfaceLayout<'a> {
+    pub fn parse(kind: DxgVidPnTableKind, bytes: &'a [u8]) -> Option<Self> {
+        let bytes = bytes.get(..kind.bytes())?;
+        if kind == DxgVidPnTableKind::VidPn
+            && u32::from_le_bytes(bytes[0..4].try_into().ok()?) != 1
+        { return None; }
+        let layout = Self { kind, bytes };
+        for index in 0..kind.slot_count() {
+            if layout.callback_at(index)? == 0 { return None; }
+        }
+        Some(layout)
+    }
+
+    pub const fn kind(self) -> DxgVidPnTableKind { self.kind }
+    pub fn callback_at(self, index: usize) -> Option<u64> {
+        let offset = self.kind.slot_offset(index)?;
+        Some(u64::from_le_bytes(self.bytes[offset..offset + 8].try_into().ok()?))
+    }
+}
+
+/// The pinned x64 DXGK recommendation arguments. VidPN and topology handles
+/// remain provider-owned opaque identities. A miniport that wants to modify a
+/// VidPN must use a separately projected VIDPN_MGR interface; this contract
+/// admits the driver's explicit no-recommendation result only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DxgRecommendationRequest {
+    Functional { vidpn: u64, targets: u64, target_count: u32 },
+    Topology { vidpn: u64 },
+}
+
+impl DxgRecommendationRequest {
+    pub const fn request_bytes(signature: DxgDdiSignature) -> Option<u64> {
+        match signature {
+            DxgDdiSignature::RecommendFunctionalVidPn => Some(48),
+            DxgDdiSignature::RecommendVidPnTopology => Some(24),
+            _ => None,
+        }
+    }
+
+    pub fn parse(signature: DxgDdiSignature, bytes: &[u8], capacity: u64) -> Option<Self> {
+        fn dword(bytes: &[u8], at: usize) -> Option<u32> {
+            Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+        }
+        fn qword(bytes: &[u8], at: usize) -> Option<u64> {
+            Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+        }
+        match signature {
+            DxgDdiSignature::RecommendFunctionalVidPn if bytes.len() >= 48 && capacity >= 48 => {
+                let count = dword(bytes, 0)?;
+                let targets = qword(bytes, 8)?;
+                let vidpn = qword(bytes, 16)?;
+                let reason = dword(bytes, 24)?;
+                if count > 16 || (count == 0) != (targets == 0)
+                    || 48u64.checked_add((count as u64) * 4)? > capacity
+                    || vidpn == 0 || reason > 3
+                    || qword(bytes, 32)? != 0 || dword(bytes, 40)? != 0
+                { return None; }
+                Some(Self::Functional { vidpn, targets, target_count: count })
+            }
+            DxgDdiSignature::RecommendVidPnTopology if bytes.len() >= 24 && capacity >= 24 => {
+                let vidpn = qword(bytes, 0)?;
+                let reason = dword(bytes, 12)?;
+                if vidpn == 0 || reason > 4 || qword(bytes, 16)? != 0 {
+                    return None;
+                }
+                Some(Self::Topology { vidpn })
+            }
+            _ => None,
+        }
+    }
+
+    pub const fn vidpn(self) -> u64 {
+        match self {
+            Self::Functional { vidpn, .. } | Self::Topology { vidpn } => vidpn,
+        }
+    }
+
+    pub const fn target_bytes(self) -> u64 {
+        match self {
+            Self::Functional { target_count, .. } => target_count as u64 * 4,
+            Self::Topology { .. } => 0,
+        }
+    }
+
+    pub const fn targets(self) -> u64 {
+        match self {
+            Self::Functional { targets, .. } => targets,
+            Self::Topology { .. } => 0,
+        }
+    }
+
+    pub const fn no_recommendation_status(self) -> i32 {
+        match self {
+            Self::Functional { .. } => 0xc01e_0323_u32 as i32,
+            Self::Topology { .. } => 0xc01e_031a_u32 as i32,
+        }
+    }
+}
+
+/// Only a completed, negative recommendation that left the projected input
+/// untouched may settle retained pins after a transient release failure.
+/// A lost callback or successful VidPN mutation requires a different owner.
+pub const fn dxg_recommendation_settle_admitted(
+    completed: bool, native_status: i32, input_unchanged: bool, owner_live: bool,
+) -> bool {
+    completed && native_status < 0 && input_unchanged && owner_live
 }
 
 /// Pinned LiberNT x64 DXGKARG_CREATEALLOCATION and one DXGK_ALLOCATIONINFO.
@@ -1531,4 +1895,279 @@ pub const fn dxg_stop_device_admitted(
     start_entered && start_succeeded && !start_callback_active && !blocked
         && !pointer_retired && !stop_entered && retained_context != 0
         && retained_context == supplied_context
+}
+
+#[cfg(test)]
+mod recommendation_tests {
+    use super::{DxgDdiSignature, DxgEnumVidPnRequest, DxgIsSupportedVidPnRequest,
+        DxgSetTimingsRequest, DxgSourceVisibilityRequest, DxgVidPnMethodRouteKey,
+        DxgRecommendationRequest,
+        DxgVidPnInterfaceLayout, DxgVidPnPathLayout, DxgVidPnTableKind,
+        dxg_recommendation_settle_admitted};
+
+    #[test]
+    fn dxg_recommendation_offsets_are_typed() {
+        // Pinned LiberNT DRIVER_INITIALIZATION_DATA places these callbacks at
+        // the same offsets for both admitted full-driver DDI versions.
+        for version in [0x5022, 0x5023, 0x11007] {
+            let functional = DxgDdiSignature::for_offset(version, 0x130);
+            let topology = DxgDdiSignature::for_offset(version, 0x168);
+            assert!(functional.is_some(), "functional VidPN DDI missing for {version:#x}");
+            assert!(topology.is_some(), "topology DDI missing for {version:#x}");
+            assert_eq!(functional.unwrap().argument_count(), 2);
+            assert_eq!(topology.unwrap().argument_count(), 2);
+        }
+        assert!(DxgDdiSignature::for_offset(0, 0x130).is_none());
+        assert!(DxgDdiSignature::for_offset(0, 0x168).is_none());
+    }
+
+    #[test]
+    fn dxg_enum_vidpn_requires_typed_signature() {
+        for version in [0x5022, 0x5023, 0x11007] {
+            let signature = DxgDdiSignature::for_offset(version, 0x138);
+            assert!(signature.is_some(), "EnumVidPnCofuncModality missing for {version:#x}");
+            assert_eq!(signature.unwrap().argument_count(), 2);
+        }
+        assert!(DxgDdiSignature::for_offset(0, 0x138).is_none());
+    }
+
+    #[test]
+    fn dxg_is_supported_vidpn_requires_typed_signature() {
+        // Pinned LiberNT DRIVER_INITIALIZATION_DATA places IsSupportedVidPn
+        // immediately before RecommendFunctionalVidPn. The miniport takes
+        // its adapter context and an in/out DXGKARG_ISSUPPORTEDVIDPN.
+        for version in [0x5022, 0x5023, 0x11007] {
+            let signature = DxgDdiSignature::for_offset(version, 0x128);
+            assert!(signature.is_some(), "IsSupportedVidPn missing for {version:#x}");
+            assert_eq!(signature.unwrap().argument_count(), 2);
+        }
+        assert!(DxgDdiSignature::for_offset(0, 0x128).is_none());
+    }
+
+    #[test]
+    fn dxg_set_timings_from_vidpn_is_wddm22_typed_signature() {
+        // Pinned DRIVER_INITIALIZATION_DATA adds the callback at x64 0x3b8
+        // in its WDDM 2.2 tail. The released miniport registers WDDM 3.2.
+        let signature = DxgDdiSignature::for_offset(0x11007, 0x3b8);
+        assert!(signature.is_some(), "SetTimingsFromVidPn missing for WDDM 3.2");
+        assert_eq!(signature.unwrap().argument_count(), 2);
+        assert!(DxgDdiSignature::for_offset(0x5022, 0x3b8).is_none());
+        assert!(DxgDdiSignature::for_offset(0x5023, 0x3b8).is_none());
+    }
+
+    #[test]
+    fn dxg_set_vidpn_source_visibility_requires_typed_signature() {
+        // Pinned DRIVER_INITIALIZATION_DATA places this legacy slot after
+        // SetVidPnSourceAddress at x64 offset 0x148.
+        for version in [0x5022, 0x5023, 0x11007] {
+            let signature = DxgDdiSignature::for_offset(version, 0x148);
+            assert!(signature.is_some(), "SetVidPnSourceVisibility missing for {version:#x}");
+            assert_eq!(signature.unwrap().argument_count(), 2);
+        }
+        assert!(DxgDdiSignature::for_offset(0, 0x148).is_none());
+    }
+
+    #[test]
+    fn source_visibility_request_preserves_source_and_const_boolean() {
+        let mut wire = [0xa5u8; DxgSourceVisibilityRequest::BYTES];
+        wire[..4].copy_from_slice(&17u32.to_le_bytes());
+        wire[4] = 1;
+        let parsed = DxgSourceVisibilityRequest::parse(&wire).unwrap();
+        assert_eq!(parsed.source_id(), 17);
+        assert!(parsed.visible());
+        wire[4] = 0;
+        assert!(!DxgSourceVisibilityRequest::parse(&wire).unwrap().visible());
+        wire[4] = 2;
+        assert!(DxgSourceVisibilityRequest::parse(&wire).unwrap().visible());
+        assert!(DxgSourceVisibilityRequest::parse(&wire[..7]).is_none());
+    }
+
+    #[test]
+    fn set_timings_request_bounds_nested_paths_without_display_identity() {
+        let mut wire = [0u8; DxgSetTimingsRequest::BYTES];
+        wire[..8].copy_from_slice(&0x1234u64.to_le_bytes());
+        wire[16..24].copy_from_slice(&0x2000u64.to_le_bytes());
+        wire[24..28].copy_from_slice(&2u32.to_le_bytes());
+        wire[32..40].copy_from_slice(&0x3000u64.to_le_bytes());
+        let parsed = DxgSetTimingsRequest::parse(&wire).unwrap();
+        assert_eq!(parsed.vidpn(), 0x1234);
+        assert_eq!(parsed.set_flags(), 0);
+        assert_eq!(parsed.results(), 0x2000);
+        assert_eq!(parsed.path_count(), 2);
+        assert_eq!(parsed.paths(), 0x3000);
+        assert_eq!(parsed.path_bytes(), 0x70);
+        wire[24..28].copy_from_slice(&33u32.to_le_bytes());
+        assert!(DxgSetTimingsRequest::parse(&wire).is_none());
+        wire[24..28].copy_from_slice(&1u32.to_le_bytes());
+        wire[32..40].fill(0);
+        assert!(DxgSetTimingsRequest::parse(&wire).is_none());
+        wire[24..28].fill(0);
+        assert!(DxgSetTimingsRequest::parse(&wire).is_some());
+    }
+
+    #[test]
+    fn set_timings_path_copyback_preserves_provider_inputs() {
+        let mut request = [0u8; DxgSetTimingsRequest::BYTES];
+        request[16..24].copy_from_slice(&0x2000u64.to_le_bytes());
+        request[24..28].copy_from_slice(&1u32.to_le_bytes());
+        request[32..40].copy_from_slice(&0x3000u64.to_le_bytes());
+        let parsed = DxgSetTimingsRequest::parse(&request).unwrap();
+        let mut original = [0x11u8; DxgSetTimingsRequest::PATH_BYTES];
+        let mut returned = original;
+        returned[16..20].fill(0x22);
+        returned[24..52].fill(0x33);
+        returned[20..24].fill(0x44); // C padding, not output.
+        returned[52..56].fill(0x55); // C padding, not output.
+        parsed.merge_path_outputs(&mut original, &returned).unwrap();
+        assert_eq!(&original[..16], &[0x11; 16]);
+        assert_eq!(&original[16..20], &[0x22; 4]);
+        assert_eq!(&original[20..24], &[0x11; 4]);
+        assert_eq!(&original[24..52], &[0x33; 28]);
+        assert_eq!(&original[52..56], &[0x11; 4]);
+        returned[0] = 0xff;
+        assert!(parsed.merge_path_outputs(&mut original, &returned).is_none());
+    }
+
+    #[test]
+    fn vidpn_method_route_uses_exact_handle_and_rejects_ambiguity() {
+        let candidates = [
+            DxgVidPnMethodRouteKey::new(0x1234, 0x1000, 7),
+            DxgVidPnMethodRouteKey::new(0x1234, 0x2000, 9),
+        ];
+        assert_eq!(DxgVidPnMethodRouteKey::select_unique(
+            &candidates, 0x1234, 0x2000, 9), Some(1));
+        assert_eq!(DxgVidPnMethodRouteKey::select_unique(
+            &candidates, 0x1234, 0x2000, 7), None);
+        let ambiguous = [candidates[1], candidates[1]];
+        assert_eq!(DxgVidPnMethodRouteKey::select_unique(
+            &ambiguous, 0x1234, 0x2000, 9), None);
+    }
+
+    #[test]
+    fn is_supported_vidpn_request_preserves_handle_and_boolean_contract() {
+        let mut wire = [0xa5u8; DxgIsSupportedVidPnRequest::BYTES];
+        wire[..8].copy_from_slice(&0x1234_5678u64.to_le_bytes());
+        wire[8] = 0;
+        let parsed = DxgIsSupportedVidPnRequest::parse(&wire).unwrap();
+        assert_eq!(parsed.vidpn(), 0x1234_5678);
+        assert_eq!(DxgIsSupportedVidPnRequest::supported(&wire), Some(false));
+        wire[8] = 1;
+        assert_eq!(DxgIsSupportedVidPnRequest::supported(&wire), Some(true));
+        wire[8] = 2;
+        assert_eq!(DxgIsSupportedVidPnRequest::supported(&wire), None);
+        assert!(DxgIsSupportedVidPnRequest::parse(&wire[..15]).is_none());
+        wire[..8].fill(0);
+        assert_eq!(DxgIsSupportedVidPnRequest::parse(&wire).unwrap().vidpn(), 0);
+    }
+
+    #[test]
+    fn enum_vidpn_request_preserves_provider_handle_and_pivot() {
+        let mut wire = [0u8; DxgEnumVidPnRequest::BYTES];
+        wire[0..8].copy_from_slice(&0x1234_5678u64.to_le_bytes());
+        wire[8..12].copy_from_slice(&5u32.to_le_bytes());
+        wire[12..16].copy_from_slice(&7u32.to_le_bytes());
+        wire[16..20].copy_from_slice(&11u32.to_le_bytes());
+        wire[20..24].fill(0xaa); // C padding is not a contract field.
+        let parsed = DxgEnumVidPnRequest::parse(&wire).unwrap();
+        assert_eq!(parsed.vidpn(), 0x1234_5678);
+        assert_eq!(parsed.pivot_type(), 5);
+        assert_eq!(parsed.source_id(), 7);
+        assert_eq!(parsed.target_id(), 11);
+        assert!(DxgEnumVidPnRequest::parse(&wire[..23]).is_none());
+        wire[0..8].fill(0);
+        assert!(DxgEnumVidPnRequest::parse(&wire).is_none());
+    }
+
+    #[test]
+    fn vidpn_tables_require_version_and_every_provider_callback() {
+        for kind in [DxgVidPnTableKind::VidPn, DxgVidPnTableKind::Topology,
+            DxgVidPnTableKind::SourceModeSet, DxgVidPnTableKind::TargetModeSet]
+        {
+            let mut bytes = [0u8; 96];
+            if kind == DxgVidPnTableKind::VidPn {
+                bytes[0..4].copy_from_slice(&1u32.to_le_bytes());
+            }
+            for index in 0..kind.slot_count() {
+                let offset = kind.slot_offset(index).unwrap();
+                bytes[offset..offset + 8]
+                    .copy_from_slice(&(0x1000 + index as u64 * 0x10).to_le_bytes());
+            }
+            let table = DxgVidPnInterfaceLayout::parse(kind,
+                &bytes[..kind.bytes()]).unwrap();
+            assert_eq!(table.kind(), kind);
+            assert_eq!(table.callback_at(kind.slot_count() - 1),
+                Some(0x1000 + (kind.slot_count() - 1) as u64 * 0x10));
+            assert!(kind.argument_count(0).is_some());
+            assert!(kind.argument_count(kind.slot_count()).is_none());
+            assert!(DxgVidPnInterfaceLayout::parse(kind,
+                &bytes[..kind.bytes() - 1]).is_none());
+            let offset = kind.slot_offset(0).unwrap();
+            bytes[offset..offset + 8].fill(0);
+            assert!(DxgVidPnInterfaceLayout::parse(kind,
+                &bytes[..kind.bytes()]).is_none());
+        }
+        assert_eq!(DxgVidPnTableKind::VidPn.bytes(), 88);
+        assert_eq!(DxgVidPnTableKind::Topology.bytes(), 96);
+        assert_eq!(DxgVidPnTableKind::SourceModeSet.bytes(), 64);
+        assert_eq!(DxgVidPnTableKind::SourceModeSet.object_bytes(), 40);
+        assert_eq!(DxgVidPnTableKind::TargetModeSet.object_bytes(), 80);
+    }
+
+    #[test]
+    fn vidpn_path_never_projects_nested_gamma_pointer() {
+        let mut path = [0u8; DxgVidPnPathLayout::BYTES];
+        assert!(DxgVidPnPathLayout::has_no_nested_data(&path));
+        path[352..360].copy_from_slice(&0x1000u64.to_le_bytes());
+        assert!(!DxgVidPnPathLayout::has_no_nested_data(&path));
+        path[352..360].fill(0);
+        path[344..352].copy_from_slice(&1u64.to_le_bytes());
+        assert!(!DxgVidPnPathLayout::has_no_nested_data(&path));
+        assert!(!DxgVidPnPathLayout::has_no_nested_data(&path[..359]));
+    }
+
+    #[test]
+    fn recommendation_request_keeps_provider_vidpn_and_rejects_unprojected_payloads() {
+        let mut functional = [0u8; 48];
+        functional[0..4].copy_from_slice(&1u32.to_le_bytes());
+        functional[8..16].copy_from_slice(&0x1000u64.to_le_bytes());
+        functional[16..24].copy_from_slice(&0x2000u64.to_le_bytes());
+        functional[24..28].copy_from_slice(&2u32.to_le_bytes());
+        let shape = DxgRecommendationRequest::parse(
+            DxgDdiSignature::RecommendFunctionalVidPn, &functional, 52).unwrap();
+        assert_eq!(shape.vidpn(), 0x2000);
+        assert_eq!(shape.targets(), 0x1000);
+        assert_eq!(shape.target_bytes(), 4);
+        assert_eq!(shape.no_recommendation_status() as u32, 0xc01e_0323);
+        assert!(DxgRecommendationRequest::parse(
+            DxgDdiSignature::RecommendFunctionalVidPn, &functional, 51).is_none());
+        functional[32..40].copy_from_slice(&0x3000u64.to_le_bytes());
+        assert!(DxgRecommendationRequest::parse(
+            DxgDdiSignature::RecommendFunctionalVidPn, &functional, 52).is_none());
+
+        let mut topology = [0u8; 24];
+        topology[0..8].copy_from_slice(&0x2000u64.to_le_bytes());
+        topology[12..16].copy_from_slice(&2u32.to_le_bytes());
+        let shape = DxgRecommendationRequest::parse(
+            DxgDdiSignature::RecommendVidPnTopology, &topology, 24).unwrap();
+        assert_eq!(shape.vidpn(), 0x2000);
+        assert_eq!(shape.no_recommendation_status() as u32, 0xc01e_031a);
+        topology[16..24].copy_from_slice(&0x4000u64.to_le_bytes());
+        assert!(DxgRecommendationRequest::parse(
+            DxgDdiSignature::RecommendVidPnTopology, &topology, 24).is_none());
+    }
+
+    #[test]
+    fn only_acknowledged_unchanged_negative_recommendation_can_settle_pins() {
+        let no_recommendation = 0xc01e_0323_u32 as i32;
+        assert!(dxg_recommendation_settle_admitted(
+            true, no_recommendation, true, true));
+        assert!(!dxg_recommendation_settle_admitted(
+            false, no_recommendation, true, true));
+        assert!(!dxg_recommendation_settle_admitted(
+            true, 0, true, true));
+        assert!(!dxg_recommendation_settle_admitted(
+            true, no_recommendation, false, true));
+        assert!(!dxg_recommendation_settle_admitted(
+            true, no_recommendation, true, false));
+    }
 }

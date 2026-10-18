@@ -19133,6 +19133,9 @@ impl HostedProviderDispatchRoute {
 
 #[derive(Clone, Copy)]
 struct ProviderMarshalState {
+    vidpn_method: Option<hosted_dxg_registration::vidpn::VidPnMethodFrame>,
+    mode_method: Option<hosted_dxg_registration::vidpn::modes::ModeMethodFrame>,
+    topology_method: Option<hosted_dxg_registration::vidpn::TopologyMethodFrame>,
     source_windows: [Option<HostedProviderMarshalWindow>; 2],
     cursor: u64,
     copyouts: [ProviderMarshalCopyout; HOSTED_PROVIDER_EXPORT_ARG_CAP],
@@ -19204,6 +19207,9 @@ struct ProviderMarshalState {
 impl ProviderMarshalState {
     const fn empty() -> Self {
         Self {
+            vidpn_method: None,
+            mode_method: None,
+            topology_method: None,
             source_windows: [None; 2],
             cursor: 0,
             copyouts: [ProviderMarshalCopyout {
@@ -30572,12 +30578,25 @@ unsafe fn complete_provider_export_side_effects(
     state: &ProviderMarshalState,
     provider_instance: usize,
     dependent_instance: usize,
+    provider_publication_cookie: u64,
     args: &[u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
     result: u64,
 ) -> Result<(), i32> {
     match policy.side_effect {
         HostedProviderExportSideEffect::None
         | HostedProviderExportSideEffect::DxgInterfaceCallback => Ok(()),
+        HostedProviderExportSideEffect::DxgVidPnInterfaceQuery => {
+            if (result as u32 as i32) < 0 { return Ok(()); }
+            if state.copyout_count != 1 || state.copyouts[0].bytes != 8 {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            hosted_dxg_registration::vidpn::complete_query_vidpn_interface(
+                provider_instance, dependent_instance, provider_publication_cookie,
+                args[0], args[1], state.copyouts[0].provider_exec_va)
+        }
+        HostedProviderExportSideEffect::DxgVidPnMethod =>
+            hosted_dxg_registration::vidpn::complete_method(provider_instance,
+                dependent_instance, provider_publication_cookie, state, result),
         HostedProviderExportSideEffect::DxgRegistration => {
             if result != STATUS_SUCCESS as u64 { return Ok(()); }
             let route = hosted_provider_dispatch_route(state.ndis_route_index)
@@ -31486,7 +31505,9 @@ where
     {
         return hosted_provider_export_failure(STATUS_INVALID_PARAMETER);
     }
-    if policy.side_effect == HostedProviderExportSideEffect::DxgInterfaceCallback
+    if matches!(policy.side_effect,
+        HostedProviderExportSideEffect::DxgInterfaceCallback
+            | HostedProviderExportSideEffect::DxgVidPnInterfaceQuery)
         && !hosted_dxg_registration::validate_interface_call(
             singleton.instance,
             dependent_index,
@@ -31533,7 +31554,10 @@ where
     ) else {
         return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
     };
-    let reentrant = if policy.side_effect == HostedProviderExportSideEffect::DxgInterfaceCallback {
+    let reentrant = if matches!(policy.side_effect,
+        HostedProviderExportSideEffect::DxgInterfaceCallback
+            | HostedProviderExportSideEffect::DxgVidPnInterfaceQuery
+            | HostedProviderExportSideEffect::DxgVidPnMethod) {
         let Some(owner) = hosted_provider_object_owner_for_pair(singleton.instance, dependent_index)
         else {
             print_str(b"[provider-export] reject stage=dxg-worker-owner\n");
@@ -31589,7 +31613,7 @@ where
     );
     let dependent_binding = current_hosted_device_dispatch_binding(dependent_index)
         .and_then(|binding| hosted_resource_binding_by_device_id(binding.device_id));
-    let marshal_state = match prepare_provider_export_marshal(
+    let mut marshal_state = match prepare_provider_export_marshal(
         policy,
         singleton.instance,
         singleton.provider_publication_cookie,
@@ -31611,6 +31635,17 @@ where
             return hosted_provider_export_failure(status);
         }
     };
+
+    if policy.side_effect == HostedProviderExportSideEffect::DxgVidPnMethod {
+        if let Err(status) = hosted_dxg_registration::vidpn::prepare_method(
+            singleton.instance, dependent_index, provider_publication_cookie,
+            provider_export_rva, dependent_inst, marshal_window,
+            &mut marshal_state, &mut args)
+        {
+            abort_provider_export_marshal_before_dispatch(&marshal_state);
+            return hosted_provider_export_failure(status);
+        }
+    }
 
     if let Some(binding) = dependent_binding {
         if let Err(status) = project_provider_resource_state(
@@ -31649,6 +31684,9 @@ where
         reentrant) {
         Ok(result) => result,
         Err(status) => {
+            if policy.side_effect == HostedProviderExportSideEffect::DxgVidPnMethod {
+                hosted_dxg_registration::vidpn::retain_uncertain_method(&marshal_state);
+            }
             trace_hosted_provider_export_rejection(
                 &singleton.provider,
                 provider_publication_cookie,
@@ -31666,18 +31704,26 @@ where
         &marshal_state,
         singleton.instance,
         dependent_index,
+        provider_publication_cookie,
         &args,
         result,
     ) {
+        if policy.side_effect == HostedProviderExportSideEffect::DxgVidPnMethod {
+            hosted_dxg_registration::vidpn::retain_uncertain_method(&marshal_state);
+        }
         print_str(b"[driver-import] provider side effect failed cookie=");
         print_u64(provider_publication_cookie);
         print_str(b" status=0x");
         print_hex(status as u32);
         print_str(b"\n");
-        if matches!(policy.side_effect,
+        if (matches!(policy.side_effect,
             HostedProviderExportSideEffect::NdisMiniportRegistration
                 | HostedProviderExportSideEffect::DxgRegistration)
-            && result == STATUS_SUCCESS as u64
+                && result == STATUS_SUCCESS as u64)
+            || (matches!(policy.side_effect,
+                HostedProviderExportSideEffect::DxgVidPnInterfaceQuery
+                    | HostedProviderExportSideEffect::DxgVidPnMethod)
+                && (result as u32 as i32) >= 0)
         {
             result = status as u32 as u64;
         }
@@ -34209,6 +34255,27 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                             hosted_dxg_registration::service_query_child_relations_callback(
                                 dispatch, marshal_window, provider_inst, record,
                                 dependent_inst, exec_code_va, arg0, arg1, arg2),
+                        Some(signature @ (nt_hosted_runtime::DxgDdiSignature::RecommendFunctionalVidPn
+                            | nt_hosted_runtime::DxgDdiSignature::RecommendVidPnTopology)) =>
+                            hosted_dxg_registration::recommendation::service_recommendation_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1, signature),
+                        Some(nt_hosted_runtime::DxgDdiSignature::EnumVidPnCofuncModality) =>
+                            hosted_dxg_registration::vidpn::service_enum_cofunc_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1),
+                        Some(nt_hosted_runtime::DxgDdiSignature::IsSupportedVidPn) =>
+                            hosted_dxg_registration::vidpn::service_is_supported_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1),
+                        Some(nt_hosted_runtime::DxgDdiSignature::SetTimingsFromVidPn) =>
+                            hosted_dxg_registration::vidpn::timing::service_set_timings_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1),
+                        Some(nt_hosted_runtime::DxgDdiSignature::SetVidPnSourceVisibility) =>
+                            hosted_dxg_registration::vidpn::visibility::service_visibility_callback(
+                                dispatch, marshal_window, provider_inst, record,
+                                dependent_inst, exec_code_va, arg0, arg1),
                         Some(nt_hosted_runtime::DxgDdiSignature::StopDevice) =>
                             hosted_dxg_registration::service_stop_device_callback(
                                 dispatch, provider_inst, record, dependent_inst,

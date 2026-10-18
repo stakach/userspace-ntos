@@ -23,6 +23,7 @@ pub use contiguous_ram::{ContiguousRamError, ContiguousRamLayout, ContiguousRamO
     ContiguousRamLeaseBank, ContiguousRamLease, ContiguousRamLeaseSource,
     ContiguousRamPublishedMapping, ContiguousRamProjectedMapping};
 pub use dxg_registration::{
+    dxg_recommendation_settle_admitted,
     dxg_contiguous_dependent_admitted,
     dxg_scanout_dependent_admitted,
     dxg_scanout_provider_admitted,
@@ -30,7 +31,12 @@ pub use dxg_registration::{
     DxgAllocationAliasKey, DxgAllocationCallbackDisposition,
     DxgAllocationCookieRetirement,
     DxgCallbackSlot, DxgCallbackSlots,
-    DxgChildRelationsLayout, DxgDdiSignature,
+    DxgChildRelationsLayout, DxgDdiSignature, DxgEnumVidPnRequest,
+    DxgIsSupportedVidPnRequest,
+    DxgSetTimingsRequest,
+    DxgSourceVisibilityRequest,
+    DxgRecommendationRequest, DxgVidPnInterfaceLayout, DxgVidPnPathLayout,
+    DxgVidPnMethodRouteKey, DxgVidPnTableKind,
     DxgContextAliasKey, DxgContextCookieRetirement,
     DxgCreateAllocationLayout, DxgCreateContextLayout, DxgCreateDeviceLayout,
     DxgDestroyAllocationLayout,
@@ -1002,6 +1008,8 @@ pub enum HostedProviderExportSideEffect {
     None,
     DxgRegistration,
     DxgInterfaceCallback,
+    DxgVidPnInterfaceQuery,
+    DxgVidPnMethod,
     NdisInitializeWrapper,
     NdisTerminateWrapper,
     NdisMiniportRegistration,
@@ -1209,6 +1217,29 @@ pub fn hosted_dxg_acquire_post_display_marshal_policy() -> HostedProviderExportM
         HostedProviderExportSideEffect::DxgInterfaceCallback,
     )
     .expect("two Dxg interface callback arguments fit the provider call frame")
+}
+
+/// DxgkCbQueryVidPnInterface returns a provider-owned function table. The
+/// executive projects its methods before the output cell is copied back.
+pub fn hosted_dxg_query_vidpn_interface_marshal_policy() -> HostedProviderExportMarshalPolicy {
+    use HostedProviderArgumentMarshal::*;
+    export_policy_with_side_effect(
+        &[Scalar, Scalar, CallerOutFixed { bytes: 8 }],
+        HostedProviderExportSideEffect::DxgVidPnInterfaceQuery,
+    )
+    .expect("three VidPN query arguments fit the provider call frame")
+}
+
+/// Nested VIDPN_MGR entrypoints are validated and marshalled by the typed
+/// executive VidPN projection. Their raw arguments must not be forwarded.
+pub fn hosted_dxg_vidpn_method_marshal_policy(
+    argument_count: u8,
+) -> Option<HostedProviderExportMarshalPolicy> {
+    if argument_count == 0 || argument_count > 4 { return None; }
+    export_policy_with_side_effect(
+        &[HostedProviderArgumentMarshal::Scalar; 4][..argument_count as usize],
+        HostedProviderExportSideEffect::DxgVidPnMethod,
+    )
 }
 
 fn export_policy_with_effect_and_result(
