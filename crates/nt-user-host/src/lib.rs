@@ -41,6 +41,7 @@ pub mod win32k_process_heap;
 #[cfg(test)]
 mod win32k_teb_tests;
 pub mod provider_kernel_activation;
+pub mod provider_ps_retirement;
 pub mod provider_kernel_pump;
 pub mod provider_kernel_wait;
 pub mod provider_local_event_request;
