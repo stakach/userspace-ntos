@@ -241,6 +241,48 @@ pub fn decode_single_bus_number_resource(
     })
 }
 
+/// Select the one PCI-root BusNumber range containing `bus` from a complete mixed resource list.
+/// Other partial descriptors remain provider-owned; their extent and type are still validated.
+pub fn decode_pci_root_bus_number_resource(
+    buf: &[u8],
+    bus: u32,
+) -> Result<BusNumberResourceDescriptor, NativeResourceListError> {
+    if validate_cm_resource_list_extent(buf)? != buf.len() || read_u32(buf, 0)? != 1 {
+        return Err(NativeResourceListError::InvalidDescriptor);
+    }
+    let mut selected = None;
+    let count = read_u32(buf, 16)? as usize;
+    for index in 0..count {
+        let offset = 20 + index * PARTIAL_DESCRIPTOR_SIZE;
+        if buf[offset] != CM_RESOURCE_TYPE_BUS_NUMBER {
+            continue;
+        }
+        let start = read_u32(buf, offset + 4)?;
+        let length = read_u32(buf, offset + 8)?;
+        let end = start
+            .checked_add(length)
+            .ok_or(NativeResourceListError::InvalidDescriptor)?;
+        if length == 0 || !(start..end).contains(&bus) {
+            continue;
+        }
+        if selected.is_some() {
+            return Err(NativeResourceListError::InvalidDescriptor);
+        }
+        selected = Some(BusNumberResourceDescriptor {
+            interface_type: read_u32(buf, 4)? as i32,
+            bus_number: read_u32(buf, 8)?,
+            version: read_u16(buf, 12)?,
+            revision: read_u16(buf, 14)?,
+            share: buf[offset + 1],
+            flags: read_u16(buf, offset + 2)?,
+            start,
+            length,
+            reserved: read_u32(buf, offset + 12)?,
+        });
+    }
+    selected.ok_or(NativeResourceListError::InvalidDescriptor)
+}
+
 /// Return the exact self-described prefix of a native `IO_RESOURCE_REQUIREMENTS_LIST` allocation.
 /// The top-level `ListSize`, alternative count, and every descriptor count must agree exactly.
 /// A present alternative may contain zero descriptors; bus drivers use that native 40-byte form
@@ -1280,6 +1322,53 @@ mod tests {
         assert_eq!(
             decode_single_bus_number_resource(&bytes),
             Err(NativeResourceListError::InvalidDescriptor)
+        );
+    }
+
+    #[test]
+    fn pci_root_selects_exactly_one_matching_range_from_mixed_list() {
+        let mut bytes = [0u8; 80];
+        w32(&mut bytes, 0, 1);
+        w32(&mut bytes, 4, INTERFACE_TYPE_PCI_BUS as u32);
+        w32(&mut bytes, 8, 7);
+        w16(&mut bytes, 12, 1);
+        w16(&mut bytes, 14, 1);
+        w32(&mut bytes, 16, 3);
+        bytes[20] = CM_RESOURCE_TYPE_BUS_NUMBER;
+        bytes[21] = CM_RESOURCE_SHARE_SHARED;
+        w32(&mut bytes, 24, 7);
+        w32(&mut bytes, 28, 2);
+        bytes[40] = CM_RESOURCE_TYPE_DEVICE_PRIVATE;
+        bytes[60] = CM_RESOURCE_TYPE_BUS_NUMBER;
+        bytes[61] = CM_RESOURCE_SHARE_SHARED;
+        w32(&mut bytes, 64, 12);
+        w32(&mut bytes, 68, 2);
+
+        assert_eq!(
+            decode_pci_root_bus_number_resource(&bytes, 8)
+                .unwrap()
+                .start,
+            7
+        );
+        assert_eq!(
+            decode_pci_root_bus_number_resource(&bytes, 12)
+                .unwrap()
+                .start,
+            12
+        );
+        assert_eq!(
+            decode_pci_root_bus_number_resource(&bytes, 10),
+            Err(NativeResourceListError::InvalidDescriptor)
+        );
+        let mut ambiguous = bytes;
+        w32(&mut ambiguous, 64, 8);
+        assert_eq!(
+            decode_pci_root_bus_number_resource(&ambiguous, 8),
+            Err(NativeResourceListError::InvalidDescriptor)
+        );
+        assert_eq!(
+            decode_pci_root_bus_number_resource(&bytes[..79], 8),
+            Err(NativeResourceListError::Truncated)
         );
     }
 

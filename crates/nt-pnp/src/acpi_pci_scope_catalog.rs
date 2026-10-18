@@ -2,7 +2,9 @@ use alloc::vec::Vec;
 
 use nt_acpi::{AcpiNamespaceChildren, AcpiNamespaceMatches, AcpiNamespacePath};
 use nt_cm_resources::{
-    decode_single_bus_number_resource, CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE, INTERFACE_TYPE_INTERNAL,
+    decode_pci_root_bus_number_resource, decode_single_bus_number_resource,
+    CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE, CM_RESOURCE_SHARE_SHARED, INTERFACE_TYPE_INTERNAL,
+    INTERFACE_TYPE_PCI_BUS,
 };
 
 use crate::{PciInventory, PciLocation};
@@ -228,16 +230,21 @@ pub fn build_acpi_pci_root_scope_fact(
         acpi_pci_root_hardware_id(device_id).ok_or(AcpiPciScopeError::InvalidRootHardwareId)?;
     let segment = u16::try_from(segment).map_err(|_| AcpiPciScopeError::InvalidRootSegment)?;
     let base_bus = u8::try_from(base_bus).map_err(|_| AcpiPciScopeError::InvalidRootBus)?;
-    let resource = decode_single_bus_number_resource(boot_resources)
+    let resource = decode_pci_root_bus_number_resource(boot_resources, base_bus as u32)
         .map_err(|_| AcpiPciScopeError::InvalidRootBusResource)?;
-    if resource.interface_type != INTERFACE_TYPE_INTERNAL
-        || resource.bus_number != 0
+    let legacy = resource.interface_type == INTERFACE_TYPE_INTERNAL
+        && decode_single_bus_number_resource(boot_resources).is_ok()
+        && resource.bus_number == 0
+        && resource.share == CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE
+        && resource.start == base_bus as u32
+        && resource.length == 1;
+    let pci = resource.interface_type == INTERFACE_TYPE_PCI_BUS
+        && resource.bus_number == base_bus as u32
+        && resource.share == CM_RESOURCE_SHARE_SHARED;
+    if !(legacy || pci)
         || resource.version != 1
         || resource.revision != 1
-        || resource.share != CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE
         || resource.flags != 0
-        || resource.start != base_bus as u32
-        || resource.length != 1
         || resource.reserved != 0
     {
         return Err(AcpiPciScopeError::InvalidRootBusResource);
@@ -470,7 +477,8 @@ impl AcpiPciScopeCatalog {
         &mut self,
         prepared: PreparedAcpiPciScopeCatalogUpdate,
     ) -> Result<u64, AcpiPciScopeError> {
-        self.try_commit_owned(prepared).map_err(|(error, _prepared)| error)
+        self.try_commit_owned(prepared)
+            .map_err(|(error, _prepared)| error)
     }
 
     /// Refusal returns the exact unpublished catalog update for retained publication repair.
@@ -897,6 +905,33 @@ mod tests {
         bytes[24..28].copy_from_slice(&base_bus.to_le_bytes());
         bytes[28..32].copy_from_slice(&1u32.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn libernt_pci_root_accepts_mixed_provider_resources() {
+        let namespace = namespace("\\_SB_.PCI0");
+        let mut resources = [0u8; 480];
+        resources[0..4].copy_from_slice(&1u32.to_le_bytes());
+        resources[4..8]
+            .copy_from_slice(&(nt_cm_resources::INTERFACE_TYPE_PCI_BUS as u32).to_le_bytes());
+        resources[12..14].copy_from_slice(&1u16.to_le_bytes());
+        resources[14..16].copy_from_slice(&1u16.to_le_bytes());
+        resources[16..20].copy_from_slice(&23u32.to_le_bytes());
+        resources[20] = nt_cm_resources::CM_RESOURCE_TYPE_BUS_NUMBER;
+        resources[21] = nt_cm_resources::CM_RESOURCE_SHARE_SHARED;
+        resources[28..32].copy_from_slice(&1u32.to_le_bytes());
+        for index in 1..23 {
+            resources[20 + index * 20] = nt_cm_resources::CM_RESOURCE_TYPE_DEVICE_PRIVATE;
+        }
+        assert!(build_acpi_pci_root_scope_fact(
+            "ACPI\\PNP0A08",
+            &namespace,
+            0,
+            0,
+            false,
+            &resources
+        )
+        .is_ok());
     }
 
     #[test]
