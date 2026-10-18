@@ -430,6 +430,7 @@ fn pinned_wddm_32_start_interface_is_bounded_and_requires_first_callbacks() {
     put_callback(&mut interface, 0x8, 0x1000); // provider-owned DeviceHandle
     put_callback(&mut interface, 0x80, 0x2080); // NotifyInterrupt
     put_callback(&mut interface, 0x88, 0x2088); // NotifyDpc
+    put_callback(&mut interface, 0x90, 0x2090); // QueryChildRelations
     put_callback(&mut interface, 0xd8, 0x20d8); // AcquirePostDisplayOwnership
     let parsed = DxgStartInterface::parse(&interface).unwrap();
     assert_eq!(parsed.size(), 0x240);
@@ -437,8 +438,11 @@ fn pinned_wddm_32_start_interface_is_bounded_and_requires_first_callbacks() {
     assert_eq!(parsed.device_handle(), 0x1000);
     assert_eq!(parsed.callback_at(0xd8), Some(0x20d8));
     assert_eq!(parsed.callback_at(0x240), None);
-    assert_eq!(parsed.callbacks().count(), 3);
+    assert_eq!(parsed.callbacks().count(), 4);
 
+    let mut bad = interface.clone();
+    put_callback(&mut bad, 0x90, 0);
+    assert_eq!(DxgStartInterface::parse(&bad), Err(DxgStartInterfaceError::MissingRequired));
     let mut bad = interface.clone();
     put_callback(&mut bad, 0xd8, 0);
     assert_eq!(DxgStartInterface::parse(&bad), Err(DxgStartInterfaceError::MissingRequired));
