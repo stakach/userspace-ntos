@@ -11672,12 +11672,57 @@ fn acquire_resource_lite(
     match unsafe { executive_resources_mut().acquire(resource as *mut u8, thread, mode) } {
         Ok(nt_kernel_exec::executive_sync::AcquireResult::Acquired) => 1,
         Ok(nt_kernel_exec::executive_sync::AcquireResult::WouldBlock) if !wait => 0,
-        Ok(nt_kernel_exec::executive_sync::AcquireResult::WouldBlock) => reject_resource_sync(
-            operation,
-            nt_kernel_exec::executive_sync::ExecutiveSyncError::BlockingWaitRequired,
-            resource,
-            thread,
-        ),
+        Ok(nt_kernel_exec::executive_sync::AcquireResult::WouldBlock) => {
+            // Publication can enter a nested dispatch. Recheck the resource atomically with
+            // ticket insertion only after the stack Event has been published.
+            let mut event = [0u64; 3];
+            let event_body = event.as_mut_ptr() as u64;
+            s_ke_initialize_event(event_body, 1, 0);
+            let admission = unsafe {
+                executive_resources_mut().begin_wait(resource as *mut u8, thread, mode, event_body)
+            };
+            use nt_kernel_exec::executive_sync::ResourceWaitAdmission;
+            match admission {
+                Ok(ResourceWaitAdmission::Acquired) => {}
+                Ok(ResourceWaitAdmission::Queued(ticket)) => {
+                    print_str(b"[win32k-resource-wait] queued resource=");
+                    print_win32k_hex64(resource);
+                    print_str(b" thread=");
+                    print_win32k_hex64(thread);
+                    print_str(b" event=");
+                    print_win32k_hex64(event_body);
+                    print_str(b"\n");
+                    let status = unsafe {
+                        provider_wait_rendezvous(
+                            &[event_body], nt_provider_wait::ProviderWaitType::Any, 0, 0, 0,
+                        )
+                    };
+                    print_str(b"[win32k-resource-wait] resumed status=");
+                    print_hex(status as u32);
+                    print_str(b" thread=");
+                    print_win32k_hex64(thread);
+                    print_str(b"\n");
+                    if status != 0 {
+                        let wake = unsafe { executive_resources_mut().cancel_wait(resource as *mut u8, thread, ticket) };
+                        let Ok(wake) = wake else { park(); };
+                        if let Some(next_event) = wake { s_ke_set_event(next_event, 0, 0); }
+                        if !unsafe { retire_existing_provider_local_event(event_body) } { park(); }
+                        reject_resource_sync(operation,
+                            nt_kernel_exec::executive_sync::ExecutiveSyncError::BlockingWaitRequired,
+                            resource, thread);
+                    }
+                    if executive_resources_mut().complete_wait(resource as *mut u8, thread, ticket).is_err() {
+                        park();
+                    }
+                }
+                Err(error) => {
+                    if !unsafe { retire_existing_provider_local_event(event_body) } { park(); }
+                    reject_resource_sync(operation, error, resource, thread);
+                }
+            }
+            if !unsafe { retire_existing_provider_local_event(event_body) } { park(); }
+            1
+        }
         Err(error) => reject_resource_sync(operation, error, resource, thread),
     }
 }
@@ -11705,8 +11750,19 @@ extern "win64" fn s_ex_acquire_resource_shared_lite(resource: u64, wait: u8) -> 
 /// `VOID ExReleaseResourceLite(PERESOURCE Resource)`.
 extern "win64" fn s_ex_release_resource_lite(resource: u64) {
     let thread = unsafe { current_ethread() };
-    if let Err(error) = unsafe { executive_resources_mut().release(resource as *mut u8, thread) } {
-        reject_resource_sync(b"ExReleaseResourceLite", error, resource, thread);
+    let wake = match unsafe { executive_resources_mut().release_with_handoff(resource as *mut u8, thread) } {
+        Ok(wake) => wake,
+        Err(error) => reject_resource_sync(b"ExReleaseResourceLite", error, resource, thread),
+    };
+    if let Some(event) = wake {
+        print_str(b"[win32k-resource-wait] grant resource=");
+        print_win32k_hex64(resource);
+        print_str(b" releaser=");
+        print_win32k_hex64(thread);
+        print_str(b" event=");
+        print_win32k_hex64(event);
+        print_str(b"\n");
+        s_ke_set_event(event, 0, 0);
     }
 }
 
