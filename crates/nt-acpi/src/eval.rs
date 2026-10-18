@@ -6,6 +6,8 @@ pub const ACPI_EVAL_INPUT_BUFFER_LEN: usize = 8;
 pub const ACPI_EVAL_INPUT_BUFFER_EX_LEN: usize = 260;
 /// Native `sizeof(ACPI_EVAL_OUTPUT_BUFFER)` for the shipped amd64 provider.
 pub const ACPI_EVAL_OUTPUT_PROBE_LEN: usize = 20;
+/// `IOCTL_ACPI_EVAL_METHOD_EX` returns a full-width ACPI integer in this exact size.
+pub const ACPI_EVAL_EXTENDED_INTEGER_LEN: usize = 24;
 
 const EVAL_INPUT_SIGNATURE: u32 = u32::from_be_bytes(*b"BieA");
 const EVAL_INPUT_EX_SIGNATURE: u32 = u32::from_be_bytes(*b"AieA");
@@ -96,6 +98,20 @@ pub fn parse_integer_evaluation(bytes: &[u8]) -> Result<u32, AcpiEvalError> {
     read_u32(bytes, 16).map_err(|_| AcpiEvalError::InvalidIntegerResult)
 }
 
+/// Decode the 64-bit integer returned by the released provider for an extended method.
+pub fn parse_extended_integer_evaluation(bytes: &[u8]) -> Result<u64, AcpiEvalError> {
+    if bytes.len() != ACPI_EVAL_EXTENDED_INTEGER_LEN
+        || read_u32(bytes, 0)? != EVAL_OUTPUT_SIGNATURE
+        || read_u32(bytes, 4)? as usize != bytes.len()
+        || read_u32(bytes, 8)? != 1
+        || read_u16(bytes, 12)? != METHOD_ARGUMENT_INTEGER
+        || read_u16(bytes, 14)? != 8
+    {
+        return Err(AcpiEvalError::InvalidIntegerResult);
+    }
+    Ok(u64::from_le_bytes(bytes[16..24].try_into().unwrap()))
+}
+
 fn valid_name_seg(method: [u8; 4]) -> bool {
     matches!(method[0], b'A'..=b'Z' | b'_')
         && method[1..]
@@ -184,6 +200,19 @@ mod tests {
             eval_output_required_len(&[0; ACPI_EVAL_OUTPUT_PROBE_LEN], 4096),
             Err(AcpiEvalError::InvalidOutput)
         );
+    }
+
+    #[test]
+    fn extended_integer_result_retains_full_adr_width() {
+        let mut bytes = [0u8; 24];
+        bytes[..4].copy_from_slice(&EVAL_OUTPUT_SIGNATURE.to_le_bytes());
+        bytes[4..8].copy_from_slice(&24u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        bytes[14..16].copy_from_slice(&8u16.to_le_bytes());
+        bytes[16..24].copy_from_slice(&0x1234_5678_9abc_def0u64.to_le_bytes());
+        assert_eq!(parse_extended_integer_evaluation(&bytes), Ok(0x1234_5678_9abc_def0));
+        bytes[14..16].copy_from_slice(&4u16.to_le_bytes());
+        assert_eq!(parse_extended_integer_evaluation(&bytes), Err(AcpiEvalError::InvalidIntegerResult));
     }
 
     #[test]

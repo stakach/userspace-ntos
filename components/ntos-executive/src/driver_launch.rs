@@ -45286,7 +45286,7 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                                         && parameters.input_len as usize
                                             == nt_acpi::ACPI_EVAL_INPUT_BUFFER_EX_LEN
                                         && parameters.output_len as usize
-                                            == HOSTED_ACPI_EVAL_INTEGER_LEN
+                                            == nt_acpi::ACPI_EVAL_EXTENDED_INTEGER_LEN
                             )
                     })
                 });
@@ -45333,7 +45333,7 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     .as_ref()
                     .unwrap()
                     .irp_id;
-                let mut payload = [0u8; HOSTED_ACPI_EVAL_INTEGER_LEN];
+                let mut payload = [0u8; nt_acpi::ACPI_EVAL_EXTENDED_INTEGER_LEN];
                 let disposition = match io_manager_mut()
                     .copy_completed_buffered_device_control_payload(irp_id, 0, &mut payload)
                 {
@@ -49485,7 +49485,7 @@ enum HostedAcpiPciNamespaceDisposition {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostedAcpiPciAddressMethodDisposition {
-    Value(u32),
+    Value(u64),
     Barrier(nt_status::NtStatus),
 }
 
@@ -49533,7 +49533,7 @@ enum HostedAcpiPciScopeDiscoveryState {
     Planned(nt_pnp::AcpiPciScopeMethodPlan),
     EvaluatingAddresses {
         plan: nt_pnp::AcpiPciScopeMethodPlan,
-        values: Vec<u32>,
+        values: Vec<u64>,
     },
     Complete(nt_pnp::AcpiPciScopeSource),
     Staged,

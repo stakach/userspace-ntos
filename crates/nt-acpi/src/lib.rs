@@ -17,8 +17,9 @@ mod namespace;
 mod pci_routing;
 
 pub use eval::{
-    eval_method_input, eval_method_input_ex, eval_output_required_len, parse_integer_evaluation,
-    AcpiEvalError, ACPI_EVAL_INPUT_BUFFER_EX_LEN, ACPI_EVAL_INPUT_BUFFER_LEN,
+    eval_method_input, eval_method_input_ex, eval_output_required_len,
+    parse_extended_integer_evaluation, parse_integer_evaluation, AcpiEvalError,
+    ACPI_EVAL_EXTENDED_INTEGER_LEN, ACPI_EVAL_INPUT_BUFFER_EX_LEN, ACPI_EVAL_INPUT_BUFFER_LEN,
     ACPI_EVAL_OUTPUT_PROBE_LEN, IOCTL_ACPI_EVAL_METHOD, IOCTL_ACPI_EVAL_METHOD_EX,
 };
 pub use hpet_projection::HpetReadOnlyAlias;

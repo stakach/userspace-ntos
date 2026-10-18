@@ -479,14 +479,14 @@ fn classify_hosted_acpi_pci_address_method_result(
     if !status.is_success() {
         return HostedAcpiPciAddressMethodDisposition::Barrier(status);
     }
-    if information != HOSTED_ACPI_EVAL_INTEGER_LEN as u64
-        || payload.len() != HOSTED_ACPI_EVAL_INTEGER_LEN
+    if information != nt_acpi::ACPI_EVAL_EXTENDED_INTEGER_LEN as u64
+        || payload.len() != nt_acpi::ACPI_EVAL_EXTENDED_INTEGER_LEN
     {
         return HostedAcpiPciAddressMethodDisposition::Barrier(
             nt_status::NtStatus::INVALID_DEVICE_REQUEST,
         );
     }
-    match nt_acpi::parse_integer_evaluation(payload) {
+    match nt_acpi::parse_extended_integer_evaluation(payload) {
         Ok(value) => HostedAcpiPciAddressMethodDisposition::Value(value),
         Err(_) => HostedAcpiPciAddressMethodDisposition::Barrier(
             nt_status::NtStatus::INVALID_DEVICE_REQUEST,
@@ -587,7 +587,7 @@ unsafe fn dispatch_hosted_acpi_pci_address_method(
             return true;
         }
     };
-    let mut output = [0u8; HOSTED_ACPI_EVAL_INTEGER_LEN];
+    let mut output = [0u8; nt_acpi::ACPI_EVAL_EXTENDED_INTEGER_LEN];
     let result = match io_manager_mut().buffered_device_control_exact_device_payload(
         ClientId(IO_MANAGER_COMPONENT_ID),
         pdo_device_id,
@@ -623,7 +623,7 @@ unsafe fn dispatch_hosted_acpi_pci_address_method(
                         if parameters.ioctl_code == nt_acpi::IOCTL_ACPI_EVAL_METHOD_EX
                             && parameters.input_len as usize
                                 == nt_acpi::ACPI_EVAL_INPUT_BUFFER_EX_LEN
-                            && parameters.output_len as usize == HOSTED_ACPI_EVAL_INTEGER_LEN
+                            && parameters.output_len as usize == nt_acpi::ACPI_EVAL_EXTENDED_INTEGER_LEN
                 )
                 .then_some((irp.origin_driver_id, current.driver_id, current.device_id))
             });
@@ -722,7 +722,7 @@ unsafe fn complete_hosted_acpi_pci_scope_source(child_index: usize) -> bool {
     for (query, adr) in plan.addresses.into_iter().zip(values) {
         addresses.push(nt_pnp::AcpiPciAddressScopeFact {
             path: query.scope,
-            adr: adr as u64,
+            adr,
             routing_table: query.routing_table,
         });
     }
