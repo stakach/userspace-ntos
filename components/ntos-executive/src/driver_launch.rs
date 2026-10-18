@@ -43650,6 +43650,16 @@ unsafe fn build_hosted_relation_mutations(
         .map_err(|_| HostedRelationPublishError::Retry)?;
 
     for (index, change) in prepared.changes().iter().enumerate() {
+    for id in child.hardware_ids.iter().chain(&child.compatible_ids) {
+        if let Some(binding) = crate::config_manager_query_driver_database_binding(id)
+            .map_err(hosted_relation_error_from_config)?
+        {
+            if binding.mount_generation != expected_generation {
+                return Err(HostedRelationPublishError::Retry);
+            }
+            return Ok(Some(binding));
+        }
+    }
         let instance_id = hosted_relation_instance_path(&change.child)?;
         let enum_path = hosted_relation_enum_path(&change.child)?;
         if change.kind == nt_pnp_manager::BusRelationChangeKind::Removal {

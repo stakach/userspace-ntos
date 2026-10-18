@@ -15540,6 +15540,18 @@ pub(crate) unsafe fn config_manager_next_device_action(
     if !config_manager_device_action_pending() {
         return Ok(None);
     }
+pub(crate) unsafe fn config_manager_query_driver_database_binding(
+    bus_id: &str,
+) -> Result<Option<nt_config_client::CriticalDeviceBinding>, i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    nt_config_client::resolve_driver_database_binding(bus_id, expected_generation, |path| {
+        config_manager_query_system_hive_key(path)
+    })
+}
+
     let current_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
     if current_generation == 0 {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
