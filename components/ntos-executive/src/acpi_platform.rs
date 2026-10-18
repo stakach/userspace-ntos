@@ -429,6 +429,26 @@ pub(crate) struct PreparedAcpiPlatformAuthority {
     pub(crate) owner: HostedPnpContextOwner,
 }
 
+impl PreparedAcpiPlatformAuthority {
+    /// Share only the firmware-selected, retained read-only HPET frame. The executive
+    /// keeps timer programming rights; a component receives only a read alias.
+    pub(crate) fn hpet_read_only_alias(&self) -> Option<nt_acpi::HpetReadOnlyAlias> {
+        let range = self.discovery.hpet?.register_block;
+        self.memory.iter().filter(|resource| resource.platform_hpet).find_map(|resource| {
+            nt_acpi::HpetReadOnlyAlias::for_firmware_range(
+                range,
+                nt_acpi::PhysicalRange {
+                    start: resource.paddr,
+                    length: resource.length,
+                },
+                resource.frame_base,
+                resource.pages,
+                resource.writable,
+            )
+        })
+    }
+}
+
 /// Map the executive's timer view from the same retained frames later projected read-only to the
 /// ACPI component. The returned address is the exact GAS address within `mapping_page_va`.
 pub(crate) unsafe fn map_executive_hpet(

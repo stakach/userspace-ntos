@@ -28791,6 +28791,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mmio_mapped = mapped_hpet.as_ref().is_ok_and(|(register_va, range)| {
         *register_va == HPET_VADDR && driver_launch::claim_platform_hpet_resource(*range).is_ok()
     });
+    // Retain the exact read-only alias before platform authority moves into the PnP
+    // grant owner. Win32k calls the shared KeQueryPerformanceCounter implementation.
+    let win32k_hpet_alias = if mmio_mapped {
+        Some(acpi_platform_authority.hpet_read_only_alias()
+            .expect("mapped firmware HPET has no read-only component projection"))
+    } else {
+        None
+    };
     print_str(b"[ntos-exec] P1: firmware HPET MMIO paddr=0x");
     if let Ok((_, range)) = mapped_hpet {
         print_hex((range.start >> 32) as u32);
@@ -31156,6 +31164,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     pts: 0,
                 };
                 n += 1;
+
+                if let Some(alias) = win32k_hpet_alias {
+                    regions[n] = Region {
+                        source: FrameSource::Alias(alias.frame_base()),
+                        base_va: HPET_VADDR,
+                        count: alias.pages(),
+                        rights: Rights::Uniform(RO_NX),
+                        // The IPC buffer has already installed this 2 MiB page table.
+                        pts: 0,
+                    };
+                    n += 1;
+                }
 
                 // DATA export region (aux PT window — no dedicated PT).
                 regions[n] = Region {

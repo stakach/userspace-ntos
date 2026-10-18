@@ -11,6 +11,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 mod eval;
+mod hpet_projection;
 mod madt;
 mod namespace;
 mod pci_routing;
@@ -20,6 +21,7 @@ pub use eval::{
     AcpiEvalError, ACPI_EVAL_INPUT_BUFFER_EX_LEN, ACPI_EVAL_INPUT_BUFFER_LEN,
     ACPI_EVAL_OUTPUT_PROBE_LEN, IOCTL_ACPI_EVAL_METHOD, IOCTL_ACPI_EVAL_METHOD_EX,
 };
+pub use hpet_projection::HpetReadOnlyAlias;
 pub use madt::{
     parse_madt_interrupt_topology, resolve_ioapic_gsi, validate_ioapic_route_extents,
     IoApicRouteError, IoApicRouteExtent, MadtError, MadtInterruptTopology, MadtIoApic,
