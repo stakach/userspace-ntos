@@ -1139,7 +1139,7 @@ pub const FSD_SERVICE_DMA_ADAPTER_LABEL: u64 = 0x78B;
 pub const FSD_SERVICE_MDL_LABEL: u64 = 0x78C;
 pub const FSD_SERVICE_FILE_LABEL: u64 = 0x78D;
 pub const FSD_SERVICE_IO_CREATE_FILE_LABEL: u64 = 0x78E;
-// 0x78f..=0x798 belongs to nt-unwind's SEH transport on this same endpoint.
+// 0x880..=0x889 belongs to nt-unwind's SEH transport on this same endpoint.
 pub const FSD_SERVICE_SOURCE_IRP_LABEL: u64 = 0x799;
 pub const FSD_SERVICE_QUERY_PATH_FORWARD_LABEL: u64 = 0x79A;
 pub const FSD_SERVICE_TOKEN_QUERY_LABEL: u64 = 0x79B;
@@ -1255,7 +1255,8 @@ const _: () = {
     ];
     let mut i = 0;
     while i < labels.len() {
-        assert!(labels[i] > nt_unwind::seh_transport::FAULT_BEGIN_LABEL);
+        assert!(labels[i] < nt_unwind::seh_transport::RAISE_LABEL
+            || labels[i] > nt_unwind::seh_transport::FAULT_BEGIN_LABEL);
         assert!(labels[i] <= 0xfff);
         let mut j = i + 1;
         while j < labels.len() {
