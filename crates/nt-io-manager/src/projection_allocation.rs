@@ -98,6 +98,9 @@ impl ProjectionAllocationLedger {
         owner: &ProjectionAllocationOwner,
         registration: HostedDevicePointerRegistration,
     ) -> Result<(), NtStatus> {
+        if self.rows.iter().any(|row| row.registration == Some(registration)) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         let row = self.row_mut(owner)?;
         if row.retirement_pending
             || row.registration.is_some()
@@ -117,6 +120,20 @@ impl ProjectionAllocationLedger {
                 && address >= row.allocation.component_address
                 && address < row.allocation.component_address + row.allocation.capacity
         })
+    }
+
+    /// Resolve a published canonical Device registration to the allocation that protects it.
+    /// Numeric addresses may coincide in independent pools; the exact registration includes its
+    /// manager, domain, device, and publication generation. A retiring row is no longer an
+    /// admissible source for new consumers.
+    pub fn physical_allocation_for_registration(
+        &self,
+        registration: HostedDevicePointerRegistration,
+    ) -> Option<(HostedDomainIdentity, SourcePoolAllocationIdentity)> {
+        self.rows
+            .iter()
+            .find(|row| !row.retirement_pending && row.registration == Some(registration))
+            .map(|row| (row.physical, row.allocation))
     }
 
     /// Enter once before native retirement effects. Refusal leaves the protection unchanged;

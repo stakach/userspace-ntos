@@ -56911,6 +56911,83 @@ fn hosted_device_binding_by_pdo_object(pdo_object: u64) -> Option<HostedDeviceBi
         .find(|slot| slot.used && slot.pdo_object != 0 && slot.pdo_object == pdo_object)
 }
 
+/// The in-flight relation owns its children until publication. Afterwards the accepted-PDO
+/// catalog supplies the same exact registration; a pointer scan is never routing authority.
+unsafe fn hosted_provider_child_registration(
+    device_id: nt_io_manager::DeviceId,
+    provider_domain: HostedDomainIdentity,
+) -> Option<nt_io_manager::HostedDevicePointerRegistration> {
+    let pending = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_ref()
+        .filter(|query| query.phase != HostedDeviceRelationQueryPhase::Barrier
+            && query.relation_domain == Some(provider_domain))
+        .and_then(|query| {
+            query.reported_children.iter().zip(&query.child_pdo_objects)
+                .find(|(child, _)| child.pdo_object_id == device_id.raw())
+                .map(|(_, &address)| (query.relation_owner, address))
+        });
+    if let Some((owner, address)) = pending {
+        if hosted_device_relation_owner_is_current(owner) {
+            let registration = io_manager_mut()
+                .hosted_device_pointer_registration(provider_domain, address)?;
+            if registration.device_id() == device_id {
+                return Some(registration);
+            }
+        }
+        return None;
+    }
+    let authority = hosted_accepted_pdo_provider_catalog()
+        .resolve(hosted_pnp_manager_mut(), hosted_bus_relations(), io_manager_mut(),
+            device_id.raw())
+        .ok()?;
+    let registration = authority.provider();
+    (registration.domain() == provider_domain && registration.device_id() == device_id)
+        .then_some(registration)
+}
+
+/// Route a relation-owned provider child through its canonical driver backend and exact
+/// physical provider allocation. This is distinct from an FDO binding and its resource state.
+unsafe fn hosted_provider_child_route_by_device_id(
+    device_id: u64,
+) -> Option<(usize, DriverInstance, u64, nt_io_manager::hosted_provider_child_route::HostedProviderChildRouteEvidence)> {
+    use nt_io_manager::hosted_provider_child_route::HostedProviderChildRouteEvidence;
+    let device_id = nt_io_manager::DeviceId(device_id);
+    let (driver_id, delete_pending) = io_manager_mut().device(device_id)
+        .map(|device| (device.driver_id, device.delete_pending))?;
+    if delete_pending { return None; }
+    let (dependent_index, dependent_inst) = instance_by_driver_id(driver_id.raw())?;
+    let route = hosted_provider_dispatch_route_for_instance(dependent_index)?;
+    if !route.add_device_ready() || route.dependent_driver_id != driver_id.raw() {
+        return None;
+    }
+    let provider_inst = instance(route.provider_instance)?;
+    if instance_domain_identity(dependent_inst) != Some(route.dependent_domain)
+        || instance_domain_identity(provider_inst) != Some(route.provider_domain)
+    {
+        return None;
+    }
+    let registration = hosted_provider_child_registration(device_id, route.provider_domain)?;
+    if io_manager_mut().hosted_device_pointer_registration(
+        route.provider_domain, registration.address()) != Some(registration)
+    {
+        return None;
+    }
+    let allocation = hosted_device_allocations::published_allocation_for_registration(
+        provider_inst, registration).ok()?;
+    let evidence = HostedProviderChildRouteEvidence {
+        device_id,
+        driver_id,
+        dependent_domain: route.dependent_domain,
+        provider_domain: route.provider_domain,
+        provider_publication_cookie: route.provider_publication_cookie,
+        provider_driver_object: route.provider_driver_object,
+        registration,
+        allocation,
+    };
+    if !evidence.is_well_formed() { return None; }
+    Some((dependent_index, dependent_inst, registration.address(), evidence))
+}
+
 fn hosted_driver_device_route_by_device_id(device_id: u64) -> Option<(usize, DriverInstance, u64)> {
     if let Some(binding) = hosted_device_binding_by_device_id(device_id) {
         let inst = instance(binding.instance)?;
@@ -56937,6 +57014,12 @@ fn hosted_driver_device_route_by_device_id(device_id: u64) -> Option<(usize, Dri
             return None;
         }
         return Some((binding.instance, inst, binding.device_object));
+    }
+
+    if let Some((index, inst, object, _)) = unsafe {
+        hosted_provider_child_route_by_device_id(device_id)
+    } {
+        return Some((index, inst, object));
     }
 
     let driver_id = {
@@ -68004,20 +68087,37 @@ unsafe fn dispatch_irp_for_instance_exact(
                 });
             }
             let binding = if let Some(request) = dispatch_request.as_ref() {
-                let binding = dispatch_binding?;
-                if binding.driver_id != request.driver_id
-                    || binding.instance != inst
-                    || binding.projection_instance != route.provider_instance
-                    || binding.projection_domain != provider_domain
-                    || binding.device_object != device_object
-                {
-                    return Some(HostedIrpTransportResult::NotDispatched {
-                        status: nt_status::NtStatus(STATUS_INVALID_PARAMETER),
-                    });
+                if let Some(binding) = dispatch_binding {
+                    if binding.device_id != request.device_id
+                        || binding.driver_id != request.driver_id
+                        || binding.instance != inst
+                        || binding.projection_instance != route.provider_instance
+                        || binding.projection_domain != provider_domain
+                        || binding.device_object != device_object
+                    {
+                        return Some(HostedIrpTransportResult::NotDispatched {
+                            status: nt_status::NtStatus(STATUS_INVALID_PARAMETER),
+                        });
+                    }
+                    Some(binding)
+                } else {
+                    let child = hosted_provider_child_route_by_device_id(request.device_id);
+                    if child.is_none_or(|(index, _, object, evidence)| {
+                        index != inst || object != device_object
+                            || evidence.driver_id.raw() != request.driver_id
+                            || evidence.provider_domain != provider_domain
+                            || evidence.provider_publication_cookie
+                                != route.provider_publication_cookie
+                            || evidence.provider_driver_object != route.provider_driver_object
+                    }) {
+                        return Some(HostedIrpTransportResult::NotDispatched {
+                            status: nt_status::NtStatus(STATUS_INVALID_PARAMETER),
+                        });
+                    }
+                    None
                 }
-                binding
             } else {
-                dispatch_binding?
+                Some(dispatch_binding?)
             };
             if provider_inst.fault_ep == 0
                 || provider_inst.pml4 == 0
@@ -68029,7 +68129,7 @@ unsafe fn dispatch_irp_for_instance_exact(
             d = provider_inst;
             sh = provider_inst.exec_shared_va;
             driver_object = route.provider_driver_object;
-        provider_binding = Some(binding);
+        provider_binding = binding;
         provider_route = Some(route);
     }
     let class_hook_request = dispatch_request.as_ref().is_some_and(|request| {

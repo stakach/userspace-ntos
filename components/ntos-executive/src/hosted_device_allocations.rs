@@ -1175,6 +1175,40 @@ pub(super) fn registration(
         .ok_or(nt_status::NtStatus::INVALID_HANDLE)
 }
 
+/// Prove the physical allocation behind one already identified published Device projection.
+/// The registration may name a logical driver in another domain; the supplied instance is the
+/// physical pool owner. Callers must separately revalidate the registration in IoManager and
+/// the provider dependency before using this allocation as a dispatch route.
+pub(super) unsafe fn published_allocation_for_registration(
+    inst: DriverInstance,
+    registration: HostedDevicePointerRegistration,
+) -> Result<SourcePoolAllocationIdentity, nt_status::NtStatus> {
+    let _guard = lock();
+    let physical = validate_arena(inst)?;
+    let row = rows()
+        .iter()
+        .find(|row| {
+            same_arena(row.instance, inst)
+                && row.domain == physical
+                && row.allocation.component_address == registration.address()
+                && row.registration == Some(registration)
+        })
+        .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if row.retirement_pending {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    let exact = row.allocation;
+    if ledger().physical_allocation_for_registration(registration) != Some((physical, exact)) {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    let _pool = hosted_instance_pool_lock(inst.exec_pool_va)
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    if allocation(inst, registration.address())? != exact {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    Ok(exact)
+}
+
 /// Cleanup provenance includes a canonical bind accepted before a later physical publication
 /// refusal. Live callers use `registration`, which exposes only fully published rows.
 pub(super) fn accepted_registration(

@@ -65,6 +65,7 @@ mod hosted_file;
 #[cfg(test)]
 mod hosted_file_lifetime_tests;
 mod hosted_device_pointer;
+pub mod hosted_provider_child_route;
 mod completion_ack;
 mod completion_retirement;
 mod projection_allocation;
