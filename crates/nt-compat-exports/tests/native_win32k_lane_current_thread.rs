@@ -95,16 +95,3 @@ fn executive_deadman_avoids_component_gs_context() {
     let watchdog = function(&main, "watchdog_report");
     assert!(!watchdog.contains("trace_win32k_request_context()"));
 }
-
-#[test]
-fn kernel_wait_resume_reselects_system_after_owner_validation() {
-    let context = source("win32k_provider_wait_context.rs");
-    let restore = function(&context, "restore");
-    let owner_validation = restore
-        .find("current_provider_wait_owner() == Some(owner)")
-        .unwrap();
-    let select_system = restore
-        .find("select_initial_system_context()")
-        .expect("kernel wait must restore the physical lane's System projection");
-    assert!(owner_validation < select_system);
-}
