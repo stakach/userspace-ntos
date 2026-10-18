@@ -629,6 +629,9 @@ pub const WIN32K_REQUEST_SOURCE_FSD_TERMINAL: u64 = 3;
 pub const WIN32K_REQUEST_SOURCE_IOCTL_TERMINAL: u64 = 4;
 #[cfg(feature = "source-irp-integration")]
 pub const WIN32K_REQUEST_SOURCE_IRP_PROBE: u64 = 5;
+/// Ps retirement callouts run under an executive-owned kernel provider activation so a
+/// contended provider wait can retain the physical dispatch after its target thread exits.
+pub const WIN32K_REQUEST_PS_RETIREMENT: u64 = 6;
 /// Executive-authenticated logical user origin. Component admission additionally requires a
 /// registered SSDT entry before publishing UserMode to its selected KTHREAD.
 pub const WIN32K_REQUEST_USER_ORIGIN: u64 = 1 << 63;
@@ -17178,7 +17181,7 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         let result = crate::win32k_glue::source_irp_integration::component_probe(a0, a1, a2);
         return (result, result as u32 as u64);
     }
-    let owner = if request_kind == WIN32K_REQUEST_SSDT {
+    let hosted_owner = if request_kind == WIN32K_REQUEST_SSDT {
         match hosted_wait_owner_at_dispatch(header) {
             Ok(owner) => owner,
             Err(()) => {
@@ -17191,10 +17194,17 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     } else {
         None
     };
-    let Some(_stack_event_activation) =
-        begin_provider_stack_event_activation(header.dispatch_id, owner, header)
-    else {
-        let status = 0xC000_009Au32;
+    let activation = if request_kind == WIN32K_REQUEST_PS_RETIREMENT {
+        capture_kernel_provider_stack_activation()
+    } else {
+        begin_provider_stack_event_activation(header.dispatch_id, hosted_owner, header)
+    };
+    let Some(_stack_event_activation) = activation else {
+        let status = if request_kind == WIN32K_REQUEST_PS_RETIREMENT {
+            0xC000_0008u32
+        } else {
+            0xC000_009Au32
+        };
         return (status as i32, status as u64);
     };
     assert!(select_initial_system_context(), "work callbacks require System projection");
@@ -17211,6 +17221,13 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     let a2 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A2) as *const u64);
     let a3 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A3) as *const u64);
     if request_kind == WIN32K_REQUEST_PS_PROVIDER {
+        let result = dispatch_ps_provider_command(a0, a1, a2);
+        return (result as u32 as i32, result);
+    }
+    if request_kind == WIN32K_REQUEST_PS_RETIREMENT {
+        if a0 != PS_WIN32_PROVIDER_THREAD_EXIT && a0 != PS_WIN32_PROVIDER_PROCESS_EXIT {
+            return (STATUS_INVALID_PARAMETER_I32, STATUS_INVALID_PARAMETER_I32 as u32 as u64);
+        }
         let result = dispatch_ps_provider_command(a0, a1, a2);
         return (result as u32 as i32, result);
     }
@@ -17469,7 +17486,7 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     // Desktop-heap mutation belongs to the win32k provider. Prepare the selected thread's client
     // mapping while the provider-private allocation and Event catalogs are addressable; the
     // executive consumes only the resulting scalar pointers after this dispatch completes.
-    if owner.is_some() && prepare_thread_desktop_client_info(t).is_some() {
+    if hosted_owner.is_some() && prepare_thread_desktop_client_info(t).is_some() {
         publish_gui_client_info_for_dispatch(
             t, header.dispatch_id, client_pi, process_id, generation, thread_id,
         );

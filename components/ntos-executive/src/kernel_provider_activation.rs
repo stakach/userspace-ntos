@@ -166,18 +166,105 @@ fn kernel_channel(channel: &spawn_hosts::PumpChannel) -> bool {
         && channel.caps.kind == spawn_hosts::ReqKind::Syscall
 }
 
-fn authenticated_channel_caller(
+fn ps_retirement_channel(channel: &spawn_hosts::PumpChannel, pi: u32, generation: u64) -> bool {
+    channel.logical_caller.is_none()
+        && channel.client_pi == u64::from(pi)
+        && pi != 0
+        && channel.client_generation == generation
+        && generation != 0
+        && channel.caps.kind == spawn_hosts::ReqKind::Syscall
+        && channel.caps.client_attach
+        && channel.caps.provider_wait
+        && !channel.caps.usermode_callback
+}
+
+unsafe fn ps_retirement_is_current(recipient: &KernelJobRecipient) -> bool {
+    let Some((pi, target)) = recipient.ps_retirement() else { return false; };
+    let Ok(handler) = crate::service_sec_image::registry_live_handler() else { return false; };
+    let process = target.process();
+    let current = nt_types::ProcessIdentity {
+        pid: process.pid,
+        generation: nt_types::ProcessGeneration::Hosted(
+            handler.hosted_process_generation(pi as usize).unwrap_or(0),
+        ),
+    };
+    handler.pm_pid_for_pi(pi as usize) == Some(process.pid)
+        && target.validate(&handler.pm, current).is_ok()
+}
+
+/// Root owns execution and completion; the terminated hosted thread is only a pinned Ps target.
+pub(crate) unsafe fn capture_ps_retirement_job(
+    channel: &spawn_hosts::PumpChannel,
+    lane: LaneHandle,
+    native: nt_process::native_handle::NativeHandleCaller,
+    result: &KernelJobResult,
+    client: crate::win32k_glue::Win32kClientContext,
+) -> Result<KernelProviderCaller, u32> {
+    let logical = client.logical_caller.ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let process = logical.process();
+    let thread = logical.thread();
+    if !ps_retirement_channel(channel, client.pi, client.generation)
+        || channel.kernel_caller.is_some()
+        || channel.initial != spawn_hosts::InitialAction::ReplyRequest
+        || process.pid as u64 != client.pid
+        || process.generation != nt_types::ProcessGeneration::Hosted(client.generation)
+        || thread.process_id() != process.pid
+        || u64::from(thread.thread_id()) != client.tid
+        || (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).binding(lane)
+            != Ok(channel_binding(channel))
+    {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    let provider = current_win32k_provider_domain().ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    with_provider_process_manager(|pm| {
+        pm.validate_native_handle_caller(native)?;
+        let target = nt_user_host::provider_ps_retirement::PsRetirementTarget::capture(
+            pm, process, thread, client.eprocess, client.ethread,
+        )?;
+        let mut recipient = match KernelJobRecipient::executive(*channel, result.0.clone()) {
+            Ok(recipient) => recipient,
+            Err(status) => {
+                let mut target = target;
+                target.release(pm).expect("new Ps target reference disappeared");
+                return Err(status);
+            }
+        };
+        recipient.retain_ps_retirement(client.pi, target);
+        let _durable = allocator::enter_durable();
+        match (&mut *core::ptr::addr_of_mut!(ACTIVATIONS)).capture_with_recipient(
+            pm, &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
+            &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS), provider, lane, native, recipient,
+        ) {
+            Ok(caller) => Ok(caller),
+            Err((status, mut recipient)) => {
+                recipient.release_ps_retirement(pm)
+                    .expect("unpublished Ps target reference disappeared");
+                Err(status)
+            }
+        }
+    })
+}
+
+pub(crate) fn authenticated_channel_caller(
     channel: &spawn_hosts::PumpChannel,
 ) -> Result<KernelProviderCaller, u32> {
     let caller = channel
         .kernel_caller
         .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-    if !kernel_channel(channel)
+    let recipient = unsafe { (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller) }
+        .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?;
+    let allowed_shape = kernel_channel(channel)
+        || recipient.ps_retirement().is_some_and(|(pi, target)| {
+            ps_retirement_channel(channel, pi, match target.process().generation {
+                nt_types::ProcessGeneration::Hosted(generation) => generation,
+                _ => 0,
+            }) && unsafe { ps_retirement_is_current(recipient) }
+        });
+    if !allowed_shape
         || channel.shared_va != win32k_subsystem::WIN32K_SHARED_VADDR
         || channel.dispatch_label != win32k_subsystem::W32_DISPATCH_LABEL
         || unsafe { kernel_provider_current_binding(caller) } != Ok(channel_binding(channel))
-        || !unsafe { (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller) }
-            .is_ok_and(|recipient| recipient.matches(channel))
+        || !recipient.matches(channel)
         || current_win32k_provider_domain().is_none_or(|provider| {
             caller.owner().provider_domain != provider.domain
                 || caller.owner().provider_generation != provider.generation
@@ -463,6 +550,27 @@ pub(super) unsafe fn service_event(
             domain: owner.provider_domain,
             generation: owner.provider_generation,
         };
+        if op == win32k_subsystem::W32_EVENT_OP_SET {
+            let handler = crate::service_sec_image::registry_live_handler()?;
+            return Ok(crate::service_sec_image::service_win32k_projected_event_set(
+                handler, arg1,
+            ));
+        }
+        if op == win32k_subsystem::W32_EVENT_OP_DEREFERENCE {
+            let handler = crate::service_sec_image::registry_live_handler()?;
+            return Ok(crate::service_sec_image::service_win32k_projected_event_dereference(
+                handler, arg1,
+            ));
+        }
+        if matches!(op,
+            win32k_subsystem::W32_EVENT_OP_DRAIN_RECLAIM
+                | win32k_subsystem::W32_EVENT_OP_ACK_RECLAIM
+        ) {
+            let handler = crate::service_sec_image::registry_live_handler()?;
+            return Ok(crate::service_sec_image::service_win32k_projected_event_reclaim(
+                handler, op, arg1, arg2,
+            ));
+        }
         if matches!(
             op,
             win32k_subsystem::W32_SYNC_OP_PUBLISH

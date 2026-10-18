@@ -15331,7 +15331,8 @@ unsafe fn install_config_manager_client(client: &mut ConfigClient<CmChan<'static
     CONFIG_CLIENT_PTR = client as *mut _;
 }
 
-/// Explicit boot-loader execution context, never a default for an unbound provider request.
+/// Live initial System execution context for explicit root-owned service jobs. The job retains
+/// its own request and target; this identity is never a default for an unbound provider request.
 unsafe fn initial_system_driver_caller() -> nt_process::native_handle::NativeHandleCaller {
     with_provider_process_manager(|pm| {
         let identity = pm.initial_system_identity().ok_or(0xc000_0008u32)?;

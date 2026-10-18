@@ -4167,6 +4167,55 @@ fn resolve_win32k_event_handle_pi(
 /// Route kernel Event requests through their retained activation; hosted requests use the live handler.
 /// The nested component pump is serialized with native dispatch, so no second handler pointer or
 /// lock domain is introduced. GUI redrive remains deferred until the outer dispatch can resume.
+pub(crate) fn service_win32k_projected_event_set(
+    handler: &mut ExecNtHandler,
+    body: u64,
+) -> (i32, u64, u64, u64) {
+    match handler.provider_set_event(body) {
+        Ok((previous, _id, index, _kind)) => {
+            if !previous {
+                let _ = unsafe { crate::wait_wake_event_set(index, handler) };
+                let current = handler
+                    .provider_read_event(body)
+                    .expect("newly signalled provider Event lost its canonical identity");
+                (0, u64::from(previous), u64::from(current), 0)
+            } else {
+                (0, 1, 1, 0)
+            }
+        }
+        Err(status) => (status as i32, 0, 0, 0),
+    }
+}
+
+pub(crate) fn service_win32k_projected_event_dereference(
+    handler: &mut ExecNtHandler,
+    body: u64,
+) -> (i32, u64, u64, u64) {
+    handler
+        .provider_dereference_event(body)
+        .map(|count| (0, count as u64, 0, 0))
+        .unwrap_or_else(|status| (status as i32, 0, 0, 0))
+}
+
+pub(crate) fn service_win32k_projected_event_reclaim(
+    handler: &mut ExecNtHandler,
+    op: u64,
+    first: u64,
+    second: u64,
+) -> (i32, u64, u64, u64) {
+    match op {
+        crate::win32k_subsystem::W32_EVENT_OP_DRAIN_RECLAIM => handler
+            .pending_event_provider_reclaim()
+            .map(|(id, body)| (0, id, body, 0))
+            .unwrap_or((0, 0, 0, 0)),
+        crate::win32k_subsystem::W32_EVENT_OP_ACK_RECLAIM => handler
+            .complete_event_provider_reclaim(first, second)
+            .map(|()| (0, 0, 0, 0))
+            .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
+        _ => (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0),
+    }
+}
+
 pub(crate) unsafe fn service_win32k_event_request(
     channel: &spawn_hosts::PumpChannel,
     reply_cap: u64,
@@ -4302,36 +4351,17 @@ pub(crate) unsafe fn service_win32k_event_request(
             .and_then(|active_pi| handler.provider_close_event(active_pi, arg1))
             .map(|()| (0, 0, 0, 0))
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
-        crate::win32k_subsystem::W32_EVENT_OP_DEREFERENCE => handler
-            .provider_dereference_event(arg1)
-            .map(|count| (0, count as u64, 0, 0))
-            .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
-        crate::win32k_subsystem::W32_EVENT_OP_DRAIN_RECLAIM => handler
-            .pending_event_provider_reclaim()
-            .map(|(id, body)| (0, id, body, 0))
-            .unwrap_or((0, 0, 0, 0)),
-        crate::win32k_subsystem::W32_EVENT_OP_ACK_RECLAIM => handler
-            .complete_event_provider_reclaim(arg1, arg2)
-            .map(|()| (0, 0, 0, 0))
-            .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
+        crate::win32k_subsystem::W32_EVENT_OP_DEREFERENCE =>
+            service_win32k_projected_event_dereference(handler, arg1),
+        crate::win32k_subsystem::W32_EVENT_OP_DRAIN_RECLAIM
+        | crate::win32k_subsystem::W32_EVENT_OP_ACK_RECLAIM =>
+            service_win32k_projected_event_reclaim(handler, op, arg1, arg2),
         crate::win32k_subsystem::W32_EVENT_OP_RETAIN_POINTER => handler
             .provider_retain_event_pointer(arg1)
             .map(|count| (0, count as u64, 0, 0))
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
-        crate::win32k_subsystem::W32_EVENT_OP_SET => match handler.provider_set_event(arg1) {
-            Ok((previous, _id, index, _kind)) => {
-                if !previous {
-                    let _ = crate::wait_wake_event_set(index, handler);
-                    let current = handler
-                        .provider_read_event(arg1)
-                        .expect("newly signalled provider Event lost its canonical identity");
-                    (0, u64::from(previous), u64::from(current), 0)
-                } else {
-                    (0, 1, 1, 0)
-                }
-            }
-            Err(status) => (status as i32, 0, 0, 0),
-        },
+        crate::win32k_subsystem::W32_EVENT_OP_SET =>
+            service_win32k_projected_event_set(handler, arg1),
         crate::win32k_subsystem::W32_EVENT_OP_RESET => handler
             .provider_reset_event(arg1)
             .map(|previous| (0, u64::from(previous), 0, 0))

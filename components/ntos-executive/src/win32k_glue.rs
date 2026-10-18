@@ -6391,6 +6391,35 @@ pub(crate) unsafe fn win32k_dispatch_ps_provider_command(
     flags: u64,
     client: Win32kClientContext,
 ) -> (u64, bool) {
+    if matches!(
+        command,
+        win32k_subsystem::PS_WIN32_PROVIDER_THREAD_EXIT
+            | win32k_subsystem::PS_WIN32_PROVIDER_PROCESS_EXIT
+    ) {
+        use crate::service_sec_image::kernel_provider_activation::{
+            capture_ps_retirement_job, run_kernel_job, KernelJobResult,
+        };
+        let _durable = crate::allocator::enter_durable();
+        let result = KernelJobResult::new();
+        let native = crate::initial_system_driver_caller();
+        let mut entered = false;
+        let mut execute = |mut channel: crate::spawn_hosts::PumpChannel, lane| {
+            // The client fields describe the attached Ps target. The retained kernel
+            // activation, not that terminating client's Reply, owns execution and waits.
+            channel.logical_caller = None;
+            channel.caps.provider_wait = true;
+            let caller = capture_ps_retirement_job(
+                &channel, lane, native, &result, client,
+            )?;
+            run_kernel_job(caller, &result)
+        };
+        return win32k_dispatch_wide_observed_inner(
+            0, command, expected_provider_state, flags, 0, 0, &[],
+            [command, expected_provider_state, flags, 0], None, None,
+            client, win32k_subsystem::WIN32K_REQUEST_PS_RETIREMENT, true,
+            Some(&mut entered), Some(&mut execute), None,
+        );
+    }
     win32k_dispatch_wide_with_completion_args_and_kind(
         0,
         command,

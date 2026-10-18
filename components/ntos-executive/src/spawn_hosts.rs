@@ -2248,8 +2248,8 @@ pub(crate) unsafe fn component_pump_resume_kernel_provider_wait(
     let caller = ch.kernel_caller.ok_or(nt_process::STATUS_INVALID_HANDLE)?;
     let binding = crate::service_sec_image::kernel_provider_current_binding(caller)?;
     if ch.logical_caller.is_some()
-        || ch.client_pi != 0
-        || ch.client_generation != 0
+        || crate::service_sec_image::kernel_provider_activation::authenticated_channel_caller(ch)
+            != Ok(caller)
         || ch.caps.kind != ReqKind::Syscall
         || !ch.caps.kernel_irq_yield
         || ch.initial != InitialAction::ReplyRequest
