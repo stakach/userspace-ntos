@@ -1660,7 +1660,7 @@ fn pending_irp_completion_output_len(
         && control_code == nt_acpi::IOCTL_ACPI_ENUM_CHILDREN
         && control_method == ioctl::METHOD_BUFFERED as u8
         && output_len == HOSTED_ACPI_NAMESPACE_HEADER_LEN as u64
-        && status == STATUS_BUFFER_OVERFLOW
+        && (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL as u32)
         && information == 0
     {
         HOSTED_ACPI_NAMESPACE_HEADER_LEN as u64
@@ -8126,10 +8126,6 @@ pub(crate) const HOSTED_INTERFACE_TYPE_INTERNAL: u32 = 0;
 pub(crate) const HOSTED_INTERFACE_TYPE_PCIBUS: u32 = 5;
 pub(crate) const HOSTED_INTERFACE_TYPE_PNPBUS: u32 = 15;
 pub(crate) const HOSTED_INTERFACE_TYPE_INTERNAL_POWER_BUS: u32 = 13;
-const GUID_ACPI_INTERFACE_STANDARD: [u8; 16] = [
-    0x8a, 0xa0, 0x91, 0xb0, 0x97, 0xba, 0xd0, 0x11, 0xbd, 0x14, 0x00, 0xaa, 0x00, 0xb7,
-    0xb3, 0x2a,
-];
 const BUS_DATA_TYPE_PCI_CONFIGURATION: u32 = 4;
 
 #[derive(Clone, Copy)]
@@ -66687,9 +66683,7 @@ pub(crate) unsafe fn hosted_accepted_acpi_child_resources(
         let Some(bus) = properties.bus_information.as_ref() else {
             return Err(invalid);
         };
-        if bus.bus_type_guid != GUID_ACPI_INTERFACE_STANDARD
-            || bus.legacy_bus_type != HOSTED_INTERFACE_TYPE_INTERNAL_POWER_BUS
-        {
+        if !nt_pnp_manager::is_acpi_child_bus_information(bus) {
             return Ok(None);
         }
         if bus.bus_number != 0 {

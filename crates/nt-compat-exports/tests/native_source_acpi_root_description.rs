@@ -142,49 +142,31 @@ fn config_manager_query_critical_device_binding(
         service_name: Some("acpi".into()),
     }))
 }
+// The shared nt-config-client resolver is exercised by its own fixture tests.
+// This port tests that root publication consumes its result and propagates refusal.
+fn config_manager_query_driver_database_binding(
+    id: &str,
+) -> Result<Option<nt_config_client::CriticalDeviceBinding>, i32> {
+    assert_eq!(id, ACPI_ROOT_COMPATIBLE_ID);
+    let state = CM.with(|cm| {
+        let cm = cm.borrow();
+        (cm.libernt_driver_database, cm.ambiguous_driver_packages)
+    });
+    if !state.0 {
+        return Ok(None);
+    }
+    if state.1 {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER.raw());
+    }
+    Ok(Some(nt_config_client::CriticalDeviceBinding {
+        mount_generation: 7,
+        class_guid: "{4D36E97D-E325-11CE-BFC1-08002BE10318}".into(),
+        service_name: Some("acpi".into()),
+    }))
+}
 fn config_manager_query_system_hive_key(
     path: &str,
 ) -> Result<nt_config_client::HiveKeySnapshot, i32> {
-    if CM.with(|cm| cm.borrow().libernt_driver_database) {
-        let package = "acpi.inf_amd64_54fdab1b0f600624";
-        let duplicate = "acpi.inf_amd64_other";
-        let ambiguous = CM.with(|cm| cm.borrow().ambiguous_driver_packages);
-        let root = r"\Registry\Machine\System\DriverDatabase";
-        let version = [0xff, 0xff, 9, 0, 0, 0, 0, 0,
-            0x7d, 0xe9, 0x36, 0x4d, 0x25, 0xe3, 0xce, 0x11,
-            0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18];
-        let value = |name: &str, value_type: u32, data: Vec<u8>| nt_config_client::HiveValueSnapshot {
-            name: name.into(), value_type, data,
-        };
-        let sz = |text: &str| text.encode_utf16().chain(std::iter::once(0))
-            .flat_map(u16::to_le_bytes).collect();
-        let snapshot = |subkeys: Vec<nt_config_client::HiveSubkeySnapshot>,
-                        values: Vec<nt_config_client::HiveValueSnapshot>| nt_config_client::HiveKeySnapshot {
-            mount_generation: 7, subkeys, values,
-        };
-        let entry = match path.strip_prefix(root) {
-            Some(r"\DeviceIds\*PNP0C08") => Some(snapshot(vec![], vec![
-                value("acpi.inf", 3, vec![1, 0xff, 0, 0])])),
-            Some(r"\DriverPackages") => Some(snapshot(
-                [package, duplicate].into_iter().take(if ambiguous { 2 } else { 1 })
-                    .map(|name| nt_config_client::HiveSubkeySnapshot { name: name.into() })
-                    .collect(), vec![])),
-            Some(r"\DriverPackages\acpi.inf_amd64_54fdab1b0f600624") =>
-                Some(snapshot(vec![], vec![value("Version", 3, version.to_vec())])),
-            Some(r"\DriverPackages\acpi.inf_amd64_other") if ambiguous =>
-                Some(snapshot(vec![], vec![value("Version", 3, version.to_vec())])),
-            Some(r"\DriverPackages\acpi.inf_amd64_54fdab1b0f600624\Descriptors\*PNP0C08") =>
-                Some(snapshot(vec![], vec![value("Configuration", 1, sz("ACPI_Inst.NT"))])),
-            Some(r"\DriverPackages\acpi.inf_amd64_other\Descriptors\*PNP0C08") if ambiguous =>
-                Some(snapshot(vec![], vec![value("Configuration", 1, sz("ACPI_Inst.NT"))])),
-            Some(r"\DriverPackages\acpi.inf_amd64_54fdab1b0f600624\Configurations\ACPI_Inst.NT") =>
-                Some(snapshot(vec![], vec![value("Service", 1, sz("acpi"))])),
-            Some(r"\DriverPackages\acpi.inf_amd64_other\Configurations\ACPI_Inst.NT") if ambiguous =>
-                Some(snapshot(vec![], vec![value("Service", 1, sz("acpi"))])),
-            _ => None,
-        };
-        if let Some(snapshot) = entry { return Ok(snapshot); }
-    }
     assert_eq!(path, ACPI_ROOT_ENUM_PATH);
     CM.with(|cm| cm.borrow().existing.clone())
         .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.raw())

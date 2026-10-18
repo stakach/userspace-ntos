@@ -13,6 +13,49 @@ pub struct BusInformationValue {
     pub bus_number: u32,
 }
 
+/// The released and legacy ACPI PDOs report distinct, exact bus GUID/type pairs.
+pub fn is_acpi_child_bus_information(bus: &crate::PnpBusInformation) -> bool {
+    const LIBERNT_ACPI: [u8; 16] = [
+        0x95, 0x68, 0xb4, 0xd7, 0x1a, 0x00, 0x42, 0x49, 0x89, 0x1f, 0xa7, 0xd4, 0x66, 0x10,
+        0xa8, 0x43,
+    ];
+    const REACTOS_ACPI: [u8; 16] = [
+        0x8a, 0xa0, 0x91, 0xb0, 0x97, 0xba, 0xd0, 0x11, 0xbd, 0x14, 0x00, 0xaa, 0x00, 0xb7,
+        0xb3, 0x2a,
+    ];
+    (bus.bus_type_guid == LIBERNT_ACPI && bus.legacy_bus_type == 0)
+        || (bus.bus_type_guid == REACTOS_ACPI && bus.legacy_bus_type == 13)
+}
+
+#[cfg(test)]
+mod acpi_bus_identity_tests {
+    use super::*;
+
+    #[test]
+    fn released_and_legacy_acpi_child_bus_pairs_are_exact() {
+        let released = crate::PnpBusInformation {
+            bus_type_guid: [0x95, 0x68, 0xb4, 0xd7, 0x1a, 0x00, 0x42, 0x49,
+                0x89, 0x1f, 0xa7, 0xd4, 0x66, 0x10, 0xa8, 0x43],
+            legacy_bus_type: 0,
+            bus_number: 0,
+        };
+        let legacy = crate::PnpBusInformation {
+            bus_type_guid: [0x8a, 0xa0, 0x91, 0xb0, 0x97, 0xba, 0xd0, 0x11,
+                0xbd, 0x14, 0x00, 0xaa, 0x00, 0xb7, 0xb3, 0x2a],
+            legacy_bus_type: 13,
+            bus_number: 0,
+        };
+        assert!(is_acpi_child_bus_information(&released));
+        assert!(is_acpi_child_bus_information(&legacy));
+        assert!(!is_acpi_child_bus_information(&crate::PnpBusInformation {
+            legacy_bus_type: 13, ..released.clone()
+        }));
+        assert!(is_acpi_child_bus_information(&crate::PnpBusInformation {
+            bus_number: 1, ..legacy
+        }));
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BusPropertyCopyError {
     Truncated,

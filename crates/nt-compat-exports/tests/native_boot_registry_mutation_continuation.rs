@@ -71,7 +71,7 @@ fn acpi_boot_receive_refusal_retains_one_owner_and_blocks_driver_selection() {
     let policy = &acpi[policy_start..start];
     assert!(policy.contains("config_manager_query_critical_device_binding("),
         "the existing critical-device lookup must remain a registry policy input");
-    assert!(policy.contains("acpi_root_driver_database_policy(expected_generation)"),
+    assert!(policy.contains("config_manager_query_driver_database_binding(ACPI_ROOT_COMPATIBLE_ID)"),
         "the mounted DriverDatabase must supply policy when the critical key is absent");
     let acpi = &acpi[start..];
     let decision = acpi.find("acpi_root_registry_policy(expected_generation)?")
