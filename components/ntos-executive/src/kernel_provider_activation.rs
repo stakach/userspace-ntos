@@ -275,6 +275,34 @@ pub(crate) fn authenticated_channel_caller(
     Ok(caller)
 }
 
+/// A parked kernel Ps callout retains its target, but the shared client alias window may have
+/// served another process while it waited. Restore the target's effective APC attachment before
+/// the physical lane can execute again; DriverEntry jobs have no client window to restore.
+unsafe fn restore_ps_retirement_window(
+    caller: KernelProviderCaller,
+    channel: &spawn_hosts::PumpChannel,
+) -> Result<(), u32> {
+    if authenticated_channel_caller(channel)? != caller {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    let recipient = (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller)?;
+    let Some((pi, target)) = recipient.ps_retirement() else {
+        return Ok(());
+    };
+    if !ps_retirement_is_current(recipient) {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    let owner = nt_user_host::client_alias_window::WindowOwner {
+        pi: pi as usize,
+        process: target.process(),
+        vspace: channel.pml4,
+    };
+    if !owner.is_valid() || channel.client_pi != u64::from(pi) {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    crate::win32k_glue::select_effective_kernel(caller, owner, target.eprocess())
+}
+
 /// Root-owned dispatch epoch for an exact stopped kernel-originated provider fault.
 pub(crate) unsafe fn fault_dispatch_id(
     channel: &spawn_hosts::PumpChannel,
@@ -467,6 +495,7 @@ unsafe fn receive_driver_entry_yields(
         let receiving = (&*core::ptr::addr_of!(ACTIVATIONS))
             .recipient(caller)?
             .execution_channel(caller)?;
+        restore_ps_retirement_window(caller, &receiving)?;
         result = spawn_hosts::component_pump_continue_receive(&receiving, &previous)?;
         observe_driver_entry_pump(&receiving, &mut receive_attempt, &result)?;
     }

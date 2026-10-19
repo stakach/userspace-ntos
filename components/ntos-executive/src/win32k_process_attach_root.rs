@@ -60,6 +60,27 @@ pub(super) unsafe fn select_effective_client(
     select(record.state.current()).is_ok()
 }
 
+/// Rebind a retained kernel Ps callout after a provider wait or scheduler yield. The native
+/// callout may have an active KeStackAttachProcess, so its current target takes precedence over
+/// the original process whose lifetime the root has retained.
+pub(crate) unsafe fn select_effective_kernel(
+    caller: KernelProviderCaller,
+    original: WindowOwner,
+    eprocess: u64,
+) -> Result<(), u32> {
+    let records = &*core::ptr::addr_of!(THREAD_ATTACHMENTS);
+    let Some(record) = records.iter().find(|record| record.caller == AttachCaller::Kernel(caller)) else {
+        return w32_client_attach(original).then_some(()).ok_or(nt_process::STATUS_INSUFFICIENT_RESOURCES);
+    };
+    if record.inflight.is_some()
+        || record.state.original().owner != Some(original)
+        || record.state.original().eprocess != eprocess
+    {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    select(record.state.current()).map_err(|_| nt_process::STATUS_INSUFFICIENT_RESOURCES)
+}
+
 /// Capture the exact process whose aliases are selected for this logical win32k invocation.
 /// An attach in progress or a mismatched shared client window cannot supply handle authority.
 pub(crate) unsafe fn current_query_process(

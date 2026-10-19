@@ -6016,6 +6016,7 @@ pub(crate) use process_attach_root::service_process_attach;
 pub(crate) use process_attach_root::retire_thread_attach;
 pub(crate) use process_attach_root::retire_kernel_attach;
 pub(crate) use process_attach_root::current_query_process;
+pub(crate) use process_attach_root::select_effective_kernel;
 
 
 /// Checked system-image loading owns its mappings and opaque module allocation independently.
