@@ -24,6 +24,8 @@ pub(crate) use pending_dispatch::{
 };
 use pending_dispatch::{
     capture_initial_arg_snapshot, capture_lpc_wait_repark, capture_provider_wait_repark,
+    capture_shared_resume_snapshot, restore_shared_resume_snapshot,
+    SharedResumeSnapshot,
     LPC_WAIT_LAST_PUMP_SUSPENDED, LPC_WAIT_PENDING_DISPATCH, PROVIDER_WAIT_LAST_PUMP_SUSPENDED,
     PROVIDER_WAIT_PENDING_DISPATCH,
     RECEIVE_PENDING_DISPATCH,
@@ -2424,12 +2426,18 @@ pub(crate) fn last_real_wm_paint_hwnd() -> u64 {
 /// with the frame however the interleaved stack is later unwound.
 unsafe fn remember_active_dispatch(request: &nt_user_callback::CallbackHeader) -> bool {
     let context = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
-    (&mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE))
-        .record_dispatch_context(
-            nt_user_callback::CallbackCorrelation::from_request(request),
-            context,
-        )
-        .is_ok()
+    let correlation = nt_user_callback::CallbackCorrelation::from_request(request);
+    let active = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE);
+    if active.record_dispatch_context(correlation, context).is_err() {
+        return false;
+    }
+    let Some(client) = user_callback_client_for_request(request) else {
+        return false;
+    };
+    let publication = capture_shared_resume_snapshot(
+        context, win32k_client_context_from_callback_client(client),
+    ).callback_publication();
+    active.record_shared_publication(correlation, publication).is_ok()
 }
 
 fn staged_userconnect_u64(offset: u64) -> u64 {
@@ -4229,6 +4237,7 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
     if let Some(yielded) = pump.receive_yield {
         return ProviderWaitPumpCompletion::ReceiveReparked(PendingReceiveDispatch {
             yielded, pump, channel, dispatch: pending.dispatch, client: pending.client,
+            shared_resume: capture_shared_resume_snapshot(pending.dispatch, pending.client),
             callback_token: None,
             arg_snapshot_len: pending.arg_snapshot_len, arg_snapshot: pending.arg_snapshot,
         });
@@ -4236,6 +4245,7 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
     if let Some(yielded) = pump.service_wait_yield {
         return ProviderWaitPumpCompletion::ServiceReparked(PendingServiceWaitDispatch {
             yielded, pump, channel, dispatch: pending.dispatch, client: pending.client,
+            shared_resume: capture_shared_resume_snapshot(pending.dispatch, pending.client),
             callback_token: None,
             arg_snapshot_len: pending.arg_snapshot_len, arg_snapshot: pending.arg_snapshot,
         });
@@ -4458,6 +4468,7 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
     if let Some(yielded) = pump.receive_yield {
         return LpcWaitPumpCompletion::ReceiveReparked(PendingReceiveDispatch {
             yielded, pump, channel, dispatch: pending.dispatch, client: pending.client,
+            shared_resume: capture_shared_resume_snapshot(pending.dispatch, pending.client),
             callback_token: None,
             arg_snapshot_len: pending.arg_snapshot_len, arg_snapshot: pending.arg_snapshot,
         });
@@ -4465,6 +4476,7 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
     if let Some(yielded) = pump.service_wait_yield {
         return LpcWaitPumpCompletion::ServiceReparked(PendingServiceWaitDispatch {
             yielded, pump, channel, dispatch: pending.dispatch, client: pending.client,
+            shared_resume: capture_shared_resume_snapshot(pending.dispatch, pending.client),
             callback_token: None,
             arg_snapshot_len: pending.arg_snapshot_len, arg_snapshot: pending.arg_snapshot,
         });
@@ -5156,6 +5168,17 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         return None;
     }
     let completed_client = callback_client_from_frame(request, active_frame)?;
+    let saved_publication = active_frame.shared_publication()?;
+    let completed_context = win32k_client_context_from_callback_client(completed_client);
+    if !select_win32k_client_window(completed_context)
+        || !restore_shared_resume_snapshot(
+            SharedResumeSnapshot::from_callback_publication(request, saved_publication),
+            *active_frame.dispatch_context(), completed_context,
+        )
+    {
+        abort_controlled_user_callbacks();
+        return None;
+    }
     // The flush can itself enter win32k, and win32k reuses the same shared callback page for every
     // nested dispatch. Re-publish the reply after the flush so the parked `KeUserModeCallback`
     // continuation consumes the result for THIS callback, not the last nested dispatch's header.
@@ -5280,6 +5303,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         let pending = PendingReceiveDispatch {
             yielded, pump: component, channel, dispatch: dispatch_context,
             client: completed_context, callback_token: Some(callback_token),
+            shared_resume: capture_shared_resume_snapshot(dispatch_context, completed_context),
             arg_snapshot_len, arg_snapshot,
         };
         let Some(callback_context) = stage_returned_user_callback_context(
@@ -5307,6 +5331,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         let pending = PendingServiceWaitDispatch {
             yielded, pump: component, channel, dispatch: dispatch_context,
             client: completed_context, callback_token: Some(callback_token),
+            shared_resume: capture_shared_resume_snapshot(dispatch_context, completed_context),
             arg_snapshot_len, arg_snapshot,
         };
         let Some(callback_context) = stage_returned_user_callback_context(
@@ -6907,6 +6932,9 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             yielded, pump: pr, channel: ch,
             dispatch: UserCallbackDispatchContext { lane, dispatch_id, ssn,
                 args: completion_args, caller_sp, output_stage, paint_output },
+            shared_resume: capture_shared_resume_snapshot(
+                UserCallbackDispatchContext { lane, dispatch_id, ssn,
+                    args: completion_args, caller_sp, output_stage, paint_output }, client),
             client, callback_token: None, arg_snapshot_len, arg_snapshot,
         }));
     }
@@ -6920,6 +6948,9 @@ unsafe fn win32k_dispatch_wide_observed_inner(
                 yielded, pump: pr, channel: ch,
                 dispatch: UserCallbackDispatchContext { lane, dispatch_id, ssn,
                     args: completion_args, caller_sp, output_stage, paint_output },
+                shared_resume: capture_shared_resume_snapshot(
+                    UserCallbackDispatchContext { lane, dispatch_id, ssn,
+                        args: completion_args, caller_sp, output_stage, paint_output }, client),
                 client, callback_token: None, arg_snapshot_len, arg_snapshot,
             }));
     }
