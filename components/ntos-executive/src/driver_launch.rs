@@ -41329,10 +41329,18 @@ pub(crate) fn resolve_kernel_directory_file_name(
     name: &[u16],
     case_insensitive: bool,
 ) -> Result<(u64, alloc::vec::Vec<u16>), u32> {
-    let (device_id, relative) =
-        hosted_io_create_file_ingress::resolve_absolute_name(name, case_insensitive)?;
+    let (device_id, relative) = resolve_hosted_device_file_name(name, case_insensitive)?;
     require_registered_kernel_filesystem_device(device_id)?;
     Ok((device_id, relative))
+}
+
+/// Resolve a native file name through the Object Manager to its exact published device.
+/// Dispatch policy belongs to the caller; this does not imply a filesystem device.
+pub(crate) fn resolve_hosted_device_file_name(
+    name: &[u16],
+    case_insensitive: bool,
+) -> Result<(u64, alloc::vec::Vec<u16>), u32> {
+    hosted_io_create_file_ingress::resolve_absolute_name(name, case_insensitive)
 }
 
 pub(crate) fn require_registered_kernel_filesystem_device(device_id: u64) -> Result<(), u32> {

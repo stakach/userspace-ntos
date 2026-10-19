@@ -43,6 +43,9 @@ mod file_capture;
 #[path = "exec_file_create.rs"]
 mod file_create;
 
+#[path = "exec_named_device_route.rs"]
+mod named_device_route;
+
 #[path = "exec_named_sections.rs"]
 mod named_sections;
 
@@ -26479,6 +26482,117 @@ impl ExecNtHandler {
         };
         let dispatch = target.and_then(|(device_id, parent, owned_name)| {
             self.registered_create_file(
+        self.create_registered_file_from_target(
+            target,
+            name16,
+            object_attributes,
+            desired_access,
+            share_access,
+            disposition,
+            file_attributes,
+            create_options,
+            ea,
+            file_handle_va,
+            iosb_va,
+        )
+    }
+
+    /// Route a resolved named driver object through the same canonical FILE_OBJECT and CREATE
+    /// lifecycle used for file-system devices. An unknown name keeps the ordinary not-found path.
+    unsafe fn create_registered_driver_peer_file(
+        &mut self,
+        name16: &[u16],
+        object_attributes: u32,
+        desired_access: u32,
+        share_access: u32,
+        disposition: u32,
+        file_attributes: u32,
+        create_options: u32,
+        ea: &[u8],
+        file_handle_va: u64,
+        iosb_va: u64,
+    ) -> Option<u32> {
+        let target = named_device_route::resolve_named_driver_peer(
+            name16,
+            object_attributes & 0x40 != 0,
+            driver_launch::resolve_hosted_device_file_name,
+            |device_id| {
+                driver_launch::registered_file_target(*device_id, major::IRP_MJ_CREATE)
+                    .map(|target| target == driver_launch::RegisteredFileTarget::DriverPeer)
+            },
+        );
+        let (device_id, owned_name) = match target {
+            Ok(Some(target)) => target,
+            Ok(None)
+            | Err(STATUS_OBJECT_NAME_NOT_FOUND)
+            | Err(nt_fs::STATUS_OBJECT_PATH_NOT_FOUND) => return None,
+            Err(status) => return Some(status),
+        };
+        Some(self.create_registered_file_from_target(
+            Ok((device_id, None, Some(owned_name))),
+            name16,
+            object_attributes,
+            desired_access,
+            share_access,
+            disposition,
+            file_attributes,
+            create_options,
+            ea,
+            file_handle_va,
+            iosb_va,
+        ))
+    }
+
+    unsafe fn create_registered_driver_peer_relative_file(
+        &mut self,
+        device_id: u64,
+        parent_file_id: u64,
+        name16: &[u16],
+        object_attributes: u32,
+        desired_access: u32,
+        share_access: u32,
+        disposition: u32,
+        file_attributes: u32,
+        create_options: u32,
+        ea: &[u8],
+        file_handle_va: u64,
+        iosb_va: u64,
+    ) -> Option<u32> {
+        if driver_launch::device_id_by_name("\\Device\\NamedPipe") == Some(device_id)
+            || driver_launch::registered_file_target(device_id, major::IRP_MJ_CREATE)
+                != Ok(driver_launch::RegisteredFileTarget::DriverPeer)
+        {
+            return None;
+        }
+        Some(self.create_registered_file_from_target(
+            Ok((device_id, Some(parent_file_id), None)),
+            name16,
+            object_attributes,
+            desired_access,
+            share_access,
+            disposition,
+            file_attributes,
+            create_options,
+            ea,
+            file_handle_va,
+            iosb_va,
+        ))
+    }
+
+    unsafe fn create_registered_file_from_target(
+        &mut self,
+        target: Result<(u64, Option<u64>, Option<alloc::vec::Vec<u16>>), u32>,
+        name16: &[u16],
+        object_attributes: u32,
+        desired_access: u32,
+        share_access: u32,
+        disposition: u32,
+        file_attributes: u32,
+        create_options: u32,
+        ea: &[u8],
+        file_handle_va: u64,
+        iosb_va: u64,
+    ) -> u32 {
                 device_id,
                 major::IRP_MJ_CREATE,
                 owned_name.as_deref().unwrap_or(name16),
@@ -26790,10 +26904,6 @@ impl ExecNtHandler {
         } else {
             live_context
         };
-        if fs_context == 0 {
-            return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
-        }
-
         // Ordinary provider CREATE and the NPFS root have no endpoint-name metadata.
         if major == major::IRP_MJ_CREATE && provider_context == 0 {
             let handle = self.bind_reserved_file_handle(file_id, reservation, desired_access)?;
@@ -26809,6 +26919,9 @@ impl ExecNtHandler {
         }
         let named_pipe_device = driver_launch::device_id_by_name("\\Device\\NamedPipe")
             .ok_or(STATUS_DEVICE_NOT_READY)?;
+        if fs_context == 0 {
+            return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+        }
         if device_id != named_pipe_device {
             return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
         }
@@ -31314,6 +31427,22 @@ impl ExecNtHandler {
                 }
                 if driver_launch::device_id_by_name("\\Device\\NamedPipe") != Some(device_id) {
                     return STATUS_INVALID_DEVICE_REQUEST;
+                if let Some(status) = self.create_registered_driver_peer_relative_file(
+                    device_id,
+                    file_id,
+                    name16,
+                    captured.attributes,
+                    desired_access,
+                    share_access,
+                    nt_fs::FILE_OPEN,
+                    0,
+                    open_options,
+                    &[],
+                    file_handle_out,
+                    args[3],
+                ) {
+                    return status;
+                }
                 }
                 let provider_context = nt_io_manager::pipe_name_hash(name16);
                 let dispatch = self.npfs_create_file(
@@ -31404,6 +31533,22 @@ impl ExecNtHandler {
         }
         // Named-pipe root and endpoint opens both cross the canonical NPFS CREATE boundary. The root
         // path opens a real RootDcb FILE_OBJECT; a leaf path connects to its FCB endpoint.
+        if !Self::is_named_pipe_root_path(name16) && !nt_fs::is_named_pipe_path(name16) {
+            if let Some(status) = self.create_registered_driver_peer_file(
+                name16,
+                captured.attributes,
+                desired_access,
+                share_access,
+                nt_fs::FILE_OPEN,
+                0,
+                open_options,
+                &[],
+                file_handle_out,
+                args[3],
+            ) {
+                return status;
+            }
+        }
         {
             let is_pipe_root = Self::is_named_pipe_root_path(name16);
             if is_pipe_root || nt_fs::is_named_pipe_path(name16) {
