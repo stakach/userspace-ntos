@@ -77,8 +77,6 @@ const DEBUG_FILTER_COMPONENTS: usize = 256;
 const TEB_DBGSS_RESERVED1_OFFSET: u64 = 0x16A8;
 const TEB_EXCEPTION_CODE_OFFSET: u64 = 0x2C0;
 const KUSER_SHARED_DATA_VA: usize = 0x7FFE_0000;
-const KUSER_PROCESSOR_FEATURES_OFFSET: usize = 0x274;
-const KUSER_PROCESSOR_FEATURES_LEN: u32 = 64;
 
 #[cfg(not(target_arch = "x86_64"))]
 static DEBUG_FILTERS: [AtomicU32; DEBUG_FILTER_COMPONENTS] =
@@ -22819,16 +22817,12 @@ pub unsafe extern "system" fn rtl_get_current_processor_number_ex(processor_numb
 /// Reads the mapped `KUSER_SHARED_DATA.ProcessorFeatures` byte array on target.
 #[export_name = "RtlIsProcessorFeaturePresent"]
 pub unsafe extern "system" fn rtl_is_processor_feature_present(processor_feature: u32) -> u8 {
-    if processor_feature >= KUSER_PROCESSOR_FEATURES_LEN {
-        return 0;
-    }
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        let byte = core::ptr::read_volatile(
-            (KUSER_SHARED_DATA_VA + KUSER_PROCESSOR_FEATURES_OFFSET + processor_feature as usize)
-                as *const u8,
-        );
-        u8::from(byte != 0)
+        u8::from(nt_ntdll_layout::kuser::mapped_processor_feature_present(
+            KUSER_SHARED_DATA_VA as *const u8,
+            processor_feature,
+        ))
     }
     #[cfg(not(target_arch = "x86_64"))]
     {

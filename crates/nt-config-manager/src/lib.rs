@@ -68,6 +68,7 @@ pub const SERVICE_GROUP_ORDER_PATH: &str =
 pub const NETWORK_WRAPPER_LOAD_ORDER_GROUP: &str = "NDIS Wrapper";
 pub const NETWORK_PNP_TRANSPORT_LOAD_ORDER_GROUP: &str = "PNP_TDI";
 pub const NETWORK_TRANSPORT_LOAD_ORDER_GROUP: &str = "TDI";
+pub const BASE_LOAD_ORDER_GROUP: &str = "Base";
 
 /// Volatile HARDWARE parents published after mounting the live SYSTEM hive.
 /// Device-specific children such as `DeviceMap\Video` belong to their providers.
@@ -98,6 +99,19 @@ pub const SERVICE_SYSTEM_START: u32 = 1;
 pub const SERVICE_AUTO_START: u32 = 2;
 pub const SERVICE_DEMAND_START: u32 = 3;
 pub const SERVICE_DISABLED: u32 = 4;
+
+/// Registry groups whose no-devnode device services have a hosted boot path.
+/// Base services run at boot; the network wrapper and transports also run at system start.
+pub fn hosted_boot_legacy_device_group(start_type: u32, group: Option<&str>) -> bool {
+    let Some(group) = group else { return false };
+    if start_type == SERVICE_BOOT_START && group.eq_ignore_ascii_case(BASE_LOAD_ORDER_GROUP) {
+        return true;
+    }
+    (start_type == SERVICE_BOOT_START || start_type == SERVICE_SYSTEM_START)
+        && (group.eq_ignore_ascii_case(NETWORK_WRAPPER_LOAD_ORDER_GROUP)
+            || group.eq_ignore_ascii_case(NETWORK_PNP_TRANSPORT_LOAD_ORDER_GROUP)
+            || group.eq_ignore_ascii_case(NETWORK_TRANSPORT_LOAD_ORDER_GROUP))
+}
 
 pub type ServiceId = u64;
 pub type DevnodeId = u64;
@@ -1132,23 +1146,17 @@ impl ConfigManager {
             .collect()
     }
 
-    /// Whether a boot/system driver service is a hosted legacy network-stack driver.
+    /// Whether a boot/system driver service has a hosted no-devnode boot path.
     ///
     /// The hosted boot-driver path can start PnP-bound device drivers from imported `Enum`
-    /// devnodes. The only no-devnode device drivers admitted here are the registry-declared NT5
-    /// network wrapper/transport groups; unrelated legacy boot drivers such as boot-bus extenders,
-    /// WDF framework loaders, debug/SAC services, and storage class drivers need their own kernel
-    /// mechanisms before they enter this path.
+    /// devnodes. Boot-start Base services and the registry-declared NT5 network
+    /// wrapper/transport groups are admitted. Boot-bus extenders, WDF framework loaders,
+    /// debug/SAC services, and storage class drivers need their own kernel mechanisms.
     pub fn is_boot_system_legacy_driver(&self, service: &ServiceMetadata) -> bool {
         service.has_launch_image()
             && service.driver_service_class() == Some(DriverServiceClass::Device)
-            && service
-                .start_type
-                .is_some_and(|start| start == SERVICE_BOOT_START || start == SERVICE_SYSTEM_START)
-            && service.load_order_group.as_deref().is_some_and(|group| {
-                group.eq_ignore_ascii_case(NETWORK_WRAPPER_LOAD_ORDER_GROUP)
-                    || group.eq_ignore_ascii_case(NETWORK_PNP_TRANSPORT_LOAD_ORDER_GROUP)
-                    || group.eq_ignore_ascii_case(NETWORK_TRANSPORT_LOAD_ORDER_GROUP)
+            && service.start_type.is_some_and(|start| {
+                hosted_boot_legacy_device_group(start, service.load_order_group.as_deref())
             })
             && !self.service_has_devnodes(&service.name)
     }
@@ -3546,6 +3554,29 @@ mod tests {
                 String::from("Afd")
             ]
         );
+    }
+
+    #[test]
+    fn boot_start_base_device_without_devnodes_is_a_hosted_legacy_driver() {
+        let mut cm = ConfigManager::new();
+        cm.register_typed_service(
+            "EntropyProvider",
+            r"system32\drivers\entropy.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_BOOT_START,
+            1,
+        );
+        let key = cm.service_metadata("EntropyProvider").unwrap().service_key;
+        cm.registry_mut().set_string(key, "Group", "Base");
+
+        let service = cm.service_metadata("EntropyProvider").unwrap();
+        assert!(cm.is_boot_system_legacy_driver(&service));
+
+        cm.registry_mut().set_dword(key, "Start", SERVICE_SYSTEM_START);
+        let service = cm.service_metadata("EntropyProvider").unwrap();
+        assert!(!cm.is_boot_system_legacy_driver(&service));
     }
 
     #[test]

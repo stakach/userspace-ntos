@@ -2,7 +2,7 @@
 
 use super::*;
 
-unsafe fn query_page(vspace: u64, address: u64) -> Result<bool, i32> {
+pub(crate) unsafe fn query_page(vspace: u64, address: u64) -> Result<bool, i32> {
     let info: u64;
     let present: u64;
     core::arch::asm!(

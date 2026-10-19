@@ -37,6 +37,18 @@ pub const ACTIVE_PROCESSOR_COUNT: usize = 0x3c0;
 pub const XSTATE_ENABLED_FEATURES: usize = 0x3d8;
 
 pub const PROCESSOR_FEATURE_COUNT: usize = 64;
+
+/// Read the authoritative processor-feature byte from a mapped shared-data page.
+///
+/// # Safety
+/// `page` must point to one readable `KUSER_SHARED_DATA` page for the duration of the read.
+pub unsafe fn mapped_processor_feature_present(page: *const u8, feature: u32) -> bool {
+    if feature as usize >= PROCESSOR_FEATURE_COUNT {
+        return false;
+    }
+    unsafe { core::ptr::read_volatile(page.add(PROCESSOR_FEATURES + feature as usize)) != 0 }
+}
+
 pub const TICK_COUNT_MULTIPLIER_ONE_MS: u32 = 1 << 24;
 
 const KF_MMX: u32 = 0x0000_0100;
@@ -361,6 +373,22 @@ mod tests {
         const PF_XSAVE_ENABLED: usize = 17;
         let features = processor_features(u32::MAX);
         assert_eq!(features[PF_XSAVE_ENABLED], 0);
+    }
+
+    #[test]
+    fn mapped_processor_feature_read_is_bounded_by_shared_data_layout() {
+        let mut page = [0u8; PAGE_SIZE];
+        page[PROCESSOR_FEATURES + 14] = 1;
+        page[PROCESSOR_FEATURES + PROCESSOR_FEATURE_COUNT - 1] = 1;
+        assert!(unsafe { mapped_processor_feature_present(page.as_ptr(), 14) });
+        assert!(!unsafe { mapped_processor_feature_present(page.as_ptr(), 13) });
+        assert!(unsafe {
+            mapped_processor_feature_present(page.as_ptr(), (PROCESSOR_FEATURE_COUNT - 1) as u32)
+        });
+        assert!(!unsafe {
+            mapped_processor_feature_present(page.as_ptr(), PROCESSOR_FEATURE_COUNT as u32)
+        });
+        assert!(!unsafe { mapped_processor_feature_present(page.as_ptr(), u32::MAX) });
     }
 
     #[test]

@@ -3307,6 +3307,30 @@ unsafe fn component_pump_loop(
                 0
             );
             continue;
+        } else if label == crate::driver_launch::HOSTED_MM_QUERY_PAGE_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let (status, present) = if !shared_pump::authenticated_badge(ch, msg.badge)
+                || msg.mi != ((crate::driver_launch::HOSTED_MM_QUERY_PAGE_LABEL << 12) | 1)
+            {
+                (0xc000_000du32 as i32, false)
+            } else {
+                match crate::driver_launch::query_hosted_driver_page(ch, *reply_cap, msg.m0) {
+                    Ok(present) => (0, present),
+                    Err(status) => (status, false),
+                }
+            };
+            pump_reply_recv4_into!(
+                ch,
+                *reply_cap,
+                msg,
+                2,
+                status as u32 as u64,
+                present as u64,
+                0,
+                0
+            );
+            continue;
         } else if label == crate::win32k_subsystem::W32_MM_QUERY_PAGE_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {

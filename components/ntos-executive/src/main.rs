@@ -21301,15 +21301,10 @@ fn current_driver_host_can_boot_launch_live(
         nt_config_client::DriverServiceClass::FileSystem => binding.devnodes.is_empty(),
         nt_config_client::DriverServiceClass::Device => {
             binding.devnodes.is_empty()
-                && binding.load_order_group.as_deref().is_some_and(|group| {
-                    group.eq_ignore_ascii_case(nt_config_manager::NETWORK_WRAPPER_LOAD_ORDER_GROUP)
-                        || group.eq_ignore_ascii_case(
-                            nt_config_manager::NETWORK_PNP_TRANSPORT_LOAD_ORDER_GROUP,
-                        )
-                        || group.eq_ignore_ascii_case(
-                            nt_config_manager::NETWORK_TRANSPORT_LOAD_ORDER_GROUP,
-                        )
-                })
+                && nt_config_manager::hosted_boot_legacy_device_group(
+                    binding.start_type,
+                    binding.load_order_group.as_deref(),
+                )
         }
     }
 }

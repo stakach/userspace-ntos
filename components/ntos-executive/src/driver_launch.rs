@@ -17098,6 +17098,37 @@ extern "win64" fn s_ex_get_current_processor_counts(idle: u64, kernel: u64, user
     }
 }
 
+extern "win64" fn s_ex_is_processor_feature_present(feature: u32) -> u8 {
+    // The driver host maps the executive's KUSER_SHARED_DATA page at this alias.
+    u8::from(unsafe {
+        nt_ntdll_layout::kuser::mapped_processor_feature_present(
+            nt_ntdll_layout::kuser::KERNEL_ALIAS_VA as *const u8,
+            feature,
+        )
+    })
+}
+
+pub(crate) const HOSTED_MM_QUERY_PAGE_LABEL: u64 = 0x786;
+
+pub(crate) unsafe fn query_hosted_driver_page(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    address: u64,
+) -> Result<bool, i32> {
+    let (_, instance) = instance_for_pump_channel(channel, reply_cap).ok_or(STATUS_ACCESS_DENIED)?;
+    win32k_address_validity::query_page(instance.pml4, address)
+}
+
+extern "win64" fn s_mm_is_address_valid(address: u64) -> u8 {
+    let (info, status, present, _, _) = unsafe {
+        call_on4_raw((HOSTED_MM_QUERY_PAGE_LABEL << 12) | 1, address, 0, 0, 0)
+    };
+    if info != 2 || status as i32 != STATUS_SUCCESS || present > 1 {
+        panic!("hosted driver page-presence query failed: info={info:#x} status={status:#x}");
+    }
+    present as u8
+}
+
 extern "win64" fn s_ex_get_current_processor_cpu_usage(_processor: u32) -> u32 {
     0
 }
@@ -35814,6 +35845,14 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "ExGetCurrentProcessorCounts",
         s_ex_get_current_processor_counts as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExIsProcessorFeaturePresent",
+        s_ex_is_processor_feature_present as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmIsAddressValid",
+        s_mm_is_address_valid as *const () as usize as u64,
     );
     reg.bind(
         "ExGetCurrentProcessorCpuUsage",
