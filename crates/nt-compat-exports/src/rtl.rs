@@ -216,6 +216,16 @@ pub fn compare_memory(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
+/// CRT `memcmp`: difference of the first unequal byte in two equal-length slices.
+pub fn compare_bytes_lexicographic(a: &[u8], b: &[u8]) -> i32 {
+    for (&left, &right) in a.iter().zip(b.iter()) {
+        if left != right {
+            return left as i32 - right as i32;
+        }
+    }
+    0
+}
+
 /// `_stricmp`: compare two complete narrow strings with ASCII case folding.
 ///
 /// The return value is the difference between the first distinct folded bytes. A missing byte is
@@ -482,6 +492,13 @@ mod tests {
         assert_eq!(compare_memory(b"hello", b"help"), 3);
         assert_eq!(compare_memory(b"abc", b"abc"), 3);
         assert_eq!(compare_memory(b"", b"x"), 0);
+    }
+
+    #[test]
+    fn memcmp_uses_unsigned_byte_order_and_not_matching_prefix_length() {
+        assert_eq!(compare_bytes_lexicographic(b"abc", b"abc"), 0);
+        assert_eq!(compare_bytes_lexicographic(b"abc", b"abd"), -1);
+        assert_eq!(compare_bytes_lexicographic(&[0xff], &[0x01]), 254);
     }
 
     #[test]

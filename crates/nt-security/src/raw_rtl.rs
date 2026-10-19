@@ -12,6 +12,43 @@ pub const fn sub_authority_offset(index: u32) -> Option<usize> {
     }
 }
 
+/// Bytes needed for a native SID with the requested number of sub-authorities.
+pub const fn required_sid_length(sub_authority_count: u32) -> u32 {
+    8u32.wrapping_add(sub_authority_count.wrapping_mul(4))
+}
+
+/// Write the fixed SID header; the caller owns the sub-authority storage.
+pub fn initialize_sid_header(
+    sid_header: &mut [u8],
+    authority: &[u8; 6],
+    sub_authority_count: u8,
+) -> Result<(), ()> {
+    if sid_header.len() < 8 {
+        return Err(());
+    }
+    sid_header[0] = 1;
+    sid_header[1] = sub_authority_count;
+    sid_header[2..8].copy_from_slice(authority);
+    Ok(())
+}
+
+#[cfg(test)]
+mod sid_header_tests {
+    use super::*;
+
+    #[test]
+    fn sid_header_and_required_length_match_native_layout() {
+        let authority = [0, 0, 0, 0, 0, 5];
+        let mut sid = [0xa5u8; 20];
+        assert_eq!(required_sid_length(3), 20);
+        initialize_sid_header(&mut sid[..8], &authority, 3).unwrap();
+        assert_eq!(&sid[..8], &[1, 3, 0, 0, 0, 0, 0, 5]);
+        assert_eq!(&sid[8..], &[0xa5; 12]);
+        assert_eq!(sub_authority_offset(2), Some(16));
+        assert_eq!(sub_authority_offset(15), None);
+    }
+}
+
 /// Update the SACL fields of a writable x64 absolute `SECURITY_DESCRIPTOR`.
 ///
 /// The caller owns the ACL pointer. This changes the descriptor's pointer and

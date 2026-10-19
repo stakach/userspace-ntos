@@ -782,7 +782,7 @@ pub unsafe extern "system" fn rtl_sid_equal_level(
 /// `RtlLengthRequiredSid(ULONG SubAuthorityCount) -> ULONG` = `8 + 4*count`. Ported from `sid.c:54`.
 #[export_name = "RtlLengthRequiredSid"]
 pub extern "system" fn rtl_length_required_sid(sub_authority_count: u32) -> u32 {
-    8 + 4 * sub_authority_count
+    nt_security::raw_rtl::required_sid_length(sub_authority_count)
 }
 
 /// `RtlInitializeSid(PSID, PSID_IDENTIFIER_AUTHORITY, UCHAR SubAuthorityCount) -> NTSTATUS`.
@@ -800,12 +800,13 @@ pub unsafe extern "system" fn rtl_initialize_sid(
     if sid.is_null() || identifier_authority.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    // SAFETY: sid is writable per the contract; identifier_authority is a 6-byte authority.
-    unsafe {
-        let p = sid as *mut u8;
-        *p = SID_REVISION;
-        *p.add(1) = sub_authority_count;
-        core::ptr::copy_nonoverlapping(identifier_authority as *const u8, p.add(2), 6);
+    // SAFETY: both pointers satisfy the native contract above.
+    let sid_header = unsafe { core::slice::from_raw_parts_mut(sid as *mut u8, 8) };
+    let authority = unsafe { &*(identifier_authority as *const [u8; 6]) };
+    if nt_security::raw_rtl::initialize_sid_header(sid_header, authority, sub_authority_count)
+        .is_err()
+    {
+        return STATUS_INVALID_PARAMETER;
     }
     STATUS_SUCCESS
 }
