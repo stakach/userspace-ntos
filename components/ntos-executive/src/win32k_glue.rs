@@ -45,6 +45,7 @@ const ATL_CREATE_WND_DATA_TID_OFFSET: u64 = 0x08;
 const ATL_CREATE_WND_DATA_NEXT_OFFSET: u64 = 0x10;
 
 static USER_CALLBACK_DISPATCH_IDS: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_TRANSFER_IDS: AtomicU64 = AtomicU64::new(1);
 static USER_CALLBACK_RENDEZVOUS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_WINLOGON_API0: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_EXPLORER_API0_REDIRECTS: AtomicU64 = AtomicU64::new(0);
@@ -2065,7 +2066,7 @@ pub(crate) fn user_callback_stack_depths() -> (usize, usize) {
 unsafe fn callback_frame_can_resume(frame: &nt_user_callback::ActiveCallbackFrame) -> bool {
     crate::component_external_resume_ready(
         frame.dispatch_context().lane,
-        u64::from(frame.request().callback_id),
+        frame.external_token(),
     )
 }
 
@@ -2194,7 +2195,7 @@ unsafe fn active_callback_lane_and_token(
         return None;
     }
     let lane = frame.dispatch_context().lane;
-    let token = u64::from(frame.request().callback_id);
+    let token = frame.external_token();
     (lane.is_valid() && token != 0).then_some((lane, token))
 }
 
@@ -2204,7 +2205,7 @@ unsafe fn pending_callback_token_on_lane(
 ) -> Option<u64> {
     let identity = nt_user_callback::ClientThreadIdentity::new(client.pi, client.tid, client.badge);
     let frame = (&*core::ptr::addr_of!(USER_CALLBACK_ACTIVE)).top_for(&identity)?;
-    let token = u64::from(frame.request().callback_id);
+    let token = frame.external_token();
     (frame.dispatch_context().lane == lane && token != 0).then_some(token)
 }
 
@@ -2276,6 +2277,13 @@ unsafe fn begin_controlled_continuation(
     if callback_client.tcb <= 1 {
         return false;
     }
+    let Ok(external_token) = USER_CALLBACK_TRANSFER_IDS.fetch_update(
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |next| next.checked_add(1),
+    ) else {
+        return false;
+    };
     let mut token_user_sid = [0u8; nt_user_callback::CLIENT_TOKEN_USER_SID_MAX];
     token_user_sid.copy_from_slice(&callback_client.token_user_sid);
     let active_client = nt_user_callback::ActiveCallbackClient::new(
@@ -2314,7 +2322,7 @@ unsafe fn begin_controlled_continuation(
         return false;
     }
     if active
-        .push_with_active_client_metadata(request, active_client)
+        .push_with_active_client_metadata_and_token(request, active_client, external_token)
         .is_err()
     {
         print_str(b"[user-callback-continuation] reject active-frame dispatch=");
@@ -3627,6 +3635,7 @@ pub(crate) unsafe fn validate_active_callback_syscall_resume(
 #[derive(Clone, Copy)]
 pub(crate) struct CallbackTransferBinding {
     request: nt_user_callback::CallbackHeader,
+    external_token: u64,
     client: Win32kClientContext,
     lane: nt_component_suspension::LaneHandle,
     dispatcher: u64,
@@ -3635,6 +3644,10 @@ pub(crate) struct CallbackTransferBinding {
 impl CallbackTransferBinding {
     pub(crate) const fn request(self) -> nt_user_callback::CallbackHeader {
         self.request
+    }
+
+    pub(crate) const fn external_token(self) -> u64 {
+        self.external_token
     }
 
     pub(crate) const fn client(self) -> Win32kClientContext {
@@ -3656,6 +3669,8 @@ pub(crate) unsafe fn validate_callback_transfer_binding(
     let frame = active.top_for(&identity).ok_or(INVALID)?;
     if frame.is_redirected()
         || *frame.request() != binding.request
+        || frame.external_token() != binding.external_token
+        || binding.external_token == 0
         || frame.dispatch_context().lane != binding.lane
         || frame.dispatch_context().dispatch_id != binding.request.dispatch_id
         || frame.client_tcb() != client.tcb
@@ -3685,9 +3700,10 @@ pub(crate) unsafe fn capture_callback_transfer(
         return Err(INVALID);
     }
     let identity = nt_user_callback::ClientThreadIdentity::new(client.pi, client.tid, client.badge);
-    let request = {
+    let (request, external_token) = {
         let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
-        *active.top_for(&identity).ok_or(INVALID)?.request()
+        let frame = active.top_for(&identity).ok_or(INVALID)?;
+        (*frame.request(), frame.external_token())
     };
     nt_user_callback::validate_request(&request).map_err(|_| INVALID)?;
     if request.dispatch_id != dispatch_id || request.callback_id == 0 {
@@ -3697,7 +3713,7 @@ pub(crate) unsafe fn capture_callback_transfer(
     if dispatcher == 0 {
         return Err(INVALID);
     }
-    let binding = CallbackTransferBinding { request, client, lane, dispatcher };
+    let binding = CallbackTransferBinding { request, external_token, client, lane, dispatcher };
     validate_callback_transfer_binding(binding)?;
     let shared = (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_USER_CALLBACK)
         as *const nt_user_callback::CallbackFrame;
@@ -4023,6 +4039,7 @@ unsafe fn flush_returned_user_callback_gdi_batch(
 unsafe fn resume_suspended_user_callback_component(
     request: nt_user_callback::CallbackHeader,
     client: crate::spawn_hosts::UserCallbackClient,
+    callback_token: u64,
     allow_receive_yield: bool,
 ) -> crate::spawn_hosts::PumpResult {
     if client.pi != request.client_pi
@@ -4036,7 +4053,6 @@ unsafe fn resume_suspended_user_callback_component(
     }
     let dispatch = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
     let lane = dispatch.lane;
-    let callback_token = u64::from(request.callback_id);
     if dispatch.dispatch_id != request.dispatch_id || !lane.is_valid() || callback_token == 0 {
         return crate::spawn_hosts::PumpResult::refused(
             0xC000_000Du32 as i32, 0,
@@ -4574,7 +4590,7 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
     let mut cancelled_count = 0u64;
     let mut last_status = STATUS_UNSUCCESSFUL;
     while cancelled_count < nt_user_callback::MAX_CONTINUATION_DEPTH as u64 {
-        let (request, dispatch_context, client) = {
+        let (request, dispatch_context, client, callback_token) = {
             let active_frame = {
                 let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
                 active.top().copied()
@@ -4615,7 +4631,7 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
                 abort_controlled_user_callbacks();
                 return (STATUS_UNSUCCESSFUL, false);
             }
-            (request, dispatch_context, client)
+            (request, dispatch_context, client, cancelled_frame.external_token())
         };
 
         cancelled_count += 1;
@@ -4625,7 +4641,7 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
             dispatch_context,
         );
-        let result = resume_suspended_user_callback_component(request, client, false);
+        let result = resume_suspended_user_callback_component(request, client, callback_token, false);
         core::ptr::write(
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
             previous_dispatch,
@@ -4843,7 +4859,7 @@ pub(crate) unsafe fn unwind_dead_client_user_callbacks(client_pi: u32) -> u64 {
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
             dispatch_context,
         );
-        let component = resume_suspended_user_callback_component(request, client, false);
+        let component = resume_suspended_user_callback_component(request, client, popped.external_token(), false);
         core::ptr::write(
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
             previous_dispatch,
@@ -5243,7 +5259,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         .top_for(&identity)
         .is_none();
     let component = resume_suspended_user_callback_component(
-        request, completed_client, allow_receive_yield,
+        request, completed_client, completed_frame.external_token(), allow_receive_yield,
     );
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
@@ -5299,7 +5315,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         ) else {
             panic!("Receive yield lost its callback pump channel");
         };
-        let callback_token = u64::from(request.callback_id);
+        let callback_token = completed_frame.external_token();
         let pending = PendingReceiveDispatch {
             yielded, pump: component, channel, dispatch: dispatch_context,
             client: completed_context, callback_token: Some(callback_token),
@@ -5327,7 +5343,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         ) else {
             panic!("service-wait yield lost its callback pump channel");
         };
-        let callback_token = u64::from(request.callback_id);
+        let callback_token = completed_frame.external_token();
         let pending = PendingServiceWaitDispatch {
             yielded, pump: component, channel, dispatch: dispatch_context,
             client: completed_context, callback_token: Some(callback_token),
@@ -5376,7 +5392,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         print_str(b"[user-callback] B transferred callback return to provider wait\n");
         return Some(CompletedUserCallback::ProviderWaitSuspended {
             pending,
-            callback_token: u64::from(request.callback_id),
+            callback_token: completed_frame.external_token(),
             callback_context,
         });
     }
@@ -5409,7 +5425,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         print_str(b"[user-callback] B transferred callback return to LPC wait\n");
         return Some(CompletedUserCallback::LpcWaitSuspended {
             pending,
-            callback_token: u64::from(request.callback_id),
+            callback_token: completed_frame.external_token(),
             callback_context,
         });
     }

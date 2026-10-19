@@ -1438,6 +1438,8 @@ impl SharedCallbackPublication {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActiveCallbackFrame {
     request: CallbackHeader,
+    /// Root-owned lane transfer identity; the header's callback ID is local to a dispatch.
+    external_token: u64,
     client: ActiveCallbackClient,
     saved_user_context: [u64; 20],
     redirected: bool,
@@ -1455,6 +1457,7 @@ impl ActiveCallbackFrame {
     const fn empty() -> Self {
         Self {
             request: CallbackHeader::idle(0, 0, 0, 0),
+            external_token: 0,
             client: ActiveCallbackClient::empty(),
             saved_user_context: [0; 20],
             redirected: false,
@@ -1484,6 +1487,7 @@ impl ActiveCallbackFrame {
         self.request.dispatch_id = 0;
         self.request.client_tid = 0;
         self.request.client_badge = 0;
+        self.external_token = 0;
         self.client.clear();
         self.saved_user_context.fill(0);
         self.redirected = false;
@@ -1503,6 +1507,10 @@ impl ActiveCallbackFrame {
 
     pub const fn request(&self) -> &CallbackHeader {
         &self.request
+    }
+
+    pub const fn external_token(&self) -> u64 {
+        self.external_token
     }
 
     pub const fn shared_publication(&self) -> Option<SharedCallbackPublication> {
@@ -1740,6 +1748,28 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         request: CallbackHeader,
         client: ActiveCallbackClient,
     ) -> Result<(), ValidationError> {
+        self.push_with_token(request, client, 0)
+    }
+
+    /// Bind an independently minted lane transfer token to this exact callback frame.
+    pub fn push_with_active_client_metadata_and_token(
+        &mut self,
+        request: CallbackHeader,
+        client: ActiveCallbackClient,
+        token: u64,
+    ) -> Result<(), ValidationError> {
+        if token == 0 || self.frames[..self.len].iter().any(|frame| frame.external_token == token) {
+            return Err(ValidationError::Correlation);
+        }
+        self.push_with_token(request, client, token)
+    }
+
+    fn push_with_token(
+        &mut self,
+        request: CallbackHeader,
+        client: ActiveCallbackClient,
+        token: u64,
+    ) -> Result<(), ValidationError> {
         validate_request(&request)?;
         if client.client_tcb <= 1 {
             return Err(ValidationError::State);
@@ -1749,6 +1779,7 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         }
         self.frames[self.len] = ActiveCallbackFrame {
             request,
+            external_token: token,
             client,
             saved_user_context: [0; 20],
             redirected: false,
@@ -3423,6 +3454,27 @@ mod tests {
 
     /// The interleaved ACTIVE stack: two threads redirected at once, each `NtCallbackReturn`
     /// resolving to its OWN frame and carrying its OWN suspended dispatch.
+    #[test]
+    fn nested_dispatches_with_the_same_callback_id_keep_distinct_lane_tokens() {
+        let mut stack = ActiveCallbackStack::<3>::new();
+        let mut outer = CallbackHeader::idle(10, 8, 184, 30);
+        outer.state = CallbackState::Request as u32;
+        outer.callback_id = 1;
+        outer.api_index = USER32_CALLBACK_WINDOWPROC;
+        let mut inner = outer;
+        inner.dispatch_id = 11;
+        let client = ActiveCallbackClient::new(64, 0, 0, 0);
+
+        stack.push_with_active_client_metadata_and_token(outer, client, 41).unwrap();
+        stack.push_with_active_client_metadata_and_token(inner, client, 42).unwrap();
+        let identity = ClientThreadIdentity::new(8, 184, 30);
+        assert_eq!(stack.top_for(&identity).unwrap().external_token(), 42);
+        assert_eq!(stack.discard_top().unwrap().external_token(), 42);
+        assert_eq!(stack.top_for(&identity).unwrap().external_token(), 41);
+        assert_eq!(stack.push_with_active_client_metadata_and_token(inner, client, 41),
+            Err(ValidationError::Correlation));
+    }
+
     #[test]
     fn active_callback_frames_of_two_threads_pop_by_identity() {
         let mut stack = ActiveCallbackStack::<4>::new();
