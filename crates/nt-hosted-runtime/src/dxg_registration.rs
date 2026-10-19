@@ -783,31 +783,50 @@ impl DxgCreateContextLayout {
     }
 }
 
-/// Pinned LiberNT x64 DXGKARG_CREATEDEVICE for the system-device path.
-/// The miniport writes only the first eight-byte `hDevice` output. All other
-/// fields are inputs and must retain their original bytes on copyback.
+/// Pinned LiberNT x64 DXGKARG_CREATEDEVICE for system and GDI devices.
+/// `hDevice` is a runtime handle on GDI input and a miniport handle on output.
+/// The flags/pInfo union becomes an absent output for GDI requests when the
+/// miniport leaves the input flag unchanged. Remaining input fields are preserved.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DxgCreateDeviceLayout {
     kmd_process: u64,
+    gdi_device: bool,
 }
 
 impl DxgCreateDeviceLayout {
     pub fn parse(version: u32, bytes: &[u8], marshal_capacity: u64) -> Option<Self> {
+        if bytes.len() < 0x20 { return None; }
+        let runtime_handle = u64::from_le_bytes(bytes[..8].try_into().ok()?);
+        let flags = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
         if DxgInitializationData::required_prefix_len(version).is_none()
-            || bytes.len() < 0x20 || marshal_capacity < 0x20
-            || bytes[..8] != [0; 8]
-            || u32::from_le_bytes(bytes[8..12].try_into().ok()?) != 1
+            || marshal_capacity < 0x20
+            || !((flags == 1 && runtime_handle == 0)
+                || (flags == 2 && runtime_handle != 0))
             || bytes[12..0x18] != [0; 12]
         { return None; }
-        Some(Self { kmd_process: u64::from_le_bytes(bytes[0x18..0x20].try_into().ok()?) })
+        Some(Self {
+            kmd_process: u64::from_le_bytes(bytes[0x18..0x20].try_into().ok()?),
+            gdi_device: flags == 2,
+        })
     }
 
     pub const fn bytes(self) -> u64 { 0x20 }
     pub const fn kmd_process(self) -> u64 { self.kmd_process }
 
-    pub fn copyback_device(self, output: &mut [u8], kmd_device: u64) -> bool {
+    pub fn copyback_device(
+        self, output: &mut [u8], kmd_device: u64, returned_union: u64,
+    ) -> bool {
         if output.len() < 0x20 || kmd_device == 0 { return false; }
+        if self.gdi_device && returned_union != 0 && returned_union != 2 {
+            // A non-null pInfo needs its own generation-bound nested projection.
+            return false;
+        }
         output[..8].copy_from_slice(&kmd_device.to_le_bytes());
+        if self.gdi_device {
+            // The input GdiDevice flag shares storage with the optional output pInfo.
+            // This miniport leaves the flag untouched; publish an absent output.
+            output[8..16].fill(0);
+        }
         true
     }
 }

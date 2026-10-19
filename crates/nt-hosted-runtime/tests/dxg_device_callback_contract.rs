@@ -48,7 +48,7 @@ fn create_device_uses_fixed_wddm2_record_and_only_handle_copyback() {
         assert_eq!(layout.bytes(), 0x20);
         assert_eq!(layout.kmd_process(), 0x5000);
         let mut projected = original;
-        assert!(layout.copyback_device(&mut projected, 0x6000));
+        assert!(layout.copyback_device(&mut projected, 0x6000, 1));
         assert_eq!(&projected[..8], &0x6000u64.to_le_bytes());
         assert_eq!(&projected[8..], &original[8..]);
         assert!(DxgCreateDeviceLayout::parse(version, &original[..0x1f], 0x1000).is_none());
@@ -64,6 +64,35 @@ fn create_device_uses_fixed_wddm2_record_and_only_handle_copyback() {
     invalid = request(0x5000);
     invalid[0x10] = 1; // PASID needs its own typed owner
     assert!(DxgCreateDeviceLayout::parse(0x5023, &invalid, 0x1000).is_none());
+}
+
+#[test]
+fn live_gdi_device_request_retains_runtime_handle_and_driver_copyback() {
+    // Captured from LiberNT's first DxgkDdiCreateDevice on its released BasicDisplay stack.
+    let mut request = [0u8; 0x20];
+    request[..8].copy_from_slice(&0x0000_0100_0e8c_4000u64.to_le_bytes());
+    request[8..12].copy_from_slice(&2u32.to_le_bytes()); // GdiDevice
+    request[0x18..0x20].copy_from_slice(&0x0000_0100_0e80_18a0u64.to_le_bytes());
+    let layout = DxgCreateDeviceLayout::parse(0x11007, &request, 2048)
+        .expect("the released GDI-device request must be admitted");
+    assert_eq!(layout.kmd_process(), 0x0000_0100_0e80_18a0);
+    let original = request;
+    assert!(layout.copyback_device(&mut request, 0x0000_0100_0e8c_9000, 2));
+    assert_eq!(&request[..8], &0x0000_0100_0e8c_9000u64.to_le_bytes());
+    assert_eq!(&request[8..16], &[0; 8], "no pInfo output must not expose the input flags as a pointer");
+    assert_eq!(&request[16..], &original[16..]);
+
+    let mut unexpected_info = original;
+    assert!(!layout.copyback_device(&mut unexpected_info, 0x0000_0100_0e8c_9000,
+        0x0000_0100_0e8c_a000));
+    assert_eq!(unexpected_info, original);
+
+    let mut invalid = original;
+    invalid[..8].fill(0);
+    assert!(DxgCreateDeviceLayout::parse(0x11007, &invalid, 2048).is_none());
+    invalid = original;
+    invalid[8] = 3; // neither a sole system nor a sole GDI-device request
+    assert!(DxgCreateDeviceLayout::parse(0x11007, &invalid, 2048).is_none());
 }
 
 #[test]

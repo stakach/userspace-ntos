@@ -145,7 +145,8 @@ pub(super) unsafe fn create(
         device.kmd_guard.as_ref().unwrap().retain_uncertain();
         return Err(STATUS_INVALID_PARAMETER);
     }
-    if !layout.copyback_device(&mut original, kmd_device) {
+    let returned_union = read_unaligned((marshal_window.exec_base + 8) as *const u64);
+    if !layout.copyback_device(&mut original, kmd_device, returned_union) {
         return Err(STATUS_INVALID_PARAMETER);
     }
     let device = &mut pdo_aliases_mut()[alias_index].devices[device_index];
