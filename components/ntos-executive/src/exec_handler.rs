@@ -26480,8 +26480,6 @@ impl ExecNtHandler {
             }
             _ => Err(STATUS_INVALID_HANDLE),
         };
-        let dispatch = target.and_then(|(device_id, parent, owned_name)| {
-            self.registered_create_file(
         self.create_registered_file_from_target(
             target,
             name16,
@@ -26593,6 +26591,8 @@ impl ExecNtHandler {
         file_handle_va: u64,
         iosb_va: u64,
     ) -> u32 {
+        let dispatch = target.and_then(|(device_id, parent, owned_name)| {
+            self.registered_create_file(
                 device_id,
                 major::IRP_MJ_CREATE,
                 owned_name.as_deref().unwrap_or(name16),
@@ -26917,11 +26917,11 @@ impl ExecNtHandler {
         if provider_context == 0 {
             return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
         }
-        let named_pipe_device = driver_launch::device_id_by_name("\\Device\\NamedPipe")
-            .ok_or(STATUS_DEVICE_NOT_READY)?;
         if fs_context == 0 {
             return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
         }
+        let named_pipe_device = driver_launch::device_id_by_name("\\Device\\NamedPipe")
+            .ok_or(STATUS_DEVICE_NOT_READY)?;
         if device_id != named_pipe_device {
             return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
         }
@@ -31425,8 +31425,6 @@ impl ExecNtHandler {
                         args[3],
                     );
                 }
-                if driver_launch::device_id_by_name("\\Device\\NamedPipe") != Some(device_id) {
-                    return STATUS_INVALID_DEVICE_REQUEST;
                 if let Some(status) = self.create_registered_driver_peer_relative_file(
                     device_id,
                     file_id,
@@ -31443,6 +31441,8 @@ impl ExecNtHandler {
                 ) {
                     return status;
                 }
+                if driver_launch::device_id_by_name("\\Device\\NamedPipe") != Some(device_id) {
+                    return STATUS_INVALID_DEVICE_REQUEST;
                 }
                 let provider_context = nt_io_manager::pipe_name_hash(name16);
                 let dispatch = self.npfs_create_file(
@@ -31531,8 +31531,6 @@ impl ExecNtHandler {
             );
             return status;
         }
-        // Named-pipe root and endpoint opens both cross the canonical NPFS CREATE boundary. The root
-        // path opens a real RootDcb FILE_OBJECT; a leaf path connects to its FCB endpoint.
         if !Self::is_named_pipe_root_path(name16) && !nt_fs::is_named_pipe_path(name16) {
             if let Some(status) = self.create_registered_driver_peer_file(
                 name16,
@@ -31549,6 +31547,8 @@ impl ExecNtHandler {
                 return status;
             }
         }
+        // Named-pipe root and endpoint opens both cross the canonical NPFS CREATE boundary. The root
+        // path opens a real RootDcb FILE_OBJECT; a leaf path connects to its FCB endpoint.
         {
             let is_pipe_root = Self::is_named_pipe_root_path(name16);
             if is_pipe_root || nt_fs::is_named_pipe_path(name16) {
