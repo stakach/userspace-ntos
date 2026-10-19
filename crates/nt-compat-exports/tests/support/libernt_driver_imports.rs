@@ -33,12 +33,11 @@ pub fn imports(driver: &str, modules: &[&str]) -> BTreeSet<String> {
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let manifest_path = root.join("rust-micro/vendor/libernt/manifest.txt");
-    if manifest_path.exists() {
+    let tree = root.join("rust-micro/.tmp/libernt/tree");
+    if tree.is_dir() {
         let manifest = std::fs::read_to_string(manifest_path).expect("pinned LiberNT manifest");
         assert!(manifest.contains(&format!("source_revision={REVISION}")));
-        let image = root
-            .join("rust-micro/.tmp/libernt/tree/Windows/system32/drivers")
-            .join(driver);
+        let image = tree.join("Windows/system32/drivers").join(driver);
         let bytes = std::fs::read(image).expect("locally staged pinned LiberNT driver");
         let pe = nt_pe_loader::PeFile::parse(&bytes).expect("pinned LiberNT PE");
         let actual: BTreeSet<(String, String)> = pe
