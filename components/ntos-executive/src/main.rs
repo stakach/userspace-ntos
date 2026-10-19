@@ -19349,15 +19349,11 @@ pub(crate) struct HiveMount {
     pub(crate) dynamic: bool,
 }
 
-/// Backing storage for a dynamically loaded hive. `RegfHive` BORROWS its bytes for the life of the
-/// mount, and the writable volume's own buffers live on the bump heap (which the service loop
-/// resets and which a later write could reallocate), so a loaded hive is COPIED into one of these
-/// executive-lifetime statics. Sized for the largest per-user hive this image can produce: the
-/// `config\default` prototype is 139264 B.
-pub(crate) const USER_HIVE_SLOT_BYTES: usize = 192 * 1024;
+/// Each dynamic hive selector owns one stable image allocation while its `RegfHive` borrows it.
+/// Slot release follows mount removal, so no later load can reuse the bytes early.
 pub(crate) const USER_HIVE_SLOTS: usize = HIVE_SEL_DYNAMIC.len();
-pub(crate) static mut USER_HIVE_BUF: [[u8; USER_HIVE_SLOT_BYTES]; USER_HIVE_SLOTS] =
-    [[0; USER_HIVE_SLOT_BYTES]; USER_HIVE_SLOTS];
+pub(crate) static mut USER_HIVE_BUF: [Option<alloc::vec::Vec<u8>>; USER_HIVE_SLOTS] =
+    [const { None }; USER_HIVE_SLOTS];
 /// Which slots are in use (bit per slot), so a load/unload pair really recycles storage.
 pub(crate) static USER_HIVE_SLOT_USED: AtomicU64 = AtomicU64::new(0);
 

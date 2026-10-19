@@ -37,6 +37,9 @@ pub(crate) mod initial_thread_creation;
 #[path = "exec_file_flush.rs"]
 mod file_flush;
 
+#[path = "exec_user_hive_image.rs"]
+mod user_hive_image;
+
 #[path = "exec_file_capture.rs"]
 mod file_capture;
 
@@ -4758,12 +4761,6 @@ impl ExecNtHandler {
         print_str(b" heap-headroom=");
         print_u64(crate::allocator::remaining() as u64);
         print_str(b"\n");
-        if image.len() > USER_HIVE_SLOT_BYTES {
-            print_str(b"[profile-setup] HKU\\.DEFAULT image too large for NtLoadKey slot: ");
-            print_u64(image.len() as u64);
-            print_str(b"B\n");
-            return;
-        }
         let len = image.len();
         print_str(b"[profile-setup] ntuser image publish begin\n");
         if unsafe { crate::writable_fs::set_default_user_ntuser_dat_image(image) } {
@@ -6565,15 +6562,6 @@ impl ExecNtHandler {
                 }
             }
         };
-        if image_len > USER_HIVE_SLOT_BYTES {
-            REG_FLUSH_KEY_DYNAMIC_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
-            print_str(b"[cm-flush] dynamic hive checkpoint too large bytes=");
-            print_u64(image_len as u64);
-            print_str(b" path=");
-            print_ascii_str(&file_path);
-            print_str(b"\n");
-            return nt_fs::STATUS_INSUFFICIENT_RESOURCES;
-        }
         let flush_result = {
             let _alloc_ctx =
                 crate::allocator::enter_context(crate::allocator::ALLOC_CTX_WRITABLE_ATOMIC_WRITE);
@@ -6691,7 +6679,7 @@ impl ExecNtHandler {
             return STATUS_SHARING_VIOLATION;
         }
 
-        // The SOURCE file: read the whole regf out of the filesystem into a durable static slot.
+        // The source bytes need a stable allocation for the lifetime of the borrowed regf view.
         let file16 = self.read_objattr_name_pe(source_oa);
         let mut folded = [0u8; FILE_OBJECT_NAME_CAP];
         let mut relative = [0u8; FILE_VOLUME_RELATIVE_CAP];
@@ -6716,21 +6704,22 @@ impl ExecNtHandler {
             print_str(b"[cm-load] NtLoadKey REFUSED: all hive slots in use\n");
             return STATUS_INSUFFICIENT_RESOURCES;
         };
-        // SAFETY: single-threaded executive; the slot is claimed below and only released by
-        // `NtUnloadKey`, which drops the borrowing mount first.
-        let buffer = &mut (*core::ptr::addr_of_mut!(USER_HIVE_BUF))[slot];
-        let len = match crate::writable_fs::read_file_relative_into(relative, buffer) {
-            Ok(Some(len)) => len,
-            result => {
-                print_str(b"[cm-load] NtLoadKey: source file unreadable: ");
-                print_ascii_str(&file_name);
-                print_str(b"\n");
-                return result.err().unwrap_or(STATUS_OBJECT_NAME_NOT_FOUND);
+        let image = {
+            let _durable = crate::allocator::enter_durable();
+            match crate::writable_fs::file_bytes_owned_if_mounted(&file_name) {
+                Ok(Some(image)) => image,
+                result => {
+                    print_str(b"[cm-load] NtLoadKey: source file unreadable: ");
+                    print_ascii_str(&file_name);
+                    print_str(b"\n");
+                    return result.err().unwrap_or(STATUS_OBJECT_NAME_NOT_FOUND);
+                }
             }
         };
-        // SAFETY: the slot is a `'static` array; the borrow lives exactly as long as the mount.
-        let bytes: &'static [u8] =
-            core::slice::from_raw_parts((*core::ptr::addr_of!(USER_HIVE_BUF))[slot].as_ptr(), len);
+        let len = image.len();
+        // SAFETY: this executive owns the chosen slot until the mount is dropped.
+        let claim = user_hive_image::Claim::new(slot, image);
+        let bytes = claim.bytes();
         let regf_hive = RegfHive::new(bytes);
         let mut core_hive = None;
         let hive_sel = HIVE_SEL_DYNAMIC[slot];
@@ -6772,7 +6761,6 @@ impl ExecNtHandler {
                 }
             }
         };
-        USER_HIVE_SLOT_USED.fetch_or(1 << slot, Ordering::Relaxed);
         if let Some(ref hive) = regf_hive {
             let imported = {
                 let _import_alloc_ctx =
@@ -6787,7 +6775,6 @@ impl ExecNtHandler {
                     | nt_hive_regf::RegfHiveImportError::InvalidSubkeyList
                     | nt_hive_regf::RegfHiveImportError::InvalidValue,
                 ) => {
-                    USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
                     print_str(b"[cm-load] NtLoadKey: mutable import invalid root key bytes=");
                     print_u64(len as u64);
                     print_str(b" target=");
@@ -6801,7 +6788,6 @@ impl ExecNtHandler {
                     | nt_hive_regf::RegfHiveImportError::UnsupportedValueType(_)
                     | nt_hive_regf::RegfHiveImportError::DepthLimitOrCycle,
                 ) => {
-                    USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
                     print_str(b"[cm-load] NtLoadKey: mutable import metadata corrupt bytes=");
                     print_u64(len as u64);
                     print_str(b" target=");
@@ -6810,7 +6796,6 @@ impl ExecNtHandler {
                     return STATUS_REGISTRY_CORRUPT;
                 }
                 Err(nt_hive_regf::RegfHiveImportError::OutOfMemory) => {
-                    USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
                     print_str(b"[cm-load] NtLoadKey: mutable import out of memory bytes=");
                     print_u64(len as u64);
                     print_str(b" target=");
@@ -6824,7 +6809,6 @@ impl ExecNtHandler {
             } {
                 Ok(bytes) => bytes.unwrap_or_default(),
                 Err(status) => {
-                    USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
                     return status;
                 }
             };
@@ -6844,13 +6828,11 @@ impl ExecNtHandler {
             drop(log_bytes);
             root_subkeys = hive.subkey_count(hive.root()) as u64;
             if self.mutable_hives.mount(&full, hive_sel, hive).is_err() {
-                USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
                 return STATUS_REGISTRY_CORRUPT;
             }
             self.mutable_hives.clear_hive_dirty(hive_sel);
         } else if let Some(hive) = core_hive {
             if self.mutable_hives.mount(&full, hive_sel, hive).is_err() {
-                USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
                 return STATUS_REGISTRY_CORRUPT;
             }
             NT_LOAD_KEY_CORE_HIVE_MOUNTED.fetch_add(1, Ordering::Relaxed);
@@ -6864,6 +6846,7 @@ impl ExecNtHandler {
             slot: Some(slot),
             dynamic: true,
         });
+        claim.publish();
         NT_LOAD_KEY_MOUNTED.fetch_add(1, Ordering::Relaxed);
         NT_LOAD_KEY_HIVE_BYTES.store(len as u64, Ordering::Relaxed);
         NT_LOAD_KEY_ROOT_SUBKEYS.store(root_subkeys, Ordering::Relaxed);
@@ -7146,9 +7129,6 @@ impl ExecNtHandler {
         self.complete_committed_mutable_hive_journal_snapshot(b"NtUnloadKey");
         self.writable_fs_commit_required = false;
         let mount = self.hive_mounts.remove(index);
-        if let Some(slot) = mount.slot {
-            USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
-        }
         let _ = self.mutable_hives.unmount(&mount.mount);
         let mut mutable_handles_invalidated = 0usize;
         for entry in self.mutable_key_handles.iter_mut() {
