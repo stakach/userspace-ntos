@@ -3308,7 +3308,7 @@ unsafe fn component_pump_loop(
             );
             continue;
         } else if label == crate::driver_launch::HOSTED_MM_QUERY_PAGE_LABEL
-            && ch.caps.kind == ReqKind::Syscall
+            && ch.caps.kind == ReqKind::Irp
         {
             let (status, present) = if !shared_pump::authenticated_badge(ch, msg.badge)
                 || msg.mi != ((crate::driver_launch::HOSTED_MM_QUERY_PAGE_LABEL << 12) | 1)
@@ -4225,6 +4225,23 @@ unsafe fn component_pump_loop(
             };
             pump_reply_recv4_into!(ch, *reply_cap, msg, 3,
                 status as u32 as u64, ticket, generation, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PRIMARY_TOKEN_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, value) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_PRIMARY_TOKEN_LABEL << 12) | 2)
+                && msg.m2 == 0
+                && msg.m3 == 0
+            {
+                crate::driver_launch::service_hosted_primary_token(
+                    ch, *reply_cap, msg.badge, msg.m0, msg.m1,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2,
+                status as u32 as u64, value, 0, 0);
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_TOKEN_QUERY_LABEL
             && ch.caps.kind == ReqKind::Irp

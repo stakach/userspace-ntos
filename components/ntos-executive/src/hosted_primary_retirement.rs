@@ -432,6 +432,7 @@ pub(super) unsafe fn release(instance_index: usize, inst: DriverInstance) -> boo
         return false;
     }
     if hosted_driver_ps_handle_reference::retire(inst).is_err()
+        || hosted_primary_token::retire(inst).is_err()
         || hosted_driver_process_identity::retire(inst).is_err()
         || driver_ps_context::retire(inst).is_err()
     {

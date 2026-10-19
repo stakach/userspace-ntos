@@ -224,6 +224,8 @@ mod hosted_flush_work;
 mod hosted_query_information_work;
 #[path = "driver_hosted_token_projection.rs"]
 mod driver_hosted_token_projection;
+#[path = "hosted_primary_token.rs"]
+mod hosted_primary_token;
 #[path = "hosted_token_query.rs"]
 mod hosted_token_query;
 #[path = "hosted_create_subject_registration.rs"]
@@ -558,7 +560,7 @@ use nt_video_miniport::{
 use crate::ntoskrnl_shared::{
     s_ex_query_depth_slist, s_exp_interlocked_flush_slist, s_exp_interlocked_pop_entry_slist, s_exp_interlocked_push_entry_slist,
     s_initialize_slist_head,
-    s_memcpy, s_memmove, s_memset, s_rtl_compare_memory, s_rtl_integer_to_unicode_string,
+    s_memcmp, s_memcpy, s_memmove, s_memset, s_rtl_compare_memory, s_rtl_integer_to_unicode_string,
     s_rtl_unicode_string_to_integer, s_rtl_upcase_unicode_char, s_stricmp, s_wcschr, s_wcsicmp,
     s_wcslen, s_wcsnicmp,
 };
@@ -1143,6 +1145,7 @@ pub const FSD_SERVICE_IO_CREATE_FILE_LABEL: u64 = 0x78E;
 pub const FSD_SERVICE_SOURCE_IRP_LABEL: u64 = 0x799;
 pub const FSD_SERVICE_QUERY_PATH_FORWARD_LABEL: u64 = 0x79A;
 pub const FSD_SERVICE_TOKEN_QUERY_LABEL: u64 = 0x79B;
+pub(crate) const FSD_SERVICE_PRIMARY_TOKEN_LABEL: u64 = 0x7D6;
 pub const FSD_SERVICE_CREATE_SUBJECT_LABEL: u64 = 0x79C;
 
 pub(crate) fn service_hosted_token_query(
@@ -1153,6 +1156,16 @@ pub(crate) fn service_hosted_token_query(
     selector: u64,
 ) -> (i32, u64) {
     hosted_token_query::service(channel, reply_cap, caller_badge, token_address, selector)
+}
+
+pub(crate) fn service_hosted_primary_token(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    caller_badge: u64,
+    op: u64,
+    value: u64,
+) -> (i32, u64) {
+    hosted_primary_token::service(channel, reply_cap, caller_badge, op, value)
 }
 
 pub(crate) unsafe fn service_hosted_create_subject_registration(
@@ -15852,6 +15865,35 @@ extern "win64" fn s_rtl_length_sid(sid: u64) -> u64 {
     unsafe { sid_len_from_ptr(sid).unwrap_or(0) as u64 }
 }
 
+extern "win64" fn s_rtl_length_required_sid(sub_authority_count: u32) -> u32 {
+    nt_security::raw_rtl::required_sid_length(sub_authority_count)
+}
+
+extern "win64" fn s_rtl_initialize_sid(sid: u64, authority: u64, sub_authority_count: u8) -> i32 {
+    if sid == 0 || authority == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let header = unsafe { core::slice::from_raw_parts_mut(sid as *mut u8, 8) };
+    let authority = unsafe { &*(authority as *const [u8; 6]) };
+    match nt_security::raw_rtl::initialize_sid_header(header, authority, sub_authority_count) {
+        Ok(()) => STATUS_SUCCESS,
+        Err(()) => STATUS_INVALID_PARAMETER,
+    }
+}
+
+extern "win64" fn s_rtl_sub_authority_sid(sid: u64, index: u32) -> u64 {
+    let Some(offset) = nt_security::raw_rtl::sub_authority_offset(index) else {
+        return 0;
+    };
+    let Some(length) = (unsafe { sid_len_from_ptr(sid) }) else {
+        return 0;
+    };
+    if offset + 4 > length {
+        return 0;
+    }
+    sid + offset as u64
+}
+
 /// `NTSTATUS RtlCreateAcl(PACL, ULONG, ULONG)`.
 extern "win64" fn s_rtl_create_acl(acl: u64, acl_size: u64, acl_revision: u64) -> i32 {
     if acl == 0 {
@@ -16495,6 +16537,33 @@ extern "win64" fn s_ps_get_current_process_id() -> u64 {
     current_ps_value(2)
 }
 
+fn primary_token_request(op: u64, value: u64) -> u64 {
+    let (info, status, result, unused0, unused1) = unsafe {
+        call_on4_raw((FSD_SERVICE_PRIMARY_TOKEN_LABEL << 12) | 2, op, value, 0, 0)
+    };
+    if info != 2 || status as u32 as i32 != STATUS_SUCCESS || unused0 != 0 || unused1 != 0 {
+        unsafe {
+            crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_PRIMARY_TOKEN_LABEL, op, status, info]);
+        }
+    }
+    result
+}
+
+extern "win64" fn s_ps_reference_primary_token(process: u64) -> u64 {
+    let token = primary_token_request(hosted_primary_token::REFERENCE, process);
+    if token == 0 {
+        unsafe { crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_PRIMARY_TOKEN_LABEL, 1, process, 0]); }
+    }
+    token
+}
+
+extern "win64" fn s_ps_dereference_primary_token(token: u64) {
+    let result = primary_token_request(hosted_primary_token::DEREFERENCE, token);
+    if result != 0 {
+        unsafe { crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_PRIMARY_TOKEN_LABEL, 2, token, result]); }
+    }
+}
+
 /// Public NT identifiers never expose scheduler-private hosted handles.
 extern "win64" fn s_ps_get_current_thread_id() -> u64 {
     current_ps_value(1)
@@ -17108,7 +17177,7 @@ extern "win64" fn s_ex_is_processor_feature_present(feature: u32) -> u8 {
     })
 }
 
-pub(crate) const HOSTED_MM_QUERY_PAGE_LABEL: u64 = 0x786;
+pub(crate) const HOSTED_MM_QUERY_PAGE_LABEL: u64 = 0x7D5;
 
 pub(crate) unsafe fn query_hosted_driver_page(
     channel: &crate::spawn_hosts::PumpChannel,
@@ -35187,7 +35256,12 @@ fn register_fsd_trampolines() -> bool {
         s_c_specific_handler as *const () as usize as u64,
     );
     // CRT / Rtl mem intrinsics (REAL — silent corruption otherwise)
+    reg.bind("memcmp", s_memcmp as *const () as usize as u64);
     reg.bind("memcpy", s_memcpy as *const () as usize as u64);
+    reg.bind(
+        "ZwQuerySystemInformation",
+        crate::ntoskrnl_shared::s_query_system_information as *const () as usize as u64,
+    );
     reg.bind("memmove", s_memmove as *const () as usize as u64);
     reg.bind("memchr", hosted_driver_crt_memchr::memchr as *const () as usize as u64);
     reg.bind("strchr", hosted_driver_crt_strchr::strchr as *const () as usize as u64);
@@ -35643,6 +35717,18 @@ fn register_fsd_trampolines() -> bool {
         s_rtl_length_sid as *const () as usize as u64,
     );
     reg.bind(
+        "RtlLengthRequiredSid",
+        s_rtl_length_required_sid as *const () as usize as u64,
+    );
+    reg.bind(
+        "RtlInitializeSid",
+        s_rtl_initialize_sid as *const () as usize as u64,
+    );
+    reg.bind(
+        "RtlSubAuthoritySid",
+        s_rtl_sub_authority_sid as *const () as usize as u64,
+    );
+    reg.bind(
         "RtlCreateAcl",
         s_rtl_create_acl as *const () as usize as u64,
     );
@@ -35763,6 +35849,18 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "PsGetProcessId",
         hosted_driver_process_identity::ps_get_process_id as *const () as usize as u64,
+    );
+    reg.bind(
+        "PsGetProcessCreateTimeQuadPart",
+        hosted_driver_process_identity::ps_get_process_create_time_quad_part as *const () as usize as u64,
+    );
+    reg.bind(
+        "PsReferencePrimaryToken",
+        s_ps_reference_primary_token as *const () as usize as u64,
+    );
+    reg.bind(
+        "PsDereferencePrimaryToken",
+        s_ps_dereference_primary_token as *const () as usize as u64,
     );
     reg.bind(
         "PsLookupProcessByProcessId",

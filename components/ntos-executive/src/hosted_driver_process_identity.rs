@@ -15,6 +15,7 @@ pub(super) const QUERY_PROCESS_EXIT_STATUS: u64 = 5;
 pub(super) const QUERY_IS_SYSTEM_PROCESS: u64 = 6;
 pub(super) const QUERY_IS_THREAD_TERMINATING: u64 = 7;
 pub(super) const QUERY_PROCESS_SESSION_ID: u64 = 8;
+const QUERY_PROCESS_CREATE_TIME: u64 = 9;
 const STATUS_UNSUPPORTED_OBJECT: i32 = STATUS_NOT_SUPPORTED;
 
 #[derive(Clone, Copy)]
@@ -58,6 +59,34 @@ pub(super) extern "win64" fn ps_get_process_id(process: u64) -> u64 {
         unsafe { crate::provider_bugcheck::report(0xc4, [LABEL, GET_ID, process, status as u32 as u64]); }
     }
     id
+}
+
+pub(super) extern "win64" fn ps_get_process_create_time_quad_part(process: u64) -> i64 {
+    query_state(QUERY_PROCESS_CREATE_TIME, process) as i64
+}
+
+/// A canonical body belongs to this call only if it is the caller's effective process or a
+/// provider-owned Ps lookup reference. A numeric EPROCESS value alone conveys no authority.
+pub(super) fn authorized_process(
+    pm: &nt_process::ProcessManager,
+    caller: nt_process::native_handle::NativeHandleCaller,
+    provider: DriverInstance,
+    body: u64,
+) -> Result<(nt_process::ProcessId, u64), u32> {
+    pm.validate_native_handle_caller(caller)?;
+    let pid = pm.pid_for_kernel_process_object(body)
+        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let domain = instance_domain_identity(provider).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let owned = pid == caller.effective_process() || unsafe {
+        (&*core::ptr::addr_of!(PROCESS_LEASES)).iter().any(|lease| {
+            lease.domain == domain && lease.pml4 == provider.pml4 && lease.body == body
+        })
+    };
+    if !owned {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    let sequence = pm.process_sequence_for_kernel_process_object(body)?;
+    Ok((pid, sequence))
 }
 
 /// `NTSTATUS PsLookupProcessByProcessId(HANDLE, PEPROCESS*)`.
@@ -231,6 +260,15 @@ pub(crate) fn service(
                     Err(status) => (status as i32, 0),
                 }
             }
+            QUERY_PROCESS_CREATE_TIME => match crate::service_sec_image::with_provider_process_manager(|pm| {
+                let (pid, _) = authorized_process(pm, caller, inst, value)?;
+                pm.process_times(pid)
+                    .map(|times| times.create_time as u64)
+                    .ok_or(nt_process::STATUS_INVALID_HANDLE)
+            }) {
+                Ok(create_time) => (STATUS_SUCCESS, create_time),
+                Err(status) => (status as i32, 0),
+            },
             QUERY_PROCESS_EXIT_STATUS => match crate::service_sec_image::with_provider_process_manager(|pm| {
                 pm.validate_native_handle_caller(caller)?;
                 pm.kernel_process_state(value)

@@ -25,6 +25,20 @@ fn pci_and_dynamic_object_services_have_distinct_labels() {
 }
 
 #[test]
+fn hosted_page_query_does_not_reuse_a_driver_service_label() {
+    let source = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    let query = label(source, "HOSTED_MM_QUERY_PAGE_LABEL");
+    for line in source.lines().filter(|line| line.contains("const FSD_") && line.contains("_LABEL: u64 = 0x")) {
+        let value = u64::from_str_radix(
+            line.split_once("_LABEL: u64 = 0x").unwrap().1
+                .chars().take_while(|c| c.is_ascii_hexdigit()).collect::<String>().as_str(),
+            16,
+        ).unwrap();
+        assert_ne!(query, value, "hosted page query collides with {line}");
+    }
+}
+
+#[test]
 fn seh_transport_and_win32k_services_have_distinct_labels() {
     let seh = include_str!("../../nt-unwind/src/seh_transport.rs");
     let win32k = include_str!("../../../components/ntos-executive/src/win32k_subsystem.rs");
