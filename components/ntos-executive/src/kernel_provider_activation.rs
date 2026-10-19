@@ -550,6 +550,27 @@ pub(super) unsafe fn service_event(
             domain: owner.provider_domain,
             generation: owner.provider_generation,
         };
+        if op == win32k_subsystem::W32_EVENT_OP_CLOSE {
+            if !(arg2 == 0 && arg3 == 0) {
+                return Err(nt_process::STATUS_INVALID_PARAMETER);
+            }
+            // Win32k's thread-exit callout closes a handle in the exiting process.
+            // The kernel job owns the provider wait, but its System handle table is
+            // never authority for that target's Event handle.
+            let recipient = (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller)?;
+            let (pi, target) = recipient.ps_retirement()
+                .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+            if !ps_retirement_is_current(recipient) {
+                return Err(nt_process::STATUS_INVALID_HANDLE);
+            }
+            let handler = crate::service_sec_image::registry_live_handler()?;
+            if handler.capture_process_identity(pi as usize) != Some(target.process()) {
+                return Err(nt_process::STATUS_INVALID_HANDLE);
+            }
+            return Ok(handler.provider_close_event(pi as usize, arg1)
+                .map(|()| (0, 0, 0, 0))
+                .unwrap_or_else(|status| (status as i32, 0, 0, 0)));
+        }
         if op == win32k_subsystem::W32_EVENT_OP_SET {
             let handler = crate::service_sec_image::registry_live_handler()?;
             return Ok(crate::service_sec_image::service_win32k_projected_event_set(
