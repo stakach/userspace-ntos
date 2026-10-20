@@ -282,7 +282,7 @@ fn final_reference_followup_survives_file_row_retirement_and_caller_exit() {
     let pid = pm.create_process("inline-owner.exe", None, None);
     let tid = pm.create_thread(pid, 0x1000, 0, false).unwrap();
     let (mut files, mut retained, id) = fixture(tid as u64);
-    let mut ports = CompletionPortTable::<1, 1>::new();
+    let mut ports = CompletionPortTable::<1>::new();
     let port_id = ports.create(1).unwrap();
     // NT forbids associating a synchronous File with an IOCP. Its inline retirement must
     // preserve the empty followup receipt, not synthesize a port reference to release.
