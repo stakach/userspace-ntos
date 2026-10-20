@@ -2372,6 +2372,7 @@ impl WaitObject {
     pub(crate) const KIND_FAT_DIRECTORY: u64 = 6;
     pub(crate) const KIND_OVERLAY_FILE: u64 = 7;
     pub(crate) const KIND_JOB: u64 = 8;
+    pub(crate) const KIND_IO_COMPLETION: u64 = 9;
 
     pub(crate) const FREE: Self = Self(u64::MAX);
 
@@ -2407,6 +2408,10 @@ impl WaitObject {
         Self((Self::KIND_JOB << Self::KIND_SHIFT) | id as u64)
     }
 
+    pub(crate) const fn io_completion(id: u32) -> Self {
+        Self((Self::KIND_IO_COMPLETION << Self::KIND_SHIFT) | id as u64)
+    }
+
     pub(crate) const fn raw(self) -> u64 {
         self.0
     }
@@ -2437,6 +2442,7 @@ impl WaitObject {
             Self::KIND_FAT_DIRECTORY => b"fat-directory",
             Self::KIND_OVERLAY_FILE => b"overlay-file",
             Self::KIND_JOB => b"job",
+            Self::KIND_IO_COMPLETION => b"io-completion",
             _ => b"unknown",
         }
     }
@@ -24072,6 +24078,11 @@ impl ExecIoCompletionPorts {
     fn depth(&self, id: u32) -> Result<u32, u32> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).depth(id) }
+    }
+
+    fn wait_ready(&self, id: u32) -> Result<bool, u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).wait_ready(id) }
     }
 }
 

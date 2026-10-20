@@ -1062,6 +1062,12 @@ impl<const PORTS: usize, const PACKETS: usize> CompletionPortTable<PORTS, PACKET
         Ok(self.port(id)?.len as u32)
     }
 
+    /// An object wait observes queued packets without claiming them. A subsequent
+    /// NtRemoveIoCompletion owns the packet transfer.
+    pub fn wait_ready(&self, id: u32) -> Result<bool, u32> {
+        Ok(self.port(id)?.len != 0)
+    }
+
     pub fn concurrency(&self, id: u32) -> Result<u32, u32> {
         Ok(self.port(id)?.concurrency)
     }
@@ -1206,6 +1212,25 @@ mod tests {
             Ok(RemoveResult::Packet(packet(20)))
         );
         assert_eq!(ports.depth(id), Ok(0));
+    }
+
+    #[test]
+    fn object_wait_observes_packets_without_consuming_them() {
+        let mut ports = Ports::new();
+        let id = ports.create(1).unwrap();
+        assert_eq!(ports.wait_ready(id), Ok(false));
+        ports.retain(id).unwrap(); // The parked wait owns the object after its handle closes.
+        ports.release(id).unwrap();
+        ports.enqueue(id, packet(10)).unwrap();
+        assert_eq!(ports.wait_ready(id), Ok(true));
+        assert_eq!(ports.depth(id), Ok(1));
+        assert_eq!(
+            ports.remove(id, RemoveMode::Poll),
+            Ok(RemoveResult::Packet(packet(10)))
+        );
+        assert_eq!(ports.wait_ready(id), Ok(false));
+        ports.release(id).unwrap();
+        assert_eq!(ports.wait_ready(id), Err(STATUS_INVALID_HANDLE));
     }
 
     #[test]

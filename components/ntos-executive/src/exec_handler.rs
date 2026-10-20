@@ -11914,6 +11914,11 @@ impl ExecNtHandler {
                 }
                 Ok(Some(WaitObject::job(id)))
             }
+            Some(nt_process::HandleObject::IoCompletion(id)) => {
+                self.io_completion_id_for(handle, required_access)?;
+                self.io_completion_ports.wait_ready(id)?;
+                Ok(Some(WaitObject::io_completion(id)))
+            }
             Some(_) | None => Ok(None),
         }
     }
@@ -12102,6 +12107,10 @@ impl ExecNtHandler {
                 .pm
                 .retain_job_wait_reference(object.id() as nt_process::job::JobId)
                 .map(|()| nt_kernel_exec::EventLeaseId::NULL),
+            WaitObject::KIND_IO_COMPLETION => self
+                .io_completion_ports
+                .retain(object.id() as u32)
+                .map(|()| nt_kernel_exec::EventLeaseId::NULL),
             _ => Err(STATUS_INVALID_HANDLE),
         }
     }
@@ -12171,6 +12180,9 @@ impl ExecNtHandler {
                 self.drain_job_destructions();
                 Ok(())
             }
+            WaitObject::KIND_IO_COMPLETION => {
+                self.try_release_io_completion_reference(object.id() as u32)
+            }
             _ => Err(STATUS_INVALID_HANDLE),
         }
     }
@@ -12198,6 +12210,10 @@ impl ExecNtHandler {
             WaitObject::KIND_JOB => self
                 .pm
                 .is_job_signaled(object.id() as nt_process::job::JobId),
+            WaitObject::KIND_IO_COMPLETION => self
+                .io_completion_ports
+                .wait_ready(object.id() as u32)
+                .unwrap_or(false),
             _ => false,
         }
     }
@@ -12224,7 +12240,8 @@ impl ExecNtHandler {
             | WaitObject::KIND_FAT_FILE
             | WaitObject::KIND_FAT_DIRECTORY
             | WaitObject::KIND_OVERLAY_FILE
-            | WaitObject::KIND_JOB => Consumed,
+            | WaitObject::KIND_JOB
+            | WaitObject::KIND_IO_COMPLETION => Consumed,
             _ => NotReady,
         }
     }
@@ -12339,6 +12356,11 @@ impl ExecNtHandler {
                 );
             }
             self.io_completion_wake = Some((waiter, wake_packet));
+            // A queued successor still signals object waits even though this remover
+            // receives the oldest packet directly.
+            if self.io_completion_ports.wait_ready(object_id).unwrap_or(false) {
+                unsafe { wait_wake_dispatcher_set(self) };
+            }
             return nt_io_completion::STATUS_SUCCESS;
         }
         trace_io_completion_packet(
@@ -12350,9 +12372,13 @@ impl ExecNtHandler {
             0,
             packet,
         );
-        self.io_completion_ports
-            .enqueue(object_id, packet)
-            .map_or_else(|status| status, |_| nt_io_completion::STATUS_SUCCESS)
+        match self.io_completion_ports.enqueue(object_id, packet) {
+            Ok(()) => {
+                unsafe { wait_wake_dispatcher_set(self) };
+                nt_io_completion::STATUS_SUCCESS
+            }
+            Err(status) => status,
+        }
     }
 
     pub(crate) fn signal_file_completion(&mut self, file_id: u64, status: u32) -> u32 {
