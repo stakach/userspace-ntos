@@ -512,13 +512,15 @@ pub const LSASS_LISTENER3_BADGE: u64 = 14;
 // The established SM/CSR/RPC roles retain their specialized layouts. An NtCreateThread whose
 // target is the current process can use this generic high-lane layout at the same target VAs in
 // each process (safe because every process has a distinct VSpace) and a per-pi mirror/scratch.
-pub const TP_WORKER_PI_COUNT: usize = 5;
-pub const TP_WORKER_LEGACY_SLOT_COUNT: usize = 2;
+const TP_WORKER_LAYOUT: nt_user_host::worker_lane_layout::WorkerLaneLayout =
+    nt_user_host::worker_lane_layout::HOSTED_WORKER_LAYOUT;
+pub const TP_WORKER_PI_COUNT: usize = TP_WORKER_LAYOUT.legacy_processes();
+pub const TP_WORKER_LEGACY_SLOT_COUNT: usize = TP_WORKER_LAYOUT.legacy_slots();
 pub const TP_WORKER_SLOT_COUNT: usize = PM_RUNTIME_THREAD_SLOTS;
 pub const TP_WORKER_BADGE_BASE: u64 = 16;
 pub const TP_WORKER_AUX_BADGE_BASE: u64 = 0x200;
 pub const TP_WORKER_EXEC_BASE: u64 = 0x0000_0100_13A0_0000;
-pub const TP_WORKER_EXEC_STRIDE: u64 = 0x0004_0000;
+pub const TP_WORKER_EXEC_STRIDE: u64 = TP_WORKER_LAYOUT.stride();
 pub const TP_WORKER_ENV_SCRATCH_OFFSET: u64 = 0x0002_0000;
 pub const TP_WORKER_SLOT1_REGION_BASE: u64 = 0x0000_0100_13E0_0000;
 pub const TP_WORKER_SLOT0_REGION_BASE: u64 = TP_WORKER_SLOT1_REGION_BASE - TP_WORKER_EXEC_STRIDE;
@@ -537,19 +539,16 @@ pub const TP_WORKER_SLOT1_EXEC_BASE: u64 = 0x0000_0100_13C0_0000;
 /// Executive-side windows for worker identities outside the legacy slot-0/slot-1, first-five-pi
 /// layout. The two legacy `TP_WORKER_*_EXEC_BASE` regions are laid out as `base + pi * STRIDE` and
 /// are only disjoint for `pi < TP_WORKER_PI_COUNT`; later hosted processes and extra worker slots get
-/// densely-packed `(pi, slot)` regions here: a free high band between the file-buffer POOL
-/// (`0x1500`+24*2 MiB = `0x1800`) and the hosted-driver execution arena. Legacy slots for
-/// `pi < TP_WORKER_PI_COUNT` are byte-identical to before.
-pub const TP_WORKER_AUX_EXEC_BASE: u64 = 0x0000_0100_1800_0000;
+/// densely-packed `(pi, slot)` regions in a dedicated executive-only high band. Legacy slots for
+/// `pi < TP_WORKER_PI_COUNT` retain their established addresses.
+pub const TP_WORKER_AUX_EXEC_BASE: u64 = TP_WORKER_LAYOUT.base();
+pub const TP_WORKER_AUX_EXEC_LIMIT: u64 = 0x0000_0105_0000_0000;
 
 #[inline]
 pub const fn tp_worker_aux_index(pi: usize, slot: usize) -> usize {
-    if pi < TP_WORKER_PI_COUNT {
-        (slot - TP_WORKER_LEGACY_SLOT_COUNT) * TP_WORKER_PI_COUNT + pi
-    } else {
-        (TP_WORKER_SLOT_COUNT - TP_WORKER_LEGACY_SLOT_COUNT) * TP_WORKER_PI_COUNT
-            + (pi - TP_WORKER_PI_COUNT) * TP_WORKER_SLOT_COUNT
-            + slot
+    match TP_WORKER_LAYOUT.aux_index(pi, slot) {
+        Some(index) => index,
+        None => panic!("invalid auxiliary worker lane"),
     }
 }
 
@@ -572,24 +571,10 @@ pub const fn tp_worker_identity_from_badge(badge: u64) -> Option<(usize, usize)>
         ))
     } else {
         let aux_offset = badge.wrapping_sub(TP_WORKER_AUX_BADGE_BASE);
-        let live_extra = (TP_WORKER_SLOT_COUNT - TP_WORKER_LEGACY_SLOT_COUNT) * TP_WORKER_PI_COUNT;
-        if aux_offset < live_extra as u64 {
-            let index = aux_offset as usize;
-            Some((
-                index % TP_WORKER_PI_COUNT,
-                TP_WORKER_LEGACY_SLOT_COUNT + index / TP_WORKER_PI_COUNT,
-            ))
+        if aux_offset < TP_WORKER_LAYOUT.aux_capacity() as u64 {
+            TP_WORKER_LAYOUT.decode_aux_index(aux_offset as usize)
         } else {
-            let later_offset = aux_offset - live_extra as u64;
-            if later_offset < ((MAX_PI - TP_WORKER_PI_COUNT) * TP_WORKER_SLOT_COUNT) as u64 {
-                let index = later_offset as usize;
-                Some((
-                    TP_WORKER_PI_COUNT + index / TP_WORKER_SLOT_COUNT,
-                    index % TP_WORKER_SLOT_COUNT,
-                ))
-            } else {
-                None
-            }
+            None
         }
     }
 }
@@ -639,7 +624,10 @@ pub const fn tp_worker_stack_mirror_va(pi: usize, slot: usize) -> u64 {
         };
         base + pi as u64 * TP_WORKER_EXEC_STRIDE
     } else {
-        TP_WORKER_AUX_EXEC_BASE + tp_worker_aux_index(pi, slot) as u64 * TP_WORKER_EXEC_STRIDE
+        match TP_WORKER_LAYOUT.mirror_base(pi, slot) {
+            Some(base) => base,
+            None => panic!("invalid auxiliary worker mirror"),
+        }
     }
 }
 
@@ -833,7 +821,8 @@ const _: () = {
     ));
     assert!(TP_WORKER_AUX_BADGE_BASE >= 0x100);
     assert!(TP_WORKER_SLOT_COUNT > TP_WORKER_LEGACY_SLOT_COUNT);
-    assert!(TP_WORKER_SLOT_COUNT <= 16);
+    assert!(TP_WORKER_SLOT_COUNT <= 64);
+    assert!(MAX_PI == TP_WORKER_LAYOUT.processes());
     assert!(tp_worker_badge(0, 0) == 16);
     assert!(tp_worker_badge(TP_WORKER_PI_COUNT - 1, 0) == 20);
     assert!(tp_worker_badge(0, 1) == 21);
@@ -874,18 +863,11 @@ const _: () = {
         tp_worker_stack_mirror_va(TP_WORKER_PI_COUNT - 1, TP_WORKER_LEGACY_SLOT_COUNT)
             >= TP_WORKER_AUX_EXEC_BASE
     );
-    // The AUX region must not alias either legacy mirror region, and must stay below the hosted
-    // driver execution arena.
+    // The AUX region occupies a dedicated high band after the contiguous RAM aperture.
     assert!(TP_WORKER_AUX_EXEC_BASE >= TP_WORKER_SLOT1_EXEC_BASE + 0x20_0000);
-    assert!(
-        tp_worker_env_scratch_va(MAX_PI - 1, TP_WORKER_SLOT_COUNT - 1) + 0x4000
-            <= crate::driver_launch::FSD_EXEC_BASE
-    );
+    assert!(TP_WORKER_AUX_EXEC_BASE >= driver_launch::hosted_contiguous_ram_broker::APERTURE_END);
     assert!(tp_worker_stack_mirror_va(0, TP_WORKER_LEGACY_SLOT_COUNT) == TP_WORKER_AUX_EXEC_BASE);
-    assert!(
-        tp_worker_env_scratch_va(MAX_PI - 1, TP_WORKER_SLOT_COUNT - 1) + 0x4000
-            <= allocator::HEAP_BASE as u64
-    );
+    assert!(TP_WORKER_LAYOUT.fits_before(TP_WORKER_AUX_EXEC_LIMIT));
     assert!(
         tp_worker_stack_mirror_va(TP_WORKER_PI_COUNT, 0)
             == TP_WORKER_AUX_EXEC_BASE
@@ -26544,7 +26526,7 @@ static PM_HANDLE_CAP_GROWTHS: AtomicU64 = AtomicU64::new(0);
 /// a reusable seL4/VA mechanism lane that can host any ordinary NT thread in that process. The
 /// current fixed-address userspace layout derives target stack/TEB/IPC/trampoline VAs and executive
 /// mirrors from this value, while ProcessManager remains the policy authority for real ETHREADs.
-const PM_RUNTIME_THREAD_SLOTS: usize = 16;
+const PM_RUNTIME_THREAD_SLOTS: usize = TP_WORKER_LAYOUT.slots();
 /// Runtime `NtCreateThread`s refused because no native execution lease is free. Counted
 /// (and the first few reported with the lease state) because the ONLY thing the caller ever sees is
 /// `STATUS_INSUFFICIENT_RESOURCES` — rpcrt4 answers it by silently dropping an RPC connection.

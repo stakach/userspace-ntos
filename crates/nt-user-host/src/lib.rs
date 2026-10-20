@@ -86,6 +86,7 @@ pub mod thread_memory_retirement_access;
 pub mod thread_charge_retirement;
 pub mod thread_stack_release;
 pub mod thread_resources;
+pub mod worker_lane_layout;
 pub mod thread_registry;
 pub mod thread_reconciliation;
 pub mod thread_retirement;

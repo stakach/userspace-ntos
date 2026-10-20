@@ -27,7 +27,8 @@ fn v2_fold_owns_cm_checkpoint_and_exact_reserve_until_two_slots_and_rollover() {
         assert!(fold.contains(contract), "native fold lost {contract}");
     }
     let image = fold.find("replace_boot_file(").unwrap();
-    let capture = fold.find("export_volume_snapshot(").expect("one folded image capture");
+    let capture = fold.find("snapshot_capture::CapturedSnapshot::capture(&work.lease, fs)")
+        .expect("one folded image capture");
     let first = fold.find("commit_next_with_wal_manifest(").unwrap();
     let second = fold[first + 1..].find("commit_next_with_wal_manifest(")
         .expect("second folded snapshot slot") + first + 1;
@@ -35,6 +36,10 @@ fn v2_fold_owns_cm_checkpoint_and_exact_reserve_until_two_slots_and_rollover() {
     let ack = fold.find("config_manager_acknowledge_system_hive_checkpoint(").unwrap();
     assert!(image < capture && capture < first && first < second && second < rollover && rollover < ack,
         "CM image fold, two slots, epoch rollover and CM ACK must retain one order");
+    assert_eq!(fold.matches("commit_next_with_wal_manifest(&mut work.lease, snapshot_bytes, folded)").count(), 2,
+        "both folded slots must commit the same captured bytes");
+    assert!(second < fold.find("drop(snapshot);").expect("release only after both writes"),
+        "the captured image must outlive both physical writes");
     assert!(!fold.contains("config_manager_abort_system_hive_checkpoint("),
         "an uncertain physical fold cannot abandon its CM checkpoint");
 }

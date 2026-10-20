@@ -44,9 +44,9 @@ fn mounted_v2_volume_checkpoint_captures_one_image_before_disk_effects() {
         .expect("mounted checkpoint entrypoint");
     let end = source[start..].find("\n/// ").map(|offset| start + offset).unwrap_or(source.len());
     let checkpoint = &source[start..end];
-    assert!(checkpoint.contains("capture_volume_snapshot()"),
+    assert!(checkpoint.contains("snapshot_capture::CapturedSnapshot::capture(&dev, fs)"),
         "v2 checkpoint must capture one immutable image before any physical write");
-    assert!(checkpoint.find("capture_volume_snapshot()").unwrap()
+    assert!(checkpoint.find("snapshot_capture::CapturedSnapshot::capture(&dev, fs)").unwrap()
         < checkpoint.find("checkpoint_volume_snapshot(").unwrap());
     assert!(checkpoint.contains("WRITABLE_FS_SNAPSHOT_DIRTY.store(true"),
         "failed pre-effect capture must preserve the dirty owner");

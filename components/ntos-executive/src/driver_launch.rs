@@ -331,7 +331,7 @@ pub(crate) const FSD_SERVICE_PCI_ROUTE_QUERY_LABEL: u64 = hosted_driver_pci_rout
 #[path = "hosted_driver_contiguous_memory.rs"]
 mod hosted_driver_contiguous_memory;
 #[path = "hosted_contiguous_ram_broker.rs"]
-mod hosted_contiguous_ram_broker;
+pub(crate) mod hosted_contiguous_ram_broker;
 #[path = "hosted_driver_physical_ranges.rs"]
 mod hosted_driver_physical_ranges;
 #[path = "hosted_driver_cr8_fault.rs"]
@@ -14371,7 +14371,9 @@ fn hosted_worker_component_base_for_slot(component_slot: usize) -> Option<u64> {
 }
 
 fn hosted_worker_exec_base_for_alias(exec_alias_slot: u64) -> Option<u64> {
-    FSD_WORKER_EXEC_ALIAS_BASE.checked_add(exec_alias_slot.checked_mul(FSD_WORKER_STRIDE)?)
+    let base = FSD_WORKER_EXEC_ALIAS_BASE.checked_add(exec_alias_slot.checked_mul(FSD_WORKER_STRIDE)?)?;
+    (base.checked_add(FSD_WORKER_STRIDE)? <= hosted_contiguous_ram_broker::APERTURE_BASE)
+        .then_some(base)
 }
 
 fn hosted_worker_component_base_from_rsp(rsp: u64) -> Option<u64> {

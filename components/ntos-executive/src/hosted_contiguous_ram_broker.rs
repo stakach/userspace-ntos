@@ -12,9 +12,10 @@ use nt_hosted_runtime::{ContiguousRamLayout, ContiguousRamOwner, ContiguousRamPr
 
 const PAGE: u64 = 4096;
 const MAX_CHILD_BYTES: u64 = 64 << 20;
-const APERTURE_BASE: u64 = 0x0000_0103_0000_0000;
+pub(crate) const APERTURE_BASE: u64 = 0x0000_0103_0000_0000;
 const APERTURE_STRIDE: u64 = MAX_CHILD_BYTES;
 const APERTURE_SLOTS: u64 = 8;
+pub(crate) const APERTURE_END: u64 = APERTURE_BASE + APERTURE_SLOTS * APERTURE_STRIDE;
 const STATUS_INVALID_PARAMETER: i32 = 0xc000_000du32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xc000_0022u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: i32 = 0xc000_009au32 as i32;
@@ -24,7 +25,7 @@ const STATUS_SUCCESS: i32 = 0;
 
 const _: () = assert!(APERTURE_BASE >= FSD_WORKER_EXEC_ALIAS_BASE + 0x8000_0000);
 const _: () = assert!(APERTURE_BASE >= FSD_EXEC_LIMIT);
-const _: () = assert!(APERTURE_BASE + APERTURE_SLOTS * APERTURE_STRIDE < 0x0000_0200_0000_0000);
+const _: () = assert!(APERTURE_END < 0x0000_0200_0000_0000);
 
 struct Allocation {
     slot: usize,
