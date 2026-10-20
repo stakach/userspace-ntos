@@ -976,33 +976,37 @@ impl<const PACKETS: usize> CompletionPort<PACKETS> {
     }
 }
 
-pub struct CompletionPortTable<const PORTS: usize, const PACKETS: usize> {
-    ports: [CompletionPort<PACKETS>; PORTS],
+/// Stable numeric port identities backed by fallible growth. Live references prevent slot reuse;
+/// the packet bound is per port, independent of the number of hosted processes.
+pub struct CompletionPortTable<const PACKETS: usize> {
+    ports: Vec<CompletionPort<PACKETS>>,
 }
 
-impl<const PORTS: usize, const PACKETS: usize> CompletionPortTable<PORTS, PACKETS> {
+impl<const PACKETS: usize> CompletionPortTable<PACKETS> {
     pub const fn new() -> Self {
-        assert!(PORTS > 0);
         assert!(PACKETS > 0);
-        Self {
-            ports: [CompletionPort::empty(); PORTS],
-        }
+        Self { ports: Vec::new() }
     }
 
     pub fn clear(&mut self) {
-        for port in self.ports.iter_mut() {
-            port.reset();
-        }
+        self.ports.clear();
     }
 
     /// Allocate one distinct completion-port body. Object Manager naming and collision policy live
     /// above this queue/reference store; the returned reference belongs to the first handle.
     pub fn create(&mut self, concurrency: u32) -> Result<u32, u32> {
-        let index = self
-            .ports
-            .iter()
-            .position(|port| !port.occupied)
-            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        let index = match self.ports.iter().position(|port| !port.occupied) {
+            Some(index) => index,
+            None => {
+                let index = self.ports.len();
+                let _ = u32::try_from(index).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+                self.ports
+                    .try_reserve(1)
+                    .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+                self.ports.push(CompletionPort::empty());
+                index
+            }
+        };
         let port = &mut self.ports[index];
         port.occupied = true;
         port.references = 1;
@@ -1087,7 +1091,7 @@ impl<const PORTS: usize, const PACKETS: usize> CompletionPortTable<PORTS, PACKET
     }
 }
 
-impl<const PORTS: usize, const PACKETS: usize> Default for CompletionPortTable<PORTS, PACKETS> {
+impl<const PACKETS: usize> Default for CompletionPortTable<PACKETS> {
     fn default() -> Self {
         Self::new()
     }
@@ -1102,7 +1106,7 @@ mod tests {
 
     use super::*;
 
-    type Ports = CompletionPortTable<2, 2>;
+    type Ports = CompletionPortTable<2>;
 
     #[test]
     fn completion_publication_distinguishes_inline_errors_from_deferred_errors() {
@@ -1179,11 +1183,23 @@ mod tests {
     }
 
     #[test]
-    fn object_capacity_fails_truthfully() {
+    fn objects_grow_without_a_worker_lifetime_limit() {
         let mut ports = Ports::new();
-        ports.create(1).unwrap();
-        ports.create(1).unwrap();
-        assert_eq!(ports.create(1), Err(STATUS_INSUFFICIENT_RESOURCES));
+        let ids: Vec<u32> = (0..3).map(|_| ports.create(1).unwrap()).collect();
+        assert_eq!(ids, [0, 1, 2]);
+    }
+
+    #[test]
+    fn independent_process_pools_can_create_more_than_legacy_worker_count() {
+        let mut ports = CompletionPortTable::<8>::new();
+        let ids: Vec<u32> = (0..6).map(|_| ports.create(0).unwrap()).collect();
+        assert_eq!(ids, [0, 1, 2, 3, 4, 5]);
+        ports.enqueue(ids[5], packet(42)).unwrap();
+        assert_eq!(ports.depth(ids[0]), Ok(0));
+        assert_eq!(
+            ports.remove(ids[5], RemoveMode::Poll),
+            Ok(RemoveResult::Packet(packet(42)))
+        );
     }
 
     #[test]

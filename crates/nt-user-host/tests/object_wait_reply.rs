@@ -44,7 +44,7 @@ struct Fixture {
     table: ObjectWaiterTable<Wait>,
     id: ObjectWaiterIdentity,
     files: FileCompletionTable<1>,
-    ports: CompletionPortTable<1, 1>,
+    ports: CompletionPortTable<1>,
     references: usize,
     released: usize,
     sends: usize,

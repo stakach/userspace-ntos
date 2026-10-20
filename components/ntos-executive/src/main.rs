@@ -24005,7 +24005,7 @@ unsafe fn initialize_exec_nt_handler_once(
     )
 }
 
-type ExecIoCompletionPortTable = nt_io_completion::CompletionPortTable<TP_WORKER_PI_COUNT, 8>;
+type ExecIoCompletionPortTable = nt_io_completion::CompletionPortTable<8>;
 type ExecFileCompletionTable = nt_io_completion::FileCompletionTable<128>;
 type ExecProcessMechanismTable = nt_user_host::ProcessMechanismTable<MAX_PI>;
 type ExecThreadMechanismTable = nt_user_host::ThreadMechanismTable<MAX_PI, PM_RUNTIME_THREAD_SLOTS>;
