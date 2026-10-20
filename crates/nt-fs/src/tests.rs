@@ -2329,6 +2329,32 @@ fn snapshot_block_store_rejects_bad_geometry_oversize_and_corruption() {
 }
 
 #[test]
+fn reusable_snapshot_capture_keeps_exact_bytes_and_allocation_across_mutations() {
+    let mut fs = FileSystem::new(MemFs::new());
+    let initial = fs.export_volume_snapshot().unwrap();
+    let mut capture = alloc::vec::Vec::with_capacity(initial.len() + 4096);
+    let address = capture.as_ptr();
+    fs.export_volume_snapshot_into(&mut capture).unwrap();
+    assert_eq!(capture, initial);
+    assert_eq!(capture.as_ptr(), address);
+
+    let file = fs.zw_create_file(
+        r"\??\C:\capture.txt",
+        FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(file.status, STATUS_SUCCESS);
+    assert_eq!(fs.zw_write_file(file.handle, None, b"updated").0, STATUS_SUCCESS);
+    let updated = fs.export_volume_snapshot().unwrap();
+    fs.export_volume_snapshot_into(&mut capture).unwrap();
+    assert_eq!(capture, updated);
+    assert_eq!(capture.as_ptr(), address);
+}
+
+#[test]
 fn memfs_snapshot_preserves_deleted_file_id_high_water() {
     let mut fs = FileSystem::new(MemFs::new());
     let deleted_path = r"\??\C:\deleted.txt";

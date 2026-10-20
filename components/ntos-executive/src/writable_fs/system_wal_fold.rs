@@ -161,24 +161,23 @@ unsafe fn fold_retained(
     };
     // Both folded slots must contain the same CM image. Capture before the first disk write so
     // native I/O reentry cannot change the live tree between CRC and payload serialization.
-    let snapshot_bytes = fs.export_volume_snapshot().map_err(|error| match error {
-        nt_fs::MemFsSnapshotError::OutOfMemory => nt_fs::STATUS_INSUFFICIENT_RESOURCES,
-        _ => 0xC000_0001,
-    })?;
+    let snapshot = snapshot_capture::CapturedSnapshot::capture(&work.lease, fs)?;
+    let snapshot_bytes = snapshot.as_slice();
     let bytes = snapshot_bytes.len();
-    let generation = store.commit_next_with_wal_manifest(&mut work.lease, &snapshot_bytes, folded)
+    let generation = store.commit_next_with_wal_manifest(&mut work.lease, snapshot_bytes, folded)
         .map_err(snapshot_store_error_status)?;
     WRITABLE_FS_SNAPSHOT_COMMITS.fetch_add(1, Ordering::Relaxed);
     WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION.store(generation, Ordering::Relaxed);
     WRITABLE_FS_SNAPSHOT_COMMIT_BYTES.store(bytes as u64, Ordering::Relaxed);
     // The second commit replaces the other slot. Both must carry the folded base before the
     // rollover can publish a RESETTING header or erase any old WAL sectors.
-    let generation = store.commit_next_with_wal_manifest(&mut work.lease, &snapshot_bytes, folded)
+    let generation = store.commit_next_with_wal_manifest(&mut work.lease, snapshot_bytes, folded)
         .map_err(snapshot_store_error_status)?;
     WRITABLE_FS_SNAPSHOT_COMMITS.fetch_add(1, Ordering::Relaxed);
     WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION.store(generation, Ordering::Relaxed);
     WRITABLE_FS_SNAPSHOT_COMMIT_BYTES.store(bytes as u64, Ordering::Relaxed);
 
+    drop(snapshot);
     let (start, sectors) = snapshot_storage::wal_bounds(&work.lease)?;
     if needs_epoch_rollover(manifest.high_water_end_lba, sectors) {
         let expected = nt_fs::WalSnapshotAnchor {

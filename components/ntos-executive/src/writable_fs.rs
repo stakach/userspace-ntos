@@ -36,6 +36,9 @@ use nt_fs::SnapshotBlockDevice;
 #[path = "writable_fs/snapshot_storage.rs"]
 pub(crate) mod snapshot_storage;
 
+#[path = "writable_fs/snapshot_capture.rs"]
+mod snapshot_capture;
+
 #[path = "writable_fs/registry_journal.rs"]
 pub(crate) mod registry_journal;
 
@@ -737,16 +740,6 @@ unsafe fn checkpoint_volume_snapshot(
     }
 }
 
-unsafe fn capture_volume_snapshot() -> Result<alloc::vec::Vec<u8>, u32> {
-    let Some(fs) = (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).as_ref() else {
-        return Err(nt_fs::STATUS_INVALID_HANDLE);
-    };
-    fs.export_volume_snapshot().map_err(|error| match error {
-        nt_fs::MemFsSnapshotError::OutOfMemory => nt_fs::STATUS_INSUFFICIENT_RESOURCES,
-        _ => 0xC000_0001,
-    })
-}
-
 /// Prove the mounted SYSTEM WAL has a complete, paired durable prefix. Every v2 mutation
 /// crosses its marker and both anchor barriers before its caller receives success; the reserve
 /// lease excludes a mutation still crossing those barriers. NtFlushKey needs this durability
@@ -806,7 +799,11 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
     // Capture the v2 payload before physical I/O can reenter the executive. A second pass over
     // the live tree could produce different length or CRC after the first payload sectors land.
     let captured_image = if wal_format {
-        match capture_volume_snapshot() {
+        let Some(fs) = (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).as_ref() else {
+            WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+            return Err(nt_fs::STATUS_INVALID_HANDLE);
+        };
+        match snapshot_capture::CapturedSnapshot::capture(&dev, fs) {
             Ok(image) => Some(image),
             Err(status) => {
                 WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
@@ -816,7 +813,11 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
     } else {
         None
     };
-    match checkpoint_volume_snapshot(&mut dev, wal_manifest, captured_image.as_deref()) {
+    match checkpoint_volume_snapshot(
+        &mut dev,
+        wal_manifest,
+        captured_image.as_ref().map(snapshot_capture::CapturedSnapshot::as_slice),
+    ) {
         Ok((generation, bytes)) => {
             WRITABLE_FS_SNAPSHOT_COMMITS.fetch_add(1, Ordering::Relaxed);
             WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION.store(generation, Ordering::Relaxed);

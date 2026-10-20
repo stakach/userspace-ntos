@@ -795,6 +795,14 @@ impl MemFs {
     /// Serialize the volume tree to a versioned, checksummed snapshot. Open FILE_OBJECT handles are
     /// intentionally not part of the image; a restored boot reopens files through normal Zw paths.
     pub fn to_snapshot(&self) -> Result<Vec<u8>, MemFsSnapshotError> {
+        let mut out = Vec::new();
+        self.write_snapshot_into(&mut out)?;
+        Ok(out)
+    }
+
+    /// Replace a caller-owned capture with the exact current snapshot, retaining its allocation
+    /// for later captures. The caller must keep these bytes immutable through physical commit.
+    pub fn write_snapshot_into(&self, out: &mut Vec<u8>) -> Result<(), MemFsSnapshotError> {
         let root = self.node(0).ok_or(MemFsSnapshotError::InvalidRecord)?;
         let mut record_count = 1u32;
         let mut path = String::new();
@@ -809,21 +817,21 @@ impl MemFs {
             )?)
             .ok_or(MemFsSnapshotError::InvalidRecord)?;
 
-        let mut out = Vec::new();
         let total_len = MEMFS_SNAPSHOT_HEADER_LEN
             .checked_add(payload_len)
             .ok_or(MemFsSnapshotError::InvalidRecord)?;
-        out.try_reserve_exact(total_len)
+        out.clear();
+        out.try_reserve(total_len)
             .map_err(|_| MemFsSnapshotError::OutOfMemory)?;
         out.resize(MEMFS_SNAPSHOT_HEADER_LEN, 0);
-        self.write_snapshot_record("", root, false, FileShortName::EMPTY, &mut out)?;
+        self.write_snapshot_record("", root, false, FileShortName::EMPTY, out)?;
         let mut written_records = 1u32;
         let mut written_files = Vec::new();
         self.write_snapshot_children(
             0,
             &mut path,
             &mut written_files,
-            &mut out,
+            out,
             &mut written_records,
         )?;
         if written_records != record_count || out.len() != total_len {
@@ -836,7 +844,7 @@ impl MemFs {
             payload_len as u64,
             payload_crc,
         );
-        Ok(out)
+        Ok(())
     }
 
     /// Restore a volume from [`Self::to_snapshot`] bytes.
@@ -4006,6 +4014,15 @@ impl FileSystem {
     /// included.
     pub fn export_volume_snapshot(&self) -> Result<Vec<u8>, MemFsSnapshotError> {
         self.volume.to_snapshot()
+    }
+
+    /// Capture into retained storage for checkpoints that must keep one immutable image across
+    /// native I/O reentry and reuse the allocation on later commits.
+    pub fn export_volume_snapshot_into(
+        &self,
+        out: &mut Vec<u8>,
+    ) -> Result<(), MemFsSnapshotError> {
+        self.volume.write_snapshot_into(out)
     }
 
     /// Reclaim immutable file-data blobs made unreachable by truncate, replace, or unlink.
