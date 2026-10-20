@@ -306,7 +306,11 @@ pub(crate) unsafe fn begin_connect(handler: &mut ExecNtHandler,
     let caller = caller(handler)?;
     let handler_ptr: *mut ExecNtHandler = handler;
     let captured = nt_alpc_native_later::capture_connect_port(args,
-        |address, out| (*handler_ptr).xas_read(address, out),
+        |address, out| {
+            // The port name can live in an unresident, dynamically mapped SEC_IMAGE view.
+            let pi = (*handler_ptr).pi;
+            (*handler_ptr).process_memory_read_status(pi, address, out).is_ok()
+        },
         |address, len| (*handler_ptr).probe_user_output(address, len))?;
     if captured.timeout.is_some() || captured.send_attributes.is_some()
     { return Err(STATUS_NOT_SUPPORTED); }
