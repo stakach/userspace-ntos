@@ -496,7 +496,7 @@ fn reset_setup_provision_trace() {
 
 struct ExecJournalNonSystemSetupSeedTarget<'a> {
     handler: &'a mut ExecNtHandler,
-    created_keys: u32,
+    changed_keys: u32,
     changed_values: u32,
     failed: bool,
     last_status: u32,
@@ -506,7 +506,7 @@ impl<'a> ExecJournalNonSystemSetupSeedTarget<'a> {
     fn new(handler: &'a mut ExecNtHandler) -> Self {
         Self {
             handler,
-            created_keys: 0,
+            changed_keys: 0,
             changed_values: 0,
             failed: false,
             last_status: 0,
@@ -514,7 +514,7 @@ impl<'a> ExecJournalNonSystemSetupSeedTarget<'a> {
     }
 
     fn changed(&self) -> bool {
-        self.created_keys != 0 || self.changed_values != 0
+        self.changed_keys != 0 || self.changed_values != 0
     }
 
     fn note_failure(&mut self, status: u32) {
@@ -536,14 +536,18 @@ impl nt_hive_core::ReactOsSetupSeedTarget for ExecJournalNonSystemSetupSeedTarge
             self.note_failure(STATUS_INVALID_HANDLE);
             return false;
         }
-        let existed = self.handler.mutable_registry_key_by_path(path).is_some();
+        let had_security = self
+            .handler
+            .mutable_registry_key_by_path(path)
+            .and_then(|key| self.handler.mutable_registry_key_security_descriptor(key))
+            .is_some_and(|descriptor| !descriptor.is_empty());
         match self
             .handler
             .ensure_mutable_registry_key_by_path_journaled(path)
         {
             Ok(_) => {
-                if !existed {
-                    self.created_keys = self.created_keys.saturating_add(1);
+                if !had_security {
+                    self.changed_keys = self.changed_keys.saturating_add(1);
                 }
                 true
             }
@@ -5230,37 +5234,66 @@ impl ExecNtHandler {
         parent: ResolvedHiveKey,
         leaf: &str,
     ) -> Result<ResolvedHiveKey, u32> {
-        let relative = self
-            .mutable_child_relative_path(parent, leaf)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-        let path = self
-            .mutable_hive_checkpoint_path_owned(parent.hive)
-            .ok_or(STATUS_INVALID_HANDLE)?;
-        let key = {
-            let hive = self
-                .mutable_hives
-                .hive_mut(parent.hive)
-                .ok_or(STATUS_INVALID_HANDLE)?;
-            let provider = crate::writable_fs::WritableHiveIoProvider::new(&path);
-            let mut manager = nt_hive_core::HiveManager::for_live_hive(provider, hive);
-            let mut key = None;
-            manager
-                .mutate_with_live_apply(
-                    hive,
-                    nt_hive_core::HiveLogOp::CreateKey { path: &relative },
-                    |hive| {
-                        key = Some(hive.create_subkey(parent.key, leaf));
-                        true
-                    },
-                )
-                .map_err(Self::mutable_hive_journal_status)?;
-            key.ok_or(STATUS_INVALID_HANDLE)?
-        };
-        self.note_mutable_hive_journal_record(parent.hive);
-        Ok(ResolvedHiveKey {
-            hive: parent.hive,
-            key,
-        })
+        let descriptor = self.assign_seed_mutable_child_security(parent)?;
+        self.journal_create_secured_mutable_subkey(parent, leaf, None, &descriptor)
+    }
+
+    fn assign_seed_mutable_child_security(
+        &mut self,
+        parent: ResolvedHiveKey,
+    ) -> Result<alloc::vec::Vec<u8>, u32> {
+        let parent_security = self
+            .mutable_registry_key_security_descriptor(parent)
+            .ok_or(nt_security::STATUS_INVALID_SECURITY_DESCR)?;
+        let identity = self.pm.initial_system_identity().ok_or(STATUS_INVALID_HANDLE)?;
+        if !self.pm.validate_initial_system_caller(identity) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let primary = self
+            .pm
+            .process_primary_token(identity.process_id())
+            .ok_or(0xC000_007Cu32)?;
+        let client = self.pm.thread_impersonation(identity.thread_id()).map(|context| {
+            nt_security::SubjectClientIdentity {
+                token: context.token,
+                level: context.level,
+            }
+        });
+        let mut captured = nt_security::CapturedSubjectContext::capture(
+            &mut self.token_store,
+            primary,
+            client,
+            u64::from(identity.process_id()),
+        )?;
+        let result = (|| {
+            let subject = captured.resolve(&self.token_store)?;
+            let mut audit = nt_security::SecurityAssignmentAudit::default();
+            let descriptor = nt_security::assign_object_security_with_audit(
+                &nt_security::ObjectSecurityAssignment {
+                    primary: subject.primary,
+                    client: subject.client.as_ref().map(|client| {
+                        nt_security::SecurityAssignmentClient {
+                            token: client.token,
+                            level: client.level,
+                        }
+                    }),
+                    creator: None,
+                    parent: Some(&parent_security),
+                    mapping: &nt_security::KEY_GENERIC_MAPPING,
+                    is_container: true,
+                    mode: nt_security::ProcessorMode::KernelMode,
+                    object_type: None,
+                    inheritance: nt_security::SecurityAssignmentInheritance::Legacy,
+                },
+                &mut audit,
+            )?;
+            if audit != nt_security::SecurityAssignmentAudit::default() {
+                return Err(STATUS_NOT_SUPPORTED);
+            }
+            Ok(descriptor)
+        })();
+        captured.release(&mut self.token_store)?;
+        result
     }
 
     fn journal_delete_mutable_value(
@@ -7184,8 +7217,14 @@ impl ExecNtHandler {
         full_path: &str,
     ) -> Result<nt_hive_core::ResolvedHiveKey, u32> {
         let canon = self.overlay_canon(full_path);
-        if let Some(key) = self.mutable_registry_key_by_path(&canon) {
-            return Ok(key);
+        let existing = self.mutable_registry_key_by_path(&canon);
+        if let Some(key) = existing {
+            if self
+                .mutable_registry_key_security_descriptor(key)
+                .is_some_and(|descriptor| !descriptor.is_empty())
+            {
+                return Ok(key);
+            }
         }
         if !self.mutable_hive_owns_path(&canon) {
             return Err(STATUS_INVALID_HANDLE);
@@ -7197,7 +7236,9 @@ impl ExecNtHandler {
             return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
         }
         let parent = self.ensure_mutable_registry_key_by_path_journaled(parent_path)?;
-        if let Some(key) = self.mutable_registry_key_by_path(&canon) {
+        if let Some(key) = existing {
+            let descriptor = self.assign_seed_mutable_child_security(parent)?;
+            self.journal_set_mutable_key_security_descriptor(key, &descriptor)?;
             return Ok(key);
         }
         self.journal_create_mutable_subkey(parent, leaf)
@@ -7230,6 +7271,25 @@ impl ExecNtHandler {
             .map(alloc::string::String::from))
     }
 
+
+    fn mutable_registry_key_security_descriptor(
+        &self,
+        key: nt_hive_core::ResolvedHiveKey,
+    ) -> Option<alloc::vec::Vec<u8>> {
+        let descriptor = self.mutable_hives.key_security_descriptor(key);
+        let mount_root = self.mutable_hives.hive(key.hive)
+            .is_some_and(|hive| key.key == hive.root());
+        let mount_security = if matches!(key.hive, HIVE_SEL_SOFTWARE | HIVE_SEL_SECURITY | HIVE_SEL_SAM) {
+            &self.registry_machine_root_security_descriptor
+        } else {
+            &self.registry_user_root_security_descriptor
+        };
+        if mount_root {
+            Some(nt_security::mounted_hive_root_security(descriptor, mount_security).to_vec())
+        } else {
+            descriptor.map(alloc::vec::Vec::from)
+        }
+    }
 
     pub(crate) fn registry_key_security_descriptor(
         &self,

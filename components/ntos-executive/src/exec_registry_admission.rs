@@ -723,7 +723,7 @@ impl ExecNtHandler {
         Ok((OVERLAY_KEY_TAG | index as u32, true))
     }
 
-    fn journal_create_secured_mutable_subkey(
+    pub(crate) fn journal_create_secured_mutable_subkey(
         &mut self,
         parent: ResolvedHiveKey,
         name: &str,
