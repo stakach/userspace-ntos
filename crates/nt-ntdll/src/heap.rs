@@ -985,6 +985,18 @@ impl<B: Backing> Heap<B> {
         true
     }
 
+    /// Whether coalescing has restored the entire backing to one free block.
+    /// Only an empty peer may transfer its VM backing out of the logical process heap.
+    pub fn is_completely_free(&self) -> bool {
+        self.header_at_offset(0).is_some_and(|header| {
+            header.is_free() && header.prev_size == 0 && header.size == self.region_len
+        })
+    }
+
+    pub fn backing_len(&self) -> usize {
+        self.region_len
+    }
+
     /// Merge `block` with its physically-adjacent free predecessor and successor.
     ///
     /// # Safety
@@ -1149,6 +1161,39 @@ impl<B: Backing> Heap<B> {
         }
         Some(moved)
     }
+}
+
+/// Keep one empty peer for subsequent temporary allocations. Return a redundant empty backing
+/// for VM retirement, preferring the largest free segment as the cache entry.
+pub fn take_redundant_empty_peer<B: Backing, const N: usize>(
+    peers: &mut [Option<Heap<B>>; N],
+) -> Option<Heap<B>> {
+    let keep = peers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            entry
+                .as_ref()
+                .filter(|heap| heap.is_completely_free())
+                .map(|heap| (index, heap.backing_len()))
+        })
+        .max_by_key(|(_, len)| *len)?
+        .0;
+    let retire = peers.iter().enumerate().find_map(|(index, entry)| {
+        (index != keep && entry.as_ref().is_some_and(Heap::is_completely_free))
+            .then_some(index)
+    })?;
+    peers[retire].take()
+}
+
+/// Reserve enough backing for a growing copy allocation to coexist with its previous block.
+/// Bound spare committed memory for very large requests; the caller still returns OOM on overflow.
+pub fn process_heap_segment_size(requested_payload: usize) -> Option<usize> {
+    const MIN_SEGMENT: usize = 0x10_0000;
+    const MAX_SPARE: usize = 0x80_0000;
+    let spare = requested_payload.saturating_mul(3).min(MAX_SPARE);
+    let rounded = requested_payload.checked_add(spare)?.checked_add(0xffff)? & !0xffff;
+    Some(rounded.max(MIN_SEGMENT))
 }
 
 /// Reallocate within a logical process heap made of one primary heap and occupied peer slots.
@@ -1660,6 +1705,39 @@ mod tests {
             assert!(!h.free(p)); // double-free rejected
             assert!(h.size_of(p).is_none()); // freed -> no size
         }
+    }
+
+    #[test]
+    fn growing_copy_allocations_reuse_a_process_segment() {
+        let initial = 1_310_720usize;
+        let capacity = process_heap_segment_size(initial).unwrap();
+        let mut segment = heap(capacity);
+        let mut previous = segment.allocate(initial).unwrap();
+        for next_size in [1_327_104, 1_376_256, 1_441_792, 1_507_328, 1_572_864] {
+            let next = segment
+                .allocate(next_size)
+                .expect("growing copy remains within reserved segment");
+            assert!(unsafe { segment.free(previous) });
+            previous = next;
+        }
+        assert!(unsafe { segment.free(previous) });
+        assert!(segment.is_completely_free());
+        assert!(process_heap_segment_size(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn empty_peer_cache_keeps_the_largest_backing_and_never_retires_live_blocks() {
+        let mut peers = [Some(heap(4096)), Some(heap(8192)), Some(heap(2048))];
+        let live = peers[2].as_mut().unwrap().allocate(128).unwrap();
+        let retired = take_redundant_empty_peer(&mut peers).unwrap();
+        assert_eq!(retired.backing_len(), heap(4096).backing_len());
+        assert!(peers[0].is_none());
+        assert!(take_redundant_empty_peer(&mut peers).is_none());
+        assert!(unsafe { peers[2].as_mut().unwrap().free(live) });
+        let retired = take_redundant_empty_peer(&mut peers).unwrap();
+        assert_eq!(retired.backing_len(), heap(2048).backing_len());
+        assert!(take_redundant_empty_peer(&mut peers).is_none());
+        assert!(peers[1].as_ref().unwrap().is_completely_free());
     }
 
     #[test]

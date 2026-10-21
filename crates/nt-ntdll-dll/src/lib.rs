@@ -33,8 +33,8 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use nt_ntdll::heap::{
-    reallocate_in_process_segments, Heap, HeapRegistry, HeapRemoval, HeapUserInfo, HeapWalkError,
-    HeapWalkOutcome, RtlHeapWalkEntry,
+    process_heap_segment_size, reallocate_in_process_segments, take_redundant_empty_peer, Heap,
+    HeapRegistry, HeapRemoval, HeapUserInfo, HeapWalkError, HeapWalkOutcome, RtlHeapWalkEntry,
 };
 
 /// Step 4.0b — the `Rtl*` / `Ldr*` / `Dbg*` / CRT PE exports smss.exe imports (completes the export
@@ -154,11 +154,10 @@ type ProcessHeapRegistry = HeapRegistry<on_target::HeapBacking, PRIVATE_HEAP_CAP
 
 /// Extra VM-backed segments owned by the distinguished process heap. These are not separate native
 /// heap handles: `Peb->ProcessHeap` remains the handle callers pass to `RtlAllocateHeap`/`Free`.
+/// `RtlWalkHeap` reports the primary segment as ordinal 0 and each peer as a `u8` ordinal.
+/// Do not impose a smaller slot budget than the ABI can represent while VM can still grow.
 #[cfg(target_arch = "x86_64")]
-const PROCESS_HEAP_SEGMENT_CAPACITY: usize = 8;
-
-#[cfg(target_arch = "x86_64")]
-const PROCESS_HEAP_SEGMENT_MIN: usize = 0x10_0000;
+const PROCESS_HEAP_SEGMENT_CAPACITY: usize = u8::MAX as usize;
 
 /// The **real process heap** installed in-process by [`LdrpInitialize`] (Step 4.B). `None` until
 /// initialization; all later access is covered by [`PROCESS_HEAP_REGISTRY_LOCK`] so hosted worker
@@ -638,14 +637,6 @@ unsafe fn process_heap_segments_locked(
 }
 
 #[cfg(target_arch = "x86_64")]
-fn process_heap_segment_size(requested_payload: usize) -> Option<usize> {
-    requested_payload
-        .checked_add(0x1_ffff)
-        .map(|size| size & !0xffff)
-        .map(|size| size.max(PROCESS_HEAP_SEGMENT_MIN))
-}
-
-#[cfg(target_arch = "x86_64")]
 unsafe fn create_process_heap_segment(size: usize) -> Option<ProcessHeap> {
     let base = unsafe { on_target::nt_allocate_virtual_memory(size) };
     if base == 0 {
@@ -668,6 +659,15 @@ unsafe fn release_owned_heap(heap: ProcessHeap) {
     let backing = heap.destroy();
     if backing.owned {
         unsafe { on_target::nt_release_virtual_memory(backing.base as u64) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn retire_empty_process_segments(
+    segments: &mut [Option<ProcessHeap>; PROCESS_HEAP_SEGMENT_CAPACITY],
+) {
+    while let Some(heap) = take_redundant_empty_peer(segments) {
+        unsafe { release_owned_heap(heap) };
     }
 }
 
@@ -844,6 +844,9 @@ pub(crate) unsafe fn heap_alloc_with_flags(handle: *mut u8, size: usize, flags: 
                 return ptr;
             }
         }
+        let Some(slot_index) = segments.iter().position(Option::is_none) else {
+            return core::ptr::null_mut();
+        };
         let Some(segment_size) = process_heap_segment_size(size) else {
             return core::ptr::null_mut();
         };
@@ -854,11 +857,7 @@ pub(crate) unsafe fn heap_alloc_with_flags(handle: *mut u8, size: usize, flags: 
             release_owned_heap(heap);
             return core::ptr::null_mut();
         };
-        let Some(slot) = segments.iter_mut().find(|entry| entry.is_none()) else {
-            release_owned_heap(heap);
-            return core::ptr::null_mut();
-        };
-        *slot = Some(heap);
+        segments[slot_index] = Some(heap);
         ptr
     }
 }
@@ -882,10 +881,14 @@ pub(crate) unsafe fn heap_free(handle: *mut u8, ptr: *mut u8, flags: u32) -> boo
         return false;
     }
     unsafe {
-        process_heap_segments_locked()
-            .iter_mut()
-            .filter_map(Option::as_mut)
-            .any(|heap| heap.free(ptr))
+        let segments = process_heap_segments_locked();
+        for index in 0..segments.len() {
+            if segments[index].as_mut().is_some_and(|heap| heap.free(ptr)) {
+                retire_empty_process_segments(segments);
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -924,6 +927,7 @@ pub(crate) unsafe fn heap_realloc_with_flags(
             flags,
             in_place_only,
         ) {
+            retire_empty_process_segments(segments);
             return result;
         }
         if in_place_only
@@ -958,6 +962,7 @@ pub(crate) unsafe fn heap_realloc_with_flags(
             return core::ptr::null_mut();
         };
         segments[slot_index] = Some(heap);
+        retire_empty_process_segments(segments);
         result
     }
 }
