@@ -22,6 +22,12 @@ pub(super) struct FreeList {
     pub head: usize,
 }
 
+pub(super) struct AdjacentGrowth {
+    pub grown: bool,
+    #[cfg(test)]
+    pub inspected: usize,
+}
+
 impl FreeList {
     unsafe fn read(addr: usize) -> usize {
         unsafe { read_volatile(addr as *const usize) }
@@ -131,5 +137,50 @@ impl FreeList {
             }
         }
         Ok(visits)
+    }
+
+    /// Consume a free node that starts exactly where the allocation ends. Nodes are ordered by
+    /// address, so the first node past that address also proves that no later node can match.
+    pub(super) unsafe fn grow_adjacent(
+        &self,
+        start: usize,
+        old_size: usize,
+        new_size: usize,
+    ) -> AdjacentGrowth {
+        #[cfg(test)]
+        let mut inspected = 0;
+        let Some(adjacent) = start.checked_add(old_size) else {
+            return AdjacentGrowth { grown: false, #[cfg(test)] inspected };
+        };
+        let Some(need) = new_size.checked_sub(old_size) else {
+            return AdjacentGrowth { grown: false, #[cfg(test)] inspected };
+        };
+        let mut prev_link = self.head;
+        let mut cur = unsafe { Self::read(self.head) };
+        while cur != 0 {
+            #[cfg(test)]
+            { inspected += 1; }
+            if cur > adjacent {
+                break;
+            }
+            let size = unsafe { Self::read(cur) };
+            let next = unsafe { Self::read(cur + WORD) };
+            if cur == adjacent && size >= need {
+                if size - need >= NODE_SIZE {
+                    let new_free = cur + need;
+                    unsafe {
+                        Self::write(new_free, size - need);
+                        Self::write(new_free + WORD, next);
+                        Self::write(prev_link, new_free);
+                    }
+                } else {
+                    unsafe { Self::write(prev_link, next) };
+                }
+                return AdjacentGrowth { grown: true, #[cfg(test)] inspected };
+            }
+            prev_link = cur + WORD;
+            cur = next;
+        }
+        AdjacentGrowth { grown: false, #[cfg(test)] inspected }
     }
 }

@@ -369,12 +369,27 @@ pub enum FramePoolError {
     Full,
 }
 
+#[derive(Copy, Clone)]
+struct RecycledFrameIndexSlot {
+    frame: u64,
+    count: usize,
+}
+
+impl RecycledFrameIndexSlot {
+    const EMPTY: Self = Self { frame: 0, count: 0 };
+}
+
 /// Growable ownership store for unmapped frame capabilities. The caller retains responsibility for
 /// deleting a capability returned by [`Self::try_recycle`] on allocation failure.
 pub struct RecycledFramePool {
     frames: Vec<u64>,
+    /// Exact membership for the LIFO stack. Empty slots have count zero; removal closes probe
+    /// chains so repeated acquire/recycle cycles cannot accumulate tombstones.
+    index: Vec<RecycledFrameIndexSlot>,
     high_water: usize,
     allocation_failures: u64,
+    #[cfg(test)]
+    inspected: core::cell::Cell<usize>,
 }
 
 impl Default for RecycledFramePool {
@@ -387,17 +402,22 @@ impl RecycledFramePool {
     pub const fn new() -> Self {
         Self {
             frames: Vec::new(),
+            index: Vec::new(),
             high_water: 0,
             allocation_failures: 0,
+            #[cfg(test)]
+            inspected: core::cell::Cell::new(0),
         }
     }
 
     pub fn acquire(&mut self) -> Option<u64> {
-        self.frames.pop()
+        let frame = self.frames.pop()?;
+        self.remove_index(frame);
+        Some(frame)
     }
 
     pub fn reserve(&mut self, additional: usize) -> bool {
-        if self.frames.try_reserve(additional).is_err() {
+        if !self.reserve_inner(additional) {
             self.allocation_failures = self.allocation_failures.saturating_add(1);
             false
         } else {
@@ -406,10 +426,10 @@ impl RecycledFramePool {
     }
 
     pub fn try_recycle(&mut self, frame: u64) -> Result<(), u64> {
-        if self.frames.try_reserve(1).is_err() {
-            self.allocation_failures = self.allocation_failures.saturating_add(1);
+        if !self.reserve(1) {
             return Err(frame);
         }
+        self.add_index(frame);
         self.frames.push(frame);
         self.high_water = self.high_water.max(self.frames.len());
         Ok(())
@@ -421,10 +441,12 @@ impl RecycledFramePool {
         if frame == 0 {
             return Err(FramePoolError::InvalidFrame);
         }
-        if self.frames.contains(&frame) {
+        if self.index_contains(frame) {
             return Err(FramePoolError::AlreadyPublished);
         }
-        if self.frames.len() == self.frames.capacity() {
+        if self.frames.len() == self.frames.capacity()
+            || self.index.len() / 2 < self.frames.capacity()
+        {
             return Err(FramePoolError::Full);
         }
         Ok(())
@@ -434,9 +456,107 @@ impl RecycledFramePool {
     /// transfers nothing; success must be acknowledged by the retained owner before allocator reuse.
     pub fn publish_reserved(&mut self, frame: u64) -> Result<(), FramePoolError> {
         self.check_reserved(frame)?;
+        self.add_index(frame);
         self.frames.push(frame);
         self.high_water = self.high_water.max(self.frames.len());
         Ok(())
+    }
+
+    fn reserve_inner(&mut self, additional: usize) -> bool {
+        if self.frames.len().checked_add(additional).is_none()
+            || self.frames.try_reserve(additional).is_err()
+        {
+            return false;
+        }
+        if self.frames.capacity() == 0 {
+            return true;
+        }
+        let Some(index_slots) = self.frames.capacity().checked_mul(2)
+            .and_then(usize::checked_next_power_of_two) else {
+            return false;
+        };
+        if index_slots > self.index.len() {
+            let mut next = Vec::new();
+            if next.try_reserve_exact(index_slots).is_err() {
+                return false;
+            }
+            next.resize(index_slots, RecycledFrameIndexSlot::EMPTY);
+            for slot in self.index.iter().copied().filter(|slot| slot.count != 0) {
+                Self::insert_index_slot(&mut next, slot);
+            }
+            self.index = next;
+        }
+        true
+    }
+
+    fn index_start(frame: u64, slots: usize) -> usize {
+        let mut hash = frame;
+        hash ^= hash >> 30;
+        hash = hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        hash ^= hash >> 27;
+        hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+        hash ^= hash >> 31;
+        (hash as usize) & (slots - 1)
+    }
+
+    fn index_position(&self, frame: u64) -> Result<usize, usize> {
+        if self.index.is_empty() {
+            return Err(0);
+        }
+        let mask = self.index.len() - 1;
+        let mut at = Self::index_start(frame, self.index.len());
+        loop {
+            let slot = self.index[at];
+            #[cfg(test)]
+            self.inspected.set(self.inspected.get() + 1);
+            if slot.count == 0 {
+                return Err(at);
+            }
+            if slot.frame == frame {
+                return Ok(at);
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    fn index_contains(&self, frame: u64) -> bool {
+        self.index_position(frame).is_ok()
+    }
+
+    fn insert_index_slot(index: &mut [RecycledFrameIndexSlot], slot: RecycledFrameIndexSlot) {
+        let mask = index.len() - 1;
+        let mut at = Self::index_start(slot.frame, index.len());
+        while index[at].count != 0 {
+            at = (at + 1) & mask;
+        }
+        index[at] = slot;
+    }
+
+    fn add_index(&mut self, frame: u64) {
+        match self.index_position(frame) {
+            Ok(at) => self.index[at].count += 1,
+            Err(at) => self.index[at] = RecycledFrameIndexSlot { frame, count: 1 },
+        }
+    }
+
+    fn remove_index(&mut self, frame: u64) {
+        let at = self.index_position(frame).expect("recycled frame index missing acquired frame");
+        if self.index[at].count > 1 {
+            self.index[at].count -= 1;
+            return;
+        }
+        let mask = self.index.len() - 1;
+        let mut hole = at;
+        let mut next = (at + 1) & mask;
+        while self.index[next].count != 0 {
+            let home = Self::index_start(self.index[next].frame, self.index.len());
+            if (next.wrapping_sub(home) & mask) > (hole.wrapping_sub(home) & mask) {
+                self.index[hole] = self.index[next];
+                hole = next;
+            }
+            next = (next + 1) & mask;
+        }
+        self.index[hole] = RecycledFrameIndexSlot::EMPTY;
     }
 
     pub fn stats(&self) -> RecycledFramePoolStats {

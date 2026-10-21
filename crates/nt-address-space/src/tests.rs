@@ -205,6 +205,66 @@ fn recycled_frame_pool_grows_past_the_old_policy_limit_and_reuses_lifo() {
 }
 
 #[test]
+fn recycled_frame_preflight_work_is_bounded_after_large_pool_growth() {
+    let mut pool = RecycledFramePool::new();
+    assert!(pool.reserve(5_000));
+    for frame in 1..=5_000 {
+        pool.publish_reserved(frame).unwrap();
+    }
+    pool.inspected.set(0);
+    assert_eq!(pool.check_reserved(10_000), Err(FramePoolError::Full));
+    assert!(pool.inspected.get() < 64, "preflight inspected {} frames", pool.inspected.get());
+    assert_eq!(pool.check_reserved(5_000), Err(FramePoolError::AlreadyPublished));
+    assert_eq!(pool.acquire(), Some(5_000));
+    pool.publish_reserved(5_000).unwrap();
+    assert_eq!(pool.acquire(), Some(5_000));
+}
+
+#[test]
+fn recycled_frame_index_preserves_exact_membership_across_collisions_and_churn() {
+    let mut pool = RecycledFramePool::new();
+    assert!(pool.reserve(32));
+    let colliding: Vec<_> = (1..)
+        .filter(|&frame| RecycledFramePool::index_start(frame, pool.index.len()) == 0)
+        .take(24)
+        .collect();
+    for &frame in &colliding {
+        pool.publish_reserved(frame).unwrap();
+    }
+    for &frame in colliding.iter().rev().take(12) {
+        assert_eq!(pool.acquire(), Some(frame));
+        assert_eq!(pool.check_reserved(frame), Ok(()));
+    }
+    for &frame in colliding.iter().take(12) {
+        assert_eq!(pool.check_reserved(frame), Err(FramePoolError::AlreadyPublished));
+    }
+    for &frame in colliding.iter().skip(12) {
+        pool.publish_reserved(frame).unwrap();
+    }
+    for &frame in colliding.iter().rev().take(12) {
+        assert_eq!(pool.acquire(), Some(frame));
+    }
+    for &frame in colliding.iter().take(12) {
+        assert_eq!(pool.check_reserved(frame), Err(FramePoolError::AlreadyPublished));
+    }
+    pool.inspected.set(0);
+    assert_eq!(pool.check_reserved(10_000), Ok(()));
+    assert!(pool.inspected.get() < 64);
+}
+
+#[test]
+fn recycled_frame_index_tracks_direct_recycle_duplicates_until_last_acquisition() {
+    let mut pool = RecycledFramePool::new();
+    assert_eq!(pool.try_recycle(70), Ok(()));
+    assert_eq!(pool.try_recycle(70), Ok(()));
+    assert_eq!(pool.check_reserved(70), Err(FramePoolError::AlreadyPublished));
+    assert_eq!(pool.acquire(), Some(70));
+    assert_eq!(pool.check_reserved(70), Err(FramePoolError::AlreadyPublished));
+    assert_eq!(pool.acquire(), Some(70));
+    assert_eq!(pool.check_reserved(70), Ok(()));
+}
+
+#[test]
 fn page_chunks_cover_in_page_boundary_and_cross_page_ranges() {
     assert_eq!(page_chunks(0x1234, 0).unwrap().next(), None);
     assert_eq!(

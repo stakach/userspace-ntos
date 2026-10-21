@@ -639,32 +639,12 @@ unsafe fn alloc_from_free_list(layout: Layout, needed: usize) -> *mut u8 {
 }
 
 unsafe fn grow_in_place_from_adjacent_free(start: usize, old_size: usize, new_size: usize) -> bool {
-    let adjacent = match start.checked_add(old_size) {
-        Some(adjacent) => adjacent,
-        None => return false,
+    let list = free_list::FreeList {
+        data: DATA,
+        counter: CTR,
+        head: FREE_HEAD,
     };
-    let need = new_size - old_size;
-    let mut prev_link = FREE_HEAD;
-    let mut cur = unsafe { read_word(FREE_HEAD) };
-    while cur != 0 {
-        let size = unsafe { free_node_size(cur) };
-        let next = unsafe { free_node_next(cur) };
-        if cur == adjacent && size >= need {
-            if size - need >= FREE_NODE_SIZE {
-                let new_free = cur + need;
-                unsafe {
-                    set_free_node(new_free, size - need, next);
-                    write_word(prev_link, new_free);
-                }
-            } else {
-                unsafe { write_word(prev_link, next) };
-            }
-            return true;
-        }
-        prev_link = cur + WORD;
-        cur = next;
-    }
-    false
+    unsafe { list.grow_adjacent(start, old_size, new_size) }.grown
 }
 
 impl Bump {

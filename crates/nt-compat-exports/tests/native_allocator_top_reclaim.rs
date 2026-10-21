@@ -109,3 +109,21 @@ fn insertion_refuses_a_corrupt_successor_before_following_it() {
     assert_eq!(error.operation, b"insert-walk");
     assert_eq!(heap.bump(), 256);
 }
+
+#[test]
+fn adjacent_growth_stops_at_first_free_block_past_target() {
+    let mut heap = Heap::new(8192);
+    for index in 0..128 {
+        heap.insert(1024 + index * 32, NODE);
+    }
+    let before = heap.blocks();
+    let miss = unsafe { heap.list.grow_adjacent(heap.data, 512, 512 + NODE) };
+    assert!(!miss.grown);
+    assert!(miss.inspected <= 1, "miss scanned {} unrelated free blocks", miss.inspected);
+    assert_eq!(heap.blocks(), before);
+
+    let hit = unsafe { heap.list.grow_adjacent(heap.data + 1008, NODE, NODE * 2) };
+    assert!(hit.grown);
+    assert!(hit.inspected <= 1);
+    assert_eq!(heap.blocks().len(), 127);
+}
