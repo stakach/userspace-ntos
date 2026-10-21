@@ -24,15 +24,11 @@ impl ExecNtHandler {
     ) -> Result<alloc::string::String, u32> {
         let mut header = [0u8; 16];
         self.process_memory_read_status(self.pi, address, &mut header)?;
-        let length = u16::from_le_bytes(header[..2].try_into().unwrap()) as usize;
-        let maximum = u16::from_le_bytes(header[2..4].try_into().unwrap()) as usize;
-        if length & 1 != 0 || length > maximum {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let pointer = u64::from_le_bytes(header[8..16].try_into().unwrap());
-        let mut bytes = alloc::vec![0u8; length];
-        if length != 0 {
-            self.process_memory_read_status(self.pi, pointer, &mut bytes)?;
+        let input = nt_kernel_exec::user_string::object_name_input(&header)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        let mut bytes = alloc::vec![0u8; input.length];
+        if input.length != 0 {
+            self.process_memory_read_status(self.pi, input.buffer, &mut bytes)?;
         }
         let units: alloc::vec::Vec<u16> = bytes
             .chunks_exact(2)
