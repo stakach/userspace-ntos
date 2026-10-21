@@ -53,14 +53,16 @@ fn block(status: u32) -> u32 {
 fn restore_continuation(
     lease: snapshot_storage::Lease,
     continuation: RegistryWalContinuation,
+    pair: nt_fs::VerifiedPairedWalSnapshot,
 ) -> Result<(), u32> {
-    match snapshot_storage::install_wal_continuation(&lease, continuation) {
+    match snapshot_storage::install_wal_continuation(&lease, continuation, pair) {
         Ok(()) => {
             drop(lease);
             Ok(())
         }
-        Err((status, continuation)) => {
+        Err((status, continuation, pair)) => {
             core::mem::forget(continuation);
+            core::mem::forget(pair);
             core::mem::forget(lease);
             Err(block(status))
         }
@@ -206,23 +208,19 @@ pub(super) unsafe fn commit_non_system_hive_log_wal(path: &str, record: &[u8]) -
         Err(status) => return status,
     };
     let store = lease.store();
-    let manifest = match store.current_paired_wal_journal_manifest(&mut lease) {
-        Ok(manifest) => manifest,
-        Err(error) => return block(snapshot_store_error_status(error)),
+    let (continuation, pair, manifest) = match snapshot_storage::take_wal_continuation(&mut lease) {
+        Ok(authority) => authority,
+        Err(status) => return block(status),
     };
     let anchored = WalSnapshotAnchor {
         incarnation: manifest.incarnation,
         serial: manifest.high_water_serial,
         end_lba: manifest.high_water_end_lba,
     };
-    let continuation = match snapshot_storage::take_wal_continuation(&lease, anchored) {
-        Ok(continuation) => continuation,
-        Err(status) => return block(status),
-    };
     let range = match snapshot_storage::owned_wal_region(lease) {
         Ok(range) => range,
         Err((status, lease)) => {
-            if let Err(error) = restore_continuation(lease, continuation) { return error; }
+            if let Err(error) = restore_continuation(lease, continuation, pair) { return error; }
             return status;
         }
     };
@@ -230,40 +228,44 @@ pub(super) unsafe fn commit_non_system_hive_log_wal(path: &str, record: &[u8]) -
         Ok(wal) => wal,
         Err((error, range, continuation)) => {
             let lease = range.into_device();
-            if let Err(status) = restore_continuation(lease, continuation) { return status; }
+            if let Err(status) = restore_continuation(lease, continuation, pair) { return status; }
             return block(wal_status(error));
         }
     };
     if let Err(error) = wal.begin(encoded) {
         let (range, continuation) = wal.into_continuation()
             .expect("failed WAL reservation has no physical effect");
-        if let Err(status) = restore_continuation(range.into_device(), continuation) { return status; }
+        if let Err(status) = restore_continuation(range.into_device(), continuation, pair) { return status; }
         return wal_status(error);
     }
     if let Err(status) = writable_fs().and_then(|fs| fs.protect_wal_log(path, file_id)) {
         let (range, continuation) = wal.into_continuation()
             .expect("unprepared WAL reservation has no physical effect");
-        if let Err(error) = restore_continuation(range.into_device(), continuation) { return error; }
+        if let Err(error) = restore_continuation(range.into_device(), continuation, pair) { return error; }
         return status;
     }
     if let Err(error) = wal.prepare() {
+        core::mem::forget(pair);
         core::mem::forget(wal);
         return block(wal_status(error));
     }
     if let Err(error) = wal.commit() {
+        core::mem::forget(pair);
         core::mem::forget(wal);
         return block(wal_status(error));
     }
     let verified = match wal.into_verified_device() {
         Ok(verified) => verified.into_full_device(),
         Err(wal) => {
+            core::mem::forget(pair);
             core::mem::forget(wal);
             return block(nt_fs::STATUS_DATA_ERROR);
         }
     };
-    let mut update = match WalSnapshotAnchorUpdate::admit_verified_wal(store, verified) {
+    let mut update = match WalSnapshotAnchorUpdate::admit_verified_wal_pair(store, verified, pair) {
         Ok(update) => update,
-        Err((error, verified)) => {
+        Err((error, verified, pair)) => {
+            core::mem::forget(pair);
             core::mem::forget(verified);
             return block(snapshot_store_error_status(error));
         }
@@ -272,7 +274,7 @@ pub(super) unsafe fn commit_non_system_hive_log_wal(path: &str, record: &[u8]) -
         core::mem::forget(update);
         return block(snapshot_store_error_status(error));
     }
-    let (lease, continuation) = match update.into_continuation() {
+    let (lease, continuation, pair) = match update.into_continuation_and_pair() {
         Ok(complete) => complete,
         Err(update) => {
             core::mem::forget(update);
@@ -287,6 +289,7 @@ pub(super) unsafe fn commit_non_system_hive_log_wal(path: &str, record: &[u8]) -
     });
     if let Err(status) = applied {
         core::mem::forget(continuation);
+        core::mem::forget(pair);
         core::mem::forget(lease);
         return block(status);
     }
@@ -294,14 +297,16 @@ pub(super) unsafe fn commit_non_system_hive_log_wal(path: &str, record: &[u8]) -
         .find(|entry| entry.path == path && entry.file_id == file_id)
     else {
         core::mem::forget(continuation);
+        core::mem::forget(pair);
         core::mem::forget(lease);
         return block(nt_fs::STATUS_DATA_ERROR);
     };
     entry.expected_len = expected_log_len + record.len() as u64;
     entry.last_sequence = last_sequence;
     entry.has_wal_records = true;
-    if let Err((status, continuation)) = snapshot_storage::install_wal_continuation(&lease, continuation) {
+    if let Err((status, continuation, pair)) = snapshot_storage::install_wal_continuation(&lease, continuation, pair) {
         core::mem::forget(continuation);
+        core::mem::forget(pair);
         core::mem::forget(lease);
         return block(status);
     }

@@ -11,10 +11,11 @@ static mut RESERVE: Option<Reserve> = None;
 struct MountedWalContinuation {
     mount: SectionMountId,
     token: nt_fs::RegistryWalContinuation,
+    pair: nt_fs::VerifiedPairedWalSnapshot,
 }
 
-// This is an in-process accelerator, never a boot recovery authority. Boot always scans the
-// physical WAL and proves paired snapshot headers before installing a fresh continuation.
+// These move-only in-process proofs are never boot recovery authority. Boot scans the physical
+// WAL and validates both snapshot payloads before installing a fresh mounted pair.
 static mut WAL_CONTINUATION: Option<MountedWalContinuation> = None;
 pub(super) const BUSY: u32 = 0x8000_0011;
 const SNAPSHOT_SECTORS: u64 = crate::fs_loader::WRITABLE_SNAPSHOT_RESERVE_SECTORS as u64;
@@ -82,58 +83,75 @@ fn checked_mount(lease: &Lease) -> Result<SectionMountId, u32> {
     Ok(mount)
 }
 
-/// Publish a typed post-anchor continuation under the same physical mount lease that produced
-/// it. The nt-fs token can only be minted by a completed paired-header anchor update or
-/// completed two-slot empty baseline repair, so its private anchor is the durable header proof;
-/// this cache adds the immutable physical mount binding. Refusal returns the move-only token.
+/// Publish the WAL continuation and verified snapshot pair under their physical mount lease.
+/// Refusal returns both move-only proofs so the caller can retain them with the lease.
 pub(super) fn install_wal_continuation(
     lease: &Lease,
     token: nt_fs::RegistryWalContinuation,
-) -> Result<(), (u32, nt_fs::RegistryWalContinuation)> {
+    pair: nt_fs::VerifiedPairedWalSnapshot,
+) -> Result<(), (u32, nt_fs::RegistryWalContinuation, nt_fs::VerifiedPairedWalSnapshot)> {
     let mount = match checked_mount(lease) {
         Ok(mount) => mount,
-        Err(status) => return Err((status, token)),
+        Err(status) => return Err((status, token, pair)),
     };
     let slot = unsafe { &mut *core::ptr::addr_of_mut!(WAL_CONTINUATION) };
-    if slot.is_some() || token.anchor().incarnation == 0 {
-        return Err((nt_fs::STATUS_INVALID_DEVICE_REQUEST, token));
+    if slot.is_some() || token.anchor().incarnation == 0 || token.anchor() != pair.anchor() {
+        return Err((nt_fs::STATUS_INVALID_DEVICE_REQUEST, token, pair));
     }
-    *slot = Some(MountedWalContinuation { mount, token });
+    *slot = Some(MountedWalContinuation { mount, token, pair });
     Ok(())
 }
 
-/// Transfer the continuation only to an owner holding the exact mount lease and paired-header
-/// anchor. Absence or mismatch refuses admission without changing the cached authority.
+/// Transfer both proofs only under the exact mount lease and unchanged paired headers.
+/// Absence or mismatch refuses admission without changing the cached authority.
 pub(super) fn take_wal_continuation(
-    lease: &Lease,
-    expected_anchor: nt_fs::WalSnapshotAnchor,
-) -> Result<nt_fs::RegistryWalContinuation, u32> {
+    lease: &mut Lease,
+) -> Result<(nt_fs::RegistryWalContinuation, nt_fs::VerifiedPairedWalSnapshot, nt_fs::WalSnapshotManifest), u32> {
     let mount = checked_mount(lease)?;
     let slot = unsafe { &mut *core::ptr::addr_of_mut!(WAL_CONTINUATION) };
     let Some(cached) = slot.as_ref() else {
         return Err(nt_fs::STATUS_DEVICE_NOT_READY);
     };
-    if cached.mount != mount || cached.token.anchor() != expected_anchor {
+    if cached.mount != mount || cached.token.anchor() != cached.pair.anchor() {
         return Err(nt_fs::STATUS_DATA_ERROR);
     }
-    Ok(slot.take().expect("checked continuation").token)
+    let manifest = lease.store()
+        .recheck_verified_paired_wal_snapshot(lease, &cached.pair)
+        .map_err(super::snapshot_store_error_status)?;
+    if cached.token.anchor() != manifest_anchor(manifest) {
+        return Err(nt_fs::STATUS_DATA_ERROR);
+    }
+    let cached = slot.take().expect("checked continuation");
+    Ok((cached.token, cached.pair, manifest))
 }
 
-/// NtFlushKey can prove the current anchored prefix without scanning the WAL again. The caller
-/// must have read and validated the paired-header anchor while holding this lease.
+/// NtFlushKey and fold admission recheck both exact headers while holding the mount lease.
 pub(super) fn peek_wal_continuation(
-    lease: &Lease,
-    expected_anchor: nt_fs::WalSnapshotAnchor,
-) -> Result<(), u32> {
+    lease: &mut Lease,
+) -> Result<nt_fs::WalSnapshotManifest, u32> {
     let mount = checked_mount(lease)?;
     let slot = unsafe { &*core::ptr::addr_of!(WAL_CONTINUATION) };
     let Some(cached) = slot.as_ref() else {
         return Err(nt_fs::STATUS_DEVICE_NOT_READY);
     };
-    if cached.mount != mount || cached.token.anchor() != expected_anchor {
+    if cached.mount != mount || cached.token.anchor() != cached.pair.anchor() {
         return Err(nt_fs::STATUS_DATA_ERROR);
     }
-    Ok(())
+    let manifest = lease.store()
+        .recheck_verified_paired_wal_snapshot(lease, &cached.pair)
+        .map_err(super::snapshot_store_error_status)?;
+    if cached.token.anchor() != manifest_anchor(manifest) {
+        return Err(nt_fs::STATUS_DATA_ERROR);
+    }
+    Ok(manifest)
+}
+
+fn manifest_anchor(manifest: nt_fs::WalSnapshotManifest) -> nt_fs::WalSnapshotAnchor {
+    nt_fs::WalSnapshotAnchor {
+        incarnation: manifest.incarnation,
+        serial: manifest.high_water_serial,
+        end_lba: manifest.high_water_end_lba,
+    }
 }
 
 pub(super) struct AhciSnapshotDevice {

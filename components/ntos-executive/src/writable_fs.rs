@@ -750,23 +750,32 @@ pub(crate) unsafe fn verify_durable_system_wal() -> Result<(), u32> {
         return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
     }
     let mut lease = snapshot_storage::acquire()?;
-    let store = lease.store();
-    let manifest = store.current_paired_wal_journal_manifest(&mut lease)
-        .map_err(|error| {
-            WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
-            snapshot_store_error_status(error)
-        })?;
-    let expected = nt_fs::WalSnapshotAnchor {
-        incarnation: manifest.incarnation,
-        serial: manifest.high_water_serial,
-        end_lba: manifest.high_water_end_lba,
-    };
-    snapshot_storage::peek_wal_continuation(&lease, expected).map_err(|status| {
+    snapshot_storage::peek_wal_continuation(&mut lease).map(|_| ()).map_err(|status| {
         // An acquired reserve with no matching in-process token contradicts the completed
         // mutation/boot publication contract. No later writer may guess the WAL prefix.
         WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
         status
     })
+}
+
+/// A failed pre-write capture has no disk effect; put the exact paired proof and WAL token back
+/// under the same mount lease before another writer can acquire it.
+fn restore_unwritten_checkpoint_authority(
+    dev: snapshot_storage::Lease,
+    authority: Option<(nt_fs::RegistryWalContinuation, nt_fs::VerifiedPairedWalSnapshot)>,
+    status: u32,
+) -> u32 {
+    if let Some((token, pair)) = authority {
+        if let Err((error, token, pair)) = snapshot_storage::install_wal_continuation(&dev, token, pair) {
+            WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+            core::mem::forget(token);
+            core::mem::forget(pair);
+            core::mem::forget(dev);
+            return error;
+        }
+    }
+    drop(dev);
+    status
 }
 
 /// Commit pending volume bytes. `Ok(true)` means a new durable snapshot was published, while
@@ -782,32 +791,32 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
     if !WRITABLE_FS_SNAPSHOT_DIRTY.swap(false, Ordering::AcqRel) {
         return Ok(false);
     }
-    let wal_manifest = if wal_format {
-        match dev.store().current_wal_checkpoint_manifest(&mut dev) {
-            Ok(manifest) => Some(manifest),
-            Err(error) => {
-                // The reserve is still read-only here. Keep dirty state and prevent another
-                // writer from treating a damaged or partially advanced anchor as reusable.
+    let (wal_manifest, authority) = if wal_format {
+        match snapshot_storage::take_wal_continuation(&mut dev) {
+            Ok((token, pair, manifest)) => (Some(manifest), Some((token, pair))),
+            Err(status) => {
                 WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
                 WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
-                return Err(snapshot_store_error_status(error));
+                return Err(status);
             }
         }
     } else {
-        None
+        (None, None)
     };
     // Capture the v2 payload before physical I/O can reenter the executive. A second pass over
     // the live tree could produce different length or CRC after the first payload sectors land.
     let captured_image = if wal_format {
         let Some(fs) = (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).as_ref() else {
             WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
-            return Err(nt_fs::STATUS_INVALID_HANDLE);
+            return Err(restore_unwritten_checkpoint_authority(
+                dev, authority, nt_fs::STATUS_INVALID_HANDLE,
+            ));
         };
         match snapshot_capture::CapturedSnapshot::capture(&dev, fs) {
             Ok(image) => Some(image),
             Err(status) => {
                 WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
-                return Err(status);
+                return Err(restore_unwritten_checkpoint_authority(dev, authority, status));
             }
         }
     } else {
@@ -819,6 +828,36 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
         captured_image.as_ref().map(snapshot_capture::CapturedSnapshot::as_slice),
     ) {
         Ok((generation, bytes)) => {
+            if let Some((token, old_pair)) = authority {
+                let pair = match dev.store().verify_paired_wal_snapshot(&mut dev) {
+                    Ok(pair) if pair.anchor() == token.anchor() => pair,
+                    Ok(_) => {
+                        WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+                        WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+                        core::mem::forget(token);
+                        core::mem::forget(old_pair);
+                        core::mem::forget(dev);
+                        return Err(nt_fs::STATUS_DATA_ERROR);
+                    }
+                    Err(error) => {
+                        WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+                        WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+                        core::mem::forget(token);
+                        core::mem::forget(old_pair);
+                        core::mem::forget(dev);
+                        return Err(snapshot_store_error_status(error));
+                    }
+                };
+                drop(old_pair);
+                if let Err((status, token, pair)) = snapshot_storage::install_wal_continuation(&dev, token, pair) {
+                    WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+                    WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+                    core::mem::forget(token);
+                    core::mem::forget(pair);
+                    core::mem::forget(dev);
+                    return Err(status);
+                }
+            }
             WRITABLE_FS_SNAPSHOT_COMMITS.fetch_add(1, Ordering::Relaxed);
             WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION.store(generation, Ordering::Relaxed);
             WRITABLE_FS_SNAPSHOT_COMMIT_BYTES.store(bytes as u64, Ordering::Relaxed);
@@ -835,6 +874,10 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
             // Either snapshot format can have changed a slot before reporting failure.
             // Retain the physical reserve and let boot recovery choose the durable image.
             WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+            if let Some((token, pair)) = authority {
+                core::mem::forget(token);
+                core::mem::forget(pair);
+            }
             core::mem::forget(dev);
             print_str(b"[writable-fs-snapshot] dirty checkpoint retained after status=0x");
             print_hex(status);
@@ -1221,12 +1264,28 @@ pub(crate) fn boot_wal_cutover_admission() -> BootWalCutoverAdmission {
 }
 
 fn publish_boot_wal_continuation(
-    lease: snapshot_storage::Lease,
+    mut lease: snapshot_storage::Lease,
     token: nt_fs::RegistryWalContinuation,
 ) -> Result<(), BootSystemRestoreError> {
-    if let Err((status, token)) = snapshot_storage::install_wal_continuation(&lease, token) {
+    let pair = match lease.store().verify_paired_wal_snapshot(&mut lease) {
+        Ok(pair) if pair.anchor() == token.anchor() => pair,
+        Ok(_) => {
+            WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+            core::mem::forget(token);
+            core::mem::forget(lease);
+            return Err(BootSystemRestoreError::Snapshot(nt_fs::STATUS_DATA_ERROR));
+        }
+        Err(error) => {
+            WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+            core::mem::forget(token);
+            core::mem::forget(lease);
+            return Err(BootSystemRestoreError::Snapshot(snapshot_store_error_status(error)));
+        }
+    };
+    if let Err((status, token, pair)) = snapshot_storage::install_wal_continuation(&lease, token, pair) {
         WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
         core::mem::forget(token);
+        core::mem::forget(pair);
         core::mem::forget(lease);
         return Err(BootSystemRestoreError::Snapshot(status));
     }

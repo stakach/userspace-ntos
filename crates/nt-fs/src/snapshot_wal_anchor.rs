@@ -17,6 +17,7 @@ pub struct WalSnapshotAnchorUpdate<D: SnapshotBlockDevice> {
     headers: [SlotHeader; 2],
     torn_companion_source: Option<SlotReadPlan>,
     continuation: Option<crate::RegistryWalContinuation>,
+    paired_proof: Option<VerifiedPairedWalSnapshot>,
     phase: Phase,
 }
 
@@ -98,6 +99,50 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
                 crate::RegistryWalVerifiedDevice::from_parts(device, prefix, record_end_lbas),
             )),
         }
+    }
+
+    /// Steady-state admission using a payload proof carried with this exact reserve since
+    /// boot or the last completed checkpoint. Exact headers are rechecked without rereading
+    /// either payload. Failure returns both move-only proofs and the unchanged device.
+    pub fn admit_verified_wal_pair(
+        store: SnapshotBlockStore,
+        verified: crate::RegistryWalVerifiedDevice<D>,
+        paired: VerifiedPairedWalSnapshot,
+    ) -> Result<Self, (SnapshotBlockStoreError, crate::RegistryWalVerifiedDevice<D>, VerifiedPairedWalSnapshot)> {
+        let (mut device, prefix, record_end_lbas) = verified.into_parts();
+        let next = prefix.anchor();
+        let checked = (|| {
+            store.recheck_verified_paired_wal_snapshot(&mut device, &paired)?;
+            for plan in paired.plans {
+                let current = plan.wal.ok_or(SnapshotBlockStoreError::Corrupt)?.anchor();
+                let exact_end = if current.serial == 0 {
+                    Some(0)
+                } else {
+                    usize::try_from(current.serial - 1)
+                        .ok()
+                        .and_then(|index| record_end_lbas.get(index).copied())
+                };
+                if current.incarnation != next.incarnation
+                    || current.serial > next.serial
+                    || exact_end != Some(current.end_lba)
+                {
+                    return Err(SnapshotBlockStoreError::Corrupt);
+                }
+            }
+            Ok::<(), SnapshotBlockStoreError>(())
+        })();
+        if let Err(error) = checked {
+            return Err((
+                error,
+                crate::RegistryWalVerifiedDevice::from_parts(device, prefix, record_end_lbas),
+                paired,
+            ));
+        }
+        let mut update = Self::from_plans(store, device, next, paired.plans, None, Some(paired));
+        update.continuation = Some(crate::RegistryWalContinuation::from_parts(
+            prefix, record_end_lbas,
+        ));
+        Ok(update)
     }
 
     /// Repair or advance both copies to a prefix proven by a parsed WAL after reboot.
@@ -190,6 +235,17 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
             Ok(plans) => plans,
             Err(error) => return Err((error, device)),
         };
+        Ok(Self::from_plans(store, device, next, plans, torn_companion_source, None))
+    }
+
+    fn from_plans(
+        store: SnapshotBlockStore,
+        device: D,
+        next: WalSnapshotAnchor,
+        plans: [SlotReadPlan; 2],
+        torn_companion_source: Option<SlotReadPlan>,
+        paired_proof: Option<VerifiedPairedWalSnapshot>,
+    ) -> Self {
         let headers = plans.map(|plan| {
             let mut wal = plan.wal.unwrap();
             wal.high_water_serial = next.serial;
@@ -204,14 +260,15 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
                 resetting: false,
             }
         });
-        Ok(Self {
+        Self {
             device: Some(device),
             store,
             headers,
             torn_companion_source,
             continuation: None,
+            paired_proof,
             phase: Phase::Pending,
-        })
+        }
     }
 
     /// Write and flush each complete header in turn. No caller success is allowed before
@@ -266,7 +323,7 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
     }
 
     pub fn into_device(mut self) -> Result<D, Self> {
-        if self.phase == Phase::Complete {
+        if self.phase == Phase::Complete && self.paired_proof.is_none() {
             Ok(self.device.take().expect("retained anchor device"))
         } else {
             Err(self)
@@ -276,12 +333,33 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
     /// Return the exact prefix only after both snapshot headers have crossed their
     /// durable barriers. Ordinary numeric-anchor admission cannot mint a continuation.
     pub fn into_continuation(mut self) -> Result<(D, crate::RegistryWalContinuation), Self> {
-        if self.phase != Phase::Complete || self.continuation.is_none() {
+        if self.phase != Phase::Complete || self.continuation.is_none() || self.paired_proof.is_some() {
             return Err(self);
         }
         Ok((
             self.device.take().expect("retained anchor device"),
             self.continuation.take().expect("verified WAL prefix"),
+        ))
+    }
+
+    /// Publish the refreshed paired proof only after both exact header barriers completed.
+    pub fn into_continuation_and_pair(
+        mut self,
+    ) -> Result<(D, crate::RegistryWalContinuation, VerifiedPairedWalSnapshot), Self> {
+        if self.phase != Phase::Complete || self.continuation.is_none() || self.paired_proof.is_none() {
+            return Err(self);
+        }
+        let mut paired = self.paired_proof.take().expect("checked paired proof");
+        for (plan, header) in paired.plans.iter_mut().zip(self.headers) {
+            plan.generation = header.generation;
+            plan.wal = header.wal;
+        }
+        paired.manifest = SnapshotBlockStore::paired_manifest(paired.plans)
+            .expect("completed paired anchor retains valid manifests");
+        Ok((
+            self.device.take().expect("retained anchor device"),
+            self.continuation.take().expect("verified WAL prefix"),
+            paired,
         ))
     }
 

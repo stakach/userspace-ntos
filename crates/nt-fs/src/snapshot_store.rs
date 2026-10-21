@@ -157,7 +157,7 @@ struct SlotSummary {
     resetting: bool,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct SlotReadPlan {
     slot: u32,
     generation: u64,
@@ -166,6 +166,26 @@ struct SlotReadPlan {
     payload_sectors: u32,
     wal: Option<WalSnapshotManifest>,
     resetting: bool,
+}
+
+/// In-process proof that both WAL snapshot payloads passed CRC validation on one exclusive
+/// reserve. It must travel with that reserve's physical owner; boot recovery must mint a fresh
+/// proof and an uncertain write must never return one to a new writer.
+#[must_use = "retain with the exact snapshot reserve until a settled update or recovery"]
+pub struct VerifiedPairedWalSnapshot {
+    store: SnapshotBlockStore,
+    plans: [SlotReadPlan; 2],
+    manifest: WalSnapshotManifest,
+}
+
+impl VerifiedPairedWalSnapshot {
+    pub fn manifest(&self) -> WalSnapshotManifest {
+        self.manifest
+    }
+
+    pub fn anchor(&self) -> WalSnapshotAnchor {
+        self.manifest.anchor()
+    }
 }
 
 /// V2 snapshot-header metadata. End LBA is relative to the disjoint WAL view.
@@ -892,6 +912,43 @@ impl SnapshotBlockStore {
             .ok_or(SnapshotBlockStoreError::Corrupt)?;
         let second = self.read_valid_slot_plan(dev, 1)?
             .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        Self::paired_manifest([first, second])
+    }
+
+    /// Mint a move-only paired-slot proof after fully validating both payload CRCs. This is a
+    /// boot/recovery boundary; steady-state callers carry the resulting proof with the reserve.
+    pub fn verify_paired_wal_snapshot<D: SnapshotBlockDevice>(
+        &self,
+        dev: &mut D,
+    ) -> Result<VerifiedPairedWalSnapshot, SnapshotBlockStoreError> {
+        let first = self.read_valid_slot_plan(dev, 0)?
+            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        let second = self.read_valid_slot_plan(dev, 1)?
+            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        let plans = [first, second];
+        let manifest = Self::paired_manifest(plans)?;
+        Ok(VerifiedPairedWalSnapshot { store: *self, plans, manifest })
+    }
+
+    /// Check exact slot headers under the proof's original exclusive reserve. Payload bytes
+    /// remain certified only while no other writer can change that reserve; native callers bind
+    /// the proof to their physical mount and move it through every possible write owner.
+    pub fn recheck_verified_paired_wal_snapshot<D: SnapshotBlockDevice>(
+        &self,
+        dev: &mut D,
+        proof: &VerifiedPairedWalSnapshot,
+    ) -> Result<WalSnapshotManifest, SnapshotBlockStoreError> {
+        if proof.store != *self
+            || self.read_slot_plan(dev, 0)? != Some(proof.plans[0])
+            || self.read_slot_plan(dev, 1)? != Some(proof.plans[1])
+        {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        Ok(proof.manifest)
+    }
+
+    fn paired_manifest(plans: [SlotReadPlan; 2]) -> Result<WalSnapshotManifest, SnapshotBlockStoreError> {
+        let [first, second] = plans;
         if first.resetting || second.resetting {
             return Err(SnapshotBlockStoreError::Corrupt);
         }
@@ -905,9 +962,7 @@ impl SnapshotBlockStore {
         if !manifest.valid() || !other.valid() {
             return Err(SnapshotBlockStoreError::Corrupt);
         }
-        same_anchor_wal_companion(
-            selected.generation, manifest, companion.generation, other,
-        )?;
+        same_anchor_wal_companion(selected.generation, manifest, companion.generation, other)?;
         Ok(manifest)
     }
 

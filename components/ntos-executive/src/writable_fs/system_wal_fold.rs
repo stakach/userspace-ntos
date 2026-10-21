@@ -11,7 +11,10 @@ struct FoldWork {
     prepared: Option<nt_config_client::PreparedSystemHiveCheckpoint>,
     lease: snapshot_storage::Lease,
     old_continuation: Option<nt_fs::RegistryWalContinuation>,
+    // Keep the pre-fold proof private while either snapshot slot may be changing.
+    old_pair: Option<nt_fs::VerifiedPairedWalSnapshot>,
     next_continuation: Option<nt_fs::RegistryWalContinuation>,
+    next_pair: Option<nt_fs::VerifiedPairedWalSnapshot>,
     phase: Phase,
 }
 
@@ -88,10 +91,10 @@ pub(crate) unsafe fn fold_system_wal_if_dirty() -> Result<bool, u32> {
     }
     let mut lease = snapshot_storage::acquire()?;
     let store = lease.store();
-    let manifest = store.current_paired_wal_journal_manifest(&mut lease)
-        .map_err(|error| {
+    let manifest = snapshot_storage::peek_wal_continuation(&mut lease)
+        .map_err(|status| {
             WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
-            snapshot_store_error_status(error)
+            status
         })?;
     let prepared = match crate::config_manager_prepare_system_hive_checkpoint() {
         Ok(prepared) => prepared,
@@ -105,15 +108,22 @@ pub(crate) unsafe fn fold_system_wal_if_dirty() -> Result<bool, u32> {
     if prepared.is_none() && manifest.base_serial == manifest.high_water_serial {
         return Ok(false);
     }
-    let anchored = nt_fs::WalSnapshotAnchor {
-        incarnation: manifest.incarnation,
-        serial: manifest.high_water_serial,
-        end_lba: manifest.high_water_end_lba,
-    };
-    let old = snapshot_storage::take_wal_continuation(&lease, anchored);
+    let old = snapshot_storage::take_wal_continuation(&mut lease);
     let refused = old.as_ref().err().copied();
+    let (old_continuation, old_pair) = match old {
+        Ok((continuation, pair, observed)) if observed == manifest => (Some(continuation), Some(pair)),
+        Ok((continuation, pair, _)) => {
+            core::mem::forget(continuation);
+            core::mem::forget(pair);
+            WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+            core::mem::forget(lease);
+            return Err(nt_fs::STATUS_DATA_ERROR);
+        }
+        Err(_) => (None, None),
+    };
     *core::ptr::addr_of_mut!(FOLD_WORK) = Some(FoldWork {
-        prepared, lease, old_continuation: old.ok(), next_continuation: None,
+        prepared, lease, old_continuation, old_pair, next_continuation: None,
+        next_pair: None,
         phase: Phase::Folding,
     });
     if let Some(status) = refused {
@@ -224,6 +234,14 @@ unsafe fn fold_retained(
         // It stays private until the exact CM checkpoint ACK has been observed.
         work.next_continuation = Some(token);
     }
+    let pair = store.verify_paired_wal_snapshot(&mut work.lease)
+        .map_err(snapshot_store_error_status)?;
+    let token = work.next_continuation.as_ref().or(work.old_continuation.as_ref())
+        .ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+    if pair.anchor() != token.anchor() {
+        return Err(nt_fs::STATUS_DATA_ERROR);
+    }
+    work.next_pair = Some(pair);
     Ok(())
 }
 
@@ -251,12 +269,14 @@ unsafe fn install_retained() -> Result<bool, u32> {
     } else {
         work.old_continuation.take()
     }.ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
-    if let Err((status, token)) = snapshot_storage::install_wal_continuation(&work.lease, token) {
+    let pair = work.next_pair.take().ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+    if let Err((status, token, pair)) = snapshot_storage::install_wal_continuation(&work.lease, token, pair) {
         if rollover {
             work.next_continuation = Some(token);
         } else {
             work.old_continuation = Some(token);
         }
+        work.next_pair = Some(pair);
         return Err(block(status));
     }
     // The two folded slots are already durable. Keep any unrelated mounted-volume dirty work
