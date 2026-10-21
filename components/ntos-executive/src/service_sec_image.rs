@@ -9725,6 +9725,7 @@ pub(crate) unsafe fn service_sec_image(
             crate::native_alpc_create_work::redrive(&mut nt_handler);
             crate::native_alpc_close_work::redrive(&mut nt_handler);
             crate::native_alpc_connect_accept_work::redrive(&mut nt_handler);
+            crate::native_srm_command_work::redrive(&mut nt_handler);
             alpc_reply_committed =
                 crate::native_alpc_send_receive_work::redrive(&mut nt_handler);
             crate::registry_mutation_work::redrive(&mut nt_handler, delay_queue);

@@ -37,6 +37,7 @@ mod native_alpc_close_work;
 mod native_alpc_port_security;
 mod native_alpc_connect_accept_work;
 mod native_alpc_send_receive_work;
+mod native_srm_command_work;
 mod kuser_active_console;
 mod termination_port_notifications;
 use termination_port_notifications::notify_thread_termination_ports;

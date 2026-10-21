@@ -930,7 +930,8 @@ fn kernel_srm_endpoint_services_native_alpc_sync_request_through_broker() {
     broker.set_accept_policy(AcceptPolicy::Manual);
     let mut alpc = AlpcServer::new();
     let name = utf16("\\SeRmCommandPort");
-    let caller = nt_port_core::ClientId { process: 128, thread: 140 };
+    let caller = nt_port_core::ClientId { process: 128, thread: 132 };
+    let sender = nt_port_core::ClientId { process: 128, thread: 140 };
     let listen = {
         let mut client = LpcClient::new(LpcDirect { server: &mut broker, out: [0; 512] });
         client.create_port(&name, 4, 0x148, 0x2400).unwrap()
@@ -963,7 +964,7 @@ fn kernel_srm_endpoint_services_native_alpc_sync_request_through_broker() {
         payload.extend_from_slice(&RM_CREATE_LOGON_SESSION.to_le_bytes());
         payload.extend_from_slice(&u64::from(luid.low).to_le_bytes());
         let request = port_message(0, &payload);
-        let mut wire = enc_checked_receive(client_port, caller, (1, sequence));
+        let mut wire = enc_checked_receive(client_port, sender, (1, sequence));
         let mut header: nt_alpc_abi::AlpcSendReceiveCheckedRequest =
             bytemuck::pod_read_unaligned(&wire);
         header.send_receive.flags = nt_alpc_abi::send_flag::SYNC_REQUEST;
@@ -981,12 +982,14 @@ fn kernel_srm_endpoint_services_native_alpc_sync_request_through_broker() {
         };
         assert_eq!(received.connection_id, connection_id);
         assert_eq!(received.client_process, caller.process);
-        assert_eq!(received.client_thread, caller.thread);
+        assert_eq!(received.client_thread, caller.thread,
+            "broker provenance records the connecting thread");
         assert_eq!(received.msg_type, nt_lpc_abi::msg_type::LPC_REQUEST);
         let delivered: PortMessage = bytemuck::pod_read_unaligned(&received.connection_info[..40]);
         assert_ne!(delivered.message_id, 0);
         assert_eq!(delivered.client_process, caller.process);
-        assert_eq!(delivered.client_thread, caller.thread);
+        assert_eq!(delivered.client_thread, sender.thread,
+            "broker message identity records the sending thread");
         let command = decode_request(&received.connection_info, 0x148).unwrap();
         assert_eq!(command.api_number, RM_CREATE_LOGON_SESSION);
         assert_eq!(command.luid, Some(u64::from(luid.low)));
@@ -1005,7 +1008,7 @@ fn kernel_srm_endpoint_services_native_alpc_sync_request_through_broker() {
         assert_eq!(&response[..completed.information as usize], reply);
         assert_eq!(u32::from_le_bytes(response[44..48].try_into().unwrap()), expected);
         assert_eq!(alpc.dispatch(broker.core_mut(), aop::ALPC_OP_ACK_SEND_RECEIVE,
-            &enc_ack_receive(caller, (1, sequence)), &mut []).status, SUCCESS);
+            &enc_ack_receive(sender, (1, sequence)), &mut []).status, SUCCESS);
     }
     assert!(sessions.contains(luid));
     assert_eq!(broker.core_mut().receive_message(kernel_server_port).unwrap(), None);

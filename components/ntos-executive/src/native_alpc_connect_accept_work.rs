@@ -65,6 +65,7 @@ struct OwnedLater {
     kernel_listen: Option<u64>,
     kernel_connection_id: Option<u64>,
     kernel_client_handle: Option<u64>,
+    srm_reserved: bool,
     kernel_cached: bool,
     reverse_request: Option<Vec<u8>>,
     reverse_failure: Option<i32>,
@@ -293,10 +294,14 @@ unsafe fn begin_owned(handler: &mut ExecNtHandler, caller: NativeCaller,
             invocation_lo: token.1,
         }, ..Default::default()
     };
+    if kernel_listen.is_some() {
+        crate::native_srm_command_work::reserve()?;
+    }
     owners.push(OwnedLater { pi, kind, retained, publication, output, ack, close: None,
         flight: Flight::Ready, reply_status: 0, submitted_once: false,
         kernel_listen, kernel_connection_id: None, kernel_client_handle: None,
-        kernel_cached: false, reverse_request, reverse_failure: None });
+        srm_reserved: kernel_listen.is_some(), kernel_cached: false,
+        reverse_request, reverse_failure: None });
     park.commit();
     Ok(())
 }
@@ -424,6 +429,9 @@ fn selected(owners: &[OwnedLater], active: Option<u64>, cursor: usize) -> Option
 }
 
 unsafe fn retire(owner: OwnedLater, handler: &mut ExecNtHandler) {
+    if owner.srm_reserved {
+        crate::native_srm_command_work::cancel_reservation();
+    }
     let cap = owner.retained.reply_cap();
     let thread = owner.caller().thread;
     assert!(owner.retained.finish_after_reply(true).is_ok());
@@ -621,6 +629,10 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
             owner.flight = if status == STATUS_PENDING {
                 Flight::KernelAcceptReady
             } else if status == 0 && client_handle != 0 && server_handle != 0 {
+                let caller = owner.caller();
+                crate::native_srm_command_work::register(owner.pi, caller.process,
+                    caller.generation, owner.kernel_connection_id.unwrap(), server_handle);
+                owner.srm_reserved = false;
                 owner.kernel_client_handle = Some(client_handle);
                 Flight::ReverseConnectReady
             } else {
@@ -655,6 +667,10 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
             owner.flight = if status == 0 { Flight::ReplyReady } else { Flight::InvalidTerminal };
         }
         Step::AckUncertain(id) => owner.flight = Flight::AckSubmitted(id),
+    }
+    if matches!(owner.flight, Flight::InvalidTerminal) && owner.srm_reserved {
+        crate::native_srm_command_work::cancel_reservation();
+        owner.srm_reserved = false;
     }
     if matches!(owner.flight, Flight::ReplyReady) {
         if owner.retained.begin_reply().is_err() { owner.flight = Flight::InvalidTerminal; }

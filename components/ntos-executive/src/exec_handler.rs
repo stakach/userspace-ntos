@@ -29490,13 +29490,6 @@ impl ExecNtHandler {
         reqmsg: u64,
         replymsg: u64,
     ) -> u32 {
-        const PORT_MESSAGE_HEADER_LEN: u64 = 0x28;
-        const SRM_API_OFFSET: u64 = PORT_MESSAGE_HEADER_LEN;
-        const SRM_RESULT_OFFSET: u64 = PORT_MESSAGE_HEADER_LEN + 4;
-        const SRM_LUID_OFFSET: u64 = PORT_MESSAGE_HEADER_LEN + 4;
-        const RM_AUDIT_SET_COMMAND: u32 = 1;
-        const RM_CREATE_LOGON_SESSION: u32 = 2;
-        const RM_DELETE_LOGON_SESSION: u32 = 3;
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
         const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 
@@ -29514,52 +29507,47 @@ impl ExecNtHandler {
         if total_len > max_message as u64 {
             return nt_status::NtStatus::PORT_MESSAGE_TOO_LONG.raw() as u32;
         }
-        let mut api_bytes = [0u8; 4];
-        if total_len < SRM_API_OFFSET + 4 || !self.xas_read(reqmsg + SRM_API_OFFSET, &mut api_bytes)
-        {
+        let mut storage = [0u8; nt_lpc_abi::PORT_MESSAGE_MAX_LEN];
+        let request = &mut storage[..total_len as usize];
+        if !self.xas_read(reqmsg, request) { return STATUS_ACCESS_VIOLATION; }
+        let Ok(mut command) = nt_srm_message::decode_request(request, max_message as usize) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let Some(reply_type) = replymsg.checked_add(4) else { return STATUS_ACCESS_VIOLATION };
+        let Some(reply_result) = replymsg.checked_add(nt_srm_message::RESULT_OFFSET as u64)
+            else { return STATUS_ACCESS_VIOLATION };
+        if replymsg == 0 || !self.probe_user_output(reply_type, 2)
+            || !self.probe_user_output(reply_result, 4) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        command.result_status = crate::native_srm_command_work::apply_request(
+            command, &self.token_store);
+        if nt_srm_message::write_reply_fields(request, command).is_err() {
             return STATUS_INVALID_PARAMETER;
         }
 
-        let api_number = u32::from_le_bytes(api_bytes);
-        let mut result_status = 0u32;
-        let mut luid = [0u8; 8];
-        match api_number {
-            RM_AUDIT_SET_COMMAND => {}
-            RM_CREATE_LOGON_SESSION | RM_DELETE_LOGON_SESSION => {
-                if total_len < SRM_LUID_OFFSET + 8
-                    || !self.xas_read(reqmsg + SRM_LUID_OFFSET, &mut luid)
-                {
-                    result_status = STATUS_INVALID_PARAMETER;
-                }
-            }
-            _ => {
-                result_status = STATUS_INVALID_PARAMETER;
-            }
-        }
-
-        if replymsg == 0
-            || !self.xas_try_write_buf(
-                replymsg + 0x04,
-                &nt_lpc_abi::msg_type::LPC_REPLY.to_le_bytes(),
+        if !self.xas_try_write_buf(
+                reply_type,
+                &request[4..6],
             )
-            || !self.xas_try_write_buf(replymsg + SRM_RESULT_OFFSET, &result_status.to_le_bytes())
+            || !self.xas_try_write_buf(reply_result,
+                &command.result_status.to_le_bytes())
         {
             return STATUS_ACCESS_VIOLATION;
         }
 
         print_str(b"[srm] serviced \\SeRmCommandPort ApiNumber=");
-        print_u64(api_number as u64);
-        if matches!(
-            api_number,
-            RM_CREATE_LOGON_SESSION | RM_DELETE_LOGON_SESSION
-        ) && result_status == 0
+        print_u64(command.api_number as u64);
+        if matches!(command.api_number, nt_srm_message::RM_CREATE_LOGON_SESSION
+            | nt_srm_message::RM_DELETE_LOGON_SESSION) && command.result_status == 0
         {
             print_str(b" luid=0x");
-            print_hex(u32::from_le_bytes(luid[4..8].try_into().unwrap()));
-            print_hex(u32::from_le_bytes(luid[0..4].try_into().unwrap()));
+            let luid = command.luid.unwrap();
+            print_hex((luid >> 32) as u32);
+            print_hex(luid as u32);
         }
         print_str(b" status=0x");
-        print_hex(result_status);
+        print_hex(command.result_status);
         print_str(b"\n");
         0
     }
