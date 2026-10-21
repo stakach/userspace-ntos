@@ -29,8 +29,11 @@ fn explicit_system_flush_checks_the_durable_v2_wal_without_rewriting_primary() {
         .unwrap_or(fs.len());
     let barrier = &fs[start..end];
     assert!(barrier.contains("snapshot_storage::acquire()"));
-    assert!(barrier.contains("current_paired_wal_journal_manifest"));
-    assert!(barrier.contains("snapshot_storage::peek_wal_continuation(&lease, expected)"));
+    assert!(barrier.contains("snapshot_storage::peek_wal_continuation(&mut lease)"));
+    let storage = include_str!("../../../components/ntos-executive/src/writable_fs/snapshot_storage.rs");
+    let peek = &storage[storage.find("pub(super) fn peek_wal_continuation(").unwrap()
+        ..storage.find("\nfn manifest_anchor(").unwrap()];
+    assert!(peek.contains("recheck_verified_paired_wal_snapshot(lease, &cached.pair)"));
     assert!(!barrier.contains("RegistryWal::recover"),
         "a live flush must use the mount-bound verified continuation");
     assert!(barrier.contains("WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true"));
@@ -51,8 +54,8 @@ fn mounted_v2_volume_checkpoint_captures_one_image_before_disk_effects() {
     assert!(checkpoint.contains("WRITABLE_FS_SNAPSHOT_DIRTY.store(true"),
         "failed pre-effect capture must preserve the dirty owner");
     assert!(checkpoint.find("WRITABLE_FS_SNAPSHOT_DIRTY.swap(false").unwrap()
-        < checkpoint.find("current_wal_checkpoint_manifest").unwrap(),
-        "a clean checkpoint poll must not read both snapshot payloads");
+        < checkpoint.find("snapshot_storage::take_wal_continuation(&mut dev)").unwrap(),
+        "a clean checkpoint poll must not acquire WAL proof or read snapshot headers");
     let start = source.find("unsafe fn checkpoint_volume_snapshot(")
         .expect("checkpoint writer");
     let end = source[start..].find("\n/// ").map(|offset| start + offset).unwrap_or(source.len());

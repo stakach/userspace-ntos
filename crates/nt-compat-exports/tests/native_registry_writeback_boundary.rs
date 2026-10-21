@@ -139,10 +139,12 @@ fn generic_checkpoint_uses_exact_v2_manifest_and_retains_uncertain_reserve() {
         ..writable.find("\n/// Commit pending volume bytes").unwrap()];
     let checkpoint = &writable[writable.find("pub(crate) unsafe fn checkpoint_dirty_volume()").unwrap()
         ..writable.find("\n/// Reclaim immutable blob payloads").unwrap()];
-    assert!(checkpoint.contains("current_wal_checkpoint_manifest"),
-        "the mounted v2 writer must derive the included base and anchor from both slots under its lease");
-    assert!(checkpoint.contains("let wal_manifest = if wal_format {"),
-        "every dirty v2 checkpoint must select its manifest under the reserve lease");
+    assert!(checkpoint.contains("snapshot_storage::take_wal_continuation(&mut dev)"),
+        "the mounted v2 writer must move the exact WAL and paired snapshot proof under its lease");
+    assert!(checkpoint.contains("let (wal_manifest, authority) = if wal_format {"),
+        "every dirty v2 checkpoint must select its manifest and authority under the reserve lease");
+    assert!(checkpoint.contains("verify_paired_wal_snapshot(&mut dev)"),
+        "a settled checkpoint must refresh its payload proof before later writers can enter");
     assert!(writer.contains("commit_next_with_wal_manifest")
         && checkpoint.contains("snapshot_capture::CapturedSnapshot::capture(&dev, fs)")
         && checkpoint.contains("captured_image.as_ref().map(snapshot_capture::CapturedSnapshot::as_slice)"),
