@@ -18,6 +18,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[path = "allocator_oom_budget.rs"]
 mod oom_budget;
+#[path = "allocator_free_list.rs"]
+mod free_list;
 
 /// The component-local heap VA. The root reserves the 64 MiB band ending at the original scratch
 /// base; its lower 32 MiB is mapped initially and later durable pages are committed on demand.
@@ -563,12 +565,12 @@ unsafe fn validate_free_list(operation: &'static [u8], owner_start: usize, owner
         let Some(end) = node.checked_add(size) else {
             allocator_corruption(operation, owner_start, owner_size, node, size, next);
         };
-        if node < previous_end
+        if (guard != 0 && node <= previous_end)
             || size < FREE_NODE_SIZE
             || size % ALLOC_GRANULE != 0
             || end > top
             || (next != 0
-                && (next <= node || next < end || next >= top || next % ALLOC_GRANULE != 0))
+                && (next <= end || next >= top || next % ALLOC_GRANULE != 0))
         {
             allocator_corruption(operation, owner_start, owner_size, node, size, next);
         }
@@ -579,94 +581,20 @@ unsafe fn validate_free_list(operation: &'static [u8], owner_start: usize, owner
 }
 
 unsafe fn insert_free_block(start: usize, size: usize) {
-    let allocated_end = DATA + unsafe { read_word(CTR) };
-    if size < FREE_NODE_SIZE
-        || start < DATA
-        || start
-            .checked_add(size)
-            .is_none_or(|end| end > allocated_end)
-    {
-        allocator_corruption(b"insert", start, size, start, size, 0);
-    }
-
-    let mut prev = 0usize;
-    let mut prev_link = FREE_HEAD;
-    let mut cur = unsafe { read_word(FREE_HEAD) };
-    while cur != 0 && cur < start {
-        prev = cur;
-        prev_link = cur + WORD;
-        cur = unsafe { free_node_next(cur) };
-    }
-    if cur == start {
-        return;
-    }
-    let end = start + size;
-    if (prev != 0
-        && prev
-            .checked_add(unsafe { free_node_size(prev) })
-            .is_none_or(|prev_end| prev_end > start))
-        || (cur != 0 && end > cur)
-    {
-        allocator_corruption(b"insert-overlap", start, size, cur, 0, 0);
-    }
-
-    unsafe {
-        set_free_node(start, size, cur);
-        write_word(prev_link, start);
-    }
-
-    let block = start;
-    let mut block_size = size;
-    if cur != 0 && block.checked_add(block_size) == Some(cur) {
-        let merged_size = block_size.saturating_add(unsafe { free_node_size(cur) });
-        let merged_next = unsafe { free_node_next(cur) };
-        unsafe { set_free_node(block, merged_size, merged_next) };
-        block_size = merged_size;
-    }
-
-    if prev != 0 {
-        let prev_size = unsafe { free_node_size(prev) };
-        if prev.checked_add(prev_size) == Some(block) {
-            let merged_size = prev_size.saturating_add(block_size);
-            let merged_next = unsafe { free_node_next(block) };
-            unsafe { set_free_node(prev, merged_size, merged_next) };
-        }
-    }
-}
-
-unsafe fn release_top_free_blocks() {
-    loop {
-        let top = DATA + unsafe { read_word(CTR) };
-        let mut prev_link = FREE_HEAD;
-        let mut cur = unsafe { read_word(FREE_HEAD) };
-        let mut released = false;
-        while cur != 0 {
-            if cur < DATA || cur >= top || cur % ALLOC_GRANULE != 0 {
-                allocator_corruption(b"release-top", 0, 0, cur, 0, 0);
-            }
-            let size = unsafe { free_node_size(cur) };
-            let next = unsafe { free_node_next(cur) };
-            if size < FREE_NODE_SIZE
-                || size % ALLOC_GRANULE != 0
-                || cur.checked_add(size).is_none_or(|end| end > top)
-                || (next != 0 && (next <= cur || next >= top || next % ALLOC_GRANULE != 0))
-            {
-                allocator_corruption(b"release-top", 0, 0, cur, size, next);
-            }
-            if cur.checked_add(size) == Some(top) {
-                unsafe {
-                    write_word(prev_link, next);
-                    write_word(CTR, cur - DATA);
-                }
-                released = true;
-                break;
-            }
-            prev_link = cur + WORD;
-            cur = next;
-        }
-        if !released {
-            break;
-        }
+    let list = free_list::FreeList {
+        data: DATA,
+        counter: CTR,
+        head: FREE_HEAD,
+    };
+    if let Err(corruption) = unsafe { list.insert(start, size) } {
+        allocator_corruption(
+            corruption.operation,
+            start,
+            size,
+            corruption.node,
+            corruption.size,
+            corruption.next,
+        );
     }
 }
 
@@ -753,7 +681,6 @@ impl Bump {
         };
         unsafe {
             insert_free_block(start, size);
-            release_top_free_blocks();
         };
     }
 
@@ -892,7 +819,6 @@ unsafe impl GlobalAlloc for Bump {
             if tail >= FREE_NODE_SIZE {
                 unsafe {
                     insert_free_block(start + new_block_size, tail);
-                    release_top_free_blocks();
                 }
             }
             return ptr;
