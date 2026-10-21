@@ -267,7 +267,10 @@ unsafe fn acquire(address: u64, shared: bool) {
                         if waiter(node).flags.fetch_and(!2, Ordering::AcqRel) & 2 != 0 {
                             let status = s_ke_wait_for_single_object(node, 28, 0, 0, 0);
                             if status != 0 {
-                                fatal(address, 17);
+                                crate::provider_bugcheck::report(
+                                    0xc4,
+                                    [TAG, address, 17, status as u32 as u64],
+                                );
                             }
                         }
                         // A resumed waiter may still have a signaling reference. It owns its

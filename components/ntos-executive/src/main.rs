@@ -87,6 +87,7 @@ mod win32k_seh_image;
 mod win32k_cr8_publication;
 mod hosted_win32k_cr8_fault;
 mod win32k_session_runtime;
+mod win32k_bulk_mapping;
 mod win32k_subsystem;
 pub(crate) use service_sec_image::*;
 mod loader_trace_diag;
@@ -7167,6 +7168,31 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
         &*core::ptr::addr_of!(EXPLORER_SSN_HIST)
     });
     print_str(b"\n");
+    if LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) != 0 {
+        let tcb = LSA_LOGON_LAST_TCB.load(Ordering::Relaxed);
+        print_str(b"[lsa-logon-census] calls=");
+        print_u64(LSA_LOGON_SSN_TRACE.load(Ordering::Relaxed));
+        print_str(b" server-tid=");
+        print_u64(LSA_LOGON_SERVER_TID.load(Ordering::Relaxed));
+        print_str(b" last-ssn=");
+        print_u64(LSA_LOGON_LAST_SSN.load(Ordering::Relaxed));
+        print_str(b" last-status=0x");
+        print_hex_u64(LSA_LOGON_LAST_STATUS.load(Ordering::Relaxed));
+        print_str(b" client-reads=");
+        print_u64(LSA_LOGON_CLIENT_READS.load(Ordering::Relaxed));
+        print_str(b" tcb=0x");
+        print_hex_u64(tcb);
+        if tcb != 0 {
+            let mut regs = [0u64; 20];
+            if unsafe { win32k_glue::tcb_read_regs20_checked(tcb, &mut regs) } {
+                print_str(b" rip=0x");
+                print_hex_u64(regs[0]);
+                print_str(b" rsp=0x");
+                print_hex_u64(regs[1]);
+            }
+        }
+        print_str(b"\n");
+    }
 }
 
 /// Dump the census if the period has elapsed, using the shared static clock.
@@ -12050,6 +12076,14 @@ unsafe fn alloc_frame_run(count: u64) -> u64 {
             print_u64(count);
             print_str(b" error=");
             print_u64(error);
+            print_str(b" root-ut-total=");
+            print_u64(UT_TOTAL_BYTES.load(Ordering::Relaxed));
+            print_str(b" cumulative-retyped=");
+            print_u64(UT_RETYPE_BYTES.load(Ordering::Relaxed));
+            print_str(b" live-retyped=");
+            print_u64(UT_RETYPE_LIVE_BYTES.load(Ordering::Relaxed));
+            print_str(b" released=");
+            print_u64(UT_RETYPE_RELEASED_BYTES.load(Ordering::Relaxed));
             print_str(b"\n");
             panic!("contiguous root frame retype failed");
         }
@@ -14605,6 +14639,14 @@ unsafe fn map_own_heap_frames(first: u64, count: u64) -> bool {
             print_u64(batch);
             print_str(b" error=");
             print_u64(error);
+            print_str(b" root-ut-total=");
+            print_u64(UT_TOTAL_BYTES.load(Ordering::Relaxed));
+            print_str(b" cumulative-retyped=");
+            print_u64(UT_RETYPE_BYTES.load(Ordering::Relaxed));
+            print_str(b" live-retyped=");
+            print_u64(UT_RETYPE_LIVE_BYTES.load(Ordering::Relaxed));
+            print_str(b" released=");
+            print_u64(UT_RETYPE_RELEASED_BYTES.load(Ordering::Relaxed));
             print_str(b"\n");
             panic!("required executive heap frame retype failed");
         }
@@ -15511,6 +15553,18 @@ pub(crate) unsafe fn config_manager_query_critical_device_binding(
     }
 }
 
+pub(crate) unsafe fn config_manager_query_driver_database_binding(
+    bus_id: &str,
+) -> Result<Option<nt_config_client::CriticalDeviceBinding>, i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    nt_config_client::resolve_driver_database_binding(bus_id, expected_generation, |path| {
+        config_manager_query_system_hive_key(path)
+    })
+}
+
 pub(crate) fn config_manager_device_action_pending() -> bool {
     CONFIG_DEVICE_ACTION_PENDING.load(Ordering::Acquire)
 }
@@ -15528,18 +15582,6 @@ pub(crate) unsafe fn config_manager_next_device_action(
     if !config_manager_device_action_pending() {
         return Ok(None);
     }
-pub(crate) unsafe fn config_manager_query_driver_database_binding(
-    bus_id: &str,
-) -> Result<Option<nt_config_client::CriticalDeviceBinding>, i32> {
-    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
-    if expected_generation == 0 {
-        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
-    }
-    nt_config_client::resolve_driver_database_binding(bus_id, expected_generation, |path| {
-        config_manager_query_system_hive_key(path)
-    })
-}
-
     let current_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
     if current_generation == 0 {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
@@ -26433,6 +26475,13 @@ pub(crate) static LSA_REPLIES_DELIVERED: AtomicU64 = AtomicU64::new(0);
 /// Bounded trace counter for native services executed while a worker owns an authentication-port
 /// request, and the first unsupported service observed in that state.
 pub(crate) static LSA_SRV_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
+/// Temporary boot diagnostic scoped to one real authentication-port logon request.
+/// Reset when API 2 is delivered, so earlier LSA traffic cannot exhaust its trace budget.
+pub(crate) static LSA_LOGON_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LSA_LOGON_LAST_SSN: AtomicU64 = AtomicU64::new(u64::MAX);
+pub(crate) static LSA_LOGON_LAST_STATUS: AtomicU64 = AtomicU64::new(u64::MAX);
+pub(crate) static LSA_LOGON_LAST_TCB: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LSA_LOGON_SERVER_TID: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LSA_SERVER_WALL_SSN: AtomicU64 = AtomicU64::new(u64::MAX);
 /// The LSA `ApiNumber` of the last request the real server received (see `LSA_API_NUMBER`).
 pub(crate) static LSA_LAST_API_NUMBER: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -30823,8 +30872,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // Pointer-free registry staging. CM channels and leased-key state remain in the
             // executive while win32k carries only bounded bytes and opaque handles.
             let registry_request_base = alloc_frame_run(win32k_subsystem::WIN32K_REGISTRY_FRAMES);
-            // Bulk provider argument staging for large GDI client buffers.
-            let bulk_arg_base = alloc_frame_run(win32k_subsystem::WIN32K_BULK_ARG_FRAMES);
             // KUSER_SHARED_DATA for win32k's kernel-mode high canonical mapping. It is initialized
             // through an executive scratch alias below, then mapped into the component after its
             // high-VA paging chain exists.
@@ -30926,28 +30973,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let _ = page_map(
                     copy_cap(registry_request_base + i),
                     win32k_subsystem::WIN32K_REGISTRY_VADDR + i * 0x1000,
-                    RW_NX,
-                    CAP_INIT_THREAD_VSPACE,
-                );
-            }
-            let bulk_arg_pt = alloc_slot();
-            let _ = untyped_retype(
-                CAP_INIT_UNTYPED,
-                OBJ_X86_PAGE_TABLE,
-                PAGING_BITS,
-                1,
-                bulk_arg_pt,
-            );
-            let _ = paging_struct_map(
-                bulk_arg_pt,
-                LBL_X86_PAGE_TABLE_MAP,
-                win32k_subsystem::WIN32K_BULK_ARG_VADDR,
-                CAP_INIT_THREAD_VSPACE,
-            );
-            for i in 0..win32k_subsystem::WIN32K_BULK_ARG_FRAMES {
-                let _ = page_map(
-                    copy_cap(bulk_arg_base + i),
-                    win32k_subsystem::WIN32K_BULK_ARG_VADDR + i * 0x1000,
                     RW_NX,
                     CAP_INIT_THREAD_VSPACE,
                 );
@@ -31230,15 +31255,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     count: win32k_subsystem::WIN32K_REGISTRY_FRAMES,
                     rights: Rights::Uniform(RW_NX),
                     pts: 0,
-                };
-                n += 1;
-                // Bulk provider argument staging (own PT window, aliased frames).
-                regions[n] = Region {
-                    source: FrameSource::Alias(bulk_arg_base),
-                    base_va: win32k_subsystem::WIN32K_BULK_ARG_VADDR,
-                    count: win32k_subsystem::WIN32K_BULK_ARG_FRAMES,
-                    rights: Rights::Uniform(RW_NX),
-                    pts: pts_for(win32k_subsystem::WIN32K_BULK_ARG_FRAMES),
                 };
                 n += 1;
                 // Session-heap + Mm-view arena (own window + PTs, aliased frames).

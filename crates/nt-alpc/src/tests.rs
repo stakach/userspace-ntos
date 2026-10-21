@@ -920,6 +920,90 @@ fn checked_sync_request_waits_for_its_exact_reply_without_replaying_send() {
     assert_eq!(core.receive_message(server_port).unwrap(), None, "redrive did not resend");
 }
 
+#[test]
+fn pending_reply_wait_delivers_sync_reply_before_next_request() {
+    use nt_port_core::{ClientId, ConnectOutcome, MessageAttrs, MessageIdentity};
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let server = ClientId { process: 7, thread: 11 };
+    let client = ClientId { process: 8, thread: 12 };
+    let name = utf16("\\ApiPortPendingReplyWait");
+    let listen = core.create_port_with_owner(&name, PortApi::Alpc, server);
+    let ConnectOutcome::Pending { connection_id } = core.connect_with_client_id(
+        &name, PortApi::Alpc, 0, b"", client).unwrap() else { panic!("pending connect"); };
+    core.receive(listen).unwrap();
+    let server_comm = core.accept(connection_id, true, 0xCAFE_BABE).unwrap();
+    let client_comm = core.complete(connection_id).unwrap().0;
+
+    let request = port_message(0, b"create-process");
+    let mut client_wire = enc_checked_receive(client_comm, client, (3, 91));
+    let mut client_header: nt_alpc_abi::AlpcSendReceiveCheckedRequest =
+        bytemuck::pod_read_unaligned(&client_wire);
+    client_header.send_receive.flags = nt_alpc_abi::send_flag::SYNC_REQUEST;
+    client_header.send_receive.message_offset = client_wire.len() as u32;
+    client_header.send_receive.message_len_bytes = request.len() as u32;
+    client_wire.copy_from_slice(bytemuck::bytes_of(&client_header));
+    client_wire.extend_from_slice(&request);
+    let mut client_output = [0u8; 128];
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &client_wire, &mut client_output).status, nt_status::NtStatus::PENDING.0);
+
+    let mut server_wire = enc_checked_receive(listen, server, (3, 92));
+    let mut server_header: nt_alpc_abi::AlpcSendReceiveCheckedRequest =
+        bytemuck::pod_read_unaligned(&server_wire);
+    server_header.send_receive.flags = nt_alpc_abi::send_flag::RECV_ATTRIBUTES;
+    server_header.send_receive.valid_attributes = msg_attr_flag::CONTEXT;
+    server_wire.copy_from_slice(bytemuck::bytes_of(&server_header));
+    let mut server_output = [0u8; 128];
+    let received = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &server_wire, &mut server_output);
+    assert_eq!(received.status, SUCCESS);
+    let delivered: PortMessage = bytemuck::pod_read_unaligned(&server_output[40..80]);
+    assert_eq!(delivered.msg_type, msg_type::REQUEST);
+    let identity = MessageIdentity { client, message_id: delivered.message_id };
+
+    let mut response = port_message(msg_type::REPLY, b"accepted");
+    response[8..16].copy_from_slice(&client.process.to_le_bytes());
+    response[16..24].copy_from_slice(&client.thread.to_le_bytes());
+    response[24..28].copy_from_slice(&identity.message_id.to_le_bytes());
+    let mut reply_wait = enc_checked_receive(server_comm, server, (3, 93));
+    let mut reply_header: nt_alpc_abi::AlpcSendReceiveCheckedRequest =
+        bytemuck::pod_read_unaligned(&reply_wait);
+    reply_header.send_receive.flags =
+        nt_alpc_abi::send_flag::REPLY_MESSAGE | nt_alpc_abi::send_flag::RECV_ATTRIBUTES;
+    reply_header.send_receive.valid_attributes = msg_attr_flag::CONTEXT;
+    reply_header.send_receive.message_offset = reply_wait.len() as u32;
+    reply_header.send_receive.message_len_bytes = response.len() as u32;
+    reply_wait.copy_from_slice(bytemuck::bytes_of(&reply_header));
+    reply_wait.extend_from_slice(&response);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &reply_wait, &mut server_output).status, nt_status::NtStatus::PENDING.0,
+        "server waits for its next request after sending the reply");
+    let completed = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &client_wire, &mut client_output);
+    assert_eq!(completed.status, SUCCESS, "client reply must not wait for the server's next request");
+    assert_eq!(&client_output[..completed.information as usize], &response);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &reply_wait, &mut server_output).status, nt_status::NtStatus::PENDING.0);
+
+    let next_identity = MessageIdentity { client, message_id: 94 };
+    let mut next_request = port_message(msg_type::REQUEST, b"next");
+    next_request[8..16].copy_from_slice(&client.process.to_le_bytes());
+    next_request[16..24].copy_from_slice(&client.thread.to_le_bytes());
+    next_request[24..28].copy_from_slice(&next_identity.message_id.to_le_bytes());
+    core.send_request_message(client_comm, &next_request, MessageAttrs::default(), next_identity)
+        .unwrap();
+    let next = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &reply_wait, &mut server_output);
+    assert_eq!(next.status, SUCCESS);
+    assert_eq!(&server_output[40..next.information as usize], &next_request);
+    assert_eq!(core.receive_reply_message(client_comm, identity).unwrap(), None,
+        "redrive must not send the first reply twice");
+    assert_eq!(core.receive_message(listen).unwrap(), None,
+        "later request was consumed exactly once");
+}
+
 fn enc_owned_create_port(
     name: &[u16],
     owner: nt_port_core::ClientId,

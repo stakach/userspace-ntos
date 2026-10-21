@@ -66,6 +66,13 @@ impl ComponentSuspensionCompletion {
 pub(super) struct HostedNativeContinuation {
     pub(super) pending: PendingComponentDispatch,
     pub(super) return_target: HostedReturnTarget<win32k_glue::StagedUserCallbackContext>,
+    pub(super) destination: HostedContinuationDestination,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HostedContinuationDestination {
+    Win32k,
+    InitialThread(nt_user_host::process_create_callout::InitialThreadReplyOrigin<HostedThreadRole>),
 }
 
 #[derive(Clone, Copy)]

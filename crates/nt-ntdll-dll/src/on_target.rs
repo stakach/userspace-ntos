@@ -2453,41 +2453,13 @@ unsafe fn load_dependent_dll(open_name_lc: &[u8]) -> u64 {
     // a relative name when RootDirectory is null: static imports use System32, DOS drive paths use
     // the \?? namespace, and already-absolute NT names pass through unchanged.
     let mut wname = [0u16; 180];
-    let mut wn = 0usize;
-    let prefix: &[u8] = if open_name_lc.first() == Some(&b'\\') {
-        b""
-    } else if open_name_lc.get(1) == Some(&b':') {
-        b"\\??\\"
-    } else {
-        b"\\SystemRoot\\System32\\"
-    };
-    let extension_len = if dll_leaf_has_extension(open_name_lc) {
-        0
-    } else {
-        4
-    };
-    if prefix
-        .len()
-        .checked_add(open_name_lc.len())
-        .and_then(|length| length.checked_add(extension_len))
-        .is_none_or(|length| length > wname.len())
-    {
+    let Some(mut wn) = nt_ntdll::loader::dll_open_name::build_candidate(
+        open_name_lc,
+        false,
+        &mut wname,
+    ) else {
         return 0;
-    }
-    for &b in prefix {
-        wname[wn] = b as u16;
-        wn += 1;
-    }
-    for &b in open_name_lc {
-        wname[wn] = b as u16;
-        wn += 1;
-    }
-    if !dll_leaf_has_extension(open_name_lc) {
-        for &b in b".dll" {
-            wname[wn] = b as u16;
-            wn += 1;
-        }
-    }
+    };
     // UNICODE_STRING { Length, MaximumLength, Buffer } (x64: u16,u16,pad,ptr).
     #[repr(C)]
     struct UnicodeString {
@@ -2496,7 +2468,7 @@ unsafe fn load_dependent_dll(open_name_lc: &[u8]) -> u64 {
         _pad: u32,
         buffer: u64,
     }
-    let us = UnicodeString {
+    let mut us = UnicodeString {
         length: (wn * 2) as u16,
         maximum_length: (wn * 2) as u16,
         _pad: 0,
@@ -2504,17 +2476,37 @@ unsafe fn load_dependent_dll(open_name_lc: &[u8]) -> u64 {
     };
 
     // NtOpenFile(image) -> NtCreateSection(SEC_IMAGE): reuse rtlp_map_file (opens by name, closes
-    // the file, leaves the SEC_IMAGE handle in `section` until the map attempt consumes it).
-    let mut section: u64 = 0;
-    // SAFETY: on-target; us is a valid UNICODE_STRING*, section a writable stack local.
-    let st = unsafe {
-        rtlp_map_file(
-            core::ptr::addr_of!(us) as *const u8,
-            0x40, // OBJ_CASE_INSENSITIVE
-            core::ptr::addr_of_mut!(section),
-        )
+    // the file, and returns the SEC_IMAGE handle until the map attempt consumes it).
+    // SAFETY: on-target; us points at the current owned name in `wname`.
+    let first = unsafe { rtlp_map_file(core::ptr::addr_of!(us) as *const u8, 0x40) };
+    let section = match first {
+        Ok(section) => section,
+        Err(error)
+            if nt_ntdll::loader::dll_open_name::retry_with_dll_extension(
+                open_name_lc,
+                error.stage,
+                error.status,
+            ) =>
+        {
+            let Some(fallback_len) = nt_ntdll::loader::dll_open_name::build_candidate(
+                open_name_lc,
+                true,
+                &mut wname,
+            ) else {
+                return 0;
+            };
+            wn = fallback_len;
+            us.length = (wn * 2) as u16;
+            us.maximum_length = us.length;
+            // SAFETY: the first open definitively missed; this is a different, exact file name.
+            match unsafe { rtlp_map_file(core::ptr::addr_of!(us) as *const u8, 0x40) } {
+                Ok(section) => section,
+                Err(_) => return 0,
+            }
+        }
+        Err(_) => return 0,
     };
-    if (st as i32) < 0 || section == 0 {
+    if section == 0 {
         return 0;
     }
 
@@ -3743,15 +3735,6 @@ unsafe fn set_ldr_process_attached(base: u64, attached: bool) {
 // the same in-process machinery as the static-import snap: load-by-name + snap-imports + the export
 // walker, over the process-wide MODULE_TABLE.
 // ---------------------------------------------------------------------------------------------
-
-fn dll_leaf_has_extension(name: &[u8]) -> bool {
-    let start = name
-        .iter()
-        .rposition(|&c| c == b'\\' || c == b'/')
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    name[start..].contains(&b'.')
-}
 
 #[cfg(target_arch = "x86_64")]
 struct DllLoadName {
@@ -8245,6 +8228,47 @@ pub enum QueueWorkItemOutcome {
     Indeterminate(u32),
 }
 
+#[cfg(target_arch = "x86_64")]
+unsafe fn trace_work_post_failure(stage: &[u8], status: u32) {
+    fn append_hex(message: &mut [u8; 112], length: &mut usize, value: u64) {
+        for shift in (0..16).rev() {
+            message[*length] = b"0123456789abcdef"[((value >> (shift * 4)) & 15) as usize];
+            *length += 1;
+        }
+    }
+    let (pid, tid): (u64, u64);
+    core::arch::asm!("mov {}, gs:[0x40]", out(reg) pid, options(nostack, preserves_flags, readonly));
+    core::arch::asm!("mov {}, gs:[0x48]", out(reg) tid, options(nostack, preserves_flags, readonly));
+    let mut message = [0u8; 112];
+    let mut length = 0usize;
+    for &byte in b"[rtl-work-post-diag] " {
+        message[length] = byte;
+        length += 1;
+    }
+    for &byte in stage {
+        message[length] = byte;
+        length += 1;
+    }
+    for &byte in b" pid=" {
+        message[length] = byte;
+        length += 1;
+    }
+    append_hex(&mut message, &mut length, pid);
+    for &byte in b" tid=" {
+        message[length] = byte;
+        length += 1;
+    }
+    append_hex(&mut message, &mut length, tid);
+    for &byte in b" status=" {
+        message[length] = byte;
+        length += 1;
+    }
+    append_hex(&mut message, &mut length, status as u64);
+    message[length] = b'\n';
+    length += 1;
+    crate::dbg_print_bytes(message.as_ptr(), length);
+}
+
 pub unsafe fn rtl_queue_work_item(function: u64, context: u64, flags: u32) -> u32 {
     match unsafe { rtl_queue_work_item_checked(function, context, flags) } {
         QueueWorkItemOutcome::NoEffect(status) => status,
@@ -8268,6 +8292,7 @@ pub unsafe fn rtl_queue_work_item_checked(
     let work_flags = nt_rtl_work_item::WorkItemFlags::from_bits_retain(flags);
     let status = unsafe { initialize_work_pool() };
     if !nt_rtl_work_item::nt_success(status) {
+        unsafe { trace_work_post_failure(b"init", status) };
         return QueueWorkItemOutcome::NoEffect(status);
     }
 
@@ -8275,6 +8300,7 @@ pub unsafe fn rtl_queue_work_item_checked(
         crate::process_heap_alloc(core::mem::size_of::<nt_rtl_work_item::WorkItemPacket>())
     };
     if packet_address.is_null() {
+        unsafe { trace_work_post_failure(b"packet", STATUS_NO_MEMORY as u32) };
         return QueueWorkItemOutcome::NoEffect(STATUS_NO_MEMORY as u32);
     }
     let mut token_handle = 0u64;
@@ -8310,6 +8336,7 @@ pub unsafe fn rtl_queue_work_item_checked(
     };
     work_pool_unlock_counters();
     let Ok(submission) = submission else {
+        unsafe { trace_work_post_failure(b"reserve", STATUS_QUOTA_EXCEEDED_U32) };
         if token_handle != 0 {
             let _ = unsafe { syscall4(SSN_NT_CLOSE, token_handle, 0, 0, 0) };
         }
@@ -8319,6 +8346,7 @@ pub unsafe fn rtl_queue_work_item_checked(
 
     let status = unsafe { start_completion_worker_for(work_flags) };
     if !nt_rtl_work_item::nt_success(status) {
+        unsafe { trace_work_post_failure(b"worker", status) };
         let _ = unsafe { cleanup_failed_submission(submission) };
         return QueueWorkItemOutcome::NoEffect(status);
     }
@@ -8340,6 +8368,7 @@ pub unsafe fn rtl_queue_work_item_checked(
         unsafe { rtl_async_wake() };
         QueueWorkItemOutcome::Queued
     } else {
+        unsafe { trace_work_post_failure(b"completion", status) };
         let _ = unsafe { cleanup_failed_submission(submission) };
         QueueWorkItemOutcome::NoEffect(status)
     }
@@ -11606,13 +11635,19 @@ fn report_file_map_failure(
     }
 }
 
-/// `RtlpMapFile` (process.c:20): NtOpenFile(image) → NtCreateSection(SEC_IMAGE) → NtClose(file). On
-/// success `*section` holds the SEC_IMAGE handle.
+#[cfg(target_arch = "x86_64")]
+struct FileMapError {
+    stage: nt_ntdll::loader::file_map_failure::FileMapFailureStage,
+    status: u32,
+}
+
+/// `RtlpMapFile` (process.c:20): NtOpenFile(image) → NtCreateSection(SEC_IMAGE) → NtClose(file).
+/// On success returns the SEC_IMAGE handle; a failure retains its stage for safe retry decisions.
 ///
 /// # Safety
-/// On-target; `image_file_name` a valid `UNICODE_STRING*`; `section` a writable `HANDLE*`.
+/// On-target; `image_file_name` a valid `UNICODE_STRING*`.
 #[cfg(target_arch = "x86_64")]
-unsafe fn rtlp_map_file(image_file_name: *const u8, attributes: u32, section: *mut u64) -> u32 {
+unsafe fn rtlp_map_file(image_file_name: *const u8, attributes: u32) -> Result<u64, FileMapError> {
     let mut h_file: u64 = 0;
     let mut iosb: [u64; 2] = [0; 2];
     let oa = ObjectAttributes {
@@ -11644,15 +11679,19 @@ unsafe fn rtlp_map_file(image_file_name: *const u8, attributes: u32, section: *m
             nt_ntdll::loader::file_map_failure::FileMapFailureStage::Open,
             st,
         );
-        return st;
+        return Err(FileMapError {
+            stage: nt_ntdll::loader::file_map_failure::FileMapFailureStage::Open,
+            status: st,
+        });
     }
     // NtCreateSection(&Section, SECTION_ALL_ACCESS, OA=NULL, MaxSize=NULL, PAGE_EXECUTE, SEC_IMAGE,
     //                 hFile).
     // SAFETY: on-target syscall.
+    let mut section = 0;
     let st = unsafe {
         syscall8(
             SSN_NT_CREATE_SECTION,
-            section as u64,
+            core::ptr::addr_of_mut!(section) as u64,
             SECTION_ALL_ACCESS,
             0,
             0,
@@ -11672,9 +11711,12 @@ unsafe fn rtlp_map_file(image_file_name: *const u8, attributes: u32, section: *m
             nt_ntdll::loader::file_map_failure::FileMapFailureStage::CreateSection,
             st,
         );
-        return st;
+        return Err(FileMapError {
+            stage: nt_ntdll::loader::file_map_failure::FileMapFailureStage::CreateSection,
+            status: st,
+        });
     }
-    st
+    Ok(section)
 }
 
 /// `RtlCreateUserProcess` (process.c:194) — create a process + its (suspended) initial thread from an
@@ -11703,12 +11745,11 @@ pub unsafe fn rtl_create_user_process(
     }
 
     // --- RtlpMapFile: open the image + create its SEC_IMAGE section. ---
-    let mut h_section: u64 = 0;
     // SAFETY: on-target.
-    let st = unsafe { rtlp_map_file(image_file_name, attributes, &mut h_section) };
-    if (st as i32) < 0 {
-        return st;
-    }
+    let h_section = match unsafe { rtlp_map_file(image_file_name, attributes) } {
+        Ok(section) => section,
+        Err(error) => return error.status,
+    };
 
     // RTL_USER_PROCESS_INFORMATION x64 layout:
     //   Size@0x00 (already set by caller), ProcessHandle@0x08, ThreadHandle@0x10,

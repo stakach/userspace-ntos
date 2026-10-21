@@ -102,7 +102,7 @@ pub(super) unsafe fn retain_callback_transfer(
             .expect("callback failure lost its delivery stage");
         lanes.record_terminal_stage(&mut attempt, reply_object, TerminalStageOutcome::Indeterminate(status))
             .expect("callback failure lost its retained payload");
-        report_retained_failure(lane);
+        report_retained_failure(lane, b"callback-capture", Some(TerminalStage::Output), None, true);
     }
 }
 
@@ -132,7 +132,7 @@ pub(super) unsafe fn retain_incomplete_provider(
             TerminalStageOutcome::Indeterminate(status),
         )
         .expect("rejected component re-wait uncertainty publication failed");
-    report_retained_failure(lane);
+    report_retained_failure(lane, b"repark-rejected", Some(TerminalStage::Output), None, false);
 }
 
 static DELIVERY_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -213,7 +213,10 @@ pub(super) unsafe fn drain_shared_returns() -> u64 {
             (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index] = None;
             completed += 1;
         } else {
-            report_retained_failure(pending.dispatch.lane());
+            report_retained_failure(
+                pending.dispatch.lane(), b"shared-return", None, None,
+                matches!(pending.action, SharedReturn::Repark(_)),
+            );
         }
     }
     completed
@@ -257,12 +260,39 @@ pub(super) unsafe fn stats() -> Stats {
     stats
 }
 
-fn report_retained_failure(lane: nt_component_suspension::LaneHandle) {
+fn report_retained_failure(
+    lane: nt_component_suspension::LaneHandle,
+    reason: &[u8],
+    stage: Option<TerminalStage>,
+    phase: Option<TerminalPhase>,
+    callback_owned: bool,
+) {
     if DELIVERY_FAILURES.fetch_add(1, Ordering::Relaxed) < 8 {
         print_str(b"[component-terminal] delivery retained after failure lane=");
         print_u64(lane.index as u64);
         print_str(b" generation=");
         print_u64(lane.generation);
+        print_str(b" reason=");
+        print_str(reason);
+        print_str(b" stage=");
+        print_str(match stage {
+            Some(TerminalStage::LocalDelivery) => b"local-delivery",
+            Some(TerminalStage::Output) => b"output",
+            Some(TerminalStage::Context) => b"context",
+            Some(TerminalStage::Publication) => b"publication",
+            Some(TerminalStage::Reply) => b"reply",
+            None => b"none",
+        });
+        print_str(b" phase=");
+        print_str(match phase {
+            Some(TerminalPhase::Ready { .. }) => b"ready",
+            Some(TerminalPhase::Invoking { .. }) => b"invoking",
+            Some(TerminalPhase::Indeterminate { .. }) => b"indeterminate",
+            Some(TerminalPhase::Acknowledged { .. }) => b"acknowledged",
+            None => b"none",
+        });
+        print_str(b" callback-owned=");
+        print_u64(u64::from(callback_owned));
         print_str(b"\n");
     }
 }
@@ -273,18 +303,57 @@ unsafe fn process_output(
     terminal: &mut NativeTerminal,
     procs: &mut [ProcExec],
     pfilled: &mut [[u64; 512]],
-) {
-    if continuation.return_target.is_abandoned() {
-        return;
+) -> Result<(), u32> {
+    if continuation.return_target.is_abandoned()
+        && !matches!(continuation.destination, HostedContinuationDestination::InitialThread(_)) {
+        if let NativeReturn::Hosted(dispatch) = terminal.returned {
+            if let Some(context) = dispatch.dispatch_context {
+                let client = continuation.pending.client();
+                if !win32k_bulk_mapping::complete_dispatch(
+                    context, client.pi, client.generation,
+                    dispatch.dispatch_return, dispatch.status,
+                ) {
+                    return Err(nt_process::STATUS_INVALID_HANDLE);
+                }
+            }
+        }
+        return Ok(());
     }
-    assert!(
-        continuation.return_target.delivery().is_some(),
-        "retiring target cannot deliver output"
-    );
+    assert!(continuation.return_target.can_resume(), "retiring target cannot deliver output");
     let NativeReturn::Hosted(mut dispatch) = terminal.returned else {
-        return;
+        return Ok(());
     };
     let client = continuation.pending.client();
+    if let HostedContinuationDestination::InitialThread(origin) = continuation.destination {
+        let binding = origin.target();
+        let exact_client = binding.pi == client.pi as usize
+            && binding.tid == client.tid
+            && binding.badge == client.badge
+            && u64::from(binding.process.pid) == client.pid
+            && matches!(binding.process.generation,
+                nt_user_host::process_identity::ProcessGeneration::Hosted(generation)
+                    if generation == client.generation)
+            && client.logical_caller.is_some_and(|caller| {
+                caller.pi() == binding.pi
+                    && caller.process() == binding.process
+                    && u64::from(caller.thread().thread_id()) == binding.tid
+                    && caller.badge() == binding.badge
+                    && caller.tcb() == binding.tcb
+            })
+            && nt_handler.capture_process_identity(binding.pi) == Some(binding.process)
+            && dispatch.ssn == 0;
+        let status = if exact_client {
+            crate::exec_handler::initial_thread_creation::finish_suspended_initial_creation(
+                nt_handler, binding, dispatch.status as u32, true,
+                continuation.return_target.is_abandoned(),
+            )
+        } else {
+            nt_process::STATUS_INVALID_HANDLE
+        };
+        if status != 0 { return Err(status); }
+        terminal.status = 0;
+        return Ok(());
+    }
     if dispatch.logical_caller != client.logical_caller {
         // Identity disagreement removes evidence only, not retained output/Reply ownership.
         dispatch.logical_caller = None;
@@ -310,6 +379,7 @@ unsafe fn process_output(
         // Copyout can have partial effects. Retain its terminal error; never replay the output.
         terminal.status = 0xC000_0001;
     }
+    Ok(())
 }
 
 unsafe fn retire_reply(continuation: HostedNativeContinuation) -> Result<(), u32> {
@@ -346,7 +416,7 @@ pub(super) unsafe fn drain(
             .binding(identity.lane())
             .expect("terminal lane binding disappeared")
             .reply_object;
-        let (continuation, mut payload, phase, order) = {
+        let (continuation, mut payload, phase, order, callback_owned) = {
             let terminal = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
                 .terminal(identity, reply_object)
                 .expect("selected terminal owner disappeared");
@@ -355,6 +425,7 @@ pub(super) unsafe fn drain(
                 terminal.payload.metadata(),
                 terminal.phase,
                 (terminal.frame.admission_sequence, identity.lane().index),
+                identity.external_token().is_some() || terminal.payload.callback.is_some(),
             )
         };
         let continuation = match continuation {
@@ -418,16 +489,30 @@ pub(super) unsafe fn drain(
                         .record_terminal_stage(&mut attempt, reply_object, outcome)
                         .expect("callback stage ACK lost its original suspension");
                     if result.is_err() {
-                        report_retained_failure(identity.lane());
+                        report_retained_failure(
+                            identity.lane(), b"callback-stage", Some(stage), Some(phase), true,
+                        );
                         cursor = Some(order);
                     }
                     continue;
                 }
                 if stage == TerminalStage::Output {
-                    process_output(nt_handler, continuation, &mut payload, procs, pfilled);
-                    (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                        .record_terminal_stage_with_payload(&mut attempt, reply_object, payload)
-                        .expect("terminal output ACK lost its owner");
+                    let result = process_output(nt_handler, continuation, &mut payload, procs, pfilled);
+                    if let Err(status) = result {
+                        let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+                        lanes.with_terminal_payload(&attempt, reply_object, |retained| *retained = payload)
+                            .expect("terminal output lost its retained payload");
+                        lanes.record_terminal_stage(&mut attempt, reply_object,
+                            TerminalStageOutcome::Indeterminate(status))
+                            .expect("uncertain initial-thread completion lost its owner");
+                        report_retained_failure(identity.lane(), b"initial-output",
+                            Some(stage), Some(phase), callback_owned);
+                        cursor = Some(order);
+                    } else {
+                        (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                            .record_terminal_stage_with_payload(&mut attempt, reply_object, payload)
+                            .expect("terminal output ACK lost its owner");
+                    }
                     continue;
                 }
                 let accepted = if continuation.return_target.is_abandoned() {
@@ -469,7 +554,9 @@ pub(super) unsafe fn drain(
                     .record_terminal_stage(&mut attempt, reply_object, outcome)
                     .expect("terminal mechanism outcome lost its owner");
                 if !accepted {
-                    report_retained_failure(identity.lane());
+                    report_retained_failure(
+                        identity.lane(), b"delivery-stage", Some(stage), Some(phase), callback_owned,
+                    );
                     cursor = Some(order);
                 }
             }
@@ -495,7 +582,9 @@ pub(super) unsafe fn drain(
                 let is_shared = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
                     .peer_route(identity.lane()).ok().flatten().is_some();
                 if is_shared && shared.is_none() {
-                    report_retained_failure(identity.lane());
+                    report_retained_failure(
+                        identity.lane(), b"shared-action-missing", None, Some(phase), callback_owned,
+                    );
                     cursor = Some(order);
                     continue;
                 }
@@ -505,7 +594,9 @@ pub(super) unsafe fn drain(
                         || (&*core::ptr::addr_of!(PENDING_SHARED_RETURNS))[index].is_some()
                         || (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).execution_busy()
                     {
-                        report_retained_failure(identity.lane());
+                        report_retained_failure(
+                            identity.lane(), b"shared-retirement-busy", None, Some(phase), callback_owned,
+                        );
                         cursor = Some(order);
                         continue;
                     }
@@ -516,7 +607,9 @@ pub(super) unsafe fn drain(
                     match (&*core::ptr::addr_of!(SHARED_RETIRED_REPLIES))[index] {
                         Some(saved) if saved == identity => Ok(()),
                         Some(_) => {
-                            report_retained_failure(identity.lane());
+                            report_retained_failure(
+                                identity.lane(), b"retired-reply-identity", None, Some(phase), callback_owned,
+                            );
                             cursor = Some(order);
                             continue;
                         }
@@ -553,7 +646,11 @@ pub(super) unsafe fn drain(
                         .expect("acknowledged terminal retirement lost its owner")
                 };
                 if completed.is_none() {
-                    report_retained_failure(identity.lane());
+                    report_retained_failure(
+                        identity.lane(),
+                        if local.is_err() { b"reply-retirement" } else { b"semantic-retirement-refused" },
+                        None, Some(phase), callback_owned,
+                    );
                     cursor = Some(order);
                     continue;
                 }

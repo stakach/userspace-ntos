@@ -209,9 +209,11 @@ unsafe fn ensure_source_page(
 
 struct ViewIo<'a> {
     handler: &'a ExecNtHandler,
+    stage: &'a mut &'static str,
 }
 impl BorrowedPageInstallationIo<ViewPage> for ViewIo<'_> {
     fn reserve(&mut self) -> Result<InstallationCap, u32> {
+        *self.stage = "shared-cap-reserve";
         try_alloc_slot()
             .map(|cap| InstallationCap { cap })
             .ok_or(RESOURCES)
@@ -221,9 +223,11 @@ impl BorrowedPageInstallationIo<ViewPage> for ViewIo<'_> {
         source: InstallationCap,
         destination: InstallationCap,
     ) -> InstallationEffect {
+        *self.stage = "shared-cap-copy";
         unsafe { effect(copy_cap_into_r(source.cap, destination.cap)) }
     }
     fn map(&mut self, target: ViewPage, destination: InstallationCap) -> InstallationEffect {
+        *self.stage = "shared-cap-map";
         if !current(self.handler, target.view, target.page) {
             return InstallationEffect::Refused(INVALID);
         }
@@ -237,6 +241,7 @@ impl BorrowedPageInstallationIo<ViewPage> for ViewIo<'_> {
         }
     }
     fn publish(&mut self, target: ViewPage, destination: InstallationCap) -> InstallationEffect {
+        *self.stage = "shared-cap-publish";
         if !current(self.handler, target.view, target.page) {
             return InstallationEffect::Refused(INVALID);
         }
@@ -255,12 +260,15 @@ impl BorrowedPageInstallationIo<ViewPage> for ViewIo<'_> {
         }
     }
     fn unmap(&mut self, cap: InstallationCap) -> InstallationEffect {
+        *self.stage = "shared-cap-unmap";
         unsafe { effect(page_unmap_r(cap.cap)) }
     }
     fn delete(&mut self, cap: InstallationCap) -> InstallationEffect {
+        *self.stage = "shared-cap-delete";
         unsafe { effect(cnode_delete_r(cap.cap)) }
     }
     fn recycle(&mut self, cap: InstallationCap) -> InstallationEffect {
+        *self.stage = "shared-cap-recycle";
         match unsafe { root_slot_recycle::publish_unretyped(cap.cap) } {
             Ok(()) => InstallationEffect::Acknowledged,
             Err(_) => InstallationEffect::Refused(INVALID),
@@ -272,10 +280,12 @@ unsafe fn install_view_page(
     handler: &mut ExecNtHandler,
     target: ViewPage,
     source: u64,
+    stage: &mut &'static str,
 ) -> Result<(), u32> {
     let pending = &mut *core::ptr::addr_of_mut!(INSTALL);
     if let Some(owner) = pending.as_mut() {
-        match owner.advance(&mut ViewIo { handler }) {
+        *stage = "shared-prior-install";
+        match owner.advance(&mut ViewIo { handler, stage }) {
             BorrowedPageInstallOutcome::Published | BorrowedPageInstallOutcome::Failed(_) => {
                 *pending = None
             }
@@ -284,6 +294,7 @@ unsafe fn install_view_page(
         }
     }
     let registry = &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY);
+    *stage = "shared-registry-admission";
     if !registry.memory_available(target.view.pi as u64, target.page, 4096) {
         return Err(RESOURCES);
     }
@@ -296,18 +307,22 @@ unsafe fn install_view_page(
             Err(INVALID)
         };
     }
+    *stage = "shared-working-set-admission";
     handler.ensure_process_working_set_admission(
         target.view.pi,
         target.page,
         target.view.scratch_base,
     )?;
+    *stage = "shared-memory-access";
     hosted_thread_memory_access(target.view.pi as u64, target.page, 4096)?;
+    *stage = "shared-page-table";
     ensure_process_user_page_table(handler, target.view.pi, target.page, target.view.pml4)?;
     *pending = BorrowedPageInstallation::new(target, InstallationCap { cap: source });
+    *stage = "shared-install-owner";
     let outcome = pending
         .as_mut()
         .ok_or(INVALID)?
-        .advance(&mut ViewIo { handler });
+        .advance(&mut ViewIo { handler, stage });
     match outcome {
         BorrowedPageInstallOutcome::Published => {
             *pending = None;
@@ -668,6 +683,7 @@ unsafe fn service_page_residency(
             protection: fault_plan.map_protection,
         },
         source_frame,
+        stage,
     )
 }
 
@@ -769,7 +785,11 @@ pub(crate) unsafe fn drain_view(
         if owner.abort_unentered(owner.descriptor()) {
             *pending = None;
         } else {
-            match owner.advance(&mut ViewIo { handler }) {
+            let mut stage = "shared-retirement";
+            match owner.advance(&mut ViewIo {
+                handler,
+                stage: &mut stage,
+            }) {
                 BorrowedPageInstallOutcome::Published | BorrowedPageInstallOutcome::Failed(_) => {
                     *pending = None
                 }

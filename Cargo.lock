@@ -409,6 +409,9 @@ dependencies = [
 [[package]]
 name = "nt-hosted-runtime"
 version = "0.1.0"
+dependencies = [
+ "nt-user-callback",
+]
 
 [[package]]
 name = "nt-interrupt-authority"
@@ -749,6 +752,13 @@ name = "nt-sim-device"
 version = "0.1.0"
 dependencies = [
  "nt-register-access",
+]
+
+[[package]]
+name = "nt-srm-message"
+version = "0.1.0"
+dependencies = [
+ "nt-lpc-abi",
 ]
 
 [[package]]

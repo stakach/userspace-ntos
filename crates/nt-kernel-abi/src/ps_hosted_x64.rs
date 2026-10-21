@@ -1,10 +1,13 @@
-//! Neutral Ps projections for the ReactOS Win2003 AMD64 profile.
+//! Neutral Ps projections for the hosted x64 driver and Win32k image.
 //!
 //! These local provider bytes are not canonical process/thread authority. Initialize fresh,
 //! unpublished storage only; never reinitialize a live projection to select a GUI caller.
-//! Offsets follow `sdk/include/ndk/{ke,ps}types.h` and `ndk/tests/win2003_x64.c`.
-//! ReactOS adds `KTHREAD.StateSaveArea` at 0x320, shifting ETHREAD fields by eight
-//! bytes relative to Windows 2003. Its final `ThreadName` is at 0x430.
+//! Most fields retain the ReactOS Win2003 AMD64 projection used by the hosted driver
+//! contract (`sdk/include/ndk/{ke,ps}types.h`, `ndk/tests/win2003_x64.c`). The pinned
+//! LiberNT win32k.sys reads `EPROCESS.Peb` directly at +0x2e0 during window creation;
+//! that field follows the released binary, not the older projection. ReactOS adds
+//! `KTHREAD.StateSaveArea` at 0x320, shifting ETHREAD fields by eight bytes relative
+//! to Windows 2003. Its final `ThreadName` is at 0x430.
 
 use crate::GuestAddr;
 
@@ -20,7 +23,7 @@ pub const EPROCESS_WIN32_PROCESS: usize = 0x1d8;
 /// Address returned by PsGetProcessImageFileName for this NT layout.
 pub const EPROCESS_IMAGE_FILE_NAME: usize = 0x260;
 pub const EPROCESS_THREAD_LIST_HEAD: usize = 0x288;
-pub const EPROCESS_PEB: usize = 0x2b8;
+pub const EPROCESS_PEB: usize = 0x2e0;
 pub const KTHREAD_APC_STATE: usize = 0x48;
 pub const KTHREAD_APC_STATE_PROCESS: usize = 0x68;
 pub const KTHREAD_TEB: usize = 0xb0;
@@ -296,5 +299,5 @@ pub fn validate_thread_activation(
 }
 
 #[cfg(test)]
-#[path = "ps_reactos_x64_tests.rs"]
+#[path = "ps_hosted_x64_tests.rs"]
 mod tests;

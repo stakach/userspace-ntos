@@ -448,6 +448,12 @@ static NT_RAISE_EXCEPTION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_TP_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static IO_COMPLETION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WAIT_OBJECT_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static SETUP_WAIT_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static SETUP_WAIT_EVENT_INDEX: AtomicU64 = AtomicU64::new(0);
+static SETUP_WAIT_PROCESS_PI: AtomicU64 = AtomicU64::new(0);
+static SETUP_WAIT_PROCESS_PID: AtomicU64 = AtomicU64::new(0);
+static SETUP_WAIT_PROCESS_GENERATION: AtomicU64 = AtomicU64::new(0);
+static SETUP_WAIT_TRANSITION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NAMED_EVENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EVENT_DELETE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_POST_LSA_REGISTRY_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -456,6 +462,8 @@ static NT_YIELD_EXECUTION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PIPE_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PIPE_OPEN_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NAMED_PIPE_IO_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static SETUP_SCM_PIPE_TRACE_N: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static SETUP_SCM_PIPE_LAST_TERMINAL_IRP: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static NT_QUERY_INFORMATION_FILE_NPFS_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static CSR_DUPLICATE_CLIENT_SOURCE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static SCM_WORKER_READ_IO_TRACE_N: [AtomicU64; TP_WORKER_SLOT_COUNT] =
@@ -1207,6 +1215,79 @@ fn trace_named_pipe_io(
     print_str(b"\n");
 }
 
+/// Bounded correlation for the setup/SCM pipe stalled during LiberNT late boot. The existing
+/// general pipe trace ends before this exchange; keep the handle at admission and correlate
+/// subsequent ownership and retirement by canonical File and IRP identities.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn trace_setup_scm_pipe_transition(
+    phase: &[u8],
+    pi: usize,
+    badge: u64,
+    tid: u64,
+    handle: Option<u64>,
+    file_id: u64,
+    fs_context: u64,
+    irp_id: u64,
+    major: u8,
+    status: u32,
+    information: u64,
+    delivery_state: u16,
+    reply_required: bool,
+) {
+    // The peer's endpoint has a different FID but the same registered pipe-name hash.
+    const SCM_CONTROL_PIPE_HASH: u64 = 0xe0c0_d292_8c29_47bc;
+    let name_hash = crate::pipe_fid_name_hash(fs_context);
+    let bucket = if pi == 11 && tid == 192 && name_hash != 0 {
+        0
+    } else if pi == 9 && name_hash == SCM_CONTROL_PIPE_HASH {
+        1
+    } else {
+        return;
+    };
+    if phase == b"terminal-seen"
+        && SETUP_SCM_PIPE_LAST_TERMINAL_IRP[bucket].swap(irp_id, Ordering::Relaxed) == irp_id
+    {
+        return;
+    }
+    let sequence = SETUP_SCM_PIPE_TRACE_N[bucket].fetch_add(1, Ordering::Relaxed);
+    if sequence >= 96 {
+        return;
+    }
+    print_str(b"[setup-scm-pipe] phase=");
+    print_str(phase);
+    print_str(b" seq=");
+    print_u64(sequence);
+    print_str(b" pi/tid/badge=");
+    print_u64(pi as u64);
+    print_str(b"/");
+    print_u64(tid);
+    print_str(b"/");
+    print_u64(badge);
+    if let Some(handle) = handle {
+        print_str(b" handle=");
+        print_hex_u64(handle);
+    }
+    print_str(b" file/fid/name/irp=");
+    print_hex_u64(file_id);
+    print_str(b"/");
+    print_hex_u64(fs_context);
+    print_str(b"/");
+    print_hex_u64(name_hash);
+    print_str(b"/");
+    print_hex_u64(irp_id);
+    print_str(b" major/status/info/state/reply=");
+    print_hex(major as u32);
+    print_str(b"/");
+    print_hex(status);
+    print_str(b"/");
+    print_u64(information);
+    print_str(b"/");
+    print_hex(delivery_state as u32);
+    print_str(b"/");
+    print_u64(reply_required as u64);
+    print_str(b"\n");
+}
+
 fn scm_worker_slot_for(nt: &ExecNtHandler) -> Option<usize> {
     match nt.hosted_thread_role_for_badge(nt.current_badge) {
         Some(HostedThreadRole::ScmWorkerSlot { slot }) if slot < TP_WORKER_SLOT_COUNT => Some(slot),
@@ -1576,11 +1657,34 @@ fn trace_wait_object(
         && handler.current_badge == 4
         && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
         && WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) == 0;
-    if handler.pi != 6 && !trace_winlogon {
+    let setup_identity = handler.current_hosted_process_image().and_then(|image| {
+        if image.process_name.eq_ignore_ascii_case("setup.exe")
+            && handler.hosted_process_generation(handler.pi) == Some(image.generation)
+        {
+            handler.pm_pid_for_pi(handler.pi).map(|pid| (pid, image.generation))
+        } else {
+            None
+        }
+    });
+    let trace_setup = setup_identity.is_some()
+        && handle == 0x34
+        && object.kind() == WaitObject::KIND_DISPATCHER;
+    if handler.pi != 6 && handler.pi != 11 && !trace_winlogon && !trace_setup {
         return;
     }
-    let n = WAIT_OBJECT_TRACE_N.fetch_add(1, Ordering::Relaxed);
-    if n >= 192 {
+    let n = if trace_setup {
+        let (pid, generation) = setup_identity.unwrap();
+        SETUP_WAIT_PROCESS_PI.store(handler.pi as u64 + 1, Ordering::Relaxed);
+        SETUP_WAIT_PROCESS_PID.store(pid as u64, Ordering::Relaxed);
+        SETUP_WAIT_PROCESS_GENERATION.store(generation, Ordering::Relaxed);
+        SETUP_WAIT_EVENT_INDEX.store(object.id() + 1, Ordering::Relaxed);
+        SETUP_WAIT_TRACE_N.fetch_add(1, Ordering::Relaxed)
+    } else {
+        WAIT_OBJECT_TRACE_N.fetch_add(1, Ordering::Relaxed)
+    };
+    if (trace_setup && (n >= 4096 || (n >= 16 && n % 32 != 0)))
+        || (!trace_setup && n >= 192)
+    {
         return;
     }
     print_str(b"[wait-object] pi=");
@@ -1632,6 +1736,51 @@ fn trace_wait_object(
             print_str(b" mutant=1");
         }
     }
+    print_str(b"\n");
+}
+
+fn trace_setup_wait_event_transition(
+    handler: &ExecNtHandler,
+    phase: &[u8],
+    handle: u64,
+    index: usize,
+    previous: bool,
+    woken: u64,
+) {
+    let Some(setup_pi) = SETUP_WAIT_PROCESS_PI.load(Ordering::Relaxed).checked_sub(1) else {
+        return;
+    };
+    let setup_pi = setup_pi as usize;
+    let generation = SETUP_WAIT_PROCESS_GENERATION.load(Ordering::Relaxed);
+    if SETUP_WAIT_EVENT_INDEX.load(Ordering::Relaxed) != index as u64 + 1
+        || handler.pm_pid_for_pi(setup_pi).map(u64::from)
+            != Some(SETUP_WAIT_PROCESS_PID.load(Ordering::Relaxed))
+        || handler.hosted_process_generation(setup_pi) != Some(generation)
+        || !handler.hosted_process_image(setup_pi).is_some_and(|image| {
+            image.generation == generation
+                && image.process_name.eq_ignore_ascii_case("setup.exe")
+        })
+    {
+        return;
+    }
+    let n = SETUP_WAIT_TRANSITION_TRACE_N.fetch_add(1, Ordering::Relaxed);
+    if n >= 4096 || (n >= 16 && n % 32 != 0) {
+        return;
+    }
+    print_str(b"[setup-wait-event] pi=");
+    print_u64(handler.pi as u64);
+    print_str(b" tid=");
+    print_u64(handler.current_tid);
+    print_str(b" ");
+    print_str(phase);
+    print_str(b" handle=0x");
+    print_hex_u64(handle);
+    print_str(b" object=");
+    print_u64(index as u64);
+    print_str(b" previous=");
+    print_u64(previous as u64);
+    print_str(b" woken=");
+    print_u64(woken as u64);
     print_str(b"\n");
 }
 
@@ -7314,21 +7463,7 @@ impl ExecNtHandler {
             return Ok(self.overlay.key_security_descriptor(index).map(alloc::vec::Vec::from));
         }
         if let Some(key) = self.mutable_registry_key(target) {
-            let descriptor = self.mutable_hives.key_security_descriptor(key);
-            let mount_root = self.mutable_hives.hive(key.hive)
-                .is_some_and(|hive| key.key == hive.root());
-            let mount_security = if matches!(key.hive, HIVE_SEL_SOFTWARE | HIVE_SEL_SECURITY | HIVE_SEL_SAM) {
-                &self.registry_machine_root_security_descriptor
-            } else {
-                &self.registry_user_root_security_descriptor
-            };
-            return Ok(if mount_root {
-                Some(nt_security::mounted_hive_root_security(
-                    descriptor, mount_security,
-                ).to_vec())
-            } else {
-                descriptor.map(alloc::vec::Vec::from)
-            });
+            return Ok(self.mutable_registry_key_security_descriptor(key));
         }
         if let Some((hive, key)) = self.base_hive(target) {
             let mount_security = if matches!(hive_sel(target), HIVE_SEL_SOFTWARE | HIVE_SEL_SECURITY | HIVE_SEL_SAM) {
@@ -8539,7 +8674,9 @@ impl ExecNtHandler {
         caller.validate(
             self.admit_hosted_thread_ingress(caller.badge()).ok().map(|runtime| runtime.binding()),
             self.pm.thread_lifetime(caller.thread().thread_id()),
-        ).is_ok()
+        ).is_ok() || unsafe {
+            initial_thread_creation::validate_process_create_provider_caller(self, caller)
+        }
     }
 
     pub(crate) fn hosted_gui_thread_teb_alias_for(
@@ -10894,11 +11031,13 @@ impl ExecNtHandler {
         let Some(previous) = self.events.set_existing(index as u64) else {
             return 0xC000_0008; // STATUS_INVALID_HANDLE
         };
+        let mut woken = 0;
         if !previous {
             // SAFETY: native dispatch is serialized; the signal and waiter selection are one
             // executive transition.
-            unsafe { wait_wake_event_set(index, self) };
+            woken = unsafe { wait_wake_event_set(index, self) };
         }
+        trace_setup_wait_event_transition(self, b"internal-set", 0, index, previous, woken);
         0
     }
 
@@ -29573,6 +29712,13 @@ impl ExecNtHandler {
                 LSA_REQUESTS_DELIVERED.fetch_add(1, Ordering::Relaxed);
                 LSA_LAST_API_NUMBER.store(api_number, Ordering::Relaxed);
                 LSA_LOGON_IN_FLIGHT.store(u64::from(api_number == 2), Ordering::Relaxed);
+                if api_number == 2 {
+                    LSA_LOGON_SSN_TRACE.store(0, Ordering::Relaxed);
+                    LSA_LOGON_LAST_SSN.store(u64::MAX, Ordering::Relaxed);
+                    LSA_LOGON_LAST_STATUS.store(u64::MAX, Ordering::Relaxed);
+                    LSA_LOGON_LAST_TCB.store(0, Ordering::Relaxed);
+                    LSA_LOGON_SERVER_TID.store(self.current_tid, Ordering::Relaxed);
+                }
                 if api_number < 64 {
                     LSA_API_MASK.fetch_or(1u64 << api_number, Ordering::Relaxed);
                 }
@@ -35287,6 +35433,9 @@ impl ExecNtHandler {
                             0,
                             0,
                         );
+                        trace_setup_wait_event_transition(
+                            self, b"reset", args[0], index, previous, 0,
+                        );
                         0
                     }
                     Err(status) => status,
@@ -35341,6 +35490,9 @@ impl ExecNtHandler {
                             Some(previous),
                             0,
                             woken,
+                        );
+                        trace_setup_wait_event_transition(
+                            self, b"set", args[0], index, previous, woken,
                         );
                         0
                     }
@@ -39716,6 +39868,21 @@ impl ExecNtHandler {
                     apc_context,
                     &payload,
                 );
+                trace_setup_scm_pipe_transition(
+                    b"write-return",
+                    self.pi,
+                    self.current_badge,
+                    self.current_tid,
+                    Some(fh),
+                    completion_file_id,
+                    routed_fs_context,
+                    pending_write_irp_id,
+                    major::IRP_MJ_WRITE,
+                    status,
+                    information,
+                    0,
+                    status == STATUS_PENDING && self.pending_file_io_wait,
+                );
                 // ★ LSA SELF-RPC instrumentation. Every MS-RPC PDU (`rpc_ver == 5`) written onto lsass'
                 // OWN `\pipe\lsarpc`, split by which side of the self-RPC wrote it: the per-connection
                 // LSA RPC worker (bind_ack / the LsarOpenPolicy response) versus lsass'
@@ -40292,6 +40459,21 @@ impl ExecNtHandler {
                     event,
                     apc_context,
                     &output[..(information as usize).min(output.len())],
+                );
+                trace_setup_scm_pipe_transition(
+                    b"read-return",
+                    self.pi,
+                    self.current_badge,
+                    self.current_tid,
+                    Some(fh),
+                    completion_file_id,
+                    npfs_route_fid,
+                    pending_read_irp_id,
+                    major::IRP_MJ_READ,
+                    status,
+                    information,
+                    0,
+                    status == STATUS_PENDING && self.pending_file_io_wait,
                 );
                 if let Some(slot) = scm_worker_slot_for(self) {
                     let seq = SCM_WORKER_READ_IO_TRACE_N[slot].fetch_add(1, Ordering::Relaxed);

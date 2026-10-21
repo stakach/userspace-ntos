@@ -23,6 +23,7 @@ const STATUS_PENDING: i32 = 0x0000_0103;
 const MAX_OWNERS: usize = 64;
 
 static NEXT_INVOCATION: AtomicU64 = AtomicU64::new(1);
+static DIAG_LSASS_PENDING: AtomicU64 = AtomicU64::new(0);
 static mut OWNERS: Vec<OwnedReceive> = Vec::new();
 static mut NEXT_OWNER: usize = 0;
 
@@ -48,6 +49,8 @@ struct OwnedReceive {
     copyout_done: bool,
     submitted_once: bool,
     reply_commit: ReplyCommitGate,
+    trace_scm: bool,
+    logged_pending: bool,
 }
 
 impl OwnedReceive {
@@ -148,9 +151,32 @@ pub(crate) unsafe fn begin(handler: &mut ExecNtHandler, args: [u64; 8]) -> Resul
     let handle_caller = handler.native_handle_caller(nt_syscall::ProcessorMode::UserMode)?;
     let port = handler.pm.lookup_native_alpc_port(handle_caller, captured.port, generation)?;
     if u64::from(port.owner_process) != process { return Err(STATUS_INVALID_HANDLE); }
-    captured.port = port.service_handle;
+    let trace_scm = handler.hosted_process_image(pi).is_some_and(|image| {
+        image.generation == generation
+            && image.process_name.eq_ignore_ascii_case("services.exe")
+    });
+    let native_port = captured.port;
     let sequence = NEXT_INVOCATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
         |next| next.checked_add(1)).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    if trace_scm {
+        print_str(b"[scm-alpc] begin tid="); print_u64(thread);
+        print_str(b" invocation="); print_u64(sequence);
+        print_str(b" port="); print_hex_u64(native_port);
+        print_str(b" service-port="); print_hex_u64(port.service_handle);
+        print_str(b" flags="); print_hex(captured.flags);
+        if let Some(message) = captured.send_message.as_deref() {
+            print_str(b" send-len="); print_u64(message.len() as u64);
+            if message.len() >= 40 {
+                print_str(b" type="); print_hex(u16::from_le_bytes([message[4], message[5]]) as u32);
+                print_str(b" message-id="); print_hex(u32::from_le_bytes(message[24..28].try_into().unwrap()));
+                if message.len() >= 52 {
+                    print_str(b" api-number="); print_hex(u32::from_le_bytes(message[48..52].try_into().unwrap()));
+                }
+            }
+        }
+        print_str(b"\n");
+    }
+    captured.port = port.service_handle;
     let token = (generation, sequence);
     let reply_commit = ReplyCommitGate::new(captured.flags, token);
     let (request, target) = captured.into_checked_wire_and_receive(caller, token)?;
@@ -179,7 +205,7 @@ pub(crate) unsafe fn begin(handler: &mut ExecNtHandler, args: [u64; 8]) -> Resul
     };
     owners.push(OwnedReceive { pi, target, retained, output, ack,
         flight: Flight::Ready, reply_status: 0, copyout_done: false,
-        submitted_once: false, reply_commit });
+        submitted_once: false, reply_commit, trace_scm, logged_pending: false });
     park.commit();
     Ok(())
 }
@@ -298,6 +324,26 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) -> Option<(u64, u64)> 
         }
         RingStep::Exact(request_id, status, info, detail0, detail1) => {
             let caller = owner.caller();
+            if owner.trace_scm && (status != STATUS_PENDING || !owner.logged_pending) {
+                print_str(b"[scm-alpc] terminal tid="); print_u64(caller.thread);
+                print_str(b" invocation="); print_u64(owner.retained.token().1);
+                print_str(b" status="); print_hex(status as u32);
+                print_str(b" info="); print_hex_u64(info);
+                print_str(b" detail0="); print_hex_u64(detail0);
+                print_str(b" detail1="); print_hex_u64(detail1);
+                print_str(b"\n");
+                if status == STATUS_PENDING { owner.logged_pending = true; }
+            }
+            if owner.pi == 10
+                && (status != STATUS_PENDING
+                    || DIAG_LSASS_PENDING.fetch_add(1, Ordering::Relaxed) < 16) {
+                print_str(b"[alpc-receive-diag] lsass tid="); print_u64(caller.thread);
+                print_str(b" status="); print_hex(status as u32);
+                print_str(b" info="); print_hex_u64(info);
+                print_str(b" d0="); print_hex_u64(detail0);
+                print_str(b" d1="); print_hex_u64(detail1);
+                print_str(b"\n");
+            }
             if status == STATUS_PENDING {
                 owner.flight = if owner.retained.continue_pending(request_id, caller).is_ok() {
                     reply_committed = owner.reply_commit.service_exact(status);

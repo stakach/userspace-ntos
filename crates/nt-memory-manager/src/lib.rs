@@ -57,6 +57,7 @@ pub mod owned_capability_copy;
 pub mod process_retirement;
 mod private_backing;
 pub mod prefetch;
+pub mod provider_large_arena;
 pub mod retained_alias;
 mod runtime_section;
 pub mod section_scratch;

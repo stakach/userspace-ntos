@@ -262,9 +262,9 @@ pub(crate) unsafe fn dispatch_exit_notification(
             return Err(nt_process::STATUS_INVALID_HANDLE);
         }
         let mapped = if driver_ps_pool_alias::contains(
-            body, nt_kernel_abi::ps_reactos_x64::EPROCESS_BODY_BYTES,
+            body, nt_kernel_abi::ps_hosted_x64::EPROCESS_BODY_BYTES,
         ) {
-            driver_ps_pool_alias::grant(inst, body, nt_kernel_abi::ps_reactos_x64::EPROCESS_BODY_BYTES)
+            driver_ps_pool_alias::grant(inst, body, nt_kernel_abi::ps_hosted_x64::EPROCESS_BODY_BYTES)
         } else {
             crate::ps_object_backing::grant_referenced_body(
                 pm, body, target, crate::ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),

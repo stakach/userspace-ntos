@@ -38,7 +38,7 @@ pub(super) fn previous_mode() -> Result<AccessMode, u32> {
     }
     let mode = unsafe {
         read_unaligned(
-            (thread + nt_kernel_abi::ps_reactos_x64::KTHREAD_PREVIOUS_MODE as u64) as *const u8,
+            (thread + nt_kernel_abi::ps_hosted_x64::KTHREAD_PREVIOUS_MODE as u64) as *const u8,
         )
     };
     match mode {

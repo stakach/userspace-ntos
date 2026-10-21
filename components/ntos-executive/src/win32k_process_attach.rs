@@ -22,9 +22,9 @@ unsafe fn thread_state() -> (u64, u64, u64, u64) {
     if thread == 0 || thread_context_index_for_ethread(thread).is_none() {
         invalid(0, thread, 2);
     }
-    let current = thread + nt_kernel_abi::ps_reactos_x64::KTHREAD_APC_STATE as u64;
-    let saved = thread + nt_kernel_abi::ps_reactos_x64::KTHREAD_SAVED_APC_STATE as u64;
-    let index = thread + nt_kernel_abi::ps_reactos_x64::KTHREAD_APC_STATE_INDEX as u64;
+    let current = thread + nt_kernel_abi::ps_hosted_x64::KTHREAD_APC_STATE as u64;
+    let saved = thread + nt_kernel_abi::ps_hosted_x64::KTHREAD_SAVED_APC_STATE as u64;
+    let index = thread + nt_kernel_abi::ps_hosted_x64::KTHREAD_APC_STATE_INDEX as u64;
     (thread, current, saved, index)
 }
 
@@ -33,7 +33,7 @@ pub(super) unsafe fn selected_process(thread: u64, original: u64) -> u64 {
         return original;
     }
     let index = read_volatile(
-        (thread + nt_kernel_abi::ps_reactos_x64::KTHREAD_APC_STATE_INDEX as u64) as *const u8,
+        (thread + nt_kernel_abi::ps_hosted_x64::KTHREAD_APC_STATE_INDEX as u64) as *const u8,
     );
     if index > 1 {
         invalid(0, thread, 13);
@@ -42,7 +42,7 @@ pub(super) unsafe fn selected_process(thread: u64, original: u64) -> u64 {
         return original;
     }
     let current = read_volatile(
-        (thread + nt_kernel_abi::ps_reactos_x64::KTHREAD_APC_STATE_PROCESS as u64) as *const u64,
+        (thread + nt_kernel_abi::ps_hosted_x64::KTHREAD_APC_STATE_PROCESS as u64) as *const u64,
     );
     if current == 0 || current == original {
         invalid(0, current, 14);
@@ -75,7 +75,7 @@ unsafe fn exchange(operation: u64, process: u64, saved: u64, thread: u64) -> (u6
 
 unsafe fn publish_process(thread: u64, current: u64, index: u8) {
     write_volatile(
-        (thread + nt_kernel_abi::ps_reactos_x64::KTHREAD_APC_STATE_INDEX as u64) as *mut u8,
+        (thread + nt_kernel_abi::ps_hosted_x64::KTHREAD_APC_STATE_INDEX as u64) as *mut u8,
         index,
     );
     write_volatile((current_kpcr_va() + 0x60) as *mut u64, current);
@@ -98,11 +98,11 @@ pub(super) extern "win64" fn ke_attach_process(process: u64) {
             move_apc_state(active, saved);
             apc_state::initialize(active, current);
             write_volatile(
-                (thread + nt_kernel_abi::ps_reactos_x64::KTHREAD_APC_STATE_POINTERS as u64) as *mut u64,
+                (thread + nt_kernel_abi::ps_hosted_x64::KTHREAD_APC_STATE_POINTERS as u64) as *mut u64,
                 saved,
             );
             write_volatile(
-                (thread + nt_kernel_abi::ps_reactos_x64::KTHREAD_APC_STATE_POINTERS as u64 + 8) as *mut u64,
+                (thread + nt_kernel_abi::ps_hosted_x64::KTHREAD_APC_STATE_POINTERS as u64 + 8) as *mut u64,
                 active,
             );
         }
@@ -122,11 +122,11 @@ pub(super) extern "win64" fn ke_detach_process() {
             move_apc_state(saved, active);
             write_volatile((saved + APC_PROCESS_OFF) as *mut u64, 0);
             write_volatile(
-                (thread + nt_kernel_abi::ps_reactos_x64::KTHREAD_APC_STATE_POINTERS as u64) as *mut u64,
+                (thread + nt_kernel_abi::ps_hosted_x64::KTHREAD_APC_STATE_POINTERS as u64) as *mut u64,
                 active,
             );
             write_volatile(
-                (thread + nt_kernel_abi::ps_reactos_x64::KTHREAD_APC_STATE_POINTERS as u64 + 8) as *mut u64,
+                (thread + nt_kernel_abi::ps_hosted_x64::KTHREAD_APC_STATE_POINTERS as u64 + 8) as *mut u64,
                 saved,
             );
         }
@@ -162,11 +162,11 @@ pub(super) extern "win64" fn ke_stack_attach_process(process: u64, apc_state: u6
         write_volatile((apc_state + APC_PROCESS_OFF) as *mut u64, marker);
         if old_index == 0 {
             write_volatile(
-                (thread + nt_kernel_abi::ps_reactos_x64::KTHREAD_APC_STATE_POINTERS as u64) as *mut u64,
+                (thread + nt_kernel_abi::ps_hosted_x64::KTHREAD_APC_STATE_POINTERS as u64) as *mut u64,
                 saved,
             );
             write_volatile(
-                (thread + nt_kernel_abi::ps_reactos_x64::KTHREAD_APC_STATE_POINTERS as u64 + 8) as *mut u64,
+                (thread + nt_kernel_abi::ps_hosted_x64::KTHREAD_APC_STATE_POINTERS as u64 + 8) as *mut u64,
                 active,
             );
         }
@@ -197,11 +197,11 @@ pub(super) extern "win64" fn ke_unstack_detach_process(apc_state: u64) {
         if marker == 0 {
             write_volatile((saved + APC_PROCESS_OFF) as *mut u64, 0);
             write_volatile(
-                (thread + nt_kernel_abi::ps_reactos_x64::KTHREAD_APC_STATE_POINTERS as u64) as *mut u64,
+                (thread + nt_kernel_abi::ps_hosted_x64::KTHREAD_APC_STATE_POINTERS as u64) as *mut u64,
                 active,
             );
             write_volatile(
-                (thread + nt_kernel_abi::ps_reactos_x64::KTHREAD_APC_STATE_POINTERS as u64 + 8) as *mut u64,
+                (thread + nt_kernel_abi::ps_hosted_x64::KTHREAD_APC_STATE_POINTERS as u64 + 8) as *mut u64,
                 saved,
             );
         }

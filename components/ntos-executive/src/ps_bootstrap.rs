@@ -44,7 +44,7 @@ pub(crate) fn is_initial_system_process(body: u64) -> bool {
 unsafe fn publish_initial_objects(
     ps: &mut nt_user_host::ps_bootstrap::PsBootstrapState,
 ) -> Result<(), u32> {
-    use nt_kernel_abi::{ps_reactos_x64 as abi, GuestAddr};
+    use nt_kernel_abi::{ps_hosted_x64 as abi, GuestAddr};
 
     let (pm, _) = ps.managers_mut();
     let identity = pm.initial_system_identity().ok_or(0xc000_000du32)?;

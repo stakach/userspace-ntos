@@ -182,12 +182,12 @@ pub(crate) fn service(
                     let (body, _references) = pm.lookup_kernel_process_by_id(pid)?;
                     let projected = if driver_ps_pool_alias::contains(
                         body,
-                        nt_kernel_abi::ps_reactos_x64::EPROCESS_BODY_BYTES,
+                        nt_kernel_abi::ps_hosted_x64::EPROCESS_BODY_BYTES,
                     ) {
                         driver_ps_pool_alias::grant(
                             inst,
                             body,
-                            nt_kernel_abi::ps_reactos_x64::EPROCESS_BODY_BYTES,
+                            nt_kernel_abi::ps_hosted_x64::EPROCESS_BODY_BYTES,
                         )
                     } else {
                         crate::ps_object_backing::grant_referenced_body(

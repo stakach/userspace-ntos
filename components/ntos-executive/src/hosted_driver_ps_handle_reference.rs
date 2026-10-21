@@ -160,8 +160,8 @@ pub(crate) fn service(
                     }
                     let body = reference.body();
                     let body_bytes = match expected {
-                        PsHandleType::Process => nt_kernel_abi::ps_reactos_x64::EPROCESS_BODY_BYTES,
-                        PsHandleType::Thread => nt_kernel_abi::ps_reactos_x64::ETHREAD_BODY_BYTES,
+                        PsHandleType::Process => nt_kernel_abi::ps_hosted_x64::EPROCESS_BODY_BYTES,
+                        PsHandleType::Thread => nt_kernel_abi::ps_hosted_x64::ETHREAD_BODY_BYTES,
                     };
                     let projected = if driver_ps_pool_alias::contains(
                         body,

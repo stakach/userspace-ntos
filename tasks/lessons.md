@@ -721,3 +721,6 @@ diagnosis-free failure.
 ## Commit Verified Increments During Long Native Bring-Up
 - When the user asks for commits as work proceeds, isolate each proven contract and commit it after its focused tests and native integration evidence, before exploring the next boot frontier.
 - Review staged paths and diff before every commit. Keep diagnostic traces and unrelated edits out; push a changed submodule commit before recording its pointer in the parent.
+
+## Keep Long Acceptance Runs Quiet When Requested
+- If the user asks for a completion-only update, continue the authorized validation and repair loop without routine progress messages. Report the full evidence after the issue is actually closed; surface a question only when work cannot continue without an answer.

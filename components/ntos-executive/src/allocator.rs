@@ -641,8 +641,18 @@ unsafe fn release_top_free_blocks() {
         let mut cur = unsafe { read_word(FREE_HEAD) };
         let mut released = false;
         while cur != 0 {
+            if cur < DATA || cur >= top || cur % ALLOC_GRANULE != 0 {
+                allocator_corruption(b"release-top", 0, 0, cur, 0, 0);
+            }
             let size = unsafe { free_node_size(cur) };
             let next = unsafe { free_node_next(cur) };
+            if size < FREE_NODE_SIZE
+                || size % ALLOC_GRANULE != 0
+                || cur.checked_add(size).is_none_or(|end| end > top)
+                || (next != 0 && (next <= cur || next >= top || next % ALLOC_GRANULE != 0))
+            {
+                allocator_corruption(b"release-top", 0, 0, cur, size, next);
+            }
             if cur.checked_add(size) == Some(top) {
                 unsafe {
                     write_word(prev_link, next);

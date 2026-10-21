@@ -7,12 +7,107 @@ use nt_kernel_exec::x86_cr8::{
 
 pub(crate) enum Cr8FaultOutcome { Unrelated, Applied, Rejected }
 
+static IRQ_CR8_DIAG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Bounded native trace for the IRQ authentication boundary; remove after live validation.
+pub(super) fn irq_cr8_diag(stage: u64, detail: u64) {
+    if IRQ_CR8_DIAG.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 16 {
+        print_str(b"[irq-cr8] stage=");
+        print_u64(stage);
+        print_str(b" detail=");
+        print_hex64(detail);
+        print_str(b"\n");
+    }
+}
+
 /// The executive mirror of the component's IRQL byte is selected through the
 /// admitted physical instance. A component-supplied address is never authority.
 unsafe fn hosted_current_irql(shared: u64) -> Option<(u64, u8)> {
     let address = shared.checked_add(SH_HOSTED_CURRENT_IRQL)?;
     let value = read_volatile(address as *const u8);
     (value <= 15).then_some((address, value))
+}
+
+/// An IRQ callback executes on its own physical lane. Its IRQL lives in that lane's arena,
+/// whereas the ordinary driver shared byte can belong to a parked primary dispatch.
+unsafe fn service_irq_read(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    words: [u64; 5],
+) -> Cr8FaultOutcome {
+    let Some(lane) = hosted_irq_cr8_fault_lane(channel, reply_cap, badge) else {
+        irq_cr8_diag(1, reply_cap);
+        return Cr8FaultOutcome::Rejected;
+    };
+    let Some(inst) = instance(lane.instance) else { return Cr8FaultOutcome::Rejected; };
+    let Some(image) = hosted_driver_process_notify::published_image_for_callback(
+        lane.instance, inst, words[0],
+    ) else { return Cr8FaultOutcome::Rejected; };
+    let Some(image_offset) = words[0].checked_sub(image.run_base) else {
+        return Cr8FaultOutcome::Rejected;
+    };
+    if image_offset.checked_add(4).is_none_or(|end| end > image.image_len) {
+        return Cr8FaultOutcome::Rejected;
+    }
+    let Some(offset) = words[0].checked_sub(FSD_CODE_VA) else {
+        return Cr8FaultOutcome::Rejected;
+    };
+    let Some(image_bytes) = inst.image_frames.checked_mul(4096) else {
+        return Cr8FaultOutcome::Rejected;
+    };
+    if offset.checked_add(4).is_none_or(|end| end > image_bytes) {
+        return Cr8FaultOutcome::Rejected;
+    }
+    let Some(alias) = ExecVaWindow::try_for_instance(lane.instance)
+        .and_then(|window| window.code_va.checked_add(offset))
+    else { return Cr8FaultOutcome::Rejected; };
+    let mut bytes = [0u8; 4];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = read_volatile((alias + index as u64) as *const u8);
+    }
+    if decode_cr8_write(&bytes).is_some() {
+        // A write must pass the arena's active-transaction transition contract; do not
+        // silently alter the primary's shared byte or resume this lane without that owner.
+        return Cr8FaultOutcome::Rejected;
+    }
+    let Some(instruction) = decode_cr8_read(&bytes) else {
+        irq_cr8_diag(2, u32::from_le_bytes(bytes) as u64);
+        return Cr8FaultOutcome::Unrelated;
+    };
+    let arena = &*(lane.arena_va as *const nt_hosted_runtime::HostedIrqArena);
+    let Ok(irql) = arena.control.current_irql(lane.identity) else {
+        return Cr8FaultOutcome::Rejected;
+    };
+    let Ok(snapshot) = crate::thread_context::LegacyThreadContext::read(channel.tcb) else {
+        return Cr8FaultOutcome::Rejected;
+    };
+    if snapshot.registers[0] != words[0]
+        || snapshot.registers[1] != words[1]
+        || snapshot.registers[2] != words[2]
+    { return Cr8FaultOutcome::Rejected; }
+    let mut registers = snapshot.registers;
+    let Some(mask) = project_cr8_read(&mut registers, instruction, irql) else {
+        return Cr8FaultOutcome::Rejected;
+    };
+    if hosted_irq_cr8_fault_lane(channel, reply_cap, badge) != Some(lane)
+        || arena.control.current_irql(lane.identity) != Ok(irql)
+        || hosted_driver_process_notify::published_image_for_callback(
+            lane.instance, inst, words[0],
+        ) != Some(image)
+    { irq_cr8_diag(3, lane.transaction.transaction); return Cr8FaultOutcome::Rejected; }
+    let restore = nt_thread_start::amd64_context::LegacyContextRestore {
+        registers,
+        register_mask: mask,
+        floating_point: None,
+        debug: None,
+    };
+    if crate::thread_context::write(channel.tcb, &restore, false).is_err() {
+        irq_cr8_diag(4, channel.tcb);
+        return Cr8FaultOutcome::Rejected;
+    }
+    irq_cr8_diag(5, irql as u64);
+    Cr8FaultOutcome::Applied
 }
 
 pub(crate) unsafe fn service(
@@ -27,6 +122,9 @@ pub(crate) unsafe fn service(
     }
     if words[4] != 0 || channel.tcb == 0 || active_reply_cap == 0 {
         return Cr8FaultOutcome::Rejected;
+    }
+    if channel.dispatch_label == FSD_IRQ_LANE_COMPLETION_LABEL {
+        return service_irq_read(channel, active_reply_cap, badge, words);
     }
     let source = crate::driver_launch::hosted_exception_stack::fault_source_identity(
         channel, active_reply_cap, badge,

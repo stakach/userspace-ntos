@@ -81,7 +81,6 @@ fn win32k_frame_runs_do_not_derive_a_run_from_scalar_allocations() {
         "lpc_request_base",
         "job_atom_base",
         "registry_request_base",
-        "bulk_arg_base",
         "heap_base",
     ] {
         assert!(

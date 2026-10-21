@@ -7,6 +7,7 @@
 #![no_std]
 
 mod hosted_irq_arena;
+mod hosted_irq_cr8_source;
 mod hosted_irq_call_stack;
 mod progress_deferral;
 mod driver_load_receipt;
@@ -16,6 +17,13 @@ mod provider_export_worker;
 mod gop_bar_projection;
 mod hosted_driver_thread_object;
 mod hosted_event_projection;
+mod win32k_bulk_stage;
+
+pub use win32k_bulk_stage::{
+    Win32kBulkDispatchIdentity, Win32kBulkLayout, Win32kBulkLease, Win32kBulkLeaseState,
+    Win32kBulkMapFailure, Win32kBulkOwner,
+    Win32kBulkStageError, Win32kBulkStages,
+};
 
 pub use driver_load_receipt::{DriverLoadPhase, RetainedEffectState};
 pub use contiguous_ram::{ContiguousRamError, ContiguousRamLayout, ContiguousRamOwner,
@@ -73,6 +81,7 @@ pub use hosted_irq_arena::{
     HOSTED_IRQ_ARENA_MAGIC, HOSTED_IRQ_ARENA_MARSHAL_BYTES, HOSTED_IRQ_ARENA_PAGE_COUNT,
     HOSTED_IRQ_ARENA_RESULT_CAP, HOSTED_IRQ_ARENA_VERSION,
 };
+pub use hosted_irq_cr8_source::{HostedIrqCr8Source, select_hosted_irq_cr8_source};
 pub use hosted_irq_call_stack::{
     validate_hosted_irq_call_pop, validate_hosted_irq_call_push, HostedIrqCallFrame,
     HostedIrqCallStackError,

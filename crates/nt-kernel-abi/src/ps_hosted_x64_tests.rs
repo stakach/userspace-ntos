@@ -25,6 +25,24 @@ fn u64_at(bytes: &[u8], offset: usize) -> u64 {
 }
 
 #[test]
+fn released_libernt_win32k_reads_the_projected_peb_at_0x2e0() {
+    // The pinned win32k.sys IntFixWindowCoordinates calls IoGetCurrentProcess, then reads
+    // [EPROCESS + 0x2e0] and [PEB + 0x20] for ProcessParameters (RVA 0xAB3C9..0xAB3D6).
+    assert_eq!(EPROCESS_PEB, 0x2e0);
+    let mut bytes = [0; EPROCESS_BODY_BYTES];
+    initialize_process(
+        &mut bytes,
+        ProcessInitialization {
+            peb: GuestAddr(0x30_0000),
+            ..process()
+        },
+    )
+    .unwrap();
+    assert_eq!(u64_at(&bytes, 0x2e0), 0x30_0000);
+    assert_eq!(u64_at(&bytes, 0x2b8), 0);
+}
+
+#[test]
 fn apc_state_index_has_reactos_x64_offset_and_survives_activation_refresh() {
     assert_eq!(KTHREAD_APC_STATE_INDEX, 0x1e4);
     let init = thread();

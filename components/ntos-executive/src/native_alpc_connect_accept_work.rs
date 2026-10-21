@@ -24,6 +24,7 @@ const MAX_OWNERS: usize = 64;
 const PORT_MESSAGE_SIZE: usize = core::mem::size_of::<nt_alpc_abi::PortMessage>();
 
 static NEXT_INVOCATION: AtomicU64 = AtomicU64::new(1);
+static DIAG_SERVICE_PENDING: AtomicU64 = AtomicU64::new(0);
 static mut OWNERS: Vec<OwnedLater> = Vec::new();
 static mut NEXT_OWNER: usize = 0;
 
@@ -312,6 +313,15 @@ pub(crate) unsafe fn begin_connect(handler: &mut ExecNtHandler,
             (*handler_ptr).process_memory_read_status(pi, address, out).is_ok()
         },
         |address, len| (*handler_ptr).probe_user_output(address, len))?;
+    if handler.pi == 9 {
+        print_str(b"[alpc-connect-diag] pi=9 tid="); print_u64(caller.thread);
+        print_str(b" name=");
+        for unit in captured.name.iter().take(64) {
+            let byte = u8::try_from(*unit).unwrap_or(b'?');
+            print_str(&[byte]);
+        }
+        print_str(b"\n");
+    }
     if captured.timeout.is_some() || captured.send_attributes.is_some()
     { return Err(STATUS_NOT_SUPPORTED); }
     // A required server SID is an authorization condition on the exact
@@ -357,6 +367,7 @@ pub(crate) unsafe fn begin_connect(handler: &mut ExecNtHandler,
 
 pub(crate) unsafe fn begin_accept(handler: &mut ExecNtHandler,
     args: [u64; 9]) -> Result<(), u32> {
+    if handler.pi == 10 { print_str(b"[alpc-accept-diag] lsass ingress\n"); }
     if lpc_client().is_none() { return Err(STATUS_DEVICE_NOT_READY); }
     let caller = caller(handler)?;
     let mut connection_id = [0u8; 4];
@@ -367,6 +378,7 @@ pub(crate) unsafe fn begin_accept(handler: &mut ExecNtHandler,
         u32::from_le_bytes(connection_id),
         |address, out| (*handler_ptr).xas_read(address, out),
         |address, len| (*handler_ptr).probe_user_output(address, len))?;
+    if handler.pi == 10 { print_str(b"[alpc-accept-diag] captured id="); print_hex(captured.connection_id); print_str(b"\n"); }
     let handle_caller = handler.native_handle_caller(nt_syscall::ProcessorMode::UserMode)?;
     let listen = handler.pm.lookup_native_alpc_port(handle_caller,
         captured.listen_port, caller.generation)?;
@@ -571,6 +583,16 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
         }
         Step::Exact(id, status, info, d0, d1) => {
             let caller = owner.caller();
+            if owner.pi == 9 && caller.thread > 300
+                && (status != STATUS_PENDING
+                    || DIAG_SERVICE_PENDING.fetch_add(1, Ordering::Relaxed) < 16) {
+                print_str(b"[alpc-connect-diag] terminal tid="); print_u64(caller.thread);
+                print_str(b" status="); print_hex(status as u32);
+                print_str(b" info="); print_hex_u64(info);
+                print_str(b" d0="); print_hex_u64(d0);
+                print_str(b" d1="); print_hex_u64(d1);
+                print_str(b"\n");
+            }
             if status == STATUS_PENDING && matches!(&owner.kind, Kind::Connect(_)) {
                 owner.flight = if owner.retained.continue_pending(id, caller).is_ok() {
                     if owner.kernel_listen.is_some() {

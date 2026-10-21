@@ -313,6 +313,8 @@ const COMPONENT_MAP_CAP_BANK_RESERVED_SLOTS: u64 = 64;
 static COMPONENT_MAP_CAP_BANK_OWNER_NEXT: AtomicU64 = AtomicU64::new(1);
 static COMPONENT_MAP_CAP_ROOT_OWNER: [AtomicU16; ROOT_SLOT_TRACK_CAP] =
     [const { AtomicU16::new(0) }; ROOT_SLOT_TRACK_CAP];
+static COMPONENT_MAP_RELEASE_DENIAL_TRACES: AtomicU64 = AtomicU64::new(0);
+const COMPONENT_MAP_RELEASE_DENIAL_TRACE_LIMIT: u64 = 8;
 
 #[inline]
 fn component_heap_pt_count(frames: u64) -> u64 {
@@ -469,6 +471,55 @@ pub(crate) unsafe fn component_map_cap_bank_tag(owner: u16, root_cap: u64) -> bo
         return false;
     };
     COMPONENT_MAP_CAP_ROOT_OWNER[owner_slot].swap(owner, Ordering::Relaxed) == 0
+}
+
+/// Retire one demand-mapped leaf without leaving its owner tag on a recycled root slot.
+/// A failed unmap or delete leaves the cap tagged for bank teardown and must quarantine its VA.
+unsafe fn trace_component_page_release_denial(stage: u64, root_cap: u64,
+    owner: u16, observed: u16, error: u64)
+{
+    if COMPONENT_MAP_RELEASE_DENIAL_TRACES.fetch_add(1, Ordering::Relaxed)
+        >= COMPONENT_MAP_RELEASE_DENIAL_TRACE_LIMIT
+    { return; }
+    print_str(b"[component-bank] page release denied stage="); print_u64(stage);
+    print_str(b" cap="); crate::print_hex_u64(root_cap);
+    print_str(b" owner="); print_u64(owner as u64);
+    print_str(b" observed="); print_u64(observed as u64);
+    print_str(b" error="); print_u64(error);
+    print_str(b"\n");
+}
+
+pub(crate) unsafe fn component_map_cap_bank_release_page(owner: u16, root_cap: u64) -> bool {
+    let Some(owner_slot) = root_slot_index(root_cap) else {
+        trace_component_page_release_denial(1, root_cap, owner, 0, 0);
+        return false;
+    };
+    let observed = COMPONENT_MAP_CAP_ROOT_OWNER[owner_slot].load(Ordering::Acquire);
+    if owner == 0 || observed != owner {
+        trace_component_page_release_denial(2, root_cap, owner, observed, 0);
+        return false;
+    }
+    let error = crate::page_unmap_r(root_cap);
+    if error != 0 {
+        trace_component_page_release_denial(3, root_cap, owner, observed, error);
+        return false;
+    }
+    let error = crate::cnode_delete_r(root_cap);
+    if error != 0 {
+        trace_component_page_release_denial(4, root_cap, owner, observed, error);
+        return false;
+    }
+    if COMPONENT_MAP_CAP_ROOT_OWNER[owner_slot]
+        .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // The deleted slot is deliberately retained, never recycled under a foreign owner tag.
+        trace_component_page_release_denial(5, root_cap, owner,
+            COMPONENT_MAP_CAP_ROOT_OWNER[owner_slot].load(Ordering::Acquire), 0);
+        return false;
+    }
+    crate::recycle_deleted_root_slot(root_cap);
+    true
 }
 
 pub(crate) unsafe fn release_component_map_cap_bank(
@@ -2028,9 +2079,10 @@ unsafe fn hosted_irq_reply_recv(
 }
 
 /// Exchange one command with an enrolled hosted-interrupt lane. This protocol deliberately has a
-/// much smaller service surface than the normal component pump: completion, demand faults, and
-/// explicitly granted I/O faults only. An ordinary `FSD_SERVICE_*` request is a fatal protocol wall
-/// because servicing it could touch the parked component's fixed request bank.
+/// much smaller service surface than the normal component pump: completion, demand faults,
+/// authenticated inline CR8 reads, and explicitly granted I/O faults. An ordinary
+/// `FSD_SERVICE_*` request is a fatal protocol wall because servicing it could touch the parked
+/// component's fixed request bank.
 pub(crate) unsafe fn component_hosted_irq_exchange(
     ch: &PumpChannel,
     action: HostedIrqExchangeAction,
@@ -2113,6 +2165,21 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
                 );
                 continue;
             }
+            match crate::driver_launch::hosted_driver_cr8_fault::service(
+                ch, ch.reply_cap, msg.badge, [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4],
+            ) {
+                crate::driver_launch::hosted_driver_cr8_fault::Cr8FaultOutcome::Applied => {
+                    msg = hosted_irq_reply_recv(
+                        ch, ch.reply_cap, 0, [0; 4], identity, expected_badge,
+                    );
+                    continue;
+                }
+                crate::driver_launch::hosted_driver_cr8_fault::Cr8FaultOutcome::Rejected => {
+                    outcome.wall(msg);
+                    break;
+                }
+                crate::driver_launch::hosted_driver_cr8_fault::Cr8FaultOutcome::Unrelated => {}
+            }
         }
         outcome.wall(msg);
         break;
@@ -2179,11 +2246,19 @@ pub(crate) unsafe fn component_pump_continue_service_wait(
     ch: &PumpChannel,
     previous: &PumpResult,
 ) -> Result<PumpResult, u32> {
-    if !previous.is_service_wait_yield()
-        || !previous.service_wait_yield.is_some_and(|yielded|
-            previous.reply_cap == yielded.reply
-                && crate::win32k_glue::service_wait_continuation_is_current(ch, yielded))
-    {
+    let yielded = previous.is_service_wait_yield();
+    let reply_matches = previous.service_wait_yield.is_some_and(|wait| previous.reply_cap == wait.reply);
+    let current = previous.service_wait_yield.is_some_and(|wait|
+        crate::win32k_glue::service_wait_continuation_is_current(ch, wait));
+    if !yielded || !reply_matches || !current {
+        static SERVICE_WAIT_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+        if SERVICE_WAIT_REJECTIONS.fetch_add(1, Ordering::Relaxed) < 8 {
+            print_str(b"[service-wait-resume] stage=authority yield/reply/current/channel-reply=");
+            print_u64(yielded as u64); print_str(b"/"); print_u64(reply_matches as u64);
+            print_str(b"/"); print_u64(current as u64);
+            print_str(b"/"); print_u64(ch.reply_cap);
+            print_str(b"\n");
+        }
         return Err(nt_process::STATUS_INVALID_PARAMETER);
     }
     component_pump_continue_receive_half(ch, previous)
@@ -3171,6 +3246,22 @@ unsafe fn component_pump_loop(
                 (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0)
             };
             pump_reply_recv4_into!(ch, *reply_cap, msg, 4, status as u32 as u64, current, saved, attached);
+            continue;
+        } else if label == crate::win32k_subsystem::W32_LARGE_POOL_RETIRE_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let acknowledgement = if shared_pump::authenticated_badge(ch, msg.badge)
+                && msg.mi == ((crate::win32k_subsystem::W32_LARGE_POOL_RETIRE_LABEL << 12) | 4)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::win32k_subsystem::large_pool::service_retirement(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3,
+                )
+            } else {
+                [0; 4]
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 4,
+                acknowledgement[0], acknowledgement[1], acknowledgement[2], acknowledgement[3]);
             continue;
         } else if label == crate::win32k_subsystem::W32_PS_LABEL
             && ch.caps.kind == ReqKind::Syscall
@@ -4677,9 +4768,18 @@ unsafe fn component_pump_loop(
 unsafe fn pump_service_user_callback(
     ch: &PumpChannel,
 ) -> Option<crate::win32k_glue::UserCallbackDisposition> {
+    print_str(b"[callback-pump-stage] enter\n");
     let lane =
         crate::win32k_glue::win32k_physical_lane_for_channel(ch.tcb, ch.fault_ep, ch.reply_cap)?;
-    crate::win32k_glue::service_user_callback(lane)
+    let outcome = crate::win32k_glue::service_user_callback(lane);
+    print_str(b"[callback-pump-stage] return disposition=");
+    print_u64(match outcome {
+        Some(crate::win32k_glue::UserCallbackDisposition::SuspendComponent) => 1,
+        Some(crate::win32k_glue::UserCallbackDisposition::ReplyImmediately) => 2,
+        None => 0,
+    });
+    print_str(b"\n");
+    outcome
 }
 
 #[inline(never)]
@@ -4701,6 +4801,9 @@ pub(crate) unsafe fn pump_service_vm_fault(
         return mapped;
     }
     if let Some(mapped) = crate::component_heap::service_fault(ch, addr, fsr) { return mapped; }
+    if let Some(mapped) = crate::win32k_subsystem::large_pool::service_fault(ch, addr, fsr) {
+        return mapped;
+    }
     if crate::win32k_subsystem::is_reserved_win32k_video_aperture(addr) { return false; }
     // Ps storage is never generic demand-zero memory or an attached-client mapping. The
     // canonical owner must authenticate an exact provider alias before this branch can map it.

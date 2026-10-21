@@ -17,7 +17,7 @@ RUST_TEST_THREADS=1 cargo test --workspace --locked --no-fail-fast
 ./run.sh --desktop # optional QEMU display
 ```
 
-The launcher requires Rust nightly with `rust-src`, QEMU with OVMF, a C compiler, `patch`, Python 3, `bsdtar`, and `7zz`. Its first run downloads the pinned release; later runs use the verified cache in `rust-micro/.tmp/libernt/`. The generated boot image is `rust-micro/.tmp/disk.img`. Allow several gigabytes for the archive, extracted filesystem, build output, and image. `BOOT_TIMEOUT_SECONDS` bounds a boot attempt to at most 3600 seconds. Run tests, native builds, image generation, and QEMU serially because they share artifacts.
+The launcher requires Rust nightly with `rust-src`, QEMU with OVMF, a C compiler, `patch`, Python 3, `bsdtar`, and `7zz`. Its first run downloads the pinned release; later runs use the verified cache in `rust-micro/.tmp/libernt/`. The generated boot image is `rust-micro/.tmp/disk.img`. Allow several gigabytes for the archive, extracted filesystem, build output, and image. QEMU defaults to 3 GiB of RAM for LiberNT's root Untyped allocation; set `QEMU_MEMORY` to override it. `BOOT_TIMEOUT_SECONDS` bounds a boot attempt to at most 3600 seconds. Run tests, native builds, image generation, and QEMU serially because they share artifacts.
 
 `./run.sh` checks a headless boot; `./run.sh --desktop` also opens a QEMU display. [LiberNT desktop acceptance](https://github.com/stakach/userspace-ntos/issues/310) requires genuine Winlogon, Userinit, and Explorer execution, a screenshot, and reboot and persistence checks. A successful crate test or image build alone does not establish desktop acceptance. [The previous ReactOS acceptance](https://github.com/stakach/userspace-ntos/issues/18) is separate.
 

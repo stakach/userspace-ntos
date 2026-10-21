@@ -15,7 +15,7 @@ pub(super) unsafe fn project(
         let thread = caller.original_thread();
         let process_body = pm.process_kernel_object(thread.process_id()).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         let thread_body = pm.thread_kernel_object(thread.thread_id()).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        use nt_kernel_abi::ps_reactos_x64::{EPROCESS_BODY_BYTES, ETHREAD_BODY_BYTES};
+        use nt_kernel_abi::ps_hosted_x64::{EPROCESS_BODY_BYTES, ETHREAD_BODY_BYTES};
         use crate::ps_object_backing::PublishedBody;
         for (body, address, bytes) in [
             (PublishedBody::Process, process_body, EPROCESS_BODY_BYTES),

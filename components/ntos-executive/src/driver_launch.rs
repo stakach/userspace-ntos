@@ -16669,7 +16669,7 @@ extern "win64" fn s_current_thread() -> u64 { current_ps_value(3) }
 extern "win64" fn s_io_thread_to_process(thread: u64) -> u64 {
     unsafe {
         read_unaligned(
-            (thread + nt_kernel_abi::ps_reactos_x64::ETHREAD_THREADS_PROCESS as u64) as *const u64,
+            (thread + nt_kernel_abi::ps_hosted_x64::ETHREAD_THREADS_PROCESS as u64) as *const u64,
         )
     }
 }
@@ -16682,7 +16682,7 @@ extern "win64" fn s_io_get_requestor_process(irp: u64) -> u64 {
         match read_unaligned((irp + 0x40) as *const u8) {
             0 => s_io_thread_to_process(thread),
             1 => read_unaligned(
-                (thread + nt_kernel_abi::ps_reactos_x64::KTHREAD_APC_STATE_PROCESS as u64)
+                (thread + nt_kernel_abi::ps_hosted_x64::KTHREAD_APC_STATE_PROCESS as u64)
                     as *const u64,
             ),
             _ => 0,
@@ -42104,6 +42104,19 @@ unsafe fn retain_hosted_query_id_result(
         .as_mut()
         .expect("hosted relation query disappeared while retaining QUERY_ID result");
     query.driver_status = Some(status);
+    if child_index == 30 {
+        print_str(b"[pnp-query-id-result] child=");
+        print_u64(child_index as u64);
+        print_str(b" type=");
+        print_u64(id_type as u64);
+        print_str(b" status=");
+        print_hex(status.raw() as u32);
+        print_str(b" info=");
+        print_u64(information);
+        print_str(b" pending=");
+        print_u64(pending_completion as u64);
+        print_str(b"\n");
+    }
     if status.is_success() && information != 0 {
         query.phase = HostedDeviceRelationQueryPhase::AwaitingIdCopy {
             child_index,
@@ -42903,41 +42916,32 @@ unsafe fn classify_hosted_acpi_namespace_result(
     information: u64,
     payload: &[u8],
 ) -> HostedNamespaceDisposition {
+    if nt_acpi::namespace_children_absent(status.raw() as u32, information) {
+        return match store_hosted_acpi_namespace(
+            child_index,
+            HostedAcpiNamespaceState::NotApplicable,
+        ) {
+            Ok(()) => HostedNamespaceDisposition::Advance,
+            Err(status) => HostedNamespaceDisposition::Barrier(status),
+        };
+    }
     if output_len == HOSTED_ACPI_NAMESPACE_HEADER_LEN {
-        if status == nt_status::NtStatus::INVALID_DEVICE_REQUEST {
-            if information != 0 {
-                return HostedNamespaceDisposition::Barrier(
-                    nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-                );
-            }
-            return match store_hosted_acpi_namespace(
-                child_index,
-                HostedAcpiNamespaceState::NotApplicable,
-            ) {
-                Ok(()) => HostedNamespaceDisposition::Advance,
-                Err(status) => HostedNamespaceDisposition::Barrier(status),
-            };
-        }
-        if status.raw() as u32 != STATUS_BUFFER_OVERFLOW {
+        if !matches!(status.raw() as u32, STATUS_BUFFER_OVERFLOW | 0xc000_0023) {
             return HostedNamespaceDisposition::Barrier(if status.is_success() {
                 nt_status::NtStatus::INVALID_DEVICE_REQUEST
             } else {
                 status
             });
         }
-        return match (information == 0)
-            .then(|| {
-                nt_acpi::namespace_children_overflow_retry_len(
-                    payload,
-                    output_len,
-                    HOSTED_ACPI_NAMESPACE_MAX_BYTES,
-                )
-                .ok()
-            })
-            .flatten()
-        {
-            Some(required) => HostedNamespaceDisposition::RetryExact(required),
-            None => {
+        return match nt_acpi::namespace_children_probe_retry_len(
+            status.raw() as u32,
+            information,
+            payload,
+            output_len,
+            HOSTED_ACPI_NAMESPACE_MAX_BYTES,
+        ) {
+            Ok(required) => HostedNamespaceDisposition::RetryExact(required),
+            Err(_) => {
                 HostedNamespaceDisposition::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
             }
         };
@@ -42953,11 +42957,37 @@ unsafe fn classify_hosted_acpi_namespace_result(
     else {
         return HostedNamespaceDisposition::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     };
-    match nt_acpi::parse_namespace_children(payload, HOSTED_ACPI_NAMESPACE_MAX_CHILDREN)
-        .map(HostedAcpiNamespaceState::Present)
-        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)
-        .and_then(|value| store_hosted_acpi_namespace(child_index, value))
-    {
+    let namespace = match nt_acpi::parse_namespace_children(
+        payload,
+        HOSTED_ACPI_NAMESPACE_MAX_CHILDREN,
+    ) {
+        Ok(namespace) => namespace,
+        Err(error) => {
+            if child_index == 1 {
+                print_str(b"[pnp-namespace-parse] error=");
+                print_u64(error as u64);
+                print_str(b" length=");
+                print_u64(payload.len() as u64);
+                print_str(b"\n");
+                for (index, byte) in payload.iter().take(1024).enumerate() {
+                    if index % 16 == 0 {
+                        print_str(b"[pnp-namespace-byte] offset=");
+                        print_u64(index as u64);
+                        print_str(b" data=");
+                    }
+                    print_hex(u32::from(*byte));
+                    print_str(b",");
+                    if index % 16 == 15 || index + 1 == payload.len().min(1024) {
+                        print_str(b"\n");
+                    }
+                }
+            }
+            return HostedNamespaceDisposition::Barrier(
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            );
+        }
+    };
+    match store_hosted_acpi_namespace(child_index, HostedAcpiNamespaceState::Present(namespace)) {
         Ok(()) => HostedNamespaceDisposition::Advance,
         Err(status) => HostedNamespaceDisposition::Barrier(status),
     }
@@ -43066,6 +43096,15 @@ unsafe fn dispatch_hosted_acpi_namespace(child_index: usize, output_len: usize) 
         Ok(result) => result,
         Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES) => return false,
         Err(status) => {
+            if child_index <= 1 {
+                print_str(b"[pnp-namespace-dispatch] child=");
+                print_u64(child_index as u64);
+                print_str(b" error status=");
+                print_hex(status.raw() as u32);
+                print_str(b" output-len=");
+                print_u64(output_len as u64);
+                print_str(b"\n");
+            }
             set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
                 status,
             ));
@@ -43078,6 +43117,22 @@ unsafe fn dispatch_hosted_acpi_namespace(child_index: usize, output_len: usize) 
             information,
             ..
         } => {
+            if child_index <= 1 {
+                print_str(b"[pnp-namespace-dispatch] child=");
+                print_u64(child_index as u64);
+                print_str(b" completed status=");
+                print_hex(status.raw() as u32);
+                print_str(b" information=");
+                print_u64(information);
+                print_str(b" output-len=");
+                print_u64(output_len as u64);
+                print_str(b" header=");
+                for byte in output.iter().take(8) {
+                    print_hex(u32::from(*byte));
+                    print_str(b",");
+                }
+                print_str(b"\n");
+            }
             let disposition = classify_hosted_acpi_namespace_result(
                 child_index,
                 output_len,
@@ -43248,6 +43303,39 @@ unsafe fn apply_hosted_acpi_pci_root_method_disposition(
         _ => Err(nt_pnp::AcpiPciScopeError::InvalidRootBusResource),
     };
     let Ok(root) = root else {
+        if child_index == 1 {
+            print_str(b"[pnp-pci-root-fact] child=1 error=");
+            print_u64(match root.err().unwrap() {
+                nt_pnp::AcpiPciScopeError::InvalidRootHardwareId => 1,
+                nt_pnp::AcpiPciScopeError::InvalidRootSegment => 2,
+                nt_pnp::AcpiPciScopeError::InvalidRootBus => 3,
+                nt_pnp::AcpiPciScopeError::InvalidRootBusResource => 4,
+                _ => 255,
+            });
+            print_str(b" segment=");
+            print_u64(segment as u64);
+            print_str(b" bus=");
+            print_u64(base_bus as u64);
+            if let nt_pnp_manager::PropertyBlobState::Present(resources) = &properties.boot_resources_raw {
+                print_str(b" resource-len=");
+                print_u64(resources.len() as u64);
+                print_str(b"\n");
+                for (index, byte) in resources.iter().take(128).enumerate() {
+                    if index % 16 == 0 {
+                        print_str(b"[pnp-pci-root-resource] offset=");
+                        print_u64(index as u64);
+                        print_str(b" data=");
+                    }
+                    print_hex(u32::from(*byte));
+                    print_str(b",");
+                    if index % 16 == 15 || index + 1 == resources.len().min(128) {
+                        print_str(b"\n");
+                    }
+                }
+            } else {
+                print_str(b" resource=absent\n");
+            }
+        }
         set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
             nt_status::NtStatus::INVALID_DEVICE_REQUEST,
         ));
@@ -43705,6 +43793,16 @@ unsafe fn resolve_hosted_relation_policy(
             return Ok(Some(binding));
         }
     }
+    for id in child.hardware_ids.iter().chain(&child.compatible_ids) {
+        if let Some(binding) = crate::config_manager_query_driver_database_binding(id)
+            .map_err(hosted_relation_error_from_config)?
+        {
+            if binding.mount_generation != expected_generation {
+                return Err(HostedRelationPublishError::Retry);
+            }
+            return Ok(Some(binding));
+        }
+    }
     Ok(None)
 }
 
@@ -43793,16 +43891,6 @@ unsafe fn build_hosted_relation_mutations(
         .map_err(|_| HostedRelationPublishError::Retry)?;
 
     for (index, change) in prepared.changes().iter().enumerate() {
-    for id in child.hardware_ids.iter().chain(&child.compatible_ids) {
-        if let Some(binding) = crate::config_manager_query_driver_database_binding(id)
-            .map_err(hosted_relation_error_from_config)?
-        {
-            if binding.mount_generation != expected_generation {
-                return Err(HostedRelationPublishError::Retry);
-            }
-            return Ok(Some(binding));
-        }
-    }
         let instance_id = hosted_relation_instance_path(&change.child)?;
         let enum_path = hosted_relation_enum_path(&change.child)?;
         if change.kind == nt_pnp_manager::BusRelationChangeKind::Removal {
@@ -44562,7 +44650,16 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     match copy_hosted_query_id_result(allocation_instance, information, id_type) {
                         Ok(value) => match store_hosted_query_id(child_index, id_type, value) {
                             Ok(()) => HostedQueryIdDisposition::Advance,
-                            Err(status) => HostedQueryIdDisposition::Barrier(status),
+                            Err(status) => {
+                                if child_index == 30 {
+                                    print_str(b"[pnp-query-id-store] child=30 type=");
+                                    print_u64(id_type as u64);
+                                    print_str(b" status=");
+                                    print_hex(status.raw() as u32);
+                                    print_str(b"\n");
+                                }
+                                HostedQueryIdDisposition::Barrier(status)
+                            }
                         },
                         Err(HostedDriverAllocationCopyError::RetryResources) => return progress,
                         Err(HostedDriverAllocationCopyError::InvalidPointer)
@@ -52183,7 +52280,27 @@ unsafe fn copy_hosted_query_id_result(
         Err(nt_pnp_manager::BusQueryIdCopyError::InsufficientResources) => {
             Err(HostedDriverAllocationCopyError::RetryResources)
         }
-        Err(_) => {
+        Err(error) => {
+            print_str(b"[pnp-query-id-copy] type=");
+            print_u64(id_type as u64);
+            print_str(b" capacity=");
+            print_u64(capacity as u64);
+            print_str(b" error=");
+            print_u64(match error {
+                nt_pnp_manager::BusQueryIdCopyError::UnsupportedType => 1,
+                nt_pnp_manager::BusQueryIdCopyError::MissingTerminator => 2,
+                nt_pnp_manager::BusQueryIdCopyError::EmptyId => 3,
+                nt_pnp_manager::BusQueryIdCopyError::IdTooLong => 4,
+                nt_pnp_manager::BusQueryIdCopyError::InvalidCharacter => 5,
+                nt_pnp_manager::BusQueryIdCopyError::InvalidSeparators => 6,
+                nt_pnp_manager::BusQueryIdCopyError::InsufficientResources => 8,
+            });
+            print_str(b" first-utf16=");
+            for unit in allocation.chunks_exact(2).take(24) {
+                print_hex(u16::from_le_bytes([unit[0], unit[1]]) as u32);
+                print_str(b",");
+            }
+            print_str(b"\n");
             if hosted_instance_pool_free_unlocked(inst, component_pointer) {
                 Err(HostedDriverAllocationCopyError::Malformed)
             } else {
@@ -53946,7 +54063,9 @@ unsafe fn build_hosted_irq_lane(
             exec_base.checked_add(FSD_WORKER_SCRATCH_OFFSET)?,
             RW_NX,
             &[],
-            false,
+            // CR8 faults must compare the stopped worker's GS transaction with the root-owned
+            // arena. Keep this exact alias through lane retirement for that authentication.
+            true,
             &mut lane.kpcr,
         ) {
             return None;
@@ -54140,6 +54259,155 @@ pub(crate) fn hosted_irq_pump_caller_tcb(
         return None;
     }
     Some(lane.tcb)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct HostedIrqCr8FaultLane {
+    instance: usize,
+    identity: nt_hosted_runtime::HostedIrqLaneIdentity,
+    arena_va: u64,
+    transaction: nt_hosted_runtime::HostedIrqTransaction,
+}
+
+/// The stopped worker's GS context is backed by this exact root alias. Match its active
+/// transaction against the arena so a previous callback cannot supply the next one's IRQL.
+unsafe fn hosted_irq_cr8_transaction(
+    lane: &HostedIrqLaneRuntime,
+) -> Option<(u64, nt_hosted_runtime::HostedIrqTransaction)> {
+    if !lane.kpcr.mapped || !lane.kpcr.exec_mapped || lane.exec_arena_va == 0 {
+        hosted_driver_cr8_fault::irq_cr8_diag(15,
+            (lane.kpcr.mapped as u64) | ((lane.kpcr.exec_mapped as u64) << 1)
+                | (((lane.exec_arena_va != 0) as u64) << 2));
+        return None;
+    }
+    let kpcr = lane.exec_arena_va
+        .checked_sub(FSD_IRQ_LANE_ARENA_OFFSET)?
+        .checked_add(FSD_WORKER_SCRATCH_OFFSET)?;
+    let word = |offset: u64| read_volatile((kpcr + offset) as *const u64);
+    if word(HOSTED_IRQ_LANE_KPCR_MAGIC_OFFSET) != HOSTED_IRQ_LANE_KPCR_MAGIC {
+        hosted_driver_cr8_fault::irq_cr8_diag(10, word(HOSTED_IRQ_LANE_KPCR_MAGIC_OFFSET));
+        return None;
+    }
+    core::sync::atomic::compiler_fence(Ordering::Acquire);
+    let component_arena = hosted_worker_component_base_for_slot(FSD_IRQ_LANE_COMPONENT_SLOT)?
+        .checked_add(FSD_IRQ_LANE_ARENA_OFFSET)?;
+    if word(HOSTED_IRQ_LANE_KPCR_ARENA_OFFSET) != component_arena
+        || word(HOSTED_IRQ_LANE_KPCR_DOMAIN_ID_OFFSET) != lane.identity.domain_id
+        || word(HOSTED_IRQ_LANE_KPCR_DOMAIN_COOKIE_OFFSET) != lane.identity.domain_cookie
+        || word(HOSTED_IRQ_LANE_KPCR_GENERATION_OFFSET) != lane.identity.lane_generation
+    {
+        hosted_driver_cr8_fault::irq_cr8_diag(11, word(HOSTED_IRQ_LANE_KPCR_ARENA_OFFSET));
+        return None;
+    }
+    let observed = word(HOSTED_IRQ_LANE_KPCR_TRANSACTION_OFFSET);
+    let class = word(HOSTED_IRQ_LANE_KPCR_CLASS_OFFSET);
+    let arena = &*(lane.exec_arena_va as *const nt_hosted_runtime::HostedIrqArena);
+    let transaction = match arena.control.active_transaction(lane.identity, observed) {
+        Ok(transaction) => transaction,
+        Err(_) => {
+            hosted_driver_cr8_fault::irq_cr8_diag(12, observed);
+            return None;
+        }
+    };
+    if transaction.class as u32 as u64 != class
+        || word(HOSTED_IRQ_LANE_KPCR_MAGIC_OFFSET) != HOSTED_IRQ_LANE_KPCR_MAGIC
+    {
+        hosted_driver_cr8_fault::irq_cr8_diag(13, class);
+        return None;
+    }
+    Some((observed, transaction))
+}
+
+/// Resolve a fault-blocked IRQ peer through its retained route and physical lane generation.
+/// The component's shared IRQL mirror belongs to the parked primary and is not authority here.
+unsafe fn hosted_irq_cr8_fault_lane(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+) -> Option<HostedIrqCr8FaultLane> {
+    use crate::spawn_hosts::shared_ingress::owner::runtime::{self, PhysicalSourceKind};
+    let Some(route) = channel.ingress_route else {
+        hosted_driver_cr8_fault::irq_cr8_diag(22, channel.fault_ep);
+        return None;
+    };
+    if route.badge() != badge || route.endpoint() != channel.fault_ep
+        || runtime::current_reply(route).ok() != Some(reply_cap)
+    {
+        hosted_driver_cr8_fault::irq_cr8_diag(20, reply_cap);
+        return None;
+    }
+    let source = match runtime::physical_source(route) {
+        Ok(source) => source,
+        Err(_) => {
+            hosted_driver_cr8_fault::irq_cr8_diag(23, route.badge());
+            return None;
+        }
+    };
+    let PhysicalSourceKind::Interrupt(identity) = source.kind else {
+        hosted_driver_cr8_fault::irq_cr8_diag(21, channel.dispatch_label);
+        return None;
+    };
+    let Some(lanes) = hosted_irq_lanes() else {
+        hosted_driver_cr8_fault::irq_cr8_diag(24, identity.lane_generation);
+        return None;
+    };
+    let mut matching = lanes.iter().filter(|lane| lane.identity == identity);
+    let Some(lane) = matching.next() else {
+        hosted_driver_cr8_fault::irq_cr8_diag(25, identity.lane_generation);
+        return None;
+    };
+    let Some(owner_route) = lane.route else {
+        hosted_driver_cr8_fault::irq_cr8_diag(26, identity.lane_generation);
+        return None;
+    };
+    let Some(binding) = crate::service_sec_image::component_execution_lane_binding(
+        owner_route.identity().lane,
+    ) else {
+        hosted_driver_cr8_fault::irq_cr8_diag(27, owner_route.badge());
+        return None;
+    };
+    let Some((observed_transaction, transaction)) = hosted_irq_cr8_transaction(lane) else {
+        hosted_driver_cr8_fault::irq_cr8_diag(28, identity.lane_generation);
+        return None;
+    };
+    let owner = nt_hosted_runtime::HostedIrqCr8Source {
+        lane: lane.identity,
+        endpoint: lane.endpoint,
+        badge: lane.badge,
+        route_generation: owner_route.identity().lane.generation,
+        transaction: transaction.transaction,
+        tcb: lane.tcb,
+        vspace: lane.pml4,
+        reply: binding.reply_object,
+    };
+    let fault = nt_hosted_runtime::HostedIrqCr8Source {
+        lane: identity,
+        endpoint: channel.fault_ep,
+        badge,
+        route_generation: route.identity().lane.generation,
+        transaction: observed_transaction,
+        tcb: source.tcb,
+        vspace: source.pml4,
+        reply: reply_cap,
+    };
+    if matching.next().is_some()
+        || lane.state != HostedIrqLaneState::Ready
+        || owner_route != route
+        || source.domain != runtime::PhysicalDomain::Hosted(lane.domain)
+        || nt_hosted_runtime::select_hosted_irq_cr8_source(owner, fault) != Some(identity)
+        || lane.exec_arena_va == 0
+        || !lane.arena.iter().all(|leaf| leaf.exec_mapped)
+        || hosted_irq_pump_caller_tcb(channel, reply_cap, lane.identity, badge) != Some(lane.tcb)
+    {
+        hosted_driver_cr8_fault::irq_cr8_diag(14, reply_cap);
+        return None;
+    }
+    Some(HostedIrqCr8FaultLane {
+        instance: lane.projection_instance,
+        identity,
+        arena_va: lane.exec_arena_va,
+        transaction,
+    })
 }
 
 unsafe fn hosted_irq_lane_is_referenced(lane: &HostedIrqLaneRuntime) -> bool {

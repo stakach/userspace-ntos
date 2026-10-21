@@ -4,7 +4,7 @@
 //! are adopted here. PM withdrawal owns retirement of published ordinary bodies.
 
 use super::*;
-use nt_kernel_abi::{ps_reactos_x64 as abi, GuestAddr};
+use nt_kernel_abi::{ps_hosted_x64 as abi, GuestAddr};
 use nt_memory_manager::owned_object_page::{ObjectPageIo, OwnedObjectPage, ROOT_ALIAS_RIGHTS};
 use nt_pnp_context::{AddressSlotAllocator, AddressSlotReservation};
 use nt_process::process_object_retirement::ProcessObjectRetirement;

@@ -112,9 +112,36 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
                 continue;
             }
         }
-        match runtime::receive(IngressExecutionOwner::Idle, ROOT_THREAD_CAP, true)
-            .expect("unified executive ingress retained after receive failure")
-        {
+        let arrival = runtime::receive(IngressExecutionOwner::Idle, ROOT_THREAD_CAP, true)
+            .unwrap_or_else(|error| {
+                print_str(b"[ingress-receive-error] root kind=");
+                let kind: &[u8] = match error {
+                    runtime::Error::Receive => b"receive\n",
+                    runtime::Error::Retain => b"retain\n",
+                    runtime::Error::UnknownPeer => b"unknown-peer\n",
+                    runtime::Error::Protocol => b"protocol\n",
+                    _ => b"other\n",
+                };
+                print_str(kind);
+                if let Some(running) = runtime::hold_snapshot().running {
+                    print_str(b"[ingress-receive-error] running lane/gen/route/kind=");
+                    print_u64(running.lane.index as u64);
+                    print_str(b"/");
+                    print_u64(running.lane.generation);
+                    print_str(b"/");
+                    print_u64(running.route.map_or(0, |route| route.badge()));
+                    print_str(b"/");
+                    let source_kind: &[u8] = match running.physical.map(|source| source.kind) {
+                        Some(runtime::PhysicalSourceKind::SystemThread { .. }) => b"system-thread\n",
+                        Some(runtime::PhysicalSourceKind::DispatchWorker { .. }) => b"dispatch-worker\n",
+                        Some(runtime::PhysicalSourceKind::Primary) => b"primary\n",
+                        _ => b"other\n",
+                    };
+                    print_str(source_kind);
+                }
+                panic!("unified executive ingress retained after receive failure")
+            });
+        match arrival {
             runtime::Arrival::Notification(message) => {
                 return ReceiveOutcome::Message(materialize(message))
             }

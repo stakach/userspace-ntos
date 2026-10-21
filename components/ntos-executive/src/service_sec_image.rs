@@ -12,7 +12,7 @@ use hosted_quiesce::dump_all_hosted_thread_quiesce;
 
 #[path = "component_continuation.rs"]
 mod component_continuation;
-use component_continuation::{HostedNativeContinuation, PendingComponentDispatch};
+use component_continuation::{HostedContinuationDestination, HostedNativeContinuation, PendingComponentDispatch};
 pub(crate) use component_continuation::{ComponentNativeContinuation, ComponentSuspensionCompletion};
 
 #[path = "bootstrap_wait_selftest.rs"]
@@ -547,10 +547,6 @@ const WIN32K_BUILD_HWND_LIST_STAGE_BYTES: usize = 0x1000;
 const WIN32K_BUILD_HWND_LIST_COUNT_OFFSET: u64 = 0x0ff0;
 const WIN32K_BUILD_HWND_LIST_MAX_HANDLES: u64 = WIN32K_BUILD_HWND_LIST_COUNT_OFFSET / 8;
 const WIN32K_CREATE_BITMAP_STAGE_BYTES: usize = 0x4000;
-const WIN32K_STRETCH_DIBITS_STAGE_BYTES: usize =
-    (win32k_subsystem::WIN32K_BULK_ARG_FRAMES as usize) * 0x1000;
-const WIN32K_EXT_TEXT_OUT_STAGE_BYTES: usize =
-    (win32k_subsystem::WIN32K_BULK_ARG_FRAMES as usize) * 0x1000;
 const WIN32K_TEXT_METRICS_STAGE_BYTES: usize = 68;
 const WIN32K_TEXT_EXTENT_STAGE_BYTES: usize = 0x4000;
 const WIN32K_CHAR_WIDTH_STAGE_BYTES: usize = 0x4000;
@@ -594,6 +590,7 @@ const CREATE_DIBITMAP_FAIL_BITS_OVERFLOW: u64 = 4;
 const CREATE_DIBITMAP_FAIL_BMI_OVERFLOW: u64 = 5;
 const CREATE_DIBITMAP_FAIL_BITS_COPY: u64 = 6;
 const CREATE_DIBITMAP_FAIL_BMI_COPY: u64 = 7;
+const CREATE_DIBITMAP_FAIL_STAGE_RESOURCE: u64 = 8;
 const CREATE_DIB_SECTION_FAIL_MISSING_SP: u64 = 1;
 const CREATE_DIB_SECTION_FAIL_STACK_TAIL: u64 = 2;
 const CREATE_DIB_SECTION_FAIL_LAYOUT: u64 = 3;
@@ -1548,7 +1545,29 @@ unsafe fn provider_wait_admit_retained(
     pending: win32k_glue::PendingProviderWaitDispatch,
     reply_cap: u64,
     callback_transfer: Option<ComponentCallbackTransfer>,
+    destination: HostedContinuationDestination,
 ) -> bool {
+    let initial_target = matches!(destination, HostedContinuationDestination::InitialThread(_));
+    if initial_target {
+        print_str(b"[initial-provider-wait] stage=request pi/tid/wait/type/timeout-kind/timeout/count=");
+        print_u64(pending.client.pi as u64);
+        print_str(b"/"); print_u64(pending.client.tid);
+        print_str(b"/"); print_u64(pending.request.header.wait_id);
+        print_str(b"/"); print_u64(pending.request.header.wait_type as u64);
+        print_str(b"/"); print_u64(pending.request.header.timeout_kind as u64);
+        print_str(b"/"); print_hex_u64(pending.request.header.timeout_100ns as u64);
+        print_str(b"/"); print_u64(pending.request.header.object_count as u64);
+        print_str(b"\n");
+        for object in pending.request.objects.iter()
+            .take(pending.request.header.object_count as usize)
+        {
+            print_str(b"[initial-provider-wait] object type/id/generation=");
+            print_u64(object.object_type as u64);
+            print_str(b"/"); print_u64(object.object_id);
+            print_str(b"/"); print_u64(object.object_generation);
+            print_str(b"\n");
+        }
+    }
     let Ok(return_target) = HostedReturnTarget::new(
         reply_cap, callback_transfer.map(|transfer| transfer.context),
     ) else {
@@ -1562,6 +1581,7 @@ unsafe fn provider_wait_admit_retained(
     let continuation = ComponentNativeContinuation::Hosted(HostedNativeContinuation {
         pending: PendingComponentDispatch::Provider(pending),
         return_target,
+        destination,
     });
     let lane = pending.dispatch.lane;
     let Ok(binding) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).binding(lane) else {
@@ -1601,6 +1621,7 @@ unsafe fn provider_wait_admit_retained(
         nt_time_snapshot(),
     ) {
         Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::Parked { .. }) => {
+            if initial_target { print_str(b"[initial-provider-wait] stage=parked\n"); }
             PROVIDER_WAIT_PARKED_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
             trace_provider_wait_admission(
                 b"park",
@@ -1610,6 +1631,7 @@ unsafe fn provider_wait_admit_retained(
             );
         }
         Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::Satisfied { wait_id, status }) => {
+            if initial_target { print_str(b"[initial-provider-wait] stage=satisfied\n"); }
             trace_provider_wait_admission(
                 b"ready",
                 wait_id,
@@ -1627,6 +1649,7 @@ unsafe fn provider_wait_admit_retained(
             }
         }
         Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::TimedOut { wait_id }) => {
+            if initial_target { print_str(b"[initial-provider-wait] stage=timeout\n"); }
             trace_provider_wait_admission(
                 b"timeout",
                 wait_id,
@@ -1644,6 +1667,7 @@ unsafe fn provider_wait_admit_retained(
             }
         }
         Err(error) => {
+            if initial_target { print_str(b"[initial-provider-wait] stage=rejected\n"); }
             let status = provider_wait_status_for_error(error);
             trace_provider_wait_admission(
                 b"reject",
@@ -1669,6 +1693,7 @@ unsafe fn provider_wait_admit_current(
     nt_handler: &mut ExecNtHandler,
     pending: win32k_glue::PendingProviderWaitDispatch,
     callback_transfer: Option<ComponentCallbackTransfer>,
+    destination: HostedContinuationDestination,
 ) -> bool {
     let active_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
@@ -1682,6 +1707,7 @@ unsafe fn provider_wait_admit_current(
         pending,
         active_reply,
         callback_transfer,
+        destination,
     ) {
         return false;
     }
@@ -1693,6 +1719,7 @@ unsafe fn receive_admit_retained(
     pending: win32k_glue::PendingReceiveDispatch,
     reply_cap: u64,
     callback_transfer: Option<ComponentCallbackTransfer>,
+    destination: HostedContinuationDestination,
 ) -> bool {
     if pending.yielded.replaces.is_some()
         || pending.callback_token != callback_transfer.map(|transfer| transfer.token)
@@ -1703,7 +1730,7 @@ unsafe fn receive_admit_retained(
     let key = nt_component_suspension::SuspensionKey::receive(pending.yielded.child.admission_sequence());
     let sequence = next_dispatcher_wait_sequence();
     let continuation = ComponentNativeContinuation::Hosted(HostedNativeContinuation {
-        pending: PendingComponentDispatch::Receive(pending), return_target,
+        pending: PendingComponentDispatch::Receive(pending), return_target, destination,
     });
     let admitted = crate::spawn_hosts::shared_ingress::owner::runtime::with_bound_receive_scope(
         pending.yielded.parent, |scope| {
@@ -1726,10 +1753,13 @@ unsafe fn receive_admit_retained(
     admitted.is_ok()
 }
 
-unsafe fn receive_admit_current(pending: win32k_glue::PendingReceiveDispatch) -> bool {
+unsafe fn receive_admit_current(
+    pending: win32k_glue::PendingReceiveDispatch,
+    destination: HostedContinuationDestination,
+) -> bool {
     let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else { return false; };
     if pending.callback_token.is_some()
-        || !receive_admit_retained(pending, REPLY_MAIN_SLOT.load(Ordering::Relaxed), None)
+        || !receive_admit_retained(pending, REPLY_MAIN_SLOT.load(Ordering::Relaxed), None, destination)
     {
         return false;
     }
@@ -1741,6 +1771,7 @@ unsafe fn service_wait_admit_retained(
     pending: win32k_glue::PendingServiceWaitDispatch,
     reply_cap: u64,
     callback_transfer: Option<ComponentCallbackTransfer>,
+    destination: HostedContinuationDestination,
 ) -> bool {
     if pending.callback_token != callback_transfer.map(|transfer| transfer.token) {
         return false;
@@ -1753,7 +1784,7 @@ unsafe fn service_wait_admit_retained(
     let key = nt_component_suspension::SuspensionKey::service_wait(yielded.token);
     let sequence = next_dispatcher_wait_sequence();
     let continuation = ComponentNativeContinuation::Hosted(HostedNativeContinuation {
-        pending: PendingComponentDispatch::ServiceWait(pending), return_target,
+        pending: PendingComponentDispatch::ServiceWait(pending), return_target, destination,
     });
     let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
     let admitted = if let Some(transfer) = callback_transfer {
@@ -1770,10 +1801,13 @@ unsafe fn service_wait_admit_retained(
     admitted.is_ok()
 }
 
-unsafe fn service_wait_admit_current(pending: win32k_glue::PendingServiceWaitDispatch) -> bool {
+unsafe fn service_wait_admit_current(
+    pending: win32k_glue::PendingServiceWaitDispatch,
+    destination: HostedContinuationDestination,
+) -> bool {
     let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else { return false; };
     if pending.callback_token.is_some()
-        || !service_wait_admit_retained(pending, REPLY_MAIN_SLOT.load(Ordering::Relaxed), None)
+        || !service_wait_admit_retained(pending, REPLY_MAIN_SLOT.load(Ordering::Relaxed), None, destination)
     {
         return false;
     }
@@ -1786,6 +1820,7 @@ unsafe fn lpc_wait_admit_retained(
     pending: win32k_glue::PendingLpcWaitDispatch,
     reply_cap: u64,
     callback_transfer: Option<ComponentCallbackTransfer>,
+    destination: HostedContinuationDestination,
 ) -> bool {
     let Ok(reservation) = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).reserve() else {
         return false;
@@ -1805,6 +1840,7 @@ unsafe fn lpc_wait_admit_retained(
     let continuation = ComponentNativeContinuation::Hosted(HostedNativeContinuation {
         pending: PendingComponentDispatch::Lpc(pending),
         return_target,
+        destination,
     });
     let lane = pending.dispatch.lane;
     let Ok(binding) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).binding(lane) else {
@@ -1845,6 +1881,7 @@ unsafe fn lpc_wait_admit_current(
     nt_handler: &mut ExecNtHandler,
     pending: win32k_glue::PendingLpcWaitDispatch,
     callback_transfer: Option<ComponentCallbackTransfer>,
+    destination: HostedContinuationDestination,
 ) -> bool {
     let active_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
@@ -1858,11 +1895,48 @@ unsafe fn lpc_wait_admit_current(
         pending,
         active_reply,
         callback_transfer,
+        destination,
     ) {
         return false;
     }
     reply_park.commit();
     true
+}
+
+struct PendingWin32kHandoff {
+    callback_suspended: bool,
+    admitted_dispatch_id: u64,
+    parked: bool,
+}
+
+/// One authoritative transfer from a returned native pump to the retained execution owner.
+/// Direct Win32k syscalls and early Ps process-create callouts use the same wait ordering.
+unsafe fn admit_pending_win32k_dispatch(
+    handler: &mut ExecNtHandler,
+    destination: HostedContinuationDestination,
+) -> PendingWin32kHandoff {
+    let callback_suspended = win32k_glue::take_user_callback_pump_suspended();
+    let mut admitted_dispatch_id = 0;
+    let mut parked = false;
+    if let Some(pending) = win32k_glue::take_pending_receive_dispatch() {
+        admitted_dispatch_id = pending.dispatch.dispatch_id;
+        parked = receive_admit_current(pending, destination);
+        assert!(parked, "Receive retains parked parent and original client Reply");
+    } else if let Some(pending) = win32k_glue::take_pending_service_wait_dispatch() {
+        admitted_dispatch_id = pending.dispatch.dispatch_id;
+        parked = service_wait_admit_current(pending, destination);
+        assert!(parked, "service wait retains exact external token and original client Reply");
+    } else if let Some(pending) = win32k_glue::take_pending_provider_wait_dispatch() {
+        admitted_dispatch_id = pending.dispatch.dispatch_id;
+        parked = provider_wait_admit_current(handler, pending, None, destination);
+        assert!(parked, "provider wait could not reserve its native continuation");
+    } else if let Some(pending) = win32k_glue::take_pending_lpc_wait_dispatch() {
+        admitted_dispatch_id = pending.dispatch.dispatch_id;
+        parked = lpc_wait_admit_current(handler, pending, None, destination);
+        assert!(parked, "LPC wait could not reserve its native continuation");
+    }
+    assert!(!callback_suspended || !parked, "callback and provider wait cannot share one native yield");
+    PendingWin32kHandoff { callback_suspended, admitted_dispatch_id, parked }
 }
 
 unsafe fn component_suspension_cancel_scope(
@@ -1940,6 +2014,14 @@ pub(crate) unsafe fn provider_wait_cancel_client_thread(
     if (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).total_suspensions() == 0 {
         return true;
     }
+    let source = (&*nt_handler.thread_runtime.table).entries.iter()
+        .filter_map(|slot| slot.owner())
+        .find(|runtime| runtime.binding().tid == tid)
+        .map(|runtime| runtime.binding());
+    let Some(source) = source else { return false; };
+    if !component_return::prepare_abandoned_initial_source_replies(
+        component_return::InitialSourceScope::Thread(source),
+    ) { return false; }
     let Some(provider) = crate::current_win32k_provider_domain() else {
         return false;
     };
@@ -1972,6 +2054,14 @@ pub(crate) unsafe fn provider_wait_cancel_client_process(
     if (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).total_suspensions() == 0 {
         return true;
     }
+    let Some(process) = nt_handler.capture_process_identity(process_index as usize) else {
+        return false;
+    };
+    if !component_return::prepare_abandoned_initial_source_replies(
+        component_return::InitialSourceScope::Process {
+            pi: process_index as usize, process,
+        },
+    ) { return false; }
     let Some(provider) = crate::current_win32k_provider_domain() else {
         return false;
     };
@@ -2133,6 +2223,15 @@ unsafe fn process_completed_user_callback_outer_dispatch(
     completion_faults: usize,
     completion_scratch_base: u64,
 ) -> bool {
+    if let Some(context) = dispatch.dispatch_context {
+        let requester_generation = nt_handler.hosted_process_generation(completion_pi).unwrap_or(0);
+        if !win32k_bulk_mapping::complete_dispatch(
+            context, completion_pi as u32, requester_generation,
+            dispatch.dispatch_return, dispatch.status,
+        ) {
+            return false;
+        }
+    }
     if let Some(claim) = dispatch.paint_output {
         if !copy_completed_paint_output(
             nt_handler,
@@ -2458,6 +2557,7 @@ unsafe fn drain_deferred_user_callback_returns(
                             token: callback_token,
                             context: callback_context,
                         }),
+                        HostedContinuationDestination::Win32k,
                     ));
                     retained_reply = true;
                     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
@@ -2475,6 +2575,7 @@ unsafe fn drain_deferred_user_callback_returns(
                             token: callback_token,
                             context: callback_context,
                         }),
+                        HostedContinuationDestination::Win32k,
                     ));
                     retained_reply = true;
                     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
@@ -2491,6 +2592,7 @@ unsafe fn drain_deferred_user_callback_returns(
                             token: callback_token,
                             context: callback_context,
                         }),
+                        HostedContinuationDestination::Win32k,
                     ));
                     retained_reply = true;
                     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
@@ -2507,6 +2609,7 @@ unsafe fn drain_deferred_user_callback_returns(
                             token: callback_token,
                             context: callback_context,
                         }),
+                        HostedContinuationDestination::Win32k,
                     ));
                     retained_reply = true;
                     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
@@ -6216,6 +6319,8 @@ unsafe fn dispatch_win32k_for_client_with_completion_args(
     paint_output: Option<nt_user_callback::PaintOutputClaim>,
     client: win32k_glue::Win32kClientContext,
     dispatch_return: &mut Option<nt_user_callback::DispatchReturn>,
+    dispatch_entered: &mut bool,
+    dispatch_context: &mut Option<nt_user_callback::DispatchContext>,
 ) -> (u64, bool) {
     let result = win32k_glue::win32k_dispatch_wide_with_return_receipt(
         ssn,
@@ -6229,6 +6334,8 @@ unsafe fn dispatch_win32k_for_client_with_completion_args(
         output_stage,
         paint_output,
         client,
+        dispatch_entered,
+        dispatch_context,
     );
     *dispatch_return = result.2;
     if sync_win32k_context_to_process_manager(
@@ -8633,6 +8740,7 @@ unsafe fn stage_optional_cursor_string_arg(
 /// same ownership boundary because the original pointers are process-private client VAs.
 unsafe fn stage_cursor_icon_data_args(
     pi: u64,
+    process_generation: u64,
     hcursor: u64,
     module_descriptor: u64,
     resource_descriptor: u64,
@@ -8640,7 +8748,7 @@ unsafe fn stage_cursor_icon_data_args(
     filled_pages: &[u64],
     nfilled: usize,
     scratch_base: u64,
-) -> Option<(u64, u64, u64)> {
+) -> Option<(u64, u64, u64, win32k_bulk_mapping::BulkStage)> {
     let staged_module = stage_optional_cursor_string_arg(
         pi,
         module_descriptor,
@@ -8684,11 +8792,6 @@ unsafe fn stage_cursor_icon_data_args(
             .try_into()
             .unwrap(),
     );
-    let base = win32k_subsystem::WIN32K_BULK_ARG_VADDR;
-    let cap = WIN32K_STRETCH_DIBITS_STAGE_BYTES as u64;
-    core::ptr::write_bytes(base as *mut u8, 0, WIN32K_STRETCH_DIBITS_STAGE_BYTES);
-    core::ptr::copy_nonoverlapping(data.as_ptr(), base as *mut u8, data.len());
-
     let trace = SET_CURSOR_ICON_DATA_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
     if trace < 96 {
         print_str(b"[w32marshal] NtUserSetCursorIconData pi=");
@@ -8706,6 +8809,10 @@ unsafe fn stage_cursor_icon_data_args(
     }
 
     if flags & CURSORF_ACON == 0 {
+        let layout = nt_hosted_runtime::Win32kBulkLayout::flat(CURSORDATA_BYTES as u64)?;
+        let stage = win32k_bulk_mapping::reserve(pi as u32, process_generation, layout)?;
+        let base = stage.base();
+        core::ptr::copy_nonoverlapping(data.as_ptr(), base as *mut u8, data.len());
         core::ptr::write_unaligned((base + CURSORDATA_ASPCUR_OFF as u64) as *mut u64, 0);
         core::ptr::write_unaligned((base + CURSORDATA_AICUR_OFF as u64) as *mut u64, 0);
         core::ptr::write_unaligned((base + CURSORDATA_AJIFRATE_OFF as u64) as *mut u64, 0);
@@ -8714,7 +8821,7 @@ unsafe fn stage_cursor_icon_data_args(
             print_hex_u64(base);
             print_str(b" standard\n");
         }
-        return Some((staged_module, staged_resource, base));
+        return Some((staged_module, staged_resource, base, stage));
     }
 
     if cpcur == 0 || cicur == 0 || cpcur > CURSORDATA_ACON_LIMIT || cicur > CURSORDATA_ACON_LIMIT {
@@ -8756,20 +8863,33 @@ unsafe fn stage_cursor_icon_data_args(
     let aicur_bytes = (cicur as u64).checked_mul(4)?;
     let ajif_rate_bytes = (cicur as u64).checked_mul(4)?;
 
-    let staged_aspcur = base + offset;
+    let aspcur_offset = offset;
     offset = align_up_u64(offset.checked_add(aspcur_bytes)?, 8)?;
-    let staged_aicur = base + offset;
+    let aicur_offset = offset;
     offset = align_up_u64(offset.checked_add(aicur_bytes)?, 4)?;
-    let staged_ajif_rate = base + offset;
+    let ajif_rate_offset = offset;
     offset = align_up_u64(offset.checked_add(ajif_rate_bytes)?, 4)?;
-    if offset > cap {
+    let Some(layout) = nt_hosted_runtime::Win32kBulkLayout::flat(offset) else {
         if trace < 96 {
-            print_str(b" cap-fail bytes=");
+            print_str(b" layout-fail bytes=");
             print_u64(offset);
             print_str(b"\n");
         }
         return None;
-    }
+    };
+    let Some(stage) = win32k_bulk_mapping::reserve(pi as u32, process_generation, layout) else {
+        if trace < 96 {
+            print_str(b" stage-fail bytes=");
+            print_u64(offset);
+            print_str(b"\n");
+        }
+        return None;
+    };
+    let base = stage.base();
+    let staged_aspcur = base + aspcur_offset;
+    let staged_aicur = base + aicur_offset;
+    let staged_ajif_rate = base + ajif_rate_offset;
+    core::ptr::copy_nonoverlapping(data.as_ptr(), base as *mut u8, data.len());
 
     if !img_spawn::client_copyin_mapped(
         pi,
@@ -8795,6 +8915,10 @@ unsafe fn stage_cursor_icon_data_args(
             print_str(b" ajif=0x");
             print_hex_u64(ajif_rate_client);
             print_str(b"\n");
+        }
+        if !win32k_bulk_mapping::settle(stage, false, false) {
+            print_str(b"[win32k-bulk] cursor staging cancellation failed\n");
+            park();
         }
         return None;
     }
@@ -8826,7 +8950,7 @@ unsafe fn stage_cursor_icon_data_args(
         print_str(b"\n");
     }
 
-    Some((staged_module, staged_resource, base))
+    Some((staged_module, staged_resource, base, stage))
 }
 
 unsafe fn capture_builtin_class_key(
@@ -12371,6 +12495,7 @@ pub(crate) unsafe fn service_sec_image(
                                             token: callback_token,
                                             context: callback_context,
                                         }),
+                                        HostedContinuationDestination::Win32k,
                                     ));
                                     procs[pi].faults = faults;
                                     procs[pi].first = first;
@@ -12405,6 +12530,7 @@ pub(crate) unsafe fn service_sec_image(
                                             token: callback_token,
                                             context: callback_context,
                                         }),
+                                        HostedContinuationDestination::Win32k,
                                     ));
                                     procs[pi].faults = faults;
                                     procs[pi].first = first;
@@ -12442,6 +12568,7 @@ pub(crate) unsafe fn service_sec_image(
                                             token: callback_token,
                                             context: callback_context,
                                         }),
+                                        HostedContinuationDestination::Win32k,
                                     ));
                                     reply_park.commit();
                                     procs[pi].faults = faults;
@@ -12480,6 +12607,7 @@ pub(crate) unsafe fn service_sec_image(
                                             token: callback_token,
                                             context: callback_context,
                                         }),
+                                        HostedContinuationDestination::Win32k,
                                     ));
                                     reply_park.commit();
                                     procs[pi].faults = faults;
@@ -12573,6 +12701,33 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"\n");
                 }
             }
+            let trace_lsa_logon = native_call_transport
+                && LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) != 0
+                && nt_handler.current_tid == LSA_LOGON_SERVER_TID.load(Ordering::Relaxed)
+                && nt_handler.hosted_process_role(pi)
+                    == Some(nt_exe_image::HostedProcessRole::LocalSecurityAuthority);
+            let lsa_logon_trace_seq = if trace_lsa_logon {
+                let n = LSA_LOGON_SSN_TRACE.fetch_add(1, Ordering::Relaxed);
+                LSA_LOGON_LAST_SSN.store(m0, Ordering::Relaxed);
+                LSA_LOGON_LAST_STATUS.store(u64::MAX, Ordering::Relaxed);
+                LSA_LOGON_LAST_TCB.store(event_runtime.tcb, Ordering::Relaxed);
+                if n < 128 {
+                    print_str(b"[lsa-logon-ssn] enter #");
+                    print_u64(n);
+                    print_str(b" tid=");
+                    print_u64(nt_handler.current_tid);
+                    print_str(b" ssn=");
+                    print_u64(m0);
+                    print_str(b" arg1=0x");
+                    print_hex_u64(get_recv_mr(9));
+                    print_str(b" arg2=0x");
+                    print_hex_u64(m3);
+                    print_str(b"\n");
+                }
+                Some(n)
+            } else {
+                None
+            };
             let mut handled = true;
             // Set by an accepted interactive milestone that parks the caller instead of replying.
             let mut wl_milestone_park = false;
@@ -13025,6 +13180,51 @@ pub(crate) unsafe fn service_sec_image(
                         crate::disk_census_ticks().wrapping_sub(dispatch_started),
                     );
                     result = res.status as u64;
+                    if m0 == SSN_NT_CREATE_THREAD {
+                        let caller = nt_handler.thread_runtime.executable_by_tid(current_tid)
+                            .filter(|runtime| runtime.pi == pi && runtime.badge == badge)
+                            .map(|runtime| runtime.binding());
+                        let suspended_target = caller.and_then(|caller| {
+                            crate::exec_handler::initial_thread_creation::suspended_for_caller(
+                                &nt_handler, caller,
+                            )
+                        });
+                        if res.status == nt_user_callback::STATUS_PENDING as u32 {
+                            print_str(b"[initial-create-handoff] caller/target/pi/tid/badge=");
+                            print_u64(caller.is_some() as u64);
+                            print_str(b"/");
+                            print_u64(suspended_target.is_some() as u64);
+                            print_str(b"/");
+                            print_u64(pi as u64);
+                            print_str(b"/");
+                            print_u64(current_tid);
+                            print_str(b"/");
+                            print_u64(badge);
+                            print_str(b"\n");
+                            assert!(suspended_target.is_some(),
+                                "pending initial creation must retain its exact caller Reply");
+                        }
+                        if let Some(target) = suspended_target {
+                            assert_eq!(res.status, nt_user_callback::STATUS_PENDING as u32);
+                            assert_eq!(nt_handler.out_writes_n, 0,
+                                "suspended initial creation cannot publish output before provider return");
+                            let handoff = admit_pending_win32k_dispatch(
+                                &mut nt_handler,
+                                HostedContinuationDestination::InitialThread(
+                                    nt_user_host::process_create_callout::InitialThreadReplyOrigin::new(
+                                        caller.expect("suspended initial creation has exact caller"), target,
+                                    ).expect("foreign initial Reply requires distinct valid owners"),
+                                ),
+                            );
+                            assert!(handoff.parked || handoff.callback_suspended,
+                                "suspended process callout lost its native yield owner");
+                            assert!(!handoff.callback_suspended,
+                                "initial process callout user callback requires retained source Reply transfer");
+                            component_suspension_admitted_dispatch_id = handoff.admitted_dispatch_id;
+                            component_suspension_park_request = handoff.parked;
+                            redirected_user_callback = handoff.parked;
+                        }
+                    }
                     if crate::registry_mutation_work::take_transferred() {
                         // The durable mutation owner already captured and rotated this Reply.
                         // STATUS_PENDING is internal state, never the syscall's terminal reply.
@@ -14026,6 +14226,7 @@ pub(crate) unsafe fn service_sec_image(
                 let mut create_dibitmap_probe_aux0 = 0u64;
                 let mut create_dibitmap_probe_aux1 = 0u64;
                 let mut create_dibitmap_probe_aux2 = 0u64;
+                let mut bulk_stage = None;
                 let mut stretch_dibits_stack_args = [0u64; 12];
                 let mut stretch_dibits_stack_arg_count = 0usize;
                 let mut stretch_dibits_probe_failed = false;
@@ -14495,53 +14696,49 @@ pub(crate) unsafe fn service_sec_image(
                             let fl = create_dib_section_stack_args[2] as u32 as u64;
                             let color_space = create_dib_section_stack_args[3];
                             let client_bits_out = create_dib_section_stack_args[4];
-                            let base = win32k_subsystem::WIN32K_BULK_ARG_VADDR;
-                            let cap = WIN32K_STRETCH_DIBITS_STAGE_BYTES as u64;
-                            let mut layout_ok = a3 != 0 && cj_header >= 12 && cj_header <= cap;
+                            let arena_cap = win32k_subsystem::WIN32K_BULK_ARENA_BYTES;
+                            let mut layout_ok = a3 != 0 && cj_header >= 12 && cj_header <= arena_cap;
                             if !layout_ok {
                                 create_dib_section_probe_failure = CREATE_DIB_SECTION_FAIL_LAYOUT;
                                 create_dib_section_probe_aux0 = a3;
                                 create_dib_section_probe_aux1 = cj_header;
-                                create_dib_section_probe_aux2 = cap;
+                                create_dib_section_probe_aux2 = arena_cap;
                             }
-                            let staged_bmi = base;
+                            let mut header_capture = alloc::vec::Vec::new();
                             let mut staged_bmi_bytes = cj_header;
                             if layout_ok {
-                                core::ptr::write_bytes(
-                                    base as *mut u8,
-                                    0,
-                                    WIN32K_STRETCH_DIBITS_STAGE_BYTES,
-                                );
-                                prefill_client_copyin_dll_range_pages(
-                                    pi as u64,
-                                    a3,
-                                    cj_header as usize,
-                                    scratch_base,
-                                    &reg,
-                                    dll_pe_store.as_slice(),
-                                );
-                                let header_out = core::slice::from_raw_parts_mut(
-                                    staged_bmi as *mut u8,
-                                    cj_header as usize,
-                                );
-                                if !img_spawn::client_copyin_mapped(
-                                    pi as u64,
-                                    a3,
-                                    header_out,
-                                    scratch_base,
+                                if header_capture.try_reserve_exact(cj_header as usize).is_err() {
+                                    layout_ok = false;
+                                    create_dib_section_probe_failure = CREATE_DIB_SECTION_FAIL_LAYOUT;
+                                    create_dib_section_probe_aux0 = a3;
+                                    create_dib_section_probe_aux1 = cj_header;
+                                    create_dib_section_probe_aux2 = arena_cap;
+                                } else {
+                                    header_capture.resize(cj_header as usize, 0);
+                                    prefill_client_copyin_dll_range_pages(
+                                        pi as u64,
+                                        a3,
+                                        cj_header as usize,
+                                        scratch_base,
+                                        &reg,
+                                        dll_pe_store.as_slice(),
+                                    );
+                                }
+                                if layout_ok && !img_spawn::client_copyin_mapped(
+                                    pi as u64, a3, &mut header_capture, scratch_base,
                                 ) {
                                     layout_ok = false;
                                     create_dib_section_probe_failure =
                                         CREATE_DIB_SECTION_FAIL_BMI_COPY;
                                     create_dib_section_probe_aux0 = a3;
                                     create_dib_section_probe_aux1 = cj_header;
-                                } else {
+                                } else if layout_ok {
                                     match nt_kernel_exec::gdi_bitmap::bitmap_info_size(
-                                        &*header_out,
+                                        &header_capture,
                                         i_usage as u32,
                                     ) {
                                         Some(bytes)
-                                            if bytes as u64 >= 12 && bytes as u64 <= cap =>
+                                            if bytes as u64 >= 12 && bytes as u64 <= arena_cap =>
                                         {
                                             staged_bmi_bytes = bytes as u64;
                                         }
@@ -14556,25 +14753,43 @@ pub(crate) unsafe fn service_sec_image(
                                     }
                                 }
                             }
-                            let staged_bits_out = if layout_ok && client_bits_out != 0 {
-                                match align_up_u64(staged_bmi_bytes, 8) {
-                                    Some(offset) if offset + 8 <= cap => base + offset,
-                                    _ => {
-                                        layout_ok = false;
-                                        create_dib_section_probe_failure =
-                                            CREATE_DIB_SECTION_FAIL_LAYOUT;
-                                        create_dib_section_probe_aux0 = staged_bmi_bytes;
-                                        create_dib_section_probe_aux1 = 8;
-                                        create_dib_section_probe_aux2 = cap;
-                                        0
-                                    }
-                                }
+                            // The fixed header capture can be longer than the computed color
+                            // table span. Keep both the declared header and any extra table bytes.
+                            let staged_info_extent = staged_bmi_bytes.max(cj_header);
+                            let bits_offset = align_up_u64(staged_info_extent, 8);
+                            let total_bytes = bits_offset.and_then(|offset| offset.checked_add(
+                                if client_bits_out != 0 { 8 } else { 0 }
+                            ));
+                            let stage = if layout_ok {
+                                total_bytes
+                                    .and_then(nt_hosted_runtime::Win32kBulkLayout::flat)
+                                    .and_then(|layout| win32k_bulk_mapping::reserve(
+                                        pi as u32,
+                                        nt_handler.hosted_process_generation(pi).unwrap_or(0),
+                                        layout,
+                                    ))
                             } else {
-                                0
+                                None
                             };
+                            if layout_ok && stage.is_none() {
+                                layout_ok = false;
+                                create_dib_section_probe_failure = CREATE_DIB_SECTION_FAIL_LAYOUT;
+                                create_dib_section_probe_aux0 = staged_bmi_bytes;
+                                create_dib_section_probe_aux1 = if client_bits_out != 0 { 8 } else { 0 };
+                                create_dib_section_probe_aux2 = arena_cap;
+                            }
+                            let base = stage.map_or(0, |stage| stage.base());
+                            let staged_bmi = base;
+                            let staged_bits_out = if layout_ok && client_bits_out != 0 {
+                                base + bits_offset.expect("checked DIBSection bits offset")
+                            } else { 0 };
+                            bulk_stage = stage;
                             if !layout_ok {
                                 create_dib_section_probe_failed = true;
                             } else {
+                                core::ptr::copy_nonoverlapping(
+                                    header_capture.as_ptr(), staged_bmi as *mut u8, header_capture.len(),
+                                );
                                 let bmi_copied = if staged_bmi_bytes <= cj_header {
                                     true
                                 } else {
@@ -14681,14 +14896,38 @@ pub(crate) unsafe fn service_sec_image(
                             let fl = create_dibitmap_stack_args[5] as u32 as u64;
                             let wants_init_bits =
                                 pj_init != 0 && ((a3 as u32) & (CBM_INIT as u32)) != 0;
-                            let base = win32k_subsystem::WIN32K_BULK_ARG_VADDR;
-                            let cap = WIN32K_STRETCH_DIBITS_STAGE_BYTES as u64;
+                            let input_valid = (pbmi == 0 || cj_max_info >= 12)
+                                && (!wants_init_bits || cj_max_bits != 0);
+                            let stage_needed = pbmi != 0 || wants_init_bits;
+                            let bits_bytes = if wants_init_bits { cj_max_bits } else { 0 };
+                            let layout = if pbmi != 0 {
+                                nt_hosted_runtime::Win32kBulkLayout::dib(bits_bytes, cj_max_info)
+                            } else {
+                                nt_hosted_runtime::Win32kBulkLayout::flat(bits_bytes)
+                            };
+                            let stage = if input_valid && stage_needed {
+                                layout.and_then(|layout| win32k_bulk_mapping::reserve(
+                                    pi as u32,
+                                    nt_handler.hosted_process_generation(pi).unwrap_or(0),
+                                    layout,
+                                ))
+                            } else {
+                                None
+                            };
+                            let base = stage.map_or(0, |stage| stage.base());
+                            let cap = stage.map_or(0, |stage| stage.capacity());
+                            bulk_stage = stage;
                             let mut offset = 0u64;
-                            let mut layout_ok = (pbmi == 0
-                                || (cj_max_info >= 12 && cj_max_info <= cap))
-                                && (!wants_init_bits || (cj_max_bits != 0 && cj_max_bits <= cap));
+                            let mut layout_ok = input_valid
+                                && (!stage_needed || stage.is_some())
+                                && (pbmi == 0 || cj_max_info <= cap)
+                                && (!wants_init_bits || cj_max_bits <= cap);
                             if !layout_ok {
-                                create_dibitmap_probe_failure = CREATE_DIBITMAP_FAIL_LAYOUT;
+                                create_dibitmap_probe_failure = if input_valid && stage_needed {
+                                    CREATE_DIBITMAP_FAIL_STAGE_RESOURCE
+                                } else {
+                                    CREATE_DIBITMAP_FAIL_LAYOUT
+                                };
                                 create_dibitmap_probe_aux0 = pbmi;
                                 create_dibitmap_probe_aux1 = cj_max_info;
                                 create_dibitmap_probe_aux2 = cj_max_bits;
@@ -14736,11 +14975,6 @@ pub(crate) unsafe fn service_sec_image(
                             if !layout_ok {
                                 create_dibitmap_probe_failed = true;
                             } else {
-                                core::ptr::write_bytes(
-                                    base as *mut u8,
-                                    0,
-                                    WIN32K_STRETCH_DIBITS_STAGE_BYTES,
-                                );
                                 let copied_bits = if !wants_init_bits {
                                     true
                                 } else {
@@ -14883,13 +15117,24 @@ pub(crate) unsafe fn service_sec_image(
                             let dw_rop = stretch_dibits_stack_args[8] as u32 as u64;
                             let cj_max_info = stretch_dibits_stack_args[9] as u32 as u64;
                             let cj_max_bits = stretch_dibits_stack_args[10] as u32 as u64;
-                            let base = win32k_subsystem::WIN32K_BULK_ARG_VADDR;
-                            let cap = WIN32K_STRETCH_DIBITS_STAGE_BYTES as u64;
+                            let bits_reserved = if pj_init == 0 { 0 } else { cj_max_bits.max(8) };
+                            let input_valid = pbmi != 0 && cj_max_info >= 12
+                                && cj_max_bits <= win32k_subsystem::WIN32K_BULK_ARENA_BYTES;
+                            let stage = if input_valid {
+                                nt_hosted_runtime::Win32kBulkLayout::dib(bits_reserved, cj_max_info)
+                                    .and_then(|layout| win32k_bulk_mapping::reserve(
+                                        pi as u32,
+                                        nt_handler.hosted_process_generation(pi).unwrap_or(0),
+                                        layout,
+                                    ))
+                            } else {
+                                None
+                            };
+                            let base = stage.map_or(0, |stage| stage.base());
+                            let cap = stage.map_or(0, |stage| stage.capacity());
+                            bulk_stage = stage;
                             let mut offset = 0u64;
-                            let mut layout_ok = pbmi != 0
-                                && cj_max_info >= 12
-                                && cj_max_info <= cap
-                                && cj_max_bits <= cap;
+                            let mut layout_ok = input_valid && stage.is_some() && cj_max_info <= cap;
                             if !layout_ok {
                                 stretch_dibits_probe_failure = STRETCH_DIBITS_FAIL_LAYOUT;
                                 stretch_dibits_probe_aux0 = pbmi;
@@ -14898,7 +15143,6 @@ pub(crate) unsafe fn service_sec_image(
                             }
                             let staged_bits = if layout_ok && pj_init != 0 {
                                 let out = base + offset;
-                                let bits_reserved = if cj_max_bits == 0 { 8 } else { cj_max_bits };
                                 match offset
                                     .checked_add(bits_reserved)
                                     .and_then(|next| align_up_u64(next, 8))
@@ -14940,11 +15184,6 @@ pub(crate) unsafe fn service_sec_image(
                             if !layout_ok {
                                 stretch_dibits_probe_failed = true;
                             } else {
-                                core::ptr::write_bytes(
-                                    base as *mut u8,
-                                    0,
-                                    WIN32K_STRETCH_DIBITS_STAGE_BYTES,
-                                );
                                 let copied_bits = if pj_init == 0 || cj_max_bits == 0 {
                                     true
                                 } else {
@@ -15089,13 +15328,11 @@ pub(crate) unsafe fn service_sec_image(
                             } else if let (Some(string_bytes), Some(dx_bytes)) =
                                 (string_bytes, dx_bytes)
                             {
-                                let base = win32k_subsystem::WIN32K_BULK_ARG_VADDR;
-                                let cap = WIN32K_EXT_TEXT_OUT_STAGE_BYTES as u64;
                                 let mut offset = 0u64;
                                 let mut layout_ok = true;
-                                let staged_rect = if unsafe_rect != 0 {
-                                    let out = base + offset;
-                                    match align_up_u64(offset + 16, 8) {
+                                let rect_offset = if unsafe_rect != 0 {
+                                    let out = offset;
+                                    match offset.checked_add(16).and_then(|next| align_up_u64(next, 8)) {
                                         Some(next) => offset = next,
                                         None => layout_ok = false,
                                     }
@@ -15103,9 +15340,9 @@ pub(crate) unsafe fn service_sec_image(
                                 } else {
                                     0
                                 };
-                                let staged_dx = if layout_ok && dx_bytes != 0 {
-                                    let out = base + offset;
-                                    match align_up_u64(offset + dx_bytes, 8) {
+                                let dx_offset = if layout_ok && dx_bytes != 0 {
+                                    let out = offset;
+                                    match offset.checked_add(dx_bytes).and_then(|next| align_up_u64(next, 8)) {
                                         Some(next) => offset = next,
                                         None => layout_ok = false,
                                     }
@@ -15113,9 +15350,9 @@ pub(crate) unsafe fn service_sec_image(
                                 } else {
                                     0
                                 };
-                                let staged_string = if layout_ok && string_bytes != 0 {
-                                    let out = base + offset;
-                                    match align_up_u64(offset + string_bytes, 8) {
+                                let string_offset = if layout_ok && string_bytes != 0 {
+                                    let out = offset;
+                                    match offset.checked_add(string_bytes).and_then(|next| align_up_u64(next, 8)) {
                                         Some(next) => offset = next,
                                         None => layout_ok = false,
                                     }
@@ -15123,12 +15360,24 @@ pub(crate) unsafe fn service_sec_image(
                                 } else {
                                     0
                                 };
-                                if !layout_ok || offset > cap {
+                                let stage = if layout_ok && offset != 0 {
+                                    nt_hosted_runtime::Win32kBulkLayout::flat(offset)
+                                        .and_then(|layout| win32k_bulk_mapping::reserve(
+                                            pi as u32,
+                                            nt_handler.hosted_process_generation(pi).unwrap_or(0),
+                                            layout,
+                                        ))
+                                } else {
+                                    None
+                                };
+                                let base = stage.map_or(0, |stage| stage.base());
+                                bulk_stage = stage;
+                                let staged_rect = if unsafe_rect != 0 { base + rect_offset } else { 0 };
+                                let staged_dx = if dx_bytes != 0 { base + dx_offset } else { 0 };
+                                let staged_string = if string_bytes != 0 { base + string_offset } else { 0 };
+                                if !layout_ok || (offset != 0 && stage.is_none()) {
                                     ext_text_out_probe_failed = true;
                                 } else {
-                                    if offset != 0 {
-                                        core::ptr::write_bytes(base as *mut u8, 0, offset as usize);
-                                    }
                                     let rect_ok = unsafe_rect == 0 || {
                                         prefill_client_copyin_dll_range_pages(
                                             pi as u64,
@@ -16277,6 +16526,7 @@ pub(crate) unsafe fn service_sec_image(
                     // pointers that later fault during WM_PAINT icon drawing.
                     match stage_cursor_icon_data_args(
                         pi as u64,
+                        nt_handler.hosted_process_generation(pi).unwrap_or(0),
                         d_a0,
                         d_a1,
                         d_a2,
@@ -16285,10 +16535,11 @@ pub(crate) unsafe fn service_sec_image(
                         faults as usize,
                         scratch_base,
                     ) {
-                        Some((module, resource, data)) => {
+                        Some((module, resource, data, stage)) => {
                             d_a1 = module;
                             d_a2 = resource;
                             d_a3 = data;
+                            bulk_stage = Some(stage);
                         }
                         None => {
                             set_cursor_icon_data_probe_failed = true;
@@ -16631,6 +16882,9 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"\n");
                     }
                 }
+                let mut dispatch_return = None;
+                let mut dispatch_entered = false;
+                let mut dispatch_context = None;
                 let (mut st, mut ok): (u64, bool) = if wl_milestone_park {
                     // The bootstrap milestone owner handles this intentional park below.
                     (0, false)
@@ -17126,7 +17380,6 @@ pub(crate) unsafe fn service_sec_image(
                         } else {
                             m0
                         };
-                    let mut dispatch_return = None;
                     let mut r = dispatch_win32k_for_client_with_completion_args(
                         &mut nt_handler,
                         dispatch_ssn,
@@ -17141,6 +17394,8 @@ pub(crate) unsafe fn service_sec_image(
                         paint_output_claim,
                         client,
                         &mut dispatch_return,
+                        &mut dispatch_entered,
+                        &mut dispatch_context,
                     );
                     let inline_batch_records = win32k_glue::completed_gdi_batch_records(
                         dispatch_return, r.0, r.1,
@@ -17600,46 +17855,35 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     r
                 };
-                let callback_suspended = win32k_glue::take_user_callback_pump_suspended();
-                if let Some(pending) = win32k_glue::take_pending_receive_dispatch() {
-                    component_suspension_admitted_dispatch_id = pending.dispatch.dispatch_id;
-                    component_suspension_park_request = receive_admit_current(pending);
-                    assert!(component_suspension_park_request, "Receive retains parked parent and original client Reply");
-                    redirected_user_callback = true;
-                } else if let Some(pending) = win32k_glue::take_pending_service_wait_dispatch() {
-                    component_suspension_admitted_dispatch_id = pending.dispatch.dispatch_id;
-                    component_suspension_park_request = service_wait_admit_current(pending);
-                    assert!(component_suspension_park_request,
-                        "service wait retains exact external token and original client Reply");
-                    redirected_user_callback = true;
-                } else if let Some(pending) = win32k_glue::take_pending_provider_wait_dispatch() {
-                    component_suspension_admitted_dispatch_id = pending.dispatch.dispatch_id;
-                    component_suspension_park_request = provider_wait_admit_current(
-                        &mut nt_handler,
-                        pending,
-                        None,
-                    );
-                    assert!(
-                        component_suspension_park_request,
-                        "provider wait could not reserve its native continuation"
-                    );
-                    // Reuse the existing post-dispatch suppression gates. The provider wait owns
-                    // the native reply now; this is not a user callback and is intercepted before
-                    // the common reply tail.
-                    redirected_user_callback = true;
-                } else if let Some(pending) = win32k_glue::take_pending_lpc_wait_dispatch() {
-                    component_suspension_admitted_dispatch_id = pending.dispatch.dispatch_id;
-                    component_suspension_park_request = lpc_wait_admit_current(
-                        &mut nt_handler,
-                        pending,
-                        None,
-                    );
-                    assert!(
-                        component_suspension_park_request,
-                        "LPC wait could not reserve its native continuation"
-                    );
-                    redirected_user_callback = true;
+                let handoff = admit_pending_win32k_dispatch(
+                    &mut nt_handler, HostedContinuationDestination::Win32k,
+                );
+                let callback_suspended = handoff.callback_suspended;
+                component_suspension_admitted_dispatch_id = handoff.admitted_dispatch_id;
+                component_suspension_park_request = handoff.parked;
+                if let Some(stage) = bulk_stage.take() {
+                    let suspended = callback_suspended || handoff.parked;
+                    let bound = if suspended {
+                        dispatch_entered
+                            && dispatch_context.is_some_and(|context| {
+                                (handoff.admitted_dispatch_id == 0
+                                    || handoff.admitted_dispatch_id == context.dispatch_id)
+                                    && win32k_bulk_mapping::retain(
+                                        stage, context, pi as u32,
+                                        nt_handler.hosted_process_generation(pi).unwrap_or(0),
+                                    )
+                            })
+                    } else {
+                        let provider_completed = dispatch_entered
+                            && dispatch_return.and_then(|receipt| receipt.handler_value()).is_some();
+                        win32k_bulk_mapping::settle(stage, dispatch_entered, provider_completed)
+                    };
+                    if !bound {
+                        print_str(b"[win32k-bulk] exact DIB lease settlement failed\n");
+                        park();
+                    }
                 }
+                if handoff.parked { redirected_user_callback = true; }
                 let direct_provider_output_len = if ok
                     && !callback_suspended
                     && !component_suspension_park_request
@@ -19067,6 +19311,22 @@ pub(crate) unsafe fn service_sec_image(
             // restart without IPC register fanout. NtContinue already bypassed this tail.
             let len = 1;
             let r0 = result;
+            if let Some(n) = lsa_logon_trace_seq {
+                LSA_LOGON_LAST_STATUS.store(r0, Ordering::Relaxed);
+                if n < 128 {
+                    print_str(b"[lsa-logon-ssn] return #");
+                    print_u64(n);
+                    print_str(b" tid=");
+                    print_u64(nt_handler.current_tid);
+                    print_str(b" ssn=");
+                    print_u64(m0);
+                    print_str(b" status=0x");
+                    print_hex_u64(r0);
+                    print_str(b" reply=0x");
+                    print_hex_u64(reply_main);
+                    print_str(b"\n");
+                }
+            }
             let trace_csrss_resume_reply = native_call_transport && badge == 29 && m0 == 214;
             if trace_csrss_resume_reply {
                 if CSRSS_RESUME_REPLIES.fetch_add(1, Ordering::Relaxed) == 1 {
@@ -26545,6 +26805,18 @@ unsafe fn pending_file_io_redrive_pass(
             .or_else(|| local_terminal.map(|result| result.1))
             .or_else(|| completed.map(|completion| completion.information))
             .expect("pending File owner has no terminal information");
+        if let Some(file_id) = hosted_file_id {
+            if matches!(pending.major, nt_io_abi::major::IRP_MJ_READ | nt_io_abi::major::IRP_MJ_WRITE) {
+                let fs_context = driver_launch::hosted_file_route(file_id)
+                    .map_or(0, |(_, context)| context);
+                crate::exec_handler::trace_setup_scm_pipe_transition(
+                    b"terminal-seen", pending.pi as usize, pending.badge, pending.tid,
+                    None, file_id, fs_context, pending.irp_id, pending.major,
+                    terminal_status, terminal_information, pending.delivery_state,
+                    pending.reply_required,
+                );
+            }
+        }
         let mut backend_ack_required = completed.is_some();
         if pending.major == nt_io_abi::major::IRP_MJ_QUERY_INFORMATION {
             if let Some(transaction_id) = set_file_name_id {
@@ -27242,6 +27514,18 @@ unsafe fn pending_file_io_redrive_pass(
         let finished = table
             .finish_owner_exact(identity, pending.irp_id)
             .expect("completed pending File owner did not retire");
+        if let Some(file_id) = finished.route.hosted_file_id() {
+            if matches!(finished.major, nt_io_abi::major::IRP_MJ_READ | nt_io_abi::major::IRP_MJ_WRITE) {
+                let fs_context = driver_launch::hosted_file_route(file_id)
+                    .map_or(0, |(_, context)| context);
+                crate::exec_handler::trace_setup_scm_pipe_transition(
+                    b"owner-retired", finished.pi as usize, finished.badge, finished.tid,
+                    None, file_id, fs_context, finished.irp_id, finished.major,
+                    terminal_status, terminal_information, finished.delivery_state,
+                    finished.reply_required,
+                );
+            }
+        }
         crate::pending_file_caller::retire(identity);
         if let Some(event) = finished.transfer_event {
             assert!(finished.event_obj_idx == u64::MAX || finished.event_obj_idx == event.native_identity);
