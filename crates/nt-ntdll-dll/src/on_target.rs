@@ -2892,14 +2892,23 @@ pub unsafe fn ldrp_drive(image_base: u64, ntdll_base: u64, startup_reserved: u64
     // winlogon's later `__getmainargs → _setargv → strlen(_acmdln=NULL)` NULL-derefs. Publishing the
     // heap base here makes GetProcessHeap non-NULL → msvcrt's attach completes → `_acmdln` set.
     // SAFETY: on-target syscall + gs:[0x60] = PEB (byte-exact x64 layout).
-    if let Some((heap, heap_base)) = unsafe { create_process_heap() } {
-        crate::install_process_heap(heap);
+    let Some((heap, heap_base)) = (unsafe { create_process_heap() }) else {
         unsafe {
-            let peb: u64;
-            core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
-            if peb != 0 {
-                core::ptr::write_volatile((peb + 0x30) as *mut u64, heap_base); // Peb->ProcessHeap
-            }
+            crate::exports::rtl_raise_status(STATUS_NO_MEMORY as u32);
+            core::hint::unreachable_unchecked();
+        }
+    };
+    if !crate::install_process_heap(heap) {
+        unsafe {
+            crate::exports::rtl_raise_status(STATUS_NO_MEMORY as u32);
+            core::hint::unreachable_unchecked();
+        }
+    }
+    unsafe {
+        let peb: u64;
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
+        if peb != 0 {
+            core::ptr::write_volatile((peb + 0x30) as *mut u64, heap_base); // Peb->ProcessHeap
         }
     }
     unsafe {

@@ -1318,6 +1318,14 @@ impl<B: Backing, const N: usize> HeapRegistry<B, N> {
         self.process.as_ref().map(Heap::handle)
     }
 
+    /// Roll back the initial process-heap transaction before its handle is published.
+    pub fn take_unpublished_process(&mut self, handle: *mut u8) -> Option<Heap<B>> {
+        if self.private_len != 0 || self.process_handle()? != handle {
+            return None;
+        }
+        self.process.take()
+    }
+
     /// Look up a heap by its exact native handle.
     pub fn find(&self, handle: *mut u8) -> Option<&Heap<B>> {
         if handle.is_null() {
@@ -1411,6 +1419,125 @@ impl<B: Backing, const N: usize> HeapRegistry<B, N> {
                     .filter_map(Option::as_ref),
             )
             .all(|heap| heap.validate(None))
+    }
+}
+
+/// Owner registry for caller-supplied peer storage. A heap's native handle always names its
+/// primary backing; peers are additional owned backing regions routed by that exact handle.
+/// Slot position is stable while occupied, so callers can use `index + 1` as the `RtlWalkHeap`
+/// segment ordinal (with `N <= u8::MAX as usize`). A finite heap supplies no peer storage.
+pub struct HeapPeerRegistry<'a, B: Backing, const H: usize, const N: usize> {
+    groups: [Option<HeapPeerGroup<'a, B, N>>; H],
+}
+
+struct HeapPeerGroup<'a, B: Backing, const N: usize> {
+    handle: *mut u8,
+    growable: bool,
+    peers: Option<&'a mut [Option<Heap<B>>; N]>,
+}
+
+impl<'a, B: Backing, const H: usize, const N: usize> Default for HeapPeerRegistry<'a, B, H, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a, B: Backing, const H: usize, const N: usize> HeapPeerRegistry<'a, B, H, N> {
+    pub const fn new() -> Self {
+        Self {
+            groups: [const { None }; H],
+        }
+    }
+
+    /// Forget inherited owner records at the start of a new process. Peer storage belongs to
+    /// the previous process address space and must not be dereferenced here.
+    pub fn reset(&mut self) {
+        for group in &mut self.groups {
+            *group = None;
+        }
+    }
+
+    fn group_index(&self, handle: *mut u8) -> Option<usize> {
+        if handle.is_null() {
+            return None;
+        }
+        self.groups
+            .iter()
+            .position(|group| group.as_ref().is_some_and(|group| group.handle == handle))
+    }
+
+    /// Register one stable primary handle. A duplicate or exhausted group table is rejected.
+    pub fn register(
+        &mut self,
+        handle: *mut u8,
+        growable: bool,
+        peers: Option<&'a mut [Option<Heap<B>>; N]>,
+    ) -> bool {
+        if handle.is_null() || self.contains(handle) || growable != peers.is_some() {
+            return false;
+        }
+        let Some(slot) = self.groups.iter_mut().find(|group| group.is_none()) else {
+            return false;
+        };
+        *slot = Some(HeapPeerGroup { handle, growable, peers });
+        true
+    }
+
+    pub fn contains(&self, handle: *mut u8) -> bool {
+        self.group_index(handle).is_some()
+    }
+
+    /// Return the owner's growth policy, distinguishing a finite owner from an unknown handle.
+    pub fn growable(&self, handle: *mut u8) -> Option<bool> {
+        self.group_index(handle)
+            .map(|index| self.groups[index].as_ref().unwrap().growable)
+    }
+
+    pub fn peers(&self, handle: *mut u8) -> Option<&[Option<Heap<B>>; N]> {
+        self.group_index(handle)
+            .and_then(|index| self.groups[index].as_ref().unwrap().peers.as_deref())
+    }
+
+    /// Mutate peers only for a growable owner; a finite caller-backed heap cannot gain peers.
+    pub fn peers_mut(&mut self, handle: *mut u8) -> Option<&mut [Option<Heap<B>>; N]> {
+        let index = self.group_index(handle)?;
+        self.groups[index]
+            .as_mut()
+            .filter(|group| group.growable)
+            .and_then(|group| group.peers.as_deref_mut())
+    }
+
+    /// Detach one peer for the caller to release before removing this owner.
+    pub fn take_owned_peer(&mut self, handle: *mut u8) -> Option<Heap<B>> {
+        let index = self.group_index(handle)?;
+        self.groups[index]
+            .as_mut()
+            .unwrap()
+            .peers
+            .as_deref_mut()?
+            .iter_mut()
+            .find_map(Option::take)
+    }
+
+    /// Remove an owner only after all peers have been detached and released.
+    pub fn unregister(&mut self, handle: *mut u8) -> bool {
+        if handle.is_null() {
+            return false;
+        }
+        let Some(index) = self.group_index(handle) else {
+            return false;
+        };
+        if self.groups[index]
+            .as_ref()
+            .unwrap()
+            .peers
+            .as_deref()
+            .is_some_and(|peers| peers.iter().any(Option::is_some))
+        {
+            return false;
+        }
+        self.groups[index] = None;
+        true
     }
 }
 
@@ -2531,5 +2658,111 @@ mod tests {
         standard.enable_low_fragmentation();
         assert_eq!(standard.compatibility_mode(), 2);
         assert_eq!(low_fragmentation.compatibility_mode(), 0);
+    }
+
+    #[test]
+    fn peer_registry_isolates_growable_owners_and_supports_large_private_allocation() {
+        let first_primary = heap(0x1000);
+        let second_primary = heap(0x1000);
+        let first = first_primary.handle();
+        let second = second_primary.handle();
+        let mut first_peers = [const { None }; 3];
+        let mut second_peers = [const { None }; 3];
+        let mut registry = HeapPeerRegistry::<VecBacking, 2, 3>::new();
+        assert!(registry.register(first, true, Some(&mut first_peers)));
+        assert!(registry.register(second, true, Some(&mut second_peers)));
+        assert!(!registry.register(first, false, None));
+        assert!(!registry.register(core::ptr::null_mut(), false, None));
+
+        let payload_len = 399_360;
+        let peer = heap(process_heap_segment_size(payload_len).unwrap());
+        registry.peers_mut(first).unwrap()[0] = Some(peer);
+        let payload = registry.peers_mut(first).unwrap()[0]
+            .as_mut()
+            .unwrap()
+            .allocate(payload_len)
+            .unwrap();
+        assert_eq!(
+            unsafe { registry.peers(first).unwrap()[0].as_ref().unwrap().size_of(payload) },
+            Some(payload_len)
+        );
+        assert!(registry.peers(second).unwrap().iter().all(Option::is_none));
+        assert!(registry.peers_mut(second).unwrap()[0].is_none());
+        assert!(!registry.unregister(first));
+
+        let mut detached = registry.take_owned_peer(first).unwrap();
+        assert_eq!(unsafe { detached.size_of(payload) }, Some(payload_len));
+        assert!(unsafe { detached.free(payload) });
+        let backing = detached.destroy();
+        assert!(backing.len() >= payload_len);
+        assert!(registry.unregister(first));
+        assert!(!registry.contains(first));
+        assert!(registry.contains(second));
+    }
+
+    #[test]
+    fn peer_registry_keeps_finite_heaps_bounded_and_reuses_only_empty_owner_slots() {
+        let finite_primary = heap(0x1000);
+        let growable_primary = heap(0x1000);
+        let replacement_primary = heap(0x1000);
+        let finite = finite_primary.handle();
+        let growable = growable_primary.handle();
+        let replacement = replacement_primary.handle();
+        let mut growable_peers = [const { None }; 3];
+        let mut replacement_peers = [const { None }; 3];
+        let mut registry = HeapPeerRegistry::<VecBacking, 2, 3>::new();
+        assert!(registry.register(finite, false, None));
+        assert!(registry.register(growable, true, Some(&mut growable_peers)));
+        assert_eq!(registry.growable(finite), Some(false));
+        assert_eq!(registry.growable(growable), Some(true));
+        assert_eq!(registry.growable(replacement), None);
+        assert!(registry.peers_mut(finite).is_none());
+        assert!(registry.peers(finite).is_none());
+        assert!(!registry.register(replacement, false, None));
+
+        registry.peers_mut(growable).unwrap()[2] = Some(heap(0x1000));
+        assert!(!registry.unregister(growable));
+        assert!(registry.take_owned_peer(growable).is_some());
+        assert!(registry.unregister(growable));
+        assert!(registry.register(replacement, true, Some(&mut replacement_peers)));
+        assert!(registry.peers(replacement).unwrap().iter().all(Option::is_none));
+        assert_eq!(registry.growable(finite), Some(false));
+    }
+
+    #[test]
+    fn peer_registry_reset_forgets_inherited_storage_without_dereferencing_it() {
+        let primary = heap(0x1000);
+        let replacement = heap(0x1000);
+        let mut primary_peers = [const { None }; 4];
+        let mut replacement_peers = [const { None }; 4];
+        let mut registry = HeapPeerRegistry::<VecBacking, 2, 4>::new();
+        assert!(registry.register(primary.handle(), true, Some(&mut primary_peers)));
+        registry.peers_mut(primary.handle()).unwrap()[0] = Some(heap(0x1000));
+        registry.peers_mut(primary.handle()).unwrap()[3] = Some(heap(0x2000));
+
+        registry.reset();
+
+        assert!(!registry.contains(primary.handle()));
+        assert!(registry.register(replacement.handle(), true, Some(&mut replacement_peers)));
+        assert!(registry
+            .peers(replacement.handle())
+            .unwrap()
+            .iter()
+            .all(Option::is_none));
+        assert!(registry.register(primary.handle(), false, None));
+        drop(registry);
+        assert!(primary_peers[0].is_some());
+        assert!(primary_peers[3].is_some());
+    }
+
+    #[test]
+    fn process_heap_install_can_roll_back_before_publication() {
+        let mut registry = HeapRegistry::<VecBacking, 2>::new();
+        let process = heap(0x1000);
+        let handle = process.handle();
+        assert!(matches!(registry.install_process(process), Ok(got) if got == handle));
+        assert!(registry.take_unpublished_process(core::ptr::null_mut()).is_none());
+        assert!(registry.take_unpublished_process(handle).is_some());
+        assert!(registry.is_empty());
     }
 }

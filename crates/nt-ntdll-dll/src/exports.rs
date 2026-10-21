@@ -6399,6 +6399,7 @@ pub unsafe extern "system" fn rtl_create_heap(
     #[cfg(target_arch = "x86_64")]
     {
         const HEAP_NO_SERIALIZE: u32 = 0x1;
+        const HEAP_GROWABLE: u32 = 0x2;
         if flags & HEAP_NO_SERIALIZE != 0 && !lock.is_null() {
             return core::ptr::null_mut();
         }
@@ -6467,7 +6468,15 @@ pub unsafe extern "system" fn rtl_create_heap(
             }
             return core::ptr::null_mut();
         };
-        match crate::install_private_heap(heap, flags & HEAP_NO_SERIALIZE == 0, lock as u64) {
+        // A zero reserve is the growable default used by HeapCreate(0, 0, 0). An explicit
+        // HEAP_GROWABLE flag also permits owned peers beside a caller-supplied primary arena.
+        let growable = flags & HEAP_GROWABLE != 0 || (base.is_null() && reserve == 0);
+        match crate::install_private_heap(
+            heap,
+            flags & HEAP_NO_SERIALIZE == 0,
+            lock as u64,
+            growable,
+        ) {
             Ok(handle) => handle as *mut c_void,
             Err(heap) => {
                 let backing = heap.destroy();
