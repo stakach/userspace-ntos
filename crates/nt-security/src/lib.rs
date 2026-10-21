@@ -15,6 +15,7 @@ mod access;
 mod client_security;
 pub mod create_token;
 mod job_token;
+mod logon_session;
 mod native_acl;
 pub mod native_acl_inheritance;
 mod native_sd;
@@ -60,6 +61,10 @@ pub use job_token::{
     JobTokenPolicyUpdate, JOB_OBJECT_SECURITY_FILTER_TOKENS, JOB_OBJECT_SECURITY_NO_ADMIN,
     JOB_OBJECT_SECURITY_ONLY_TOKEN, JOB_OBJECT_SECURITY_RESTRICTED_TOKEN,
     JOB_OBJECT_SECURITY_VALID_FLAGS, JOB_SECURITY_LIMIT_INFORMATION_SIZE,
+};
+pub use logon_session::{
+    LogonSessionRegistry, STATUS_BAD_LOGON_SESSION_STATE, STATUS_LOGON_SESSION_EXISTS,
+    STATUS_NO_SUCH_LOGON_SESSION,
 };
 pub use native_acl::{NativeAcl, NativeAclError, STATUS_INVALID_ACL};
 mod key_creation;
