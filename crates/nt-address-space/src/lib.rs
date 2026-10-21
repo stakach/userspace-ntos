@@ -15,6 +15,8 @@
 #![no_std]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 pub mod copy;
 pub mod native_output;
@@ -1820,6 +1822,11 @@ pub struct VmRegionMap<const N: usize> {
     protection_overrides: [Option<VmProtectionOverride>; VM_PROTECTION_OVERRIDE_CAPACITY],
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static VM_BASIC_EXTENT_INSPECTIONS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
 impl<const N: usize> VmRegionMap<N> {
     pub const fn new(lower_bound: u64, upper_bound: u64) -> Self {
         Self {
@@ -1856,6 +1863,8 @@ impl<const N: usize> VmRegionMap<N> {
     }
 
     pub fn extent_at(&self, address: u64) -> Option<VmExtent> {
+        #[cfg(test)]
+        VM_BASIC_EXTENT_INSPECTIONS.with(|count| count.set(count.get() + 1));
         self.extents
             .iter()
             .flatten()
@@ -1921,18 +1930,6 @@ impl<const N: usize> VmRegionMap<N> {
             .map(|value| value & !(alignment - 1))
     }
 
-    fn basic_state_and_protection(&self, address: u64) -> Option<(u32, u32)> {
-        let extent = self.extent_at(address)?;
-        Some(match extent.state {
-            VmExtentState::Reserved => (MEM_RESERVE, 0),
-            VmExtentState::Committed => (
-                MEM_COMMIT,
-                self.override_protection_at(address)
-                    .unwrap_or(extent.protection),
-            ),
-        })
-    }
-
     /// Query private VAD state for `address`, returning a ReactOS-compatible
     /// `MEMORY_BASIC_INFORMATION` view. `address_space_end` is the exclusive user VA ceiling used
     /// to size free gaps after the final VAD.
@@ -1946,18 +1943,39 @@ impl<const N: usize> VmRegionMap<N> {
             return Err(STATUS_INVALID_PARAMETER);
         }
         if let Some(extent) = self.extent_at(base) {
-            let (state, protect) = self.basic_state_and_protection(base).unwrap();
-            let mut end = (base + PAGE_SIZE).min(extent.end()).min(address_space_end);
-            while end < extent.end() && end < address_space_end {
-                match self.basic_state_and_protection(end) {
-                    Some((next_state, next_protect))
-                        if next_state == state && next_protect == protect =>
-                    {
-                        end = (end + PAGE_SIZE).min(extent.end()).min(address_space_end);
-                    }
-                    _ => break,
+            let limit = extent.end().min(address_space_end);
+            let (state, protect, end) = match extent.state {
+                VmExtentState::Reserved => (MEM_RESERVE, 0, limit),
+                VmExtentState::Committed => {
+                    let protect = self
+                        .override_protection_at(base)
+                        .unwrap_or(extent.protection);
+                    let end = if protect == extent.protection {
+                        // Overrides are sparse and unsorted. The first different page is the
+                        // next protection boundary, regardless of the size of this extent.
+                        self.protection_overrides
+                            .iter()
+                            .flatten()
+                            .filter(|entry| {
+                                entry.page > base
+                                    && entry.page < limit
+                                    && entry.protection != protect
+                            })
+                            .map(|entry| entry.page)
+                            .min()
+                            .unwrap_or(limit)
+                    } else {
+                        // A nondefault run can only contain pages represented by overrides.
+                        // Walk those pages until their protection changes or the extent ends.
+                        let mut next = base.saturating_add(PAGE_SIZE).min(limit);
+                        while next < limit && self.override_protection_at(next) == Some(protect) {
+                            next = next.saturating_add(PAGE_SIZE).min(limit);
+                        }
+                        next
+                    };
+                    (MEM_COMMIT, protect, end)
                 }
-            }
+            };
             Ok(VmBasicInformation {
                 base_address: base,
                 allocation_base: extent.allocation_base,

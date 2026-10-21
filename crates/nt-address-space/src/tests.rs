@@ -1665,6 +1665,98 @@ fn fixed_vm_map_query_basic_splits_on_page_protection_override() {
 }
 
 #[test]
+fn fixed_vm_map_large_query_inspects_sparse_protection_boundaries() {
+    const REGION_SIZE: u64 = 64 * 1024 * 1024;
+    const OVERRIDE_OFFSET: u64 = 32 * 1024 * 1024;
+    let mut map = VmRegionMap::<4>::new(0x10000, 0x1000_0000);
+    let allocation = map
+        .allocate(
+            Some(0x10000),
+            REGION_SIZE,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+        )
+        .unwrap();
+    map.protect(allocation.base + OVERRIDE_OFFSET, PAGE_SIZE, PAGE_READONLY)
+        .unwrap();
+
+    VM_BASIC_EXTENT_INSPECTIONS.with(|count| count.set(0));
+    let before_override = map.query_basic(allocation.base, 0x1000_0000).unwrap();
+    let inspections = VM_BASIC_EXTENT_INSPECTIONS.with(|count| count.get());
+    assert_eq!(before_override.region_size, OVERRIDE_OFFSET);
+    assert_eq!(before_override.protect, PAGE_READWRITE);
+    assert!(
+        inspections <= 2,
+        "query searched extents {inspections} times"
+    );
+
+    let overridden = map
+        .query_basic(allocation.base + OVERRIDE_OFFSET, 0x1000_0000)
+        .unwrap();
+    assert_eq!(overridden.region_size, PAGE_SIZE);
+    assert_eq!(overridden.protect, PAGE_READONLY);
+    let after_override = map
+        .query_basic(allocation.base + OVERRIDE_OFFSET + PAGE_SIZE, 0x1000_0000)
+        .unwrap();
+    assert_eq!(
+        after_override.region_size,
+        REGION_SIZE - OVERRIDE_OFFSET - PAGE_SIZE
+    );
+    assert_eq!(after_override.protect, PAGE_READWRITE);
+}
+
+#[test]
+fn fixed_vm_map_query_basic_finds_unsorted_and_contiguous_protection_overrides() {
+    let mut map = VmRegionMap::<4>::new(0x10000, 0x20_0000);
+    let allocation = map
+        .allocate(
+            Some(0x10000),
+            0x8000,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+        )
+        .unwrap();
+    // Insert the later override first so slot order differs from virtual address order.
+    map.protect(allocation.base + 0x5000, PAGE_SIZE, PAGE_READONLY)
+        .unwrap();
+    map.protect(allocation.base + 0x2000, 2 * PAGE_SIZE, PAGE_READONLY)
+        .unwrap();
+
+    for (offset, region_size, protect) in [
+        (0, 0x2000, PAGE_READWRITE),
+        (0x2000, 0x2000, PAGE_READONLY),
+        (0x3000, 0x1000, PAGE_READONLY),
+        (0x4000, 0x1000, PAGE_READWRITE),
+        (0x5000, 0x1000, PAGE_READONLY),
+        (0x6000, 0x2000, PAGE_READWRITE),
+    ] {
+        let info = map
+            .query_basic(allocation.base + offset, 0x20_0000)
+            .unwrap();
+        assert_eq!(info.region_size, region_size, "offset {offset:#x}");
+        assert_eq!(info.protect, protect, "offset {offset:#x}");
+        assert_eq!(info.allocation_base, allocation.base);
+        assert_eq!(info.allocation_protect, PAGE_READWRITE);
+    }
+}
+
+#[test]
+fn fixed_vm_map_query_basic_reserved_extent_stops_at_address_ceiling() {
+    let mut map = VmRegionMap::<4>::new(0x10000, 0x20_0000);
+    let allocation = map
+        .allocate(Some(0x10000), 0x8000, MEM_RESERVE, PAGE_READWRITE)
+        .unwrap();
+    let info = map
+        .query_basic(allocation.base + 0x123, allocation.base + 0x2800)
+        .unwrap();
+    assert_eq!(info.base_address, allocation.base);
+    assert_eq!(info.region_size, 0x2800);
+    assert_eq!(info.state, MEM_RESERVE);
+    assert_eq!(info.protect, 0);
+    assert_eq!(info.allocation_protect, PAGE_READWRITE);
+}
+
+#[test]
 fn committed_range_table_queries_and_coalesces_runtime_mappings() {
     let mut table = VmCommittedRangeTable::<4>::new();
     table
