@@ -921,6 +921,98 @@ fn checked_sync_request_waits_for_its_exact_reply_without_replaying_send() {
 }
 
 #[test]
+fn kernel_srm_endpoint_services_native_alpc_sync_request_through_broker() {
+    use nt_lpc_abi::{opcode as lop, LpcKernelAcceptConnectRequest};
+    use nt_security::{LogonSessionRegistry, Luid, TokenStore, STATUS_LOGON_SESSION_EXISTS};
+    use nt_srm_message::{decode_request, write_reply_fields, RM_CREATE_LOGON_SESSION};
+
+    let mut broker = Server::new();
+    broker.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let name = utf16("\\SeRmCommandPort");
+    let caller = nt_port_core::ClientId { process: 128, thread: 140 };
+    let listen = {
+        let mut client = LpcClient::new(LpcDirect { server: &mut broker, out: [0; 512] });
+        client.create_port(&name, 4, 0x148, 0x2400).unwrap()
+    };
+    let connect = enc_checked_connect(&name, caller, (1, 20),
+        &port_message(msg_type::CONNECTION_REQUEST, &[]));
+    let pending = alpc.dispatch(broker.core_mut(), aop::ALPC_OP_CONNECT_PORT,
+        &connect, &mut []);
+    assert_eq!(pending.status, NtStatus::PENDING.raw());
+    let connection_id = pending.detail1;
+    let accept = LpcKernelAcceptConnectRequest {
+        abi_size: size_of::<LpcKernelAcceptConnectRequest>() as u16,
+        listen_port: listen, connection_id, client_process: caller.process,
+        client_thread: caller.thread, ..Default::default()
+    };
+    let accepted = broker.dispatch(lop::LPC_OP_KERNEL_ACCEPT_CONNECT,
+        bytemuck::bytes_of(&accept), &mut []);
+    assert_eq!(accepted.status, SUCCESS);
+    let client_port = accepted.detail0;
+    let kernel_server_port = accepted.detail1;
+    assert_ne!(kernel_server_port, 0);
+    assert_eq!(alpc.dispatch(broker.core_mut(), aop::ALPC_OP_CONNECT_PORT,
+        &connect, &mut []).status, SUCCESS);
+
+    let luid = Luid::new(0x4a2d);
+    let mut sessions = LogonSessionRegistry::new();
+    let tokens = TokenStore::new();
+    for (sequence, expected) in [(21, 0), (22, STATUS_LOGON_SESSION_EXISTS)] {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&RM_CREATE_LOGON_SESSION.to_le_bytes());
+        payload.extend_from_slice(&u64::from(luid.low).to_le_bytes());
+        let request = port_message(0, &payload);
+        let mut wire = enc_checked_receive(client_port, caller, (1, sequence));
+        let mut header: nt_alpc_abi::AlpcSendReceiveCheckedRequest =
+            bytemuck::pod_read_unaligned(&wire);
+        header.send_receive.flags = nt_alpc_abi::send_flag::SYNC_REQUEST;
+        header.send_receive.message_offset = wire.len() as u32;
+        header.send_receive.message_len_bytes = request.len() as u32;
+        wire.copy_from_slice(bytemuck::bytes_of(&header));
+        wire.extend_from_slice(&request);
+        let mut response = [0u8; 128];
+        assert_eq!(alpc.dispatch(broker.core_mut(), aop::ALPC_OP_SEND_RECEIVE,
+            &wire, &mut response).status, NtStatus::PENDING.raw());
+
+        let received = {
+            let mut kernel = LpcClient::new(LpcDirect { server: &mut broker, out: [0; 512] });
+            kernel.reply_wait_receive(kernel_server_port).unwrap()
+        };
+        assert_eq!(received.connection_id, connection_id);
+        assert_eq!(received.client_process, caller.process);
+        assert_eq!(received.client_thread, caller.thread);
+        assert_eq!(received.msg_type, nt_lpc_abi::msg_type::LPC_REQUEST);
+        let delivered: PortMessage = bytemuck::pod_read_unaligned(&received.connection_info[..40]);
+        assert_ne!(delivered.message_id, 0);
+        assert_eq!(delivered.client_process, caller.process);
+        assert_eq!(delivered.client_thread, caller.thread);
+        let command = decode_request(&received.connection_info, 0x148).unwrap();
+        assert_eq!(command.api_number, RM_CREATE_LOGON_SESSION);
+        assert_eq!(command.luid, Some(u64::from(luid.low)));
+        let result_status = sessions.create(luid).err().unwrap_or(0);
+        assert_eq!(result_status, expected);
+        let mut reply = received.connection_info;
+        write_reply_fields(&mut reply,
+            nt_srm_message::RequestReply { result_status, ..command }).unwrap();
+        {
+            let mut kernel = LpcClient::new(LpcDirect { server: &mut broker, out: [0; 512] });
+            kernel.reply_port(kernel_server_port, &reply).unwrap();
+        }
+        let completed = alpc.dispatch(broker.core_mut(), aop::ALPC_OP_SEND_RECEIVE,
+            &wire, &mut response);
+        assert_eq!(completed.status, SUCCESS);
+        assert_eq!(&response[..completed.information as usize], reply);
+        assert_eq!(u32::from_le_bytes(response[44..48].try_into().unwrap()), expected);
+        assert_eq!(alpc.dispatch(broker.core_mut(), aop::ALPC_OP_ACK_SEND_RECEIVE,
+            &enc_ack_receive(caller, (1, sequence)), &mut []).status, SUCCESS);
+    }
+    assert!(sessions.contains(luid));
+    assert_eq!(broker.core_mut().receive_message(kernel_server_port).unwrap(), None);
+    assert_eq!(sessions.delete(luid, &tokens), Ok(()));
+}
+
+#[test]
 fn pending_reply_wait_delivers_sync_reply_before_next_request() {
     use nt_port_core::{ClientId, ConnectOutcome, MessageAttrs, MessageIdentity};
     let mut core = PortCore::new();

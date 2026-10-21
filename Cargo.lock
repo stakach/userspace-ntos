@@ -197,6 +197,7 @@ dependencies = [
  "nt-lpc-server",
  "nt-port-core",
  "nt-security",
+ "nt-srm-message",
  "nt-status",
 ]
 

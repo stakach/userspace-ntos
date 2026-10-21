@@ -22,6 +22,7 @@ bytemuck = { version = "1", default-features = false }
 nt-lpc-server = { workspace = true }
 nt-lpc-client = { workspace = true }
 nt-lpc-abi = { workspace = true }
+nt-srm-message = { workspace = true }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
