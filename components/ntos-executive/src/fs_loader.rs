@@ -16,7 +16,9 @@ pub(crate) const FAT32_SCRATCH_OFFSET: u64 = 0xA00;
 const FAT32_FAT_CACHE_OFFSET: u64 = FAT32_SCRATCH_OFFSET;
 // The isolated storage host maps its image read-only and never uses this cache. The executive
 // owns one mounted FAT volume and serializes its native filesystem calls through the service loop.
-static mut EXEC_FAT_RANGE_CURSOR: nt_fs::FatRangeCursor = nt_fs::FatRangeCursor::new();
+static mut EXEC_FAT_RANGE_CURSORS: nt_fs::FatRangeCursorSet<16> =
+    nt_fs::FatRangeCursorSet::new();
+static mut EXEC_FAT_SECTOR_CACHE: nt_fs::FatSectorCache = nt_fs::FatSectorCache::new();
 const _: () = assert!(
     FAT32_FAT_CACHE_OFFSET + core::mem::size_of::<FatSectorCacheScratch>() as u64 <= 0x1000
 );
@@ -186,14 +188,19 @@ pub(crate) fn disk_census_record(
 }
 
 unsafe fn fat_cache_invalidate(fs: &Fat32) {
+    if fs.census {
+        return;
+    }
     let cache = &mut *((fs.dma_vaddr + FAT32_FAT_CACHE_OFFSET) as *mut FatSectorCacheScratch);
     cache.valid = 0;
 }
 
 unsafe fn fat_chain_cache_invalidate(fs: &Fat32) {
-    fat_cache_invalidate(fs);
     if fs.census {
-        (&mut *core::ptr::addr_of_mut!(EXEC_FAT_RANGE_CURSOR)).invalidate();
+        (&mut *core::ptr::addr_of_mut!(EXEC_FAT_SECTOR_CACHE)).invalidate();
+        (&mut *core::ptr::addr_of_mut!(EXEC_FAT_RANGE_CURSORS)).invalidate();
+    } else {
+        fat_cache_invalidate(fs);
     }
 }
 
@@ -334,7 +341,21 @@ unsafe fn fat_next_checked(fs: &Fat32, cluster: u32) -> Result<u32, u32> {
         .checked_add(byte / fs.bps)
         .filter(|sector| *sector < fs.data_start)
         .ok_or(nt_fs::STATUS_DATA_ERROR)?;
-    let off = (byte % fs.bps) as u64;
+    let off = byte % fs.bps;
+    if fs.census {
+        let mount = exec_fs_mount_identity().ok_or(nt_fs::STATUS_DATA_ERROR)?;
+        let value = (&mut *core::ptr::addr_of_mut!(EXEC_FAT_SECTOR_CACHE)).read_entry(
+            mount.value(),
+            sec,
+            off,
+            |sector, data| {
+                let p = fat_read_sector_checked(fs, sector).ok_or(nt_fs::STATUS_DATA_ERROR)?;
+                core::ptr::copy_nonoverlapping(p, data.as_mut_ptr(), data.len());
+                Ok(())
+            },
+        )?;
+        return Ok(value & 0x0FFF_FFFF);
+    }
     let cache = &mut *((fs.dma_vaddr + FAT32_FAT_CACHE_OFFSET) as *mut FatSectorCacheScratch);
     if cache.valid != 1 || cache.sector != sec {
         let p = fat_read_sector_checked(fs, sec).ok_or(nt_fs::STATUS_DATA_ERROR)?;
@@ -797,19 +818,66 @@ pub(crate) unsafe fn fat_read_file_range(
     if cluster_bytes == 0 {
         return 0;
     }
-    let mut local_cursor = nt_fs::FatRangeCursor::new();
-    let cursor = if fs.census {
-        &mut *core::ptr::addr_of_mut!(EXEC_FAT_RANGE_CURSOR)
+    let target_index = offset / cluster_bytes;
+    let located = if fs.census {
+        let Some(mount) = exec_fs_mount_identity() else {
+            return 0;
+        };
+        (&mut *core::ptr::addr_of_mut!(EXEC_FAT_RANGE_CURSORS)).locate(
+            mount.value(),
+            first_cluster,
+            size,
+            target_index,
+            |cluster| fat_next(fs, cluster),
+        )
     } else {
-        &mut local_cursor
+        nt_fs::FatRangeCursor::new().locate(first_cluster, size, target_index, |cluster| {
+            fat_next(fs, cluster)
+        })
     };
-    let Some(mut cluster) = cursor.locate(first_cluster, size, offset / cluster_bytes, |cluster| {
-        fat_next(fs, cluster)
-    }) else {
+    let Some(mut cluster) = located else {
         return 0;
     };
     let mut within_cluster = offset % cluster_bytes;
     let mut written = 0usize;
+    if fs.spc == 1 {
+        while written < wanted {
+            let Some(batch) = nt_fs::FatRangeBatch::plan(
+                cluster,
+                within_cluster,
+                wanted - written,
+                fs.bps,
+                AHCI_MAX_SECTORS_PER_READ,
+                |current| fat_next(fs, current),
+            ) else {
+                break;
+            };
+            let Some(data) = fat_read_sectors_checked(
+                fs,
+                fat_cluster_sector(fs, cluster),
+                batch.sectors,
+            ) else {
+                break;
+            };
+            core::ptr::copy_nonoverlapping(
+                data.add(batch.skip_bytes),
+                output.as_mut_ptr().add(written),
+                batch.copy_bytes,
+            );
+            if batch.sectors > 1 {
+                fat_cache_invalidate(fs);
+            }
+            written += batch.copy_bytes;
+            if written < wanted {
+                let Some(next) = batch.next_cluster else {
+                    break;
+                };
+                cluster = next;
+                within_cluster = 0;
+            }
+        }
+        return written;
+    }
     while cluster >= 2 && cluster < 0x0FFF_FFF8 && written < wanted {
         for sector in 0..fs.spc {
             let sector_start = sector * fs.bps;
@@ -1078,6 +1146,8 @@ pub(crate) unsafe fn publish_exec_fs(fs: Fat32) -> Result<(), u32> {
     if slot.is_some() { return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST); }
     let id = crate::mounted_volume::allocate_mount_id()?;
     crate::writable_fs::snapshot_storage::publish(fs, id)?;
+    (&mut *core::ptr::addr_of_mut!(EXEC_FAT_SECTOR_CACHE)).invalidate();
+    (&mut *core::ptr::addr_of_mut!(EXEC_FAT_RANGE_CURSORS)).invalidate();
     *core::ptr::addr_of_mut!(EXEC_FS_MOUNT_ID) = Some(id);
     *slot = Some(fs);
     Ok(())
