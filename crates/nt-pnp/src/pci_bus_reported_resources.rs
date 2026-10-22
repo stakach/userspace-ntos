@@ -446,6 +446,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn accepted_pci_no_resource_report_requires_zero_bars_and_no_interrupt_pin() {
+        let mut function = device();
+        function.bars.clear();
+        function.irq_pin = 0;
+        function.irq_line = 255;
+        assert_eq!(validate_pci_bus_reported_resources(&function, &[], &[]), Ok(()));
+
+        function.irq_pin = 1;
+        assert!(validate_pci_bus_reported_resources(&function, &[], &[]).is_err());
+        function.irq_pin = 0;
+        function.bars = device().bars;
+        assert!(validate_pci_bus_reported_resources(&function, &[], &[]).is_err());
+    }
+
     fn provider_lists(device: &PciDevice) -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) {
         let raw_descriptors = [
             CmResourceDescriptor::Memory(MemoryDescriptor {

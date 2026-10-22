@@ -132,6 +132,14 @@ pub struct BusReportedResourceSnapshot {
     pub resource_requirements: Vec<u8>,
 }
 
+/// A successful PCI bus query may report no descriptors at all. Require all three query
+/// results to agree; an unqueried or one-sided result cannot authorize an empty START.
+pub fn pci_bus_reports_no_resources(properties: &crate::PdoProperties) -> bool {
+    matches!(properties.boot_resources_raw, crate::PropertyBlobState::KnownNone)
+        && matches!(properties.boot_resources_translated, crate::PropertyBlobState::KnownNone)
+        && matches!(properties.resource_requirements, crate::PropertyBlobState::KnownNone)
+}
+
 /// Retain a complete resource pair from an accepted bus PDO without replacing it with a
 /// synthetic no-resource plan. One-sided and unqueried pairs cannot authorize START.
 pub fn prepare_bus_reported_resource_snapshot(
@@ -534,6 +542,26 @@ mod tests {
             crate::PropertyBlobState::Present(vec![1]),
         );
         assert_eq!(prepare_bus_reported_bus_number_start(&arbitrated), Ok(None));
+    }
+
+    #[test]
+    fn pci_no_resource_report_requires_exact_completed_bus_queries() {
+        use crate::PropertyBlobState::{KnownNone, Present, Unqueried};
+
+        let no_resources = bus_properties(KnownNone, KnownNone, KnownNone);
+        assert!(pci_bus_reports_no_resources(&no_resources));
+        for (raw, translated, requirements) in [
+            (Unqueried, KnownNone, KnownNone),
+            (KnownNone, Unqueried, KnownNone),
+            (KnownNone, KnownNone, Unqueried),
+            (Present(Vec::new()), KnownNone, KnownNone),
+            (KnownNone, Present(Vec::new()), KnownNone),
+            (KnownNone, KnownNone, Present(Vec::new())),
+        ] {
+            assert!(!pci_bus_reports_no_resources(&bus_properties(
+                raw, translated, requirements,
+            )));
+        }
     }
 
     #[test]
