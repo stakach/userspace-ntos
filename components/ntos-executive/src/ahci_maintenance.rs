@@ -108,7 +108,9 @@ pub(super) unsafe fn expected_disk(
         (0, &mut sector_zero),
         (fat.volume_start_lba, &mut volume_sector),
     ] {
-        if super::ahci_read_sector(fat.ahci_vaddr, fat.dma_vaddr, fat.dma_paddr, lba) != 0 {
+        if !nt_ahci::read_completion_ok(super::ahci_read_sector(
+            fat.ahci_vaddr, fat.dma_vaddr, fat.dma_paddr, lba,
+        )) {
             return Err(Error::Device);
         }
         core::ptr::copy_nonoverlapping(
