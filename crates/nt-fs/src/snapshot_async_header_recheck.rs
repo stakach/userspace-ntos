@@ -110,7 +110,10 @@ impl AsyncSnapshotHeaderRecheck {
         Ok((proof, manifest))
     }
 
-    pub fn finish_proven(self) -> Result<RecheckedPairedWalSnapshot, Self> {
+    /// # Safety
+    /// Every completed read must have been the exact reserve read returned by the native
+    /// provider after terminal completion and ACK, while the same exclusive lease was held.
+    pub unsafe fn finish_proven(self) -> Result<RecheckedPairedWalSnapshot, Self> {
         let store = self.store;
         let sector_size = self.sector_size;
         let device_sectors = self.device_sectors;

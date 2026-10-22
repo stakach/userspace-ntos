@@ -164,6 +164,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
             Operation::Prepare => self.state = RegistryWalState::Prepared,
             Operation::Commit => {
                 let pending = self.pending.take().expect("committed WAL frame");
+                self.newly_committed_serial = Some(pending.serial);
                 self.record_end_lbas.push(self.cursor + 2 + pending.sectors);
                 self.records.push(RegistryWalRecord { serial: pending.serial, payload: pending.payload });
                 self.next_serial += 1;

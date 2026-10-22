@@ -341,6 +341,16 @@ impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
             .then_some(self.write_buffer.as_slice())
     }
 
+    /// A local admission refusal before dispatch has no physical effect. Retain the phase and
+    /// mint a different sequence on retry so a stale claim cannot complete the new command.
+    pub fn release_unentered(&mut self, request: AsyncSnapshotRequest)
+        -> Result<(), AsyncSnapshotCommitError>
+    {
+        if self.pending != Some(request) { return Err(AsyncSnapshotCommitError::WrongTicket); }
+        self.pending = None;
+        Ok(())
+    }
+
     pub fn lose(&mut self, request: AsyncSnapshotRequest) -> Result<(), AsyncSnapshotCommitError> {
         if self.pending != Some(request) {
             return Err(AsyncSnapshotCommitError::WrongTicket);
@@ -519,7 +529,10 @@ impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
     /// A WAL checkpoint starts with a paired, payload-valid reserve. Its scan validates the
     /// unchanged slot; the exact payload and acknowledged final header/flush prove the new one.
     /// No post-commit physical read is needed to publish the refreshed in-process pair.
-    pub fn finish_with_paired_proof(self) -> Result<(u64, VerifiedPairedWalSnapshot), Self> {
+    /// # Safety
+    /// All completed native reads, writes, and flushes must have reached exact provider
+    /// terminal completion and ACK under one reserve lease. A local reply is not a barrier.
+    pub unsafe fn finish_with_paired_proof(self) -> Result<(u64, VerifiedPairedWalSnapshot), Self> {
         if !self.is_done() || self.failure.is_some() { return Err(self); }
         let other = 1 - self.target_slot;
         let ScanResult::Valid(unchanged) = self.scan[other as usize] else { return Err(self); };

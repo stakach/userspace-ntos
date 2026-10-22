@@ -16,7 +16,8 @@ fn native_anchor_requires_rechecked_pair_and_two_exact_write_flush_pairs() {
         disk.read_sector(request.lba, &mut sector).unwrap();
         recheck.complete_read(request, &sector).unwrap();
     }
-    let rechecked = recheck.finish_proven().ok().unwrap();
+    // Both fixture reads came from the exact disk under this owner.
+    let rechecked = unsafe { recheck.finish_proven() }.ok().unwrap();
     let range = OwnedBoundedBlockRange::new(disk, 16, 16).ok().unwrap();
     let mut wal = RegistryWal::recover(range, 77).unwrap();
     wal.begin(alloc::vec![0x51; 512]).unwrap();
@@ -39,10 +40,13 @@ fn native_anchor_requires_rechecked_pair_and_two_exact_write_flush_pairs() {
         } else {
             update.device_for_test().flush().unwrap();
         }
-        update.complete(request, true).unwrap();
+        // The fixture issued and completed the exact write/flush above.
+        unsafe { update.complete(request, true) }.unwrap();
     }
     assert_eq!(update.enter_next(), Ok(None));
-    let (mut disk, continuation, pair) = update.into_continuation_and_pair().ok().unwrap();
+    let (mut disk, publication) = update.into_anchored_publication().ok().unwrap();
+    assert_eq!(publication.payload(), &[0x51; 512]);
+    let (continuation, pair, _payload) = publication.into_parts();
     assert_eq!(continuation.anchor(), pair.anchor());
     disk.power_cut();
     assert_eq!(store.read_latest_wal(&mut disk).unwrap().unwrap().anchor, pair.anchor());
@@ -70,11 +74,11 @@ fn native_anchor_uncertain_completion_cannot_be_replayed_or_published() {
     wal.commit().unwrap();
     let verified = wal.into_verified_device().unwrap().into_full_device();
     let mut update = AsyncWalSnapshotAnchorUpdate::admit_verified_wal_pair(
-        store, verified, recheck.finish_proven().ok().unwrap()).ok().unwrap();
+        store, verified, unsafe { recheck.finish_proven() }.ok().unwrap()).ok().unwrap();
     let request = update.enter_next().unwrap().unwrap();
-    assert_eq!(update.complete(request, false),
+    assert_eq!(unsafe { update.complete(request, false) },
         Err(AsyncSnapshotCommitError::Store(SnapshotBlockStoreError::Io)));
-    assert_eq!(update.complete(request, true),
+    assert_eq!(unsafe { update.complete(request, true) },
         Err(AsyncSnapshotCommitError::Store(SnapshotBlockStoreError::Io)));
     assert_eq!(update.enter_next(),
         Err(AsyncSnapshotCommitError::Store(SnapshotBlockStoreError::Io)));

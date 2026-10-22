@@ -18,6 +18,7 @@ pub struct WalSnapshotAnchorUpdate<D: SnapshotBlockDevice> {
     torn_companion_source: Option<SlotReadPlan>,
     continuation: Option<crate::RegistryWalContinuation>,
     paired_proof: Option<VerifiedPairedWalSnapshot>,
+    newly_committed_payload: Option<Vec<u8>>,
     phase: Phase,
 }
 
@@ -53,6 +54,9 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
 
     pub(super) fn complete_async_headers(&mut self) { self.phase = Phase::Complete; }
     pub(super) fn fail_async_headers(&mut self) { self.phase = Phase::Uncertain; }
+    pub(super) fn has_newly_committed_payload(&self) -> bool {
+        self.newly_committed_payload.is_some()
+    }
 
     #[cfg(test)]
     pub(super) fn device_for_test(&mut self) -> &mut D {
@@ -65,7 +69,7 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
         verified: crate::RegistryWalVerifiedDevice<D>,
         rechecked: super::RecheckedPairedWalSnapshot,
     ) -> Result<Self, (SnapshotBlockStoreError, crate::RegistryWalVerifiedDevice<D>, super::RecheckedPairedWalSnapshot)> {
-        let (device, prefix, record_end_lbas) = verified.into_parts();
+        let (device, prefix, record_end_lbas, newly_committed_payload) = verified.into_parts();
         let next = prefix.anchor();
         let checked = (|| {
             if rechecked.store != store || rechecked.pair.store != store
@@ -91,13 +95,15 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
         })();
         if let Err(error) = checked {
             return Err((error,
-                crate::RegistryWalVerifiedDevice::from_parts(device, prefix, record_end_lbas),
+                crate::RegistryWalVerifiedDevice::from_parts(device, prefix, record_end_lbas,
+                    newly_committed_payload),
                 rechecked));
         }
         let pair = rechecked.pair;
         let mut update = Self::from_plans(store, device, next, pair.plans, None, Some(pair));
         update.continuation = Some(crate::RegistryWalContinuation::from_parts(
             prefix, record_end_lbas));
+        update.newly_committed_payload = newly_committed_payload;
         Ok(update)
     }
     /// Admission reads and validates both payloads before any write. Failure returns the
@@ -126,7 +132,7 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
         store: SnapshotBlockStore,
         verified: crate::RegistryWalVerifiedDevice<D>,
     ) -> Result<Self, (SnapshotBlockStoreError, crate::RegistryWalVerifiedDevice<D>)> {
-        let (device, prefix, record_end_lbas) = verified.into_parts();
+        let (device, prefix, record_end_lbas, newly_committed_payload) = verified.into_parts();
         let next = prefix.anchor();
         let result = Self::admit_checked(store, device, next, true, |current| {
             for anchor in current {
@@ -151,11 +157,13 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
                 update.continuation = Some(crate::RegistryWalContinuation::from_parts(
                     prefix, record_end_lbas,
                 ));
+                update.newly_committed_payload = newly_committed_payload;
                 Ok(update)
             }
             Err((error, device)) => Err((
                 error,
-                crate::RegistryWalVerifiedDevice::from_parts(device, prefix, record_end_lbas),
+                crate::RegistryWalVerifiedDevice::from_parts(device, prefix, record_end_lbas,
+                    newly_committed_payload),
             )),
         }
     }
@@ -168,7 +176,7 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
         verified: crate::RegistryWalVerifiedDevice<D>,
         paired: VerifiedPairedWalSnapshot,
     ) -> Result<Self, (SnapshotBlockStoreError, crate::RegistryWalVerifiedDevice<D>, VerifiedPairedWalSnapshot)> {
-        let (mut device, prefix, record_end_lbas) = verified.into_parts();
+        let (mut device, prefix, record_end_lbas, newly_committed_payload) = verified.into_parts();
         let next = prefix.anchor();
         let checked = (|| {
             store.recheck_verified_paired_wal_snapshot(&mut device, &paired)?;
@@ -193,7 +201,8 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
         if let Err(error) = checked {
             return Err((
                 error,
-                crate::RegistryWalVerifiedDevice::from_parts(device, prefix, record_end_lbas),
+                crate::RegistryWalVerifiedDevice::from_parts(device, prefix, record_end_lbas,
+                    newly_committed_payload),
                 paired,
             ));
         }
@@ -201,6 +210,7 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
         update.continuation = Some(crate::RegistryWalContinuation::from_parts(
             prefix, record_end_lbas,
         ));
+        update.newly_committed_payload = newly_committed_payload;
         Ok(update)
     }
 
@@ -326,6 +336,7 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
             torn_companion_source,
             continuation: None,
             paired_proof,
+            newly_committed_payload: None,
             phase: Phase::Pending,
         }
     }
@@ -402,9 +413,10 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
     }
 
     /// Publish the refreshed paired proof only after both exact header barriers completed.
-    pub fn into_continuation_and_pair(
+    pub(super) fn into_continuation_pair_and_payload(
         mut self,
-    ) -> Result<(D, crate::RegistryWalContinuation, VerifiedPairedWalSnapshot), Self> {
+    ) -> Result<(D, crate::RegistryWalContinuation, VerifiedPairedWalSnapshot,
+        Option<Vec<u8>>), Self> {
         if self.phase != Phase::Complete || self.continuation.is_none() || self.paired_proof.is_none() {
             return Err(self);
         }
@@ -419,7 +431,15 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
             self.device.take().expect("retained anchor device"),
             self.continuation.take().expect("verified WAL prefix"),
             paired,
+            self.newly_committed_payload.take(),
         ))
+    }
+
+    pub fn into_continuation_and_pair(self)
+        -> Result<(D, crate::RegistryWalContinuation, VerifiedPairedWalSnapshot), Self>
+    {
+        self.into_continuation_pair_and_payload()
+            .map(|(device, token, pair, _)| (device, token, pair))
     }
 
     #[cfg(test)]

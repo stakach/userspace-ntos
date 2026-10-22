@@ -22,7 +22,7 @@ pub use async_header_recheck::{AsyncSnapshotHeaderRecheck, RecheckedPairedWalSna
 
 #[path = "snapshot_async_wal_anchor.rs"]
 mod async_wal_anchor;
-pub use async_wal_anchor::AsyncWalSnapshotAnchorUpdate;
+pub use async_wal_anchor::{AnchoredWalPublication, AsyncWalSnapshotAnchorUpdate};
 
 #[path = "snapshot_wal_anchor.rs"]
 mod wal_anchor;

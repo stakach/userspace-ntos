@@ -61,6 +61,7 @@ pub struct RegistryWalVerifiedDevice<D> {
     device: D,
     prefix: RegistryWalVerifiedPrefix,
     record_end_lbas: Vec<u64>,
+    newly_committed_payload: Option<Vec<u8>>,
 }
 
 /// Move-only proof of the settled WAL prefix for another use of the same physical reserve.
@@ -86,7 +87,7 @@ impl RegistryWalContinuation {
     }
 
     pub(crate) fn from_verified<D>(verified: RegistryWalVerifiedDevice<D>) -> (D, Self) {
-        let (device, prefix, record_end_lbas) = verified.into_parts();
+        let (device, prefix, record_end_lbas, _) = verified.into_parts();
         (device, Self { prefix, record_end_lbas })
     }
 }
@@ -97,20 +98,22 @@ impl<D> RegistryWalVerifiedDevice<D> {
 
     pub(crate) fn device_mut(&mut self) -> &mut D { &mut self.device }
 
-    pub(crate) fn into_parts(self) -> (D, RegistryWalVerifiedPrefix, Vec<u64>) {
-        (self.device, self.prefix, self.record_end_lbas)
+    pub(crate) fn into_parts(self) -> (D, RegistryWalVerifiedPrefix, Vec<u64>, Option<Vec<u8>>) {
+        (self.device, self.prefix, self.record_end_lbas, self.newly_committed_payload)
     }
 
-    pub(crate) fn from_parts(device: D, prefix: RegistryWalVerifiedPrefix, record_end_lbas: Vec<u64>) -> Self {
-        Self { device, prefix, record_end_lbas }
+    pub(crate) fn from_parts(device: D, prefix: RegistryWalVerifiedPrefix,
+        record_end_lbas: Vec<u64>, newly_committed_payload: Option<Vec<u8>>) -> Self {
+        Self { device, prefix, record_end_lbas, newly_committed_payload }
     }
 }
 
 impl<D: SnapshotBlockDevice> RegistryWalVerifiedDevice<OwnedBoundedBlockRange<D>> {
     /// Move from the bounded WAL view to its full parent without releasing the exact lease.
     pub fn into_full_device(self) -> RegistryWalVerifiedDevice<D> {
-        let (device, prefix, record_end_lbas) = self.into_parts();
-        RegistryWalVerifiedDevice::from_parts(device.into_device(), prefix, record_end_lbas)
+        let (device, prefix, record_end_lbas, newly_committed_payload) = self.into_parts();
+        RegistryWalVerifiedDevice::from_parts(device.into_device(), prefix, record_end_lbas,
+            newly_committed_payload)
     }
 }
 
@@ -144,6 +147,7 @@ pub struct RegistryWal<D: SnapshotBlockDevice> {
     state: RegistryWalState,
     async_effect: Option<async_io::AsyncWalEffect>,
     async_sequence: u64,
+    newly_committed_serial: Option<u64>,
 }
 
 impl<D: SnapshotBlockDevice> Drop for RegistryWal<D> {
@@ -312,6 +316,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
             state: RegistryWalState::Ready,
             async_effect: None,
             async_sequence: 1,
+            newly_committed_serial: None,
         })
     }
 
@@ -434,6 +439,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
             },
             async_effect: None,
             async_sequence: 1,
+            newly_committed_serial: None,
         })
     }
 
@@ -535,6 +541,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
         self.record_end_lbas
             .try_reserve(1)
             .map_err(|_| RegistryWalError::OutOfMemory)?;
+        self.newly_committed_serial = None;
         self.pending = Some(Pending {
             serial: self.next_serial,
             sectors: count,
@@ -651,6 +658,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
             return Err(error);
         }
         let pending = self.pending.take().unwrap();
+        self.newly_committed_serial = Some(pending.serial);
         self.records.push(RegistryWalRecord {
             serial: pending.serial,
             payload: pending.payload,
@@ -705,10 +713,15 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
         }
         let (incarnation, serial, end_lba) = self.verified_prefix().expect("settled WAL prefix");
         let prefix = RegistryWalVerifiedPrefix { incarnation, serial, end_lba };
+        let newly_committed_payload = if self.newly_committed_serial == Some(serial) {
+            self.records.last_mut().and_then(|record|
+                (record.serial == serial).then(|| core::mem::take(&mut record.payload)))
+        } else { None };
         Ok(RegistryWalVerifiedDevice::from_parts(
             self.device.take().expect("retained WAL device"),
             prefix,
             core::mem::take(&mut self.record_end_lbas),
+            newly_committed_payload,
         ))
     }
 

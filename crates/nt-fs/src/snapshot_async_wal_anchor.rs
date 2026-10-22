@@ -2,6 +2,23 @@
 
 use super::*;
 
+/// Move-only publication authority for the newly committed WAL record. The record bytes came
+/// from the same verified WAL prefix whose anchor crossed both native header barriers.
+#[must_use = "consume only for the matching durable mutation publication"]
+pub struct AnchoredWalPublication {
+    continuation: crate::RegistryWalContinuation,
+    pair: VerifiedPairedWalSnapshot,
+    payload: Vec<u8>,
+}
+
+impl AnchoredWalPublication {
+    pub fn anchor(&self) -> WalSnapshotAnchor { self.continuation.anchor() }
+    pub fn payload(&self) -> &[u8] { &self.payload }
+    pub fn into_parts(self) -> (crate::RegistryWalContinuation, VerifiedPairedWalSnapshot, Vec<u8>) {
+        (self.continuation, self.pair, self.payload)
+    }
+}
+
 #[must_use = "retain until both exact native header writes and flushes complete"]
 pub struct AsyncWalSnapshotAnchorUpdate<D: SnapshotBlockDevice> {
     inner: WalSnapshotAnchorUpdate<D>,
@@ -67,8 +84,10 @@ impl<D: SnapshotBlockDevice> AsyncWalSnapshotAnchorUpdate<D> {
         Ok(())
     }
 
-    /// `settled` is true only after exact native provider completion and ACK.
-    pub fn complete(&mut self, request: AsyncSnapshotRequest, settled: bool)
+    /// # Safety
+    /// `settled = true` requires the exact physical write or flush to have reached provider
+    /// terminal completion and acknowledgement for this request. A reply alone is insufficient.
+    pub unsafe fn complete(&mut self, request: AsyncSnapshotRequest, settled: bool)
         -> Result<(), AsyncSnapshotCommitError>
     {
         if self.failed { return Err(AsyncSnapshotCommitError::Store(SnapshotBlockStoreError::Io)); }
@@ -88,9 +107,21 @@ impl<D: SnapshotBlockDevice> AsyncWalSnapshotAnchorUpdate<D> {
         -> Result<(D, crate::RegistryWalContinuation, VerifiedPairedWalSnapshot), Self>
     {
         if self.failed || self.step != 4 || self.pending.is_some() { return Err(self); }
-        match self.inner.into_continuation_and_pair() {
-            Ok(parts) => Ok(parts),
+        match self.inner.into_continuation_pair_and_payload() {
+            Ok((device, token, pair, _payload)) => Ok((device, token, pair)),
             Err(_) => unreachable!("completed async anchor must release exact proof"),
+        }
+    }
+
+    /// Only a newly marked record may mint a publication authority; a recovered prefix has no
+    /// current mutation payload even if its numeric anchor is valid.
+    pub fn into_anchored_publication(self) -> Result<(D, AnchoredWalPublication), Self> {
+        if self.failed || self.step != 4 || self.pending.is_some()
+            || !self.inner.has_newly_committed_payload() { return Err(self); }
+        match self.inner.into_continuation_pair_and_payload() {
+            Ok((device, continuation, pair, Some(payload))) =>
+                Ok((device, AnchoredWalPublication { continuation, pair, payload })),
+            _ => unreachable!("completed native anchor retains newly committed payload"),
         }
     }
 

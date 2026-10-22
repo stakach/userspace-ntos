@@ -9,6 +9,24 @@ fn disk() -> CachedDisk {
     CachedDisk::with_sectors(32)
 }
 
+#[test]
+fn only_newly_committed_frame_moves_payload_into_anchor_owner() {
+    let payload = alloc::vec![0x52; 600];
+    let mut wal = RegistryWal::recover(disk(), 77).unwrap();
+    wal.begin(payload.clone()).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    let (mut device, prefix, _, committed) = wal.into_verified_device().unwrap().into_parts();
+    assert_eq!(prefix.anchor().serial, 1);
+    assert_eq!(committed, Some(payload));
+
+    device.power_cut();
+    let recovered = RegistryWal::recover(device, 77).unwrap();
+    let (_, prefix, _, committed) = recovered.into_verified_device().unwrap().into_parts();
+    assert_eq!(prefix.anchor().serial, 1);
+    assert_eq!(committed, None, "recovery does not mint a new publication receipt");
+}
+
 fn settle_async_step(wal: &mut RegistryWal<CachedDisk>, request: AsyncWalIoRequest) {
     match request.kind {
         AsyncWalIoKind::Write => {

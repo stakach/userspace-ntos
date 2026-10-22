@@ -104,12 +104,30 @@ fn native_checkpoint_mints_paired_proof_from_completed_io_without_postcommit_rea
         perform(&mut disk, &mut commit, request);
     }
     let reads = disk.read_attempts;
-    let (generation, pair) = commit.finish_with_paired_proof().ok().unwrap();
+    // The fixture feeds the exact disk completion and flush for every request.
+    let (generation, pair) = unsafe { commit.finish_with_paired_proof() }.ok().unwrap();
     assert_eq!(generation, 3);
     assert_eq!(disk.read_attempts, reads);
     assert_eq!(pair.anchor(), baseline().anchor());
     assert_eq!(SnapshotBlockStore::new(0, 16)
         .recheck_verified_paired_wal_snapshot(&mut disk, &pair), Ok(pair.manifest()));
+}
+
+#[test]
+fn native_checkpoint_unentered_request_can_retry_with_new_exact_ticket() {
+    let (mut disk, mut commit) = fixture(alloc::vec![0xa5; 1300]);
+    let first = commit.enter_next().unwrap().unwrap();
+    assert_eq!(first.kind, AsyncSnapshotIoKind::Flush);
+    commit.release_unentered(first).unwrap();
+    let second = commit.enter_next().unwrap().unwrap();
+    assert_ne!(first.sequence, second.sequence);
+    assert_eq!(commit.complete_effect(first, 0), Err(AsyncSnapshotCommitError::WrongTicket));
+    perform(&mut disk, &mut commit, second);
+    while let Some(request) = commit.enter_next().unwrap() {
+        perform(&mut disk, &mut commit, request);
+    }
+    // The fixture completed every request against the same disk.
+    assert_eq!(unsafe { commit.finish_with_paired_proof() }.ok().unwrap().0, 3);
 }
 
 #[test]
