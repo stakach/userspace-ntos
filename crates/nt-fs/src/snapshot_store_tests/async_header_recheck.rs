@@ -42,3 +42,24 @@ fn async_header_recheck_reads_exact_pair_and_rejects_changed_header() {
         Err(AsyncSnapshotCommitError::Store(SnapshotBlockStoreError::Corrupt)));
     assert!(stale.finish().is_err());
 }
+
+#[test]
+fn unentered_header_refusal_returns_original_pair_without_disk_effect() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::new();
+    store.commit_next_with_wal_manifest(&mut disk, b"older", manifest()).unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, b"newer", manifest()).unwrap();
+    let proof = store.verify_paired_wal_snapshot(&mut disk).unwrap();
+    let mut recheck = AsyncSnapshotHeaderRecheck::new(
+        store, proof, disk.sector_size(), disk.sector_count()).ok().unwrap();
+    let _request = recheck.enter_next().unwrap().unwrap();
+    assert!(recheck.abort_no_effect().is_err());
+    // Rebuild only to test the released request; the first cursor was consumed above.
+    let proof = store.verify_paired_wal_snapshot(&mut disk).unwrap();
+    let mut recheck = AsyncSnapshotHeaderRecheck::new(
+        store, proof, disk.sector_size(), disk.sector_count()).ok().unwrap();
+    let request = recheck.enter_next().unwrap().unwrap();
+    recheck.release_unentered(request).unwrap();
+    let proof = recheck.abort_no_effect().ok().unwrap();
+    assert_eq!(proof.anchor(), manifest().anchor());
+}

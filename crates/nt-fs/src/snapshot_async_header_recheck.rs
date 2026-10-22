@@ -112,6 +112,13 @@ impl AsyncSnapshotHeaderRecheck {
         Ok((proof, manifest))
     }
 
+    /// All completed operations were reads. After an exact unentered local refusal has been
+    /// released, return the original paired proof so the same reserve can retry admission.
+    pub fn abort_no_effect(mut self) -> Result<VerifiedPairedWalSnapshot, Self> {
+        if self.pending.is_some() || self.failure.is_some() { return Err(self); }
+        Ok(self.proof.take().expect("recheck retains paired proof"))
+    }
+
     /// # Safety
     /// Every completed read must have been the exact reserve read returned by the native
     /// provider after terminal completion and ACK, while the same exclusive lease was held.
