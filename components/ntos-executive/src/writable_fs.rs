@@ -715,13 +715,18 @@ unsafe fn install_writable_fs(mut fs: nt_fs::FileSystem, restored: bool) -> Resu
     Ok(())
 }
 
+enum SnapshotCommitFailure {
+    Unentered(u32),
+    Entered(u32),
+}
+
 unsafe fn checkpoint_volume_snapshot(
     dev: &mut snapshot_storage::Lease,
     wal_manifest: Option<nt_fs::WalSnapshotManifest>,
     captured_image: Option<&[u8]>,
-) -> Result<(u64, usize), u32> {
+) -> Result<(u64, usize), SnapshotCommitFailure> {
     let Some(fs) = (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).as_ref() else {
-        return Err(nt_fs::STATUS_INVALID_HANDLE);
+        return Err(SnapshotCommitFailure::Unentered(nt_fs::STATUS_INVALID_HANDLE));
     };
     let store = dev.store();
     print_str(b"[writable-fs-snapshot] dirty commit begin nodes=");
@@ -733,9 +738,17 @@ unsafe fn checkpoint_volume_snapshot(
     print_str(b"\n");
     let result = match wal_manifest {
         Some(manifest) => {
-            let image = captured_image.ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
-            store.commit_next_with_wal_manifest(dev, image, manifest)
-                .map(|generation| (generation, image.len()))
+            let image = captured_image.ok_or(SnapshotCommitFailure::Unentered(
+                nt_fs::STATUS_INVALID_DEVICE_REQUEST,
+            ))?;
+            // The captured payload is already durable. The synchronous cursor's scratch must
+            // also survive the caller's nearly full transient syscall scope. Construct it before
+            // the first physical request so an allocation refusal can return the exact authority.
+            let _durable = crate::allocator::enter_durable();
+            let commit = nt_fs::AsyncSnapshotCommit::new(
+                store, image, manifest, dev.sector_size(), dev.sector_count(),
+            ).map_err(|error| SnapshotCommitFailure::Unentered(snapshot_store_error_status(error)))?;
+            commit.run_sync(dev).map(|generation| (generation, image.len()))
         }
         None => fs.commit_volume_snapshot(&store, dev),
     };
@@ -745,7 +758,7 @@ unsafe fn checkpoint_volume_snapshot(
             print_str(b"[writable-fs-snapshot] commit failed err=");
             print_snapshot_store_error(err);
             print_str(b"\n");
-            Err(snapshot_store_error_status(err))
+            Err(SnapshotCommitFailure::Entered(snapshot_store_error_status(err)))
         }
     }
 }
@@ -897,7 +910,11 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
             print_str(b"\n");
             Ok(true)
         }
-        Err(status) => {
+        Err(SnapshotCommitFailure::Unentered(status)) => {
+            WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+            Err(restore_unwritten_checkpoint_authority(dev, authority, status))
+        }
+        Err(SnapshotCommitFailure::Entered(status)) => {
             WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
             WRITABLE_FS_SNAPSHOT_FAILURES.fetch_add(1, Ordering::Relaxed);
             // Either snapshot format can have changed a slot before reporting failure.

@@ -586,14 +586,14 @@ impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
         })? {
             match request.kind {
                 AsyncSnapshotIoKind::Read => {
-                    let mut bytes = Vec::new();
-                    bytes
-                        .try_reserve_exact(request.bytes)
-                        .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
+                    // `new` reserved one full batch before any I/O. Reads and writes never
+                    // overlap, so reuse that buffer rather than allocating after Preflush.
+                    let mut bytes = core::mem::take(&mut self.write_buffer);
                     bytes.resize(request.bytes, 0);
                     dev.read_sectors(request.lba, &mut bytes)?;
                     self.complete_read(request, &bytes)
                         .map_err(|_| SnapshotBlockStoreError::Corrupt)?;
+                    self.write_buffer = bytes;
                 }
                 AsyncSnapshotIoKind::Write => {
                     dev.write_sectors(
