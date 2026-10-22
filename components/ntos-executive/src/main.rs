@@ -174,6 +174,7 @@ mod hard_error;
 mod hosted_pci_topology;
 mod hosted_interrupt_authority;
 mod hosted_pnp_context;
+mod boot_storage_dma_handoff;
 mod power_manager;
 pub(crate) use hosted_pci_topology::*;
 pub(crate) use hosted_interrupt_authority::*;
@@ -13390,6 +13391,19 @@ unsafe fn grant_hosted_pci_devnode_resources(
     context_lease: nt_pnp_context::ContextLeaseIdentity,
     filtered_resource_requirements: alloc::vec::Vec<u8>,
 ) -> Result<Option<HostedDevnodeGrant>, nt_status::NtStatus> {
+    match boot_storage_dma_handoff::admit_hosted_pci_controller_grant(
+        context_lease,
+        &bus_resources.device,
+        &window,
+    ) {
+        boot_storage_dma_handoff::ControllerGrantAdmission::Current => {}
+        boot_storage_dma_handoff::ControllerGrantAdmission::Pending => {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+        boot_storage_dma_handoff::ControllerGrantAdmission::Blocked(status) => {
+            return Err(status);
+        }
+    }
     let interrupt_claim = if bus_resources.device.irq_pin != 0 {
         Some(
             hosted_pci_topology::acquire_hosted_pci_interrupt_route(&bus_resources.device)
@@ -20773,6 +20787,30 @@ unsafe fn map_generation_owned_pci_dma_iommu(
     Ok(())
 }
 
+unsafe fn map_boot_storage_pci_dma_iommu(
+    owner: &mut HostedPnpContextOwner,
+    io_space_cap: u64,
+    grant: HostedPciDmaGrant,
+) -> Result<(), nt_status::NtStatus> {
+    for page in 0..grant.pages {
+        let (frame_io, copy_error) = copy_cap_r(grant.frame_base + page);
+        if copy_error != 0 {
+            return Err(nt_status::NtStatus::UNSUCCESSFUL);
+        }
+        owner.adopt_alias_cap(frame_io, false);
+        let map_error = map_io(frame_io, io_space_cap, 0x3, grant.logical + page * 0x1000);
+        if map_error != 0 {
+            print_str(b"[pci-dma-iommu] boot-domain frame map failed page=");
+            print_u64(page);
+            print_str(b" error=");
+            print_u64(map_error);
+            print_str(b"\n");
+            return Err(nt_status::NtStatus::UNSUCCESSFUL);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) unsafe fn request_hosted_pnp_pci_dma_window(
     context_lease: nt_pnp_context::ContextLeaseIdentity,
     bus: u8,
@@ -20795,6 +20833,11 @@ pub(crate) unsafe fn request_hosted_pnp_pci_dma_window(
     }
 
     let mut owner = HostedPnpContextOwner::new();
+    let boot_controller = boot_storage_dma_handoff::is_boot_storage_controller(&device);
+    if boot_storage_dma_handoff::is_boot_storage_bdf(&device) && !boot_controller {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let mut boot_window = None;
     let build = (|| {
         let pages = HOSTED_PCI_DMA_WINDOW_PAGES;
         let bytes = pages
@@ -20828,9 +20871,28 @@ pub(crate) unsafe fn request_hosted_pnp_pci_dma_window(
             owner.adopt_root_frame(frame, false);
             page += 1;
         }
-        let grant =
-            HostedPciDmaGrant::new(frame_base, pages, HOSTED_PCI_DMA_WINDOW_IOVA);
-        map_generation_owned_pci_dma_iommu(&mut owner, &device, grant)?;
+        let logical = if boot_controller {
+            boot_storage_dma_handoff::HOSTED_BOOT_AHCI_IOVA
+        } else {
+            HOSTED_PCI_DMA_WINDOW_IOVA
+        };
+        let grant = HostedPciDmaGrant::new(frame_base, pages, logical);
+        if boot_controller {
+            let (io_space_cap, id) = boot_storage_dma_handoff::reserve_hosted_boot_dma_window(
+                context_lease, &device, pages,
+            )?;
+            boot_window = Some(id);
+            if !owner.reserve_alias_caps(pages_usize) {
+                boot_storage_dma_handoff::cancel_prepared_hosted_boot_dma_window(id);
+                boot_window = None;
+                return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+            }
+            boot_storage_dma_handoff::begin_hosted_boot_dma_map(id)
+                .expect("reserved boot AHCI DMA window lost");
+            map_boot_storage_pci_dma_iommu(&mut owner, io_space_cap, grant)?;
+        } else {
+            map_generation_owned_pci_dma_iommu(&mut owner, &device, grant)?;
+        }
         let va = reserve_hosted_pnp_component_span(&mut owner, bytes)
             .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
         let seed_va = reserve_hosted_pnp_root_seed_span(&mut owner, bytes)
@@ -20843,18 +20905,38 @@ pub(crate) unsafe fn request_hosted_pnp_pci_dma_window(
             pages,
             va,
             seed_va,
-            logical: HOSTED_PCI_DMA_WINDOW_IOVA,
+            logical,
             len: HOSTED_PCI_DMA_WINDOW_LEN,
         })
     })();
     let dma = match build {
         Ok(dma) => dma,
         Err(status) => {
-            retire_hosted_pnp_context_owner(owner)?;
+            if let Some(id) = boot_window {
+                boot_storage_dma_handoff::quarantine_hosted_boot_dma_map(id, owner);
+            } else {
+                retire_hosted_pnp_context_owner(owner)?;
+            }
             return Err(status);
         }
     };
-    commit_hosted_pnp_pci_dma_window(context_lease, bus, dev, func, dma, owner)
+    let result = commit_hosted_pnp_pci_dma_window(
+        context_lease, bus, dev, func, dma, owner, boot_controller,
+    );
+    if let Some(id) = boot_window {
+        match result {
+            Ok(window) => {
+                boot_storage_dma_handoff::confirm_hosted_boot_dma_map(id)?;
+                Ok(window)
+            }
+            Err(status) => {
+                boot_storage_dma_handoff::quarantine_hosted_boot_dma_phase(id);
+                Err(status)
+            }
+        }
+    } else {
+        result
+    }
 }
 
 fn hosted_pci_resource_bar_eligible(device: &nt_pnp::PciDevice) -> bool {
@@ -29148,30 +29230,31 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // The AHCI can then DMA to AHCI_IOVA only — VT-d faults anything else.
             let ahci_rid =
                 ((storage_bus as u64) << 8) | ((storage_dev as u64) << 3) | (storage_func as u64);
-            let ahci_io_badge = (2u64 << 16) | ahci_rid; // storage proof domain
+            let ahci_io_badge = (boot_storage_dma_handoff::BOOT_DOMAIN << 16) | ahci_rid;
             let ahci_io_space = alloc_slot();
-            let _ = syscall5(
-                SYS_SEND,
+            let io_space_mint_error = cnode_mint_r(
                 CAP_INIT_THREAD_CNODE,
-                LBL_CNODE_MINT << 12,
                 ahci_io_space,
                 SLOT_IO_SPACE,
                 ahci_io_badge,
             );
             let mut iopt_err = 0u64;
-            for _ in 0..4 {
+            let mut ahci_iopts = [0u64; 4];
+            for iopt_slot in &mut ahci_iopts {
                 let iopt = alloc_slot();
-                let _ = untyped_retype(
+                *iopt_slot = iopt;
+                let retype_error = untyped_retype(
                     CAP_INIT_UNTYPED,
                     OBJ_X86_IO_PAGE_TABLE,
                     PAGING_BITS,
                     1,
                     iopt,
                 );
-                let e = iopt_map(iopt, ahci_io_space, AHCI_IOVA);
-                if e != 0 {
-                    iopt_err = e;
+                if retype_error != 0 || io_space_mint_error != 0 || iopt_err != 0 {
+                    iopt_err = if retype_error != 0 { retype_error } else { 1 };
+                    continue;
                 }
+                iopt_err = iopt_map(iopt, ahci_io_space, AHCI_IOVA);
             }
             print_str(b"[ntos-exec] AHCI IO page-table build err=");
             print_u64(iopt_err);
@@ -29182,11 +29265,28 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 &mut passed,
             );
             let dma_frame_io = copy_cap(dma_frame);
-            let map_err = map_io(dma_frame_io, ahci_io_space, 0x3, AHCI_IOVA);
+            let map_err = if iopt_err == 0 && io_space_mint_error == 0 {
+                map_io(dma_frame_io, ahci_io_space, 0x3, AHCI_IOVA)
+            } else {
+                1
+            };
             print_str(b"[ntos-exec] AHCI map_io err=");
             print_u64(map_err);
             print_str(b"\n");
             check(b"exec_ahci_dma_frame_io_mapped", map_err == 0, &mut passed);
+            let boot_dma_ready = boot_storage_dma_handoff::install_boot_storage_dma_authority(
+                storage_bus,
+                storage_dev,
+                storage_func,
+                ahci_bar,
+                ahci_frame,
+                ahci_io_space,
+                ahci_iopts,
+                dma_frame,
+                dma_frame_io,
+                io_space_mint_error == 0 && iopt_err == 0 && map_err == 0,
+            );
+            check(b"exec_ahci_dma_authority_recorded", boot_dma_ready, &mut passed);
             // Shared storage run: page 0 carries AHCI IOVA + verdict/size metadata + imports.bin;
             // the remaining pages carry the generated SYSTEM.DAT hive.
             let shared_start = alloc_frame_run(STORAGE_SHARED_FRAMES);

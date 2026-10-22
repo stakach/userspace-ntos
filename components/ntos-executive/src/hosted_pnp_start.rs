@@ -177,6 +177,7 @@ pub(crate) struct OwnedHostedPnpStartBatch {
     pending_device_id: u64,
     pending_filter_admission: Option<PendingHostedFilterAdmission>,
     pending_filter: Option<PendingHostedPnpFilter>,
+    pending_grant_admission: Option<PendingHostedGrantAdmission>,
     pending_relations: Option<driver_launch::HostedPnpRelationRefresh>,
     pending_bus_relation_devnode: Option<usize>,
     bootstrap_required_bus_pdos: Vec<usize>,
@@ -210,6 +211,16 @@ struct PendingHostedFilterAdmission {
     devnode_index: usize,
     device_id: u64,
     resource_plan: PreparedHostedResourcePlan,
+}
+
+/// FILTER is terminal, but the accepted controller is not yet available for a physical grant.
+/// Keep the same FDO and checked requirements until the controller owner admits START.
+struct PendingHostedGrantAdmission {
+    devnode_index: usize,
+    device_id: u64,
+    resource_plan: PreparedHostedResourcePlan,
+    filtered_requirements: Vec<u8>,
+    blocked_status: Option<nt_status::NtStatus>,
 }
 
 impl OwnedHostedPnpStartBatch {
@@ -247,6 +258,7 @@ impl OwnedHostedPnpStartBatch {
             pending_device_id: 0,
             pending_filter_admission: None,
             pending_filter: None,
+            pending_grant_admission: None,
             pending_relations: None,
             pending_bus_relation_devnode: None,
             bootstrap_required_bus_pdos: Vec::new(),
@@ -297,6 +309,7 @@ impl OwnedHostedPnpStartBatch {
                 && [
                     self.pending_filter.as_ref().map(|pending| (pending.devnode_index, pending.device_id)),
                     self.pending_filter_admission.as_ref().map(|pending| (pending.devnode_index, pending.device_id)),
+                    self.pending_grant_admission.as_ref().map(|pending| (pending.devnode_index, pending.device_id)),
                 ].into_iter().flatten().all(|(pending_index, device_id)| {
                     pending_index != index
                         || driver_launch::hosted_function_device_id_for_instance(
@@ -404,6 +417,7 @@ impl OwnedHostedPnpStartBatch {
 
     pub(crate) fn needs_completion_redrive(&self) -> bool {
         self.pending_filter_admission.is_some()
+            || self.pending_grant_admission.as_ref().is_some_and(|pending| pending.blocked_status.is_none())
             || self.pending_filter
             .as_ref()
             .is_some_and(|pending| pending.ownership_lost.is_none())
@@ -464,6 +478,34 @@ impl OwnedHostedPnpStartBatch {
                     resource_plan,
                 });
                 return Some(OwnedHostedPnpStartProgress::AwaitingCompletion);
+            }
+            HostedPnpDevnodeProgress::GrantAdmissionPending {
+                device_id, resource_plan, filtered_requirements,
+            } => {
+                assert!(self.pending_grant_admission.is_none());
+                self.pending_grant_admission = Some(PendingHostedGrantAdmission {
+                    devnode_index,
+                    device_id,
+                    resource_plan,
+                    filtered_requirements,
+                    blocked_status: None,
+                });
+                return Some(OwnedHostedPnpStartProgress::AwaitingCompletion);
+            }
+            HostedPnpDevnodeProgress::GrantAdmissionBlocked {
+                device_id, resource_plan, filtered_requirements, status,
+            } => {
+                assert!(self.pending_grant_admission.is_none());
+                self.pending_grant_admission = Some(PendingHostedGrantAdmission {
+                    devnode_index,
+                    device_id,
+                    resource_plan,
+                    filtered_requirements,
+                    blocked_status: Some(status),
+                });
+                return Some(OwnedHostedPnpStartProgress::OwnershipLost(
+                    HostedPnpStartBatchFailure { status, teardown_blocked: true },
+                ));
             }
             HostedPnpDevnodeProgress::FilterPending {
                 device_id,
@@ -568,6 +610,8 @@ impl OwnedHostedPnpStartBatch {
             | HostedPnpDevnodeProgress::FilterAdmissionPending { .. }
             | HostedPnpDevnodeProgress::FilterPending { .. }
             | HostedPnpDevnodeProgress::FilterOwnershipLost { .. }
+            | HostedPnpDevnodeProgress::GrantAdmissionPending { .. }
+            | HostedPnpDevnodeProgress::GrantAdmissionBlocked { .. }
             | HostedPnpDevnodeProgress::ResourceAdmissionPending => unreachable!(),
         }
     }
@@ -603,6 +647,28 @@ impl OwnedHostedPnpStartBatch {
                 let progress = filter_attached_devnode(
                     pending.device_id,
                     pending.resource_plan,
+                    &self.spec.service_name,
+                    &devnode.instance_id,
+                    self.options,
+                    &mut self.report,
+                );
+                if let Some(outcome) = self.apply_devnode_progress(devnode_index, progress) {
+                    return outcome;
+                }
+                continue;
+            }
+            if let Some(status) = self.pending_grant_admission.as_ref().and_then(|pending| pending.blocked_status) {
+                return OwnedHostedPnpStartProgress::OwnershipLost(
+                    HostedPnpStartBatchFailure { status, teardown_blocked: true },
+                );
+            }
+            if let Some(pending) = self.pending_grant_admission.take() {
+                let devnode_index = pending.devnode_index;
+                let devnode = &self.spec.devnodes[devnode_index];
+                let progress = start_filtered_devnode(
+                    pending.device_id,
+                    pending.resource_plan,
+                    pending.filtered_requirements,
                     &self.spec.service_name,
                     &devnode.instance_id,
                     self.options,
@@ -1372,6 +1438,20 @@ pub(crate) enum PreparedHostedResourcePlan {
 }
 
 impl PreparedHostedResourcePlan {
+    fn grant_admission(&self) -> crate::boot_storage_dma_handoff::ControllerGrantAdmission {
+        match self {
+            Self::Pci { bus_resources, window, lease, .. } => {
+                crate::boot_storage_dma_handoff::admit_hosted_pci_controller_grant(
+                    lease.identity(), &bus_resources.device, window,
+                )
+            }
+            Self::BusReportedBusNumber { .. } | Self::BusOwnedRoot { .. }
+            | Self::PciNoResources { .. } | Self::Platform { .. }
+            | Self::AcpiChild { .. } | Self::AcpiChildNoResources { .. }
+            | Self::None => crate::boot_storage_dma_handoff::ControllerGrantAdmission::Current,
+        }
+    }
+
     fn native_property_blobs(&self) -> (Option<&[u8]>, Option<&[u8]>) {
         match self {
             Self::BusReportedBusNumber { resources } => (Some(&resources.raw_resources), None),
@@ -1798,6 +1878,17 @@ enum HostedPnpDevnodeProgress {
     FilterAdmissionPending {
         device_id: u64,
         resource_plan: PreparedHostedResourcePlan,
+    },
+    GrantAdmissionPending {
+        device_id: u64,
+        resource_plan: PreparedHostedResourcePlan,
+        filtered_requirements: Vec<u8>,
+    },
+    GrantAdmissionBlocked {
+        device_id: u64,
+        resource_plan: PreparedHostedResourcePlan,
+        filtered_requirements: Vec<u8>,
+        status: nt_status::NtStatus,
     },
     Terminal {
         device_id: u64,
@@ -2330,6 +2421,24 @@ unsafe fn start_filtered_devnode(
     options: HostedPnpStartOptions,
     report: &mut HostedPnpStartReport,
 ) -> HostedPnpDevnodeProgress {
+    match resource_plan.grant_admission() {
+        crate::boot_storage_dma_handoff::ControllerGrantAdmission::Current => {}
+        crate::boot_storage_dma_handoff::ControllerGrantAdmission::Pending => {
+            return HostedPnpDevnodeProgress::GrantAdmissionPending {
+                device_id,
+                resource_plan,
+                filtered_requirements: filtered_resource_requirements,
+            };
+        }
+        crate::boot_storage_dma_handoff::ControllerGrantAdmission::Blocked(status) => {
+            return HostedPnpDevnodeProgress::GrantAdmissionBlocked {
+                device_id,
+                resource_plan,
+                filtered_requirements: filtered_resource_requirements,
+                status,
+            };
+        }
+    }
     let start_status = match grant_prepared_hosted_devnode_resources(
         device_id,
         resource_plan,

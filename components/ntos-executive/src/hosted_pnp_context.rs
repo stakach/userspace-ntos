@@ -748,6 +748,7 @@ pub(crate) unsafe fn commit_hosted_pnp_pci_dma_window(
     func: u8,
     dma: HostedPciDmaWindow,
     staged_owner: HostedPnpContextOwner,
+    boot_controller: bool,
 ) -> Result<HostedPnpPciResourceDescriptor, nt_status::NtStatus> {
     let mut staged_owner = Some(staged_owner);
     let access = hosted_pnp_context_authority_mut()
@@ -784,7 +785,11 @@ pub(crate) unsafe fn commit_hosted_pnp_pci_dma_window(
         Ok(committed) => committed,
         Err(_) => {
             if let Some(owner) = staged_owner {
-                retire_or_retain(owner)?;
+                if boot_controller {
+                    boot_storage_dma_handoff::quarantine_hosted_boot_dma_owner(owner);
+                } else {
+                    retire_or_retain(owner)?;
+                }
             }
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
@@ -793,7 +798,11 @@ pub(crate) unsafe fn commit_hosted_pnp_pci_dma_window(
         Ok(window) => Ok(window),
         Err(status) => {
             if let Some(owner) = staged_owner {
-                retire_or_retain(owner)?;
+                if boot_controller {
+                    boot_storage_dma_handoff::quarantine_hosted_boot_dma_owner(owner);
+                } else {
+                    retire_or_retain(owner)?;
+                }
             }
             Err(status)
         }

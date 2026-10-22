@@ -1,0 +1,215 @@
+//! Boot AHCI VT-d authority shared with a later hosted PCI DMA grant.
+//!
+//! The boot storage host remains the controller operator until a real block route is
+//! published. This owner only admits disjoint DMA memory in the same RID domain.
+
+use crate::*;
+use nt_pnp_context::pci_dma_handoff::{ControllerState, PciController, PciDmaHandoff, WindowId};
+
+const BOOT_GENERATION: u64 = 1;
+pub(crate) const BOOT_DOMAIN: u64 = 2;
+pub(crate) const HOSTED_BOOT_AHCI_IOVA: u64 = AHCI_IOVA + 0x1000;
+
+pub(crate) struct BootStorageDmaAuthority {
+    controller: PciController,
+    abar_phys: u64,
+    abar_frame: u64,
+    io_space_cap: u64,
+    // Retain the complete boot-owned tree and frame aliases for the controller lifetime.
+    _iopt_caps: [u64; 4],
+    _dma_frame: u64,
+    _dma_frame_io: u64,
+    ledger: PciDmaHandoff,
+    ready: bool,
+    native_lease: Option<nt_pnp_context::ContextLeaseIdentity>,
+    native_window: Option<WindowId>,
+    uncertain_owner: Option<HostedPnpContextOwner>,
+}
+
+static mut BOOT_STORAGE_DMA: Option<BootStorageDmaAuthority> = None;
+
+fn authority() -> Option<&'static mut BootStorageDmaAuthority> {
+    // The executive dispatches these admission operations on its single broker thread.
+    unsafe { BOOT_STORAGE_DMA.as_mut() }
+}
+
+pub(crate) fn install_boot_storage_dma_authority(
+    bus: u8,
+    dev: u8,
+    func: u8,
+    abar_phys: u64,
+    abar_frame: u64,
+    io_space_cap: u64,
+    iopt_caps: [u64; 4],
+    dma_frame: u64,
+    dma_frame_io: u64,
+    mapped: bool,
+) -> bool {
+    if authority().is_some() {
+        return false;
+    }
+    let Some(controller) = PciController::new(bus, dev, func, BOOT_GENERATION) else {
+        return false;
+    };
+    let mut ledger = PciDmaHandoff::new();
+    let ready = mapped
+        && ledger
+            .register(controller, io_space_cap, AHCI_IOVA, 1)
+            .is_ok();
+    unsafe {
+        BOOT_STORAGE_DMA = Some(BootStorageDmaAuthority {
+            controller,
+            abar_phys,
+            abar_frame,
+            io_space_cap,
+            _iopt_caps: iopt_caps,
+            _dma_frame: dma_frame,
+            _dma_frame_io: dma_frame_io,
+            ledger,
+            ready,
+            native_lease: None,
+            native_window: None,
+            uncertain_owner: None,
+        });
+    }
+    ready
+}
+
+pub(crate) fn is_boot_storage_controller(device: &nt_pnp::PciDevice) -> bool {
+    authority().is_some_and(|owner| is_same_controller(owner, device))
+}
+
+pub(crate) fn is_boot_storage_bdf(device: &nt_pnp::PciDevice) -> bool {
+    authority().is_some_and(|owner| {
+        owner.controller.bus == device.bus
+            && owner.controller.device == device.dev
+            && owner.controller.function == device.func
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControllerGrantAdmission {
+    Current,
+    Pending,
+    Blocked(nt_status::NtStatus),
+}
+
+/// Check this before any BAR cap is copied into a hosted driver and again at handout.
+/// A native-start transition is recorded only after all direct boot I/O is drained.
+pub(crate) fn admit_hosted_pci_controller_grant(
+    lease: nt_pnp_context::ContextLeaseIdentity,
+    device: &nt_pnp::PciDevice,
+    window: &HostedPnpPciResourceDescriptor,
+) -> ControllerGrantAdmission {
+    let Some(owner) = authority() else {
+        return ControllerGrantAdmission::Current;
+    };
+    if owner.controller.bus != device.bus
+        || owner.controller.device != device.dev
+        || owner.controller.function != device.func
+    {
+        return ControllerGrantAdmission::Current;
+    }
+    if !owner.ready
+        || !is_same_controller(owner, device)
+        || !window.matches(device)
+        || !window
+            .memory_window(5)
+            .is_some_and(|bar| bar.phys == owner.abar_phys && bar.frame_base == owner.abar_frame)
+        || owner.native_lease.is_some_and(|accepted| accepted != lease)
+    {
+        return ControllerGrantAdmission::Blocked(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    owner.native_lease = Some(lease);
+    match owner.ledger.state(owner.controller, owner.io_space_cap) {
+        Ok(ControllerState::NativeStarting) => ControllerGrantAdmission::Current,
+        Ok(ControllerState::BootActive | ControllerState::BootDraining) => {
+            ControllerGrantAdmission::Pending
+        }
+        _ => ControllerGrantAdmission::Blocked(nt_status::NtStatus::DEVICE_BUSY),
+    }
+}
+
+pub(crate) fn reserve_hosted_boot_dma_window(
+    lease: nt_pnp_context::ContextLeaseIdentity,
+    device: &nt_pnp::PciDevice,
+    pages: u64,
+) -> Result<(u64, WindowId), nt_status::NtStatus> {
+    let owner = authority().ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if !owner.ready
+        || !is_same_controller(owner, device)
+        || owner.native_lease.is_some_and(|accepted| accepted != lease)
+        || owner.native_window.is_some()
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let id = owner
+        .ledger
+        .reserve_window(
+            owner.controller,
+            owner.io_space_cap,
+            HOSTED_BOOT_AHCI_IOVA,
+            pages,
+        )
+        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    owner.native_lease = Some(lease);
+    owner.native_window = Some(id);
+    Ok((owner.io_space_cap, id))
+}
+
+fn is_same_controller(owner: &BootStorageDmaAuthority, device: &nt_pnp::PciDevice) -> bool {
+    owner.controller.bus == device.bus
+        && owner.controller.device == device.dev
+        && owner.controller.function == device.func
+        && device.bars.iter().any(|bar| {
+            bar.index == 5 && bar.is_present() && !bar.is_io && bar.base == owner.abar_phys
+        })
+}
+
+pub(crate) fn begin_hosted_boot_dma_map(id: WindowId) -> Result<(), nt_status::NtStatus> {
+    let owner = authority().ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    owner
+        .ledger
+        .begin_map(owner.controller, owner.io_space_cap, id)
+        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+}
+
+pub(crate) fn cancel_prepared_hosted_boot_dma_window(id: WindowId) {
+    let owner = authority().expect("boot AHCI DMA authority lost");
+    owner
+        .ledger
+        .cancel_window(owner.controller, owner.io_space_cap, id)
+        .expect("boot AHCI DMA preparation phase lost");
+    assert_eq!(owner.native_window, Some(id));
+    owner.native_window = None;
+}
+
+pub(crate) fn confirm_hosted_boot_dma_map(id: WindowId) -> Result<(), nt_status::NtStatus> {
+    let owner = authority().ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    owner
+        .ledger
+        .confirm_map(owner.controller, owner.io_space_cap, id)
+        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+}
+
+pub(crate) fn quarantine_hosted_boot_dma_map(id: WindowId, staged: HostedPnpContextOwner) {
+    let owner = authority().expect("boot AHCI DMA authority lost");
+    owner
+        .ledger
+        .quarantine(owner.controller, owner.io_space_cap, id)
+        .expect("boot AHCI DMA mapping phase lost");
+    assert!(owner.uncertain_owner.replace(staged).is_none());
+}
+
+pub(crate) fn quarantine_hosted_boot_dma_owner(staged: HostedPnpContextOwner) {
+    let owner = authority().expect("boot AHCI DMA authority lost");
+    assert!(owner.uncertain_owner.replace(staged).is_none());
+}
+
+pub(crate) fn quarantine_hosted_boot_dma_phase(id: WindowId) {
+    let owner = authority().expect("boot AHCI DMA authority lost");
+    owner
+        .ledger
+        .quarantine(owner.controller, owner.io_space_cap, id)
+        .expect("boot AHCI DMA mapping phase lost");
+}
