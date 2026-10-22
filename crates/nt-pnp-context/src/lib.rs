@@ -8,6 +8,7 @@
 
 extern crate alloc;
 
+pub mod pci_dma_handoff;
 pub mod resource_mapping;
 
 use alloc::vec::Vec;
