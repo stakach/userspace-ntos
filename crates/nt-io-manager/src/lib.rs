@@ -82,6 +82,7 @@ pub mod video_monitor_array_projection;
 pub mod hosted_kernel_read_delivery;
 pub mod inline_file_retirement;
 mod irp;
+pub mod internal_block_io;
 pub mod kernel_irp_builder;
 pub mod io_create_file;
 pub mod io_create_file_capture;
