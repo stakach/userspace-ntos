@@ -102,6 +102,7 @@ pub enum Error {
 /// dropping a request owner, including after an uncertain effect, cannot authorize a new one.
 pub struct NativeStorageAdmissions {
     controllers: Vec<PciController>,
+    candidates: Vec<StorageHandoffKey>,
 }
 
 impl Default for NativeStorageAdmissions {
@@ -114,10 +115,28 @@ impl NativeStorageAdmissions {
     pub const fn new() -> Self {
         Self {
             controllers: Vec::new(),
+            candidates: Vec::new(),
         }
     }
 
-    fn claim(&mut self, controller: PciController) -> Result<(), Error> {
+    fn register_candidate(&mut self, key: StorageHandoffKey) -> Result<(), Error> {
+        self.available(key.controller)?;
+        // A later relation generation cannot replay a still-entered request against the same
+        // canonical PDO. Distinct LUN PDOs on this controller may be proved independently.
+        if self.candidates.iter().any(|candidate| {
+            candidate.controller.bus == key.controller.bus
+                && candidate.controller.device == key.controller.device
+                && candidate.controller.function == key.controller.function
+                && candidate.pdo.device == key.pdo.device
+        }) {
+            return Err(Error::ControllerClaimed);
+        }
+        self.candidates.try_reserve(1).map_err(|_| Error::InsufficientResources)?;
+        self.candidates.push(key);
+        Ok(())
+    }
+
+    fn available(&self, controller: PciController) -> Result<(), Error> {
         if self.controllers.iter().any(|existing| {
             existing.bus == controller.bus
                 && existing.device == controller.device
@@ -125,6 +144,11 @@ impl NativeStorageAdmissions {
         }) {
             return Err(Error::ControllerClaimed);
         }
+        Ok(())
+    }
+
+    fn claim(&mut self, controller: PciController) -> Result<(), Error> {
+        self.available(controller)?;
         self.controllers
             .try_reserve(1)
             .map_err(|_| Error::InsufficientResources)?;
@@ -167,7 +191,9 @@ impl NativeStorageHandoff {
             return Err(Error::InvalidIdentity);
         }
         Self::check_dma_starting(dma, key)?;
-        admissions.claim(key.controller)?;
+        // Several native LUNs may share this controller. Each candidate is single-use even
+        // after a refused or uncertain probe; only the proven mount commit claims the controller.
+        admissions.register_candidate(key)?;
         Ok(Self {
             key,
             expected,
@@ -316,6 +342,7 @@ impl NativeStorageHandoff {
     /// Reserve the single transition of both FAT and snapshot storage under the same mount.
     pub fn enter_mount_commit(
         &mut self,
+        admissions: &mut NativeStorageAdmissions,
         dma: &PciDmaHandoff,
         key: StorageHandoffKey,
     ) -> Result<MountCommit, Error> {
@@ -325,7 +352,9 @@ impl NativeStorageHandoff {
             return Err(Error::WrongPhase);
         }
         let ticket = self.next_ticket;
-        self.next_ticket = ticket.checked_add(1).ok_or(Error::IdExhausted)?;
+        let next_ticket = ticket.checked_add(1).ok_or(Error::IdExhausted)?;
+        admissions.claim(key.controller)?;
+        self.next_ticket = next_ticket;
         let commit = MountCommit { key, ticket };
         self.mount_commit = Some(commit);
         self.phase = HandoffPhase::MountCommitEntered;
@@ -456,7 +485,7 @@ mod tests {
         let capacity = handoff.enter_srb(&dma, key).unwrap();
         assert_eq!(capacity.step, ProofStep::Capacity);
         assert_eq!(
-            handoff.enter_mount_commit(&dma, key),
+            handoff.enter_mount_commit(&mut admissions, &dma, key),
             Err(Error::WrongPhase)
         );
         handoff
@@ -475,7 +504,7 @@ mod tests {
         handoff
             .complete_sector(volume, &expected.volume_sector)
             .unwrap();
-        let commit = handoff.enter_mount_commit(&dma, key).unwrap();
+        let commit = handoff.enter_mount_commit(&mut admissions, &dma, key).unwrap();
         assert_eq!(
             handoff.mark_relation_published(&dma, key),
             Err(Error::WrongPhase)
@@ -483,6 +512,33 @@ mod tests {
         handoff.complete_mount_commit(&mut dma, commit).unwrap();
         handoff.mark_relation_published(&dma, key).unwrap();
         assert_eq!(handoff.phase(), HandoffPhase::RelationPublished);
+    }
+
+    #[test]
+    fn nonmatching_lun_does_not_claim_the_controller_mount() {
+        let (mut dma, key, expected) = fixture();
+        native_start(&mut dma, key);
+        let mut admissions = NativeStorageAdmissions::new();
+        let mut other = key;
+        other.pdo.device += 1;
+        other.pdo.raw_pointer += 0x100;
+        let mut candidate = NativeStorageHandoff::new(&mut admissions, &dma, other, expected.clone()).unwrap();
+        let capacity = candidate.enter_srb(&dma, other).unwrap();
+        assert_eq!(candidate.complete_capacity(capacity, 512, expected.sector_count - 1),
+            Err(Error::GeometryMismatch));
+        let mut matching = NativeStorageHandoff::new(&mut admissions, &dma, key, expected.clone()).unwrap();
+        let capacity = matching.enter_srb(&dma, key).unwrap();
+        matching.complete_capacity(capacity, 512, expected.sector_count).unwrap();
+        let first = matching.enter_srb(&dma, key).unwrap();
+        matching.complete_sector(first, &expected.sector_zero).unwrap();
+        let second = matching.enter_srb(&dma, key).unwrap();
+        matching.complete_sector(second, &expected.volume_sector).unwrap();
+        matching.enter_mount_commit(&mut admissions, &dma, key).unwrap();
+        let mut third = key;
+        third.pdo.device += 2;
+        third.pdo.raw_pointer += 0x200;
+        assert!(matches!(NativeStorageHandoff::new(&mut admissions, &dma, third, expected),
+            Err(Error::ControllerClaimed)));
     }
 
     #[test]
@@ -535,10 +591,8 @@ mod tests {
             handoff.enter_srb(&dma, key).unwrap().step,
             ProofStep::SectorZero
         );
-        assert!(matches!(
-            NativeStorageHandoff::new(&mut admissions, &dma, key, expected.clone()),
-            Err(Error::ControllerClaimed)
-        ));
+        assert!(matches!(NativeStorageHandoff::new(&mut admissions, &dma, key, expected.clone()),
+            Err(Error::ControllerClaimed)));
         let (mut dma, key, expected) = fixture();
         native_start(&mut dma, key);
         let mut admissions = NativeStorageAdmissions::new();
@@ -554,7 +608,7 @@ mod tests {
         second
             .complete_sector(volume, &expected.volume_sector)
             .unwrap();
-        let commit = second.enter_mount_commit(&dma, key).unwrap();
+        let commit = second.enter_mount_commit(&mut admissions, &dma, key).unwrap();
         second.lose_mount_commit(commit).unwrap();
         assert_eq!(second.phase(), HandoffPhase::Uncertain);
         let mut wrong = commit;
