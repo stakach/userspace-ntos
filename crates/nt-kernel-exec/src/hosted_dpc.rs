@@ -64,6 +64,29 @@ pub enum HostedDpcQueueResult {
     AlreadyQueued(HostedDpcIdentity),
 }
 
+/// WDK `KDPC_IMPORTANCE`. ReactOS places High at the head of the normal DPC list;
+/// the other three values join its tail in insertion order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum HostedDpcImportance {
+    Low = 0,
+    Medium = 1,
+    High = 2,
+    MediumHigh = 3,
+}
+
+impl HostedDpcImportance {
+    pub const fn from_raw(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Low),
+            1 => Some(Self::Medium),
+            2 => Some(Self::High),
+            3 => Some(Self::MediumHigh),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostedDpcSnapshot {
     pub identity: HostedDpcIdentity,
@@ -87,6 +110,7 @@ pub enum HostedDpcError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HostedDpcQueued {
     sequence: u64,
+    importance: HostedDpcImportance,
     argument1: u64,
     argument2: u64,
 }
@@ -97,7 +121,7 @@ struct HostedDpcRecord {
     routine: u64,
     deferred_context: u64,
     queued: Option<HostedDpcQueued>,
-    in_flight: Option<u64>,
+    in_flight: Option<HostedDpcQueued>,
 }
 
 pub struct HostedDpcTable {
@@ -211,6 +235,16 @@ impl HostedDpcTable {
         argument1: u64,
         argument2: u64,
     ) -> Result<HostedDpcQueueResult, HostedDpcError> {
+        self.queue_with_importance(identity, argument1, argument2, HostedDpcImportance::Medium)
+    }
+
+    pub fn queue_with_importance(
+        &mut self,
+        identity: HostedDpcIdentity,
+        argument1: u64,
+        argument2: u64,
+        importance: HostedDpcImportance,
+    ) -> Result<HostedDpcQueueResult, HostedDpcError> {
         let index = self.record_index(identity)?;
         if self.records[index].queued.is_some() {
             return Ok(HostedDpcQueueResult::AlreadyQueued(identity));
@@ -221,6 +255,7 @@ impl HostedDpcTable {
             .ok_or(HostedDpcError::SequenceExhausted)?;
         self.records[index].queued = Some(HostedDpcQueued {
             sequence,
+            importance,
             argument1,
             argument2,
         });
@@ -237,8 +272,24 @@ impl HostedDpcTable {
         argument1: u64,
         argument2: u64,
     ) -> Result<HostedDpcQueueResult, HostedDpcError> {
+        self.register_and_queue_with_importance(
+            owner, dpc_token, routine, deferred_context, argument1, argument2,
+            HostedDpcImportance::Medium,
+        )
+    }
+
+    pub fn register_and_queue_with_importance(
+        &mut self,
+        owner: HostedDpcOwner,
+        dpc_token: u64,
+        routine: u64,
+        deferred_context: u64,
+        argument1: u64,
+        argument2: u64,
+        importance: HostedDpcImportance,
+    ) -> Result<HostedDpcQueueResult, HostedDpcError> {
         let identity = self.register(owner, dpc_token, routine, deferred_context)?;
-        self.queue(identity, argument1, argument2)
+        self.queue_with_importance(identity, argument1, argument2, importance)
     }
 
     pub fn remove(&mut self, identity: HostedDpcIdentity) -> Result<bool, HostedDpcError> {
@@ -310,9 +361,16 @@ impl HostedDpcTable {
                     .filter(|_| {
                         record.live && record.identity.owner == owner && record.in_flight.is_none()
                     })
-                    .map(|queued| (index, queued.sequence))
+                    .map(|queued| {
+                        let order = if queued.importance == HostedDpcImportance::High {
+                            (0, u64::MAX - queued.sequence)
+                        } else {
+                            (1, queued.sequence)
+                        };
+                        (index, order)
+                    })
             })
-            .min_by_key(|(_, sequence)| *sequence)
+            .min_by_key(|(_, order)| *order)
             .map(|(index, _)| index)
         else {
             return Ok(None);
@@ -325,7 +383,7 @@ impl HostedDpcTable {
             .queued
             .take()
             .ok_or(HostedDpcError::StaleActivation)?;
-        record.in_flight = Some(queued.sequence);
+        record.in_flight = Some(queued);
         Ok(Some(HostedDpcActivation {
             identity: record.identity,
             sequence: queued.sequence,
@@ -339,7 +397,7 @@ impl HostedDpcTable {
     pub fn complete(&mut self, activation: HostedDpcActivation) -> Result<(), HostedDpcError> {
         let index = self.record_index(activation.identity)?;
         let record = &mut self.records[index];
-        if record.in_flight != Some(activation.sequence) {
+        if record.in_flight.map(|queued| queued.sequence) != Some(activation.sequence) {
             return Err(HostedDpcError::StaleActivation);
         }
         record.in_flight = None;
@@ -349,15 +407,12 @@ impl HostedDpcTable {
     pub fn abort(&mut self, activation: HostedDpcActivation) -> Result<(), HostedDpcError> {
         let index = self.record_index(activation.identity)?;
         let record = &mut self.records[index];
-        if record.in_flight != Some(activation.sequence) || record.queued.is_some() {
+        if record.in_flight.map(|queued| queued.sequence) != Some(activation.sequence)
+            || record.queued.is_some()
+        {
             return Err(HostedDpcError::StaleActivation);
         }
-        record.in_flight = None;
-        record.queued = Some(HostedDpcQueued {
-            sequence: activation.sequence,
-            argument1: activation.system_argument1,
-            argument2: activation.system_argument2,
-        });
+        record.queued = record.in_flight.take();
         Ok(())
     }
 
@@ -584,5 +639,91 @@ mod tests {
         table.queue(replacement, 1, 2).unwrap();
         assert_eq!(table.remove(identity), Err(HostedDpcError::NotRegistered));
         assert_eq!(table.remove_registered(first_owner, 0x1000), Ok(true));
+    }
+
+    #[test]
+    fn high_importance_preempts_at_head_without_crossing_owner_or_generation() {
+        let mut table = HostedDpcTable::new();
+        let lane = owner(7);
+        let normal = table.register(lane, 0x1000, 0x2000, 0).unwrap();
+        let high_older = table.register(lane, 0x1001, 0x2001, 0).unwrap();
+        let high_newer = table.register(lane, 0x1002, 0x2002, 0).unwrap();
+        let other = table.register(owner(9), 0x1000, 0x3000, 0).unwrap();
+        table.queue(normal, 0, 0).unwrap();
+        table.queue(other, 0, 0).unwrap();
+        table
+            .queue_with_importance(high_older, 0, 0, HostedDpcImportance::High)
+            .unwrap();
+        table
+            .queue_with_importance(high_newer, 0, 0, HostedDpcImportance::High)
+            .unwrap();
+        assert_eq!(table.begin_next(lane).unwrap().unwrap().identity, high_newer);
+        assert_eq!(table.begin_next(owner(9)).unwrap().unwrap().identity, other);
+        assert_eq!(table.begin_next(lane).unwrap().unwrap().identity, high_older);
+        assert_eq!(table.begin_next(lane).unwrap().unwrap().identity, normal);
+        assert_eq!(
+            table.queue(high_older, 0, 0),
+            Ok(HostedDpcQueueResult::Queued(high_older))
+        );
+        assert_eq!(table.retire(high_older), Err(HostedDpcError::Busy));
+    }
+
+    #[test]
+    fn importance_is_captured_at_insertion_and_reuse_is_generation_fenced() {
+        let mut table = HostedDpcTable::new();
+        let lane = owner(7);
+        let first = table.register(lane, 0x1000, 0x2000, 0).unwrap();
+        let second = table.register(lane, 0x1001, 0x2001, 0).unwrap();
+        table.queue(first, 0, 0).unwrap();
+        table
+            .queue_with_importance(second, 0, 0, HostedDpcImportance::High)
+            .unwrap();
+        assert_eq!(
+            table.queue_with_importance(second, 1, 2, HostedDpcImportance::Medium),
+            Ok(HostedDpcQueueResult::AlreadyQueued(second))
+        );
+        assert_eq!(table.begin_next(lane).unwrap().unwrap().identity, second);
+        assert!(table.remove(first).unwrap());
+        let replacement = table.register(lane, 0x1000, 0x2002, 0).unwrap();
+        assert_ne!(first.generation, replacement.generation);
+        assert_eq!(
+            table.queue_with_importance(first, 0, 0, HostedDpcImportance::High),
+            Err(HostedDpcError::NotRegistered)
+        );
+        table.queue(replacement, 0, 0).unwrap();
+        assert_eq!(table.begin_next(lane).unwrap().unwrap().identity, replacement);
+    }
+
+    #[test]
+    fn aborted_high_importance_activation_keeps_its_original_order() {
+        let mut table = HostedDpcTable::new();
+        let lane = owner(7);
+        let high = table.register(lane, 0x1000, 0x2000, 0).unwrap();
+        let normal = table.register(lane, 0x1001, 0x2001, 0).unwrap();
+        table
+            .queue_with_importance(high, 4, 5, HostedDpcImportance::High)
+            .unwrap();
+        let activation = table.begin_next(lane).unwrap().unwrap();
+        table.queue(normal, 6, 7).unwrap();
+        table.abort(activation).unwrap();
+        assert_eq!(table.begin_next(lane), Ok(Some(activation)));
+        assert_eq!(table.begin_next(lane).unwrap().unwrap().identity, normal);
+    }
+
+    #[test]
+    fn medium_high_remains_in_tail_order_and_invalid_raw_importance_is_rejected() {
+        let mut table = HostedDpcTable::new();
+        let lane = owner(7);
+        let low = table.register(lane, 0x1000, 0x2000, 0).unwrap();
+        let medium_high = table.register(lane, 0x1001, 0x2001, 0).unwrap();
+        table
+            .queue_with_importance(low, 0, 0, HostedDpcImportance::Low)
+            .unwrap();
+        table
+            .queue_with_importance(medium_high, 0, 0, HostedDpcImportance::MediumHigh)
+            .unwrap();
+        assert_eq!(table.begin_next(lane).unwrap().unwrap().identity, low);
+        assert_eq!(table.begin_next(lane).unwrap().unwrap().identity, medium_high);
+        assert_eq!(HostedDpcImportance::from_raw(4), None);
     }
 }

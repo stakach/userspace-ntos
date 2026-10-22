@@ -104,8 +104,8 @@ pub use event_object::{
     SignalQueueResult,
 };
 pub use hosted_dpc::{
-    HostedDpcActivation, HostedDpcError, HostedDpcIdentity, HostedDpcOwner, HostedDpcQueueResult,
-    HostedDpcSnapshot, HostedDpcTable,
+    HostedDpcActivation, HostedDpcError, HostedDpcIdentity, HostedDpcImportance, HostedDpcOwner,
+    HostedDpcQueueResult, HostedDpcSnapshot, HostedDpcTable,
 };
 pub use interrupt::{
     InterruptConnectError, InterruptConnection, InterruptMode, InterruptScan,
