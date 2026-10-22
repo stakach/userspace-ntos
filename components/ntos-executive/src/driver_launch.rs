@@ -27,6 +27,24 @@ mod hosted_irq_broker;
 pub(crate) mod hosted_bus_interface;
 #[path = "hosted_source_retirement.rs"]
 mod hosted_source_retirement;
+#[path = "hosted_driver_preload.rs"]
+mod hosted_driver_preload;
+pub(crate) use hosted_driver_preload::PreloadReceipt;
+
+pub(crate) unsafe fn boot_driver_preload_receipt_is_current(receipt: PreloadReceipt) -> bool {
+    hosted_driver_preload::receipt_is_current(receipt)
+}
+
+pub(crate) unsafe fn current_boot_driver_preload_receipt() -> Option<PreloadReceipt> {
+    hosted_driver_preload::current_receipt()
+}
+
+pub(crate) unsafe fn stage_registry_boot_driver_sources(
+    fs: &Fat32,
+    generation: u64,
+) -> Option<PreloadReceipt> {
+    hosted_driver_preload::stage_registry_boot_sources(fs, generation)
+}
 #[path = "hosted_dxg_registration.rs"]
 mod hosted_dxg_registration;
 #[path = "hosted_provider_export_lane.rs"]
@@ -39658,7 +39676,7 @@ unsafe fn collect_hosted_dependency_closure(
             return None;
         }
     };
-    let (src_va, src_size) = match load_file_to_pool(fs, &dep_path[..dep_path_len]) {
+    let (src_va, src_size) = match hosted_driver_preload::source_for_launch(fs, &dep_path[..dep_path_len]) {
         Some(loaded) => loaded,
         None => {
             print_str(b"[driver-launch] dependency source missing ");
@@ -39791,7 +39809,7 @@ unsafe fn plan_hosted_images(
         idx += 1;
     }
     let (auxiliary_src_va, auxiliary_src_size) =
-        match load_file_to_pool(fs, HOSTED_AUXILIARY_PE_PATH) {
+        match hosted_driver_preload::source_for_launch(fs, HOSTED_AUXILIARY_PE_PATH) {
             Some(source) => source,
             None => {
                 print_str(b"[driver-launch] OS support PE missing: ");
@@ -40602,8 +40620,8 @@ unsafe fn load_driver_reserved(
     };
 
     // 1. Load the .sys bytes by-path into the executive's pool.
-    let (src_va, src_size) =
-        load_file_to_pool(fs, path).ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    let (src_va, src_size) = hosted_driver_preload::source_for_launch(fs, path)
+        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
     print_str(b"[driver-launch] loaded ");
     print_str(path);
     print_str(b" size=");

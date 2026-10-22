@@ -30005,6 +30005,22 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let system_boot_driver_plan = system_hive_boot_driver_launch_plan(&boot_driver_snapshot);
     let config_pnp_plan = config_hive_boot_system_pnp_driver_launch_plan(&boot_driver_snapshot);
     let config_demand_pnp_plan = config_hive_demand_pnp_driver_launch_plan(&demand_driver_snapshot);
+    // The class stack can be selected after the boot controller begins draining. Keep source
+    // bytes for boot-start services, class filters, and their PE imports in the monotonic pool
+    // while direct installed-volume reads are still admitted. PnP still selects the actual
+    // service from the accepted child's mounted-CM policy at START time.
+    let preload_receipt = {
+        let fs = exec_fs().expect("boot driver preload requires mounted installed volume");
+        driver_launch::stage_registry_boot_driver_sources(&fs, live_cm_mount.generation)
+            .expect("registry-selected boot driver source preload failed")
+    };
+    print_str(b"[driver-preload] services/bytes=");
+    print_u64(preload_receipt.services as u64);
+    print_str(b"/");
+    print_u64(preload_receipt.bytes);
+    print_str(b" generation=");
+    print_u64(live_cm_mount.generation);
+    print_str(b"\n");
     let replyless_device_service_count = system_boot_driver_plan
         .as_slice()
         .iter()

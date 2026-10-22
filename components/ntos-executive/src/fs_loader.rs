@@ -1384,6 +1384,9 @@ pub const POOL_VADDR: u64 = 0x0000_0100_1500_0000;
 pub const POOL_PTS: u64 = 24; // 48 MiB (24 * 2 MiB) — headroom for the whole stack + P5 binaries
 pub(crate) static POOL_NEXT: AtomicU64 = AtomicU64::new(0);
 pub(crate) static POOL_INITED: AtomicU64 = AtomicU64::new(0);
+/// The file pool is bump-only and never resets or frees allocations in this executive lifetime.
+/// If a reset is ever introduced, it must advance this epoch before an address can be reused.
+pub(crate) static POOL_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 /// Reserve the pool's page tables in the executive's VSpace (once). Idempotent.
 pub(crate) unsafe fn pool_init() -> bool {
