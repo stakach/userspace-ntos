@@ -18,6 +18,9 @@ mod bounded_read;
 mod directory;
 mod fat_directory;
 mod fat_directory_walk;
+mod fat_path_lookup;
+mod fat_directory_lookup;
+mod fat_range_lookup;
 mod fat_range_cursor;
 mod fat_sector_cache;
 mod file_backing;
@@ -50,6 +53,9 @@ pub use bounded_read::published_file_size;
 pub use directory::*;
 pub use fat_directory::*;
 pub use fat_directory_walk::*;
+pub use fat_path_lookup::*;
+pub use fat_directory_lookup::*;
+pub use fat_range_lookup::*;
 pub use fat_range_cursor::{FatRangeBatch, FatRangeCursor, FatRangeCursorSet};
 pub use fat_sector_cache::FatSectorCache;
 pub use file_backing::FileBacking;
@@ -85,14 +91,17 @@ pub use path::{
 };
 pub use query::*;
 pub use snapshot_store::{
-    BootSnapshotRecovery, PayloadSectorReader, PayloadSectorWriter, SnapshotBlockDevice, SnapshotBlockStore,
+    AsyncSnapshotCommit, AsyncSnapshotCommitError, AsyncSnapshotHeaderRecheck,
+    AsyncSnapshotIoKind, AsyncSnapshotRequest, AsyncWalSnapshotAnchorUpdate,
+    RecheckedPairedWalSnapshot, BootSnapshotRecovery,
+    PayloadSectorReader, PayloadSectorWriter, SnapshotBlockDevice, SnapshotBlockStore,
     SnapshotBlockStoreError, SnapshotPayloadReader, SnapshotPayloadSink, SnapshotReadFormat,
     StoredSnapshot, StoredSnapshotMetadata, StoredWalSnapshot, WalSnapshotAnchor,
     WalSnapshotAnchorUpdate, WalSnapshotEpochRollover, WalSnapshotManifest, VerifiedPairedWalSnapshot,
 };
 pub use snapshot_reserve::{SnapshotReserve, SnapshotReserveLease};
 pub use snapshot_region::{BoundedBlockRange, OwnedBoundedBlockRange};
-pub use registry_wal_store::{RegistryWal, RegistryWalContinuation, RegistryWalError, RegistryWalRecord, RegistryWalState, RegistryWalVerifiedDevice, RegistryWalVerifiedPrefix};
+pub use registry_wal_store::{AsyncWalIoKind, AsyncWalIoRequest, AsyncWalRefusal, RegistryWal, RegistryWalContinuation, RegistryWalError, RegistryWalRecord, RegistryWalState, RegistryWalVerifiedDevice, RegistryWalVerifiedPrefix};
 pub use volume_wal_payload::{decode_volume_wal_payload, encode_hive_log_wal_payload, HiveLogWalPayload, HiveLogWalReplay, HiveLogWalReplayError, VolumeWalPayload, VolumeWalPayloadError};
 mod snapshot_baseline_repair;
 pub use snapshot_baseline_repair::WalSnapshotBaselineRepair;

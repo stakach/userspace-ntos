@@ -41,6 +41,65 @@ impl<D: SnapshotBlockDevice> Drop for WalSnapshotAnchorUpdate<D> {
 }
 
 impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
+    pub(super) fn encode_async_header(&self, index: usize, out: &mut [u8]) {
+        out.fill(0);
+        encode_header(out, self.headers[index]);
+    }
+
+    pub(super) fn async_header_lba(&self, slot_sectors: u64, slot: u32)
+        -> Result<u64, SnapshotBlockStoreError> {
+        self.store.slot_lba(slot_sectors, slot)
+    }
+
+    pub(super) fn complete_async_headers(&mut self) { self.phase = Phase::Complete; }
+    pub(super) fn fail_async_headers(&mut self) { self.phase = Phase::Uncertain; }
+
+    #[cfg(test)]
+    pub(super) fn device_for_test(&mut self) -> &mut D {
+        self.device.as_mut().expect("retained anchor device")
+    }
+    /// Native admission consumes a header recheck minted under the same exclusive reserve.
+    /// The WAL touched only its disjoint tail while the reserve remained held.
+    pub(super) fn admit_rechecked_wal_pair(
+        store: SnapshotBlockStore,
+        verified: crate::RegistryWalVerifiedDevice<D>,
+        rechecked: super::RecheckedPairedWalSnapshot,
+    ) -> Result<Self, (SnapshotBlockStoreError, crate::RegistryWalVerifiedDevice<D>, super::RecheckedPairedWalSnapshot)> {
+        let (device, prefix, record_end_lbas) = verified.into_parts();
+        let next = prefix.anchor();
+        let checked = (|| {
+            if rechecked.store != store || rechecked.pair.store != store
+                || rechecked.sector_size != device.sector_size()
+                || rechecked.device_sectors != device.sector_count()
+                || rechecked.sector_size < WAL_HEADER_LEN
+            {
+                return Err(SnapshotBlockStoreError::InvalidGeometry);
+            }
+            for plan in rechecked.pair.plans {
+                let current = plan.wal.ok_or(SnapshotBlockStoreError::Corrupt)?.anchor();
+                let exact_end = if current.serial == 0 { Some(0) } else {
+                    usize::try_from(current.serial - 1).ok()
+                        .and_then(|index| record_end_lbas.get(index).copied())
+                };
+                if current.incarnation != next.incarnation
+                    || current.serial > next.serial || exact_end != Some(current.end_lba)
+                {
+                    return Err(SnapshotBlockStoreError::Corrupt);
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = checked {
+            return Err((error,
+                crate::RegistryWalVerifiedDevice::from_parts(device, prefix, record_end_lbas),
+                rechecked));
+        }
+        let pair = rechecked.pair;
+        let mut update = Self::from_plans(store, device, next, pair.plans, None, Some(pair));
+        update.continuation = Some(crate::RegistryWalContinuation::from_parts(
+            prefix, record_end_lbas));
+        Ok(update)
+    }
     /// Admission reads and validates both payloads before any write. Failure returns the
     /// unchanged device; WAL mode must first establish two valid v2 snapshot slots.
     pub fn admit(

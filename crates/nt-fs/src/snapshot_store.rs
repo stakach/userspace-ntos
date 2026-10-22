@@ -16,6 +16,14 @@ pub use payload_writer::PayloadSectorWriter;
 mod async_commit;
 pub use async_commit::{AsyncSnapshotCommit, AsyncSnapshotCommitError, AsyncSnapshotIoKind, AsyncSnapshotRequest};
 
+#[path = "snapshot_async_header_recheck.rs"]
+mod async_header_recheck;
+pub use async_header_recheck::{AsyncSnapshotHeaderRecheck, RecheckedPairedWalSnapshot};
+
+#[path = "snapshot_async_wal_anchor.rs"]
+mod async_wal_anchor;
+pub use async_wal_anchor::AsyncWalSnapshotAnchorUpdate;
+
 #[path = "snapshot_wal_anchor.rs"]
 mod wal_anchor;
 pub use wal_anchor::WalSnapshotAnchorUpdate;
@@ -379,6 +387,8 @@ impl StoredSnapshotMetadata {
 }
 
 impl SnapshotBlockStore {
+    pub fn sector_count(&self) -> u64 { self.sector_count }
+
     pub fn new(start_lba: u64, sector_count: u64) -> Self {
         Self {
             start_lba,
@@ -1249,6 +1259,15 @@ impl SnapshotBlockStore {
             .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
         sector.resize(sector_size, 0);
         dev.read_sector(slot_base, &mut sector)?;
+        Self::slot_plan_from_sector(slot, sector_size, slot_sectors, &sector)
+    }
+
+    fn slot_plan_from_sector(
+        slot: u32,
+        sector_size: usize,
+        slot_sectors: u64,
+        sector: &[u8],
+    ) -> Result<Option<SlotReadPlan>, SnapshotBlockStoreError> {
         let Some(header) = decode_header(&sector)? else {
             return Ok(None);
         };

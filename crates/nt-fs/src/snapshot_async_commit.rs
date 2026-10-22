@@ -516,6 +516,28 @@ impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
         }
     }
 
+    /// A WAL checkpoint starts with a paired, payload-valid reserve. Its scan validates the
+    /// unchanged slot; the exact payload and acknowledged final header/flush prove the new one.
+    /// No post-commit physical read is needed to publish the refreshed in-process pair.
+    pub fn finish_with_paired_proof(self) -> Result<(u64, VerifiedPairedWalSnapshot), Self> {
+        if !self.is_done() || self.failure.is_some() { return Err(self); }
+        let other = 1 - self.target_slot;
+        let ScanResult::Valid(unchanged) = self.scan[other as usize] else { return Err(self); };
+        let Some(payload_sectors) = u32::try_from(
+            self.payload.as_ref().len().div_ceil(self.sector_size)).ok() else { return Err(self); };
+        let published = SlotReadPlan {
+            slot: self.target_slot, generation: self.generation,
+            payload_len: self.payload.as_ref().len(),
+            payload_crc: crc32c(self.payload.as_ref()), payload_sectors,
+            wal: Some(self.manifest), resetting: false,
+        };
+        let plans = if self.target_slot == 0 { [published, unchanged] }
+            else { [unchanged, published] };
+        let Ok(manifest) = SnapshotBlockStore::paired_manifest(plans) else { return Err(self); };
+        let proof = VerifiedPairedWalSnapshot { store: self.store, plans, manifest };
+        Ok((self.generation, proof))
+    }
+
     /// The old synchronous entry point consumes precisely these same requests. Native callers
     /// instead retain this owner and feed authenticated SRB completions from the outer pump.
     pub fn run_sync<D: SnapshotBlockDevice>(

@@ -98,6 +98,21 @@ fn async_commit_preserves_payload_header_barrier_order_and_recovery() {
 }
 
 #[test]
+fn native_checkpoint_mints_paired_proof_from_completed_io_without_postcommit_reads() {
+    let (mut disk, mut commit) = fixture(alloc::vec![0xa5; 1300]);
+    while let Some(request) = commit.enter_next().unwrap() {
+        perform(&mut disk, &mut commit, request);
+    }
+    let reads = disk.read_attempts;
+    let (generation, pair) = commit.finish_with_paired_proof().ok().unwrap();
+    assert_eq!(generation, 3);
+    assert_eq!(disk.read_attempts, reads);
+    assert_eq!(pair.anchor(), baseline().anchor());
+    assert_eq!(SnapshotBlockStore::new(0, 16)
+        .recheck_verified_paired_wal_snapshot(&mut disk, &pair), Ok(pair.manifest()));
+}
+
+#[test]
 fn every_async_read_write_and_flush_keeps_its_exact_ticket_until_completion() {
     for uncertain_step in 0..9 {
         let (mut disk, mut commit) = fixture(alloc::vec![0xa5; 1300]);
