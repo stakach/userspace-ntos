@@ -1039,6 +1039,33 @@ impl DmaManager {
         Ok(())
     }
 
+    /// Release a transfer mapping through the exact adapter that created it. A native
+    /// FreeMapRegisters receipt identifies the logical range, not the manager's private ID.
+    pub fn free_mapping_for_adapter(
+        &mut self,
+        owner: DmaOwner,
+        adapter_id: u64,
+        logical_base: u64,
+        length: u64,
+    ) -> Result<(), DmaError> {
+        self.adapter(adapter_id, owner)?;
+        let mapping = self
+            .mappings
+            .iter_mut()
+            .find(|mapping| {
+                mapping.active && mapping.owner == owner && mapping.logical_base == logical_base
+            })
+            .ok_or(DmaError::StaleId)?;
+        if mapping.adapter_id != adapter_id {
+            return Err(DmaError::WrongOwner);
+        }
+        if mapping.length != length {
+            return Err(DmaError::OutOfRange);
+        }
+        mapping.active = false;
+        Ok(())
+    }
+
     /// Driver-host fault / device remove cleanup (spec §15.3, §17.4): revoke every
     /// common buffer + mapping owned by `owner`. Returns `(buffers, mappings)` revoked.
     pub fn revoke_owner(&mut self, owner: DmaOwner) -> (usize, usize) {
@@ -1381,6 +1408,26 @@ mod tests {
             dma.ensure_mapping_at(owner(), narrow, 0x9000, 0x50_000, 512),
             Err(DmaError::LogicalViolation)
         );
+    }
+
+    #[test]
+    fn transfer_mapping_free_requires_exact_adapter_before_put() {
+        let mut dma = DmaManager::new();
+        let wide = dma.register_adapter(owner(), true, 4096, true);
+        let narrow = dma.register_adapter(owner(), true, 4096, false);
+        dma.ensure_mapping_at(owner(), narrow, 0x9000, 0x50_000, 512)
+            .unwrap();
+
+        assert_eq!(
+            dma.free_mapping_for_adapter(owner(), wide, 0x9000, 512),
+            Err(DmaError::WrongOwner)
+        );
+        assert_eq!(dma.put_adapter_for_owner(owner(), narrow), Err(DmaError::AdapterBusy));
+        assert_eq!(
+            dma.free_mapping_for_adapter(owner(), narrow, 0x9000, 512),
+            Ok(())
+        );
+        assert_eq!(dma.put_adapter_for_owner(owner(), narrow), Ok(()));
     }
 
     #[test]
