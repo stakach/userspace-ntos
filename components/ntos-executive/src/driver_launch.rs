@@ -3015,17 +3015,16 @@ unsafe fn poll_hosted_detached_pnp_completion(
 
 // --- host-side pool allocator (the trampolines run in the component) --------------------------
 
-/// Hard bound on a free-list traversal. The pool has a 16-byte header, so a well-formed
-/// list can never be longer than this; anything past it means the list is CORRUPT (a cycle), and a
-/// cycle must degrade to the bump path rather than spin the whole executive.
+/// Hard bound on a free-list traversal. A well-formed list cannot have more nodes than
+/// 16-byte allocation headers in the arena. Corrupt lists fail closed before any mutation.
 const POOL_FREE_LIST_MAX: u64 = (FSD_POOL_FRAMES * 0x1000) / 16;
 const COMPONENT_POOL_LOCK_OFF: u64 = 0x10;
 const COMPONENT_DEVICE_REPLY_LOCK_OFF: u64 = 0x18;
 const COMPONENT_POOL_GENERATION_OFF: u64 = 0x20;
-/// Double `pool_free` calls the guard below rejected, and free-list cycles `pool_alloc` broke out of.
-/// Both are counter-backed so a regression is a gate failure rather than a silent 555-second hang.
+/// Rejected double frees, invalid free lists, and invalid free pointers are counter-backed so a
+/// regression is a gate failure rather than a silent allocator stall.
 pub(crate) static FSD_POOL_DOUBLE_FREES: AtomicU64 = AtomicU64::new(0);
-pub(crate) static FSD_POOL_LIST_CYCLES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FSD_POOL_LIST_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FSD_POOL_INVALID_FREES: AtomicU64 = AtomicU64::new(0);
 
 struct ComponentPoolLockGuard;
@@ -3086,8 +3085,8 @@ unsafe fn component_device_reply_lock() -> ComponentDeviceReplyLockGuard {
 }
 
 /// A simple free-list allocator: an FSD alloc/frees file objects; a leak-forever bump would exhaust
-/// under FSCTL churn. Header = 16 B ([+0]=capacity, [+8]=next-free). `pool_free` pushes onto the
-/// single free list (head @ [POOL+8]); `pool_alloc` first-fits it before bumping. Counter @ [POOL+0].
+/// under FSCTL churn. Header = 16 B ([+0]=capacity, [+8]=next-free). `pool_free` inserts in
+/// address order (head @ [POOL+8]); `pool_alloc` first-fits it before bumping. Counter @ [POOL+0].
 ///
 /// The first-fit walk is cycle-bounded so allocator metadata damage cannot spin the executive.
 pub(crate) unsafe fn pool_alloc(size: u64) -> u64 {
@@ -3133,50 +3132,24 @@ unsafe fn pool_free_locked(p: u64) -> bool {
         print_hex(p as u32);
         print_str(b"\n");
     }
-    if component_pool_allocation_capacity(p).is_none() {
+    let Some(position) = hosted_pool_free_list_position(FSD_POOL_VADDR, p) else {
         if FSD_POOL_INVALID_FREES.fetch_add(1, Ordering::Relaxed) == 0 {
             print_str(b"[fsd-pool-invalid] component free pointer=");
             print_hex64(p);
             print_str(b"\n");
         }
         return false;
-    }
-    let head_slot = (FSD_POOL_VADDR + 8) as *mut u64;
-    let mut cur = read_volatile(head_slot);
-    let mut steps = 0u64;
-    while cur != 0 && steps < POOL_FREE_LIST_MAX {
-        if component_pool_allocation_capacity(cur).is_none() {
-            return false;
-        }
-        if steps == 4096 && POOL_LONG_WALKS < 8 {
-            POOL_LONG_WALKS += 1;
-            print_str(b"[fsd-pool] LONG free-list walk p=");
+    };
+    if position.is_free {
+        if FSD_POOL_DOUBLE_FREES.fetch_add(1, Ordering::Relaxed) == 0 {
+            print_str(b"[fsd-host] rejected DOUBLE pool_free p=0x");
             print_hex(p as u32);
-            print_str(b" cur=");
-            print_hex(cur as u32);
-            print_str(b"\n");
-        }
-        if cur == p {
-            if FSD_POOL_DOUBLE_FREES.fetch_add(1, Ordering::Relaxed) == 0 {
-                print_str(b"[fsd-host] rejected DOUBLE pool_free p=0x");
-                print_hex(p as u32);
-                print_str(b" (would cycle the free list)\n");
-            }
-            return false;
-        }
-        cur = read_volatile((cur - 8) as *const u64);
-        steps += 1;
-    }
-    if cur != 0 {
-        // Already corrupt (a cycle from before this guard existed) — do not extend it.
-        if FSD_POOL_LIST_CYCLES.fetch_add(1, Ordering::Relaxed) == 0 {
-            print_str(b"[fsd-host] POOL FREE-LIST CYCLE on free -> drop\n");
+            print_str(b" (would cycle the free list)\n");
         }
         return false;
     }
-    let head = read_volatile(head_slot);
-    write_volatile((p - 8) as *mut u64, head);
-    write_volatile(head_slot, p);
+    write_volatile((position.target_view - 8) as *mut u64, position.next);
+    write_volatile(position.previous_next_slot as *mut u64, p);
     true
 }
 
@@ -4014,6 +3987,96 @@ unsafe fn hosted_pool_publish_used(pool_view_base: u64, used: u64) {
     (&*(pool_view_base as *const AtomicU64)).store(used, Ordering::Release);
 }
 
+struct PoolFreeListPosition {
+    target_view: u64,
+    previous_next_slot: u64,
+    next: u64,
+    is_free: bool,
+}
+
+/// Map the two views into pool-relative offsets for the tested, monotonic free-list scan.
+/// Callers hold the shared pool lock throughout the scan and any subsequent mutation.
+unsafe fn hosted_pool_scan(
+    pool_view_base: u64,
+    target: Option<u64>,
+    request: Option<(u64, bool)>,
+) -> Option<nt_io_manager::hosted_pool_range::HostedPoolFreeListScan> {
+    if pool_view_base == 0 {
+        return None;
+    }
+    let published_used = hosted_pool_used(pool_view_base);
+    if published_used != 0 && published_used < POOL_DATA_OFF {
+        return None;
+    }
+    let used = published_used.max(POOL_DATA_OFF);
+    let head = read_volatile((pool_view_base.checked_add(8)?) as *const u64);
+    let head = if head == 0 {
+        0
+    } else {
+        head.checked_sub(FSD_POOL_VADDR).filter(|offset| *offset != 0)?
+    };
+    let target = match target {
+        Some(address) => Some(address.checked_sub(FSD_POOL_VADDR)?),
+        None => None,
+    };
+    let scan = nt_io_manager::hosted_pool_range::scan_hosted_pool_free_list(
+        FSD_POOL_FRAMES * 0x1000,
+        used,
+        POOL_DATA_OFF,
+        head,
+        target,
+        POOL_FREE_LIST_MAX,
+        |header| {
+            let view = pool_view_base.checked_add(header)?;
+            Some(read_volatile(view as *const u64))
+        },
+        |base| {
+            let view = pool_view_base.checked_add(base)?.checked_sub(8)?;
+            let next = read_volatile(view as *const u64);
+            if next == 0 {
+                Some(0)
+            } else {
+                next.checked_sub(FSD_POOL_VADDR).filter(|offset| *offset != 0)
+            }
+        },
+        |allocation| request.is_some_and(|(size, large)| {
+            allocation.capacity >= size
+                && (!large || (allocation.base & 0xfff == 0 && allocation.capacity & 0xfff == 0))
+        }),
+    )?;
+    if pool_view_base == FSD_POOL_VADDR && scan.nodes > 4096 && POOL_LONG_WALKS < 8 {
+        POOL_LONG_WALKS += 1;
+        print_str(b"[fsd-pool] LONG free-list walk nodes=");
+        print_u64(scan.nodes);
+        print_str(b"\n");
+    }
+    Some(scan)
+}
+
+/// Locate one exact target after validating the entire free list and header chain prefix.
+unsafe fn hosted_pool_free_list_position(
+    pool_view_base: u64,
+    target: u64,
+) -> Option<PoolFreeListPosition> {
+    let scan = hosted_pool_scan(pool_view_base, Some(target), None)?;
+    let target_view = pool_view_base.checked_add(target.checked_sub(FSD_POOL_VADDR)?)?;
+    let previous_next_slot = match scan.insertion_previous {
+        Some(previous) => pool_view_base.checked_add(previous)?.checked_sub(8)?,
+        None => pool_view_base.checked_add(8)?,
+    };
+    let next = if scan.insertion_next == 0 {
+        0
+    } else {
+        FSD_POOL_VADDR.checked_add(scan.insertion_next)?
+    };
+    Some(PoolFreeListPosition {
+        target_view,
+        previous_next_slot,
+        next,
+        is_free: scan.target_is_free,
+    })
+}
+
 fn component_pool_end() -> u64 {
     FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000
 }
@@ -4231,28 +4294,31 @@ unsafe fn hosted_pool_alloc_locked(pool_view_base: u64, size: u64) -> Option<u64
     const PAGE_ALIGNED_MIN: u64 = 0x10000;
     let large = size >= PAGE_ALIGNED_MIN;
     let head_slot = pool_view_base.checked_add(8)?;
-    let mut prev_next_slot = head_slot;
-    let mut cur = read_volatile(head_slot as *const u64);
-    let mut steps = 0u64;
-    while cur != 0 {
-        if steps >= POOL_FREE_LIST_MAX {
-            FSD_POOL_LIST_CYCLES.fetch_add(1, Ordering::Relaxed);
-            break;
+    // Select the first fit but validate the entire tail before unlinking anything. A malformed
+    // later link must not turn an otherwise valid early candidate into a committed allocation.
+    let scan = match hosted_pool_scan(pool_view_base, None, Some((size, large))) {
+        Some(scan) => scan,
+        None => {
+            FSD_POOL_LIST_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return None;
         }
-        steps += 1;
-        let Some((cur_view, cap)) = hosted_pool_allocation_exec_range(pool_view_base, cur)
-        else {
-            break;
+    };
+    if let Some(candidate) = scan.first_fit {
+        let previous_next_slot = match candidate.previous {
+            Some(previous) => pool_view_base.checked_add(previous)?.checked_sub(8)?,
+            None => head_slot,
         };
-        let next = read_volatile((cur_view - 8) as *const u64);
-        if cap >= size && (!large || (cur & 0xfff == 0 && cap & 0xfff == 0)) {
-            let generation = next_component_pool_generation(pool_view_base)?;
-            write_volatile(prev_next_slot as *mut u64, next);
-            write_volatile((cur_view - 8) as *mut u64, generation);
-            return Some(cur);
-        }
-        prev_next_slot = cur_view - 8;
-        cur = next;
+        let cur_view = pool_view_base.checked_add(candidate.base)?;
+        let next = if candidate.next == 0 {
+            0
+        } else {
+            FSD_POOL_VADDR.checked_add(candidate.next)?
+        };
+        let component_va = FSD_POOL_VADDR.checked_add(candidate.base)?;
+        let generation = next_component_pool_generation(pool_view_base)?;
+        write_volatile(previous_next_slot as *mut u64, next);
+        write_volatile((cur_view - 8) as *mut u64, generation);
+        return Some(component_va);
     }
     let mut off = hosted_pool_used(pool_view_base);
     if off < POOL_DATA_OFF {
@@ -4265,8 +4331,13 @@ unsafe fn hosted_pool_alloc_locked(pool_view_base: u64, size: u64) -> Option<u64
     if let Some(padding) = plan.padding {
         let pad_view = pool_view_base.checked_add(padding.base)?;
         write_volatile((pad_view - 16) as *mut u64, padding.capacity);
-        write_volatile((pad_view - 8) as *mut u64, read_volatile(head_slot as *const u64));
-        write_volatile(head_slot as *mut u64, FSD_POOL_VADDR + padding.base);
+        write_volatile((pad_view - 8) as *mut u64, 0);
+        // Padding follows every pre-existing allocation and therefore every valid free node.
+        let tail_next_slot = match scan.tail {
+            Some(tail) => pool_view_base.checked_add(tail)?.checked_sub(8)?,
+            None => head_slot,
+        };
+        write_volatile(tail_next_slot as *mut u64, FSD_POOL_VADDR + padding.base);
     }
     let block_view = pool_view_base.checked_add(plan.payload)?;
     write_volatile((block_view - 16) as *mut u64, plan.capacity);
@@ -4276,7 +4347,7 @@ unsafe fn hosted_pool_alloc_locked(pool_view_base: u64, size: u64) -> Option<u64
 }
 
 unsafe fn hosted_instance_pool_free_unlocked(inst: DriverInstance, p: u64) -> bool {
-    let Some(p_exec) = hosted_pool_allocation_exec_va(inst.exec_pool_va, p, 1) else {
+    let Some(position) = hosted_pool_free_list_position(inst.exec_pool_va, p) else {
         if FSD_POOL_INVALID_FREES.fetch_add(1, Ordering::Relaxed) == 0 {
             print_str(b"[fsd-pool-invalid] executive free pointer=");
             print_hex64(p);
@@ -4286,33 +4357,12 @@ unsafe fn hosted_instance_pool_free_unlocked(inst: DriverInstance, p: u64) -> bo
         }
         return false;
     };
-    let Some(head_slot_exec) = inst.exec_pool_va.checked_add(8) else {
-        return false;
-    };
-    let mut cur = read_volatile(head_slot_exec as *const u64);
-    let mut steps = 0u64;
-    while cur != 0 && steps < POOL_FREE_LIST_MAX {
-        if cur == p {
-            FSD_POOL_DOUBLE_FREES.fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
-        let Some((cur_exec, _)) = hosted_pool_allocation_exec_range(inst.exec_pool_va, cur)
-        else { return false; };
-        if cur_exec < inst.exec_pool_va + 16 {
-            return false;
-        }
-        cur = read_volatile((cur_exec - 8) as *const u64);
-        steps += 1;
-    }
-    if cur != 0 {
-        FSD_POOL_LIST_CYCLES.fetch_add(1, Ordering::Relaxed);
+    if position.is_free {
+        FSD_POOL_DOUBLE_FREES.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    write_volatile(
-        (p_exec - 8) as *mut u64,
-        read_volatile(head_slot_exec as *const u64),
-    );
-    write_volatile(head_slot_exec as *mut u64, p);
+    write_volatile((position.target_view - 8) as *mut u64, position.next);
+    write_volatile(position.previous_next_slot as *mut u64, p);
     true
 }
 
@@ -4328,28 +4378,7 @@ unsafe fn hosted_instance_pool_allocation_is_free_unlocked(
     inst: DriverInstance,
     p: u64,
 ) -> Option<bool> {
-    hosted_pool_allocation_exec_va(inst.exec_pool_va, p, 1)?;
-    let head_slot_exec = inst.exec_pool_va.checked_add(8)?;
-    let exec_pool_end = inst
-        .exec_pool_va
-        .checked_add(FSD_POOL_FRAMES.checked_mul(0x1000)?)?;
-    let mut current = read_volatile(head_slot_exec as *const u64);
-    let mut steps = 0u64;
-    while current != 0 {
-        if steps >= POOL_FREE_LIST_MAX {
-            return None;
-        }
-        if current == p {
-            return Some(true);
-        }
-        let (current_exec, _) = hosted_pool_allocation_exec_range(inst.exec_pool_va, current)?;
-        if current_exec < inst.exec_pool_va + POOL_DATA_OFF + 16 || current_exec >= exec_pool_end {
-            return None;
-        }
-        current = read_volatile((current_exec - 8) as *const u64);
-        steps += 1;
-    }
-    Some(false)
+    hosted_pool_free_list_position(inst.exec_pool_va, p).map(|position| position.is_free)
 }
 
 unsafe fn release_hosted_instance_pool_allocation_if_live(inst: DriverInstance, p: u64) -> bool {

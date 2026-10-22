@@ -52,6 +52,11 @@ fn actual_native_source_pool_bounds_and_fallback_behavior() {
         ),
         functions_between(
             driver,
+            "struct PoolFreeListPosition {",
+            "\nfn component_pool_end()",
+        ),
+        functions_between(
+            driver,
             "fn component_pool_end()",
             "\nunsafe fn hosted_pool_allocation_exec_va(",
         ),
@@ -152,7 +157,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const POOL_FREE_LIST_MAX:u64 = 1024;
-static FSD_POOL_LIST_CYCLES:AtomicU64 = AtomicU64::new(0);
+static FSD_POOL_LIST_FAILURES:AtomicU64 = AtomicU64::new(0);
 static FSD_POOL_INVALID_FREES:AtomicU64 = AtomicU64::new(0);
 static FSD_POOL_DOUBLE_FREES:AtomicU64 = AtomicU64::new(0);
 static mut POOL_CALLS:u64 = 0;
@@ -328,6 +333,68 @@ fn cyclic_exec_free_list_cannot_admit_another_free() {
     assert!(writes.is_empty(), "cycle refusal must preserve all pool metadata: {writes:x?}");
     assert_eq!(head, first);
     assert_eq!(second_generation, 9);
+}
+
+#[test]
+fn executive_free_inserts_in_address_order_and_reuse_preserves_links() {
+    let first = FSD_POOL_VADDR + POOL_DATA_OFF + 16;
+    let second = first + 0x20;
+    let third = second + 0x20;
+    let view = instance().exec_pool_va + POOL_DATA_OFF;
+    reset(POOL_DATA_OFF + 0x60, 16, 7, false);
+    MEMORY.with(|memory| {
+        let mut memory = memory.borrow_mut();
+        memory.words.insert(view + 0x20, 16);
+        memory.words.insert(view + 0x28, 7);
+        memory.words.insert(view + 0x40, 16);
+        memory.words.insert(view + 0x48, 0);
+        memory.words.insert(instance().exec_pool_va + 8, first);
+        memory.words.insert(view + 8, third);
+    });
+    assert!(unsafe { hosted_instance_pool_free_unlocked(instance(), second) });
+    MEMORY.with(|memory| {
+        let memory = memory.borrow();
+        assert_eq!(memory.words[&(instance().exec_pool_va + 8)], first);
+        assert_eq!(memory.words[&(view + 8)], second);
+        assert_eq!(memory.words[&(view + 0x28)], third);
+    });
+    assert_eq!(unsafe { hosted_instance_pool_allocation_is_free_unlocked(instance(), second) }, Some(true));
+    MEMORY.with(|memory| memory.borrow_mut().writes.clear());
+    assert!(!unsafe { hosted_instance_pool_free_unlocked(instance(), second) });
+    assert!(MEMORY.with(|memory| memory.borrow().writes.is_empty()),
+        "a duplicate free must leave the sorted links unchanged");
+
+    assert_eq!(unsafe { hosted_instance_pool_alloc(instance(), 16) }, Some(first));
+    MEMORY.with(|memory| {
+        let memory = memory.borrow();
+        assert_eq!(memory.words[&(instance().exec_pool_va + 8)], second);
+        assert_eq!(memory.words[&(view + 8)], 7,
+            "reused allocation must carry its new generation instead of a free link");
+    });
+}
+
+#[test]
+fn first_fit_cannot_unlink_before_a_corrupt_tail_is_validated() {
+    let first = FSD_POOL_VADDR + POOL_DATA_OFF + 16;
+    let third = first + 0x40;
+    let view = instance().exec_pool_va + POOL_DATA_OFF;
+    reset(POOL_DATA_OFF + 0x60, 16, 7, false);
+    MEMORY.with(|memory| {
+        let mut memory = memory.borrow_mut();
+        memory.words.insert(view + 0x20, 16);
+        memory.words.insert(view + 0x28, 7);
+        memory.words.insert(view + 0x40, 16);
+        memory.words.insert(view + 0x48, third);
+        memory.words.insert(instance().exec_pool_va + 8, first);
+        memory.words.insert(view + 8, third);
+    });
+    assert_eq!(unsafe { hosted_instance_pool_alloc(instance(), 16) }, None);
+    MEMORY.with(|memory| {
+        let memory = memory.borrow();
+        assert!(memory.writes.is_empty(), "a fitting head cannot be unlinked before tail proof");
+        assert_eq!(memory.words[&(instance().exec_pool_va + 8)], first);
+        assert_eq!(memory.words[&(view + 8)], third);
+    });
 }
 
 #[test]

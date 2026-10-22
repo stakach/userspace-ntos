@@ -6147,8 +6147,8 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     print_u64(new_clients);
     print_str(b" pool-double-frees-rejected=");
     print_u64(driver_launch::FSD_POOL_DOUBLE_FREES.load(Ordering::Relaxed));
-    print_str(b" pool-list-cycles=");
-    print_u64(driver_launch::FSD_POOL_LIST_CYCLES.load(Ordering::Relaxed));
+    print_str(b" pool-list-failures=");
+    print_u64(driver_launch::FSD_POOL_LIST_FAILURES.load(Ordering::Relaxed));
     print_str(b" pool-invalid-frees=");
     print_u64(driver_launch::FSD_POOL_INVALID_FREES.load(Ordering::Relaxed));
     print_str(
@@ -6219,7 +6219,7 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     check(
         b"exec_hosted_driver_pool_integrity",
         driver_launch::FSD_POOL_DOUBLE_FREES.load(Ordering::Relaxed) == 0
-            && driver_launch::FSD_POOL_LIST_CYCLES.load(Ordering::Relaxed) == 0
+            && driver_launch::FSD_POOL_LIST_FAILURES.load(Ordering::Relaxed) == 0
             && driver_launch::FSD_POOL_INVALID_FREES.load(Ordering::Relaxed) == 0,
         passed,
     );
