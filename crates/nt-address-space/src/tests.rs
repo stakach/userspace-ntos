@@ -1857,6 +1857,41 @@ fn committed_range_table_queries_and_coalesces_runtime_mappings() {
 }
 
 #[test]
+fn committed_range_table_large_queries_inspect_bounded_candidates() {
+    const BASE: u64 = 0x2000_0000;
+    const STRIDE: u64 = 0x3000;
+    const COUNT: usize = 400;
+    // Build the same sorted layout produced by registration and normalization without
+    // making this lookup regression depend on the cost of 400 insertions.
+    let mut ranges = [None; 512];
+    for (index, slot) in ranges.iter_mut().enumerate().take(COUNT) {
+        *slot = Some(VmCommittedRange::mapped(
+            BASE + index as u64 * STRIDE,
+            PAGE_SIZE,
+            PAGE_READONLY,
+        ));
+    }
+    let table = VmCommittedRangeTable::<512> { ranges };
+
+    let last = BASE + (COUNT as u64 - 1) * STRIDE;
+    VM_COMMITTED_QUERY_INSPECTIONS.with(|count| count.set(0));
+    assert_eq!(table.query_basic(last + 0x123).unwrap().base_address, last);
+    let inspections = VM_COMMITTED_QUERY_INSPECTIONS.with(|count| count.get());
+    assert!(
+        inspections < 32,
+        "last-range query inspected {inspections} candidates"
+    );
+
+    VM_COMMITTED_QUERY_INSPECTIONS.with(|count| count.set(0));
+    assert!(table.query_basic(last - PAGE_SIZE).is_none());
+    let inspections = VM_COMMITTED_QUERY_INSPECTIONS.with(|count| count.get());
+    assert!(
+        inspections < 32,
+        "late-gap query inspected {inspections} candidates"
+    );
+}
+
+#[test]
 fn committed_range_table_rejects_overlaps_and_tracks_next_base() {
     let mut table = VmCommittedRangeTable::<4>::new();
     table

@@ -1541,6 +1541,11 @@ pub struct VmCommittedRangeTable<const N: usize> {
     ranges: [Option<VmCommittedRange>; N],
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static VM_COMMITTED_QUERY_INSPECTIONS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
 impl<const N: usize> VmCommittedRangeTable<N> {
     pub const fn new() -> Self {
         Self { ranges: [None; N] }
@@ -1715,12 +1720,21 @@ impl<const N: usize> VmCommittedRangeTable<N> {
 
     pub fn query_basic(&self, address: u64) -> Option<VmBasicInformation> {
         let page = address & !(PAGE_SIZE - 1);
-        self.ranges
-            .iter()
-            .flatten()
-            .copied()
-            .find(|range| range.contains(page))
-            .map(|range| range.info_at(page))
+        // Normalization keeps live ranges sorted by base in a Some prefix. The only
+        // possible containing range is the predecessor of this page's insertion point.
+        let predecessor = self.ranges.partition_point(|slot| {
+            if let Some(range) = slot {
+                #[cfg(test)]
+                VM_COMMITTED_QUERY_INSPECTIONS.with(|count| count.set(count.get() + 1));
+                range.base <= page
+            } else {
+                false
+            }
+        });
+        let range = self.ranges.get(predecessor.checked_sub(1)?)?.as_ref()?;
+        #[cfg(test)]
+        VM_COMMITTED_QUERY_INSPECTIONS.with(|count| count.set(count.get() + 1));
+        range.contains(page).then(|| range.info_at(page))
     }
 
     pub fn image_allocation_for_page(&self, address: u64) -> Option<VmImageAllocation> {
