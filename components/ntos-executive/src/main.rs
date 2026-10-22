@@ -2199,6 +2199,8 @@ const ROOT_SLOT_TRACK_CAP: usize = 1 << 19;
 const ROOT_SLOT_LIVE_WORDS: usize = ROOT_SLOT_TRACK_CAP / 64;
 const ROOT_RETYPE_FAN_OUT_LIMIT: u64 = 256;
 static mut ROOT_SLOT_RECYCLE: [u64; ROOT_SLOT_RECYCLE_CAP] = [0; ROOT_SLOT_RECYCLE_CAP];
+/// Exact membership of the active recycled-slot prefix, indexed by root CSpace slot.
+static mut ROOT_SLOT_RECYCLE_BITS: [u64; ROOT_SLOT_LIVE_WORDS] = [0; ROOT_SLOT_LIVE_WORDS];
 static ROOT_SLOT_RECYCLE_N: AtomicU64 = AtomicU64::new(0);
 static ROOT_SLOT_RECYCLE_HW: AtomicU64 = AtomicU64::new(0);
 static ROOT_SLOT_RECYCLE_REUSED: AtomicU64 = AtomicU64::new(0);
@@ -7665,13 +7667,28 @@ fn root_slot_recycle_count() -> u64 {
         return count;
     }
     ROOT_SLOT_RECYCLE_CORRUPT.fetch_add(1, Ordering::Relaxed);
-    ROOT_SLOT_RECYCLE_N.store(cap, Ordering::Relaxed);
-    print_str(b"[cap] recycled-slot stack length clamped from ");
+    print_str(b"[cap] corrupt recycled-slot stack length=");
     print_u64(count);
-    print_str(b" to ");
+    print_str(b" capacity=");
     print_u64(cap);
     print_str(b"\n");
-    cap
+    park()
+}
+
+unsafe fn root_recycled_slots() -> nt_user_host::slot_recycle::RecycledSlotStack<'static> {
+    nt_user_host::slot_recycle::RecycledSlotStack {
+        start: ROOT_CSPACE_START.load(Ordering::Relaxed),
+        end: ROOT_CSPACE_END.load(Ordering::Relaxed),
+        free: &mut *core::ptr::addr_of_mut!(ROOT_SLOT_RECYCLE),
+        membership: &mut *core::ptr::addr_of_mut!(ROOT_SLOT_RECYCLE_BITS),
+        count: root_slot_recycle_count(),
+    }
+}
+
+fn root_recycle_corrupt() -> ! {
+    ROOT_SLOT_RECYCLE_CORRUPT.fetch_add(1, Ordering::Relaxed);
+    print_str(b"[cap] recycled-slot membership disagrees with active stack\n");
+    park()
 }
 
 unsafe fn root_slot_mark_live(slot: u64) -> bool {
@@ -7729,27 +7746,24 @@ unsafe fn root_slot_pin_run(base: u64, count: u64) {
 }
 
 unsafe fn root_slot_remove_recycled(slot: u64) -> bool {
-    let n = root_slot_recycle_count();
-    let stack = core::ptr::addr_of_mut!(ROOT_SLOT_RECYCLE) as *mut u64;
-    let mut i = 0;
-    while i < n {
-        if core::ptr::read(stack.add(i as usize)) == slot {
-            let next = n - 1;
-            if i != next {
-                let last = core::ptr::read(stack.add(next as usize));
-                core::ptr::write(stack.add(i as usize), last);
-            }
-            core::ptr::write(stack.add(next as usize), 0);
-            ROOT_SLOT_RECYCLE_N.store(next, Ordering::Relaxed);
-            return true;
-        }
-        i += 1;
+    let mut slots = root_recycled_slots();
+    let removed = slots.remove(slot).unwrap_or_else(|_| root_recycle_corrupt());
+    if removed {
+        ROOT_SLOT_RECYCLE_N.store(slots.count, Ordering::Relaxed);
     }
-    false
+    removed
 }
 
 unsafe fn root_slot_note_occupied(slot: u64) {
-    if root_slot_mark_live(slot) {
+    if slot <= 1 || root_slot_bit(slot).is_none() {
+        let _ = root_slot_mark_live(slot);
+        return;
+    }
+    let newly_live = root_slot_mark_live(slot);
+    let indexed = root_recycled_slots()
+        .contains(slot)
+        .unwrap_or_else(|_| root_recycle_corrupt());
+    if newly_live || indexed {
         let _ = root_slot_remove_recycled(slot);
     }
 }
@@ -7788,17 +7802,11 @@ unsafe fn root_slot_take_retype_bytes(slot: u64) -> u64 {
 
 fn try_recycled_root_slot() -> Option<u64> {
     loop {
-        let n = root_slot_recycle_count();
-        if n == 0 {
+        let mut slots = unsafe { root_recycled_slots() };
+        let Some(slot) = slots.pop().unwrap_or_else(|_| root_recycle_corrupt()) else {
             return None;
-        }
-        let next = n - 1;
-        ROOT_SLOT_RECYCLE_N.store(next, Ordering::Relaxed);
-        let slot = unsafe {
-            core::ptr::read(
-                (core::ptr::addr_of!(ROOT_SLOT_RECYCLE) as *const u64).add(next as usize),
-            )
         };
+        ROOT_SLOT_RECYCLE_N.store(slots.count, Ordering::Relaxed);
         if unsafe { root_slot_mark_live(slot) } {
             ROOT_SLOT_RECYCLE_REUSED.fetch_add(1, Ordering::Relaxed);
             return Some(slot);
@@ -7820,18 +7828,17 @@ unsafe fn recycle_deleted_root_slot(slot: u64) {
         return;
     }
     let _ = root_slot_take_retype_bytes(slot);
-    let n = root_slot_recycle_count();
-    if n >= ROOT_SLOT_RECYCLE_CAP as u64 {
-        ROOT_SLOT_RECYCLE_DROPPED.fetch_add(1, Ordering::Relaxed);
-        return;
+    let mut slots = root_recycled_slots();
+    match slots.push(slot) {
+        Ok(()) => {
+            ROOT_SLOT_RECYCLE_N.store(slots.count, Ordering::Relaxed);
+            note_high_water(&ROOT_SLOT_RECYCLE_HW, slots.count);
+        }
+        Err(nt_user_host::slot_recycle::RecycledSlotError::Full) => {
+            ROOT_SLOT_RECYCLE_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(_) => root_recycle_corrupt(),
     }
-    core::ptr::write(
-        (core::ptr::addr_of_mut!(ROOT_SLOT_RECYCLE) as *mut u64).add(n as usize),
-        slot,
-    );
-    let next = n + 1;
-    ROOT_SLOT_RECYCLE_N.store(next, Ordering::Relaxed);
-    note_high_water(&ROOT_SLOT_RECYCLE_HW, next);
 }
 
 fn root_slot_available_count() -> u64 {
