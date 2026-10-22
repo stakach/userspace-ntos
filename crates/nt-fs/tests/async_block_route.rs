@@ -106,3 +106,25 @@ fn uncertain_native_write_retains_only_its_exact_completion_and_blocks_replay() 
         )
         .is_ok());
 }
+
+#[test]
+fn copied_fat_handles_and_snapshot_reserve_share_one_mount_fence() {
+    let mut mount = BlockRouteOwner::new(31, 4096).unwrap();
+    let copied_fat_mount = 31;
+    let reserve_mount = 31;
+    mount.admit_boot(copied_fat_mount, BlockSource::Fat,
+        BlockOperation::Read { lba: 12, sectors: 1 }).unwrap();
+    mount.admit_boot(reserve_mount, BlockSource::Snapshot,
+        BlockOperation::Flush).unwrap();
+    assert_eq!(mount.admit_boot(32, BlockSource::Fat,
+        BlockOperation::Read { lba: 12, sectors: 1 }), Err(BlockRouteError::WrongMount));
+    assert_eq!(mount.admit_boot(reserve_mount, BlockSource::Snapshot,
+        BlockOperation::Write { lba: 4095, sectors: 2 }), Err(BlockRouteError::InvalidGeometry));
+    mount.begin_drain(31).unwrap();
+    for source in [BlockSource::Fat, BlockSource::Snapshot] {
+        assert_eq!(mount.admit_boot(31, source, BlockOperation::Read { lba: 12, sectors: 1 }),
+            Err(BlockRouteError::WrongPhase));
+        assert_eq!(mount.admit_boot(31, source, BlockOperation::Flush),
+            Err(BlockRouteError::WrongPhase));
+    }
+}

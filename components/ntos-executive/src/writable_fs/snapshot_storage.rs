@@ -30,12 +30,12 @@ pub(super) fn wal_bounds(lease: &Lease) -> Result<(u64, u64), u32> {
 
 /// Boot-only publication, before the executable filesystem identity becomes visible. This slot
 /// cannot be replaced; copied Fat32 values elsewhere never grant snapshot device access.
-pub(crate) unsafe fn publish(fat: Fat32, mount: SectionMountId) -> Result<(), u32> {
+pub(crate) unsafe fn publish(fat: Fat32, mount: SectionMountId, physical_sectors: u64) -> Result<(), u32> {
     let slot = &mut *core::ptr::addr_of_mut!(RESERVE);
     if slot.is_some() {
         return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
     }
-    if let Some(device) = AhciSnapshotDevice::from_backing(fat)? {
+    if let Some(device) = AhciSnapshotDevice::from_backing(fat, physical_sectors)? {
         let store = nt_fs::SnapshotBlockStore::new(0, SNAPSHOT_SECTORS);
         *slot = Some(SnapshotReserve::new(device, mount, store));
     }
@@ -162,12 +162,10 @@ pub(super) struct AhciSnapshotDevice {
 }
 
 impl AhciSnapshotDevice {
-    fn from_backing(fat: Fat32) -> Result<Option<Self>, u32> {
+    fn from_backing(fat: Fat32, physical_sectors: u64) -> Result<Option<Self>, u32> {
         let Some((start_lba, snapshot_sectors)) = crate::fs_loader::writable_snapshot_reserve(&fat) else {
             return Ok(None);
         };
-        let physical_sectors = unsafe { crate::ahci_maintenance::physical_sector_count(&fat) }
-            .map_err(|_| nt_fs::STATUS_DEVICE_NOT_READY)?;
         let snapshot_end = start_lba
             .checked_add(u64::from(snapshot_sectors))
             .ok_or(nt_fs::STATUS_INVALID_PARAMETER)?;
@@ -201,6 +199,9 @@ impl AhciSnapshotDevice {
 
 impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
     fn flush(&mut self) -> Result<(), nt_fs::SnapshotBlockStoreError> {
+        if !crate::fs_loader::admit_exec_mount_boot_io(nt_fs::BlockSource::Snapshot, nt_fs::BlockOperation::Flush) {
+            return Err(nt_fs::SnapshotBlockStoreError::Io);
+        }
         unsafe { crate::ahci_maintenance::flush(&self.fat, &mut self.flush_command) }
             .map_err(|_| nt_fs::SnapshotBlockStoreError::Io)
     }
@@ -247,6 +248,12 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
         while sector_index < total_sectors as usize {
             let chunk_sectors = (total_sectors as usize - sector_index).min(max_chunk);
             let absolute = self.absolute_lba(lba + sector_index as u64)?;
+            if !crate::fs_loader::admit_exec_mount_boot_io(
+                nt_fs::BlockSource::Snapshot,
+                nt_fs::BlockOperation::Read { lba: absolute, sectors: chunk_sectors as u32 },
+            ) {
+                return Err(nt_fs::SnapshotBlockStoreError::Io);
+            }
             let byte_start = sector_index * sector_size;
             let byte_end = byte_start + chunk_sectors * sector_size;
             let started = self.fat.census.then(disk_census_ticks);
@@ -312,6 +319,12 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
             let chunk_sectors = (total_sectors as usize - sector_index).min(max_chunk);
             let relative_lba = lba + sector_index as u64;
             let absolute = self.absolute_lba(relative_lba)?;
+            if !crate::fs_loader::admit_exec_mount_boot_io(
+                nt_fs::BlockSource::Snapshot,
+                nt_fs::BlockOperation::Write { lba: absolute, sectors: chunk_sectors as u32 },
+            ) {
+                return Err(nt_fs::SnapshotBlockStoreError::Io);
+            }
             let byte_start = sector_index * sector_size;
             let byte_end = byte_start + chunk_sectors * sector_size;
             let started = self.fat.census.then(disk_census_ticks);

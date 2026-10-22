@@ -84,6 +84,10 @@ pub(crate) fn begin_native_start_after_preload(
     receipt: driver_launch::PreloadReceipt,
     lease: nt_pnp_context::ContextLeaseIdentity,
 ) -> Result<NativeStartAdmission, nt_status::NtStatus> {
+    // Snapshot recovery may read and repair the reserve. Do it while direct AHCI admission
+    // remains open; BusRelations publication must never discover a lazy mount after drain.
+    unsafe { crate::writable_fs::ensure_mounted() }
+        .map_err(|status| nt_status::NtStatus(status as i32))?;
     if !unsafe { driver_launch::boot_driver_preload_receipt_is_current(receipt) } {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
@@ -99,6 +103,10 @@ pub(crate) fn begin_native_start_after_preload(
     {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
+    // Reject an absent/unpublished mount before the controller enters its irreversible drain.
+    if !crate::fs_loader::exec_mount_can_drain() {
+        return Err(nt_status::NtStatus::DEVICE_NOT_READY);
+    }
     match owner.ledger.state(owner.controller, owner.io_space_cap) {
         Ok(ControllerState::BootActive) => owner
             .ledger
@@ -108,6 +116,10 @@ pub(crate) fn begin_native_start_after_preload(
         Ok(ControllerState::NativeStarting) => return Ok(NativeStartAdmission::Ready),
         _ => return Err(nt_status::NtStatus::DEVICE_BUSY),
     }
+    // The controller's exact boot tickets remain the command authority. A separate mount
+    // fence prevents copied FAT handles and the snapshot reserve from entering new boot I/O.
+    crate::fs_loader::begin_exec_mount_drain()
+        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     match owner
         .ledger
         .begin_native_start_exact(owner.controller, owner.io_space_cap, window)

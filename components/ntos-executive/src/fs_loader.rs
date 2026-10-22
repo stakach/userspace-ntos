@@ -31,7 +31,12 @@ unsafe fn read_owner_sector(
     lba: u64,
 ) -> u32 {
     match owner {
-        FatIoOwner::Executive => ahci_read_sector(ahci_vaddr, dma_vaddr, dma_paddr, lba),
+        FatIoOwner::Executive => {
+            if !admit_exec_mount_boot_io(nt_fs::BlockSource::Fat, nt_fs::BlockOperation::Read { lba, sectors: 1 }) {
+                return 0xff;
+            }
+            ahci_read_sector(ahci_vaddr, dma_vaddr, dma_paddr, lba)
+        }
         FatIoOwner::IsolatedStorageHost => {
             ahci_read_sector_isolated_storage_host(ahci_vaddr, dma_vaddr, dma_paddr, lba)
         }
@@ -47,7 +52,12 @@ unsafe fn read_owner_sectors(
     count: u32,
 ) -> u32 {
     match owner {
-        FatIoOwner::Executive => ahci_read_sectors(ahci_vaddr, dma_vaddr, dma_paddr, lba, count),
+        FatIoOwner::Executive => {
+            if !admit_exec_mount_boot_io(nt_fs::BlockSource::Fat, nt_fs::BlockOperation::Read { lba, sectors: count }) {
+                return 0xff;
+            }
+            ahci_read_sectors(ahci_vaddr, dma_vaddr, dma_paddr, lba, count)
+        }
         FatIoOwner::IsolatedStorageHost => ahci_read_sectors_isolated_storage_host(
             ahci_vaddr,
             dma_vaddr,
@@ -253,6 +263,9 @@ pub(crate) unsafe fn fat_write_sector(fs: &Fat32, sector: u32, data: &[u8]) -> u
     };
     // A timed-out write may still have reached media, so invalidate before issuing it.
     fat_chain_cache_invalidate(fs);
+    if !admit_exec_mount_boot_io(nt_fs::BlockSource::Fat, nt_fs::BlockOperation::Write { lba: disk_lba, sectors: 1 }) {
+        return 0xff;
+    }
     let started = fs.census.then(disk_census_ticks);
     let status = ahci_write_sectors(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba, data);
     disk_census_record(
@@ -287,6 +300,9 @@ pub(crate) unsafe fn fat_write_sectors(fs: &Fat32, sector: u32, data: &[u8]) -> 
         return 0xff;
     }
     fat_chain_cache_invalidate(fs);
+    if !admit_exec_mount_boot_io(nt_fs::BlockSource::Fat, nt_fs::BlockOperation::Write { lba: disk_lba, sectors }) {
+        return 0xff;
+    }
     let started = fs.census.then(disk_census_ticks);
     let status = ahci_write_sectors(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba, data);
     disk_census_record(
@@ -1183,15 +1199,71 @@ pub(crate) unsafe fn query_nt_path_metadata_into(
 /// executive's AHCI BAR + DMA-frame mappings). `None` until mounted. Read-only.
 static mut EXEC_FS: Option<Fat32> = None;
 static mut EXEC_FS_MOUNT_ID: Option<nt_memory_manager::SectionMountId> = None;
+static mut EXEC_BLOCK_ROUTE: Option<nt_fs::BlockRouteOwner> = None;
+
+/// All executive FAT copies and the snapshot reserve enter the same physical mount route.
+/// Before publication, only FAT bootstrap reads are allowed; the isolated host uses its
+/// separate address space and never touches this owner.
+pub(crate) fn admit_exec_mount_boot_io(
+    source: nt_fs::BlockSource,
+    operation: nt_fs::BlockOperation,
+) -> bool {
+    unsafe {
+        match (
+            *core::ptr::addr_of!(EXEC_FS_MOUNT_ID),
+            (&*core::ptr::addr_of!(EXEC_BLOCK_ROUTE)).as_ref(),
+        ) {
+            (Some(mount), Some(route)) => route.admit_boot(mount.value(), source, operation).is_ok(),
+            (None, None) => source == nt_fs::BlockSource::Fat,
+            _ => false,
+        }
+    }
+}
+
+/// The controller ledger owns exact boot command retirement; this mount owner fences both
+/// logical consumers before native START. Redrive keeps the same drain state.
+pub(crate) fn exec_mount_can_drain() -> bool {
+    unsafe {
+        let mount = *core::ptr::addr_of!(EXEC_FS_MOUNT_ID);
+        let route = (&*core::ptr::addr_of!(EXEC_BLOCK_ROUTE)).as_ref();
+        match (mount, route) {
+            (Some(_), Some(route)) => matches!(
+                route.source_kind(),
+                nt_fs::BlockSourceKind::Boot | nt_fs::BlockSourceKind::Draining
+            ),
+            _ => false,
+        }
+    }
+}
+
+pub(crate) fn begin_exec_mount_drain() -> Result<(), nt_fs::BlockRouteError> {
+    unsafe {
+        let mount = (*core::ptr::addr_of!(EXEC_FS_MOUNT_ID))
+            .ok_or(nt_fs::BlockRouteError::InvalidMount)?;
+        let route = (&mut *core::ptr::addr_of_mut!(EXEC_BLOCK_ROUTE))
+            .as_mut()
+            .ok_or(nt_fs::BlockRouteError::InvalidMount)?;
+        match route.source_kind() {
+            nt_fs::BlockSourceKind::Boot => route.begin_drain(mount.value()),
+            nt_fs::BlockSourceKind::Draining => Ok(()),
+            nt_fs::BlockSourceKind::Native => Err(nt_fs::BlockRouteError::WrongPhase),
+        }
+    }
+}
 
 pub(crate) unsafe fn publish_exec_fs(fs: Fat32) -> Result<(), u32> {
     let slot = &mut *core::ptr::addr_of_mut!(EXEC_FS);
     if slot.is_some() { return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST); }
     let id = crate::mounted_volume::allocate_mount_id()?;
-    crate::writable_fs::snapshot_storage::publish(fs, id)?;
+    let physical_sectors = crate::ahci_maintenance::physical_sector_count(&fs)
+        .map_err(|_| nt_fs::STATUS_DEVICE_NOT_READY)?;
+    let route = nt_fs::BlockRouteOwner::new(id.value(), physical_sectors)
+        .map_err(|_| nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
+    crate::writable_fs::snapshot_storage::publish(fs, id, physical_sectors)?;
     (&mut *core::ptr::addr_of_mut!(EXEC_FAT_SECTOR_CACHE)).invalidate();
     (&mut *core::ptr::addr_of_mut!(EXEC_FAT_RANGE_CURSORS)).invalidate();
     *core::ptr::addr_of_mut!(EXEC_FS_MOUNT_ID) = Some(id);
+    *core::ptr::addr_of_mut!(EXEC_BLOCK_ROUTE) = Some(route);
     *slot = Some(fs);
     Ok(())
 }
