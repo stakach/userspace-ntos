@@ -76,6 +76,7 @@ pub struct BlockRouteOwner {
     phase: BlockSourceKind,
     native_route: Option<u64>,
     native_io: Option<NativeBlockTicket>,
+    native_entered: bool,
     next_sequence: u64,
 }
 
@@ -93,6 +94,7 @@ impl BlockRouteOwner {
             phase: BlockSourceKind::Boot,
             native_route: None,
             native_io: None,
+            native_entered: false,
             next_sequence: 1,
         })
     }
@@ -194,7 +196,24 @@ impl BlockRouteOwner {
             operation,
         };
         self.native_io = Some(ticket);
+        self.native_entered = false;
         Ok(ticket)
+    }
+
+    /// Undo a reservation only when the transport proves the provider was never entered.
+    /// Once entry is possible, the exact ticket remains retained until terminal completion.
+    pub fn cancel_unentered_native(
+        &mut self,
+        ticket: NativeBlockTicket,
+    ) -> Result<(), BlockRouteError> {
+        if self.native_io != Some(ticket) {
+            return Err(BlockRouteError::WrongTicket);
+        }
+        if self.native_entered {
+            return Err(BlockRouteError::WrongPhase);
+        }
+        self.native_io = None;
+        Ok(())
     }
 
     pub fn lose_native(&mut self, ticket: NativeBlockTicket) -> Result<(), BlockRouteError> {
@@ -202,6 +221,7 @@ impl BlockRouteOwner {
             return Err(BlockRouteError::WrongTicket);
         }
         // The retained ticket is the fence; only its exact late completion may resolve it.
+        self.native_entered = true;
         Ok(())
     }
 
@@ -215,10 +235,31 @@ impl BlockRouteOwner {
         if self.native_io != Some(ticket) {
             return Err(BlockRouteError::WrongTicket);
         }
+        if !self.native_entered {
+            return Err(BlockRouteError::WrongPhase);
+        }
         if transferred_bytes != ticket.operation.transfer_bytes() {
             return Err(BlockRouteError::Incomplete);
         }
         self.native_io = None;
+        self.native_entered = false;
+        Ok(())
+    }
+
+    /// Retire an entered command whose exact provider terminal and acknowledgement report
+    /// failure. The operation fails to its caller; this only releases the physical route.
+    pub fn complete_native_failure(
+        &mut self,
+        ticket: NativeBlockTicket,
+    ) -> Result<(), BlockRouteError> {
+        if self.native_io != Some(ticket) {
+            return Err(BlockRouteError::WrongTicket);
+        }
+        if !self.native_entered {
+            return Err(BlockRouteError::WrongPhase);
+        }
+        self.native_io = None;
+        self.native_entered = false;
         Ok(())
     }
 }

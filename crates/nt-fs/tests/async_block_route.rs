@@ -128,3 +128,24 @@ fn copied_fat_handles_and_snapshot_reserve_share_one_mount_fence() {
             Err(BlockRouteError::WrongPhase));
     }
 }
+
+#[test]
+fn proven_unentered_native_request_can_release_its_ticket_but_entered_request_cannot() {
+    let mut owner = BlockRouteOwner::new(11, 4096).unwrap();
+    owner.begin_drain(11).unwrap();
+    owner.commit_native(11, 77).unwrap();
+    let request = owner.enter_native(11, BlockSource::Fat,
+        BlockOperation::Read { lba: 32, sectors: 1 }).unwrap();
+    let mut wrong = request;
+    wrong.sequence += 1;
+    assert_eq!(owner.cancel_unentered_native(wrong), Err(BlockRouteError::WrongTicket));
+    owner.cancel_unentered_native(request).unwrap();
+    let entered = owner.enter_native(11, BlockSource::Fat,
+        BlockOperation::Read { lba: 32, sectors: 1 }).unwrap();
+    assert_eq!(owner.complete_native(entered, 512), Err(BlockRouteError::WrongPhase));
+    owner.lose_native(entered).unwrap();
+    assert_eq!(owner.cancel_unentered_native(entered), Err(BlockRouteError::WrongPhase));
+    assert_eq!(owner.pending_native(), Some(entered));
+    owner.complete_native_failure(entered).unwrap();
+    assert_eq!(owner.pending_native(), None);
+}
