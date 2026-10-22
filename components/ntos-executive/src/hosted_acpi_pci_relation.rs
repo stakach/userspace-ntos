@@ -78,21 +78,15 @@ unsafe fn classify_hosted_acpi_pci_namespace_filter_result(
     payload: &[u8],
 ) -> HostedAcpiPciNamespaceDisposition {
     if matches!(status.raw() as u32, STATUS_BUFFER_OVERFLOW | 0xc000_0023) {
-        return match (information == 0)
-            .then(|| {
-                nt_acpi::namespace_children_probe_retry_len(
-                    status.raw() as u32,
-                    information,
-                    payload,
-                    output_len,
-                    HOSTED_ACPI_NAMESPACE_MAX_BYTES,
-                )
-                .ok()
-            })
-            .flatten()
-        {
-            Some(required) => HostedAcpiPciNamespaceDisposition::RetryExact(required),
-            None => HostedAcpiPciNamespaceDisposition::Barrier(
+        return match nt_acpi::namespace_children_probe_retry_len(
+            status.raw() as u32,
+            information,
+            payload,
+            output_len,
+            HOSTED_ACPI_NAMESPACE_MAX_BYTES,
+        ) {
+            Ok(required) => HostedAcpiPciNamespaceDisposition::RetryExact(required),
+            Err(_) => HostedAcpiPciNamespaceDisposition::Barrier(
                 nt_status::NtStatus::INVALID_DEVICE_REQUEST,
             ),
         };

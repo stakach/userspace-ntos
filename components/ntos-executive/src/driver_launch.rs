@@ -42954,14 +42954,7 @@ unsafe fn classify_hosted_acpi_namespace_result(
             Err(status) => HostedNamespaceDisposition::Barrier(status),
         };
     }
-    if output_len == HOSTED_ACPI_NAMESPACE_HEADER_LEN {
-        if !matches!(status.raw() as u32, STATUS_BUFFER_OVERFLOW | 0xc000_0023) {
-            return HostedNamespaceDisposition::Barrier(if status.is_success() {
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST
-            } else {
-                status
-            });
-        }
+    if matches!(status.raw() as u32, STATUS_BUFFER_OVERFLOW | 0xc000_0023) {
         return match nt_acpi::namespace_children_probe_retry_len(
             status.raw() as u32,
             information,
