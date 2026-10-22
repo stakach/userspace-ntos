@@ -810,21 +810,40 @@ unsafe fn stage_hosted_acpi_pci_scope_sources() -> bool {
     if link_candidates.try_reserve_exact(candidate_count).is_err() {
         return false;
     }
+    let mut stale_child_identity = false;
     if source_count != 0 {
         let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
             .as_ref()
             .unwrap();
-        for properties in &query.child_properties {
+        for (child_index, properties) in query.child_properties.iter().enumerate() {
             if let HostedAcpiNamespaceState::Present(namespace) = &properties.acpi_namespace {
+                let Some((device_id, domain, pdo_object)) =
+                    hosted_relation_child_identity(child_index)
+                else {
+                    stale_child_identity = true;
+                    break;
+                };
                 let Ok(path) = namespace.self_path().try_clone() else {
                     return false;
                 };
                 link_candidates.push(nt_pnp::AcpiPciLinkCandidateFact {
                     relation_owner,
+                    endpoint: nt_pnp::AcpiPciProviderEndpoint {
+                        device_id: device_id.raw(),
+                        hosted_domain_id: domain.domain_id.raw(),
+                        hosted_domain_cookie: domain.cookie,
+                        pdo_object,
+                    },
                     path,
                 });
             }
         }
+    }
+    if stale_child_identity {
+        set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+        return true;
     }
     let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
         .as_mut()

@@ -77,12 +77,13 @@ pub struct AcpiPciScopeSource {
     pub addresses: Vec<AcpiPciAddressScopeFact>,
 }
 
-/// Canonical ACPI object path observed in the same authoritative BusRelations transaction as its
-/// PCI root sources. It carries no PDO or capability identity; METHOD_EX remains rooted at an
-/// authenticated PCI-root endpoint.
+/// Canonical ACPI object path and exact owning PDO observed in the same authoritative
+/// BusRelations transaction as its PCI root sources. LiberNT METHOD_EX confines absolute paths
+/// to the receiving PDO's subtree, so sibling interrupt links require their own PDO endpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcpiPciLinkCandidateFact {
     pub relation_owner: AcpiPciProviderEndpoint,
+    pub endpoint: AcpiPciProviderEndpoint,
     pub path: AcpiNamespacePath,
 }
 
@@ -381,7 +382,13 @@ impl AcpiPciScopeCatalog {
                 .any(|source| source.relation_owner != relation_owner)
             || link_candidates
                 .iter()
-                .any(|candidate| candidate.relation_owner != relation_owner)
+                .any(|candidate| {
+                    candidate.relation_owner != relation_owner
+                        || !candidate.endpoint.is_valid()
+                        || candidate.endpoint.hosted_domain_id != relation_owner.hosted_domain_id
+                        || candidate.endpoint.hosted_domain_cookie
+                            != relation_owner.hosted_domain_cookie
+                })
             || (sources.is_empty() && !link_candidates.is_empty())
         {
             return Err(AcpiPciScopeError::InvalidProviderEndpoint);
@@ -695,6 +702,7 @@ fn try_clone_link_candidate(
 ) -> Result<AcpiPciLinkCandidateFact, AcpiPciScopeError> {
     Ok(AcpiPciLinkCandidateFact {
         relation_owner: candidate.relation_owner,
+        endpoint: candidate.endpoint,
         path: candidate
             .path
             .try_clone()
@@ -740,7 +748,13 @@ fn canonicalize_link_candidates(
 ) -> Result<(), AcpiPciScopeError> {
     if candidates
         .iter()
-        .any(|candidate| !candidate.relation_owner.is_valid())
+        .any(|candidate| {
+            !candidate.relation_owner.is_valid()
+                || !candidate.endpoint.is_valid()
+                || candidate.endpoint.hosted_domain_id != candidate.relation_owner.hosted_domain_id
+                || candidate.endpoint.hosted_domain_cookie
+                    != candidate.relation_owner.hosted_domain_cookie
+        })
     {
         return Err(AcpiPciScopeError::InvalidProviderEndpoint);
     }
@@ -1026,10 +1040,12 @@ mod tests {
         let owner = provider(1);
         let first_candidate = AcpiPciLinkCandidateFact {
             relation_owner: owner,
+            endpoint: provider(46),
             path: path("\\_SB_.LNKA"),
         };
         let second_candidate = AcpiPciLinkCandidateFact {
             relation_owner: owner,
+            endpoint: provider(47),
             path: path("\\_SB_.LNKB"),
         };
         let mut first = source(44);
@@ -1098,6 +1114,7 @@ mod tests {
         let mut catalog = AcpiPciScopeCatalog::default();
         let first = AcpiPciLinkCandidateFact {
             relation_owner: owner,
+            endpoint: provider(45),
             path: path("\\_SB_.LNKA"),
         };
         let prepared = catalog
@@ -1123,6 +1140,7 @@ mod tests {
 
         let replacement = AcpiPciLinkCandidateFact {
             relation_owner: owner,
+            endpoint: provider(46),
             path: path("\\_SB_.LNKB"),
         };
         let changed = catalog
@@ -1148,6 +1166,7 @@ mod tests {
         );
         let cross_relation = AcpiPciLinkCandidateFact {
             relation_owner: provider(2),
+            endpoint: provider(47),
             path: path("\\_SB_.LNKC"),
         };
         assert_eq!(
@@ -1363,7 +1382,8 @@ mod tests {
         let facts = source(44);
         let candidate = AcpiPciLinkCandidateFact {
             relation_owner: owner,
-            path: path("\\_SB_.PCI0.LNKA"),
+            endpoint: provider(45),
+            path: path("\\_SB_.LNKA"),
         };
         let mut catalog = AcpiPciScopeCatalog::default();
         let update = catalog
@@ -1382,7 +1402,7 @@ mod tests {
                     function: None,
                     pin: 0,
                     source: nt_acpi::PciRouteSource::InterruptLink {
-                        name: String::from("LNKA"),
+                        name: String::from("^LNKA"),
                         resource_index: 0,
                     },
                 }],
@@ -1395,7 +1415,7 @@ mod tests {
                     function: None,
                     pin: 0,
                     source: nt_acpi::PciRouteSource::InterruptLink {
-                        name: String::from("^LNKA"),
+                        name: String::from("^^LNKA"),
                         resource_index: 0,
                     },
                 }],
@@ -1432,14 +1452,16 @@ mod tests {
         assert_eq!(links.routing_queries().len(), 2);
         assert_eq!(links.link_queries().len(), 1);
         assert_eq!(links.binding_count(), 2);
-        assert_eq!(links.link_queries()[0].endpoint, provider(44));
+        // LiberNT METHOD_EX rejects a sibling link on the PCI-root PDO with
+        // STATUS_OBJECT_PATH_INVALID; use the link PDO from BusRelations.
+        assert_eq!(links.link_queries()[0].endpoint, provider(45));
         assert_eq!(
             links.link_queries()[0].object_path,
-            path("\\_SB_.PCI0.LNKA")
+            path("\\_SB_.LNKA")
         );
         assert_eq!(
             links.link_queries()[0].method_path,
-            path("\\_SB_.PCI0.LNKA._CRS")
+            path("\\_SB_.LNKA._CRS")
         );
         assert!(links.is_current(&catalog, &inventory, &routes));
     }
@@ -1540,10 +1562,12 @@ mod tests {
         let candidates = [
             AcpiPciLinkCandidateFact {
                 relation_owner: owner,
+                endpoint: provider(45),
                 path: path("\\_SB_.PCI0.LNKA"),
             },
             AcpiPciLinkCandidateFact {
                 relation_owner: owner,
+                endpoint: provider(46),
                 path: path("\\_SB_.PCI0.LNKB"),
             },
         ];
