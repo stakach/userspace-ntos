@@ -77,7 +77,7 @@ pub use hive::{
     CurrentControlSetError, DeleteKeyError, Hive, HiveId, HiveKind, HiveMountTable,
     HiveOverlayError, HiveTransaction, HiveValueBlobCompactError, HiveValueBlobCompaction,
     MutableHiveSet, RegistryValueCopyProvenance, RegistryValueCopyProvenanceTable,
-    HiveValueJournalPhase, PreparedSetValue, RegistryValueType, ResolvedHiveKey,
+    HiveValueJournalPhase, OwnedPreparedSetValue, PreparedSetValue, RegistryValueType, ResolvedHiveKey,
     ResolvedHiveValue, RetainedHiveValueJournal, SetValueError,
     SYSTEM_HIVE_PATH,
 };

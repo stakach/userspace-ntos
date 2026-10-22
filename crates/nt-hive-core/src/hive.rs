@@ -12,7 +12,7 @@ use nt_page_storage::PageSequence;
 
 #[path = "hive_set_value.rs"]
 mod set_value;
-pub use set_value::{PreparedSetValue, SetValueError};
+pub use set_value::{OwnedPreparedSetValue, PreparedSetValue, SetValueError};
 #[path = "hive_value_journal.rs"]
 mod value_journal;
 pub use value_journal::{HiveValueJournalPhase, RetainedHiveValueJournal};
@@ -1528,6 +1528,8 @@ impl RegistryValueCopyProvenanceTable {
 pub struct MutableHiveSet {
     mounts: HiveMountTable,
     hives: Vec<(HiveId, Hive)>,
+    retained_value_owners: Vec<(HiveId, u64)>,
+    next_value_owner: u64,
 }
 
 impl MutableHiveSet {
@@ -1535,6 +1537,8 @@ impl MutableHiveSet {
         Self {
             mounts: HiveMountTable::new(),
             hives: Vec::new(),
+            retained_value_owners: Vec::new(),
+            next_value_owner: 1,
         }
     }
 
@@ -1554,7 +1558,12 @@ impl MutableHiveSet {
             .filter(|entry| entry.root.eq_ignore_ascii_case(root_path))
             .any(|entry| self.hive(entry.hive)
                 .is_some_and(|owned| owned.pending_value_journal.is_some()));
-        if retained_id || retained_root {
+        if retained_id || retained_root
+            || self.retained_value_owners.iter().any(|(id, _)| *id == hive_id)
+            || self.mounts.mounts.iter()
+                .filter(|entry| entry.root.eq_ignore_ascii_case(root_path))
+                .any(|entry| self.retained_value_owners.iter().any(|(id, _)| *id == entry.hive))
+        {
             return Err(CurrentControlSetError::RetainedPublication);
         }
         let current_control_set = if root_path.eq_ignore_ascii_case(SYSTEM_HIVE_PATH) {
@@ -1579,7 +1588,9 @@ impl MutableHiveSet {
         let hive_id = self.mounts.mounts.iter()
             .find(|entry| entry.root.eq_ignore_ascii_case(root_path))?.hive;
         let index = self.hives.iter().position(|(id, _)| *id == hive_id)?;
-        if self.hives[index].1.pending_value_journal.is_some() {
+        if self.hives[index].1.pending_value_journal.is_some()
+            || self.retained_value_owners.iter().any(|(id, _)| *id == hive_id)
+        {
             return None;
         }
         self.mounts.unmount(root_path)?;
@@ -1594,6 +1605,9 @@ impl MutableHiveSet {
     }
 
     pub fn hive_mut(&mut self, hive_id: HiveId) -> Option<&mut Hive> {
+        if self.retained_value_owners.iter().any(|(id, _)| *id == hive_id) {
+            return None;
+        }
         self.hives
             .iter_mut()
             .find(|(id, _)| *id == hive_id)
