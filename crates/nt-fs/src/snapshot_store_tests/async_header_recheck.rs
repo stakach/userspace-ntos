@@ -35,5 +35,10 @@ fn async_header_recheck_reads_exact_pair_and_rejects_changed_header() {
     disk.read_sector(request.lba, &mut bytes).unwrap();
     assert_eq!(stale.complete_read(request, &bytes),
         Err(AsyncSnapshotCommitError::Store(SnapshotBlockStoreError::Corrupt)));
+    assert_eq!(stale.pending(), Some(request));
+    assert_eq!(stale.release_unentered(request),
+        Err(AsyncSnapshotCommitError::Store(SnapshotBlockStoreError::Corrupt)));
+    assert_eq!(stale.complete_read(request, &bytes),
+        Err(AsyncSnapshotCommitError::Store(SnapshotBlockStoreError::Corrupt)));
     assert!(stale.finish().is_err());
 }

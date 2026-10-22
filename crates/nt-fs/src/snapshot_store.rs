@@ -32,6 +32,11 @@ pub use wal_anchor::WalSnapshotAnchorUpdate;
 mod epoch_rollover;
 pub use epoch_rollover::WalSnapshotEpochRollover;
 
+#[path = "snapshot_async_epoch_rollover.rs"]
+mod async_epoch_rollover;
+pub use async_epoch_rollover::AsyncWalEpochRollover;
+
+
 #[cfg(test)]
 #[path = "snapshot_store_tests.rs"]
 mod tests;
@@ -191,6 +196,13 @@ pub struct VerifiedPairedWalSnapshot {
 }
 
 impl VerifiedPairedWalSnapshot {
+    /// In-memory durability fence for a pair retained from settled header/flush ACKs.
+    /// The caller must also hold the exact exclusive physical reserve lease.
+    pub fn matches_cached_fence(&self, store: SnapshotBlockStore, anchor: WalSnapshotAnchor) -> bool {
+        self.store == store && anchor.incarnation != 0
+            && self.manifest.anchor() == anchor
+    }
+
     pub fn manifest(&self) -> WalSnapshotManifest {
         self.manifest
     }

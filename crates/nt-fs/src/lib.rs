@@ -93,7 +93,7 @@ pub use path::{
 pub use query::*;
 pub use snapshot_store::{
     AnchoredWalPublication, AsyncSnapshotCommit, AsyncSnapshotCommitError, AsyncSnapshotHeaderRecheck,
-    AsyncSnapshotIoKind, AsyncSnapshotRequest, AsyncWalSnapshotAnchorUpdate,
+    AsyncSnapshotIoKind, AsyncSnapshotRequest, AsyncWalSnapshotAnchorUpdate, AsyncWalEpochRollover,
     RecheckedPairedWalSnapshot, BootSnapshotRecovery,
     PayloadSectorReader, PayloadSectorWriter, SnapshotBlockDevice, SnapshotBlockStore,
     SnapshotBlockStoreError, SnapshotPayloadReader, SnapshotPayloadSink, SnapshotReadFormat,

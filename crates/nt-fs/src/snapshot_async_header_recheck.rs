@@ -77,6 +77,7 @@ impl AsyncSnapshotHeaderRecheck {
     pub fn release_unentered(&mut self, request: AsyncSnapshotRequest)
         -> Result<(), AsyncSnapshotCommitError>
     {
+        if let Some(error) = self.failure { return Err(AsyncSnapshotCommitError::Store(error)); }
         if self.pending != Some(request) { return Err(AsyncSnapshotCommitError::WrongTicket); }
         self.pending = None;
         Ok(())
@@ -85,6 +86,7 @@ impl AsyncSnapshotHeaderRecheck {
     pub fn complete_read(&mut self, request: AsyncSnapshotRequest, bytes: &[u8])
         -> Result<(), AsyncSnapshotCommitError>
     {
+        if let Some(error) = self.failure { return Err(AsyncSnapshotCommitError::Store(error)); }
         if self.pending != Some(request) { return Err(AsyncSnapshotCommitError::WrongTicket); }
         if request.kind != AsyncSnapshotIoKind::Read { return Err(AsyncSnapshotCommitError::WrongKind); }
         if bytes.len() != request.bytes { return Err(AsyncSnapshotCommitError::Incomplete); }

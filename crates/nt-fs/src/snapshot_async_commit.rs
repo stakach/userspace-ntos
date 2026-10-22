@@ -75,6 +75,7 @@ pub struct AsyncSnapshotCommit<P: AsRef<[u8]>> {
     generation: u64,
     write_buffer: Vec<u8>,
     failure: Option<SnapshotBlockStoreError>,
+    uncertain: bool,
 }
 
 impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
@@ -128,6 +129,7 @@ impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
             generation: 0,
             write_buffer,
             failure: None,
+            uncertain: false,
         })
     }
 
@@ -346,6 +348,8 @@ impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
     pub fn release_unentered(&mut self, request: AsyncSnapshotRequest)
         -> Result<(), AsyncSnapshotCommitError>
     {
+        if self.uncertain { return Err(AsyncSnapshotCommitError::Outstanding); }
+        if let Some(error) = self.failure { return Err(AsyncSnapshotCommitError::Store(error)); }
         if self.pending != Some(request) { return Err(AsyncSnapshotCommitError::WrongTicket); }
         self.pending = None;
         Ok(())
@@ -355,7 +359,9 @@ impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
         if self.pending != Some(request) {
             return Err(AsyncSnapshotCommitError::WrongTicket);
         }
-        // The exact retained request is the uncertainty state. No new request can enter.
+        // A late exact terminal+ACK may still resolve this request, but it cannot be released
+        // or retried while the effect remains uncertain.
+        self.uncertain = true;
         Ok(())
     }
 
@@ -364,7 +370,9 @@ impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
         request: AsyncSnapshotRequest,
         kind: AsyncSnapshotIoKind,
     ) -> Result<(), AsyncSnapshotCommitError> {
-        if self.pending != Some(request) {
+        if let Some(error) = self.failure {
+            Err(AsyncSnapshotCommitError::Store(error))
+        } else if self.pending != Some(request) {
             Err(AsyncSnapshotCommitError::WrongTicket)
         } else if request.kind != kind {
             Err(AsyncSnapshotCommitError::WrongKind)
@@ -482,6 +490,7 @@ impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
             _ => return Err(AsyncSnapshotCommitError::WrongKind),
         }
         self.pending = None;
+        self.uncertain = false;
         Ok(())
     }
 
@@ -490,6 +499,7 @@ impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
         request: AsyncSnapshotRequest,
         transferred: usize,
     ) -> Result<(), AsyncSnapshotCommitError> {
+        if let Some(error) = self.failure { return Err(AsyncSnapshotCommitError::Store(error)); }
         if self.pending != Some(request) {
             return Err(AsyncSnapshotCommitError::WrongTicket);
         }
@@ -515,6 +525,7 @@ impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
             _ => return Err(AsyncSnapshotCommitError::WrongKind),
         };
         self.pending = None;
+        self.uncertain = false;
         Ok(())
     }
 
@@ -533,6 +544,18 @@ impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
     /// All completed native reads, writes, and flushes must have reached exact provider
     /// terminal completion and ACK under one reserve lease. A local reply is not a barrier.
     pub unsafe fn finish_with_paired_proof(self) -> Result<(u64, VerifiedPairedWalSnapshot), Self> {
+        unsafe { self.finish_with_payload_and_paired_proof() }
+            .map(|(_payload, generation, proof)| (generation, proof))
+    }
+
+    /// Preserve the exact captured payload for a second folded snapshot pass. The proof is
+    /// minted only after the same terminal and ACK precondition as `finish_with_paired_proof`.
+    /// # Safety
+    /// Every completed native request must have reached exact provider terminal and ACK under
+    /// the same exclusive reserve lease.
+    pub unsafe fn finish_with_payload_and_paired_proof(self)
+        -> Result<(P, u64, VerifiedPairedWalSnapshot), Self>
+    {
         if !self.is_done() || self.failure.is_some() { return Err(self); }
         let other = 1 - self.target_slot;
         let ScanResult::Valid(unchanged) = self.scan[other as usize] else { return Err(self); };
@@ -548,7 +571,7 @@ impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
             else { [unchanged, published] };
         let Ok(manifest) = SnapshotBlockStore::paired_manifest(plans) else { return Err(self); };
         let proof = VerifiedPairedWalSnapshot { store: self.store, plans, manifest };
-        Ok((self.generation, proof))
+        Ok((self.payload, self.generation, proof))
     }
 
     /// The old synchronous entry point consumes precisely these same requests. Native callers

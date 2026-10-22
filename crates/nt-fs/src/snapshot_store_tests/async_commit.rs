@@ -109,8 +109,35 @@ fn native_checkpoint_mints_paired_proof_from_completed_io_without_postcommit_rea
     assert_eq!(generation, 3);
     assert_eq!(disk.read_attempts, reads);
     assert_eq!(pair.anchor(), baseline().anchor());
+    let reserve = crate::SnapshotReserve::new((), 91u64, SnapshotBlockStore::new(0, 16));
+    let lease = reserve.try_acquire().unwrap();
+    assert!(pair.matches_cached_fence(lease.store(), baseline().anchor()));
+    assert!(!pair.matches_cached_fence(SnapshotBlockStore::new(1, 16), baseline().anchor()));
+    assert!(!pair.matches_cached_fence(lease.store(), WalSnapshotAnchor {
+        incarnation: 77, serial: 1, end_lba: 1,
+    }));
+    // A pending native owner retains this physical lease and excludes NtFlushKey.
+    assert!(reserve.try_acquire().is_none());
+    drop(lease);
+    assert!(reserve.try_acquire().is_some());
     assert_eq!(SnapshotBlockStore::new(0, 16)
         .recheck_verified_paired_wal_snapshot(&mut disk, &pair), Ok(pair.manifest()));
+}
+
+#[test]
+fn folded_first_pass_returns_the_same_owned_payload_for_second_pass() {
+    let payload = alloc::vec![0x5c; 1300];
+    let (mut disk, mut commit) = fixture(payload.clone());
+    while let Some(request) = commit.enter_next().unwrap() {
+        perform(&mut disk, &mut commit, request);
+    }
+    // Each synthetic completion above executes the exact backing operation and flush.
+    let (returned, generation, pair) = unsafe {
+        commit.finish_with_payload_and_paired_proof()
+    }.ok().unwrap();
+    assert_eq!(returned, payload);
+    assert_eq!(generation, 3);
+    assert_eq!(pair.anchor(), baseline().anchor());
 }
 
 #[test]
@@ -138,6 +165,8 @@ fn every_async_read_write_and_flush_keeps_its_exact_ticket_until_completion() {
             let request = commit.enter_next().unwrap().unwrap();
             if index == uncertain_step {
                 commit.lose(request).unwrap();
+                assert_eq!(commit.release_unentered(request),
+                    Err(AsyncSnapshotCommitError::Outstanding));
                 assert_eq!(
                     commit.enter_next(),
                     Err(AsyncSnapshotCommitError::Outstanding)
