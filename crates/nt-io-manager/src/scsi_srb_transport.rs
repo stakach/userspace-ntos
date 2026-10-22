@@ -15,6 +15,7 @@ const SRB_DATA_TRANSFER_LENGTH: usize = 0x10;
 const SRB_DATA_BUFFER: usize = 0x18;
 const SRB_SENSE_BUFFER: usize = 0x20;
 const SRB_NEXT: usize = 0x28;
+#[cfg(test)]
 const SRB_ORIGINAL_REQUEST: usize = 0x30;
 const SRB_EXTENSION: usize = 0x38;
 const MDL_BYTE_COUNT: usize = 0x28;
@@ -22,17 +23,31 @@ const MDL_BYTE_COUNT: usize = 0x28;
 /// Copy only scalar SRB state onto the provider wire. The five x64 pointer slots are
 /// source-domain addresses and must never be serialized across an address domain.
 pub fn sanitized_legacy_srb(
-    source: &[u8], data_length: usize, sense_length: usize,
+    source: &[u8],
+    data_length: usize,
+    sense_length: usize,
 ) -> Result<[u8; WDM_X64_LEGACY_SRB_SIZE], ScsiSrbError> {
     if source.len() != WDM_X64_LEGACY_SRB_SIZE
         || usize::from(u16::from_le_bytes([source[0], source[1]])) != WDM_X64_LEGACY_SRB_SIZE
-        || u32::from_le_bytes(source[SRB_DATA_TRANSFER_LENGTH..SRB_DATA_TRANSFER_LENGTH + 4]
-            .try_into().unwrap()) as usize != data_length
+        || u32::from_le_bytes(
+            source[SRB_DATA_TRANSFER_LENGTH..SRB_DATA_TRANSFER_LENGTH + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize
+            != data_length
         || usize::from(source[0x0b]) != sense_length
-        || (data_length != 0 && u64::from_le_bytes(source[SRB_DATA_BUFFER..SRB_DATA_BUFFER + 8]
-            .try_into().unwrap()) == 0)
-        || (sense_length != 0 && u64::from_le_bytes(source[SRB_SENSE_BUFFER..SRB_SENSE_BUFFER + 8]
-            .try_into().unwrap()) == 0)
+        || (data_length != 0
+            && u64::from_le_bytes(
+                source[SRB_DATA_BUFFER..SRB_DATA_BUFFER + 8]
+                    .try_into()
+                    .unwrap(),
+            ) == 0)
+        || (sense_length != 0
+            && u64::from_le_bytes(
+                source[SRB_SENSE_BUFFER..SRB_SENSE_BUFFER + 8]
+                    .try_into()
+                    .unwrap(),
+            ) == 0)
         || source[SRB_NEXT..SRB_NEXT + 8] != [0; 8]
     {
         return Err(ScsiSrbError::InvalidSrb);
@@ -46,13 +61,20 @@ pub fn sanitized_legacy_srb(
 /// Merge provider completion into the retained source SRB without importing its address-space
 /// pointers. Data and sense bytes are copied through their separately bounded allocations.
 pub fn merge_provider_legacy_srb(
-    source: &[u8], provider: &[u8], data_capacity: usize, sense_capacity: usize,
+    source: &[u8],
+    provider: &[u8],
+    data_capacity: usize,
+    sense_capacity: usize,
 ) -> Result<[u8; WDM_X64_LEGACY_SRB_SIZE], ScsiSrbError> {
     sanitized_legacy_srb(source, data_capacity, sense_capacity)?;
     if provider.len() != WDM_X64_LEGACY_SRB_SIZE
         || usize::from(u16::from_le_bytes([provider[0], provider[1]])) != WDM_X64_LEGACY_SRB_SIZE
-        || u32::from_le_bytes(provider[SRB_DATA_TRANSFER_LENGTH..SRB_DATA_TRANSFER_LENGTH + 4]
-            .try_into().unwrap()) as usize > data_capacity
+        || u32::from_le_bytes(
+            provider[SRB_DATA_TRANSFER_LENGTH..SRB_DATA_TRANSFER_LENGTH + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize
+            > data_capacity
         || usize::from(provider[0x0b]) > sense_capacity
         || provider[SRB_NEXT..SRB_NEXT + 8] != [0; 8]
     {
@@ -72,6 +94,52 @@ pub struct ScsiSrbRoute {
     pub relation_generation: u64,
     /// Authenticated pointer registration for this PDO in the provider address space.
     pub provider_pdo: u64,
+}
+
+/// Canonical major-0x0f stack parameters. The SRB image is pointer-free; retained transfer
+/// and sense bytes live in the detached owner's buffers, not in this copyable stack value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScsiParameters {
+    pub route: ScsiSrbRoute,
+    pub srb: [u8; WDM_X64_LEGACY_SRB_SIZE],
+    pub data_length: u32,
+    pub sense_length: u8,
+}
+
+impl ScsiParameters {
+    pub fn from_source(
+        route: ScsiSrbRoute,
+        source_srb: &[u8],
+        data_length: u32,
+        sense_length: u8,
+    ) -> Result<Self, ScsiSrbError> {
+        let wire = sanitized_legacy_srb(source_srb, data_length as usize, sense_length as usize)?;
+        Self::from_wire(route, wire, data_length, sense_length)
+    }
+
+    pub fn from_wire(
+        route: ScsiSrbRoute,
+        srb: [u8; WDM_X64_LEGACY_SRB_SIZE],
+        data_length: u32,
+        sense_length: u8,
+    ) -> Result<Self, ScsiSrbError> {
+        if !route.valid() {
+            return Err(ScsiSrbError::InvalidRoute);
+        }
+        if usize::from(u16::from_le_bytes([srb[0], srb[1]])) != WDM_X64_LEGACY_SRB_SIZE
+            || u32::from_le_bytes(srb[0x10..0x14].try_into().unwrap()) != data_length
+            || srb[0x0b] != sense_length
+            || srb[SRB_DATA_BUFFER..SRB_EXTENSION + 8] != [0; 0x28]
+        {
+            return Err(ScsiSrbError::InvalidSrb);
+        }
+        Ok(Self {
+            route,
+            srb,
+            data_length,
+            sense_length,
+        })
+    }
 }
 
 impl ScsiSrbRoute {
@@ -102,6 +170,19 @@ pub enum ScsiSrbError {
     WrongIdentity,
     WrongPhase,
     ExcessInformation,
+}
+
+/// IoStatus.Information is a byte count, not an address or the SRB's returned transfer length.
+/// Keep its native scalar value only inside the captured data allocation's bound.
+pub fn bounded_scsi_information(
+    information: u64,
+    data_capacity: usize,
+) -> Result<u64, ScsiSrbError> {
+    if information > data_capacity as u64 {
+        Err(ScsiSrbError::ExcessInformation)
+    } else {
+        Ok(information)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -179,7 +260,9 @@ impl ScsiSrbTransport {
         }
         let sense_length = usize::from(srb[0x0b]);
         let sense_pointer = u64::from_le_bytes(
-            srb[SRB_SENSE_BUFFER..SRB_SENSE_BUFFER + 8].try_into().unwrap(),
+            srb[SRB_SENSE_BUFFER..SRB_SENSE_BUFFER + 8]
+                .try_into()
+                .unwrap(),
         );
         if sense_length != sense.len()
             || (sense_length != 0 && (projection.sense == 0 || sense_pointer != projection.sense))
@@ -288,16 +371,15 @@ impl ScsiSrbTransport {
         ) {
             return Err(ScsiSrbError::WrongPhase);
         }
-        if returned_srb.len() != self.srb.len() || returned_data.len() != self.data.len()
-            || returned_sense.len() != self.sense.len() {
+        if returned_srb.len() != self.srb.len()
+            || returned_data.len() != self.data.len()
+            || returned_sense.len() != self.sense.len()
+        {
             return Err(ScsiSrbError::InvalidSrb);
         }
-        if information > self.data.len() as u64 {
-            return Err(ScsiSrbError::ExcessInformation);
-        }
-        let merged = merge_provider_legacy_srb(
-            &self.srb, returned_srb, self.data.len(), self.sense.len(),
-        )?;
+        bounded_scsi_information(information, self.data.len())?;
+        let merged =
+            merge_provider_legacy_srb(&self.srb, returned_srb, self.data.len(), self.sense.len())?;
         self.srb.copy_from_slice(&merged);
         self.data.copy_from_slice(returned_data);
         self.sense.copy_from_slice(returned_sense);
@@ -417,6 +499,20 @@ mod tests {
     }
 
     #[test]
+    fn information_cannot_smuggle_a_provider_address_into_a_zero_data_srb() {
+        assert_eq!(bounded_scsi_information(0, 0), Ok(0));
+        assert_eq!(
+            bounded_scsi_information(u64::MAX, 0),
+            Err(ScsiSrbError::ExcessInformation)
+        );
+        assert_eq!(bounded_scsi_information(7, 8), Ok(7));
+        assert_eq!(
+            bounded_scsi_information(9, 8),
+            Err(ScsiSrbError::ExcessInformation)
+        );
+    }
+
+    #[test]
     fn mismatched_srb_data_or_mdl_is_rejected_before_entry() {
         let base = transport();
         let mut bad = base.srb().to_vec();
@@ -483,7 +579,10 @@ mod tests {
         assert_eq!(&wire[0x48..], &source[0x48..]);
 
         source[SRB_NEXT..SRB_NEXT + 8].copy_from_slice(&0x4455_6677_8899_aabbu64.to_le_bytes());
-        assert_eq!(sanitized_legacy_srb(&source, 8, 0x20), Err(ScsiSrbError::InvalidSrb));
+        assert_eq!(
+            sanitized_legacy_srb(&source, 8, 0x20),
+            Err(ScsiSrbError::InvalidSrb)
+        );
     }
 
     #[test]
@@ -510,15 +609,21 @@ mod tests {
         provider[0x48] = 0x28;
         let merged = merge_provider_legacy_srb(&source, &provider, 8, 0x20).unwrap();
         assert_eq!(merged[3], 1);
-        assert_eq!(&merged[SRB_DATA_TRANSFER_LENGTH..SRB_DATA_TRANSFER_LENGTH + 4],
-            &4u32.to_le_bytes());
-        assert_eq!(&merged[SRB_DATA_BUFFER..SRB_EXTENSION + 8],
-            &source[SRB_DATA_BUFFER..SRB_EXTENSION + 8]);
+        assert_eq!(
+            &merged[SRB_DATA_TRANSFER_LENGTH..SRB_DATA_TRANSFER_LENGTH + 4],
+            &4u32.to_le_bytes()
+        );
+        assert_eq!(
+            &merged[SRB_DATA_BUFFER..SRB_EXTENSION + 8],
+            &source[SRB_DATA_BUFFER..SRB_EXTENSION + 8]
+        );
         assert_eq!(merged[0x48], 0x28);
 
         provider[SRB_DATA_TRANSFER_LENGTH..SRB_DATA_TRANSFER_LENGTH + 4]
             .copy_from_slice(&9u32.to_le_bytes());
-        assert_eq!(merge_provider_legacy_srb(&source, &provider, 8, 0x20),
-            Err(ScsiSrbError::InvalidSrb));
+        assert_eq!(
+            merge_provider_legacy_srb(&source, &provider, 8, 0x20),
+            Err(ScsiSrbError::InvalidSrb)
+        );
     }
 }

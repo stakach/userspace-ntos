@@ -289,6 +289,10 @@ pub trait DriverDispatchBackend {
     /// Request cancellation of a (typically pending) IRP owned by this backend.
     fn cancel_irp(&mut self, irp_id: IrpId) -> Result<(), NtStatus>;
 
+    /// Advance retained work only from an explicit outer service turn. The completion pump may
+    /// run recursively and must only observe terminal records, never start new native effects.
+    fn service_pending(&mut self) -> usize { 0 }
+
     /// Poll for a ready final completion of a previously-pending IRP. The I/O
     /// Manager's `pump` drains these. Backends that only complete synchronously
     /// use the default (never any pending completions).

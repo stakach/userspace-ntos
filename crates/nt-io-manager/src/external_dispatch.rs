@@ -37,6 +37,17 @@ pub(crate) fn validate_external_parameter_layout(
     system_buffer_len: usize,
 ) -> Result<(), NtStatus> {
     match params {
+        IoParameters::Scsi(parameters) => {
+            let transfer = parameters.data_length
+                .checked_add(u32::from(parameters.sense_length))
+                .ok_or(NtStatus::INVALID_PARAMETER)?;
+            if major != nt_io_abi::major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+                || input_len != transfer
+                || output_len != transfer.checked_add(64 + 0x58).ok_or(NtStatus::INVALID_PARAMETER)?
+                || system_buffer_len != input_len.max(output_len) as usize
+                || !stack_flags.is_empty()
+            { return Err(NtStatus::INVALID_PARAMETER); }
+        }
         IoParameters::Pnp(parameters) => {
             let expected_input = parameters.input_len();
             let expected_output = parameters.output_len();

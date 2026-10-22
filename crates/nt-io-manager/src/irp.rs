@@ -376,6 +376,7 @@ pub enum IoParameters {
     Write(ReadWriteParameters),
     DeviceControl(DeviceControlParameters),
     InternalDeviceControl(DeviceControlParameters),
+    Scsi(crate::scsi_srb_transport::ScsiParameters),
     FlushBuffers,
     QueryInformation(InformationParameters),
     SetInformation(SetInformationParameters),
@@ -404,6 +405,10 @@ impl IoParameters {
             IoParameters::Write(p) => (p.length.min(cap), 0),
             IoParameters::DeviceControl(p) | IoParameters::InternalDeviceControl(p) => {
                 (p.input_len.min(cap), p.output_len.min(cap))
+            }
+            IoParameters::Scsi(p) => {
+                let transfer = p.data_length.saturating_add(u32::from(p.sense_length));
+                (transfer.min(cap), transfer.saturating_add(64 + 0x58).min(cap))
             }
             IoParameters::QueryInformation(p) => (0, p.length.min(cap)),
             IoParameters::SetInformation(p) => (p.length.min(cap), 0),

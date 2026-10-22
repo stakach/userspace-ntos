@@ -31,6 +31,23 @@ impl PciController {
     }
 }
 
+/// A bus-validated PDO identity remains authoritative while its optional queried PCI
+/// properties and native DMA grant are pending. Either observation identifies the same
+/// physical controller; a missing property query cannot turn off its media proof.
+pub fn relation_requires_native_disk_proof(
+    controller: PciController,
+    relation_pdo: u64,
+    accepted_pdo: Option<u64>,
+    observed_pci_location: Option<(u32, u32)>,
+) -> bool {
+    accepted_pdo == Some(relation_pdo)
+        || observed_pci_location.is_some_and(|(bus, address)| {
+            bus == u32::from(controller.bus)
+                && address == ((u32::from(controller.device) << 16)
+                    | u32::from(controller.function))
+        })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     InvalidController,
@@ -453,15 +470,28 @@ impl PciDmaHandoff {
     }
 
     /// Complete only after a real native block route has been authenticated and can service the mount.
+    pub fn can_activate_native(
+        &self,
+        key: PciController,
+        root: u64,
+        route: u64,
+    ) -> Result<(), Error> {
+        if route == 0 { return Err(Error::InvalidController); }
+        let row = self.record(key, root)?;
+        if row.state != ControllerState::NativeStarting || row.native_route.is_some() {
+            return Err(Error::WrongPhase);
+        }
+        Ok(())
+    }
+
+    /// Complete only after a real native block route has been authenticated and can service the mount.
     pub fn activate_native(
         &mut self,
         key: PciController,
         root: u64,
         route: u64,
     ) -> Result<(), Error> {
-        if route == 0 {
-            return Err(Error::InvalidController);
-        }
+        self.can_activate_native(key, root, route)?;
         let row = self.record_mut(key, root)?;
         if row.state != ControllerState::NativeStarting {
             return Err(Error::WrongPhase);
@@ -493,6 +523,16 @@ mod tests {
         let mut ledger = PciDmaHandoff::new();
         ledger.register(AHCI, 41, 0x1000, 1).unwrap();
         ledger
+    }
+
+    #[test]
+    fn boot_controller_relation_requires_proof_before_dma_ready_or_properties_arrive() {
+        let pdo = 91;
+        assert!(relation_requires_native_disk_proof(AHCI, pdo, Some(pdo), None));
+        assert!(relation_requires_native_disk_proof(AHCI, pdo, Some(pdo), Some((0, 2 << 16))));
+        assert!(relation_requires_native_disk_proof(AHCI, pdo, None, Some((0, 2 << 16))));
+        assert!(!relation_requires_native_disk_proof(AHCI, 92, Some(pdo), None));
+        assert!(!relation_requires_native_disk_proof(AHCI, 92, None, Some((0, 3 << 16))));
     }
 
     #[test]

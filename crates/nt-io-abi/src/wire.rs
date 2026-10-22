@@ -163,6 +163,9 @@ pub struct IrpDispatchRequest {
     pub power_system_context: u32,
     /// Raw `Parameters.Power.ShutdownType`; zero for PoRequestPowerIrp.
     pub power_shutdown_type: u32,
+    /// Exact accepted PDO relation generation for `_reserved0 == IRP_DISPATCH_SCSI_SRB`.
+    /// Zero for every other dispatch kind.
+    pub scsi_relation_generation: u64,
 }
 
 impl IrpDispatchRequest {
@@ -198,7 +201,7 @@ const _: () = {
     assert!(size_of::<IoDeviceControlRequest>() == 56);
     assert!(size_of::<IoFileRequest>() == 16);
     assert!(size_of::<IoCancelRequest>() == 16);
-    assert!(size_of::<IrpDispatchRequest>() == 272);
+    assert!(size_of::<IrpDispatchRequest>() == 280);
     assert!(core::mem::offset_of!(IrpDispatchRequest, file_create_options) == 228);
     assert!(core::mem::offset_of!(IrpDispatchRequest, create_case_sensitive) == 244);
     assert!(core::mem::offset_of!(IrpDispatchRequest, initial_information) == 248);

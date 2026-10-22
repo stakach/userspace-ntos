@@ -33,6 +33,30 @@ pub struct StorageHandoffKey {
     pub pdo: StoragePdo,
 }
 
+/// A later BusRelations generation may reaffirm the mounted PDO without replaying its media
+/// proof. Every physical identity and the native controller route must still be the same.
+pub fn validate_native_relation_refresh(
+    dma: &PciDmaHandoff,
+    published: StorageHandoffKey,
+    candidate: StorageHandoffKey,
+) -> Result<(), Error> {
+    if candidate.relation.generation < published.relation.generation
+        || candidate.relation.generation == 0
+        || candidate.controller != published.controller
+        || candidate.dma_root != published.dma_root
+        || candidate.mount != published.mount
+        || candidate.relation.bus_device != published.relation.bus_device
+        || candidate.relation.provider_domain != published.relation.provider_domain
+        || candidate.relation.provider_cookie != published.relation.provider_cookie
+        || candidate.pdo != published.pdo
+        || dma.state(published.controller, published.dma_root)
+            != Ok(ControllerState::NativeActive)
+        || dma.native_route(published.controller, published.dma_root)
+            != Ok(Some(published.pdo.device))
+    { return Err(Error::WrongOwner); }
+    Ok(())
+}
+
 /// Exact pre-drain observations of the mounted physical disk. The current FAT mount requires
 /// 512-byte sectors; no partition or controller identity is inferred from a device name.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -461,6 +485,27 @@ mod tests {
         dma.begin_drain(key.controller, key.dma_root).unwrap();
         dma.begin_native_start(key.controller, key.dma_root)
             .unwrap();
+    }
+
+    #[test]
+    fn refresh_reaffirms_exact_native_disk_without_replaying_proof() {
+        let (mut dma, key, _) = fixture();
+        native_start(&mut dma, key);
+        assert_eq!(dma.can_activate_native(key.controller, key.dma_root, key.pdo.device), Ok(()));
+        dma.activate_native(key.controller, key.dma_root, key.pdo.device).unwrap();
+        let mut next = key;
+        next.relation.generation += 1;
+        assert_eq!(validate_native_relation_refresh(&dma, key, next), Ok(()));
+        next.pdo.raw_pointer += 8;
+        assert_eq!(validate_native_relation_refresh(&dma, key, next), Err(Error::WrongOwner));
+        next.pdo = key.pdo;
+        next.relation.provider_cookie += 1;
+        assert_eq!(validate_native_relation_refresh(&dma, key, next), Err(Error::WrongOwner));
+        next.relation = key.relation;
+        next.relation.generation -= 1;
+        assert_eq!(validate_native_relation_refresh(&dma, key, next), Err(Error::WrongOwner));
+        assert_eq!(dma.can_activate_native(key.controller, key.dma_root, key.pdo.device),
+            Err(crate::pci_dma_handoff::Error::WrongPhase));
     }
 
     #[test]

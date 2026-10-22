@@ -348,6 +348,18 @@ fn validate_buffers(
                 && input == p.input_len
                 && output == p.output_len
         }
+        IoParameters::Scsi(p) => {
+            let transfer = p.data_length.checked_add(u32::from(p.sense_length));
+            request.major == major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+                && p.route.pdo == request.device_id
+                && request.file_id.is_none()
+                && request.stack_flags.is_empty()
+                && transfer == Some(input)
+                && transfer.and_then(|length| length.checked_add(64 + 0x58)) == Some(output)
+                && p.srb[0x18..0x40] == [0; 0x28]
+                && u32::from_le_bytes(p.srb[0x10..0x14].try_into().unwrap()) == p.data_length
+                && p.srb[0x0b] == p.sense_length
+        }
         IoParameters::QueryInformation(p) => {
             request.major == major::IRP_MJ_QUERY_INFORMATION && input == 0 && output == p.length
         }
@@ -374,6 +386,7 @@ fn validate_buffers(
                 request.parameters,
                 IoParameters::DeviceControl(_)
                     | IoParameters::InternalDeviceControl(_)
+                    | IoParameters::Scsi(_)
                     | IoParameters::FlushBuffers
             )
     {
@@ -438,12 +451,29 @@ impl<P: ObjectManagerPort> IoManager<P> {
         self.prepare_external_file_irp_owned_with_start(request, buffers, true)
     }
 
+    /// Prepare a pointer-free SCSI SRB at the exact accepted PDO. The source adapter retains
+    /// the physical SRB, MDL, data and sense allocations independently of this canonical IRP.
+    pub fn prepare_external_scsi_irp_owned_at_device(
+        &mut self,
+        request: ExternalFileIrpRequest,
+        buffers: ExternalFileIrpBuffers,
+    ) -> Result<PreparedExternalFileIrp, NtStatus> {
+        if request.file_id.is_some()
+            || !matches!((&request.parameters, request.major),
+                (IoParameters::Scsi(_), major::IRP_MJ_INTERNAL_DEVICE_CONTROL))
+        { return Err(NtStatus::INVALID_PARAMETER); }
+        self.prepare_external_file_irp_owned_with_start(request, buffers, true)
+    }
+
     fn prepare_external_file_irp_owned_with_start(
         &mut self,
         mut request: ExternalFileIrpRequest,
         buffers: ExternalFileIrpBuffers,
         exact_device: bool,
     ) -> Result<PreparedExternalFileIrp, NtStatus> {
+        if matches!(request.parameters, IoParameters::Scsi(_)) && !exact_device {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         let (input, output, total) = validate_buffers(&request, &buffers)?;
         let device = self
             .device(request.device_id)
