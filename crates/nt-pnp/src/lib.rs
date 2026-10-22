@@ -916,6 +916,38 @@ where
     None
 }
 
+/// Resolve an accepted PCI PDO using its bus-owned location and the enumerated identity.
+/// A short instance suffix such as LiberNT's `\\5F` does not encode an unambiguous BDF.
+pub fn find_pci_device_for_accepted_pdo<'a, H: AsRef<str>>(
+    devices: &'a [PciDevice],
+    instance_id: &str,
+    hardware_ids: &[H],
+    bus_number: u32,
+    address: u32,
+) -> Option<&'a PciDevice> {
+    let (Ok(bus), Ok(dev), Ok(func)) = (
+        u8::try_from(bus_number),
+        u8::try_from(address >> 16),
+        u8::try_from(address & 0xffff),
+    ) else {
+        return None;
+    };
+    if dev >= 32 || func >= 8 {
+        return None;
+    }
+    let pattern = parse_pci_id_pattern(instance_id)?;
+    devices.iter().find(|device| {
+        device.bus == bus
+            && device.dev == dev
+            && device.func == func
+            && pattern.matches(device)
+            && (hardware_ids.is_empty()
+                || hardware_ids.iter().any(|id| {
+                    parse_pci_id_pattern(id.as_ref()).is_some_and(|id| id.matches(device))
+                }))
+    })
+}
+
 /// Selects the bus-relative or translated side of one PnP resource assignment.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ResourceView {
@@ -2600,6 +2632,28 @@ mod tests {
             &[r"PCI\CC_020000"],
         );
         assert!(dev.is_none());
+    }
+
+    #[test]
+    fn accepted_libernt_pdo_location_selects_repeated_ahci_function() {
+        let first = PciDevice { bus: 0, dev: 2, func: 0, vendor: 0x8086, device: 0x2922,
+            class: 0x010601, header_type: 0, bridge: None, irq_line: 22, irq_pin: 1,
+            bars: vec![] };
+        let second = PciDevice { bus: 0, dev: 31, func: 2, ..first.clone() };
+        let devices = [first, second];
+        let instance = r"PCI\VEN_8086&DEV_2922&SUBSYS_11001AF4&REV_02\5F";
+        let hardware_ids = [r"PCI\VEN_8086&DEV_2922"];
+        assert_eq!(
+            find_pci_device_for_accepted_pdo(&devices, instance, &hardware_ids, 0, (31 << 16) | 2)
+                .map(|device| (device.dev, device.func)),
+            Some((31, 2)),
+        );
+        assert!(find_pci_device_for_accepted_pdo(
+            &devices, instance, &hardware_ids, 0, (30 << 16) | 2,
+        ).is_none());
+        assert!(find_pci_device_for_accepted_pdo(
+            &devices, r"PCI\VEN_1234&DEV_1111\5F", &hardware_ids, 0, (31 << 16) | 2,
+        ).is_none());
     }
 
     #[test]

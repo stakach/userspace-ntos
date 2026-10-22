@@ -46,6 +46,8 @@ pub const CM_RESOURCE_TYPE_MF_CARD_CONFIG: u8 = 131;
 /// Interrupt `Flags` bits.
 pub const CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE: u16 = 0;
 pub const CM_RESOURCE_INTERRUPT_LATCHED: u16 = 1;
+pub const CM_RESOURCE_INTERRUPT_MESSAGE: u16 = 2;
+pub const CM_RESOURCE_INTERRUPT_MESSAGE_TOKEN: u32 = u32::MAX - 1;
 
 /// Memory `Flags` bits.
 pub const CM_RESOURCE_MEMORY_READ_WRITE: u16 = 0;
