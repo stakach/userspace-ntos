@@ -993,6 +993,28 @@ fn select_io_resource_assignment_inner(
         while descriptor_index < descriptor_count {
             let first = descriptor_index;
             let descriptor = descriptor_base + first * IO_RESOURCE_DESCRIPTOR_SIZE;
+            if bytes[descriptor + 1] == CM_RESOURCE_TYPE_DEVICE_PRIVATE {
+                // PCI places a private BAR index after the address alternatives. It describes
+                // the preceding group; it is not another resource the host may grant.
+                let preceding_address = first > 0
+                    && matches!(
+                        bytes[descriptor - IO_RESOURCE_DESCRIPTOR_SIZE + 1],
+                        CM_RESOURCE_TYPE_MEMORY | CM_RESOURCE_TYPE_PORT,
+                    );
+                if !preceding_address
+                    || bytes[descriptor] != 0
+                    || bytes[descriptor + 2] != CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE
+                    || bytes[descriptor + 3..descriptor + 8] != [0; 5]
+                    || read_u32(bytes, descriptor + 8)
+                        .map_err(IoResourceAssignmentError::Malformed)?
+                        != 1
+                    || bytes[descriptor + 16..descriptor + IO_RESOURCE_DESCRIPTOR_SIZE] != [0; 16]
+                {
+                    return Err(IoResourceAssignmentError::UnsupportedDescriptor);
+                }
+                descriptor_index += 1;
+                continue;
+            }
             let option = bytes[descriptor];
             if option & IO_RESOURCE_ALTERNATIVE != 0 || !io_option_is_valid(option) {
                 return Err(IoResourceAssignmentError::UnsupportedDescriptor);
