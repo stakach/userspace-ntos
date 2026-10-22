@@ -2,6 +2,7 @@
 
 use super::{disk_census_ticks, platform_tsc_frequency_hz, Fat32};
 use nt_ahci::{Command, Error, FlushCommand, PortIo};
+use nt_pnp_context::native_storage_handoff::ExpectedDisk;
 
 struct Port {
     controller: u64,
@@ -86,6 +87,42 @@ pub(super) unsafe fn physical_sector_count(fat: &Fat32) -> Result<u64, Error> {
     };
     nt_ahci::lba48_sector_count(word(83), [word(100), word(101), word(102), word(103)])
         .ok_or(Error::Device)
+}
+
+/// Capture actual boot-controller media sectors before the irreversible DMA drain. A native
+/// LUN must later return these bytes and capacity through its own SRBs before it can serve the
+/// mounted FAT and snapshot reserve; GPT or a registry disk name is not that proof.
+pub(super) unsafe fn expected_disk(
+    fat: &Fat32,
+    physical_sectors: u64,
+) -> Result<ExpectedDisk, Error> {
+    if physical_sectors == 0
+        || fat.volume_start_lba == 0
+        || fat.volume_start_lba >= physical_sectors
+    {
+        return Err(Error::Device);
+    }
+    let mut sector_zero = [0u8; 512];
+    let mut volume_sector = [0u8; 512];
+    for (lba, output) in [
+        (0, &mut sector_zero),
+        (fat.volume_start_lba, &mut volume_sector),
+    ] {
+        if super::ahci_read_sector(fat.ahci_vaddr, fat.dma_vaddr, fat.dma_paddr, lba) != 0 {
+            return Err(Error::Device);
+        }
+        core::ptr::copy_nonoverlapping(
+            (fat.dma_vaddr + super::AHCI_DMA_DATA_OFFSET) as *const u8,
+            output.as_mut_ptr(),
+            output.len(),
+        );
+    }
+    Ok(ExpectedDisk {
+        sector_count: physical_sectors,
+        volume_lba: fat.volume_start_lba,
+        sector_zero,
+        volume_sector,
+    })
 }
 
 unsafe fn flush_owned(fat: &Fat32, selected: &mut Option<FlushCommand>) -> Result<(), Error> {

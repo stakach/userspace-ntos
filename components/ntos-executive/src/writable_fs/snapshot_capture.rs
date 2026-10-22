@@ -37,6 +37,10 @@ impl CapturedSnapshot {
     }
 }
 
+impl AsRef<[u8]> for CapturedSnapshot {
+    fn as_ref(&self) -> &[u8] { self.as_slice() }
+}
+
 impl Drop for CapturedSnapshot {
     fn drop(&mut self) {
         self.image.clear();

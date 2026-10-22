@@ -111,7 +111,7 @@ pub(crate) struct FatOpenMetadata {
 }
 
 impl FatOpenMetadata {
-    fn from_record(record: nt_fs::FatDirectoryRecord) -> Self {
+    pub(crate) fn from_record(record: nt_fs::FatDirectoryRecord) -> Self {
         let alternate_name = nt_fs::FatShortName::from_units(record.entry.short_name())
             .expect("FAT decoder bounds short names to its fixed 12-unit field");
         Self {
@@ -596,13 +596,13 @@ unsafe fn system32_cache_candidate_count(fs: &Fat32, system32_cluster: u32) -> u
 }
 
 unsafe fn system32_cache_build(fs: &Fat32) -> bool {
-    let Some(installed_root) = fat_find_open_metadata(fs, fs.root_cl, crate::installed_layout::ROOT) else {
+    let Some(installed_root) = fat_lookup_metadata(fs, fs.root_cl, crate::installed_layout::ROOT) else {
         return false;
     };
     if !installed_root.metadata.is_directory {
         return false;
     }
-    let Some(system32) = fat_find_open_metadata(fs, installed_root.first_cluster, b"system32") else {
+    let Some(system32) = fat_lookup_metadata(fs, installed_root.first_cluster, b"system32") else {
         return false;
     };
     if !system32.metadata.is_directory {
@@ -968,35 +968,31 @@ pub(crate) unsafe fn fat_read_file_range(
     written
 }
 
-fn fat_name_matches_ascii(name: &[u16], wanted: &[u8]) -> bool {
-    name.len() == wanted.len()
-        && name
-            .iter()
-            .zip(wanted)
-            .all(|(unit, byte)| *unit <= 0x7f && (*unit as u8).eq_ignore_ascii_case(byte))
-}
-
-unsafe fn fat_find_open_metadata(
+unsafe fn fat_lookup_metadata(
     fs: &Fat32,
-    directory_cluster: u32,
-    component: &[u8],
+    start_cluster: u32,
+    path: &[u8],
 ) -> Option<FatOpenMetadata> {
-    let mut found = None;
-    fat_visit_directory(fs, directory_cluster, |entry, first_cluster| {
-        let matches = fat_name_matches_ascii(entry.name(), component)
-            || (!entry.short_name().is_empty()
-                && fat_name_matches_ascii(entry.short_name(), component));
-        if matches {
-            found = Some(FatOpenMetadata::from_record(nt_fs::FatDirectoryRecord {
-                entry,
-                first_cluster,
-            }));
-            false
-        } else {
-            true
+    let geometry = nt_fs::FatPathGeometry {
+        fat_start_sector: fs.fat_start,
+        data_start_sector: fs.data_start,
+        total_sectors: fs.total_sectors,
+        sectors_per_cluster: fs.spc,
+    };
+    let mut lookup = nt_fs::FatPathLookup::new(geometry, start_cluster, path).ok()?;
+    loop {
+        let request = lookup.request()?;
+        let sector = fat_read_sector_checked(fs, request.sector)?;
+        let mut bytes = [0; 512];
+        core::ptr::copy_nonoverlapping(sector, bytes.as_mut_ptr(), bytes.len());
+        match lookup.feed(request, &bytes).ok()? {
+            nt_fs::FatPathProgress::Pending => {}
+            nt_fs::FatPathProgress::Found => {
+                return lookup.take_found().map(FatOpenMetadata::from_record);
+            }
+            nt_fs::FatPathProgress::NotFound => return None,
         }
-    });
-    found
+    }
 }
 
 /// Find one native FAT directory entry by its long name or physical short alias.
@@ -1006,7 +1002,7 @@ pub(crate) unsafe fn dir_find_lfn(
     directory_cluster: u32,
     component: &[u8],
 ) -> Option<(u32, u32, u8)> {
-    fat_find_open_metadata(fs, directory_cluster, component).map(FatOpenMetadata::entry_tuple)
+    fat_lookup_metadata(fs, directory_cluster, component).map(FatOpenMetadata::entry_tuple)
 }
 
 unsafe fn fat_open_path_metadata_inner(
@@ -1022,29 +1018,7 @@ unsafe fn fat_open_path_metadata_inner(
             }
         }
     }
-    let mut current = start_cluster;
-    let mut start = 0usize;
-    let mut result = None;
-    let mut index = 0usize;
-    while index <= path.len() {
-        let separator = index == path.len() || path[index] == b'\\' || path[index] == b'/';
-        if separator {
-            if index > start {
-                let entry = fat_find_open_metadata(fs, current, &path[start..index])?;
-                if index == path.len() {
-                    result = Some(entry);
-                } else {
-                    if !entry.metadata.is_directory {
-                        return None;
-                    }
-                    current = entry.first_cluster;
-                }
-            }
-            start = index + 1;
-        }
-        index += 1;
-    }
-    result
+    fat_lookup_metadata(fs, start_cluster, path)
 }
 
 pub(crate) fn fat_root_metadata(fs: &Fat32) -> FatOpenMetadata {
@@ -1200,6 +1174,7 @@ pub(crate) unsafe fn query_nt_path_metadata_into(
 static mut EXEC_FS: Option<Fat32> = None;
 static mut EXEC_FS_MOUNT_ID: Option<nt_memory_manager::SectionMountId> = None;
 static mut EXEC_BLOCK_ROUTE: Option<nt_fs::BlockRouteOwner> = None;
+static mut EXEC_EXPECTED_DISK: Option<nt_pnp_context::native_storage_handoff::ExpectedDisk> = None;
 
 /// All executive FAT copies and the snapshot reserve enter the same physical mount route.
 /// Before publication, only FAT bootstrap reads are allowed; the isolated host uses its
@@ -1236,6 +1211,99 @@ pub(crate) fn exec_mount_can_drain() -> bool {
     }
 }
 
+/// Phase observation for a caller that already holds the exact physical mount identity.
+pub(crate) fn exec_block_route_kind(mount: nt_memory_manager::SectionMountId) -> Option<nt_fs::BlockSourceKind> {
+    unsafe {
+        if *core::ptr::addr_of!(EXEC_FS_MOUNT_ID) != Some(mount) { return None; }
+        (&*core::ptr::addr_of!(EXEC_BLOCK_ROUTE)).as_ref().map(|route| route.source_kind())
+    }
+}
+
+/// Commit the proven native PDO to the same physical mount shared by FAT and snapshot I/O.
+/// The caller must retain the exact `NativeStorageHandoff::MountCommit` across this effect.
+pub(crate) fn commit_exec_block_route(
+    mount: nt_memory_manager::SectionMountId,
+    pdo: nt_io_manager::DeviceId,
+) -> Result<(), nt_fs::BlockRouteError> {
+    unsafe {
+        if *core::ptr::addr_of!(EXEC_FS_MOUNT_ID) != Some(mount) {
+            return Err(nt_fs::BlockRouteError::WrongMount);
+        }
+        (&mut *core::ptr::addr_of_mut!(EXEC_BLOCK_ROUTE))
+            .as_mut()
+            .ok_or(nt_fs::BlockRouteError::InvalidMount)?
+            .commit_native(mount.value(), pdo.raw())
+    }
+}
+
+pub(crate) fn enter_exec_native_block(
+    mount: nt_memory_manager::SectionMountId,
+    source: nt_fs::BlockSource,
+    operation: nt_fs::BlockOperation,
+) -> Result<nt_fs::NativeBlockTicket, nt_fs::BlockRouteError> {
+    unsafe {
+        if *core::ptr::addr_of!(EXEC_FS_MOUNT_ID) != Some(mount) {
+            return Err(nt_fs::BlockRouteError::WrongMount);
+        }
+        (&mut *core::ptr::addr_of_mut!(EXEC_BLOCK_ROUTE))
+            .as_mut()
+            .ok_or(nt_fs::BlockRouteError::InvalidMount)?
+            .enter_native(mount.value(), source, operation)
+    }
+}
+
+pub(crate) fn exec_native_block_pending(
+    mount: nt_memory_manager::SectionMountId,
+) -> Option<nt_fs::NativeBlockTicket> {
+    unsafe {
+        if *core::ptr::addr_of!(EXEC_FS_MOUNT_ID) != Some(mount) { return None; }
+        (&*core::ptr::addr_of!(EXEC_BLOCK_ROUTE)).as_ref()?.pending_native()
+    }
+}
+
+pub(crate) fn cancel_unentered_exec_native_block(
+    ticket: nt_fs::NativeBlockTicket,
+) -> Result<(), nt_fs::BlockRouteError> {
+    unsafe {
+        let route = (&mut *core::ptr::addr_of_mut!(EXEC_BLOCK_ROUTE))
+            .as_mut().ok_or(nt_fs::BlockRouteError::InvalidMount)?;
+        route.cancel_unentered_native(ticket)
+    }
+}
+
+pub(crate) fn mark_entered_exec_native_block(
+    ticket: nt_fs::NativeBlockTicket,
+) -> Result<(), nt_fs::BlockRouteError> {
+    unsafe {
+        let route = (&mut *core::ptr::addr_of_mut!(EXEC_BLOCK_ROUTE))
+            .as_mut().ok_or(nt_fs::BlockRouteError::InvalidMount)?;
+        route.lose_native(ticket)
+    }
+}
+
+/// Only a canonical provider completion may settle an entered native block request.
+pub(crate) fn complete_exec_native_block(
+    ticket: nt_fs::NativeBlockTicket,
+    transferred_bytes: u64,
+) -> Result<(), nt_fs::BlockRouteError> {
+    unsafe {
+        let route = (&mut *core::ptr::addr_of_mut!(EXEC_BLOCK_ROUTE))
+            .as_mut().ok_or(nt_fs::BlockRouteError::InvalidMount)?;
+        route.complete_native(ticket, transferred_bytes)
+    }
+}
+
+/// An exact failed provider terminal still retires its block ticket after canonical ACK.
+pub(crate) fn complete_exec_native_block_failure(
+    ticket: nt_fs::NativeBlockTicket,
+) -> Result<(), nt_fs::BlockRouteError> {
+    unsafe {
+        let route = (&mut *core::ptr::addr_of_mut!(EXEC_BLOCK_ROUTE))
+            .as_mut().ok_or(nt_fs::BlockRouteError::InvalidMount)?;
+        route.complete_native_failure(ticket)
+    }
+}
+
 pub(crate) fn begin_exec_mount_drain() -> Result<(), nt_fs::BlockRouteError> {
     unsafe {
         let mount = (*core::ptr::addr_of!(EXEC_FS_MOUNT_ID))
@@ -1254,9 +1322,11 @@ pub(crate) fn begin_exec_mount_drain() -> Result<(), nt_fs::BlockRouteError> {
 pub(crate) unsafe fn publish_exec_fs(fs: Fat32) -> Result<(), u32> {
     let slot = &mut *core::ptr::addr_of_mut!(EXEC_FS);
     if slot.is_some() { return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST); }
-    let id = crate::mounted_volume::allocate_mount_id()?;
     let physical_sectors = crate::ahci_maintenance::physical_sector_count(&fs)
         .map_err(|_| nt_fs::STATUS_DEVICE_NOT_READY)?;
+    let expected_disk = crate::ahci_maintenance::expected_disk(&fs, physical_sectors)
+        .map_err(|_| nt_fs::STATUS_DEVICE_NOT_READY)?;
+    let id = crate::mounted_volume::allocate_mount_id()?;
     let route = nt_fs::BlockRouteOwner::new(id.value(), physical_sectors)
         .map_err(|_| nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
     crate::writable_fs::snapshot_storage::publish(fs, id, physical_sectors)?;
@@ -1264,8 +1334,18 @@ pub(crate) unsafe fn publish_exec_fs(fs: Fat32) -> Result<(), u32> {
     (&mut *core::ptr::addr_of_mut!(EXEC_FAT_RANGE_CURSORS)).invalidate();
     *core::ptr::addr_of_mut!(EXEC_FS_MOUNT_ID) = Some(id);
     *core::ptr::addr_of_mut!(EXEC_BLOCK_ROUTE) = Some(route);
+    *core::ptr::addr_of_mut!(EXEC_EXPECTED_DISK) = Some(expected_disk);
     *slot = Some(fs);
     Ok(())
+}
+
+/// Immutable pre-drain media evidence for authenticating the replacement native LUN.
+pub(crate) unsafe fn exec_expected_disk(
+) -> Option<(nt_memory_manager::SectionMountId, nt_pnp_context::native_storage_handoff::ExpectedDisk)> {
+    Some((
+        (*core::ptr::addr_of!(EXEC_FS_MOUNT_ID))?,
+        (&*core::ptr::addr_of!(EXEC_EXPECTED_DISK)).as_ref()?.clone(),
+    ))
 }
 
 pub(crate) unsafe fn exec_fs_file_identity(file_id: u64) -> Option<nt_memory_manager::SectionFileIdentity> {

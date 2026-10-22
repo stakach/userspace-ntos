@@ -1,5 +1,9 @@
 # Lessons
 
+## Check The Pinned Storage Provider Before Encoding CDBs
+- ReactOS references can lag the pinned LiberNT release. ReactOS storahci lacks READ CAPACITY16, READ16/WRITE16, and SYNCHRONIZE CACHE, while LiberNT commit `8e478a22a1e8f8a22bab17131f3184a7b4548c3d` implements all of them plus an ATA FLUSH CACHE path. Inspect the exact release source before restricting or submitting a command.
+- A reusable SRB builder does not establish live provider support. Match its command set to the pinned driver source, then verify retained native completion and flush durability before mounting writable storage.
+
 ## Keep The Kernel-Facing DLL When Changing Userspace Media
 - An installed distribution supplies the user-mode image and drivers, but this project's
   source-built `ntdll.dll` is the interface to its NT kernel personality. Stage our DLL
@@ -729,3 +733,6 @@ diagnosis-free failure.
 ## Keep DMA Broker Allocations Authoritative
 - A missing native allocation record is not proof that a DMA buffer was freed. A driver can clear shared memory without completing the root Free operation. Reject `PutDmaAdapter` while the root manager still owns a buffer or mapping; do not silently revoke those rows to make retirement succeed.
 - Forward an exact, authenticated Free to the root while the native record is still live. If allocation and Free happen before the next replay, first register the exact bounded buffer with the root, then free it. Clear the local record only after a confirmed root receipt; an uncertain reply retains ownership and stops the provider.
+
+## Resolve The Active Worktree Before Editing
+- Print the Git worktree path before a multi-worktree task. Pass that exact path as `workdir` on every read, edit, and validation command; never rely on the chat's default checkout.

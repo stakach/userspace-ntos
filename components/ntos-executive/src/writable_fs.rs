@@ -36,6 +36,12 @@ use nt_fs::SnapshotBlockDevice;
 #[path = "writable_fs/snapshot_storage.rs"]
 pub(crate) mod snapshot_storage;
 
+#[path = "writable_fs/native_snapshot_io.rs"]
+pub(crate) mod native_snapshot_io;
+
+#[path = "writable_fs/native_checkpoint.rs"]
+mod native_checkpoint;
+
 #[path = "writable_fs/snapshot_capture.rs"]
 mod snapshot_capture;
 
@@ -46,7 +52,7 @@ pub(crate) mod registry_journal;
 pub(crate) mod registry_wal;
 
 #[path = "writable_fs/hive_wal.rs"]
-mod hive_wal;
+pub(crate) mod hive_wal;
 
 #[path = "writable_fs/system_wal_fold.rs"]
 mod system_wal_fold;
@@ -382,11 +388,15 @@ pub(crate) fn system_wal_fold_blocked() -> bool {
     WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire)
 }
 
+pub(crate) fn block_uncertain_snapshot_reserve() {
+    WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+    WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+}
+
 /// A legacy SYSTEM checkpoint may have changed a snapshot slot before a provider error was
 /// reported. Preserve its CM preparation and refuse all later mount writes until boot recovery.
 pub(crate) fn block_uncertain_system_checkpoint() {
-    WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
-    WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+    block_uncertain_snapshot_reserve();
 }
 
 fn note_mounted_snapshot_format(format: nt_fs::SnapshotReadFormat) {
@@ -745,12 +755,26 @@ unsafe fn checkpoint_volume_snapshot(
 /// lease excludes a mutation still crossing those barriers. NtFlushKey needs this durability
 /// fence even when no full snapshot fold is due.
 pub(crate) unsafe fn verify_durable_system_wal() -> Result<(), u32> {
-    ensure_mounted()?;
+    let native = crate::fs_loader::exec_fs_mount_identity()
+        .and_then(crate::fs_loader::exec_block_route_kind)
+        == Some(nt_fs::BlockSourceKind::Native);
+    if native {
+        if (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_none() {
+            return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+        }
+    } else {
+        ensure_mounted()?;
+    }
     if legacy_snapshot_writes_allowed() || WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire) {
         return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
     }
     let mut lease = snapshot_storage::acquire()?;
-    snapshot_storage::peek_wal_continuation(&mut lease).map(|_| ()).map_err(|status| {
+    let result = if native {
+        snapshot_storage::check_cached_wal_fence(&lease)
+    } else {
+        snapshot_storage::peek_wal_continuation(&mut lease).map(|_| ())
+    };
+    result.map_err(|status| {
         // An acquired reserve with no matching in-process token contradicts the completed
         // mutation/boot publication contract. No later writer may guess the WAL prefix.
         WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
@@ -781,6 +805,11 @@ fn restore_unwritten_checkpoint_authority(
 /// Commit pending volume bytes. `Ok(true)` means a new durable snapshot was published, while
 /// `Ok(false)` means the volume was already clean.
 pub(crate) unsafe fn checkpoint_dirty_volume() -> Result<bool, u32> {
+    if crate::fs_loader::exec_fs_mount_identity()
+        .and_then(crate::fs_loader::exec_block_route_kind)
+        == Some(nt_fs::BlockSourceKind::Native) {
+        return native_checkpoint::checkpoint_dirty_native();
+    }
     let wal_format = !legacy_snapshot_writes_allowed();
     if WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire) {
         return Err(nt_fs::STATUS_DEVICE_NOT_READY);
@@ -1865,6 +1894,22 @@ pub(crate) unsafe fn directory_entries_relative(
     writable_fs()?.try_directory_entries_relative(relative)
 }
 
+pub(crate) unsafe fn directory_entries_relative_if_mounted(
+    relative: &[u8],
+) -> Result<Option<alloc::vec::Vec<nt_fs::DirectoryEntry>>, u32> {
+    match mounted_namespace_fs()? {
+        Some(fs) => fs.try_directory_entries_relative(relative),
+        None => Ok(None),
+    }
+}
+
+pub(crate) unsafe fn directory_entries_opened_if_mounted(
+    file_id: u64,
+) -> Result<alloc::vec::Vec<nt_fs::DirectoryEntry>, u32> {
+    mounted_namespace_fs()?.ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?
+        .try_directory_entries_opened(file_id)
+}
+
 pub(crate) unsafe fn directory_entries_opened(
     file_id: u64,
 ) -> Result<alloc::vec::Vec<nt_fs::DirectoryEntry>, u32> {
@@ -2357,7 +2402,6 @@ fn hive_io_status(status: u32) -> Result<(), nt_hive_core::HiveIoError> {
 pub(crate) struct WritableHiveIoProvider {
     image_path: alloc::string::String,
     log_path: alloc::string::String,
-    staged_v2_log: Option<alloc::vec::Vec<u8>>,
 }
 
 impl WritableHiveIoProvider {
@@ -2365,14 +2409,17 @@ impl WritableHiveIoProvider {
         Self {
             image_path: alloc::string::String::from(image_path),
             log_path: alloc::format!("{}.LOG", image_path),
-            staged_v2_log: None,
         }
     }
 
-    fn uses_v2_hive_wal(&self) -> Result<bool, nt_hive_core::HiveIoError> {
-        unsafe { ensure_mounted() }.map_err(|_| nt_hive_core::HiveIoError::Io)?;
-        Ok(!self.image_path.eq_ignore_ascii_case(CONFIG_SYSTEM_HIVE_PATH)
-            && !legacy_snapshot_writes_allowed())
+    fn require_pre_native_mutation(&self) -> Result<(), nt_hive_core::HiveIoError> {
+        match unsafe { crate::fs_loader::exec_fs_mount_identity() }
+            .and_then(crate::fs_loader::exec_block_route_kind)
+        {
+            Some(nt_fs::BlockSourceKind::Native | nt_fs::BlockSourceKind::Draining) =>
+                Err(nt_hive_core::HiveIoError::NotSupported),
+            _ => Ok(()),
+        }
     }
 
     pub(crate) fn log_len(&self) -> Result<usize, nt_hive_core::HiveIoError> {
@@ -2381,11 +2428,10 @@ impl WritableHiveIoProvider {
     }
 
     fn require_legacy_file_mutation(&self) -> Result<(), nt_hive_core::HiveIoError> {
-        if !self.image_path.eq_ignore_ascii_case(CONFIG_SYSTEM_HIVE_PATH) {
-            return Ok(());
-        }
+        self.require_pre_native_mutation()?;
         // The format bit is set by mount. Checking it before a lazy mount would mistake
-        // a restored v2 volume for an empty legacy volume.
+        // a restored v2 volume for an empty legacy volume. Every v2 hive mutation enters
+        // through the retained native journal owner, including a boot-phase caller.
         unsafe { ensure_mounted() }.map_err(|_| nt_hive_core::HiveIoError::Io)?;
         if legacy_snapshot_writes_allowed() {
             Ok(())
@@ -2439,29 +2485,17 @@ impl nt_hive_core::HiveIoProvider for WritableHiveIoProvider {
 
     fn append_log_record(&mut self, bytes: &[u8]) -> Result<(), nt_hive_core::HiveIoError> {
         self.require_legacy_file_mutation()?;
-        if self.uses_v2_hive_wal()? {
-            if self.staged_v2_log.is_some() || bytes.is_empty() {
-                return Err(nt_hive_core::HiveIoError::Io);
-            }
-            let mut staged = alloc::vec::Vec::new();
-            staged.try_reserve_exact(bytes.len()).map_err(|_| nt_hive_core::HiveIoError::Io)?;
-            staged.extend_from_slice(bytes);
-            self.staged_v2_log = Some(staged);
-            return Ok(());
-        }
         let _scope = crate::allocator::enter_scope(b"memfs.hive-journal-append");
         hive_io_status(unsafe { append_file(&self.log_path, bytes) })
     }
 
     fn truncate_log(&mut self) -> Result<(), nt_hive_core::HiveIoError> {
         self.require_legacy_file_mutation()?;
-        if self.staged_v2_log.is_some() {
-            return Err(nt_hive_core::HiveIoError::Io);
-        }
         hive_io_status(unsafe { truncate_file(&self.log_path) })
     }
 
     fn flush_image(&mut self) -> Result<(), nt_hive_core::HiveIoError> {
+        self.require_pre_native_mutation()?;
         // Hive bytes live in the writable volume. A file-cache flush alone does not publish
         // its immutable snapshot or issue the backing device's durability barrier.
         unsafe { checkpoint_dirty_volume() }
@@ -2470,10 +2504,7 @@ impl nt_hive_core::HiveIoProvider for WritableHiveIoProvider {
     }
 
     fn flush_log(&mut self) -> Result<(), nt_hive_core::HiveIoError> {
-        if let Some(staged) = self.staged_v2_log.take() {
-            let status = unsafe { hive_wal::commit_non_system_hive_log_wal(&self.log_path, &staged) };
-            return hive_io_status(status);
-        }
+        self.require_pre_native_mutation()?;
         unsafe { checkpoint_dirty_volume() }
             .map(|_| ())
             .map_err(|_| nt_hive_core::HiveIoError::Io)

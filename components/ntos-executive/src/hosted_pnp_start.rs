@@ -1785,6 +1785,9 @@ where
                     });
                 }
                 Ok(driver_launch::AcceptedPciResourceProperties::Present { raw, requirements }) => {
+                    if let Err(status) = crate::boot_storage_dma_handoff::remember_boot_controller_pdo(pdo, device) {
+                        return Err(release_context_lease_after_error(lease, status));
+                    }
                     Some((raw, requirements))
                 }
                 Err(status) => return Err(release_context_lease_after_error(lease, status)),

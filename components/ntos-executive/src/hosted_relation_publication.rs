@@ -13,6 +13,7 @@ use nt_config_client::{
 #[derive(Clone, Copy)]
 enum HostedRelationPublicationPhase {
     AcquireBusLease,
+    ProveNativeDisk,
     Begin,
     Prepare,
     Admit,
@@ -52,6 +53,15 @@ struct HostedRelationPublication {
     bus_lease: Option<nt_pnp_manager::BusRelationPublicationLease>,
     original_changes: Option<Vec<nt_pnp_manager::BusRelationChange>>,
     after_bus_lease: HostedRelationPublicationPhase,
+    after_native_disk: HostedRelationPublicationPhase,
+    native_disk_required: bool,
+    native_disk_candidate: usize,
+    native_disk_proof: Option<crate::driver_launch::native_disk_relation::NativeDiskProof>,
+    native_disk_refresh: Option<(
+        crate::driver_launch::native_disk_relation::NativeStorageRoute,
+        crate::driver_launch::native_disk_relation::NativeStorageRoute,
+    )>,
+    native_disk_published: bool,
     reported_children: Vec<nt_pnp_manager::BusReportedChild>,
     child_properties: Vec<HostedBusChildProperties>,
     providers: Vec<(u64, nt_io_manager::HostedDevicePointerRegistration)>,
@@ -108,6 +118,13 @@ unsafe fn finish_hosted_relation_local_publication(
     owner: &mut HostedRelationPublication,
 ) -> bool {
     use HostedRelationPublicationPhase as Phase;
+    if owner.native_disk_required && !owner.native_disk_published {
+        if let Some((previous, next)) = owner.native_disk_refresh {
+            if crate::driver_launch::native_disk_relation::validate_refreshed_native_storage_route(
+                previous, next,
+            ).is_err() { return false; }
+        } else if owner.native_disk_proof.is_none() { return false; }
+    }
     if let Some(prepared) = owner.catalog_update.take() {
         match crate::hosted_pci_topology::try_commit_hosted_acpi_pci_relation_sources(prepared) {
             Ok(_) => owner.pci_catalog_published = true,
@@ -151,6 +168,18 @@ unsafe fn finish_hosted_relation_local_publication(
         };
         owner.route_reconciliation_ready = Some(ready);
     }
+    if owner.native_disk_required && !owner.native_disk_published {
+        if let Some(proof) = owner.native_disk_proof.as_mut() {
+            if proof.mark_published().is_err() { return false; }
+        }
+        if let Some((previous, next)) = owner.native_disk_refresh {
+            if crate::driver_launch::native_disk_relation::commit_refreshed_native_storage_route(
+                previous, next,
+            ).is_err() { return false; }
+            owner.native_disk_refresh = None;
+        }
+        owner.native_disk_published = true;
+    }
     owner.phase = if owner.receipt.is_some() {
         Phase::Acknowledge
     } else {
@@ -188,6 +217,128 @@ unsafe fn advance_hosted_relation_publication(
                     owner.original_changes = Some(original);
                 }
                 owner.phase = owner.after_bus_lease;
+            }
+            Phase::ProveNativeDisk => {
+                if owner.native_disk_proof.is_none() && owner.native_disk_refresh.is_none() {
+                    if let Some(published) = crate::driver_launch::native_disk_relation::native_storage_route() {
+                        if crate::fs_loader::exec_native_block_pending(published.mount).is_some() {
+                            return owner.pending();
+                        }
+                        let next = owner.providers.iter().find_map(|(pdo, registration)| {
+                            (*pdo == published.scsi.pdo.raw()
+                                && registration.domain() == published.scsi.provider
+                                && registration.address() == published.scsi.provider_pdo)
+                                .then_some(*registration)
+                        });
+                        let Some(registration) = next else {
+                            owner.refusal = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+                            owner.phase = Phase::AbortProvider;
+                            continue;
+                        };
+                        let next_generation = owner.parent_relation.relation().generation();
+                        let mut key = published.key;
+                        key.relation.generation = next_generation;
+                        if crate::boot_storage_dma_handoff::validate_native_disk_refresh(
+                            published.key, key,
+                        ).is_err()
+                            || registration.device_id() != published.scsi.pdo
+                            || io_manager_mut().device(published.scsi.pdo)
+                                .is_none_or(|device| device.delete_pending
+                                    || device.driver_id != published.driver_id)
+                        {
+                            owner.refusal = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+                            owner.phase = Phase::AbortProvider;
+                            continue;
+                        }
+                        let mut route = published;
+                        route.scsi.relation_generation = next_generation;
+                        route.key = key;
+                        if crate::driver_launch::native_disk_relation::begin_native_storage_refresh(
+                            published,
+                        ).is_err() { return owner.pending(); }
+                        owner.native_disk_refresh = Some((published, route));
+                        owner.phase = owner.after_native_disk;
+                        continue;
+                    }
+                }
+                if owner.native_disk_proof.is_none() {
+                    if owner.native_disk_candidate >= owner.reported_children.len() {
+                        owner.refusal = nt_status::NtStatus::DEVICE_NOT_READY;
+                        owner.phase = Phase::AbortProvider;
+                        continue;
+                    }
+                    let pdo = owner.reported_children[owner.native_disk_candidate].pdo_object_id;
+                    let Some((_, registration)) = owner.providers.iter()
+                        .find(|(device, _)| *device == pdo).copied()
+                    else {
+                        owner.refusal = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+                        owner.phase = Phase::AbortProvider;
+                        continue;
+                    };
+                    let Some(device) = io_manager_mut().device(nt_io_manager::DeviceId(pdo)) else {
+                        owner.refusal = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+                        owner.phase = Phase::AbortProvider;
+                        continue;
+                    };
+                    let driver_id = device.driver_id;
+                    if device.delete_pending || driver_id.is_null() {
+                        owner.refusal = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+                        owner.phase = Phase::AbortProvider;
+                        continue;
+                    }
+                    let relation = nt_pnp_context::native_storage_handoff::StorageRelation {
+                        bus_device: owner.claim.pdo_device_id,
+                        generation: owner.parent_relation.relation().generation(),
+                        provider_domain: registration.domain().domain_id.raw(),
+                        provider_cookie: registration.domain().cookie,
+                    };
+                    let storage_pdo = nt_pnp_context::native_storage_handoff::StoragePdo {
+                        device: pdo,
+                        raw_pointer: registration.address(),
+                        provider_driver: driver_id.raw(),
+                    };
+                    let handoff = match crate::boot_storage_dma_handoff::begin_native_disk_proof(
+                        relation, storage_pdo,
+                    ) {
+                        Ok(handoff) => handoff,
+                        Err(status) if status == nt_status::NtStatus::DEVICE_NOT_READY =>
+                            return owner.pending(),
+                        Err(_) => {
+                            owner.native_disk_candidate += 1;
+                            continue;
+                        }
+                    };
+                    let Some((mount, _)) = crate::fs_loader::exec_expected_disk() else {
+                        return owner.pending();
+                    };
+                    if mount.value() != handoff.key().mount { return owner.pending(); }
+                    let scsi = nt_io_manager::scsi_srb_transport::ScsiSrbRoute {
+                        pdo: nt_io_manager::DeviceId(pdo),
+                        provider: registration.domain(),
+                        relation_generation: relation.generation,
+                        provider_pdo: registration.address(),
+                    };
+                    let key = handoff.key();
+                    owner.native_disk_proof = Some(
+                        crate::driver_launch::native_disk_relation::NativeDiskProof::new(
+                            handoff,
+                            crate::driver_launch::native_disk_relation::NativeStorageRoute {
+                                mount, scsi, driver_id, key,
+                            },
+                        )
+                    );
+                }
+                match owner.native_disk_proof.as_mut().unwrap().progress() {
+                    crate::driver_launch::native_disk_relation::ProofProgress::Pending =>
+                        return owner.pending(),
+                    crate::driver_launch::native_disk_relation::ProofProgress::Refused => {
+                        owner.native_disk_proof = None;
+                        owner.native_disk_candidate += 1;
+                    }
+                    crate::driver_launch::native_disk_relation::ProofProgress::Mounted => {
+                        owner.phase = owner.after_native_disk;
+                    }
+                }
             }
             Phase::Begin => {
                 let attempt = owner.attempt.as_mut().expect("retained relation BEGIN");
@@ -390,6 +541,41 @@ unsafe fn advance_hosted_relation_publication(
                         return owner.pending();
                     }
                 };
+                if owner.native_disk_required {
+                    let published = owner.native_disk_refresh.map(|(previous, _)| previous)
+                        .or_else(|| crate::driver_launch::native_disk_relation::native_storage_route());
+                    let Some(published) = published else {
+                        owner.provider_batch = Some(providers);
+                        return owner.pending();
+                    };
+                    let next_generation = parent.relation().generation();
+                    let mut key = published.key;
+                    key.relation.generation = next_generation;
+                    if crate::boot_storage_dma_handoff::validate_native_disk_refresh(
+                        published.key, key,
+                    ).is_err()
+                        || !owner.providers.iter().any(|(pdo, registration)| {
+                            *pdo == published.scsi.pdo.raw()
+                                && registration.domain() == published.scsi.provider
+                                && registration.address() == published.scsi.provider_pdo
+                        })
+                    {
+                        owner.provider_batch = Some(providers);
+                        return owner.pending();
+                    }
+                    if owner.native_disk_refresh.is_none()
+                        && crate::driver_launch::native_disk_relation::begin_native_storage_refresh(
+                            published,
+                        ).is_err()
+                    {
+                        owner.provider_batch = Some(providers);
+                        return owner.pending();
+                    }
+                    let mut next = published;
+                    next.key = key;
+                    next.scsi.relation_generation = next_generation;
+                    owner.native_disk_refresh = Some((published, next));
+                }
                 owner.parent_relation = parent;
                 owner.prepared_relations = Some(relation);
                 owner.prepared_devnodes = Some(devnodes);
@@ -542,6 +728,9 @@ unsafe fn advance_hosted_relation_publication(
                 owner.phase = Phase::AbortProvider;
             }
             Phase::AbortProvider => {
+                if let Some((previous, _)) = owner.native_disk_refresh.take() {
+                    crate::driver_launch::native_disk_relation::abort_native_storage_refresh(previous);
+                }
                 if let Some(batch) = owner.provider_batch.take() {
                     match batch.abort(io_manager_mut()) {
                         Ok(()) => {}

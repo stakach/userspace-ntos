@@ -7,6 +7,10 @@ use crate::*;
 use nt_pnp_context::pci_dma_handoff::{
     BootIoTicket, ControllerState, PciController, PciDmaHandoff, WindowId, WindowPhase,
 };
+use nt_pnp_context::native_storage_handoff::{
+    MountCommit, NativeStorageAdmissions, NativeStorageHandoff, SrbProofRequest,
+    StorageHandoffKey, StoragePdo, StorageRelation,
+};
 
 const BOOT_GENERATION: u64 = 1;
 pub(crate) const BOOT_DOMAIN: u64 = 2;
@@ -25,14 +29,100 @@ pub(crate) struct BootStorageDmaAuthority {
     ready: bool,
     native_lease: Option<nt_pnp_context::ContextLeaseIdentity>,
     native_window: Option<WindowId>,
+    accepted_pdo: Option<u64>,
     uncertain_owner: Option<HostedPnpContextOwner>,
 }
 
 static mut BOOT_STORAGE_DMA: Option<BootStorageDmaAuthority> = None;
+static mut NATIVE_STORAGE_ADMISSIONS: NativeStorageAdmissions = NativeStorageAdmissions::new();
 
 fn authority() -> Option<&'static mut BootStorageDmaAuthority> {
     // The executive dispatches these admission operations on its single broker thread.
     unsafe { BOOT_STORAGE_DMA.as_mut() }
+}
+
+/// Consume the one native-disk admission for this physical controller only after the exact
+/// boot mount and observed accepted LUN relation are available. The returned move-only owner
+/// retains the pre-drain capacity/sector evidence through the three native SRB probes.
+pub(crate) fn begin_native_disk_proof(
+    relation: StorageRelation,
+    pdo: StoragePdo,
+) -> Result<NativeStorageHandoff, nt_status::NtStatus> {
+    let (mount, expected) = unsafe { crate::fs_loader::exec_expected_disk() }
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    let owner = authority().ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    if !owner.ready || owner.native_lease.is_none() || owner.native_window.is_none() {
+        return Err(nt_status::NtStatus::DEVICE_NOT_READY);
+    }
+    let key = StorageHandoffKey {
+        controller: owner.controller,
+        dma_root: owner.io_space_cap,
+        mount: mount.value(),
+        relation,
+        pdo,
+    };
+    unsafe {
+        NativeStorageHandoff::new(
+            &mut *core::ptr::addr_of_mut!(NATIVE_STORAGE_ADMISSIONS),
+            &owner.ledger,
+            key,
+            expected,
+        )
+    }
+    .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+}
+
+pub(crate) fn enter_native_disk_srb(
+    handoff: &mut NativeStorageHandoff,
+) -> Result<SrbProofRequest, nt_status::NtStatus> {
+    let owner = authority().ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    let key = handoff.key();
+    handoff.enter_srb(&owner.ledger, key)
+        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+}
+
+pub(crate) fn enter_native_disk_mount(
+    handoff: &mut NativeStorageHandoff,
+) -> Result<MountCommit, nt_status::NtStatus> {
+    let owner = authority().ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    let key = handoff.key();
+    owner.ledger.can_activate_native(key.controller, key.dma_root, key.pdo.device)
+        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    unsafe {
+        handoff.enter_mount_commit(
+            &mut *core::ptr::addr_of_mut!(NATIVE_STORAGE_ADMISSIONS),
+            &owner.ledger,
+            key,
+        )
+    }.map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+}
+
+pub(crate) fn complete_native_disk_mount(
+    handoff: &mut NativeStorageHandoff,
+    commit: MountCommit,
+) -> Result<(), nt_status::NtStatus> {
+    let owner = authority().ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    handoff.complete_mount_commit(&mut owner.ledger, commit)
+        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+}
+
+pub(crate) fn mark_native_disk_relation_published(
+    handoff: &mut NativeStorageHandoff,
+) -> Result<(), nt_status::NtStatus> {
+    let owner = authority().ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    let key = handoff.key();
+    handoff.mark_relation_published(&owner.ledger, key)
+        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+}
+
+pub(crate) fn validate_native_disk_refresh(
+    published: StorageHandoffKey,
+    candidate: StorageHandoffKey,
+) -> Result<(), nt_status::NtStatus> {
+    let owner = authority().ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    nt_pnp_context::native_storage_handoff::validate_native_relation_refresh(
+        &owner.ledger, published, candidate,
+    ).map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)
 }
 
 /// A command is untracked only before the executive installs its controller owner, or in
@@ -183,6 +273,7 @@ pub(crate) fn install_boot_storage_dma_authority(
             ready,
             native_lease: None,
             native_window: None,
+            accepted_pdo: None,
             uncertain_owner: None,
         });
     }
@@ -198,6 +289,32 @@ pub(crate) fn is_boot_storage_bdf(device: &nt_pnp::PciDevice) -> bool {
         owner.controller.bus == device.bus
             && owner.controller.device == device.dev
             && owner.controller.function == device.func
+    })
+}
+
+/// Called only after the independent PCI inventory and bus-owned PDO resource bytes match.
+/// The PDO survives later missing property queries, so its disk relation remains proof-gated.
+pub(crate) fn remember_boot_controller_pdo(
+    pdo: u64,
+    device: &nt_pnp::PciDevice,
+) -> Result<(), nt_status::NtStatus> {
+    if !is_boot_storage_bdf(device) { return Ok(()); }
+    let owner = authority().ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    if pdo == 0 || !is_same_controller(owner, device) {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    owner.accepted_pdo = Some(pdo);
+    Ok(())
+}
+
+pub(crate) fn relation_parent_requires_native_disk_proof(
+    pdo: u64,
+    observed_pci_location: Option<(u32, u32)>,
+) -> bool {
+    authority().is_some_and(|owner| {
+        nt_pnp_context::pci_dma_handoff::relation_requires_native_disk_proof(
+            owner.controller, pdo, owner.accepted_pdo, observed_pci_location,
+        )
     })
 }
 

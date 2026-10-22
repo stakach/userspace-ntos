@@ -144,6 +144,23 @@ impl ExecNtHandler {
                 Err(status) => status,
             };
         }
+        if let Some(mutable) = self.mutable_key_handle(key) {
+            let route = crate::fs_loader::exec_fs_mount_identity()
+                .and_then(crate::fs_loader::exec_block_route_kind);
+            if matches!(route, Some(nt_fs::BlockSourceKind::Draining)) {
+                return 0xC000_00A3;
+            }
+            if matches!(route, Some(nt_fs::BlockSourceKind::Native)) {
+                let Some(value_type) = nt_hive_core::RegistryValueType::from_u32(nt_ulong_arg(args[3]))
+                    else { return STATUS_INVALID_PARAMETER; };
+                return match crate::mutable_hive_mutation_work::submit_hosted_set_value(
+                    self, key, mutable, name, value_type, data,
+                ) {
+                    Ok(()) => 0x103,
+                    Err(status) => status,
+                };
+            }
+        }
         self.registry_target_set_value(key, &name, nt_ulong_arg(args[3]), &data)
     }
 

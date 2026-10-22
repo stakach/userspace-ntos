@@ -9551,6 +9551,7 @@ pub(crate) unsafe fn service_sec_image(
                 )
                 && !defer_quiesce_for_active_user_callbacks(b"all-live-waiting")
                 && crate::registry_mutation_work::next_deadline().is_none()
+                && crate::mutable_hive_mutation_work::next_deadline().is_none()
                 && crate::section_metadata_work::next_deadline().is_none()
                 && crate::section_pagein_work::next_deadline().is_none()
                 && crate::provider_section_broker::next_deadline().is_none()
@@ -9729,6 +9730,7 @@ pub(crate) unsafe fn service_sec_image(
             alpc_reply_committed =
                 crate::native_alpc_send_receive_work::redrive(&mut nt_handler);
             crate::registry_mutation_work::redrive(&mut nt_handler, delay_queue);
+            crate::mutable_hive_mutation_work::redrive(&mut nt_handler, delay_queue);
             crate::section_metadata_work::redrive(&mut nt_handler, delay_queue);
             crate::section_pagein_work::redrive(&mut nt_handler);
             crate::provider_section_broker::redrive(nt_handler as *mut _);
@@ -9736,6 +9738,7 @@ pub(crate) unsafe fn service_sec_image(
             crate::driver_launch::redrive_hosted_driver_io_create_file(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_query_path_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_internal_control_forward(nt_handler as *mut _);
+            crate::driver_launch::redrive_hosted_scsi_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_write_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_read_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_flush_forward(nt_handler as *mut _);
@@ -13235,6 +13238,20 @@ pub(crate) unsafe fn service_sec_image(
                         // STATUS_PENDING is internal state, never the syscall's terminal reply.
                         mark_wait_parked!(pi, resume_ip);
                         crate::registry_mutation_work::redrive(&mut nt_handler, delay_queue);
+                        let _ = finalize_service_loop_state(&mut nt_handler);
+                        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                        let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                        badge = nb;
+                        mi = nmi;
+                        m0 = nm0;
+                        m1 = nm1;
+                        m2 = nm2;
+                        m3 = nm3;
+                        continue;
+                    }
+                    if crate::mutable_hive_mutation_work::take_transferred() {
+                        mark_wait_parked!(pi, resume_ip);
+                        crate::mutable_hive_mutation_work::redrive(&mut nt_handler, delay_queue);
                         let _ = finalize_service_loop_state(&mut nt_handler);
                         let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                         let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
@@ -25814,6 +25831,16 @@ pub(crate) unsafe fn complete_registry_mutation_reply(
     true
 }
 
+pub(crate) unsafe fn complete_mutable_hive_mutation_reply(
+    _handler: &mut ExecNtHandler,
+    tid: u64,
+    reply: u64,
+    status: u32,
+) -> bool {
+    assert!(crate::mutable_hive_mutation_work::has_thread(tid));
+    reply_parked_syscall(reply, status as u64)
+}
+
 fn record_pending_start_result(
     nt_handler: &mut ExecNtHandler,
     request: nt_pnp_manager::StartDeviceRequestIdentity,
@@ -26275,6 +26302,8 @@ unsafe fn pump_hosted_io_and_redrive_driver_starts(
 ) -> u64 {
     let retired = driver_launch::drain_hosted_file_retirements();
     let video_retired = crate::video_device::drain_video_file_retirements();
+    let serviced = driver_launch::service_pending_file_backends() as u64;
+    let native_blocks = driver_launch::service_mounted_native_blocks() as u64;
     let pumped = driver_launch::pump_hosted_io_completions() as u64;
     if crate::config_manager_take_device_action_wake() {
         nt_handler.pnp_signal_pending_action();
@@ -26282,6 +26311,8 @@ unsafe fn pump_hosted_io_and_redrive_driver_starts(
     let progress = activated
         .saturating_add(retired)
         .saturating_add(video_retired)
+        .saturating_add(serviced)
+        .saturating_add(native_blocks)
         .saturating_add(pumped)
         .saturating_add(pending_driver_start_redrive_all(nt_handler))
         .saturating_add(start_committed_critical_children(nt_handler))

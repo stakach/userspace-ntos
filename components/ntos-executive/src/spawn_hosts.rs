@@ -4443,6 +4443,7 @@ unsafe fn component_pump_loop(
             continue;
         } else if (label == crate::driver_launch::FSD_SERVICE_QUERY_PATH_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL
+            || label == crate::driver_launch::FSD_SERVICE_SCSI_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_WRITE_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_READ_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_FLUSH_FORWARD_LABEL
@@ -4465,6 +4466,10 @@ unsafe fn component_pump_loop(
                         )
                     } else if label == crate::driver_launch::FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL {
                         crate::driver_launch::service_hosted_internal_control_forward(
+                            ch, *reply_cap, msg.badge, msg.m0, msg.m1, msg.m2,
+                        )
+                    } else if label == crate::driver_launch::FSD_SERVICE_SCSI_FORWARD_LABEL {
+                        crate::driver_launch::service_hosted_scsi_forward(
                             ch, *reply_cap, msg.badge, msg.m0, msg.m1, msg.m2,
                         )
                     } else if label == crate::driver_launch::FSD_SERVICE_WRITE_FORWARD_LABEL {

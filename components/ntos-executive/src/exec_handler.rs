@@ -5309,7 +5309,7 @@ impl ExecNtHandler {
         Some(self.overlay_canon(&full))
     }
 
-    fn mutable_key_relative_path(&self, key: ResolvedHiveKey) -> Option<alloc::string::String> {
+    pub(crate) fn mutable_key_relative_path(&self, key: ResolvedHiveKey) -> Option<alloc::string::String> {
         self.mutable_hives
             .hive(key.hive)?
             .key_path(key.key)
@@ -5332,7 +5332,7 @@ impl ExecNtHandler {
         Some(relative)
     }
 
-    fn mutable_hive_checkpoint_path_owned(&self, hive_sel: u32) -> Option<alloc::string::String> {
+    pub(crate) fn mutable_hive_checkpoint_path_owned(&self, hive_sel: u32) -> Option<alloc::string::String> {
         Self::boot_mutable_hive_checkpoint_path(hive_sel)
             .map(alloc::string::String::from)
             .or_else(|| {
@@ -5361,7 +5361,7 @@ impl ExecNtHandler {
         }
     }
 
-    fn note_mutable_hive_journal_record(&mut self, hive_sel: u32) {
+    pub(crate) fn note_mutable_hive_journal_record(&mut self, hive_sel: u32) {
         self.note_durable_hive_journal_records(Some(hive_sel), 1);
     }
 
@@ -9496,6 +9496,7 @@ impl ExecNtHandler {
                 || crate::pending_file_apc::has_thread(tid)
                 || crate::current_apc::has_thread(tid)
                 || crate::registry_mutation_work::has_thread(tid)
+                || crate::mutable_hive_mutation_work::has_thread(tid)
                 || crate::section_metadata_work::has_thread(tid)
         }
         {

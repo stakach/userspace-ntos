@@ -94,30 +94,61 @@ fn native_boot_verifies_wal_suffix_before_publishing_volume_for_cm_import() {
 #[test]
 fn retained_wal_files_and_checkpoint_images_escape_transient_request_scope() {
     let fold = include_str!("../../../components/ntos-executive/src/writable_fs/system_wal_fold.rs");
-    let commit = include_str!("../../../components/ntos-executive/src/writable_fs/hive_wal.rs");
+    let commit = include_str!("../../../components/ntos-executive/src/writable_fs/hive_wal_native.rs");
     let fold_entry = source_block(fold, "pub(crate) unsafe fn fold_system_wal_if_dirty(");
-    let commit_entry = source_block(commit, "pub(super) unsafe fn commit_non_system_hive_log_wal(");
+    let commit_entry = source_block(commit, "pub(crate) unsafe fn begin_native_hive_journal(");
     assert!(fold_entry.find("allocator::enter_durable()").expect("durable fold admission")
         < fold_entry.find("config_manager_prepare_system_hive_checkpoint()")
             .expect("CM checkpoint transfer"),
         "CM image transferred into the mounted filesystem must outlive the transient timer scope");
     assert!(commit_entry.find("allocator::enter_durable()").expect("durable log admission")
-        < commit_entry.find("prepare_log_baseline(path, record)").expect("log baseline"),
+        < commit_entry.find("inspect_baseline(&path, &record)").expect("log baseline"),
         "retained log catalog and WAL replay bytes must be allocated durably");
 }
 
 #[test]
 fn folded_hive_log_cache_requires_a_new_baseline_before_reuse() {
-    let source = include_str!("../../../components/ntos-executive/src/writable_fs/hive_wal.rs");
-    let fold = source_block(source, "pub(super) unsafe fn note_volume_wal_folded(");
-    let baseline = source_block(source, "unsafe fn prepare_log_baseline(");
+    let source = include_str!("../../../components/ntos-executive/src/writable_fs/hive_wal_native.rs");
+    let cache = include_str!("../../../components/ntos-executive/src/writable_fs/hive_wal.rs");
+    let fold = source_block(cache, "pub(super) unsafe fn note_volume_wal_folded(");
+    let baseline = source_block(source, "unsafe fn inspect_baseline(");
+    let finish = source_block(source, "unsafe fn finish_baseline(");
     assert!(fold.contains("baseline.has_wal_records = false"));
     assert!(baseline.contains(
         "entry.has_wal_records && entry.file_id == file_id && entry.expected_len == length"
     ), "a fold releases write protection, so file ID and length cannot authenticate cached bytes");
-    assert!(baseline.contains("checkpoint_dirty_volume()?")
-        && baseline.contains("validate_first_record(writable_fs()?, path, length, record)?"),
-        "the first append after a fold must establish and verify a fresh durable baseline");
+    assert!(baseline.contains("mark_snapshot_dirty()")
+        && source.contains("native_checkpoint::checkpoint_dirty_native()")
+        && finish.contains("validate_first_record(fs, &journal.path"),
+        "the first append after a fold must checkpoint and verify a fresh durable baseline");
+}
+
+#[test]
+fn native_system_fold_keeps_prepared_hive_private_until_ack() {
+    let native = include_str!("../../../components/ntos-executive/src/writable_fs/system_wal_fold/native.rs");
+    let fold = include_str!("../../../components/ntos-executive/src/writable_fs/system_wal_fold.rs");
+    let stage = source_block(native, "unsafe fn advance_recheck()");
+    assert!(stage.contains("FileSystem::from_volume_snapshot(baseline.as_slice())")
+        && stage.contains("stage_prepared_checkpoint(&mut staged, &prepared)")
+        && stage.contains("CapturedSnapshot::capture(&lease, &staged)"));
+    assert!(!stage.contains("apply_prepared_checkpoint(fs,"));
+    let ack = source_block(fold, "unsafe fn acknowledge_retained()");
+    let install = source_block(fold, "unsafe fn install_retained()");
+    assert!(ack.find("config_manager_acknowledge_system_hive_checkpoint(prepared)")
+        < ack.find("install_retained()"));
+    assert!(install.find("apply_prepared_checkpoint(fs, &mut work.prepared)")
+        < install.find("snapshot_storage::install_wal_continuation(&work.lease"));
+}
+
+#[test]
+fn rollback_keeps_admitting_system_wal_owner_until_header_recheck_is_settled() {
+    let source = include_str!("../../../components/ntos-executive/src/registry_mutation_work.rs");
+    let start = source.find("pub(crate) unsafe fn release_rolled_back(").unwrap();
+    let release = &source[start..source[start..].find("\n}\n\nstruct Work {").unwrap() + start];
+    assert!(!release.contains("PersistenceOwner::Admitting { .. } => {}"),
+        "rollback ACK must not discard retained CM bytes while header recheck owns the reserve");
+    assert!(release.contains("snapshot_storage::take_rechecked_wal_continuation"),
+        "rollback must distinguish completed/no-effect recheck from entered uncertainty");
 }
 
 #[test]
@@ -156,12 +187,12 @@ fn generic_checkpoint_uses_exact_v2_manifest_and_retains_uncertain_reserve() {
 }
 
 #[test]
-fn writable_hive_provider_refuses_v2_system_log_append_before_file_effect() {
+fn writable_hive_provider_refuses_every_v2_legacy_log_append_before_file_effect() {
     let source = include_str!("../../../components/ntos-executive/src/writable_fs.rs");
     let guard = &source[source.find("fn require_legacy_file_mutation(").unwrap()
         ..source.find("\n    pub(crate) fn truncate_log_to(").unwrap()];
-    assert!(guard.contains("CONFIG_SYSTEM_HIVE_PATH") && guard.contains("legacy_snapshot_writes_allowed()"),
-        "the file mutation gate must distinguish SYSTEM v2 from unrelated hive logs");
+    assert!(guard.contains("legacy_snapshot_writes_allowed()"),
+        "the file mutation gate must refuse every v2 legacy log append");
     assert!(guard.contains("ensure_mounted()"),
         "a lazy restored v2 volume must be classified before its legacy provider writes");
     let provider = &source[source.find("impl nt_hive_core::HiveIoProvider for WritableHiveIoProvider {").unwrap()
@@ -169,7 +200,7 @@ fn writable_hive_provider_refuses_v2_system_log_append_before_file_effect() {
     let append = &provider[provider.find("fn append_log_record(").unwrap()
         ..provider.find("\n    fn truncate_log(").unwrap()];
     let guard = append.find("require_legacy_file_mutation()")
-        .expect("the ordinary SYSTEM.LOG provider must refuse mounted v2 before any append");
+        .expect("the ordinary provider must refuse mounted v2 before any append");
     let effect = append.find("append_file(").expect("legacy provider append effect");
     assert!(guard < effect, "v2 refusal must precede the file append");
 }
@@ -269,13 +300,63 @@ fn cm_persistence_owner_retains_refused_release_for_exact_retry() {
         mod nt_fs {
             pub const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
             pub const STATUS_DATA_ERROR: u32 = 0xC000_003E;
+            pub const STATUS_DEVICE_NOT_READY: u32 = 0xC000_00A3;
+            pub struct AsyncWalIoRequest;
+            pub enum BlockOperation { Flush }
+            pub enum BlockSourceKind { Draining, Native }
+        }
+        mod nt_memory_manager { pub struct SectionMountId; }
+        mod nt_status {
+            pub struct NtStatus(pub u32);
+            impl NtStatus {
+                pub const DEVICE_BUSY: Self = Self(0x8000_0011);
+                pub fn raw(self) -> u32 { self.0 }
+            }
+        }
+        mod fs_loader {
+            pub fn exec_fs_mount_identity() -> Option<crate::nt_memory_manager::SectionMountId> { None }
+            pub fn exec_block_route_kind(_: crate::nt_memory_manager::SectionMountId)
+                -> Option<crate::nt_fs::BlockSourceKind> { None }
         }
         mod writable_fs {
             use super::*;
             pub fn ensure_mounted() -> Result<(), u32> { Ok(()) }
+            pub fn block_uncertain_snapshot_reserve() {}
             pub static LEGACY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
             pub fn legacy_snapshot_writes_allowed() -> bool {
                 LEGACY.load(std::sync::atomic::Ordering::Relaxed)
+            }
+            pub mod snapshot_storage {
+                use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+                pub static OUTCOME: AtomicU8 = AtomicU8::new(0);
+                pub static INSTALLS: AtomicUsize = AtomicUsize::new(0);
+                pub struct Lease;
+                pub struct Token;
+                pub struct Pair;
+                pub struct Proof;
+                impl Proof { pub fn into_pair(self) -> Pair { Pair } }
+                pub fn take_rechecked_wal_continuation(_: u64)
+                    -> Result<Option<(Lease, Token, Proof)>, u32> {
+                    match OUTCOME.load(Ordering::Relaxed) {
+                        0 => Ok(None),
+                        1 => Ok(Some((Lease, Token, Proof))),
+                        2 => Err(0xC000_00A3),
+                        _ => Err(0xC000_003E),
+                    }
+                }
+                pub fn recheck_was_aborted_no_effect(_: u64) -> bool {
+                    OUTCOME.load(Ordering::Relaxed) == 2
+                }
+                pub fn install_wal_continuation(_: &Lease, token: Token, pair: Pair)
+                    -> Result<(), (u32, Token, Pair)> {
+                    INSTALLS.fetch_add(1, Ordering::Relaxed);
+                    let _ = (token, pair);
+                    Ok(())
+                }
+                pub fn begin_wal_continuation_recheck() -> Result<u64, u32> { Ok(1) }
+            }
+            pub mod native_snapshot_io {
+                pub fn admission_busy(_: u32) -> bool { false }
             }
             pub mod registry_journal {
                 use super::*;
@@ -308,6 +389,16 @@ fn cm_persistence_owner_retains_refused_release_for_exact_retry() {
                 pub struct Journal;
                 impl Journal {
                     pub unsafe fn admit(_: &PreparedSystemHiveMutation, _: Vec<u8>) -> Result<Self, u32> { Ok(Self) }
+                    pub fn admit_rechecked(_: &PreparedSystemHiveMutation, _: Vec<u8>,
+                        _: crate::writable_fs::snapshot_storage::Lease,
+                        _: crate::writable_fs::snapshot_storage::Token,
+                        _: crate::writable_fs::snapshot_storage::Proof) -> Result<Self, u32> { Ok(Self) }
+                    pub fn mount(&self) -> crate::nt_memory_manager::SectionMountId {
+                        crate::nt_memory_manager::SectionMountId
+                    }
+                    pub fn claim_native_io(&mut self)
+                        -> Result<Option<(crate::nt_fs::AsyncWalIoRequest,
+                            crate::nt_fs::BlockOperation, Vec<u8>)>, u32> { Ok(None) }
                     pub fn prepare(&mut self) -> Result<(), u32> { Ok(()) }
                     pub fn commit_marker(&mut self, _: SystemHiveMutationCommitReceipt) -> Result<(), u32> { Ok(()) }
                     pub fn anchor(&mut self) -> Result<(), u32> { Ok(()) }
@@ -345,6 +436,33 @@ fn cm_persistence_owner_retains_refused_release_for_exact_retry() {
             assert!(aborted.has_journal());
             aborted.release_rolled_back(ack).unwrap();
             assert!(!aborted.has_journal());
+
+            use std::sync::atomic::Ordering;
+            use writable_fs::snapshot_storage::{OUTCOME, INSTALLS};
+            let mut pending = MutationPersistence::new();
+            pending.owner = PersistenceOwner::Admitting { recheck_id: 41, bytes: vec![4] };
+            pending.abort_receipt = Some(receipt);
+            OUTCOME.store(0, Ordering::Relaxed);
+            assert_eq!(pending.release_rolled_back(ack), Err(nt_fs::STATUS_DEVICE_NOT_READY));
+            assert!(pending.admitting());
+            OUTCOME.store(1, Ordering::Relaxed);
+            pending.release_rolled_back(ack).unwrap();
+            assert!(!pending.admitting());
+            assert_eq!(INSTALLS.load(Ordering::Relaxed), 1);
+
+            let mut no_effect = MutationPersistence::new();
+            no_effect.owner = PersistenceOwner::Admitting { recheck_id: 42, bytes: vec![5] };
+            no_effect.abort_receipt = Some(receipt);
+            OUTCOME.store(2, Ordering::Relaxed);
+            no_effect.release_rolled_back(ack).unwrap();
+            assert!(!no_effect.admitting());
+
+            let mut uncertain = MutationPersistence::new();
+            uncertain.owner = PersistenceOwner::Admitting { recheck_id: 43, bytes: vec![6] };
+            uncertain.abort_receipt = Some(receipt);
+            OUTCOME.store(3, Ordering::Relaxed);
+            assert_eq!(uncertain.release_rolled_back(ack), Err(nt_fs::STATUS_DATA_ERROR));
+            assert!(uncertain.admitting());
 
             writable_fs::LEGACY.store(false, std::sync::atomic::Ordering::Relaxed);
             let prepared = PreparedSystemHiveMutation(SystemHiveMutationStorageBinding(9));

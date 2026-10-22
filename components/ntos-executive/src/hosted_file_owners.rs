@@ -388,12 +388,20 @@ fn capture_projection_registration(
         binding.device_object
     } else {
         if provider_hosted {
-            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            // A retained BusRelations query may authorize its exact child PDO before the
+            // accepted-provider catalog is committed. The pending query checks its parent,
+            // provider domain, physical pointer registration, and current invalidation owner;
+            // the allocation check below still pins that same provider object.
+            unsafe { hosted_provider_child_registration(device, physical.domain) }
+                .filter(|registration| registration.device_id() == device)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+                .address()
+        } else {
+            // Direct hosted devices use the canonical domain/address publication, not a guessed PDO.
+            io_manager_mut()
+                .hosted_device_address_by_identity(physical.domain, device)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
         }
-        // Direct hosted devices use the canonical domain/address publication, not a guessed PDO.
-        io_manager_mut()
-            .hosted_device_address_by_identity(physical.domain, device)
-            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
     };
     let registration = io_manager_mut()
         .hosted_device_pointer_registration(physical.domain, address)
@@ -455,6 +463,7 @@ fn discard(id: u64, prepared: PreparedExternalFileIrp) -> Result<(), nt_status::
 
 pub(super) enum DispatchResult {
     Returned {
+        irp_id: IrpId,
         status: nt_status::NtStatus,
         information: u64,
         file_context: Option<u64>,
@@ -565,6 +574,7 @@ fn dispatch_with_port_connect(
                         Err(_) => return Ok(DispatchResult::Outstanding { irp_id }),
                     };
                     Ok(DispatchResult::Returned {
+                        irp_id,
                         status: completion.status,
                         information: completion.information,
                         file_context: completion.file_context,

@@ -13,7 +13,9 @@ pub(super) const FSD_DISPATCH_DYNAMIC_DELETE: u64 = u64::MAX - 0x7bd;
 const BANK_OFFSET: u64 = FSD_WORKER_KPCR_OFFSET + 0x1000;
 const ARG_OFFSET: u64 = BANK_OFFSET + 0x1000;
 const REQUEST_OFFSET: u64 = 0x800;
-const JUMP_OFFSET: u64 = 0x910;
+const JUMP_OFFSET: u64 = align_up_u64(
+    REQUEST_OFFSET + core::mem::size_of::<IrpDispatchRequest>() as u64, 16,
+);
 const SCRATCH_BANK_OFFSET: u64 = 0xff0;
 const ORDINAL_BIT: u64 = 1 << 63;
 const _: () = assert!(REQUEST_OFFSET + core::mem::size_of::<IrpDispatchRequest>() as u64 <= JUMP_OFFSET);

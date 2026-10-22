@@ -199,6 +199,7 @@ unsafe fn submit_provider_inner(
         reply, token, child_handle: None, reply_entered: false,
     };
     let work = Some(Work {
+        id: next_work_id(),
         caller: Caller::Provider(caller), phase: Phase::ProviderAdmit,
         prepared: None, persistence: MutationPersistence::new(), receipt: None, opening: None, status: 0,
         cancelled: false, commit_entered: false, published: false,

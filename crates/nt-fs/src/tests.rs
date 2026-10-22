@@ -1,5 +1,34 @@
 use super::*;
 
+#[test]
+fn staged_fold_volume_is_independent_until_shared_publication() {
+    const PATH: &str = r"\??\C:\Windows\System32\config\SYSTEM";
+    let mut live = FileSystem::new(MemFs::new());
+    assert!(live.provision_file(PATH, b"old-system"));
+    let before = live.export_volume_snapshot().unwrap();
+    let mut staged = FileSystem::from_volume_snapshot(&before).unwrap();
+    let opened = staged.zw_create_file(PATH, FILE_WRITE_DATA, 0, 0, FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE);
+    assert_eq!(opened.status, STATUS_SUCCESS);
+    assert_eq!(staged.replace_file_data_owned(opened.handle, b"new-system".to_vec()),
+        STATUS_SUCCESS);
+    staged.zw_close(opened.handle);
+    let folded = staged.export_volume_snapshot().unwrap();
+    assert_ne!(folded, before);
+    // Both native snapshot passes may consume `folded` while the live overlay stays private.
+    assert_eq!(live.export_volume_snapshot().unwrap(), before);
+    let opened = live.zw_create_file(PATH, FILE_READ_DATA | FILE_WRITE_DATA, 0, 0, FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE);
+    assert_eq!(opened.status, STATUS_SUCCESS);
+    assert_eq!(live.zw_read_file(opened.handle, Some(0), 32),
+        (STATUS_SUCCESS, b"old-system".to_vec()));
+    // Model the single post-ACK shared publication while preserving the pre-existing handle.
+    assert_eq!(live.replace_file_data_owned(opened.handle, b"new-system".to_vec()),
+        STATUS_SUCCESS);
+    assert_eq!(live.zw_read_file(opened.handle, Some(0), 32),
+        (STATUS_SUCCESS, b"new-system".to_vec()));
+}
+
 struct MemoryBlockDevice {
     sector_size: usize,
     data: alloc::vec::Vec<u8>,

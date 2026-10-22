@@ -175,6 +175,8 @@ pub(crate) mod hosted_add_device_rollback;
 mod hosted_file_dispatch;
 #[path = "hosted_file_owners.rs"]
 mod hosted_file_owners;
+#[path = "mounted_native_block.rs"]
+mod mounted_native_block;
 #[path = "hosted_device_allocations.rs"]
 mod hosted_device_allocations;
 #[path = "hosted_device_publication.rs"]
@@ -234,6 +236,12 @@ mod hosted_read_work;
 mod hosted_internal_control_work;
 #[path = "hosted_scsi_srb_capture.rs"]
 mod hosted_scsi_srb_capture;
+#[path = "hosted_scsi_srb_provider.rs"]
+mod hosted_scsi_srb_provider;
+#[path = "hosted_scsi_srb_work.rs"]
+mod hosted_scsi_srb_work;
+#[path = "native_disk_relation.rs"]
+mod native_disk_relation;
 #[path = "hosted_source_completion_lane.rs"]
 pub(crate) mod hosted_source_completion_lane;
 #[path = "hosted_class_irp_lane.rs"]
@@ -1255,6 +1263,7 @@ pub const FSD_SERVICE_HOOK_FORWARD_LABEL: u64 = 0x7A8;
 pub const FSD_SERVICE_LOWER_FILE_FORWARD_LABEL: u64 = 0x7A9;
 pub const FSD_SERVICE_LOWER_POWER_FORWARD_LABEL: u64 = 0x7D9;
 pub const FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL: u64 = 0x7AA;
+pub const FSD_SERVICE_SCSI_FORWARD_LABEL: u64 = 0x7E4;
 pub const FSD_SERVICE_REMOVE_DPC_LABEL: u64 = 0x7BA;
 pub const FSD_SERVICE_ZW_UNLOAD_DRIVER_LABEL: u64 = 0x7BB;
 pub const FSD_SERVICE_UUID_CREATE_LABEL: u64 = 0x7BC;
@@ -1301,6 +1310,7 @@ const _: () = {
         FSD_SERVICE_LOWER_FILE_FORWARD_LABEL,
         FSD_SERVICE_LOWER_POWER_FORWARD_LABEL,
         FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL,
+        FSD_SERVICE_SCSI_FORWARD_LABEL,
         FSD_SERVICE_REMOVE_DPC_LABEL,
         FSD_SERVICE_ZW_UNLOAD_DRIVER_LABEL,
         FSD_SERVICE_UUID_CREATE_LABEL,
@@ -1485,6 +1495,7 @@ struct PendingIrp {
     requestor_tid: u64,
     major: u8,
     minor: u8,
+    scsi_route: Option<nt_io_manager::scsi_srb_transport::ScsiSrbRoute>,
     /// Selects the WDM output surface without conflating it with buffer ownership. Buffered pipe
     /// reads may replace SystemBuffer; direct and neither I/O always complete into `data`.
     completion_source_kind: u8,
@@ -2238,7 +2249,9 @@ unsafe fn pending_irp_node_valid(node: u64) -> bool {
 #[derive(Clone, Copy)]
 struct PendingIrpCompletionTarget {
     data: u64,
+    aux_data: u64,
     output_capacity: u64,
+    scsi_route: Option<nt_io_manager::scsi_srb_transport::ScsiSrbRoute>,
     completion_source_kind: u8,
     major: u8,
     minor: u8,
@@ -2359,6 +2372,8 @@ unsafe fn claim_pending_irp_completion(irp: u64) -> Option<PendingIrpCompletionC
                         data: read_volatile(
                             (entry + core::mem::offset_of!(PendingIrp, data) as u64) as *const u64,
                         ),
+                        aux_data: owner.aux_data,
+                        scsi_route: owner.scsi_route,
                         output_capacity: read_volatile(
                             (entry + core::mem::offset_of!(PendingIrp, output_capacity) as u64)
                                 as *const u64,
@@ -9597,6 +9612,78 @@ unsafe fn forward_hosted_internal_control(
     status as u32 as i32
 }
 
+/// Major 0x0f overloads internal control and SCSI. Resolve the exact foreign accepted PDO
+/// before inspecting the stack union, which contains an SRB pointer on the storage route.
+unsafe fn is_hosted_foreign_scsi_pdo(device: u64) -> bool {
+    let (label, status, accepted, _, _) = call_on4(
+        (FSD_SERVICE_SCSI_FORWARD_LABEL << 12) | 4, 0, device, 0, 0,
+    );
+    if label != 0 || status as u32 as i32 != STATUS_SUCCESS || accepted > 1 {
+        crate::provider_bugcheck::report(
+            0xc4, [FSD_SERVICE_SCSI_FORWARD_LABEL, 0, device, label],
+        );
+    }
+    accepted == 1
+}
+
+unsafe fn forward_hosted_scsi(
+    device: u64, irp: u64, next: u64, current_location_after_forward: u8,
+) -> i32 {
+    if !reserve_held_scsi_completion(irp) {
+        return nt_status::NtStatus::DEVICE_BUSY.raw();
+    }
+    write_unaligned((next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64, device);
+    let (label, status, accepted, token, _) = call_on4(
+        (FSD_SERVICE_SCSI_FORWARD_LABEL << 12) | 4, 1, device, irp, 0,
+    );
+    if label != 0 || accepted > 1 || (accepted != 0 && token == 0) {
+        crate::provider_bugcheck::report(
+            0xc4, [FSD_SERVICE_SCSI_FORWARD_LABEL, 1, irp, label],
+        );
+    }
+    if accepted == 0 {
+        if !cancel_unbound_scsi_completion(irp) {
+            crate::provider_bugcheck::report(
+                0xc4, [FSD_SERVICE_SCSI_FORWARD_LABEL, 10, irp, token],
+            );
+        }
+        return status as u32 as i32;
+    }
+    if !bind_held_scsi_completion(irp, token) {
+        crate::provider_bugcheck::report(
+            0xc4, [FSD_SERVICE_SCSI_FORWARD_LABEL, 11, irp, token],
+        );
+    }
+    write_unaligned((irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
+        current_location_after_forward);
+    write_unaligned((irp + 0xb8) as *mut u64, next);
+    write_unaligned((next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64, device);
+    let completion = complete_hosted_irp_with_owner(irp);
+    if completion.outcome == HostedIrpUnwindOutcome::MoreProcessingRequired {
+        hosted_forward_origin::acknowledge_inline_held(
+            FSD_SERVICE_SCSI_FORWARD_LABEL, irp, token,
+        );
+        if arm_held_scsi_completion(irp, token) {
+            acknowledge_held_scsi_terminal(irp, token);
+        }
+        return status as u32 as i32;
+    }
+    if !cancel_held_scsi_completion(irp, token) {
+        crate::provider_bugcheck::report(
+            0xc4, [FSD_SERVICE_SCSI_FORWARD_LABEL, 7, irp, token],
+        );
+    }
+    let (ack_label, ack_status, _, _, _) = call_on4(
+        (FSD_SERVICE_SCSI_FORWARD_LABEL << 12) | 4, 2, irp, token, 0,
+    );
+    if ack_label != 0 || ack_status as u32 as i32 != STATUS_SUCCESS {
+        crate::provider_bugcheck::report(
+            0xc4, [FSD_SERVICE_SCSI_FORWARD_LABEL, 2, irp, ack_status],
+        );
+    }
+    status as u32 as i32
+}
+
 /// Foreign POWER dispatch retains the source IRP until its exact provider terminal and local
 /// completion callback both finish. The source adapter may defer an IoFreeIrp while pinned.
 unsafe fn forward_hosted_power(
@@ -9670,6 +9757,9 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                     return forward_hosted_power(device, irp, next, previous_location);
                 }
                 if major == major::IRP_MJ_INTERNAL_DEVICE_CONTROL as u64 {
+                    if is_hosted_foreign_scsi_pdo(device) {
+                        return forward_hosted_scsi(device, irp, next, current_location_after_forward);
+                    }
                     let control = read_unaligned(next as *const nt_kernel_abi::IoStackLocation)
                         .device_io_control()
                         .io_control_code;
@@ -9782,6 +9872,9 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
         }
 
         if major == major::IRP_MJ_INTERNAL_DEVICE_CONTROL as u64 {
+            if is_hosted_foreign_scsi_pdo(device) {
+                return forward_hosted_scsi(device, irp, next, current_location_after_forward);
+            }
             let control = read_unaligned(next as *const nt_kernel_abi::IoStackLocation)
                 .device_io_control()
                 .io_control_code;
@@ -12896,6 +12989,7 @@ type HeldPnpTable = nt_io_manager::held_pnp_completion::HeldPnpCompletionTable<6
 type HeldPnpAcknowledgement = nt_io_manager::held_pnp_completion::HeldPnpAcknowledgement;
 type HeldPnpIdentity = nt_io_manager::held_pnp_completion::HeldPnpIdentity;
 type HeldPnpError = nt_io_manager::held_pnp_completion::HeldPnpError;
+const HELD_SCSI_CAP: usize = 32;
 
 /// The executive image is shared across hosted components. Keep both the lock and the table in
 /// each component's private DATA arena; no pointer in this state refers into a component heap.
@@ -12903,12 +12997,28 @@ type HeldPnpError = nt_io_manager::held_pnp_completion::HeldPnpError;
 struct HostedHeldPnpCompletions {
     lock: AtomicBool,
     table: HeldPnpTable,
+    scsi: [HeldScsiCompletion; HELD_SCSI_CAP],
 }
 
 impl HostedHeldPnpCompletions {
     const fn new() -> Self {
-        Self { lock: AtomicBool::new(false), table: HeldPnpTable::new() }
+        Self {
+            lock: AtomicBool::new(false), table: HeldPnpTable::new(),
+            scsi: [HeldScsiCompletion::EMPTY; HELD_SCSI_CAP],
+        }
     }
+}
+
+#[derive(Clone, Copy)]
+struct HeldScsiCompletion {
+    irp: u64,
+    token: u64,
+    armed: bool,
+    terminal_seen: bool,
+}
+
+impl HeldScsiCompletion {
+    const EMPTY: Self = Self { irp: 0, token: 0, armed: false, terminal_seen: false };
 }
 
 const _: () = assert!(core::mem::size_of::<HostedHeldPnpCompletions>() <= 0x1000);
@@ -12926,6 +13036,101 @@ unsafe fn with_held_pnp_completions<R>(f: impl FnOnce(&mut HeldPnpTable) -> R) -
     let result = f(&mut (*state).table);
     lock.store(false, Ordering::Release);
     result
+}
+
+unsafe fn with_held_scsi_completions<R>(
+    f: impl FnOnce(&mut [HeldScsiCompletion; HELD_SCSI_CAP]) -> R,
+) -> R {
+    let state = (FSD_DATA_VADDR + FSD_DATA_HELD_PNP_COMPLETIONS_OFF)
+        as *mut HostedHeldPnpCompletions;
+    let lock = &(*state).lock;
+    while lock.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    let result = f(&mut (*state).scsi);
+    lock.store(false, Ordering::Release);
+    result
+}
+
+unsafe fn reserve_held_scsi_completion(irp: u64) -> bool {
+    with_held_scsi_completions(|table| {
+        if irp == 0 || table.iter().any(|row| row.irp == irp) { return false; }
+        let Some(row) = table.iter_mut().find(|row| row.irp == 0) else { return false; };
+        *row = HeldScsiCompletion { irp, token: 0, armed: false, terminal_seen: false };
+        true
+    })
+}
+
+unsafe fn bind_held_scsi_completion(irp: u64, token: u64) -> bool {
+    with_held_scsi_completions(|table| {
+        let Some(row) = table.iter_mut().find(|row| row.irp == irp && row.token == 0)
+        else { return false; };
+        if token == 0 || row.armed || row.terminal_seen { return false; }
+        row.token = token;
+        true
+    })
+}
+
+unsafe fn cancel_unbound_scsi_completion(irp: u64) -> bool {
+    with_held_scsi_completions(|table| {
+        let Some(row) = table.iter_mut().find(|row| row.irp == irp && row.token == 0)
+        else { return false; };
+        *row = HeldScsiCompletion::EMPTY;
+        true
+    })
+}
+
+unsafe fn cancel_held_scsi_completion(irp: u64, token: u64) -> bool {
+    with_held_scsi_completions(|table| {
+        let Some(row) = table.iter_mut().find(|row| row.irp == irp && row.token == token)
+        else { return false; };
+        if row.armed || row.terminal_seen { return false; }
+        *row = HeldScsiCompletion::EMPTY;
+        true
+    })
+}
+
+/// The later terminal may race the native origin's operation-4 hold receipt. The row records
+/// either order and yields the token exactly once after both causal observations are present.
+unsafe fn arm_held_scsi_completion(irp: u64, token: u64) -> bool {
+    with_held_scsi_completions(|table| {
+        let row = table.iter_mut().find(|row| row.irp == irp && row.token == token)
+            .expect("held SCSI origin row");
+        if row.armed { crate::provider_bugcheck::report(
+            0xc4, [FSD_SERVICE_SCSI_FORWARD_LABEL, 8, irp, token],
+        ); }
+        row.armed = true;
+        if row.terminal_seen {
+            *row = HeldScsiCompletion::EMPTY;
+            true
+        } else { false }
+    })
+}
+
+unsafe fn observe_held_scsi_terminal(irp: u64) -> Option<u64> {
+    with_held_scsi_completions(|table| {
+        let row = table.iter_mut().find(|row| row.irp == irp)?;
+        if row.terminal_seen { crate::provider_bugcheck::report(
+            0xc4, [FSD_SERVICE_SCSI_FORWARD_LABEL, 9, irp, row.token],
+        ); }
+        row.terminal_seen = true;
+        if row.armed {
+            let token = row.token;
+            *row = HeldScsiCompletion::EMPTY;
+            Some(token)
+        } else { None }
+    })
+}
+
+unsafe fn acknowledge_held_scsi_terminal(irp: u64, token: u64) {
+    let (label, status, _, _, _) = call_on4(
+        (FSD_SERVICE_SCSI_FORWARD_LABEL << 12) | 4, 5, irp, token, 0,
+    );
+    if label != 0 || status as u32 as i32 != STATUS_SUCCESS {
+        crate::provider_bugcheck::report(
+            0xc4, [FSD_SERVICE_SCSI_FORWARD_LABEL, 5, irp, status],
+        );
+    }
 }
 
 /// Inspect the source component's own terminal event while its private table is locked.
@@ -13030,6 +13235,9 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         let outcome = complete_hosted_irp(irp);
         if outcome == HostedIrpUnwindOutcome::Terminal {
             acknowledge_held_pnp_if_terminal(irp);
+            if let Some(token) = observe_held_scsi_terminal(irp) {
+                acknowledge_held_scsi_terminal(irp, token);
+            }
         }
     }
 }
@@ -13163,7 +13371,15 @@ unsafe fn complete_hosted_irp_with_owner(irp: u64) -> HostedIrpCompletionReceipt
         // original buffered-I/O allocation while completing a queued read.
         let sysbuf = read_unaligned((irp + 0x18) as *const u64);
         let irp_flags = read_unaligned((irp + 0x10) as *const u32);
-        let length = pending_irp_completion_output_len(
+        let scsi_capture_valid = target.scsi_route.is_none_or(|route| {
+            hosted_scsi_srb_provider::capture_completion(
+                route, IrpId(canonical_irp_id), target.data,
+                target.output_capacity, target.aux_data,
+            )
+        });
+        let length = if target.scsi_route.is_some() {
+            if scsi_capture_valid { target.output_capacity as usize } else { 0 }
+        } else { pending_irp_completion_output_len(
             target.major as u64,
             target.minor as u64,
             target.control_code,
@@ -13171,8 +13387,7 @@ unsafe fn complete_hosted_irp_with_owner(irp: u64) -> HostedIrpCompletionReceipt
             target.output_capacity,
             status,
             information,
-        )
-        .min(u32::MAX as u64) as usize;
+        ).min(u32::MAX as u64) as usize };
         let source = if length == 0 {
             0
         } else if target.completion_source_kind == COMPLETION_SOURCE_REQUEST_DATA {
@@ -13196,7 +13411,8 @@ unsafe fn complete_hosted_irp_with_owner(irp: u64) -> HostedIrpCompletionReceipt
         let returned_allocation_valid = !filter_requirements
             || information == 0
             || component_pool_allocation_capacity(information).is_some();
-        let completion_valid = source_valid && reclaim_valid && returned_allocation_valid;
+        let completion_valid = source_valid && reclaim_valid && returned_allocation_valid
+            && scsi_capture_valid;
         // The retained graph owns its input allocation until acknowledgement. If the driver
         // returned that same pointer, the accepted PDO edge needs only an unchanged-input proof.
         // Keep the allocation in the graph for its normal release and do not export the pointer.
@@ -37766,9 +37982,14 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         || request.stack_count > u8::MAX as u32
         || request.flags & !0xffff != 0
         || (request._reserved0 != 0
-            && (request._reserved0 != nt_io_abi::IRP_DISPATCH_SUBSIDIARY_FILE_LIFECYCLE
-                || !matches!(request.major,
-                    major::IRP_MJ_CREATE | major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE)))
+            && !((request._reserved0 == nt_io_abi::IRP_DISPATCH_SUBSIDIARY_FILE_LIFECYCLE
+                && matches!(request.major,
+                    major::IRP_MJ_CREATE | major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE))
+                || (request._reserved0 == nt_io_abi::IRP_DISPATCH_SCSI_SRB
+                    && request.major == major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+                    && request.file_id == 0)))
+        || ((request._reserved0 == nt_io_abi::IRP_DISPATCH_SCSI_SRB)
+            != (request.scsi_relation_generation != 0))
         || !nt_io_abi::valid_create_case_sensitive(request.major, request.create_case_sensitive)
         || !nt_io_abi::valid_file_create_options(request.major, request.file_create_options)
         || !nt_io_abi::power_dispatch::valid_power_dispatch(
@@ -37795,6 +38016,7 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     let canonical_file_id = request.file_id;
     let subsidiary_file_lifecycle =
         request._reserved0 == nt_io_abi::IRP_DISPATCH_SUBSIDIARY_FILE_LIFECYCLE;
+    let is_scsi = request._reserved0 == nt_io_abi::IRP_DISPATCH_SCSI_SRB;
     let owner_domain = HostedDomainIdentity {
         domain_id: nt_io_manager::HostedDomainId(request.target_domain_id),
         cookie: request.target_domain_cookie,
@@ -37993,7 +38215,7 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     // - METHOD_BUFFERED: AssociatedIrp.SystemBuffer owns input and receives output.
     // - METHOD_{IN,OUT}_DIRECT: SystemBuffer owns input; MdlAddress maps the output buffer.
     // - METHOD_NEITHER: Type3InputBuffer carries input; Irp->UserBuffer carries output.
-    let control_method = control_transfer_method(major, fsctl);
+    let control_method = if is_scsi { None } else { control_transfer_method(major, fsctl) };
     let output_is_separate = (matches!(
         major as u8,
         major::IRP_MJ_QUERY_EA | major::IRP_MJ_QUERY_QUOTA
@@ -38180,6 +38402,7 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 },
             )
         }
+        _ if is_scsi => (0, 0, 0, 0),
         _ => (data, data, data, 0),
     };
 
@@ -38204,6 +38427,20 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     let iosl = irp + WDM_X64_IRP_SIZE as u64;
     let current_iosl =
         iosl + (current_location as u64 - 1).saturating_mul(WDM_X64_IO_STACK_LOCATION_SIZE as u64);
+    let scsi_projection = if is_scsi {
+        match hosted_scsi_srb_provider::prepare(&request, devobj, data, irp) {
+            Ok(projection) => {
+                aux_data = projection.srb;
+                mdl = projection.mdl;
+                Some(projection)
+            }
+            Err(status) => {
+                pool_free(irp);
+                pool_free_request_buffers(data, aux_data, mdl);
+                return (status, 0);
+            }
+        }
+    } else { None };
     let mut pnp_resource_list = 0u64;
     let mut create_security_context = 0u64;
     let mut create_access_state = 0u64;
@@ -38419,6 +38656,11 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 length: aux_data,
                 key: request.lock_key,
                 byte_offset: request.lock_byte_offset,
+            }
+        }
+        IRP_MJ_INTERNAL_DEVICE_CONTROL if is_scsi => {
+            WdmIoStackParameters::Scsi {
+                srb: scsi_projection.expect("SCSI projection prepared").srb,
             }
         }
         IRP_MJ_FILE_SYSTEM_CONTROL | IRP_MJ_DEVICE_CONTROL | IRP_MJ_INTERNAL_DEVICE_CONTROL => {
@@ -38713,7 +38955,7 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
             );
         }
     }
-    let read_completion = pending_irp_returns_read_bytes(major, minor, fsctl, outlen);
+    let read_completion = is_scsi || pending_irp_returns_read_bytes(major, minor, fsctl, outlen);
     let completion_source_kind = if !(major == IRP_MJ_FILE_SYSTEM_CONTROL
         && fsctl == FSCTL_PIPE_TRANSCEIVE)
         && output_is_separate
@@ -38739,6 +38981,7 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         requestor_tid,
         major: major as u8,
         minor: minor as u8,
+        scsi_route: scsi_projection.map(|projection| projection.route),
         completion_source_kind,
         read_completion,
         owns_fo,
@@ -39199,7 +39442,9 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
             }
         }
         if read_completion {
-            let copy_len = pending_irp_completion_output_len(
+            let copy_len = if completed.scsi_route.is_some() {
+                outlen
+            } else { pending_irp_completion_output_len(
                 major,
                 minor,
                 completed.control_code,
@@ -39207,7 +39452,7 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 outlen,
                 st as u32,
                 info,
-            );
+            ) };
             let full_control_output = (major == IRP_MJ_DEVICE_CONTROL
                 || major == IRP_MJ_INTERNAL_DEVICE_CONTROL)
                 && (ioctl::METHOD_IN_DIRECT as u8..=ioctl::METHOD_NEITHER as u8)
@@ -42008,6 +42253,14 @@ pub(crate) fn pump_registered_file_lifecycle() -> usize {
     pump_io_manager()
 }
 
+pub(crate) fn service_pending_file_backends() -> usize {
+    io_manager_mut().service_pending_backends()
+}
+
+pub(crate) fn service_mounted_native_blocks() -> usize {
+    unsafe { mounted_native_block::service() }
+}
+
 /// Consume the manager's complete durable-allocation signal. Unlike the pump
 /// report, this includes canonical driver/device/File/IRP/domain records and
 /// their record-owned heap data regardless of which operation created them.
@@ -44665,6 +44918,19 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
             }
         };
 
+        let observed_pci_location = hosted_pnp_manager_mut()
+            .enumerated_pdo_properties(query.relation_owner.device_id)
+            .and_then(|properties| {
+                let bus = properties.bus_information.as_ref()?;
+                let capabilities = properties.capabilities.as_ref()?;
+                (bus.bus_type_guid == nt_pnp_manager::GUID_BUS_TYPE_PCI
+                    && bus.legacy_bus_type == nt_pnp_manager::INTERFACE_TYPE_PCI_BUS)
+                    .then_some((bus.bus_number, capabilities.address))
+            });
+        let native_disk_required = crate::boot_storage_dma_handoff::relation_parent_requires_native_disk_proof(
+            query.relation_owner.device_id, observed_pci_location,
+        );
+
         let (phase, attempt) = if mutations.is_empty() {
             (HostedRelationPublicationPhase::PostCommitRepair, None)
         } else {
@@ -44690,7 +44956,15 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
             children,
             bus_lease: None,
             original_changes: None,
-            after_bus_lease: phase,
+            after_bus_lease: if native_disk_required {
+                HostedRelationPublicationPhase::ProveNativeDisk
+            } else { phase },
+            after_native_disk: phase,
+            native_disk_required,
+            native_disk_candidate: 0,
+            native_disk_proof: None,
+            native_disk_refresh: None,
+            native_disk_published: false,
             reported_children: query.reported_children.clone(),
             child_properties: query.child_properties.clone(),
             providers,
@@ -48123,12 +48397,32 @@ fn hosted_irp_dispatch_request(
     }) {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
+    let scsi = match &irp.parameters {
+        IoParameters::Scsi(parameters) => {
+            let expected = 64usize.checked_add(0x58)
+                .and_then(|len| len.checked_add(parameters.data_length as usize))
+                .and_then(|len| len.checked_add(parameters.sense_length as usize))
+                .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+            if irp.major != major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+                || irp.file_id.is_some()
+                || irp.device_id != parameters.route.pdo
+                || target.hosted_domain_id != parameters.route.provider.domain_id.raw()
+                || target.hosted_domain_cookie != parameters.route.provider.cookie
+                || input_len != expected || output_len != expected
+                || subsidiary_file_lifecycle.is_some()
+            { return Err(nt_status::NtStatus::INVALID_PARAMETER); }
+            Some(parameters)
+        }
+        _ => None,
+    };
     Ok(IrpDispatchRequest {
         abi_version: IO_ABI_VERSION as u16,
         abi_size: core::mem::size_of::<IrpDispatchRequest>() as u16,
         major: irp.major,
         minor: irp.minor,
-        _reserved0: if subsidiary_file_lifecycle.is_some() {
+        _reserved0: if scsi.is_some() {
+            nt_io_abi::IRP_DISPATCH_SCSI_SRB
+        } else if subsidiary_file_lifecycle.is_some() {
             nt_io_abi::IRP_DISPATCH_SUBSIDIARY_FILE_LIFECYCLE
         } else { 0 },
         flags: irp.flags.bits() as u32 | ((irp.control.bits() as u32) << 8),
@@ -48212,6 +48506,7 @@ fn hosted_irp_dispatch_request(
             IoParameters::Power(parameters) => parameters.shutdown_type(),
             _ => 0,
         },
+        scsi_relation_generation: scsi.map_or(0, |params| params.route.relation_generation),
         buffer_id: irp.buffer.map(|buffer| buffer.buffer_id).unwrap_or(0),
         buffer_len: u32::try_from(transfer_len)
             .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
@@ -48264,6 +48559,29 @@ fn hosted_irp_explicit_transfer_dispatch(
     let buffer = irp.buffer.ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     let input_len = buffer.input_len as usize;
     let output_len = buffer.output_len as usize;
+    if let IoParameters::Scsi(parameters) = &irp.parameters {
+        let transfer = (parameters.data_length as usize)
+            .checked_add(parameters.sense_length as usize)
+            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+        if input_len != transfer || output_len != 64 + 0x58 + transfer
+            || ctx.system_buffer.len() < output_len
+        { return Err(nt_status::NtStatus::INVALID_PARAMETER); }
+        let input = &ctx.system_buffer[..transfer];
+        let packet = nt_io_manager::scsi_srb_wire::encode_scsi_wire_request(
+            parameters.route,
+            irp.irp_id,
+            parameters.srb,
+            &input[..parameters.data_length as usize],
+            &input[parameters.data_length as usize..],
+        ).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+        return Ok(hosted_file_dispatch::execute(
+            instance,
+            Some(unsafe { crate::initial_system_driver_caller() }),
+            irp,
+            &packet,
+            &mut ctx.system_buffer[..output_len],
+        ));
+    }
     let control = matches!(
         irp.major,
         major::IRP_MJ_DEVICE_CONTROL | major::IRP_MJ_INTERNAL_DEVICE_CONTROL
@@ -48319,7 +48637,8 @@ impl DriverDispatchBackend for HostedDriverBackend {
         if irp.requestor_tid != 0 {
             return Err(nt_status::NtStatus::INVALID_HANDLE);
         }
-        let result = if ctx.has_nonbuffered_transfer() {
+        let result = if matches!(irp.parameters, IoParameters::Scsi(_))
+            || ctx.has_nonbuffered_transfer() {
             hosted_irp_explicit_transfer_dispatch(self.instance, ctx, irp)?
         } else {
             // Legacy File transport supplies one combined bank, with separate output
@@ -48905,6 +49224,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
     ).map_err(|status| status.raw() as u32)?;
     match result {
         hosted_file_owners::DispatchResult::Returned {
+            irp_id: _,
             status,
             information,
             file_context,
@@ -63567,6 +63887,37 @@ pub(crate) unsafe fn redrive_hosted_internal_control_forward(handler: *mut ExecN
     hosted_internal_control_work::redrive(handler);
 }
 
+pub(crate) unsafe fn service_hosted_scsi_forward(
+    ch: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    operation: u64,
+    address: u64,
+    irp_or_token: u64,
+) -> Option<(i32, bool)> {
+    match operation {
+        0 if irp_or_token == 0 => Some(hosted_scsi_srb_work::classify(
+            ch, reply_cap, badge, address,
+        )),
+        1 => hosted_scsi_srb_work::submit(ch, irp_or_token, address, badge, reply_cap)
+            .map(|status| (status, false)),
+        2 => hosted_scsi_srb_work::acknowledge(
+            ch, reply_cap, badge, address, irp_or_token,
+        ).map(|status| (status, false)),
+        4 => Some((hosted_scsi_srb_work::hold_inline(
+            ch, reply_cap, badge, address, irp_or_token,
+        ), false)),
+        5 => Some((hosted_scsi_srb_work::complete_held(
+            ch, reply_cap, badge, address, irp_or_token,
+        ), false)),
+        _ => Some((STATUS_INVALID_PARAMETER, false)),
+    }
+}
+
+pub(crate) unsafe fn redrive_hosted_scsi_forward(handler: *mut ExecNtHandler) {
+    hosted_scsi_srb_work::redrive(handler);
+}
+
 pub(crate) unsafe fn redrive_hosted_query_path_forward(handler: *mut ExecNtHandler) {
     hosted_query_path_work::redrive(handler);
     hosted_create_subject_registration::redrive_terminal();
@@ -63878,10 +64229,12 @@ pub(crate) unsafe fn nested_hosted_query_path_ready() -> bool {
 
 pub(crate) unsafe fn nested_hosted_internal_control_ready() -> bool {
     hosted_internal_control_work::nested_work_ready()
+        || hosted_scsi_srb_work::nested_work_ready()
 }
 
 pub(crate) unsafe fn redrive_nested_hosted_internal_control(handler: *mut ExecNtHandler) -> bool {
     hosted_internal_control_work::redrive_nested_ready(handler)
+        || hosted_scsi_srb_work::redrive_nested_ready(handler)
 }
 
 pub(crate) unsafe fn redrive_nested_hosted_query_path(handler: *mut ExecNtHandler) -> bool {
@@ -69809,13 +70162,19 @@ unsafe fn dispatch_irp_for_instance_exact(
             || request.input_len as usize != in_data.len()
             || request.output_len as usize != out.len()
             || (request._reserved0 != 0
-                && (request._reserved0 != nt_io_abi::IRP_DISPATCH_SUBSIDIARY_FILE_LIFECYCLE
-                    || io_manager_mut()
+                && !((request._reserved0 == nt_io_abi::IRP_DISPATCH_SUBSIDIARY_FILE_LIFECYCLE
+                    && io_manager_mut()
                         .subsidiary_file_lifecycle_identity(IrpId(request.irp_id))
-                        .is_none_or(|identity| {
-                            identity.file_id().raw() != request.file_id
-                                || identity.major() != request.major
-                        })))
+                        .is_some_and(|identity| {
+                            identity.file_id().raw() == request.file_id
+                                && identity.major() == request.major
+                        }))
+                    || (request._reserved0 == nt_io_abi::IRP_DISPATCH_SCSI_SRB
+                        && request.major == major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+                        && request.file_id == 0
+                        && request.scsi_relation_generation != 0)))
+            || ((request._reserved0 == nt_io_abi::IRP_DISPATCH_SCSI_SRB)
+                != (request.scsi_relation_generation != 0))
             || request.stack_count == 0
             || request.stack_location >= request.stack_count
             || !nt_io_abi::valid_create_case_sensitive(request.major, request.create_case_sensitive)

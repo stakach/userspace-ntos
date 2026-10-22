@@ -9,6 +9,11 @@ impl ExecNtHandler {
         value_type: nt_hive_core::RegistryValueType,
         data: &[u8],
     ) -> Result<(), u32> {
+        if matches!(unsafe { crate::fs_loader::exec_fs_mount_identity() }
+            .and_then(crate::fs_loader::exec_block_route_kind),
+            Some(nt_fs::BlockSourceKind::Native | nt_fs::BlockSourceKind::Draining)) {
+            return Err(nt_fs::STATUS_NOT_SUPPORTED);
+        }
         let _durable = allocator::enter_durable();
         let _path_scope = allocator::enter_scope(b"registry.mutable-hive-path");
         let relative = self
@@ -35,7 +40,7 @@ impl ExecNtHandler {
         Ok(())
     }
 
-    fn mutable_hive_set_value_status(err: nt_hive_core::HiveSetValueError) -> u32 {
+    pub(crate) fn mutable_hive_set_value_status(err: nt_hive_core::HiveSetValueError) -> u32 {
         use nt_hive_core::{HiveSetValueError, SetValueError};
         match err {
             HiveSetValueError::Prepare(SetValueError::KeyNotFound)
