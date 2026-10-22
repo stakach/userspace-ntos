@@ -1348,6 +1348,11 @@ pub(crate) enum PreparedHostedResourcePlan {
         window: HostedPnpPciResourceDescriptor,
         lease: nt_pnp_context::ContextLease,
     },
+    PciNoResources {
+        provider: nt_pnp_manager::AcceptedPdoProviderAuthority,
+        child: nt_pnp_manager::DevnodeIdentity,
+        device: nt_pnp::PciDevice,
+    },
     Platform {
         grant: DevnodeRootResourceGrant,
         window: HostedPnpPlatformResourceDescriptor,
@@ -1389,7 +1394,7 @@ impl PreparedHostedResourcePlan {
                 Some(&resources.raw_resources),
                 Some(&resources.resource_requirements),
             ),
-            Self::AcpiChildNoResources { .. } | Self::None => (None, None),
+            Self::PciNoResources { .. } | Self::AcpiChildNoResources { .. } | Self::None => (None, None),
         }
     }
 
@@ -1398,7 +1403,7 @@ impl PreparedHostedResourcePlan {
             Self::Pci { lease, .. } | Self::Platform { lease, .. }
             | Self::AcpiChild { lease, .. } => lease,
             Self::BusReportedBusNumber { .. } | Self::BusOwnedRoot { .. }
-            | Self::AcpiChildNoResources { .. }
+            | Self::PciNoResources { .. } | Self::AcpiChildNoResources { .. }
             | Self::None => return Ok(()),
         };
         release_hosted_pnp_context_lease(lease.into_identity())
@@ -1415,7 +1420,8 @@ impl PreparedHostedResourcePlan {
             }
             Self::BusReportedBusNumber { .. } | Self::BusOwnedRoot { .. }
             | Self::Platform { .. }
-            | Self::AcpiChild { .. } | Self::AcpiChildNoResources { .. }
+            | Self::AcpiChild { .. } | Self::PciNoResources { .. }
+            | Self::AcpiChildNoResources { .. }
             | Self::None => {
                 crate::hosted_pci_topology::HostedPciInterruptRouteAdmission::Current
             }
@@ -1583,14 +1589,57 @@ where
             return Err(release_context_lease_after_error(lease, status));
         }
     };
-    let pci_device = nt_pnp::find_pci_device_for_devnode(
-        &context.pci_devices,
-        instance_id,
-        hardware_ids,
-        compatible_ids,
-    );
+    let accepted_pci_pdo = bus_pdo.filter(|_| nt_pnp::parse_pci_id_pattern(instance_id).is_some());
+    let pci_device = if let Some(pdo) = accepted_pci_pdo {
+        let (bus_number, address) = match driver_launch::hosted_accepted_pci_location(instance_id, pdo) {
+            Ok(location) => location,
+            Err(status) => return Err(release_context_lease_after_error(lease, status)),
+        };
+        nt_pnp::find_pci_device_for_accepted_pdo(
+            &context.pci_devices,
+            instance_id,
+            hardware_ids,
+            bus_number,
+            address,
+        )
+    } else {
+        nt_pnp::find_pci_device_for_devnode(
+            &context.pci_devices,
+            instance_id,
+            hardware_ids,
+            compatible_ids,
+        )
+    };
+
+    if accepted_pci_pdo.is_some() && pci_device.is_none() {
+        return Err(release_context_lease_after_error(
+            lease,
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+    }
 
     if let Some(device) = pci_device {
+        let accepted_properties = match bus_pdo {
+            Some(pdo) => match driver_launch::hosted_accepted_pci_resource_properties(
+                instance_id, pdo, device,
+            ) {
+                Ok(driver_launch::AcceptedPciResourceProperties::NoResources { provider, child }) => {
+                    let device = device.clone();
+                    release_hosted_pnp_context_lease(lease.into_identity())?;
+                    return Ok(PreparedHostedDevnode {
+                        pdo_description: None,
+                        resource_plan: PreparedHostedResourcePlan::PciNoResources {
+                            provider, child, device,
+                        },
+                    });
+                }
+                Ok(driver_launch::AcceptedPciResourceProperties::Present { raw, requirements }) => {
+                    Some((raw, requirements))
+                }
+                Err(status) => return Err(release_context_lease_after_error(lease, status)),
+            },
+            None => None,
+        };
         let window = context
             .pci_windows
             .iter()
@@ -1607,19 +1656,6 @@ where
                 lease,
                 nt_status::NtStatus::INVALID_DEVICE_REQUEST,
             ));
-        };
-        let accepted_properties = match bus_pdo {
-            Some(pdo) => match driver_launch::hosted_accepted_pci_resource_properties(
-                instance_id,
-                pdo,
-                device,
-            ) {
-                Ok(properties) => Some(properties),
-                Err(status) => {
-                    return Err(release_context_lease_after_error(lease, status));
-                }
-            },
-            None => None,
         };
         let resource_publication = nt_root_bus::PdoResourcePublication {
             raw_boot_resources: nt_root_bus::BusResourceState::Present(
@@ -2180,6 +2216,15 @@ unsafe fn filter_attached_devnode(
     if let PreparedHostedResourcePlan::AcpiChildNoResources { provider, child } = &resource_plan {
         if let Err(status) = driver_launch::validate_hosted_accepted_acpi_no_resources(
             instance_id, device_id, *provider, *child,
+        ) {
+            return finish_filter_failure(
+                device_id, resource_plan, service_name, instance_id, options, status, report,
+            );
+        }
+    }
+    if let PreparedHostedResourcePlan::PciNoResources { provider, child, device } = &resource_plan {
+        if let Err(status) = driver_launch::validate_hosted_accepted_pci_no_resources(
+            instance_id, device_id, *provider, *child, device,
         ) {
             return finish_filter_failure(
                 device_id, resource_plan, service_name, instance_id, options, status, report,

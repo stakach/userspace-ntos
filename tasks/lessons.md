@@ -725,3 +725,7 @@ diagnosis-free failure.
 
 ## Keep Long Acceptance Runs Quiet When Requested
 - If the user asks for a completion-only update, continue the authorized validation and repair loop without routine progress messages. Report the full evidence after the issue is actually closed; surface a question only when work cannot continue without an answer.
+
+## Keep DMA Broker Allocations Authoritative
+- A missing native allocation record is not proof that a DMA buffer was freed. A driver can clear shared memory without completing the root Free operation. Reject `PutDmaAdapter` while the root manager still owns a buffer or mapping; do not silently revoke those rows to make retirement succeed.
+- Forward an exact, authenticated Free to the root while the native record is still live. If allocation and Free happen before the next replay, first register the exact bounded buffer with the root, then free it. Clear the local record only after a confirmed root receipt; an uncertain reply retains ownership and stops the provider.

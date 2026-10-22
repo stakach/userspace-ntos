@@ -14055,7 +14055,8 @@ unsafe fn grant_hosted_devnode_resources(
             );
             settle_hosted_pnp_context_grant(device_id, context_lease, result)
         }
-        PreparedHostedResourcePlan::AcpiChildNoResources { .. }
+        PreparedHostedResourcePlan::PciNoResources { .. }
+        | PreparedHostedResourcePlan::AcpiChildNoResources { .. }
         | PreparedHostedResourcePlan::None => {
             if filtered_resource_requirements.is_empty() {
                 Ok(None)
@@ -20716,13 +20717,16 @@ unsafe fn map_generation_owned_pci_dma_iommu(
     let io_space_cap = try_alloc_slot().ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let domain = hosted_pci_dma_domain(device);
     let io_badge = (domain << 16) | hosted_pci_request_id(device);
-    if cnode_mint_r(
+    let mint_error = cnode_mint_r(
         CAP_INIT_THREAD_CNODE,
         io_space_cap,
         SLOT_IO_SPACE,
         io_badge,
-    ) != 0
-    {
+    );
+    if mint_error != 0 {
+        print_str(b"[pci-dma-iommu] mint failed rid="); print_u64(hosted_pci_request_id(device));
+        print_str(b" domain="); print_u64(domain);
+        print_str(b" error="); print_u64(mint_error); print_str(b"\n");
         recycle_deleted_root_slot(io_space_cap);
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
     }
@@ -20741,7 +20745,11 @@ unsafe fn map_generation_owned_pci_dma_iommu(
             return Err(nt_status::NtStatus::UNSUCCESSFUL);
         }
         owner.adopt_alias_cap(iopt, false);
-        if iopt_map(iopt, io_space_cap, grant.logical) != 0 {
+        let map_error = iopt_map(iopt, io_space_cap, grant.logical);
+        if map_error != 0 {
+            print_str(b"[pci-dma-iommu] page-table map failed rid="); print_u64(hosted_pci_request_id(device));
+            print_str(b" domain="); print_u64(domain);
+            print_str(b" error="); print_u64(map_error); print_str(b"\n");
             return Err(nt_status::NtStatus::UNSUCCESSFUL);
         }
     }
@@ -20752,7 +20760,12 @@ unsafe fn map_generation_owned_pci_dma_iommu(
             return Err(nt_status::NtStatus::UNSUCCESSFUL);
         }
         owner.adopt_alias_cap(frame_io, false);
-        if map_io(frame_io, io_space_cap, 0x3, grant.logical + page * 0x1000) != 0 {
+        let map_error = map_io(frame_io, io_space_cap, 0x3, grant.logical + page * 0x1000);
+        if map_error != 0 {
+            print_str(b"[pci-dma-iommu] frame map failed rid="); print_u64(hosted_pci_request_id(device));
+            print_str(b" domain="); print_u64(domain);
+            print_str(b" page="); print_u64(page);
+            print_str(b" error="); print_u64(map_error); print_str(b"\n");
             return Err(nt_status::NtStatus::UNSUCCESSFUL);
         }
         page += 1;

@@ -83,3 +83,90 @@ fn released_for_dpc_and_processor_index_imports_preserve_real_topology() {
     assert!(spin.contains("fn acquire_for_dpc(") && spin.contains("fn release_for_dpc("));
     assert!(cpu.contains("fn processor_number_from_index("));
 }
+
+#[test]
+fn released_network_processor_relationship_import_has_a_native_topology_owner() {
+    let drivers = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../rust-micro/.tmp/libernt/tree/Windows/system32/drivers");
+    if let Some(imports) = kernel_imports(&drivers.join("ndis.sys")) {
+        assert!(imports.contains("KeQueryLogicalProcessorRelationship"));
+    }
+    let launch = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    let cpu = include_str!("../../../components/ntos-executive/src/hosted_driver_processor_mask.rs");
+    assert!(launch.contains("reg.bind(\n        \"KeQueryLogicalProcessorRelationship\""));
+    assert!(cpu.contains("fn query_logical_processor_relationship("));
+    assert!(cpu.contains("write_relation_group("));
+}
+
+#[test]
+fn released_network_group_and_guid_imports_have_native_bindings() {
+    let drivers = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../rust-micro/.tmp/libernt/tree/Windows/system32/drivers");
+    let expected = [
+        "KeQueryMaximumProcessorCountEx",
+        "KeSetTargetProcessorDpcEx",
+        "RtlGUIDFromString",
+    ];
+    if let Some(imports) = kernel_imports(&drivers.join("ndis.sys")) {
+        for symbol in expected { assert!(imports.contains(symbol), "pinned ndis.sys no longer imports {symbol}"); }
+    }
+    let launch = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    for symbol in expected { assert!(launch.contains(&format!("\"{symbol}\"")), "missing native {symbol}"); }
+}
+
+#[test]
+fn released_storage_and_network_timer_watchdog_imports_have_native_owners() {
+    let drivers = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../rust-micro/.tmp/libernt/tree/Windows/system32/drivers");
+    for (driver, symbol) in [
+        ("ndis.sys", "KeSetCoalescableTimer"),
+        ("storport.sys", "KeQueryDpcWatchdogInformation"),
+    ] {
+        if let Some(imports) = kernel_imports(&drivers.join(driver)) {
+            assert!(imports.contains(symbol), "pinned {driver} no longer imports {symbol}");
+        }
+    }
+    let launch = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    assert!(launch.contains("reg.bind(\n        \"KeSetCoalescableTimer\""));
+    assert!(launch.contains("reg.bind(\n        \"KeQueryDpcWatchdogInformation\""));
+    assert!(launch.contains("s_ke_set_coalescable_timer as *const ()"));
+    assert!(launch.contains("s_ke_query_dpc_watchdog_information as *const ()"));
+}
+
+#[test]
+fn released_storport_physical_inverse_uses_published_mappings() {
+    let drivers = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../rust-micro/.tmp/libernt/tree/Windows/system32/drivers");
+    if let Some(imports) = kernel_imports(&drivers.join("storport.sys")) {
+        assert!(imports.contains("MmGetVirtualForPhysical"));
+    }
+    let launch = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    assert!(launch.contains("reg.bind(\n        \"MmGetVirtualForPhysical\""));
+    assert!(launch.contains("s_mm_get_virtual_for_physical as *const ()"));
+    assert!(launch.contains("hosted_component_virtual_address(physical_address, 1)"));
+}
+
+#[test]
+fn released_network_image_directory_import_uses_checked_pe_parser() {
+    let drivers = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../rust-micro/.tmp/libernt/tree/Windows/system32/drivers");
+    if let Some(imports) = kernel_imports(&drivers.join("ndis.sys")) {
+        assert!(imports.contains("RtlImageDirectoryEntryToData"));
+    }
+    let launch = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    let image = include_str!("../../../components/ntos-executive/src/hosted_driver_image_directory.rs");
+    assert!(launch.contains("reg.bind(\n        \"RtlImageDirectoryEntryToData\""));
+    assert!(image.contains("nt_pe_loader::image_directory_entry("));
+}
+
+#[test]
+fn released_network_unicode_prefix_import_has_a_counted_kernel_binding() {
+    let drivers = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../rust-micro/.tmp/libernt/tree/Windows/system32/drivers");
+    if let Some(imports) = kernel_imports(&drivers.join("ndis.sys")) {
+        assert!(imports.contains("RtlPrefixUnicodeString"));
+    }
+    let launch = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    assert!(launch.contains("reg.bind(\n        \"RtlPrefixUnicodeString\""));
+    assert!(launch.contains("fn s_rtl_prefix_unicode_string("));
+}

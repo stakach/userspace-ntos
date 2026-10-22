@@ -4134,6 +4134,21 @@ unsafe fn component_pump_loop(
                 0
             );
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_BUS_INTERFACE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, value1, value2) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_BUS_INTERFACE_LABEL << 12) | 4)
+            {
+                crate::driver_launch::hosted_bus_interface::service(
+                    ch, *reply_cap, msg.badge, msg.m0, msg.m1, msg.m2, msg.m3,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 3,
+                status as u32 as u64, value1, value2, 0);
+            continue;
         } else if label == crate::win32k_subsystem::W32_DEVICE_POINTER_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {

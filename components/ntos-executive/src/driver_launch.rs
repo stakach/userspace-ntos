@@ -23,6 +23,8 @@
 #[path = "hosted_irq_broker.rs"]
 #[allow(dead_code)]// Activated only by the atomic ISR/DPC/provider cutover tracked in the plan.
 mod hosted_irq_broker;
+#[path = "hosted_bus_interface.rs"]
+pub(crate) mod hosted_bus_interface;
 #[path = "hosted_source_retirement.rs"]
 mod hosted_source_retirement;
 #[path = "hosted_dxg_registration.rs"]
@@ -272,6 +274,10 @@ mod hosted_driver_create_driver;
 pub(crate) use hosted_driver_create_driver::service as service_hosted_driver_create_driver;
 #[path = "hosted_driver_processor_mask.rs"]
 mod hosted_driver_processor_mask;
+#[path = "hosted_driver_guid.rs"]
+mod hosted_driver_guid;
+#[path = "hosted_driver_image_directory.rs"]
+mod hosted_driver_image_directory;
 #[path = "hosted_driver_thermal_request.rs"]
 mod hosted_driver_thermal_request;
 #[path = "hosted_driver_process_bitness.rs"]
@@ -555,7 +561,8 @@ use nt_mdl::{MdlKey, MdlRegistry};
 use nt_kernel_exec::{
     classify_dispatcher_wait_timeout, init_ksemaphore, kevent, ksemaphore_read_state,
     ksemaphore_release, ksemaphore_try_wait, rtl_bitmap, DispatcherWaitTimeout, EventKind,
-    HostedDpcActivation, HostedDpcError, HostedDpcOwner, HostedDpcQueueResult, HostedDpcTable,
+    HostedDpcActivation, HostedDpcError, HostedDpcImportance, HostedDpcOwner,
+    HostedDpcQueueResult, HostedDpcTable,
     HostedDriverThreadError, HostedDriverThreadTable,
     InterruptActualLockError, InterruptActualLockIdentity, InterruptActualLockLease,
     InterruptActualLockTable,
@@ -908,7 +915,7 @@ pub const SH_REGISTRY_EXPORT_BUF: u64 = 0x610; // in: ASCII Linkage\Export
 pub const SH_DMA_ALLOC_CURSOR: u64 = 0x6A0; // out: next offset in the granted common-buffer window
 pub const SH_DMA_ALLOC_RECORD_COUNT: u64 = 0x6A8; // out: high-water mark in allocation records
 pub const SH_DMA_ALLOC_RECORD_CAPACITY: u64 = 0x6B0; // out: records available in the shared arena
-pub const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x38;
+pub const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x40;
 pub const SH_DMA_ALLOC_RECORD_LOGICAL: u64 = 0x00;
 pub const SH_DMA_ALLOC_RECORD_LEN: u64 = 0x08;
 pub const SH_DMA_ALLOC_RECORD_VA: u64 = 0x10;
@@ -916,6 +923,7 @@ pub const SH_DMA_ALLOC_RECORD_KIND: u64 = 0x18;
 pub const SH_DMA_ALLOC_RECORD_SOURCE_VA: u64 = 0x20;
 pub const SH_DMA_ALLOC_RECORD_FLAGS: u64 = 0x28;
 pub const SH_DMA_ALLOC_RECORD_MAP_REGISTER: u64 = 0x30;
+pub const SH_DMA_ALLOC_RECORD_ADAPTER_ID: u64 = 0x38;
 pub const SH_ACTIVE_IRP: u64 = 0x6C0; // out: component VA of the IRP currently inside MajorFunction
 pub const SH_ACTIVE_IOSL: u64 = 0x6C8; // out: component VA of Tail.Overlay.CurrentStackLocation
 pub const SH_ACTIVE_DATA: u64 = 0x6D0; // out: component VA of request SystemBuffer/UserBuffer
@@ -1163,6 +1171,7 @@ pub const FSD_SERVICE_ROOT_PDO_PNP_LABEL: u64 = 0x781;
 pub const FSD_SERVICE_DEVICE_LABEL: u64 = 0x782;
 pub const FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL: u64 = 0x783;
 pub const FSD_SERVICE_PCI_CONFIG_LABEL: u64 = 0x784;
+pub const FSD_SERVICE_BUS_INTERFACE_LABEL: u64 = hosted_bus_interface::LABEL;
 pub const FSD_SERVICE_INTERRUPT_LABEL: u64 = 0x785;
 pub const FSD_IRQ_LANE_COMPLETION_LABEL: u64 = 0x786;
 pub const FSD_IRQ_LANE_FAULT_LABEL: u64 = 0x787;
@@ -1298,6 +1307,7 @@ const _: () = {
         FSD_SERVICE_LUID_LABEL,
         FSD_SERVICE_KMUTEX_LABEL,
         FSD_SERVICE_PCI_ROOT_LABEL,
+        FSD_SERVICE_BUS_INTERFACE_LABEL,
         FSD_SERVICE_PCI_ROUTE_QUERY_LABEL,
         FSD_SERVICE_PCI_IPI_PREFLIGHT_LABEL,
         FSD_SERVICE_HAL_PCI_ROUTED_INTERRUPT_LABEL,
@@ -5207,7 +5217,29 @@ extern "win64" fn s_ke_set_timer(timer: u64, due_time: u64, dpc: u64) -> u8 {
 }
 
 extern "win64" fn s_ke_set_timer_ex(timer: u64, due_time: u64, period: i32, dpc: u64) -> u8 {
-    if timer == 0 || period < 0 {
+    if period < 0 {
+        if unsafe { hosted_irq_lane_context().is_some() } {
+            hosted_irq_lane_protocol_fault(timer);
+        }
+        return 0;
+    }
+    s_ke_set_timer_with_period(timer, due_time, period as u32, dpc)
+}
+
+/// Earliest due time is always within the coalescing window. Keep the full
+/// ULONG period, including values above LONG_MAX, in the root timer owner.
+extern "win64" fn s_ke_set_coalescable_timer(
+    timer: u64,
+    due_time: u64,
+    period: u32,
+    _tolerable_delay: u32,
+    dpc: u64,
+) -> u8 {
+    s_ke_set_timer_with_period(timer, due_time, period, dpc)
+}
+
+fn s_ke_set_timer_with_period(timer: u64, due_time: u64, period: u32, dpc: u64) -> u8 {
+    if timer == 0 {
         if unsafe { hosted_irq_lane_context().is_some() } {
             hosted_irq_lane_protocol_fault(timer);
         }
@@ -5219,7 +5251,7 @@ extern "win64" fn s_ke_set_timer_ex(timer: u64, due_time: u64, period: i32, dpc:
             FSD_SERVICE_KE_SET_TIMER_LABEL,
             timer,
             due_time,
-            period as u32,
+            period,
             dpc,
         )
     } {
@@ -5230,7 +5262,7 @@ extern "win64" fn s_ke_set_timer_ex(timer: u64, due_time: u64, period: i32, dpc:
             (FSD_SERVICE_KE_SET_TIMER_LABEL << 12) | 4,
             timer,
             due_time,
-            period as u32 as u64,
+            period as u64,
             dpc,
         )
     };
@@ -7494,6 +7526,32 @@ extern "win64" fn s_rtl_append_unicode_to_string(dst: u64, src: u64) -> i32 {
 /// `BOOLEAN RtlEqualUnicodeString(PCUNICODE_STRING, PCUNICODE_STRING, BOOLEAN)`.
 extern "win64" fn s_rtl_equal_unicode_string(left: u64, right: u64, case_insensitive: u8) -> u8 {
     (s_rtl_compare_unicode_string(left, right, case_insensitive) == 0) as u8
+}
+
+/// `BOOLEAN RtlPrefixUnicodeString(PCUNICODE_STRING, PCUNICODE_STRING, BOOLEAN)`.
+extern "win64" fn s_rtl_prefix_unicode_string(prefix: u64, string: u64, case_insensitive: u8) -> u8 {
+    unsafe {
+        let (Some((prefix_len, _, prefix_buf)), Some((string_len, _, string_buf))) =
+            (unicode_string_triplet(prefix), unicode_string_triplet(string))
+        else {
+            return 0;
+        };
+        if prefix_len > string_len || prefix_buf == 0 || string_buf == 0 {
+            return 0;
+        }
+        for index in 0..usize::from(prefix_len / 2) {
+            let mut left = read_unaligned((prefix_buf + (index * 2) as u64) as *const u16);
+            let mut right = read_unaligned((string_buf + (index * 2) as u64) as *const u16);
+            if case_insensitive != 0 {
+                left = nt_compat_exports::rtl::upcase_char(left);
+                right = nt_compat_exports::rtl::upcase_char(right);
+            }
+            if left != right {
+                return 0;
+            }
+        }
+        1
+    }
 }
 
 unsafe fn ansi_string_triplet(s: u64) -> Option<(u16, u16, u64)> {
@@ -9874,6 +9932,13 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
         if major != IRP_MJ_PNP {
             return nt_status::NtStatus::INVALID_DEVICE_REQUEST.raw();
         }
+        if forwarded_minor == nt_pnp_abi::IRP_MN_QUERY_INTERFACE as u64 {
+            if let Some(status) = hosted_bus_interface::try_query_interface(
+                device, irp, next, previous_location,
+            ) {
+                return status;
+            }
+        }
         if forwarded_minor == nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS as u64 {
             if !reserve_held_pnp_completion(irp, 5) {
                 return nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw();
@@ -10830,10 +10895,22 @@ unsafe fn hosted_component_physical_address(virtual_address: u64) -> Option<u64>
 }
 
 unsafe fn hosted_component_virtual_address(physical_address: u64, length: u64) -> Option<u64> {
-    nt_compat_exports::memory::virtual_address(
-        hosted_component_physical_mappings()?,
+    let shared = hosted_provider_export_lane::current_component_bank()
+        .or_else(hosted_class_irp_lane::current_component_bank)
+        .unwrap_or(FSD_SHARED_VADDR);
+    if let Some(resource) = find_shared_address_resource_by_range(
+        shared,
+        SH_RESOURCE_ADDRESS_KIND_MEMORY,
         physical_address,
         length,
+        true,
+    ) {
+        if resource.va != 0 {
+            return resource.va.checked_add(physical_address.checked_sub(resource.translated_start)?);
+        }
+    }
+    nt_compat_exports::memory::virtual_address(
+        hosted_component_physical_mappings()?, physical_address, length,
     )
 }
 
@@ -10841,6 +10918,12 @@ unsafe fn hosted_component_virtual_address(physical_address: u64, length: u64) -
 /// this isolated driver VSpace. Unknown or unmapped addresses return zero, as NT does on failure.
 extern "win64" fn s_mm_get_physical_address(virtual_address: u64) -> u64 {
     unsafe { hosted_component_physical_address(virtual_address).unwrap_or(0) }
+}
+
+/// `PVOID MmGetVirtualForPhysical(PHYSICAL_ADDRESS)`. Return only an existing
+/// mapping belonging to this provider; this query never creates a new alias.
+extern "win64" fn s_mm_get_virtual_for_physical(physical_address: u64) -> u64 {
+    unsafe { hosted_component_virtual_address(physical_address, 1).unwrap_or(0) }
 }
 
 /// `PVOID MmMapIoSpace(PHYSICAL_ADDRESS, SIZE_T, MEMORY_CACHING_TYPE)` — return the component VA
@@ -11190,6 +11273,8 @@ fn project_hosted_dma_adapter(
     number_of_map_registers: *mut u32,
 ) -> u64 {
     unsafe {
+        static DMA_REQUEST_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+        let trace = DMA_REQUEST_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8;
         if pdo == 0 || device_description == 0 {
             return 0;
         }
@@ -11199,8 +11284,24 @@ fn project_hosted_dma_adapter(
         );
         let description = match nt_dma_manager::Nt5DeviceDescription::parse(bytes) {
             Ok(description) => description,
-            Err(_) => return 0,
+            Err(_) => {
+                if trace {
+                    print_str(b"[dma-request] invalid descriptor pdo=0x");
+                    print_hex64(pdo);
+                    print_str(b" version=");
+                    print_u64(u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as u64);
+                    print_str(b"\n");
+                }
+                return 0;
+            }
         };
+        if trace {
+            print_str(b"[dma-request] pdo=0x"); print_hex64(pdo);
+            print_str(b" dma64="); print_u64(description.dma64 as u64);
+            print_str(b" maxlen="); print_u64(description.maximum_length as u64);
+            print_str(b" bus="); print_u64(description.bus_number as u64);
+            print_str(b"\n");
+        }
         let mut words = description.service_words();
         words[0] |= HOSTED_DMA_SERVICE_REQUEST_ADAPTER << HOSTED_DMA_SERVICE_OPERATION_SHIFT;
         let (_label, status, granted_adapter_id, granted_map_registers, granted_lease_id) = call_on5(
@@ -11211,6 +11312,12 @@ fn project_hosted_dma_adapter(
             words[2],
             words[3],
         );
+        if trace {
+            print_str(b"[dma-request] result status=0x"); print_hex64(status as u32 as u64);
+            print_str(b" adapter="); print_u64(granted_adapter_id);
+            print_str(b" lease="); print_u64(granted_lease_id);
+            print_str(b"\n");
+        }
         if status as u32 as i32 != STATUS_SUCCESS
             || granted_adapter_id == 0
             || granted_lease_id == 0
@@ -11229,26 +11336,18 @@ fn project_hosted_dma_adapter(
             || grant_len == 0
             || grant_logical == 0
         {
+            release_unpublished_dma_adapter_lease(granted_lease_id);
             return 0;
         }
-        let active_adapter = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *const u64);
-        if dma_adapter_blob_matches(active_adapter, adapter_id)
-            && read_unaligned((active_adapter + HOSTED_DMA_ADAPTER_LEASE_ID_OFFSET) as *const u64)
-                == granted_lease_id
-        {
-            if !number_of_map_registers.is_null() {
-                write_unaligned(number_of_map_registers, granted_map_registers as u32);
-            }
-            return active_adapter;
-        }
-
         let ops = pool_alloc(0x100);
         if ops == 0 {
+            release_unpublished_dma_adapter_lease(granted_lease_id);
             return 0;
         }
         let adapter = pool_alloc(HOSTED_DMA_ADAPTER_SIZE);
         if adapter == 0 {
             pool_free(ops);
+            release_unpublished_dma_adapter_lease(granted_lease_id);
             return 0;
         }
 
@@ -11356,6 +11455,21 @@ fn project_hosted_dma_adapter(
     }
 }
 
+/// A successful root grant must be released if its local projection cannot be published.
+unsafe fn release_unpublished_dma_adapter_lease(lease_id: u64) {
+    let (_label, status, _, _, _) = call_on5(
+        (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+        lease_id,
+        HOSTED_DMA_SERVICE_RELEASE_ADAPTER << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+        0,
+        0,
+        0,
+    );
+    if status as u32 as i32 != STATUS_SUCCESS {
+        crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_DMA_ADAPTER_LABEL, lease_id, 0, status]);
+    }
+}
+
 /// `PutDmaAdapter` — release the component-local adapter projection.
 extern "win64" fn s_dma_put_adapter(adapter: u64) {
     unsafe {
@@ -11375,7 +11489,10 @@ extern "win64" fn s_dma_put_adapter(adapter: u64) {
             0,
         );
         if status as u32 as i32 != STATUS_SUCCESS {
-            return;
+            crate::provider_bugcheck::report(
+                0xc4,
+                [FSD_SERVICE_DMA_ADAPTER_LABEL, lease_id, adapter, status],
+            );
         }
         let active = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *const u64);
         let ops = read_unaligned((adapter + HOSTED_DMA_ADAPTER_OPS_OFFSET) as *const u64);
@@ -11412,6 +11529,8 @@ const HOSTED_DMA_SERVICE_OPERATION_SHIFT: u64 = 56;
 const HOSTED_DMA_SERVICE_OPERATION_MASK: u64 = 0xff << HOSTED_DMA_SERVICE_OPERATION_SHIFT;
 const HOSTED_DMA_SERVICE_REQUEST_ADAPTER: u64 = 1;
 const HOSTED_DMA_SERVICE_RELEASE_ADAPTER: u64 = 2;
+const HOSTED_DMA_SERVICE_FREE_COMMON_BUFFER: u64 = 3;
+const HOSTED_DMA_SERVICE_FREE_MAPPING: u64 = 4;
 
 #[derive(Clone, Copy)]
 struct HostedDmaAdapterMetadata {
@@ -11478,6 +11597,7 @@ unsafe fn clear_dma_allocation_record(record: u64) {
     write_volatile((record + SH_DMA_ALLOC_RECORD_SOURCE_VA) as *mut u64, 0);
     write_volatile((record + SH_DMA_ALLOC_RECORD_FLAGS) as *mut u64, 0);
     write_volatile((record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *mut u64, 0);
+    write_volatile((record + SH_DMA_ALLOC_RECORD_ADAPTER_ID) as *mut u64, 0);
 }
 
 unsafe fn dma_allocation_range_overlaps(
@@ -11548,15 +11668,6 @@ unsafe fn dma_adapter_metadata(adapter: u64) -> Option<HostedDmaAdapterMetadata>
     })
 }
 
-unsafe fn dma_adapter_blob_matches(adapter: u64, adapter_id: u64) -> bool {
-    if adapter_id == 0 {
-        return false;
-    }
-    dma_adapter_metadata(adapter)
-        .map(|metadata| metadata.adapter_id == adapter_id)
-        .unwrap_or(false)
-}
-
 /// `AllocateCommonBuffer` — allocate a bounded slice from the PnP-granted DMA common-buffer window.
 extern "win64" fn s_dma_allocate_common_buffer(
     adapter: u64,
@@ -11614,6 +11725,7 @@ extern "win64" fn s_dma_allocate_common_buffer(
         write_volatile((record + SH_DMA_ALLOC_RECORD_SOURCE_VA) as *mut u64, 0);
         write_volatile((record + SH_DMA_ALLOC_RECORD_FLAGS) as *mut u64, 0);
         write_volatile((record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *mut u64, 0);
+        write_volatile((record + SH_DMA_ALLOC_RECORD_ADAPTER_ID) as *mut u64, metadata.adapter_id);
         write_volatile(
             (FSD_SHARED_VADDR + SH_DMA_REQUESTED_LEN) as *mut u64,
             requested,
@@ -11653,9 +11765,9 @@ extern "win64" fn s_dma_free_common_buffer(
     _cache_enabled: u8,
 ) {
     unsafe {
-        if dma_active_adapter_and_grant(adapter).is_none() {
+        let Some(metadata) = dma_adapter_metadata(adapter) else {
             return;
-        }
+        };
         let logical = logical as u64;
         let mut i = 0u64;
         let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
@@ -11668,10 +11780,37 @@ extern "win64" fn s_dma_free_common_buffer(
                 let kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
                 if active_logical != 0
                     && kind == HOSTED_DMA_RECORD_KIND_COMMON
+                    && read_volatile((record + SH_DMA_ALLOC_RECORD_ADAPTER_ID) as *const u64)
+                        == metadata.adapter_id
                     && logical == active_logical
                     && virtual_address == active_va
                     && length as u64 == active_len
                 {
+                    let lease_id = read_unaligned(
+                        (adapter + HOSTED_DMA_ADAPTER_LEASE_ID_OFFSET) as *const u64,
+                    );
+                    let (reply, status, adapter_reply, logical_reply, length_reply) = call_on5(
+                        (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+                        lease_id,
+                        HOSTED_DMA_SERVICE_FREE_COMMON_BUFFER << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+                        metadata.adapter_id,
+                        active_logical,
+                        active_len,
+                    );
+                    if reply >> 12 != 0
+                        || reply & 0x7f != 4
+                        || status as u32 as i32 != STATUS_SUCCESS
+                        || adapter_reply != 0
+                        || logical_reply != 0
+                        || length_reply != 0
+                    {
+                        // Free is void in the NT ABI. The root receipt is required before
+                        // recycling a record or allowing this logical address to be reused.
+                        crate::provider_bugcheck::report(
+                            0xc4,
+                            [FSD_SERVICE_DMA_ADAPTER_LABEL, lease_id, active_logical, status],
+                        );
+                    }
                     write_volatile(
                         (FSD_SHARED_VADDR + SH_DMA_FREED_LOGICAL) as *mut u64,
                         active_logical,
@@ -11818,14 +11957,16 @@ extern "win64" fn s_dma_allocate_adapter_channel(
     context: u64,
 ) -> i32 {
     unsafe {
-        if dma_active_adapter_and_grant(adapter).is_none()
-            || number_of_map_registers == 0
+        let Some(metadata) = dma_adapter_metadata(adapter) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        if number_of_map_registers == 0
             || number_of_map_registers > 64
             || execution_routine == 0
         {
             return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
         }
-        let map_register = dma_allocate_map_register_token(number_of_map_registers);
+        let map_register = dma_allocate_map_register_token(metadata.adapter_id, number_of_map_registers);
         if map_register == 0 {
             return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
         }
@@ -11869,6 +12010,7 @@ extern "win64" fn s_dma_map_transfer(
         };
         if map_register_base == 0
             || read_unaligned(map_register_base as *const u64) != HOSTED_DMA_MAP_REGISTER_SIGNATURE
+            || read_unaligned((map_register_base + 16) as *const u64) != metadata.adapter_id
             || length.is_null()
         {
             trace_hosted_dma_sg(
@@ -12013,6 +12155,7 @@ extern "win64" fn s_dma_map_transfer(
             (record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *mut u64,
             map_register_base,
         );
+        write_volatile((record + SH_DMA_ALLOC_RECORD_ADAPTER_ID) as *mut u64, metadata.adapter_id);
         let count = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
         let used = ((record - FSD_SHARED_VADDR - SH_DMA_ALLOC_RECORDS) / SH_DMA_ALLOC_RECORD_SIZE)
             .saturating_add(1);
@@ -12044,7 +12187,7 @@ extern "win64" fn s_dma_map_transfer(
     }
 }
 
-unsafe fn dma_find_map_record(map_register_base: u64, source_va: u64) -> Option<u64> {
+unsafe fn dma_find_map_record(adapter_id: u64, map_register_base: u64, source_va: u64) -> Option<u64> {
     let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
     let mut i = 0u64;
     while i < capacity {
@@ -12054,6 +12197,7 @@ unsafe fn dma_find_map_record(map_register_base: u64, source_va: u64) -> Option<
         let active_len = read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64);
         let active_source = read_volatile((record + SH_DMA_ALLOC_RECORD_SOURCE_VA) as *const u64);
         if kind == HOSTED_DMA_RECORD_KIND_MAP_TRANSFER
+            && read_volatile((record + SH_DMA_ALLOC_RECORD_ADAPTER_ID) as *const u64) == adapter_id
             && token == map_register_base
             && active_len != 0
             && (source_va == 0 || source_va == active_source)
@@ -12074,10 +12218,13 @@ extern "win64" fn s_dma_flush_adapter_buffers(
     write_to_device: u8,
 ) -> u8 {
     unsafe {
-        if dma_active_adapter_and_grant(adapter).is_none() || map_register_base == 0 {
+        let Some(metadata) = dma_adapter_metadata(adapter) else {
+            return 0;
+        };
+        if map_register_base == 0 {
             return 0;
         }
-        let Some(record) = dma_find_map_record(map_register_base, current_va) else {
+        let Some(record) = dma_find_map_record(metadata.adapter_id, map_register_base, current_va) else {
             return 0;
         };
         let mapped_len = read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64);
@@ -12094,12 +12241,18 @@ extern "win64" fn s_dma_flush_adapter_buffers(
 }
 
 extern "win64" fn s_dma_free_map_registers(
-    _adapter: u64,
+    adapter: u64,
     map_register_base: u64,
     _number_of_map_registers: u32,
 ) {
     unsafe {
-        if map_register_base == 0 {
+        let Some(metadata) = dma_adapter_metadata(adapter) else {
+            return;
+        };
+        if map_register_base == 0
+            || read_unaligned(map_register_base as *const u64) != HOSTED_DMA_MAP_REGISTER_SIGNATURE
+            || read_unaligned((map_register_base + 16) as *const u64) != metadata.adapter_id
+        {
             return;
         }
         let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
@@ -12109,7 +12262,38 @@ extern "win64" fn s_dma_free_map_registers(
                 let kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
                 let token =
                     read_volatile((record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *const u64);
-                if kind == HOSTED_DMA_RECORD_KIND_MAP_TRANSFER && token == map_register_base {
+                if kind == HOSTED_DMA_RECORD_KIND_MAP_TRANSFER
+                    && token == map_register_base
+                    && read_volatile((record + SH_DMA_ALLOC_RECORD_ADAPTER_ID) as *const u64)
+                        == metadata.adapter_id
+                {
+                    let logical = read_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *const u64);
+                    let length = read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64);
+                    let lease_id = read_unaligned(
+                        (adapter + HOSTED_DMA_ADAPTER_LEASE_ID_OFFSET) as *const u64,
+                    );
+                    let (reply, status, adapter_reply, logical_reply, length_reply) = call_on5(
+                        (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+                        lease_id,
+                        HOSTED_DMA_SERVICE_FREE_MAPPING << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+                        metadata.adapter_id,
+                        logical,
+                        length,
+                    );
+                    if reply >> 12 != 0
+                        || reply & 0x7f != 4
+                        || status as u32 as i32 != STATUS_SUCCESS
+                        || adapter_reply != 0
+                        || logical_reply != 0
+                        || length_reply != 0
+                    {
+                        // A void ABI cannot report an uncertain Free to the caller. Keep the
+                        // record and token live, and stop this provider before either is reused.
+                        crate::provider_bugcheck::report(
+                            0xc4,
+                            [FSD_SERVICE_DMA_ADAPTER_LABEL, lease_id, logical, status],
+                        );
+                    }
                     clear_dma_allocation_record(record);
                 }
             }
@@ -12129,7 +12313,7 @@ extern "win64" fn s_dma_read_dma_counter(_adapter: u64) -> u32 {
     0
 }
 
-const HOSTED_SG_CONTEXT_SIZE: u64 = 0x30;
+const HOSTED_SG_CONTEXT_SIZE: u64 = 0x38;
 const HOSTED_SG_CONTEXT_SIGNATURE: u64 = 0x5347_4354_5830_3031; // "SGCTX001"
 const HOSTED_SG_CONTEXT_MAP_REGISTER: u64 = 0x08;
 const HOSTED_SG_CONTEXT_MDL: u64 = 0x10;
@@ -12137,11 +12321,12 @@ const HOSTED_SG_CONTEXT_CURRENT_VA: u64 = 0x18;
 const HOSTED_SG_CONTEXT_LENGTH: u64 = 0x20;
 const HOSTED_SG_CONTEXT_WRITE_TO_DEVICE: u64 = 0x28;
 const HOSTED_SG_CONTEXT_LIST_OWNED: u64 = 0x29;
+const HOSTED_SG_CONTEXT_ADAPTER_ID: u64 = 0x30;
 const HOSTED_SG_LIST_SIZE_ONE: u64 = 0x28;
 const HOSTED_SG_ELEMENT_OFFSET: u64 = 0x10;
 
-unsafe fn dma_allocate_map_register_token(number_of_map_registers: u32) -> u64 {
-    if number_of_map_registers == 0 || number_of_map_registers > 64 {
+unsafe fn dma_allocate_map_register_token(adapter_id: u64, number_of_map_registers: u32) -> u64 {
+    if adapter_id == 0 || number_of_map_registers == 0 || number_of_map_registers > 64 {
         return 0;
     }
     let map_register = pool_alloc_zeroed(0x20);
@@ -12150,6 +12335,7 @@ unsafe fn dma_allocate_map_register_token(number_of_map_registers: u32) -> u64 {
     }
     write_unaligned(map_register as *mut u64, HOSTED_DMA_MAP_REGISTER_SIGNATURE);
     write_unaligned((map_register + 8) as *mut u32, number_of_map_registers);
+    write_unaligned((map_register + 16) as *mut u64, adapter_id);
     map_register
 }
 
@@ -12177,7 +12363,10 @@ unsafe fn dma_prepare_one_element_sg_list(
         );
         return STATUS_INVALID_PARAMETER;
     }
-    let map_register = dma_allocate_map_register_token(1);
+    let Some(metadata) = dma_adapter_metadata(adapter) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let map_register = dma_allocate_map_register_token(metadata.adapter_id, 1);
     let sg_context = pool_alloc_zeroed(HOSTED_SG_CONTEXT_SIZE);
     if map_register == 0 || sg_context == 0 {
         if map_register != 0 {
@@ -12248,6 +12437,10 @@ unsafe fn dma_prepare_one_element_sg_list(
     write_unaligned(
         (sg_context + HOSTED_SG_CONTEXT_LIST_OWNED) as *mut u8,
         list_owned,
+    );
+    write_unaligned(
+        (sg_context + HOSTED_SG_CONTEXT_ADAPTER_ID) as *mut u64,
+        metadata.adapter_id,
     );
 
     write_unaligned(sg_list as *mut u32, 1);
@@ -12453,6 +12646,14 @@ extern "win64" fn s_dma_put_scatter_gather_list(
         let sg_context = read_unaligned((scatter_gather + 8) as *const u64);
         if sg_context == 0
             || read_unaligned(sg_context as *const u64) != HOSTED_SG_CONTEXT_SIGNATURE
+        {
+            return;
+        }
+        let Some(metadata) = dma_adapter_metadata(adapter) else {
+            return;
+        };
+        if read_unaligned((sg_context + HOSTED_SG_CONTEXT_ADAPTER_ID) as *const u64)
+            != metadata.adapter_id
         {
             return;
         }
@@ -15268,6 +15469,10 @@ extern "win64" fn s_ke_query_system_time(out: u64) {
     }
 }
 
+const KDPC_TYPE_OFFSET: u64 = 0;
+const KDPC_IMPORTANCE_OFFSET: u64 = 1;
+const KDPC_OBJECT_TYPE: u8 = 19;
+const KDPC_THREADED_OBJECT_TYPE: u8 = 24;
 const KDPC_DEFERRED_ROUTINE_OFFSET: u64 = 0x18;
 const KDPC_DEFERRED_CONTEXT_OFFSET: u64 = 0x20;
 const KDPC_SYSTEM_ARGUMENT1_OFFSET: u64 = 0x28;
@@ -15282,16 +15487,52 @@ unsafe fn clear_dpc_diagnostics(sh: u64) {
 
 /// `void KeInitializeDpc(PRKDPC, PKDEFERRED_ROUTINE, PVOID)`.
 extern "win64" fn s_ke_initialize_dpc(dpc: u64, routine: u64, deferred_context: u64) {
+    initialize_dpc_projection(dpc, routine, deferred_context, KDPC_OBJECT_TYPE);
+}
+
+/// `void KeInitializeThreadedDpc(PRKDPC, PKDEFERRED_ROUTINE, PVOID)`.
+extern "win64" fn s_ke_initialize_threaded_dpc(dpc: u64, routine: u64, deferred_context: u64) {
+    initialize_dpc_projection(dpc, routine, deferred_context, KDPC_THREADED_OBJECT_TYPE);
+}
+
+fn initialize_dpc_projection(dpc: u64, routine: u64, deferred_context: u64, object_type: u8) {
     unsafe {
         if dpc == 0 {
             return;
         }
         core::ptr::write_bytes(dpc as *mut u8, 0, KDPC_SIZE as usize);
+        write_unaligned((dpc + KDPC_TYPE_OFFSET) as *mut u8, object_type);
+        write_unaligned(
+            (dpc + KDPC_IMPORTANCE_OFFSET) as *mut u8,
+            HostedDpcImportance::Medium as u8,
+        );
         write_unaligned((dpc + KDPC_DEFERRED_ROUTINE_OFFSET) as *mut u64, routine);
         write_unaligned(
             (dpc + KDPC_DEFERRED_CONTEXT_OFFSET) as *mut u64,
             deferred_context,
         );
+    }
+}
+
+/// No DPC watchdog accounting is published by the hosted scheduler. Report
+/// unsupported instead of filling the structure with fabricated limits.
+extern "win64" fn s_ke_query_dpc_watchdog_information(_information: u64) -> i32 {
+    STATUS_NOT_SUPPORTED
+}
+
+/// `void KeSetImportanceDpc(PRKDPC, KDPC_IMPORTANCE)`.
+extern "win64" fn s_ke_set_importance_dpc(dpc: u64, importance: u32) {
+    if dpc == 0 || importance > u8::MAX as u32 {
+        return;
+    }
+    let Some(importance) = HostedDpcImportance::from_raw(importance as u8) else {
+        return;
+    };
+    unsafe {
+        let object_type = read_unaligned((dpc + KDPC_TYPE_OFFSET) as *const u8);
+        if object_type == KDPC_OBJECT_TYPE || object_type == KDPC_THREADED_OBJECT_TYPE {
+            write_unaligned((dpc + KDPC_IMPORTANCE_OFFSET) as *mut u8, importance as u8);
+        }
     }
 }
 
@@ -19381,6 +19622,7 @@ struct ProviderMarshalState {
     resource_mapping_copyback: bool,
     resource_state_copyback: bool,
     dma_state_copyback: bool,
+    dma_free_adapter_id: u64,
     dma_free_logical: u64,
     dma_free_len: u64,
     miniport_interrupt_provider_instance: usize,
@@ -19469,6 +19711,7 @@ impl ProviderMarshalState {
             resource_mapping_copyback: false,
             resource_state_copyback: false,
             dma_state_copyback: false,
+            dma_free_adapter_id: 0,
             dma_free_logical: 0,
             dma_free_len: 0,
             miniport_interrupt_provider_instance: usize::MAX,
@@ -29179,24 +29422,24 @@ unsafe fn dma_common_pointer_in_grant(
     va_offset == logical_offset && va_offset <= grant_len && length <= grant_len - va_offset
 }
 
-unsafe fn dma_common_allocation_record_matches(
+unsafe fn dma_common_allocation_record_adapter_id(
     sh: u64,
     component_va: u64,
     logical: u64,
     length: u64,
-) -> bool {
+) -> Option<u64> {
     if !dma_common_pointer_in_grant(sh, component_va, logical, length) {
-        return false;
+        return None;
     }
     let capacity = dma_allocation_record_capacity(sh);
     let count = read_volatile((sh + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
     if capacity == 0 || count > capacity {
-        return false;
+        return None;
     }
     let mut index = 0u64;
     while index < count {
         let Some(record) = dma_allocation_record(sh, index) else {
-            return false;
+            return None;
         };
         let record_logical = read_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *const u64);
         let record_len = read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64);
@@ -29207,11 +29450,12 @@ unsafe fn dma_common_allocation_record_matches(
             && record_len == length
             && record_va == component_va
         {
-            return true;
+            let adapter_id = read_volatile((record + SH_DMA_ALLOC_RECORD_ADAPTER_ID) as *const u64);
+            return (adapter_id != 0).then_some(adapter_id);
         }
         index += 1;
     }
-    false
+    None
 }
 
 unsafe fn dma_common_allocation_record_covers(
@@ -29328,15 +29572,16 @@ unsafe fn provider_marshal_input_dma_common_buffer(
     if length > u32::MAX as u64 {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    if !dma_common_allocation_record_matches(
+    let Some(adapter_id) = dma_common_allocation_record_adapter_id(
         dependent_inst.exec_shared_va,
         arg_value,
         physical_address,
         length,
-    ) {
+    ) else {
         return Err(STATUS_INVALID_PARAMETER);
-    }
+    };
     state.dma_state_copyback = true;
+    state.dma_free_adapter_id = adapter_id;
     state.dma_free_logical = physical_address;
     state.dma_free_len = length;
     Ok(arg_value)
@@ -30973,7 +31218,6 @@ unsafe fn provider_dma_allocation_records_valid(sh: u64) -> bool {
     let grant_va = read_volatile((sh + SH_DMA_COMMON_VA) as *const u64);
     let grant_len = read_volatile((sh + SH_DMA_COMMON_LEN) as *const u64);
     let grant_logical = read_volatile((sh + SH_DMA_COMMON_LOGICAL) as *const u64);
-    let adapter_id = read_volatile((sh + SH_DMA_ADAPTER_ID) as *const u64);
     let mut index = 0u64;
     while index < record_count {
         let Some(record) = dma_allocation_record(sh, index) else {
@@ -30983,7 +31227,8 @@ unsafe fn provider_dma_allocation_records_valid(sh: u64) -> bool {
         let len = read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64);
         let va = read_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *const u64);
         let kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
-        if logical != 0 || len != 0 || va != 0 || kind != 0 {
+        let adapter_id = read_volatile((record + SH_DMA_ALLOC_RECORD_ADAPTER_ID) as *const u64);
+        if logical != 0 || len != 0 || va != 0 || kind != 0 || adapter_id != 0 {
             if adapter_id == 0
                 || grant_va == 0
                 || grant_len == 0
@@ -31044,6 +31289,8 @@ unsafe fn project_provider_resource_state(
     write_hosted_resource_state_projection(provider_shared, state, false);
     copy_provider_mmio_mapping_state(provider_shared, dependent_shared);
     copy_provider_interrupt_state(provider_shared, dependent_shared);
+    replay_hosted_dma_allocation_records(binding, dependent_shared)
+        .map_err(|status| status.raw())?;
     project_provider_dma_state(dependent_shared, provider_shared)?;
     Ok(())
 }
@@ -31104,27 +31351,31 @@ unsafe fn complete_provider_dma_state(
         print_str(b"[driver-import] provider DMA state rejected\n");
         return;
     }
-    copy_provider_dma_projection_fields(dependent_shared, provider_shared);
-    copy_provider_dma_allocation_records(dependent_shared, provider_shared);
     let Some(binding) = binding else {
         print_str(b"[driver-import] provider DMA state has no dependent binding\n");
         return;
     };
     if state.dma_free_logical != 0 {
-        let freed = read_volatile((dependent_shared + SH_DMA_FREED_LOGICAL) as *const u64);
+        let freed = read_volatile((provider_shared + SH_DMA_FREED_LOGICAL) as *const u64);
         if freed == state.dma_free_logical {
-            match hosted_dma_manager_mut().free_common_buffer(
+            if let Err(error) = hosted_dma_manager_mut().free_common_buffer_for_adapter(
                 hosted_dma_owner(binding),
+                state.dma_free_adapter_id,
                 state.dma_free_logical,
                 state.dma_free_len,
             ) {
-                Ok(()) | Err(DmaError::StaleId) => {}
-                Err(_) => {
-                    print_str(b"[driver-import] provider DMA free rejected by manager\n");
-                }
+                print_str(b"[driver-import] provider DMA free rejected by manager status=0x");
+                print_hex(hosted_dma_status(error).0 as u32);
+                print_str(b"\n");
+                return;
             }
+        } else {
+            print_str(b"[driver-import] provider DMA free missing exact receipt\n");
+            return;
         }
     }
+    copy_provider_dma_projection_fields(dependent_shared, provider_shared);
+    copy_provider_dma_allocation_records(dependent_shared, provider_shared);
     match replay_hosted_dma_allocation_records(binding, dependent_shared) {
         Ok(()) => refresh_hosted_device_resource_state(binding, dependent_shared),
         Err(status) => {
@@ -34696,6 +34947,14 @@ fn register_fsd_trampolines() -> bool {
         s_rtl_init_unicode_string as *const () as usize as u64,
     );
     reg.bind(
+        "RtlGUIDFromString",
+        hosted_driver_guid::guid_from_string as *const () as usize as u64,
+    );
+    reg.bind(
+        "RtlImageDirectoryEntryToData",
+        hosted_driver_image_directory::image_directory_entry_to_data as *const () as usize as u64,
+    );
+    reg.bind(
         "RtlInitEmptyUnicodeString",
         s_rtl_init_empty_unicode_string as *const () as usize as u64,
     );
@@ -34758,6 +35017,10 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "RtlEqualUnicodeString",
         s_rtl_equal_unicode_string as *const () as usize as u64,
+    );
+    reg.bind(
+        "RtlPrefixUnicodeString",
+        s_rtl_prefix_unicode_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlInitAnsiString",
@@ -35153,6 +35416,10 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "MmGetPhysicalAddress",
         s_mm_get_physical_address as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmGetVirtualForPhysical",
+        s_mm_get_virtual_for_physical as *const () as usize as u64,
     );
     reg.bind(
         "MmGetPhysicalMemoryRanges",
@@ -35676,6 +35943,30 @@ fn register_fsd_trampolines() -> bool {
         hosted_driver_processor_mask::processor_number_from_index as *const () as usize as u64,
     );
     reg.bind(
+        "KeQueryLogicalProcessorRelationship",
+        hosted_driver_processor_mask::query_logical_processor_relationship as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeQueryMaximumProcessorCountEx",
+        hosted_driver_processor_mask::query_maximum_processor_count_ex as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeQueryActiveGroupCount",
+        hosted_driver_processor_mask::query_active_group_count as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeQueryGroupAffinity",
+        hosted_driver_processor_mask::query_group_affinity as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeQueryNodeActiveAffinity",
+        hosted_driver_processor_mask::query_node_active_affinity as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeSetTargetProcessorDpcEx",
+        hosted_driver_processor_mask::set_target_processor_dpc_ex as *const () as usize as u64,
+    );
+    reg.bind(
         "KeAcquireSpinLockAtDpcLevel",
         hosted_driver_spin_lock::acquire_at_dpc as *const () as usize as u64,
     );
@@ -35762,6 +36053,10 @@ fn register_fsd_trampolines() -> bool {
         s_ke_set_timer_ex as *const () as usize as u64,
     );
     reg.bind(
+        "KeSetCoalescableTimer",
+        s_ke_set_coalescable_timer as *const () as usize as u64,
+    );
+    reg.bind(
         "KeDelayExecutionThread",
         s_ke_delay_execution_thread as *const () as usize as u64,
     );
@@ -35776,6 +36071,18 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "KeInitializeDpc",
         s_ke_initialize_dpc as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeInitializeThreadedDpc",
+        s_ke_initialize_threaded_dpc as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeSetImportanceDpc",
+        s_ke_set_importance_dpc as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeQueryDpcWatchdogInformation",
+        s_ke_query_dpc_watchdog_information as *const () as usize as u64,
     );
     reg.bind(
         "KeInsertQueueDpc",
@@ -49782,6 +50089,9 @@ static mut HOSTED_DEVICE_RELATION_FAILURES: Option<Vec<HostedDeviceRelationFailu
 static mut HOSTED_RESOURCE_MANAGER: Option<ResourceManager> = None;
 static mut HOSTED_DMA_MANAGER: Option<HostedDmaManager> = None;
 static mut HOSTED_DMA_ADAPTER_LEASES: Option<Vec<HostedDmaAdapterLease>> = None;
+// A failed DMA mapping/PCI-command rollback has uncertain native effects. Retain the exact
+// generation tombstone so a later request cannot replay those effects or reuse its adapter.
+static mut HOSTED_DMA_QUARANTINED_OWNERS: Vec<DmaOwner> = Vec::new();
 static HOSTED_DMA_ADAPTER_LEASE_NEXT: AtomicU64 = AtomicU64::new(0);
 static mut HOSTED_MDL_REGISTRY: Option<MdlRegistry> = None;
 static mut HOSTED_DEVICE_RESOURCE_STATES: Option<Vec<HostedDeviceResourceState>> = None;
@@ -51129,6 +51439,18 @@ unsafe fn hosted_dma_adapter_leases_mut() -> &'static mut Vec<HostedDmaAdapterLe
     slot.as_mut().unwrap()
 }
 
+unsafe fn hosted_dma_owner_is_quarantined(owner: DmaOwner) -> bool {
+    (&*core::ptr::addr_of!(HOSTED_DMA_QUARANTINED_OWNERS)).contains(&owner)
+}
+
+unsafe fn quarantine_hosted_dma_owner(owner: DmaOwner) {
+    let owners = &mut *core::ptr::addr_of_mut!(HOSTED_DMA_QUARANTINED_OWNERS);
+    if !owners.contains(&owner) {
+        // Capacity was reserved before starting any native mapping or PCI command effect.
+        owners.push(owner);
+    }
+}
+
 unsafe fn hosted_dma_pdo_generation(pdo_device_id: u64) -> Option<HostedDmaPdoGeneration> {
     let pnp = hosted_pnp_manager_mut();
     let devnode = pnp.devnode_identity_for_pdo(pdo_device_id)?;
@@ -51174,26 +51496,14 @@ unsafe fn retain_hosted_dma_adapter_lease(
     let pdo_generation = hosted_dma_pdo_generation(binding.pdo_device_id)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let leases = hosted_dma_adapter_leases_mut();
-    if let Some(lease) = leases.iter().copied().find(|lease| {
+    if leases.iter().any(|lease| {
         lease.adapter_id == adapter_id
             && lease.owner == owner
             && lease.consumer_domain == binding.projection_domain
+            && (lease.pdo_registration != pdo_registration
+                || !hosted_dma_generations_equal(lease.pdo_generation, pdo_generation))
     }) {
-        return if lease.pdo_registration == pdo_registration
-            && match (lease.pdo_generation, pdo_generation) {
-                (HostedDmaPdoGeneration::Root(left), HostedDmaPdoGeneration::Root(right)) => {
-                    left == right
-                }
-                (HostedDmaPdoGeneration::Child(left), HostedDmaPdoGeneration::Child(right)) => {
-                    left == right
-                }
-                _ => false,
-            }
-        {
-            Ok(lease.lease_id)
-        } else {
-            Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
-        };
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     let lease_id = HOSTED_DMA_ADAPTER_LEASE_NEXT
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -51214,6 +51524,14 @@ unsafe fn retain_hosted_dma_adapter_lease(
         pdo_generation,
     });
     Ok(lease_id)
+}
+
+fn hosted_dma_generations_equal(left: HostedDmaPdoGeneration, right: HostedDmaPdoGeneration) -> bool {
+    match (left, right) {
+        (HostedDmaPdoGeneration::Root(left), HostedDmaPdoGeneration::Root(right)) => left == right,
+        (HostedDmaPdoGeneration::Child(left), HostedDmaPdoGeneration::Child(right)) => left == right,
+        _ => false,
+    }
 }
 
 unsafe fn release_hosted_dma_adapter_lease(
@@ -51238,11 +51556,217 @@ unsafe fn release_hosted_dma_adapter_lease(
     {
         return Err(nt_status::NtStatus::ACCESS_DENIED);
     }
-    hosted_dma_manager_mut()
-        .put_adapter_for_owner(lease.owner, lease.adapter_id)
-        .map_err(hosted_dma_status)?;
+    if !leases.iter().enumerate().any(|(other_index, other)| {
+        other_index != index && other.owner == lease.owner && other.adapter_id == lease.adapter_id
+    }) {
+        if hosted_dma_adapter_has_live_records(lease.owner, lease.adapter_id)? {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+        hosted_dma_manager_mut()
+            .put_adapter_for_owner(lease.owner, lease.adapter_id)
+            .map_err(hosted_dma_status)?;
+    }
     leases.remove(index);
     Ok(())
+}
+
+unsafe fn hosted_dma_adapter_has_live_records(
+    owner: DmaOwner,
+    adapter_id: u64,
+) -> Result<bool, nt_status::NtStatus> {
+    let Some(bindings) = hosted_device_bindings() else {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    };
+    let mut found = false;
+    for binding in bindings.iter().copied().filter(|binding| {
+        binding.used && hosted_dma_owner(*binding) == owner
+    }) {
+        found = true;
+        let inst = instance(binding.projection_instance)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        if instance_domain_identity(inst) != Some(binding.projection_domain) {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        let sh = inst.exec_shared_va;
+        let capacity = dma_allocation_record_capacity(sh);
+        let count = read_volatile((sh + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
+        if capacity != dma_allocation_record_arena_capacity() || count > capacity {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        for record_index in 0..count {
+            let record = dma_allocation_record(sh, record_index)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+            if read_volatile((record + SH_DMA_ALLOC_RECORD_ADAPTER_ID) as *const u64) == adapter_id {
+                return Ok(true);
+            }
+        }
+    }
+    if found {
+        Ok(false)
+    } else {
+        Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+    }
+}
+
+unsafe fn authenticated_hosted_dma_free_lease(
+    instance_index: usize,
+    domain: HostedDomainIdentity,
+    sh: u64,
+    lease_id: u64,
+    adapter_id: u64,
+) -> Result<(HostedDmaAdapterLease, HostedPnpPciResourceDescriptor), nt_status::NtStatus> {
+    let lease = hosted_dma_adapter_leases_mut()
+        .iter()
+        .copied()
+        .find(|lease| lease.lease_id == lease_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if lease.consumer_domain != domain
+        || lease.adapter_id != adapter_id
+        || hosted_dma_owner_is_quarantined(lease.owner)
+        || io_manager_mut().hosted_device_pointer_registration(
+            lease.pdo_registration.domain(),
+            lease.pdo_registration.address(),
+        ) != Some(lease.pdo_registration)
+        || !hosted_dma_pdo_generation_is_live(
+            lease.pdo_registration.device_id().raw(),
+            lease.pdo_generation,
+        )
+    {
+        return Err(nt_status::NtStatus::ACCESS_DENIED);
+    }
+    let binding = hosted_device_bindings()
+        .and_then(|bindings| {
+            bindings.iter().copied().find(|binding| {
+                binding.used
+                    && binding.projection_instance == instance_index
+                    && binding.projection_domain == domain
+                    && binding.pdo_device_id == lease.pdo_registration.device_id().raw()
+                    && hosted_dma_owner(*binding) == lease.owner
+            })
+        })
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let inst = instance(instance_index).ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if inst.exec_shared_va != sh || instance_domain_identity(inst) != Some(domain) {
+        return Err(nt_status::NtStatus::ACCESS_DENIED);
+    }
+    let state = hosted_device_resource_state_by_device_id(binding.device_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let context_lease = state.pnp_context_lease
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if state.interface_type != HOSTED_INTERFACE_TYPE_PCIBUS
+        || state.dma_frame_base == 0
+        || state.address & !0x001F_0007 != 0
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let window = crate::request_hosted_pnp_pci_dma_window(
+        context_lease,
+        state.bus_number as u8,
+        (state.address >> 16) as u8,
+        state.address as u8,
+    )?;
+    if state.dma_frame_base != window.dma_frame_base
+        || state.dma_pages != window.dma_pages
+        || state.dma_broker_va != window.dma_seed_va
+        || read_volatile((sh + SH_DMA_COMMON_VA) as *const u64) != window.dma_va
+        || read_volatile((sh + SH_DMA_COMMON_LEN) as *const u64) != window.dma_len
+        || read_volatile((sh + SH_DMA_COMMON_LOGICAL) as *const u64) != window.dma_logical
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    Ok((lease, window))
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn free_hosted_dma_common_buffer_lease(
+    instance_index: usize,
+    domain: HostedDomainIdentity,
+    sh: u64,
+    lease_id: u64,
+    adapter_id: u64,
+    logical: u64,
+    length: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let (lease, _window) =
+        authenticated_hosted_dma_free_lease(instance_index, domain, sh, lease_id, adapter_id)?;
+    let count = read_volatile((sh + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
+    if count > dma_allocation_record_capacity(sh) {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let mut backing_va = None;
+    for index in 0..count {
+        let record = dma_allocation_record(sh, index)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        if read_volatile((record + SH_DMA_ALLOC_RECORD_ADAPTER_ID) as *const u64) == adapter_id
+            && read_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *const u64) == logical
+            && read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64) == length
+            && read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64)
+                == HOSTED_DMA_RECORD_KIND_COMMON
+        {
+            let va = read_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *const u64);
+            if !dma_common_pointer_in_grant(sh, va, logical, length) || backing_va.replace(va).is_some() {
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
+        }
+    }
+    let backing_va = backing_va.ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    // An allocation and Free can happen before the next provider completion. Learn the exact
+    // still-live native record first, then retire it; absence cannot be treated as proof of Free.
+    hosted_dma_manager_mut()
+        .ensure_common_buffer_at(lease.owner, adapter_id, logical, length, backing_va)
+        .map_err(hosted_dma_status)?;
+    hosted_dma_manager_mut()
+        .free_common_buffer_for_adapter(lease.owner, adapter_id, logical, length)
+        .map_err(hosted_dma_status)
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn free_hosted_dma_mapping_lease(
+    instance_index: usize,
+    domain: HostedDomainIdentity,
+    sh: u64,
+    lease_id: u64,
+    adapter_id: u64,
+    logical: u64,
+    length: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let (lease, _window) =
+        authenticated_hosted_dma_free_lease(instance_index, domain, sh, lease_id, adapter_id)?;
+    let count = read_volatile((sh + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
+    if count > dma_allocation_record_capacity(sh) {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let mut backing_va = None;
+    for index in 0..count {
+        let record = dma_allocation_record(sh, index)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        if read_volatile((record + SH_DMA_ALLOC_RECORD_ADAPTER_ID) as *const u64) == adapter_id
+            && read_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *const u64) == logical
+            && read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64) == length
+            && read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64)
+                == HOSTED_DMA_RECORD_KIND_MAP_TRANSFER
+        {
+            let va = read_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *const u64);
+            let source_va = read_volatile((record + SH_DMA_ALLOC_RECORD_SOURCE_VA) as *const u64);
+            let map_register =
+                read_volatile((record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *const u64);
+            if !dma_common_pointer_in_grant(sh, va, logical, length)
+                || source_va == 0
+                || map_register == 0
+                || backing_va.replace(va).is_some()
+            {
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
+        }
+    }
+    let backing_va = backing_va.ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    // MapTransfer and FreeMapRegisters can complete before ordinary provider replay.
+    hosted_dma_manager_mut()
+        .ensure_mapping_at(lease.owner, adapter_id, logical, backing_va, length)
+        .map_err(hosted_dma_status)?;
+    hosted_dma_manager_mut()
+        .free_mapping_for_adapter(lease.owner, adapter_id, logical, length)
+        .map_err(hosted_dma_status)
 }
 
 unsafe fn revoke_hosted_dma_adapter_leases(binding: HostedDeviceBinding) {
@@ -56183,6 +56707,7 @@ fn hosted_dma_status(error: DmaError) -> nt_status::NtStatus {
             nt_status::NtStatus::INVALID_DEVICE_REQUEST
         }
         DmaError::AdapterConflict => nt_status::NtStatus::CONFLICTING_ADDRESSES,
+        DmaError::AdapterBusy => nt_status::NtStatus::DEVICE_BUSY,
     }
 }
 
@@ -61285,6 +61810,56 @@ pub(crate) fn service_hosted_driver_dma_adapter(
             Err(status) => (status.raw(), 0, 0, 0),
         };
     }
+    if operation == HOSTED_DMA_SERVICE_FREE_COMMON_BUFFER {
+        if words[0] != 0 || pdo_object == 0 || words[1] == 0 || words[2] == 0 || words[3] == 0 {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
+        let Some((instance_index, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        };
+        let Some(domain) = instance_domain_identity(inst) else {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        };
+        return match unsafe {
+            free_hosted_dma_common_buffer_lease(
+                instance_index,
+                domain,
+                ch.shared_va,
+                pdo_object,
+                words[1],
+                words[2],
+                words[3],
+            )
+        } {
+            Ok(()) => (STATUS_SUCCESS, 0, 0, 0),
+            Err(status) => (status.raw(), 0, 0, 0),
+        };
+    }
+    if operation == HOSTED_DMA_SERVICE_FREE_MAPPING {
+        if words[0] != 0 || pdo_object == 0 || words[1] == 0 || words[2] == 0 || words[3] == 0 {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
+        let Some((instance_index, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        };
+        let Some(domain) = instance_domain_identity(inst) else {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        };
+        return match unsafe {
+            free_hosted_dma_mapping_lease(
+                instance_index,
+                domain,
+                ch.shared_va,
+                pdo_object,
+                words[1],
+                words[2],
+                words[3],
+            )
+        } {
+            Ok(()) => (STATUS_SUCCESS, 0, 0, 0),
+            Err(status) => (status.raw(), 0, 0, 0),
+        };
+    }
     if operation != HOSTED_DMA_SERVICE_REQUEST_ADAPTER {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
     }
@@ -61309,6 +61884,15 @@ pub(crate) fn service_hosted_driver_dma_adapter(
         || ch.shared_va != inst.exec_shared_va
     {
         return (STATUS_ACCESS_DENIED, 0, 0, 0);
+    }
+    let owner = hosted_dma_owner(binding);
+    if unsafe { hosted_dma_owner_is_quarantined(owner) } {
+        return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+    }
+    if unsafe { (&mut *core::ptr::addr_of_mut!(HOSTED_DMA_QUARANTINED_OWNERS)).try_reserve(1) }
+        .is_err()
+    {
+        return (STATUS_INSUFFICIENT_RESOURCES, 0, 0, 0);
     }
     let Some(state) = (unsafe { hosted_device_resource_state_by_device_id(binding.device_id) }) else {
         return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
@@ -61351,19 +61935,11 @@ pub(crate) fn service_hosted_driver_dma_adapter(
             continue;
         }
         let Some(target) = instance(target_index) else {
-            if adapter.created {
-                unsafe {
-                    hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
-                }
-            }
+            unsafe { rollback_created_hosted_dma_adapter(binding, adapter) };
             return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
         };
         let Some(domain) = instance_domain_identity(target) else {
-            if adapter.created {
-                unsafe {
-                    hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
-                }
-            }
+            unsafe { rollback_created_hosted_dma_adapter(binding, adapter) };
             return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
         };
         target_runtimes[position] = Some((target_index, target, domain));
@@ -61376,11 +61952,7 @@ pub(crate) fn service_hosted_driver_dma_adapter(
             reserve_hosted_resource_map_caps(count).is_err()
         })
         {
-            if adapter.created {
-                unsafe {
-                    hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
-                }
-            }
+            unsafe { rollback_created_hosted_dma_adapter(binding, adapter) };
             return (STATUS_INSUFFICIENT_RESOURCES, 0, 0, 0);
         }
         for (target_index, target, domain) in target_runtimes.into_iter().flatten() {
@@ -61397,25 +61969,20 @@ pub(crate) fn service_hosted_driver_dma_adapter(
                     RW_NX,
                 )
             } {
-                for cleanup_index in targets {
-                    if let Some(cleanup) = instance(cleanup_index) {
-                        if let Some(cleanup_domain) = instance_domain_identity(cleanup) {
-                            unsafe {
-                                clear_hosted_resource_map_caps_for_device(
-                                    cleanup_index,
-                                    cleanup_domain,
-                                    binding.device_id,
-                                    Some(context_lease),
-                                );
-                            }
-                        }
-                    }
+                if unsafe {
+                    rollback_unpublished_dma_window_mappings(
+                        binding,
+                        context_lease,
+                        window.dma_va,
+                        window.dma_pages,
+                    )
                 }
-                if adapter.created {
-                    unsafe {
-                        hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
-                    }
+                .is_err()
+                {
+                    unsafe { quarantine_hosted_dma_owner(owner) };
+                    return (STATUS_UNSUCCESSFUL, 0, 0, 0);
                 }
+                unsafe { rollback_created_hosted_dma_adapter(binding, adapter) };
                 return (status.raw(), 0, 0, 0);
             }
         }
@@ -61430,25 +61997,20 @@ pub(crate) fn service_hosted_driver_dma_adapter(
         } {
             Ok(bits) => bits,
             Err(status) => {
-                for cleanup_index in targets {
-                    if let Some(cleanup) = instance(cleanup_index) {
-                        if let Some(cleanup_domain) = instance_domain_identity(cleanup) {
-                            unsafe {
-                                clear_hosted_resource_map_caps_for_device(
-                                    cleanup_index,
-                                    cleanup_domain,
-                                    binding.device_id,
-                                    Some(context_lease),
-                                );
-                            }
-                        }
-                    }
+                if unsafe {
+                    rollback_unpublished_dma_window_mappings(
+                        binding,
+                        context_lease,
+                        window.dma_va,
+                        window.dma_pages,
+                    )
                 }
-                if adapter.created {
-                    unsafe {
-                        hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
-                    }
+                .is_err()
+                {
+                    unsafe { quarantine_hosted_dma_owner(owner) };
+                    return (STATUS_UNSUCCESSFUL, 0, 0, 0);
                 }
+                unsafe { rollback_created_hosted_dma_adapter(binding, adapter) };
                 return (status.raw(), 0, 0, 0);
             }
         };
@@ -61456,6 +62018,32 @@ pub(crate) fn service_hosted_driver_dma_adapter(
             .iter_mut()
             .find(|current| current.device_id == binding.device_id)
         else {
+            if unsafe {
+                crate::pnp::release_pci_command_for_resources(
+                    state.bus_number,
+                    state.address,
+                    bus_master_bits,
+                )
+            }
+            .is_err()
+            {
+                unsafe { quarantine_hosted_dma_owner(owner) };
+                return (STATUS_UNSUCCESSFUL, 0, 0, 0);
+            }
+            if unsafe {
+                rollback_unpublished_dma_window_mappings(
+                    binding,
+                    context_lease,
+                    window.dma_va,
+                    window.dma_pages,
+                )
+            }
+            .is_err()
+            {
+                unsafe { quarantine_hosted_dma_owner(owner) };
+                return (STATUS_UNSUCCESSFUL, 0, 0, 0);
+            }
+            unsafe { rollback_created_hosted_dma_adapter(binding, adapter) };
             return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
         };
         current.dma_broker_va = window.dma_seed_va;
@@ -61472,15 +62060,9 @@ pub(crate) fn service_hosted_driver_dma_adapter(
                 (ch.shared_va + SH_DMA_COMMON_LOGICAL) as *mut u64,
                 window.dma_logical,
             );
-            write_volatile(
-                (ch.shared_va + SH_DMA_ADAPTER_ID) as *mut u64,
-                adapter.adapter_id,
-            );
             clear_dma_allocation_records(ch.shared_va);
         }
     } else {
-        let shared_adapter =
-            unsafe { read_volatile((ch.shared_va + SH_DMA_ADAPTER_ID) as *const u64) };
         let shared_va = unsafe { read_volatile((ch.shared_va + SH_DMA_COMMON_VA) as *const u64) };
         let shared_len =
             unsafe { read_volatile((ch.shared_va + SH_DMA_COMMON_LEN) as *const u64) };
@@ -61493,39 +62075,81 @@ pub(crate) fn service_hosted_driver_dma_adapter(
             || shared_len != window.dma_len
             || shared_logical != window.dma_logical
         {
+            unsafe { rollback_created_hosted_dma_adapter(binding, adapter) };
             return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
-        }
-        if shared_adapter != adapter.adapter_id {
-            if !adapter.created {
-                return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
-            }
-            unsafe {
-                write_volatile(
-                    (ch.shared_va + SH_DMA_ADAPTER_ID) as *mut u64,
-                    adapter.adapter_id,
-                );
-                clear_dma_allocation_records(ch.shared_va);
-            }
         }
     }
     let lease_id = match unsafe { retain_hosted_dma_adapter_lease(binding, adapter.adapter_id) } {
         Ok(lease_id) => lease_id,
         Err(status) => {
-            if adapter.created {
-                let _ = unsafe {
-                    hosted_dma_manager_mut()
-                        .put_adapter_for_owner(hosted_dma_owner(binding), adapter.adapter_id)
-                };
-            }
+            unsafe { rollback_created_hosted_dma_adapter(binding, adapter) };
             return (status.raw(), 0, 0, 0);
         }
     };
+    // The shared ID is only a diagnostic/latest projection. Allocation records carry their own
+    // adapter IDs, so publishing a second adapter cannot disown the first one's DMA mappings.
+    unsafe {
+        write_volatile((ch.shared_va + SH_DMA_ADAPTER_ID) as *mut u64, adapter.adapter_id);
+    }
     (
         STATUS_SUCCESS,
         adapter.adapter_id,
         adapter.num_map_registers as u64,
         lease_id,
     )
+}
+
+unsafe fn rollback_unpublished_dma_window_mappings(
+    binding: HostedDeviceBinding,
+    context_lease: nt_pnp_context::ContextLeaseIdentity,
+    component_va: u64,
+    pages: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let targets = [binding.instance, binding.projection_instance];
+    let mut failed = false;
+    for (position, target_index) in targets.into_iter().enumerate() {
+        if position != 0 && target_index == targets[0] {
+            continue;
+        }
+        let Some(target) = instance(target_index) else {
+            failed = true;
+            continue;
+        };
+        let Some(domain) = instance_domain_identity(target) else {
+            failed = true;
+            continue;
+        };
+        if hosted_resource_mapping::clear_range(
+            target_index,
+            domain,
+            binding.device_id,
+            context_lease,
+            component_va,
+            pages,
+        )
+        .is_err()
+        {
+            failed = true;
+        }
+    }
+    if failed {
+        Err(nt_status::NtStatus::UNSUCCESSFUL)
+    } else {
+        Ok(())
+    }
+}
+
+unsafe fn rollback_created_hosted_dma_adapter(
+    binding: HostedDeviceBinding,
+    adapter: nt_dma_manager::DmaAdapterGrant,
+) {
+    if adapter.created
+        && hosted_dma_manager_mut()
+            .put_adapter_for_owner(hosted_dma_owner(binding), adapter.adapter_id)
+            .is_err()
+    {
+        crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_DMA_ADAPTER_LABEL, adapter.adapter_id, 0, 0]);
+    }
 }
 
 fn hosted_mdl_status(error: nt_mdl::MdlError) -> nt_status::NtStatus {
@@ -64356,6 +64980,16 @@ unsafe fn queue_hosted_driver_dpc(
     let lane_generation = ensure_hosted_irq_lane(instance_index, domain)?;
     let exec_dpc = hosted_driver_component_object_exec_va(instance_index, inst, dpc, KDPC_SIZE)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let object_type = read_unaligned((exec_dpc + KDPC_TYPE_OFFSET) as *const u8);
+    // The hosted processor does not enable a separate threaded-DPC lane. As in
+    // ReactOS with ThreadDpcEnable clear, both object types queue to the normal lane.
+    if object_type != KDPC_OBJECT_TYPE && object_type != KDPC_THREADED_OBJECT_TYPE {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let importance = HostedDpcImportance::from_raw(read_unaligned(
+        (exec_dpc + KDPC_IMPORTANCE_OFFSET) as *const u8,
+    ))
+    .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let routine = read_unaligned((exec_dpc + KDPC_DEFERRED_ROUTINE_OFFSET) as *const u64);
     let deferred_context =
         read_unaligned((exec_dpc + KDPC_DEFERRED_CONTEXT_OFFSET) as *const u64);
@@ -64383,7 +65017,9 @@ unsafe fn queue_hosted_driver_dpc(
     let owner = HostedDpcOwner::new(domain.domain_id.raw(), domain.cookie, lane_generation)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let queued = hosted_dpcs_mut()
-        .register_and_queue(owner, dpc, routine, deferred_context, argument1, argument2)
+        .register_and_queue_with_importance(
+            owner, dpc, routine, deferred_context, argument1, argument2, importance,
+        )
         .map_err(hosted_dpc_status)?;
     let inserted = matches!(queued, HostedDpcQueueResult::Queued(_));
     let identity = match queued {
@@ -66704,7 +67340,6 @@ unsafe fn replay_hosted_dma_allocation_records(
     binding: HostedDeviceBinding,
     sh: u64,
 ) -> Result<(), nt_status::NtStatus> {
-    let dma_adapter_id = read_volatile((sh + SH_DMA_ADAPTER_ID) as *const u64);
     let dma_grant_va = read_volatile((sh + SH_DMA_COMMON_VA) as *const u64);
     let dma_grant_len = read_volatile((sh + SH_DMA_COMMON_LEN) as *const u64);
     let dma_grant_logical = read_volatile((sh + SH_DMA_COMMON_LOGICAL) as *const u64);
@@ -66723,7 +67358,8 @@ unsafe fn replay_hosted_dma_allocation_records(
         let len = read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64);
         let va = read_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *const u64);
         let kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
-        if logical != 0 || len != 0 || va != 0 {
+        let dma_adapter_id = read_volatile((record + SH_DMA_ALLOC_RECORD_ADAPTER_ID) as *const u64);
+        if logical != 0 || len != 0 || va != 0 || kind != 0 || dma_adapter_id != 0 {
             if dma_adapter_id == 0
                 || dma_grant_va == 0
                 || dma_grant_len == 0
@@ -66735,6 +67371,21 @@ unsafe fn replay_hosted_dma_allocation_records(
                     && kind != HOSTED_DMA_RECORD_KIND_MAP_TRANSFER)
             {
                 return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
+            if !hosted_dma_adapter_leases_mut().iter().any(|lease| {
+                lease.adapter_id == dma_adapter_id
+                    && lease.owner == hosted_dma_owner(binding)
+                    && lease.consumer_domain == binding.projection_domain
+                    && io_manager_mut().hosted_device_pointer_registration(
+                        lease.pdo_registration.domain(),
+                        lease.pdo_registration.address(),
+                    ) == Some(lease.pdo_registration)
+                    && hosted_dma_pdo_generation_is_live(
+                        lease.pdo_registration.device_id().raw(),
+                        lease.pdo_generation,
+                    )
+            }) {
+                return Err(nt_status::NtStatus::ACCESS_DENIED);
             }
             let logical_offset = logical
                 .checked_sub(dma_grant_logical)
@@ -67399,11 +68050,44 @@ pub(crate) unsafe fn validate_hosted_bus_pdo_resource_properties(
 /// Retain the exact PCI bus-owned query results before a function driver can filter them. The
 /// independently scanned PCI function supplies physical BDF/BAR evidence; the accepted PDO owns
 /// its native property bytes and the platform route remains a separate authority.
+pub(crate) unsafe fn hosted_accepted_pci_location(
+    instance_path: &str,
+    pdo_device_id: u64,
+) -> Result<(u32, u32), nt_status::NtStatus> {
+    let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+    if hosted_bus_reported_device_id(instance_path) != Some(pdo_device_id) {
+        return Err(invalid);
+    }
+    let properties = hosted_pnp_manager_mut()
+        .enumerated_pdo_properties(pdo_device_id)
+        .ok_or(invalid)?;
+    let information = properties.bus_information.as_ref().ok_or(invalid)?;
+    let capabilities = properties.capabilities.as_ref().ok_or(invalid)?;
+    if information.bus_type_guid != nt_pnp_manager::GUID_BUS_TYPE_PCI
+        || information.legacy_bus_type != nt_pnp_manager::INTERFACE_TYPE_PCI_BUS
+    {
+        return Err(invalid);
+    }
+    Ok((information.bus_number, capabilities.address))
+}
+
+pub(crate) enum AcceptedPciResourceProperties {
+    NoResources {
+        provider: nt_pnp_manager::AcceptedPdoProviderAuthority,
+        child: nt_pnp_manager::DevnodeIdentity,
+    },
+    Present {
+        raw: Vec<u8>,
+        requirements: Vec<u8>,
+    },
+}
+
+/// Retain the exact PCI bus-owned query results before a function driver can filter them.
 pub(crate) unsafe fn hosted_accepted_pci_resource_properties(
     instance_path: &str,
     pdo_device_id: u64,
     device: &nt_pnp::PciDevice,
-) -> Result<(Vec<u8>, Vec<u8>), nt_status::NtStatus> {
+) -> Result<AcceptedPciResourceProperties, nt_status::NtStatus> {
     let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
     if hosted_bus_reported_device_id(instance_path) != Some(pdo_device_id) {
         return Err(invalid);
@@ -67420,6 +68104,21 @@ pub(crate) unsafe fn hosted_accepted_pci_resource_properties(
     {
         return Err(invalid);
     }
+    if nt_pnp_manager::pci_bus_reports_no_resources(properties) {
+        nt_pnp::validate_pci_bus_reported_resources(device, &[], &[]).map_err(|_| invalid)?;
+        let child = hosted_pnp_manager_mut()
+            .devnode_identity_for_pdo(pdo_device_id)
+            .ok_or(invalid)?;
+        let provider = hosted_accepted_pdo_provider_catalog()
+            .resolve(
+                hosted_pnp_manager_mut(),
+                hosted_bus_relations(),
+                io_manager_mut(),
+                pdo_device_id,
+            )
+            .map_err(|_| invalid)?;
+        return Ok(AcceptedPciResourceProperties::NoResources { provider, child });
+    }
     let (
         nt_pnp_manager::PropertyBlobState::Present(raw),
         nt_pnp_manager::PropertyBlobState::Present(requirements),
@@ -67431,18 +68130,46 @@ pub(crate) unsafe fn hosted_accepted_pci_resource_properties(
         return Err(invalid);
     };
     nt_pnp::validate_pci_bus_reported_resources(device, raw, requirements)
-        .map_err(|_| invalid)?;
-    let mut raw_copy = Vec::new();
-    raw_copy
-        .try_reserve_exact(raw.len())
-        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    raw_copy.extend_from_slice(raw);
-    let mut requirements_copy = Vec::new();
-    requirements_copy
-        .try_reserve_exact(requirements.len())
-        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    requirements_copy.extend_from_slice(requirements);
-    Ok((raw_copy, requirements_copy))
+        .map_err(|error| {
+            print_str(b"[pci-resource-validation] instance=");
+            print_str(instance_path.as_bytes());
+            print_str(b" bdf=");
+            print_u64(device.bus as u64);
+            print_str(b":");
+            print_u64(device.dev as u64);
+            print_str(b".");
+            print_u64(device.func as u64);
+            print_str(b" error=");
+            print_str(match error {
+                nt_pnp::PciBusResourceError::UnsupportedDevice => b"unsupported-device",
+                nt_pnp::PciBusResourceError::Malformed => b"malformed",
+                nt_pnp::PciBusResourceError::Identity => b"identity",
+                nt_pnp::PciBusResourceError::ResourceMismatch => b"resource-mismatch",
+            });
+            print_str(b" bars=");
+            print_u64(device.bars.len() as u64);
+            for bar in &device.bars {
+                print_str(b" [");
+                print_u64(bar.index as u64);
+                print_str(b" base=0x");
+                print_hex64(bar.base);
+                print_str(b" size=0x");
+                print_hex64(bar.size);
+                print_str(b"]");
+            }
+            for (label, bytes) in [(b" raw=".as_slice(), raw), (b" requirements=".as_slice(), requirements)] {
+                print_str(label);
+                for &byte in bytes {
+                    print_hex_byte(byte);
+                }
+            }
+            print_str(b"\n");
+            invalid
+        })?;
+    Ok(AcceptedPciResourceProperties::Present {
+        raw: clone_pnp_resource_list(raw)?,
+        requirements: clone_pnp_resource_list(requirements)?,
+    })
 }
 
 pub(crate) struct HostedAcceptedAcpiChildResources {
@@ -67519,10 +68246,8 @@ pub(crate) unsafe fn hosted_accepted_acpi_child_resources(
     })))
 }
 
-pub(crate) unsafe fn validate_hosted_accepted_acpi_no_resources(
-    instance_path: &str,
+unsafe fn validate_hosted_accepted_no_resource_fdo(
     device_id: u64,
-    provider: nt_pnp_manager::AcceptedPdoProviderAuthority,
     child: nt_pnp_manager::DevnodeIdentity,
 ) -> Result<(), nt_status::NtStatus> {
     let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
@@ -67543,6 +68268,35 @@ pub(crate) unsafe fn validate_hosted_accepted_acpi_no_resources(
     {
         return Err(invalid);
     }
+    Ok(())
+}
+
+pub(crate) unsafe fn validate_hosted_accepted_pci_no_resources(
+    instance_path: &str,
+    device_id: u64,
+    provider: nt_pnp_manager::AcceptedPdoProviderAuthority,
+    child: nt_pnp_manager::DevnodeIdentity,
+    device: &nt_pnp::PciDevice,
+) -> Result<(), nt_status::NtStatus> {
+    let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+    validate_hosted_accepted_no_resource_fdo(device_id, child)?;
+    match hosted_accepted_pci_resource_properties(instance_path, child.pdo_object_id(), device)? {
+        AcceptedPciResourceProperties::NoResources {
+            provider: current_provider,
+            child: current_child,
+        } if current_provider == provider && current_child == child => Ok(()),
+        _ => Err(invalid),
+    }
+}
+
+pub(crate) unsafe fn validate_hosted_accepted_acpi_no_resources(
+    instance_path: &str,
+    device_id: u64,
+    provider: nt_pnp_manager::AcceptedPdoProviderAuthority,
+    child: nt_pnp_manager::DevnodeIdentity,
+) -> Result<(), nt_status::NtStatus> {
+    let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+    validate_hosted_accepted_no_resource_fdo(device_id, child)?;
     match hosted_accepted_acpi_child_resources(instance_path, child.pdo_object_id())? {
         Some(AcceptedAcpiChildResources::NoResources {
             provider: current_provider,
