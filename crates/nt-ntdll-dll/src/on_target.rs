@@ -1275,25 +1275,21 @@ fn is_ntdll_base(table: &ModuleTable, base: u64) -> bool {
     table.find(b"ntdll") == base
 }
 
-/// Compare a NUL-terminated ASCII export name at `base + name_rva` against `want` (ASCII bytes).
+/// Compare `want` with a NUL-terminated ASCII export name at `base + name_rva`.
 ///
 /// # Safety
 /// `base + name_rva` must point at a mapped, NUL-terminated ASCII string.
-unsafe fn name_eq(base: u64, name_rva: u32, want: &[u8]) -> bool {
+unsafe fn compare_export_name(base: u64, name_rva: u32, want: &[u8]) -> core::cmp::Ordering {
     // SAFETY: caller guarantees a mapped NUL-terminated string.
     unsafe {
         let p = (base + name_rva as u64) as *const u8;
-        let mut i = 0usize;
-        loop {
-            let c = core::ptr::read_volatile(p.add(i));
-            if i >= want.len() {
-                return c == 0; // exact length match: next char must be the NUL
+        for (i, &wanted) in want.iter().enumerate() {
+            let actual = core::ptr::read_volatile(p.add(i));
+            if wanted != actual {
+                return wanted.cmp(&actual);
             }
-            if c != want[i] {
-                return false;
-            }
-            i += 1;
         }
+        0u8.cmp(&core::ptr::read_volatile(p.add(want.len())))
     }
 }
 
@@ -1332,16 +1328,20 @@ unsafe fn export_rva_by_name(base: u64, want: &[u8]) -> u32 {
         let addr_of_functions = rd32(ed, 0x1c) as u64; // AddressOfFunctions RVA
         let addr_of_names = rd32(ed, 0x20) as u64; // AddressOfNames RVA
         let addr_of_ordinals = rd32(ed, 0x24) as u64; // AddressOfNameOrdinals RVA
-        for i in 0..number_of_names as u64 {
-            let name_rva = rd32(base, addr_of_names + i * 4);
-            if name_eq(base, name_rva, want) {
-                let ordinal = rd16(base, addr_of_ordinals + i * 2) as u64;
-                if ordinal >= number_of_functions as u64 {
-                    return 0;
-                }
-                let func_rva = rd32(base, addr_of_functions + ordinal * 4);
-                return func_rva;
+        if let Some(i) = nt_ntdll::loader::export_name_search::find_sorted_export_name(
+            number_of_names,
+            |index| {
+                let name_rva = rd32(base, addr_of_names + u64::from(index) * 4);
+                compare_export_name(base, name_rva, want)
+            },
+        ) {
+            let i = u64::from(i);
+            let ordinal = rd16(base, addr_of_ordinals + i * 2) as u64;
+            if ordinal >= number_of_functions as u64 {
+                return 0;
             }
+            let func_rva = rd32(base, addr_of_functions + ordinal * 4);
+            return func_rva;
         }
         0
     }
