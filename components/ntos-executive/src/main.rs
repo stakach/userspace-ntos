@@ -23647,6 +23647,7 @@ fn publish_boot_driver_start(
             pending.publish(reservation, PendingDriverStart {
                 batch, reservation, bootstrap_predecessors: predecessors,
                 owner: PendingDriverStartOwner::Boot { target, report_published: false },
+                observed_wait_stage: None,
             }).expect("pending boot START rejected its pre-reserved owner");
             report
         }
@@ -23656,6 +23657,7 @@ fn publish_boot_driver_start(
             pending.publish(reservation, PendingDriverStart {
                 batch, reservation, bootstrap_predecessors: predecessors,
                 owner: PendingDriverStartOwner::Boot { target, report_published: true },
+                observed_wait_stage: None,
             }).expect("indeterminate boot START rejected its barrier owner");
             report
         }
@@ -24047,6 +24049,7 @@ struct PendingDriverStart {
     reservation: nt_driver_start::PendingOperationReservation,
     bootstrap_predecessors: alloc::vec::Vec<nt_driver_start::PendingOperationReservation>,
     owner: PendingDriverStartOwner,
+    observed_wait_stage: Option<hosted_pnp_start::HostedPnpWaitStage>,
 }
 
 enum OwnedPendingPnpOperation {

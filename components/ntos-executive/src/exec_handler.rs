@@ -19243,6 +19243,7 @@ impl ExecNtHandler {
                                 request: None,
                                 reply: None,
                             },
+                            observed_wait_stage: None,
                         },
                     )
                     .expect("indeterminate user START rejected its barrier owner");

@@ -25771,6 +25771,7 @@ unsafe fn pending_driver_start_transfer(
             reservation,
             bootstrap_predecessors: alloc::vec::Vec::new(),
             owner,
+            observed_wait_stage: None,
         })
         .expect("reserved driver START continuation rejected its exact batch");
     reply_park.commit();
@@ -25893,6 +25894,24 @@ fn record_pending_start_reply(
     }
 }
 
+fn trace_pending_driver_start_wait(
+    slot: usize,
+    pending: &mut PendingDriverStart,
+    stage: hosted_pnp_start::HostedPnpWaitStage,
+) {
+    if pending.observed_wait_stage == Some(stage) {
+        return;
+    }
+    pending.observed_wait_stage = Some(stage);
+    print_str(b"[pnp-start-wait] slot=");
+    print_u64(slot as u64);
+    print_str(b" service=");
+    print_str(pending.batch.service_name().as_bytes());
+    print_str(b" stage=");
+    print_str(stage.label());
+    print_str(b"\n");
+}
+
 unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     let mut completed = 0u64;
     for slot in 0..nt_handler.pending_driver_starts.slot_count() {
@@ -25927,6 +25946,13 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
             }
         };
         if bootstrap_barrier == 1 {
+            if let Some(pending) = nt_handler.pending_driver_starts.get_mut(slot) {
+                trace_pending_driver_start_wait(
+                    slot,
+                    pending,
+                    hosted_pnp_start::HostedPnpWaitStage::BootstrapPredecessor,
+                );
+            }
             continue;
         }
         let progress = {
@@ -25942,7 +25968,12 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
             }
         };
         match progress {
-            OwnedHostedPnpStartProgress::AwaitingCompletion => {}
+            OwnedHostedPnpStartProgress::AwaitingCompletion => {
+                if let Some(pending) = nt_handler.pending_driver_starts.get_mut(slot) {
+                    let stage = pending.batch.wait_stage();
+                    trace_pending_driver_start_wait(slot, pending, stage);
+                }
+            }
             OwnedHostedPnpStartProgress::Complete(result) => {
                 let status = match result {
                     Ok(_) => nt_status::NtStatus::SUCCESS.raw() as u32,
@@ -26258,6 +26289,7 @@ unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u
                         reservation,
                         bootstrap_predecessors: alloc::vec::Vec::new(),
                         owner: PendingDriverStartOwner::CriticalChild { claim: Some(claim) },
+                        observed_wait_stage: None,
                     },
                 ).expect("pending critical START rejected its pre-reserved continuation");
             }
@@ -26270,6 +26302,7 @@ unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u
                         reservation,
                         bootstrap_predecessors: alloc::vec::Vec::new(),
                         owner: PendingDriverStartOwner::CriticalChild { claim: None },
+                        observed_wait_stage: None,
                     },
                 ).expect("uncertain critical START lost its retained continuation");
             }

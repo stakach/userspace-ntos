@@ -169,6 +169,31 @@ pub(crate) enum OwnedHostedPnpStartProgress {
     OwnershipLost(HostedPnpStartBatchFailure),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostedPnpWaitStage {
+    BootstrapPredecessor,
+    Relations,
+    FilterAdmission,
+    FilterCompletion,
+    GrantAdmission,
+    StartCompletion,
+    DevnodeAdmission,
+}
+
+impl HostedPnpWaitStage {
+    pub(crate) const fn label(self) -> &'static [u8] {
+        match self {
+            Self::BootstrapPredecessor => b"bootstrap-predecessor",
+            Self::Relations => b"relations",
+            Self::FilterAdmission => b"filter-admission",
+            Self::FilterCompletion => b"filter-completion",
+            Self::GrantAdmission => b"grant-admission",
+            Self::StartCompletion => b"start-completion",
+            Self::DevnodeAdmission => b"devnode-admission",
+        }
+    }
+}
+
 pub(crate) struct OwnedHostedPnpStartBatch {
     spec: DriverServiceLaunchSpec,
     options: HostedPnpStartOptions,
@@ -276,6 +301,22 @@ impl OwnedHostedPnpStartBatch {
 
     pub(crate) fn service_name(&self) -> &str {
         &self.spec.service_name
+    }
+
+    pub(crate) fn wait_stage(&self) -> HostedPnpWaitStage {
+        if self.pending_relations.is_some() {
+            HostedPnpWaitStage::Relations
+        } else if self.pending_filter_admission.is_some() {
+            HostedPnpWaitStage::FilterAdmission
+        } else if self.pending_grant_admission.is_some() {
+            HostedPnpWaitStage::GrantAdmission
+        } else if self.pending_filter.is_some() {
+            HostedPnpWaitStage::FilterCompletion
+        } else if matches!(self.coordinator.phase(), nt_driver_start::BatchPhase::Awaiting { .. }) {
+            HostedPnpWaitStage::StartCompletion
+        } else {
+            HostedPnpWaitStage::DevnodeAdmission
+        }
     }
 
     /// A predecessor lost exact ownership before this batch entered native AddDevice/START.
