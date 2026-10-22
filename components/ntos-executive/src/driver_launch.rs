@@ -282,6 +282,8 @@ mod hosted_driver_rtl_integer;
 mod hosted_driver_queued_spin_lock;
 #[path = "hosted_driver_remove_lock.rs"]
 mod hosted_driver_remove_lock;
+#[path = "hosted_driver_configuration.rs"]
+mod hosted_driver_configuration;
 #[path = "hosted_driver_pci_kernel.rs"]
 pub(crate) mod hosted_driver_pci_kernel;
 #[path = "hosted_driver_range_list.rs"]
@@ -673,6 +675,12 @@ const FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_OFF: u64 = 0x208;
 const FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_OFF: u64 = 0x210;
 const FSD_DATA_KD_DEBUGGER_NOT_PRESENT_OFF: u64 = 0x218;
 const FSD_DATA_KE_NUMBER_PROCESSORS_OFF: u64 = 0x220;
+// HAL_DISPATCH is an imported data object. Its unsupported callbacks remain null.
+const FSD_DATA_HAL_DISPATCH_OFF: u64 = 0x240;
+const FSD_DATA_HAL_DISPATCH_BYTES: u64 = 0xC0;
+const FSD_DATA_HAL_DISPATCH_VERSION: u32 = 4;
+const FSD_DATA_HAL_DISPATCH_VA: u64 = FSD_DATA_VADDR + FSD_DATA_HAL_DISPATCH_OFF;
+const _: () = assert!(FSD_DATA_HAL_DISPATCH_OFF + FSD_DATA_HAL_DISPATCH_BYTES <= 0x300);
 const FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_OFF: u64 = 0x300;
 const FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_OFF: u64 = 0x340;
 const FSD_DATA_SE_EXPORTS_CELL_OFF: u64 = 0x400;
@@ -5445,6 +5453,9 @@ unsafe fn initialize_hosted_loader_block(exec_data_va: u64) {
 }
 
 unsafe fn initialize_hosted_driver_data_exports(exec_data_va: u64) {
+    let hal_dispatch = exec_data_va + FSD_DATA_HAL_DISPATCH_OFF;
+    core::ptr::write_bytes(hal_dispatch as *mut u8, 0, FSD_DATA_HAL_DISPATCH_BYTES as usize);
+    write_unaligned(hal_dispatch as *mut u32, FSD_DATA_HAL_DISPATCH_VERSION);
     let hal_private = exec_data_va + FSD_DATA_HAL_PRIVATE_DISPATCH_OFF;
     core::ptr::write_bytes(
         hal_private as *mut u8,
@@ -5514,6 +5525,7 @@ unsafe fn initialize_hosted_driver_data_exports(exec_data_va: u64) {
 
 fn fsd_data_export_addr(name: &str) -> Option<u64> {
     Some(match name {
+        "HalDispatchTable" => FSD_DATA_HAL_DISPATCH_VA,
         "HalPrivateDispatchTable" => FSD_DATA_HAL_PRIVATE_DISPATCH_VA,
         "MmSystemRangeStart" => FSD_DATA_MM_SYSTEM_RANGE_START_VA,
         "KdDebuggerNotPresent" => FSD_DATA_KD_DEBUGGER_NOT_PRESENT_VA,
@@ -7241,6 +7253,11 @@ unsafe fn registry_arg_data_slice(len: u32) -> &'static [u8] {
 /// `PVOID ExAllocatePoolWithTag(POOL_TYPE, SIZE_T NumberOfBytes, ULONG Tag)`.
 extern "win64" fn s_ex_alloc_pool_tag(_pool: u64, size: u64, _tag: u64) -> u64 {
     unsafe { pool_alloc(size) }
+}
+/// ReactOS' priority entry uses the same pool allocation owner; the priority
+/// hint does not change its allocation or free semantics.
+extern "win64" fn s_ex_alloc_pool_tag_priority(pool: u64, size: u64, tag: u64, _priority: u64) -> u64 {
+    s_ex_alloc_pool_tag(pool, size, tag)
 }
 /// `PVOID ExAllocatePoolWithQuotaTag(POOL_TYPE, SIZE_T, ULONG)`.
 extern "win64" fn s_ex_alloc_pool_quota_tag(_pool: u64, size: u64, _tag: u64) -> u64 {
@@ -34651,6 +34668,7 @@ fn register_fsd_trampolines() -> bool {
     reg.bind("RtlAssert", crate::hosted_driver_assertion::rtl_assert as usize as u64);
     crate::ex_rundown_exports::bind_ex_rundown_exports(reg);
     hosted_driver_remove_lock::bind_remove_lock_exports(reg);
+    hosted_driver_configuration::bind_configuration_export(reg);
     hosted_driver_pci_kernel::bind_pci_kernel_exports(reg);
     hosted_driver_range_list::bind_range_list_exports(reg);
     // pool (ExAllocatePool* → the FSD arena)
@@ -34658,6 +34676,7 @@ fn register_fsd_trampolines() -> bool {
         "ExAllocatePoolWithTag",
         s_ex_alloc_pool_tag as *const () as usize as u64,
     );
+    reg.bind("ExAllocatePoolWithTagPriority", s_ex_alloc_pool_tag_priority as *const () as usize as u64);
     reg.bind(
         "ExAllocatePoolWithQuotaTag",
         s_ex_alloc_pool_quota_tag as *const () as usize as u64,

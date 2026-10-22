@@ -14,6 +14,7 @@ extern crate alloc;
 
 pub mod avl_table;
 pub mod configuration;
+pub mod configuration_information;
 pub mod crt;
 pub mod driver_resolve;
 mod hal;
