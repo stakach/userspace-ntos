@@ -406,6 +406,26 @@ impl PciDmaHandoff {
     }
 
     pub fn begin_native_start(&mut self, key: PciController, root: u64) -> Result<(), Error> {
+        self.begin_native_start_selected(key, root, None)
+    }
+
+    /// Enter native START only for the exact window granted to this controller's provider.
+    /// Another mapped window in the same RID domain cannot stand in for a stale receipt.
+    pub fn begin_native_start_exact(
+        &mut self,
+        key: PciController,
+        root: u64,
+        expected_window: WindowId,
+    ) -> Result<(), Error> {
+        self.begin_native_start_selected(key, root, Some(expected_window))
+    }
+
+    fn begin_native_start_selected(
+        &mut self,
+        key: PciController,
+        root: u64,
+        expected_window: Option<WindowId>,
+    ) -> Result<(), Error> {
         let row = self.record_mut(key, root)?;
         if row.state != ControllerState::BootDraining {
             return Err(Error::WrongPhase);
@@ -423,7 +443,8 @@ impl PciDmaHandoff {
         if !row
             .windows
             .iter()
-            .any(|window| window.phase == WindowPhase::Mapped)
+            .any(|window| window.phase == WindowPhase::Mapped
+                && expected_window.is_none_or(|id| window.id == id))
         {
             return Err(Error::NoNativeWindow);
         }
@@ -583,6 +604,26 @@ mod tests {
         assert_eq!(ledger.enter_boot_io(AHCI, 41), Err(Error::WrongPhase));
         assert_eq!(ledger.activate_native(AHCI, 41, 82), Err(Error::WrongPhase));
         assert!(ledger.reserve_window(AHCI, 41, 0x3000, 1).is_ok());
+    }
+
+    #[test]
+    fn native_start_requires_a_mapped_window_and_exact_boot_command_retirement() {
+        let mut ledger = ledger();
+        let command = ledger.enter_boot_io(AHCI, 41).unwrap();
+        let native = ledger.reserve_window(AHCI, 41, 0x2000, 1).unwrap();
+        let other = ledger.reserve_window(AHCI, 41, 0x3000, 1).unwrap();
+        ledger.begin_drain(AHCI, 41).unwrap();
+        assert_eq!(ledger.enter_boot_io(AHCI, 41), Err(Error::WrongPhase));
+        assert_eq!(ledger.begin_native_start_exact(AHCI, 41, native), Err(Error::BootIoOutstanding));
+        ledger.complete_boot_io(AHCI, 41, command).unwrap();
+        assert_eq!(ledger.begin_native_start_exact(AHCI, 41, native), Err(Error::NoNativeWindow));
+        ledger.begin_map(AHCI, 41, native).unwrap();
+        assert_eq!(ledger.begin_native_start_exact(AHCI, 41, native), Err(Error::NoNativeWindow));
+        ledger.confirm_map(AHCI, 41, native).unwrap();
+        assert_eq!(ledger.begin_native_start_exact(AHCI, 41, other), Err(Error::NoNativeWindow));
+        ledger.begin_native_start_exact(AHCI, 41, native).unwrap();
+        assert_eq!(ledger.state(AHCI, 41), Ok(ControllerState::NativeStarting));
+        assert_eq!(ledger.enter_boot_io(AHCI, 41), Err(Error::WrongPhase));
     }
 
     #[test]

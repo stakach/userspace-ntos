@@ -663,6 +663,51 @@ impl OwnedHostedPnpStartBatch {
                 );
             }
             if let Some(pending) = self.pending_grant_admission.take() {
+                let mut pending = pending;
+                if pending.resource_plan.is_boot_storage_controller() {
+                    let Some(receipt) = driver_launch::current_boot_driver_preload_receipt() else {
+                        pending.blocked_status = Some(nt_status::NtStatus::DEVICE_NOT_READY);
+                        self.pending_grant_admission = Some(pending);
+                        return OwnedHostedPnpStartProgress::OwnershipLost(
+                            HostedPnpStartBatchFailure {
+                                status: nt_status::NtStatus::DEVICE_NOT_READY,
+                                teardown_blocked: true,
+                            },
+                        );
+                    };
+                    let lease = match pending.resource_plan.prepare_boot_storage_controller_window() {
+                        Ok(Some(lease)) => lease,
+                        Ok(None) => {
+                            let status = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+                            pending.blocked_status = Some(status);
+                            self.pending_grant_admission = Some(pending);
+                            return OwnedHostedPnpStartProgress::OwnershipLost(
+                                HostedPnpStartBatchFailure { status, teardown_blocked: true },
+                            );
+                        }
+                        Err(status) => {
+                            pending.blocked_status = Some(status);
+                            self.pending_grant_admission = Some(pending);
+                            return OwnedHostedPnpStartProgress::OwnershipLost(
+                                HostedPnpStartBatchFailure { status, teardown_blocked: true },
+                            );
+                        }
+                    };
+                    match crate::boot_storage_dma_handoff::begin_native_start_after_preload(receipt, lease) {
+                        Ok(crate::boot_storage_dma_handoff::NativeStartAdmission::Ready) => {}
+                        Ok(crate::boot_storage_dma_handoff::NativeStartAdmission::Draining) => {
+                            self.pending_grant_admission = Some(pending);
+                            return OwnedHostedPnpStartProgress::AwaitingCompletion;
+                        }
+                        Err(status) => {
+                            pending.blocked_status = Some(status);
+                            self.pending_grant_admission = Some(pending);
+                            return OwnedHostedPnpStartProgress::OwnershipLost(
+                                HostedPnpStartBatchFailure { status, teardown_blocked: true },
+                            );
+                        }
+                    }
+                }
                 let devnode_index = pending.devnode_index;
                 let devnode = &self.spec.devnodes[devnode_index];
                 let progress = start_filtered_devnode(
@@ -1438,6 +1483,32 @@ pub(crate) enum PreparedHostedResourcePlan {
 }
 
 impl PreparedHostedResourcePlan {
+    fn is_boot_storage_controller(&self) -> bool {
+        matches!(self, Self::Pci { bus_resources, .. }
+            if crate::boot_storage_dma_handoff::is_boot_storage_controller(&bus_resources.device))
+    }
+
+    unsafe fn prepare_boot_storage_controller_window(
+        &mut self,
+    ) -> Result<Option<nt_pnp_context::ContextLeaseIdentity>, nt_status::NtStatus> {
+        match self {
+            Self::Pci { bus_resources, window, lease, .. }
+                if crate::boot_storage_dma_handoff::is_boot_storage_controller(&bus_resources.device) =>
+            {
+                let device = &bus_resources.device;
+                let mapped = crate::request_hosted_pnp_pci_dma_window(
+                    lease.identity(), device.bus, device.dev, device.func,
+                )?;
+                if !mapped.matches(device) || !mapped.dma_grant_valid() {
+                    return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                }
+                *window = mapped;
+                Ok(Some(lease.identity()))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn grant_admission(&self) -> crate::boot_storage_dma_handoff::ControllerGrantAdmission {
         match self {
             Self::Pci { bus_resources, window, lease, .. } => {

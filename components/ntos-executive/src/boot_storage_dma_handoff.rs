@@ -5,7 +5,7 @@
 
 use crate::*;
 use nt_pnp_context::pci_dma_handoff::{
-    BootIoTicket, ControllerState, PciController, PciDmaHandoff, WindowId,
+    BootIoTicket, ControllerState, PciController, PciDmaHandoff, WindowId, WindowPhase,
 };
 
 const BOOT_GENERATION: u64 = 1;
@@ -54,6 +54,70 @@ pub(crate) fn enter_boot_io() -> Result<BootIoAdmission, ()> {
         .enter_boot_io(owner.controller, owner.io_space_cap)
         .map(BootIoAdmission::Ticket)
         .map_err(|_| ())
+}
+
+/// A cache miss may read the installed volume only while the exact boot controller still
+/// accepts direct I/O. Once drain starts, callers must use resident source bytes.
+pub(crate) fn boot_disk_reads_admitted() -> bool {
+    let Some(owner) = authority() else {
+        return true;
+    };
+    owner.ready
+        && matches!(
+            owner.ledger.state(owner.controller, owner.io_space_cap),
+            Ok(ControllerState::BootActive)
+        )
+}
+
+/// Result of redriving the exact boot-controller transition. A pending boot command keeps
+/// the controller in BootDraining; it never reopens direct AHCI admission.
+pub(crate) enum NativeStartAdmission {
+    Draining,
+    Ready,
+}
+
+/// Fence direct AHCI only after the registry-selected driver source closure is resident and
+/// the exact hosted controller lease has a mapped native DMA window. The same caller may
+/// redrive this while an entered boot command is still retiring; uncertain commands retain
+/// their ledger tickets and cannot be treated as retired by a timeout or Reply ACK.
+pub(crate) fn begin_native_start_after_preload(
+    receipt: driver_launch::PreloadReceipt,
+    lease: nt_pnp_context::ContextLeaseIdentity,
+) -> Result<NativeStartAdmission, nt_status::NtStatus> {
+    if !unsafe { driver_launch::boot_driver_preload_receipt_is_current(receipt) } {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let owner = authority().ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    if !owner.ready || owner.native_lease != Some(lease) {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let window = owner.native_window.ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    if owner
+        .ledger
+        .window_phase(owner.controller, owner.io_space_cap, window)
+        != Ok(WindowPhase::Mapped)
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    match owner.ledger.state(owner.controller, owner.io_space_cap) {
+        Ok(ControllerState::BootActive) => owner
+            .ledger
+            .begin_drain(owner.controller, owner.io_space_cap)
+            .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?,
+        Ok(ControllerState::BootDraining) => {}
+        Ok(ControllerState::NativeStarting) => return Ok(NativeStartAdmission::Ready),
+        _ => return Err(nt_status::NtStatus::DEVICE_BUSY),
+    }
+    match owner
+        .ledger
+        .begin_native_start_exact(owner.controller, owner.io_space_cap, window)
+    {
+        Ok(()) => Ok(NativeStartAdmission::Ready),
+        Err(nt_pnp_context::pci_dma_handoff::Error::BootIoOutstanding) => {
+            Ok(NativeStartAdmission::Draining)
+        }
+        Err(_) => Err(nt_status::NtStatus::DEVICE_BUSY),
+    }
 }
 
 /// Complete only a command whose hardware retirement is known. An ambiguous timeout or
