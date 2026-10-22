@@ -13600,11 +13600,11 @@ unsafe fn read_file_handle_bounded(
             if requested == 0 {
                 return Err(too_large_status);
             }
-            let old_length = contents.len();
-            contents
-                .try_reserve_exact(requested)
-                .map_err(|_| STATUS_NO_MEMORY)?;
-            contents.resize(old_length + requested, 0);
+            let old_length = nt_ntdll::rtl::activation::prepare_bounded_read_chunk(
+                &mut contents,
+                requested,
+            )
+            .map_err(|_| STATUS_NO_MEMORY)?;
             iosb = [0; 2];
             let byte_offset = i64::try_from(old_length).map_err(|_| STATUS_NO_MEMORY)?;
             let status = unsafe {
