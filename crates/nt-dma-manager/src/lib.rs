@@ -46,6 +46,8 @@ pub enum DmaError {
     LogicalViolation,
     /// A live adapter already exists for this owner and address width with different properties.
     AdapterConflict,
+    /// Live common buffers or transfer mappings still belong to this adapter.
+    AdapterBusy,
 }
 
 /// Bus-facing properties supplied by `IoGetDmaAdapter` after validating the caller's
@@ -234,6 +236,7 @@ struct CommonBuffer {
 
 struct Mapping {
     id: u64,
+    adapter_id: u64,
     owner: DmaOwner,
     logical_base: u64,
     length: u64,
@@ -456,7 +459,8 @@ impl DmaManager {
 
     /// Release one exact live adapter. Native projections use this owner-checked
     /// operation so a stale or foreign projection cannot retire another device's
-    /// DMA authority.
+    /// DMA authority. A live buffer or mapping prevents retirement even if a native record
+    /// appears empty; the broker remains authoritative until the matching Free is observed.
     pub fn put_adapter_for_owner(
         &mut self,
         owner: DmaOwner,
@@ -475,6 +479,13 @@ impl DmaManager {
             } else {
                 DmaError::StaleId
             })?;
+        if self.common_buffers.iter().any(|common| {
+            common.active && common.owner == owner && common.adapter_id == adapter_id
+        }) || self.mappings.iter().any(|mapping| {
+            mapping.active && mapping.owner == owner && mapping.adapter_id == adapter_id
+        }) {
+            return Err(DmaError::AdapterBusy);
+        }
         adapter.active = false;
         Ok(())
     }
@@ -614,6 +625,31 @@ impl DmaManager {
             } else {
                 DmaError::StaleId
             })?;
+        if cb.length != length {
+            return Err(DmaError::OutOfRange);
+        }
+        cb.active = false;
+        Ok(())
+    }
+
+    /// Free a common buffer through the exact adapter that created it. Native callback
+    /// forwarding uses this before the component clears its allocation record.
+    pub fn free_common_buffer_for_adapter(
+        &mut self,
+        owner: DmaOwner,
+        adapter_id: u64,
+        logical_base: u64,
+        length: u64,
+    ) -> Result<(), DmaError> {
+        self.adapter(adapter_id, owner)?;
+        let cb = self
+            .common_buffers
+            .iter_mut()
+            .find(|cb| cb.active && cb.owner == owner && cb.logical_base == logical_base)
+            .ok_or(DmaError::StaleId)?;
+        if cb.adapter_id != adapter_id {
+            return Err(DmaError::WrongOwner);
+        }
         if cb.length != length {
             return Err(DmaError::OutOfRange);
         }
@@ -928,6 +964,7 @@ impl DmaManager {
         self.next_mapping_id += 1;
         self.mappings.push(Mapping {
             id,
+            adapter_id,
             owner,
             logical_base,
             length,
@@ -953,6 +990,7 @@ impl DmaManager {
     ) -> Result<MapGrant, DmaError> {
         if let Some(existing) = self.mappings.iter().find(|m| {
             m.active
+                && m.adapter_id == adapter_id
                 && m.owner == owner
                 && m.logical_base == logical_base
                 && m.length == length
@@ -1277,6 +1315,71 @@ mod tests {
         assert_eq!(
             d.put_adapter_for_owner(owner(), adapter.adapter_id),
             Err(DmaError::StaleId)
+        );
+    }
+
+    #[test]
+    fn owner_checked_put_refuses_live_dma_ranges_without_touching_sibling() {
+        let mut dma = DmaManager::new();
+        let wide = dma.register_adapter(owner(), true, 4096, true);
+        let narrow = dma.register_adapter(owner(), true, 4096, false);
+        dma.register_common_buffer_at(owner(), wide, 0x1000, 4096, 0x20_000)
+            .unwrap();
+        dma.register_common_buffer_at(owner(), narrow, 0x3000, 4096, 0x30_000)
+            .unwrap();
+        dma.register_mapping_at(owner(), wide, 0x5000, 0x40_000, 4096)
+            .unwrap();
+        dma.register_mapping_at(owner(), narrow, 0x7000, 0x50_000, 4096)
+            .unwrap();
+
+        assert_eq!(dma.put_adapter_for_owner(owner(), narrow), Err(DmaError::AdapterBusy));
+        assert_eq!(dma.decode_owner_logical(owner(), 0x3000, 1), Ok(0x30_000));
+        assert_eq!(dma.decode_owner_logical(owner(), 0x7000, 1), Ok(0x50_000));
+        assert_eq!(dma.decode_owner_logical(owner(), 0x1000, 1), Ok(0x20_000));
+        assert_eq!(dma.decode_owner_logical(owner(), 0x5000, 1), Ok(0x40_000));
+
+        dma.free_common_buffer(owner(), 0x3000, 4096).unwrap();
+        let map = dma.mappings.iter().find(|map| map.logical_base == 0x7000).unwrap().id;
+        dma.free_mapping_for_owner(owner(), map).unwrap();
+        assert_eq!(dma.put_adapter_for_owner(owner(), narrow), Ok(()));
+        assert_eq!(dma.decode_owner_logical(owner(), 0x1000, 1), Ok(0x20_000));
+    }
+
+    #[test]
+    fn common_buffer_free_requires_its_exact_adapter_before_put() {
+        let mut dma = DmaManager::new();
+        let wide = dma.register_adapter(owner(), true, 4096, true);
+        let narrow = dma.register_adapter(owner(), true, 4096, false);
+        dma.register_common_buffer_at(owner(), narrow, 0x1000, 4096, 0x20_000)
+            .unwrap();
+
+        assert_eq!(
+            dma.free_common_buffer_for_adapter(owner(), wide, 0x1000, 4096),
+            Err(DmaError::WrongOwner)
+        );
+        assert_eq!(dma.put_adapter_for_owner(owner(), narrow), Err(DmaError::AdapterBusy));
+        assert_eq!(
+            dma.free_common_buffer_for_adapter(owner(), narrow, 0x1000, 4096),
+            Ok(())
+        );
+        assert_eq!(dma.put_adapter_for_owner(owner(), narrow), Ok(()));
+    }
+
+    #[test]
+    fn transfer_mapping_replay_cannot_change_its_adapter() {
+        let mut dma = DmaManager::new();
+        let wide = dma.register_adapter(owner(), true, 4096, true);
+        let narrow = dma.register_adapter(owner(), true, 4096, false);
+        let first = dma
+            .ensure_mapping_at(owner(), wide, 0x9000, 0x50_000, 512)
+            .unwrap();
+        assert_eq!(
+            dma.ensure_mapping_at(owner(), wide, 0x9000, 0x50_000, 512),
+            Ok(first)
+        );
+        assert_eq!(
+            dma.ensure_mapping_at(owner(), narrow, 0x9000, 0x50_000, 512),
+            Err(DmaError::LogicalViolation)
         );
     }
 
