@@ -53286,12 +53286,13 @@ unsafe fn hosted_critical_child_starts_mut() -> &'static mut nt_pnp_manager::Cri
     slot.as_mut().unwrap()
 }
 
-pub(crate) unsafe fn claim_hosted_critical_child_start(
+pub(crate) unsafe fn claim_hosted_critical_child_start_ready(
     mount_identity: u64,
+    ready: impl FnMut(nt_pnp_manager::CriticalChildStartKey, &str) -> bool,
 ) -> Result<Option<nt_pnp_manager::CriticalChildStartClaim>, nt_pnp_manager::CriticalChildStartError> {
     let pnp = hosted_pnp_manager_mut();
     let relations = hosted_bus_relations();
-    hosted_critical_child_starts_mut().claim_next(pnp, relations, mount_identity)
+    hosted_critical_child_starts_mut().claim_next_ready(pnp, relations, mount_identity, ready)
 }
 
 pub(crate) unsafe fn hosted_critical_child_instance_id(
@@ -53315,14 +53316,6 @@ pub(crate) unsafe fn quarantine_hosted_critical_child_start(
     hosted_critical_child_starts_mut()
         .quarantine(claim)
         .expect("critical child lost its uncertain START claim");
-}
-
-pub(crate) unsafe fn defer_hosted_critical_child_start(
-    claim: nt_pnp_manager::CriticalChildStartClaim,
-) {
-    hosted_critical_child_starts_mut()
-        .defer(claim)
-        .expect("unentered critical child START lost its exact claim");
 }
 
 pub(crate) unsafe fn retire_hosted_critical_child_from_config_start(

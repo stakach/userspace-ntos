@@ -176,7 +176,8 @@ fn generic_checkpoint_uses_exact_v2_manifest_and_retains_uncertain_reserve() {
         "every dirty v2 checkpoint must select its manifest and authority under the reserve lease");
     assert!(checkpoint.contains("verify_paired_wal_snapshot(&mut dev)"),
         "a settled checkpoint must refresh its payload proof before later writers can enter");
-    assert!(writer.contains("commit_next_with_wal_manifest")
+    assert!(writer.contains("nt_fs::AsyncSnapshotCommit::new(")
+        && writer.contains("commit.run_sync(dev)")
         && checkpoint.contains("snapshot_capture::CapturedSnapshot::capture(&dev, fs)")
         && checkpoint.contains("captured_image.as_ref().map(snapshot_capture::CapturedSnapshot::as_slice)"),
         "an unrelated dirty-file checkpoint must freeze its image and retain the v2 WAL floor");

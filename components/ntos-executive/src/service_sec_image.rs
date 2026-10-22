@@ -26125,14 +26125,20 @@ unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u
         return 0;
     };
     let mut progress = 0u64;
-    let mut first_deferred = None;
     for _ in 0..8 {
         // A terminal bus START can queue its initial relations during the redrive above or
         // during an earlier iteration. Admit no sibling START before that query dispatches.
         if driver_launch::hosted_bus_relation_pending() {
             break;
         }
-        let claim = match driver_launch::claim_hosted_critical_child_start(mount.identity_token()) {
+        let claim = match driver_launch::claim_hosted_critical_child_start_ready(
+            mount.identity_token(),
+            |key, instance| !nt_handler.pending_driver_starts.occupied_slots().any(|slot| {
+                nt_handler.pending_driver_starts.get(slot).is_some_and(|pending| {
+                    pending.batch.owns_current_bus_child(instance, key.child().pdo_object_id())
+                })
+            }),
+        ) {
             Ok(Some(claim)) => claim,
             Ok(None) => break,
             Err(nt_pnp_manager::CriticalChildStartError::StalePublication) => {
@@ -26141,12 +26147,6 @@ unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u
             }
             Err(_) => break,
         };
-        // A deferred owner moves to the tail. Stop after one pass over the current queue
-        // rather than reclaiming the same pending batch repeatedly in this pump.
-        if first_deferred == Some(claim.key()) {
-            driver_launch::defer_hosted_critical_child_start(claim);
-            break;
-        }
         let instance = driver_launch::hosted_critical_child_instance_id(claim)
             .expect("critical child claim lost its instance identity");
         print_str(b"[pnp-critical-start] instance=");
@@ -26173,23 +26173,6 @@ unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u
                 continue;
             }
             nt_pnp_manager::ExistingDeviceStartDisposition::RequiresAction => {}
-        }
-        if nt_handler.pending_driver_starts.occupied_slots().any(|slot| {
-            nt_handler
-                .pending_driver_starts
-                .get(slot)
-                .is_some_and(|pending| {
-                    pending.batch.owns_current_bus_child(
-                        instance,
-                        claim.key().child().pdo_object_id(),
-                    )
-                })
-        }) {
-            driver_launch::defer_hosted_critical_child_start(claim);
-            if first_deferred.is_none() {
-                first_deferred = Some(claim.key());
-            }
-            continue;
         }
         progress += 1;
         let spec = match live_config_existing_device_launch_spec(instance, SERVICE_DEMAND_START) {

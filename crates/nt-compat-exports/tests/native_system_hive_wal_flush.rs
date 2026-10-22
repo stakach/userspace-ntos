@@ -60,8 +60,10 @@ fn mounted_v2_volume_checkpoint_captures_one_image_before_disk_effects() {
         .expect("checkpoint writer");
     let end = source[start..].find("\n/// ").map(|offset| start + offset).unwrap_or(source.len());
     let writer = &source[start..end];
-    assert!(writer.contains("commit_next_with_wal_manifest"),
-        "v2 checkpoint must commit the captured bytes against the exact WAL manifest");
+    assert!(writer.contains("nt_fs::AsyncSnapshotCommit::new(")
+        && writer.contains("store, image, manifest, dev.sector_size(), dev.sector_count()")
+        && writer.contains("commit.run_sync(dev)"),
+        "v2 checkpoint must prepare the captured bytes and exact WAL manifest before disk I/O");
     assert!(!writer.contains("commit_volume_snapshot_with_wal_manifest"),
         "v2 checkpoint must not rerun mutable volume serialization during disk I/O");
 }

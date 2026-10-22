@@ -257,36 +257,47 @@ impl CriticalChildStartQueue {
         relations: &BusRelationTable,
         mount_identity: u64,
     ) -> Result<Option<CriticalChildStartClaim>, CriticalChildStartError> {
-        let Some(index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.state == CriticalChildStartState::Reserved)
-        else {
-            return Ok(None);
-        };
-        let key = self.entries[index].key;
-        if key.mount_identity != mount_identity {
-            self.entries[index].state = CriticalChildStartState::Uncertain;
-            return Err(CriticalChildStartError::StalePublication);
+        self.claim_next_ready(pnp, relations, mount_identity, |_, _| true)
+    }
+
+    /// Claim the oldest current child whose external START owner has retired. A skipped child
+    /// stays reserved without consuming a token; stale publications are still quarantined.
+    pub fn claim_next_ready(
+        &mut self,
+        pnp: &PnpManager,
+        relations: &BusRelationTable,
+        mount_identity: u64,
+        mut ready: impl FnMut(CriticalChildStartKey, &str) -> bool,
+    ) -> Result<Option<CriticalChildStartClaim>, CriticalChildStartError> {
+        for index in 0..self.entries.len() {
+            if self.entries[index].state != CriticalChildStartState::Reserved {
+                continue;
+            }
+            let key = self.entries[index].key;
+            if key.mount_identity != mount_identity
+                || Self::current_key(
+                    pnp,
+                    relations,
+                    key.mount_identity,
+                    key.child.pdo_object_id(),
+                    &self.entries[index].instance_id,
+                ) != Ok(key)
+            {
+                self.entries[index].state = CriticalChildStartState::Uncertain;
+                return Err(CriticalChildStartError::StalePublication);
+            }
+            if !ready(key, &self.entries[index].instance_id) {
+                continue;
+            }
+            let token = self.next_token;
+            self.next_token = token
+                .checked_add(1)
+                .ok_or(CriticalChildStartError::InsufficientResources)?;
+            self.entries[index].token = token;
+            self.entries[index].state = CriticalChildStartState::Claimed;
+            return Ok(Some(CriticalChildStartClaim { key, token }));
         }
-        if Self::current_key(
-            pnp,
-            relations,
-            key.mount_identity,
-            key.child.pdo_object_id(),
-            &self.entries[index].instance_id,
-        ) != Ok(key)
-        {
-            self.entries[index].state = CriticalChildStartState::Uncertain;
-            return Err(CriticalChildStartError::StalePublication);
-        }
-        let token = self.next_token;
-        self.next_token = token
-            .checked_add(1)
-            .ok_or(CriticalChildStartError::InsufficientResources)?;
-        self.entries[index].token = token;
-        self.entries[index].state = CriticalChildStartState::Claimed;
-        Ok(Some(CriticalChildStartClaim { key, token }))
+        Ok(None)
     }
 
     fn claimed_entry(
@@ -641,6 +652,60 @@ mod tests {
         let reclaimed = queue.claim_next(&pnp, &relations, 7).unwrap().unwrap();
         assert_eq!(reclaimed.key(), mouse_key);
         assert_ne!(reclaimed, first);
+    }
+
+    #[test]
+    fn pending_owner_does_not_reclaim_or_starve_reserved_children() {
+        let (pnp, relations, children) = committed_children(true);
+        let mut queue = CriticalChildStartQueue::new();
+        let (blocked_pdo, blocked_instance) = &children[0];
+        let (ready_pdo, ready_instance) = &children[1];
+        let (blocked_key, _) = queue
+            .reserve_committed(&pnp, &relations, 7, *blocked_pdo, blocked_instance)
+            .unwrap();
+        let (ready_key, _) = queue
+            .reserve_committed(&pnp, &relations, 7, *ready_pdo, ready_instance)
+            .unwrap();
+        let first_token = queue.next_token;
+
+        for _ in 0..32 {
+            let claim = queue
+                .claim_next_ready(&pnp, &relations, 7, |key, _| key != blocked_key)
+                .unwrap();
+            if let Some(claim) = claim {
+                assert_eq!(claim.key(), ready_key);
+                queue.complete(claim, 0).unwrap();
+                queue.retire(claim).unwrap();
+            }
+            assert_eq!(queue.state(blocked_key), Some(CriticalChildStartState::Reserved));
+        }
+        assert_eq!(queue.next_token, first_token + 1);
+
+        let claim = queue
+            .claim_next_ready(&pnp, &relations, 7, |_, _| true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.key(), blocked_key);
+        assert_eq!(queue.next_token, first_token + 2);
+    }
+
+    #[test]
+    fn blocked_child_with_stale_publication_is_quarantined() {
+        let (pnp, mut relations, pdo, instance_id) = committed_child();
+        let mut queue = CriticalChildStartQueue::new();
+        let (key, _) = queue
+            .reserve_committed(&pnp, &relations, 7, pdo, &instance_id)
+            .unwrap();
+        let next_token = queue.next_token;
+        let next = relations.prepare_bus_relations(0x9000, &[]).unwrap();
+        relations.commit_bus_relations(next).unwrap();
+
+        assert_eq!(
+            queue.claim_next_ready(&pnp, &relations, 7, |_, _| false),
+            Err(CriticalChildStartError::StalePublication)
+        );
+        assert_eq!(queue.state(key), Some(CriticalChildStartState::Uncertain));
+        assert_eq!(queue.next_token, next_token);
     }
 
     #[test]
