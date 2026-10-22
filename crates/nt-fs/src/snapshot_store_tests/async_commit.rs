@@ -1,0 +1,178 @@
+use super::*;
+
+fn baseline() -> WalSnapshotManifest {
+    WalSnapshotManifest {
+        incarnation: 77,
+        base_serial: 0,
+        high_water_serial: 0,
+        high_water_end_lba: 0,
+    }
+}
+
+fn fixture(payload: Vec<u8>) -> (CachedDisk, AsyncSnapshotCommit<Vec<u8>>) {
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::new();
+    store
+        .commit_next_with_wal_manifest(&mut disk, b"older", baseline())
+        .unwrap();
+    store
+        .commit_next_with_wal_manifest(&mut disk, b"newer", baseline())
+        .unwrap();
+    disk.events.clear();
+    let commit = AsyncSnapshotCommit::new(
+        store,
+        payload,
+        baseline(),
+        disk.sector_size(),
+        disk.sector_count(),
+    )
+    .ok()
+    .unwrap();
+    (disk, commit)
+}
+
+fn perform(
+    disk: &mut CachedDisk,
+    commit: &mut AsyncSnapshotCommit<Vec<u8>>,
+    request: AsyncSnapshotRequest,
+) {
+    match request.kind {
+        AsyncSnapshotIoKind::Flush => {
+            disk.flush().unwrap();
+            commit.complete_effect(request, 0).unwrap();
+        }
+        AsyncSnapshotIoKind::Write => {
+            disk.write_sectors(request.lba, commit.write_bytes(request).unwrap())
+                .unwrap();
+            commit.complete_effect(request, request.bytes).unwrap();
+        }
+        AsyncSnapshotIoKind::Read => {
+            let mut bytes = alloc::vec![0; request.bytes];
+            disk.read_sectors(request.lba, &mut bytes).unwrap();
+            commit.complete_read(request, &bytes).unwrap();
+        }
+    }
+}
+
+#[test]
+fn async_commit_preserves_payload_header_barrier_order_and_recovery() {
+    let (mut disk, mut commit) = fixture(alloc::vec![0xa5; 1300]);
+    let mut kinds = Vec::new();
+    while let Some(request) = commit.enter_next().unwrap() {
+        if request.kind != AsyncSnapshotIoKind::Read {
+            kinds.push(request.kind);
+        }
+        perform(&mut disk, &mut commit, request);
+    }
+    assert_eq!(
+        kinds,
+        [
+            AsyncSnapshotIoKind::Flush,
+            AsyncSnapshotIoKind::Write,
+            AsyncSnapshotIoKind::Flush,
+            AsyncSnapshotIoKind::Write,
+            AsyncSnapshotIoKind::Flush,
+        ]
+    );
+    assert_eq!(
+        disk.events,
+        [
+            Event::Flush,
+            Event::Write(1),
+            Event::Write(2),
+            Event::Write(3),
+            Event::Flush,
+            Event::Write(0),
+            Event::Flush,
+        ]
+    );
+    let generation = commit.finish().ok().unwrap();
+    assert_eq!(generation, 3);
+    disk.power_cut();
+    let selected = SnapshotBlockStore::new(0, 16)
+        .read_latest(&mut disk)
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.generation, 3);
+    assert_eq!(selected.payload, alloc::vec![0xa5; 1300]);
+}
+
+#[test]
+fn every_async_read_write_and_flush_keeps_its_exact_ticket_until_completion() {
+    for uncertain_step in 0..9 {
+        let (mut disk, mut commit) = fixture(alloc::vec![0xa5; 1300]);
+        for index in 0..9 {
+            let request = commit.enter_next().unwrap().unwrap();
+            if index == uncertain_step {
+                commit.lose(request).unwrap();
+                assert_eq!(
+                    commit.enter_next(),
+                    Err(AsyncSnapshotCommitError::Outstanding)
+                );
+                let mut wrong = request;
+                wrong.sequence += 1;
+                assert_eq!(
+                    commit.complete_effect(wrong, wrong.bytes),
+                    Err(AsyncSnapshotCommitError::WrongTicket)
+                );
+                assert_eq!(commit.pending(), Some(request));
+            }
+            perform(&mut disk, &mut commit, request);
+            assert_eq!(
+                commit.complete_effect(request, request.bytes),
+                Err(AsyncSnapshotCommitError::WrongTicket)
+            );
+        }
+        assert!(commit.enter_next().unwrap().is_none());
+        assert_eq!(commit.finish().ok().unwrap(), 3);
+    }
+}
+
+#[test]
+fn async_commit_power_cuts_preserve_a_complete_wal_snapshot() {
+    for partial_flush in [false, true] {
+        for cut in 0..7 {
+            let (mut disk, mut commit) = fixture(alloc::vec![0xa5; 1300]);
+            disk.fail_event = Some(cut);
+            disk.partial_flush = partial_flush;
+            while let Some(request) = commit.enter_next().unwrap() {
+                let result = match request.kind {
+                    AsyncSnapshotIoKind::Read => {
+                        let mut bytes = alloc::vec![0; request.bytes];
+                        disk.read_sectors(request.lba, &mut bytes).unwrap();
+                        commit.complete_read(request, &bytes).unwrap();
+                        continue;
+                    }
+                    AsyncSnapshotIoKind::Write => {
+                        disk.write_sectors(request.lba, commit.write_bytes(request).unwrap())
+                    }
+                    AsyncSnapshotIoKind::Flush => disk.flush(),
+                };
+                if result.is_err() {
+                    commit.lose(request).unwrap();
+                    assert_eq!(commit.pending(), Some(request));
+                    assert_eq!(
+                        commit.enter_next(),
+                        Err(AsyncSnapshotCommitError::Outstanding)
+                    );
+                    break;
+                }
+                commit.complete_effect(request, request.bytes).unwrap();
+            }
+            disk.power_cut();
+            let selected = SnapshotBlockStore::new(0, 16)
+                .read_latest(&mut disk)
+                .unwrap()
+                .unwrap();
+            assert!(selected.generation == 2 || selected.generation == 3);
+            assert_eq!(
+                selected.payload,
+                if selected.generation == 2 {
+                    b"newer".to_vec()
+                } else {
+                    alloc::vec![0xa5; 1300]
+                }
+            );
+        }
+    }
+}

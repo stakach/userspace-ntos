@@ -12,6 +12,10 @@ use nt_config_store::codec::{crc32c, Crc32c};
 mod payload_writer;
 pub use payload_writer::PayloadSectorWriter;
 
+#[path = "snapshot_async_commit.rs"]
+mod async_commit;
+pub use async_commit::{AsyncSnapshotCommit, AsyncSnapshotCommitError, AsyncSnapshotIoKind, AsyncSnapshotRequest};
+
 #[path = "snapshot_wal_anchor.rs"]
 mod wal_anchor;
 pub use wal_anchor::WalSnapshotAnchorUpdate;
@@ -671,13 +675,8 @@ impl SnapshotBlockStore {
         payload: &[u8],
         manifest: WalSnapshotManifest,
     ) -> Result<u64, SnapshotBlockStoreError> {
-        self.commit_next_streaming_with_wal_manifest(
-            dev,
-            payload.len(),
-            crc32c(payload),
-            manifest,
-            |writer| writer.write_all(payload),
-        )
+        AsyncSnapshotCommit::new(*self, payload, manifest, dev.sector_size(), dev.sector_count())?
+            .run_sync(dev)
     }
 
     /// Finish an interrupted v1-to-v2 baseline migration before any WAL record is admitted.

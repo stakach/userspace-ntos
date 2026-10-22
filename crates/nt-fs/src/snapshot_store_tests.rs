@@ -13,6 +13,9 @@ mod wal_manifest;
 #[path = "snapshot_store_tests/wal_epoch_rollover.rs"]
 mod wal_epoch_rollover;
 
+#[path = "snapshot_store_tests/async_commit.rs"]
+mod async_commit;
+
 fn two_generations() -> (SnapshotBlockStore, CachedDisk) {
     let store = SnapshotBlockStore::new(0, 16);
     let mut dev = CachedDisk::new();
