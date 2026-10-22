@@ -4,6 +4,10 @@ use super::*;
 use nt_io_manager::pending_irp_graph::captured::{CapturedGraph, GraphRoles, PreparedInventory};
 use nt_io_manager::pending_irp_graph::GraphReleaseKind;
 use nt_io_manager::retained_query_path_forward::SourceIrpTicket;
+use nt_io_manager::scsi_source_retention::{
+    ScsiSourceChildren, ScsiSourceRetentionLedger,
+};
+use nt_io_manager::scsi_srb_transport::{ScsiSrbRoute, WDM_X64_LEGACY_SRB_SIZE};
 use nt_io_manager::source_irp_auxiliary::{
     SourceIrpAuxiliary, SourceIrpAuxiliaryError, SourceIrpAuxiliaryLedger, SourceIrpAuxiliaryPhase,
     SourceIrpCompletionOwner, SourceMdlAllocationIdentity, SourceMemoryIdentity,
@@ -21,6 +25,7 @@ use nt_io_manager::start_io_native_owner::{
 static LOCK: AtomicU64 = AtomicU64::new(0);
 static mut LEDGER: SourceIrpLedger = SourceIrpLedger::new();
 static mut AUXILIARY: SourceIrpAuxiliaryLedger = SourceIrpAuxiliaryLedger::new();
+static mut SCSI_CHILDREN: ScsiSourceRetentionLedger = ScsiSourceRetentionLedger::new();
 static mut CALLER_PROJECTIONS: Option<Vec<CallerProjection>> = None;
 
 struct CallerProjection {
@@ -67,6 +72,175 @@ fn ledger() -> &'static mut SourceIrpLedger {
 fn auxiliary() -> &'static mut SourceIrpAuxiliaryLedger {
     // Serialized by the source-IRP ownership lock alongside the primary ledger.
     unsafe { &mut *core::ptr::addr_of_mut!(AUXILIARY) }
+}
+
+fn scsi_children() -> &'static mut ScsiSourceRetentionLedger {
+    // Serialized by the source-IRP ownership lock, including free and MDL-release admission.
+    unsafe { &mut *core::ptr::addr_of_mut!(SCSI_CHILDREN) }
+}
+
+/// Capture every independently allocated source object and register its free guard under the
+/// same source/pool locks. There is no window in which a copied SRB can be freed and reused
+/// before retention becomes visible to ExFreePool/MmFreePagesFromMdl.
+pub(super) fn capture_scsi_children(
+    instance_index: usize,
+    source: SourceIrpAllocation,
+    ticket: SourceIrpTicket,
+    target_device: u64,
+    route: ScsiSrbRoute,
+) -> Option<(ScsiSourceChildren, Vec<u8>, Option<Vec<u8>>, Vec<u8>)> {
+    let _guard = lock();
+    let inst = instance(instance_index)?;
+    if source.domain != ticket.domain
+        || instance_domain_identity(inst) != Some(source.domain)
+        || !ledger().admits_forward(ticket, source)
+    { return None; }
+    let _pool_guard = unsafe { hosted_instance_pool_lock(inst.exec_pool_va)? };
+    let mut current = allocation_unlocked(instance_index, inst,
+        source.component_address, source.bytes, source.stack_count)?;
+    current.owner = source.owner;
+    if current != source { return None; }
+    let irp_exec = unsafe { hosted_pool_allocation_exec_va(
+        inst.exec_pool_va, source.component_address, source.bytes,
+    )? };
+    let irp = unsafe { read_unaligned(irp_exec as *const nt_kernel_abi::Irp) };
+    let stack_address = hosted_source_irp_stack::next_stack_address(source, &irp)?;
+    let stack_exec = irp_exec.checked_add(stack_address.checked_sub(source.component_address)?)?;
+    let stack_bytes = unsafe { core::slice::from_raw_parts(
+        stack_exec as *const u8, WDM_X64_IO_STACK_LOCATION_SIZE,
+    ) };
+    let stack = nt_io_manager::decode_wdm_kernel_built_scsi_stack(stack_bytes).ok()?;
+    let nt_io_manager::WdmIoStackParameters::Scsi { srb: srb_address } = stack.parameters
+    else { return None };
+    if stack.device_object != target_device || stack.file_object != 0
+        || irp.associated_irp_system_buffer.0 != 0 || irp.user_buffer.0 != 0
+    { return None; }
+    let srb_identity = unsafe { exact_pool_identity_unlocked(
+        inst, srb_address, WDM_X64_LEGACY_SRB_SIZE as u64,
+    )? };
+    let srb_exec = inst.exec_pool_va.checked_add(srb_address.checked_sub(FSD_POOL_VADDR)?)?;
+    let srb_slice = unsafe { core::slice::from_raw_parts(
+        srb_exec as *const u8, WDM_X64_LEGACY_SRB_SIZE,
+    ) };
+    if u16::from_le_bytes(srb_slice[..2].try_into().ok()?) as usize != WDM_X64_LEGACY_SRB_SIZE {
+        return None;
+    }
+    let transfer_length = u32::from_le_bytes(srb_slice[0x10..0x14].try_into().ok()?);
+    let data_address = u64::from_le_bytes(srb_slice[0x18..0x20].try_into().ok()?);
+    let (mdl_identity, mdl_bytes, data_identity, data_bytes) = if transfer_length == 0 {
+        if irp.mdl_address.0 != 0 { return None; }
+        (None, None, None, Vec::new())
+    } else {
+        let mdl_address = irp.mdl_address.0;
+        if mdl_address == 0 || data_address == 0 { return None; }
+        let (mdl_identity, mapped_address) = unsafe {
+            mdl_identity_unlocked(inst, source.domain, mdl_address, transfer_length)?
+        };
+        if mapped_address != data_address { return None; }
+        let mdl_exec = inst.exec_pool_va.checked_add(mdl_address.checked_sub(FSD_POOL_VADDR)?)?;
+        let mdl_slice = unsafe { core::slice::from_raw_parts(
+            mdl_exec as *const u8, nt_mdl::MDL_SIZE,
+        ) };
+        let mdl_count = u32::from_le_bytes(
+            mdl_slice[nt_mdl::MDL_OFF_BYTE_COUNT as usize
+                ..nt_mdl::MDL_OFF_BYTE_COUNT as usize + 4].try_into().ok()?,
+        );
+        if mdl_count < transfer_length { return None; }
+        let data_allocation = unsafe { pool_range_identity_unlocked(
+            inst, data_address, u64::from(transfer_length),
+        )? };
+        let data_exec = inst.exec_pool_va.checked_add(data_address.checked_sub(FSD_POOL_VADDR)?)?;
+        let data_slice = unsafe { core::slice::from_raw_parts(data_exec as *const u8,
+            transfer_length as usize) };
+        let mut data = Vec::new();
+        data.try_reserve_exact(transfer_length as usize).ok()?;
+        data.extend_from_slice(data_slice);
+        let mut mdl = Vec::new();
+        mdl.try_reserve_exact(nt_mdl::MDL_SIZE).ok()?;
+        mdl.extend_from_slice(mdl_slice);
+        (Some(mdl_identity), Some(mdl), Some(SourceMemoryIdentity::Pool {
+            allocation: data_allocation,
+            component_address: data_address,
+            bytes: u64::from(transfer_length),
+        }), data)
+    };
+    let mut srb = Vec::new();
+    srb.try_reserve_exact(WDM_X64_LEGACY_SRB_SIZE).ok()?;
+    srb.extend_from_slice(srb_slice);
+    let children = ScsiSourceChildren {
+        source, ticket, route, srb: srb_identity, mdl: mdl_identity,
+        data: data_identity, transfer_length,
+    };
+    scsi_children().retain(children).ok()?;
+    Some((children, srb, mdl_bytes, data_bytes))
+}
+
+pub(super) fn scsi_children_match_current(
+    instance_index: usize, children: ScsiSourceChildren,
+) -> bool {
+    let _guard = lock();
+    if !scsi_children().contains_exact(children)
+        || !ledger().admits_forward(children.ticket, children.source)
+    { return false; }
+    let Some(inst) = instance(instance_index) else { return false; };
+    if instance_domain_identity(inst) != Some(children.source.domain) { return false; }
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
+        return false;
+    };
+    let mut observed = unsafe { allocation_unlocked(instance_index, inst,
+        children.source.component_address, children.source.bytes, children.source.stack_count) };
+    if let Some(source) = observed.as_mut() { source.owner = children.source.owner; }
+    observed == Some(children.source)
+        && unsafe { exact_pool_identity_unlocked(inst, children.srb.component_address, 0x58) }
+            == Some(children.srb)
+        && children.mdl.is_none_or(|mdl| unsafe {
+            mdl_identity_matches_unlocked(inst, children.source.domain, mdl)
+        })
+        && children.data.is_none_or(|data| unsafe {
+            memory_identity_matches_unlocked(instance_index, inst, data)
+        })
+}
+
+pub(super) fn abandon_scsi_children(children: ScsiSourceChildren) -> bool {
+    let _guard = lock();
+    scsi_children().abandon_prepared(children).is_ok()
+}
+
+pub(super) fn scsi_children_enter(children: ScsiSourceChildren, provider_irp: IrpId) -> bool {
+    let _guard = lock();
+    scsi_children().enter(children, provider_irp).is_ok()
+}
+
+pub(super) fn scsi_children_pending(children: ScsiSourceChildren, provider_irp: IrpId) -> bool {
+    let _guard = lock();
+    scsi_children().pending(children, provider_irp).is_ok()
+}
+
+pub(super) fn scsi_children_uncertain(children: ScsiSourceChildren, provider_irp: IrpId) -> bool {
+    let _guard = lock();
+    scsi_children().uncertain(children, provider_irp).is_ok()
+}
+
+pub(super) fn scsi_children_terminal(children: ScsiSourceChildren, provider_irp: IrpId) -> bool {
+    let _guard = lock();
+    scsi_children().terminal(children, provider_irp).is_ok()
+}
+
+pub(super) fn scsi_children_acknowledge(children: ScsiSourceChildren, provider_irp: IrpId) -> bool {
+    let _guard = lock();
+    scsi_children().acknowledge(children, provider_irp).is_ok()
+}
+
+pub(super) fn scsi_children_source_completed(
+    children: ScsiSourceChildren, provider_irp: IrpId,
+) -> bool {
+    let _guard = lock();
+    scsi_children().source_completed(children, provider_irp).is_ok()
+}
+
+pub(super) fn release_scsi_children(children: ScsiSourceChildren) -> bool {
+    let _guard = lock();
+    scsi_children().release(children).is_ok()
 }
 
 pub(super) unsafe fn pool_range_identity_unlocked(
@@ -716,6 +890,9 @@ pub(super) fn retire_allocation(
             SourceIrpOwner::HostedDriver(instance_index),
             domain,
             component_address,
+        )
+        || op == 3 && scsi_children().protects_pool(
+            SourceIrpOwner::HostedDriver(instance_index), domain, component_address,
         )
     {
         return (nt_status::NtStatus::PENDING.raw(), 0, 0);
@@ -1708,6 +1885,7 @@ pub(super) fn mdl_release_allowed(
 ) -> bool {
     let _guard = lock();
     !auxiliary().protected_pool_child(SourceIrpOwner::HostedDriver(instance_index), domain, mdl)
+        && !scsi_children().protects_mdl(SourceIrpOwner::HostedDriver(instance_index), domain, mdl)
 }
 
 pub(super) fn unpin(ticket: SourceIrpTicket) -> bool {

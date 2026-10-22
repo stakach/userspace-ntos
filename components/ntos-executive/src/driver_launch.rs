@@ -214,6 +214,8 @@ mod hosted_write_work;
 mod hosted_read_work;
 #[path = "hosted_internal_control_work.rs"]
 mod hosted_internal_control_work;
+#[path = "hosted_scsi_srb_capture.rs"]
+mod hosted_scsi_srb_capture;
 #[path = "hosted_source_completion_lane.rs"]
 pub(crate) mod hosted_source_completion_lane;
 #[path = "hosted_class_irp_lane.rs"]
