@@ -44,7 +44,7 @@ pub enum DmaError {
     OutOfRange,
     /// The logical address is not owned by / mapped for this device (§19.2).
     LogicalViolation,
-    /// A live adapter already exists for the owner with different properties.
+    /// A live adapter already exists for this owner and address width with different properties.
     AdapterConflict,
 }
 
@@ -364,10 +364,11 @@ impl DmaManager {
         id
     }
 
-    /// Resolve one live DMA adapter for an exact hosted devnode generation.
+    /// Resolve one live DMA adapter per address width for an exact hosted devnode generation.
     ///
-    /// An exact retry returns the existing adapter. A different request cannot mutate a live
-    /// adapter, and a retired owner generation never aliases a replacement adapter ID.
+    /// An exact retry returns the existing adapter. A data adapter may support 64-bit addresses
+    /// while its common-buffer adapter requires 32-bit addresses. Other property changes cannot
+    /// mutate a live adapter, and a retired owner generation never aliases a replacement ID.
     pub fn request_adapter(
         &mut self,
         owner: DmaOwner,
@@ -380,14 +381,11 @@ impl DmaManager {
         {
             return Err(DmaError::OutOfRange);
         }
-        if let Some(adapter) = self
-            .adapters
-            .iter()
-            .find(|adapter| adapter.owner == owner && adapter.active)
-        {
+        if let Some(adapter) = self.adapters.iter().find(|adapter| {
+            adapter.owner == owner && adapter.dma64 == request.dma64 && adapter.active
+        }) {
             if adapter.sg_supported != request.scatter_gather
                 || adapter.max_length != request.maximum_length
-                || adapter.dma64 != request.dma64
             {
                 return Err(DmaError::AdapterConflict);
             }
@@ -1204,6 +1202,48 @@ mod tests {
                 .adapter_id,
             first.adapter_id
         );
+    }
+
+    #[test]
+    fn data64_and_common32_adapters_share_owner_but_keep_distinct_lifetimes() {
+        let mut d = DmaManager::new();
+        let data_request = adapter_request();
+        let common_request = DmaAdapterRequest {
+            dma64: false,
+            ..data_request
+        };
+        let data = d.request_adapter(owner(), data_request).unwrap();
+        let common = d.request_adapter(owner(), common_request).unwrap();
+
+        assert!(data.created && common.created);
+        assert_ne!(data.adapter_id, common.adapter_id);
+        assert_eq!(
+            d.request_adapter(owner(), data_request).unwrap().adapter_id,
+            data.adapter_id
+        );
+        assert_eq!(
+            d.request_adapter(owner(), common_request)
+                .unwrap()
+                .adapter_id,
+            common.adapter_id
+        );
+        assert_eq!(
+            d.register_common_buffer_at(owner(), common.adapter_id, 0x1_0000_0000, 4096, 0x1000),
+            Err(DmaError::OutOfRange)
+        );
+
+        d.put_adapter_for_owner(owner(), data.adapter_id).unwrap();
+        assert_eq!(
+            d.register_common_buffer_at(owner(), data.adapter_id, 0x1000, 4096, 0x1000),
+            Err(DmaError::Inactive)
+        );
+        assert!(d
+            .register_common_buffer_at(owner(), common.adapter_id, 0x1000, 4096, 0x1000)
+            .is_ok());
+        assert_eq!(d.revoke_owner(owner()), (1, 0));
+        let replacement = d.request_adapter(owner(), common_request).unwrap();
+        assert!(replacement.created);
+        assert_ne!(replacement.adapter_id, common.adapter_id);
     }
 
     #[test]
