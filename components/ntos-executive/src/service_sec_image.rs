@@ -12237,6 +12237,10 @@ pub(crate) unsafe fn service_sec_image(
                     flags,
                 )
             };
+            // Released LiberNT compatibility DLLs can issue raw syscall numbers that differ
+            // from the source-built ntdll's private table. Resolve the observed external ABI
+            // before admission and dispatch, after preserving the original fault/reply frame.
+            m0 = nt_syscall_abi::normalize_external_raw_ssn(m0, native_call_transport);
             let current_tid = nt_handler
                 .hosted_thread_tid_for_badge(badge)
                 .unwrap_or_else(|| {

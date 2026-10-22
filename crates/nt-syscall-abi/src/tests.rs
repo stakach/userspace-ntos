@@ -416,6 +416,25 @@ fn native_alpc_ingress_precedes_dispatcher_table_lookup() {
 }
 
 #[test]
+fn released_libernt_raw_wait_for_alert_uses_registered_native_service() {
+    let registered = u64::from(ssn_of("NtWaitForAlertByThreadId").unwrap());
+    let alert_registered = u64::from(ssn_of("NtAlertThreadByThreadId").unwrap());
+    assert_eq!(registered, 0x4ad);
+    assert_eq!(alert_registered, 0x406);
+    // The pinned LiberNT ntdll and ntdll_vista alert/wait stubs issue 0x16c/0x16d.
+    // Only genuine UnknownSyscall ingress uses that external service numbering.
+    assert_eq!(normalize_external_raw_ssn(0x16d, false), registered);
+    assert_eq!(normalize_external_raw_ssn(0x16c, false), alert_registered);
+    assert_eq!(normalize_external_raw_ssn(0x16d, true), 0x16d);
+    assert_eq!(normalize_external_raw_ssn(0x16c, true), 0x16c);
+    for unrelated in [0x16b, 0x16e] {
+        assert_eq!(normalize_external_raw_ssn(unrelated, false), unrelated);
+    }
+    assert_eq!(normalize_external_raw_ssn(registered, false), registered);
+    assert_eq!(normalize_external_raw_ssn(alert_registered, false), alert_registered);
+}
+
+#[test]
 fn native_ipc_buffer_selects_main_and_worker_layouts() {
     assert_eq!(
         native_ipc_buffer_va(NT_NATIVE_SEC_IMAGE_MAIN_TEB_VA),

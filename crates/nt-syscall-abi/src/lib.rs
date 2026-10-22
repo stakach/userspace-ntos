@@ -128,6 +128,23 @@ pub const LIBERNT_BASE_SSN: u32 = 0x300;
 /// These stay below the executive's 0x1000 win32k shadow-table routing boundary.
 pub const LIBERNT_FULL_EXPORT_SSN_BASE: u32 = 0x400;
 
+/// Translate a released LiberNT raw `syscall` number into our registered native
+/// service number. The released `ntdll_vista.dll` threadpool calls its private
+/// `NtAlertThreadByThreadId` and `NtWaitForAlertByThreadId` stubs with SSNs
+/// 0x16c and 0x16d; our source-built ntdll uses distinct numbers through the
+/// native Call transport. Keep the external numbers scoped to genuine
+/// UnknownSyscall faults so they cannot alter our own ntdll/executive contract.
+pub const fn normalize_external_raw_ssn(ssn: u64, native_call_transport: bool) -> u64 {
+    if native_call_transport {
+        return ssn;
+    }
+    match ssn {
+        0x16c => (LIBERNT_FULL_EXPORT_SSN_BASE + 6) as u64,
+        0x16d => (LIBERNT_FULL_EXPORT_SSN_BASE + 173) as u64,
+        _ => ssn,
+    }
+}
+
 /// ntdll_plan Step 6.A — the msginfo LABEL that marks a REQUEST as an NT native seL4-Call syscall
 /// (our ntdll's `Nt*` stub → the executive over a real seL4 `Call`, NOT a Windows-`syscall`
 /// UnknownSyscall trap). ASCII `"NT"` (0x4E54) — well clear of the kernel fault-type labels
