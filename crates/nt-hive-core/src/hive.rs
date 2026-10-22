@@ -490,7 +490,9 @@ fn compose_hive_overlay_inner(
         }
     }
 
-    composed.finish_clean_import();
+    // Overlay construction uses ordinary mutators, but it is part of boot import rather than
+    // a new durable mutation. Keep the persisted base's journal head for the next CM append.
+    composed.finish_clean_import_at_sequence(base.sequence);
     Ok(composed)
 }
 
@@ -920,13 +922,20 @@ impl Hive {
     /// the first journalled sequence numbers, and a later checkpoint should not report import-time
     /// construction as dirty runtime state.
     pub fn finish_clean_import(&mut self) {
+        self.finish_clean_import_at_sequence(0);
+    }
+
+    /// Mark an overlay composition clean without rewinding the persisted journal head.
+    /// Generated cells receive no independently durable sequence; their construction clocks
+    /// must not make the composed image dirty or advance its next log-record number.
+    fn finish_clean_import_at_sequence(&mut self, sequence: u64) {
         assert!(self.pending_value_journal.is_none(), "retained publication excludes import reset");
-        self.sequence = 0;
+        self.sequence = sequence;
         self.generation = 0;
         for cell in self.cells.iter_mut().filter_map(|cell| cell.as_mut()) {
             match cell {
-                Cell::Key(key) => key.last_write_sequence = 0,
-                Cell::Value(value) => value.last_write_sequence = 0,
+                Cell::Key(key) => key.last_write_sequence = key.last_write_sequence.min(sequence),
+                Cell::Value(value) => value.last_write_sequence = value.last_write_sequence.min(sequence),
             }
         }
         self.clear_dirty();
