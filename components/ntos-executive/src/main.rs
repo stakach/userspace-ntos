@@ -17118,48 +17118,11 @@ pub(crate) unsafe fn delay_timer_drain_overdue_without_badge(
         return 0;
     }
     DRAIN_DUE_HITS.fetch_add(1, Ordering::Relaxed);
-    // Snapshot the per-sub-drain totals so a SLOW call can report its own deltas. Aggregates are
-    // useless here: this path runs a handful of times per boot and one call can cost a minute.
-    let mut before = [0u64; SUBDRAIN_N];
-    for slot in 0..SUBDRAIN_N {
-        before[slot] = SUBDRAIN_TICKS[slot].load(Ordering::Relaxed);
-    }
     let work_started = disk_census_ticks();
     let woken = delay_timer_drain_due_work(queue, handler, now);
     teardown_pending_job_time_terminations(queue, handler);
     let work_ticks = disk_census_ticks().wrapping_sub(work_started);
     DRAIN_WORK_TICKS.fetch_add(work_ticks, Ordering::Relaxed);
-    // Print EVERY due drain, not just slow ones: the path fires only a handful of times per boot,
-    // so this is a few lines, and a run that diverges before the expensive one still reports the
-    // cheap ones — which is what tells us the shape.
-    {
-        print_str(b"[drain-due] total_ms=");
-        print_u64(work_ticks / 1_000_000);
-        print_str(b" woken=");
-        print_u64(woken);
-        print_str(b" by-subdrain:");
-        for slot in 0..SUBDRAIN_N {
-            let ms = SUBDRAIN_TICKS[slot]
-                .load(Ordering::Relaxed)
-                .wrapping_sub(before[slot])
-                / 1_000_000;
-            if ms == 0 {
-                continue;
-            }
-            print_str(b" #");
-            print_u64(slot as u64);
-            print_str(b"=");
-            print_u64(ms);
-            print_str(b"ms");
-        }
-        print_str(b" delay-wake reply_ms=");
-        print_u64(DELAY_WAKE_REPLY_TICKS.load(Ordering::Relaxed) / 1_000_000);
-        print_str(b" other_ms=");
-        print_u64(DELAY_WAKE_OTHER_TICKS.load(Ordering::Relaxed) / 1_000_000);
-        print_str(b" badge=");
-        print_u64(DELAY_WAKE_LAST_BADGE.load(Ordering::Relaxed));
-        print_str(b"\n");
-    }
     TIMER_DUE_WORK_DRAINS.fetch_add(1, Ordering::Relaxed);
     let rearm_started = disk_census_ticks();
     delay_timer_rearm(queue, handler);
