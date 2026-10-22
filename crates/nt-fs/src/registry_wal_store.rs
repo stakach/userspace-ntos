@@ -393,20 +393,21 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
                 return Err(RegistryWalError::Corrupt);
             }
             let mut payload = Vec::new();
+            let padded_len = usize::try_from(payload_count)
+                .ok()
+                .and_then(|sectors| sectors.checked_mul(size))
+                .ok_or(RegistryWalError::Corrupt)?;
             payload
-                .try_reserve_exact(len)
+                .try_reserve_exact(padded_len)
                 .map_err(|_| RegistryWalError::OutOfMemory)?;
-            for index in 0..payload_count {
-                device
-                    .read_sector(cursor + 1 + index, &mut sector)
-                    .map_err(RegistryWalError::Storage)?;
-                let remaining = len - payload.len();
-                let take = remaining.min(size);
-                payload.extend_from_slice(&sector[..take]);
-                if take < size && !sector_is_zero(&sector[take..]) {
-                    return Err(RegistryWalError::Corrupt);
-                }
+            payload.resize(padded_len, 0);
+            device
+                .read_sectors(cursor + 1, &mut payload)
+                .map_err(RegistryWalError::Storage)?;
+            if !sector_is_zero(&payload[len..]) {
+                return Err(RegistryWalError::Corrupt);
             }
+            payload.truncate(len);
             if crc32c(&payload) != payload_crc {
                 return Err(RegistryWalError::Corrupt);
             }

@@ -173,6 +173,46 @@ fn empty_tail_recovery_uses_bounded_range_reads_and_checks_the_last_sector() {
 }
 
 #[test]
+fn committed_payload_recovery_reads_a_range_without_losing_padding_or_io_errors() {
+    let payload = alloc::vec![0x5a; 6 * 512 + 17];
+    let mut wal = RegistryWal::recover(CachedDisk::with_sectors(24), 77).unwrap();
+    wal.begin(payload.clone()).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    let mut disk = wal.into_device().unwrap();
+    disk.power_cut();
+
+    let singles = Rc::new(Cell::new(0));
+    let batches = Rc::new(Cell::new(0));
+    let counted = |inner| BatchedZeroDisk {
+        inner,
+        singles: singles.clone(),
+        batches: batches.clone(),
+    };
+    let recovered = RegistryWal::recover(counted(disk), 77).unwrap();
+    assert_eq!(recovered.records()[0].payload, payload);
+    assert_eq!(recovered.settled_anchor().unwrap().serial, 1);
+    assert!(batches.get() >= 2, "payload and empty suffix must use range reads");
+    assert!(singles.get() <= 4, "payload must not issue a command per sector");
+
+    let mut disk = recovered.into_device().unwrap().inner;
+    let padding_byte = 512 + payload.len();
+    disk.cache[padding_byte] = 1;
+    disk.stable[padding_byte] = 1;
+    assert!(matches!(RegistryWal::recover(counted(disk), 77), Err(RegistryWalError::Corrupt)));
+
+    let mut wal = RegistryWal::recover(CachedDisk::with_sectors(24), 77).unwrap();
+    wal.begin(payload).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    let mut disk = wal.into_device().unwrap();
+    disk.power_cut();
+    disk.fail_read = Some(3);
+    assert!(matches!(RegistryWal::recover(counted(disk), 77),
+        Err(RegistryWalError::Storage(SnapshotBlockStoreError::Io))));
+}
+
+#[test]
 fn settled_wal_anchor_is_exact_and_unavailable_during_an_effect() {
     let mut wal = RegistryWal::recover(self::disk(), 77).unwrap();
     assert_eq!(wal.settled_anchor(), Some(WalSnapshotAnchor {
