@@ -83,6 +83,7 @@ pub mod hosted_kernel_read_delivery;
 pub mod inline_file_retirement;
 mod irp;
 pub mod internal_block_io;
+pub mod scsi_srb_transport;
 pub mod kernel_irp_builder;
 pub mod io_create_file;
 pub mod io_create_file_capture;
@@ -310,7 +311,8 @@ pub use volume_information::{
     SetVolumeInformationParameters, VolumeInformationContract,
 };
 pub use wdm_x64::{
-    decode_wdm_kernel_built_io_stack, initialize_wdm_irp_thread_list,
+    decode_wdm_kernel_built_io_stack, decode_wdm_kernel_built_scsi_stack,
+    initialize_wdm_irp_thread_list,
     write_wdm_device_object, write_wdm_driver_object,
     write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
     write_wdm_irp_completion_targets,
