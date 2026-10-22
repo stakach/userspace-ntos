@@ -1892,6 +1892,46 @@ fn committed_range_table_large_queries_inspect_bounded_candidates() {
 }
 
 #[test]
+fn committed_range_table_normalizes_many_ranges_with_bounded_comparisons() {
+    const BASE: u64 = 0x4000_0000;
+    const PAIRS: usize = 200;
+    // Include holes and reverse address order so normalization must both compact and sort.
+    // Each pair has a common allocation identity and must coalesce after sorting.
+    let mut ranges = [None; 512];
+    for index in 0..PAIRS * 2 {
+        let pair_base = BASE + (index / 2) as u64 * 3 * PAGE_SIZE;
+        ranges[511 - index] = Some(VmCommittedRange::image_region(
+            pair_base + (index % 2) as u64 * PAGE_SIZE,
+            PAGE_SIZE,
+            pair_base,
+            PAGE_READONLY,
+        ));
+    }
+    let mut table = VmCommittedRangeTable::<512> { ranges };
+    VM_COMMITTED_NORMALIZE_COMPARISONS.with(|count| count.set(0));
+    table.normalize();
+    let comparisons = VM_COMMITTED_NORMALIZE_COMPARISONS.with(|count| count.get());
+    assert!(
+        comparisons < 10_000,
+        "normalizing 400 ranges took {comparisons} comparisons"
+    );
+    assert_eq!(table.range_count(), PAIRS);
+    for (index, slot) in table.ranges.iter().enumerate() {
+        if index < PAIRS {
+            let range = slot.expect("sorted committed range prefix");
+            assert_eq!(range.base, BASE + index as u64 * 3 * PAGE_SIZE);
+            assert_eq!(range.size, 2 * PAGE_SIZE);
+            assert_eq!(range.allocation_base, range.base);
+        } else {
+            assert!(
+                slot.is_none(),
+                "normalization must clear the trailing slots"
+            );
+        }
+    }
+}
+
+#[test]
 fn committed_range_table_rejects_overlaps_and_tracks_next_base() {
     let mut table = VmCommittedRangeTable::<4>::new();
     table

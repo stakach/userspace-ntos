@@ -1544,6 +1544,7 @@ pub struct VmCommittedRangeTable<const N: usize> {
 #[cfg(test)]
 std::thread_local! {
     static VM_COMMITTED_QUERY_INSPECTIONS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static VM_COMMITTED_NORMALIZE_COMPARISONS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 impl<const N: usize> VmCommittedRangeTable<N> {
@@ -1886,29 +1887,29 @@ impl<const N: usize> VmCommittedRangeTable<N> {
     }
 
     fn normalize(&mut self) {
-        for left in 0..N {
-            for right in left + 1..N {
-                let swap = match (self.ranges[left], self.ranges[right]) {
-                    (None, Some(_)) => true,
-                    (Some(a), Some(b)) => b.base < a.base,
-                    _ => false,
-                };
-                if swap {
-                    self.ranges.swap(left, right);
-                }
+        let mut used = 0usize;
+        for read in 0..N {
+            if let Some(range) = self.ranges[read] {
+                self.ranges[used] = Some(range);
+                used += 1;
             }
         }
+        self.ranges[used..].fill(None);
+        self.ranges[..used].sort_unstable_by(|left, right| {
+            #[cfg(test)]
+            VM_COMMITTED_NORMALIZE_COMPARISONS.with(|count| count.set(count.get() + 1));
+            left.as_ref()
+                .expect("compacted committed range")
+                .base
+                .cmp(&right.as_ref().expect("compacted committed range").base)
+        });
         let mut read = 0usize;
         let mut write = 0usize;
-        while read < N {
-            let Some(mut current) = self.ranges[read] else {
-                break;
-            };
+        while read < used {
+            let mut current = self.ranges[read].expect("compacted committed range");
             read += 1;
-            while read < N {
-                let Some(next) = self.ranges[read] else {
-                    break;
-                };
+            while read < used {
+                let next = self.ranges[read].expect("compacted committed range");
                 if !current.contiguous_with(next) {
                     break;
                 }
