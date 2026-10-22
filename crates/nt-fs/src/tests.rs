@@ -1723,6 +1723,78 @@ fn copied_file_chunks_share_provisioned_source_until_modified() {
 }
 
 #[test]
+fn unrelated_short_writes_do_not_scan_every_window_of_a_large_immutable_blob() {
+    let mut fs = FileSystem::new(MemFs::new());
+    let source_bytes = alloc::vec![0xa5; 256 * 1024];
+    let source_path = r"\??\C:\profiles\Default User\large-source.bin";
+    let dest_path = r"\??\C:\profiles\Default User\unrelated.bin";
+    assert!(fs.provision_file(source_path, &source_bytes));
+    let dest = fs.zw_create_file(
+        dest_path,
+        FILE_WRITE_DATA | FILE_READ_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        0,
+    );
+    assert_eq!(dest.status, STATUS_SUCCESS);
+
+    let inspected_before = fs.blob_slice_candidates_inspected();
+    let mut expected = alloc::vec::Vec::new();
+    for value in 1..=24u8 {
+        let chunk = [value; 16];
+        assert_eq!(
+            fs.zw_write_file(dest.handle, None, &chunk),
+            (STATUS_SUCCESS, chunk.len())
+        );
+        expected.extend_from_slice(&chunk);
+    }
+
+    assert_eq!(fs.file_bytes(dest_path), Some(expected.as_slice()));
+    assert_eq!(fs.file_bytes(source_path), Some(source_bytes.as_slice()));
+    let inspected = fs.blob_slice_candidates_inspected() - inspected_before;
+    assert!(
+        inspected <= 24 * 64,
+        "{inspected} candidate windows inspected for 24 unrelated short writes"
+    );
+}
+
+#[test]
+fn compacted_blob_indexes_do_not_reuse_stale_read_provenance() {
+    let mut fs = FileSystem::new(MemFs::new());
+    let source_path = r"\??\C:\Temp\source.bin";
+    let other_path = r"\??\C:\Temp\other.bin";
+    let dest_path = r"\??\C:\Temp\dest.bin";
+    assert!(fs.provision_file(source_path, b"old"));
+    assert!(fs.provision_file(other_path, b"new"));
+    let source = fs.zw_create_file(source_path, FILE_READ_DATA, 0, 0, FILE_OPEN, 0);
+    assert_eq!(source.status, STATUS_SUCCESS);
+    let mut read = [0; 3];
+    assert_eq!(
+        fs.zw_read_file_into(source.handle, None, &mut read),
+        (STATUS_SUCCESS, read.len())
+    );
+    assert_eq!(&read, b"old");
+
+    assert!(fs.provision_file(source_path, b"replacement"));
+    let compacted = fs.compact_volume_blobs().unwrap();
+    assert_eq!(compacted.reclaimed_blobs(), 1);
+    let inspected_before = fs.blob_slice_candidates_inspected();
+    let dest = fs.zw_create_file(dest_path, FILE_WRITE_DATA, 0, 0, FILE_CREATE, 0);
+    assert_eq!(dest.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_write_file(dest.handle, None, &read),
+        (STATUS_SUCCESS, read.len())
+    );
+    assert_eq!(fs.blob_slice_candidates_inspected(), inspected_before);
+
+    let restored = FileSystem::from_volume_snapshot(&fs.export_volume_snapshot().unwrap()).unwrap();
+    assert_eq!(restored.file_bytes(source_path), Some(&b"replacement"[..]));
+    assert_eq!(restored.file_bytes(other_path), Some(&b"new"[..]));
+    assert_eq!(restored.file_bytes(dest_path), Some(&b"old"[..]));
+}
+
+#[test]
 fn compact_volume_blobs_reclaims_only_unreferenced_storage() {
     let mut fs = FileSystem::new(MemFs::new());
     assert!(fs.provision_file(r"\??\C:\Temp\live.log", b"header"));

@@ -7,6 +7,8 @@
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+#[cfg(test)]
+use core::sync::atomic::{AtomicUsize, Ordering};
 use nt_config_store::codec::{crc32c, crc32c_combine, Crc32c};
 
 use crate::directory::{
@@ -525,6 +527,8 @@ struct MemFsDirEntry {
 pub struct MemFs {
     nodes: Vec<Option<MemFsNode>>,
     blobs: Vec<Vec<u8>>,
+    #[cfg(test)]
+    blob_slice_candidates_inspected: AtomicUsize,
     next_file_id: u64,
     next_entry_id: u64,
     current_time_100ns: u64,
@@ -546,6 +550,8 @@ impl MemFs {
         let mut fs = MemFs {
             nodes: Vec::new(),
             blobs: Vec::new(),
+            #[cfg(test)]
+            blob_slice_candidates_inspected: AtomicUsize::new(0),
             next_file_id: 1,
             next_entry_id: 1,
             current_time_100ns: 0,
@@ -2970,6 +2976,52 @@ impl MemFs {
         let Some(n) = self.node(id) else { return 0 };
         n.data.read_into(&self.blobs, offset, out)
     }
+
+    /// Preserve only a read wholly backed by one immutable blob. The writer still compares its
+    /// bytes with that exact range before sharing it; this is a hint, never authority for content.
+    fn immutable_read_extent(&self, id: u64, offset: u64, len: usize) -> Option<FileExtent> {
+        if len == 0 {
+            return None;
+        }
+        let FileData::Extents(extents) = &self.node(id)?.data else {
+            return None;
+        };
+        let start = usize::try_from(offset).ok()?;
+        let end = start.checked_add(len)?;
+        let mut file_offset = 0usize;
+        for extent in extents {
+            let extent_end = file_offset.checked_add(extent.len)?;
+            if start >= file_offset && end <= extent_end && extent.blob != ZERO_EXTENT_BLOB {
+                let blob_offset = extent.offset.checked_add(start - file_offset)?;
+                let blob_end = blob_offset.checked_add(len)?;
+                self.blobs.get(extent.blob)?.get(blob_offset..blob_end)?;
+                return Some(FileExtent {
+                    blob: extent.blob,
+                    offset: blob_offset,
+                    len,
+                });
+            }
+            file_offset = extent_end;
+        }
+        None
+    }
+
+    fn matching_immutable_read(
+        &self,
+        bytes: &[u8],
+        recent: Option<FileExtent>,
+    ) -> Option<FileExtent> {
+        let extent = recent?;
+        if extent.len != bytes.len() || extent.blob == ZERO_EXTENT_BLOB {
+            return None;
+        }
+        let end = extent.offset.checked_add(extent.len)?;
+        #[cfg(test)]
+        self.blob_slice_candidates_inspected
+            .fetch_add(1, Ordering::Relaxed);
+        (self.blobs.get(extent.blob)?.get(extent.offset..end)? == bytes).then_some(extent)
+    }
+
     /// Replace a file node's contents with `bytes`, allocating EXACTLY once (the volume lives on a
     /// bump heap in the executive, so a growth-by-doubling `resize` would strand the intermediate
     /// buffers). `false` if the node is missing or is a directory.
@@ -3061,7 +3113,13 @@ impl MemFs {
         }
     }
 
-    fn write_at(&mut self, id: u64, offset: u64, bytes: &[u8]) -> usize {
+    fn write_at(
+        &mut self,
+        id: u64,
+        offset: u64,
+        bytes: &[u8],
+        recent_read: Option<FileExtent>,
+    ) -> usize {
         let Some(node) = self.node(id) else {
             return 0;
         };
@@ -3082,7 +3140,7 @@ impl MemFs {
                 if extents.iter().any(|extent| extent.blob == ZERO_EXTENT_BLOB)
         );
         if sparse_extent_backed {
-            let Some(extent) = self.extent_for_bytes(bytes) else {
+            let Some(extent) = self.extent_for_bytes(bytes, recent_read) else {
                 return 0;
             };
             return if self.splice_write_extent(id, start, extent) {
@@ -3091,8 +3149,10 @@ impl MemFs {
                 0
             };
         }
-        let copied_extent = (start == current_len)
-            .then(|| self.find_blob_slice(bytes))
+        let can_append_extent = matches!(&node.data, FileData::Extents(_))
+            || matches!(&node.data, FileData::Bytes(data) if data.is_empty());
+        let copied_extent = (start == current_len && can_append_extent)
+            .then(|| self.matching_immutable_read(bytes, recent_read))
             .flatten();
         if let Some(extent) = copied_extent {
             let Some(node) = self.node_mut(id) else {
@@ -3226,8 +3286,12 @@ impl MemFs {
         bytes.len()
     }
 
-    fn extent_for_bytes(&mut self, bytes: &[u8]) -> Option<FileExtent> {
-        self.find_blob_slice(bytes).or_else(|| {
+    fn extent_for_bytes(
+        &mut self,
+        bytes: &[u8],
+        recent_read: Option<FileExtent>,
+    ) -> Option<FileExtent> {
+        self.matching_immutable_read(bytes, recent_read).or_else(|| {
             let blob = self.intern_blob(bytes)?;
             Some(FileExtent {
                 blob,
@@ -3344,27 +3408,6 @@ impl MemFs {
         self.blobs.try_reserve_exact(1).ok()?;
         self.blobs.push(bytes);
         Some(self.blobs.len() - 1)
-    }
-
-    fn find_blob_slice(&self, bytes: &[u8]) -> Option<FileExtent> {
-        if bytes.is_empty() {
-            return None;
-        }
-        for (blob_index, blob) in self.blobs.iter().enumerate() {
-            if bytes.len() > blob.len() {
-                continue;
-            }
-            for offset in 0..=blob.len() - bytes.len() {
-                if &blob[offset..offset + bytes.len()] == bytes {
-                    return Some(FileExtent {
-                        blob: blob_index,
-                        offset,
-                        len: bytes.len(),
-                    });
-                }
-            }
-        }
-        None
     }
 
     fn materialize_node_data(&mut self, id: u64) -> bool {
@@ -3833,6 +3876,9 @@ pub fn parse_file_basic_information_attributes(data: &[u8]) -> Result<u32, u32> 
 /// exposing the Zw* native file APIs (spec §8-§9).
 pub struct FileSystem {
     volume: MemFs,
+    /// Last exact immutable range returned to a caller. Consumed by the next write after an
+    /// exact byte comparison, so unrelated writes never search provisioned file contents.
+    recent_immutable_read: Option<FileExtent>,
     mounts: MountManager,
     handles: Vec<Option<FileObject>>,
     /// Live log nodes still covered by an unfurled volume WAL suffix.
@@ -3858,6 +3904,7 @@ impl FileSystem {
     pub fn new(volume: MemFs) -> Self {
         FileSystem {
             volume,
+            recent_immutable_read: None,
             mounts: MountManager::new(),
             handles: Vec::new(),
             wal_protected_logs: Vec::new(),
@@ -4027,6 +4074,7 @@ impl FileSystem {
 
     /// Reclaim immutable file-data blobs made unreachable by truncate, replace, or unlink.
     pub fn compact_volume_blobs(&mut self) -> Result<MemFsBlobCompaction, MemFsBlobCompactError> {
+        self.recent_immutable_read = None;
         self.volume.compact_blobs()
     }
 
@@ -4618,6 +4666,9 @@ impl FileSystem {
             return (STATUS_END_OF_FILE, Vec::new());
         }
         let bytes = self.volume.read_at(node_id, offset, length);
+        self.recent_immutable_read =
+            self.volume
+                .immutable_read_extent(node_id, offset, bytes.len());
         if byte_offset.is_none() {
             self.obj_mut(handle).unwrap().current_offset = offset + bytes.len() as u64;
         }
@@ -4626,23 +4677,30 @@ impl FileSystem {
 
     /// Read backing bytes without logical-file position or access-metadata side effects. Cache
     /// owners use this for fragments; the native operation accounts for the complete read once.
-    pub fn read_backing_into(&self, handle: u64, offset: u64, output: &mut [u8]) -> (u32, usize) {
+    /// An exact immutable source range is retained briefly so a following copy write can share it.
+    pub fn read_backing_into(
+        &mut self,
+        handle: u64,
+        offset: u64,
+        output: &mut [u8],
+    ) -> (u32, usize) {
+        self.recent_immutable_read = None;
         let Some(obj) = self.obj(handle) else {
             return (STATUS_INVALID_HANDLE, 0);
         };
-        if self.volume.is_dir(obj.node_id) {
+        let node_id = obj.node_id;
+        if self.volume.is_dir(node_id) {
             return (STATUS_INVALID_DEVICE_REQUEST, 0);
         }
         if output.is_empty() {
             return (STATUS_SUCCESS, 0);
         }
-        if offset >= self.volume.size(obj.node_id) {
+        if offset >= self.volume.size(node_id) {
             return (STATUS_END_OF_FILE, 0);
         }
-        (
-            STATUS_SUCCESS,
-            self.volume.read_at_into(obj.node_id, offset, output),
-        )
+        let read = self.volume.read_at_into(node_id, offset, output);
+        self.recent_immutable_read = self.volume.immutable_read_extent(node_id, offset, read);
+        (STATUS_SUCCESS, read)
     }
 
     /// `ZwReadFile` into caller-provided storage. Same semantics as [`Self::zw_read_file`], but
@@ -4714,7 +4772,8 @@ impl FileSystem {
             return (STATUS_ACCESS_DENIED, 0);
         }
         let offset = byte_offset.unwrap_or(obj.current_offset);
-        let n = self.volume.write_at(node_id, offset, data);
+        let recent_read = self.recent_immutable_read.take();
+        let n = self.volume.write_at(node_id, offset, data, recent_read);
         if !data.is_empty() && n == 0 {
             return (STATUS_INSUFFICIENT_RESOURCES, 0);
         }
@@ -5434,6 +5493,13 @@ impl FileSystem {
     /// Number of unique immutable file byte blobs retained by the volume.
     pub fn unique_data_blobs(&self) -> usize {
         self.volume.blobs.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn blob_slice_candidates_inspected(&self) -> usize {
+        self.volume
+            .blob_slice_candidates_inspected
+            .load(Ordering::Relaxed)
     }
 
     /// `NtQueryAttributesFile` / `NtQueryFullAttributesFile` (spec §8.6): query a file's attributes
