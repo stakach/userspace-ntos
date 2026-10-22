@@ -586,6 +586,27 @@ mod tests {
     }
 
     #[test]
+    fn unacknowledged_boot_command_keeps_native_handoff_fenced() {
+        let mut ledger = ledger();
+        let completed = ledger.enter_boot_io(AHCI, 41).unwrap();
+        let unacknowledged = ledger.enter_boot_io(AHCI, 41).unwrap();
+        let native = ledger.reserve_window(AHCI, 41, 0x2000, 1).unwrap();
+        ledger.begin_map(AHCI, 41, native).unwrap();
+        ledger.confirm_map(AHCI, 41, native).unwrap();
+        ledger.complete_boot_io(AHCI, 41, completed).unwrap();
+        ledger.begin_drain(AHCI, 41).unwrap();
+        assert_eq!(ledger.enter_boot_io(AHCI, 41), Err(Error::WrongPhase));
+        assert_eq!(
+            ledger.begin_native_start(AHCI, 41),
+            Err(Error::BootIoOutstanding)
+        );
+        // Recovery may later prove that the command retired. Until then its exact
+        // ticket remains owned by the boot controller, even if other I/O finished.
+        ledger.complete_boot_io(AHCI, 41, unacknowledged).unwrap();
+        ledger.begin_native_start(AHCI, 41).unwrap();
+    }
+
+    #[test]
     fn uncertain_dma_or_native_start_never_reopens_boot_controller() {
         let mut handoff = ledger();
         let mapped = handoff.reserve_window(AHCI, 41, 0x2000, 1).unwrap();

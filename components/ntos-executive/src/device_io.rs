@@ -30,7 +30,7 @@ pub(crate) unsafe fn storage_probe(
     let ssts = core::ptr::read_volatile((ahci_vaddr + 0x100 + 0x28) as *const u32);
     let det = (ssts >> 8) & 0xF;
     // Read sector 0 via a real READ DMA EXT and validate the protective MBR.
-    let tfd = ahci_read_sector(ahci_vaddr, dma_vaddr, dma_paddr, 0);
+    let tfd = ahci_read_sector_isolated_storage_host(ahci_vaddr, dma_vaddr, dma_paddr, 0);
     let mbr = core::slice::from_raw_parts(
         (dma_vaddr + AHCI_DMA_DATA_OFFSET) as *const u8,
         nt_fs::DISK_SECTOR_BYTES,
@@ -47,7 +47,7 @@ pub(crate) unsafe fn storage_probe(
         verdict |= 1;
     }
     let (mut hive_size, mut smss_size, mut imports_size) = (0u32, 0u32, 0u32);
-    if let Some(fs) = fat32_mount_with_census(ahci_vaddr, dma_vaddr, dma_paddr, false) {
+    if let Some(fs) = fat32_mount_isolated_storage_host(ahci_vaddr, dma_vaddr, dma_paddr) {
         verdict |= 2;
         // P7-A: source every ReactOS binary BY PATH from the real \reactos\system32 tree (LFN-aware
         // fat_open_path), NOT from the flat root ::NAME files. Each read tries the real path first

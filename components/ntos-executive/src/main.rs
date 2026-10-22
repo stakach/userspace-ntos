@@ -27871,12 +27871,57 @@ unsafe fn ahci_read_sector(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64, sect
     ahci_read_sectors(ahci_vaddr, dma_vaddr, dma_paddr, sector, 1)
 }
 
+/// The one-shot storage host runs from a read-only alias of this image and cannot mutate the
+/// executive's ticket ledger. Its owner is selected only by the isolated host mount entry.
+unsafe fn ahci_read_sector_isolated_storage_host(
+    ahci_vaddr: u64,
+    dma_vaddr: u64,
+    dma_paddr: u64,
+    sector: u64,
+) -> u32 {
+    ahci_read_sectors_untracked(ahci_vaddr, dma_vaddr, dma_paddr, sector, 1)
+}
+
+unsafe fn ahci_read_sectors_isolated_storage_host(
+    ahci_vaddr: u64,
+    dma_vaddr: u64,
+    dma_paddr: u64,
+    sector: u64,
+    sector_count: u32,
+) -> u32 {
+    ahci_read_sectors_untracked(ahci_vaddr, dma_vaddr, dma_paddr, sector, sector_count)
+}
+
 /// Bring up AHCI port 0 and READ `sector_count` 512-byte sectors into the DMA frame at
 /// `dma_vaddr + AHCI_DMA_DATA_OFFSET` (paddr `dma_paddr + AHCI_DMA_DATA_OFFSET`) via ATA READ DMA
 /// EXT. All AHCI DMA structures live in one 4 KiB frame: Command List @0 (1 KiB-aligned), FIS Rx
 /// @0x400 (256-aligned), Command Table @0x500 (128-aligned), data buffer @0x800. Returns the port
 /// Task File Data low byte after completion (0 = success; 0xFF = timeout/invalid count).
 unsafe fn ahci_read_sectors(
+    ahci_vaddr: u64,
+    dma_vaddr: u64,
+    dma_paddr: u64,
+    sector: u64,
+    sector_count: u32,
+) -> u32 {
+    if sector_count == 0 || sector_count > AHCI_MAX_SECTORS_PER_READ {
+        return 0xFF;
+    }
+    let Ok(admission) = boot_storage_dma_handoff::enter_boot_io() else {
+        return 0xFF;
+    };
+    let status = ahci_read_sectors_untracked(
+        ahci_vaddr,
+        dma_vaddr,
+        dma_paddr,
+        sector,
+        sector_count,
+    );
+    boot_storage_dma_handoff::finish_boot_io(admission, status != 0xFF);
+    status
+}
+
+unsafe fn ahci_read_sectors_untracked(
     ahci_vaddr: u64,
     dma_vaddr: u64,
     dma_paddr: u64,
@@ -28007,6 +28052,22 @@ unsafe fn ahci_write_sectors(
     {
         return 0xFF;
     }
+    let Ok(admission) = boot_storage_dma_handoff::enter_boot_io() else {
+        return 0xFF;
+    };
+    let status = ahci_write_sectors_owned(ahci_vaddr, dma_vaddr, dma_paddr, sector, data);
+    boot_storage_dma_handoff::finish_boot_io(admission, status != 0xFF);
+    status
+}
+
+#[allow(dead_code)]
+unsafe fn ahci_write_sectors_owned(
+    ahci_vaddr: u64,
+    dma_vaddr: u64,
+    dma_paddr: u64,
+    sector: u64,
+    data: &[u8],
+) -> u32 {
     let sector_count = (data.len() / 512) as u32;
     let port = ahci_vaddr + 0x100; // port 0 register set
     let pr = |o: u64| core::ptr::read_volatile((port + o) as *const u32);
@@ -28108,10 +28169,19 @@ unsafe fn ahci_write_sectors(
 /// `AHCI_DMA_VADDR + AHCI_DMA_DATA_OFFSET`; whole-file reads may consume a bounded contiguous
 /// sector run, while directory walkers still consume one sector before triggering the next read.
 #[derive(Clone, Copy)]
+enum FatIoOwner {
+    Executive,
+    IsolatedStorageHost,
+}
+
+#[derive(Clone, Copy)]
 struct Fat32 {
     /// Update the disk-I/O census on this mount. FALSE for the isolated storage host's mount:
     /// its image is mapped read-only, so bumping a static there faults with no handler.
     census: bool,
+    /// Selects the controller owner independently of instrumentation. The isolated host
+    /// must never mutate the executive's ticket ledger through its read-only image alias.
+    io_owner: FatIoOwner,
     ahci_vaddr: u64,
     dma_vaddr: u64,
     dma_paddr: u64,

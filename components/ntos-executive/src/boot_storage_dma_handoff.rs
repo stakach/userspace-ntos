@@ -4,7 +4,9 @@
 //! published. This owner only admits disjoint DMA memory in the same RID domain.
 
 use crate::*;
-use nt_pnp_context::pci_dma_handoff::{ControllerState, PciController, PciDmaHandoff, WindowId};
+use nt_pnp_context::pci_dma_handoff::{
+    BootIoTicket, ControllerState, PciController, PciDmaHandoff, WindowId,
+};
 
 const BOOT_GENERATION: u64 = 1;
 pub(crate) const BOOT_DOMAIN: u64 = 2;
@@ -31,6 +33,42 @@ static mut BOOT_STORAGE_DMA: Option<BootStorageDmaAuthority> = None;
 fn authority() -> Option<&'static mut BootStorageDmaAuthority> {
     // The executive dispatches these admission operations on its single broker thread.
     unsafe { BOOT_STORAGE_DMA.as_mut() }
+}
+
+/// A command is untracked only before the executive installs its controller owner, or in
+/// the isolated storage host's separate address space. A refused admission issues no MMIO.
+pub(crate) enum BootIoAdmission {
+    Untracked,
+    Ticket(BootIoTicket),
+}
+
+pub(crate) fn enter_boot_io() -> Result<BootIoAdmission, ()> {
+    let Some(owner) = authority() else {
+        return Ok(BootIoAdmission::Untracked);
+    };
+    if !owner.ready {
+        return Err(());
+    }
+    owner
+        .ledger
+        .enter_boot_io(owner.controller, owner.io_space_cap)
+        .map(BootIoAdmission::Ticket)
+        .map_err(|_| ())
+}
+
+/// Complete only a command whose hardware retirement is known. An ambiguous timeout or
+/// controller fault retains the ticket, so a later native-start attempt stays fenced.
+pub(crate) fn finish_boot_io(admission: BootIoAdmission, retired: bool) {
+    let BootIoAdmission::Ticket(ticket) = admission else {
+        return;
+    };
+    if retired {
+        let owner = authority().expect("boot AHCI DMA authority lost during I/O");
+        owner
+            .ledger
+            .complete_boot_io(owner.controller, owner.io_space_cap, ticket)
+            .expect("boot AHCI I/O ticket lost");
+    }
 }
 
 pub(crate) fn install_boot_storage_dma_authority(

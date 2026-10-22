@@ -23,6 +23,41 @@ const _: () = assert!(
     FAT32_FAT_CACHE_OFFSET + core::mem::size_of::<FatSectorCacheScratch>() as u64 <= 0x1000
 );
 
+unsafe fn read_owner_sector(
+    owner: FatIoOwner,
+    ahci_vaddr: u64,
+    dma_vaddr: u64,
+    dma_paddr: u64,
+    lba: u64,
+) -> u32 {
+    match owner {
+        FatIoOwner::Executive => ahci_read_sector(ahci_vaddr, dma_vaddr, dma_paddr, lba),
+        FatIoOwner::IsolatedStorageHost => {
+            ahci_read_sector_isolated_storage_host(ahci_vaddr, dma_vaddr, dma_paddr, lba)
+        }
+    }
+}
+
+unsafe fn read_owner_sectors(
+    owner: FatIoOwner,
+    ahci_vaddr: u64,
+    dma_vaddr: u64,
+    dma_paddr: u64,
+    lba: u64,
+    count: u32,
+) -> u32 {
+    match owner {
+        FatIoOwner::Executive => ahci_read_sectors(ahci_vaddr, dma_vaddr, dma_paddr, lba, count),
+        FatIoOwner::IsolatedStorageHost => ahci_read_sectors_isolated_storage_host(
+            ahci_vaddr,
+            dma_vaddr,
+            dma_paddr,
+            lba,
+            count,
+        ),
+    }
+}
+
 const SYSTEM32_CACHE_NAME_CAP: usize = 96;
 
 #[derive(Clone, Copy)]
@@ -137,7 +172,7 @@ pub(crate) unsafe fn fat_read_sector(fs: &Fat32, sector: u32) -> Option<*const u
 unsafe fn fat_read_sector_checked(fs: &Fat32, sector: u32) -> Option<*const u8> {
     let disk_lba = nt_fs::checked_partition_lba(fs.volume_start_lba, sector)?;
     let census_started = fs.census.then(disk_census_ticks);
-    let status = ahci_read_sector(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba);
+    let status = read_owner_sector(fs.io_owner, fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba);
     disk_census_record(
         nt_ahci::IoOperation::Read,
         census_started,
@@ -158,7 +193,7 @@ unsafe fn fat_read_sectors_checked(fs: &Fat32, sector: u32, count: u32) -> Optio
     let last = sector.checked_add(count.checked_sub(1)?)?;
     nt_fs::checked_partition_lba(fs.volume_start_lba, last)?;
     let census_started = fs.census.then(disk_census_ticks);
-    let status = ahci_read_sectors(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba, count);
+    let status = read_owner_sectors(fs.io_owner, fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba, count);
     disk_census_record(
         nt_ahci::IoOperation::Read,
         census_started,
@@ -207,7 +242,10 @@ unsafe fn fat_chain_cache_invalidate(fs: &Fat32) {
 /// Write one full FAT sector through the same AHCI DMA frame used by [`fat_read_sector`].
 #[allow(dead_code)]
 pub(crate) unsafe fn fat_write_sector(fs: &Fat32, sector: u32, data: &[u8]) -> u32 {
-    if fs.bps != 512 || data.len() != fs.bps as usize {
+    if !matches!(fs.io_owner, FatIoOwner::Executive)
+        || fs.bps != 512
+        || data.len() != fs.bps as usize
+    {
         return 0xff;
     }
     let Some(disk_lba) = nt_fs::checked_partition_lba(fs.volume_start_lba, sector) else {
@@ -228,7 +266,11 @@ pub(crate) unsafe fn fat_write_sector(fs: &Fat32, sector: u32, data: &[u8]) -> u
 
 #[allow(dead_code)]
 pub(crate) unsafe fn fat_write_sectors(fs: &Fat32, sector: u32, data: &[u8]) -> u32 {
-    if fs.bps != 512 || data.is_empty() || data.len() % fs.bps as usize != 0 {
+    if !matches!(fs.io_owner, FatIoOwner::Executive)
+        || fs.bps != 512
+        || data.is_empty()
+        || data.len() % fs.bps as usize != 0
+    {
         return 0xff;
     }
     let sectors = (data.len() / fs.bps as usize) as u32;
@@ -291,7 +333,8 @@ pub(crate) unsafe fn fat_volume_size(fs: &Fat32) -> Option<nt_fs::VolumeSizeInfo
         || fs.spc == 0
         || fs.total_sectors <= fs.data_start
         || fs.fs_info_sector == 0
-        || ahci_read_sector(
+        || read_owner_sector(
+            fs.io_owner,
             fs.ahci_vaddr,
             fs.dma_vaddr,
             fs.dma_paddr,
@@ -1223,13 +1266,14 @@ pub(crate) unsafe fn load_dll_from_fs(
 /// Discover the unique EFI System Partition through the protective MBR and primary GPT,
 /// validate its entry-array CRC, then mount the FAT32 volume inside that partition.
 unsafe fn read_disk_sector_into(
+    owner: FatIoOwner,
     ahci_vaddr: u64,
     dma_vaddr: u64,
     dma_paddr: u64,
     lba: u64,
     out: &mut [u8; nt_fs::DISK_SECTOR_BYTES],
 ) -> Option<()> {
-    if ahci_read_sector(ahci_vaddr, dma_vaddr, dma_paddr, lba) == 0xff {
+    if read_owner_sector(owner, ahci_vaddr, dma_vaddr, dma_paddr, lba) == 0xff {
         print_str(b"[fat-mount] read timeout lba=");
         print_u64(lba);
         print_str(b"\n");
@@ -1243,16 +1287,16 @@ unsafe fn read_disk_sector_into(
     Some(())
 }
 
-pub(crate) unsafe fn fat32_mount_with_census(
+unsafe fn fat32_mount_for_owner(
     ahci_vaddr: u64,
     dma_vaddr: u64,
     dma_paddr: u64,
-    census: bool,
+    owner: FatIoOwner,
 ) -> Option<Fat32> {
     let mut sector = [0u8; nt_fs::DISK_SECTOR_BYTES];
-    read_disk_sector_into(ahci_vaddr, dma_vaddr, dma_paddr, 0, &mut sector)?;
+    read_disk_sector_into(owner, ahci_vaddr, dma_vaddr, dma_paddr, 0, &mut sector)?;
     nt_fs::validate_protective_mbr(&sector).ok()?;
-    read_disk_sector_into(ahci_vaddr, dma_vaddr, dma_paddr, 1, &mut sector)?;
+    read_disk_sector_into(owner, ahci_vaddr, dma_vaddr, dma_paddr, 1, &mut sector)?;
     let header = nt_fs::parse_gpt_header(&sector, 1).ok()?;
     let table_bytes = usize::try_from(header.partition_entries_bytes()?).ok()?;
     let entry_size = header.partition_entry_size as usize;
@@ -1265,7 +1309,7 @@ pub(crate) unsafe fn fat32_mount_with_census(
         let lba = header
             .partition_entries_lba
             .checked_add((consumed / nt_fs::DISK_SECTOR_BYTES) as u64)?;
-        read_disk_sector_into(ahci_vaddr, dma_vaddr, dma_paddr, lba, &mut sector)?;
+        read_disk_sector_into(owner, ahci_vaddr, dma_vaddr, dma_paddr, lba, &mut sector)?;
         let take = (table_bytes - consumed).min(nt_fs::DISK_SECTOR_BYTES);
         crc.update(&sector[..take]);
         for byte in &sector[..take] {
@@ -1291,11 +1335,12 @@ pub(crate) unsafe fn fat32_mount_with_census(
     }
     let esp = esp?;
     let partition_sectors = esp.sector_count()?;
-    read_disk_sector_into(ahci_vaddr, dma_vaddr, dma_paddr, esp.first_lba, &mut sector)?;
+    read_disk_sector_into(owner, ahci_vaddr, dma_vaddr, dma_paddr, esp.first_lba, &mut sector)?;
     let geometry = nt_fs::Fat32Geometry::parse(&sector, partition_sectors).ok()?;
     let snapshot_start_lba = header.disk_sectors()?;
     let mounted = Fat32 {
-        census,
+        census: matches!(owner, FatIoOwner::Executive),
+        io_owner: owner,
         ahci_vaddr,
         dma_vaddr,
         dma_paddr,
@@ -1320,7 +1365,15 @@ pub(crate) unsafe fn fat32_mount_with_census(
 }
 
 pub(crate) unsafe fn fat32_mount(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64) -> Option<Fat32> {
-    fat32_mount_with_census(ahci_vaddr, dma_vaddr, dma_paddr, true)
+    fat32_mount_for_owner(ahci_vaddr, dma_vaddr, dma_paddr, FatIoOwner::Executive)
+}
+
+pub(crate) unsafe fn fat32_mount_isolated_storage_host(
+    ahci_vaddr: u64,
+    dma_vaddr: u64,
+    dma_paddr: u64,
+) -> Option<Fat32> {
+    fat32_mount_for_owner(ahci_vaddr, dma_vaddr, dma_paddr, FatIoOwner::IsolatedStorageHost)
 }
 
 /// The executive's on-demand file-buffer POOL: a fresh VA region whose frames are allocated + mapped
