@@ -55,8 +55,7 @@ pub fn eval_method_input_ex(
 
 /// Validate an overflow probe and return the provider's exact retry size.
 ///
-/// The ReactOS provider writes `Signature`, `Length`, and `Count`, then reports the same required
-/// length through `IoStatus.Information`. The executive validates both values independently.
+/// The provider writes `Signature`, required `Length`, and `Count` into the fixed header.
 pub fn eval_output_required_len(probe: &[u8], maximum: usize) -> Result<usize, AcpiEvalError> {
     if probe.len() < EVAL_OUTPUT_HEADER_LEN {
         return Err(AcpiEvalError::Truncated);
@@ -78,6 +77,24 @@ pub fn eval_output_required_len(probe: &[u8], maximum: usize) -> Result<usize, A
         return Err(AcpiEvalError::InvalidRequiredLength);
     }
     Ok(required)
+}
+
+/// Decode the released LiberNT provider's `STATUS_BUFFER_OVERFLOW` result.
+///
+/// `IoStatus.Information` is the 20 valid header bytes, while `Length` inside that
+/// header is the exact retry size. This avoids a METHOD_BUFFERED completion copy
+/// beyond the caller's probe buffer.
+pub fn eval_output_overflow_retry_len(
+    information: u64,
+    probe: &[u8],
+    maximum: usize,
+) -> Result<usize, AcpiEvalError> {
+    if information != ACPI_EVAL_OUTPUT_PROBE_LEN as u64
+        || probe.len() != ACPI_EVAL_OUTPUT_PROBE_LEN
+    {
+        return Err(AcpiEvalError::InvalidRequiredLength);
+    }
+    eval_output_required_len(probe, maximum)
 }
 
 /// Decode one exact integer result, as used for `_SEG` and `_BBN`.
@@ -200,6 +217,18 @@ mod tests {
             eval_output_required_len(&[0; ACPI_EVAL_OUTPUT_PROBE_LEN], 4096),
             Err(AcpiEvalError::InvalidOutput)
         );
+    }
+
+    #[test]
+    fn pinned_libernt_overflow_reports_header_bytes_not_required_size() {
+        // LiberNT acpi.sys at 8e478a22: EvalCreateOutputArguments writes the required
+        // length into OutputBuffer->Length, but IoStatus.Information is sizeof header
+        // (20) on STATUS_BUFFER_OVERFLOW so buffered completion cannot overcopy.
+        let probe = output_header(84, 4);
+        assert_eq!(eval_output_overflow_retry_len(20, &probe, 4096), Ok(84));
+        assert_eq!(eval_output_overflow_retry_len(84, &probe, 4096), Err(AcpiEvalError::InvalidRequiredLength));
+        assert_eq!(eval_output_overflow_retry_len(19, &probe, 4096), Err(AcpiEvalError::InvalidRequiredLength));
+        assert_eq!(eval_output_overflow_retry_len(20, &output_header(20, 1), 4096), Err(AcpiEvalError::InvalidRequiredLength));
     }
 
     #[test]

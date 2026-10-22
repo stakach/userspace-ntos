@@ -6,6 +6,9 @@ use alloc::vec::Vec;
 pub const IOCTL_ACPI_ENUM_CHILDREN: u32 = 0x0032_c020;
 pub const ACPI_ENUM_CHILDREN_INPUT_LEN: usize = 16;
 pub const ACPI_ENUM_CHILDREN_FILTER_INPUT_LEN: usize = 17;
+/// The released provider checks `sizeof(ACPI_ENUM_CHILDREN_OUTPUT_BUFFER)` before
+/// returning the variable-length output header. One inline child makes that 20 bytes.
+pub const ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN: usize = 20;
 
 const ENUM_INPUT_SIGNATURE: u32 = u32::from_be_bytes(*b"HieA");
 const ENUM_OUTPUT_SIGNATURE: u32 = u32::from_be_bytes(*b"GieA");
@@ -180,36 +183,9 @@ pub fn namespace_children_required_len(
     Ok(required)
 }
 
-/// Choose the next output extent after `IOCTL_ACPI_ENUM_CHILDREN` reports buffer overflow.
-/// Providers that publish the standard required-length header get an exact retry. Providers that
-/// leave the METHOD_BUFFERED input header in place get one bounded maximum-sized retry; another
-/// opaque overflow at that maximum is rejected.
-pub fn namespace_children_overflow_retry_len(
-    header: &[u8],
-    current: usize,
-    maximum: usize,
-) -> Result<usize, AcpiNamespaceError> {
-    if header.len() != current
-        || current < ENUM_OUTPUT_HEADER_LEN
-        || maximum < ENUM_OUTPUT_HEADER_LEN
-        || current > maximum
-    {
-        return Err(AcpiNamespaceError::InvalidRequiredLength);
-    }
-    if read_u32(header, 0)? == ENUM_OUTPUT_SIGNATURE {
-        let required = namespace_children_required_len(header, maximum)?;
-        return (required > current)
-            .then_some(required)
-            .ok_or(AcpiNamespaceError::InvalidRequiredLength);
-    }
-    (current < maximum)
-        .then_some(maximum)
-        .ok_or(AcpiNamespaceError::InvalidRequiredLength)
-}
-
-/// Select one bounded retry for an undersized namespace probe. Released ACPI providers may
-/// return either overflow with a required-length header or buffer-too-small with the original
-/// METHOD_BUFFERED input still in the output. Neither status authorizes an unbounded retry.
+/// Select a bounded retry from the released provider's two distinct short-buffer statuses.
+/// A buffer below the 20-byte C-struct minimum gets that minimum once; overflow after
+/// the minimum returns 20 valid header bytes with the exact required length at offset 4.
 pub fn namespace_children_probe_retry_len(
     status: u32,
     information: u64,
@@ -217,10 +193,26 @@ pub fn namespace_children_probe_retry_len(
     current: usize,
     maximum: usize,
 ) -> Result<usize, AcpiNamespaceError> {
-    if !matches!(status, 0x8000_0005 | 0xc000_0023) || information != 0 {
+    if header.len() != current || current < ENUM_OUTPUT_HEADER_LEN
+        || maximum < ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN || current > maximum
+    {
+        return Err(AcpiNamespaceError::InvalidRequiredLength);
+    }
+    if status == 0xc000_0023 && information == 0 {
+        return (current < ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN)
+            .then_some(ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN)
+            .ok_or(AcpiNamespaceError::InvalidRequiredLength);
+    }
+    if status != 0x8000_0005
+        || information != ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN as u64
+        || current < ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN
+    {
         return Err(AcpiNamespaceError::InvalidOutput);
     }
-    namespace_children_overflow_retry_len(header, current, maximum)
+    let required = namespace_children_required_len(header, maximum)?;
+    (required > current)
+        .then_some(required)
+        .ok_or(AcpiNamespaceError::InvalidRequiredLength)
 }
 
 /// An ACPI PDO without a namespace handle cannot enumerate children. The provider may report
@@ -582,37 +574,31 @@ mod tests {
     }
 
     #[test]
-    fn opaque_overflow_gets_one_bounded_maximum_retry() {
-        let input_header = immediate_namespace_children_input();
-        assert_eq!(
-            namespace_children_overflow_retry_len(&input_header[..8], 8, 4096),
-            Ok(4096)
-        );
-        assert_eq!(
-            namespace_children_overflow_retry_len(&input_header[..8], 8, 8),
-            Err(AcpiNamespaceError::InvalidRequiredLength)
-        );
-
-        let mut required_header = [0u8; 8];
-        required_header[..4].copy_from_slice(&ENUM_OUTPUT_SIGNATURE.to_le_bytes());
-        required_header[4..].copy_from_slice(&1234u32.to_le_bytes());
-        assert_eq!(
-            namespace_children_overflow_retry_len(&required_header, 8, 4096),
-            Ok(1234)
-        );
-    }
-
-    #[test]
     fn undersized_acpi_namespace_probe_gets_one_bounded_retry() {
         let input_header = immediate_namespace_children_input();
         assert_eq!(
             namespace_children_probe_retry_len(0xc000_0023, 0, &input_header[..8], 8, 4096),
-            Ok(4096)
+            Ok(ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN)
         );
         assert_eq!(
             namespace_children_probe_retry_len(0xc000_0023, 0, &input_header[..8], 4096, 4096),
             Err(AcpiNamespaceError::InvalidRequiredLength)
         );
+    }
+
+    #[test]
+    fn pinned_libernt_namespace_probe_and_overflow_have_distinct_status_contracts() {
+        // Bus_PDO_EnumChildren requires sizeof(ACPI_ENUM_CHILDREN_OUTPUT_BUFFER)=20
+        // before writing a header. Its subsequent overflow reports Information=20,
+        // with required bytes in NumberOfChildren at header offset 4.
+        let input = immediate_namespace_children_input();
+        assert_eq!(namespace_children_probe_retry_len(0xc000_0023, 0, &input[..8], 8, 4096), Ok(20));
+        let mut output = [0u8; 20];
+        output[..4].copy_from_slice(&ENUM_OUTPUT_SIGNATURE.to_le_bytes());
+        output[4..8].copy_from_slice(&1234u32.to_le_bytes());
+        assert_eq!(namespace_children_probe_retry_len(0x8000_0005, 20, &output, 20, 4096), Ok(1234));
+        assert_eq!(namespace_children_probe_retry_len(0x8000_0005, 0, &output, 20, 4096), Err(AcpiNamespaceError::InvalidOutput));
+        assert_eq!(namespace_children_probe_retry_len(0xc000_0023, 0, &output, 20, 4096), Err(AcpiNamespaceError::InvalidRequiredLength));
     }
 
     #[test]

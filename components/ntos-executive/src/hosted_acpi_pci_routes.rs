@@ -571,22 +571,15 @@ fn classify_hosted_acpi_variable_eval_result(
     payload: &[u8],
 ) -> HostedAcpiVariableEvalDisposition {
     if status.raw() as u32 == STATUS_BUFFER_OVERFLOW {
-        let required = usize::try_from(information).ok();
-        let valid = output_len == nt_acpi::ACPI_EVAL_OUTPUT_PROBE_LEN
-            && payload.len() == output_len
-            && required.is_some_and(|required| {
-                required > output_len
-                    && nt_acpi::eval_output_required_len(
-                        payload,
-                        HOSTED_ACPI_ROUTE_MAX_EVAL_BYTES,
-                    ) == Ok(required)
-            });
-        return if valid {
-            HostedAcpiVariableEvalDisposition::RetryExact(required.unwrap())
-        } else {
-            HostedAcpiVariableEvalDisposition::Barrier(
+        return match (output_len == nt_acpi::ACPI_EVAL_OUTPUT_PROBE_LEN)
+            .then(|| nt_acpi::eval_output_overflow_retry_len(
+                information, payload, HOSTED_ACPI_ROUTE_MAX_EVAL_BYTES,
+            ))
+        {
+            Some(Ok(required)) => HostedAcpiVariableEvalDisposition::RetryExact(required),
+            _ => HostedAcpiVariableEvalDisposition::Barrier(
                 nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-            )
+            ),
         };
     }
     if status.raw() != STATUS_SUCCESS {
@@ -1174,7 +1167,7 @@ unsafe fn drain_hosted_acpi_pci_route_query() -> usize {
                         } else {
                             HostedAcpiPciRoutePhase::DispatchCrsFilter {
                                 endpoint_index: 0,
-                                output_len: HOSTED_ACPI_NAMESPACE_HEADER_LEN,
+                                output_len: nt_acpi::ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN,
                             }
                         };
                     }
