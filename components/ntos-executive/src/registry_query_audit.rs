@@ -47,6 +47,10 @@ fn value_units(value: &[u16]) {
 pub(crate) fn missing_value(
     pid: Option<u32>, tid: u64, pi: usize, key: u32, path: Option<&str>, name: &[u16],
 ) {
+    static TRACE_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    if !crate::DEBUG_TRACE && !crate::bounded_trace_sample(&TRACE_COUNT, 4) {
+        return;
+    }
     let Some(receipt) = BUDGET.claim(crate::diagnostic_time_100ns()) else { return; };
     crate::print_str(b"[registry-query-miss] receipt=");
     crate::print_u64(receipt.receipt);

@@ -1796,6 +1796,9 @@ fn trace_tp_worker_event_transition(
     let Some((tp_pi, tp_slot)) = tp_worker_identity_from_badge(handler.current_badge) else {
         return;
     };
+    if !crate::DEBUG_TRACE {
+        return;
+    }
     let Some(n) = bump_tp_worker_slot_event_trace(tp_pi, tp_slot) else {
         return;
     };
@@ -11763,17 +11766,19 @@ impl ExecNtHandler {
                 nt_kernel_exec::DispatcherConsumeResult::NotReady => return 0xC000_0001,
             };
             trace_wait_object(self, b"ready", handle, object, timeout_ptr, status);
-            print_str(b"[wait] pi=");
-            print_u64(self.pi as u64);
-            print_str(b" ");
-            print_str(operation);
-            print_str(b"(");
-            print_str(object.describe());
-            print_str(b" ");
-            print_u64(object.id());
-            print_str(b") already SIGNALLED -> immediate status=0x");
-            print_hex(status);
-            print_str(b"\n");
+            if crate::DEBUG_TRACE {
+                print_str(b"[wait] pi=");
+                print_u64(self.pi as u64);
+                print_str(b" ");
+                print_str(operation);
+                print_str(b"(");
+                print_str(object.describe());
+                print_str(b" ");
+                print_u64(object.id());
+                print_str(b") already SIGNALLED -> immediate status=0x");
+                print_hex(status);
+                print_str(b"\n");
+            }
             return status;
         }
         if alertable {
@@ -11800,15 +11805,17 @@ impl ExecNtHandler {
         self.wait_park_event = object.raw() as i64;
         self.wait_alertable = alertable;
         trace_wait_object(self, b"park", handle, object, timeout_ptr, 0x102);
-        print_str(b"[wait] pi=");
-        print_u64(self.pi as u64);
-        print_str(b" ");
-        print_str(operation);
-        print_str(b"(");
-        print_str(object.describe());
-        print_str(b" ");
-        print_u64(object.id());
-        print_str(b") UNSIGNALLED -> PARK caller (reply-cap park)\n");
+        if crate::DEBUG_TRACE {
+            print_str(b"[wait] pi=");
+            print_u64(self.pi as u64);
+            print_str(b" ");
+            print_str(operation);
+            print_str(b"(");
+            print_str(object.describe());
+            print_str(b" ");
+            print_u64(object.id());
+            print_str(b") UNSIGNALLED -> PARK caller (reply-cap park)\n");
+        }
         0x102
     }
 

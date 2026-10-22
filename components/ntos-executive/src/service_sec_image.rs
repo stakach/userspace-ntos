@@ -10238,7 +10238,7 @@ pub(crate) unsafe fn service_sec_image(
         }
         if is_tp_worker && !is_scm_worker && !is_lsa_worker {
             let n = GENERIC_TP_WORKER_FAULT_TRACE.fetch_add(1, Ordering::Relaxed);
-            if n < 64 {
+            if DEBUG_TRACE && n < 64 {
                 print_str(b"[tp-worker-event] #");
                 print_u64(n);
                 print_str(b" badge=");
@@ -19011,15 +19011,17 @@ pub(crate) unsafe fn service_sec_image(
                     let current_tid = nt_handler.current_tid;
                     let wait_still_parked = wait_recheck_after_park(&mut nt_handler, current_tid);
                     delay_timer_rearm_after_park(delay_queue, &mut nt_handler, timed);
-                    print_str(b"[wait] pi=");
-                    print_u64(pi as u64);
-                    print_str(b" NtWaitForMultipleObjects(");
-                    print_u64(park_wait_set_n as u64);
-                    print_str(if park_wait_set_all {
-                        b" objects, WaitAll) UNSIGNALLED -> PARK caller\n"
-                    } else {
-                        b" objects, WaitAny) UNSIGNALLED -> PARK caller\n"
-                    });
+                    if DEBUG_TRACE {
+                        print_str(b"[wait] pi=");
+                        print_u64(pi as u64);
+                        print_str(b" NtWaitForMultipleObjects(");
+                        print_u64(park_wait_set_n as u64);
+                        print_str(if park_wait_set_all {
+                            b" objects, WaitAll) UNSIGNALLED -> PARK caller\n"
+                        } else {
+                            b" objects, WaitAny) UNSIGNALLED -> PARK caller\n"
+                        });
+                    }
                     if !timed && wait_still_parked {
                         trace_indefinite_wait_park(
                             &nt_handler,
