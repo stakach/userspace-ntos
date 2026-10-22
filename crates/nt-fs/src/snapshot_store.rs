@@ -119,18 +119,20 @@ pub trait SnapshotPayloadReader {
     fn remaining(&self) -> usize;
 }
 
+const READ_BATCH_SECTORS: usize = 4;
+
 /// Sector-buffered payload reader for [`SnapshotBlockStore::read_latest_streaming`].
 pub struct PayloadSectorReader<'a, D: SnapshotBlockDevice> {
     dev: &'a mut D,
-    sector: Vec<u8>,
+    batch: Vec<u8>,
     sector_size: usize,
     slot_base: u64,
     payload_len: usize,
     payload_crc: u32,
     read: usize,
     sector_index: u64,
-    sector_offset: usize,
-    sector_valid: usize,
+    batch_offset: usize,
+    batch_valid: usize,
     crc: Crc32c,
 }
 
@@ -614,14 +616,17 @@ impl SnapshotBlockStore {
     {
         let (sector_size, slot_sectors) = self.geometry(dev)?;
         let slot_base = self.slot_lba(slot_sectors, plan.slot)?;
-        let mut sector = Vec::new();
-        sector
-            .try_reserve_exact(sector_size)
+        let batch_size = sector_size
+            .checked_mul(READ_BATCH_SECTORS)
+            .ok_or(SnapshotBlockStoreError::InvalidGeometry)?;
+        let mut batch = Vec::new();
+        batch
+            .try_reserve_exact(batch_size)
             .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
-        sector.resize(sector_size, 0);
+        batch.resize(batch_size, 0);
         let generation = plan.generation;
         let payload_len = plan.payload_len;
-        let mut reader = PayloadSectorReader::new(dev, sector, sector_size, slot_base, plan);
+        let mut reader = PayloadSectorReader::new(dev, batch, sector_size, slot_base, plan);
         let result = read_payload(&mut reader)?;
         reader.finish()?;
         Ok((generation, payload_len, result))
@@ -1323,14 +1328,13 @@ impl SnapshotBlockStore {
         dev: &mut D,
         plan: SlotReadPlan,
     ) -> Result<(), SnapshotBlockStoreError> {
-        const READ_BATCH_SECTORS: u32 = 4;
         let (sector_size, slot_sectors) = self.geometry(dev)?;
         if plan.payload_sectors as u64 > slot_sectors - 1 {
             return Err(SnapshotBlockStoreError::Corrupt);
         }
         let slot_base = self.slot_lba(slot_sectors, plan.slot)?;
         let batch_size = sector_size
-            .checked_mul(READ_BATCH_SECTORS as usize)
+            .checked_mul(READ_BATCH_SECTORS)
             .ok_or(SnapshotBlockStoreError::InvalidGeometry)?;
         let mut batch = Vec::new();
         batch
@@ -1341,7 +1345,7 @@ impl SnapshotBlockStore {
         let mut crc = Crc32c::new();
         let mut index = 0;
         while index < plan.payload_sectors {
-            let sectors = (plan.payload_sectors - index).min(READ_BATCH_SECTORS);
+            let sectors = (plan.payload_sectors - index).min(READ_BATCH_SECTORS as u32);
             let bytes = sectors as usize * sector_size;
             let output = &mut batch[..bytes];
             output.fill(0);
@@ -1412,36 +1416,39 @@ impl SnapshotBlockStore {
 impl<'a, D: SnapshotBlockDevice> PayloadSectorReader<'a, D> {
     fn new(
         dev: &'a mut D,
-        sector: Vec<u8>,
+        batch: Vec<u8>,
         sector_size: usize,
         slot_base: u64,
         plan: SlotReadPlan,
     ) -> Self {
         Self {
             dev,
-            sector,
+            batch,
             sector_size,
             slot_base,
             payload_len: plan.payload_len,
             payload_crc: plan.payload_crc,
             read: 0,
             sector_index: 0,
-            sector_offset: 0,
-            sector_valid: 0,
+            batch_offset: 0,
+            batch_valid: 0,
             crc: Crc32c::new(),
         }
     }
 
-    fn fill_sector(&mut self) -> Result<(), SnapshotBlockStoreError> {
+    fn fill_batch(&mut self) -> Result<(), SnapshotBlockStoreError> {
         if self.read >= self.payload_len {
             return Err(SnapshotBlockStoreError::Corrupt);
         }
-        self.sector.fill(0);
+        let remaining = self.payload_len - self.read;
+        let sectors = remaining.div_ceil(self.sector_size).min(READ_BATCH_SECTORS);
+        let bytes = sectors * self.sector_size;
+        self.batch[..bytes].fill(0);
         self.dev
-            .read_sector(self.slot_base + 1 + self.sector_index, &mut self.sector)?;
-        self.sector_index += 1;
-        self.sector_offset = 0;
-        self.sector_valid = (self.payload_len - self.read).min(self.sector_size);
+            .read_sectors(self.slot_base + 1 + self.sector_index, &mut self.batch[..bytes])?;
+        self.sector_index += sectors as u64;
+        self.batch_offset = 0;
+        self.batch_valid = remaining.min(bytes);
         Ok(())
     }
 
@@ -1459,14 +1466,14 @@ impl<D: SnapshotBlockDevice> SnapshotPayloadReader for PayloadSectorReader<'_, D
             return Err(SnapshotBlockStoreError::Corrupt);
         }
         while !out.is_empty() {
-            if self.sector_offset == self.sector_valid {
-                self.fill_sector()?;
+            if self.batch_offset == self.batch_valid {
+                self.fill_batch()?;
             }
-            let copy = out.len().min(self.sector_valid - self.sector_offset);
-            let bytes = &self.sector[self.sector_offset..self.sector_offset + copy];
+            let copy = out.len().min(self.batch_valid - self.batch_offset);
+            let bytes = &self.batch[self.batch_offset..self.batch_offset + copy];
             self.crc.update(bytes);
             out[..copy].copy_from_slice(bytes);
-            self.sector_offset += copy;
+            self.batch_offset += copy;
             self.read += copy;
             out = &mut out[copy..];
         }
