@@ -114,14 +114,47 @@ pub fn copy_pnp_required_device_text_x64(bytes: &[u8]) -> Result<Vec<u8>, BusPro
 
 /// An immutable bus-owned boot resource assignment that needs no HAL translation.
 ///
-/// A PCI root bridge reported by ACPI has one `CmResourceTypeBusNumber` boot descriptor and no
-/// resource requirements. NT preserves that descriptor byte-for-byte in both raw and translated
-/// START_DEVICE lists. Keeping this policy beside `PdoProperties` prevents a function driver from
-/// replacing the bus PDO's already-published resource authority.
+/// Some bus PDOs report one `CmResourceTypeBusNumber` boot descriptor and no resource
+/// requirements. NT preserves that descriptor byte-for-byte in both raw and translated
+/// START_DEVICE lists. PDOs with additional resources or present requirements use a separate
+/// checked assignment path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BusReportedBusNumberStart {
     pub raw_resources: Vec<u8>,
     pub translated_resources: Vec<u8>,
+}
+
+/// Exact bus-owned current resources and possible-resource requirements. The boot list is an
+/// assignment reported by the bus; the requirements still need checked admission before START.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BusReportedResourceSnapshot {
+    pub raw_resources: Vec<u8>,
+    pub resource_requirements: Vec<u8>,
+}
+
+/// Retain a complete resource pair from an accepted bus PDO without replacing it with a
+/// synthetic no-resource plan. One-sided and unqueried pairs cannot authorize START.
+pub fn prepare_bus_reported_resource_snapshot(
+    properties: &crate::PdoProperties,
+) -> Result<Option<BusReportedResourceSnapshot>, BusPropertyCopyError> {
+    use crate::PropertyBlobState::{KnownNone, Present, Unqueried};
+    match (
+        &properties.boot_resources_raw,
+        &properties.boot_resources_translated,
+        &properties.resource_requirements,
+    ) {
+        (Unqueried, _, _) | (_, Unqueried, _) | (_, _, Unqueried) => {
+            Err(BusPropertyCopyError::Malformed)
+        }
+        (KnownNone, KnownNone, KnownNone) | (Present(_), KnownNone, KnownNone) => Ok(None),
+        (Present(raw), KnownNone, Present(requirements)) => Ok(Some(
+            BusReportedResourceSnapshot {
+                raw_resources: copy_cm_resource_list(raw)?,
+                resource_requirements: copy_io_resource_requirements_list(requirements)?,
+            },
+        )),
+        _ => Err(BusPropertyCopyError::Malformed),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -501,6 +534,64 @@ mod tests {
             crate::PropertyBlobState::Present(vec![1]),
         );
         assert_eq!(prepare_bus_reported_bus_number_start(&arbitrated), Ok(None));
+    }
+
+    #[test]
+    fn bus_owned_multi_resource_snapshot_preserves_raw_and_requirements() {
+        let mut raw_storage = [0u8; 96];
+        let raw_len = build_memory_interrupt_list(
+            &mut raw_storage,
+            INTERFACE_TYPE_PCI_BUS,
+            0,
+            MemoryDescriptor {
+                start: 0x1000,
+                length: 0x1000,
+                flags: 0,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            },
+            InterruptDescriptor {
+                level: 5,
+                vector: 5,
+                affinity: 1,
+                flags: 0,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            },
+        )
+        .unwrap();
+        let requirement = [IoResourceRequirement::Memory(IoAddressRequirement {
+            option: IO_RESOURCE_REQUIRED,
+            share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            flags: 0,
+            length: 0x1000,
+            alignment: 0x1000,
+            minimum: 0x1000,
+            maximum: 0x1fff,
+        })];
+        let mut req_storage = [0u8; 96];
+        let req_len = build_io_resource_requirements_list(
+            &mut req_storage,
+            INTERFACE_TYPE_PCI_BUS,
+            0,
+            0,
+            &requirement,
+        )
+        .unwrap();
+        let raw = raw_storage[..raw_len].to_vec();
+        let requirements = req_storage[..req_len].to_vec();
+        let properties = bus_properties(
+            crate::PropertyBlobState::Present(raw.clone()),
+            crate::PropertyBlobState::KnownNone,
+            crate::PropertyBlobState::Present(requirements.clone()),
+        );
+
+        // This is an accepted bus PDO with real requirements. A no-resource plan would pass
+        // `None`/`None` to native property validation and reject both provider-owned blobs.
+        let snapshot = prepare_bus_reported_resource_snapshot(&properties)
+            .unwrap()
+            .expect("present bus-owned resources");
+        assert_eq!(snapshot.raw_resources, raw);
+        assert_eq!(snapshot.resource_requirements, requirements);
+        assert_eq!(prepare_bus_reported_bus_number_start(&properties), Ok(None));
     }
 
     #[test]

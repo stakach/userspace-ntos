@@ -58,6 +58,7 @@ pub const CM_RESOURCE_PORT_MEMORY: u16 = 0;
 pub const CM_RESOURCE_PORT_IO: u16 = 1;
 pub const CM_RESOURCE_PORT_16_BIT_DECODE: u16 = 0x0010;
 pub const CM_RESOURCE_PORT_POSITIVE_DECODE: u16 = 0x0020;
+pub const CM_RESOURCE_PORT_WINDOW_DECODE: u16 = 0x0080;
 pub const CM_RESOURCE_PORT_BAR: u16 = 0x0100;
 
 /// `ShareDisposition` values.
@@ -571,13 +572,45 @@ pub struct InterruptDescriptor {
     pub share: u8,
 }
 
+/// A bus-owned bus-number interval in a native partial resource list.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BusNumberDescriptor {
+    pub start: u32,
+    pub length: u32,
+    pub flags: u16,
+    pub share: u8,
+}
+
+/// Native scaled large-memory window (`CmResourceTypeMemoryLarge`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MemoryLargeDescriptor {
+    pub start: u64,
+    pub length: u64,
+    pub flags: u16,
+    pub share: u8,
+}
+
+fn memory_large_shift(flags: u16) -> Option<u32> {
+    match flags & 0x0e00 {
+        0x0200 => Some(8),
+        0x0400 => Some(16),
+        0x0800 => Some(32),
+        _ => None,
+    }
+}
+
 /// One native `CM_PARTIAL_RESOURCE_DESCRIPTOR` supported by the generic encoder.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CmResourceDescriptor {
     Memory(MemoryDescriptor),
     Port(PortDescriptor),
     Interrupt(InterruptDescriptor),
+    BusNumber(BusNumberDescriptor),
+    MemoryLarge(MemoryLargeDescriptor),
 }
+
+mod bus_owned_root;
+pub use bus_owned_root::{admit_bus_owned_root_resources, BusOwnedRootResourceError};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum IoResourceAssignmentError {
@@ -627,7 +660,37 @@ fn io_requirement_matches_candidate(
                 && candidate.flags == flags
                 && candidate.share == bytes[descriptor + 2])
         }
-        (CM_RESOURCE_TYPE_MEMORY | CM_RESOURCE_TYPE_PORT | CM_RESOURCE_TYPE_INTERRUPT, _) => {
+        (CM_RESOURCE_TYPE_BUS_NUMBER, CmResourceDescriptor::BusNumber(candidate)) => {
+            let length = read_u32(bytes, descriptor + 8).map_err(IoResourceAssignmentError::Malformed)?;
+            let minimum = read_u32(bytes, descriptor + 12).map_err(IoResourceAssignmentError::Malformed)?;
+            let maximum = read_u32(bytes, descriptor + 16).map_err(IoResourceAssignmentError::Malformed)?;
+            let flags = u16::from_le_bytes([bytes[descriptor + 4], bytes[descriptor + 5]]);
+            let end = candidate.start.checked_add(candidate.length.saturating_sub(1));
+            Ok(length != 0 && candidate.length == length && candidate.start >= minimum
+                && end.is_some_and(|end| end <= maximum) && candidate.flags == flags
+                && candidate.share == bytes[descriptor + 2])
+        }
+        (CM_RESOURCE_TYPE_MEMORY_LARGE, CmResourceDescriptor::MemoryLarge(candidate)) => {
+            let flags = u16::from_le_bytes([bytes[descriptor + 4], bytes[descriptor + 5]]);
+            let shift = memory_large_shift(flags)
+                .ok_or(IoResourceAssignmentError::UnsupportedDescriptor)?;
+            let length = u64::from(read_u32(bytes, descriptor + 8)
+                .map_err(IoResourceAssignmentError::Malformed)?) << shift;
+            let scaled_alignment = u64::from(read_u32(bytes, descriptor + 12)
+                .map_err(IoResourceAssignmentError::Malformed)?);
+            let alignment = if scaled_alignment == 0 { 1 } else { scaled_alignment << shift };
+            let minimum = read_u64(bytes, descriptor + 16)
+                .map_err(IoResourceAssignmentError::Malformed)?;
+            let maximum = read_u64(bytes, descriptor + 24)
+                .map_err(IoResourceAssignmentError::Malformed)?;
+            Ok(length != 0 && candidate.length == length && candidate.start >= minimum
+                && candidate.start % alignment == 0
+                && candidate.start.checked_add(length - 1)
+                    .is_some_and(|end| end <= maximum)
+                && candidate.flags == flags && candidate.share == bytes[descriptor + 2])
+        }
+        (CM_RESOURCE_TYPE_MEMORY | CM_RESOURCE_TYPE_PORT | CM_RESOURCE_TYPE_INTERRUPT
+            | CM_RESOURCE_TYPE_BUS_NUMBER | CM_RESOURCE_TYPE_MEMORY_LARGE, _) => {
             Ok(false)
         }
         _ => Err(IoResourceAssignmentError::UnsupportedDescriptor),
@@ -656,13 +719,19 @@ fn io_address_requirement_matches(
     } else {
         CM_RESOURCE_PORT_BAR
     };
+    // ACPI current resources can add WINDOW_DECODE to the raw root-port assignment while
+    // the matching possible-resource descriptor retains its decode flags without that bit.
+    // Keep the provider's raw flag; this comparison only admits its added metadata.
+    let port_window_metadata = bytes[descriptor + 1] == CM_RESOURCE_TYPE_PORT
+        && candidate_flags & CM_RESOURCE_PORT_WINDOW_DECODE != 0
+        && candidate_flags & !CM_RESOURCE_PORT_WINDOW_DECODE == flags;
     Ok(length != 0
         && alignment != 0
         && maximum >= minimum
         && candidate_length == length
         && candidate_start >= minimum
         && candidate_start % alignment as u64 == 0
-        && (candidate_flags == flags
+        && (candidate_flags == flags || port_window_metadata
             || (candidate_flags & marker != 0 && candidate_flags & !marker == flags))
         && candidate_share == bytes[descriptor + 2]
         && end.is_some_and(|end| end <= maximum))
@@ -710,6 +779,38 @@ fn validate_io_requirement_descriptor(
                 || affinity_policy != 0
                 || priority_policy != 0
                 || targeted_processors != 0
+            {
+                return Err(IoResourceAssignmentError::UnsupportedDescriptor);
+            }
+        }
+        CM_RESOURCE_TYPE_BUS_NUMBER => {
+            let length = read_u32(bytes, descriptor + 8).map_err(IoResourceAssignmentError::Malformed)?;
+            let minimum = read_u32(bytes, descriptor + 12).map_err(IoResourceAssignmentError::Malformed)?;
+            let maximum = read_u32(bytes, descriptor + 16).map_err(IoResourceAssignmentError::Malformed)?;
+            if length == 0 || minimum > maximum
+                || u64::from(maximum) - u64::from(minimum) + 1 < u64::from(length)
+                || read_u32(bytes, descriptor + 20).map_err(IoResourceAssignmentError::Malformed)? != 0
+                || read_u64(bytes, descriptor + 24).map_err(IoResourceAssignmentError::Malformed)? != 0
+            {
+                return Err(IoResourceAssignmentError::UnsupportedDescriptor);
+            }
+        }
+        CM_RESOURCE_TYPE_MEMORY_LARGE => {
+            let flags = u16::from_le_bytes([bytes[descriptor + 4], bytes[descriptor + 5]]);
+            let shift = memory_large_shift(flags)
+                .ok_or(IoResourceAssignmentError::UnsupportedDescriptor)?;
+            let length = u64::from(read_u32(bytes, descriptor + 8)
+                .map_err(IoResourceAssignmentError::Malformed)?) << shift;
+            let scaled_alignment = u64::from(read_u32(bytes, descriptor + 12)
+                .map_err(IoResourceAssignmentError::Malformed)?);
+            let alignment = if scaled_alignment == 0 { 1 } else { scaled_alignment << shift };
+            let minimum = read_u64(bytes, descriptor + 16)
+                .map_err(IoResourceAssignmentError::Malformed)?;
+            let maximum = read_u64(bytes, descriptor + 24)
+                .map_err(IoResourceAssignmentError::Malformed)?;
+            if length == 0 || maximum < minimum || alignment == 0
+                || maximum.checked_sub(minimum).and_then(|span| span.checked_add(1))
+                    .is_none_or(|span| span < length)
             {
                 return Err(IoResourceAssignmentError::UnsupportedDescriptor);
             }
@@ -972,6 +1073,17 @@ pub fn build_cm_resource_list(
             // IRQ/vector zero is a valid raw bus interrupt. There is no empty interrupt
             // descriptor encoding analogous to a zero-length address descriptor.
             CmResourceDescriptor::Interrupt(_) => true,
+            CmResourceDescriptor::BusNumber(bus) => {
+                bus.length != 0 && bus.start.checked_add(bus.length - 1).is_some()
+            }
+            CmResourceDescriptor::MemoryLarge(memory) => {
+                memory_large_shift(memory.flags).is_some_and(|shift| {
+                    memory.length != 0
+                        && memory.length & ((1u64 << shift) - 1) == 0
+                        && memory.length >> shift <= u64::from(u32::MAX)
+                        && memory.start.checked_add(memory.length - 1).is_some()
+                })
+            }
         };
         if !valid {
             return Err(CmResourceListError::InvalidDescriptor);
@@ -997,6 +1109,23 @@ pub fn build_cm_resource_list(
             CmResourceDescriptor::Port(port) => write_port_descriptor(buf, offset, port),
             CmResourceDescriptor::Interrupt(interrupt) => {
                 write_interrupt_descriptor(buf, offset, interrupt)
+            }
+            CmResourceDescriptor::BusNumber(bus) => {
+                buf[offset] = CM_RESOURCE_TYPE_BUS_NUMBER;
+                buf[offset + 1] = bus.share;
+                w16(buf, offset + 2, bus.flags);
+                w32(buf, offset + 4, bus.start);
+                w32(buf, offset + 8, bus.length);
+                w32(buf, offset + 12, 0);
+            }
+            CmResourceDescriptor::MemoryLarge(memory) => {
+                let shift = memory_large_shift(memory.flags)
+                    .ok_or(CmResourceListError::InvalidDescriptor)?;
+                buf[offset] = CM_RESOURCE_TYPE_MEMORY_LARGE;
+                buf[offset + 1] = memory.share;
+                w16(buf, offset + 2, memory.flags);
+                w64(buf, offset + 4, memory.start);
+                w32(buf, offset + 12, (memory.length >> shift) as u32);
             }
         }
     }
