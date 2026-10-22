@@ -3562,6 +3562,40 @@ unsafe fn component_pump_loop(
             };
             pump_reply_recv4_into!(ch, *reply_cap, msg, 4, status as u32 as u64, 0, 0, 0);
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PCI_IPI_PREFLIGHT_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, base, len, count) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_PCI_IPI_PREFLIGHT_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+                && msg.m1 == 0 && msg.m2 == 0 && msg.m3 == 0
+            {
+                crate::driver_launch::hosted_driver_pci_kernel::ipi_preflight(
+                    ch, msg.m0, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0, 0, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 4,
+                status as u32 as u64, base, len, count);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_HAL_PCI_ROUTED_INTERRUPT_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (found, gsi) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_HAL_PCI_ROUTED_INTERRUPT_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::driver_launch::hosted_driver_hal_pci::service_routed_interrupt(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                (0, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 4, found, gsi, 0, 0);
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_DIRECTORY_OBJECT_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
@@ -4399,6 +4433,7 @@ unsafe fn component_pump_loop(
             || label == crate::driver_launch::FSD_SERVICE_FLUSH_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_QUERY_INFORMATION_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_LOWER_PNP_FORWARD_LABEL
+            || label == crate::driver_launch::FSD_SERVICE_LOWER_POWER_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_LOWER_FILE_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_CONNECT_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_HOOK_FORWARD_LABEL)
@@ -4431,6 +4466,10 @@ unsafe fn component_pump_loop(
                         )
                     } else if label == crate::driver_launch::FSD_SERVICE_LOWER_PNP_FORWARD_LABEL {
                         crate::driver_launch::service_hosted_lower_pnp_forward(
+                            ch, *reply_cap, msg.badge, msg.m0, msg.m1, msg.m2,
+                        )
+                    } else if label == crate::driver_launch::FSD_SERVICE_LOWER_POWER_FORWARD_LABEL {
+                        crate::driver_launch::service_hosted_lower_power_forward(
                             ch, *reply_cap, msg.badge, msg.m0, msg.m1, msg.m2,
                         )
                     } else if label == crate::driver_launch::FSD_SERVICE_LOWER_FILE_FORWARD_LABEL {

@@ -389,7 +389,7 @@ pub enum IoParameters {
     NotifyDirectory(DirectoryNotifyParameters),
     LockControl(LockControlParameters),
     Pnp(PnpParameters),
-    Power,
+    Power(crate::power_irp_request::PowerParameters),
     #[default]
     Unsupported,
 }

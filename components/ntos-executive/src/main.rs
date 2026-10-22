@@ -13996,6 +13996,26 @@ unsafe fn grant_hosted_devnode_resources(
                 dma_len: 0,
             }))
         }
+        PreparedHostedResourcePlan::BusOwnedRoot { resources } => {
+            driver_launch::validate_hosted_bus_owned_root_provider(&resources)?;
+            if !filtered_resource_requirements.is_empty()
+                && filtered_resource_requirements != resources.snapshot.resource_requirements
+            {
+                // A filter-modified list requires a new checked assignment decision.
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
+            Ok(Some(HostedDevnodeGrant {
+                kind: HostedDevnodeGrantKind::RootBus,
+                raw_resource_list: resources.snapshot.raw_resources,
+                translated_resource_list: resources.translated_resources,
+                mmio_phys: 0,
+                mmio_len: 0,
+                io_port_base: 0,
+                io_port_len: 0,
+                vector: 0,
+                dma_len: 0,
+            }))
+        }
         PreparedHostedResourcePlan::Pci {
             bus_resources,
             window,

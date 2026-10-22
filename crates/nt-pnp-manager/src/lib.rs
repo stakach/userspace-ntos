@@ -11,6 +11,7 @@
 extern crate alloc;
 
 mod accepted_pdo_filter_edge;
+mod accepted_pdo_direct_filter_edge;
 mod accepted_pdo_pnp;
 mod accepted_pdo_provider;
 mod bus_properties;
@@ -30,6 +31,7 @@ mod target_device_relation;
 mod upper_filter_attachment;
 
 pub use accepted_pdo_filter_edge::*;
+pub use accepted_pdo_direct_filter_edge::*;
 pub use accepted_pdo_pnp::*;
 pub use accepted_pdo_provider::*;
 pub use bus_properties::*;

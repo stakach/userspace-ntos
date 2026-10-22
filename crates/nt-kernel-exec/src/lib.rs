@@ -44,6 +44,8 @@ pub mod np_prefix;
 pub mod provider_pool;
 pub mod provider_kernel_alias;
 pub mod process_attach;
+pub mod processor_topology;
+pub mod ipi_broadcast;
 pub mod push_lock;
 pub mod provider_bugcheck;
 pub mod queued_spin_lock;

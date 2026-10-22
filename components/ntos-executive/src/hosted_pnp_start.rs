@@ -1339,6 +1339,9 @@ pub(crate) enum PreparedHostedResourcePlan {
     BusReportedBusNumber {
         resources: nt_pnp_manager::BusReportedBusNumberStart,
     },
+    BusOwnedRoot {
+        resources: driver_launch::HostedBusOwnedRootResources,
+    },
     Pci {
         bus_resources: DevnodePciBusResources,
         accepted_properties: Option<(Vec<u8>, Vec<u8>)>,
@@ -1367,6 +1370,10 @@ impl PreparedHostedResourcePlan {
     fn native_property_blobs(&self) -> (Option<&[u8]>, Option<&[u8]>) {
         match self {
             Self::BusReportedBusNumber { resources } => (Some(&resources.raw_resources), None),
+            Self::BusOwnedRoot { resources } => (
+                Some(&resources.snapshot.raw_resources),
+                Some(&resources.snapshot.resource_requirements),
+            ),
             Self::Pci { bus_resources, accepted_properties, .. } => accepted_properties
                 .as_ref()
                 .map(|(raw, requirements)| (Some(raw.as_slice()), Some(requirements.as_slice())))
@@ -1390,7 +1397,8 @@ impl PreparedHostedResourcePlan {
         let lease = match self {
             Self::Pci { lease, .. } | Self::Platform { lease, .. }
             | Self::AcpiChild { lease, .. } => lease,
-            Self::BusReportedBusNumber { .. } | Self::AcpiChildNoResources { .. }
+            Self::BusReportedBusNumber { .. } | Self::BusOwnedRoot { .. }
+            | Self::AcpiChildNoResources { .. }
             | Self::None => return Ok(()),
         };
         release_hosted_pnp_context_lease(lease.into_identity())
@@ -1405,7 +1413,8 @@ impl PreparedHostedResourcePlan {
                     &bus_resources.device,
                 )
             }
-            Self::BusReportedBusNumber { .. } | Self::Platform { .. }
+            Self::BusReportedBusNumber { .. } | Self::BusOwnedRoot { .. }
+            | Self::Platform { .. }
             | Self::AcpiChild { .. } | Self::AcpiChildNoResources { .. }
             | Self::None => {
                 crate::hosted_pci_topology::HostedPciInterruptRouteAdmission::Current
@@ -1495,6 +1504,22 @@ where
 
     let lease = acquire_hosted_pnp_context_lease()?;
     if let Some(pdo) = bus_pdo {
+        match driver_launch::hosted_accepted_bus_owned_root_resources(instance_id, pdo) {
+            Ok(Some(resources)) => {
+                release_hosted_pnp_context_lease(lease.into_identity())?;
+                return Ok(PreparedHostedDevnode {
+                    pdo_description: None,
+                    resource_plan: PreparedHostedResourcePlan::BusOwnedRoot { resources },
+                });
+            }
+            Ok(None) => {}
+            Err(status) => {
+                driver_launch::trace_hosted_bus_resource_refusal(
+                    b"bus-owned-root", instance_id, pdo, status,
+                );
+                return Err(release_context_lease_after_error(lease, status));
+            }
+        }
         let accepted = match driver_launch::hosted_accepted_acpi_child_resources(instance_id, pdo) {
             Ok(accepted) => accepted,
             Err(status) => {

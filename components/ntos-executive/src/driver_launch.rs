@@ -280,6 +280,12 @@ mod hosted_driver_process_bitness;
 mod hosted_driver_rtl_integer;
 #[path = "hosted_driver_queued_spin_lock.rs"]
 mod hosted_driver_queued_spin_lock;
+#[path = "hosted_driver_remove_lock.rs"]
+mod hosted_driver_remove_lock;
+#[path = "hosted_driver_pci_kernel.rs"]
+pub(crate) mod hosted_driver_pci_kernel;
+#[path = "hosted_driver_range_list.rs"]
+mod hosted_driver_range_list;
 #[path = "hosted_driver_crt_memchr.rs"]
 mod hosted_driver_crt_memchr;
 #[path = "hosted_driver_crt_strchr.rs"]
@@ -328,6 +334,13 @@ pub(crate) const FSD_SERVICE_PCI_ROOT_LABEL: u64 = hosted_driver_pci_root::LABEL
 #[path = "hosted_driver_pci_route_query.rs"]
 pub(crate) mod hosted_driver_pci_route_query;
 pub(crate) const FSD_SERVICE_PCI_ROUTE_QUERY_LABEL: u64 = hosted_driver_pci_route_query::LABEL;
+pub(crate) const FSD_SERVICE_PCI_IPI_PREFLIGHT_LABEL: u64 = hosted_driver_pci_kernel::IPI_PREFLIGHT_LABEL;
+#[path = "hosted_driver_hal_pci.rs"]
+pub(crate) mod hosted_driver_hal_pci;
+#[path = "hosted_driver_power_irp.rs"]
+mod hosted_driver_power_irp;
+pub(crate) const FSD_SERVICE_HAL_PCI_ROUTED_INTERRUPT_LABEL: u64 =
+    hosted_driver_hal_pci::ROUTED_INTERRUPT_LABEL;
 #[path = "hosted_driver_contiguous_memory.rs"]
 mod hosted_driver_contiguous_memory;
 #[path = "hosted_contiguous_ram_broker.rs"]
@@ -388,6 +401,12 @@ mod hosted_video_memory_mapping;
 mod hosted_kernel_win32k_source_pnp;
 #[path = "hosted_lower_pnp_capture.rs"]
 mod hosted_lower_pnp_capture;
+#[path = "hosted_source_irp_stack.rs"]
+mod hosted_source_irp_stack;
+#[path = "hosted_lower_power_capture.rs"]
+mod hosted_lower_power_capture;
+#[path = "hosted_lower_power_work.rs"]
+mod hosted_lower_power_work;
 #[path = "hosted_lower_file_capture.rs"]
 mod hosted_lower_file_capture;
 #[path = "hosted_lower_file_work.rs"]
@@ -404,6 +423,8 @@ mod hosted_start_fdo_capture;
 mod hosted_start_fdo_work;
 #[path = "hosted_accepted_pdo_filter_edge.rs"]
 mod hosted_accepted_pdo_filter_edge;
+#[path = "hosted_accepted_pdo_direct_filter_edge.rs"]
+mod hosted_accepted_pdo_direct_filter_edge;
 #[path = "hosted_kernel_win32k_source_fsd.rs"]
 mod hosted_kernel_win32k_source_fsd;
 #[path = "hosted_kernel_win32k_source_admission.rs"]
@@ -651,6 +672,7 @@ const FSD_DATA_MM_SYSTEM_RANGE_START_OFF: u64 = 0x200;
 const FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_OFF: u64 = 0x208;
 const FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_OFF: u64 = 0x210;
 const FSD_DATA_KD_DEBUGGER_NOT_PRESENT_OFF: u64 = 0x218;
+const FSD_DATA_KE_NUMBER_PROCESSORS_OFF: u64 = 0x220;
 const FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_OFF: u64 = 0x300;
 const FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_OFF: u64 = 0x340;
 const FSD_DATA_SE_EXPORTS_CELL_OFF: u64 = 0x400;
@@ -691,6 +713,8 @@ const FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_OFF;
 const FSD_DATA_KD_DEBUGGER_NOT_PRESENT_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_KD_DEBUGGER_NOT_PRESENT_OFF;
+const FSD_DATA_KE_NUMBER_PROCESSORS_VA: u64 =
+    FSD_DATA_VADDR + FSD_DATA_KE_NUMBER_PROCESSORS_OFF;
 const FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_OFF;
 const FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_VA: u64 =
@@ -1192,6 +1216,7 @@ pub const FSD_SERVICE_LOWER_PNP_FORWARD_LABEL: u64 = 0x7A6;
 pub const FSD_SERVICE_CONNECT_FORWARD_LABEL: u64 = 0x7A7;
 pub const FSD_SERVICE_HOOK_FORWARD_LABEL: u64 = 0x7A8;
 pub const FSD_SERVICE_LOWER_FILE_FORWARD_LABEL: u64 = 0x7A9;
+pub const FSD_SERVICE_LOWER_POWER_FORWARD_LABEL: u64 = 0x7D9;
 pub const FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL: u64 = 0x7AA;
 pub const FSD_SERVICE_REMOVE_DPC_LABEL: u64 = 0x7BA;
 pub const FSD_SERVICE_ZW_UNLOAD_DRIVER_LABEL: u64 = 0x7BB;
@@ -1237,6 +1262,7 @@ const _: () = {
         FSD_SERVICE_CONNECT_FORWARD_LABEL,
         FSD_SERVICE_HOOK_FORWARD_LABEL,
         FSD_SERVICE_LOWER_FILE_FORWARD_LABEL,
+        FSD_SERVICE_LOWER_POWER_FORWARD_LABEL,
         FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL,
         FSD_SERVICE_REMOVE_DPC_LABEL,
         FSD_SERVICE_ZW_UNLOAD_DRIVER_LABEL,
@@ -1265,6 +1291,8 @@ const _: () = {
         FSD_SERVICE_KMUTEX_LABEL,
         FSD_SERVICE_PCI_ROOT_LABEL,
         FSD_SERVICE_PCI_ROUTE_QUERY_LABEL,
+        FSD_SERVICE_PCI_IPI_PREFLIGHT_LABEL,
+        FSD_SERVICE_HAL_PCI_ROUTED_INTERRUPT_LABEL,
     ];
     let mut i = 0;
     while i < labels.len() {
@@ -5339,7 +5367,6 @@ const SID_HEADER_BYTES: usize = 8;
 const SID_MAX_SUB_AUTHORITIES: usize = 15;
 const VALID_INHERIT_FLAGS: u64 = 0x1F;
 
-static mut KE_NUMBER_PROCESSORS_VALUE: u8 = 1;
 
 unsafe fn initialize_hosted_loader_block(exec_data_va: u64) {
     let cell = exec_data_va + FSD_DATA_KE_LOADER_BLOCK_CELL_OFF;
@@ -5455,6 +5482,13 @@ unsafe fn initialize_hosted_driver_data_exports(exec_data_va: u64) {
         kd_debugger_not_present as *mut u8,
         u8::from(!hosted_kd_debug::kernel_debugger_connected()),
     );
+    let processor_count = nt_kernel_exec::processor_topology::active_processor_count(
+        crate::SYSTEM_PROCESSOR_COUNT.load(Ordering::Acquire),
+    );
+    write_volatile(
+        (exec_data_va + FSD_DATA_KE_NUMBER_PROCESSORS_OFF) as *mut u8,
+        processor_count as u8,
+    );
 
     let se_exports_cell = exec_data_va + FSD_DATA_SE_EXPORTS_CELL_OFF;
     let se_exports_struct = exec_data_va + FSD_DATA_SE_EXPORTS_STRUCT_OFF;
@@ -5483,6 +5517,7 @@ fn fsd_data_export_addr(name: &str) -> Option<u64> {
         "HalPrivateDispatchTable" => FSD_DATA_HAL_PRIVATE_DISPATCH_VA,
         "MmSystemRangeStart" => FSD_DATA_MM_SYSTEM_RANGE_START_VA,
         "KdDebuggerNotPresent" => FSD_DATA_KD_DEBUGGER_NOT_PRESENT_VA,
+        "KeNumberProcessors" => FSD_DATA_KE_NUMBER_PROCESSORS_VA,
         "IoFileObjectType" => FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_VA,
         "ExEventObjectType" => FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_VA,
         "PsInitialSystemProcess" => hosted_driver_process_state::INITIAL_SYSTEM_PROCESS_CELL_VA,
@@ -9467,6 +9502,44 @@ unsafe fn forward_hosted_internal_control(
     status as u32 as i32
 }
 
+/// Foreign POWER dispatch retains the source IRP until its exact provider terminal and local
+/// completion callback both finish. The source adapter may defer an IoFreeIrp while pinned.
+unsafe fn forward_hosted_power(
+    device: u64, irp: u64, next: u64, previous_location: u8,
+) -> i32 {
+    // IoCallDriver publishes the exact target before the source-domain broker captures the
+    // forwarded stack. The current-location cursor advances only after accepted entry.
+    write_unaligned((next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64, device);
+    let (label, status, accepted, token, _) = call_on4(
+        (FSD_SERVICE_LOWER_POWER_FORWARD_LABEL << 12) | 4,
+        1, device, irp, 0,
+    );
+    if label != 0 || accepted > 1 || (accepted != 0 && token == 0) {
+        crate::provider_bugcheck::report(0xc4,
+            [FSD_SERVICE_LOWER_POWER_FORWARD_LABEL, 1, irp, label]);
+    }
+    if accepted == 0 { return status as u32 as i32; }
+    write_unaligned((irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
+        previous_location - 1);
+    write_unaligned((irp + 0xb8) as *mut u64, next);
+    // The provider terminal has already been copied into the pinned source packet. The
+    // callback may call IoFreeIrp; the service retains its source pin until the second ACK.
+    let _completion = complete_hosted_irp_with_owner(irp);
+    if !hosted_lower_power_work::mark_native_completion(irp, token) {
+        crate::provider_bugcheck::report(0xc4,
+            [FSD_SERVICE_LOWER_POWER_FORWARD_LABEL, 3, irp, token]);
+    }
+    let (ack_label, ack_status, _, _, _) = call_on4(
+        (FSD_SERVICE_LOWER_POWER_FORWARD_LABEL << 12) | 4,
+        2, irp, token, 0,
+    );
+    if ack_label != 0 || ack_status as u32 as i32 != STATUS_SUCCESS {
+        crate::provider_bugcheck::report(0xc4,
+            [FSD_SERVICE_LOWER_POWER_FORWARD_LABEL, 2, irp, ack_status]);
+    }
+    status as u32 as i32
+}
+
 /// `NTSTATUS IofCallDriver(PDEVICE_OBJECT, PIRP)`.
 extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
     unsafe {
@@ -9498,6 +9571,9 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                     as *const u64,
             );
             if handler == 0 {
+                if major == major::IRP_MJ_POWER as u64 {
+                    return forward_hosted_power(device, irp, next, previous_location);
+                }
                 if major == major::IRP_MJ_INTERNAL_DEVICE_CONTROL as u64 {
                     let control = read_unaligned(next as *const nt_kernel_abi::IoStackLocation)
                         .device_io_control()
@@ -9774,6 +9850,9 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                 crate::provider_bugcheck::report(0xc4, [forward_label, 2, irp, ack_status]);
             }
             return status as u32 as i32;
+        }
+        if major == major::IRP_MJ_POWER as u64 {
+            return forward_hosted_power(device, irp, next, previous_location);
         }
         if major != IRP_MJ_PNP {
             return nt_status::NtStatus::INVALID_DEVICE_REQUEST.raw();
@@ -34571,6 +34650,9 @@ fn register_fsd_trampolines() -> bool {
     bind_kd_debug_export(reg);
     reg.bind("RtlAssert", crate::hosted_driver_assertion::rtl_assert as usize as u64);
     crate::ex_rundown_exports::bind_ex_rundown_exports(reg);
+    hosted_driver_remove_lock::bind_remove_lock_exports(reg);
+    hosted_driver_pci_kernel::bind_pci_kernel_exports(reg);
+    hosted_driver_range_list::bind_range_list_exports(reg);
     // pool (ExAllocatePool* → the FSD arena)
     reg.bind(
         "ExAllocatePoolWithTag",
@@ -34929,6 +35011,7 @@ fn register_fsd_trampolines() -> bool {
         "PoCallDriver",
         s_po_call_driver as *const () as usize as u64,
     );
+    hosted_driver_power_irp::bind_power_irp_export(reg);
     reg.bind(
         "PoStartNextPowerIrp",
         s_po_start_next_power_irp as *const () as usize as u64,
@@ -35307,6 +35390,7 @@ fn register_fsd_trampolines() -> bool {
         "HalGetInterruptTargetInformation",
         hosted_driver_hal_target_info::hal_get_interrupt_target_information as *const () as usize as u64,
     );
+    hosted_driver_hal_pci::bind_pci_hal_exports(reg);
     reg.bind(
         "HalGetMemoryCachingRequirements",
         hosted_driver_hal_cache::hal_get_memory_caching_requirements as *const () as usize as u64,
@@ -35689,10 +35773,6 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "KeReleaseInterruptSpinLock",
         s_ke_release_interrupt_spin_lock as *const () as usize as u64,
-    );
-    reg.bind(
-        "KeNumberProcessors",
-        core::ptr::addr_of!(KE_NUMBER_PROCESSORS_VALUE) as usize as u64,
     );
     reg.bind(
         "ExInitializeFastMutex",
@@ -37321,6 +37401,11 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                     major::IRP_MJ_CREATE | major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE)))
         || !nt_io_abi::valid_create_case_sensitive(request.major, request.create_case_sensitive)
         || !nt_io_abi::valid_file_create_options(request.major, request.file_create_options)
+        || !nt_io_abi::power_dispatch::valid_power_dispatch(
+            request.major, request.minor, request.power_state_type,
+            request.power_state, request.power_system_context, request.power_shutdown_type,
+            request.input_len, request.output_len,
+        )
         || (request.major == major::IRP_MJ_QUERY_INFORMATION
             && request.buffer_len != request.output_len)
         || !nt_io_abi::valid_initial_information(
@@ -37972,6 +38057,20 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 input_buffer_length: inlen as u32,
                 io_control_code: fsctl as u32,
                 type3_input_buffer,
+            }
+        }
+        value if value == major::IRP_MJ_POWER as u64
+            && minor == nt_power_types::IRP_MN_WAIT_WAKE as u64 => {
+            WdmIoStackParameters::WaitWake { state: request.power_state }
+        }
+        value if value == major::IRP_MJ_POWER as u64
+            && (minor == nt_power_types::IRP_MN_SET_POWER as u64
+                || minor == nt_power_types::IRP_MN_QUERY_POWER as u64) => {
+            WdmIoStackParameters::Power {
+                system_context: request.power_system_context,
+                state_type: request.power_state_type,
+                state: request.power_state,
+                shutdown_type: request.power_shutdown_type,
             }
         }
         IRP_MJ_PNP if minor == IRP_MN_START_DEVICE => {
@@ -46511,6 +46610,98 @@ pub(crate) unsafe fn prepare_hosted_bus_pdo_bus_number_start(
     })
 }
 
+pub(crate) struct HostedBusOwnedRootResources {
+    pub snapshot: nt_pnp_manager::BusReportedResourceSnapshot,
+    pub translated_resources: Vec<u8>,
+    pub provider: nt_pnp_manager::AcceptedPdoProviderAuthority,
+    pub child: nt_pnp_manager::DevnodeIdentity,
+}
+
+/// Adopt a bus-number-bearing PDO's complete current resource assignment. The accepted parent
+/// provider and exact child generation are retained through native START preparation.
+pub(crate) unsafe fn hosted_accepted_bus_owned_root_resources(
+    instance_path: &str,
+    pdo_device_id: u64,
+) -> Result<Option<HostedBusOwnedRootResources>, nt_status::NtStatus> {
+    let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+    if hosted_bus_reported_device_id(instance_path) != Some(pdo_device_id) {
+        return Err(invalid);
+    }
+    let pnp = hosted_pnp_manager_mut();
+    let child = pnp.devnode_identity_for_pdo(pdo_device_id).ok_or(invalid)?;
+    if !pnp.instance_id(child.devnode_id())
+        .is_some_and(|name| name.eq_ignore_ascii_case(instance_path))
+    {
+        return Err(invalid);
+    }
+    let properties = pnp.enumerated_pdo_properties(pdo_device_id).ok_or(invalid)?;
+    let Some(information) = properties.bus_information.as_ref() else {
+        return Err(invalid);
+    };
+    if information.bus_type_guid != nt_pnp_manager::GUID_BUS_TYPE_PCI
+        || information.legacy_bus_type != nt_pnp_manager::INTERFACE_TYPE_PCI_BUS
+    {
+        return Ok(None);
+    }
+    let nt_pnp_manager::PropertyBlobState::Present(raw) = &properties.boot_resources_raw else {
+        return Ok(None);
+    };
+    // A PCI function's memory/interrupt list is handled by the function-resource path. A
+    // BusNumber partial descriptor marks a bus-owned range and must pass full validation.
+    let extent = nt_cm_resources::validate_cm_resource_list_extent(raw).map_err(|_| invalid)?;
+    if extent != raw.len()
+        || u32::from_le_bytes(raw.get(0..4).ok_or(invalid)?.try_into().unwrap()) != 1
+    {
+        return Err(invalid);
+    }
+    let count = u32::from_le_bytes(raw.get(16..20).ok_or(invalid)?.try_into().unwrap()) as usize;
+    if !(0..count).any(|index| raw[20 + index * nt_cm_resources::PARTIAL_DESCRIPTOR_SIZE]
+        == nt_cm_resources::CM_RESOURCE_TYPE_BUS_NUMBER)
+    {
+        return Ok(None);
+    }
+    nt_cm_resources::decode_pci_root_bus_number_resource(raw, information.bus_number)
+        .map_err(|_| invalid)?;
+    let snapshot = nt_pnp_manager::prepare_bus_reported_resource_snapshot(properties)
+        .map_err(|error| match error {
+            nt_pnp_manager::BusPropertyCopyError::InsufficientResources =>
+                nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+            _ => invalid,
+        })?
+        .ok_or(invalid)?;
+    let translated_resources = nt_cm_resources::admit_bus_owned_root_resources(
+        &snapshot.raw_resources,
+        &snapshot.resource_requirements,
+        information.bus_number,
+    ).map_err(|error| {
+        match error {
+            nt_cm_resources::BusOwnedRootResourceError::OutOfMemory =>
+                nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+            _ => invalid,
+        }
+    })?;
+    let provider = hosted_accepted_pdo_provider_catalog()
+        .resolve(
+            hosted_pnp_manager_mut(), hosted_bus_relations(), io_manager_mut(), pdo_device_id,
+        ).map_err(|_| invalid)?;
+    Ok(Some(HostedBusOwnedRootResources { snapshot, translated_resources, provider, child }))
+}
+
+pub(crate) unsafe fn validate_hosted_bus_owned_root_provider(
+    resources: &HostedBusOwnedRootResources,
+) -> Result<(), nt_status::NtStatus> {
+    let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+    let pdo = resources.child.pdo_object_id();
+    if hosted_pnp_manager_mut().devnode_identity_for_pdo(pdo) != Some(resources.child)
+        || hosted_accepted_pdo_provider_catalog().resolve(
+            hosted_pnp_manager_mut(), hosted_bus_relations(), io_manager_mut(), pdo,
+        ).map_err(|_| invalid)? != resources.provider
+    {
+        return Err(invalid);
+    }
+    Ok(())
+}
+
 pub(crate) unsafe fn hosted_bus_pdo_attach_admission(
     instance_path: &str,
     pdo_device_id: u64,
@@ -47635,6 +47826,22 @@ fn hosted_irp_dispatch_request(
             _ => 0,
         },
         initial_information,
+        power_state_type: match &irp.parameters {
+            IoParameters::Power(parameters) => parameters.state_type(),
+            _ => 0,
+        },
+        power_state: match &irp.parameters {
+            IoParameters::Power(parameters) => parameters.state(),
+            _ => 0,
+        },
+        power_system_context: match &irp.parameters {
+            IoParameters::Power(parameters) => parameters.system_context(),
+            _ => 0,
+        },
+        power_shutdown_type: match &irp.parameters {
+            IoParameters::Power(parameters) => parameters.shutdown_type(),
+            _ => 0,
+        },
         buffer_id: irp.buffer.map(|buffer| buffer.buffer_id).unwrap_or(0),
         buffer_len: u32::try_from(transfer_len)
             .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?,
@@ -47919,6 +48126,67 @@ impl DriverDispatchBackend for HostedDriverBackend {
         }
     }
 
+    fn dispatch_power_irp(
+        &mut self,
+        ctx: DispatchContext<'_>,
+        irp: &IrpProjection,
+    ) -> PnpBackendDispatch {
+        if irp.major != major::IRP_MJ_POWER
+            || irp.file_id.is_some()
+            || !ctx.system_buffer.is_empty()
+            || !matches!(&irp.parameters, IoParameters::Power(parameters)
+                if parameters.minor() == irp.minor)
+        {
+            return PnpBackendDispatch::NotDispatched {
+                status: nt_status::NtStatus::INVALID_PARAMETER,
+            };
+        }
+        let request = match hosted_irp_dispatch_request(self.instance, irp, 0, 0) {
+            Ok(request) => request,
+            Err(status) => return PnpBackendDispatch::NotDispatched { status },
+        };
+        let Some((route_instance, _, device_object)) =
+            hosted_driver_device_route_by_device_id(irp.device_id.raw())
+                .filter(|(instance, _, _)| *instance == self.instance)
+        else {
+            return PnpBackendDispatch::NotDispatched {
+                status: nt_status::NtStatus::INVALID_PARAMETER,
+            };
+        };
+        let caller = unsafe { crate::initial_system_driver_caller() };
+        let result = unsafe {
+            dispatch_irp_for_instance_exact(
+                route_instance,
+                irp.major as u64,
+                irp.minor as u64,
+                device_object,
+                irp.irp_id.raw(),
+                0,
+                0,
+                device_object,
+                irp.requestor_tid,
+                Some(request),
+                &[],
+                &mut [],
+                Some(caller),
+            )
+        };
+        match result {
+            None => PnpBackendDispatch::NotDispatched {
+                status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+            },
+            Some(HostedIrpTransportResult::NotDispatched { status }) =>
+                PnpBackendDispatch::NotDispatched { status },
+            Some(HostedIrpTransportResult::Returned {
+                status: nt_status::NtStatus::PENDING, ..
+            }) => PnpBackendDispatch::Pending,
+            Some(HostedIrpTransportResult::Returned { status, information, .. }) =>
+                PnpBackendDispatch::Returned { status, information },
+            Some(HostedIrpTransportResult::Indeterminate { transport_status }) =>
+                PnpBackendDispatch::Indeterminate { transport_status },
+        }
+    }
+
     fn cancel_irp(&mut self, irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
         let result = hosted_file_dispatch::control(
             self.instance, irp_id, FSD_DISPATCH_CANCEL_IRP, 0, &mut [],
@@ -48151,7 +48419,7 @@ fn external_irp_parameters(
                 output_len,
             },
         )),
-        major::IRP_MJ_POWER => Some(IoParameters::Power),
+        major::IRP_MJ_POWER => None,
         major::IRP_MJ_PNP => None,
         _ => Some(IoParameters::Unsupported),
     }
@@ -52513,10 +52781,28 @@ unsafe fn dispatch_hosted_filter_prepared(
     irp_id: IrpId,
     prepared: nt_io_manager::PreparedExternalPnpIrp,
 ) {
-    match io_manager_mut()
+    let direct = hosted_filter_requirements_transactions_mut().iter().any(|transaction| {
+        transaction.irp_id == irp_id
+            && transaction.video_provider_proof.is_some()
+            && io_manager_mut().irp(irp_id)
+                .and_then(|irp| irp.current_stack())
+                .is_some_and(|frame| frame.device_id.raw() == transaction.binding.device_id)
+    });
+    if direct && !hosted_accepted_pdo_direct_filter_edge::publish(irp_id) {
+        io_manager_mut().discard_prepared_external_pnp(prepared)
+            .expect("unentered direct FILTER owner could not be discarded");
+        set_hosted_filter_requirements_indeterminate(
+            irp_id, nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        );
+        return;
+    }
+    let result = io_manager_mut()
         .dispatch_prepared_external_pnp(prepared)
-        .expect("prepared hosted PnP request belongs to the canonical I/O manager")
-    {
+        .expect("prepared hosted PnP request belongs to the canonical I/O manager");
+    if direct && !matches!(&result, ExternalPnpDispatchResult::Pending { .. } | ExternalPnpDispatchResult::Indeterminate { .. }) {
+        hosted_accepted_pdo_direct_filter_edge::retire_unentered(irp_id);
+    }
+    match result {
         ExternalPnpDispatchResult::Returned {
             status,
             information,
@@ -56109,6 +56395,11 @@ pub(crate) unsafe fn service_hosted_accepted_pdo_filter_terminal(
     };
     if hosted_root_bus_mut().pdo(pdo).is_some() {
         return (STATUS_SUCCESS, false);
+    }
+    if let Some(result) = hosted_accepted_pdo_direct_filter_edge::consume(
+        ch, pdo_object, source_irp, caller_badge, active_reply_cap,
+    ) {
+        return result;
     }
     hosted_accepted_pdo_filter_edge::consume(
         ch, pdo_object, source_irp, caller_badge, active_reply_cap,
@@ -62745,6 +63036,11 @@ pub(crate) unsafe fn service_hosted_lower_pnp_forward(
         )));
     }
     if (operation == 4 || operation == 5) && irp_or_minor == 0 {
+        if let Some(result) = hosted_accepted_pdo_direct_filter_edge::acknowledge(
+            ch, reply_cap, address,
+        ) {
+            return Some(result);
+        }
         return Some(hosted_accepted_pdo_filter_edge::acknowledge(
             ch, reply_cap, address,
         ));
@@ -62772,6 +63068,17 @@ pub(crate) unsafe fn service_hosted_lower_pnp_forward(
         );
     }
     hosted_lower_pnp_work::service(ch, reply_cap, badge, operation, address, irp_or_minor)
+}
+
+pub(crate) unsafe fn service_hosted_lower_power_forward(
+    ch: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    operation: u64,
+    address: u64,
+    other: u64,
+) -> Option<(i32, bool)> {
+    hosted_lower_power_work::service(ch, reply_cap, badge, operation, address, other)
 }
 
 /// Admit the retained class CONNECT transaction through its exact source and provider owners.
@@ -62831,16 +63138,19 @@ pub(crate) unsafe fn redrive_hosted_lower_pnp_forward(handler: *mut ExecNtHandle
     hosted_lower_pnp_work::redrive(handler);
     hosted_filter_fdo_work::redrive(handler);
     hosted_start_fdo_work::redrive();
+    hosted_lower_power_work::redrive();
 }
 
 pub(crate) unsafe fn nested_hosted_lower_pnp_ready() -> bool {
     hosted_lower_pnp_work::nested_work_ready()
         || hosted_filter_fdo_work::nested_work_ready()
+        || hosted_lower_power_work::nested_work_ready()
 }
 
 pub(crate) unsafe fn redrive_nested_hosted_lower_pnp(handler: *mut ExecNtHandler) -> bool {
     hosted_lower_pnp_work::redrive_nested_ready(handler)
         || hosted_filter_fdo_work::redrive_nested_ready(handler)
+        || hosted_lower_power_work::redrive_nested_ready()
 }
 
 pub(crate) unsafe fn nested_hosted_start_fdo_ready() -> bool {

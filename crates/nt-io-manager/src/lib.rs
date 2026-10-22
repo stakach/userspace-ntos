@@ -36,6 +36,8 @@ pub mod start_io_queued;
 pub mod start_io_selection;
 pub mod start_io_native_transaction;
 pub mod device_power;
+pub mod power_irp_request;
+pub mod power_forward_cancel;
 mod device_file_name;
 mod device_reference;
 mod device_control;
@@ -46,10 +48,12 @@ mod directory_control;
 mod dispatch;
 mod driver;
 pub mod driver_reinitialization;
+pub mod remove_lock;
 mod driver_host;
 mod driver_peer;
 mod ea;
 mod external_dispatch;
+mod detached_external_power;
 pub mod detached_file_irp;
 mod fault;
 mod file;
@@ -206,6 +210,10 @@ pub use external_dispatch::{
     PreparedExternalPnpIrp, PreparedExternalPnpRejection,
 };
 pub use completion_ack::CompletionAcknowledgement;
+pub use detached_external_power::{PreparedExternalPowerIrp, ExternalPowerRejection,
+    ExternalPowerInvocation, ExternalPowerReturn, RetainedExternalPower,
+    ExternalPowerFinishResult, ExternalPowerCompletionInvocation,
+    ExternalPowerCompletionReturn, ExternalPowerTerminalReceipt};
 pub use file::{CreateOptions, FileRecord, FileState, ShareAccess};
 pub use file_mode::FileModeState;
 pub use file_information::{
@@ -793,6 +801,7 @@ impl<P> IoManager<P> {
                         location.flags = parameters.case_sensitive_stack_flags(major)
                     }
                     IoParameters::Pnp(parameters) => location.minor = parameters.minor,
+                    IoParameters::Power(parameters) => location.minor = parameters.minor(),
                     IoParameters::LockControl(parameters) => location.minor = parameters.minor,
                     IoParameters::NotifyDirectory(_) => {
                         location.minor = crate::IRP_MN_NOTIFY_CHANGE_DIRECTORY
@@ -836,6 +845,7 @@ impl<P> IoManager<P> {
                     location.flags = parameters.case_sensitive_stack_flags(major)
                 }
                 IoParameters::Pnp(parameters) => location.minor = parameters.minor,
+                IoParameters::Power(parameters) => location.minor = parameters.minor(),
                 IoParameters::LockControl(parameters) => location.minor = parameters.minor,
                 IoParameters::NotifyDirectory(_) => {
                     location.minor = crate::IRP_MN_NOTIFY_CHANGE_DIRECTORY
@@ -868,7 +878,7 @@ impl<P> IoManager<P> {
         let mut irp = IrpRecord::new(client, device, file, major);
         irp.origin_driver_id = driver;
         irp.origin_minor = stack[0].minor;
-        if major == nt_io_abi::major::IRP_MJ_PNP {
+        if matches!(major, nt_io_abi::major::IRP_MJ_PNP | nt_io_abi::major::IRP_MJ_POWER) {
             irp.status = NtStatus::NOT_SUPPORTED;
         }
         irp.stack = stack;
@@ -892,7 +902,7 @@ impl<P> IoManager<P> {
         let mut irp = IrpRecord::new(client, device, file, major);
         irp.origin_driver_id = driver;
         irp.origin_minor = stack[0].minor;
-        if major == nt_io_abi::major::IRP_MJ_PNP {
+        if matches!(major, nt_io_abi::major::IRP_MJ_PNP | nt_io_abi::major::IRP_MJ_POWER) {
             irp.status = NtStatus::NOT_SUPPORTED;
         }
         irp.stack = stack;
@@ -1544,6 +1554,7 @@ mod tests {
     mod exact_external_pnp;
     mod detached_external_pnp;
     mod detached_external_pnp_completion;
+    mod detached_external_power_tests;
 
     use super::*;
     use nt_io_abi::{ioctl, major};

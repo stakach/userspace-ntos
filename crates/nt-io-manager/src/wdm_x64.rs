@@ -179,6 +179,15 @@ pub enum WdmIoStackParameters {
         io_control_code: u32,
         type3_input_buffer: u64,
     },
+    Power {
+        system_context: u32,
+        state_type: u32,
+        state: u32,
+        shutdown_type: u32,
+    },
+    WaitWake {
+        state: u32,
+    },
     PnpStartDevice {
         allocated_resources: u64,
         allocated_resources_translated: u64,
@@ -569,6 +578,17 @@ pub fn write_wdm_io_stack_location(
             put_u32(bytes, 0x10, input_buffer_length);
             put_u32(bytes, 0x18, io_control_code);
             put_u64(bytes, 0x20, type3_input_buffer);
+        }
+        WdmIoStackParameters::Power { system_context, state_type, state, shutdown_type } => {
+            put_u32(bytes, nt_power_types::PARAM_POWER_SYSTEM_CONTEXT_OFFSET as usize,
+                system_context);
+            put_u32(bytes, nt_power_types::PARAM_POWER_TYPE_OFFSET as usize, state_type);
+            put_u32(bytes, nt_power_types::PARAM_POWER_STATE_OFFSET as usize, state);
+            put_u32(bytes, nt_power_types::PARAM_POWER_SHUTDOWN_TYPE_OFFSET as usize,
+                shutdown_type);
+        }
+        WdmIoStackParameters::WaitWake { state } => {
+            put_u32(bytes, 0x08, state);
         }
         WdmIoStackParameters::PnpStartDevice {
             allocated_resources,

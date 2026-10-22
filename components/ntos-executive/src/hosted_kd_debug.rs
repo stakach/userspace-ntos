@@ -12,6 +12,22 @@ static FIRST_INVOCATION_TRACED: AtomicBool = AtomicBool::new(false);
 /// ports are a different NT facility and do not change the KD presence byte.
 pub(super) const fn kernel_debugger_connected() -> bool { false }
 
+/// `NTSTATUS KdDisableDebugger(void)` when no kernel-debug transport is registered.
+pub(super) extern "win64" fn s_kd_disable_debugger() -> i32 {
+    if kernel_debugger_connected() {
+        unsafe { crate::provider_bugcheck::report(0xc4, [0x4b44_4449, 0, 0, 0]); }
+    }
+    nt_compat_exports::kd_debug_control::status_without_transport()
+}
+
+/// `NTSTATUS KdEnableDebugger(void)` when no kernel-debug transport is registered.
+pub(super) extern "win64" fn s_kd_enable_debugger() -> i32 {
+    if kernel_debugger_connected() {
+        unsafe { crate::provider_bugcheck::report(0xc4, [0x4b44_454e, 0, 0, 0]); }
+    }
+    nt_compat_exports::kd_debug_control::status_without_transport()
+}
+
 pub(super) extern "win64" fn s_kd_system_debug_control(
     command: u32,
     _input_buffer: u64,

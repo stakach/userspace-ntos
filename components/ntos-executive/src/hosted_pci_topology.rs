@@ -277,6 +277,33 @@ pub(crate) unsafe fn acquire_hosted_pci_interrupt_route(
     }))
 }
 
+/// Answer HAL's read-only `_PRT` query for an explicit 1-based INTx pin.
+/// This may be a bridge-swizzled pin rather than the config-space pin. Both
+/// the accepted route publication and its generation are checked at lookup.
+pub(crate) unsafe fn query_hosted_pci_routed_interrupt(
+    segment: u16,
+    location: PciLocation,
+    pin: u8,
+) -> Option<u32> {
+    let authority = (*core::ptr::addr_of!(HOSTED_PCI_TOPOLOGY)).as_ref()?;
+    if routing_reconciliation_pending(authority) || authority.route_blocked.is_some() {
+        return None;
+    }
+    let claim = authority.routes.resolve_pin(
+        &authority.inventory,
+        authority.scopes.generation(),
+        segment,
+        location,
+        pin,
+    ).ok()??;
+    let route = authority.routes.validate(
+        &authority.inventory,
+        authority.scopes.generation(),
+        claim,
+    ).ok()?;
+    Some(route.gsi)
+}
+
 /// Report whether this exact PCI function may enter interrupt resource arbitration. Initial
 /// provider discovery, a relevant BusRelations refresh, and route-generation reconciliation are
 /// transient ownership (`Pending`); a failed reconciliation or missing current route is terminal.

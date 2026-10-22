@@ -117,6 +117,10 @@ pub const IRP_MN_QUERY_POWER: u8 = 0x03;
 pub const PARAM_POWER_TYPE_OFFSET: u64 = 16;
 /// Offset of `Parameters.Power.State`.
 pub const PARAM_POWER_STATE_OFFSET: u64 = 24;
+/// Offset of the raw `SystemContext`/`SystemPowerStateContext` union member.
+pub const PARAM_POWER_SYSTEM_CONTEXT_OFFSET: u64 = 8;
+/// Offset of `Parameters.Power.ShutdownType`.
+pub const PARAM_POWER_SHUTDOWN_TYPE_OFFSET: u64 = 32;
 
 /// `STATUS_DEVICE_POWERED_OFF`.
 pub const STATUS_DEVICE_POWERED_OFF: i32 = 0xC000_02DBu32 as i32;

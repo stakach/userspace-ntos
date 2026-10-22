@@ -259,6 +259,33 @@ pub trait DriverDispatchBackend {
         }
     }
 
+    /// Preserve the exact entry evidence for a File-less POWER stack call. Hosted transports
+    /// override this so a lost transport reply never looks like a driver return.
+    fn dispatch_power_irp(
+        &mut self,
+        ctx: DispatchContext<'_>,
+        irp: &IrpProjection,
+    ) -> PnpBackendDispatch {
+        if irp.major != nt_io_abi::major::IRP_MJ_POWER
+            || !matches!(irp.parameters, IoParameters::Power(_))
+        {
+            return PnpBackendDispatch::NotDispatched {
+                status: NtStatus::INVALID_PARAMETER,
+            };
+        }
+        match self.dispatch_irp(ctx, irp) {
+            Ok(DispatchOutcome::Pending)
+            | Ok(DispatchOutcome::Completed { status: NtStatus::PENDING, .. })
+            | Ok(DispatchOutcome::Failed { status: NtStatus::PENDING }) =>
+                PnpBackendDispatch::Pending,
+            Ok(DispatchOutcome::Completed { status, information, .. }) =>
+                PnpBackendDispatch::Returned { status, information },
+            Ok(DispatchOutcome::Failed { status }) =>
+                PnpBackendDispatch::Returned { status, information: 0 },
+            Err(transport_status) => PnpBackendDispatch::Indeterminate { transport_status },
+        }
+    }
+
     /// Request cancellation of a (typically pending) IRP owned by this backend.
     fn cancel_irp(&mut self, irp_id: IrpId) -> Result<(), NtStatus>;
 

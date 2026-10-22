@@ -292,6 +292,22 @@ fn build_dispatch_request(
     if !nt_io_abi::valid_file_create_options(irp.major, irp.file_create_options) {
         return Err(NtStatus::INVALID_PARAMETER);
     }
+    let (power_state_type, power_state, power_system_context, power_shutdown_type) = match &irp.parameters {
+        crate::irp::IoParameters::Power(parameters)
+            if irp.major == major::IRP_MJ_POWER && irp.minor == parameters.minor() =>
+        {
+            (parameters.state_type(), parameters.state(),
+                parameters.system_context(), parameters.shutdown_type())
+        }
+        crate::irp::IoParameters::Power(_) => return Err(NtStatus::INVALID_PARAMETER),
+        _ => (0, 0, 0, 0),
+    };
+    if !nt_io_abi::power_dispatch::valid_power_dispatch(
+        irp.major, irp.minor, power_state_type, power_state,
+        power_system_context, power_shutdown_type, input_len, output_len,
+    ) {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
     Ok(IrpDispatchRequest {
         abi_version: IO_ABI_VERSION as u16,
         abi_size: core::mem::size_of::<IrpDispatchRequest>() as u16,
@@ -356,6 +372,10 @@ fn build_dispatch_request(
         read_write_key,
         create_case_sensitive,
         initial_information,
+        power_state_type,
+        power_state,
+        power_system_context,
+        power_shutdown_type,
     })
 }
 
@@ -790,7 +810,8 @@ mod initial_information_tests {
         assert_eq!(request.initial_information, 88);
         assert_eq!(request.input_len, 0);
         assert_eq!(request.output_len, 104);
-        assert_eq!(request.buffer_offset, 256);
+        assert_eq!(request.buffer_offset as usize,
+            core::mem::size_of::<IrpDispatchRequest>());
         let mut output = [0x5a; 104];
         let before = output;
         let control = MockPeerControl::new();
