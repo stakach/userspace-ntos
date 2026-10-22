@@ -9,6 +9,8 @@
 
 use alloc::vec::Vec;
 
+pub mod guid;
+
 mod ntstatus_to_dos_error_map;
 
 use ntstatus_to_dos_error_map::*;
