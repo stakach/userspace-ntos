@@ -21,6 +21,8 @@ pub struct ScsiSourceChildren {
     pub ticket: SourceIrpTicket,
     pub route: ScsiSrbRoute,
     pub srb: SourcePoolAllocationIdentity,
+    pub sense: Option<SourcePoolAllocationIdentity>,
+    pub sense_length: u8,
     pub mdl: Option<SourceMdlAllocationIdentity>,
     pub data: Option<SourceMemoryIdentity>,
     pub transfer_length: u32,
@@ -258,6 +260,7 @@ impl ScsiSourceRetentionLedger {
         self.rows.iter().any(|row| row.children.source.owner == owner
             && row.children.source.domain == domain
             && (row.children.srb.component_address == address
+                || row.children.sense.is_some_and(|sense| sense.component_address == address)
                 || row.children.mdl.is_some_and(|mdl| mdl.pool.component_address == address)
                 || matches!(row.children.data, Some(SourceMemoryIdentity::Pool { allocation, .. })
                     if allocation.component_address == address)))
@@ -324,6 +327,12 @@ fn valid(children: ScsiSourceChildren) -> bool {
         && route.relation_generation != 0
         && route.provider_pdo != 0;
     let srb_valid = srb.component_address != 0 && srb.capacity >= 0x58 && srb.pool_generation != 0;
+    let sense_valid = match (children.sense_length, children.sense) {
+        (0, None) => true,
+        (length, Some(sense)) => length != 0 && sense.component_address != 0
+            && sense.capacity >= u64::from(length) && sense.pool_generation != 0,
+        _ => false,
+    };
     let data_valid = match (children.transfer_length, children.data, children.mdl) {
         (0, None, None) => true,
         (
@@ -358,7 +367,7 @@ fn valid(children: ScsiSourceChildren) -> bool {
         (_, Some(SourceMemoryIdentity::MappedRange { .. }), _) => false,
         _ => false,
     };
-    source_valid && route_valid && srb_valid && data_valid
+    source_valid && route_valid && srb_valid && sense_valid && data_valid
 }
 
 #[cfg(test)]
@@ -393,6 +402,12 @@ mod tests {
                 capacity: 0x58,
                 pool_generation: 5,
             },
+            sense: Some(SourcePoolAllocationIdentity {
+                component_address: 0x5000,
+                capacity: 0x20,
+                pool_generation: 12,
+            }),
+            sense_length: 0x20,
             mdl: Some(SourceMdlAllocationIdentity {
                 pool: SourcePoolAllocationIdentity {
                     component_address: 0x3000,
@@ -547,5 +562,27 @@ mod tests {
             ledger.retain(children),
             Err(ScsiSourceRetentionError::Invalid)
         );
+    }
+
+    #[test]
+    fn sense_buffer_is_an_independent_retained_child() {
+        let mut ledger = ScsiSourceRetentionLedger::new();
+        let children = fixture();
+        ledger.retain(children).unwrap();
+        assert!(ledger.protects_pool(children.source.owner, children.source.domain, 0x5000));
+        let mut stale = children;
+        stale.sense.as_mut().unwrap().pool_generation += 1;
+        assert!(!ledger.contains_exact(stale));
+        ledger.abandon_prepared(children).unwrap();
+
+        let mut missing = children;
+        missing.sense = None;
+        assert_eq!(ledger.retain(missing), Err(ScsiSourceRetentionError::Invalid));
+        let mut short = children;
+        short.sense.as_mut().unwrap().capacity = 0x1f;
+        assert_eq!(ledger.retain(short), Err(ScsiSourceRetentionError::Invalid));
+        let mut zero = children;
+        zero.sense_length = 0;
+        assert_eq!(ledger.retain(zero), Err(ScsiSourceRetentionError::Invalid));
     }
 }

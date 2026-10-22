@@ -84,6 +84,7 @@ pub mod inline_file_retirement;
 mod irp;
 pub mod internal_block_io;
 pub mod scsi_srb_transport;
+pub mod scsi_srb_wire;
 pub mod scsi_source_retention;
 pub mod kernel_irp_builder;
 pub mod io_create_file;

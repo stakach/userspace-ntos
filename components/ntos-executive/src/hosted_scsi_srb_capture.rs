@@ -7,7 +7,8 @@
 use super::*;
 use nt_io_manager::{
     hosted_forward_target::HostedForwardTarget, retained_query_path_forward::SourceIrpTicket,
-    scsi_source_retention::ScsiSourceChildren, scsi_srb_transport::ScsiSrbRoute,
+    scsi_source_retention::ScsiSourceChildren,
+    scsi_srb_transport::{sanitized_legacy_srb, ScsiSrbRoute, WDM_X64_LEGACY_SRB_SIZE},
     source_irp_ledger::SourceIrpAllocation, HostedDomainIdentity,
 };
 use nt_pnp_manager::AcceptedPdoProviderAuthority;
@@ -31,6 +32,7 @@ pub(super) struct CapturedSourceScsi {
     srb: Vec<u8>,
     mdl: Option<Vec<u8>>,
     data: Vec<u8>,
+    sense: Option<Vec<u8>>,
     children_retained: bool,
     source_pinned: bool,
 }
@@ -42,14 +44,22 @@ impl CapturedSourceScsi {
     pub(super) fn children(&self) -> ScsiSourceChildren {
         self.children
     }
-    pub(super) fn srb(&self) -> &[u8] {
-        &self.srb
+    pub(super) fn wire_srb(&self) -> Result<[u8; WDM_X64_LEGACY_SRB_SIZE], CaptureError> {
+        sanitized_legacy_srb(
+            &self.srb,
+            self.data.len(),
+            self.sense.as_ref().map_or(0, Vec::len),
+        )
+        .map_err(|_| CaptureError::InvalidSrb)
     }
     pub(super) fn mdl(&self) -> Option<&[u8]> {
         self.mdl.as_deref()
     }
     pub(super) fn data(&self) -> &[u8] {
         &self.data
+    }
+    pub(super) fn sense(&self) -> Option<&[u8]> {
+        self.sense.as_deref()
     }
     pub(super) fn provider_authority(&self) -> AcceptedPdoProviderAuthority {
         self.authority
@@ -206,7 +216,7 @@ pub(super) unsafe fn capture(
                 relation_generation: authority.parent_relation().relation().generation(),
                 provider_pdo: authority.provider().address(),
             };
-            let (children, srb, mdl, data) = hosted_source_irp_ledger::capture_scsi_children(
+            let (children, srb, mdl, data, sense) = hosted_source_irp_ledger::capture_scsi_children(
                 instance_index,
                 source,
                 ticket,
@@ -214,10 +224,10 @@ pub(super) unsafe fn capture(
                 route,
             )
             .ok_or(CaptureError::InvalidSrb)?;
-            Ok((authority, children, srb, mdl, data))
+            Ok((authority, children, srb, mdl, data, sense))
         })();
         match admitted {
-            Ok((authority, children, srb, mdl, data)) => Ok(CapturedSourceScsi {
+            Ok((authority, children, srb, mdl, data, sense)) => Ok(CapturedSourceScsi {
                 instance_index,
                 source,
                 ticket,
@@ -227,6 +237,7 @@ pub(super) unsafe fn capture(
                 srb,
                 mdl,
                 data,
+                sense,
                 children_retained: true,
                 source_pinned: true,
             }),

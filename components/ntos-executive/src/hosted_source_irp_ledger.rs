@@ -88,7 +88,7 @@ pub(super) fn capture_scsi_children(
     ticket: SourceIrpTicket,
     target_device: u64,
     route: ScsiSrbRoute,
-) -> Option<(ScsiSourceChildren, Vec<u8>, Option<Vec<u8>>, Vec<u8>)> {
+) -> Option<(ScsiSourceChildren, Vec<u8>, Option<Vec<u8>>, Vec<u8>, Option<Vec<u8>>)> {
     let _guard = lock();
     let inst = instance(instance_index)?;
     if source.domain != ticket.domain
@@ -125,6 +125,26 @@ pub(super) fn capture_scsi_children(
     if u16::from_le_bytes(srb_slice[..2].try_into().ok()?) as usize != WDM_X64_LEGACY_SRB_SIZE {
         return None;
     }
+    // A chained SRB requires a separately owned and bounded graph; the native lane only
+    // supports one legacy request block.
+    if u64::from_le_bytes(srb_slice[0x28..0x30].try_into().ok()?) != 0 { return None; }
+    let sense_length = srb_slice[0x0b];
+    let sense_address = u64::from_le_bytes(srb_slice[0x20..0x28].try_into().ok()?);
+    let (sense_identity, sense_bytes) = if sense_length == 0 {
+        (None, None)
+    } else {
+        let identity = unsafe { exact_pool_identity_unlocked(
+            inst, sense_address, u64::from(sense_length),
+        )? };
+        let sense_exec = inst.exec_pool_va.checked_add(sense_address.checked_sub(FSD_POOL_VADDR)?)?;
+        let sense_slice = unsafe { core::slice::from_raw_parts(
+            sense_exec as *const u8, usize::from(sense_length),
+        ) };
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(usize::from(sense_length)).ok()?;
+        bytes.extend_from_slice(sense_slice);
+        (Some(identity), Some(bytes))
+    };
     let transfer_length = u32::from_le_bytes(srb_slice[0x10..0x14].try_into().ok()?);
     let data_address = u64::from_le_bytes(srb_slice[0x18..0x20].try_into().ok()?);
     let (mdl_identity, mdl_bytes, data_identity, data_bytes) = if transfer_length == 0 {
@@ -168,11 +188,12 @@ pub(super) fn capture_scsi_children(
     srb.try_reserve_exact(WDM_X64_LEGACY_SRB_SIZE).ok()?;
     srb.extend_from_slice(srb_slice);
     let children = ScsiSourceChildren {
-        source, ticket, route, srb: srb_identity, mdl: mdl_identity,
+        source, ticket, route, srb: srb_identity, sense: sense_identity,
+        sense_length, mdl: mdl_identity,
         data: data_identity, transfer_length,
     };
     scsi_children().retain(children).ok()?;
-    Some((children, srb, mdl_bytes, data_bytes))
+    Some((children, srb, mdl_bytes, data_bytes, sense_bytes))
 }
 
 pub(super) fn scsi_children_match_current(
@@ -193,6 +214,10 @@ pub(super) fn scsi_children_match_current(
     observed == Some(children.source)
         && unsafe { exact_pool_identity_unlocked(inst, children.srb.component_address, 0x58) }
             == Some(children.srb)
+        && children.sense.is_none_or(|sense| unsafe {
+            exact_pool_identity_unlocked(inst, sense.component_address,
+                u64::from(children.sense_length)) == Some(sense)
+        })
         && children.mdl.is_none_or(|mdl| unsafe {
             mdl_identity_matches_unlocked(inst, children.source.domain, mdl)
         })
