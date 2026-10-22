@@ -35,3 +35,51 @@ fn pinned_boot_driver_imports_have_owned_kernel_bindings() {
     assert!(launch.contains("FSD_DATA_HAL_DISPATCH_VERSION"));
     assert!(launch.contains("reg.bind(\"ExAllocatePoolWithTagPriority\","));
 }
+
+#[test]
+fn released_storage_and_network_dpc_imports_have_exact_native_contracts() {
+    let drivers = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../rust-micro/.tmp/libernt/tree/Windows/system32/drivers");
+    for (driver, symbol) in [
+        ("storport.sys", "KeAcquireInStackQueuedSpinLockAtDpcLevel"),
+        ("storport.sys", "KeReleaseInStackQueuedSpinLockFromDpcLevel"),
+        ("ndis.sys", "KeGetCurrentProcessorNumberEx"),
+    ] {
+        if let Some(imports) = kernel_imports(&drivers.join(driver)) {
+            assert!(imports.contains(symbol), "pinned {driver} no longer imports {symbol}");
+        }
+    }
+
+    let launch = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    let spin = include_str!("../../../components/ntos-executive/src/hosted_driver_queued_spin_lock.rs");
+    let cpu = include_str!("../../../components/ntos-executive/src/hosted_driver_processor_mask.rs");
+    assert!(launch.contains("\"KeAcquireInStackQueuedSpinLockAtDpcLevel\""));
+    assert!(launch.contains("\"KeReleaseInStackQueuedSpinLockFromDpcLevel\""));
+    assert!(spin.contains("fn acquire_at_dpc(") && spin.contains("fn release_from_dpc("));
+    assert!(spin.contains("current_irql < DISPATCH_LEVEL"));
+    assert!(launch.contains("\"KeGetCurrentProcessorNumberEx\""));
+    assert!(cpu.contains("fn current_processor_number_ex("));
+}
+
+#[test]
+fn released_for_dpc_and_processor_index_imports_preserve_real_topology() {
+    let drivers = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../rust-micro/.tmp/libernt/tree/Windows/system32/drivers");
+    for (driver, symbol) in [
+        ("storport.sys", "KeAcquireInStackQueuedSpinLockForDpc"),
+        ("storport.sys", "KeReleaseInStackQueuedSpinLockForDpc"),
+        ("ndis.sys", "KeGetProcessorNumberFromIndex"),
+    ] {
+        if let Some(imports) = kernel_imports(&drivers.join(driver)) {
+            assert!(imports.contains(symbol), "pinned {driver} no longer imports {symbol}");
+        }
+    }
+    let launch = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    let spin = include_str!("../../../components/ntos-executive/src/hosted_driver_queued_spin_lock.rs");
+    let cpu = include_str!("../../../components/ntos-executive/src/hosted_driver_processor_mask.rs");
+    for symbol in ["KeAcquireInStackQueuedSpinLockForDpc", "KeReleaseInStackQueuedSpinLockForDpc", "KeGetProcessorNumberFromIndex"] {
+        assert!(launch.contains(&format!("\"{symbol}\"")), "missing {symbol} binding");
+    }
+    assert!(spin.contains("fn acquire_for_dpc(") && spin.contains("fn release_for_dpc("));
+    assert!(cpu.contains("fn processor_number_from_index("));
+}

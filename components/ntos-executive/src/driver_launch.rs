@@ -35644,12 +35644,36 @@ fn register_fsd_trampolines() -> bool {
         hosted_driver_queued_spin_lock::acquire as *const () as usize as u64,
     );
     reg.bind(
+        "KeAcquireInStackQueuedSpinLockAtDpcLevel",
+        hosted_driver_queued_spin_lock::acquire_at_dpc as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeAcquireInStackQueuedSpinLockForDpc",
+        hosted_driver_queued_spin_lock::acquire_for_dpc as *const () as usize as u64,
+    );
+    reg.bind(
         "KeInvalidateRangeAllCaches",
         hosted_driver_cache_invalidation::invalidate as *const () as usize as u64,
     );
     reg.bind(
         "KeReleaseInStackQueuedSpinLock",
         hosted_driver_queued_spin_lock::release as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeReleaseInStackQueuedSpinLockFromDpcLevel",
+        hosted_driver_queued_spin_lock::release_from_dpc as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeReleaseInStackQueuedSpinLockForDpc",
+        hosted_driver_queued_spin_lock::release_for_dpc as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeGetCurrentProcessorNumberEx",
+        hosted_driver_processor_mask::current_processor_number_ex as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeGetProcessorNumberFromIndex",
+        hosted_driver_processor_mask::processor_number_from_index as *const () as usize as u64,
     );
     reg.bind(
         "KeAcquireSpinLockAtDpcLevel",

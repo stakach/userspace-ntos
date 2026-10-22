@@ -1,6 +1,21 @@
 //! Processor count and mask must describe the same boot topology to PCI.
 
-use nt_kernel_exec::processor_topology::{active_processor_count_for_group, active_processor_mask};
+use nt_kernel_exec::processor_topology::{active_processor_count_for_group, active_processor_mask, processor_number_for_index, single_processor_index};
+
+#[test]
+fn current_processor_requires_a_single_processor_boot_topology() {
+    assert_eq!(single_processor_index(1), Some(0));
+    assert_eq!(single_processor_index(0), None);
+    assert_eq!(single_processor_index(2), None);
+}
+
+#[test]
+fn processor_index_projects_only_installed_group_zero_cpus() {
+    assert_eq!(processor_number_for_index(1, 0), Some(0));
+    assert_eq!(processor_number_for_index(2, 1), Some(1 << 16));
+    assert_eq!(processor_number_for_index(2, 2), None);
+    assert_eq!(processor_number_for_index(0, 0), None);
+}
 
 #[test]
 fn group_zero_and_all_groups_project_exact_active_count() {

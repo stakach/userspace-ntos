@@ -14,3 +14,18 @@ pub const fn active_processor_mask(count: u64) -> u64 {
 pub const fn active_processor_count_for_group(count: u64, group: u16) -> u32 {
     if group == 0 || group == u16::MAX { active_processor_count(count) } else { 0 }
 }
+
+/// A hosted driver can identify its current processor without a per-thread
+/// processor owner only while the boot topology contains one processor.
+pub const fn single_processor_index(count: u64) -> Option<u32> {
+    if count == 1 { Some(0) } else { None }
+}
+
+/// Encode a group-zero `PROCESSOR_NUMBER` for a real boot processor index.
+pub const fn processor_number_for_index(count: u64, index: u32) -> Option<u32> {
+    if count == 0 || index >= active_processor_count(count) {
+        None
+    } else {
+        Some(index << 16)
+    }
+}
