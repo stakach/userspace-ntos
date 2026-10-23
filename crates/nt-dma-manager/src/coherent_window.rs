@@ -69,6 +69,13 @@ pub struct CoherentReservationAlias {
     pub length: u64,
 }
 
+impl CoherentReservationAlias {
+    /// Exact alias generation for a retained native SG record.
+    pub const fn alias_id(self) -> u64 {
+        self.alias_id
+    }
+}
+
 impl DmaManager {
     /// Register an exact PnP-granted coherent window before reserving slices in it.
     /// Repeating the same live grant is idempotent; changing its range or owner is refused.
@@ -488,6 +495,7 @@ mod tests {
                 32,
             )
             .unwrap();
+        assert_ne!(alias.alias_id(), 0);
         assert_eq!(alias.logical_base, 0x10_020);
         assert_eq!(
             dma.decode_owner_logical(owner(), alias.logical_base, 32),
@@ -506,6 +514,13 @@ mod tests {
             Err(DmaError::AdapterBusy)
         );
         assert_eq!(dma.end_coherent_reservation_alias(owner(), alias), Ok(()));
+        let later = dma
+            .begin_coherent_reservation_alias(
+                owner(), storport, reservation.reservation_id, window, 0x60_020, 32,
+            )
+            .unwrap();
+        assert_ne!(alias.alias_id(), later.alias_id());
+        assert_eq!(dma.end_coherent_reservation_alias(owner(), later), Ok(()));
         assert_eq!(
             dma.end_coherent_reservation_alias(owner(), alias),
             Err(DmaError::StaleId)
