@@ -13,6 +13,11 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+mod coherent_window;
+pub use coherent_window::{CoherentReservationAlias, CoherentReservationGrant, CoherentWindowIdentity};
+use coherent_window::{CoherentAliasRecord, CoherentReservation, CoherentReservationState, CoherentWindow};
+
+
 /// Identifies the requester of a DMA operation (spec §10.1).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct DmaOwner {
@@ -48,6 +53,8 @@ pub enum DmaError {
     AdapterConflict,
     /// Live common buffers or transfer mappings still belong to this adapter.
     AdapterBusy,
+    /// An uncertain DMA effect retains its original mapping and cannot be reused.
+    Quarantined,
 }
 
 /// Bus-facing properties supplied by `IoGetDmaAdapter` after validating the caller's
@@ -254,6 +261,7 @@ struct Mapping {
 pub enum DmaLogicalRangeKind {
     CommonBuffer,
     TransferMapping,
+    CoherentReservation,
 }
 
 /// One descriptor completed through an owner-scoped DMA translation.
@@ -315,10 +323,12 @@ pub struct FixedDescriptorObservation {
     pub descriptors_with_decodable_buffer: u64,
     pub descriptors_with_common_buffer: u64,
     pub descriptors_with_transfer_mapping: u64,
+    pub descriptors_with_coherent_reservation: u64,
     pub descriptors_with_length: u64,
     pub completed_descriptors: u64,
     pub completed_common_buffer_descriptors: u64,
     pub completed_transfer_mapping_descriptors: u64,
+    pub completed_coherent_reservation_descriptors: u64,
     pub malformed_descriptors: u64,
 }
 
@@ -327,10 +337,15 @@ pub struct DmaManager {
     adapters: Vec<Adapter>,
     common_buffers: Vec<CommonBuffer>,
     common_buffer_aliases: Vec<CommonBufferAliasRecord>,
+    coherent_windows: Vec<CoherentWindow>,
+    coherent_reservations: Vec<CoherentReservation>,
+    coherent_aliases: Vec<CoherentAliasRecord>,
     mappings: Vec<Mapping>,
     next_adapter_id: u64,
     next_cb_id: u64,
     next_alias_id: u64,
+    next_coherent_reservation_id: u64,
+    next_coherent_alias_id: u64,
     next_mapping_id: u64,
     next_logical: u64,
 }
@@ -347,10 +362,15 @@ impl DmaManager {
             adapters: Vec::new(),
             common_buffers: Vec::new(),
             common_buffer_aliases: Vec::new(),
+            coherent_windows: Vec::new(),
+            coherent_reservations: Vec::new(),
+            coherent_aliases: Vec::new(),
             mappings: Vec::new(),
             next_adapter_id: 1,
             next_cb_id: 1,
             next_alias_id: 1,
+            next_coherent_reservation_id: 1,
+            next_coherent_alias_id: 1,
             next_mapping_id: 1,
             // Fake device-address space; each allocation gets a 64 KiB-aligned base.
             next_logical: 0x8000_0000,
@@ -505,6 +525,10 @@ impl DmaManager {
             common.active && common.owner == owner && common.adapter_id == adapter_id
         }) || self.mappings.iter().any(|mapping| {
             mapping.active && mapping.owner == owner && mapping.adapter_id == adapter_id
+        }) || self.coherent_aliases.iter().any(|alias| {
+            alias.active && alias.owner == owner && alias.alias.adapter_id == adapter_id
+        }) || self.coherent_reservations.iter().any(|reservation| {
+            reservation.owner == owner && reservation.state == CoherentReservationState::Quarantined
         }) {
             return Err(DmaError::AdapterBusy);
         }
@@ -695,6 +719,16 @@ impl DmaManager {
                 return true;
             }
         }
+        for reservation in self.coherent_reservations.iter().filter(|reservation| {
+            reservation.owner == owner && reservation.state != CoherentReservationState::Released
+        }) {
+            let Some(reservation_end) = reservation.logical_base.checked_add(reservation.length) else {
+                return true;
+            };
+            if logical_base < reservation_end && reservation.logical_base < end {
+                return true;
+            }
+        }
         false
     }
 
@@ -819,6 +853,19 @@ impl DmaManager {
                 ));
             }
         }
+        for reservation in self.coherent_reservations.iter().filter(|reservation| {
+            reservation.owner == owner && reservation.state != CoherentReservationState::Released
+        }) {
+            let end = logical.checked_add(length).ok_or(DmaError::OutOfRange)?;
+            let reservation_end = reservation.logical_base.checked_add(reservation.length)
+                .ok_or(DmaError::OutOfRange)?;
+            if logical >= reservation.logical_base && end <= reservation_end {
+                return Ok((
+                    reservation.backing_va + (logical - reservation.logical_base),
+                    DmaLogicalRangeKind::CoherentReservation,
+                ));
+            }
+        }
         Err(DmaError::LogicalViolation)
     }
 
@@ -844,6 +891,16 @@ impl DmaManager {
                 .ok_or(DmaError::OutOfRange)?;
             if logical >= m.logical_base && end <= map_end {
                 return Ok(m.backing_va + (logical - m.logical_base));
+            }
+        }
+        for reservation in self.coherent_reservations.iter().filter(|reservation| {
+            reservation.state != CoherentReservationState::Released
+        }) {
+            let end = logical.checked_add(length).ok_or(DmaError::OutOfRange)?;
+            let reservation_end = reservation.logical_base.checked_add(reservation.length)
+                .ok_or(DmaError::OutOfRange)?;
+            if logical >= reservation.logical_base && end <= reservation_end {
+                return Ok(reservation.backing_va + (logical - reservation.logical_base));
             }
         }
         Err(DmaError::LogicalViolation)
@@ -929,6 +986,13 @@ impl DmaManager {
                         observation.descriptors_with_transfer_mapping += 1;
                         if completed {
                             observation.completed_transfer_mapping_descriptors += 1;
+                        }
+                    }
+                    Ok((_, DmaLogicalRangeKind::CoherentReservation)) => {
+                        observation.descriptors_with_decodable_buffer += 1;
+                        observation.descriptors_with_coherent_reservation += 1;
+                        if completed {
+                            observation.completed_coherent_reservation_descriptors += 1;
                         }
                     }
                     Err(_) => observation.malformed_descriptors += 1,
@@ -1177,6 +1241,29 @@ impl DmaManager {
             if alias.owner == owner {
                 alias.active = false;
             }
+        }
+        for reservation in self.coherent_reservations.iter_mut().filter(|reservation| {
+            reservation.owner == owner && reservation.state == CoherentReservationState::Active
+        }) {
+            reservation.state = if self.coherent_aliases.iter().any(|alias| {
+                alias.active && alias.alias.reservation_id == reservation.id
+            }) {
+                CoherentReservationState::Quarantined
+            } else {
+                CoherentReservationState::Released
+            };
+        }
+        for window in self.coherent_windows.iter_mut().filter(|window| {
+            window.owner == owner && window.state == CoherentReservationState::Active
+        }) {
+            window.state = if self.coherent_reservations.iter().any(|reservation| {
+                reservation.owner == owner && reservation.window == window.identity
+                    && reservation.state == CoherentReservationState::Quarantined
+            }) {
+                CoherentReservationState::Quarantined
+            } else {
+                CoherentReservationState::Released
+            };
         }
         let mut b = 0;
         for cb in self.common_buffers.iter_mut() {
