@@ -6,7 +6,7 @@
 
 use super::*;
 
-const BATCH_SECTORS: u32 = 4;
+const BATCH_SECTORS: u32 = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AsyncSnapshotIoKind {

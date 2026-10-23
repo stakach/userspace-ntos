@@ -158,6 +158,67 @@ fn native_checkpoint_unentered_request_can_retry_with_new_exact_ticket() {
 }
 
 #[test]
+fn native_checkpoint_scans_and_writes_large_payloads_in_bounded_commands() {
+    let store = SnapshotBlockStore::new(0, 256);
+    let mut disk = CachedDisk::with_sectors(256);
+    let old = alloc::vec![0x31; 40 * 512];
+    store.commit_next_with_wal_manifest(&mut disk, &old, baseline()).unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, &old, baseline()).unwrap();
+    let replacement = alloc::vec![0xa5; 65 * 512];
+    let mut commit = AsyncSnapshotCommit::new(
+        store, replacement.clone(), baseline(), disk.sector_size(), disk.sector_count(),
+    ).unwrap();
+    let mut reads = Vec::new();
+    let mut writes = Vec::new();
+    while let Some(request) = commit.enter_next().unwrap() {
+        match request.kind {
+            AsyncSnapshotIoKind::Read => reads.push((request.lba, request.bytes / 512)),
+            AsyncSnapshotIoKind::Write => writes.push((request.lba, request.bytes / 512)),
+            AsyncSnapshotIoKind::Flush => {}
+        }
+        perform(&mut disk, &mut commit, request);
+    }
+    assert_eq!(reads, [(0, 1), (1, 32), (33, 8), (128, 1), (129, 32), (161, 8)]);
+    assert_eq!(writes, [(1, 32), (33, 32), (65, 1), (0, 1)]);
+    assert_eq!(commit.finish().ok().unwrap(), 3);
+    disk.power_cut();
+    let selected = store.read_latest(&mut disk).unwrap().unwrap();
+    assert_eq!(selected.generation, 3);
+    assert_eq!(selected.payload, replacement);
+}
+
+#[test]
+fn interrupted_large_native_checkpoint_write_retains_owner_and_old_snapshot() {
+    let store = SnapshotBlockStore::new(0, 256);
+    let mut disk = CachedDisk::with_sectors(256);
+    let old = alloc::vec![0x31; 40 * 512];
+    store.commit_next_with_wal_manifest(&mut disk, &old, baseline()).unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, &old, baseline()).unwrap();
+    disk.events.clear();
+    disk.fail_event = Some(16);
+    let mut commit = AsyncSnapshotCommit::new(
+        store, alloc::vec![0xa5; 65 * 512], baseline(), disk.sector_size(), disk.sector_count(),
+    ).unwrap();
+    loop {
+        let request = commit.enter_next().unwrap().unwrap();
+        if request.kind == AsyncSnapshotIoKind::Write {
+            assert_eq!(request.bytes, 32 * 512);
+            assert_eq!(disk.write_sectors(request.lba, commit.write_bytes(request).unwrap()),
+                Err(SnapshotBlockStoreError::Io));
+            commit.lose(request).unwrap();
+            assert_eq!(commit.pending(), Some(request));
+            assert_eq!(commit.enter_next(), Err(AsyncSnapshotCommitError::Outstanding));
+            break;
+        }
+        perform(&mut disk, &mut commit, request);
+    }
+    disk.power_cut();
+    let selected = store.read_latest(&mut disk).unwrap().unwrap();
+    assert_eq!(selected.generation, 2);
+    assert_eq!(selected.payload, old);
+}
+
+#[test]
 fn every_async_read_write_and_flush_keeps_its_exact_ticket_until_completion() {
     for uncertain_step in 0..9 {
         let (mut disk, mut commit) = fixture(alloc::vec![0xa5; 1300]);
