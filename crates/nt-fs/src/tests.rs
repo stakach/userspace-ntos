@@ -4654,6 +4654,70 @@ fn installed_file_import_is_fail_closed_and_never_replaces_the_writable_winner()
 }
 
 #[test]
+fn prepared_overlay_create_failure_rolls_back_import_and_materialized_parent() {
+    let mut fs = FileSystem::new(MemFs::new());
+    let source = FileMetadata {
+        end_of_file: 3,
+        valid_data_length: 3,
+        attributes: FILE_ATTRIBUTE_ARCHIVE,
+        number_of_links: 1,
+        ..FileMetadata::default()
+    };
+    let before = fs.export_volume_snapshot().unwrap();
+    let failed = fs.create_prepared_overlay_relative(
+        b"windows\\system32\\state.dat", Some(b"windows\\system32"),
+        Some((source, b"fat".to_vec())), FILE_READ_DATA, FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_READ, FILE_CREATE, 0,
+    );
+    assert_eq!(failed.status, STATUS_OBJECT_NAME_COLLISION);
+    assert_eq!(fs.export_volume_snapshot().unwrap(), before);
+    assert_eq!(fs.query_metadata_relative(b"windows\\system32"), None);
+    assert_eq!(fs.file_bytes_relative(b"windows\\system32\\state.dat"), None);
+}
+
+#[test]
+fn prepared_overlay_create_failure_preserves_existing_upper_winner() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_directory_relative(b"windows"));
+    assert!(fs.provision_file_relative(b"windows\\state.dat", b"upper"));
+    let source = FileMetadata {
+        end_of_file: 3, attributes: FILE_ATTRIBUTE_ARCHIVE, number_of_links: 1,
+        ..FileMetadata::default()
+    };
+    let before = fs.export_volume_snapshot().unwrap();
+    let failed = fs.create_prepared_overlay_relative(
+        b"windows\\state.dat", None, Some((source, b"fat".to_vec())),
+        FILE_READ_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_CREATE, 0,
+    );
+    assert_eq!(failed.status, STATUS_OBJECT_NAME_COLLISION);
+    assert_eq!(fs.export_volume_snapshot().unwrap(), before);
+    assert_eq!(fs.file_bytes_relative(b"windows\\state.dat"), Some(&b"upper"[..]));
+}
+
+#[test]
+fn prepared_overlay_create_commits_installed_bytes_and_parent_with_one_open() {
+    let mut fs = FileSystem::new(MemFs::new());
+    let source = FileMetadata {
+        end_of_file: 3,
+        valid_data_length: 3,
+        attributes: FILE_ATTRIBUTE_ARCHIVE,
+        number_of_links: 1,
+        ..FileMetadata::default()
+    };
+    let opened = fs.create_prepared_overlay_relative(
+        b"windows\\system32\\state.dat", Some(b"windows\\system32"),
+        Some((source, b"fat".to_vec())), FILE_READ_DATA,
+        FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_OPEN, 0,
+    );
+    assert_eq!(opened.status, STATUS_SUCCESS);
+    assert_eq!(opened.information, FILE_OPENED);
+    assert!(fs.query_metadata_relative(b"windows\\system32").unwrap().is_directory);
+    assert_eq!(fs.zw_read_file(opened.handle, Some(0), 3),
+        (STATUS_SUCCESS, b"fat".to_vec()));
+    assert_eq!(fs.zw_close(opened.handle), STATUS_SUCCESS);
+}
+
+#[test]
 fn installed_file_open_policy_has_one_owner_for_every_disposition() {
     assert_eq!(
         installed_file_open_action(FILE_READ_DATA, FILE_OPEN, 0),

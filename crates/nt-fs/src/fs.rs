@@ -2511,19 +2511,32 @@ impl MemFs {
 
     /// Create every missing directory along a folded volume-relative path, returning the leaf id.
     fn ensure_dir_folded_relative(&mut self, path: &[u8]) -> Option<u64> {
+        self.materialize_parent_folded_relative(path).ok()
+    }
+
+    /// Fallible directory materialization used by a prepared CREATE transaction. Each component
+    /// is admitted before its local namespace effect; the outer transaction rolls back earlier
+    /// components if a later admission fails.
+    fn materialize_parent_folded_relative(&mut self, path: &[u8]) -> Result<u64, u32> {
         let mut cur = 0;
         for comp in path.split(|byte| *byte == b'\\').filter(|c| !c.is_empty()) {
+            if !self.is_dir(cur) {
+                return Err(STATUS_OBJECT_PATH_NOT_FOUND);
+            }
             cur = match self.child_folded_bytes(cur, comp) {
                 Some(id) => id,
                 None => {
                     let name = core::str::from_utf8(comp)
-                        .map_err(|_| STATUS_INVALID_PARAMETER)
-                        .ok()?;
-                    self.create_child(cur, name, true)
+                        .map_err(|_| STATUS_INVALID_PARAMETER)?;
+                    let plan = self.prepare_create_child(
+                        cur, name, FILE_DIRECTORY_FILE, 0,
+                        &mut file_create::CreateAllocator::default(),
+                    )?;
+                    self.apply_create(plan).0
                 }
             };
         }
-        Some(cur)
+        if self.is_dir(cur) { Ok(cur) } else { Err(STATUS_OBJECT_PATH_NOT_FOUND) }
     }
 
     /// Resolve a volume-relative path to a node id.
@@ -4572,7 +4585,11 @@ impl FileSystem {
         if leaf.is_empty() || leaf == "." || leaf == ".." {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let (node_id, entry_id) = self.volume.create_child_with_entry(parent, leaf, false);
+        let plan = self.volume.prepare_create_child(
+            parent, leaf, FILE_NON_DIRECTORY_FILE, 0,
+            &mut file_create::CreateAllocator::default(),
+        )?;
+        let (node_id, entry_id, _) = self.volume.apply_create(plan);
         if !self.volume.set_file_data_owned(node_id, bytes) {
             let _ = self.volume.unlink_entry(entry_id);
             self.volume.reap_unlinked(node_id);
@@ -4591,6 +4608,62 @@ impl FileSystem {
             attributes => attributes,
         };
         Ok(true)
+    }
+
+    /// Complete a prepared lower-layer CREATE as one resident namespace transaction. The caller
+    /// has already proved `parent_path` against the immutable installed source and owns `bytes`.
+    /// No backing-device I/O occurs here. A failed final CREATE removes only entries this call
+    /// created; a pre-existing writable entry and its handles remain untouched.
+    pub fn create_prepared_overlay_relative(
+        &mut self,
+        relative: &[u8],
+        parent_path: Option<&[u8]>,
+        import: Option<(FileMetadata, Vec<u8>)>,
+        desired_access: u32,
+        file_attributes: u32,
+        share_access: u32,
+        disposition: u32,
+        options: u32,
+    ) -> CreateResult {
+        let first_entry = self.volume.next_entry_id;
+        let first_file = self.volume.next_file_id;
+        let first_node_len = self.volume.nodes.len();
+        let fail = |status| CreateResult {
+            status, handle: INVALID_HANDLE, information: 0,
+        };
+        let result = (|| {
+            if let Some(parent) = parent_path {
+                if let Err(status) = self.volume.materialize_parent_folded_relative(parent) {
+                    return fail(status);
+                }
+            }
+            if let Some((metadata, bytes)) = import {
+                if let Err(status) = self.import_file_relative(relative, metadata, bytes) {
+                    return fail(status);
+                }
+            }
+            self.zw_create_file_relative(relative, desired_access, file_attributes,
+                share_access, disposition, options)
+        })();
+        if result.status == STATUS_SUCCESS {
+            return result;
+        }
+        // Provisioning and import publish neither handles nor notifications. `zw_create` plans
+        // all fallible work before `apply_create`, so a failed result added no File object or
+        // entry. Reverse identity order removes the imported leaf before any new parent.
+        let mut entry = self.volume.next_entry_id;
+        while entry > first_entry {
+            entry -= 1;
+            if self.volume.entry_location(entry).is_some() {
+                let node = self.volume.unlink_entry(entry)
+                    .expect("newly created transaction entry has no published child");
+                self.volume.reap_unlinked(node);
+            }
+        }
+        self.volume.nodes.truncate(first_node_len);
+        self.volume.next_file_id = first_file;
+        self.volume.next_entry_id = first_entry;
+        result
     }
 
     /// Create or open a folded path beneath an existing directory FILE_OBJECT. The directory's
