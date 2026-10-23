@@ -82,8 +82,8 @@ impl FatRangeLookup {
         (sector < limit).then_some(FatRangeRequest { sector, kind: self.phase })
     }
 
-    /// Number of file-data sectors that may be read together without crossing a FAT-chain
-    /// boundary. The caller must still retain the exact first request until completion.
+    /// Number of physically adjacent file-data sectors proven by this cursor's completed
+    /// FAT sector. The caller still retains the exact first request until completion.
     pub fn contiguous_data_sectors(&self, max: u32) -> Option<u32> {
         if max == 0 || self.phase != FatRangeRequestKind::Data || self.request().is_none() {
             return None;
@@ -91,9 +91,25 @@ impl FatRangeLookup {
         let skip = if self.written == 0 { self.first_skip } else { 0 };
         // Split before adding: `remaining + skip` can overflow usize for a large request.
         let needed = self.remaining / 512 + (self.remaining % 512 + skip).div_ceil(512);
-        let within_cluster = self.geometry.sectors_per_cluster.checked_sub(self.sector_in_cluster)?;
-        Some(max.min(within_cluster).min(u32::try_from(needed).unwrap_or(u32::MAX)))
-            .filter(|count| *count != 0)
+        let limit = max.min(u32::try_from(needed).unwrap_or(u32::MAX));
+        let mut count = limit.min(self.geometry.sectors_per_cluster.checked_sub(self.sector_in_cluster)?);
+        let mut cluster = self.cluster;
+        while count < limit {
+            let fat_sector = self.geometry.fat_start_sector.checked_add(cluster.checked_mul(4)? / 512)?;
+            let Some((cached_sector, bytes)) = self.cached_fat_sector.as_ref() else { break; };
+            if *cached_sector != fat_sector { break; }
+            let byte = (cluster as usize % 128) * 4;
+            let next = u32::from_le_bytes(bytes[byte..byte + 4].try_into().unwrap()) & 0x0fff_ffff;
+            let clusters = (self.geometry.total_sectors - self.geometry.data_start_sector)
+                / self.geometry.sectors_per_cluster;
+            if cluster.checked_add(1) != Some(next) || next >= EOC || next == BAD
+                || next.checked_sub(2).is_none_or(|index| index >= clusters)
+                || self.visited.contains(&next)
+            { break; }
+            count += (limit - count).min(self.geometry.sectors_per_cluster);
+            cluster = next;
+        }
+        Some(count).filter(|count| *count != 0)
     }
 
     /// Feed an exact contiguous data read. Validate the whole transfer before changing the
@@ -282,6 +298,57 @@ mod tests {
         }));
         assert_eq!(cursor.feed(first, &sector, &mut output), Err(FatPathError::WrongRequest));
         assert_eq!(cursor.written(), 4 * 512);
+    }
+
+    #[test]
+    fn completed_fat_proof_batches_physically_adjacent_clusters() {
+        let mut one_sector_clusters = geometry();
+        one_sector_clusters.sectors_per_cluster = 1;
+        let mut cursor = FatRangeLookup::new(one_sector_clusters, 2, 0, 4 * 512).unwrap();
+        let mut output = [0; 4 * 512];
+        assert_eq!(cursor.contiguous_data_sectors(32), Some(1));
+        cursor.feed(cursor.request().unwrap(), &[1; 512], &mut output).unwrap();
+        let mut fat = [0; 512];
+        for cluster in 2..5 {
+            fat[cluster * 4..(cluster + 1) * 4]
+                .copy_from_slice(&((cluster + 1) as u32).to_le_bytes());
+        }
+        cursor.feed(cursor.request().unwrap(), &fat, &mut output).unwrap();
+        assert_eq!(cursor.contiguous_data_sectors(32), Some(3));
+        assert_eq!(cursor.feed_contiguous_data(cursor.request().unwrap(), &[2; 3 * 512],
+            &mut output), Ok(FatRangeProgress::Complete));
+        assert_eq!(&output[..512], &[1; 512]);
+        assert_eq!(&output[512..], &[2; 3 * 512]);
+
+        let mut fragmented = FatRangeLookup::new(one_sector_clusters, 2, 0, 4 * 512).unwrap();
+        let mut fragment_output = [0; 4 * 512];
+        fragmented.feed(fragmented.request().unwrap(), &[1; 512], &mut fragment_output).unwrap();
+        fat[3 * 4..4 * 4].copy_from_slice(&7u32.to_le_bytes());
+        fragmented.feed(fragmented.request().unwrap(), &fat, &mut fragment_output).unwrap();
+        assert_eq!(fragmented.contiguous_data_sectors(32), Some(1),
+            "a nonadjacent cluster must start another physical command");
+    }
+
+    #[test]
+    fn adjacent_cluster_batch_stops_at_the_caller_command_limit() {
+        let mut one_sector_clusters = geometry();
+        one_sector_clusters.sectors_per_cluster = 1;
+        let mut cursor = FatRangeLookup::new(one_sector_clusters, 2, 0, 40 * 512).unwrap();
+        let mut output = [0; 40 * 512];
+        cursor.feed(cursor.request().unwrap(), &[1; 512], &mut output).unwrap();
+        let mut fat = [0; 512];
+        for cluster in 2..42 {
+            fat[cluster * 4..(cluster + 1) * 4]
+                .copy_from_slice(&((cluster + 1) as u32).to_le_bytes());
+        }
+        cursor.feed(cursor.request().unwrap(), &fat, &mut output).unwrap();
+        let first = cursor.request().unwrap();
+        assert_eq!(cursor.contiguous_data_sectors(32), Some(32));
+        assert_eq!(cursor.feed_contiguous_data(first, &[2; 32 * 512], &mut output),
+            Ok(FatRangeProgress::Pending));
+        assert_eq!(cursor.contiguous_data_sectors(32), Some(7));
+        assert_eq!(cursor.feed_contiguous_data(cursor.request().unwrap(), &[3; 7 * 512],
+            &mut output), Ok(FatRangeProgress::Complete));
     }
 
     #[test]
