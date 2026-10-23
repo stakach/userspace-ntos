@@ -930,6 +930,23 @@ impl HostedIrqArenaControl {
         Ok(self.current_irql.load(Ordering::Acquire) as u8)
     }
 
+    /// Apply a stopped IRQ worker's decoded CR8 write to its active transaction. The
+    /// expected value comes from the same arena immediately before context projection.
+    pub fn worker_write_cr8(
+        &self,
+        identity: HostedIrqLaneIdentity,
+        transaction: HostedIrqTransaction,
+        expected: u8,
+        target: u8,
+    ) -> Result<(), HostedIrqArenaError> {
+        self.check_transaction(identity, transaction)?;
+        if target >= expected {
+            self.worker_raise_irql(identity, transaction, expected, target)
+        } else {
+            self.worker_lower_irql(identity, transaction, expected, target)
+        }
+    }
+
     pub fn worker_raise_irql(
         &self,
         identity: HostedIrqLaneIdentity,
@@ -3083,6 +3100,31 @@ mod tests {
         control
             .root_finish_transaction(identity(), transaction)
             .unwrap();
+    }
+
+    #[test]
+    fn cr8_fault_write_requires_exact_active_irq_transaction_and_expected_irql() {
+        let control = active_control();
+        let transaction = control
+            .root_begin_transaction(identity(), HostedIrqTransactionClass::Interrupt)
+            .unwrap();
+        control.worker_raise_irql(identity(), transaction, 0, 2).unwrap();
+        assert_eq!(control.worker_write_cr8(identity(), transaction, 2, 2), Ok(()));
+        assert_eq!(control.worker_write_cr8(identity(), transaction, 0, 3),
+            Err(HostedIrqArenaError::InvalidIrql));
+        assert_eq!(control.worker_write_cr8(identity(), transaction, 2, 5), Ok(()));
+        assert_eq!(control.current_irql(identity()), Ok(5));
+        let stale = HostedIrqTransaction { transaction: transaction.transaction + 1, ..transaction };
+        assert_eq!(control.worker_write_cr8(identity(), stale, 5, 2),
+            Err(HostedIrqArenaError::StaleTransaction));
+        assert_eq!(control.worker_write_cr8(identity(), transaction, 5, 2), Ok(()));
+        assert_eq!(control.worker_write_cr8(identity(), transaction, 2, 16),
+            Err(HostedIrqArenaError::InvalidIrql));
+        assert_eq!(control.current_irql(identity()), Ok(2));
+        control.worker_lower_irql(identity(), transaction, 2, 0).unwrap();
+        control.root_finish_transaction(identity(), transaction).unwrap();
+        assert_eq!(control.worker_write_cr8(identity(), transaction, 0, 2),
+            Err(HostedIrqArenaError::StaleTransaction));
     }
 
     #[test]
