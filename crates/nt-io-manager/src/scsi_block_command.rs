@@ -97,20 +97,28 @@ impl ScsiBlockCommand {
     pub const fn srb(&self) -> &[u8; WDM_X64_LEGACY_SRB_SIZE] { &self.srb }
 
     pub fn verify_completion(&self, completed: &[u8], transferred: usize) -> Result<(), BlockCommandError> {
+        let actual = if completed.len() == WDM_X64_LEGACY_SRB_SIZE {
+            u32::from_le_bytes(completed[0x10..0x14].try_into().unwrap()) as usize
+        } else { return Err(BlockCommandError::InvalidCompletion); };
+        let exact = usize::try_from(self.data_len).ok() == Some(transferred);
+        let reported = match self.kind {
+            BlockCommandKind::Capacity => (12..=transferred).contains(&actual),
+            _ => actual == transferred,
+        };
         if completed.len() != WDM_X64_LEGACY_SRB_SIZE
             || completed[0..2] != self.srb[0..2]
             || completed[2] != 0
             || completed[3] & 0x3f != SRB_STATUS_SUCCESS
             || completed[4] != 0
             || completed[0x48..0x58] != self.srb[0x48..0x58]
-            || usize::try_from(self.data_len).ok() != Some(transferred)
-            || u32::from_le_bytes(completed[0x10..0x14].try_into().unwrap()) != self.data_len
+            || !exact
+            || !reported
         { return Err(BlockCommandError::InvalidCompletion); }
         Ok(())
     }
 
     pub fn parse_capacity(&self, data: &[u8]) -> Result<(u32, u64), BlockCommandError> {
-        if self.kind != BlockCommandKind::Capacity || data.len() != 32 {
+        if self.kind != BlockCommandKind::Capacity || !(12..=32).contains(&data.len()) {
             return Err(BlockCommandError::InvalidCompletion);
         }
         let last_lba = u64::from_be_bytes(data[0..8].try_into().unwrap());
@@ -136,8 +144,26 @@ mod tests {
         data[0..8].copy_from_slice(&4095u64.to_be_bytes());
         data[8..12].copy_from_slice(&512u32.to_be_bytes());
         assert_eq!(command.parse_capacity(&data), Ok((512, 4096)));
+        assert_eq!(command.parse_capacity(&data[..12]), Ok((512, 4096)));
+        assert_eq!(command.parse_capacity(&data[..11]), Err(BlockCommandError::InvalidCompletion));
         data[8..12].copy_from_slice(&4096u32.to_be_bytes());
         assert_eq!(command.parse_capacity(&data), Err(BlockCommandError::GeometryMismatch));
+    }
+
+    #[test]
+    fn capacity_completion_accepts_only_a_bounded_reported_transfer() {
+        let command = ScsiBlockCommand::read_capacity();
+        let mut completed = *command.srb();
+        completed[3] = SRB_STATUS_SUCCESS;
+        for actual in [12u32, 32] {
+            completed[0x10..0x14].copy_from_slice(&actual.to_le_bytes());
+            assert_eq!(command.verify_completion(&completed, 32), Ok(()));
+        }
+        for actual in [0u32, 11, 33] {
+            completed[0x10..0x14].copy_from_slice(&actual.to_le_bytes());
+            assert_eq!(command.verify_completion(&completed, 32),
+                Err(BlockCommandError::InvalidCompletion));
+        }
     }
 
     #[test]

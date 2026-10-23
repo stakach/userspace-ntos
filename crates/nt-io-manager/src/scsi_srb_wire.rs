@@ -5,7 +5,7 @@
 
 use alloc::vec::Vec;
 
-use crate::scsi_srb_transport::{sanitized_legacy_srb, ScsiSrbRoute, WDM_X64_LEGACY_SRB_SIZE};
+use crate::scsi_srb_transport::{sanitized_legacy_srb, ScsiParameters, ScsiSrbRoute, WDM_X64_LEGACY_SRB_SIZE};
 use crate::IrpId;
 
 const MAGIC: u32 = u32::from_le_bytes(*b"SCSI");
@@ -60,6 +60,25 @@ pub fn encode_scsi_wire_request(
         return Err(ScsiWireError::InvalidPayload);
     }
     encode_packet(route, irp, srb, data, sense)
+}
+
+/// Convert the canonical detached IRP transfer bytes into the provider's pointer-free packet.
+/// Every native dispatch path uses the same exact data/sense split and route identity.
+pub fn encode_scsi_dispatch_input(
+    parameters: &ScsiParameters,
+    irp: IrpId,
+    transfer: &[u8],
+) -> Result<Vec<u8>, ScsiWireError> {
+    let data_len = parameters.data_length as usize;
+    let expected = data_len.checked_add(parameters.sense_length as usize)
+        .ok_or(ScsiWireError::InvalidPayload)?;
+    if transfer.len() != expected {
+        return Err(ScsiWireError::InvalidPayload);
+    }
+    encode_scsi_wire_request(
+        parameters.route, irp, parameters.srb,
+        &transfer[..data_len], &transfer[data_len..],
+    )
 }
 
 fn encode_packet(
@@ -226,6 +245,20 @@ mod tests {
             (0x38, 0x4444_5555_6666_7777),
         ] { source[offset..offset + 8].copy_from_slice(&value.to_le_bytes()); }
         source
+    }
+
+    #[test]
+    fn canonical_scsi_transfer_is_encoded_once_for_native_dispatch() {
+        let irp = IrpId::new(6, 7);
+        let parameters = crate::scsi_srb_transport::ScsiParameters::from_source(
+            route(), &source_srb(), 3, 4,
+        ).unwrap();
+        let packet = encode_scsi_dispatch_input(&parameters, irp, &[1, 2, 3, 4, 5, 6, 7]).unwrap();
+        let decoded = decode_scsi_request(&packet, route(), irp).unwrap();
+        assert_eq!(decoded.data, &[1, 2, 3]);
+        assert_eq!(decoded.sense, &[4, 5, 6, 7]);
+        assert_eq!(encode_scsi_dispatch_input(&parameters, irp, &[1, 2, 3]),
+            Err(ScsiWireError::InvalidPayload));
     }
 
     #[test]
