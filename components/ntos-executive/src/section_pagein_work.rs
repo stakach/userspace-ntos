@@ -545,14 +545,17 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
         }
         Phase::Copying(irp, offset) => {
             let (irp, offset) = (*irp, *offset);
-            let remaining = work.plan.unwrap().length() - offset;
             let mut bytes = [0u8; DATA_PAGE_SIZE];
+            let Some(copy_len) = work.plan.unwrap().next_copy_len(offset, bytes.len()) else {
+                work.phase = Phase::Indeterminate;
+                return false;
+            };
             let copied = match driver_launch::copy_completed_irp_output_exact(
                 irp.raw(),
                 offset as u64,
-                &mut bytes[..remaining],
+                &mut bytes[..copy_len],
             ) {
-                Ok(copied) if copied != 0 && copied <= remaining => copied,
+                Ok(copied) if copied != 0 && copied <= copy_len => copied,
                 Ok(_) => {
                     assert!((&mut *core::ptr::addr_of_mut!(READS)).fail_copy(
                         work.read_id.unwrap(),
