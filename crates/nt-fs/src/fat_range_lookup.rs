@@ -78,6 +78,42 @@ impl FatRangeLookup {
         (sector < limit).then_some(FatRangeRequest { sector, kind: self.phase })
     }
 
+    /// Number of file-data sectors that may be read together without crossing a FAT-chain
+    /// boundary. The caller must still retain the exact first request until completion.
+    pub fn contiguous_data_sectors(&self, max: u32) -> Option<u32> {
+        if max == 0 || self.phase != FatRangeRequestKind::Data || self.request().is_none() {
+            return None;
+        }
+        let skip = if self.written == 0 { self.first_skip } else { 0 };
+        // Split before adding: `remaining + skip` can overflow usize for a large request.
+        let needed = self.remaining / 512 + (self.remaining % 512 + skip).div_ceil(512);
+        let within_cluster = self.geometry.sectors_per_cluster.checked_sub(self.sector_in_cluster)?;
+        Some(max.min(within_cluster).min(u32::try_from(needed).unwrap_or(u32::MAX)))
+            .filter(|count| *count != 0)
+    }
+
+    /// Feed an exact contiguous data read. Validate the whole transfer before changing the
+    /// cursor or caller-owned output, so a malformed completion cannot publish a prefix.
+    pub fn feed_contiguous_data(&mut self, request: FatRangeRequest, bytes: &[u8],
+        output: &mut [u8]) -> Result<FatRangeProgress, FatPathError>
+    {
+        let count = u32::try_from(bytes.len() / 512).map_err(|_| FatPathError::WrongRequest)?;
+        if bytes.is_empty() || bytes.len() % 512 != 0
+            || request.kind != FatRangeRequestKind::Data
+            || self.request() != Some(request)
+            || self.contiguous_data_sectors(count) != Some(count)
+            || output.len() < self.written + self.remaining
+        { return Err(FatPathError::WrongRequest); }
+        let mut progress = FatRangeProgress::Pending;
+        for (index, sector) in bytes.chunks_exact(512).enumerate() {
+            let expected = request.sector.checked_add(index as u32)
+                .map(|sector| FatRangeRequest { sector, kind: FatRangeRequestKind::Data })
+                .ok_or(FatPathError::WrongRequest)?;
+            progress = self.feed(expected, sector.try_into().unwrap(), output)?;
+        }
+        Ok(progress)
+    }
+
     pub fn feed(&mut self, request: FatRangeRequest, bytes: &[u8; 512], output: &mut [u8])
         -> Result<FatRangeProgress, FatPathError>
     {
@@ -175,5 +211,50 @@ mod tests {
         sector[12..16].copy_from_slice(&2u32.to_le_bytes());
         assert_eq!(cyclic.feed(cyclic.request().unwrap(), &sector, &mut output),
             Err(FatPathError::Corrupt));
+    }
+
+    #[test]
+    fn batches_only_data_needed_within_one_validated_cluster() {
+        let mut cursor = FatRangeLookup::new(geometry(), 2, 510, 5).unwrap();
+        assert_eq!(cursor.contiguous_data_sectors(32), Some(2));
+        let mut bytes = [0; 1024];
+        bytes[510..515].copy_from_slice(&[1, 2, 3, 4, 5]);
+        let mut output = [0; 5];
+        let first = cursor.request().unwrap();
+        assert_eq!(cursor.feed_contiguous_data(first, &bytes, &mut output),
+            Ok(FatRangeProgress::Complete));
+        assert_eq!(output, [1, 2, 3, 4, 5]);
+
+        let mut boundary = FatRangeLookup::new(geometry(), 2, 0, 1536).unwrap();
+        assert_eq!(boundary.contiguous_data_sectors(32), Some(2));
+        assert_eq!(boundary.contiguous_data_sectors(1), Some(1));
+        assert_eq!(boundary.feed_contiguous_data(boundary.request().unwrap(), &[7; 1024],
+            &mut [0; 1536]), Ok(FatRangeProgress::Pending));
+        assert_eq!(boundary.request().unwrap().kind, FatRangeRequestKind::Fat);
+        assert_eq!(boundary.contiguous_data_sectors(32), None);
+    }
+
+    #[test]
+    fn malformed_batch_does_not_change_cursor_or_output() {
+        let mut cursor = FatRangeLookup::new(geometry(), 2, 0, 1536).unwrap();
+        let request = cursor.request().unwrap();
+        let mut output = [9; 1536];
+        for bytes in [&[1; 511][..], &[1; 1536][..], &[][..]] {
+            assert_eq!(cursor.feed_contiguous_data(request, bytes, &mut output),
+                Err(FatPathError::WrongRequest));
+            assert_eq!(cursor.request(), Some(request));
+            assert_eq!(cursor.written(), 0);
+            assert!(output.iter().all(|byte| *byte == 9));
+        }
+        let wrong = FatRangeRequest { sector: request.sector + 1, ..request };
+        assert_eq!(cursor.feed_contiguous_data(wrong, &[1; 512], &mut output),
+            Err(FatPathError::WrongRequest));
+        assert_eq!(cursor.request(), Some(request));
+    }
+
+    #[test]
+    fn batch_bound_handles_large_requested_length_without_overflow() {
+        let cursor = FatRangeLookup::new(geometry(), 2, 510, usize::MAX).unwrap();
+        assert_eq!(cursor.contiguous_data_sectors(32), Some(2));
     }
 }
