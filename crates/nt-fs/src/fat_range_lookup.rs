@@ -27,6 +27,9 @@ pub struct FatRangeLookup {
     remaining: usize,
     written: usize,
     visited: Vec<u32>,
+    // Retained only by this file-range owner after its exact FAT read completes.
+    // A new cursor must obtain its own sector from the installed backing volume.
+    cached_fat_sector: Option<(u32, [u8; 512])>,
     phase: FatRangeRequestKind,
     complete: bool,
 }
@@ -59,7 +62,8 @@ impl FatRangeLookup {
             target_sector: within / 512,
             sector_in_cluster: if target_cluster == 0 { within / 512 } else { 0 },
             first_skip: (within % 512) as usize, remaining: length, written: 0,
-            visited, phase: if target_cluster == 0 { FatRangeRequestKind::Data } else { FatRangeRequestKind::Fat },
+            visited, cached_fat_sector: None,
+            phase: if target_cluster == 0 { FatRangeRequestKind::Data } else { FatRangeRequestKind::Fat },
             complete: false,
         })
     }
@@ -134,30 +138,50 @@ impl FatRangeLookup {
                 self.sector_in_cluster += 1;
                 if self.sector_in_cluster == self.geometry.sectors_per_cluster {
                     self.phase = FatRangeRequestKind::Fat;
+                    self.follow_cached_fat()?;
                 }
             }
             FatRangeRequestKind::Fat => {
                 let byte = (self.cluster as usize % 128) * 4;
                 let next = u32::from_le_bytes(bytes[byte..byte + 4].try_into().unwrap()) & 0x0fff_ffff;
-                let clusters = (self.geometry.total_sectors - self.geometry.data_start_sector)
-                    / self.geometry.sectors_per_cluster;
-                if next >= EOC || next == BAD || next < 2
-                    || next.checked_sub(2).is_none_or(|index| index >= clusters)
-                    || self.visited.contains(&next)
-                { return Err(FatPathError::Corrupt); }
-                self.visited.try_reserve(1).map_err(|_| FatPathError::NoCapacity)?;
-                self.visited.push(next);
-                self.cluster = next;
-                self.cluster_index += 1;
-                self.sector_in_cluster = if self.cluster_index == self.target_cluster {
-                    self.target_sector
-                } else { 0 };
-                self.phase = if self.cluster_index < self.target_cluster {
-                    FatRangeRequestKind::Fat
-                } else { FatRangeRequestKind::Data };
+                self.advance_fat_entry(next)?;
+                self.cached_fat_sector = Some((request.sector, *bytes));
+                self.follow_cached_fat()?;
             }
         }
         Ok(FatRangeProgress::Pending)
+    }
+
+    fn advance_fat_entry(&mut self, next: u32) -> Result<(), FatPathError> {
+        let clusters = (self.geometry.total_sectors - self.geometry.data_start_sector)
+            / self.geometry.sectors_per_cluster;
+        if next >= EOC || next == BAD || next < 2
+            || next.checked_sub(2).is_none_or(|index| index >= clusters)
+            || self.visited.contains(&next)
+        { return Err(FatPathError::Corrupt); }
+        self.visited.try_reserve(1).map_err(|_| FatPathError::NoCapacity)?;
+        self.visited.push(next);
+        self.cluster = next;
+        self.cluster_index += 1;
+        self.sector_in_cluster = if self.cluster_index == self.target_cluster {
+            self.target_sector
+        } else { 0 };
+        self.phase = if self.cluster_index < self.target_cluster {
+            FatRangeRequestKind::Fat
+        } else { FatRangeRequestKind::Data };
+        Ok(())
+    }
+
+    fn follow_cached_fat(&mut self) -> Result<(), FatPathError> {
+        while self.phase == FatRangeRequestKind::Fat {
+            let request = self.request().ok_or(FatPathError::Invalid)?;
+            let Some((sector, bytes)) = self.cached_fat_sector.as_ref() else { break; };
+            if *sector != request.sector { break; }
+            let byte = (self.cluster as usize % 128) * 4;
+            let next = u32::from_le_bytes(bytes[byte..byte + 4].try_into().unwrap()) & 0x0fff_ffff;
+            self.advance_fat_entry(next)?;
+        }
+        Ok(())
     }
 
     pub fn written(&self) -> usize { self.written }
@@ -207,10 +231,57 @@ mod tests {
         assert_eq!(output, [9]);
 
         let mut cyclic = FatRangeLookup::new(geometry(), 2, 2048, 1).unwrap();
-        cyclic.feed(cyclic.request().unwrap(), &sector, &mut output).unwrap();
         sector[12..16].copy_from_slice(&2u32.to_le_bytes());
         assert_eq!(cyclic.feed(cyclic.request().unwrap(), &sector, &mut output),
             Err(FatPathError::Corrupt));
+    }
+
+    #[test]
+    fn one_verified_fat_sector_advances_all_clusters_it_describes() {
+        let mut cursor = FatRangeLookup::new(geometry(), 2, 0, 5 * 512).unwrap();
+        let mut output = [0; 5 * 512];
+        let mut fat_sector = [0; 512];
+        fat_sector[2 * 4..3 * 4].copy_from_slice(&3u32.to_le_bytes());
+        fat_sector[3 * 4..4 * 4].copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(cursor.feed_contiguous_data(cursor.request().unwrap(), &[1; 1024],
+            &mut output), Ok(FatRangeProgress::Pending));
+        let fat = cursor.request().unwrap();
+        assert_eq!(fat, FatRangeRequest { sector: 1, kind: FatRangeRequestKind::Fat });
+        assert_eq!(cursor.feed(fat, &fat_sector, &mut output), Ok(FatRangeProgress::Pending));
+        assert_eq!(cursor.request(), Some(FatRangeRequest {
+            sector: 12, kind: FatRangeRequestKind::Data,
+        }));
+        assert_eq!(cursor.feed_contiguous_data(cursor.request().unwrap(), &[2; 1024],
+            &mut output), Ok(FatRangeProgress::Pending));
+        assert_eq!(cursor.request(), Some(FatRangeRequest {
+            sector: 14, kind: FatRangeRequestKind::Data,
+        }), "the retained FAT sector covers the next cluster without another I/O");
+        assert_eq!(cursor.feed(cursor.request().unwrap(), &[3; 512], &mut output),
+            Ok(FatRangeProgress::Complete));
+        assert_eq!(&output[..1024], &[1; 1024]);
+        assert_eq!(&output[1024..2048], &[2; 1024]);
+        assert_eq!(&output[2048..], &[3; 512]);
+
+        let fresh = FatRangeLookup::new(geometry(), 2, 2 * 1024, 1).unwrap();
+        assert_eq!(fresh.request(), Some(fat), "a new cursor must obtain its own FAT proof");
+    }
+
+    #[test]
+    fn cached_fat_sector_does_not_cross_into_an_unread_sector() {
+        let mut cursor = FatRangeLookup::new(geometry(), 127, 0, 5 * 512).unwrap();
+        let mut output = [0; 5 * 512];
+        cursor.feed_contiguous_data(cursor.request().unwrap(), &[1; 1024], &mut output).unwrap();
+        let first = cursor.request().unwrap();
+        assert_eq!(first.sector, 1);
+        let mut sector = [0; 512];
+        sector[127 * 4..128 * 4].copy_from_slice(&128u32.to_le_bytes());
+        cursor.feed(first, &sector, &mut output).unwrap();
+        cursor.feed_contiguous_data(cursor.request().unwrap(), &[2; 1024], &mut output).unwrap();
+        assert_eq!(cursor.request(), Some(FatRangeRequest {
+            sector: 2, kind: FatRangeRequestKind::Fat,
+        }));
+        assert_eq!(cursor.feed(first, &sector, &mut output), Err(FatPathError::WrongRequest));
+        assert_eq!(cursor.written(), 4 * 512);
     }
 
     #[test]
