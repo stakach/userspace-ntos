@@ -4918,3 +4918,76 @@ fn writable_filesystem_batches_rename_old_and_new_names() {
         ]
     );
 }
+
+#[test]
+fn native_cutover_retains_fat_metadata_request_until_exact_sector_completion() {
+    let geometry = FatPathGeometry {
+        fat_start_sector: 1,
+        data_start_sector: 100,
+        total_sectors: 200,
+        sectors_per_cluster: 1,
+    };
+    let mut lookup = FatPathLookup::new(geometry, 2, b"missing.txt").unwrap();
+    let request = lookup.request().unwrap();
+    assert_eq!(request, FatPathRequest {
+        sector: 100,
+        kind: FatPathRequestKind::Directory,
+    });
+
+    let mut route = BlockRouteOwner::new(7, 1_000).unwrap();
+    route.begin_drain(7).unwrap();
+    route.commit_native(7, 0x44).unwrap();
+    let operation = BlockOperation::Read { lba: 300, sectors: 1 };
+    assert_eq!(route.source_kind(), BlockSourceKind::Native);
+    assert_eq!(route.admit_boot(7, BlockSource::Fat, operation), Err(BlockRouteError::WrongPhase));
+    // A fenced boot read is not a negative directory entry. The cursor retains its request.
+    assert_eq!(lookup.request(), Some(request));
+    assert!(lookup.take_found().is_none());
+
+    assert_eq!(route.enter_native(8, BlockSource::Fat, operation), Err(BlockRouteError::WrongMount));
+    let ticket = route.enter_native(7, BlockSource::Fat, operation).unwrap();
+    assert_eq!(route.pending_native(), Some(ticket));
+    route.lose_native(ticket).unwrap();
+    let wrong_ticket = NativeBlockTicket { sequence: ticket.sequence + 1, ..ticket };
+    assert_eq!(route.complete_native(wrong_ticket, 512), Err(BlockRouteError::WrongTicket));
+    assert_eq!(route.complete_native(ticket, 511), Err(BlockRouteError::Incomplete));
+    assert_eq!(route.pending_native(), Some(ticket));
+    assert_eq!(lookup.request(), Some(request));
+
+    // Only the exact completed native sector can decide that the entry is absent.
+    route.complete_native(ticket, 512).unwrap();
+    assert_eq!(lookup.feed(request, &[0; 512]), Ok(FatPathProgress::NotFound));
+    assert_eq!(lookup.request(), None);
+    assert_eq!(route.pending_native(), None);
+}
+
+#[test]
+fn native_cutover_retains_fat_range_output_and_blocks_second_owner() {
+    let geometry = FatPathGeometry {
+        fat_start_sector: 1,
+        data_start_sector: 100,
+        total_sectors: 200,
+        sectors_per_cluster: 1,
+    };
+    let mut range = FatRangeLookup::new(geometry, 2, 0, 4).unwrap();
+    let request = range.request().unwrap();
+    let mut output = [0; 4];
+    let mut route = BlockRouteOwner::new(7, 1_000).unwrap();
+    route.begin_drain(7).unwrap();
+    route.commit_native(7, 0x44).unwrap();
+    let operation = BlockOperation::Read { lba: 300, sectors: 1 };
+    assert_eq!(route.admit_boot(7, BlockSource::Fat, operation), Err(BlockRouteError::WrongPhase));
+    assert_eq!(range.request(), Some(request));
+    assert_eq!(output, [0; 4]);
+
+    let ticket = route.enter_native(7, BlockSource::Fat, operation).unwrap();
+    assert_eq!(route.enter_native(7, BlockSource::Snapshot, operation),
+        Err(BlockRouteError::NativeIoOutstanding));
+    route.lose_native(ticket).unwrap();
+    assert_eq!(range.request(), Some(request));
+    assert_eq!(output, [0; 4]);
+    route.complete_native(ticket, 512).unwrap();
+    assert_eq!(range.feed(request, &[1; 512], &mut output), Ok(FatRangeProgress::Complete));
+    assert_eq!(output, [1; 4]);
+    assert_eq!(range.request(), None);
+}
