@@ -234,6 +234,12 @@ struct CommonBuffer {
     active: bool,
 }
 
+struct CommonBufferAliasRecord {
+    alias: CommonBufferAlias,
+    owner: DmaOwner,
+    active: bool,
+}
+
 struct Mapping {
     id: u64,
     adapter_id: u64,
@@ -266,6 +272,18 @@ pub struct FixedDescriptorCompletion {
 pub struct CommonBufferGrant {
     pub common_buffer_id: u64,
     pub logical_base: u64,
+}
+
+/// A live SG view into an exact common-buffer generation. The view shares the existing
+/// logical mapping; it does not create a second, overlapping transfer mapping.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CommonBufferAlias {
+    alias_id: u64,
+    common_buffer_id: u64,
+    adapter_id: u64,
+    pub logical_base: u64,
+    pub backing_va: u64,
+    pub length: u64,
 }
 
 /// The result of a `map_transfer`.
@@ -308,9 +326,11 @@ pub struct FixedDescriptorObservation {
 pub struct DmaManager {
     adapters: Vec<Adapter>,
     common_buffers: Vec<CommonBuffer>,
+    common_buffer_aliases: Vec<CommonBufferAliasRecord>,
     mappings: Vec<Mapping>,
     next_adapter_id: u64,
     next_cb_id: u64,
+    next_alias_id: u64,
     next_mapping_id: u64,
     next_logical: u64,
 }
@@ -326,9 +346,11 @@ impl DmaManager {
         Self {
             adapters: Vec::new(),
             common_buffers: Vec::new(),
+            common_buffer_aliases: Vec::new(),
             mappings: Vec::new(),
             next_adapter_id: 1,
             next_cb_id: 1,
+            next_alias_id: 1,
             next_mapping_id: 1,
             // Fake device-address space; each allocation gets a 64 KiB-aligned base.
             next_logical: 0x8000_0000,
@@ -573,6 +595,78 @@ impl DmaManager {
         self.register_common_buffer_at(owner, adapter_id, logical_base, length, backing_va)
     }
 
+    /// Borrow a fully covered part of one live common buffer as a DMA scatter/gather view.
+    /// The buffer's ID is its generation: a later allocation at the same logical address
+    /// cannot satisfy an old request. The caller must end the view before freeing the buffer.
+    pub fn begin_common_buffer_alias(
+        &mut self,
+        owner: DmaOwner,
+        adapter_id: u64,
+        common_buffer_id: u64,
+        backing_va: u64,
+        length: u64,
+    ) -> Result<CommonBufferAlias, DmaError> {
+        self.adapter(adapter_id, owner)?;
+        let common = self.common_buffers.iter().find(|common| {
+            common.id == common_buffer_id && common.active
+        }).ok_or(DmaError::StaleId)?;
+        if common.owner != owner || common.adapter_id != adapter_id {
+            return Err(DmaError::WrongOwner);
+        }
+        let offset = backing_va.checked_sub(common.backing_va).ok_or(DmaError::OutOfRange)?;
+        if length == 0 || offset >= common.length || length > common.length - offset {
+            return Err(DmaError::OutOfRange);
+        }
+        let logical_base = common.logical_base.checked_add(offset).ok_or(DmaError::OutOfRange)?;
+        let alias_id = self.next_alias_id;
+        self.next_alias_id = alias_id.checked_add(1).ok_or(DmaError::OutOfRange)?;
+        let alias = CommonBufferAlias {
+            alias_id,
+            common_buffer_id,
+            adapter_id,
+            logical_base,
+            backing_va,
+            length,
+        };
+        let record = CommonBufferAliasRecord {
+            alias,
+            owner,
+            active: true,
+        };
+        if let Some(slot) = self.common_buffer_aliases.iter_mut().find(|slot| !slot.active) {
+            *slot = record;
+        } else {
+            self.common_buffer_aliases.push(record);
+        }
+        Ok(alias)
+    }
+
+    /// End only the exact alias generation. A duplicate or stale release cannot release a
+    /// later alias, even when it covers the same common-buffer bytes.
+    pub fn end_common_buffer_alias(
+        &mut self,
+        owner: DmaOwner,
+        alias: CommonBufferAlias,
+    ) -> Result<(), DmaError> {
+        let record = self.common_buffer_aliases.iter_mut()
+            .find(|record| record.alias.alias_id == alias.alias_id && record.active)
+            .ok_or(DmaError::StaleId)?;
+        if record.owner != owner {
+            return Err(DmaError::WrongOwner);
+        }
+        if record.alias != alias {
+            return Err(DmaError::OutOfRange);
+        }
+        record.active = false;
+        Ok(())
+    }
+
+    fn common_buffer_has_live_alias(&self, common_buffer_id: u64) -> bool {
+        self.common_buffer_aliases.iter().any(|alias| {
+            alias.active && alias.alias.common_buffer_id == common_buffer_id
+        })
+    }
+
     fn logical_range_in_use(&self, owner: DmaOwner, logical_base: u64, length: u64) -> bool {
         let Some(end) = logical_base.checked_add(length) else {
             return true;
@@ -618,7 +712,7 @@ impl DmaManager {
             .any(|c| c.logical_base == logical_base && c.active && c.owner != owner);
         let cb = self
             .common_buffers
-            .iter_mut()
+            .iter()
             .find(|c| c.logical_base == logical_base && c.active && c.owner == owner)
             .ok_or(if has_other_owner {
                 DmaError::WrongOwner
@@ -628,6 +722,11 @@ impl DmaManager {
         if cb.length != length {
             return Err(DmaError::OutOfRange);
         }
+        let cb_id = cb.id;
+        if self.common_buffer_has_live_alias(cb_id) {
+            return Err(DmaError::AdapterBusy);
+        }
+        let cb = self.common_buffers.iter_mut().find(|c| c.id == cb_id).unwrap();
         cb.active = false;
         Ok(())
     }
@@ -644,7 +743,7 @@ impl DmaManager {
         self.adapter(adapter_id, owner)?;
         let cb = self
             .common_buffers
-            .iter_mut()
+            .iter()
             .find(|cb| cb.active && cb.owner == owner && cb.logical_base == logical_base)
             .ok_or(DmaError::StaleId)?;
         if cb.adapter_id != adapter_id {
@@ -653,6 +752,11 @@ impl DmaManager {
         if cb.length != length {
             return Err(DmaError::OutOfRange);
         }
+        let cb_id = cb.id;
+        if self.common_buffer_has_live_alias(cb_id) {
+            return Err(DmaError::AdapterBusy);
+        }
+        let cb = self.common_buffers.iter_mut().find(|entry| entry.id == cb_id).unwrap();
         cb.active = false;
         Ok(())
     }
@@ -1069,6 +1173,11 @@ impl DmaManager {
     /// Driver-host fault / device remove cleanup (spec §15.3, §17.4): revoke every
     /// common buffer + mapping owned by `owner`. Returns `(buffers, mappings)` revoked.
     pub fn revoke_owner(&mut self, owner: DmaOwner) -> (usize, usize) {
+        for alias in self.common_buffer_aliases.iter_mut() {
+            if alias.owner == owner {
+                alias.active = false;
+            }
+        }
         let mut b = 0;
         for cb in self.common_buffers.iter_mut() {
             if cb.owner == owner && cb.active {
@@ -1516,6 +1625,121 @@ mod tests {
             d.ensure_common_buffer_at(owner(), a, 0x1000, 4096, 0x3_0000),
             Err(DmaError::LogicalViolation)
         );
+    }
+
+    #[test]
+    fn common_buffer_alias_requires_exact_live_reservation_and_covered_range() {
+        let mut dma = DmaManager::new();
+        let adapter = dma.register_adapter(owner(), true, 4096, true);
+        let other_adapter = dma.register_adapter(owner(), true, 4096, false);
+        let reservation = dma
+            .register_common_buffer_at(owner(), adapter, 0x4000, 512, 0x20_000)
+            .unwrap();
+        let other_owner = DmaOwner::new(1, 101, 10);
+
+        assert_eq!(
+            dma.begin_common_buffer_alias(other_owner, adapter, reservation.common_buffer_id, 0x20_020, 32),
+            Err(DmaError::WrongOwner)
+        );
+        assert_eq!(
+            dma.begin_common_buffer_alias(owner(), other_adapter, reservation.common_buffer_id, 0x20_020, 32),
+            Err(DmaError::WrongOwner)
+        );
+        assert_eq!(
+            dma.begin_common_buffer_alias(owner(), adapter, reservation.common_buffer_id, 0x20_000, 0),
+            Err(DmaError::OutOfRange)
+        );
+        assert_eq!(
+            dma.begin_common_buffer_alias(owner(), adapter, reservation.common_buffer_id, 0x1_ffff, 1),
+            Err(DmaError::OutOfRange)
+        );
+        assert_eq!(
+            dma.begin_common_buffer_alias(owner(), adapter, reservation.common_buffer_id, 0x20_1ff, 2),
+            Err(DmaError::OutOfRange)
+        );
+
+        let alias = dma
+            .begin_common_buffer_alias(owner(), adapter, reservation.common_buffer_id, 0x20_020, 32)
+            .unwrap();
+        assert_eq!(alias.logical_base, 0x4020);
+        assert_eq!(alias.backing_va, 0x20_020);
+        assert_eq!(alias.length, 32);
+        assert_eq!(dma.decode_owner_logical(owner(), alias.logical_base, 32), Ok(0x20_020));
+        assert_eq!(
+            dma.free_common_buffer_for_adapter(owner(), adapter, 0x4000, 512),
+            Err(DmaError::AdapterBusy)
+        );
+        assert_eq!(dma.end_common_buffer_alias(other_owner, alias), Err(DmaError::WrongOwner));
+        assert_eq!(dma.end_common_buffer_alias(owner(), alias), Ok(()));
+        let next_alias = dma
+            .begin_common_buffer_alias(owner(), adapter, reservation.common_buffer_id, 0x20_020, 32)
+            .unwrap();
+        assert_eq!(dma.end_common_buffer_alias(owner(), alias), Err(DmaError::StaleId));
+        assert_eq!(
+            dma.free_common_buffer_for_adapter(owner(), adapter, 0x4000, 512),
+            Err(DmaError::AdapterBusy)
+        );
+        assert_eq!(dma.end_common_buffer_alias(owner(), next_alias), Ok(()));
+        assert_eq!(dma.free_common_buffer_for_adapter(owner(), adapter, 0x4000, 512), Ok(()));
+    }
+
+    #[test]
+    fn common_buffer_alias_does_not_follow_reused_logical_address() {
+        let mut dma = DmaManager::new();
+        let adapter = dma.register_adapter(owner(), true, 4096, true);
+        let original = dma
+            .register_common_buffer_at(owner(), adapter, 0x8000, 128, 0x30_000)
+            .unwrap();
+        dma.free_common_buffer_for_adapter(owner(), adapter, 0x8000, 128).unwrap();
+        let replacement = dma
+            .register_common_buffer_at(owner(), adapter, 0x8000, 128, 0x30_000)
+            .unwrap();
+        assert_ne!(original.common_buffer_id, replacement.common_buffer_id);
+        assert_eq!(
+            dma.begin_common_buffer_alias(owner(), adapter, original.common_buffer_id, 0x30_000, 32),
+            Err(DmaError::StaleId)
+        );
+        let alias = dma
+            .begin_common_buffer_alias(owner(), adapter, replacement.common_buffer_id, 0x30_000, 32)
+            .unwrap();
+        assert_eq!(dma.end_common_buffer_alias(owner(), alias), Ok(()));
+    }
+
+    #[test]
+    fn common_buffer_aliases_keep_reservation_live_until_each_exact_release() {
+        let mut dma = DmaManager::new();
+        let adapter = dma.register_adapter(owner(), true, 4096, true);
+        let reservation = dma
+            .register_common_buffer_at(owner(), adapter, 0xa000, 256, 0x40_000)
+            .unwrap();
+        let first = dma
+            .begin_common_buffer_alias(owner(), adapter, reservation.common_buffer_id, 0x40_000, 64)
+            .unwrap();
+        let second = dma
+            .begin_common_buffer_alias(owner(), adapter, reservation.common_buffer_id, 0x40_040, 64)
+            .unwrap();
+        assert_eq!(dma.end_common_buffer_alias(owner(), first), Ok(()));
+        assert_eq!(dma.free_common_buffer(owner(), 0xa000, 256), Err(DmaError::AdapterBusy));
+        let mut altered = second;
+        altered.length = 32;
+        assert_eq!(dma.end_common_buffer_alias(owner(), altered), Err(DmaError::OutOfRange));
+        assert_eq!(dma.end_common_buffer_alias(owner(), second), Ok(()));
+        assert_eq!(dma.free_common_buffer(owner(), 0xa000, 256), Ok(()));
+    }
+
+    #[test]
+    fn owner_revocation_invalidates_outstanding_common_aliases() {
+        let mut dma = DmaManager::new();
+        let adapter = dma.register_adapter(owner(), true, 4096, true);
+        let reservation = dma
+            .register_common_buffer_at(owner(), adapter, 0xb000, 256, 0x50_000)
+            .unwrap();
+        let alias = dma
+            .begin_common_buffer_alias(owner(), adapter, reservation.common_buffer_id, 0x50_000, 64)
+            .unwrap();
+        assert_eq!(dma.revoke_owner(owner()), (1, 0));
+        assert_eq!(dma.end_common_buffer_alias(owner(), alias), Err(DmaError::StaleId));
+        assert_eq!(dma.decode_owner_logical(owner(), alias.logical_base, 1), Err(DmaError::LogicalViolation));
     }
 
     #[test]
