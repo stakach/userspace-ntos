@@ -35,7 +35,10 @@ pub use headers::{
     DIRECTORY_ENTRY_RESOURCE, DIRECTORY_ENTRY_TLS,
 };
 pub use image::MappedImage;
-pub use image_header_capture::{capture_image_layout, ImageHeaderCaptureError};
+pub use image_header_capture::{
+    capture_image_layout, ImageHeaderCaptureError, ImageHeaderRead,
+    IncrementalImageLayoutCapture,
+};
 pub use image_page_fill::{
     ImagePageFileSpan, ImagePageFillPlan, ImagePageReadError, IMAGE_PAGE_SIZE,
 };

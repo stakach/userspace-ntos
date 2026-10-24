@@ -1,7 +1,7 @@
 //! SEC_IMAGE metadata capture reads bounded header windows, not the File payload.
 
 use super::*;
-use nt_pe_loader::{capture_image_layout, ImageHeaderCaptureError};
+use nt_pe_loader::{capture_image_layout, ImageHeaderCaptureError, IncrementalImageLayoutCapture};
 
 fn capture_bytes(bytes: &[u8]) -> nt_pe_loader::PeLayout {
     capture_image_layout(bytes.len() as u64, |offset, output: &mut [u8]| {
@@ -98,6 +98,41 @@ fn high_nt_offset_does_not_capture_dos_gap_eof_or_size_of_headers() {
     assert_eq!(layout.headers().size_of_headers, 0x7000_1000);
     assert_eq!(reads, [(0, 4096), (0x7000_0000, 8192)]);
     assert_eq!(layout.sections().len(), 1);
+}
+
+#[test]
+fn incremental_capture_requests_only_bounded_windows_and_waits_for_each_completion() {
+    let source = SparseHeaders::new(0x7000_0300, 1);
+    let mut capture = IncrementalImageLayoutCapture::new(source.extent);
+    let mut reads = Vec::new();
+    let layout = loop {
+        let window = capture.next_window().expect("pending header window");
+        reads.push((window.offset, window.length));
+        assert!(window.length <= 8192);
+        let mut bytes = vec![0; window.length];
+        source.read(window.offset, &mut bytes);
+        if let Some(layout) = capture.complete_window(&bytes).unwrap() {
+            break layout;
+        }
+    };
+    assert_eq!(reads, [(0, 4096), (0x7000_0000, 8192)]);
+    assert_eq!(layout.headers().nt_offset, source.offset as usize);
+    assert!(capture.next_window().is_none());
+}
+
+#[test]
+fn incremental_capture_rejects_short_window_without_advancing() {
+    let source = SparseHeaders::new(0xffc, 96);
+    let mut capture = IncrementalImageLayoutCapture::new(source.extent);
+    let first = capture.next_window().unwrap();
+    assert_eq!((first.offset, first.length), (0, 4096));
+    assert!(matches!(capture.complete_window(&[0; 8]), Err(PeError::Truncated)));
+    assert_eq!(capture.next_window(), Some(first));
+    let mut bytes = vec![0; first.length];
+    source.read(first.offset, &mut bytes);
+    assert!(capture.complete_window(&bytes).unwrap().is_none());
+    let second = capture.next_window().unwrap();
+    assert_eq!((second.offset, second.length), (0, 8192));
 }
 
 #[test]
