@@ -50,6 +50,7 @@ pub mod data_section;
 mod section_creation;
 pub use section_creation::validate_section_creation_parameters;
 pub mod pending_section_pagein;
+pub mod routed_image_read;
 pub mod image_section;
 pub mod owned_paging_structure;
 pub mod owned_object_page;

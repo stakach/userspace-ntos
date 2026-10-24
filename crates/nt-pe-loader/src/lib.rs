@@ -40,7 +40,8 @@ pub use image_header_capture::{
     IncrementalImageLayoutCapture,
 };
 pub use image_page_fill::{
-    ImagePageFileSpan, ImagePageFillPlan, ImagePageReadError, IMAGE_PAGE_SIZE,
+    ImagePageFileSpan, ImagePageFillCapture, ImagePageFillPlan, ImagePageReadError,
+    IMAGE_PAGE_SIZE,
 };
 pub use imports::{ImportRef, ImportedDll};
 pub use layout::PeLayout;
