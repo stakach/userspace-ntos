@@ -16,6 +16,59 @@ pub struct FatRangeRequest { pub sector: u32, pub kind: FatRangeRequestKind }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FatRangeProgress { Pending, Complete }
 
+/// A verified prefix of one immutable installed file's FAT chain. Only successful cursor
+/// completions can extend it; a new range may resume from any proven cluster.
+pub struct FatVerifiedChain {
+    geometry: FatPathGeometry,
+    first_cluster: u32,
+    clusters: Vec<u32>,
+}
+
+impl FatVerifiedChain {
+    pub fn new(geometry: FatPathGeometry, first_cluster: u32) -> Result<Self, FatPathError> {
+        let cursor = FatRangeLookup::new(geometry, first_cluster, 0, 1)?;
+        Ok(Self { geometry, first_cluster, clusters: cursor.visited })
+    }
+
+    pub fn absorb(&mut self, cursor: &FatRangeLookup) -> Result<(), FatPathError> {
+        if self.geometry != cursor.geometry || cursor.visited.first() != Some(&self.first_cluster) {
+            return Err(FatPathError::Invalid);
+        }
+        let common = self.clusters.len().min(cursor.visited.len());
+        if self.clusters[..common] != cursor.visited[..common] {
+            return Err(FatPathError::Corrupt);
+        }
+        if cursor.visited.len() > self.clusters.len() {
+            self.clusters.try_reserve(cursor.visited.len() - self.clusters.len())
+                .map_err(|_| FatPathError::NoCapacity)?;
+            self.clusters.extend_from_slice(&cursor.visited[self.clusters.len()..]);
+        }
+        Ok(())
+    }
+
+    pub fn lookup(&self, offset: u32, length: usize) -> Result<FatRangeLookup, FatPathError> {
+        let mut cursor = FatRangeLookup::new(self.geometry, self.first_cluster, offset, length)?;
+        cursor.visited.try_reserve(self.clusters.len().saturating_sub(1))
+            .map_err(|_| FatPathError::NoCapacity)?;
+        cursor.visited.clear();
+        cursor.visited.extend_from_slice(&self.clusters);
+        let index = (cursor.target_cluster as usize).min(self.clusters.len() - 1);
+        cursor.cluster_index = index as u32;
+        cursor.cluster = self.clusters[index];
+        cursor.sector_in_cluster = if cursor.cluster_index == cursor.target_cluster {
+            cursor.target_sector
+        } else { 0 };
+        cursor.phase = if cursor.cluster_index == cursor.target_cluster {
+            FatRangeRequestKind::Data
+        } else { FatRangeRequestKind::Fat };
+        Ok(cursor)
+    }
+
+    pub fn geometry(&self) -> FatPathGeometry { self.geometry }
+    pub fn first_cluster(&self) -> u32 { self.first_cluster }
+    pub fn len(&self) -> usize { self.clusters.len() }
+}
+
 pub struct FatRangeLookup {
     geometry: FatPathGeometry,
     cluster: u32,
@@ -94,7 +147,15 @@ impl FatRangeLookup {
         let limit = max.min(u32::try_from(needed).unwrap_or(u32::MAX));
         let mut count = limit.min(self.geometry.sectors_per_cluster.checked_sub(self.sector_in_cluster)?);
         let mut cluster = self.cluster;
+        let mut index = self.cluster_index as usize;
         while count < limit {
+            if let Some(&next) = self.visited.get(index + 1) {
+                if cluster.checked_add(1) != Some(next) { break; }
+                count += (limit - count).min(self.geometry.sectors_per_cluster);
+                cluster = next;
+                index += 1;
+                continue;
+            }
             let fat_sector = self.geometry.fat_start_sector.checked_add(cluster.checked_mul(4)? / 512)?;
             let Some((cached_sector, bytes)) = self.cached_fat_sector.as_ref() else { break; };
             if *cached_sector != fat_sector { break; }
@@ -108,6 +169,7 @@ impl FatRangeLookup {
             { break; }
             count += (limit - count).min(self.geometry.sectors_per_cluster);
             cluster = next;
+            index += 1;
         }
         Some(count).filter(|count| *count != 0)
     }
@@ -173,10 +235,14 @@ impl FatRangeLookup {
             / self.geometry.sectors_per_cluster;
         if next >= EOC || next == BAD || next < 2
             || next.checked_sub(2).is_none_or(|index| index >= clusters)
-            || self.visited.contains(&next)
+            || self.visited.get(self.cluster_index as usize + 1).is_some_and(|known| *known != next)
+            || (self.visited.get(self.cluster_index as usize + 1).is_none()
+                && self.visited.contains(&next))
         { return Err(FatPathError::Corrupt); }
-        self.visited.try_reserve(1).map_err(|_| FatPathError::NoCapacity)?;
-        self.visited.push(next);
+        if self.visited.get(self.cluster_index as usize + 1).is_none() {
+            self.visited.try_reserve(1).map_err(|_| FatPathError::NoCapacity)?;
+            self.visited.push(next);
+        }
         self.cluster = next;
         self.cluster_index += 1;
         self.sector_in_cluster = if self.cluster_index == self.target_cluster {
@@ -190,6 +256,10 @@ impl FatRangeLookup {
 
     fn follow_cached_fat(&mut self) -> Result<(), FatPathError> {
         while self.phase == FatRangeRequestKind::Fat {
+            if let Some(&next) = self.visited.get(self.cluster_index as usize + 1) {
+                self.advance_fat_entry(next)?;
+                continue;
+            }
             let request = self.request().ok_or(FatPathError::Invalid)?;
             let Some((sector, bytes)) = self.cached_fat_sector.as_ref() else { break; };
             if *sector != request.sector { break; }
@@ -201,6 +271,9 @@ impl FatRangeLookup {
     }
 
     pub fn written(&self) -> usize { self.written }
+    pub fn geometry(&self) -> FatPathGeometry { self.geometry }
+    pub fn first_cluster(&self) -> u32 { self.visited[0] }
+    pub fn verified_len(&self) -> usize { self.visited.len() }
     pub fn is_complete(&self) -> bool { self.complete }
 }
 
@@ -280,6 +353,40 @@ mod tests {
 
         let fresh = FatRangeLookup::new(geometry(), 2, 2 * 1024, 1).unwrap();
         assert_eq!(fresh.request(), Some(fat), "a new cursor must obtain its own FAT proof");
+    }
+
+    #[test]
+    fn verified_file_chain_starts_later_range_without_rewalking_earlier_fat() {
+        let geometry = FatPathGeometry { sectors_per_cluster: 1, ..geometry() };
+        let mut first = FatRangeLookup::new(geometry, 2, 0, 3 * 512).unwrap();
+        let mut output = [0; 3 * 512];
+        first.feed(first.request().unwrap(), &[1; 512], &mut output).unwrap();
+        let mut fat = [0; 512];
+        fat[8..12].copy_from_slice(&3u32.to_le_bytes());
+        fat[12..16].copy_from_slice(&4u32.to_le_bytes());
+        first.feed(first.request().unwrap(), &fat, &mut output).unwrap();
+        first.feed(first.request().unwrap(), &[2; 512], &mut output).unwrap();
+        first.feed(first.request().unwrap(), &[3; 512], &mut output).unwrap();
+
+        let mut chain = FatVerifiedChain::new(geometry, 2).unwrap();
+        chain.absorb(&first).unwrap();
+        let later = chain.lookup(2 * 512, 512).unwrap();
+        assert_eq!(later.request(), Some(FatRangeRequest { sector: 12,
+            kind: FatRangeRequestKind::Data }));
+        assert_eq!(later.contiguous_data_sectors(32), Some(1));
+
+        let beyond = chain.lookup(3 * 512, 512).unwrap();
+        assert_eq!(beyond.request(), Some(FatRangeRequest { sector: 1,
+            kind: FatRangeRequestKind::Fat }), "unverified tail still requires FAT I/O");
+
+        let mut extended = chain.lookup(512, 3 * 512).unwrap();
+        let mut output = [0; 3 * 512];
+        extended.feed(extended.request().unwrap(), &[1; 512], &mut output).unwrap();
+        extended.feed(extended.request().unwrap(), &[2; 512], &mut output).unwrap();
+        let mut cycle = [0; 512];
+        cycle[4 * 4..5 * 4].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(extended.feed(extended.request().unwrap(), &cycle, &mut output),
+            Err(FatPathError::Corrupt), "a later loop into the shared prefix remains corrupt");
     }
 
     #[test]

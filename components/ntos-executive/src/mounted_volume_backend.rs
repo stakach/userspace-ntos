@@ -19,8 +19,9 @@ use crate::fs_loader::{
     fat_open_path_metadata_from, fat_read_file_range, fat_visit_directory_checked, FatOpenMetadata,
 };
 
-#[path = "mounted_installed_read.rs"]
-pub(crate) mod mounted_installed_read;
+pub(crate) mod mounted_installed_read {
+    pub(crate) use nt_fs::{ReadCompletions, ReadError, ReadSectorClaim};
+}
 use mounted_installed_read::ReadCompletions;
 pub(crate) type MountedReadQueue = Rc<RefCell<ReadCompletions>>;
 #[path = "mounted_create_lookup.rs"]
