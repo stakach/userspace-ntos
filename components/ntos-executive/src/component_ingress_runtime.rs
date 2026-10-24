@@ -1,6 +1,7 @@
 //! Serialized native ownership transactions for the shared component endpoint.
 
 use super::*;
+use crate::print_str;
 use crate::service_sec_image::{ComponentLanes, COMPONENT_SUSPENSIONS};
 use nt_component_suspension::{
     IngressReplyObservation, LaneDispatchIdentity, PeerRetirementEffect,
@@ -573,6 +574,44 @@ pub(crate) enum Arrival {
     Call { route: PeerRoute, reply: u64 },
 }
 
+fn log_receive_error_kind(error: super::super::ReceiveError) {
+    use nt_component_suspension::ReceiveProbeError;
+    use super::super::ReceiveError;
+    let kind: &[u8] = match error {
+        ReceiveError::Probe(ReceiveProbeError::ReplyNotFree) => b"reply-not-free\n",
+        ReceiveError::Probe(ReceiveProbeError::UnknownCaller) => b"unknown-caller\n",
+        ReceiveError::Probe(ReceiveProbeError::BindingMismatch) => b"binding-mismatch\n",
+        ReceiveError::Probe(ReceiveProbeError::Query(_)) => b"probe-query\n",
+        ReceiveError::Ownership(nt_component_suspension::ReservedReceiveError::InvalidPhase) => b"ownership-invalid-phase\n",
+        ReceiveError::Ownership(nt_component_suspension::ReservedReceiveError::WrongIngress) => b"ownership-wrong-ingress\n",
+        ReceiveError::Ownership(nt_component_suspension::ReservedReceiveError::Store(error)) => {
+            print_str(b"ownership-store-");
+            let detail: &[u8] = match error {
+                nt_component_suspension::RetainedWorkError::NoCapacity => b"no-capacity\n",
+                nt_component_suspension::RetainedWorkError::ReplyInUse => b"reply-in-use\n",
+                _ => b"other\n",
+            };
+            return print_str(detail);
+        }
+        ReceiveError::Ownership(nt_component_suspension::ReservedReceiveError::Ingress(error)) => {
+            print_str(b"ownership-ingress-");
+            let detail: &[u8] = match error {
+                nt_component_suspension::IngressError::ReplyInUse => b"reply-in-use\n",
+                nt_component_suspension::IngressError::ExecutionBusy => b"execution-busy\n",
+                nt_component_suspension::IngressError::ExecutionOwnerMismatch => b"owner-mismatch\n",
+                nt_component_suspension::IngressError::NotReady => b"not-ready\n",
+                _ => b"other\n",
+            };
+            return print_str(detail);
+        }
+        ReceiveError::Ownership(_) => b"ownership-other\n",
+        ReceiveError::Capture(_, _) => b"capture\n",
+        ReceiveError::Retain(_) => b"retain\n",
+        _ => b"other\n",
+    };
+    print_str(kind);
+}
+
 /// Capture, classify and retain before returning to a handler. No borrowed owner crosses a
 /// semantic handler, and an unrelated arrival remains owned for its own physical worker.
 pub(crate) unsafe fn receive(
@@ -585,7 +624,11 @@ pub(crate) unsafe fn receive(
     let lanes = lanes();
     owner
         .receive(lanes, execution, probe_tcb, blocking)
-        .map_err(|_| Error::Receive)?;
+        .map_err(|error| {
+            print_str(b"[ingress-receive-error] stage=receive kind=");
+            log_receive_error_kind(error);
+            Error::Receive
+        })?;
     let peers = owner.peers.as_ref().expect("ready peers");
     let routes = peers;
     let mut resolver = |badge| {
@@ -604,7 +647,11 @@ pub(crate) unsafe fn receive(
         probe_tcb,
         &mut resolver,
     )
-    .map_err(|_| Error::Receive)?;
+    .map_err(|error| {
+        print_str(b"[ingress-receive-error] stage=classify kind=");
+        log_receive_error_kind(error);
+        Error::Receive
+    })?;
     if let Some(message) = notification {
         return Ok(Arrival::Notification(message));
     }

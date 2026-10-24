@@ -11,6 +11,11 @@ pub const PORT_IS_FATAL: u32 = 0x7800_0000;
 pub const TASK_FILE_FAILURE: u32 = 0xa9; // BSY | DF | DRQ | ERR
 pub const DATA_OFFSET: usize = 0x800;
 
+/// ATA commands may complete with DRDY and DSC set; only failure/busy bits refuse the data.
+pub fn read_completion_ok(task_file_status: u32) -> bool {
+    task_file_status & TASK_FILE_FAILURE == 0
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     InvalidDma,

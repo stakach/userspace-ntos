@@ -15,6 +15,7 @@ mod access;
 mod client_security;
 pub mod create_token;
 mod job_token;
+mod logon_session;
 mod native_acl;
 pub mod native_acl_inheritance;
 mod native_sd;
@@ -22,6 +23,7 @@ mod object_security;
 mod object_creation_grant;
 mod directory_security;
 mod port;
+pub mod raw_rtl;
 mod section_security;
 pub mod se_exports;
 mod sid;
@@ -60,6 +62,10 @@ pub use job_token::{
     JOB_OBJECT_SECURITY_ONLY_TOKEN, JOB_OBJECT_SECURITY_RESTRICTED_TOKEN,
     JOB_OBJECT_SECURITY_VALID_FLAGS, JOB_SECURITY_LIMIT_INFORMATION_SIZE,
 };
+pub use logon_session::{
+    LogonSessionRegistry, STATUS_BAD_LOGON_SESSION_STATE, STATUS_LOGON_SESSION_EXISTS,
+    STATUS_NO_SUCH_LOGON_SESSION,
+};
 pub use native_acl::{NativeAcl, NativeAclError, STATUS_INVALID_ACL};
 mod key_creation;
 mod key_open;
@@ -87,7 +93,8 @@ pub use native_sd::{
     UNPROTECTED_SACL_SECURITY_INFORMATION,
 };
 pub use port::{
-    validate_secure_port_connect, SecurePortConnectSecurity, STATUS_SERVER_SID_MISMATCH,
+    authorize_port_connect, validate_secure_port_connect, SecurePortConnectSecurity,
+    PORT_CONNECT, PORT_GENERIC_MAPPING, STATUS_SERVER_SID_MISMATCH,
 };
 pub use section_security::{
     assign_section_security, authorize_section_open, SECTION_GENERIC_MAPPING,

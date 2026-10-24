@@ -31,6 +31,37 @@ struct TemporaryPinRow {
 static mut TEMPORARY_PINS: Vec<TemporaryPinRow> = Vec::new();
 static mut NEXT_TEMPORARY_PIN_ID: u64 = 1;
 
+/// Long-lived framebuffer grants are separate from callback pins. Their owner is the video
+/// mapping transaction, and generic pool free remains excluded until the caller alias is gone.
+struct VideoPinRow {
+    id: u64,
+    instance: DriverInstance,
+    domain: HostedDomainIdentity,
+    allocation: SourcePoolAllocationIdentity,
+    uncertain: bool,
+}
+static mut VIDEO_PINS: Vec<VideoPinRow> = Vec::new();
+static mut NEXT_VIDEO_PIN_ID: u64 = 1;
+
+fn video_pins() -> &'static mut Vec<VideoPinRow> {
+    unsafe { &mut *core::ptr::addr_of_mut!(VIDEO_PINS) }
+}
+
+#[must_use = "retain through alias revocation and exact UNMAP ownership"]
+pub(super) struct VideoPoolPin {
+    id: u64,
+    instance: DriverInstance,
+    domain: HostedDomainIdentity,
+    allocation: SourcePoolAllocationIdentity,
+    held: bool,
+}
+
+impl VideoPoolPin {
+    pub(super) fn allocation(&self) -> SourcePoolAllocationIdentity { self.allocation }
+    pub(super) fn domain(&self) -> HostedDomainIdentity { self.domain }
+    pub(super) fn instance(&self) -> DriverInstance { self.instance }
+}
+
 fn temporary_pins() -> &'static mut Vec<TemporaryPinRow> {
     unsafe { &mut *core::ptr::addr_of_mut!(TEMPORARY_PINS) }
 }
@@ -207,6 +238,66 @@ unsafe fn allocation_containing(
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
     Ok(exact)
+}
+
+pub(super) unsafe fn pin_video_pool_range(
+    inst: DriverInstance,
+    address: u64,
+    bytes: u64,
+) -> Result<VideoPoolPin, nt_status::NtStatus> {
+    let _durable = crate::allocator::enter_durable();
+    let _guard = lock();
+    let domain = validate_arena(inst)?;
+    let _pool = hosted_instance_pool_lock(inst.exec_pool_va)
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    let exact = allocation_containing(inst, address, bytes)?;
+    if exact.component_address & 0xfff != 0 || exact.capacity & 0xfff != 0
+        || ledger().protects_address(domain, exact.component_address)
+        || rows().iter().any(|row| same_pool(row.instance, inst)
+            && row.allocation.component_address == exact.component_address)
+        || file_rows().iter().any(|row| same_pool(row.instance, inst)
+            && protects_file_member(row, exact.component_address))
+        || temporary_pins().iter().any(|row| same_pool(row.instance, inst)
+            && contains_allocation(row.allocation, exact.component_address))
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    video_pins().try_reserve(1)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let id = NEXT_VIDEO_PIN_ID;
+    NEXT_VIDEO_PIN_ID = id.checked_add(1)
+        .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    video_pins().push(VideoPinRow { id, instance: inst, domain, allocation: exact, uncertain: false });
+    Ok(VideoPoolPin { id, instance: inst, domain, allocation: exact, held: true })
+}
+
+pub(super) fn quarantine_video_pool_pin(pin: &VideoPoolPin) -> bool {
+    let _guard = lock();
+    let Some(row) = video_pins().iter_mut().find(|row| row.id == pin.id) else { return false; };
+    if !pin.held || !same_arena(row.instance, pin.instance)
+        || row.domain != pin.domain || row.allocation != pin.allocation { return false; }
+    row.uncertain = true;
+    true
+}
+
+pub(super) unsafe fn release_video_pool_pin(
+    pin: &mut VideoPoolPin,
+) -> Result<(), nt_status::NtStatus> {
+    let _guard = lock();
+    if !pin.held { return Err(nt_status::NtStatus::INVALID_HANDLE); }
+    let index = video_pins().iter().position(|row| row.id == pin.id
+        && same_arena(row.instance, pin.instance)
+        && row.domain == pin.domain && row.allocation == pin.allocation)
+        .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if video_pins()[index].uncertain { return Err(nt_status::NtStatus::DEVICE_BUSY); }
+    let _pool = hosted_instance_pool_lock(pin.instance.exec_pool_va)
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    if allocation(pin.instance, pin.allocation.component_address)? != pin.allocation {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    video_pins().swap_remove(index);
+    pin.held = false;
+    Ok(())
 }
 
 /// Pin the exact live pool allocation containing a callback byte range before provider entry.
@@ -463,6 +554,38 @@ pub(super) unsafe fn retire_owned_temporary_pool_allocation(
     Ok(())
 }
 
+/// VideoPort transfers ownership of its monitor array to the successful IOCTL caller. The
+/// win32k bridge is that caller's proxy: its typed lease proves the exact provider generation,
+/// dependent free, and completion barrier before this physical free may be attempted.
+pub(super) unsafe fn retire_transferred_monitor_array(
+    pin: &mut TemporaryPoolPin,
+    ownership: &nt_io_manager::video_monitor_array_projection::MonitorArrayProjection,
+) -> Result<(), nt_status::NtStatus> {
+    use nt_io_manager::video_monitor_array_projection::MonitorArrayAllocation;
+    let source = MonitorArrayAllocation::new(pin.domain, pin.allocation)
+        .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+    if ownership.source() != source || !ownership.provider_retirement_ready() {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    retire_owned_temporary_pool_allocation(pin)
+}
+
+/// A sealed, acknowledged source IOCTL may stop after capture but before any dependent pointer
+/// projection exists. Its successful VideoPort result still transferred ownership to the caller;
+/// the retained exact pin is the authority to retire that unpublished allocation once.
+pub(super) unsafe fn retire_unpublished_transferred_monitor_array(
+    pin: &mut TemporaryPoolPin,
+    source: nt_io_manager::video_monitor_array_projection::MonitorArrayAllocation,
+) -> Result<(), nt_status::NtStatus> {
+    use nt_io_manager::video_monitor_array_projection::MonitorArrayAllocation;
+    if MonitorArrayAllocation::new(pin.domain, pin.allocation)
+        .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)? != source
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    retire_owned_temporary_pool_allocation(pin)
+}
+
 /// The returned lock spans the subsequent generic free, preventing publication in between.
 pub(super) fn generic_free_admission(
     inst: DriverInstance,
@@ -480,6 +603,9 @@ pub(super) fn generic_free_admission(
             .iter()
             .any(|row| same_pool(row.instance, inst) && protects_file_member(row, address))
         || temporary_pins().iter().any(|row| {
+            same_pool(row.instance, inst) && contains_allocation(row.allocation, address)
+        })
+        || video_pins().iter().any(|row| {
             same_pool(row.instance, inst) && contains_allocation(row.allocation, address)
         })
     {
@@ -943,6 +1069,21 @@ pub(super) unsafe fn capture_allocation(
     allocation(inst, address)
 }
 
+/// Resolve an interior output cell to its exact physical pool allocation.
+/// The caller retains the returned generation across a parked callback and
+/// rechecks it before copyout; owned Device projections remain free excluded
+/// by their registration, while other allocations need a temporary pin.
+pub(super) unsafe fn capture_range_allocation(
+    inst: DriverInstance,
+    address: u64,
+    bytes: u64,
+) -> Result<SourcePoolAllocationIdentity, nt_status::NtStatus> {
+    validate_arena(inst)?;
+    let _pool =
+        hosted_instance_pool_lock(inst.exec_pool_va).ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    allocation_containing(inst, address, bytes)
+}
+
 /// Free one row-owned graph member only when its original physical allocation is still live.
 /// The caller clears its ownership bit only after this exact free acknowledges success.
 pub(super) unsafe fn free_captured_allocation(
@@ -1034,6 +1175,40 @@ pub(super) fn registration(
         .ok_or(nt_status::NtStatus::INVALID_HANDLE)
 }
 
+/// Prove the physical allocation behind one already identified published Device projection.
+/// The registration may name a logical driver in another domain; the supplied instance is the
+/// physical pool owner. Callers must separately revalidate the registration in IoManager and
+/// the provider dependency before using this allocation as a dispatch route.
+pub(super) unsafe fn published_allocation_for_registration(
+    inst: DriverInstance,
+    registration: HostedDevicePointerRegistration,
+) -> Result<SourcePoolAllocationIdentity, nt_status::NtStatus> {
+    let _guard = lock();
+    let physical = validate_arena(inst)?;
+    let row = rows()
+        .iter()
+        .find(|row| {
+            same_arena(row.instance, inst)
+                && row.domain == physical
+                && row.allocation.component_address == registration.address()
+                && row.registration == Some(registration)
+        })
+        .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if row.retirement_pending {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    let exact = row.allocation;
+    if ledger().physical_allocation_for_registration(registration) != Some((physical, exact)) {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    let _pool = hosted_instance_pool_lock(inst.exec_pool_va)
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    if allocation(inst, registration.address())? != exact {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    Ok(exact)
+}
+
 /// Cleanup provenance includes a canonical bind accepted before a later physical publication
 /// refusal. Live callers use `registration`, which exposes only fully published rows.
 pub(super) fn accepted_registration(
@@ -1055,6 +1230,9 @@ pub(super) fn instance_quiesced(inst: DriverInstance) -> bool {
             .iter()
             .any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
         && !temporary_pins()
+        .iter()
+        .any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
+        && !video_pins()
         .iter()
         .any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
 }

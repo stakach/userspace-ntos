@@ -118,6 +118,7 @@ struct Work {
     metadata_id: Option<PendingSectionMetadataId>,
     file_metadata: Option<nt_memory_manager::RoutedSectionMetadata>,
     image_header: Vec<u8>,
+    image_layout: Option<nt_pe_loader::PeLayout>,
     image_path: Option<Vec<u8>>,
     observation_target: Option<nt_exe_image::CapturedImageObservation>,
     reserved: Option<ReservedSection>,
@@ -410,6 +411,7 @@ unsafe fn retain_work(
         metadata_id,
         file_metadata: None,
         image_header: Vec::new(),
+        image_layout: None,
         image_path: submission.image_path,
         observation_target: submission.observation_target,
         reserved: reserved
@@ -898,6 +900,56 @@ unsafe fn advance(
                 return Step::Progress;
             }
             let metadata = work.file_metadata.expect("image file metadata");
+            if work.image_header.is_empty() && work.image_layout.is_none() {
+                let capture = work.capture.as_ref().expect("image header File capture");
+                let immutable = driver_launch::io_manager_mut().immutable_file_extent(
+                    nt_types::ClientId(driver_launch::IO_MANAGER_COMPONENT_ID),
+                    FileId(capture.file_id()),
+                    DeviceId(capture.device_id()),
+                    capture.fs_context(),
+                );
+                match immutable {
+                    Ok(Some(extent)) if extent == metadata.end_of_file && !metadata.is_directory => {
+                        let layout = nt_pe_loader::capture_image_layout(extent, |offset, output| {
+                            let (status, read) = crate::routed_section_io::read_retained(
+                                capture.file_id(), capture.device_id(), capture.fs_context(),
+                                offset, output,
+                            );
+                            if status == 0 { Ok(read) } else { Err(status) }
+                        });
+                        match layout {
+                            Ok(layout) => {
+                                work.image_layout = Some(layout);
+                                work.phase = Phase::Publish;
+                            }
+                            Err(nt_pe_loader::ImageHeaderCaptureError::Read(status)) => {
+                                work.status = status;
+                                work.phase = Phase::ReadyReply;
+                            }
+                            Err(nt_pe_loader::ImageHeaderCaptureError::ShortRead { .. }) => {
+                                work.status = 0xc000_0185;
+                                work.phase = Phase::ReadyReply;
+                            }
+                            Err(nt_pe_loader::ImageHeaderCaptureError::Parse(_)) => {
+                                work.status = STATUS_INVALID_IMAGE_FORMAT;
+                                work.phase = Phase::ReadyReply;
+                            }
+                        }
+                        return Step::Progress;
+                    }
+                    Ok(Some(_)) => {
+                        work.status = STATUS_INVALID_IMAGE_FORMAT;
+                        work.phase = Phase::ReadyReply;
+                        return Step::Progress;
+                    }
+                    Ok(None) => {}
+                    Err(status) => {
+                        work.status = status.raw() as u32;
+                        work.phase = Phase::ReadyReply;
+                        return Step::Progress;
+                    }
+                }
+            }
             let offset = work.image_header.len();
             let Ok(file_size) = usize::try_from(metadata.end_of_file) else {
                 work.status = STATUS_INSUFFICIENT_RESOURCES;
@@ -1094,6 +1146,7 @@ unsafe fn advance(
                             capture,
                             metadata,
                             header: core::mem::take(&mut work.image_header),
+                            layout: work.image_layout.take(),
                             image_path: work.image_path.take().expect("captured image File name"),
                             observation_target: work.observation_target,
                             name: work.image_name.take(),

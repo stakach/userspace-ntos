@@ -30,6 +30,9 @@ pub mod exception_images;
 pub mod exception_snapshot;
 pub mod exception_walk;
 pub mod hardware_fault;
+pub mod kernel_frame_ingress;
+pub mod user_frame_source;
+pub mod user_image_catalog;
 pub mod raw_context;
 pub mod raw_exception;
 pub mod seh_linkage_image;
@@ -369,6 +372,14 @@ pub enum FrameWalkError {
     StackRead,
     /// A covering runtime function had unreadable or invalid unwind metadata.
     UnwindData,
+    /// The starting PC has no authenticated executable-image ownership.
+    UnknownImage,
+    /// An admitted image reported unreadable or corrupt exception metadata.
+    ImageLookup(exception_walk::ExceptionImageError),
+    /// The captured context does not match the retained provider ingress return slot.
+    InvalidCallSite,
+    /// Low flag bits require a separately authenticated user-stack transition.
+    UnsupportedFlags,
 }
 
 /// Restrict stack reads to one active thread or provider lane before consulting the backing reader.
@@ -453,6 +464,213 @@ pub fn walk_frame_chain(
         }
     }
     Ok(total)
+}
+
+/// Walk a hosted kernel component's frame chain through admitted PE images.
+///
+/// The caller supplies an already captured x64 context, authenticated physical
+/// lane stack bounds, and an immutable catalog of admitted executable images.
+/// Only a PC positively classified as an image leaf may pop a return address
+/// without `.pdata`; an unknown PC ends a proven chain and can never become a
+/// guessed leaf. The catalog must cover every PE image executable in the lane.
+///
+/// The return count includes successfully skipped frames, matching ReactOS.
+pub fn walk_kernel_frame_chain<I: exception_walk::ExceptionImageReader>(
+    context: Context,
+    callers: &mut [u64],
+    frames_to_skip: usize,
+    stack_low: u64,
+    stack_high: u64,
+    image: &I,
+    stack: &dyn StackReader,
+) -> Result<usize, FrameWalkError> {
+    walk_kernel_frame_chain_with_stop(
+        context, callers, frames_to_skip, stack_low, stack_high, image, stack,
+    )
+    .map(|walk| walk.count)
+}
+
+/// Why an admitted kernel walk stopped. A stack boundary permits a separately authenticated
+/// attached-user walk; this result alone never authenticates the user TCB or its image catalog.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FrameChainStop {
+    Budget,
+    StackBoundary,
+    UnknownImage,
+}
+
+impl FrameChainStop {
+    pub const fn authorizes_attached_user(self) -> bool {
+        matches!(self, Self::StackBoundary)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FrameChainWalk {
+    pub count: usize,
+    pub stop: FrameChainStop,
+}
+
+fn walk_kernel_frame_chain_with_stop<I: exception_walk::ExceptionImageReader>(
+    mut context: Context,
+    callers: &mut [u64],
+    frames_to_skip: usize,
+    stack_low: u64,
+    stack_high: u64,
+    image: &I,
+    stack: &dyn StackReader,
+) -> Result<FrameChainWalk, FrameWalkError> {
+    use exception_walk::{ExceptionFunction, ExceptionImageError};
+
+    let bounded = BoundedStack::new(stack, stack_low, stack_high)?;
+    let total = frames_to_skip
+        .checked_add(callers.len())
+        .ok_or(FrameWalkError::CountOverflow)?;
+    let mut control_pc = context.rip;
+
+    for index in 0..total {
+        let frame = match image.lookup_exception_function(control_pc) {
+            Ok(frame) => frame,
+            Err(ExceptionImageError::UnknownImage) if index > 0 => {
+                return Ok(FrameChainWalk {
+                    count: index,
+                    stop: FrameChainStop::UnknownImage,
+                });
+            }
+            Err(ExceptionImageError::UnknownImage) => return Err(FrameWalkError::UnknownImage),
+            Err(error) => return Err(FrameWalkError::ImageLookup(error)),
+        };
+        match frame {
+            ExceptionFunction::Function { image_base, function } => {
+                virtual_unwind(
+                    unw_flag::NHANDLER,
+                    image_base,
+                    control_pc,
+                    function,
+                    &mut context,
+                    image,
+                    &bounded,
+                )
+                .ok_or(FrameWalkError::UnwindData)?;
+            }
+            ExceptionFunction::Leaf => {
+                let rsp = context.rsp();
+                context.rip = bounded.read_u64(rsp).ok_or(FrameWalkError::StackRead)?;
+                context.set_rsp(rsp.checked_add(8).ok_or(FrameWalkError::StackRead)?);
+            }
+        }
+
+        if context.rsp() <= stack_low || context.rsp() >= stack_high {
+            return Ok(FrameChainWalk {
+                count: index,
+                stop: FrameChainStop::StackBoundary,
+            });
+        }
+        match image.lookup_exception_function(context.rip) {
+            Ok(_) => {}
+            Err(ExceptionImageError::UnknownImage) => {
+                return Ok(FrameChainWalk {
+                    count: index,
+                    stop: FrameChainStop::UnknownImage,
+                });
+            }
+            Err(error) => return Err(FrameWalkError::ImageLookup(error)),
+        }
+        control_pc = context.rip;
+        if index >= frames_to_skip {
+            callers[index - frames_to_skip] = control_pc;
+        }
+    }
+    Ok(FrameChainWalk {
+        count: total,
+        stop: FrameChainStop::Budget,
+    })
+}
+
+/// A provider callsite verified against its retained lane's entry return slot.
+///
+/// The caller must keep `stack` tied to the exact live physical lane throughout construction and
+/// walking. This value is a checked snapshot, not an independent lane ownership token.
+#[derive(Copy, Clone, Debug)]
+pub struct CapturedKernelCallSite {
+    context: Context,
+    stack_low: u64,
+    stack_high: u64,
+}
+
+impl CapturedKernelCallSite {
+    /// Check that an ingress-captured `CONTEXT` begins immediately after the provider's call and
+    /// names the return PC actually stored in the retained lane stack.
+    pub fn from_entry<I: exception_walk::ExceptionImageReader>(
+        context: Context,
+        entry_rsp: u64,
+        stack_low: u64,
+        stack_high: u64,
+        image: &I,
+        stack: &dyn StackReader,
+    ) -> Result<Self, FrameWalkError> {
+        let bounded = BoundedStack::new(stack, stack_low, stack_high)?;
+        let post_call_rsp = entry_rsp.checked_add(8).ok_or(FrameWalkError::InvalidCallSite)?;
+        if context.rsp() != post_call_rsp
+            || context.rsp() >= stack_high
+            || context.rsp() <= stack_low
+        {
+            return Err(FrameWalkError::InvalidCallSite);
+        }
+        let return_pc = bounded.read_u64(entry_rsp).ok_or(FrameWalkError::StackRead)?;
+        if context.rip != return_pc {
+            return Err(FrameWalkError::InvalidCallSite);
+        }
+        match image.lookup_exception_function(return_pc) {
+            Ok(_) => Ok(Self {
+                context,
+                stack_low,
+                stack_high,
+            }),
+            Err(exception_walk::ExceptionImageError::UnknownImage) => {
+                Err(FrameWalkError::UnknownImage)
+            }
+            Err(error) => Err(FrameWalkError::ImageLookup(error)),
+        }
+    }
+}
+
+/// Walk a captured kernel callsite with ReactOS high-byte skip semantics.
+///
+/// Flag bit 0 requests a user-stack transition. The kernel-only catalog and stack reader cannot
+/// prove that transition, so low flag bits are refused until a separate attached-user authority
+/// is supplied. The return count includes successfully skipped frames.
+pub fn walk_captured_kernel_frame_chain<I: exception_walk::ExceptionImageReader>(
+    captured: CapturedKernelCallSite,
+    callers: &mut [u64],
+    flags: u32,
+    image: &I,
+    stack: &dyn StackReader,
+) -> Result<usize, FrameWalkError> {
+    walk_captured_kernel_frame_chain_with_stop(captured, callers, flags, image, stack)
+        .map(|walk| walk.count)
+}
+
+/// Preserve the kernel stop provenance for an attached-user continuation decision.
+pub fn walk_captured_kernel_frame_chain_with_stop<I: exception_walk::ExceptionImageReader>(
+    captured: CapturedKernelCallSite,
+    callers: &mut [u64],
+    flags: u32,
+    image: &I,
+    stack: &dyn StackReader,
+) -> Result<FrameChainWalk, FrameWalkError> {
+    if flags & 0xff != 0 {
+        return Err(FrameWalkError::UnsupportedFlags);
+    }
+    walk_kernel_frame_chain_with_stop(
+        captured.context,
+        callers,
+        (flags >> 8) as usize,
+        captured.stack_low,
+        captured.stack_high,
+        image,
+        stack,
+    )
 }
 
 /// Validate the bounded request used by `RtlCaptureStackBackTrace`. The native routine adds one

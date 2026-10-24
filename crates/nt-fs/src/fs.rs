@@ -7,6 +7,8 @@
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+#[cfg(test)]
+use core::sync::atomic::{AtomicUsize, Ordering};
 use nt_config_store::codec::{crc32c, crc32c_combine, Crc32c};
 
 use crate::directory::{
@@ -525,6 +527,8 @@ struct MemFsDirEntry {
 pub struct MemFs {
     nodes: Vec<Option<MemFsNode>>,
     blobs: Vec<Vec<u8>>,
+    #[cfg(test)]
+    blob_slice_candidates_inspected: AtomicUsize,
     next_file_id: u64,
     next_entry_id: u64,
     current_time_100ns: u64,
@@ -546,6 +550,8 @@ impl MemFs {
         let mut fs = MemFs {
             nodes: Vec::new(),
             blobs: Vec::new(),
+            #[cfg(test)]
+            blob_slice_candidates_inspected: AtomicUsize::new(0),
             next_file_id: 1,
             next_entry_id: 1,
             current_time_100ns: 0,
@@ -795,6 +801,14 @@ impl MemFs {
     /// Serialize the volume tree to a versioned, checksummed snapshot. Open FILE_OBJECT handles are
     /// intentionally not part of the image; a restored boot reopens files through normal Zw paths.
     pub fn to_snapshot(&self) -> Result<Vec<u8>, MemFsSnapshotError> {
+        let mut out = Vec::new();
+        self.write_snapshot_into(&mut out)?;
+        Ok(out)
+    }
+
+    /// Replace a caller-owned capture with the exact current snapshot, retaining its allocation
+    /// for later captures. The caller must keep these bytes immutable through physical commit.
+    pub fn write_snapshot_into(&self, out: &mut Vec<u8>) -> Result<(), MemFsSnapshotError> {
         let root = self.node(0).ok_or(MemFsSnapshotError::InvalidRecord)?;
         let mut record_count = 1u32;
         let mut path = String::new();
@@ -809,21 +823,21 @@ impl MemFs {
             )?)
             .ok_or(MemFsSnapshotError::InvalidRecord)?;
 
-        let mut out = Vec::new();
         let total_len = MEMFS_SNAPSHOT_HEADER_LEN
             .checked_add(payload_len)
             .ok_or(MemFsSnapshotError::InvalidRecord)?;
-        out.try_reserve_exact(total_len)
+        out.clear();
+        out.try_reserve(total_len)
             .map_err(|_| MemFsSnapshotError::OutOfMemory)?;
         out.resize(MEMFS_SNAPSHOT_HEADER_LEN, 0);
-        self.write_snapshot_record("", root, false, FileShortName::EMPTY, &mut out)?;
+        self.write_snapshot_record("", root, false, FileShortName::EMPTY, out)?;
         let mut written_records = 1u32;
         let mut written_files = Vec::new();
         self.write_snapshot_children(
             0,
             &mut path,
             &mut written_files,
-            &mut out,
+            out,
             &mut written_records,
         )?;
         if written_records != record_count || out.len() != total_len {
@@ -836,7 +850,7 @@ impl MemFs {
             payload_len as u64,
             payload_crc,
         );
-        Ok(out)
+        Ok(())
     }
 
     /// Restore a volume from [`Self::to_snapshot`] bytes.
@@ -2497,19 +2511,32 @@ impl MemFs {
 
     /// Create every missing directory along a folded volume-relative path, returning the leaf id.
     fn ensure_dir_folded_relative(&mut self, path: &[u8]) -> Option<u64> {
+        self.materialize_parent_folded_relative(path).ok()
+    }
+
+    /// Fallible directory materialization used by a prepared CREATE transaction. Each component
+    /// is admitted before its local namespace effect; the outer transaction rolls back earlier
+    /// components if a later admission fails.
+    fn materialize_parent_folded_relative(&mut self, path: &[u8]) -> Result<u64, u32> {
         let mut cur = 0;
         for comp in path.split(|byte| *byte == b'\\').filter(|c| !c.is_empty()) {
+            if !self.is_dir(cur) {
+                return Err(STATUS_OBJECT_PATH_NOT_FOUND);
+            }
             cur = match self.child_folded_bytes(cur, comp) {
                 Some(id) => id,
                 None => {
                     let name = core::str::from_utf8(comp)
-                        .map_err(|_| STATUS_INVALID_PARAMETER)
-                        .ok()?;
-                    self.create_child(cur, name, true)
+                        .map_err(|_| STATUS_INVALID_PARAMETER)?;
+                    let plan = self.prepare_create_child(
+                        cur, name, FILE_DIRECTORY_FILE, 0,
+                        &mut file_create::CreateAllocator::default(),
+                    )?;
+                    self.apply_create(plan).0
                 }
             };
         }
-        Some(cur)
+        if self.is_dir(cur) { Ok(cur) } else { Err(STATUS_OBJECT_PATH_NOT_FOUND) }
     }
 
     /// Resolve a volume-relative path to a node id.
@@ -2962,6 +2989,52 @@ impl MemFs {
         let Some(n) = self.node(id) else { return 0 };
         n.data.read_into(&self.blobs, offset, out)
     }
+
+    /// Preserve only a read wholly backed by one immutable blob. The writer still compares its
+    /// bytes with that exact range before sharing it; this is a hint, never authority for content.
+    fn immutable_read_extent(&self, id: u64, offset: u64, len: usize) -> Option<FileExtent> {
+        if len == 0 {
+            return None;
+        }
+        let FileData::Extents(extents) = &self.node(id)?.data else {
+            return None;
+        };
+        let start = usize::try_from(offset).ok()?;
+        let end = start.checked_add(len)?;
+        let mut file_offset = 0usize;
+        for extent in extents {
+            let extent_end = file_offset.checked_add(extent.len)?;
+            if start >= file_offset && end <= extent_end && extent.blob != ZERO_EXTENT_BLOB {
+                let blob_offset = extent.offset.checked_add(start - file_offset)?;
+                let blob_end = blob_offset.checked_add(len)?;
+                self.blobs.get(extent.blob)?.get(blob_offset..blob_end)?;
+                return Some(FileExtent {
+                    blob: extent.blob,
+                    offset: blob_offset,
+                    len,
+                });
+            }
+            file_offset = extent_end;
+        }
+        None
+    }
+
+    fn matching_immutable_read(
+        &self,
+        bytes: &[u8],
+        recent: Option<FileExtent>,
+    ) -> Option<FileExtent> {
+        let extent = recent?;
+        if extent.len != bytes.len() || extent.blob == ZERO_EXTENT_BLOB {
+            return None;
+        }
+        let end = extent.offset.checked_add(extent.len)?;
+        #[cfg(test)]
+        self.blob_slice_candidates_inspected
+            .fetch_add(1, Ordering::Relaxed);
+        (self.blobs.get(extent.blob)?.get(extent.offset..end)? == bytes).then_some(extent)
+    }
+
     /// Replace a file node's contents with `bytes`, allocating EXACTLY once (the volume lives on a
     /// bump heap in the executive, so a growth-by-doubling `resize` would strand the intermediate
     /// buffers). `false` if the node is missing or is a directory.
@@ -3053,7 +3126,13 @@ impl MemFs {
         }
     }
 
-    fn write_at(&mut self, id: u64, offset: u64, bytes: &[u8]) -> usize {
+    fn write_at(
+        &mut self,
+        id: u64,
+        offset: u64,
+        bytes: &[u8],
+        recent_read: Option<FileExtent>,
+    ) -> usize {
         let Some(node) = self.node(id) else {
             return 0;
         };
@@ -3074,7 +3153,7 @@ impl MemFs {
                 if extents.iter().any(|extent| extent.blob == ZERO_EXTENT_BLOB)
         );
         if sparse_extent_backed {
-            let Some(extent) = self.extent_for_bytes(bytes) else {
+            let Some(extent) = self.extent_for_bytes(bytes, recent_read) else {
                 return 0;
             };
             return if self.splice_write_extent(id, start, extent) {
@@ -3083,8 +3162,10 @@ impl MemFs {
                 0
             };
         }
-        let copied_extent = (start == current_len)
-            .then(|| self.find_blob_slice(bytes))
+        let can_append_extent = matches!(&node.data, FileData::Extents(_))
+            || matches!(&node.data, FileData::Bytes(data) if data.is_empty());
+        let copied_extent = (start == current_len && can_append_extent)
+            .then(|| self.matching_immutable_read(bytes, recent_read))
             .flatten();
         if let Some(extent) = copied_extent {
             let Some(node) = self.node_mut(id) else {
@@ -3218,8 +3299,12 @@ impl MemFs {
         bytes.len()
     }
 
-    fn extent_for_bytes(&mut self, bytes: &[u8]) -> Option<FileExtent> {
-        self.find_blob_slice(bytes).or_else(|| {
+    fn extent_for_bytes(
+        &mut self,
+        bytes: &[u8],
+        recent_read: Option<FileExtent>,
+    ) -> Option<FileExtent> {
+        self.matching_immutable_read(bytes, recent_read).or_else(|| {
             let blob = self.intern_blob(bytes)?;
             Some(FileExtent {
                 blob,
@@ -3336,27 +3421,6 @@ impl MemFs {
         self.blobs.try_reserve_exact(1).ok()?;
         self.blobs.push(bytes);
         Some(self.blobs.len() - 1)
-    }
-
-    fn find_blob_slice(&self, bytes: &[u8]) -> Option<FileExtent> {
-        if bytes.is_empty() {
-            return None;
-        }
-        for (blob_index, blob) in self.blobs.iter().enumerate() {
-            if bytes.len() > blob.len() {
-                continue;
-            }
-            for offset in 0..=blob.len() - bytes.len() {
-                if &blob[offset..offset + bytes.len()] == bytes {
-                    return Some(FileExtent {
-                        blob: blob_index,
-                        offset,
-                        len: bytes.len(),
-                    });
-                }
-            }
-        }
-        None
     }
 
     fn materialize_node_data(&mut self, id: u64) -> bool {
@@ -3825,6 +3889,9 @@ pub fn parse_file_basic_information_attributes(data: &[u8]) -> Result<u32, u32> 
 /// exposing the Zw* native file APIs (spec §8-§9).
 pub struct FileSystem {
     volume: MemFs,
+    /// Last exact immutable range returned to a caller. Consumed by the next write after an
+    /// exact byte comparison, so unrelated writes never search provisioned file contents.
+    recent_immutable_read: Option<FileExtent>,
     mounts: MountManager,
     handles: Vec<Option<FileObject>>,
     /// Live log nodes still covered by an unfurled volume WAL suffix.
@@ -3850,6 +3917,7 @@ impl FileSystem {
     pub fn new(volume: MemFs) -> Self {
         FileSystem {
             volume,
+            recent_immutable_read: None,
             mounts: MountManager::new(),
             handles: Vec::new(),
             wal_protected_logs: Vec::new(),
@@ -4008,8 +4076,18 @@ impl FileSystem {
         self.volume.to_snapshot()
     }
 
+    /// Capture into retained storage for checkpoints that must keep one immutable image across
+    /// native I/O reentry and reuse the allocation on later commits.
+    pub fn export_volume_snapshot_into(
+        &self,
+        out: &mut Vec<u8>,
+    ) -> Result<(), MemFsSnapshotError> {
+        self.volume.write_snapshot_into(out)
+    }
+
     /// Reclaim immutable file-data blobs made unreachable by truncate, replace, or unlink.
     pub fn compact_volume_blobs(&mut self) -> Result<MemFsBlobCompaction, MemFsBlobCompactError> {
+        self.recent_immutable_read = None;
         self.volume.compact_blobs()
     }
 
@@ -4507,7 +4585,11 @@ impl FileSystem {
         if leaf.is_empty() || leaf == "." || leaf == ".." {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let (node_id, entry_id) = self.volume.create_child_with_entry(parent, leaf, false);
+        let plan = self.volume.prepare_create_child(
+            parent, leaf, FILE_NON_DIRECTORY_FILE, 0,
+            &mut file_create::CreateAllocator::default(),
+        )?;
+        let (node_id, entry_id, _) = self.volume.apply_create(plan);
         if !self.volume.set_file_data_owned(node_id, bytes) {
             let _ = self.volume.unlink_entry(entry_id);
             self.volume.reap_unlinked(node_id);
@@ -4526,6 +4608,62 @@ impl FileSystem {
             attributes => attributes,
         };
         Ok(true)
+    }
+
+    /// Complete a prepared lower-layer CREATE as one resident namespace transaction. The caller
+    /// has already proved `parent_path` against the immutable installed source and owns `bytes`.
+    /// No backing-device I/O occurs here. A failed final CREATE removes only entries this call
+    /// created; a pre-existing writable entry and its handles remain untouched.
+    pub fn create_prepared_overlay_relative(
+        &mut self,
+        relative: &[u8],
+        parent_path: Option<&[u8]>,
+        import: Option<(FileMetadata, Vec<u8>)>,
+        desired_access: u32,
+        file_attributes: u32,
+        share_access: u32,
+        disposition: u32,
+        options: u32,
+    ) -> CreateResult {
+        let first_entry = self.volume.next_entry_id;
+        let first_file = self.volume.next_file_id;
+        let first_node_len = self.volume.nodes.len();
+        let fail = |status| CreateResult {
+            status, handle: INVALID_HANDLE, information: 0,
+        };
+        let result = (|| {
+            if let Some(parent) = parent_path {
+                if let Err(status) = self.volume.materialize_parent_folded_relative(parent) {
+                    return fail(status);
+                }
+            }
+            if let Some((metadata, bytes)) = import {
+                if let Err(status) = self.import_file_relative(relative, metadata, bytes) {
+                    return fail(status);
+                }
+            }
+            self.zw_create_file_relative(relative, desired_access, file_attributes,
+                share_access, disposition, options)
+        })();
+        if result.status == STATUS_SUCCESS {
+            return result;
+        }
+        // Provisioning and import publish neither handles nor notifications. `zw_create` plans
+        // all fallible work before `apply_create`, so a failed result added no File object or
+        // entry. Reverse identity order removes the imported leaf before any new parent.
+        let mut entry = self.volume.next_entry_id;
+        while entry > first_entry {
+            entry -= 1;
+            if self.volume.entry_location(entry).is_some() {
+                let node = self.volume.unlink_entry(entry)
+                    .expect("newly created transaction entry has no published child");
+                self.volume.reap_unlinked(node);
+            }
+        }
+        self.volume.nodes.truncate(first_node_len);
+        self.volume.next_file_id = first_file;
+        self.volume.next_entry_id = first_entry;
+        result
     }
 
     /// Create or open a folded path beneath an existing directory FILE_OBJECT. The directory's
@@ -4601,6 +4739,9 @@ impl FileSystem {
             return (STATUS_END_OF_FILE, Vec::new());
         }
         let bytes = self.volume.read_at(node_id, offset, length);
+        self.recent_immutable_read =
+            self.volume
+                .immutable_read_extent(node_id, offset, bytes.len());
         if byte_offset.is_none() {
             self.obj_mut(handle).unwrap().current_offset = offset + bytes.len() as u64;
         }
@@ -4609,23 +4750,30 @@ impl FileSystem {
 
     /// Read backing bytes without logical-file position or access-metadata side effects. Cache
     /// owners use this for fragments; the native operation accounts for the complete read once.
-    pub fn read_backing_into(&self, handle: u64, offset: u64, output: &mut [u8]) -> (u32, usize) {
+    /// An exact immutable source range is retained briefly so a following copy write can share it.
+    pub fn read_backing_into(
+        &mut self,
+        handle: u64,
+        offset: u64,
+        output: &mut [u8],
+    ) -> (u32, usize) {
+        self.recent_immutable_read = None;
         let Some(obj) = self.obj(handle) else {
             return (STATUS_INVALID_HANDLE, 0);
         };
-        if self.volume.is_dir(obj.node_id) {
+        let node_id = obj.node_id;
+        if self.volume.is_dir(node_id) {
             return (STATUS_INVALID_DEVICE_REQUEST, 0);
         }
         if output.is_empty() {
             return (STATUS_SUCCESS, 0);
         }
-        if offset >= self.volume.size(obj.node_id) {
+        if offset >= self.volume.size(node_id) {
             return (STATUS_END_OF_FILE, 0);
         }
-        (
-            STATUS_SUCCESS,
-            self.volume.read_at_into(obj.node_id, offset, output),
-        )
+        let read = self.volume.read_at_into(node_id, offset, output);
+        self.recent_immutable_read = self.volume.immutable_read_extent(node_id, offset, read);
+        (STATUS_SUCCESS, read)
     }
 
     /// `ZwReadFile` into caller-provided storage. Same semantics as [`Self::zw_read_file`], but
@@ -4697,7 +4845,8 @@ impl FileSystem {
             return (STATUS_ACCESS_DENIED, 0);
         }
         let offset = byte_offset.unwrap_or(obj.current_offset);
-        let n = self.volume.write_at(node_id, offset, data);
+        let recent_read = self.recent_immutable_read.take();
+        let n = self.volume.write_at(node_id, offset, data, recent_read);
         if !data.is_empty() && n == 0 {
             return (STATUS_INSUFFICIENT_RESOURCES, 0);
         }
@@ -5417,6 +5566,13 @@ impl FileSystem {
     /// Number of unique immutable file byte blobs retained by the volume.
     pub fn unique_data_blobs(&self) -> usize {
         self.volume.blobs.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn blob_slice_candidates_inspected(&self) -> usize {
+        self.volume
+            .blob_slice_candidates_inspected
+            .load(Ordering::Relaxed)
     }
 
     /// `NtQueryAttributesFile` / `NtQueryFullAttributesFile` (spec §8.6): query a file's attributes

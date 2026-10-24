@@ -19,9 +19,7 @@ pub fn memcmp(a: &[u8], b: &[u8], n: usize) -> core::cmp::Ordering {
 
 /// `memchr`: index of the first byte equal to `c` within the first `n` bytes.
 pub fn memchr(haystack: &[u8], c: u8, n: usize) -> Option<usize> {
-    haystack[..n.min(haystack.len())]
-        .iter()
-        .position(|&b| b == c)
+    nt_compat_exports::crt::memchr(haystack, c, n)
 }
 
 // --- ASCII ctype ------------------------------------------------------------------------------
@@ -262,7 +260,7 @@ pub fn strnicmp(a: &[u8], b: &[u8], n: usize) -> core::cmp::Ordering {
 
 /// `strchr`: index of the first `c`.
 pub fn strchr(s: &[u8], c: u8) -> Option<usize> {
-    s[..strlen(s)].iter().position(|&b| b == c)
+    nt_compat_exports::crt::strchr(s, c)
 }
 
 /// `strrchr`: index of the last `c`.

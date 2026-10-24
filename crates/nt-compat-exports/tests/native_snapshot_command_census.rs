@@ -144,9 +144,10 @@ fn audit_commands(file: &syn::File, transport: &str, operation: &str, sectors: &
                 };
                 transport.visit_expr(&initializer.expr);
                 let request = transport.call.unwrap();
-                if self.transport == "ahci_read_sectors" {
+                if self.transport == "ahci_read_sectors" || self.transport == "read_owner_sectors" {
+                    let count_arg = if self.transport == "read_owner_sectors" { 5 } else { 4 };
                     assert!(
-                        path_ends(plain(&request.args[4]), self.sectors),
+                        path_ends(plain(&request.args[count_arg]), self.sectors),
                         "read census count must match the actual transport request"
                     );
                 } else if self.transport == "ahci_write_sectors" {
@@ -304,8 +305,8 @@ fn fat_reads_account_for_task_file_failures_not_only_timeouts() {
     let file = parse(include_str!(
         "../../../components/ntos-executive/src/fs_loader.rs"
     ));
-    audit_commands(&file, "ahci_read_sector", "Read", "1");
-    audit_commands(&file, "ahci_read_sectors", "Read", "count");
+    audit_commands(&file, "read_owner_sector", "Read", "1");
+    audit_commands(&file, "read_owner_sectors", "Read", "count");
 }
 
 #[test]

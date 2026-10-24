@@ -5,7 +5,8 @@
 //! CLOSE releases the body and File context. Position and mode survive CLEANUP for pointer-owned
 //! operations. No later operation re-resolves the name to select a different backing file.
 
-use alloc::vec::Vec;
+use alloc::{rc::Rc, vec::Vec};
+use core::cell::RefCell;
 
 use nt_io_abi::major;
 use nt_io_manager::{
@@ -17,6 +18,55 @@ use nt_status::NtStatus;
 use crate::fs_loader::{
     fat_open_path_metadata_from, fat_read_file_range, fat_visit_directory_checked, FatOpenMetadata,
 };
+
+#[path = "mounted_installed_read.rs"]
+pub(crate) mod mounted_installed_read;
+use mounted_installed_read::ReadCompletions;
+pub(crate) type MountedReadQueue = Rc<RefCell<ReadCompletions>>;
+#[path = "mounted_create_lookup.rs"]
+pub(crate) mod mounted_create_lookup;
+use mounted_create_lookup::{CreateLookupFound, CreateLookupQueue};
+#[path = "mounted_directory_lookup.rs"]
+pub(crate) mod mounted_directory_lookup;
+use mounted_directory_lookup::DirectoryLookupQueue;
+
+const RESIDENT_BUSY: NtStatus = NtStatus(0x8000_0011u32 as i32);
+
+struct CompletedCreate {
+    owner: CapturedCreate,
+    completion: DriverCompletion,
+    published: bool,
+}
+
+pub(crate) struct CapturedCreate {
+    irp: IrpId,
+    file: nt_io_manager::FileId,
+    name: Vec<u16>,
+    relative: Vec<u8>,
+    parameters: nt_io_manager::CreateParameters,
+}
+
+pub(crate) type MountedCreateQueue = Rc<RefCell<CreateLookupQueue<CapturedCreate>>>;
+
+pub(crate) struct CapturedDirectory {
+    irp: IrpId,
+    file: nt_io_manager::FileId,
+    context: nt_fs::LayeredOpenContextId,
+    relative: Vec<u8>,
+    overlay_file: Option<u64>,
+    parameters: nt_io_manager::DirectoryQueryParameters,
+    return_single: bool,
+    restart_scan: bool,
+    output: Vec<u8>,
+}
+
+pub(crate) type MountedDirectoryQueue = Rc<RefCell<DirectoryLookupQueue<CapturedDirectory>>>;
+
+struct CompletedDirectory {
+    owner: CapturedDirectory,
+    completion: DriverCompletion,
+    published: bool,
+}
 
 #[path = "mounted_directory_query.rs"]
 mod directory_query;
@@ -57,16 +107,27 @@ pub(crate) struct MountedVolumeBackend {
     shares: nt_fs::ReadOnlyFileOpenTable<OPEN_CAP>,
     directories: nt_fs::DirectoryOpenTable<OPEN_CAP>,
     bindings: Vec<Option<MountedBinding>>,
+    read_completions: MountedReadQueue,
+    pending_creates: MountedCreateQueue,
+    create_completions: Vec<CompletedCreate>,
+    pending_directories: MountedDirectoryQueue,
+    directory_completions: Vec<CompletedDirectory>,
 }
 
 impl MountedVolumeBackend {
-    pub(crate) fn new(fs: crate::Fat32) -> Self {
+    pub(crate) fn new(fs: crate::Fat32, pending_creates: MountedCreateQueue,
+        read_completions: MountedReadQueue, pending_directories: MountedDirectoryQueue) -> Self {
         Self {
             fs,
             opens: nt_fs::LayeredOpenTable::new(),
             shares: nt_fs::ReadOnlyFileOpenTable::new(),
             directories: nt_fs::DirectoryOpenTable::new(),
             bindings: Vec::new(),
+            read_completions,
+            pending_creates,
+            create_completions: Vec::new(),
+            pending_directories,
+            directory_completions: Vec::new(),
         }
     }
 
@@ -174,20 +235,73 @@ impl MountedVolumeBackend {
         };
         let relative = &relative[..length];
 
+        let physical_mount = unsafe { crate::fs_loader::exec_fs_mount_identity() }
+            .ok_or(NtStatus::DEVICE_NOT_READY)?;
+        let route_kind = crate::fs_loader::exec_block_route_kind(physical_mount)
+            .ok_or(NtStatus::DEVICE_NOT_READY)?;
+        if route_kind != nt_fs::BlockSourceKind::Boot {
+            let mut owned_name = Vec::new();
+            owned_name.try_reserve_exact(units.len()).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+            owned_name.extend_from_slice(units);
+            let mut owned_relative = Vec::new();
+            owned_relative.try_reserve_exact(relative.len()).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+            owned_relative.extend_from_slice(relative);
+            let owner = CapturedCreate { irp: irp.irp_id, file: file_id,
+                name: owned_name, relative: owned_relative, parameters: *parameters };
+            if relative.is_empty() {
+                self.pending_creates.borrow_mut().capture_resolved_root(
+                    irp.irp_id.raw(), physical_mount.value(), owner)
+                    .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+            } else {
+                let geometry = nt_fs::FatPathGeometry {
+                    fat_start_sector: self.fs.fat_start,
+                    data_start_sector: self.fs.data_start,
+                    total_sectors: self.fs.total_sectors,
+                    sectors_per_cluster: self.fs.spc,
+                };
+                let lookup = nt_fs::FatPathLookup::new(geometry, self.fs.root_cl, relative)
+                    .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+                self.pending_creates.borrow_mut().capture(
+                    irp.irp_id.raw(), physical_mount.value(), owner, lookup)
+                    .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+            }
+            return Ok(DispatchOutcome::Pending);
+        }
         let installed = unsafe { fat_open_path_metadata_from(&self.fs, self.fs.root_cl, relative) };
-        let overlay =
-            unsafe { crate::writable_fs::query_metadata_relative(relative) }.map_err(status)?;
+        self.create_decided(file_id.raw(), units, relative, installed, parameters, false)
+    }
+
+    fn create_decided(
+        &mut self,
+        file_id: u64,
+        units: &[u16],
+        relative: &[u8],
+        installed: Option<FatOpenMetadata>,
+        parameters: &nt_io_manager::CreateParameters,
+        resident_only: bool,
+    ) -> Result<DispatchOutcome, NtStatus> {
+        let access = parameters.desired_access.bits();
+        let share = parameters.share_access.bits();
+        let options = parameters.create_options.bits();
+        let overlay = unsafe {
+            if resident_only {
+                crate::writable_fs::query_metadata_relative_if_mounted(relative)
+            } else {
+                crate::writable_fs::query_metadata_relative(relative)
+            }
+        }.map_err(status)?;
         if options & nt_fs::FILE_DIRECTORY_FILE != 0
             || overlay.is_some_and(|entry| entry.is_directory)
             || (overlay.is_none() && installed.is_some_and(|entry| entry.metadata.is_directory))
         {
             return self.create_directory(
-                file_id.raw(),
+                file_id,
                 units,
                 relative,
                 installed,
                 overlay,
                 parameters,
+                resident_only,
             );
         }
         let decision = nt_fs::layered_file_open_decision(
@@ -201,7 +315,7 @@ impl MountedVolumeBackend {
         match decision {
             nt_fs::LayeredFileOpenDecision::Installed(nt_fs::InstalledFileOpenAction::ReadOnly) => {
                 self.create_installed(
-                    file_id.raw(),
+                    file_id,
                     units,
                     relative,
                     installed.unwrap(),
@@ -214,7 +328,7 @@ impl MountedVolumeBackend {
                 nt_fs::InstalledFileOpenAction::NameCollision,
             ) => Err(NtStatus::OBJECT_NAME_COLLISION),
             nt_fs::LayeredFileOpenDecision::Installed(action) => self.create_overlay(
-                file_id.raw(),
+                file_id,
                 units,
                 relative,
                 installed,
@@ -222,10 +336,11 @@ impl MountedVolumeBackend {
                 true,
                 false,
                 parameters,
+                resident_only,
             ),
             nt_fs::LayeredFileOpenDecision::UseOverlay
             | nt_fs::LayeredFileOpenDecision::CreateOverlay => self.create_overlay(
-                file_id.raw(),
+                file_id,
                 units,
                 relative,
                 installed,
@@ -233,8 +348,115 @@ impl MountedVolumeBackend {
                 matches!(decision, nt_fs::LayeredFileOpenDecision::CreateOverlay),
                 false,
                 parameters,
+                resident_only,
             ),
         }
+    }
+
+    /// This is called only by the outer I/O service turn, never from completion polling.
+    fn service_resolved_create(&mut self) -> usize {
+        let Some(resolved) = self.pending_creates.borrow_mut().take_resolved() else { return 0; };
+        if self.create_completions.try_reserve(1).is_err() {
+            self.pending_creates.borrow_mut().restore_resolved(resolved)
+                .expect("a removed queue entry retains its allocation");
+            return 0;
+        }
+        let installed = match resolved.result {
+            Ok(CreateLookupFound::Path(record)) => record.map(FatOpenMetadata::from_record),
+            Ok(CreateLookupFound::Root) => Some(crate::fs_loader::fat_root_metadata(&self.fs)),
+            Err(error) => {
+                let status = match error {
+                    nt_fs::FatPathError::NoCapacity => NtStatus::INSUFFICIENT_RESOURCES,
+                    _ => NtStatus(nt_fs::STATUS_DATA_ERROR as i32),
+                };
+                self.create_completions.push(CompletedCreate {
+                    completion: DriverCompletion {
+                        irp_id: resolved.payload.irp, status, information: 0,
+                        file_context: None,
+                    }, owner: resolved.payload, published: false,
+                });
+                return 1;
+            }
+        };
+        let owner = &resolved.payload;
+        let outcome = self.create_decided(owner.file.raw(), &owner.name, &owner.relative,
+            installed, &owner.parameters, true);
+        if matches!(outcome, Err(RESIDENT_BUSY)) {
+            self.pending_creates.borrow_mut().restore_resolved(resolved)
+                .expect("a removed queue entry retains its allocation");
+            return 0;
+        }
+        let (status, information, file_context) = match outcome {
+            Ok(DispatchOutcome::Completed { status, information, file_context }) =>
+                (status, information, file_context),
+            Ok(DispatchOutcome::Failed { status }) | Err(status) => (status, 0, None),
+            Ok(DispatchOutcome::Pending) => panic!("mounted CREATE decision cannot nest pending work"),
+        };
+        self.create_completions.push(CompletedCreate {
+            completion: DriverCompletion {
+                irp_id: resolved.payload.irp, status, information, file_context,
+            }, owner: resolved.payload, published: false,
+        });
+        1
+    }
+
+    fn service_resolved_directory(&mut self) -> usize {
+        let Some(mut resolved) = self.pending_directories.borrow_mut().take_resolved() else { return 0; };
+        if self.directory_completions.try_reserve(1).is_err() {
+            self.pending_directories.borrow_mut().restore_resolved(resolved)
+                .expect("removed directory lookup retains queue capacity");
+            return 0;
+        }
+        let outcome = match &resolved.result {
+            Err(error) => Err(match error {
+                nt_fs::FatPathError::NoCapacity => NtStatus::INSUFFICIENT_RESOURCES,
+                _ => status(nt_fs::STATUS_DATA_ERROR),
+            }),
+            Ok(installed) => {
+                let owner = &mut resolved.payload;
+                let overlay = unsafe {
+                    if let Some(file) = owner.overlay_file {
+                        crate::writable_fs::directory_entries_opened_if_mounted(file).map(Some)
+                    } else {
+                        crate::writable_fs::directory_entries_relative_if_mounted(&owner.relative)
+                    }
+                }.map_err(status);
+                match overlay {
+                    Err(error) => Err(error),
+                    Ok(overlay) => (|| -> Result<(NtStatus, u64), NtStatus> {
+                        let entries = nt_fs::merge_layered_directory_entries(
+                            installed, overlay.as_deref().unwrap_or(&[])).map_err(status)?;
+                        self.opens.get(owner.context, owner.file.raw()).map_err(status)?;
+                        let index = context_index(owner.context).ok_or(NtStatus::INVALID_HANDLE)?;
+                        let binding = self.bindings[index].as_mut()
+                            .filter(|binding| binding.context == owner.context)
+                            .ok_or(NtStatus::INVALID_HANDLE)?;
+                        let mut query = binding.directory_query;
+                        let result = nt_fs::query_directory(&mut query, &entries,
+                            owner.parameters.information_class, owner.return_single,
+                            owner.parameters.pattern.as_ref().map(|pattern| pattern.as_units()),
+                            owner.restart_scan, &mut owner.output);
+                        binding.directory_query = query;
+                        Ok((status(result.status), result.information as u64))
+                    })(),
+                }
+            }
+        };
+        if matches!(outcome, Err(RESIDENT_BUSY)) {
+            self.pending_directories.borrow_mut().restore_resolved(resolved)
+                .expect("removed directory lookup retains queue capacity");
+            return 0;
+        }
+        let (status, information) = match outcome {
+            Ok(value) => value,
+            Err(error) => (error, 0),
+        };
+        self.directory_completions.push(CompletedDirectory {
+            completion: DriverCompletion { irp_id: resolved.payload.irp, status,
+                information, file_context: None },
+            owner: resolved.payload, published: false,
+        });
+        1
     }
 
     fn create_directory(
@@ -245,6 +467,7 @@ impl MountedVolumeBackend {
         installed: Option<FatOpenMetadata>,
         overlay: Option<nt_fs::FileMetadata>,
         parameters: &nt_io_manager::CreateParameters,
+        resident_only: bool,
     ) -> Result<DispatchOutcome, NtStatus> {
         let access = parameters.desired_access.bits();
         let share = parameters.share_access.bits();
@@ -275,11 +498,11 @@ impl MountedVolumeBackend {
                         .map_err(status)?;
                 }
                 self.create_overlay(
-                    file_id, units, relative, installed, None, false, true, parameters,
+                    file_id, units, relative, installed, None, false, true, parameters, resident_only,
                 )
             }
             nt_fs::LayeredDirectoryOpenDecision::CreateOverlay => self.create_overlay(
-                file_id, units, relative, None, None, true, true, parameters,
+                file_id, units, relative, None, None, true, true, parameters, resident_only,
             ),
         }
     }
@@ -422,7 +645,11 @@ impl MountedVolumeBackend {
         materialize_parent: bool,
         is_directory: bool,
         parameters: &nt_io_manager::CreateParameters,
+        resident_only: bool,
     ) -> Result<DispatchOutcome, NtStatus> {
+        // Overlay creation/copy-up may walk installed parents or access the snapshot device.
+        // Its native continuation is separate from the read-only installed CREATE lane.
+        if resident_only { return Err(RESIDENT_BUSY); }
         let context = self.reserve_open_context(file_id, units)?;
         let access = parameters.desired_access.bits();
         let share = parameters.share_access.bits();
@@ -612,6 +839,25 @@ impl MountedVolumeBackend {
             return Err(NtStatus::END_OF_FILE);
         }
         let expected = (parameters.length as usize).min((eof - offset) as usize);
+        let physical_mount = unsafe { crate::fs_loader::exec_fs_mount_identity() }
+            .ok_or(NtStatus::DEVICE_NOT_READY)?;
+        let route_kind = crate::fs_loader::exec_block_route_kind(physical_mount)
+            .ok_or(NtStatus::DEVICE_NOT_READY)?;
+        if route_kind != nt_fs::BlockSourceKind::Boot {
+            let geometry = nt_fs::FatPathGeometry {
+                fat_start_sector: self.fs.fat_start,
+                data_start_sector: self.fs.data_start,
+                total_sectors: self.fs.total_sectors,
+                sectors_per_cluster: self.fs.spc,
+            };
+            let position = (self.shares.get(installed_open).map_err(status)?.create_options
+                & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT) != 0)
+                .then_some((installed_open, u64::from(offset) + expected as u64));
+            self.read_completions.borrow_mut().capture_range(irp.irp_id.raw(),
+                physical_mount.value(), file_id.raw(), geometry, first_cluster, offset,
+                expected, position).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+            return Ok(DispatchOutcome::Pending);
+        }
         let written = unsafe {
             fat_read_file_range(
                 &self.fs,
@@ -869,6 +1115,17 @@ impl MountedVolumeBackend {
 }
 
 impl DriverDispatchBackend for MountedVolumeBackend {
+    fn immutable_file_extent(&self, file_id: nt_io_manager::FileId, file_context: u64) -> Option<u64> {
+        let context = nt_fs::LayeredOpenContextId::from_raw(file_context);
+        let extent = self.opens.immutable_installed_file_extent(context, file_id.raw())?;
+        let binding = self.bindings.get(context_index(context)?)?.as_ref()?;
+        if binding.context != context || binding.is_directory || binding.overlay_open {
+            return None;
+        }
+        self.shares.get(binding.installed_open?).ok()?;
+        Some(extent)
+    }
+
     fn dispatch_irp(
         &mut self,
         ctx: DispatchContext<'_>,
@@ -890,8 +1147,70 @@ impl DriverDispatchBackend for MountedVolumeBackend {
         Err(NtStatus::NOT_SUPPORTED)
     }
 
+    fn service_pending(&mut self) -> usize {
+        let mut progress = self.service_resolved_create();
+        progress += self.service_resolved_directory();
+        let pending_position = self.read_completions.borrow().pending_position();
+        if let Some((irp, open, next)) = pending_position {
+            if let Ok(entry) = self.shares.get_mut(open) {
+                entry.current_offset = next;
+                self.read_completions.borrow_mut().mark_position_committed(irp)
+                    .expect("terminal read position owner is retained");
+                progress += 1;
+            }
+        }
+        progress
+    }
+
     fn poll_completion(&mut self) -> Option<DriverCompletion> {
-        None
+        if let Some(ready) = self.create_completions.iter_mut().find(|item| !item.published) {
+            ready.published = true;
+            return Some(ready.completion);
+        }
+        if let Some(ready) = self.directory_completions.iter_mut().find(|item| !item.published) {
+            ready.published = true;
+            return Some(ready.completion);
+        }
+        self.read_completions.borrow_mut().next_completion().map(|(irp, status, transferred)| DriverCompletion {
+            irp_id: IrpId(irp),
+            status: NtStatus(status),
+            information: transferred as u64,
+            file_context: None,
+        })
+    }
+
+    fn copy_completion_output(
+        &mut self,
+        irp_id: IrpId,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<usize, NtStatus> {
+        let offset = usize::try_from(offset).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+        if let Some(item) = self.directory_completions.iter().find(|item| item.owner.irp == irp_id) {
+            if !item.published { return Err(NtStatus::INVALID_PARAMETER); }
+            let transferred = usize::try_from(item.completion.information)
+                .map_err(|_| NtStatus::INVALID_PARAMETER)?;
+            let remaining = transferred.checked_sub(offset).ok_or(NtStatus::INVALID_PARAMETER)?;
+            let copied = remaining.min(output.len());
+            output[..copied].copy_from_slice(&item.owner.output[offset..offset + copied]);
+            return Ok(copied);
+        }
+        self.read_completions.borrow().copy(irp_id.raw(), offset, output)
+            .map_err(|_| NtStatus::INVALID_PARAMETER)
+    }
+
+    fn acknowledge_completion(&mut self, irp_id: IrpId) -> Result<(), NtStatus> {
+        if let Some(index) = self.create_completions.iter().position(|item| item.owner.irp == irp_id) {
+            self.create_completions.swap_remove(index);
+            return Ok(());
+        }
+        if let Some(index) = self.directory_completions.iter().position(|item| item.owner.irp == irp_id) {
+            if !self.directory_completions[index].published { return Err(NtStatus::INVALID_PARAMETER); }
+            self.directory_completions.swap_remove(index);
+            return Ok(());
+        }
+        self.read_completions.borrow_mut().ack(irp_id.raw())
+            .map_err(|_| NtStatus::INVALID_PARAMETER)
     }
 }
 

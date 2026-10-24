@@ -6,10 +6,10 @@
 
 const BODY_BYTES: usize = 239;
 
-// Version 1, no handler/frame register, six codes in descending instruction-end order.
+// Version 1, no handler/frame register, seven codes in descending instruction-end order.
 // See https://learn.microsoft.com/en-us/cpp/build/exception-handling-x64
-const UNWIND_BYTES: [u8; 16] = [
-    1, 15, 6, 0, 15, 0xf2, // ALLOC_SMALL 128
+const UNWIND_BYTES: [u8; 18] = [
+    1, 15, 7, 0, 15, 0x01, 18, 0, // ALLOC_LARGE 144
     8, 0xd0, // PUSH_NONVOL R13
     6, 0xc0, // PUSH_NONVOL R12
     4, 0xf0, // PUSH_NONVOL R15
@@ -53,19 +53,19 @@ pub(super) fn unwind_matches(pdata: &[u8], image: &[u8], export_rva: u32) -> boo
 }
 
 pub(super) fn matches(bytes: &[u8], ssn: u32, argc: u8) -> bool {
-    argc <= 16 && bytes.starts_with(&expected_body(ssn, argc))
+    argc <= 17 && bytes.starts_with(&expected_body(ssn, argc))
 }
 
 fn expected_body(ssn: u32, argc: u8) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(BODY_BYTES);
     bytes.extend_from_slice(&[
         0x57, 0x56, 0x41, 0x57, 0x41, 0x54, 0x41, 0x55, // save RDI/RSI/R15/R12/R13
-        0x48, 0x81, 0xec, 0x80, 0, 0, 0, // reserve immutable argument vector
+        0x48, 0x81, 0xec, 0x90, 0, 0, 0, // reserve immutable argument vector
         0x48, 0x89, 0x0c, 0x24, // [rsp] = RCX
         0x48, 0x89, 0x54, 0x24, 0x08, // [rsp+8] = RDX
         0x4c, 0x89, 0x44, 0x24, 0x10, // [rsp+16] = R8
         0x4c, 0x89, 0x4c, 0x24, 0x18, // [rsp+24] = R9
-        0x48, 0x8d, 0xb4, 0x24, 0xd0, 0, 0, 0, // RSI = entry RSP + 40
+        0x48, 0x8d, 0xb4, 0x24, 0xe0, 0, 0, 0, // RSI = entry RSP + 40
         0x48, 0x8d, 0x7c, 0x24, 0x20, // RDI = retained argument five
         0xb9,
     ]);
@@ -94,7 +94,7 @@ fn expected_body(ssn: u32, argc: u8) -> Vec<u8> {
         0x83, 0xe9, 2, 0x7e, 3, 0xf3, 0x48, 0xa5, // copy argc-2 on every attempt
         0x4c, 0x8b, 0x0c, 0x24, // R9 = retained argument one
         0x4c, 0x8b, 0x7c, 0x24, 8, // R15 = retained argument two
-        0x4c, 0x8d, 0x84, 0x24, 0xa8, 0, 0, 0, // R8 = exact entry RSP
+        0x4c, 0x8d, 0x84, 0x24, 0xb8, 0, 0, 0, // R8 = exact entry RSP
         0x41, 0xba,
     ]);
     bytes.extend_from_slice(&ssn.to_le_bytes());
@@ -116,7 +116,7 @@ fn expected_body(ssn: u32, argc: u8) -> Vec<u8> {
         0x0f, 0x84, 0x62, 0xff, 0xff, 0xff, // retry -> GS load at offset 60
         0x0f, 0x0b, // invalid envelope never replays a service
         0x4c, 0x89, 0xd0, // terminal RAX = MR0
-        0x48, 0x81, 0xc4, 0x80, 0, 0, 0, 0x41, 0x5d, 0x41, 0x5c, 0x41, 0x5f, 0x5e, 0x5f, 0xc3,
+        0x48, 0x81, 0xc4, 0x90, 0, 0, 0, 0x41, 0x5d, 0x41, 0x5c, 0x41, 0x5f, 0x5e, 0x5f, 0xc3,
     ]);
     assert_eq!(bytes.len(), BODY_BYTES);
     bytes
@@ -173,7 +173,7 @@ mod tests {
 
     fn unwind_fixture() -> (Vec<u8>, Vec<u8>) {
         let mut image = vec![0; 1024];
-        image[512..528].copy_from_slice(&UNWIND_BYTES);
+        image[512..530].copy_from_slice(&UNWIND_BYTES);
         let pdata = [64u32, 64 + BODY_BYTES as u32, 512]
             .into_iter()
             .flat_map(u32::to_le_bytes)
@@ -185,7 +185,7 @@ mod tests {
     fn every_unwind_header_and_operation_bit_is_required() {
         let (pdata, image) = unwind_fixture();
         assert!(unwind_matches(&pdata, &image, 64));
-        for index in 512..528 {
+        for index in 512..530 {
             for bit in 0..8 {
                 let mut changed = image.clone();
                 changed[index] ^= 1 << bit;

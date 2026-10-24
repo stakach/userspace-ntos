@@ -228,6 +228,21 @@ impl<const SLOTS: usize> LayeredOpenTable<SLOTS> {
         })
     }
 
+    /// Immutable-source evidence from the exact CREATE-selected File context. Namespace names
+    /// and volume attributes cannot grant this evidence to an overlay or a reused context.
+    pub fn immutable_installed_file_extent(
+        &self,
+        context: LayeredOpenContextId,
+        canonical_file_id: u64,
+    ) -> Option<u64> {
+        let LayeredOpenSource::Installed { metadata, .. } =
+            self.get(context, canonical_file_id).ok()?.source
+        else {
+            return None;
+        };
+        (!metadata.is_directory && metadata.end_of_file != 0).then_some(metadata.end_of_file)
+    }
+
     /// Find the live open bound to an exact canonical File identity, including its generation.
     pub fn get_by_file_id(
         &self,
@@ -473,6 +488,28 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(table.get_by_file_id(10), Err(STATUS_INVALID_HANDLE));
         assert_eq!(table.get_by_file_id(11).unwrap().0, second);
+    }
+
+    #[test]
+    fn immutable_extent_requires_exact_installed_open_generation_not_name() {
+        let mut table = LayeredOpenTable::<2>::new();
+        let name = [b'a' as u16];
+        let installed_context = table.insert(10, installed(), &name).unwrap();
+        assert_eq!(table.immutable_installed_file_extent(installed_context, 10), Some(4096));
+        assert_eq!(table.immutable_installed_file_extent(installed_context, 11), None);
+
+        // A later overlay open under the same name must not change the retained installed File.
+        let overlay = table
+            .insert(11, LayeredOpenSource::Overlay { file_id: 88 }, &name)
+            .unwrap();
+        assert_eq!(table.immutable_installed_file_extent(installed_context, 10), Some(4096));
+        assert_eq!(table.immutable_installed_file_extent(overlay, 11), None);
+
+        table.release(installed_context, 10).unwrap();
+        let replacement = table.insert(10, installed(), &name).unwrap();
+        assert_ne!(installed_context, replacement);
+        assert_eq!(table.immutable_installed_file_extent(installed_context, 10), None);
+        assert_eq!(table.immutable_installed_file_extent(replacement, 10), Some(4096));
     }
 
     #[test]

@@ -58,6 +58,7 @@ pub enum DispatcherWaitSource {
     Native,
     Gui,
     Provider,
+    HostedDriver,
 }
 
 pub fn classify_dispatcher_wait_timeout(timeout: Option<i64>) -> DispatcherWaitTimeout {

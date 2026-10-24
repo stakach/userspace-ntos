@@ -12,8 +12,13 @@ mod memory_retirement;
 pub(crate) struct HostedThreadRuntimeOwner {
     runtime: HostedThreadRuntime,
     pub(crate) suspension: crate::thread_suspend::HostedThreadSuspend,
+    /// Physical priority work pins this exact runtime until canonical PM commit.
+    priority_transition_pending: core::cell::Cell<bool>,
     pub(crate) initial_creation: core::cell::RefCell<
         Option<crate::exec_handler::initial_thread_creation::PendingInitialThreadCreation>,
+    >,
+    pub(crate) process_create_callout: core::cell::RefCell<
+        Option<nt_user_host::process_create_callout::ProcessCreateCalloutOwner>,
     >,
     fresh_creation: core::cell::RefCell<Option<nt_process::FreshHostedThreadPreparation>>,
     memory_coverage: nt_user_host::thread_construction::MemoryConstructionCoverage<TP_WORKER_STACK_FRAME_COUNT>,
@@ -31,7 +36,9 @@ impl HostedThreadRuntimeOwner {
         Self {
             runtime,
             suspension: crate::thread_suspend::HostedThreadSuspend::new(),
+            priority_transition_pending: core::cell::Cell::new(false),
             initial_creation: core::cell::RefCell::new(None),
+            process_create_callout: core::cell::RefCell::new(None),
             fresh_creation: core::cell::RefCell::new(None),
             memory_coverage: nt_user_host::thread_construction::MemoryConstructionCoverage::empty(),
             registered_memory: None,
@@ -46,7 +53,11 @@ impl HostedThreadRuntimeOwner {
 
     fn construction_is_empty(&self) -> bool {
         self.suspension.is_empty()
+            && !self.priority_transition_pending.get()
             && self.initial_creation.try_borrow().is_ok_and(|owner| owner.is_none())
+            && self.process_create_callout.try_borrow().is_ok_and(|owner| {
+                owner.as_ref().is_none_or(nt_user_host::process_create_callout::ProcessCreateCalloutOwner::may_retire)
+            })
             && self.fresh_creation.try_borrow().is_ok_and(|owner| owner.is_none())
             && self.memory_coverage.is_empty()
             && !self.registry_preparation.is_prepared() && self.alias_preparation.get().is_none()
@@ -703,6 +714,52 @@ impl HostedThreadRuntimeTable {
             .find(|entry| entry.tid == tid)
     }
 
+    pub(crate) fn reserve_priority_effects(
+        &self,
+        effects: &[nt_user_host::thread_priority_transition::PriorityEffect<HostedThreadRole>],
+    ) -> Result<(), u32> {
+        for effect in effects {
+            let binding = effect.binding();
+            let owner = self.entries.iter().filter_map(RuntimeSlot::executable)
+                .find(|entry| entry.runtime.tid == binding.tid)
+                .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+            if owner.binding() != binding || owner.priority_transition_pending.get() {
+                return Err(nt_process::STATUS_INVALID_HANDLE);
+            }
+        }
+        for effect in effects {
+            let binding = effect.binding();
+            let owner = self.entries.iter().filter_map(RuntimeSlot::owner)
+                .find(|entry| entry.runtime.tid == binding.tid)
+                .expect("preflighted priority runtime is held by the serialized table");
+            owner.priority_transition_pending.set(true);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_priority_effects(
+        &self,
+        effects: &[nt_user_host::thread_priority_transition::PriorityEffect<HostedThreadRole>],
+    ) -> Result<(), u32> {
+        for effect in effects {
+            let binding = effect.binding();
+            let owner = self.entries.iter().filter_map(RuntimeSlot::owner)
+                .find(|entry| entry.runtime.tid == binding.tid)
+                .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+            if owner.binding() != binding || !owner.priority_transition_pending.get() {
+                return Err(nt_process::STATUS_INVALID_HANDLE);
+            }
+        }
+        for effect in effects {
+            let binding = effect.binding();
+            let owner = self.entries.iter().filter_map(RuntimeSlot::owner)
+                .find(|entry| entry.runtime.tid == binding.tid)
+                .expect("preflighted priority owner remains in the serialized table");
+            owner.priority_transition_pending.set(false);
+        }
+        Ok(())
+    }
+
     pub(crate) fn executable_by_badge(&self, badge: u64) -> Option<HostedThreadRuntime> {
         self.entries
             .iter()
@@ -989,6 +1046,20 @@ impl HostedThreadRuntimes {
 
     pub(crate) fn executable_by_tid(&self, tid: u64) -> Option<HostedThreadRuntime> {
         unsafe { (&*self.table).executable_by_tid(tid) }
+    }
+
+    pub(crate) fn reserve_priority_effects(
+        &self,
+        effects: &[nt_user_host::thread_priority_transition::PriorityEffect<HostedThreadRole>],
+    ) -> Result<(), u32> {
+        unsafe { (&*self.table).reserve_priority_effects(effects) }
+    }
+
+    pub(crate) fn release_priority_effects(
+        &self,
+        effects: &[nt_user_host::thread_priority_transition::PriorityEffect<HostedThreadRole>],
+    ) -> Result<(), u32> {
+        unsafe { (&*self.table).release_priority_effects(effects) }
     }
 
     pub(crate) fn executable_by_badge(&self, badge: u64) -> Option<HostedThreadRuntime> {
@@ -1282,6 +1353,7 @@ impl RuntimeIdentity for HostedThreadRuntimeOwner {
 
     fn control_busy(&self) -> bool {
         self.suspension.is_pending()
+            || self.priority_transition_pending.get()
             || self.initial_creation.try_borrow().map_or(true, |owner| owner.is_some())
     }
 }
@@ -1322,7 +1394,11 @@ pub(crate) fn check_user_stack_retirement_access(
 
 impl RuntimeTcbProjection for HostedThreadRuntimeOwner {
     fn clear_retired_tcb_projection(&mut self, expected_cap: u64) -> Result<(), u32> {
-        if self.initial_creation.try_borrow().map_or(true, |owner| owner.is_some()) {
+        if self.initial_creation.try_borrow().map_or(true, |owner| owner.is_some())
+            || self.process_create_callout.try_borrow().map_or(true, |owner| {
+                owner.as_ref().is_some_and(|owner| !owner.may_retire())
+            })
+        {
             return Err(nt_process::STATUS_DEVICE_BUSY);
         }
         if expected_cap <= 1 || (self.runtime.tcb != expected_cap && self.runtime.tcb != 1) {

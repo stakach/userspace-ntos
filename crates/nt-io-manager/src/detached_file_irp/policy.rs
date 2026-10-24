@@ -16,6 +16,8 @@ pub enum ExternalFileIrpDispatchPolicy {
     DeviceControlAtDevice,
     /// File-less METHOD_NEITHER control whose input bytes are modified by the driver.
     MutableMethodNeitherInputAtDevice,
+    /// File-less `IRP_MJ_SCSI` at one authenticated PDO, with a pointer-free SRB packet.
+    ScsiAtDevice,
 }
 
 /// The retained Type3InputBuffer return occupies one preallocated page in the provider.
@@ -30,6 +32,7 @@ impl ExternalFileIrpDispatchPolicy {
             Self::MutableMethodNeitherInputAtDevice => {
                 ExternalFileIrpOutputCapture::MethodNeitherInput
             }
+            Self::ScsiAtDevice => ExternalFileIrpOutputCapture::Scsi,
         }
     }
 
@@ -60,6 +63,9 @@ impl ExternalFileIrpDispatchPolicy {
             }
             Self::DeviceControlAtDevice | Self::MutableMethodNeitherInputAtDevice => {
                 manager.prepare_external_device_control_irp_owned_at_device(request, buffers)
+            }
+            Self::ScsiAtDevice => {
+                manager.prepare_external_scsi_irp_owned_at_device(request, buffers)
             }
         }
     }

@@ -9,6 +9,8 @@
 
 use alloc::vec::Vec;
 
+pub mod guid;
+
 mod ntstatus_to_dos_error_map;
 
 use ntstatus_to_dos_error_map::*;
@@ -189,6 +191,12 @@ pub fn equal_unicode(a: &[u16], b: &[u16], case_insensitive: bool) -> bool {
     compare_unicode(a, b, case_insensitive) == core::cmp::Ordering::Equal
 }
 
+/// `RtlPrefixUnicodeString`: compare a counted UTF-16 prefix, including embedded NUL units.
+pub fn prefix_unicode(prefix: &[u16], string: &[u16], case_insensitive: bool) -> bool {
+    prefix.len() <= string.len()
+        && equal_unicode(prefix, &string[..prefix.len()], case_insensitive)
+}
+
 /// `RtlUpcaseUnicodeChar`: upper-case a single code unit. Covers ASCII a-z and
 /// Latin-1 supplement à-þ (the ranges win32k needs for class-name folding);
 /// other code units pass through unchanged.
@@ -208,6 +216,16 @@ pub fn ansi_char_to_unicode(c: u8) -> u16 {
 /// `RtlCompareMemory`: number of leading bytes that are equal.
 pub fn compare_memory(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
+/// CRT `memcmp`: difference of the first unequal byte in two equal-length slices.
+pub fn compare_bytes_lexicographic(a: &[u8], b: &[u8]) -> i32 {
+    for (&left, &right) in a.iter().zip(b.iter()) {
+        if left != right {
+            return left as i32 - right as i32;
+        }
+    }
+    0
 }
 
 /// `_stricmp`: compare two complete narrow strings with ASCII case folding.
@@ -302,15 +320,25 @@ pub fn integer_to_unicode_into(value: u32, base: u32, buffer: &mut [u16; 32]) ->
 /// Base zero recognizes the native lowercase `0b`, `0o`, and `0x` prefixes. Arithmetic wraps as a
 /// Windows `ULONG`; a valid base with no leading digits produces zero. `None` only denotes an
 /// unsupported explicit base.
-pub fn unicode_string_to_integer(s: &[u16], mut base: u32) -> Option<u32> {
+pub fn unicode_string_to_integer(s: &[u16], base: u32) -> Option<u32> {
+    parse_integer(s.len(), |i| s[i], base)
+}
+
+/// The single-byte `RtlCharToInteger` grammar. The caller owns NUL termination;
+/// this slice contains exactly the bytes before that terminator.
+pub fn char_to_integer(s: &[u8], base: u32) -> Option<u32> {
+    parse_integer(s.len(), |i| u16::from(s[i]), base)
+}
+
+fn parse_integer(len: usize, at: impl Fn(usize) -> u16, mut base: u32) -> Option<u32> {
     let mut i = 0;
-    while i < s.len() && s[i] <= b' ' as u16 {
+    while i < len && at(i) <= b' ' as u16 {
         i += 1;
     }
-    let negative = if i < s.len() && s[i] == b'+' as u16 {
+    let negative = if i < len && at(i) == b'+' as u16 {
         i += 1;
         false
-    } else if i < s.len() && s[i] == b'-' as u16 {
+    } else if i < len && at(i) == b'-' as u16 {
         i += 1;
         true
     } else {
@@ -318,8 +346,8 @@ pub fn unicode_string_to_integer(s: &[u16], mut base: u32) -> Option<u32> {
     };
     if base == 0 {
         base = 10;
-        if i + 1 < s.len() && s[i] == b'0' as u16 {
-            base = match s[i + 1] {
+        if i + 1 < len && at(i) == b'0' as u16 {
+            base = match at(i + 1) {
                 c if c == b'b' as u16 => 2,
                 c if c == b'o' as u16 => 8,
                 c if c == b'x' as u16 => 16,
@@ -333,8 +361,8 @@ pub fn unicode_string_to_integer(s: &[u16], mut base: u32) -> Option<u32> {
         return None;
     }
     let mut acc: u32 = 0;
-    while i < s.len() {
-        let c = s[i];
+    while i < len {
+        let c = at(i);
         let d = match c {
             0x30..=0x39 => (c - 0x30) as u32,
             0x41..=0x5a => (c - 0x41 + 10) as u32,
@@ -361,6 +389,16 @@ mod tests {
 
     fn u(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()
+    }
+
+    #[test]
+    fn char_integer_matches_native_unsigned_semantics() {
+        assert_eq!(char_to_integer(b"  -0x10tail", 0), Some(0xffff_fff0));
+        assert_eq!(char_to_integer(b"+11", 10), Some(11));
+        assert_eq!(char_to_integer(b"0b101", 0), Some(5));
+        assert_eq!(char_to_integer(b"FFFFFFFFF", 16), Some(u32::MAX));
+        assert_eq!(char_to_integer(b"anything", 10), Some(0));
+        assert_eq!(char_to_integer(b"12", 3), None);
     }
 
     #[test]
@@ -456,6 +494,13 @@ mod tests {
         assert_eq!(compare_memory(b"hello", b"help"), 3);
         assert_eq!(compare_memory(b"abc", b"abc"), 3);
         assert_eq!(compare_memory(b"", b"x"), 0);
+    }
+
+    #[test]
+    fn memcmp_uses_unsigned_byte_order_and_not_matching_prefix_length() {
+        assert_eq!(compare_bytes_lexicographic(b"abc", b"abc"), 0);
+        assert_eq!(compare_bytes_lexicographic(b"abc", b"abd"), -1);
+        assert_eq!(compare_bytes_lexicographic(&[0xff], &[0x01]), 254);
     }
 
     #[test]

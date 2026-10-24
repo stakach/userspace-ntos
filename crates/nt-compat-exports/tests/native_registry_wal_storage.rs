@@ -6,11 +6,17 @@ fn v2_system_wal_owner_admits_exact_paired_anchor_before_any_write() {
     let admit = &source[source.find("pub(crate) unsafe fn admit(").unwrap()
         ..source.find("\n    pub(crate) fn prepare(").unwrap()];
     let mount = admit.find("ensure_mounted()").unwrap();
-    let paired = admit.find("current_paired_wal_journal_manifest").unwrap();
-    let exact = admit.find("snapshot_storage::take_wal_continuation(&lease, expected)").unwrap();
+    let exact = admit.find("snapshot_storage::take_wal_continuation(&mut lease)").unwrap();
     let resumed = admit.find("RegistryWal::resume_from_continuation").unwrap();
     let begin = admit.find("wal.begin(").unwrap();
-    assert!(mount < paired && paired < exact && exact < resumed && resumed < begin);
+    assert!(mount < exact && exact < resumed && resumed < begin);
+    let storage = include_str!("../../../components/ntos-executive/src/writable_fs/snapshot_storage.rs");
+    let take = &storage[storage.find("pub(super) fn take_wal_continuation(").unwrap()
+        ..storage.find("\n/// NtFlushKey").unwrap()];
+    assert!(take.contains("recheck_verified_paired_wal_snapshot(lease, &cached.pair)"),
+        "admission must recheck both exact headers under the mount lease");
+    assert!(take.contains("cached.token.anchor() != cached.pair.anchor()"),
+        "the WAL token and paired payload proof must name the same anchor");
     assert!(!admit.contains("RegistryWal::recover"),
         "a live mutation must consume boot's mount-bound proof, not rescan the WAL tail");
     assert!(admit.contains("legacy_snapshot_writes_allowed()"));

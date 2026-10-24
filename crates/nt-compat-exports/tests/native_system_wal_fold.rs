@@ -13,40 +13,55 @@ fn source(name: &str) -> String {
 #[test]
 fn v2_fold_owns_cm_checkpoint_and_exact_reserve_until_two_slots_and_rollover() {
     let fold = source("writable_fs/system_wal_fold.rs");
-    for contract in [
-        "PreparedSystemHiveCheckpoint",
-        "snapshot_storage::Lease",
-        "static mut FOLD_WORK",
-        "base_serial: manifest.high_water_serial",
-        "replace_boot_file(",
-        "CONFIG_SYSTEM_HIVE_PATH",
-        "WalSnapshotEpochRollover::admit(",
-        "publish_resetting()",
-        "finish()",
-    ] {
-        assert!(fold.contains(contract), "native fold lost {contract}");
-    }
-    let image = fold.find("replace_boot_file(").unwrap();
-    let capture = fold.find("export_volume_snapshot(").expect("one folded image capture");
-    let first = fold.find("commit_next_with_wal_manifest(").unwrap();
-    let second = fold[first + 1..].find("commit_next_with_wal_manifest(")
-        .expect("second folded snapshot slot") + first + 1;
-    let rollover = fold.find("WalSnapshotEpochRollover::admit(").unwrap();
-    let ack = fold.find("config_manager_acknowledge_system_hive_checkpoint(").unwrap();
-    assert!(image < capture && capture < first && first < second && second < rollover && rollover < ack,
-        "CM image fold, two slots, epoch rollover and CM ACK must retain one order");
-    assert!(!fold.contains("config_manager_abort_system_hive_checkpoint("),
-        "an uncertain physical fold cannot abandon its CM checkpoint");
+    let native = source("writable_fs/system_wal_fold/native.rs");
+    let entry = &fold[fold.find("pub(crate) unsafe fn fold_system_wal_if_dirty()").unwrap()..];
+    assert!(entry.find("BlockSourceKind::Native").unwrap()
+        < entry.find("ensure_mounted()?").unwrap(),
+        "native cutover must enter the retained fold before any synchronous mount I/O");
+    let stage = &native[native.find("unsafe fn advance_recheck()").unwrap()
+        ..native.find("pub(super) unsafe fn fold_system_wal_native()").unwrap()];
+    assert!(stage.contains("take_rechecked_wal_continuation(id)")
+        && stage.contains("FileSystem::from_volume_snapshot(baseline.as_slice())")
+        && stage.contains("stage_prepared_checkpoint(&mut staged, &prepared)")
+        && stage.contains("CapturedSnapshot::capture(&lease, &staged)")
+        && stage.contains("cursor: Some(Cursor::First(commit))"),
+        "the exact rechecked lease must retain a private prepared image for native writes");
+    assert!(!stage.contains("apply_prepared_checkpoint(fs,"),
+        "pending native effects must not expose the prepared SYSTEM image in the live overlay");
+    let complete = &native[native.find("pub(crate) unsafe fn complete(").unwrap()
+        ..native.find("fn stall(").unwrap()];
+    let first = complete.find("Cursor::First(commit) =>").unwrap();
+    let reused = complete[first..].find("finish_with_payload_and_paired_proof()").unwrap() + first;
+    let second = complete.find("Cursor::Second(commit) =>").unwrap();
+    let rollover = complete.find("AsyncWalEpochRollover::admit(").unwrap();
+    let ready = complete.find("Cursor::Rollover(cursor) =>").unwrap();
+    assert!(first < reused && reused < second && second < rollover && rollover < ready,
+        "both slots must use the same owned capture before optional rollover");
+    assert!(complete.contains("AsyncSnapshotCommit::new(active.lease.store(), image,")
+        && complete.contains("publish_ready(active, None, pair)")
+        && complete.contains("publish_ready(active, Some(next), pair)"),
+        "small and rollover folds must retain the exact pair until CM acknowledgement");
+    let acknowledge = &fold[fold.find("unsafe fn acknowledge_retained()").unwrap()..];
+    assert!(native.contains("phase: Phase::Acknowledging")
+        && acknowledge.contains("config_manager_acknowledge_system_hive_checkpoint(prepared)")
+        && acknowledge.contains("install_retained()"),
+        "the CM ACK follows native proof completion while FOLD_WORK owns the lease");
+    assert!(!native.contains("config_manager_abort_system_hive_checkpoint("),
+        "an uncertain native fold cannot abandon its CM checkpoint");
 }
 
 #[test]
 fn uncertain_fold_keeps_owner_and_dirty_state_for_boot_recovery() {
     let fold = source("writable_fs/system_wal_fold.rs");
+    let native = source("writable_fs/system_wal_fold/native.rs");
     assert!(fold.contains("WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED"));
     assert!(fold.contains("WRITABLE_FS_SNAPSHOT_DIRTY"));
     assert!(fold.contains("FOLD_WORK"));
     assert!(fold.contains("core::mem::forget") || fold.contains("Phase::Blocked"),
         "uncertain effects cannot drop the exact lease");
+    assert!(native.contains("Work::Stalled") && native.contains("active.failed = true")
+        && native.contains("mark_snapshot_dirty()"),
+        "native uncertainty must retain the exact lease and leave dirty work visible");
 
     let writable = source("writable_fs.rs");
     assert!(writable.contains("mod system_wal_fold;"));
@@ -102,6 +117,7 @@ fn pending_cm_ack_redrives_before_generic_snapshot_or_timer_gate() {
 #[test]
 fn small_fold_keeps_anchored_epoch_and_reserves_rollover_for_capacity() {
     let fold = source("writable_fs/system_wal_fold.rs");
+    let native = source("writable_fs/system_wal_fold/native.rs");
     let first = fold.find("commit_next_with_wal_manifest(").unwrap();
     let second = fold[first + 1..].find("commit_next_with_wal_manifest(").unwrap() + first + 1;
     let decision = fold.find("if needs_epoch_rollover(manifest.high_water_end_lba, sectors)")
@@ -113,6 +129,10 @@ fn small_fold_keeps_anchored_epoch_and_reserves_rollover_for_capacity() {
     assert!(fold.contains("work.old_continuation.take()")
         && fold.contains("work.next_continuation.is_some()"),
         "no rollover reuses the exact anchored token after CM ACK");
+    assert!(native.contains("if needs_epoch_rollover(active.manifest.high_water_end_lba, sectors)")
+        && native.contains("publish_ready(active, None, pair)")
+        && native.contains("publish_ready(active, Some(next), pair)"),
+        "native small fold retains its anchored token and rolls only at the capacity gate");
 }
 
 #[test]

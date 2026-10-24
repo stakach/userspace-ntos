@@ -179,6 +179,18 @@ pub enum WdmIoStackParameters {
         io_control_code: u32,
         type3_input_buffer: u64,
     },
+    /// `IRP_MJ_SCSI` aliases internal device control (0x0f), but its parameter union is a
+    /// single SRB pointer. Decode it only when the caller has authenticated a SCSI PDO route.
+    Scsi { srb: u64 },
+    Power {
+        system_context: u32,
+        state_type: u32,
+        state: u32,
+        shutdown_type: u32,
+    },
+    WaitWake {
+        state: u32,
+    },
     PnpStartDevice {
         allocated_resources: u64,
         allocated_resources_translated: u64,
@@ -570,6 +582,23 @@ pub fn write_wdm_io_stack_location(
             put_u32(bytes, 0x18, io_control_code);
             put_u64(bytes, 0x20, type3_input_buffer);
         }
+        WdmIoStackParameters::Scsi { srb } => {
+            if init.major != nt_io_abi::major::IRP_MJ_INTERNAL_DEVICE_CONTROL || srb == 0 {
+                return Err(WdmLayoutError::InvalidField);
+            }
+            put_u64(bytes, 0x08, srb);
+        }
+        WdmIoStackParameters::Power { system_context, state_type, state, shutdown_type } => {
+            put_u32(bytes, nt_power_types::PARAM_POWER_SYSTEM_CONTEXT_OFFSET as usize,
+                system_context);
+            put_u32(bytes, nt_power_types::PARAM_POWER_TYPE_OFFSET as usize, state_type);
+            put_u32(bytes, nt_power_types::PARAM_POWER_STATE_OFFSET as usize, state);
+            put_u32(bytes, nt_power_types::PARAM_POWER_SHUTDOWN_TYPE_OFFSET as usize,
+                shutdown_type);
+        }
+        WdmIoStackParameters::WaitWake { state } => {
+            put_u32(bytes, 0x08, state);
+        }
         WdmIoStackParameters::PnpStartDevice {
             allocated_resources,
             allocated_resources_translated,
@@ -598,6 +627,31 @@ pub fn write_wdm_io_stack_location(
         }
     }
     Ok(())
+}
+
+/// Decode the SCSI form of major 0x0f after the caller has authenticated the target as a
+/// storage PDO. The generic decoder must continue interpreting 0x0f as device control.
+pub fn decode_wdm_kernel_built_scsi_stack(
+    bytes: &[u8],
+) -> Result<WdmIoStackLocationInit, WdmLayoutError> {
+    require(bytes, WDM_X64_IO_STACK_LOCATION_SIZE)?;
+    if bytes[0] != nt_io_abi::major::IRP_MJ_INTERNAL_DEVICE_CONTROL || bytes[1] != 0 {
+        return Err(WdmLayoutError::InvalidField);
+    }
+    let pointer = |offset: usize| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+    let srb = pointer(0x08);
+    if srb == 0 {
+        return Err(WdmLayoutError::InvalidField);
+    }
+    Ok(WdmIoStackLocationInit {
+        major: bytes[0],
+        minor: bytes[1],
+        flags: bytes[2],
+        control: bytes[3],
+        device_object: pointer(0x28),
+        file_object: pointer(0x30),
+        parameters: WdmIoStackParameters::Scsi { srb },
+    })
 }
 
 /// Decode the next stack location of a kernel-built IRP before it enters the I/O manager.

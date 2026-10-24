@@ -27,10 +27,7 @@ impl ReservedGenericDataSection {
 
     pub(crate) fn publish(&mut self, handler: &mut ExecNtHandler) -> Result<u64, u32> {
         let sections = unsafe {
-            &*handler
-                .loop_ctx
-                .expect("Section publication context")
-                .generic_sections
+            &*crate::service_sec_image::registered_section_table_for_handler(handler)?
         };
         assert_eq!(sections.section_identity(self.index), Some(self.identity));
         self.publication.publish(&mut handler.pm)
@@ -39,10 +36,8 @@ impl ReservedGenericDataSection {
     pub(crate) fn abort(&mut self, handler: &mut ExecNtHandler) {
         handler.withdraw_data_section_name(self.identity);
         let sections = unsafe {
-            &mut *handler
-                .loop_ctx
-                .expect("Section rollback context")
-                .generic_sections
+            &mut *crate::service_sec_image::registered_section_table_for_handler(handler)
+                .expect("reserved Section retains its registered table owner")
         };
         assert_eq!(sections.section_identity(self.index), Some(self.identity));
         assert_eq!(
@@ -58,10 +53,7 @@ impl ReservedGenericDataSection {
         handler: &mut ExecNtHandler,
     ) -> Result<(nt_memory_manager::SectionReference, u64, u32), u32> {
         let sections = unsafe {
-            &mut *handler
-                .loop_ctx
-                .expect("reserved Section context")
-                .generic_sections
+            &mut *crate::service_sec_image::registered_section_table_for_handler(handler)?
         };
         assert_eq!(sections.section_identity(self.index), Some(self.identity));
         let protection = sections
@@ -79,7 +71,9 @@ impl ReservedGenericDataSection {
                 crate::provider_bugcheck::report(0xc4, [self.index as u64, self.size, 0, 91]);
             }
         }
-        let sections = unsafe { &mut *handler.loop_ctx.expect("Section context").generic_sections };
+        let sections = unsafe {
+            &mut *crate::service_sec_image::registered_section_table_for_handler(handler)?
+        };
         assert_eq!(sections.section_identity(self.index), Some(self.identity));
         assert!(sections.release_handle(self.index));
         Ok((reference, self.size, protection))
@@ -113,7 +107,11 @@ impl ExecNtHandler {
         if self.pm_pid_for_pi(owner_pi) != Some(caller.effective_process()) {
             return Err(nt_fs::STATUS_INVALID_HANDLE);
         }
-        let generic_sections = self.loop_ctx.ok_or(0xC000_00A3u32)?.generic_sections;
+        if self.loop_ctx.is_none() && (sec_file != 0 || routed_admission.is_some()) {
+            return Err(0xC000_00A3u32);
+        }
+        let generic_sections =
+            crate::service_sec_image::registered_section_table_for_handler(self)?;
         let mut routed_lease = None;
         let mut local_lease = None;
         let (backing, backing_size) = if sec_file == 0 && routed_admission.is_none() {

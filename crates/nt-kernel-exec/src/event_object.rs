@@ -728,6 +728,29 @@ impl EventObjectRegistry {
         Ok(self.events[self.event_slot(id)?].provider_body)
     }
 
+    /// Read the canonical signal state behind a live projected provider pointer.
+    /// The provider body is an alias, never an independent dispatcher object.
+    pub fn projected_ready(&self, body: u64, events: &crate::EventStore) -> Option<bool> {
+        let id = self.id_for_provider_body(body)?;
+        let native = self.snapshot(id).ok()?.native_identity;
+        events.query_existing(native).map(|(_, signaled)| signaled)
+    }
+
+    /// Consume a live projected synchronization Event through its canonical state.
+    pub fn projected_consume(&self, body: u64, events: &mut crate::EventStore) -> Option<bool> {
+        let id = self.id_for_provider_body(body)?;
+        let native = self.snapshot(id).ok()?.native_identity;
+        events.query_existing(native)?;
+        Some(events.consume_existing(native))
+    }
+
+    /// Make a provider pointer signal visible to every handle and wait owner.
+    pub fn projected_set(&self, body: u64, events: &mut crate::EventStore) -> Option<bool> {
+        let id = self.id_for_provider_body(body)?;
+        let native = self.snapshot(id).ok()?.native_identity;
+        events.set_existing(native)
+    }
+
     fn increment(value: &mut u32) -> Result<(), EventObjectError> {
         *value = value
             .checked_add(1)
@@ -804,6 +827,28 @@ impl EventObjectRegistry {
         let id = self
             .id_for_provider_body(body)
             .ok_or(EventObjectError::InvalidProviderBody)?;
+        let slot = self.event_slot(id)?;
+        if self.events[slot].pointer_leases == 0 {
+            return Err(EventObjectError::StaleLease);
+        }
+        self.events[slot].pointer_leases -= 1;
+        Ok(self.try_retire(slot))
+    }
+
+    /// Retain a canonical Event for a native driver's independently owned VSpace body.
+    /// The caller's generation-bound projection ledger owns the body mapping.
+    pub fn retain_external_pointer(&mut self, id: EventObjectId) -> Result<(), EventObjectError> {
+        let slot = self.event_slot(id)?;
+        if self.events[slot].provider_local_identity.is_some() {
+            return Err(EventObjectError::InvalidProviderBody);
+        }
+        Self::increment(&mut self.events[slot].pointer_leases)
+    }
+
+    /// Release only the canonical lease; the caller retires its exact VSpace body separately.
+    pub fn release_external_pointer(
+        &mut self, id: EventObjectId,
+    ) -> Result<Option<RetiredEventObject>, EventObjectError> {
         let slot = self.event_slot(id)?;
         if self.events[slot].pointer_leases == 0 {
             return Err(EventObjectError::StaleLease);
@@ -1040,6 +1085,18 @@ impl EventObjectRegistry {
                         body,
                     )
                 })
+        })
+    }
+
+    /// Find the retired body owned by an authenticated projection without
+    /// allowing a tombstone in another provider domain to block its reclaim.
+    pub fn pending_provider_reclaim_for_body(&self, body: u64) -> Option<EventObjectId> {
+        if body == 0 {
+            return None;
+        }
+        self.events.iter().enumerate().find_map(|(slot, record)| {
+            (!record.live && record.provider_body == Some(body))
+                .then(|| EventObjectId(ObjectId::new(record.generation, slot as u64)))
         })
     }
 
@@ -1986,6 +2043,67 @@ mod tests {
         assert_eq!(old.0.slot(), reused.0.slot());
         assert_ne!(old.0.generation(), reused.0.generation());
         assert_eq!(retired.provider_body, Some(0x7000));
+    }
+
+    #[test]
+    fn pending_reclaim_finds_exact_body_behind_another_domain_tombstone() {
+        let mut registry = EventObjectRegistry::new();
+        let foreign = create(&mut registry, 73);
+        registry.install_provider_body(foreign, 0x7300).unwrap();
+        registry.retain_pointer(foreign).unwrap();
+        registry.request_delete(foreign).unwrap();
+        registry.release_pointer_by_body(0x7300).unwrap();
+
+        let local = create(&mut registry, 74);
+        registry.install_provider_body(local, 0x7400).unwrap();
+        registry.retain_pointer(local).unwrap();
+        registry.request_delete(local).unwrap();
+        registry.release_pointer_by_body(0x7400).unwrap();
+
+        assert_eq!(registry.pending_provider_reclaim(), Some((foreign, 0x7300)));
+        assert_eq!(registry.pending_provider_reclaim_for_body(0x7400), Some(local));
+        assert_eq!(registry.pending_provider_reclaim_for_body(0x7301), None);
+        registry.complete_provider_reclaim(local, 0x7400).unwrap();
+        assert_eq!(registry.pending_provider_reclaim(), Some((foreign, 0x7300)));
+    }
+
+    #[test]
+    fn projected_pointer_and_native_handle_share_one_event_state() {
+        let mut registry = EventObjectRegistry::new();
+        let mut events = crate::EventStore::new();
+        events.initialize(0x7600, crate::EventKind::Synchronization, false);
+        let id = create(&mut registry, 0x7600);
+        registry.install_provider_body(id, 0x7700).unwrap();
+        assert_eq!(registry.projected_ready(0x7700, &events), Some(false));
+
+        // A native handle set must make the projected pointer wait-ready.
+        assert_eq!(events.set_existing(0x7600), Some(false));
+        assert_eq!(registry.projected_ready(0x7700, &events), Some(true));
+        assert_eq!(registry.projected_consume(0x7700, &mut events), Some(true));
+        assert_eq!(events.query_existing(0x7600),
+            Some((crate::EventKind::Synchronization, false)));
+
+        // A projected pointer set must be visible through the native handle.
+        assert_eq!(registry.projected_set(0x7700, &mut events), Some(false));
+        assert_eq!(events.query_existing(0x7600),
+            Some((crate::EventKind::Synchronization, true)));
+        assert_eq!(registry.projected_ready(0x7701, &events), None);
+    }
+
+    #[test]
+    fn one_system_event_retains_independent_native_driver_projection_leases() {
+        let mut registry = EventObjectRegistry::new();
+        let id = create(&mut registry, 0x7800);
+        registry.retain_handle(id).unwrap();
+        registry.retain_external_pointer(id).unwrap(); // driver domain A
+        registry.retain_external_pointer(id).unwrap(); // driver domain B
+        registry.request_delete(id).unwrap();
+        registry.release_handle(id).unwrap();
+        assert_eq!(registry.snapshot(id).unwrap().pointer_leases, 2);
+        assert_eq!(registry.release_external_pointer(id).unwrap(), None);
+        assert_eq!(registry.snapshot(id).unwrap().pointer_leases, 1);
+        assert!(registry.release_external_pointer(id).unwrap().is_some());
+        assert!(registry.snapshot(id).is_err());
     }
 
     #[test]

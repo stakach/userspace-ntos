@@ -71,6 +71,38 @@ fn retained_hive() -> (Hive, CellId) {
     (hive, target)
 }
 
+#[test]
+fn owned_prepared_value_waits_for_exact_durable_publication() {
+    let mut set = MutableHiveSet::new();
+    let mut user = Hive::new(HiveKind::Software);
+    let key = user.create_key("Target");
+    user.finish_clean_import();
+    set.mount(MOUNT, 7, user).unwrap();
+    set.mount(r"\Registry\User\Other", 8, Hive::new(HiveKind::Software))
+        .unwrap();
+
+    let prepared = set
+        .prepare_owned_set_value(7, key, "Target", "Value", RegistryValueType::Binary, vec![2])
+        .unwrap();
+    let sequence = prepared.sequence();
+    assert_eq!(prepared.record(), encode_log_record(
+        &HiveLogOp::SetValue {
+            path: "Target", name: "Value", value_type: RegistryValueType::Binary, data: &[2],
+        }, sequence,
+    ));
+    assert_eq!(set.hive(7).unwrap().query_value(key, "Value"), None);
+    assert!(set.hive_mut(7).is_none());
+    assert!(set.hive_mut(8).is_some());
+    assert!(matches!(
+        set.prepare_owned_set_value(7, key, "Target", "Other", RegistryValueType::Binary, vec![3]),
+        Err(SetValueError::RetainedPublication)
+    ));
+    // No physical entry occurred, so releasing the owner cannot publish the edit.
+    set.release_unentered_owned_set_value(prepared).unwrap();
+    assert_eq!(set.hive(7).unwrap().query_value(key, "Value"), None);
+    assert!(set.hive_mut(7).is_some());
+}
+
 struct Snapshot {
     image: Vec<u8>,
     record: Vec<u8>,

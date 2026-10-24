@@ -21,6 +21,7 @@ fn pending_capabilities_completion_uses_pnp_payload_length() {
         "const IRP_MJ_PNP: u64 = 0x1b;\n\
          const IRP_MJ_DEVICE_CONTROL: u64 = 0x0e;\n\
          const STATUS_BUFFER_OVERFLOW: u32 = 0x80000005;\n\
+         const STATUS_BUFFER_TOO_SMALL: u32 = 0xc0000023;\n\
          const HOSTED_ACPI_NAMESPACE_HEADER_LEN: usize = 8;\n\
          mod nt_acpi {{ pub const IOCTL_ACPI_ENUM_CHILDREN: u32 = 0x0032c020; }}\n\
          mod ioctl {{ pub const METHOD_BUFFERED: u32 = 0; }}\n\

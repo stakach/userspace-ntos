@@ -93,7 +93,8 @@ fn physical(instance_index: usize, kind: PhysicalSourceKind) -> Option<(Physical
         }
         PhysicalSourceKind::DispatchWorker { ordinal } => {
             let worker = unsafe { hosted_source_completion_lane::worker(instance_index, ordinal)
-                .or_else(|| hosted_class_irp_lane::worker(instance_index, ordinal))? };
+                .or_else(|| hosted_class_irp_lane::worker(instance_index, ordinal))
+                .or_else(|| hosted_provider_export_lane::worker(instance_index, ordinal))? };
             let thread = unsafe { (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_TABLES)) }
                 .as_ref()?.get(instance_index)?.get(worker.handle)?;
             if worker.domain != domain || worker.pml4 != inst.pml4 || thread.tcb != worker.tcb {
@@ -187,6 +188,7 @@ pub(crate) fn thread_enrollment(instance_index: usize, handle: u64) -> Option<En
                         || matches!(row.physical.kind, PhysicalSourceKind::DispatchWorker { ordinal }
                             if hosted_source_completion_lane::worker(instance_index, ordinal)
                                 .or_else(|| hosted_class_irp_lane::worker(instance_index, ordinal))
+                                .or_else(|| hosted_provider_export_lane::worker(instance_index, ordinal))
                                 .is_some_and(|worker| worker.handle == handle)))
                     && row.physical.domain == domain
                     && row.physical.pml4 == inst.pml4

@@ -34,6 +34,7 @@ impl ExecNtHandler {
         if caller.mode() == nt_types::AccessMode::UserMode
             && handle.granted_access() & nt_memory_manager::section_view_access::SECTION_MAP_EXECUTE == 0
         { return Err(nt_process::STATUS_ACCESS_DENIED); }
+        let area = self.image_sections.area(id).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         let source = self.image_sections.source(id).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         if !source.has_readable_image() { return Err(STATUS_NOT_SUPPORTED); }
         let path = source.image_path.as_deref().ok_or(STATUS_NOT_SUPPORTED)?;
@@ -45,7 +46,7 @@ impl ExecNtHandler {
         let (path_len, root) = dynamic_hosted_nt_image_path(path, leaf, &mut image_path)
             .ok_or(STATUS_NOT_SUPPORTED)?;
         let _durable = crate::allocator::enter_durable();
-        let mut bytes = source.materialize_process_snapshot(self)?;
+        let mut bytes = source.materialize_process_snapshot(self, area)?;
         if bytes.len() as u64 != source.backing.file_extent { return Err(INVALID_IMAGE); }
         // Preserve the canonical preferred transfer address through main-image placement.
         let headers = source.layout.headers();

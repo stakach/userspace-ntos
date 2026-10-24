@@ -4,7 +4,7 @@
 //! are adopted here. PM withdrawal owns retirement of published ordinary bodies.
 
 use super::*;
-use nt_kernel_abi::{ps_reactos_x64 as abi, GuestAddr};
+use nt_kernel_abi::{ps_hosted_x64 as abi, GuestAddr};
 use nt_memory_manager::owned_object_page::{ObjectPageIo, OwnedObjectPage, ROOT_ALIAS_RIGHTS};
 use nt_pnp_context::{AddressSlotAllocator, AddressSlotReservation};
 use nt_process::process_object_retirement::ProcessObjectRetirement;
@@ -232,6 +232,42 @@ pub(super) enum PublishedBody {
     Thread,
 }
 
+/// Authenticate a provider-visible ETHREAD against the published Ps row and its live alias.
+/// This performs no mapping or reference acquisition; the caller retains the wait reference.
+pub(super) fn verify_provider_thread_wait_body(
+    pm: &ProcessManager,
+    lifetime: ThreadLifetime,
+    body: u64,
+    target: ProviderRoot,
+) -> Result<(), u32> {
+    let _borrow = Borrow::acquire()?;
+    let arena = unsafe { &*core::ptr::addr_of!(ARENA) }.as_ref().ok_or(INVALID)?;
+    arena.validate(pm)?;
+    if !arena.providers.retains(target)
+        || pm.thread_lifetime(lifetime.thread_id()) != Some(lifetime)
+        || pm.thread_kernel_object(lifetime.thread_id()) != Some(body)
+    {
+        return Err(INVALID);
+    }
+    if lifetime == arena.root.system.thread() {
+        let initial = ps_bootstrap::initial_system_projection().ok_or(INVALID)?;
+        return (initial.identity == arena.root.system && body == initial.thread_body)
+            .then_some(()).ok_or(INVALID);
+    }
+    let index = arena.existing(BodyId::Thread(lifetime.thread_id())).ok_or(INVALID)?;
+    let row = &arena.rows[index];
+    if row.phase != BodyPhase::Published
+        || row.current_thread_lifetime != Some(lifetime)
+        || row.page.descriptor().address != body
+        || !row.page.is_initialized()
+        || !row.page.live_alias(MappingTarget::Provider(target))
+            .is_some_and(|(cap, rights)| cap != 0 && rights == ROOT_ALIAS_RIGHTS)
+    {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
 /// Read provider-published Win32Thread state from this owner's acknowledged canonical body.
 /// The PM mirror may not yet have been imported while the provider's dispatch is still entered.
 pub(super) fn read_thread_win32(
@@ -418,6 +454,7 @@ pub(super) unsafe fn grant_referenced_body(
 /// Root has stopped provider execution and closed all dispatch/callback admission for this exact
 /// target. Closing leaf admission is sticky; failures retain every remaining leaf/table/root.
 pub(super) unsafe fn retire_provider(target: ProviderRoot, scratch_base: u64) -> Result<(), u32> {
+    if crate::provider_ps_wait::has_target(target) { return Err(RESOURCES); }
     let borrow = Borrow::acquire()?;
     let arena = (&mut *core::ptr::addr_of_mut!(ARENA))
         .as_mut()
@@ -557,6 +594,9 @@ pub(super) unsafe fn prepare_process(
         return Err(INVALID);
     }
     let peb = pm.query_process_basic(pid, u64::MAX)?.peb_base_address;
+    let image_file_name = pm.kernel_process_export_state(pid)
+        .and_then(|state| state.eprocess_image_file_name())
+        .ok_or(INVALID)?;
     arena.prepare(
         BodyId::Process(pid),
         |address| {
@@ -564,6 +604,7 @@ pub(super) unsafe fn prepare_process(
                 body: GuestAddr(address),
                 process_id: u64::from(pid),
                 peb: GuestAddr(peb),
+                image_file_name,
             })
         },
         scratch_base,

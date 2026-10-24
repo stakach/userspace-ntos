@@ -88,6 +88,7 @@ pub enum ProviderWaitObjectType {
     Process = 4,
     Thread = 5,
     File = 6,
+    Mutant = 7,
 }
 
 impl ProviderWaitObjectType {
@@ -99,6 +100,7 @@ impl ProviderWaitObjectType {
             4 => Some(Self::Process),
             5 => Some(Self::Thread),
             6 => Some(Self::File),
+            7 => Some(Self::Mutant),
             _ => None,
         }
     }
@@ -624,6 +626,23 @@ mod tests {
         request.begin(metadata(), &objects).unwrap();
         assert_eq!(request.validate().unwrap().objects.len(), 64);
         assert!(core::mem::size_of::<ProviderWaitRequest>() <= 0x1000);
+    }
+
+    #[test]
+    fn mutant_wait_type_round_trips_as_typed_identity() {
+        // Native KMUTEX uses the mutant dispatcher object contract. Its wire
+        // tag must remain a typed identity rather than a provider pointer.
+        let mutant = ProviderWaitObject {
+            object_type: 7,
+            flags: PROVIDER_WAIT_OBJECT_FLAG_NONE,
+            object_id: 19,
+            object_generation: 3,
+        };
+        let mut request = ProviderWaitRequest::empty();
+        request.begin(metadata(), &[mutant]).unwrap();
+        let validated = request.validate().expect("generation-bound mutant wait");
+        assert!(validated.objects[0].typed().is_some());
+        assert_eq!(validated.objects[0].object_generation, 3);
     }
 
     #[test]

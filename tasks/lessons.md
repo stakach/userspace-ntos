@@ -1,5 +1,19 @@
 # Lessons
 
+## Check The Pinned Storage Provider Before Encoding CDBs
+- ReactOS references can lag the pinned LiberNT release. ReactOS storahci lacks READ CAPACITY16, READ16/WRITE16, and SYNCHRONIZE CACHE, while LiberNT commit `8e478a22a1e8f8a22bab17131f3184a7b4548c3d` implements all of them plus an ATA FLUSH CACHE path. Inspect the exact release source before restricting or submitting a command.
+- A reusable SRB builder does not establish live provider support. Match its command set to the pinned driver source, then verify retained native completion and flush durability before mounting writable storage.
+
+## Keep The Kernel-Facing DLL When Changing Userspace Media
+- An installed distribution supplies the user-mode image and drivers, but this project's
+  source-built `ntdll.dll` is the interface to its NT kernel personality. Stage our DLL
+  in the generated image and leave the release archive and its `acpi.sys` untouched.
+- Compare the built DLL's named exports and ordinals with the distribution DLL before
+  booting. Gate on missing names; report ordinal differences separately when the pinned
+  installed binaries import by name. Scan the whole installed PE tree for ntdll ordinal
+  imports before accepting different ordinals; the pinned LiberNT tree has none. Generate
+  import fixups against the DLL actually staged, and fail on gaps.
+
 ## Stage The Whole Public Export Chain
 - Before committing a tested crate change, inspect `git diff --cached` for every module
   re-export between the new type and the crate root. Local tests can pass from uncommitted
@@ -657,6 +671,9 @@ diagnosis-free failure.
 ## Fix Upstream Source Instead Of Patching Vendor Binaries
 - When a pinned ReactOS binary has a source-level defect, prepare an upstream source pull request
   with the native reproduction and reference accounting. Do not alter the binary locally.
+- Treat load-time instruction rewrites as binary modification too. When hosted code executes a
+  privileged instruction, implement an exact fault/continuation contract in source instead of
+  assuming a fixed image RVA or patchable instruction length in a new release.
 - Keep strict acceptance failed until an official fixed build is integrated and the native fixture
   passes. Track the upstream dependency separately from already-proven desktop acceptance.
 
@@ -676,3 +693,46 @@ diagnosis-free failure.
 ## Verify Live Input Before Requesting Desktop Interaction
 - A visible Winlogon frame does not prove that keyboard input reaches i8042 and kbdclass. Send a bounded QMP key event and verify the IRQ and class callback before asking a person to type credentials.
 - When replaying a shorter accepted persistence tail into a larger reserve, clear the entire reserve first. Stale bytes in the unused half can change recovery and invalidate the boot comparison.
+
+## Keep The Kernel Interface In Our Ntdll
+- For a replacement userspace release, stage this project's source-built `ntdll.dll` as the kernel interface and retain the release's unrelated drivers, including `acpi.sys`.
+- Compare exported names against the pinned release `ntdll.dll` and check installed PE imports before boot. Export coverage is an admission gate; live calls and desktop behavior need separate proof.
+- Treat named export coverage as the DLL compatibility requirement when the installed binaries import by name. Audit ordinal imports separately; differing export ordinal numbers alone do not require replacing the source-built kernel interface.
+
+## Test Native Boundaries Through Their Domain Contracts
+- A source-string assertion that only repeats the intended implementation is not a useful regression. Prove filtering, generation, ownership, and selector behavior in the relevant domain or protocol tests, then verify native wiring with a build and boot.
+
+## Preserve The RED Checkpoint With A Sole Test Owner
+- When another agent is the sole build and test owner, save the reproducing regression and stop editing until that agent reports the RED result. Implementing immediately can turn the requested RED checkpoint into an unobserved test.
+
+## Complete Native Contracts Before Closing The Issue
+- Treat a successful callback entry or a boot that advances one frontier as a checkpoint. Close the issue only after its live acceptance criteria, reboot evidence, exact-head CI, and final review pass.
+- When projecting a native interface, validate every supported argument and preserve each handle, alias, and uncertain effect through exact retirement. Fence unsupported operations explicitly; a convenient success result creates hidden debt.
+
+## Restore Suspended Native Lane Metadata As One Owned Context
+- When a native lane's Ps thread is correct but a shared callback or request header names another dispatch, trace the suspension and resume owner before changing callback policy. Keep the cross-process guard.
+- Retain and restore the exact per-dispatch shared metadata at each yield boundary. A failed native hypothesis must be reverted before changing the next path; focused tests alone do not establish live ownership.
+
+## Validate Initialization Callbacks Without Inventing Published Objects
+- Win32k callouts may suspend before their Win32 objects are published. Retain the exact active callout phase, stack activation, generation, and Ps object pair across a permitted callback or wait; an ordinary dispatch still requires both published Win32 objects.
+- A callout may publish its object before returning. Revalidate the current real publication at each resume instead of assuming every callback in that phase sees zero. Treat later root ingress failures as separate ownership failures until the typed receive error is known.
+
+## Separate Initial Thread Targets From Their Creating Callers
+- An initial-thread Ps callout executes for the dormant target, while `NtCreateThread` holds the creating caller's Reply. Capture the target's authenticated provider context before publishing the creation guard, then retain both identities across a provider wait and finish creation only after exact completion.
+- A callback redirect cannot transfer the creating caller's Reply into the target TCB. Require an explicit dual-identity contract before supporting that path; fail closed rather than treating a callback yield as an ordinary wait.
+- A bounded boot that advances to the next process is still a checkpoint. Identify the specific wait object, selection and resume eligibility before changing wake behavior, and keep genuine Explorer and reboot evidence as closure gates.
+
+## Commit Verified Increments During Long Native Bring-Up
+- When the user asks for commits as work proceeds, isolate each proven contract and commit it after its focused tests and native integration evidence, before exploring the next boot frontier.
+- Review staged paths and diff before every commit. Keep diagnostic traces and unrelated edits out; push a changed submodule commit before recording its pointer in the parent.
+- A workspace test can pass against unstaged native source while the committed tree fails CI. Before pushing a partial commit, check each source file read by its regressions against the staged snapshot and include all native call sites needed by the contract.
+
+## Keep Long Acceptance Runs Quiet When Requested
+- If the user asks for a completion-only update, continue the authorized validation and repair loop without routine progress messages. Report the full evidence after the issue is actually closed; surface a question only when work cannot continue without an answer.
+
+## Keep DMA Broker Allocations Authoritative
+- A missing native allocation record is not proof that a DMA buffer was freed. A driver can clear shared memory without completing the root Free operation. Reject `PutDmaAdapter` while the root manager still owns a buffer or mapping; do not silently revoke those rows to make retirement succeed.
+- Forward an exact, authenticated Free to the root while the native record is still live. If allocation and Free happen before the next replay, first register the exact bounded buffer with the root, then free it. Clear the local record only after a confirmed root receipt; an uncertain reply retains ownership and stops the provider.
+
+## Resolve The Active Worktree Before Editing
+- Print the Git worktree path before a multi-worktree task. Pass that exact path as `workdir` on every read, edit, and validation command; never rely on the chat's default checkout.

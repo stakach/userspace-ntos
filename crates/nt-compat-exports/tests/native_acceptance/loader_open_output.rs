@@ -319,7 +319,7 @@ fn internal_loader_record_failure_retires_only_its_unpublished_minted_handle() {
 
 #[test]
 fn finalized_open_routes_share_checked_publication_without_error_output_stores() {
-    for name in ["nt_open_file_service", "create_registered_kernel_file"] {
+    for name in ["nt_open_file_service", "create_registered_file_from_target"] {
         let function = handler_function(name);
         let mut calls = Calls::default();
         calls.visit_block(&function.block);
@@ -331,4 +331,10 @@ fn finalized_open_routes_share_checked_publication_without_error_output_stores()
             | "publish_loader_file_open_result")),
             "{name} cannot retain a private unchecked or unconditional final-output path");
     }
+    let mut kernel_calls = Calls::default();
+    kernel_calls.visit_block(&handler_function("create_registered_kernel_file").block);
+    assert!(kernel_calls.0.iter().any(|name| name == "create_registered_file_from_target"));
+    let mut peer_calls = Calls::default();
+    peer_calls.visit_block(&handler_function("create_registered_driver_peer_file").block);
+    assert!(peer_calls.0.iter().any(|name| name == "create_registered_file_from_target"));
 }

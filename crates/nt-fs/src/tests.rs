@@ -1,5 +1,34 @@
 use super::*;
 
+#[test]
+fn staged_fold_volume_is_independent_until_shared_publication() {
+    const PATH: &str = r"\??\C:\Windows\System32\config\SYSTEM";
+    let mut live = FileSystem::new(MemFs::new());
+    assert!(live.provision_file(PATH, b"old-system"));
+    let before = live.export_volume_snapshot().unwrap();
+    let mut staged = FileSystem::from_volume_snapshot(&before).unwrap();
+    let opened = staged.zw_create_file(PATH, FILE_WRITE_DATA, 0, 0, FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE);
+    assert_eq!(opened.status, STATUS_SUCCESS);
+    assert_eq!(staged.replace_file_data_owned(opened.handle, b"new-system".to_vec()),
+        STATUS_SUCCESS);
+    staged.zw_close(opened.handle);
+    let folded = staged.export_volume_snapshot().unwrap();
+    assert_ne!(folded, before);
+    // Both native snapshot passes may consume `folded` while the live overlay stays private.
+    assert_eq!(live.export_volume_snapshot().unwrap(), before);
+    let opened = live.zw_create_file(PATH, FILE_READ_DATA | FILE_WRITE_DATA, 0, 0, FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE);
+    assert_eq!(opened.status, STATUS_SUCCESS);
+    assert_eq!(live.zw_read_file(opened.handle, Some(0), 32),
+        (STATUS_SUCCESS, b"old-system".to_vec()));
+    // Model the single post-ACK shared publication while preserving the pre-existing handle.
+    assert_eq!(live.replace_file_data_owned(opened.handle, b"new-system".to_vec()),
+        STATUS_SUCCESS);
+    assert_eq!(live.zw_read_file(opened.handle, Some(0), 32),
+        (STATUS_SUCCESS, b"new-system".to_vec()));
+}
+
 struct MemoryBlockDevice {
     sector_size: usize,
     data: alloc::vec::Vec<u8>,
@@ -1723,6 +1752,78 @@ fn copied_file_chunks_share_provisioned_source_until_modified() {
 }
 
 #[test]
+fn unrelated_short_writes_do_not_scan_every_window_of_a_large_immutable_blob() {
+    let mut fs = FileSystem::new(MemFs::new());
+    let source_bytes = alloc::vec![0xa5; 256 * 1024];
+    let source_path = r"\??\C:\profiles\Default User\large-source.bin";
+    let dest_path = r"\??\C:\profiles\Default User\unrelated.bin";
+    assert!(fs.provision_file(source_path, &source_bytes));
+    let dest = fs.zw_create_file(
+        dest_path,
+        FILE_WRITE_DATA | FILE_READ_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        0,
+    );
+    assert_eq!(dest.status, STATUS_SUCCESS);
+
+    let inspected_before = fs.blob_slice_candidates_inspected();
+    let mut expected = alloc::vec::Vec::new();
+    for value in 1..=24u8 {
+        let chunk = [value; 16];
+        assert_eq!(
+            fs.zw_write_file(dest.handle, None, &chunk),
+            (STATUS_SUCCESS, chunk.len())
+        );
+        expected.extend_from_slice(&chunk);
+    }
+
+    assert_eq!(fs.file_bytes(dest_path), Some(expected.as_slice()));
+    assert_eq!(fs.file_bytes(source_path), Some(source_bytes.as_slice()));
+    let inspected = fs.blob_slice_candidates_inspected() - inspected_before;
+    assert!(
+        inspected <= 24 * 64,
+        "{inspected} candidate windows inspected for 24 unrelated short writes"
+    );
+}
+
+#[test]
+fn compacted_blob_indexes_do_not_reuse_stale_read_provenance() {
+    let mut fs = FileSystem::new(MemFs::new());
+    let source_path = r"\??\C:\Temp\source.bin";
+    let other_path = r"\??\C:\Temp\other.bin";
+    let dest_path = r"\??\C:\Temp\dest.bin";
+    assert!(fs.provision_file(source_path, b"old"));
+    assert!(fs.provision_file(other_path, b"new"));
+    let source = fs.zw_create_file(source_path, FILE_READ_DATA, 0, 0, FILE_OPEN, 0);
+    assert_eq!(source.status, STATUS_SUCCESS);
+    let mut read = [0; 3];
+    assert_eq!(
+        fs.zw_read_file_into(source.handle, None, &mut read),
+        (STATUS_SUCCESS, read.len())
+    );
+    assert_eq!(&read, b"old");
+
+    assert!(fs.provision_file(source_path, b"replacement"));
+    let compacted = fs.compact_volume_blobs().unwrap();
+    assert_eq!(compacted.reclaimed_blobs(), 1);
+    let inspected_before = fs.blob_slice_candidates_inspected();
+    let dest = fs.zw_create_file(dest_path, FILE_WRITE_DATA, 0, 0, FILE_CREATE, 0);
+    assert_eq!(dest.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_write_file(dest.handle, None, &read),
+        (STATUS_SUCCESS, read.len())
+    );
+    assert_eq!(fs.blob_slice_candidates_inspected(), inspected_before);
+
+    let restored = FileSystem::from_volume_snapshot(&fs.export_volume_snapshot().unwrap()).unwrap();
+    assert_eq!(restored.file_bytes(source_path), Some(&b"replacement"[..]));
+    assert_eq!(restored.file_bytes(other_path), Some(&b"new"[..]));
+    assert_eq!(restored.file_bytes(dest_path), Some(&b"old"[..]));
+}
+
+#[test]
 fn compact_volume_blobs_reclaims_only_unreferenced_storage() {
     let mut fs = FileSystem::new(MemFs::new());
     assert!(fs.provision_file(r"\??\C:\Temp\live.log", b"header"));
@@ -2326,6 +2427,32 @@ fn snapshot_block_store_rejects_bad_geometry_oversize_and_corruption() {
         store.read_latest(&mut dev),
         Err(SnapshotBlockStoreError::Corrupt)
     );
+}
+
+#[test]
+fn reusable_snapshot_capture_keeps_exact_bytes_and_allocation_across_mutations() {
+    let mut fs = FileSystem::new(MemFs::new());
+    let initial = fs.export_volume_snapshot().unwrap();
+    let mut capture = alloc::vec::Vec::with_capacity(initial.len() + 4096);
+    let address = capture.as_ptr();
+    fs.export_volume_snapshot_into(&mut capture).unwrap();
+    assert_eq!(capture, initial);
+    assert_eq!(capture.as_ptr(), address);
+
+    let file = fs.zw_create_file(
+        r"\??\C:\capture.txt",
+        FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(file.status, STATUS_SUCCESS);
+    assert_eq!(fs.zw_write_file(file.handle, None, b"updated").0, STATUS_SUCCESS);
+    let updated = fs.export_volume_snapshot().unwrap();
+    fs.export_volume_snapshot_into(&mut capture).unwrap();
+    assert_eq!(capture, updated);
+    assert_eq!(capture.as_ptr(), address);
 }
 
 #[test]
@@ -4527,6 +4654,70 @@ fn installed_file_import_is_fail_closed_and_never_replaces_the_writable_winner()
 }
 
 #[test]
+fn prepared_overlay_create_failure_rolls_back_import_and_materialized_parent() {
+    let mut fs = FileSystem::new(MemFs::new());
+    let source = FileMetadata {
+        end_of_file: 3,
+        valid_data_length: 3,
+        attributes: FILE_ATTRIBUTE_ARCHIVE,
+        number_of_links: 1,
+        ..FileMetadata::default()
+    };
+    let before = fs.export_volume_snapshot().unwrap();
+    let failed = fs.create_prepared_overlay_relative(
+        b"windows\\system32\\state.dat", Some(b"windows\\system32"),
+        Some((source, b"fat".to_vec())), FILE_READ_DATA, FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_READ, FILE_CREATE, 0,
+    );
+    assert_eq!(failed.status, STATUS_OBJECT_NAME_COLLISION);
+    assert_eq!(fs.export_volume_snapshot().unwrap(), before);
+    assert_eq!(fs.query_metadata_relative(b"windows\\system32"), None);
+    assert_eq!(fs.file_bytes_relative(b"windows\\system32\\state.dat"), None);
+}
+
+#[test]
+fn prepared_overlay_create_failure_preserves_existing_upper_winner() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_directory_relative(b"windows"));
+    assert!(fs.provision_file_relative(b"windows\\state.dat", b"upper"));
+    let source = FileMetadata {
+        end_of_file: 3, attributes: FILE_ATTRIBUTE_ARCHIVE, number_of_links: 1,
+        ..FileMetadata::default()
+    };
+    let before = fs.export_volume_snapshot().unwrap();
+    let failed = fs.create_prepared_overlay_relative(
+        b"windows\\state.dat", None, Some((source, b"fat".to_vec())),
+        FILE_READ_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_CREATE, 0,
+    );
+    assert_eq!(failed.status, STATUS_OBJECT_NAME_COLLISION);
+    assert_eq!(fs.export_volume_snapshot().unwrap(), before);
+    assert_eq!(fs.file_bytes_relative(b"windows\\state.dat"), Some(&b"upper"[..]));
+}
+
+#[test]
+fn prepared_overlay_create_commits_installed_bytes_and_parent_with_one_open() {
+    let mut fs = FileSystem::new(MemFs::new());
+    let source = FileMetadata {
+        end_of_file: 3,
+        valid_data_length: 3,
+        attributes: FILE_ATTRIBUTE_ARCHIVE,
+        number_of_links: 1,
+        ..FileMetadata::default()
+    };
+    let opened = fs.create_prepared_overlay_relative(
+        b"windows\\system32\\state.dat", Some(b"windows\\system32"),
+        Some((source, b"fat".to_vec())), FILE_READ_DATA,
+        FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_OPEN, 0,
+    );
+    assert_eq!(opened.status, STATUS_SUCCESS);
+    assert_eq!(opened.information, FILE_OPENED);
+    assert!(fs.query_metadata_relative(b"windows\\system32").unwrap().is_directory);
+    assert_eq!(fs.zw_read_file(opened.handle, Some(0), 3),
+        (STATUS_SUCCESS, b"fat".to_vec()));
+    assert_eq!(fs.zw_close(opened.handle), STATUS_SUCCESS);
+}
+
+#[test]
 fn installed_file_open_policy_has_one_owner_for_every_disposition() {
     assert_eq!(
         installed_file_open_action(FILE_READ_DATA, FILE_OPEN, 0),
@@ -4790,4 +4981,77 @@ fn writable_filesystem_batches_rename_old_and_new_names() {
             (FILE_ACTION_RENAMED_NEW_NAME, "after.txt".into()),
         ]
     );
+}
+
+#[test]
+fn native_cutover_retains_fat_metadata_request_until_exact_sector_completion() {
+    let geometry = FatPathGeometry {
+        fat_start_sector: 1,
+        data_start_sector: 100,
+        total_sectors: 200,
+        sectors_per_cluster: 1,
+    };
+    let mut lookup = FatPathLookup::new(geometry, 2, b"missing.txt").unwrap();
+    let request = lookup.request().unwrap();
+    assert_eq!(request, FatPathRequest {
+        sector: 100,
+        kind: FatPathRequestKind::Directory,
+    });
+
+    let mut route = BlockRouteOwner::new(7, 1_000).unwrap();
+    route.begin_drain(7).unwrap();
+    route.commit_native(7, 0x44).unwrap();
+    let operation = BlockOperation::Read { lba: 300, sectors: 1 };
+    assert_eq!(route.source_kind(), BlockSourceKind::Native);
+    assert_eq!(route.admit_boot(7, BlockSource::Fat, operation), Err(BlockRouteError::WrongPhase));
+    // A fenced boot read is not a negative directory entry. The cursor retains its request.
+    assert_eq!(lookup.request(), Some(request));
+    assert!(lookup.take_found().is_none());
+
+    assert_eq!(route.enter_native(8, BlockSource::Fat, operation), Err(BlockRouteError::WrongMount));
+    let ticket = route.enter_native(7, BlockSource::Fat, operation).unwrap();
+    assert_eq!(route.pending_native(), Some(ticket));
+    route.lose_native(ticket).unwrap();
+    let wrong_ticket = NativeBlockTicket { sequence: ticket.sequence + 1, ..ticket };
+    assert_eq!(route.complete_native(wrong_ticket, 512), Err(BlockRouteError::WrongTicket));
+    assert_eq!(route.complete_native(ticket, 511), Err(BlockRouteError::Incomplete));
+    assert_eq!(route.pending_native(), Some(ticket));
+    assert_eq!(lookup.request(), Some(request));
+
+    // Only the exact completed native sector can decide that the entry is absent.
+    route.complete_native(ticket, 512).unwrap();
+    assert_eq!(lookup.feed(request, &[0; 512]), Ok(FatPathProgress::NotFound));
+    assert_eq!(lookup.request(), None);
+    assert_eq!(route.pending_native(), None);
+}
+
+#[test]
+fn native_cutover_retains_fat_range_output_and_blocks_second_owner() {
+    let geometry = FatPathGeometry {
+        fat_start_sector: 1,
+        data_start_sector: 100,
+        total_sectors: 200,
+        sectors_per_cluster: 1,
+    };
+    let mut range = FatRangeLookup::new(geometry, 2, 0, 4).unwrap();
+    let request = range.request().unwrap();
+    let mut output = [0; 4];
+    let mut route = BlockRouteOwner::new(7, 1_000).unwrap();
+    route.begin_drain(7).unwrap();
+    route.commit_native(7, 0x44).unwrap();
+    let operation = BlockOperation::Read { lba: 300, sectors: 1 };
+    assert_eq!(route.admit_boot(7, BlockSource::Fat, operation), Err(BlockRouteError::WrongPhase));
+    assert_eq!(range.request(), Some(request));
+    assert_eq!(output, [0; 4]);
+
+    let ticket = route.enter_native(7, BlockSource::Fat, operation).unwrap();
+    assert_eq!(route.enter_native(7, BlockSource::Snapshot, operation),
+        Err(BlockRouteError::NativeIoOutstanding));
+    route.lose_native(ticket).unwrap();
+    assert_eq!(range.request(), Some(request));
+    assert_eq!(output, [0; 4]);
+    route.complete_native(ticket, 512).unwrap();
+    assert_eq!(range.feed(request, &[1; 512], &mut output), Ok(FatRangeProgress::Complete));
+    assert_eq!(output, [1; 4]);
+    assert_eq!(range.request(), None);
 }

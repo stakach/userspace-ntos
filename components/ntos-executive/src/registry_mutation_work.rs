@@ -168,6 +168,7 @@ enum Phase {
 enum PersistenceOwner {
     Unadmitted,
     NoStorage,
+    Admitting { recheck_id: u64, bytes: Vec<u8> },
     Legacy(writable_fs::registry_journal::Journal<()>),
     Wal(WalJournal),
 }
@@ -183,6 +184,18 @@ pub(crate) struct MutationPersistence {
 }
 
 impl MutationPersistence {
+    fn admitting(&self) -> bool { matches!(&self.owner, PersistenceOwner::Admitting { .. }) }
+
+    fn claim_native_wal_io(&mut self) -> Result<Option<(nt_fs::AsyncWalIoRequest, nt_fs::BlockOperation, Vec<u8>, nt_memory_manager::SectionMountId)>, u32> {
+        let PersistenceOwner::Wal(wal) = &mut self.owner else { return Ok(None); };
+        let mount = wal.mount();
+        wal.claim_native_io().map(|claim| claim.map(|(request, operation, input)| (request, operation, input, mount)))
+    }
+
+    fn native_wal_mut(&mut self) -> Option<&mut WalJournal> {
+        match &mut self.owner { PersistenceOwner::Wal(wal) => Some(wal), _ => None }
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             owner: PersistenceOwner::Unadmitted,
@@ -202,6 +215,21 @@ impl MutationPersistence {
         prepared: &PreparedSystemHiveMutation,
         bytes: Vec<u8>,
     ) -> Result<(), u32> {
+        if let PersistenceOwner::Admitting { recheck_id, .. } = &self.owner {
+            let recheck_id = *recheck_id;
+            let Some((lease, token, rechecked)) =
+                writable_fs::snapshot_storage::take_rechecked_wal_continuation(recheck_id)?
+            else { return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32); };
+            let PersistenceOwner::Admitting { bytes: retained, .. } =
+                core::mem::replace(&mut self.owner, PersistenceOwner::Unadmitted)
+            else { unreachable!() };
+            // The prepared CM bytes are checked again by admit_rechecked before its lease
+            // moves into the WAL. The retained copy is the only bytes that may be persisted.
+            drop(bytes);
+            let wal = WalJournal::admit_rechecked(prepared, retained, lease, token, rechecked)?;
+            self.owner = PersistenceOwner::Wal(wal);
+            return Ok(());
+        }
         assert!(matches!(&self.owner, PersistenceOwner::Unadmitted), "one storage owner per CM mutation");
         writable_fs::ensure_mounted()?;
         if bytes.is_empty() {
@@ -210,6 +238,21 @@ impl MutationPersistence {
             self.owner = PersistenceOwner::NoStorage;
             self.binding = Some(prepared.storage_binding());
             return Ok(());
+        }
+        match crate::fs_loader::exec_fs_mount_identity()
+            .and_then(crate::fs_loader::exec_block_route_kind) {
+            Some(nt_fs::BlockSourceKind::Draining) =>
+                return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32),
+            Some(nt_fs::BlockSourceKind::Native) => {
+                let recheck_id = writable_fs::snapshot_storage::begin_wal_continuation_recheck()
+                    .map_err(|status| if writable_fs::native_snapshot_io::admission_busy(status) {
+                        nt_status::NtStatus::DEVICE_BUSY.raw() as u32
+                    } else { status })?;
+                self.binding = Some(prepared.storage_binding());
+                self.owner = PersistenceOwner::Admitting { recheck_id, bytes };
+                return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32);
+            }
+            _ => {}
         }
         self.owner = if writable_fs::legacy_snapshot_writes_allowed() {
             let journal = writable_fs::registry_journal::Journal::admit(bytes, ())
@@ -228,6 +271,7 @@ impl MutationPersistence {
             PersistenceOwner::Legacy(journal) => journal.make_durable(),
             PersistenceOwner::Wal(wal) => wal.prepare(),
             PersistenceOwner::NoStorage | PersistenceOwner::Unadmitted => Ok(()),
+            PersistenceOwner::Admitting { .. } => Err(nt_fs::STATUS_DEVICE_NOT_READY),
         }
     }
 
@@ -264,6 +308,7 @@ impl MutationPersistence {
         match &mut self.owner {
             PersistenceOwner::Legacy(journal) => journal.rollback(),
             PersistenceOwner::Wal(_) | PersistenceOwner::NoStorage | PersistenceOwner::Unadmitted => Ok(()),
+            PersistenceOwner::Admitting { .. } => Err(nt_fs::STATUS_DEVICE_NOT_READY),
         }
     }
 
@@ -293,6 +338,10 @@ impl MutationPersistence {
         }
         match core::mem::replace(&mut self.owner, PersistenceOwner::Unadmitted) {
             PersistenceOwner::NoStorage => {}
+            PersistenceOwner::Admitting { recheck_id, bytes } => {
+                self.owner = PersistenceOwner::Admitting { recheck_id, bytes };
+                return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+            }
             PersistenceOwner::Unadmitted => return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST),
             PersistenceOwner::Legacy(journal) => match journal.release_after_publication() {
                 Ok(()) => {}
@@ -319,8 +368,39 @@ impl MutationPersistence {
         if self.abort_receipt != Some(ack.receipt()) {
             return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
         }
+        if let PersistenceOwner::Admitting { recheck_id, .. } = &self.owner {
+            let recheck_id = *recheck_id;
+            match writable_fs::snapshot_storage::take_rechecked_wal_continuation(recheck_id) {
+                Ok(None) => return Err(nt_fs::STATUS_DEVICE_NOT_READY),
+                Err(status) => {
+                    if writable_fs::snapshot_storage::recheck_was_aborted_no_effect(recheck_id) {
+                        self.owner = PersistenceOwner::Unadmitted;
+                        return Ok(());
+                    }
+                    return Err(status);
+                }
+                Ok(Some((lease, token, proof))) => {
+                    if let Err((status, token, pair)) =
+                        writable_fs::snapshot_storage::install_wal_continuation(
+                            &lease, token, proof.into_pair()) {
+                        core::mem::forget(lease);
+                        core::mem::forget(token);
+                        core::mem::forget(pair);
+                        writable_fs::block_uncertain_snapshot_reserve();
+                        return Err(status);
+                    }
+                    drop(lease);
+                    self.owner = PersistenceOwner::Unadmitted;
+                    return Ok(());
+                }
+            }
+        }
         match core::mem::replace(&mut self.owner, PersistenceOwner::Unadmitted) {
             PersistenceOwner::NoStorage | PersistenceOwner::Unadmitted => {}
+            PersistenceOwner::Admitting { recheck_id, bytes } => {
+                self.owner = PersistenceOwner::Admitting { recheck_id, bytes };
+                return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+            }
             PersistenceOwner::Legacy(journal) => match journal.release_rolled_back() {
                 Ok(()) => {}
                 Err(journal) => {
@@ -341,6 +421,7 @@ impl MutationPersistence {
 }
 
 struct Work {
+    id: u64,
     caller: Caller,
     phase: Phase,
     prepared: Option<PreparedSystemHiveMutation>,
@@ -355,6 +436,13 @@ struct Work {
 
 static mut ATTEMPTS: CmMutationBeginAttempts = CmMutationBeginAttempts::new();
 static mut WORK: Vec<Option<Work>> = Vec::new();
+static NEXT_WORK_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_work_id() -> u64 {
+    let id = NEXT_WORK_ID.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(id, 0, "registry mutation work id exhausted");
+    id
+}
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static PENDING: AtomicU64 = AtomicU64::new(0);
 static SYSTEM_LOCALE_PENDING: AtomicU64 = AtomicU64::new(0);
@@ -373,6 +461,66 @@ pub(crate) fn pending_count() -> u64 {
 
 pub(crate) fn redrive_active() -> bool {
     ACTIVE.load(Ordering::Acquire)
+}
+
+/// The outer native block executor alone claims physical WAL commands. A selected work row is
+/// temporarily moved out of this table, so skip it until redrive has restored the owner.
+pub(crate) unsafe fn claim_next_native_wal_io() -> Option<writable_fs::native_snapshot_io::SnapshotClaim> {
+    let rows = &mut *core::ptr::addr_of_mut!(WORK);
+    for (index, row) in rows.iter_mut().enumerate() {
+        if EXECUTING_INDEX.load(Ordering::Relaxed) == index as u64 { continue; }
+        let Some(work) = row.as_mut() else { continue; };
+        match work.persistence.claim_native_wal_io() {
+            Ok(Some((request, operation, input, mount))) => {
+                return Some(writable_fs::native_snapshot_io::SnapshotClaim::from_mutation(
+                    mount, operation, input, work.id, request,
+                ));
+            }
+            Ok(None) => {},
+            Err(_) => {
+                return None;
+            }
+        }
+    }
+    None
+}
+
+unsafe fn native_wal_by_id(id: u64) -> Result<&'static mut WalJournal, u32> {
+    let rows = &mut *core::ptr::addr_of_mut!(WORK);
+    rows.iter_mut().flatten().find(|work| work.id == id)
+        .and_then(|work| work.persistence.native_wal_mut())
+        .ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)
+}
+
+pub(crate) unsafe fn mark_native_wal_io_entered(id: u64, request: nt_fs::AsyncWalIoRequest) -> Result<(), u32> {
+    native_wal_by_id(id)?.mark_native_io_entered(request)
+}
+
+pub(crate) unsafe fn release_unentered_native_wal_io(id: u64, request: nt_fs::AsyncWalIoRequest) -> Result<(), u32> {
+    native_wal_by_id(id)?.release_unentered_native_io(request)
+}
+
+pub(crate) unsafe fn refuse_unentered_native_wal_io(
+    id: u64, request: nt_fs::AsyncWalIoRequest, status: nt_status::NtStatus,
+) -> Result<(), u32> {
+    let work = (&mut *core::ptr::addr_of_mut!(WORK)).iter_mut().flatten()
+        .find(|work| work.id == id).ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
+    let wal = work.persistence.native_wal_mut().ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
+    let refusal = wal.refuse_unentered_native_io(request)?;
+    work.status = status.raw() as u32;
+    if refusal == nt_fs::AsyncWalRefusal::NoEffect {
+        work.phase = Phase::Rollback;
+    }
+    NEXT.store(monotonic_time_100ns(), Ordering::Release);
+    Ok(())
+}
+
+pub(crate) unsafe fn complete_native_wal_io(
+    id: u64, request: nt_fs::AsyncWalIoRequest, result: Result<&[u8], nt_status::NtStatus>,
+) -> Result<(), u32> {
+    let settled = native_wal_by_id(id)?.complete_native_io(request, result);
+    NEXT.store(monotonic_time_100ns(), Ordering::Release);
+    settled
 }
 
 /// Failure returns both canonical owners unchanged; no CM mutation has been sent.
@@ -442,6 +590,7 @@ pub(crate) unsafe fn submit_hosted(
     };
     assert_ne!(caller.reply, 0);
     let work = Some(Work {
+        id: next_work_id(),
         caller: Caller::Hosted(caller), phase: Phase::Begin(attempt), prepared: None, persistence: MutationPersistence::new(),
         receipt: None, opening: None, status: 0,
         cancelled: false, commit_entered: false, published: false,
@@ -550,6 +699,7 @@ pub(crate) unsafe fn submit_hosted_existing(
     };
     assert_ne!(hosted.reply, 0);
     let work = Some(Work {
+        id: next_work_id(),
         caller: Caller::Hosted(hosted), phase: Phase::Begin(attempt), prepared: None, persistence: MutationPersistence::new(),
         receipt: None, opening: None, status: 0,
         cancelled: false, commit_entered: false, published: false,
@@ -607,6 +757,7 @@ pub(crate) unsafe fn submit_hosted_system_locale(
     };
     assert_ne!(caller.reply, 0);
     let work = Some(Work {
+        id: next_work_id(),
         caller: Caller::Hosted(caller), phase: Phase::Begin(attempt), prepared: None, persistence: MutationPersistence::new(),
         receipt: None, opening: None, status: 0,
         cancelled: false, commit_entered: false, published: false,
@@ -824,7 +975,7 @@ unsafe fn advance(
             }
         }
         Phase::Admit => {
-            if work.cancelled {
+            if work.cancelled && !work.persistence.admitting() {
                 work.phase = Phase::Abort;
                 return Ok(false);
             }
@@ -834,7 +985,8 @@ unsafe fn advance(
                 work.phase = Phase::Abort;
                 return Ok(false);
             }
-            let bytes = system_mutation_storage(prepared).map_err(|status| status as i32)?;
+            let bytes = if work.persistence.admitting() { Vec::new() }
+                else { system_mutation_storage(prepared).map_err(|status| status as i32)? };
             match work.persistence.admit(prepared, bytes) {
                 Ok(()) => {
                     work.phase = if work.persistence.has_journal() { Phase::Durable } else { Phase::Commit };

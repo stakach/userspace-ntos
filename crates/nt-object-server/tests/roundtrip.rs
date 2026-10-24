@@ -89,6 +89,72 @@ fn full_service_roundtrip() {
 }
 
 #[test]
+fn session_zero_link_openif_returns_the_existing_canonical_identity() {
+    let mut server = Server::new().unwrap();
+    let cid = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);
+    let mut c = client(&mut server, cid);
+    let path = "\\Sessions\\0\\BaseNamedObjects";
+    let target = "\\BaseNamedObjects";
+    let (existing, existing_before) = c
+        .create_or_open_symbolic_link(path, target, true, true, true)
+        .unwrap();
+    assert!(existing_before);
+    assert_ne!(existing.0, 0);
+    assert_eq!(c.query_symbolic_link(path, true).unwrap(), target.encode_utf16().collect::<Vec<_>>());
+    assert_eq!(
+        c.create_or_open_symbolic_link(path, target, true, false, true),
+        Err(NtStatus::OBJECT_NAME_COLLISION)
+    );
+    assert_eq!(
+        c.create_or_open_symbolic_link(path, "\\Different", true, true, true),
+        Err(NtStatus::OBJECT_NAME_COLLISION)
+    );
+    assert_eq!(
+        c.create_or_open_symbolic_link("\\Sessions\\0", target, true, true, true),
+        Err(NtStatus::OBJECT_TYPE_MISMATCH)
+    );
+    let (again, opened_existing) = c
+        .create_or_open_symbolic_link(path, target, true, true, true)
+        .unwrap();
+    assert!(opened_existing);
+    assert_eq!(again, existing);
+    let (folded, folded_existing) = c
+        .create_or_open_symbolic_link("\\sessions\\0\\basenamedobjects", target, true, true, true)
+        .unwrap();
+    assert!(folded_existing);
+    assert_eq!(folded, existing);
+}
+
+#[test]
+fn created_session_owns_exact_numbered_windows_namespace_until_retired() {
+    let mut server = Server::new().unwrap();
+    let cid = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);
+    let mut c = client(&mut server, cid);
+    assert_eq!(c.lookup("\\Sessions\\37", true), Err(NtStatus::OBJECT_NAME_NOT_FOUND));
+
+    let owned = c.create_session_namespace(37).unwrap();
+    assert_eq!(c.lookup("\\Sessions\\37", true).unwrap(), owned.session);
+    assert_eq!(c.lookup("\\Sessions\\37\\Windows", true).unwrap(), owned.windows);
+    assert_eq!(c.lookup("\\Sessions\\37\\BaseNamedObjects", true).unwrap(), owned.base_named_objects);
+    assert_eq!(c.create_session_namespace(37), Err(NtStatus::OBJECT_NAME_COLLISION));
+    assert_eq!(c.lookup("\\Sessions\\38", true), Err(NtStatus::OBJECT_NAME_NOT_FOUND));
+    let stale = nt_object_client::SessionNamespace {
+        session: nt_types::ObjectId(owned.session.0 + 1),
+        windows: owned.windows,
+        base_named_objects: owned.base_named_objects,
+    };
+    assert_eq!(c.retire_session_namespace_exact(37, stale), Err(NtStatus::INVALID_HANDLE));
+    assert_eq!(c.lookup("\\Sessions\\37\\Windows", true).unwrap(), owned.windows);
+
+    let child = c.create_directory("\\Sessions\\37\\Windows\\WindowStations", false).unwrap();
+    assert_eq!(c.lookup("\\Sessions\\37\\Windows\\WindowStations", true).unwrap(), child);
+    assert_eq!(c.retire_session_namespace_exact(37, owned), Err(NtStatus::DIRECTORY_NOT_EMPTY));
+    c.delete_object("\\Sessions\\37\\Windows\\WindowStations", true).unwrap();
+    c.retire_session_namespace_exact(37, owned).unwrap();
+    assert_eq!(c.lookup("\\Sessions\\37", true), Err(NtStatus::OBJECT_NAME_NOT_FOUND));
+}
+
+#[test]
 fn service_denies_over_request() {
     let mut server = Server::new().unwrap();
     let cid = server.connect(ClientKind::NativeUser, AccessMode::UserMode);

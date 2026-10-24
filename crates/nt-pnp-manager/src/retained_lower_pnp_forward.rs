@@ -1304,6 +1304,84 @@ mod tests {
     }
 
     #[test]
+    fn direct_fdo_filter_consumes_only_its_exact_accepted_pdo_proof() {
+        // The PCI FDO forwards the original PDO-origin FILTER IRP directly to
+        // the ACPI PDO. There is no separately constructed nested FDO IRP.
+        let mut fixture = fixture(Box::new(PassThroughFilterBackend));
+        let pdo = fixture.provider.device_id();
+        let fdo_driver = fixture
+            .io
+            .create_kernel_driver_with_majors(
+                &NtPath::parse_str(r"\Driver\FunctionFilter").unwrap(),
+                Box::new(PassThroughFilterBackend),
+                &[nt_pnp_abi::IRP_MJ_PNP],
+            )
+            .unwrap();
+        let fdo = fixture
+            .io
+            .create_device(
+                fdo_driver, None, DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(), DeviceFlags::empty(), 0,
+            )
+            .unwrap();
+        fixture.io.attach_device_to_stack(fdo, pdo).unwrap();
+        let fdo_registration = fixture
+            .io
+            .bind_hosted_device_pointer(fixture.consumer_domain, 0x3000, fdo)
+            .unwrap();
+        let pdo_projection = fixture
+            .io
+            .hosted_device_pointer_registration(fixture.consumer_domain, fixture.consumer_address)
+            .unwrap();
+        let devnode = fixture.pnp.devnode_for_pdo(pdo.raw()).unwrap();
+        fixture.pnp.set_fdo(devnode, fdo.raw()).unwrap();
+        let parameters = PnpParameters::filter_resource_requirements(64).unwrap();
+        let outer = fixture.io.prepare_external_pnp_owned_to_device(
+            fixture.client, pdo, 17, parameters, vec![0x5a; 64],
+        ).unwrap();
+        let authority = fixture.providers.resolve(
+            &fixture.pnp, &fixture.relations, &fixture.io, pdo.raw(),
+        ).unwrap();
+        let identity = crate::AcceptedPdoPnpIdentity {
+            outer_irp: outer.irp_id(), pdo,
+            minor: nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS,
+            provider: authority,
+        };
+        let mut proof = crate::AcceptedPdoLowerFilterProof::new(
+            identity, NtStatus::NOT_SUPPORTED,
+        ).unwrap();
+        let source = SourceIrpTicket::new(fixture.consumer_domain, 9, 1).unwrap();
+        let stale = SourceIrpTicket::new(fixture.consumer_domain, 9, 2).unwrap();
+        let foreign_domain = fixture.io.register_hosted_domain();
+        let foreign_source = SourceIrpTicket::new(foreign_domain, 9, 1).unwrap();
+        let mut edge = crate::AcceptedPdoDirectFilterEdge::capture(
+            &fixture.pnp, &fixture.relations, &fixture.providers, &fixture.io,
+            outer.irp_id(), fdo_registration, pdo_projection, fixture.client, 17,
+        ).unwrap();
+        assert!(edge.bind_source(outer.irp_id(), foreign_source).is_err());
+        edge.bind_source(outer.irp_id(), source).unwrap();
+        assert!(edge.consume_proof(
+            &fixture.pnp, &fixture.relations, &fixture.providers, &fixture.io,
+            outer.irp_id(), stale, &mut proof,
+        ).is_err());
+        fixture.io.device_mut(fdo).unwrap().attached_to = None;
+        assert!(edge.consume_proof(
+            &fixture.pnp, &fixture.relations, &fixture.providers, &fixture.io,
+            outer.irp_id(), source, &mut proof,
+        ).is_err());
+        fixture.io.device_mut(fdo).unwrap().attached_to = Some(pdo);
+        assert_eq!(edge.consume_proof(
+            &fixture.pnp, &fixture.relations, &fixture.providers, &fixture.io,
+            outer.irp_id(), source, &mut proof,
+        ), Ok(NtStatus::NOT_SUPPORTED));
+        assert!(edge.consume_proof(
+            &fixture.pnp, &fixture.relations, &fixture.providers, &fixture.io,
+            outer.irp_id(), source, &mut proof,
+        ).is_err());
+        fixture.io.discard_prepared_external_pnp(outer).unwrap();
+    }
+
+    #[test]
     fn accepted_acpi_child_filter_enters_its_provider_and_keeps_optional_pass_through() {
         // ReactOS ACPI's PDO leaves this optional IRP's seeded status and borrowed input pointer.
         let mut fixture = fixture_with_bus(

@@ -28,6 +28,12 @@ extern crate alloc;
 #[path = "dll_relocation.rs"]
 mod dll_relocation;
 
+#[cfg(target_arch = "x86_64")]
+#[path = "csr_connect.rs"]
+mod csr_connect;
+#[cfg(target_arch = "x86_64")]
+pub use csr_connect::csr_client_connect_to_server;
+
 use core::{
     ffi::c_void,
     marker::PhantomData,
@@ -53,10 +59,6 @@ const SSN_NT_PROTECT_VIRTUAL_MEMORY: u32 = 143;
 #[cfg(target_arch = "x86_64")]
 const SSN_NT_UNMAP_VIEW_OF_SECTION: u32 = 277;
 
-/// `NtRequestWaitReplyPort` SSN (CSR API message data plane).
-#[cfg(target_arch = "x86_64")]
-const SSN_NT_REQUEST_WAIT_REPLY_PORT: u32 = 208;
-
 /// `STATUS_NO_MEMORY`.
 const STATUS_NO_MEMORY: u64 = 0xC000_0017;
 
@@ -80,6 +82,8 @@ const NT_CURRENT_PROCESS: u64 = u64::MAX; // (HANDLE)-1
 /// `CsrPortMemoryDelta`, `CsrProcessId`).
 #[cfg(target_arch = "x86_64")]
 static mut CSR_API_PORT: u64 = 0;
+#[cfg(target_arch = "x86_64")]
+static mut CSR_PORT_HEAP: u64 = 0;
 #[cfg(target_arch = "x86_64")]
 static mut CSR_PORT_MEMORY_DELTA: isize = 0;
 #[cfg(target_arch = "x86_64")]
@@ -108,6 +112,12 @@ pub unsafe fn csr_process_id() -> u64 {
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn csr_api_port() -> u64 {
     unsafe { core::ptr::read_volatile(core::ptr::addr_of!(CSR_API_PORT)) }
+}
+
+/// Return the private heap formatted inside the accepted shared CSR port view.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn csr_port_heap() -> u64 {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(CSR_PORT_HEAP)) }
 }
 
 /// Return the client/server CSR port-memory delta.
@@ -246,19 +256,30 @@ unsafe fn publish_native_csr_static_data() -> u64 {
     0
 }
 
-/// Issue `NtRequestWaitReplyPort(CsrApiPort, message, message)` for a CSR API message.
+/// Send a CSR API request and receive its reply in the same message buffer.
 ///
 /// # Safety
 /// `message` must point to a writable CSR_API_MESSAGE whose PORT_MESSAGE header starts at byte 0.
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn csr_request_wait_reply(message: u64) -> u32 {
+pub unsafe fn csr_alpc_sync_call(message: u64) -> u32 {
     // SAFETY: single-writer during CSR connect; later reads are plain scalar loads.
     let port = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(CSR_API_PORT)) };
     if port == 0 || message == 0 {
         return 0xC000_000D; // STATUS_INVALID_PARAMETER
     }
-    // SAFETY: message is both request and reply buffer, matching ReactOS CsrClientCallServer.
-    unsafe { seh_syscall3(SSN_NT_REQUEST_WAIT_REPLY_PORT, port, message, message) as u32 }
+    let total_length = unsafe { core::ptr::read_unaligned((message + 2) as *const u16) };
+    let Some(call) = nt_ntdll::csr::CsrAlpcSyncCall::from_total_length(total_length) else {
+        return 0xC000_000D;
+    };
+    let mut buffer_length = call.buffer_length;
+    // The generated eight-argument stub preserves the complete native syscall
+    // frame and retained reply across a pending ALPC round trip.
+    unsafe {
+        nt_ntdll::trap_stubs::nt_alpc_send_wait_receive_port(
+            port, call.flags as u64, message, 0, message,
+            &mut buffer_length as *mut usize as u64, 0, 0,
+        ) as u32
+    }
 }
 
 /// Issue `NtAllocateVirtualMemory(NtCurrentProcess(), &base, 0, &size, MEM_COMMIT|RESERVE, RW)`.
@@ -1254,25 +1275,21 @@ fn is_ntdll_base(table: &ModuleTable, base: u64) -> bool {
     table.find(b"ntdll") == base
 }
 
-/// Compare a NUL-terminated ASCII export name at `base + name_rva` against `want` (ASCII bytes).
+/// Compare `want` with a NUL-terminated ASCII export name at `base + name_rva`.
 ///
 /// # Safety
 /// `base + name_rva` must point at a mapped, NUL-terminated ASCII string.
-unsafe fn name_eq(base: u64, name_rva: u32, want: &[u8]) -> bool {
+unsafe fn compare_export_name(base: u64, name_rva: u32, want: &[u8]) -> core::cmp::Ordering {
     // SAFETY: caller guarantees a mapped NUL-terminated string.
     unsafe {
         let p = (base + name_rva as u64) as *const u8;
-        let mut i = 0usize;
-        loop {
-            let c = core::ptr::read_volatile(p.add(i));
-            if i >= want.len() {
-                return c == 0; // exact length match: next char must be the NUL
+        for (i, &wanted) in want.iter().enumerate() {
+            let actual = core::ptr::read_volatile(p.add(i));
+            if wanted != actual {
+                return wanted.cmp(&actual);
             }
-            if c != want[i] {
-                return false;
-            }
-            i += 1;
         }
+        0u8.cmp(&core::ptr::read_volatile(p.add(want.len())))
     }
 }
 
@@ -1311,16 +1328,20 @@ unsafe fn export_rva_by_name(base: u64, want: &[u8]) -> u32 {
         let addr_of_functions = rd32(ed, 0x1c) as u64; // AddressOfFunctions RVA
         let addr_of_names = rd32(ed, 0x20) as u64; // AddressOfNames RVA
         let addr_of_ordinals = rd32(ed, 0x24) as u64; // AddressOfNameOrdinals RVA
-        for i in 0..number_of_names as u64 {
-            let name_rva = rd32(base, addr_of_names + i * 4);
-            if name_eq(base, name_rva, want) {
-                let ordinal = rd16(base, addr_of_ordinals + i * 2) as u64;
-                if ordinal >= number_of_functions as u64 {
-                    return 0;
-                }
-                let func_rva = rd32(base, addr_of_functions + ordinal * 4);
-                return func_rva;
+        if let Some(i) = nt_ntdll::loader::export_name_search::find_sorted_export_name(
+            number_of_names,
+            |index| {
+                let name_rva = rd32(base, addr_of_names + u64::from(index) * 4);
+                compare_export_name(base, name_rva, want)
+            },
+        ) {
+            let i = u64::from(i);
+            let ordinal = rd16(base, addr_of_ordinals + i * 2) as u64;
+            if ordinal >= number_of_functions as u64 {
+                return 0;
             }
+            let func_rva = rd32(base, addr_of_functions + ordinal * 4);
+            return func_rva;
         }
         0
     }
@@ -2432,41 +2453,13 @@ unsafe fn load_dependent_dll(open_name_lc: &[u8]) -> u64 {
     // a relative name when RootDirectory is null: static imports use System32, DOS drive paths use
     // the \?? namespace, and already-absolute NT names pass through unchanged.
     let mut wname = [0u16; 180];
-    let mut wn = 0usize;
-    let prefix: &[u8] = if open_name_lc.first() == Some(&b'\\') {
-        b""
-    } else if open_name_lc.get(1) == Some(&b':') {
-        b"\\??\\"
-    } else {
-        b"\\SystemRoot\\System32\\"
-    };
-    let extension_len = if dll_leaf_has_extension(open_name_lc) {
-        0
-    } else {
-        4
-    };
-    if prefix
-        .len()
-        .checked_add(open_name_lc.len())
-        .and_then(|length| length.checked_add(extension_len))
-        .is_none_or(|length| length > wname.len())
-    {
+    let Some(mut wn) = nt_ntdll::loader::dll_open_name::build_candidate(
+        open_name_lc,
+        false,
+        &mut wname,
+    ) else {
         return 0;
-    }
-    for &b in prefix {
-        wname[wn] = b as u16;
-        wn += 1;
-    }
-    for &b in open_name_lc {
-        wname[wn] = b as u16;
-        wn += 1;
-    }
-    if !dll_leaf_has_extension(open_name_lc) {
-        for &b in b".dll" {
-            wname[wn] = b as u16;
-            wn += 1;
-        }
-    }
+    };
     // UNICODE_STRING { Length, MaximumLength, Buffer } (x64: u16,u16,pad,ptr).
     #[repr(C)]
     struct UnicodeString {
@@ -2475,7 +2468,7 @@ unsafe fn load_dependent_dll(open_name_lc: &[u8]) -> u64 {
         _pad: u32,
         buffer: u64,
     }
-    let us = UnicodeString {
+    let mut us = UnicodeString {
         length: (wn * 2) as u16,
         maximum_length: (wn * 2) as u16,
         _pad: 0,
@@ -2483,17 +2476,37 @@ unsafe fn load_dependent_dll(open_name_lc: &[u8]) -> u64 {
     };
 
     // NtOpenFile(image) -> NtCreateSection(SEC_IMAGE): reuse rtlp_map_file (opens by name, closes
-    // the file, leaves the SEC_IMAGE handle in `section` until the map attempt consumes it).
-    let mut section: u64 = 0;
-    // SAFETY: on-target; us is a valid UNICODE_STRING*, section a writable stack local.
-    let st = unsafe {
-        rtlp_map_file(
-            core::ptr::addr_of!(us) as *const u8,
-            0x40, // OBJ_CASE_INSENSITIVE
-            core::ptr::addr_of_mut!(section),
-        )
+    // the file, and returns the SEC_IMAGE handle until the map attempt consumes it).
+    // SAFETY: on-target; us points at the current owned name in `wname`.
+    let first = unsafe { rtlp_map_file(core::ptr::addr_of!(us) as *const u8, 0x40) };
+    let section = match first {
+        Ok(section) => section,
+        Err(error)
+            if nt_ntdll::loader::dll_open_name::retry_with_dll_extension(
+                open_name_lc,
+                error.stage,
+                error.status,
+            ) =>
+        {
+            let Some(fallback_len) = nt_ntdll::loader::dll_open_name::build_candidate(
+                open_name_lc,
+                true,
+                &mut wname,
+            ) else {
+                return 0;
+            };
+            wn = fallback_len;
+            us.length = (wn * 2) as u16;
+            us.maximum_length = us.length;
+            // SAFETY: the first open definitively missed; this is a different, exact file name.
+            match unsafe { rtlp_map_file(core::ptr::addr_of!(us) as *const u8, 0x40) } {
+                Ok(section) => section,
+                Err(_) => return 0,
+            }
+        }
+        Err(_) => return 0,
     };
-    if (st as i32) < 0 || section == 0 {
+    if section == 0 {
         return 0;
     }
 
@@ -2879,14 +2892,23 @@ pub unsafe fn ldrp_drive(image_base: u64, ntdll_base: u64, startup_reserved: u64
     // winlogon's later `__getmainargs → _setargv → strlen(_acmdln=NULL)` NULL-derefs. Publishing the
     // heap base here makes GetProcessHeap non-NULL → msvcrt's attach completes → `_acmdln` set.
     // SAFETY: on-target syscall + gs:[0x60] = PEB (byte-exact x64 layout).
-    if let Some((heap, heap_base)) = unsafe { create_process_heap() } {
-        crate::install_process_heap(heap);
+    let Some((heap, heap_base)) = (unsafe { create_process_heap() }) else {
         unsafe {
-            let peb: u64;
-            core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
-            if peb != 0 {
-                core::ptr::write_volatile((peb + 0x30) as *mut u64, heap_base); // Peb->ProcessHeap
-            }
+            crate::exports::rtl_raise_status(STATUS_NO_MEMORY as u32);
+            core::hint::unreachable_unchecked();
+        }
+    };
+    if !crate::install_process_heap(heap) {
+        unsafe {
+            crate::exports::rtl_raise_status(STATUS_NO_MEMORY as u32);
+            core::hint::unreachable_unchecked();
+        }
+    }
+    unsafe {
+        let peb: u64;
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
+        if peb != 0 {
+            core::ptr::write_volatile((peb + 0x30) as *mut u64, heap_base); // Peb->ProcessHeap
         }
     }
     unsafe {
@@ -3723,15 +3745,6 @@ unsafe fn set_ldr_process_attached(base: u64, attached: bool) {
 // walker, over the process-wide MODULE_TABLE.
 // ---------------------------------------------------------------------------------------------
 
-fn dll_leaf_has_extension(name: &[u8]) -> bool {
-    let start = name
-        .iter()
-        .rposition(|&c| c == b'\\' || c == b'/')
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    name[start..].contains(&b'.')
-}
-
 #[cfg(target_arch = "x86_64")]
 struct DllLoadName {
     key: [u8; 32],
@@ -4215,6 +4228,51 @@ pub unsafe fn ldr_get_dll_handle(dll_name: *const c_void, dll_handle: *mut *mut 
     0
 }
 
+/// Copy the recorded full path for a mapped module. The loader lock is held by the caller.
+///
+/// # Safety
+/// `name` is a writable x64 UNICODE_STRING; a nonzero `MaximumLength` requires a writable
+/// `Buffer`. The Ldr entries and their name buffers have process lifetime.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn ldr_get_dll_full_name(module: *mut c_void, name: *mut c_void) -> u32 {
+    if name.is_null() {
+        return 0xC000_000D; // STATUS_INVALID_PARAMETER
+    }
+    let base = if module.is_null() {
+        unsafe { EXE_BASE }
+    } else {
+        module as u64
+    };
+    let state = unsafe { &*core::ptr::addr_of!(LDR_STATE) };
+    let entry = state.entry_vas[..state.count.min(LDR_MAX_ENTRIES)]
+        .iter()
+        .copied()
+        .find(|&entry| unsafe { core::ptr::read_unaligned((entry + 0x30) as *const u64) } == base);
+    let Some(entry) = entry else {
+        return 0xC000_0135; // STATUS_DLL_NOT_FOUND
+    };
+    let src_len = unsafe { core::ptr::read_unaligned((entry + 0x48) as *const u16) } as usize;
+    let src = unsafe { core::ptr::read_unaligned((entry + 0x50) as *const u64) } as *const u8;
+    let max_len = unsafe { core::ptr::read_unaligned((name as *const u8).add(2) as *const u16) }
+        as usize;
+    let dst = unsafe { core::ptr::read_unaligned((name as *const u8).add(8) as *const u64) }
+        as *mut u8;
+    if max_len != 0 && dst.is_null() {
+        return 0xC000_000D;
+    }
+    let copied = src_len.min(max_len);
+    if copied != 0 {
+        unsafe { core::ptr::copy_nonoverlapping(src, dst, copied) };
+    }
+    unsafe { core::ptr::write_unaligned(name as *mut u16, copied as u16) };
+    if max_len >= src_len + 2 {
+        unsafe { core::ptr::write_unaligned(dst.add(src_len) as *mut u16, 0) };
+        0
+    } else {
+        0xC000_0023 // STATUS_BUFFER_TOO_SMALL, including a full but unterminated copy.
+    }
+}
+
 /// `LdrGetProcedureAddress` in-process driver — resolve an export (by name via the `ANSI_STRING`, or
 /// by ordinal if `name` is NULL) in the mapped module at `base_address`.
 ///
@@ -4470,386 +4528,6 @@ unsafe fn native_map_view(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 6]) ->
             ],
         )
     }
-}
-
-/// `NtSecureConnectPort` through its generated nine-argument Windows-ABI entry.
-///
-/// # Safety
-/// The port and connection-info pointers must satisfy the selected service contract.
-#[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
-#[inline]
-#[allow(clippy::too_many_arguments)]
-unsafe fn native_secure_connect_port(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 5]) -> u64 {
-    unsafe {
-        native_invoke(
-            SSN_NT_SECURE_CONNECT_PORT,
-            &[a1, a2, a3, a4, tail[0], tail[1], tail[2], tail[3], tail[4]],
-        )
-    }
-}
-
-/// `NtSecureConnectPort` over the TRAP transport. This is the same Windows x64 ABI shape as
-/// [`syscall8`], extended with the fifth stack argument at `[rsp+0x48]`.
-///
-/// # Safety
-/// On-target hosted-process syscall; pointer arguments must satisfy the target syscall contract.
-#[cfg(all(target_arch = "x86_64", not(feature = "native_transport")))]
-#[inline]
-#[allow(clippy::too_many_arguments)]
-unsafe fn secure_connect_port(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 5]) -> u64 {
-    let status: u64;
-    // SAFETY: a hosted-process syscall trap serviced by the executive. The stack slots match the
-    // Windows x64 ABI positions the executive mirror reads for NtSecureConnectPort args 5..9.
-    unsafe {
-        core::arch::asm!(
-            "sub rsp, 0x58",
-            "mov qword ptr [rsp+0x28], {a5}",
-            "mov qword ptr [rsp+0x30], {a6}",
-            "mov qword ptr [rsp+0x38], {a7}",
-            "mov qword ptr [rsp+0x40], {a8}",
-            "mov qword ptr [rsp+0x48], {a9}",
-            "mov r10, {a1}",
-            "mov rdx, {a2}",
-            "mov r8,  {a3}",
-            "mov r9,  {a4}",
-            "mov eax, {ssn:e}",
-            "syscall",
-            "add rsp, 0x58",
-            ssn = in(reg) SSN_NT_SECURE_CONNECT_PORT,
-            a1 = in(reg) a1,
-            a2 = in(reg) a2,
-            a3 = in(reg) a3,
-            a4 = in(reg) a4,
-            a5 = in(reg) tail[0],
-            a6 = in(reg) tail[1],
-            a7 = in(reg) tail[2],
-            a8 = in(reg) tail[3],
-            a9 = in(reg) tail[4],
-            out("rax") status,
-            out("rcx") _, out("r11") _, out("r10") _, out("r8") _, out("r9") _,
-            clobber_abi("system"),
-        );
-    }
-    status
-}
-
-/// `NtSecureConnectPort` over the native seL4-call transport.
-///
-/// # Safety
-/// On-target hosted-process syscall; pointer arguments must satisfy the target syscall contract.
-#[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
-#[inline]
-#[allow(clippy::too_many_arguments)]
-unsafe fn secure_connect_port(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 5]) -> u64 {
-    // SAFETY: forwarding the already-validated NtSecureConnectPort ABI frame.
-    unsafe { native_secure_connect_port(a1, a2, a3, a4, tail) }
-}
-
-/// `NtSecureConnectPort` SSN (shared `nt-syscall-abi` table; sysfuncs.lst line 219 = index 218).
-#[cfg(target_arch = "x86_64")]
-const SSN_NT_SECURE_CONNECT_PORT: u32 = 218;
-
-/// The CSR client connect — port of ReactOS `CsrClientConnectToServer` / `CsrpConnectToServer`
-/// (`subsystems/csr/csrlib/connect.c`).
-///
-/// Called from `CsrClientConnectToServer` (kernel32's `BaseDllInitialize` → the very first thing in
-/// its `DLL_PROCESS_ATTACH`). Native subsystem images follow ReactOS' server-process path and avoid
-/// `NtSecureConnectPort`; Win32 clients build the `\Windows\ApiPort` PortName + the PORT_VIEW / QoS /
-/// CSR_API_CONNECTINFO stack locals, issue the 9-arg `NtSecureConnectPort`, then copy
-/// `ConnectionInfo.{SharedSectionBase,SharedSectionHeap,SharedStaticServerData}` into the PEB
-/// (`ReadOnlySharedMemoryBase@0x88 / …Heap@0x90 / ReadOnlyStaticServerData@0x98`) — exactly what
-/// kernel32's `DllMain` reads next (`ASSERT(Peb->ReadOnlyStaticServerData)` +
-/// `BaseStaticServerData = Peb->ReadOnlyStaticServerData[BASESRV=1]`).
-///
-/// All out-param structs are stack locals, matching ReactOS. The 64 KiB capture heap is a real
-/// anonymous section passed through `PORT_VIEW`; the kernel maps shared views into this client and
-/// CSRSS during the LPC connection transaction.
-///
-/// # Safety
-/// On-target hosted process; issues a real syscall. `object_directory` is a NUL-terminated UTF-16
-/// string (or NULL → default `\Windows`). The out-params (`connection_info_size`,
-/// `server_to_server`) are NULL or writable.
-#[cfg(target_arch = "x86_64")]
-pub unsafe fn csr_client_connect_to_server(
-    object_directory: *const u16,
-    _server_id: u32,
-    _connection_info: *mut core::ffi::c_void,
-    connection_info_size: *mut u32,
-    server_to_server: *mut u8,
-) -> u64 {
-    const IMAGE_SUBSYSTEM_NATIVE: u16 = 1;
-
-    if CSR_INSIDE_PROCESS.load(Ordering::Relaxed) {
-        if !server_to_server.is_null() {
-            // SAFETY: caller passed a writable byte or NULL (checked).
-            unsafe { core::ptr::write(server_to_server, 1) };
-        }
-        return unsafe { publish_native_csr_static_data() };
-    }
-
-    if unsafe { current_image_subsystem() } == Some(IMAGE_SUBSYSTEM_NATIVE) {
-        CSR_INSIDE_PROCESS.store(true, Ordering::Relaxed);
-        if !server_to_server.is_null() {
-            // SAFETY: caller passed a writable byte or NULL (checked).
-            unsafe { core::ptr::write(server_to_server, 1) };
-        }
-        return unsafe { publish_native_csr_static_data() };
-    }
-
-    if !server_to_server.is_null() {
-        // SAFETY: caller passed a writable byte or NULL (checked).
-        unsafe { core::ptr::write(server_to_server, 0) };
-    }
-
-    // ★ Faithful to CsrpConnectToServer's `if (!CsrApiPort)` guard: connect to \Windows\ApiPort
-    // exactly ONCE per process. kernel32's BaseDllInitialize + winlogon's own init both call
-    // CsrClientConnectToServer; the second+ calls must be no-op successes (the PEB CSR fields are
-    // already published) — otherwise we redundantly re-drive the executive's CSR rendezvous.
-    // SAFETY: single-threaded during loader init; a benign racy re-store is harmless (idempotent).
-    if CSR_CONNECTED.swap(true, Ordering::Relaxed) {
-        if !connection_info_size.is_null() {
-            // SAFETY: writable ULONG or NULL (checked). 0x38 = sizeof(CSR_API_CONNECTINFO) x64.
-            unsafe { core::ptr::write(connection_info_size, 0x38) };
-        }
-        return 0; // STATUS_SUCCESS — already connected.
-    }
-
-    // Build the PortName = "<ObjectDirectory>\ApiPort". ObjectDirectory is L"\Windows" for the base
-    // session (CSR_PORT_NAME = L"ApiPort"). Assemble it into a stack UTF-16 buffer.
-    let mut name_buf = [0u16; 64];
-    let mut nlen = 0usize;
-    // Copy the object directory (default L"\Windows" if NULL).
-    if object_directory.is_null() {
-        for &c in &[
-            0x5Cu16,
-            b'W' as u16,
-            b'i' as u16,
-            b'n' as u16,
-            b'd' as u16,
-            b'o' as u16,
-            b'w' as u16,
-            b's' as u16,
-        ] {
-            name_buf[nlen] = c;
-            nlen += 1;
-        }
-    } else {
-        // SAFETY: NUL-terminated UTF-16 (the loader passed a valid PCWSTR).
-        unsafe {
-            let mut i = 0usize;
-            loop {
-                let c = *object_directory.add(i);
-                if c == 0 || nlen >= 55 {
-                    break;
-                }
-                name_buf[nlen] = c;
-                nlen += 1;
-                i += 1;
-            }
-        }
-    }
-    // Append "\ApiPort".
-    for &c in &[
-        0x5Cu16,
-        b'A' as u16,
-        b'p' as u16,
-        b'i' as u16,
-        b'P' as u16,
-        b'o' as u16,
-        b'r' as u16,
-        b't' as u16,
-    ] {
-        if nlen >= 63 {
-            break;
-        }
-        name_buf[nlen] = c;
-        nlen += 1;
-    }
-    let name_bytes = (nlen * 2) as u16;
-
-    // UNICODE_STRING PortName { Length, MaximumLength, Buffer } (stack local, points at name_buf).
-    #[repr(C)]
-    struct UnicodeString {
-        length: u16,
-        maximum_length: u16,
-        _pad: u32,
-        buffer: u64,
-    }
-    let port_name = UnicodeString {
-        length: name_bytes,
-        maximum_length: name_bytes,
-        _pad: 0,
-        buffer: name_buf.as_ptr() as u64,
-    };
-
-    // SECURITY_QUALITY_OF_SERVICE { Length, ImpersonationLevel, ContextTrackingMode, EffectiveOnly }.
-    #[repr(C)]
-    struct SecurityQos {
-        length: u32,
-        impersonation_level: u32,  // SecurityImpersonation = 2
-        context_tracking_mode: u8, // SECURITY_DYNAMIC_TRACKING = 1
-        effective_only: u8,        // TRUE
-        _pad: [u8; 2],
-    }
-    let qos = SecurityQos {
-        length: 12,
-        impersonation_level: 2,
-        context_tracking_mode: 1,
-        effective_only: 1,
-        _pad: [0; 2],
-    };
-    // SID S-1-5-18 (LocalSystem), matching ReactOS's NtSecureConnectPort server identity check.
-    let system_sid = [1u8, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
-
-    let mut csr_section_handle = 0u64;
-    let mut csr_section_size = 0x1_0000u64;
-    const SEC_RESERVE: u64 = 0x0400_0000;
-    // NtCreateSection(&Section, SECTION_ALL_ACCESS, NULL, &Size, PAGE_READWRITE, SEC_RESERVE, NULL).
-    let create_status = unsafe {
-        syscall8(
-            SSN_NT_CREATE_SECTION,
-            core::ptr::addr_of_mut!(csr_section_handle) as u64,
-            SECTION_ALL_ACCESS,
-            0,
-            core::ptr::addr_of_mut!(csr_section_size) as u64,
-            PAGE_READWRITE as u64,
-            SEC_RESERVE,
-            0,
-            0,
-        )
-    };
-    if create_status != 0 {
-        CSR_CONNECTED.store(false, Ordering::Relaxed);
-        return create_status;
-    }
-
-    // PORT_VIEW LpcWrite { Length, SectionHandle, SectionOffset, ViewSize, ViewBase, ViewRemoteBase }.
-    #[repr(C)]
-    struct PortView {
-        length: u32,
-        _pad0: u32,
-        section_handle: u64,
-        section_offset: u32,
-        _pad1: u32,
-        view_size: u64,
-        view_base: u64,
-        view_remote_base: u64,
-    }
-    let mut lpc_write = PortView {
-        length: 0x30,
-        _pad0: 0,
-        section_handle: csr_section_handle,
-        section_offset: 0,
-        _pad1: 0,
-        view_size: 0x1_0000,
-        view_base: 0,
-        view_remote_base: 0,
-    };
-
-    // REMOTE_PORT_VIEW LpcRead { Length, ViewSize, ViewBase }.
-    #[repr(C)]
-    struct RemotePortView {
-        length: u32,
-        _pad0: u32,
-        view_size: u64,
-        view_base: u64,
-    }
-    let mut lpc_read = RemotePortView {
-        length: 0x18,
-        _pad0: 0,
-        view_size: 0,
-        view_base: 0,
-    };
-
-    // CSR_API_CONNECTINFO ConnectionInfo (x64 0x38): ObjectDirectory@0, SharedSectionBase@0x08,
-    // SharedStaticServerData@0x10, SharedSectionHeap@0x18, DebugFlags@0x20, …, ServerProcessId@0x30.
-    #[repr(C)]
-    struct CsrApiConnectInfo {
-        object_directory: u64,
-        shared_section_base: u64,
-        shared_static_server_data: u64,
-        shared_section_heap: u64,
-        debug_flags: u32,
-        size_of_peb_data: u32,
-        size_of_teb_data: u32,
-        number_of_server_dll_names: u32,
-        server_process_id: u64,
-    }
-    let mut conn_info = CsrApiConnectInfo {
-        object_directory: 0,
-        shared_section_base: 0,
-        shared_static_server_data: 0,
-        shared_section_heap: 0,
-        debug_flags: 0,
-        size_of_peb_data: 0,
-        size_of_teb_data: 0,
-        number_of_server_dll_names: 0,
-        server_process_id: 0,
-    };
-    let mut conn_info_len: u32 = core::mem::size_of::<CsrApiConnectInfo>() as u32;
-
-    // *CsrApiPort — the returned client comm-port handle (stack local, executive writes it).
-    let mut csr_api_port: u64 = 0;
-
-    // NtSecureConnectPort(&CsrApiPort, &PortName, &Qos, &LpcWrite, SystemSid, &LpcRead,
-    //                     MaxMessageLength=NULL, &ConnectionInfo, &ConnectionInfoLength).
-    // SAFETY: all pointer args are valid stack locals; the executive services SSN 218.
-    let status = unsafe {
-        secure_connect_port(
-            &mut csr_api_port as *mut u64 as u64,      // a1 = *PortHandle
-            &port_name as *const UnicodeString as u64, // a2 = PortName
-            &qos as *const SecurityQos as u64,         // a3 = SecurityQos
-            &mut lpc_write as *mut PortView as u64,    // a4 = ClientView (LpcWrite)
-            [
-                system_sid.as_ptr() as u64, // a5 = ServerSid (LocalSystem)
-                &mut lpc_read as *mut RemotePortView as u64, // a6 = ServerView (LpcRead)
-                0,                          // a7 = MaxMessageLength (NULL)
-                &mut conn_info as *mut CsrApiConnectInfo as u64, // a8 = ConnectionInformation
-                &mut conn_info_len as *mut u32 as u64, // a9 = ConnectionInformationLength
-            ],
-        )
-    };
-    let _ = unsafe { syscall4(SSN_NT_CLOSE, csr_section_handle, 0, 0, 0) };
-    if status != 0 {
-        CSR_CONNECTED.store(false, Ordering::Relaxed);
-        return status;
-    }
-
-    // Publish ReactOS's CSR ntdll globals for later CsrClientCallServer/CsrGetProcessId calls.
-    // Preserve the actual client/server mapping delta for capture-buffer pointer conversion.
-    unsafe {
-        core::ptr::write_volatile(core::ptr::addr_of_mut!(CSR_API_PORT), csr_api_port);
-        core::ptr::write_volatile(
-            core::ptr::addr_of_mut!(CSR_PORT_MEMORY_DELTA),
-            (lpc_write.view_remote_base as isize).wrapping_sub(lpc_write.view_base as isize),
-        );
-        core::ptr::write_volatile(
-            core::ptr::addr_of_mut!(CSR_PROCESS_ID),
-            conn_info.server_process_id,
-        );
-    }
-
-    // Copy the CSR section data into the PEB (CsrpConnectToServer, connect.c:167-169).
-    // SAFETY: gs:[0x60] = PEB; offsets are the byte-exact x64 layout (nt-ntdll-layout).
-    unsafe {
-        let peb: u64;
-        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
-        if peb != 0 {
-            core::ptr::write_volatile((peb + 0x88) as *mut u64, conn_info.shared_section_base); // ReadOnlySharedMemoryBase
-            core::ptr::write_volatile((peb + 0x90) as *mut u64, conn_info.shared_section_heap); // ReadOnlySharedMemoryHeap
-            core::ptr::write_volatile(
-                (peb + 0x98) as *mut u64,
-                conn_info.shared_static_server_data,
-            ); // ReadOnlyStaticServerData
-        }
-    }
-
-    // Report the (unchanged) connection-info size back to the caller.
-    if !connection_info_size.is_null() {
-        // SAFETY: caller passed a writable ULONG or NULL (checked).
-        unsafe { core::ptr::write(connection_info_size, conn_info_len) };
-    }
-    0 // STATUS_SUCCESS
 }
 
 /// A general 6-arg syscall. TRAP transport (fallback): arg1..4 registers, arg5/arg6 on the stack.
@@ -6079,6 +5757,7 @@ static mut WORK_POOL_FLEET: nt_rtl_work_item::WorkerFleet = nt_rtl_work_item::Wo
 pub(crate) unsafe fn reset_process_runtime_state_for_new_process() {
     unsafe {
         CSR_API_PORT = 0;
+        CSR_PORT_HEAP = 0;
         CSR_PORT_MEMORY_DELTA = 0;
         CSR_PROCESS_ID = 0;
     }
@@ -8547,21 +8226,91 @@ pub unsafe extern "C" fn on_target_export_anchor() {
     core::hint::black_box(anchors);
 }
 
+/// The observable ownership result of one work-item post. A returned native Nt* status comes
+/// from an exact seL4 reply; malformed post-entry replies stop in the stub and cannot grant
+/// cleanup authority. The indeterminate case is retained for transports that can return without
+/// such a reply, and must never be mapped to `NoEffect` by a caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueWorkItemOutcome {
+    NoEffect(u32),
+    Queued,
+    Indeterminate(u32),
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn trace_work_post_failure(stage: &[u8], status: u32) {
+    fn append_hex(message: &mut [u8; 112], length: &mut usize, value: u64) {
+        for shift in (0..16).rev() {
+            message[*length] = b"0123456789abcdef"[((value >> (shift * 4)) & 15) as usize];
+            *length += 1;
+        }
+    }
+    let (pid, tid): (u64, u64);
+    core::arch::asm!("mov {}, gs:[0x40]", out(reg) pid, options(nostack, preserves_flags, readonly));
+    core::arch::asm!("mov {}, gs:[0x48]", out(reg) tid, options(nostack, preserves_flags, readonly));
+    let mut message = [0u8; 112];
+    let mut length = 0usize;
+    for &byte in b"[rtl-work-post-diag] " {
+        message[length] = byte;
+        length += 1;
+    }
+    for &byte in stage {
+        message[length] = byte;
+        length += 1;
+    }
+    for &byte in b" pid=" {
+        message[length] = byte;
+        length += 1;
+    }
+    append_hex(&mut message, &mut length, pid);
+    for &byte in b" tid=" {
+        message[length] = byte;
+        length += 1;
+    }
+    append_hex(&mut message, &mut length, tid);
+    for &byte in b" status=" {
+        message[length] = byte;
+        length += 1;
+    }
+    append_hex(&mut message, &mut length, status as u64);
+    message[length] = b'\n';
+    length += 1;
+    crate::dbg_print_bytes(message.as_ptr(), length);
+}
+
 pub unsafe fn rtl_queue_work_item(function: u64, context: u64, flags: u32) -> u32 {
+    match unsafe { rtl_queue_work_item_checked(function, context, flags) } {
+        QueueWorkItemOutcome::NoEffect(status) => status,
+        QueueWorkItemOutcome::Queued => STATUS_SUCCESS_U32,
+        // A scalar NTSTATUS would invite replay of a possibly posted callback. Current native
+        // stubs stop before this branch on a malformed post-entry reply; preserve that rule.
+        QueueWorkItemOutcome::Indeterminate(_) => unsafe {
+            core::arch::asm!("ud2", options(noreturn))
+        },
+    }
+}
+
+pub unsafe fn rtl_queue_work_item_checked(
+    function: u64,
+    context: u64,
+    flags: u32,
+) -> QueueWorkItemOutcome {
     if function == 0 {
-        return STATUS_INVALID_PARAMETER_U32;
+        return QueueWorkItemOutcome::NoEffect(STATUS_INVALID_PARAMETER_U32);
     }
     let work_flags = nt_rtl_work_item::WorkItemFlags::from_bits_retain(flags);
     let status = unsafe { initialize_work_pool() };
     if !nt_rtl_work_item::nt_success(status) {
-        return status;
+        unsafe { trace_work_post_failure(b"init", status) };
+        return QueueWorkItemOutcome::NoEffect(status);
     }
 
     let packet_address = unsafe {
         crate::process_heap_alloc(core::mem::size_of::<nt_rtl_work_item::WorkItemPacket>())
     };
     if packet_address.is_null() {
-        return STATUS_NO_MEMORY as u32;
+        unsafe { trace_work_post_failure(b"packet", STATUS_NO_MEMORY as u32) };
+        return QueueWorkItemOutcome::NoEffect(STATUS_NO_MEMORY as u32);
     }
     let mut token_handle = 0u64;
     if work_flags.transfers_impersonation() {
@@ -8578,7 +8327,7 @@ pub unsafe fn rtl_queue_work_item(function: u64, context: u64, flags: u32) -> u3
             nt_rtl_work_item::normalize_token_capture(work_flags, token_status, token_handle);
         if !nt_rtl_work_item::nt_success(capture.status()) {
             let _ = unsafe { crate::process_heap_free(packet_address) };
-            return capture.status();
+            return QueueWorkItemOutcome::NoEffect(capture.status());
         }
         token_handle = capture.token_handle();
     }
@@ -8596,17 +8345,19 @@ pub unsafe fn rtl_queue_work_item(function: u64, context: u64, flags: u32) -> u3
     };
     work_pool_unlock_counters();
     let Ok(submission) = submission else {
+        unsafe { trace_work_post_failure(b"reserve", STATUS_QUOTA_EXCEEDED_U32) };
         if token_handle != 0 {
             let _ = unsafe { syscall4(SSN_NT_CLOSE, token_handle, 0, 0, 0) };
         }
         let _ = unsafe { crate::process_heap_free(packet_address) };
-        return STATUS_QUOTA_EXCEEDED_U32;
+        return QueueWorkItemOutcome::NoEffect(STATUS_QUOTA_EXCEEDED_U32);
     };
 
     let status = unsafe { start_completion_worker_for(work_flags) };
     if !nt_rtl_work_item::nt_success(status) {
+        unsafe { trace_work_post_failure(b"worker", status) };
         let _ = unsafe { cleanup_failed_submission(submission) };
-        return status;
+        return QueueWorkItemOutcome::NoEffect(status);
     }
     let port = WORK_POOL_PORT.load(Ordering::Acquire);
     let status = unsafe {
@@ -8624,10 +8375,11 @@ pub unsafe fn rtl_queue_work_item(function: u64, context: u64, flags: u32) -> u3
         let _queued = submission.commit_queue_success();
         unsafe { commit_completion_worker_persistent_floor_if_needed(work_flags) };
         unsafe { rtl_async_wake() };
-        STATUS_SUCCESS_U32
+        QueueWorkItemOutcome::Queued
     } else {
+        unsafe { trace_work_post_failure(b"completion", status) };
         let _ = unsafe { cleanup_failed_submission(submission) };
-        status
+        QueueWorkItemOutcome::NoEffect(status)
     }
 }
 
@@ -11892,13 +11644,19 @@ fn report_file_map_failure(
     }
 }
 
-/// `RtlpMapFile` (process.c:20): NtOpenFile(image) → NtCreateSection(SEC_IMAGE) → NtClose(file). On
-/// success `*section` holds the SEC_IMAGE handle.
+#[cfg(target_arch = "x86_64")]
+struct FileMapError {
+    stage: nt_ntdll::loader::file_map_failure::FileMapFailureStage,
+    status: u32,
+}
+
+/// `RtlpMapFile` (process.c:20): NtOpenFile(image) → NtCreateSection(SEC_IMAGE) → NtClose(file).
+/// On success returns the SEC_IMAGE handle; a failure retains its stage for safe retry decisions.
 ///
 /// # Safety
-/// On-target; `image_file_name` a valid `UNICODE_STRING*`; `section` a writable `HANDLE*`.
+/// On-target; `image_file_name` a valid `UNICODE_STRING*`.
 #[cfg(target_arch = "x86_64")]
-unsafe fn rtlp_map_file(image_file_name: *const u8, attributes: u32, section: *mut u64) -> u32 {
+unsafe fn rtlp_map_file(image_file_name: *const u8, attributes: u32) -> Result<u64, FileMapError> {
     let mut h_file: u64 = 0;
     let mut iosb: [u64; 2] = [0; 2];
     let oa = ObjectAttributes {
@@ -11930,15 +11688,19 @@ unsafe fn rtlp_map_file(image_file_name: *const u8, attributes: u32, section: *m
             nt_ntdll::loader::file_map_failure::FileMapFailureStage::Open,
             st,
         );
-        return st;
+        return Err(FileMapError {
+            stage: nt_ntdll::loader::file_map_failure::FileMapFailureStage::Open,
+            status: st,
+        });
     }
     // NtCreateSection(&Section, SECTION_ALL_ACCESS, OA=NULL, MaxSize=NULL, PAGE_EXECUTE, SEC_IMAGE,
     //                 hFile).
     // SAFETY: on-target syscall.
+    let mut section = 0;
     let st = unsafe {
         syscall8(
             SSN_NT_CREATE_SECTION,
-            section as u64,
+            core::ptr::addr_of_mut!(section) as u64,
             SECTION_ALL_ACCESS,
             0,
             0,
@@ -11958,9 +11720,12 @@ unsafe fn rtlp_map_file(image_file_name: *const u8, attributes: u32, section: *m
             nt_ntdll::loader::file_map_failure::FileMapFailureStage::CreateSection,
             st,
         );
-        return st;
+        return Err(FileMapError {
+            stage: nt_ntdll::loader::file_map_failure::FileMapFailureStage::CreateSection,
+            status: st,
+        });
     }
-    st
+    Ok(section)
 }
 
 /// `RtlCreateUserProcess` (process.c:194) — create a process + its (suspended) initial thread from an
@@ -11989,12 +11754,11 @@ pub unsafe fn rtl_create_user_process(
     }
 
     // --- RtlpMapFile: open the image + create its SEC_IMAGE section. ---
-    let mut h_section: u64 = 0;
     // SAFETY: on-target.
-    let st = unsafe { rtlp_map_file(image_file_name, attributes, &mut h_section) };
-    if (st as i32) < 0 {
-        return st;
-    }
+    let h_section = match unsafe { rtlp_map_file(image_file_name, attributes) } {
+        Ok(section) => section,
+        Err(error) => return error.status,
+    };
 
     // RTL_USER_PROCESS_INFORMATION x64 layout:
     //   Size@0x00 (already set by caller), ProcessHandle@0x08, ThreadHandle@0x10,

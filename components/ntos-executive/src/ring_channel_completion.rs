@@ -31,6 +31,10 @@ impl<T> CompletionInbox<T> {
         self.active_request = None;
     }
 
+    pub(crate) fn active_request(&self) -> Option<u64> {
+        self.active_request
+    }
+
     pub(crate) fn take(&mut self, request_id: u64) -> Option<T> {
         let index = self.pending.iter().position(|(id, _)| *id == request_id)?;
         Some(self.pending.swap_remove(index).1)
@@ -49,5 +53,23 @@ impl<T> CompletionInbox<T> {
         self.pending.try_reserve(1).expect("SURT completion identity must be retained");
         self.pending.push((completed_request_id, completion));
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CompletionInbox;
+
+    #[test]
+    fn active_request_remains_owned_until_exact_terminal_receipt() {
+        let mut inbox = CompletionInbox::<u32>::new();
+        assert!(inbox.begin(41));
+        assert_eq!(inbox.active_request(), Some(41));
+        assert!(!inbox.begin(42));
+        assert_eq!(inbox.accept(42, 41, 7), None);
+        assert_eq!(inbox.take(41), Some(7));
+        assert_eq!(inbox.active_request(), Some(41));
+        inbox.finish(41);
+        assert_eq!(inbox.active_request(), None);
     }
 }

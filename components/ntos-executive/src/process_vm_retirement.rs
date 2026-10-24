@@ -136,6 +136,11 @@ impl ProcessVmRetirementIo for FinalProcessVm<'_> {
             {
                 return false;
             }
+            if provider_mm_section_objects::retire_client_aliases_for_process(
+                self.handler, pi, owner.process,
+            ).is_err() {
+                return false;
+            }
             if csrss_frame_drop_process_all(pi as u64, owner.process, self.handler).is_err() {
                 return false;
             }

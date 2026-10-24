@@ -428,6 +428,26 @@ pub(crate) struct PreparedAcpiPlatformAuthority {
     pub(crate) owner: HostedPnpContextOwner,
 }
 
+impl PreparedAcpiPlatformAuthority {
+    /// Share only the firmware-selected, retained read-only HPET frame. The executive
+    /// keeps timer programming rights; a component receives only a read alias.
+    pub(crate) fn hpet_read_only_alias(&self) -> Option<nt_acpi::HpetReadOnlyAlias> {
+        let range = self.discovery.hpet?.register_block;
+        self.memory.iter().filter(|resource| resource.platform_hpet).find_map(|resource| {
+            nt_acpi::HpetReadOnlyAlias::for_firmware_range(
+                range,
+                nt_acpi::PhysicalRange {
+                    start: resource.paddr,
+                    length: resource.length,
+                },
+                resource.frame_base,
+                resource.pages,
+                resource.writable,
+            )
+        })
+    }
+}
+
 /// Map the executive's timer view from the same retained frames later projected read-only to the
 /// ACPI component. The returned address is the exact GAS address within `mapping_page_va`.
 pub(crate) unsafe fn map_executive_hpet(
@@ -906,25 +926,47 @@ fn encode_registry_multi_sz(values: &[&str]) -> Result<Vec<u8>, nt_status::NtSta
     Ok(encoded)
 }
 
-/// Publish the firmware-discovered ACPI root identity through normal CriticalDeviceDatabase
-/// policy before the boot-driver launch snapshot is taken. No service name is embedded here.
+struct AcpiRootRegistryPolicy {
+    mount_generation: u64,
+    class_guid: alloc::string::String,
+    service_name: alloc::string::String,
+}
+
+unsafe fn acpi_root_registry_policy(
+    expected_generation: u64,
+) -> Result<AcpiRootRegistryPolicy, nt_status::NtStatus> {
+    let binding = match config_manager_query_critical_device_binding(ACPI_ROOT_COMPATIBLE_ID)
+        .map_err(nt_status::NtStatus)?
+    {
+        Some(binding) => Some(binding),
+        None => config_manager_query_driver_database_binding(ACPI_ROOT_COMPATIBLE_ID)
+            .map_err(nt_status::NtStatus)?,
+    }
+    .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    if binding.mount_generation != expected_generation || binding.class_guid.is_empty() {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let service_name = binding
+        .service_name
+        .filter(|service| !service.is_empty())
+        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    Ok(AcpiRootRegistryPolicy {
+        mount_generation: binding.mount_generation,
+        class_guid: binding.class_guid,
+        service_name,
+    })
+}
+
+/// Publish the firmware-discovered ACPI root identity through mounted registry policy before the
+/// boot-driver launch snapshot is taken. No service name is embedded here.
 pub(crate) unsafe fn publish_acpi_root_devnode_from_registry_policy(
 ) -> Result<(), nt_status::NtStatus> {
     let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
-    let policy = config_manager_query_critical_device_binding(ACPI_ROOT_COMPATIBLE_ID)
-        .map_err(nt_status::NtStatus)?
-        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    let policy = acpi_root_registry_policy(expected_generation)?;
     if policy.mount_generation != expected_generation {
         return Err(nt_status::NtStatus(0xC000_0059u32 as i32));
     }
-    let service = policy
-        .service_name
-        .as_deref()
-        .filter(|service| !service.is_empty())
-        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
-    if policy.class_guid.is_empty() {
-        return Err(nt_status::NtStatus::INVALID_PARAMETER);
-    }
+    let service = policy.service_name.as_str();
     let existing = match config_manager_query_system_hive_key(ACPI_ROOT_ENUM_PATH) {
         Ok(snapshot) => Some(snapshot),
         Err(status) if status as u32 == nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.raw() as u32 => {
@@ -932,7 +974,10 @@ pub(crate) unsafe fn publish_acpi_root_devnode_from_registry_policy(
         }
         Err(status) => return Err(nt_status::NtStatus(status)),
     };
-    if existing.as_ref().is_some_and(|snapshot| snapshot.mount_generation != expected_generation) {
+    if existing
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.mount_generation != expected_generation)
+    {
         return Err(nt_status::NtStatus(0xC000_0059u32 as i32));
     }
     let hardware = encode_registry_multi_sz(&[ACPI_ROOT_HARDWARE_ID])?;
@@ -1028,7 +1073,10 @@ pub(crate) unsafe fn publish_acpi_root_devnode_from_registry_policy(
         &mutations,
     )
     .map_err(|status| nt_status::NtStatus(status as i32))?;
-    assert_eq!(outcome.generation, expected_generation + 1,
-        "ACPI root CM ACK returned the wrong generation");
+    assert_eq!(
+        outcome.generation,
+        expected_generation + 1,
+        "ACPI root CM ACK returned the wrong generation"
+    );
     Ok(())
 }

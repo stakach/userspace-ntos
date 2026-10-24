@@ -57,6 +57,7 @@ pub mod owned_capability_copy;
 pub mod process_retirement;
 mod private_backing;
 pub mod prefetch;
+pub mod provider_large_arena;
 pub mod retained_alias;
 mod runtime_section;
 pub mod section_scratch;
@@ -78,7 +79,8 @@ pub use copy_context::{copy_bookkeeping, live_checkpoint_matches, CopyBookkeepin
 pub use runtime_section::{
     SectionFilePage, SectionFileReadIo, SectionFileResizeIo, SectionFileWriteIo,
     GenericSection, GenericSectionBacking, GenericSectionFlushPlan, GenericSectionTable,
-    GenericSectionTableStats, GenericSectionView, ProviderSectionView, ProviderVspaceIdentity,
+    GenericSectionTableStats, GenericSectionView, ProviderClientSectionAlias, ProviderSectionView,
+    ProviderVspaceIdentity,
     PendingSectionFrames, SectionRetirement, SectionRetirementIo,
     SectionIdentity, SectionReference, SectionPagePublication, SectionPagePublicationError,
     SectionRetirementResource, RoutedSectionLease, GENERIC_SECTION_BACKING_ANON,

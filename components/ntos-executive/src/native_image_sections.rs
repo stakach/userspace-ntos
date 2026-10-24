@@ -61,11 +61,11 @@ pub(crate) struct NativeImageSource {
     pub(crate) observation_target: Option<nt_exe_image::CapturedImageObservation>,
 }
 
-/// Mounted Disk Files are immutable and retained for bounded page reads. Mutable Overlay and
-/// routed providers preserve their existing captured snapshot until a real write/paging fence
-/// is integrated; this is not a fallback between source kinds.
+/// Mounted Disk Files and provider-attested installed routed Files are immutable and retained
+/// for bounded page reads. Mutable Overlay and other routed providers keep captured snapshots.
 pub(crate) enum NativeImageContents {
     RetainedDisk,
+    RetainedRouted,
     Snapshot(Vec<u8>),
 }
 
@@ -77,6 +77,11 @@ impl NativeImageSource {
                 NativeImageContents::RetainedDisk => {
                     self.local_file.is_some()
                         && self.backing.kind == nt_memory_manager::GENERIC_SECTION_BACKING_DISK
+                }
+                NativeImageContents::RetainedRouted => {
+                    self.local_file.is_none()
+                        && self.backing.routed_lease.is_some()
+                        && self.backing.kind == nt_memory_manager::GENERIC_SECTION_BACKING_ROUTED
                 }
                 NativeImageContents::Snapshot(bytes) => {
                     u64::try_from(bytes.len()).ok() == Some(self.backing.file_extent)
@@ -192,7 +197,7 @@ impl NativeImageStore {
             .position(|candidate| *candidate == view)
             .ok_or(NativeImageError::InvalidSection)?;
         self.authority.abort_prepared_mapped_view(view, process)?;
-        self.views.swap_remove(index);
+        let _ = self.views.swap_remove(index);
         Ok(())
     }
 
@@ -217,7 +222,7 @@ impl NativeImageStore {
             .position(|candidate| *candidate == view)
             .ok_or(NativeImageError::InvalidSection)?;
         self.authority.acknowledge_mapped_view_retirement(receipt)?;
-        self.views.swap_remove(index);
+        let _ = self.views.swap_remove(index);
         Ok(())
     }
 

@@ -207,6 +207,13 @@ pub enum PnpBackendDispatch {
 /// A driver dispatch backend (spec §15.1). Pluggable: the mock backend for
 /// tests/bring-up, or a SURT driver-peer backend for an isolated Driver Host.
 pub trait DriverDispatchBackend {
+    /// Attest that the exact live File context reads immutable bytes of this extent for its
+    /// remaining lifetime. Unknown or mutable providers return None. The I/O Manager validates
+    /// canonical File/device/context identity before consulting this provider-owned claim.
+    fn immutable_file_extent(&self, _file_id: FileId, _file_context: u64) -> Option<u64> {
+        None
+    }
+
     /// Dispatch one IRP projection. Returns how it was handled.
     fn dispatch_irp(
         &mut self,
@@ -252,8 +259,39 @@ pub trait DriverDispatchBackend {
         }
     }
 
+    /// Preserve the exact entry evidence for a File-less POWER stack call. Hosted transports
+    /// override this so a lost transport reply never looks like a driver return.
+    fn dispatch_power_irp(
+        &mut self,
+        ctx: DispatchContext<'_>,
+        irp: &IrpProjection,
+    ) -> PnpBackendDispatch {
+        if irp.major != nt_io_abi::major::IRP_MJ_POWER
+            || !matches!(irp.parameters, IoParameters::Power(_))
+        {
+            return PnpBackendDispatch::NotDispatched {
+                status: NtStatus::INVALID_PARAMETER,
+            };
+        }
+        match self.dispatch_irp(ctx, irp) {
+            Ok(DispatchOutcome::Pending)
+            | Ok(DispatchOutcome::Completed { status: NtStatus::PENDING, .. })
+            | Ok(DispatchOutcome::Failed { status: NtStatus::PENDING }) =>
+                PnpBackendDispatch::Pending,
+            Ok(DispatchOutcome::Completed { status, information, .. }) =>
+                PnpBackendDispatch::Returned { status, information },
+            Ok(DispatchOutcome::Failed { status }) =>
+                PnpBackendDispatch::Returned { status, information: 0 },
+            Err(transport_status) => PnpBackendDispatch::Indeterminate { transport_status },
+        }
+    }
+
     /// Request cancellation of a (typically pending) IRP owned by this backend.
     fn cancel_irp(&mut self, irp_id: IrpId) -> Result<(), NtStatus>;
+
+    /// Advance retained work only from an explicit outer service turn. The completion pump may
+    /// run recursively and must only observe terminal records, never start new native effects.
+    fn service_pending(&mut self) -> usize { 0 }
 
     /// Poll for a ready final completion of a previously-pending IRP. The I/O
     /// Manager's `pump` drains these. Backends that only complete synchronously

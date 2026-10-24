@@ -12,7 +12,7 @@ use nt_page_storage::PageSequence;
 
 #[path = "hive_set_value.rs"]
 mod set_value;
-pub use set_value::{PreparedSetValue, SetValueError};
+pub use set_value::{OwnedPreparedSetValue, PreparedSetValue, SetValueError};
 #[path = "hive_value_journal.rs"]
 mod value_journal;
 pub use value_journal::{HiveValueJournalPhase, RetainedHiveValueJournal};
@@ -490,7 +490,9 @@ fn compose_hive_overlay_inner(
         }
     }
 
-    composed.finish_clean_import();
+    // Overlay construction uses ordinary mutators, but it is part of boot import rather than
+    // a new durable mutation. Keep the persisted base's journal head for the next CM append.
+    composed.finish_clean_import_at_sequence(base.sequence);
     Ok(composed)
 }
 
@@ -920,13 +922,20 @@ impl Hive {
     /// the first journalled sequence numbers, and a later checkpoint should not report import-time
     /// construction as dirty runtime state.
     pub fn finish_clean_import(&mut self) {
+        self.finish_clean_import_at_sequence(0);
+    }
+
+    /// Mark an overlay composition clean without rewinding the persisted journal head.
+    /// Generated cells receive no independently durable sequence; their construction clocks
+    /// must not make the composed image dirty or advance its next log-record number.
+    fn finish_clean_import_at_sequence(&mut self, sequence: u64) {
         assert!(self.pending_value_journal.is_none(), "retained publication excludes import reset");
-        self.sequence = 0;
+        self.sequence = sequence;
         self.generation = 0;
         for cell in self.cells.iter_mut().filter_map(|cell| cell.as_mut()) {
             match cell {
-                Cell::Key(key) => key.last_write_sequence = 0,
-                Cell::Value(value) => value.last_write_sequence = 0,
+                Cell::Key(key) => key.last_write_sequence = key.last_write_sequence.min(sequence),
+                Cell::Value(value) => value.last_write_sequence = value.last_write_sequence.min(sequence),
             }
         }
         self.clear_dirty();
@@ -1519,6 +1528,8 @@ impl RegistryValueCopyProvenanceTable {
 pub struct MutableHiveSet {
     mounts: HiveMountTable,
     hives: Vec<(HiveId, Hive)>,
+    retained_value_owners: Vec<(HiveId, u64)>,
+    next_value_owner: u64,
 }
 
 impl MutableHiveSet {
@@ -1526,6 +1537,8 @@ impl MutableHiveSet {
         Self {
             mounts: HiveMountTable::new(),
             hives: Vec::new(),
+            retained_value_owners: Vec::new(),
+            next_value_owner: 1,
         }
     }
 
@@ -1545,7 +1558,12 @@ impl MutableHiveSet {
             .filter(|entry| entry.root.eq_ignore_ascii_case(root_path))
             .any(|entry| self.hive(entry.hive)
                 .is_some_and(|owned| owned.pending_value_journal.is_some()));
-        if retained_id || retained_root {
+        if retained_id || retained_root
+            || self.retained_value_owners.iter().any(|(id, _)| *id == hive_id)
+            || self.mounts.mounts.iter()
+                .filter(|entry| entry.root.eq_ignore_ascii_case(root_path))
+                .any(|entry| self.retained_value_owners.iter().any(|(id, _)| *id == entry.hive))
+        {
             return Err(CurrentControlSetError::RetainedPublication);
         }
         let current_control_set = if root_path.eq_ignore_ascii_case(SYSTEM_HIVE_PATH) {
@@ -1570,7 +1588,9 @@ impl MutableHiveSet {
         let hive_id = self.mounts.mounts.iter()
             .find(|entry| entry.root.eq_ignore_ascii_case(root_path))?.hive;
         let index = self.hives.iter().position(|(id, _)| *id == hive_id)?;
-        if self.hives[index].1.pending_value_journal.is_some() {
+        if self.hives[index].1.pending_value_journal.is_some()
+            || self.retained_value_owners.iter().any(|(id, _)| *id == hive_id)
+        {
             return None;
         }
         self.mounts.unmount(root_path)?;
@@ -1585,6 +1605,9 @@ impl MutableHiveSet {
     }
 
     pub fn hive_mut(&mut self, hive_id: HiveId) -> Option<&mut Hive> {
+        if self.retained_value_owners.iter().any(|(id, _)| *id == hive_id) {
+            return None;
+        }
         self.hives
             .iter_mut()
             .find(|(id, _)| *id == hive_id)

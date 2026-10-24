@@ -121,6 +121,22 @@ impl ExecNtHandler {
                         iosb,
                     );
                 }
+                if let Some(status) = self.create_registered_driver_peer_relative_file(
+                    device_id,
+                    file_id,
+                    name16,
+                    captured.attributes,
+                    desired_access,
+                    share_access,
+                    create_disposition,
+                    file_attributes,
+                    create_options,
+                    &ea,
+                    file_handle_out,
+                    iosb,
+                ) {
+                    return status;
+                }
                 if driver_launch::device_id_by_name("\\Device\\NamedPipe")
                     != Some(device_id)
                 {
@@ -186,6 +202,22 @@ impl ExecNtHandler {
                 Ok(()) => status,
                 Err(status) => status,
             };
+        }
+        if !Self::is_named_pipe_root_path(name16) && !nt_fs::is_named_pipe_path(name16) {
+            if let Some(status) = self.create_registered_driver_peer_file(
+                name16,
+                captured.attributes,
+                desired_access,
+                share_access,
+                create_disposition,
+                file_attributes,
+                create_options,
+                &ea,
+                file_handle_out,
+                iosb,
+            ) {
+                return status;
+            }
         }
         if create_options & nt_fs::FILE_DIRECTORY_FILE != 0
             && !Self::is_named_pipe_root_path(name16)

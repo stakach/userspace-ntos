@@ -16,6 +16,8 @@ mod retained_snapshot_integration;
 mod active_driver_service;
 mod registry_string;
 pub use registry_string::decode_terminated_reg_sz;
+mod driver_database_binding;
+pub use driver_database_binding::resolve_driver_database_binding;
 mod rtl_registry_delete;
 pub use rtl_registry_delete::{
     plan_rtl_registry_delete, plan_rtl_registry_write, RtlRegistryDeleteTarget,
@@ -97,7 +99,7 @@ use nt_config_abi::{
     hive_mutation_kind, hive_mutation_transfer, key_flags, launch_plan_kind, launch_plan_transfer,
     leased_hive_record_kind, network_plan_kind, opcode, pnp_query_kind, pnp_query_transfer,
     raw_value_query_transfer, raw_value_transfer, win32_service_plan_kind,
-    win32_service_process_kind, CmDeviceActionRequest, CmDevicePropertyRequest,
+    win32_service_process_kind, CmDeviceActionRequest, CmDevicePropertyRequest, CmDevpropSetRequest,
     CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveCheckpointHeader, CmHiveCheckpointRequest,
     CmHiveExportHeader, CmHiveImportRequest, CmHivePathRequest, CmHiveKeyRequest,
     CmHiveMutationRecord, CmHiveMutationRequest, CmKeyRequest, CmLaunchPlanRequest,
@@ -1789,6 +1791,41 @@ impl<B: Backend> ConfigClient<B> {
         }
     }
 
+    /// Publish a bounded typed DEVPROPKEY value for an existing CM devnode.
+    pub fn set_device_devprop(
+        &mut self,
+        instance: &str,
+        fmtid: [u8; 16],
+        pid: u32,
+        property_type: u32,
+        data: &[u8],
+    ) -> Result<(), i32> {
+        let instance_bytes = utf16_bytes(instance);
+        let header_size = core::mem::size_of::<CmDevpropSetRequest>();
+        if instance_bytes.is_empty() || instance_bytes.len() > CM_MAX_INSTANCE_UNITS * 2
+            || instance.chars().any(|ch| ch == '\0') || data.len() > 1024
+        { return Err(STATUS_INVALID_PARAMETER); }
+        let mut request = Vec::new();
+        request.try_reserve_exact(header_size + instance_bytes.len() + data.len())
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        let header = CmDevpropSetRequest {
+            abi_size: header_size as u16,
+            abi_version: CM_ABI_VERSION,
+            property_type,
+            fmtid,
+            pid,
+            instance_offset: header_size as u32,
+            instance_len_bytes: instance_bytes.len() as u32,
+            data_offset: (header_size + instance_bytes.len()) as u32,
+            data_len: data.len() as u32,
+        };
+        request.extend_from_slice(header.as_bytes());
+        request.extend_from_slice(&instance_bytes);
+        request.extend_from_slice(data);
+        let response = self.backend.call(opcode::CM_OP_SET_DEVICE_DEVPROP, &request, &mut []);
+        if response.status == STATUS_SUCCESS { Ok(()) } else { Err(response.status) }
+    }
+
     /// Query a legacy device property by stable devnode instance path. Errors retain the exact
     /// required length so native `IoGetDeviceProperty` callers can report and retry correctly.
     pub fn query_device_property(
@@ -2824,7 +2861,9 @@ impl<B: Backend> ConfigClient<B> {
         let shape_valid = match query_kind {
             pnp_query_kind::ENUMERATE_DEVNODE => instance.is_empty() && auxiliary.is_empty(),
             pnp_query_kind::INTERFACE_LINKS => {
-                !instance.is_empty() && selector == 0 && auxiliary.len() == 16
+                !instance.is_empty()
+                    && selector <= pnp_query_kind::INTERFACE_LINKS_INCLUDE_NONACTIVE
+                    && auxiliary.len() == 16
             }
             pnp_query_kind::DYNAMIC_PROPERTY | pnp_query_kind::RELATED_DEVICE => {
                 !instance.is_empty() && auxiliary.is_empty()
@@ -4700,6 +4739,20 @@ mod tests {
             .unwrap()
             .symbolic_link
             .clone();
+        let disabled = client
+            .backend
+            .server
+            .config_mut()
+            .register_interface(boot_devnode, interface_guid, "disabled", false)
+            .unwrap();
+        let disabled_link = client
+            .backend
+            .server
+            .config()
+            .interface(disabled)
+            .unwrap()
+            .symbolic_link
+            .clone();
         let critical = client
             .backend
             .server
@@ -4842,7 +4895,20 @@ mod tests {
                 &interface_guid_bytes,
             )
             .expect("enabled interface links");
-        assert_eq!(interfaces.strings, vec![expected_link]);
+        assert_eq!(interfaces.strings, vec![expected_link.clone()]);
+        let all_interfaces = client
+            .query_pnp(
+                pnp_query_kind::INTERFACE_LINKS,
+                pnp_query_kind::INTERFACE_LINKS_INCLUDE_NONACTIVE,
+                r"ROOT\BOOTDEV\0000",
+                &interface_guid_bytes,
+            )
+            .expect("all interface links");
+        assert_eq!(all_interfaces.strings, vec![expected_link, disabled_link]);
+        assert_eq!(
+            client.query_pnp(pnp_query_kind::INTERFACE_LINKS, 2, r"ROOT\BOOTDEV\0000", &interface_guid_bytes),
+            Err(STATUS_INVALID_PARAMETER)
+        );
         let network = client
             .query_network_adapter_plan()
             .expect("network adapter plan");

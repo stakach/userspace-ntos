@@ -21,6 +21,12 @@ fn ace(flags: u8, mask: u32, trustee: &Sid) -> Vec<u8> {
     bytes
 }
 
+fn audit_acl() -> NativeAcl {
+    let mut audit = ace(0x40, 1, &Sid::everyone());
+    audit[0] = 2;
+    acl(&[audit])
+}
+
 fn acl(aces: &[Vec<u8>]) -> NativeAcl {
     acl_revision(2, aces)
 }
@@ -196,7 +202,8 @@ fn anonymous_kernel_subject_uses_client_defaults_but_cannot_assign_user_mode_own
     let owner = sd(Some(&client.user), None, None, None, 0);
     request.creator = Some(&owner);
     assert_eq!(assign_object_security(&request), Err(STATUS_INVALID_OWNER));
-    let sacl = sd(None, None, None, Some(None), 0);
+    let audit = audit_acl();
+    let sacl = sd(None, None, None, Some(Some(&audit)), 0);
     request.creator = Some(&sacl);
     assert_eq!(
         assign_object_security(&request),
@@ -384,7 +391,7 @@ fn explicit_creator_owner_group_override_parent_default_flags() {
 }
 
 #[test]
-fn explicit_null_empty_and_defaulted_sacls_all_require_security_privilege() {
+fn explicit_null_empty_and_defaulted_sacls_need_no_security_privilege() {
     let primary = primary();
     let mapping = mapping();
     let empty = acl(&[]);
@@ -393,12 +400,10 @@ fn explicit_null_empty_and_defaulted_sacls_all_require_security_privilege() {
             let descriptor = sd(None, None, None, Some(sacl), control);
             let mut request = assignment(&primary, &mapping);
             request.creator = Some(&descriptor);
-            assert_eq!(
-                assign_object_security(&request),
-                Err(STATUS_PRIVILEGE_NOT_HELD)
-            );
-            extended(&mut request, SEF_AVOID_PRIVILEGE_CHECK);
-            assert!(assign_object_security(&request).is_ok());
+            let assigned = assign_object_security(&request).unwrap();
+            let parsed = parse_self_relative_descriptor(&assigned).unwrap();
+            assert!(parsed.sacl_present);
+            assert_eq!(parsed.sacl.is_some(), sacl.is_some());
         }
     }
 }
@@ -422,7 +427,8 @@ fn inherited_sacl_needs_no_assignment_privilege() {
 fn explicit_sacl_uses_client_enabled_privilege_and_effective_impersonation_level() {
     let primary = AccessToken::system();
     let mut client = client();
-    let descriptor = sd(None, None, None, Some(None), 0);
+    let audit = audit_acl();
+    let descriptor = sd(None, None, None, Some(Some(&audit)), 0);
     let mapping = mapping();
     let mut request = assignment(&primary, &mapping);
     request.creator = Some(&descriptor);
@@ -877,7 +883,8 @@ fn audit_trace_resets_before_validation_and_on_check_free_success() {
 
 #[test]
 fn audit_records_denied_and_granted_security_privilege_attempts() {
-    let creator = sd(None, None, None, Some(None), 0);
+    let audit_acl = audit_acl();
+    let creator = sd(None, None, None, Some(Some(&audit_acl)), 0);
     let mapping = mapping();
     for granted in [false, true] {
         let mut primary = primary();
@@ -943,7 +950,8 @@ fn audit_retains_earlier_granted_security_check_when_later_owner_check_fails() {
     let mut primary = primary();
     privilege(&mut primary, SE_SECURITY);
     let mapping = mapping();
-    let creator = sd(Some(&Sid::local_system()), None, None, Some(None), 0);
+    let audit_acl = audit_acl();
+    let creator = sd(Some(&Sid::local_system()), None, None, Some(Some(&audit_acl)), 0);
     let mut request = assignment(&primary, &mapping);
     request.creator = Some(&creator);
     let mut audit = SecurityAssignmentAudit::default();
@@ -968,7 +976,8 @@ fn low_client_level_denies_security_audit_but_never_reaches_restore_check() {
     privilege(&mut client, SE_SECURITY);
     privilege(&mut client, SE_RESTORE);
     let mapping = mapping();
-    let sacl = sd(None, None, None, Some(None), 0);
+    let audit_acl = audit_acl();
+    let sacl = sd(None, None, None, Some(Some(&audit_acl)), 0);
     let owner = sd(Some(&Sid::local_system()), None, None, None, 0);
     let mut request = assignment(&primary, &mapping);
     request.client = Some(SecurityAssignmentClient {
@@ -1019,7 +1028,8 @@ fn kernel_and_explicit_bypass_flags_report_no_privilege_use() {
 fn failed_security_check_does_not_record_unreached_restore_check() {
     let primary = primary();
     let mapping = mapping();
-    let creator = sd(Some(&Sid::local_system()), None, None, Some(None), 0);
+    let audit_acl = audit_acl();
+    let creator = sd(Some(&Sid::local_system()), None, None, Some(Some(&audit_acl)), 0);
     let mut request = assignment(&primary, &mapping);
     request.creator = Some(&creator);
     let mut audit = SecurityAssignmentAudit::default();

@@ -11,15 +11,19 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 mod eval;
+mod hpet_projection;
 mod madt;
 mod namespace;
 mod pci_routing;
 
 pub use eval::{
-    eval_method_input, eval_method_input_ex, eval_output_required_len, parse_integer_evaluation,
-    AcpiEvalError, ACPI_EVAL_INPUT_BUFFER_EX_LEN, ACPI_EVAL_INPUT_BUFFER_LEN,
+    eval_method_input, eval_method_input_ex, eval_output_overflow_retry_len,
+    eval_output_required_len,
+    parse_extended_integer_evaluation, parse_integer_evaluation, AcpiEvalError,
+    ACPI_EVAL_EXTENDED_INTEGER_LEN, ACPI_EVAL_INPUT_BUFFER_EX_LEN, ACPI_EVAL_INPUT_BUFFER_LEN,
     ACPI_EVAL_OUTPUT_PROBE_LEN, IOCTL_ACPI_EVAL_METHOD, IOCTL_ACPI_EVAL_METHOD_EX,
 };
+pub use hpet_projection::HpetReadOnlyAlias;
 pub use madt::{
     parse_madt_interrupt_topology, resolve_ioapic_gsi, validate_ioapic_route_extents,
     IoApicRouteError, IoApicRouteExtent, MadtError, MadtInterruptTopology, MadtIoApic,
@@ -27,10 +31,13 @@ pub use madt::{
 };
 pub use namespace::{
     immediate_namespace_children_input, multilevel_namespace_filter_input,
-    namespace_children_overflow_retry_len, namespace_children_required_len,
+    namespace_children_absent,
+    namespace_children_probe_retry_len,
+    namespace_children_required_len,
     parse_namespace_children, parse_namespace_matches, resolve_namespace_reference,
     AcpiNamespaceChild, AcpiNamespaceChildren, AcpiNamespaceError, AcpiNamespaceMatches,
     AcpiNamespacePath, ACPI_ENUM_CHILDREN_FILTER_INPUT_LEN, ACPI_ENUM_CHILDREN_INPUT_LEN,
+    ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN,
     IOCTL_ACPI_ENUM_CHILDREN,
 };
 pub use pci_routing::{

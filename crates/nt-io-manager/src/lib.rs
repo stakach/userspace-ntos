@@ -36,6 +36,8 @@ pub mod start_io_queued;
 pub mod start_io_selection;
 pub mod start_io_native_transaction;
 pub mod device_power;
+pub mod power_irp_request;
+pub mod power_forward_cancel;
 mod device_file_name;
 mod device_reference;
 mod device_control;
@@ -46,10 +48,12 @@ mod directory_control;
 mod dispatch;
 mod driver;
 pub mod driver_reinitialization;
+pub mod remove_lock;
 mod driver_host;
 mod driver_peer;
 mod ea;
 mod external_dispatch;
+mod detached_external_power;
 pub mod detached_file_irp;
 mod fault;
 mod file;
@@ -65,6 +69,7 @@ mod hosted_file;
 #[cfg(test)]
 mod hosted_file_lifetime_tests;
 mod hosted_device_pointer;
+pub mod hosted_provider_child_route;
 mod completion_ack;
 mod completion_retirement;
 mod projection_allocation;
@@ -73,9 +78,15 @@ mod hosted_safe_attach;
 mod hosted_bus_pdo_publication;
 mod hosted_file_system_registry;
 pub mod hosted_pool_range;
+pub mod video_monitor_array_projection;
 pub mod hosted_kernel_read_delivery;
 pub mod inline_file_retirement;
 mod irp;
+pub mod internal_block_io;
+pub mod scsi_srb_transport;
+pub mod scsi_block_command;
+pub mod scsi_srb_wire;
+pub mod scsi_source_retention;
 pub mod kernel_irp_builder;
 pub mod io_create_file;
 pub mod io_create_file_capture;
@@ -88,6 +99,7 @@ pub mod redir_query_path;
 pub mod retained_query_path_forward;
 pub mod retained_write_forward;
 pub mod retained_read_forward;
+pub mod internal_device_control_forward;
 pub mod retained_query_information_forward;
 pub mod retained_flush_forward;
 pub mod retained_connect_forward;
@@ -203,6 +215,10 @@ pub use external_dispatch::{
     PreparedExternalPnpIrp, PreparedExternalPnpRejection,
 };
 pub use completion_ack::CompletionAcknowledgement;
+pub use detached_external_power::{PreparedExternalPowerIrp, ExternalPowerRejection,
+    ExternalPowerInvocation, ExternalPowerReturn, RetainedExternalPower,
+    ExternalPowerFinishResult, ExternalPowerCompletionInvocation,
+    ExternalPowerCompletionReturn, ExternalPowerTerminalReceipt};
 pub use file::{CreateOptions, FileRecord, FileState, ShareAccess};
 pub use file_mode::FileModeState;
 pub use file_information::{
@@ -298,7 +314,8 @@ pub use volume_information::{
     SetVolumeInformationParameters, VolumeInformationContract,
 };
 pub use wdm_x64::{
-    decode_wdm_kernel_built_io_stack, initialize_wdm_irp_thread_list,
+    decode_wdm_kernel_built_io_stack, decode_wdm_kernel_built_scsi_stack,
+    initialize_wdm_irp_thread_list,
     write_wdm_device_object, write_wdm_driver_object,
     write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
     write_wdm_irp_completion_targets,
@@ -790,6 +807,7 @@ impl<P> IoManager<P> {
                         location.flags = parameters.case_sensitive_stack_flags(major)
                     }
                     IoParameters::Pnp(parameters) => location.minor = parameters.minor,
+                    IoParameters::Power(parameters) => location.minor = parameters.minor(),
                     IoParameters::LockControl(parameters) => location.minor = parameters.minor,
                     IoParameters::NotifyDirectory(_) => {
                         location.minor = crate::IRP_MN_NOTIFY_CHANGE_DIRECTORY
@@ -833,6 +851,7 @@ impl<P> IoManager<P> {
                     location.flags = parameters.case_sensitive_stack_flags(major)
                 }
                 IoParameters::Pnp(parameters) => location.minor = parameters.minor,
+                IoParameters::Power(parameters) => location.minor = parameters.minor(),
                 IoParameters::LockControl(parameters) => location.minor = parameters.minor,
                 IoParameters::NotifyDirectory(_) => {
                     location.minor = crate::IRP_MN_NOTIFY_CHANGE_DIRECTORY
@@ -865,7 +884,7 @@ impl<P> IoManager<P> {
         let mut irp = IrpRecord::new(client, device, file, major);
         irp.origin_driver_id = driver;
         irp.origin_minor = stack[0].minor;
-        if major == nt_io_abi::major::IRP_MJ_PNP {
+        if matches!(major, nt_io_abi::major::IRP_MJ_PNP | nt_io_abi::major::IRP_MJ_POWER) {
             irp.status = NtStatus::NOT_SUPPORTED;
         }
         irp.stack = stack;
@@ -889,7 +908,7 @@ impl<P> IoManager<P> {
         let mut irp = IrpRecord::new(client, device, file, major);
         irp.origin_driver_id = driver;
         irp.origin_minor = stack[0].minor;
-        if major == nt_io_abi::major::IRP_MJ_PNP {
+        if matches!(major, nt_io_abi::major::IRP_MJ_PNP | nt_io_abi::major::IRP_MJ_POWER) {
             irp.status = NtStatus::NOT_SUPPORTED;
         }
         irp.stack = stack;
@@ -1541,6 +1560,7 @@ mod tests {
     mod exact_external_pnp;
     mod detached_external_pnp;
     mod detached_external_pnp_completion;
+    mod detached_external_power_tests;
 
     use super::*;
     use nt_io_abi::{ioctl, major};
@@ -5027,6 +5047,10 @@ mod tests {
     }
 
     impl DriverDispatchBackend for KernelFileRouteBackend {
+        fn immutable_file_extent(&self, _file_id: FileId, file_context: u64) -> Option<u64> {
+            (file_context == 0xfeed).then_some(4)
+        }
+
         fn dispatch_irp(
             &mut self,
             ctx: DispatchContext<'_>,
@@ -5177,6 +5201,15 @@ mod tests {
         ));
         assert_eq!(om.file(file).unwrap().state, FileState::Open);
         assert_eq!(om.external_file_context(client, file), Ok(Some(0xfeed)));
+        assert_eq!(om.immutable_file_extent(client, file, device, 0xfeed), Ok(Some(4)));
+        assert_eq!(
+            om.immutable_file_extent(client, file, device, 0xbeef),
+            Err(NtStatus::INVALID_HANDLE)
+        );
+        assert_eq!(
+            om.immutable_file_extent(client, file, DeviceId::NULL, 0xfeed),
+            Err(NtStatus::INVALID_HANDLE)
+        );
 
         let mut metadata = [0; 4];
         assert!(matches!(

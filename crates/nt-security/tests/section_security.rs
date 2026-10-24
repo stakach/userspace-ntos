@@ -147,10 +147,13 @@ fn malformed_descriptor_refuses_assignment_and_open_without_grant() {
 fn sacl_assignment_reports_actual_denied_privilege() {
     let token = AccessToken::user(19);
     let mut creator = world_descriptor(4);
-    let sacl = creator.len() as u32;
+    let mut sacl = creator[20..].to_vec();
+    sacl[8] = 2; // SYSTEM_AUDIT_ACE_TYPE
+    sacl[9] = 0x40; // SUCCESSFUL_ACCESS_ACE_FLAG
+    let sacl_offset = creator.len() as u32;
     creator[2] |= 0x10;
-    creator[12..16].copy_from_slice(&sacl.to_le_bytes());
-    creator.extend_from_slice(&[2, 0, 8, 0, 0, 0, 0, 0]);
+    creator[12..16].copy_from_slice(&sacl_offset.to_le_bytes());
+    creator.extend_from_slice(&sacl);
     let mut audit = SecurityAssignmentAudit::default();
     assert_eq!(
         assign_section_security(

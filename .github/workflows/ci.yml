@@ -30,6 +30,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          submodules: true
       # Public compile-time inputs; no proprietary Windows binaries or microkernel are needed.
       - name: Fetch pinned ReactOS source inputs
         uses: actions/checkout@v4

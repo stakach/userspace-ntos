@@ -141,6 +141,12 @@ impl DataSectionReadWindow {
     pub const fn pages(self) -> usize { self.pages }
     pub const fn capacity(self) -> usize { self.pages * DATA_PAGE_SIZE }
 
+    /// Bound one retained output copy to both the planned read and the caller's scratch.
+    pub fn next_copy_len(self, copied: usize, scratch_capacity: usize) -> Option<usize> {
+        if copied >= self.length || scratch_capacity == 0 { return None; }
+        Some((self.length - copied).min(scratch_capacity))
+    }
+
     pub fn complete(self, status: u32, read: usize, output: &mut [u8]) -> Result<(), u32> {
         if status != 0 { return Err(status); }
         if read != self.length || output.len() != self.capacity() {

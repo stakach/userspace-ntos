@@ -80,7 +80,8 @@ impl ExecNtHandler {
         if caller.mode() == nt_types::AccessMode::UserMode && handle.granted_access() & required != required {
             return Err(nt_process::STATUS_ACCESS_DENIED);
         }
-        if !matches!(args[7], 1 | 2) || nt_ulong_arg(args[8]) & !nt_address_space::MEM_TOP_DOWN != 0 {
+        nt_address_space::image_view_placement::validate_x64_map_view_inherit_disposition(args[7])?;
+        if nt_ulong_arg(args[8]) & !nt_address_space::MEM_TOP_DOWN != 0 {
             return Err(nt_process::STATUS_INVALID_PARAMETER);
         }
         let (pid, pi) = self.resolve_process_for_access(args[1], 0x0008)?;

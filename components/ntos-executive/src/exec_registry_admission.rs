@@ -24,15 +24,11 @@ impl ExecNtHandler {
     ) -> Result<alloc::string::String, u32> {
         let mut header = [0u8; 16];
         self.process_memory_read_status(self.pi, address, &mut header)?;
-        let length = u16::from_le_bytes(header[..2].try_into().unwrap()) as usize;
-        let maximum = u16::from_le_bytes(header[2..4].try_into().unwrap()) as usize;
-        if length & 1 != 0 || length > maximum {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let pointer = u64::from_le_bytes(header[8..16].try_into().unwrap());
-        let mut bytes = alloc::vec![0u8; length];
-        if length != 0 {
-            self.process_memory_read_status(self.pi, pointer, &mut bytes)?;
+        let input = nt_kernel_exec::user_string::object_name_input(&header)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        let mut bytes = alloc::vec![0u8; input.length];
+        if input.length != 0 {
+            self.process_memory_read_status(self.pi, input.buffer, &mut bytes)?;
         }
         let units: alloc::vec::Vec<u16> = bytes
             .chunks_exact(2)
@@ -399,6 +395,18 @@ impl ExecNtHandler {
     }
 
     pub(super) unsafe fn nt_open_key_admitted(&mut self, args: &[u64]) -> u32 {
+        self.nt_open_key_with_options(args, false)
+    }
+
+    pub(super) unsafe fn nt_open_key_ex_admitted(&mut self, args: &[u64]) -> u32 {
+        let backup = match nt_config_manager::validate_key_open_options(nt_ulong_arg(args[3])) {
+            Ok(backup) => backup,
+            Err(status) => return status,
+        };
+        self.nt_open_key_with_options(args, backup)
+    }
+
+    unsafe fn nt_open_key_with_options(&mut self, args: &[u64], backup: bool) -> u32 {
         let _durable = allocator::enter_durable();
         let (mut state, _) = match self.capture_hosted_registry_publication(args, false) {
             Ok(state) => state,
@@ -407,7 +415,7 @@ impl ExecNtHandler {
         let result = (|| {
             let target = self.acquire_hosted_registry_target(&state)?;
             self.bind_hosted_registry_target(&mut state, target)?;
-            let granted = match self.registry_open_grant(&state, target, false) {
+            let granted = match self.registry_open_grant(&state, target, backup) {
                 Ok(granted) => granted,
                 Err(status) => return Err(status),
             };
@@ -711,7 +719,7 @@ impl ExecNtHandler {
         Ok((OVERLAY_KEY_TAG | index as u32, true))
     }
 
-    fn journal_create_secured_mutable_subkey(
+    pub(crate) fn journal_create_secured_mutable_subkey(
         &mut self,
         parent: ResolvedHiveKey,
         name: &str,

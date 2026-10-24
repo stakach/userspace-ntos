@@ -248,6 +248,18 @@ mod tests {
     }
 
     #[test]
+    fn kernel_thread_delay_keeps_full_interval_and_correct_clock_domain() {
+        let initial = snapshot(1_000_000, 500_000_000);
+        let relative = Deadline::from_nt_timeout(Some(-50_000_000), initial); // five seconds
+        assert!(!relative.is_due(snapshot(1_010_000, 600_000_000)));
+        assert!(relative.is_due(snapshot(51_000_000, 400_000_000)));
+
+        let absolute = Deadline::from_nt_timeout(Some(550_000_000), initial);
+        assert!(!absolute.is_due(snapshot(100_000_000, 549_999_999)));
+        assert!(absolute.is_due(snapshot(1_000_001, 550_000_000)));
+    }
+
+    #[test]
     fn hpet_conversion_rounds_deadlines_up() {
         let period_fs = 10_000_000;
         assert_eq!(ticks_to_100ns(10, period_fs), 1);

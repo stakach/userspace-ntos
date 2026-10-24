@@ -15,12 +15,14 @@ std = ["nt-status/std"]
 nt-status = { workspace = true }
 nt-port-core = { workspace = true }
 nt-alpc-abi = { workspace = true }
+nt-security = { workspace = true }
 bytemuck = { version = "1", default-features = false }
 
 [dev-dependencies]
 nt-lpc-server = { workspace = true }
 nt-lpc-client = { workspace = true }
 nt-lpc-abi = { workspace = true }
+nt-srm-message = { workspace = true }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

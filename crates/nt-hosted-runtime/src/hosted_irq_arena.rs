@@ -148,6 +148,7 @@ pub enum HostedIrqServiceKind {
     ClassServiceRequest = 8,
     TimerCancel = 9,
     TimerSet = 10,
+    RemoveDpc = 11,
 }
 
 impl HostedIrqServiceKind {
@@ -163,6 +164,7 @@ impl HostedIrqServiceKind {
             8 => Some(Self::ClassServiceRequest),
             9 => Some(Self::TimerCancel),
             10 => Some(Self::TimerSet),
+            11 => Some(Self::RemoveDpc),
             _ => None,
         }
     }
@@ -493,6 +495,11 @@ impl HostedIrqServiceCommand {
                 }
                 HostedIrqServiceKind::QueueDpc => {
                     self.authority_cookie == 0 && self.argument_count == 4 && self.arguments[0] != 0
+                }
+                HostedIrqServiceKind::RemoveDpc => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 0
+                        && self.arguments.iter().all(|argument| *argument == 0)
                 }
                 HostedIrqServiceKind::Mdl => {
                     self.authority_cookie == 0
@@ -921,6 +928,23 @@ impl HostedIrqArenaControl {
     pub fn current_irql(&self, identity: HostedIrqLaneIdentity) -> Result<u8, HostedIrqArenaError> {
         self.check_identity(identity)?;
         Ok(self.current_irql.load(Ordering::Acquire) as u8)
+    }
+
+    /// Apply a stopped IRQ worker's decoded CR8 write to its active transaction. The
+    /// expected value comes from the same arena immediately before context projection.
+    pub fn worker_write_cr8(
+        &self,
+        identity: HostedIrqLaneIdentity,
+        transaction: HostedIrqTransaction,
+        expected: u8,
+        target: u8,
+    ) -> Result<(), HostedIrqArenaError> {
+        self.check_transaction(identity, transaction)?;
+        if target >= expected {
+            self.worker_raise_irql(identity, transaction, expected, target)
+        } else {
+            self.worker_lower_irql(identity, transaction, expected, target)
+        }
     }
 
     pub fn worker_raise_irql(
@@ -2468,7 +2492,8 @@ mod tests {
         assert_eq!(HostedIrqServiceKind::from_raw(8), Some(HostedIrqServiceKind::ClassServiceRequest));
         assert_eq!(HostedIrqServiceKind::from_raw(9), Some(HostedIrqServiceKind::TimerCancel));
         assert_eq!(HostedIrqServiceKind::from_raw(10), Some(HostedIrqServiceKind::TimerSet));
-        assert_eq!(HostedIrqServiceKind::from_raw(11), None);
+        assert_eq!(HostedIrqServiceKind::from_raw(11), Some(HostedIrqServiceKind::RemoveDpc));
+        assert_eq!(HostedIrqServiceKind::from_raw(12), None);
         assert!(HostedIrqServiceKind::ProviderCallbackRequest.may_request_nested_dispatch());
         assert!(HostedIrqServiceKind::ClassServiceRequest.may_request_nested_dispatch());
         assert!(!HostedIrqServiceKind::ProviderImport.may_request_nested_dispatch());
@@ -2499,6 +2524,15 @@ mod tests {
         queue_dpc.arguments[0] = 43;
         queue_dpc.argument_count = 3;
         assert!(!queue_dpc.valid());
+
+        let mut remove_dpc = service();
+        remove_dpc.kind = HostedIrqServiceKind::RemoveDpc;
+        remove_dpc.authority_cookie = 0;
+        remove_dpc.argument_count = 0;
+        remove_dpc.arguments = [0; HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        assert!(remove_dpc.valid());
+        remove_dpc.arguments[0] = 1;
+        assert!(!remove_dpc.valid());
 
         let mut mdl = service();
         mdl.kind = HostedIrqServiceKind::Mdl;
@@ -3066,6 +3100,31 @@ mod tests {
         control
             .root_finish_transaction(identity(), transaction)
             .unwrap();
+    }
+
+    #[test]
+    fn cr8_fault_write_requires_exact_active_irq_transaction_and_expected_irql() {
+        let control = active_control();
+        let transaction = control
+            .root_begin_transaction(identity(), HostedIrqTransactionClass::Interrupt)
+            .unwrap();
+        control.worker_raise_irql(identity(), transaction, 0, 2).unwrap();
+        assert_eq!(control.worker_write_cr8(identity(), transaction, 2, 2), Ok(()));
+        assert_eq!(control.worker_write_cr8(identity(), transaction, 0, 3),
+            Err(HostedIrqArenaError::InvalidIrql));
+        assert_eq!(control.worker_write_cr8(identity(), transaction, 2, 5), Ok(()));
+        assert_eq!(control.current_irql(identity()), Ok(5));
+        let stale = HostedIrqTransaction { transaction: transaction.transaction + 1, ..transaction };
+        assert_eq!(control.worker_write_cr8(identity(), stale, 5, 2),
+            Err(HostedIrqArenaError::StaleTransaction));
+        assert_eq!(control.worker_write_cr8(identity(), transaction, 5, 2), Ok(()));
+        assert_eq!(control.worker_write_cr8(identity(), transaction, 2, 16),
+            Err(HostedIrqArenaError::InvalidIrql));
+        assert_eq!(control.current_irql(identity()), Ok(2));
+        control.worker_lower_irql(identity(), transaction, 2, 0).unwrap();
+        control.root_finish_transaction(identity(), transaction).unwrap();
+        assert_eq!(control.worker_write_cr8(identity(), transaction, 0, 2),
+            Err(HostedIrqArenaError::StaleTransaction));
     }
 
     #[test]

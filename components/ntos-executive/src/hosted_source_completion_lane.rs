@@ -278,6 +278,7 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
         shared,
         Some(HostedWorkerSharedBankSpec {
             offset: BANK_OFFSET,
+            frames: 1,
             arg_offset: None,
         }),
     )

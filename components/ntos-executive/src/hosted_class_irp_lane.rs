@@ -9,14 +9,17 @@ use crate::spawn_hosts::shared_ingress::owner::runtime;
 use nt_component_suspension::peer_registry::PeerRoute;
 
 const LABEL: u64 = 0x7bd;
+pub(super) const FSD_DISPATCH_DYNAMIC_DELETE: u64 = u64::MAX - 0x7bd;
 const BANK_OFFSET: u64 = FSD_WORKER_KPCR_OFFSET + 0x1000;
 const ARG_OFFSET: u64 = BANK_OFFSET + 0x1000;
 const REQUEST_OFFSET: u64 = 0x800;
-const JUMP_OFFSET: u64 = 0x900;
+const JUMP_OFFSET: u64 = align_up_u64(
+    REQUEST_OFFSET + core::mem::size_of::<IrpDispatchRequest>() as u64, 16,
+);
 const SCRATCH_BANK_OFFSET: u64 = 0xff0;
 const ORDINAL_BIT: u64 = 1 << 63;
 const _: () = assert!(REQUEST_OFFSET + core::mem::size_of::<IrpDispatchRequest>() as u64 <= JUMP_OFFSET);
-const _: () = assert!(JUMP_OFFSET + 3 * 8 <= 0x1000);
+const _: () = assert!(JUMP_OFFSET + 3 * 8 <= SCRATCH_BANK_OFFSET);
 const _: () = assert!(BANK_OFFSET + 0x1000 <= FSD_WORKER_STRIDE);
 const _: () = assert!(ARG_OFFSET + FSD_ARG_FRAMES * 0x1000 <= FSD_WORKER_STRIDE);
 
@@ -55,7 +58,7 @@ impl Selection {
 }
 
 #[derive(Clone, Copy)]
-enum SelectionPurpose { New, Control(u64) }
+enum SelectionPurpose { New, Control(u64), Callback }
 
 unsafe fn index_for(instance_index: usize) -> Option<usize> {
     let inst = instance(instance_index)?;
@@ -153,7 +156,8 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
     (&mut *core::ptr::addr_of_mut!(LANES))[index].handle = handle;
     let spawn = spawn_hosted_driver_worker_thread_with_shared_bank(
         instance_index, inst, handle, slot, entry as *const () as u64, shared,
-        Some(HostedWorkerSharedBankSpec { offset: BANK_OFFSET, arg_offset: Some(ARG_OFFSET) }),
+        Some(HostedWorkerSharedBankSpec { offset: BANK_OFFSET, frames: 1,
+            arg_offset: Some(ARG_OFFSET) }),
     ).ok_or(STATUS_INSUFFICIENT_RESOURCES as u32)?;
     let bank = spawn.shared_bank.ok_or(STATUS_INVALID_HANDLE as u32)?;
     if bank.component != shared || bank.arg_component
@@ -267,6 +271,7 @@ unsafe fn select(instance_index: usize, purpose: SelectionPurpose) -> Option<Sel
     match purpose {
         SelectionPurpose::New if row.current_irp.is_some() => return None,
         SelectionPurpose::Control(irp) if row.current_irp != Some(irp) => return None,
+        SelectionPurpose::Callback if row.current_irp.is_some() => return None,
         _ => {}
     }
     let route = row.route?;
@@ -278,6 +283,41 @@ unsafe fn select(instance_index: usize, purpose: SelectionPurpose) -> Option<Sel
 
 pub(super) unsafe fn select_new(instance_index: usize) -> Option<Selection> {
     select(instance_index, SelectionPurpose::New)
+}
+
+pub(super) unsafe fn select_callback(instance_index: usize) -> Option<Selection> {
+    select(instance_index, SelectionPurpose::Callback)
+}
+
+/// Execute one PASSIVE_LEVEL callback on the worker's independent TCB, Reply, and bank. The
+/// caller must retain its exact callback ticket before entering this uncertain native effect.
+pub(super) unsafe fn dispatch_callback(
+    instance_index: usize, selection: &Selection, callback: u64, object: u64,
+) -> bool {
+    let Some(index) = index_for(instance_index) else { return false; };
+    let Some(worker) = worker(instance_index, (&*core::ptr::addr_of!(LANES))[index].ordinal)
+    else { return false; };
+    let Some(inst) = instance(instance_index) else { return false; };
+    if selection.shared != (&*core::ptr::addr_of!(LANES))[index].executive_shared
+        || callback == 0 || object == 0
+    { return false; }
+    let Some(caller) = hosted_thread_resources::registry_caller(worker).ok() else {
+        return false;
+    };
+    let Ok(ch) = channel(index, worker, crate::spawn_hosts::InitialAction::ReplyRequest)
+    else { return false; };
+    write_volatile((selection.shared + SH_DRVOBJ) as *mut u64, selection.shared);
+    write_volatile((selection.shared + SH_REQ_MAJOR) as *mut u64, FSD_DISPATCH_DYNAMIC_DELETE);
+    write_volatile((selection.shared + SH_REQ_MINOR) as *mut u64, callback);
+    write_volatile((selection.shared + SH_REQ_FILEID) as *mut u64, object);
+    write_volatile((selection.shared + SH_REQ_STATUS) as *mut i32, 0);
+    write_volatile((selection.shared + SH_REQ_INFO) as *mut u64, 0);
+    if instance_domain_identity(inst) != Some((&*core::ptr::addr_of!(LANES))[index].domain)
+        || !mark_entered(instance_index, selection, None)
+    { return false; }
+    let result = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
+    finish(instance_index, selection, result.completed);
+    result.completed && result.status == STATUS_SUCCESS
 }
 
 pub(super) unsafe fn select_control(instance_index: usize, irp: u64) -> Option<Selection> {
@@ -311,6 +351,7 @@ pub(super) unsafe fn mark_entered(instance_index: usize, selection: &Selection,
         SelectionPurpose::New if irp.is_none() || row.current_irp.is_some() => return false,
         SelectionPurpose::Control(expected) if irp.is_some()
             || row.current_irp != Some(expected) => return false,
+        SelectionPurpose::Callback if irp.is_some() || row.current_irp.is_some() => return false,
         _ => {}
     }
     row.phase = Phase::Entered;
@@ -390,6 +431,21 @@ unsafe extern "win64" fn entry(shared: u64) {
 unsafe fn execute(request: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
     let shared = request.drv;
     if current_component_bank() != Some(shared) { return (STATUS_INVALID_PARAMETER, 0); }
+    if request.sel == FSD_DISPATCH_DYNAMIC_DELETE {
+        let callback = read_volatile((shared + SH_REQ_MINOR) as *const u64);
+        let object = read_volatile((shared + SH_REQ_FILEID) as *const u64);
+        if callback == 0 || object == 0 { return (STATUS_INVALID_PARAMETER, 0); }
+        let Some(jb) = current_jump_buffer() else { return (STATUS_INVALID_HANDLE, 0); };
+        let boundary = read_volatile((FSD_SHARED_VADDR + SH_SEH_FOREIGN_CALL16_VA) as *const u64);
+        if boundary == 0 { return (STATUS_INVALID_DEVICE_REQUEST, 0); }
+        write_volatile(jb, 0);
+        write_volatile(jb.add(1), 0);
+        write_volatile(jb.add(2), 0);
+        let args = [object, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        fsd_guarded_call_vector(callback, args.as_ptr(), 12, jb, boundary);
+        if read_volatile(jb.add(2)) != 0 { return (STATUS_UNSUCCESSFUL, 0); }
+        return (STATUS_SUCCESS, 0);
+    }
     let irp = read_volatile((shared + SH_REQ_CONTROL_ID) as *const u64);
     if matches!(request.sel, FSD_DISPATCH_COPY_MUTABLE_INPUT | FSD_DISPATCH_COPY_COMPLETION
         | FSD_DISPATCH_ACK_COMPLETION | FSD_DISPATCH_CANCEL_IRP) {

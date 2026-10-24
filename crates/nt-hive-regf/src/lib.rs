@@ -2532,8 +2532,38 @@ mod tests {
         )
         .expect("complete committed WAL mutation");
         assert_eq!(composed.replayed_sequence, 1);
+        assert_eq!(composed.hive.sequence, 1, "the imported CM must append after the recovered WAL");
         let key = composed.hive.open_key(r"ControlSet001\Services\Npfs").unwrap();
         assert_eq!(composed.hive.query_dword(key, "Recovered"), Some(7));
+
+        // A checkpoint of the composed image is the next boot's primary. Its sequence must
+        // remain the recovered WAL head, so a new committed mutation can append at sequence 2.
+        let checkpoint = nt_hive_core::encode_image(&composed.hive);
+        let next_record = nt_hive_core::encode_log_record(
+            &nt_hive_core::HiveLogOp::SetValue {
+                path: r"ControlSet001\Services\Npfs",
+                name: "AfterReboot",
+                value_type: RegistryValueType::Dword,
+                data: &8u32.to_le_bytes(),
+            },
+            2,
+        );
+        let rebooted = compose_boot_system_hive_with_wal_suffix(
+            Some(&installed),
+            Some(&checkpoint),
+            &next_record,
+            &generated,
+            BootSystemWalSuffix {
+                snapshot_log_len: 0,
+                first_sequence: 2,
+                last_sequence: 2,
+            },
+        )
+        .expect("next boot must compose the advancing WAL suffix");
+        assert_eq!(rebooted.replayed_sequence, 2);
+        assert_eq!(rebooted.hive.sequence, 2);
+        let key = rebooted.hive.open_key(r"ControlSet001\Services\Npfs").unwrap();
+        assert_eq!(rebooted.hive.query_dword(key, "AfterReboot"), Some(8));
         assert!(matches!(
             compose_boot_system_hive_with_wal_suffix(
                 Some(&installed), None, &record, &generated,
