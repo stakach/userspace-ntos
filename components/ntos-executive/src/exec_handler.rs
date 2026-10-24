@@ -2724,31 +2724,11 @@ fn dynamic_hosted_nt_image_path(
     leaf: &[u8],
     out: &mut [u8; nt_exe_image::MAX_NT_IMAGE_PATH],
 ) -> Option<(usize, nt_exe_image::HostedImageRoot)> {
-    let (prefix, root) = if volume_relative
-        .strip_prefix(crate::installed_layout::SYSTEM32_PREFIX)
-        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(leaf))
-    {
-        (
-            b"\\SystemRoot\\System32\\" as &[u8],
-            nt_exe_image::HostedImageRoot::System32,
-        )
-    } else if volume_relative
-        .strip_prefix(crate::installed_layout::ROOT_PREFIX)
-        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(leaf))
-    {
-        (
-            b"\\SystemRoot\\" as &[u8],
-            nt_exe_image::HostedImageRoot::SystemRoot,
-        )
-    } else {
-        return None;
-    };
-    let len = prefix.len().checked_add(leaf.len())?;
-    if len > out.len() {
-        return None;
-    }
-    out[..prefix.len()].copy_from_slice(prefix);
-    out[prefix.len()..len].copy_from_slice(leaf);
+    let (len, root) = nt_exe_image::canonical_hosted_nt_image_path(
+        volume_relative, crate::installed_layout::ROOT, out,
+    )?;
+    nt_exe_image::canonical_exe_leaf(&out[..len])
+        .filter(|candidate| candidate.eq_ignore_ascii_case(leaf))?;
     Some((len, root))
 }
 

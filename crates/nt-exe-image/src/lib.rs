@@ -1336,6 +1336,48 @@ pub fn canonical_exe_leaf(path: &[u8]) -> Option<&[u8]> {
     Some(leaf)
 }
 
+/// Derive process display metadata from an already selected mounted File name. The caller
+/// retains the File/Section as image authority; this path is never used to reopen the image.
+/// Mounted File names may have one leading device-relative separator or none.
+pub fn canonical_hosted_nt_image_path(
+    file_name: &[u8],
+    installed_root: &[u8],
+    out: &mut [u8; MAX_NT_IMAGE_PATH],
+) -> Option<(usize, HostedImageRoot)> {
+    if installed_root.is_empty()
+        || !installed_root.iter().all(|byte| byte.is_ascii()
+            && !matches!(byte, b'\\' | b'/' | b':' | 0))
+    {
+        return None;
+    }
+    let relative = file_name.strip_prefix(b"\\").unwrap_or(file_name);
+    let root = relative.get(..installed_root.len())?;
+    let tail = relative.get(installed_root.len()..)?;
+    if !root.eq_ignore_ascii_case(installed_root) || !tail.starts_with(b"\\") {
+        return None;
+    }
+    let tail = &tail[1..];
+    let system32 = b"system32\\";
+    let (prefix, root, leaf) = if tail.len() >= system32.len()
+        && tail[..system32.len()].eq_ignore_ascii_case(system32)
+    {
+        (b"\\SystemRoot\\System32\\" as &[u8], HostedImageRoot::System32,
+            &tail[system32.len()..])
+    } else {
+        (b"\\SystemRoot\\" as &[u8], HostedImageRoot::SystemRoot, tail)
+    };
+    if canonical_exe_leaf(leaf)? != leaf {
+        return None;
+    }
+    let len = prefix.len().checked_add(leaf.len())?;
+    if len > out.len() {
+        return None;
+    }
+    out[..prefix.len()].copy_from_slice(prefix);
+    out[prefix.len()..len].copy_from_slice(leaf);
+    Some((len, root))
+}
+
 fn contains_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|window| {
         window
