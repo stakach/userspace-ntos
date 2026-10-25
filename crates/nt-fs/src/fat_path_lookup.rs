@@ -269,4 +269,53 @@ mod tests {
         assert_eq!(lookup.feed(request, &[0; 512]), Ok(FatPathProgress::NotFound));
         assert_eq!(lookup.request(), None);
     }
+
+    #[test]
+    fn libernt_fonts_directory_finds_names_across_real_fat_sector_chain() {
+        // These five immutable sector snapshots come from the pinned LiberNT installed tree
+        // staged in our Simpleboot FAT image. The live win32k trace reports ZwOpenFile failures
+        // for some names even though neighboring names in the same directory succeed.
+        let fixture = include_str!("../tests/fixtures/libernt_fonts_directory.hex");
+        let geometry = FatPathGeometry {
+            fat_start_sector: 8,
+            data_start_sector: 32_728,
+            total_sectors: 2_093_056,
+            sectors_per_cluster: 1,
+        };
+        for name in [
+            b"georgiaz.ttf".as_slice(),
+            b"palab.ttf",
+            b"symbol.ttf",
+            b"couri.ttf",
+            b"SourceSansPro-It.ttf",
+            b"FSEX301-L2.ttf",
+        ] {
+            let mut lookup = FatPathLookup::new(geometry, 379_146, name).unwrap();
+            for _ in 0..8 {
+                let request = lookup.request().expect("font directory lookup still pending");
+                let sector = fixture.lines().filter(|line| !line.starts_with('#'))
+                    .find_map(|line| {
+                        let (number, hex) = line.split_once(' ')?;
+                        (number.parse::<u32>().ok()? == request.sector).then_some(hex)
+                    })
+                    .expect("requested sector must be in captured directory chain");
+                let mut bytes = [0u8; 512];
+                for (index, byte) in bytes.iter_mut().enumerate() {
+                    *byte = u8::from_str_radix(&sector[index * 2..index * 2 + 2], 16)
+                        .expect("fixture contains hexadecimal sector bytes");
+                }
+                match lookup.feed(request, &bytes).unwrap() {
+                    FatPathProgress::Found => {
+                        let found = lookup.take_found().expect("found directory record");
+                        assert!(name_matches(found.entry.name(), name),
+                            "wrong installed font entry for {:?}", name);
+                        break;
+                    }
+                    FatPathProgress::Pending => {}
+                    FatPathProgress::NotFound => panic!("pinned font was not found: {:?}", name),
+                }
+            }
+            assert!(lookup.request().is_none(), "lookup exceeded captured sector chain");
+        }
+    }
 }
