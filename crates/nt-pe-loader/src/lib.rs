@@ -27,6 +27,7 @@ mod relocs;
 mod rva;
 mod snapshot_capacity;
 pub mod system_image_request;
+pub mod system_image_load_plan;
 pub mod system_module;
 
 pub use exports::ExportedSymbol;
