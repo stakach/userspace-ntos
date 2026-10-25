@@ -10,6 +10,7 @@ mod hosted_irq_arena;
 mod hosted_irq_cr8_source;
 mod hosted_irq_call_stack;
 mod progress_deferral;
+mod installer_progress_deferral;
 mod driver_load_receipt;
 mod dxg_registration;
 mod contiguous_ram;
@@ -87,6 +88,7 @@ pub use hosted_irq_call_stack::{
     HostedIrqCallStackError,
 };
 pub use progress_deferral::ProgressDeferralBudget;
+pub use installer_progress_deferral::{InstallerOwner, InstallerProgressDeferral};
 
 pub const PAGE_SIZE: u64 = 0x1000;
 pub const PAGE_TABLE_SPAN: u64 = 0x20_0000;
