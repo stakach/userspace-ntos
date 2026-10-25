@@ -859,19 +859,25 @@ pub struct ProcessObjectDeleteBlockers {
 }
 
 impl ProcessObjectDeleteBlockers {
-    pub const fn delete_ready(self) -> bool {
+    /// Terminated execution has no remaining process-owned activity. Object Manager references
+    /// may still keep the signaled EPROCESS and ETHREAD objects alive after this point.
+    pub const fn execution_retirement_ready(self) -> bool {
         matches!(self.state, Some(ProcessState::Terminated))
             && self.process_exit_notifications == 0
-            && self.process_wait_references == 0
-            && self.process_kernel_pointer_references == 0
             && !self.debug_port_present
             && self.own_handle_slots == 0
-            && self.external_process_handles == 0
             && self.missing_threads == 0
             && self.live_threads == 0
+            && self.thread_termination_ports == 0
+    }
+
+    pub const fn delete_ready(self) -> bool {
+        self.execution_retirement_ready()
+            && self.process_wait_references == 0
+            && self.process_kernel_pointer_references == 0
+            && self.external_process_handles == 0
             && self.thread_wait_references == 0
             && self.thread_kernel_pointer_references == 0
-            && self.thread_termination_ports == 0
             && self.external_thread_handles == 0
     }
 }
@@ -4188,6 +4194,18 @@ impl ProcessManager {
             job,
             deleted_threads,
         })
+    }
+
+    /// Whether stopped execution can release its VM and slot while Object Manager references
+    /// still keep the terminated process and thread objects available to handle holders.
+    /// Pending debug events, exit callbacks, and process-owned activity still block retirement.
+    pub fn process_execution_retirement_ready(&mut self, pid: ProcessId) -> bool {
+        if self.has_process_suspend_control(pid) || self.has_initial_thread_creation_pending(pid) {
+            return false;
+        }
+        let _ = self.clear_deleted_process_debug_object_if_unreferenced(pid);
+        self.process_object_delete_blockers(pid)
+            .is_some_and(ProcessObjectDeleteBlockers::execution_retirement_ready)
     }
 
     /// Whether only Ps-owned token/port references remain before the process delete procedure can
