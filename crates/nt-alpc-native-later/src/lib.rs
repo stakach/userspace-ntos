@@ -26,6 +26,32 @@ pub const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
 pub const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 const MAX_MESSAGE: usize = 65_536;
 const HEADER_SIZE: usize = 40;
+
+/// Find the first provider-backed page that must be owned before a caller copy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CapturePageState { Resident, Routed, Invalid }
+
+pub fn first_routed_capture_page(
+    address: u64,
+    length: usize,
+    user_limit: u64,
+    mut classify: impl FnMut(u64) -> CapturePageState,
+) -> Option<u64> {
+    let last = address.checked_add(u64::try_from(length).ok()?.checked_sub(1)?)?;
+    if last >= user_limit { return None; }
+    let mut page = address & !4095;
+    let last_page = last & !4095;
+    loop {
+        match classify(page) {
+            CapturePageState::Routed => return Some(page),
+            CapturePageState::Invalid => return None,
+            CapturePageState::Resident => {}
+        }
+        if page == last_page { break; }
+        page = page.checked_add(4096)?;
+    }
+    None
+}
 const MAX_NAME_BYTES: usize = 2048;
 const CONTEXT_ATTR: u32 = 0x2000_0000;
 

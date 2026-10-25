@@ -477,3 +477,21 @@ fn checked_reply_and_receive_inspects_retained_component_reply_once_after_exact_
     assert_eq!(receive_only.service_exact(0x103), None,
         "a receive-only listener has not published a reply");
 }
+#[test]
+fn routed_capture_preflight_visits_exact_pages_before_copy() {
+    use super::CapturePageState::{Invalid, Resident, Routed};
+    let name = 0x7ff9_3020_fd0u64;
+    assert_eq!(super::first_routed_capture_page(name, 44, 0x8000_0000_0000,
+        |page| if page == 0x7ff9_3020_000 { Routed } else { Resident }), Some(0x7ff9_3020_000));
+    assert_eq!(super::first_routed_capture_page(0x1ff0, 48, 0x8000_0000_0000,
+        |page| if page == 0x2000 { Routed } else { Resident }), Some(0x2000));
+    assert_eq!(super::first_routed_capture_page(0x1ff0, 48, 0x8000_0000_0000,
+        |page| if page == 0x1000 { Routed } else { Resident }), Some(0x1000));
+    assert_eq!(super::first_routed_capture_page(0x1ff0, 48, 0x8000_0000_0000,
+        |page| if page == 0x1000 { Invalid } else { Routed }), None,
+        "an invalid earlier page must not trigger provider I/O for a later page");
+    assert_eq!(super::first_routed_capture_page(u64::MAX - 3, 8, u64::MAX,
+        |_| Routed), None);
+    assert_eq!(super::first_routed_capture_page(name, 0, 0x8000_0000_0000,
+        |_| Routed), None);
+}
