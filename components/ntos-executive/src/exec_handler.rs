@@ -19682,7 +19682,12 @@ impl ExecNtHandler {
         }
         match operation {
             PNP_GET_DEVICE_STATUS => {
-                let (status, problem) = self.pnp_runtime_status(&instance);
+                let (explicit_status, explicit_problem) = self.pnp_runtime_status(&instance);
+                let (status, problem) = nt_pnp_manager::device_status_from_lifecycle(
+                    driver_launch::hosted_pnp_device_state_for_instance(&instance),
+                    explicit_status,
+                    explicit_problem,
+                );
                 if !self.xas_write_u32(buffer + 20, status)
                     || !self.xas_write_u32(buffer + 24, problem)
                 {
