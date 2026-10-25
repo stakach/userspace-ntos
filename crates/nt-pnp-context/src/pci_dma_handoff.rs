@@ -4,6 +4,20 @@ use alloc::vec::Vec;
 
 const PAGE_BYTES: u64 = 0x1000;
 
+/// Entire page-aligned native DMA aperture inside one mapped IOMMU leaf-table span.
+/// Reserving less than this loses legitimate large common-buffer allocations while
+/// the caller still owns and maps every returned page explicitly.
+pub const fn confined_dma_window_pages(start_iova: u64, leaf_span: u64) -> Option<u64> {
+    if start_iova == 0
+        || start_iova & (PAGE_BYTES - 1) != 0
+        || leaf_span & (PAGE_BYTES - 1) != 0
+        || start_iova >= leaf_span
+    {
+        return None;
+    }
+    Some((leaf_span - start_iova) / PAGE_BYTES)
+}
+
 /// Physical PCI function and the discovery generation that authorized it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PciController {
@@ -229,6 +243,11 @@ impl PciDmaHandoff {
 
     pub fn state(&self, key: PciController, root: u64) -> Result<ControllerState, Error> {
         Ok(self.record(key, root)?.state)
+    }
+
+    /// Observe outstanding exact boot commands without changing their ownership.
+    pub fn outstanding_boot_io_count(&self, key: PciController, root: u64) -> Result<usize, Error> {
+        Ok(self.record(key, root)?.boot_io.len())
     }
 
     pub fn native_route(&self, key: PciController, root: u64) -> Result<Option<u64>, Error> {
@@ -516,6 +535,16 @@ impl PciDmaHandoff {
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_dma_aperture_holds_page_rounded_storport_request_pool() {
+        let pages = confined_dma_window_pages(0x2000, 0x20_0000).unwrap();
+        assert!(pages * PAGE_BYTES >= 256 * PAGE_BYTES);
+        assert_eq!(0x2000 + pages * PAGE_BYTES, 0x20_0000);
+        assert_eq!(confined_dma_window_pages(0, 0x20_0000), None);
+        assert_eq!(confined_dma_window_pages(0x2100, 0x20_0000), None);
+        assert_eq!(confined_dma_window_pages(0x20_0000, 0x20_0000), None);
+    }
+
     const AHCI: PciController = PciController::new(0, 2, 0, 7).unwrap();
     const NEXT_GENERATION: PciController = PciController::new(0, 2, 0, 8).unwrap();
 
@@ -622,10 +651,13 @@ mod tests {
     fn boot_io_drains_before_native_start_and_never_reopens_after_activation() {
         let mut ledger = ledger();
         let ticket = ledger.enter_boot_io(AHCI, 41).unwrap();
+        assert_eq!(ledger.outstanding_boot_io_count(AHCI, 41), Ok(1));
+        assert_eq!(ledger.outstanding_boot_io_count(NEXT_GENERATION, 41), Err(Error::WrongController));
         let native = ledger.reserve_window(AHCI, 41, 0x2000, 1).unwrap();
         ledger.begin_map(AHCI, 41, native).unwrap();
         ledger.confirm_map(AHCI, 41, native).unwrap();
         ledger.begin_drain(AHCI, 41).unwrap();
+        assert_eq!(ledger.outstanding_boot_io_count(AHCI, 41), Ok(1));
         assert_eq!(ledger.enter_boot_io(AHCI, 41), Err(Error::WrongPhase));
         assert_eq!(
             ledger.begin_native_start(AHCI, 41),
@@ -636,6 +668,7 @@ mod tests {
             Err(Error::WrongController)
         );
         ledger.complete_boot_io(AHCI, 41, ticket).unwrap();
+        assert_eq!(ledger.outstanding_boot_io_count(AHCI, 41), Ok(0));
         ledger.begin_native_start(AHCI, 41).unwrap();
         assert_eq!(ledger.state(AHCI, 41), Ok(ControllerState::NativeStarting));
         assert_eq!(ledger.enter_boot_io(AHCI, 41), Err(Error::WrongPhase));
