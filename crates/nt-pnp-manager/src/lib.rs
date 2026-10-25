@@ -13,6 +13,8 @@ extern crate alloc;
 mod accepted_pdo_filter_edge;
 mod accepted_pdo_direct_filter_edge;
 mod accepted_pdo_pnp;
+mod existing_device_start_service;
+pub use existing_device_start_service::*;
 mod accepted_pdo_provider;
 mod bus_properties;
 mod bus_relations;
