@@ -442,6 +442,23 @@ impl<D: SnapshotBlockDevice> WalSnapshotAnchorUpdate<D> {
             .map(|(device, token, pair, _)| (device, token, pair))
     }
 
+    /// Mint an exact newly committed payload receipt only after both header flushes.
+    /// A recovered prefix may advance the anchor, but cannot publish a new mutation.
+    pub fn into_anchored_publication(self)
+        -> Result<(D, super::AnchoredWalPublication), Self>
+    {
+        if self.phase != Phase::Complete || self.continuation.is_none()
+            || self.paired_proof.is_none() || self.newly_committed_payload.is_none()
+        {
+            return Err(self);
+        }
+        match self.into_continuation_pair_and_payload() {
+            Ok((device, continuation, pair, Some(payload))) =>
+                Ok((device, super::AnchoredWalPublication::from_parts(continuation, pair, payload))),
+            _ => unreachable!("completed anchor retains newly committed payload"),
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn into_device_for_test(mut self) -> D {
         self.phase = Phase::Complete;

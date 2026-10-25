@@ -109,7 +109,10 @@ pub use snapshot_store::{
 pub use snapshot_reserve::{SnapshotReserve, SnapshotReserveLease};
 pub use snapshot_region::{BoundedBlockRange, OwnedBoundedBlockRange};
 pub use registry_wal_store::{AsyncWalIoKind, AsyncWalIoRequest, AsyncWalRefusal, RegistryWal, RegistryWalContinuation, RegistryWalError, RegistryWalRecord, RegistryWalState, RegistryWalVerifiedDevice, RegistryWalVerifiedPrefix};
-pub use hive_wal_publication::{publish_anchored_hive_value, HiveWalPublicationError, HiveWalPublicationRefusal};
+pub use hive_wal_publication::{
+    publish_anchored_hive_child, publish_anchored_hive_value,
+    HiveChildWalPublicationRefusal, HiveWalPublicationError, HiveWalPublicationRefusal,
+};
 pub use volume_wal_payload::{decode_volume_wal_payload, encode_hive_log_wal_payload, HiveLogWalPayload, HiveLogWalReplay, HiveLogWalReplayError, VolumeWalPayload, VolumeWalPayloadError};
 mod snapshot_baseline_repair;
 pub use snapshot_baseline_repair::WalSnapshotBaselineRepair;
