@@ -1852,9 +1852,34 @@ impl PnpManager {
         Ok(devnode.id)
     }
 
-    /// Build a PDO-only stack only from a successful, retained bus capability query.
-    /// No FDO or function-driver identity is fabricated for this devnode.
+    /// Build a root PDO-only stack from its published bus capability query.
+    /// A bus child must instead prove that its accepted parent relation is still current.
     pub fn commit_raw_pdo_stack(&mut self, pdo_object_id: u64) -> Result<u64, PnpError> {
+        if self.parent_relation_for_pdo(pdo_object_id).is_some() {
+            return Err(PnpError::InvalidTransition);
+        }
+        self.commit_raw_pdo_stack_inner(pdo_object_id)
+    }
+
+    /// Build a bus child PDO-only stack under its exact accepted parent relation.
+    pub fn commit_raw_pdo_stack_for_current_relation(
+        &mut self,
+        relations: &BusRelationTable,
+        pdo_object_id: u64,
+    ) -> Result<u64, PnpError> {
+        let parent_relation = self
+            .parent_relation_for_pdo(pdo_object_id)
+            .ok_or(PnpError::InvalidIdentity)?;
+        if !self.relation_parent_is_started(parent_relation)
+            || !relations.relation_contains(parent_relation.relation, pdo_object_id)
+        {
+            return Err(PnpError::StalePublication);
+        }
+        self.commit_raw_pdo_stack_inner(pdo_object_id)
+    }
+
+    /// No FDO or function-driver identity is fabricated for this devnode.
+    fn commit_raw_pdo_stack_inner(&mut self, pdo_object_id: u64) -> Result<u64, PnpError> {
         let devnode = self.devnodes.iter_mut().find(|devnode| {
             devnode.pdo_object_id == pdo_object_id && devnode.pdo_properties.is_some()
         }).ok_or(PnpError::StaleId)?;
@@ -1874,6 +1899,34 @@ impl PnpManager {
             _ => return Err(PnpError::InvalidTransition),
         }
         Ok(devnode.id)
+    }
+
+    /// Direct START may enter the accepted PDO provider only for a current, resource-assigned
+    /// raw child that has no function stack and no in-flight lifecycle effect.
+    pub fn raw_pdo_start_admissible(
+        &self,
+        relations: &BusRelationTable,
+        pdo_object_id: u64,
+    ) -> bool {
+        let Some(devnode) = self.devnodes.iter().find(|devnode| {
+            devnode.pdo_object_id == pdo_object_id && devnode.pdo_properties.is_some()
+        }) else {
+            return false;
+        };
+        let Some(parent_relation) = devnode.parent_relation else {
+            return false;
+        };
+        devnode.state == DeviceState::ResourcesAssigned
+            && devnode.fdo_object_id == 0
+            && devnode.driver_id == 0
+            && devnode.pending_dispatch.is_none()
+            && devnode.negotiation.is_none()
+            && devnode.remove_ready.is_none()
+            && devnode.pdo_properties.as_ref()
+                .and_then(|properties| properties.capabilities.as_ref())
+                .is_some_and(|capabilities| capabilities.raw_device_ok)
+            && self.relation_parent_is_started(parent_relation)
+            && relations.relation_contains(parent_relation.relation, pdo_object_id)
     }
 
     /// Roll back a stack that never became externally visible to PnP clients.
@@ -2915,6 +2968,45 @@ mod tests {
         relations.commit_bus_relations(unrelated).unwrap();
         p.commit_resource_assignment_for_current_relation(&relations, 0x1235, vec![3], vec![4])
             .unwrap();
+    }
+
+    #[test]
+    fn raw_pdo_stack_rejects_stale_accepted_parent_relation() {
+        let mut p = PnpManager::new();
+        let parent_pdo = 0x9a00;
+        create_started_parent(&mut p, parent_pdo);
+        let first = BusReportedChild::new(
+            0x9a01, r"ACPI\RAW", "0001", &[r"ACPI\RAW"], &[] as &[&str],
+        );
+        let second = BusReportedChild::new(
+            0x9a02, r"ACPI\RAW", "0002", &[r"ACPI\RAW"], &[] as &[&str],
+        );
+        let mut relations = BusRelationTable::new();
+        relations.seed_bus_relations(parent_pdo, &[]).unwrap();
+        let prepared = relations.prepare_bus_relations(parent_pdo, &[first.clone(), second.clone()]).unwrap();
+        let parent_relation = p.claim_started_parent_relation(parent_pdo, prepared.relation_identity()).unwrap();
+        let raw_properties = || {
+            let mut properties = pci_properties();
+            properties.capabilities.as_mut().unwrap().raw_device_ok = true;
+            properties
+        };
+        let children = p.prepare_enumerated_pdo_batch(vec![
+            EnumeratedPdoRecord::new(first.enum_instance_path(), first.pdo_object_id, raw_properties())
+                .with_parent_relation(parent_relation),
+            EnumeratedPdoRecord::new(second.enum_instance_path(), second.pdo_object_id, raw_properties())
+                .with_parent_relation(parent_relation),
+        ]).unwrap();
+        p.commit_enumerated_pdo_batch(children).unwrap();
+        relations.commit_bus_relations(prepared).unwrap();
+
+        assert_eq!(p.commit_raw_pdo_stack(first.pdo_object_id), Err(PnpError::InvalidTransition));
+        assert!(p.commit_raw_pdo_stack_for_current_relation(&relations, first.pdo_object_id).is_ok());
+        let second_id = p.devnode_for_pdo(second.pdo_object_id).unwrap();
+        let removed = relations.prepare_bus_relations(parent_pdo, &[first]).unwrap();
+        relations.commit_bus_relations(removed).unwrap();
+        assert_eq!(p.commit_raw_pdo_stack_for_current_relation(&relations, second.pdo_object_id),
+            Err(PnpError::StalePublication));
+        assert_eq!(p.state(second_id), Some(DeviceState::Enumerated));
     }
 
     #[test]

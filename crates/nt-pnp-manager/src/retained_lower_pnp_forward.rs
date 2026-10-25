@@ -699,9 +699,10 @@ mod tests {
         provider: HostedDevicePointerRegistration,
     }
 
-    fn fixture_with_bus(
+    fn fixture_with_bus_capability(
         backend: Box<dyn DriverDispatchBackend>,
         bus_information: PnpBusInformation,
+        raw_device_ok: bool,
     ) -> Fixture {
         let mut io = IoManager::new(MockObjectPort::new());
         let client = io.register_client();
@@ -770,7 +771,7 @@ mod tests {
                 removable: false,
                 eject_supported: false,
                 surprise_removal_ok: false,
-                raw_device_ok: false,
+                raw_device_ok,
                 address: 0,
             },
             PropertyBlobState::KnownNone,
@@ -805,6 +806,13 @@ mod tests {
             consumer_address: 0x2000,
             provider,
         }
+    }
+
+    fn fixture_with_bus(
+        backend: Box<dyn DriverDispatchBackend>,
+        bus_information: PnpBusInformation,
+    ) -> Fixture {
+        fixture_with_bus_capability(backend, bus_information, false)
     }
 
     fn fixture(backend: Box<dyn DriverDispatchBackend>) -> Fixture {
@@ -1040,6 +1048,105 @@ mod tests {
         assert_eq!(terminal.status(), NtStatus::SUCCESS);
         assert_eq!(terminal.retire(&mut fixture.io).unwrap(), NtStatus::SUCCESS);
         fixture.io.discard_prepared_external_pnp(outer).unwrap();
+    }
+
+    #[test]
+    fn direct_raw_pdo_start_retains_one_canonical_irp_until_provider_ack_and_pnp_receipt() {
+        let bus = PnpBusInformation {
+            bus_type_guid: GUID_BUS_TYPE_PCI,
+            legacy_bus_type: INTERFACE_TYPE_PCI_BUS,
+            bus_number: 0,
+        };
+        let mut nonraw = fixture_with_bus(Box::new(StartBackend), bus.clone());
+        let nonraw_pdo = nonraw.provider.device_id();
+        assert!(crate::PreparedAcceptedPdoPnp::start_direct(
+            &nonraw.pnp, &nonraw.relations, &nonraw.providers, &mut nonraw.io,
+            nonraw_pdo, nonraw.client, 0, 0, 0, Vec::new(),
+        ).is_err());
+
+        let mut fixture = fixture_with_bus_capability(Box::new(StartBackend), bus, true);
+        let pdo = fixture.provider.device_id();
+        let devnode = fixture.pnp.devnode_for_pdo(pdo.raw()).unwrap();
+        fixture.pnp.commit_raw_pdo_stack_for_current_relation(&fixture.relations, pdo.raw()).unwrap();
+        fixture.pnp.commit_resource_assignment_for_current_relation(
+            &fixture.relations, pdo.raw(), Vec::new(), Vec::new(),
+        ).unwrap();
+        let prepared = crate::PreparedAcceptedPdoPnp::start_direct(
+            &fixture.pnp, &fixture.relations, &fixture.providers, &mut fixture.io,
+            pdo, fixture.client, 0, 0, 0, Vec::new(),
+        ).unwrap();
+        let identity = prepared.identity();
+        assert_eq!(identity.outer_irp, prepared.provider_irp());
+        let token = fixture.pnp.begin_pnp_dispatch(
+            pdo.raw(), crate::PnpMinor::StartDevice, prepared.provider_irp().raw(),
+        ).unwrap();
+        let invocation = prepared.begin(
+            &fixture.pnp, &fixture.relations, &fixture.providers, &mut fixture.io, identity,
+        ).unwrap();
+        let returned = invocation.invoke(|_, projection| {
+            assert_eq!(projection.device_id, pdo);
+            PnpBackendDispatch::Returned { status: NtStatus::SUCCESS, information: 0 }
+        });
+        let mut terminal = match returned.finish(&mut fixture.io).unwrap() {
+            crate::AcceptedPdoPnpResult::Terminal(terminal) => terminal,
+            result => panic!("unexpected direct START result: {result:?}"),
+        };
+        assert_eq!(fixture.pnp.state(devnode), Some(crate::DeviceState::StartIrpSent));
+        terminal.acknowledge_provider(&mut fixture.io).unwrap();
+        let receipt = terminal.retire_with_receipt(&mut fixture.io).unwrap();
+        fixture.pnp.complete_start_device_dispatch(&token, pdo.raw(), receipt).unwrap();
+        assert_eq!(fixture.pnp.state(devnode), Some(crate::DeviceState::Started));
+    }
+
+    #[test]
+    fn direct_raw_pdo_pending_start_waits_for_exact_completion_ack() {
+        let mut fixture = fixture_with_bus_capability(
+            Box::new(StartBackend),
+            PnpBusInformation {
+                bus_type_guid: GUID_BUS_TYPE_PCI,
+                legacy_bus_type: INTERFACE_TYPE_PCI_BUS,
+                bus_number: 0,
+            },
+            true,
+        );
+        let pdo = fixture.provider.device_id();
+        let devnode = fixture.pnp.devnode_for_pdo(pdo.raw()).unwrap();
+        fixture.pnp.commit_raw_pdo_stack_for_current_relation(&fixture.relations, pdo.raw()).unwrap();
+        fixture.pnp.commit_resource_assignment_for_current_relation(
+            &fixture.relations, pdo.raw(), Vec::new(), Vec::new(),
+        ).unwrap();
+        let prepared = crate::PreparedAcceptedPdoPnp::start_direct(
+            &fixture.pnp, &fixture.relations, &fixture.providers, &mut fixture.io,
+            pdo, fixture.client, 0, 0, 0, Vec::new(),
+        ).unwrap();
+        let identity = prepared.identity();
+        let token = fixture.pnp.begin_pnp_dispatch(
+            pdo.raw(), crate::PnpMinor::StartDevice, prepared.provider_irp().raw(),
+        ).unwrap();
+        let invocation = prepared.begin(
+            &fixture.pnp, &fixture.relations, &fixture.providers, &mut fixture.io, identity,
+        ).unwrap();
+        let provider_irp = invocation.provider_irp();
+        let returned = invocation.invoke(|_, _| PnpBackendDispatch::Pending);
+        let retained = match returned.finish(&mut fixture.io).unwrap() {
+            crate::AcceptedPdoPnpResult::Retained(retained) => retained,
+            result => panic!("unexpected pending direct START: {result:?}"),
+        };
+        assert_eq!(fixture.pnp.state(devnode), Some(crate::DeviceState::StartIrpSent));
+        let driver = fixture.io.irp(provider_irp).unwrap().current_stack().unwrap().driver_id;
+        assert!(fixture.io.publish_driver_completion(driver, DriverCompletion {
+            irp_id: provider_irp, status: NtStatus::SUCCESS, information: 0, file_context: None,
+        }));
+        let invocation = retained.prepare_completion(&mut fixture.io, identity).unwrap();
+        let returned = invocation.invoke(|_| nt_io_manager::CompletionAcknowledgement::Acknowledged);
+        let terminal = match returned.finish(&mut fixture.io).unwrap() {
+            crate::AcceptedPdoPnpResult::Terminal(terminal) => terminal,
+            result => panic!("unexpected direct START completion: {result:?}"),
+        };
+        assert!(terminal.provider_acknowledged());
+        let receipt = terminal.retire_with_receipt(&mut fixture.io).unwrap();
+        fixture.pnp.complete_start_device_dispatch(&token, pdo.raw(), receipt).unwrap();
+        assert_eq!(fixture.pnp.state(devnode), Some(crate::DeviceState::Started));
     }
 
     #[test]
