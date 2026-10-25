@@ -151,6 +151,26 @@ pub const fn existing_device_start_disposition(
     }
 }
 
+/// Report a devnode's started bit from its canonical PnP lifecycle.
+///
+/// A Configuration Manager instance or a caller-written status record does not prove that its
+/// START transaction completed. Preserve the other explicit status/problem bits, but never let
+/// a stale record assert `DN_STARTED` for an absent or nonstarted hosted devnode.
+pub const fn device_status_from_lifecycle(
+    state: Option<DeviceState>,
+    explicit_status: u32,
+    explicit_problem: u32,
+) -> (u32, u32) {
+    const DN_STARTED: u32 = 0x0000_0008;
+    let status = (explicit_status & !DN_STARTED)
+        | if matches!(state, Some(DeviceState::Started)) {
+            DN_STARTED
+        } else {
+            0
+        };
+    (status, explicit_problem)
+}
+
 /// Pure coordinator for one live CM notification.
 ///
 /// `PlugPlayControlUserResponse` retires the notification independently of the later device-install
@@ -3727,6 +3747,25 @@ mod tests {
             existing_device_start_disposition(None),
             ExistingDeviceStartDisposition::RequiresAction
         );
+    }
+
+    #[test]
+    fn device_status_started_bit_follows_canonical_lifecycle() {
+        const DN_STARTED: u32 = 0x0000_0008;
+        const DN_HAS_PROBLEM: u32 = 0x0000_0400;
+        let explicit = DN_HAS_PROBLEM | 0x0000_0002;
+
+        assert_eq!(
+            device_status_from_lifecycle(Some(Started), explicit, 0x25),
+            (explicit | DN_STARTED, 0x25),
+        );
+        for state in [None, Some(Enumerated), Some(StartIrpSent), Some(Stopped), Some(Failed)] {
+            assert_eq!(
+                device_status_from_lifecycle(state, explicit | DN_STARTED, 0x25),
+                (explicit, 0x25),
+                "nonstarted devnode must not inherit a stale started flag: {state:?}",
+            );
+        }
     }
 
     #[test]
