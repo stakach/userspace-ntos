@@ -4,9 +4,7 @@
 //! A borrowed dispatch buffer cannot survive native SCSI transport entry.
 
 use alloc::vec::Vec;
-use crate::{FatPathError, FatPathGeometry, FatRangeLookup, FatRangeProgress, FatRangeRequest, FatVerifiedChain, STATUS_DATA_ERROR};
-#[cfg(test)]
-use crate::FatRangeRequestKind;
+use crate::{FatPathError, FatPathGeometry, FatRangeLookup, FatRangeProgress, FatRangeRequest, FatRangeRequestKind, FatVerifiedChain, STATUS_DATA_ERROR};
 
 // The installed layer is immutable for this mount generation. A larger file remains readable
 // when a bounded chain index stops growing; the cursor resumes from its longest proven prefix.
@@ -37,6 +35,18 @@ pub struct ReadSectorClaim {
     pub request: FatRangeRequest,
     pub sectors: u32,
     pub generation: u64,
+}
+
+impl ReadSectorClaim {
+    /// The installed layer is immutable for this mount generation. File data and multi-sector
+    /// claims retain their own completion ownership and cannot share this metadata cache.
+    pub const fn installed_fat_metadata_sector(self) -> Option<u32> {
+        if matches!(self.request.kind, FatRangeRequestKind::Fat) && self.sectors == 1 {
+            Some(self.request.sector)
+        } else {
+            None
+        }
+    }
 }
 
 struct Entry {
@@ -291,6 +301,27 @@ impl ReadCompletions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_single_sector_fat_reads_are_installed_metadata() {
+        let mut claim = ReadSectorClaim {
+            irp: 1,
+            mount: 2,
+            file: 3,
+            request: FatRangeRequest { sector: 42, kind: FatRangeRequestKind::Fat },
+            sectors: 1,
+            generation: 4,
+        };
+        assert_eq!(claim.installed_fat_metadata_sector(), Some(42));
+
+        claim.request.kind = FatRangeRequestKind::Data;
+        assert_eq!(claim.installed_fat_metadata_sector(), None);
+        claim.sectors = 4;
+        assert_eq!(claim.installed_fat_metadata_sector(), None);
+
+        claim.request.kind = FatRangeRequestKind::Fat;
+        assert_eq!(claim.installed_fat_metadata_sector(), None);
+    }
 
     #[test]
     fn pending_read_retains_output_until_exact_ack() {

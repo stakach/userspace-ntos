@@ -81,3 +81,23 @@ impl<K: Copy + Eq, const N: usize> InstalledMetadataSectorCache<K, N> {
 impl<K: Copy + Eq, const N: usize> Default for InstalledMetadataSectorCache<K, N> {
     fn default() -> Self { Self::new() }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copied_metadata_requires_the_exact_mount_and_provider_generation() {
+        let mut cache = InstalledMetadataSectorCache::<(u64, u64), 2>::new();
+        let mut provider_bytes = [0x5a; 512];
+        assert!(!cache.publish((7, 11), 42, &provider_bytes));
+        provider_bytes.fill(0);
+
+        assert_eq!(cache.lookup((7, 11), 42), Some(&[0x5a; 512]));
+        assert_eq!(cache.lookup((8, 11), 42), None);
+        assert_eq!(cache.lookup((7, 12), 42), None);
+        assert_eq!(cache.lookup((7, 11), 43), None);
+        cache.invalidate();
+        assert_eq!(cache.lookup((7, 11), 42), None);
+    }
+}
