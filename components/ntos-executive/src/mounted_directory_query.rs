@@ -42,13 +42,15 @@ impl MountedVolumeBackend {
             .ok_or(NtStatus::DEVICE_NOT_READY)?;
         if route_kind != nt_fs::BlockSourceKind::Boot {
             if let Some(cluster) = binding.installed_directory_cluster {
-                let relative = self.directories
-                    .get(binding.directory_open.ok_or(NtStatus::INVALID_HANDLE)?)
-                    .map_err(status)?.volume_relative_path();
-                let mut owned_relative = Vec::new();
-                owned_relative.try_reserve_exact(relative.len())
-                    .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
-                owned_relative.extend_from_slice(relative);
+                let installed_path = match record.source {
+                    nt_fs::LayeredOpenSource::Installed { .. } => Some(self.directories
+                        .get(binding.directory_open.ok_or(NtStatus::INVALID_HANDLE)?)
+                        .map_err(status)?.volume_relative_path()),
+                    nt_fs::LayeredOpenSource::Overlay { .. } => None,
+                };
+                let source = directory_source::capture_directory_source(
+                    record.source, record.name, installed_path,
+                ).map_err(status)?;
                 let mut output = Vec::new();
                 output.try_reserve_exact(length).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
                 output.resize(length, 0);
@@ -62,8 +64,8 @@ impl MountedVolumeBackend {
                     .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
                 self.pending_directories.borrow_mut().capture(irp.irp_id.raw(),
                     physical_mount.value(), CapturedDirectory {
-                        irp: irp.irp_id, file: file_id, context, relative: owned_relative,
-                        overlay_file: None, parameters: parameters.clone(),
+                        irp: irp.irp_id, file: file_id, context, relative: source.relative,
+                        overlay_file: source.overlay_file, parameters: parameters.clone(),
                         return_single: irp.flags.contains(nt_io_manager::StackFlags::RETURN_SINGLE_ENTRY),
                         restart_scan: irp.flags.contains(nt_io_manager::StackFlags::RESTART_SCAN),
                         output,

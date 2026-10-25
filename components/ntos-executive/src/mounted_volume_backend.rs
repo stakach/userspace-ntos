@@ -71,6 +71,8 @@ struct CompletedDirectory {
 
 #[path = "mounted_directory_query.rs"]
 mod directory_query;
+#[path = "mounted_directory_source.rs"]
+mod directory_source;
 
 // Directory and installed-file handles encode a 16-bit slot index plus a 16-bit generation.
 // This is the identity-schema ceiling, not an eagerly allocated resource reservation.
