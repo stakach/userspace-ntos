@@ -17,6 +17,12 @@ pub enum LoadPlanError {
     NoCapacity,
 }
 
+/// Search the driver directory only when System32 lookup established absence. Invalid names
+/// and other failures remain terminal, preserving the original error.
+pub const fn retry_driver_path(status: u32) -> bool {
+    matches!(status, 0xc000_0034 | 0xc000_003a)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     NeedRead,
@@ -245,5 +251,13 @@ mod tests {
         assert_eq!(plan.next(), Some(LoadAction::Map("cdd.dll".into())));
         plan.mapped("cdd.dll").unwrap();
         assert_eq!(plan.next(), None);
+    }
+
+    #[test]
+    fn invalid_name_does_not_trigger_driver_directory_fallback() {
+        assert!(retry_driver_path(0xc000_0034));
+        assert!(retry_driver_path(0xc000_003a));
+        assert!(!retry_driver_path(0xc000_0033));
+        assert!(!retry_driver_path(0xc000_009a));
     }
 }
