@@ -17,6 +17,55 @@ fn queued() -> (ProcessDeletionCandidateTable<2>, ProcessDeletionCandidate) {
 }
 
 #[test]
+fn retained_process_object_does_not_consume_reused_execution_slot() {
+    let (mut table, first) = queued();
+    // A terminated process can retain EPROCESS/ETHREAD handles in CSRSS after its execution
+    // resources are retired. A later process may use the same pi and terminate before those
+    // handles close. Both exact deletion owners must survive until their own references drain.
+    let second = ProcessDeletionCandidate::from_mechanism(
+        ProcessMechanism {
+            pi: first.pi,
+            pid: 13,
+            main_tid: 21,
+            top_badge: 2,
+            generation: first.generation + 1,
+        },
+        true,
+    );
+    assert_eq!(table.queue(second), Ok(true));
+    assert_eq!(table.live_len(), 2);
+    assert_eq!(table.get(first.pi), None);
+    assert_eq!(table.get_exact(first.pi, first.pid, first.generation), Some(first));
+    assert_eq!(table.get_exact(second.pi, second.pid, second.generation), Some(second));
+    assert_eq!(table.iter().collect::<Vec<_>>(), Vec::from([first, second]));
+}
+
+#[test]
+fn reused_slot_retains_each_owner_receipt_independently() {
+    let (mut table, first) = queued();
+    let second = ProcessDeletionCandidate { pid: 13, generation: 8, ..first };
+    table.queue(second).unwrap();
+    let first_ack = table.acknowledge_lpc_rundown_exact(first).unwrap();
+    assert_eq!(table.queue(first), Ok(false));
+    assert_eq!(table.get_exact(1, 12, 7), Some(first_ack));
+    assert_eq!(table.get_exact(1, 13, 8), Some(second));
+    assert_eq!(table.acknowledge_lpc_rundown_exact(first), Err(MechanismError::StaleIdentity));
+    let second_ack = table.acknowledge_lpc_rundown_exact(second).unwrap();
+    assert_eq!(table.get_exact(1, 12, 7), Some(first_ack));
+    assert_eq!(table.get_exact(1, 13, 8), Some(second_ack));
+    assert_eq!(table.remove_exact(first_ack), Err(MechanismError::InvalidIdentity));
+}
+
+#[test]
+fn failed_owner_reservation_keeps_existing_receipts() {
+    let (mut table, first) = queued();
+    let ack = table.acknowledge_lpc_rundown_exact(first).unwrap();
+    assert_eq!(table.try_reserve(usize::MAX), Err(MechanismError::InsufficientResources));
+    assert_eq!(table.get_exact(first.pi, first.pid, first.generation), Some(ack));
+    assert_eq!(table.live_len(), 1);
+}
+
+#[test]
 fn acknowledged_rundown_is_once_only_and_cannot_be_discarded_or_reset() {
     let (mut table, initial) = queued();
     let acknowledged = table.acknowledge_lpc_rundown_exact(initial).unwrap();
