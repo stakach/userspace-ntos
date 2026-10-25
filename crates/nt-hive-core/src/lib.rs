@@ -20,6 +20,7 @@ mod config_import;
 mod hive;
 mod io;
 mod overlay;
+mod quiesce;
 mod reactos_registration;
 pub mod registry_wal;
 pub mod writeback_owner;
@@ -29,6 +30,8 @@ pub use boot_object_policy::{
 };
 
 pub use overlay::{canon_path, RegistryOverlay};
+pub use quiesce::{v2_hive_quiesce_decision, HiveJournalEvidence, HiveQuiesceDecision,
+    VolumeSnapshotEvidence};
 pub use reactos_registration::{
     collect_reactos_network_adapter_bindings, reactos_network_ipv4_defaults_for_interface,
     reactos_time_zone_index_for_language, reactos_time_zone_setup_from_mutable_hives,
