@@ -257,6 +257,7 @@ pub fn copy_device_capabilities_x64(
     Ok(crate::PdoCapabilities {
         eject_supported: flags & (1 << 3) != 0,
         removable: flags & (1 << 4) != 0,
+        raw_device_ok: flags & (1 << 6) != 0,
         surprise_removal_ok: flags & (1 << 9) != 0,
         address: u32::from_le_bytes(
             prefix[DEVICE_CAPABILITIES_ADDRESS_OFFSET..DEVICE_CAPABILITIES_ADDRESS_OFFSET + 4]
@@ -383,7 +384,7 @@ mod tests {
         );
 
         let mut returned = initialized;
-        returned[4..8].copy_from_slice(&((1u32 << 3) | (1 << 4) | (1 << 9)).to_le_bytes());
+        returned[4..8].copy_from_slice(&((1u32 << 3) | (1 << 4) | (1 << 6) | (1 << 9)).to_le_bytes());
         returned[8..12].copy_from_slice(&7u32.to_le_bytes());
         assert_eq!(
             copy_device_capabilities_x64(&returned),
@@ -391,9 +392,12 @@ mod tests {
                 removable: true,
                 eject_supported: true,
                 surprise_removal_ok: true,
+                raw_device_ok: true,
                 address: 7,
             })
         );
+        returned[4..8].copy_from_slice(&((1u32 << 3) | (1 << 4) | (1 << 9)).to_le_bytes());
+        assert!(!copy_device_capabilities_x64(&returned).unwrap().raw_device_ok);
         assert_eq!(
             copy_device_capabilities_x64(&returned[..63]),
             Err(BusPropertyCopyError::Truncated)

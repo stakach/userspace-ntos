@@ -324,6 +324,7 @@ pub struct StartDeviceLifecycleReceipt {
     start_status: u32,
 }
 
+#[derive(Clone, Copy)]
 struct StartDeviceIoTerminalIdentity {
     irp_id: u64,
     pdo_device_id: u64,
@@ -812,6 +813,8 @@ pub struct PdoCapabilities {
     pub removable: bool,
     pub eject_supported: bool,
     pub surprise_removal_ok: bool,
+    /// The bus permits the PDO to act as the complete device stack without a function driver.
+    pub raw_device_ok: bool,
     pub address: u32,
 }
 
@@ -1849,6 +1852,30 @@ impl PnpManager {
         Ok(devnode.id)
     }
 
+    /// Build a PDO-only stack only from a successful, retained bus capability query.
+    /// No FDO or function-driver identity is fabricated for this devnode.
+    pub fn commit_raw_pdo_stack(&mut self, pdo_object_id: u64) -> Result<u64, PnpError> {
+        let devnode = self.devnodes.iter_mut().find(|devnode| {
+            devnode.pdo_object_id == pdo_object_id && devnode.pdo_properties.is_some()
+        }).ok_or(PnpError::StaleId)?;
+        if !devnode.pdo_properties.as_ref().and_then(|properties| properties.capabilities.as_ref())
+            .is_some_and(|capabilities| capabilities.raw_device_ok)
+            || devnode.fdo_object_id != 0
+            || devnode.driver_id != 0
+            || devnode.pending_dispatch.is_some()
+            || devnode.negotiation.is_some()
+            || devnode.remove_ready.is_some()
+        {
+            return Err(PnpError::InvalidTransition);
+        }
+        match devnode.state {
+            DeviceState::Enumerated => devnode.state = DeviceState::DeviceStackBuilt,
+            DeviceState::DeviceStackBuilt => {},
+            _ => return Err(PnpError::InvalidTransition),
+        }
+        Ok(devnode.id)
+    }
+
     /// Roll back a stack that never became externally visible to PnP clients.
     pub fn rollback_device_stack(
         &mut self,
@@ -2328,7 +2355,13 @@ impl PnpManager {
             || pending.canonical_irp_id != identity.canonical_irp_id
             || pending.minor != PnpMinor::StartDevice
             || pending_devnode.pdo_object_id != pdo_device_id
-            || pending_devnode.fdo_object_id != fdo_device_id
+            || (pending_devnode.fdo_object_id != fdo_device_id
+                && !(pending_devnode.fdo_object_id == 0
+                    && fdo_device_id == pdo_device_id
+                    && pending_devnode.pdo_properties.as_ref()
+                        .and_then(|properties| properties.capabilities.as_ref())
+                        .is_some_and(|capabilities| capabilities.raw_device_ok)))
+            || (pending_devnode.fdo_object_id == 0 && completion_device_id != pdo_device_id)
         {
             return Err(PnpError::StaleDispatch);
         }
@@ -2345,7 +2378,12 @@ impl PnpManager {
             || devnode.pending_dispatch.is_some()
             || devnode.state != expected_state
             || devnode.pdo_object_id != pdo_device_id
-            || devnode.fdo_object_id != fdo_device_id
+            || (devnode.fdo_object_id != fdo_device_id
+                && !(devnode.fdo_object_id == 0
+                    && fdo_device_id == pdo_device_id
+                    && devnode.pdo_properties.as_ref()
+                        .and_then(|properties| properties.capabilities.as_ref())
+                        .is_some_and(|capabilities| capabilities.raw_device_ok)))
         {
             return Err(PnpError::StaleDispatch);
         }
@@ -2648,6 +2686,7 @@ mod tests {
                 removable: false,
                 eject_supported: false,
                 surprise_removal_ok: false,
+                raw_device_ok: false,
                 address: (3 << 16) | 1,
             },
             PropertyBlobState::Present(vec![9, 8]),
@@ -2765,6 +2804,7 @@ mod tests {
                 removable: true,
                 eject_supported: true,
                 surprise_removal_ok: false,
+                raw_device_ok: false,
                 address: 0,
             }),
             DeviceRemovalPolicy::ExpectOrderlyRemoval
@@ -2774,6 +2814,7 @@ mod tests {
                 removable: true,
                 eject_supported: false,
                 surprise_removal_ok: true,
+                raw_device_ok: false,
                 address: 0,
             }),
             DeviceRemovalPolicy::ExpectSurpriseRemoval
@@ -3895,6 +3936,64 @@ mod tests {
         assert_eq!(receipt.driver_pending(), driver_pending);
         assert_eq!(manager.state(id), Some(DeviceState::Started));
         receipt
+    }
+
+    #[test]
+    fn raw_pdo_start_requires_provider_capability_and_exact_terminal_irp() {
+        let mut manager = PnpManager::new();
+        let pdo = 0x7a00;
+        let mut raw = pci_properties();
+        raw.capabilities.as_mut().unwrap().raw_device_ok = true;
+        let id = manager.register_enumerated_pdo(r"ACPI\RAW\0001", pdo, raw).unwrap();
+        let other = 0x7a01;
+        manager.register_enumerated_pdo(r"ACPI\NORAW\0001", other, pci_properties()).unwrap();
+        assert_eq!(manager.commit_raw_pdo_stack(other), Err(PnpError::InvalidTransition));
+        assert_eq!(manager.state(id), Some(DeviceState::Enumerated));
+
+        manager.commit_raw_pdo_stack(pdo).unwrap();
+        manager.commit_resource_assignment(pdo, vec![], vec![]).unwrap();
+        let token = manager.begin_pnp_dispatch(pdo, PnpMinor::StartDevice, 0x7a02).unwrap();
+        assert_eq!(manager.state(id), Some(DeviceState::StartIrpSent));
+        let identity = StartDeviceIoTerminalIdentity {
+            irp_id: 0x7a02,
+            pdo_device_id: pdo,
+            origin_driver_id: 0x44,
+            completion_driver_id: 0x44,
+            completion_device_id: pdo,
+            minor: PnpMinor::StartDevice.raw(),
+            driver_pending: true,
+            start_status: 0,
+        };
+        let mut wrong = identity;
+        wrong.completion_device_id = other;
+        assert_eq!(manager.complete_start_device_dispatch_identity(&token, pdo, wrong),
+            Err(PnpError::StaleDispatch));
+        assert_eq!(manager.state(id), Some(DeviceState::StartIrpSent));
+        manager.complete_start_device_dispatch_identity(&token, pdo, identity).unwrap();
+        assert_eq!(manager.state(id), Some(DeviceState::Started));
+        assert_eq!(manager.begin_pnp_dispatch(pdo, PnpMinor::StartDevice, 0x7a03),
+            Err(PnpError::InvalidTransition));
+
+        let failed_pdo = 0x7a04;
+        let mut raw = pci_properties();
+        raw.capabilities.as_mut().unwrap().raw_device_ok = true;
+        let failed_id = manager.register_enumerated_pdo(r"ACPI\RAW\0002", failed_pdo, raw).unwrap();
+        manager.commit_raw_pdo_stack(failed_pdo).unwrap();
+        manager.commit_resource_assignment(failed_pdo, vec![], vec![]).unwrap();
+        let failed_token = manager.begin_pnp_dispatch(failed_pdo, PnpMinor::StartDevice, 0x7a05).unwrap();
+        manager.complete_start_device_dispatch_identity(&failed_token, failed_pdo,
+            StartDeviceIoTerminalIdentity {
+                irp_id: 0x7a05,
+                pdo_device_id: failed_pdo,
+                origin_driver_id: 0x44,
+                completion_driver_id: 0x44,
+                completion_device_id: failed_pdo,
+                minor: PnpMinor::StartDevice.raw(),
+                driver_pending: false,
+                start_status: 0xC000_0001,
+            }).unwrap();
+        assert_eq!(manager.state(failed_id), Some(DeviceState::Failed));
+        assert_eq!(device_status_from_lifecycle(manager.state(failed_id), 0, 0).0 & 8, 0);
     }
 
     #[test]
