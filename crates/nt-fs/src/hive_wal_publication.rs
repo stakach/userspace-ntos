@@ -1,6 +1,9 @@
 //! Publication of a mounted hive edit only from the exact newly anchored WAL payload.
 
-use nt_hive_core::{CellId, MutableHiveSet, OwnedPreparedCreateChild, OwnedPreparedSetValue};
+use nt_hive_core::{
+    CellId, MutableHiveSet, OwnedPreparedCreateChild, OwnedPreparedSetKeySecurity,
+    OwnedPreparedSetValue,
+};
 
 use crate::{
     decode_volume_wal_payload, AnchoredWalPublication, HiveLogWalPayload,
@@ -21,6 +24,10 @@ pub type HiveWalPublicationRefusal =
 /// A refused child keeps both the retained hive edit and the exact anchor receipt.
 pub type HiveChildWalPublicationRefusal =
     (HiveWalPublicationError, OwnedPreparedCreateChild, AnchoredWalPublication);
+
+/// A refused security edit retains both the prepared descriptor and anchor receipt.
+pub type HiveSecurityWalPublicationRefusal =
+    (HiveWalPublicationError, OwnedPreparedSetKeySecurity, AnchoredWalPublication);
 
 fn matches_exact_hive_record(
     anchored: &AnchoredWalPublication,
@@ -87,4 +94,27 @@ pub fn publish_anchored_hive_child(
     };
     let (continuation, pair, _) = anchored.into_parts();
     Ok((child, continuation, pair))
+}
+
+/// Publish one key security descriptor only from its exact newly anchored hive log record.
+pub fn publish_anchored_hive_security(
+    set: &mut MutableHiveSet,
+    mut prepared: OwnedPreparedSetKeySecurity,
+    anchored: AnchoredWalPublication,
+    file_id: u64,
+    expected_log_len: u64,
+    log_path: &str,
+) -> Result<(RegistryWalContinuation, VerifiedPairedWalSnapshot), HiveSecurityWalPublicationRefusal> {
+    unsafe { prepared.mark_entered(); }
+    if !matches_exact_hive_record(&anchored, prepared.record(), file_id, expected_log_len, log_path) {
+        return Err((HiveWalPublicationError::WrongPayload, prepared, anchored));
+    }
+    let sequence = prepared.sequence();
+    if let Err((_, prepared)) = unsafe {
+        set.publish_owned_set_key_security_unchecked(prepared, sequence)
+    } {
+        return Err((HiveWalPublicationError::WrongHiveOwner, prepared, anchored));
+    }
+    let (continuation, pair, _) = anchored.into_parts();
+    Ok((continuation, pair))
 }

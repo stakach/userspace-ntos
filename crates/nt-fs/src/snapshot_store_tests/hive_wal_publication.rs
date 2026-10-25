@@ -1,6 +1,7 @@
 use crate::snapshot_test_device::CachedDisk;
 use crate::{
-    publish_anchored_hive_child, publish_anchored_hive_value, AnchoredWalPublication, AsyncSnapshotHeaderRecheck,
+    publish_anchored_hive_child, publish_anchored_hive_security,
+    publish_anchored_hive_value, AnchoredWalPublication, AsyncSnapshotHeaderRecheck,
     AsyncSnapshotIoKind, AsyncWalSnapshotAnchorUpdate, HiveLogWalPayload, OwnedBoundedBlockRange,
     RegistryWal, SnapshotBlockDevice, SnapshotBlockStore, WalSnapshotAnchorUpdate,
     WalSnapshotManifest,
@@ -180,6 +181,48 @@ fn foreign_anchored_child_record_keeps_original_hive_owner_pinned() {
         &mut set, prepared, receipt, 9, 0, SECURITY_LOG).err().unwrap();
     assert_eq!(set.hive(7).unwrap().open_subkey(root, "Policy"), None);
     assert!(set.release_unentered_owned_create_child(prepared).is_err());
+    assert!(set.hive_mut(7).is_none());
+    core::mem::forget(receipt);
+    core::mem::forget(disk);
+}
+
+#[test]
+fn exact_anchored_security_repair_publishes_after_durable_record() {
+    let mut set = MutableHiveSet::new();
+    let mut hive = Hive::new(HiveKind::Security);
+    let policy = hive.create_key("Policy");
+    hive.finish_clean_import();
+    set.mount(r"\Registry\Machine\Security", 7, hive).unwrap();
+    let prepared = set.prepare_owned_set_key_security(
+        7, policy, "Policy", alloc::vec![1, 2, 3]).unwrap();
+    let payload = crate::encode_hive_log_wal_payload(HiveLogWalPayload {
+        file_id: 9, expected_log_len: 0, path: SECURITY_LOG, record: prepared.record(),
+    }).unwrap();
+    let (_disk, receipt) = anchored_payload(payload);
+    assert_eq!(set.hive(7).unwrap().key_security_descriptor(policy), None);
+    let (continuation, pair) = publish_anchored_hive_security(
+        &mut set, prepared, receipt, 9, 0, SECURITY_LOG).ok().unwrap();
+    assert_eq!(continuation.anchor(), pair.anchor());
+    assert_eq!(set.hive(7).unwrap().key_security_descriptor(policy), Some(&[1, 2, 3][..]));
+}
+
+#[test]
+fn foreign_anchored_security_record_keeps_descriptor_unpublished() {
+    let mut set = MutableHiveSet::new();
+    let mut hive = Hive::new(HiveKind::Security);
+    let policy = hive.create_key("Policy");
+    hive.finish_clean_import();
+    set.mount(r"\Registry\Machine\Security", 7, hive).unwrap();
+    let prepared = set.prepare_owned_set_key_security(
+        7, policy, "Policy", alloc::vec![1, 2, 3]).unwrap();
+    let payload = crate::encode_hive_log_wal_payload(HiveLogWalPayload {
+        file_id: 10, expected_log_len: 0, path: SECURITY_LOG, record: prepared.record(),
+    }).unwrap();
+    let (disk, receipt) = anchored_payload(payload);
+    let (_, prepared, receipt) = publish_anchored_hive_security(
+        &mut set, prepared, receipt, 9, 0, SECURITY_LOG).err().unwrap();
+    assert_eq!(set.hive(7).unwrap().key_security_descriptor(policy), None);
+    assert!(set.release_unentered_owned_set_key_security(prepared).is_err());
     assert!(set.hive_mut(7).is_none());
     core::mem::forget(receipt);
     core::mem::forget(disk);
