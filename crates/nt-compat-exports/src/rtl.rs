@@ -136,12 +136,16 @@ impl UnicodeString {
     }
 
     /// `RtlCopyUnicodeString`: copy `src` into `self`, truncating to
-    /// `maximum_length`. Returns the number of code units copied.
+    /// `maximum_length` and terminating when a UTF-16 unit remains.
+    /// Returns the number of code units copied.
     pub fn copy_from(&mut self, src: &UnicodeString) -> usize {
         let cap = (self.maximum_length as usize) / 2;
         let n = src.units().min(cap);
         self.buffer.truncate(0);
         self.buffer.extend_from_slice(&src.as_units()[..n]);
+        if n < cap {
+            self.buffer.push(0);
+        }
         self.length = (n * 2) as u16;
         n
     }
@@ -427,6 +431,19 @@ mod tests {
         };
         assert_eq!(dst.copy_from(&src), 4);
         assert_eq!(dst.as_units(), &u("Long")[..]);
+    }
+
+    #[test]
+    fn copy_terminates_when_destination_has_spare_utf16_unit() {
+        let src = UnicodeString::init(&u("Font"));
+        let mut dst = UnicodeString {
+            buffer: alloc::vec![0xaaaa; 8],
+            length: 0,
+            maximum_length: 16,
+        };
+        assert_eq!(dst.copy_from(&src), 4);
+        assert_eq!(dst.length, 8);
+        assert_eq!(dst.buffer[4], 0);
     }
 
     #[test]
