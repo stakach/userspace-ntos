@@ -144,6 +144,9 @@ const WIN32K_IMAGE_BYTES: u64 = WIN32K_IMAGE_FRAMES * 0x1000;
 /// head at +8, data at +0x1000. Its own 0x0A00_0000 window spans four 2 MiB page tables.
 pub const WIN32K_POOL_VADDR: u64 = 0x0000_0100_0A00_0000;
 pub const WIN32K_POOL_FRAMES: u64 = 2048; // 8 MiB, pre-mapped
+/// Caller alias space for video provider RAM. The preceding 16 MiB band belongs to
+/// the assigned display BAR even before its first VideoPortMapMemory request.
+pub const WIN32K_VIDEO_POOL_ALIAS_VA: u64 = WIN32K_POOL_VADDR + WIN32K_POOL_FRAMES * 0x1000;
 /// Dedicated provider-owned cursor capture pool. Its payload lies above the imported
 /// MmUserProbeAddress without changing the user probe contract for client buffers.
 pub const WIN32K_CURSOR_ALIAS_VADDR: u64 = 0x0000_7fff_ffff_1000;
@@ -2436,6 +2439,8 @@ unsafe fn pool_alloc(size: u64) -> u64 {
 /// +8, payload starts at +0x1000.
 pub const WIN32K_FTYP_VADDR: u64 = 0x0000_0100_0B00_0000;
 pub const WIN32K_FTYP_FRAMES: u64 = 512; // 2 MiB (own window, pre-mapped)
+const _: () = assert!(WIN32K_FB_VA + 0x0100_0000 <= WIN32K_POOL_VADDR);
+const _: () = assert!(WIN32K_VIDEO_POOL_ALIAS_VA < WIN32K_FTYP_VADDR);
 /// FreeType's `EngAllocMem` tag ('FTYP', little-endian) — see the ftfd ft_alloc disasm.
 pub const FTYP_TAG: u64 = 0x5059_5446;
 
@@ -19090,10 +19095,11 @@ unsafe fn record_registered_ntuser_handler() {
 /// to the video-memory mapping transaction, never to loading a particular display image.
 pub const WIN32K_FB_VA: u64 = 0x0000_0100_0900_0000;
 
-/// Reservation geometry is not mapping authority. Only the resource-backed transaction may
-/// populate this band; an unbacked fault must never acquire anonymous private memory.
+/// Reservation geometry is not mapping authority. Only the exact resource or pinned RAM
+/// transaction may populate its band; an unbacked fault must not acquire private memory.
 pub(crate) const fn is_reserved_win32k_video_aperture(address: u64) -> bool {
-    address >= WIN32K_FB_VA && address < WIN32K_POOL_VADDR
+    (address >= WIN32K_FB_VA && address < WIN32K_POOL_VADDR)
+        || (address >= WIN32K_VIDEO_POOL_ALIAS_VA && address < WIN32K_FTYP_VADDR)
 }
 
 

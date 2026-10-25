@@ -206,6 +206,10 @@ pub(super) unsafe fn prepare(
     if state.interface_type != HOSTED_INTERFACE_TYPE_PCIBUS
         || state.video_memory_len == 0
         || state.video_memory_caller_va == 0
+        || state
+            .video_memory_caller_va
+            .checked_add(state.video_memory_len)
+            .is_none_or(|end| end > crate::win32k_subsystem::WIN32K_POOL_VADDR)
     {
         return Err(nt_status::NtStatus::NOT_SUPPORTED);
     }

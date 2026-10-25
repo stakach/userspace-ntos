@@ -350,8 +350,8 @@ pub(super) unsafe fn publish_map(
     else {
         return reject_before_alias(pin, b"table-count-overflow");
     };
-    let mut alias = crate::win32k_subsystem::WIN32K_FB_VA;
-    let limit = crate::win32k_subsystem::WIN32K_POOL_VADDR;
+    let mut alias = crate::win32k_subsystem::WIN32K_VIDEO_POOL_ALIAS_VA;
+    let limit = crate::win32k_subsystem::WIN32K_FTYP_VADDR;
     let chosen = loop {
         let Some(end) = alias.checked_add(rounded) else { break None; };
         if end > limit { break None; }
