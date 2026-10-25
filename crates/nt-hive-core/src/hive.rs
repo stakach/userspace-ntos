@@ -25,6 +25,11 @@ pub use create_child::{CreateChildError, OwnedPreparedCreateChild};
 #[path = "hive_set_key_security.rs"]
 mod set_key_security;
 pub use set_key_security::{OwnedPreparedSetKeySecurity, SetKeySecurityError};
+#[path = "hive_delete.rs"]
+mod delete;
+pub use delete::{
+    DeleteKeyEditError, DeleteValueEditError, OwnedPreparedDeleteKey, OwnedPreparedDeleteValue,
+};
 
 pub use nt_config_manager::RegistryValueType;
 
@@ -1614,6 +1619,13 @@ impl MutableHiveSet {
             .iter()
             .find(|(id, _)| *id == hive_id)
             .map(|(_, hive)| hive)
+    }
+
+    /// Whether a deferred edit must wait before consuming its owned input. A retained
+    /// publication pins the hive until the exact provider effect is resolved.
+    pub fn has_retained_publication(&self, hive_id: HiveId) -> bool {
+        self.retained_value_owners.iter().any(|(id, _)| *id == hive_id)
+            || self.hive(hive_id).is_some_and(|hive| hive.pending_value_journal.is_some())
     }
 
     pub fn hive_mut(&mut self, hive_id: HiveId) -> Option<&mut Hive> {

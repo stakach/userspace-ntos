@@ -12,6 +12,14 @@ pub struct AnchoredWalPublication {
 }
 
 impl AnchoredWalPublication {
+    pub(super) fn from_parts(
+        continuation: crate::RegistryWalContinuation,
+        pair: VerifiedPairedWalSnapshot,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self { continuation, pair, payload }
+    }
+
     pub fn anchor(&self) -> WalSnapshotAnchor { self.continuation.anchor() }
     pub fn payload(&self) -> &[u8] { &self.payload }
     pub fn into_parts(self) -> (crate::RegistryWalContinuation, VerifiedPairedWalSnapshot, Vec<u8>) {
@@ -69,6 +77,7 @@ impl<D: SnapshotBlockDevice> AsyncWalSnapshotAnchorUpdate<D> {
 
     pub fn pending(&self) -> Option<AsyncSnapshotRequest> { self.pending }
     pub fn is_done(&self) -> bool { !self.failed && self.step == 4 && self.pending.is_none() }
+    pub fn is_failed(&self) -> bool { self.failed }
 
     pub fn write_bytes(&self, request: AsyncSnapshotRequest) -> Option<&[u8]> {
         (self.pending == Some(request) && request.kind == AsyncSnapshotIoKind::Write)
@@ -120,7 +129,7 @@ impl<D: SnapshotBlockDevice> AsyncWalSnapshotAnchorUpdate<D> {
             || !self.inner.has_newly_committed_payload() { return Err(self); }
         match self.inner.into_continuation_pair_and_payload() {
             Ok((device, continuation, pair, Some(payload))) =>
-                Ok((device, AnchoredWalPublication { continuation, pair, payload })),
+                Ok((device, AnchoredWalPublication::from_parts(continuation, pair, payload))),
             _ => unreachable!("completed native anchor retains newly committed payload"),
         }
     }

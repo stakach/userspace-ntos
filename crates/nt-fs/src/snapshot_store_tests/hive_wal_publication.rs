@@ -1,10 +1,11 @@
 use crate::snapshot_test_device::CachedDisk;
 use crate::{
-    publish_anchored_hive_child, publish_anchored_hive_security,
+    publish_anchored_hive_child, publish_anchored_hive_delete_key,
+    publish_anchored_hive_delete_value, publish_anchored_hive_security,
     publish_anchored_hive_value, AnchoredWalPublication, AsyncSnapshotHeaderRecheck,
     AsyncSnapshotIoKind, AsyncWalSnapshotAnchorUpdate, HiveLogWalPayload, OwnedBoundedBlockRange,
     RegistryWal, SnapshotBlockDevice, SnapshotBlockStore, WalSnapshotAnchorUpdate,
-    WalSnapshotManifest,
+    WalSnapshotManifest, HiveWalPublicationError,
 };
 use nt_hive_core::{Hive, HiveKind, MutableHiveSet, RegistryValueType};
 
@@ -223,6 +224,122 @@ fn foreign_anchored_security_record_keeps_descriptor_unpublished() {
         &mut set, prepared, receipt, 9, 0, SECURITY_LOG).err().unwrap();
     assert_eq!(set.hive(7).unwrap().key_security_descriptor(policy), None);
     assert!(set.release_unentered_owned_set_key_security(prepared).is_err());
+    assert!(set.hive_mut(7).is_none());
+    core::mem::forget(receipt);
+    core::mem::forget(disk);
+}
+
+fn mounted_leaf_for_deletion() -> (MutableHiveSet, nt_hive_core::CellId, nt_hive_core::CellId) {
+    let mut set = MutableHiveSet::new();
+    let mut hive = Hive::new(HiveKind::Software);
+    let root = hive.root();
+    let leaf = hive.create_key("Leaf");
+    assert!(hive.set_value(leaf, "Obsolete", RegistryValueType::Binary, alloc::vec![4]));
+    hive.finish_clean_import();
+    set.mount(r"\Registry\User\Retained", 7, hive).unwrap();
+    (set, root, leaf)
+}
+
+#[test]
+fn exact_anchor_publishes_delete_value_only_after_paired_headers() {
+    let (mut set, _, leaf) = mounted_leaf_for_deletion();
+    let prepared = set.prepare_owned_delete_value(7, leaf, "Leaf", "Obsolete").unwrap();
+    let payload = crate::encode_hive_log_wal_payload(HiveLogWalPayload {
+        file_id: 9, expected_log_len: 0, path: LOG, record: prepared.record(),
+    }).unwrap();
+    let (_disk, receipt) = anchored_payload(payload);
+    assert!(set.hive(7).unwrap().query_value(leaf, "Obsolete").is_some());
+    let (continuation, pair) = publish_anchored_hive_delete_value(
+        &mut set, prepared, receipt, 9, 0, LOG).ok().unwrap();
+    assert_eq!(continuation.anchor(), pair.anchor());
+    assert_eq!(set.hive(7).unwrap().query_value(leaf, "Obsolete"), None);
+}
+
+#[test]
+fn wrong_delete_value_payload_retains_both_move_only_owners() {
+    let (mut set, _, leaf) = mounted_leaf_for_deletion();
+    let prepared = set.prepare_owned_delete_value(7, leaf, "Leaf", "Obsolete").unwrap();
+    let payload = crate::encode_hive_log_wal_payload(HiveLogWalPayload {
+        file_id: 10, expected_log_len: 0, path: LOG, record: prepared.record(),
+    }).unwrap();
+    let (disk, receipt) = anchored_payload(payload);
+    let (error, prepared, receipt) = publish_anchored_hive_delete_value(
+        &mut set, prepared, receipt, 9, 0, LOG).err().unwrap();
+    assert_eq!(error, HiveWalPublicationError::WrongPayload);
+    assert!(set.hive(7).unwrap().query_value(leaf, "Obsolete").is_some());
+    assert!(set.release_unentered_owned_delete_value(prepared).is_err());
+    assert!(set.hive_mut(7).is_none());
+    core::mem::forget(receipt);
+    core::mem::forget(disk);
+}
+
+#[test]
+fn wrong_delete_value_hive_retains_both_move_only_owners() {
+    let (mut set, _, leaf) = mounted_leaf_for_deletion();
+    let mut other = MutableHiveSet::new();
+    let prepared = set.prepare_owned_delete_value(7, leaf, "Leaf", "Obsolete").unwrap();
+    let payload = crate::encode_hive_log_wal_payload(HiveLogWalPayload {
+        file_id: 9, expected_log_len: 0, path: LOG, record: prepared.record(),
+    }).unwrap();
+    let (disk, receipt) = anchored_payload(payload);
+    let (error, prepared, receipt) = publish_anchored_hive_delete_value(
+        &mut other, prepared, receipt, 9, 0, LOG).err().unwrap();
+    assert_eq!(error, HiveWalPublicationError::WrongHiveOwner);
+    assert!(set.hive(7).unwrap().query_value(leaf, "Obsolete").is_some());
+    assert!(set.release_unentered_owned_delete_value(prepared).is_err());
+    assert!(set.hive_mut(7).is_none());
+    core::mem::forget(receipt);
+    core::mem::forget(disk);
+}
+
+#[test]
+fn exact_anchor_publishes_delete_key_and_its_values_only_after_paired_headers() {
+    let (mut set, root, leaf) = mounted_leaf_for_deletion();
+    let prepared = set.prepare_owned_delete_key(7, leaf, "Leaf").unwrap();
+    let payload = crate::encode_hive_log_wal_payload(HiveLogWalPayload {
+        file_id: 9, expected_log_len: 0, path: LOG, record: prepared.record(),
+    }).unwrap();
+    let (_disk, receipt) = anchored_payload(payload);
+    assert_eq!(set.hive(7).unwrap().open_subkey(root, "Leaf"), Some(leaf));
+    let (continuation, pair) = publish_anchored_hive_delete_key(
+        &mut set, prepared, receipt, 9, 0, LOG).ok().unwrap();
+    assert_eq!(continuation.anchor(), pair.anchor());
+    assert_eq!(set.hive(7).unwrap().open_subkey(root, "Leaf"), None);
+    assert_eq!(set.hive(7).unwrap().query_value(leaf, "Obsolete"), None);
+}
+
+#[test]
+fn wrong_delete_key_payload_retains_both_move_only_owners() {
+    let (mut set, root, leaf) = mounted_leaf_for_deletion();
+    let prepared = set.prepare_owned_delete_key(7, leaf, "Leaf").unwrap();
+    let payload = crate::encode_hive_log_wal_payload(HiveLogWalPayload {
+        file_id: 10, expected_log_len: 0, path: LOG, record: prepared.record(),
+    }).unwrap();
+    let (disk, receipt) = anchored_payload(payload);
+    let (error, prepared, receipt) = publish_anchored_hive_delete_key(
+        &mut set, prepared, receipt, 9, 0, LOG).err().unwrap();
+    assert_eq!(error, HiveWalPublicationError::WrongPayload);
+    assert_eq!(set.hive(7).unwrap().open_subkey(root, "Leaf"), Some(leaf));
+    assert!(set.release_unentered_owned_delete_key(prepared).is_err());
+    assert!(set.hive_mut(7).is_none());
+    core::mem::forget(receipt);
+    core::mem::forget(disk);
+}
+
+#[test]
+fn wrong_delete_key_hive_retains_both_move_only_owners() {
+    let (mut set, root, leaf) = mounted_leaf_for_deletion();
+    let mut other = MutableHiveSet::new();
+    let prepared = set.prepare_owned_delete_key(7, leaf, "Leaf").unwrap();
+    let payload = crate::encode_hive_log_wal_payload(HiveLogWalPayload {
+        file_id: 9, expected_log_len: 0, path: LOG, record: prepared.record(),
+    }).unwrap();
+    let (disk, receipt) = anchored_payload(payload);
+    let (error, prepared, receipt) = publish_anchored_hive_delete_key(
+        &mut other, prepared, receipt, 9, 0, LOG).err().unwrap();
+    assert_eq!(error, HiveWalPublicationError::WrongHiveOwner);
+    assert_eq!(set.hive(7).unwrap().open_subkey(root, "Leaf"), Some(leaf));
+    assert!(set.release_unentered_owned_delete_key(prepared).is_err());
     assert!(set.hive_mut(7).is_none());
     core::mem::forget(receipt);
     core::mem::forget(disk);

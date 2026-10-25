@@ -74,10 +74,11 @@ pub use hive::{
     CreateChildError, OwnedPreparedCreateChild, OwnedPreparedSetKeySecurity, SetKeySecurityError,
     compose_hive_overlay, compose_system_hive_overlay, compose_system_hive_overlay_secured,
     CellId, CurrentControlSet, KeyKind,
-    CurrentControlSetError, DeleteKeyError, Hive, HiveId, HiveKind, HiveMountTable,
+    CurrentControlSetError, DeleteKeyEditError, DeleteKeyError, DeleteValueEditError, Hive, HiveId, HiveKind, HiveMountTable,
     HiveOverlayError, HiveTransaction, HiveValueBlobCompactError, HiveValueBlobCompaction,
     MutableHiveSet, RegistryValueCopyProvenance, RegistryValueCopyProvenanceTable,
-    HiveValueJournalPhase, OwnedPreparedSetValue, PreparedSetValue, RegistryValueType, ResolvedHiveKey,
+    HiveValueJournalPhase, OwnedPreparedDeleteKey, OwnedPreparedDeleteValue, OwnedPreparedSetValue,
+    PreparedSetValue, RegistryValueType, ResolvedHiveKey,
     ResolvedHiveValue, RetainedHiveValueJournal, SetValueError,
     SYSTEM_HIVE_PATH,
 };
