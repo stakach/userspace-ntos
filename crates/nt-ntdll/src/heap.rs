@@ -854,50 +854,60 @@ impl<B: Backing> Heap<B> {
 
     /// Allocate a block and capture the per-allocation user metadata requested in `flags`.
     pub fn allocate_with_flags(&mut self, size: usize, flags: u32) -> Option<*mut u8> {
-        if !self.validate(None) {
-            return None;
-        }
         let need = checked_block_size(size)?;
-        let base = self.backing.base();
         let mut offset = 0usize;
         let mut previous_size = 0usize;
+        let mut previous_was_free = false;
+        let mut first_fit = None;
+
+        // Validate the complete physical chain before changing any block. Remember the first
+        // suitable free block while walking so allocation does not need a second traversal.
+        while offset < self.region_len {
+            let header = self.header_at_offset(offset)?;
+            let next = self.validate_header(offset, previous_size, header)?;
+            if previous_was_free && header.is_free() {
+                return None;
+            }
+            if first_fit.is_none() && header.is_free() && header.size >= need {
+                first_fit = Some((offset, header.size));
+            }
+            previous_was_free = header.is_free();
+            previous_size = header.size;
+            offset = next;
+        }
+        if !self.formatted || offset != self.region_len {
+            return None;
+        }
+
+        let (offset, bsize) = first_fit?;
+        let base = self.backing.base();
         // SAFETY: checked header snapshots constrain every physical step to the backing region.
         unsafe {
-            while offset < self.region_len {
-                let header = self.header_at_offset(offset)?;
-                let next = self.validate_header(offset, previous_size, header)?;
-                let cur = base.add(offset);
-                let (bsize, bfree) = (header.size, header.is_free());
-                if bfree && bsize >= need {
-                    let retained = if bsize - need >= MIN_BLOCK_SIZE {
-                        need
-                    } else {
-                        bsize
-                    };
-                    let unused = retained - HDR - size;
-                    debug_assert!(unused <= u8::MAX as usize);
-                    self.split(cur, need);
-                    let allocated = self.hdr(cur);
-                    (*allocated).user_value = 0;
-                    (*allocated).user_flags = flags & HEAP_SETTABLE_USER_FLAGS;
-                    (*allocated).state = if flags & HEAP_SETTABLE_USER_VALUE != 0 {
-                        BLOCK_HAS_USER_VALUE
-                    } else {
-                        0
-                    };
-                    (*allocated).unused_bytes = unused as u8;
-                    (*allocated).reserved = 0;
-                    let payload = cur.add(HDR);
-                    if flags & HEAP_ZERO_MEMORY != 0 && size != 0 {
-                        core::ptr::write_bytes(payload, 0, size);
-                    }
-                    return Some(payload);
-                }
-                previous_size = bsize;
-                offset = next;
+            let cur = base.add(offset);
+            let retained = if bsize - need >= MIN_BLOCK_SIZE {
+                need
+            } else {
+                bsize
+            };
+            let unused = retained - HDR - size;
+            debug_assert!(unused <= u8::MAX as usize);
+            self.split(cur, need);
+            let allocated = self.hdr(cur);
+            (*allocated).user_value = 0;
+            (*allocated).user_flags = flags & HEAP_SETTABLE_USER_FLAGS;
+            (*allocated).state = if flags & HEAP_SETTABLE_USER_VALUE != 0 {
+                BLOCK_HAS_USER_VALUE
+            } else {
+                0
+            };
+            (*allocated).unused_bytes = unused as u8;
+            (*allocated).reserved = 0;
+            let payload = cur.add(HDR);
+            if flags & HEAP_ZERO_MEMORY != 0 && size != 0 {
+                core::ptr::write_bytes(payload, 0, size);
             }
+            Some(payload)
         }
-        None
     }
 
     /// The payload size of an allocation (`RtlSizeHeap`). Returns `None` if `payload` is not a live
@@ -1945,6 +1955,23 @@ mod tests {
             (*h.hdr(next)).size = usize::MAX & !(HEAP_ALIGN - 1);
             assert!(!h.free(pointer));
         }
+    }
+
+    #[test]
+    fn allocation_rejects_late_corruption_before_reusing_an_earlier_free_block() {
+        let mut h = heap(512);
+        let first = h.allocate(32).unwrap();
+        let _middle = h.allocate(32).unwrap();
+        let last = h.allocate(32).unwrap();
+        // SAFETY: these are exact live allocations from this heap. The final header remains
+        // inside the backing, but its physical predecessor link is intentionally corrupted.
+        unsafe {
+            assert!(h.free(first));
+            (*h.hdr(h.block_of(last).unwrap())).prev_size += HEAP_ALIGN;
+        }
+        assert!(h.allocate(16).is_none());
+        // The failed allocation must leave the earlier free block untouched.
+        assert!(unsafe { (*h.hdr(h.handle())).is_free() });
     }
 
     #[test]
