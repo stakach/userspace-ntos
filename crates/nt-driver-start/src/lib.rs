@@ -4,6 +4,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+pub mod preload_catalog;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DispatchToken {
     driver_id: u64,
@@ -430,6 +432,16 @@ impl PendingOperationReservation {
     }
 }
 
+/// A boot controller's exact reserved START may advance through its initial relations while
+/// sibling STARTs wait for the native disk route those relations must prove and publish.
+pub fn boot_start_admitted(
+    candidate: PendingOperationReservation,
+    storage_owner: Option<PendingOperationReservation>,
+    native_route_published: bool,
+) -> bool {
+    native_route_published || storage_owner.is_none_or(|owner| owner == candidate)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PendingOperationTableError {
     Full,
@@ -575,6 +587,15 @@ impl<T> PendingOperationTable<T> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn boot_storage_relation_precedes_unrelated_start() {
+        let mut pending = super::PendingOperationTable::<()>::with_capacity(2);
+        let storage = pending.reserve().unwrap();
+        let graphics = pending.reserve().unwrap();
+        assert!(super::boot_start_admitted(storage, Some(storage), false));
+        assert!(!super::boot_start_admitted(graphics, Some(storage), false));
+        assert!(super::boot_start_admitted(graphics, Some(storage), true));
+    }
     use super::*;
 
     #[test]
