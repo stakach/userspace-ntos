@@ -189,6 +189,105 @@ fn entered_child_requires_exact_owner_and_sequence_before_publication() {
     other.release_unentered_owned_create_child(other_child).unwrap();
 }
 
+#[test]
+fn restored_descriptorless_key_waits_for_exact_durable_security_publication() {
+    let mut set = MutableHiveSet::new();
+    let mut security = Hive::new(HiveKind::Security);
+    security.create_key("Policy");
+    security.finish_clean_import();
+    let security = decode_image(&encode_image(&security)).unwrap();
+    let policy = security.open_key("Policy").unwrap();
+    set.mount(r"\Registry\Machine\Security", 7, security).unwrap();
+
+    let before = encode_image(set.hive(7).unwrap());
+    let mut prepared = set.prepare_owned_set_key_security(
+        7, policy, "Policy", vec![1, 2, 3]).unwrap();
+    assert_eq!(prepared.record(), encode_log_record(
+        &HiveLogOp::SetKeySecurityDescriptor {
+            path: "Policy", descriptor: &[1, 2, 3],
+        },
+        prepared.sequence(),
+    ));
+    assert_eq!(encode_image(set.hive(7).unwrap()), before);
+    assert_eq!(set.hive(7).unwrap().key_security_descriptor(policy), None);
+    assert!(set.hive_mut(7).is_none());
+    unsafe { prepared.mark_entered(); }
+    let (error, prepared) = set.release_unentered_owned_set_key_security(prepared).unwrap_err();
+    assert_eq!(error, SetKeySecurityError::RetainedPublication);
+    assert_eq!(encode_image(set.hive(7).unwrap()), before);
+    let sequence = prepared.sequence();
+    let (error, prepared) = unsafe {
+        set.publish_owned_set_key_security_unchecked(prepared, sequence + 1)
+    }.unwrap_err();
+    assert_eq!(error, SetKeySecurityError::RetainedPublication);
+    assert_eq!(set.hive(7).unwrap().key_security_descriptor(policy), None);
+    unsafe { set.publish_owned_set_key_security_unchecked(prepared, sequence) }.unwrap();
+    assert_eq!(set.hive(7).unwrap().key_security_descriptor(policy), Some(&[1, 2, 3][..]));
+    assert!(set.hive_mut(7).is_some());
+}
+
+#[test]
+fn retained_security_rejects_wrong_owner_and_volatile_key() {
+    fn mounted() -> (MutableHiveSet, CellId) {
+        let mut set = MutableHiveSet::new();
+        let mut hive = Hive::new(HiveKind::Security);
+        let key = hive.create_key("Policy");
+        hive.finish_clean_import();
+        set.mount(r"\Registry\Machine\Security", 7, hive).unwrap();
+        (set, key)
+    }
+
+    let (mut set, key) = mounted();
+    let (mut other, _) = mounted();
+    let before = encode_image(set.hive(7).unwrap());
+    let owner = set.prepare_owned_set_key_security(7, key, "Policy", vec![1]).unwrap();
+    let other_owner = other.prepare_owned_set_key_security(7, key, "Policy", vec![2]).unwrap();
+    let sequence = owner.sequence();
+    let (error, mut owner) = unsafe {
+        set.publish_owned_set_key_security_unchecked(owner, sequence)
+    }.unwrap_err();
+    assert_eq!(error, SetKeySecurityError::RetainedPublication);
+    unsafe { owner.mark_entered(); }
+    let (error, owner) = unsafe {
+        other.publish_owned_set_key_security_unchecked(owner, sequence)
+    }.unwrap_err();
+    assert_eq!(error, SetKeySecurityError::RetainedPublication);
+    assert_eq!(encode_image(set.hive(7).unwrap()), before);
+    unsafe { set.publish_owned_set_key_security_unchecked(owner, sequence) }.unwrap();
+    assert_eq!(set.hive(7).unwrap().key_security_descriptor(key), Some(&[1][..]));
+    other.release_unentered_owned_set_key_security(other_owner).unwrap();
+
+    let (mut set, _) = mounted();
+    let root = set.hive(7).unwrap().root();
+    let volatile = {
+        let mut tx = set.hive_mut(7).unwrap().begin_transaction();
+        let key = tx.try_create_child_with_options(root, "Transient".into(), None, vec![3], true)
+            .unwrap();
+        tx.commit();
+        key
+    };
+    assert!(matches!(
+        set.prepare_owned_set_key_security(7, volatile, "Transient", vec![4]),
+        Err(SetKeySecurityError::KeyMustBeDurable)
+    ));
+    assert!(set.hive_mut(7).is_some());
+}
+
+#[test]
+fn unentered_security_owner_releases_without_publishing() {
+    let mut set = MutableHiveSet::new();
+    let mut hive = Hive::new(HiveKind::Security);
+    let key = hive.create_key("Policy");
+    hive.finish_clean_import();
+    set.mount(r"\Registry\Machine\Security", 7, hive).unwrap();
+    let before = encode_image(set.hive(7).unwrap());
+    let prepared = set.prepare_owned_set_key_security(7, key, "Policy", vec![1]).unwrap();
+    set.release_unentered_owned_set_key_security(prepared).unwrap();
+    assert_eq!(encode_image(set.hive(7).unwrap()), before);
+    assert_eq!(set.hive(7).unwrap().key_security_descriptor(key), None);
+    assert!(set.hive_mut(7).is_some());
+}
+
 struct Snapshot {
     image: Vec<u8>,
     record: Vec<u8>,

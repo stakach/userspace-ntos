@@ -22,6 +22,9 @@ use value_journal::PendingHiveValueJournal;
 #[path = "hive_create_child.rs"]
 mod create_child;
 pub use create_child::{CreateChildError, OwnedPreparedCreateChild};
+#[path = "hive_set_key_security.rs"]
+mod set_key_security;
+pub use set_key_security::{OwnedPreparedSetKeySecurity, SetKeySecurityError};
 
 pub use nt_config_manager::RegistryValueType;
 
