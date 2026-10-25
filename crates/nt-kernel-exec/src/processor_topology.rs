@@ -15,10 +15,23 @@ pub const fn active_processor_count_for_group(count: u64, group: u16) -> u32 {
     if group == 0 || group == u16::MAX { active_processor_count(count) } else { 0 }
 }
 
-/// A hosted driver can identify its current processor without a per-thread
-/// processor owner only while the boot topology contains one processor.
-pub const fn single_processor_index(count: u64) -> Option<u32> {
-    if count == 1 { Some(0) } else { None }
+/// Map a hosted callback to the boot node only while its observed physical APIC identity
+/// still matches the node on which the executive captured that identity. A migrated callback
+/// needs an independently discovered APIC-to-node map and cannot borrow the boot node's index.
+pub const fn local_processor_index(
+    count: u64,
+    boot_node: u64,
+    boot_apic_id: u32,
+    current_apic_id: u32,
+) -> Option<u32> {
+    if count == 0
+        || boot_node >= active_processor_count(count) as u64
+        || current_apic_id != boot_apic_id
+    {
+        None
+    } else {
+        Some(boot_node as u32)
+    }
 }
 
 /// Encode a group-zero `PROCESSOR_NUMBER` for a real boot processor index.
