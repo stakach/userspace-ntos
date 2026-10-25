@@ -2773,6 +2773,15 @@ impl ImageFaultObservation {
     }
 }
 
+/// A first routed image page must be read and acknowledged before either a hardware
+/// not-present fault or a checked kernel copy can use its file-backed bytes.
+pub const fn routed_image_pagein_required(observation: ImageFaultObservation) -> bool {
+    matches!(
+        observation,
+        ImageFaultObservation::NotPresent | ImageFaultObservation::CopyAccess
+    )
+}
+
 /// Decode only image faults the Receive child pager can service without changing the fault's
 /// meaning. Present user writes require a committed writecopy image mapping at the caller.
 pub const fn x86_user_image_receive_fault(
