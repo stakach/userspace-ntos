@@ -88,10 +88,7 @@ impl MutableHiveSet {
         if self.retained_value_owners.iter().any(|(id, _)| *id == hive_id) {
             return Err(SetValueError::RetainedPublication);
         }
-        let owner = self.next_value_owner;
-        let next_owner = owner.checked_add(1).ok_or(SetValueError::InsufficientResources)?;
-        self.retained_value_owners.try_reserve(1)
-            .map_err(|_| SetValueError::InsufficientResources)?;
+        let owner = self.reserve_retained_owner().ok_or(SetValueError::InsufficientResources)?;
         let hive = self.hives.iter_mut().find(|(id, _)| *id == hive_id)
             .map(|(_, hive)| hive).ok_or(SetValueError::KeyNotFound)?;
         if hive.open_key(path) != Some(key) {
@@ -107,7 +104,6 @@ impl MutableHiveSet {
             return Err(SetValueError::InsufficientResources);
         }
         self.retained_value_owners.push((hive_id, owner));
-        self.next_value_owner = next_owner;
         Ok(OwnedPreparedSetValue {
             hive_id, owner, key, value_type, sequence, blob, cell, record, entered: false,
         })

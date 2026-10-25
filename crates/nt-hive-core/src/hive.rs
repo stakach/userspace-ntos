@@ -8,6 +8,7 @@
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use nt_page_storage::PageSequence;
 
 #[path = "hive_set_value.rs"]
@@ -20,7 +21,7 @@ use value_journal::PendingHiveValueJournal;
 
 #[path = "hive_create_child.rs"]
 mod create_child;
-pub use create_child::CreateChildError;
+pub use create_child::{CreateChildError, OwnedPreparedCreateChild};
 
 pub use nt_config_manager::RegistryValueType;
 
@@ -1529,8 +1530,11 @@ pub struct MutableHiveSet {
     mounts: HiveMountTable,
     hives: Vec<(HiveId, Hive)>,
     retained_value_owners: Vec<(HiveId, u64)>,
-    next_value_owner: u64,
 }
+
+// A retained edit can move between sets before publication. An owner number must therefore
+// distinguish the exact preparation across sets, including independently constructed sets.
+static NEXT_RETAINED_OWNER: AtomicU64 = AtomicU64::new(1);
 
 impl MutableHiveSet {
     pub fn new() -> Self {
@@ -1538,8 +1542,13 @@ impl MutableHiveSet {
             mounts: HiveMountTable::new(),
             hives: Vec::new(),
             retained_value_owners: Vec::new(),
-            next_value_owner: 1,
         }
+    }
+
+    fn reserve_retained_owner(&mut self) -> Option<u64> {
+        self.retained_value_owners.try_reserve(1).ok()?;
+        NEXT_RETAINED_OWNER.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |owner|
+            owner.checked_add(1)).ok()
     }
 
     /// Mount or replace a mutable hive atomically at the namespace level.

@@ -103,6 +103,92 @@ fn owned_prepared_value_waits_for_exact_durable_publication() {
     assert!(set.hive_mut(7).is_some());
 }
 
+#[test]
+fn owned_prepared_child_keeps_restored_hive_unchanged_until_durable_publication() {
+    let mut set = MutableHiveSet::new();
+    let mut security = Hive::new(HiveKind::Security);
+    security.finish_clean_import();
+    let security = decode_image(&encode_image(&security)).unwrap();
+    let root = security.root();
+    set.mount(r"\Registry\Machine\Security", 7, security).unwrap();
+
+    let before = encode_image(set.hive(7).unwrap());
+    let prepared = set
+        .prepare_owned_create_child(7, root, "", "Policy", None, vec![1, 2, 3])
+        .unwrap();
+    assert_eq!(prepared.record(), encode_log_record(
+        &HiveLogOp::CreateChild {
+            parent: "", name: "Policy", class_name: None, descriptor: &[1, 2, 3],
+        },
+        prepared.sequence(),
+    ));
+    assert_eq!(encode_image(set.hive(7).unwrap()), before);
+    assert_eq!(set.hive(7).unwrap().open_subkey(root, "Policy"), None);
+    assert!(set.hive_mut(7).is_none());
+
+    set.release_unentered_owned_create_child(prepared).unwrap();
+    assert_eq!(encode_image(set.hive(7).unwrap()), before);
+    assert!(set.hive_mut(7).is_some());
+}
+
+#[test]
+fn entered_child_requires_exact_owner_and_sequence_before_publication() {
+    fn mounted() -> MutableHiveSet {
+        let mut set = MutableHiveSet::new();
+        let mut hive = Hive::new(HiveKind::Security);
+        hive.finish_clean_import();
+        set.mount(r"\Registry\Machine\Security", 7, hive).unwrap();
+        set
+    }
+
+    let mut set = mounted();
+    let mut other = mounted();
+    let root = set.hive(7).unwrap().root();
+    let baseline = encode_image(set.hive(7).unwrap());
+    let child = set.prepare_owned_create_child(
+        7, root, "", "Policy", Some("policy class"), vec![1, 2, 3],
+    ).unwrap();
+    let other_child = other.prepare_owned_create_child(
+        7, root, "", "Elsewhere", None, vec![4],
+    ).unwrap();
+    let sequence = child.sequence();
+    let link_capacity = set.hive(7).unwrap().key(root).unwrap().subkeys.capacity();
+    let (error, returned) = unsafe {
+        set.publish_owned_create_child_unchecked(child, sequence)
+    }.unwrap_err();
+    assert_eq!(error, CreateChildError::RetainedPublication);
+    let mut child = returned;
+    assert_eq!(encode_image(set.hive(7).unwrap()), baseline);
+    unsafe { child.mark_entered(); }
+
+    // The physical effect is now uncertain: release and wrong receipt attempts keep ownership.
+    let (error, child) = set.release_unentered_owned_create_child(child).unwrap_err();
+    assert_eq!(error, CreateChildError::RetainedPublication);
+    let (error, child) = unsafe {
+        other.publish_owned_create_child_unchecked(child, sequence)
+    }.unwrap_err();
+    assert_eq!(error, CreateChildError::RetainedPublication);
+    let (error, child) = unsafe {
+        set.publish_owned_create_child_unchecked(child, sequence + 1)
+    }.unwrap_err();
+    assert_eq!(error, CreateChildError::RetainedPublication);
+    assert!(set.hive_mut(7).is_none());
+    assert_eq!(encode_image(set.hive(7).unwrap()), baseline);
+    assert_eq!(set.hive(7).unwrap().open_subkey(root, "Policy"), None);
+
+    // The exact durable receipt permits one allocation-free in-memory publication.
+    let id = unsafe { set.publish_owned_create_child_unchecked(child, sequence) }.unwrap();
+    let hive = set.hive(7).unwrap();
+    assert_eq!(hive.key(root).unwrap().subkeys.capacity(), link_capacity);
+    assert_eq!(hive.open_subkey(root, "Policy"), Some(id));
+    assert_eq!(hive.key_class(id), Some("policy class"));
+    assert_eq!(hive.key_security_descriptor(id), Some(&[1, 2, 3][..]));
+    assert_eq!(hive.sequence, sequence);
+    assert!(hive.dirty_count() > 0);
+    assert!(set.hive_mut(7).is_some());
+    other.release_unentered_owned_create_child(other_child).unwrap();
+}
+
 struct Snapshot {
     image: Vec<u8>,
     record: Vec<u8>,

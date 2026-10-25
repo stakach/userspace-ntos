@@ -71,7 +71,7 @@ pub use config_import::{
     import_control_set_services_into_config_manager,
 };
 pub use hive::{
-    CreateChildError,
+    CreateChildError, OwnedPreparedCreateChild,
     compose_hive_overlay, compose_system_hive_overlay, compose_system_hive_overlay_secured,
     CellId, CurrentControlSet, KeyKind,
     CurrentControlSetError, DeleteKeyError, Hive, HiveId, HiveKind, HiveMountTable,
