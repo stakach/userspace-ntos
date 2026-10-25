@@ -240,7 +240,7 @@ unsafe fn begin_owned(handler: &mut ExecNtHandler, caller: NativeCaller,
     kind: Kind, authorized_listen: Option<u64>, kernel_listen: Option<u64>) -> Result<(), u32> {
     let pi = handler.pi;
     let owners = &mut *core::ptr::addr_of_mut!(OWNERS);
-    if owners.len() >= MAX_OWNERS || owners.iter().any(|owner| owner.caller().badge == caller.badge) {
+    if owners.len() >= MAX_OWNERS || owners.iter().any(|owner| owner.caller() == caller) {
         return Err(STATUS_DEVICE_BUSY);
     }
     owners.try_reserve(1).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;

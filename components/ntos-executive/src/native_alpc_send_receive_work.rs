@@ -183,7 +183,7 @@ pub(crate) unsafe fn begin(handler: &mut ExecNtHandler, args: [u64; 8]) -> Resul
     if request.len() > REP_DATA_LEN { return Err(STATUS_NOT_SUPPORTED); }
     let owners = &mut *core::ptr::addr_of_mut!(OWNERS);
     if owners.len() >= MAX_OWNERS
-        || owners.iter().any(|owner| owner.caller().badge == badge)
+        || owners.iter().any(|owner| owner.caller() == caller)
     { return Err(STATUS_DEVICE_BUSY); }
     owners.try_reserve(1).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
     let mut output = Vec::new();
