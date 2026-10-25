@@ -17,7 +17,10 @@ mod child_ids;
 pub mod mode_evidence;
 pub mod video_children;
 mod control;
-pub use control::{classify_start_io_status, VideoControlCompletion, VideoControlProtocolError};
+pub use control::{
+    classify_start_io_status, video_port_control_owner, VideoControlCompletion,
+    VideoControlProtocolError, VideoPortControlOwner,
+};
 mod lifecycle;
 mod pnp;
 pub use child_ids::{write_monitor_child_id, MonitorChildIdError, MonitorChildIdResult};
@@ -716,7 +719,9 @@ impl<A: VideoMiniportAdapter> VideoPort<A> {
             IOCTL_VIDEO_INIT_WIN32K_CALLBACKS => {
                 write_win32k_callbacks(input, output, self.video_device_object)
             }
-            IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => Err(VideoMiniportError::UnsupportedIoctl),
+            IOCTL_VIDEO_ENUM_MONITOR_PDO | IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => {
+                Err(VideoMiniportError::UnsupportedIoctl)
+            }
             _ => self.adapter.dispatch_io_control(ioctl, input, output),
         }
     }
@@ -748,7 +753,9 @@ impl<A: VideoMiniportAdapter> VideoPort<A> {
                     self.video_device_object,
                 )
             }
-            IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => Err(VideoMiniportError::UnsupportedIoctl),
+            IOCTL_VIDEO_ENUM_MONITOR_PDO | IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => {
+                Err(VideoMiniportError::UnsupportedIoctl)
+            }
             _ => self.adapter.dispatch_buffered_io_control(
                 ioctl,
                 system_buffer,
