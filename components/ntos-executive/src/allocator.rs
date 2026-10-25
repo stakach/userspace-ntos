@@ -21,7 +21,7 @@ mod oom_budget;
 #[path = "allocator_free_list.rs"]
 mod free_list;
 
-/// The component-local heap VA. The root reserves the 64 MiB band ending at the original scratch
+/// The component-local heap VA. The root reserves an 88 MiB band before the scratch
 /// base; its lower 32 MiB is mapped initially and later durable pages are committed on demand.
 /// This band is above the executive image and worker mirrors. Isolated components have separate
 /// VSpaces and retain their declared heap profiles at the same VA.
@@ -29,7 +29,7 @@ pub const HEAP_BASE: usize = 0x0000_0100_1e00_0000;
 /// Maximum VA reservation in 4 KiB frames, including the root transient lane. Physical pages
 /// beyond the initial root commitment are retyped and mapped only when allocations need them.
 /// Spawned services map a separately declared subset, ordinarily [`DEFAULT_SERVICE_HEAP_FRAMES`].
-pub const HEAP_FRAMES: u64 = 16384;
+pub const HEAP_FRAMES: u64 = 22528;
 /// Frames committed before the root executive starts serving requests. Further durable pages are
 /// mapped only as allocations require them; isolated services still use their declared profiles.
 pub const EXECUTIVE_INITIAL_HEAP_FRAMES: u64 = 8192;

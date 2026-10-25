@@ -1340,7 +1340,7 @@ pub const DEMAND_SCRATCH_WINDOW: u64 = 0x0400_0000; // 64 MiB per process
                                                     // paging level, so this layout does not depend on boot-image page tables.
 pub const SMSS_SCRATCH_BASE: u64 = allocator::HEAP_BASE as u64 + allocator::HEAP_FRAMES * 0x1000;
 const _: () = assert!(SMSS_SCRATCH_BASE & 0x1f_ffff == 0);
-const _: () = assert!(SMSS_SCRATCH_BASE == 0x0000_0100_2200_0000);
+const _: () = assert!(SMSS_SCRATCH_BASE == 0x0000_0100_2380_0000);
 /// csrss's demand-fault scratch window (own 64 MiB, PTs mapped at spawn).
 pub const CSRSS_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + DEMAND_SCRATCH_WINDOW;
 /// Fault-endpoint badge for the THIRD hosted process (winlogon). Distinct from smss (0) + csrss (2).
