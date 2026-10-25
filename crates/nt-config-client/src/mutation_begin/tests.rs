@@ -9,6 +9,7 @@ use nt_hive_core::{encode_image, Hive, HiveKind};
 
 const PATH: &str = r"\Registry\Machine\System\CurrentControlSet\Services\Device";
 const BUSY: i32 = 0x8000_0011u32 as i32;
+const REVISION_MISMATCH: i32 = 0xC000_0059u32 as i32;
 
 fn reserve<C>(manager: &mut CmMutationBeginAttempts, caller: C) -> CmMutationBeginAttempt<C> {
     reserve_on(manager, &mut client(), caller)
@@ -237,6 +238,47 @@ fn acknowledged_busy_retries_with_new_identity_and_original_mutation_owner() {
     assert_eq!(upload.continuation(), &42);
     assert_eq!(upload.expected_generation(), 1);
     assert_eq!(upload.mutation_token, 31);
+}
+
+#[test]
+fn acknowledged_stale_begin_rebases_only_a_no_effect_mutation_on_the_same_mount() {
+    let mut manager = CmMutationBeginAttempts::with_slot_limit(1).unwrap();
+    let mut attempt = reserve(&mut manager, 42);
+    let original = attempt.identity;
+    let same_mount = attempt.mount();
+    let journal = attempt.journal().to_vec();
+    let journal_ptr = attempt.journal().as_ptr();
+    complete(&mut manager, &mut attempt, CmMutationBeginOperation::Query, 0, 0);
+    complete(&mut manager, &mut attempt, CmMutationBeginOperation::Begin,
+        REVISION_MISMATCH, 0);
+    assert_eq!(manager.retry_acknowledged_revision(&mut attempt, same_mount, 2),
+        Err(STATUS_INVALID_PARAMETER));
+    complete(&mut manager, &mut attempt, CmMutationBeginOperation::Acknowledge, 0, 0);
+    assert_eq!(manager.retry_acknowledged_revision(&mut attempt, same_mount, 1),
+        Err(STATUS_INVALID_PARAMETER));
+    manager.retry_acknowledged_revision(&mut attempt, same_mount, 2).unwrap();
+    assert_eq!(attempt.identity.sequence, original.sequence + 1);
+    assert_eq!(attempt.expected_generation(), 2);
+    assert_eq!(attempt.journal().as_ptr(), journal_ptr);
+    assert_eq!(attempt.journal(), journal);
+    assert_eq!(attempt.continuation(), Some(&42));
+    let exchange = manager.begin_exchange(&mut attempt, CmMutationBeginOperation::Begin).unwrap();
+    let request = Request::from_bytes(&exchange.bytes).unwrap();
+    assert_eq!(request.expected_generation, 2);
+    assert_eq!(request.request_generation, original.sequence + 1);
+}
+
+#[test]
+fn acquired_writer_can_never_be_rebased_after_acknowledgement() {
+    let mut manager = CmMutationBeginAttempts::with_slot_limit(1).unwrap();
+    let mut attempt = reserve(&mut manager, 42);
+    let same_mount = attempt.mount();
+    complete(&mut manager, &mut attempt, CmMutationBeginOperation::Query, 0, 0);
+    complete(&mut manager, &mut attempt, CmMutationBeginOperation::Begin, 0, 31);
+    complete(&mut manager, &mut attempt, CmMutationBeginOperation::Acknowledge, 0, 0);
+    assert_eq!(manager.retry_acknowledged_revision(&mut attempt, same_mount, 2),
+        Err(STATUS_INVALID_PARAMETER));
+    assert_eq!(manager.take_upload(&mut attempt).unwrap().mutation_token, 31);
 }
 
 #[test]
@@ -619,6 +661,10 @@ fn client() -> ConfigClient<Direct> {
     let select = hive.create_key("Select");
     hive.set_dword(select, "Current", 1);
     hive.create_key(r"ControlSet001\Services");
+    let control_set = hive.open_key("ControlSet001").unwrap();
+    assert!(hive.set_key_security_descriptor(
+        control_set, &nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR,
+    ));
     hive.finish_clean_import();
     let mut client = ConfigClient::new(Direct {
         server: CmServer::new_for_incarnation(NonZeroU32::MIN),
@@ -640,6 +686,49 @@ fn exchange<C>(
     let mut ticket = manager.begin_exchange(attempt, operation)?;
     let response = client.exchange_system_hive_mutation_begin(&ticket);
     manager.complete_exchange(attempt, &mut ticket, response)
+}
+
+#[test]
+fn real_server_waiting_service_value_rebases_after_another_writer_commits() {
+    let mut client = client();
+    let mount = client.query_system_hive_mount(1).unwrap().mount();
+    let mut manager = CmMutationBeginAttempts::with_slot_limit(1).unwrap();
+    let control_path = r"\Registry\Machine\System\ControlSet001\Control";
+    let service_path = r"\Registry\Machine\System\ControlSet001\Control\ServiceCurrent";
+    let mut waiting = manager.reserve(
+        mount, 1,
+        &[SystemHiveMutation::SetValue {
+            path: service_path,
+            name: "",
+            value_type: 4,
+            data: &1u32.to_le_bytes(),
+        }],
+        42,
+    ).unwrap();
+    let first = client.prepare_system_hive_mutation(1, &[
+        SystemHiveMutation::CreateKey { path: control_path },
+        SystemHiveMutation::CreateKey { path: service_path },
+    ]).unwrap();
+    assert_eq!(client.publish_system_hive_mutation(&first).unwrap().generation, 2);
+
+    exchange(&mut manager, &mut waiting, &mut client,
+        CmMutationBeginOperation::Query).unwrap();
+    exchange(&mut manager, &mut waiting, &mut client,
+        CmMutationBeginOperation::Begin).unwrap();
+    assert_eq!(waiting.outcome_status(), Some(REVISION_MISMATCH));
+    assert_eq!(client.backend.tokens.last(), Some(&0));
+    exchange(&mut manager, &mut waiting, &mut client,
+        CmMutationBeginOperation::Acknowledge).unwrap();
+    manager.retry_acknowledged_revision(&mut waiting, mount, 2).unwrap();
+    exchange(&mut manager, &mut waiting, &mut client,
+        CmMutationBeginOperation::Begin).unwrap();
+    assert_eq!(waiting.outcome_status(), Some(STATUS_SUCCESS));
+    assert_ne!(client.backend.tokens.last(), Some(&0));
+    exchange(&mut manager, &mut waiting, &mut client,
+        CmMutationBeginOperation::Acknowledge).unwrap();
+    let upload = manager.take_upload(&mut waiting).unwrap();
+    assert_eq!(upload.expected_generation(), 2);
+    assert_eq!(upload.continuation(), &42);
 }
 
 #[test]
