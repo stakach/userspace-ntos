@@ -64,23 +64,27 @@ pub struct ProcessDeletionCandidate {
 #[repr(u8)]
 pub enum ProcessDeletionPhase {
     #[default]
-    AwaitingReferences = 0,
+    AwaitingExecutionQuiescence = 0,
     ReclaimingVm = 1,
-    DeletingProcessObject = 2,
-    FinalizingProviderObjects = 3,
-    ReleasingExecutiveReferences = 4,
-    RetiringMechanism = 5,
+    RetiringExecution = 2,
+    AwaitingReferences = 3,
+    DeletingProcessObject = 4,
+    FinalizingProviderObjects = 5,
+    ReleasingExecutiveReferences = 6,
+    Complete = 7,
 }
 
 impl ProcessDeletionPhase {
     pub const fn next(self) -> Option<Self> {
         match self {
-            Self::AwaitingReferences => Some(Self::ReclaimingVm),
-            Self::ReclaimingVm => Some(Self::DeletingProcessObject),
+            Self::AwaitingExecutionQuiescence => Some(Self::ReclaimingVm),
+            Self::ReclaimingVm => Some(Self::RetiringExecution),
+            Self::RetiringExecution => Some(Self::AwaitingReferences),
+            Self::AwaitingReferences => Some(Self::DeletingProcessObject),
             Self::DeletingProcessObject => Some(Self::FinalizingProviderObjects),
             Self::FinalizingProviderObjects => Some(Self::ReleasingExecutiveReferences),
-            Self::ReleasingExecutiveReferences => Some(Self::RetiringMechanism),
-            Self::RetiringMechanism => None,
+            Self::ReleasingExecutiveReferences => Some(Self::Complete),
+            Self::Complete => None,
         }
     }
 }
@@ -93,7 +97,7 @@ impl ProcessDeletionCandidate {
             generation: 0,
             provider_objects: false,
             lpc_rundown_acknowledged: false,
-            phase: ProcessDeletionPhase::AwaitingReferences,
+            phase: ProcessDeletionPhase::AwaitingExecutionQuiescence,
             pending_primary_token: 0,
             pending_exception_port: 0,
             deleted_threads: 0,
@@ -107,7 +111,7 @@ impl ProcessDeletionCandidate {
             generation: mechanism.generation,
             provider_objects,
             lpc_rundown_acknowledged: false,
-            phase: ProcessDeletionPhase::AwaitingReferences,
+            phase: ProcessDeletionPhase::AwaitingExecutionQuiescence,
             pending_primary_token: 0,
             pending_exception_port: 0,
             deleted_threads: 0,
@@ -196,7 +200,7 @@ impl<const N: usize> ProcessDeletionCandidateTable<N> {
         if candidate.pid == 0
             || candidate.generation == 0
             || candidate.lpc_rundown_acknowledged
-            || candidate.phase != ProcessDeletionPhase::AwaitingReferences
+            || candidate.phase != ProcessDeletionPhase::AwaitingExecutionQuiescence
             || candidate.pending_primary_token != 0
             || candidate.pending_exception_port != 0
             || candidate.deleted_threads != 0
@@ -226,7 +230,7 @@ impl<const N: usize> ProcessDeletionCandidateTable<N> {
         expected: ProcessDeletionCandidate,
     ) -> Result<ProcessDeletionCandidate, MechanismError> {
         let slot = self.record_mut(expected)?;
-        if expected.phase != ProcessDeletionPhase::AwaitingReferences
+        if expected.phase != ProcessDeletionPhase::AwaitingExecutionQuiescence
             || expected.lpc_rundown_acknowledged
         {
             return Err(MechanismError::InvalidIdentity);
@@ -245,7 +249,8 @@ impl<const N: usize> ProcessDeletionCandidateTable<N> {
         let Some(next) = expected.phase.next() else {
             return Err(MechanismError::InvalidIdentity);
         };
-        if expected.phase == ProcessDeletionPhase::DeletingProcessObject
+        if expected.phase == ProcessDeletionPhase::RetiringExecution
+            || expected.phase == ProcessDeletionPhase::DeletingProcessObject
             || expected.phase == ProcessDeletionPhase::FinalizingProviderObjects
             || (expected.phase == ProcessDeletionPhase::ReleasingExecutiveReferences
                 && (expected.pending_primary_token != 0 || expected.pending_exception_port != 0))
@@ -253,6 +258,20 @@ impl<const N: usize> ProcessDeletionCandidateTable<N> {
             return Err(MechanismError::InvalidIdentity);
         }
         slot.phase = next;
+        Ok(*slot)
+    }
+
+    /// Record the once-only release of the exact VM, image, badge, and execution mechanism.
+    /// The old Ps object may still be retained by external process and thread handles.
+    pub fn record_execution_retirement_exact(
+        &mut self,
+        expected: ProcessDeletionCandidate,
+    ) -> Result<ProcessDeletionCandidate, MechanismError> {
+        let slot = self.record_mut(expected)?;
+        if expected.phase != ProcessDeletionPhase::RetiringExecution {
+            return Err(MechanismError::InvalidIdentity);
+        }
+        slot.phase = ProcessDeletionPhase::AwaitingReferences;
         Ok(*slot)
     }
 
@@ -355,9 +374,9 @@ impl<const N: usize> ProcessDeletionCandidateTable<N> {
             || expected.pending_exception_port != 0
             || !matches!(
                 expected.phase,
-                ProcessDeletionPhase::AwaitingReferences | ProcessDeletionPhase::RetiringMechanism
+                ProcessDeletionPhase::AwaitingExecutionQuiescence | ProcessDeletionPhase::Complete
             )
-            || (expected.phase == ProcessDeletionPhase::AwaitingReferences
+            || (expected.phase == ProcessDeletionPhase::AwaitingExecutionQuiescence
                 && (expected.deleted_threads != 0 || expected.lpc_rundown_acknowledged))
         {
             return Err(MechanismError::InvalidIdentity);
@@ -913,7 +932,7 @@ mod tests {
             generation: 3,
             provider_objects: true,
             lpc_rundown_acknowledged: false,
-            phase: ProcessDeletionPhase::AwaitingReferences,
+            phase: ProcessDeletionPhase::AwaitingExecutionQuiescence,
             pending_primary_token: 0,
             pending_exception_port: 0,
             deleted_threads: 0,
@@ -962,7 +981,9 @@ mod tests {
             Err(MechanismError::StaleIdentity)
         );
 
-        let deleting = table.advance_exact(reclaiming).unwrap();
+        let retiring_execution = table.advance_exact(reclaiming).unwrap();
+        let awaiting_references = table.record_execution_retirement_exact(retiring_execution).unwrap();
+        let deleting = table.advance_exact(awaiting_references).unwrap();
         assert_eq!(
             table.advance_exact(deleting),
             Err(MechanismError::InvalidIdentity)
@@ -992,7 +1013,7 @@ mod tests {
         let releasing = table.release_exception_port_exact(releasing).unwrap();
         assert_eq!(releasing.deleted_threads, 2);
         let retiring = table.advance_exact(releasing).unwrap();
-        assert_eq!(retiring.phase, ProcessDeletionPhase::RetiringMechanism);
+        assert_eq!(retiring.phase, ProcessDeletionPhase::Complete);
         assert_eq!(
             table.advance_exact(retiring),
             Err(MechanismError::InvalidIdentity)
@@ -1022,18 +1043,20 @@ mod tests {
     fn deletion_phase_order_keeps_references_through_provider_finalization() {
         use ProcessDeletionPhase::*;
         let phases = [
-            AwaitingReferences,
+            AwaitingExecutionQuiescence,
             ReclaimingVm,
+            RetiringExecution,
+            AwaitingReferences,
             DeletingProcessObject,
             FinalizingProviderObjects,
             ReleasingExecutiveReferences,
-            RetiringMechanism,
+            Complete,
         ];
         for pair in phases.windows(2) {
             assert_eq!(pair[0].next(), Some(pair[1]));
             assert!(pair[0] < pair[1]);
         }
-        assert_eq!(RetiringMechanism.next(), None);
+        assert_eq!(Complete.next(), None);
     }
 
     #[test]
@@ -1042,10 +1065,12 @@ mod tests {
         let reclaiming = table.advance_exact(initial).unwrap();
         for phase in [
             ProcessDeletionPhase::ReclaimingVm,
+            ProcessDeletionPhase::RetiringExecution,
+            ProcessDeletionPhase::AwaitingReferences,
             ProcessDeletionPhase::DeletingProcessObject,
             ProcessDeletionPhase::FinalizingProviderObjects,
             ProcessDeletionPhase::ReleasingExecutiveReferences,
-            ProcessDeletionPhase::RetiringMechanism,
+            ProcessDeletionPhase::Complete,
         ] {
             let advanced = ProcessDeletionCandidate { phase, ..initial };
             assert_eq!(table.queue(advanced), Err(MechanismError::InvalidIdentity));
@@ -1062,7 +1087,7 @@ mod tests {
     fn withdrawal_and_deletion_cannot_skip_preceding_work() {
         let (mut table, initial) = queued_deletion_candidate(true);
         let mut current = initial;
-        for _ in 0..2 {
+        for _ in 0..4 {
             assert_eq!(
                 table.record_process_object_withdrawal_exact(current),
                 Err(MechanismError::InvalidIdentity)
@@ -1072,7 +1097,15 @@ mod tests {
                 Err(MechanismError::InvalidIdentity)
             );
             assert_eq!(table.get(current.pi), Some(current));
-            current = table.advance_exact(current).unwrap();
+            current = if current.phase == ProcessDeletionPhase::RetiringExecution {
+                assert_eq!(
+                    table.advance_exact(current),
+                    Err(MechanismError::InvalidIdentity)
+                );
+                table.record_execution_retirement_exact(current).unwrap()
+            } else {
+                table.advance_exact(current).unwrap()
+            };
         }
         assert_eq!(current.phase, ProcessDeletionPhase::DeletingProcessObject);
         assert_eq!(
@@ -1102,7 +1135,9 @@ mod tests {
     fn exact_withdrawal_rejects_stale_or_modified_snapshots_without_effects() {
         let (mut table, initial) = queued_deletion_candidate(true);
         let reclaiming = table.advance_exact(initial).unwrap();
-        let deleting = table.advance_exact(reclaiming).unwrap();
+        let retiring_execution = table.advance_exact(reclaiming).unwrap();
+        let awaiting_references = table.record_execution_retirement_exact(retiring_execution).unwrap();
+        let deleting = table.advance_exact(awaiting_references).unwrap();
         for stale in [
             initial,
             reclaiming,
@@ -1150,7 +1185,9 @@ mod tests {
     fn finalized_deletion_publishes_reference_payload_only_once() {
         let (mut table, initial) = queued_deletion_candidate(true);
         let reclaiming = table.advance_exact(initial).unwrap();
-        let deleting = table.advance_exact(reclaiming).unwrap();
+        let retiring_execution = table.advance_exact(reclaiming).unwrap();
+        let awaiting_references = table.record_execution_retirement_exact(retiring_execution).unwrap();
+        let deleting = table.advance_exact(awaiting_references).unwrap();
         let finalizing = table
             .record_process_object_withdrawal_exact(deleting)
             .unwrap();
@@ -1205,7 +1242,7 @@ mod tests {
         let released = table.release_primary_token_exact(without_port).unwrap();
         assert_eq!(
             table.advance_exact(released).unwrap().phase,
-            ProcessDeletionPhase::RetiringMechanism
+            ProcessDeletionPhase::Complete
         );
     }
 
@@ -1213,7 +1250,9 @@ mod tests {
     fn no_provider_objects_still_requires_exact_withdrawal_and_final_retirement() {
         let (mut table, initial) = queued_deletion_candidate(false);
         let reclaiming = table.advance_exact(initial).unwrap();
-        let deleting = table.advance_exact(reclaiming).unwrap();
+        let retiring_execution = table.advance_exact(reclaiming).unwrap();
+        let awaiting_references = table.record_execution_retirement_exact(retiring_execution).unwrap();
+        let deleting = table.advance_exact(awaiting_references).unwrap();
         assert_eq!(
             table.advance_exact(deleting),
             Err(MechanismError::InvalidIdentity)
@@ -1251,7 +1290,9 @@ mod tests {
             Err(MechanismError::InvalidIdentity)
         );
         assert_eq!(table.get(initial.pi), Some(reclaiming));
-        let deleting = table.advance_exact(reclaiming).unwrap();
+        let retiring_execution = table.advance_exact(reclaiming).unwrap();
+        let awaiting_references = table.record_execution_retirement_exact(retiring_execution).unwrap();
+        let deleting = table.advance_exact(awaiting_references).unwrap();
         assert_eq!(
             table.remove_exact(deleting),
             Err(MechanismError::InvalidIdentity)
@@ -1306,12 +1347,12 @@ mod tests {
                 ..initial
             },
             ProcessDeletionCandidate {
-                phase: ProcessDeletionPhase::RetiringMechanism,
+                phase: ProcessDeletionPhase::Complete,
                 pending_primary_token: 9,
                 ..initial
             },
             ProcessDeletionCandidate {
-                phase: ProcessDeletionPhase::RetiringMechanism,
+                phase: ProcessDeletionPhase::Complete,
                 pending_exception_port: 17,
                 ..initial
             },
@@ -1332,17 +1373,19 @@ mod tests {
     fn deletion_clear_refuses_all_live_phases_atomically() {
         let (_, initial) = queued_deletion_candidate(true);
         for phase in [
-            ProcessDeletionPhase::AwaitingReferences,
+            ProcessDeletionPhase::AwaitingExecutionQuiescence,
             ProcessDeletionPhase::ReclaimingVm,
+            ProcessDeletionPhase::RetiringExecution,
+            ProcessDeletionPhase::AwaitingReferences,
             ProcessDeletionPhase::DeletingProcessObject,
             ProcessDeletionPhase::FinalizingProviderObjects,
             ProcessDeletionPhase::ReleasingExecutiveReferences,
-            ProcessDeletionPhase::RetiringMechanism,
+            ProcessDeletionPhase::Complete,
         ] {
             let mut table = ProcessDeletionCandidateTable::<2>::new();
             assert_eq!(table.clear(), Ok(()));
             let candidate = ProcessDeletionCandidate { phase, ..initial };
-            if phase == ProcessDeletionPhase::AwaitingReferences {
+            if phase == ProcessDeletionPhase::AwaitingExecutionQuiescence {
                 table.queue(candidate).unwrap();
             } else {
                 assert_eq!(table.queue(candidate), Err(MechanismError::InvalidIdentity));

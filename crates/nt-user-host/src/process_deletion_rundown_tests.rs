@@ -66,6 +66,30 @@ fn failed_owner_reservation_keeps_existing_receipts() {
 }
 
 #[test]
+fn execution_retirement_receipt_is_once_only_across_pi_reuse() {
+    let (mut table, first) = queued();
+    let reclaiming = table.advance_exact(first).unwrap();
+    let retiring = table.advance_exact(reclaiming).unwrap();
+    assert_eq!(
+        table.advance_exact(retiring),
+        Err(MechanismError::InvalidIdentity)
+    );
+    let awaiting_refs = table.record_execution_retirement_exact(retiring).unwrap();
+    let second = ProcessDeletionCandidate {
+        pid: 13,
+        generation: 8,
+        ..first
+    };
+    assert_eq!(table.queue(second), Ok(true));
+    assert_eq!(
+        table.record_execution_retirement_exact(retiring),
+        Err(MechanismError::StaleIdentity)
+    );
+    assert_eq!(table.get_exact(1, 12, 7), Some(awaiting_refs));
+    assert_eq!(table.get_exact(1, 13, 8), Some(second));
+}
+
+#[test]
 fn acknowledged_rundown_is_once_only_and_cannot_be_discarded_or_reset() {
     let (mut table, initial) = queued();
     let acknowledged = table.acknowledge_lpc_rundown_exact(initial).unwrap();
@@ -154,7 +178,9 @@ fn rundown_acknowledgement_survives_all_retirement_transitions_not_slot_reuse() 
     let (mut table, initial) = queued();
     let acknowledged = table.acknowledge_lpc_rundown_exact(initial).unwrap();
     let reclaiming = table.advance_exact(acknowledged).unwrap();
-    let deleting = table.advance_exact(reclaiming).unwrap();
+    let retiring_execution = table.advance_exact(reclaiming).unwrap();
+    let awaiting_references = table.record_execution_retirement_exact(retiring_execution).unwrap();
+    let deleting = table.advance_exact(awaiting_references).unwrap();
     let withdrawn = table
         .record_process_object_withdrawal_exact(deleting)
         .unwrap();
@@ -166,6 +192,8 @@ fn rundown_acknowledgement_survives_all_retirement_transitions_not_slot_reuse() 
     let retired = table.advance_exact(port_released).unwrap();
     for snapshot in [
         reclaiming,
+        retiring_execution,
+        awaiting_references,
         deleting,
         withdrawn,
         releasing,
