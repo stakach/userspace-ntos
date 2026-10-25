@@ -4204,8 +4204,9 @@ impl ProcessManager {
             return false;
         }
         let _ = self.clear_deleted_process_debug_object_if_unreferenced(pid);
-        self.process_object_delete_blockers(pid)
-            .is_some_and(ProcessObjectDeleteBlockers::execution_retirement_ready)
+        self.process_object_delete_blockers(pid).is_some_and(|blockers| {
+            blockers.execution_retirement_ready() && blockers.thread_impersonations == 0
+        })
     }
 
     /// Whether only Ps-owned token/port references remain before the process delete procedure can

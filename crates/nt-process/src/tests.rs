@@ -3803,12 +3803,14 @@ fn process_delete_readiness_leaves_impersonation_to_the_delete_procedure() {
     let blockers = pm.process_object_delete_blockers(pid).unwrap();
     assert_eq!(blockers.thread_impersonations, 1);
     assert!(blockers.delete_ready());
+    assert!(!pm.process_execution_retirement_ready(pid));
     assert_eq!(pm.delete_process_object_if_unreferenced(pid), None);
 
     assert_eq!(
         pm.replace_thread_impersonation(tid, None),
         Ok(Some(context))
     );
+    assert!(pm.process_execution_retirement_ready(pid));
     assert!(pm.delete_process_object_if_unreferenced(pid).is_some());
 }
 
