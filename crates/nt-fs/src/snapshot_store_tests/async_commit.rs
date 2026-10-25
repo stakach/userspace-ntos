@@ -54,6 +54,108 @@ fn perform(
     }
 }
 
+fn rechecked_pair(store: SnapshotBlockStore, disk: &mut CachedDisk) -> RecheckedPairedWalSnapshot {
+    let pair = store.verify_paired_wal_snapshot(disk).unwrap();
+    let mut recheck = AsyncSnapshotHeaderRecheck::new(
+        store, pair, disk.sector_size(), disk.sector_count(),
+    ).ok().unwrap();
+    while let Some(request) = recheck.enter_next().unwrap() {
+        let mut bytes = alloc::vec![0; request.bytes];
+        disk.read_sectors(request.lba, &mut bytes).unwrap();
+        recheck.complete_read(request, &bytes).unwrap();
+    }
+    // The fixture completed exact reads under one exclusive synthetic reserve.
+    unsafe { recheck.finish_proven() }.ok().unwrap()
+}
+
+#[test]
+fn rechecked_pair_commit_skips_full_payload_scan_and_preserves_barriers() {
+    let store = SnapshotBlockStore::new(0, 256);
+    let mut disk = CachedDisk::with_sectors(256);
+    let old = alloc::vec![0x31; 40 * 512];
+    store.commit_next_with_wal_manifest(&mut disk, &old, baseline()).unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, &old, baseline()).unwrap();
+    let proof = rechecked_pair(store, &mut disk);
+    let reads_before = disk.read_attempts;
+    disk.events.clear();
+    let mut commit = AsyncSnapshotCommit::new_from_rechecked_pair(
+        alloc::vec![0xa5; 65 * 512], baseline(), proof,
+    ).ok().unwrap();
+    while let Some(request) = commit.enter_next().unwrap() {
+        assert_ne!(request.kind, AsyncSnapshotIoKind::Read);
+        perform(&mut disk, &mut commit, request);
+    }
+    assert_eq!(disk.read_attempts, reads_before);
+    assert_eq!(disk.events.first(), Some(&Event::Flush));
+    assert_eq!(disk.events.last(), Some(&Event::Flush));
+    let (payload, generation, pair) = unsafe {
+        commit.finish_with_payload_and_paired_proof()
+    }.ok().unwrap();
+    assert_eq!(generation, 3);
+    assert_eq!(pair.anchor(), baseline().anchor());
+    let reads_before_second = disk.read_attempts;
+    let mut second = unsafe { AsyncSnapshotCommit::new_from_verified_pair(
+        store, payload, baseline(), disk.sector_size(), disk.sector_count(), pair,
+    ) }.ok().unwrap();
+    while let Some(request) = second.enter_next().unwrap() {
+        assert_ne!(request.kind, AsyncSnapshotIoKind::Read);
+        perform(&mut disk, &mut second, request);
+    }
+    assert_eq!(disk.read_attempts, reads_before_second);
+    let (generation, pair) = unsafe { second.finish_with_paired_proof() }.ok().unwrap();
+    assert_eq!(generation, 4);
+    assert_eq!(pair.anchor(), baseline().anchor());
+    disk.power_cut();
+    assert_eq!(store.read_latest(&mut disk).unwrap().unwrap().generation, 4);
+}
+
+#[test]
+fn proof_checkpoint_refusal_returns_payload_and_exact_proof_before_effect() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::new();
+    store.commit_next_with_wal_manifest(&mut disk, b"older", baseline()).unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, b"newer", baseline()).unwrap();
+    let proof = rechecked_pair(store, &mut disk);
+    let events = disk.events.clone();
+    let payload = b"replacement".to_vec();
+    let wrong = WalSnapshotManifest { incarnation: 78, ..baseline() };
+    let (error, returned, proof) = match AsyncSnapshotCommit::new_from_rechecked_pair(
+        payload.clone(), wrong, proof,
+    ) {
+        Ok(_) => panic!("changed anchor must refuse before physical effect"),
+        Err(parts) => parts,
+    };
+    assert_eq!(error, SnapshotBlockStoreError::Corrupt);
+    assert_eq!(returned, payload);
+    assert_eq!(proof.anchor(), baseline().anchor());
+    assert_eq!(disk.events, events);
+}
+
+#[test]
+fn proof_checkpoint_uncertain_write_retains_ticket_and_previous_slot() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut disk = CachedDisk::new();
+    store.commit_next_with_wal_manifest(&mut disk, b"older", baseline()).unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, b"newer", baseline()).unwrap();
+    let proof = rechecked_pair(store, &mut disk);
+    let mut commit = AsyncSnapshotCommit::new_from_rechecked_pair(
+        b"replacement".to_vec(), baseline(), proof,
+    ).ok().unwrap();
+    let barrier = commit.enter_next().unwrap().unwrap();
+    assert_eq!(barrier.kind, AsyncSnapshotIoKind::Flush);
+    perform(&mut disk, &mut commit, barrier);
+    let write = commit.enter_next().unwrap().unwrap();
+    assert_eq!(write.kind, AsyncSnapshotIoKind::Write);
+    commit.lose(write).unwrap();
+    assert_eq!(commit.pending(), Some(write));
+    assert_eq!(commit.enter_next(), Err(AsyncSnapshotCommitError::Outstanding));
+    assert_eq!(commit.release_unentered(write), Err(AsyncSnapshotCommitError::Outstanding));
+    disk.power_cut();
+    let selected = store.read_latest(&mut disk).unwrap().unwrap();
+    assert_eq!(selected.generation, 2);
+    assert_eq!(selected.payload, b"newer");
+}
+
 #[test]
 fn async_commit_preserves_payload_header_barrier_order_and_recovery() {
     let (mut disk, mut commit) = fixture(alloc::vec![0xa5; 1300]);

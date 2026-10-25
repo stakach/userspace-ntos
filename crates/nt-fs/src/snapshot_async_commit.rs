@@ -76,16 +76,20 @@ pub struct AsyncSnapshotCommit<P: AsRef<[u8]>> {
     write_buffer: Vec<u8>,
     failure: Option<SnapshotBlockStoreError>,
     uncertain: bool,
+    /// A verified pair remains owned by the commit through uncertain native effects.
+    initial_proof: Option<VerifiedPairedWalSnapshot>,
+    /// Target phase selected from that proof, entered only after the pre-write barrier.
+    proven_after_preflush: Option<Phase>,
 }
 
 impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
-    pub fn new(
+    fn validate_geometry(
         store: SnapshotBlockStore,
-        payload: P,
+        payload: &P,
         manifest: WalSnapshotManifest,
         sector_size: usize,
         device_sectors: u64,
-    ) -> Result<Self, SnapshotBlockStoreError> {
+    ) -> Result<(), SnapshotBlockStoreError> {
         if !manifest.valid() {
             return Err(SnapshotBlockStoreError::Corrupt);
         }
@@ -105,14 +109,23 @@ impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
             return Err(SnapshotBlockStoreError::OutOfSpace);
         }
         u32::try_from(payload_sectors).map_err(|_| SnapshotBlockStoreError::OutOfSpace)?;
+        Ok(())
+    }
+
+    fn initialized(
+        store: SnapshotBlockStore,
+        payload: P,
+        manifest: WalSnapshotManifest,
+        sector_size: usize,
+    ) -> Result<Self, (SnapshotBlockStoreError, P)> {
         let mut write_buffer = Vec::new();
-        write_buffer
-            .try_reserve_exact(
-                sector_size
-                    .checked_mul(BATCH_SECTORS as usize)
-                    .ok_or(SnapshotBlockStoreError::InvalidGeometry)?,
-            )
-            .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
+        let Some(capacity) = sector_size.checked_mul(BATCH_SECTORS as usize) else {
+            return Err((SnapshotBlockStoreError::InvalidGeometry, payload));
+        };
+        if write_buffer.try_reserve_exact(capacity).is_err() {
+            return Err((SnapshotBlockStoreError::OutOfMemory, payload));
+        }
+        let slot_sectors = store.sector_count / 2;
         Ok(Self {
             store,
             payload,
@@ -130,7 +143,110 @@ impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
             write_buffer,
             failure: None,
             uncertain: false,
+            initial_proof: None,
+            proven_after_preflush: None,
         })
+    }
+
+    pub fn new(
+        store: SnapshotBlockStore,
+        payload: P,
+        manifest: WalSnapshotManifest,
+        sector_size: usize,
+        device_sectors: u64,
+    ) -> Result<Self, SnapshotBlockStoreError> {
+        Self::validate_geometry(store, &payload, manifest, sector_size, device_sectors)?;
+        Self::initialized(store, payload, manifest, sector_size)
+            .map_err(|(error, _payload)| error)
+    }
+
+    /// Start a native checkpoint from the exact two-header recheck of an already CRC-verified
+    /// pair. On pre-effect failure both the payload and original proof return to the caller.
+    /// No payload sector is reread: the caller must retain the same exclusive physical reserve.
+    pub fn new_from_rechecked_pair(
+        payload: P,
+        manifest: WalSnapshotManifest,
+        proof: RecheckedPairedWalSnapshot,
+    ) -> Result<Self, (SnapshotBlockStoreError, P, RecheckedPairedWalSnapshot)> {
+        let store = proof.store;
+        let sector_size = proof.sector_size;
+        let device_sectors = proof.device_sectors;
+        if let Err(error) = Self::validate_geometry(
+            store, &payload, manifest, sector_size, device_sectors,
+        ) {
+            return Err((error, payload, proof));
+        }
+        if let Err(error) = Self::validate_proven_pair(store, manifest, &proof.pair) {
+            return Err((error, payload, proof));
+        }
+        let mut commit = match Self::initialized(store, payload, manifest, sector_size) {
+            Ok(commit) => commit,
+            Err((error, payload)) => return Err((error, payload, proof)),
+        };
+        commit.seed_proven_pair(proof.pair);
+        // Every paired proof has two payload-valid slot plans with an unchanged anchor, so
+        // target selection cannot fail after the above manifest check.
+        commit.select_target().expect("paired proof selects a snapshot target");
+        commit.proven_after_preflush = Some(commit.phase);
+        commit.phase = Phase::Preflush;
+        Ok(commit)
+    }
+
+    /// Use the refreshed pair minted by the preceding acknowledged commit in the same exclusive
+    /// reserve. The caller must keep that lease and must have completed every previous effect
+    /// through exact terminal and ACK; otherwise the pair is not physical authority.
+    ///
+    /// # Safety
+    /// `proof` must be the settled proof for this exact reserve, without an intervening writer.
+    pub unsafe fn new_from_verified_pair(
+        store: SnapshotBlockStore,
+        payload: P,
+        manifest: WalSnapshotManifest,
+        sector_size: usize,
+        device_sectors: u64,
+        proof: VerifiedPairedWalSnapshot,
+    ) -> Result<Self, (SnapshotBlockStoreError, P, VerifiedPairedWalSnapshot)> {
+        if let Err(error) = Self::validate_geometry(
+            store, &payload, manifest, sector_size, device_sectors,
+        ) {
+            return Err((error, payload, proof));
+        }
+        if let Err(error) = Self::validate_proven_pair(store, manifest, &proof) {
+            return Err((error, payload, proof));
+        }
+        let mut commit = match Self::initialized(store, payload, manifest, sector_size) {
+            Ok(commit) => commit,
+            Err((error, payload)) => return Err((error, payload, proof)),
+        };
+        commit.seed_proven_pair(proof);
+        commit.select_target().expect("paired proof selects a snapshot target");
+        commit.proven_after_preflush = Some(commit.phase);
+        commit.phase = Phase::Preflush;
+        Ok(commit)
+    }
+
+    fn seed_proven_pair(&mut self, proof: VerifiedPairedWalSnapshot) {
+        self.scan = proof.plans.map(ScanResult::Valid);
+        self.header_plans = proof.plans.map(Some);
+        self.initial_proof = Some(proof);
+    }
+
+    fn validate_proven_pair(
+        store: SnapshotBlockStore,
+        manifest: WalSnapshotManifest,
+        proof: &VerifiedPairedWalSnapshot,
+    ) -> Result<(), SnapshotBlockStoreError> {
+        if proof.store != store || proof.manifest.anchor() != manifest.anchor()
+            || manifest.base_serial < proof.manifest.base_serial
+            || proof.plans.iter().any(|plan| {
+                plan.generation == u64::MAX || plan.resetting
+                    || plan.wal.is_none_or(|wal| wal.anchor() != manifest.anchor()
+                        || wal.base_serial > manifest.base_serial)
+            })
+        {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        Ok(())
     }
 
     pub fn pending(&self) -> Option<AsyncSnapshotRequest> {
@@ -510,7 +626,7 @@ impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
             return Err(AsyncSnapshotCommitError::Incomplete);
         }
         self.phase = match self.phase {
-            Phase::Preflush => Phase::Header(0),
+            Phase::Preflush => self.proven_after_preflush.take().unwrap_or(Phase::Header(0)),
             Phase::PayloadWrite(sector) => {
                 let next = sector + (request.bytes / self.sector_size) as u32;
                 if next == self.payload.as_ref().len().div_ceil(self.sector_size) as u32 {
