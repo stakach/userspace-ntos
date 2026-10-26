@@ -157,6 +157,22 @@ impl ReadCompletions {
         Ok(())
     }
 
+    /// Refuse a certainly unentered physical request without losing its pending IRP owner.
+    /// The terminal remains retained until the caller publishes and acknowledges it.
+    pub fn refuse_unentered(&mut self, claim: ReadSectorClaim, status: i32)
+        -> Result<(), ReadError>
+    {
+        if status >= 0 { return Err(ReadError::Invalid); }
+        let entry = self.entry_mut(claim.irp, claim.mount, claim.file)?;
+        if entry.claimed != Some(claim) || entry.terminal.is_some() {
+            return Err(ReadError::WrongClaim);
+        }
+        entry.claimed = None;
+        entry.terminal = Some((status, 0));
+        entry.position_committed = true;
+        Ok(())
+    }
+
     pub fn complete_sectors(&mut self, claim: ReadSectorClaim,
         sectors: Result<&[u8], FatPathError>) -> Result<FatRangeProgress, ReadError>
     {
@@ -369,6 +385,32 @@ mod tests {
         assert_eq!(reads.next_completion(), Some((0x1_0001, -1, 0)));
         assert_eq!(reads.copy(0x1_0001, 0, &mut [0; 1]), Ok(0));
         reads.ack(0x1_0001).unwrap();
+    }
+
+    #[test]
+    fn unentered_refusal_requires_exact_claim_and_publishes_one_failure() {
+        let mut reads = ReadCompletions::new();
+        let geometry = FatPathGeometry {
+            fat_start_sector: 1, data_start_sector: 2, total_sectors: 18,
+            sectors_per_cluster: 1,
+        };
+        reads.capture_range(0x51, 7, 9, geometry, 2, 0, 512, Some((11, 512)))
+            .unwrap();
+        let claim = reads.claim_next_bounded(4).unwrap();
+        assert_eq!(reads.refuse_unentered(ReadSectorClaim { generation: claim.generation + 1, ..claim },
+            STATUS_DATA_ERROR as i32), Err(ReadError::WrongClaim));
+        assert_eq!(reads.refuse_unentered(ReadSectorClaim { file: 10, ..claim },
+            STATUS_DATA_ERROR as i32), Err(ReadError::WrongIdentity));
+        assert_eq!(reads.refuse_unentered(claim, 0), Err(ReadError::Invalid));
+        assert_eq!(reads.next_completion(), None);
+        reads.refuse_unentered(claim, STATUS_DATA_ERROR as i32).unwrap();
+        assert_eq!(reads.next_completion(), Some((0x51, STATUS_DATA_ERROR as i32, 0)));
+        assert_eq!(reads.next_completion(), None);
+        assert!(reads.claim_next_bounded(1).is_none());
+        assert_eq!(reads.refuse_unentered(claim, STATUS_DATA_ERROR as i32),
+            Err(ReadError::WrongClaim));
+        reads.ack(0x51).unwrap();
+        assert!(!reads.has_outstanding());
     }
 
     #[test]
