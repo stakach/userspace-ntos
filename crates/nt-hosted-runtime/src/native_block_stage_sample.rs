@@ -68,7 +68,7 @@ impl NativeBlockStageSampler {
         if sequence < 8 { return true; }
         if sequence < 128 { return false; }
         let octave = 1u32 << (31 - sequence.leading_zeros());
-        sequence == octave || (octave <= (1u32 << 30) && sequence == octave + octave / 2)
+        sequence == octave || (octave <= (1u32 << 30) && sequence == octave + octave / 4)
     }
 
     /// An unacknowledged or malformed observation cannot be reported as completed I/O.
@@ -188,11 +188,11 @@ mod tests {
             if let Some(sample) = sampler.observe(observation(7, u64::from(n) + 1,
                 u64::from(n) + 11, 100)) {
                 count += 1;
-                if n >= 20_000 { late_sample = Some(sample); }
+                if (20_000..23_000).contains(&n) { late_sample = Some(sample); }
             }
         }
         let late_sample = late_sample.expect("periodic sampling must reach late boot");
-        assert!(late_sample.sequence >= 20_000);
+        assert!((20_000..23_000).contains(&late_sample.sequence));
         assert_eq!(late_sample.observation.ticket, u64::from(late_sample.sequence) + 11);
         assert!(count <= NativeBlockStageSampler::MAX_EMITTED as usize);
         assert_eq!(sampler.emitted() as usize, count);
@@ -208,7 +208,7 @@ mod tests {
             if sampler.observe(observation(7, u64::from(n) + 1,
                 u64::from(n) + 11, elapsed)).is_some() {
                 if (8..1_000).contains(&n) { slow_samples += 1; }
-                if n >= 20_000 { late_periodic = true; }
+                if (20_000..23_000).contains(&n) { late_periodic = true; }
             }
         }
         assert!(slow_samples > 0, "long latency must still be sampled");
