@@ -3,7 +3,7 @@
 //!
 //! This is Category B: load-bearing (the loader + every DLL allocates through it), and portable, so
 //! it is implemented properly rather than stubbed. The allocator is a classic **first-fit
-//! free-list with boundary tags and coalescing** over a byte region. The region itself is abstract
+//! boundary-tagged heap with coalescing** over a byte region. The region itself is abstract
 //! (a [`Backing`]): in the real process it is committed via `NtAllocateVirtualMemory`; in tests it
 //! is a plain `Vec<u8>`. Everything is therefore host-tested (alloc / free / realloc / coalesce /
 //! size / exhaustion) with no target dependency.
@@ -14,10 +14,10 @@
 //! ```
 //! `BlockHeader` holds boundary sizes, live/free state, and the allocation's optional user metadata.
 //! `size`/`prev_size` are payload+header sizes in bytes; `prev_size == 0` marks the first block. Free
-//! blocks are found by a linear walk (first-fit) -- adequate and simple; a size-class free-list is a
-//! later optimisation, not correctness. Free/size/realloc recover the target header directly from
-//! the payload pointer and verify the neighbouring boundary tags, so destructor-heavy callers do not
-//! pay a full heap walk for every released allocation.
+//! blocks use first-fit. An exact earliest-free hint makes append allocations independent of the
+//! number of live blocks; fragmented heaps retain the physical walk. Free/size/realloc recover the
+//! target header directly from the payload pointer and verify the neighbouring boundary tags, so
+//! destructor-heavy callers do not pay a full heap walk for every released allocation.
 
 use core::mem::{align_of, size_of};
 
@@ -357,13 +357,16 @@ fn checked_block_size(payload_size: usize) -> Option<usize> {
         .map(|size| size & !(HEAP_ALIGN - 1))
 }
 
-/// A first-fit free-list heap over a [`Backing`] region.
+/// A first-fit boundary-tagged heap over a [`Backing`] region.
 pub struct Heap<B: Backing> {
     backing: B,
     /// Aligned prefix of the backing used for physical blocks.
     region_len: usize,
     /// Whether the region has been formatted into an initial free block.
     formatted: bool,
+    /// Offset of the earliest free physical block, or `region_len` when full. Mutations maintain
+    /// this index; it permits local validation of the common terminal free extent.
+    first_free: usize,
     /// Front-end type returned by `RtlQueryHeapInformation` class 0.
     compatibility_mode: u32,
 }
@@ -382,6 +385,7 @@ impl<B: Backing> Heap<B> {
             backing,
             region_len,
             formatted: false,
+            first_free: 0,
             compatibility_mode: 0,
         };
         // SAFETY: region is >= HDR+HEAP_ALIGN and valid per the Backing contract.
@@ -533,6 +537,20 @@ impl<B: Backing> Heap<B> {
         Some(header)
     }
 
+    /// Find the first free block from a known physical boundary after a mutation.
+    fn next_free_from(&self, mut offset: usize, mut previous_size: usize) -> Option<usize> {
+        while offset < self.region_len {
+            let header = self.header_at_offset(offset)?;
+            let next = self.validate_header(offset, previous_size, header)?;
+            if header.is_free() {
+                return Some(offset);
+            }
+            previous_size = header.size;
+            offset = next;
+        }
+        (offset == self.region_len).then_some(offset)
+    }
+
     fn direct_live_block(&self, payload: *const u8) -> Option<(usize, BlockHeader)> {
         let offset = self.direct_block_offset_for_payload(payload)?;
         let header = self.validate_direct_header(offset, None)?;
@@ -578,6 +596,7 @@ impl<B: Backing> Heap<B> {
         let mut offset = 0usize;
         let mut previous_size = 0usize;
         let mut previous_was_free = false;
+        let mut first_free = self.region_len;
         while offset < self.region_len {
             let Some(header) = self.header_at_offset(offset) else {
                 return false;
@@ -588,11 +607,14 @@ impl<B: Backing> Heap<B> {
             if previous_was_free && header.is_free() {
                 return false;
             }
+            if header.is_free() && first_free == self.region_len {
+                first_free = offset;
+            }
             previous_was_free = header.is_free();
             previous_size = header.size;
             offset = next;
         }
-        self.formatted && offset == self.region_len
+        self.formatted && offset == self.region_len && self.first_free == first_free
     }
 
     /// Capture the native heap-debug summary from a validated physical block chain.
@@ -853,33 +875,69 @@ impl<B: Backing> Heap<B> {
     }
 
     /// Allocate a block and capture the per-allocation user metadata requested in `flags`.
+    /// The terminal free extent is checked with its immediate boundary tags; explicit
+    /// [`Self::validate`] checks the complete physical chain, including off-path corruption.
     pub fn allocate_with_flags(&mut self, size: usize, flags: u32) -> Option<*mut u8> {
         let need = checked_block_size(size)?;
-        let mut offset = 0usize;
-        let mut previous_size = 0usize;
-        let mut previous_was_free = false;
-        let mut first_fit = None;
-
-        // Validate the complete physical chain before changing any block. Remember the first
-        // suitable free block while walking so allocation does not need a second traversal.
-        while offset < self.region_len {
-            let header = self.header_at_offset(offset)?;
-            let next = self.validate_header(offset, previous_size, header)?;
-            if previous_was_free && header.is_free() {
+        let first_fit = if self.first_free == self.region_len {
+            return None;
+        } else {
+            let hint = self.first_free;
+            let header = self.header_at_offset(hint)?;
+            let end = self.validate_header(hint, header.prev_size, header)?;
+            if !header.is_free() {
                 return None;
             }
-            if first_fit.is_none() && header.is_free() && header.size >= need {
-                first_fit = Some((offset, header.size));
+            if hint == 0 {
+                if header.prev_size != 0 {
+                    return None;
+                }
+            } else {
+                let previous_offset = hint.checked_sub(header.prev_size)?;
+                let previous = self.validate_direct_header(previous_offset, None)?;
+                if previous.size != header.prev_size || previous.is_free() {
+                    return None;
+                }
             }
-            previous_was_free = header.is_free();
-            previous_size = header.size;
-            offset = next;
-        }
-        if !self.formatted || offset != self.region_len {
-            return None;
-        }
+            if end == self.region_len {
+                // The index identifies the earliest free block, and this one reaches the region
+                // end, so no earlier or later free block can be a better first fit.
+                (header.size >= need).then_some((hint, header.size))
+            } else {
+                let mut offset = 0usize;
+                let mut previous_size = 0usize;
+                let mut previous_was_free = false;
+                let mut fit = None;
+                while offset < self.region_len {
+                    let header = self.header_at_offset(offset)?;
+                    let next = self.validate_header(offset, previous_size, header)?;
+                    if previous_was_free && header.is_free() {
+                        return None;
+                    }
+                    if fit.is_none() && header.is_free() && header.size >= need {
+                        fit = Some((offset, header.size));
+                    }
+                    previous_was_free = header.is_free();
+                    previous_size = header.size;
+                    offset = next;
+                }
+                if !self.formatted || offset != self.region_len {
+                    return None;
+                }
+                fit
+            }
+        };
 
         let (offset, bsize) = first_fit?;
+        let replacement = if self.first_free == offset {
+            if bsize - need >= MIN_BLOCK_SIZE {
+                offset + need
+            } else {
+                self.next_free_from(offset + bsize, bsize)?
+            }
+        } else {
+            self.first_free
+        };
         let base = self.backing.base();
         // SAFETY: checked header snapshots constrain every physical step to the backing region.
         unsafe {
@@ -892,6 +950,7 @@ impl<B: Backing> Heap<B> {
             let unused = retained - HDR - size;
             debug_assert!(unused <= u8::MAX as usize);
             self.split(cur, need);
+            self.first_free = replacement;
             let allocated = self.hdr(cur);
             (*allocated).user_value = 0;
             (*allocated).user_flags = flags & HEAP_SETTABLE_USER_FLAGS;
@@ -991,7 +1050,8 @@ impl<B: Backing> Heap<B> {
         header.user_flags = 0;
         header.unused_bytes = 0;
         header.reserved = 0;
-        self.coalesce(block);
+        let coalesced = self.coalesce(block);
+        self.first_free = self.first_free.min(coalesced);
         true
     }
 
@@ -1011,7 +1071,7 @@ impl<B: Backing> Heap<B> {
     ///
     /// # Safety
     /// `block` must be a valid, now-free block header.
-    unsafe fn coalesce(&mut self, block: *mut u8) {
+    unsafe fn coalesce(&mut self, block: *mut u8) -> usize {
         let end = self.region_end();
         let mut start = block;
 
@@ -1036,6 +1096,7 @@ impl<B: Backing> Heap<B> {
         if (after as usize) < end {
             (*self.hdr(after)).prev_size = (*self.hdr(start)).size;
         }
+        start as usize - self.backing.base() as usize
     }
 
     /// `RtlReAllocateHeap(payload, new_size)`: grow/shrink in place when possible, else allocate +
@@ -1086,7 +1147,8 @@ impl<B: Backing> Heap<B> {
             debug_assert!(unused <= u8::MAX as usize);
             self.split(block, need);
             if (*self.hdr(block)).size != cur_total {
-                self.coalesce(block.add(need));
+                let coalesced = self.coalesce(block.add(need));
+                self.first_free = self.first_free.min(coalesced);
             }
             (*self.hdr(block)).unused_bytes = unused as u8;
             if new_size > old_size {
@@ -1104,6 +1166,16 @@ impl<B: Backing> Heap<B> {
             && cur_total + (*self.hdr(next)).size >= need
         {
             let merged = cur_total + (*self.hdr(next)).size;
+            let next_offset = offset + cur_total;
+            let replacement = if self.first_free == next_offset {
+                if merged - need >= MIN_BLOCK_SIZE {
+                    offset + need
+                } else {
+                    self.next_free_from(offset + merged, (*self.hdr(next)).size)?
+                }
+            } else {
+                self.first_free
+            };
             (*self.hdr(block)).size = merged;
             // Fix the block after `next`.
             let after = block.add(merged);
@@ -1111,6 +1183,7 @@ impl<B: Backing> Heap<B> {
                 (*self.hdr(after)).prev_size = merged;
             }
             self.split(block, need);
+            self.first_free = replacement;
             let unused = (*self.hdr(block)).size - HDR - new_size;
             debug_assert!(unused <= u8::MAX as usize);
             (*self.hdr(block)).unused_bytes = unused as u8;
@@ -1555,6 +1628,8 @@ impl<'a, B: Backing, const H: usize, const N: usize> HeapPeerRegistry<'a, B, H, 
 mod tests {
     extern crate std;
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
     use std::vec;
     use std::vec::Vec;
 
@@ -1621,6 +1696,45 @@ mod tests {
             buf: vec![0u8; bytes + HEAP_ALIGN],
         })
         .unwrap()
+    }
+
+    struct CountedBacking {
+        buf: Vec<u8>,
+        base_calls: Rc<Cell<usize>>,
+    }
+
+    // SAFETY: the backing owns a stable byte buffer, and base is aligned within its allocation.
+    unsafe impl Backing for CountedBacking {
+        fn base(&self) -> *mut u8 {
+            self.base_calls.set(self.base_calls.get() + 1);
+            round_up(self.buf.as_ptr() as usize, HEAP_ALIGN) as *mut u8
+        }
+
+        fn len(&self) -> usize {
+            let raw = self.buf.as_ptr() as usize;
+            self.buf.len() - (round_up(raw, HEAP_ALIGN) - raw)
+        }
+    }
+
+    #[test]
+    fn append_allocation_does_not_scan_every_live_block() {
+        let base_calls = Rc::new(Cell::new(0));
+        let mut heap = Heap::create(CountedBacking {
+            buf: vec![0; 512 * 1024 + HEAP_ALIGN],
+            base_calls: Rc::clone(&base_calls),
+        })
+        .unwrap();
+        for _ in 0..4096 {
+            heap.allocate(16).unwrap();
+        }
+        base_calls.set(0);
+        assert!(heap.allocate(16).is_some());
+        assert!(
+            base_calls.get() < 64,
+            "append visited {} backing blocks",
+            base_calls.get()
+        );
+        assert!(heap.validate(None));
     }
 
     fn next_walk_entry(heap: &Heap<VecBacking>, entry: &mut RtlHeapWalkEntry) -> RtlHeapWalkEntry {
