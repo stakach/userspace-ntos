@@ -322,6 +322,17 @@ fn pinned_dxgkrnl_debugger_presence_reads_component_data_byte() {
 }
 
 #[test]
+fn pinned_serial_debug_port_import_reads_an_isolated_kernel_data_pointer() {
+    assert!(native_imports("serial.sys").contains("KdComPortInUse"));
+    let launch = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    assert!(launch.contains("\"KdComPortInUse\" => FSD_DATA_KD_COM_PORT_IN_USE_VA"),
+        "serial.sys must resolve the data import in its mapped provider VSpace");
+    assert!(launch.contains("FSD_DATA_KD_COM_PORT_IN_USE_OFF"));
+    assert!(launch.contains("kd_com_port_in_use as *mut u64"),
+        "the exported PUCHAR is a pointer-sized data cell, not a callable thunk");
+}
+
+#[test]
 fn pinned_acpi_underscored_wide_printf_reuses_win64_variadic_gate() {
     assert!(native_imports("acpi.sys").contains("_swprintf"));
     let launch = include_str!("../../../components/ntos-executive/src/driver_launch.rs");

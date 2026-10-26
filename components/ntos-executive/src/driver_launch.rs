@@ -710,6 +710,7 @@ const FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_OFF: u64 = 0x208;
 const FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_OFF: u64 = 0x210;
 const FSD_DATA_KD_DEBUGGER_NOT_PRESENT_OFF: u64 = 0x218;
 const FSD_DATA_KE_NUMBER_PROCESSORS_OFF: u64 = 0x220;
+const FSD_DATA_KD_COM_PORT_IN_USE_OFF: u64 = 0x228;
 // HAL_DISPATCH is an imported data object. Its unsupported callbacks remain null.
 const FSD_DATA_HAL_DISPATCH_OFF: u64 = 0x240;
 const FSD_DATA_HAL_DISPATCH_BYTES: u64 = 0xC0;
@@ -758,6 +759,9 @@ const FSD_DATA_KD_DEBUGGER_NOT_PRESENT_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_KD_DEBUGGER_NOT_PRESENT_OFF;
 const FSD_DATA_KE_NUMBER_PROCESSORS_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_KE_NUMBER_PROCESSORS_OFF;
+const FSD_DATA_KD_COM_PORT_IN_USE_VA: u64 =
+    FSD_DATA_VADDR + FSD_DATA_KD_COM_PORT_IN_USE_OFF;
+const _: () = assert!(FSD_DATA_KD_COM_PORT_IN_USE_OFF + 8 <= FSD_DATA_HAL_DISPATCH_OFF);
 const FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_OFF;
 const FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_VA: u64 =
@@ -5567,6 +5571,10 @@ unsafe fn initialize_hosted_driver_data_exports(exec_data_va: u64) {
         (exec_data_va + FSD_DATA_KE_NUMBER_PROCESSORS_OFF) as *mut u8,
         processor_count as u8,
     );
+    // No serial kernel-debugger transport is registered. Export the real null PUCHAR data
+    // cell so serial.sys can compare its controller address without claiming the port.
+    let kd_com_port_in_use = exec_data_va + FSD_DATA_KD_COM_PORT_IN_USE_OFF;
+    write_volatile(kd_com_port_in_use as *mut u64, 0);
 
     let se_exports_cell = exec_data_va + FSD_DATA_SE_EXPORTS_CELL_OFF;
     let se_exports_struct = exec_data_va + FSD_DATA_SE_EXPORTS_STRUCT_OFF;
@@ -5596,6 +5604,7 @@ fn fsd_data_export_addr(name: &str) -> Option<u64> {
         "HalPrivateDispatchTable" => FSD_DATA_HAL_PRIVATE_DISPATCH_VA,
         "MmSystemRangeStart" => FSD_DATA_MM_SYSTEM_RANGE_START_VA,
         "KdDebuggerNotPresent" => FSD_DATA_KD_DEBUGGER_NOT_PRESENT_VA,
+        "KdComPortInUse" => FSD_DATA_KD_COM_PORT_IN_USE_VA,
         "KeNumberProcessors" => FSD_DATA_KE_NUMBER_PROCESSORS_VA,
         "IoFileObjectType" => FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_VA,
         "ExEventObjectType" => FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_VA,

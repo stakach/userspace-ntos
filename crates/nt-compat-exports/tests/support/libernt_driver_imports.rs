@@ -13,6 +13,7 @@ fn fixture(driver: &str) -> &'static str {
         "basicdisplay.sys" => include_str!("../fixtures/libernt_basicdisplay_native_imports.txt"),
         "dxgkrnl.sys" => include_str!("../fixtures/libernt_dxgkrnl_native_imports.txt"),
         "ksecdd.sys" => include_str!("../fixtures/libernt_ksecdd_native_imports.txt"),
+        "serial.sys" => include_str!("../fixtures/libernt_serial_native_imports.txt"),
         _ => panic!("unreviewed LiberNT driver {driver}"),
     }
 }
