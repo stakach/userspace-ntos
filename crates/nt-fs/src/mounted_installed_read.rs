@@ -131,11 +131,18 @@ impl ReadCompletions {
     }
 
     pub fn claim_next(&mut self) -> Option<ReadSectorClaim> {
+        self.claim_next_bounded(32)
+    }
+
+    /// The caller supplies the live transport's numeric sector ceiling. FAT and data claims
+    /// retain the same exact generation and completion owner regardless of that ceiling.
+    pub fn claim_next_bounded(&mut self, max_sectors: u32) -> Option<ReadSectorClaim> {
+        if max_sectors == 0 { return None; }
         let generation = self.next_generation.checked_add(1)?;
         let entry = self.entries.iter_mut().find(|entry| entry.cursor.is_some()
             && entry.claimed.is_none() && entry.terminal.is_none())?;
         let request = entry.cursor.as_ref()?.request()?;
-        let sectors = entry.cursor.as_ref()?.contiguous_data_sectors(32).unwrap_or(1);
+        let sectors = entry.cursor.as_ref()?.contiguous_data_sectors(max_sectors).unwrap_or(1);
         let claim = ReadSectorClaim { irp: entry.irp, mount: entry.mount, file: entry.file,
             request, sectors, generation };
         self.next_generation = generation;
@@ -391,6 +398,65 @@ mod tests {
         assert_eq!(reads.copy(11, 0, &mut output), Ok(4));
         assert_eq!(output, [1, 2, 3, 4]);
         reads.ack(11).unwrap();
+    }
+
+    #[test]
+    fn transport_bound_preserves_exact_claim_and_rejects_short_completion() {
+        let geometry = FatPathGeometry { fat_start_sector: 1, data_start_sector: 10,
+            total_sectors: 1000, sectors_per_cluster: 4 };
+        let mut reads = ReadCompletions::new();
+        reads.capture_range(11, 7, 9, geometry, 2, 0, 2048, None).unwrap();
+        assert!(reads.claim_next_bounded(0).is_none());
+        let first = reads.claim_next_bounded(2).unwrap();
+        assert_eq!(first.sectors, 2);
+        assert!(reads.claim_next_bounded(2).is_none());
+        assert_eq!(reads.complete_sectors(first, Ok(&[1; 512])),
+            Ok(FatRangeProgress::Complete));
+        assert_eq!(reads.next_completion(), Some((11, STATUS_DATA_ERROR as i32, 0)));
+        reads.ack(11).unwrap();
+
+        reads.capture_range(12, 7, 9, geometry, 2, 0, 2048, None).unwrap();
+        let first = reads.claim_next_bounded(2).unwrap();
+        assert_eq!(first.sectors, 2);
+        assert_eq!(reads.complete_sectors(first, Ok(&[1; 1024])),
+            Ok(FatRangeProgress::Pending));
+        let second = reads.claim_next_bounded(2).unwrap();
+        assert_eq!(second.request.sector, first.request.sector + 2);
+        assert_eq!(second.sectors, 2);
+        assert_eq!(reads.complete_sectors(second, Ok(&[2; 1024])),
+            Ok(FatRangeProgress::Complete));
+        assert_eq!(reads.next_completion(), Some((12, 0, 2048)));
+        let mut output = [0; 2048];
+        assert_eq!(reads.copy(12, 0, &mut output), Ok(2048));
+        assert_eq!(&output[..1024], &[1; 1024]);
+        assert_eq!(&output[1024..], &[2; 1024]);
+        reads.ack(12).unwrap();
+    }
+
+    #[test]
+    fn changed_transport_bound_releases_unentered_claim_before_replanning() {
+        let geometry = FatPathGeometry { fat_start_sector: 1, data_start_sector: 10,
+            total_sectors: 1000, sectors_per_cluster: 4 };
+        let mut reads = ReadCompletions::new();
+        reads.capture_range(11, 7, 9, geometry, 2, 0, 2048, None).unwrap();
+        let obsolete = reads.claim_next_bounded(4).unwrap();
+        assert_eq!(obsolete.sectors, 4);
+        reads.release_unentered(obsolete).unwrap();
+        let current = reads.claim_next_bounded(1).unwrap();
+        assert_eq!(current.sectors, 1);
+        assert_ne!(current.generation, obsolete.generation);
+        assert_eq!(reads.complete_sectors(obsolete, Ok(&[1; 2048])),
+            Err(ReadError::WrongClaim));
+        for expected_sector in 10..14 {
+            let claim = if expected_sector == 10 { current }
+                else { reads.claim_next_bounded(1).unwrap() };
+            assert_eq!(claim.request.sector, expected_sector);
+            let progress = reads.complete_sectors(claim, Ok(&[1; 512])).unwrap();
+            assert_eq!(progress, if expected_sector == 13 {
+                FatRangeProgress::Complete
+            } else { FatRangeProgress::Pending });
+        }
+        assert_eq!(reads.next_completion(), Some((11, 0, 2048)));
     }
 
     #[test]

@@ -461,6 +461,14 @@ impl DmaManager {
             .map(|a| a.num_map_registers)
     }
 
+    /// Maximum bytes in one transfer on an exact live adapter. An adapter ID alone does not
+    /// confer authority; retired and foreign adapters cannot supply a dispatch limit.
+    pub fn maximum_transfer_length_for_owner(
+        &self, owner: DmaOwner, adapter_id: u64,
+    ) -> Result<u64, DmaError> {
+        Ok(self.adapter(adapter_id, owner)?.max_length)
+    }
+
     /// Whether the adapter advertised scatter/gather support (spec §9.4).
     pub fn sg_supported(&self, adapter_id: u64) -> Option<bool> {
         self.adapters
@@ -1539,6 +1547,19 @@ mod tests {
             d.put_adapter_for_owner(owner(), adapter.adapter_id),
             Err(DmaError::StaleId)
         );
+    }
+
+    #[test]
+    fn transfer_limit_requires_exact_live_adapter_owner() {
+        let mut dma = DmaManager::new();
+        let owner = owner();
+        let adapter = dma.register_adapter(owner, true, 8192, true);
+        assert_eq!(dma.maximum_transfer_length_for_owner(owner, adapter), Ok(8192));
+        assert_eq!(dma.maximum_transfer_length_for_owner(
+            DmaOwner::new(2, 200, 20), adapter), Err(DmaError::WrongOwner));
+        dma.put_adapter_for_owner(owner, adapter).unwrap();
+        assert_eq!(dma.maximum_transfer_length_for_owner(owner, adapter), Err(DmaError::Inactive));
+        assert_eq!(dma.maximum_transfer_length_for_owner(owner, adapter + 1), Err(DmaError::StaleId));
     }
 
     #[test]
