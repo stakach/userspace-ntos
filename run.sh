@@ -232,7 +232,7 @@ cargo run -q -p ntdll-dll-verify -- --compare-exports \
   "$RM/.tmp/libernt/tree/Windows/system32/ntdll.dll" \
   "$ROOT/.tmp/nt-ntdll.dll"
 "$ROOT/components/ntos-executive/build.sh"
-( cd "$RM" && ./scripts/build_kernel.sh extern-rootserver )
+( cd "$RM" && ./scripts/build_kernel.sh extern-rootserver qemu-debugcon )
 
 if [ "$BUILD_ONLY" = 1 ]; then
   say "Boot image staged: $BOOT_IMAGE"
