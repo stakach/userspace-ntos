@@ -7009,6 +7009,31 @@ fn print_hot_ssn_field(who: &[u8], hist: &[AtomicU64; SSN_HIST_N]) {
     }
 }
 
+fn print_shared_receive_census() {
+    use nt_hosted_runtime::SharedReceiveOwner;
+    let census = spawn_hosts::shared_ingress::receive_census_snapshot();
+    print_str(b"[census] shared-recv count/total-Mtick/max-ktick");
+    for (owner, label) in [
+        (SharedReceiveOwner::Idle, b" idle".as_slice()),
+        (SharedReceiveOwner::Dispatch, b" dispatch".as_slice()),
+        (SharedReceiveOwner::Startup, b" startup".as_slice()),
+    ] {
+        for (blocking, mode) in [(true, b"-blocking".as_slice()),
+            (false, b"-nonblocking".as_slice())] {
+            let sample = census.sample(owner, blocking);
+            print_str(label);
+            print_str(mode);
+            print_str(b"=");
+            print_u64(sample.count);
+            print_str(b"/");
+            print_u64(sample.total_ticks / 1_000_000);
+            print_str(b"/");
+            print_u64(sample.max_ticks / 1_000);
+        }
+    }
+    print_str(b"\n");
+}
+
 fn print_periodic_census_heartbeat(n: u64, now: u64) {
     ingress_observation::print_hold_snapshot(now);
     let mut total_events = 0u64;
@@ -7183,6 +7208,7 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
         &*core::ptr::addr_of!(EXPLORER_SSN_HIST)
     });
     print_str(b"\n");
+    print_shared_receive_census();
     if LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) != 0 {
         let tcb = LSA_LOGON_LAST_TCB.load(Ordering::Relaxed);
         print_str(b"[lsa-logon-census] calls=");

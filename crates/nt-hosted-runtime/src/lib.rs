@@ -14,6 +14,7 @@ mod installer_progress_deferral;
 mod retained_system_fold_phase;
 mod native_block_stage_sample;
 mod badge_census;
+mod shared_receive_census;
 mod driver_load_receipt;
 mod dxg_registration;
 mod contiguous_ram;
@@ -90,6 +91,7 @@ pub use hosted_irq_call_stack::{
     validate_hosted_irq_call_pop, validate_hosted_irq_call_push, HostedIrqCallFrame,
     HostedIrqCallStackError,
 };
+pub use shared_receive_census::{SharedReceiveCensus, SharedReceiveOwner, SharedReceiveSample};
 pub use progress_deferral::ProgressDeferralBudget;
 pub use installer_progress_deferral::{InstallerOwner, InstallerProgressDeferral};
 pub use retained_system_fold_phase::RetainedSystemFoldPhase;
