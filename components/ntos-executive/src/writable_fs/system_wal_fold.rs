@@ -22,13 +22,7 @@ struct FoldWork {
     phase: Phase,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Phase {
-    Folding,
-    Acknowledging,
-    Installing,
-    Failed,
-}
+type Phase = nt_hosted_runtime::RetainedSystemFoldPhase;
 
 // An uncertain physical fold remains here until restart and boot recovery. CM retains the exact
 // ACK result, so an uncertain ACK may be retried with this preparation and without replaying I/O.
@@ -43,7 +37,12 @@ pub(crate) fn system_wal_fold_ack_pending() -> bool {
 /// Advance only the exact fold owner after both native snapshot slots reached terminal ACK.
 /// The caller has parked its physical Receive parent; this is never a general filesystem sweep.
 pub(crate) unsafe fn redrive_retained_system_wal_fold_after_native_completion() -> bool {
-    if !system_wal_fold_ack_pending() || !crate::config_manager_channel_idle() {
+    let Some(phase) = (&*core::ptr::addr_of!(FOLD_WORK)).as_ref().map(|work| work.phase) else {
+        return false;
+    };
+    let cm_channel_idle = matches!(phase, Phase::Acknowledging)
+        && crate::config_manager_channel_idle();
+    if !phase.can_redrive(cm_channel_idle) {
         return false;
     }
     // The retained checkpoint token and reserve remain installed on any uncertain CM receipt.
