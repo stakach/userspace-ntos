@@ -56,7 +56,8 @@ pub(crate) mod hive_wal;
 
 #[path = "writable_fs/system_wal_fold.rs"]
 mod system_wal_fold;
-pub(crate) use system_wal_fold::{fold_system_wal_if_dirty, system_wal_fold_ack_pending};
+pub(crate) use system_wal_fold::{fold_system_wal_if_dirty,
+    redrive_retained_system_wal_fold_after_native_completion, system_wal_fold_ack_pending};
 
 #[path = "writable_fs/file_cleanup.rs"]
 mod file_cleanup;

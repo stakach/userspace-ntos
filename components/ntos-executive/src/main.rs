@@ -15379,9 +15379,33 @@ pub(crate) unsafe fn object_manager_close_handle(
 
 /// The Configuration Manager transport wrapper.
 struct CmChan<'a>(RingChannel<'a>);
+static CM_CHANNEL_CALL_ACTIVE: AtomicBool = AtomicBool::new(false);
+static CM_CHANNEL_REQUEST_PENDING: AtomicBool = AtomicBool::new(false);
+
+struct CmChannelCallScope;
+impl Drop for CmChannelCallScope {
+    fn drop(&mut self) {
+        CM_CHANNEL_CALL_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
 impl nt_config_client::Backend for CmChan<'_> {
     fn call(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> CmReply {
+        if CM_CHANNEL_CALL_ACTIVE.swap(true, Ordering::AcqRel) {
+            return CmReply {
+                status: nt_status::NtStatus::DEVICE_BUSY.raw(),
+                information: 0,
+                detail0: 0,
+                detail1: 0,
+            };
+        }
+        let _scope = CmChannelCallScope;
         let (status, _flags, information, detail0, detail1) = self.0.raw(opcode, in_buf, out_buf);
+        // An uncertain reply keeps the one shared CM request/reply frame owned even after this
+        // stack borrow ends. A fold ACK may enter only after that exact request retires.
+        CM_CHANNEL_REQUEST_PENDING.store(
+            self.0.completion_inbox.active_request().is_some(), Ordering::Release,
+        );
         CmReply {
             status,
             information: information as u32,
@@ -15392,6 +15416,11 @@ impl nt_config_client::Backend for CmChan<'_> {
 }
 
 static mut CONFIG_CLIENT_PTR: *mut ConfigClient<CmChan<'static>> = core::ptr::null_mut();
+pub(crate) fn config_manager_channel_idle() -> bool {
+    (unsafe { !CONFIG_CLIENT_PTR.is_null() })
+        && !CM_CHANNEL_CALL_ACTIVE.load(Ordering::Acquire)
+        && !CM_CHANNEL_REQUEST_PENDING.load(Ordering::Acquire)
+}
 static mut LIVE_CONFIG_MANAGER_SYSTEM_MOUNT: Option<nt_config_client::SystemHiveMount> = None;
 static LIVE_CONFIG_MANAGER_SYSTEM_GENERATION: AtomicU64 = AtomicU64::new(0);
 static CONFIG_DEVICE_ACTION_PENDING: AtomicBool = AtomicBool::new(false);
@@ -15400,6 +15429,8 @@ const CONFIG_STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 const CONFIG_STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 
 unsafe fn install_config_manager_client(client: &mut ConfigClient<CmChan<'static>>) {
+    CM_CHANNEL_CALL_ACTIVE.store(false, Ordering::Release);
+    CM_CHANNEL_REQUEST_PENDING.store(false, Ordering::Release);
     LIVE_CONFIG_MANAGER_SYSTEM_MOUNT = None;
     LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.store(0, Ordering::Release);
     CONFIG_CLIENT_PTR = client as *mut _;

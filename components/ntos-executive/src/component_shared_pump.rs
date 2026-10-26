@@ -118,6 +118,20 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: b
                 Err(_) => panic!("service-wait yield lost its exact physical ownership"),
             }
         }
+        // A native SYSTEM fold may finish its second physical slot while this IRP Receive
+        // retains the parent Call. Release its exact CM checkpoint and reserve before a
+        // dependent registry writer retries; the generic outer finalizer cannot run here.
+        if crate::writable_fs::system_wal_fold_ack_pending() {
+            let mut parent = match runtime::nested::park_current() {
+                Ok(parent) => parent,
+                Err(_) => return PumpMessage::transport_wall(),
+            };
+            let progressed = crate::writable_fs::redrive_retained_system_wal_fold_after_native_completion();
+            if runtime::nested::restore(&mut parent).is_err() {
+                return PumpMessage::transport_wall();
+            }
+            if progressed { continue; }
+        }
         crate::registry_mutation_work::redrive_provider();
         let connect_ready = crate::driver_launch::nested_hosted_connect_forward_ready();
         if crate::driver_launch::nested_hosted_driver_create_ready()

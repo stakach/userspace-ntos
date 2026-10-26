@@ -40,6 +40,17 @@ pub(crate) fn system_wal_fold_ack_pending() -> bool {
         .is_some_and(|work| matches!(work.phase, Phase::Acknowledging | Phase::Installing)) }
 }
 
+/// Advance only the exact fold owner after both native snapshot slots reached terminal ACK.
+/// The caller has parked its physical Receive parent; this is never a general filesystem sweep.
+pub(crate) unsafe fn redrive_retained_system_wal_fold_after_native_completion() -> bool {
+    if !system_wal_fold_ack_pending() || !crate::config_manager_channel_idle() {
+        return false;
+    }
+    // The retained checkpoint token and reserve remain installed on any uncertain CM receipt.
+    // A later pump pass may retry only that same acknowledgement and installation.
+    fold_system_wal_if_dirty().is_ok()
+}
+
 /// Borrow the retained physical lease without transferring it to a recover/rollover operation
 /// whose error type does not return the device. The lease itself always stays in FOLD_WORK.
 struct FoldLease<'a>(&'a mut snapshot_storage::Lease);

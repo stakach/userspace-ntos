@@ -4654,6 +4654,16 @@ mod tests {
         assert_eq!(mounted.hive.generation, header.image_generation);
         assert_eq!(mounted.hive.dirty_count(), 0);
 
+        // A writer that observed BUSY while the fully-pulled checkpoint owned CM must be
+        // able to acquire a fresh upload after its exact durable-image ACK. This is the
+        // dependency exercised by the native fold's retained ACK continuation.
+        let resumed_mutation = server.dispatch(
+            opcode::CM_OP_MUTATE_SYSTEM_HIVE,
+            blocked_mutation.as_bytes(),
+            &mut [],
+        );
+        assert_eq!(resumed_mutation.status, STATUS_SUCCESS);
+
         // The first ACK may have taken effect while its IPC reply was lost. An
         // exact retry must report that same outcome without applying it again.
         let retry = server.dispatch(

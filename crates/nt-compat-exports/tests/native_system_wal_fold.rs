@@ -115,6 +115,29 @@ fn pending_cm_ack_redrives_before_generic_snapshot_or_timer_gate() {
 }
 
 #[test]
+fn completed_native_fold_can_advance_inside_the_active_irp_pump() {
+    let pump = source("component_shared_pump.rs");
+    let start = pump.find("pub(super) unsafe fn receive(")
+        .expect("active component Receive pump");
+    let body = &pump[start..];
+    let loop_start = body.find("loop {").expect("retained Receive loop");
+    let mutation = body.find("crate::registry_mutation_work::redrive_provider()")
+        .expect("CM mutation redrive under held parent");
+    let next_message = body.find("runtime::next_message(route)")
+        .expect("blocking Receive frontier");
+    let progress = body.find("redrive_retained_system_wal_fold_after_native_completion()")
+        .expect("exact folded checkpoint continuation under held parent");
+    assert!(loop_start < progress && progress < mutation && mutation < next_message,
+        "the folded checkpoint must release CM's writer before a BUSY mutation retries or the active IRP pump waits");
+    let narrow = &body[loop_start..mutation];
+    assert!(narrow.contains("runtime::nested::park_current()")
+        && narrow.contains("runtime::nested::restore("),
+        "the exact fold continuation must preserve and restore its physical Receive parent");
+    assert!(!narrow.contains("finalize_service_loop_state("),
+        "the active IRP pump must not run the generic provider/filesystem finalizer");
+}
+
+#[test]
 fn small_fold_keeps_anchored_epoch_and_reserves_rollover_for_capacity() {
     let fold = source("writable_fs/system_wal_fold.rs");
     let native = source("writable_fs/system_wal_fold/native.rs");
