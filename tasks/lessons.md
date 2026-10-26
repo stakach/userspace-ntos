@@ -749,3 +749,4 @@ diagnosis-free failure.
 ## Keep Native Boot Loops Evidence Driven
 - Assign a read-only monitor to long boots so the build owner can investigate the next failure without repeatedly consuming the boot log. Record a specific failing observation and a focused regression before changing source, then compare the next bounded boot against that observation.
 - A newly visible warning is not necessarily the current blocker. Track whether the boot advances past it before redirecting implementation work.
+- For QEMU performance comparisons, clone and verify the entire writable disk image before the first run, then restore that full image before each variant. Restoring only a persistence tail leaves FAT32 writes behind and invalidates the comparison.
