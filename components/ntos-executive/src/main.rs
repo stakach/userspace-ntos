@@ -6614,9 +6614,9 @@ pub(crate) static LSA_WORKER_SYSCALLS: AtomicU64 = AtomicU64::new(0);
 /// iteration of it, so the loop's WALL-CLOCK is the scarce resource the whole boot competes for.
 /// A "starvation" claim is only meaningful with the census that says WHO SPENT IT. `BADGE_EVENTS`
 /// counts loop iterations per badge; `BADGE_TIME_100NS` attributes the wall-clock between two
-/// consecutive loop tops to the badge that was serviced in between. Both are indexed by badge
-/// (every live badge is < [`BADGE_CENSUS_N`]); anything larger lands in the last slot.
-pub(crate) const BADGE_CENSUS_N: usize = 40;
+/// consecutive loop tops to the badge that was serviced in between. Endpoint badges below 64
+/// retain their own slots; timer, IRQ, guard/ISR, and larger endpoints have separate bounded slots.
+pub(crate) const BADGE_CENSUS_N: usize = nt_hosted_runtime::BADGE_CENSUS_SLOTS;
 pub(crate) static BADGE_EVENTS: [AtomicU64; BADGE_CENSUS_N] =
     [const { AtomicU64::new(0) }; BADGE_CENSUS_N];
 pub(crate) static BADGE_TIME_100NS: [AtomicU64; BADGE_CENSUS_N] =
@@ -6852,15 +6852,25 @@ pub(crate) fn ssn_bucket(ssn: u64) -> usize {
 /// before the quiesce each badge was last able to run.
 pub(crate) static BADGE_LAST_T: [AtomicU64; BADGE_CENSUS_N] =
     [const { AtomicU64::new(0) }; BADGE_CENSUS_N];
-/// Map a badge to its census slot. The hosted-thread badges are small and dense (0..=26) so they
-/// index directly; the three non-thread deliveries the loop can see get their own named slots.
+/// Map ingress to its census slot without attributing newer hosted threads to overflow.
 pub(crate) fn census_slot(badge: u64) -> usize {
-    match badge {
-        b if badge_has_delay_timer(b) => 36,
-        b if hosted_irq_lines_from_badge(b) != 0 => 37,
-        ISR_DONE_BADGE | CN_GUARD_BADGE => 38,
-        b if (b as usize) < 36 => b as usize,
-        _ => 39,
+    use nt_hosted_runtime::BadgeCensusSource;
+    let source = match badge {
+        b if badge_has_delay_timer(b) => BadgeCensusSource::DelayTimer,
+        b if hosted_irq_lines_from_badge(b) != 0 => BadgeCensusSource::HostedIrq,
+        ISR_DONE_BADGE | CN_GUARD_BADGE => BadgeCensusSource::GuardOrIsr,
+        b => BadgeCensusSource::Endpoint(b),
+    };
+    source.slot()
+}
+
+fn print_census_slot_identity(slot: usize) {
+    match slot {
+        nt_hosted_runtime::TIMER_SLOT => print_str(b"timer"),
+        nt_hosted_runtime::HOSTED_IRQ_SLOT => print_str(b"irq"),
+        nt_hosted_runtime::GUARD_OR_ISR_SLOT => print_str(b"guard/isr"),
+        nt_hosted_runtime::OVERFLOW_SLOT => print_str(b"endpoint-overflow"),
+        _ => print_u64(slot as u64),
     }
 }
 /// Timer-storm diagnostics: HPET one-shot deliveries the service loop saw, and how many of them
@@ -7025,7 +7035,7 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
     if hot_badge == usize::MAX {
         print_str(b"none");
     } else {
-        print_u64(hot_badge as u64);
+        print_census_slot_identity(hot_badge);
         print_str(b"/");
         print_u64(hot_badge_events);
         print_str(b"/");
@@ -7398,7 +7408,7 @@ fn print_census_badges() {
             continue;
         }
         print_str(b"[census] badge=");
-        print_u64(badge as u64);
+        print_census_slot_identity(badge);
         print_str(b" events=");
         print_u64(events);
         print_str(b" ms=");
