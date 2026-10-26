@@ -1,5 +1,9 @@
 # Lessons
 
+## Delegate Bounded Boot Monitoring
+- Assign a read-only agent to monitor each long graphical boot and report only new frontier or failure evidence with log lines and timing. Keep one owner for QEMU, builds, tests, and disk images.
+- Stop a boot once a failure makes its acceptance result unusable. Preserve its trace and disk tail, then require a focused regression or new diagnostic question before repeating the run.
+
 ## Check The Pinned Storage Provider Before Encoding CDBs
 - ReactOS references can lag the pinned LiberNT release. ReactOS storahci lacks READ CAPACITY16, READ16/WRITE16, and SYNCHRONIZE CACHE, while LiberNT commit `8e478a22a1e8f8a22bab17131f3184a7b4548c3d` implements all of them plus an ATA FLUSH CACHE path. Inspect the exact release source before restricting or submitting a command.
 - A reusable SRB builder does not establish live provider support. Match its command set to the pinned driver source, then verify retained native completion and flush durability before mounting writable storage.
