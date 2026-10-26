@@ -49,13 +49,27 @@ pub struct NativeBlockStageSample {
 /// Diagnostic output has a finite cap independent of the number of block requests.
 pub struct NativeBlockStageSampler {
     observations: u32,
-    emitted: u8,
+    periodic_emitted: u8,
+    slow_emitted: u8,
 }
 
 impl NativeBlockStageSampler {
     pub const MAX_EMITTED: u8 = 64;
+    const MAX_PERIODIC: u8 = 48;
+    const MAX_SLOW: u8 = Self::MAX_EMITTED - Self::MAX_PERIODIC;
 
-    pub const fn new() -> Self { Self { observations: 0, emitted: 0 } }
+    pub const fn new() -> Self {
+        Self { observations: 0, periodic_emitted: 0, slow_emitted: 0 }
+    }
+
+    /// Two samples per octave keep the setup and desktop frontier visible even
+    /// after thousands of tickets, without spending the whole output budget early.
+    fn periodic(sequence: u32) -> bool {
+        if sequence < 8 { return true; }
+        if sequence < 128 { return false; }
+        let octave = 1u32 << (31 - sequence.leading_zeros());
+        sequence == octave || (octave <= (1u32 << 30) && sequence == octave + octave / 2)
+    }
 
     /// An unacknowledged or malformed observation cannot be reported as completed I/O.
     pub fn observe(&mut self, observation: NativeBlockStageObservation)
@@ -70,23 +84,25 @@ impl NativeBlockStageSampler {
             || observation.terminal_seen_at_100ns < observation.dispatch_returned_at_100ns
             || observation.acknowledged_at_100ns < observation.terminal_seen_at_100ns
             || observation.completed_at_100ns < observation.acknowledged_at_100ns
-            || self.emitted >= Self::MAX_EMITTED
+            || self.emitted() >= Self::MAX_EMITTED
         {
             return None;
         }
         let sequence = self.observations;
         self.observations = self.observations.saturating_add(1);
-        if sequence < 8 || sequence % 128 == 0
-            || observation.completed_at_100ns - observation.claimed_at_100ns > 10_000_000
-        {
-            self.emitted += 1;
+        if Self::periodic(sequence) && self.periodic_emitted < Self::MAX_PERIODIC {
+            self.periodic_emitted += 1;
+            Some(NativeBlockStageSample { sequence, observation })
+        } else if observation.completed_at_100ns - observation.claimed_at_100ns > 10_000_000
+            && self.slow_emitted < Self::MAX_SLOW {
+            self.slow_emitted += 1;
             Some(NativeBlockStageSample { sequence, observation })
         } else {
             None
         }
     }
 
-    pub const fn emitted(&self) -> u8 { self.emitted }
+    pub const fn emitted(&self) -> u8 { self.periodic_emitted + self.slow_emitted }
 }
 
 impl Default for NativeBlockStageSampler {
@@ -142,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn first_eight_every_128th_and_over_one_second_have_finite_output() {
+    fn first_eight_periodic_and_over_one_second_have_finite_output() {
         let mut sampler = NativeBlockStageSampler::new();
         let mut samples = [u32::MAX; NativeBlockStageSampler::MAX_EMITTED as usize];
         let mut count = 0;
@@ -161,6 +177,44 @@ mod tests {
         assert!(samples[..count].contains(&1001));
         assert!(count <= NativeBlockStageSampler::MAX_EMITTED as usize);
         assert_eq!(sampler.emitted() as usize, count);
+    }
+
+    #[test]
+    fn periodic_samples_reach_late_setup_tickets_with_a_finite_cap() {
+        let mut sampler = NativeBlockStageSampler::new();
+        let mut late_sample = None;
+        let mut count = 0;
+        for n in 0..25_000u32 {
+            if let Some(sample) = sampler.observe(observation(7, u64::from(n) + 1,
+                u64::from(n) + 11, 100)) {
+                count += 1;
+                if n >= 20_000 { late_sample = Some(sample); }
+            }
+        }
+        let late_sample = late_sample.expect("periodic sampling must reach late boot");
+        assert!(late_sample.sequence >= 20_000);
+        assert_eq!(late_sample.observation.ticket, u64::from(late_sample.sequence) + 11);
+        assert!(count <= NativeBlockStageSampler::MAX_EMITTED as usize);
+        assert_eq!(sampler.emitted() as usize, count);
+    }
+
+    #[test]
+    fn early_slow_ticket_burst_preserves_late_periodic_sampling() {
+        let mut sampler = NativeBlockStageSampler::new();
+        let mut late_periodic = false;
+        let mut slow_samples = 0;
+        for n in 0..25_000u32 {
+            let elapsed = if (8..1_000).contains(&n) { 10_000_001 } else { 100 };
+            if sampler.observe(observation(7, u64::from(n) + 1,
+                u64::from(n) + 11, elapsed)).is_some() {
+                if (8..1_000).contains(&n) { slow_samples += 1; }
+                if n >= 20_000 { late_periodic = true; }
+            }
+        }
+        assert!(slow_samples > 0, "long latency must still be sampled");
+        assert!(late_periodic, "slow tickets must not exhaust the periodic horizon");
+        assert!(sampler.emitted() >= 24);
+        assert!(sampler.emitted() <= NativeBlockStageSampler::MAX_EMITTED);
     }
 
     #[test]
@@ -197,6 +251,6 @@ mod tests {
                 ..observation(13, ticket, ticket, 10_000_001)
             });
         }
-        assert_eq!(sampler.emitted(), NativeBlockStageSampler::MAX_EMITTED);
+        assert!(sampler.emitted() <= NativeBlockStageSampler::MAX_EMITTED);
     }
 }
