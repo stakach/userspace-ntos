@@ -12,6 +12,8 @@ mod hosted_irq_call_stack;
 mod progress_deferral;
 mod installer_progress_deferral;
 mod retained_system_fold_phase;
+mod native_block_stage_sample;
+mod badge_census;
 mod driver_load_receipt;
 mod dxg_registration;
 mod contiguous_ram;
@@ -91,6 +93,10 @@ pub use hosted_irq_call_stack::{
 pub use progress_deferral::ProgressDeferralBudget;
 pub use installer_progress_deferral::{InstallerOwner, InstallerProgressDeferral};
 pub use retained_system_fold_phase::RetainedSystemFoldPhase;
+pub use native_block_stage_sample::{NativeBlockStageObservation, NativeBlockStageOwner,
+    NativeBlockStageSample, NativeBlockStageSampler};
+pub use badge_census::{BadgeCensusSource, BADGE_CENSUS_SLOTS, DIRECT_BADGE_SLOTS,
+    TIMER_SLOT, HOSTED_IRQ_SLOT, GUARD_OR_ISR_SLOT, OVERFLOW_SLOT};
 
 pub const PAGE_SIZE: u64 = 0x1000;
 pub const PAGE_TABLE_SPAN: u64 = 0x20_0000;
