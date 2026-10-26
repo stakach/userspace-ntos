@@ -56,6 +56,8 @@ mod named_sections;
 mod named_directories;
 #[path = "exec_named_events.rs"]
 mod named_events;
+#[path = "exec_event_terminal_receipt.rs"]
+mod event_terminal_receipt;
 
 #[path = "file_image_section.rs"]
 pub(crate) mod file_image_section;
@@ -35488,6 +35490,11 @@ impl ExecNtHandler {
             NativeService::NtOpenEvent => unsafe {
                 let out = args[0];
                 let oa = args[2];
+                let mut receipt_root = None;
+                let mut receipt_path = [0u8; 192];
+                let mut receipt_path_len = 0;
+                let mut receipt_object = None;
+                let status = (|| -> u32 {
                 if out == 0 {
                     return 0xC000_0005; // STATUS_ACCESS_VIOLATION
                 }
@@ -35507,11 +35514,15 @@ impl ExecNtHandler {
                 let Some(path) = captured.path() else {
                     return 0xC000_0033; // STATUS_OBJECT_NAME_INVALID
                 };
+                receipt_path_len = path.len().min(receipt_path.len());
+                receipt_path[..receipt_path_len].copy_from_slice(&path[..receipt_path_len]);
                 let (root_idx, path) = match self.event_root_and_path(captured.root, path) {
                     Ok(resolved) => resolved,
                     Err(status) => return status,
                 };
+                receipt_root = Some(root_idx);
                 if let Some(i) = self.obj_resolve(path, root_idx) {
+                    receipt_object = Some(i);
                     if self.obj_ns[i].kind != 2 {
                         return 0xC000_0024; // STATUS_OBJECT_TYPE_MISMATCH
                     }
@@ -35546,6 +35557,12 @@ impl ExecNtHandler {
                     false,
                 );
                 0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
+                })();
+                event_terminal_receipt::open_failure(
+                    self, status, out, oa, receipt_root,
+                    &receipt_path[..receipt_path_len], receipt_object,
+                );
+                status
             },
             NativeService::NtCreateTimer => unsafe {
                 let out = args[0];
@@ -37463,12 +37480,19 @@ impl ExecNtHandler {
             NativeService::NtWaitForSingleObject => {
                 let handle = args[0];
                 let alertable = nt_boolean_arg(args[1]);
-                match self.wait_object_for_handle(handle, SYNCHRONIZE_ACCESS) {
+                let mut receipt_object = None;
+                let status = match self.wait_object_for_handle(handle, SYNCHRONIZE_ACCESS) {
                     Ok(object) => {
+                        receipt_object = Some(object);
                         let timeout_ptr = args[2];
                         let timeout = match self.wait_timeout_interval(timeout_ptr) {
                             Ok(timeout) => timeout,
-                            Err(status) => return status,
+                            Err(status) => {
+                                event_terminal_receipt::wait_failure(
+                                    self, status, handle, timeout_ptr, receipt_object,
+                                );
+                                return status;
+                            }
                         };
                         self.begin_single_object_wait(
                             b"NtWaitForSingleObject",
@@ -37480,7 +37504,11 @@ impl ExecNtHandler {
                         )
                     }
                     Err(status) => status,
-                }
+                };
+                event_terminal_receipt::wait_failure(
+                    self, status, handle, args[2], receipt_object,
+                );
+                status
             }
             NativeService::NtWaitForMultipleObjects => self.begin_multiple_object_wait(
                 nt_ulong_arg(args[0]),

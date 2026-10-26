@@ -1208,6 +1208,31 @@ mod tests {
     }
 
     #[test]
+    fn distinct_process_handles_share_named_notification_event_state() {
+        use crate::{EventKind, EventStore, IrqlState, WaitResult};
+
+        // The executive resolves a named path once and mints a handle in each process table.
+        // Both handles retain the same generation-protected event body.
+        let native_identity = 0xC0DE;
+        let mut objects = EventObjectRegistry::new();
+        let creator_handle = objects.create(EventObjectOwner::new(41, 3), native_identity).unwrap();
+        objects.retain_handle(creator_handle).unwrap();
+        let opener_handle = objects.id_for_native(native_identity).unwrap();
+        objects.retain_handle(opener_handle).unwrap();
+        assert_eq!(creator_handle, opener_handle);
+        assert_eq!(objects.snapshot(opener_handle).unwrap().handle_leases, 2);
+
+        let mut state = EventStore::new();
+        let irql = IrqlState::new();
+        state.initialize(native_identity, EventKind::Notification, false);
+        assert_eq!(state.poll(native_identity, &irql), WaitResult::TimedOut);
+        assert!(!state.set(native_identity));
+        assert_eq!(state.poll(native_identity, &irql), WaitResult::Signaled);
+        assert_eq!(state.poll(native_identity, &irql), WaitResult::Signaled,
+            "notification state remains visible to both process handles");
+    }
+
+    #[test]
     fn grows_beyond_old_event_and_gui_wait_limits() {
         let mut registry = EventObjectRegistry::with_capacity(1, 1);
         let mut ids = Vec::new();
