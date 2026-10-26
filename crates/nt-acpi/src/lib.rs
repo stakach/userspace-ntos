@@ -42,9 +42,9 @@ pub use namespace::{
 };
 pub use pci_routing::{
     parse_interrupt_resource_template, parse_pci_routing_table, resolve_legacy_irq,
-    resolve_pci_routing_table,
+    resolve_interrupt_resource, resolve_pci_routing_table,
     InterruptResource, InterruptSource, LegacyIrqOverride, PciInterruptLink, PciRouteSource,
-    PciRoutingEntry, PciRoutingError, PciRoutingTable, ResolvedPciRoute,
+    PciRoutingEntry, PciRoutingError, PciRoutingTable, ResolvedInterruptResource, ResolvedPciRoute,
 };
 
 pub const SDT_HEADER_LEN: usize = 36;
