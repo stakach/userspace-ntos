@@ -418,6 +418,8 @@ impl StartDeviceCompletion {
 pub struct StartDeviceTerminalRecord {
     identity: StartDeviceRequestIdentity,
     instance_id: String,
+    caller_pid: u64,
+    caller_generation: u64,
     completion: StartDeviceCompletionKind,
     path: StartDeviceCallPath,
     lifecycle_receipt: Option<StartDeviceLifecycleReceipt>,
@@ -434,6 +436,14 @@ impl StartDeviceTerminalRecord {
 
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    pub const fn caller_pid(&self) -> u64 {
+        self.caller_pid
+    }
+
+    pub const fn caller_generation(&self) -> u64 {
+        self.caller_generation
     }
 
     pub const fn completion(&self) -> StartDeviceCompletionKind {
@@ -474,9 +484,29 @@ impl StartDeviceTerminalRecord {
 struct ActiveStartDeviceRequest {
     identity: StartDeviceRequestIdentity,
     instance_id: String,
+    caller_pid: u64,
+    caller_generation: u64,
     path: StartDeviceCallPath,
     completion: Option<StartDeviceCompletion>,
     reply: ActiveStartDeviceReply,
+}
+
+/// Read-only evidence for the exact completed START result awaiting its syscall reply.
+#[derive(Debug, PartialEq, Eq)]
+pub struct StartDeviceReplyEvidence<'a> {
+    instance_id: &'a str,
+    caller_pid: u64,
+    caller_generation: u64,
+    completion: StartDeviceCompletionKind,
+    status: u32,
+}
+
+impl StartDeviceReplyEvidence<'_> {
+    pub const fn instance_id(&self) -> &str { self.instance_id }
+    pub const fn caller_pid(&self) -> u64 { self.caller_pid }
+    pub const fn caller_generation(&self) -> u64 { self.caller_generation }
+    pub const fn completion(&self) -> StartDeviceCompletionKind { self.completion }
+    pub const fn status(&self) -> u32 { self.status }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -519,6 +549,15 @@ impl StartDeviceCallLedger {
         &mut self,
         instance_id: &str,
     ) -> Result<StartDeviceRequestIdentity, StartDeviceLedgerError> {
+        self.begin_with_caller(instance_id, 0, 0)
+    }
+
+    pub fn begin_with_caller(
+        &mut self,
+        instance_id: &str,
+        caller_pid: u64,
+        caller_generation: u64,
+    ) -> Result<StartDeviceRequestIdentity, StartDeviceLedgerError> {
         if instance_id.is_empty() {
             return Err(StartDeviceLedgerError::InvalidInstance);
         }
@@ -553,6 +592,8 @@ impl StartDeviceCallLedger {
         self.active.push(ActiveStartDeviceRequest {
             identity,
             instance_id: owned_instance,
+            caller_pid,
+            caller_generation,
             path: StartDeviceCallPath::Synchronous,
             completion: None,
             reply: ActiveStartDeviceReply::Awaiting,
@@ -775,6 +816,8 @@ impl StartDeviceCallLedger {
         self.terminal.push(StartDeviceTerminalRecord {
             identity,
             instance_id: request.instance_id,
+            caller_pid: request.caller_pid,
+            caller_generation: request.caller_generation,
             completion: completion_kind,
             path: request.path,
             lifecycle_receipt,
@@ -796,6 +839,31 @@ impl StartDeviceCallLedger {
 
     pub fn terminal_rows(&self) -> &[StartDeviceTerminalRecord] {
         &self.terminal
+    }
+
+    pub fn result_for_reply(
+        &self,
+        identity: StartDeviceRequestIdentity,
+    ) -> Option<StartDeviceReplyEvidence<'_>> {
+        let request = self.active.iter().find(|request| request.identity == identity)?;
+        if request.reply != ActiveStartDeviceReply::Awaiting {
+            return None;
+        }
+        let completion = request.completion.as_ref()?;
+        Some(StartDeviceReplyEvidence {
+            instance_id: &request.instance_id,
+            caller_pid: request.caller_pid,
+            caller_generation: request.caller_generation,
+            completion: completion.kind(),
+            status: completion.status(),
+        })
+    }
+
+    pub fn terminal_by_identity(
+        &self,
+        identity: StartDeviceRequestIdentity,
+    ) -> Option<&StartDeviceTerminalRecord> {
+        self.terminal.iter().find(|row| row.identity == identity)
     }
 
     pub const fn protocol_errors(&self) -> u64 {
@@ -4333,5 +4401,40 @@ mod tests {
             Err(StartDeviceLedgerError::UnknownRequest)
         );
         assert_eq!(ledger.protocol_errors(), 3);
+    }
+
+    #[test]
+    fn start_device_reply_evidence_requires_exact_live_request_identity() {
+        let mut ledger = StartDeviceCallLedger::new();
+        let old = ledger.begin_with_caller(r"PCI\VEN_1111\0001", 40, 3).unwrap();
+        let current = ledger.begin_with_caller(r"PCI\VEN_2222\0002", 44, 7).unwrap();
+        ledger.complete_without_start_irp(old, 0xc000_000e).unwrap();
+        ledger.complete_without_start_irp(current, 0xc000_000e).unwrap();
+
+        let evidence = ledger.result_for_reply(current).unwrap();
+        assert_eq!(evidence.instance_id(), r"PCI\VEN_2222\0002");
+        assert_eq!((evidence.caller_pid(), evidence.caller_generation()), (44, 7));
+        assert_eq!(evidence.completion(), StartDeviceCompletionKind::NoStartIrp);
+        assert_eq!(evidence.status(), 0xc000_000e);
+        assert_ne!(ledger.result_for_reply(old).unwrap().instance_id(), evidence.instance_id());
+        assert_eq!(ledger.result_for_reply(StartDeviceRequestIdentity { sequence: 999 }), None);
+        assert_eq!(
+            ledger.record_reply(StartDeviceRequestIdentity { sequence: 999 }, 0xc000_000e, true),
+            Err(StartDeviceLedgerError::UnknownRequest)
+        );
+        assert_eq!(ledger.result_for_reply(current).unwrap().instance_id(), r"PCI\VEN_2222\0002");
+
+        ledger.record_reply(current, 0xc000_000e, true).unwrap();
+        assert_eq!(ledger.result_for_reply(current), None);
+        let terminal = ledger.terminal_by_identity(current).unwrap();
+        assert_eq!(terminal.instance_id(), r"PCI\VEN_2222\0002");
+        assert_eq!((terminal.caller_pid(), terminal.caller_generation()), (44, 7));
+        assert!(terminal.reply_matches());
+        assert!(ledger.terminal_by_identity(old).is_none());
+        assert_eq!(ledger.result_for_reply(old).unwrap().instance_id(), r"PCI\VEN_1111\0001");
+        ledger.record_reply(old, 0xc000_000e, true).unwrap();
+        assert_eq!(ledger.result_for_reply(old), None);
+        assert_eq!(ledger.record_reply(old, 0xc000_000e, true), Err(StartDeviceLedgerError::UnknownRequest));
+        assert_eq!(ledger.terminal_by_identity(current).unwrap().instance_id(), r"PCI\VEN_2222\0002");
     }
 }

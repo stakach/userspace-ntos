@@ -9,6 +9,11 @@ use crate::provider_local_event::trace as trace_provider_local_event;
 use nt_io_abi::major;
 use nt_io_manager::{LocalFileObject, PendingFileRoute};
 
+static PNP_START_RESULT_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static PNP_START_FAILURE_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static PNP_DEVICE_STATUS_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static PNP_DEVICE_STATUS_FAILURE_TRACE_N: AtomicU64 = AtomicU64::new(0);
+
 #[path = "native_job_bodies.rs"]
 pub(crate) mod native_job_bodies;
 
@@ -18905,8 +18910,43 @@ impl ExecNtHandler {
         status: u32,
         delivered: bool,
     ) -> Result<(), nt_pnp_manager::StartDeviceLedgerError> {
-        self.pnp_start_device_calls
-            .record_reply(identity, status, delivered)
+        let result = self.pnp_start_device_calls.record_reply(identity, status, delivered);
+        // The terminal row is indexed by the manager-minted request identity. Never infer an
+        // instance from the currently scheduled process when a pending START finally replies.
+        if let Some(row) = self.pnp_start_device_calls.terminal_by_identity(identity) {
+            let n = PNP_START_RESULT_TRACE_N.fetch_add(1, Ordering::Relaxed);
+            let failure = row.status() != 0 || !delivered;
+            let failure_n = failure.then(|| PNP_START_FAILURE_TRACE_N.fetch_add(1, Ordering::Relaxed));
+            if n < 32 || (n < 8192 && n % 128 == 0) || failure_n.is_some_and(|n| n < 32) {
+                print_str(b"[pnp-start-result] call=");
+                print_u64(identity.sequence());
+                print_str(b" instance=");
+                print_str(row.instance_id().as_bytes());
+                print_str(b" caller-pid/gen=");
+                print_u64(row.caller_pid());
+                print_str(b"/");
+                print_u64(row.caller_generation());
+                print_str(b" path=");
+                print_str(match row.path() {
+                    nt_pnp_manager::StartDeviceCallPath::Synchronous => b"synchronous",
+                    nt_pnp_manager::StartDeviceCallPath::Pending => b"pending",
+                });
+                print_str(b" completion=");
+                print_str(match row.completion() {
+                    nt_pnp_manager::StartDeviceCompletionKind::NoStartIrp => b"no-start-irp",
+                    nt_pnp_manager::StartDeviceCompletionKind::LifecycleTerminal => b"lifecycle-terminal",
+                    nt_pnp_manager::StartDeviceCompletionKind::OwnershipLost => b"ownership-lost",
+                });
+                print_str(b" status=0x");
+                print_hex_u64(row.status() as u64);
+                print_str(b" reply=0x");
+                print_hex_u64(status as u64);
+                print_str(b" delivered=");
+                print_u64(delivered as u64);
+                print_str(b"\n");
+            }
+        }
+        result
     }
 
     unsafe fn pnp_read_u32(&self, va: u64) -> Result<u32, u32> {
@@ -19038,7 +19078,30 @@ impl ExecNtHandler {
             9 => self.pnp_control_interface_device_list(buffer, buffer_len),
             10 => self.pnp_control_property(buffer, buffer_len),
             12 => self.pnp_control_related_device(buffer, buffer_len),
-            14 => self.pnp_control_device_status(buffer, buffer_len),
+            14 => {
+                let status = self.pnp_control_device_status(buffer, buffer_len);
+                let n = PNP_DEVICE_STATUS_TRACE_N.fetch_add(1, Ordering::Relaxed);
+                let failure_n = (status != 0)
+                    .then(|| PNP_DEVICE_STATUS_FAILURE_TRACE_N.fetch_add(1, Ordering::Relaxed));
+                if n < 32 || (n < 8192 && n % 128 == 0) || failure_n.is_some_and(|n| n < 32) {
+                    print_str(b"[pnp-device-status-result] caller-pid/gen=");
+                    print_u64(self.pm_pid_for_pi(self.pi).map(u64::from).unwrap_or(0));
+                    print_str(b"/");
+                    print_u64(self.hosted_process_generation(self.pi).unwrap_or(0));
+                    print_str(b" operation=");
+                    print_u64(self.pnp_read_u32(buffer.saturating_add(16)).unwrap_or(u32::MAX) as u64);
+                    print_str(b" instance=");
+                    if let Ok(instance) = self.pnp_read_device_instance(buffer) {
+                        print_str(instance.as_bytes());
+                    } else {
+                        print_str(b"<unreadable>");
+                    }
+                    print_str(b" status=0x");
+                    print_hex_u64(status as u64);
+                    print_str(b"\n");
+                }
+                status
+            },
             15 => self.pnp_control_device_depth(buffer, buffer_len),
             16 => self.pnp_control_device_relations(buffer, buffer_len),
             20 => self.pnp_control_reset_device(buffer, buffer_len),
@@ -19074,7 +19137,11 @@ impl ExecNtHandler {
             Ok(instance) => instance,
             Err(status) => return status,
         };
-        let request = match self.pnp_start_device_calls.begin(&instance) {
+        let caller_pid = self.pm_pid_for_pi(self.pi).map(u64::from).unwrap_or(0);
+        let caller_generation = self.hosted_process_generation(self.pi).unwrap_or(0);
+        let request = match self.pnp_start_device_calls.begin_with_caller(
+            &instance, caller_pid, caller_generation,
+        ) {
             Ok(request) => request,
             Err(_) => return STATUS_INSUFFICIENT_RESOURCES,
         };
