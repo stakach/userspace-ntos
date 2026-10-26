@@ -25706,8 +25706,9 @@ unsafe fn file_cleanup_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 )
             });
         if !cleanup_complete {
-            driver_launch::release_hosted_file(file_id)
-                .expect("active File cleanup lost its canonical manager owner");
+            // start_file_cleanup transferred the final-handle owner once. The
+            // manager and retained lifecycle row own every pending retry;
+            // observing a nonterminal File does not grant another release.
             continue;
         }
         let continuation =
