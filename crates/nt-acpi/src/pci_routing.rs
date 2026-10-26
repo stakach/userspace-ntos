@@ -103,6 +103,55 @@ pub struct ResolvedInterruptResource {
     pub shared: bool,
 }
 
+/// Interrupt fields retained from a bus-reported CM descriptor.
+/// CM omits both polarity and whether its line is a legacy IRQ or a direct GSI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReportedInterruptResource {
+    pub line: u32,
+    pub level_sensitive: bool,
+    pub shared: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportedInterruptError {
+    Missing,
+    Ambiguous,
+    Mismatch,
+    InvalidRoute,
+}
+
+/// Reconcile an accepted PDO's exact `_CRS` with its bus-reported CM interrupt.
+/// The caller must retain the `_CRS` slice with that same PDO and provider generation.
+pub fn reconcile_reported_interrupt(
+    crs_interrupts: &[InterruptResource],
+    reported: ReportedInterruptResource,
+    legacy_irq_overrides: &[LegacyIrqOverride],
+) -> Result<ResolvedInterruptResource, ReportedInterruptError> {
+    let mut selected = None;
+    for resource in crs_interrupts {
+        let source_line = match resource.interrupt {
+            InterruptSource::LegacyIrq(irq) => u32::from(irq),
+            InterruptSource::GlobalSystemInterrupt(gsi) => gsi,
+        };
+        if source_line != reported.line {
+            continue;
+        }
+        if selected.replace(*resource).is_some() {
+            return Err(ReportedInterruptError::Ambiguous);
+        }
+    }
+    let resource = selected.ok_or(ReportedInterruptError::Missing)?;
+    if resource.level_sensitive != reported.level_sensitive || resource.shared != reported.shared {
+        return Err(ReportedInterruptError::Mismatch);
+    }
+    resolve_interrupt_resource(resource, legacy_irq_overrides)
+        .map_err(|_| ReportedInterruptError::InvalidRoute)
+}
+
+#[cfg(test)]
+#[path = "pci_routing/reconcile_tests.rs"]
+mod reconcile_tests;
+
 /// Resolve one exact ACPI `_CRS` interrupt descriptor without discarding its electrical mode.
 ///
 /// A small IRQ descriptor names a legacy line and its own trigger, polarity, and sharing. A MADT
@@ -499,9 +548,6 @@ fn parse_small_irq(
     }
     let level_sensitive = flags & 0x01 == 0;
     let active_low = flags & 0x08 != 0;
-    if level_sensitive != active_low {
-        return Err(PciRoutingError::InvalidResourceTemplate);
-    }
     for irq in 0..16u8 {
         if mask & (1u16 << irq) == 0 {
             continue;
@@ -994,12 +1040,12 @@ mod tests {
 
     #[test]
     fn unsupported_or_ambiguous_interrupt_authority_fails_closed() {
-        let invalid_pic_pair = eval_output(&[argument(
+        let reserved_pic_flags = eval_output(&[argument(
             METHOD_ARGUMENT_BUFFER,
-            &[0x23, 0x20, 0x00, 0x19, 0x79, 0],
+            &[0x23, 0x20, 0x00, 0x40, 0x79, 0],
         )]);
         assert_eq!(
-            parse_interrupt_resource_template(&invalid_pic_pair),
+            parse_interrupt_resource_template(&reserved_pic_flags),
             Err(PciRoutingError::InvalidResourceTemplate)
         );
 

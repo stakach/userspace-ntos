@@ -651,6 +651,7 @@ version = "0.1.0"
 name = "nt-pnp-manager"
 version = "0.1.0"
 dependencies = [
+ "nt-acpi",
  "nt-cm-resources",
  "nt-io-abi",
  "nt-io-manager",

@@ -926,6 +926,8 @@ pub struct PdoProperties {
     pub boot_resources_translated: PropertyBlobState,
     /// Initial requirements returned by the bus before the function stack is built.
     pub resource_requirements: PropertyBlobState,
+    /// Exact `_CRS` interrupt facts from this PDO's accepted ACPI relation query.
+    pub acpi_interrupt_resources: Option<Vec<nt_acpi::InterruptResource>>,
     /// Requirements after `IRP_MN_FILTER_RESOURCE_REQUIREMENTS` has traversed the function stack.
     pub filtered_resource_requirements: PropertyBlobState,
     pub allocated_resources_raw: PropertyBlobState,
@@ -950,6 +952,7 @@ impl PdoProperties {
             boot_resources_raw,
             boot_resources_translated,
             resource_requirements,
+            acpi_interrupt_resources: None,
             filtered_resource_requirements: PropertyBlobState::Unqueried,
             allocated_resources_raw: PropertyBlobState::Unqueried,
             allocated_resources_translated: PropertyBlobState::Unqueried,
@@ -972,6 +975,14 @@ impl PdoProperties {
         )
     }
 
+    pub fn with_acpi_interrupt_resources(
+        mut self,
+        resources: Vec<nt_acpi::InterruptResource>,
+    ) -> Self {
+        self.acpi_interrupt_resources = Some(resources);
+        self
+    }
+
     fn immutable_identity_eq(&self, other: &Self) -> bool {
         self.bus_information == other.bus_information
             && self.capabilities == other.capabilities
@@ -979,6 +990,32 @@ impl PdoProperties {
             && self.boot_resources_raw == other.boot_resources_raw
             && self.boot_resources_translated == other.boot_resources_translated
             && self.resource_requirements == other.resource_requirements
+            && self.acpi_interrupt_resources == other.acpi_interrupt_resources
+    }
+}
+
+#[cfg(test)]
+mod acpi_interrupt_provenance_tests {
+    use super::*;
+
+    #[test]
+    fn accepted_pdo_identity_includes_evaluated_interrupt_provenance() {
+        let plain = PdoProperties::from_bus_queries(
+            None,
+            None,
+            PropertyBlobState::KnownNone,
+            PropertyBlobState::KnownNone,
+            PropertyBlobState::KnownNone,
+        );
+        let with_crs = plain.clone().with_acpi_interrupt_resources(alloc::vec![nt_acpi::InterruptResource {
+            descriptor_index: 0,
+            interrupt: nt_acpi::InterruptSource::LegacyIrq(4),
+            level_sensitive: true,
+            active_low: true,
+            shared: true,
+        }]);
+        assert!(!plain.immutable_identity_eq(&with_crs));
+        assert!(plain.immutable_identity_eq(&plain.clone()));
     }
 }
 
