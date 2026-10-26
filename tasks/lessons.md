@@ -4,6 +4,7 @@
 - Assign a read-only agent to monitor each long graphical boot and report only new frontier or failure evidence with log lines and timing. Keep one owner for QEMU, builds, tests, and disk images.
 - Stop a boot once a failure makes its acceptance result unusable. Preserve its trace and disk tail, then require a focused regression or new diagnostic question before repeating the run.
 - Match guest object paths case-insensitively and inspect the actual operation receipt before reporting an absent event. The native trace normalizes `Global` names to lowercase; a case-sensitive monitor missed successful setup opens of the PnP completion event.
+- Distinguish a guest reboot API request from a machine reset. Require a second firmware, loader, and kernel-init sequence before claiming a reboot; a setup process can request reboot and exit while the current kernel continues running.
 
 ## Check Census Bucket Semantics Before Naming an Owner
 - The final `hot-badge` slot aggregates every badge above the census limit. Read the bucket definition before attributing its time or event count to a process; use exact process samples and syscall traces to identify a hotspot.
