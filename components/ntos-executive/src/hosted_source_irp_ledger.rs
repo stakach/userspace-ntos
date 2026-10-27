@@ -1089,6 +1089,77 @@ fn mutate_local_irp_packet(
     }
 }
 
+/// Perform the void export's effect under every owner that can retire or recycle
+/// its source packet and requestor ETHREAD. The address arguments select candidates
+/// only; the source ticket, physical pool generation, canonical PM, and device
+/// registry establish authority.
+fn set_hard_error_or_verify_device(
+    instance_index: usize,
+    inst: DriverInstance,
+    irp: u64,
+    device: u64,
+) -> (i32, u64, u64) {
+    let Some(domain) = instance_domain_identity(inst) else {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    };
+    let _source_guard = lock();
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    };
+    let registration = [
+        SourceIrpOwner::HostedDriver(instance_index),
+        SourceIrpOwner::HostedCaller(instance_index),
+    ].into_iter().find_map(|owner| ledger().registered(owner, domain, irp));
+    let Some((ticket, allocation)) = registration else {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    };
+    let Some(current) = allocation_unlocked(
+        instance_index, inst, irp, allocation.bytes, allocation.stack_count,
+    ) else {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    };
+    if current.pool_generation != allocation.pool_generation
+        || current.domain != domain
+        || !matches!(allocation.owner,
+            SourceIrpOwner::HostedDriver(_) | SourceIrpOwner::HostedCaller(_))
+    {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    }
+    let Some(source) = SourceIrpForwardIdentity::new(ticket, allocation) else {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    };
+    let Some(exec) = (unsafe {
+        hosted_pool_allocation_exec_va(inst.exec_pool_va, irp, WDM_X64_IRP_SIZE as u64)
+    }) else {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    };
+    // IRP.Tail.Overlay.Thread is at +0x98 in the hosted AMD64 WDM projection.
+    let irp_thread = unsafe { read_unaligned((exec + 0x98) as *const u64) };
+    let registration = (device != 0)
+        .then(|| unsafe { io_manager_mut().hosted_device_pointer_registration(domain, device) })
+        .flatten();
+    let result = unsafe { crate::service_sec_image::with_provider_process_manager(|pm| {
+        let canonical_thread = pm.tid_for_kernel_thread_object(irp_thread)
+            .and_then(|tid| pm.thread_lifetime(tid).filter(|lifetime| {
+                pm.validate_thread_lifetime(*lifetime)
+                    && pm.thread_kernel_object(tid) == Some(irp_thread)
+            }))
+            .map(|_| irp_thread);
+        let write = nt_io_manager::hard_error_verify_device::plan_hard_error_verify_device(
+            ledger(), source, irp_thread, canonical_thread, device,
+            registration.map(|registration| registration.device_id()),
+        ).map_err(|_| nt_process::STATUS_INVALID_HANDLE)?;
+        if let Some((thread, _)) = write {
+            crate::ps_object_backing::set_thread_device_to_verify(pm, thread, registration)?;
+        }
+        Ok(())
+    }) };
+    match result {
+        Ok(()) => (STATUS_SUCCESS, 0, 0),
+        Err(status) => (status as i32, 0, 0),
+    }
+}
+
 pub(super) fn service(
     ch: &crate::spawn_hosts::PumpChannel,
     op: u64,
@@ -1105,6 +1176,12 @@ pub(super) fn service(
         return (STATUS_INVALID_HANDLE, 0, 0);
     }
     match op {
+        14 if stack_count == 0 => {
+            if hosted_driver_caller(instance_index, inst, caller_badge).is_none() {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            }
+            set_hard_error_or_verify_device(instance_index, inst, component_address, bytes)
+        }
         12 | 13 => mutate_local_irp_packet(
             instance_index, inst, op, component_address, bytes, stack_count,
         ),

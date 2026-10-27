@@ -208,6 +208,8 @@ mod hosted_source_irp_ledger;
 mod hosted_driver_object_reference;
 #[path = "hosted_irp_lifecycle_exports.rs"]
 mod hosted_irp_lifecycle_exports;
+#[path = "hosted_hard_error_verify_device.rs"]
+mod hosted_hard_error_verify_device;
 #[path = "hosted_driver_apc_region.rs"]
 mod hosted_driver_apc_region;
 #[path = "hosted_start_io.rs"]
@@ -35507,6 +35509,7 @@ fn register_fsd_trampolines() -> bool {
         s_io_allocate_irp as *const () as usize as u64,
     );
     hosted_irp_lifecycle_exports::bind(reg);
+    hosted_hard_error_verify_device::bind(reg);
     reg.bind("IoFreeIrp", s_io_free_irp as *const () as usize as u64);
     reg.bind(
         "IoBuildDeviceIoControlRequest",
