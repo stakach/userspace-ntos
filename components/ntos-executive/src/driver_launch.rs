@@ -68,6 +68,10 @@ mod hosted_connect_work;
 #[path = "hosted_connect_live.rs"]
 mod hosted_connect_live;
 #[path = "hosted_class_callback_lane.rs"]
+#[path = "hosted_wmi_reginfo.rs"]
+mod hosted_wmi_reginfo;
+#[path = "hosted_driver_wmi.rs"]
+mod hosted_driver_wmi;
 mod hosted_class_callback_lane;
 #[path = "hosted_class_callback_thunk.rs"]
 mod hosted_class_callback_thunk;
@@ -439,6 +443,7 @@ mod hosted_kernel_file_read_query;
 #[path = "hosted_kernel_win32k_async_read.rs"]
 mod hosted_kernel_win32k_async_read;
 #[path = "hosted_power_broker.rs"]
+pub(crate) use hosted_driver_wmi::service as service_hosted_driver_wmi;
 mod hosted_power_broker;
 #[path = "hosted_sync_relations.rs"]
 pub(crate) mod hosted_sync_relations;
@@ -1346,6 +1351,7 @@ const _: () = {
         FSD_SERVICE_LOWER_FILE_FORWARD_LABEL,
         FSD_SERVICE_LOWER_POWER_FORWARD_LABEL,
         FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL,
+pub const FSD_SERVICE_WMI_LABEL: u64 = hosted_driver_wmi::LABEL;
         FSD_SERVICE_SCSI_FORWARD_LABEL,
         FSD_SERVICE_REMOVE_DPC_LABEL,
         FSD_SERVICE_ZW_UNLOAD_DRIVER_LABEL,
@@ -1395,6 +1401,7 @@ const _: () = {
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_VIDEO_FIND_ADAPTER: u64 = u64::MAX - 0x775;
+        FSD_SERVICE_WMI_LABEL,
 pub const FSD_DISPATCH_VIDEO_ADD_DEVICE: u64 = u64::MAX - 0x778;
 pub const FSD_DISPATCH_PROVIDER_EXPORT: u64 = u64::MAX - 0x779;
 pub const FSD_DISPATCH_PROVIDER_CALLBACK: u64 = u64::MAX - 0x77A;
@@ -35875,6 +35882,7 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "RtlFindUnicodePrefix",
         s_rtl_find_unicode_prefix as *const () as usize as u64,
+    hosted_driver_wmi::bind(reg);
     );
     reg.bind(
         "RtlRemoveUnicodePrefix",
@@ -59790,7 +59798,11 @@ unsafe fn drain_hosted_device_retirements() -> usize {
         if !retirement.pointer_retired {
             let registration = retirement.pointer_registration;
             match hosted_device_allocations::retire_canonical_pointer(io_manager_mut(), registration) {
-                Ok(()) => hosted_device_retirements_mut()[index].pointer_retired = true,
+                Ok(()) => {
+                    hosted_driver_wmi::retire_device(registration)
+                        .expect("exact WMI device provider identity must retire with pointer");
+                    hosted_device_retirements_mut()[index].pointer_retired = true;
+                }
                 Err(nt_status::NtStatus::DEVICE_BUSY) => {
                     index += 1;
                     continue;

@@ -50,6 +50,38 @@ pub struct WmiProviderId(u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WmiBlockId(u64);
 
+/// A REGINFO request reserved before native dispatch. The token cannot be
+/// retargeted to a later device incarnation at the same address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegInfoTicket {
+    id: u64,
+    identity: WmiDeviceIdentity,
+}
+
+impl RegInfoTicket {
+    /// Transport the ticket through an authenticated broker channel. The
+    /// broker must derive `identity` independently from its live caller.
+    pub const fn raw(self) -> u64 {
+        self.id
+    }
+
+    pub const fn for_authenticated_device(id: u64, identity: WmiDeviceIdentity) -> Self {
+        Self { id, identity }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegInfoPhase {
+    Prepared,
+    Dispatched,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingRegInfo {
+    ticket: RegInfoTicket,
+    phase: RegInfoPhase,
+}
+
 struct Provider {
     id: WmiProviderId,
     owner: WmiProviderOwner,
@@ -69,6 +101,7 @@ struct DeviceProvider {
     id: u32,
     live: bool,
     guids: Vec<(WmiGuid, u32)>,
+    pending_reginfo: Option<PendingRegInfo>,
 }
 
 /// A successful WMI event transfers a normal pool allocation to WMI. A traced
@@ -84,6 +117,7 @@ pub enum WmiEventOwnership {
 pub struct WmiRegistry {
     next_id: u64,
     next_device_provider_id: u64,
+    next_reginfo_ticket_id: u64,
     providers: Vec<Provider>,
     blocks: Vec<Block>,
     device_providers: Vec<DeviceProvider>,
@@ -94,6 +128,7 @@ impl WmiRegistry {
         Self {
             next_id: 1,
             next_device_provider_id: 1,
+            next_reginfo_ticket_id: 1,
             providers: Vec::new(),
             blocks: Vec::new(),
             device_providers: Vec::new(),
@@ -114,6 +149,7 @@ impl WmiRegistry {
             if identity.generation < entry.identity.generation
                 || (identity.generation == entry.identity.generation && !entry.live)
                 || (identity.generation > entry.identity.generation && entry.live)
+                || entry.pending_reginfo.is_some() && identity.generation != entry.identity.generation
             {
                 return Err(STATUS_INVALID_HANDLE);
             }
@@ -127,6 +163,7 @@ impl WmiRegistry {
             entry.id = id;
             entry.live = true;
             entry.guids.clear();
+            entry.pending_reginfo = None;
             return Ok(id);
         }
         self.device_providers
@@ -140,6 +177,7 @@ impl WmiRegistry {
             id,
             live: true,
             guids: Vec::new(),
+            pending_reginfo: None,
         });
         Ok(id)
     }
@@ -151,6 +189,87 @@ impl WmiRegistry {
             .find(|entry| entry.live && entry.identity == identity)
             .map(|entry| entry.id)
             .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    /// Reserve the exact registration before the native REGINFO IRP can run.
+    /// A dispatched ticket stays pending across uncertain effects; retrying
+    /// registration while it is pending would replay the driver callback.
+    pub fn begin_reginfo(&mut self, identity: WmiDeviceIdentity) -> Result<RegInfoTicket, u32> {
+        let entry = self.device_providers.iter().position(|entry| {
+            entry.live && entry.identity == identity && entry.pending_reginfo.is_none()
+        }).ok_or(STATUS_INVALID_HANDLE)?;
+        let id = self.next_reginfo_ticket_id;
+        self.next_reginfo_ticket_id = id.checked_add(1).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        let ticket = RegInfoTicket { id, identity };
+        self.device_providers[entry].pending_reginfo = Some(PendingRegInfo {
+            ticket,
+            phase: RegInfoPhase::Prepared,
+        });
+        Ok(ticket)
+    }
+
+    /// Mark the point after which a native callback might have run. A caller
+    /// must do this before submitting the IRP, including synchronous dispatch.
+    pub fn mark_reginfo_dispatched(&mut self, ticket: RegInfoTicket) -> Result<(), u32> {
+        let entry = self.reginfo_entry_mut(ticket)?;
+        match entry.pending_reginfo.as_mut() {
+            Some(pending) if pending.phase == RegInfoPhase::Prepared => {
+                pending.phase = RegInfoPhase::Dispatched;
+                Ok(())
+            }
+            _ => Err(STATUS_INVALID_HANDLE),
+        }
+    }
+
+    /// Release a reservation only when no native effect has been dispatched.
+    pub fn abort_reginfo_before_dispatch(&mut self, ticket: RegInfoTicket) -> Result<(), u32> {
+        let entry = self.reginfo_entry_mut(ticket)?;
+        if entry.pending_reginfo.map(|pending| pending.phase) != Some(RegInfoPhase::Prepared) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        entry.pending_reginfo = None;
+        Ok(())
+    }
+
+    /// Consume a proven terminal result. Only a successful, bounded REGINFO
+    /// packet replaces advertised GUIDs. An invalid packet or failed IRP
+    /// leaves the old publication intact and releases the finished ticket.
+    pub fn complete_reginfo(
+        &mut self,
+        ticket: RegInfoTicket,
+        status: u32,
+        bytes: &[u8],
+    ) -> Result<(), u32> {
+        let entry = self.reginfo_entry_mut(ticket)?;
+        if entry.pending_reginfo.map(|pending| pending.phase) != Some(RegInfoPhase::Dispatched) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        entry.pending_reginfo = None;
+        if !entry.live {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        if (status as i32) < 0 {
+            return Err(status);
+        }
+        let registrations = reginfo::parse_reginfo(bytes).map_err(|error| match error {
+            reginfo::RegInfoError::Allocation => STATUS_INSUFFICIENT_RESOURCES,
+            _ => STATUS_INVALID_PARAMETER,
+        })?;
+        let mut guids = Vec::new();
+        guids.try_reserve(registrations.len()).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        for registration in registrations {
+            if registration.flags & 0x0001_0000 == 0 {
+                guids.push((registration.guid, WMIGUID_NOTIFICATION));
+            }
+        }
+        self.publish_device_guids(ticket.identity, &guids)
+    }
+
+    fn reginfo_entry_mut(&mut self, ticket: RegInfoTicket) -> Result<&mut DeviceProvider, u32> {
+        self.device_providers.iter_mut().find(|entry| {
+            entry.identity == ticket.identity
+                && entry.pending_reginfo.map(|pending| pending.ticket) == Some(ticket)
+        }).ok_or(STATUS_INVALID_HANDLE)
     }
 
     /// Publish the GUIDs returned by an authenticated device's REGINFO IRP.
@@ -219,6 +338,9 @@ impl WmiRegistry {
             .find(|entry| entry.live && entry.identity == identity)
             .ok_or(STATUS_INVALID_HANDLE)?;
         entry.live = false;
+        if entry.pending_reginfo.map(|pending| pending.phase) == Some(RegInfoPhase::Prepared) {
+            entry.pending_reginfo = None;
+        }
         Ok(())
     }
 

@@ -3880,6 +3880,18 @@ unsafe fn component_pump_loop(
                 (STATUS_INVALID_PARAMETER_I32, 0)
             };
             pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, value, 0, 0);
+        } else if label == crate::driver_launch::FSD_SERVICE_WMI_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, provider_id) = if msg.mi == ((crate::driver_launch::FSD_SERVICE_WMI_LABEL << 12) | 4) {
+                crate::driver_launch::service_hosted_driver_wmi(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, provider_id, 0, 0);
+            continue;
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_KMUTEX_LABEL
             && ch.caps.kind == ReqKind::Irp

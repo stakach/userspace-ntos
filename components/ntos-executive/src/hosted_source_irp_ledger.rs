@@ -507,6 +507,7 @@ unsafe fn capture_auxiliary_unlocked(
     expected_thread: u64,
     ticket: SourceIrpTicket,
     source: SourceIrpAllocation,
+    wmi_registration: Option<nt_io_manager::HostedDevicePointerRegistration>,
 ) -> Option<SourceIrpAuxiliary> {
     let irp =
         hosted_pool_allocation_exec_va(inst.exec_pool_va, source.component_address, source.bytes)?;
@@ -529,6 +530,8 @@ unsafe fn capture_auxiliary_unlocked(
     }
     let stack = irp + source.bytes - WDM_X64_IO_STACK_LOCATION_SIZE as u64;
     let major = read_unaligned(stack as *const u8);
+    let minor = read_unaligned((stack + 1) as *const u8);
+    let wmi_reginfo = major == major::IRP_MJ_SYSTEM_CONTROL && minor == 8;
     if !matches!(
         major,
         major::IRP_MJ_READ
@@ -537,12 +540,13 @@ unsafe fn capture_auxiliary_unlocked(
             | major::IRP_MJ_SHUTDOWN
             | major::IRP_MJ_PNP
             | major::IRP_MJ_POWER
-    ) {
+    ) && !wmi_reginfo {
         return None;
     }
     let transfer = matches!(major, major::IRP_MJ_READ | major::IRP_MJ_WRITE);
-    let length = if transfer {
-        read_unaligned((stack + 0x08) as *const u32)
+    let length = if transfer || wmi_reginfo {
+        let length_offset = if wmi_reginfo { 0x18 } else { 0x08 };
+        read_unaligned((stack + length_offset) as *const u32)
     } else {
         0
     };
@@ -553,6 +557,24 @@ unsafe fn capture_auxiliary_unlocked(
     if system_address != 0 && mdl_address != 0 {
         return None;
     }
+    if wmi_reginfo {
+        let wmi_provider_id = read_unaligned((stack + 0x08) as *const u64);
+        let wmi_data_path = read_unaligned((stack + 0x10) as *const u64);
+        let wmi_buffer = read_unaligned((stack + 0x20) as *const u64);
+        let device_object = read_unaligned((stack + 0x28) as *const u64);
+        if length < 24 || flags != (IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER)
+            || mdl_address != 0 || user_buffer != 0
+            || system_address == 0 || wmi_buffer == 0
+            || wmi_buffer != system_address || wmi_provider_id != device_object
+            || wmi_data_path != 0
+            || !wmi_registration.is_some_and(|registration| {
+                registration.domain() == source.domain
+                    && registration.address() == device_object
+            })
+        {
+            return None;
+        }
+    }
 
     let system_buffer = if system_address != 0 {
         let expected = IRP_BUFFERED_IO
@@ -562,7 +584,7 @@ unsafe fn capture_auxiliary_unlocked(
             } else {
                 0
             };
-        if !transfer || length == 0 || flags != expected {
+        if length == 0 || (!wmi_reginfo && (!transfer || flags != expected)) {
             return None;
         }
         Some(exact_pool_identity_unlocked(
@@ -596,7 +618,9 @@ unsafe fn capture_auxiliary_unlocked(
     if transfer && length != 0 && transfer_address.is_none() {
         return None;
     }
-    if !transfer && (flags != 0 || system_address != 0 || mdl_address != 0 || user_buffer != 0) {
+    if !transfer && !wmi_reginfo
+        && (flags != 0 || system_address != 0 || mdl_address != 0 || user_buffer != 0)
+    {
         return None;
     }
     let transfer_buffer = transfer_address.and_then(|address| {
@@ -667,6 +691,28 @@ unsafe fn capture_auxiliary_unlocked(
             iosb,
         },
     })
+}
+
+/// A registered source IRP keeps its allocation live. This address is only a
+/// selector for the physical catalog, never authority: capture rechecks the
+/// stack under catalog and pool locks before admitting the source packet.
+unsafe fn wmi_device_selector(inst: DriverInstance, source: SourceIrpAllocation) -> u64 {
+    if source.bytes < WDM_X64_IO_STACK_LOCATION_SIZE as u64 {
+        return 0;
+    }
+    let Some(irp) = hosted_pool_allocation_exec_va(
+        inst.exec_pool_va, source.component_address, source.bytes,
+    ) else {
+        return 0;
+    };
+    let stack = irp + source.bytes - WDM_X64_IO_STACK_LOCATION_SIZE as u64;
+    if read_unaligned(stack as *const u8) == major::IRP_MJ_SYSTEM_CONTROL
+        && read_unaligned((stack + 1) as *const u8) == 8
+    {
+        read_unaligned((stack + 0x28) as *const u64)
+    } else {
+        0
+    }
 }
 
 unsafe fn auxiliary_matches_unlocked(
@@ -1242,10 +1288,6 @@ pub(super) fn service(
                 _ => return (STATUS_INVALID_HANDLE, 0, 0),
             };
             let _guard = lock();
-            let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) })
-            else {
-                return (STATUS_INVALID_HANDLE, 0, 0);
-            };
             let Some((ticket, source)) = ledger().registered(
                 SourceIrpOwner::HostedDriver(instance_index),
                 domain,
@@ -1253,25 +1295,31 @@ pub(super) fn service(
             ) else {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             };
-            let Some(owner) = (unsafe {
-                capture_auxiliary_unlocked(
-                    instance_index,
-                    inst,
-                    &caller,
-                    expected_thread,
-                    ticket,
-                    source,
-                )
-            }) else {
-                return (STATUS_INVALID_PARAMETER, 0, 0);
-            };
-            match auxiliary().register(owner) {
-                Ok(()) => (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get()),
-                Err(SourceIrpAuxiliaryError::NoCapacity) => (STATUS_INSUFFICIENT_RESOURCES, 0, 0),
-                Err(SourceIrpAuxiliaryError::AlreadyLive) => {
-                    (nt_status::NtStatus::OBJECT_NAME_COLLISION.raw(), 0, 0)
-                }
-                Err(_) => (STATUS_INVALID_PARAMETER, 0, 0),
+            let selector = unsafe { wmi_device_selector(inst, source) };
+            match hosted_device_allocations::with_live_verify_device_registration(
+                inst, domain, selector, |registration| {
+                    let Some(owner) = (unsafe {
+                        capture_auxiliary_unlocked(
+                            instance_index, inst, &caller, expected_thread, ticket, source,
+                            registration,
+                        )
+                    }) else {
+                        return (STATUS_INVALID_PARAMETER, 0, 0);
+                    };
+                    match auxiliary().register(owner) {
+                        Ok(()) => (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get()),
+                        Err(SourceIrpAuxiliaryError::NoCapacity) => {
+                            (STATUS_INSUFFICIENT_RESOURCES, 0, 0)
+                        }
+                        Err(SourceIrpAuxiliaryError::AlreadyLive) => {
+                            (nt_status::NtStatus::OBJECT_NAME_COLLISION.raw(), 0, 0)
+                        }
+                        Err(_) => (STATUS_INVALID_PARAMETER, 0, 0),
+                    }
+                },
+            ) {
+                Ok(result) => result,
+                Err(_) => (STATUS_INVALID_HANDLE, 0, 0),
             }
         }
         5 if bytes == 0 && stack_count == 0 => {

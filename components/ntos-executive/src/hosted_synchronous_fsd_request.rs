@@ -6,8 +6,8 @@
 
 use super::*;
 use nt_io_manager::kernel_irp_builder::{
-    plan_device_io_control_request, plan_synchronous_fsd_request, KernelBuiltIrpPlan,
-    MdlAccess,
+    plan_device_io_control_request, plan_synchronous_fsd_request, plan_wmi_reginfo_request,
+    KernelBuiltIrpPlan, MdlAccess,
 };
 
 /// Children remain unpublished until `publish`. Dropping an incomplete build
@@ -241,6 +241,35 @@ pub(super) unsafe fn build_control(
     let stack = request.irp + plan.next_stack_offset as u64;
     let stack_bytes = core::slice::from_raw_parts_mut(
         stack as *mut u8, WDM_X64_IO_STACK_LOCATION_SIZE,
+    );
+    if write_wdm_io_stack_location(stack_bytes, plan.stack).is_err() { return 0; }
+    request.publish(plan, event, iosb)
+}
+
+/// Materialize a REGINFO packet and publish its IRP/output-buffer graph to the
+/// source ledger before any driver can observe it. Dispatch, terminal waiting,
+/// parsing and publication are separate steps owned by the WMI broker.
+pub(super) unsafe fn build_wmi_reginfo(
+    device: u64,
+    capacity: u32,
+    event: u64,
+    iosb: u64,
+) -> u64 {
+    if event == 0 || iosb == 0 { return 0; }
+    let Some((stack_count, _)) = device_contract(device) else { return 0; };
+    let Ok(mut plan) = plan_wmi_reginfo_request(stack_count, device, capacity) else { return 0; };
+    let Some(mut request) = UnpublishedRequest::allocate(plan.stack_count) else { return 0; };
+    if !request.allocate_system_buffer(capacity) { return 0; }
+    plan.stack.parameters = WdmIoStackParameters::Wmi {
+        provider_id: device,
+        data_path: 0,
+        buffer_size: capacity,
+        buffer: request.system_buffer,
+    };
+    let stack = request.irp + plan.next_stack_offset as u64;
+    let stack_bytes = core::slice::from_raw_parts_mut(
+        stack as *mut u8,
+        WDM_X64_IO_STACK_LOCATION_SIZE,
     );
     if write_wdm_io_stack_location(stack_bytes, plan.stack).is_err() { return 0; }
     request.publish(plan, event, iosb)
