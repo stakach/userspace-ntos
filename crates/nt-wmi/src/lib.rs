@@ -18,6 +18,7 @@ pub const STATUS_INVALID_HANDLE: u32 = 0xc000_0008;
 pub const STATUS_INVALID_PARAMETER: u32 = 0xc000_000d;
 pub const STATUS_ACCESS_DENIED: u32 = 0xc000_0022;
 pub const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xc000_009a;
+pub const WNODE_FLAG_TRACED_GUID: u32 = 0x0002_0000;
 const VALID_ACCESS: u32 = WMIGUID_QUERY | WMIGUID_SET | WMIGUID_NOTIFICATION | WMIGUID_EXECUTE;
 
 /// The 16 bytes of an NT GUID in native memory order.
@@ -64,6 +65,15 @@ struct DeviceProvider {
     identity: WmiDeviceIdentity,
     id: u32,
     live: bool,
+    guids: Vec<(WmiGuid, u32)>,
+}
+
+/// A successful WMI event transfers a normal pool allocation to WMI. A traced
+/// event leaves the input allocation with its caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WmiEventOwnership {
+    TransferPoolOnSuccess,
+    RetainCaller,
 }
 
 /// IDs are monotonically allocated and never reused, even after slot reuse.
@@ -113,6 +123,7 @@ impl WmiRegistry {
             entry.identity = identity;
             entry.id = id;
             entry.live = true;
+            entry.guids.clear();
             return Ok(id);
         }
         self.device_providers
@@ -125,6 +136,7 @@ impl WmiRegistry {
             identity,
             id,
             live: true,
+            guids: Vec::new(),
         });
         Ok(id)
     }
@@ -136,6 +148,64 @@ impl WmiRegistry {
             .find(|entry| entry.live && entry.identity == identity)
             .map(|entry| entry.id)
             .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    /// Publish the GUIDs returned by an authenticated device's REGINFO IRP.
+    /// All entries are prepared before publication so a failed update leaves
+    /// the prior registration intact.
+    pub fn publish_device_guids(
+        &mut self,
+        identity: WmiDeviceIdentity,
+        guids: &[(WmiGuid, u32)],
+    ) -> Result<(), u32> {
+        let entry = self
+            .device_providers
+            .iter_mut()
+            .find(|entry| entry.live && entry.identity == identity)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let mut replacement = Vec::new();
+        replacement
+            .try_reserve(guids.len())
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        for &(guid, access) in guids {
+            if access == 0 || access & !VALID_ACCESS != 0
+                || replacement.iter().any(|(existing, _)| *existing == guid)
+            {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            replacement.push((guid, access));
+        }
+        entry.guids = replacement;
+        Ok(())
+    }
+
+    /// Admit a submitted event only for a live provider and a GUID that its
+    /// completed REGINFO advertised for notification. The native broker must
+    /// copy/deliver or consume the allocation before returning success.
+    pub fn plan_device_event(
+        &self,
+        provider_id: u32,
+        guid: WmiGuid,
+        flags: u32,
+    ) -> Result<(WmiDeviceIdentity, WmiEventOwnership), u32> {
+        let entry = self
+            .device_providers
+            .iter()
+            .find(|entry| entry.live && entry.id == provider_id)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if !entry
+            .guids
+            .iter()
+            .any(|(registered, access)| *registered == guid && *access & WMIGUID_NOTIFICATION != 0)
+        {
+            return Err(STATUS_WMI_GUID_NOT_FOUND);
+        }
+        let ownership = if flags & WNODE_FLAG_TRACED_GUID != 0 {
+            WmiEventOwnership::RetainCaller
+        } else {
+            WmiEventOwnership::TransferPoolOnSuccess
+        };
+        Ok((entry.identity, ownership))
     }
 
     /// Keep a tombstone so an old generation cannot register after address reuse.
