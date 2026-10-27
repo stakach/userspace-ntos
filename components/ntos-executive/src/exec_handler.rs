@@ -36716,7 +36716,8 @@ impl ExecNtHandler {
                 const QUERY_MASK: u32 = nt_security::OWNER_SECURITY_INFORMATION
                     | nt_security::GROUP_SECURITY_INFORMATION
                     | nt_security::DACL_SECURITY_INFORMATION
-                    | nt_security::SACL_SECURITY_INFORMATION;
+                    | nt_security::SACL_SECURITY_INFORMATION
+                    | nt_security::LABEL_SECURITY_INFORMATION;
                 let security_information = nt_ulong_arg(args[1]);
                 let buffer_length = nt_ulong_arg(args[3]) as usize;
                 if security_information & !QUERY_MASK != 0 {
@@ -36727,7 +36728,8 @@ impl ExecNtHandler {
                 if security_information
                     & (nt_security::OWNER_SECURITY_INFORMATION
                         | nt_security::GROUP_SECURITY_INFORMATION
-                        | nt_security::DACL_SECURITY_INFORMATION)
+                        | nt_security::DACL_SECURITY_INFORMATION
+                        | nt_security::LABEL_SECURITY_INFORMATION)
                     != 0
                 {
                     required_access |= READ_CONTROL;
@@ -36807,6 +36809,32 @@ impl ExecNtHandler {
                     }
                 } else if args[0] == u64::MAX {
                     return nt_process::STATUS_INVALID_HANDLE;
+                }
+                let caller = match self.native_handle_caller(ctx.previous_mode) {
+                    Ok(caller) => caller,
+                    Err(status) => return status,
+                };
+                if self.pm.lookup_native_object_directory_handle(caller, args[0], 0).is_ok() {
+                    let descriptor = match self.query_directory_object_security(
+                        caller, args[0], required_access, security_information,
+                    ) {
+                        Ok(descriptor) => descriptor,
+                        Err(status) => return status,
+                    };
+                    if args[4] == 0
+                        || !self.xas_write_u32(args[4], descriptor.len().min(u32::MAX as usize) as u32)
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    if args[2] == 0 || buffer_length < descriptor.len() {
+                        return STATUS_BUFFER_TOO_SMALL;
+                    }
+                    if !self.probe_user_output(args[2], descriptor.len())
+                        || !self.xas_try_write_buf(args[2], &descriptor)
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    return 0;
                 }
                 let native_handle_object = self.pm_pid_for_pi(self.pi).and_then(|pid| {
                     (args[0] <= u32::MAX as u64)
@@ -36909,6 +36937,7 @@ impl ExecNtHandler {
                     | nt_security::GROUP_SECURITY_INFORMATION
                     | nt_security::DACL_SECURITY_INFORMATION
                     | nt_security::SACL_SECURITY_INFORMATION
+                    | nt_security::LABEL_SECURITY_INFORMATION
                     | nt_security::PROTECTED_DACL_SECURITY_INFORMATION
                     | nt_security::PROTECTED_SACL_SECURITY_INFORMATION
                     | nt_security::UNPROTECTED_DACL_SECURITY_INFORMATION
@@ -36932,7 +36961,8 @@ impl ExecNtHandler {
                 let mut required_access = 0;
                 if security_information
                     & (nt_security::OWNER_SECURITY_INFORMATION
-                        | nt_security::GROUP_SECURITY_INFORMATION)
+                        | nt_security::GROUP_SECURITY_INFORMATION
+                        | nt_security::LABEL_SECURITY_INFORMATION)
                     != 0
                 {
                     required_access |= WRITE_OWNER;
@@ -37027,6 +37057,25 @@ impl ExecNtHandler {
                 } else if args[0] == u64::MAX {
                     return nt_process::STATUS_INVALID_HANDLE;
                 }
+                let caller = match self.native_handle_caller(ctx.previous_mode) {
+                    Ok(caller) => caller,
+                    Err(status) => return status,
+                };
+                if self.pm.lookup_native_object_directory_handle(caller, args[0], 0).is_ok() {
+                    let memory = ExecClientMemory { handler: self };
+                    let modification = match nt_security::capture_security_descriptor_bytes(
+                        &memory, args[2],
+                    ) {
+                        Ok(descriptor) => descriptor,
+                        Err(status) => return status,
+                    };
+                    return match self.set_directory_object_security(
+                        caller, args[0], required_access, security_information, &modification,
+                    ) {
+                        Ok(()) => 0,
+                        Err(status) => status,
+                    };
+                }
                 let native_handle_object = self.pm_pid_for_pi(self.pi).and_then(|pid| {
                     (args[0] <= u32::MAX as u64)
                         .then(|| self.pm.lookup_handle(pid, args[0] as nt_process::Handle))
@@ -37084,6 +37133,35 @@ impl ExecNtHandler {
                 } else {
                     None
                 };
+                if retained.is_none() {
+                    if let Some(mutable) = self.mutable_key_handle(key) {
+                        if mutable.hive == HIVE_SEL_SYSTEM {
+                            return STATUS_INVALID_HANDLE;
+                        }
+                        let route = unsafe { crate::fs_loader::exec_fs_mount_identity() }
+                            .and_then(crate::fs_loader::exec_block_route_kind);
+                        if matches!(route, Some(nt_fs::BlockSourceKind::Draining)) {
+                            return 0xC000_00A3;
+                        }
+                        if matches!(route, Some(nt_fs::BlockSourceKind::Native)) {
+                            let memory = ExecClientMemory { handler: self };
+                            let modification = match nt_security::capture_security_descriptor_bytes(
+                                &memory, args[2],
+                            ) {
+                                Ok(descriptor) => descriptor,
+                                Err(status) => return status,
+                            };
+                            return match unsafe {
+                                crate::mutable_hive_mutation_work::submit_hosted_set_security(
+                                    self, key, mutable, security_information, modification,
+                                )
+                            } {
+                                Ok(()) => 0x103,
+                                Err(status) => status,
+                            };
+                        }
+                    }
+                }
                 let prepared = (|| -> Result<_, u32> {
                     let memory = ExecClientMemory { handler: self };
                     let modification = nt_security::capture_security_descriptor_bytes(&memory, args[2])?;
