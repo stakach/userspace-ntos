@@ -17,6 +17,7 @@ pub mod ioctl;
 pub mod major;
 pub mod opcodes;
 pub mod projection;
+pub mod scsi_dma_authority;
 pub mod wire;
 
 pub use device_pointer::{
@@ -26,13 +27,18 @@ pub use device_pointer::{
 pub use projection::{
     DeviceObjectProjection, DriverObjectProjection, FileObjectProjection, IoStackLocationProjection,
 };
+pub use scsi_dma_authority::{
+    validate_scsi_coherent_authority, ScsiCoherentAlias, ScsiCoherentAuthority,
+    ScsiCoherentProjection, SCSI_DMA_AUTHORITY_ALIASES, SCSI_DMA_AUTHORITY_BYTES,
+    SCSI_DMA_AUTHORITY_SLOTS, SCSI_COHERENT_RECORD_KIND,
+};
 pub use wire::{
     IoCancelRequest, IoDeviceControlRequest, IoFileRequest, IoOpenRequest, IoReadWriteRequest,
     IoReply, IrpDispatchRequest,
 };
 
 /// ABI version of this wire contract; bumped on any incompatible change.
-pub const IO_ABI_VERSION: u32 = 18;
+pub const IO_ABI_VERSION: u32 = 19;
 
 /// Root-authenticated `IrpDispatchRequest._reserved0` value for a canonical subsidiary File
 /// lifecycle IRP. Native retains an inline terminal until physical completion ACK.
@@ -566,7 +572,7 @@ mod tests {
 
     #[test]
     fn initial_information_wire_appends_scalar_without_moving_existing_fields() {
-        assert_eq!(IO_ABI_VERSION, 18);
+        assert_eq!(IO_ABI_VERSION, 19);
         assert_eq!(core::mem::size_of::<IrpDispatchRequest>(), 280);
         assert_eq!(
             core::mem::offset_of!(IrpDispatchRequest, target_domain_id),

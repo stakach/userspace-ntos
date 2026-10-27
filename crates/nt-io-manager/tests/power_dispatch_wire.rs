@@ -41,5 +41,5 @@ fn power_dispatch_wire_has_dedicated_scalar_fields() {
     assert_eq!(request.power_state, 3);
     assert_eq!(request.power_system_context, 0x1234_5678);
     assert_eq!(request.power_shutdown_type, 5);
-    assert_eq!(nt_io_abi::IO_ABI_VERSION, 18);
+    assert_eq!(nt_io_abi::IO_ABI_VERSION, 19);
 }
