@@ -741,6 +741,7 @@ diagnosis-free failure.
 - When the user asks for commits as work proceeds, isolate each proven contract and commit it after its focused tests and native integration evidence, before exploring the next boot frontier.
 - Review staged paths and diff before every commit. Keep diagnostic traces and unrelated edits out; push a changed submodule commit before recording its pointer in the parent.
 - A workspace test can pass against unstaged native source while the committed tree fails CI. Before pushing a partial commit, check each source file read by its regressions against the staged snapshot and include all native call sites needed by the contract.
+- For a selectively staged shared Rust file, parse the staged blob itself before commit. A valid working tree can hide a constant or binding spliced into the middle of another expression in the committed snapshot.
 
 ## Keep Long Acceptance Runs Quiet When Requested
 - If the user asks for a completion-only update, continue the authorized validation and repair loop without routine progress messages. Report the full evidence after the issue is actually closed; surface a question only when work cannot continue without an answer.
