@@ -100,7 +100,7 @@ pub(crate) fn retain_hosted_existing(handler: &mut ExecNtHandler, key: KeyRef) -
 #[path = "registry_mutation_provider.rs"]
 mod provider;
 pub(crate) use provider::{
-    submit_provider, submit_provider_existing, DeferredRegistryExisting, ProviderRegistryResult,
+    submit_provider, submit_provider_existing, submit_provider_interface, DeferredRegistryExisting, ProviderRegistryResult,
     ProviderValueMutation,
 };
 
@@ -920,6 +920,50 @@ unsafe fn advance(
             if attempt.is_acknowledged() {
                 if attempt.outcome_status() == Some(0) {
                     work.phase = Phase::Prepare(attempts.take_upload(attempt)?.into_preparation());
+                } else if attempt.outcome_status() == Some(0xC000_0059u32 as i32)
+                    && !work.cancelled
+                    && matches!(&work.caller, Caller::Provider(provider::ProviderCaller {
+                        admission: provider::ProviderAdmission::InterfaceRegister(_), ..
+                    }))
+                {
+                    // The old BEGIN is durably ACKed with no effect. A concurrent writer may
+                    // advance SYSTEM, but the original interface may retry only on the same
+                    // mounted hive while its exact PDO and devnode still name that instance.
+                    let rebase = (|| {
+                        let generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+                        let mount = LIVE_CONFIG_MANAGER_SYSTEM_MOUNT
+                            .ok_or(0xC000_00A3u32 as i32)?;
+                        let value = match &mut work.caller {
+                            Caller::Provider(provider::ProviderCaller {
+                                admission: provider::ProviderAdmission::InterfaceRegister(value), ..
+                            }) => value,
+                            _ => unreachable!(),
+                        };
+                        if mount != value.mount {
+                            return Err(0xC000_00A3u32 as i32);
+                        }
+                        if generation <= attempt.expected_generation() {
+                            return Err(0x8000_0011u32 as i32);
+                        }
+                        CONFIG_CLIENT_PTR.as_mut()
+                            .ok_or(0xC000_00A3u32 as i32)?
+                            .validate_system_hive_mount(value.mount, generation)?;
+                        value.revalidate_for_revision_retry(
+                            mount, attempt.expected_generation(), generation,
+                        )?;
+                        attempts.retry_acknowledged_revision(attempt, value.mount, generation)?;
+                        value.expected_generation = generation;
+                        Ok(())
+                    })();
+                    match rebase {
+                        Ok(()) => return Ok(false),
+                        Err(status) if status == 0x8000_0011u32 as i32 => return Err(status),
+                        Err(status) => {
+                            let _ = attempts.take_failure(attempt)?;
+                            work.status = status as u32;
+                            work.phase = Phase::Complete;
+                        }
+                    }
                 } else {
                     let (status, ()) = attempts.take_failure(attempt)?;
                     work.status = status as u32;
@@ -1072,7 +1116,8 @@ unsafe fn advance(
             if matches!(&work.caller, Caller::Hosted(HostedCaller {
                 completion: HostedCompletion::Existing { .. } | HostedCompletion::SystemLocale { .. }, ..
             }) | Caller::Provider(provider::ProviderCaller {
-                admission: provider::ProviderAdmission::Existing(_), ..
+                admission: provider::ProviderAdmission::Existing(_)
+                    | provider::ProviderAdmission::InterfaceRegister(_), ..
             })) {
                 work.published = !work.cancelled;
                 work.phase = Phase::Acknowledge;

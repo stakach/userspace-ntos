@@ -91,3 +91,35 @@ pub fn resolve_interface_instance_key(
         &registration.reference,
     ))
 }
+
+/// Admit a fresh BEGIN only after an acknowledged, no-effect revision mismatch. The caller
+/// supplies observations from the exact retained PDO and its current PnP devnode; this check
+/// prevents a new SYSTEM generation from silently rebinding the original journal to a remount,
+/// retired device, or replacement instance.
+pub fn revalidate_interface_registration_revision(
+    registration: &HostedInterfaceRegistration,
+    registry_parent: &str,
+    captured_mount: u64,
+    live_mount: u64,
+    previous_generation: u64,
+    live_generation: u64,
+    live_instance_path: &str,
+    is_live: impl FnMut(HostedDomainIdentity, DeviceId, u64) -> bool,
+) -> Result<(), NtStatus> {
+    if captured_mount == 0 || captured_mount != live_mount {
+        return Err(NtStatus::DEVICE_NOT_READY);
+    }
+    if live_generation <= previous_generation {
+        return Err(NtStatus::DEVICE_BUSY);
+    }
+    if !registration.instance_path.eq_ignore_ascii_case(live_instance_path) {
+        return Err(NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let canonical_parent = resolve_interface_instance_key(
+        core::slice::from_ref(registration), &registration.symbolic_link, is_live,
+    )?;
+    if !canonical_parent.eq_ignore_ascii_case(registry_parent) {
+        return Err(NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    Ok(())
+}

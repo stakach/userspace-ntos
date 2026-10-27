@@ -106,6 +106,8 @@ use hosted_zw_enumerate_value_key::HOSTED_REGISTRY_OP_ENUMERATE_VALUE;
 #[path = "hosted_zw_query_key.rs"]
 mod hosted_zw_query_key;
 use hosted_zw_query_key::HOSTED_REGISTRY_OP_QUERY_KEY;
+#[path = "hosted_driver_interface_registry.rs"]
+pub(crate) mod hosted_driver_interface_registry;
 #[path = "hosted_device_object_pointer.rs"]
 mod hosted_device_object_pointer;
 #[path = "hosted_driver_reinitialization.rs"]
@@ -6149,6 +6151,8 @@ const HOSTED_REGISTRY_OP_DELETE_HANDLE_VALUE: u64 = 13;
 mod driver_registry_deferred_value;
 const HOSTED_REGISTRY_OP_PUBLISH_HANDLE: u64 = 14;
 const HOSTED_REGISTRY_OP_ABORT_PUBLICATION: u64 = 15;
+const HOSTED_REGISTRY_OP_OPEN_INTERFACE_KEY: u64 = 16;
+const HOSTED_REGISTRY_OP_REGISTER_INTERFACE: u64 = 17;
 const REG_OPTION_VOLATILE: u32 = 0x0000_0001;
 const REG_CREATED_NEW_KEY: u32 = 1;
 const REG_OPENED_EXISTING_KEY: u32 = 2;
@@ -6163,7 +6167,6 @@ const HOSTED_DEVICE_OP_DETACH: u64 = 8;
 const HOSTED_DEVICE_OP_DELETE: u64 = 9;
 const HOSTED_DEVICE_OP_CREATE_SYMBOLIC_LINK: u64 = 10;
 const HOSTED_DEVICE_OP_DELETE_SYMBOLIC_LINK: u64 = 11;
-const HOSTED_DEVICE_OP_REGISTER_INTERFACE: u64 = 12;
 const HOSTED_DEVICE_OP_SET_INTERFACE_STATE: u64 = 13;
 const HOSTED_DEVICE_OP_REFERENCE_POINTER: u64 = 14;
 const HOSTED_DEVICE_OP_DEREFERENCE_POINTER: u64 = 15;
@@ -6406,6 +6409,8 @@ impl DriverRegistryHandleTarget {
 struct HostedDeviceInterfaceRegistration {
     owner_domain: HostedDomainIdentity,
     pdo_device_id: u64,
+    devnode_generation: u64,
+    instance_path: HostedAscii<HOSTED_INSTANCE_PATH_MAX>,
     class_guid: [u64; 2],
     reference: HostedAscii<HOSTED_DRIVER_KEY_NAME_MAX>,
     symbolic_link: HostedAscii<HOSTED_INTERFACE_LINK_MAX>,
@@ -6420,6 +6425,8 @@ const EMPTY_HOSTED_DEVICE_INTERFACE_REGISTRATION: HostedDeviceInterfaceRegistrat
             cookie: 0,
         },
         pdo_device_id: 0,
+        devnode_generation: 0,
+        instance_path: HostedAscii::empty(),
         class_guid: [0; 2],
         reference: HostedAscii::empty(),
         symbolic_link: HostedAscii::empty(),
@@ -8032,29 +8039,6 @@ unsafe fn clear_hosted_device_interface_arg() {
     );
 }
 
-unsafe fn copy_ascii_to_hosted_device_interface_arg<const N: usize>(value: &HostedAscii<N>) -> i32 {
-    let len = value.len.saturating_mul(2);
-    if value.is_empty()
-        || len > HOSTED_INTERFACE_LINK_MAX.saturating_mul(2)
-        || len > u16::MAX as usize
-    {
-        return STATUS_INVALID_PARAMETER;
-    }
-    let mut i = 0usize;
-    while i < value.len {
-        write_volatile(
-            (FSD_ARG_VADDR + HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF + (i as u64) * 2) as *mut u16,
-            value.bytes[i] as u16,
-        );
-        i += 1;
-    }
-    write_volatile(
-        (FSD_ARG_VADDR + HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN) as *mut u16,
-        len as u16,
-    );
-    STATUS_SUCCESS
-}
-
 unsafe fn copy_unicode_to_hosted_device_interface_arg(unicode_string: u64) -> i32 {
     let Some((len, _max, buffer)) = unicode_string_triplet(unicode_string) else {
         return STATUS_INVALID_PARAMETER;
@@ -8592,11 +8576,14 @@ unsafe fn hosted_interface_instance_path(
 unsafe fn register_hosted_device_interface(
     owner_domain: HostedDomainIdentity,
     pdo_device_id: u64,
+    devnode_generation: u64,
+    instance_path: HostedAscii<HOSTED_INSTANCE_PATH_MAX>,
     class_guid: [u64; 2],
     reference: HostedAscii<HOSTED_DRIVER_KEY_NAME_MAX>,
     symbolic_link: HostedAscii<HOSTED_INTERFACE_LINK_MAX>,
 ) -> Result<(), nt_status::NtStatus> {
-    if owner_domain.domain_id.raw() == 0 || owner_domain.cookie == 0 || pdo_device_id == 0 {
+    if owner_domain.domain_id.raw() == 0 || owner_domain.cookie == 0 || pdo_device_id == 0
+        || devnode_generation == 0 || instance_path.is_empty() {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
     let table = hosted_device_interface_registrations_mut();
@@ -8634,6 +8621,8 @@ unsafe fn register_hosted_device_interface(
     let registration = HostedDeviceInterfaceRegistration {
         owner_domain,
         pdo_device_id,
+        devnode_generation,
+        instance_path,
         class_guid,
         reference,
         symbolic_link,
@@ -8710,34 +8699,33 @@ fn s_io_register_device_interface_impl(
         if output == 0 {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
-        let _reply_guard = component_device_reply_lock();
-        clear_hosted_device_interface_arg();
-        if !reference.is_empty() {
-            let capture_status = copy_ascii_to_hosted_device_interface_arg(&reference);
-            if capture_status < 0 {
-                pool_free(output);
-                return capture_status;
-            }
+        if !write_registry_arg_ascii(
+            HOSTED_REGISTRY_ARG_KEY_LEN,
+            HOSTED_REGISTRY_ARG_KEY_OFF,
+            &reference,
+        ) {
+            pool_free(output);
+            return STATUS_INVALID_PARAMETER;
         }
-        let broker_status = hosted_device_interface_operation(
-            HOSTED_DEVICE_OP_REGISTER_INTERFACE,
+        let (broker_status, _, _) = hosted_registry_broker_call(
+            HOSTED_REGISTRY_OP_REGISTER_INTERFACE,
             pdo,
             read_unaligned(class_guid as *const u64),
             read_unaligned((class_guid + 8) as *const u64),
         );
         if broker_status < 0 {
-            clear_hosted_device_interface_arg();
             pool_free(output);
             return broker_status;
         }
-        let Some(symbolic_link) = shared_path_ascii_at::<HOSTED_INTERFACE_LINK_MAX>(
+        let Some(symbolic_link) = read_registry_arg_ascii_at::<HOSTED_INTERFACE_LINK_MAX>(
             FSD_ARG_VADDR,
-            HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN,
-            HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF,
+            HOSTED_REGISTRY_ARG_KEY_LEN,
+            HOSTED_REGISTRY_ARG_KEY_OFF,
+            false,
         ) else {
             crate::provider_bugcheck::report(
                 0xc4,
-                [HOSTED_DEVICE_OP_REGISTER_INTERFACE, pdo, 0, 0],
+                [HOSTED_REGISTRY_OP_REGISTER_INTERFACE, pdo, 0, 0],
             );
         };
         let len = symbolic_link.len * 2;
@@ -8757,7 +8745,6 @@ fn s_io_register_device_interface_impl(
             (symbolic_link_name + UNICODE_STRING_BUFFER_OFFSET) as *mut u64,
             output,
         );
-        clear_hosted_device_interface_arg();
         STATUS_SUCCESS
     }
 }
@@ -35444,6 +35431,7 @@ fn register_fsd_trampolines() -> bool {
         "IoRegisterDeviceInterface",
         s_io_register_device_interface as *const () as usize as u64,
     );
+    hosted_driver_interface_registry::bind(reg);
     reg.bind(
         "IoRegisterPlugPlayNotification",
         hosted_driver_pnp_notification::register as *const () as usize as u64,
@@ -57551,7 +57539,6 @@ pub(crate) fn service_hosted_device(
             | HOSTED_DEVICE_OP_DELETE
             | HOSTED_DEVICE_OP_CREATE_SYMBOLIC_LINK
             | HOSTED_DEVICE_OP_DELETE_SYMBOLIC_LINK
-            | HOSTED_DEVICE_OP_REGISTER_INTERFACE
             | HOSTED_DEVICE_OP_SET_INTERFACE_STATE
             | HOSTED_DEVICE_OP_REFERENCE_POINTER
             | HOSTED_DEVICE_OP_REFERENCE_BY_POINTER
@@ -57787,88 +57774,6 @@ pub(crate) fn service_hosted_device(
                 0,
             ),
             Err(status) => (status.raw(), 0, 0, 0),
-        };
-    }
-    if op == HOSTED_DEVICE_OP_REGISTER_INTERFACE {
-        let (_, inst, pdo_device_id) =
-            match authenticated_hosted_pdo(ch, pdo_object, active_reply_cap) {
-                Ok(resolved) => resolved,
-                Err(status) => {
-                    return (status.raw(), 0, 0, 0);
-                }
-            };
-        let owner_domain = HostedDomainIdentity {
-            domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
-            cookie: inst.hosted_domain_cookie,
-        };
-        if inst.exec_arg_va == 0 {
-            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
-        }
-        let reference_len = unsafe {
-            read_volatile((inst.exec_arg_va + HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN) as *const u16)
-        } as usize;
-        let reference = if reference_len == 0 {
-            HostedAscii::<HOSTED_DRIVER_KEY_NAME_MAX>::empty()
-        } else {
-            let Some(reference) = (unsafe {
-                shared_path_ascii_at::<HOSTED_DRIVER_KEY_NAME_MAX>(
-                    inst.exec_arg_va,
-                    HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN,
-                    HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF,
-                )
-            }) else {
-                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
-            };
-            if reference.as_bytes().iter().any(|byte| *byte == b'\\' || *byte == b'/') {
-                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
-            }
-            reference
-        };
-        let class_guid = [arg2, arg3];
-        let Some(guid) = guid_words_to_hosted_ascii(class_guid) else {
-            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
-        };
-        let Some(instance_path) = (unsafe {
-            hosted_interface_instance_path(pdo_device_id.raw())
-        }) else {
-            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
-        };
-        let Some(symbolic_link) = build_hosted_interface_link(&guid, &instance_path, &reference) else {
-            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
-        };
-        if parse_nt_path(symbolic_link.as_str()).is_none() {
-            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
-        }
-        return match unsafe {
-            register_hosted_device_interface(
-                owner_domain,
-                pdo_device_id.raw(),
-                class_guid,
-                reference,
-                symbolic_link,
-            )
-        } {
-            Ok(()) => {
-                unsafe {
-                    let len = symbolic_link.len * 2;
-                    for (index, byte) in symbolic_link.as_bytes().iter().enumerate() {
-                        write_volatile(
-                            (inst.exec_arg_va
-                                + HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF
-                                + index as u64 * 2) as *mut u16,
-                            *byte as u16,
-                        );
-                    }
-                    write_volatile(
-                        (inst.exec_arg_va + HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN) as *mut u16,
-                        len as u16,
-                    );
-                }
-                (STATUS_SUCCESS, 0, 0, 0)
-            }
-            Err(status) => {
-                (status.raw(), 0, 0, 0)
-            }
         };
     }
     if op == HOSTED_DEVICE_OP_SET_INTERFACE_STATE {
@@ -63585,6 +63490,14 @@ pub(crate) fn service_hosted_driver_registry(
         driver_registry_deferred_value::route(ch, op, a1, a2, a3, active_reply_cap)
     } {
         return result;
+    }
+    if op == HOSTED_REGISTRY_OP_OPEN_INTERFACE_KEY {
+        return hosted_driver_interface_registry::service_open(ch, active_reply_cap);
+    }
+    if op == HOSTED_REGISTRY_OP_REGISTER_INTERFACE {
+        return hosted_driver_interface_registry::service_register(
+            ch, a1, a2, a3, active_reply_cap,
+        );
     }
     if op != HOSTED_REGISTRY_OP_CREATE_RELATIVE_KEY {
         return ProviderRegistryResult::Ready(service_hosted_driver_registry_sync(

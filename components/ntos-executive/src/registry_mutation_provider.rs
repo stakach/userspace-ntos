@@ -87,15 +87,24 @@ impl DeferredRegistryExisting {
 pub(super) enum ProviderAdmission {
     Create(DeferredRegistryCreate),
     Existing(DeferredRegistryExisting),
+    InterfaceRegister(crate::driver_launch::hosted_driver_interface_registry::DeferredInterfaceRegistration),
 }
 
 impl ProviderAdmission {
     fn caller(&self) -> NativeHandleCaller {
-        match self { Self::Create(value) => value.caller, Self::Existing(value) => value.caller }
+        match self {
+            Self::Create(value) => value.caller,
+            Self::Existing(value) => value.caller,
+            Self::InterfaceRegister(value) => value.caller,
+        }
     }
 
     fn dispatch(&self) -> RegistryPublicationDispatch {
-        match self { Self::Create(value) => value.dispatch, Self::Existing(value) => value.dispatch }
+        match self {
+            Self::Create(value) => value.dispatch,
+            Self::Existing(value) => value.dispatch,
+            Self::InterfaceRegister(value) => value.dispatch,
+        }
     }
 
     unsafe fn cleanup(&mut self, publish: bool) -> Result<(), i32> {
@@ -105,22 +114,24 @@ impl ProviderAdmission {
                 if !publish { value.abort_child()?; }
             }
             Self::Existing(value) => value.abort()?,
+            Self::InterfaceRegister(_) => {},
         }
         Ok(())
     }
 
     unsafe fn abort_child(&mut self) -> Result<(), i32> {
-        match self { Self::Create(value) => value.abort_child(), Self::Existing(_) => Ok(()) }
+        match self { Self::Create(value) => value.abort_child(), Self::Existing(_) | Self::InterfaceRegister(_) => Ok(()) }
     }
 
     unsafe fn release_existing(&mut self) -> Result<(), i32> {
-        match self { Self::Create(_) => Ok(()), Self::Existing(value) => value.abort() }
+        match self { Self::Create(_) | Self::InterfaceRegister(_) => Ok(()), Self::Existing(value) => value.abort() }
     }
 
     unsafe fn return_child_pending(&mut self) -> Result<Option<u64>, i32> {
         match self {
             Self::Create(value) => value.return_child_pending().map(Some),
             Self::Existing(_) => Ok(None),
+            Self::InterfaceRegister(_) => Ok(None),
         }
     }
 }
@@ -150,6 +161,13 @@ pub(crate) unsafe fn submit_provider_existing(
     admission: DeferredRegistryExisting,
 ) -> ProviderRegistryResult {
     submit_provider_inner(channel, ProviderAdmission::Existing(admission), None)
+}
+
+pub(crate) unsafe fn submit_provider_interface(
+    channel: &spawn_hosts::PumpChannel,
+    admission: crate::driver_launch::hosted_driver_interface_registry::DeferredInterfaceRegistration,
+) -> ProviderRegistryResult {
+    submit_provider_inner(channel, ProviderAdmission::InterfaceRegister(admission), None)
 }
 
 unsafe fn submit_provider_inner(
@@ -242,6 +260,11 @@ impl ProviderCaller {
 
     pub(super) unsafe fn begin(&self) -> Result<CmMutationBeginAttempt<()>, i32> {
         let mount = LIVE_CONFIG_MANAGER_SYSTEM_MOUNT.ok_or(0xC000_00A3u32 as i32)?;
+        if let ProviderAdmission::InterfaceRegister(value) = &self.admission {
+            if value.mount != mount {
+                return Err(0xC000_00A3u32 as i32);
+            }
+        }
         let (expected_generation, mutation) = match &self.admission {
             ProviderAdmission::Create(value) => (
                 value.expected_generation,
@@ -263,6 +286,10 @@ impl ProviderCaller {
                         path: &value.physical_path, name,
                     },
                 },
+            ),
+            ProviderAdmission::InterfaceRegister(value) => (
+                value.expected_generation,
+                SystemHiveMutation::CreateKey { path: &value.registry_parent },
             ),
         };
         (&mut *core::ptr::addr_of_mut!(ATTEMPTS))
@@ -327,6 +354,15 @@ impl ProviderCaller {
             return Ok(true);
         }
         if self.reply_entered { return Err(0xC000_00A3u32 as i32); }
+        let status = if publish && status == 0 {
+            match &mut self.admission {
+                ProviderAdmission::InterfaceRegister(value) => match value.publish() {
+                    Ok(()) => status,
+                    Err(error) => error as u32,
+                },
+                _ => status,
+            }
+        } else { status };
         if publish && status == 0 && self.child_handle.is_none() {
             self.child_handle = self.admission.return_child_pending()?;
         } else if status != 0 {

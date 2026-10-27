@@ -4600,6 +4600,43 @@ mod tests {
     }
 
     #[test]
+    fn interface_registry_parent_is_durable_before_link_publication() {
+        let mut hive = Hive::new(HiveKind::System);
+        let select = hive.create_key("Select");
+        hive.set_dword(select, "Current", 1);
+        hive.create_key(r"ControlSet001\Control");
+        secure_fixture_hive(&mut hive);
+        hive.finish_clean_import();
+
+        let mut client = ConfigClient::new(Framed { server: fresh_server() });
+        assert_eq!(client.import_system_hive(&encode_image(&hive)), Ok(1));
+        let parent = nt_config_manager::interface_reference_registry_path(
+            "{53F56307-B6BF-11D0-94F2-00A0C91EFB8B}",
+            r"PCI\VEN_1234&DEV_5678\0",
+            "Disk0",
+        );
+        let prepared = client.prepare_system_hive_mutation(
+            1,
+            &[SystemHiveMutation::CreateKey { path: &parent }],
+        ).unwrap();
+        assert_eq!(
+            client.query_system_hive_key(&parent),
+            Err(STATUS_OBJECT_NAME_NOT_FOUND),
+            "registration cannot expose the link before durable CM publication",
+        );
+
+        let mut replayed = hive.clone();
+        try_replay_log(&mut replayed, prepared.durable_journal(), 0).unwrap();
+        let mut restarted = ConfigClient::new(Framed { server: fresh_server() });
+        assert_eq!(restarted.import_system_hive(&encode_image(&replayed)), Ok(1));
+        assert!(restarted.query_system_hive_key(&parent).is_ok(),
+            "the interface instance key must survive a same-disk restart");
+
+        client.publish_system_hive_mutation(&prepared).unwrap();
+        assert!(client.query_system_hive_key(&parent).is_ok());
+    }
+
+    #[test]
     fn mounted_system_driver_plans_are_ordered_generation_bound_snapshots() {
         let mut hive = Hive::new(HiveKind::System);
         let select = hive.create_key("Select");
