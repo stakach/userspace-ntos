@@ -110,6 +110,7 @@ pub mod class_service_callback;
 pub mod reverse_class_alias_projection;
 pub mod source_irp_ledger;
 pub mod hard_error_verify_device;
+pub mod verify_device_retirement;
 pub mod source_irp_auxiliary;
 pub mod provider_source_irp;
 pub mod query_path_wire;
