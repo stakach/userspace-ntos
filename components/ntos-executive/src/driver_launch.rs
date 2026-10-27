@@ -302,6 +302,8 @@ mod hosted_driver_create_driver;
 pub(crate) use hosted_driver_create_driver::service as service_hosted_driver_create_driver;
 #[path = "hosted_driver_processor_mask.rs"]
 mod hosted_driver_processor_mask;
+#[path = "io_paging_priority_exports.rs"]
+mod io_paging_priority_exports;
 
 pub(crate) fn current_processor_index() -> usize {
     hosted_driver_processor_mask::current_processor_number_ex(0) as usize
@@ -35167,6 +35169,7 @@ fn register_fsd_trampolines() -> bool {
     bind_kd_debug_export(reg);
     reg.bind("RtlAssert", crate::hosted_driver_assertion::rtl_assert as usize as u64);
     crate::ex_rundown_exports::bind_ex_rundown_exports(reg);
+    io_paging_priority_exports::bind(reg);
     hosted_driver_remove_lock::bind_remove_lock_exports(reg);
     hosted_driver_configuration::bind_configuration_export(reg);
     hosted_driver_pci_kernel::bind_pci_kernel_exports(reg);

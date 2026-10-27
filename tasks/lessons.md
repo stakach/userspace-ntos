@@ -754,6 +754,7 @@ diagnosis-free failure.
 
 ## Keep Native Boot Loops Evidence Driven
 - Assign a read-only monitor to long boots so the build owner can investigate the next failure without repeatedly consuming the boot log. Record a specific failing observation and a focused regression before changing source, then compare the next bounded boot against that observation.
+- When a released dependency fails import resolution, audit its complete pinned IAT against the resolver that actually loads that dependency before another boot. A separate registry or primary-image-only resolver is not proof of dependency coverage. Make one regression report the full missing set so validation does not discover one import per boot.
 - A newly visible warning is not necessarily the current blocker. Track whether the boot advances past it before redirecting implementation work.
 - For QEMU performance comparisons, clone and verify the entire writable disk image before the first run, then restore that full image before each variant. Restoring only a persistence tail leaves FAT32 writes behind and invalidates the comparison.
 - `./run.sh --build-only` recreates the disk from the release tree and resets its snapshot reserve. A native WAL experiment must stage the newly source-built boot payloads into a cloned, verified native-route disk and prove route publication before interpreting fold or latency data. A fresh image's fast MemFs setup is a different lane.
