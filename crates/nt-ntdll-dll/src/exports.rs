@@ -13682,6 +13682,61 @@ unsafe fn read_associated_manifest_file(nt_path: &[u16]) -> Result<Vec<u8>, NtSt
 }
 
 #[cfg(target_arch = "x86_64")]
+unsafe fn read_activation_pe_manifest(
+    handle: u64,
+    resource_name: &nt_ntdll::rtl::pe_manifest::ManifestResourceName,
+    language: u16,
+) -> Result<Vec<u8>, NtStatus> {
+    let mut iosb = [0u64; 2];
+    let mut info = [0u8; 24]; // FILE_STANDARD_INFORMATION
+    let status = unsafe {
+        nt_ntdll::trap_stubs::nt_query_information_file(
+            handle,
+            &mut iosb as *mut [u64; 2] as u64,
+            info.as_mut_ptr() as u64,
+            info.len() as u64,
+            5, // FileStandardInformation
+        ) as NtStatus
+    };
+    if status != STATUS_SUCCESS {
+        return Err(status);
+    }
+    let file_size = u64::from_le_bytes(info[8..16].try_into().unwrap());
+    if file_size > nt_ntdll::rtl::activation::MAX_ACTIVATION_PE_BYTES as u64 {
+        return Err(STATUS_INVALID_IMAGE_FORMAT);
+    }
+    nt_ntdll::rtl::pe_manifest::extract_manifest_resource_from_reader(
+        file_size,
+        |offset, output| {
+            let byte_offset = i64::try_from(offset).map_err(|_| STATUS_INVALID_IMAGE_FORMAT)?;
+            let mut read_iosb = [0u64; 2];
+            let status = unsafe {
+                boot_nt_read_file(
+                    handle,
+                    &mut read_iosb,
+                    output.as_mut_ptr().cast(),
+                    output.len() as u32,
+                    &byte_offset,
+                )
+            };
+            if status == nt_ntdll::rtl::activation::STATUS_END_OF_FILE {
+                return Ok(0);
+            }
+            if status != STATUS_SUCCESS {
+                return Err(status);
+            }
+            let transferred = usize::try_from(read_iosb[1]).unwrap_or(usize::MAX);
+            if transferred > output.len() {
+                return Err(STATUS_RESOURCE_DATA_NOT_FOUND);
+            }
+            Ok(transferred)
+        },
+        resource_name,
+        language,
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
 unsafe fn open_activation_directory(nt_path: &[u16]) -> Result<u64, NtStatus> {
     const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
     let path_bytes = nt_path
@@ -14478,21 +14533,15 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                     Ok(handle) => handle,
                     Err(status) => return status,
                 };
-                let pe_contents = read_file_handle_bounded(
-                    pe_handle,
-                    nt_ntdll::rtl::activation::MAX_ACTIVATION_PE_BYTES,
-                    STATUS_INVALID_IMAGE_FORMAT,
-                );
-                let _ = boot_nt_close(pe_handle);
-                let primary = pe_contents.and_then(|contents| {
-                    let (resource_name, _) = resource_name?;
-                    let bytes = nt_ntdll::rtl::pe_manifest::extract_manifest_resource(
-                        &contents,
+                let primary = match resource_name {
+                    Ok((resource_name, _)) => read_activation_pe_manifest(
+                        pe_handle,
                         &resource_name,
                         descriptor.language_id,
-                    )?;
-                    copy_activation_manifest_bytes(bytes)
-                });
+                    ),
+                    Err(status) => Err(status),
+                };
+                let _ = boot_nt_close(pe_handle);
                 match primary {
                     Ok(manifest) => (
                         manifest,
