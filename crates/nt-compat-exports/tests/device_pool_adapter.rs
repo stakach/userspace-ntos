@@ -43,6 +43,23 @@ mod allocator {
     pub fn enter_durable() -> Durable { Durable }
 }
 
+// The included retirement adapter calls the production process-manager boundary.
+// This pool-only fixture has no process manager or ETHREAD projections to clear.
+mod service_sec_image {
+    pub fn with_provider_process_manager<R>(f: impl FnOnce(&mut ()) -> R) -> R {
+        f(&mut ())
+    }
+}
+
+mod ps_object_backing {
+    pub fn clear_device_to_verify_for_registration(
+        _: &mut (),
+        _: nt_io_manager::HostedDevicePointerRegistration,
+    ) -> Result<(), ()> {
+        Ok(())
+    }
+}
+
 thread_local! {
     static POOL_LOCK: Cell<Option<u64>> = const { Cell::new(None) };
     static EVENTS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
