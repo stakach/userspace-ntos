@@ -734,12 +734,14 @@ const FSD_DATA_LOADER_BLOCK_OFF: u64 = 0x810;
 const FSD_DATA_LOADER_CONFIG_ROOT_OFF: u64 = 0x910;
 const FSD_DATA_LOADER_ACPI_NODE_OFF: u64 = 0x958;
 const FSD_DATA_LOADER_ACPI_IDENTIFIER_OFF: u64 = 0x9A0;
+const _: () = assert!(FSD_DATA_LOADER_ACPI_IDENTIFIER_OFF + 10 <= crate::hosted_driver_nls_exports::FSD_NLS_STATE_OFFSET);
 // The released LiberNT acpi.sys reads KeLoaderBlock->ConfigurationRoot at +0xb0 (PE RVA 0xb560).
 const FSD_LOADER_CONFIGURATION_ROOT_OFF: u64 = 0xB0;
 // Pinned ACPI's sole HAL_PRIVATE_DISPATCH IAT use checks HalUnmaskInterrupt at +0x1f8.
 // Keep the whole version-32 table resident in the provider data frame. A null optional slot
 // advertises that this HAL operation is unavailable; ACPI itself returns STATUS_NOT_SUPPORTED.
 const FSD_DATA_HAL_PRIVATE_DISPATCH_OFF: u64 = 0xC00;
+const _: () = assert!(crate::hosted_driver_nls_exports::FSD_NLS_STATE_OFFSET + crate::hosted_driver_nls_exports::FSD_NLS_STATE_BYTES <= FSD_DATA_HAL_PRIVATE_DISPATCH_OFF);
 const FSD_DATA_HAL_PRIVATE_DISPATCH_BYTES: u64 = 0x400;
 const FSD_DATA_HAL_PRIVATE_DISPATCH_VERSION: u32 = 32;
 const FSD_DATA_HAL_PRIVATE_DISPATCH_VA: u64 =
@@ -35230,6 +35232,7 @@ fn register_fsd_trampolines() -> bool {
     reg.bind("RtlGetVersion", crate::ntoskrnl_classpnp_rtl::rtl_get_version as *const () as usize as u64);
     reg.bind("RtlTimeToTimeFields", crate::ntoskrnl_shared::s_rtl_time_to_time_fields as *const () as usize as u64);
     crate::rtl_avl_exports::bind_rtl_avl_exports(reg);
+    crate::hosted_driver_nls_exports::bind(reg);
     reg.bind(
         "RtlCopyUnicodeString",
         s_rtl_copy_unicode_string as *const () as usize as u64,
@@ -40627,6 +40630,7 @@ const SEL4_DELETE_FIRST: u64 = 8;
 
 unsafe fn load_hosted_dependency_images(
     plan: &PlannedHostedImages,
+    seh_linkage: &nt_unwind::seh_linkage_image::SehLinkageImage,
     instance: usize,
     code_va: u64,
     run_va: u64,
@@ -40683,9 +40687,9 @@ unsafe fn load_hosted_dependency_images(
         let dep_run_va = run_va + dep_offset;
         let mut resolver = HostedProviderImportResolver {
             thunks: executable_thunks.as_deref_mut(),
-            seh_raise_va: None,
-            seh_unwind_va: None,
-            seh_legacy_unwind_va: None,
+            seh_raise_va: Some(seh_linkage.raise_va),
+            seh_unwind_va: Some(seh_linkage.unwind_entry_va),
+            seh_legacy_unwind_va: Some(seh_linkage.legacy_unwind_va),
         };
         let (dep_entry_rva, dep_image_len) = load_pe_into(
             planned.src_va,
@@ -41065,6 +41069,12 @@ unsafe fn load_driver_reserved(
             .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     }
     initialize_hosted_driver_data_exports(win.data_va);
+    if !crate::hosted_driver_nls_exports::publish_validated_page(
+        win.data_va,
+        NLS_ANSI_SIZE.load(Ordering::Acquire) as usize,
+    ) {
+        return Err(nt_status::NtStatus::INVALID_IMAGE_FORMAT);
+    }
     hosted_driver_process_state::initialize_data_cells(win.data_va)
         .map_err(|status| nt_status::NtStatus(status as i32))?;
 
@@ -41107,6 +41117,7 @@ unsafe fn load_driver_reserved(
     );
     let support_images = load_hosted_dependency_images(
         &planned_images,
+        &seh_linkage,
         instance,
         code_va,
         run_va,
@@ -41693,6 +41704,13 @@ unsafe fn spawn_fsd_component(
             count: FSD_ARG_FRAMES,
             rights: Rights::Uniform(RW_NX),
             pts: 0,
+        },
+        Region {
+            source: FrameSource::Alias(NLS_ANSI_START.load(Ordering::Acquire)),
+            base_va: NLS_ANSI_VADDR,
+            count: NLS_ANSI_FRAMES,
+            rights: Rights::Uniform(RO_NX),
+            pts: 1,
         },
     ];
     let d = ComponentDescriptor {

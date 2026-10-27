@@ -73,6 +73,7 @@ mod io_server;
 mod lpc_server;
 mod ntoskrnl_shared;
 mod ntoskrnl_classpnp_rtl;
+mod hosted_driver_nls_exports;
 mod server;
 mod service_sec_image;
 mod hosted_stack_growth;
