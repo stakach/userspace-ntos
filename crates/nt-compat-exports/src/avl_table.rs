@@ -1,9 +1,9 @@
-//! AVL-flavoured `RTL_AVL_TABLE` generic-table helpers.
+//! `RTL_AVL_TABLE` generic-table helpers.
 //!
 //! The ABI surface here is the ReactOS/Windows raw C layout. The implementation keeps a normal
 //! ordered binary tree rooted at `BalancedRoot.RightChild` and preserves the observable RTL
-//! contracts: callback allocation/free, collation-order lookup/enumeration, restart keys, and delete
-//! accounting. It does not depend on kernel state.
+//! contracts: callback allocation/free, logarithmic AVL lookup/update, collation-order
+//! lookup/enumeration, restart keys, and delete accounting. It does not depend on kernel state.
 
 use core::ffi::c_void;
 use core::ptr::{copy_nonoverlapping, null_mut};
@@ -239,14 +239,163 @@ unsafe fn successor_in_table(
     }
 }
 
-unsafe fn compute_depth(node: *mut BalancedLinks) -> u32 {
-    if node.is_null() {
-        return 0;
-    }
+/// Follow the taller child according to each valid AVL balance factor.
+unsafe fn balanced_depth(mut node: *mut BalancedLinks) -> u32 {
+    let mut depth = 0;
     unsafe {
-        let left = compute_depth((*node).left_child);
-        let right = compute_depth((*node).right_child);
-        1 + if left > right { left } else { right }
+        while !node.is_null() {
+            depth += 1;
+            node = if (*node).balance > 0 {
+                (*node).right_child
+            } else if (*node).balance < 0 {
+                (*node).left_child
+            } else if !(*node).left_child.is_null() {
+                (*node).left_child
+            } else {
+                (*node).right_child
+            };
+        }
+    }
+    depth
+}
+
+unsafe fn replace_parent_link(
+    table: *mut RtlAvlTable,
+    old: *mut BalancedLinks,
+    replacement: *mut BalancedLinks,
+) {
+    unsafe {
+        let parent = (*old).parent;
+        if parent == sentinel(table) {
+            set_root(table, replacement);
+        } else if (*parent).left_child == old {
+            (*parent).left_child = replacement;
+        } else {
+            (*parent).right_child = replacement;
+        }
+        if !replacement.is_null() {
+            (*replacement).parent = parent;
+        }
+    }
+}
+
+unsafe fn rotate_left(table: *mut RtlAvlTable, node: *mut BalancedLinks) {
+    unsafe {
+        let child = (*node).right_child;
+        (*node).right_child = (*child).left_child;
+        if !(*node).right_child.is_null() {
+            (*(*node).right_child).parent = node;
+        }
+        replace_parent_link(table, node, child);
+        (*child).left_child = node;
+        (*node).parent = child;
+    }
+}
+
+unsafe fn rotate_right(table: *mut RtlAvlTable, node: *mut BalancedLinks) {
+    unsafe {
+        let child = (*node).left_child;
+        (*node).left_child = (*child).right_child;
+        if !(*node).left_child.is_null() {
+            (*(*node).left_child).parent = node;
+        }
+        replace_parent_link(table, node, child);
+        (*child).right_child = node;
+        (*node).parent = child;
+    }
+}
+
+/// Rebalance a node whose balance is +/-2. Returns true only when deletion's
+/// child-balance-zero case leaves this subtree at its former height.
+unsafe fn rebalance(table: *mut RtlAvlTable, node: *mut BalancedLinks) -> bool {
+    unsafe {
+        let balance = (*node).balance;
+        let child = if balance > 0 { (*node).right_child } else { (*node).left_child };
+        let child_balance = (*child).balance;
+        if child_balance == balance.signum() {
+            if balance > 0 { rotate_left(table, node) } else { rotate_right(table, node) };
+            (*node).balance = 0;
+            (*child).balance = 0;
+            return false;
+        }
+        if child_balance == -balance.signum() {
+            let grandchild = if balance > 0 { (*child).left_child } else { (*child).right_child };
+            let grandchild_balance = (*grandchild).balance;
+            if balance > 0 {
+                rotate_right(table, child);
+                rotate_left(table, node);
+            } else {
+                rotate_left(table, child);
+                rotate_right(table, node);
+            }
+            (*node).balance = if grandchild_balance == balance.signum() { -balance.signum() } else { 0 };
+            (*child).balance = if grandchild_balance == -balance.signum() { balance.signum() } else { 0 };
+            (*grandchild).balance = 0;
+            return false;
+        }
+        // A balanced child can occur only after deletion. This rotation does not
+        // shorten the subtree, so the deletion retrace ends here.
+        if balance > 0 { rotate_left(table, node) } else { rotate_right(table, node) };
+        (*node).balance = balance.signum();
+        (*child).balance = -balance.signum();
+        true
+    }
+}
+
+unsafe fn rebalance_after_insert(table: *mut RtlAvlTable, mut child: *mut BalancedLinks) {
+    unsafe {
+        let head = sentinel(table);
+        let mut parent = (*child).parent;
+        while parent != head {
+            let delta = if (*parent).right_child == child { 1 } else { -1 };
+            let balance = (*parent).balance;
+            if balance == 0 {
+                (*parent).balance = delta;
+                child = parent;
+                parent = (*parent).parent;
+            } else if balance == -delta {
+                (*parent).balance = 0;
+                break;
+            } else {
+                (*parent).balance = balance + delta;
+                rebalance(table, parent);
+                break;
+            }
+        }
+    }
+}
+
+/// `removed_from_left` identifies the subtree that lost one level.
+unsafe fn rebalance_after_delete(
+    table: *mut RtlAvlTable,
+    mut parent: *mut BalancedLinks,
+    mut removed_from_left: bool,
+) {
+    unsafe {
+        let head = sentinel(table);
+        while parent != head {
+            let delta = if removed_from_left { 1 } else { -1 };
+            let balance = (*parent).balance + delta;
+            (*parent).balance = balance;
+            if balance.abs() == 1 {
+                break;
+            }
+            let subtree_root = if balance == 0 {
+                parent
+            } else {
+                let unchanged_height = rebalance(table, parent);
+                if unchanged_height {
+                    break;
+                }
+                (*parent).parent
+            };
+            let grandparent = (*subtree_root).parent;
+            if grandparent == head {
+                break;
+            }
+            removed_from_left = (*grandparent).left_child == subtree_root;
+            parent = grandparent;
+        }
     }
 }
 
@@ -262,48 +411,46 @@ unsafe fn transplant(
     old: *mut BalancedLinks,
     new_node: *mut BalancedLinks,
 ) {
-    unsafe {
-        let parent = (*old).parent;
-        if parent == sentinel(table) {
-            set_root(table, new_node);
-        } else if (*parent).left_child == old {
-            (*parent).left_child = new_node;
-            if !new_node.is_null() {
-                (*new_node).parent = parent;
-            }
-        } else {
-            (*parent).right_child = new_node;
-            if !new_node.is_null() {
-                (*new_node).parent = parent;
-            }
-        }
-    }
+    unsafe { replace_parent_link(table, old, new_node) }
 }
 
 unsafe fn delete_node_from_tree(table: *mut RtlAvlTable, node: *mut BalancedLinks) {
     unsafe {
+        let rebalance_parent;
+        let removed_from_left;
         if (*node).left_child.is_null() {
+            rebalance_parent = (*node).parent;
+            removed_from_left = (*rebalance_parent).left_child == node;
             transplant(table, node, (*node).right_child);
         } else if (*node).right_child.is_null() {
+            rebalance_parent = (*node).parent;
+            removed_from_left = (*rebalance_parent).left_child == node;
             transplant(table, node, (*node).left_child);
         } else {
             let successor = leftmost((*node).right_child);
             if (*successor).parent != node {
+                rebalance_parent = (*successor).parent;
+                removed_from_left = true;
                 transplant(table, successor, (*successor).right_child);
                 (*successor).right_child = (*node).right_child;
                 (*(*successor).right_child).parent = successor;
+            } else {
+                rebalance_parent = successor;
+                removed_from_left = false;
             }
             transplant(table, node, successor);
             (*successor).left_child = (*node).left_child;
             (*(*successor).left_child).parent = successor;
-            (*successor).balance = 0;
+            (*successor).balance = (*node).balance;
         }
+
+        rebalance_after_delete(table, rebalance_parent, removed_from_left);
 
         (*node).parent = node;
         (*node).left_child = null_mut();
         (*node).right_child = null_mut();
         (*node).balance = 0;
-        (*table).depth_of_tree = compute_depth(root(table));
+        (*table).depth_of_tree = balanced_depth(root(table));
     }
 }
 
@@ -501,7 +648,10 @@ pub unsafe fn insert_element_generic_table_full_avl(
             }
             (*table).number_generic_table_elements =
                 (*table).number_generic_table_elements.saturating_add(1);
-            (*table).depth_of_tree = compute_depth(root(table));
+            if search_result != TableSearchResult::TableEmptyTree {
+                rebalance_after_insert(table, node);
+            }
+            (*table).depth_of_tree = balanced_depth(root(table));
             reset_order_cache(table);
         }
 
@@ -783,7 +933,105 @@ mod tests {
 
     use super::*;
     use core::alloc::Layout;
-    use std::alloc::alloc;
+    use std::alloc::{alloc, dealloc};
+
+    #[derive(Default)]
+    struct AllocationCounts {
+        allocated: usize,
+        freed: usize,
+    }
+
+    unsafe extern "system" fn counted_allocate(
+        table: *mut RtlAvlTable,
+        byte_size: u32,
+    ) -> *mut c_void {
+        let counts = unsafe { &mut *((*table).table_context as *mut AllocationCounts) };
+        counts.allocated += 1;
+        let layout = Layout::from_size_align(byte_size as usize, 8).unwrap();
+        unsafe { alloc(layout) as *mut c_void }
+    }
+
+    unsafe extern "system" fn counted_free(table: *mut RtlAvlTable, buffer: *mut c_void) {
+        let counts = unsafe { &mut *((*table).table_context as *mut AllocationCounts) };
+        counts.freed += 1;
+        let layout = Layout::from_size_align(TABLE_ENTRY_USER_DATA_OFFSET + 4, 8).unwrap();
+        unsafe { dealloc(buffer as *mut u8, layout) };
+    }
+
+    unsafe fn assert_avl_subtree(node: *mut BalancedLinks, parent: *mut BalancedLinks) -> u32 {
+        if node.is_null() {
+            return 0;
+        }
+        unsafe {
+            assert_eq!((*node).parent, parent);
+            let left = assert_avl_subtree((*node).left_child, node);
+            let right = assert_avl_subtree((*node).right_child, node);
+            assert!(left.abs_diff(right) <= 1);
+            assert_eq!((*node).balance as i32, right as i32 - left as i32);
+            1 + left.max(right)
+        }
+    }
+
+    #[test]
+    fn sorted_insertions_and_deletions_remain_balanced_and_free_once() {
+        unsafe {
+            let mut table = RtlAvlTable::zeroed();
+            let mut counts = AllocationCounts::default();
+            initialize_generic_table_avl(
+                &mut table,
+                Some(compare_i32),
+                Some(counted_allocate),
+                Some(counted_free),
+                &mut counts as *mut _ as *mut c_void,
+            );
+
+            for value in 0i32..127 {
+                let mut inserted = 0;
+                let ptr = insert_element_generic_table_avl(
+                    &mut table,
+                    &value as *const _ as *mut c_void,
+                    4,
+                    &mut inserted,
+                );
+                assert!(!ptr.is_null());
+                assert_eq!(inserted, 1);
+            }
+            assert_eq!(table.number_generic_table_elements, 127);
+            let head = sentinel(&mut table);
+            let depth = table.depth_of_tree;
+            assert_eq!(depth, assert_avl_subtree(root(&mut table), head));
+            assert!(table.depth_of_tree <= 8);
+
+            for value in (0i32..127).step_by(2) {
+                assert!(delete_element_generic_table_avl(
+                    &mut table,
+                    &value as *const _ as *mut c_void,
+                ));
+                let head = sentinel(&mut table);
+                let depth = table.depth_of_tree;
+                assert_eq!(depth, assert_avl_subtree(root(&mut table), head));
+            }
+            assert_eq!(counts.allocated, 127);
+            assert_eq!(counts.freed, 64);
+            assert_eq!(table.number_generic_table_elements, 63);
+            let mut restart = null_mut();
+            for expected in (1i32..127).step_by(2) {
+                let ptr = enumerate_generic_table_without_splaying_avl(&mut table, &mut restart);
+                assert!(!ptr.is_null());
+                assert_eq!(*(ptr as *const i32), expected);
+            }
+            assert!(enumerate_generic_table_without_splaying_avl(&mut table, &mut restart).is_null());
+            for value in (1i32..127).step_by(2) {
+                assert!(delete_element_generic_table_avl(
+                    &mut table,
+                    &value as *const _ as *mut c_void,
+                ));
+            }
+            assert_eq!(counts.freed, counts.allocated);
+            assert_eq!(table.depth_of_tree, 0);
+            assert!(root(&mut table).is_null());
+        }
+    }
 
     unsafe extern "system" fn compare_i32(
         _table: *mut RtlAvlTable,
