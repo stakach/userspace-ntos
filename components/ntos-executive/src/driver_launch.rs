@@ -208,6 +208,8 @@ mod hosted_source_irp_ledger;
 mod hosted_driver_object_reference;
 #[path = "hosted_irp_lifecycle_exports.rs"]
 mod hosted_irp_lifecycle_exports;
+#[path = "hosted_driver_apc_region.rs"]
+mod hosted_driver_apc_region;
 #[path = "hosted_start_io.rs"]
 mod hosted_start_io;
 #[path = "hosted_kd_debug.rs"]
@@ -36280,10 +36282,7 @@ fn register_fsd_trampolines() -> bool {
         "KeGetCurrentIrql",
         s_ke_get_current_irql as *const () as usize as u64,
     );
-    reg.bind("KeEnterCriticalRegion", s_void as *const () as usize as u64);
-    reg.bind("KeLeaveCriticalRegion", s_void as *const () as usize as u64);
-    reg.bind("KeEnterGuardedRegion", s_void as *const () as usize as u64);
-    reg.bind("KeLeaveGuardedRegion", s_void as *const () as usize as u64);
+    hosted_driver_apc_region::bind(reg);
     reg.bind(
         "KeInitializeEvent",
         s_ke_initialize_event as *const () as usize as u64,
