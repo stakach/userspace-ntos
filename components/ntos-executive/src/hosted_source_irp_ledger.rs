@@ -985,6 +985,110 @@ pub(super) fn retire_allocation(
     }
 }
 
+/// Commit `IoInitializeIrp`/`IoReuseIrp` in the provider's mapped pool while the
+/// physical allocation and every source owner are serialized. The caller's pointer
+/// selects storage only; exact allocation identity and ownership are rederived here.
+fn mutate_local_irp_packet(
+    instance_index: usize,
+    inst: DriverInstance,
+    operation: u64,
+    irp: u64,
+    argument: u64,
+    flags: u64,
+) -> (i32, u64, u64) {
+    if irp == 0 || irp & 15 != 0 {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    }
+    let (stack_count, apc_environment) = if operation == 12 {
+        if flags & !0xffff != 0 || argument > u16::MAX as u64 {
+            return (STATUS_INVALID_PARAMETER, 0, 0);
+        }
+        (flags as u8, (flags >> 8) as u8)
+    } else {
+        if flags > 1 || argument > u32::MAX as u64 {
+            return (STATUS_INVALID_PARAMETER, 0, 0);
+        }
+        (0, flags as u8)
+    };
+    if apc_environment > 1 {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    }
+    let Some(domain) = instance_domain_identity(inst) else {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    };
+    let _source_guard = lock();
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    };
+    let Some(identity) = (unsafe {
+        exact_pool_identity_unlocked(inst, irp, WDM_X64_IRP_SIZE as u64)
+    }) else {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    };
+    let Some(header_exec) = (unsafe {
+        hosted_pool_allocation_exec_va(inst.exec_pool_va, irp, WDM_X64_IRP_SIZE as u64)
+    }) else {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    };
+    let (packet_size, stack_count) = if operation == 12 {
+        (argument as u16, stack_count)
+    } else {
+        unsafe {
+            (read_unaligned((header_exec + 2) as *const u16),
+                read_unaligned((header_exec + WDM_X64_IRP_STACK_COUNT_OFFSET) as *const u8))
+        }
+    };
+    if packet_size as usize > identity.capacity as usize
+        || (packet_size as usize) < WDM_X64_IRP_SIZE
+        || !(1..=32).contains(&stack_count)
+        || caller_projections().iter().any(|row| {
+            row.allocation.domain == domain
+                && row.allocation.component_address == irp
+        })
+    {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    }
+    match ledger().pool_free_admission(instance_index, domain, irp) {
+        Ok(SourcePoolFreeAdmission::Unregistered) => {},
+        Ok(SourcePoolFreeAdmission::DriverOwned(owner)) => {
+            let Some((ticket, registered)) = ledger().registered(
+                SourceIrpOwner::HostedDriver(instance_index), domain, irp,
+            ) else {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            };
+            if registered != owner || owner.pool_generation != identity.pool_generation
+                || owner.bytes != packet_size as u64 || owner.stack_count != stack_count
+                || ledger().mutation_ready(ticket, owner).is_err()
+                || auxiliary().snapshot(ticket, owner).is_ok()
+            {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            }
+        }
+        Ok(SourcePoolFreeAdmission::Protected(_)) | Err(_) => {
+            return (STATUS_INVALID_HANDLE, 0, 0);
+        }
+    }
+    let Some(exec) = (unsafe {
+        hosted_pool_allocation_exec_va(inst.exec_pool_va, irp, u64::from(packet_size))
+    }) else {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    };
+    let packet = unsafe { core::slice::from_raw_parts_mut(exec as *mut u8, usize::from(packet_size)) };
+    let result = if operation == 12 {
+        nt_io_manager::initialize_wdm_irp_packet(
+            packet, irp, packet_size, stack_count, apc_environment,
+        )
+    } else {
+        nt_io_manager::reuse_wdm_irp_packet(
+            packet, irp, argument as u32 as i32, false, apc_environment,
+        )
+    };
+    match result {
+        Ok(()) => (STATUS_SUCCESS, 0, 0),
+        Err(_) => (STATUS_INVALID_PARAMETER, 0, 0),
+    }
+}
+
 pub(super) fn service(
     ch: &crate::spawn_hosts::PumpChannel,
     op: u64,
@@ -1001,6 +1105,9 @@ pub(super) fn service(
         return (STATUS_INVALID_HANDLE, 0, 0);
     }
     match op {
+        12 | 13 => mutate_local_irp_packet(
+            instance_index, inst, op, component_address, bytes, stack_count,
+        ),
         1 => {
             let Some(stack_count) = u8::try_from(stack_count).ok() else {
                 return (STATUS_INVALID_PARAMETER, 0, 0);

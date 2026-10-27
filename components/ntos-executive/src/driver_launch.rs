@@ -204,6 +204,8 @@ mod hosted_file_lifecycle_owners;
 mod hosted_file_retirements;
 #[path = "hosted_source_irp_ledger.rs"]
 mod hosted_source_irp_ledger;
+#[path = "hosted_irp_lifecycle_exports.rs"]
+mod hosted_irp_lifecycle_exports;
 #[path = "hosted_start_io.rs"]
 mod hosted_start_io;
 #[path = "hosted_kd_debug.rs"]
@@ -35482,6 +35484,7 @@ fn register_fsd_trampolines() -> bool {
         "IoAllocateIrp",
         s_io_allocate_irp as *const () as usize as u64,
     );
+    hosted_irp_lifecycle_exports::bind(reg);
     reg.bind("IoFreeIrp", s_io_free_irp as *const () as usize as u64);
     reg.bind(
         "IoBuildDeviceIoControlRequest",
