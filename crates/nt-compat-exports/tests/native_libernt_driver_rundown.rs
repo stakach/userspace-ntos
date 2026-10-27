@@ -1,7 +1,14 @@
 //! Released LiberNT drivers resolve the same live EX rundown ABI as win32k.
 
 #[cfg(target_arch = "x86_64")]
-use nt_kernel_exec::ExRundownRef;
+use nt_kernel_exec::{ExCacheAwareRundownRef, ExRundownRef};
+#[cfg(target_arch = "x86_64")]
+static SYSTEM_PROCESSOR_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+#[cfg(target_arch = "x86_64")]
+mod driver_launch {
+    pub(crate) fn current_processor_index() -> usize { 0 }
+}
 #[path = "support/libernt_driver_imports.rs"]
 mod libernt_driver_imports;
 
@@ -115,4 +122,33 @@ fn shared_win64_exports_preserve_real_descriptor_lifecycle() {
     reinitialize(ptr);
     assert_eq!(acquire(ptr), 1, "reinitialize reopens admission");
     release(ptr);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn cache_aware_win64_exports_preserve_caller_owned_descriptor_lifecycle() {
+    let size: extern "win64" fn() -> usize =
+        ex_rundown_exports::ex_size_of_rundown_protection_cache_aware;
+    let initialize: extern "win64" fn(*mut ExCacheAwareRundownRef, usize) =
+        ex_rundown_exports::ex_initialize_rundown_protection_cache_aware;
+    let acquire: extern "win64" fn(*const ExCacheAwareRundownRef) -> u8 =
+        ex_rundown_exports::ex_acquire_rundown_protection_cache_aware;
+    let release: extern "win64" fn(*const ExCacheAwareRundownRef) =
+        ex_rundown_exports::ex_release_rundown_protection_cache_aware;
+    let wait: extern "win64" fn(*const ExCacheAwareRundownRef) =
+        ex_rundown_exports::ex_wait_for_rundown_protection_release_cache_aware;
+    let reinitialize: extern "win64" fn(*const ExCacheAwareRundownRef) =
+        ex_rundown_exports::ex_reinitialize_rundown_protection_cache_aware;
+
+    assert_eq!(size(), 32);
+    let mut storage = Box::new([0u64; 4]);
+    let descriptor = storage.as_mut_ptr().cast::<ExCacheAwareRundownRef>();
+    initialize(descriptor, size());
+    assert_eq!(acquire(descriptor), 1);
+    release(descriptor);
+    wait(descriptor);
+    assert_eq!(acquire(descriptor), 0);
+    reinitialize(descriptor);
+    assert_eq!(acquire(descriptor), 1);
+    release(descriptor);
 }
