@@ -14,8 +14,8 @@
 //! ```
 //! `BlockHeader` holds boundary sizes, live/free state, and the allocation's optional user metadata.
 //! `size`/`prev_size` are payload+header sizes in bytes; `prev_size == 0` marks the first block. Free
-//! blocks use first-fit. An exact earliest-free hint makes append allocations independent of the
-//! number of live blocks; fragmented heaps retain the physical walk. Free/size/realloc recover the
+//! blocks use first-fit through an in-band, address-ordered free chain, so allocations visit only
+//! free blocks. Free/size/realloc recover the
 //! target header directly from the payload pointer and verify the neighbouring boundary tags, so
 //! destructor-heavy callers do not pay a full heap walk for every released allocation.
 
@@ -315,7 +315,7 @@ struct BlockHeader {
     /// The previous (physically-adjacent) block's total size, or `0` for the first block. Enables
     /// backward coalescing without a global list.
     prev_size: usize,
-    /// Opaque value stored by `RtlSetUserValueHeap`.
+    /// Opaque value stored by `RtlSetUserValueHeap`; zero for free blocks.
     user_value: usize,
     /// Caller-controlled `HEAP_SETTABLE_USER_FLAGS` bits.
     user_flags: u32,
@@ -364,8 +364,7 @@ pub struct Heap<B: Backing> {
     region_len: usize,
     /// Whether the region has been formatted into an initial free block.
     formatted: bool,
-    /// Offset of the earliest free physical block, or `region_len` when full. Mutations maintain
-    /// this index; it permits local validation of the common terminal free extent.
+    /// Head of the address-ordered in-band free chain, or `region_len` when full.
     first_free: usize,
     /// Front-end type returned by `RtlQueryHeapInformation` class 0.
     compatibility_mode: u32,
@@ -403,6 +402,7 @@ impl<B: Backing> Heap<B> {
                     reserved: 0,
                 },
             );
+            core::ptr::write(base.add(HDR) as *mut usize, h.region_len);
         }
         h.formatted = true;
         Some(h)
@@ -537,18 +537,114 @@ impl<B: Backing> Heap<B> {
         Some(header)
     }
 
-    /// Find the first free block from a known physical boundary after a mutation.
-    fn next_free_from(&self, mut offset: usize, mut previous_size: usize) -> Option<usize> {
-        while offset < self.region_len {
-            let header = self.header_at_offset(offset)?;
-            let next = self.validate_header(offset, previous_size, header)?;
-            if header.is_free() {
-                return Some(offset);
-            }
-            previous_size = header.size;
-            offset = next;
+    /// Check one free node and its physical neighbours before following its in-band link or
+    /// modifying a boundary tag. This does not inspect unrelated live blocks.
+    fn validated_free_node(&self, offset: usize) -> Option<(BlockHeader, usize)> {
+        let header = self.validate_direct_header(offset, None)?;
+        if !header.is_free() {
+            return None;
         }
-        (offset == self.region_len).then_some(offset)
+        if offset == 0 {
+            if header.prev_size != 0 {
+                return None;
+            }
+        } else {
+            let previous_offset = offset.checked_sub(header.prev_size)?;
+            let previous = self.validate_direct_header(previous_offset, None)?;
+            if previous.size != header.prev_size || previous.is_free() {
+                return None;
+            }
+        }
+        let next_offset = offset + header.size;
+        if next_offset < self.region_len {
+            let next = self.validate_direct_header(next_offset, Some(header.size))?;
+            if next.is_free() {
+                return None;
+            }
+        }
+        // SAFETY: every free block has at least HEAP_ALIGN payload bytes, enough for one usize.
+        let link =
+            unsafe { core::ptr::read(self.backing.base().add(offset + HDR) as *const usize) };
+        if link <= offset || link > self.region_len || link % HEAP_ALIGN != 0 {
+            return None;
+        }
+        Some((header, link))
+    }
+
+    /// A link may skip many live blocks, but it must name another locally valid free block.
+    /// Checking it before mutation prevents a forged in-range link from becoming a write target.
+    fn validated_free_link(&self, link: usize) -> Option<()> {
+        if link == self.region_len {
+            Some(())
+        } else {
+            self.validated_free_node(link).map(|_| ())
+        }
+    }
+
+    /// Locate the free-list links bracketing an address. The caller verifies that the physical
+    /// free neighbours, if any, are these same nodes before changing the block chain.
+    fn free_links_before(&self, offset: usize) -> Option<(Option<usize>, usize)> {
+        let mut previous = None;
+        let mut current = self.first_free;
+        while current < offset {
+            let (_, next) = self.validated_free_node(current)?;
+            previous = Some(current);
+            current = next;
+        }
+        if current != self.region_len {
+            let (_, following) = self.validated_free_node(current)?;
+            self.validated_free_link(following)?;
+        }
+        Some((previous, current))
+    }
+
+    fn insertion_links(
+        &self,
+        offset: usize,
+        previous_free: Option<usize>,
+        successor_free: Option<usize>,
+    ) -> Option<(Option<usize>, usize)> {
+        let (before, after) = self.free_links_before(offset)?;
+        if after == offset
+            || previous_free.is_some_and(|previous| before != Some(previous))
+            || successor_free.is_some_and(|successor| after != successor)
+        {
+            return None;
+        }
+        Some((before, after))
+    }
+
+    /// Replace the free nodes absorbed into a newly coalesced block. `before` and `after` are
+    /// captured while the original physical chain is still intact.
+    unsafe fn link_coalesced_free(
+        &mut self,
+        offset: usize,
+        before: Option<usize>,
+        after: usize,
+        previous_free: bool,
+        successor_free: bool,
+    ) {
+        let start = if previous_free {
+            before.unwrap()
+        } else {
+            offset
+        };
+        let successor = if successor_free {
+            core::ptr::read(self.backing.base().add(after + HDR) as *const usize)
+        } else {
+            after
+        };
+        core::ptr::write(
+            self.backing.base().add(start + HDR) as *mut usize,
+            successor,
+        );
+        if !previous_free {
+            if let Some(previous) = before {
+                core::ptr::write(self.backing.base().add(previous + HDR) as *mut usize, start);
+            } else {
+                self.first_free = start;
+            }
+        }
     }
 
     fn direct_live_block(&self, payload: *const u8) -> Option<(usize, BlockHeader)> {
@@ -596,7 +692,7 @@ impl<B: Backing> Heap<B> {
         let mut offset = 0usize;
         let mut previous_size = 0usize;
         let mut previous_was_free = false;
-        let mut first_free = self.region_len;
+        let mut next_free = self.first_free;
         while offset < self.region_len {
             let Some(header) = self.header_at_offset(offset) else {
                 return false;
@@ -607,14 +703,24 @@ impl<B: Backing> Heap<B> {
             if previous_was_free && header.is_free() {
                 return false;
             }
-            if header.is_free() && first_free == self.region_len {
-                first_free = offset;
+            if header.is_free() {
+                if next_free != offset {
+                    return false;
+                }
+                // SAFETY: a validated free block has at least one aligned usize of payload.
+                next_free = unsafe {
+                    core::ptr::read(self.backing.base().add(offset + HDR) as *const usize)
+                };
+                if next_free <= offset || next_free > self.region_len || next_free % HEAP_ALIGN != 0
+                {
+                    return false;
+                }
             }
             previous_was_free = header.is_free();
             previous_size = header.size;
             offset = next;
         }
-        self.formatted && offset == self.region_len && self.first_free == first_free
+        self.formatted && offset == self.region_len && next_free == self.region_len
     }
 
     /// Capture the native heap-debug summary from a validated physical block chain.
@@ -681,7 +787,7 @@ impl<B: Backing> Heap<B> {
         Some(largest)
     }
 
-    /// Zero every free block's payload bytes while preserving the heap's physical metadata.
+    /// Zero free payload bytes except the in-band free-chain link.
     ///
     /// Returns `false` without modifying memory if the heap headers are corrupt.
     pub fn zero_free_blocks(&mut self) -> bool {
@@ -700,11 +806,14 @@ impl<B: Backing> Heap<B> {
             if header.is_free() {
                 // SAFETY: validation proved the free block lies wholly inside the backing region.
                 unsafe {
+                    let link =
+                        core::ptr::read(self.backing.base().add(offset + HDR) as *const usize);
                     core::ptr::write_bytes(
                         self.backing.base().add(offset + HDR),
                         0,
                         header.size - HDR,
                     );
+                    core::ptr::write(self.backing.base().add(offset + HDR) as *mut usize, link);
                 }
             }
             previous_size = header.size;
@@ -875,82 +984,42 @@ impl<B: Backing> Heap<B> {
     }
 
     /// Allocate a block and capture the per-allocation user metadata requested in `flags`.
-    /// The terminal free extent is checked with its immediate boundary tags; explicit
-    /// [`Self::validate`] checks the complete physical chain, including off-path corruption.
+    /// Each candidate is checked with its immediate boundary tags. Explicit [`Self::validate`]
+    /// checks the complete physical chain, including off-path corruption.
     pub fn allocate_with_flags(&mut self, size: usize, flags: u32) -> Option<*mut u8> {
         let need = checked_block_size(size)?;
-        let first_fit = if self.first_free == self.region_len {
-            return None;
-        } else {
-            let hint = self.first_free;
-            let header = self.header_at_offset(hint)?;
-            let end = self.validate_header(hint, header.prev_size, header)?;
-            if !header.is_free() {
+        let mut previous_free = None;
+        let mut offset = self.first_free;
+        let (bsize, following) = loop {
+            if offset >= self.region_len {
                 return None;
             }
-            if hint == 0 {
-                if header.prev_size != 0 {
-                    return None;
-                }
-            } else {
-                let previous_offset = hint.checked_sub(header.prev_size)?;
-                let previous = self.validate_direct_header(previous_offset, None)?;
-                if previous.size != header.prev_size || previous.is_free() {
-                    return None;
-                }
+            let (header, following) = self.validated_free_node(offset)?;
+            if header.size >= need {
+                break (header.size, following);
             }
-            if end == self.region_len {
-                // The index identifies the earliest free block, and this one reaches the region
-                // end, so no earlier or later free block can be a better first fit.
-                (header.size >= need).then_some((hint, header.size))
-            } else {
-                let mut offset = 0usize;
-                let mut previous_size = 0usize;
-                let mut previous_was_free = false;
-                let mut fit = None;
-                while offset < self.region_len {
-                    let header = self.header_at_offset(offset)?;
-                    let next = self.validate_header(offset, previous_size, header)?;
-                    if previous_was_free && header.is_free() {
-                        return None;
-                    }
-                    if fit.is_none() && header.is_free() && header.size >= need {
-                        fit = Some((offset, header.size));
-                    }
-                    previous_was_free = header.is_free();
-                    previous_size = header.size;
-                    offset = next;
-                }
-                if !self.formatted || offset != self.region_len {
-                    return None;
-                }
-                fit
-            }
+            previous_free = Some(offset);
+            offset = following;
         };
-
-        let (offset, bsize) = first_fit?;
-        let replacement = if self.first_free == offset {
-            if bsize - need >= MIN_BLOCK_SIZE {
-                offset + need
-            } else {
-                self.next_free_from(offset + bsize, bsize)?
-            }
-        } else {
-            self.first_free
-        };
+        self.validated_free_link(following)?;
+        let split = bsize - need >= MIN_BLOCK_SIZE;
+        let replacement = if split { offset + need } else { following };
         let base = self.backing.base();
         // SAFETY: checked header snapshots constrain every physical step to the backing region.
         unsafe {
             let cur = base.add(offset);
-            let retained = if bsize - need >= MIN_BLOCK_SIZE {
-                need
-            } else {
-                bsize
-            };
+            let retained = if split { need } else { bsize };
             let unused = retained - HDR - size;
             debug_assert!(unused <= u8::MAX as usize);
             self.split(cur, need);
-            self.first_free = replacement;
+            if split {
+                core::ptr::write(base.add(replacement + HDR) as *mut usize, following);
+            }
+            if let Some(previous) = previous_free {
+                core::ptr::write(base.add(previous + HDR) as *mut usize, replacement);
+            } else {
+                self.first_free = replacement;
+            }
             let allocated = self.hdr(cur);
             (*allocated).user_value = 0;
             (*allocated).user_flags = flags & HEAP_SETTABLE_USER_FLAGS;
@@ -1040,7 +1109,24 @@ impl<B: Backing> Heap<B> {
     /// `payload` must be a pointer previously returned by [`Self::allocate`]/[`Self::reallocate`] on
     /// this heap, or null (matching the real `RtlFreeHeap` contract).
     pub unsafe fn free(&mut self, payload: *mut u8) -> bool {
-        let Some((offset, _)) = self.direct_live_block_with_successor(payload) else {
+        let Some((offset, old)) = self.direct_live_block_with_successor(payload) else {
+            return false;
+        };
+        let previous_free = (old.prev_size != 0)
+            .then(|| {
+                let previous = offset - old.prev_size;
+                self.header_at_offset(previous)
+                    .filter(|header| header.is_free())
+                    .map(|_| previous)
+            })
+            .flatten();
+        let next_offset = offset + old.size;
+        let successor_free = self
+            .header_at_offset(next_offset)
+            .filter(|header| header.is_free())
+            .map(|_| next_offset);
+        let Some((before, after)) = self.insertion_links(offset, previous_free, successor_free)
+        else {
             return false;
         };
         let block = self.backing.base().add(offset);
@@ -1051,15 +1137,22 @@ impl<B: Backing> Heap<B> {
         header.unused_bytes = 0;
         header.reserved = 0;
         let coalesced = self.coalesce(block);
-        self.first_free = self.first_free.min(coalesced);
+        debug_assert_eq!(coalesced, previous_free.unwrap_or(offset));
+        self.link_coalesced_free(
+            offset,
+            before,
+            after,
+            previous_free.is_some(),
+            successor_free.is_some(),
+        );
         true
     }
 
     /// Whether coalescing has restored the entire backing to one free block.
     /// Only an empty peer may transfer its VM backing out of the logical process heap.
     pub fn is_completely_free(&self) -> bool {
-        self.header_at_offset(0).is_some_and(|header| {
-            header.is_free() && header.prev_size == 0 && header.size == self.region_len
+        self.validated_free_node(0).is_some_and(|(header, next)| {
+            self.first_free == 0 && header.size == self.region_len && next == self.region_len
         })
     }
 
@@ -1145,10 +1238,29 @@ impl<B: Backing> Heap<B> {
             };
             let unused = retained - HDR - new_size;
             debug_assert!(unused <= u8::MAX as usize);
+            let new_free_links = if retained != cur_total {
+                let tail_offset = offset + need;
+                let next_offset = offset + cur_total;
+                let successor_free = self
+                    .header_at_offset(next_offset)
+                    .filter(|header| header.is_free())
+                    .map(|_| next_offset);
+                let links = self.insertion_links(tail_offset, None, successor_free)?;
+                Some((tail_offset, successor_free, links))
+            } else {
+                None
+            };
             self.split(block, need);
-            if (*self.hdr(block)).size != cur_total {
+            if let Some((tail_offset, successor_free, (before, after))) = new_free_links {
                 let coalesced = self.coalesce(block.add(need));
-                self.first_free = self.first_free.min(coalesced);
+                debug_assert_eq!(coalesced, tail_offset);
+                self.link_coalesced_free(
+                    tail_offset,
+                    before,
+                    after,
+                    false,
+                    successor_free.is_some(),
+                );
             }
             (*self.hdr(block)).unused_bytes = unused as u8;
             if new_size > old_size {
@@ -1167,15 +1279,14 @@ impl<B: Backing> Heap<B> {
         {
             let merged = cur_total + (*self.hdr(next)).size;
             let next_offset = offset + cur_total;
-            let replacement = if self.first_free == next_offset {
-                if merged - need >= MIN_BLOCK_SIZE {
-                    offset + need
-                } else {
-                    self.next_free_from(offset + merged, (*self.hdr(next)).size)?
-                }
-            } else {
-                self.first_free
-            };
+            let (before, found) = self.free_links_before(next_offset)?;
+            if found != next_offset {
+                return None;
+            }
+            let (_, following) = self.validated_free_node(next_offset)?;
+            self.validated_free_link(following)?;
+            let split = merged - need >= MIN_BLOCK_SIZE;
+            let replacement = if split { offset + need } else { following };
             (*self.hdr(block)).size = merged;
             // Fix the block after `next`.
             let after = block.add(merged);
@@ -1183,7 +1294,20 @@ impl<B: Backing> Heap<B> {
                 (*self.hdr(after)).prev_size = merged;
             }
             self.split(block, need);
-            self.first_free = replacement;
+            if split {
+                core::ptr::write(
+                    self.backing.base().add(replacement + HDR) as *mut usize,
+                    following,
+                );
+            }
+            if let Some(previous) = before {
+                core::ptr::write(
+                    self.backing.base().add(previous + HDR) as *mut usize,
+                    replacement,
+                );
+            } else {
+                self.first_free = replacement;
+            }
             let unused = (*self.hdr(block)).size - HDR - new_size;
             debug_assert!(unused <= u8::MAX as usize);
             (*self.hdr(block)).unused_bytes = unused as u8;
@@ -1263,8 +1387,7 @@ pub fn take_redundant_empty_peer<B: Backing, const N: usize>(
         .max_by_key(|(_, len)| *len)?
         .0;
     let retire = peers.iter().enumerate().find_map(|(index, entry)| {
-        (index != keep && entry.as_ref().is_some_and(Heap::is_completely_free))
-            .then_some(index)
+        (index != keep && entry.as_ref().is_some_and(Heap::is_completely_free)).then_some(index)
     })?;
     peers[retire].take()
 }
@@ -1308,9 +1431,11 @@ pub unsafe fn reallocate_in_process_segments<B: Backing, const N: usize>(
         return None;
     }
 
-    let owner_index = peers
-        .iter()
-        .position(|entry| entry.as_ref().is_some_and(|heap| heap.size_of(payload).is_some()))?;
+    let owner_index = peers.iter().position(|entry| {
+        entry
+            .as_ref()
+            .is_some_and(|heap| heap.size_of(payload).is_some())
+    })?;
     let (before, owner_and_after) = peers.split_at_mut(owner_index);
     let (owner_slot, after) = owner_and_after.split_first_mut()?;
     let owner = owner_slot.as_mut()?;
@@ -1321,7 +1446,11 @@ pub unsafe fn reallocate_in_process_segments<B: Backing, const N: usize>(
         if let Some(result) = owner.relocate_to(primary, payload, new_size, flags) {
             return Some(result);
         }
-        for peer in before.iter_mut().chain(after.iter_mut()).filter_map(Option::as_mut) {
+        for peer in before
+            .iter_mut()
+            .chain(after.iter_mut())
+            .filter_map(Option::as_mut)
+        {
             if let Some(result) = owner.relocate_to(peer, payload, new_size, flags) {
                 return Some(result);
             }
@@ -1562,7 +1691,11 @@ impl<'a, B: Backing, const H: usize, const N: usize> HeapPeerRegistry<'a, B, H, 
         let Some(slot) = self.groups.iter_mut().find(|group| group.is_none()) else {
             return false;
         };
-        *slot = Some(HeapPeerGroup { handle, growable, peers });
+        *slot = Some(HeapPeerGroup {
+            handle,
+            growable,
+            peers,
+        });
         true
     }
 
@@ -1735,6 +1868,53 @@ mod tests {
             base_calls.get()
         );
         assert!(heap.validate(None));
+    }
+
+    #[test]
+    fn reuse_of_an_early_free_block_does_not_scan_the_remaining_live_heap() {
+        let base_calls = Rc::new(Cell::new(0));
+        let mut heap = Heap::create(CountedBacking {
+            buf: vec![0; 512 * 1024 + HEAP_ALIGN],
+            base_calls: Rc::clone(&base_calls),
+        })
+        .unwrap();
+        let first = heap.allocate(16).unwrap();
+        for _ in 0..4096 {
+            heap.allocate(16).unwrap();
+        }
+        // SAFETY: `first` is the live allocation returned by this heap above.
+        assert!(unsafe { heap.free(first) });
+        base_calls.set(0);
+        assert!(heap.allocate(16).is_some());
+        assert!(
+            base_calls.get() < 64,
+            "reuse visited {} backing blocks",
+            base_calls.get()
+        );
+        assert!(heap.validate(None));
+    }
+
+    #[test]
+    fn ordered_free_chain_keeps_first_fit_across_split_and_coalescing() {
+        let mut h = heap(2048);
+        let small = h.allocate(64).unwrap();
+        let guard_a = h.allocate(32).unwrap();
+        let large = h.allocate(192).unwrap();
+        let guard_b = h.allocate(32).unwrap();
+        assert!(unsafe { h.free(large) });
+        assert!(unsafe { h.free(small) });
+        assert!(h.validate(None));
+
+        // The earlier free block is too small; splitting the next one must preserve both links.
+        assert_eq!(h.allocate(96), Some(large));
+        assert!(h.validate(None));
+        assert_eq!(h.allocate(64), Some(small));
+        assert!(h.validate(None));
+
+        // The two guards keep these free extents separate until they are retired.
+        assert!(unsafe { h.free(guard_a) });
+        assert!(unsafe { h.free(guard_b) });
+        assert!(h.validate(None));
     }
 
     fn next_walk_entry(heap: &Heap<VecBacking>, entry: &mut RtlHeapWalkEntry) -> RtlHeapWalkEntry {
@@ -2072,7 +2252,7 @@ mod tests {
     }
 
     #[test]
-    fn allocation_rejects_late_corruption_before_reusing_an_earlier_free_block() {
+    fn allocation_uses_local_checks_and_explicit_validation_finds_late_corruption() {
         let mut h = heap(512);
         let first = h.allocate(32).unwrap();
         let _middle = h.allocate(32).unwrap();
@@ -2083,9 +2263,51 @@ mod tests {
             assert!(h.free(first));
             (*h.hdr(h.block_of(last).unwrap())).prev_size += HEAP_ALIGN;
         }
+        assert!(!h.validate(None));
+        // First-fit reuse touches the early block and its neighbours, not the corrupt later tag.
+        assert_eq!(h.allocate(16), Some(first));
+        assert!(!h.validate(None));
+    }
+
+    #[test]
+    fn allocation_rejects_corrupt_local_successor_and_free_chain_link() {
+        let mut h = heap(512);
+        let first = h.allocate(32).unwrap();
+        let second = h.allocate(32).unwrap();
+        assert!(unsafe { h.free(first) });
+        let second_header = h.block_of(second).unwrap();
+        // SAFETY: change only the in-band successor's integer predecessor tag.
+        unsafe { (*h.hdr(second_header)).prev_size += HEAP_ALIGN };
         assert!(h.allocate(16).is_none());
-        // The failed allocation must leave the earlier free block untouched.
         assert!(unsafe { (*h.hdr(h.handle())).is_free() });
+
+        let mut h = heap(512);
+        let first = h.allocate(32).unwrap();
+        let _second = h.allocate(32).unwrap();
+        assert!(unsafe { h.free(first) });
+        // SAFETY: overwrite the free node's in-band link with an out-of-range offset.
+        unsafe { (first as *mut usize).write(h.region_len + HEAP_ALIGN) };
+        assert!(!h.validate(None));
+        assert!(h.allocate(16).is_none());
+    }
+
+    #[test]
+    fn allocation_rejects_free_link_into_a_live_successor_without_writing_it() {
+        let mut h = heap(512);
+        let first = h.allocate(16).unwrap();
+        let second = h.allocate(32).unwrap();
+        let second_offset = h.block_of(second).unwrap() as usize - h.handle() as usize;
+        assert!(unsafe { h.free(first) });
+        let sentinel = 0x5a5a_3344_7788_99aau64 as usize;
+        // SAFETY: these are exact live/free payloads. Corrupt only the free link, leaving the
+        // physical headers intact, to model a plausible in-range link scribble.
+        unsafe {
+            (second as *mut usize).write(sentinel);
+            (first as *mut usize).write(second_offset);
+        }
+        assert!(!h.validate(None));
+        assert!(h.allocate(16).is_none());
+        assert_eq!(unsafe { (second as *const usize).read() }, sentinel);
     }
 
     #[test]
@@ -2379,9 +2601,12 @@ mod tests {
             assert!(core::slice::from_raw_parts(first, 64)
                 .iter()
                 .all(|byte| *byte == 0x11));
-            assert!(core::slice::from_raw_parts(middle, 80)
-                .iter()
-                .all(|byte| *byte == 0));
+            assert!(core::slice::from_raw_parts(
+                middle.add(size_of::<usize>()),
+                80 - size_of::<usize>()
+            )
+            .iter()
+            .all(|byte| *byte == 0));
             assert!(core::slice::from_raw_parts(last, 64)
                 .iter()
                 .all(|byte| *byte == 0x22));
@@ -2473,12 +2698,16 @@ mod tests {
             assert_eq!(owner.user_info(old).unwrap().user_value, 0x1234);
             assert!(peer.free(peer_blocker));
 
-            let moved = owner.relocate_to(&mut peer, old, 24, HEAP_ZERO_MEMORY).unwrap();
+            let moved = owner
+                .relocate_to(&mut peer, old, 24, HEAP_ZERO_MEMORY)
+                .unwrap();
             assert_eq!(owner.size_of(old), None);
             assert_eq!(peer.size_of(moved), Some(24));
             assert_eq!(peer.user_info(moved).unwrap().user_value, 0x1234);
             assert_eq!(peer.user_info(moved).unwrap().user_flags, 0x200);
-            assert!(core::slice::from_raw_parts(moved, 16).iter().all(|&b| b == 0x5a));
+            assert!(core::slice::from_raw_parts(moved, 16)
+                .iter()
+                .all(|&b| b == 0x5a));
             assert!(core::slice::from_raw_parts(moved.add(16), 8)
                 .iter()
                 .all(|&b| b == 0));
@@ -2534,7 +2763,9 @@ mod tests {
             assert!(metadata.has_user_value);
             assert_eq!(metadata.user_value, 0x1234);
             assert_eq!(metadata.user_flags, 0x200);
-            assert!(core::slice::from_raw_parts(moved, 16).iter().all(|&byte| byte == 0x5a));
+            assert!(core::slice::from_raw_parts(moved, 16)
+                .iter()
+                .all(|&byte| byte == 0x5a));
             assert!(core::slice::from_raw_parts(moved.add(16), 8)
                 .iter()
                 .all(|&byte| byte == 0));
@@ -2824,7 +3055,12 @@ mod tests {
             .allocate(payload_len)
             .unwrap();
         assert_eq!(
-            unsafe { registry.peers(first).unwrap()[0].as_ref().unwrap().size_of(payload) },
+            unsafe {
+                registry.peers(first).unwrap()[0]
+                    .as_ref()
+                    .unwrap()
+                    .size_of(payload)
+            },
             Some(payload_len)
         );
         assert!(registry.peers(second).unwrap().iter().all(Option::is_none));
@@ -2866,7 +3102,11 @@ mod tests {
         assert!(registry.take_owned_peer(growable).is_some());
         assert!(registry.unregister(growable));
         assert!(registry.register(replacement, true, Some(&mut replacement_peers)));
-        assert!(registry.peers(replacement).unwrap().iter().all(Option::is_none));
+        assert!(registry
+            .peers(replacement)
+            .unwrap()
+            .iter()
+            .all(Option::is_none));
         assert_eq!(registry.growable(finite), Some(false));
     }
 
@@ -2902,7 +3142,9 @@ mod tests {
         let process = heap(0x1000);
         let handle = process.handle();
         assert!(matches!(registry.install_process(process), Ok(got) if got == handle));
-        assert!(registry.take_unpublished_process(core::ptr::null_mut()).is_none());
+        assert!(registry
+            .take_unpublished_process(core::ptr::null_mut())
+            .is_none());
         assert!(registry.take_unpublished_process(handle).is_some());
         assert!(registry.is_empty());
     }
