@@ -102,6 +102,7 @@ struct DeviceProvider {
     live: bool,
     guids: Vec<(WmiGuid, u32)>,
     pending_reginfo: Option<PendingRegInfo>,
+    reginfo_bytes: Vec<u8>,
 }
 
 /// A successful WMI event transfers a normal pool allocation to WMI. A traced
@@ -164,6 +165,7 @@ impl WmiRegistry {
             entry.live = true;
             entry.guids.clear();
             entry.pending_reginfo = None;
+            entry.reginfo_bytes.clear();
             return Ok(id);
         }
         self.device_providers
@@ -178,6 +180,7 @@ impl WmiRegistry {
             live: true,
             guids: Vec::new(),
             pending_reginfo: None,
+            reginfo_bytes: Vec::new(),
         });
         Ok(id)
     }
@@ -191,6 +194,17 @@ impl WmiRegistry {
             .ok_or(STATUS_INVALID_HANDLE)
     }
 
+    /// Resolve a pending ticket without requiring the device to remain live.
+    /// The native broker still authenticates the caller's domain separately.
+    pub fn pending_reginfo_identity(&self, id: u64) -> Option<WmiDeviceIdentity> {
+        if id == 0 { return None; }
+        self.device_providers.iter().find_map(|entry| {
+            entry.pending_reginfo.and_then(|pending| {
+                (pending.ticket.id == id).then_some(pending.ticket.identity)
+            })
+        })
+    }
+
     /// Reserve the exact registration before the native REGINFO IRP can run.
     /// A dispatched ticket stays pending across uncertain effects; retrying
     /// registration while it is pending would replay the driver callback.
@@ -201,6 +215,7 @@ impl WmiRegistry {
         let id = self.next_reginfo_ticket_id;
         self.next_reginfo_ticket_id = id.checked_add(1).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         let ticket = RegInfoTicket { id, identity };
+        self.device_providers[entry].reginfo_bytes.clear();
         self.device_providers[entry].pending_reginfo = Some(PendingRegInfo {
             ticket,
             phase: RegInfoPhase::Prepared,
@@ -228,7 +243,49 @@ impl WmiRegistry {
             return Err(STATUS_INVALID_HANDLE);
         }
         entry.pending_reginfo = None;
+        entry.reginfo_bytes.clear();
         Ok(())
+    }
+
+    /// Append one exact transport chunk. The offset makes an uncertain reply
+    /// visible as a collision instead of silently replaying bytes.
+    pub fn stage_reginfo_chunk(
+        &mut self,
+        ticket: RegInfoTicket,
+        offset: u64,
+        chunk: &[u8],
+    ) -> Result<(), u32> {
+        let entry = self.reginfo_entry_mut(ticket)?;
+        if entry.pending_reginfo.map(|pending| pending.phase) != Some(RegInfoPhase::Dispatched)
+            || chunk.is_empty()
+            || offset != entry.reginfo_bytes.len() as u64
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let total = entry.reginfo_bytes.len().checked_add(chunk.len())
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        if total > u32::MAX as usize {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        entry.reginfo_bytes.try_reserve(chunk.len())
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        entry.reginfo_bytes.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    /// Consume only a proven terminal IRP result. A failed terminal may have
+    /// no output chunks; a successful one must parse as complete WMIREGINFO.
+    pub fn complete_streamed_reginfo(
+        &mut self,
+        ticket: RegInfoTicket,
+        status: u32,
+    ) -> Result<(), u32> {
+        let entry = self.reginfo_entry_mut(ticket)?;
+        if entry.pending_reginfo.map(|pending| pending.phase) != Some(RegInfoPhase::Dispatched) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let bytes = core::mem::take(&mut entry.reginfo_bytes);
+        self.complete_reginfo(ticket, status, &bytes)
     }
 
     /// Consume a proven terminal result. Only a successful, bounded REGINFO
@@ -245,6 +302,7 @@ impl WmiRegistry {
             return Err(STATUS_INVALID_HANDLE);
         }
         entry.pending_reginfo = None;
+        entry.reginfo_bytes.clear();
         if !entry.live {
             return Err(STATUS_INVALID_HANDLE);
         }
@@ -301,6 +359,19 @@ impl WmiRegistry {
         Ok(())
     }
 
+    /// Deregistration withdraws advertised GUIDs while retaining the device's
+    /// stable provider ID until its physical pointer is retired.
+    pub fn deregister_device_guids(&mut self, identity: WmiDeviceIdentity) -> Result<(), u32> {
+        let entry = self.device_providers.iter_mut()
+            .find(|entry| entry.live && entry.identity == identity)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if entry.pending_reginfo.is_some() {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        entry.guids.clear();
+        Ok(())
+    }
+
     /// Admit a submitted event only for a live provider and a GUID that its
     /// completed REGINFO advertised for notification. The native broker must
     /// copy/deliver or consume the allocation before returning success.
@@ -340,6 +411,7 @@ impl WmiRegistry {
         entry.live = false;
         if entry.pending_reginfo.map(|pending| pending.phase) == Some(RegInfoPhase::Prepared) {
             entry.pending_reginfo = None;
+            entry.reginfo_bytes.clear();
         }
         Ok(())
     }

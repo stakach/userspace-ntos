@@ -55,6 +55,12 @@ pub(super) use hosted_dxg_registration::bridge_dxg_registration_entry;
 
 #[path = "hosted_wmi.rs"]
 mod hosted_wmi;
+#[path = "hosted_wmi_reginfo.rs"]
+mod hosted_wmi_reginfo;
+#[path = "hosted_wmi_event.rs"]
+mod hosted_wmi_event;
+#[path = "hosted_driver_wmi.rs"]
+mod hosted_driver_wmi;
 
 #[path = "hosted_ingress_sources.rs"]
 pub(crate) mod hosted_ingress_sources;
@@ -70,10 +76,6 @@ mod hosted_connect_work;
 #[path = "hosted_connect_live.rs"]
 mod hosted_connect_live;
 #[path = "hosted_class_callback_lane.rs"]
-#[path = "hosted_wmi_reginfo.rs"]
-mod hosted_wmi_reginfo;
-#[path = "hosted_driver_wmi.rs"]
-mod hosted_driver_wmi;
 mod hosted_class_callback_lane;
 #[path = "hosted_class_callback_thunk.rs"]
 mod hosted_class_callback_thunk;

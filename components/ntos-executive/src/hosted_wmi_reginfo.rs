@@ -10,6 +10,11 @@ pub(super) struct RegInfoReply {
     pub bytes: Vec<u8>,
 }
 
+pub(super) struct RegInfoFailure {
+    pub status: i32,
+    pub dispatched: bool,
+}
+
 struct HeldRegInfoIrp {
     irp: u64,
 }
@@ -25,9 +30,13 @@ impl Drop for HeldRegInfoIrp {
 /// Dispatch to the device's current `IRP_MJ_SYSTEM_CONTROL` handler and wait
 /// through an inline or pending terminal. The completion callback parks the
 /// source packet; the guard resumes normal terminal cleanup after the copy.
-pub(super) unsafe fn query(device: u64, capacity: u32) -> Result<RegInfoReply, i32> {
+pub(super) unsafe fn query(
+    device: u64,
+    capacity: u32,
+    ticket: u64,
+) -> Result<RegInfoReply, RegInfoFailure> {
     if device == 0 || capacity < 24 {
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(RegInfoFailure { status: STATUS_INVALID_PARAMETER, dispatched: false });
     }
     let mut completion = HostedSyncForwardContext {
         event: [0; 3],
@@ -42,7 +51,11 @@ pub(super) unsafe fn query(device: u64, capacity: u32) -> Result<RegInfoReply, i
         device, capacity, event, iosb,
     );
     if irp == 0 {
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
+        return Err(RegInfoFailure { status: STATUS_INSUFFICIENT_RESOURCES, dispatched: false });
+    }
+    let _held = HeldRegInfoIrp { irp };
+    if let Err(status) = hosted_driver_wmi::ticket_operation(3, device, ticket, 0) {
+        return Err(RegInfoFailure { status, dispatched: false });
     }
     let buffer = read_unaligned((irp + 0x18) as *const u64);
     let next = irp_next_stack_location(irp);
@@ -73,24 +86,27 @@ pub(super) unsafe fn query(device: u64, capacity: u32) -> Result<RegInfoReply, i
             [device, irp, event, dispatch_status as u32 as u64],
         );
     }
-    let _held = HeldRegInfoIrp { irp };
     let status = read_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const i32);
     let information = read_unaligned((irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *const u64);
     if status != STATUS_SUCCESS {
         return Ok(RegInfoReply { status, information, bytes: Vec::new() });
     }
     let Some(actual_capacity) = component_pool_allocation_capacity(buffer) else {
-        return Err(STATUS_INVALID_HANDLE);
+        return Err(RegInfoFailure { status: STATUS_INVALID_HANDLE, dispatched: true });
     };
     if buffer == 0 || read_unaligned((irp + 0x18) as *const u64) != buffer
         || information < 24 || information > u64::from(capacity)
         || information > actual_capacity
     {
-        return Err(STATUS_INVALID_BUFFER_SIZE as i32);
+        return Err(RegInfoFailure { status: STATUS_INVALID_BUFFER_SIZE as i32, dispatched: true });
     }
-    let length = usize::try_from(information).map_err(|_| STATUS_INVALID_BUFFER_SIZE as i32)?;
+    let length = usize::try_from(information).map_err(|_| RegInfoFailure {
+        status: STATUS_INVALID_BUFFER_SIZE as i32, dispatched: true,
+    })?;
     let mut bytes = Vec::new();
-    bytes.try_reserve_exact(length).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    bytes.try_reserve_exact(length).map_err(|_| RegInfoFailure {
+        status: STATUS_INSUFFICIENT_RESOURCES, dispatched: true,
+    })?;
     bytes.resize(length, 0);
     core::ptr::copy_nonoverlapping(buffer as *const u8, bytes.as_mut_ptr(), length);
     Ok(RegInfoReply { status, information, bytes })

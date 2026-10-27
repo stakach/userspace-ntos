@@ -65,3 +65,16 @@ fn retired_dispatched_ticket_blocks_address_reuse_until_terminal_result() {
     let fresh = registry.register_device(replacement).unwrap();
     assert_eq!(registry.plan_device_event(fresh, GUID, 0), Err(STATUS_WMI_GUID_NOT_FOUND));
 }
+
+#[test]
+fn deregistration_clears_guid_publication_only_after_pending_effect_finishes() {
+    let mut registry = WmiRegistry::new();
+    let provider = registry.register_device(DEVICE).unwrap();
+    let ticket = registry.begin_reginfo(DEVICE).unwrap();
+    registry.mark_reginfo_dispatched(ticket).unwrap();
+    assert_eq!(registry.deregister_device_guids(DEVICE), Err(STATUS_INVALID_HANDLE));
+    registry.complete_reginfo(ticket, 0, &reginfo(GUID)).unwrap();
+    registry.deregister_device_guids(DEVICE).unwrap();
+    assert_eq!(registry.plan_device_event(provider, GUID, 0), Err(STATUS_WMI_GUID_NOT_FOUND));
+    assert_eq!(registry.device_provider_id(DEVICE), Ok(provider));
+}
