@@ -110,6 +110,90 @@ fn rechecked_pair_commit_skips_full_payload_scan_and_preserves_barriers() {
 }
 
 #[test]
+fn paired_snapshot_commit_obeys_transfer_bound_and_recovers_both_slots() {
+    for (max_sectors, expected_writes_per_slot) in [(8, 10), (256, 2)] {
+        let store = SnapshotBlockStore::new(0, 512);
+        let mut disk = CachedDisk::with_sectors(512);
+        let old = alloc::vec![0x31; 65 * 512];
+        let replacement = alloc::vec![0xa5; 65 * 512];
+        store.commit_next_with_wal_manifest(&mut disk, &old, baseline()).unwrap();
+        store.commit_next_with_wal_manifest(&mut disk, &old, baseline()).unwrap();
+        let proof = rechecked_pair(store, &mut disk);
+        disk.events.clear();
+
+        let mut first = AsyncSnapshotCommit::new_from_rechecked_pair(
+            replacement.clone(), baseline(), proof,
+        ).ok().unwrap();
+        first.set_max_batch_sectors(max_sectors).unwrap();
+        let mut first_writes = 0;
+        while let Some(request) = first.enter_next().unwrap() {
+            if request.kind != AsyncSnapshotIoKind::Flush {
+                assert!(request.bytes <= max_sectors as usize * 512);
+            }
+            if request.kind == AsyncSnapshotIoKind::Write { first_writes += 1; }
+            perform(&mut disk, &mut first, request);
+        }
+        assert_eq!(first_writes, expected_writes_per_slot);
+        let (payload, generation, pair) = unsafe {
+            first.finish_with_payload_and_paired_proof()
+        }.ok().unwrap();
+        assert_eq!(generation, 3);
+
+        let mut second = unsafe { AsyncSnapshotCommit::new_from_verified_pair(
+            store, payload, baseline(), disk.sector_size(), disk.sector_count(), pair,
+        ) }.ok().unwrap();
+        second.set_max_batch_sectors(max_sectors).unwrap();
+        let mut second_writes = 0;
+        while let Some(request) = second.enter_next().unwrap() {
+            if request.kind != AsyncSnapshotIoKind::Flush {
+                assert!(request.bytes <= max_sectors as usize * 512);
+            }
+            if request.kind == AsyncSnapshotIoKind::Write { second_writes += 1; }
+            perform(&mut disk, &mut second, request);
+        }
+        assert_eq!(second_writes, expected_writes_per_slot);
+        let (generation, _) = unsafe { second.finish_with_paired_proof() }.ok().unwrap();
+        assert_eq!(generation, 4);
+        disk.power_cut();
+        let recovered = store.read_latest(&mut disk).unwrap().unwrap();
+        assert_eq!(recovered.generation, 4);
+        assert_eq!(recovered.payload, replacement);
+    }
+}
+
+#[test]
+fn snapshot_transfer_bound_changes_only_between_unentered_requests() {
+    let (mut disk, mut commit) = fixture(alloc::vec![0x5a; 4 * 512]);
+    assert_eq!(
+        commit.set_max_batch_sectors(0),
+        Err(AsyncSnapshotCommitError::Store(
+            SnapshotBlockStoreError::InvalidGeometry,
+        )),
+    );
+    let request = loop {
+        let request = commit.enter_next().unwrap().unwrap();
+        if request.kind == AsyncSnapshotIoKind::Write && request.bytes > 512 {
+            break request;
+        }
+        perform(&mut disk, &mut commit, request);
+    };
+    assert_eq!(
+        commit.set_max_batch_sectors(1),
+        Err(AsyncSnapshotCommitError::Outstanding),
+    );
+    commit.release_unentered(request).unwrap();
+    commit.set_max_batch_sectors(1).unwrap();
+    let retry = commit.enter_next().unwrap().unwrap();
+    assert_ne!(retry.sequence, request.sequence);
+    assert_eq!(retry.bytes, 512);
+    assert_eq!(
+        commit.complete_effect(request, request.bytes),
+        Err(AsyncSnapshotCommitError::WrongTicket),
+    );
+    perform(&mut disk, &mut commit, retry);
+}
+
+#[test]
 fn proof_checkpoint_refusal_returns_payload_and_exact_proof_before_effect() {
     let store = SnapshotBlockStore::new(0, 16);
     let mut disk = CachedDisk::new();

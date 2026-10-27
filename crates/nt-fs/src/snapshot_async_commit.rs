@@ -7,6 +7,7 @@
 use super::*;
 
 const BATCH_SECTORS: u32 = 32;
+const MAX_BATCH_SECTORS: u32 = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AsyncSnapshotIoKind {
@@ -73,6 +74,7 @@ pub struct AsyncSnapshotCommit<P: AsRef<[u8]>> {
     scan_crc: Crc32c,
     target_slot: u32,
     generation: u64,
+    batch_sectors: u32,
     write_buffer: Vec<u8>,
     failure: Option<SnapshotBlockStoreError>,
     uncertain: bool,
@@ -140,6 +142,7 @@ impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
             scan_crc: Crc32c::new(),
             target_slot: 0,
             generation: 0,
+            batch_sectors: BATCH_SECTORS,
             write_buffer,
             failure: None,
             uncertain: false,
@@ -251,6 +254,34 @@ impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
 
     pub fn pending(&self) -> Option<AsyncSnapshotRequest> {
         self.pending
+    }
+
+    /// Bound each payload request by the exact device route's current transfer ceiling.
+    /// A caller may lower the bound after releasing an unentered request, but never while
+    /// a physical effect is outstanding.
+    pub fn set_max_batch_sectors(
+        &mut self,
+        max_sectors: u32,
+    ) -> Result<(), AsyncSnapshotCommitError> {
+        if self.pending.is_some() {
+            return Err(AsyncSnapshotCommitError::Outstanding);
+        }
+        if max_sectors == 0 {
+            return Err(AsyncSnapshotCommitError::Store(
+                SnapshotBlockStoreError::InvalidGeometry,
+            ));
+        }
+        let batch_sectors = max_sectors.min(MAX_BATCH_SECTORS);
+        let capacity = self
+            .sector_size
+            .checked_mul(batch_sectors as usize)
+            .ok_or(AsyncSnapshotCommitError::Store(
+                SnapshotBlockStoreError::InvalidGeometry,
+            ))?;
+        self.batch_sectors = if self.write_buffer
+            .try_reserve_exact(capacity.saturating_sub(self.write_buffer.len()))
+            .is_ok() { batch_sectors } else { self.batch_sectors.min(max_sectors) };
+        Ok(())
     }
 
     pub fn is_done(&self) -> bool {
@@ -392,7 +423,7 @@ impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
                 let plan = self.header_plans[slot as usize].ok_or(
                     AsyncSnapshotCommitError::Store(SnapshotBlockStoreError::Corrupt),
                 )?;
-                let sectors = (plan.payload_sectors - sector).min(BATCH_SECTORS);
+                let sectors = (plan.payload_sectors - sector).min(self.batch_sectors);
                 (
                     AsyncSnapshotIoKind::Read,
                     self.slot_base(slot) + 1 + u64::from(sector),
@@ -401,7 +432,7 @@ impl<P: AsRef<[u8]>> AsyncSnapshotCommit<P> {
             }
             Phase::PayloadWrite(sector) => {
                 let total = self.payload.as_ref().len().div_ceil(self.sector_size) as u32;
-                let sectors = (total - sector).min(BATCH_SECTORS);
+                let sectors = (total - sector).min(self.batch_sectors);
                 let offset = sector as usize * self.sector_size;
                 let bytes = sectors as usize * self.sector_size;
                 self.write_buffer.resize(bytes, 0);
