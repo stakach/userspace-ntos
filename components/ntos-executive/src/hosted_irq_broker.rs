@@ -1724,6 +1724,72 @@ impl HostedIrqRootSession {
     }
 }
 
+fn trace_irq_contention(
+    reason: &[u8],
+    connection: HostedIrqConnection,
+    lane: HostedIrqLaneView,
+    holder: Option<InterruptActualLockLease>,
+    arena: Option<nt_hosted_runtime::HostedIrqContentionSnapshot>,
+) {
+    static TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+    if TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 16 { return; }
+    print_str(b"[hosted-irq-contention] reason=");
+    print_str(reason);
+    print_str(b" interrupt/connection/vector=");
+    print_u64(connection.route.tokens.interrupt_id);
+    print_str(b"/");
+    print_u64(connection.rundown.identity().connection_id);
+    print_str(b"/");
+    print_u64(connection.route.tokens.vector as u64);
+    print_str(b" lane=");
+    print_u64(lane.identity.domain_id);
+    print_str(b"/");
+    print_u64(lane.identity.domain_cookie);
+    print_str(b"/");
+    print_u64(lane.identity.lane_generation);
+    print_str(b" lock=");
+    print_hex64(connection.actual_lock.lock_token);
+    print_str(b"/");
+    print_u64(connection.actual_lock.generation);
+    print_str(if reason == b"arena-transaction" {
+        b" attempt-lock="
+    } else {
+        b" held-lock="
+    });
+    if let Some(holder) = holder {
+        print_u64(holder.owner.owner_domain);
+        print_str(b"/");
+        print_u64(holder.owner.owner_cookie);
+        print_str(b"/");
+        print_u64(holder.owner.connection_id);
+        print_str(b"/");
+        print_u64(holder.owner.grant_generation);
+        print_str(b"/");
+        print_u64(holder.sequence);
+    } else {
+        print_str(b"none");
+    }
+    print_str(b" active-arena=");
+    if let Some(arena) = arena {
+        print_u64(arena.active_raw);
+        print_str(b"/");
+        print_u64(arena.class_raw as u64);
+        print_str(b"/");
+        print_u64(arena.current_irql as u64);
+        print_str(b" masks=");
+        print_hex(arena.dispatch_mask);
+        print_str(b"/");
+        print_hex(arena.service_mask);
+        print_str(b"/");
+        print_hex(arena.dispatch_running_mask);
+        print_str(b"/");
+        print_hex(arena.service_running_mask);
+    } else {
+        print_str(b"unavailable");
+    }
+    print_str(b"\n");
+}
+
 pub(super) unsafe fn dispatch_interrupt(
     connection: HostedIrqConnection,
 ) -> Result<HostedIrqRootDispatchOutcome, nt_status::NtStatus> {
@@ -1738,6 +1804,11 @@ pub(super) unsafe fn dispatch_interrupt(
     {
         Ok(lease) => lease,
         Err(InterruptActualLockError::Busy) => {
+            let holder = hosted_irq_actual_locks_mut()
+                .held_lease(connection.actual_lock).ok().flatten();
+            let arena = lane.arena().control
+                .root_contention_snapshot(lane.identity).ok();
+            trace_irq_contention(b"actual-lock", connection, lane, holder, arena);
             return Ok(HostedIrqRootDispatchOutcome::DeferredBusy)
         }
         Err(error) => return Err(hosted_irq_actual_lock_status(error)),
@@ -1749,7 +1820,11 @@ pub(super) unsafe fn dispatch_interrupt(
     ) {
         Ok(transaction) => transaction,
         Err(nt_hosted_runtime::HostedIrqArenaError::Busy) => {
+            // The lease is this attempt's lock, not the competing arena owner.
+            let holder = Some(outer_lock);
+            let snapshot = arena.control.root_contention_snapshot(lane.identity).ok();
             release_hosted_irq_actual_lock_lease(outer_lock)?;
+            trace_irq_contention(b"arena-transaction", connection, lane, holder, snapshot);
             return Ok(HostedIrqRootDispatchOutcome::DeferredBusy);
         }
         Err(error) => {

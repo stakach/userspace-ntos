@@ -661,6 +661,19 @@ pub struct HostedIrqArenaControl {
     padding: [u8; 3792],
 }
 
+/// Read-only lane state sampled during contention; it never grants execution authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostedIrqContentionSnapshot {
+    pub active: Option<HostedIrqTransaction>,
+    pub active_raw: u64,
+    pub class_raw: u32,
+    pub current_irql: u32,
+    pub dispatch_mask: u32,
+    pub service_mask: u32,
+    pub dispatch_running_mask: u32,
+    pub service_running_mask: u32,
+}
+
 impl HostedIrqArenaControl {
     pub fn new(config: HostedIrqArenaConfig) -> Result<Self, HostedIrqArenaError> {
         if !config.valid() {
@@ -923,6 +936,34 @@ impl HostedIrqArenaControl {
         };
         self.check_transaction_present(identity, active)?;
         Ok(active)
+    }
+
+    /// Decode only a stable token/class pair; retain raw fields when a transition races sampling.
+    pub fn root_contention_snapshot(
+        &self,
+        identity: HostedIrqLaneIdentity,
+    ) -> Result<HostedIrqContentionSnapshot, HostedIrqArenaError> {
+        self.check_identity(identity)?;
+        let first = self.active_transaction.load(Ordering::Acquire);
+        let class_raw = self.active_transaction_class.load(Ordering::Acquire);
+        let last = self.active_transaction.load(Ordering::Acquire);
+        let active = (first == last && last != 0 && last != TRANSACTION_PUBLISHING)
+            .then(|| HostedIrqTransactionClass::from_raw(class_raw).map(|class| HostedIrqTransaction {
+                lane_generation: identity.lane_generation,
+                transaction: last,
+                class,
+            }))
+            .flatten();
+        Ok(HostedIrqContentionSnapshot {
+            active,
+            active_raw: last,
+            class_raw,
+            current_irql: self.current_irql.load(Ordering::Acquire),
+            dispatch_mask: self.dispatch_mask.load(Ordering::Acquire),
+            service_mask: self.service_mask.load(Ordering::Acquire),
+            dispatch_running_mask: self.dispatch_running_mask.load(Ordering::Acquire),
+            service_running_mask: self.service_running_mask.load(Ordering::Acquire),
+        })
     }
 
     pub fn current_irql(&self, identity: HostedIrqLaneIdentity) -> Result<u8, HostedIrqArenaError> {
@@ -3197,6 +3238,26 @@ mod tests {
             control.root_begin_transaction(identity(), HostedIrqTransactionClass::Interrupt),
             Err(HostedIrqArenaError::Shutdown)
         );
+    }
+
+    #[test]
+    fn contention_snapshot_identifies_the_exact_active_transaction() {
+        let control = active_control();
+        assert_eq!(control.root_contention_snapshot(identity()).unwrap().active, None);
+        let callback = control
+            .root_begin_transaction(identity(), HostedIrqTransactionClass::Callback)
+            .unwrap();
+        assert_eq!(
+            control.root_begin_transaction(identity(), HostedIrqTransactionClass::Interrupt),
+            Err(HostedIrqArenaError::Busy)
+        );
+        let busy = control.root_contention_snapshot(identity()).unwrap();
+        assert_eq!(busy.active, Some(callback));
+        assert_eq!(busy.current_irql, 0);
+        assert_eq!(busy.dispatch_mask, 0);
+        assert_eq!(busy.service_mask, 0);
+        control.root_finish_transaction(identity(), callback).unwrap();
+        assert_eq!(control.root_contention_snapshot(identity()).unwrap().active, None);
     }
 
     #[test]
