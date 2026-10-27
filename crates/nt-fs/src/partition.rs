@@ -140,7 +140,7 @@ pub fn parse_gpt_header(sector: &[u8], expected_lba: u64) -> Result<GptHeader, G
     }
     let revision = le_u32(sector, 8)?;
     let header_size = le_u32(sector, 12)? as usize;
-    if revision < 0x0001_0000 || !(92..=DISK_SECTOR_BYTES).contains(&header_size) {
+    if revision < 0x0001_0000 || !(92..=sector.len()).contains(&header_size) {
         return Err(GptError::InvalidHeader);
     }
     let stored_crc = le_u32(sector, 16)?;
@@ -167,7 +167,9 @@ pub fn parse_gpt_header(sector: &[u8], expected_lba: u64) -> Result<GptHeader, G
     };
     let primary = header.current_lba < header.backup_lba;
     let entry_end = header
-        .partition_entries_sectors()
+        .partition_entries_bytes()
+        .and_then(|bytes| bytes.checked_add(sector.len() as u64 - 1))
+        .map(|bytes| bytes / sector.len() as u64)
         .and_then(|sectors| header.partition_entries_lba.checked_add(sectors));
     let entry_array_in_role = if primary {
         entry_end.is_some_and(|end| end <= header.first_usable_lba)
@@ -183,7 +185,7 @@ pub fn parse_gpt_header(sector: &[u8], expected_lba: u64) -> Result<GptHeader, G
         || header.partition_entries_lba == 0
         || header.partition_entry_count == 0
         || header.partition_entry_size < GPT_ENTRY_MIN_BYTES
-        || header.partition_entry_size as usize > DISK_SECTOR_BYTES
+        || header.partition_entry_size as usize > sector.len()
         || header.partition_entry_size % 8 != 0
         || header.partition_entries_bytes().is_none()
         || !entry_array_in_role
@@ -337,6 +339,18 @@ mod tests {
         let crc = gpt_crc32(&sector[..92]);
         sector[16..20].copy_from_slice(&crc.to_le_bytes());
         sector
+    }
+
+    #[test]
+    fn four_kib_gpt_header_uses_physical_sector_geometry_for_entry_array_bounds() {
+        let mut sector = [0u8; 4096];
+        sector[..92].copy_from_slice(&header_sector()[..92]);
+        sector[40..48].copy_from_slice(&6u64.to_le_bytes());
+        sector[48..56].copy_from_slice(&4062u64.to_le_bytes());
+        sector[16..20].fill(0);
+        let crc = gpt_crc32(&sector[..92]);
+        sector[16..20].copy_from_slice(&crc.to_le_bytes());
+        assert!(parse_gpt_header(&sector, 1).is_ok());
     }
 
     #[test]

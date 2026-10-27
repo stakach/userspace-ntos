@@ -220,6 +220,8 @@ mod hosted_start_io;
 mod hosted_kd_debug;
 #[path = "hosted_synchronous_fsd_request.rs"]
 mod hosted_synchronous_fsd_request;
+#[path = "hosted_partition_table.rs"]
+mod hosted_partition_table;
 #[path = "hosted_source_create_security.rs"]
 mod hosted_source_create_security;
 #[path = "hosted_source_pool_memory.rs"]
@@ -35507,6 +35509,7 @@ fn register_fsd_trampolines() -> bool {
         "IoBuildSynchronousFsdRequest",
         hosted_synchronous_fsd_request::build as *const () as usize as u64,
     );
+    hosted_partition_table::bind(reg);
     reg.bind("IoCancelIrp", s_io_cancel_irp as *const () as usize as u64);
     reg.bind(
         "IoAcquireCancelSpinLock",

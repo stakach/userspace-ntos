@@ -12,6 +12,7 @@ pub const PARTITION_INFORMATION_EX_BYTES: usize = 144;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DriveLayoutError {
     InvalidSectorSize,
+    InvalidPartition,
     TooManyPartitions,
     OutOfMemory,
     ArithmeticOverflow,
@@ -176,6 +177,11 @@ fn read_mbr_layout<E>(
     }
     if let Some((base, extent)) = extended {
         let limit = base + extent;
+        if partitions.iter().any(|partition: &MbrPartition| {
+            partition.first_lba < limit && base < partition.first_lba + partition.sectors
+        }) {
+            return Err(DriveLayoutReadError::InvalidPartitionTable);
+        }
         let mut next = base;
         let mut visited = Vec::new();
         let mut sector = Vec::new();
@@ -208,6 +214,10 @@ fn read_mbr_layout<E>(
                 return Err(DriveLayoutReadError::InvalidPartitionTable);
             }
             let relative = u64::from(u32::from_le_bytes(link[8..12].try_into().unwrap()));
+            let link_len = u64::from(u32::from_le_bytes(link[12..16].try_into().unwrap()));
+            if link_len == 0 || relative.checked_add(link_len).is_none_or(|end| end > extent) {
+                return Err(DriveLayoutReadError::InvalidPartitionTable);
+            }
             next = base.checked_add(relative).ok_or(DriveLayoutReadError::InvalidPartitionTable)?;
         }
     }
@@ -279,6 +289,21 @@ pub fn gpt_drive_layout_ex(
     }
     if partitions.len() > header.partition_entry_count as usize {
         return Err(DriveLayoutError::TooManyPartitions);
+    }
+    for (index, partition) in partitions.iter().enumerate() {
+        if partition.type_guid == [0; 16]
+            || partition.unique_guid == [0; 16]
+            || partition.first_lba < header.first_usable_lba
+            || partition.last_lba > header.last_usable_lba
+            || partition.first_lba > partition.last_lba
+            || partitions[..index].iter().any(|previous| {
+                previous.unique_guid == partition.unique_guid
+                    || partition.first_lba <= previous.last_lba
+                        && previous.first_lba <= partition.last_lba
+            })
+        {
+            return Err(DriveLayoutError::InvalidPartition);
+        }
     }
     let count = u32::try_from(partitions.len()).map_err(|_| DriveLayoutError::TooManyPartitions)?;
     let usable_sectors = header.last_usable_lba.checked_sub(header.first_usable_lba)
@@ -385,6 +410,19 @@ mod tests {
         bad.first_usable_lba = u64::MAX / 512;
         bad.last_usable_lba = u64::MAX;
         assert_eq!(gpt_drive_layout_ex(bad, &[], 512), Err(DriveLayoutError::ArithmeticOverflow));
+    }
+
+    #[test]
+    fn overlapping_gpt_extents_cannot_publish_a_layout() {
+        let first = partition();
+        let mut overlapping = partition();
+        overlapping.first_lba = 100;
+        overlapping.last_lba = 120;
+        overlapping.unique_guid = [0x78; 16];
+        assert_eq!(
+            gpt_drive_layout_ex(header(), &[first, overlapping], 512),
+            Err(DriveLayoutError::InvalidPartition),
+        );
     }
 
     fn gpt_disk() -> alloc::vec::Vec<[u8; 512]> {
