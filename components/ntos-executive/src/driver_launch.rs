@@ -35472,6 +35472,10 @@ fn register_fsd_trampolines() -> bool {
         hosted_driver_pnp_notification::unregister_ex as *const () as usize as u64,
     );
     reg.bind(
+        "IoReportTargetDeviceChangeAsynchronous",
+        hosted_driver_pnp_notification::report_target_async as *const () as usize as u64,
+    );
+    reg.bind(
         "IoGetDeviceInterfaces",
         hosted_driver_device_interfaces::s_io_get_device_interfaces as *const () as usize as u64,
     );
