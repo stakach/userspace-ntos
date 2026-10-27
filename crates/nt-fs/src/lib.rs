@@ -37,6 +37,7 @@ mod layered_directory_open;
 mod layered_open;
 mod notify;
 mod partition;
+mod partition_layout;
 mod path;
 mod query;
 mod snapshot_store;
@@ -90,6 +91,7 @@ pub use layered_open::{
 };
 pub use notify::*;
 pub use partition::*;
+pub use partition_layout::*;
 pub use path::{
     is_named_pipe_path, is_under_prefix, normalize_separators, nt_file_relative_path_into,
     nt_path_to_volume_relative, nt_path_to_volume_relative_into, writable_mount_relative,
