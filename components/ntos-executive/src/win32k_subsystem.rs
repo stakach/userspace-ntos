@@ -16079,6 +16079,7 @@ fn register_trampolines() -> bool {
         "RtlWalkFrameChain",
         crate::win32k_frame_capture::rtl_walk_frame_chain as usize as u64,
     );
+    crate::rtl_avl_exports::bind_rtl_avl_exports(reg);
     // --- batch 4: Ps identity + per-process win32-slots (set by win32k's process callout) ---
     reg.bind(
         "PsGetCurrentProcessId",

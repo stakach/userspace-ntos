@@ -68,6 +68,10 @@ fn pinned_win32k_native_imports_are_all_bound() {
     bound.extend(binding_names(include_str!(
         "../../../components/ntos-executive/src/ex_rundown_exports.rs"
     )));
+    assert!(register.contains("crate::rtl_avl_exports::bind_rtl_avl_exports(reg);"));
+    bound.extend(binding_names(include_str!(
+        "../../../components/ntos-executive/src/rtl_avl_exports.rs"
+    )));
     let data_exports = source
         .split_once("const DATA_EXPORTS: ")
         .expect("win32k data export declarations")
