@@ -182,6 +182,12 @@ pub enum WdmIoStackParameters {
     /// `IRP_MJ_SCSI` aliases internal device control (0x0f), but its parameter union is a
     /// single SRB pointer. Decode it only when the caller has authenticated a SCSI PDO route.
     Scsi { srb: u64 },
+    Wmi {
+        provider_id: u64,
+        data_path: u64,
+        buffer_size: u32,
+        buffer: u64,
+    },
     Power {
         system_context: u32,
         state_type: u32,
@@ -656,6 +662,20 @@ pub fn write_wdm_io_stack_location(
                 return Err(WdmLayoutError::InvalidField);
             }
             put_u64(bytes, 0x08, srb);
+        }
+        WdmIoStackParameters::Wmi {
+            provider_id,
+            data_path,
+            buffer_size,
+            buffer,
+        } => {
+            if init.major != nt_io_abi::major::IRP_MJ_SYSTEM_CONTROL {
+                return Err(WdmLayoutError::InvalidField);
+            }
+            put_u64(bytes, 0x08, provider_id);
+            put_u64(bytes, 0x10, data_path);
+            put_u32(bytes, 0x18, buffer_size);
+            put_u64(bytes, 0x20, buffer);
         }
         WdmIoStackParameters::Power { system_context, state_type, state, shutdown_type } => {
             put_u32(bytes, nt_power_types::PARAM_POWER_SYSTEM_CONTEXT_OFFSET as usize,
