@@ -450,6 +450,7 @@ dependencies = [
  "bitflags",
  "nt-address-space",
  "nt-cm-resources",
+ "nt-config-manager",
  "nt-driver-runtime",
  "nt-fs",
  "nt-io-abi",

@@ -1910,7 +1910,7 @@ impl ConfigManager {
         }) {
             return Ok(existing.id);
         }
-        let symbolic_link = build_symbolic_link(guid, &instance, reference);
+        let symbolic_link = device_interface_symbolic_link(guid, &instance, reference);
         materialize_interface_registry(
             &mut self.registry,
             guid,
@@ -2242,7 +2242,9 @@ fn interface_registry_path(guid: &str, instance: &str) -> String {
     path
 }
 
-fn interface_reference_registry_path(guid: &str, instance: &str, reference: &str) -> String {
+/// Registry instance key belonging to a device-interface reference. The `Device Parameters`
+/// child is opened or created beneath this key by `IoOpenDeviceInterfaceRegistryKey`.
+pub fn interface_reference_registry_path(guid: &str, instance: &str, reference: &str) -> String {
     let mut path = interface_registry_path(guid, instance);
     path.push_str(r"\#");
     path.push_str(reference);
@@ -2288,7 +2290,7 @@ fn materialize_interface_registry(
 }
 
 /// The device-interface symbolic link name: `\??\<mangled-instance>#{GUID}\reference`.
-fn build_symbolic_link(guid: &str, instance: &str, reference: &str) -> String {
+pub fn device_interface_symbolic_link(guid: &str, instance: &str, reference: &str) -> String {
     let mut s = String::from(r"\??\");
     s.push_str(&mangled_device_instance(instance));
     s.push('#');
