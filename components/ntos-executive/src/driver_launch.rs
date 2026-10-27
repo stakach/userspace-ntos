@@ -7417,6 +7417,18 @@ extern "win64" fn s_rtl_free_unicode_string(us: u64) {
     }
 }
 
+/// `NTSTATUS RtlStringFromGUID(REFGUID, PUNICODE_STRING)` uses the same pool
+/// owner that `RtlFreeUnicodeString` releases in this driver component.
+extern "win64" fn s_rtl_string_from_guid(guid: u64, us: u64) -> i32 {
+    unsafe {
+        crate::ntoskrnl_classpnp_rtl::rtl_string_from_guid_with_pool(
+            guid as *const u8,
+            us as *mut u8,
+            |size| pool_alloc(size),
+        )
+    }
+}
+
 /// `VOID RtlCopyUnicodeString(PUNICODE_STRING Destination, PCUNICODE_STRING Source)`.
 extern "win64" fn s_rtl_copy_unicode_string(dst: u64, src: u64) {
     if dst == 0 {
@@ -35214,6 +35226,10 @@ fn register_fsd_trampolines() -> bool {
         "RtlFreeUnicodeString",
         s_rtl_free_unicode_string as *const () as usize as u64,
     );
+    reg.bind("RtlStringFromGUID", s_rtl_string_from_guid as *const () as usize as u64);
+    reg.bind("RtlGetVersion", crate::ntoskrnl_classpnp_rtl::rtl_get_version as *const () as usize as u64);
+    reg.bind("RtlTimeToTimeFields", crate::ntoskrnl_shared::s_rtl_time_to_time_fields as *const () as usize as u64);
+    crate::rtl_avl_exports::bind_rtl_avl_exports(reg);
     reg.bind(
         "RtlCopyUnicodeString",
         s_rtl_copy_unicode_string as *const () as usize as u64,

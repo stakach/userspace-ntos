@@ -6765,41 +6765,6 @@ extern "win64" fn s_rtl_unicode_to_multibyte_n(
     0
 }
 
-type Win32kAvlTable = nt_compat_exports::avl_table::RtlAvlTable;
-
-extern "win64" fn s_rtl_initialize_generic_table_avl(
-    table: *mut Win32kAvlTable,
-    compare: Option<nt_compat_exports::avl_table::CompareRoutine>,
-    allocate: Option<nt_compat_exports::avl_table::AllocateRoutine>,
-    free: Option<nt_compat_exports::avl_table::FreeRoutine>,
-    context: *mut core::ffi::c_void,
-) {
-    unsafe { nt_compat_exports::avl_table::initialize_generic_table_avl(table, compare, allocate, free, context) }
-}
-
-extern "win64" fn s_rtl_insert_element_generic_table_avl(
-    table: *mut Win32kAvlTable,
-    buffer: *mut core::ffi::c_void,
-    buffer_size: u32,
-    new_element: *mut u8,
-) -> *mut core::ffi::c_void {
-    unsafe { nt_compat_exports::avl_table::insert_element_generic_table_avl(table, buffer, buffer_size, new_element) }
-}
-
-extern "win64" fn s_rtl_lookup_element_generic_table_avl(
-    table: *mut Win32kAvlTable,
-    buffer: *mut core::ffi::c_void,
-) -> *mut core::ffi::c_void {
-    unsafe { nt_compat_exports::avl_table::lookup_element_generic_table_avl(table, buffer) }
-}
-
-extern "win64" fn s_rtl_delete_element_generic_table_avl(
-    table: *mut Win32kAvlTable,
-    buffer: *mut core::ffi::c_void,
-) -> u8 {
-    unsafe { nt_compat_exports::avl_table::delete_element_generic_table_avl(table, buffer) as u8 }
-}
-
 extern "win64" fn s_rtl_prefix_unicode_string(
     prefix: *const u8,
     string: *const u8,
@@ -15641,10 +15606,7 @@ fn register_trampolines() -> bool {
     reg.bind("KeDelayExecutionThread", s_ke_delay_execution_thread as usize as u64);
     reg.bind("KeQueryTimeIncrement", crate::driver_launch::s_ke_query_time_increment as usize as u64);
     reg.bind("RtlUnicodeToMultiByteN", s_rtl_unicode_to_multibyte_n as usize as u64);
-    reg.bind("RtlInitializeGenericTableAvl", s_rtl_initialize_generic_table_avl as usize as u64);
-    reg.bind("RtlInsertElementGenericTableAvl", s_rtl_insert_element_generic_table_avl as usize as u64);
-    reg.bind("RtlLookupElementGenericTableAvl", s_rtl_lookup_element_generic_table_avl as usize as u64);
-    reg.bind("RtlDeleteElementGenericTableAvl", s_rtl_delete_element_generic_table_avl as usize as u64);
+    crate::rtl_avl_exports::bind_rtl_avl_exports(reg);
     reg.bind("RtlPrefixUnicodeString", s_rtl_prefix_unicode_string as usize as u64);
     reg.bind("RtlSetSaclSecurityDescriptor", s_rtl_set_sacl_security_descriptor as usize as u64);
     reg.bind("RtlSubAuthoritySid", s_rtl_sub_authority_sid as usize as u64);

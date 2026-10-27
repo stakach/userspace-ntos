@@ -10,6 +10,7 @@
 use alloc::vec::Vec;
 
 pub mod guid;
+pub mod classpnp;
 
 mod ntstatus_to_dos_error_map;
 
