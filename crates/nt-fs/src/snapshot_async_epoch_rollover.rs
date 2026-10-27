@@ -20,6 +20,7 @@ pub struct AsyncWalEpochRollover {
     wal_sectors: u64,
     next_incarnation: u64,
     sector_size: usize,
+    erase_batch_sectors: u64,
     step: Step,
     pending: Option<AsyncSnapshotRequest>,
     sequence: u64,
@@ -64,7 +65,22 @@ impl AsyncWalEpochRollover {
         }
         buffer.resize(capacity, 0);
         Ok(Self { pair, wal_start, wal_sectors, next_incarnation, sector_size,
-            step: Step::ResetWrite(0), pending: None, sequence: 1, buffer, failed: false })
+            erase_batch_sectors: ERASE_BATCH, step: Step::ResetWrite(0), pending: None,
+            sequence: 1, buffer, failed: false })
+    }
+
+    /// Bound WAL erasure by the live route's transfer ceiling. A changed ceiling can only
+    /// take effect after an unentered request has been released or an entered one ACKed.
+    pub fn set_max_batch_sectors(&mut self, max_sectors: u32)
+        -> Result<(), AsyncSnapshotCommitError>
+    {
+        if self.pending.is_some() { return Err(AsyncSnapshotCommitError::Outstanding); }
+        if max_sectors == 0 {
+            return Err(AsyncSnapshotCommitError::Store(
+                SnapshotBlockStoreError::InvalidGeometry));
+        }
+        self.erase_batch_sectors = u64::from(max_sectors).min(ERASE_BATCH);
+        Ok(())
     }
 
     fn header(&mut self, slot: u32, resetting: bool) {
@@ -92,7 +108,7 @@ impl AsyncWalEpochRollover {
             }
             Step::EraseTail(remaining) => {
                 self.buffer.fill(0);
-                let count = (remaining - 1).min(ERASE_BATCH);
+                let count = (remaining - 1).min(self.erase_batch_sectors);
                 let offset = remaining - count;
                 (AsyncSnapshotIoKind::Write, self.wal_start + offset,
                     count as usize * self.sector_size)
@@ -146,7 +162,7 @@ impl AsyncWalEpochRollover {
                 Step::EraseTail(self.wal_sectors)
             },
             Step::EraseTail(remaining) => {
-                let offset = remaining - (remaining - 1).min(ERASE_BATCH);
+                let offset = remaining - (request.bytes / self.sector_size) as u64;
                 if offset > 1 { Step::EraseTail(offset) } else { Step::EraseFlush }
             }
             Step::EraseFlush => Step::EraseFirst,
