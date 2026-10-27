@@ -36,6 +36,8 @@ pub const KTHREAD_SAVED_APC_STATE: usize = 0x220;
 pub const KTHREAD_WIN32_THREAD: usize = 0x250;
 pub const ETHREAD_CLIENT_ID_PROCESS: usize = 0x378;
 pub const ETHREAD_CLIENT_ID_THREAD: usize = 0x380;
+/// ReactOS AMD64 `ETHREAD.DeviceToVerify`, immediately before `ThreadsProcess`.
+pub const ETHREAD_DEVICE_TO_VERIFY: usize = 0x3d0;
 pub const ETHREAD_THREADS_PROCESS: usize = 0x3d8;
 pub const ETHREAD_CROSS_THREAD_FLAGS: usize = 0x41c;
 pub const ETHREAD_THREAD_NAME: usize = 0x430;
@@ -295,6 +297,23 @@ pub fn validate_thread_activation(
     {
         return Err(ProjectionError::IdentityMismatch);
     }
+    Ok(())
+}
+
+/// Project a verified device into the requestor's exact live ETHREAD body.
+///
+/// The caller must have already authenticated the IRP, its requestor thread, and the canonical
+/// device under their owning locks. This function validates the projected ETHREAD identity again
+/// before touching its one field; a stale or truncated body is never partially modified. A null
+/// device is permitted because the native field may be cleared.
+pub fn set_thread_device_to_verify(
+    output: &mut [u8],
+    thread: ThreadInitialization,
+    device: GuestAddr,
+) -> Result<(), ProjectionError> {
+    validate_thread_activation(output, thread)?;
+    aligned(device)?;
+    write_u64(output, ETHREAD_DEVICE_TO_VERIFY, device.0);
     Ok(())
 }
 

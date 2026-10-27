@@ -25,6 +25,48 @@ fn u64_at(bytes: &[u8], offset: usize) -> u64 {
 }
 
 #[test]
+fn verify_device_updates_only_the_exact_live_ethread_projection() {
+    // ReactOS ETHREAD.DeviceToVerify precedes ThreadsProcess on this AMD64 projection.
+    assert_eq!(ETHREAD_DEVICE_TO_VERIFY, 0x3d0);
+    let init = thread();
+    let mut bytes = [0; ETHREAD_BODY_BYTES];
+    initialize_thread(&mut bytes, init).unwrap();
+    let before = bytes;
+    set_thread_device_to_verify(&mut bytes, init, GuestAddr(0x40_0000)).unwrap();
+    assert_eq!(u64_at(&bytes, ETHREAD_DEVICE_TO_VERIFY), 0x40_0000);
+    assert_eq!(
+        &bytes[..ETHREAD_DEVICE_TO_VERIFY],
+        &before[..ETHREAD_DEVICE_TO_VERIFY]
+    );
+    assert_eq!(
+        &bytes[ETHREAD_DEVICE_TO_VERIFY + 8..],
+        &before[ETHREAD_DEVICE_TO_VERIFY + 8..]
+    );
+
+    let written = bytes;
+    assert_eq!(
+        set_thread_device_to_verify(
+            &mut bytes,
+            ThreadInitialization {
+                thread_id: init.thread_id + 1,
+                ..init
+            },
+            GuestAddr(0x50_0000),
+        ),
+        Err(ProjectionError::IdentityMismatch)
+    );
+    assert_eq!(bytes, written, "wrong thread identity must not write");
+
+    let mut too_short = [0xa5; ETHREAD_DEVICE_TO_VERIFY + 7];
+    let unchanged = too_short;
+    assert_eq!(
+        set_thread_device_to_verify(&mut too_short, init, GuestAddr(0x50_0000)),
+        Err(ProjectionError::BufferTooSmall)
+    );
+    assert_eq!(too_short, unchanged);
+}
+
+#[test]
 fn released_libernt_win32k_reads_the_projected_peb_at_0x2e0() {
     // The pinned win32k.sys IntFixWindowCoordinates calls IoGetCurrentProcess, then reads
     // [EPROCESS + 0x2e0] and [PEB + 0x20] for ProcessParameters (RVA 0xAB3C9..0xAB3D6).
