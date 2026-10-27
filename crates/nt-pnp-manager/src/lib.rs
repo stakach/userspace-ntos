@@ -153,6 +153,21 @@ pub const fn existing_device_start_disposition(
     }
 }
 
+/// `PlugPlayControlStartDevice` acknowledges a processed action separately from a completed
+/// START IRP. An initialized PDO with no service and a known negative RawDeviceOK capability has
+/// no stack to start; the action can finish successfully while `DN_STARTED` remains clear. This
+/// matches the reference PnP action worker, whose state machine does not return AddDevice failure
+/// as the action's syscall status. The native caller must first verify the exact live PDO identity.
+pub const fn may_acknowledge_unstarted_start_action(
+    state: Option<DeviceState>,
+    raw_device_ok: Option<bool>,
+    has_problem: bool,
+) -> bool {
+    matches!(state, Some(DeviceState::Enumerated))
+        && matches!(raw_device_ok, Some(false))
+        && !has_problem
+}
+
 /// Report a devnode's started bit from its canonical PnP lifecycle.
 ///
 /// A Configuration Manager instance or a caller-written status record does not prove that its
@@ -3987,6 +4002,37 @@ mod tests {
             existing_device_start_disposition(None),
             ExistingDeviceStartDisposition::RequiresAction
         );
+    }
+
+    #[test]
+    fn initialized_driverless_pdo_acknowledges_action_without_claiming_start() {
+        assert!(may_acknowledge_unstarted_start_action(
+            Some(DeviceState::Enumerated), Some(false), false,
+        ));
+        assert_eq!(
+            device_status_from_lifecycle(Some(DeviceState::Enumerated), 0, 0),
+            (0, 0),
+        );
+        for state in [
+            None,
+            Some(DeviceState::Uninitialized),
+            Some(DeviceState::DeviceStackBuilt),
+            Some(DeviceState::ResourcesAssigned),
+            Some(DeviceState::Stopped),
+            Some(DeviceState::Failed),
+            Some(DeviceState::Removed),
+        ] {
+            assert!(!may_acknowledge_unstarted_start_action(state, Some(false), false));
+        }
+        assert!(!may_acknowledge_unstarted_start_action(
+            Some(DeviceState::Enumerated), None, false,
+        ));
+        assert!(!may_acknowledge_unstarted_start_action(
+            Some(DeviceState::Enumerated), Some(true), false,
+        ));
+        assert!(!may_acknowledge_unstarted_start_action(
+            Some(DeviceState::Enumerated), Some(false), true,
+        ));
     }
 
     #[test]
