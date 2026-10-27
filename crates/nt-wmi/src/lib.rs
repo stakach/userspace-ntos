@@ -31,6 +31,15 @@ pub struct WmiProviderOwner {
     pub generation: u64,
 }
 
+/// A canonical hosted device address within its authenticated driver incarnation.
+/// The native broker must verify this identity before registering it here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WmiDeviceIdentity {
+    pub domain: u64,
+    pub generation: u64,
+    pub device_object: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WmiProviderId(u64);
 
@@ -51,21 +60,93 @@ struct Block {
     references: u32,
 }
 
+struct DeviceProvider {
+    identity: WmiDeviceIdentity,
+    id: u32,
+    live: bool,
+}
+
 /// IDs are monotonically allocated and never reused, even after slot reuse.
 /// Native callers serialize this store with provider registration and queries.
 pub struct WmiRegistry {
     next_id: u64,
+    next_device_provider_id: u64,
     providers: Vec<Provider>,
     blocks: Vec<Block>,
+    device_providers: Vec<DeviceProvider>,
 }
 
 impl WmiRegistry {
     pub const fn new() -> Self {
         Self {
             next_id: 1,
+            next_device_provider_id: 1,
             providers: Vec::new(),
             blocks: Vec::new(),
+            device_providers: Vec::new(),
         }
+    }
+
+    /// Assign the 32-bit provider identity used by `IoWMIDeviceObjectToProviderId`.
+    /// Repeated registration of one live device is idempotent. An address cannot
+    /// be reused by a new generation until the old registration is retired.
+    pub fn register_device(&mut self, identity: WmiDeviceIdentity) -> Result<u32, u32> {
+        if identity.domain == 0 || identity.generation == 0 || identity.device_object == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if let Some(entry) = self.device_providers.iter_mut().find(|entry| {
+            entry.identity.domain == identity.domain
+                && entry.identity.device_object == identity.device_object
+        }) {
+            if identity.generation < entry.identity.generation
+                || (identity.generation == entry.identity.generation && !entry.live)
+                || (identity.generation > entry.identity.generation && entry.live)
+            {
+                return Err(STATUS_INVALID_HANDLE);
+            }
+            if identity.generation == entry.identity.generation {
+                return Ok(entry.id);
+            }
+            let id = u32::try_from(self.next_device_provider_id)
+                .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+            self.next_device_provider_id += 1;
+            entry.identity = identity;
+            entry.id = id;
+            entry.live = true;
+            return Ok(id);
+        }
+        self.device_providers
+            .try_reserve(1)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        let id = u32::try_from(self.next_device_provider_id)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        self.next_device_provider_id += 1;
+        self.device_providers.push(DeviceProvider {
+            identity,
+            id,
+            live: true,
+        });
+        Ok(id)
+    }
+
+    /// Resolve only an exact live device incarnation, never an address alone.
+    pub fn device_provider_id(&self, identity: WmiDeviceIdentity) -> Result<u32, u32> {
+        self.device_providers
+            .iter()
+            .find(|entry| entry.live && entry.identity == identity)
+            .map(|entry| entry.id)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    /// Keep a tombstone so an old generation cannot register after address reuse.
+    pub fn unregister_device(&mut self, identity: WmiDeviceIdentity) -> Result<(), u32> {
+        let entry = self
+            .device_providers
+            .iter_mut()
+            .find(|entry| entry.live && entry.identity == identity)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        entry.live = false;
+        Ok(())
     }
 
     fn id(&mut self) -> Result<u64, u32> {
