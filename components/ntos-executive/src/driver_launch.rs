@@ -204,6 +204,8 @@ mod hosted_file_lifecycle_owners;
 mod hosted_file_retirements;
 #[path = "hosted_source_irp_ledger.rs"]
 mod hosted_source_irp_ledger;
+#[path = "hosted_driver_object_reference.rs"]
+mod hosted_driver_object_reference;
 #[path = "hosted_irp_lifecycle_exports.rs"]
 mod hosted_irp_lifecycle_exports;
 #[path = "hosted_start_io.rs"]
@@ -719,6 +721,7 @@ const FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_OFF: u64 = 0x210;
 const FSD_DATA_KD_DEBUGGER_NOT_PRESENT_OFF: u64 = 0x218;
 const FSD_DATA_KE_NUMBER_PROCESSORS_OFF: u64 = 0x220;
 const FSD_DATA_KD_COM_PORT_IN_USE_OFF: u64 = 0x228;
+const FSD_DATA_IO_DEVICE_OBJECT_TYPE_CELL_OFF: u64 = hosted_driver_object_reference::DEVICE_OBJECT_TYPE_CELL_OFFSET;
 // HAL_DISPATCH is an imported data object. Its unsupported callbacks remain null.
 const FSD_DATA_HAL_DISPATCH_OFF: u64 = 0x240;
 const FSD_DATA_HAL_DISPATCH_BYTES: u64 = 0xC0;
@@ -727,6 +730,9 @@ const FSD_DATA_HAL_DISPATCH_VA: u64 = FSD_DATA_VADDR + FSD_DATA_HAL_DISPATCH_OFF
 const _: () = assert!(FSD_DATA_HAL_DISPATCH_OFF + FSD_DATA_HAL_DISPATCH_BYTES <= 0x300);
 const FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_OFF: u64 = 0x300;
 const FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_OFF: u64 = 0x340;
+const FSD_DATA_IO_DEVICE_OBJECT_TYPE_BODY_OFF: u64 = hosted_driver_object_reference::DEVICE_OBJECT_TYPE_BODY_OFFSET;
+const _: () = assert!(FSD_DATA_IO_DEVICE_OBJECT_TYPE_CELL_OFF + 8 <= FSD_DATA_HAL_DISPATCH_OFF);
+const _: () = assert!(FSD_DATA_IO_DEVICE_OBJECT_TYPE_BODY_OFF + 8 <= FSD_DATA_SE_EXPORTS_CELL_OFF);
 const FSD_DATA_SE_EXPORTS_CELL_OFF: u64 = 0x400;
 const FSD_DATA_SE_EXPORTS_STRUCT_OFF: u64 = 0x500;
 const FSD_DATA_SE_SID_POOL_OFF: u64 =
@@ -765,6 +771,8 @@ const FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_OFF;
 const FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_OFF;
+const FSD_DATA_IO_DEVICE_OBJECT_TYPE_CELL_VA: u64 =
+    FSD_DATA_VADDR + FSD_DATA_IO_DEVICE_OBJECT_TYPE_CELL_OFF;
 const FSD_DATA_KD_DEBUGGER_NOT_PRESENT_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_KD_DEBUGGER_NOT_PRESENT_OFF;
 const FSD_DATA_KE_NUMBER_PROCESSORS_VA: u64 =
@@ -776,6 +784,8 @@ const FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_OFF;
 const FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_OFF;
+const FSD_DATA_IO_DEVICE_OBJECT_TYPE_BODY_VA: u64 =
+    FSD_DATA_VADDR + FSD_DATA_IO_DEVICE_OBJECT_TYPE_BODY_OFF;
 const FSD_DATA_SE_EXPORTS_CELL_VA: u64 = FSD_DATA_VADDR + FSD_DATA_SE_EXPORTS_CELL_OFF;
 const FSD_DATA_SE_EXPORTS_STRUCT_VA: u64 = FSD_DATA_VADDR + FSD_DATA_SE_EXPORTS_STRUCT_OFF;
 const FSD_DATA_SE_SID_POOL_VA: u64 = FSD_DATA_VADDR + FSD_DATA_SE_SID_POOL_OFF;
@@ -5568,6 +5578,14 @@ unsafe fn initialize_hosted_driver_data_exports(exec_data_va: u64) {
         FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_VA,
     );
     write_volatile(ex_event_object_type_body as *mut u64, 0x4556_454e_5459_5045); // "EVENTYPE"
+    write_volatile(
+        (exec_data_va + FSD_DATA_IO_DEVICE_OBJECT_TYPE_CELL_OFF) as *mut u64,
+        FSD_DATA_IO_DEVICE_OBJECT_TYPE_BODY_VA,
+    );
+    write_volatile(
+        (exec_data_va + FSD_DATA_IO_DEVICE_OBJECT_TYPE_BODY_OFF) as *mut u64,
+        hosted_driver_object_reference::DEVICE_OBJECT_TYPE_MARKER,
+    );
 
     let kd_debugger_not_present = exec_data_va + FSD_DATA_KD_DEBUGGER_NOT_PRESENT_OFF;
     write_volatile(
@@ -5617,6 +5635,7 @@ fn fsd_data_export_addr(name: &str) -> Option<u64> {
         "KdComPortInUse" => FSD_DATA_KD_COM_PORT_IN_USE_VA,
         "KeNumberProcessors" => FSD_DATA_KE_NUMBER_PROCESSORS_VA,
         "IoFileObjectType" => FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_VA,
+        "IoDeviceObjectType" => FSD_DATA_IO_DEVICE_OBJECT_TYPE_CELL_VA,
         "ExEventObjectType" => FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_VA,
         "PsInitialSystemProcess" => hosted_driver_process_state::INITIAL_SYSTEM_PROCESS_CELL_VA,
         "PsProcessType" => hosted_driver_process_state::PROCESS_TYPE_CELL_VA,
@@ -6167,6 +6186,7 @@ const HOSTED_DEVICE_OP_CONTIGUOUS_EXPIRE: u64 = 35;
 const HOSTED_DEVICE_OP_CONTIGUOUS_PHYSICAL: u64 = 36;
 const HOSTED_DEVICE_OP_CONTIGUOUS_MAP: u64 = 37;
 const HOSTED_DEVICE_OP_CONTIGUOUS_UNMAP: u64 = 38;
+const HOSTED_DEVICE_OP_REFERENCE_BY_POINTER: u64 = hosted_driver_object_reference::OP_REFERENCE_BY_POINTER;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN: u64 = 0;
 const HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF: u64 = 2;
 const HOSTED_DEVICE_ARG_DATA_OFF: u64 = FSD_ARG_BYTES;
@@ -36556,6 +36576,7 @@ fn register_fsd_trampolines() -> bool {
         "ObReferenceObjectByHandle",
         s_ob_reference_object_by_handle as *const () as usize as u64,
     );
+    hosted_driver_object_reference::bind(reg);
     reg.bind(
         "ObOpenObjectByPointer",
         s_ob_open_object_by_pointer as *const () as usize as u64,
@@ -57531,6 +57552,7 @@ pub(crate) fn service_hosted_device(
             | HOSTED_DEVICE_OP_REGISTER_INTERFACE
             | HOSTED_DEVICE_OP_SET_INTERFACE_STATE
             | HOSTED_DEVICE_OP_REFERENCE_POINTER
+            | HOSTED_DEVICE_OP_REFERENCE_BY_POINTER
             | HOSTED_DEVICE_OP_DEREFERENCE_POINTER
             | HOSTED_DEVICE_OP_REFERENCE_ATTACHED_TOP
             | HOSTED_DEVICE_OP_ATTACH_SAFE
@@ -57700,6 +57722,36 @@ pub(crate) fn service_hosted_device(
         };
         return match result {
             Ok(()) => (STATUS_SUCCESS, 0, 0, 0),
+            Err(status) => (status.raw(), 0, 0, 0),
+        };
+    }
+    if op == HOSTED_DEVICE_OP_REFERENCE_BY_POINTER {
+        if arg3 != 0 {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
+        if arg2 != 0 && arg2 != FSD_DATA_IO_DEVICE_OBJECT_TYPE_BODY_VA {
+            return (nt_status::NtStatus::OBJECT_TYPE_MISMATCH.raw(), 0, 0, 0);
+        }
+        let (_, inst, device_id) =
+            match authenticated_hosted_device(ch, pdo_object, active_reply_cap) {
+                Ok(identity) => identity,
+                Err(status) => return (status.raw(), 0, 0, 0),
+            };
+        let domain = HostedDomainIdentity {
+            domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
+            cookie: inst.hosted_domain_cookie,
+        };
+        let registration = match hosted_device_pointer_registration(domain, pdo_object, device_id) {
+            Ok(registration) => registration,
+            Err(status) => return (status.raw(), 0, 0, 0),
+        };
+        return match io_manager_mut().reference_hosted_device_object_by_pointer(
+            domain,
+            registration,
+            (arg2 != 0).then_some(arg2),
+            FSD_DATA_IO_DEVICE_OBJECT_TYPE_BODY_VA,
+        ) {
+            Ok(count) => (STATUS_SUCCESS, count, 0, 0),
             Err(status) => (status.raw(), 0, 0, 0),
         };
     }
