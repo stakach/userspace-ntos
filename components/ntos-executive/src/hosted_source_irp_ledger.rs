@@ -1110,14 +1110,32 @@ fn set_hard_error_or_verify_device(
         return (STATUS_INVALID_HANDLE, 0, 0);
     };
     let _source_guard = lock();
-    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
-        return (STATUS_INVALID_HANDLE, 0, 0);
-    };
-    let registration = [
+    match hosted_device_allocations::with_live_verify_device_registration(
+        inst, domain, device,
+        |registration| set_hard_error_or_verify_device_locked(
+            instance_index, inst, domain, irp, device, registration,
+        ),
+    ) {
+        Ok(result) => result,
+        Err(_) => (STATUS_INVALID_HANDLE, 0, 0),
+    }
+}
+
+// The source, allocation catalog, and pool locks remain held by the caller. A canonical
+// retirement cannot invalidate this exact registration before the ETHREAD write completes.
+fn set_hard_error_or_verify_device_locked(
+    instance_index: usize,
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    irp: u64,
+    device: u64,
+    registration: Option<nt_io_manager::HostedDevicePointerRegistration>,
+) -> (i32, u64, u64) {
+    let source_registration = [
         SourceIrpOwner::HostedDriver(instance_index),
         SourceIrpOwner::HostedCaller(instance_index),
     ].into_iter().find_map(|owner| ledger().registered(owner, domain, irp));
-    let Some((ticket, allocation)) = registration else {
+    let Some((ticket, allocation)) = source_registration else {
         return (STATUS_INVALID_HANDLE, 0, 0);
     };
     let Some(current) = allocation_unlocked(
@@ -1142,9 +1160,6 @@ fn set_hard_error_or_verify_device(
     };
     // IRP.Tail.Overlay.Thread is at +0x98 in the hosted AMD64 WDM projection.
     let irp_thread = unsafe { read_unaligned((exec + 0x98) as *const u64) };
-    let registration = (device != 0)
-        .then(|| unsafe { io_manager_mut().hosted_device_pointer_registration(domain, device) })
-        .flatten();
     let result = unsafe { crate::service_sec_image::with_provider_process_manager(|pm| {
         let canonical_thread = pm.tid_for_kernel_thread_object(irp_thread)
             .and_then(|tid| pm.thread_lifetime(tid).filter(|lifetime| {

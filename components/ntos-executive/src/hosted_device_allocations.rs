@@ -13,6 +13,7 @@ struct Row {
     accepted: Option<HostedDevicePointerRegistration>,
     accepted_driver_object: Option<u64>,
     registration: Option<HostedDevicePointerRegistration>,
+    canonical_live: bool,
     owner: ProjectionAllocationOwner,
     retirement_pending: bool,
 }
@@ -850,6 +851,7 @@ pub(super) unsafe fn protect_allocation_exact(
         accepted: None,
         accepted_driver_object: None,
         registration: None,
+        canonical_live: false,
         owner,
         retirement_pending: false,
     });
@@ -875,10 +877,13 @@ pub(super) fn publish_registration(
         return Err(nt_status::NtStatus::INVALID_HANDLE);
     }
     if row.registration == Some(registration) {
-        return Ok(());
+        return if row.canonical_live { Ok(()) } else {
+            Err(nt_status::NtStatus::INVALID_HANDLE)
+        };
     }
     ledger().attach_registration(&row.owner, registration)?;
     row.registration = Some(registration);
+    row.canonical_live = true;
     Ok(())
 }
 
@@ -1171,8 +1176,70 @@ pub(super) fn registration(
     rows()
         .iter()
         .find(|row| same_arena(row.instance, inst) && row.allocation.component_address == address)
-        .map(|row| row.registration)
+        .map(|row| row.canonical_live.then_some(row.registration).flatten())
         .ok_or(nt_status::NtStatus::INVALID_HANDLE)
+}
+
+/// Retire the canonical anchor and invalidate the physical catalog as one serialized step.
+/// A source RPC holding the catalog lock can therefore never observe an already retired token.
+pub(super) fn retire_canonical_pointer(
+    io: &mut ExecutiveIoManager,
+    registration: HostedDevicePointerRegistration,
+) -> Result<(), nt_status::NtStatus> {
+    let _guard = lock();
+    io.retire_hosted_device_pointer(registration)?;
+    for row in rows().iter_mut() {
+        if row.registration == Some(registration) {
+            row.canonical_live = false;
+        }
+    }
+    Ok(())
+}
+
+/// The source owner is already locked. Acquire the allocation catalog before the pool, matching
+/// the physical retirement order, and hold both through the requestor ETHREAD write.
+pub(super) fn with_live_verify_device_registration<T>(
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    address: u64,
+    use_registration: impl FnOnce(Option<HostedDevicePointerRegistration>) -> T,
+) -> Result<T, nt_status::NtStatus> {
+    let _guard = lock();
+    let selected = if address == 0 { None } else {
+        let mut matches = rows().iter().filter(|row| {
+            row.registration.is_some_and(|registration| {
+                registration.domain() == domain && registration.address() == address
+            })
+        });
+        let row = matches.next().ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+        if matches.next().is_some() || !row.canonical_live || row.retirement_pending {
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
+        Some((row.instance, row.domain, row.allocation,
+            row.registration.expect("selected published registration")))
+    };
+    let physical_pool = selected.map_or(inst.exec_pool_va, |(owner, _, _, _)| owner.exec_pool_va);
+    let (first_pool, second_pool) = if inst.exec_pool_va <= physical_pool {
+        (inst.exec_pool_va, physical_pool)
+    } else {
+        (physical_pool, inst.exec_pool_va)
+    };
+    let _first = unsafe { hosted_instance_pool_lock(first_pool) }
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    let _second = if second_pool == first_pool { None } else {
+        Some(unsafe { hosted_instance_pool_lock(second_pool) }
+            .ok_or(nt_status::NtStatus::DEVICE_BUSY)?)
+    };
+    let registration = if let Some((owner, physical_domain, exact, registration)) = selected {
+        if unsafe { allocation(owner, address) }? != exact
+            || ledger().physical_allocation_for_registration(registration)
+                != Some((physical_domain, exact))
+        {
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
+        Some(registration)
+    } else { None };
+    Ok(use_registration(registration))
 }
 
 /// Prove the physical allocation behind one already identified published Device projection.

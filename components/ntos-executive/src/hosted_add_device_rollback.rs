@@ -591,7 +591,7 @@ unsafe fn advance_inner(id: u64) -> Result<(), nt_status::NtStatus> {
             return Err(nt_status::NtStatus::DEVICE_BUSY);
         }
         if !device.pointer_retired {
-            io_manager_mut().retire_hosted_device_pointer(device.registration)?;
+            hosted_device_allocations::retire_canonical_pointer(io_manager_mut(), device.registration)?;
             owner(id).created[index].pointer_retired = true;
         }
         if !device.destroyed {
@@ -611,7 +611,7 @@ unsafe fn advance_inner(id: u64) -> Result<(), nt_status::NtStatus> {
     }
     if let Some(registration) = owner(id).pdo_registration {
         if owner(id).pdo_created && !owner(id).pdo_canonical_retired {
-            io_manager_mut().retire_hosted_device_pointer(registration)?;
+            hosted_device_allocations::retire_canonical_pointer(io_manager_mut(), registration)?;
             owner(id).pdo_canonical_retired = true;
         }
     }

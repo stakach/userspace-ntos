@@ -1736,7 +1736,7 @@ pub(super) unsafe fn retire_pdo_aliases_for_instance(
         if !pdo_aliases_mut()[index].pointer_retired {
             if io_manager_mut().hosted_device_pointer_registration(domain, alias.address())
                 != Some(alias)
-                || io_manager_mut().retire_hosted_device_pointer(alias).is_err()
+                || hosted_device_allocations::retire_canonical_pointer(io_manager_mut(), alias).is_err()
             {
                 pdo_aliases_mut()[index].blocked = true;
                 failures += 1;

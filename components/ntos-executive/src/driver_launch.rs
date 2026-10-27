@@ -59651,7 +59651,7 @@ fn teardown_hosted_device_binding(binding: HostedDeviceBinding) -> bool {
             Ok(registration) => registration,
             Err(_) => return false,
         };
-        if io_manager_mut().retire_hosted_device_pointer(registration).is_err() {
+        if hosted_device_allocations::retire_canonical_pointer(io_manager_mut(), registration).is_err() {
             return false;
         }
         for retirement in unsafe { hosted_device_retirements_mut() }.iter_mut() {
@@ -59789,7 +59789,7 @@ unsafe fn drain_hosted_device_retirements() -> usize {
         }
         if !retirement.pointer_retired {
             let registration = retirement.pointer_registration;
-            match io_manager_mut().retire_hosted_device_pointer(registration) {
+            match hosted_device_allocations::retire_canonical_pointer(io_manager_mut(), registration) {
                 Ok(()) => hosted_device_retirements_mut()[index].pointer_retired = true,
                 Err(nt_status::NtStatus::DEVICE_BUSY) => {
                     index += 1;
