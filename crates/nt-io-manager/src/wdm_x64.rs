@@ -424,6 +424,75 @@ pub fn write_wdm_irp(bytes: &mut [u8], init: WdmIrpInit) -> Result<(), WdmLayout
     Ok(())
 }
 
+/// Initialize a caller-supplied x64 IRP packet as ReactOS `IoInitializeIrp` does.
+/// `irp_address` is its final provider virtual address, not the address of this slice.
+pub fn initialize_wdm_irp_packet(
+    bytes: &mut [u8],
+    irp_address: u64,
+    packet_size: u16,
+    stack_count: u8,
+    apc_environment: u8,
+) -> Result<(), WdmLayoutError> {
+    let size = usize::from(packet_size);
+    let minimum = WDM_X64_IRP_SIZE
+        .checked_add(usize::from(stack_count) * WDM_X64_IO_STACK_LOCATION_SIZE)
+        .ok_or(WdmLayoutError::InvalidField)?;
+    let stack_end = irp_address
+        .checked_add(minimum as u64)
+        .ok_or(WdmLayoutError::InvalidField)?;
+    irp_address.checked_add(size as u64)
+        .ok_or(WdmLayoutError::InvalidField)?;
+    let entry = irp_address
+        .checked_add(0x20)
+        .ok_or(WdmLayoutError::InvalidField)?;
+    if irp_address == 0 || stack_count == 0 || stack_count >= i8::MAX as u8
+        || size < minimum || apc_environment > 1
+    {
+        return Err(WdmLayoutError::InvalidField);
+    }
+    require(bytes, size)?;
+    bytes[..size].fill(0);
+    put_u16(bytes, 0, 6);
+    put_u16(bytes, 2, packet_size);
+    put_u64(bytes, 0x20, entry);
+    put_u64(bytes, 0x28, entry);
+    put_u8(bytes, 0x42, stack_count);
+    put_u8(bytes, 0x43, stack_count + 1);
+    put_u8(bytes, 0x46, apc_environment);
+    put_u64(bytes, 0xb8, stack_end);
+    Ok(())
+}
+
+/// Reuse an idle IRP while retaining its allocation provenance. `active_owner` must be
+/// determined by the canonical source/caller ownership ledger under its mutation lock.
+pub fn reuse_wdm_irp_packet(
+    bytes: &mut [u8],
+    irp_address: u64,
+    status: i32,
+    active_owner: bool,
+    apc_environment: u8,
+) -> Result<(), WdmLayoutError> {
+    require(bytes, WDM_X64_IRP_SIZE)?;
+    let packet_size = u16::from_le_bytes(bytes[2..4].try_into().unwrap());
+    let stack_count = bytes[0x42];
+    let allocation_flags = bytes[0x47];
+    let thread_entry = irp_address
+        .checked_add(0x20)
+        .ok_or(WdmLayoutError::InvalidField)?;
+    if active_owner
+        || u16::from_le_bytes(bytes[..2].try_into().unwrap()) != 6
+        || u64::from_le_bytes(bytes[0x20..0x28].try_into().unwrap()) != thread_entry
+        || u64::from_le_bytes(bytes[0x28..0x30].try_into().unwrap()) != thread_entry
+        || u64::from_le_bytes(bytes[0x68..0x70].try_into().unwrap()) != 0
+    {
+        return Err(WdmLayoutError::InvalidField);
+    }
+    initialize_wdm_irp_packet(bytes, irp_address, packet_size, stack_count, apc_environment)?;
+    bytes[0x30..0x34].copy_from_slice(&status.to_le_bytes());
+    bytes[0x47] = allocation_flags;
+    Ok(())
+}
+
 /// Complete IoInitializeIrp's self-linked ThreadListEntry once the packet has
 /// its final address. The requestor-thread queue is a separate ownership step.
 pub fn initialize_wdm_irp_thread_list(

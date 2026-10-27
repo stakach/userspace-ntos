@@ -282,6 +282,27 @@ impl SourceIrpLedger {
         Ok(())
     }
 
+    /// Admit an in-place IRP header mutation while the caller holds both the source
+    /// ownership and physical pool locks. A pending free is distinct from an idle IRP.
+    pub fn mutation_ready(
+        &self,
+        ticket: SourceIrpTicket,
+        allocation: SourceIrpAllocation,
+    ) -> Result<(), SourceIrpLedgerError> {
+        let row = self.rows.iter().find(|row| row.ticket == ticket)
+            .ok_or(SourceIrpLedgerError::WrongIdentity)?;
+        if row.allocation != allocation {
+            return Err(SourceIrpLedgerError::WrongIdentity);
+        }
+        if row.retirement_started || row.defer_free_armed || row.free_requested {
+            return Err(SourceIrpLedgerError::RetirementStarted);
+        }
+        if row.pins != 0 {
+            return Err(SourceIrpLedgerError::Pinned);
+        }
+        Ok(())
+    }
+
     pub fn unpin(&mut self, ticket: SourceIrpTicket) -> Result<(), SourceIrpLedgerError> {
         let row = self
             .rows

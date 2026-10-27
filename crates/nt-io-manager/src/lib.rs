@@ -317,6 +317,7 @@ pub use volume_information::{
 pub use wdm_x64::{
     decode_wdm_kernel_built_io_stack, decode_wdm_kernel_built_scsi_stack,
     initialize_wdm_irp_thread_list,
+    initialize_wdm_irp_packet, reuse_wdm_irp_packet,
     write_wdm_device_object, write_wdm_driver_object,
     write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
     write_wdm_irp_completion_targets,
