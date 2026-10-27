@@ -14,6 +14,8 @@ const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xc000_0034;
 pub struct InstallerOwner<Process> {
     pub worker: Process,
     pub parent: Process,
+    /// A live registered noninteractive service ancestor reached by the current PM parent chain.
+    pub service: Process,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,7 +95,7 @@ impl<Process: Copy + Eq> InstallerProgressDeferral<Process> {
         status: u32,
         now_100ns: u64,
     ) -> bool {
-        if owner != self.owner
+        if owner.service != self.owner.service
             || now_100ns < self.epoch_started_100ns
             || self.latest.is_some_and(|last| now_100ns <= last.at_100ns)
             || status != STATUS_OBJECT_NAME_NOT_FOUND
@@ -103,6 +105,13 @@ impl<Process: Copy + Eq> InstallerProgressDeferral<Process> {
         let Some(name) = InfName::from_mapping_path(path) else {
             return false;
         };
+        if owner != self.owner {
+            // The setup worker may ask a service to launch another installer process. Preserve
+            // the epoch's grant budget across that handoff, while fencing the prior probe owner.
+            self.owner = owner;
+            self.latest = None;
+            self.granted = None;
+        }
         if self.latest.is_some_and(|last| last.name == name)
             || self.granted.is_some_and(|last| last.name == name)
         {
@@ -137,6 +146,8 @@ impl<Process: Copy + Eq> InstallerProgressDeferral<Process> {
     }
 
     pub const fn grants(&self) -> u8 { self.grants }
+
+    pub const fn owner(&self) -> InstallerOwner<Process> { self.owner }
 }
 
 #[cfg(test)]
@@ -151,6 +162,7 @@ mod tests {
     const OWNER: InstallerOwner<(u32, u64)> = InstallerOwner {
         worker: (424, 3),
         parent: (160, 2),
+        service: (120, 1),
     };
 
     fn probe(policy: &mut InstallerProgressDeferral<(u32, u64)>, name: &str, at: u64) -> bool {
@@ -174,13 +186,10 @@ mod tests {
     #[test]
     fn stale_repeated_or_unowned_probe_cannot_extend_window() {
         let mut policy = InstallerProgressDeferral::new(OWNER, 7, 100);
-        assert!(!policy.observe_completed_probe(
-            InstallerOwner { worker: (424, 4), ..OWNER },
-            &std::format!("{PREFIX}input.inf"), STATUS_OBJECT_NAME_NOT_FOUND, 200,
-        ));
         assert!(!policy.grant(Some(OWNER), 200, WINDOW));
         assert!(probe(&mut policy, "input.inf", 200));
         assert!(!policy.grant(None, 201, WINDOW));
+        assert!(!policy.grant(Some(InstallerOwner { worker: (424, 4), ..OWNER }), 201, WINDOW));
         assert!(!policy.grant(Some(OWNER), 201 + WINDOW, WINDOW));
         assert!(policy.grant(Some(OWNER), 200 + WINDOW, WINDOW));
         assert!(!probe(&mut policy, "INPUT.INF", 300 + WINDOW));
@@ -221,5 +230,52 @@ mod tests {
         assert!(probe(&mut policy, "input.inf", 202));
         assert!(!probe(&mut policy, "disk.inf", 203));
         assert!(policy.grant(Some(OWNER), 204, WINDOW));
+    }
+
+    #[test]
+    fn service_child_handoff_keeps_the_epoch_grant_limit() {
+        let mut policy = InstallerProgressDeferral::new(OWNER, 7, 100);
+        assert!(probe(&mut policy, "unattend.inf", 200));
+        assert!(policy.grant(Some(OWNER), 201, WINDOW));
+        let next = InstallerOwner { worker: (500, 1), ..OWNER };
+        assert!(policy.observe_completed_probe(
+            next, &std::format!("{PREFIX}disk.inf"), STATUS_OBJECT_NAME_NOT_FOUND, 300,
+        ));
+        assert_eq!(policy.owner(), next);
+        assert!(!policy.grant(Some(OWNER), 301, WINDOW));
+        assert!(policy.grant(Some(next), 301, WINDOW));
+        assert!(!policy.grant(Some(next), 302, WINDOW));
+        assert_eq!(policy.grants(), 2);
+    }
+
+    #[test]
+    fn unrelated_service_cannot_replace_the_progress_owner() {
+        let mut policy = InstallerProgressDeferral::new(OWNER, 7, 100);
+        assert!(probe(&mut policy, "unattend.inf", 200));
+        let unrelated = InstallerOwner {
+            worker: (600, 1),
+            parent: (580, 1),
+            service: (560, 1),
+        };
+        assert!(!policy.observe_completed_probe(
+            unrelated, &std::format!("{PREFIX}disk.inf"), STATUS_OBJECT_NAME_NOT_FOUND, 300,
+        ));
+        assert_eq!(policy.owner(), OWNER);
+        assert!(policy.grant(Some(OWNER), 301, WINDOW));
+    }
+
+    #[test]
+    fn recycled_service_generation_cannot_replace_the_progress_owner() {
+        let mut policy = InstallerProgressDeferral::new(OWNER, 7, 100);
+        let recycled = InstallerOwner {
+            worker: (600, 1),
+            parent: (580, 1),
+            service: (OWNER.service.0, OWNER.service.1 + 1),
+        };
+        assert!(!policy.observe_completed_probe(
+            recycled, &std::format!("{PREFIX}disk.inf"), STATUS_OBJECT_NAME_NOT_FOUND, 200,
+        ));
+        assert_eq!(policy.owner(), OWNER);
+        assert_eq!(policy.grants(), 0);
     }
 }
