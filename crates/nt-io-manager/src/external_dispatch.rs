@@ -285,6 +285,9 @@ pub enum ExternalDispatchResult {
         status: NtStatus,
         information: u64,
         file_context: Option<u64>,
+        /// The exact stack frame that completed the IRP, captured before inline retirement.
+        completion_driver_id: DriverId,
+        completion_device_id: DeviceId,
     },
     Pending {
         irp_id: IrpId,
@@ -1368,10 +1371,6 @@ impl<P> IoManager<P> {
         irp_id: IrpId,
         outcome: Result<DispatchOutcome, NtStatus>,
     ) -> ExternalDispatchResult {
-        let (major, file_id) = self
-            .irp(irp_id)
-            .map(|irp| (irp.origin_major, irp.file_id))
-            .unwrap_or((u8::MAX, None));
         if self
             .irp(irp_id)
             .map(|irp| irp.state != IrpState::Dispatched)
@@ -1379,6 +1378,12 @@ impl<P> IoManager<P> {
         {
             return ExternalDispatchResult::Pending { irp_id };
         }
+        let (major, file_id, completion_driver_id, completion_device_id) = self
+            .irp(irp_id)
+            .and_then(|irp| irp.current_stack().map(|stack| {
+                (irp.origin_major, irp.file_id, stack.driver_id, stack.device_id)
+            }))
+            .expect("dispatched external IRP has an exact completing stack frame");
         match outcome {
             Ok(DispatchOutcome::Completed {
                 status,
@@ -1402,6 +1407,8 @@ impl<P> IoManager<P> {
                     status,
                     information,
                     file_context,
+                    completion_driver_id,
+                    completion_device_id,
                 }
             }
             Ok(DispatchOutcome::Failed { status }) | Err(status) => {
@@ -1421,6 +1428,8 @@ impl<P> IoManager<P> {
                     status,
                     information: 0,
                     file_context: None,
+                    completion_driver_id,
+                    completion_device_id,
                 }
             }
             Ok(DispatchOutcome::Pending) => {

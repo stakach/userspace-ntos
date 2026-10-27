@@ -3926,6 +3926,8 @@ mod tests {
                 status: warning,
                 information: 48,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             }
         );
         assert_eq!(&output[..3], b"hdr");
@@ -3984,6 +3986,8 @@ mod tests {
                 status: warning,
                 information: 0,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             })
         );
         assert_eq!(&output, header);
@@ -4037,6 +4041,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: pdo_driver,
+                completion_device_id: pdo,
             })
         );
         assert_eq!(pdo_seen.borrow().len(), 1);
@@ -4050,6 +4056,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: function_driver,
+                completion_device_id: function,
             })
         );
         assert_eq!(pdo_seen.borrow().len(), 1);
@@ -4082,6 +4090,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             })
         );
         let seen = seen.borrow();
@@ -4212,6 +4222,8 @@ mod tests {
                 status: warning,
                 information: 3,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             }
         );
         assert_eq!(&buf[..3], b"out");
@@ -4367,6 +4379,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: top_driver,
+                completion_device_id: top,
             })
         );
         assert_eq!(om.close(client, handle), Ok(()));
@@ -4582,6 +4596,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 4,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: DeviceId::NULL,
             }
         );
         assert_eq!(&buf, b"pong");
@@ -4653,6 +4669,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: Some(0xCCB0),
+                completion_driver_id: driver,
+                completion_device_id: device,
             }
         );
         assert_eq!(om.external_file_context(client, file_id), Ok(Some(0xCCB0)));
@@ -5538,6 +5556,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: Some(0xCCB1),
+                completion_driver_id: driver,
+                completion_device_id: device,
             })
         );
         assert_eq!(om.external_file_context(client, file_id), Ok(Some(0xCCB1)));
@@ -7254,6 +7274,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: om.device(device).unwrap().driver_id,
+                completion_device_id: device,
             })
         );
         assert!(om.file(target).unwrap().state.is_open());
@@ -7289,6 +7311,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: om.device(device).unwrap().driver_id,
+                completion_device_id: device,
             })
         );
         let request = control.last_request().unwrap();
@@ -7324,6 +7348,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: om.device(device).unwrap().driver_id,
+                completion_device_id: device,
             })
         );
         let request = control.last_request().unwrap();
@@ -7404,6 +7430,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             })
         );
         let request = control.last_request().unwrap();
@@ -7433,6 +7461,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             })
         );
         let request = control.last_request().unwrap();
@@ -7511,6 +7541,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             })
         );
         let request = control.last_request().unwrap();
@@ -7541,6 +7573,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             })
         );
         let request = control.last_request().unwrap();
@@ -7620,6 +7654,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             })
         );
         let request = control.last_request().unwrap();
@@ -7896,6 +7932,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             })
         );
         let request = control.last_request().unwrap();
@@ -7925,6 +7963,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             })
         );
         let request = control.last_request().unwrap();
