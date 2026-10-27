@@ -87,6 +87,7 @@ mod video_device;
 mod win32k_pe;
 mod ex_rundown_exports;
 mod rtl_avl_exports;
+mod kernel_frame_capture;
 mod win32k_frame_capture;
 mod win32k_seh_image;
 mod win32k_cr8_publication;

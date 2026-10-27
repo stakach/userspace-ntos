@@ -25,6 +25,8 @@
 mod hosted_irq_broker;
 #[path = "hosted_bus_interface.rs"]
 pub(crate) mod hosted_bus_interface;
+#[path = "hosted_driver_frame_capture.rs"]
+pub(crate) mod hosted_driver_frame_capture;
 #[path = "hosted_source_retirement.rs"]
 mod hosted_source_retirement;
 #[path = "hosted_driver_preload.rs"]
@@ -1330,6 +1332,7 @@ pub const FSD_SERVICE_POWER_SETTING_LABEL: u64 = hosted_driver_power_setting::LA
 pub const FSD_SERVICE_LUID_LABEL: u64 = hosted_driver_luid::LABEL;
 pub const FSD_SERVICE_KMUTEX_LABEL: u64 = hosted_driver_kmutex::LABEL;
 pub const FSD_SERVICE_GUARDED_MUTEX_LABEL: u64 = hosted_driver_guarded_mutex::LABEL;
+pub const FSD_SERVICE_FRAME_CHAIN_LABEL: u64 = hosted_driver_frame_capture::LABEL;
 const _: () = {
     let labels = [
         FSD_SERVICE_SOURCE_IRP_LABEL,
@@ -1379,6 +1382,7 @@ pub const FSD_SERVICE_WMI_LABEL: u64 = hosted_driver_wmi::LABEL;
         FSD_SERVICE_LUID_LABEL,
         FSD_SERVICE_KMUTEX_LABEL,
         FSD_SERVICE_GUARDED_MUTEX_LABEL,
+        FSD_SERVICE_FRAME_CHAIN_LABEL,
         FSD_SERVICE_PCI_ROOT_LABEL,
         FSD_SERVICE_BUS_INTERFACE_LABEL,
         FSD_SERVICE_PCI_ROUTE_QUERY_LABEL,
@@ -35219,6 +35223,7 @@ fn register_fsd_trampolines() -> bool {
     reg.bind("RtlAssert", crate::hosted_driver_assertion::rtl_assert as usize as u64);
     crate::ex_rundown_exports::bind_ex_rundown_exports(reg);
     io_paging_priority_exports::bind(reg);
+    hosted_driver_frame_capture::bind(reg);
     hosted_driver_remove_lock::bind_remove_lock_exports(reg);
     hosted_driver_configuration::bind_configuration_export(reg);
     hosted_driver_pci_kernel::bind_pci_kernel_exports(reg);

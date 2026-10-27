@@ -1,4 +1,4 @@
-//! Exact paused-lane broker for win32k's native x64 frame chain.
+//! Exact paused-lane broker for native x64 kernel frame chains.
 //!
 //! This child of `hosted_exception_stack` can borrow the private physical stack lease. A caller
 //! must retain the same PumpChannel, Reply, and badge until this function returns. If a result
@@ -23,20 +23,21 @@ pub(crate) enum FrameChainBrokerError {
     Uncertain,
 }
 
-/// Walk from a Win64 ingress packet copied through the exact paused physical win32k lane.
+/// Walk from a Win64 ingress packet copied through the exact paused physical lane.
 ///
 /// The native shim reserves a fixed result suffix on its own component stack. The executive
 /// writes only that suffix via the retained stack alias; the opaque caller output VA is never
 /// translated or dereferenced here. The provider copies the successful prefix after it resumes.
-pub(crate) fn capture_win32k_frame_chain(
+fn capture_kernel_frame_chain(
     channel: &crate::spawn_hosts::PumpChannel,
     reply_cap: u64,
     badge: u64,
     packet_va: u64,
+    kind: crate::spawn_hosts::ReqKind,
 ) -> Result<u32, FrameChainBrokerError> {
     use FrameChainBrokerError::{Refused, Uncertain, UnsupportedUserSource};
 
-    if channel.caps.kind != crate::spawn_hosts::ReqKind::Syscall
+    if channel.caps.kind != kind
         || channel.reply_cap != reply_cap
         || packet_va & 15 != 0
     {
@@ -67,7 +68,10 @@ pub(crate) fn capture_win32k_frame_chain(
     // the exact reader and admitted catalog below.
     let mut frames = [0u64; FRAME_CHAIN_RESULT_CAPACITY];
     let mut wrote = false;
-    let walked = crate::win32k_seh_image::with_catalog(channel, reply_cap, |catalog| {
+    if kind == crate::spawn_hosts::ReqKind::Irp && packet.flags() & 1 != 0 {
+        return Err(UnsupportedUserSource);
+    }
+    let walked = super::with_catalog(channel, reply_cap, |catalog| {
         if !lease.still_live() {
             return Err(Refused);
         }
@@ -136,4 +140,26 @@ pub(crate) fn capture_win32k_frame_chain(
         None if wrote => Err(Uncertain),
         None => Err(Refused),
     }
+}
+
+pub(crate) fn capture_win32k_frame_chain(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    packet_va: u64,
+) -> Result<u32, FrameChainBrokerError> {
+    capture_kernel_frame_chain(
+        channel, reply_cap, badge, packet_va, crate::spawn_hosts::ReqKind::Syscall,
+    )
+}
+
+pub(crate) fn capture_hosted_driver_frame_chain(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    packet_va: u64,
+) -> Result<u32, FrameChainBrokerError> {
+    capture_kernel_frame_chain(
+        channel, reply_cap, badge, packet_va, crate::spawn_hosts::ReqKind::Irp,
+    )
 }

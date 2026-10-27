@@ -662,15 +662,31 @@ pub fn walk_captured_kernel_frame_chain_with_stop<I: exception_walk::ExceptionIm
     if flags & 0xff != 0 {
         return Err(FrameWalkError::UnsupportedFlags);
     }
-    walk_kernel_frame_chain_with_stop(
+    let skipped = (flags >> 8) as usize;
+    let total = skipped.checked_add(callers.len()).ok_or(FrameWalkError::CountOverflow)?;
+    if total == 0 {
+        return Ok(FrameChainWalk { count: 0, stop: FrameChainStop::Budget });
+    }
+    // `from_entry` has already authenticated the native shim's return slot. That return PC is
+    // the direct caller of RtlWalkFrameChain and is its first reported frame. The lower-level
+    // walker begins at that callsite and therefore reports the subsequent frames only.
+    let following = if skipped == 0 {
+        callers[0] = captured.context.rip;
+        &mut callers[1..]
+    } else {
+        callers
+    };
+    let mut walk = walk_kernel_frame_chain_with_stop(
         captured.context,
-        callers,
-        (flags >> 8) as usize,
+        following,
+        skipped.saturating_sub(1),
         captured.stack_low,
         captured.stack_high,
         image,
         stack,
-    )
+    )?;
+    walk.count = walk.count.checked_add(1).ok_or(FrameWalkError::CountOverflow)?;
+    Ok(walk)
 }
 
 /// Validate the bounded request used by `RtlCaptureStackBackTrace`. The native routine adds one

@@ -79,8 +79,8 @@ fn captured_provider_callsite_controls_count_and_high_flag_skip() {
     let mut callers = [0xdead_beefu64; 3];
     let count = walk_captured_kernel_frame_chain(captured, &mut callers, 0, &AdmittedImage, &stack)
         .expect("bounded admitted chain");
-    assert_eq!(count, 2);
-    assert_eq!(callers, [IMAGE + 0x3010, IMAGE + 0x3020, 0xdead_beef]);
+    assert_eq!(count, 3);
+    assert_eq!(callers, [PROVIDER_PC, IMAGE + 0x3010, IMAGE + 0x3020]);
 
     let mut skipped = [0xdead_beefu64; 2];
     let count = walk_captured_kernel_frame_chain(
@@ -91,8 +91,8 @@ fn captured_provider_callsite_controls_count_and_high_flag_skip() {
         &stack,
     )
     .expect("high flag bits skip one proven frame");
-    assert_eq!(count, 2); // ReactOS includes the skipped frame in its return count.
-    assert_eq!(skipped, [IMAGE + 0x3020, 0xdead_beef]);
+    assert_eq!(count, 3); // ReactOS includes the skipped frame in its return count.
+    assert_eq!(skipped, [IMAGE + 0x3010, IMAGE + 0x3020]);
 }
 
 #[test]
@@ -127,7 +127,7 @@ fn continuation_requires_a_proven_stack_boundary_not_an_unknown_kernel_pc() {
     let stopped = walk_captured_kernel_frame_chain_with_stop(
         captured, &mut callers, 0, &AdmittedImage, &foreign,
     ).unwrap();
-    assert_eq!(stopped.count, 2);
+    assert_eq!(stopped.count, 3);
     assert_eq!(stopped.stop, FrameChainStop::UnknownImage);
     assert!(!stopped.stop.authorizes_attached_user());
 
@@ -149,7 +149,7 @@ fn continuation_requires_a_proven_stack_boundary_not_an_unknown_kernel_pc() {
     let stopped = walk_captured_kernel_frame_chain_with_stop(
         captured, &mut callers, 0, &AdmittedImage, &boundary,
     ).unwrap();
-    assert_eq!(stopped.count, 0);
+    assert_eq!(stopped.count, 1);
     assert_eq!(stopped.stop, FrameChainStop::StackBoundary);
     assert!(stopped.stop.authorizes_attached_user());
 }

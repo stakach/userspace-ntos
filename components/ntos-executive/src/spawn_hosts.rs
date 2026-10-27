@@ -3290,6 +3290,39 @@ unsafe fn component_pump_loop(
                 out3
             );
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_FRAME_CHAIN_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            if !shared_pump::authenticated_badge(ch, msg.badge)
+                || msg.mi != ((crate::driver_launch::FSD_SERVICE_FRAME_CHAIN_LABEL << 12) | 1)
+                || *reply_cap != ch.reply_cap
+            {
+                outcome.wall(msg);
+                break;
+            }
+            use crate::driver_launch::hosted_exception_stack::FrameChainBrokerError;
+            match crate::driver_launch::hosted_exception_stack::capture_hosted_driver_frame_chain(
+                ch, *reply_cap, msg.badge, msg.m0,
+            ) {
+                Ok(count) => {
+                    pump_reply_recv_into!(ch, *reply_cap, msg, 1, u64::from(count));
+                    continue;
+                }
+                Err(FrameChainBrokerError::Refused) => {
+                    pump_reply_recv_into!(ch, *reply_cap, msg, 1, 0);
+                    continue;
+                }
+                Err(FrameChainBrokerError::UnsupportedUserSource) => {
+                    crate::print_str(b"[driver-frame] unsupported user frame source; wall lane\n");
+                    outcome.wall(msg);
+                    break;
+                }
+                Err(FrameChainBrokerError::Uncertain) => {
+                    crate::print_str(b"[driver-frame] uncertain result publication; wall lane\n");
+                    outcome.wall(msg);
+                    break;
+                }
+            }
         } else if label == crate::win32k_subsystem::W32_FRAME_CHAIN_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
