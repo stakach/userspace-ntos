@@ -30,6 +30,7 @@ mod retained_start_fdo_forward;
 mod retained_start_fdo_forward_tests;
 pub mod returned_pnp_buffer;
 mod target_device_relation;
+pub mod target_device_change;
 mod upper_filter_attachment;
 
 pub use accepted_pdo_filter_edge::*;
