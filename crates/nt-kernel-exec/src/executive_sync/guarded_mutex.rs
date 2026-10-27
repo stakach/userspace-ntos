@@ -72,6 +72,14 @@ impl GuardedMutexStore {
         self.mutexes.iter().position(|state| state.address == mutex as u64)
     }
 
+    /// Whether this exact projection has no owner or retained waiters and may be retired.
+    pub fn idle(&self, mutex: *mut u8) -> Result<bool, ExecutiveSyncError> {
+        validate_mutex(mutex)?;
+        let state = self.mutexes.get(self.index_of(mutex).ok_or(ExecutiveSyncError::NotInitialized)?)
+            .ok_or(ExecutiveSyncError::NotInitialized)?;
+        Ok(state.owner == 0 && state.waiters.is_empty())
+    }
+
     /// Initialize driver-owned native storage. The caller owns its mapped lifetime.
     ///
     /// # Safety
@@ -197,6 +205,22 @@ impl GuardedMutexStore {
         state.saved_apc_disable = apc;
         write_projection(mutex, state);
         Ok(())
+    }
+
+    /// Whether the exact retained waiter has been granted the gate. This is only a
+    /// readiness query; ownership still transfers in `complete_wait` on its continuation.
+    pub fn granted(
+        &self,
+        mutex: *mut u8,
+        thread: u64,
+        ticket: GuardedMutexWaitTicket,
+    ) -> Result<bool, ExecutiveSyncError> {
+        validate_mutex(mutex)?;
+        let index = self.index_of(mutex).ok_or(ExecutiveSyncError::NotInitialized)?;
+        self.mutexes[index].waiters.iter()
+            .find(|waiter| waiter.ticket == ticket && waiter.thread == thread)
+            .map(|waiter| waiter.granted)
+            .ok_or(ExecutiveSyncError::InvalidOwner)
     }
 
     /// Release the exact owner and return at most one continuation to wake.

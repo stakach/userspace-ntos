@@ -46,6 +46,7 @@ fn contention_parks_second_thread_and_wakes_only_after_owner_release() {
 
     unsafe {
         store.initialize(mutex.0.as_mut_ptr()).unwrap();
+        assert_eq!(store.idle(mutex.0.as_mut_ptr()), Ok(true));
         assert_eq!(count(&mutex), 1);
         assert_eq!(owner(&mutex), 0);
         assert_eq!(special_apc_disable(&first_thread), 0);
@@ -60,6 +61,7 @@ fn contention_parks_second_thread_and_wakes_only_after_owner_release() {
             Ok(GuardedMutexWaitAdmission::Acquired),
         );
         assert_eq!(owner(&mutex), first);
+        assert_eq!(store.idle(mutex.0.as_mut_ptr()), Ok(false));
         assert_eq!(special_apc_disable(&first_thread), -1);
 
         let ticket = match store
@@ -76,6 +78,7 @@ fn contention_parks_second_thread_and_wakes_only_after_owner_release() {
         };
         assert_eq!(owner(&mutex), first);
         assert_eq!(special_apc_disable(&second_thread), -1);
+        assert_eq!(store.granted(mutex.0.as_mut_ptr(), second, ticket), Ok(false));
         assert_eq!(
             store.complete_wait(mutex.0.as_mut_ptr(), second, ticket),
             Err(ExecutiveSyncError::BlockingWaitRequired),
@@ -93,6 +96,7 @@ fn contention_parks_second_thread_and_wakes_only_after_owner_release() {
         );
         assert_eq!(special_apc_disable(&first_thread), 0);
         assert_eq!(owner(&mutex), 0);
+        assert_eq!(store.granted(mutex.0.as_mut_ptr(), second, ticket), Ok(true));
         assert_eq!(
             store.complete_wait(mutex.0.as_mut_ptr(), second, ticket),
             Ok(()),
@@ -200,6 +204,48 @@ fn cancel_wait_restores_apc_state_and_invalidates_ticket() {
                 .unwrap(),
             None,
         );
+        store.delete(mutex.0.as_mut_ptr()).unwrap();
+    }
+}
+
+#[test]
+fn cancelling_granted_ticket_passes_gate_to_next_exact_waiter() {
+    let mut mutex = Aligned([0u8; 0x40]);
+    let mut owner_thread = Aligned([0u8; 0x280]);
+    let mut first_thread = Aligned([0u8; 0x280]);
+    let mut second_thread = Aligned([0u8; 0x280]);
+    let mut store = GuardedMutexStore::new();
+    unsafe {
+        store.initialize(mutex.0.as_mut_ptr()).unwrap();
+        store.begin_wait(mutex.0.as_mut_ptr(), 0x1000, owner_thread.0.as_mut_ptr(), 0)
+            .unwrap();
+        let first = match store.begin_wait(mutex.0.as_mut_ptr(), 0x2000,
+            first_thread.0.as_mut_ptr(), 0xabc0).unwrap() {
+            GuardedMutexWaitAdmission::Queued(ticket) => ticket,
+            _ => panic!("first contender did not queue"),
+        };
+        let second = match store.begin_wait(mutex.0.as_mut_ptr(), 0x3000,
+            second_thread.0.as_mut_ptr(), 0xdef0).unwrap() {
+            GuardedMutexWaitAdmission::Queued(ticket) => ticket,
+            _ => panic!("second contender did not queue"),
+        };
+        assert_eq!(store.granted(mutex.0.as_mut_ptr(), 0x2000, second),
+            Err(ExecutiveSyncError::InvalidOwner));
+        assert_eq!(store.idle(mutex.0.as_mut_ptr()), Ok(false));
+        assert_eq!(store.release(mutex.0.as_mut_ptr(), 0x1000,
+            owner_thread.0.as_mut_ptr()), Ok(Some(0xabc0)));
+        assert_eq!(store.granted(mutex.0.as_mut_ptr(), 0x2000, first), Ok(true));
+        assert_eq!(store.granted(mutex.0.as_mut_ptr(), 0x3000, second), Ok(false));
+        assert_eq!(store.cancel_wait(mutex.0.as_mut_ptr(), 0x2000,
+            first_thread.0.as_mut_ptr(), first), Ok(Some(0xdef0)));
+        assert_eq!(special_apc_disable(&first_thread), 0);
+        assert_eq!(store.granted(mutex.0.as_mut_ptr(), 0x3000, second), Ok(true));
+        store.complete_wait(mutex.0.as_mut_ptr(), 0x3000, second).unwrap();
+        assert_eq!(owner(&mutex), 0x3000);
+        assert_eq!(store.release(mutex.0.as_mut_ptr(), 0x3000,
+            second_thread.0.as_mut_ptr()), Ok(None));
+        assert_eq!(special_apc_disable(&second_thread), 0);
+        assert_eq!(store.idle(mutex.0.as_mut_ptr()), Ok(true));
         store.delete(mutex.0.as_mut_ptr()).unwrap();
     }
 }

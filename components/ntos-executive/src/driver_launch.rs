@@ -417,9 +417,12 @@ mod hosted_driver_power_setting;
 mod hosted_driver_luid;
 #[path = "hosted_driver_kmutex.rs"]
 mod hosted_driver_kmutex;
+#[path = "hosted_driver_guarded_mutex.rs"]
+mod hosted_driver_guarded_mutex;
 #[path = "hosted_driver_device_state.rs"]
 mod hosted_driver_device_state;
 pub(crate) use hosted_driver_pnp_notification::service as service_hosted_driver_pnp_notification;
+pub(crate) use hosted_driver_guarded_mutex::service as service_hosted_driver_guarded_mutex;
 pub(crate) use hosted_driver_pofx::service as service_hosted_driver_pofx;
 pub(crate) use hosted_driver_power_setting::service as service_hosted_driver_power_setting;
 pub(crate) use hosted_driver_luid::service as service_hosted_driver_luid;
@@ -1321,6 +1324,7 @@ pub const FSD_SERVICE_POFX_LABEL: u64 = hosted_driver_pofx::LABEL;
 pub const FSD_SERVICE_POWER_SETTING_LABEL: u64 = hosted_driver_power_setting::LABEL;
 pub const FSD_SERVICE_LUID_LABEL: u64 = hosted_driver_luid::LABEL;
 pub const FSD_SERVICE_KMUTEX_LABEL: u64 = hosted_driver_kmutex::LABEL;
+pub const FSD_SERVICE_GUARDED_MUTEX_LABEL: u64 = hosted_driver_guarded_mutex::LABEL;
 const _: () = {
     let labels = [
         FSD_SERVICE_SOURCE_IRP_LABEL,
@@ -1368,6 +1372,7 @@ const _: () = {
         FSD_SERVICE_POWER_SETTING_LABEL,
         FSD_SERVICE_LUID_LABEL,
         FSD_SERVICE_KMUTEX_LABEL,
+        FSD_SERVICE_GUARDED_MUTEX_LABEL,
         FSD_SERVICE_PCI_ROOT_LABEL,
         FSD_SERVICE_BUS_INTERFACE_LABEL,
         FSD_SERVICE_PCI_ROUTE_QUERY_LABEL,
@@ -14760,7 +14765,8 @@ unsafe fn hosted_dispatcher_ready_for(
 ) -> Result<bool, i32> {
     match key {
         Some(key) => hosted_driver_kmutex::ready(object, key, thread),
-        None => hosted_dispatcher_ready(object),
+        None => hosted_driver_guarded_mutex::ready(object, thread)
+            .unwrap_or_else(|| hosted_dispatcher_ready(object)),
     }
 }
 
@@ -14800,7 +14806,8 @@ unsafe fn hosted_dispatcher_consume_for(
 ) -> bool {
     match key {
         Some(key) => hosted_driver_kmutex::acquire(object, key, thread, owner) == Ok(true),
-        None => hosted_dispatcher_consume(object),
+        None => hosted_driver_guarded_mutex::consume(object, thread)
+            .unwrap_or_else(|| hosted_dispatcher_consume(object)),
     }
 }
 
@@ -14867,8 +14874,9 @@ unsafe fn hosted_dispatcher_wait_ready_with_handler(
     }
     let ready = |object: u64, key| match key {
         Some(key) => hosted_driver_kmutex::ready(object, key, thread),
-        None => hosted_driver_event_reference::projected_ready_with_handler(object, handler)
-            .unwrap_or_else(|| hosted_dispatcher_ready(object)),
+        None => hosted_driver_guarded_mutex::ready(object, thread)
+            .unwrap_or_else(|| hosted_driver_event_reference::projected_ready_with_handler(object, handler)
+                .unwrap_or_else(|| hosted_dispatcher_ready(object))),
     };
     if wait_all {
         for (&object, &key) in objects.iter().zip(keys) {
@@ -14894,8 +14902,9 @@ unsafe fn hosted_dispatcher_wait_consume_with_handler(
 ) -> bool {
     let mut consume = |object: u64, key| match key {
         Some(key) => hosted_driver_kmutex::acquire(object, key, thread, owner) == Ok(true),
-        None => hosted_driver_event_reference::projected_consume_with_handler(object, handler)
-            .unwrap_or_else(|| hosted_dispatcher_consume(object)),
+        None => hosted_driver_guarded_mutex::consume(object, thread)
+            .unwrap_or_else(|| hosted_driver_event_reference::projected_consume_with_handler(object, handler)
+                .unwrap_or_else(|| hosted_dispatcher_consume(object))),
     };
     if wait_all {
         for (&object, &key) in objects.iter().zip(keys) {
@@ -15264,6 +15273,9 @@ unsafe fn reply_hosted_driver_waiter(mut waiter: HostedDriverRawWaiter, status: 
     let thread_handle = waiter.thread_handle;
     let sequence = waiter.sequence;
     let reply = waiter.reply_cap;
+    if status != STATUS_SUCCESS {
+        hosted_driver_guarded_mutex::cancel_pending(instance, thread_handle, reply);
+    }
     let reply_entered = waiter.delivery.reply_entered();
     if !reply_entered {
         if !waiter.delivery.select() || !waiter.delivery.enter_reply() {
@@ -15320,6 +15332,7 @@ unsafe fn reply_hosted_driver_waiter(mut waiter: HostedDriverRawWaiter, status: 
         else { waiter.delivery.reconcile(true) }) {
         crate::provider_bugcheck::report(0xc4, [instance as u64, sequence, reply, 13]);
     }
+    hosted_driver_guarded_mutex::acknowledged(instance, thread_handle, reply, cancelled);
     for lease in waiter.event_projection_leases {
         if hosted_driver_event_reference::release_wait(lease).is_err() {
             crate::provider_bugcheck::report(0xc4, [instance as u64, sequence, 0, 11]);
@@ -36431,6 +36444,12 @@ fn register_fsd_trampolines() -> bool {
         hosted_driver_kmutex::initialize as *const () as usize as u64);
     reg.bind("KeReleaseMutex",
         hosted_driver_kmutex::release as *const () as usize as u64);
+    reg.bind("KeInitializeGuardedMutex",
+        hosted_driver_guarded_mutex::initialize as *const () as usize as u64);
+    reg.bind("KeAcquireGuardedMutex",
+        hosted_driver_guarded_mutex::acquire as *const () as usize as u64);
+    reg.bind("KeReleaseGuardedMutex",
+        hosted_driver_guarded_mutex::release as *const () as usize as u64);
     reg.bind(
         "KeInitializeSemaphore",
         s_ke_initialize_semaphore as *const () as usize as u64,
@@ -60616,6 +60635,7 @@ unsafe fn hosted_driver_device_lifetime_quiesced(
         && hosted_driver_pnp_notification::quiesced(domain)
         && hosted_driver_pofx::quiesced(domain)
         && hosted_driver_kmutex::quiesced(domain)
+        && hosted_driver_guarded_mutex::quiesced(domain)
 }
 
 fn hosted_driver_thread_error_status(error: HostedDriverThreadError) -> i32 {
@@ -61289,6 +61309,7 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
             hosted_driver_pnp_notification::retire_domain(domain);
             hosted_driver_pofx::retire_domain(domain);
             hosted_driver_kmutex::retire_domain(domain);
+            hosted_driver_guarded_mutex::retire_domain(domain);
         }
     }
     if let Some(domain) = retiring_domain {

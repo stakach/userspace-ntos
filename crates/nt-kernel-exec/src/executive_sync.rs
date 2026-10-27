@@ -8,7 +8,8 @@
 use alloc::vec::Vec;
 
 mod guarded_mutex;
-pub use guarded_mutex::{guarded_mutex_layout, GuardedMutexStore, GuardedMutexWaitAdmission};
+pub use guarded_mutex::{guarded_mutex_layout, GuardedMutexStore, GuardedMutexWaitAdmission,
+    GuardedMutexWaitTicket};
 
 /// Native x64 `ERESOURCE` offsets (NT 5.x / ReactOS ABI).
 pub mod eresource_layout {

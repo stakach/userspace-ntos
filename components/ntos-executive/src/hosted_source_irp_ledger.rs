@@ -926,7 +926,8 @@ pub(super) fn retire_allocation(
         unsafe { exact_pool_identity_unlocked(inst, component_address, 1) }
             .map(|identity| (identity.component_address, identity.pool_generation))
     } else { None };
-    if mutex_pool.is_some_and(|pool| !hosted_driver_kmutex::pool_free_admission(domain, pool)) {
+    if mutex_pool.is_some_and(|pool| !hosted_driver_kmutex::pool_free_admission(domain, pool)
+        || !hosted_driver_guarded_mutex::pool_free_admission(domain, pool)) {
         return (nt_status::NtStatus::DELETE_PENDING.raw(), 0, 0);
     }
     let owner = match ledger().pool_free_admission(instance_index, domain, component_address) {
@@ -936,7 +937,10 @@ pub(super) fn retire_allocation(
                     == Some(false)
                 && unsafe { hosted_instance_pool_free_unlocked(inst, component_address) }
             {
-                if let Some(pool) = mutex_pool { hosted_driver_kmutex::pool_freed(domain, pool); }
+                if let Some(pool) = mutex_pool {
+                    hosted_driver_kmutex::pool_freed(domain, pool);
+                    hosted_driver_guarded_mutex::pool_freed(domain, pool);
+                }
                 (STATUS_SUCCESS, 0, 0)
             } else {
                 (STATUS_INVALID_HANDLE, 0, 0)
@@ -957,7 +961,10 @@ pub(super) fn retire_allocation(
             if !unsafe { hosted_instance_pool_free_unlocked(inst, component_address) } {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             }
-            if let Some(pool) = mutex_pool { hosted_driver_kmutex::pool_freed(domain, pool); }
+            if let Some(pool) = mutex_pool {
+                hosted_driver_kmutex::pool_freed(domain, pool);
+                hosted_driver_guarded_mutex::pool_freed(domain, pool);
+            }
             if ledger().retire(ticket, owner).is_err() {
                 unsafe {
                     crate::provider_bugcheck::report(
