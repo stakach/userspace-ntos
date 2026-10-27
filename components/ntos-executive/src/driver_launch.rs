@@ -302,6 +302,10 @@ mod hosted_driver_create_driver;
 pub(crate) use hosted_driver_create_driver::service as service_hosted_driver_create_driver;
 #[path = "hosted_driver_processor_mask.rs"]
 mod hosted_driver_processor_mask;
+
+pub(crate) fn current_processor_index() -> usize {
+    hosted_driver_processor_mask::current_processor_number_ex(0) as usize
+}
 #[path = "hosted_driver_guid.rs"]
 mod hosted_driver_guid;
 #[path = "hosted_driver_image_directory.rs"]

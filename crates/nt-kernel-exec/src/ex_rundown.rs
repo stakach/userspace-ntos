@@ -130,6 +130,10 @@ impl ExRundownRef {
     pub fn reinitialize(&self) -> bool {
         self.state.compare_exchange(ACTIVE, 0, Ordering::AcqRel, Ordering::Acquire).is_ok()
     }
+
+    pub fn is_completed(&self) -> bool {
+        self.state.load(Ordering::Acquire) == ACTIVE
+    }
 }
 
 impl Default for ExRundownRef {

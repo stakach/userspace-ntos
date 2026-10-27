@@ -32,9 +32,55 @@ fn pinned_drivers_resolve_rundown_through_generic_export_registry() {
     let source = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
     assert!(source.contains("crate::ex_rundown_exports::bind_ex_rundown_exports(reg);"));
     let source = include_str!("../../../components/ntos-executive/src/ex_rundown_exports.rs");
-    assert_eq!(source.matches("extern \"win64\" fn ex_").count(), 5, "all five direct exports must use the native Win64 ABI");
+    assert!(source.matches("extern \"win64\" fn ex_").count() >= 5, "the basic direct exports must use the native Win64 ABI");
     for name in RUNDOWN_IMPORTS {
         assert!(source.contains(&format!("reg.bind(\"{name}\",")), "generic driver registry lacks {name}");
+    }
+}
+
+const CLASS_PNP_CACHE_AWARE_IMPORTS: [&str; 6] = [
+    "ExAcquireRundownProtectionCacheAware",
+    "ExInitializeRundownProtectionCacheAware",
+    "ExReInitializeRundownProtectionCacheAware",
+    "ExReleaseRundownProtectionCacheAware",
+    "ExSizeOfRundownProtectionCacheAware",
+    "ExWaitForRundownProtectionReleaseCacheAware",
+];
+
+#[test]
+fn pinned_classpnp_cache_aware_rundown_imports_have_real_native_bindings() {
+    use nt_pe_loader::ImportRef;
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let image = root.join("rust-micro/.tmp/libernt/tree/Windows/system32/drivers/classpnp.sys");
+    if image.exists() {
+        let bytes = std::fs::read(image).expect("staged pinned classpnp.sys");
+        let pe = nt_pe_loader::PeFile::parse(&bytes).expect("classpnp PE");
+        let imports: BTreeSet<String> = pe.imports().expect("classpnp imports")
+            .into_iter()
+            .filter(|dll| dll.name.eq_ignore_ascii_case("ntoskrnl.exe"))
+            .flat_map(|dll| dll.functions)
+            .filter_map(|entry| match entry {
+                ImportRef::ByName { name, .. } => Some(name),
+                ImportRef::ByOrdinal { .. } => None,
+            })
+            .collect();
+        for name in CLASS_PNP_CACHE_AWARE_IMPORTS {
+            assert!(imports.contains(name), "pinned classpnp.sys no longer imports {name}");
+        }
+    }
+
+    // The generic driver resolver enters this registry before DriverEntry. A source check runs
+    // on CI hosts without the staged image and stays red until each real direct export is bound.
+    let resolver = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    assert!(resolver.contains("crate::ex_rundown_exports::bind_ex_rundown_exports(reg);"));
+    let exports = include_str!("../../../components/ntos-executive/src/ex_rundown_exports.rs");
+    for name in CLASS_PNP_CACHE_AWARE_IMPORTS {
+        assert!(exports.contains(&format!("reg.bind(\"{name}\","))
+            || exports.contains(&format!("reg.bind(\n        \"{name}\",")),
+            "classpnp.sys cannot load: missing live cache-aware rundown export {name}");
     }
 }
 
