@@ -132,7 +132,13 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: b
             }
             if progressed { continue; }
         }
-        crate::registry_mutation_work::redrive_provider();
+        let progressed = crate::registry_mutation_work::redrive_provider();
+        // A retained CM mutation can use all sixteen steps and still have a local terminal
+        // phase to run. Take another fair, bounded pass before entering a blocking Receive.
+        // A stalled or ineligible owner returns false, so it cannot spin this pump.
+        if progressed && crate::registry_mutation_work::wake_due(crate::monotonic_time_100ns()) != 0 {
+            continue;
+        }
         let connect_ready = crate::driver_launch::nested_hosted_connect_forward_ready();
         if crate::driver_launch::nested_hosted_driver_create_ready()
             || crate::driver_launch::nested_hosted_query_path_ready()

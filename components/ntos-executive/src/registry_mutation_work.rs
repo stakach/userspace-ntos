@@ -453,6 +453,25 @@ static mut EXECUTING: Option<ProviderLogicalCaller> = None;
 static EXECUTING_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
 const RETRY_DELAY: u64 = 10_000_000;
 
+#[derive(Eq, PartialEq)]
+enum PhaseProgressFingerprint {
+    Other(core::mem::Discriminant<Phase>),
+    Begin(Option<u64>, Option<i32>, bool),
+    Prepare(CmMutationPreparationPhase, usize, usize),
+}
+
+fn phase_progress_fingerprint(phase: &Phase) -> PhaseProgressFingerprint {
+    match phase {
+        Phase::Begin(attempt) => PhaseProgressFingerprint::Begin(
+            attempt.server_nonce(), attempt.outcome_status(), attempt.is_acknowledged(),
+        ),
+        Phase::Prepare(preparation) => PhaseProgressFingerprint::Prepare(
+            preparation.phase(), preparation.uploaded_len(), preparation.collected_len(),
+        ),
+        _ => PhaseProgressFingerprint::Other(core::mem::discriminant(phase)),
+    }
+}
+
 /// Includes work retained across a failed CM exchange or a storage effect. The bootstrap
 /// handoff must wait for this count and the journal owner before moving Ps into the handler.
 pub(crate) fn pending_count() -> u64 {
@@ -824,28 +843,30 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler, queue: &mut nt_delay_e
 
 /// Bootstrap and provider pumps may progress provider work without inventing a hosted handler.
 #[inline(never)]
-pub(crate) unsafe fn redrive_provider() {
+pub(crate) unsafe fn redrive_provider() -> bool {
     // Keep the common empty/already-running path out of redrive_inner's large Work frame.
     // Nested hosted pumps can reach this call several times on the rootserver stack.
     if PENDING.load(Ordering::Acquire) == 0
         || monotonic_time_100ns() < NEXT.load(Ordering::Acquire)
         || ACTIVE.load(Ordering::Acquire)
     {
-        return;
+        return false;
     }
-    redrive_inner(None);
+    redrive_inner(None)
 }
 
 #[inline(never)]
-unsafe fn redrive_inner(mut context: HostedContext<'_>) {
+unsafe fn redrive_inner(mut context: HostedContext<'_>) -> bool {
     if PENDING.load(Ordering::Acquire) == 0
         || monotonic_time_100ns() < NEXT.load(Ordering::Acquire)
         || ACTIVE.swap(true, Ordering::AcqRel)
     {
-        return;
+        return false;
     }
     let _durable = allocator::enter_durable();
     let mut failed = false;
+    let mut immediate_progress = false;
+    let mut completed = false;
     let selected = {
         let rows = &mut *core::ptr::addr_of_mut!(WORK);
         let count = rows.len();
@@ -863,15 +884,17 @@ unsafe fn redrive_inner(mut context: HostedContext<'_>) {
         EXECUTING_INDEX.store(index as u64, Ordering::Relaxed);
         CURSOR.store(index as u64 + 1, Ordering::Relaxed);
         *core::ptr::addr_of_mut!(EXECUTING) = work.caller.logical();
-        let mut completed = false;
         // Bound each sweep; long journals resume fairly on the next maintenance tick.
         for _ in 0..16 {
             *core::ptr::addr_of_mut!(EXECUTING) =
                 if matches!(work.phase, Phase::ReconcileRuntime) { None } else { work.caller.logical() };
+            let previous_phase = phase_progress_fingerprint(&work.phase);
             match advance(&mut context, &mut work) {
-                Ok(true) => { completed = true; break; }
-                Ok(false) => {}
-                Err(_) => { failed = true; break; }
+                Ok(true) => { completed = true; immediate_progress = true; break; }
+                Ok(false) => {
+                    immediate_progress = previous_phase != phase_progress_fingerprint(&work.phase);
+                }
+                Err(_) => { failed = true; immediate_progress = false; break; }
             }
         }
         if completed {
@@ -884,6 +907,10 @@ unsafe fn redrive_inner(mut context: HostedContext<'_>) {
     }
     NEXT.store(monotonic_time_100ns().saturating_add(if failed { RETRY_DELAY } else { 0 }), Ordering::Release);
     ACTIVE.store(false, Ordering::Release);
+    if !completed && immediate_progress {
+        return true;
+    }
+    completed && PENDING.load(Ordering::Acquire) != 0
 }
 
 unsafe fn caller_cancelled(handler: &ExecNtHandler, caller: &HostedCaller) -> bool {
