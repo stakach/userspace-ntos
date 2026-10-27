@@ -7,6 +7,9 @@
 
 extern crate alloc;
 
+pub mod reginfo;
+pub mod event;
+
 use alloc::vec::Vec;
 
 pub const WMIGUID_QUERY: u32 = 0x0001;
