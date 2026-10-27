@@ -12,6 +12,8 @@ use nt_io_manager::{
 };
 use nt_types::NtPath;
 
+type ExecutiveIoManager = IoManager<MockObjectPort>;
+
 const FSD_POOL_VADDR: u64 = 0x400000;
 const FSD_POOL_FRAMES: u64 = 2;
 const POOL_DATA_OFF: u64 = 0x1000;
