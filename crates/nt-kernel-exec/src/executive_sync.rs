@@ -7,6 +7,9 @@
 
 use alloc::vec::Vec;
 
+mod guarded_mutex;
+pub use guarded_mutex::{guarded_mutex_layout, GuardedMutexStore, GuardedMutexWaitAdmission};
+
 /// Native x64 `ERESOURCE` offsets (NT 5.x / ReactOS ABI).
 pub mod eresource_layout {
     pub const SYSTEM_RESOURCES_LIST: usize = 0x00;
@@ -67,6 +70,7 @@ pub enum ExecutiveSyncError {
     ApcDisableUnderflow,
     FastMutexCorrupt,
     FastMutexRecursiveAcquire,
+    GuardedMutexRecursiveAcquire,
     BlockingWaitRequired,
 }
 
