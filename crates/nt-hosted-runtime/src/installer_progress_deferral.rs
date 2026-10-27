@@ -46,7 +46,8 @@ impl InfName {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CompletedInfProbe {
+struct CompletedInfProbe<Process> {
+    owner: InstallerOwner<Process>,
     name: InfName,
     at_100ns: u64,
 }
@@ -57,8 +58,8 @@ pub struct InstallerProgressDeferral<Process> {
     owner: InstallerOwner<Process>,
     epoch: u64,
     epoch_started_100ns: u64,
-    latest: Option<CompletedInfProbe>,
-    granted: Option<CompletedInfProbe>,
+    latest: Option<CompletedInfProbe<Process>>,
+    granted: Option<CompletedInfProbe<Process>>,
     grants: u8,
 }
 
@@ -106,18 +107,16 @@ impl<Process: Copy + Eq> InstallerProgressDeferral<Process> {
             return false;
         };
         if owner != self.owner {
-            // The setup worker may ask a service to launch another installer process. Preserve
-            // the epoch's grant budget across that handoff, while fencing the prior probe owner.
+            // A sibling helper can take over only within the same service generation. Retain
+            // the prior INF names and grant budget, while fencing its ungranted probe.
             self.owner = owner;
-            self.latest = None;
-            self.granted = None;
         }
         if self.latest.is_some_and(|last| last.name == name)
             || self.granted.is_some_and(|last| last.name == name)
         {
             return false;
         }
-        self.latest = Some(CompletedInfProbe { name, at_100ns: now_100ns });
+        self.latest = Some(CompletedInfProbe { owner, name, at_100ns: now_100ns });
         true
     }
 
@@ -131,6 +130,7 @@ impl<Process: Copy + Eq> InstallerProgressDeferral<Process> {
     ) -> bool {
         let Some(probe) = self.latest else { return false };
         if live_owner != Some(self.owner)
+            || probe.owner != self.owner
             || self.grants >= Self::MAX_GRANTS_PER_EPOCH
             || now_100ns < probe.at_100ns
             || now_100ns - probe.at_100ns > window_100ns
@@ -276,6 +276,35 @@ mod tests {
             recycled, &std::format!("{PREFIX}disk.inf"), STATUS_OBJECT_NAME_NOT_FOUND, 200,
         ));
         assert_eq!(policy.owner(), OWNER);
+        assert_eq!(policy.grants(), 0);
+    }
+
+    #[test]
+    fn helper_handoff_does_not_count_the_same_inf_again() {
+        let mut policy = InstallerProgressDeferral::new(OWNER, 7, 100);
+        assert!(probe(&mut policy, "display.inf", 200));
+        assert!(policy.grant(Some(OWNER), 201, WINDOW));
+        let next = InstallerOwner { worker: (500, 1), ..OWNER };
+        assert!(!policy.observe_completed_probe(
+            next, &std::format!("{PREFIX}DISPLAY.inf"), STATUS_OBJECT_NAME_NOT_FOUND, 300,
+        ));
+        assert_eq!(policy.owner(), next);
+        assert!(!policy.grant(Some(next), 301, WINDOW));
+        assert!(policy.observe_completed_probe(
+            next, &std::format!("{PREFIX}monitor.inf"), STATUS_OBJECT_NAME_NOT_FOUND, 302,
+        ));
+        assert!(policy.grant(Some(next), 303, WINDOW));
+    }
+
+    #[test]
+    fn ungranted_prior_helper_probe_cannot_be_granted_by_new_helper() {
+        let mut policy = InstallerProgressDeferral::new(OWNER, 7, 100);
+        assert!(probe(&mut policy, "display.inf", 200));
+        let next = InstallerOwner { worker: (500, 1), ..OWNER };
+        assert!(!policy.observe_completed_probe(
+            next, &std::format!("{PREFIX}DISPLAY.inf"), STATUS_OBJECT_NAME_NOT_FOUND, 300,
+        ));
+        assert!(!policy.grant(Some(next), 301, WINDOW));
         assert_eq!(policy.grants(), 0);
     }
 }
