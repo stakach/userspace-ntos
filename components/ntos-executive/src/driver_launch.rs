@@ -61,6 +61,7 @@ mod hosted_wmi_reginfo;
 mod hosted_wmi_event;
 #[path = "hosted_driver_wmi.rs"]
 mod hosted_driver_wmi;
+pub(crate) use hosted_driver_wmi::service as service_hosted_driver_wmi;
 
 #[path = "hosted_ingress_sources.rs"]
 pub(crate) mod hosted_ingress_sources;
@@ -447,8 +448,8 @@ mod hosted_kernel_file_read_query;
 #[path = "hosted_kernel_win32k_async_read.rs"]
 mod hosted_kernel_win32k_async_read;
 #[path = "hosted_power_broker.rs"]
-pub(crate) use hosted_driver_wmi::service as service_hosted_driver_wmi;
 mod hosted_power_broker;
+pub(crate) use hosted_power_broker::trace_report_rpc;
 #[path = "hosted_sync_relations.rs"]
 pub(crate) mod hosted_sync_relations;
 #[path = "hosted_kernel_win32k_buffered_ioctl.rs"]
@@ -6195,7 +6196,7 @@ const HOSTED_DEVICE_OP_ATTACH_SAFE: u64 = 17;
 const HOSTED_DEVICE_OP_ROLLBACK_ATTACH_SAFE: u64 = 18;
 const HOSTED_DEVICE_OP_REGISTER_FILE_SYSTEM: u64 = 19;
 const HOSTED_DEVICE_OP_UNREGISTER_FILE_SYSTEM: u64 = 20;
-const HOSTED_DEVICE_OP_REPORT_POWER_STATE: u64 = 21;
+pub(crate) const HOSTED_DEVICE_OP_REPORT_POWER_STATE: u64 = 21;
 const HOSTED_DEVICE_OP_SET_START_IO_ATTRIBUTES: u64 = 22;
 const HOSTED_DEVICE_OP_START_PACKET: u64 = 23;
 const HOSTED_DEVICE_OP_START_PACKET_CALLBACK_RETURNED: u64 = 24;

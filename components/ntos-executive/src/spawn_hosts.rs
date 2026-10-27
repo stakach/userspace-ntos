@@ -1861,7 +1861,30 @@ unsafe fn pump_reply_recv4(
     reply_r2: u64,
     reply_r3: u64,
 ) -> PumpMessage {
-    if !shared_pump::reply(ch, reply_cap, reply_msginfo, [reply_r0, reply_r1, reply_r2, reply_r3]) {
+    pump_reply_recv4_traced(ch, reply_cap, reply_msginfo, reply_r0, reply_r1, reply_r2, reply_r3, None)
+}
+
+unsafe fn pump_reply_recv4_traced(
+    ch: &PumpChannel,
+    reply_cap: u64,
+    reply_msginfo: u64,
+    reply_r0: u64,
+    reply_r1: u64,
+    reply_r2: u64,
+    reply_r3: u64,
+    power_report_badge: Option<u64>,
+) -> PumpMessage {
+    if let Some(badge) = power_report_badge {
+        crate::driver_launch::trace_report_rpc(b"reply-send", reply_cap, badge, reply_r0 as u32 as i32, reply_r1);
+    }
+    let sent = shared_pump::reply(ch, reply_cap, reply_msginfo, [reply_r0, reply_r1, reply_r2, reply_r3]);
+    if let Some(badge) = power_report_badge {
+        crate::driver_launch::trace_report_rpc(
+            if sent { &b"reply-accepted"[..] } else { &b"reply-refused"[..] },
+            reply_cap, badge, reply_r0 as u32 as i32, reply_r1,
+        );
+    }
+    if !sent {
         return PumpMessage::transport_wall();
     }
     if shared_pump::autonomous(ch) {
@@ -4293,16 +4316,20 @@ unsafe fn component_pump_loop(
                         ch, msg.m0, msg.m1, msg.m2, msg.m3, *reply_cap, msg.badge,
                     )
                 };
-            pump_reply_recv4_into!(
-                ch,
-                *reply_cap,
-                msg,
-                4,
-                status as u32 as u64,
-                required_len,
-                transfer_token,
-                chunk_len
-            );
+            if msg.m0 == crate::driver_launch::HOSTED_DEVICE_OP_REPORT_POWER_STATE {
+                crate::driver_launch::trace_report_rpc(
+                    b"service-return", *reply_cap, msg.badge, status, required_len,
+                );
+                msg = pump_reply_recv4_traced(
+                    ch, *reply_cap, 4, status as u32 as u64,
+                    required_len, transfer_token, chunk_len, Some(msg.badge),
+                );
+            } else {
+                pump_reply_recv4_into!(
+                    ch, *reply_cap, msg, 4, status as u32 as u64,
+                    required_len, transfer_token, chunk_len
+                );
+            }
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_KE_PULSE_EVENT_LABEL
             && ch.caps.kind == ReqKind::Irp
