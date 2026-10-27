@@ -1334,6 +1334,7 @@ pub const FSD_SERVICE_POWER_SETTING_LABEL: u64 = hosted_driver_power_setting::LA
 pub const FSD_SERVICE_LUID_LABEL: u64 = hosted_driver_luid::LABEL;
 pub const FSD_SERVICE_KMUTEX_LABEL: u64 = hosted_driver_kmutex::LABEL;
 pub const FSD_SERVICE_GUARDED_MUTEX_LABEL: u64 = hosted_driver_guarded_mutex::LABEL;
+pub const FSD_SERVICE_WMI_LABEL: u64 = hosted_driver_wmi::LABEL;
 pub const FSD_SERVICE_FRAME_CHAIN_LABEL: u64 = hosted_driver_frame_capture::LABEL;
 const _: () = {
     let labels = [
@@ -1356,7 +1357,6 @@ const _: () = {
         FSD_SERVICE_LOWER_FILE_FORWARD_LABEL,
         FSD_SERVICE_LOWER_POWER_FORWARD_LABEL,
         FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL,
-pub const FSD_SERVICE_WMI_LABEL: u64 = hosted_driver_wmi::LABEL;
         FSD_SERVICE_SCSI_FORWARD_LABEL,
         FSD_SERVICE_REMOVE_DPC_LABEL,
         FSD_SERVICE_ZW_UNLOAD_DRIVER_LABEL,
@@ -1384,6 +1384,7 @@ pub const FSD_SERVICE_WMI_LABEL: u64 = hosted_driver_wmi::LABEL;
         FSD_SERVICE_LUID_LABEL,
         FSD_SERVICE_KMUTEX_LABEL,
         FSD_SERVICE_GUARDED_MUTEX_LABEL,
+        FSD_SERVICE_WMI_LABEL,
         FSD_SERVICE_FRAME_CHAIN_LABEL,
         FSD_SERVICE_PCI_ROOT_LABEL,
         FSD_SERVICE_BUS_INTERFACE_LABEL,
@@ -1407,7 +1408,6 @@ pub const FSD_SERVICE_WMI_LABEL: u64 = hosted_driver_wmi::LABEL;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_VIDEO_FIND_ADAPTER: u64 = u64::MAX - 0x775;
-        FSD_SERVICE_WMI_LABEL,
 pub const FSD_DISPATCH_VIDEO_ADD_DEVICE: u64 = u64::MAX - 0x778;
 pub const FSD_DISPATCH_PROVIDER_EXPORT: u64 = u64::MAX - 0x779;
 pub const FSD_DISPATCH_PROVIDER_CALLBACK: u64 = u64::MAX - 0x77A;
@@ -35448,6 +35448,7 @@ fn register_fsd_trampolines() -> bool {
         "IoWMIQueryAllData",
         hosted_wmi::query_all_data as *const () as usize as u64,
     );
+    hosted_driver_wmi::bind(reg);
     reg.bind(
         "IoInvalidateDeviceRelations",
         s_io_invalidate_device_relations as *const () as usize as u64,
@@ -35893,7 +35894,6 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "RtlFindUnicodePrefix",
         s_rtl_find_unicode_prefix as *const () as usize as u64,
-    hosted_driver_wmi::bind(reg);
     );
     reg.bind(
         "RtlRemoveUnicodePrefix",
