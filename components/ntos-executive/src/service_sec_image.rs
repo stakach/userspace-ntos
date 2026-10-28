@@ -5871,6 +5871,33 @@ unsafe fn redrive_nested_hosted_input_work() -> bool {
     start || connect || hook
 }
 
+/// Admit a nested pump only when a local runner can advance. Keep this gate beside the
+/// runners; a later runner is rechecked after earlier work changes its readiness.
+pub(crate) unsafe fn nested_hosted_file_work_ready() -> bool {
+    let input = crate::driver_launch::nested_hosted_start_fdo_ready()
+        || crate::driver_launch::nested_hosted_connect_forward_ready()
+        || crate::driver_launch::nested_hosted_hook_forward_ready();
+    if SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) == 0 {
+        return input;
+    }
+    input
+        || crate::driver_launch::nested_hosted_driver_create_ready()
+        || crate::driver_launch::nested_hosted_query_path_ready()
+        || crate::driver_launch::nested_hosted_internal_control_ready()
+        || crate::driver_launch::nested_hosted_write_ready()
+        || crate::driver_launch::nested_hosted_read_ready()
+        || crate::driver_launch::nested_hosted_flush_ready()
+        || crate::driver_launch::nested_hosted_query_information_ready()
+        || crate::driver_launch::nested_hosted_lower_pnp_ready()
+        || crate::driver_launch::nested_hosted_lower_file_ready()
+        || crate::driver_launch::nested_hosted_kernel_file_read_query_ready()
+        || crate::driver_launch::nested_hosted_win32k_async_read_ready()
+        || crate::driver_launch::nested_hosted_file_lifecycle_work_ready()
+        || crate::hosted_routed_file_close_work::nested_work_ready()
+        || crate::driver_launch::nested_win32k_source_work_ready()
+        || crate::provider_section_broker::nested_work_ready()
+}
+
 /// Run locally ready retained work while the exact parent invocation is parked. The File
 /// handler is required only by runners that actually borrow it across their local step.
 pub(crate) unsafe fn redrive_nested_hosted_file_work() -> bool {

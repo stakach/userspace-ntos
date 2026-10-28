@@ -139,24 +139,7 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: b
         if progressed && crate::registry_mutation_work::wake_due(crate::monotonic_time_100ns()) != 0 {
             continue;
         }
-        let connect_ready = crate::driver_launch::nested_hosted_connect_forward_ready();
-        if crate::driver_launch::nested_hosted_driver_create_ready()
-            || crate::driver_launch::nested_hosted_query_path_ready()
-            || crate::driver_launch::nested_hosted_internal_control_ready()
-            || crate::driver_launch::nested_hosted_write_ready()
-            || crate::driver_launch::nested_hosted_read_ready()
-            || crate::driver_launch::nested_hosted_flush_ready()
-            || crate::driver_launch::nested_hosted_query_information_ready()
-            || crate::driver_launch::nested_hosted_lower_pnp_ready()
-            || crate::driver_launch::nested_hosted_start_fdo_ready()
-            || connect_ready
-            || crate::driver_launch::nested_hosted_hook_forward_ready()
-            || crate::driver_launch::nested_hosted_kernel_file_read_query_ready()
-            || crate::driver_launch::nested_hosted_win32k_async_read_ready()
-            || crate::hosted_routed_file_close_work::nested_work_ready()
-            || crate::driver_launch::nested_hosted_file_lifecycle_work_ready()
-            || crate::driver_launch::nested_win32k_source_work_ready()
-            || crate::provider_section_broker::nested_work_ready() {
+        if crate::service_sec_image::nested_hosted_file_work_ready() {
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             let mut parent = match runtime::nested::park_current() {
                 Ok(parent) => parent,
