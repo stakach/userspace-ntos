@@ -28,9 +28,13 @@ fn kernel_only_driver_profile_does_not_use_desktop_milestone_stall_termination()
                 excluded: bool,
             }
             impl<'ast> Visit<'ast> for Condition {
-                fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
-                    self.budget |= path.path.is_ident("STALL_BUDGET_100NS");
-                    syn::visit::visit_expr_path(self, path);
+                fn visit_expr_binary(&mut self, binary: &'ast syn::ExprBinary) {
+                    if matches!(binary.op, syn::BinOp::Ge(_))
+                        && matches!(&*binary.right, syn::Expr::Path(path) if path.path.is_ident("STALL_BUDGET_100NS"))
+                    {
+                        self.budget = true;
+                    }
+                    syn::visit::visit_expr_binary(self, binary);
                 }
                 fn visit_expr(&mut self, expression: &'ast syn::Expr) {
                     self.excluded |= kernel_only_cfg(expression, true);
