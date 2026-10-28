@@ -585,7 +585,9 @@ pub(super) unsafe fn redrive() {
             trace_connect_live(10, work.source.source_irp_address(), u64::from(work.source_acknowledged), 0);
         }
         if work.source_acknowledged {
-            work.port_acknowledged = match work.port.phase() {
+            // A nested ACK can finish while this caller is parked in the provider ACK.
+            // Preserve the completed ownership transition across the older retry.
+            work.port_acknowledged |= match work.port.phase() {
                 hosted_input_connect_dispatch::PortConnectPhase::Prepared
                 | hosted_input_connect_dispatch::PortConnectPhase::Rejected(_) => true,
                 _ => work.port.acknowledge_after_source_completion(&work.source).is_ok(),
