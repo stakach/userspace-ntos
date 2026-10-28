@@ -17,11 +17,12 @@ fn retained_internal_control_runs_during_nested_driver_activation() {
     assert!(nested_sweep.contains("nested_hosted_internal_control_ready()"));
     assert!(nested_sweep.contains("redrive_nested_hosted_internal_control(handler)"));
 
-    let nested_pump = PUMP
-        .split("nested_hosted_query_path_ready()")
+    assert!(PUMP.contains("service_sec_image::nested_hosted_file_work_ready()"));
+    let nested_pump = SERVICE
+        .split("pub(crate) unsafe fn nested_hosted_file_work_ready()")
         .nth(1)
         .expect("nested pump readiness checks")
-        .split("let _message = crate::ipc_message::SavedMessageBuffer::capture()")
+        .split("pub(crate) unsafe fn redrive_nested_hosted_file_work()")
         .next()
         .expect("end of readiness checks");
     assert!(nested_pump.contains("nested_hosted_internal_control_ready()"));
