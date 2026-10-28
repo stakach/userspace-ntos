@@ -111,10 +111,11 @@ mod hosted_exception_images;
 mod hosted_zw_load_driver;
 #[path = "hosted_zw_enumerate_value_key.rs"]
 mod hosted_zw_enumerate_value_key;
-use hosted_zw_enumerate_value_key::HOSTED_REGISTRY_OP_ENUMERATE_VALUE;
 #[path = "hosted_zw_query_key.rs"]
 mod hosted_zw_query_key;
-use hosted_zw_query_key::HOSTED_REGISTRY_OP_QUERY_KEY;
+#[path = "hosted_registry_opcodes.rs"]
+mod hosted_registry_opcodes;
+use hosted_registry_opcodes::*;
 #[path = "hosted_driver_interface_registry.rs"]
 pub(crate) mod hosted_driver_interface_registry;
 #[path = "hosted_device_object_pointer.rs"]
@@ -6155,25 +6156,8 @@ const HOSTED_REGISTRY_ARG_DATA_OFF: u64 =
     HOSTED_REGISTRY_ARG_VALUE_OFF + HOSTED_REGISTRY_PATH_MAX as u64;
 const HOSTED_REGISTRY_ARG_DATA_CAP: u64 = HOSTED_REGISTRY_VALUE_SCRATCH_MAX as u64;
 const _: () = assert!(HOSTED_REGISTRY_ARG_DATA_OFF + HOSTED_REGISTRY_ARG_DATA_CAP <= FSD_ARG_BYTES);
-const HOSTED_REGISTRY_OP_OPEN_RELATIVE_KEY: u64 = 1;
-const HOSTED_REGISTRY_OP_OPEN_DEVICE_KEY: u64 = 2;
-const HOSTED_REGISTRY_OP_CLOSE: u64 = 3;
-const HOSTED_REGISTRY_OP_ENUMERATE_KEY: u64 = 4;
-const HOSTED_REGISTRY_OP_QUERY_HANDLE_VALUE: u64 = 5;
-const HOSTED_REGISTRY_OP_QUERY_PATH_VALUE: u64 = 6;
-const HOSTED_REGISTRY_OP_SET_HANDLE_VALUE: u64 = 7;
-const HOSTED_REGISTRY_OP_CREATE_RELATIVE_KEY: u64 = 8;
-const HOSTED_REGISTRY_OP_BEGIN_SET_HANDLE_VALUE: u64 = 9;
-const HOSTED_REGISTRY_OP_APPEND_SET_HANDLE_VALUE: u64 = 10;
-const HOSTED_REGISTRY_OP_COMMIT_SET_HANDLE_VALUE: u64 = 11;
-const HOSTED_REGISTRY_OP_ABORT_SET_HANDLE_VALUE: u64 = 12;
-const HOSTED_REGISTRY_OP_DELETE_HANDLE_VALUE: u64 = 13;
 #[path = "driver_registry_deferred_value.rs"]
 mod driver_registry_deferred_value;
-const HOSTED_REGISTRY_OP_PUBLISH_HANDLE: u64 = 14;
-const HOSTED_REGISTRY_OP_ABORT_PUBLICATION: u64 = 15;
-const HOSTED_REGISTRY_OP_OPEN_INTERFACE_KEY: u64 = 16;
-const HOSTED_REGISTRY_OP_REGISTER_INTERFACE: u64 = 17;
 const REG_OPTION_VOLATILE: u32 = 0x0000_0001;
 const REG_CREATED_NEW_KEY: u32 = 1;
 const REG_OPENED_EXISTING_KEY: u32 = 2;

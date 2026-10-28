@@ -3,8 +3,6 @@
 
 use super::*;
 
-pub(super) const HOSTED_REGISTRY_OP_QUERY_KEY: u64 = 17;
-
 /// The enclosing registry broker has authenticated the physical call, native
 /// caller, and retained Reply. Only a copied information buffer crosses back
 /// into the component's shared argument frame.
