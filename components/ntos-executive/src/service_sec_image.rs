@@ -9904,6 +9904,11 @@ pub(crate) unsafe fn service_sec_image(
                     let snapshot = deferral.unwrap();
                     trace_progress_stall_deferral(snapshot, &nt_handler, crash_parked, wait_parked);
                     last_progress_t = now;
+                } else if nt_handler.grant_installer_inf_progress(ep, now, STALL_BUDGET_100NS) {
+                    print_str(b"[quiesce] deferring installer INF traversal grant=");
+                    print_u64(nt_handler.installer_inf_grants() as u64);
+                    print_str(b"/2\n");
+                    last_progress_t = now;
                 } else {
                     dump_lsa_readiness_quiesce(
                         &nt_handler,

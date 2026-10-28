@@ -98,6 +98,8 @@ pub(crate) mod private_residency;
 
 #[path = "exec_registry_value_name.rs"]
 mod registry_value_name;
+#[path = "exec_installer_progress.rs"]
+mod installer_progress;
 
 #[path = "exec_virtual_memory_protect.rs"]
 mod virtual_memory_protect;
@@ -4074,6 +4076,7 @@ impl ExecNtHandler {
             registry_value_copy_provenance,
             RegistryValueCopyProvenanceTable::with_capacity(64)
         );
+        write_field!(installer_progress, None);
         write_field!(registry_machine_root_security_descriptor, root_security.machine);
         write_field!(registry_user_root_security_descriptor, root_security.user);
         write_field!(time_zone_information, time_zone_information);

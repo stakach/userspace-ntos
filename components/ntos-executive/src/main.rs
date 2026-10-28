@@ -23214,6 +23214,9 @@ struct ExecNtHandler {
     /// Manager install the destination as a same-hive shared payload when the pointer/length/type
     /// still match and the user buffer validates byte-for-byte.
     registry_value_copy_provenance: RegistryValueCopyProvenanceTable,
+    installer_progress: Option<nt_hosted_runtime::InstallerProgressDeferral<
+        nt_user_host::process_identity::ProcessIdentity,
+    >>,
     /// Security descriptors for virtual registry namespace roots. `\Registry\Machine` and
     /// `\Registry\User` are CM namespace sentinels, not hive cells and not overlay keys, but
     /// security queries/updates still target their handle identity.

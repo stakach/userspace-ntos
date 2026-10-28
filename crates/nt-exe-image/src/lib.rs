@@ -1877,6 +1877,47 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_service_observation_preserves_registered_role() {
+        let boot = boot_owned_catalog();
+        let mut catalog = OwnedHostedImageCatalog::<9>::new();
+        for image in boot.entries {
+            if !image.leaf().is_empty() {
+                catalog.register(image).unwrap();
+            }
+        }
+        let target = SpawnTarget::from_image(catalog.get_by_pi(3).unwrap());
+        let observation = catalog.capture_image_observation(target).unwrap();
+        let service_pi = catalog
+            .admit_dynamic_executable_observed(
+                b"services.exe",
+                HostedProcessRole::Application,
+                b"\\SystemRoot\\System32\\services.exe",
+                b"\\SystemRoot\\System32\\services.exe",
+                HostedImageRoot::System32,
+                Some(observation),
+                DYNAMIC_PROCESS_FIRST_PI + 2,
+            )
+            .unwrap();
+        let service = catalog.get_by_pi(service_pi).unwrap();
+        assert_eq!(service.role, HostedProcessRole::Application);
+        assert_eq!(service.observation_role(), HostedProcessRole::ServiceControlManager);
+        assert!(service.observation_role().is_noninteractive_service_class());
+
+        let ordinary_pi = catalog
+            .admit_dynamic_executable(
+                b"ordinary.exe",
+                HostedProcessRole::Application,
+                b"\\SystemRoot\\System32\\ordinary.exe",
+                b"\\SystemRoot\\System32\\ordinary.exe",
+                HostedImageRoot::System32,
+                DYNAMIC_PROCESS_FIRST_PI + 2,
+            )
+            .unwrap();
+        let ordinary = catalog.get_by_pi(ordinary_pi).unwrap();
+        assert!(!ordinary.observation_role().is_noninteractive_service_class());
+    }
+
+    #[test]
     fn owned_catalog_admits_repeated_dynamic_executable_instances() {
         let mut catalog = OwnedHostedImageCatalog::<3>::new();
         let first = catalog

@@ -426,6 +426,7 @@ impl ExecNtHandler {
             Err(status) => {
                 if status == STATUS_OBJECT_NAME_NOT_FOUND {
                     self.note_registry_open_miss(&state.path);
+                    self.note_completed_installer_inf_probe(&state.path, status);
                 }
                 crate::registry_security_audit::admission_error(
                     b"open", &state.path, status, self.pi, self.current_tid,
