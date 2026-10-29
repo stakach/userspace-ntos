@@ -2139,9 +2139,9 @@ where
     C: AsRef<str>,
 {
     let bus_pdo = driver_launch::hosted_bus_reported_device_id(devnode.instance_id);
-    let relation_pending = bus_pdo.is_none() && driver_launch::hosted_bus_relation_pending();
-
-    if bus_pdo.is_none() && relation_pending {
+    let relation_pending = (bus_pdo.is_none() && driver_launch::hosted_bus_relation_pending())
+        || driver_launch::hosted_relation_cm_writer_pending();
+    if relation_pending {
         return HostedPnpDevnodeProgress::BusRelationPending { require_accepted_bus_pdo };
     }
     let prepared = match prepare_current_hosted_devnode(

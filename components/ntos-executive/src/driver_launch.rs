@@ -53005,6 +53005,28 @@ pub(crate) unsafe fn hosted_bus_relation_pending() -> bool {
         || (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).is_some()
 }
 
+/// AddDevice may synchronously register an interface through the shared CM writer. A
+/// different relation can own that writer from BEGIN through exact acknowledgement even
+/// when this devnode's PDO is already accepted. A submitted BEGIN with a lost reply is
+/// retained as possible authority until its outcome is resolved.
+pub(crate) unsafe fn hosted_relation_cm_writer_pending() -> bool {
+    let Some(query) = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).as_ref() else {
+        return false;
+    };
+    let Some(publication) = query.publication.as_ref() else {
+        return false;
+    };
+    (publication.attempt.as_ref().is_some_and(|attempt| attempt.was_submitted())
+        || publication.preparation.is_some()
+        || publication.prepared.is_some()
+        || publication.receipt.is_some()
+        || publication.abort_receipt.is_some())
+        && !matches!(
+            publication.phase,
+            HostedRelationPublicationPhase::ReleaseBus | HostedRelationPublicationPhase::Published
+        )
+}
+
 pub(crate) unsafe fn hosted_pnp_relation_progress(
     refresh: HostedPnpRelationRefresh,
 ) -> HostedPnpRelationProgress {

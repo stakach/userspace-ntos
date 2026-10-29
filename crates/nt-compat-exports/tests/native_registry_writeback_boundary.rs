@@ -670,6 +670,28 @@ fn hosted_relation_budget_edge_finishes_catalog_before_yield() {
 }
 
 #[test]
+fn config_child_start_waits_for_retained_relation_writer_release() {
+    let driver = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    let gate = source_block(driver, "pub(crate) unsafe fn hosted_relation_cm_writer_pending(");
+    assert!(gate.contains("HOSTED_DEVICE_RELATION_QUERY")
+        && gate.contains("was_submitted()")
+        && gate.contains("preparation.is_some()")
+        && gate.contains("prepared.is_some()")
+        && gate.contains("receipt.is_some()")
+        && gate.contains("HostedRelationPublicationPhase::ReleaseBus"),
+        "a submitted relation BEGIN may own the shared CM writer through release");
+
+    let start = include_str!("../../../components/ntos-executive/src/hosted_pnp_start.rs");
+    let one = source_block(start, "unsafe fn start_one_devnode<");
+    let gate_call = one.find("hosted_relation_cm_writer_pending(")
+        .expect("config child start must consult the shared CM writer owner");
+    let prepare = one.find("prepare_current_hosted_devnode(")
+        .expect("child start must retain normal resource preparation");
+    assert!(gate_call < prepare && one.contains("HostedPnpDevnodeProgress::BusRelationPending"),
+        "the config PnP batch must retain the child before AddDevice enters CM");
+}
+
+#[test]
 fn hosted_relation_v2_wal_barriers_precede_local_publication_and_ack() {
     let helper = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"), "/../../components/ntos-executive/src/hosted_relation_publication.rs"
