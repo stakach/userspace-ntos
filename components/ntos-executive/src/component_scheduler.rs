@@ -79,19 +79,10 @@ impl ComponentSchedulerScope {
         let timer_work = crate::dispatcher_bootstrap::service_hosted_timer_work();
         let irq_lines = drain_pending_hosted_irqs_snapshot();
         let dpcs = drain_hosted_driver_dpcs();
-        // A hosted IRP may be waiting for a provider registry write whose exact native
-        // header/WAL command cannot wait for the outer service loop. The parent is parked;
-        // execute one block command through its separate retained provider owner.
-        let native_blocks = crate::driver_launch::service_mounted_native_blocks();
         // Nested exchanges may reconcile earlier requests before these effects publish new demand.
         crate::dispatcher_bootstrap::request_receive_checkpoint();
         crate::dispatcher_bootstrap::prepare_receive()
             .expect("bootstrap timer admission failed before retained receive");
-        // A nested call can observe a sector claimed by its parked parent before that parent
-        // publishes PENDING. Only a completed native service turn may rearm from its final state.
-        if !crate::driver_launch::mounted_native_block_service_active() {
-            crate::service_sec_image::rearm_registered_active_delay_timer();
-        }
         if yield_number <= 16 {
             // Report canonical demand after the actual receive checkpoint.
             let deadline = crate::dispatcher_bootstrap::next_deadline(crate::nt_time_snapshot());
@@ -105,8 +96,6 @@ impl ComponentSchedulerScope {
             print_u64(irq_lines);
             print_str(b" dpcs=");
             print_u64(dpcs);
-            print_str(b" native-blocks=");
-            print_u64(native_blocks as u64);
             match deadline {
                 Ok(Some((target, source))) => {
                     print_str(b" bootstrap-deadline=");
