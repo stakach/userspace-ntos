@@ -96,3 +96,36 @@ fn unused_capture_can_be_retired_but_entered_dispatch_cannot() {
     entered.enter_window().unwrap();
     assert!(entered.abort_ready().is_err());
 }
+
+#[test]
+fn syscall_output_page_waits_for_exact_provider_ack_before_writing_or_replying() {
+    let mut output_page = [0xa5; 4];
+    let mut replied = false;
+    let mut read = RoutedImageRead::<_, u64, _>::new_at(
+        (17, 29), 0x31_000, 4, 4, String::from("captured File and Section"),
+    )
+    .unwrap();
+    assert_eq!(read.enter_window(), Some(ImageReadWindow { offset: 0x31_000, length: 4 }));
+    assert!(read.bind_pending(41));
+    assert!(read.terminal(41, 0, 4));
+    assert!(read.copy_fragment(41, 0, b"data"));
+    // Completing the provider IRP is not an acknowledgement and must not release the
+    // source capture or permit the syscall output page to be written.
+    assert_eq!(read.acknowledgment_key(), Some(41));
+    assert_eq!(read.terminal_result(), None);
+    assert_eq!(output_page, [0xa5; 4]);
+    assert!(!replied);
+    read = read.into_terminal().err().unwrap();
+    assert!(!read.acknowledge(42));
+    assert_eq!(read.owner(), "captured File and Section");
+    assert_eq!(output_page, [0xa5; 4]);
+    assert!(!replied);
+
+    assert!(read.acknowledge(41));
+    let (owner, bytes) = read.into_terminal().ok().unwrap();
+    assert_eq!(owner, "captured File and Section");
+    output_page.copy_from_slice(&bytes.unwrap());
+    replied = true;
+    assert_eq!(&output_page, b"data");
+    assert!(replied);
+}
