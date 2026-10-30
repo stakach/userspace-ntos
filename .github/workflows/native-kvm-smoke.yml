@@ -2,6 +2,12 @@ name: Native x86 KVM smoke
 
 on:
   workflow_dispatch:
+    inputs:
+      boot_seconds:
+        description: Bounded guest runtime in seconds
+        type: choice
+        default: '180'
+        options: ['180', '1200', '3600']
   push:
     branches: [codex/libernt-userspace]
     paths: [.github/workflows/native-kvm-smoke.yml, scripts/ci_kvm_smoke.py]
@@ -102,7 +108,7 @@ jobs:
           GRAPHICS: '1'
           QEMU_MEMORY: 3072M
           QEMU_CPUS: '4'
-        run: python3 scripts/ci_kvm_smoke.py --seconds 180 --trace-interrupts
+        run: python3 scripts/ci_kvm_smoke.py --seconds "${{ inputs.boot_seconds || '180' }}" --trace-interrupts
       - name: Upload native build and startup evidence
         if: always()
         uses: actions/upload-artifact@v4
