@@ -5,6 +5,7 @@ use super::*;
 #[derive(Debug)]
 pub(crate) struct PendingInitialThreadCreation {
     plan: nt_process::InitialThreadCreationPlan,
+    progress: nt_user_host::initial_creation_progress::InitialCreationProgress,
     handle: Option<nt_process::HandleReservation>,
     bound: bool,
     origin: InitialCreationOrigin,
@@ -321,6 +322,9 @@ unsafe fn cancel_creation(handler: &mut ExecNtHandler, binding: Binding, status:
     let Some(owner) = slot.as_mut() else {
         return nt_process::STATUS_DEVICE_BUSY;
     };
+    if !owner.progress.may_cancel_no_effects() {
+        return nt_process::STATUS_DEVICE_BUSY;
+    }
     if let Some(handle) = owner.handle {
         let result = if owner.bound {
             handler.pm.cancel_bound_handle(handle).map(|_| ())
@@ -337,6 +341,87 @@ unsafe fn cancel_creation(handler: &mut ExecNtHandler, binding: Binding, status:
     }
     *slot = None;
     status
+}
+
+/// Advance only the uncommitted effect. Each acknowledged boundary is recorded before the
+/// next effect, so a failed Ps commit or handle publication cannot restart the physical TCB.
+unsafe fn advance_initial_creation(
+    handler: &mut ExecNtHandler,
+    binding: Binding,
+    create_suspended: bool,
+) -> Result<(), u32> {
+    use nt_user_host::initial_creation_progress::InitialCreationStep;
+    let target = runtime(handler, binding).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let slot = target.initial_creation.try_borrow().map_err(|_| nt_process::STATUS_DEVICE_BUSY)?;
+    let owner = slot.as_ref().ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let lifetime = owner.plan.lifetime();
+    let step = owner.progress.next_step();
+    drop(slot);
+    match step {
+        InitialCreationStep::StartPhysical => {
+            let result = crate::thread_suspend::create_initial_thread(
+                handler, lifetime, create_suspended, binding,
+            );
+            match result {
+                crate::thread_suspend::InitialThreadStartOutcome::Committed => {
+                    runtime(handler, binding).ok_or(nt_process::STATUS_DEVICE_BUSY)?
+                        .initial_creation.borrow_mut().as_mut()
+                        .expect("acknowledged initial owner retained")
+                        .progress.physical_started()
+                        .expect("physical start recorded once");
+                }
+                crate::thread_suspend::InitialThreadStartOutcome::RefusedNoEffects(status) => {
+                    return Err(cancel_creation(handler, binding, status));
+                }
+                crate::thread_suspend::InitialThreadStartOutcome::Retained(status) => {
+                    runtime(handler, binding).ok_or(nt_process::STATUS_DEVICE_BUSY)?
+                        .initial_creation.borrow_mut().as_mut()
+                        .expect("uncertain initial owner retained")
+                        .progress.physical_indeterminate()
+                        .expect("physical uncertainty recorded once");
+                    return Err(status);
+                }
+            }
+        }
+        InitialCreationStep::PhysicalIndeterminate => {
+            let result = crate::thread_suspend::resolve_initial_thread_start(
+                handler, lifetime, binding,
+            );
+            match result {
+                crate::thread_suspend::InitialThreadStartOutcome::Committed => {
+                    runtime(handler, binding).ok_or(nt_process::STATUS_DEVICE_BUSY)?
+                        .initial_creation.borrow_mut().as_mut()
+                        .expect("resolved initial owner retained")
+                        .progress.physical_resolved()
+                        .expect("physical result resolved once");
+                }
+                crate::thread_suspend::InitialThreadStartOutcome::RefusedNoEffects(status) => {
+                    runtime(handler, binding).ok_or(nt_process::STATUS_DEVICE_BUSY)?
+                        .initial_creation.borrow_mut().as_mut()
+                        .expect("refused initial owner retained")
+                        .progress.physical_refused_no_effects()
+                        .expect("no-effects rejection certified once");
+                    return Err(cancel_creation(handler, binding, status));
+                }
+                crate::thread_suspend::InitialThreadStartOutcome::Retained(status) => {
+                    return Err(status);
+                }
+            }
+        }
+        InitialCreationStep::CommitPs | InitialCreationStep::PublishHandle => {}
+    }
+    let target = (&*handler.thread_runtime.table).entries.iter()
+        .filter_map(|slot| slot.owner())
+        .find(|owner| owner.binding() == binding)
+        .ok_or(nt_process::STATUS_DEVICE_BUSY)?;
+    let mut slot = target.initial_creation.try_borrow_mut()
+        .map_err(|_| nt_process::STATUS_DEVICE_BUSY)?;
+    let owner = slot.as_mut().ok_or(nt_process::STATUS_DEVICE_BUSY)?;
+    if owner.progress.next_step() == InitialCreationStep::CommitPs {
+        handler.pm.commit_initial_thread_creation(&owner.plan)?;
+        owner.progress.ps_committed().expect("Ps commit recorded once");
+    }
+    Ok(())
 }
 
 impl ExecNtHandler {
@@ -385,6 +470,7 @@ impl ExecNtHandler {
             );
             *slot = Some(PendingInitialThreadCreation {
                 plan,
+                progress: nt_user_host::initial_creation_progress::InitialCreationProgress::new(),
                 handle: None,
                 bound: false,
                 origin: InitialCreationOrigin::Configured,
@@ -410,29 +496,9 @@ impl ExecNtHandler {
         }
         let lifetime = owner.plan.lifetime();
         drop(slot);
-        match crate::thread_suspend::create_initial_thread(self, lifetime, false, binding) {
-            crate::thread_suspend::InitialThreadStartOutcome::Committed => {}
-            crate::thread_suspend::InitialThreadStartOutcome::RefusedNoEffects(status) => {
-                return cancel_creation(self, binding, status);
-            }
-            crate::thread_suspend::InitialThreadStartOutcome::Retained(status) => return status,
-        }
-        {
-            let table = &*self.thread_runtime.table;
-            let runtime = table
-                .entries
-                .iter()
-                .filter_map(|slot| slot.owner())
-                .find(|owner| owner.binding() == binding)
-                .expect("acknowledged configured initial runtime retained");
-            let mut slot = runtime.initial_creation.borrow_mut();
-            let owner = slot.as_ref().expect("configured creation receipt retained");
-            if let Err(status) = self.pm.commit_initial_thread_creation(&owner.plan) {
-                return status;
-            }
-            *slot = None;
-            drop(slot);
-        }
+        if let Err(status) = advance_initial_creation(self, binding, false) { return status; }
+        runtime(self, binding).expect("committed configured runtime retained")
+            .initial_creation.borrow_mut().take();
         trace_created(lifetime, false);
         0
     }
@@ -522,6 +588,7 @@ impl ExecNtHandler {
             );
             *slot = Some(PendingInitialThreadCreation {
                 plan,
+                progress: nt_user_host::initial_creation_progress::InitialCreationProgress::new(),
                 handle: None,
                 bound: false,
                 origin: InitialCreationOrigin::Foreign(origin),
@@ -559,14 +626,8 @@ impl ExecNtHandler {
         let caller_pid = origin.caller.process.pid;
         let create_suspended = origin.create_suspended;
         if delivery == InitialCreationDelivery::Abandoned {
-            match crate::thread_suspend::create_initial_thread(
-                self, lifetime, create_suspended, binding,
-            ) {
-                crate::thread_suspend::InitialThreadStartOutcome::Committed => {}
-                crate::thread_suspend::InitialThreadStartOutcome::RefusedNoEffects(status) => {
-                    return cancel_creation(self, binding, status);
-                }
-                crate::thread_suspend::InitialThreadStartOutcome::Retained(status) => return status,
+            if let Err(status) = advance_initial_creation(self, binding, create_suspended) {
+                return status;
             }
             {
                 let table = &*self.thread_runtime.table;
@@ -574,9 +635,15 @@ impl ExecNtHandler {
                     .find(|owner| owner.binding() == binding)
                     .expect("initial creation runtime retained");
                 let mut slot = runtime.initial_creation.borrow_mut();
-                let owner = slot.as_ref().expect("acknowledged initial creation retained");
-                if let Err(status) = self.pm.commit_initial_thread_creation(&owner.plan) {
-                    return status;
+                let owner = slot.as_mut().expect("acknowledged initial creation retained");
+                if let Some(handle) = owner.handle {
+                    let result = if owner.bound {
+                        self.pm.cancel_bound_handle(handle).map(|_| ())
+                    } else {
+                        self.pm.cancel_reserved_handle(handle)
+                    };
+                    if let Err(status) = result { return status; }
+                    owner.handle = None;
                 }
                 *slot = None;
             }
@@ -590,42 +657,29 @@ impl ExecNtHandler {
             || self.capture_process_identity(origin.caller.pi) != Some(origin.caller.process)
         { return nt_process::STATUS_INVALID_HANDLE; }
         let handle_capacity = self.pm.handle_capacity(caller_pid);
-        let handle_reservation = match self.pm.try_reserve_handle_slot(caller_pid) {
-            Ok(reservation) => reservation,
-            Err(status) => return cancel_creation(self, binding, status),
+        let existing_handle = runtime(self, binding)
+            .expect("initial creation runtime retained")
+            .initial_creation.borrow().as_ref().unwrap().handle;
+        let handle_reservation = if let Some(handle) = existing_handle { handle } else {
+            let reservation = match self.pm.try_reserve_handle_slot(caller_pid) {
+                Ok(reservation) => reservation,
+                Err(status) => return cancel_creation(self, binding, status),
+            };
+            runtime(self, binding).expect("initial creation runtime retained")
+                .initial_creation.borrow_mut().as_mut().unwrap().handle = Some(reservation);
+            reservation
         };
-        runtime(self, binding)
-            .expect("initial creation runtime retained")
-            .initial_creation
-            .borrow_mut()
-            .as_mut()
-            .unwrap()
-            .handle = Some(handle_reservation);
-        if let Err(status) = self.pm.bind_reserved_handle(
-            handle_reservation,
-            nt_process::HandleObject::Thread(tid),
-            origin.desired_access,
-        ) {
-            return cancel_creation(self, binding, status);
+        let bound = runtime(self, binding).expect("initial creation runtime retained")
+            .initial_creation.borrow().as_ref().unwrap().bound;
+        if !bound {
+            if let Err(status) = self.pm.bind_reserved_handle(
+                handle_reservation, nt_process::HandleObject::Thread(tid), origin.desired_access,
+            ) { return cancel_creation(self, binding, status); }
+            runtime(self, binding).expect("initial creation runtime retained")
+                .initial_creation.borrow_mut().as_mut().unwrap().bound = true;
         }
-        runtime(self, binding)
-            .expect("initial creation runtime retained")
-            .initial_creation
-            .borrow_mut()
-            .as_mut()
-            .unwrap()
-            .bound = true;
-        match crate::thread_suspend::create_initial_thread(
-            self,
-            lifetime,
-            create_suspended,
-            binding,
-        ) {
-            crate::thread_suspend::InitialThreadStartOutcome::Committed => {}
-            crate::thread_suspend::InitialThreadStartOutcome::RefusedNoEffects(status) => {
-                return cancel_creation(self, binding, status);
-            }
-            crate::thread_suspend::InitialThreadStartOutcome::Retained(status) => return status,
+        if let Err(status) = advance_initial_creation(self, binding, create_suspended) {
+            return status;
         }
         let handle = {
             let table = &*self.thread_runtime.table;
@@ -636,12 +690,7 @@ impl ExecNtHandler {
                 .find(|owner| owner.binding() == binding)
                 .expect("acknowledged initial runtime retained");
             let mut slot = runtime.initial_creation.borrow_mut();
-            let owner = slot
-                .as_ref()
-                .expect("acknowledged initial creation retained");
-            if let Err(status) = self.pm.commit_initial_thread_creation(&owner.plan) {
-                return status;
-            }
+            assert!(slot.is_some(), "acknowledged initial creation retained");
             let handle = match self.pm.publish_reserved_handle(handle_reservation) {
                 Ok(handle) => u64::from(handle),
                 Err(status) => return status,

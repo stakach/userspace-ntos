@@ -28,6 +28,7 @@ mod mechanism;
 mod ntdll;
 mod profile;
 pub mod process_identity;
+pub mod initial_creation_progress;
 pub mod process_observation;
 pub mod desktop_launch;
 pub mod provider_alias_bank;
