@@ -48,10 +48,13 @@ jobs:
           for tool in bsdtar 7zz qemu-system-x86_64 clang cc python3; do
             command -v "$tool"
           done
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src
-          targets: x86_64-pc-windows-gnullvm
+      - name: Install native target-spec compatible nightly
+        run: |
+          # The custom NT target specs were verified with this nightly. The build
+          # scripts invoke +nightly, so link that name to the pinned toolchain.
+          rustup toolchain install nightly-2026-04-30 --profile minimal --component rust-src --target x86_64-pc-windows-gnullvm
+          rustup toolchain link nightly "$(rustc +nightly-2026-04-30 --print sysroot)"
+          rustc +nightly --version
       - name: Stage hive-generator INF input
         run: |
           mkdir -p rust-micro/.tmp/reactos/reactos/inf
