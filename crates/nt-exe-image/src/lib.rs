@@ -8,6 +8,7 @@
 
 mod process_image_layout;
 pub use process_image_layout::ProcessImageLayout;
+pub mod service_group_launch;
 
 pub const MAX_EXE_LEAF: usize = 64;
 pub const MAX_NT_IMAGE_PATH: usize = 192;
