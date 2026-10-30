@@ -767,6 +767,30 @@ impl MountedVolumeBackend {
         Ok((context, binding))
     }
 
+    /// Resolve the File body retained by CREATE, never the path used to open it.
+    fn opened_overlay_file(
+        &self,
+        context: nt_fs::LayeredOpenContextId,
+        binding: MountedBinding,
+        file_id: nt_io_manager::FileId,
+    ) -> Result<u64, NtStatus> {
+        if binding.is_directory {
+            return Err(NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        let nt_fs::LayeredOpenSource::Overlay { file_id: overlay_file } = self
+            .opens
+            .get(context, file_id.raw())
+            .map_err(status)?
+            .source
+        else {
+            return Err(NtStatus::ACCESS_DENIED);
+        };
+        if !binding.overlay_open {
+            return Err(NtStatus::INVALID_HANDLE);
+        }
+        Ok(overlay_file)
+    }
+
     fn read(
         &mut self,
         ctx: DispatchContext<'_>,
@@ -1020,19 +1044,7 @@ impl MountedVolumeBackend {
             return Err(NtStatus::ACCESS_DENIED);
         }
         let file_id = irp.file_id.ok_or(NtStatus::INVALID_PARAMETER)?;
-        let nt_fs::LayeredOpenSource::Overlay {
-            file_id: overlay_file,
-        } = self
-            .opens
-            .get(context, file_id.raw())
-            .map_err(status)?
-            .source
-        else {
-            return Err(NtStatus::ACCESS_DENIED);
-        };
-        if !binding.overlay_open {
-            return Err(NtStatus::INVALID_HANDLE);
-        }
+        let overlay_file = self.opened_overlay_file(context, binding, file_id)?;
         let info =
             unsafe { crate::writable_fs::file_object_information(overlay_file) }.map_err(status)?;
         let synchronous = binding.create_options
@@ -1058,6 +1070,63 @@ impl MountedVolumeBackend {
         Ok(DispatchOutcome::Completed {
             status: status(result),
             information: written as u64,
+            file_context: None,
+        })
+    }
+
+    fn flush(&mut self, irp: &IrpProjection) -> Result<DispatchOutcome, NtStatus> {
+        let (context, binding) = self.binding(irp)?;
+        if !matches!(irp.parameters, IoParameters::FlushBuffers) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        if !nt_fs::file_flush_access_allowed(binding.granted_access, false) {
+            return Err(NtStatus::ACCESS_DENIED);
+        }
+        let file_id = irp.file_id.ok_or(NtStatus::INVALID_PARAMETER)?;
+        let overlay_file = self.opened_overlay_file(context, binding, file_id)?;
+        let result = unsafe { crate::writable_fs::flush(overlay_file) };
+        Ok(DispatchOutcome::Completed {
+            status: status(result),
+            information: 0,
+            file_context: None,
+        })
+    }
+
+    fn set_information(
+        &mut self,
+        ctx: DispatchContext<'_>,
+        irp: &IrpProjection,
+    ) -> Result<DispatchOutcome, NtStatus> {
+        let (context, binding) = self.binding(irp)?;
+        let IoParameters::SetInformation(parameters) = irp.parameters else {
+            return Err(NtStatus::INVALID_PARAMETER);
+        };
+        // EventLog clears a corrupt log with FileEndOfFileInformation. Other classes need
+        // their own target-File and access contracts before they can be routed here.
+        if parameters.info_class != nt_fs::FILE_END_OF_FILE_INFORMATION {
+            return Err(NtStatus::NOT_SUPPORTED);
+        }
+        if parameters.target_file.is_some()
+            || !matches!(parameters.control, nt_io_manager::SetInformationControl::None)
+            || parameters.length != 8
+            || ctx.system_buffer.len() < 8
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let write_access = nt_fs::FILE_WRITE_DATA | 0x4000_0000 | 0x1000_0000;
+        if binding.granted_access & write_access == 0 {
+            return Err(NtStatus::ACCESS_DENIED);
+        }
+        let file_id = irp.file_id.ok_or(NtStatus::INVALID_PARAMETER)?;
+        let overlay_file = self.opened_overlay_file(context, binding, file_id)?;
+        let result = unsafe {
+            crate::writable_fs::set_information(
+                overlay_file, parameters.info_class, &ctx.system_buffer[..8],
+            )
+        };
+        Ok(DispatchOutcome::Completed {
+            status: status(result),
+            information: 0,
             file_context: None,
         })
     }
@@ -1138,6 +1207,8 @@ impl DriverDispatchBackend for MountedVolumeBackend {
             major::IRP_MJ_CREATE => self.create(irp),
             major::IRP_MJ_READ => self.read(ctx, irp),
             major::IRP_MJ_WRITE => self.write(ctx, irp),
+            major::IRP_MJ_FLUSH_BUFFERS => self.flush(irp),
+            major::IRP_MJ_SET_INFORMATION => self.set_information(ctx, irp),
             major::IRP_MJ_QUERY_INFORMATION => self.query(ctx, irp),
             major::IRP_MJ_DIRECTORY_CONTROL => self.query_directory(ctx, irp),
             major::IRP_MJ_CLEANUP => self.cleanup_or_close(irp, false),
