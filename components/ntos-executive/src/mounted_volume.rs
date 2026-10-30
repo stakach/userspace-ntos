@@ -76,7 +76,7 @@ pub(crate) fn release_unentered_mounted_directory_sector(
 
 pub(crate) fn claim_mounted_read_sector() -> Option<crate::mounted_volume_backend::mounted_installed_read::ReadSectorClaim> {
     let queue = unsafe { (&*core::ptr::addr_of!(MOUNT_READ_QUEUE)).as_ref()?.clone() };
-    let claim = queue.borrow_mut().claim_next();
+    let claim = queue.borrow_mut().claim_next_bounded(1);
     claim
 }
 
@@ -86,7 +86,7 @@ pub(crate) fn complete_mounted_read_sector(
 ) -> Result<nt_fs::FatRangeProgress, crate::mounted_volume_backend::mounted_installed_read::ReadError> {
     let queue = unsafe { (&*core::ptr::addr_of!(MOUNT_READ_QUEUE)).as_ref().cloned() }
         .ok_or(crate::mounted_volume_backend::mounted_installed_read::ReadError::Invalid)?;
-    let result = queue.borrow_mut().complete_sector(claim, sector);
+    let result = queue.borrow_mut().complete_sectors(claim, sector.map(|sector| &sector[..]));
     result
 }
 

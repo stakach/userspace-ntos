@@ -12432,27 +12432,47 @@ extern "win64" fn s_dma_free_map_registers(
                     let lease_id = read_unaligned(
                         (adapter + HOSTED_DMA_ADAPTER_LEASE_ID_OFFSET) as *const u64,
                     );
-                    let (reply, status, adapter_reply, logical_reply, length_reply) = call_on5(
-                        (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
-                        lease_id,
-                        HOSTED_DMA_SERVICE_FREE_MAPPING << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
-                        metadata.adapter_id,
-                        logical,
-                        length,
-                    );
-                    if reply >> 12 != 0
-                        || reply & 0x7f != 4
-                        || status as u32 as i32 != STATUS_SUCCESS
-                        || adapter_reply != 0
-                        || logical_reply != 0
-                        || length_reply != 0
-                    {
-                        // A void ABI cannot report an uncertain Free to the caller. Keep the
-                        // record and token live, and stop this provider before either is reused.
-                        crate::provider_bugcheck::report(
-                            0xc4,
-                            [FSD_SERVICE_DMA_ADAPTER_LABEL, lease_id, logical, status],
+                    if let Some((_, identity, _, _, grant)) = hosted_irq_lane_context() {
+                        let mut arguments = [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+                        arguments[..4].copy_from_slice(&[
+                            lease_id, metadata.adapter_id, logical, length,
+                        ]);
+                        let result = hosted_irq_lane_service(nt_hosted_runtime::HostedIrqServiceCommand {
+                            kind: nt_hosted_runtime::HostedIrqServiceKind::DmaFreeMapping,
+                            service_id: FSD_SERVICE_DMA_ADAPTER_LABEL,
+                            target_domain_id: identity.domain_id,
+                            target_domain_cookie: identity.domain_cookie,
+                            authority_cookie: 0,
+                            grant,
+                            argument_count: 4,
+                            arguments,
+                        });
+                        if result.faulted || result.value_count != 0 || result.status != STATUS_SUCCESS {
+                            // This void ABI cannot expose an uncertain release. Retain the
+                            // component record and stop this exact IRQ transaction.
+                            hosted_irq_lane_protocol_fault(lease_id);
+                        }
+                    } else {
+                        let (reply, status, adapter_reply, logical_reply, length_reply) = call_on5(
+                            (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+                            lease_id,
+                            HOSTED_DMA_SERVICE_FREE_MAPPING << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+                            metadata.adapter_id,
+                            logical,
+                            length,
                         );
+                        if reply >> 12 != 0
+                            || reply & 0x7f != 4
+                            || status as u32 as i32 != STATUS_SUCCESS
+                            || adapter_reply != 0
+                            || logical_reply != 0
+                            || length_reply != 0
+                        {
+                            crate::provider_bugcheck::report(
+                                0xc4,
+                                [FSD_SERVICE_DMA_ADAPTER_LABEL, lease_id, logical, status],
+                            );
+                        }
                     }
                     clear_dma_allocation_record(record);
                 }
@@ -12960,16 +12980,42 @@ extern "win64" fn s_io_unregister_file_system(device: u64) {
 }
 
 unsafe fn finish_driver_local_irp(irp: u64) {
-    let (label, begin_status, auxiliary_output_limit, _, _) =
-        call_on4((FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4, 5, irp, 0, 0);
-    if label != 0
-        || (begin_status as u32 as i32 != STATUS_SUCCESS
-            && begin_status as u32 as i32
-                != nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.raw())
+    let (begin_status, auxiliary_output_limit) = if let Some((_, identity, _, _, grant)) =
+        hosted_irq_lane_context()
+    {
+        let mut arguments = [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        arguments[0] = irp;
+        let result = hosted_irq_lane_service(nt_hosted_runtime::HostedIrqServiceCommand {
+            kind: nt_hosted_runtime::HostedIrqServiceKind::BeginLocalIrpCompletion,
+            service_id: FSD_SERVICE_SOURCE_IRP_LABEL,
+            target_domain_id: identity.domain_id,
+            target_domain_cookie: identity.domain_cookie,
+            authority_cookie: 0,
+            grant,
+            argument_count: 1,
+            arguments,
+        });
+        if result.faulted || result.value_count != 1 {
+            hosted_irq_lane_protocol_fault(irp);
+        }
+        (result.status, result.values[0])
+    } else {
+        let (label, status, limit, _, _) =
+            call_on4((FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4, 5, irp, 0, 0);
+        if label != 0 {
+            crate::provider_bugcheck::report(
+                0xc4,
+                [FSD_SERVICE_SOURCE_IRP_LABEL, 5, irp, status],
+            );
+        }
+        (status as u32 as i32, limit)
+    };
+    if begin_status != STATUS_SUCCESS
+        && begin_status != nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.raw()
     {
         crate::provider_bugcheck::report(
             0xc4,
-            [FSD_SERVICE_SOURCE_IRP_LABEL, 5, irp, begin_status],
+            [FSD_SERVICE_SOURCE_IRP_LABEL, 5, irp, begin_status as u32 as u64],
         );
     }
     let status = read_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const i32);
@@ -14625,6 +14671,27 @@ extern "win64" fn s_ke_set_event(event: u64, increment: i32, wait: u8) -> i32 {
     }
     if let Some(previous) = hosted_driver_event_reference::set_if_owned(event) {
         return previous as i32;
+    }
+    if let Some((_, identity, _, _, grant)) = unsafe { hosted_irq_lane_context() } {
+        if increment != 0 || wait != 0 {
+            hosted_irq_lane_protocol_fault(event);
+        }
+        let mut arguments = [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        arguments[0] = event;
+        let result = unsafe { hosted_irq_lane_service(nt_hosted_runtime::HostedIrqServiceCommand {
+            kind: nt_hosted_runtime::HostedIrqServiceKind::SetEvent,
+            service_id: FSD_SERVICE_KE_SET_EVENT_LABEL,
+            target_domain_id: identity.domain_id,
+            target_domain_cookie: identity.domain_cookie,
+            authority_cookie: 0,
+            grant,
+            argument_count: 1,
+            arguments,
+        }) };
+        if result.faulted || result.status != STATUS_SUCCESS || result.value_count != 1 {
+            hosted_irq_lane_protocol_fault(event);
+        }
+        return result.values[0] as u32 as i32;
     }
     let packed = (increment as u32 as u64) | ((wait as u64) << 32);
     let (_label, previous, _, _, _) = unsafe {
@@ -52229,6 +52296,34 @@ unsafe fn free_hosted_dma_mapping_lease(
         .map_err(hosted_dma_status)
 }
 
+/// The IRQ broker authenticates the physical lane, active transaction, and service grant.
+/// Reuse the same exact DMA lease proof as the ordinary provider service before acknowledging
+/// a mapping release to the worker.
+pub(crate) unsafe fn service_hosted_irq_lane_dma_free_mapping(
+    instance_index: usize,
+    domain_id: u64,
+    domain_cookie: u64,
+    lease_id: u64,
+    adapter_id: u64,
+    logical: u64,
+    length: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let inst = instance(instance_index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    let domain = instance_domain_identity(inst).ok_or(nt_status::NtStatus::ACCESS_DENIED)?;
+    if domain.domain_id.raw() != domain_id || domain.cookie != domain_cookie {
+        return Err(nt_status::NtStatus::ACCESS_DENIED);
+    }
+    free_hosted_dma_mapping_lease(
+        instance_index,
+        domain,
+        inst.exec_shared_va,
+        lease_id,
+        adapter_id,
+        logical,
+        length,
+    )
+}
+
 unsafe fn revoke_hosted_dma_adapter_leases(binding: HostedDeviceBinding) {
     let owner = hosted_dma_owner(binding);
     hosted_dma_adapter_leases_mut().retain(|lease| lease.owner != owner);
@@ -65330,6 +65425,37 @@ pub(crate) fn service_hosted_driver_ke_set_event(
         print_str(b"\n");
     }
     previous
+}
+
+/// Signal a live driver event from its authenticated IRQ arena. The event is resolved through
+/// this instance's mapped storage; the IRQ worker's component pointer is never dereferenced as
+/// root authority, and waiters are woken only after the exact event changes state.
+pub(crate) unsafe fn service_hosted_irq_lane_set_event(
+    instance_index: usize,
+    domain_id: u64,
+    domain_cookie: u64,
+    event: u64,
+) -> Result<i32, nt_status::NtStatus> {
+    let inst = instance(instance_index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    let domain = instance_domain_identity(inst).ok_or(nt_status::NtStatus::ACCESS_DENIED)?;
+    if domain.domain_id.raw() != domain_id || domain.cookie != domain_cookie {
+        return Err(nt_status::NtStatus::ACCESS_DENIED);
+    }
+    let exec_event = hosted_driver_wait_object_exec_va(instance_index, inst, None, event)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    if !matches!(read_unaligned(exec_event as *const u8),
+        kevent::EVENT_NOTIFICATION_OBJECT | kevent::EVENT_SYNCHRONIZATION_OBJECT)
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let previous = kevent::kevent_set(exec_event as *mut u8) as i32;
+    let woken = wake_hosted_driver_waiters_for_instance(instance_index);
+    if woken != 0 {
+        print_str(b"[irq-event] woke waiters=");
+        print_u64(woken as u64);
+        print_str(b"\n");
+    }
+    Ok(previous)
 }
 
 unsafe fn apply_hosted_driver_ke_set_timer(

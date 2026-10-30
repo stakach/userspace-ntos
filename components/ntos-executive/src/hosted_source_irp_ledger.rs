@@ -1038,6 +1038,57 @@ pub(super) fn retire_allocation(
     }
 }
 
+fn begin_local_completion(
+    instance_index: usize,
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    component_address: u64,
+) -> (i32, u64, u64) {
+    let _guard = lock();
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    };
+    let Some((ticket, source)) = ledger().registered(
+        SourceIrpOwner::HostedDriver(instance_index),
+        domain,
+        component_address,
+    ) else {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    };
+    let Ok((owner, phase)) = auxiliary().snapshot(ticket, source) else {
+        return (nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.raw(), 0, 0);
+    };
+    if phase != SourceIrpAuxiliaryPhase::Protected
+        || !unsafe { auxiliary_matches_unlocked(instance_index, inst, owner, phase) }
+    {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    }
+    match auxiliary().begin_completion(ticket, source) {
+        Ok(owner) => (
+            STATUS_SUCCESS,
+            owner.transfer_buffer.map_or(0, memory_bytes),
+            ticket.generation.get(),
+        ),
+        Err(_) => (STATUS_INVALID_HANDLE, 0, 0),
+    }
+}
+
+/// Called only after the arena broker authenticated the live IRQ lane and service grant.
+/// The same source ticket, allocation, and auxiliary phase checks govern ordinary callers.
+pub(super) fn begin_irq_local_completion(
+    instance_index: usize,
+    domain_id: u64,
+    domain_cookie: u64,
+    component_address: u64,
+) -> (i32, u64, u64) {
+    let Some(inst) = instance(instance_index) else { return (STATUS_INVALID_HANDLE, 0, 0); };
+    let Some(domain) = instance_domain_identity(inst) else { return (STATUS_INVALID_HANDLE, 0, 0); };
+    if domain.domain_id.raw() != domain_id || domain.cookie != domain_cookie {
+        return (STATUS_ACCESS_DENIED, 0, 0);
+    }
+    begin_local_completion(instance_index, inst, domain, component_address)
+}
+
 /// Commit `IoInitializeIrp`/`IoReuseIrp` in the provider's mapped pool while the
 /// physical allocation and every source owner are serialized. The caller's pointer
 /// selects storage only; exact allocation identity and ownership are rederived here.
@@ -1329,34 +1380,7 @@ pub(super) fn service(
             let Some(_caller) = hosted_driver_caller(instance_index, inst, caller_badge) else {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             };
-            let _guard = lock();
-            let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) })
-            else {
-                return (STATUS_INVALID_HANDLE, 0, 0);
-            };
-            let Some((ticket, source)) = ledger().registered(
-                SourceIrpOwner::HostedDriver(instance_index),
-                domain,
-                component_address,
-            ) else {
-                return (STATUS_INVALID_HANDLE, 0, 0);
-            };
-            let Ok((owner, phase)) = auxiliary().snapshot(ticket, source) else {
-                return (nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.raw(), 0, 0);
-            };
-            if phase != SourceIrpAuxiliaryPhase::Protected
-                || !unsafe { auxiliary_matches_unlocked(instance_index, inst, owner, phase) }
-            {
-                return (STATUS_INVALID_HANDLE, 0, 0);
-            }
-            match auxiliary().begin_completion(ticket, source) {
-                Ok(owner) => (
-                    STATUS_SUCCESS,
-                    owner.transfer_buffer.map_or(0, memory_bytes),
-                    ticket.generation.get(),
-                ),
-                Err(_) => (STATUS_INVALID_HANDLE, 0, 0),
-            }
+            begin_local_completion(instance_index, inst, domain, component_address)
         }
         2 | 3 if bytes == 0 && stack_count == 0 => {
             let Some(domain) = instance_domain_identity(inst) else {

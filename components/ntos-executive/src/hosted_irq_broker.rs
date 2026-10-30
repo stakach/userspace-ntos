@@ -1444,6 +1444,104 @@ impl HostedIrqRootSession {
         service_result(status, None)
     }
 
+    unsafe fn dma_free_mapping_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let Ok(lane) = self.lane(lane_index) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        if command.service_id != FSD_SERVICE_DMA_ADAPTER_LABEL
+            || command.target_domain_id != lane.identity.domain_id
+            || command.target_domain_cookie != lane.identity.domain_cookie
+            || command.authority_cookie != 0
+            || command.argument_count != 4
+            || command.arguments[..4].iter().any(|argument| *argument == 0)
+            || command.arguments[4..].iter().any(|argument| *argument != 0)
+            || (!self.has_dpc_dispatch_grant(lane, command.grant)
+                && !lane_has_service_grant(lane, command.grant))
+        {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        match service_hosted_irq_lane_dma_free_mapping(
+            lane.projection_instance,
+            lane.identity.domain_id,
+            lane.identity.domain_cookie,
+            command.arguments[0],
+            command.arguments[1],
+            command.arguments[2],
+            command.arguments[3],
+        ) {
+            Ok(()) => service_result(STATUS_SUCCESS, None),
+            Err(status) => fatal_service_result(status.raw()),
+        }
+    }
+
+    unsafe fn set_event_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let Ok(lane) = self.lane(lane_index) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        if command.service_id != FSD_SERVICE_KE_SET_EVENT_LABEL
+            || command.target_domain_id != lane.identity.domain_id
+            || command.target_domain_cookie != lane.identity.domain_cookie
+            || command.authority_cookie != 0
+            || command.argument_count != 1
+            || command.arguments[0] == 0
+            || command.arguments[1..].iter().any(|argument| *argument != 0)
+            || (!self.has_dpc_dispatch_grant(lane, command.grant)
+                && !lane_has_service_grant(lane, command.grant))
+        {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        match service_hosted_irq_lane_set_event(
+            lane.projection_instance,
+            lane.identity.domain_id,
+            lane.identity.domain_cookie,
+            command.arguments[0],
+        ) {
+            Ok(previous) => service_result(STATUS_SUCCESS, Some(previous as u32 as u64)),
+            Err(status) => fatal_service_result(status.raw()),
+        }
+    }
+
+    unsafe fn begin_local_irp_completion_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let Ok(lane) = self.lane(lane_index) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        if command.service_id != FSD_SERVICE_SOURCE_IRP_LABEL
+            || command.target_domain_id != lane.identity.domain_id
+            || command.target_domain_cookie != lane.identity.domain_cookie
+            || command.authority_cookie != 0
+            || command.argument_count != 1
+            || command.arguments[0] == 0
+            || command.arguments[1..].iter().any(|argument| *argument != 0)
+            || (!self.has_dpc_dispatch_grant(lane, command.grant)
+                && !lane_has_service_grant(lane, command.grant))
+        {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let (status, limit, _generation) = hosted_source_irp_ledger::begin_irq_local_completion(
+            lane.projection_instance,
+            lane.identity.domain_id,
+            lane.identity.domain_cookie,
+            command.arguments[0],
+        );
+        if status == STATUS_SUCCESS || status == nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.raw() {
+            service_result(status, Some(limit))
+        } else {
+            fatal_service_result(status)
+        }
+    }
+
     unsafe fn timer_service(
         &mut self,
         lane_index: usize,
@@ -1556,6 +1654,15 @@ impl HostedIrqRootSession {
             }
             nt_hosted_runtime::HostedIrqServiceKind::ProviderCallbackRequest => {
                 self.provider_callback_service(lane_index, service, command)
+            }
+            nt_hosted_runtime::HostedIrqServiceKind::DmaFreeMapping => {
+                self.dma_free_mapping_service(lane_index, command)
+            }
+            nt_hosted_runtime::HostedIrqServiceKind::SetEvent => {
+                self.set_event_service(lane_index, command)
+            }
+            nt_hosted_runtime::HostedIrqServiceKind::BeginLocalIrpCompletion => {
+                self.begin_local_irp_completion_service(lane_index, command)
             }
             nt_hosted_runtime::HostedIrqServiceKind::ClassServiceRequest => {
                 self.class_callback_service(lane_index, service, command)
