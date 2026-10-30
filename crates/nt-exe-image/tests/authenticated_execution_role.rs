@@ -105,10 +105,31 @@ fn lineage(
 }
 
 #[test]
+fn bootstrap_root_requires_the_actual_mounted_file() {
+    let mut mounts = SectionMountIds::new();
+    let mount = mounts.allocate().unwrap();
+    let other_mount = mounts.allocate().unwrap();
+    let registered_file = SectionFileIdentity { mount, file_id: 10 };
+    let mut catalog = OwnedHostedImageCatalog::<16>::new();
+    let smss = registered(&mut catalog, 0, 0, b"smss.exe",
+        HostedProcessRole::NativeSession, HostedProcessRole::NativeSession,
+        registered_file);
+    let process = process(12, 1);
+    let mut roles = ExecutionRoleLedger::<16>::new();
+    assert_eq!(roles.seed_bootstrap_root(&catalog, smss, process,
+        SectionFileIdentity { mount: other_mount, file_id: registered_file.file_id }),
+        Err(nt_exe_image::execution_role::ExecutionRoleError::InvalidBacking));
+    assert_eq!(roles.role(smss, process), None);
+    assert_eq!(roles.seed_bootstrap_root(&catalog, smss, process, registered_file), Ok(()));
+    assert_eq!(roles.role(smss, process), Some(HostedProcessRole::NativeSession));
+}
+
+#[test]
 fn exact_live_creator_transfers_role_without_mutating_spawn_identity() {
     let mut mounts = SectionMountIds::new();
     let mount = mounts.allocate().unwrap();
     let mut catalog = OwnedHostedImageCatalog::<16>::new();
+    let smss_file = SectionFileIdentity { mount, file_id: 10 };
     let smss = registered(
         &mut catalog,
         0,
@@ -116,7 +137,7 @@ fn exact_live_creator_transfers_role_without_mutating_spawn_identity() {
         b"smss.exe",
         HostedProcessRole::NativeSession,
         HostedProcessRole::NativeSession,
-        SectionFileIdentity { mount, file_id: 10 },
+        smss_file,
     );
     let winlogon_file = SectionFileIdentity { mount, file_id: 11 };
     let winlogon = registered(
@@ -147,7 +168,7 @@ fn exact_live_creator_transfers_role_without_mutating_spawn_identity() {
     let services_identity = process(120, 4);
     let mut roles = ExecutionRoleLedger::<16>::new();
     roles
-        .seed_bootstrap_root(&catalog, smss, smss_identity)
+        .seed_bootstrap_root(&catalog, smss, smss_identity, smss_file)
         .unwrap();
 
     // An exact image observation by itself cannot turn the dynamic Application into SCM.
@@ -220,6 +241,7 @@ fn forged_parent_wrong_backing_stale_generation_and_repeat_cannot_transfer_role(
     let mount = mounts.allocate().unwrap();
     let other_mount = mounts.allocate().unwrap();
     let mut catalog = OwnedHostedImageCatalog::<16>::new();
+    let smss_file = SectionFileIdentity { mount, file_id: 10 };
     let smss = registered(
         &mut catalog,
         0,
@@ -227,7 +249,7 @@ fn forged_parent_wrong_backing_stale_generation_and_repeat_cannot_transfer_role(
         b"smss.exe",
         HostedProcessRole::NativeSession,
         HostedProcessRole::NativeSession,
-        SectionFileIdentity { mount, file_id: 10 },
+        smss_file,
     );
     let winlogon_file = SectionFileIdentity { mount, file_id: 11 };
     let registered_winlogon = registered(
@@ -259,7 +281,7 @@ fn forged_parent_wrong_backing_stale_generation_and_repeat_cannot_transfer_role(
     let application_identity = process(200, 7);
     let mut roles = ExecutionRoleLedger::<16>::new();
     roles
-        .seed_bootstrap_root(&catalog, smss, smss_identity)
+        .seed_bootstrap_root(&catalog, smss, smss_identity, smss_file)
         .unwrap();
     roles
         .admit_foreign_initial_thread(
@@ -487,9 +509,10 @@ fn pending_initial_thread_has_no_authority_until_exact_one_shot_commit() {
     let mut mounts = SectionMountIds::new();
     let mount = mounts.allocate().unwrap();
     let mut catalog = OwnedHostedImageCatalog::<16>::new();
+    let smss_file = SectionFileIdentity { mount, file_id: 10 };
     let smss = registered(&mut catalog, 0, 0, b"smss.exe",
         HostedProcessRole::NativeSession, HostedProcessRole::NativeSession,
-        SectionFileIdentity { mount, file_id: 10 });
+        smss_file);
     let winlogon_file = SectionFileIdentity { mount, file_id: 11 };
     let winlogon = registered(&mut catalog, 2, 4, b"winlogon.exe",
         HostedProcessRole::InteractiveLogon, HostedProcessRole::NativeSession, winlogon_file);
@@ -507,7 +530,7 @@ fn pending_initial_thread_has_no_authority_until_exact_one_shot_commit() {
     let services_identity = process(120, 4);
     let worker_identity = process(124, 5);
     let mut roles = ExecutionRoleLedger::<16>::new();
-    roles.seed_bootstrap_root(&catalog, smss, smss_identity).unwrap();
+    roles.seed_bootstrap_root(&catalog, smss, smss_identity, smss_file).unwrap();
 
     let winlogon_evidence = evidence(smss_identity, winlogon_identity, dynamic_winlogon,
         winlogon, winlogon_file, Some(smss_identity));

@@ -9090,6 +9090,17 @@ pub(crate) unsafe fn service_sec_image(
     let generic_sections = reset_service_generic_sections_work();
     register_loaded_hosted_image(exe_image_catalog, primary_image, !pe.bytes().is_empty())
         .expect("primary hosted image metadata must register once");
+    let primary_backing = crate::fs_loader::exec_fs()
+        .and_then(|fs| crate::fs_loader::fat_open_path_metadata(&fs, crate::installed_layout::SMSS))
+        .filter(|entry| !entry.metadata.is_directory)
+        .and_then(|entry| crate::fs_loader::exec_fs_file_identity(entry.metadata.file_id))
+        .expect("primary SMSS image requires its exact mounted File identity");
+    let primary_target = nt_exe_image::SpawnTarget::from_image(primary_image);
+    exe_image_catalog.bind_registered_backing(primary_target, primary_backing)
+        .expect("primary SMSS File identity must bind once");
+    exe_image_catalog.bind_registered_launch_policy(
+        primary_target, nt_exe_image::HostedProcessRole::NativeSession,
+    ).expect("primary SMSS execution policy must bind once");
     let primary_pi = primary_image.pi;
     if let Some(runtime) = hosted_process_runtime_for_pi(primary_pi) {
         if let Some(spawned) = runtime.spawned {
@@ -9204,6 +9215,8 @@ pub(crate) unsafe fn service_sec_image(
     print_str(b"[sec-init] handler-ready\n");
     nt_handler.register_main_thread_spawn(primary_pi, primary_spawn)
         .expect("primary runtime publication must precede first execution");
+    nt_handler.seed_bootstrap_execution_role(primary_pi, primary_backing)
+        .expect("primary execution root requires exact mounted File and live Ps identity");
     // Bootstrap and runtime retain one queue at the same address; registration cannot clear it.
     let delay_queue = (&mut *core::ptr::addr_of_mut!(SERVICE_DELAY_QUEUE_WORK))
         .as_mut()

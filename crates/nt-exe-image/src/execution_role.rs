@@ -74,13 +74,18 @@ impl<const N: usize> ExecutionRoleLedger<N> {
         catalog: &OwnedHostedImageCatalog<N>,
         target: SpawnTarget,
         process: ProcessIdentity,
+        actual_backing: SectionFileIdentity,
     ) -> Result<(), ExecutionRoleError> {
         if !valid_process(process) { return Err(ExecutionRoleError::InvalidIdentity); }
-        if target.role != HostedProcessRole::NativeSession
-            || catalog.registered_launch_policy(target)
-                .is_none_or(|(_, creator)| creator != target.role)
-        {
+        if target.role != HostedProcessRole::NativeSession {
             return Err(ExecutionRoleError::UnregisteredRole);
+        }
+        let Some((backing, creator)) = catalog.registered_launch_policy(target) else {
+            return Err(ExecutionRoleError::UnregisteredRole);
+        };
+        if creator != target.role { return Err(ExecutionRoleError::UnregisteredRole); }
+        if backing != actual_backing || backing.file_id == 0 || backing.mount.value() == 0 {
+            return Err(ExecutionRoleError::InvalidBacking);
         }
         self.insert(catalog, target, process, target.role, None, None, None)
     }

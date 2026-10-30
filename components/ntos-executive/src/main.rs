@@ -23505,6 +23505,8 @@ struct ExecNtHandler {
     /// Loop-owned hosted process identity catalog. The handler stores a pointer instead of owning a
     /// second catalog so process identity, image open, and spawn all consult the same runtime table.
     hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
+    /// Execution authority bound to exact process generations, separate from image provenance.
+    execution_roles: nt_exe_image::execution_role::ExecutionRoleLedger<HOSTED_PROCESS_IMAGE_CAP>,
     /// seL4 VSpace caps for hosted and temporary process slots, owned by the handler.
     process_vspaces: alloc::vec::Vec<u64>,
     /// Generation-exact capabilities that constitute each hosted SEC_IMAGE address space.

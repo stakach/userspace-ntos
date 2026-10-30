@@ -4218,6 +4218,7 @@ impl ExecNtHandler {
         );
         write_field!(ps_object_retirements, crate::ps_object_retirement::Retirements::default());
         write_field!(hosted_images, hosted_images);
+        write_field!(execution_roles, nt_exe_image::execution_role::ExecutionRoleLedger::new());
         write_field!(process_vspaces, zeroed_process_slot_u64_vec());
         write_field!(process_vspace_caps, hosted_process_vspace::HostedProcessVSpaces::new(MAX_PI));
         write_field!(temporary_process_slots,
@@ -9540,6 +9541,22 @@ impl ExecNtHandler {
 
     pub(crate) fn hosted_process_role(&self, pi: usize) -> Option<nt_exe_image::HostedProcessRole> {
         self.hosted_process_image(pi).map(|image| image.role)
+    }
+
+    /// Install the bootstrap execution root only after its exact Ps mechanism and main runtime
+    /// have been published. The mounted File identity must match the registered image backing.
+    pub(crate) fn seed_bootstrap_execution_role(
+        &mut self,
+        pi: usize,
+        actual_backing: nt_memory_manager::SectionFileIdentity,
+    ) -> Result<(), nt_exe_image::execution_role::ExecutionRoleError> {
+        let process = self.capture_process_identity(pi)
+            .ok_or(nt_exe_image::execution_role::ExecutionRoleError::InvalidIdentity)?;
+        let catalog = unsafe { &*self.hosted_images };
+        let image = catalog.get_by_pi(pi)
+            .ok_or(nt_exe_image::execution_role::ExecutionRoleError::StaleTarget)?;
+        let target = nt_exe_image::SpawnTarget::from_image(image);
+        self.execution_roles.seed_bootstrap_root(catalog, target, process, actual_backing)
     }
 
     pub(crate) fn hosted_process_observation_role(&self, pi: usize) -> Option<nt_exe_image::HostedProcessRole> {
