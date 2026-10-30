@@ -5016,6 +5016,7 @@ extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
         print_hex_u64(u64::from(file_status as u32));
         print_str(b"\n");
         if file_status == 0 {
+            crate::driver_launch::arm_next_font_broker_trace();
             return file_count;
         }
         if file_status != STATUS_INVALID_HANDLE_I32 {

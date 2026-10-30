@@ -37744,6 +37744,18 @@ pub(crate) unsafe fn call_on4(
     (reply_info >> 12, m0, m1, m2, m3)
 }
 
+// Bounded boot diagnostic: one broker Call immediately after each successful win32k
+// FileObject dereference. The caller keeps the exact dispatch.
+static NEXT_FONT_BROKER_TRACE: AtomicU64 = AtomicU64::new(0);
+static FONT_BROKER_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn arm_next_font_broker_trace() {
+    let sequence = FONT_BROKER_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if sequence <= 64 {
+        NEXT_FONT_BROKER_TRACE.store(sequence, Ordering::Release);
+    }
+}
+
 /// Preserve the reply length for transports carrying lane-private extended message registers.
 #[inline(never)]
 pub(crate) unsafe fn call_on4_raw(
@@ -37753,6 +37765,14 @@ pub(crate) unsafe fn call_on4_raw(
     arg2: u64,
     arg3: u64,
 ) -> (u64, u64, u64, u64, u64) {
+    let font_trace = NEXT_FONT_BROKER_TRACE.swap(0, Ordering::AcqRel);
+    if font_trace != 0 {
+        print_str(b"[font-next-broker-enter] ordinal="); print_u64(font_trace);
+        print_str(b" label=0x"); print_hex64(msginfo >> 12);
+        print_str(b" op=0x"); print_hex64(arg0);
+        print_str(b" arg1=0x"); print_hex64(arg1);
+        print_str(b"\n");
+    }
     let reply_info: u64;
     let m0: u64;
     let m1: u64;
@@ -37787,6 +37807,12 @@ pub(crate) unsafe fn call_on4_raw(
         inlateout("rax") arg3 => m3,
         lateout("rcx") _, lateout("r11") _,
     );
+    if font_trace != 0 {
+        print_str(b"[font-next-broker-return] ordinal="); print_u64(font_trace);
+        print_str(b" reply-info=0x"); print_hex64(reply_info);
+        print_str(b" status=0x"); print_hex64(m0);
+        print_str(b"\n");
+    }
     (reply_info, m0, m1, m2, m3)
 }
 
