@@ -18,6 +18,7 @@ SCREENSHOT = ROOT / "native-kvm-smoke.ppm"
 QMP_SOCKET = ROOT / "native-kvm-smoke-qmp.sock"
 INTERRUPT_TRACE = MICRO / "native-kvm-qemu-int.log"
 INTERRUPT_TRACE_TAIL = ROOT / "native-kvm-qemu-int-tail.log"
+STALL_STATE = ROOT / "native-kvm-stall-state.json"
 
 
 def qmp_reply(stream, command_id):
@@ -54,6 +55,43 @@ def capture_framebuffer():
         raise RuntimeError("QMP did not write a framebuffer image")
 
 
+def capture_stall_state():
+    """Keep per-CPU register evidence when the bounded boot window expires."""
+    state = {"cpus": []}
+    try:
+        with socket.socket(socket.AF_UNIX) as connection:
+            connection.settimeout(3)
+            connection.connect(str(QMP_SOCKET))
+            with connection.makefile("rwb", buffering=0) as stream:
+                greeting = json.loads(stream.readline())
+                if "QMP" not in greeting:
+                    raise RuntimeError("QMP greeting missing")
+                stream.write(b'{"execute":"qmp_capabilities","id":"capabilities"}\n')
+                qmp_reply(stream, "capabilities")
+                stream.write(b'{"execute":"query-cpus-fast","id":"cpus"}\n')
+                cpus = qmp_reply(stream, "cpus")["return"]
+                state["cpus"] = cpus
+                for cpu in cpus:
+                    index = cpu["cpu-index"]
+                    command_id = f"registers-{index}"
+                    command = {
+                        "execute": "human-monitor-command",
+                        "arguments": {"command-line": "info registers", "cpu-index": index},
+                        "id": command_id,
+                    }
+                    stream.write((json.dumps(command) + "\n").encode())
+                    try:
+                        state.setdefault("registers", {})[str(index)] = qmp_reply(
+                            stream, command_id
+                        )["return"]
+                    except (OSError, RuntimeError, ValueError, KeyError) as error:
+                        state.setdefault("register_errors", {})[str(index)] = str(error)
+    except (OSError, RuntimeError, ValueError, KeyError) as error:
+        state["error"] = str(error)
+    finally:
+        STALL_STATE.write_text(json.dumps(state, indent=2) + "\n")
+
+
 def stop_process_group(process):
     if process.poll() is not None:
         return
@@ -76,6 +114,7 @@ def main():
     SCREENSHOT.unlink(missing_ok=True)
     INTERRUPT_TRACE.unlink(missing_ok=True)
     INTERRUPT_TRACE_TAIL.unlink(missing_ok=True)
+    STALL_STATE.unlink(missing_ok=True)
     command = [
         "./scripts/run_specs.sh",
         "-qmp",
@@ -109,8 +148,12 @@ def main():
                     next_capture = time.monotonic() + 30
                 time.sleep(1)
         finally:
-            stop_process_group(process)
-            QMP_SOCKET.unlink(missing_ok=True)
+            try:
+                if process.poll() is None and time.monotonic() - started >= args.seconds:
+                    capture_stall_state()
+            finally:
+                stop_process_group(process)
+                QMP_SOCKET.unlink(missing_ok=True)
             if args.trace_interrupts and INTERRUPT_TRACE.is_file():
                 with INTERRUPT_TRACE.open("rb") as trace:
                     trace.seek(0, os.SEEK_END)
