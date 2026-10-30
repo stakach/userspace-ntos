@@ -91,6 +91,7 @@ jobs:
           PY
       - name: Build native image from verified pinned LiberNT release
         run: |
+          set -o pipefail
           ./run.sh --build-only 2>&1 | tee native-kvm-build.log
           sha256sum rust-micro/.tmp/disk.img > native-kvm-image.sha256
           cp rust-micro/vendor/libernt/manifest.txt native-kvm-libernt-manifest.txt
