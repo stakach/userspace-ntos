@@ -1799,6 +1799,14 @@ impl PumpLoopOutcome {
 /// Receive only through the shared, retained ingress owner.
 #[inline(never)]
 unsafe fn pump_recv(ch: &PumpChannel, _reply_cap: u64) -> PumpMessage {
+    pump_recv_with_scheduler_checkpoint(ch, false)
+}
+
+/// Scheduler work has already run for this retained receive half. A blocking receive gives
+/// lower-priority component workers a chance to publish READY even if timer demand renews.
+unsafe fn pump_recv_with_scheduler_checkpoint(
+    ch: &PumpChannel, serviced_scheduler_yield: bool,
+) -> PumpMessage {
     match shared_ingress::owner::runtime::channel_route(ch) {
         Ok(Some(route)) => shared_pump::receive(ch, route, false, serviced_scheduler_yield),
         Err(_) | Ok(None) => {
@@ -1817,14 +1825,6 @@ unsafe fn pump_recv_retained_seh(ch: &PumpChannel) -> PumpMessage {
             crate::print_str(b"[pump-ingress] retained SEH route unavailable\n");
             PumpMessage::transport_wall()
         }
-    pump_recv_with_scheduler_checkpoint(ch, false)
-}
-
-/// Scheduler work has already run for this retained receive half. A blocking receive gives
-/// lower-priority component workers a chance to publish READY even if timer demand renews.
-unsafe fn pump_recv_with_scheduler_checkpoint(
-    ch: &PumpChannel, serviced_scheduler_yield: bool,
-) -> PumpMessage {
     }
 }
 
@@ -2267,6 +2267,26 @@ pub(crate) unsafe fn component_pump_continue_receive(
     component_pump_continue_receive_half(ch, previous, false)
 }
 
+/// Continue only the receive half after this invocation's scheduler has serviced IRQ/timer
+/// demand. The service pass retains the physical Call and Reply; no request is sent again.
+pub(crate) unsafe fn component_pump_continue_receive_after_scheduler_service(
+    ch: &PumpChannel,
+    previous: &PumpResult,
+) -> Result<PumpResult, u32> {
+    if !previous.scheduler_yielded || !receive_continuation_authorized(ch, previous) {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    component_pump_continue_receive_half(ch, previous, true)
+}
+
+unsafe fn receive_continuation_authorized(ch: &PumpChannel, previous: &PumpResult) -> bool {
+    previous.is_receive_yield()
+        && (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield
+            || previous.receive_yield.is_some_and(|yielded|
+                crate::win32k_glue::receive_continuation_is_current(ch, yielded)))
+        && (!ch.caps.kernel_irq_yield || previous.reply_cap == ch.reply_cap)
+}
+
 /// Resume only the receive half after the exact external service wait has been ACKed and
 /// retired by the root owner. Its prior request and service Reply must never be sent again.
 pub(crate) unsafe fn component_pump_continue_service_wait(
@@ -2291,29 +2311,10 @@ pub(crate) unsafe fn component_pump_continue_service_wait(
     component_pump_continue_receive_half(ch, previous, false)
 }
 
-/// Continue only the receive half after this invocation's scheduler has serviced IRQ/timer
-/// demand. The service pass retains the physical Call and Reply; no request is sent again.
-pub(crate) unsafe fn component_pump_continue_receive_after_scheduler_service(
-    ch: &PumpChannel,
-    previous: &PumpResult,
-) -> Result<PumpResult, u32> {
-    if !previous.scheduler_yielded || !receive_continuation_authorized(ch, previous) {
-        return Err(nt_process::STATUS_INVALID_PARAMETER);
-    }
-    component_pump_continue_receive_half(ch, previous, true)
-}
-
-unsafe fn receive_continuation_authorized(ch: &PumpChannel, previous: &PumpResult) -> bool {
-    previous.is_receive_yield()
-        && (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield
-            || previous.receive_yield.is_some_and(|yielded|
-                crate::win32k_glue::receive_continuation_is_current(ch, yielded)))
-        && (!ch.caps.kernel_irq_yield || previous.reply_cap == ch.reply_cap)
-}
-
 unsafe fn component_pump_continue_receive_half(
     ch: &PumpChannel,
     previous: &PumpResult,
+    serviced_scheduler_yield: bool,
 ) -> Result<PumpResult, u32> {
     if let Some(yielded) = previous.receive_yield {
         crate::win32k_glue::trace_receive_phase(
@@ -2332,7 +2333,6 @@ unsafe fn component_pump_continue_receive_half(
         crate::win32k_glue::trace_receive_phase(
             b"resume-before-recv", yielded.parent, yielded.child, yielded.owner,
         );
-    serviced_scheduler_yield: bool,
     }
     let first = pump_recv_with_scheduler_checkpoint(ch, serviced_scheduler_yield);
     if let Some(yielded) = previous.receive_yield {
