@@ -38134,6 +38134,16 @@ const _: () = assert!(!valid_set_information_relation(
     2
 ));
 
+fn trace_port_connect_handler(stage: u64, irp: u64, device: u64, code: u64, handler: u64, result: u64) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 12 { return; }
+    print_str(b"[port-connect-handler] stage/irp/device/code/handler/result=");
+    for value in [stage, irp, device, code, handler, result] {
+        print_hex_u64(value); print_str(b"/");
+    }
+    print_str(b"\n");
+}
+
 unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     run_irp_with_bank(major, handler, FSD_SHARED_VADDR,
         FSD_DATA_VADDR + FSD_DATA_IRP_DISPATCH_REQUEST_OFF)
@@ -38144,6 +38154,15 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     let request = read_volatile(
         request_address as *const IrpDispatchRequest,
     );
+    let trace_connect_handler = major == IRP_MJ_INTERNAL_DEVICE_CONTROL
+        && u64::from(request.input_len)
+            == nt_io_manager::retained_connect_forward::ConnectPayloadIdentity::CONNECT_DATA_BYTES
+        && request.output_len == 0
+        && (request.ioctl_code == nt_io_manager::retained_connect_forward::ConnectControl::Keyboard.code()
+            || request.ioctl_code == nt_io_manager::retained_connect_forward::ConnectControl::Mouse.code());
+    if trace_connect_handler {
+        trace_port_connect_handler(0, request.irp_id, devobj, u64::from(request.ioctl_code), handler, 0);
+    }
     if request.abi_version != IO_ABI_VERSION as u16
         || request.abi_size as usize != core::mem::size_of::<IrpDispatchRequest>()
         || !request.has_well_formed_domain_route()
@@ -39340,7 +39359,13 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     write_volatile(jb.add(2), 0);
     let boundary = read_volatile((shared + SH_SEH_FOREIGN_CALL2_VA) as *const u64);
     assert_ne!(boundary, 0, "hosted driver callback lacks its admitted PE boundary");
+    if trace_connect_handler {
+        trace_port_connect_handler(1, canonical_irp_id, devobj, fsctl, handler, 0);
+    }
     let ret = fsd_guarded_call(handler, devobj, irp, jb, boundary);
+    if trace_connect_handler {
+        trace_port_connect_handler(2, canonical_irp_id, devobj, fsctl, handler, ret as u32 as u64);
+    }
     let post_call_irp_status =
         read_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const u32);
     let post_call_irp_information = read_unaligned((irp + 0x38) as *const u64);
@@ -70157,6 +70182,49 @@ pub(crate) fn print_active_driver_dispatch_for_deadman() {
 /// isn't available.
 ///
 /// This is the private component transport engine. Public callers route through driver/device ids.
+static PORT_CONNECT_PUMP_TRACE_IRP: AtomicU64 = AtomicU64::new(0);
+static PORT_CONNECT_PUMP_TRACE_TCB: AtomicU64 = AtomicU64::new(0);
+
+/// Bounded observation of the exact retained port CONNECT request across admission and Reply.
+/// The two atomics are diagnostic keys only; physical ingress ownership remains with the pump.
+pub(crate) unsafe fn trace_port_connect_pump_boundary(
+    stage: u64, ch: &crate::spawn_hosts::PumpChannel, reply: u64, detail: u64,
+) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let irp = PORT_CONNECT_PUMP_TRACE_IRP.load(Ordering::Relaxed);
+    if irp == 0 || PORT_CONNECT_PUMP_TRACE_TCB.load(Ordering::Relaxed) != ch.tcb
+        || (stage != 2 && read_volatile((ch.shared_va + SH_REQ_CONTROL_ID) as *const u64) != irp)
+        || COUNT.fetch_add(1, Ordering::Relaxed) >= 12
+    {
+        return;
+    }
+    let mut state = [0u64; crate::win32k_glue::TCB_DEBUG_STATE_WORDS];
+    crate::win32k_glue::tcb_read_debug_state(ch.tcb, reply, &mut state);
+    print_str(b"[port-connect-boundary] stage/irp/endpoint/executor/tcb/reply/detail/state/sched/enq/prio/pending/reply-bound/queue-top/timer=");
+    print_u64(stage); print_str(b"/"); print_hex_u64(irp); print_str(b"/");
+    if let Some(route) = ch.ingress_route {
+        print_hex_u64(route.endpoint()); print_str(b"/");
+        print_hex_u64(route.identity().executor);
+    } else {
+        print_u64(0); print_str(b"/"); print_u64(0);
+    }
+    print_str(b"/"); print_hex_u64(ch.tcb); print_str(b"/"); print_hex_u64(reply);
+    print_str(b"/"); print_hex_u64(detail); print_str(b"/");
+    for field in [
+        crate::win32k_glue::TCB_DBG_STATE,
+        crate::win32k_glue::TCB_DBG_SCHEDULABLE,
+        crate::win32k_glue::TCB_DBG_ENQUEUED,
+        crate::win32k_glue::TCB_DBG_PRIORITY,
+        crate::win32k_glue::TCB_DBG_PENDING_REPLY,
+        crate::win32k_glue::TCB_DBG_REPLY_BOUND_TCB,
+        crate::win32k_glue::TCB_DBG_QUEUE_TOP_PRIORITY,
+    ] {
+        print_u64(state[field]); print_str(b"/");
+    }
+    print_u64(u64::from(crate::dispatcher_bootstrap::timer_work_pending()));
+    print_str(b"\n");
+}
+
 fn trace_port_connect_pump(
     stage: u64,
     irp: u64,
@@ -70167,6 +70235,13 @@ fn trace_port_connect_pump(
     detail: u64,
 ) {
     static COUNT: AtomicU64 = AtomicU64::new(0);
+    if stage == 1 {
+        PORT_CONNECT_PUMP_TRACE_IRP.store(irp, Ordering::Relaxed);
+        PORT_CONNECT_PUMP_TRACE_TCB.store(tcb, Ordering::Relaxed);
+    } else if stage == 2 && PORT_CONNECT_PUMP_TRACE_IRP.load(Ordering::Relaxed) == irp {
+        PORT_CONNECT_PUMP_TRACE_IRP.store(0, Ordering::Relaxed);
+        PORT_CONNECT_PUMP_TRACE_TCB.store(0, Ordering::Relaxed);
+    }
     if COUNT.fetch_add(1, Ordering::Relaxed) >= 12 { return; }
     print_str(b"[port-connect-pump] stage/irp/hook/class/endpoint/executor/tcb/detail=");
     print_u64(stage); print_str(b"/");

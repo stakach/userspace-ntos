@@ -145,6 +145,9 @@ unsafe fn hosted_component_pump_inner(
         let route = route.expect("hosted dispatch requires enrolled source");
         runtime::admit(route).expect("admit exact hosted dispatch Call");
         channel.reply_cap = runtime::current_reply(route).expect("admitted canonical Reply");
+        crate::driver_launch::trace_port_connect_pump_boundary(
+            0, &channel, channel.reply_cap, 0,
+        );
         parent
     } else {
         None

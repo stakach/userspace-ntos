@@ -1886,7 +1886,9 @@ unsafe fn pump_reply_recv4_traced(
     if let Some(badge) = power_report_badge {
         crate::driver_launch::trace_report_rpc(b"reply-send", reply_cap, badge, reply_r0 as u32 as i32, reply_r1);
     }
+    crate::driver_launch::trace_port_connect_pump_boundary(1, ch, reply_cap, reply_r0);
     let sent = shared_pump::reply(ch, reply_cap, reply_msginfo, [reply_r0, reply_r1, reply_r2, reply_r3]);
+    crate::driver_launch::trace_port_connect_pump_boundary(2, ch, reply_cap, u64::from(sent));
     if let Some(badge) = power_report_badge {
         crate::driver_launch::trace_report_rpc(
             if sent { &b"reply-accepted"[..] } else { &b"reply-refused"[..] },
