@@ -7414,7 +7414,7 @@ impl ExecNtHandler {
     }
 
 
-    fn mutable_registry_key_security_descriptor(
+    pub(crate) fn mutable_registry_key_security_descriptor(
         &self,
         key: nt_hive_core::ResolvedHiveKey,
     ) -> Option<alloc::vec::Vec<u8>> {
