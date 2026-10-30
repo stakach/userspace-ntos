@@ -10,12 +10,16 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+mod aml_static_resources;
 mod eval;
 mod hpet_projection;
 mod madt;
 mod namespace;
 mod pci_routing;
 
+pub use aml_static_resources::{
+    parse_static_system_io_resources, StaticIoResource, StaticIoResourceError,
+};
 pub use eval::{
     eval_method_input, eval_method_input_ex, eval_output_overflow_retry_len,
     eval_output_required_len,
@@ -439,6 +443,37 @@ pub struct AcpiPlatformResources {
     /// remains separate in [`FixedAcpiDescription`] because it is a platform-control authority and
     /// must not be widened by coalescing it with ordinary fixed-register access.
     pub fixed_registers: Vec<RegisterBlock>,
+    /// Literal SystemIO regions independently backed by a Device `_CRS` in a validated DSDT or
+    /// self-contained SSDT. Unsupported AML contributes no authority.
+    pub static_io: Vec<StaticIoResource>,
+}
+
+fn static_io_overlaps(a: &StaticIoResource, b: &StaticIoResource) -> bool {
+    let a_start = a.start as u32;
+    let b_start = b.start as u32;
+    a_start < b_start + b.length as u32 && b_start < a_start + a.length as u32
+}
+
+/// An ambiguous firmware claim revokes all supplemental static I/O authority. Other ACPI table
+/// discovery remains available so the provider can still evaluate methods after safe startup.
+fn append_unambiguous_static_io(
+    retained: &mut Vec<StaticIoResource>,
+    fresh: Vec<StaticIoResource>,
+) -> bool {
+    for (index, candidate) in fresh.iter().enumerate() {
+        if retained.iter().any(|prior| static_io_overlaps(prior, candidate))
+            || fresh[..index].iter().any(|prior| static_io_overlaps(prior, candidate))
+        {
+            retained.clear();
+            return false;
+        }
+    }
+    if retained.try_reserve(fresh.len()).is_err() {
+        retained.clear();
+        return false;
+    }
+    retained.extend(fresh);
+    true
 }
 
 pub fn discover_platform_resources<R: PhysicalMemoryReader>(
@@ -472,6 +507,8 @@ pub fn discover_platform_resources<R: PhysicalMemoryReader>(
     let mut fadt_bytes = None;
     let mut madt_topology = None;
     let mut hpet = None;
+    let mut static_io = Vec::new();
+    let mut static_io_ambiguous = false;
     for address in root.entries {
         let (table, bytes) = read_sdt(reader, address, limits.max_table_length)?;
         if table.signature == FADT_SIGNATURE {
@@ -490,6 +527,14 @@ pub fn discover_platform_resources<R: PhysicalMemoryReader>(
                 return Err(AcpiError::DuplicateHpet);
             }
             hpet = Some(HpetDescription::parse(&bytes)?);
+        } else if table.signature == *b"SSDT" {
+            // Parsing failure is a refusal of supplemental authority, not invalidation of the
+            // firmware table itself. The provider may still interpret unsupported AML later.
+            if !static_io_ambiguous {
+                if let Ok(resources) = parse_static_system_io_resources(&bytes, address) {
+                    static_io_ambiguous = !append_unambiguous_static_io(&mut static_io, resources);
+                }
+            }
         }
         tables.push(table);
     }
@@ -505,11 +550,16 @@ pub fn discover_platform_resources<R: PhysicalMemoryReader>(
     {
         return Err(AcpiError::DuplicateTableAddress);
     }
-    let (dsdt, _) = read_sdt(reader, fixed.dsdt_address, limits.max_table_length)?;
+    let (dsdt, dsdt_bytes) = read_sdt(reader, fixed.dsdt_address, limits.max_table_length)?;
     if dsdt.signature != DSDT_SIGNATURE {
         return Err(AcpiError::InvalidSignature);
     }
     tables.push(dsdt);
+    if !static_io_ambiguous {
+        if let Ok(resources) = parse_static_system_io_resources(&dsdt_bytes, fixed.dsdt_address) {
+            append_unambiguous_static_io(&mut static_io, resources);
+        }
+    }
 
     let facs = fixed
         .facs_address
@@ -541,6 +591,7 @@ pub fn discover_platform_resources<R: PhysicalMemoryReader>(
         io_apics: madt_topology.io_apics,
         interrupt_overrides: madt_topology.interrupt_overrides,
         fixed,
+        static_io,
     })
 }
 
@@ -1332,6 +1383,66 @@ mod tests {
             ]
         );
         assert!(memory.reads.contains(&(FACS, FACS_MIN_LEN)));
+    }
+
+    #[test]
+    fn platform_discovery_retains_q35_cpu_hotplug_crs_provenance() {
+        const ROOT: u64 = 0x7ffe_1000;
+        const FADT: u64 = 0x7ffe_2000;
+        const MADT: u64 = 0x7ffe_2800;
+        const DSDT: u64 = 0x7ffe_3000;
+        let dsdt = include_bytes!("../tests/fixtures/qemu-q35-dsdt.aml").to_vec();
+
+        let mut xsdt = vec![0; SDT_HEADER_LEN + 16];
+        write_u64(&mut xsdt, SDT_HEADER_LEN, FADT);
+        write_u64(&mut xsdt, SDT_HEADER_LEN + 8, MADT);
+        let xsdt = finish_table(xsdt, b"XSDT");
+
+        let mut fadt = vec![0; 244];
+        write_u32(&mut fadt, 40, DSDT as u32);
+        write_u16(&mut fadt, 46, 9);
+        write_u32(&mut fadt, 48, 0xb2);
+
+        let mut madt = vec![0; SDT_HEADER_LEN + 8];
+        write_u32(&mut madt, SDT_HEADER_LEN + 4, 1);
+        madt.extend_from_slice(&[1, 12, 0, 0]);
+        madt.extend_from_slice(&0xfec0_0000u32.to_le_bytes());
+        madt.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut memory = TestPhysicalMemory::new(vec![
+            (ROOT, xsdt.clone()),
+            (FADT, finish_table(fadt, b"FACP")),
+            (MADT, finish_table(madt, b"APIC")),
+            (DSDT, dsdt),
+        ]);
+        let resources = discover_platform_resources(
+            &mut memory, ROOT, xsdt.len() as u32, DiscoveryLimits::default(),
+        ).unwrap();
+        assert!(resources.static_io.iter().any(|resource| {
+            resource.hardware_id == "PNP0A06"
+                && resource.namespace_path == "\\_SB_.PCI0.PRES"
+                && resource.region_name == *b"PRST"
+                && resource.start == 0xcd8
+                && resource.length == 12
+                && resource.table_address == DSDT
+                && resource.table_signature == *b"DSDT"
+        }));
+    }
+
+    #[test]
+    fn overlapping_dsdt_and_ssdt_static_io_revokes_supplemental_authority() {
+        let dsdt = include_bytes!("../tests/fixtures/qemu-q35-dsdt.aml");
+        let first = parse_static_system_io_resources(dsdt, 0x3000).unwrap();
+        let mut ssdt = dsdt.to_vec();
+        ssdt[..4].copy_from_slice(b"SSDT");
+        ssdt[9] = 0;
+        ssdt[9] = 0u8.wrapping_sub(ssdt.iter().copied().fold(0u8, u8::wrapping_add));
+        let second = parse_static_system_io_resources(&ssdt, 0x6000).unwrap();
+        let mut retained = Vec::new();
+        assert!(append_unambiguous_static_io(&mut retained, first));
+        assert!(!retained.is_empty());
+        assert!(!append_unambiguous_static_io(&mut retained, second));
+        assert!(retained.is_empty());
     }
 
     #[test]
