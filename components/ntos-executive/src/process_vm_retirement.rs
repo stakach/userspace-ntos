@@ -1,4 +1,5 @@
-//! Final process VM cleanup. The generation-exact Ps deletion candidate owns every retry.
+//! Execution VM cleanup. The generation-exact process candidate owns every retry even while
+//! external handles retain the signaled Ps objects.
 use super::*;
 use nt_memory_manager::process_retirement::{
     retire_process_vm, ProcessVmRetirement, ProcessVmRetirementIo,
@@ -23,7 +24,7 @@ impl ProcessVmRetirementIo for FinalProcessVm<'_> {
         let handler = &self.handler;
         if pi >= MAX_PI
             || candidate.phase != nt_user_host::ProcessDeletionPhase::ReclaimingVm
-            || handler.process_deletion_candidates.get(pi) != Some(candidate)
+            || handler.process_deletion_candidates.get_exact(pi, candidate.pid, candidate.generation) != Some(candidate)
             || !handler
                 .process_mechanisms
                 .get(pi)
@@ -33,7 +34,9 @@ impl ProcessVmRetirementIo for FinalProcessVm<'_> {
             || !handler
                 .pm
                 .process_object_delete_blockers(candidate.pid)
-                .is_some_and(nt_process::ProcessObjectDeleteBlockers::delete_ready)
+                .is_some_and(nt_process::ProcessObjectDeleteBlockers::execution_retirement_ready)
+            || handler.pm.process_object_delete_blockers(candidate.pid)
+                .is_none_or(|blockers| blockers.thread_impersonations != 0)
             || handler.pm.process_win32(candidate.pid).is_some()
             || handler.pm.process(candidate.pid).is_none_or(|process| {
                 process

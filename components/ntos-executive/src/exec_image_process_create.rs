@@ -137,7 +137,9 @@ impl ExecNtHandler {
     }
 
     pub(super) fn release_native_process_image(&mut self, pi: usize, pid: nt_process::ProcessId, generation: u64) {
-        let Some(index) = self.process_image_owners.iter().position(|row| row.target.pi == pi) else { return; };
+        let Some(index) = self.process_image_owners.iter().position(|row|
+            row.target.pi == pi && row.target.generation == generation && row.pid == Some(pid))
+        else { return; };
         let row = &self.process_image_owners[index];
         assert_eq!(row.target.generation, generation);
         assert_eq!(row.pid, Some(pid));

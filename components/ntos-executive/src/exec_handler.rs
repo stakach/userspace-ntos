@@ -4244,13 +4244,13 @@ impl ExecNtHandler {
             if pid != 0 && main_tid != 0 {
                 if let Some(image) = handler.hosted_process_image(pi) {
                     let _ = handler.publish_registered_hosted_process_metadata(image);
-                    let _ = handler.register_hosted_process_identity(
+                    handler.register_hosted_process_identity(
                         pi,
                         pid,
                         main_tid,
                         image.top_badge,
                         image.generation,
-                    );
+                    ).expect("bootstrap process identity and deletion-owner capacity");
                 }
                 handler.observe_desktop_catalog(pi);
             }
@@ -9605,6 +9605,14 @@ impl ExecNtHandler {
         top_badge: u64,
         generation: u64,
     ) -> Result<(), u32> {
+        // Every live execution mechanism may later need one persistent delete owner. Reserve
+        // room for all possible active slots before publishing another process, including when
+        // older Ps objects already occupy detached candidate rows.
+        {
+            let _durable = allocator::enter_durable();
+            self.process_deletion_candidates.try_reserve(MAX_PI)
+                .map_err(|_| nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
+        }
         let main_claimed = self.register_hosted_main_thread_identity(pi, main_tid)?;
 
         match self
@@ -9996,7 +10004,7 @@ impl ExecNtHandler {
         unsafe { driver_launch::driver_registry_value_transfers::cancel_process(pid); }
         // No user execution has been admitted, so this metadata-only rollback cannot own
         // transition backing. Detect a stale process-slot lifetime before releasing Ps ownership.
-        assert!(self.process_deletion_candidates.get(pi).is_none()
+        assert!(self.process_deletion_candidates.iter().all(|candidate| candidate.pid != pid)
             && !self.ps_object_retirements.owns_mechanism_slot(pi),
             "creation rollback cannot discard process retirement ownership");
         unsafe { process_working_set_clear_metadata(pi) };
@@ -21009,48 +21017,68 @@ impl ExecNtHandler {
         &mut self,
         pid: nt_process::ProcessId,
     ) -> HostedProcessDeletionOutcome {
-        let Some(pi) = self.process_mechanisms.pi_for_pid(pid) else {
-            return HostedProcessDeletionOutcome::Stale;
-        };
-        let Some(process_mechanism) = self.process_mechanisms.get(pi) else {
-            return HostedProcessDeletionOutcome::Stale;
-        };
-        self.observe_desktop_terminal(pi);
-        let (candidate, newly_queued) = match self.process_deletion_candidates.get(pi) {
-            Some(candidate) => {
-                if !candidate.matches_mechanism(process_mechanism) {
-                    return HostedProcessDeletionOutcome::Stale;
-                }
-                (candidate, false)
-            }
+        let existing = self.process_deletion_candidates.iter().find(|candidate| candidate.pid == pid);
+        let Some(pi) = existing.map(|candidate| candidate.pi)
+            .or_else(|| self.process_mechanisms.pi_for_pid(pid))
+        else { return HostedProcessDeletionOutcome::Stale; };
+        if existing.is_none_or(|candidate|
+            candidate.phase <= nt_user_host::ProcessDeletionPhase::RetiringExecution)
+        {
+            self.observe_desktop_terminal(pi);
+        }
+        let (candidate, newly_queued) = match existing {
+            Some(candidate) => (candidate, false),
             None => {
+                let Some(process_mechanism) = self.process_mechanisms.get(pi) else {
+                    return HostedProcessDeletionOutcome::Stale;
+                };
                 if !self.pm.is_process_signaled(pid) {
                     return HostedProcessDeletionOutcome::Pending(
-                        nt_user_host::ProcessDeletionPhase::AwaitingReferences,
+                        nt_user_host::ProcessDeletionPhase::AwaitingExecutionQuiescence,
                     );
                 }
                 let candidate = nt_user_host::ProcessDeletionCandidate::from_mechanism(
                     process_mechanism,
                     self.pm.process_kernel_object(pid).is_some(),
                 );
-                match self.process_deletion_candidates.queue(candidate) {
+                let queued = {
+                    let _durable = allocator::enter_durable();
+                    self.process_deletion_candidates.queue(candidate)
+                };
+                match queued {
                     Ok(newly_queued) => (candidate, newly_queued),
+                    Err(nt_user_host::MechanismError::InsufficientResources) => {
+                        return HostedProcessDeletionOutcome::Pending(candidate.phase);
+                    }
                     Err(_) => return HostedProcessDeletionOutcome::Stale,
                 }
             }
         };
+        if candidate.phase <= nt_user_host::ProcessDeletionPhase::RetiringExecution {
+            let Some(mechanism) = self.process_mechanisms.get(pi) else {
+                return HostedProcessDeletionOutcome::Pending(candidate.phase);
+            };
+            let role = self.hosted_process_role(pi);
+            if !candidate.matches_mechanism(mechanism)
+                || self.ps_object_retirements.prepare_provider_context(
+                    candidate, mechanism.top_badge, role,
+                ).is_err()
+            {
+                return HostedProcessDeletionOutcome::Pending(candidate.phase);
+            }
+        }
         if newly_queued {
             self.trace_hosted_process_delete_blockers(candidate);
         }
         let candidate = self
             .process_deletion_candidates
-            .get(pi)
+            .get_exact(pi, pid, candidate.generation)
             .expect("queued process deletion identity must remain owned");
         let outcome = self.try_delete_hosted_process_object_exact(candidate);
         if outcome == HostedProcessDeletionOutcome::Complete {
             let candidate = self
                 .process_deletion_candidates
-                .get(pi)
+                .get_exact(pi, pid, candidate.generation)
                 .expect("completed process deletion must retain its final phase");
             self.process_deletion_candidates
                 .remove_exact(candidate)
@@ -21171,22 +21199,23 @@ impl ExecNtHandler {
     ) -> HostedProcessDeletionOutcome {
         let pi = candidate.pi;
         let pid = candidate.pid;
-        let Some(process_mechanism) = self.process_mechanisms.get(pi) else {
-            return if candidate.phase == nt_user_host::ProcessDeletionPhase::AwaitingReferences
-                && !self.ps_object_retirements.contains(candidate)
-            {
-                HostedProcessDeletionOutcome::Stale
-            } else {
-                HostedProcessDeletionOutcome::Pending(candidate.phase)
-            };
-        };
-        if !candidate.matches_mechanism(process_mechanism) {
+        if candidate.phase <= nt_user_host::ProcessDeletionPhase::RetiringExecution
+            && !self.process_mechanisms.get(pi)
+                .is_some_and(|mechanism| candidate.matches_mechanism(mechanism))
+        {
             return HostedProcessDeletionOutcome::Pending(candidate.phase);
         }
-        self.observe_desktop_terminal(pi);
+        if candidate.phase > nt_user_host::ProcessDeletionPhase::RetiringExecution
+            && !self.ps_object_retirements.execution_retired(candidate)
+        {
+            return HostedProcessDeletionOutcome::Pending(candidate.phase);
+        }
+        if candidate.phase <= nt_user_host::ProcessDeletionPhase::RetiringExecution {
+            self.observe_desktop_terminal(pi);
+        }
         loop {
             match candidate.phase {
-                nt_user_host::ProcessDeletionPhase::AwaitingReferences => {
+                nt_user_host::ProcessDeletionPhase::AwaitingExecutionQuiescence => {
                     if self.pm.is_process_signaled(pid) && !candidate.lpc_rundown_acknowledged {
                         let process = nt_user_host::process_identity::ProcessIdentity {
                             pid,
@@ -21201,10 +21230,11 @@ impl ExecNtHandler {
                             .acknowledge_lpc_rundown_exact(candidate)
                             .expect("broker rundown ACK belongs to the exact deletion candidate");
                     }
-                    let process_object_present = self.pm.process(pid).is_some();
                     if !self.pm.is_process_signaled(pid)
                         || self.thread_runtime.has_process(pi)
-                        || (process_object_present && !self.pm.process_object_delete_ready(pid))
+                        || !self.pm.process_execution_retirement_ready(pid)
+                        || self.pm.process_object_delete_blockers(pid)
+                            .is_none_or(|blockers| blockers.thread_impersonations != 0)
                     {
                         return HostedProcessDeletionOutcome::Pending(candidate.phase);
                     }
@@ -21235,7 +21265,7 @@ impl ExecNtHandler {
                     candidate = self
                         .process_deletion_candidates
                         .advance_exact(candidate)
-                        .expect("preflighted process deletion must enter VM reclaim exactly");
+                        .expect("quiescent execution must enter VM reclaim exactly");
                 }
                 nt_user_host::ProcessDeletionPhase::ReclaimingVm => {
                     let reclaim = unsafe { reclaim_final_process_vm(candidate, self) };
@@ -21255,7 +21285,58 @@ impl ExecNtHandler {
                     candidate = self
                         .process_deletion_candidates
                         .advance_exact(candidate)
-                        .expect("reclaimed process VM must enter Ps deletion exactly");
+                        .expect("reclaimed process VM must enter execution retirement exactly");
+                }
+                nt_user_host::ProcessDeletionPhase::RetiringExecution => {
+                    let Some(process_mechanism) = self.process_mechanisms.get(pi) else {
+                        return HostedProcessDeletionOutcome::Pending(candidate.phase);
+                    };
+                    if !candidate.matches_mechanism(process_mechanism)
+                        || !self.ps_object_retirements.contains(candidate)
+                    {
+                        return HostedProcessDeletionOutcome::Pending(candidate.phase);
+                    }
+                    let dynamic_retirement = self
+                        .hosted_process_dynamic_retirement(pi, candidate.generation)
+                        .expect("reclaimed execution retained its exact image attachments");
+                    if let Some((loop_ctx, target, published_targets)) = dynamic_retirement {
+                        assert!(unsafe {
+                            retire_dynamic_hosted_identity_attachments(
+                                loop_ctx, target, published_targets,
+                            )
+                        });
+                    }
+                    let _ = self.thread_mechanisms.release_main(pi);
+                    for slot in 0..PM_RUNTIME_THREAD_SLOTS {
+                        let _ = self.thread_mechanisms.release_pool(pi, slot);
+                    }
+                    let released = self
+                        .process_mechanisms
+                        .release_exact(process_mechanism)
+                        .expect("reclaimed exact execution mechanism must retire once");
+                    debug_assert_eq!(released.pid, pid);
+                    self.release_native_process_image(pi, pid, candidate.generation);
+                    self.pool_used[pi] = 0;
+                    self.drain_job_destructions();
+                    self.refresh_process_manager_gates();
+                    self.ps_object_retirements.mark_execution_retired(candidate)
+                        .expect("exact provider metadata survives execution retirement");
+                    candidate = self.process_deletion_candidates.record_execution_retirement_exact(candidate)
+                        .expect("completed execution retirement must await external Ps references");
+                    print_str(b"[process-execution-retired] pi=");
+                    print_u64(pi as u64);
+                    print_str(b" pid=");
+                    print_u64(pid as u64);
+                    print_str(b" generation=");
+                    print_u64(candidate.generation);
+                    print_str(b"\n");
+                }
+                nt_user_host::ProcessDeletionPhase::AwaitingReferences => {
+                    if !self.pm.process_object_delete_ready(pid) {
+                        return HostedProcessDeletionOutcome::Pending(candidate.phase);
+                    }
+                    candidate = self.process_deletion_candidates.advance_exact(candidate)
+                        .expect("unreferenced Ps object must enter deletion exactly");
                 }
                 nt_user_host::ProcessDeletionPhase::DeletingProcessObject => {
                     if self.ps_object_retirements.withdraw(candidate, &mut self.pm).is_err() {
@@ -21319,19 +21400,25 @@ impl ExecNtHandler {
                         Err(_) => return HostedProcessDeletionOutcome::Pending(candidate.phase),
                     };
                     if !provider_ready {
+                        let Some((provider_badge, provider_role)) = self
+                            .ps_object_retirements
+                            .provider_finalizer_context(candidate)
+                        else {
+                            return HostedProcessDeletionOutcome::Pending(candidate.phase);
+                        };
                         let finalizer_client = win32k_glue::Win32kClientContext {
                             logical_caller: None,
                             pi: pi as u32,
                             generation: candidate.generation,
                             pid: u64::from(pid),
-                            badge: process_mechanism.top_badge,
+                            badge: provider_badge,
                             tid: 0,
                             tcb: 0,
                             eprocess: 0,
                             ethread: 0,
                             role: None,
-                            process_role: self.hosted_process_role(pi),
-                            top_badge: process_mechanism.top_badge,
+                            process_role: provider_role,
+                            top_badge: provider_badge,
                             teb: 0,
                             peb_mirror: 0,
                             scratch_base: EXECUTIVE_WIN32K_SCRATCH_BASE,
@@ -21379,34 +21466,9 @@ impl ExecNtHandler {
                         )
                         .expect("finalized Ps references must enter their exact release owner");
                 }
-                nt_user_host::ProcessDeletionPhase::RetiringMechanism => {
+                nt_user_host::ProcessDeletionPhase::Complete => {
                     assert!(!self.ps_object_retirements.contains(candidate));
-                    let dynamic_retirement = self
-                        .hosted_process_dynamic_retirement(pi, candidate.generation)
-                        .expect("preflighted dynamic process retirement identity changed");
-                    if let Some((loop_ctx, target, published_targets)) = dynamic_retirement {
-                        assert!(unsafe {
-                            retire_dynamic_hosted_identity_attachments(
-                                loop_ctx,
-                                target,
-                                published_targets,
-                            )
-                        });
-                    }
-                    let _ = self.thread_mechanisms.release_main(pi);
-                    for slot in 0..PM_RUNTIME_THREAD_SLOTS {
-                        let _ = self.thread_mechanisms.release_pool(pi, slot);
-                    }
-                    let released = self
-                        .process_mechanisms
-                        .release_exact(process_mechanism)
-                        .expect("preflighted hosted process mechanism must retire exactly");
-                    debug_assert_eq!(released.pid, pid);
-                    self.release_native_process_image(pi, pid, candidate.generation);
-                    self.pool_used[pi] = 0;
-                    self.drain_job_destructions();
-                    self.refresh_process_manager_gates();
-                    print_str(b"[process-delete] retired pi=");
+                    print_str(b"[process-delete] object retired pi=");
                     print_u64(pi as u64);
                     print_str(b" pid=");
                     print_u64(pid as u64);
@@ -21428,38 +21490,40 @@ impl ExecNtHandler {
         }
     }
 
-    /// Retry every exact hosted-process deletion candidate once. A missing or replacement process
-    /// mechanism can discard only an untouched candidate. Once cleanup begins, its exact owner
-    /// survives even an inconsistent mechanism generation and must not affect its replacement.
+    /// Retry every exact hosted-process deletion owner once. Dead objects may outlive their old
+    /// execution pi and coexist with a replacement there, so the drain never indexes by pi alone.
     pub(crate) fn drain_hosted_process_deletion_candidates(&mut self) -> usize {
         self.drain_failed_thread_constructions();
         let mut deleted = 0usize;
+        let _durable = allocator::enter_durable();
+        // A transient reservation failure cannot strand a signaled process whose deletion row
+        // was never queued. Rediscover that exact live mechanism on each service-loop drain.
         for pi in 0..MAX_PI {
-            let Some(candidate) = self.process_deletion_candidates.get(pi) else {
+            let Some(mechanism) = self.process_mechanisms.get(pi) else {
                 continue;
             };
-            let current = self.process_mechanisms.get(pi);
-            if !current.is_some_and(|mechanism| candidate.matches_mechanism(mechanism)) {
-                if candidate.phase != nt_user_host::ProcessDeletionPhase::AwaitingReferences
-                    || self.ps_object_retirements.contains(candidate)
-                {
-                    continue;
-                }
-                self.process_deletion_candidates
-                    .remove_exact(candidate)
-                    .expect("candidate remains exact until this serialized stale retirement");
-                continue;
-            }
-            if self.try_delete_hosted_process_object_exact(candidate)
-                == HostedProcessDeletionOutcome::Complete
+            if self.pm.is_process_signaled(mechanism.pid)
+                && self.process_deletion_candidates.get_exact(
+                    pi, mechanism.pid, mechanism.generation,
+                ).is_none()
+                && self.try_delete_hosted_process_object(mechanism.pid)
+                    == HostedProcessDeletionOutcome::Complete
             {
-                let candidate = self
-                    .process_deletion_candidates
-                    .get(pi)
-                    .expect("completed process deletion must retain its final phase");
-                self.process_deletion_candidates
-                    .remove_exact(candidate)
-                    .expect("successful exact process deletion must retire its retry owner");
+                deleted += 1;
+            }
+        }
+        let mut candidates = Vec::new();
+        if candidates.try_reserve(self.process_deletion_candidates.live_len()).is_err() {
+            return deleted;
+        }
+        candidates.extend(self.process_deletion_candidates.iter());
+        for candidate in candidates {
+            if self.process_deletion_candidates.get_exact(
+                candidate.pi, candidate.pid, candidate.generation,
+            ).is_some()
+                && self.try_delete_hosted_process_object(candidate.pid)
+                    == HostedProcessDeletionOutcome::Complete
+            {
                 deleted += 1;
             }
         }
