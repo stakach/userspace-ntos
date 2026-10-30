@@ -11,6 +11,8 @@ pub(crate) struct ProcessImageOwner {
     target: nt_exe_image::SpawnTarget,
     pid: Option<nt_process::ProcessId>,
     view: ImageViewRef,
+    /// Captured from the retained Section source, independent of later handle or path changes.
+    pub(crate) source: nt_exe_image::ProcessImageSourceEvidence,
     mechanism_retired: bool,
 }
 
@@ -53,6 +55,7 @@ impl ExecNtHandler {
         if headers.machine != 0x8664 || !headers.is_executable() { return Err(INVALID_IMAGE); }
         let role = nt_exe_image::HostedProcessRole::for_image_subsystem(headers.subsystem)
             .ok_or(STATUS_NOT_SUPPORTED)?;
+        let physical_file = source.backing.file.ok_or(INVALID_IMAGE)?;
         let observation_target = source.observation_target;
         let metadata = nt_exe_image::ImageMetadata {
             pool_va: bytes.as_mut_ptr() as u64, file_size: bytes.len() as u64,
@@ -80,6 +83,16 @@ impl ExecNtHandler {
         };
         let image = catalog.get_by_pi(pi).expect("new exact process image registration");
         let target = nt_exe_image::SpawnTarget::from_image(image);
+        let source = match nt_exe_image::ProcessImageSourceEvidence::capture(
+            image, physical_file, observation_target,
+        ) {
+            Ok(source) => source,
+            Err(_) => {
+                catalog.retire_dynamic_target(target).expect("unpublished exact image registration");
+                self.image_sections.release_view(view).expect("unpublished process image view");
+                return Err(INVALID_IMAGE);
+            }
+        };
         if register_hosted_process_runtime_for_image(image).is_err() {
             catalog.retire_dynamic_target(target).expect("unpublished exact image registration");
             self.image_sections.release_view(view).expect("unpublished process image view");
@@ -91,7 +104,7 @@ impl ExecNtHandler {
             self.image_sections.release_view(view).expect("unpublished process image view");
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
-        self.process_image_owners.push(ProcessImageOwner { target, pid: None, view, mechanism_retired: false });
+        self.process_image_owners.push(ProcessImageOwner { target, pid: None, view, source, mechanism_retired: false });
         let request = match (&mut *ctx.exe_images).reserve_spawn_from_native_section(
             catalog, target, self.pi, create.section_handle, metadata, desired_access, output,
         ) {

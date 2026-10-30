@@ -10,6 +10,8 @@ mod process_image_layout;
 pub use process_image_layout::ProcessImageLayout;
 pub mod service_group_launch;
 pub mod execution_role;
+mod process_image_source;
+pub use process_image_source::{ProcessImageSourceError, ProcessImageSourceEvidence};
 
 pub const MAX_EXE_LEAF: usize = 64;
 pub const MAX_NT_IMAGE_PATH: usize = 192;

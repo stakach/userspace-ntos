@@ -1,5 +1,5 @@
 use nt_exe_image::{HostedImageRoot, HostedProcessRole, ImageMetadata, ImageTable,
-    OwnedHostedImageCatalog, OwnedHostedProcessImage, SpawnTarget};
+    OwnedHostedImageCatalog, OwnedHostedProcessImage, ProcessImageSourceEvidence, SpawnTarget};
 use nt_memory_manager::{SectionFileIdentity, SectionMountIds};
 
 const META: ImageMetadata = ImageMetadata {
@@ -73,4 +73,38 @@ fn stale_target_and_reused_dynamic_process_identity_do_not_inherit_binding() {
     assert_eq!(replacement_pi, first_pi);
     assert_ne!(SpawnTarget::from_image(catalog.get_by_pi(replacement_pi).unwrap()), first);
     assert_eq!(catalog.get_by_pi(replacement_pi).unwrap().observation_target(), None);
+}
+
+#[test]
+fn retained_process_source_keeps_exact_file_and_observation_across_registration_reuse() {
+    let (mut catalog, registered_target, exact_file, other_file, _) = registered();
+    catalog.bind_registered_backing(registered_target, exact_file).unwrap();
+    catalog.bind_registered_launch_policy(registered_target,
+        HostedProcessRole::NativeSession).unwrap();
+    let observed = catalog.observation_for_backing(exact_file).unwrap();
+    let first_pi = catalog.admit_dynamic_executable_observed(b"services.exe",
+        HostedProcessRole::Application, b"\\SystemRoot\\System32\\services.exe",
+        b"services.exe", HostedImageRoot::System32, Some(observed), 64).unwrap();
+    let first_image = catalog.get_by_pi(first_pi).unwrap();
+    let first_target = SpawnTarget::from_image(first_image);
+    let source = ProcessImageSourceEvidence::capture(first_image, exact_file, Some(observed)).unwrap();
+    assert_eq!(source.file(), exact_file);
+    assert_eq!(source.observation(), Some(registered_target));
+    assert!(source.matches_target(first_target));
+    assert_eq!(source.registered_target_for_role(&catalog), Some(registered_target));
+    let wrong_file = ProcessImageSourceEvidence::capture(first_image, other_file, Some(observed)).unwrap();
+    assert_eq!(wrong_file.registered_target_for_role(&catalog), None,
+        "a different File cannot transfer the registered execution role");
+
+    catalog.retire_dynamic_target(first_target).unwrap();
+    let replacement_pi = catalog.admit_dynamic_executable_observed(b"services.exe",
+        HostedProcessRole::Application, b"\\SystemRoot\\System32\\services.exe",
+        b"services.exe", HostedImageRoot::System32, None, 64).unwrap();
+    let replacement = SpawnTarget::from_image(catalog.get_by_pi(replacement_pi).unwrap());
+    assert_eq!(replacement_pi, first_pi);
+    assert!(!source.matches_target(replacement));
+    assert_eq!(source.observation(), Some(registered_target));
+    assert_eq!(source.registered_target_for_role(&catalog), None);
+    assert!(ProcessImageSourceEvidence::capture(catalog.get_by_pi(replacement_pi).unwrap(),
+        exact_file, Some(observed)).is_err(), "old generation cannot attach to the replacement");
 }
