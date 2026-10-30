@@ -6,9 +6,17 @@ use super::*;
 pub(crate) struct PendingInitialThreadCreation {
     plan: nt_process::InitialThreadCreationPlan,
     progress: nt_user_host::initial_creation_progress::InitialCreationProgress,
+    role_reservation: Option<PendingInitialThreadRole>,
     handle: Option<nt_process::HandleReservation>,
     bound: bool,
     origin: InitialCreationOrigin,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingInitialThreadRole {
+    token: nt_exe_image::execution_role::PendingInitialThreadToken,
+    target: nt_exe_image::SpawnTarget,
+    process: nt_memory_manager::ProcessIdentity,
 }
 
 pub(crate) type Binding = nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>;
@@ -47,6 +55,58 @@ unsafe fn runtime(handler: &ExecNtHandler, binding: Binding) -> Option<&HostedTh
         .iter()
         .filter_map(|slot| slot.owner())
         .find(|owner| owner.binding() == binding)
+}
+
+fn lineage_status(error: nt_exe_image::execution_role::ExecutionRoleError) -> u32 {
+    use nt_exe_image::execution_role::ExecutionRoleError;
+    match error {
+        ExecutionRoleError::Full | ExecutionRoleError::TokenExhausted =>
+            STATUS_INSUFFICIENT_RESOURCES,
+        ExecutionRoleError::InvalidIdentity | ExecutionRoleError::InvalidBacking =>
+            nt_process::STATUS_INVALID_PARAMETER,
+        _ => nt_process::STATUS_DEVICE_BUSY,
+    }
+}
+
+/// Optional ledger admission for a child whose exact live Section File is retained. Existing
+/// process routes without that evidence keep ordinary NtCreateThread behavior but receive no
+/// ancestry or execution-role grant. A caller without a committed ledger identity cannot grant
+/// lineage; a historical image observation cannot promote a privileged role here.
+unsafe fn reserve_foreign_initial_thread_lineage(
+    handler: &mut ExecNtHandler,
+    caller: Binding,
+    child: Binding,
+) -> Result<Option<PendingInitialThreadRole>, u32> {
+    use nt_exe_image::{execution_role::ForeignInitialThreadLineageEvidence, HostedProcessRole, SpawnTarget};
+    if runtime(handler, caller).is_none()
+        || handler.capture_process_identity(caller.pi) != Some(caller.process)
+        || handler.capture_process_identity(child.pi) != Some(child.process)
+    { return Err(nt_process::STATUS_INVALID_HANDLE); }
+    let catalog = &*handler.hosted_images;
+    let child_image = catalog.get_by_pi(child.pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let target = SpawnTarget::from_image(child_image);
+    if !matches!(target.role, HostedProcessRole::Application | HostedProcessRole::NativeApplication) {
+        return Ok(None);
+    }
+    let Some(source) = handler.process_image_owners.iter()
+        .find_map(|owner| owner.source_for_live_process(target, child.process.pid))
+    else { return Ok(None); };
+    let caller_target = catalog.get_by_pi(caller.pi).map(SpawnTarget::from_image)
+        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    if handler.execution_roles.role(caller_target, caller.process).is_none() {
+        return Ok(None);
+    }
+    let token = handler.execution_roles.reserve_foreign_initial_thread_lineage(
+        catalog,
+        ForeignInitialThreadLineageEvidence {
+            caller: caller.process,
+            child: child.process,
+            child_target: target,
+            section_image: source.file(),
+            parent_handle_hint: None,
+        },
+    ).map_err(lineage_status)?;
+    Ok(Some(PendingInitialThreadRole { token, target, process: child.process }))
 }
 
 /// Capture the dormant target's exact provider identity before initial-thread ownership closes
@@ -325,6 +385,12 @@ unsafe fn cancel_creation(handler: &mut ExecNtHandler, binding: Binding, status:
     if !owner.progress.may_cancel_no_effects() {
         return nt_process::STATUS_DEVICE_BUSY;
     }
+    if let Some(reservation) = owner.role_reservation {
+        if let Err(error) = handler.execution_roles.cancel_foreign_initial_thread(
+            reservation.token, reservation.target, reservation.process,
+        ) { return lineage_status(error); }
+        owner.role_reservation = None;
+    }
     if let Some(handle) = owner.handle {
         let result = if owner.bound {
             handler.pm.cancel_bound_handle(handle).map(|_| ())
@@ -421,6 +487,20 @@ unsafe fn advance_initial_creation(
         handler.pm.commit_initial_thread_creation(&owner.plan)?;
         owner.progress.ps_committed().expect("Ps commit recorded once");
     }
+    let role_reservation = owner.role_reservation;
+    drop(slot);
+    if let Some(reservation) = role_reservation {
+        handler.execution_roles.commit_foreign_initial_thread(
+            &*handler.hosted_images,
+            reservation.token,
+            reservation.target,
+            reservation.process,
+        ).map_err(lineage_status)?;
+        runtime(handler, binding).ok_or(nt_process::STATUS_DEVICE_BUSY)?
+            .initial_creation.borrow_mut().as_mut()
+            .expect("committed initial owner retained")
+            .role_reservation = None;
+    }
     Ok(())
 }
 
@@ -471,6 +551,7 @@ impl ExecNtHandler {
             *slot = Some(PendingInitialThreadCreation {
                 plan,
                 progress: nt_user_host::initial_creation_progress::InitialCreationProgress::new(),
+                role_reservation: None,
                 handle: None,
                 bound: false,
                 origin: InitialCreationOrigin::Configured,
@@ -579,6 +660,14 @@ impl ExecNtHandler {
             desired_access: nt_ulong_arg(args[1]),
             create_suspended: nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]),
         };
+        let role_reservation = match reserve_foreign_initial_thread_lineage(self, caller, binding) {
+            Ok(reservation) => reservation,
+            Err(status) => {
+                self.pm.cancel_initial_thread_creation(&plan)
+                    .expect("unentered lineage admission retains its canonical reservation");
+                return status;
+            }
+        };
         {
             let runtime = runtime(self, binding).expect("validated initial runtime");
             let mut slot = runtime.initial_creation.borrow_mut();
@@ -589,6 +678,7 @@ impl ExecNtHandler {
             *slot = Some(PendingInitialThreadCreation {
                 plan,
                 progress: nt_user_host::initial_creation_progress::InitialCreationProgress::new(),
+                role_reservation,
                 handle: None,
                 bound: false,
                 origin: InitialCreationOrigin::Foreign(origin),

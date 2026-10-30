@@ -21313,6 +21313,10 @@ impl ExecNtHandler {
                     {
                         return HostedProcessDeletionOutcome::Pending(candidate.phase);
                     }
+                    let Some(role_target) = self.hosted_process_image(pi)
+                        .map(nt_exe_image::SpawnTarget::from_image)
+                        .filter(|target| target.generation == candidate.generation)
+                    else { return HostedProcessDeletionOutcome::Pending(candidate.phase); };
                     let dynamic_retirement = self
                         .hosted_process_dynamic_retirement(pi, candidate.generation)
                         .expect("reclaimed execution retained its exact image attachments");
@@ -21332,6 +21336,14 @@ impl ExecNtHandler {
                         .release_exact(process_mechanism)
                         .expect("reclaimed exact execution mechanism must retire once");
                     debug_assert_eq!(released.pid, pid);
+                    let role_process = nt_memory_manager::ProcessIdentity {
+                        pid,
+                        generation: nt_memory_manager::ProcessGeneration::Hosted(candidate.generation),
+                    };
+                    match self.execution_roles.retire_exact(role_target, role_process) {
+                        Ok(()) | Err(nt_exe_image::execution_role::ExecutionRoleError::NotFound) => {}
+                        Err(error) => panic!("exact execution-role retirement failed: {error:?}"),
+                    }
                     self.release_native_process_image(pi, pid, candidate.generation);
                     self.pool_used[pi] = 0;
                     self.drain_job_destructions();

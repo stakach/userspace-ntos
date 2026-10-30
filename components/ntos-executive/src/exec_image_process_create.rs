@@ -16,6 +16,19 @@ pub(crate) struct ProcessImageOwner {
     mechanism_retired: bool,
 }
 
+impl ProcessImageOwner {
+    /// Give initial-thread admission only the Section File captured for this live process image.
+    /// A reused PI or PID cannot borrow an older owner's backing.
+    pub(crate) fn source_for_live_process(
+        &self,
+        target: nt_exe_image::SpawnTarget,
+        pid: nt_process::ProcessId,
+    ) -> Option<nt_exe_image::ProcessImageSourceEvidence> {
+        (self.target == target && self.pid == Some(pid) && !self.mechanism_retired
+            && self.source.matches_target(target)).then_some(self.source)
+    }
+}
+
 impl ExecNtHandler {
     pub(super) unsafe fn reserve_native_image_process(
         &mut self,
