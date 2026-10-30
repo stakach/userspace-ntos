@@ -30098,7 +30098,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // service from the accepted child's mounted-CM policy at START time.
     let preload_receipt = {
         let fs = exec_fs().expect("boot driver preload requires mounted installed volume");
-        driver_launch::stage_registry_boot_driver_sources(&fs, live_cm_mount.generation)
+        driver_launch::stage_registry_boot_driver_sources(&fs, boot_driver_snapshot.mount_generation)
             .expect("registry-selected boot driver source preload failed")
     };
     print_str(b"[driver-preload] services/bytes=");
@@ -30106,7 +30106,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_str(b"/");
     print_u64(preload_receipt.bytes);
     print_str(b" generation=");
-    print_u64(live_cm_mount.generation);
+    print_u64(preload_receipt.generation);
     print_str(b"\n");
     let replyless_device_service_count = system_boot_driver_plan
         .as_slice()
