@@ -90,6 +90,17 @@ impl RetainedConnectWork {
         &mut self.origin
     }
 
+    pub(super) unsafe fn nested_preparation_ready(&self) -> bool {
+        let Ok(command) = self.completion_command() else { return false };
+        use nt_io_manager::source_irp_ledger::SourceIrpOwner;
+        let instance = match command.allocation.owner {
+            SourceIrpOwner::HostedDriver(index) | SourceIrpOwner::HostedCaller(index) => index,
+            SourceIrpOwner::Win32k => return false,
+        };
+        self.origin.terminal_ready(command)
+            && hosted_source_completion_lane::ready_for_source(instance, command)
+    }
+
     pub(super) fn forward(&self) -> Option<&nt_io_manager::retained_connect_forward::RetainedConnectForward> {
         self.source.forward_ref()
     }

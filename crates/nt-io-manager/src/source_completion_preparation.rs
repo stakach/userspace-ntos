@@ -25,6 +25,15 @@ pub const fn admit_existing(
     }
 }
 
+/// Whether a retained CONNECT owner may run in a nested receive turn.
+pub const fn nested_connect_ready(
+    active: bool,
+    provider_entered: bool,
+    source_prepared: bool,
+) -> bool {
+    active && (provider_entered || source_prepared)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{admit_existing, ExistingLanePhase, ExistingLanePreparation};
@@ -54,5 +63,13 @@ mod tests {
             admit_existing(ExistingLanePhase::Other, true),
             ExistingLanePreparation::RetainedUncertain,
         );
+    }
+
+    #[test]
+    fn nested_connect_waits_for_prepared_source_but_preserves_entered_progress() {
+        assert!(!super::nested_connect_ready(true, false, false));
+        assert!(super::nested_connect_ready(true, false, true));
+        assert!(super::nested_connect_ready(true, true, false));
+        assert!(!super::nested_connect_ready(false, true, true));
     }
 }
