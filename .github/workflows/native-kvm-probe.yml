@@ -1,0 +1,49 @@
+name: Native x86 KVM probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/libernt-userspace]
+    paths: [.github/workflows/native-kvm-probe.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  kvm-probe:
+    name: Probe hosted x86 KVM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Verify KVM access
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import fcntl
+          import os
+          import platform
+          import stat
+
+          machine = platform.machine()
+          print(f"host architecture: {machine}")
+          if machine != "x86_64":
+              raise SystemExit("expected an x86_64 hosted runner")
+
+          path = "/dev/kvm"
+          try:
+              metadata = os.stat(path)
+          except FileNotFoundError:
+              raise SystemExit(f"{path} is absent; hosted KVM is unavailable")
+          if not stat.S_ISCHR(metadata.st_mode):
+              raise SystemExit(f"{path} is not a character device")
+
+          try:
+              with open(path, "rb+", buffering=0) as device:
+                  # Linux uapi/linux/kvm.h: KVM_GET_API_VERSION = _IO(KVMIO, 0x00).
+                  version = fcntl.ioctl(device, 0xAE00)
+          except OSError as error:
+              raise SystemExit(f"cannot access hosted KVM: {error}")
+          if version != 12:
+              raise SystemExit(f"unexpected KVM API version: {version}")
+          print(f"hosted KVM available: {path}, API version {version}")
+          PY
