@@ -140,6 +140,7 @@ static EXECUTING_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
 static EXECUTING_ADMISSION_RELEASED: AtomicBool = AtomicBool::new(false);
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 static NEXT: AtomicU64 = AtomicU64::new(0);
+static ROUTED_OBSERVATION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 
 fn finish_sparse_header_window(work: &mut Work) {
     let capture = work.sparse_image.as_mut().expect("sparse image header owner");
@@ -746,6 +747,38 @@ unsafe fn advance(
                     .expect("Section metadata did not reach a terminal phase");
                 match result {
                     Ok(metadata) => {
+                        if work.allocation_attrs & 0x0100_0000 != 0 && !metadata.is_directory {
+                            let observation = work.capture.as_ref()
+                                .and_then(|capture| mounted_volume::physical_exec_file_alias(
+                                    capture.device_id(), metadata.file,
+                                ))
+                                .and_then(|physical_file| handler.loop_ctx.and_then(|ctx| {
+                                    // The catalog is loop-owned and this metadata completion is
+                                    // serialized before image Section publication.
+                                    unsafe { (&*ctx.exe_image_catalog).observation_for_backing(physical_file) }
+                                }));
+                            if let Some(observation) = observation {
+                                if work.observation_target.is_some_and(|existing| existing != observation) {
+                                    work.capture.take();
+                                    work.status = STATUS_INVALID_IMAGE_FORMAT;
+                                    work.phase = Phase::ReadyReply;
+                                    return Step::Progress;
+                                }
+                                work.observation_target = Some(observation);
+                                let n = ROUTED_OBSERVATION_TRACE_N.fetch_add(1, Ordering::Relaxed);
+                                if n < 8 {
+                                    print_str(b"[routed-image-observation] pi/role/target-pi/generation=");
+                                    print_u64(work.pi as u64);
+                                    print_str(b"/");
+                                    print_u64(observation.target().role as u64);
+                                    print_str(b"/");
+                                    print_u64(observation.target().pi as u64);
+                                    print_str(b"/");
+                                    print_u64(observation.target().generation);
+                                    print_str(b"\n");
+                                }
+                            }
+                        }
                         work.file_metadata = Some(metadata);
                         work.phase = if work.allocation_attrs & 0x0100_0000 != 0 {
                             Phase::HeaderDispatch

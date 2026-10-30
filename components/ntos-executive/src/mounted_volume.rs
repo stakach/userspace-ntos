@@ -14,6 +14,40 @@ static mut MOUNT_BINDINGS: SectionMountBindings<nt_io_manager::DeviceId> =
 static mut MOUNT_CREATE_QUEUE: Option<MountedCreateQueue> = None;
 static mut MOUNT_READ_QUEUE: Option<MountedReadQueue> = None;
 static mut MOUNT_DIRECTORY_QUEUE: Option<MountedDirectoryQueue> = None;
+/// The published File device for the executive's exact physical FAT mount.
+static mut EXEC_VOLUME_DEVICE: Option<(SectionMountId, u64)> = None;
+
+pub(crate) fn draining_exec_volume_device() -> Option<u64> {
+    let physical = unsafe { crate::fs_loader::exec_fs_mount_identity() }?;
+    if !matches!(
+        crate::fs_loader::exec_block_route_kind(physical),
+        Some(nt_fs::BlockSourceKind::Draining | nt_fs::BlockSourceKind::Native)
+    ) {
+        return None;
+    }
+    let (bound, device_id) = unsafe { *core::ptr::addr_of!(EXEC_VOLUME_DEVICE) }?;
+    if bound != physical || mount_id_for_live_device(device_id).is_none() {
+        return None;
+    }
+    Some(device_id)
+}
+
+/// Catalog lookup alias for a routed File on the exact live installed-volume device.
+/// The File's namespace identity must remain the original mounted-volume identity.
+pub(crate) fn physical_exec_file_alias(
+    device_id: u64,
+    file: nt_memory_manager::SectionFileIdentity,
+) -> Option<nt_memory_manager::SectionFileIdentity> {
+    let physical = unsafe { crate::fs_loader::exec_fs_mount_identity() }?;
+    let registered = draining_exec_volume_device()?;
+    unsafe { (&*core::ptr::addr_of!(MOUNT_BINDINGS)).physical_file_alias(
+        nt_io_manager::DeviceId(device_id),
+        file,
+        Some((physical, nt_io_manager::DeviceId(registered))),
+        true,
+    ) }
+}
+
 
 pub(crate) fn claim_mounted_directory_sector() -> Option<crate::mounted_volume_backend::mounted_directory_lookup::DirectorySectorClaim> {
     let queue = unsafe { (&*core::ptr::addr_of!(MOUNT_DIRECTORY_QUEUE)).as_ref()?.clone() };
@@ -143,6 +177,8 @@ fn discover_installed_root(fs: &crate::Fat32) -> Result<nt_fs::InstalledRoot, Nt
 pub(crate) fn register_mounted_volume(
     fs: crate::Fat32,
 ) -> Result<(u64, bool, nt_fs::InstalledRoot, String), NtStatus> {
+    let physical_mount = unsafe { crate::fs_loader::exec_fs_mount_identity() }
+        .ok_or(NtStatus::DEVICE_NOT_READY)?;
     let installed_root = discover_installed_root(&fs)?;
     let root_name =
         String::from_utf16(&installed_root.name).map_err(|_| NtStatus::OBJECT_NAME_INVALID)?;
@@ -191,6 +227,7 @@ pub(crate) fn register_mounted_volume(
     unsafe { *core::ptr::addr_of_mut!(MOUNT_CREATE_QUEUE) = Some(create_queue); }
     unsafe { *core::ptr::addr_of_mut!(MOUNT_READ_QUEUE) = Some(read_queue); }
     unsafe { *core::ptr::addr_of_mut!(MOUNT_DIRECTORY_QUEUE) = Some(directory_queue); }
+    unsafe { *core::ptr::addr_of_mut!(EXEC_VOLUME_DEVICE) = Some((physical_mount, device_id)); }
     crate::print_str(b"[mounted-volume] registered ");
     crate::print_str(device_path.as_bytes());
     crate::print_str(b" device=");

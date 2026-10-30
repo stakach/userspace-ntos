@@ -49,6 +49,9 @@ fn same_leaf_other_file_or_mount_cannot_supply_registered_observation() {
     catalog.bind_registered_backing(target, exact).unwrap();
     assert_eq!(catalog.observation_for_backing(other_file), None);
     assert_eq!(catalog.observation_for_backing(other_mount), None);
+    assert_eq!(catalog.observation_for_backing(SectionFileIdentity {
+        file_id: (1 << 63) | exact.file_id, ..exact
+    }), None);
     assert_eq!(catalog.observation_for_backing(exact).unwrap().target(), target);
 }
 
