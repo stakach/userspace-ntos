@@ -239,3 +239,76 @@ fn scheduler_settles_validated_startup_with_exact_protocol_and_current_reply() {
     protocol.visit_block(&helper.block);
     assert!(protocol.0);
 }
+
+#[test]
+fn timer_demand_probes_exact_ingress_once_before_yielding_worker_startup() {
+    // A class worker can publish READY while a timer rearm remains pending. Yielding before
+    // entering the physical receive starves that Call even though its route and Reply are live.
+    let file = source("component_shared_pump.rs");
+    let receive = function(&file, "receive").expect("shared component receive boundary");
+    let loop_body = receive.block.stmts.iter().find_map(|statement| {
+        let syn::Stmt::Expr(Expr::Loop(loop_expr), _) = statement else { return None };
+        Some(&loop_expr.body)
+    }).expect("shared receive must retain its invocation across timer checkpoints");
+    let calls = |statement: &syn::Stmt| {
+        let mut observe = Observe::default();
+        observe.visit_stmt(statement);
+        observe.calls
+    };
+    let position = |name: &str| loop_body.stmts.iter().position(|statement|
+        calls(statement).iter().any(|call| call == name))
+        .unwrap_or_else(|| panic!("receive loop lacks {name}"));
+    let target = position("next_message");
+    let timer = position("timer_work_pending");
+    let yield_guard = position("scheduler_yield");
+    let owner = position("receive_owner");
+    let physical = position("receive");
+    assert!(target < timer && timer < yield_guard && yield_guard < owner && owner < physical,
+        "inspect retained READY first, then give pending timer one physical probe before yielding");
+
+    let syn::Stmt::Expr(Expr::If(guard), _) = &loop_body.stmts[yield_guard] else {
+        panic!("scheduler yield must be guarded by the consumed timer probe");
+    };
+    assert!(matches!(&*guard.cond, Expr::Binary(condition)
+        if matches!(&*condition.left, Expr::Path(path) if path.path.is_ident("timer_checkpoint"))
+            && matches!(&*condition.right, Expr::Path(path)
+                if path.path.is_ident("timer_probe_consumed"))),
+        "timer work may yield only after one receive probe in this invocation");
+    let armed = loop_body.stmts.iter().enumerate().any(|(index, statement)| {
+        if index <= yield_guard || index >= physical { return false; }
+        matches!(statement, syn::Stmt::Expr(Expr::Assign(assignment), _)
+            if matches!(&*assignment.left, Expr::Path(path)
+                if path.path.is_ident("timer_probe_consumed"))
+                && matches!(&*assignment.right, Expr::Path(path)
+                    if path.path.is_ident("timer_checkpoint")))
+    });
+    assert!(armed, "record the one-shot probe before entering the native receive effect");
+
+    struct PhysicalProbe(bool);
+    impl<'ast> Visit<'ast> for PhysicalProbe {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if matches!(&*call.func, Expr::Path(path)
+                if path.path.segments.iter().any(|part| part.ident == "runtime")
+                    && path.path.segments.last().is_some_and(|part| part.ident == "receive")) {
+                self.0 |= call.args.len() == 3
+                    && matches!(&call.args[0], Expr::Path(path)
+                        if path.path.is_ident("execution"))
+                    && matches!(&call.args[1], Expr::Field(field)
+                        if matches!(&field.member, syn::Member::Named(name) if name == "tcb"))
+                    && matches!(&call.args[2], Expr::Unary(unary)
+                        if matches!(&unary.op, syn::UnOp::Not(_))
+                            && matches!(&*unary.expr, Expr::Path(path)
+                                if path.path.is_ident("timer_checkpoint")));
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
+    let mut probe = PhysicalProbe(false);
+    probe.visit_stmt(&loop_body.stmts[physical]);
+    assert!(probe.0,
+        "timer demand must attempt one nonblocking physical receive through the exact ingress owner");
+    let mut all = Observe::default();
+    all.visit_block(loop_body);
+    assert!(!all.calls.iter().any(|name| name == "reply" || name == "reply_seh"),
+        "the fairness probe must not send or reuse the worker's retained Reply");
+}

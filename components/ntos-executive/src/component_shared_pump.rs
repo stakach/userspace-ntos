@@ -94,6 +94,7 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: b
     let inline_irq_checkpoint =
         retained_seh || (ch.caps.kind == ReqKind::Syscall && !ch.caps.kernel_irq_yield);
     let mut irq_checkpoint = inline_irq_checkpoint && inline_irq_work_pending();
+    let mut timer_probe_consumed = false;
     loop {
         if !retained_seh {
             match crate::win32k_glue::prepare_receive_yield(ch) {
@@ -198,11 +199,16 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: b
                 }
             }
         }
-        if !retained_seh && (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
-            && crate::dispatcher_bootstrap::timer_work_pending()
-        {
+        let timer_checkpoint = !retained_seh
+            && (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
+            && crate::dispatcher_bootstrap::timer_work_pending();
+        if timer_checkpoint && timer_probe_consumed {
             return PumpMessage::scheduler_yield();
         }
+        // A pending timer still gets its scheduler pass, but first give a newly arrived Call
+        // one nonblocking physical receive through the exact retained ingress owner. Otherwise
+        // continuously republished timer demand can starve a worker's READY Call forever.
+        timer_probe_consumed = timer_checkpoint;
         if inline_irq_checkpoint && irq_checkpoint {
             if service_inline_irq_checkpoint(ch, route).is_err() {
                 crate::print_str(b"[pump-ingress] inline IRQ checkpoint lost its route\n");
@@ -220,7 +226,7 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: b
                 return PumpMessage::transport_wall();
             }
         };
-        let arrival = runtime::receive(execution, ch.tcb, true);
+        let arrival = runtime::receive(execution, ch.tcb, !timer_checkpoint);
         match arrival {
             Ok(runtime::Arrival::Hosted) => {}
             Ok(runtime::Arrival::Call { .. }) => {
@@ -228,6 +234,11 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: b
                 // this invocation's stored arrival on the next pass.
             }
             Ok(runtime::Arrival::Notification(message)) => {
+                // The shared ingress has already proven NoCall with a free Reply. An empty
+                // nonblocking probe has no sender and must not count as watchdog progress.
+                if timer_checkpoint && message.badge() == 0 && message.info() == 0 {
+                    return PumpMessage::scheduler_yield();
+                }
                 crate::census_tick_static(crate::monotonic_time_100ns());
                 let (event, _, irq) = pump_handle_executive_event_badge(message.badge());
                 if irq {
