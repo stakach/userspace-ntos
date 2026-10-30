@@ -15,6 +15,7 @@ pub(crate) struct HostedBootstrapLoadSpec {
     pub(crate) disk_path: &'static [u8],
     pub(crate) stem: &'static [u8],
     pub(crate) image: nt_exe_image::HostedProcessImageRef<'static>,
+    pub(crate) allowed_creator: nt_exe_image::HostedProcessRole,
 }
 
 #[derive(Clone, Copy)]
@@ -24,6 +25,7 @@ struct HostedBootstrapManifestEntry {
     top_badge: u64,
     leaf: &'static [u8],
     role: nt_exe_image::HostedProcessRole,
+    allowed_creator: nt_exe_image::HostedProcessRole,
     nt_image_path: &'static [u8],
     command_line: &'static [u8],
     image_root: nt_exe_image::HostedImageRoot,
@@ -53,6 +55,7 @@ impl HostedBootstrapManifestEntry {
             disk_path: self.disk_path,
             stem: self.stem,
             image: self.image(pi),
+            allowed_creator: self.allowed_creator,
         }
     }
 }
@@ -63,6 +66,7 @@ const SMSS_BOOTSTRAP_MANIFEST: HostedBootstrapManifestEntry = HostedBootstrapMan
     top_badge: nt_exe_image::SMSS_TOP_BADGE,
     leaf: b"smss.exe",
     role: nt_exe_image::HostedProcessRole::NativeSession,
+    allowed_creator: nt_exe_image::HostedProcessRole::NativeSession,
     nt_image_path: b"\\SystemRoot\\System32\\smss.exe",
     command_line: b"smss.exe",
     image_root: nt_exe_image::HostedImageRoot::System32,
@@ -76,6 +80,7 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         top_badge: nt_exe_image::CSRSS_TOP_BADGE,
         leaf: b"csrss.exe",
         role: nt_exe_image::HostedProcessRole::Win32Subsystem,
+        allowed_creator: nt_exe_image::HostedProcessRole::NativeSession,
         nt_image_path: b"\\SystemRoot\\System32\\csrss.exe",
         command_line: b"csrss.exe ObjectDirectory=\\Windows SharedSection=1024,3072,512 Windows=On SubSystemType=Windows ServerDll=basesrv,1 ServerDll=winsrv:UserServerDllInitialization,3 ServerDll=winsrv:ConServerDllInitialization,2 ProfileControl=Off MaxRequestThreads=16",
         image_root: nt_exe_image::HostedImageRoot::System32,
@@ -87,6 +92,7 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         top_badge: nt_exe_image::WINLOGON_TOP_BADGE,
         leaf: b"winlogon.exe",
         role: nt_exe_image::HostedProcessRole::InteractiveLogon,
+        allowed_creator: nt_exe_image::HostedProcessRole::NativeSession,
         nt_image_path: b"\\SystemRoot\\System32\\winlogon.exe",
         command_line: b"winlogon.exe",
         image_root: nt_exe_image::HostedImageRoot::System32,
@@ -98,6 +104,7 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         top_badge: nt_exe_image::SERVICES_TOP_BADGE,
         leaf: b"services.exe",
         role: nt_exe_image::HostedProcessRole::ServiceControlManager,
+        allowed_creator: nt_exe_image::HostedProcessRole::InteractiveLogon,
         nt_image_path: b"\\SystemRoot\\System32\\services.exe",
         command_line: b"services.exe",
         image_root: nt_exe_image::HostedImageRoot::System32,
@@ -109,6 +116,7 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         top_badge: nt_exe_image::LSASS_TOP_BADGE,
         leaf: b"lsass.exe",
         role: nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
+        allowed_creator: nt_exe_image::HostedProcessRole::InteractiveLogon,
         nt_image_path: b"\\SystemRoot\\System32\\lsass.exe",
         command_line: b"lsass.exe",
         image_root: nt_exe_image::HostedImageRoot::System32,
@@ -120,6 +128,7 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         top_badge: nt_exe_image::USERINIT_TOP_BADGE,
         leaf: b"userinit.exe",
         role: nt_exe_image::HostedProcessRole::InteractiveShellBootstrap,
+        allowed_creator: nt_exe_image::HostedProcessRole::InteractiveLogon,
         nt_image_path: b"\\SystemRoot\\System32\\userinit.exe",
         command_line: b"userinit.exe",
         image_root: nt_exe_image::HostedImageRoot::System32,
@@ -131,6 +140,7 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         top_badge: nt_exe_image::EXPLORER_TOP_BADGE,
         leaf: b"explorer.exe",
         role: nt_exe_image::HostedProcessRole::InteractiveShell,
+        allowed_creator: nt_exe_image::HostedProcessRole::InteractiveShellBootstrap,
         nt_image_path: b"\\SystemRoot\\explorer.exe",
         command_line: b"explorer.exe",
         image_root: nt_exe_image::HostedImageRoot::SystemRoot,

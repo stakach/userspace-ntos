@@ -6017,10 +6017,13 @@ unsafe fn load_hosted_bootstrap_image(
     register_loaded_hosted_image(catalog, spec.image, loaded)
         .expect("hosted bootstrap image metadata must register once when loaded");
     if loaded {
+        let target = nt_exe_image::SpawnTarget::from_image(spec.image);
         catalog.bind_registered_backing(
-            nt_exe_image::SpawnTarget::from_image(spec.image),
+            target,
             backing.expect("loaded bootstrap image retains its exact mounted File identity"),
         ).expect("bootstrap image File identity must bind its registered generation once");
+        catalog.bind_registered_launch_policy(target, spec.allowed_creator)
+            .expect("bootstrap creator policy must bind after its exact mounted File");
     }
     print_str(b"[sec-init] bootstrap-image item=");
     print_u64(index as u64);
