@@ -98,7 +98,7 @@ impl RetainedConnectWork {
             SourceIrpOwner::Win32k => return false,
         };
         self.origin.terminal_ready(command)
-            && hosted_source_completion_lane::ready_for_source(instance, command)
+            && hosted_source_completion_lane::preparation_ready(instance, command)
     }
 
     pub(super) fn forward(&self) -> Option<&nt_io_manager::retained_connect_forward::RetainedConnectForward> {

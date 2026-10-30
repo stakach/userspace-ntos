@@ -29,9 +29,22 @@ pub const fn admit_existing(
 pub const fn nested_connect_ready(
     active: bool,
     provider_entered: bool,
-    source_prepared: bool,
+    source_admissible: bool,
 ) -> bool {
-    active && (provider_entered || source_prepared)
+    active && (provider_entered || source_admissible)
+}
+
+/// Admission before a nested CONNECT provider entry, using the exact source lane state.
+pub const fn nested_source_preparation_ready(
+    phase: Option<ExistingLanePhase>,
+    current: bool,
+    prepared_route_ready: bool,
+) -> bool {
+    current && match phase {
+        None => true,
+        Some(ExistingLanePhase::Prepared) => prepared_route_ready,
+        Some(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -71,5 +84,18 @@ mod tests {
         assert!(super::nested_connect_ready(true, false, true));
         assert!(super::nested_connect_ready(true, true, false));
         assert!(!super::nested_connect_ready(false, true, true));
+    }
+
+    #[test]
+    fn absent_lane_can_be_constructed_once_while_preparing_defers() {
+        use super::nested_source_preparation_ready as ready;
+        assert!(ready(None, true, false), "the first nested turn owns construction");
+        assert!(!ready(Some(ExistingLanePhase::Preparing), true, false));
+        assert!(ready(Some(ExistingLanePhase::Prepared), true, true));
+        assert!(!ready(Some(ExistingLanePhase::Prepared), true, false));
+        assert!(!ready(None, false, false));
+        assert!(!ready(Some(ExistingLanePhase::Preparing), false, false));
+        assert!(!ready(Some(ExistingLanePhase::Prepared), false, true));
+        assert!(!ready(Some(ExistingLanePhase::Other), true, false));
     }
 }

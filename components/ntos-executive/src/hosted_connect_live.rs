@@ -623,10 +623,10 @@ pub(super) unsafe fn redrive_nested_ready() -> bool {
 impl Work {
     fn nested_ready(&self) -> bool {
         let active = !self.blocked && !self.port_acknowledged;
-        let source_prepared = active && !self.provider_entered
+        let source_admissible = active && !self.provider_entered
             && unsafe { self.source.nested_preparation_ready() };
         nt_io_manager::source_completion_preparation::nested_connect_ready(
-            active, self.provider_entered, source_prepared,
+            active, self.provider_entered, source_admissible,
         )
     }
 

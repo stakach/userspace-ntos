@@ -169,13 +169,19 @@ pub(super) unsafe fn preparation_ready(
     instance_index: usize,
     command: SourceCompletionCommand,
 ) -> bool {
-    if !command_is_current(instance_index, command) {
-        return false;
-    }
-    match row_for(instance_index, command) {
-        Some(_) => ready_for_source(instance_index, command),
-        None => true,
-    }
+    let phase = row_for(instance_index, command).map(|index| {
+        match (&*core::ptr::addr_of!(LANES))[index].phase {
+            Phase::Preparing => ExistingLanePhase::Preparing,
+            Phase::Prepared => ExistingLanePhase::Prepared,
+            _ => ExistingLanePhase::Other,
+        }
+    });
+    nt_io_manager::source_completion_preparation::nested_source_preparation_ready(
+        phase,
+        command_is_current(instance_index, command),
+        matches!(phase, Some(ExistingLanePhase::Prepared))
+            && ready_for_source(instance_index, command),
+    )
 }
 
 pub(super) unsafe fn prepare(
