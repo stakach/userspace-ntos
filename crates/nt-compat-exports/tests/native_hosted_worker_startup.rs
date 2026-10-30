@@ -337,3 +337,83 @@ fn serviced_scheduler_yield_blocks_on_exact_worker_receive_despite_renewed_timer
         && continuation_calls.fields.iter().any(|name| name == "scheduler_yielded"),
         "the continuation must validate the retained yielded pump and avoid a second request/reply");
 }
+
+#[test]
+fn scheduler_yield_hands_off_once_to_its_authenticated_component_before_receive() {
+    // A bound timer may wake the priority-255 executive before its priority-100 worker has
+    // published READY or completed a port CONNECT. The next retained receive must give that
+    // exact component a dispatch chance; a new request or synthetic completion cannot substitute
+    // for its physical Call.
+    let file = source("component_scheduler.rs");
+    let pump = function(&file, "hosted_component_pump_inner").unwrap();
+    let mut whole = Observe::default();
+    whole.visit_block(&pump.block);
+    assert!(whole.calls.iter().any(|call| call == "channel_route"),
+        "component handoff must use the authenticated exact physical route");
+
+    let yield_loop = pump.block.stmts.iter().find_map(|statement| {
+        let syn::Stmt::Expr(Expr::While(loop_expr), _) = statement else { return None };
+        matches!(&*loop_expr.cond, Expr::Field(field)
+            if matches!(&field.member, syn::Member::Named(name) if name == "scheduler_yielded"))
+            .then_some(&loop_expr.body)
+    }).expect("startup scheduler loop must retain the yielded pump");
+    let calls = |statement: &syn::Stmt| {
+        let mut observe = Observe::default();
+        observe.visit_stmt(statement);
+        observe.calls
+    };
+    let serviced = yield_loop.stmts.iter().position(|statement|
+        calls(statement).iter().any(|call| call == "service_irq_yield"))
+        .expect("service the timer before granting a worker dispatch chance");
+    let continued = yield_loop.stmts.iter().position(|statement|
+        calls(statement).iter().any(|call|
+            call == "component_pump_continue_receive_after_scheduler_service"))
+        .expect("retain the receive-only continuation");
+    assert!(serviced < continued);
+
+    struct Handoff {
+        exact_worker: bool,
+        count: usize,
+    }
+    impl<'ast> Visit<'ast> for Handoff {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if matches!(&*call.func, Expr::Path(path)
+                if path.path.segments.last().is_some_and(|part|
+                    part.ident.to_string().contains("handoff"))) {
+                self.count += 1;
+                self.exact_worker |= call.args.iter().any(|arg|
+                    matches!(arg, Expr::Field(field)
+                        if matches!(&*field.base, Expr::Path(path)
+                            if path.path.is_ident("channel"))
+                            && matches!(&field.member, syn::Member::Named(name)
+                                if name == "tcb")));
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
+    let guarded = yield_loop.stmts.iter().enumerate().any(|(index, statement)| {
+        if index <= serviced || index >= continued { return false; }
+        let syn::Stmt::Expr(Expr::If(branch), _) = statement else { return false };
+        if !matches!(&*branch.cond, Expr::MethodCall(call)
+            if call.method == "is_some"
+                && matches!(&*call.receiver, Expr::Path(path)
+                    if path.path.is_ident("route"))) {
+            return false;
+        }
+        let mut handoff = Handoff { exact_worker: false, count: 0 };
+        handoff.visit_block(&branch.then_branch);
+        handoff.exact_worker && handoff.count == 1
+    });
+    assert!(guarded,
+        "after timer service, the authenticated physical route must hand off once to channel.tcb before the retained receive");
+    let mut all_handoffs = Handoff { exact_worker: false, count: 0 };
+    all_handoffs.visit_block(yield_loop);
+    assert_eq!(all_handoffs.count, 1,
+        "no unrelated or repeated handoff may escape the authenticated route guard");
+
+    let mut loop_calls = Observe::default();
+    loop_calls.visit_block(yield_loop);
+    assert!(!loop_calls.calls.iter().any(|call|
+        matches!(call.as_str(), "reply" | "reply_seh" | "pump_deliver_initial_request" | "component_pump")),
+        "worker handoff must not replay the request, its Reply, or invent completion");
+}

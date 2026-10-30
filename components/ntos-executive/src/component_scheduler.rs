@@ -48,6 +48,12 @@ pub(super) fn is_active() -> bool {
     DEPTH.load(Ordering::Acquire) != 0
 }
 
+/// The retained physical route owns this TCB cap. A failed request means the worker is no
+/// longer runnable; the subsequent exact receive remains responsible for any completion.
+fn handoff_exact_component_once(tcb: u64) -> bool {
+    sel4_rt::tcb_yield_to(tcb) == 0
+}
+
 /// Keeps PASSIVE work and projection retirement outside the entire component invocation.
 /// IRQ isolation comes from the dedicated broker arenas, not a copy of an active request bank.
 pub(crate) struct ComponentSchedulerScope {
@@ -73,10 +79,19 @@ impl ComponentSchedulerScope {
         let timer_work = crate::dispatcher_bootstrap::service_hosted_timer_work();
         let irq_lines = drain_pending_hosted_irqs_snapshot();
         let dpcs = drain_hosted_driver_dpcs();
+        // A hosted IRP may be waiting for a provider registry write whose exact native
+        // header/WAL command cannot wait for the outer service loop. The parent is parked;
+        // execute one block command through its separate retained provider owner.
+        let native_blocks = crate::driver_launch::service_mounted_native_blocks();
         // Nested exchanges may reconcile earlier requests before these effects publish new demand.
         crate::dispatcher_bootstrap::request_receive_checkpoint();
         crate::dispatcher_bootstrap::prepare_receive()
             .expect("bootstrap timer admission failed before retained receive");
+        // A nested call can observe a sector claimed by its parked parent before that parent
+        // publishes PENDING. Only a completed native service turn may rearm from its final state.
+        if !crate::driver_launch::mounted_native_block_service_active() {
+            crate::service_sec_image::rearm_registered_active_delay_timer();
+        }
         if yield_number <= 16 {
             // Report canonical demand after the actual receive checkpoint.
             let deadline = crate::dispatcher_bootstrap::next_deadline(crate::nt_time_snapshot());
@@ -90,6 +105,8 @@ impl ComponentSchedulerScope {
             print_u64(irq_lines);
             print_str(b" dpcs=");
             print_u64(dpcs);
+            print_str(b" native-blocks=");
+            print_u64(native_blocks as u64);
             match deadline {
                 Ok(Some((target, source))) => {
                     print_str(b" bootstrap-deadline=");
@@ -177,6 +194,9 @@ unsafe fn hosted_component_pump_inner(
         scope.service_irq_yield(channel.shared_va);
         trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 3, Some(&result));
         trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 3, Some(&result));
+        if route.is_some() {
+            let _ = handoff_exact_component_once(channel.tcb);
+        }
         if let Some(route) = route {
             channel.reply_cap = runtime::current_reply(route).expect("retained canonical Reply");
         }
