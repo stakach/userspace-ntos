@@ -149,6 +149,9 @@ pub enum HostedIrqServiceKind {
     TimerCancel = 9,
     TimerSet = 10,
     RemoveDpc = 11,
+    DmaFreeMapping = 12,
+    SetEvent = 13,
+    BeginLocalIrpCompletion = 14,
 }
 
 impl HostedIrqServiceKind {
@@ -165,6 +168,9 @@ impl HostedIrqServiceKind {
             9 => Some(Self::TimerCancel),
             10 => Some(Self::TimerSet),
             11 => Some(Self::RemoveDpc),
+            12 => Some(Self::DmaFreeMapping),
+            13 => Some(Self::SetEvent),
+            14 => Some(Self::BeginLocalIrpCompletion),
             _ => None,
         }
     }
@@ -506,6 +512,19 @@ impl HostedIrqServiceCommand {
                         && self.argument_count == 4
                         && self.arguments[0] != 0
                         && self.arguments[1] != 0
+                }
+                HostedIrqServiceKind::DmaFreeMapping => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 4
+                        && self.arguments[..4].iter().all(|argument| *argument != 0)
+                        && self.arguments[4..].iter().all(|argument| *argument == 0)
+                }
+                HostedIrqServiceKind::SetEvent
+                | HostedIrqServiceKind::BeginLocalIrpCompletion => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 1
+                        && self.arguments[0] != 0
+                        && self.arguments[1..].iter().all(|argument| *argument == 0)
                 }
                 HostedIrqServiceKind::PoolRetirement => {
                     self.authority_cookie == 0
@@ -2534,7 +2553,7 @@ mod tests {
         assert_eq!(HostedIrqServiceKind::from_raw(9), Some(HostedIrqServiceKind::TimerCancel));
         assert_eq!(HostedIrqServiceKind::from_raw(10), Some(HostedIrqServiceKind::TimerSet));
         assert_eq!(HostedIrqServiceKind::from_raw(11), Some(HostedIrqServiceKind::RemoveDpc));
-        assert_eq!(HostedIrqServiceKind::from_raw(12), None);
+        assert_eq!(HostedIrqServiceKind::from_raw(15), None);
         assert!(HostedIrqServiceKind::ProviderCallbackRequest.may_request_nested_dispatch());
         assert!(HostedIrqServiceKind::ClassServiceRequest.may_request_nested_dispatch());
         assert!(!HostedIrqServiceKind::ProviderImport.may_request_nested_dispatch());
@@ -2603,6 +2622,63 @@ mod tests {
         assert!(class.valid());
         class.arguments[4] = 1;
         assert!(!class.valid());
+    }
+
+    #[test]
+    fn irq_dma_mapping_release_carries_only_exact_lease_identity() {
+        assert_eq!(HostedIrqServiceKind::from_raw(12),
+            Some(HostedIrqServiceKind::DmaFreeMapping));
+        let mut free = service();
+        free.kind = HostedIrqServiceKind::DmaFreeMapping;
+        free.authority_cookie = 0;
+        free.argument_count = 4;
+        free.arguments = [17, 19, 0x108000, 2056, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(free.valid());
+        for index in 0..4 {
+            let saved = free.arguments[index];
+            free.arguments[index] = 0;
+            assert!(!free.valid());
+            free.arguments[index] = saved;
+        }
+        free.arguments[4] = 1;
+        assert!(!free.valid());
+        free.arguments[4] = 0;
+        free.authority_cookie = 1;
+        assert!(!free.valid());
+    }
+
+    #[test]
+    fn irq_event_signal_carries_only_one_owned_event() {
+        assert_eq!(HostedIrqServiceKind::from_raw(13),
+            Some(HostedIrqServiceKind::SetEvent));
+        let mut signal = service();
+        signal.kind = HostedIrqServiceKind::SetEvent;
+        signal.authority_cookie = 0;
+        signal.argument_count = 1;
+        signal.arguments = [0x18000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(signal.valid());
+        signal.arguments[0] = 0;
+        assert!(!signal.valid());
+        signal.arguments[0] = 0x18000;
+        signal.arguments[1] = 1;
+        assert!(!signal.valid());
+    }
+
+    #[test]
+    fn irq_local_irp_completion_begin_carries_one_source_pointer() {
+        assert_eq!(HostedIrqServiceKind::from_raw(14),
+            Some(HostedIrqServiceKind::BeginLocalIrpCompletion));
+        let mut begin = service();
+        begin.kind = HostedIrqServiceKind::BeginLocalIrpCompletion;
+        begin.authority_cookie = 0;
+        begin.argument_count = 1;
+        begin.arguments = [0x24000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(begin.valid());
+        begin.arguments[0] = 0;
+        assert!(!begin.valid());
+        begin.arguments[0] = 0x24000;
+        begin.arguments[1] = 1;
+        assert!(!begin.valid());
     }
 
     #[test]

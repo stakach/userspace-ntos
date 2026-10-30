@@ -9,14 +9,16 @@
 mod hosted_irq_arena;
 mod hosted_irq_cr8_source;
 mod hosted_irq_call_stack;
+mod badge_census;
+mod shared_receive_census;
 mod progress_deferral;
 mod installer_progress_deferral;
-mod retained_system_fold_phase;
+mod setup_read_progress_deferral;
+mod setup_read_stage_sample;
 mod hosted_file_phase_diagnostic;
+mod hosted_install_pipe_diagnostic;
 mod native_block_stage_sample;
-mod badge_census;
-mod event_terminal_receipt;
-mod shared_receive_census;
+mod retained_system_fold_phase;
 mod driver_load_receipt;
 mod dxg_registration;
 mod contiguous_ram;
@@ -25,7 +27,9 @@ mod gop_bar_projection;
 mod hosted_driver_thread_object;
 mod hosted_current_thread_kpcr;
 mod hosted_event_projection;
+mod event_terminal_receipt;
 mod win32k_bulk_stage;
+mod rpc_op6_trace;
 
 pub use win32k_bulk_stage::{
     Win32kBulkDispatchIdentity, Win32kBulkLayout, Win32kBulkLease, Win32kBulkLeaseState,
@@ -73,19 +77,21 @@ pub use provider_export_worker::{HostedProviderExportCompletion, HostedProviderW
     select_hosted_cr8_bank, select_hosted_provider_export_worker};
 pub use gop_bar_projection::{GopBarProjection, GopLegacyVgaPortAuthority,
     GopPciBarAuthority};
-pub use hosted_current_thread_kpcr::HostedCurrentThreadKpcr;
 pub use hosted_driver_thread_object::{HostedDriverThreadObjectKey,
     HostedDriverThreadObjectRecord};
+pub use hosted_current_thread_kpcr::HostedCurrentThreadKpcr;
 pub use hosted_event_projection::{HostedEventProjectionKey, HostedEventProjectionLifetime,
     HostedEventWaitDelivery};
+pub use event_terminal_receipt::EventTerminalReceiptSampler;
+pub use rpc_op6_trace::{RpcOp6ExchangeTracker, RpcOp6TraceCounts};
 
 pub use hosted_irq_arena::{
     decode_hosted_irq_transport_message, HostedIrqArena, HostedIrqArenaConfig,
     HostedIrqArenaControl, HostedIrqArenaError, HostedIrqArenaLayout, HostedIrqArenaResult,
+    HostedIrqContentionSnapshot,
     HostedIrqArenaToken, HostedIrqDispatchCommand, HostedIrqDispatchKind, HostedIrqDispatchPage,
     HostedIrqFaultKind, HostedIrqFaultRecord, HostedIrqGrantIdentity, HostedIrqLaneDirection,
     HostedIrqLaneIdentity, HostedIrqServiceCommand, HostedIrqServiceKind, HostedIrqServicePage,
-    HostedIrqContentionSnapshot,
     HostedIrqTransaction, HostedIrqTransactionClass, HostedIrqTransportMessage,
     HOSTED_IRQ_ARENA_ARGUMENT_CAP, HOSTED_IRQ_ARENA_BYTES, HOSTED_IRQ_ARENA_DEPTH,
     HOSTED_IRQ_ARENA_MAGIC, HOSTED_IRQ_ARENA_MARSHAL_BYTES, HOSTED_IRQ_ARENA_PAGE_COUNT,
@@ -96,16 +102,20 @@ pub use hosted_irq_call_stack::{
     validate_hosted_irq_call_pop, validate_hosted_irq_call_push, HostedIrqCallFrame,
     HostedIrqCallStackError,
 };
+pub use badge_census::{
+    BadgeCensusSource, BADGE_CENSUS_SLOTS, DIRECT_BADGE_SLOTS, GUARD_OR_ISR_SLOT,
+    HOSTED_IRQ_SLOT, OVERFLOW_SLOT, TIMER_SLOT,
+};
 pub use shared_receive_census::{SharedReceiveCensus, SharedReceiveOwner, SharedReceiveSample};
-pub use event_terminal_receipt::EventTerminalReceiptSampler;
 pub use progress_deferral::ProgressDeferralBudget;
 pub use installer_progress_deferral::{InstallerOwner, InstallerProgressDeferral};
+pub use setup_read_progress_deferral::SetupReadProgressDeferral;
+pub use setup_read_stage_sample::SetupReadStageSampler;
 pub use hosted_file_phase_diagnostic::{FilePhaseIdentity, FilePhaseCounts, HostedFilePhaseDiagnostic, LocalFilePhaseDurations, LocalFilePhaseMarks, NpfsDispatchDurations, NpfsDispatchMarks, NpfsCallbackDiagnostic, NpfsCallbackIdentity, NpfsCallbackCounts, NpfsMajor, NpfsPoolRetireDurations, NpfsPoolRetireMarks};
+pub use hosted_install_pipe_diagnostic::{is_install_pipe_name, InstallChildIdentity, InstallPipeCounts, InstallPipeDiagnostic, InstallPipeIdentity, InstallPipeObservation, InstallPipeTerminal};
+pub use native_block_stage_sample::{NativeBlockStageObservation, NativeBlockStageOwner, NativeBlockStageSample,
+    NativeBlockStageSampler};
 pub use retained_system_fold_phase::RetainedSystemFoldPhase;
-pub use native_block_stage_sample::{NativeBlockStageObservation, NativeBlockStageOwner,
-    NativeBlockStageSample, NativeBlockStageSampler};
-pub use badge_census::{BadgeCensusSource, BADGE_CENSUS_SLOTS, DIRECT_BADGE_SLOTS,
-    TIMER_SLOT, HOSTED_IRQ_SLOT, GUARD_OR_ISR_SLOT, OVERFLOW_SLOT};
 
 pub const PAGE_SIZE: u64 = 0x1000;
 pub const PAGE_TABLE_SPAN: u64 = 0x20_0000;
