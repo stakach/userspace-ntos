@@ -16,6 +16,7 @@ mod key_close;
 mod mutation_commit;
 mod mutation_transfer;
 mod mutation_begin;
+pub use mutation_begin::SystemMutationBusyDiagnostic;
 mod key_open;
 mod active_driver_service;
 mod retained_snapshot;
