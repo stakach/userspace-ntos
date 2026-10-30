@@ -8,6 +8,9 @@ use crate::spawn_hosts::shared_ingress::owner::runtime;
 use nt_component_suspension::peer_registry::PeerRoute;
 use nt_io_manager::retained_query_path_forward::SourceIrpTicket;
 use nt_io_manager::source_irp_ledger::SourceIrpAllocation;
+use nt_io_manager::source_completion_preparation::{
+    admit_existing, ExistingLanePhase, ExistingLanePreparation,
+};
 
 const LABEL: u64 = 0x7bc;
 const SELECTOR: u64 = u64::MAX - LABEL;
@@ -62,12 +65,15 @@ pub(super) enum SourceCompletionDispatch {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum SourceCompletionPreparation {
+    InProgress,
     Ready,
     KnownRejected(u32),
     RetainedUncertain,
 }
 
 static mut LANES: Vec<SourceCompletionLane> = Vec::new();
+static STARTUP_FAILURE_TRACE_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 unsafe fn row_for(instance_index: usize, command: SourceCompletionCommand) -> Option<usize> {
     let inst = instance(instance_index)?;
@@ -176,18 +182,21 @@ pub(super) unsafe fn prepare(
     instance_index: usize,
     command: SourceCompletionCommand,
 ) -> SourceCompletionPreparation {
-    use SourceCompletionPreparation::{KnownRejected, Ready, RetainedUncertain};
+    use SourceCompletionPreparation::{InProgress, KnownRejected, Ready, RetainedUncertain};
     // An old-domain construction remains owned even after current admission has disappeared.
     if let Some(index) = (&*core::ptr::addr_of!(LANES))
         .iter()
         .position(|row| row.instance == instance_index && row.command == Some(command))
     {
-        return if (&*core::ptr::addr_of!(LANES))[index].phase == Phase::Prepared
-            && command_is_current(instance_index, command)
-        {
-            Ready
-        } else {
-            RetainedUncertain
+        let phase = match (&*core::ptr::addr_of!(LANES))[index].phase {
+            Phase::Preparing => ExistingLanePhase::Preparing,
+            Phase::Prepared => ExistingLanePhase::Prepared,
+            _ => ExistingLanePhase::Other,
+        };
+        return match admit_existing(phase, command_is_current(instance_index, command)) {
+            ExistingLanePreparation::InProgress => InProgress,
+            ExistingLanePreparation::Ready => Ready,
+            ExistingLanePreparation::RetainedUncertain => RetainedUncertain,
         };
     }
     let domain = command.allocation.domain;
@@ -352,6 +361,27 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
                 handle,
             ])
     {
+        if STARTUP_FAILURE_TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+            print_str(b"[source-completion-startup] ordinal/completed/status/flags/wall-label/receipt=");
+            print_u64(ordinal);
+            print_str(b"/");
+            print_u64(pump.completed as u64);
+            print_str(b"/");
+            print_hex(pump.status as u32);
+            print_str(b"/");
+            let flags = (pump.scheduler_yielded as u64)
+                | ((pump.receive_yield.is_some() as u64) << 1)
+                | ((pump.service_wait_yield.is_some() as u64) << 2)
+                | ((pump.callback_suspended as u64) << 3)
+                | ((pump.provider_wait_suspended as u64) << 4)
+                | ((pump.lpc_wait_suspended as u64) << 5);
+            print_hex(flags as u32);
+            print_str(b"/");
+            print_u64(pump.wall_label);
+            print_str(b"/");
+            print_u64(pump.startup_stack_receipt.is_some() as u64);
+            print_str(b"\n");
+        }
         return Err(STATUS_INVALID_HANDLE as u32);
     }
     (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Ready;
