@@ -4529,6 +4529,69 @@ fn owned_provisioning_installs_large_file_without_copying_into_blob_store() {
     assert_eq!(returned.len(), 130_682);
 }
 
+/// LiberNT's LiveCD setup saves HKU\.DEFAULT to the profile source. A prior boot may already
+/// have published that file, so RegSaveKeyExW first sees a create collision, moves the old file
+/// to `.bak`, and retries the save. The collision must never hide an unreachable source file.
+#[test]
+fn existing_default_profile_hive_can_be_backed_up_before_retrying_save() {
+    const SOURCE: &str = r"\??\C:\Users\Default\ntuser.dat";
+    const BACKUP: &str = r"\??\C:\Users\Default\ntuser.bak";
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    let mut fs = FileSystem::new(MemFs::new());
+    fs.provision_file_owned(SOURCE, b"old regf image".to_vec())
+        .expect("existing default profile hive");
+    let committed = fs.export_volume_snapshot().expect("persisted profile source");
+    let mut fs = FileSystem::from_volume_snapshot(&committed).expect("next boot profile source");
+
+    // RegSaveKeyExW opens its destination with FILE_CREATE before writing any hive bytes.
+    let first_save = fs.zw_create_file(
+        SOURCE,
+        FILE_WRITE_DATA | SYNCHRONIZE,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+    );
+    assert_eq!(first_save.status, STATUS_OBJECT_NAME_COLLISION);
+
+    // MoveFileExW opens the same path with backup intent and renames that exact File object.
+    let old = fs.zw_create_file(
+        SOURCE,
+        FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_OPEN_FOR_BACKUP_INTENT,
+    );
+    assert_eq!(old.status, STATUS_SUCCESS, "colliding hive must still be openable");
+    assert_eq!(
+        fs.zw_set_information_file(
+            old.handle,
+            FILE_RENAME_INFORMATION,
+            &rename_information(BACKUP, 0, true),
+        ),
+        STATUS_SUCCESS,
+        "MoveFileExW must rename the existing hive to its backup",
+    );
+    fs.zw_close(old.handle);
+    assert_eq!(fs.file_bytes(SOURCE), None);
+    assert_eq!(fs.file_bytes(BACKUP), Some(&b"old regf image"[..]));
+
+    let retry = fs.zw_create_file(
+        SOURCE,
+        FILE_WRITE_DATA | SYNCHRONIZE,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+    );
+    assert_eq!(retry.status, STATUS_SUCCESS, "retry save creates a new hive file");
+    assert_eq!(fs.zw_write_file(retry.handle, None, b"new regf image"), (STATUS_SUCCESS, 14));
+    fs.zw_close(retry.handle);
+    assert_eq!(fs.file_bytes(SOURCE), Some(&b"new regf image"[..]));
+    assert_eq!(fs.file_bytes(BACKUP), Some(&b"old regf image"[..]));
+}
+
 /// Provisioning REPLACES an existing file's bytes exactly (no append, no stale tail), refuses a
 /// path that names a directory, and refuses a path off this volume. `file_bytes` misses honestly.
 #[test]
