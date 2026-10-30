@@ -27,6 +27,18 @@ static mut LEDGER: SourceIrpLedger = SourceIrpLedger::new();
 static mut AUXILIARY: SourceIrpAuxiliaryLedger = SourceIrpAuxiliaryLedger::new();
 static mut SCSI_CHILDREN: ScsiSourceRetentionLedger = ScsiSourceRetentionLedger::new();
 static mut CALLER_PROJECTIONS: Option<Vec<CallerProjection>> = None;
+static mut CALLER_ACKS: Option<Vec<CallerTerminalAck>> = None;
+
+#[derive(Clone, Copy)]
+struct CallerTerminalAck {
+    ticket: SourceIrpTicket,
+    owner: SourceIrpOwner,
+}
+
+fn caller_acks() -> &'static mut Vec<CallerTerminalAck> {
+    let slot = unsafe { &mut *core::ptr::addr_of_mut!(CALLER_ACKS) };
+    slot.get_or_insert_with(Vec::new)
+}
 
 struct CallerProjection {
     ticket: SourceIrpTicket,
@@ -36,6 +48,7 @@ struct CallerProjection {
     canonical_irp_id: u64,
     graph: CapturedGraph,
     terminal_started: bool,
+    terminal_finished: bool,
     released_members: u16,
     replacement: Option<SourcePoolAllocationIdentity>,
     replacement_released: bool,
@@ -1476,6 +1489,7 @@ pub(super) fn service(
                 canonical_irp_id,
                 graph,
                 terminal_started: false,
+                terminal_finished: false,
                 released_members: 0,
                 replacement: None,
                 replacement_released: false,
@@ -1524,6 +1538,64 @@ pub(super) fn service(
                 Ok(()) => (STATUS_SUCCESS, 0, 0),
                 Err(SourceIrpLedgerError::Pinned) => (STATUS_SUCCESS, 1, 0),
                 Err(_) => (STATUS_INVALID_HANDLE, 0, 0),
+            }
+        }
+        12 | 13 => {
+            let Some(domain) = instance_domain_identity(inst) else {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            };
+            let Some(ticket) = SourceIrpTicket::new(domain, component_address, bytes) else {
+                return (STATUS_INVALID_PARAMETER, 0, 0);
+            };
+            let _guard = lock();
+            let Some(index) = caller_projections().iter().position(|row| {
+                row.ticket == ticket
+                    && row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index)
+                    && row.allocation.domain == domain
+            }) else {
+                // Only an exact consumed ticket authenticates a duplicate metadata ACK.
+                return if op == 13 && stack_count == 0 && caller_acks().iter().any(|ack|
+                    ack.ticket == ticket
+                        && ack.owner == SourceIrpOwner::HostedCaller(instance_index)) {
+                    (STATUS_SUCCESS, 0, 0)
+                } else {
+                    (STATUS_INVALID_HANDLE, 0, 0)
+                };
+            };
+            let row = &caller_projections()[index];
+            if op == 13 {
+                if stack_count != 0 || !row.terminal_finished {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                }
+                let _durable = crate::allocator::enter_durable();
+                if caller_acks().try_reserve(1).is_err() {
+                    return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
+                }
+                caller_acks().push(CallerTerminalAck { ticket, owner: row.allocation.owner });
+                caller_projections().swap_remove(index);
+                return (STATUS_SUCCESS, 0, 0);
+            }
+            // Read-only receipt. Indices 0..10 address immutable initial members;
+            // 10 is the adopted replacement, 11 the terminal ledger effect, and 12 op7.
+            match stack_count {
+                0..=9 => {
+                    let Ok(member_index) = usize::try_from(stack_count) else {
+                        return (STATUS_INVALID_PARAMETER, 0, 0);
+                    };
+                    if member_index >= row.graph.initial_members().len() || !row.terminal_started {
+                        return (STATUS_INVALID_HANDLE, 0, 0);
+                    }
+                    (STATUS_SUCCESS, u64::from(row.released_members & (1u16 << member_index) != 0), 0)
+                }
+                10 if row.terminal_started && row.replacement.is_some() =>
+                    (STATUS_SUCCESS, u64::from(row.replacement_released), 0),
+                11 if row.terminal_started => (STATUS_SUCCESS, u64::from(row.terminal_finished), 0),
+                12 if row.terminal_started => (
+                    STATUS_SUCCESS,
+                    row.graph.initial_members().len() as u64,
+                    row.replacement.map_or(0, |identity| identity.component_address),
+                ),
+                _ => (STATUS_INVALID_HANDLE, 0, 0),
             }
         }
         7 | 8 | 9 | 10 => {
@@ -1712,10 +1784,11 @@ pub(super) fn service(
                 {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 }
-                row.released_members |= bit; // record ownership before the physical effect
                 if !unsafe { hosted_instance_pool_free_unlocked(inst, member_address) } {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 }
+                // A definite refusal leaves the captured member pending for exact retry.
+                row.released_members |= bit;
                 (STATUS_SUCCESS, 0, 0)
             } else if op == 10 {
                 let Some(row) = caller_projections().iter_mut().find(|candidate| {
@@ -1728,10 +1801,11 @@ pub(super) fn service(
                 {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 }
-                row.replacement_released = true; // terminal ownership before physical effect
                 if !unsafe { hosted_instance_pool_free_unlocked(inst, member_address) } {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 }
+                // The local free is synchronous under the source and pool locks.
+                row.replacement_released = true;
                 (STATUS_SUCCESS, 0, 0)
             } else {
                 let Some(row) = caller_projections().iter().find(|candidate| candidate.ticket == ticket)
@@ -1751,16 +1825,25 @@ pub(super) fn service(
                 {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 }
-                let index = caller_projections()
-                    .iter()
-                    .position(|candidate| candidate.ticket == ticket)
+                let row = caller_projections().iter_mut()
+                    .find(|candidate| candidate.ticket == ticket)
                     .expect("finished caller IRP lost its root-side projection receipt");
-                caller_projections().swap_remove(index);
+                row.terminal_finished = true;
                 (STATUS_SUCCESS, 0, 0)
             }
         }
         _ => (STATUS_INVALID_PARAMETER, 0, 0),
     }
+}
+
+pub(super) fn drain_caller_terminal_acks(instance_index: usize) -> Result<(), nt_status::NtStatus> {
+    let _guard = lock();
+    if caller_projections().iter().any(|row|
+        row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index)) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    caller_acks().retain(|ack| ack.owner != SourceIrpOwner::HostedCaller(instance_index));
+    Ok(())
 }
 
 /// Admit only an op6-published caller packet. This obtains real source and device pins, but it

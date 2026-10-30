@@ -75,6 +75,11 @@ pub(super) unsafe fn retire_hosted_device_projection(
                     return Err(nt_status::NtStatus::INVALID_PARAMETER);
                 }
                 let next_device = read_unaligned((device_exec + 0x10) as *const u64);
+                // An unlinked PDO has no driver list owner. Its provider-writable
+                // NextDevice field cannot introduce a link after publication.
+                if driver_object == 0 && next_device != 0 {
+                    return Err(nt_status::NtStatus::INVALID_PARAMETER);
+                }
                 let mut target_link = None;
                 if driver_object != 0 {
                     let (driver_exec, driver_capacity) =

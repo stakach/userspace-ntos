@@ -696,6 +696,8 @@ diagnosis-free failure.
 - When a user asks to continue with the next issue, check the current open issue list and explicit
   dependency status before choosing it. A failure already waiting on an upstream pull request is
   not a new implementation target unless the user names it.
+- If several independent issues remain and the user's ordering is unclear, ask which one they
+  mean before committing to a new implementation target.
 - If the user corrects that choice, record the excluded issue and continue the remaining requested
   issues without reopening the dependency as a local binary patch.
 
@@ -760,3 +762,7 @@ diagnosis-free failure.
 - For QEMU performance comparisons, clone and verify the entire writable disk image before the first run, then restore that full image before each variant. Restoring only a persistence tail leaves FAT32 writes behind and invalidates the comparison.
 - `./run.sh --build-only` recreates the disk from the release tree and resets its snapshot reserve. A native WAL experiment must stage the newly source-built boot payloads into a cloned, verified native-route disk and prove route publication before interpreting fold or latency data. A fresh image's fast MemFs setup is a different lane.
 - Once a controlled comparison has measured a change, resume the newest healthy full end disk for acceptance instead of repeatedly resetting to an older setup baseline. Preserve the baseline and its log for reproducibility, and require WAL replay and exact mount checks after a bounded stop before trusting continued setup progress.
+
+## Fold A Requested Pull Request Without Losing Its Contracts
+- When the user asks to merge one open PR into another, merge its committed branch into an isolated clean checkout of the destination. Preserve both parents and the original dirty worktrees; never treat closure alone as integration.
+- Resolve conflicts at the behavior boundary, then check auto-merged ownership paths as carefully as textual conflicts. Keep the source PR open until the combined head has focused tests, native validation, and exact-head CI; close it with a link to the destination only after its work is represented there.
