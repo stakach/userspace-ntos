@@ -78,15 +78,22 @@ pub(super) extern "win64" fn set_target_processor_dpc_ex(dpc: u64, number: u64) 
 /// `ULONG KeGetCurrentProcessorNumberEx(PPROCESSOR_NUMBER)`.
 pub(super) extern "win64" fn current_processor_number_ex(number: u64) -> u32 {
     let count = crate::SYSTEM_PROCESSOR_COUNT.load(Ordering::Acquire);
-    let Some(index) = nt_kernel_exec::processor_topology::single_processor_index(count) else {
-        unsafe { crate::provider_bugcheck::report(0xc4, [count, number, 0x50524f43, 0]); }
+    let boot_node = crate::SYSTEM_BOOT_NODE_ID.load(Ordering::Acquire);
+    let boot_apic = crate::SYSTEM_BOOT_APIC_ID.load(Ordering::Acquire);
+    let current_apic = unsafe { (core::arch::x86_64::__cpuid(1).ebx >> 24) as u64 };
+    let Some(index) = nt_kernel_exec::processor_topology::local_processor_index(
+        count, boot_node, boot_apic as u32, current_apic as u32,
+    ) else {
+        unsafe { crate::provider_bugcheck::report(0xc4, [count, boot_node, boot_apic, current_apic]); }
     };
     if number != 0 {
         if number.checked_add(4).is_none() {
-            unsafe { crate::provider_bugcheck::report(0xc4, [count, number, 0x50524f43, 1]); }
+            unsafe { crate::provider_bugcheck::report(0xc4, [count, number, boot_apic, 1]); }
         }
         // PROCESSOR_NUMBER: USHORT Group, UCHAR Number, UCHAR Reserved.
-        unsafe { write_unaligned(number as *mut u32, index); }
+        let encoded = nt_kernel_exec::processor_topology::processor_number_for_index(count, index)
+            .expect("validated boot node lost its processor topology");
+        unsafe { write_unaligned(number as *mut u32, encoded); }
     }
     index
 }
