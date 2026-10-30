@@ -150,6 +150,28 @@ pub(crate) unsafe fn current_receipt() -> Option<PreloadReceipt> {
 
 static mut SOURCES: Option<Catalog> = None;
 
+fn preload_failure(stage: &[u8], subject: &[u8], status: u64) {
+    print_str(b"[driver-preload-fail] stage=");
+    print_str(stage);
+    print_str(b" subject=");
+    print_str(subject);
+    print_str(b" status=0x");
+    print_hex_u64(status);
+    print_str(b"\n");
+}
+
+macro_rules! preload_or_fail {
+    ($value:expr, $stage:expr, $subject:expr) => {
+        match $value {
+            Some(value) => value,
+            None => {
+                preload_failure($stage, $subject, 0);
+                return None;
+            }
+        }
+    };
+}
+
 fn dword(snapshot: &nt_config_client::HiveKeySnapshot, name: &str) -> Option<u32> {
     let value = snapshot.values.iter().find(|value| value.name.eq_ignore_ascii_case(name))?;
     (value.value_type == 4 && value.data.len() == 4)
@@ -192,9 +214,14 @@ fn parse_filter_services(value_type: u32, data: &[u8]) -> Option<Vec<String>> {
     (first == units.len() - 1).then_some(names)
 }
 
-unsafe fn stage_file(fs: &Fat32, generation: u64, path: &[u8]) -> Option<Source> {
-    let metadata = crate::fs_loader::fat_open_path_metadata(fs, path)?;
+unsafe fn stage_file(
+    fs: &Fat32,
+    generation: u64,
+    path: &[u8],
+) -> Option<Source> {
+    let metadata = preload_or_fail!(crate::fs_loader::fat_open_path_metadata(fs, path), b"file-metadata", path);
     if metadata.metadata.is_directory || metadata.metadata.end_of_file == 0 {
+        preload_failure(b"file-not-source", path, metadata.metadata.end_of_file);
         return None;
     }
     let file = FileIdentity {
@@ -205,17 +232,22 @@ unsafe fn stage_file(fs: &Fat32, generation: u64, path: &[u8]) -> Option<Source>
     };
     let before = crate::fs_loader::POOL_NEXT.load(Ordering::Acquire);
     let epoch = crate::fs_loader::POOL_EPOCH.load(Ordering::Acquire);
-    (*core::ptr::addr_of_mut!(SOURCES)).as_mut()?.stage(generation, path, file, before, || {
-        let (va, len) = load_file_to_pool(fs, path)?;
-        let again = crate::fs_loader::fat_open_path_metadata(fs, path)?;
+    let source = (*core::ptr::addr_of_mut!(SOURCES)).as_mut()?.stage(generation, path, file, before, || {
+        let (va, len) = preload_or_fail!(load_file_to_pool(fs, path), b"file-read", path);
+        let again = preload_or_fail!(crate::fs_loader::fat_open_path_metadata(fs, path), b"file-recheck", path);
         if again != metadata {
+            preload_failure(b"file-identity-changed", path, 0);
             return None;
         }
         let start = va.checked_sub(crate::fs_loader::POOL_VADDR)?;
         let end = start.checked_add((len as u64).checked_add(0xfff)? & !0xfff)?;
         let after = crate::fs_loader::POOL_NEXT.load(Ordering::Acquire);
         Some((Source { va, len, pin: PoolPin { epoch, start, end } }, after))
-    })
+    });
+    if source.is_none() {
+        preload_failure(b"catalog-stage", path, before);
+    }
+    source
 }
 
 unsafe fn stage_pe_closure(
@@ -225,6 +257,7 @@ unsafe fn stage_pe_closure(
     depth: usize,
 ) -> Option<()> {
     if depth > 32 {
+        preload_failure(b"pe-depth", path, depth as u64);
         return None;
     }
     let epoch = crate::fs_loader::POOL_EPOCH.load(Ordering::Acquire);
@@ -235,33 +268,50 @@ unsafe fn stage_pe_closure(
         return Some(());
     }
     let mut dependencies = Vec::<HostedAscii<HOSTED_DEP_PROVIDER_MAX>>::new();
-    raw_pe_collect_hosted_dependencies(source.va, source.len, &mut dependencies)?;
+    preload_or_fail!(raw_pe_collect_hosted_dependencies(source.va, source.len, &mut dependencies), b"pe-imports", path);
     for dependency in dependencies {
         if let Some((_index, singleton)) = find_hosted_provider_singleton(&dependency) {
             if singleton.image_frames == 0 || singleton.image_frames > FSD_IMAGE_MAX_FRAMES {
+                preload_failure(b"provider-frames", dependency.as_str().as_bytes(), singleton.image_frames);
                 return None;
             }
-            match classify_hosted_provider_domain(Some(hosted_provider_domain_descriptor(singleton))).ok()? {
+            match preload_or_fail!(classify_hosted_provider_domain(Some(hosted_provider_domain_descriptor(singleton))).ok(), b"provider-domain", dependency.as_str().as_bytes()) {
                 HostedProviderDomainStatus::Callable(_) => continue,
                 HostedProviderDomainStatus::Absent | HostedProviderDomainStatus::MetadataOnly => {}
             }
         }
         let mut dep_path = [0; HOSTED_DEP_PATH_MAX];
-        let len = hosted_dependency_path(dependency.as_str(), &mut dep_path)?;
+        let len = preload_or_fail!(hosted_dependency_path(dependency.as_str(), &mut dep_path), b"pe-import-path", dependency.as_str().as_bytes());
         stage_pe_closure(fs, generation, &dep_path[..len], depth + 1)?;
     }
     Some(())
 }
 
-unsafe fn stage_service(fs: &Fat32, generation: u64, name: &str) -> Option<()> {
-    let binding = crate::config_manager_query_driver_service(name).ok()?;
-    if !binding.service_name.eq_ignore_ascii_case(name)
-        || binding.class != nt_config_client::DriverServiceClass::Device
-        || binding.start_type >= 4
-    {
+unsafe fn stage_service(
+    fs: &Fat32,
+    generation: u64,
+    name: &str,
+) -> Option<()> {
+    let binding = match crate::config_manager_query_driver_service(name) {
+        Ok(binding) => binding,
+        Err(status) => {
+            preload_failure(b"service-query", name.as_bytes(), status as u32 as u64);
+            return None;
+        }
+    };
+    if !binding.service_name.eq_ignore_ascii_case(name) {
+        preload_failure(b"service-name", name.as_bytes(), 0);
         return None;
     }
-    let path = crate::registry_ascii_path(&binding.image_path)?;
+    if binding.class != nt_config_client::DriverServiceClass::Device {
+        preload_failure(b"service-class", name.as_bytes(), 1);
+        return None;
+    }
+    if binding.start_type >= 4 {
+        preload_failure(b"service-start", name.as_bytes(), binding.start_type as u64);
+        return None;
+    }
+    let path = preload_or_fail!(crate::registry_ascii_path(&binding.image_path), b"service-path", name.as_bytes());
     stage_pe_closure(fs, generation, &path, 0)
 }
 
@@ -269,21 +319,36 @@ unsafe fn stage_service(fs: &Fat32, generation: u64, name: &str) -> Option<()> {
 /// generation. PnP still selects the actual service for each child when it starts.
 pub(super) unsafe fn stage_registry_boot_sources(fs: &Fat32, generation: u64) -> Option<PreloadReceipt> {
     if generation == 0 || (*core::ptr::addr_of!(SOURCES)).is_some() {
+        preload_failure(b"entry-authority", b"boot-disk", generation);
         return None;
     }
-    let capacity = crate::fs_loader::POOL_PTS.checked_mul(0x20_0000)?;
+    let capacity = preload_or_fail!(crate::fs_loader::POOL_PTS.checked_mul(0x20_0000), b"pool-capacity", b"pool");
     let epoch = crate::fs_loader::POOL_EPOCH.load(Ordering::Acquire);
-    SOURCES = Some(Catalog::new(generation, crate::fs_loader::POOL_VADDR, epoch, capacity)?);
+    SOURCES = Some(preload_or_fail!(Catalog::new(generation, crate::fs_loader::POOL_VADDR, epoch, capacity), b"catalog-create", b"pool"));
     let services_path = r"\Registry\Machine\System\CurrentControlSet\Services";
-    let services = crate::config_manager_query_system_hive_key(services_path).ok()?;
+    let services = match crate::config_manager_query_system_hive_key(services_path) {
+        Ok(services) => services,
+        Err(status) => {
+            preload_failure(b"services-query", services_path.as_bytes(), status as u32 as u64);
+            return None;
+        }
+    };
     if services.mount_generation != generation {
+        preload_failure(b"services-generation", services_path.as_bytes(), services.mount_generation);
         return None;
     }
     let mut selected = 0usize;
     for service in &services.subkeys {
         let path = alloc::format!(r"{}\{}", services_path, service.name);
-        let snapshot = crate::config_manager_query_system_hive_key(&path).ok()?;
+        let snapshot = match crate::config_manager_query_system_hive_key(&path) {
+            Ok(snapshot) => snapshot,
+            Err(status) => {
+                preload_failure(b"key-query", path.as_bytes(), status as u32 as u64);
+                return None;
+            }
+        };
         if snapshot.mount_generation != generation {
+            preload_failure(b"key-generation", path.as_bytes(), snapshot.mount_generation);
             return None;
         }
         if dword(&snapshot, "Start") == Some(0) && dword(&snapshot, "Type") == Some(1) {
@@ -292,18 +357,32 @@ pub(super) unsafe fn stage_registry_boot_sources(fs: &Fat32, generation: u64) ->
         }
     }
     let classes_path = r"\Registry\Machine\System\CurrentControlSet\Control\Class";
-    let classes = crate::config_manager_query_system_hive_key(classes_path).ok()?;
+    let classes = match crate::config_manager_query_system_hive_key(classes_path) {
+        Ok(classes) => classes,
+        Err(status) => {
+            preload_failure(b"classes-query", classes_path.as_bytes(), status as u32 as u64);
+            return None;
+        }
+    };
     if classes.mount_generation != generation {
+        preload_failure(b"classes-generation", classes_path.as_bytes(), classes.mount_generation);
         return None;
     }
     for class in &classes.subkeys {
         let path = alloc::format!(r"{}\{}", classes_path, class.name);
-        let snapshot = crate::config_manager_query_system_hive_key(&path).ok()?;
+        let snapshot = match crate::config_manager_query_system_hive_key(&path) {
+            Ok(snapshot) => snapshot,
+            Err(status) => {
+                preload_failure(b"key-query", path.as_bytes(), status as u32 as u64);
+                return None;
+            }
+        };
         if snapshot.mount_generation != generation {
+            preload_failure(b"key-generation", path.as_bytes(), snapshot.mount_generation);
             return None;
         }
         for value_name in ["UpperFilters", "LowerFilters"] {
-            for service in class_filters(&snapshot, value_name)? {
+            for service in preload_or_fail!(class_filters(&snapshot, value_name), b"class-filter-format", class.name.as_bytes()) {
                 stage_service(fs, generation, &service)?;
                 selected += 1;
             }
@@ -311,6 +390,7 @@ pub(super) unsafe fn stage_registry_boot_sources(fs: &Fat32, generation: u64) ->
     }
     stage_file(fs, generation, HOSTED_AUXILIARY_PE_PATH)?;
     if LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) != generation {
+        preload_failure(b"final-generation", b"system", LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire));
         return None;
     }
     let catalog = (*core::ptr::addr_of_mut!(SOURCES)).as_mut()?;
