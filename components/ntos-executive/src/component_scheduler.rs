@@ -5,6 +5,35 @@ use super::*;
 static DEPTH: AtomicU64 = AtomicU64::new(0);
 static YIELDS: AtomicU64 = AtomicU64::new(0);
 
+fn trace_source_startup_pump(
+    ordinal: Option<u64>,
+    stage: u64,
+    result: Option<&crate::spawn_hosts::PumpResult>,
+) {
+    let Some(ordinal) = ordinal else { return };
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 48 { return; }
+    print_str(b"[source-startup-pump] ordinal/stage/completed/status/flags/wall-label/receipt=");
+    print_u64(ordinal); print_str(b"/");
+    print_u64(stage); print_str(b"/");
+    if let Some(result) = result {
+        let flags = u32::from(result.scheduler_yielded)
+            | (u32::from(result.receive_yield.is_some()) << 1)
+            | (u32::from(result.service_wait_yield.is_some()) << 2)
+            | (u32::from(result.callback_suspended) << 3)
+            | (u32::from(result.provider_wait_suspended) << 4)
+            | (u32::from(result.lpc_wait_suspended) << 5);
+        print_u64(u64::from(result.completed)); print_str(b"/");
+        print_hex(result.status as u32); print_str(b"/");
+        print_hex(flags); print_str(b"/");
+        print_u64(result.wall_label); print_str(b"/");
+        print_u64(u64::from(result.startup_stack_receipt.is_some()));
+    } else {
+        print_str(b"pending");
+    }
+    print_str(b"\n");
+}
+
 pub(super) fn is_active() -> bool {
     DEPTH.load(Ordering::Acquire) != 0
 }
@@ -118,16 +147,25 @@ unsafe fn hosted_component_pump_inner(
     crate::driver_launch::driver_thread_projection::enter(channel, caller)
         .expect("driver execution requires its exact retained thread projection");
     let scope = ComponentSchedulerScope::enter();
+    let startup_ordinal =
+        crate::driver_launch::hosted_source_completion_lane::startup_expected(channel)
+            .map(|words| words[0]);
+    trace_source_startup_pump(startup_ordinal, 0, None);
     let mut result = crate::spawn_hosts::component_pump(channel);
+    trace_source_startup_pump(startup_ordinal, 1, Some(&result));
     while result.scheduler_yielded {
+        trace_source_startup_pump(startup_ordinal, 2, Some(&result));
         scope.service_irq_yield(channel.shared_va);
+        trace_source_startup_pump(startup_ordinal, 3, Some(&result));
         if let Some(route) = route {
             channel.reply_cap = runtime::current_reply(route).expect("retained canonical Reply");
         }
         result = crate::spawn_hosts::component_pump_continue_receive(channel, &result)
             .expect("hosted IRQ yield must retain its exact receive continuation");
+        trace_source_startup_pump(startup_ordinal, 4, Some(&result));
     }
     if result.completed {
+        trace_source_startup_pump(startup_ordinal, 5, Some(&result));
         let route = route.expect("hosted completion requires enrolled source");
         let dispatch = runtime::dispatch(route).expect("retained hosted dispatch epoch");
         if let Some(words) = result.startup_stack_receipt {
@@ -148,7 +186,10 @@ unsafe fn hosted_component_pump_inner(
             runtime::complete(route, dispatch, result.reply_cap, channel.dispatch_label)
                 .expect("authenticate hosted final completion Call");
         }
+        trace_source_startup_pump(startup_ordinal, 6, Some(&result));
     }
+    trace_source_startup_pump(startup_ordinal, 7, Some(&result));
     runtime::nested::restore(&mut parent).expect("restore nested hosted parent");
+    trace_source_startup_pump(startup_ordinal, 8, Some(&result));
     result
 }
