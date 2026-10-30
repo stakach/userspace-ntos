@@ -5,15 +5,25 @@ use super::*;
 static DEPTH: AtomicU64 = AtomicU64::new(0);
 static YIELDS: AtomicU64 = AtomicU64::new(0);
 
-fn trace_source_startup_pump(
+#[derive(Clone, Copy)]
+enum StartupKind { Source, Class }
+
+fn trace_worker_startup_pump(
+    kind: StartupKind,
     ordinal: Option<u64>,
     stage: u64,
     result: Option<&crate::spawn_hosts::PumpResult>,
 ) {
     let Some(ordinal) = ordinal else { return };
-    static COUNT: AtomicU64 = AtomicU64::new(0);
-    if COUNT.fetch_add(1, Ordering::Relaxed) >= 48 { return; }
-    print_str(b"[source-startup-pump] ordinal/stage/completed/status/flags/wall-label/receipt=");
+    static SOURCE_COUNT: AtomicU64 = AtomicU64::new(0);
+    static CLASS_COUNT: AtomicU64 = AtomicU64::new(0);
+    let count = match kind { StartupKind::Source => &SOURCE_COUNT, StartupKind::Class => &CLASS_COUNT };
+    if count.fetch_add(1, Ordering::Relaxed) >= 48 { return; }
+    let prefix: &[u8] = match kind {
+        StartupKind::Source => b"[source-startup-pump] ordinal/stage/completed/status/flags/wall-label/receipt=",
+        StartupKind::Class => b"[class-startup-pump] ordinal/stage/completed/status/flags/wall-label/receipt=",
+    };
+    print_str(prefix);
     print_u64(ordinal); print_str(b"/");
     print_u64(stage); print_str(b"/");
     if let Some(result) = result {
@@ -150,22 +160,31 @@ unsafe fn hosted_component_pump_inner(
     let startup_ordinal =
         crate::driver_launch::hosted_source_completion_lane::startup_expected(channel)
             .map(|words| words[0]);
-    trace_source_startup_pump(startup_ordinal, 0, None);
+    let class_startup_ordinal =
+        crate::driver_launch::hosted_class_irp_lane::startup_expected(channel)
+            .map(|words| words[0]);
+    trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 0, None);
+    trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 0, None);
     let mut result = crate::spawn_hosts::component_pump(channel);
-    trace_source_startup_pump(startup_ordinal, 1, Some(&result));
+    trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 1, Some(&result));
+    trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 1, Some(&result));
     while result.scheduler_yielded {
-        trace_source_startup_pump(startup_ordinal, 2, Some(&result));
+        trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 2, Some(&result));
+        trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 2, Some(&result));
         scope.service_irq_yield(channel.shared_va);
-        trace_source_startup_pump(startup_ordinal, 3, Some(&result));
+        trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 3, Some(&result));
+        trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 3, Some(&result));
         if let Some(route) = route {
             channel.reply_cap = runtime::current_reply(route).expect("retained canonical Reply");
         }
         result = crate::spawn_hosts::component_pump_continue_receive(channel, &result)
             .expect("hosted IRQ yield must retain its exact receive continuation");
-        trace_source_startup_pump(startup_ordinal, 4, Some(&result));
+        trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 4, Some(&result));
+        trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 4, Some(&result));
     }
     if result.completed {
-        trace_source_startup_pump(startup_ordinal, 5, Some(&result));
+        trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 5, Some(&result));
+        trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 5, Some(&result));
         let route = route.expect("hosted completion requires enrolled source");
         let dispatch = runtime::dispatch(route).expect("retained hosted dispatch epoch");
         if let Some(words) = result.startup_stack_receipt {
@@ -186,10 +205,13 @@ unsafe fn hosted_component_pump_inner(
             runtime::complete(route, dispatch, result.reply_cap, channel.dispatch_label)
                 .expect("authenticate hosted final completion Call");
         }
-        trace_source_startup_pump(startup_ordinal, 6, Some(&result));
+        trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 6, Some(&result));
+        trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 6, Some(&result));
     }
-    trace_source_startup_pump(startup_ordinal, 7, Some(&result));
+    trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 7, Some(&result));
+    trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 7, Some(&result));
     runtime::nested::restore(&mut parent).expect("restore nested hosted parent");
-    trace_source_startup_pump(startup_ordinal, 8, Some(&result));
+    trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 8, Some(&result));
+    trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 8, Some(&result));
     result
 }

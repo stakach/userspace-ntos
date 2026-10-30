@@ -132,9 +132,20 @@ pub(super) unsafe fn prepare(instance_index: usize) -> Result<(), nt_status::NtS
         rows.len() - 1
     };
     let result = construct(index, inst);
-    (&mut *core::ptr::addr_of_mut!(LANES))[index].phase =
-        if result.is_ok() { Phase::Ready } else { Phase::Uncertain };
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    row.phase = if result.is_ok() { Phase::Ready } else { Phase::Uncertain };
+    trace_startup_return(row, result.as_ref().err().copied().unwrap_or(0));
     result.map_err(|status| nt_status::NtStatus(status as i32))
+}
+
+fn trace_startup_return(row: &Lane, status: u32) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 16 { return; }
+    print_str(b"[class-startup-return] instance/ordinal/phase/status=");
+    print_u64(row.instance as u64); print_str(b"/");
+    print_u64(row.ordinal); print_str(b"/");
+    print_u64(match row.phase { Phase::Ready => 1, Phase::Uncertain => 2, _ => 0 });
+    print_str(b"/"); print_hex(status); print_str(b"\n");
 }
 
 unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
