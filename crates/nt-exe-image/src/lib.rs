@@ -201,6 +201,14 @@ pub enum HostedImageRegistrationError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegisteredImageBackingError {
+    InvalidIdentity,
+    StaleTarget,
+    AlreadyBound,
+    BackingCollision,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostedImageRetirementError {
     StaticIdentity,
     NotFound,
@@ -521,6 +529,7 @@ impl OwnedHostedProcessImage {
 pub struct OwnedHostedImageCatalog<const N: usize> {
     entries: [OwnedHostedProcessImage; N],
     used: [bool; N],
+    backings: [Option<nt_memory_manager::SectionFileIdentity>; N],
     next_dynamic_generation: u64,
 }
 
@@ -535,12 +544,14 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
         Self {
             entries: [OwnedHostedProcessImage::empty(); N],
             used: [false; N],
+            backings: [None; N],
             next_dynamic_generation: 1,
         }
     }
 
     pub fn clear(&mut self) {
         self.used.fill(false);
+        self.backings.fill(None);
         self.next_dynamic_generation = 1;
     }
 
@@ -565,6 +576,7 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
             .ok_or(HostedImageRegistrationError::Full)?;
         self.entries[index] = image;
         self.used[index] = true;
+        self.backings[index] = None;
         Ok(index)
     }
 
@@ -589,6 +601,7 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
             .ok_or(HostedImageRegistrationError::Full)?;
         self.entries[index].copy_from_ref(image)?;
         self.used[index] = true;
+        self.backings[index] = None;
         Ok(index)
     }
 
@@ -655,6 +668,49 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
             .then_some(CapturedImageObservation { target })
     }
 
+    /// Associate a registered image with its canonical mounted File. This is historical image
+    /// provenance for native File/Section capture, never process or service authority.
+    pub fn bind_registered_backing(
+        &mut self,
+        target: SpawnTarget,
+        backing: nt_memory_manager::SectionFileIdentity,
+    ) -> Result<(), RegisteredImageBackingError> {
+        if backing.file_id == 0 || backing.mount.value() == 0 {
+            return Err(RegisteredImageBackingError::InvalidIdentity);
+        }
+        let index = self.entries.iter().zip(self.used.iter())
+            .position(|(image, used)| *used && image.pi == target.pi
+                && SpawnTarget::from_image(image.as_ref()) == target)
+            .ok_or(RegisteredImageBackingError::StaleTarget)?;
+        if self.backings.iter().enumerate().any(|(other, value)|
+            other != index && *value == Some(backing)) {
+            return Err(RegisteredImageBackingError::BackingCollision);
+        }
+        match self.backings[index] {
+            Some(existing) if existing == backing => Ok(()),
+            Some(_) => Err(RegisteredImageBackingError::AlreadyBound),
+            None => {
+                self.backings[index] = Some(backing);
+                Ok(())
+            }
+        }
+    }
+
+    /// Resolve only an exact mounted File identity to a still-registered image generation.
+    pub fn observation_for_backing(
+        &self,
+        backing: nt_memory_manager::SectionFileIdentity,
+    ) -> Option<CapturedImageObservation> {
+        if backing.file_id == 0 || backing.mount.value() == 0 {
+            return None;
+        }
+        self.backings.iter().zip(self.entries.iter()).zip(self.used.iter())
+            .find_map(|((bound, image), used)| (*used && *bound == Some(backing))
+                .then(|| CapturedImageObservation {
+                    target: SpawnTarget::from_image(image.as_ref()),
+                }))
+    }
+
     /// Retire an exact dynamic process-image identity after all process-instance owners have been
     /// removed. Generation matching prevents a delayed cleanup from clearing a replacement that
     /// reused the same PI and top-level fault badge.
@@ -677,6 +733,7 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
         let retired = self.entries[index];
         self.entries[index] = OwnedHostedProcessImage::empty();
         self.used[index] = false;
+        self.backings[index] = None;
         Ok(retired)
     }
 
@@ -698,6 +755,7 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
             .ok_or(HostedImageRegistrationError::Full)?;
         self.entries[index] = image;
         self.used[index] = true;
+        self.backings[index] = None;
         Ok(index)
     }
 

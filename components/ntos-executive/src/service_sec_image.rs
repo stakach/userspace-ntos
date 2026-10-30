@@ -5982,6 +5982,10 @@ unsafe fn load_hosted_bootstrap_image(
     index: usize,
     spec: HostedBootstrapLoadSpec,
 ) {
+    let backing = crate::fs_loader::exec_fs()
+        .and_then(|fs| crate::fs_loader::fat_open_path_metadata(&fs, spec.disk_path))
+        .filter(|entry| !entry.metadata.is_directory)
+        .and_then(|entry| crate::fs_loader::exec_fs_file_identity(entry.metadata.file_id));
     print_str(b"[sec-init] bootstrap-image item=");
     print_u64(index as u64);
     print_str(b" pi=");
@@ -6012,6 +6016,12 @@ unsafe fn load_hosted_bootstrap_image(
     print_str(b"\n");
     register_loaded_hosted_image(catalog, spec.image, loaded)
         .expect("hosted bootstrap image metadata must register once when loaded");
+    if loaded {
+        catalog.bind_registered_backing(
+            nt_exe_image::SpawnTarget::from_image(spec.image),
+            backing.expect("loaded bootstrap image retains its exact mounted File identity"),
+        ).expect("bootstrap image File identity must bind its registered generation once");
+    }
     print_str(b"[sec-init] bootstrap-image item=");
     print_u64(index as u64);
     print_str(b" loaded-table-begin\n");
