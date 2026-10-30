@@ -12,6 +12,7 @@ mod hosted_irq_call_stack;
 mod progress_deferral;
 mod installer_progress_deferral;
 mod retained_system_fold_phase;
+mod hosted_file_phase_diagnostic;
 mod native_block_stage_sample;
 mod badge_census;
 mod event_terminal_receipt;
@@ -99,6 +100,7 @@ pub use shared_receive_census::{SharedReceiveCensus, SharedReceiveOwner, SharedR
 pub use event_terminal_receipt::EventTerminalReceiptSampler;
 pub use progress_deferral::ProgressDeferralBudget;
 pub use installer_progress_deferral::{InstallerOwner, InstallerProgressDeferral};
+pub use hosted_file_phase_diagnostic::{FilePhaseIdentity, FilePhaseCounts, HostedFilePhaseDiagnostic, LocalFilePhaseDurations, LocalFilePhaseMarks, NpfsDispatchDurations, NpfsDispatchMarks, NpfsCallbackDiagnostic, NpfsCallbackIdentity, NpfsCallbackCounts, NpfsMajor, NpfsPoolRetireDurations, NpfsPoolRetireMarks};
 pub use retained_system_fold_phase::RetainedSystemFoldPhase;
 pub use native_block_stage_sample::{NativeBlockStageObservation, NativeBlockStageOwner,
     NativeBlockStageSample, NativeBlockStageSampler};
