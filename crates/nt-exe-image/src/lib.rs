@@ -9,6 +9,7 @@
 mod process_image_layout;
 pub use process_image_layout::ProcessImageLayout;
 pub mod service_group_launch;
+pub mod execution_role;
 
 pub const MAX_EXE_LEAF: usize = 64;
 pub const MAX_NT_IMAGE_PATH: usize = 192;
@@ -213,6 +214,13 @@ pub enum RegisteredImageBackingError {
     StaleTarget,
     AlreadyBound,
     BackingCollision,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegisteredLaunchPolicyError {
+    StaleTarget,
+    MissingBacking,
+    AlreadyBound,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -537,6 +545,7 @@ pub struct OwnedHostedImageCatalog<const N: usize> {
     entries: [OwnedHostedProcessImage; N],
     used: [bool; N],
     backings: [Option<nt_memory_manager::SectionFileIdentity>; N],
+    launch_creators: [Option<HostedProcessRole>; N],
     next_dynamic_generation: u64,
 }
 
@@ -552,6 +561,7 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
             entries: [OwnedHostedProcessImage::empty(); N],
             used: [false; N],
             backings: [None; N],
+            launch_creators: [None; N],
             next_dynamic_generation: 1,
         }
     }
@@ -559,6 +569,7 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
     pub fn clear(&mut self) {
         self.used.fill(false);
         self.backings.fill(None);
+        self.launch_creators.fill(None);
         self.next_dynamic_generation = 1;
     }
 
@@ -584,6 +595,7 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
         self.entries[index] = image;
         self.used[index] = true;
         self.backings[index] = None;
+        self.launch_creators[index] = None;
         Ok(index)
     }
 
@@ -609,6 +621,7 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
         self.entries[index].copy_from_ref(image)?;
         self.used[index] = true;
         self.backings[index] = None;
+        self.launch_creators[index] = None;
         Ok(index)
     }
 
@@ -703,6 +716,37 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
         }
     }
 
+    /// Bootstrap-owned creator policy for an exact registered image generation. Image
+    /// observations can carry this identity but cannot themselves confer execution authority.
+    pub fn bind_registered_launch_policy(
+        &mut self,
+        target: SpawnTarget,
+        creator: HostedProcessRole,
+    ) -> Result<(), RegisteredLaunchPolicyError> {
+        let index = self.entries.iter().zip(self.used.iter())
+            .position(|(image, used)| *used && image.pi == target.pi
+                && SpawnTarget::from_image(image.as_ref()) == target)
+            .ok_or(RegisteredLaunchPolicyError::StaleTarget)?;
+        if self.backings[index].is_none() {
+            return Err(RegisteredLaunchPolicyError::MissingBacking);
+        }
+        if self.launch_creators[index].is_some() {
+            return Err(RegisteredLaunchPolicyError::AlreadyBound);
+        }
+        self.launch_creators[index] = Some(creator);
+        Ok(())
+    }
+
+    pub fn registered_launch_policy(
+        &self,
+        target: SpawnTarget,
+    ) -> Option<(nt_memory_manager::SectionFileIdentity, HostedProcessRole)> {
+        self.entries.iter().zip(self.used.iter()).enumerate()
+            .find(|(_, (image, used))| **used && image.pi == target.pi
+                && SpawnTarget::from_image(image.as_ref()) == target)
+            .and_then(|(index, _)| Some((self.backings[index]?, self.launch_creators[index]?)))
+    }
+
     /// Resolve only an exact mounted File identity to a still-registered image generation.
     pub fn observation_for_backing(
         &self,
@@ -741,6 +785,7 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
         self.entries[index] = OwnedHostedProcessImage::empty();
         self.used[index] = false;
         self.backings[index] = None;
+        self.launch_creators[index] = None;
         Ok(retired)
     }
 
@@ -763,6 +808,7 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
         self.entries[index] = image;
         self.used[index] = true;
         self.backings[index] = None;
+        self.launch_creators[index] = None;
         Ok(index)
     }
 
