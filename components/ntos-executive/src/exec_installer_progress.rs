@@ -28,9 +28,9 @@ impl ExecNtHandler {
             if process.state != nt_process::ProcessState::Running {
                 return None;
             }
-            // Dynamic PE instances retain the generic subsystem role. The exact image
-            // observation carries the registered service role for this boot-only signal.
-            if self.hosted_process_observation_role(ancestor_pi)?.is_noninteractive_service_class() {
+            // Historical image observations cannot grant installer service ownership.
+            let image = self.hosted_process_image(ancestor_pi)?;
+            if image.can_own_installer_service_work() {
                 return Some(InstallerOwner { worker, parent, service: ancestor });
             }
             let next_pid = process.parent?;

@@ -178,6 +178,12 @@ pub struct HostedProcessImageRef<'a> {
 }
 
 impl HostedProcessImageRef<'_> {
+    /// Installer service ownership requires a registered execution role. A captured image
+    /// observation remains historical attribution and cannot grant this policy capability.
+    pub fn can_own_installer_service_work(&self) -> bool {
+        self.role.is_noninteractive_service_class()
+    }
+
     pub fn observation_role(&self) -> HostedProcessRole {
         self.observation.map_or(self.role, |proof| proof.target.role)
     }
