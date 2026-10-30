@@ -16,6 +16,8 @@ MICRO = ROOT / "rust-micro"
 LOG = ROOT / "native-kvm-smoke.log"
 SCREENSHOT = ROOT / "native-kvm-smoke.ppm"
 QMP_SOCKET = ROOT / "native-kvm-smoke-qmp.sock"
+INTERRUPT_TRACE = MICRO / "native-kvm-qemu-int.log"
+INTERRUPT_TRACE_TAIL = ROOT / "native-kvm-qemu-int-tail.log"
 
 
 def qmp_reply(stream, command_id):
@@ -66,16 +68,21 @@ def stop_process_group(process):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seconds", type=int, default=180)
+    parser.add_argument("--trace-interrupts", action="store_true")
     args = parser.parse_args()
     if not 1 <= args.seconds <= 3600:
         parser.error("--seconds must be between 1 and 3600")
     QMP_SOCKET.unlink(missing_ok=True)
     SCREENSHOT.unlink(missing_ok=True)
+    INTERRUPT_TRACE.unlink(missing_ok=True)
+    INTERRUPT_TRACE_TAIL.unlink(missing_ok=True)
     command = [
         "./scripts/run_specs.sh",
         "-qmp",
         f"unix:{QMP_SOCKET},server=on,wait=off",
     ]
+    if args.trace_interrupts:
+        command += ["-d", "int,cpu_reset", "-D", str(INTERRUPT_TRACE)]
     with LOG.open("wb") as log:
         process = subprocess.Popen(
             command,
@@ -104,6 +111,12 @@ def main():
         finally:
             stop_process_group(process)
             QMP_SOCKET.unlink(missing_ok=True)
+            if args.trace_interrupts and INTERRUPT_TRACE.is_file():
+                with INTERRUPT_TRACE.open("rb") as trace:
+                    trace.seek(0, os.SEEK_END)
+                    trace.seek(max(0, trace.tell() - 131072))
+                    INTERRUPT_TRACE_TAIL.write_bytes(trace.read())
+                INTERRUPT_TRACE.unlink()
 
     output = LOG.read_text(errors="replace")
     if "boot: reading Simpleboot memory map" not in output:

@@ -102,7 +102,7 @@ jobs:
           GRAPHICS: '1'
           QEMU_MEMORY: 3072M
           QEMU_CPUS: '4'
-        run: python3 scripts/ci_kvm_smoke.py --seconds 180
+        run: python3 scripts/ci_kvm_smoke.py --seconds 180 --trace-interrupts
       - name: Upload native build and startup evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -112,6 +112,8 @@ jobs:
             native-kvm-build.log
             native-kvm-smoke.log
             native-kvm-smoke.ppm
+            native-kvm-qemu-int-tail.log
             native-kvm-image.sha256
             native-kvm-libernt-manifest.txt
+            rust-micro/target/mykernel-x86/release/mykernel-rust
           if-no-files-found: warn
