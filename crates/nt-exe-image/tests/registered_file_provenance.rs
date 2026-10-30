@@ -108,3 +108,30 @@ fn retained_process_source_keeps_exact_file_and_observation_across_registration_
     assert!(ProcessImageSourceEvidence::capture(catalog.get_by_pi(replacement_pi).unwrap(),
         exact_file, Some(observed)).is_err(), "old generation cannot attach to the replacement");
 }
+
+#[test]
+fn routed_section_keeps_io_file_but_role_requires_authenticated_physical_alias() {
+    let (mut catalog, registered_target, physical_file, wrong_physical, routed_file) = registered();
+    catalog.bind_registered_backing(registered_target, physical_file).unwrap();
+    catalog.bind_registered_launch_policy(registered_target,
+        HostedProcessRole::NativeSession).unwrap();
+    let observed = catalog.observation_for_backing(physical_file).unwrap();
+    let pi = catalog.admit_dynamic_executable_observed(b"services.exe",
+        HostedProcessRole::Application, b"\\SystemRoot\\System32\\services.exe",
+        b"services.exe", HostedImageRoot::System32, Some(observed), 64).unwrap();
+    let image = catalog.get_by_pi(pi).unwrap();
+    assert_ne!(routed_file.mount, physical_file.mount);
+    let exact = ProcessImageSourceEvidence::capture_with_registered_file(
+        image, routed_file, Some(physical_file), Some(observed)).unwrap();
+    assert_eq!(exact.file(), routed_file, "ordinary Section lineage retains routed I/O identity");
+    assert_eq!(exact.registered_file(), Some(physical_file));
+    assert_eq!(exact.registered_target_for_role(&catalog), Some(registered_target));
+    for alias in [None, Some(wrong_physical), Some(routed_file)] {
+        let source = ProcessImageSourceEvidence::capture_with_registered_file(
+            image, routed_file, alias, Some(observed)).unwrap();
+        assert_eq!(source.registered_target_for_role(&catalog), None);
+    }
+    let target = SpawnTarget::from_image(image);
+    catalog.retire_dynamic_target(target).unwrap();
+    assert_eq!(exact.registered_target_for_role(&catalog), None);
+}

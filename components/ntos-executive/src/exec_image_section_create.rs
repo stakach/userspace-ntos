@@ -17,6 +17,7 @@ pub(crate) struct RoutedImageAdmission {
     pub(crate) layout: Option<nt_pe_loader::PeLayout>,
     pub(crate) image_path: Vec<u8>,
     pub(crate) observation_target: Option<nt_exe_image::CapturedImageObservation>,
+    pub(crate) registered_file: Option<nt_memory_manager::SectionFileIdentity>,
     pub(crate) name: Option<crate::section_metadata_work::ImageObjectName>,
 }
 
@@ -172,6 +173,7 @@ impl ExecNtHandler {
             contents,
             admission.name,
             admission.observation_target,
+            admission.registered_file,
             ImageSourceAdmission::Routed {
                 capture: Some(admission.capture),
                 path: admission.image_path,
@@ -217,6 +219,7 @@ impl ExecNtHandler {
             contents,
             name,
             observation_target,
+            observation_target.map(|_| identity),
             ImageSourceAdmission::Local {
                 backing,
                 file,
@@ -240,6 +243,7 @@ impl ExecNtHandler {
         contents: NativeImageContents,
         name: Option<crate::section_metadata_work::ImageObjectName>,
         observation_target: Option<nt_exe_image::CapturedImageObservation>,
+        registered_file: Option<nt_memory_manager::SectionFileIdentity>,
         mut admission: ImageSourceAdmission<'_>,
         image: &mut NativeImageReservation,
     ) -> Result<ReservedNativeImageSection, u32> {
@@ -331,6 +335,7 @@ impl ExecNtHandler {
                 local_file,
                 image_path,
                 observation_target,
+                registered_file,
             });
         }
         let id = match self.image_sections.publish(image, &mut source) {

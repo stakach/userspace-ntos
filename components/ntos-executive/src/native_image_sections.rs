@@ -59,6 +59,9 @@ pub(crate) struct NativeImageSource {
     /// Captured opened pathname for process metadata, never source selection.
     pub(crate) image_path: Option<Vec<u8>>,
     pub(crate) observation_target: Option<nt_exe_image::CapturedImageObservation>,
+    /// Exact physical catalog alias captured from the routed File's live mount/device binding.
+    /// `backing.file` remains the original Section I/O identity.
+    pub(crate) registered_file: Option<SectionFileIdentity>,
 }
 
 /// Mounted Disk Files and provider-attested installed routed Files are immutable and retained

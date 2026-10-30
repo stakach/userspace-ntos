@@ -68,7 +68,8 @@ impl ExecNtHandler {
         if headers.machine != 0x8664 || !headers.is_executable() { return Err(INVALID_IMAGE); }
         let role = nt_exe_image::HostedProcessRole::for_image_subsystem(headers.subsystem)
             .ok_or(STATUS_NOT_SUPPORTED)?;
-        let physical_file = source.backing.file.ok_or(INVALID_IMAGE)?;
+        let section_file = source.backing.file.ok_or(INVALID_IMAGE)?;
+        let registered_file = source.registered_file;
         let observation_target = source.observation_target;
         let metadata = nt_exe_image::ImageMetadata {
             pool_va: bytes.as_mut_ptr() as u64, file_size: bytes.len() as u64,
@@ -96,8 +97,8 @@ impl ExecNtHandler {
         };
         let image = catalog.get_by_pi(pi).expect("new exact process image registration");
         let target = nt_exe_image::SpawnTarget::from_image(image);
-        let source = match nt_exe_image::ProcessImageSourceEvidence::capture(
-            image, physical_file, observation_target,
+        let source = match nt_exe_image::ProcessImageSourceEvidence::capture_with_registered_file(
+            image, section_file, registered_file, observation_target,
         ) {
             Ok(source) => source,
             Err(_) => {

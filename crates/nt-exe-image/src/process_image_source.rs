@@ -13,6 +13,7 @@ pub enum ProcessImageSourceError {
 pub struct ProcessImageSourceEvidence {
     target: SpawnTarget,
     file: SectionFileIdentity,
+    registered_file: Option<SectionFileIdentity>,
     observation: Option<SpawnTarget>,
 }
 
@@ -24,6 +25,15 @@ impl ProcessImageSourceEvidence {
         file: SectionFileIdentity,
         observation: Option<CapturedImageObservation>,
     ) -> Result<Self, ProcessImageSourceError> {
+        Self::capture_with_registered_file(image, file, Some(file), observation)
+    }
+
+    pub fn capture_with_registered_file(
+        image: HostedProcessImageRef<'_>,
+        file: SectionFileIdentity,
+        registered_file: Option<SectionFileIdentity>,
+        observation: Option<CapturedImageObservation>,
+    ) -> Result<Self, ProcessImageSourceError> {
         if file.file_id == 0 || file.mount.value() == 0 {
             return Err(ProcessImageSourceError::InvalidFile);
         }
@@ -31,10 +41,11 @@ impl ProcessImageSourceEvidence {
         if image.observation_target() != observation {
             return Err(ProcessImageSourceError::ObservationMismatch);
         }
-        Ok(Self { target: SpawnTarget::from_image(image), file, observation })
+        Ok(Self { target: SpawnTarget::from_image(image), file, registered_file, observation })
     }
 
     pub const fn file(self) -> SectionFileIdentity { self.file }
+    pub const fn registered_file(self) -> Option<SectionFileIdentity> { self.registered_file }
     pub const fn observation(self) -> Option<SpawnTarget> { self.observation }
     pub fn matches_target(self, target: SpawnTarget) -> bool { self.target == target }
 
@@ -49,6 +60,6 @@ impl ProcessImageSourceEvidence {
         { return None; }
         let registered = self.observation?;
         catalog.registered_launch_policy(registered)
-            .and_then(|(file, _)| (file == self.file).then_some(registered))
+            .and_then(|(file, _)| (Some(file) == self.registered_file).then_some(registered))
     }
 }

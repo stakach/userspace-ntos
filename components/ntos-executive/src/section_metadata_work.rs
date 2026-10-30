@@ -123,6 +123,7 @@ struct Work {
     image_layout: Option<nt_pe_loader::PeLayout>,
     image_path: Option<Vec<u8>>,
     observation_target: Option<nt_exe_image::CapturedImageObservation>,
+    registered_file: Option<nt_memory_manager::SectionFileIdentity>,
     reserved: Option<ReservedSection>,
     published_handle: Option<u64>,
     phase: Phase,
@@ -437,6 +438,7 @@ unsafe fn retain_work(
         image_layout: None,
         image_path: submission.image_path,
         observation_target: submission.observation_target,
+        registered_file: None,
         reserved: reserved
             .and_then(|slot| slot.take())
             .map(ReservedSection::Data),
@@ -748,14 +750,15 @@ unsafe fn advance(
                 match result {
                     Ok(metadata) => {
                         if work.allocation_attrs & 0x0100_0000 != 0 && !metadata.is_directory {
-                            let observation = work.capture.as_ref()
+                            let physical_file = work.capture.as_ref()
                                 .and_then(|capture| mounted_volume::physical_exec_file_alias(
                                     capture.device_id(), metadata.file,
-                                ))
-                                .and_then(|physical_file| handler.loop_ctx.and_then(|ctx| {
+                                ));
+                            let observation = physical_file
+                                .and_then(|file| handler.loop_ctx.and_then(|ctx| {
                                     // The catalog is loop-owned and this metadata completion is
                                     // serialized before image Section publication.
-                                    unsafe { (&*ctx.exe_image_catalog).observation_for_backing(physical_file) }
+                                    unsafe { (&*ctx.exe_image_catalog).observation_for_backing(file) }
                                 }));
                             if let Some(observation) = observation {
                                 if work.observation_target.is_some_and(|existing| existing != observation) {
@@ -765,6 +768,7 @@ unsafe fn advance(
                                     return Step::Progress;
                                 }
                                 work.observation_target = Some(observation);
+                                work.registered_file = physical_file;
                                 let n = ROUTED_OBSERVATION_TRACE_N.fetch_add(1, Ordering::Relaxed);
                                 if n < 8 {
                                     print_str(b"[routed-image-observation] pi/role/target-pi/generation=");
@@ -1250,6 +1254,7 @@ unsafe fn advance(
                             layout: work.image_layout.take(),
                             image_path: work.image_path.take().expect("captured image File name"),
                             observation_target: work.observation_target,
+                            registered_file: work.registered_file,
                             name: work.image_name.take(),
                         },
                     )
