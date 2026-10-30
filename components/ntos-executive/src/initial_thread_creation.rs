@@ -71,13 +71,18 @@ fn lineage_status(error: nt_exe_image::execution_role::ExecutionRoleError) -> u3
 /// Optional ledger admission for a child whose exact live Section File is retained. Existing
 /// process routes without that evidence keep ordinary NtCreateThread behavior but receive no
 /// ancestry or execution-role grant. A caller without a committed ledger identity cannot grant
-/// lineage; a historical image observation cannot promote a privileged role here.
+/// lineage. Registered roles additionally require the Section's authenticated physical File
+/// alias and the registered policy's actual creator role.
 unsafe fn reserve_foreign_initial_thread_lineage(
     handler: &mut ExecNtHandler,
     caller: Binding,
     child: Binding,
 ) -> Result<Option<PendingInitialThreadRole>, u32> {
-    use nt_exe_image::{execution_role::ForeignInitialThreadLineageEvidence, HostedProcessRole, SpawnTarget};
+    use nt_exe_image::{
+        execution_role::{ExecutionRoleError, ForeignInitialThreadLineageEvidence,
+            ForeignInitialThreadRoleEvidence},
+        HostedProcessRole, SpawnTarget,
+    };
     if runtime(handler, caller).is_none()
         || handler.capture_process_identity(caller.pi) != Some(caller.process)
         || handler.capture_process_identity(child.pi) != Some(child.process)
@@ -96,16 +101,38 @@ unsafe fn reserve_foreign_initial_thread_lineage(
     if handler.execution_roles.role(caller_target, caller.process).is_none() {
         return Ok(None);
     }
-    let token = handler.execution_roles.reserve_foreign_initial_thread_lineage(
-        catalog,
-        ForeignInitialThreadLineageEvidence {
+    let registered = source.registered_target_for_role(catalog);
+    let role_token = registered.map(|registered_target| {
+        handler.execution_roles.reserve_foreign_initial_thread_role(
+            catalog,
+            ForeignInitialThreadRoleEvidence {
+                caller: caller.process,
+                child: child.process,
+                child_target: target,
+                registered_target,
+                section_image: source.registered_file()
+                    .expect("registered source has its exact physical File"),
+                parent_handle_hint: None,
+            },
+        )
+    });
+    let token = match role_token {
+        Some(Ok(token)) => token,
+        // The actual creator may launch the image as an ordinary process, but does not inherit
+        // its registered execution role. Keep its exact routed Section lineage only.
+        None | Some(Err(ExecutionRoleError::UnauthorizedCreator)) =>
+            handler.execution_roles.reserve_foreign_initial_thread_lineage(
+                catalog,
+                ForeignInitialThreadLineageEvidence {
             caller: caller.process,
             child: child.process,
             child_target: target,
             section_image: source.file(),
             parent_handle_hint: None,
         },
-    ).map_err(lineage_status)?;
+            ).map_err(lineage_status)?,
+        Some(Err(error)) => return Err(lineage_status(error)),
+    };
     Ok(Some(PendingInitialThreadRole { token, target, process: child.process }))
 }
 

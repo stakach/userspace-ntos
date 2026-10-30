@@ -141,7 +141,7 @@ fn uncertain_physical_reconciliation_has_no_second_native_start() {
 }
 
 #[test]
-fn foreign_initial_lineage_is_reserved_before_effects_and_committed_after_ps() {
+fn foreign_initial_authority_is_reserved_before_effects_and_committed_after_ps() {
     let file = creation_source();
     let owner = file.items.iter().find_map(|item| match item {
         Item::Struct(item) if item.ident == "PendingInitialThreadCreation" => Some(item),
@@ -164,8 +164,11 @@ fn foreign_initial_lineage_is_reserved_before_effects_and_committed_after_ps() {
     let ledger_reserve = evidence_path.iter().position(|name| name == "reserve_foreign_initial_thread_lineage")
         .expect("lineage uses the ordinary reservation contract");
     assert!(source < caller_role && caller_role < ledger_reserve);
-    assert_eq!(count(&evidence_path, "reserve_foreign_initial_thread_role"), 0,
-        "ordinary lineage cannot promote a registered privileged role");
+    assert_eq!(count(&evidence_path, "reserve_foreign_initial_thread_role"), 1,
+        "registered role admission requires its separate exact File and creator check");
+    assert!(evidence_path.iter().position(|name| name == "registered_target_for_role").unwrap()
+        < evidence_path.iter().position(|name| name == "reserve_foreign_initial_thread_role").unwrap(),
+        "historical observations cannot directly grant registered roles");
 
     let advance = calls(native_function(&file, "advance_initial_creation"));
     let ps = advance.iter().position(|name| name == "ps_committed").unwrap();

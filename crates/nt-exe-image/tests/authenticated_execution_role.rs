@@ -8,6 +8,7 @@ use nt_exe_image::{
         ExecutionRoleLedger, ForeignInitialThreadLineageEvidence, ForeignInitialThreadRoleEvidence,
     },
     HostedImageRoot, HostedProcessRole, OwnedHostedImageCatalog, OwnedHostedProcessImage,
+    ProcessImageSourceEvidence,
     SpawnTarget,
 };
 use nt_memory_manager::{ProcessGeneration, ProcessIdentity, SectionFileIdentity, SectionMountIds};
@@ -17,6 +18,39 @@ fn process(pid: u32, generation: u64) -> ProcessIdentity {
         pid,
         generation: ProcessGeneration::Hosted(generation),
     }
+}
+
+#[test]
+fn registered_file_alias_cannot_override_the_actual_creator_policy() {
+    use nt_exe_image::execution_role::ExecutionRoleError;
+    let mut mounts = SectionMountIds::new();
+    let physical_mount = mounts.allocate().unwrap();
+    let routed_mount = mounts.allocate().unwrap();
+    let root_file = SectionFileIdentity { mount: physical_mount, file_id: 10 };
+    let service_file = SectionFileIdentity { mount: physical_mount, file_id: 12 };
+    let routed_file = SectionFileIdentity { mount: routed_mount, file_id: 12 };
+    let mut catalog = OwnedHostedImageCatalog::<16>::new();
+    let smss = registered(&mut catalog, 0, 0, b"smss.exe",
+        HostedProcessRole::NativeSession, HostedProcessRole::NativeSession, root_file);
+    let service = registered(&mut catalog, 3, 6, b"services.exe",
+        HostedProcessRole::ServiceControlManager, HostedProcessRole::InteractiveLogon, service_file);
+    let observation = catalog.capture_image_observation(service).unwrap();
+    let child = child(&mut catalog, b"services.exe", Some(observation));
+    let source = ProcessImageSourceEvidence::capture_with_registered_file(
+        catalog.get_by_pi(child.pi).unwrap(), routed_file, Some(service_file), Some(observation)).unwrap();
+    let caller_process = process(12, 1);
+    let child_process = process(120, 2);
+    let mut roles = ExecutionRoleLedger::<16>::new();
+    roles.seed_bootstrap_root(&catalog, smss, caller_process, root_file).unwrap();
+    let candidate = source.registered_target_for_role(&catalog).unwrap();
+    assert_eq!(roles.reserve_foreign_initial_thread_role(&catalog,
+        evidence(caller_process, child_process, child, candidate,
+            source.registered_file().unwrap(), None)), Err(ExecutionRoleError::UnauthorizedCreator));
+    assert_eq!(roles.role(child, child_process), None);
+    let token = roles.reserve_foreign_initial_thread_lineage(&catalog,
+        lineage(caller_process, child_process, child, source.file(), None)).unwrap();
+    roles.commit_foreign_initial_thread(&catalog, token, child, child_process).unwrap();
+    assert_eq!(roles.role(child, child_process), Some(HostedProcessRole::Application));
 }
 
 fn registered(

@@ -148,6 +148,7 @@ fn publish(
         contents: NativeImageContents::Snapshot(bytes),
         local_file: None,
         image_path: Some(b"exact-opened-path".to_vec()),
+        registered_file: None,
         observation_target: None,
     });
     let id = store.publish(&mut reservation, &mut source).unwrap();
@@ -174,6 +175,7 @@ fn retained_disk_source_needs_its_file_pin_not_a_complete_payload_vec() {
         contents: NativeImageContents::RetainedDisk,
         local_file: None,
         image_path: Some(b"exact-opened-path".to_vec()),
+        registered_file: None,
         observation_target: None,
     });
     assert_eq!(store.publish(&mut reservation, &mut source), Err(NativeImageError::InvalidSource));
@@ -314,6 +316,7 @@ fn permanent_immutable_routed_images_keep_file_owners_without_heap_sized_snapsho
             contents: NativeImageContents::RetainedRouted,
             local_file: None,
             image_path: None,
+            registered_file: None,
             observation_target: None,
         });
         let id = store.publish(&mut reservation, &mut source).unwrap();
