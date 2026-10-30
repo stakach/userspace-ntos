@@ -70157,6 +70157,28 @@ pub(crate) fn print_active_driver_dispatch_for_deadman() {
 /// isn't available.
 ///
 /// This is the private component transport engine. Public callers route through driver/device ids.
+fn trace_port_connect_pump(
+    stage: u64,
+    irp: u64,
+    hook: bool,
+    selected: bool,
+    route: nt_component_suspension::peer_registry::PeerRoute,
+    tcb: u64,
+    detail: u64,
+) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 12 { return; }
+    print_str(b"[port-connect-pump] stage/irp/hook/class/endpoint/executor/tcb/detail=");
+    print_u64(stage); print_str(b"/");
+    print_hex_u64(irp); print_str(b"/");
+    print_u64(u64::from(hook)); print_str(b"/");
+    print_u64(u64::from(selected)); print_str(b"/");
+    print_hex_u64(route.endpoint()); print_str(b"/");
+    print_hex_u64(route.identity().executor); print_str(b"/");
+    print_hex_u64(tcb); print_str(b"/");
+    print_hex_u64(detail); print_str(b"\n");
+}
+
 unsafe fn dispatch_irp_for_instance_exact(
     inst: usize,
     major: u64,
@@ -70332,6 +70354,18 @@ unsafe fn dispatch_irp_for_instance_exact(
         Some(selection) => selection.route,
         None => hosted_ingress_sources::primary_route(dispatch_index)?,
     };
+    let trace_connect_pump = dispatch_request.as_ref().is_some_and(|request| {
+        hosted_file_owners::port_connect_dispatch_for_trace(
+            nt_io_manager::IrpId(canonical_irp_id),
+            nt_io_manager::DeviceId(request.device_id),
+        )
+    });
+    if trace_connect_pump {
+        trace_port_connect_pump(0, canonical_irp_id, class_hook_request,
+            class_selection.is_some(), ingress_route,
+            class_selection.as_ref().map_or(d.tcb, |selection| selection.tcb),
+            dispatch_index as u64);
+    }
     if !crate::spawn_hosts::shared_ingress::owner::runtime::ready_for_admission(ingress_route)
         .ok()?
     {
@@ -70617,10 +70651,19 @@ unsafe fn dispatch_irp_for_instance_exact(
             });
         }
     }
+    if trace_connect_pump {
+        trace_port_connect_pump(1, canonical_irp_id, class_hook_request,
+            class_selection.is_some(), ingress_route, ch.tcb, ch.reply_cap);
+    }
     let pr = match caller {
         Some(caller) => component_scheduler::hosted_component_pump_with_caller(&ch, caller),
         None => hosted_component_pump(&ch),
     };
+    if trace_connect_pump {
+        trace_port_connect_pump(2, canonical_irp_id, class_hook_request,
+            class_selection.is_some(), ingress_route, ch.tcb,
+            ((u64::from(pr.completed)) << 32) | (pr.status as u32 as u64));
+    }
     let guarded_abort = FSD_BUGCHECKS.load(Ordering::Relaxed) != bugchecks_before;
     if let Some(selection) = class_selection.as_ref() {
         hosted_class_irp_lane::finish(dispatch_index, selection, pr.completed && !guarded_abort);
