@@ -29,7 +29,7 @@ pub enum StaticIoResourceError {
 
 type Result<T> = core::result::Result<T, StaticIoResourceError>;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 struct Scope(Vec<[u8; 4]>);
 
 impl Scope {
@@ -68,10 +68,22 @@ struct Device {
 struct Aml<'a> {
     data: &'a [u8],
     table_address: u64,
+    declared: Vec<Scope>,
     found: Vec<StaticIoResource>,
 }
 
 impl Aml<'_> {
+    fn declare(&mut self, name: Scope) -> Result<()> {
+        if self.declared.contains(&name) {
+            return Err(StaticIoResourceError::MalformedAml);
+        }
+        self.declared
+            .try_reserve(1)
+            .map_err(|_| StaticIoResourceError::Allocation)?;
+        self.declared.push(name);
+        Ok(())
+    }
+
     fn direct_child(name: &Scope, parent: &Scope) -> bool {
         name.0.len() == parent.0.len() + 1 && name.0[..parent.0.len()] == parent.0[..]
     }
@@ -85,6 +97,15 @@ impl Aml<'_> {
     }
 
     fn pkg(&self, at: usize, end: usize) -> Result<(usize, usize)> {
+        let (size, body) = self.pkg_length(at, end)?;
+        let limit = at
+            .checked_add(size)
+            .filter(|limit| *limit >= body && *limit <= end)
+            .ok_or(StaticIoResourceError::MalformedAml)?;
+        Ok((body, limit))
+    }
+
+    fn pkg_length(&self, at: usize, end: usize) -> Result<(usize, usize)> {
         let lead = self.byte(at, end)?;
         let more = (lead >> 6) as usize;
         let mut size = if more == 0 {
@@ -96,11 +117,36 @@ impl Aml<'_> {
             size |= (self.byte(at + 1 + n, end)? as usize) << (4 + 8 * n);
         }
         let body = at + 1 + more;
-        let limit = at
-            .checked_add(size)
-            .filter(|limit| *limit >= body && *limit <= end)
-            .ok_or(StaticIoResourceError::MalformedAml)?;
-        Ok((body, limit))
+        Ok((size, body))
+    }
+
+    fn field_list(&mut self, mut at: usize, end: usize, scope: &Scope) -> Result<()> {
+        while at < end {
+            match self.byte(at, end)? {
+                0 => at = self.pkg_length(at + 1, end)?.1,
+                1 => at = at + 3,
+                2 => {
+                    at = if self.byte(at + 1, end)? == 0x11 {
+                        self.pkg(at + 2, end)?.1
+                    } else {
+                        self.name(at + 1, end, scope)?.1
+                    };
+                }
+                3 => at = at + 4,
+                _ => {
+                    let (name, next) = self.name(at, end, scope)?;
+                    if next != at + 4 {
+                        return Err(StaticIoResourceError::MalformedAml);
+                    }
+                    self.declare(name)?;
+                    at = self.pkg_length(next, end)?.1;
+                }
+            }
+            if at > end {
+                return Err(StaticIoResourceError::MalformedAml);
+            }
+        }
+        Ok(())
     }
 
     fn name(&self, at: usize, end: usize, parent: &Scope) -> Result<(Scope, usize)> {
@@ -307,7 +353,7 @@ impl Aml<'_> {
                     && p[5] == 1
                     && start == maximum
                     && length != 0
-                    && start.checked_add(length).is_some()
+                    && (start as u32 + length as u32) <= 0x1_0000
                 {
                     ports
                         .try_reserve(1)
@@ -345,6 +391,7 @@ impl Aml<'_> {
                 0x5b if self.byte(at + 1, end)? == 0x82 => {
                     let (body, next) = self.pkg(at + 2, end)?;
                     let (name, terms) = self.name(body, next, scope)?;
+                    self.declare(name.clone())?;
                     let mut child = Device::default();
                     self.walk(terms, next, &name, Some(&mut child), depth + 1)?;
                     if let Some(hid) = child.hid {
@@ -370,6 +417,7 @@ impl Aml<'_> {
                 }
                 0x08 => {
                     let (name, value) = self.name(at + 1, end, scope)?;
+                    self.declare(name.clone())?;
                     if let Some(device) = device.as_deref_mut() {
                         if Self::direct_child(&name, scope) && name.0.last() == Some(b"_HID") {
                             if device.hid_declared {
@@ -390,6 +438,7 @@ impl Aml<'_> {
                 }
                 0x5b if self.byte(at + 1, end)? == 0x80 => {
                     let (name, space) = self.name(at + 2, end, scope)?;
+                    self.declare(name.clone())?;
                     if Self::direct_child(&name, scope) {
                         if let (Some(device), Some(region_name)) =
                             (device.as_deref_mut(), name.0.last())
@@ -414,7 +463,7 @@ impl Aml<'_> {
                         if let (Ok(start), Ok(length)) =
                             (u16::try_from(address), u16::try_from(length))
                         {
-                            if length != 0 && start.checked_add(length).is_some() {
+                            if length != 0 && (start as u32 + length as u32) <= 0x1_0000 {
                                 if let (Some(device), Some(region_name)) =
                                     (device.as_deref_mut(), name.0.last())
                                 {
@@ -431,21 +480,57 @@ impl Aml<'_> {
                     }
                     at = next;
                 }
-                0x14 | 0xa0 | 0xa1 | 0xa2 => at = self.pkg(at + 1, end)?.1,
-                0x5b if matches!(
-                    self.byte(at + 1, end)?,
-                    0x81 | 0x83 | 0x84 | 0x85 | 0x86 | 0x87
-                ) =>
-                {
-                    at = self.pkg(at + 2, end)?.1;
+                0x14 => {
+                    let (body, next) = self.pkg(at + 1, end)?;
+                    let (name, _) = self.name(body, next, scope)?;
+                    self.declare(name)?;
+                    at = next;
+                }
+                0xa0 | 0xa1 | 0xa2 => at = self.pkg(at + 1, end)?.1,
+                0x5b if matches!(self.byte(at + 1, end)?, 0x81 | 0x86 | 0x87) => {
+                    let opcode = self.byte(at + 1, end)?;
+                    let (body, next) = self.pkg(at + 2, end)?;
+                    let (_, mut fields) = self.name(body, next, scope)?;
+                    if opcode != 0x81 {
+                        fields = self.name(fields, next, scope)?.1;
+                    }
+                    if opcode == 0x87 {
+                        fields = self
+                            .integer(fields, next)?
+                            .ok_or(StaticIoResourceError::MalformedAml)?
+                            .1;
+                    }
+                    self.byte(fields, next)?; // FieldFlags
+                    self.field_list(fields + 1, next, scope)?;
+                    at = next;
+                }
+                0x5b if matches!(self.byte(at + 1, end)?, 0x83 | 0x84 | 0x85) => {
+                    let opcode = self.byte(at + 1, end)?;
+                    let (body, next) = self.pkg(at + 2, end)?;
+                    let (name, terms) = self.name(body, next, scope)?;
+                    self.declare(name.clone())?;
+                    let fixed = match opcode {
+                        0x83 => 6, // Processor ID, PBlock address, PBlock length.
+                        0x84 => 3, // System level and resource order.
+                        _ => 0,
+                    };
+                    let terms = terms
+                        .checked_add(fixed)
+                        .filter(|terms| *terms <= next)
+                        .ok_or(StaticIoResourceError::MalformedAml)?;
+                    self.walk(terms, next, &name, None, depth + 1)?;
+                    at = next;
                 }
                 0x5b if self.byte(at + 1, end)? == 0x01 => {
-                    let (_, next) = self.name(at + 2, end, scope)?;
+                    let (name, next) = self.name(at + 2, end, scope)?;
+                    self.declare(name)?;
                     at = next + 1;
                 }
                 0x06 => {
                     let (_, next) = self.name(at + 1, end, scope)?;
-                    at = self.name(next, end, scope)?.1;
+                    let (name, next) = self.name(next, end, scope)?;
+                    self.declare(name)?;
+                    at = next;
                 }
                 other => {
                     return Err(StaticIoResourceError::UnsupportedAml {
@@ -476,6 +561,7 @@ pub fn parse_static_system_io_resources(
     let mut aml = Aml {
         data: table,
         table_address,
+        declared: Vec::new(),
         found: Vec::new(),
     };
     aml.walk(36, table.len(), &Scope::default(), None, 0)?;

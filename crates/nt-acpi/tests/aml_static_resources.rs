@@ -6,6 +6,91 @@ use nt_acpi::{parse_static_system_io_resources, StaticIoResourceError};
 
 const Q35_DSDT: &[u8] = include_bytes!("fixtures/qemu-q35-dsdt.aml");
 
+fn table_with_terms(terms: &[u8]) -> Vec<u8> {
+    let mut table = vec![0u8; 36];
+    table[..4].copy_from_slice(b"DSDT");
+    table.extend_from_slice(terms);
+    let length = table.len() as u32;
+    table[4..8].copy_from_slice(&length.to_le_bytes());
+    table[9] = 0u8.wrapping_sub(table.iter().copied().fold(0u8, u8::wrapping_add));
+    table
+}
+
+fn table_with_devices(devices: &[Vec<u8>]) -> Vec<u8> {
+    let mut terms = Vec::new();
+    for device in devices {
+        assert!(device.len() + 1 < 64);
+        terms.extend_from_slice(&[0x5b, 0x82, (device.len() + 1) as u8]);
+        terms.extend_from_slice(device);
+    }
+    table_with_terms(&terms)
+}
+
+fn literal_port_device(port: u16, name_collision: bool) -> Vec<u8> {
+    let mut device = b"TST0".to_vec();
+    device.extend_from_slice(&[0x08, b'_', b'H', b'I', b'D', 0x0d]);
+    device.extend_from_slice(b"PNP0A06\0");
+    device.extend_from_slice(&[0x08, b'_', b'C', b'R', b'S', 0x11, 0x0d, 0x0a, 0x0a]);
+    device.extend_from_slice(&[0x47, 0x01]);
+    device.extend_from_slice(&port.to_le_bytes());
+    device.extend_from_slice(&port.to_le_bytes());
+    device.extend_from_slice(&[1, 1, 0x79, 0]);
+    if name_collision {
+        device.extend_from_slice(&[0x08, b'P', b'R', b'S', b'T', 0]);
+    }
+    device.extend_from_slice(&[0x5b, 0x80, b'P', b'R', b'S', b'T', 1, 0x0b]);
+    device.extend_from_slice(&port.to_le_bytes());
+    device.extend_from_slice(&[0x0a, 1]);
+    device
+}
+
+#[test]
+fn duplicate_device_path_cannot_authorize_ports() {
+    let table = table_with_devices(&[b"TST0".to_vec(), literal_port_device(0xcd8, false)]);
+    assert!(parse_static_system_io_resources(&table, 0x5000).is_err());
+}
+
+#[test]
+fn name_collision_with_operation_region_cannot_authorize_ports() {
+    let table = table_with_devices(&[literal_port_device(0xcd8, true)]);
+    assert!(parse_static_system_io_resources(&table, 0x5000).is_err());
+}
+
+#[test]
+fn named_field_collision_with_operation_region_cannot_authorize_ports() {
+    let mut device = literal_port_device(0xcd8, false);
+    let region = device
+        .windows(4)
+        .position(|window| window == b"PRST")
+        .unwrap();
+    device.splice(
+        region - 2..region - 2,
+        [
+            0x5b, 0x81, 0x0b, b'D', b'U', b'M', b'Y', 0, b'P', b'R', b'S', b'T', 8,
+        ],
+    );
+    let table = table_with_devices(&[device]);
+    assert!(parse_static_system_io_resources(&table, 0x5000).is_err());
+}
+
+#[test]
+fn processor_name_collision_with_device_cannot_authorize_ports() {
+    let mut terms = vec![0x5b, 0x83, 0x0b, b'T', b'S', b'T', b'0', 0, 0, 0, 0, 0, 0];
+    let device = literal_port_device(0xcd8, false);
+    terms.extend_from_slice(&[0x5b, 0x82, (device.len() + 1) as u8]);
+    terms.extend_from_slice(&device);
+    let table = table_with_terms(&terms);
+    assert!(parse_static_system_io_resources(&table, 0x5000).is_err());
+}
+
+#[test]
+fn final_io_port_has_valid_exclusive_end() {
+    let table = table_with_devices(&[literal_port_device(0xffff, false)]);
+    let resources = parse_static_system_io_resources(&table, 0x5000).unwrap();
+    assert_eq!(resources.len(), 1);
+    assert_eq!((resources[0].start, resources[0].length), (0xffff, 1));
+}
+
 #[test]
 fn q35_cpu_hotplug_io_is_backed_by_matching_crs_and_operation_region() {
     let resources = parse_static_system_io_resources(Q35_DSDT, 0x7f7a_0000).unwrap();
